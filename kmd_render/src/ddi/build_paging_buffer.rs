@@ -5,8 +5,16 @@
 //! paging requests without emitting DMA, while render/UMD paths remain disabled.
 
 use core::ffi::c_void;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::dxgk::*;
+
+/// DISPATCH-safe paging-buffer tracer. `DxgkDdiBuildPagingBuffer` can run at
+/// DISPATCH_LEVEL, where `diag::record`'s `RtlWriteRegistryValue` is illegal
+/// (PASSIVE-only). Instead we bump these lock-free atomics, which ntoseye reads
+/// by symbol to see the op flow without an IRQL violation. Stage 2b.
+pub static PAGING_LAST_OP: AtomicU32 = AtomicU32::new(0xFFFF_FFFF);
+pub static PAGING_CALL_COUNT: AtomicU32 = AtomicU32::new(0);
 
 /// `DxgkDdiBuildPagingBuffer` — translate a memory-management operation into GPU
 /// DMA commands written into `pDmaBuffer`.
@@ -23,8 +31,14 @@ pub unsafe extern "C" fn dxgkddi_build_paging_buffer(
 
     // Do not advance pDmaBuffer. Dxgkrnl supplied a buffer, but this bring-up
     // engine has no real page-table or aperture commands to write yet.
+    //
+    // IRQL: this DDI can run at DISPATCH_LEVEL — record via DISPATCH-safe atomics,
+    // NOT diag::record (RtlWriteRegistryValue is PASSIVE-only). Stage 2b will read
+    // the op here (ntoseye breakpoint) to learn which op carries the VidMm segment
+    // offset, then issue resource_map_blob(resource_id, offset).
     let args = unsafe { &*build_paging_buffer };
-    crate::diag::record(0x0500_0000 | (args.Operation as u32 & 0xFFFF));
+    PAGING_LAST_OP.store(args.Operation as u32, Ordering::Relaxed);
+    PAGING_CALL_COUNT.fetch_add(1, Ordering::Relaxed);
     STATUS_SUCCESS
 }
 

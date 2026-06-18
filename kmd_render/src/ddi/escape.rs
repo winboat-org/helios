@@ -17,11 +17,14 @@ use core::mem::size_of;
 
 use bytemuck::{bytes_of, pod_read_unaligned};
 use helios_protocol::{
-    HeliosEscapeCtxCreate, HeliosEscapeCtxDestroy, HeliosEscapeHeader, HeliosEscapeSubmitVenus,
-    HELIOS_ESCAPE_CTX_CREATE, HELIOS_ESCAPE_CTX_DESTROY, HELIOS_ESCAPE_SUBMIT_VENUS,
-    HELIOS_ESCAPE_WAIT_FENCE,
+    HeliosEscapeAllocBlob, HeliosEscapeCtxCreate, HeliosEscapeCtxDestroy, HeliosEscapeHeader,
+    HeliosEscapeMapBlob, HeliosEscapeReleaseBlob, HeliosEscapeSubmitVenus, HELIOS_ESCAPE_ALLOC_BLOB,
+    HELIOS_ESCAPE_CTX_CREATE, HELIOS_ESCAPE_CTX_DESTROY, HELIOS_ESCAPE_MAP_BLOB,
+    HELIOS_ESCAPE_RELEASE_BLOB, HELIOS_ESCAPE_SUBMIT_VENUS, HELIOS_ESCAPE_WAIT_FENCE,
 };
 
+use super::blob_map::{effective_map_cache, map_cache_to_mm, map_io_pages_to_user,
+    unmap_io_pages_from_user};
 use crate::adapter::AdapterContext;
 use crate::dxgk::*;
 use crate::virtio::hal::DmaBuffer;
@@ -54,12 +57,21 @@ pub unsafe extern "C" fn dxgkddi_escape(
         return STATUS_INVALID_PARAMETER;
     }
 
+    // Owner token for blob mappings: dxgkrnl passes our DeviceContext handle (the
+    // one we returned from DxgkDdiCreateDevice) as `hDevice`, and hands the SAME
+    // handle to DxgkDdiDestroyDevice — so a mapping tagged with it is unmapped at
+    // the right time, in the creating process. Blob verbs require a device handle.
+    let owner = args.hDevice as usize;
+
     match hdr.cmd_type {
         HELIOS_ESCAPE_CTX_CREATE => escape_ctx_create(adapter, buf),
         HELIOS_ESCAPE_CTX_DESTROY => escape_ctx_destroy(adapter, buf),
         HELIOS_ESCAPE_SUBMIT_VENUS => escape_submit_venus(adapter, buf),
         HELIOS_ESCAPE_WAIT_FENCE => escape_wait_fence(buf),
-        // ALLOC_BLOB / MAP_BLOB land in M3.5; unknown verbs are rejected.
+        HELIOS_ESCAPE_ALLOC_BLOB => escape_alloc_blob(adapter, buf),
+        HELIOS_ESCAPE_MAP_BLOB => escape_map_blob(adapter, buf, owner),
+        HELIOS_ESCAPE_RELEASE_BLOB => escape_release_blob(adapter, buf, owner),
+        // Unknown verbs are rejected.
         _ => STATUS_NOT_IMPLEMENTED,
     }
 }
@@ -147,4 +159,109 @@ fn escape_wait_fence(buf: &[u8]) -> NTSTATUS {
         return STATUS_BUFFER_TOO_SMALL;
     }
     STATUS_SUCCESS
+}
+
+/// `HELIOS_ESCAPE_ALLOC_BLOB` → create a HOST3D virtio-gpu blob (create + attach)
+/// and record its size; write the guest-assigned `out_resource_id` back.
+fn escape_alloc_blob(adapter: &AdapterContext, buf: &mut [u8]) -> NTSTATUS {
+    let sz = size_of::<HeliosEscapeAllocBlob>();
+    if buf.len() < sz {
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+    let req: HeliosEscapeAllocBlob = pod_read_unaligned(&buf[..sz]);
+    match adapter.with_virtio(|v| {
+        v.alloc_blob(req.ctx_id, req.blob_mem, req.blob_flags, req.blob_id, req.size)
+    }) {
+        Ok(Ok(resource_id)) => {
+            let mut out = req;
+            out.out_resource_id = resource_id;
+            buf[..sz].copy_from_slice(bytes_of(&out));
+            STATUS_SUCCESS
+        }
+        Ok(Err(ve)) => ve.into(),
+        Err(de) => de.into(),
+    }
+}
+
+/// `HELIOS_ESCAPE_MAP_BLOB` → map a host-visible blob's pages into the calling
+/// process and return the user VA (the zero-copy BAR model). Two-phase like the
+/// System-class IOCTL: `map_blob_prepare` runs the `RESOURCE_MAP_BLOB` round-trip
+/// under the virtio spinlock (DISPATCH), then we build the MDL + map into user
+/// space at PASSIVE_LEVEL, in this thread's (the ICD's) process. The mapping is
+/// tagged with the owning device handle and unmapped at DxgkDdiDestroyDevice.
+fn escape_map_blob(adapter: &AdapterContext, buf: &mut [u8], owner: usize) -> NTSTATUS {
+    let sz = size_of::<HeliosEscapeMapBlob>();
+    if buf.len() < sz {
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+    let req: HeliosEscapeMapBlob = pod_read_unaligned(&buf[..sz]);
+    if owner == 0 || req.resource_id == 0 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    // Reject a second map of an already-mapped resource (would claim a second
+    // window offset + leave a duplicate host mapping). The ICD maps each blob once.
+    if adapter.mappings.contains(req.resource_id) {
+        return STATUS_INVALID_DEVICE_REQUEST;
+    }
+
+    // Phase 1 — under the virtio spinlock (DISPATCH): RESOURCE_MAP_BLOB at a fresh
+    // window offset; returns the guest-physical range + host caching.
+    let prep = match adapter.with_virtio(|v| v.map_blob_prepare(req.resource_id)) {
+        Ok(Ok(p)) => p,
+        Ok(Err(ve)) => return ve.into(),
+        Err(de) => return de.into(),
+    };
+    // `IoAllocateMdl` length is a ULONG (u32); the per-map cap (gpu.rs) bounds this.
+    if prep.size == 0 || prep.size > u32::MAX as u64 {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    // Phase 2 — at PASSIVE_LEVEL, in the caller's process, holding NO lock.
+    let eff_cache = effective_map_cache(req.map_cache, prep.map_cache);
+    let cache = map_cache_to_mm(eff_cache);
+    // SAFETY: PASSIVE_LEVEL Escape in the ICD's process; `prep` names a valid
+    // host-injected window range from RESOURCE_MAP_BLOB.
+    let (user_va, mdl) = match unsafe { map_io_pages_to_user(prep.gpa, prep.size, cache) } {
+        Some(x) => x,
+        None => return STATUS_INSUFFICIENT_RESOURCES,
+    };
+
+    // Phase 3 — record for handle-close teardown. Table full → undo immediately.
+    if !adapter
+        .mappings
+        .insert(owner, req.resource_id, user_va, mdl as usize)
+    {
+        // SAFETY: still in the owning process at PASSIVE; pair returned just above.
+        unsafe { unmap_io_pages_from_user(user_va, mdl) };
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    let mut out = req;
+    out.out_user_va = user_va;
+    out.map_cache = eff_cache;
+    buf[..sz].copy_from_slice(bytes_of(&out));
+    STATUS_SUCCESS
+}
+
+/// `HELIOS_ESCAPE_RELEASE_BLOB` → unmap this device's user view (if any), then
+/// detach + unref the blob. Symmetric to MAP_BLOB; runs in the owning process.
+fn escape_release_blob(adapter: &AdapterContext, buf: &[u8], owner: usize) -> NTSTATUS {
+    let sz = size_of::<HeliosEscapeReleaseBlob>();
+    if buf.len() < sz {
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+    let req: HeliosEscapeReleaseBlob = pod_read_unaligned(&buf[..sz]);
+    if req.ctx_id == 0 || req.resource_id == 0 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    // The user VA can only be unmapped in the process/device that created it.
+    if let Some((user_va, mdl)) = adapter.mappings.take_for_resource(owner, req.resource_id) {
+        // SAFETY: PASSIVE, in the creating process; pair from a prior MAP_BLOB.
+        unsafe { unmap_io_pages_from_user(user_va, mdl as wdk_sys::PMDL) };
+    }
+    match adapter.with_virtio(|v| v.release_blob(req.ctx_id, req.resource_id)) {
+        Ok(Ok(())) => STATUS_SUCCESS,
+        Ok(Err(ve)) => ve.into(),
+        Err(de) => de.into(),
+    }
 }

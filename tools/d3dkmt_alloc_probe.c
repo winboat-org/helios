@@ -22,6 +22,9 @@ typedef LONG NTSTATUS, *PNTSTATUS;
 #define HELIOS_ESCAPE_MAGIC 0x48454C53u /* 'HELS' */
 #define HELIOS_ESCAPE_VERSION 1u
 #define HELIOS_ESCAPE_CTX_CREATE 0x0002u
+#define HELIOS_ESCAPE_ALLOC_BLOB 0x0004u
+#define HELIOS_ESCAPE_MAP_BLOB   0x0005u
+#define HELIOS_ESCAPE_RELEASE_BLOB 0x0008u
 #define VIRTIO_GPU_CAPSET_VENUS 4u
 
 struct helios_escape_header {
@@ -31,6 +34,26 @@ struct helios_escape_ctx_create {
     struct helios_escape_header hdr;
     UINT capset_id;
     UINT out_ctx_id;
+};
+// mirror protocol/src/escape.rs (exact field order/sizes)
+struct helios_escape_alloc_blob {
+    struct helios_escape_header hdr;
+    UINT64 size;             // in
+    UINT64 blob_id;          // in (0 = scratch shmem)
+    UINT blob_flags;         // in
+    UINT blob_mem;           // in
+    UINT ctx_id;             // in
+    UINT out_resource_id;    // out
+};
+struct helios_escape_map_blob {
+    struct helios_escape_header hdr;
+    UINT64 out_user_va;      // out
+    UINT resource_id;        // in
+    UINT map_cache;          // in/out
+};
+struct helios_escape_release_blob {
+    struct helios_escape_header hdr;
+    UINT ctx_id, resource_id, flags, padding;
 };
 
 // ── Helios WDDM allocation private data (mirror protocol/src/wddm.rs, 48B) ───
@@ -114,7 +137,46 @@ int main(void) {
     UINT ctx_id = cc.out_ctx_id;
     printf("CTX_CREATE(VENUS) ok ctx_id=%u\n", ctx_id);
 
-    // create a HOST3D mappable blob (kind=SHMEM, blob_id=0)
+    // ── Gate 5a Stage 2b: the zero-copy BAR path over D3DKMTEscape ──────────
+    // ALLOC_BLOB(blob_id=0, HOST3D mappable) -> MAP_BLOB -> sentinel on user VA.
+    struct helios_escape_alloc_blob ab; memset(&ab, 0, sizeof(ab));
+    ab.hdr.magic = HELIOS_ESCAPE_MAGIC; ab.hdr.cmd_type = HELIOS_ESCAPE_ALLOC_BLOB;
+    ab.hdr.version = HELIOS_ESCAPE_VERSION; ab.hdr.size = sizeof(ab);
+    ab.size = 4096; ab.blob_id = 0; ab.ctx_id = ctx_id;
+    ab.blob_mem = VIRTIO_GPU_BLOB_MEM_HOST3D;
+    ab.blob_flags = VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE;
+    printf("alloc_blob sizeof=%zu (expect 48)\n", sizeof(ab));
+    if (escape(&ab, sizeof(ab))) { printf("ALLOC_BLOB escape failed\n"); }
+    else {
+        UINT rid = ab.out_resource_id;
+        printf("ALLOC_BLOB ok resource_id=%u\n", rid);
+
+        struct helios_escape_map_blob mb; memset(&mb, 0, sizeof(mb));
+        mb.hdr.magic = HELIOS_ESCAPE_MAGIC; mb.hdr.cmd_type = HELIOS_ESCAPE_MAP_BLOB;
+        mb.hdr.version = HELIOS_ESCAPE_VERSION; mb.hdr.size = sizeof(mb);
+        mb.resource_id = rid;
+        printf("map_blob sizeof=%zu (expect 32)\n", sizeof(mb));
+        if (escape(&mb, sizeof(mb))) { printf("MAP_BLOB escape failed\n"); }
+        else {
+            printf("MAP_BLOB ok user_va=0x%llx map_cache=%u\n",
+                   (unsigned long long)mb.out_user_va, mb.map_cache);
+            if (mb.out_user_va) {
+                volatile unsigned* p = (volatile unsigned*)(UINT_PTR)mb.out_user_va;
+                *p = 0xCAFEF00D;            // write a sentinel into the host-visible blob
+                unsigned rb = *p;           // read it back through the BAR mapping
+                printf("  BAR sentinel write/read = 0x%08x (%s)\n",
+                       rb, rb == 0xCAFEF00D ? "OK" : "MISMATCH");
+            }
+        }
+
+        struct helios_escape_release_blob rb2; memset(&rb2, 0, sizeof(rb2));
+        rb2.hdr.magic = HELIOS_ESCAPE_MAGIC; rb2.hdr.cmd_type = HELIOS_ESCAPE_RELEASE_BLOB;
+        rb2.hdr.version = HELIOS_ESCAPE_VERSION; rb2.hdr.size = sizeof(rb2);
+        rb2.ctx_id = ctx_id; rb2.resource_id = rid;
+        printf("RELEASE_BLOB %s\n", escape(&rb2, sizeof(rb2)) ? "failed" : "ok");
+    }
+
+    // (legacy) create a HOST3D mappable blob via D3DKMTCreateAllocation (kind=SHMEM, blob_id=0)
     struct helios_wddm_alloc_private priv; memset(&priv, 0, sizeof(priv));
     priv.magic = HELIOS_WDDM_MAGIC; priv.version = HELIOS_WDDM_VERSION;
     priv.kind = HELIOS_WDDM_ALLOC_KIND_SHMEM; priv.ctx_id = ctx_id;

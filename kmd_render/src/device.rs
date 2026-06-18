@@ -52,11 +52,31 @@ pub unsafe extern "C" fn dxgkddi_create_device(
     STATUS_SUCCESS
 }
 
-/// `DxgkDdiDestroyDevice` — free per-device state.
+/// `DxgkDdiDestroyDevice` — free per-device state, after unmapping any host-visible
+/// blob views this device opened (Gate 5a Stage 2b). The user VAs were mapped by
+/// `HELIOS_ESCAPE_MAP_BLOB` (tagged with this `h_device` as owner) and MUST be
+/// unmapped here — in the creating process, at PASSIVE_LEVEL — or the kernel
+/// bugchecks `0x76 PROCESS_HAS_LOCKED_PAGES` at process exit. This DDI runs in the
+/// context of the thread destroying the device (the ICD's process), so the unmap is
+/// in-process. The mapping table is on the AdapterContext (independent spinlock), so
+/// teardown is correct even if the virtio transport is already gone.
 pub unsafe extern "C" fn dxgkddi_destroy_device(h_device: *mut c_void) -> NTSTATUS {
     if !h_device.is_null() {
-        // SAFETY: h_device was produced by Box::into_raw in create_device and is
-        // destroyed exactly once.
+        // SAFETY: h_device came from Box::into_raw in create_device; its `adapter`
+        // back-pointer is valid for the device's lifetime.
+        let dev = unsafe { &*(h_device as *mut DeviceContext) };
+        let adapter = unsafe { &*dev.adapter };
+        let owner = h_device as usize;
+        // Drain THIS device's mappings one at a time, unmapping outside the table
+        // lock (MmUnmapLockedPages needs PASSIVE; the table lock raises to DISPATCH).
+        while let Some((user_va, mdl)) = adapter.mappings.take_one_for(owner) {
+            // SAFETY: PASSIVE_LEVEL in the creating process; pair from a prior
+            // MAP_BLOB on this device handle.
+            unsafe {
+                crate::ddi::unmap_io_pages_from_user(user_va, mdl as *mut wdk_sys::MDL)
+            };
+        }
+        // SAFETY: produced by Box::into_raw in create_device; destroyed exactly once.
         drop(unsafe { Box::from_raw(h_device as *mut DeviceContext) });
     }
     STATUS_SUCCESS

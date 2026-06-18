@@ -31,8 +31,17 @@ pub unsafe extern "C" fn dxgkddi_query_adapter_info(
     // SAFETY: valid per the DDI contract; we only read the args struct.
     let args = unsafe { &*query_adapter_info };
 
-    // DIAG: log every QueryAdapterInfo type dxgkrnl requests during AddAdapter.
-    crate::diag::record(0x0100_0000 | (args.Type as u32 & 0xFFFF));
+    // DIAG: log every QueryAdapterInfo type dxgkrnl requests during AddAdapter,
+    // EXCEPT the steady-state perf-poll types (NODEPERFDATA 0x18 / ADAPTERPERFDATA
+    // 0x19) that dxgkrnl polls continuously to feed the Task Manager GPU tab.
+    // Those flood the 160-entry diag ring within ~1s and overwrite the one-shot
+    // bring-up / failure breadcrumbs we actually need. Gate them out here so the
+    // ring stays readable for post-start diagnosis.
+    let type_num = args.Type as u32 & 0xFFFF;
+    let is_perf_poll = type_num == 0x18 || type_num == 0x19;
+    if !is_perf_poll {
+        crate::diag::record(0x0100_0000 | type_num);
+    }
 
     match args.Type {
         DXGKQAITYPE_DRIVERCAPS => unsafe { query_driver_caps(args) },
@@ -61,7 +70,10 @@ pub unsafe extern "C" fn dxgkddi_query_adapter_info(
         // / Flags contract is undefined for us until we have real execution nodes.
         other => {
             // DIAG: which type we rejected (suspect if AddAdapter dies right after).
-            crate::diag::record(0x0200_0000 | (other as u32 & 0xFFFF));
+            // Same perf-poll gate as the entry log — 0x18/0x19 flood the ring.
+            if !is_perf_poll {
+                crate::diag::record(0x0200_0000 | (other as u32 & 0xFFFF));
+            }
             STATUS_NOT_SUPPORTED
         }
     }
@@ -234,6 +246,20 @@ unsafe fn write_wchar_z_unaligned(dst: *mut WCHAR, dst_len: usize, ascii: &[u8])
     }
 }
 
+// Gate 5a Stage 2b finding (2026-06-18): a CPU-visible **memory** segment
+// (Aperture=0) whose `CpuTranslatedAddress` points at the host-visible BAR — the
+// approach this function briefly carried (.66–.70) — is REJECTED by VidMm right
+// after `DxgkDdiCreateDevice` (clean-boot Code 43 / FAILED_POST_START, confirmed
+// independent of segment size: tested 8 GiB and a 256 MiB sub-window). The proven
+// virtio-gpu WDDM driver (`virtio-research-only-3d/.../viogpu_adapter.cpp`) uses an
+// **aperture** segment instead, backing allocations with OS system-memory MDLs via
+// `BuildPagingBuffer` MAP_APERTURE_SEGMENT and reaching the host with explicit
+// TRANSFER_TO_HOST copies — never a CPU-visible memory segment. A real memory
+// segment needs a declared GPU memory model (GpuMmu/IoMmu) we don't yet provide.
+// So we restore the proven aperture segment here (keeps the adapter at Code 0);
+// mapping the host-visible BAR to a `D3DKMTLock2` VA needs a different mechanism
+// (see GATE5_STAGE2_ALLOC_DESIGN.md / the gate5a memory). The host-visible window
+// scan + `resource_map_blob` plumbing stays in `virtio/gpu.rs` for that work.
 unsafe fn query_segments(args: &DXGKARG_QUERYADAPTERINFO) -> NTSTATUS {
     if (args.OutputDataSize as usize) < size_of::<DXGK_QUERYSEGMENTOUT4>() {
         return STATUS_BUFFER_TOO_SMALL;

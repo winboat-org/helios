@@ -2,6 +2,7 @@
 //! `DRIVER_INITIALIZATION_DATA` table.
 
 mod add_device;
+mod blob_map;
 mod build_paging_buffer;
 mod create_allocation;
 mod display;
@@ -13,6 +14,7 @@ mod start_device;
 mod submit_command;
 
 pub use add_device::dxgkddi_add_device;
+pub use blob_map::unmap_io_pages_from_user;
 pub use build_paging_buffer::{
     dxgkddi_build_paging_buffer, dxgkddi_get_root_page_table_size, dxgkddi_set_root_page_table,
 };

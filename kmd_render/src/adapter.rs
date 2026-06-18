@@ -32,6 +32,11 @@ pub struct AdapterContext {
     /// The virtio-gpu transport, brought up in `DxgkDdiStartDevice` (Phase 2).
     /// Guarded by `virtio_lock`; `None` until StartDevice (and after StopDevice).
     virtio: UnsafeCell<Option<VirtioGpu>>,
+    /// Live host-visible blob → user-VA mappings (Gate 5a Stage 2b). Tagged by the
+    /// owning D3D device handle (`DXGKARG_ESCAPE.hDevice`); `DxgkDdiDestroyDevice`
+    /// drains and unmaps them. Has its own spinlock, independent of `virtio_lock`,
+    /// so teardown works even after the transport is gone.
+    pub mappings: crate::mapping::MappingTable,
 }
 
 // SAFETY: `dxgkrnl` is written only during the device-lifecycle DDIs, which
@@ -50,6 +55,7 @@ impl AdapterContext {
             last_completed_fence: AtomicU32::new(0),
             virtio_lock: UnsafeCell::new(0),
             virtio: UnsafeCell::new(None),
+            mappings: crate::mapping::MappingTable::new(),
         })
     }
 

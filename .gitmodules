@@ -4,3 +4,9 @@
 [submodule "LookingGlass"]
 	path = LookingGlass
 	url = https://github.com/gnif/LookingGlass
+[submodule "dxvk-helios"]
+	path = dxvk-helios
+	url = https://github.com/rupansh/dxvk
+[submodule "vkd3d-proton-helios"]
+	path = vkd3d-proton-helios
+	url = https://github.com/rupansh/vkd3d-proton

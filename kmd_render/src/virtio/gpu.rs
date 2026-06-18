@@ -14,6 +14,7 @@
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU32, Ordering};
 
+use alloc::vec::Vec;
 use bytemuck::Zeroable;
 use helios_protocol::{
     resp_is_ok, VirtioGpuCmdSubmit, VirtioGpuCtrlHdr, VirtioGpuCtxCreate, VirtioGpuCtxDestroy,
@@ -146,6 +147,64 @@ fn scan_host_visible_window(access: &DxgkConfigAccess) -> Option<HostVisibleWind
     None
 }
 
+// ── Host-visible blob mapping (Gate 5a Stage 2b, venus-over-Escape) ──────────
+// Ported (synchronous variant) from the proven System-class `kmd/src/virtio/gpu.rs`.
+// The venus ICD allocates HOST3D blobs (ALLOC_BLOB) and maps them into its address
+// space (MAP_BLOB) over `DxgkDdiEscape`; the KMD picks a window offset, issues
+// `RESOURCE_MAP_BLOB`, and the Escape handler maps `host_visible.base + offset`
+// into the calling process with `MmMapLockedPagesSpecifyCache` — the zero-copy BAR
+// model (no WDDM memory segment / GpuMmu; see GATE5_STAGE2_ALLOC_DESIGN.md).
+
+/// Page granularity for blob window offsets/sizes.
+const BLOB_PAGE: u64 = 4096;
+/// Max concurrently-tracked blobs. Generous for bring-up; table-full → alloc fails.
+const MAX_BLOBS: usize = 256;
+/// Max coalescing free ranges in the window allocator's free list.
+const MAX_WINDOW_RANGES: usize = 64;
+/// Per-map size cap (also bounds the `IoAllocateMdl` ULONG length on the caller).
+const MAX_BLOB_MAP_BYTES: u64 = 256 << 20;
+
+/// Round `n` up to the next [`BLOB_PAGE`] multiple (saturating).
+const fn round_up_page(n: u64) -> u64 {
+    n.saturating_add(BLOB_PAGE - 1) & !(BLOB_PAGE - 1)
+}
+
+/// Result of the under-lock phase of MAP_BLOB ([`VirtioGpu::map_blob_prepare`]): the
+/// guest-physical range to map and the host's requested caching. The user-space
+/// mapping (MDL + `MmMapLockedPagesSpecifyCache`) is built by the Escape handler at
+/// PASSIVE_LEVEL, OUTSIDE the virtio spinlock.
+#[derive(Clone, Copy)]
+pub struct BlobMapPrep {
+    /// Guest-physical base of the resource's mapping inside the host-visible window.
+    pub gpa: u64,
+    /// Page-rounded length to map, in bytes.
+    pub size: u64,
+    /// Host caching nibble (`VIRTIO_GPU_MAP_CACHE_*`) from `RESP_OK_MAP_INFO`.
+    pub map_cache: u32,
+}
+
+/// One tracked blob resource.
+#[derive(Clone, Copy)]
+struct BlobSlot {
+    ctx_id: u32,
+    resource_id: u32,
+    /// Blob size in bytes (from ALLOC_BLOB; MAP_BLOB needs it to size the MDL).
+    size: u64,
+    /// RESOURCE_MAP_BLOB succeeded and must be paired with RESOURCE_UNMAP_BLOB.
+    mapped: bool,
+    /// Host-visible window offset used for RESOURCE_MAP_BLOB.
+    map_offset: u64,
+    /// Rounded mapped length in the host-visible window.
+    map_len: u64,
+}
+
+/// A free span in the host-visible window's offset space (bump + coalescing free).
+#[derive(Clone, Copy)]
+struct WindowRange {
+    offset: u64,
+    len: u64,
+}
+
 /// An initialized virtio-gpu transport.
 pub struct VirtioGpu {
     /// The virtio-modern PCI transport (owns the mapped cfg-region VAs).
@@ -164,6 +223,13 @@ pub struct VirtioGpu {
     /// in `init`. `None` if the device exposes no host-visible window — the WDDM
     /// blob-map path is then unavailable (Stage 2 fails honestly). Gate 5a Stage 2.
     host_visible: Option<HostVisibleWindow>,
+    /// Tracked blobs (resource_id → size/mapping state). Heap-reserved to MAX_BLOBS
+    /// at init so `push` under the spinlock never reallocates (the 0x7F lesson).
+    blobs: Vec<BlobSlot>,
+    /// Bump high-water for the host-visible window offset allocator.
+    next_window_offset: u64,
+    /// Coalescing free list for released window ranges (bounded by MAX_WINDOW_RANGES).
+    free_window_ranges: Vec<WindowRange>,
 }
 
 impl VirtioGpu {
@@ -272,6 +338,9 @@ impl VirtioGpu {
             next_ctx_id: AtomicU32::new(1),
             next_resource_id: AtomicU32::new(1),
             host_visible,
+            blobs: Vec::with_capacity(MAX_BLOBS),
+            next_window_offset: 0,
+            free_window_ranges: Vec::with_capacity(MAX_WINDOW_RANGES),
         };
 
         // Gate-2 bring-up validation (diagnostic; runs at PASSIVE_LEVEL from
@@ -416,6 +485,152 @@ impl VirtioGpu {
         self.ctrl_roundtrip(bytemuck::bytes_of(&cmd))?;
         self.ctx_attach_resource(ctx_id, resource_id)?;
         Ok(resource_id)
+    }
+
+    /// `HELIOS_ESCAPE_ALLOC_BLOB` — create a HOST3D blob (create + ctx-attach) and
+    /// record its size so a later MAP_BLOB can size the MDL. Returns the resource id.
+    pub fn alloc_blob(
+        &mut self,
+        ctx_id: u32,
+        blob_mem: u32,
+        blob_flags: u32,
+        blob_id: u64,
+        size: u64,
+    ) -> Result<u32, VirtioError> {
+        if size == 0 {
+            return Err(VirtioError::DeviceError);
+        }
+        if self.blobs.len() >= MAX_BLOBS {
+            return Err(VirtioError::OutOfMemory);
+        }
+        let resource_id = self.resource_create_blob(ctx_id, blob_mem, blob_flags, blob_id, size)?;
+        // `push` stays within the reserved capacity (no realloc under the lock).
+        self.blobs.push(BlobSlot {
+            ctx_id,
+            resource_id,
+            size,
+            mapped: false,
+            map_offset: 0,
+            map_len: 0,
+        });
+        Ok(resource_id)
+    }
+
+    /// `HELIOS_ESCAPE_MAP_BLOB` under-lock phase: pick a window offset, issue
+    /// `RESOURCE_MAP_BLOB`, and return the guest-physical range + host caching for the
+    /// caller to map into user space (PASSIVE, outside the lock). The guest chooses
+    /// the window offset, so VidMm is never involved — the host backs exactly the
+    /// `host_visible.base + offset` range we report back.
+    pub fn map_blob_prepare(&mut self, resource_id: u32) -> Result<BlobMapPrep, VirtioError> {
+        let window = self.host_visible.ok_or(VirtioError::DeviceError)?;
+        let size = self
+            .blobs
+            .iter()
+            .find(|s| s.resource_id == resource_id)
+            .map(|s| s.size)
+            .ok_or(VirtioError::DeviceError)?;
+        let map_len = round_up_page(size);
+        if map_len == 0 || map_len > MAX_BLOB_MAP_BYTES {
+            return Err(VirtioError::DeviceError);
+        }
+        let offset = self.alloc_window_range(map_len, window.len)?;
+
+        // Host round-trip before recording the blob as mapped; on rejection return
+        // the reserved window range for later reuse.
+        let map_cache = match self.resource_map_blob(resource_id, offset) {
+            Ok(c) => c,
+            Err(e) => {
+                self.free_window_range(offset, map_len);
+                return Err(e);
+            }
+        };
+
+        if let Some(slot) = self.blobs.iter_mut().find(|s| s.resource_id == resource_id) {
+            slot.mapped = true;
+            slot.map_offset = offset;
+            slot.map_len = map_len;
+        }
+        Ok(BlobMapPrep {
+            gpa: window.base + offset,
+            size: map_len,
+            map_cache,
+        })
+    }
+
+    /// `HELIOS_ESCAPE_RELEASE_BLOB` — unmap (if mapped) + detach + unref a blob and
+    /// drop its tracking slot, returning its window range to the free list.
+    pub fn release_blob(&mut self, ctx_id: u32, resource_id: u32) -> Result<(), VirtioError> {
+        let Some(idx) = self
+            .blobs
+            .iter()
+            .position(|s| s.ctx_id == ctx_id && s.resource_id == resource_id)
+        else {
+            return Ok(());
+        };
+        let slot = self.blobs.swap_remove(idx);
+        if slot.mapped {
+            let _ = self.resource_unmap_blob(slot.resource_id);
+            self.free_window_range(slot.map_offset, slot.map_len);
+        }
+        let _ = self.ctx_detach_resource(slot.ctx_id, slot.resource_id);
+        self.resource_unref(slot.resource_id)
+    }
+
+    /// Allocate a page-rounded `len`-byte range in the host-visible window: reuse a
+    /// free range if one fits, else bump the high-water mark (bounded by `window_len`).
+    fn alloc_window_range(&mut self, len: u64, window_len: u64) -> Result<u64, VirtioError> {
+        if let Some(idx) = self.free_window_ranges.iter().position(|r| r.len >= len) {
+            let offset = self.free_window_ranges[idx].offset;
+            if self.free_window_ranges[idx].len == len {
+                self.free_window_ranges.swap_remove(idx);
+            } else {
+                self.free_window_ranges[idx].offset += len;
+                self.free_window_ranges[idx].len -= len;
+            }
+            return Ok(offset);
+        }
+        let offset = self.next_window_offset;
+        let end = offset.checked_add(len).ok_or(VirtioError::OutOfMemory)?;
+        if end > window_len {
+            return Err(VirtioError::OutOfMemory);
+        }
+        self.next_window_offset = end;
+        Ok(offset)
+    }
+
+    /// Return a window range to the allocator: drop the high-water mark if it abuts,
+    /// else coalesce into an adjacent free range, else record a new free range (or
+    /// silently leak if the bounded free list is full — bring-up acceptable).
+    fn free_window_range(&mut self, offset: u64, len: u64) {
+        if len == 0 {
+            return;
+        }
+        if offset.checked_add(len) == Some(self.next_window_offset) {
+            self.next_window_offset = offset;
+            while let Some(idx) = self
+                .free_window_ranges
+                .iter()
+                .position(|r| r.offset.checked_add(r.len) == Some(self.next_window_offset))
+            {
+                let r = self.free_window_ranges.swap_remove(idx);
+                self.next_window_offset = r.offset;
+            }
+            return;
+        }
+        for range in &mut self.free_window_ranges {
+            if range.offset.checked_add(range.len) == Some(offset) {
+                range.len += len;
+                return;
+            }
+            if offset.checked_add(len) == Some(range.offset) {
+                range.offset = offset;
+                range.len += len;
+                return;
+            }
+        }
+        if self.free_window_ranges.len() < MAX_WINDOW_RANGES {
+            self.free_window_ranges.push(WindowRange { offset, len });
+        }
     }
 
     /// Bind a resource to its 3D context (`VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE`).
