@@ -13,8 +13,15 @@ pub mod ffi {
     unsafe extern "C++" {
         include!("dxvk_bridge.h");
 
-        /// Opaque holder for the DXVK instance + adapter + device.
+        /// Opaque holder for the DXVK instance + adapter + device + the DXVK
+        /// D3D11 COM device the DDI forwards to.
         type HeliosDxvkDevice;
+
+        /// Raw `ID3D11Device*` / `ID3D11DeviceContext*` (as usize) the DDI
+        /// device-funcs forward to. 0 if not created. Borrowed — the bridge keeps
+        /// the owning ref; wrap on the Rust side without taking ownership.
+        fn d3d11_device_ptr(self: &HeliosDxvkDevice) -> usize;
+        fn d3d11_context_ptr(self: &HeliosDxvkDevice) -> usize;
 
         /// Create a DXVK instance and logical device on the Helios venus adapter.
         ///

@@ -147,10 +147,35 @@ pub extern "system" fn helios_umd_selftest() -> i32 {
     let dev = bridge::ffi::helios_dxvk_create_device(0, 0);
     let bridge_ok = !dev.is_null();
     log_line(&format!("helios_umd_selftest: bridge ok={bridge_ok}"));
-    drop(dev);
     if !bridge_ok {
         return 1;
     }
+
+    // Prove the windows-crate COM bindings call straight into DXVK's ID3D11Device
+    // (the foundation for the pure-Rust DDI forwarders): create a real buffer.
+    {
+        use windows::Win32::Graphics::Direct3D11::*;
+        let dev_ptr = dev.d3d11_device_ptr();
+        log_line(&format!("helios_umd_selftest: ID3D11Device* = 0x{dev_ptr:x}"));
+        if dev_ptr != 0 {
+            let device = core::mem::ManuallyDrop::new(unsafe {
+                <ID3D11Device as windows::core::Interface>::from_raw(dev_ptr as *mut _)
+            });
+            let desc = D3D11_BUFFER_DESC {
+                ByteWidth: 256,
+                Usage: D3D11_USAGE_DEFAULT,
+                BindFlags: D3D11_BIND_VERTEX_BUFFER.0 as u32,
+                ..Default::default()
+            };
+            let mut buffer: Option<ID3D11Buffer> = None;
+            let hr = unsafe { device.CreateBuffer(&desc, None, Some(&mut buffer)) };
+            log_line(&format!(
+                "helios_umd_selftest: windows-crate CreateBuffer -> {hr:?}, buffer_some={}",
+                buffer.is_some()
+            ));
+        }
+    }
+    drop(dev);
 
     // Exercise the full CreateDevice path in-process with synthesized runtime
     // buffers (no D3D runtime / DWM): proves CalcPrivateDeviceSize + CreateDevice

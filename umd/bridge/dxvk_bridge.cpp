@@ -99,6 +99,13 @@ struct HeliosDxvkDeviceImpl {
 HeliosDxvkDevice::HeliosDxvkDevice() noexcept = default;
 HeliosDxvkDevice::~HeliosDxvkDevice() = default;
 
+std::size_t HeliosDxvkDevice::d3d11_device_ptr() const {
+  return impl ? reinterpret_cast<std::size_t>(impl->d3d11) : 0;
+}
+std::size_t HeliosDxvkDevice::d3d11_context_ptr() const {
+  return impl ? reinterpret_cast<std::size_t>(impl->context) : 0;
+}
+
 std::unique_ptr<HeliosDxvkDevice> helios_dxvk_create_device(
     std::uint32_t luid_low,
     std::int32_t  luid_high) {

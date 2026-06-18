@@ -22,6 +22,10 @@ struct HeliosDxvkDevice {
   HeliosDxvkDevice& operator=(const HeliosDxvkDevice&) = delete;
 
   std::unique_ptr<HeliosDxvkDeviceImpl> impl;
+
+  // Raw ID3D11Device* / ID3D11DeviceContext* (as size_t) for the DDI forwarders.
+  std::size_t d3d11_device_ptr() const;
+  std::size_t d3d11_context_ptr() const;
 };
 
 // Create a DXVK instance + logical device on the Helios venus adapter.
