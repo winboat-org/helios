@@ -1,5 +1,20 @@
 # Gate 5b — a WDDM D3D11 UMD on Helios (reusing DXVK's engine)
 
+> **★ IMPLEMENTATION UPDATE (2026-06-18) — UMD is Rust + cxx, NOT a C++ `umd11.dll`.**
+> Per the owner's direction the UMD is the **existing Rust `umd/` crate
+> (`helios_umd.dll`)** bridged to DXVK's C++ engine via
+> [cxx](https://github.com/dtolnay/cxx) — not a separately-written C++ `umd11.dll`.
+> The "link not fork" / "reuse `src/dxvk` + dxbc-spirv under our DDI frontend"
+> design below is unchanged; only the frontend language (Rust) and the C++ interop
+> mechanism (cxx) differ. **VALIDATED LIVE:** DXVK builds under clang-cl (MSVC ABI,
+> `/MD`), links into the Rust DLL, and a temp `helios_umd_selftest` export brings up
+> a `DxvkDevice` on the venus adapter (D3DKMTEscape `CTX_CREATE` fires). The exact
+> build recipe + cxx gotchas (pimpl, `/EHsc`, `Logger::s_instance`, the
+> `ssize_t`/libdisplay-info shim, MS-COFF `.a` archives) are in the
+> `gate5b-dxvk-cxx-bridge` memory. Read that for current state; §6 below is the
+> original plan. Files: `umd/build.rs`, `umd/src/bridge.rs`,
+> `umd/bridge/dxvk_bridge.{h,cpp}`, `umd/build-support/dxvk_c_compat.h`.
+
 > Status: design/research, 2026-06-18. Prereq: **Gate 5a DONE** — the venus Vulkan
 > stack works on the `kmd_render` WDDM render adapter over `D3DKMTEscape`
 > (`vulkaninfo` enumerates `Virtio-GPU Venus (NVIDIA RTX PRO 6000 Blackwell)`,

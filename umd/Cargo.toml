@@ -1,0 +1,23 @@
+[package]
+name = "helios_umd"
+version = "0.1.0"
+edition = "2021"
+description = "Helios vGPU WDDM user-mode display driver bring-up DLL."
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+cxx = "1"
+
+[build-dependencies]
+cxx-build = "1"
+
+[profile.dev]
+panic = "abort"
+opt-level = 1
+
+[profile.release]
+panic = "abort"
+lto = "thin"
+opt-level = 2
