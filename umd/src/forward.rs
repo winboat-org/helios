@@ -1077,6 +1077,69 @@ pub unsafe fn selftest_triangle(h: Hdevice) -> i32 {
     result
 }
 
+/// Diagnostic: create an immutable constant buffer with known content, copy it
+/// to a staging buffer, and read it back. Tells us whether buffer-content upload
+/// works (red back) or not (zero back) — independent of shader binding.
+pub unsafe fn selftest_cb_readback(h: Hdevice) -> i32 {
+    let red: [f32; 4] = [1.0, 0.25, 0.5, 1.0];
+    let mip = ddi::D3D10DDI_MIPINFO {
+        TexelWidth: 16,
+        ..Default::default()
+    };
+    let init = ddi::D3D10_DDIARG_SUBRESOURCE_UP {
+        pSysMem: red.as_ptr() as *mut c_void,
+        SysMemPitch: 16,
+        SysMemSlicePitch: 16,
+    };
+    let mut cb = ddi::D3D11DDIARG_CREATERESOURCE::default();
+    cb.pMipInfoList = &mip;
+    cb.pInitialDataUP = &init;
+    cb.ResourceDimension = RES_BUFFER;
+    cb.Usage = 1; // IMMUTABLE
+    cb.BindFlags = D3D11_BIND_CONSTANT_BUFFER.0 as u32;
+    cb.MipLevels = 1;
+    cb.ArraySize = 1;
+    let mut cb_priv = 0u64;
+    let h_cb = ddi::D3D10DDI_HRESOURCE {
+        pDrvPrivate: &mut cb_priv as *mut u64 as *mut c_void,
+    };
+    create_resource(h, &cb, h_cb, Default::default());
+
+    let mut st = ddi::D3D11DDIARG_CREATERESOURCE::default();
+    st.pMipInfoList = &mip;
+    st.ResourceDimension = RES_BUFFER;
+    st.Usage = 3; // STAGING
+    st.BindFlags = 0;
+    st.MipLevels = 1;
+    st.ArraySize = 1;
+    let mut st_priv = 0u64;
+    let h_st = ddi::D3D10DDI_HRESOURCE {
+        pDrvPrivate: &mut st_priv as *mut u64 as *mut c_void,
+    };
+    create_resource(h, &st, h_st, Default::default());
+    if cb_priv == 0 || st_priv == 0 {
+        log_line(&format!("cb_readback: create failed cb={cb_priv:#x} st={st_priv:#x}"));
+        return 1;
+    }
+    resource_copy(h, h_st, h_cb);
+    flush(h);
+    let mut mapped = ddi::D3D10DDI_MAPPED_SUBRESOURCE::default();
+    resource_map(h, h_st, 0, 1, 0, &mut mapped);
+    if mapped.pData.is_null() {
+        log_line("cb_readback: map failed");
+        return 2;
+    }
+    let f = mapped.pData as *const f32;
+    log_line(&format!(
+        "cb_readback: floats = {} {} {} {} (want 1 0.25 0.5 1)",
+        *f, *f.add(1), *f.add(2), *f.add(3)
+    ));
+    resource_unmap(h, h_st, 0);
+    destroy_resource(h, h_st);
+    destroy_resource(h, h_cb);
+    0
+}
+
 /// Install the implemented forwarders into the device-funcs table (over the
 /// stub fill). Uses the real bindgen PFN field types — no transmute.
 pub unsafe fn install(funcs: *mut ddi::D3D11DDI_DEVICEFUNCS) {
