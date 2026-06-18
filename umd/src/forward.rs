@@ -616,6 +616,183 @@ unsafe extern "C" fn set_depth_stencil_state(
 unsafe extern "C" fn destroy_raster_state(_h: Hdevice, h_state: ddi::D3D10DDI_HRASTERIZERSTATE) {
     release_com(h_state.pDrvPrivate);
 }
+
+// --- Shader resource views, samplers, constant buffers ----------------------
+
+unsafe extern "C" fn calc_size_srv(
+    _h: Hdevice,
+    _a: *const ddi::D3D11DDIARG_CREATESHADERRESOURCEVIEW,
+) -> u64 {
+    8
+}
+
+unsafe extern "C" fn create_srv(
+    h: Hdevice,
+    arg: *const ddi::D3D11DDIARG_CREATESHADERRESOURCEVIEW,
+    h_srv: ddi::D3D10DDI_HSHADERRESOURCEVIEW,
+    _hrt: ddi::D3D10DDI_HRTSHADERRESOURCEVIEW,
+) {
+    let Some(device) = d3d11_device(h) else {
+        return;
+    };
+    let a = &*arg;
+    let Some(res) = load_com::<ID3D11Resource>(a.hDrvResource.pDrvPrivate) else {
+        return;
+    };
+    let mut srv: Option<ID3D11ShaderResourceView> = None;
+    match device.CreateShaderResourceView(&*res, None, Some(&mut srv)) {
+        Ok(()) => {
+            if let Some(v) = srv {
+                store_com(h_srv.pDrvPrivate, v);
+            }
+        }
+        Err(e) => log_line(&format!("DDI create_srv failed: {e:?}")),
+    }
+}
+
+unsafe extern "C" fn destroy_srv(_h: Hdevice, h_srv: ddi::D3D10DDI_HSHADERRESOURCEVIEW) {
+    release_com(h_srv.pDrvPrivate);
+}
+
+unsafe extern "C" fn calc_size_sampler(_h: Hdevice, _d: *const ddi::D3D10_DDI_SAMPLER_DESC) -> u64 {
+    8
+}
+
+unsafe extern "C" fn create_sampler(
+    h: Hdevice,
+    desc: *const ddi::D3D10_DDI_SAMPLER_DESC,
+    h_sampler: ddi::D3D10DDI_HSAMPLER,
+    _hrt: ddi::D3D10DDI_HRTSAMPLER,
+) {
+    let Some(device) = d3d11_device(h) else {
+        return;
+    };
+    let d = &*desc;
+    let sd = D3D11_SAMPLER_DESC {
+        Filter: D3D11_FILTER(d.Filter),
+        AddressU: D3D11_TEXTURE_ADDRESS_MODE(d.AddressU),
+        AddressV: D3D11_TEXTURE_ADDRESS_MODE(d.AddressV),
+        AddressW: D3D11_TEXTURE_ADDRESS_MODE(d.AddressW),
+        MipLODBias: d.MipLODBias,
+        MaxAnisotropy: d.MaxAnisotropy,
+        ComparisonFunc: D3D11_COMPARISON_FUNC(d.ComparisonFunc),
+        BorderColor: d.BorderColor,
+        MinLOD: d.MinLOD,
+        MaxLOD: d.MaxLOD,
+    };
+    let mut s: Option<ID3D11SamplerState> = None;
+    if device.CreateSamplerState(&sd, Some(&mut s)).is_ok() {
+        if let Some(o) = s {
+            store_com(h_sampler.pDrvPrivate, o);
+        }
+    }
+}
+
+unsafe extern "C" fn destroy_sampler(_h: Hdevice, h_sampler: ddi::D3D10DDI_HSAMPLER) {
+    release_com(h_sampler.pDrvPrivate);
+}
+
+unsafe fn collect_buffers(start: u32, num: u32, h: *const ddi::D3D10DDI_HRESOURCE) -> Vec<Option<ID3D11Buffer>> {
+    let _ = start;
+    let mut v = Vec::with_capacity(num as usize);
+    for i in 0..num as usize {
+        let p = (*h.add(i)).pDrvPrivate;
+        v.push(load_com::<ID3D11Resource>(p).and_then(|r| (*r).cast::<ID3D11Buffer>().ok()));
+    }
+    v
+}
+unsafe fn collect_srvs(num: u32, h: *const ddi::D3D10DDI_HSHADERRESOURCEVIEW) -> Vec<Option<ID3D11ShaderResourceView>> {
+    let mut v = Vec::with_capacity(num as usize);
+    for i in 0..num as usize {
+        let p = (*h.add(i)).pDrvPrivate;
+        v.push(load_com::<ID3D11ShaderResourceView>(p).map(|m| (*m).clone()));
+    }
+    v
+}
+unsafe fn collect_samplers(num: u32, h: *const ddi::D3D10DDI_HSAMPLER) -> Vec<Option<ID3D11SamplerState>> {
+    let mut v = Vec::with_capacity(num as usize);
+    for i in 0..num as usize {
+        let p = (*h.add(i)).pDrvPrivate;
+        v.push(load_com::<ID3D11SamplerState>(p).map(|m| (*m).clone()));
+    }
+    v
+}
+
+unsafe extern "C" fn ps_set_constant_buffers(h: Hdevice, start: u32, num: u32, bufs: *const ddi::D3D10DDI_HRESOURCE) {
+    if let Some(c) = d3d11_context(h) {
+        c.PSSetConstantBuffers(start, Some(&collect_buffers(start, num, bufs)));
+    }
+}
+unsafe extern "C" fn vs_set_constant_buffers(h: Hdevice, start: u32, num: u32, bufs: *const ddi::D3D10DDI_HRESOURCE) {
+    if let Some(c) = d3d11_context(h) {
+        c.VSSetConstantBuffers(start, Some(&collect_buffers(start, num, bufs)));
+    }
+}
+unsafe extern "C" fn ps_set_shader_resources(h: Hdevice, start: u32, num: u32, srvs: *const ddi::D3D10DDI_HSHADERRESOURCEVIEW) {
+    if let Some(c) = d3d11_context(h) {
+        c.PSSetShaderResources(start, Some(&collect_srvs(num, srvs)));
+    }
+}
+unsafe extern "C" fn vs_set_shader_resources(h: Hdevice, start: u32, num: u32, srvs: *const ddi::D3D10DDI_HSHADERRESOURCEVIEW) {
+    if let Some(c) = d3d11_context(h) {
+        c.VSSetShaderResources(start, Some(&collect_srvs(num, srvs)));
+    }
+}
+unsafe extern "C" fn ps_set_samplers(h: Hdevice, start: u32, num: u32, samplers: *const ddi::D3D10DDI_HSAMPLER) {
+    if let Some(c) = d3d11_context(h) {
+        c.PSSetSamplers(start, Some(&collect_samplers(num, samplers)));
+    }
+}
+unsafe extern "C" fn vs_set_samplers(h: Hdevice, start: u32, num: u32, samplers: *const ddi::D3D10DDI_HSAMPLER) {
+    if let Some(c) = d3d11_context(h) {
+        c.VSSetSamplers(start, Some(&collect_samplers(num, samplers)));
+    }
+}
+
+unsafe extern "C" fn resource_update_subresource(
+    h: Hdevice,
+    h_res: ddi::D3D10DDI_HRESOURCE,
+    subresource: u32,
+    box_: *const ddi::D3D10_DDI_BOX,
+    data: *const c_void,
+    row_pitch: u32,
+    depth_pitch: u32,
+) {
+    let Some(context) = d3d11_context(h) else {
+        return;
+    };
+    let Some(res) = load_com::<ID3D11Resource>(h_res.pDrvPrivate) else {
+        return;
+    };
+    let bx;
+    let bx_ptr = if box_.is_null() {
+        None
+    } else {
+        let b = &*box_;
+        bx = D3D11_BOX {
+            left: b.left as u32,
+            top: b.top as u32,
+            front: b.front as u32,
+            right: b.right as u32,
+            bottom: b.bottom as u32,
+            back: b.back as u32,
+        };
+        Some(&bx as *const D3D11_BOX)
+    };
+    context.UpdateSubresource(&*res, subresource, bx_ptr, data, row_pitch, depth_pitch);
+}
+
+unsafe extern "C" fn check_format_support(h: Hdevice, fmt: ddi::DXGI_FORMAT, out: *mut u32) {
+    let mut caps: u32 = 0;
+    if let Some(device) = d3d11_device(h) {
+        if let Ok(c) = device.CheckFormatSupport(DXGI_FORMAT(fmt as i32)) {
+            caps = c;
+        }
+    }
+    if !out.is_null() {
+        *out = caps;
+    }
+}
 unsafe extern "C" fn destroy_depth_state(_h: Hdevice, h_state: ddi::D3D10DDI_HDEPTHSTENCILSTATE) {
     release_com(h_state.pDrvPrivate);
 }
@@ -938,4 +1115,21 @@ pub unsafe fn install(funcs: *mut ddi::D3D11DDI_DEVICEFUNCS) {
     f.pfnCreateDepthStencilState = Some(create_depth_stencil_state);
     f.pfnSetDepthStencilState = Some(set_depth_stencil_state);
     f.pfnDestroyDepthStencilState = Some(destroy_depth_state);
+
+    // SRVs, samplers, constant buffers, updates, format support.
+    f.pfnCalcPrivateShaderResourceViewSize = Some(calc_size_srv);
+    f.pfnCreateShaderResourceView = Some(create_srv);
+    f.pfnDestroyShaderResourceView = Some(destroy_srv);
+    f.pfnCalcPrivateSamplerSize = Some(calc_size_sampler);
+    f.pfnCreateSampler = Some(create_sampler);
+    f.pfnDestroySampler = Some(destroy_sampler);
+    f.pfnPsSetConstantBuffers = Some(ps_set_constant_buffers);
+    f.pfnVsSetConstantBuffers = Some(vs_set_constant_buffers);
+    f.pfnPsSetShaderResources = Some(ps_set_shader_resources);
+    f.pfnVsSetShaderResources = Some(vs_set_shader_resources);
+    f.pfnPsSetSamplers = Some(ps_set_samplers);
+    f.pfnVsSetSamplers = Some(vs_set_samplers);
+    f.pfnResourceUpdateSubresourceUP = Some(resource_update_subresource);
+    f.pfnDefaultConstantBufferUpdateSubresourceUP = Some(resource_update_subresource);
+    f.pfnCheckFormatSupport = Some(check_format_support);
 }
