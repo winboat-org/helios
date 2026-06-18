@@ -149,9 +149,14 @@ fn main() {
     }
 
     // System libraries DXVK's engine/WSI depend on.
+    // NOTE: deliberately NOT linking system dxgi. A WDDM UMD sits below DXGI and
+    // implements the DXGI DDI; it must not depend on dxgi.dll. DXVK's only
+    // dxgi.dll call (CreateDXGIFactory1) is in d3d11_main.cpp's exported d3d11.dll
+    // entry points, which we never reference (we build D3D11DXGIDevice directly),
+    // so that object is never pulled out of the static archive.
     for lib in [
         "setupapi", "gdi32", "user32", "ole32", "oleaut32", "version", "advapi32",
-        "shell32", "cfgmgr32", "dxgi",
+        "shell32", "cfgmgr32",
     ] {
         println!("cargo:rustc-link-lib=dylib={lib}");
     }
