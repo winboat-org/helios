@@ -113,6 +113,8 @@ fn main() {
         .include("bridge")
         .include(format!(r"{dxvk_src}\src"))
         .include(format!(r"{dxvk_src}\src\dxvk"))
+        .include(format!(r"{dxvk_src}\src\d3d11"))
+        .include(format!(r"{dxvk_src}\subprojects\dxbc-spirv"))
         .include(format!(r"{dxvk_src}\include"))
         .include(format!(r"{dxvk_src}\include\vulkan\include"))
         .include(format!(r"{dxvk_src}\include\spirv\include"))
@@ -130,6 +132,9 @@ fn main() {
     // name, so we pass full paths as link args rather than relying on Rust's
     // `static=NAME` -> `NAME.lib` name resolution.
     let libs = [
+        // DXVK's full D3D11 COM implementation (must precede libdxvk so its
+        // engine references resolve against the dxvk archive).
+        format!(r"{dxvk_build}\src\d3d11\libhelios_d3d11_static.a"),
         format!(r"{dxvk_build}\src\dxvk\libdxvk.a"),
         format!(r"{dxvk_build}\subprojects\dxbc-spirv\libdxbc_spv.a"),
         format!(r"{dxvk_build}\src\spirv\libspirv.a"),
@@ -146,7 +151,7 @@ fn main() {
     // System libraries DXVK's engine/WSI depend on.
     for lib in [
         "setupapi", "gdi32", "user32", "ole32", "oleaut32", "version", "advapi32",
-        "shell32", "cfgmgr32",
+        "shell32", "cfgmgr32", "dxgi",
     ] {
         println!("cargo:rustc-link-lib=dylib={lib}");
     }
