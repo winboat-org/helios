@@ -10,6 +10,7 @@ use core::ffi::c_void;
 use std::io::Write;
 
 mod bridge;
+mod ddi;
 
 type Hresult = i32;
 
