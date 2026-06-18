@@ -38,6 +38,17 @@ unsafe fn d3d11_device(h: Hdevice) -> Option<ManuallyDrop<ID3D11Device>> {
     Some(ManuallyDrop::new(ID3D11Device::from_raw(p as *mut c_void)))
 }
 
+/// Borrow the `HeliosDevice` behind a device handle (for the deferred
+/// input-assembler state). Does not take ownership.
+unsafe fn helios_device<'a>(h: Hdevice) -> Option<&'a HeliosDevice> {
+    let hd = h.pDrvPrivate as *const HeliosDevice;
+    if hd.is_null() {
+        None
+    } else {
+        Some(&*hd)
+    }
+}
+
 unsafe fn d3d11_context(h: Hdevice) -> Option<ManuallyDrop<ID3D11DeviceContext>> {
     let hd = h.pDrvPrivate as *const HeliosDevice;
     if hd.is_null() {
@@ -378,6 +389,12 @@ unsafe extern "C" fn create_vertex_shader(
         Ok(()) => {
             if let Some(s) = vs {
                 store_com(h_shader.pDrvPrivate, s);
+                // Keep the bytecode so input layouts can be created lazily (the
+                // ISGN supplies the semantic names CreateInputLayout requires).
+                let com = *(h_shader.pDrvPrivate as *const usize);
+                if let Some(dev) = helios_device(h) {
+                    dev.ia.borrow_mut().vs_bytecode.insert(com, bytes.to_vec());
+                }
             }
         }
         Err(e) => log_line(&format!("DDI create_vertex_shader failed: {e:?}")),
@@ -411,6 +428,14 @@ unsafe extern "C" fn destroy_shader(_h: Hdevice, h_shader: ddi::D3D10DDI_HSHADER
 }
 
 unsafe extern "C" fn vs_set_shader(h: Hdevice, h_shader: ddi::D3D10DDI_HSHADER) {
+    let com = if h_shader.pDrvPrivate.is_null() {
+        0
+    } else {
+        *(h_shader.pDrvPrivate as *const usize)
+    };
+    if let Some(dev) = helios_device(h) {
+        dev.ia.borrow_mut().current_vs = com;
+    }
     let Some(context) = d3d11_context(h) else {
         return;
     };
@@ -491,6 +516,7 @@ unsafe extern "C" fn ia_set_topology(h: Hdevice, topo: ddi::D3D10_DDI_PRIMITIVE_
 }
 
 unsafe extern "C" fn draw(h: Hdevice, vertex_count: u32, start_vertex: u32) {
+    bind_input_layout(h);
     if let Some(context) = d3d11_context(h) {
         context.Draw(vertex_count, start_vertex);
     }
@@ -502,6 +528,7 @@ unsafe extern "C" fn draw_indexed(
     start_index: u32,
     base_vertex: i32,
 ) {
+    bind_input_layout(h);
     if let Some(context) = d3d11_context(h) {
         context.DrawIndexed(index_count, start_index, base_vertex);
     }
@@ -1324,6 +1351,326 @@ pub unsafe fn selftest_triangle_cb(h: Hdevice) -> i32 {
     result
 }
 
+// --- Input layouts (lazy, via the VS input signature) -----------------------
+
+/// One d3d10umddi input element, kept until the bound VS is known (the DDI gives
+/// us the VS input *register*, not a semantic name, so we resolve names lazily).
+struct DdiInputElement {
+    input_slot: u32,
+    aligned_byte_offset: u32,
+    format: i32,
+    input_slot_class: u32,
+    instance_step_rate: u32,
+    input_register: u32,
+}
+
+/// Element-layout data, Box'd and stashed in the CreateElementLayout handle.
+struct LayoutData {
+    elements: Vec<DdiInputElement>,
+}
+
+/// Parse a vertex shader's DXBC `ISGN` (input signature) chunk and return the
+/// (semantic name, semantic index) of the element bound to input `register`.
+/// `ID3D11Device::CreateInputLayout` needs semantic names, but the DDI only
+/// passes the register index, so we recover the names from the shader bytecode.
+unsafe fn isgn_lookup(dxbc: &[u8], register: u32) -> Option<(std::ffi::CString, u32)> {
+    if dxbc.len() < 32 || &dxbc[0..4] != b"DXBC" {
+        return None;
+    }
+    let chunk_count = u32::from_le_bytes(dxbc[28..32].try_into().ok()?) as usize;
+    for i in 0..chunk_count {
+        let off_pos = 32 + i * 4;
+        if off_pos + 4 > dxbc.len() {
+            return None;
+        }
+        let coff = u32::from_le_bytes(dxbc[off_pos..off_pos + 4].try_into().ok()?) as usize;
+        if coff + 8 > dxbc.len() || &dxbc[coff..coff + 4] != b"ISGN" {
+            continue;
+        }
+        let data = coff + 8; // skip FourCC + chunk size
+        if data + 8 > dxbc.len() {
+            return None;
+        }
+        let elem_count = u32::from_le_bytes(dxbc[data..data + 4].try_into().ok()?) as usize;
+        for e in 0..elem_count {
+            let ep = data + 8 + e * 24;
+            if ep + 24 > dxbc.len() {
+                return None;
+            }
+            let name_off = u32::from_le_bytes(dxbc[ep..ep + 4].try_into().ok()?) as usize;
+            let sem_index = u32::from_le_bytes(dxbc[ep + 4..ep + 8].try_into().ok()?);
+            let reg = u32::from_le_bytes(dxbc[ep + 16..ep + 20].try_into().ok()?);
+            if reg == register {
+                let nstart = data + name_off;
+                let mut nend = nstart;
+                while nend < dxbc.len() && dxbc[nend] != 0 {
+                    nend += 1;
+                }
+                let name = std::ffi::CString::new(&dxbc[nstart..nend]).ok()?;
+                return Some((name, sem_index));
+            }
+        }
+        return None;
+    }
+    None
+}
+
+unsafe extern "C" fn calc_size_element_layout(
+    _h: Hdevice,
+    _a: *const ddi::D3D10DDIARG_CREATEELEMENTLAYOUT,
+) -> u64 {
+    8
+}
+
+unsafe extern "C" fn create_element_layout(
+    _h: Hdevice,
+    arg: *const ddi::D3D10DDIARG_CREATEELEMENTLAYOUT,
+    h_el: ddi::D3D10DDI_HELEMENTLAYOUT,
+    _hrt: ddi::D3D10DDI_HRTELEMENTLAYOUT,
+) {
+    let a = &*arg;
+    let mut elems = Vec::with_capacity(a.NumElements as usize);
+    for i in 0..a.NumElements as usize {
+        let e = &*a.pVertexElements.add(i);
+        elems.push(DdiInputElement {
+            input_slot: e.InputSlot,
+            aligned_byte_offset: e.AlignedByteOffset,
+            format: e.Format as i32,
+            input_slot_class: e.InputSlotClass as u32,
+            instance_step_rate: e.InstanceDataStepRate,
+            input_register: e.InputRegister,
+        });
+    }
+    let boxed = Box::new(LayoutData { elements: elems });
+    *(h_el.pDrvPrivate as *mut usize) = Box::into_raw(boxed) as usize;
+}
+
+unsafe extern "C" fn destroy_element_layout(_h: Hdevice, h_el: ddi::D3D10DDI_HELEMENTLAYOUT) {
+    if h_el.pDrvPrivate.is_null() {
+        return;
+    }
+    let p = *(h_el.pDrvPrivate as *const usize);
+    if p != 0 {
+        drop(Box::from_raw(p as *mut LayoutData));
+        *(h_el.pDrvPrivate as *mut usize) = 0;
+    }
+}
+
+unsafe extern "C" fn ia_set_input_layout(h: Hdevice, h_el: ddi::D3D10DDI_HELEMENTLAYOUT) {
+    if let Some(dev) = helios_device(h) {
+        let p = if h_el.pDrvPrivate.is_null() {
+            0
+        } else {
+            *(h_el.pDrvPrivate as *const usize)
+        };
+        dev.ia.borrow_mut().current_layout = p;
+    }
+}
+
+/// Lazily create + bind the `ID3D11InputLayout` for the current (element layout,
+/// VS) pair, resolving element semantic names from the VS input signature.
+unsafe fn bind_input_layout(h: Hdevice) {
+    let Some(dev) = helios_device(h) else {
+        return;
+    };
+    let (lp, vp) = {
+        let ia = dev.ia.borrow();
+        (ia.current_layout, ia.current_vs)
+    };
+    if lp == 0 || vp == 0 {
+        return;
+    }
+    let cached = dev.ia.borrow().layout_cache.get(&(lp, vp)).copied();
+    let il_raw = match cached {
+        Some(p) => p,
+        None => {
+            let bytecode = match dev.ia.borrow().vs_bytecode.get(&vp) {
+                Some(b) => b.clone(),
+                None => return,
+            };
+            let layout = &*(lp as *const LayoutData);
+            // Reserve so the CString store never reallocates (the descs below
+            // borrow raw pointers into it for the CreateInputLayout call).
+            let mut names: Vec<std::ffi::CString> = Vec::with_capacity(layout.elements.len());
+            let mut descs: Vec<D3D11_INPUT_ELEMENT_DESC> =
+                Vec::with_capacity(layout.elements.len());
+            for el in &layout.elements {
+                let Some((name, sem_index)) = isgn_lookup(&bytecode, el.input_register) else {
+                    continue;
+                };
+                names.push(name);
+                let name_ptr = names.last().unwrap().as_ptr() as *const u8;
+                descs.push(D3D11_INPUT_ELEMENT_DESC {
+                    SemanticName: PCSTR(name_ptr),
+                    SemanticIndex: sem_index,
+                    Format: DXGI_FORMAT(el.format),
+                    InputSlot: el.input_slot,
+                    AlignedByteOffset: el.aligned_byte_offset,
+                    InputSlotClass: D3D11_INPUT_CLASSIFICATION(el.input_slot_class as i32),
+                    InstanceDataStepRate: el.instance_step_rate,
+                });
+            }
+            if descs.is_empty() {
+                return;
+            }
+            let Some(device) = d3d11_device(h) else {
+                return;
+            };
+            let mut il: Option<ID3D11InputLayout> = None;
+            match device.CreateInputLayout(&descs, &bytecode, Some(&mut il)) {
+                Ok(()) => match il {
+                    Some(l) => {
+                        let raw = l.into_raw() as usize;
+                        dev.ia.borrow_mut().layout_cache.insert((lp, vp), raw);
+                        raw
+                    }
+                    None => return,
+                },
+                Err(e) => {
+                    log_line(&format!("CreateInputLayout failed: {e:?}"));
+                    return;
+                }
+            }
+        }
+    };
+    if let Some(context) = d3d11_context(h) {
+        let il = ManuallyDrop::new(ID3D11InputLayout::from_raw(il_raw as *mut c_void));
+        context.IASetInputLayout(&*il);
+    }
+}
+
+unsafe extern "C" fn ia_set_vertex_buffers(
+    h: Hdevice,
+    start: u32,
+    num: u32,
+    buffers: *const ddi::D3D10DDI_HRESOURCE,
+    strides: *const u32,
+    offsets: *const u32,
+) {
+    let Some(context) = d3d11_context(h) else {
+        return;
+    };
+    let mut bufs: Vec<Option<ID3D11Buffer>> = Vec::with_capacity(num as usize);
+    for i in 0..num as usize {
+        let p = (*buffers.add(i)).pDrvPrivate;
+        bufs.push(load_com::<ID3D11Resource>(p).and_then(|r| (*r).cast::<ID3D11Buffer>().ok()));
+    }
+    context.IASetVertexBuffers(start, num, Some(bufs.as_ptr()), Some(strides), Some(offsets));
+}
+
+unsafe extern "C" fn ia_set_index_buffer(
+    h: Hdevice,
+    h_buf: ddi::D3D10DDI_HRESOURCE,
+    format: ddi::DXGI_FORMAT,
+    offset: u32,
+) {
+    let Some(context) = d3d11_context(h) else {
+        return;
+    };
+    let buf =
+        load_com::<ID3D11Resource>(h_buf.pDrvPrivate).and_then(|r| (*r).cast::<ID3D11Buffer>().ok());
+    context.IASetIndexBuffer(buf.as_ref(), DXGI_FORMAT(format as i32), offset);
+}
+
+// --- Blend state ------------------------------------------------------------
+
+unsafe extern "C" fn calc_size_blend(_h: Hdevice, _d: *const ddi::D3D10_1_DDI_BLEND_DESC) -> u64 {
+    8
+}
+
+unsafe extern "C" fn create_blend_state(
+    h: Hdevice,
+    desc: *const ddi::D3D10_1_DDI_BLEND_DESC,
+    h_bs: ddi::D3D10DDI_HBLENDSTATE,
+    _hrt: ddi::D3D10DDI_HRTBLENDSTATE,
+) {
+    let Some(device) = d3d11_device(h) else {
+        return;
+    };
+    let d = &*desc;
+    let mut rt: [D3D11_RENDER_TARGET_BLEND_DESC; 8] = Default::default();
+    for i in 0..8 {
+        let s = &d.RenderTarget[i];
+        rt[i] = D3D11_RENDER_TARGET_BLEND_DESC {
+            BlendEnable: windows::Win32::Foundation::BOOL(s.BlendEnable),
+            SrcBlend: D3D11_BLEND(s.SrcBlend),
+            DestBlend: D3D11_BLEND(s.DestBlend),
+            BlendOp: D3D11_BLEND_OP(s.BlendOp),
+            SrcBlendAlpha: D3D11_BLEND(s.SrcBlendAlpha),
+            DestBlendAlpha: D3D11_BLEND(s.DestBlendAlpha),
+            BlendOpAlpha: D3D11_BLEND_OP(s.BlendOpAlpha),
+            RenderTargetWriteMask: s.RenderTargetWriteMask,
+        };
+    }
+    let bd = D3D11_BLEND_DESC {
+        AlphaToCoverageEnable: windows::Win32::Foundation::BOOL(d.AlphaToCoverageEnable),
+        IndependentBlendEnable: windows::Win32::Foundation::BOOL(d.IndependentBlendEnable),
+        RenderTarget: rt,
+    };
+    let mut bs: Option<ID3D11BlendState> = None;
+    if device.CreateBlendState(&bd, Some(&mut bs)).is_ok() {
+        if let Some(s) = bs {
+            store_com(h_bs.pDrvPrivate, s);
+        }
+    }
+}
+
+unsafe extern "C" fn set_blend_state(
+    h: Hdevice,
+    h_bs: ddi::D3D10DDI_HBLENDSTATE,
+    factor: *const f32,
+    sample_mask: u32,
+) {
+    let Some(context) = d3d11_context(h) else {
+        return;
+    };
+    let f = if factor.is_null() {
+        [1.0f32; 4]
+    } else {
+        [*factor, *factor.add(1), *factor.add(2), *factor.add(3)]
+    };
+    match load_com::<ID3D11BlendState>(h_bs.pDrvPrivate) {
+        Some(s) => context.OMSetBlendState(&*s, Some(&f), sample_mask),
+        None => context.OMSetBlendState(None, Some(&f), sample_mask),
+    }
+}
+
+unsafe extern "C" fn destroy_blend_state(_h: Hdevice, h_bs: ddi::D3D10DDI_HBLENDSTATE) {
+    release_com(h_bs.pDrvPrivate);
+}
+
+// --- DXGI present -----------------------------------------------------------
+
+/// Benign DXGI `pfnPresent`: flush the deferred GPU work and report success.
+///
+/// A render-only Helios adapter has no scanout of its own (presentation to the
+/// paired display adapter is the unsolved cross-adapter path), so we cannot
+/// actually scan the surface out. But returning an error here makes the D3D
+/// runtime / DWM / LogonUI fail-fast and crash-loop. Flushing + returning S_OK
+/// keeps the compositor alive (no visible Helios output, but stable) — which is
+/// what matters for not wedging the venus stack. `hSurfaceToPresent` already
+/// holds the rendered frame; we simply consume the present.
+unsafe extern "C" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT) -> i32 {
+    if arg.is_null() {
+        return 0;
+    }
+    let a = &*arg;
+    // DXGI_DDI_HDEVICE is a UINT_PTR carrying the driver device handle — the same
+    // value as our D3D10DDI_HDEVICE.pDrvPrivate (the HeliosDevice pointer).
+    let h = Hdevice {
+        pDrvPrivate: a.hDevice as *mut c_void,
+    };
+    if let Some(context) = d3d11_context(h) {
+        context.Flush();
+    }
+    0 // S_OK
+}
+
+/// Install the DXGI base-DDI present handler over the stub fill.
+pub unsafe fn install_dxgi(funcs: *mut ddi::DXGI_DDI_BASE_FUNCTIONS) {
+    (*funcs).pfnPresent = Some(dxgi_present);
+}
+
 /// Install the implemented forwarders into the device-funcs table (over the
 /// stub fill). Uses the real bindgen PFN field types — no transmute.
 pub unsafe fn install(funcs: *mut ddi::D3D11DDI_DEVICEFUNCS) {
@@ -1379,4 +1726,16 @@ pub unsafe fn install(funcs: *mut ddi::D3D11DDI_DEVICEFUNCS) {
     f.pfnResourceUpdateSubresourceUP = Some(resource_update_subresource);
     f.pfnDefaultConstantBufferUpdateSubresourceUP = Some(resource_update_subresource);
     f.pfnCheckFormatSupport = Some(check_format_support);
+
+    // Input layouts (lazy), vertex/index buffers, blend state.
+    f.pfnCalcPrivateElementLayoutSize = Some(calc_size_element_layout);
+    f.pfnCreateElementLayout = Some(create_element_layout);
+    f.pfnDestroyElementLayout = Some(destroy_element_layout);
+    f.pfnIaSetInputLayout = Some(ia_set_input_layout);
+    f.pfnIaSetVertexBuffers = Some(ia_set_vertex_buffers);
+    f.pfnIaSetIndexBuffer = Some(ia_set_index_buffer);
+    f.pfnCalcPrivateBlendStateSize = Some(calc_size_blend);
+    f.pfnCreateBlendState = Some(create_blend_state);
+    f.pfnSetBlendState = Some(set_blend_state);
+    f.pfnDestroyBlendState = Some(destroy_blend_state);
 }

@@ -382,7 +382,10 @@ unsafe extern "system" fn create_device(
     unsafe {
         core::ptr::write(
             create.h_drv_device as *mut device_funcs::HeliosDevice,
-            device_funcs::HeliosDevice { dxvk },
+            device_funcs::HeliosDevice {
+                dxvk,
+                ia: core::cell::RefCell::new(device_funcs::IaState::default()),
+            },
         );
     }
 

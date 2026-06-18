@@ -23,6 +23,25 @@ use crate::log_line;
 /// bridge created on the Helios venus adapter.
 pub struct HeliosDevice {
     pub dxvk: cxx::UniquePtr<bridge::ffi::HeliosDxvkDevice>,
+    /// Input-assembler state for lazy `ID3D11InputLayout` creation. The d3d10umddi
+    /// `CreateElementLayout` DDI does NOT pass the vertex-shader input-signature
+    /// bytecode that `ID3D11Device::CreateInputLayout` requires, so we stash the
+    /// element descs + the bound VS bytecode and create the layout lazily at draw.
+    pub ia: core::cell::RefCell<IaState>,
+}
+
+/// Deferred input-assembler binding state (see [`HeliosDevice::ia`]).
+#[derive(Default)]
+pub struct IaState {
+    /// VS COM pointer (as `usize`) → its DXBC input-signature bytecode.
+    pub vs_bytecode: std::collections::HashMap<usize, Vec<u8>>,
+    /// Currently-bound vertex shader's COM pointer.
+    pub current_vs: usize,
+    /// Currently-bound element layout's `LayoutData` raw pointer (0 = none).
+    pub current_layout: usize,
+    /// Cache of created input layouts keyed by (layout_ptr, vs_ptr) → owned
+    /// `ID3D11InputLayout` raw pointer.
+    pub layout_cache: std::collections::HashMap<(usize, usize), usize>,
 }
 
 pub fn device_private_size() -> usize {
@@ -117,4 +136,6 @@ pub unsafe fn fill_dxgi_base_funcs(funcs: *mut ddi::DXGI_DDI_BASE_FUNCTIONS) {
     for i in 0..n {
         *slots.add(i) = Some(ddi_noop);
     }
+    // Real (benign) present so LogonUI/DWM don't fail-fast on present.
+    crate::forward::install_dxgi(funcs);
 }
