@@ -1,0 +1,52 @@
+[package]
+name = "helios_kmd_render"
+version = "0.1.0"
+edition = "2021"
+build = "build.rs"
+description = "Helios vGPU WDDM 3.2 render-only miniport bring-up driver."
+
+[lib]
+crate-type = ["cdylib"]
+
+# windows-drivers-rs driver model. WDM = we register the DDI table ourselves
+# (via DxgkInitialize) rather than going through KMDF.
+[package.metadata.wdk.driver-model]
+driver-type = "WDM"
+
+[dependencies]
+# windows-drivers-rs family — coherent set published 2025-11-14.
+wdk = "0.4"
+wdk-sys = "0.5"
+wdk-alloc = "0.4"
+wdk-panic = "0.4"
+# Shared wire-format definitions (no_std), so virtio-gpu structs match the ICD.
+helios_protocol = { path = "../protocol" }
+# no_std; used to serialize helios_protocol command structs (Pod) into the DMA
+# scratch buffers. default-features=false keeps it std-free for the kernel target.
+bytemuck = { version = "1", default-features = false, features = ["derive"] }
+# Maintained no_std virtio transport. We implement its Hal + ConfigurationAccess
+# over WDK primitives (see virtio/hal.rs, virtio/config.rs) and drive a raw
+# VirtQueue with helios_protocol commands, skipping its built-in 2D GPU driver.
+virtio-drivers = "0.13"
+
+[build-dependencies]
+wdk-build = "0.5"
+# We generate the WDDM display-miniport DDIs ourselves: wdk-sys has no display
+# ApiSubset, so build.rs runs bindgen over dispmprt.h + d3dkmddi.h. See build.rs.
+# MUST match the bindgen version wdk-build uses (0.71), so its BuilderExt
+# (Builder::wdk_default) applies to the same bindgen::Builder type we construct.
+bindgen = "0.71"
+
+[profile.dev]
+panic = "abort"
+lto = "thin"
+opt-level = 1
+
+[profile.release]
+panic = "abort"
+lto = true
+opt-level = 3
+codegen-units = 1
+
+[features]
+default = []

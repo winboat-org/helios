@@ -1,0 +1,69 @@
+# cargo-make driver build, per windows-drivers-rs. `cargo make` packages the
+# .sys + .inf (+ test cert) into target/<profile>/package/.
+# wdk-build's load_rust_driver_makefile writes rust-driver-makefile.toml to
+# `${CARGO_MAKE_WORKSPACE_WORKING_DIRECTORY}/target/` (hardcoded `target/`, it
+# does NOT honor CARGO_TARGET_DIR). So this stays the default `target/...`.
+# IMPORTANT: build from a LOCAL disk (C:\), never the Z:\ share — Rust file IO
+# (this very copy) fails on the 9p/virtio share with OS error 87. See TOOLCHAIN.md.
+extend = "target/rust-driver-makefile.toml"
+
+[config]
+load_script = '''
+#!@rust
+//! ```cargo
+//! [dependencies]
+//! wdk-build = "0.5"
+//! ```
+#![allow(unused_doc_comments)]
+wdk_build::cargo_make::load_rust_driver_makefile()?
+'''
+
+[tasks.copy-umd-to-package]
+private = true
+dependencies = ["copy-driver-binary-to-package", "copy-inf-to-package"]
+script_runner = "@rust"
+script = '''
+use std::path::PathBuf;
+use std::process::Command;
+
+let kmd_dir = PathBuf::from(std::env::var("CARGO_MAKE_WORKING_DIRECTORY").unwrap());
+let repo = kmd_dir.parent().unwrap().to_path_buf();
+let umd_dir = repo.join("umd");
+
+let status = Command::new("cargo")
+    .arg("build")
+    .current_dir(&umd_dir)
+    .status()
+    .expect("launch cargo build for helios_umd");
+assert!(status.success(), "helios_umd build failed");
+
+let source = umd_dir.join("target").join("debug").join("helios_umd.dll");
+let package = kmd_dir
+    .join("target")
+    .join("debug")
+    .join("helios_kmd_render_package");
+std::fs::create_dir_all(&package).unwrap();
+std::fs::copy(&source, package.join("helios_umd.dll")).unwrap();
+'''
+
+[tasks.stampinf]
+private = true
+command = "stampinf"
+args = [
+  "-f", "${WDK_BUILD_OUTPUT_DIRECTORY}/${CARGO_MAKE_CRATE_FS_NAME}.inf",
+  "-d", "*",
+  "-a", "amd64",
+  "-c", "${CARGO_MAKE_CRATE_FS_NAME}.cat",
+  "-v", "22.22.32.65",
+]
+
+[tasks.inf2cat]
+private = true
+dependencies = ["copy-driver-binary-to-package", "copy-inf-to-package", "copy-umd-to-package"]
+env = { "WDK_BUILD_INF2CAT_OS" = { source = "${CARGO_MAKE_CRATE_TARGET_TRIPLE}", default_value = "UNKNOWN", mapping = { "x86_64-pc-windows-msvc" = "10_x64", "aarch64-pc-windows-msvc" = "Server10_arm64" } } }
+command = "inf2cat"
+args = [
+  "/driver:${WDK_BUILD_OUTPUT_DIRECTORY}/${CARGO_MAKE_CRATE_FS_NAME}_package",
+  "/os:${WDK_BUILD_INF2CAT_OS}",
+  "/uselocaltime",
+]

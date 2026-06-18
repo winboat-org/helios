@@ -1,0 +1,7 @@
+# The KMD is no_std kernel-mode code and requires nightly for build-std
+# (recompiling core/alloc for the kernel target). rust-src supplies the std
+# sources build-std consumes.
+[toolchain]
+channel = "nightly"
+components = ["rust-src", "clippy", "rustfmt"]
+targets = ["x86_64-pc-windows-msvc"]

@@ -1,0 +1,99 @@
+; helios_kmd_render.inx — Helios vGPU render-only WDDM miniport driver.
+; Matches the virtio-gpu PCI device (VEN_1AF4 & DEV_1050). The wdk-build
+; toolchain stamps DriverVer and produces helios_kmd_render.inf during packaging.
+; Gate-1 test package only: intentionally worse-ranked than production drivers.
+
+[Version]
+Signature   = "$Windows NT$"
+Class       = Display
+ClassGUID   = {4D36E968-E325-11CE-BFC1-08002BE10318}
+Provider    = %ProviderName%
+CatalogFile = helios_kmd_render.cat
+PnpLockdown = 1
+
+[DestinationDirs]
+Helios_CopyFiles = 13  ; driver store (DIRID 13) — required for a universal INF
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+
+[SourceDisksFiles]
+helios_kmd_render.sys = 1,,
+helios_umd.dll = 1,,
+
+; ──── Manufacturer / Models ────────────────────────────────────────────────
+
+; TargetOSVersion decoration (...16299 = Win10 1709) — required because the
+; install section copies to DIRID 13 (driver store), introduced in 10.0.16299.
+[Manufacturer]
+%ProviderName% = Helios_Models,NTamd64.10.0...16299
+
+[Helios_Models.NTamd64.10.0...16299]
+%DeviceDesc% = Helios_Install, PCI\VEN_1AF4&DEV_1050&SUBSYS_11001AF4&REV_01, PCI\VEN_1AF4&DEV_1050
+
+; ──── Installation ─────────────────────────────────────────────────────────
+
+[Helios_Install]
+Include = msdv.inf
+FeatureScore = FF
+CopyFiles = Helios_CopyFiles
+AddReg = Helios_DeviceSettings
+
+[Helios_CopyFiles]
+helios_kmd_render.sys
+helios_umd.dll
+
+[Helios_Install.Services]
+AddService = helios_kmd_render, 0x00000002, Helios_ServiceInstall, Helios_EventLog
+
+[Helios_ServiceInstall]
+ServiceType    = 1                   ; SERVICE_KERNEL_DRIVER
+StartType      = 3                   ; SERVICE_DEMAND_START
+ErrorControl   = 0                   ; SERVICE_ERROR_IGNORE
+ServiceBinary  = %13%\helios_kmd_render.sys
+AddReg         = Helios_Service_AddReg
+
+[Helios_Service_AddReg]
+HKR,Parameters,SingleDeviceInstall,%REG_DWORD%,1
+
+[Helios_EventLog]
+AddReg = Helios_EventLog_AddReg
+
+[Helios_EventLog_AddReg]
+HKR,,EventMessageFile,%REG_EXPAND_SZ%,"%%SystemRoot%%\System32\IoLogMsg.dll"
+HKR,,TypesSupported,%REG_DWORD%,7
+
+[Helios_Install.HW]
+AddReg = Helios_PCI_MSIX
+
+[Helios_PCI_MSIX]
+HKR, "Interrupt Management",, 0x00000010
+HKR, "Interrupt Management\MessageSignaledInterruptProperties",, 0x00000010
+HKR, "Interrupt Management\MessageSignaledInterruptProperties", MSISupported, %REG_DWORD%, 0
+HKR, "Interrupt Management\MessageSignaledInterruptProperties", MessageNumberLimit, %REG_DWORD%, 1
+
+; ──── Software key / UMD registration ──────────────────────────────────────
+; Gate 1 registers a real DLL name so Dxgkrnl/Direct3D see the package as a
+; normal third-party display miniport stack. The DLL entrypoints fail honestly
+; until the DXVK/VKD3D-backed UMD path is implemented.
+
+[Helios_DeviceSettings]
+HKR,, UserModeDriverName,       %REG_MULTI_SZ%, %13%\helios_umd.dll,%13%\helios_umd.dll,%13%\helios_umd.dll,%13%\helios_umd.dll
+HKR,, InstalledDisplayDrivers,  %REG_MULTI_SZ%, helios_umd,helios_umd,helios_umd,helios_umd
+
+; ──── Vulkan ICD registration ──────────────────────────────────────────────
+; A universal INF may only write device-relative (HKR) registry keys, not the
+; absolute HKLM\SOFTWARE\Khronos\Vulkan\Drivers value the Vulkan loader reads.
+; ICD registration is therefore handled at ICD deployment (Phase 5/6) — via the
+; ICD's own installer / a setup step that registers helios_vulkan.json — not by
+; this KMD package.
+
+; ──── Strings ──────────────────────────────────────────────────────────────
+
+[Strings]
+ProviderName = "Helios Project"
+DeviceDesc   = "Helios vGPU Render Adapter (WDDM bring-up)"
+DiskName     = "Helios vGPU Driver Disk"
+REG_DWORD    = 0x00010001
+REG_MULTI_SZ = 0x00010000
+REG_EXPAND_SZ = 0x00020000

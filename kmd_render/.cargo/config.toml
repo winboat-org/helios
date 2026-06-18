@@ -1,0 +1,9 @@
+# Kernel-mode drivers must link the static CRT.
+[build]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+# To enable KernelAddressSanitizer during debugging, add:
+#   "-Z", "sanitizer=address"
+# (nightly-only; remove for any driver you intend to load for real testing).

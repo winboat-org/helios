@@ -24,8 +24,10 @@ pub mod virtio_gpu;
 pub mod escape;
 pub mod features;
 pub mod ioctl;
+pub mod wddm;
 
 pub use escape::*;
 pub use features::*;
 pub use ioctl::*;
 pub use virtio_gpu::*;
+pub use wddm::*;

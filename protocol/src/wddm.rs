@@ -1,0 +1,117 @@
+//! Helios WDDM (D3DKMT) wire-format structs — the venus-over-WDDM transport
+//! contract (see `GATE5_VENUS_WDDM_DESIGN.md`).
+//!
+//! Parallel to [`crate::escape`] (which carries the System-class IOCTL payloads):
+//! these are the private-driver-data layouts the Mesa Venus ICD passes to the
+//! `kmd_render` WDDM adapter through `D3DKMT*` thunks, and that the KMD reads in
+//! its `DxgkDdi*` callbacks. The IOCTL path stays unchanged; this is additive.
+//!
+//! Two boundaries use these:
+//!   - `D3DKMTCreateAllocation` → `pAllocationInfo[i].pPrivateDriverData`
+//!     carries [`HeliosWddmAllocPrivate`]; the KMD's `DxgkDdiCreateAllocation`
+//!     reads it and creates the backing virtio-gpu blob (`resource_create_blob`).
+//!   - `D3DKMTRender` → the command buffer begins with [`HeliosWddmCmdBuf`]
+//!     followed by the opaque venus byte stream; `DxgkDdiRender`/`SubmitCommand`
+//!     reads it and forwards the stream via `submit_venus`. Allocation references
+//!     travel in the `D3DDDI_ALLOCATIONLIST`/patch list, not inline here.
+//!
+//! All structs are `repr(C)`, padding-free (8-byte fields first), so they derive
+//! `Pod`/`Zeroable` and have a stable byte layout the C ICD mirrors.
+
+use bytemuck::{Pod, Zeroable};
+
+/// `'HWDM'` — sanity magic at the start of every WDDM private-data blob.
+pub const HELIOS_WDDM_MAGIC: u32 = 0x4857_444D;
+/// Current WDDM transport protocol version.
+pub const HELIOS_WDDM_VERSION: u32 = 1;
+
+/// [`HeliosWddmAllocPrivate::kind`] — a host-visible command/staging ring blob
+/// with no venus device-memory backing (`blob_id == 0`).
+pub const HELIOS_WDDM_ALLOC_KIND_SHMEM: u32 = 0;
+/// [`HeliosWddmAllocPrivate::kind`] — a blob bound to a venus `VkDeviceMemory`
+/// object (`blob_id == venus mem id` from the ICD's `vkAllocateMemory`).
+pub const HELIOS_WDDM_ALLOC_KIND_DEVICE_MEMORY: u32 = 1;
+
+/// Private driver data for one allocation created via `D3DKMTCreateAllocation`.
+///
+/// `blob_id` is the venus device-memory id that backs a HOST3D mappable blob (0
+/// for a scratch shmem ring); `blob_mem`/`blob_flags` mirror the
+/// `VIRTIO_GPU_BLOB_MEM_*` / `VIRTIO_GPU_BLOB_FLAG_*` the KMD forwards to
+/// `VirtioGpu::resource_create_blob`. 48 bytes.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct HeliosWddmAllocPrivate {
+    pub blob_id: u64,    // in:  venus device-memory id backing the blob (0 = scratch shmem)
+    pub size: u64,       // in:  blob size in bytes
+    pub magic: u32,      // == HELIOS_WDDM_MAGIC
+    pub version: u32,    // == HELIOS_WDDM_VERSION
+    pub blob_mem: u32,   // in:  VIRTIO_GPU_BLOB_MEM_* (HOST3D)
+    pub blob_flags: u32, // in:  VIRTIO_GPU_BLOB_FLAG_* (USE_MAPPABLE)
+    pub ctx_id: u32,     // in:  owning venus context id
+    pub map_cache: u32,  // in/out: requested/effective VIRTIO_GPU_MAP_CACHE_*
+    pub kind: u32,       // in:  HELIOS_WDDM_ALLOC_KIND_*
+    pub _pad: u32,
+}
+
+impl HeliosWddmAllocPrivate {
+    pub const fn new(
+        kind: u32,
+        ctx_id: u32,
+        blob_id: u64,
+        size: u64,
+        blob_mem: u32,
+        blob_flags: u32,
+        map_cache: u32,
+    ) -> Self {
+        Self {
+            blob_id,
+            size,
+            magic: HELIOS_WDDM_MAGIC,
+            version: HELIOS_WDDM_VERSION,
+            blob_mem,
+            blob_flags,
+            ctx_id,
+            map_cache,
+            kind,
+            _pad: 0,
+        }
+    }
+
+    /// Validate magic + version. The KMD calls this before trusting any field.
+    #[inline]
+    pub fn is_valid(&self) -> bool {
+        self.magic == HELIOS_WDDM_MAGIC && self.version == HELIOS_WDDM_VERSION
+    }
+}
+
+/// Header at the start of a `D3DKMTRender` command buffer. The opaque venus byte
+/// stream begins at `venus_offset` and runs for `venus_size` bytes; the KMD
+/// forwards exactly those bytes to `submit_venus(ctx_id, fence, stream)`.
+///
+/// `ring_idx` is the venus per-queue host timeline (0 = CPU/primary ring), same
+/// meaning as [`crate::escape::HeliosEscapeSubmitVenus::ring_idx`]. `seq` is an
+/// ICD-side monotonically increasing submission sequence for debugging/ordering;
+/// the authoritative GPU fence is WDDM's `SubmissionFenceId`. 32 bytes.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct HeliosWddmCmdBuf {
+    pub seq: u64,          // in:  ICD submission sequence (debug/ordering)
+    pub magic: u32,        // == HELIOS_WDDM_MAGIC
+    pub version: u32,      // == HELIOS_WDDM_VERSION
+    pub ctx_id: u32,       // in:  owning venus context id
+    pub ring_idx: u32,     // in:  venus per-queue host timeline (0 = CPU ring)
+    pub venus_offset: u32, // in:  byte offset of the venus stream within the command buffer
+    pub venus_size: u32,   // in:  venus stream length in bytes
+}
+
+impl HeliosWddmCmdBuf {
+    #[inline]
+    pub fn is_valid(&self) -> bool {
+        self.magic == HELIOS_WDDM_MAGIC && self.version == HELIOS_WDDM_VERSION
+    }
+}
+
+const _: () = {
+    assert!(core::mem::size_of::<HeliosWddmAllocPrivate>() == 48);
+    assert!(core::mem::size_of::<HeliosWddmCmdBuf>() == 32);
+};
