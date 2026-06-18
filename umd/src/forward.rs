@@ -1140,6 +1140,190 @@ pub unsafe fn selftest_cb_readback(h: Hdevice) -> i32 {
     0
 }
 
+/// Diagnostic: full draw of a triangle whose PS reads a constant buffer, with
+/// probes to localize the "CB content never reaches the shader" bug. Returns 0
+/// when the center pixel is the CB-supplied green.
+///
+/// Probes, in order:
+///  1. CB created with immutable green initial-data (proven-good content path).
+///  2. After `ps_set_constant_buffers`, call `PSGetConstantBuffers` and log
+///     whether DXVK reports our buffer bound — splits "our bind didn't register"
+///     from "bound but shader reads garbage".
+///  3. After the draw, copy the CB to staging and read it back — confirms the
+///     resource still holds green at draw time (rules out it being clobbered).
+pub unsafe fn selftest_triangle_cb(h: Hdevice) -> i32 {
+    let vs_src = b"float4 VS(uint id:SV_VertexID):SV_Position{float2 uv=float2((id<<1)&2,id&2);return float4(uv*2-1,0,1);}\0";
+    // PS reads col from the constant buffer at b0.
+    let ps_src = b"cbuffer C:register(b0){float4 col;} float4 PS():SV_Target{return col;}\0";
+    let Some(vsb) = compile_hlsl(vs_src, b"VS\0", b"vs_5_0\0") else { return 30; };
+    let Some(psb) = compile_hlsl(ps_src, b"PS\0", b"ps_5_0\0") else { return 31; };
+
+    let mut rt_priv = 0u64;
+    let h_rt = make_tex2d(h, &mut rt_priv, 0, D3D11_BIND_RENDER_TARGET.0 as u32);
+    if rt_priv == 0 {
+        return 32;
+    }
+    let mut rtv_desc = ddi::D3D10DDIARG_CREATERENDERTARGETVIEW::default();
+    rtv_desc.hDrvResource = h_rt;
+    rtv_desc.Format = 87;
+    rtv_desc.ResourceDimension = RES_TEX2D;
+    let mut rtv_priv = 0u64;
+    let h_rtv = ddi::D3D10DDI_HRENDERTARGETVIEW {
+        pDrvPrivate: &mut rtv_priv as *mut u64 as *mut c_void,
+    };
+    create_rtv(h, &rtv_desc, h_rtv, Default::default());
+    if rtv_priv == 0 {
+        return 33;
+    }
+
+    // Constant buffer: 16 bytes, immutable, content = green (0,1,0,1).
+    let green: [f32; 4] = [0.0, 1.0, 0.0, 1.0];
+    let mip = ddi::D3D10DDI_MIPINFO {
+        TexelWidth: 16,
+        ..Default::default()
+    };
+    let init = ddi::D3D10_DDIARG_SUBRESOURCE_UP {
+        pSysMem: green.as_ptr() as *mut c_void,
+        SysMemPitch: 16,
+        SysMemSlicePitch: 16,
+    };
+    let mut cb = ddi::D3D11DDIARG_CREATERESOURCE::default();
+    cb.pMipInfoList = &mip;
+    cb.pInitialDataUP = &init;
+    cb.ResourceDimension = RES_BUFFER;
+    cb.Usage = 1; // IMMUTABLE
+    cb.BindFlags = D3D11_BIND_CONSTANT_BUFFER.0 as u32;
+    cb.MipLevels = 1;
+    cb.ArraySize = 1;
+    let mut cb_priv = 0u64;
+    let h_cb = ddi::D3D10DDI_HRESOURCE {
+        pDrvPrivate: &mut cb_priv as *mut u64 as *mut c_void,
+    };
+    create_resource(h, &cb, h_cb, Default::default());
+    if cb_priv == 0 {
+        log_line("selftest_triangle_cb: CB create failed");
+        return 34;
+    }
+    log_line(&format!("selftest_triangle_cb: CB COM ptr = {cb_priv:#x}"));
+
+    // Shaders.
+    let mut vs_priv = 0u64;
+    let h_vs = ddi::D3D10DDI_HSHADER {
+        pDrvPrivate: &mut vs_priv as *mut u64 as *mut c_void,
+    };
+    create_vertex_shader(h, vsb.GetBufferPointer() as *const u32, h_vs, Default::default(), core::ptr::null());
+    let mut ps_priv = 0u64;
+    let h_ps = ddi::D3D10DDI_HSHADER {
+        pDrvPrivate: &mut ps_priv as *mut u64 as *mut c_void,
+    };
+    create_pixel_shader(h, psb.GetBufferPointer() as *const u32, h_ps, Default::default(), core::ptr::null());
+    if vs_priv == 0 || ps_priv == 0 {
+        return 35;
+    }
+    vs_set_shader(h, h_vs);
+    ps_set_shader(h, h_ps);
+
+    // CULL_NONE so the triangle isn't culled.
+    let mut rs_desc = ddi::D3D10_DDI_RASTERIZER_DESC::default();
+    rs_desc.FillMode = 3;
+    rs_desc.CullMode = 1;
+    rs_desc.DepthClipEnable = 1;
+    let mut rs_priv = 0u64;
+    let h_rs = ddi::D3D10DDI_HRASTERIZERSTATE {
+        pDrvPrivate: &mut rs_priv as *mut u64 as *mut c_void,
+    };
+    create_rasterizer_state(h, &rs_desc, h_rs, Default::default());
+    set_rasterizer_state(h, h_rs);
+
+    // Bind the constant buffer to PS slot b0.
+    ps_set_constant_buffers(h, 0, 1, &h_cb);
+
+    // PROBE 2: ask DXVK what it now has bound at PS b0.
+    if let Some(c) = d3d11_context(h) {
+        let mut bound: [Option<ID3D11Buffer>; 1] = [None];
+        c.PSGetConstantBuffers(0, Some(&mut bound));
+        match &bound[0] {
+            Some(b) => {
+                let raw = b.as_raw() as usize;
+                log_line(&format!(
+                    "selftest_triangle_cb: PSGetConstantBuffers[0] = {raw:#x} (CB was {cb_priv:#x}, match={})",
+                    raw == cb_priv as usize
+                ));
+            }
+            None => log_line("selftest_triangle_cb: PSGetConstantBuffers[0] = NULL (bind did NOT register!)"),
+        }
+    }
+
+    let mut black = [0.0f32, 0.0, 0.0, 1.0];
+    clear_rtv(h, h_rtv, black.as_mut_ptr());
+    set_render_targets(h, &h_rtv, 1, 0, Default::default(), core::ptr::null(), core::ptr::null(), 0, 0, 0, 0);
+    let vp = ddi::D3D10_DDI_VIEWPORT {
+        TopLeftX: 0.0, TopLeftY: 0.0, Width: 64.0, Height: 64.0, MinDepth: 0.0, MaxDepth: 1.0,
+    };
+    set_viewports(h, 1, 0, &vp);
+    ia_set_topology(h, 4 /* TRIANGLELIST */);
+    draw(h, 3, 0);
+    flush(h);
+
+    // PROBE 3: CB content still green at draw time?
+    let mut cbst = ddi::D3D11DDIARG_CREATERESOURCE::default();
+    cbst.pMipInfoList = &mip;
+    cbst.ResourceDimension = RES_BUFFER;
+    cbst.Usage = 3; // STAGING
+    cbst.MipLevels = 1;
+    cbst.ArraySize = 1;
+    let mut cbst_priv = 0u64;
+    let h_cbst = ddi::D3D10DDI_HRESOURCE {
+        pDrvPrivate: &mut cbst_priv as *mut u64 as *mut c_void,
+    };
+    create_resource(h, &cbst, h_cbst, Default::default());
+    if cbst_priv != 0 {
+        resource_copy(h, h_cbst, h_cb);
+        flush(h);
+        let mut m = ddi::D3D10DDI_MAPPED_SUBRESOURCE::default();
+        resource_map(h, h_cbst, 0, 1, 0, &mut m);
+        if !m.pData.is_null() {
+            let f = m.pData as *const f32;
+            log_line(&format!(
+                "selftest_triangle_cb: CB content at draw time = {} {} {} {} (want 0 1 0 1)",
+                *f, *f.add(1), *f.add(2), *f.add(3)
+            ));
+            resource_unmap(h, h_cbst, 0);
+        }
+        destroy_resource(h, h_cbst);
+    }
+
+    // Read back the center pixel.
+    let mut st_priv = 0u64;
+    let h_st = make_tex2d(h, &mut st_priv, 3, 0);
+    if st_priv == 0 {
+        return 36;
+    }
+    resource_copy(h, h_st, h_rt);
+    flush(h);
+    let mut mapped = ddi::D3D10DDI_MAPPED_SUBRESOURCE::default();
+    resource_map(h, h_st, 0, 1, 0, &mut mapped);
+    let mut result = 37;
+    if !mapped.pData.is_null() {
+        let off = 32 * mapped.RowPitch as usize + 32 * 4;
+        let px = (mapped.pData as *const u8).add(off);
+        let (b, g, r, a) = (*px, *px.add(1), *px.add(2), *px.add(3));
+        log_line(&format!(
+            "selftest_triangle_cb: center BGRA = {b} {g} {r} {a} (want green ~0 255 0 255)"
+        ));
+        result = if g > 250 && r < 5 && b < 5 && a == 255 { 0 } else { 38 };
+        resource_unmap(h, h_st, 0);
+    }
+    destroy_resource(h, h_st);
+    destroy_shader(h, h_ps);
+    destroy_shader(h, h_vs);
+    destroy_resource(h, h_cb);
+    destroy_rtv(h, h_rtv);
+    destroy_resource(h, h_rt);
+    log_line(&format!("selftest_triangle_cb: result={result} (0=PASS)"));
+    result
+}
+
 /// Install the implemented forwarders into the device-funcs table (over the
 /// stub fill). Uses the real bindgen PFN field types — no transmute.
 pub unsafe fn install(funcs: *mut ddi::D3D11DDI_DEVICEFUNCS) {
