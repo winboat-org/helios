@@ -12,6 +12,7 @@ use std::io::Write;
 mod bridge;
 mod ddi;
 mod device_funcs;
+mod forward;
 
 type Hresult = i32;
 
@@ -220,6 +221,13 @@ pub extern "system" fn helios_umd_selftest() -> i32 {
         .filter(|&i| unsafe { (*table.add(i)).is_none() })
         .count();
     log_line(&format!("helios_umd_selftest: device-funcs null slots = {null_slots} / {n}"));
+
+    // Offscreen clear+readback through the real forwarders.
+    let hdev = ddi::D3D10DDI_HDEVICE {
+        pDrvPrivate: device_priv.as_mut_ptr().cast(),
+    };
+    let render_rc = unsafe { forward::selftest_offscreen_clear(hdev) };
+    log_line(&format!("helios_umd_selftest: offscreen clear rc={render_rc}"));
 
     // Tear the device back down via the real DestroyDevice entry.
     let device_funcs_table = funcs.as_ptr() as *const ddi::D3D11DDI_DEVICEFUNCS;

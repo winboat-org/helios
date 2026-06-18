@@ -98,6 +98,9 @@ pub unsafe fn fill_d3d11_device_funcs(funcs: *mut ddi::D3D11DDI_DEVICEFUNCS) {
 
     // Real cleanup on device teardown (matching signature, no transmute).
     f.pfnDestroyDevice = Some(ddi_destroy_device);
+
+    // Override stubs with the real D3D11 COM forwarders.
+    crate::forward::install(funcs);
 }
 
 /// Fill the DXGI base DDI table (presentation/resource base funcs) the runtime
