@@ -159,6 +159,8 @@ fn scan_host_visible_window(access: &DxgkConfigAccess) -> Option<HostVisibleWind
 const BLOB_PAGE: u64 = 4096;
 /// Max concurrently-tracked blobs. Generous for bring-up; table-full → alloc fails.
 const MAX_BLOBS: usize = 256;
+/// Max concurrently-tracked virtio-gpu contexts (one per live device, generous).
+const MAX_CONTEXTS: usize = 256;
 /// Max coalescing free ranges in the window allocator's free list.
 const MAX_WINDOW_RANGES: usize = 64;
 /// Per-map size cap (also bounds the `IoAllocateMdl` ULONG length on the caller).
@@ -186,6 +188,13 @@ pub struct BlobMapPrep {
 /// One tracked blob resource.
 #[derive(Clone, Copy)]
 struct BlobSlot {
+    /// The owning D3D device handle (`DXGKARG_ESCAPE.hDevice`, as an opaque
+    /// `usize`) that allocated this blob. `DxgkDdiDestroyDevice` reclaims every
+    /// blob tagged with the destroyed handle, so a crashing/forgetful ICD (e.g.
+    /// the crash-looping LogonUI, or any process that skips RELEASE_BLOB) cannot
+    /// leak the bounded blob table (`MAX_BLOBS`) and false-trip later allocations
+    /// with `STATUS_INSUFFICIENT_RESOURCES`.
+    owner: usize,
     ctx_id: u32,
     resource_id: u32,
     /// Blob size in bytes (from ALLOC_BLOB; MAP_BLOB needs it to size the MDL).
@@ -203,6 +212,15 @@ struct BlobSlot {
 struct WindowRange {
     offset: u64,
     len: u64,
+}
+
+/// One tracked virtio-gpu context, tagged with the owning device handle for
+/// device-teardown reclamation.
+#[derive(Clone, Copy)]
+struct ContextSlot {
+    /// Owning D3D device handle (`DXGKARG_ESCAPE.hDevice` as an opaque `usize`).
+    owner: usize,
+    ctx_id: u32,
 }
 
 /// An initialized virtio-gpu transport.
@@ -226,6 +244,12 @@ pub struct VirtioGpu {
     /// Tracked blobs (resource_id → size/mapping state). Heap-reserved to MAX_BLOBS
     /// at init so `push` under the spinlock never reallocates (the 0x7F lesson).
     blobs: Vec<BlobSlot>,
+    /// Live virtio-gpu contexts, tagged with the owning device handle, so
+    /// `DxgkDdiDestroyDevice` can `CTX_DESTROY` any context an ICD created but did
+    /// not tear down (crash / skipped CTX_DESTROY) — otherwise leaked contexts
+    /// accumulate host-side state and eventually wedge the render server. Reserved
+    /// to MAX_CONTEXTS at init (no realloc under the spinlock).
+    contexts: Vec<ContextSlot>,
     /// Bump high-water for the host-visible window offset allocator.
     next_window_offset: u64,
     /// Coalescing free list for released window ranges (bounded by MAX_WINDOW_RANGES).
@@ -339,6 +363,7 @@ impl VirtioGpu {
             next_resource_id: AtomicU32::new(1),
             host_visible,
             blobs: Vec::with_capacity(MAX_BLOBS),
+            contexts: Vec::with_capacity(MAX_CONTEXTS),
             next_window_offset: 0,
             free_window_ranges: Vec::with_capacity(MAX_WINDOW_RANGES),
         };
@@ -371,8 +396,10 @@ impl VirtioGpu {
     // passed in already contiguous.
 
     /// Create a virtio-gpu 3D context bound to `capset_id` (Venus = 4) and return
-    /// the guest-assigned context id.
-    pub fn ctx_create(&mut self, capset_id: u32) -> Result<u32, VirtioError> {
+    /// the guest-assigned context id. `owner` is the D3D device handle that owns
+    /// the context, recorded so `DxgkDdiDestroyDevice` can reclaim a context the
+    /// ICD created but never explicitly destroyed.
+    pub fn ctx_create(&mut self, capset_id: u32, owner: usize) -> Result<u32, VirtioError> {
         let ctx_id = self.next_ctx_id.fetch_add(1, Ordering::Relaxed);
         let mut cmd = VirtioGpuCtxCreate::zeroed();
         cmd.hdr.type_ = VIRTIO_GPU_CMD_CTX_CREATE;
@@ -384,11 +411,20 @@ impl VirtioGpu {
         cmd.nlen = NAME.len() as u32;
         cmd.debug_name[..NAME.len()].copy_from_slice(NAME);
         self.ctrl_roundtrip(bytemuck::bytes_of(&cmd))?;
+        // Track for device-teardown reclamation. `push` stays within the reserved
+        // capacity (no realloc under the spinlock); if the registry is somehow full
+        // we still hand back the context — it just won't be auto-reclaimed.
+        if self.contexts.len() < MAX_CONTEXTS {
+            self.contexts.push(ContextSlot { owner, ctx_id });
+        }
         Ok(ctx_id)
     }
 
-    /// Destroy a previously created 3D context.
+    /// Destroy a previously created 3D context and drop its tracking slot.
     pub fn ctx_destroy(&mut self, ctx_id: u32) -> Result<(), VirtioError> {
+        if let Some(idx) = self.contexts.iter().position(|c| c.ctx_id == ctx_id) {
+            self.contexts.swap_remove(idx);
+        }
         let mut cmd = VirtioGpuCtxDestroy::zeroed();
         cmd.hdr.type_ = VIRTIO_GPU_CMD_CTX_DESTROY;
         cmd.hdr.ctx_id = ctx_id;
@@ -496,6 +532,7 @@ impl VirtioGpu {
         blob_flags: u32,
         blob_id: u64,
         size: u64,
+        owner: usize,
     ) -> Result<u32, VirtioError> {
         if size == 0 {
             return Err(VirtioError::DeviceError);
@@ -506,6 +543,7 @@ impl VirtioGpu {
         let resource_id = self.resource_create_blob(ctx_id, blob_mem, blob_flags, blob_id, size)?;
         // `push` stays within the reserved capacity (no realloc under the lock).
         self.blobs.push(BlobSlot {
+            owner,
             ctx_id,
             resource_id,
             size,
@@ -574,6 +612,57 @@ impl VirtioGpu {
         }
         let _ = self.ctx_detach_resource(slot.ctx_id, slot.resource_id);
         self.resource_unref(slot.resource_id)
+    }
+
+    /// Reclaim every blob still owned by `owner` (a destroyed D3D device handle):
+    /// unmap (if mapped), detach, unref, and return the window range. This is the
+    /// KMD-side safety net for an ICD that crashes or skips RELEASE_BLOB — without
+    /// it the bounded blob table (`MAX_BLOBS`) fills across device creations and
+    /// later allocations fail with `STATUS_INSUFFICIENT_RESOURCES`, which manifests
+    /// as spurious render corruption / "venus wedge". Returns the count reclaimed.
+    /// Called under the virtio spinlock at `DxgkDdiDestroyDevice`; `swap_remove`
+    /// never reallocates, so it stays lock-safe.
+    pub fn release_blobs_for_owner(&mut self, owner: usize) -> u32 {
+        let mut reclaimed = 0u32;
+        let mut i = 0;
+        while i < self.blobs.len() {
+            if self.blobs[i].owner != owner {
+                i += 1;
+                continue;
+            }
+            let slot = self.blobs.swap_remove(i);
+            if slot.mapped {
+                let _ = self.resource_unmap_blob(slot.resource_id);
+                self.free_window_range(slot.map_offset, slot.map_len);
+            }
+            let _ = self.ctx_detach_resource(slot.ctx_id, slot.resource_id);
+            let _ = self.resource_unref(slot.resource_id);
+            reclaimed += 1;
+            // Do not advance `i`: `swap_remove` moved the last element into slot `i`.
+        }
+        reclaimed
+    }
+
+    /// `CTX_DESTROY` and drop every context still owned by `owner`. Complements
+    /// [`release_blobs_for_owner`]; together they leave the host with no dangling
+    /// venus state for a device that tore down uncleanly. Returns the count.
+    pub fn destroy_contexts_for_owner(&mut self, owner: usize) -> u32 {
+        let mut destroyed = 0u32;
+        let mut i = 0;
+        while i < self.contexts.len() {
+            if self.contexts[i].owner != owner {
+                i += 1;
+                continue;
+            }
+            let slot = self.contexts.swap_remove(i);
+            let mut cmd = VirtioGpuCtxDestroy::zeroed();
+            cmd.hdr.type_ = VIRTIO_GPU_CMD_CTX_DESTROY;
+            cmd.hdr.ctx_id = slot.ctx_id;
+            let _ = self.ctrl_roundtrip(bytemuck::bytes_of(&cmd));
+            destroyed += 1;
+            // Do not advance `i`: `swap_remove` filled slot `i` with the last entry.
+        }
+        destroyed
     }
 
     /// Allocate a page-rounded `len`-byte range in the host-visible window: reuse a
@@ -735,7 +824,9 @@ impl VirtioGpu {
     /// flow; a standalone HOST3D blob can't be smoke-tested here because it needs a
     /// venus memory id that only the UMD's `vkAllocateMemory` can produce.
     pub fn self_test_venus_context(&mut self) -> u32 {
-        match self.ctx_create(VIRTIO_GPU_CAPSET_VENUS) {
+        // owner = 0: this diagnostic context is destroyed immediately below, so it
+        // needs no device-teardown reclamation; ctx_destroy deregisters it anyway.
+        match self.ctx_create(VIRTIO_GPU_CAPSET_VENUS, 0) {
             Ok(ctx) => {
                 // Best-effort cleanup; ignore the destroy result (diagnostic path).
                 let _ = self.ctx_destroy(ctx);

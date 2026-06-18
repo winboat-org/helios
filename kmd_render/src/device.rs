@@ -76,6 +76,23 @@ pub unsafe extern "C" fn dxgkddi_destroy_device(h_device: *mut c_void) -> NTSTAT
                 crate::ddi::unmap_io_pages_from_user(user_va, mdl as *mut wdk_sys::MDL)
             };
         }
+        // Reclaim any virtio blobs / contexts this device allocated but did not
+        // release (ICD crash, or a process that skipped RELEASE_BLOB/CTX_DESTROY —
+        // e.g. a crash-looping client). Without this the bounded blob table fills
+        // across device creations and later ALLOC_BLOBs fail STATUS_INSUFFICIENT_
+        // RESOURCES, surfacing as spurious "venus wedge" / render corruption. If
+        // the transport is already gone (StopDevice), there is nothing to reclaim.
+        let _ = adapter.with_virtio(|v| {
+            let blobs = v.release_blobs_for_owner(owner);
+            let contexts = v.destroy_contexts_for_owner(owner);
+            if blobs != 0 || contexts != 0 {
+                // 0x0Bnn pattern matches the gpu.rs diag namespace; low bytes carry
+                // the reclaimed counts (saturated to a byte) for post-mortem triage.
+                crate::diag::record(
+                    0x0B00_0D00 | ((blobs.min(0xF) << 4) | contexts.min(0xF)),
+                );
+            }
+        });
         // SAFETY: produced by Box::into_raw in create_device; destroyed exactly once.
         drop(unsafe { Box::from_raw(h_device as *mut DeviceContext) });
     }

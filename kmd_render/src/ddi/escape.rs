@@ -64,11 +64,11 @@ pub unsafe extern "C" fn dxgkddi_escape(
     let owner = args.hDevice as usize;
 
     match hdr.cmd_type {
-        HELIOS_ESCAPE_CTX_CREATE => escape_ctx_create(adapter, buf),
+        HELIOS_ESCAPE_CTX_CREATE => escape_ctx_create(adapter, buf, owner),
         HELIOS_ESCAPE_CTX_DESTROY => escape_ctx_destroy(adapter, buf),
         HELIOS_ESCAPE_SUBMIT_VENUS => escape_submit_venus(adapter, buf),
         HELIOS_ESCAPE_WAIT_FENCE => escape_wait_fence(buf),
-        HELIOS_ESCAPE_ALLOC_BLOB => escape_alloc_blob(adapter, buf),
+        HELIOS_ESCAPE_ALLOC_BLOB => escape_alloc_blob(adapter, buf, owner),
         HELIOS_ESCAPE_MAP_BLOB => escape_map_blob(adapter, buf, owner),
         HELIOS_ESCAPE_RELEASE_BLOB => escape_release_blob(adapter, buf, owner),
         // Unknown verbs are rejected.
@@ -78,13 +78,13 @@ pub unsafe extern "C" fn dxgkddi_escape(
 
 /// `HELIOS_ESCAPE_CTX_CREATE` → create a Venus virtio-gpu context; write the
 /// guest-assigned id back into the in/out buffer's `out_ctx_id`.
-fn escape_ctx_create(adapter: &AdapterContext, buf: &mut [u8]) -> NTSTATUS {
+fn escape_ctx_create(adapter: &AdapterContext, buf: &mut [u8], owner: usize) -> NTSTATUS {
     let sz = size_of::<HeliosEscapeCtxCreate>();
     if buf.len() < sz {
         return STATUS_BUFFER_TOO_SMALL;
     }
     let req: HeliosEscapeCtxCreate = pod_read_unaligned(&buf[..sz]);
-    match adapter.with_virtio(|v| v.ctx_create(req.capset_id)) {
+    match adapter.with_virtio(|v| v.ctx_create(req.capset_id, owner)) {
         Ok(Ok(ctx_id)) => {
             let mut out = req;
             out.out_ctx_id = ctx_id;
@@ -163,14 +163,14 @@ fn escape_wait_fence(buf: &[u8]) -> NTSTATUS {
 
 /// `HELIOS_ESCAPE_ALLOC_BLOB` → create a HOST3D virtio-gpu blob (create + attach)
 /// and record its size; write the guest-assigned `out_resource_id` back.
-fn escape_alloc_blob(adapter: &AdapterContext, buf: &mut [u8]) -> NTSTATUS {
+fn escape_alloc_blob(adapter: &AdapterContext, buf: &mut [u8], owner: usize) -> NTSTATUS {
     let sz = size_of::<HeliosEscapeAllocBlob>();
     if buf.len() < sz {
         return STATUS_BUFFER_TOO_SMALL;
     }
     let req: HeliosEscapeAllocBlob = pod_read_unaligned(&buf[..sz]);
     match adapter.with_virtio(|v| {
-        v.alloc_blob(req.ctx_id, req.blob_mem, req.blob_flags, req.blob_id, req.size)
+        v.alloc_blob(req.ctx_id, req.blob_mem, req.blob_flags, req.blob_id, req.size, owner)
     }) {
         Ok(Ok(resource_id)) => {
             let mut out = req;
