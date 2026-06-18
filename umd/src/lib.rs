@@ -376,12 +376,17 @@ unsafe extern "system" fn get_supported_versions(
     entries: *mut u32,
     supported_versions: *mut u64,
 ) -> Hresult {
-    log_line("GetSupportedVersions");
     if entries.is_null() {
+        log_line("GetSupportedVersions: null entries -> E_NOTIMPL");
         return E_NOTIMPL;
     }
 
     let requested_entries = unsafe { *entries };
+    log_line(&format!(
+        "GetSupportedVersions requested={requested_entries} bufNull={} (advertising {:#018x?})",
+        supported_versions.is_null(),
+        SUPPORTED_DDI_VERSIONS,
+    ));
     unsafe { *entries = SUPPORTED_DDI_VERSIONS.len() as u32 };
 
     if supported_versions.is_null() {
@@ -402,12 +407,28 @@ unsafe extern "system" fn get_caps(
     _h_adapter: D3d10DdiAdapterHandle,
     args: *const D3d10_2DdiArgGetCaps,
 ) -> Hresult {
-    log_line("GetCaps");
+    // D3D11DDICAPS_3DPIPELINESUPPORT (130): the runtime gates D3D11 device
+    // creation on this — return 0 and it concludes the adapter can't do D3D11 and
+    // returns DXGI_ERROR_UNSUPPORTED before ever calling CreateDevice.
+    const D3D11DDICAPS_3DPIPELINESUPPORT: u32 = 130;
+
     if !args.is_null() {
         let args = unsafe { &*args };
+        log_line(&format!(
+            "GetCaps type=0x{:08x} dataSize={} pInfo={:p}",
+            args.caps_type, args.data_size, args.p_info,
+        ));
         if !args.p_data.is_null() && args.data_size != 0 {
+            // Default: zero the output.
             unsafe { core::ptr::write_bytes(args.p_data as *mut u8, 0, args.data_size as usize) };
+            // Report 3D pipeline support so the runtime proceeds to CreateDevice.
+            if args.caps_type == D3D11DDICAPS_3DPIPELINESUPPORT && args.data_size >= 4 {
+                unsafe { *(args.p_data as *mut u32) = 1 };
+                log_line("  GetCaps: reporting 3DPIPELINESUPPORT = TRUE");
+            }
         }
+    } else {
+        log_line("GetCaps: null args");
     }
     S_OK
 }
