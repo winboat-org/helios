@@ -496,6 +496,130 @@ unsafe extern "C" fn draw(h: Hdevice, vertex_count: u32, start_vertex: u32) {
     }
 }
 
+unsafe extern "C" fn draw_indexed(
+    h: Hdevice,
+    index_count: u32,
+    start_index: u32,
+    base_vertex: i32,
+) {
+    if let Some(context) = d3d11_context(h) {
+        context.DrawIndexed(index_count, start_index, base_vertex);
+    }
+}
+
+// --- Rasterizer / depth-stencil state ---------------------------------------
+
+unsafe extern "C" fn calc_size_raster(
+    _h: Hdevice,
+    _d: *const ddi::D3D10_DDI_RASTERIZER_DESC,
+) -> u64 {
+    8
+}
+unsafe extern "C" fn calc_size_depth(
+    _h: Hdevice,
+    _d: *const ddi::D3D10_DDI_DEPTH_STENCIL_DESC,
+) -> u64 {
+    8
+}
+
+unsafe extern "C" fn create_rasterizer_state(
+    h: Hdevice,
+    desc: *const ddi::D3D10_DDI_RASTERIZER_DESC,
+    h_rs: ddi::D3D10DDI_HRASTERIZERSTATE,
+    _hrt: ddi::D3D10DDI_HRTRASTERIZERSTATE,
+) {
+    let Some(device) = d3d11_device(h) else {
+        return;
+    };
+    let d = &*desc;
+    let rd = D3D11_RASTERIZER_DESC {
+        FillMode: D3D11_FILL_MODE(d.FillMode),
+        CullMode: D3D11_CULL_MODE(d.CullMode),
+        FrontCounterClockwise: windows::Win32::Foundation::BOOL(d.FrontCounterClockwise),
+        DepthBias: d.DepthBias,
+        DepthBiasClamp: d.DepthBiasClamp,
+        SlopeScaledDepthBias: d.SlopeScaledDepthBias,
+        DepthClipEnable: windows::Win32::Foundation::BOOL(d.DepthClipEnable),
+        ScissorEnable: windows::Win32::Foundation::BOOL(d.ScissorEnable),
+        MultisampleEnable: windows::Win32::Foundation::BOOL(d.MultisampleEnable),
+        AntialiasedLineEnable: windows::Win32::Foundation::BOOL(d.AntialiasedLineEnable),
+    };
+    let mut rs: Option<ID3D11RasterizerState> = None;
+    if device.CreateRasterizerState(&rd, Some(&mut rs)).is_ok() {
+        if let Some(s) = rs {
+            store_com(h_rs.pDrvPrivate, s);
+        }
+    }
+}
+
+unsafe extern "C" fn set_rasterizer_state(h: Hdevice, h_rs: ddi::D3D10DDI_HRASTERIZERSTATE) {
+    let Some(context) = d3d11_context(h) else {
+        return;
+    };
+    match load_com::<ID3D11RasterizerState>(h_rs.pDrvPrivate) {
+        Some(s) => context.RSSetState(&*s),
+        None => context.RSSetState(None),
+    }
+}
+
+unsafe fn cvt_stencilop(d: &ddi::D3D10_DDI_DEPTH_STENCILOP_DESC) -> D3D11_DEPTH_STENCILOP_DESC {
+    D3D11_DEPTH_STENCILOP_DESC {
+        StencilFailOp: D3D11_STENCIL_OP(d.StencilFailOp),
+        StencilDepthFailOp: D3D11_STENCIL_OP(d.StencilDepthFailOp),
+        StencilPassOp: D3D11_STENCIL_OP(d.StencilPassOp),
+        StencilFunc: D3D11_COMPARISON_FUNC(d.StencilFunc),
+    }
+}
+
+unsafe extern "C" fn create_depth_stencil_state(
+    h: Hdevice,
+    desc: *const ddi::D3D10_DDI_DEPTH_STENCIL_DESC,
+    h_ds: ddi::D3D10DDI_HDEPTHSTENCILSTATE,
+    _hrt: ddi::D3D10DDI_HRTDEPTHSTENCILSTATE,
+) {
+    let Some(device) = d3d11_device(h) else {
+        return;
+    };
+    let d = &*desc;
+    let dd = D3D11_DEPTH_STENCIL_DESC {
+        DepthEnable: windows::Win32::Foundation::BOOL(d.DepthEnable),
+        DepthWriteMask: D3D11_DEPTH_WRITE_MASK(d.DepthWriteMask),
+        DepthFunc: D3D11_COMPARISON_FUNC(d.DepthFunc),
+        StencilEnable: windows::Win32::Foundation::BOOL(d.StencilEnable),
+        StencilReadMask: d.StencilReadMask,
+        StencilWriteMask: d.StencilWriteMask,
+        FrontFace: cvt_stencilop(&d.FrontFace),
+        BackFace: cvt_stencilop(&d.BackFace),
+    };
+    let mut ds: Option<ID3D11DepthStencilState> = None;
+    if device.CreateDepthStencilState(&dd, Some(&mut ds)).is_ok() {
+        if let Some(s) = ds {
+            store_com(h_ds.pDrvPrivate, s);
+        }
+    }
+}
+
+unsafe extern "C" fn set_depth_stencil_state(
+    h: Hdevice,
+    h_ds: ddi::D3D10DDI_HDEPTHSTENCILSTATE,
+    stencil_ref: u32,
+) {
+    let Some(context) = d3d11_context(h) else {
+        return;
+    };
+    match load_com::<ID3D11DepthStencilState>(h_ds.pDrvPrivate) {
+        Some(s) => context.OMSetDepthStencilState(&*s, stencil_ref),
+        None => context.OMSetDepthStencilState(None, stencil_ref),
+    }
+}
+
+unsafe extern "C" fn destroy_raster_state(_h: Hdevice, h_state: ddi::D3D10DDI_HRASTERIZERSTATE) {
+    release_com(h_state.pDrvPrivate);
+}
+unsafe extern "C" fn destroy_depth_state(_h: Hdevice, h_state: ddi::D3D10DDI_HDEPTHSTENCILSTATE) {
+    release_com(h_state.pDrvPrivate);
+}
+
 /// In-process offscreen clear+readback through the real forwarders (no install,
 /// no DXGI, no runtime): create a render-target texture, clear it, copy to a
 /// staging texture, map and read back pixel 0. Returns 0 on PASS. `h` is the
@@ -653,7 +777,7 @@ unsafe fn make_tex2d(h: Hdevice, priv_: &mut u64, usage: u32, bind: u32) -> ddi:
 /// Draw a `SV_VertexID` triangle (no vertex buffer / input layout) into an
 /// offscreen RT and read back the center pixel. Returns 0 on PASS.
 pub unsafe fn selftest_triangle(h: Hdevice) -> i32 {
-    let vs_src = b"float4 VS(uint id:SV_VertexID):SV_Position{float2 uv=float2(id&2,(id<<1)&2);return float4(uv*2-1,0,1);}\0";
+    let vs_src = b"float4 VS(uint id:SV_VertexID):SV_Position{float2 uv=float2((id<<1)&2,id&2);return float4(uv*2-1,0,1);}\0";
     let ps_src = b"float4 PS():SV_Target{return float4(1,0,0,1);}\0"; // red
     let Some(vsb) = compile_hlsl(vs_src, b"VS\0", b"vs_5_0\0") else { return 10; };
     let Some(psb) = compile_hlsl(ps_src, b"PS\0", b"ps_5_0\0") else { return 11; };
@@ -704,6 +828,19 @@ pub unsafe fn selftest_triangle(h: Hdevice) -> i32 {
     }
     vs_set_shader(h, h_vs);
     ps_set_shader(h, h_ps);
+
+    // CULL_NONE rasterizer so the (back-facing) triangle isn't culled — also
+    // validates create_rasterizer_state + set_rasterizer_state.
+    let mut rs_desc = ddi::D3D10_DDI_RASTERIZER_DESC::default();
+    rs_desc.FillMode = 3; // SOLID
+    rs_desc.CullMode = 1; // NONE
+    rs_desc.DepthClipEnable = 1;
+    let mut rs_priv = 0u64;
+    let h_rs = ddi::D3D10DDI_HRASTERIZERSTATE {
+        pDrvPrivate: &mut rs_priv as *mut u64 as *mut c_void,
+    };
+    create_rasterizer_state(h, &rs_desc, h_rs, Default::default());
+    set_rasterizer_state(h, h_rs);
 
     let mut black = [0.0f32, 0.0, 0.0, 1.0];
     clear_rtv(h, h_rtv, black.as_mut_ptr());
@@ -790,4 +927,15 @@ pub unsafe fn install(funcs: *mut ddi::D3D11DDI_DEVICEFUNCS) {
     f.pfnSetViewports = Some(set_viewports);
     f.pfnIaSetTopology = Some(ia_set_topology);
     f.pfnDraw = Some(draw);
+    f.pfnDrawIndexed = Some(draw_indexed);
+
+    // Rasterizer + depth-stencil state.
+    f.pfnCalcPrivateRasterizerStateSize = Some(calc_size_raster);
+    f.pfnCreateRasterizerState = Some(create_rasterizer_state);
+    f.pfnSetRasterizerState = Some(set_rasterizer_state);
+    f.pfnDestroyRasterizerState = Some(destroy_raster_state);
+    f.pfnCalcPrivateDepthStencilStateSize = Some(calc_size_depth);
+    f.pfnCreateDepthStencilState = Some(create_depth_stencil_state);
+    f.pfnSetDepthStencilState = Some(set_depth_stencil_state);
+    f.pfnDestroyDepthStencilState = Some(destroy_depth_state);
 }
