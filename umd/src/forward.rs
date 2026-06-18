@@ -12,7 +12,9 @@
 use core::ffi::c_void;
 use core::mem::ManuallyDrop;
 
-use windows::core::{IUnknown, Interface};
+use windows::core::{IUnknown, Interface, PCSTR};
+use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_SAMPLE_DESC};
 
@@ -345,6 +347,155 @@ unsafe extern "C" fn flush(h: Hdevice) {
     }
 }
 
+// --- Shaders ----------------------------------------------------------------
+
+/// DXBC container total byte size (header field at byte offset 24).
+unsafe fn dxbc_len(code: *const u32) -> usize {
+    *code.add(6) as usize
+}
+
+unsafe extern "C" fn calc_size_shader(
+    _h: Hdevice,
+    _code: *const u32,
+    _sig: *const ddi::D3D10DDIARG_STAGE_IO_SIGNATURES,
+) -> u64 {
+    8
+}
+
+unsafe extern "C" fn create_vertex_shader(
+    h: Hdevice,
+    code: *const u32,
+    h_shader: ddi::D3D10DDI_HSHADER,
+    _hrt: ddi::D3D10DDI_HRTSHADER,
+    _sig: *const ddi::D3D10DDIARG_STAGE_IO_SIGNATURES,
+) {
+    let Some(device) = d3d11_device(h) else {
+        return;
+    };
+    let bytes = core::slice::from_raw_parts(code as *const u8, dxbc_len(code));
+    let mut vs: Option<ID3D11VertexShader> = None;
+    match device.CreateVertexShader(bytes, None, Some(&mut vs)) {
+        Ok(()) => {
+            if let Some(s) = vs {
+                store_com(h_shader.pDrvPrivate, s);
+            }
+        }
+        Err(e) => log_line(&format!("DDI create_vertex_shader failed: {e:?}")),
+    }
+}
+
+unsafe extern "C" fn create_pixel_shader(
+    h: Hdevice,
+    code: *const u32,
+    h_shader: ddi::D3D10DDI_HSHADER,
+    _hrt: ddi::D3D10DDI_HRTSHADER,
+    _sig: *const ddi::D3D10DDIARG_STAGE_IO_SIGNATURES,
+) {
+    let Some(device) = d3d11_device(h) else {
+        return;
+    };
+    let bytes = core::slice::from_raw_parts(code as *const u8, dxbc_len(code));
+    let mut ps: Option<ID3D11PixelShader> = None;
+    match device.CreatePixelShader(bytes, None, Some(&mut ps)) {
+        Ok(()) => {
+            if let Some(s) = ps {
+                store_com(h_shader.pDrvPrivate, s);
+            }
+        }
+        Err(e) => log_line(&format!("DDI create_pixel_shader failed: {e:?}")),
+    }
+}
+
+unsafe extern "C" fn destroy_shader(_h: Hdevice, h_shader: ddi::D3D10DDI_HSHADER) {
+    release_com(h_shader.pDrvPrivate);
+}
+
+unsafe extern "C" fn vs_set_shader(h: Hdevice, h_shader: ddi::D3D10DDI_HSHADER) {
+    let Some(context) = d3d11_context(h) else {
+        return;
+    };
+    match load_com::<ID3D11VertexShader>(h_shader.pDrvPrivate) {
+        Some(s) => context.VSSetShader(&*s, None),
+        None => context.VSSetShader(None, None),
+    }
+}
+
+unsafe extern "C" fn ps_set_shader(h: Hdevice, h_shader: ddi::D3D10DDI_HSHADER) {
+    let Some(context) = d3d11_context(h) else {
+        return;
+    };
+    match load_com::<ID3D11PixelShader>(h_shader.pDrvPrivate) {
+        Some(s) => context.PSSetShader(&*s, None),
+        None => context.PSSetShader(None, None),
+    }
+}
+
+// --- Output-merger / rasterizer state setters -------------------------------
+
+#[allow(clippy::too_many_arguments)]
+unsafe extern "C" fn set_render_targets(
+    h: Hdevice,
+    rtvs: *const ddi::D3D10DDI_HRENDERTARGETVIEW,
+    num_views: u32,
+    _clear_slots: u32,
+    dsv: ddi::D3D10DDI_HDEPTHSTENCILVIEW,
+    _uavs: *const ddi::D3D11DDI_HUNORDEREDACCESSVIEW,
+    _uav_counts: *const u32,
+    _uav_start: u32,
+    _num_uavs: u32,
+    _uav_first: u32,
+    _uav_count: u32,
+) {
+    let Some(context) = d3d11_context(h) else {
+        return;
+    };
+    let mut views: Vec<Option<ID3D11RenderTargetView>> = Vec::with_capacity(num_views as usize);
+    for i in 0..num_views as usize {
+        let p = (*rtvs.add(i)).pDrvPrivate;
+        views.push(load_com::<ID3D11RenderTargetView>(p).map(|m| (*m).clone()));
+    }
+    let depth = load_com::<ID3D11DepthStencilView>(dsv.pDrvPrivate).map(|m| (*m).clone());
+    context.OMSetRenderTargets(Some(&views), depth.as_ref());
+}
+
+unsafe extern "C" fn set_viewports(
+    h: Hdevice,
+    num: u32,
+    _clear: u32,
+    vps: *const ddi::D3D10_DDI_VIEWPORT,
+) {
+    let Some(context) = d3d11_context(h) else {
+        return;
+    };
+    let mut out: Vec<D3D11_VIEWPORT> = Vec::with_capacity(num as usize);
+    for i in 0..num as usize {
+        let v = &*vps.add(i);
+        out.push(D3D11_VIEWPORT {
+            TopLeftX: v.TopLeftX as f32,
+            TopLeftY: v.TopLeftY as f32,
+            Width: v.Width as f32,
+            Height: v.Height as f32,
+            MinDepth: v.MinDepth,
+            MaxDepth: v.MaxDepth,
+        });
+    }
+    context.RSSetViewports(Some(&out));
+}
+
+unsafe extern "C" fn ia_set_topology(h: Hdevice, topo: ddi::D3D10_DDI_PRIMITIVE_TOPOLOGY) {
+    if let Some(context) = d3d11_context(h) {
+        context.IASetPrimitiveTopology(windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY(
+            topo as i32,
+        ));
+    }
+}
+
+unsafe extern "C" fn draw(h: Hdevice, vertex_count: u32, start_vertex: u32) {
+    if let Some(context) = d3d11_context(h) {
+        context.Draw(vertex_count, start_vertex);
+    }
+}
+
 /// In-process offscreen clear+readback through the real forwarders (no install,
 /// no DXGI, no runtime): create a render-target texture, clear it, copy to a
 /// staging texture, map and read back pixel 0. Returns 0 on PASS. `h` is the
@@ -443,6 +594,175 @@ pub unsafe fn selftest_offscreen_clear(h: Hdevice) -> i32 {
     result
 }
 
+unsafe fn compile_hlsl(src: &[u8], entry: &[u8], target: &[u8]) -> Option<ID3DBlob> {
+    let mut blob: Option<ID3DBlob> = None;
+    let mut errs: Option<ID3DBlob> = None;
+    let hr = D3DCompile(
+        src.as_ptr() as *const c_void,
+        src.len(),
+        PCSTR::null(),
+        None,
+        None,
+        PCSTR(entry.as_ptr()),
+        PCSTR(target.as_ptr()),
+        0,
+        0,
+        &mut blob,
+        Some(&mut errs),
+    );
+    if hr.is_err() {
+        if let Some(e) = errs {
+            let msg = core::slice::from_raw_parts(
+                e.GetBufferPointer() as *const u8,
+                e.GetBufferSize(),
+            );
+            log_line(&format!("D3DCompile error: {}", String::from_utf8_lossy(msg)));
+        }
+        return None;
+    }
+    blob
+}
+
+/// Synthesize + create a tex2d via the create_resource forwarder. Returns the
+/// resource handle private storage (caller owns it).
+unsafe fn make_tex2d(h: Hdevice, priv_: &mut u64, usage: u32, bind: u32) -> ddi::D3D10DDI_HRESOURCE {
+    let mip = ddi::D3D10DDI_MIPINFO {
+        TexelWidth: 64,
+        TexelHeight: 64,
+        TexelDepth: 1,
+        PhysicalWidth: 64,
+        PhysicalHeight: 64,
+        PhysicalDepth: 1,
+    };
+    let mut desc = ddi::D3D11DDIARG_CREATERESOURCE::default();
+    desc.pMipInfoList = &mip;
+    desc.ResourceDimension = RES_TEX2D;
+    desc.Format = 87; // BGRA
+    desc.Usage = usage;
+    desc.BindFlags = bind;
+    desc.MipLevels = 1;
+    desc.ArraySize = 1;
+    desc.SampleDesc.Count = 1;
+    let hr = ddi::D3D10DDI_HRESOURCE {
+        pDrvPrivate: priv_ as *mut u64 as *mut c_void,
+    };
+    create_resource(h, &desc, hr, Default::default());
+    hr
+}
+
+/// Draw a `SV_VertexID` triangle (no vertex buffer / input layout) into an
+/// offscreen RT and read back the center pixel. Returns 0 on PASS.
+pub unsafe fn selftest_triangle(h: Hdevice) -> i32 {
+    let vs_src = b"float4 VS(uint id:SV_VertexID):SV_Position{float2 uv=float2(id&2,(id<<1)&2);return float4(uv*2-1,0,1);}\0";
+    let ps_src = b"float4 PS():SV_Target{return float4(1,0,0,1);}\0"; // red
+    let Some(vsb) = compile_hlsl(vs_src, b"VS\0", b"vs_5_0\0") else { return 10; };
+    let Some(psb) = compile_hlsl(ps_src, b"PS\0", b"ps_5_0\0") else { return 11; };
+
+    let mut rt_priv = 0u64;
+    let h_rt = make_tex2d(h, &mut rt_priv, 0, D3D11_BIND_RENDER_TARGET.0 as u32);
+    if rt_priv == 0 {
+        return 12;
+    }
+    let mut rtv_desc = ddi::D3D10DDIARG_CREATERENDERTARGETVIEW::default();
+    rtv_desc.hDrvResource = h_rt;
+    rtv_desc.Format = 87;
+    rtv_desc.ResourceDimension = RES_TEX2D;
+    let mut rtv_priv = 0u64;
+    let h_rtv = ddi::D3D10DDI_HRENDERTARGETVIEW {
+        pDrvPrivate: &mut rtv_priv as *mut u64 as *mut c_void,
+    };
+    create_rtv(h, &rtv_desc, h_rtv, Default::default());
+    if rtv_priv == 0 {
+        return 13;
+    }
+
+    let mut vs_priv = 0u64;
+    let h_vs = ddi::D3D10DDI_HSHADER {
+        pDrvPrivate: &mut vs_priv as *mut u64 as *mut c_void,
+    };
+    create_vertex_shader(
+        h,
+        vsb.GetBufferPointer() as *const u32,
+        h_vs,
+        Default::default(),
+        core::ptr::null(),
+    );
+    let mut ps_priv = 0u64;
+    let h_ps = ddi::D3D10DDI_HSHADER {
+        pDrvPrivate: &mut ps_priv as *mut u64 as *mut c_void,
+    };
+    create_pixel_shader(
+        h,
+        psb.GetBufferPointer() as *const u32,
+        h_ps,
+        Default::default(),
+        core::ptr::null(),
+    );
+    if vs_priv == 0 || ps_priv == 0 {
+        log_line("selftest_triangle: shader create failed");
+        return 14;
+    }
+    vs_set_shader(h, h_vs);
+    ps_set_shader(h, h_ps);
+
+    let mut black = [0.0f32, 0.0, 0.0, 1.0];
+    clear_rtv(h, h_rtv, black.as_mut_ptr());
+    set_render_targets(
+        h,
+        &h_rtv,
+        1,
+        0,
+        Default::default(),
+        core::ptr::null(),
+        core::ptr::null(),
+        0,
+        0,
+        0,
+        0,
+    );
+    let vp = ddi::D3D10_DDI_VIEWPORT {
+        TopLeftX: 0.0,
+        TopLeftY: 0.0,
+        Width: 64.0,
+        Height: 64.0,
+        MinDepth: 0.0,
+        MaxDepth: 1.0,
+    };
+    set_viewports(h, 1, 0, &vp);
+    ia_set_topology(h, 4 /* TRIANGLELIST */);
+    draw(h, 3, 0);
+    flush(h);
+
+    // Read back the center pixel.
+    let mut st_priv = 0u64;
+    let h_st = make_tex2d(h, &mut st_priv, 3 /* STAGING */, 0);
+    if st_priv == 0 {
+        return 15;
+    }
+    resource_copy(h, h_st, h_rt);
+    flush(h);
+    let mut mapped = ddi::D3D10DDI_MAPPED_SUBRESOURCE::default();
+    resource_map(h, h_st, 0, 1, 0, &mut mapped);
+    let mut result = 16;
+    if !mapped.pData.is_null() {
+        let off = 32 * mapped.RowPitch as usize + 32 * 4;
+        let px = (mapped.pData as *const u8).add(off);
+        let (b, g, r, a) = (*px, *px.add(1), *px.add(2), *px.add(3));
+        log_line(&format!(
+            "selftest_triangle: center BGRA = {b} {g} {r} {a} (want red ~0 0 255 255)"
+        ));
+        result = if r > 250 && g < 5 && b < 5 && a == 255 { 0 } else { 17 };
+        resource_unmap(h, h_st, 0);
+    }
+    destroy_resource(h, h_st);
+    destroy_shader(h, h_ps);
+    destroy_shader(h, h_vs);
+    destroy_rtv(h, h_rtv);
+    destroy_resource(h, h_rt);
+    log_line(&format!("selftest_triangle: result={result} (0=PASS)"));
+    result
+}
+
 /// Install the implemented forwarders into the device-funcs table (over the
 /// stub fill). Uses the real bindgen PFN field types — no transmute.
 pub unsafe fn install(funcs: *mut ddi::D3D11DDI_DEVICEFUNCS) {
@@ -458,4 +778,16 @@ pub unsafe fn install(funcs: *mut ddi::D3D11DDI_DEVICEFUNCS) {
     f.pfnResourceMap = Some(resource_map);
     f.pfnResourceUnmap = Some(resource_unmap);
     f.pfnFlush = Some(flush);
+
+    // Shaders + pipeline.
+    f.pfnCalcPrivateShaderSize = Some(calc_size_shader);
+    f.pfnCreateVertexShader = Some(create_vertex_shader);
+    f.pfnCreatePixelShader = Some(create_pixel_shader);
+    f.pfnDestroyShader = Some(destroy_shader);
+    f.pfnVsSetShader = Some(vs_set_shader);
+    f.pfnPsSetShader = Some(ps_set_shader);
+    f.pfnSetRenderTargets = Some(set_render_targets);
+    f.pfnSetViewports = Some(set_viewports);
+    f.pfnIaSetTopology = Some(ia_set_topology);
+    f.pfnDraw = Some(draw);
 }

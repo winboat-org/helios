@@ -228,6 +228,8 @@ pub extern "system" fn helios_umd_selftest() -> i32 {
     };
     let render_rc = unsafe { forward::selftest_offscreen_clear(hdev) };
     log_line(&format!("helios_umd_selftest: offscreen clear rc={render_rc}"));
+    let tri_rc = unsafe { forward::selftest_triangle(hdev) };
+    log_line(&format!("helios_umd_selftest: triangle rc={tri_rc}"));
 
     // Tear the device back down via the real DestroyDevice entry.
     let device_funcs_table = funcs.as_ptr() as *const ddi::D3D11DDI_DEVICEFUNCS;
