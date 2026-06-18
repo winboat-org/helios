@@ -11,10 +11,12 @@ use std::io::Write;
 
 mod bridge;
 mod ddi;
+mod device_funcs;
 
 type Hresult = i32;
 
 const S_OK: Hresult = 0;
+const E_FAIL: Hresult = 0x8000_4005u32 as i32;
 const E_NOTIMPL: Hresult = 0x8000_4001u32 as i32;
 const E_OUTOFMEMORY: Hresult = 0x8007_000eu32 as i32;
 
@@ -23,18 +25,14 @@ const fn ddi_supported(major: u64, minor: u64, build: u64) -> u64 {
     (interface << 32) | (build << 16)
 }
 
-// DWM-CRASH EXPERIMENT (2026-06-18): empty = "this adapter supports no D3D
-// device DDI version yet". The runtime queries this after OpenAdapter; with a
-// non-empty (and partly fabricated) list it then picks a version and calls
-// CreateDevice, which honestly returns E_NOTIMPL — and DWM (observed calling
-// CreateDevice on Helios, pids 1896/10604) crash-loops in dwmcore on that
-// advertise-render-caps-but-fail-CreateDevice inconsistency. Returning zero
-// supported versions is the honest state until the device funcs table is real
-// (Gate 5b): the runtime should then NOT attempt CreateDevice and skip Helios
-// for D3D, which DWM handles gracefully. Restore real entries when CreateDevice
-// is backed. The Gate-5a venus path uses D3DKMT thunks directly and does NOT
-// depend on this list, so emptying it is safe for Gate 5.
-const SUPPORTED_DDI_VERSIONS: &[u64] = &[];
+// Gate 5b: advertise D3D11_0 (D3D11_0_DDI_SUPPORTED = ddi_supported(11, 10, 2);
+// Interface == D3D11_0_DDI_INTERFACE_VERSION 0x000b000a, build 2). The runtime
+// echoes this as create.Interface and so passes us the `p11DeviceFuncs`
+// (D3D11DDI_DEVICEFUNCS) table to fill. This list was previously EMPTY to dodge
+// the DWM crash-loop (DWM fail-fasts when CreateDevice on its chosen composition
+// adapter fails) — now safe because CreateDevice returns S_OK with a real device
+// funcs table backed by the DXVK device (see device_funcs.rs).
+const SUPPORTED_DDI_VERSIONS: &[u64] = &[ddi_supported(11, 10, 2)];
 
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -147,13 +145,70 @@ static mut ADAPTER_COOKIE: usize = 0x4845_4c49_4f53_554d; // "HELIOSUM"
 pub extern "system" fn helios_umd_selftest() -> i32 {
     log_line("helios_umd_selftest: creating DXVK device on venus...");
     let dev = bridge::ffi::helios_dxvk_create_device(0, 0);
-    let ok = !dev.is_null();
-    log_line(&format!("helios_umd_selftest: result ok={ok}"));
+    let bridge_ok = !dev.is_null();
+    log_line(&format!("helios_umd_selftest: bridge ok={bridge_ok}"));
     drop(dev);
-    if ok {
+    if !bridge_ok {
+        return 1;
+    }
+
+    // Exercise the full CreateDevice path in-process with synthesized runtime
+    // buffers (no D3D runtime / DWM): proves CalcPrivateDeviceSize + CreateDevice
+    // + the 152-entry table fill + DestroyDevice don't crash before risking a
+    // live install. Buffers are u64-backed for 8-byte alignment.
+    let hadapter = D3d10DdiAdapterHandle {
+        p_drv_private: core::ptr::null_mut(),
+    };
+    let dev_size = unsafe { calc_private_device_size(hadapter, core::ptr::null()) };
+
+    let mut device_priv = vec![0u64; dev_size / 8 + 1];
+    let mut funcs = vec![0u64; core::mem::size_of::<ddi::D3D11DDI_DEVICEFUNCS>() / 8 + 1];
+    let mut dxgi_funcs = vec![0u64; core::mem::size_of::<ddi::DXGI_DDI_BASE_FUNCTIONS>() / 8 + 1];
+
+    let arg = D3d10DdiArgCreateDevice {
+        h_rt_device: core::ptr::null_mut(),
+        interface: 0x000b_000a, // D3D11_0_DDI_INTERFACE_VERSION
+        version: 0,
+        p_kt_callbacks: core::ptr::null(),
+        p_device_funcs: funcs.as_mut_ptr().cast(),
+        h_drv_device: device_priv.as_mut_ptr().cast(),
+        dxgi_base_ddi: DxgiDdiBaseArgs {
+            p_dxgi_base_callbacks: core::ptr::null(),
+            p_dxgi_ddi_base_functions: dxgi_funcs.as_mut_ptr().cast(),
+        },
+        h_rt_core_layer: core::ptr::null_mut(),
+        p_um_callbacks: core::ptr::null(),
+        flags: 0,
+        ppfn_retrieve_sub_object: core::ptr::null_mut(),
+    };
+
+    let hr = unsafe { create_device(hadapter, &arg as *const _ as *mut c_void) };
+    log_line(&format!("helios_umd_selftest: synthesized CreateDevice -> 0x{hr:08x}"));
+    if hr != S_OK {
+        return 2;
+    }
+
+    // Sanity: the table must be fully non-null (a null entry the runtime calls = crash).
+    let table = funcs.as_ptr() as *const Option<unsafe extern "C" fn(usize) -> usize>;
+    let n = core::mem::size_of::<ddi::D3D11DDI_DEVICEFUNCS>() / 8;
+    let null_slots = (0..n)
+        .filter(|&i| unsafe { (*table.add(i)).is_none() })
+        .count();
+    log_line(&format!("helios_umd_selftest: device-funcs null slots = {null_slots} / {n}"));
+
+    // Tear the device back down via the real DestroyDevice entry.
+    let device_funcs_table = funcs.as_ptr() as *const ddi::D3D11DDI_DEVICEFUNCS;
+    if let Some(destroy) = unsafe { (*device_funcs_table).pfnDestroyDevice } {
+        let hdev = ddi::D3D10DDI_HDEVICE {
+            pDrvPrivate: device_priv.as_mut_ptr().cast(),
+        };
+        unsafe { destroy(hdev) };
+    }
+
+    if null_slots == 0 {
         0
     } else {
-        1
+        3
     }
 }
 
@@ -241,8 +296,9 @@ unsafe extern "system" fn calc_private_device_size(
     _h_adapter: D3d10DdiAdapterHandle,
     _args: *const c_void,
 ) -> usize {
-    log_line("CalcPrivateDeviceSize -> 0");
-    0
+    let size = device_funcs::device_private_size();
+    log_line(&format!("CalcPrivateDeviceSize -> {size}"));
+    size
 }
 
 unsafe extern "system" fn create_device(
@@ -260,31 +316,54 @@ unsafe extern "system" fn create_device(
     let create = unsafe { &*(args as *const D3d10DdiArgCreateDevice) };
     log_line(&format!(
         "CreateDevice interface=0x{:08x} version=0x{:08x} flags=0x{:08x} \
-         pDeviceFuncs={:p} pKTCallbacks={:p} pUMCallbacks={:p} pDXGIBaseFuncs={:p}",
+         pDeviceFuncs={:p} hDrvDevice={:p} pKTCallbacks={:p} pUMCallbacks={:p} pDXGIBaseFuncs={:p}",
         create.interface,
         create.version,
         create.flags,
         create.p_device_funcs,
+        create.h_drv_device,
         create.p_kt_callbacks,
         create.p_um_callbacks,
         create.dxgi_base_ddi.p_dxgi_ddi_base_functions,
     ));
 
-    // Gate 5b smoke test: bring up a DXVK device on the Helios venus adapter from
-    // inside the D3D runtime's CreateDevice path. We do NOT yet fill the device
-    // funcs table (that's the Milestone-1 work) — returning S_OK with a half-baked
-    // table corrupts DWM/Explorer (the .52/.53 lesson). So we still return
-    // E_NOTIMPL, but prove the engine round-trips venus here first.
-    let dxvk_device = bridge::ffi::helios_dxvk_create_device(0, 0);
-    if dxvk_device.is_null() {
-        log_line("  bridge: DXVK device creation FAILED (see helios_umd.log dxvk-bridge lines)");
-    } else {
-        log_line("  bridge: DXVK device created on venus OK (engine reachable from UMD)");
+    // 1) Bring up the DXVK device on the Helios venus adapter.
+    let dxvk = bridge::ffi::helios_dxvk_create_device(0, 0);
+    if dxvk.is_null() {
+        log_line("  CreateDevice: DXVK device creation FAILED -> E_FAIL");
+        return E_FAIL;
     }
-    drop(dxvk_device);
 
-    log_line("  -> E_NOTIMPL (Gate 5b: device funcs table not yet backed; honest failure)");
-    E_NOTIMPL
+    // 2) Construct our device object in the runtime-allocated private memory
+    //    (size came from CalcPrivateDeviceSize). hDrvDevice IS that pointer.
+    if create.h_drv_device.is_null() {
+        log_line("  CreateDevice: null hDrvDevice -> E_FAIL");
+        return E_FAIL;
+    }
+    unsafe {
+        core::ptr::write(
+            create.h_drv_device as *mut device_funcs::HeliosDevice,
+            device_funcs::HeliosDevice { dxvk },
+        );
+    }
+
+    // 3) Fill the device-funcs table (Interface == D3D11_0 -> p11DeviceFuncs) and
+    //    the DXGI base DDI table the runtime handed us.
+    if create.p_device_funcs.is_null() {
+        log_line("  CreateDevice: null pDeviceFuncs -> E_FAIL");
+        return E_FAIL;
+    }
+    unsafe {
+        device_funcs::fill_d3d11_device_funcs(
+            create.p_device_funcs as *mut ddi::D3D11DDI_DEVICEFUNCS,
+        );
+        device_funcs::fill_dxgi_base_funcs(
+            create.dxgi_base_ddi.p_dxgi_ddi_base_functions as *mut ddi::DXGI_DDI_BASE_FUNCTIONS,
+        );
+    }
+
+    log_line("  CreateDevice -> S_OK (DXVK device + D3D11 funcs table installed)");
+    S_OK
 }
 
 unsafe extern "system" fn close_adapter(_h_adapter: D3d10DdiAdapterHandle) -> Hresult {
@@ -333,7 +412,7 @@ unsafe extern "system" fn get_caps(
     S_OK
 }
 
-fn log_line(message: &str) {
+pub(crate) fn log_line(message: &str) {
     if let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
