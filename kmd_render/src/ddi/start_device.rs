@@ -11,6 +11,12 @@ use core::ffi::c_void;
 use crate::adapter::AdapterContext;
 use crate::dxgk::*;
 
+/// Run the in-StartDevice venus self-allocation of the page-table window. Gated so
+/// the safe/recovery build boots cleanly: the venus client busy-polls a ring in
+/// StartDevice and a protocol bug there can hang/crash boot. Turn ON only when
+/// debugging the venus path with ntoseye attached (so a wedge is catchable).
+const VENUS_ALLOC_ENABLED: bool = true;
+
 /// `DxgkDdiStartDevice` — bring the adapter online.
 pub unsafe extern "C" fn dxgkddi_start_device(
     miniport_device_context: *mut c_void,
@@ -57,13 +63,76 @@ pub unsafe extern "C" fn dxgkddi_start_device(
         Ok(gpu) => {
             crate::kmsg(c"Helios: virtio-gpu transport up\n");
             crate::diag::record(0x0B00_0003);
+            // Publish the ISR-status register VA for the DIRQL ISR before the
+            // transport goes live (capture before `gpu` is moved into set_virtio).
+            adapter
+                .isr_status
+                .store(gpu.isr_status_addr(), core::sync::atomic::Ordering::Release);
             adapter.set_virtio(Some(gpu));
+
+            // ── Venus-backed page-table memory (best-effort) ─────────────────
+            // Self-allocate a 16-MiB HOST_VISIBLE|HOST_COHERENT VkDeviceMemory over
+            // venus and expose it as a BAR-backed, CPU-coherent region VidMm can
+            // register as the page-table segment (VidMm drops a system-RAM segment;
+            // it accepts device-BAR memory backed by real host memory). Runs at
+            // PASSIVE in this single-threaded StartDevice, so we take the transport
+            // WITHOUT the DISPATCH spinlock (MmMapIoSpace + ring busy-polls are
+            // illegal under it). On any failure we record diag and leave
+            // page_table_window = None — never fail StartDevice (Gate 1 stays
+            // start-safe). See virtio::venus.
+            // SAFETY: PASSIVE_LEVEL inside StartDevice; Dxgkrnl serializes the
+            // lifecycle DDIs and no escape/DPC path touches the transport yet, so
+            // the unlocked transport access is single-threaded.
+            if !VENUS_ALLOC_ENABLED {
+                // venus page-table allocation disabled — boot-safe build.
+                adapter.venus_ctx_id = 0;
+                adapter.venus_client = None;
+                adapter.page_table_window = None;
+            } else {
+                let venus_result = unsafe {
+                    adapter.with_virtio_passive(|v| {
+                        // Persistent venus context for the device lifetime (owner 0:
+                        // KMD-internal, destroyed explicitly in StopDevice).
+                        let ctx_id = v.ctx_create(helios_protocol::VIRTIO_GPU_CAPSET_VENUS, 0)?;
+                        let (client, blob) =
+                            crate::virtio::venus::allocate_host_visible_blob(v, ctx_id)?;
+                        Ok::<_, crate::virtio::VirtioError>((ctx_id, client, blob))
+                    })
+                };
+                match venus_result {
+                    Ok(Ok((ctx_id, client, blob))) => {
+                        crate::diag::record(0x0B00_0007);
+                        adapter.venus_ctx_id = ctx_id;
+                        adapter.venus_client = Some(client);
+                        adapter.page_table_window = Some((blob.gpa, blob.size));
+                    }
+                    Ok(Err(e)) => {
+                        // venus bring-up failed; transport is up but no page-table window.
+                        let status: NTSTATUS = e.into();
+                        crate::diag::record(0x0B00_00E7);
+                        crate::diag::record(status as u32);
+                        adapter.venus_ctx_id = 0;
+                        adapter.venus_client = None;
+                        adapter.page_table_window = None;
+                    }
+                    Err(_) => {
+                        // Transport not up (should not happen — we just set it).
+                        crate::diag::record(0x0B00_00E8);
+                        adapter.venus_ctx_id = 0;
+                        adapter.venus_client = None;
+                        adapter.page_table_window = None;
+                    }
+                }
+            } // end if VENUS_ALLOC_ENABLED
         }
         Err(e) => {
             crate::kmsg(c"Helios: virtio-gpu init FAILED\n");
             let status: NTSTATUS = e.into();
             crate::diag::record(0x0B00_00E0);
             crate::diag::record(status as u32);
+            adapter
+                .isr_status
+                .store(0, core::sync::atomic::Ordering::Release);
             adapter.set_virtio(None);
         }
     }
@@ -85,6 +154,27 @@ pub unsafe extern "C" fn dxgkddi_stop_device(miniport_device_context: *mut c_voi
     if !miniport_device_context.is_null() {
         // SAFETY: our adapter context, handed back from AddDevice.
         let adapter = unsafe { &mut *(miniport_device_context as *mut AdapterContext) };
+        // Stop the ISR from touching the (about-to-be-reset) device first.
+        adapter
+            .isr_status
+            .store(0, core::sync::atomic::Ordering::Release);
+
+        // Tear down the venus client + page-table blob + context BEFORE dropping
+        // the transport (the unref/detach/destroy commands need the live device).
+        // Drop the client first to unmap its ring/reply BAR kernel mappings.
+        let venus_ctx = adapter.venus_ctx_id;
+        adapter.venus_client = None; // Drop → MmUnmapIoSpace ring + reply mappings.
+        adapter.page_table_window = None;
+        adapter.venus_ctx_id = 0;
+        if venus_ctx != 0 {
+            // Best-effort: unref every KMD-internal blob (owner 0) and destroy the
+            // venus context. Done under the spinlock (control-queue round-trips).
+            let _ = adapter.with_virtio(|v| {
+                v.release_blobs_for_owner(0);
+                let _ = v.ctx_destroy(venus_ctx);
+            });
+        }
+
         // Tear down the virtio transport: VirtioGpu::drop resets the device and
         // frees its rings + scratch. A later StartDevice re-initializes.
         adapter.set_virtio(None);

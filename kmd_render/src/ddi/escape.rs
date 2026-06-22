@@ -18,13 +18,15 @@ use core::mem::size_of;
 use bytemuck::{bytes_of, pod_read_unaligned};
 use helios_protocol::{
     HeliosEscapeAllocBlob, HeliosEscapeCtxCreate, HeliosEscapeCtxDestroy, HeliosEscapeHeader,
-    HeliosEscapeMapBlob, HeliosEscapeReleaseBlob, HeliosEscapeSubmitVenus, HELIOS_ESCAPE_ALLOC_BLOB,
-    HELIOS_ESCAPE_CTX_CREATE, HELIOS_ESCAPE_CTX_DESTROY, HELIOS_ESCAPE_MAP_BLOB,
-    HELIOS_ESCAPE_RELEASE_BLOB, HELIOS_ESCAPE_SUBMIT_VENUS, HELIOS_ESCAPE_WAIT_FENCE,
+    HeliosEscapeMapBlob, HeliosEscapeReleaseBlob, HeliosEscapeSubmitVenus,
+    HELIOS_ESCAPE_ALLOC_BLOB, HELIOS_ESCAPE_CTX_CREATE, HELIOS_ESCAPE_CTX_DESTROY,
+    HELIOS_ESCAPE_MAP_BLOB, HELIOS_ESCAPE_RELEASE_BLOB, HELIOS_ESCAPE_SUBMIT_VENUS,
+    HELIOS_ESCAPE_WAIT_FENCE,
 };
 
-use super::blob_map::{effective_map_cache, map_cache_to_mm, map_io_pages_to_user,
-    unmap_io_pages_from_user};
+use super::blob_map::{
+    effective_map_cache, map_cache_to_mm, map_io_pages_to_user, unmap_io_pages_from_user,
+};
 use crate::adapter::AdapterContext;
 use crate::dxgk::*;
 use crate::virtio::hal::DmaBuffer;
@@ -169,8 +171,18 @@ fn escape_alloc_blob(adapter: &AdapterContext, buf: &mut [u8], owner: usize) -> 
         return STATUS_BUFFER_TOO_SMALL;
     }
     let req: HeliosEscapeAllocBlob = pod_read_unaligned(&buf[..sz]);
+    // DIAG: 0x0E04_HHHH = ALLOC_BLOB's owning handle (low 16 bits), to confirm it
+    // matches the handle DxgkDdiDestroyDevice reclaims under (0x0E01_HHHH).
+    crate::diag::record(0x0E04_0000 | ((owner as u32) & 0xFFFF));
     match adapter.with_virtio(|v| {
-        v.alloc_blob(req.ctx_id, req.blob_mem, req.blob_flags, req.blob_id, req.size, owner)
+        v.alloc_blob(
+            req.ctx_id,
+            req.blob_mem,
+            req.blob_flags,
+            req.blob_id,
+            req.size,
+            owner,
+        )
     }) {
         Ok(Ok(resource_id)) => {
             let mut out = req;

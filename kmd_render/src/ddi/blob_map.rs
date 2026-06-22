@@ -15,10 +15,8 @@ use core::mem::size_of;
 use helios_protocol::{
     VIRTIO_GPU_MAP_CACHE_CACHED, VIRTIO_GPU_MAP_CACHE_UNCACHED, VIRTIO_GPU_MAP_CACHE_WC,
 };
-use wdk_sys::ntddk::{
-    IoAllocateMdl, IoFreeMdl, MmMapLockedPagesSpecifyCache, MmUnmapLockedPages,
-};
-use wdk_sys::{MDL, PMDL, PVOID, ULONG, _MEMORY_CACHING_TYPE};
+use wdk_sys::ntddk::{IoAllocateMdl, IoFreeMdl, MmMapLockedPagesSpecifyCache, MmUnmapLockedPages};
+use wdk_sys::{_MEMORY_CACHING_TYPE, MDL, PMDL, PVOID, ULONG};
 
 /// log2(page size). The host-visible window is mapped page-granular.
 const PAGE_SHIFT: u32 = 12;

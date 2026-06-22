@@ -72,9 +72,7 @@ pub unsafe extern "C" fn dxgkddi_destroy_device(h_device: *mut c_void) -> NTSTAT
         while let Some((user_va, mdl)) = adapter.mappings.take_one_for(owner) {
             // SAFETY: PASSIVE_LEVEL in the creating process; pair from a prior
             // MAP_BLOB on this device handle.
-            unsafe {
-                crate::ddi::unmap_io_pages_from_user(user_va, mdl as *mut wdk_sys::MDL)
-            };
+            unsafe { crate::ddi::unmap_io_pages_from_user(user_va, mdl as *mut wdk_sys::MDL) };
         }
         // Reclaim any virtio blobs / contexts this device allocated but did not
         // release (ICD crash, or a process that skipped RELEASE_BLOB/CTX_DESTROY —
@@ -82,16 +80,26 @@ pub unsafe extern "C" fn dxgkddi_destroy_device(h_device: *mut c_void) -> NTSTAT
         // across device creations and later ALLOC_BLOBs fail STATUS_INSUFFICIENT_
         // RESOURCES, surfacing as spurious "venus wedge" / render corruption. If
         // the transport is already gone (StopDevice), there is nothing to reclaim.
+        // DIAG: 0x0E00_0001 = DestroyDevice entry (unconditional). Low 16 bits of
+        // the owning handle so we can correlate with ALLOC_BLOB's owner.
+        crate::diag::record(0x0E00_0001);
+        crate::diag::record(0x0E01_0000 | ((owner as u32) & 0xFFFF));
+        // Mirror the GpuMmu page-table-DDI tracers into the PASSIVE ring so the
+        // post-CreateContext Code-43 failure stage is visible over SSH without
+        // ntoseye (Step-2 decorative-GpuMmu bring-up).
+        crate::ddi::diag_dump_gpummu_atomics();
+        // Engine-path tracers (SubmitCommand/Render/Patch/ISR/DPC counts): show
+        // whether VidSch exercised the submission engine at all before the
+        // post-CreateContext VidSchTerminateAdapter Code-43 (Step-2 coherent fence).
+        crate::ddi::diag_dump_engine_atomics();
         let _ = adapter.with_virtio(|v| {
+            let before = v.blob_count() as u32;
             let blobs = v.release_blobs_for_owner(owner);
             let contexts = v.destroy_contexts_for_owner(owner);
-            if blobs != 0 || contexts != 0 {
-                // 0x0Bnn pattern matches the gpu.rs diag namespace; low bytes carry
-                // the reclaimed counts (saturated to a byte) for post-mortem triage.
-                crate::diag::record(
-                    0x0B00_0D00 | ((blobs.min(0xF) << 4) | contexts.min(0xF)),
-                );
-            }
+            // 0x0E02_BBBB = blob-table size BEFORE reclaim (saturated to 16 bits).
+            crate::diag::record(0x0E02_0000 | before.min(0xFFFF));
+            // 0x0E03_RRCC = reclaimed blobs (RR) + contexts (CC).
+            crate::diag::record(0x0E03_0000 | ((blobs.min(0xFF) << 8) | contexts.min(0xFF)));
         });
         // SAFETY: produced by Box::into_raw in create_device; destroyed exactly once.
         drop(unsafe { Box::from_raw(h_device as *mut DeviceContext) });
@@ -102,6 +110,10 @@ pub unsafe extern "C" fn dxgkddi_destroy_device(h_device: *mut c_void) -> NTSTAT
 /// `DxgkDdiCreateContext` — GPU execution context.
 ///
 // STUB: Phase 4 — create the Venus virtio-gpu context here.
+// NOTE: a TEMP int3 debug breakpoint lived here during the Step-2 GpuMmu bring-up
+// and was removed (ntoseye is a gdbstub, not a Windows KD — a bare int3 BSODs the
+// guest instead of trapping). Use a spin-loop released via ntoseye write_memory if
+// a live pause is needed. This comment also forces a clean recompile.
 pub unsafe extern "C" fn dxgkddi_create_context(
     h_device: *mut c_void,
     create_context: *mut DXGKARG_CREATECONTEXT,
@@ -117,7 +129,13 @@ pub unsafe extern "C" fn dxgkddi_create_context(
     });
     args.hContext = Box::into_raw(ctx) as HANDLE;
 
-    args.ContextInfo.DmaBufferSegmentSet = 0;
+    // Use the paging aperture for DMA buffers. With the decorative GpuMmu model,
+    // dxgkrnl's CDD context creates a privileged DMA pool with GPU-VA mapping
+    // enabled; if this is 0, dxgmms2 uses contiguous system memory, skips creating
+    // a VIDMM allocation object, then later dereferences that null allocation in
+    // VidMmInitDmaPool. A nonzero aperture segment set makes VidMm back the pool
+    // through the normal aperture allocation path.
+    args.ContextInfo.DmaBufferSegmentSet = 1; // segment id 1 (aperture)
     args.ContextInfo.DmaBufferSize = 256 * 1024;
     args.ContextInfo.DmaBufferPrivateDataSize = 40;
     args.ContextInfo.AllocationListSize = DXGK_ALLOCATION_LIST_SIZE_GDICONTEXT;

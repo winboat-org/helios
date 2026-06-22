@@ -20,13 +20,14 @@ use helios_protocol::{
     resp_is_ok, VirtioGpuCmdSubmit, VirtioGpuCtrlHdr, VirtioGpuCtxCreate, VirtioGpuCtxDestroy,
     VirtioGpuCtxResource, VirtioGpuResourceCreateBlob, VirtioGpuResourceMapBlob,
     VirtioGpuResourceUnmapBlob, VirtioGpuResourceUnref, VirtioGpuRespDisplayInfo,
-    VirtioGpuRespMapInfo, HELIOS_OPTIONAL_FEATURES, HELIOS_REQUIRED_FEATURES, VIRTIO_GPU_CAPSET_VENUS,
-    VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE, VIRTIO_GPU_CMD_CTX_CREATE,
-    VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE, VIRTIO_GPU_CMD_CTX_DESTROY,
+    VirtioGpuRespMapInfo, HELIOS_OPTIONAL_FEATURES, HELIOS_REQUIRED_FEATURES,
+    VIRTIO_GPU_CAPSET_VENUS, VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE, VIRTIO_GPU_CMD_CTX_CREATE,
+    VIRTIO_GPU_CMD_CTX_DESTROY, VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE,
     VIRTIO_GPU_CMD_GET_DISPLAY_INFO, VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB,
     VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB, VIRTIO_GPU_CMD_RESOURCE_UNMAP_BLOB,
     VIRTIO_GPU_CMD_RESOURCE_UNREF, VIRTIO_GPU_CMD_SUBMIT_3D, VIRTIO_GPU_FLAG_FENCE,
-    VIRTIO_GPU_MAP_CACHE_MASK, VIRTIO_GPU_SHM_ID_HOST_VISIBLE, VIRTIO_PCI_CAP_SHARED_MEMORY_CFG,
+    VIRTIO_GPU_MAP_CACHE_MASK, VIRTIO_GPU_SHM_ID_HOST_VISIBLE, VIRTIO_PCI_CAP_ISR_CFG,
+    VIRTIO_PCI_CAP_SHARED_MEMORY_CFG,
 };
 use virtio_drivers::queue::VirtQueue;
 use virtio_drivers::transport::pci::bus::{ConfigurationAccess, DeviceFunction, PciRoot};
@@ -131,10 +132,10 @@ fn scan_host_visible_window(access: &DxgkConfigAccess) -> Option<HostVisibleWind
             let shmid = (d1 >> 8) & 0xFF;
             if shmid == VIRTIO_GPU_SHM_ID_HOST_VISIBLE as u32 {
                 // `virtio_pci_cap64`: offset lo/hi at +8/+16, length lo/hi at +12/+20.
-                let off =
-                    cfg_read32(access, cap + 8) as u64 | ((cfg_read32(access, cap + 16) as u64) << 32);
-                let len =
-                    cfg_read32(access, cap + 12) as u64 | ((cfg_read32(access, cap + 20) as u64) << 32);
+                let off = cfg_read32(access, cap + 8) as u64
+                    | ((cfg_read32(access, cap + 16) as u64) << 32);
+                let len = cfg_read32(access, cap + 12) as u64
+                    | ((cfg_read32(access, cap + 20) as u64) << 32);
                 let base = bar_base(access, bar)?;
                 return Some(HostVisibleWindow {
                     base: base + off,
@@ -145,6 +146,50 @@ fn scan_host_visible_window(access: &DxgkConfigAccess) -> Option<HostVisibleWind
         cap = cap_next;
     }
     None
+}
+
+/// Walk the PCI capability list for the virtio `ISR_CFG` capability and map its
+/// 1-byte ISR-status register, returning the mapped kernel VA (0 if absent).
+///
+/// This register is **read-to-clear**: reading it returns the pending-interrupt
+/// bits (bit0 = used-ring/queue interrupt, bit1 = config change) and DEASSERTS
+/// the device's level-triggered INTx line. `DxgkDdiInterruptRoutine` reads it at
+/// DIRQL to acknowledge the line (the device is line-based INTx — `MSISupported=0`
+/// — so without this read the line stays high and Windows' interrupt-storm
+/// detector disables the adapter → Code 43). virtio-drivers' `PciTransport`
+/// owns this register internally and never exposes its VA, and its `ack_interrupt`
+/// needs `&mut self` (the queue lock) which the ISR cannot take at DIRQL — so we
+/// locate and map the register ourselves and read it lock-free.
+fn map_isr_status_register(access: &DxgkConfigAccess) -> usize {
+    if (cfg_read32(access, PCI_CFG_STATUS) >> 16) & PCI_STATUS_CAP_LIST == 0 {
+        return 0;
+    }
+    let mut cap = (cfg_read32(access, PCI_CFG_CAP_PTR) & 0xFF) as u16 & 0xFC;
+    for _ in 0..48 {
+        if cap == 0 {
+            break;
+        }
+        let d0 = cfg_read32(access, cap);
+        let cap_id = d0 & 0xFF;
+        let cap_next = ((d0 >> 8) & 0xFF) as u16 & 0xFC;
+        let cfg_type = (d0 >> 24) & 0xFF;
+        if cap_id == PCI_CAP_ID_VNDR && cfg_type == VIRTIO_PCI_CAP_ISR_CFG as u32 {
+            // `virtio_pci_cap`: bar at +4 byte0; offset (u32) at +8.
+            let bar = (cfg_read32(access, cap + 4) & 0xFF) as u16;
+            let offset = cfg_read32(access, cap + 8) as u64;
+            let Some(base) = bar_base(access, bar) else {
+                return 0;
+            };
+            let phys = base + offset;
+            // SAFETY: maps a real device BAR sub-region (the ISR-status register)
+            // at PASSIVE_LEVEL via the shared MMIO cache; non-cached MMIO.
+            let va =
+                unsafe { <WdkHal as Hal>::mmio_phys_to_virt(phys as virtio_drivers::PhysAddr, 16) };
+            return va.as_ptr() as usize;
+        }
+        cap = cap_next;
+    }
+    0
 }
 
 // ── Host-visible blob mapping (Gate 5a Stage 2b, venus-over-Escape) ──────────
@@ -241,6 +286,11 @@ pub struct VirtioGpu {
     /// in `init`. `None` if the device exposes no host-visible window — the WDDM
     /// blob-map path is then unavailable (Stage 2 fails honestly). Gate 5a Stage 2.
     host_visible: Option<HostVisibleWindow>,
+    /// Mapped kernel VA of the virtio ISR-status register (read-to-clear), or 0 if
+    /// the device exposes no ISR cap. `DxgkDdiInterruptRoutine` reads this at DIRQL
+    /// to acknowledge the line-based INTx (the device is `MSISupported=0`). See
+    /// [`map_isr_status_register`].
+    isr_status_va: usize,
     /// Tracked blobs (resource_id → size/mapping state). Heap-reserved to MAX_BLOBS
     /// at init so `push` under the spinlock never reallocates (the 0x7F lesson).
     blobs: Vec<BlobSlot>,
@@ -355,6 +405,15 @@ impl VirtioGpu {
             0x0B00_00E5
         });
 
+        // Locate + map the ISR-status register so the (real) ISR can read-to-clear
+        // the level-triggered INTx line and stop the unhandled-interrupt storm.
+        let isr_status_va = map_isr_status_register(&DxgkConfigAccess::new(dxgkrnl));
+        crate::diag::record(if isr_status_va != 0 {
+            0x0B00_0006
+        } else {
+            0x0B00_00E6
+        });
+
         let mut gpu = Self {
             transport,
             control,
@@ -362,6 +421,7 @@ impl VirtioGpu {
             next_ctx_id: AtomicU32::new(1),
             next_resource_id: AtomicU32::new(1),
             host_visible,
+            isr_status_va,
             blobs: Vec::with_capacity(MAX_BLOBS),
             contexts: Vec::with_capacity(MAX_CONTEXTS),
             next_window_offset: 0,
@@ -380,6 +440,17 @@ impl VirtioGpu {
         let resp = gpu.self_test_venus_context();
         crate::diag::record(0x0B00_0010);
         crate::diag::record(resp);
+
+        // Read-to-clear the ISR-status register once: the GET_DISPLAY_INFO + venus
+        // self-test commands above completed via the polled path, which never
+        // touches this register, so the device may still be asserting INTx from
+        // those completions. Clear it now (PASSIVE) so the line starts deasserted
+        // before dxgkrnl connects our interrupt.
+        if gpu.isr_status_va != 0 {
+            // SAFETY: `isr_status_va` is the mapped MMIO VA of the 1-byte
+            // read-to-clear ISR-status register; a volatile read clears it.
+            let _ = unsafe { core::ptr::read_volatile(gpu.isr_status_va as *const u8) };
+        }
 
         Ok(gpu)
     }
@@ -554,6 +625,33 @@ impl VirtioGpu {
         Ok(resource_id)
     }
 
+    /// Record a blob's size in the tracking table so a later [`map_blob_prepare`]
+    /// can size the mapping. Used by the in-kernel venus client, which creates its
+    /// ring/reply/page-table blobs via `resource_create_blob` directly (it owns the
+    /// resource lifecycle for the device lifetime rather than per-escape) and must
+    /// register the size the same way [`alloc_blob`] does for the escape path.
+    /// `owner = 0` marks a KMD-internal blob (not reclaimed by an escape owner).
+    /// Silently no-ops if the table is full (the map_prepare then fails honestly).
+    pub fn note_blob_size(&mut self, resource_id: u32, size: u64) {
+        if self.blobs.iter().any(|s| s.resource_id == resource_id) {
+            return;
+        }
+        if self.blobs.len() >= MAX_BLOBS {
+            return;
+        }
+        // Record with ctx_id 0 / owner 0: these blobs are not driven by an escape
+        // device handle; teardown unrefs them explicitly via the venus client.
+        self.blobs.push(BlobSlot {
+            owner: 0,
+            ctx_id: 0,
+            resource_id,
+            size,
+            mapped: false,
+            map_offset: 0,
+            map_len: 0,
+        });
+    }
+
     /// `HELIOS_ESCAPE_MAP_BLOB` under-lock phase: pick a window offset, issue
     /// `RESOURCE_MAP_BLOB`, and return the guest-physical range + host caching for the
     /// caller to map into user space (PASSIVE, outside the lock). The guest chooses
@@ -622,6 +720,11 @@ impl VirtioGpu {
     /// as spurious render corruption / "venus wedge". Returns the count reclaimed.
     /// Called under the virtio spinlock at `DxgkDdiDestroyDevice`; `swap_remove`
     /// never reallocates, so it stays lock-safe.
+    /// Current number of tracked blob slots (diagnostics).
+    pub fn blob_count(&self) -> usize {
+        self.blobs.len()
+    }
+
     pub fn release_blobs_for_owner(&mut self, owner: usize) -> u32 {
         let mut reclaimed = 0u32;
         let mut i = 0;
@@ -764,6 +867,13 @@ impl VirtioGpu {
     /// segment offset to `base` for the user mapping. Gate 5a Stage 2.
     pub fn host_visible(&self) -> Option<HostVisibleWindow> {
         self.host_visible
+    }
+
+    /// Mapped kernel VA of the virtio ISR-status register (read-to-clear), or 0 if
+    /// the device exposes no ISR cap. `DxgkDdiStartDevice` copies this into the
+    /// `AdapterContext` so the DIRQL ISR can acknowledge the INTx line lock-free.
+    pub fn isr_status_addr(&self) -> usize {
+        self.isr_status_va
     }
 
     /// Map a HOST3D mappable blob into the host-visible window at `offset` — for

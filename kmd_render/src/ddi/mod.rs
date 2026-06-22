@@ -4,9 +4,11 @@
 mod add_device;
 mod blob_map;
 mod build_paging_buffer;
+mod cpu_host_aperture;
 mod create_allocation;
 mod display;
 mod escape;
+mod gpummu;
 mod interrupt;
 mod query_adapter_info;
 mod scheduler;
@@ -16,8 +18,10 @@ mod submit_command;
 pub use add_device::dxgkddi_add_device;
 pub use blob_map::unmap_io_pages_from_user;
 pub use build_paging_buffer::{
-    dxgkddi_build_paging_buffer, dxgkddi_get_root_page_table_size, dxgkddi_set_root_page_table,
+    diag_dump_gpummu_atomics, dxgkddi_build_paging_buffer, dxgkddi_get_root_page_table_size,
+    dxgkddi_set_root_page_table,
 };
+pub use cpu_host_aperture::{dxgkddi_map_cpu_host_aperture, dxgkddi_unmap_cpu_host_aperture};
 pub use create_allocation::{
     dxgkddi_close_allocation, dxgkddi_create_allocation, dxgkddi_describe_allocation,
     dxgkddi_destroy_allocation, dxgkddi_get_standard_allocation_driver_data,
@@ -51,7 +55,7 @@ pub use start_device::{
     dxgkddi_start_device, dxgkddi_stop_device, dxgkddi_unload,
 };
 pub use submit_command::{
-    dxgkddi_collect_dbg_info, dxgkddi_patch, dxgkddi_preempt_command, dxgkddi_query_current_fence,
-    dxgkddi_render, dxgkddi_render_km, dxgkddi_reset_from_timeout, dxgkddi_restart_from_timeout,
-    dxgkddi_submit_command, dxgkddi_submit_command_virtual,
+    diag_dump_engine_atomics, dxgkddi_collect_dbg_info, dxgkddi_patch, dxgkddi_preempt_command,
+    dxgkddi_query_current_fence, dxgkddi_render, dxgkddi_render_km, dxgkddi_reset_from_timeout,
+    dxgkddi_restart_from_timeout, dxgkddi_submit_command, dxgkddi_submit_command_virtual,
 };

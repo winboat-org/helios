@@ -16,6 +16,7 @@
 pub mod config;
 pub mod gpu;
 pub mod hal;
+pub mod venus;
 
 pub use gpu::VirtioGpu;
 

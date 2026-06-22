@@ -31,7 +31,7 @@ const RTL_REGISTRY_SERVICES: u32 = 1;
 /// `REG_DWORD`.
 const REG_DWORD: u32 = 4;
 /// Cap on breadcrumbs so a chatty steady state can't grow the key unbounded.
-const MAX_STEPS: u32 = 160;
+const MAX_STEPS: u32 = 3000;
 
 static STEP: AtomicU32 = AtomicU32::new(0);
 

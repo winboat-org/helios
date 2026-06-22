@@ -130,6 +130,8 @@ fn build_ddi_table() -> DRIVER_INITIALIZATION_DATA {
     data.DxgkDdiCreateAllocation = Some(ddi::dxgkddi_create_allocation);
     data.DxgkDdiDestroyAllocation = Some(ddi::dxgkddi_destroy_allocation);
     data.DxgkDdiBuildPagingBuffer = Some(ddi::dxgkddi_build_paging_buffer);
+    data.DxgkDdiMapCpuHostAperture = Some(ddi::dxgkddi_map_cpu_host_aperture);
+    data.DxgkDdiUnmapCpuHostAperture = Some(ddi::dxgkddi_unmap_cpu_host_aperture);
 
     // ── Command submission (registered, but not advertised as usable yet) ────
     data.DxgkDdiSubmitCommand = Some(ddi::dxgkddi_submit_command);

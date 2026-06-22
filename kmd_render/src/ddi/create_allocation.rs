@@ -82,9 +82,9 @@ unsafe fn create_one(
 
     // ── Create the backing virtio-gpu blob (create_blob + ctx_attach) ───────
     crate::diag::record(0x0C01_0010 | (ap.kind & 0xFF));
-    let resource_id = match adapter
-        .with_virtio(|v| v.resource_create_blob(ap.ctx_id, ap.blob_mem, ap.blob_flags, ap.blob_id, ap.size))
-    {
+    let resource_id = match adapter.with_virtio(|v| {
+        v.resource_create_blob(ap.ctx_id, ap.blob_mem, ap.blob_flags, ap.blob_id, ap.size)
+    }) {
         Ok(Ok(rid)) => rid,
         Ok(Err(_ve)) => {
             // Host rejected the blob (e.g. the .56 blob_id=0 RESP_ERR_UNSPEC case).
@@ -99,7 +99,11 @@ unsafe fn create_one(
     crate::diag::record(0x0C01_0020);
     crate::diag::record(resource_id);
 
-    let size = round_up_page(if ap.size == 0 { PAGE } else { ap.size as SIZE_T });
+    let size = round_up_page(if ap.size == 0 {
+        PAGE
+    } else {
+        ap.size as SIZE_T
+    });
     let ctx = Box::new(AllocationContext {
         ctx_id: ap.ctx_id,
         resource_id,
@@ -110,15 +114,20 @@ unsafe fn create_one(
         mapped: false,
     });
 
-    // ── VidMm metadata: a CPU-visible blob in segment 1 ─────────────────────
+    // ── VidMm metadata: a CPU-visible blob in the memory segment ────────────
     info.hAllocation = Box::into_raw(ctx) as HANDLE;
     info.Size = size;
     info.PitchAlignedSize = size;
-    info.SupportedWriteSegmentSet = 1; // segment id 1 (bit 0)
+    let segment_bit = 1u32 << (crate::ddi::gpummu::MEMORY_SEGMENT_ID - 1);
+    info.SupportedWriteSegmentSet = segment_bit;
     info.EvictionSegmentSet = 0; // host-visible blob is pinned; never evicted
     unsafe {
         info.__bindgen_anon_1.Alignment = PAGE as UINT;
-        info.__bindgen_anon_2.SupportedReadSegmentSet = 1;
+        info.PreferredSegment
+            .__bindgen_anon_1
+            .__bindgen_anon_1
+            .set_SegmentId0(crate::ddi::gpummu::MEMORY_SEGMENT_ID);
+        info.__bindgen_anon_2.SupportedReadSegmentSet = segment_bit;
         info.__bindgen_anon_3.MaximumRenamingListLength = 0;
         info.__bindgen_anon_4
             .FlagsWddm2
@@ -152,8 +161,7 @@ pub unsafe extern "C" fn dxgkddi_create_allocation(
             for j in 0..i {
                 let prev = unsafe { &mut *args.pAllocationInfo.add(j) };
                 if !prev.hAllocation.is_null() {
-                    let ctx =
-                        unsafe { Box::from_raw(prev.hAllocation as *mut AllocationContext) };
+                    let ctx = unsafe { Box::from_raw(prev.hAllocation as *mut AllocationContext) };
                     unsafe { destroy_allocation_ctx(adapter, ctx) };
                     prev.hAllocation = core::ptr::null_mut();
                 }
@@ -214,7 +222,17 @@ pub unsafe extern "C" fn dxgkddi_open_allocation(
     }
     for i in 0..args.NumAllocations as usize {
         let info = unsafe { &mut *args.pOpenAllocation.add(i) };
-        info.hDeviceSpecificAllocation = info.hAllocation as usize as HANDLE;
+        info.hDeviceSpecificAllocation = if info.hAllocation == 0 {
+            // VidMm also opens implicit/internal allocations that are not backed
+            // by a KMD AllocationContext. Returning a null device-specific handle
+            // leaves dxgmms2's internal VIDMM_ALLOC output null while still
+            // treating the open as successful, which later AVs in DMA-pool init.
+            // Use the open-info slot address as a stable non-null token for this
+            // open; the null paging/render engine never dereferences it.
+            (info as *mut DXGK_OPENALLOCATIONINFO).cast()
+        } else {
+            info.hAllocation as usize as HANDLE
+        };
     }
     STATUS_SUCCESS
 }

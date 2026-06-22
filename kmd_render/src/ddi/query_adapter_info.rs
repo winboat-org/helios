@@ -14,12 +14,16 @@ use crate::dxgk::_D3DKMDT_COMPUTE_PREEMPTION_GRANULARITY::D3DKMDT_COMPUTE_PREEMP
 use crate::dxgk::_D3DKMDT_GRAPHICS_PREEMPTION_GRANULARITY::D3DKMDT_GRAPHICS_PREEMPTION_DMA_BUFFER_BOUNDARY;
 use crate::dxgk::_DXGK_QUERYADAPTERINFOTYPE::{
     DXGKQAITYPE_64BITONLYCAPS, DXGKQAITYPE_ADAPTERPERFDATA_CAPS, DXGKQAITYPE_DIRTYBITTRACKINGCAPS,
-    DXGKQAITYPE_DRIVERCAPS, DXGKQAITYPE_GPUVERSION, DXGKQAITYPE_HARDWARERESERVEDRANGES2,
-    DXGKQAITYPE_HISTORYBUFFERPRECISION, DXGKQAITYPE_IOMMU_CAPS, DXGKQAITYPE_PHYSICAL_MEMORY_CAPS,
+    DXGKQAITYPE_DRIVERCAPS, DXGKQAITYPE_GPUMMUCAPS, DXGKQAITYPE_GPUVERSION,
+    DXGKQAITYPE_HARDWARERESERVEDRANGES2, DXGKQAITYPE_HISTORYBUFFERPRECISION,
+    DXGKQAITYPE_IOMMU_CAPS, DXGKQAITYPE_PAGETABLELEVELDESC, DXGKQAITYPE_PHYSICAL_MEMORY_CAPS,
     DXGKQAITYPE_QUERYSEGMENT4, DXGKQAITYPE_WDDMDEVICECAPS,
 };
 use crate::dxgk::_DXGK_WDDMVERSION::DXGKDDI_WDDMv3_2;
 use crate::dxgk::*;
+
+use crate::adapter::AdapterContext;
+use crate::ddi::gpummu;
 
 pub unsafe extern "C" fn dxgkddi_query_adapter_info(
     miniport_device_context: *mut c_void,
@@ -30,6 +34,8 @@ pub unsafe extern "C" fn dxgkddi_query_adapter_info(
     }
     // SAFETY: valid per the DDI contract; we only read the args struct.
     let args = unsafe { &*query_adapter_info };
+    // SAFETY: Dxgkrnl hands back our AdapterContext as the miniport context.
+    let adapter = unsafe { &*(miniport_device_context as *const AdapterContext) };
 
     // DIAG: log every QueryAdapterInfo type dxgkrnl requests during AddAdapter,
     // EXCEPT the steady-state perf-poll types (NODEPERFDATA 0x18 / ADAPTERPERFDATA
@@ -45,7 +51,11 @@ pub unsafe extern "C" fn dxgkddi_query_adapter_info(
 
     match args.Type {
         DXGKQAITYPE_DRIVERCAPS => unsafe { query_driver_caps(args) },
-        DXGKQAITYPE_QUERYSEGMENT4 => unsafe { query_segments(args) },
+        DXGKQAITYPE_QUERYSEGMENT4 => unsafe { query_segments(adapter, args) },
+        DXGKQAITYPE_GPUMMUCAPS => unsafe { gpummu::fill_gpummu_caps(args) },
+        DXGKQAITYPE_PAGETABLELEVELDESC => unsafe {
+            gpummu::fill_page_table_level_desc(args, gpummu::SYSTEM_MEMORY_SEGMENT_ID)
+        },
         DXGKQAITYPE_WDDMDEVICECAPS => unsafe { query_wddm_device_caps(args) },
         DXGKQAITYPE_PHYSICAL_MEMORY_CAPS => unsafe { query_physical_memory_caps(args) },
         DXGKQAITYPE_IOMMU_CAPS => unsafe { query_zeroed::<DXGK_IOMMU_CAPS>(args) },
@@ -129,18 +139,37 @@ unsafe fn query_driver_caps(args: &DXGKARG_QUERYADAPTERINFO) -> NTSTATUS {
     // these caps are NOT over-advertised and cannot be honestly dropped; they
     // must be BACKED with real impl (Gate 2/3). Full mandatory set restored below.
     const PRESENTATIONCAPS_SUPPORT_KERNEL_MODE_COMMAND_BUFFER: u32 = 1 << 2;
+    // Avoid dxgkrnl falling back through the CDD shadow-buffer interop path for a
+    // zero-source render adapter. Bit 8 is DriverSupportsCddDwmInterop in the WDK
+    // binding dump.
+    const PRESENTATIONCAPS_DRIVER_SUPPORTS_CDD_DWM_INTEROP: u32 = 1 << 8;
     const FLIPCAPS_FLIP_ON_VSYNC_MMIO: u32 = 1 << 1;
     const SCHEDULINGCAPS_MULTI_ENGINE_AWARE: u32 = 1 << 0;
     const SCHEDULINGCAPS_PREEMPTION_AWARE: u32 = 1 << 2;
     const MEMORYMANAGEMENTCAPS_SECTION_BACKED_PRIMARY: u32 = 1 << 3;
+    // GpuMmu memory-model opt-in (DXGK_VIDMMCAPS = DRIVERCAPS.MemoryManagementCaps,
+    // bit positions verified against the bindgen dump, WDDM_FAKE_VIDMM_RESEARCH.md
+    // §A1): bit 5 = VirtualAddressingSupported (umbrella "this adapter does WDDM 2.0
+    // GPU virtual addressing"), bit 6 = GpuMmuSupported (selects the GpuMmu model).
+    // Per the research doc these two together are the minimal opt-in. We deliberately
+    // do NOT set IoMmuSupported (bit 7) — no IoMmu path — nor ParavirtualizationSupported
+    // (bit 10): that is a host-KMD GPU-PV contract Helios does not implement, and the
+    // GpuVirtualizationFlags lever was already proven not to govern our path.
+    const MEMORYMANAGEMENTCAPS_VIRTUAL_ADDRESSING_SUPPORTED: u32 = 1 << 5;
+    const MEMORYMANAGEMENTCAPS_GPU_MMU_SUPPORTED: u32 = 1 << 6;
 
     caps.PresentationCaps.__bindgen_anon_1.Value =
-        PRESENTATIONCAPS_SUPPORT_KERNEL_MODE_COMMAND_BUFFER;
+        PRESENTATIONCAPS_SUPPORT_KERNEL_MODE_COMMAND_BUFFER
+            | PRESENTATIONCAPS_DRIVER_SUPPORTS_CDD_DWM_INTEROP;
     caps.FlipCaps.__bindgen_anon_1.Value = FLIPCAPS_FLIP_ON_VSYNC_MMIO;
     caps.SchedulingCaps.__bindgen_anon_1.Value =
         SCHEDULINGCAPS_MULTI_ENGINE_AWARE | SCHEDULINGCAPS_PREEMPTION_AWARE;
-    caps.MemoryManagementCaps.__bindgen_anon_1.Value =
-        MEMORYMANAGEMENTCAPS_SECTION_BACKED_PRIMARY;
+    caps.MemoryManagementCaps.__bindgen_anon_1.Value = MEMORYMANAGEMENTCAPS_SECTION_BACKED_PRIMARY
+        | MEMORYMANAGEMENTCAPS_VIRTUAL_ADDRESSING_SUPPORTED
+        | MEMORYMANAGEMENTCAPS_GPU_MMU_SUPPORTED;
+    // PagingNode = 0 (single engine node). MemoryManagementCaps.PagingNode is the
+    // second field of DXGK_VIDMMCAPS, after the flags union; the zero-fill at the
+    // top of this fn already leaves it 0, which is what we want.
     caps.MaxQueuedFlipOnVSync = 1;
     caps.GpuEngineTopology.NbAsymetricProcessingNodes = 1;
 
@@ -246,29 +275,113 @@ unsafe fn write_wchar_z_unaligned(dst: *mut WCHAR, dst_len: usize, ascii: &[u8])
     }
 }
 
-// Gate 5a Stage 2b finding (2026-06-18): a CPU-visible **memory** segment
-// (Aperture=0) whose `CpuTranslatedAddress` points at the host-visible BAR — the
-// approach this function briefly carried (.66–.70) — is REJECTED by VidMm right
-// after `DxgkDdiCreateDevice` (clean-boot Code 43 / FAILED_POST_START, confirmed
-// independent of segment size: tested 8 GiB and a 256 MiB sub-window). The proven
-// virtio-gpu WDDM driver (`virtio-research-only-3d/.../viogpu_adapter.cpp`) uses an
-// **aperture** segment instead, backing allocations with OS system-memory MDLs via
-// `BuildPagingBuffer` MAP_APERTURE_SEGMENT and reaching the host with explicit
-// TRANSFER_TO_HOST copies — never a CPU-visible memory segment. A real memory
-// segment needs a declared GPU memory model (GpuMmu/IoMmu) we don't yet provide.
-// So we restore the proven aperture segment here (keeps the adapter at Code 0);
-// mapping the host-visible BAR to a `D3DKMTLock2` VA needs a different mechanism
-// (see GATE5_STAGE2_ALLOC_DESIGN.md / the gate5a memory). The host-visible window
-// scan + `resource_map_blob` plumbing stays in `virtio/gpu.rs` for that work.
-unsafe fn query_segments(args: &DXGKARG_QUERYADAPTERINFO) -> NTSTATUS {
+/// GPU-VA base of the aperture segment's address window (matches viogpu3d's
+/// `0xC0000000`). An aperture is address-space only; the value just needs to be a
+/// plausible, non-overlapping window base.
+const APERTURE_BASE_ADDRESS: i64 = 0xC000_0000;
+/// Aperture window length. viogpu3d uses 1 GiB (`256 * 1024 * 4096`).
+const APERTURE_SEGMENT_SIZE: SIZE_T = 256 * 1024 * 4096;
+
+/// Segment-shape selector — the lever from the live-KD decode of dxgmms2's paging
+/// DMA-pool init (INITDMAPOOLS_HANDOVER.md, 2026-06-21).
+///
+/// `VIDMM_GLOBAL::InitDmaPools` builds ONE paging DMA pool and validates the FIRST
+/// reported segment (`segdesc[0]`): it requires that segment's per-attribute
+/// object's "can host a paging buffer" flag (`[attr+0x68] & 1`). A CPU-visible
+/// *memory* segment (the BAR) NEVER has that flag; a linear **aperture** segment
+/// does (classic WDDM paging-buffer backing via MAP_APERTURE_SEGMENT — what the
+/// proven viogpu3d driver reports, WDDM_FAKE_VIDMM §A2.2). The decode also showed
+/// VidMm DROPS a system-RAM-backed memory segment (only the BAR registered), so the
+/// old "RAM paging segment id 2" never existed.
+///
+/// - `false` = **SAFE** shape: report only the BAR CpuVisible **memory** segment.
+///   InitDmaPools then cleanly *rejects* it (`STATUS_INVALID_PARAMETER`, Code 43) —
+///   a status return, not a crash, so the adapter just fails to start and the VM
+///   boots normally with gpu-gl attached. Use this for a deployable safe baseline.
+/// - `true` = **APERTURE** shape: report a viogpu3d-style aperture segment FIRST
+///   (= `PagingBufferSegmentId`) so InitDmaPools ACCEPTS it, plus the BAR memory
+///   segment (id 2) for page tables (`MEMORY_SEGMENT_ID`) + render. This is the
+///   deployable shape after the 2026-06-22 follow-on fix in `CreateContext`:
+///   `DmaBufferSegmentSet=1` keeps the CDD/system context DMA pool on the
+///   aperture allocation path instead of letting VidMm build a null-allocation
+///   contiguous-memory pool.
+const REPORT_APERTURE_PAGING_SEGMENT: bool = true;
+
+/// Write the viogpu3d-style linear aperture descriptor (paging-buffer host).
+/// SAFETY: `seg` points to a writable `DXGK_SEGMENTDESCRIPTOR4`.
+unsafe fn write_aperture_descriptor(seg: *mut DXGK_SEGMENTDESCRIPTOR4) {
+    unsafe {
+        core::ptr::write_bytes(seg as *mut u8, 0, size_of::<DXGK_SEGMENTDESCRIPTOR4>());
+        let s = &mut *seg;
+        s.Flags.__bindgen_anon_1.__bindgen_anon_1.set_Aperture(1);
+        s.Flags
+            .__bindgen_anon_1
+            .__bindgen_anon_1
+            .set_CacheCoherent(1);
+        s.Flags.__bindgen_anon_1.__bindgen_anon_1.set_DirectFlip(1);
+        // CpuVisible deliberately 0 — an aperture holds no bits (viogpu3d :558).
+        s.BaseAddress.QuadPart = APERTURE_BASE_ADDRESS;
+        s.Size = APERTURE_SEGMENT_SIZE;
+        s.CommitLimit = APERTURE_SEGMENT_SIZE;
+    }
+}
+
+/// Write a MEMORY descriptor (`Aperture=0`, holds bits) whose backing lives at
+/// `base` (guest-physical) for `len` bytes. For the GpuMmu page-table segment we
+/// expose CPU access through WDDM's CPU host aperture, not the legacy CpuVisible
+/// direct-BAR path: VidMm's `GetCpuVisibleAddress` accepts the internal segment
+/// attribute only when it is a CPU-host-aperture segment (bit 13), and the public
+/// docs describe `DXGK_CPUHOSTAPERTURE` as the alternative mapping path for
+/// non-CPU-accessible memory segments.
+/// SAFETY: `seg` points to a writable `DXGK_SEGMENTDESCRIPTOR4`.
+unsafe fn write_cpu_host_memory_descriptor(seg: *mut DXGK_SEGMENTDESCRIPTOR4, base: u64, len: u64) {
+    unsafe {
+        core::ptr::write_bytes(seg as *mut u8, 0, size_of::<DXGK_SEGMENTDESCRIPTOR4>());
+        let s = &mut *seg;
+        s.BaseAddress.QuadPart = 0;
+        // CpuVisible deliberately stays 0. If this is set, dxgkrnl treats the
+        // union as CpuTranslatedAddress and does not create the CPU-host-aperture
+        // segment attributes VidMm needs for paging-process page tables.
+        s.Flags
+            .__bindgen_anon_1
+            .__bindgen_anon_1
+            .set_SupportsCpuHostAperture(1);
+        s.Flags
+            .__bindgen_anon_1
+            .__bindgen_anon_1
+            .set_SupportsCachedCpuHostAperture(1);
+        // Aperture stays 0 — this segment holds bits (the BAR/device memory).
+        s.Flags
+            .__bindgen_anon_1
+            .__bindgen_anon_1
+            .set_CacheCoherent(1);
+        let cpu_host = DXGK_CPUHOSTAPERTURE {
+            PhysicalAddress: base,
+            SizeInPages: (len / 4096).min(u32::MAX as u64) as u32,
+        };
+        *s.__bindgen_anon_1.CpuHostAperture.as_mut() = cpu_host;
+        s.Size = len as SIZE_T;
+        s.CommitLimit = len as SIZE_T;
+    }
+}
+
+unsafe fn query_segments(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTERINFO) -> NTSTATUS {
     if (args.OutputDataSize as usize) < size_of::<DXGK_QUERYSEGMENTOUT4>() {
         return STATUS_BUFFER_TOO_SMALL;
     }
 
+    // The host-visible BAR window backs the CPU-visible memory segment.
+    let window = adapter.with_virtio(|v| v.host_visible()).ok().flatten();
+    crate::diag::record(if window.is_some() {
+        0x0900_0001
+    } else {
+        0x0900_0000
+    });
+
     // SAFETY: pOutputData points to a writable DXGK_QUERYSEGMENTOUT4 of
     // sufficient size, checked above.
     let out = unsafe { &mut *(args.pOutputData as *mut DXGK_QUERYSEGMENTOUT4) };
-    let segment_descriptor = out.pSegmentDescriptor;
+    let descriptors = out.pSegmentDescriptor;
     unsafe {
         core::ptr::write_bytes(
             out as *mut _ as *mut u8,
@@ -277,35 +390,68 @@ unsafe fn query_segments(args: &DXGKARG_QUERYADAPTERINFO) -> NTSTATUS {
         );
     }
 
-    // One small CPU-visible aperture segment is enough for dxgkrnl bring-up and
-    // paging-buffer staging. It is not advertised as render-capable GPU memory.
-    out.NbSegment = 1;
-    out.SegmentDescriptorStride = size_of::<DXGK_SEGMENTDESCRIPTOR4>() as u64;
-    out.PagingBufferSegmentId = 1;
+    let stride = size_of::<DXGK_SEGMENTDESCRIPTOR4>();
+    out.SegmentDescriptorStride = stride as u64;
     out.PagingBufferSize = 64 * 1024;
     out.PagingBufferPrivateDataSize = 0;
 
-    if !segment_descriptor.is_null() {
-        // SAFETY: the second QUERYSEGMENT4 call provides an array for NbSegment
-        // descriptors; we report exactly one descriptor.
-        let seg = unsafe { &mut *(segment_descriptor as *mut DXGK_SEGMENTDESCRIPTOR4) };
-        unsafe {
-            core::ptr::write_bytes(
-                seg as *mut _ as *mut u8,
-                0,
-                size_of::<DXGK_SEGMENTDESCRIPTOR4>(),
-            );
-            seg.Flags
-                .__bindgen_anon_1
-                .__bindgen_anon_1
-                .set_CpuVisible(1);
-            seg.Flags.__bindgen_anon_1.__bindgen_anon_1.set_Aperture(1);
+    if REPORT_APERTURE_PAGING_SEGMENT {
+        // APERTURE shape (Option A): aperture (id 1, idx 0) = paging-buffer host
+        // (passes InitDmaPools); AddDevice-time RAM-backed MEMORY segment (id 2,
+        // idx 1) = page tables, exposed through WDDM CPU host aperture. This must
+        // use `paging_ram`, not `page_table_window`: QuerySegment4 runs before
+        // StartDevice's venus allocation, so `page_table_window` is not available
+        // when VidMm builds its segment table. If the contiguous RAM allocation was
+        // unavailable, fall back to NbSegment=1 (aperture only).
+        let page_table = adapter.paging_ram();
+        crate::diag::record(if descriptors.is_null() {
+            0x0901_0000
+        } else {
+            0x0901_0001
+        });
+        crate::diag::record(if page_table.is_some() {
+            0x0902_0001
+        } else {
+            0x0902_0000
+        });
+        out.NbSegment = if page_table.is_some() { 2 } else { 1 };
+        // Paging buffers come from segdesc[0] (the aperture) — InitDmaPools
+        // validates the FIRST segment for paging-buffer-host capability.
+        out.PagingBufferSegmentId = gpummu::APERTURE_SEGMENT_ID;
+        if !descriptors.is_null() {
+            // SAFETY: the second QUERYSEGMENT4 call provides NbSegment descriptors.
+            unsafe { write_aperture_descriptor(descriptors as *mut DXGK_SEGMENTDESCRIPTOR4) };
+            if let Some((gpa, size)) = page_table {
+                crate::diag::record(0x0903_0000 | (((gpa >> 12) as u32) & 0xFFFF));
+                crate::diag::record(0x0904_0000 | (((size >> 12) as u32) & 0xFFFF));
+                // SAFETY: index 1 is in bounds (NbSegment == 2).
+                let seg2 = unsafe { (descriptors as *mut u8).add(stride) };
+                unsafe {
+                    write_cpu_host_memory_descriptor(
+                        seg2 as *mut DXGK_SEGMENTDESCRIPTOR4,
+                        gpa,
+                        size,
+                    )
+                };
+            }
         }
-        seg.BaseAddress.QuadPart = 0;
-        seg.Size = 64 * 1024 * 1024;
-        seg.CommitLimit = 64 * 1024 * 1024;
+    } else {
+        // SAFE shape: a single BAR CpuVisible memory segment (id 1). InitDmaPools
+        // rejects it cleanly (Code 43, no crash). If there is no host-visible
+        // window, fall back to the aperture descriptor (never CpuVisible-backed).
+        out.NbSegment = 1;
+        out.PagingBufferSegmentId = gpummu::APERTURE_SEGMENT_ID; // numeric id 1 = sole segment
+        if !descriptors.is_null() {
+            let seg0 = descriptors as *mut DXGK_SEGMENTDESCRIPTOR4;
+            match window {
+                // SAFETY: descriptors points to a writable DXGK_SEGMENTDESCRIPTOR4.
+                Some(w) => unsafe { write_cpu_host_memory_descriptor(seg0, w.base, w.len) },
+                None => unsafe { write_aperture_descriptor(seg0) },
+            }
+        }
     }
 
+    crate::diag::record(0x0900_0002 | (out.NbSegment << 8));
     STATUS_SUCCESS
 }
 
@@ -334,7 +480,14 @@ pub unsafe extern "C" fn dxgkddi_get_node_metadata(
         core::ptr::write_bytes(node as *mut _ as *mut u8, 0, size_of::<DXGK_NODEMETADATA>());
     }
     node.EngineType = DXGK_ENGINE_TYPE::DXGK_ENGINE_TYPE_3D;
-    // Do not set GpuMmuSupported until GPU-VA/page-table DDIs are real.
-    // FriendlyName, Flags, IoMmuSupported stay zeroed.
+    // Per-node memory-model selection (WDDM_FAKE_VIDMM_RESEARCH.md §A1/§G): the
+    // GpuMmu-vs-IoMmu choice is made HERE per engine node, in tandem with the
+    // DXGK_VIDMMCAPS GpuMmuSupported bit in query_driver_caps. We declare the
+    // decorative GpuMmu model (host GPU owns the real MMU; guest page tables are
+    // never read by hardware — §A3.7) and no IoMmu. The GPUMMUCAPS / page-table
+    // geometry VidMm then queries lives in `ddi::gpummu`.
+    node.GpuMmuSupported = 1;
+    node.IoMmuSupported = 0;
+    // FriendlyName, Flags stay zeroed.
     STATUS_SUCCESS
 }
