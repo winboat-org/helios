@@ -63,10 +63,14 @@ pub fn record(mut code: u32) {
     if idx >= MAX_STEPS {
         return;
     }
-    // Build the value name "S<idx>\0" as UTF-16 (idx < 160 → at most 3 digits).
-    let mut name = [0u16; 6];
+    // Build the value name "S<idx>\0" as UTF-16. `idx` is a u32 (up to 10 digits);
+    // MAX_STEPS lets it exceed 999, so size both buffers for the full u32 range —
+    // `digits[d]` previously overflowed `[0u8; 3]` once idx reached 1000, panicking
+    // (→ the no_std loop{} handler hangs the thread under dxgkrnl's adapter lock and
+    // deadlocks the whole graphics stack). 'S' + up to 10 digits + NUL = 12.
+    let mut name = [0u16; 12];
     name[0] = b'S' as u16;
-    let mut digits = [0u8; 3];
+    let mut digits = [0u8; 10];
     let mut n = idx;
     let mut d = 0usize;
     if n == 0 {
