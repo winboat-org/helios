@@ -31,6 +31,13 @@ pub const HELIOS_WDDM_ALLOC_KIND_SHMEM: u32 = 0;
 /// [`HeliosWddmAllocPrivate::kind`] — a blob bound to a venus `VkDeviceMemory`
 /// object (`blob_id == venus mem id` from the ICD's `vkAllocateMemory`).
 pub const HELIOS_WDDM_ALLOC_KIND_DEVICE_MEMORY: u32 = 1;
+/// [`HeliosWddmAllocPrivate::kind`] — a runtime "standard" allocation (the
+/// shared-primary / shadow / staging / GDI surfaces DWM and IddCx create). The KMD
+/// self-fills this private data in `DxgkDdiGetStandardAllocationDriverData` and
+/// self-backs it with a host-allocated HOST3D mappable blob (`blob_id == 0`,
+/// `ctx_id` = the KMD's internal venus context). The geometry the runtime supplied
+/// (width/height/format) is appended after this struct as a KMD-private trailer.
+pub const HELIOS_WDDM_ALLOC_KIND_STANDARD: u32 = 2;
 
 /// Private driver data for one allocation created via `D3DKMTCreateAllocation`.
 ///

@@ -15,11 +15,34 @@ use alloc::boxed::Box;
 use core::ffi::c_void;
 use core::mem::size_of;
 
-use bytemuck::pod_read_unaligned;
-use helios_protocol::HeliosWddmAllocPrivate;
+use bytemuck::{pod_read_unaligned, Pod, Zeroable};
+use helios_protocol::{
+    HeliosWddmAllocPrivate, HELIOS_WDDM_ALLOC_KIND_STANDARD, VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE,
+    VIRTIO_GPU_BLOB_MEM_HOST3D, VIRTIO_GPU_MAP_CACHE_CACHED,
+};
 
 use crate::adapter::AdapterContext;
+use crate::dxgk::_D3DDDIFORMAT::D3DDDIFMT_A8R8G8B8;
+use crate::dxgk::_D3DKMDT_STANDARDALLOCATION_TYPE::{
+    D3DKMDT_STANDARDALLOCATION_GDISURFACE, D3DKMDT_STANDARDALLOCATION_SHADOWSURFACE,
+    D3DKMDT_STANDARDALLOCATION_SHAREDPRIMARYSURFACE, D3DKMDT_STANDARDALLOCATION_STAGINGSURFACE,
+};
 use crate::dxgk::*;
+
+/// KMD-private trailer appended after [`HeliosWddmAllocPrivate`] for a
+/// `HELIOS_WDDM_ALLOC_KIND_STANDARD` allocation. The KMD writes it in
+/// `DxgkDdiGetStandardAllocationDriverData` (from the runtime's surface data) and
+/// reads it back in `DxgkDdiCreateAllocation` to populate the allocation's
+/// `DxgkDdiDescribeAllocation` metadata. Both ends are the KMD, so this layout is
+/// private (it never crosses to the ICD/UMD, which only sends the 48-byte prefix).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+struct StandardAllocMeta {
+    width: u32,
+    height: u32,
+    format: u32, // D3DDDIFORMAT
+    pitch: u32,
+}
 
 /// Per-allocation KMD state: the venus context + virtio resource backing it, plus
 /// the host-visible window mapping (filled in Stage 2b by BuildPagingBuffer).
@@ -34,6 +57,11 @@ struct AllocationContext {
     map_len: u64,
     /// `true` once `RESOURCE_MAP_BLOB` has succeeded (so destroy unmaps first).
     mapped: bool,
+    /// Surface geometry for `DxgkDdiDescribeAllocation` (0 for UMD blob allocations
+    /// that carry no dimensions). Populated from the standard-allocation trailer.
+    width: u32,
+    height: u32,
+    format: u32, // D3DDDIFORMAT
 }
 
 const PAGE: SIZE_T = 4096;
@@ -80,6 +108,29 @@ unsafe fn create_one(
         return Err(STATUS_INVALID_PARAMETER);
     }
 
+    // For a KMD-originated standard allocation (DWM/IddCx composition surface), the
+    // private data carries a geometry trailer the KMD itself wrote in
+    // GetStandardAllocationDriverData, and `ctx_id` is the KMD's internal venus
+    // context — which must be live (it is at Code 0; defensive otherwise).
+    let mut meta = StandardAllocMeta::zeroed();
+    if ap.kind == HELIOS_WDDM_ALLOC_KIND_STANDARD {
+        if ap.ctx_id == 0 {
+            crate::diag::record(0x0C01_00E2);
+            return Err(STATUS_DEVICE_NOT_READY);
+        }
+        let want = size_of::<HeliosWddmAllocPrivate>() + size_of::<StandardAllocMeta>();
+        if priv_len >= want {
+            // SAFETY: bounds-checked above; the trailer follows the 48-byte prefix.
+            let meta_bytes = unsafe {
+                core::slice::from_raw_parts(
+                    priv_ptr.add(size_of::<HeliosWddmAllocPrivate>()),
+                    size_of::<StandardAllocMeta>(),
+                )
+            };
+            meta = pod_read_unaligned(meta_bytes);
+        }
+    }
+
     // ── Create the backing virtio-gpu blob (create_blob + ctx_attach) ───────
     crate::diag::record(0x0C01_0010 | (ap.kind & 0xFF));
     let resource_id = match adapter.with_virtio(|v| {
@@ -112,6 +163,9 @@ unsafe fn create_one(
         map_offset: 0,
         map_len: 0,
         mapped: false,
+        width: meta.width,
+        height: meta.height,
+        format: meta.format,
     });
 
     // ── VidMm metadata: a CPU-visible blob in the memory segment ────────────
@@ -246,21 +300,150 @@ pub unsafe extern "C" fn dxgkddi_close_allocation(
 }
 
 /// `DxgkDdiDescribeAllocation` — report an allocation's dimensions/format.
-/// Filled with real metadata in Stage 3 (once submits reference allocations).
+///
+/// dxgkrnl calls this for shared / cross-process surfaces (and DWM's composition
+/// surfaces) to learn their geometry. We echo the geometry recorded at
+/// CreateAllocation time (from the standard-allocation trailer). UMD blob
+/// allocations carry no dimensions (0×0); report them as-is.
 pub unsafe extern "C" fn dxgkddi_describe_allocation(
-    _h_adapter: IN_CONST_HANDLE,
-    _describe_allocation: INOUT_PDXGKARG_DESCRIBEALLOCATION,
+    h_adapter: IN_CONST_HANDLE,
+    describe_allocation: INOUT_PDXGKARG_DESCRIBEALLOCATION,
 ) -> NTSTATUS {
     crate::diag::record(0x0C02_0001);
-    STATUS_NOT_IMPLEMENTED
+    if h_adapter.is_null() || describe_allocation.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    // SAFETY: dxgkrnl passes a writable DXGKARG_DESCRIBEALLOCATION.
+    let args = unsafe { &mut *describe_allocation };
+    if args.hAllocation.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    // SAFETY: hAllocation is the AllocationContext pointer we returned from
+    // CreateAllocation; dxgkrnl round-trips it back unmodified.
+    let ctx = unsafe { &*(args.hAllocation as *const AllocationContext) };
+
+    args.Width = ctx.width;
+    args.Height = ctx.height;
+    // Default a plausible BGRA format for dimensionless UMD blobs so dxgkrnl never
+    // sees D3DDDIFMT_UNKNOWN(0) for a describable allocation.
+    args.Format = if ctx.format != 0 {
+        ctx.format as D3DDDIFORMAT
+    } else {
+        D3DDDIFMT_A8R8G8B8
+    };
+    args.MultisampleMethod.NumSamples = 1;
+    args.MultisampleMethod.NumQualityLevels = 1;
+    args.RefreshRate.Numerator = 60;
+    args.RefreshRate.Denominator = 1;
+    args.PrivateDriverFormatAttribute = 0;
+    STATUS_SUCCESS
 }
 
 /// `DxgkDdiGetStandardAllocationDriverData` — describe a runtime "standard"
-/// allocation (shared primary, staging surface, ...).
+/// allocation (shared primary, shadow, staging, GDI surface). DWM and IddCx use
+/// these for the desktop composition surfaces.
+///
+/// Two-call contract (viogpu3d `viogpu_allocation.cpp:135` is the template):
+///   1. **Size query** — `pAllocationPrivateDriverData == NULL`: report the byte
+///      sizes the runtime must allocate for the per-allocation / per-resource
+///      private data.
+///   2. **Fill** — buffers provided: write the private data the runtime then hands
+///      to `DxgkDdiCreateAllocation`, and fill the surface `Pitch` out-fields.
+///
+/// We fill a [`HeliosWddmAllocPrivate`] (`kind = STANDARD`, `blob_id = 0` so the
+/// host allocates a HOST3D mappable blob, `ctx_id` = the KMD's internal venus
+/// context) plus a [`StandardAllocMeta`] geometry trailer.
 pub unsafe extern "C" fn dxgkddi_get_standard_allocation_driver_data(
-    _h_adapter: IN_CONST_HANDLE,
-    _standard_allocation: INOUT_PDXGKARG_GETSTANDARDALLOCATIONDRIVERDATA,
+    h_adapter: IN_CONST_HANDLE,
+    standard_allocation: INOUT_PDXGKARG_GETSTANDARDALLOCATIONDRIVERDATA,
 ) -> NTSTATUS {
-    crate::diag::record(0x0C02_0002);
-    STATUS_NOT_IMPLEMENTED
+    if h_adapter.is_null() || standard_allocation.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    // SAFETY: dxgkrnl hands back our AdapterContext and a writable args struct.
+    let adapter = unsafe { &*(h_adapter as *const AdapterContext) };
+    let args = unsafe { &mut *standard_allocation };
+    crate::diag::record(0x0C02_0002 | ((args.StandardAllocationType as u32 & 0xFF) << 4));
+
+    const PRIV_SIZE: u32 =
+        (size_of::<HeliosWddmAllocPrivate>() + size_of::<StandardAllocMeta>()) as u32;
+
+    // ── Phase 1: size query (runtime passes a null allocation buffer) ────────
+    if args.pAllocationPrivateDriverData.is_null() {
+        args.AllocationPrivateDriverDataSize = PRIV_SIZE;
+        // We read no per-resource private data in CreateAllocation.
+        args.ResourcePrivateDriverDataSize = 0;
+        return STATUS_SUCCESS;
+    }
+    if (args.AllocationPrivateDriverDataSize as usize) < PRIV_SIZE as usize {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    // ── Phase 2: extract geometry from the per-type union; set out Pitch ─────
+    // SAFETY: the union arm is selected by StandardAllocationType; dxgkrnl
+    // guarantees the matching surface-data pointer is valid for the fill call.
+    let (width, height, format): (u32, u32, u32) = match args.StandardAllocationType {
+        D3DKMDT_STANDARDALLOCATION_SHAREDPRIMARYSURFACE => {
+            let sd = unsafe { &*args.__bindgen_anon_1.pCreateSharedPrimarySurfaceData };
+            (sd.Width, sd.Height, sd.Format as u32)
+        }
+        D3DKMDT_STANDARDALLOCATION_SHADOWSURFACE => {
+            let sd = unsafe { &mut *args.__bindgen_anon_1.pCreateShadowSurfaceData };
+            sd.Pitch = sd.Width.saturating_mul(4);
+            (sd.Width, sd.Height, sd.Format as u32)
+        }
+        D3DKMDT_STANDARDALLOCATION_STAGINGSURFACE => {
+            let sd = unsafe { &mut *args.__bindgen_anon_1.pCreateStagingSurfaceData };
+            sd.Pitch = sd.Width.saturating_mul(4);
+            (sd.Width, sd.Height, D3DDDIFMT_A8R8G8B8 as u32)
+        }
+        D3DKMDT_STANDARDALLOCATION_GDISURFACE => {
+            let sd = unsafe { &mut *args.__bindgen_anon_1.pCreateGdiSurfaceData };
+            sd.Pitch = sd.Width.saturating_mul(4);
+            (sd.Width, sd.Height, sd.Format as u32)
+        }
+        _ => {
+            crate::diag::record(0x0C02_00E2);
+            return STATUS_NOT_SUPPORTED;
+        }
+    };
+
+    let pitch = width.saturating_mul(4);
+    let size = (pitch as u64)
+        .saturating_mul(height as u64)
+        .max(PAGE as u64);
+
+    let ap = HeliosWddmAllocPrivate::new(
+        HELIOS_WDDM_ALLOC_KIND_STANDARD,
+        adapter.venus_ctx_id,
+        0, // blob_id 0 → host-allocated HOST3D mappable blob (no UMD venus memory)
+        size,
+        VIRTIO_GPU_BLOB_MEM_HOST3D,
+        VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE,
+        VIRTIO_GPU_MAP_CACHE_CACHED,
+    );
+    let meta = StandardAllocMeta {
+        width,
+        height,
+        format,
+        pitch,
+    };
+
+    // SAFETY: AllocationPrivateDriverDataSize bytes (>= PRIV_SIZE) are writable.
+    let dst = args.pAllocationPrivateDriverData as *mut u8;
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            &ap as *const _ as *const u8,
+            dst,
+            size_of::<HeliosWddmAllocPrivate>(),
+        );
+        core::ptr::copy_nonoverlapping(
+            &meta as *const _ as *const u8,
+            dst.add(size_of::<HeliosWddmAllocPrivate>()),
+            size_of::<StandardAllocMeta>(),
+        );
+    }
+    args.AllocationPrivateDriverDataSize = PRIV_SIZE;
+    crate::diag::record(0x0C02_0005);
+    STATUS_SUCCESS
 }
