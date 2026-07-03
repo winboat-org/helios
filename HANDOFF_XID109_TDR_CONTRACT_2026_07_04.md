@@ -100,7 +100,25 @@ On real hardware step 1 is a TDR and dwm recovers in ~2 s. Helios lacked that co
    mid-boot silence proves nothing), no Xid 109, live desktop through the login transition.
    ~30 stale DriverStore package dirs remain (only the root stray was load-bearing); prune
    opportunistically.
-3. **Extend the forward-progress deadline to fence and query feedback waits** (same shape as
+3. **Cold-boot verification PASSED (validate on): ZERO Input-08733 on the fresh boot** — the
+   layout-driven variants hold from dwm's first composition. Killing the flood exposed two
+   previously-drowned validation classes:
+   - **Image memory-requirements inconsistency — FIXED (icd/mesa 3671722a8f2)**: the image
+     twin of the session-7 buffer bug. `vn_GetDeviceImageMemoryRequirements` forwarded the
+     PLAIN create info while `vn_CreateImage` injects the external handle type into LINEAR
+     images → undersized dedicated allocations + disallowed memory types (VUID 02964/01615/
+     01617) from dwm's composition images. Verified in-boot: zero new instances after the
+     ICD redeploy (dedupe budget for those VUIDs was not exhausted, so silence is meaningful).
+   - **Command-buffer lifecycle violations — NEXT FRONTIER (open)**: `vkResetCommandPool`/
+     `vkBeginCommandBuffer`/`vkDestroyCommandPool` on PENDING command buffers, bursting in
+     CHURN windows (boot device handoff, dwm restarts/kills). Working hypothesis:
+     teardown-under-load — device/context teardown proceeds while the host GPU still
+     executes (either guest teardown paths skipping an effective wait-idle, the vn feedback
+     recycler resetting its own pending feedback CBs, or forced process kills reaching vkr
+     context destroy with work in flight). This ALSO matches every observed Xid-109 timing
+     (login transition = dwm device teardown; kill windows). Investigate with per-line
+     timestamps + correlate against guest device-destroy logs.
+4. **Extend the forward-progress deadline to fence and query feedback waits** (same shape as
    semaphores in vn_queue.c). dwm's kill path was semaphores; games may wedge on fences.
 4. Backlog unchanged: rotation cost (C3 async-fence), buffer-reqs cache always-miss, §5
    residual C1 boot hole, instrument hygiene (`RotateSample` still 16 — set 0 for production
