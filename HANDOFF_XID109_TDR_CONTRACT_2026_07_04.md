@@ -118,6 +118,23 @@ On real hardware step 1 is a TDR and dwm recovers in ~2 s. Helios lacked that co
      context destroy with work in flight). This ALSO matches every observed Xid-109 timing
      (login transition = dwm device teardown; kill windows). Investigate with per-line
      timestamps + correlate against guest device-destroy logs.
+   - **Xid 31 GPU MMU READ FAULT — root-caused and FIXED same session (live kill: frozen
+     frame → LG placeholder; IDD log ends mid `CopyResource staging←swapchain`; WUDFHost
+     dead, Code 43).** The GPU read past an UNDERSIZED imported image: KMD standard
+     allocations (GDI/shadow/staging, also the flip-queue-adjacent surfaces the IDD
+     samples) were sized pitch×height, but NVIDIA's external-linear image requirements
+     round rows to GOB granularity + opaque slack (+11–32%: 368640→487424,
+     7913472→8773632, 7667712→7864320 = pitch×align(h,128)). Fixes deployed + verified
+     (no size violations under live composition, no Xids, feed stable): KMD pads to
+     `pitch × align(height,128) + 64KiB` (d8bded7); dxvk-helios REFUSES undersized imports
+     (3d27c1af — the old 'fails at bind, loud not fatal' assumption is false on NVIDIA:
+     the bind succeeds and the sampler faults). Remaining tracked UB: imports bind
+     host-visible type-2 memory while NVIDIA external-linear images report memoryTypeBits
+     0x3 (VUID-01615, functional today); and the known layout-00344.
+     DXVK rebuild recipe (cargo can't see it): sync `Z:\dxvk-helios\src` →
+     `C:\Users\Rupansh\dxvk-helios\src`, `ninja -C C:\Users\Rupansh\dxvk-build` with PATH =
+     MSVC `Hostx64\x64` (lib.exe) + `LLVM\bin` (clang-cl), then touch `umd\build.rs` +
+     `cargo build`, and grep the DLL for a new string to confirm the relink took.
 4. **Extend the forward-progress deadline to fence and query feedback waits** (same shape as
    semaphores in vn_queue.c). dwm's kill path was semaphores; games may wedge on fences.
 4. Backlog unchanged: rotation cost (C3 async-fence), buffer-reqs cache always-miss, §5
