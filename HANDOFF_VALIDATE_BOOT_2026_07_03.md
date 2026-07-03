@@ -32,6 +32,36 @@ of the probe still pending (expected same — the bug was guest-side and vendor-
 **Remaining owner-visible acceptance: real desktop frames in the LG client** — the §4
 divergence was the identified blocker between dwm's composition and the acquired frames.
 
+## ⚡⚡ THE NEW FRONTIER (post-fix, owner-observed): the KMD present nop (audit K-B2)
+
+After the deferred-clear fix went live, the owner saw — for the first time — **a single frame
+with real desktop structure** (taskbar geometry with rounded overlay + border shading, black
+DX overlays, heavy corruption, red tint), frozen, then black. Instrument chain (18:1xZ):
+
+- IDD healthy: bound swapchain, acquires at dwm cadence (frame 63+), dwm stable, no dumps.
+- IDD content sampler: `sampleNonZero=0/357, first=center=0x00000000` at steady state — the
+  three rotating IddCx swapchain buffers are ALL-ZERO.
+- dwm UMD log: `DXGI Present: #51..#65 src=0x80004540 dst=0x0 copied=false flags=0x2` —
+  flip-model presents; the UMD-level copy path has no destination BY DESIGN (flip). Present
+  count matches acquire count (the binding is live, not stale).
+- The stage that must move pixels (dwm's composition buffer → IddCx swapchain buffer, the
+  dxgkrnl BLTQUEUE present on the render adapter) lands in **`kmd_render`'s
+  `dxgkddi_present` — which emits a 4-DWORD 'HEPR' NOP DMA (audit K-B2, confirmed in
+  source `ddi/display.rs`). Composed pixels are never blitted.**
+- The corrupted transition frame's content is consistent with the KMD **GDI executor** (the
+  only path that CPU-writes those surfaces today) — explains the GDI-ish look, black DX
+  overlays, and plausibly the red tint (GdF format handling; evaluate after pixels flow).
+
+**Next session = implement the real present copy (C3/K-A2/K-B2):** at `DxgkDdiPresent`
+(or the submit path), execute an actual src-allocation → dst-allocation copy host-side via
+venus (both allocations carry venus resids; identical creation parameters make a raw
+blob-to-blob byte copy image-correct on the same host device — or do it properly with
+imported VkBuffers + vkCmdCopyBuffer in the KMD's venus context), then retire the fence.
+Verify with the IDD sampler (`sampleNonZero` > 0 and hash changing per frame), then owner
+eyes. Note `PBcall/PBflag/PBcnt` named diag values already exist in `dxgkddi_present` for
+confirming call shape — but the registry diag ring burns out in minutes (the C-class tracer
+strip is still pending), so rely on the atomics/CollectDbgInfo HDBG report instead.
+
 ---
 
 # Session record below (validate boot first, then the Intel boot that closed it)
