@@ -45,6 +45,17 @@ pub struct HeliosDevice {
 pub struct IaState {
     /// VS COM pointer (as `usize`) → its DXBC input-signature bytecode.
     pub vs_bytecode: std::collections::HashMap<usize, Vec<u8>>,
+    /// VS COM pointer → the flattened DDI signature words it was created with
+    /// ([n_in, n_out, (sysval, reg, mask, comptype, stream) × …]); used to
+    /// recompile input-class variants (see `resolve_vs_input_variant`).
+    pub vs_sig_words: std::collections::HashMap<usize, Vec<u32>>,
+    /// (VS COM pointer, layout input-class key) → variant VS COM pointer,
+    /// recompiled with the layout's per-register numeric classes. Variants
+    /// live until device teardown (bounded: shaders × distinct class sets).
+    pub vs_variants: std::collections::HashMap<(usize, u64), usize>,
+    /// The VS COM pointer most recently handed to DXVK's VSSetShader (may be
+    /// a variant; `current_vs` stays the runtime's own binding).
+    pub bound_vs_com: usize,
     /// Currently-bound vertex shader's COM pointer.
     pub current_vs: usize,
     /// Currently-bound pixel shader's COM pointer.

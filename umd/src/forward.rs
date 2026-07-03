@@ -2243,6 +2243,24 @@ unsafe fn create_shader_11_1_common(
         return;
     };
     let sig_words = flatten_stage_io_signatures(sig);
+    {
+        // Evidence line for the Input-08733 investigation: dump each input
+        // entry's (register, mask, component type) — comptype 0 (UNKNOWN)
+        // falls back to float32 in the bridge, which is UB against SINT
+        // vertex formats.
+        let n_in = sig_words[0] as usize;
+        let mut dump = format!("DDI {name} sig entries:");
+        for i in 0..n_in.min(8) {
+            let base = 2 + i * 5;
+            dump.push_str(&format!(
+                " [r{} m0x{:x} t{}]",
+                sig_words[base + 1],
+                sig_words[base + 2],
+                sig_words[base + 3]
+            ));
+        }
+        log_line(&dump);
+    }
     let raw = dxvk.create_shader_sig(
         kind,
         bytes.as_ptr(),
@@ -2260,8 +2278,12 @@ unsafe fn create_shader_11_1_common(
         }
         store_raw_com(h_shader.pDrvPrivate, raw);
         if kind == 0 {
-            // Keep the bytecode so input layouts can be created lazily.
-            dev.ia.borrow_mut().vs_bytecode.insert(raw, bytes.to_vec());
+            // Keep the bytecode so input layouts can be created lazily, and
+            // the signature words so input-class variants can be recompiled
+            // against the bound layout (resolve_vs_input_variant).
+            let mut ia = dev.ia.borrow_mut();
+            ia.vs_bytecode.insert(raw, bytes.to_vec());
+            ia.vs_sig_words.insert(raw, sig_words);
         }
     } else {
         log_line(&format!("DDI {name} failed"));
@@ -2476,7 +2498,9 @@ unsafe extern "C" fn vs_set_shader(h: Hdevice, h_shader: ddi::D3D10DDI_HSHADER) 
         *(h_shader.pDrvPrivate as *const usize)
     };
     if let Some(dev) = helios_device(h) {
-        dev.ia.borrow_mut().current_vs = com;
+        let mut ia = dev.ia.borrow_mut();
+        ia.current_vs = com;
+        ia.bound_vs_com = com;
     }
     let n = SHADER_BIND_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
     if n < 128 {
@@ -4962,6 +4986,172 @@ unsafe fn bind_input_layout(h: Hdevice) {
         let il = ManuallyDrop::new(ID3D11InputLayout::from_raw(il_raw as *mut c_void));
         context.IASetInputLayout(&*il);
     }
+
+    // VUID-Input-08733: the DDI never provides shader-input component types
+    // (RegisterComponentType arrives 0/UNKNOWN — verified against both dwm's
+    // SM4 shaders and the SM5 draw probe), so compiled VS inputs default to
+    // float32 while layouts may bind SINT/UINT vertex formats: vertex-fetch
+    // UB (dwm binds R16G16_SINT TEXCOORDs; the garbage is the prime Xid-109
+    // suspect). The INPUT LAYOUT is the ground truth for the numeric class —
+    // any (layout, VS) pair the runtime allows to bind matched the app's
+    // original input signature — so bind a variant recompiled with the
+    // layout's classes whenever any attribute is non-float.
+    resolve_vs_input_variant(h, lp, vp);
+}
+
+/// Numeric class of a DXGI vertex format for Vulkan's vertex-input contract,
+/// as a DXBC ISGN component type: 1 = UINT, 2 = SINT, 3 = FLOAT (covers
+/// FLOAT/UNORM/SNORM — all float-class at the fetch).
+fn dxgi_vertex_class(format: i32) -> u32 {
+    match format {
+        // *_UINT: R32G32B32A32, R32G32B32, R16G16B16A16, R32G32, R10G10B10A2,
+        // R8G8B8A8, R16G16, R32, R8G8, R16, R8
+        3 | 7 | 12 | 17 | 25 | 30 | 36 | 42 | 50 | 57 | 62 => 1,
+        // *_SINT: same families
+        4 | 8 | 14 | 18 | 32 | 38 | 43 | 52 | 59 | 64 => 2,
+        _ => 3,
+    }
+}
+
+/// Component mask of a DXGI vertex format (for synthesized ISGN entries).
+fn dxgi_vertex_mask(format: i32) -> u32 {
+    match format {
+        1..=4 | 9..=14 | 19..=32 => 0xf,          // 4-component families
+        5..=8 => 0x7,                             // R32G32B32
+        15..=18 | 33..=38 | 48..=52 => 0x3,       // 2-component families
+        _ => 0x1,                                 // scalars and the rest
+    }
+}
+
+/// Pick (and lazily compile) the vertex-shader variant whose declared input
+/// component types match the bound layout's format classes, then bind it.
+/// All-float layouts (the overwhelmingly common case) bind the original.
+unsafe fn resolve_vs_input_variant(h: Hdevice, lp: usize, vp: usize) {
+    let Some(dev) = helios_device(h) else {
+        return;
+    };
+    let layout = &*(lp as *const LayoutData);
+    // (register, class, mask) per input register, merging multi-element
+    // registers (matrix-style attributes span elements, same class).
+    let mut classes: Vec<(u32, u32, u32)> = Vec::new();
+    let mut any_nonfloat = false;
+    for el in &layout.elements {
+        let class = dxgi_vertex_class(el.format);
+        let mask = dxgi_vertex_mask(el.format);
+        if class != 3 {
+            any_nonfloat = true;
+        }
+        if let Some(entry) = classes.iter_mut().find(|c| c.0 == el.input_register) {
+            entry.1 = entry.1.max(class);
+            entry.2 |= mask;
+        } else {
+            classes.push((el.input_register, class, mask));
+        }
+    }
+
+    let desired = if !any_nonfloat {
+        vp
+    } else {
+        // FNV-1a over (register, class) pairs = the variant cache key.
+        let mut key: u64 = 0xcbf2_9ce4_8422_2325;
+        for &(r, c, _) in &classes {
+            key = (key ^ (((r as u64) << 8) | c as u64)).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        let cached = dev.ia.borrow().vs_variants.get(&(vp, key)).copied();
+        let variant = match cached {
+            Some(v) => v,
+            None => {
+                let v = create_vs_input_variant(dev, vp, &classes);
+                dev.ia.borrow_mut().vs_variants.insert((vp, key), v);
+                v
+            }
+        };
+        if variant != 0 { variant } else { vp }
+    };
+
+    if dev.ia.borrow().bound_vs_com == desired {
+        return;
+    }
+    let Some(context) = d3d11_context(h) else {
+        return;
+    };
+    let s = ManuallyDrop::new(ID3D11VertexShader::from_raw(desired as *mut c_void));
+    context.VSSetShader(&*s, None);
+    dev.ia.borrow_mut().bound_vs_com = desired;
+    let n = SHADER_BIND_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+    if n < 256 {
+        log_line(&format!(
+            "DDI VS input-class variant bound: vs=0x{vp:x} -> 0x{desired:x}"
+        ));
+    }
+}
+
+/// Recompile a vertex shader with its synthesized ISGN component types taken
+/// from the bound input layout. Returns 0 on failure (caller falls back to
+/// the original shader — no worse than the pre-variant behaviour).
+unsafe fn create_vs_input_variant(
+    dev: &HeliosDevice,
+    vp: usize,
+    classes: &[(u32, u32, u32)],
+) -> usize {
+    let (bytecode, mut words) = {
+        let ia = dev.ia.borrow();
+        let Some(b) = ia.vs_bytecode.get(&vp) else {
+            log_line(&format!("VS variant: no bytecode for vs=0x{vp:x}"));
+            return 0;
+        };
+        if b.len() >= 4 && &b[0..4] == b"DXBC" {
+            // Real container: its own ISGN already carries real types.
+            return 0;
+        }
+        let w = ia
+            .vs_sig_words
+            .get(&vp)
+            .cloned()
+            .unwrap_or_else(|| vec![0u32, 0u32]);
+        (b.clone(), w)
+    };
+
+    let n_in = words[0] as usize;
+    if n_in > 0 {
+        // Patch the DDI-provided entries' component types from the layout.
+        for i in 0..n_in {
+            let base = 2 + i * 5;
+            let reg = words[base + 1];
+            if let Some(&(_, class, _)) = classes.iter().find(|c| c.0 == reg) {
+                words[base + 3] = class;
+            } else if words[base + 3] == 0 {
+                words[base + 3] = 3;
+            }
+        }
+    } else {
+        // Shader arrived through the legacy untyped create: synthesize the
+        // input entries wholesale from the layout (extra entries for unused
+        // registers are declared-then-eliminated by the compiler).
+        let n_out = words[1];
+        let out_words = words.split_off(2);
+        words = vec![classes.len() as u32, n_out];
+        for &(reg, class, mask) in classes {
+            words.extend_from_slice(&[0, reg, mask, class, 0]);
+        }
+        words.extend_from_slice(&out_words);
+    }
+
+    let Some(dxvk) = dev.dxvk.as_ref() else {
+        return 0;
+    };
+    let raw = dxvk.create_shader_sig(
+        0,
+        bytecode.as_ptr(),
+        bytecode.len(),
+        words.as_ptr(),
+        words.len(),
+    );
+    log_line(&format!(
+        "VS input-class variant: vs=0x{vp:x} classes={:?} -> raw=0x{raw:x}",
+        classes.iter().map(|c| (c.0, c.1)).collect::<Vec<_>>()
+    ));
+    raw
 }
 
 unsafe extern "C" fn ia_set_vertex_buffers(
