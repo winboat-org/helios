@@ -558,6 +558,7 @@ unsafe fn open_adapter_common(open_data: *mut D3d10DdiArgOpenAdapter, with_10_2:
         "open_adapter_common interface=0x{:08x} version=0x{:08x} with_10_2={}",
         open.interface, open.version, with_10_2
     ));
+    log_self_module_path();
 
     open.h_adapter = D3d10DdiAdapterHandle {
         p_drv_private: core::ptr::addr_of_mut!(ADAPTER_COOKIE).cast::<c_void>(),
@@ -602,6 +603,19 @@ unsafe extern "system" fn create_device(
         return E_NOTIMPL;
     }
     let create = unsafe { &*(args as *const D3d10DdiArgCreateDevice) };
+    // Ground-truth dump: the negotiated Interface decides which funcs-table
+    // LAYOUT the runtime reads back, and a misread here silently wires typed
+    // 11.1 handlers into slots an 11.0-negotiated device never calls (dwm's
+    // singlethreaded devices were observed hitting the UNTYPED shader creates
+    // → float32-typed SPIR-V inputs vs SINT vertex data, VUID-Input-08733).
+    {
+        let q = args as *const u64;
+        let mut raw = String::from("CreateDevice raw args:");
+        for i in 0..12 {
+            raw.push_str(&format!(" [{}]=0x{:016x}", i, unsafe { q.add(i).read_unaligned() }));
+        }
+        log_line(&raw);
+    }
     log_line(&format!(
         "CreateDevice interface=0x{:08x} version=0x{:08x} flags=0x{:08x} \
          pDeviceFuncs={:p} hDrvDevice={:p} pKTCallbacks={:p} pUMCallbacks={:p} pDXGIBaseFuncs={:p}",
@@ -814,5 +828,51 @@ pub(crate) fn log_line(message: &str) {
         .open(umd_log_path())
     {
         let _ = writeln!(file, "[pid={}] {}", std::process::id(), message);
+    }
+}
+
+/// Log which DLL file THIS code is running from, once per process. Multiple
+/// UMD copies exist on disk (DriverStore package, ProgramData versioned
+/// copies) and boot-time resolution has served stale builds before (a stray
+/// pre-typed-signature FileRepository\helios_umd.dll caused cold-boot dwm
+/// devices to run old shader handlers, 2026-07-04) — the per-pid log alone
+/// cannot distinguish which copy handled which device.
+fn log_self_module_path() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static LOGGED: AtomicBool = AtomicBool::new(false);
+    if LOGGED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetModuleHandleExW(
+            flags: u32,
+            module_name: *const u16,
+            module: *mut *mut c_void,
+        ) -> i32;
+        fn GetModuleFileNameW(module: *mut c_void, filename: *mut u16, size: u32) -> u32;
+    }
+    const FROM_ADDRESS: u32 = 0x4; // GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
+    const UNCHANGED_REFCOUNT: u32 = 0x2; // ..._UNCHANGED_REFCOUNT
+    unsafe {
+        let mut hmod: *mut c_void = core::ptr::null_mut();
+        let anchor = log_self_module_path as *const ();
+        if GetModuleHandleExW(
+            FROM_ADDRESS | UNCHANGED_REFCOUNT,
+            anchor as *const u16,
+            &mut hmod,
+        ) != 0
+        {
+            let mut buf = [0u16; 512];
+            let n = GetModuleFileNameW(hmod, buf.as_mut_ptr(), buf.len() as u32) as usize;
+            if n > 0 && n < buf.len() {
+                log_line(&format!(
+                    "UMD module: {}",
+                    String::from_utf16_lossy(&buf[..n])
+                ));
+                return;
+            }
+        }
+        log_line("UMD module: <unresolvable>");
     }
 }
