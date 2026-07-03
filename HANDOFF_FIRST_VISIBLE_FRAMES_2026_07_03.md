@@ -1,5 +1,56 @@
 # Handoff — FIRST USER-VISIBLE FRAMES (2026-07-03)
 
+> ## §0c Cold boot #3 (07:30): SELF-CONVERGED, zero manual actions — and the boot taxonomy
+>
+> Third cold boot, nothing touched: **the system converged on its own at boot+4.5 min** and
+> the bound swapchain now acquires at the idle-desktop cadence (exactly one frame per minute
+> — the taskbar clock redraw — at 02:05:00/02:06:00/02:07:00Z; a fed steady-state binding,
+> which also answers the §3 "is idle-zero-presents legitimate" question for the idle case).
+> Sequence (CORRECTED after the owner spotted the host-side lines — the first venus
+> activity of the boot in `/tmp/helios-qemu-stderr.log`):
+> **the dwm crash was a C1 ALLOCATION-IDENTITY failure, not boot slowness.**
+> dwm opened a shared surface → ICD imported by venus res_id 45 → host:
+> `vkr: failed to import resource: invalid res_id 45` (the resource was never attached to
+> dwm's venus context — the exact C1 hole: no CTX_ATTACH_RESOURCE for the opener) →
+> `vkAllocateMemory resulted in CS error` → `ring_submit_cmd: vn_dispatch_command failed`
+> → dwm's ring dead → the now-SYNC `vn_call_vkAllocateMemory` waited on the dead ring →
+> **mesa's watchdog abort()ed dwm** (dump `dwm.exe.1904.dmp`, stack resolved via mingw
+> addr2line with the PE ImageBase added: `abort ← vn_ring_wait_seqno vn_ring.c:258 ←
+> vn_call_vkAllocateMemory ← vn_device_memory_import_resource_id vn_device_memory.c:277`).
+> While dwm hung on that dead ring it could not offer a swapchain — which is WHY this
+> boot had no offer during post-start. Then Windows restarted dwm (07:33:19), the C5
+> replug loop (pacing arrival→10 s offer-timeout→replug the whole time, ~11 s/cycle,
+> CommitModes every cycle) re-offered, and the post-dwm-restart cycle **bound
+> successfully** (07:34:55) → frames. Note the P0.1 payoff: under the old async alloc this
+> same identity failure was SILENT phantom-object ring poison; now it is loud and
+> attributable host-side. The guest's failure mode (stall→abort instead of clean
+> VK_ERROR_DEVICE_LOST) is the remaining I-A4/I-A5/I-A6 work; the ROOT is C1.
+>
+> **The three-boot taxonomy (the discriminator for the fix):**
+> - Boot #1: swapchain offered at +2 s → born abandoned → no re-offer → host killed at
+>   ASSIGN+25 s → FAILED_POST_START (permanent).
+> - Boot #2: same, callback stuck in 22 s SetDevice stalls → killed at +25 s.
+> - Boot #3: NO offer during post-start (dwm stalled/aborted) → **no kill** → post-start
+>   completed → replug loop converged once dwm was reborn.
+>
+> ⇒ **The lethal condition for the IDD is specifically "an abandoned swapchain assigned
+> during the post-start window"** — not the abandon itself (warm abandons recover), not
+> callback duration, not the replug loop (it ran for minutes unharmed and then delivered
+> the convergence). And **the #1 crash driver at boot is now proven to be C1** (the
+> invalid-res_id import above), which is very likely also the black-window content class
+> (failed imports → metadata-texture fallback → black). Fix order, updated:
+> 1. **C1 (promoted, hard evidence)**: KMD attaches the resource to the OPENER's venus
+>    context at OpenAllocation (CTX_ATTACH_RESOURCE with the opener's ctx id) + the
+>    versioned identity ABI + exact-size import + DELETE the metadata fallback. This
+>    removes the invalid-res_id class entirely.
+> 2. ICD failure-mode honesty (I-A4/I-A5/I-A6): host CS error → clean VkResult /
+>    VK_ERROR_DEVICE_LOST instead of dead-ring stall → watchdog abort() of the process.
+> 3. The born-abandoned first swapchain at boot (June-26 DxgkRemoveAdapter→BLTQUEUE::Reset
+>    chain) — root of the boot-#1/#2 kill; option: gate the FIRST IddCxMonitorArrival on
+>    desktop readiness (arrival gating moves the fragile assignment out of post-start).
+> No WUDF dump this boot (nothing crashed WUDFHost); the writer stays armed for the next
+> boot-#1-shaped failure.
+
 > ## ⚠️ §0 COLD-BOOT RESULT (added same day, after the owner's hard reboot): TRANSIENT.
 > The visible frames did NOT survive a cold boot. After a hard reboot (07:09) the owner sees
 > only the LG client placeholder. Diagnosis from that boot's evidence (nothing was restarted;
