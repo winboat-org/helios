@@ -16,6 +16,7 @@
 
 #include "dxvk_bridge.h"
 
+#include <array>
 #include <atomic>
 #include <cstring>
 #include <d3d11.h>
@@ -427,6 +428,127 @@ namespace {
     return false;
   }
 
+  // One DDI signature entry flattened by the Rust side:
+  // (SystemValue, Register, Mask, RegisterComponentType, Stream).
+  constexpr std::size_t kSigEntryWords = 5;
+
+  // Append one 24-byte DXBC signature chunk (ISGN/OSGN) built from flattened
+  // D3D11_1DDIARG_SIGNATURE_ENTRY2 values. Semantic names are synthesized as
+  // "TEXCOORD<register>" — names are only a matching key (the input-layout
+  // path fabricates the same convention); the load-bearing fields are the
+  // register, mask, system value and, critically, the COMPONENT TYPE the raw
+  // token stream cannot express (dwm binds R16G16_SINT vertex data against
+  // shaders whose ISGN declares SINT inputs — typing them float32 was
+  // VUID-Input-08733 UB that rasterized nothing).
+  void append_signature_chunk(std::vector<std::uint8_t>& blob,
+                              const char tag[4],
+                              const std::uint32_t* entries,
+                              std::uint32_t count) {
+    constexpr const char kName[] = "TEXCOORD";  // + NUL = 9 bytes
+    const std::uint32_t entries_size = count * 24u;
+    const std::uint32_t name_off = 8u + entries_size;  // relative to chunk data
+    std::uint32_t data_len = name_off + sizeof(kName);
+    data_len = (data_len + 3u) & ~3u;
+
+    auto put32 = [&blob](std::uint32_t v) {
+      blob.push_back(std::uint8_t(v));
+      blob.push_back(std::uint8_t(v >> 8));
+      blob.push_back(std::uint8_t(v >> 16));
+      blob.push_back(std::uint8_t(v >> 24));
+    };
+
+    blob.insert(blob.end(), tag, tag + 4);
+    put32(data_len);
+    const std::size_t data_start = blob.size();
+    put32(count);
+    put32(8u);
+    for (std::uint32_t i = 0; i < count; ++i) {
+      const std::uint32_t* e = entries + std::size_t(i) * kSigEntryWords;
+      const std::uint32_t sysval = e[0];
+      const std::uint32_t reg = e[1];
+      const std::uint32_t mask = e[2] & 0xFu;
+      // UNKNOWN(0) component type: default to float32 (matches the previous
+      // behaviour and the D3D convention for untyped registers).
+      const std::uint32_t comptype = e[3] ? e[3] : 3u;
+      if (e[4]) {
+        char msg[96];
+        std::snprintf(msg, sizeof(msg),
+                      "shader signature entry reg=%u has stream=%u (unencoded)", reg, e[4]);
+        umd_log(msg);
+      }
+      put32(name_off);
+      put32(reg);  // semantic index = register (TEXCOORD<reg> convention)
+      put32(sysval);
+      put32(comptype);
+      put32(reg);
+      put32(mask | (mask << 8));  // mask | read/write mask, 2 pad bytes
+    }
+    blob.insert(blob.end(), kName, kName + sizeof(kName));
+    while ((blob.size() - data_start) < data_len)
+      blob.push_back(0);
+  }
+
+  // Wrap a raw SM4/SM5 token stream in a DXBC container carrying REAL input/
+  // output signature chunks from the >=11.1 DDI. Layout mirrors
+  // prepare_shader_bytecode's code-only wrap, with two extra chunks.
+  ShaderBytecode prepare_shader_bytecode_with_sigs(
+      const std::uint8_t* code, std::size_t len,
+      const std::uint32_t* in_entries, std::uint32_t n_in,
+      const std::uint32_t* out_entries, std::uint32_t n_out) {
+    ShaderBytecode result = { };
+    if (!code || !len || len < 8 || (len & 3u))
+      return result;
+
+    const auto* dwords = reinterpret_cast<const std::uint32_t*>(code);
+    const std::uint32_t major = (dwords[0] >> 4u) & 0xfu;
+    if (std::size_t(dwords[1]) * sizeof(std::uint32_t) != len) {
+      umd_log("raw shader bytecode dword count mismatch (sig wrap)");
+      return result;
+    }
+    const char* code_tag = major >= 5u ? "SHEX" : "SHDR";
+
+    // Build the three chunks into a scratch buffer first.
+    std::vector<std::uint8_t> chunks;
+    std::array<std::uint32_t, 3> chunk_offsets = { };
+    std::uint32_t chunk_count = 0;
+
+    chunk_offsets.at(chunk_count++) = std::uint32_t(chunks.size());
+    append_signature_chunk(chunks, "ISGN", in_entries, n_in);
+    chunk_offsets.at(chunk_count++) = std::uint32_t(chunks.size());
+    append_signature_chunk(chunks, "OSGN", out_entries, n_out);
+    chunk_offsets.at(chunk_count++) = std::uint32_t(chunks.size());
+    chunks.insert(chunks.end(), code_tag, code_tag + 4);
+    {
+      std::uint32_t v = std::uint32_t(len);
+      chunks.push_back(std::uint8_t(v));
+      chunks.push_back(std::uint8_t(v >> 8));
+      chunks.push_back(std::uint8_t(v >> 16));
+      chunks.push_back(std::uint8_t(v >> 24));
+    }
+    chunks.insert(chunks.end(), code, code + len);
+
+    const std::uint32_t file_header_size = 32u;
+    const std::uint32_t offset_table_size = chunk_count * sizeof(std::uint32_t);
+    const std::uint32_t chunk_base = file_header_size + offset_table_size;
+    const std::uint32_t file_size = chunk_base + std::uint32_t(chunks.size());
+
+    result.owned.resize(file_size);
+    std::memcpy(&result.owned[0], "DXBC", 4);
+    write_le(result.owned, 20u, std::uint32_t(1u));
+    write_le(result.owned, 24u, file_size);
+    write_le(result.owned, 28u, chunk_count);
+    for (std::uint32_t i = 0; i < chunk_count; ++i)
+      write_le(result.owned, 32u + 4u * i, chunk_base + chunk_offsets.at(i));
+    std::memcpy(&result.owned[chunk_base], chunks.data(), chunks.size());
+
+    auto digest = dxbc_spv::dxbc::hashDxbcBinary(result.owned.data(), result.owned.size());
+    std::memcpy(&result.owned[4], digest.data.data(), digest.data.size());
+
+    result.data = result.owned.data();
+    result.len = result.owned.size();
+    return result;
+  }
+
   ShaderBytecode prepare_shader_bytecode(const std::uint8_t* code, std::size_t len) {
     ShaderBytecode result = { };
 
@@ -784,6 +906,174 @@ std::size_t HeliosDxvkDevice::create_geometry_shader(const std::uint8_t* code, s
   return 0;
 }
 
+std::size_t HeliosDxvkDevice::create_shader_sig(
+    std::uint32_t kind,
+    const std::uint8_t* code,
+    std::size_t len,
+    const std::uint32_t* sig_words,
+    std::size_t sig_words_len) const {
+  if (!impl || !impl->d3d11 || !code || !len || !sig_words || sig_words_len < 2)
+    return 0;
+  const std::uint32_t n_in = sig_words[0];
+  const std::uint32_t n_out = sig_words[1];
+  if (sig_words_len != 2 + std::size_t(n_in + n_out) * kSigEntryWords) {
+    umd_log("create_shader_sig: signature word count mismatch");
+    return 0;
+  }
+  const std::uint32_t* in_entries = sig_words + 2;
+  const std::uint32_t* out_entries = in_entries + std::size_t(n_in) * kSigEntryWords;
+  try {
+    auto bytecode = prepare_shader_bytecode_with_sigs(
+        code, len, in_entries, n_in, out_entries, n_out);
+    if (!bytecode)
+      return 0;
+    HRESULT hr = E_FAIL;
+    void* shader = nullptr;
+    switch (kind) {
+      case 0:
+        hr = impl->d3d11->CreateVertexShader(bytecode.data, bytecode.len, nullptr,
+                                             reinterpret_cast<ID3D11VertexShader**>(&shader));
+        break;
+      case 1:
+        hr = impl->d3d11->CreatePixelShader(bytecode.data, bytecode.len, nullptr,
+                                            reinterpret_cast<ID3D11PixelShader**>(&shader));
+        break;
+      case 2:
+        hr = impl->d3d11->CreateGeometryShader(bytecode.data, bytecode.len, nullptr,
+                                               reinterpret_cast<ID3D11GeometryShader**>(&shader));
+        break;
+      default:
+        umd_log("create_shader_sig: unknown shader kind");
+        return 0;
+    }
+    if (FAILED(hr)) {
+      umd_log("create_shader_sig: shader creation returned failure");
+      return 0;
+    }
+    return reinterpret_cast<std::size_t>(shader);
+  } catch (const dxvk::DxvkError& e) {
+    umd_log(("create_shader_sig DxvkError: " + e.message()).c_str());
+  } catch (const std::exception& e) {
+    umd_log(e.what());
+  } catch (...) {
+    umd_log("unknown exception in create_shader_sig");
+  }
+  return 0;
+}
+
+bool HeliosDxvkDevice::rotate_resource_backings(
+    const std::size_t* d3d11_resource_ptrs,
+    std::size_t count) const {
+  if (!impl || !impl->d3d11 || !impl->context || !d3d11_resource_ptrs || count < 2)
+    return false;
+  try {
+    // Collect the DXVK images first; refuse the whole rotation if any entry
+    // is not a storage-backed texture (a partial rotation would corrupt the
+    // swapchain identity mapping).
+    std::vector<dxvk::DxvkImage*> images;
+    images.reserve(count);
+    for (std::size_t i = 0; i < count; ++i) {
+      auto* resource = reinterpret_cast<ID3D11Resource*>(d3d11_resource_ptrs[i]);
+      auto* texture = resource ? dxvk::GetCommonTexture(resource) : nullptr;
+      if (!texture || texture->GetImage() == nullptr || texture->GetImage()->storage() == nullptr) {
+        umd_log("rotate_resource_backings: entry without image storage");
+        return false;
+      }
+      images.push_back(texture->GetImage().ptr());
+    }
+
+    // Full device sync: the storages must not be referenced by in-flight CS
+    // or GPU work while they move between images. Presents on this stack are
+    // low-rate during bring-up; revisit with the C3 async-fence work.
+    D3D11_QUERY_DESC qd = { D3D11_QUERY_EVENT, 0 };
+    ID3D11Query* query = nullptr;
+    if (FAILED(impl->d3d11->CreateQuery(&qd, &query)) || !query) {
+      umd_log("rotate_resource_backings: event query creation failed");
+      return false;
+    }
+    impl->context->End(query);
+    impl->context->Flush();
+    while (impl->context->GetData(query, nullptr, 0, 0) == S_FALSE)
+      ::Sleep(0);
+    query->Release();
+
+    // Debug instrument (registry-gated, off by default): sample the surface
+    // that was JUST presented (resource[0], pre-rotation) while the device is
+    // fully idle — write-side ground truth for "does the composed frame carry
+    // pixels". HKLM\SOFTWARE\Helios!RotateSample (DWORD) = sample every Nth
+    // rotation.
+    static std::atomic<std::uint32_t> s_sampleEvery{~0u};
+    static std::atomic<std::uint32_t> s_rotateCount{0};
+    std::uint32_t sampleEvery = s_sampleEvery.load(std::memory_order_relaxed);
+    if (sampleEvery == ~0u) {
+      DWORD value = 0, size = sizeof(value);
+      if (RegGetValueA(HKEY_LOCAL_MACHINE, "SOFTWARE\\Helios", "RotateSample",
+                       RRF_RT_REG_DWORD, nullptr, &value, &size) != ERROR_SUCCESS)
+        value = 0;
+      sampleEvery = value;
+      s_sampleEvery.store(sampleEvery, std::memory_order_relaxed);
+    }
+    if (sampleEvery && (s_rotateCount.fetch_add(1) % sampleEvery) == 0) {
+      auto* res0 = reinterpret_cast<ID3D11Resource*>(d3d11_resource_ptrs[0]);
+      ID3D11Texture2D* tex = nullptr;
+      if (SUCCEEDED(res0->QueryInterface(__uuidof(ID3D11Texture2D),
+                                         reinterpret_cast<void**>(&tex)))) {
+        D3D11_TEXTURE2D_DESC td = {};
+        tex->GetDesc(&td);
+        D3D11_TEXTURE2D_DESC sd = td;
+        sd.BindFlags = 0;
+        sd.MiscFlags = 0;
+        sd.Usage = D3D11_USAGE_STAGING;
+        sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        sd.MipLevels = 1;
+        sd.ArraySize = 1;
+        ID3D11Texture2D* staging = nullptr;
+        if (SUCCEEDED(impl->d3d11->CreateTexture2D(&sd, nullptr, &staging)) && staging) {
+          impl->context->CopyResource(staging, tex);
+          D3D11_MAPPED_SUBRESOURCE map = {};
+          if (SUCCEEDED(impl->context->Map(staging, 0, D3D11_MAP_READ, 0, &map))) {
+            const auto* base = static_cast<const std::uint8_t*>(map.pData);
+            std::uint32_t nonzero = 0, samples = 0;
+            for (UINT y = 0; y < td.Height; y += 64) {
+              const auto* row = reinterpret_cast<const std::uint32_t*>(base + std::size_t(y) * map.RowPitch);
+              for (UINT x = 0; x < td.Width; x += 64) {
+                ++samples;
+                nonzero += row[x] != 0;
+              }
+            }
+            char msg[160];
+            std::snprintf(msg, sizeof(msg),
+                          "rotate-sample: presented %ux%u nonzero=%u/%u center=0x%08x",
+                          td.Width, td.Height, nonzero, samples,
+                          reinterpret_cast<const std::uint32_t*>(
+                              base + std::size_t(td.Height / 2) * map.RowPitch)[td.Width / 2]);
+            umd_log(msg);
+            impl->context->Unmap(staging, 0);
+          }
+          staging->Release();
+        }
+        tex->Release();
+      }
+    }
+
+    // resource[i] takes resource[i+1]'s storage; the last takes the first's.
+    std::vector<dxvk::Rc<dxvk::DxvkResourceAllocation>> storages;
+    storages.reserve(count);
+    for (std::size_t i = 0; i < count; ++i)
+      storages.push_back(images[i]->storage());
+    for (std::size_t i = 0; i < count; ++i)
+      images[i]->assignStorage(std::move(storages[(i + 1) % count]));
+    return true;
+  } catch (const dxvk::DxvkError& e) {
+    umd_log(("rotate_resource_backings DxvkError: " + e.message()).c_str());
+  } catch (const std::exception& e) {
+    umd_log(e.what());
+  } catch (...) {
+    umd_log("unknown exception in rotate_resource_backings");
+  }
+  return false;
+}
+
 std::size_t HeliosDxvkDevice::create_hull_shader(const std::uint8_t* code, std::size_t len) const {
   if (!impl || !impl->d3d11 || !code || !len)
     return 0;
@@ -862,6 +1152,19 @@ std::unique_ptr<HeliosDxvkDevice> helios_dxvk_create_device(
   // Force selection of the Helios venus device if other ICDs are present.
   _putenv_s("DXVK_FILTER_DEVICE_NAME", "Virtio-GPU Venus");
   _putenv_s("HELIOS_DXVK_KMT_SHARED", "1");
+
+  // Debug instrument (registry-gated, off by default): route DXVK's shader
+  // dumping into every UMD-hosting process — session-0 services (dwm) cannot
+  // be given process env vars any other way. HKLM\SOFTWARE\Helios!
+  // ShaderDumpPath (REG_SZ) = target directory.
+  {
+    char dumpPath[MAX_PATH] = {};
+    DWORD size = sizeof(dumpPath);
+    if (RegGetValueA(HKEY_LOCAL_MACHINE, "SOFTWARE\\Helios", "ShaderDumpPath",
+                     RRF_RT_REG_SZ, nullptr, dumpPath, &size) == ERROR_SUCCESS &&
+        dumpPath[0])
+      _putenv_s("DXVK_SHADER_DUMP_PATH", dumpPath);
+  }
 
   try {
     auto out = std::make_unique<HeliosDxvkDevice>();

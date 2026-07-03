@@ -62,6 +62,26 @@ struct HeliosDxvkDevice {
   std::size_t create_vertex_shader(const std::uint8_t* code, std::size_t len) const;
   std::size_t create_pixel_shader(const std::uint8_t* code, std::size_t len) const;
   std::size_t create_geometry_shader(const std::uint8_t* code, std::size_t len) const;
+  // Signature-carrying variant for the >=11.1 DDI, whose typed
+  // D3D11_1DDIARG_SIGNATURE_ENTRY2 arrays supply the component types the raw
+  // token stream lacks. `kind`: 0 = vertex, 1 = pixel, 2 = geometry.
+  // `sig_words` = [n_in, n_out, then (sysval, register, mask, comptype,
+  // stream) x n_in, then the same x n_out]; the container gets real
+  // ISGN/OSGN chunks so dxbc-spv declares correctly-typed I/O.
+  std::size_t create_shader_sig(
+      std::uint32_t kind,
+      const std::uint8_t* code,
+      std::size_t len,
+      const std::uint32_t* sig_words,
+      std::size_t sig_words_len) const;
+
+  // Flip-model identity rotation (DXGI pfnRotateResourceIdentities): each
+  // texture takes the DXVK storage (memory + VkImage + KMT handles) of the
+  // NEXT one in the list, the last takes the first's. Fully synchronizes the
+  // device first (event query) so no in-flight work references the storages.
+  bool rotate_resource_backings(
+      const std::size_t* d3d11_resource_ptrs,
+      std::size_t count) const;
   std::size_t create_hull_shader(const std::uint8_t* code, std::size_t len) const;
   std::size_t create_domain_shader(const std::uint8_t* code, std::size_t len) const;
   std::size_t create_compute_shader(const std::uint8_t* code, std::size_t len) const;

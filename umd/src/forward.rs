@@ -1936,6 +1936,17 @@ unsafe extern "C" fn discard_11_1(
         ));
     }
 
+    // A rect-limited discard invalidates ONLY the given sub-rects. D3D11's
+    // Discard is a hint, so discarding LESS than requested is always legal —
+    // discarding more is not: forwarding these as full-view discards made
+    // DXVK reinitialize the whole image, wiping the undamaged 99% of dwm's
+    // flip backbuffer every frame (dwm redraws only the dirty region and
+    // rect-discards exactly that region on the incoming buffer). Match
+    // upstream DXVK's DiscardView1 behaviour: drop partial discards.
+    if num_rects != 0 {
+        return;
+    }
+
     let Some(context) = d3d11_context1(h) else {
         return;
     };
@@ -2141,6 +2152,129 @@ unsafe extern "C" fn create_pixel_shader(
     } else {
         log_line("DDI create_pixel_shader failed");
     }
+}
+
+/// Flatten a >=11.1 typed signature block into the bridge wire layout:
+/// [n_in, n_out, (sysval, register, mask, comptype, stream) x n_in, same x
+/// n_out]. The ENTRY2 arm is the one the >=11.1 runtime fills.
+unsafe fn flatten_stage_io_signatures(
+    sig: *const ddi::D3D11_1DDIARG_STAGE_IO_SIGNATURES,
+) -> Vec<u32> {
+    let mut words = vec![0u32, 0u32];
+    if sig.is_null() {
+        return words;
+    }
+    let s = &*sig;
+    let p_in = s.__bindgen_anon_1.pInputSignature;
+    let p_out = s.__bindgen_anon_2.pOutputSignature;
+    let n_in = if p_in.is_null() { 0 } else { s.NumInputSignatureEntries };
+    let n_out = if p_out.is_null() { 0 } else { s.NumOutputSignatureEntries };
+    words[0] = n_in;
+    words[1] = n_out;
+    for i in 0..n_in as usize {
+        let e = &*p_in.add(i);
+        words.extend_from_slice(&[
+            e.SystemValue as u32,
+            e.Register,
+            e.Mask as u32,
+            e.RegisterComponentType as u32,
+            e.Stream as u32,
+        ]);
+    }
+    for i in 0..n_out as usize {
+        let e = &*p_out.add(i);
+        words.extend_from_slice(&[
+            e.SystemValue as u32,
+            e.Register,
+            e.Mask as u32,
+            e.RegisterComponentType as u32,
+            e.Stream as u32,
+        ]);
+    }
+    words
+}
+
+/// Shared body for the >=11.1 typed shader creates. `kind`: 0 = vertex,
+/// 1 = pixel, 2 = geometry (bridge convention). The typed signatures carry
+/// the component types the raw token stream cannot express — without them
+/// dxbc-spv declared every input float32 while dwm binds R16G16_SINT vertex
+/// data (VUID-Input-08733 UB: garbage positions, nothing rasterized).
+unsafe fn create_shader_11_1_common(
+    h: Hdevice,
+    kind: u32,
+    code: *const u32,
+    h_shader: ddi::D3D10DDI_HSHADER,
+    sig: *const ddi::D3D11_1DDIARG_STAGE_IO_SIGNATURES,
+    name: &str,
+) {
+    clear_handle(h_shader.pDrvPrivate);
+    let Some(dev) = helios_device(h) else {
+        return;
+    };
+    let len = shader_code_len(code);
+    log_shader_code(name, code, len);
+    if len == 0 {
+        log_line(&format!("DDI {name} failed: unknown shader length"));
+        return;
+    }
+    let bytes = core::slice::from_raw_parts(code as *const u8, len);
+    let Some(dxvk) = dev.dxvk.as_ref() else {
+        return;
+    };
+    let sig_words = flatten_stage_io_signatures(sig);
+    let raw = dxvk.create_shader_sig(
+        kind,
+        bytes.as_ptr(),
+        bytes.len(),
+        sig_words.as_ptr(),
+        sig_words.len(),
+    );
+    if raw != 0 {
+        let n = SHADER_BIND_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+        if n < 128 {
+            log_line(&format!(
+                "DDI {name} ok: raw=0x{raw:x} len={len} sig_in={} sig_out={}",
+                sig_words[0], sig_words[1]
+            ));
+        }
+        store_raw_com(h_shader.pDrvPrivate, raw);
+        if kind == 0 {
+            // Keep the bytecode so input layouts can be created lazily.
+            dev.ia.borrow_mut().vs_bytecode.insert(raw, bytes.to_vec());
+        }
+    } else {
+        log_line(&format!("DDI {name} failed"));
+    }
+}
+
+unsafe extern "C" fn create_vertex_shader_11_1(
+    h: Hdevice,
+    code: *const u32,
+    h_shader: ddi::D3D10DDI_HSHADER,
+    _hrt: ddi::D3D10DDI_HRTSHADER,
+    sig: *const ddi::D3D11_1DDIARG_STAGE_IO_SIGNATURES,
+) {
+    create_shader_11_1_common(h, 0, code, h_shader, sig, "create_vertex_shader_11_1");
+}
+
+unsafe extern "C" fn create_pixel_shader_11_1(
+    h: Hdevice,
+    code: *const u32,
+    h_shader: ddi::D3D10DDI_HSHADER,
+    _hrt: ddi::D3D10DDI_HRTSHADER,
+    sig: *const ddi::D3D11_1DDIARG_STAGE_IO_SIGNATURES,
+) {
+    create_shader_11_1_common(h, 1, code, h_shader, sig, "create_pixel_shader_11_1");
+}
+
+unsafe extern "C" fn create_geometry_shader_11_1(
+    h: Hdevice,
+    code: *const u32,
+    h_shader: ddi::D3D10DDI_HSHADER,
+    _hrt: ddi::D3D10DDI_HRTSHADER,
+    sig: *const ddi::D3D11_1DDIARG_STAGE_IO_SIGNATURES,
+) {
+    create_shader_11_1_common(h, 2, code, h_shader, sig, "create_geometry_shader_11_1");
 }
 
 unsafe extern "C" fn create_geometry_shader(
@@ -4891,6 +5025,76 @@ unsafe extern "C" fn create_blend_state(
     }
 }
 
+/// D3D11.1-interface `pfnCalcPrivateBlendStateSize` (same 8-byte COM-pointer
+/// slot as `calc_size_blend`; only the desc type differs).
+unsafe extern "C" fn calc_size_blend_11_1(
+    _h: Hdevice,
+    _d: *const ddi::D3D11_1_DDI_BLEND_DESC,
+) -> u64 {
+    8
+}
+
+/// D3D11.1-interface `pfnCreateBlendState`. Every device-funcs table from
+/// D3D11.1 up passes `D3D11_1_DDI_BLEND_DESC`, whose per-RT struct INSERTS
+/// `LogicOpEnable` after `BlendEnable` and `LogicOp` before
+/// `RenderTargetWriteMask` — it is NOT prefix-compatible with the 10.1 desc.
+/// Installing the 10.1 reader here made the mask field land on the 11.1
+/// desc's `BlendOpAlpha` (default D3D11_BLEND_OP_ADD = 1), so every blend
+/// state — including the runtime's defaults — carried RenderTargetWriteMask =
+/// RED-only and every draw on the stack wrote just the R channel (the
+/// black/red-tinted composition class; minimal repro
+/// tools/d3d11_shared_draw_probe.cpp, 2026-07-03).
+unsafe extern "C" fn create_blend_state_11_1(
+    h: Hdevice,
+    desc: *const ddi::D3D11_1_DDI_BLEND_DESC,
+    h_bs: ddi::D3D10DDI_HBLENDSTATE,
+    _hrt: ddi::D3D10DDI_HRTBLENDSTATE,
+) {
+    clear_handle(h_bs.pDrvPrivate);
+    let Some(device) = d3d11_device(h) else {
+        return;
+    };
+    let Ok(device1) = device.cast::<ID3D11Device1>() else {
+        log_line("DDI create_blend_state_11_1: ID3D11Device1 cast failed");
+        return;
+    };
+    let d = &*desc;
+    let mut rt: [D3D11_RENDER_TARGET_BLEND_DESC1; 8] = Default::default();
+    for i in 0..8 {
+        let s = &d.RenderTarget[i];
+        rt[i] = D3D11_RENDER_TARGET_BLEND_DESC1 {
+            BlendEnable: windows::Win32::Foundation::BOOL(s.BlendEnable),
+            LogicOpEnable: windows::Win32::Foundation::BOOL(s.LogicOpEnable),
+            SrcBlend: D3D11_BLEND(s.SrcBlend),
+            DestBlend: D3D11_BLEND(s.DestBlend),
+            BlendOp: D3D11_BLEND_OP(s.BlendOp),
+            SrcBlendAlpha: D3D11_BLEND(s.SrcBlendAlpha),
+            DestBlendAlpha: D3D11_BLEND(s.DestBlendAlpha),
+            BlendOpAlpha: D3D11_BLEND_OP(s.BlendOpAlpha),
+            // The API logic-op enum mirrors the DDI enum value-for-value.
+            LogicOp: D3D11_LOGIC_OP(s.LogicOp),
+            RenderTargetWriteMask: s.RenderTargetWriteMask,
+        };
+    }
+    let bd = D3D11_BLEND_DESC1 {
+        AlphaToCoverageEnable: windows::Win32::Foundation::BOOL(d.AlphaToCoverageEnable),
+        IndependentBlendEnable: windows::Win32::Foundation::BOOL(d.IndependentBlendEnable),
+        RenderTarget: rt,
+    };
+    let mut bs: Option<ID3D11BlendState1> = None;
+    if device1.CreateBlendState1(&bd, Some(&mut bs)).is_ok() {
+        if let Some(s) = bs {
+            // `set_blend_state` loads an ID3D11BlendState from this slot;
+            // store the base interface.
+            if let Ok(base) = s.cast::<ID3D11BlendState>() {
+                store_com(h_bs.pDrvPrivate, base);
+            }
+        }
+    } else {
+        log_line("DDI create_blend_state_11_1: CreateBlendState1 failed");
+    }
+}
+
 unsafe extern "C" fn set_blend_state(
     h: Hdevice,
     h_bs: ddi::D3D10DDI_HBLENDSTATE,
@@ -5066,6 +5270,18 @@ unsafe extern "C" fn dxgi_query_resource_residency(
     0
 }
 
+/// DXGI flip-model identity rotation. The runtime calls this after each flip
+/// present so the app's fixed buffer objects walk the swapchain's allocation
+/// ring: resource[i] takes resource[i+1]'s identity, the last takes the
+/// first's. Two coordinated moves keep the world consistent:
+///   1. the DXVK storages (venus memory + VkImage + KMT handles) rotate in
+///      the bridge, so draws through existing views land in the allocation
+///      the runtime now associates with the buffer;
+///   2. our per-resource WDDM {allocation, km} records rotate here, so the
+///      next present reports the rotated hSrcAllocation to dxgkrnl.
+/// The old Flush-only stub pinned dwm's composition to ONE allocation while
+/// dxgkrnl/IddCx walked all three swapchain buffers — two of every three
+/// acquired frames were buffers dwm never rendered (black IDD output).
 unsafe extern "C" fn dxgi_rotate_resource_identities(
     arg: *mut ddi::DXGI_DDI_ARG_ROTATE_RESOURCE_IDENTITIES,
 ) -> i32 {
@@ -5073,11 +5289,68 @@ unsafe extern "C" fn dxgi_rotate_resource_identities(
         return 0;
     }
     let a = &*arg;
-    if let Some(context) = d3d11_context(dxgi_device_handle(a.hDevice)) {
-        context.Flush();
+    let h = dxgi_device_handle(a.hDevice);
+    let n = a.Resources as usize;
+    if n < 2 || a.pResources.is_null() {
+        return 0;
+    }
+
+    // Collect the per-resource state pointers; all entries must be tracked
+    // resources or the rotation is refused whole (a partial rotation would
+    // permanently corrupt the swapchain mapping).
+    let mut states: Vec<*mut ResourceState> = Vec::with_capacity(n);
+    for i in 0..n {
+        let hr = dxgi_resource_handle(*a.pResources.add(i));
+        if hr.pDrvPrivate.is_null() {
+            log_line("DXGI RotateResourceIdentities: null resource handle");
+            return 0;
+        }
+        let state = *(hr.pDrvPrivate as *const *mut ResourceState);
+        if state.is_null() {
+            log_line("DXGI RotateResourceIdentities: untracked resource");
+            return 0;
+        }
+        states.push(state);
+    }
+
+    let rotated = if let Some(dev) = helios_device(h) {
+        let ptrs: Vec<usize> = states.iter().map(|s| (**s).com_raw).collect();
+        dev.dxvk.rotate_resource_backings(ptrs.as_ptr(), ptrs.len())
+    } else {
+        false
+    };
+    if !rotated {
+        log_line("DXGI RotateResourceIdentities: backing rotation FAILED");
+        return 0;
+    }
+
+    // Rotate the WDDM identity records in lockstep with the storages.
+    let first = (
+        (*states[0]).allocation,
+        (*states[0]).km_resource,
+        (*states[0]).owns_allocation,
+    );
+    for i in 0..n - 1 {
+        (*states[i]).allocation = (*states[i + 1]).allocation;
+        (*states[i]).km_resource = (*states[i + 1]).km_resource;
+        (*states[i]).owns_allocation = (*states[i + 1]).owns_allocation;
+    }
+    (*states[n - 1]).allocation = first.0;
+    (*states[n - 1]).km_resource = first.1;
+    (*states[n - 1]).owns_allocation = first.2;
+
+    let c = ROTATE_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+    if c < 64 {
+        log_line(&format!(
+            "DXGI RotateResourceIdentities: rotated {} resources, alloc[0]=0x{:x}",
+            n,
+            (*states[0]).allocation
+        ));
     }
     0
 }
+
+static ROTATE_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 unsafe extern "C" fn dxgi_blt(arg: *mut ddi::DXGI_DDI_ARG_BLT) -> i32 {
     if arg.is_null() {
@@ -5305,6 +5578,22 @@ pub unsafe fn install_11_1(funcs: *mut ddi::D3D11_1DDI_DEVICEFUNCS) {
     f.pfnDiscard = Some(discard_11_1);
     f.pfnCheckDirectFlipSupport = Some(check_direct_flip_support_11_1);
     f.pfnClearView = Some(clear_view_11_1);
+    // The >=11.1 tables pass D3D11_1_DDI_BLEND_DESC (LogicOpEnable/LogicOp
+    // inserted mid-struct) — `install()`'s 10.1-desc handlers misread the
+    // write mask (see create_blend_state_11_1). NOTE the 11.1 rasterizer desc
+    // only APPENDS ForcedSampleCount, so the shared 10.x reader stays valid
+    // for pfnCreateRasterizerState.
+    f.pfnCalcPrivateBlendStateSize = Some(calc_size_blend_11_1);
+    f.pfnCreateBlendState = Some(create_blend_state_11_1);
+    // The >=11.1 shader creates carry TYPED signature entries
+    // (D3D11_1DDIARG_SIGNATURE_ENTRY2.RegisterComponentType); forward them so
+    // dxbc-spv declares correctly-typed shader I/O instead of assuming
+    // float32 for everything (hull/domain use a different tessellation
+    // signatures struct and compute has none — those keep the shared
+    // handlers).
+    f.pfnCreateVertexShader = Some(create_vertex_shader_11_1);
+    f.pfnCreatePixelShader = Some(create_pixel_shader_11_1);
+    f.pfnCreateGeometryShader = Some(create_geometry_shader_11_1);
 }
 
 pub unsafe fn install_wddm2_1(funcs: *mut ddi::D3DWDDM2_1DDI_DEVICEFUNCS) {

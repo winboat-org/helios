@@ -70,6 +70,26 @@ pub mod ffi {
             code: *const u8,
             len: usize,
         ) -> usize;
+        /// >=11.1 DDI shader create carrying the typed I/O signatures. `kind`:
+        /// 0 = vertex, 1 = pixel, 2 = geometry. `sig_words` layout:
+        /// [n_in, n_out, (sysval, register, mask, comptype, stream) x n_in,
+        /// the same x n_out].
+        unsafe fn create_shader_sig(
+            self: &HeliosDxvkDevice,
+            kind: u32,
+            code: *const u8,
+            len: usize,
+            sig_words: *const u32,
+            sig_words_len: usize,
+        ) -> usize;
+        /// Flip-model identity rotation: texture i takes texture i+1's DXVK
+        /// storage (memory + VkImage + KMT handles); the last takes the
+        /// first's. Synchronizes the device before swapping.
+        unsafe fn rotate_resource_backings(
+            self: &HeliosDxvkDevice,
+            d3d11_resource_ptrs: *const usize,
+            count: usize,
+        ) -> bool;
         unsafe fn create_geometry_shader(
             self: &HeliosDxvkDevice,
             code: *const u8,
