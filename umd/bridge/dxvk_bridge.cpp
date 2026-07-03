@@ -407,6 +407,26 @@ namespace {
     return 0;
   }
 
+  bool venus_memory_alloc_info_from_handle(VkDeviceMemory memory,
+                                           std::uint64_t* alloc_size,
+                                           std::uint32_t* memory_type_index) {
+    if (alloc_size)
+      *alloc_size = 0;
+    if (memory_type_index)
+      *memory_type_index = 0;
+    if (memory == VK_NULL_HANDLE)
+      return false;
+
+    using Fn = bool (__cdecl*)(VkDeviceMemory, std::uint64_t*, std::uint32_t*);
+    constexpr const char* export_name = "helios_venus_memory_alloc_info";
+
+    if (auto fn = find_helios_icd_export<Fn>(export_name))
+      return fn(memory, alloc_size, memory_type_index);
+
+    umd_log("helios_venus_memory_alloc_info export unavailable");
+    return false;
+  }
+
   ShaderBytecode prepare_shader_bytecode(const std::uint8_t* code, std::size_t len) {
     ShaderBytecode result = { };
 
@@ -565,6 +585,27 @@ bool HeliosDxvkDevice::get_resource_memory_info(
   return venusId != 0 && info.size != 0;
 }
 
+bool HeliosDxvkDevice::get_resource_alloc_identity(
+    std::size_t d3d11_resource_ptr,
+    std::uint64_t* venus_alloc_size,
+    std::uint32_t* memory_type_index) const {
+  if (venus_alloc_size)
+    *venus_alloc_size = 0;
+  if (memory_type_index)
+    *memory_type_index = 0;
+
+  if (!d3d11_resource_ptr)
+    return false;
+
+  auto* resource = reinterpret_cast<ID3D11Resource*>(d3d11_resource_ptr);
+  auto* texture = dxvk::GetCommonTexture(resource);
+  if (!texture || !texture->GetImage() || !texture->GetImage()->storage())
+    return false;
+
+  auto info = texture->GetImage()->storage()->getMemoryInfo();
+  return venus_memory_alloc_info_from_handle(info.memory, venus_alloc_size, memory_type_index);
+}
+
 bool HeliosDxvkDevice::transfer_resource_ownership(
     std::size_t d3d11_resource_ptr) const {
   if (!d3d11_resource_ptr)
@@ -595,16 +636,19 @@ std::size_t HeliosDxvkDevice::open_ddi_texture2d(
     std::uint32_t bind_flags,
     std::uint32_t misc_flags,
     std::uint32_t global,
-    std::uint32_t renderer_resource_id) const {
+    std::uint32_t renderer_resource_id,
+    std::uint64_t venus_alloc_size,
+    std::uint32_t memory_type_index) const {
   if (!impl || !impl->d3d11 || !global || !renderer_resource_id || !width || !height)
     return 0;
 
   try {
     {
-      char msg[224];
+      char msg[256];
       std::snprintf(msg, sizeof(msg),
-        "OpenDdiTexture2D begin %ux%u fmt=%u bind=0x%08x misc=0x%08x global=0x%08x renderer_res=%u",
-        width, height, format, bind_flags, misc_flags, global, renderer_resource_id);
+        "OpenDdiTexture2D begin %ux%u fmt=%u bind=0x%08x misc=0x%08x global=0x%08x renderer_res=%u alloc_size=%llu mem_type=%u",
+        width, height, format, bind_flags, misc_flags, global, renderer_resource_id,
+        static_cast<unsigned long long>(venus_alloc_size), memory_type_index);
       umd_log(msg);
     }
 
@@ -623,10 +667,23 @@ std::size_t HeliosDxvkDevice::open_ddi_texture2d(
     desc.MiscFlags = misc_flags | D3D11_RESOURCE_MISC_SHARED;
     desc.TextureLayout = D3D11_TEXTURE_LAYOUT_UNDEFINED;
 
+    // Typed venus import identity (C1): the resid plus the creator's exact
+    // allocation size/memory type from the KMD's open-identity record. The
+    // HANDLE parameter still carries the resid value only to select Import
+    // mode in the shared-texture path; the import itself reads the typed info.
+    dxvk::D3D11_HELIOS_IMPORT_INFO importInfo = { };
+    importInfo.ResourceId      = renderer_resource_id;
+    importInfo.AllocSize       = venus_alloc_size;
+    // memory_type_index 0 is a real venus type; the identity is only recorded
+    // as a (size, type) pair, so size == 0 means "no recorded identity" and
+    // the type must not be applied as an override either.
+    importInfo.MemoryTypeIndex = venus_alloc_size ? memory_type_index : ~0u;
+
     auto* device = reinterpret_cast<dxvk::D3D11Device*>(impl->d3d11);
     auto* texture = new dxvk::D3D11Texture2D(
         device, &desc, nullptr,
-        reinterpret_cast<HANDLE>(static_cast<std::uintptr_t>(renderer_resource_id)));
+        reinterpret_cast<HANDLE>(static_cast<std::uintptr_t>(renderer_resource_id)),
+        &importInfo);
 
     ID3D11Resource* resource = nullptr;
     HRESULT hr = texture->QueryInterface(

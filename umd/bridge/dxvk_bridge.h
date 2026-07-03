@@ -37,6 +37,13 @@ struct HeliosDxvkDevice {
       std::uint64_t* size,
       std::uint64_t* offset,
       std::uint32_t* resource_id) const;
+  // C1 identity: the creating vkAllocateMemory's exact allocationSize and
+  // memoryTypeIndex for the resource's backing venus memory (recorded into
+  // the WDDM allocation trailer so cross-process openers import with them).
+  bool get_resource_alloc_identity(
+      std::size_t d3d11_resource_ptr,
+      std::uint64_t* venus_alloc_size,
+      std::uint32_t* memory_type_index) const;
   bool transfer_resource_ownership(std::size_t d3d11_resource_ptr) const;
   std::size_t open_ddi_texture2d(
       std::uint32_t width,
@@ -45,7 +52,9 @@ struct HeliosDxvkDevice {
       std::uint32_t bind_flags,
       std::uint32_t misc_flags,
       std::uint32_t global,
-      std::uint32_t renderer_resource_id) const;
+      std::uint32_t renderer_resource_id,
+      std::uint64_t venus_alloc_size,
+      std::uint32_t memory_type_index) const;
 
   // Shader creation wrappers. DXVK may throw dxvk::DxvkError while compiling
   // shader modules; these methods catch it and return 0 so exceptions never

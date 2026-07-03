@@ -37,6 +37,15 @@ pub mod ffi {
             offset: *mut u64,
             resource_id: *mut u32,
         ) -> bool;
+        /// C1 identity: exact creating-`vkAllocateMemory` size + memoryTypeIndex
+        /// of the resource's backing venus memory (recorded into the WDDM
+        /// allocation trailer for cross-process openers).
+        unsafe fn get_resource_alloc_identity(
+            self: &HeliosDxvkDevice,
+            d3d11_resource_ptr: usize,
+            venus_alloc_size: *mut u64,
+            memory_type_index: *mut u32,
+        ) -> bool;
         fn transfer_resource_ownership(self: &HeliosDxvkDevice, d3d11_resource_ptr: usize) -> bool;
         fn open_ddi_texture2d(
             self: &HeliosDxvkDevice,
@@ -47,6 +56,8 @@ pub mod ffi {
             misc_flags: u32,
             global: u32,
             renderer_resource_id: u32,
+            venus_alloc_size: u64,
+            memory_type_index: u32,
         ) -> usize;
 
         unsafe fn create_vertex_shader(

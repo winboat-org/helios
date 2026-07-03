@@ -640,6 +640,14 @@ impl VirtioGpu {
         blob_id: u64,
         size: u64,
     ) -> Result<u32, VirtioError> {
+        // The live-resource table is load-bearing (OpenAllocation / ATTACH
+        // liveness validation reads it), so an untracked-but-live resource must
+        // never exist: refuse the create when the table is full instead of
+        // creating and silently dropping the tracking entry.
+        if self.resources.len() >= MAX_RESOURCES {
+            crate::diag::record(0x0D20_00E1);
+            return Err(VirtioError::OutOfMemory);
+        }
         let resource_id = self.next_resource_id.fetch_add(1, Ordering::Relaxed);
         let mut cmd = VirtioGpuResourceCreateBlob::zeroed();
         cmd.hdr.type_ = VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB;
@@ -652,12 +660,24 @@ impl VirtioGpu {
         cmd.size = size;
         self.ctrl_roundtrip(bytemuck::bytes_of(&cmd))?;
         self.ctx_attach_resource(ctx_id, resource_id)?;
-        if self.resources.len() < MAX_RESOURCES {
-            self.resources.push(resource_id);
-        } else {
-            crate::diag::record(0x0D20_00E1);
-        }
+        self.resources.push(resource_id);
         Ok(resource_id)
+    }
+
+    /// Whether `resource_id` is alive host-side, per the KMD's authoritative
+    /// live-resource table (the KMD owns the resid namespace: every blob create
+    /// and every unref goes through it, so this mirrors the host's global
+    /// resource table exactly).
+    ///
+    /// This exists because the host's CTX_ATTACH_RESOURCE path CANNOT be
+    /// trusted to report failure: `virgl_renderer_ctx_attach_resource` is void
+    /// and silently no-ops on an unknown resource, so QEMU replies OK_NODATA
+    /// for an attach that never happened — the exact mechanism behind the
+    /// boot-#3 `vkr: failed to import resource: invalid res_id 45` dwm kill.
+    /// OpenAllocation and the ATTACH_RESOURCE escape validate against this
+    /// table and fail loudly instead.
+    pub fn resource_is_live(&self, resource_id: u32) -> bool {
+        self.resources.iter().any(|&r| r == resource_id)
     }
 
     /// Remove a live resource id from the one-shot ownership table.
@@ -768,25 +788,31 @@ impl VirtioGpu {
         self.map_blob_prepare_for_owner(slot.owner, resource_id)
     }
 
-    /// Drop an owner-scoped tracking entry without touching the host resource.
+    /// Transfer a blob's lifetime ownership from its escape owner (the D3DKMT
+    /// device handle the ICD allocated it under) to the WDDM allocation adopting
+    /// it in `DxgkDdiCreateAllocation`. Returns whether the resource is LIVE —
+    /// adopting a dead resid must fail the CreateAllocation loudly.
     ///
-    /// `allocate_memory_blob` initially records resources as owner 0 so the
-    /// in-kernel Venus paths can map and reclaim them. A standard WDDM allocation
-    /// can later adopt the same resource id into its `AllocationContext`; at that
-    /// point the allocation destroy path owns detach/unref, so the temporary owner
-    /// 0 table entry must be removed to avoid a later StopDevice double-unref.
-    pub fn forget_unmapped_blob_for_owner(&mut self, owner: usize, resource_id: u32) -> bool {
-        let Some(idx) = self
-            .blobs
-            .iter()
-            .position(|s| s.owner == owner && s.resource_id == resource_id)
-        else {
-            return false;
-        };
-        if self.blobs[idx].mapped {
+    /// This closes the res-45 lifetime hole (2026-07-03 boot #3): without the
+    /// re-tag, `DxgkDdiDestroyDevice`'s `release_blobs_for_owner` sweep unrefs
+    /// the host resource when the CREATING process's device dies, even though
+    /// the shared WDDM allocation (and its cross-process openers) still
+    /// reference it. Re-tagging to owner 0 removes it from every escape-owner
+    /// reclaim path; from here the allocation destroy path
+    /// (`destroy_allocation_ctx` → `forget_allocation_blob` + guarded unref)
+    /// owns the lifetime, matching KMD-created standard allocations.
+    pub fn adopt_blob_for_allocation(&mut self, resource_id: u32) -> bool {
+        if !self.resource_is_live(resource_id) {
+            crate::diag::record(0x0D20_00E2);
             return false;
         }
-        self.blobs.swap_remove(idx);
+        if let Some(slot) = self
+            .blobs
+            .iter_mut()
+            .find(|s| s.resource_id == resource_id)
+        {
+            slot.owner = 0;
+        }
         true
     }
 

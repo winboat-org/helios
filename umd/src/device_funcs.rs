@@ -29,6 +29,10 @@ pub struct HeliosDevice {
     pub h_context: ddi::HANDLE,
     pub kt_callbacks: *const ddi::D3DDDI_DEVICECALLBACKS,
     pub dxgi_callbacks: *mut ddi::DXGI_DDI_BASE_CALLBACKS,
+    /// Runtime corelayer handle + callbacks (pfnSetErrorCb) so VOID-returning
+    /// DDIs can report failures to the runtime instead of leaving null handles.
+    pub h_rt_core_layer: *mut core::ffi::c_void,
+    pub um_callbacks: *const core::ffi::c_void,
     /// Input-assembler state for lazy `ID3D11InputLayout` creation. The d3d10umddi
     /// `CreateElementLayout` DDI does NOT pass the vertex-shader input-signature
     /// bytecode that `ID3D11Device::CreateInputLayout` requires, so we stash the

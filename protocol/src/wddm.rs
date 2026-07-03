@@ -118,7 +118,96 @@ impl HeliosWddmCmdBuf {
     }
 }
 
+/// Geometry + venus-identity trailer appended after [`HeliosWddmAllocPrivate`]
+/// in an allocation's create-time private driver data.
+///
+/// Two writers, one definition (this struct replaces the former per-crate
+/// `StandardAllocMeta` copies in the KMD and UMD):
+///   - `DxgkDdiGetStandardAllocationDriverData` writes it for OS-requested
+///     standard allocations (shared primary / shadow / staging / GDI surfaces);
+///     the KMD then fills `venus_alloc_size`/`memory_type_index` at
+///     `DxgkDdiCreateAllocation` once the kernel venus client has allocated the
+///     backing memory (create-time write-back into the per-allocation buffer).
+///   - The UMD writes it for shared DXVK/Venus textures it allocates via
+///     `pfnAllocateCb`, filling `venus_alloc_size`/`memory_type_index` from the
+///     creating process's `vkAllocateMemory` parameters.
+///
+/// `venus_alloc_size`/`memory_type_index` exist so a cross-process opener can
+/// import the backing venus memory with the creator's EXACT allocation size and
+/// memory type — vkr's OPAQUE-fd import requires an exact-size match, and the
+/// memory type must be one the host driver accepts for the exported handle.
+/// 40 bytes, padding-free (six u32 = 24 bytes, so the u64 lands 8-aligned).
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy, Pod, Zeroable)]
+pub struct HeliosWddmAllocMeta {
+    pub width: u32,
+    pub height: u32,
+    pub format: u32, // D3DDDIFORMAT
+    pub pitch: u32,
+    pub bind_flags: u32,
+    pub misc_flags: u32,
+    /// Exact `VkMemoryAllocateInfo::allocationSize` of the backing venus memory
+    /// as encoded by the creator (0 = unknown; opener falls back to blob size).
+    pub venus_alloc_size: u64,
+    /// Creator's venus `memoryTypeIndex` for the backing memory.
+    pub memory_type_index: u32,
+    pub reserved: u32,
+}
+
+/// `'HIDN'` — magic of [`HeliosWddmOpenIdentity`].
+pub const HELIOS_WDDM_IDENTITY_MAGIC: u32 = 0x4849_444E;
+/// Current open-identity ABI version.
+pub const HELIOS_WDDM_IDENTITY_VERSION: u32 = 1;
+
+/// Allocation identity record the KMD writes into the OPEN-time private driver
+/// data in `DxgkDdiOpenAllocation`, overwriting the first 48 bytes (the
+/// [`HeliosWddmAllocPrivate`] region — the [`HeliosWddmAllocMeta`] trailer at
+/// bytes 48.. is left as the creator wrote it). This replaces the old scheme of
+/// smuggling the venus resource id through `HeliosWddmAllocPrivate::_pad`.
+///
+/// The KMD only writes this record after validating `resource_id` against its
+/// live-resource table (the KMD owns the resid namespace: every create and every
+/// unref goes through it), so a parsing opener may trust that the resource was
+/// alive at open time. An open of an allocation whose venus resource is dead
+/// FAILS in the KMD instead of producing this record. 48 bytes.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct HeliosWddmOpenIdentity {
+    /// Exact creator-side `vkAllocateMemory` size for the import (never 0;
+    /// falls back to the page-rounded blob size when the creator did not
+    /// record one).
+    pub venus_alloc_size: u64,
+    /// Page-rounded virtio-gpu blob size (the WDDM allocation size).
+    pub blob_size: u64,
+    pub magic: u32,   // == HELIOS_WDDM_IDENTITY_MAGIC
+    pub version: u32, // == HELIOS_WDDM_IDENTITY_VERSION
+    /// Venus/virtio resource id backing the allocation; live at open time.
+    pub resource_id: u32,
+    /// Creator's venus `memoryTypeIndex` for the backing memory.
+    pub memory_type_index: u32,
+    /// Creating venus context id (diagnostic only).
+    pub ctx_id: u32,
+    /// Creator's `HELIOS_WDDM_ALLOC_KIND_*`.
+    pub kind: u32,
+    pub reserved: [u32; 2],
+}
+
+impl HeliosWddmOpenIdentity {
+    #[inline]
+    pub fn is_valid(&self) -> bool {
+        self.magic == HELIOS_WDDM_IDENTITY_MAGIC
+            && self.version == HELIOS_WDDM_IDENTITY_VERSION
+    }
+}
+
 const _: () = {
     assert!(core::mem::size_of::<HeliosWddmAllocPrivate>() == 48);
     assert!(core::mem::size_of::<HeliosWddmCmdBuf>() == 32);
+    assert!(core::mem::size_of::<HeliosWddmAllocMeta>() == 40);
+    // The identity record must fit exactly over the HeliosWddmAllocPrivate
+    // region so the meta trailer's offset is unchanged for openers.
+    assert!(
+        core::mem::size_of::<HeliosWddmOpenIdentity>()
+            == core::mem::size_of::<HeliosWddmAllocPrivate>()
+    );
 };

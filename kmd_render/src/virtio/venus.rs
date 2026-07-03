@@ -389,6 +389,14 @@ pub struct VenusClient {
 }
 
 impl VenusClient {
+    /// The HOST_VISIBLE|HOST_COHERENT venus `memoryTypeIndex` every
+    /// [`Self::allocate_memory_blob`] allocation uses — recorded into the
+    /// allocation identity so cross-process openers import with the creator's
+    /// exact memory type.
+    pub fn memory_type_index(&self) -> u32 {
+        self.memory_type_index
+    }
+
     /// Allocate a fresh guest handle id.
     fn alloc_handle(&mut self) -> u64 {
         let h = self.next_handle;

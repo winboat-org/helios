@@ -302,7 +302,20 @@ fn escape_attach_resource(adapter: &AdapterContext, buf: &[u8]) -> NTSTATUS {
     if req.ctx_id == 0 || req.resource_id == 0 {
         return STATUS_INVALID_PARAMETER;
     }
-    match adapter.with_virtio(|v| v.ctx_attach_resource(req.ctx_id, req.resource_id)) {
+    // C1: validate liveness against the KMD's authoritative resource table
+    // BEFORE sending the attach. The host path cannot be trusted to fail:
+    // `virgl_renderer_ctx_attach_resource` is void and silently no-ops on an
+    // unknown resource (QEMU still replies OK_NODATA), so without this check an
+    // attach of a dead resid "succeeds" and the importer's next
+    // `vkAllocateMemory` poisons its whole venus ring (host `invalid res_id`
+    // → CS error → fatal decoder state — the boot-#3 dwm kill).
+    match adapter.with_virtio(|v| {
+        if !v.resource_is_live(req.resource_id) {
+            crate::diag::record(0x0E09_0000 | (req.resource_id & 0xFFFF));
+            return Err(crate::virtio::VirtioError::DeviceError);
+        }
+        v.ctx_attach_resource(req.ctx_id, req.resource_id)
+    }) {
         Ok(Ok(())) => STATUS_SUCCESS,
         Ok(Err(ve)) => ve.into(),
         Err(de) => de.into(),

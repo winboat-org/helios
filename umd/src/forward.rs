@@ -27,7 +27,8 @@ use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_SAMPLE_DESC};
 
 use helios_protocol::{
-    HeliosWddmAllocPrivate, HELIOS_WDDM_ALLOC_KIND_DEVICE_MEMORY, HELIOS_WDDM_ALLOC_KIND_STANDARD,
+    HeliosWddmAllocMeta, HeliosWddmAllocPrivate, HeliosWddmOpenIdentity,
+    HELIOS_WDDM_ALLOC_KIND_DEVICE_MEMORY, HELIOS_WDDM_ALLOC_KIND_STANDARD,
     VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE, VIRTIO_GPU_BLOB_FLAG_USE_SHAREABLE,
     VIRTIO_GPU_BLOB_MEM_HOST3D, VIRTIO_GPU_MAP_CACHE_CACHED,
 };
@@ -71,8 +72,17 @@ struct RtvState {
 }
 
 #[repr(C)]
+#[derive(Copy, Clone)]
+struct RuntimeAllocPrivate {
+    alloc: HeliosWddmAllocPrivate,
+    meta: HeliosWddmAllocMeta,
+}
+
+/// Legacy 24-byte trailer (geometry + bind/misc, no venus identity) written by
+/// pre-identity driver builds. Parse-only.
+#[repr(C)]
 #[derive(Default, Copy, Clone)]
-struct StandardAllocMeta {
+struct StandardAllocMetaV2 {
     width: u32,
     height: u32,
     format: u32,
@@ -81,13 +91,7 @@ struct StandardAllocMeta {
     misc_flags: u32,
 }
 
-#[repr(C)]
-#[derive(Copy, Clone)]
-struct RuntimeAllocPrivate {
-    alloc: HeliosWddmAllocPrivate,
-    meta: StandardAllocMeta,
-}
-
+/// Oldest legacy 16-byte trailer. Parse-only.
 #[repr(C)]
 #[derive(Default, Copy, Clone)]
 struct StandardAllocMetaV1 {
@@ -119,26 +123,31 @@ fn d3dddi_to_dxgi_format(format: u32) -> DXGI_FORMAT {
     }
 }
 
-unsafe fn read_runtime_alloc_private(ptr: *const c_void, size: u32) -> Option<RuntimeAllocPrivate> {
-    if ptr.is_null() || (size as usize) < core::mem::size_of::<HeliosWddmAllocPrivate>() {
-        return None;
+/// Parse the meta trailer at `base_off` bytes into the buffer, tolerating the
+/// two legacy (shorter) layouts. Returns a zero-extended [`HeliosWddmAllocMeta`].
+unsafe fn read_alloc_meta(ptr: *const c_void, size: u32, base_off: usize) -> Option<HeliosWddmAllocMeta> {
+    let avail = (size as usize).checked_sub(base_off)?;
+    let meta_ptr = (ptr as *const u8).add(base_off);
+    if avail >= core::mem::size_of::<HeliosWddmAllocMeta>() {
+        return Some(core::ptr::read_unaligned(meta_ptr as *const HeliosWddmAllocMeta));
     }
-    let alloc = core::ptr::read_unaligned(ptr as *const HeliosWddmAllocPrivate);
-    if (size as usize) >= core::mem::size_of::<RuntimeAllocPrivate>() {
-        return Some(core::ptr::read_unaligned(ptr as *const RuntimeAllocPrivate));
+    if avail >= core::mem::size_of::<StandardAllocMetaV2>() {
+        let legacy = core::ptr::read_unaligned(meta_ptr as *const StandardAllocMetaV2);
+        return Some(HeliosWddmAllocMeta {
+            width: legacy.width,
+            height: legacy.height,
+            format: legacy.format,
+            pitch: legacy.pitch,
+            bind_flags: legacy.bind_flags,
+            misc_flags: legacy.misc_flags,
+            venus_alloc_size: 0,
+            memory_type_index: 0,
+            reserved: 0,
+        });
     }
-
-    let legacy_size = core::mem::size_of::<HeliosWddmAllocPrivate>()
-        + core::mem::size_of::<StandardAllocMetaV1>();
-    if (size as usize) < legacy_size {
-        return None;
-    }
-
-    let meta_ptr = (ptr as *const u8).add(core::mem::size_of::<HeliosWddmAllocPrivate>());
-    let legacy = core::ptr::read_unaligned(meta_ptr as *const StandardAllocMetaV1);
-    Some(RuntimeAllocPrivate {
-        alloc,
-        meta: StandardAllocMeta {
+    if avail >= core::mem::size_of::<StandardAllocMetaV1>() {
+        let legacy = core::ptr::read_unaligned(meta_ptr as *const StandardAllocMetaV1);
+        return Some(HeliosWddmAllocMeta {
             width: legacy.width,
             height: legacy.height,
             format: legacy.format,
@@ -148,8 +157,32 @@ unsafe fn read_runtime_alloc_private(ptr: *const c_void, size: u32) -> Option<Ru
             // shader-readable instead of constructing a zero-usage texture.
             bind_flags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
             misc_flags: 0,
-        },
-    })
+            venus_alloc_size: 0,
+            memory_type_index: 0,
+            reserved: 0,
+        });
+    }
+    None
+}
+
+/// Parse the OPEN-time private data: the KMD's versioned [`HeliosWddmOpenIdentity`]
+/// record (written in `DxgkDdiOpenAllocation` after validating the venus resource
+/// is LIVE) plus the creator's meta trailer. This replaces the `_pad`-smuggling
+/// heuristics: an open-time buffer either carries a valid identity or the open is
+/// not backed by an identified venus resource.
+unsafe fn read_open_identity(
+    ptr: *const c_void,
+    size: u32,
+) -> Option<(HeliosWddmOpenIdentity, Option<HeliosWddmAllocMeta>)> {
+    if ptr.is_null() || (size as usize) < core::mem::size_of::<HeliosWddmOpenIdentity>() {
+        return None;
+    }
+    let ident = core::ptr::read_unaligned(ptr as *const HeliosWddmOpenIdentity);
+    if !ident.is_valid() || ident.resource_id == 0 {
+        return None;
+    }
+    let meta = read_alloc_meta(ptr, size, core::mem::size_of::<HeliosWddmOpenIdentity>());
+    Some((ident, meta))
 }
 
 // --- handle <-> COM helpers -------------------------------------------------
@@ -174,6 +207,35 @@ unsafe fn helios_device<'a>(h: Hdevice) -> Option<&'a HeliosDevice> {
         None
     } else {
         Some(&*hd)
+    }
+}
+
+const E_FAIL: i32 = 0x8000_4005u32 as i32;
+const E_INVALIDARG: i32 = 0x8007_0057u32 as i32;
+
+/// Report an error to the D3D11 runtime for a VOID-returning DDI via the
+/// corelayer `pfnSetErrorCb`. The runtime fails the API call that invoked the
+/// DDI (e.g. `OpenSharedResource`), which is the contractual way for
+/// `open_resource`/`create_*` to fail loudly instead of leaving a null handle
+/// the runtime will dereference.
+unsafe fn set_runtime_error(h: Hdevice, hr: i32) {
+    let Some(dev) = helios_device(h) else {
+        return;
+    };
+    if dev.um_callbacks.is_null() {
+        log_line("set_runtime_error: no corelayer callbacks");
+        return;
+    }
+    // pfnSetErrorCb is the first member of every D3D11DDI_CORELAYER_DEVICECALLBACKS
+    // revision, so reading it through the 11.0 layout is version-independent.
+    let cb = &*(dev.um_callbacks as *const ddi::D3D11DDI_CORELAYER_DEVICECALLBACKS);
+    if let Some(f) = cb.pfnSetErrorCb {
+        f(
+            ddi::D3D10DDI_HRTCORELAYER {
+                handle: dev.h_rt_core_layer,
+            },
+            hr,
+        );
     }
 }
 
@@ -589,6 +651,8 @@ unsafe fn allocate_wddm_resource(
     backing_blob_id: u64,
     backing_blob_size: u64,
     backing_resource_id: u32,
+    venus_alloc_size: u64,
+    memory_type_index: u32,
 ) -> (ddi::D3DKMT_HANDLE, ddi::D3DKMT_HANDLE) {
     const DDI_BIND_PRESENT: u32 = 0x0000_0080;
     const DDI_MISC_SHARED: u32 = 0x0000_0002;
@@ -653,13 +717,20 @@ unsafe fn allocate_wddm_resource(
             },
             VIRTIO_GPU_MAP_CACHE_CACHED,
         ),
-        meta: StandardAllocMeta {
+        meta: HeliosWddmAllocMeta {
             width: mip0.TexelWidth,
             height: mip0.TexelHeight,
             format: dxgi_to_d3dddi_format(a.Format as u32),
             pitch,
             bind_flags: a.BindFlags,
             misc_flags: a.MiscFlags,
+            // C1 identity: the creating vkAllocateMemory's exact parameters for
+            // adopted venus-backed resources (a cross-process opener must import
+            // with them). Zero for KMD-backed standard allocations — the KMD
+            // fills them at CreateAllocation from its kernel venus client.
+            venus_alloc_size,
+            memory_type_index,
+            reserved: 0,
         },
     };
     if backing_blob_id != 0 && backing_resource_id != 0 {
@@ -792,7 +863,7 @@ unsafe extern "C" fn create_resource(
                 MiscFlags: misc,
                 StructureByteStride: a.ByteStride,
             };
-            let (allocation, km_resource) = allocate_wddm_resource(h, a, &mip0, h_rt, 0, 0, 0);
+            let (allocation, km_resource) = allocate_wddm_resource(h, a, &mip0, h_rt, 0, 0, 0, 0, 0);
             let mut buf: Option<ID3D11Buffer> = None;
             match device.CreateBuffer(&desc, init_ptr, Some(&mut buf)) {
                 Ok(()) => {
@@ -912,6 +983,24 @@ unsafe extern "C" fn create_resource(
                                     }
                                     (0, 0, 0)
                                 };
+                            // C1: record the creating vkAllocateMemory's exact
+                            // size + memory type into the allocation trailer so
+                            // cross-process openers import with them.
+                            let (mut venus_alloc_size, mut memory_type_index) = (0u64, 0u32);
+                            if backing_resource_id != 0 {
+                                if let Some(dev) = helios_device(h) {
+                                    if !dev.dxvk.get_resource_alloc_identity(
+                                        res.as_raw() as usize,
+                                        &mut venus_alloc_size,
+                                        &mut memory_type_index,
+                                    ) {
+                                        log_line(&format!(
+                                            "DDI create_resource(tex2d): no venus alloc identity for res_id={}",
+                                            backing_resource_id
+                                        ));
+                                    }
+                                }
+                            }
                             let (allocation, km_resource) = allocate_wddm_resource(
                                 h,
                                 a,
@@ -920,6 +1009,8 @@ unsafe extern "C" fn create_resource(
                                 backing_blob_id,
                                 backing_blob_size,
                                 backing_resource_id,
+                                venus_alloc_size,
+                                memory_type_index,
                             );
                             if allocation != 0 && backing_resource_id != 0 {
                                 if let Some(dev) = helios_device(h) {
@@ -989,45 +1080,27 @@ unsafe extern "C" fn open_resource(
 
     if arg.is_null() {
         log_line("DDI open_resource: null args");
+        set_runtime_error(h, E_INVALIDARG);
         return;
     }
-
-    let Some(device) = d3d11_device(h) else {
-        log_line("DDI open_resource: no D3D11 device");
-        return;
-    };
 
     let a = &*arg;
     let info = unsafe { a.__bindgen_anon_1.pOpenAllocationInfo };
     let info2 = unsafe { a.__bindgen_anon_1.pOpenAllocationInfo2 };
     let mut detail = String::new();
     let mut allocation: ddi::D3DKMT_HANDLE = 0;
-    let mut private = read_runtime_alloc_private(a.pPrivateDriverData, a.PrivateDriverDataSize);
-    // Prefer a parse that carries a live venus resource id. For KMD-created
-    // standard allocations (indirect-swapchain backbuffers, GDI surfaces) the
-    // RESOURCE-level buffer is the pristine GetStandardAllocationDriverData
-    // output with `_pad = 0` — the KMD's create-time resid write-back lands in
-    // the per-ALLOCATION buffer only. Taking the resource-level parse here made
-    // open_resource fall back to a non-aliased metadata texture, so DWM composed
-    // into a substitute image and the real backbuffer blob stayed black.
-    let upgrade = |cur: &Option<RuntimeAllocPrivate>, ptr: *const c_void, size: u32| {
-        let needs_id = cur.as_ref().map(|p| p.alloc._pad == 0).unwrap_or(true);
-        if !needs_id {
-            return None;
-        }
-        // SAFETY: ptr/size come straight from the runtime's open-info entry,
-        // valid for the duration of this DDI call (same contract as the
-        // resource-level read above).
-        match unsafe { read_runtime_alloc_private(ptr, size) } {
-            Some(p2) if p2.alloc._pad != 0 || cur.is_none() => Some(p2),
-            _ => None,
-        }
+    // C1 identity ABI: the KMD wrote a versioned HeliosWddmOpenIdentity record
+    // into the open-time private data in DxgkDdiOpenAllocation, after
+    // validating the backing venus resource is LIVE. Prefer the per-allocation
+    // buffer; fall back to the resource-level one. No `_pad` heuristics.
+    let mut identity = unsafe {
+        read_open_identity(a.pPrivateDriverData, a.PrivateDriverDataSize)
     };
     if !info.is_null() {
         let i = &*info;
         allocation = i.hAllocation;
-        if let Some(p2) = upgrade(&private, i.pPrivateDriverData, i.PrivateDriverDataSize) {
-            private = Some(p2);
+        if identity.is_none() {
+            identity = unsafe { read_open_identity(i.pPrivateDriverData, i.PrivateDriverDataSize) };
         }
         detail.push_str(&format!(
             " info.hAlloc=0x{:x} info.private=0x{:x}/{}",
@@ -1037,8 +1110,8 @@ unsafe extern "C" fn open_resource(
     if !info2.is_null() {
         let i = &*info2;
         allocation = i.hAllocation;
-        if let Some(p2) = upgrade(&private, i.pPrivateDriverData, i.PrivateDriverDataSize) {
-            private = Some(p2);
+        if identity.is_none() {
+            identity = unsafe { read_open_identity(i.pPrivateDriverData, i.PrivateDriverDataSize) };
         }
         detail.push_str(&format!(
             " info2.hAlloc=0x{:x} info2.private=0x{:x}/{} gpuva=0x{:x}",
@@ -1057,116 +1130,99 @@ unsafe extern "C" fn open_resource(
         detail
     ));
 
-    let meta = private.map(|p| p.meta).unwrap_or(StandardAllocMeta {
+    // A shared open without a KMD identity record cannot alias the real
+    // surface. The old metadata-texture fallback fabricated a blank texture
+    // here and stamped it with the real KMT handles — draws "succeeded" and
+    // the shared content stayed black forever (audit U-B2). Fail loudly
+    // instead so the producer-side bug gets found.
+    let Some((ident, meta)) = identity else {
+        log_line(&format!(
+            "DDI open_resource FAILED: no venus identity record (hKM={:?} alloc=0x{:x}) -> E_FAIL",
+            a.hKMResource, allocation
+        ));
+        set_runtime_error(h, E_FAIL);
+        return;
+    };
+    let meta = meta.unwrap_or(HeliosWddmAllocMeta {
         width: 1,
         height: 1,
         format: 21,
         pitch: 4,
         bind_flags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
         misc_flags: 0,
+        venus_alloc_size: 0,
+        memory_type_index: 0,
+        reserved: 0,
     });
-    let renderer_resource_id = private.map(|p| p.alloc._pad).unwrap_or(0);
 
-    if a.hKMResource.handle != 0 && renderer_resource_id != 0 {
-        if let Some(dev) = helios_device(h) {
-            let open_bind = api_bind_flags(meta.bind_flags);
-            let open_misc = meta.misc_flags
-                & (D3D11_RESOURCE_MISC_SHARED.0 as u32
-                    | D3D11_RESOURCE_MISC_RESOURCE_CLAMP.0 as u32
-                    | D3D11_RESOURCE_MISC_GDI_COMPATIBLE.0 as u32);
-            log_line(&format!(
-                "DDI open_resource v2: meta_bind=0x{:x} meta_misc=0x{:x} open_bind=0x{:x} open_misc=0x{:x}",
-                meta.bind_flags, meta.misc_flags, open_bind, open_misc
-            ));
-            let raw = dev.dxvk.open_ddi_texture2d(
-                meta.width.max(1),
-                meta.height.max(1),
-                d3dddi_to_dxgi_format(meta.format).0 as u32,
-                open_bind,
-                open_misc,
-                a.hKMResource.handle,
-                renderer_resource_id,
-            );
-            if raw != 0 {
-                let res = ID3D11Resource::from_raw(raw as *mut c_void);
-                stamp_dxvk_resource_kmt_handles(h, &res, allocation, a.hKMResource.handle);
-                log_line(&format!(
-                    "DDI open_resource ddi-shared ok: {}x{} d3dfmt={} alloc=0x{:x} hKM={:?} raw=0x{:x}",
-                    meta.width, meta.height, meta.format, allocation, a.hKMResource, raw
-                ));
-                store_resource(
-                    h_resource.pDrvPrivate,
-                    res,
-                    allocation,
-                    a.hKMResource.handle,
-                    h_rt.handle,
-                    false, // opened: runtime owns these allocation handles
-                );
-                return;
-            }
-            log_line(&format!(
-                "DDI open_resource ddi-shared failed: {}x{} d3dfmt={} alloc=0x{:x} hKM={:?} renderer_res={}; falling back to metadata texture",
-                meta.width,
-                meta.height,
-                meta.format,
-                allocation, a.hKMResource, renderer_resource_id
-            ));
-        }
-    } else if a.hKMResource.handle != 0 {
+    if a.hKMResource.handle == 0 {
         log_line(&format!(
-            "DDI open_resource ddi-shared unavailable: {}x{} d3dfmt={} alloc=0x{:x} hKM={:?} renderer_res={}",
-            meta.width, meta.height, meta.format, allocation, a.hKMResource, renderer_resource_id
+            "DDI open_resource FAILED: no hKMResource (res_id={}) -> E_FAIL",
+            ident.resource_id
         ));
+        set_runtime_error(h, E_FAIL);
+        return;
     }
 
-    let desc = D3D11_TEXTURE2D_DESC {
-        Width: meta.width.max(1),
-        Height: meta.height.max(1),
-        MipLevels: 1,
-        ArraySize: 1,
-        Format: d3dddi_to_dxgi_format(meta.format),
-        SampleDesc: DXGI_SAMPLE_DESC {
-            Count: 1,
-            Quality: 0,
-        },
-        Usage: D3D11_USAGE_DEFAULT,
-        BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
-        CPUAccessFlags: 0,
-        MiscFlags: 0,
+    let Some(dev) = helios_device(h) else {
+        log_line("DDI open_resource FAILED: no Helios device -> E_FAIL");
+        set_runtime_error(h, E_FAIL);
+        return;
     };
-    let mut tex: Option<ID3D11Texture2D> = None;
-    match device.CreateTexture2D(&desc, None, Some(&mut tex)) {
-        Ok(()) => {
-            if let Some(t) = tex {
-                match t.cast::<ID3D11Resource>() {
-                    Ok(res) => {
-                        // This fallback resource represents the same shared WDDM
-                        // object on the opener's device. Stamp it the same way as
-                        // the real OpenSharedResource path: device-local allocation
-                        // handle first, cross-process KM resource handle second.
-                        stamp_dxvk_resource_kmt_handles(h, &res, allocation, a.hKMResource.handle);
-                        log_line(&format!(
-                            "DDI open_resource ok: {}x{} d3dfmt={} alloc=0x{:x} hKM={:?}",
-                            desc.Width, desc.Height, meta.format, allocation, a.hKMResource
-                        ));
-                        store_resource(
-                            h_resource.pDrvPrivate,
-                            res,
-                            allocation,
-                            a.hKMResource.handle,
-                            h_rt.handle,
-                            false, // opened: runtime owns these allocation handles
-                        );
-                    }
-                    Err(e) => log_line(&format!("DDI open_resource cast failed: {e:?}")),
-                }
-            }
-        }
-        Err(e) => log_line(&format!(
-            "DDI open_resource CreateTexture2D failed: {}x{} d3dfmt={} {e:?}",
-            desc.Width, desc.Height, meta.format
-        )),
+
+    let open_bind = api_bind_flags(meta.bind_flags);
+    let open_misc = meta.misc_flags
+        & (D3D11_RESOURCE_MISC_SHARED.0 as u32
+            | D3D11_RESOURCE_MISC_RESOURCE_CLAMP.0 as u32
+            | D3D11_RESOURCE_MISC_GDI_COMPATIBLE.0 as u32);
+    // Prefer the identity's venus alloc size; the meta trailer carries the
+    // creator-recorded copy for KMD standard allocations.
+    let venus_alloc_size = if ident.venus_alloc_size != 0 {
+        ident.venus_alloc_size
+    } else {
+        meta.venus_alloc_size
+    };
+    log_line(&format!(
+        "DDI open_resource identity: res_id={} alloc_size={} mem_type={} kind={} ctx={} meta_bind=0x{:x} meta_misc=0x{:x} open_bind=0x{:x} open_misc=0x{:x}",
+        ident.resource_id, venus_alloc_size, ident.memory_type_index, ident.kind, ident.ctx_id,
+        meta.bind_flags, meta.misc_flags, open_bind, open_misc
+    ));
+    let raw = dev.dxvk.open_ddi_texture2d(
+        meta.width.max(1),
+        meta.height.max(1),
+        d3dddi_to_dxgi_format(meta.format).0 as u32,
+        open_bind,
+        open_misc,
+        a.hKMResource.handle,
+        ident.resource_id,
+        venus_alloc_size,
+        ident.memory_type_index,
+    );
+    if raw == 0 {
+        // Import of a KMD-validated-live resource failed: a real bug, not a
+        // condition to paper over with substitute content (audit C1.3).
+        log_line(&format!(
+            "DDI open_resource FAILED: ddi-shared import {}x{} d3dfmt={} alloc=0x{:x} hKM={:?} res_id={} -> E_FAIL",
+            meta.width, meta.height, meta.format, allocation, a.hKMResource, ident.resource_id
+        ));
+        set_runtime_error(h, E_FAIL);
+        return;
     }
+
+    let res = ID3D11Resource::from_raw(raw as *mut c_void);
+    stamp_dxvk_resource_kmt_handles(h, &res, allocation, a.hKMResource.handle);
+    log_line(&format!(
+        "DDI open_resource ddi-shared ok: {}x{} d3dfmt={} alloc=0x{:x} hKM={:?} raw=0x{:x}",
+        meta.width, meta.height, meta.format, allocation, a.hKMResource, raw
+    ));
+    store_resource(
+        h_resource.pDrvPrivate,
+        res,
+        allocation,
+        a.hKMResource.handle,
+        h_rt.handle,
+        false, // opened: runtime owns these allocation handles
+    );
 }
 
 unsafe extern "C" fn calc_size_opened_resource(

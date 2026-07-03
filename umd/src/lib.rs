@@ -638,6 +638,8 @@ unsafe extern "system" fn create_device(
                 kt_callbacks: create.p_kt_callbacks as *const ddi::D3DDDI_DEVICECALLBACKS,
                 dxgi_callbacks: create.dxgi_base_ddi.p_dxgi_base_callbacks
                     as *mut ddi::DXGI_DDI_BASE_CALLBACKS,
+                h_rt_core_layer: create.h_rt_core_layer,
+                um_callbacks: create.p_um_callbacks,
                 ia: core::cell::RefCell::new(device_funcs::IaState::default()),
             },
         );
