@@ -1,4 +1,40 @@
-# Handoff — validate boot: shared-surface path is VALIDATION-CLEAN yet diverges; missing external barriers = prime suspect; two new VUID classes; SetDevice-overrun kill under validation (2026-07-03, fifth session)
+# Handoff — THE ALIASING DIVERGENCE IS ROOT-CAUSED AND FIXED (guest DXVK deferred-clear hole), via validate-boot + Intel-boot elimination (2026-07-03, fifth session)
+
+## ⚡ FINAL RESULT (read this first — supersedes §1's "prime suspect")
+
+**Root cause of the §4 clears-diverge/copies-propagate divergence: a guest-side DXVK bug.**
+`DxvkContext::prepareSharedImages()` flushed deferred clears only for images present in
+`m_nonDefaultLayoutImages` — but an image whose ONLY pending work is a deferred clear never
+leaves its default (GENERAL) layout and is absent from that list. A `ClearRenderTargetView` +
+`Flush` on a shared surface therefore left the clear **deferred in the producer's context
+indefinitely** — it only materialized when a later same-context operation (e.g. a CPU
+readback) forced it. Every observation fits: clears diverged both directions, copies
+propagated (not deferrable), a producer-side readback made clears propagate (it flushed the
+deferral), and v1-D's "stomp" (dev1 later reading its OWN older clear after dev2 wrote) was
+the deferred clear finally landing over dev2's newer content.
+
+**Eliminated on the way, with instruments:** host compression/fast-clear metadata (divergence
+identical on ANV and NVIDIA; identical with LINEAR-tiling images — no aux state exists);
+missing `VK_QUEUE_FAMILY_EXTERNAL` barriers (implemented, emission confirmed via debug log —
+20 correctly-interleaved release/acquire events — behavior unchanged); VUID-02726-class guest
+violations (host validation layers: zero messages on the entire export→import→bind path).
+
+**Fix: dxvk-helios `ecbd8f78`** — `prepareSharedImages` scans `m_deferredClears` itself for
+shared-image entries. **Verified: the shared-content probe passes every step** (C0 = clear#2
+propagates immediately, D = clear#3 propagates reverse, E = copies) with OPTIMAL tiling on
+ANV. The LINEAR-forcing experiment was reverted (its justification was disproven); the
+external QFOT release/acquire barriers were KEPT (spec-required availability mechanism for
+external memory, not the divergence fix — comment in code says exactly this). Deployed as
+UMD 42dfad843610bab1 on the Intel boot; IDD self-converged after a devnode restart
+(FAILED_POST_START recovery from deploy-window kills) and is acquiring. NVIDIA re-verification
+of the probe still pending (expected same — the bug was guest-side and vendor-independent).
+
+**Remaining owner-visible acceptance: real desktop frames in the LG client** — the §4
+divergence was the identified blocker between dwm's composition and the acquired frames.
+
+---
+
+# Session record below (validate boot first, then the Intel boot that closed it)
 
 Continues `HANDOFF_BLOBTABLE_ALIASING_2026_07_03.md` (its §4 leads were this session's brief).
 Deployed: KMD 22.22.42.0 (unchanged), UMD b89f9918 (unchanged), **LGIdd 16.41.16.666**
