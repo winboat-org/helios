@@ -38,6 +38,12 @@ pub const HELIOS_ESCAPE_WAIT_FENCE: u32 = 0x0006;
 pub const HELIOS_ESCAPE_PRESENT_BLOB: u32 = 0x0007;
 pub const HELIOS_ESCAPE_RELEASE_BLOB: u32 = 0x0008;
 pub const HELIOS_ESCAPE_ATTACH_RESOURCE: u32 = 0x0009;
+/// Read-only KMD resource-table statistics (blob/resource/context table
+/// occupancy, high-waters, rejection counters, host-visible-window usage).
+/// Diagnostic observability for the bounded-table exhaustion class
+/// (2026-07-03: MAX_BLOBS=256 filled → every new venus ring/shmem/export
+/// alloc failed guest-side with STATUS_INSUFFICIENT_RESOURCES).
+pub const HELIOS_ESCAPE_QUERY_STATS: u32 = 0x000A;
 
 /// Header for all escape commands. 16 bytes.
 #[repr(C)]
@@ -188,8 +194,47 @@ pub struct HeliosEscapePresentBlob {
     pub offset: u32,      // in: plane-0 byte offset into the blob
 }
 
+/// `HELIOS_ESCAPE_QUERY_STATS` — read-only snapshot of the KMD's bounded
+/// resource tables and rejection counters. Output-only (the caller sends a
+/// zeroed body); 88 bytes. Values are point-in-time under the device lock for
+/// the `live` fields and monotonic since driver start for the counters.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct HeliosEscapeQueryStats {
+    pub hdr: HeliosEscapeHeader,
+    /// Bytes currently allocated in the host-visible window's offset space
+    /// (bump high-water minus the coalesced free list).
+    pub out_window_used: u64,
+    /// Total host-visible window length (QEMU `hostmem=`), 0 if absent.
+    pub out_window_len: u64,
+    pub out_blobs_live: u32,
+    pub out_blobs_cap: u32,
+    pub out_blobs_high_water: u32,
+    /// ALLOC_BLOB / note_blob_size rejections because the blob table was full.
+    pub out_blob_full_rejects: u32,
+    pub out_resources_live: u32,
+    pub out_resources_cap: u32,
+    pub out_resources_high_water: u32,
+    /// resource_create_blob rejections because the live-resource table was full.
+    pub out_resource_full_rejects: u32,
+    pub out_contexts_live: u32,
+    /// Context tracking slots dropped because the context table was full (the
+    /// context still works but is not auto-reclaimed at DestroyDevice).
+    pub out_context_full_drops: u32,
+    /// Freed window ranges dropped because the free list was full (leaked
+    /// window offset space).
+    pub out_window_range_drops: u32,
+    /// Virtio control-queue round-trip timeouts (transport poison latch).
+    pub out_ctrl_timeouts: u32,
+    /// take_live_resource calls for an id not in the table (duplicate teardown).
+    pub out_take_live_misses: u32,
+    /// adopt_blob_for_allocation rejections of a dead resource id.
+    pub out_adopt_dead_rejects: u32,
+}
+
 const _: () = {
     assert!(core::mem::size_of::<HeliosEscapeHeader>() == 16);
+    assert!(core::mem::size_of::<HeliosEscapeQueryStats>() == 88);
     assert!(core::mem::size_of::<HeliosEscapeSubmitVenus>() == 40);
     assert!(core::mem::size_of::<HeliosEscapeCtxCreate>() == 24);
     assert!(core::mem::size_of::<HeliosEscapeAllocBlob>() == 48);

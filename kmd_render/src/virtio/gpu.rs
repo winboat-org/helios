@@ -61,6 +61,50 @@ const CTRL_POLL_SPINS: u64 = 100_000_000;
 /// by `DxgkDdiCollectDbgInfo`; nonzero means the host stopped answering.
 pub static CTRL_TIMEOUT_COUNT: AtomicU32 = AtomicU32::new(0);
 
+// ── DISPATCH-safe resource-table telemetry ──────────────────────────────────
+// All updated under the device spinlock (DISPATCH_LEVEL), so they must be
+// atomics, never `diag::record` (RtlWriteRegistryValue is PASSIVE-only — the
+// same latent-IRQL class the 2026-07-03 audit removed from the venus client).
+// Read by `DxgkDdiCollectDbgInfo` and `HELIOS_ESCAPE_QUERY_STATS`.
+
+/// High-water of `blobs.len()` since driver start.
+pub static BLOB_HIGH_WATER: AtomicU32 = AtomicU32::new(0);
+/// ALLOC_BLOB / note_blob_size attempts rejected because the blob table was
+/// full. Nonzero = the 2026-07-03 exhaustion class is live again.
+pub static BLOB_FULL_REJECTS: AtomicU32 = AtomicU32::new(0);
+/// High-water of `resources.len()` since driver start.
+pub static RESOURCE_HIGH_WATER: AtomicU32 = AtomicU32::new(0);
+/// resource_create_blob attempts rejected because the live-resource table was full.
+pub static RESOURCE_FULL_REJECTS: AtomicU32 = AtomicU32::new(0);
+/// Context tracking slots dropped because the context table was full.
+pub static CONTEXT_FULL_DROPS: AtomicU32 = AtomicU32::new(0);
+/// Freed window ranges dropped because the free list was full (leaked offsets).
+pub static WINDOW_RANGE_DROPS: AtomicU32 = AtomicU32::new(0);
+/// `take_live_resource` misses (duplicate-teardown suppressions). Replaces the
+/// in-lock `diag::record(0x0D20_00E0)` breadcrumb.
+pub static TAKE_LIVE_MISSES: AtomicU32 = AtomicU32::new(0);
+/// `adopt_blob_for_allocation` rejections of a dead resource id. Replaces the
+/// in-lock `diag::record(0x0D20_00E2)` breadcrumb.
+pub static ADOPT_DEAD_REJECTS: AtomicU32 = AtomicU32::new(0);
+
+/// Raise `hw` to at least `n` (relaxed; approximate under concurrency is fine
+/// for telemetry).
+fn bump_high_water(hw: &AtomicU32, n: usize) {
+    let n = n as u32;
+    if hw.load(Ordering::Relaxed) < n {
+        hw.store(n, Ordering::Relaxed);
+    }
+}
+
+/// Table capacity accessors for `HELIOS_ESCAPE_QUERY_STATS` (the consts are
+/// module-private).
+pub fn max_blobs() -> usize {
+    MAX_BLOBS
+}
+pub fn max_resources() -> usize {
+    MAX_RESOURCES
+}
+
 // ── Host-visible window discovery (Gate 5a Stage 2) ─────────────────────────
 // Ported from the proven System-class `kmd/src/virtio/gpu.rs`. The host-visible
 // window is a prefetchable 64-bit PCI BAR (QEMU `hostmem=`) that
@@ -216,15 +260,30 @@ fn map_isr_status_register(access: &DxgkConfigAccess) -> usize {
 
 /// Page granularity for blob window offsets/sizes.
 const BLOB_PAGE: u64 = 4096;
-/// Max concurrently-tracked blobs. Generous for bring-up; table-full → alloc fails.
-const MAX_BLOBS: usize = 256;
+/// Max concurrently-tracked blobs.
+///
+/// SIZING (2026-07-03 exhaustion incident): a live desktop legitimately holds
+/// hundreds of blobs at once — every venus ring/reply/fence shmem of every
+/// process, every host-visible DXVK memory chunk, every exported/shared
+/// surface, and every KMD-standard GDI redirection surface is one slot. The
+/// old cap of 256 filled after ~2 h of desktop churn, at which point every
+/// new venus consumer failed guest-side (`vkCreateInstance` →
+/// VK_ERROR_OUT_OF_HOST_MEMORY for new processes; dwm lost its device → no
+/// IddCx swapchain offers). 8192 slots ≈ 448 KiB of non-paged pool, reserved
+/// once at init. Exhaustion is now counted (`BLOB_FULL_REJECTS`) and visible
+/// via `HELIOS_ESCAPE_QUERY_STATS`; hitting the new cap indicates a leak, not
+/// a workload.
+const MAX_BLOBS: usize = 8192;
 /// Max live virtio resources. This covers both escape blobs and KMD/WDDM standard
-/// allocations, so teardown can suppress duplicate RESOURCE_UNREF commands.
-const MAX_RESOURCES: usize = 1024;
+/// allocations, so teardown can suppress duplicate RESOURCE_UNREF commands. Must
+/// be ≥ MAX_BLOBS (every blob is a live resource; non-blob resources add more).
+const MAX_RESOURCES: usize = 16384;
 /// Max concurrently-tracked virtio-gpu contexts (one per live device, generous).
-const MAX_CONTEXTS: usize = 256;
-/// Max coalescing free ranges in the window allocator's free list.
-const MAX_WINDOW_RANGES: usize = 64;
+const MAX_CONTEXTS: usize = 1024;
+/// Max coalescing free ranges in the window allocator's free list. Overflow
+/// drops the freed range (leaks window offset space) — counted in
+/// `WINDOW_RANGE_DROPS`.
+const MAX_WINDOW_RANGES: usize = 1024;
 /// Per-map size cap (also bounds the `IoAllocateMdl` ULONG length on the caller).
 const MAX_BLOB_MAP_BYTES: u64 = 256 << 20;
 
@@ -274,6 +333,19 @@ struct BlobSlot {
 struct WindowRange {
     offset: u64,
     len: u64,
+}
+
+/// Point-in-time occupancy snapshot of the bounded tables (see
+/// [`VirtioGpu::table_stats`]); consumed by `HELIOS_ESCAPE_QUERY_STATS`.
+#[derive(Clone, Copy)]
+pub struct TableStats {
+    pub blobs_live: u32,
+    pub resources_live: u32,
+    pub contexts_live: u32,
+    /// Bytes allocated in the window offset space (bump high-water minus free list).
+    pub window_used: u64,
+    /// Total window length (0 if the device exposes no host-visible window).
+    pub window_len: u64,
 }
 
 /// One tracked virtio-gpu context, tagged with the owning device handle for
@@ -542,6 +614,8 @@ impl VirtioGpu {
         // we still hand back the context — it just won't be auto-reclaimed.
         if self.contexts.len() < MAX_CONTEXTS {
             self.contexts.push(ContextSlot { owner, ctx_id });
+        } else {
+            CONTEXT_FULL_DROPS.fetch_add(1, Ordering::Relaxed);
         }
         Ok(ctx_id)
     }
@@ -645,7 +719,9 @@ impl VirtioGpu {
         // never exist: refuse the create when the table is full instead of
         // creating and silently dropping the tracking entry.
         if self.resources.len() >= MAX_RESOURCES {
-            crate::diag::record(0x0D20_00E1);
+            // Atomic, not diag::record — this runs under the device spinlock at
+            // DISPATCH_LEVEL, where the registry tracer is illegal.
+            RESOURCE_FULL_REJECTS.fetch_add(1, Ordering::Relaxed);
             return Err(VirtioError::OutOfMemory);
         }
         let resource_id = self.next_resource_id.fetch_add(1, Ordering::Relaxed);
@@ -661,6 +737,7 @@ impl VirtioGpu {
         self.ctrl_roundtrip(bytemuck::bytes_of(&cmd))?;
         self.ctx_attach_resource(ctx_id, resource_id)?;
         self.resources.push(resource_id);
+        bump_high_water(&RESOURCE_HIGH_WATER, self.resources.len());
         Ok(resource_id)
     }
 
@@ -687,7 +764,9 @@ impl VirtioGpu {
     /// the resource and returns ERR_INVALID_RESOURCE_ID.
     pub fn take_live_resource(&mut self, resource_id: u32) -> bool {
         let Some(idx) = self.resources.iter().position(|&r| r == resource_id) else {
-            crate::diag::record(0x0D20_00E0);
+            // Atomic, not diag::record — callers hold the device spinlock
+            // (DISPATCH_LEVEL); the registry tracer is PASSIVE-only.
+            TAKE_LIVE_MISSES.fetch_add(1, Ordering::Relaxed);
             return false;
         };
         self.resources.swap_remove(idx);
@@ -709,6 +788,7 @@ impl VirtioGpu {
             return Err(VirtioError::DeviceError);
         }
         if self.blobs.len() >= MAX_BLOBS {
+            BLOB_FULL_REJECTS.fetch_add(1, Ordering::Relaxed);
             return Err(VirtioError::OutOfMemory);
         }
         let resource_id = self.resource_create_blob(ctx_id, blob_mem, blob_flags, blob_id, size)?;
@@ -722,6 +802,7 @@ impl VirtioGpu {
             map_offset: 0,
             map_len: 0,
         });
+        bump_high_water(&BLOB_HIGH_WATER, self.blobs.len());
         Ok(resource_id)
     }
 
@@ -731,12 +812,13 @@ impl VirtioGpu {
     /// resource lifecycle for the device lifetime rather than per-escape) and must
     /// register the size the same way [`alloc_blob`] does for the escape path.
     /// `owner = 0` marks a KMD-internal blob (not reclaimed by an escape owner).
-    /// Silently no-ops if the table is full (the map_prepare then fails honestly).
+    /// No-ops (counted) if the table is full — the map_prepare then fails honestly.
     pub fn note_blob_size(&mut self, resource_id: u32, size: u64) {
         if self.blobs.iter().any(|s| s.resource_id == resource_id) {
             return;
         }
         if self.blobs.len() >= MAX_BLOBS {
+            BLOB_FULL_REJECTS.fetch_add(1, Ordering::Relaxed);
             return;
         }
         // Record with ctx_id 0 / owner 0: these blobs are not driven by an escape
@@ -803,7 +885,9 @@ impl VirtioGpu {
     /// owns the lifetime, matching KMD-created standard allocations.
     pub fn adopt_blob_for_allocation(&mut self, resource_id: u32) -> bool {
         if !self.resource_is_live(resource_id) {
-            crate::diag::record(0x0D20_00E2);
+            // Atomic, not diag::record — CreateAllocation calls this under the
+            // device spinlock (DISPATCH_LEVEL); the registry tracer is PASSIVE-only.
+            ADOPT_DEAD_REJECTS.fetch_add(1, Ordering::Relaxed);
             return false;
         }
         if let Some(slot) = self
@@ -936,6 +1020,19 @@ impl VirtioGpu {
         self.blobs.len()
     }
 
+    /// Point-in-time table occupancy + host-visible-window usage for
+    /// `HELIOS_ESCAPE_QUERY_STATS`. Called under the device spinlock; pure reads.
+    pub fn table_stats(&self) -> TableStats {
+        let free: u64 = self.free_window_ranges.iter().map(|r| r.len).sum();
+        TableStats {
+            blobs_live: self.blobs.len() as u32,
+            resources_live: self.resources.len() as u32,
+            contexts_live: self.contexts.len() as u32,
+            window_used: self.next_window_offset.saturating_sub(free),
+            window_len: self.host_visible.map_or(0, |w| w.len),
+        }
+    }
+
     pub fn release_blobs_for_owner(&mut self, owner: usize) -> u32 {
         let mut reclaimed = 0u32;
         let mut i = 0;
@@ -1035,6 +1132,11 @@ impl VirtioGpu {
         }
         if self.free_window_ranges.len() < MAX_WINDOW_RANGES {
             self.free_window_ranges.push(WindowRange { offset, len });
+        } else {
+            // Free list full: the range is dropped and its window offset space
+            // is leaked until driver restart. Counted so QUERY_STATS makes the
+            // leak visible instead of silent.
+            WINDOW_RANGE_DROPS.fetch_add(1, Ordering::Relaxed);
         }
     }
 

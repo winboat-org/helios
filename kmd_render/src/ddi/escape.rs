@@ -18,10 +18,11 @@ use core::mem::size_of;
 use bytemuck::{bytes_of, pod_read_unaligned};
 use helios_protocol::{
     HeliosEscapeAllocBlob, HeliosEscapeAttachResource, HeliosEscapeCtxCreate,
-    HeliosEscapeCtxDestroy, HeliosEscapeHeader, HeliosEscapeMapBlob, HeliosEscapeReleaseBlob,
-    HeliosEscapeSubmitVenus, HELIOS_ESCAPE_ALLOC_BLOB, HELIOS_ESCAPE_ATTACH_RESOURCE,
-    HELIOS_ESCAPE_CTX_CREATE, HELIOS_ESCAPE_CTX_DESTROY, HELIOS_ESCAPE_MAP_BLOB,
-    HELIOS_ESCAPE_RELEASE_BLOB, HELIOS_ESCAPE_SUBMIT_VENUS, HELIOS_ESCAPE_WAIT_FENCE,
+    HeliosEscapeCtxDestroy, HeliosEscapeHeader, HeliosEscapeMapBlob, HeliosEscapeQueryStats,
+    HeliosEscapeReleaseBlob, HeliosEscapeSubmitVenus, HELIOS_ESCAPE_ALLOC_BLOB,
+    HELIOS_ESCAPE_ATTACH_RESOURCE, HELIOS_ESCAPE_CTX_CREATE, HELIOS_ESCAPE_CTX_DESTROY,
+    HELIOS_ESCAPE_MAP_BLOB, HELIOS_ESCAPE_QUERY_STATS, HELIOS_ESCAPE_RELEASE_BLOB,
+    HELIOS_ESCAPE_SUBMIT_VENUS, HELIOS_ESCAPE_WAIT_FENCE,
 };
 
 use super::blob_map::{
@@ -74,9 +75,52 @@ pub unsafe extern "C" fn dxgkddi_escape(
         HELIOS_ESCAPE_MAP_BLOB => escape_map_blob(adapter, buf, owner),
         HELIOS_ESCAPE_RELEASE_BLOB => escape_release_blob(adapter, buf, owner),
         HELIOS_ESCAPE_ATTACH_RESOURCE => escape_attach_resource(adapter, buf),
+        HELIOS_ESCAPE_QUERY_STATS => escape_query_stats(adapter, buf),
         // Unknown verbs are rejected.
         _ => STATUS_NOT_IMPLEMENTED,
     }
+}
+
+/// `HELIOS_ESCAPE_QUERY_STATS` → read-only snapshot of the bounded resource
+/// tables (occupancy under the device lock) and the DISPATCH-safe rejection /
+/// high-water counters. Diagnostic observability for the 2026-07-03 blob-table
+/// exhaustion class; no device state is modified.
+fn escape_query_stats(adapter: &AdapterContext, buf: &mut [u8]) -> NTSTATUS {
+    use core::sync::atomic::Ordering;
+
+    use crate::virtio::gpu::{
+        ADOPT_DEAD_REJECTS, BLOB_FULL_REJECTS, BLOB_HIGH_WATER, CONTEXT_FULL_DROPS,
+        CTRL_TIMEOUT_COUNT, RESOURCE_FULL_REJECTS, RESOURCE_HIGH_WATER, TAKE_LIVE_MISSES,
+        WINDOW_RANGE_DROPS,
+    };
+
+    let sz = size_of::<HeliosEscapeQueryStats>();
+    if buf.len() < sz {
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+    let stats = match adapter.with_virtio(|v| v.table_stats()) {
+        Ok(s) => s,
+        Err(de) => return de.into(),
+    };
+    let mut out: HeliosEscapeQueryStats = pod_read_unaligned(&buf[..sz]);
+    out.out_window_used = stats.window_used;
+    out.out_window_len = stats.window_len;
+    out.out_blobs_live = stats.blobs_live;
+    out.out_blobs_cap = crate::virtio::gpu::max_blobs() as u32;
+    out.out_blobs_high_water = BLOB_HIGH_WATER.load(Ordering::Relaxed);
+    out.out_blob_full_rejects = BLOB_FULL_REJECTS.load(Ordering::Relaxed);
+    out.out_resources_live = stats.resources_live;
+    out.out_resources_cap = crate::virtio::gpu::max_resources() as u32;
+    out.out_resources_high_water = RESOURCE_HIGH_WATER.load(Ordering::Relaxed);
+    out.out_resource_full_rejects = RESOURCE_FULL_REJECTS.load(Ordering::Relaxed);
+    out.out_contexts_live = stats.contexts_live;
+    out.out_context_full_drops = CONTEXT_FULL_DROPS.load(Ordering::Relaxed);
+    out.out_window_range_drops = WINDOW_RANGE_DROPS.load(Ordering::Relaxed);
+    out.out_ctrl_timeouts = CTRL_TIMEOUT_COUNT.load(Ordering::Relaxed);
+    out.out_take_live_misses = TAKE_LIVE_MISSES.load(Ordering::Relaxed);
+    out.out_adopt_dead_rejects = ADOPT_DEAD_REJECTS.load(Ordering::Relaxed);
+    buf[..sz].copy_from_slice(bytes_of(&out));
+    STATUS_SUCCESS
 }
 
 /// `HELIOS_ESCAPE_CTX_CREATE` → create a Venus virtio-gpu context; write the

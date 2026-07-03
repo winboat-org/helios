@@ -571,9 +571,9 @@ pub unsafe extern "C" fn dxgkddi_collect_dbg_info(
         let adapter = unsafe { &*(h_adapter as *const AdapterContext) };
         adapter.last_completed_fence.load(Ordering::Relaxed) as u32
     };
-    let report: [u32; 13] = [
+    let report: [u32; 21] = [
         0x4844_4247, // 'HDBG'
-        1,           // report version
+        2,           // report version (2: + resource-table telemetry)
         args.Reason,
         SUBMIT_COUNT.load(Ordering::Relaxed),
         SUBMIT_LAST_FENCE.load(Ordering::Relaxed),
@@ -588,8 +588,17 @@ pub unsafe extern "C" fn dxgkddi_collect_dbg_info(
         // poisoned (host stopped answering) — the likely reason for the TDR
         // this dump belongs to.
         crate::virtio::gpu::CTRL_TIMEOUT_COUNT.load(Ordering::Relaxed),
+        // v2: bounded-table telemetry (the 2026-07-03 MAX_BLOBS exhaustion class).
+        crate::virtio::gpu::BLOB_HIGH_WATER.load(Ordering::Relaxed),
+        crate::virtio::gpu::BLOB_FULL_REJECTS.load(Ordering::Relaxed),
+        crate::virtio::gpu::RESOURCE_HIGH_WATER.load(Ordering::Relaxed),
+        crate::virtio::gpu::RESOURCE_FULL_REJECTS.load(Ordering::Relaxed),
+        crate::virtio::gpu::CONTEXT_FULL_DROPS.load(Ordering::Relaxed),
+        crate::virtio::gpu::WINDOW_RANGE_DROPS.load(Ordering::Relaxed),
+        crate::virtio::gpu::TAKE_LIVE_MISSES.load(Ordering::Relaxed),
+        crate::virtio::gpu::ADOPT_DEAD_REJECTS.load(Ordering::Relaxed),
     ];
-    let report_bytes = size_of::<[u32; 13]>();
+    let report_bytes = size_of::<[u32; 21]>();
     let copy_len = core::cmp::min(report_bytes, buf_len);
     // SAFETY: copy_len <= BufferSize (writable, checked above) and
     // copy_len <= size_of report (readable local array).
