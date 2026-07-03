@@ -1,0 +1,126 @@
+# Handoff — validate boot: shared-surface path is VALIDATION-CLEAN yet diverges; missing external barriers = prime suspect; two new VUID classes; SetDevice-overrun kill under validation (2026-07-03, fifth session)
+
+Continues `HANDOFF_BLOBTABLE_ALIASING_2026_07_03.md` (its §4 leads were this session's brief).
+Deployed: KMD 22.22.42.0 (unchanged), UMD b89f9918 (unchanged), **LGIdd 16.41.16.666**
+(LookingGlass `846a7edd` — the §3 frame-held replug gate — devcon-installed this session).
+
+## 0. The clean cold boot (16:22 IST, pre-validate) — §6b checklist results
+
+1. **Self-convergence PASSED — first fully zero-touch cold boot.** First binding stale →
+   stale-binding watchdog replugged at +10 s → second binding stable, acquires at dwm cadence
+   (67 frames by boot+20 min), zero manual actions, zero kill dumps, all devnodes Code 0.
+   After the LGIdd 16.41.16.666 devcon deploy (device restart), the IDD self-converged AGAIN
+   in 34 s. Two consecutive self-convergences on the C5 state machine.
+2. **C1 boot hole did NOT fire** (host log clean through boot+20 min). Intermittent — keep the
+   rotated-log discipline.
+3. **Blob table healthy**: 132/8192 at steady state, zero rejects, zero ctrl-timeouts.
+4. **Aliasing repro confirmed cold** (identical A/B pass, C stale, D own-clears-only, E copy
+   propagates). Owner did not watch the client at bind time on this boot.
+
+## 1. §4 LEAD 1 RESULT (the headline): the sharing path is spec-clean AND still diverges
+
+**Static analysis** (all verified in source this session): the external+dedicated shape is
+plumbed end-to-end — DXVK chains `VkMemoryDedicatedAllocateInfo` on both sides (creator:
+dedicated→`VkExportMemoryAllocateInfo`; opener: dedicated→`VkImportMemoryResourceInfoMESA`,
+`dxvk_memory.cpp:1201`), the ICD forwards the full pNext chain and `fix_alloc_info` preserves
+dedicated while rewriting handle types to DMA_BUF, vkr (`vkr_device_memory.c:246`) translates
+res-info→fd-info in place preserving the chain, and the venus wire encoder serializes both
+structs. The `meta_bind=0xa8` vs `open_bind=0x28` log difference is a DDI-vs-API namespace
+artifact (both sides feed DXVK 0x28 through `api_bind_flags`) — NOT a usage divergence.
+
+**Dynamic confirmation (validate boot, host vulkan-validation-layers 1.4.350.1-1 active):**
+`HeliosSharedProbe` re-run under validation reproduced the divergence EXACTLY (C stale, D
+own-clears, E propagates) while the host log recorded **ZERO validation messages for the
+probe's entire export → import → bind → clear → readback path** — no vkAllocateMemory, no
+bind, no external-memory, no image-create complaint. **The VUID-02726-class hypothesis for
+the sharing path is dead**; the guest emits spec-legal Vulkan.
+
+**Prime suspect now: missing `VK_QUEUE_FAMILY_EXTERNAL` release/acquire barriers.**
+`grep -rn QUEUE_FAMILY_EXTERNAL dxvk-helios/` → zero hits. DXVK never emits the external
+queue-family ownership transfers that the spec requires for cross-instance memory
+consistency on external images (shared images do stay in `VK_IMAGE_LAYOUT_GENERAL` —
+`d3d11_texture.cpp:241` skips OptimizeLayout for shared — but layout alone is not the
+availability mechanism). On native Windows this is masked: the WDDM driver coordinates
+shared-allocation compression below the API. On our Linux dma_buf path nothing does.
+Validation CANNOT flag a missing external barrier (it cannot know two images alias), which
+is consistent with a clean log + divergence. The clears-diverge/copies-propagate signature
+matches metadata-encoded clears never being made available to the second instance.
+
+**Fix shape (C7.2-aligned, not started):** bracket shared-image producer work with a release
+barrier to `VK_QUEUE_FAMILY_EXTERNAL` (at flush / keyed-mutex release / after RT writes) and
+consumer work with an acquire from it — in DXVK's backend for images with
+`DxvkSharedHandleMode != None`. This also converges with the §4c ICD-side
+`VK_KHR_external_memory_win32` emulation: one owner for external-memory correctness.
+**Discriminator still pending: the Intel/ANV comparison (owner relaunch)** — if ANV passes
+without barriers, NVIDIA metadata is confirmed as the differentiator; the barrier fix is
+required either way (spec), but Intel tells us whether it will be sufficient on NVIDIA.
+
+## 2. NEW VUID classes surfaced by the validate boot (real bugs, NOT the aliasing mechanism)
+
+1. **`VUID-VkGraphicsPipelineCreateInfo-Input-08733` (storm, every dwm-style worker):**
+   `R16G16_SINT`/`R32_SINT` vertex attribute formats vs `float32` SPIR-V input variables
+   (`v0_xy`…`v4_x`). dwm's composition quads use SINT vertex layouts; the UMD's synthetic
+   input-signature blobs (`forward.rs:4605-4673`, audit C-class) type everything as float →
+   dxbc-spv declares float inputs → UB per draw. NVIDIA currently renders it correctly
+   (owner saw a correct desktop in transient frames), but this is exactly the
+   works-until-a-driver-update class the audit§C7 bans. Fix: carry true component types into
+   the synthetic signatures (the DDI signature entries lack types; derive from the shader's
+   IL input declarations in dxbc-spv, or declare typeless-compatible inputs).
+2. **`VUID-VkDescriptorBufferInfo-buffer-02999` (storm):** null-descriptor UNIFORM_BUFFER
+   writes with `range != VK_WHOLE_SIZE` (48/128/256/4000). Even with nullDescriptor enabled,
+   range must be WHOLE_SIZE. DXVK null-uniform-buffer path. Plus
+   `VUID-vkCmdBindVertexBuffers2-pBuffers-04112` (null vertex buffer with nonzero offset) —
+   same family.
+3. **`VUID-vkCmdDraw-imageLayout-00344` (twice):** image known in `GENERAL` sampled through
+   a descriptor declaring `SHADER_READ_ONLY_OPTIMAL` ("t0"). A shared/GENERAL image being
+   sampled by a pipeline whose descriptors assume the optimized layout — layout-discipline
+   mismatch in the shared-image consumer path; worth chasing with the barrier work (same
+   code region).
+
+## 3. Validate-boot IDD kill: SetDevice overran the frame-release deadline (environment-induced)
+
+Under validation everything host-side is ~an order slower. Boot sequence: OS assigned the
+swapchain, dwm presented immediately, the processor thread sat inside
+`IddCxSwapChainSetDevice → IddSwapChain::Open` for 25+ s (stale-binding watchdog fired and
+was correctly DEFERRED by the binding-in-flight gate the whole time) → IddCx's kernel
+watchdog fired `ReportBugcheckForSwapChainTimeoutDriverDidNotReleaseFrame` → WUDFHost
+terminated (twice: PID-1592 16:49:01, PID-1576 16:53:47 — full stacks via cdb on the
+PID-1576 dump; thread 12 = SetDevice in flight, thread 4 = the IddCx bugcheck report) →
+devnode `FAILED_POST_START`, client loops "Waiting for the host to restart".
+
+This is a **different §3 variant** from the departure-mid-hold one fixed this session
+(LGIdd 846a7edd gates ReplugMonitor on m_frameHeld): here NO frame was ever acquired — the
+deadline ran against a bring-up that could not finish in time. The gate cannot and should
+not help. Disposition: environment-induced under validation slowness (the same 22 s
+SetDevice was observed in normal boot churn without a kill — the deadline only bites when
+dwm has already presented). Options if validate boots need a live IDD later: IddCx debug
+control to relax the watchdog for instrumented boots only (documented debug knob, not a
+production change), or accept no-display on validate boots — the §4 probe does not need the
+IDD at all (proven this session).
+
+## 4. Ops learned
+
+- The shared-content probe is IDD-independent: two D3D11 devices in one process. Validate
+  boots can gather §4 evidence with the IDD dead.
+- cdb (`C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\cdb.exe`) + `.symopt+0x40` +
+  `!analyze -v; ~*k` symbolizes the WUDFHost dumps directly on the guest.
+- Validation output goes to the same `/tmp/helios-qemu-stderr.log` tee; vkr prefixes worker
+  pid per guest process; bracket experiments by line count (`wc -l` before/after).
+- The validation layer's `duplicate_message_limit` (10) silences repeat VUIDs per worker —
+  early lines are the complete class inventory.
+- pgrep against `qemu-system-x86_64` without `-f` fails (comm truncates to 15 chars) — use
+  `pgrep -f qemu-system`.
+
+## 5. State to carry forward
+
+- LGIdd 16.41.16.666 deployed + committed (LookingGlass `846a7edd`); IDD currently
+  FAILED_POST_START on the validate boot (expected; recovers on a normal relaunch).
+- Host log rotations: `.2026-07-03-session4` (pre-cold-boot), `.2026-07-03-session5-coldboot`
+  (the clean cold boot), current = the validate boot.
+- Next actions, in order: (1) **Intel/ANV comparison relaunch** (owner:
+  `HELIOS_QEMU_RENDER_GPU` unset/intel, validate optional) → run `HeliosSharedProbe`; (2) if
+  ANV passes → implement the external-barrier release/acquire in DXVK for shared images (and
+  decide §4c win32-emulation as the vehicle); (3) UMD synthetic-signature component types
+  (§2.1); (4) DXVK null-descriptor range + null-VB offset cleanups (§2.2); (5) chase the
+  00344 layout mismatch alongside the barrier work; (6) still open from before: §5 residual
+  C1 boot hole, P2/C6 linear GDI mismatches, KMD diag-tracer strip.
