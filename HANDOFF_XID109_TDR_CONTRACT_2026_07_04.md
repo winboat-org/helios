@@ -84,11 +84,22 @@ On real hardware step 1 is a TDR and dwm recovers in ~2 s. Helios lacked that co
    hash DC207B58, untracked) — same negotiated interface 0xb000f everywhere (raw-args dump
    proved the struct read correct); post-hotplug devices loaded the current DLL and were
    typed. The stray is DELETED; the UMD now logs its own module path per process
-   (`UMD module:` line) and dumps raw CreateDevice args. Verified post-deploy: 12/12 typed
-   creates, 0 untyped. **Confirm on the next cold boot (validate on): expect the first dwm
-   devices to log the current module, 0 untyped creates, no Input-08733 in
-   /tmp/helios-qemu-stderr.log, and no Xid 109.** ~30 stale DriverStore package dirs remain
-   (only the root stray was load-bearing); prune opportunistically.
+   (`UMD module:` line) and dumps raw CreateDevice args. **Second, deeper cause found on the
+   next cold boot (violations persisted with the current DLL): the D3D11 runtime NEVER
+   fills `ENTRY2.RegisterComponentType` — every signature entry arrives 0/UNKNOWN, for
+   dwm's SM4 shaders AND the SM5 probe alike** (the session-6 "typed signatures" fix never
+   actually received types; it silently defaulted everything to float32). Real fix (commit
+   d8a2d97): **layout-driven VS input-class variants.** The input layout's DXGI format
+   classes are the only available ground truth (any (layout, VS) pair the runtime lets bind
+   matched the app's original ISGN); at `bind_input_layout`, a non-float layout triggers a
+   (VS, class-set)-cached recompile with the synthesized ISGN's component types patched from
+   the layout, and the variant is bound in place of the original. Verified live: dwm
+   compiles and binds SINT variants, desktop frames flow. **Confirm on the next cold boot
+   (validate on): ZERO Input-08733 in a fresh /tmp/helios-qemu-stderr.log** (this boot's
+   render server exhausted the validation layer's per-VUID duplicate limit of 10, so
+   mid-boot silence proves nothing), no Xid 109, live desktop through the login transition.
+   ~30 stale DriverStore package dirs remain (only the root stray was load-bearing); prune
+   opportunistically.
 3. **Extend the forward-progress deadline to fence and query feedback waits** (same shape as
    semaphores in vn_queue.c). dwm's kill path was semaphores; games may wedge on fences.
 4. Backlog unchanged: rotation cost (C3 async-fence), buffer-reqs cache always-miss, §5
