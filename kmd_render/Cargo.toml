@@ -31,6 +31,10 @@ virtio-drivers = "0.13"
 
 [build-dependencies]
 wdk-build = "0.5"
+# Compiles src/seh_shim.c — a C __try/__except wrapper for
+# MmMapLockedPagesSpecifyCache(UserMode), which RAISES on failure (no SEH in
+# no_std Rust → bugcheck, reachable from any process via Escape MAP_BLOB).
+cc = "1"
 # We generate the WDDM display-miniport DDIs ourselves: wdk-sys has no display
 # ApiSubset, so build.rs runs bindgen over dispmprt.h + d3dkmddi.h. See build.rs.
 # MUST match the bindgen version wdk-build uses (0.71), so its BuilderExt

@@ -851,4 +851,4 @@ If `WdfDriverCreate` returns an error, the `[.Wdf]` KMDF directive or `KmdfLibra
 ### Virtqueue stuck / no responses
 1. Check that you're posting descriptors in the right order (readable before writable)
 2. Verify the notification doorbell address — wrong BAR or wrong offset will silently drop notifications
-3. (Note: `VIRGL_DEBUG` produces no readable host logs in the libvirt+render-server setup — see HOST.md §5.1; use QEMU `-d guest_errors` for `RESP_ERR_*` instead)
+3. (Note: `VIRGL_DEBUG` may produce no readable host logs with the render-server setup — see HOST.md §5.1; use QEMU `-d guest_errors` for `RESP_ERR_*` instead)

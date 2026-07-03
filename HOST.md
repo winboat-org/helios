@@ -144,7 +144,7 @@ Set these before launching QEMU:
 
 ```bash
 # NOTE: VIRGL_DEBUG (=venus / =verbose / etc.) does NOT produce readable logs in
-# the libvirt + venus render-server setup — venus runs in the virgl_render_server
+# the venus render-server setup — venus runs in the virgl_render_server
 # child process whose stderr is not captured (user-confirmed 2026-06-06). Do not
 # rely on it for host-side venus tracing.
 
@@ -191,16 +191,6 @@ for TID in $VCPU_THREADS; do
 done
 ```
 
-Or via libvirt:
-```xml
-<vcpu placement="static">8</vcpu>
-<cputune>
-  <vcpupin vcpu="0" cpuset="4"/>
-  <vcpupin vcpu="1" cpuset="5"/>
-  <!-- ... -->
-</cputune>
-```
-
 ### 4.2 Huge Pages
 
 Using huge pages reduces TLB pressure for large blob memory:
@@ -240,10 +230,9 @@ Venus in virglrenderer runs in a separate process/thread per context. For best p
 
 ### 5.1 Host-side venus tracing — VIRGL_DEBUG does NOT work here
 
-> ⚠️ **`VIRGL_DEBUG` (any value) produces no readable logs in this setup** (libvirt
-> `qemu:///system` + venus render-server) — user-confirmed 2026-06-06. venus runs in
-> the separate `virgl_render_server` child process whose stderr / `VIRGL_DEBUG`
-> output is not captured into `/var/log/libvirt/qemu/win11.log`. The QEMU log still
+> ⚠️ **`VIRGL_DEBUG` (any value) may produce no readable logs in this setup**.
+> venus runs in the separate `virgl_render_server` child process whose stderr /
+> `VIRGL_DEBUG` output is not necessarily captured. The QEMU log still
 > captures QEMU-level `LOG_GUEST_ERROR` (`-d guest_errors`, e.g. a `RESP_ERR_*`), but
 > not virglrenderer/venus decode traces. For host-side venus diagnostics, capture the
 > render-server child's stderr directly or build virglrenderer with logging — not

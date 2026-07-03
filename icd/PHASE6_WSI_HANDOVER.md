@@ -90,7 +90,7 @@ in rough priority:
    `-display egl-headless,rendernode=/dev/dri/renderD129`; the working Ubuntu venus reference
    uses `-display gtk,gl=on` (a continuously-pumped host GL loop). Hypothesis: egl-headless
    doesn't pump the iGPU, so GPU writes to host-visible blobs flush/propagate lazily. **Test:
-   change the win11 libvirt XML display to `gtk,gl=on` (or `sdl,gl=on`), restart the VM, rebind,
+   change the standalone launcher display to `gtk,gl=on` (or `sdl,gl=on`), restart the VM, rebind,
    re-run vkcube WITH feedback (default).** If the lag vanishes (vkcube fast AND correct), the
    fix is the host display backend — a real, non-hacky fix. NEEDS the user (VM reconfig+restart;
    they declined earlier, but the per-frame WSI impact now justifies it). Also try whether the

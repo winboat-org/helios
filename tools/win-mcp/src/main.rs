@@ -281,18 +281,6 @@ struct WinLookingGlassIddArgs {
     timeout_secs: Option<u64>,
 }
 
-fn mesa_exclude_for_source(source_root: &str) -> String {
-    let source_root_no_slash = source_root.trim_end_matches(['\\', '/']);
-    if source_root_no_slash.ends_with("\\.") || source_root_no_slash.ends_with("/.") {
-        format!(
-            "{}\\icd\\mesa",
-            &source_root_no_slash[..source_root_no_slash.len() - 2]
-        )
-    } else {
-        format!("{source_root_no_slash}\\icd\\mesa")
-    }
-}
-
 fn ps_join_path(root: &str, rel: &str) -> String {
     if root.ends_with(['\\', '/']) {
         format!("{root}{rel}")
@@ -343,8 +331,9 @@ impl WinHost {
         // excluding it keeps every kmd/probe build fast. Mesa is built separately,
         // straight from the share, via `win_meson` (no robocopy — validated).
         let command = format!(
-            "robocopy {PROJECT_DRIVE} {MIRROR_ROOT} /MIR /XD target .git \"{MESA_SRC}\" /NFL /NDL /NJH /NJS /NP /R:1 /W:1 | Out-Null\n\
-             if ($LASTEXITCODE -ge 8) {{ \"win_cargo: robocopy mirror sync failed (exit $LASTEXITCODE)\"; exit $LASTEXITCODE }}\n\
+            "robocopy {PROJECT_DRIVE} {MIRROR_ROOT} /MIR /XJ /XD target .git \"{MESA_SRC}\" dxvk dxvk-research-only vkd3d-proton virtio-research-only-3d windows-driver-docs-research-only /NFL /NDL /NJH /NJS /NP /R:1 /W:1\n\
+             $robocopyExit = $LASTEXITCODE\n\
+             if ($robocopyExit -ge 8) {{ \"win_cargo: robocopy mirror sync failed (exit $robocopyExit)\"; exit $robocopyExit }}\n\
              Set-Location -LiteralPath '{MIRROR_ROOT}\\{}'\n\
              cargo {}",
             a.crate_dir,
@@ -391,6 +380,7 @@ impl WinHost {
     )]
     async fn win_looking_glass(&self, Parameters(a): Parameters<WinLookingGlassArgs>) -> String {
         let source_root = a.source_root.unwrap_or_else(|| PROJECT_DRIVE.to_string());
+        let lg_source = ps_join_path(&source_root, "LookingGlass");
         let build_dir = a
             .build_dir
             .unwrap_or_else(|| "C:\\Users\\Rupansh\\helios-lookingglass-host-build".to_string());
@@ -413,12 +403,11 @@ impl WinHost {
         } else {
             format!("cmake --build \"{build_dir}\" {}", a.build_args.join(" "))
         };
-        let mesa_exclude = mesa_exclude_for_source(&source_root);
-
         let command = format!(
             "if (!(Test-Path -LiteralPath '{source_root}')) {{ \"win_looking_glass: source root not found: {source_root}\"; exit 3 }}\n\
-             robocopy \"{source_root}\" {MIRROR_ROOT} /MIR /XD target .git icd\\mesa \"{mesa_exclude}\" /NFL /NDL /NJH /NJS /NP /R:1 /W:1 | Out-Null\n\
-             if ($LASTEXITCODE -ge 8) {{ \"win_looking_glass: robocopy mirror sync failed (exit $LASTEXITCODE)\"; exit $LASTEXITCODE }}\n\
+             robocopy \"{lg_source}\" {MIRROR_ROOT}\\LookingGlass /MIR /XJ /XD .git build x64 Debug Release /NFL /NDL /NJH /NJS /NP /R:1 /W:1\n\
+             $robocopyExit = $LASTEXITCODE\n\
+             if ($robocopyExit -ge 8) {{ \"win_looking_glass: robocopy LookingGlass sync failed (exit $robocopyExit)\"; exit $robocopyExit }}\n\
              if (!(Test-Path -LiteralPath '{MIRROR_ROOT}\\LookingGlass\\host')) {{ \"win_looking_glass: LookingGlass\\host missing after sync\"; exit 2 }}\n\
              $env:PATH = '{MINGW_BIN};' + $env:PATH\n\
              {}\n\
@@ -453,7 +442,7 @@ impl WinHost {
         Parameters(a): Parameters<WinLookingGlassIddArgs>,
     ) -> String {
         let source_root = a.source_root.unwrap_or_else(|| PROJECT_DRIVE.to_string());
-        let mesa_exclude = mesa_exclude_for_source(&source_root);
+        let lg_source = ps_join_path(&source_root, "LookingGlass");
         let mesa_vulkan_src = ps_join_path(&source_root, "icd\\mesa\\include\\vulkan");
         let msbuild = a.msbuild_path.unwrap_or_else(|| MSBUILD.to_string());
         let sln = format!("{MIRROR_ROOT}\\LookingGlass\\idd\\LGIdd.sln");
@@ -475,11 +464,13 @@ impl WinHost {
 
         let command = format!(
             "if (!(Test-Path -LiteralPath '{source_root}')) {{ \"win_looking_glass_idd: source root not found: {source_root}\"; exit 3 }}\n\
-             robocopy \"{source_root}\" {MIRROR_ROOT} /MIR /XD target .git icd\\mesa \"{mesa_exclude}\" /NFL /NDL /NJH /NJS /NP /R:1 /W:1 | Out-Null\n\
-             if ($LASTEXITCODE -ge 8) {{ \"win_looking_glass_idd: robocopy mirror sync failed (exit $LASTEXITCODE)\"; exit $LASTEXITCODE }}\n\
+             robocopy \"{lg_source}\" {MIRROR_ROOT}\\LookingGlass /MIR /XJ /XD .git build x64 Debug Release /NFL /NDL /NJH /NJS /NP /R:1 /W:1\n\
+             $robocopyExit = $LASTEXITCODE\n\
+             if ($robocopyExit -ge 8) {{ \"win_looking_glass_idd: robocopy LookingGlass sync failed (exit $robocopyExit)\"; exit $robocopyExit }}\n\
              New-Item -ItemType Directory -Force -Path '{MIRROR_ROOT}\\icd\\mesa\\include\\vulkan' | Out-Null\n\
-             robocopy \"{mesa_vulkan_src}\" {MIRROR_ROOT}\\icd\\mesa\\include\\vulkan /MIR /NFL /NDL /NJH /NJS /NP /R:1 /W:1 | Out-Null\n\
-             if ($LASTEXITCODE -ge 8) {{ \"win_looking_glass_idd: Vulkan header sync failed (exit $LASTEXITCODE)\"; exit $LASTEXITCODE }}\n\
+             robocopy \"{mesa_vulkan_src}\" {MIRROR_ROOT}\\icd\\mesa\\include\\vulkan /MIR /XJ /NFL /NDL /NJH /NJS /NP /R:1 /W:1\n\
+             $robocopyExit = $LASTEXITCODE\n\
+             if ($robocopyExit -ge 8) {{ \"win_looking_glass_idd: Vulkan header sync failed (exit $robocopyExit)\"; exit $robocopyExit }}\n\
              if (!(Test-Path -LiteralPath '{sln}')) {{ \"win_looking_glass_idd: LGIdd.sln missing after sync: {sln}\"; exit 2 }}\n\
              {build}"
         );

@@ -21,6 +21,9 @@
 # Host GPU used by QEMU/virglrenderer/Venus:
 #   HELIOS_QEMU_RENDER_GPU=nvidia HELIOS_DISPLAY=looking-glass bash tools/launch-helios-gtk.sh
 #
+# Temporarily boot without the Helios virtio-gpu PCI device:
+#   HELIOS_DISABLE_VIRTIO_GPU=1 HELIOS_DISPLAY=looking-glass bash tools/launch-helios-gtk.sh
+#
 # Host GPU used by the Looking Glass client:
 #   HELIOS_LG_RENDER_GPU=intel HELIOS_DISPLAY=looking-glass bash tools/launch-helios-gtk.sh
 #
@@ -34,10 +37,16 @@
 # Looking Glass KVMFR defaults to 512 MiB for the normal desktop stream.
 # Ensure /dev/kvmfr0 was created with the same size, or override:
 #   HELIOS_KVMFR_SIZE=134217728 HELIOS_DISPLAY=looking-glass bash tools/launch-helios-gtk.sh
+#
+# Kernel debugging over Windows KDCOM for ntoseye:
+#   HELIOS_KD_SERIAL=socket HELIOS_DISPLAY=looking-glass bash tools/launch-helios-gtk.sh
+# This exposes COM1 at /tmp/ntoseye-kd.sock. Configure the guest with:
+#   bcdedit /debug on
+#   bcdedit /dbgsettings serial debugport:1 baudrate:115200
 set -uo pipefail
 
 if [ "${HELIOS_PHASE:-}" != "user" ] && [ "$(id -u)" -ne 0 ]; then
-  exec sudo --preserve-env=HELIOS_DISPLAY,HELIOS_QEMU_RENDER_GPU,HELIOS_INTEL_RENDER_NODE,HELIOS_NVIDIA_RENDER_NODE,HELIOS_LG_TRANSPORT,HELIOS_SPICE_PORT,HELIOS_KVMFR_DEV,HELIOS_KVMFR_SIZE,HELIOS_LG_CLIENT,HELIOS_LG_RENDER_GPU,HELIOS_LG_DISPLAY_SERVER,HELIOS_LG_RENDERER,HELIOS_LG_ALLOW_DMA,HELIOS_LG_START_CLIENT,HELIOS_LG_RESTART_CLIENT,HELIOS_LG_CLIENT_DELAY,HELIOS_LG_CLIENT_LOG,HELIOS_INT_ACTION,HELIOS_SMP,HELIOS_SOCKETS,HELIOS_CORES,HELIOS_THREADS,HELIOS_VKR_DEBUG,HELIOS_QEMU_LOG,DISPLAY,WAYLAND_DISPLAY,GDK_BACKEND,SDL_VIDEODRIVER \
+  exec sudo --preserve-env=HELIOS_DISPLAY,HELIOS_QEMU_RENDER_GPU,HELIOS_DISABLE_VIRTIO_GPU,HELIOS_INTEL_RENDER_NODE,HELIOS_NVIDIA_RENDER_NODE,HELIOS_LG_TRANSPORT,HELIOS_SPICE_PORT,HELIOS_KVMFR_DEV,HELIOS_KVMFR_SIZE,HELIOS_LG_CLIENT,HELIOS_LG_RENDER_GPU,HELIOS_LG_DISPLAY_SERVER,HELIOS_LG_RENDERER,HELIOS_LG_ALLOW_DMA,HELIOS_LG_START_CLIENT,HELIOS_LG_RESTART_CLIENT,HELIOS_LG_CLIENT_DELAY,HELIOS_LG_CLIENT_LOG,HELIOS_INT_ACTION,HELIOS_SMP,HELIOS_SOCKETS,HELIOS_CORES,HELIOS_THREADS,HELIOS_VKR_DEBUG,HELIOS_QEMU_LOG,HELIOS_KD_SERIAL,HELIOS_KD_SOCKET,DISPLAY,WAYLAND_DISPLAY,GDK_BACKEND,SDL_VIDEODRIVER \
     bash "$0" "$@"
 fi
 
@@ -46,6 +55,7 @@ DISK=/var/lib/libvirt/images/win11.qcow2; NVRAM=/var/lib/libvirt/qemu/nvram/win1
 SWSRC=/var/lib/libvirt/swtpm/bfe8dc1f-8c5b-435c-8045-1ef3a5c19053/tpm2; TPMDIR=/tmp/helios-tpm; SHARE=/home/rupansh/helios-vgpu
 DISPLAY_MODE=${HELIOS_DISPLAY:-gtk}
 QEMU_RENDER_GPU=${HELIOS_QEMU_RENDER_GPU:-intel}
+DISABLE_VIRTIO_GPU=${HELIOS_DISABLE_VIRTIO_GPU:-0}
 INTEL_RENDER_NODE=${HELIOS_INTEL_RENDER_NODE:-/dev/dri/renderD129}
 NVIDIA_RENDER_NODE=${HELIOS_NVIDIA_RENDER_NODE:-/dev/dri/renderD128}
 LG_TRANSPORT=${HELIOS_LG_TRANSPORT:-kvmfr}
@@ -58,7 +68,7 @@ LG_DISPLAY_SERVER=${HELIOS_LG_DISPLAY_SERVER:-wayland}
 LG_RENDERER=${HELIOS_LG_RENDERER:-EGL}
 LG_ALLOW_DMA=${HELIOS_LG_ALLOW_DMA:-no}
 LG_START_CLIENT=${HELIOS_LG_START_CLIENT:-yes}
-LG_RESTART_CLIENT=${HELIOS_LG_RESTART_CLIENT:-yes}
+LG_RESTART_CLIENT=${HELIOS_LG_RESTART_CLIENT:-no}
 LG_CLIENT_DELAY=${HELIOS_LG_CLIENT_DELAY:-12}
 LG_CLIENT_LOG=${HELIOS_LG_CLIENT_LOG:-/tmp/helios-looking-glass-client.log}
 INT_ACTION=${HELIOS_INT_ACTION:-shutdown}
@@ -66,6 +76,8 @@ SMP=${HELIOS_SMP:-16}
 SOCKETS=${HELIOS_SOCKETS:-1}
 CORES=${HELIOS_CORES:-16}
 THREADS=${HELIOS_THREADS:-1}
+KD_SERIAL=${HELIOS_KD_SERIAL:-pty}
+KD_SOCKET=${HELIOS_KD_SOCKET:-/tmp/ntoseye-kd.sock}
 if [ "${HELIOS_PHASE:-}" != "user" ]; then
   [ "$(id -u)" -eq 0 ] || { echo "run with sudo"; exit 1; }
   USER_PHASE_PID=
@@ -108,13 +120,14 @@ if [ "${HELIOS_PHASE:-}" != "user" ]; then
   ip link set heltap0 master virbr0 && ip link set heltap0 up
   sudo -u "$USER_NAME" env HELIOS_PHASE=user XDG_RUNTIME_DIR=/run/user/$USER_UID \
     DISPLAY=${DISPLAY:-:0} WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-wayland-1} GDK_BACKEND=${GDK_BACKEND:-wayland,x11,*} SDL_VIDEODRIVER=${SDL_VIDEODRIVER:-wayland} \
-    HELIOS_DISPLAY="$DISPLAY_MODE" HELIOS_QEMU_RENDER_GPU="$QEMU_RENDER_GPU" HELIOS_INTEL_RENDER_NODE="$INTEL_RENDER_NODE" HELIOS_NVIDIA_RENDER_NODE="$NVIDIA_RENDER_NODE" HELIOS_LG_TRANSPORT="$LG_TRANSPORT" HELIOS_SPICE_PORT="$SPICE_PORT" HELIOS_KVMFR_DEV="$KVMFR_DEV" \
+    HELIOS_DISPLAY="$DISPLAY_MODE" HELIOS_QEMU_RENDER_GPU="$QEMU_RENDER_GPU" HELIOS_DISABLE_VIRTIO_GPU="$DISABLE_VIRTIO_GPU" HELIOS_INTEL_RENDER_NODE="$INTEL_RENDER_NODE" HELIOS_NVIDIA_RENDER_NODE="$NVIDIA_RENDER_NODE" HELIOS_LG_TRANSPORT="$LG_TRANSPORT" HELIOS_SPICE_PORT="$SPICE_PORT" HELIOS_KVMFR_DEV="$KVMFR_DEV" \
     HELIOS_KVMFR_SIZE="$KVMFR_SIZE" HELIOS_LG_CLIENT="$LG_CLIENT" \
     HELIOS_LG_RENDER_GPU="$LG_RENDER_GPU" HELIOS_LG_DISPLAY_SERVER="$LG_DISPLAY_SERVER" HELIOS_LG_RENDERER="$LG_RENDERER" HELIOS_LG_ALLOW_DMA="$LG_ALLOW_DMA" \
     HELIOS_LG_START_CLIENT="$LG_START_CLIENT" HELIOS_LG_RESTART_CLIENT="$LG_RESTART_CLIENT" \
     HELIOS_LG_CLIENT_DELAY="$LG_CLIENT_DELAY" HELIOS_LG_CLIENT_LOG="$LG_CLIENT_LOG" \
     HELIOS_INT_ACTION="$INT_ACTION" HELIOS_SMP="$SMP" HELIOS_SOCKETS="$SOCKETS" HELIOS_CORES="$CORES" HELIOS_THREADS="$THREADS" \
     HELIOS_VKR_DEBUG="${HELIOS_VKR_DEBUG:-}" HELIOS_QEMU_LOG="${HELIOS_QEMU_LOG:-}" \
+    HELIOS_KD_SERIAL="$KD_SERIAL" HELIOS_KD_SOCKET="$KD_SOCKET" \
     bash "$0" &
   USER_PHASE_PID=$!
   while kill -0 "$USER_PHASE_PID" 2>/dev/null; do
@@ -209,7 +222,9 @@ sleep 1
 
 qemu_display_args=(-display gtk,gl=on)
 qemu_lg_args=()
+qemu_gpu_args=()
 qemu_env_prefix=(env)
+qemu_serial_args=()
 lg_client_args=()
 lg_client_env_prefix=(env)
 qemu_egl_headless=egl-headless
@@ -245,6 +260,30 @@ elif [ "$QEMU_RENDER_GPU" != "default" ]; then
     exit 1
   fi
 fi
+
+case "$KD_SERIAL" in
+  pty)
+    qemu_serial_args=(
+      -chardev pty,id=charserial0
+      -device '{"driver":"isa-serial","chardev":"charserial0","id":"serial0","index":0}'
+    )
+    ;;
+  socket)
+    rm -f "$KD_SOCKET"
+    qemu_serial_args=(
+      -chardev "socket,id=charserial0,path=$KD_SOCKET,server=on,wait=off"
+      -device '{"driver":"isa-serial","chardev":"charserial0","id":"serial0","index":0}'
+    )
+    echo ">>> KD serial socket: $KD_SOCKET (COM1) <<<"
+    ;;
+  none)
+    qemu_serial_args=()
+    ;;
+  *)
+    echo "unknown HELIOS_KD_SERIAL=$KD_SERIAL (expected pty, socket, or none)"
+    exit 1
+    ;;
+esac
 
 if [ "$DISPLAY_MODE" = "looking-glass" ]; then
   if [ "$LG_TRANSPORT" = "kvmfr" ]; then
@@ -362,7 +401,18 @@ if [ "$DISPLAY_MODE" = "looking-glass" ]; then
   fi
 fi
 
-echo ">>> QEMU ($DISPLAY_MODE, virtio-gpu-gl-pci, host GPU: $QEMU_RENDER_GPU). Z:\\ = repo. SSH 192.168.122.120 <<<"
+if [ "$DISABLE_VIRTIO_GPU" = "1" ] || [ "$DISABLE_VIRTIO_GPU" = "yes" ]; then
+  echo ">>> HELIOS_DISABLE_VIRTIO_GPU=$DISABLE_VIRTIO_GPU: omitting virtio-gpu-gl-pci device <<<"
+  QEMU_GPU_LABEL="virtio-gpu disabled"
+else
+  qemu_gpu_args=(
+    -device
+    '{"driver":"virtio-gpu-gl-pci","id":"ua-heliosgpu","max_outputs":1,"bus":"pci.8","addr":"0x0","venus":true,"blob":true,"hostmem":8589934592,"max_hostmem":8589934592}'
+  )
+  QEMU_GPU_LABEL="virtio-gpu-gl-pci"
+fi
+
+echo ">>> QEMU ($DISPLAY_MODE, $QEMU_GPU_LABEL, host GPU: $QEMU_RENDER_GPU). Z:\\ = repo. SSH 192.168.122.120 <<<"
 # Capture QEMU + virgl_render_server (vkr_log) stderr; render-server diagnostics
 # like "failed to look up object" / "mem fd export failed" land here. Optional
 # HELIOS_VKR_DEBUG (e.g. "validate" / "all") enables vkr debugging incl. host-side
@@ -467,10 +517,7 @@ setsid "${qemu_env_prefix[@]}" /usr/bin/qemu-system-x86_64 \
   tap,id=hostnet0,ifname=heltap0,script=no,downscript=no \
   -device \
   '{"driver":"virtio-net-pci","netdev":"hostnet0","id":"net0","mac":"52:54:00:2e:4b:35","bus":"pci.1","addr":"0x0"}' \
-  -chardev \
-  pty,id=charserial0 \
-  -device \
-  '{"driver":"isa-serial","chardev":"charserial0","id":"serial0","index":0}' \
+  "${qemu_serial_args[@]}" \
   -chardev \
   socket,id=chrtpm,path=/tmp/helios-tpm/swtpm-sock \
   -tpmdev \
@@ -479,8 +526,7 @@ setsid "${qemu_env_prefix[@]}" /usr/bin/qemu-system-x86_64 \
   '{"driver":"tpm-crb","tpmdev":"tpm-tpm0","id":"tpm0"}' \
   -device \
   '{"driver":"usb-tablet","id":"input2","bus":"usb.0","port":"1"}' \
-  -device \
-  '{"driver":"virtio-gpu-gl-pci","id":"ua-heliosgpu","max_outputs":1,"bus":"pci.8","addr":"0x0","venus":true,"blob":true,"hostmem":8589934592,"max_hostmem":8589934592}' \
+  "${qemu_gpu_args[@]}" \
   -global \
   ICH9-LPC.noreboot=off \
   -watchdog-action \

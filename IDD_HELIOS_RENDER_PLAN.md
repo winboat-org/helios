@@ -18,6 +18,20 @@ This doc is the research record + plan so the next session can go straight to im
 > real blocker is §4's core: make DWM actually composite on Helios so the OS builds a display
 > path. Details + next steps in `WDDM_COMPOSITION_HANDOFF.md`.
 
+> **★ UPDATE 2026-06-23 — D3D11 device creation is no longer the blocker.**
+> The probe `C:\Users\Rupansh\helios-probe\d3d11_devicecreate_probe.exe` now returns
+> `D3D11CreateDevice hr=0x00000000 featureLevel=0xa000` on Helios. The old
+> `0x889800b0`/`DXGI_ERROR_UNSUPPORTED` DWM failure stage was fixed in the UMD/cap path.
+> The current blocker is earlier in display activation from the user-visible point of view:
+> IddCx monitor arrival succeeds, but CCD has zero active/all/database paths and the helper's
+> `SetDisplayConfig` attempts return `ERROR_GEN_FAILURE` (`31`). This also reproduced in a
+> same-boot Helios-disabled test, but a clean Windows boot without gpu-gl/Helios verifies that
+> the Looking Glass IDD works: session-1 CCD reports active/all/database paths, AssignSwapChain
+> fires, D3D11/D3D12 device init succeeds, and the Looking Glass client displays the desktop.
+> Treat the same-boot Helios-disabled result as contaminated by live graphics-stack state.
+> `LookingGlass/idd` has no current source diff; do not assume an IDD code experiment is still
+> deployed from source.
+
 ---
 
 ## 1. How IddCx actually delivers frames (RESEARCHED — do not re‑investigate)
@@ -65,9 +79,14 @@ adapter level). From `kmd_render/src/ddi/query_adapter_info.rs`:
   being stubbed is fine — **the gap is the WDDM memory/allocation model, not the command model.**
 - `DxgkDdiCreateAllocation` IS real (`create_allocation.rs:132-166`, makes venus HOST3D blobs).
 
-**Also:** loading the Helios KMD currently **kills the whole display** — `QueryDisplayConfig` returns
-`active paths=0` (no IDD swapchain assigned), whereas with the Helios KMD absent the WARP→IDD→LG path works
-and LG shows the desktop. (User has deprioritized "make WARP keep working while Helios is loaded" — see §4.)
+**Current correction (2026-06-23):** loading Helios still leaves `QueryDisplayConfig` at
+`active/all/database paths=0`. A same-boot controlled test with Helios disabled also returned
+0 paths and `SetDisplayConfig` ret 31, but a clean boot without gpu-gl/Helios does not: WMI
+reports the LG monitor active, `Win32_VideoController` reports the Looking Glass IDD at
+`1920x1080`, a session-1 CCD probe reports active/all/database paths, `AssignSwapChain` fires,
+and the Looking Glass client displays the desktop. Use that clean gpu-gl-out boot as the
+baseline; treat the same-boot Helios-disabled result as contaminated by live graphics-stack
+state.
 
 ## 3. The CHeliosSink direct path (scaffolded, currently OFF)
 
@@ -175,13 +194,13 @@ on Helios and the IDD displays the desktop in Looking Glass.
   validated; input layouts (ISGN‑resolved, lazy) / VB‑IB / blend / benign present added (compile + load‑clean,
   venus‑untested). This is what lets DWM/apps create a *working* D3D11 device on Helios — they still abandon it
   for the §2 memory reason, not a UMD reason.
-- **Deploy reality:** a freshly‑installed KMD package version (`devcon`/`pnputil`, any version ≠ the live
-  `oem123`/e0bd) hits `FAILED_ADD` / `0xC0000182` (a pre‑existing render‑only adapter install/pairing quirk,
-  reproduced with OLD code too — NOT the leak fix). Deploy new KMD/UMD builds by **in‑place overwriting the
-  e0bd DriverStore `.sys`/`helios_umd.dll`** (takeown + copy), regenerating the catalog
-  (`inf2cat /os:10_x64 /uselocaltime`) and signing it + the `.sys` with **WDRLocalTestCert**
-  (thumbprint `BB44916FAFF199C0B9659CDB319394F6DF3D671E`, needs an interactive login session for the key),
-  then `devcon restart`. (A self‑signed machine cert gets the image to load but dxgkrnl still rejects it.)
+- **Deploy reality:** use `Z:\tools\install-helios-kmd.ps1` for KMD packages. It signs with a
+  machine-store `WDRLocalTestCert`, publishes to the existing PCI devnode with
+  `devcon update <inf> <hardware-id>` when DevCon is present, falls back to
+  `pnputil /add-driver /install` only when requested/needed, and verifies Code 0. Do not manually
+  overwrite DriverStore files during normal iteration. The script's `-BinaryOnly` mode is an
+  emergency already-trusted-package override; it backs up the active store, regenerates/signs the
+  active catalog, and hash-verifies the copy.
 - **Looking Glass:** IDD (`ROOT\DISPLAY\0000`) + monitor enumerate OK; logs to
   `C:\ProgramData\Looking Glass (IDD)\looking-glass-idd.txt`. CHeliosSink path present but OFF.
 - The Mesa ICD is a submodule at `icd/mesa` (checked out); win build glue in `icd/win-build`.

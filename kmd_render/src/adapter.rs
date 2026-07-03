@@ -85,7 +85,7 @@ pub struct AdapterContext {
     /// alive for the device lifetime so the page-table blob stays mapped. `None`
     /// until/unless the StartDevice venus bring-up succeeds. Its `Drop` unmaps the
     /// ring/reply kernel mappings; cleared (dropped) in StopDevice.
-    pub venus_client: Option<crate::virtio::venus::VenusClient>,
+    venus_client: UnsafeCell<Option<crate::virtio::venus::VenusClient>>,
     /// The persistent venus 3D context id (`VIRTIO_GPU_CAPSET_VENUS`) the venus
     /// client rides, created in StartDevice and destroyed in StopDevice. `0` = none.
     pub venus_ctx_id: u32,
@@ -109,17 +109,17 @@ impl AdapterContext {
             virtio_lock: UnsafeCell::new(0),
             virtio: UnsafeCell::new(None),
             mappings: crate::mapping::MappingTable::new(),
-            paging_ram: Self::alloc_paging_ram(),
+            paging_ram: None,
             page_table_window: None,
-            venus_client: None,
+            venus_client: UnsafeCell::new(None),
             venus_ctx_id: 0,
         })
     }
 
-    /// Allocate the real-RAM-backed paging/page-table segment (PASSIVE_LEVEL — we
-    /// are in AddDevice). Returns `None` on failure; the caller then reports only
-    /// the single (BAR/aperture) segment, preserving the prior behavior.
-    fn alloc_paging_ram() -> Option<PagingRam> {
+    /// Allocate the real-RAM-backed paging/page-table segment. Called from
+    /// StartDevice, after PnP has accepted the display miniport context, so AddDevice
+    /// stays a cheap context-allocation step.
+    pub(crate) fn alloc_paging_ram() -> Option<PagingRam> {
         // Permit the contiguous block anywhere in the 64-bit physical space.
         let mut highest: PHYSICAL_ADDRESS = unsafe { core::mem::zeroed() };
         highest.QuadPart = i64::MAX;
@@ -215,6 +215,54 @@ impl AdapterContext {
             Some(v) => Ok(f(v)),
             None => Err(DriverError::DeviceNotFound),
         }
+    }
+
+    /// Install or clear the persistent KMD Venus client. Device-lifecycle only.
+    pub unsafe fn set_venus_client(&self, client: Option<crate::virtio::venus::VenusClient>) {
+        *self.venus_client.get() = client;
+    }
+
+    /// Run `f` against both the live virtio transport and persistent Venus client.
+    ///
+    /// # Safety
+    /// This performs unlocked mutable access and must only be used at PASSIVE_LEVEL
+    /// from paths that are externally serialized. It is intentionally narrow for
+    /// standard WDDM allocations while the composition path is being brought up.
+    pub unsafe fn with_virtio_and_venus_passive<R>(
+        &self,
+        f: impl FnOnce(&mut VirtioGpu, &mut crate::virtio::venus::VenusClient) -> R,
+    ) -> Result<R, DriverError> {
+        let virtio = unsafe { &mut *self.virtio.get() };
+        let venus = unsafe { &mut *self.venus_client.get() };
+        match (virtio, venus) {
+            (Some(v), Some(c)) => Ok(f(v, c)),
+            _ => Err(DriverError::DeviceNotFound),
+        }
+    }
+
+    /// Run `f` against both the live virtio transport and the persistent Venus
+    /// client while holding `virtio_lock` — the [`with_virtio`] discipline, so it
+    /// cannot race concurrent escape/DPC transport users. `f` runs at
+    /// DISPATCH_LEVEL: everything the venus client does on the allocation path
+    /// (fixed-buffer ring writes, bounded ring polls, ctrl-queue submits) is
+    /// DISPATCH-safe — the same pattern as the synchronous venus-over-escape path.
+    /// Used by standard-allocation create/destroy (KMD-backed venus memory blobs).
+    pub fn with_virtio_and_venus_locked<R>(
+        &self,
+        f: impl FnOnce(&mut VirtioGpu, &mut crate::virtio::venus::VenusClient) -> R,
+    ) -> Result<R, DriverError> {
+        // SAFETY: spinlock-guarded exclusive access to both cells' contents for
+        // the duration of the critical section (the venus client is only ever
+        // installed/cleared at device lifecycle, under external serialization).
+        let irql = unsafe { KeAcquireSpinLockRaiseToDpc(self.virtio_lock.get()) };
+        let virtio = unsafe { &mut *self.virtio.get() };
+        let venus = unsafe { &mut *self.venus_client.get() };
+        let result = match (virtio, venus) {
+            (Some(v), Some(c)) => Ok(f(v, c)),
+            _ => Err(DriverError::DeviceNotFound),
+        };
+        unsafe { KeReleaseSpinLock(self.virtio_lock.get(), irql) };
+        result
     }
 }
 

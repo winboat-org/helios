@@ -300,13 +300,17 @@ the `vtn_*` SPIR-V→NIR link dep (link libvtn, or confirm the IOCTL transport p
   The KMDF universal INF cannot write this — an ICD installer/postinstall script does it (independent
   of the PnP device). Precedent: lavapipe + SwiftShader enumerate via exactly this with no display
   adapter. (Or just set `VK_DRIVER_FILES`/`VK_ICD_FILENAMES` env for testing.)
-- **Helios installer:** use `Z:\tools\install-helios-icd.ps1` after every Mesa ICD rebuild. It copies the
-  DLL to a content-hashed ProgramData path (`vulkan_virtio-<hash>.dll`), rewrites
-  `C:\ProgramData\HeliosVulkan\virtio_devenv_icd.x86_64.json`, removes stale Helios/Virtio registry
-  entries, and registers that ProgramData JSON under the Khronos Vulkan Drivers key. This avoids the
-  failure mode where the loader keeps using an old build-tree JSON such as
-  `C:\Users\Rupansh\helios-mesa-mingw\...`, and also avoids overwrite failures when the previous ICD
-  DLL is still mapped.
+- **Helios installer:** use `Z:\tools\install-helios-icd.ps1 -PlanOnly -NoSmoke`, then
+  `Z:\tools\install-helios-icd.ps1` after every Mesa ICD rebuild. It copies the DLL to a
+  content-hashed ProgramData path (`vulkan_virtio-<hash>.dll`), atomically rewrites
+  `C:\ProgramData\HeliosVulkan\virtio_devenv_icd.x86_64.json`, validates the JSON, removes stale
+  Helios/Virtio registry entries, and registers that ProgramData JSON under the Khronos Vulkan
+  Drivers key. Old hashed DLLs are retained unless `-PruneOld` is passed, which avoids overwrite
+  failures when a previous ICD DLL is still mapped.
+- The WDDM UMD/DXVK bridge follows those same ICD manifests to locate Helios-specific ICD exports
+  (`helios_venus_current_ctx_id`, memory id/resource id helpers). It no longer carries a hardcoded
+  list of `vulkan_virtio*.dll` names, so the manifest installed by this script is the single source
+  of truth for both normal Vulkan apps and the UMD helper path.
 
 ---
 
@@ -314,8 +318,8 @@ the `vtn_*` SPIR-V→NIR link dep (link libvtn, or confirm the IOCTL transport p
 
 1. **First milestone — host logs the first `vkCreateInstance`.** Set `VN_DEBUG=init` (bit 0,
    `vn_common.h:118`) to get the ICD's "connected to renderer"/"wire format version" lines
-   (`vn_instance.c:215`); confirm on the host in `/var/log/libvirt/qemu/win11.log` (root-only,
-   `sudo tail`). Minimum to reach here: `info` (§5, validated before host traffic) + `shmem_ops.create`
+   (`vn_instance.c:215`); confirm on the host from the standalone QEMU/render-server log. Minimum
+   to reach here: `info` (§5, validated before host traffic) + `shmem_ops.create`
    (the 128 KiB ring, `vn_instance.c:142`/`vn_ring.c:294` — needs a genuinely host-coherent mapping) +
    `ops.submit` (`vkCreateRingMESA` carries the ring's `resourceId`) + `ops.wait`/`sync_ops`.
 2. **`vulkaninfo`** → `driverName "venus"`, exactly one physical device.

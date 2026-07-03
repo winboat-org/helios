@@ -32,11 +32,11 @@ loading**; the remaining work is one focused VidPN bug + the venus-over-escape c
   (EnumVidPnCofuncModality); the standalone sits at LogonUI with no present. So `EnumVidPnCofuncModality` yields
   a cofunctional VidPN dxgkrnl won't commit.
 
-**DO THIS FIRST — find why no commit.** Build+sign on the **libvirt** win11 (signing fails on the standalone:
-no user crypto profile at LogonUI), install, reboot, then read `HKLM\SYSTEM\CurrentControlSet\Services\
+**DO THIS FIRST — find why no commit.** Build+sign through the Windows MCP mirror, install on the standalone
+target, reboot, then read `HKLM\SYSTEM\CurrentControlSet\Services\
 helios_kmd\HeliosMask` (sticky OR of every DDI bit) + `HeliosStep` (= `0x0800_00<flags><paths>` from
 EnumVidPnCofuncModality: paths in bits[0..8], src-modeset-assigned `0x100`, tgt-modeset-assigned `0x200`). To
-make dxgkrnl actually attempt a commit on the (secondary) libvirt Helios, extend the desktop onto it
+make dxgkrnl actually attempt a commit on the Helios display, extend the desktop onto it
 (`SetDisplayConfig` CCD / display settings). Interpret: `paths==0` ⇒ empty constraining topology (upstream);
 assigns==0 ⇒ create/assign failed; assigns set but no commit ⇒ **mode-set CONTENT malformed** — compare
 `add_single_source_mode`/`add_single_target_mode` field-by-field vs KMDOD `bdd_dmm.cxx` (suspects: target
@@ -48,8 +48,8 @@ standalone floods `Gdk-WARNING eglMakeCurrent failed` (black window). Two observ
 (a) `gl=on` works in a separate minimal qemu launch (q35 + one virtio-gpu-gl-pci + an Ubuntu ISO) on this host;
 (b) changing `tools/launch-helios-gtk.sh` to run as the desktop user with the full session env (it no longer
 sudo-re-execs with a stripped env) did NOT change the failure. Root cause unknown — the next session must figure
-it out. Until then the launcher (run it as your user: `bash tools/launch-helios-gtk.sh`; libvirt win11 off
-first, restart after) defaults to `$HELIOS_DISPLAY=gtk` (software, no EGL — can display the 2D desktop without
+it out. Until then the launcher (run it as your user: `bash tools/launch-helios-gtk.sh`, restart after changes)
+defaults to `$HELIOS_DISPLAY=gtk` (software, no EGL — can display the 2D desktop without
 GL); use `gtk,gl=on,show-cursor=on` to reproduce the bug, or `spice` (`-spice :5930`, `remote-viewer
 spice://127.0.0.1:5930`). NB: `gl=on` is needed for the venus dmabuf path (7.3), so this must be solved before
 then.

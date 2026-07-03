@@ -57,6 +57,41 @@ static SERVICE_NAME: [u16; 18] = [
     0,
 ];
 
+/// Write a DWORD breadcrumb to a FIXED value name (not the `S<idx>` ring). The
+/// `S*` ring is overwritten within ~1s by steady-state QueryAdapterInfo polling,
+/// so it is useless for one-shot tracing of a rare DDI (e.g. Present). A fixed
+/// name persists until the next write, so it can be read live from the registry.
+/// `name` must be a NUL-terminated UTF-16 value name. PASSIVE_LEVEL only.
+pub fn record_named(name: &[u16], mut code: u32) {
+    // SAFETY: PASSIVE_LEVEL (see module note). `name` is a caller-provided
+    // NUL-terminated UTF-16 value name; ValueData points to a 4-byte DWORD that
+    // RtlWriteRegistryValue copies before returning.
+    unsafe {
+        let _ = RtlWriteRegistryValue(
+            RTL_REGISTRY_SERVICES,
+            SERVICE_NAME.as_ptr(),
+            name.as_ptr(),
+            REG_DWORD,
+            (&mut code as *mut u32).cast::<core::ffi::c_void>(),
+            4,
+        );
+    }
+}
+
+/// `record_named` convenience: build the UTF-16 value name from an ASCII byte
+/// slice (≤14 chars). PASSIVE_LEVEL only.
+pub fn record_named_bytes(name: &[u8], value: u32) {
+    let mut buf = [0u16; 16];
+    let n = name.len().min(14);
+    let mut i = 0;
+    while i < n {
+        buf[i] = name[i] as u16;
+        i += 1;
+    }
+    buf[n] = 0;
+    record_named(&buf[..=n], value);
+}
+
 /// Append one DWORD breadcrumb. Cheap and lossy by design (best-effort tracing).
 pub fn record(mut code: u32) {
     let idx = STEP.fetch_add(1, Ordering::Relaxed);

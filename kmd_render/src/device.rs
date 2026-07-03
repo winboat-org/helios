@@ -92,6 +92,10 @@ pub unsafe extern "C" fn dxgkddi_destroy_device(h_device: *mut c_void) -> NTSTAT
         // whether VidSch exercised the submission engine at all before the
         // post-CreateContext VidSchTerminateAdapter Code-43 (Step-2 coherent fence).
         crate::ddi::diag_dump_engine_atomics();
+        // Present-path tracers: the steady-state registry ring is too noisy for
+        // per-call breadcrumbs, so mirror the latest cross-adapter present args
+        // here at PASSIVE_LEVEL.
+        crate::ddi::diag_dump_present_atomics();
         let _ = adapter.with_virtio(|v| {
             let before = v.blob_count() as u32;
             let blobs = v.release_blobs_for_owner(owner);

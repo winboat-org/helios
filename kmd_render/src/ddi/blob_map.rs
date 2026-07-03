@@ -15,8 +15,22 @@ use core::mem::size_of;
 use helios_protocol::{
     VIRTIO_GPU_MAP_CACHE_CACHED, VIRTIO_GPU_MAP_CACHE_UNCACHED, VIRTIO_GPU_MAP_CACHE_WC,
 };
-use wdk_sys::ntddk::{IoAllocateMdl, IoFreeMdl, MmMapLockedPagesSpecifyCache, MmUnmapLockedPages};
+use wdk_sys::ntddk::{IoAllocateMdl, IoFreeMdl, MmUnmapLockedPages};
 use wdk_sys::{_MEMORY_CACHING_TYPE, MDL, PMDL, PVOID, ULONG};
+
+extern "C" {
+    /// C SEH shim (`src/seh_shim.c`, compiled by build.rs): wraps
+    /// `MmMapLockedPagesSpecifyCache(mdl, UserMode, cache, NULL, FALSE, priority)`
+    /// in `__try/__except`. For UserMode the kernel RAISES on failure instead of
+    /// returning NULL; without SEH that raise is a bugcheck reachable from any
+    /// process via the Escape MAP_BLOB verb. The shim converts it to NULL.
+    fn helios_mm_map_locked_pages_user_seh(
+        mdl: PMDL,
+        access_mode: i8,
+        cache_type: i32,
+        priority: u32,
+    ) -> PVOID;
+}
 
 /// log2(page size). The host-visible window is mapped page-granular.
 const PAGE_SHIFT: u32 = 12;
@@ -66,11 +80,10 @@ pub fn effective_map_cache(requested: u32, host: u32) -> u32 {
 /// window range (from `RESOURCE_MAP_BLOB`). The PFNs are device pages not subject
 /// to paging, so `MDL_PAGES_LOCKED` is the correct flag (no `MmProbeAndLockPages`).
 ///
-/// ⚠️ HARDENING TODO (carried from the System-class driver): for UserMode,
-/// `MmMapLockedPagesSpecifyCache` RAISES on failure rather than returning NULL,
-/// and this `no_std` crate has no SEH, so a failure unwinds → bugcheck. Exposure is
-/// bounded by the per-map size cap and the sole caller being the trusted ICD. Add a
-/// C `__try/__except` shim before exposing MAP_BLOB to any untrusted caller.
+/// The UserMode map goes through the C SEH shim (`helios_mm_map_locked_pages_user_seh`):
+/// `MmMapLockedPagesSpecifyCache` RAISES on failure for UserMode rather than
+/// returning NULL, and a raise in this no_std crate is a bugcheck reachable from
+/// any process via D3DKMTEscape. The shim's `__except` turns it into NULL.
 pub unsafe fn map_io_pages_to_user(
     gpa: u64,
     size: u64,
@@ -101,12 +114,10 @@ pub unsafe fn map_io_pages_to_user(
     }
     let priority = NORMAL_PAGE_PRIORITY | MDL_MAPPING_NO_EXECUTE;
     // SAFETY: `mdl` is a valid, populated, locked MDL; maps into the current (user)
-    // process. BugCheckOnFailure = FALSE (ignored for UserMode — see the note above).
-    let va =
-        MmMapLockedPagesSpecifyCache(mdl, USER_MODE, cache, core::ptr::null_mut(), 0, priority);
+    // process. The shim catches the UserMode failure raise and returns NULL.
+    let va = helios_mm_map_locked_pages_user_seh(mdl, USER_MODE, cache as i32, priority);
     if va.is_null() {
-        // Unreached for UserMode (it raises rather than returning NULL), kept as
-        // defense-in-depth in case a future kernel build returns NULL.
+        // Map failed (raise caught by the SEH shim, or NULL from the kernel).
         IoFreeMdl(mdl);
         return None;
     }

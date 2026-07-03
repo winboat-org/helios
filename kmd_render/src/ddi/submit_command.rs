@@ -8,6 +8,7 @@ use core::mem::size_of;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::adapter::AdapterContext;
+use crate::ddi::gdi_blit;
 use crate::dxgk::_DXGK_INTERRUPT_TYPE::DXGK_INTERRUPT_DMA_COMPLETED;
 use crate::dxgk::*;
 
@@ -25,6 +26,10 @@ pub static SUBMIT_LAST_FENCE: AtomicU32 = AtomicU32::new(0);
 pub static RENDER_COUNT: AtomicU32 = AtomicU32::new(0);
 pub static PATCH_COUNT: AtomicU32 = AtomicU32::new(0);
 pub static PREEMPT_COUNT: AtomicU32 = AtomicU32::new(0);
+pub static DMA_NOTIFY_COUNT: AtomicU32 = AtomicU32::new(0);
+pub static DMA_QUEUE_DPC_COUNT: AtomicU32 = AtomicU32::new(0);
+pub static DMA_SYNC_STATUS_LOW: AtomicU32 = AtomicU32::new(0);
+pub static DMA_SYNC_RET: AtomicU32 = AtomicU32::new(0);
 
 /// Mirror the DISPATCH-safe engine tracers into the PASSIVE diag ring. Call ONLY
 /// from a PASSIVE DDI (DxgkDdiDestroyDevice). Codes (continuing the 0x0F.. space
@@ -38,6 +43,10 @@ pub static PREEMPT_COUNT: AtomicU32 = AtomicU32::new(0);
 ///   0x0F0C_NNNN = InterruptRoutine delivery count
 ///   0x0F0D_NNNN = DpcRoutine count
 ///   0x0F0E_NNNN = ControlInterrupt count
+///   0x0F0F_NNNN = DMA-complete NotifyInterrupt count
+///   0x0F10_NNNN = DMA-complete QueueDpc count
+///   0x0F11_NNNN = DxgkCbSynchronizeExecution status low 16
+///   0x0F12_NNNN = DxgkCbSynchronizeExecution return BOOLEAN
 pub fn diag_dump_engine_atomics() {
     crate::diag::record(0x0F06_0000 | (SUBMIT_COUNT.load(Ordering::Relaxed) & 0xFFFF));
     crate::diag::record(0x0F07_0000 | (SUBMIT_LAST_FENCE.load(Ordering::Relaxed) & 0xFFFF));
@@ -54,6 +63,10 @@ pub fn diag_dump_engine_atomics() {
     crate::diag::record(
         0x0F0E_0000 | (super::interrupt::CONTROL_INT_COUNT.load(Ordering::Relaxed) & 0xFFFF),
     );
+    crate::diag::record(0x0F0F_0000 | (DMA_NOTIFY_COUNT.load(Ordering::Relaxed) & 0xFFFF));
+    crate::diag::record(0x0F10_0000 | (DMA_QUEUE_DPC_COUNT.load(Ordering::Relaxed) & 0xFFFF));
+    crate::diag::record(0x0F11_0000 | (DMA_SYNC_STATUS_LOW.load(Ordering::Relaxed) & 0xFFFF));
+    crate::diag::record(0x0F12_0000 | (DMA_SYNC_RET.load(Ordering::Relaxed) & 0xFFFF));
 }
 
 /// Context handed to [`notify_dma_completed_routine`] across the
@@ -78,6 +91,14 @@ unsafe extern "C" fn notify_dma_completed_routine(context: *mut c_void) -> BOOLE
         // SAFETY: at DIRQL (raised by DxgkCbSynchronizeExecution); `interrupt`
         // points to a fully-initialized DMA_COMPLETED packet, live for this call.
         unsafe { notify_interrupt(dxgkrnl.DeviceHandle, ctx.interrupt) };
+        DMA_NOTIFY_COUNT.fetch_add(1, Ordering::Relaxed);
+    }
+    if let Some(queue_dpc) = dxgkrnl.DxgkCbQueueDpc {
+        // viogpu3d queues the DPC from the synchronized interrupt routine, while
+        // still at the device DIRQL. Keep that ordering so dxgkrnl sees the
+        // notify+DPC pair as one interrupt-completion event.
+        unsafe { queue_dpc(dxgkrnl.DeviceHandle) };
+        DMA_QUEUE_DPC_COUNT.fetch_add(1, Ordering::Relaxed);
     }
     1 // TRUE
 }
@@ -104,31 +125,68 @@ unsafe fn signal_dma_completed(dxgkrnl: &DXGKRNL_INTERFACE, fence: u32) -> NTSTA
     if let Some(sync) = dxgkrnl.DxgkCbSynchronizeExecution {
         let mut ret: BOOLEAN = 0;
         // SAFETY: valid DeviceHandle; the routine + context live for the call.
-        unsafe {
+        let status = unsafe {
             sync(
                 dxgkrnl.DeviceHandle,
                 Some(notify_dma_completed_routine),
                 &ctx as *const _ as *mut c_void,
                 0,
                 &mut ret,
-            );
+            )
+        };
+        DMA_SYNC_STATUS_LOW.store(status as u32, Ordering::Relaxed);
+        DMA_SYNC_RET.store(ret as u32, Ordering::Relaxed);
+        if status != STATUS_SUCCESS {
+            return status;
+        }
+        if ret == 0 {
+            return STATUS_DEVICE_NOT_READY;
         }
     } else {
         return STATUS_DEVICE_NOT_READY;
     }
-
-    if let Some(queue_dpc) = dxgkrnl.DxgkCbQueueDpc {
-        // SAFETY: valid DeviceHandle.
-        let _ = unsafe { queue_dpc(dxgkrnl.DeviceHandle) };
-    }
     STATUS_SUCCESS
 }
 
+/// `DxgkDdiSubmitCommandVirtual` — submit a DMA buffer addressed by GPU virtual
+/// address. Because Helios declares the GpuMmu model (`VirtualAddressingSupported`
+/// + `GpuMmuSupported`), VidSch routes a GpuMmu context's command buffers HERE, not
+/// to `DxgkDdiSubmitCommand`. Leaving it `STATUS_NOT_SUPPORTED` was fine only while
+/// no render work was ever submitted; once `DxgkDdiRenderGdi` produces a real render
+/// DMA buffer, `dxgmms2!VidSchiSendToExecutionQueue` submits it here, gets
+/// NOT_SUPPORTED (0xC00000BB), and bugchecks **0x119 (VIDEO_SCHEDULER_INTERNAL_ERROR)
+/// Arg1=2** ("driver failed upon submission of a command") — observed live.
+///
+/// Same null-engine completion as `dxgkddi_submit_command`: there is no guest GPU to
+/// program (the host owns the real MMU; venus addresses by resource id), so retire
+/// the fence via `DxgkCbNotifyInterrupt`(DMA_COMPLETED) at the device DIRQL. Runs at
+/// DISPATCH_LEVEL. (Real venus forwarding of render buffers is the deferred §C work.)
 pub unsafe extern "C" fn dxgkddi_submit_command_virtual(
-    _h_adapter: *mut c_void,
-    _submit_command: *const DXGKARG_SUBMITCOMMANDVIRTUAL,
+    h_adapter: *mut c_void,
+    submit_command: *const DXGKARG_SUBMITCOMMANDVIRTUAL,
 ) -> NTSTATUS {
-    STATUS_NOT_SUPPORTED
+    if h_adapter.is_null() || submit_command.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let adapter = unsafe { &*(h_adapter as *const AdapterContext) };
+    let submit = unsafe { &*submit_command };
+    let fence = submit.SubmissionFenceId;
+
+    SUBMIT_COUNT.fetch_add(1, Ordering::Relaxed);
+    SUBMIT_LAST_FENCE.store(fence, Ordering::Relaxed);
+    // SAFETY: `Value` is a plain UINT view of the (valid) flags union.
+    let is_paging = (unsafe { submit.Flags.__bindgen_anon_1.Value } & 1) != 0;
+    if is_paging {
+        SUBMIT_PAGING_COUNT.fetch_add(1, Ordering::Relaxed);
+    }
+
+    adapter.last_completed_fence.store(fence, Ordering::Release);
+    let dxgkrnl = match adapter.dxgkrnl() {
+        Ok(interface) => interface,
+        Err(_) => return STATUS_DEVICE_NOT_READY,
+    };
+    // SAFETY: dxgkrnl is the live callback interface; signal at correct IRQL.
+    unsafe { signal_dma_completed(dxgkrnl, fence) }
 }
 
 /// `DxgkDdiSubmitCommand` — submit a DMA buffer to the GPU. Critically, this is
@@ -189,21 +247,40 @@ pub unsafe extern "C" fn dxgkddi_submit_command(
 }
 
 pub unsafe extern "C" fn dxgkddi_preempt_command(
-    _h_adapter: *mut c_void,
-    _preempt_command: *const DXGKARG_PREEMPTCOMMAND,
+    h_adapter: *mut c_void,
+    preempt_command: *const DXGKARG_PREEMPTCOMMAND,
 ) -> NTSTATUS {
     PREEMPT_COUNT.fetch_add(1, Ordering::Relaxed);
-    STATUS_NOT_IMPLEMENTED
+    if h_adapter.is_null() || preempt_command.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    // Null-engine bring-up: every submitted fence is completed synchronously, so
+    // there is no hardware queue to interrupt. Reporting success keeps VidSch's
+    // preempt/TDR path coherent instead of escalating on NOT_IMPLEMENTED.
+    STATUS_SUCCESS
 }
 
 /// `DxgkDdiResetFromTimeout` — TDR recovery (no engines to reset yet).
-pub unsafe extern "C" fn dxgkddi_reset_from_timeout(_h_adapter: *mut c_void) -> NTSTATUS {
-    STATUS_NOT_SUPPORTED
+pub unsafe extern "C" fn dxgkddi_reset_from_timeout(h_adapter: *mut c_void) -> NTSTATUS {
+    if h_adapter.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    // The current KMD model retires paging/render submissions immediately via
+    // DMA_COMPLETED notifications and has no hardware engine state to reset.
+    // Returning NOT_SUPPORTED here makes dxgkrnl's TDR recovery fail-fast with
+    // VIDEO_TDR_FAILURE Arg3=STATUS_NOT_SUPPORTED.
+    STATUS_SUCCESS
 }
 
 /// `DxgkDdiRestartFromTimeout` — resume after TDR.
-pub unsafe extern "C" fn dxgkddi_restart_from_timeout(_h_adapter: *mut c_void) -> NTSTATUS {
-    STATUS_NOT_SUPPORTED
+pub unsafe extern "C" fn dxgkddi_restart_from_timeout(h_adapter: *mut c_void) -> NTSTATUS {
+    if h_adapter.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    STATUS_SUCCESS
 }
 
 // ── Render-path DDIs. ───────────────────────────────────────────────────────
@@ -229,34 +306,190 @@ pub unsafe extern "C" fn dxgkddi_render(
         return STATUS_INVALID_PARAMETER;
     }
     let args = unsafe { &mut *render };
-    if args.pCommand.is_null() || args.pDmaBuffer.is_null() {
+    if args.pDmaBuffer.is_null() {
         return STATUS_INVALID_PARAMETER;
     }
     let cmd_len = args.CommandLength as usize;
     let dma_cap = args.DmaSize as usize;
-    if cmd_len == 0 || cmd_len > dma_cap {
+    if cmd_len > 0 && args.pCommand.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if cmd_len > dma_cap {
         // Buffer too small for the recorded command: ask the runtime to grow it.
         return STATUS_BUFFER_TOO_SMALL;
     }
-    // SAFETY: the runtime guarantees `pCommand` has `CommandLength` readable bytes
-    // and `pDmaBuffer` has `DmaSize` writable bytes; we copy at most `cmd_len`
-    // (<= DmaSize) and the ranges do not overlap (distinct allocations).
-    unsafe {
-        core::ptr::copy_nonoverlapping(
-            args.pCommand as *const u8,
-            args.pDmaBuffer as *mut u8,
-            cmd_len,
-        );
+
+    if args.PatchLocationListInSize > args.PatchLocationListOutSize {
+        return STATUS_BUFFER_TOO_SMALL;
     }
+    if args.PatchLocationListInSize != 0
+        && (args.pPatchLocationListIn.is_null() || args.pPatchLocationListOut.is_null())
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    for i in 0..args.PatchLocationListInSize {
+        let input = unsafe { &*args.pPatchLocationListIn.add(i as usize) };
+        let output = unsafe { &mut *args.pPatchLocationListOut.add(i as usize) };
+        unsafe { core::ptr::write_bytes(output as *mut _, 0, 1) };
+        output.AllocationIndex = input.AllocationIndex;
+        output.AllocationOffset = 0;
+        output.PatchOffset = 0;
+        output.SplitOffset = 0;
+        unsafe {
+            output.__bindgen_anon_1.Value = i & 0x00ff_ffff;
+        }
+    }
+    args.PatchLocationListOutSize = args.PatchLocationListInSize;
+    if !args.pPatchLocationListOut.is_null() {
+        args.pPatchLocationListOut = unsafe {
+            args.pPatchLocationListOut
+                .add(args.PatchLocationListInSize as usize)
+        };
+    }
+
+    if cmd_len > 0 {
+        // SAFETY: the runtime guarantees `pCommand` has `CommandLength` readable
+        // bytes and `pDmaBuffer` has `DmaSize` writable bytes; we copy at most
+        // `cmd_len` (<= DmaSize) and the ranges do not overlap.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                args.pCommand as *const u8,
+                args.pDmaBuffer as *mut u8,
+                cmd_len,
+            );
+        }
+    }
+    args.pDmaBuffer = unsafe { (args.pDmaBuffer as *mut u8).add(cmd_len) as *mut c_void };
+    args.MultipassOffset = 0;
     STATUS_SUCCESS
 }
 
-/// `DxgkDdiRenderKm` — kernel-mode (GDI) render path.
+/// `DxgkDdiRenderKm` — kernel-mode (GDI hardware-acceleration) render path.
+///
+/// dxgkrnl drives this when GDI renders to a cross-adapter / GDI-accelerated surface
+/// — gated by `DXGK_PRESENTATIONCAPS::SupportKernelModeCommandBuffer` (which we
+/// advertise, mandatory for Code-0 load) together with `CrossAdapterResource`
+/// (`gdi-hardware-acceleration.md`: GDI-HW-accel KMDs MUST implement
+/// CreateAllocation + GetStandardAllocationDriverData + RenderKm). The OS passes an
+/// array of `DXGK_RENDERKM_COMMAND` ops in `pCommand`; the driver must translate
+/// them into a DMA buffer + patch-location list, **advance the in/out pointers**,
+/// and return SUCCESS. Returning `STATUS_NOT_IMPLEMENTED` leaves `pDmaBuffer`
+/// unadvanced and the submission output unfilled, after which
+/// `dxgkrnl!ADAPTER_RENDER::DdiRenderGdi` calls a null function pointer
+/// (observed live: `DdiRenderGdi+0x140` `call rax`, rax=0 → 0xC0000005).
+///
+/// Decorative-GpuMmu model: the host GPU (venus) owns real rendering by resource id,
+/// so we do not lower GDI ops to GPU instructions here. We record the opaque command
+/// bytes into the DMA buffer (so `DxgkDdiSubmitCommand` has a non-empty buffer to
+/// retire) and advance the DMA write pointer; there are no guest GPU-VAs to patch
+/// (matching `DxgkDdiPatch`'s no-op), so the out patch list stays at its base (0
+/// entries). `SubmitCommand` drives the fence. NOTE: this makes the path structurally
+/// complete (no crash); pixel-correct GDI lowering is a later step — DWM's own
+/// composition is D3D (the UMD `DxgkDdiRender` path), not this GDI path.
 pub unsafe extern "C" fn dxgkddi_render_km(
     _h_context: IN_CONST_HANDLE,
-    _render: INOUT_PDXGKARG_RENDER,
+    render: INOUT_PDXGKARG_RENDER,
 ) -> NTSTATUS {
-    STATUS_NOT_IMPLEMENTED
+    RENDER_COUNT.fetch_add(1, Ordering::Relaxed);
+    if render.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let args = unsafe { &mut *render };
+    if args.pDmaBuffer.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let cmd_len = args.CommandLength as usize;
+    let dma_cap = args.DmaSize as usize;
+    // Ask the runtime to grow the DMA buffer if the command does not fit, rather
+    // than truncating (mirrors `dxgkddi_render`).
+    if cmd_len > dma_cap {
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+    if cmd_len > 0 && !args.pCommand.is_null() {
+        // SAFETY: runtime guarantees `CommandLength` readable bytes at `pCommand`
+        // and `DmaSize` (>= cmd_len) writable bytes at `pDmaBuffer`; distinct buffers.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                args.pCommand as *const u8,
+                args.pDmaBuffer as *mut u8,
+                cmd_len,
+            );
+        }
+    }
+    // Advance the DMA write pointer past the recorded bytes so the runtime sees a
+    // non-empty buffer to submit. No GPU-VA patches → leave pPatchLocationListOut at
+    // its base. Single pass → MultipassOffset 0.
+    // SAFETY: advancing within the `DmaSize`-byte buffer (cmd_len <= dma_cap).
+    args.pDmaBuffer = unsafe { (args.pDmaBuffer as *mut u8).add(cmd_len) as *mut c_void };
+    args.MultipassOffset = 0;
+    STATUS_SUCCESS
+}
+
+/// `DxgkDdiRenderGdi` — GDI hardware-acceleration render path
+/// (`PDXGKDDI_RENDERGDI`, args `DXGKARG_RENDERGDI`). This is a SEPARATE DDI from
+/// `DxgkDdiRender` and `DxgkDdiRenderKm` — and the one dxgkrnl's
+/// `ADAPTER_RENDER::DdiRenderGdi` actually invokes (through a CFG-guarded indirect
+/// call). Leaving the `DxgkDdiRenderGdi` field null (we previously registered only
+/// Render + RenderKm) made that call land on a null pointer and bugcheck
+/// (kernel `0xC0000005`, `DdiRenderGdi+0x140`, observed live). dxgkrnl drives it
+/// once we declare `CrossAdapterResource` together with the (mandatory-for-load)
+/// `SupportKernelModeCommandBuffer` cap: GDI rendering to the cross-adapter
+/// composition surface arrives here as `DXGK_RENDERKM_COMMAND` ops in `pCommand`.
+///
+/// Decorative-GpuMmu model (host GPU owns real rendering by resource id): record the
+/// opaque command bytes into the DMA buffer (so `DxgkDdiSubmitCommand` has a
+/// non-empty buffer to retire), advance the DMA write pointer, single pass, no
+/// GPU-VA patches → return SUCCESS. Same shape as `dxgkddi_render_km`.
+pub unsafe extern "C" fn dxgkddi_render_gdi(
+    h_context: IN_CONST_HANDLE,
+    render_gdi: INOUT_PDXGKARG_RENDERGDI,
+) -> NTSTATUS {
+    RENDER_COUNT.fetch_add(1, Ordering::Relaxed);
+    if render_gdi.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let args = unsafe { &mut *render_gdi };
+    if args.pDmaBuffer.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    // Execute the raster ops on the CPU against the surfaces' host-visible venus
+    // blob memory (see `gdi_blit`) — the null engine will retire the recorded DMA
+    // below without running anything, so this is where the pixels actually land.
+    if !h_context.is_null() {
+        // SAFETY: h_context is the ContextContext we returned from CreateContext;
+        // its device/adapter back-pointers are valid for the context's lifetime.
+        // DxgkDdiRenderGdi runs at PASSIVE_LEVEL per its DDI annotation.
+        let ctx = unsafe { &*(h_context as *const crate::device::ContextContext) };
+        if !ctx.device.is_null() {
+            let dev = unsafe { &*ctx.device };
+            if !dev.adapter.is_null() {
+                let adapter = unsafe { &*dev.adapter };
+                unsafe { gdi_blit::execute(adapter, args) };
+            }
+        }
+    }
+    let cmd_len = args.CommandLength as usize;
+    let dma_cap = args.DmaSize as usize;
+    if cmd_len > dma_cap {
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+    if cmd_len > 0 && !args.pCommand.is_null() {
+        // SAFETY: runtime guarantees CommandLength readable bytes at pCommand and
+        // DmaSize (>= cmd_len) writable bytes at pDmaBuffer; distinct buffers.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                args.pCommand as *const u8,
+                args.pDmaBuffer as *mut u8,
+                cmd_len,
+            );
+        }
+    }
+    // SAFETY: advancing within the DmaSize-byte buffer (cmd_len <= dma_cap).
+    args.pDmaBuffer = unsafe { (args.pDmaBuffer as *mut u8).add(cmd_len) as *mut c_void };
+    args.MultipassOffset = 0;
+    STATUS_SUCCESS
 }
 
 /// `DxgkDdiPatch` — patch allocation references in a DMA buffer.
@@ -300,9 +533,72 @@ pub unsafe extern "C" fn dxgkddi_query_current_fence(
 }
 
 /// `DxgkDdiCollectDbgInfo` — dump driver debug state on a TDR/bugcheck.
+///
+/// Contract notes (this fires DURING TDR dump collection, possibly at
+/// HIGH_LEVEL during a bugcheck, so returning STATUS_NOT_IMPLEMENTED here
+/// marked the driver as misbehaving in the 2026-07-02 ETW capture):
+/// - May be called at any IRQL; must not block, allocate, take locks, or touch
+///   pageable code/data. Only the DISPATCH-safe atomics are read.
+/// - The OS-provided buffer must be written in full (unused tail zeroed).
 pub unsafe extern "C" fn dxgkddi_collect_dbg_info(
-    _h_adapter: IN_CONST_HANDLE,
-    _collect_dbg_info: IN_CONST_PDXGKARG_COLLECTDBGINFO,
+    h_adapter: IN_CONST_HANDLE,
+    collect_dbg_info: IN_CONST_PDXGKARG_COLLECTDBGINFO,
 ) -> NTSTATUS {
-    STATUS_NOT_IMPLEMENTED
+    if collect_dbg_info.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    // SAFETY: dxgkrnl guarantees the argument struct is valid for the call.
+    let args = unsafe { &*collect_dbg_info };
+    if args.pBuffer.is_null() || args.BufferSize == 0 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let buf_len = args.BufferSize as usize;
+
+    // SAFETY: dxgkrnl guarantees BufferSize writable non-paged bytes at
+    // pBuffer for the duration of the call. Zero the whole buffer first so
+    // the report is fully written regardless of how much we fill.
+    unsafe {
+        core::ptr::write_bytes(args.pBuffer as *mut u8, 0, buf_len);
+    }
+
+    // Fixed-shape DWORD report: magic + version + reason + engine counters.
+    // Decoded offline from the TDR minidump's driver-private section.
+    let last_fence = if h_adapter.is_null() {
+        0
+    } else {
+        // SAFETY: dxgkrnl passes the adapter context handle it got from
+        // DxgkDdiAddDevice; valid for the adapter's lifetime. Atomic load only.
+        let adapter = unsafe { &*(h_adapter as *const AdapterContext) };
+        adapter.last_completed_fence.load(Ordering::Relaxed) as u32
+    };
+    let report: [u32; 13] = [
+        0x4844_4247, // 'HDBG'
+        1,           // report version
+        args.Reason,
+        SUBMIT_COUNT.load(Ordering::Relaxed),
+        SUBMIT_LAST_FENCE.load(Ordering::Relaxed),
+        SUBMIT_PAGING_COUNT.load(Ordering::Relaxed),
+        RENDER_COUNT.load(Ordering::Relaxed),
+        PATCH_COUNT.load(Ordering::Relaxed),
+        PREEMPT_COUNT.load(Ordering::Relaxed),
+        DMA_NOTIFY_COUNT.load(Ordering::Relaxed),
+        DMA_QUEUE_DPC_COUNT.load(Ordering::Relaxed),
+        last_fence,
+        // Nonzero = the virtio control queue timed out and the transport is
+        // poisoned (host stopped answering) — the likely reason for the TDR
+        // this dump belongs to.
+        crate::virtio::gpu::CTRL_TIMEOUT_COUNT.load(Ordering::Relaxed),
+    ];
+    let report_bytes = size_of::<[u32; 13]>();
+    let copy_len = core::cmp::min(report_bytes, buf_len);
+    // SAFETY: copy_len <= BufferSize (writable, checked above) and
+    // copy_len <= size_of report (readable local array).
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            report.as_ptr() as *const u8,
+            args.pBuffer as *mut u8,
+            copy_len,
+        );
+    }
+    STATUS_SUCCESS
 }

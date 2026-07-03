@@ -43,6 +43,10 @@ pub unsafe extern "C" fn dxgkddi_start_device(
     adapter.dxgkrnl = Some(unsafe { *dxgkrnl_interface });
     crate::diag::record(0x0B00_0002);
 
+    if adapter.paging_ram.is_none() {
+        adapter.paging_ram = AdapterContext::alloc_paging_ram();
+    }
+
     // ── Phase 2: bring up the virtio-gpu transport ──────────────────────────
     // VirtioGpu::init reads PCI config + maps BARs through the Dxgkrnl callbacks
     // (DxgkConfigAccess / WdkHal) and discovers the virtio device.
@@ -86,7 +90,7 @@ pub unsafe extern "C" fn dxgkddi_start_device(
             if !VENUS_ALLOC_ENABLED {
                 // venus page-table allocation disabled — boot-safe build.
                 adapter.venus_ctx_id = 0;
-                adapter.venus_client = None;
+                adapter.set_venus_client(None);
                 adapter.page_table_window = None;
             } else {
                 let venus_result = unsafe {
@@ -103,7 +107,7 @@ pub unsafe extern "C" fn dxgkddi_start_device(
                     Ok(Ok((ctx_id, client, blob))) => {
                         crate::diag::record(0x0B00_0007);
                         adapter.venus_ctx_id = ctx_id;
-                        adapter.venus_client = Some(client);
+                        adapter.set_venus_client(Some(client));
                         adapter.page_table_window = Some((blob.gpa, blob.size));
                     }
                     Ok(Err(e)) => {
@@ -112,14 +116,14 @@ pub unsafe extern "C" fn dxgkddi_start_device(
                         crate::diag::record(0x0B00_00E7);
                         crate::diag::record(status as u32);
                         adapter.venus_ctx_id = 0;
-                        adapter.venus_client = None;
+                        adapter.set_venus_client(None);
                         adapter.page_table_window = None;
                     }
                     Err(_) => {
                         // Transport not up (should not happen — we just set it).
                         crate::diag::record(0x0B00_00E8);
                         adapter.venus_ctx_id = 0;
-                        adapter.venus_client = None;
+                        adapter.set_venus_client(None);
                         adapter.page_table_window = None;
                     }
                 }
@@ -163,7 +167,7 @@ pub unsafe extern "C" fn dxgkddi_stop_device(miniport_device_context: *mut c_voi
         // the transport (the unref/detach/destroy commands need the live device).
         // Drop the client first to unmap its ring/reply BAR kernel mappings.
         let venus_ctx = adapter.venus_ctx_id;
-        adapter.venus_client = None; // Drop → MmUnmapIoSpace ring + reply mappings.
+        adapter.set_venus_client(None); // Drop → MmUnmapIoSpace ring + reply mappings.
         adapter.page_table_window = None;
         adapter.venus_ctx_id = 0;
         if venus_ctx != 0 {
@@ -198,20 +202,24 @@ pub unsafe extern "C" fn dxgkddi_remove_device(miniport_device_context: *mut c_v
 /// adapter.
 pub unsafe extern "C" fn dxgkddi_dispatch_io_request(
     _miniport_device_context: *mut c_void,
-    _vidpn_source_id: u32,
+    vidpn_source_id: u32,
     _video_request_packet: PVIDEO_REQUEST_PACKET,
 ) -> NTSTATUS {
-    STATUS_NOT_IMPLEMENTED
+    crate::diag::record(0x0A10_0000 | (vidpn_source_id & 0xFFFF));
+    STATUS_SUCCESS
 }
 
 /// `DxgkDdiSetPowerState` — accept power transitions (nothing device-specific to
 /// do yet).
 pub unsafe extern "C" fn dxgkddi_set_power_state(
     _miniport_device_context: *mut c_void,
-    _device_uid: u32,
-    _device_power_state: DEVICE_POWER_STATE,
-    _action_type: POWER_ACTION::Type,
+    device_uid: u32,
+    device_power_state: DEVICE_POWER_STATE,
+    action_type: POWER_ACTION::Type,
 ) -> NTSTATUS {
+    crate::diag::record(0x0A11_0000 | (device_uid & 0xFFFF));
+    crate::diag::record(0x0A12_0000 | ((device_power_state as u32) & 0xFFFF));
+    crate::diag::record(0x0A13_0000 | ((action_type as u32) & 0xFFFF));
     STATUS_SUCCESS
 }
 
@@ -219,8 +227,10 @@ pub unsafe extern "C" fn dxgkddi_set_power_state(
 pub unsafe extern "C" fn dxgkddi_query_child_relations(
     _miniport_device_context: *mut c_void,
     _child_relations: *mut DXGK_CHILD_DESCRIPTOR,
-    _child_relations_size: u32,
+    child_relations_size: u32,
 ) -> NTSTATUS {
+    crate::diag::record(0x1200_0001);
+    crate::diag::record(0x1201_0000 | (child_relations_size & 0xFFFF));
     // No connectors/monitors → leave the (already-zeroed) array untouched.
     STATUS_SUCCESS
 }
@@ -228,18 +238,25 @@ pub unsafe extern "C" fn dxgkddi_query_child_relations(
 /// `DxgkDdiQueryChildStatus` — no children to report status for.
 pub unsafe extern "C" fn dxgkddi_query_child_status(
     _miniport_device_context: *mut c_void,
-    _child_status: *mut DXGK_CHILD_STATUS,
-    _non_destructive_only: BOOLEAN,
+    child_status: *mut DXGK_CHILD_STATUS,
+    non_destructive_only: BOOLEAN,
 ) -> NTSTATUS {
+    crate::diag::record(0x1200_0002);
+    if !child_status.is_null() {
+        crate::diag::record(0x1202_0000 | unsafe { (*child_status).ChildUid & 0xFFFF });
+    }
+    crate::diag::record(0x1203_0000 | ((non_destructive_only as u32) & 0xFFFF));
     STATUS_SUCCESS
 }
 
 /// `DxgkDdiQueryDeviceDescriptor` — no child descriptors (no EDID/monitor).
 pub unsafe extern "C" fn dxgkddi_query_device_descriptor(
     _miniport_device_context: *mut c_void,
-    _child_uid: u32,
+    child_uid: u32,
     _device_descriptor: *mut DXGK_DEVICE_DESCRIPTOR,
 ) -> NTSTATUS {
+    crate::diag::record(0x1200_0003);
+    crate::diag::record(0x1204_0000 | (child_uid & 0xFFFF));
     STATUS_NOT_SUPPORTED
 }
 
@@ -294,10 +311,15 @@ pub unsafe extern "C" fn dxgkddi_reset_device(_miniport_device_context: IN_CONST
 /// `DxgkDdiNotifyAcpiEvent` — handle a platform ACPI event. We service none.
 pub unsafe extern "C" fn dxgkddi_notify_acpi_event(
     _miniport_device_context: IN_CONST_PVOID,
-    _event_type: IN_DXGK_EVENT_TYPE,
-    _event: IN_ULONG,
+    event_type: IN_DXGK_EVENT_TYPE,
+    event: IN_ULONG,
     _argument: IN_PVOID,
-    _acpi_flags: OUT_PULONG,
+    acpi_flags: OUT_PULONG,
 ) -> NTSTATUS {
-    STATUS_NOT_IMPLEMENTED
+    crate::diag::record(0x0A14_0000 | ((event_type as u32) & 0xFFFF));
+    crate::diag::record(0x0A15_0000 | (event & 0xFFFF));
+    if !acpi_flags.is_null() {
+        unsafe { *acpi_flags = 0 };
+    }
+    STATUS_SUCCESS
 }

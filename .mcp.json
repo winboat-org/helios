@@ -5,6 +5,10 @@
       "command": "/home/rupansh/helios-vgpu/target/linux/release/win-mcp",
       "args": [],
       "env": {}
+    },
+    "ntoseye": {
+      "type": "http",
+      "url": "http://localhost:8080/mcp"
     }
   }
 }

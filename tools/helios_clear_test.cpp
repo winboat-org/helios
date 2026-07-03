@@ -25,22 +25,27 @@ int main() {
   if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory), (void**)&factory))) {
     printf("CreateDXGIFactory1 failed\n"); return 1;
   }
-  IDXGIAdapter* adapter = nullptr;
-  IDXGIAdapter* helios = nullptr;
-  for (UINT i = 0; factory->EnumAdapters(i, &adapter) != DXGI_ERROR_NOT_FOUND; i++) {
-    DXGI_ADAPTER_DESC d; adapter->GetDesc(&d);
-    if (d.VendorId == 0x1af4) { helios = adapter; break; }
-    adapter->Release();
-  }
-  if (!helios) { printf("Helios adapter (0x1af4) not found\n"); return 1; }
-
+  // Multiple Helios instances can be enumerated (the raw adapter plus one or
+  // more indirect-display pairing instances, some stale) — try each until a
+  // device creates.
   D3D_FEATURE_LEVEL got = {};
   ID3D11Device* dev = nullptr; ID3D11DeviceContext* ctx = nullptr;
-  D3D_FEATURE_LEVEL want[] = { D3D_FEATURE_LEVEL_11_0 };
-  HRESULT hr = D3D11CreateDevice(helios, D3D_DRIVER_TYPE_UNKNOWN, nullptr, 0,
-      want, 1, D3D11_SDK_VERSION, &dev, &got, &ctx);
-  printf("D3D11CreateDevice hr=0x%08x fl=%s dev=%p\n", hr, fl_name(got), (void*)dev);
-  if (FAILED(hr)) return 2;
+  D3D_FEATURE_LEVEL want[] = { D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1,
+                               D3D_FEATURE_LEVEL_10_0 };
+  HRESULT hr = E_FAIL;
+  IDXGIAdapter* adapter = nullptr;
+  for (UINT i = 0; factory->EnumAdapters(i, &adapter) != DXGI_ERROR_NOT_FOUND; i++) {
+    DXGI_ADAPTER_DESC d; adapter->GetDesc(&d);
+    if (d.VendorId != 0x1af4) { adapter->Release(); continue; }
+    hr = D3D11CreateDevice(adapter, D3D_DRIVER_TYPE_UNKNOWN, nullptr, 0,
+        want, 3, D3D11_SDK_VERSION, &dev, &got, &ctx);
+    printf("D3D11CreateDevice[adapter %u luid %08x:%08x] hr=0x%08x fl=%s dev=%p\n",
+        i, (unsigned)d.AdapterLuid.HighPart, (unsigned)d.AdapterLuid.LowPart,
+        hr, fl_name(got), (void*)dev);
+    adapter->Release();
+    if (SUCCEEDED(hr)) break;
+  }
+  if (FAILED(hr)) { printf("no Helios adapter creates a device\n"); return 2; }
 
   // Render-target texture.
   D3D11_TEXTURE2D_DESC rtd = {};

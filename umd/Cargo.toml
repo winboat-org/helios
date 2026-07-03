@@ -9,6 +9,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 cxx = "1"
+helios_protocol = { path = "../protocol" }
 windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_Graphics_Direct3D",

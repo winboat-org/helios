@@ -95,6 +95,12 @@ sudo make install
 
 ### 1.4 QEMU Launch Command for Development
 
+**Operational rule:** if you change the standalone VM launch command, launcher script, QEMU display/debug
+transport, or any environment variable needed by `tools/launch-helios-gtk.sh`, do not try to start the VM
+yourself unless the user explicitly asks in that same turn. Tell the user exactly what changed and ask them to
+run the VM. This matters because the launcher often needs the user's desktop session, sudo credentials, GPU
+environment, and active display state.
+
 ```bash
 #!/bin/bash
 # launch-vm.sh — launch the Windows 11 target VM
@@ -404,6 +410,11 @@ Get-WinEvent -LogName System | Where-Object {$_.ProviderName -eq "helios_kmd"} |
 
 ### WinDbg Kernel Debugging (Host ↔ Target VM)
 
+The same launch-command rule applies to kernel debugging. If adding or changing a KD transport requires a QEMU
+argument or `tools/launch-helios-gtk.sh` environment change, document the exact command and
+ask the user to run/restart the VM. Configure guest BCD and build tools from automation, but leave VM launch to
+the user after launch-command changes.
+
 On the target VM:
 ```powershell
 bcdedit /debug on
@@ -439,9 +450,8 @@ unsafe { KdPrint!("Helios: adapter started\n\0"); }
 
 ### virglrenderer Logging (Host Side)
 
-> ⚠️ **`VIRGL_DEBUG` does NOT produce readable logs** in the libvirt
-> `qemu:///system` + venus render-server setup (user-confirmed 2026-06-06): venus
-> runs in the `virgl_render_server` child whose stderr isn't captured. See HOST.md
+> ⚠️ **`VIRGL_DEBUG` does NOT reliably produce readable logs** with the venus render-server:
+> venus runs in the `virgl_render_server` child whose stderr may not be captured. See HOST.md
 > §5.1. Use QEMU `-d guest_errors` for `RESP_ERR_*`; for venus traces, capture the
 > render-server child's stderr directly or build virglrenderer with logging.
 

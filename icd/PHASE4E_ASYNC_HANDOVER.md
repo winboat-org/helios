@@ -23,7 +23,7 @@ in `HKLM\SOFTWARE\Khronos\Vulkan\Drivers` (REG_DWORD = abs path to
 session makes the loader ignore VK_DRIVER_FILES → must use the registry). mingw bin (for the ICD's
 libwinpthread + to build test EXEs):
 `C:\Users\Rupansh\AppData\Local\Microsoft\WinGet\Packages\BrechtSanders.WinLibs.POSIX.UCRT_*\mingw64\bin`.
-Host = Arch, no sudo for you — ask the user for `/var/log/libvirt/qemu/win11.log`. A working venus
+Host = Arch, no sudo for you — ask the user for host-side QEMU/render-server logs when needed. A working venus
 reference guest: `ssh ubuntu@localhost -p 2222`. virgl/qemu sources at `/tmp/virgl-src`, `/tmp/qemu-virgl.c`.
 
 **Test gate:** `C:\Users\Rupansh\helios_vk_exec.exe` → `vkQueueWaitIdle => 0 OK` (today it's `-13`

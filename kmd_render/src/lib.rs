@@ -79,10 +79,26 @@ fn build_ddi_table() -> DRIVER_INITIALIZATION_DATA {
     // registered"; we then fill in the callbacks we support.
     let mut data: DRIVER_INITIALIZATION_DATA = unsafe { core::mem::zeroed() };
 
-    // WDK 10.0.26100 declares this as the native WDDM 3.2 DDI interface. The
-    // callback table is still incomplete; unsupported paths fail honestly until
-    // their implementations land.
-    data.Version = DXGKDDI_INTERFACE_VERSION;
+    // Advertise the interface level that matches the implemented table. The WDK
+    // 10.0.26100 `DXGKDDI_INTERFACE_VERSION` macro is WDDM 3.2; exposing that
+    // while most WDDM 2.x/3.x-only callback blocks are null can pass
+    // DxgkInitialize and still fail the adapter bring-up path before StartDevice.
+    //
+    // Helios followed the viogpu3d-style WDDM 1.3 render/display miniport shape
+    // during bring-up. The WDDM-sync-redesign M1 raises it to a coherent WDDM 3.2 +
+    // GpuMmu surface (gated by `RAISE_WDDM_3_2_GPUMMU`) so the OS enables monitored
+    // fences. The interface version is the primary lever (the OS infers the WDDM
+    // level from it + the advertised caps); it is bumped together with the matching
+    // `DXGK_DRIVERCAPS.WDDMVersion`, the GpuMmu `MemoryManagementCaps` bits, and
+    // `GetNodeMetadata.GpuMmuSupported` in `query_adapter_info.rs`. WDDM 3.2 (not
+    // 2.0) is the target: a 2.0 adapter was previously rejected as too old for the
+    // 24H2 user-mode driver (STATUS_REVISION_MISMATCH), and the struct ABI we
+    // bindgen is already the 26100/WDDM-3.2 shape.
+    data.Version = if crate::ddi::query_adapter_info::RAISE_WDDM_3_2_GPUMMU {
+        DXGKDDI_INTERFACE_VERSION_WDDM3_2
+    } else {
+        DXGKDDI_INTERFACE_VERSION_WDDM1_3
+    };
 
     // ── PnP / power lifecycle (Phase 1, real) ──────────────────────────────
     data.DxgkDdiAddDevice = Some(ddi::dxgkddi_add_device);
@@ -182,6 +198,7 @@ fn build_ddi_table() -> DRIVER_INITIALIZATION_DATA {
     // implemented and advertised.
     data.DxgkDdiRender = Some(ddi::dxgkddi_render);
     data.DxgkDdiRenderKm = Some(ddi::dxgkddi_render_km);
+    data.DxgkDdiRenderGdi = Some(ddi::dxgkddi_render_gdi);
     data.DxgkDdiPatch = Some(ddi::dxgkddi_patch);
     data.DxgkDdiOpenAllocation = Some(ddi::dxgkddi_open_allocation);
     data.DxgkDdiCloseAllocation = Some(ddi::dxgkddi_close_allocation);

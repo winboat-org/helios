@@ -66,12 +66,14 @@ HELIOS_LG_DISPLAY_SERVER=wayland
 HELIOS_LG_RENDERER=EGL
 ```
 
-This is the correctness baseline. With the NVIDIA host renderer as Venus GPU0, Doom 2016 produced black/white
-frames and the Linux host desktop could show framebuffer corruption or freeze. With Intel as Venus GPU0, Doom
-launches and plays, including a normal Steam launch. This does not require the Looking Glass client itself to use
-Intel; the client can stay on the default host GPU for viewer-side EGL compositing. The Intel Venus path is slower
-(observed below 20 fps in Doom), so performance work should first measure the Intel baseline and then either
-optimize it or re-enable NVIDIA for QEMU/Venus only after the host-renderer corruption is understood.
+Intel is the launcher default and a known-good baseline. The NVIDIA host-renderer corruption that originally
+motivated this default — Doom 2016 black/white frames plus possible Linux host framebuffer corruption or freeze —
+was root-caused (guest Venus external-memory bind UB + host-visible cache-coherency) and fixed in `icd/mesa`, and
+the Xid 13 FECS host freeze is fixed (2026-06-18); NVIDIA now renders the full Venus path correctly and is the
+faster option. With Intel as Venus GPU0, Doom launches and plays, including a normal Steam launch. This does not
+require the Looking Glass client itself to use Intel; the client can stay on the default host GPU for viewer-side
+EGL compositing. The Intel Venus path is slower (observed below 20 fps in Doom), so for performance prefer the
+NVIDIA Venus path now that the corruption/freeze is fixed.
 
 For Doom/Venus performance captures, run the diagnostic launcher from the Windows desktop session:
 
@@ -89,17 +91,19 @@ The direct KVMFR producer path was removed on 2026-06-17. Mesa WSI no longer tal
 DIB-shadow + `BitBlt` Win32 present feeding the standard Looking Glass IDD capture queue. Testing showed the real
 bottleneck was cache coherency when GDI read Venus-mapped BAR memory directly, not GDI/BitBlt itself.
 
-The NVIDIA path remains available for controlled testing only. Use the explicit `nvidia` mode rather than the vague
-host `default` mode; the launcher checks `nvidia-smi` first and forces the NVIDIA GLVND/EGL environment for QEMU:
+The NVIDIA path is a fully supported Venus render target (the FECS host freeze that previously made it testing-only
+was fixed 2026-06-18); Intel stays the launcher default purely as a config choice. Use the explicit `nvidia` mode
+rather than the vague host `default` mode; the launcher checks `nvidia-smi` first and forces the NVIDIA GLVND/EGL
+environment for QEMU:
 
 ```text
 HELIOS_QEMU_RENDER_GPU=nvidia \
   HELIOS_DISPLAY=looking-glass ./tools/launch-helios-gtk.sh
 ```
 
-If the NVIDIA kernel module reports NVRM register-read errors or `nvidia-smi` cannot talk to the driver after a run,
-the host driver is wedged below QEMU/virglrenderer. Reboot or reload the NVIDIA driver before collecting further
-Venus data; guest Helios IOCTL timings are not meaningful for that failure mode.
+In the rare event the NVIDIA kernel module reports NVRM register-read errors or `nvidia-smi` cannot talk to the
+driver after a run, the host driver is wedged below QEMU/virglrenderer. Reboot or reload the NVIDIA driver before
+collecting further Venus data; guest Helios IOCTL timings are not meaningful for that failure mode.
 
 Looking Glass KVMFR defaults to 512 MiB for the normal desktop stream. The host `/dev/kvmfr0` backing device must be
 created at the same size, or the launcher must be overridden with `HELIOS_KVMFR_SIZE`.

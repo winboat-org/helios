@@ -464,9 +464,12 @@ Recent caveats:
   `/tmp/helios-qemu-stderr.log` by the launcher). Doom 2016 now renders correctly at 120+ fps on the NVIDIA host.
   Known accepted residue: a LINEAR+PREINITIALIZED app image (e.g. vkcube's staging texture) legally cannot carry
   external info (VUID 01443) and keeps the upstream bind mismatch.
-- The Xid 13 "Graphics FECS Exception: UCODE Fatal Error" host freeze is a known unrecoverable NVIDIA Blackwell
-  GB202 firmware defect (open-gpu-kernel-modules#1080: GSP halts by design on a detected ctx-switch hang); never
-  leave a broken-rendering run sitting, and keep the host compositor on the Intel iGPU during NVIDIA experiments.
+- **The Xid 13 "Graphics FECS Exception: UCODE Fatal Error" host freeze is fixed (2026-06-18, by codex).** It was
+  not a standing defect to design around: the freeze was tripped by the guest Venus external-memory bind UB +
+  host-visible cache-coherency bugs above (open-gpu-kernel-modules#1080 documents the GB202 GSP halt that the
+  mis-issued work used to trigger). With those fixed in `icd/mesa`, NVIDIA runs the full Venus path without the FECS
+  freeze. The earlier guidance — "never leave a broken-rendering run sitting" and keeping the host compositor on the
+  Intel iGPU during NVIDIA runs — is now precautionary only, not a hard requirement.
 
 ### Performance improvement candidates (2026-06-10, NVIDIA baseline 120+ fps)
 
@@ -493,8 +496,8 @@ Ordered by expected payoff; measure with `HELIOS_PERF=1` + `HELIOS_WSI_PERF=1` b
    allocations (alignment padding showed up in vkr's opaque-fd path), a refinement is injecting only for buffers
    whose usage can plausibly bind host-visible memory. Only worth doing if profiling shows it.
 7. **Default render node.** The launcher still defaults QEMU/Venus to Intel (`HELIOS_QEMU_RENDER_GPU=intel`,
-   40–45 fps). After a stability soak on NVIDIA (multiple late-uptime sessions without Xid), flipping the default
-   is a free 3x.
+   40–45 fps). With the Xid 13 FECS host freeze fixed (2026-06-18), NVIDIA no longer needs a stability soak before
+   being trusted — flipping the default to NVIDIA is a free ~3x whenever desired.
 - WDDM/DXGI remains a possible future escape hatch, not the next default step. It would require a real WDDM render
   adapter path rather than only the current System-class DeviceIoControl KMD, and it would not by itself implement
   D3D12. Optimize and measure the current Venus path first.

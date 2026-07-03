@@ -26,6 +26,36 @@ struct HeliosDxvkDevice {
   // Raw ID3D11Device* / ID3D11DeviceContext* (as size_t) for the DDI forwarders.
   std::size_t d3d11_device_ptr() const;
   std::size_t d3d11_context_ptr() const;
+  std::uint32_t venus_context_id() const;
+  bool set_resource_kmt_handles(
+      std::size_t d3d11_resource_ptr,
+      std::uint32_t local,
+      std::uint32_t global) const;
+  bool get_resource_memory_info(
+      std::size_t d3d11_resource_ptr,
+      std::uint64_t* memory,
+      std::uint64_t* size,
+      std::uint64_t* offset,
+      std::uint32_t* resource_id) const;
+  bool transfer_resource_ownership(std::size_t d3d11_resource_ptr) const;
+  std::size_t open_ddi_texture2d(
+      std::uint32_t width,
+      std::uint32_t height,
+      std::uint32_t format,
+      std::uint32_t bind_flags,
+      std::uint32_t misc_flags,
+      std::uint32_t global,
+      std::uint32_t renderer_resource_id) const;
+
+  // Shader creation wrappers. DXVK may throw dxvk::DxvkError while compiling
+  // shader modules; these methods catch it and return 0 so exceptions never
+  // cross the D3D UMD ABI.
+  std::size_t create_vertex_shader(const std::uint8_t* code, std::size_t len) const;
+  std::size_t create_pixel_shader(const std::uint8_t* code, std::size_t len) const;
+  std::size_t create_geometry_shader(const std::uint8_t* code, std::size_t len) const;
+  std::size_t create_hull_shader(const std::uint8_t* code, std::size_t len) const;
+  std::size_t create_domain_shader(const std::uint8_t* code, std::size_t len) const;
+  std::size_t create_compute_shader(const std::uint8_t* code, std::size_t len) const;
 };
 
 // Create a DXVK instance + logical device on the Helios venus adapter.

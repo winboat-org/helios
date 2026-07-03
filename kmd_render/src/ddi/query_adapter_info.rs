@@ -8,7 +8,7 @@
 //! Reference: https://learn.microsoft.com/windows-hardware/drivers/ddi/d3dkmddi/nc-d3dkmddi-dxgkddi_queryadapterinfo
 
 use core::ffi::c_void;
-use core::mem::size_of;
+use core::mem::{offset_of, size_of};
 
 use crate::dxgk::_D3DKMDT_COMPUTE_PREEMPTION_GRANULARITY::D3DKMDT_COMPUTE_PREEMPTION_DMA_BUFFER_BOUNDARY;
 use crate::dxgk::_D3DKMDT_GRAPHICS_PREEMPTION_GRANULARITY::D3DKMDT_GRAPHICS_PREEMPTION_DMA_BUFFER_BOUNDARY;
@@ -17,9 +17,10 @@ use crate::dxgk::_DXGK_QUERYADAPTERINFOTYPE::{
     DXGKQAITYPE_DRIVERCAPS, DXGKQAITYPE_GPUMMUCAPS, DXGKQAITYPE_GPUVERSION,
     DXGKQAITYPE_HARDWARERESERVEDRANGES2, DXGKQAITYPE_HISTORYBUFFERPRECISION,
     DXGKQAITYPE_IOMMU_CAPS, DXGKQAITYPE_PAGETABLELEVELDESC, DXGKQAITYPE_PHYSICAL_MEMORY_CAPS,
-    DXGKQAITYPE_QUERYSEGMENT4, DXGKQAITYPE_WDDMDEVICECAPS,
+    DXGKQAITYPE_QUERYSEGMENT, DXGKQAITYPE_QUERYSEGMENT3, DXGKQAITYPE_QUERYSEGMENT4,
+    DXGKQAITYPE_WDDMDEVICECAPS,
 };
-use crate::dxgk::_DXGK_WDDMVERSION::DXGKDDI_WDDMv3_2;
+use crate::dxgk::_DXGK_WDDMVERSION::{DXGKDDI_WDDMv1_3, DXGKDDI_WDDMv3_2};
 use crate::dxgk::*;
 
 use crate::adapter::AdapterContext;
@@ -51,6 +52,8 @@ pub unsafe extern "C" fn dxgkddi_query_adapter_info(
 
     match args.Type {
         DXGKQAITYPE_DRIVERCAPS => unsafe { query_driver_caps(args) },
+        DXGKQAITYPE_QUERYSEGMENT => unsafe { query_segments_legacy(args) },
+        DXGKQAITYPE_QUERYSEGMENT3 => unsafe { query_segments3(args) },
         DXGKQAITYPE_QUERYSEGMENT4 => unsafe { query_segments(adapter, args) },
         DXGKQAITYPE_GPUMMUCAPS => unsafe { gpummu::fill_gpummu_caps(args) },
         DXGKQAITYPE_PAGETABLELEVELDESC => unsafe {
@@ -76,8 +79,13 @@ pub unsafe extern "C" fn dxgkddi_query_adapter_info(
         // steady-state-polls NODEPERFDATA (0x18) and ADAPTERPERFDATA (0x19) to
         // feed the Task Manager GPU tab; virtio-gpu exposes no such telemetry, so
         // NOT_SUPPORTED is the honest answer here — an expected poll, not a gap.
-        // PHYSICALADAPTERCAPS (0x0F) is also deferred: its DxgkPhysicalAdapterHandle
-        // / Flags contract is undefined for us until we have real execution nodes.
+        // PHYSICALADAPTERCAPS (0x0F) stays rejected: answering it (2026-06-22 test)
+        // pulls dxgmms2 into per-physical-adapter / per-execution-node setup that
+        // dereferences a null node structure our null engine never provides
+        // (bugcheck 0x3B SYSTEM_SERVICE_EXCEPTION, AV on null-base+0x210 in
+        // dxgmms2+0x9775d). viogpu3d also leaves it unimplemented. So its contract
+        // remains undefined for us until we have real execution nodes; D3D11's
+        // device-create rejection is NOT this query (DXGI tolerates the rejection).
         other => {
             // DIAG: which type we rejected (suspect if AddAdapter dies right after).
             // Same perf-poll gate as the entry log — 0x18/0x19 flood the ring.
@@ -90,12 +98,18 @@ pub unsafe extern "C" fn dxgkddi_query_adapter_info(
 }
 
 unsafe fn query_driver_caps(args: &DXGKARG_QUERYADAPTERINFO) -> NTSTATUS {
-    if (args.OutputDataSize as usize) < size_of::<DXGK_DRIVERCAPS>() {
+    const REQUIRED_DRIVER_CAPS_SIZE: usize =
+        offset_of!(DXGK_DRIVERCAPS, SupportDirectFlip) + size_of::<BOOLEAN>();
+
+    crate::diag::record(0x01CF_0000 | (args.OutputDataSize & 0xFFFF));
+    if (args.OutputDataSize as usize) < REQUIRED_DRIVER_CAPS_SIZE {
+        crate::diag::record(0x02CF_0000 | ((REQUIRED_DRIVER_CAPS_SIZE as u32) & 0xFFFF));
         return STATUS_BUFFER_TOO_SMALL;
     }
-    // SAFETY: pOutputData points to a DXGK_DRIVERCAPS of sufficient size.
+    // SAFETY: pOutputData points to a versioned DXGK_DRIVERCAPS buffer large
+    // enough for every field this WDDM 1.3 caps surface writes.
     let caps = unsafe { &mut *(args.pOutputData as *mut DXGK_DRIVERCAPS) };
-    unsafe { core::ptr::write_bytes(caps as *mut _ as *mut u8, 0, size_of::<DXGK_DRIVERCAPS>()) };
+    unsafe { core::ptr::write_bytes(args.pOutputData as *mut u8, 0, args.OutputDataSize as usize) };
 
     // 64-bit addressable; no render/memory features are advertised here yet.
     caps.HighestAcceptableAddress.QuadPart = -1;
@@ -107,7 +121,11 @@ unsafe fn query_driver_caps(args: &DXGKARG_QUERYADAPTERINFO) -> NTSTATUS {
     // Keep this in sync with DXGKQAITYPE_WDDMDEVICECAPS and DriverEntry's
     // DRIVER_INITIALIZATION_DATA.Version. Dxgkrnl rejects internally
     // inconsistent version/capability surfaces during AddAdapter.
-    caps.WDDMVersion = DXGKDDI_WDDMv3_2;
+    caps.WDDMVersion = if RAISE_WDDM_3_2_GPUMMU {
+        DXGKDDI_WDDMv3_2
+    } else {
+        DXGKDDI_WDDMv1_3
+    };
     caps.PreemptionCaps.GraphicsPreemptionGranularity =
         D3DKMDT_GRAPHICS_PREEMPTION_DMA_BUFFER_BOUNDARY;
     caps.PreemptionCaps.ComputePreemptionGranularity =
@@ -139,39 +157,88 @@ unsafe fn query_driver_caps(args: &DXGKARG_QUERYADAPTERINFO) -> NTSTATUS {
     // these caps are NOT over-advertised and cannot be honestly dropped; they
     // must be BACKED with real impl (Gate 2/3). Full mandatory set restored below.
     const PRESENTATIONCAPS_SUPPORT_KERNEL_MODE_COMMAND_BUFFER: u32 = 1 << 2;
-    // Avoid dxgkrnl falling back through the CDD shadow-buffer interop path for a
-    // zero-source render adapter. Bit 8 is DriverSupportsCddDwmInterop in the WDK
-    // binding dump.
-    const PRESENTATIONCAPS_DRIVER_SUPPORTS_CDD_DWM_INTEROP: u32 = 1 << 8;
+    // GDI HW-ACCELERATION LEVER (2026-07-02): SupportKernelModeCommandBuffer is the
+    // GDI hardware-acceleration opt-in. With it set, ALL window content (explorer,
+    // shell, LogonUI — everything GDI-drawn) arrives as DXGK_RENDERKM_COMMAND ops in
+    // DxgkDdiRenderGdi, which records-and-discards them (null engine) → every window
+    // surface stays zero → DWM correctly composes a black desktop → black frames in
+    // the IDD/Looking Glass even though clears/readback (helios_clear_test) work.
+    // BISECTED 2026-07-02 (v22.22.34.0): dropping the bit regresses the adapter to
+    // CM_PROB_FAILED_ADD — SupportKernelModeCommandBuffer is LOAD-MANDATORY for this
+    // WDDM 3.2 render adapter shape, same as FlipOnVSyncMmIo. There is no CPU-GDI
+    // fallback to buy; the fix is executing the GDI ops in DxgkDdiRenderGdi
+    // (software blitter over the host-visible blob memory).
+    const ADVERTISE_GDI_HW_ACCELERATION: bool = true;
     const FLIPCAPS_FLIP_ON_VSYNC_MMIO: u32 = 1 << 1;
     const SCHEDULINGCAPS_MULTI_ENGINE_AWARE: u32 = 1 << 0;
     const SCHEDULINGCAPS_PREEMPTION_AWARE: u32 = 1 << 2;
     const MEMORYMANAGEMENTCAPS_SECTION_BACKED_PRIMARY: u32 = 1 << 3;
-    // GpuMmu memory-model opt-in (DXGK_VIDMMCAPS = DRIVERCAPS.MemoryManagementCaps,
-    // bit positions verified against the bindgen dump, WDDM_FAKE_VIDMM_RESEARCH.md
-    // §A1): bit 5 = VirtualAddressingSupported (umbrella "this adapter does WDDM 2.0
-    // GPU virtual addressing"), bit 6 = GpuMmuSupported (selects the GpuMmu model).
-    // Per the research doc these two together are the minimal opt-in. We deliberately
-    // do NOT set IoMmuSupported (bit 7) — no IoMmu path — nor ParavirtualizationSupported
-    // (bit 10): that is a host-KMD GPU-PV contract Helios does not implement, and the
-    // GpuVirtualizationFlags lever was already proven not to govern our path.
+    // Do not set WDDM 2.0+ GPU virtual-addressing/GpuMmu bits while the driver
+    // advertises a WDDM 1.3 interface. The GpuMmu work remains in-tree, but the
+    // public capability surface must stay self-consistent or dxgkrnl can reject
+    // the adapter before StartDevice.
+    // Cross-adapter resource support (DXGK_VIDMMCAPS bit 4, WDDM_FAKE_VIDMM_RESEARCH
+    // §A1). PATH-A LEVER (2026-06-22): the Looking Glass IDD selects Helios as its
+    // render adapter, but the OS builds 0 display paths and never assigns the
+    // indirect monitor a swapchain. WARP — itself a render-ONLY adapter with no
+    // VidPN sources — works in that slot, so the gap is NOT a missing VidPN source;
+    // it is that the IddCx composition swapchain surface is a CROSS-ADAPTER resource
+    // (created as a standard allocation, opened on the render GPU via
+    // GetStandardAllocationDriverData — see
+    // display/rendering-on-a-discrete-gpu-using-cross-adapter-resources.md). An
+    // adapter that does not declare CrossAdapterResource cannot be used as the
+    // cross-adapter render side, so the OS cannot stand up the swapchain → no path.
+    // Declaring it (the user-mode SupportCrossAdapterResource bit derives from this)
+    // lets the OS attempt the cross-adapter composition surface on Helios. Gated so
+    // it is reversible if it destabilizes boot (flip false + redeploy / gpu-gl-out).
+    const MEMORYMANAGEMENTCAPS_CROSS_ADAPTER_RESOURCE: u32 = 1 << 4;
+    // DXGK_VIDMMCAPS bit positions (verified against the generated bitfield order
+    // in dxgk_bindings: bit5 = VirtualAddressingSupported, bit6 = GpuMmuSupported).
+    // The GpuMmu opt-in is the WDDM 2.0+ GPU-virtual-addressing memory model that
+    // gates monitored fences; declared together with the WDDM 3.2 version above and
+    // GetNodeMetadata.GpuMmuSupported below so the cap surface is self-consistent.
     const MEMORYMANAGEMENTCAPS_VIRTUAL_ADDRESSING_SUPPORTED: u32 = 1 << 5;
     const MEMORYMANAGEMENTCAPS_GPU_MMU_SUPPORTED: u32 = 1 << 6;
 
-    caps.PresentationCaps.__bindgen_anon_1.Value =
+    let mut mem_caps = MEMORYMANAGEMENTCAPS_SECTION_BACKED_PRIMARY;
+    if DECLARE_CROSS_ADAPTER_RESOURCE {
+        mem_caps |= MEMORYMANAGEMENTCAPS_CROSS_ADAPTER_RESOURCE;
+    }
+    if RAISE_WDDM_3_2_GPUMMU {
+        mem_caps |= MEMORYMANAGEMENTCAPS_VIRTUAL_ADDRESSING_SUPPORTED
+            | MEMORYMANAGEMENTCAPS_GPU_MMU_SUPPORTED;
+    }
+
+    caps.PresentationCaps.__bindgen_anon_1.Value = if ADVERTISE_GDI_HW_ACCELERATION {
         PRESENTATIONCAPS_SUPPORT_KERNEL_MODE_COMMAND_BUFFER
-            | PRESENTATIONCAPS_DRIVER_SUPPORTS_CDD_DWM_INTEROP;
+    } else {
+        0
+    };
     caps.FlipCaps.__bindgen_anon_1.Value = FLIPCAPS_FLIP_ON_VSYNC_MMIO;
     caps.SchedulingCaps.__bindgen_anon_1.Value =
         SCHEDULINGCAPS_MULTI_ENGINE_AWARE | SCHEDULINGCAPS_PREEMPTION_AWARE;
-    caps.MemoryManagementCaps.__bindgen_anon_1.Value = MEMORYMANAGEMENTCAPS_SECTION_BACKED_PRIMARY
-        | MEMORYMANAGEMENTCAPS_VIRTUAL_ADDRESSING_SUPPORTED
-        | MEMORYMANAGEMENTCAPS_GPU_MMU_SUPPORTED;
+    caps.MemoryManagementCaps.__bindgen_anon_1.Value = mem_caps;
     // PagingNode = 0 (single engine node). MemoryManagementCaps.PagingNode is the
     // second field of DXGK_VIDMMCAPS, after the flags union; the zero-fill at the
     // top of this fn already leaves it 0, which is what we want.
     caps.MaxQueuedFlipOnVSync = 1;
+    caps.SupportDirectFlip = 1;
     caps.GpuEngineTopology.NbAsymetricProcessingNodes = 1;
+
+    crate::diag::record(0x01D0_0000 | ((caps.WDDMVersion as u32) & 0xFFFF));
+    crate::diag::record(0x01D1_0000 | (caps.PresentationCaps.__bindgen_anon_1.Value & 0xFFFF));
+    crate::diag::record(0x01D2_0000 | (caps.FlipCaps.__bindgen_anon_1.Value & 0xFFFF));
+    crate::diag::record(0x01D3_0000 | (caps.SchedulingCaps.__bindgen_anon_1.Value & 0xFFFF));
+    crate::diag::record(0x01D4_0000 | (caps.MemoryManagementCaps.__bindgen_anon_1.Value & 0xFFFF));
+    crate::diag::record(0x01D5_0000 | ((caps.MaxAllocationListSlotId as u32) & 0xFFFF));
+    crate::diag::record(0x01D6_0000 | ((caps.ApertureSegmentCommitLimit as u32) & 0xFFFF));
+    crate::diag::record(
+        0x01D7_0000
+            | (((caps.SupportNonVGA as u32) & 1) << 0)
+            | (((caps.SupportPerEngineTDR as u32) & 1) << 1)
+            | (((caps.SupportDirectFlip as u32) & 1) << 2),
+    );
+    crate::diag::record(0x01D8_0000 | (caps.GpuEngineTopology.NbAsymetricProcessingNodes & 0xFFFF));
 
     STATUS_SUCCESS
 }
@@ -182,7 +249,7 @@ unsafe fn query_zeroed<T>(args: &DXGKARG_QUERYADAPTERINFO) -> NTSTATUS {
     }
 
     // SAFETY: pOutputData points to a writable object of the requested type.
-    unsafe { core::ptr::write_bytes(args.pOutputData as *mut u8, 0, size_of::<T>()) };
+    unsafe { core::ptr::write_bytes(args.pOutputData as *mut u8, 0, args.OutputDataSize as usize) };
     STATUS_SUCCESS
 }
 
@@ -193,14 +260,12 @@ unsafe fn query_wddm_device_caps(args: &DXGKARG_QUERYADAPTERINFO) -> NTSTATUS {
 
     // SAFETY: pOutputData points to a DXGK_WDDMDEVICECAPS of sufficient size.
     let caps = unsafe { &mut *(args.pOutputData as *mut DXGK_WDDMDEVICECAPS) };
-    unsafe {
-        core::ptr::write_bytes(
-            caps as *mut _ as *mut u8,
-            0,
-            size_of::<DXGK_WDDMDEVICECAPS>(),
-        );
-    }
-    caps.WDDMVersion = DXGKDDI_WDDMv3_2;
+    unsafe { core::ptr::write_bytes(args.pOutputData as *mut u8, 0, args.OutputDataSize as usize) };
+    caps.WDDMVersion = if RAISE_WDDM_3_2_GPUMMU {
+        DXGKDDI_WDDMv3_2
+    } else {
+        DXGKDDI_WDDMv1_3
+    };
     STATUS_SUCCESS
 }
 
@@ -211,13 +276,7 @@ unsafe fn query_physical_memory_caps(args: &DXGKARG_QUERYADAPTERINFO) -> NTSTATU
 
     // SAFETY: pOutputData points to a DXGK_PHYSICAL_MEMORY_CAPS of sufficient size.
     let caps = unsafe { &mut *(args.pOutputData as *mut DXGK_PHYSICAL_MEMORY_CAPS) };
-    unsafe {
-        core::ptr::write_bytes(
-            caps as *mut _ as *mut u8,
-            0,
-            size_of::<DXGK_PHYSICAL_MEMORY_CAPS>(),
-        );
-    }
+    unsafe { core::ptr::write_bytes(args.pOutputData as *mut u8, 0, args.OutputDataSize as usize) };
     caps.HighestVisibleAddress.QuadPart = -1;
     STATUS_SUCCESS
 }
@@ -230,7 +289,7 @@ unsafe fn query_gpu_version(args: &DXGKARG_QUERYADAPTERINFO) -> NTSTATUS {
     // SAFETY: pOutputData points to a DXGK_GPUVERSION of sufficient size.
     let version = args.pOutputData as *mut DXGK_GPUVERSION;
     unsafe {
-        core::ptr::write_bytes(version as *mut u8, 0, size_of::<DXGK_GPUVERSION>());
+        core::ptr::write_bytes(args.pOutputData as *mut u8, 0, args.OutputDataSize as usize);
         write_wchar_z_unaligned(
             core::ptr::addr_of_mut!((*version).BiosVersion) as *mut WCHAR,
             32,
@@ -253,11 +312,7 @@ unsafe fn query_history_buffer_precision(args: &DXGKARG_QUERYADAPTERINFO) -> NTS
     // SAFETY: pOutputData points to a DXGKARG_HISTORYBUFFERPRECISION of sufficient size.
     let precision = unsafe { &mut *(args.pOutputData as *mut DXGKARG_HISTORYBUFFERPRECISION) };
     unsafe {
-        core::ptr::write_bytes(
-            precision as *mut _ as *mut u8,
-            0,
-            size_of::<DXGKARG_HISTORYBUFFERPRECISION>(),
-        );
+        core::ptr::write_bytes(args.pOutputData as *mut u8, 0, args.OutputDataSize as usize);
     }
     // Dxgkrnl validates history-buffer timestamp precision during
     // ADAPTER_RENDER bring-up and accepts 32..64 bits.
@@ -307,6 +362,47 @@ const APERTURE_SEGMENT_SIZE: SIZE_T = 256 * 1024 * 4096;
 ///   contiguous-memory pool.
 const REPORT_APERTURE_PAGING_SEGMENT: bool = true;
 
+/// PATH-A lever (2026-06-22): declare `DXGK_VIDMMCAPS::CrossAdapterResource` so the
+/// OS can use Helios as the cross-adapter render side for the Looking Glass IDD's
+/// composition swapchain. See the comment in `query_driver_caps`. Gated for clean
+/// reversibility — flip to `false` and redeploy if it destabilizes boot.
+/// `pub(crate)` so the allocation path (`create_allocation.rs`) gates the matching
+/// cross-adapter surface layout (aperture-eligible + 256-aligned linear) on the
+/// same lever.
+///
+/// 2026-06-22 EXPERIMENT RESULT (1st try, `true`): declaring the cap made dxgkrnl
+/// drive the GDI hardware-acceleration render path (`DxgkDdiRenderKm`) against the
+/// cross-adapter resource — gated by our (mandatory-for-load)
+/// `SupportKernelModeCommandBuffer` cap — and our `RenderKm` returned
+/// `STATUS_NOT_IMPLEMENTED`, so dxgkrnl `call`ed a null DMA/submission pointer
+/// (`dxgkrnl!ADAPTER_RENDER::DdiRenderGdi+0x140`, `call rax` rax=0 → kernel
+/// 0xC0000005). FIX (this build): `dxgkddi_render_km` now records the command into
+/// the DMA buffer + advances the output pointer + returns SUCCESS
+/// (`submit_command.rs`), satisfying the GDI-HW-accel DDI contract
+/// (`gdi-hardware-acceleration.md`: CreateAllocation + GetStandardAllocationDriverData
+/// + RenderKm). Re-enabled to test whether the OS now builds the display path. Flip
+/// `false` + redeploy to revert if it still destabilizes boot.
+pub(crate) const DECLARE_CROSS_ADAPTER_RESOURCE: bool = false;
+
+/// WDDM-sync-redesign M1 (2026-06-25): raise the adapter from the bring-up WDDM 1.3
+/// surface to a coherent WDDM 3.2 + GpuMmu (GPU virtual addressing) surface, so the
+/// OS enables the monitored-fence path that `D3DDDI_MONITORED_FENCE` (and the
+/// IddCx swapchain keyed-mutex/host-completion sync) requires. This is a SINGLE
+/// atomic on/off lever wired into every coupled site (DriverEntry `data.Version`,
+/// `DRIVERCAPS.WDDMVersion` + the `VirtualAddressingSupported|GpuMmuSupported`
+/// `MemoryManagementCaps` bits, `WDDMDEVICECAPS.WDDMVersion`, and
+/// `GetNodeMetadata.GpuMmuSupported`) because a PARTIAL raise is internally
+/// inconsistent and dxgkrnl rejects it at AddAdapter.
+///
+/// The GpuMmu DDI surface (GPUMMUCAPS, page-table-level desc, SetRootPageTable,
+/// GetRootPageTableSize, BuildPagingBuffer, SubmitCommand/SubmitCommandVirtual,
+/// CreateProcess) is already implemented (decorative/null engine), so this lever
+/// only flips the capability *declaration*. RISK: declaring GPU VA re-engages the
+/// VidMm paging path that historically bugchecked (InitDmaPools Code-43,
+/// 0x10E:0x49). If boot destabilizes, flip `false` + redeploy to revert to the
+/// known-good 1.3 surface. See `WDDM_SYNC_REDESIGN.md` M1.
+pub(crate) const RAISE_WDDM_3_2_GPUMMU: bool = true;
+
 /// Write the viogpu3d-style linear aperture descriptor (paging-buffer host).
 /// SAFETY: `seg` points to a writable `DXGK_SEGMENTDESCRIPTOR4`.
 unsafe fn write_aperture_descriptor(seg: *mut DXGK_SEGMENTDESCRIPTOR4) {
@@ -320,6 +416,46 @@ unsafe fn write_aperture_descriptor(seg: *mut DXGK_SEGMENTDESCRIPTOR4) {
             .set_CacheCoherent(1);
         s.Flags.__bindgen_anon_1.__bindgen_anon_1.set_DirectFlip(1);
         // CpuVisible deliberately 0 — an aperture holds no bits (viogpu3d :558).
+        s.BaseAddress.QuadPart = APERTURE_BASE_ADDRESS;
+        s.Size = APERTURE_SEGMENT_SIZE;
+        s.CommitLimit = APERTURE_SEGMENT_SIZE;
+    }
+}
+
+/// Write the viogpu3d-style linear aperture descriptor for WDDM 1.2/1.3
+/// `DXGK_QUERYSEGMENTOUT3`.
+/// SAFETY: `seg` points to a writable `DXGK_SEGMENTDESCRIPTOR3`.
+unsafe fn write_aperture_descriptor3(seg: *mut DXGK_SEGMENTDESCRIPTOR3) {
+    unsafe {
+        core::ptr::write_bytes(seg as *mut u8, 0, size_of::<DXGK_SEGMENTDESCRIPTOR3>());
+        let s = &mut *seg;
+        s.Flags.__bindgen_anon_1.__bindgen_anon_1.set_Aperture(1);
+        s.Flags
+            .__bindgen_anon_1
+            .__bindgen_anon_1
+            .set_CacheCoherent(1);
+        s.Flags.__bindgen_anon_1.__bindgen_anon_1.set_DirectFlip(1);
+        // CpuVisible deliberately 0 — a linear aperture redirects system-memory
+        // MDLs through MAP_APERTURE_SEGMENT instead of exposing device memory.
+        s.BaseAddress.QuadPart = APERTURE_BASE_ADDRESS;
+        s.Size = APERTURE_SEGMENT_SIZE;
+        s.CommitLimit = APERTURE_SEGMENT_SIZE;
+    }
+}
+
+/// Write the legacy `DXGK_QUERYSEGMENTOUT` descriptor used if dxgkrnl falls back
+/// from QUERYSEGMENT3.
+/// SAFETY: `seg` points to a writable `DXGK_SEGMENTDESCRIPTOR`.
+unsafe fn write_aperture_descriptor_legacy(seg: *mut DXGK_SEGMENTDESCRIPTOR) {
+    unsafe {
+        core::ptr::write_bytes(seg as *mut u8, 0, size_of::<DXGK_SEGMENTDESCRIPTOR>());
+        let s = &mut *seg;
+        s.Flags.__bindgen_anon_1.__bindgen_anon_1.set_Aperture(1);
+        s.Flags
+            .__bindgen_anon_1
+            .__bindgen_anon_1
+            .set_CacheCoherent(1);
+        s.Flags.__bindgen_anon_1.__bindgen_anon_1.set_DirectFlip(1);
         s.BaseAddress.QuadPart = APERTURE_BASE_ADDRESS;
         s.Size = APERTURE_SEGMENT_SIZE;
         s.CommitLimit = APERTURE_SEGMENT_SIZE;
@@ -390,6 +526,7 @@ unsafe fn query_segments(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTERIN
         );
     }
 
+    out.pSegmentDescriptor = descriptors;
     let stride = size_of::<DXGK_SEGMENTDESCRIPTOR4>();
     out.SegmentDescriptorStride = stride as u64;
     out.PagingBufferSize = 64 * 1024;
@@ -455,6 +592,83 @@ unsafe fn query_segments(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTERIN
     STATUS_SUCCESS
 }
 
+unsafe fn query_segments3(args: &DXGKARG_QUERYADAPTERINFO) -> NTSTATUS {
+    if (args.OutputDataSize as usize) < size_of::<DXGK_QUERYSEGMENTOUT3>() {
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+
+    let out = unsafe { &mut *(args.pOutputData as *mut DXGK_QUERYSEGMENTOUT3) };
+    let descriptors = out.pSegmentDescriptor;
+    unsafe {
+        core::ptr::write_bytes(
+            out as *mut _ as *mut u8,
+            0,
+            size_of::<DXGK_QUERYSEGMENTOUT3>(),
+        );
+    }
+    out.pSegmentDescriptor = descriptors;
+
+    crate::diag::record(if descriptors.is_null() {
+        0x0913_0000
+    } else {
+        0x0913_0001
+    });
+
+    out.NbSegment = 1;
+    if descriptors.is_null() {
+        // Segment queries are a two-call protocol. On the first call dxgkrnl
+        // passes pSegmentDescriptor = NULL and the driver must report only the
+        // segment count; paging-buffer fields are valid only with descriptors.
+        return STATUS_SUCCESS;
+    }
+
+    out.PagingBufferSegmentId = gpummu::APERTURE_SEGMENT_ID;
+    out.PagingBufferSize = 10 * 4096;
+    out.PagingBufferPrivateDataSize = 0;
+
+    unsafe { write_aperture_descriptor3(descriptors) };
+
+    STATUS_SUCCESS
+}
+
+unsafe fn query_segments_legacy(args: &DXGKARG_QUERYADAPTERINFO) -> NTSTATUS {
+    if (args.OutputDataSize as usize) < size_of::<DXGK_QUERYSEGMENTOUT>() {
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+
+    let out = unsafe { &mut *(args.pOutputData as *mut DXGK_QUERYSEGMENTOUT) };
+    let descriptors = out.pSegmentDescriptor;
+    unsafe {
+        core::ptr::write_bytes(
+            out as *mut _ as *mut u8,
+            0,
+            size_of::<DXGK_QUERYSEGMENTOUT>(),
+        );
+    }
+    out.pSegmentDescriptor = descriptors;
+
+    crate::diag::record(if descriptors.is_null() {
+        0x0912_0000
+    } else {
+        0x0912_0001
+    });
+
+    out.NbSegment = 1;
+    if descriptors.is_null() {
+        // Same two-call contract as QUERYSEGMENT3: first call reports only
+        // NbSegment, second call supplies pSegmentDescriptor and gets details.
+        return STATUS_SUCCESS;
+    }
+
+    out.PagingBufferSegmentId = gpummu::APERTURE_SEGMENT_ID;
+    out.PagingBufferSize = 10 * 4096;
+    out.PagingBufferPrivateDataSize = 0;
+
+    unsafe { write_aperture_descriptor_legacy(descriptors) };
+
+    STATUS_SUCCESS
+}
+
 /// `DxgkDdiGetNodeMetadata` — describe GPU engine node `node_ordinal`.
 ///
 /// Unlike the other Phase-1.5 stubs this has a real body: Dxgkrnl enumerates
@@ -480,13 +694,11 @@ pub unsafe extern "C" fn dxgkddi_get_node_metadata(
         core::ptr::write_bytes(node as *mut _ as *mut u8, 0, size_of::<DXGK_NODEMETADATA>());
     }
     node.EngineType = DXGK_ENGINE_TYPE::DXGK_ENGINE_TYPE_3D;
-    // Per-node memory-model selection (WDDM_FAKE_VIDMM_RESEARCH.md §A1/§G): the
-    // GpuMmu-vs-IoMmu choice is made HERE per engine node, in tandem with the
-    // DXGK_VIDMMCAPS GpuMmuSupported bit in query_driver_caps. We declare the
-    // decorative GpuMmu model (host GPU owns the real MMU; guest page tables are
-    // never read by hardware — §A3.7) and no IoMmu. The GPUMMUCAPS / page-table
-    // geometry VidMm then queries lives in `ddi::gpummu`.
-    node.GpuMmuSupported = 1;
+    // The node memory model must match the DRIVERCAPS surface. When the WDDM 3.2 +
+    // GpuMmu raise is active, this 3D node advertises the GpuMmu (GPU virtual
+    // addressing) model; otherwise it stays at the viogpu3d-style WDDM 1.3 surface
+    // (no explicit memory model). GpuMmu and IoMmu are mutually exclusive.
+    node.GpuMmuSupported = if RAISE_WDDM_3_2_GPUMMU { 1 } else { 0 };
     node.IoMmuSupported = 0;
     // FriendlyName, Flags stay zeroed.
     STATUS_SUCCESS

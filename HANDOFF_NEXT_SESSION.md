@@ -1,4 +1,115 @@
-# Helios — next-session handoff (2026-06-18, Gate 5a venus-over-D3DKMT)
+# Helios — next-session handoff (2026-06-23, IDD + Helios composition)
+
+> **⛔ SUPERSEDED (2026-06-26) — read `FABLE5_HANDOFF.md`.** Historical (pre-M1). Its display-topology
+> framing is now known to rest partly on session-0-artifact readings; the current blocker is the IDD
+> failing its PnP post-start (Code 43) on the render-only-Helios pairing.
+
+Paste the section under "PROMPT" into a fresh session. The older 2026-06-18 Gate 5a prompt is
+kept below as historical context only; the 2026-06-23 prompt is current.
+
+---
+
+## PROMPT
+
+Continue the Helios WDDM + Looking Glass IDD bring-up in `/home/rupansh/helios-vgpu`.
+
+Goal: make Windows compose and render the whole desktop on the Helios WDDM render adapter
+(`virtio-gpu-gl`/venus on the host), then have the Looking Glass IDD receive the IddCx
+swapchain frames and display them in the Looking Glass client. Do not pivot to per-app venus
+or WARP composition as the final design.
+
+Read first:
+
+- `WDDM_COMPOSITION_HANDOFF.md` — especially the 2026-06-23 update.
+- `IDD_HELIOS_RENDER_PLAN.md` — especially the 2026-06-23 correction.
+- `BRINGUP_QUIRKS.md` §6c.
+- `NTOSEYE.md` only if you need live kernel/user debugging.
+
+Current verified state:
+
+- Helios KMD loads Code 0 with gpu-gl attached.
+- UMD/D3D11 device creation is fixed: `D3D11CreateDevice` on "Helios vGPU Render Adapter
+  (WDDM bring-up)" returns `S_OK`, feature level `0xa000`.
+- Looking Glass IDD can select Helios with
+  `HKLM:\SOFTWARE\LookingGlass\IDD\HeliosRenderAdapter = 1`.
+- IddCx monitor arrival succeeds and returns an OS adapter LUID + target id for the LG monitor.
+- No source diff remains under `LookingGlass/idd`; the IDD code has been restored to the
+  repository/submodule baseline.
+- Clean gpu-gl-out baseline verified after reboot: with the Helios PCI node a phantom
+  non-started device (`Get-PnpDevice Status=Unknown`, `Problem=CM_PROB_PHANTOM`; earlier probe
+  surfaced this as disconnected), the Looking Glass IDD is `OK`, WMI reports the LG monitor
+  active, `Win32_VideoController` reports `1920x1080`, a session-1 CCD probe reports
+  `active paths=1 modes=2`, `all paths=2 modes=4`, `database paths=1 modes=2`, and the
+  Looking Glass client displays the desktop. `HeliosRenderAdapter=1` remains set in the
+  registry, but the IDD logs `Preferred IDD render adapter not found; IddCx render adapter
+  remains OS-selected`; `AssignSwapChain` fires with render-adapter LUID
+  `00000000:000076b0`, D3D11 initializes at feature level `0xb100`, and D3D12 creates the
+  IVSHMEM heap plus copy/compute queues.
+- Current deployed KMD test hash:
+  `B0B8A079394E86609C0FCD72785981A01FB70F366F459F3C4E394B68DCC3A315`.
+
+Observed current blocker:
+
+- With Helios/gpu-gl present, CCD/display activation is failing. In session 1, the helper logs:
+  `GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS/QDC_ALL_PATHS/QDC_DATABASE_CURRENT)` all
+  return success with `paths=0 modes=0`.
+- The LG target name resolves and `WmiMonitorID` sees the LG monitor as active, but the helper's
+  synthetic `SetDisplayConfig(SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_APPLY | ...)` attempts all
+  return `31` (`ERROR_GEN_FAILURE`).
+- `EnumDisplayDevices` shows `Microsoft Basic Display Driver` and `INDIRECTKMD` with state flags
+  `0x00000000`; `EnumDisplaySettings` for the LG display returns `ERROR_BUSY` (`170`).
+- A controlled same-boot test with Helios disabled still produced empty CCD paths and ret 31.
+  The clean gpu-gl-out boot above contradicts that same-boot result, so treat the same-boot
+  Helios-disabled data as affected by live graphics-stack state.
+
+Known negative tests:
+
+- Do not change IDD monitor-mode `vSyncFreqDivider` to `1`; that made
+  `IddCxMonitorArrival` fail with `STATUS_INVALID_PARAMETER`. The IDD source is restored.
+- Do not disable `DECLARE_CROSS_ADAPTER_RESOURCE` as a "fix"; it made D3D11/Venus context creation
+  regress (`D3DKMTEscape` `0xc0000185`). Cross-adapter support is restored.
+- `IddCxAdapterDisplayConfigUpdate` returns `0xc00000bb`; treat it as expected for this local
+  IDD path unless WPP proves otherwise.
+
+Code changes to preserve:
+
+- `kmd_render/src/ddi/query_adapter_info.rs`: `DriverSupportsCddDwmInterop` is no longer
+  advertised. Helios is zero-source render-only; that bit claims a display-miniport CDD/DWM
+  interop path.
+- `kmd_render/src/virtio/gpu.rs` and `kmd_render/src/ddi/create_allocation.rs`: standard WDDM
+  allocations that adopt a KMD-created Venus resource now remove the temporary owner-0 tracking
+  slot without sending host commands, avoiding later double-unref on StopDevice. This addresses
+  qemu logs like `virgl_cmd_resource_unref: resource does not exist` / `ctrl 0x102 error 0x1203`.
+
+Useful next investigation tools:
+
+1. IddCx WPP capture, if the display-topology path is under investigation:
+   `logman create trace IddCx -o C:\Windows\Temp\IddCx-helios.etl -ets -ow -mode sequential -p {D92BCB52-FA78-406F-A9A5-2037509FADEA} 0x4f4 0xFF`,
+   cycle `ROOT\DISPLAY\0000`, trigger helper activation, then `logman stop IddCx -ets`.
+   `tracerpt` only gives `Unknown(...)`; use `tracefmt`/`tracepdb` with public `IddCx.pdb`, or
+   kernel `!wmitrace.logdump IddCx`.
+2. Session-1 display probes, if using Win32 CCD APIs: log full flags and returned source/target
+   names, and verify with WMI/session-1 probes rather than SSH/session 0.
+3. If/when CCD has an active path and IddCx calls `AssignSwapChain`, Helios composition checks:
+   confirm DWM allocates standard composition surfaces on Helios, check whether render work uses
+   UMD escape/venus or WDDM Render/SubmitCommand, and then fix real fence/coherency as needed.
+   D3D12/vkd3d-proton is future app support; it is not the immediate blocker before swapchain
+   assignment.
+
+Build/deploy reminders:
+
+- KMD build: `win_cargo crate_dir:"kmd_render" args:["build"]`, then manually copy/sign
+  `target\debug\deps\helios_kmd_render.dll` as `helios_kmd_render.sys`, regenerate/sign cat,
+  in-place copy `.sys` + `.cat` into the live e0bd DriverStore dir, and PnP disable/enable the
+  Helios PCI device. This was reboot-free in the 2026-06-23 session.
+- IDD build/deploy, if you change it: use `win_looking_glass_idd`, then install/rebind with
+  devcon/pnputil. Do not in-place copy into the IDD DriverStore directory.
+- Display checks must use WMI or active session-1 probes. SSH/session 0 is misleading for monitor
+  and CCD state.
+
+---
+
+# Historical handoff (2026-06-18, Gate 5a venus-over-D3DKMT)
 
 Paste the section under "PROMPT" into a fresh session.
 
@@ -106,7 +217,7 @@ ICD `ops.submit`/`ops.wait`. Then `vulkaninfo` full + the offscreen
   `probe.exe` (D3D11CreateDevice), `dxgi_enum.exe`.
 - **ntoseye** is the kernel debugger (coherent after reboot). `debug_log` is empty
   here — use breakpoints. Our driver's symbols don't auto-resolve; use base+RVA.
-- VM-launch ownership: changing `tools/launch-helios-gtk.sh` / libvirt XML / the
+- VM-launch ownership: changing `tools/launch-helios-gtk.sh` / the
   launcher env needs a user relaunch. A devcon install + guest reboot is in-guest
   (QEMU stays up) but still ASK the user to reboot when the stack wedges.
 

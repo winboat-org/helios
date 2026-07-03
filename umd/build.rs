@@ -99,6 +99,7 @@ fn main() {
     let dxvk_src = def("HELIOS_DXVK_SRC", r"C:\Users\Rupansh\dxvk-helios");
     let dxvk_build = def("HELIOS_DXVK_BUILD", r"C:\Users\Rupansh\dxvk-build");
     let clang_cl = def("HELIOS_CLANG_CL", r"C:\Program Files\LLVM\bin\clang-cl.exe");
+    let archiver = def("HELIOS_MSVC_LIB", r"C:\Program Files\LLVM\bin\llvm-lib.exe");
 
     generate_d3d10umddi_bindings();
 
@@ -107,6 +108,7 @@ fn main() {
     build
         .file("bridge/dxvk_bridge.cpp")
         .compiler(&clang_cl)
+        .archiver(&archiver)
         .std("c++17")
         // DXVK (and our shim) use C++ exceptions; cxx-build disables them by default.
         .flag("/EHsc")
@@ -155,8 +157,8 @@ fn main() {
     // entry points, which we never reference (we build D3D11DXGIDevice directly),
     // so that object is never pulled out of the static archive.
     for lib in [
-        "setupapi", "gdi32", "user32", "ole32", "oleaut32", "version", "advapi32",
-        "shell32", "cfgmgr32",
+        "setupapi", "gdi32", "user32", "ole32", "oleaut32", "version", "advapi32", "shell32",
+        "cfgmgr32",
     ] {
         println!("cargo:rustc-link-lib=dylib={lib}");
     }

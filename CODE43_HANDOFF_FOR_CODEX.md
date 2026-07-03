@@ -122,12 +122,11 @@ so the newest build always out-ranks older staged packages.
   share** (Rust IO fails, OS error 87); a build helper mirrors `Z:\` → `C:\Users\Rupansh\helios-vgpu`
   and builds there. In the prior chat this was the `win` MCP server (`win_cargo`, `win_exec`).
   For Codex: build via that mirror; run `pnputil`/registry reads over SSH to `.120`.
-- **Test device = the STANDALONE qemu, NOT libvirt.** The user launches
-  `tools/launch-helios-gtk.sh` (as their normal user, after `virsh shutdown win11`) with
+- **Test device = the STANDALONE qemu only.** The user launches
+  `tools/launch-helios-gtk.sh` as their normal user with
   `HELIOS_GPU=plain` → a **`virtio-gpu-pci`** device (non-VGA, 2D, software `gtk` display, no
-  GL/venus needed for this 2D bring-up). It keeps the VM at `.120`. **Why not libvirt:**
-  libvirt forces `virtio-vga-gl` (a VGA device) which needs `DxgkCbAcquirePostDisplayOwnership`
-  the DOD does not implement → that path Code-43's *before* present. Use the standalone.
+  GL/venus needed for this 2D bring-up). It keeps the VM at `.120`. Do not use alternate VM managers
+  or XML/domain definitions for this target; they do not match the hardware expected by IDD + Helios.
 - **Build + sign + infverif:** `cargo make --makefile Cargo.make.toml` in `kmd/` (DriverVer is
   timestamp-based, newest wins). `["build"]` alone = compile-only (fast).
 - **Stage on the running guest** (driver auto-binds via the INX specific-hwid match):
@@ -332,12 +331,9 @@ require this per-source realize-on-commit contract.
 ## 8. Open mystery worth resolving
 
 VioGpuDod uses NOTSPECIFIED freqs and ships/works on virtio-gpu, but NOTSPECIFIED is rejected
-on our **non-VGA** path (`0xC01E030A`). Two possibilities: (a) the user's working VioGpuDod is
-the **VGA** path (POST framebuffer modes) — then the right move may be to implement the VGA /
-`DxgkCbAcquirePostDisplayOwnership` path and use `virtio-vga-gl`; (b) there's a subtler mode
-field we still get wrong that makes NOTSPECIFIED invalid only for us. Concrete timing
-side-steps it and lets the desktop commit, so it is the pragmatic choice unless the VGA path
-is pursued.
+on our **non-VGA** path (`0xC01E030A`). The working path for Helios remains the standalone
+launcher and its non-VGA virtio-gpu device. Concrete timing side-steps the rejection and lets
+the desktop commit; revisit the exact timing contract only if the display path regresses.
 
 ---
 

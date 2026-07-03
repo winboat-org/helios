@@ -234,12 +234,12 @@ adapter. **Scope:** fullscreen venus = fast/zero-copy; the 2D desktop = GL-displ
 ## 6. Host configuration (required)
 
 - **Display backend:** move the win11 VM off `-display egl-headless,rendernode=/dev/dri/renderD129` to
-  **`-spice gl=on`** (`<graphics type='spice'><gl enable='yes'/></graphics>` + a local/remote
-  `rendernode`). This is the chosen production backend (matches "SPICE + OGL"); for first bring-up debugging,
+  **`-spice gl=on`** or `-display gtk,gl=on` in `tools/launch-helios-gtk.sh`. This is the chosen
+  production backend (matches "SPICE + OGL"); for first bring-up debugging,
   `-display gtk,gl=on` on the local console is the easiest place to *see* the dmabuf import working. Both import
   the scanout (2D texture or blob dmabuf) as a host GL texture with **no `glReadPixels` readback** (the
-  egl-headless readback is what the old path paid). **Requires a VM XML edit + restart + `devcon` rebind.**
-- **Device:** keep `virtio-gpu-gl` (or `virtio-vga-gl`) with `venus=on,blob=on,hostmem=…`. `max_outputs=1` is
+  egl-headless readback is what the old path paid). **Requires a launcher edit + restart + `devcon` rebind.**
+- **Device:** keep standalone `virtio-gpu-gl` with `venus=on,blob=on,hostmem=…`. `max_outputs=1` is
   sufficient (Helios owns scanout 0 for both desktop and venus). `context_init`/`render-server`/`udmabuf` stay.
 - **Venus export:** venus runs in the **render-server** process (always, per LB6). The render-server is what
   exports the per-resource `dmabuf_fd` for `SET_SCANOUT_BLOB`. **Intel ANV exports DMA_BUF** (the setup's host

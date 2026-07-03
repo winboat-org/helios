@@ -57,7 +57,7 @@ pub struct HeliosWddmAllocPrivate {
     pub ctx_id: u32,     // in:  owning venus context id
     pub map_cache: u32,  // in/out: requested/effective VIRTIO_GPU_MAP_CACHE_*
     pub kind: u32,       // in:  HELIOS_WDDM_ALLOC_KIND_*
-    pub _pad: u32,
+    pub _pad: u32,       // in:  optional existing virtio resource id to adopt
 }
 
 impl HeliosWddmAllocPrivate {

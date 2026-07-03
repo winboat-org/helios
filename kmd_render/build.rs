@@ -63,6 +63,7 @@ const BLOCKLISTED_BASE_TYPES: &[&str] = &[
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     generate_dxgk_bindings()?;
     compile_version_resource()?;
+    compile_seh_shim();
 
     // Emit the link configuration for a WDK binary (resolves ntoskrnl, etc.).
     Config::from_env_auto()?.configure_binary_build()?;
@@ -75,6 +76,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Compile the SEH shim for `MmMapLockedPagesSpecifyCache(UserMode)` (which
+/// raises on failure — un-catchable from no_std Rust). Kernel-appropriate
+/// flags: `/Zl` omits default-CRT lib records from the object (rustc drives
+/// the kernel link; msvcrt must not be pulled in) and `/GS-` avoids
+/// `__security_cookie` references. The `__C_specific_handler` reference the
+/// `__try/__except` emits resolves from ntoskrnl.lib, already on the link.
+fn compile_seh_shim() {
+    cc::Build::new()
+        .file("src/seh_shim.c")
+        .flag("/Zl")
+        .flag("/GS-")
+        .compile("helios_seh_shim");
+    println!("cargo:rerun-if-changed=src/seh_shim.c");
+}
+
 fn compile_version_resource() -> Result<(), Box<dyn std::error::Error>> {
     let out_dir = std::path::PathBuf::from(std::env::var("OUT_DIR")?);
     let rc_path = out_dir.join("helios_kmd_render_version.rc");
@@ -83,8 +99,8 @@ fn compile_version_resource() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::write(
         &rc_path,
         r#"1 VERSIONINFO
-FILEVERSION 22,22,32,72
-PRODUCTVERSION 22,22,32,72
+FILEVERSION 22,22,40,0
+PRODUCTVERSION 22,22,40,0
 FILEFLAGSMASK 0x3fL
 FILEFLAGS 0
 FILEOS 0x00040004L
@@ -97,11 +113,11 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "Helios Project\0"
             VALUE "FileDescription", "Helios vGPU WDDM render miniport\0"
-            VALUE "FileVersion", "22.22.32.72\0"
+            VALUE "FileVersion", "22.22.40.0\0"
             VALUE "InternalName", "helios_kmd_render.sys\0"
             VALUE "OriginalFilename", "helios_kmd_render.sys\0"
             VALUE "ProductName", "Helios vGPU\0"
-            VALUE "ProductVersion", "22.22.32.72\0"
+            VALUE "ProductVersion", "22.22.40.0\0"
         END
     END
     BLOCK "VarFileInfo"

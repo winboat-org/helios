@@ -61,21 +61,32 @@ signtool sign /s WDRTestCertStore /n WDRLocalTestCert /fd SHA256  package\helios
   `Valid` even for a catalog that doesn't cover the deployed binary. Also confirm
   `(Get-FileHash deployed.sys) -eq (Get-FileHash package.sys)` after the in-place copy.
 
-## 3. Deploy = in-place DriverStore overwrite (NOT a fresh package install)
+## 3. Deploy = scripted, verified hotplug only
 
-A fresh package version hits a pre-existing `FAILED_ADD / 0xC0000182` quirk. Overwrite the live
-DriverStore copy in place instead:
+Do not manually copy KMD, UMD, or ICD files during normal iteration. Use the scripts below and fix
+the scripts when a deployment edge case is found:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File Z:\tools\install-helios-kmd.ps1 -PlanOnly
+powershell -NoProfile -ExecutionPolicy Bypass -File Z:\tools\install-helios-kmd.ps1
+
+powershell -NoProfile -ExecutionPolicy Bypass -File Z:\tools\hotplug-helios-umd.ps1 -PlanOnly
+powershell -NoProfile -ExecutionPolicy Bypass -File Z:\tools\hotplug-helios-umd.ps1
+
+powershell -NoProfile -ExecutionPolicy Bypass -File Z:\tools\install-helios-icd.ps1 -PlanOnly -NoSmoke
+powershell -NoProfile -ExecutionPolicy Bypass -File Z:\tools\install-helios-icd.ps1
 ```
-C:\Windows\System32\DriverStore\FileRepository\helios_kmd_render.inf_amd64_e0bd070459ad7ca4\
-```
-- `takeown /f <live.sys>` + `icacls <live.sys> /grant Administrators:F` first.
-- **Copy BOTH `.sys` AND the matching `.cat`.** If you copy a new `.sys` but leave the stale
-  `.cat`, a clean boot fails the package integrity check (driver won't run; looks like a
-  load/`Code 22`-ish failure with zero diag breadcrumbs).
-- If Helios is **loaded** (file mapped, can't overwrite): rename the in-use `.sys` →
-  `.sys.old` first (NTFS allows renaming a mapped image), then copy the new one in.
-- If Helios is **absent** (gpu-gl removed) or unloaded: just overwrite.
-- Always re-verify the live `.sys` is `sig=Valid` after copying.
+
+The scripts verify SHA256 after every copy and fail loudly instead of letting a stale binary become
+the next graphics-debugging target. KMD install preserves the active UMD by default; pass
+`-IncludeUmd` only when a package-wide replacement is intended. UMD hotplug defaults to the
+ProgramData override (`C:\ProgramData\HeliosUmd\helios_umd.dll`) and rebinds the adapter. ICD
+hotplug uses content-hashed ProgramData DLLs and an atomically written Khronos manifest.
+
+The KMD script signs with/imports a **machine-store** `WDRLocalTestCert` fallback. This is important
+when LoginUI/Explorer are crash-looping: CurrentUser certs may be unavailable, but an elevated
+session-0 script can still use `LocalMachine\My`, `LocalMachine\Root`, and
+`LocalMachine\TrustedPublisher`.
 
 ## 4. Reloading the driver / replaying bring-up
 
@@ -183,21 +194,72 @@ When changing the VM launch / device set, STOP and let the user drive it (CLAUDE
   (`MAX_STEPS=3000`). To find a panic site live: a CPU stuck at `eb fe` in the driver is the
   handler; the caller's `panic_bounds_check(index,len,&Location)` regs + the `&Location`'s
   `src\file.rs` + line give the exact spot (read it from guest memory — SSH/`.map` aren't needed).
-- **Deploy the IDD (LGIdd) with `devcon`, NOT in-place DriverStore copy.** Unlike the KMD `e0bd`
-  dir (which takes in-place writes after `takeown`), the `lgidd.inf_amd64_*` DriverStore dir is
-  TrustedInstaller-protected such that a copy *silently yields a 0-byte DLL* (rename succeeds, the
-  write doesn't) → the IDD fails to load and the device falls back to a stale `oemNN` copy. Use
-  `devcon update <pkg>\LGIdd.inf "Root\LGIdd"` (installs a fresh DriverStore copy + rebinds) or
-  `devcon restart "Root\LGIdd"` to re-run init without a new build. There are many stale
-  `lgidd.inf_amd64_*` dirs; the active one is whichever `C:\Windows\INF\oemNN.inf` (from the
-  device's `DEVPKEY_Device_DriverInfPath`) hashes to.
+- **Deploy the IDD (LGIdd) with `devcon`, NOT in-place DriverStore copy.** The
+  `lgidd.inf_amd64_*` DriverStore dir is TrustedInstaller-protected such that a copy can silently
+  yield a 0-byte DLL (rename succeeds, the write doesn't) → the IDD fails to load and the device
+  falls back to a stale `oemNN` copy. Use `devcon update <pkg>\LGIdd.inf "Root\LGIdd"` (installs a
+  fresh DriverStore copy + rebinds) or `devcon restart "Root\LGIdd"` to re-run init without a new
+  build. There are many stale `lgidd.inf_amd64_*` dirs; the active one is whichever
+  `C:\Windows\INF\oemNN.inf` (from the device's `DEVPKEY_Device_DriverInfPath`) hashes to. Apply
+  the same rule to Helios KMD: use `Z:\tools\install-helios-kmd.ps1` so package binding goes
+  through `devcon update`/PnP, not manual DriverStore mutation.
 - **The `win_looking_glass_idd` build prints an `InfVerif.dll`-missing error — it is non-fatal**;
   the signed `LGIdd.dll` + `lgidd.cat` are still produced.
 - **Reading display state over SSH:** `QueryDisplayConfig` via `GetDisplayConfigBufferSizes`
-  (flag 0x2 = active, 0x1 = all). With Helios present we see ALL paths = 0 (the display path
-  collapses); with Helios absent the IDD path activates. DWM crashes log to the Application event
-  log (`Application Error` id 1000 + `Dwminit` id 0 with the exit HRESULT and "Primary display
-  device ID").
+  (flag 0x2 = active, 0x1 = all). Historical 2026-06-22 runs showed the path collapsing with
+  Helios present while Helios-absent IDD activation worked; the 2026-06-23 same-boot check saw
+  zero CCD paths even with Helios disabled, but a clean gpu-gl-out boot verified the baseline:
+  WMI sees the LG monitor active, `Win32_VideoController` reports the Looking Glass IDD at
+  `1920x1080`, and a session-1 CCD probe reports active/all/database paths. Use WMI or a
+  scheduled `/IT` session-1 probe for monitor/CCD state; SSH/session 0 can be misleading. DWM
+  crashes log to the Application event log (`Application Error` id 1000 + `Dwminit` id 0 with
+  the exit HRESULT and "Primary display device ID").
+
+## 6c. New lessons (2026-06-23 IDD + Helios composition bring-up)
+
+- **Do display/monitor checks from session 1 or WMI, not an SSH/session-0 process.** SSH runs in
+  session 0 and can report misleading desktop state. Reliable checks used this session:
+  `Win32_VideoController`, `Win32_PnPEntity`, `root\wmi:WmiMonitorID`, and scheduled `/IT`
+  helper/probe tasks in the active console session.
+- **Current D3D11 state:** `D3D11CreateDevice` on Helios returns `S_OK` (`featureLevel=0xa000`).
+  If this regresses, debug UMD/caps again; otherwise do not chase the old
+  `dwmcore!CD3DDevice::CreateD3D11Device` / `0x889800b0` path.
+- **Current Helios-present IDD/CCD symptom:** IddCx monitor arrival succeeds and
+  `DisplayConfigGetDeviceInfo` can resolve the LG target, but
+  `GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS)`, `QDC_ALL_PATHS`, and
+  `QDC_DATABASE_CURRENT` all return `paths=0 modes=0`. The helper's supplied
+  `SetDisplayConfig` path returns `ERROR_GEN_FAILURE` (`31`) and `EnumDisplaySettings` on the
+  LG display returns `ERROR_BUSY` (`170`).
+- **Clean gpu-gl-out baseline:** with Helios absent from the render/display path at boot
+  (`Get-PnpDevice Status=Unknown`, `Problem=CM_PROB_PHANTOM`; earlier probe surfaced this as
+  disconnected), `LGIddHelper` runs, the Looking Glass IDD reports `OK`, `WmiMonitorID`
+  reports `DISPLAY\LGD1DDD...` active, `Win32_VideoController` reports `1920x1080`, and a
+  session-1 `display_config_probe.exe` run returns `active paths=1 modes=2`,
+  `all paths=2 modes=4`, `database paths=1 modes=2`. The IDD log shows OS-selected render
+  adapter LUID
+  `00000000:000076b0`, D3D11 feature level `0xb100`, D3D12 IVSHMEM heap/queues created, and
+  the Looking Glass client displays the desktop.
+- **IddCx WPP tracing works, decode still needs WPP format strings.** Capture:
+  ```powershell
+  logman create trace IddCx -o C:\Windows\Temp\IddCx-helios.etl -ets -ow -mode sequential -p {D92BCB52-FA78-406F-A9A5-2037509FADEA} 0x4f4 0xFF
+  # cycle Root\LGIdd / trigger activation
+  logman stop IddCx -ets
+  ```
+  `tracerpt` emits the ETL as CSV but leaves WPP events as `Unknown(...)`. Use
+  `tracefmt.exe`/`tracepdb.exe` with public `IddCx.pdb`, or kernel `!wmitrace.logdump IddCx`.
+- **IDD source restored.** No current diff remains under `LookingGlass/idd`. Earlier attempts
+  to change monitor-mode `vSyncFreqDivider` broke `IddCxMonitorArrival`; do not reapply that.
+- **KMD/UMD/ICD hot deploy can be reboot-free for these tests, but only through the verified
+  scripts.** Do not add `COPYFLG_IN_USE_TRY_RENAME` to the `DIRID 13` copy line; WDK `infverif`
+  rejects that combination. Default to `Z:\tools\install-helios-kmd.ps1`,
+  `Z:\tools\hotplug-helios-umd.ps1`, and `Z:\tools\install-helios-icd.ps1`. Use
+  `hotplug-helios-umd.ps1 -Mode PackageUpgrade` only when explicitly testing the
+  Microsoft-shaped path: install a new `DIRID 13` package and rebind/restart so the UMD is loaded
+  from a new unique DriverStore directory. Still use a full VM reset if the graphics stack wedges.
+- **KMD resource lifetime fix from 2026-06-23:** standard WDDM allocations that adopt a
+  KMD-created Venus `res_id` now remove the temporary owner-0 blob-table entry without host
+  commands, so allocation destroy owns the detach/unref. This targets host log noise like
+  `virgl_cmd_resource_unref: resource does not exist` / `ctrl 0x102 error 0x1203`.
 
 ## 7. Leave the VM clean
 

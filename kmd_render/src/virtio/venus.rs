@@ -46,6 +46,7 @@ const CMD_ENUMERATE_PHYSICAL_DEVICES: u32 = 2;
 const CMD_GET_PHYSICAL_DEVICE_MEMORY_PROPERTIES: u32 = 8;
 const CMD_CREATE_DEVICE: u32 = 11;
 const CMD_ALLOCATE_MEMORY: u32 = 21;
+const CMD_FREE_MEMORY: u32 = 22;
 const CMD_SET_REPLY_COMMAND_STREAM_MESA: u32 = 178;
 const CMD_CREATE_RING_MESA: u32 = 188;
 const CMD_NOTIFY_RING_MESA: u32 = 190;
@@ -376,6 +377,15 @@ pub struct VenusClient {
     instance_id: u64,
     /// venus device handle.
     device_id: u64,
+    /// HOST_VISIBLE|HOST_COHERENT memory type chosen during bring-up.
+    memory_type_index: u32,
+    /// Poison latch: set when a ring wait hits its spin bound or the host
+    /// reports RING_STATUS_FATAL. A wedged/fatal ring never recovers, and the
+    /// allocation path reaches these waits at DISPATCH_LEVEL under the device
+    /// spinlock — without the latch every subsequent call re-burned the full
+    /// RING_POLL_SPINS budget (~1 s each), which is the 2026-07-03 guest
+    /// wedge. Once set, every ring command fails fast with `DeviceError`.
+    fatal: bool,
 }
 
 impl VenusClient {
@@ -393,19 +403,23 @@ impl VenusClient {
     fn submit_direct(&self, gpu: &mut VirtioGpu, stream: &[u8]) -> Result<(), VirtioError> {
         // fence_id 0: the submit is synchronous (polled used-ring) inside
         // `submit_venus`, so we do not need a per-command fence id here.
-        gpu.submit_venus(self.ctx_id, 0, stream)
+        gpu.submit_venus(self.ctx_id, 0, 0, stream)
     }
 
     /// Publish the ring buffer up to `self.cur` (SeqCst tail store), then nudge the
     /// host if the ring reports idle. Returns the seqno of the just-written command
     /// (== the post-write `cur`). Aborts on a fatal ring status.
     fn publish_and_notify(&mut self, gpu: &mut VirtioGpu) -> Result<u32, VirtioError> {
+        if self.fatal {
+            return Err(VirtioError::DeviceError);
+        }
         let seqno = self.cur;
         self.ring_map.store_u32_seqcst(RING_TAIL_OFFSET, seqno);
 
         let status = self.ring_map.load_u32_acquire(RING_STATUS_OFFSET);
         if status & RING_STATUS_FATAL != 0 {
-            diag(0x00E1);
+            // No diag() — DISPATCH-reachable (see wait_seqno). Latch fatal.
+            self.fatal = true;
             return Err(VirtioError::DeviceError);
         }
         // vkNotifyRingMESA(ring, seqno, flags=0): wake the host ring dispatch.
@@ -428,6 +442,9 @@ impl VenusClient {
     /// advancing `cur` (vn_ring producer). Spins until the host has consumed enough
     /// to make room (`cur + size - head <= buffer_size`), bounded by RING_POLL_SPINS.
     fn write_to_ring(&mut self, stream: &[u8]) -> Result<(), VirtioError> {
+        if self.fatal {
+            return Err(VirtioError::DeviceError);
+        }
         let size = stream.len() as u32;
         if size as u64 > RING_BUFFER_SIZE as u64 {
             return Err(VirtioError::DeviceError);
@@ -442,7 +459,10 @@ impl VenusClient {
             }
             spins += 1;
             if spins >= RING_POLL_SPINS {
-                diag(0x00E2);
+                // A ring that stopped draining is a wedged host — latch fatal
+                // so later calls fail fast instead of re-spinning (this path
+                // runs at DISPATCH under the device spinlock).
+                self.fatal = true;
                 return Err(VirtioError::DeviceError);
             }
             core::hint::spin_loop();
@@ -454,7 +474,10 @@ impl VenusClient {
 
     /// Poll the ring head until it reaches `seqno` (the host has consumed and
     /// completed the command). Wrap-safe `(i32)(head - seqno) >= 0` compare.
-    fn wait_seqno(&self, seqno: u32) -> Result<(), VirtioError> {
+    fn wait_seqno(&mut self, seqno: u32) -> Result<(), VirtioError> {
+        if self.fatal {
+            return Err(VirtioError::DeviceError);
+        }
         let mut spins = 0u64;
         loop {
             let head = self.ring_map.load_u32_acquire(RING_HEAD_OFFSET);
@@ -463,12 +486,15 @@ impl VenusClient {
             }
             let status = self.ring_map.load_u32_acquire(RING_STATUS_OFFSET);
             if status & RING_STATUS_FATAL != 0 {
-                diag(0x00E3);
+                // Host declared the ring fatal — it never recovers. NOTE: no
+                // diag() here; this loop runs at DISPATCH under the device
+                // spinlock (alloc path) where the registry tracer is illegal.
+                self.fatal = true;
                 return Err(VirtioError::DeviceError);
             }
             spins += 1;
             if spins >= RING_POLL_SPINS {
-                diag(0x00E4);
+                self.fatal = true;
                 return Err(VirtioError::DeviceError);
             }
             core::hint::spin_loop();
@@ -530,6 +556,87 @@ impl VenusClient {
         wait.u64(seqno);
         self.submit_direct(gpu, wait.as_slice())
     }
+
+    /// Allocate HOST_VISIBLE|HOST_COHERENT Venus device memory and bind it to a
+    /// HOST3D blob. Returns the memory id (`blob_id`) and virtio resource id.
+    pub fn allocate_memory_blob(
+        &mut self,
+        gpu: &mut VirtioGpu,
+        size: u64,
+        mappable: bool,
+    ) -> Result<HostVisibleBlob, VirtioError> {
+        let size = round_up_page(size.max(4096));
+        let memory_id = self.alloc_handle();
+        {
+            let mut w = Writer::new();
+            w.header(CMD_ALLOCATE_MEMORY, CMD_FLAG_GENERATE_REPLY);
+            w.u64(self.device_id);
+            w.count(true);
+            w.i32(ST_MEMORY_ALLOCATE_INFO);
+            w.u64(0);
+            w.u64(size);
+            w.u32(self.memory_type_index);
+            w.count(false);
+            w.count(true);
+            w.u64(memory_id);
+            self.ring_command_reply(gpu, w.as_slice())?;
+
+            let mut r = ReplyReader::new(&self.reply_map);
+            let cmd = r.read_i32()?;
+            if cmd as u32 != CMD_ALLOCATE_MEMORY {
+                diag(0x00F6);
+                return Err(VirtioError::DeviceError);
+            }
+            let result = r.read_i32()?;
+            if result != 0 {
+                diag(0x00F7);
+                return Err(VirtioError::DeviceError);
+            }
+        }
+
+        let flags = if mappable {
+            VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE
+        } else {
+            0
+        };
+        let res_id = gpu.resource_create_blob(
+            self.ctx_id,
+            VIRTIO_GPU_BLOB_MEM_HOST3D,
+            flags,
+            memory_id,
+            size,
+        )?;
+        gpu.note_blob_size(res_id, size);
+        Ok(HostVisibleBlob {
+            blob_id: memory_id,
+            res_id,
+            gpa: 0,
+            size,
+        })
+    }
+
+    /// Free a venus `VkDeviceMemory` allocated by [`Self::allocate_memory_blob`]
+    /// (`vkFreeMemory` over the ring — cmd 22, wire shape per
+    /// `vn_encode_vkFreeMemory`: device id, memory id, null pAllocator). The
+    /// caller unrefs the blob RESOURCE separately, before this, so the host drops
+    /// the blob's reference on the memory first. DISPATCH-safe (fixed-buffer ring
+    /// write + bounded seqno poll).
+    pub fn free_memory_blob(
+        &mut self,
+        gpu: &mut VirtioGpu,
+        memory_id: u64,
+    ) -> Result<(), VirtioError> {
+        let mut w = Writer::new();
+        w.header(CMD_FREE_MEMORY, 0);
+        w.u64(self.device_id);
+        w.u64(memory_id);
+        w.count(false); // pAllocator = NULL
+        self.ring_command_noreply(gpu, w.as_slice())
+    }
+}
+
+fn round_up_page(size: u64) -> u64 {
+    (size + 4095) & !4095
 }
 
 /// Run the entire venus bring-up and self-allocate a 16-MiB HOST_VISIBLE|
@@ -593,6 +700,8 @@ pub fn allocate_host_visible_blob(
         ctx_id,
         instance_id: 0,
         device_id: 0,
+        memory_type_index: 0,
+        fatal: false,
     };
 
     // ── 3. vkCreateRingMESA (direct) — register the ring with the host ────────
@@ -792,6 +901,7 @@ pub fn allocate_host_visible_blob(
             }
         }
     }
+    client.memory_type_index = memory_type_index;
     diag(0x0008);
 
     // ── 7. vkCreateDevice — one queue, family 0, priority 1.0 ─────────────────
@@ -846,52 +956,16 @@ pub fn allocate_host_visible_blob(
 
     // ── 8. vkAllocateMemory — 16 MiB of the chosen HOST_VISIBLE|COHERENT type ──
     // The memory handle id we pick IS the virtio-gpu blob_id used below.
-    let memory_id = client.alloc_handle();
-    {
-        let mut w = Writer::new();
-        w.header(CMD_ALLOCATE_MEMORY, CMD_FLAG_GENERATE_REPLY);
-        w.u64(device_id); // VkDevice
-        w.count(true); // simple_pointer(pAllocateInfo)
-                       // VkMemoryAllocateInfo:
-        w.i32(ST_MEMORY_ALLOCATE_INFO); // sType
-        w.u64(0); // pNext NULL
-        w.u64(PAGE_TABLE_ALLOC_SIZE); // allocationSize (VkDeviceSize)
-        w.u32(memory_type_index); // memoryTypeIndex
-        w.count(false); // simple_pointer(pAllocator) NULL
-        w.count(true); // simple_pointer(pMemory)
-        w.u64(memory_id); // VkDeviceMemory handle
-        client.ring_command_reply(gpu, w.as_slice())?;
-
-        // Reply: [i32 cmd][i32 VkResult][sp u64][u64 memory]
-        let mut r = ReplyReader::new(&client.reply_map);
-        let cmd = r.read_i32()?;
-        if cmd as u32 != CMD_ALLOCATE_MEMORY {
-            diag(0x00F4);
-            return Err(VirtioError::DeviceError);
-        }
-        let result = r.read_i32()?;
-        if result != 0 {
-            diag(0x00F5);
-            return Err(VirtioError::DeviceError);
-        }
-    }
+    let blob = client.allocate_memory_blob(gpu, PAGE_TABLE_ALLOC_SIZE, true)?;
     diag(0x000A);
 
     // ── 9. Create + map the page-table blob backed by the venus memory id ─────
-    let pt_res_id = gpu.resource_create_blob(
-        ctx_id,
-        VIRTIO_GPU_BLOB_MEM_HOST3D,
-        VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE,
-        memory_id, // blob_id == the venus VkDeviceMemory id
-        PAGE_TABLE_ALLOC_SIZE,
-    )?;
-    gpu.note_blob_size(pt_res_id, PAGE_TABLE_ALLOC_SIZE);
-    let pt_prep = gpu.map_blob_prepare(pt_res_id)?;
+    let pt_prep = gpu.map_blob_prepare(blob.res_id)?;
     diag(0x000B);
 
     let blob = HostVisibleBlob {
-        blob_id: memory_id,
-        res_id: pt_res_id,
+        blob_id: blob.blob_id,
+        res_id: blob.res_id,
         gpa: pt_prep.gpa,
         size: pt_prep.size,
     };

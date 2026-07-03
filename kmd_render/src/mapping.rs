@@ -82,14 +82,14 @@ impl MappingTable {
         }
     }
 
-    /// True if `resource_id` already has a live mapping. Used by `MAP_BLOB` to
-    /// reject a duplicate map (which would leak a window offset / desync the host).
-    pub fn contains(&self, resource_id: u32) -> bool {
+    /// True if `resource_id` already has a live mapping for `owner`. Used by
+    /// `MAP_BLOB` to reject a duplicate map from the same D3DKMT device handle.
+    pub fn contains(&self, owner: usize, resource_id: u32) -> bool {
         let irql = unsafe { KeAcquireSpinLockRaiseToDpc(self.lock.get()) };
         // SAFETY: spinlock-guarded read of the entries.
         let found = unsafe { &*self.entries.get() }
             .iter()
-            .any(|m| m.resource_id == resource_id);
+            .any(|m| m.owner == owner && m.resource_id == resource_id);
         unsafe { KeReleaseSpinLock(self.lock.get(), irql) };
         found
     }

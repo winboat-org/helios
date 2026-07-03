@@ -8,9 +8,10 @@ mod cpu_host_aperture;
 mod create_allocation;
 mod display;
 mod escape;
+mod gdi_blit;
 mod gpummu;
 mod interrupt;
-mod query_adapter_info;
+pub(crate) mod query_adapter_info;
 mod scheduler;
 mod start_device;
 mod submit_command;
@@ -28,9 +29,9 @@ pub use create_allocation::{
     dxgkddi_open_allocation,
 };
 pub use display::{
-    dxgkddi_commit_vidpn, dxgkddi_enum_vidpn_cofunc_modality, dxgkddi_exchange_pre_start_info,
-    dxgkddi_get_scan_line, dxgkddi_is_supported_vidpn, dxgkddi_present,
-    dxgkddi_query_vidpn_hw_capability, dxgkddi_recommend_functional_vidpn,
+    diag_dump_present_atomics, dxgkddi_commit_vidpn, dxgkddi_enum_vidpn_cofunc_modality,
+    dxgkddi_exchange_pre_start_info, dxgkddi_get_scan_line, dxgkddi_is_supported_vidpn,
+    dxgkddi_present, dxgkddi_query_vidpn_hw_capability, dxgkddi_recommend_functional_vidpn,
     dxgkddi_recommend_monitor_modes, dxgkddi_set_pointer_position, dxgkddi_set_pointer_shape,
     dxgkddi_set_vidpn_source_address, dxgkddi_set_vidpn_source_visibility,
     dxgkddi_stop_device_and_release_post_display_ownership, dxgkddi_system_display_enable,
@@ -56,6 +57,7 @@ pub use start_device::{
 };
 pub use submit_command::{
     diag_dump_engine_atomics, dxgkddi_collect_dbg_info, dxgkddi_patch, dxgkddi_preempt_command,
-    dxgkddi_query_current_fence, dxgkddi_render, dxgkddi_render_km, dxgkddi_reset_from_timeout,
-    dxgkddi_restart_from_timeout, dxgkddi_submit_command, dxgkddi_submit_command_virtual,
+    dxgkddi_query_current_fence, dxgkddi_render, dxgkddi_render_gdi, dxgkddi_render_km,
+    dxgkddi_reset_from_timeout, dxgkddi_restart_from_timeout, dxgkddi_submit_command,
+    dxgkddi_submit_command_virtual,
 };

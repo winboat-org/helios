@@ -20,20 +20,26 @@ const S_OK: Hresult = 0;
 const E_FAIL: Hresult = 0x8000_4005u32 as i32;
 const E_NOTIMPL: Hresult = 0x8000_4001u32 as i32;
 const E_OUTOFMEMORY: Hresult = 0x8007_000eu32 as i32;
+const DXGI_ERROR_UNSUPPORTED: Hresult = 0x887a_0020u32 as i32;
 
 const fn ddi_supported(major: u64, minor: u64, build: u64) -> u64 {
     let interface = (major << 16) | minor;
     (interface << 32) | (build << 16)
 }
 
-// Gate 5b: advertise D3D11_0 (D3D11_0_DDI_SUPPORTED = ddi_supported(11, 10, 2);
-// Interface == D3D11_0_DDI_INTERFACE_VERSION 0x000b000a, build 2). The runtime
-// echoes this as create.Interface and so passes us the `p11DeviceFuncs`
-// (D3D11DDI_DEVICEFUNCS) table to fill. This list was previously EMPTY to dodge
-// the DWM crash-loop (DWM fail-fasts when CreateDevice on its chosen composition
-// adapter fails) — now safe because CreateDevice returns S_OK with a real device
-// funcs table backed by the DXVK device (see device_funcs.rs).
-const SUPPORTED_DDI_VERSIONS: &[u64] = &[ddi_supported(11, 10, 2)];
+// Advertise D3D11.1 first so the runtime exposes DXGI 1.1 resource-sharing
+// DDIs (notably ResolveSharedResource) and the extended resource-sharing path
+// DWM/IddCx require. Keep D3D11.0 as a fallback for older/runtime-selected paths.
+const SUPPORTED_DDI_VERSIONS: &[u64] = &[
+    ddi_supported(11, 15, 0), // D3D11_1_DDI_SUPPORTED
+    ddi_supported(11, 10, 2), // D3D11_0_DDI_SUPPORTED
+];
+
+const D3D12_SUPPORTED_DDI_VERSIONS: &[u64] = &[
+    // D3D12DDI_SUPPORTED_0003 from WDK 10.0.26100 d3d12umddi.h:
+    // interface ((12 << 16) | 2), build 8.
+    ddi_supported(12, 2, 8),
+];
 
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -121,19 +127,63 @@ pub struct D3d12DdiArgOpenAdapter {
 
 #[repr(C)]
 pub struct D3d12DdiAdapterFuncs {
-    pub pfn_calc_private_device_size:
-        Option<unsafe extern "system" fn(D3d10DdiAdapterHandle, *const c_void) -> usize>,
-    pub pfn_create_device:
-        Option<unsafe extern "system" fn(D3d10DdiAdapterHandle, *mut c_void) -> Hresult>,
+    pub pfn_calc_private_device_size: Option<
+        unsafe extern "system" fn(
+            D3d10DdiAdapterHandle,
+            *const D3d12DdiArgCalcPrivateDeviceSize,
+        ) -> usize,
+    >,
+    pub pfn_create_device: Option<
+        unsafe extern "system" fn(D3d10DdiAdapterHandle, *const D3d12DdiArgCreateDevice) -> Hresult,
+    >,
     pub pfn_close_adapter: Option<unsafe extern "system" fn(D3d10DdiAdapterHandle) -> Hresult>,
     pub pfn_get_supported_versions:
         Option<unsafe extern "system" fn(D3d10DdiAdapterHandle, *mut u32, *mut u64) -> Hresult>,
     pub pfn_get_caps: Option<
         unsafe extern "system" fn(D3d10DdiAdapterHandle, *const D3d10_2DdiArgGetCaps) -> Hresult,
     >,
-    pub pfn_get_optional_ddi_tables: *const c_void,
-    pub pfn_fill_ddi_table: *const c_void,
-    pub pfn_destroy_device: *const c_void,
+    pub pfn_get_optional_ddi_tables: Option<
+        unsafe extern "system" fn(
+            D3d10DdiAdapterHandle,
+            *mut u32,
+            *mut D3d12DdiTableRequest,
+        ) -> Hresult,
+    >,
+    pub pfn_fill_ddi_table: Option<
+        unsafe extern "system" fn(
+            D3d10DdiAdapterHandle,
+            u32,
+            *mut c_void,
+            usize,
+            u32,
+            *mut c_void,
+        ) -> Hresult,
+    >,
+    pub pfn_destroy_device: Option<unsafe extern "system" fn(*mut c_void)>,
+}
+
+#[repr(C)]
+pub struct D3d12DdiArgCalcPrivateDeviceSize {
+    pub interface: u32,
+    pub version: u32,
+    pub flags: u32,
+}
+
+#[repr(C)]
+pub struct D3d12DdiArgCreateDevice {
+    pub h_rt_device: *mut c_void,
+    pub interface: u32,
+    pub version: u32,
+    pub p_kt_callbacks: *const c_void,
+    pub h_drv_device: *mut c_void,
+    pub p_um_callbacks: *const c_void,
+    pub flags: u32,
+}
+
+#[repr(C)]
+pub struct D3d12DdiTableRequest {
+    pub table_type: u32,
+    pub num_tables: u32,
 }
 
 static mut ADAPTER_COOKIE: usize = 0x4845_4c49_4f53_554d; // "HELIOSUM"
@@ -157,7 +207,9 @@ pub extern "system" fn helios_umd_selftest() -> i32 {
     {
         use windows::Win32::Graphics::Direct3D11::*;
         let dev_ptr = dev.d3d11_device_ptr();
-        log_line(&format!("helios_umd_selftest: ID3D11Device* = 0x{dev_ptr:x}"));
+        log_line(&format!(
+            "helios_umd_selftest: ID3D11Device* = 0x{dev_ptr:x}"
+        ));
         if dev_ptr != 0 {
             let device = core::mem::ManuallyDrop::new(unsafe {
                 <ID3D11Device as windows::core::Interface>::from_raw(dev_ptr as *mut _)
@@ -209,7 +261,9 @@ pub extern "system" fn helios_umd_selftest() -> i32 {
     };
 
     let hr = unsafe { create_device(hadapter, &arg as *const _ as *mut c_void) };
-    log_line(&format!("helios_umd_selftest: synthesized CreateDevice -> 0x{hr:08x}"));
+    log_line(&format!(
+        "helios_umd_selftest: synthesized CreateDevice -> 0x{hr:08x}"
+    ));
     if hr != S_OK {
         return 2;
     }
@@ -220,14 +274,18 @@ pub extern "system" fn helios_umd_selftest() -> i32 {
     let null_slots = (0..n)
         .filter(|&i| unsafe { (*table.add(i)).is_none() })
         .count();
-    log_line(&format!("helios_umd_selftest: device-funcs null slots = {null_slots} / {n}"));
+    log_line(&format!(
+        "helios_umd_selftest: device-funcs null slots = {null_slots} / {n}"
+    ));
 
     // Offscreen clear+readback through the real forwarders.
     let hdev = ddi::D3D10DDI_HDEVICE {
         pDrvPrivate: device_priv.as_mut_ptr().cast(),
     };
     let render_rc = unsafe { forward::selftest_offscreen_clear(hdev) };
-    log_line(&format!("helios_umd_selftest: offscreen clear rc={render_rc}"));
+    log_line(&format!(
+        "helios_umd_selftest: offscreen clear rc={render_rc}"
+    ));
     let tri_rc = unsafe { forward::selftest_triangle(hdev) };
     log_line(&format!("helios_umd_selftest: triangle rc={tri_rc}"));
     let cb_rc = unsafe { forward::selftest_cb_readback(hdev) };
@@ -266,32 +324,223 @@ pub unsafe extern "system" fn OpenAdapter10_2(open_data: *mut D3d10DdiArgOpenAda
 #[no_mangle]
 pub unsafe extern "system" fn OpenAdapter12(open_data: *mut D3d12DdiArgOpenAdapter) -> Hresult {
     log_line("OpenAdapter12");
-    if open_data.is_null() {
-        log_line("OpenAdapter12 null open_data");
+    log_line("OpenAdapter12 -> DXGI_ERROR_UNSUPPORTED (D3D12 DDI not implemented yet)");
+    let _ = open_data;
+    return DXGI_ERROR_UNSUPPORTED;
+
+    #[allow(unreachable_code)]
+    {
+        if open_data.is_null() {
+            log_line("OpenAdapter12 null open_data -> E_NOTIMPL");
+            return E_NOTIMPL;
+        }
+
+        let open = unsafe { &mut *open_data };
+        if open.p_adapter_funcs.is_null() {
+            log_line("OpenAdapter12 null pAdapterFuncs -> E_NOTIMPL");
+            return E_NOTIMPL;
+        }
+
+        open.h_adapter = D3d10DdiAdapterHandle {
+            p_drv_private: core::ptr::addr_of_mut!(ADAPTER_COOKIE).cast::<c_void>(),
+        };
+
+        let funcs = unsafe { &mut *open.p_adapter_funcs };
+        funcs.pfn_calc_private_device_size = Some(d3d12_calc_private_device_size);
+        funcs.pfn_create_device = Some(d3d12_create_device);
+        funcs.pfn_close_adapter = Some(d3d12_close_adapter);
+        funcs.pfn_get_supported_versions = Some(d3d12_get_supported_versions);
+        funcs.pfn_get_caps = Some(d3d12_get_caps);
+        funcs.pfn_get_optional_ddi_tables = Some(d3d12_get_optional_ddi_tables);
+        funcs.pfn_fill_ddi_table = Some(d3d12_fill_ddi_table);
+        funcs.pfn_destroy_device = Some(d3d12_destroy_device);
+
+        log_line("OpenAdapter12 -> S_OK (adapter funcs installed)");
+        S_OK
+    }
+}
+
+unsafe extern "system" fn d3d12_calc_private_device_size(
+    _h_adapter: D3d10DdiAdapterHandle,
+    args: *const D3d12DdiArgCalcPrivateDeviceSize,
+) -> usize {
+    if args.is_null() {
+        log_line("D3D12 CalcPrivateDeviceSize null args -> 8");
+    } else {
+        let args = unsafe { &*args };
+        log_line(&format!(
+            "D3D12 CalcPrivateDeviceSize interface=0x{:08x} version=0x{:08x} flags=0x{:08x} -> 8",
+            args.interface, args.version, args.flags
+        ));
+    }
+    core::mem::size_of::<usize>()
+}
+
+unsafe extern "system" fn d3d12_create_device(
+    _h_adapter: D3d10DdiAdapterHandle,
+    args: *const D3d12DdiArgCreateDevice,
+) -> Hresult {
+    if args.is_null() {
+        log_line("D3D12 CreateDevice null args -> E_NOTIMPL");
+    } else {
+        let args = unsafe { &*args };
+        log_line(&format!(
+            "D3D12 CreateDevice interface=0x{:08x} version=0x{:08x} flags=0x{:08x} \
+             hRTDevice={:p} hDrvDevice={:p} pKTCallbacks={:p} pUMCallbacks={:p} -> E_NOTIMPL",
+            args.interface,
+            args.version,
+            args.flags,
+            args.h_rt_device,
+            args.h_drv_device,
+            args.p_kt_callbacks,
+            args.p_um_callbacks,
+        ));
+    }
+    E_NOTIMPL
+}
+
+unsafe extern "system" fn d3d12_close_adapter(_h_adapter: D3d10DdiAdapterHandle) -> Hresult {
+    log_line("D3D12 CloseAdapter");
+    S_OK
+}
+
+unsafe extern "system" fn d3d12_get_supported_versions(
+    _h_adapter: D3d10DdiAdapterHandle,
+    entries: *mut u32,
+    supported_versions: *mut u64,
+) -> Hresult {
+    if entries.is_null() {
+        log_line("D3D12 GetSupportedVersions null entries -> E_NOTIMPL");
         return E_NOTIMPL;
     }
 
-    let open = unsafe { &mut *open_data };
-    if open.p_adapter_funcs.is_null() {
-        log_line("OpenAdapter12 null p_adapter_funcs");
-        return E_NOTIMPL;
+    let requested_entries = unsafe { *entries };
+    log_line(&format!(
+        "D3D12 GetSupportedVersions requested={requested_entries} bufNull={} (advertising {:#018x?})",
+        supported_versions.is_null(),
+        D3D12_SUPPORTED_DDI_VERSIONS,
+    ));
+    unsafe { *entries = D3D12_SUPPORTED_DDI_VERSIONS.len() as u32 };
+
+    if supported_versions.is_null() {
+        return S_OK;
     }
 
-    open.h_adapter = D3d10DdiAdapterHandle {
-        p_drv_private: core::ptr::addr_of_mut!(ADAPTER_COOKIE).cast::<c_void>(),
-    };
+    if requested_entries < D3D12_SUPPORTED_DDI_VERSIONS.len() as u32 {
+        return E_OUTOFMEMORY;
+    }
 
-    let funcs = unsafe { &mut *open.p_adapter_funcs };
-    funcs.pfn_calc_private_device_size = Some(calc_private_device_size);
-    funcs.pfn_create_device = Some(create_device);
-    funcs.pfn_close_adapter = Some(close_adapter);
-    funcs.pfn_get_supported_versions = Some(get_supported_versions);
-    funcs.pfn_get_caps = Some(get_caps);
-    funcs.pfn_get_optional_ddi_tables = core::ptr::null();
-    funcs.pfn_fill_ddi_table = core::ptr::null();
-    funcs.pfn_destroy_device = core::ptr::null();
+    for (index, version) in D3D12_SUPPORTED_DDI_VERSIONS.iter().enumerate() {
+        unsafe { *supported_versions.add(index) = *version };
+    }
+    S_OK
+}
+
+unsafe extern "system" fn d3d12_get_caps(
+    _h_adapter: D3d10DdiAdapterHandle,
+    args: *const D3d10_2DdiArgGetCaps,
+) -> Hresult {
+    const D3D12DDICAPS_TYPE_MEMORY_ARCHITECTURE: u32 = 1002;
+    const D3D12DDICAPS_TYPE_SHADER: u32 = 1004;
+    const D3D12DDICAPS_TYPE_ARCHITECTURE_INFO: u32 = 1005;
+    const D3D12DDICAPS_TYPE_D3D12_OPTIONS: u32 = 1006;
+    const D3D12DDICAPS_TYPE_3DPIPELINESUPPORT: u32 = 1007;
+    const D3D12DDICAPS_TYPE_0081_3DPIPELINESUPPORT1: u32 = 1074;
+    const D3D12DDI_3DPIPELINELEVEL_1_0_CORE: u32 = 2;
+
+    if args.is_null() {
+        log_line("D3D12 GetCaps null args -> S_OK");
+        return S_OK;
+    }
+
+    let args = unsafe { &*args };
+    log_line(&format!(
+        "D3D12 GetCaps type=0x{:08x} dataSize={} pInfo={:p}",
+        args.caps_type, args.data_size, args.p_info,
+    ));
+
+    if !args.p_data.is_null() && args.data_size != 0 {
+        if args.caps_type == D3D12DDICAPS_TYPE_0081_3DPIPELINESUPPORT1 && args.data_size >= 8 {
+            let data = args.p_data as *mut u32;
+            let runtime_max = unsafe { *data.add(0) };
+            let driver_max = runtime_max.min(D3D12DDI_3DPIPELINELEVEL_1_0_CORE);
+            unsafe {
+                *data.add(1) = driver_max;
+            }
+            log_line(&format!(
+                "  D3D12 GetCaps: 3DPIPELINESUPPORT1 runtimeMax={} driverMax={}",
+                runtime_max, driver_max
+            ));
+            return S_OK;
+        }
+
+        unsafe { core::ptr::write_bytes(args.p_data as *mut u8, 0, args.data_size as usize) };
+        match args.caps_type {
+            D3D12DDICAPS_TYPE_3DPIPELINESUPPORT if args.data_size >= 4 => {
+                unsafe { *(args.p_data as *mut u32) = D3D12DDI_3DPIPELINELEVEL_1_0_CORE };
+                log_line("  D3D12 GetCaps: 3DPIPELINESUPPORT = 1_0_CORE");
+            }
+            D3D12DDICAPS_TYPE_MEMORY_ARCHITECTURE if args.data_size >= 12 => {
+                let data = args.p_data as *mut u32;
+                unsafe {
+                    *data.add(0) = 1; // UMA
+                    *data.add(1) = 1; // IO coherent
+                    *data.add(2) = 1; // Cache coherent
+                }
+                log_line("  D3D12 GetCaps: MEMORY_ARCHITECTURE = UMA/IO/cache coherent");
+            }
+            D3D12DDICAPS_TYPE_SHADER => {
+                log_line("  D3D12 GetCaps: SHADER = zero");
+            }
+            D3D12DDICAPS_TYPE_D3D12_OPTIONS => {
+                log_line("  D3D12 GetCaps: D3D12_OPTIONS = zero");
+            }
+            D3D12DDICAPS_TYPE_ARCHITECTURE_INFO => {
+                log_line("  D3D12 GetCaps: ARCHITECTURE_INFO = zero");
+            }
+            _ => {}
+        }
+    }
 
     S_OK
+}
+
+unsafe extern "system" fn d3d12_get_optional_ddi_tables(
+    _h_adapter: D3d10DdiAdapterHandle,
+    entries: *mut u32,
+    requests: *mut D3d12DdiTableRequest,
+) -> Hresult {
+    if entries.is_null() {
+        log_line("D3D12 GetOptionalDDITables null entries -> E_NOTIMPL");
+        return E_NOTIMPL;
+    }
+
+    let requested_entries = unsafe { *entries };
+    log_line(&format!(
+        "D3D12 GetOptionalDDITables requested={requested_entries} requestsNull={} -> 0 tables",
+        requests.is_null()
+    ));
+    unsafe { *entries = 0 };
+    S_OK
+}
+
+unsafe extern "system" fn d3d12_fill_ddi_table(
+    _h_adapter: D3d10DdiAdapterHandle,
+    table_type: u32,
+    table: *mut c_void,
+    table_size: usize,
+    interface: u32,
+    rt_table: *mut c_void,
+) -> Hresult {
+    log_line(&format!(
+        "D3D12 FillDDITable type={} table={:p} size={} interface=0x{:08x} rtTable={:p} -> E_NOTIMPL",
+        table_type, table, table_size, interface, rt_table,
+    ));
+    E_NOTIMPL
+}
+
+unsafe extern "system" fn d3d12_destroy_device(h_device: *mut c_void) {
+    log_line(&format!("D3D12 DestroyDevice hDevice={h_device:p}"));
 }
 
 unsafe fn open_adapter_common(open_data: *mut D3d10DdiArgOpenAdapter, with_10_2: bool) -> Hresult {
@@ -384,8 +633,16 @@ unsafe extern "system" fn create_device(
             create.h_drv_device as *mut device_funcs::HeliosDevice,
             device_funcs::HeliosDevice {
                 dxvk,
+                h_rt_device: create.h_rt_device,
+                h_context: core::ptr::null_mut(),
+                kt_callbacks: create.p_kt_callbacks as *const ddi::D3DDDI_DEVICECALLBACKS,
+                dxgi_callbacks: create.dxgi_base_ddi.p_dxgi_base_callbacks
+                    as *mut ddi::DXGI_DDI_BASE_CALLBACKS,
                 ia: core::cell::RefCell::new(device_funcs::IaState::default()),
             },
+        );
+        device_funcs::create_runtime_context(
+            &mut *(create.h_drv_device as *mut device_funcs::HeliosDevice),
         );
     }
 
@@ -396,12 +653,30 @@ unsafe extern "system" fn create_device(
         return E_FAIL;
     }
     unsafe {
-        device_funcs::fill_d3d11_device_funcs(
-            create.p_device_funcs as *mut ddi::D3D11DDI_DEVICEFUNCS,
-        );
-        device_funcs::fill_dxgi_base_funcs(
-            create.dxgi_base_ddi.p_dxgi_ddi_base_functions as *mut ddi::DXGI_DDI_BASE_FUNCTIONS,
-        );
+        if create.interface >= 0x000b_0022 {
+            device_funcs::fill_wddm2_1_device_funcs(
+                create.p_device_funcs as *mut ddi::D3DWDDM2_1DDI_DEVICEFUNCS,
+            );
+            device_funcs::fill_dxgi_1_1_base_funcs(
+                create.dxgi_base_ddi.p_dxgi_ddi_base_functions
+                    as *mut ddi::DXGI1_1_DDI_BASE_FUNCTIONS,
+            );
+        } else if create.interface >= 0x000b_000f {
+            device_funcs::fill_d3d11_1_device_funcs(
+                create.p_device_funcs as *mut ddi::D3D11_1DDI_DEVICEFUNCS,
+            );
+            device_funcs::fill_dxgi_1_1_base_funcs(
+                create.dxgi_base_ddi.p_dxgi_ddi_base_functions
+                    as *mut ddi::DXGI1_1_DDI_BASE_FUNCTIONS,
+            );
+        } else {
+            device_funcs::fill_d3d11_device_funcs(
+                create.p_device_funcs as *mut ddi::D3D11DDI_DEVICEFUNCS,
+            );
+            device_funcs::fill_dxgi_base_funcs(
+                create.dxgi_base_ddi.p_dxgi_ddi_base_functions as *mut ddi::DXGI_DDI_BASE_FUNCTIONS,
+            );
+        }
     }
 
     log_line("  CreateDevice -> S_OK (DXVK device + D3D11 funcs table installed)");
@@ -449,10 +724,12 @@ unsafe extern "system" fn get_caps(
     _h_adapter: D3d10DdiAdapterHandle,
     args: *const D3d10_2DdiArgGetCaps,
 ) -> Hresult {
-    // D3D11DDICAPS_3DPIPELINESUPPORT (130): the runtime gates D3D11 device
-    // creation on this — return 0 and it concludes the adapter can't do D3D11 and
-    // returns DXGI_ERROR_UNSUPPORTED before ever calling CreateDevice.
+    const D3D11DDICAPS_THREADING: u32 = 128;
+    const D3D11DDICAPS_SHADER: u32 = 129;
     const D3D11DDICAPS_3DPIPELINESUPPORT: u32 = 130;
+    const D3D11_1DDICAPS_D3D11_OPTIONS: u32 = 131;
+    const D3D11_1DDICAPS_ARCHITECTURE_INFO: u32 = 132;
+    const D3D11_1DDICAPS_SHADER_MIN_PRECISION_SUPPORT: u32 = 134;
 
     if !args.is_null() {
         let args = unsafe { &*args };
@@ -463,10 +740,44 @@ unsafe extern "system" fn get_caps(
         if !args.p_data.is_null() && args.data_size != 0 {
             // Default: zero the output.
             unsafe { core::ptr::write_bytes(args.p_data as *mut u8, 0, args.data_size as usize) };
-            // Report 3D pipeline support so the runtime proceeds to CreateDevice.
-            if args.caps_type == D3D11DDICAPS_3DPIPELINESUPPORT && args.data_size >= 4 {
-                unsafe { *(args.p_data as *mut u32) = 1 };
-                log_line("  GetCaps: reporting 3DPIPELINESUPPORT = TRUE");
+            match args.caps_type {
+                // D3D11DDI_THREADING_CAPS::Caps. Zero means no free-threaded
+                // mode and no command-list build support; the runtime must
+                // serialize/emulate.
+                D3D11DDICAPS_THREADING if args.data_size >= 4 => {
+                    unsafe { *(args.p_data as *mut u32) = 0 };
+                    log_line("  GetCaps: THREADING caps = 0");
+                }
+                // D3D11DDI_SHADER_CAPS::Caps. Zero means no optional shader
+                // caps such as double precision.
+                D3D11DDICAPS_SHADER if args.data_size >= 4 => {
+                    unsafe { *(args.p_data as *mut u32) = 0 };
+                    log_line("  GetCaps: SHADER caps = 0");
+                }
+                // D3D11DDI_3DPIPELINESUPPORT_CAPS::Caps is a
+                // D3D11DDI_3DPIPELINELEVEL enum. Advertising 10_1 lets the
+                // runtime enter CreateDevice; the stricter MSAA/format caps then
+                // make it settle on FL10_0 for this adapter. Advertising exactly
+                // 10_0 makes the runtime remove the device before CreateDevice
+                // completes on this stack.
+                D3D11DDICAPS_3DPIPELINESUPPORT if args.data_size >= 4 => {
+                    const D3D11DDI_3DPIPELINELEVEL_10_1: u32 = 1;
+                    unsafe { *(args.p_data as *mut u32) = D3D11DDI_3DPIPELINELEVEL_10_1 };
+                    log_line("  GetCaps: 3DPIPELINESUPPORT = 10_1");
+                }
+                // D3D11.1 optional caps. The zeroed structs are valid
+                // conservative answers: no logic-op, no debug binary support,
+                // immediate-mode renderer, no shader min-precision support.
+                D3D11_1DDICAPS_D3D11_OPTIONS if args.data_size >= 8 => {
+                    log_line("  GetCaps: D3D11_OPTIONS = zero");
+                }
+                D3D11_1DDICAPS_ARCHITECTURE_INFO if args.data_size >= 4 => {
+                    log_line("  GetCaps: ARCHITECTURE_INFO = zero");
+                }
+                D3D11_1DDICAPS_SHADER_MIN_PRECISION_SUPPORT if args.data_size >= 8 => {
+                    log_line("  GetCaps: SHADER_MIN_PRECISION_SUPPORT = zero");
+                }
+                _ => {}
             }
         }
     } else {
@@ -475,11 +786,30 @@ unsafe extern "system" fn get_caps(
     S_OK
 }
 
+/// Resolve the per-process UMD log path, computed once.
+///
+/// The restricted IddCx host process (which opens the IDD swapchain surface)
+/// cannot write `C:\Windows\Temp\helios_umd.log` — that directory's ACL only
+/// grants SYSTEM/Administrators, so the IDD process's log lines vanished. We log
+/// to a per-pid file under `C:\ProgramData\Helios\` instead: standard users may
+/// create files there (inherited ProgramData ACL), and a per-pid name means each
+/// process owns its own file with full control regardless of who created the dir.
+pub(crate) fn umd_log_path() -> &'static std::path::Path {
+    use std::sync::OnceLock;
+    static PATH: OnceLock<std::path::PathBuf> = OnceLock::new();
+    PATH.get_or_init(|| {
+        let dir = std::path::Path::new(r"C:\ProgramData\Helios");
+        // Best effort: ignore AlreadyExists / permission errors.
+        let _ = std::fs::create_dir_all(dir);
+        dir.join(format!("umd-{}.log", std::process::id()))
+    })
+}
+
 pub(crate) fn log_line(message: &str) {
     if let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(r"C:\Windows\Temp\helios_umd.log")
+        .open(umd_log_path())
     {
         let _ = writeln!(file, "[pid={}] {}", std::process::id(), message);
     }

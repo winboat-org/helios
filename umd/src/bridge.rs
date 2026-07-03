@@ -22,6 +22,60 @@ pub mod ffi {
         /// the owning ref; wrap on the Rust side without taking ownership.
         fn d3d11_device_ptr(self: &HeliosDxvkDevice) -> usize;
         fn d3d11_context_ptr(self: &HeliosDxvkDevice) -> usize;
+        fn venus_context_id(self: &HeliosDxvkDevice) -> u32;
+        fn set_resource_kmt_handles(
+            self: &HeliosDxvkDevice,
+            d3d11_resource_ptr: usize,
+            local: u32,
+            global: u32,
+        ) -> bool;
+        unsafe fn get_resource_memory_info(
+            self: &HeliosDxvkDevice,
+            d3d11_resource_ptr: usize,
+            memory: *mut u64,
+            size: *mut u64,
+            offset: *mut u64,
+            resource_id: *mut u32,
+        ) -> bool;
+        fn transfer_resource_ownership(self: &HeliosDxvkDevice, d3d11_resource_ptr: usize) -> bool;
+        fn open_ddi_texture2d(
+            self: &HeliosDxvkDevice,
+            width: u32,
+            height: u32,
+            format: u32,
+            bind_flags: u32,
+            misc_flags: u32,
+            global: u32,
+            renderer_resource_id: u32,
+        ) -> usize;
+
+        unsafe fn create_vertex_shader(
+            self: &HeliosDxvkDevice,
+            code: *const u8,
+            len: usize,
+        ) -> usize;
+        unsafe fn create_pixel_shader(
+            self: &HeliosDxvkDevice,
+            code: *const u8,
+            len: usize,
+        ) -> usize;
+        unsafe fn create_geometry_shader(
+            self: &HeliosDxvkDevice,
+            code: *const u8,
+            len: usize,
+        ) -> usize;
+        unsafe fn create_hull_shader(self: &HeliosDxvkDevice, code: *const u8, len: usize)
+            -> usize;
+        unsafe fn create_domain_shader(
+            self: &HeliosDxvkDevice,
+            code: *const u8,
+            len: usize,
+        ) -> usize;
+        unsafe fn create_compute_shader(
+            self: &HeliosDxvkDevice,
+            code: *const u8,
+            len: usize,
+        ) -> usize;
 
         /// Create a DXVK instance and logical device on the Helios venus adapter.
         ///

@@ -37,6 +37,7 @@ pub const HELIOS_ESCAPE_WAIT_FENCE: u32 = 0x0006;
 /// protocol; removed once the DOD's `HELIOS_PRESENT_BLOB` escape supersedes it.
 pub const HELIOS_ESCAPE_PRESENT_BLOB: u32 = 0x0007;
 pub const HELIOS_ESCAPE_RELEASE_BLOB: u32 = 0x0008;
+pub const HELIOS_ESCAPE_ATTACH_RESOURCE: u32 = 0x0009;
 
 /// Header for all escape commands. 16 bytes.
 #[repr(C)]
@@ -148,6 +149,17 @@ pub struct HeliosEscapeReleaseBlob {
     pub padding: u32,
 }
 
+/// `HELIOS_ESCAPE_ATTACH_RESOURCE`. Attach an existing virtio-gpu resource id to
+/// a Venus context before importing it with `VkImportMemoryResourceInfoMESA`.
+/// Input-only. 24 bytes.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct HeliosEscapeAttachResource {
+    pub hdr: HeliosEscapeHeader,
+    pub ctx_id: u32,
+    pub resource_id: u32,
+}
+
 /// `HELIOS_ESCAPE_WAIT_FENCE`. 32 bytes.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
@@ -183,6 +195,7 @@ const _: () = {
     assert!(core::mem::size_of::<HeliosEscapeAllocBlob>() == 48);
     assert!(core::mem::size_of::<HeliosEscapeMapBlob>() == 32);
     assert!(core::mem::size_of::<HeliosEscapeReleaseBlob>() == 32);
+    assert!(core::mem::size_of::<HeliosEscapeAttachResource>() == 24);
     assert!(core::mem::size_of::<HeliosEscapeWaitFence>() == 32);
     assert!(core::mem::size_of::<HeliosEscapePresentBlob>() == 40);
 };

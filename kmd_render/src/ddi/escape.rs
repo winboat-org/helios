@@ -17,11 +17,11 @@ use core::mem::size_of;
 
 use bytemuck::{bytes_of, pod_read_unaligned};
 use helios_protocol::{
-    HeliosEscapeAllocBlob, HeliosEscapeCtxCreate, HeliosEscapeCtxDestroy, HeliosEscapeHeader,
-    HeliosEscapeMapBlob, HeliosEscapeReleaseBlob, HeliosEscapeSubmitVenus,
-    HELIOS_ESCAPE_ALLOC_BLOB, HELIOS_ESCAPE_CTX_CREATE, HELIOS_ESCAPE_CTX_DESTROY,
-    HELIOS_ESCAPE_MAP_BLOB, HELIOS_ESCAPE_RELEASE_BLOB, HELIOS_ESCAPE_SUBMIT_VENUS,
-    HELIOS_ESCAPE_WAIT_FENCE,
+    HeliosEscapeAllocBlob, HeliosEscapeAttachResource, HeliosEscapeCtxCreate,
+    HeliosEscapeCtxDestroy, HeliosEscapeHeader, HeliosEscapeMapBlob, HeliosEscapeReleaseBlob,
+    HeliosEscapeSubmitVenus, HELIOS_ESCAPE_ALLOC_BLOB, HELIOS_ESCAPE_ATTACH_RESOURCE,
+    HELIOS_ESCAPE_CTX_CREATE, HELIOS_ESCAPE_CTX_DESTROY, HELIOS_ESCAPE_MAP_BLOB,
+    HELIOS_ESCAPE_RELEASE_BLOB, HELIOS_ESCAPE_SUBMIT_VENUS, HELIOS_ESCAPE_WAIT_FENCE,
 };
 
 use super::blob_map::{
@@ -73,6 +73,7 @@ pub unsafe extern "C" fn dxgkddi_escape(
         HELIOS_ESCAPE_ALLOC_BLOB => escape_alloc_blob(adapter, buf, owner),
         HELIOS_ESCAPE_MAP_BLOB => escape_map_blob(adapter, buf, owner),
         HELIOS_ESCAPE_RELEASE_BLOB => escape_release_blob(adapter, buf, owner),
+        HELIOS_ESCAPE_ATTACH_RESOURCE => escape_attach_resource(adapter, buf),
         // Unknown verbs are rejected.
         _ => STATUS_NOT_IMPLEMENTED,
     }
@@ -133,6 +134,16 @@ fn escape_submit_venus(adapter: &AdapterContext, buf: &mut [u8]) -> NTSTATUS {
         Some(e) if e <= buf.len() => e,
         _ => return STATUS_INVALID_PARAMETER,
     };
+    crate::diag::record(0x0D00_0000 | ((req.buffer_size as u32) & 0xFFFF));
+    crate::diag::record(0x0D01_0000 | ((buf.len() as u32) & 0xFFFF));
+    if payload >= 4 {
+        let w0 = u32::from_le_bytes([buf[hsz], buf[hsz + 1], buf[hsz + 2], buf[hsz + 3]]);
+        crate::diag::record(0x0D02_0000 | (w0 & 0xFFFF));
+    }
+    if payload >= 8 {
+        let w1 = u32::from_le_bytes([buf[hsz + 4], buf[hsz + 5], buf[hsz + 6], buf[hsz + 7]]);
+        crate::diag::record(0x0D03_0000 | (w1 & 0xFFFF));
+    }
 
     // Copy the stream into device-visible contiguous memory (PASSIVE_LEVEL).
     let mut dma = match DmaBuffer::new(payload) {
@@ -141,8 +152,8 @@ fn escape_submit_venus(adapter: &AdapterContext, buf: &mut [u8]) -> NTSTATUS {
     };
     dma.as_mut_slice().copy_from_slice(&buf[hsz..end]);
 
-    let (ctx_id, fence_id) = (req.ctx_id, req.fence_id);
-    match adapter.with_virtio(|v| v.submit_venus(ctx_id, fence_id, dma.as_slice())) {
+    let (ctx_id, fence_id, ring_idx) = (req.ctx_id, req.fence_id, req.ring_idx);
+    match adapter.with_virtio(|v| v.submit_venus(ctx_id, fence_id, ring_idx, dma.as_slice())) {
         Ok(Ok(())) => STATUS_SUCCESS,
         Ok(Err(ve)) => ve.into(),
         Err(de) => de.into(),
@@ -212,13 +223,13 @@ fn escape_map_blob(adapter: &AdapterContext, buf: &mut [u8], owner: usize) -> NT
     }
     // Reject a second map of an already-mapped resource (would claim a second
     // window offset + leave a duplicate host mapping). The ICD maps each blob once.
-    if adapter.mappings.contains(req.resource_id) {
+    if adapter.mappings.contains(owner, req.resource_id) {
         return STATUS_INVALID_DEVICE_REQUEST;
     }
 
     // Phase 1 — under the virtio spinlock (DISPATCH): RESOURCE_MAP_BLOB at a fresh
     // window offset; returns the guest-physical range + host caching.
-    let prep = match adapter.with_virtio(|v| v.map_blob_prepare(req.resource_id)) {
+    let prep = match adapter.with_virtio(|v| v.map_blob_prepare_for_owner(owner, req.resource_id)) {
         Ok(Ok(p)) => p,
         Ok(Err(ve)) => return ve.into(),
         Err(de) => return de.into(),
@@ -271,7 +282,27 @@ fn escape_release_blob(adapter: &AdapterContext, buf: &[u8], owner: usize) -> NT
         // SAFETY: PASSIVE, in the creating process; pair from a prior MAP_BLOB.
         unsafe { unmap_io_pages_from_user(user_va, mdl as wdk_sys::PMDL) };
     }
-    match adapter.with_virtio(|v| v.release_blob(req.ctx_id, req.resource_id)) {
+    match adapter.with_virtio(|v| v.release_blob_for_owner(owner, req.ctx_id, req.resource_id)) {
+        Ok(Ok(())) => STATUS_SUCCESS,
+        Ok(Err(ve)) => ve.into(),
+        Err(de) => de.into(),
+    }
+}
+
+/// `HELIOS_ESCAPE_ATTACH_RESOURCE` → attach a live resource id to a Venus context
+/// without taking ownership. Used by the DXVK/Mesa shared-resource import path:
+/// the resource was created by another device/context and must be visible in the
+/// importing context before `VkImportMemoryResourceInfoMESA` reaches virglrenderer.
+fn escape_attach_resource(adapter: &AdapterContext, buf: &[u8]) -> NTSTATUS {
+    let sz = size_of::<HeliosEscapeAttachResource>();
+    if buf.len() < sz {
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+    let req: HeliosEscapeAttachResource = pod_read_unaligned(&buf[..sz]);
+    if req.ctx_id == 0 || req.resource_id == 0 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    match adapter.with_virtio(|v| v.ctx_attach_resource(req.ctx_id, req.resource_id)) {
         Ok(Ok(())) => STATUS_SUCCESS,
         Ok(Err(ve)) => ve.into(),
         Err(de) => de.into(),
