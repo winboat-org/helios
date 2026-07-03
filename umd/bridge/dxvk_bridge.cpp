@@ -985,6 +985,11 @@ bool HeliosDxvkDevice::rotate_resource_backings(
     // Full device sync: the storages must not be referenced by in-flight CS
     // or GPU work while they move between images. Presents on this stack are
     // low-rate during bring-up; revisit with the C3 async-fence work.
+    //
+    // The wait MUST be bounded: this runs on dwm's present thread inside a
+    // runtime DDI, and a query that never signals (renderer context killed
+    // host-side, e.g. Xid 109) otherwise wedges composition process-wide
+    // (observed 2026-07-03: 80+ minutes at 100% of a core).
     D3D11_QUERY_DESC qd = { D3D11_QUERY_EVENT, 0 };
     ID3D11Query* query = nullptr;
     if (FAILED(impl->d3d11->CreateQuery(&qd, &query)) || !query) {
@@ -993,9 +998,32 @@ bool HeliosDxvkDevice::rotate_resource_backings(
     }
     impl->context->End(query);
     impl->context->Flush();
-    while (impl->context->GetData(query, nullptr, 0, 0) == S_FALSE)
-      ::Sleep(0);
+    constexpr ULONGLONG kSyncDeadlineMs = 30000;
+    const ULONGLONG syncStart = GetTickCount64();
+    HRESULT syncHr;
+    for (uint32_t spin = 0; (syncHr = impl->context->GetData(query, nullptr, 0, 0)) == S_FALSE; ++spin) {
+      if ((spin & 0xff) == 0xff) {
+        HRESULT removed = impl->d3d11->GetDeviceRemovedReason();
+        if (FAILED(removed)) {
+          umd_log("rotate_resource_backings: device removed during sync, skipping rotation");
+          query->Release();
+          return false;
+        }
+        if (GetTickCount64() - syncStart >= kSyncDeadlineMs) {
+          umd_log("rotate_resource_backings: sync deadline exceeded (device wedged?), skipping rotation");
+          query->Release();
+          return false;
+        }
+      }
+      // stay hot briefly for the common sub-millisecond completion, then
+      // yield the core so a slow/dead GPU does not peg the present thread
+      ::Sleep(spin < 1024 ? 0 : 1);
+    }
     query->Release();
+    if (syncHr != S_OK) {
+      umd_log("rotate_resource_backings: event query GetData failed, skipping rotation");
+      return false;
+    }
 
     // Debug instrument (registry-gated, off by default): sample the surface
     // that was JUST presented (resource[0], pre-rotation) while the device is

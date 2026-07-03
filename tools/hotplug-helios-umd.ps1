@@ -119,6 +119,19 @@ if ($Mode -eq "PackageUpgrade") {
     if ($RestartDevice) {
       Write-Host "Re-enabling Helios after ProgramData UMD replacement."
       Invoke-HeliosPnpUtil @("/enable-device", $id) 90 | Out-Null
+      # The Helios PnP restart mints a new adapter LUID; the IDD's latched
+      # render-adapter pairing then names a dead adapter and the OS never
+      # re-offers a swapchain (observed 2026-07-04: endless no-AssignSwapChain
+      # replug loop after a deploy). Restart the IDD so it re-pairs against
+      # the fresh LUID. (LGIdd also revalidates the LUID on fruitless replugs
+      # now — this keeps deploys deterministic rather than waiting on that.)
+      $devcon = "C:\Program Files (x86)\Windows Kits\10\Tools\10.0.26100.0\x64\devcon.exe"
+      if (Test-Path -LiteralPath $devcon) {
+        Write-Host "Restarting the LG IDD so it re-pairs with the new Helios adapter LUID."
+        & $devcon restart '@ROOT\DISPLAY\0000' | Out-Null
+      } else {
+        Write-Warning "devcon not found at $devcon; restart ROOT\DISPLAY\0000 manually so the IDD re-pairs."
+      }
     }
   }
 }
