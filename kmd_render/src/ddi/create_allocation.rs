@@ -963,8 +963,20 @@ pub unsafe extern "C" fn dxgkddi_get_standard_allocation_driver_data(
     };
 
     let pitch = cross_adapter_pitch(width);
+    // Size the blob past pitch×height: these blobs get imported as LINEAR
+    // VkImages on the host, and NVIDIA's external-linear image requirements
+    // round the row count up to GOB granularity plus opaque tail slack
+    // (observed: 1896x48 → 487424 vs 368640 tight; 1896x1030 → 8773632 vs
+    // 7913472; 1024x1872 → 7864320 = pitch × align(1872, 128)). A blob
+    // smaller than the image requirement binds "successfully" and then MMU-
+    // faults when the sampler reads the slack region (host Xid 31,
+    // FAULT_PTE VIRT_READ — killed the IDD feed live 2026-07-04). The
+    // importer refuses undersized imports loudly, so an insufficient bound
+    // here surfaces as a failed open, never a GPU fault.
+    let padded_rows = ((height as u64) + 127) & !127;
     let size = (pitch as u64)
-        .saturating_mul(height as u64)
+        .saturating_mul(padded_rows)
+        .saturating_add(64 * 1024)
         .max(PAGE as u64);
 
     let ap = HeliosWddmAllocPrivate::new(
