@@ -71,12 +71,24 @@ On real hardware step 1 is a TDR and dwm recovers in ~2 s. Helios lacked that co
    presents). Only sustained owner-visible desktop closes the milestone (content pipeline is
    unchanged from the 7th session which had verified real pixels; this session's sampler
    reads only caught frame-1 zeros because the desktop was idle).
-2. **H1 — why did dwm's submission hang the GPU channel (Xid 109) at the login transition?**
-   Open question, now *observable*: with the TDR contract a recurrence = one loud
-   `HELIOS: semaphore forward-progress deadline exceeded` log + dwm restart + host Xid line,
-   instead of a silent freeze. If it recurs, correlate the host Xid timestamp with dwm's UMD
-   log (what was submitted) — suspect list: a GPU-side wait-before-signal ordering bug in a
-   submission, or a degenerate draw (infinite/huge loop) from a still-broken state path.
+2. **H1 — RESOLVED to a concrete suspect (same session, validate boot).** Owner rebooted
+   with `HELIOS_VKR_DEBUG=validate`; the FULL host validation log contains exactly ONE
+   violation class: dwm pipelines binding `R16G16_SINT`/`R32_SINT` vertex attributes against
+   **float32-typed shader inputs** (`VUID-VkGraphicsPipelineCreateInfo-Input-08733`,
+   TEXCOORD0–4) — vertex-fetch UB; garbage SINT→float reinterpretation feeding dwm's
+   composition shaders is the prime Xid-109 trigger (two more Xids fired at 00:51/01:11
+   during churn, each as dwm rebuilt composition; the venus/ICD layer itself was
+   validation-clean). Root cause of the float typing: **cold-boot dwm devices hit the
+   UNTYPED legacy create_vertex_shader** because boot-time UMD resolution served a **stray
+   pre-typed-fix `helios_umd.dll` at the DriverStore FileRepository ROOT** (dated 06-24;
+   hash DC207B58, untracked) — same negotiated interface 0xb000f everywhere (raw-args dump
+   proved the struct read correct); post-hotplug devices loaded the current DLL and were
+   typed. The stray is DELETED; the UMD now logs its own module path per process
+   (`UMD module:` line) and dumps raw CreateDevice args. Verified post-deploy: 12/12 typed
+   creates, 0 untyped. **Confirm on the next cold boot (validate on): expect the first dwm
+   devices to log the current module, 0 untyped creates, no Input-08733 in
+   /tmp/helios-qemu-stderr.log, and no Xid 109.** ~30 stale DriverStore package dirs remain
+   (only the root stray was load-bearing); prune opportunistically.
 3. **Extend the forward-progress deadline to fence and query feedback waits** (same shape as
    semaphores in vn_queue.c). dwm's kill path was semaphores; games may wedge on fences.
 4. Backlog unchanged: rotation cost (C3 async-fence), buffer-reqs cache always-miss, §5
