@@ -1,5 +1,49 @@
 # Handoff — FIRST USER-VISIBLE FRAMES (2026-07-03)
 
+> ## ⚠️ §0 COLD-BOOT RESULT (added same day, after the owner's hard reboot): TRANSIENT.
+> The visible frames did NOT survive a cold boot. After a hard reboot (07:09) the owner sees
+> only the LG client placeholder. Diagnosis from that boot's evidence (nothing was restarted;
+> the failed state was left in place):
+>
+> - **dwm: STABLE.** Single instance since boot, zero dumps — the P0 crash-loop class did not
+>   return. Helios KMD: Code 0.
+> - **The IDD devnode is Code 43 `CM_PROB_FAILED_POST_START`** — the pre-existing cold-boot
+>   failure mode (June-26 memory), which predates this session's changes.
+> - **Root cause class found: LGIdd.dll crashed WUDFHost — a UMDF VERIFIER FAILFAST.**
+>   System log 07:10:09 Critical: "A runtime failure has occurred in user-mode driver
+>   LGIdd.dll and the hosting process has been terminated"; WER report
+>   `NonCritical_VerifierFailure_…` → `fxverifierbugcheck.cpp:188
+>   (FxVerifierDriverReportedBugcheck)`, ErrorNumber `050100040000010f`, Driver=LGIdd.dll.
+>   No stack in the report (no dump was configured at the time).
+> - **Boot log sequence** (`looking-glass-idd.1.txt` after the next rotation; times 01:39Z):
+>   clean init → SelectRenderAdapter(Helios @ LUID fa5d) → MonitorArrival OK → CommitModes
+>   paths=1 → AssignSwapChain at +2 s **paired to LUID 77eb — an OLDER pairing instance than
+>   the live Helios adapter** (boot-time pairing churn, same signature as the warm case) →
+>   SetDevice ×5 `0x887A0026` → ABANDON returned at 01:39:44 → **log ends**. CDebug flushes
+>   per line, and the state machine's offer-timeout would have logged at +10 s (01:39:51)
+>   before acting — no such line exists ⇒ **the crash happened in the ~7 s window right
+>   after the boot-time ABANDON, BEFORE the new watchdog ever ran.** The watchdog machinery
+>   is exonerated for the crash itself (and died with the process — an in-driver watchdog
+>   cannot recover a FAILED_POST_START devnode).
+> - Contrast with the warm case (06:53, same driver): identical ABANDON → OS re-offered a
+>   new swapchain 1 s later → bind → frames. At cold boot the OS (or the crash) never got
+>   there. UMDF said it would retry the device 5 times; no retry ever reached DriverEntry
+>   (the log never rotated again) — the devnode settled at FAILED_POST_START.
+> - **Action taken: WUDFHost.exe LocalDumps enabled** (C:\HeliosDumps, full, DumpCount=3) —
+>   the next boot-time failfast leaves a stack. That dump is the #1 input for the next
+>   session.
+>
+> **Next-session priority therefore shifts:** before the §3/§4 items below, root-cause the
+> boot-time UMDF verifier failfast (reboot with dumps armed → `cdb -z` the WUDFHost dump
+> with the LGIdd PDB from `LookingGlass\idd\x64\Release`). Suspect surface: the
+> ABANDON-return aftermath at boot (IddCx deleting the abandoned swapchain during
+> post-start while the monitor-object teardown/our EvtCleanupCallback interleave — the
+> same FxObject double-management class as the June-25 swapchain-leak verifier bug), and
+> any interaction with the stale-pairing (LUID 77eb) instance being torn down under our
+> live CD3D11Device. The IDD was deliberately left in the failed state; a
+> `pnputil /restart-device ROOT\DISPLAY\0000` (or reboot) will bring it back when the
+> owner chooses.
+
 **Milestone, owner-confirmed by eyes on the Looking Glass client** (the only evidence that
 counts, per `HELIOS_FIRST_PRINCIPLES_AUDIT.md` §4): a very dark-red desktop background with
 black padding top and bottom, the Notepad window (content completely black; the Notepad logo

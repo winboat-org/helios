@@ -466,6 +466,21 @@ indirect swapchain objects); (b) consider a cross-component staleness signal (th
 dwm's presents on Helios; the IDD sees acquires — presents advancing with acquires pinned at
 0 for N s IS decidable with UMD→IDD plumbing, e.g. via the existing pipe server).
 
+**⚠️ Cold-boot addendum (same day, after the owner's hard reboot): the visible frames were
+TRANSIENT — they do not survive a cold boot.** The owner sees only the client placeholder
+after a hard reboot. Evidence (boot 07:09): dwm stable (P0 held), Helios Code 0, but the IDD
+devnode is Code 43 `CM_PROB_FAILED_POST_START` because **LGIdd.dll failfasted WUDFHost — a
+UMDF verifier bugcheck** (`FxVerifierDriverReportedBugcheck`, error `050100040000010f`) in
+the ~7 s window right after the boot-time first-swapchain ABANDON, *before* the new watchdog
+ever ran (per-line-flushed log ends at the abandon; the +10 s watchdog line never printed).
+This is the pre-existing June-26 cold-boot failure mode, now bracketed to a crash class and
+window. The boot swapchain again arrived paired to an OLDER LUID than the live Helios
+adapter (churn), abandon behaved per contract — but at boot the OS never re-offers; the
+process dies instead. WUDFHost LocalDumps now enabled (C:\HeliosDumps, full ×3): the next
+cold boot yields the stack. **C5's watchdog cannot fix this — no user-mode state machine
+survives its own host process being terminated; the failfast itself must be root-caused
+and fixed.** See `HANDOFF_FIRST_VISIBLE_FRAMES_2026_07_03.md` §0.
+
 ## 5. Handoff prompt (copy-paste for the next session)
 
 > You are continuing the Helios vGPU project in /home/rupansh/helios-vgpu. **Read
