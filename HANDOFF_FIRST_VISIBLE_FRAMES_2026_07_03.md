@@ -267,19 +267,65 @@ Leads, in order:
   lands in the CollectDbgInfo 'HDBG' report (13 DWORDs, magic 0x48444247).
 - The tree is now COMMITTED (c8f9091) — keep committing scoped work from here on.
 
-## 7. Copy-paste prompt for the next session
+## 7. Copy-paste prompt for the next session (updated after the three cold boots)
 
 > You are continuing the Helios vGPU project in /home/rupansh/helios-vgpu. Read
-> `HELIOS_FIRST_PRINCIPLES_AUDIT.md` in full (esp. §4b), then
-> `HANDOFF_FIRST_VISIBLE_FRAMES_2026_07_03.md`. State: first owner-confirmed visible frames
-> (wallpaper + window frames + cursor in the LG client); notepad content black; frame
-> occasionally drops to black. P0+P1 are deployed and committed (parent c8f9091). Work in
-> order: (1) resolve the steady-state feed question with the on-demand repro in handoff §3 —
-> re-run the notepad poke while the owner watches, then ntoseye into dxgkrnl's
-> indirect-swapchain/blt-queue if acquires stay 0 while the image changes are unexplained;
-> (2) P2 content correctness per audit C1 then C6 (black GDI windows are the expected
-> casualty of those two contracts — acceptance: notepad/cmd legible in the client);
-> (3) P1 acceptance: ten consecutive cold boots, owner sees the live desktop, zero manual
-> actions (ask the owner to run the boots). Evidence discipline: only what the owner sees in
-> the client counts. No hacks, no restart rituals, loud failure over fake success. Ask
-> before rebooting the VM. Commit scoped work as you go.
+> `HELIOS_FIRST_PRINCIPLES_AUDIT.md` in full (esp. §4b and the cold-boot addendum), then
+> `HANDOFF_FIRST_VISIBLE_FRAMES_2026_07_03.md` — §§0a-0c are the current frontier. The
+> overseer's standing directive: no hacks, no kick/restart rituals, implement the real
+> fixes; loud failure over fake success. Evidence discipline: only what the owner sees
+> live in the Looking Glass client counts; instrument-level results are leads, not proof.
+> Ask before rebooting or relaunching the VM. The tree is committed through the boot-#3
+> docs; commit scoped work as you go.
+>
+> STATE: P0 (all five stability fixes) and P1's C5 monitor-lifecycle state machine are
+> implemented, deployed (KMD 22.22.40.0, UMD f9609819, ICD sync-alloc build, LGIdd
+> 6.53.8.135) and committed (parent c8f9091 + follow-ups). First owner-confirmed visible
+> frames happened warm (dark-red wallpaper, black notepad window, live cursor). Three cold
+> boots then established the taxonomy: the IDD is killed (WUDFHost terminated at
+> AssignSwapChain+25 s, FxVerifierDriverReportedBugcheck 050100040000010f → Code 43
+> FAILED_POST_START) IFF an abandoned first swapchain is ASSIGNED during the post-start
+> window (boots #1/#2); when no assignment happens during post-start (boot #3), the IDD
+> survives and the C5 replug loop self-converges — boot #3 reached a FED steady-state
+> binding (1-frame-per-minute taskbar-clock acquires) with ZERO manual actions.
+>
+> WORK IN ORDER:
+> 1. **C1 allocation identity (hard evidence now)**: boot #3's dwm crash was
+>    `vkr: failed to import resource: invalid res_id 45` → CS error → dead ring → the
+>    sync vkAllocateMemory stalled → mesa watchdog abort()ed dwm. Implement audit §1 C1:
+>    KMD records {resid, blob_size, memory_type_index, exact venus allocationSize} at
+>    CreateAllocation; at OpenAllocation writes a VERSIONED identity struct into the
+>    open-time private data (replacing the `_pad` smuggling) AND attaches the resource to
+>    the OPENER's venus context (CTX_ATTACH_RESOURCE with the opener's ctx id); ICD
+>    imports with the recorded exact size/memory type; DELETE the UMD metadata-texture
+>    fallback (fail opens loudly). This kills the invalid-res_id crash class and is the
+>    lead suspect for the black window content.
+> 2. **ICD failure honesty (audit I-A4/I-A5/I-A6)**: a host CS error must surface as a
+>    clean VkResult / VK_ERROR_DEVICE_LOST — today it is dead-ring stall → watchdog
+>    abort() of the whole process (dwm). Submit-status out-field or ring-status poll
+>    after submit; propagate fatal ring as DEVICE_LOST end-to-end.
+> 3. **The boot-#1/#2 killer**: root-cause the born-abandoned first swapchain (June-26
+>    chain: DxgkRemoveAdapter → BLTQUEUE::Reset → MarkAbandoned → SetDevice 0x887A0026).
+>    The WUDF dump writer is armed (`HKLM\...\CurrentVersion\WUDF` LogEnable=1,
+>    LogMinidumpType=0x1122 → dumps in System32\LogFiles\WUDF) — a boot that reproduces
+>    #1/#2 yields the terminating stack; WER LocalDumps does NOT fire for these. Design
+>    option if the root is external: gate the FIRST IddCxMonitorArrival on desktop
+>    readiness so the fragile assignment cannot happen during post-start.
+> 4. Then the §3 steady-state feed question (stale bindings under activity — repro:
+>    schtasks notepad poke; boot #3 proves idle 1-frame/min is a HEALTHY cadence, so only
+>    activity-without-acquires indicates staleness), P2/C6 GDI coherence (notepad/cmd
+>    legible = acceptance), and the ten-cold-boot P1 acceptance run.
+>
+> OPS: build/deploy recipes in this handoff §5 + `HANDOFF_GDI_BLACKFRAME.md` §6f-2/§6g
+> (KMD: bump the version in kmd_render/build.rs AND Cargo.make.toml before every deploy,
+> install-helios-kmd.ps1 -RestartDevice; UMD: hotplug-helios-umd.ps1 -Mode ProgramData
+> -NoProbe -RestartDevice; ICD: win_meson + install-helios-icd.ps1; IDD:
+> win_looking_glass_idd + devcon update "Root\LGIdd", never in-place DriverStore copy).
+> Logs: IDD `C:\ProgramData\Looking Glass (IDD)\looking-glass-idd.txt`, dwm DXVK
+> `C:\ProgramData\Helios\dwm_helios_umd_dxvk.log` + per-pid umd-<pid>.log beside it, host
+> venus `/tmp/helios-qemu-stderr.log` (vkr lines have NO timestamp prefix — do not grep
+> them away), LG client `/tmp/helios-looking-glass-client.log`. Crash symbolization for
+> the mingw ICD: addr2line -e <build dll> (ImageBase from objdump -p) + RVA. Never
+> taskkill dwm and restart the Helios PCI device together; every Helios device restart
+> AVs venus processes (known). QMP `/tmp/helios-tpm/mon.sock`; ntoseye KD-less:
+> `ntoseye -b memory mcp --http 127.0.0.1:8080`.
