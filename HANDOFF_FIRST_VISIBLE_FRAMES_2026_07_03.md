@@ -43,6 +43,38 @@
 > live CD3D11Device. The IDD was deliberately left in the failed state; a
 > `pnputil /restart-device ROOT\DISPLAY\0000` (or reboot) will bring it back when the
 > owner chooses.
+>
+> ### §0b Second cold boot (07:20, same day) — reproduced; the deadline is the tell
+>
+> Identical outcome (same WER bucket `3f94fe28…`, IDD FAILED_POST_START), but the log
+> bracketed the kill differently and exposed the key invariant:
+>
+> - Boot #2's log ends **inside the SetDevice retry loop**: attempts 1-2 at 01:51:08Z, then
+>   **one IddCxSwapChainSetDevice call blocked for 22 s** (attempt 3 at 01:51:30), attempt 4
+>   at 01:51:32, host killed ≈01:51:33 — no attempt 5, no abandon line.
+> - **Both boots: host terminated at AssignSwapChain-entry + ~25 s**, regardless of whether
+>   our callback had returned (boot #1 returned in 1 s and was still killed at +25 s; boot
+>   #2 was still inside the callback). ⇒ Not a callback-duration violation and not our
+>   watchdog: this looks like an **IddCx/UMDF post-start deadline** — the first swapchain
+>   never becomes functional (born abandoned: the June-26 DxgkRemoveAdapter →
+>   BLTQUEUE::Reset → MarkAbandoned chain), dxgkrnl does not re-offer during post-start,
+>   and ~25 s after assignment the framework terminates the host
+>   (FxVerifierDriverReportedBugcheck) → CM_PROB_FAILED_POST_START. Warm, the re-offer
+>   arrives ~1 s after the abandon and everything proceeds.
+> - LUID note: a pairing render-adapter LUID older than the physical Helios enumeration
+>   LUID is NORMAL (the indirect pairing instance has its own LUID and survives physical
+>   re-enumeration) — the warm 06:53 bind SUCCEEDED on such a LUID. Drop the
+>   "stale LUID = broken" reading; the question is why the BOOT pairing's blt queue is
+>   reset/abandoned and never re-created in time.
+> - **WUDF dump writer now armed** (`HKLM\...\CurrentVersion\WUDF` `LogEnable=1`,
+>   `LogMinidumpType=0x1122` full-memory; dumps land in
+>   `C:\Windows\System32\LogFiles\WUDF\`) — the WER LocalDumps route does NOT fire for
+>   framework-reported failfasts (confirmed empty across two crashes). Next cold boot
+>   should finally yield the terminating stack; verify the theory against it before
+>   designing the fix. Fix directions if confirmed: eliminate whatever resets the boot
+>   pairing (the churn source behind MarkAbandoned — the actual root), or make the OS
+>   re-offer/pairing re-create fast enough inside the post-start window; handling it from
+>   inside LGIdd is impossible (the host process is the thing being killed).
 
 **Milestone, owner-confirmed by eyes on the Looking Glass client** (the only evidence that
 counts, per `HELIOS_FIRST_PRINCIPLES_AUDIT.md` §4): a very dark-red desktop background with
