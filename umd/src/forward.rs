@@ -2009,7 +2009,7 @@ unsafe extern "C" fn clear_view_11_1(
     view_type: ddi::D3D11DDI_HANDLETYPE,
     view: *mut c_void,
     color: *const f32,
-    _rects: *const ddi::D3D10_DDI_RECT,
+    rects: *const ddi::D3D10_DDI_RECT,
     num_rects: u32,
 ) {
     let n = D3D11_1_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -2019,12 +2019,18 @@ unsafe extern "C" fn clear_view_11_1(
         ));
     }
     if view_type != ddi::D3D11DDI_HANDLETYPE_D3D10DDI_HT_RENDERTARGETVIEW {
+        log_line(&format!(
+            "DDI D3D11.1 ClearView UNSUPPORTED view type {view_type} — clear dropped"
+        ));
         return;
     }
-    let Some(context) = d3d11_context(h) else {
+    let Some(context) = d3d11_context1(h) else {
         return;
     };
     let Some(rtv) = load_rtv(view) else {
+        return;
+    };
+    let Ok(view) = (*rtv).cast::<ID3D11View>() else {
         return;
     };
     let rgba = if color.is_null() {
@@ -2032,7 +2038,22 @@ unsafe extern "C" fn clear_view_11_1(
     } else {
         [*color, *color.add(1), *color.add(2), *color.add(3)]
     };
-    context.ClearRenderTargetView(&*rtv, &rgba);
+    // A rect-limited ClearView clears ONLY the given sub-rects. The previous
+    // ClearRenderTargetView forwarding cleared the WHOLE view: dwm's flip
+    // composition issues ClearView(dirty-rect) each frame before redrawing
+    // just that region, so every frame the accumulated desktop was wiped to
+    // the (transparent-black) clear color and only the delta survived — the
+    // all-zero presented-frame class. D3D10_DDI_RECT is layout-identical to
+    // RECT; DXVK implements ID3D11DeviceContext1::ClearView incl. rects.
+    if num_rects != 0 && !rects.is_null() {
+        let rects = core::slice::from_raw_parts(
+            rects as *const windows::Win32::Foundation::RECT,
+            num_rects as usize,
+        );
+        context.ClearView(&view, &rgba, Some(rects));
+    } else {
+        context.ClearView(&view, &rgba, None);
+    }
 }
 
 // --- Shaders ----------------------------------------------------------------

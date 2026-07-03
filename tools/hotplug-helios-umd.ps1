@@ -100,6 +100,21 @@ if ($Mode -eq "PackageUpgrade") {
     New-ItemProperty -LiteralPath $classKey -Name "UserModeDriverName" -PropertyType MultiString -Value $umdPaths -Force | Out-Null
     New-ItemProperty -LiteralPath $classKey -Name "InstalledDisplayDrivers" -PropertyType MultiString -Value $umdNames -Force | Out-Null
     Write-Host "Installed ProgramData UMD: $($copy.Destination)"
+    # ALSO sync the active DriverStore package copy: at COLD BOOT dxgkrnl's
+    # first UMD-path resolution loads the package's helios_umd.dll (before the
+    # registry override takes effect for later device creates), so a stale
+    # DriverStore copy means dwm's first — composition — device runs an old
+    # UMD every boot (proven 2026-07-03: two different handler generations in
+    # one dwm process, early devices on the stale DLL).
+    $storeDll = Join-Path $store "helios_umd.dll"
+    if (Test-Path -LiteralPath $storeDll -PathType Leaf) {
+      & takeown.exe /F $storeDll | Out-Null
+      & icacls.exe $storeDll /grant "Administrators:F" | Out-Null
+      Copy-Item -LiteralPath $UmdDll -Destination $storeDll -Force
+      Write-Host "Synced DriverStore UMD: $storeDll"
+    } else {
+      Write-Warning "DriverStore UMD not found at $storeDll - cold boots may load a stale UMD"
+    }
   } finally {
     if ($RestartDevice) {
       Write-Host "Re-enabling Helios after ProgramData UMD replacement."

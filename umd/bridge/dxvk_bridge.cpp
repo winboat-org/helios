@@ -1014,10 +1014,17 @@ bool HeliosDxvkDevice::rotate_resource_backings(
       s_sampleEvery.store(sampleEvery, std::memory_order_relaxed);
     }
     if (sampleEvery && (s_rotateCount.fetch_add(1) % sampleEvery) == 0) {
-      auto* res0 = reinterpret_cast<ID3D11Resource*>(d3d11_resource_ptrs[0]);
-      ID3D11Texture2D* tex = nullptr;
-      if (SUCCEEDED(res0->QueryInterface(__uuidof(ID3D11Texture2D),
-                                         reinterpret_cast<void**>(&tex)))) {
+      // Sample EVERY buffer in the ring, not just the presented one: a
+      // nonzero count appearing in a slot other than [0] means content lands
+      // in a buffer the present/rotation bookkeeping does not associate with
+      // the presented allocation (ring misalignment), while all-zero across
+      // the whole ring means the composition draws genuinely write nothing.
+      for (std::size_t s = 0; s < count; ++s) {
+        auto* res = reinterpret_cast<ID3D11Resource*>(d3d11_resource_ptrs[s]);
+        ID3D11Texture2D* tex = nullptr;
+        if (FAILED(res->QueryInterface(__uuidof(ID3D11Texture2D),
+                                       reinterpret_cast<void**>(&tex))))
+          continue;
         D3D11_TEXTURE2D_DESC td = {};
         tex->GetDesc(&td);
         D3D11_TEXTURE2D_DESC sd = td;
@@ -1043,8 +1050,8 @@ bool HeliosDxvkDevice::rotate_resource_backings(
             }
             char msg[160];
             std::snprintf(msg, sizeof(msg),
-                          "rotate-sample: presented %ux%u nonzero=%u/%u center=0x%08x",
-                          td.Width, td.Height, nonzero, samples,
+                          "rotate-sample: slot=%zu/%zu %ux%u nonzero=%u/%u center=0x%08x",
+                          s, count, td.Width, td.Height, nonzero, samples,
                           reinterpret_cast<const std::uint32_t*>(
                               base + std::size_t(td.Height / 2) * map.RowPitch)[td.Width / 2]);
             umd_log(msg);

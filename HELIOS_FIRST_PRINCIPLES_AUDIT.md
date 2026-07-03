@@ -1,5 +1,13 @@
 # Helios vGPU — First-Principles Audit: every hack, the contract it violates, and the real fix
 
+> **2026-07-03 (7th session) corrections — see `HANDOFF_FIRST_CONTENT_FRAMES_2026_07_03.md`:**
+> D-A1's refined attribution ("without-global-buffer self-repairs") was WRONG — that path
+> was THE all-zero-composition cause (fixed in the ICD: `vn_GetDeviceBufferMemoryRequirements`
+> now applies the same external-memory fix-up as `vn_CreateBuffer`). The C-class claim that
+> DDI signature entries lack component types is wrong for >=11.1 (ENTRY2 carries them; used
+> now). K-B2's present-nop theory is falsified (DxgkDdiPresent is never called; flip presents
+> are zero-copy into IddCx). First real desktop content reached the IddCx swapchain 2026-07-03.
+
 **Date:** 2026-07-03. **Written at the overseer's direction** after repeated instability
 ("stop implementing hacks; there's something fundamentally wrong; the driver must be
 implemented properly, no matter the effort"). This document supersedes the *approach* of the

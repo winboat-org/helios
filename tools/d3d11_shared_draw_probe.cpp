@@ -203,14 +203,23 @@ int main() {
 
     // Quad over pixel-space [128,128)..(256,256); the CB maps pixel coords to
     // clip space: clip = pixel * (2/256, -2/256) + (-1, 1).
+    // dwm's exact vertex data path: a DYNAMIC vertex buffer streamed through
+    // Map(WRITE_DISCARD) — the previous IMMUTABLE+init-data shape bypasses
+    // the dynamic-map upload machinery dwm's composition rides.
     const short verts2[8] = {128, 128, 256, 128, 128, 256, 256, 256};
     D3D11_BUFFER_DESC vbd{};
     vbd.ByteWidth = sizeof(verts2);
-    vbd.Usage = D3D11_USAGE_IMMUTABLE;
+    vbd.Usage = D3D11_USAGE_DYNAMIC;
     vbd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
-    D3D11_SUBRESOURCE_DATA vinit{verts2, 0, 0};
+    vbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
     ID3D11Buffer* vb2 = nullptr;
-    if (FAILED(dev1->CreateBuffer(&vbd, &vinit, &vb2))) return 26;
+    if (FAILED(dev1->CreateBuffer(&vbd, nullptr, &vb2))) return 26;
+    {
+      D3D11_MAPPED_SUBRESOURCE vm{};
+      if (FAILED(ctx1->Map(vb2, 0, D3D11_MAP_WRITE_DISCARD, 0, &vm))) return 40;
+      memcpy(vm.pData, verts2, sizeof(verts2));
+      ctx1->Unmap(vb2, 0);
+    }
 
     const unsigned short indices[6] = {0, 1, 2, 2, 1, 3};
     D3D11_BUFFER_DESC ibd{};
@@ -221,16 +230,30 @@ int main() {
     ID3D11Buffer* ib = nullptr;
     if (FAILED(dev1->CreateBuffer(&ibd, &iinit, &ib))) return 27;
 
+    // dwm's exact CB data path: a DEFAULT-usage constant buffer created EMPTY
+    // and filled through UpdateSubresource (DXVK lowers small buffer updates
+    // to vkCmdUpdateBuffer / CS-embedded copies — a path no probe validated;
+    // dwm's transforms all ride it). An IMMUTABLE+init-data CB (the previous
+    // shape) bypasses it entirely.
     const float cbdata[4] = {2.0f / 256.0f, -2.0f / 256.0f, -1.0f, 1.0f};
     D3D11_BUFFER_DESC cbd{};
     cbd.ByteWidth = sizeof(cbdata) * 4;  // 64-byte min alignment comfort
-    cbd.Usage = D3D11_USAGE_IMMUTABLE;
+    cbd.Usage = D3D11_USAGE_DEFAULT;
     cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
     float cbfull[16] = {};
     memcpy(cbfull, cbdata, sizeof(cbdata));
-    D3D11_SUBRESOURCE_DATA cinit{cbfull, 0, 0};
     ID3D11Buffer* cb = nullptr;
-    if (FAILED(dev1->CreateBuffer(&cbd, &cinit, &cb))) return 28;
+    {
+      D3D11_BUFFER_DESC cbi = cbd;
+      cbi.Usage = D3D11_USAGE_IMMUTABLE;
+      D3D11_SUBRESOURCE_DATA cinit{cbfull, 0, 0};
+      if (FAILED(dev1->CreateBuffer(&cbi, &cinit, &cb))) return 28;
+    }
+    // Second CB on dwm's exact path (DEFAULT + UpdateSubresource), used by
+    // the textured pass below to isolate the buffer-UpdateSubresource path.
+    ID3D11Buffer* cb2 = nullptr;
+    if (FAILED(dev1->CreateBuffer(&cbd, nullptr, &cb2))) return 41;
+    ctx1->UpdateSubresource(cb2, 0, nullptr, cbfull, 0, 0);
 
     ctx1->OMSetRenderTargets(1, &rtv, nullptr);
     ctx1->RSSetViewports(1, &vp);
@@ -302,8 +325,11 @@ int main() {
     // Quad over pixel-space [0,128)..(128,256) via the SINT VS + CB.
     const short verts3[8] = {0, 128, 128, 128, 0, 256, 128, 256};
     D3D11_SUBRESOURCE_DATA vinit3{verts3, 0, 0};
+    D3D11_BUFFER_DESC vbd3 = vbd;
+    vbd3.Usage = D3D11_USAGE_IMMUTABLE;
+    vbd3.CPUAccessFlags = 0;
     ID3D11Buffer* vb3 = nullptr;
-    if (FAILED(dev1->CreateBuffer(&vbd, &vinit3, &vb3))) return 36;
+    if (FAILED(dev1->CreateBuffer(&vbd3, &vinit3, &vb3))) return 36;
 
     ctx1->OMSetRenderTargets(1, &rtv, nullptr);
     const float bf[4] = {1, 1, 1, 1};
@@ -315,7 +341,7 @@ int main() {
     ctx1->IASetInputLayout(layout2);
     ctx1->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     ctx1->VSSetShader(vs2, nullptr, 0);
-    ctx1->VSSetConstantBuffers(0, 1, &cb);
+    ctx1->VSSetConstantBuffers(0, 1, &cb2);
     ctx1->PSSetShader(ps3, nullptr, 0);
     ctx1->PSSetShaderResources(0, 1, &srv);
     ctx1->PSSetSamplers(0, 1, &sam);
