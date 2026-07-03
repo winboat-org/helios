@@ -190,3 +190,81 @@ IDD at all (proven this session).
   (§2.1); (4) DXVK null-descriptor range + null-VB offset cleanups (§2.2); (5) chase the
   00344 layout mismatch alongside the barrier work; (6) still open from before: §5 residual
   C1 boot hole, P2/C6 linear GDI mismatches, KMD diag-tracer strip.
+
+## 7. Copy-paste prompt for the next session
+
+> You are continuing the Helios vGPU project in /home/rupansh/helios-vgpu. Read
+> `HELIOS_FIRST_PRINCIPLES_AUDIT.md` (contracts C1–C7, hack inventory), then
+> `HANDOFF_VALIDATE_BOOT_2026_07_03.md` in full — start with its ⚡ and ⚡⚡ sections.
+> STATE: the §4 shared-surface aliasing divergence is ROOT-CAUSED AND FIXED — it was a
+> guest DXVK bug (prepareSharedImages never flushed deferred clears of shared images that
+> stayed in GENERAL layout; fix = dxvk-helios `ecbd8f78`, scans m_deferredClears directly;
+> the shared-content probe passes every step with OPTIMAL tiling). Host-metadata theories
+> are DEAD (eliminated by instrument: validation-clean path on NVIDIA, identical divergence
+> on ANV, identical with LINEAR tiling, QFOT external barriers emitted-and-ineffective; the
+> barriers were KEPT as the spec external-memory availability contract, the LINEAR forcing
+> was reverted). After the fix went live the owner saw — first time ever — a frame with
+> real desktop structure (taskbar geometry, black DX overlays, red tint, corruption,
+> frozen, then black): content consistent with the KMD GDI executor, the only path that
+> writes those surfaces today.
+>
+> THE FRONTIER (⚡⚡, evidence chain complete): **the KMD present nop (audit K-B2)**.
+> dwm flip-presents (`DXGI Present dst=0x0 copied=false` at exactly the IDD's acquire
+> cadence), the three rotating IddCx swapchain buffers sample ALL-ZERO
+> (`sampleNonZero=0/357` in the IDD log), and the stage that must move pixels — dxgkrnl's
+> BLTQUEUE present executed on Helios — is `kmd_render/src/ddi/display.rs::dxgkddi_present`,
+> which emits a 4-DWORD 'HEPR' NOP DMA. Note its current shape: present flags bit (1<<2)
+> returns SUCCESS early, and src/dst allocation lists are already read into atomics
+> (PBcall/PBflag/PBcnt named diag values exist, but the registry diag ring burns out in
+> minutes — use the DISPATCH-safe atomics / the HDBG CollectDbgInfo report instead).
+>
+> TASK (C3/K-A2/K-B2, work it first): implement the REAL present copy. At DxgkDdiPresent
+> (or its submit path), execute an actual src-allocation → dst-allocation copy host-side
+> via venus — both allocations carry venus resids in the KMD's allocation state; with
+> identical creation parameters a raw blob→blob byte copy is image-correct on one host
+> device, or do it properly with imported VkBuffers (VkImportMemoryResourceInfoMESA) +
+> vkCmdCopyBuffer in the KMD's own venus context — then retire the fence. Beware the
+> audit's K-A3 constraint (no unbounded DISPATCH-level virtio waits under the spinlock; the
+> bounded-poll + poison-latch infrastructure from P0 exists). Acceptance ladder: (1) IDD
+> sampler shows sampleNonZero > 0 and a per-frame-changing sampleHash; (2) the owner
+> watches the live desktop (moving cursor, dragging windows) in the LG client, sustained.
+> Only (2) closes the milestone. Then evaluate the red tint / corruption (suspect the GDI
+> executor GdF format handling and/or 10bpc IddCx path) against real content.
+>
+> Deployed right now (Intel boot, `HELIOS_QEMU_RENDER_GPU` default): KMD 22.22.42.0, UMD
+> hash 42dfad843610bab1 (dxvk ecbd8f78 linked), LGIdd 16.41.16.666 (LookingGlass 846a7edd,
+> frame-held replug gate), ICD unchanged. Everything is committed: parent through 755d59a,
+> dxvk-helios ecbd8f78, LookingGlass 846a7edd. Also open, in rough order: NVIDIA re-verify
+> of the shared-content probe (expected pass — the bug was guest-side); the SetDevice-
+> overrun DriverDidNotReleaseFrame kill variant (bring-up exceeding IddCx's frame deadline
+> — hit under validation slowness and during deploy churn; the frameHeld gate correctly
+> does not cover it); §5 residual C1 boot hole (did NOT fire on the last cold boot; keep
+> rotated-clean host logs); UMD synthetic input-signature component types (dwm binds
+> R16G16_SINT vertex formats against float32 SPIR-V inputs — Input-08733 storm, NVIDIA
+> tolerates today = C7 time bomb, forward.rs:4605); DXVK null-descriptor range/offset
+> violations (buffer-02999/04112); the imageLayout-00344 GENERAL-vs-READ_ONLY sampled-image
+> mismatch; the KMD diag-tracer strip (registry ring burns its 3000 cap in minutes); P2/C6
+> linear GDI-surface import-size mismatches.
+>
+> Ops: KMD version bump before every deploy (kmd_render build.rs + Cargo.make.toml), build
+> via win_cargo, devcon at `C:\Program Files (x86)\Windows Kits\10\Tools\10.0.26100.0\x64\devcon.exe`
+> (instance IDs need the `@` prefix for devcon restart), UMD hotplug AFTER KMD install via
+> `tools/hotplug-helios-umd.ps1 -Mode ProgramData -KillUmdUsers -NoProbe -RestartDevice
+> -UmdDll ...\umd\target\release\helios_umd.dll`. dxvk rebuild: edit on Z:, copy changed
+> files to C:\Users\Rupansh\dxvk-helios, `meson compile -C C:\Users\Rupansh\dxvk-build`
+> with `C:\Program Files\LLVM\bin` AND MSVC `...\bin\Hostx64\x64` on PATH (vcvars64 alone
+> lacks clang-cl), purge `...\helios-vgpu\umd\target\release\.fingerprint\helios_umd-*`,
+> `win_cargo umd build --release`, hotplug. LGIdd builds via win_looking_glass_idd (stampinf
+> auto-versions; the InfVerif x86-DLL error is non-fatal). Probes run via schtasks /IT
+> (HeliosSharedProbe, HeliosBlobTruthProbe, HeliosBlobProbe); outputs in
+> C:\Users\Rupansh\helios-probe\. IDD log: `C:\ProgramData\Looking Glass (IDD)\
+> looking-glass-idd.txt` (acquires + the per-30-frames content sampler). dwm/UMD logs in
+> C:\ProgramData\Helios\ (umd-<pid>.log; `DXGI Present` lines). Host venus log
+> /tmp/helios-qemu-stderr.log (rotate before boots; vkr lines carry no timestamps). QMP at
+> /tmp/helios-tpm/mon.sock. Each Helios device restart churns the dwm/IDD pairing and can
+> kill WUDFHost (deploy-window collateral); recover the devnode with devcon restart
+> `@ROOT\DISPLAY\0000` and let the C5 watchdog reconverge — but batch deploys to minimize
+> restarts. WUDFHost dumps: cdb `!analyze -v; ~*k` with `.symopt+0x40` works on-guest.
+> The overseer's standing directive: no hacks, no kick rituals, loud failure over fake
+> success; only owner-visible LG-client output closes milestones. Ask before cold boots or
+> VM relaunches.
