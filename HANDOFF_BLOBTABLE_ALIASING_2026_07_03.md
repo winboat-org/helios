@@ -151,6 +151,38 @@ the wire).
    linear-GDI-surface work (`import size override 368640 < requirement 487424`
    warnings still stand for KMD-standard GDI surfaces).
 
+## 4b. OWNER-VISIBLE OBSERVATION (after the fixes, during the probe runs) — load-bearing
+
+The owner saw, live in the LG client during this session's testing: **a few frames
+of the real Windows desktop (with a dark red overlay), which then went black again.**
+
+Interpretation (matches the reproducer exactly): at (re)bind, the initial surface
+content crosses the alias once (probe step B passes) → real desktop frames reach
+the client; then dwm's ongoing composition (clears + draws through its own host
+VkImage) diverges from the raw memory the IDD's image reads (steps C/D) → black.
+Two conclusions:
+1. **The full pipeline dwm→venus→IddCx→KVMFR→client renders real desktop content
+   end-to-end when content exists.** The remaining defect is only the §4 aliasing
+   divergence.
+2. The dark-red tint matches the earlier wallpaper sighting — likely the
+   10-bpc/HDR path or a format/swizzle issue; re-evaluate only after frames are
+   sustained.
+
+## 4c. Design note — VK_KHR_external_memory_win32 emulation in the ICD (owner question)
+
+Current state: the ICD emulates external **semaphores** ICD-side (over D3DKMT sync
+objects) but does NOT emulate `VK_KHR_external_memory_win32`. DXVK sidesteps it
+with the helios-specific KMT bridge (`heliosKmtOnlySharedResources()`:
+OPAQUE_FD wire fiction + `VkImportMemoryResourceInfoMESA` typed resid import) —
+hence the `proceeding without VK_KHR_external_memory_win32` warnings in every
+DXVK log. Emulating memory-win32 in the ICD (HANDLE ↔ {resid, identity} mapping
+ICD-side, DXVK using its stock win32 sharing path) is the cleaner C7.2 shape:
+one place owns external-memory correctness (handle types, dedicated-allocation
+linkage, external image info end-to-end), instead of a DXVK special case per
+call site — and it is plausibly the right vehicle for the §4 aliasing fix, since
+the fix must guarantee both sides' host images/allocations are properly
+external+dedicated. Take this decision when §4's mechanism is confirmed.
+
 ## 5. Residual C1 boot-path hole (unchanged priority)
 
 This boot (02:00:09Z) reproduced `invalid res_id 45` → CS error → dead ring at
@@ -160,6 +192,25 @@ from abort-looping; Windows restarted it. A second CS error (`vkAllocateMemory`,
 worker 571734, no invalid-res_id line) appeared at ~09:40Z. Root-cause still
 needed: the attach-to-opener-ctx ordering at boot (open before the opener's venus
 context exists?) — catch it on the next cold boot with the now-clean host log.
+
+## 5b. Housekeeping performed (2026-07-03, pre-cold-boot)
+
+- Deleted all dumps in `C:\HeliosDumps` (25.9 GB freed incl. the 19.5 GB full dwm
+  dump; C: now 229 GB free). Kept the three `stacks-*.txt` analysis records.
+- dwm WER LocalDumps: **FULL → minidump** (DumpType 1, DumpCount 3) — crash
+  evidence stays cheap for the cold boot.
+- WUDFHost WER LocalDumps → minidump; **WUDFHost SilentProcessExit + IFEO
+  GlobalFlag stay ARMED with FULL dumps** — deliberate deviation from the earlier
+  "disarm when stable" item: two kill classes are still open
+  (DriverDidNotReleaseFrame §3; C1 boot hole §5) and full dumps were decisive
+  twice today. Disarm only after ten clean cold boots.
+- WER ReportQueue purged (~44 MB). Guest `C:\ProgramData\Helios\*.log` cleared
+  (live processes recreated fresh ones). Host `/tmp/helios-qemu-stderr.log`
+  rotated to `.2026-07-03-session4` so the next boot's host log is unambiguous
+  (vkr lines carry no timestamps — never mix boots).
+- The KMD diag registry ring (3000 one-shot) is still burned in minutes by the
+  per-submit 0x0D10/0x0D12 tracers — strip with the audit C-class cleanup (code
+  change, not done today).
 
 ## 6. Ops learned this session
 
@@ -175,27 +226,68 @@ context exists?) — catch it on the next cold boot with the now-clean host log.
 - KMD deploy verified end-to-end with the new stats verb: deploy → run
   `blob_capacity_probe` → `[before]` line shows live counts.
 
+## 6b. COLD-BOOT CHECKLIST (the boot the owner runs after this session)
+
+What to check, in order, on the untouched cold boot (deployed: KMD 22.22.42.0,
+UMD b89f9918, LGIdd 15.36.22.667, all committed):
+
+1. **Owner eyes on the LG client** (the only closing evidence): expected per the
+   current model — desktop frames appear at bind, then fade to black (the §4
+   divergence). Sustained frames would mean the divergence is
+   churn-window-dependent; note EXACTLY what is seen and when relative to boot.
+2. **Self-convergence**: did the IDD reach a bound, acquiring swapchain with zero
+   manual actions? (`looking-glass-idd.txt`: MonitorArrival → AssignSwapChain →
+   `acquire returned hr=0` lines; no FAILED_POST_START, no kill dumps in
+   C:\HeliosDumps.)
+3. **C1 boot hole**: the rotated host log (`/tmp/helios-qemu-stderr.log`) — any
+   `invalid res_id` / CS error in the first ~5 min? Pair with dwm's
+   `umd-<pid>.log` (identity lines vs `ddi-shared ok` count) to find the failed
+   open. This is task the next session root-causes with clean evidence.
+4. **Blob table at boot steady state**: run
+   `C:\Users\Rupansh\helios-probe\blob_capacity_probe.exe` via
+   `schtasks /run /tn HeliosBlobProbe` → `[before] blobs=N/8192` line
+   (output `C:\Users\Rupansh\helios-probe\blob_probe_out.txt`). Expect low
+   hundreds; watch drift over hours for a leak.
+5. **The aliasing reproducer on a clean boot**:
+   `schtasks /run /tn HeliosSharedProbe` (output `shared_probe_out.txt`) —
+   confirm the C/D divergence reproduces cold (it should; it is
+   state-independent).
+
 ## 7. Copy-paste prompt for the next session
 
 > You are continuing the Helios vGPU project in /home/rupansh/helios-vgpu. Read
 > `HELIOS_FIRST_PRINCIPLES_AUDIT.md` (contracts C1–C7), then
-> `HANDOFF_BLOBTABLE_ALIASING_2026_07_03.md` — the frontier is its §4: the IDD now
-> holds a STABLE bound swapchain acquiring frames continuously (the 5-hour
-> no-offers state was KMD blob-table exhaustion, fixed in 22.22.42.0 with
-> QUERY_STATS observability; the WUDFHost dtor double-delete of the OS-owned child
-> swapchain is fixed in LGIdd e8a6a40b), but every acquired frame is ALL ZEROS.
-> The class is minimally reproduced by `tools/d3d11_shared_content_probe.cpp`:
-> two devices aliasing one shared RT — copy-engine writes propagate, CLEARS
-> diverge per-image (NVIDIA per-VkImage fast-clear/compression metadata; the
-> VUID-02726 UB shape on the sharing path). Work §4's leads in order: (1)
-> host-side dedicated-allocation linkage through vkr's import
-> (virglrenderer-1.3.0 vkr_device_memory.c:246), with HELIOS_VKR_DEBUG=validate
-> (host validation layers; needs owner VM relaunch); (2) Intel-host comparison
-> (owner relaunch); (3) only then consider LINEAR-tiling shared surfaces as an
-> explicit contract. Also open: §3's DriverDidNotReleaseFrame kill (defer replug
-> while a frame is held), §5's residual C1 boot hole (res 45 at boot+4 min — catch
-> on next cold boot), and the P2/C6 linear GDI-surface open mismatches. The
-> overseer's standing directive: no hacks, no kick rituals, loud failure over fake
-> success; only owner-visible LG-client output closes milestones. Ask before cold
-> boots or VM relaunches. Tree committed through `106e531`; LGIdd deploys via
-> the full devcon path (`C:\Program Files (x86)\Windows Kits\10\Tools\10.0.26100.0\x64\devcon.exe`).
+> `HANDOFF_BLOBTABLE_ALIASING_2026_07_03.md` in full — the frontier is its §4.
+> STATE: the 5-hour no-offers state was KMD blob-table exhaustion (MAX_BLOBS=256),
+> fixed in KMD 22.22.42.0 with the new HELIOS_ESCAPE_QUERY_STATS observability;
+> the WUDFHost dtor double-delete of the OS-owned child swapchain is fixed in
+> LGIdd e8a6a40b/15.36.22.667 (the IddCx contract: the OS creates AND destroys
+> swapchain objects; they are children of the monitor). The IDD then held a
+> STABLE bound swapchain acquiring at dwm's cadence for over an hour — and the
+> OWNER SAW real desktop frames (dark-red tint) in the LG client that faded to
+> black, matching the §4 model: initial content crosses the alias once, then
+> dwm's clears/compose diverge per host VkImage. Minimal repro
+> `tools/d3d11_shared_content_probe.cpp` (schtasks HeliosSharedProbe): copies
+> propagate, CLEARS diverge — NVIDIA per-VkImage fast-clear/compression metadata,
+> the VUID-02726 UB shape on the sharing path. A cold boot happened right after
+> the session — FIRST read its evidence per §6b (owner sighting, self-convergence,
+> C1 boot-hole signature in the rotated-clean host log, blob occupancy, repro).
+> THEN work §4's leads in order: (1) host-side dedicated-allocation/external-info
+> linkage through vkr's import (virglrenderer-1.3.0 vkr_device_memory.c:246 —
+> clone is in the session scratchpad or re-clone tag virglrenderer-1.3.0), with
+> HELIOS_VKR_DEBUG=validate (host validation layers; needs owner VM relaunch);
+> (2) Intel-host comparison (owner relaunch); (3) consider ICD-side
+> VK_KHR_external_memory_win32 emulation as the C7.2 vehicle for the fix (§4c —
+> owner asked for this direction; only semaphores are emulated today); (4) only
+> then LINEAR-tiling shared surfaces as an explicit documented contract. Also
+> open: §3's DriverDidNotReleaseFrame kill (defer replug while a frame is held,
+> dump stacks-8464.txt), §5's residual C1 boot hole, P2/C6 linear GDI-surface
+> open mismatches, and the audit C-class diag-tracer strip (the registry ring
+> burns its 3000 cap in minutes). Housekeeping state per §5b: dwm=minidumps,
+> WUDFHost SilentProcessExit FULL dumps deliberately still armed. The overseer's
+> standing directive: no hacks, no kick rituals, loud failure over fake success;
+> only owner-visible LG-client output closes milestones. Ask before cold boots or
+> VM relaunches. Tree committed through this doc; LGIdd deploys via the full
+> devcon path (`C:\Program Files (x86)\Windows Kits\10\Tools\10.0.26100.0\x64\devcon.exe`),
+> KMD version bump before every deploy (build.rs + Cargo.make.toml), UMD hotplug
+> AFTER KMD install with -UmdDll ...\umd\target\release\helios_umd.dll.
