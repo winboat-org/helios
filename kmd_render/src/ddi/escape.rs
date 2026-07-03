@@ -1,11 +1,15 @@
-//! `DxgkDdiEscape` — out-of-band ICD → KMD channel (Phase 3, M3.3).
+//! `DxgkDdiEscape` — out-of-band ICD → KMD channel (Phase 3, M3.3 → C3/M3.4).
 //!
 //! The user-mode Vulkan ICD reaches the KMD through `D3DKMTEscape`, not through
 //! the WDDM command/GPU-VA path. Every escape buffer begins with a
 //! [`HeliosEscapeHeader`] (`helios_protocol::escape`); we validate it and
-//! dispatch the Venus control verbs (CTX_CREATE / SUBMIT_VENUS / CTX_DESTROY,
-//! plus a trivial WAIT_FENCE for the interim synchronous fence model). Blob verbs
-//! (ALLOC_BLOB / MAP_BLOB) arrive in M3.5.
+//! dispatch the Venus control verbs.
+//!
+//! C3/M3.4: SUBMIT_VENUS is ASYNC — it queues the stream, writes the assigned
+//! wire fence id back into the escape buffer, and returns; WAIT_FENCE is a
+//! real PASSIVE KEVENT wait on that wire id. All other verbs are synchronous
+//! flows through `virtio::ctrl` (PASSIVE waits — never a DISPATCH spin under
+//! the device spinlock).
 //!
 //! TRUST BOUNDARY: `pPrivateDriverData` is guest-supplied. We treat
 //! `PrivateDriverDataSize` as the only authoritative length and bounds-check
@@ -19,10 +23,10 @@ use bytemuck::{bytes_of, pod_read_unaligned};
 use helios_protocol::{
     HeliosEscapeAllocBlob, HeliosEscapeAttachResource, HeliosEscapeCtxCreate,
     HeliosEscapeCtxDestroy, HeliosEscapeHeader, HeliosEscapeMapBlob, HeliosEscapeQueryStats,
-    HeliosEscapeReleaseBlob, HeliosEscapeSubmitVenus, HELIOS_ESCAPE_ALLOC_BLOB,
-    HELIOS_ESCAPE_ATTACH_RESOURCE, HELIOS_ESCAPE_CTX_CREATE, HELIOS_ESCAPE_CTX_DESTROY,
-    HELIOS_ESCAPE_MAP_BLOB, HELIOS_ESCAPE_QUERY_STATS, HELIOS_ESCAPE_RELEASE_BLOB,
-    HELIOS_ESCAPE_SUBMIT_VENUS, HELIOS_ESCAPE_WAIT_FENCE,
+    HeliosEscapeReleaseBlob, HeliosEscapeSubmitVenus, HeliosEscapeWaitFence,
+    HELIOS_ESCAPE_ALLOC_BLOB, HELIOS_ESCAPE_ATTACH_RESOURCE, HELIOS_ESCAPE_CTX_CREATE,
+    HELIOS_ESCAPE_CTX_DESTROY, HELIOS_ESCAPE_MAP_BLOB, HELIOS_ESCAPE_QUERY_STATS,
+    HELIOS_ESCAPE_RELEASE_BLOB, HELIOS_ESCAPE_SUBMIT_VENUS, HELIOS_ESCAPE_WAIT_FENCE,
 };
 
 use super::blob_map::{
@@ -30,7 +34,7 @@ use super::blob_map::{
 };
 use crate::adapter::AdapterContext;
 use crate::dxgk::*;
-use crate::virtio::hal::DmaBuffer;
+use crate::virtio::ctrl;
 
 pub unsafe extern "C" fn dxgkddi_escape(
     h_adapter: *mut c_void,
@@ -70,7 +74,7 @@ pub unsafe extern "C" fn dxgkddi_escape(
         HELIOS_ESCAPE_CTX_CREATE => escape_ctx_create(adapter, buf, owner),
         HELIOS_ESCAPE_CTX_DESTROY => escape_ctx_destroy(adapter, buf),
         HELIOS_ESCAPE_SUBMIT_VENUS => escape_submit_venus(adapter, buf),
-        HELIOS_ESCAPE_WAIT_FENCE => escape_wait_fence(buf),
+        HELIOS_ESCAPE_WAIT_FENCE => escape_wait_fence(adapter, buf),
         HELIOS_ESCAPE_ALLOC_BLOB => escape_alloc_blob(adapter, buf, owner),
         HELIOS_ESCAPE_MAP_BLOB => escape_map_blob(adapter, buf, owner),
         HELIOS_ESCAPE_RELEASE_BLOB => escape_release_blob(adapter, buf, owner),
@@ -131,15 +135,14 @@ fn escape_ctx_create(adapter: &AdapterContext, buf: &mut [u8], owner: usize) -> 
         return STATUS_BUFFER_TOO_SMALL;
     }
     let req: HeliosEscapeCtxCreate = pod_read_unaligned(&buf[..sz]);
-    match adapter.with_virtio(|v| v.ctx_create(req.capset_id, owner)) {
-        Ok(Ok(ctx_id)) => {
+    match ctrl::ctx_create(adapter, req.capset_id, owner) {
+        Ok(ctx_id) => {
             let mut out = req;
             out.out_ctx_id = ctx_id;
             buf[..sz].copy_from_slice(bytes_of(&out));
             STATUS_SUCCESS
         }
-        Ok(Err(ve)) => ve.into(),
-        Err(de) => de.into(),
+        Err(ve) => ve.into(),
     }
 }
 
@@ -150,17 +153,20 @@ fn escape_ctx_destroy(adapter: &AdapterContext, buf: &mut [u8]) -> NTSTATUS {
         return STATUS_BUFFER_TOO_SMALL;
     }
     let req: HeliosEscapeCtxDestroy = pod_read_unaligned(&buf[..sz]);
-    match adapter.with_virtio(|v| v.ctx_destroy(req.ctx_id)) {
-        Ok(Ok(())) => STATUS_SUCCESS,
-        Ok(Err(ve)) => ve.into(),
-        Err(de) => de.into(),
+    match ctrl::ctx_destroy(adapter, req.ctx_id) {
+        Ok(()) => STATUS_SUCCESS,
+        Err(ve) => ve.into(),
     }
 }
 
-/// `HELIOS_ESCAPE_SUBMIT_VENUS` → forward an opaque Venus command stream to the
-/// host. The stream is the `buffer_size` bytes immediately following the 32-byte
-/// payload header; we stage it into a contiguous DMA buffer (at PASSIVE_LEVEL,
-/// before taking the queue lock) and submit it fenced.
+/// `HELIOS_ESCAPE_SUBMIT_VENUS` → ASYNC (C3/M3.4). The stream is the
+/// `buffer_size` bytes immediately following the 40-byte payload header;
+/// `virtio::ctrl` stages it into contiguous DMA memory and queues it fenced
+/// with a KMD-assigned wire fence id, which is written back into the escape
+/// buffer's `fence_id` for the ICD to wait on. Returns at QUEUE time — the
+/// caller's ~seconds-long host round-trip no longer serializes every other
+/// escape under the dxgkrnl adapter lock (the 2026-07-04 WUDFHost/IddCx
+/// deadline-collision root cause).
 fn escape_submit_venus(adapter: &AdapterContext, buf: &mut [u8]) -> NTSTATUS {
     let hsz = size_of::<HeliosEscapeSubmitVenus>();
     if buf.len() < hsz {
@@ -178,43 +184,54 @@ fn escape_submit_venus(adapter: &AdapterContext, buf: &mut [u8]) -> NTSTATUS {
         Some(e) if e <= buf.len() => e,
         _ => return STATUS_INVALID_PARAMETER,
     };
-    crate::diag::record(0x0D00_0000 | ((req.buffer_size as u32) & 0xFFFF));
-    crate::diag::record(0x0D01_0000 | ((buf.len() as u32) & 0xFFFF));
-    if payload >= 4 {
-        let w0 = u32::from_le_bytes([buf[hsz], buf[hsz + 1], buf[hsz + 2], buf[hsz + 3]]);
-        crate::diag::record(0x0D02_0000 | (w0 & 0xFFFF));
-    }
-    if payload >= 8 {
-        let w1 = u32::from_le_bytes([buf[hsz + 4], buf[hsz + 5], buf[hsz + 6], buf[hsz + 7]]);
-        crate::diag::record(0x0D03_0000 | (w1 & 0xFFFF));
-    }
 
-    // Copy the stream into device-visible contiguous memory (PASSIVE_LEVEL).
-    let mut dma = match DmaBuffer::new(payload) {
-        Some(d) => d,
-        None => return STATUS_INSUFFICIENT_RESOURCES,
-    };
-    dma.as_mut_slice().copy_from_slice(&buf[hsz..end]);
-
-    let (ctx_id, fence_id, ring_idx) = (req.ctx_id, req.fence_id, req.ring_idx);
-    match adapter.with_virtio(|v| v.submit_venus(ctx_id, fence_id, ring_idx, dma.as_slice())) {
-        Ok(Ok(())) => STATUS_SUCCESS,
-        Ok(Err(ve)) => ve.into(),
-        Err(de) => de.into(),
+    match ctrl::submit_venus_async(adapter, req.ctx_id, req.ring_idx, &buf[hsz..end]) {
+        Ok(wire_fence) => {
+            // Report the assigned wire fence id back (in/out escape buffer).
+            let mut out = req;
+            out.fence_id = wire_fence;
+            buf[..hsz].copy_from_slice(bytes_of(&out));
+            STATUS_SUCCESS
+        }
+        Err(ve) => ve.into(),
     }
-    // `dma` drops here, at PASSIVE_LEVEL, after the lock has been released.
 }
 
-/// `HELIOS_ESCAPE_WAIT_FENCE` → interim synchronous fence model.
-///
-/// `submit_venus` blocks on the used ring until the device acknowledges the
-/// fenced command, so any fence the ICD asks to wait on has already completed by
-/// the time SUBMIT_VENUS returned. We only validate the request shape and report
-/// success; the real KEVENT-backed wait arrives with async submission in M3.4.
-fn escape_wait_fence(buf: &[u8]) -> NTSTATUS {
-    if buf.len() < size_of::<helios_protocol::HeliosEscapeWaitFence>() {
+/// `HELIOS_ESCAPE_WAIT_FENCE` → REAL wait (C3/M3.4): block (PASSIVE, KEVENT)
+/// until the wire fence completes on the used ring or `timeout_ns` elapses.
+/// The outcome is reported in `out_completed` (1 = complete, 0 = timeout) with
+/// STATUS_SUCCESS — informational NTSTATUS pass-through from DxgkDdiEscape is
+/// not contractual, so the payload carries the verdict. The legacy 32-byte
+/// shape (old ICD) is still accepted: it waits, but can only report a timeout
+/// via a failure status.
+fn escape_wait_fence(adapter: &AdapterContext, buf: &mut [u8]) -> NTSTATUS {
+    const LEGACY_SIZE: usize = 32;
+    let sz = size_of::<HeliosEscapeWaitFence>();
+    if buf.len() < LEGACY_SIZE {
         return STATUS_BUFFER_TOO_SMALL;
     }
+    let legacy = buf.len() < sz;
+    // The legacy struct is a strict prefix of the v2 struct; read the common
+    // fields (hdr + fence_id + timeout_ns) from the prefix. buf.len() >= 32 is
+    // guaranteed above, so these fixed reads cannot go out of bounds.
+    let fence_id: u64 = pod_read_unaligned(&buf[16..24]);
+    let timeout_ns: u64 = pod_read_unaligned(&buf[24..32]);
+
+    let outcome = ctrl::wait_fence(adapter, fence_id, timeout_ns);
+    if legacy {
+        return match outcome {
+            ctrl::WaitFenceOutcome::Complete => STATUS_SUCCESS,
+            ctrl::WaitFenceOutcome::TimedOut => wdk_sys::STATUS_IO_TIMEOUT,
+            ctrl::WaitFenceOutcome::Invalid => STATUS_INVALID_PARAMETER,
+        };
+    }
+    let mut out: HeliosEscapeWaitFence = pod_read_unaligned(&buf[..sz]);
+    match outcome {
+        ctrl::WaitFenceOutcome::Complete => out.out_completed = 1,
+        ctrl::WaitFenceOutcome::TimedOut => out.out_completed = 0,
+        ctrl::WaitFenceOutcome::Invalid => return STATUS_INVALID_PARAMETER,
+    }
+    buf[..sz].copy_from_slice(bytes_of(&out));
     STATUS_SUCCESS
 }
 
@@ -229,24 +246,22 @@ fn escape_alloc_blob(adapter: &AdapterContext, buf: &mut [u8], owner: usize) -> 
     // DIAG: 0x0E04_HHHH = ALLOC_BLOB's owning handle (low 16 bits), to confirm it
     // matches the handle DxgkDdiDestroyDevice reclaims under (0x0E01_HHHH).
     crate::diag::record(0x0E04_0000 | ((owner as u32) & 0xFFFF));
-    match adapter.with_virtio(|v| {
-        v.alloc_blob(
-            req.ctx_id,
-            req.blob_mem,
-            req.blob_flags,
-            req.blob_id,
-            req.size,
-            owner,
-        )
-    }) {
-        Ok(Ok(resource_id)) => {
+    match ctrl::alloc_blob(
+        adapter,
+        req.ctx_id,
+        req.blob_mem,
+        req.blob_flags,
+        req.blob_id,
+        req.size,
+        owner,
+    ) {
+        Ok(resource_id) => {
             let mut out = req;
             out.out_resource_id = resource_id;
             buf[..sz].copy_from_slice(bytes_of(&out));
             STATUS_SUCCESS
         }
-        Ok(Err(ve)) => ve.into(),
-        Err(de) => de.into(),
+        Err(ve) => ve.into(),
     }
 }
 
@@ -271,12 +286,12 @@ fn escape_map_blob(adapter: &AdapterContext, buf: &mut [u8], owner: usize) -> NT
         return STATUS_INVALID_DEVICE_REQUEST;
     }
 
-    // Phase 1 — under the virtio spinlock (DISPATCH): RESOURCE_MAP_BLOB at a fresh
-    // window offset; returns the guest-physical range + host caching.
-    let prep = match adapter.with_virtio(|v| v.map_blob_prepare_for_owner(owner, req.resource_id)) {
-        Ok(Ok(p)) => p,
-        Ok(Err(ve)) => return ve.into(),
-        Err(de) => return de.into(),
+    // Phase 1 — the RESOURCE_MAP_BLOB flow (PASSIVE waits in virtio::ctrl):
+    // reserves a window offset, round-trips the map, returns the
+    // guest-physical range + host caching.
+    let prep = match ctrl::map_blob_prepare(adapter, Some(owner), req.resource_id) {
+        Ok(p) => p,
+        Err(ve) => return ve.into(),
     };
     // `IoAllocateMdl` length is a ULONG (u32); the per-map cap (gpu.rs) bounds this.
     if prep.size == 0 || prep.size > u32::MAX as u64 {
@@ -326,10 +341,9 @@ fn escape_release_blob(adapter: &AdapterContext, buf: &[u8], owner: usize) -> NT
         // SAFETY: PASSIVE, in the creating process; pair from a prior MAP_BLOB.
         unsafe { unmap_io_pages_from_user(user_va, mdl as wdk_sys::PMDL) };
     }
-    match adapter.with_virtio(|v| v.release_blob_for_owner(owner, req.ctx_id, req.resource_id)) {
-        Ok(Ok(())) => STATUS_SUCCESS,
-        Ok(Err(ve)) => ve.into(),
-        Err(de) => de.into(),
+    match ctrl::release_blob_for_owner(adapter, owner, req.ctx_id, req.resource_id) {
+        Ok(()) => STATUS_SUCCESS,
+        Err(ve) => ve.into(),
     }
 }
 
@@ -353,15 +367,8 @@ fn escape_attach_resource(adapter: &AdapterContext, buf: &[u8]) -> NTSTATUS {
     // attach of a dead resid "succeeds" and the importer's next
     // `vkAllocateMemory` poisons its whole venus ring (host `invalid res_id`
     // → CS error → fatal decoder state — the boot-#3 dwm kill).
-    match adapter.with_virtio(|v| {
-        if !v.resource_is_live(req.resource_id) {
-            crate::diag::record(0x0E09_0000 | (req.resource_id & 0xFFFF));
-            return Err(crate::virtio::VirtioError::DeviceError);
-        }
-        v.ctx_attach_resource(req.ctx_id, req.resource_id)
-    }) {
-        Ok(Ok(())) => STATUS_SUCCESS,
-        Ok(Err(ve)) => ve.into(),
-        Err(de) => de.into(),
+    match ctrl::attach_resource_checked(adapter, req.ctx_id, req.resource_id) {
+        Ok(()) => STATUS_SUCCESS,
+        Err(ve) => ve.into(),
     }
 }

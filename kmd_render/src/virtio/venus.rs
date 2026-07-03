@@ -19,13 +19,16 @@
 //! shared-memory blob. All wire encodings are byte-for-byte verified against
 //! `icd/mesa/src/virtio/venus-protocol/vn_protocol_driver_*.h` and `vn_ring.c`.
 //!
-//! IRQL. The entire flow runs at PASSIVE_LEVEL from `DxgkDdiStartDevice` (it
-//! `MmMapIoSpace`s the ring/reply blobs and busy-polls the ring head). StartDevice
-//! is single-threaded device bring-up, so the transport is not touched
-//! concurrently: this module takes `&mut VirtioGpu` directly rather than holding
-//! the DISPATCH-level virtio spinlock across the long ring polls (the spinlock
-//! discipline exists for the concurrent escape/DPC paths, which are not yet live
-//! and never run during StartDevice). See `AdapterContext::with_virtio_passive`.
+//! IRQL. The entire flow runs at PASSIVE_LEVEL — bring-up from
+//! `DxgkDdiStartDevice`, runtime allocation from `DxgkDdiCreateAllocation` /
+//! `DxgkDdiDestroyAllocation` under the adapter's PASSIVE venus mutex
+//! (`AdapterContext::with_venus_client`). Control-queue submissions ride
+//! `virtio::ctrl` (PASSIVE KEVENT waits under the hood); the venus ring-head
+//! waits are PASSIVE sleep-polls (short spin burst, then 1 ms sleeps) — the vn
+//! ring has no interrupt to wait on (the host writes progress into the ring
+//! shmem only), and the old DISPATCH spins under the device spinlock were one
+//! of the 2026-07-04 convoy/poison classes. NOTHING here ever holds the virtio
+//! spinlock across a wait.
 
 use core::sync::atomic::{compiler_fence, fence, Ordering};
 
@@ -36,8 +39,9 @@ use helios_protocol::{
 use wdk_sys::ntddk::{MmMapIoSpace, MmUnmapIoSpace};
 use wdk_sys::{_MEMORY_CACHING_TYPE, PHYSICAL_ADDRESS};
 
-use super::gpu::VirtioGpu;
+use super::ctrl;
 use super::VirtioError;
+use crate::adapter::AdapterContext;
 
 // ── venus command type ids (VkCommandTypeEXT) ────────────────────────────────
 // Verified against vn_protocol_driver_defines.h.
@@ -99,10 +103,14 @@ const REPLY_SHMEM_SIZE: u64 = 4096;
 /// Allocation size of the host-visible page-table memory (16 MiB).
 const PAGE_TABLE_ALLOC_SIZE: u64 = 16 * 1024 * 1024;
 
-/// Busy-poll bound for the ring head advancing past a published seqno. Each
-/// iteration is a volatile read + a `spin_loop`; the cap protects against a wedged
-/// host without hanging StartDevice forever.
-const RING_POLL_SPINS: u64 = 100_000_000;
+/// Short spin burst before a ring-head wait falls back to PASSIVE 1 ms sleeps
+/// (fast replies stay fast; slow ones cost only sleep latency, never a
+/// DISPATCH spin).
+const RING_SPIN_BURST: u32 = 50_000;
+/// PASSIVE wait budget for the ring head advancing past a published seqno
+/// (1 ms sleep-polls). A host that has not consumed the ring in this long is
+/// genuinely wedged → the client latches `fatal`.
+const RING_WAIT_TIMEOUT_MS: u64 = 30_000;
 
 /// Maximum venus stream we build for any single direct/ring command. The largest
 /// is `vkCreateDevice` (~120 bytes); 512 is comfortable headroom.
@@ -407,17 +415,16 @@ impl VenusClient {
     /// Send a direct (non-ring) venus command via `VIRTIO_GPU_CMD_SUBMIT_3D`. Used
     /// for the ring-bootstrap commands (`vkCreateRingMESA`, `vkNotifyRingMESA`,
     /// `vkSubmit/WaitVirtqueueSeqnoMESA`) which must reach the host before / around
-    /// the ring being usable.
-    fn submit_direct(&self, gpu: &mut VirtioGpu, stream: &[u8]) -> Result<(), VirtioError> {
-        // fence_id 0: the submit is synchronous (polled used-ring) inside
-        // `submit_venus`, so we do not need a per-command fence id here.
-        gpu.submit_venus(self.ctx_id, 0, 0, stream)
+    /// the ring being usable. Blocks at PASSIVE (virtio::ctrl KEVENT wait) until
+    /// the device acks the command.
+    fn submit_direct(&self, adapter: &AdapterContext, stream: &[u8]) -> Result<(), VirtioError> {
+        ctrl::submit_venus_sync(adapter, self.ctx_id, stream)
     }
 
     /// Publish the ring buffer up to `self.cur` (SeqCst tail store), then nudge the
     /// host if the ring reports idle. Returns the seqno of the just-written command
     /// (== the post-write `cur`). Aborts on a fatal ring status.
-    fn publish_and_notify(&mut self, gpu: &mut VirtioGpu) -> Result<u32, VirtioError> {
+    fn publish_and_notify(&mut self, adapter: &AdapterContext) -> Result<u32, VirtioError> {
         if self.fatal {
             return Err(VirtioError::DeviceError);
         }
@@ -426,29 +433,64 @@ impl VenusClient {
 
         let status = self.ring_map.load_u32_acquire(RING_STATUS_OFFSET);
         if status & RING_STATUS_FATAL != 0 {
-            // No diag() — DISPATCH-reachable (see wait_seqno). Latch fatal.
             self.fatal = true;
             return Err(VirtioError::DeviceError);
         }
         // vkNotifyRingMESA(ring, seqno, flags=0): wake the host ring dispatch.
         // Sent UNCONDITIONALLY (not gated on the IDLE status bit): the host idles
         // after a 1 ms timeout and the guest's read of the IDLE bit from the ring
-        // shmem is racy/coherency-sensitive — always nudging is correct and cheap
-        // for this one-shot bring-up. vkNotifyRingMESA is a valid DIRECT command
-        // (unlike vkWaitVirtqueueSeqnoMESA, which the host rejects off-ring).
+        // shmem is racy/coherency-sensitive — always nudging is correct and cheap.
+        // vkNotifyRingMESA is a valid DIRECT command (unlike
+        // vkWaitVirtqueueSeqnoMESA, which the host rejects off-ring).
         self.notify_seqno = self.notify_seqno.wrapping_add(1);
         let mut w = Writer::new();
         w.header(CMD_NOTIFY_RING_MESA, 0);
         w.u64(self.ring_id);
         w.u32(self.notify_seqno);
         w.u32(0); // VkRingNotifyFlagsMESA
-        self.submit_direct(gpu, w.as_slice())?;
+        self.submit_direct(adapter, w.as_slice())?;
         Ok(seqno)
     }
 
+    /// PASSIVE ring-progress wait: run `ready()` until it returns true, with a
+    /// short spin burst then 1 ms sleeps, bounded by [`RING_WAIT_TIMEOUT_MS`].
+    /// Checks the ring FATAL status each round. Latches `fatal` on timeout.
+    fn ring_wait_until(
+        &mut self,
+        ready: impl Fn(&Self) -> bool,
+    ) -> Result<(), VirtioError> {
+        if self.fatal {
+            return Err(VirtioError::DeviceError);
+        }
+        for _ in 0..RING_SPIN_BURST {
+            if ready(self) {
+                return Ok(());
+            }
+            core::hint::spin_loop();
+        }
+        let mut slept_ms: u64 = 0;
+        loop {
+            if ready(self) {
+                return Ok(());
+            }
+            let status = self.ring_map.load_u32_acquire(RING_STATUS_OFFSET);
+            if status & RING_STATUS_FATAL != 0 {
+                // Host declared the ring fatal — it never recovers.
+                self.fatal = true;
+                return Err(VirtioError::DeviceError);
+            }
+            if slept_ms >= RING_WAIT_TIMEOUT_MS {
+                self.fatal = true;
+                return Err(VirtioError::DeviceError);
+            }
+            ctrl::sleep_ms(1);
+            slept_ms += 1;
+        }
+    }
+
     /// Reserve space and copy `stream` into the ring buffer at `self.cur`,
-    /// advancing `cur` (vn_ring producer). Spins until the host has consumed enough
-    /// to make room (`cur + size - head <= buffer_size`), bounded by RING_POLL_SPINS.
+    /// advancing `cur` (vn_ring producer). Waits (PASSIVE) until the host has
+    /// consumed enough to make room (`cur + size - head <= buffer_size`).
     fn write_to_ring(&mut self, stream: &[u8]) -> Result<(), VirtioError> {
         if self.fatal {
             return Err(VirtioError::DeviceError);
@@ -457,67 +499,36 @@ impl VenusClient {
         if size as u64 > RING_BUFFER_SIZE as u64 {
             return Err(VirtioError::DeviceError);
         }
-        // Wait for buffer space (u32 free-running arithmetic, wrap-preserving).
-        let mut spins = 0u64;
-        loop {
-            let head = self.ring_map.load_u32_acquire(RING_HEAD_OFFSET);
-            // occupancy after this write = cur + size - head; must be <= buffer_size.
-            if self.cur.wrapping_add(size).wrapping_sub(head) <= RING_BUFFER_SIZE {
-                break;
-            }
-            spins += 1;
-            if spins >= RING_POLL_SPINS {
-                // A ring that stopped draining is a wedged host — latch fatal
-                // so later calls fail fast instead of re-spinning (this path
-                // runs at DISPATCH under the device spinlock).
-                self.fatal = true;
-                return Err(VirtioError::DeviceError);
-            }
-            core::hint::spin_loop();
-        }
+        // Wait for buffer space (u32 free-running arithmetic, wrap-preserving):
+        // occupancy after this write = cur + size - head; must be <= buffer_size.
+        let cur = self.cur;
+        self.ring_wait_until(move |c| {
+            let head = c.ring_map.load_u32_acquire(RING_HEAD_OFFSET);
+            cur.wrapping_add(size).wrapping_sub(head) <= RING_BUFFER_SIZE
+        })?;
         self.ring_map.write_ring_buffer(self.cur, stream);
         self.cur = self.cur.wrapping_add(size);
         Ok(())
     }
 
-    /// Poll the ring head until it reaches `seqno` (the host has consumed and
-    /// completed the command). Wrap-safe `(i32)(head - seqno) >= 0` compare.
+    /// Wait (PASSIVE) until the ring head reaches `seqno` (the host has consumed
+    /// and completed the command). Wrap-safe `(i32)(head - seqno) >= 0` compare.
     fn wait_seqno(&mut self, seqno: u32) -> Result<(), VirtioError> {
-        if self.fatal {
-            return Err(VirtioError::DeviceError);
-        }
-        let mut spins = 0u64;
-        loop {
-            let head = self.ring_map.load_u32_acquire(RING_HEAD_OFFSET);
-            if (head.wrapping_sub(seqno)) as i32 >= 0 {
-                return Ok(());
-            }
-            let status = self.ring_map.load_u32_acquire(RING_STATUS_OFFSET);
-            if status & RING_STATUS_FATAL != 0 {
-                // Host declared the ring fatal — it never recovers. NOTE: no
-                // diag() here; this loop runs at DISPATCH under the device
-                // spinlock (alloc path) where the registry tracer is illegal.
-                self.fatal = true;
-                return Err(VirtioError::DeviceError);
-            }
-            spins += 1;
-            if spins >= RING_POLL_SPINS {
-                self.fatal = true;
-                return Err(VirtioError::DeviceError);
-            }
-            core::hint::spin_loop();
-        }
+        self.ring_wait_until(move |c| {
+            let head = c.ring_map.load_u32_acquire(RING_HEAD_OFFSET);
+            (head.wrapping_sub(seqno)) as i32 >= 0
+        })
     }
 
     /// Issue a command WITHOUT a reply through the ring: write → publish → wait.
     #[allow(dead_code)]
     fn ring_command_noreply(
         &mut self,
-        gpu: &mut VirtioGpu,
+        adapter: &AdapterContext,
         stream: &[u8],
     ) -> Result<(), VirtioError> {
         self.write_to_ring(stream)?;
-        let seqno = self.publish_and_notify(gpu)?;
+        let seqno = self.publish_and_notify(adapter)?;
         self.wait_seqno(seqno)
     }
 
@@ -527,7 +538,7 @@ impl VenusClient {
     /// reply-shmem offset 0; the caller decodes it via a fresh [`ReplyReader`].
     fn ring_command_reply(
         &mut self,
-        gpu: &mut VirtioGpu,
+        adapter: &AdapterContext,
         cmd_stream: &[u8],
     ) -> Result<(), VirtioError> {
         // vkSetReplyCommandStreamMESA: point the host at reply shmem [0, size).
@@ -542,7 +553,7 @@ impl VenusClient {
         // The real command, with GENERATE_REPLY.
         self.write_to_ring(cmd_stream)?;
 
-        let seqno = self.publish_and_notify(gpu)?;
+        let seqno = self.publish_and_notify(adapter)?;
         self.wait_seqno(seqno)?;
         Ok(())
     }
@@ -550,26 +561,30 @@ impl VenusClient {
     /// Warm up the reply shmem so the host maps it before the first reply: a
     /// virtqueue-seqno submit + wait roundtrip (`vkSubmit/WaitVirtqueueSeqnoMESA`,
     /// both direct). seqno is monotonic from 1.
-    fn reply_shmem_roundtrip(&mut self, gpu: &mut VirtioGpu) -> Result<(), VirtioError> {
+    #[allow(dead_code)]
+    fn reply_shmem_roundtrip(&mut self, adapter: &AdapterContext) -> Result<(), VirtioError> {
         self.roundtrip_seqno += 1;
         let seqno = self.roundtrip_seqno;
         let mut sub = Writer::new();
         sub.header(CMD_SUBMIT_VIRTQUEUE_SEQNO_MESA, 0);
         sub.u64(self.ring_id);
         sub.u64(seqno);
-        self.submit_direct(gpu, sub.as_slice())?;
+        self.submit_direct(adapter, sub.as_slice())?;
 
         let mut wait = Writer::new();
         wait.header(CMD_WAIT_VIRTQUEUE_SEQNO_MESA, 0);
         wait.u64(seqno);
-        self.submit_direct(gpu, wait.as_slice())
+        self.submit_direct(adapter, wait.as_slice())
     }
 
     /// Allocate HOST_VISIBLE|HOST_COHERENT Venus device memory and bind it to a
     /// HOST3D blob. Returns the memory id (`blob_id`) and virtio resource id.
+    /// The ring reply wait guarantees `vkAllocateMemory` has EXECUTED before the
+    /// blob create references it (guest-side ordering — the host ctrl queue is
+    /// never blocked waiting for this client's allocations).
     pub fn allocate_memory_blob(
         &mut self,
-        gpu: &mut VirtioGpu,
+        adapter: &AdapterContext,
         size: u64,
         mappable: bool,
     ) -> Result<HostVisibleBlob, VirtioError> {
@@ -587,7 +602,7 @@ impl VenusClient {
             w.count(false);
             w.count(true);
             w.u64(memory_id);
-            self.ring_command_reply(gpu, w.as_slice())?;
+            self.ring_command_reply(adapter, w.as_slice())?;
 
             let mut r = ReplyReader::new(&self.reply_map);
             let cmd = r.read_i32()?;
@@ -607,14 +622,15 @@ impl VenusClient {
         } else {
             0
         };
-        let res_id = gpu.resource_create_blob(
+        let res_id = ctrl::resource_create_blob(
+            adapter,
             self.ctx_id,
             VIRTIO_GPU_BLOB_MEM_HOST3D,
             flags,
             memory_id,
             size,
         )?;
-        gpu.note_blob_size(res_id, size);
+        let _ = adapter.with_virtio(|v| v.note_blob_size(res_id, size));
         Ok(HostVisibleBlob {
             blob_id: memory_id,
             res_id,
@@ -627,11 +643,10 @@ impl VenusClient {
     /// (`vkFreeMemory` over the ring — cmd 22, wire shape per
     /// `vn_encode_vkFreeMemory`: device id, memory id, null pAllocator). The
     /// caller unrefs the blob RESOURCE separately, before this, so the host drops
-    /// the blob's reference on the memory first. DISPATCH-safe (fixed-buffer ring
-    /// write + bounded seqno poll).
+    /// the blob's reference on the memory first.
     pub fn free_memory_blob(
         &mut self,
-        gpu: &mut VirtioGpu,
+        adapter: &AdapterContext,
         memory_id: u64,
     ) -> Result<(), VirtioError> {
         let mut w = Writer::new();
@@ -639,7 +654,7 @@ impl VenusClient {
         w.u64(self.device_id);
         w.u64(memory_id);
         w.count(false); // pAllocator = NULL
-        self.ring_command_noreply(gpu, w.as_slice())
+        self.ring_command_noreply(adapter, w.as_slice())
     }
 }
 
@@ -655,40 +670,42 @@ fn round_up_page(size: u64) -> u64 {
 /// [`VenusClient`] (kept alive by the caller so the ring/reply mappings persist)
 /// and the [`HostVisibleBlob`] describing the page-table region.
 ///
-/// Runs at PASSIVE_LEVEL during StartDevice; takes `&mut VirtioGpu` directly (no
-/// spinlock) because StartDevice is single-threaded — see the module docs.
+/// Runs at PASSIVE_LEVEL during StartDevice, after `set_virtio` installs the
+/// transport (all round-trips ride `virtio::ctrl`'s PASSIVE waits).
 pub fn allocate_host_visible_blob(
-    gpu: &mut VirtioGpu,
+    adapter: &AdapterContext,
     ctx_id: u32,
 ) -> Result<(VenusClient, HostVisibleBlob), VirtioError> {
     diag(0x0001);
 
     // ── 1. Ring shmem: create blob + map into window + kernel-map + zero ──────
-    let ring_res_id = gpu.resource_create_blob(
+    let ring_res_id = ctrl::resource_create_blob(
+        adapter,
         ctx_id,
         VIRTIO_GPU_BLOB_MEM_HOST3D,
         VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE,
         0, // blob_id 0: ring shmem is host-allocated (no venus mem binding)
         RING_SHMEM_SIZE,
     )?;
-    // Track the ring blob so map_blob_prepare can size the mapping.
-    gpu.note_blob_size(ring_res_id, RING_SHMEM_SIZE);
-    let ring_prep = gpu.map_blob_prepare(ring_res_id)?;
+    // Track the ring blob (owner 0) so the map below can size the mapping.
+    let _ = adapter.with_virtio(|v| v.note_blob_size(ring_res_id, RING_SHMEM_SIZE));
+    let ring_prep = ctrl::map_blob_prepare(adapter, Some(0), ring_res_id)?;
     let ring_map = KernelMap::new(ring_prep.gpa, ring_prep.size, ring_prep.map_cache)
         .ok_or(VirtioError::MmioMapFailed)?;
     ring_map.zero();
     diag(0x0002);
 
     // ── 2. Reply shmem: create blob + map + kernel-map + zero ─────────────────
-    let reply_res_id = gpu.resource_create_blob(
+    let reply_res_id = ctrl::resource_create_blob(
+        adapter,
         ctx_id,
         VIRTIO_GPU_BLOB_MEM_HOST3D,
         VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE,
         0,
         REPLY_SHMEM_SIZE,
     )?;
-    gpu.note_blob_size(reply_res_id, REPLY_SHMEM_SIZE);
-    let reply_prep = gpu.map_blob_prepare(reply_res_id)?;
+    let _ = adapter.with_virtio(|v| v.note_blob_size(reply_res_id, REPLY_SHMEM_SIZE));
+    let reply_prep = ctrl::map_blob_prepare(adapter, Some(0), reply_res_id)?;
     let reply_map = KernelMap::new(reply_prep.gpa, reply_prep.size, reply_prep.map_cache)
         .ok_or(VirtioError::MmioMapFailed)?;
     reply_map.zero();
@@ -733,7 +750,7 @@ pub fn allocate_host_visible_blob(
         w.u64(RING_BUFFER_SIZE as u64); // bufferSize
         w.u64(RING_EXTRA_OFFSET); // extraOffset
         w.u64(RING_EXTRA_SIZE); // extraSize
-        client.submit_direct(gpu, w.as_slice())?;
+        client.submit_direct(adapter, w.as_slice())?;
     }
     diag(0x0004);
 
@@ -763,7 +780,7 @@ pub fn allocate_host_visible_blob(
         w.count(false); // simple_pointer(pAllocator) NULL
         w.count(true); // simple_pointer(pInstance)
         w.u64(instance_id); // VkInstance handle
-        client.ring_command_reply(gpu, w.as_slice())?;
+        client.ring_command_reply(adapter, w.as_slice())?;
     }
     // Reply: [i32 cmd][i32 VkResult][simple_pointer u64][u64 instance]
     {
@@ -790,7 +807,7 @@ pub fn allocate_host_visible_blob(
         w.count(true); // simple_pointer(pPhysicalDeviceCount)
         w.u32(0); // *pPhysicalDeviceCount = 0
         w.count(false); // pPhysicalDevices NULL → array_size 0
-        client.ring_command_reply(gpu, w.as_slice())?;
+        client.ring_command_reply(adapter, w.as_slice())?;
         // We don't strictly need the count value; just validate the reply header.
         let mut r = ReplyReader::new(&client.reply_map);
         let cmd = r.read_i32()?;
@@ -811,7 +828,7 @@ pub fn allocate_host_visible_blob(
         w.u32(1); // *pPhysicalDeviceCount = 1
         w.count(true); // pPhysicalDevices present → array_size 1 follows
         w.u64(phys_dev_id); // guest-assigned VkPhysicalDevice id for slot 0
-        client.ring_command_reply(gpu, w.as_slice())?;
+        client.ring_command_reply(adapter, w.as_slice())?;
 
         // Reply: [i32 cmd][i32 VkResult][sp u64][u32 count][array_size u64][u64 id×N]
         let mut r = ReplyReader::new(&client.reply_map);
@@ -864,7 +881,7 @@ pub fn allocate_host_visible_blob(
                        // partial-encoded struct: array_size(32) then array_size(16).
         w.u64(VK_MAX_MEMORY_TYPES as u64);
         w.u64(VK_MAX_MEMORY_HEAPS as u64);
-        client.ring_command_reply(gpu, w.as_slice())?;
+        client.ring_command_reply(adapter, w.as_slice())?;
 
         // Reply (NO VkResult): [i32 cmd][sp u64][u32 typeCount][array u64]
         //   [ (u32 propertyFlags, u32 heapIndex) × 32 ]
@@ -943,7 +960,7 @@ pub fn allocate_host_visible_blob(
         w.count(false); // simple_pointer(pAllocator) NULL
         w.count(true); // simple_pointer(pDevice)
         w.u64(device_id); // VkDevice handle
-        client.ring_command_reply(gpu, w.as_slice())?;
+        client.ring_command_reply(adapter, w.as_slice())?;
 
         // Reply: [i32 cmd][i32 VkResult][sp u64][u64 device]
         let mut r = ReplyReader::new(&client.reply_map);
@@ -964,11 +981,11 @@ pub fn allocate_host_visible_blob(
 
     // ── 8. vkAllocateMemory — 16 MiB of the chosen HOST_VISIBLE|COHERENT type ──
     // The memory handle id we pick IS the virtio-gpu blob_id used below.
-    let blob = client.allocate_memory_blob(gpu, PAGE_TABLE_ALLOC_SIZE, true)?;
+    let blob = client.allocate_memory_blob(adapter, PAGE_TABLE_ALLOC_SIZE, true)?;
     diag(0x000A);
 
     // ── 9. Create + map the page-table blob backed by the venus memory id ─────
-    let pt_prep = gpu.map_blob_prepare(blob.res_id)?;
+    let pt_prep = ctrl::map_blob_prepare(adapter, Some(0), blob.res_id)?;
     diag(0x000B);
 
     let blob = HostVisibleBlob {

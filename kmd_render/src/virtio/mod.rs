@@ -14,6 +14,7 @@
 //! M5 MSI-X ISR/DPC → M6 teardown.
 
 pub mod config;
+pub mod ctrl;
 pub mod gpu;
 pub mod hal;
 pub mod venus;
@@ -21,7 +22,8 @@ pub mod venus;
 pub use gpu::VirtioGpu;
 
 use wdk_sys::{
-    NTSTATUS, STATUS_INSUFFICIENT_RESOURCES, STATUS_IO_DEVICE_ERROR, STATUS_NOT_IMPLEMENTED,
+    NTSTATUS, STATUS_DEVICE_BUSY, STATUS_INSUFFICIENT_RESOURCES, STATUS_IO_DEVICE_ERROR,
+    STATUS_IO_TIMEOUT, STATUS_NOT_IMPLEMENTED,
 };
 
 /// Errors from virtio-gpu bring-up. Mapped to NTSTATUS so `StartDevice` can fail
@@ -38,6 +40,12 @@ pub enum VirtioError {
     MmioMapFailed,
     /// The device reported an error or behaved unexpectedly.
     DeviceError,
+    /// The control queue / in-flight tables are full — retry after a PASSIVE
+    /// sleep (natural backpressure; NOT a device failure).
+    QueueFull,
+    /// A synchronous control command did not complete within its PASSIVE wait
+    /// budget (the in-flight slot was abandoned; the transport keeps working).
+    Timeout,
     /// Not yet implemented (scaffolding).
     NotImplemented,
 }
@@ -49,6 +57,8 @@ impl From<VirtioError> for NTSTATUS {
             VirtioError::CapNotFound | VirtioError::FeatureRejected | VirtioError::DeviceError => {
                 STATUS_IO_DEVICE_ERROR
             }
+            VirtioError::QueueFull => STATUS_DEVICE_BUSY,
+            VirtioError::Timeout => STATUS_IO_TIMEOUT,
             VirtioError::NotImplemented => STATUS_NOT_IMPLEMENTED,
         }
     }

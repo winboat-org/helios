@@ -271,45 +271,36 @@ unsafe fn write_open_identity(
 
 /// Tear down one blob allocation: unmap (if mapped) → detach → unref → free the
 /// KMD context. Best-effort on the virtio ops (teardown must not get stuck).
+/// PASSIVE_LEVEL (DxgkDdiDestroyAllocation) — the round-trips ride
+/// `virtio::ctrl`'s PASSIVE waits.
 unsafe fn destroy_allocation_ctx(adapter: &AdapterContext, ctx: Box<AllocationContext>) {
     if ctx.resource_id != 0 && ctx.owns_resource {
+        // Drop the owner-0 tracking slot (registered at CreateAllocation, or
+        // re-owned to the allocation at adopt), unmapping the GDI executor's
+        // host-visible mapping if one is live.
+        let unmapped_here = crate::virtio::ctrl::forget_allocation_blob(adapter, ctx.resource_id);
+        if ctx.mapped && !unmapped_here {
+            let _ = crate::virtio::ctrl::resource_unmap_blob(adapter, ctx.resource_id);
+        }
+        // One guarded teardown path for created AND adopted resources. The old
+        // adopted arm unref'd unconditionally, which double-freed resources
+        // another path had already reclaimed — QEMU's "virgl_cmd_resource_unref:
+        // resource does not exist ×9" at the 2026-07-03 boot-#3 dwm teardown.
+        let first_teardown = adapter
+            .with_virtio(|v| v.take_live_resource(ctx.resource_id))
+            .unwrap_or(false);
+        if first_teardown {
+            let _ = crate::virtio::ctrl::ctx_detach_resource(adapter, ctx.ctx_id, ctx.resource_id);
+            let _ = crate::virtio::ctrl::resource_unref(adapter, ctx.resource_id);
+        }
         if ctx.venus_memory_id != 0 {
-            // KMD-backed standard allocation: unmap/untrack the blob, detach +
-            // unref the RESOURCE first (the host blob holds a reference into the
-            // memory object), then vkFreeMemory the venus memory. Best-effort:
-            // if the venus client is already gone (device teardown), the host
-            // context destruction reclaims everything anyway.
-            let _ = adapter.with_virtio_and_venus_locked(|v, c| {
-                let unmapped_here = v.forget_allocation_blob(ctx.resource_id);
-                if ctx.mapped && !unmapped_here {
-                    let _ = v.resource_unmap_blob(ctx.resource_id);
-                }
-                if v.take_live_resource(ctx.resource_id) {
-                    let _ = v.ctx_detach_resource(ctx.ctx_id, ctx.resource_id);
-                    let _ = v.resource_unref(ctx.resource_id);
-                }
-                let _ = c.free_memory_blob(v, ctx.venus_memory_id);
-            });
-        } else {
-            let _ = adapter.with_virtio(|v| {
-                // Drop the owner-0 tracking slot (registered at CreateAllocation,
-                // or re-owned to the allocation at adopt), unmapping the GDI
-                // executor's host-visible mapping if one is live.
-                let unmapped_here = v.forget_allocation_blob(ctx.resource_id);
-                if ctx.mapped && !unmapped_here {
-                    let _ = v.resource_unmap_blob(ctx.resource_id);
-                }
-                // One guarded teardown path for created AND adopted resources.
-                // The old adopted arm unref'd unconditionally, which double-
-                // freed resources another path had already reclaimed — QEMU's
-                // "virgl_cmd_resource_unref: resource does not exist ×9" at the
-                // 2026-07-03 boot-#3 dwm teardown.
-                if !v.take_live_resource(ctx.resource_id) {
-                    return Ok(());
-                }
-                let _ = v.ctx_detach_resource(ctx.ctx_id, ctx.resource_id);
-                v.resource_unref(ctx.resource_id)
-            });
+            // KMD-backed standard allocation: after the RESOURCE teardown above
+            // (the host blob holds a reference into the memory object),
+            // vkFreeMemory the venus memory. Best-effort: if the venus client
+            // is already gone (device teardown), the host context destruction
+            // reclaims everything anyway.
+            let _ =
+                adapter.with_venus_client(|c| c.free_memory_blob(adapter, ctx.venus_memory_id));
         }
     }
     drop(ctx);
@@ -423,8 +414,9 @@ unsafe fn create_one(
         // look up object of type 8" → fatal decoder state → context destroyed).
         // `allocate_memory_blob` also registers the blob in the tracking table
         // (owner 0), which the GDI executor's `blob_kernel_range` resolves.
-        match adapter.with_virtio_and_venus_locked(|v, c| {
-            c.allocate_memory_blob(v, ap.size, true)
+        // PASSIVE flow under the venus mutex (never the DISPATCH spinlock).
+        match adapter.with_venus_client(|c| {
+            c.allocate_memory_blob(adapter, ap.size, true)
                 .map(|b| (b, c.memory_type_index()))
         }) {
             Ok(Ok((blob, kernel_mti))) => {
@@ -451,27 +443,28 @@ unsafe fn create_one(
             }
         }
     } else {
-        match adapter.with_virtio(|v| {
-            let rid =
-                v.resource_create_blob(ap.ctx_id, ap.blob_mem, ap.blob_flags, ap.blob_id, ap.size)?;
-            // Register the blob in the tracking table (owner 0 = KMD-internal) so
-            // the GDI executor's `blob_kernel_range` can resolve and host-map this
-            // allocation by resource id. Removed again in `destroy_allocation_ctx`
-            // via `forget_allocation_blob`.
-            v.note_blob_size(rid, ap.size);
-            Ok::<u32, crate::virtio::VirtioError>(rid)
-        }) {
-            Ok(Ok(rid)) => rid,
-            Ok(Err(_ve)) => {
+        match crate::virtio::ctrl::resource_create_blob(
+            adapter,
+            ap.ctx_id,
+            ap.blob_mem,
+            ap.blob_flags,
+            ap.blob_id,
+            ap.size,
+        ) {
+            Ok(rid) => {
+                // Register the blob in the tracking table (owner 0 = KMD-internal)
+                // so the GDI executor's `blob_kernel_range` can resolve and
+                // host-map this allocation by resource id. Removed again in
+                // `destroy_allocation_ctx` via `forget_allocation_blob`.
+                let _ = adapter.with_virtio(|v| v.note_blob_size(rid, ap.size));
+                rid
+            }
+            Err(_ve) => {
                 // Host rejected the blob (e.g. the .56 blob_id=0 RESP_ERR_UNSPEC case).
                 // STATUS_NO_MEMORY, not STATUS_UNSUCCESSFUL — see the standard-alloc
                 // arm above (invalid-NTSTATUS → dxgkrnl adapter resets).
                 crate::diag::record(0x0C01_00E0);
                 return Err(STATUS_NO_MEMORY);
-            }
-            Err(_de) => {
-                crate::diag::record(0x0C01_00E1);
-                return Err(STATUS_DEVICE_NOT_READY);
             }
         }
     };

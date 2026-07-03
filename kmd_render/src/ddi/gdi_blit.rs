@@ -189,9 +189,11 @@ unsafe fn surface(
         return None;
     };
 
-    let prep = match adapter.with_virtio(|v| v.blob_kernel_range(info.resource_id)) {
-        Ok(Ok(p)) => p,
-        _ => {
+    // Any-owner resolve + host-map of the allocation's blob (PASSIVE flow —
+    // DxgkDdiRenderGdi runs at PASSIVE_LEVEL).
+    let prep = match crate::virtio::ctrl::map_blob_prepare(adapter, None, info.resource_id) {
+        Ok(p) => p,
+        Err(_) => {
             SKIP_NO_BLOB.fetch_add(1, Ordering::Relaxed);
             LAST_SKIP_RESID.store(info.resource_id, Ordering::Relaxed);
             return None;

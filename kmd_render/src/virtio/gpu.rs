@@ -1,43 +1,63 @@
 //! The virtio-gpu device object, built on the `virtio-drivers` PCI transport.
 //!
 //! `VirtioGpu` owns the `PciTransport` (discovers/maps the virtio config
-//! regions), the control `VirtQueue`, and a contiguous DMA scratch page, and
-//! layers the virtio-gpu command protocol (`helios_protocol`) on top. Built by
-//! `init` from `DxgkDdiStartDevice` and stored in `AdapterContext::virtio`.
+//! regions) and the control `VirtQueue`, and layers the virtio-gpu command
+//! protocol (`helios_protocol`) on top. Built by `init` from
+//! `DxgkDdiStartDevice` and stored in `AdapterContext::virtio`.
 //!
 //! Bring-up (all in `init`, at PASSIVE_LEVEL):
 //!   M1 — `DxgkConfigAccess` → `PciRoot` → `PciTransport::new::<WdkHal,_>`
 //!   M2 — feature negotiation via the `Transport` trait
 //!   M3 — control `VirtQueue::<WdkHal>` setup + DRIVER_OK
 //!   M4 — `GET_DISPLAY_INFO` polled round-trip (Phase-2 smoke test)
+//!
+//! ## C3/M3.4 async transport (2026-07-04)
+//!
+//! Every control-queue command is a tracked [`InFlight`] entry that OWNS its
+//! device-visible DMA buffers until the device returns its descriptor chain on
+//! the used ring ([`VirtioGpu::drain_used`], token-matched `peek_used` →
+//! `pop_used` — ported from the proven System-class phase4e model in
+//! `kmd/src/virtio/gpu.rs`). Nothing in this module ever waits:
+//!
+//!   * Fenced `SUBMIT_3D` is ASYNC ([`VirtioGpu::enqueue_async_submit`]): the
+//!     KMD assigns a globally-monotonic WIRE fence id, queues the descriptors,
+//!     notifies, and returns. Completion signals any registered
+//!     [`FenceWaiter`] (KEVENT) and advances the WDDM pending FIFO.
+//!   * Synchronous verbs (ctx/blob/map) are enqueued with an optional
+//!     [`SyncWaitBlock`] waiter ([`VirtioGpu::enqueue_sync`]); the waiter
+//!     blocks at PASSIVE_LEVEL in `virtio::ctrl`, NEVER at DISPATCH under the
+//!     device spinlock (the 2026-07-04 Escape-convoy root cause).
+//!   * Completed entries are parked (their `DmaBuffer`s are PASSIVE-only to
+//!     free) and reaped by PASSIVE callers via [`VirtioGpu::swap_parked`].
+//!
+//! The used-ring consumer is [`VirtioGpu::drain_used`], called from the
+//! interrupt DPC (`ddi/interrupt.rs`) and opportunistically (under the same
+//! spinlock) by enqueue paths and by `virtio::ctrl`'s wait slices, so waits
+//! survive a lost interrupt with only slice-granularity latency.
 
+use core::cell::UnsafeCell;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
+use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use bytemuck::Zeroable;
+use wdk_sys::ntddk::{KeInitializeEvent, KeSetEvent};
+use wdk_sys::KEVENT;
 use helios_protocol::{
-    resp_is_ok, VirtioGpuCmdSubmit, VirtioGpuCtrlHdr, VirtioGpuCtxCreate, VirtioGpuCtxDestroy,
-    VirtioGpuCtxResource, VirtioGpuResourceCreateBlob, VirtioGpuResourceMapBlob,
-    VirtioGpuResourceUnmapBlob, VirtioGpuResourceUnref, VirtioGpuRespDisplayInfo,
-    VirtioGpuRespMapInfo, HELIOS_OPTIONAL_FEATURES, HELIOS_REQUIRED_FEATURES,
-    VIRTIO_GPU_CAPSET_VENUS, VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE, VIRTIO_GPU_CMD_CTX_CREATE,
-    VIRTIO_GPU_CMD_CTX_DESTROY, VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE,
-    VIRTIO_GPU_CMD_GET_DISPLAY_INFO, VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB,
-    VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB, VIRTIO_GPU_CMD_RESOURCE_UNMAP_BLOB,
-    VIRTIO_GPU_CMD_RESOURCE_UNREF, VIRTIO_GPU_CMD_SUBMIT_3D, VIRTIO_GPU_FLAG_FENCE,
-    VIRTIO_GPU_FLAG_INFO_RING_IDX, VIRTIO_GPU_MAP_CACHE_CACHED, VIRTIO_GPU_MAP_CACHE_MASK,
-    VIRTIO_GPU_SHM_ID_HOST_VISIBLE,
-    VIRTIO_PCI_CAP_ISR_CFG, VIRTIO_PCI_CAP_SHARED_MEMORY_CFG,
+    resp_is_ok, VirtioGpuCmdSubmit, VirtioGpuCtrlHdr, VirtioGpuRespDisplayInfo,
+    HELIOS_OPTIONAL_FEATURES, HELIOS_REQUIRED_FEATURES, VIRTIO_GPU_CMD_GET_DISPLAY_INFO,
+    VIRTIO_GPU_CMD_SUBMIT_3D, VIRTIO_GPU_FLAG_FENCE, VIRTIO_GPU_FLAG_INFO_RING_IDX,
+    VIRTIO_GPU_SHM_ID_HOST_VISIBLE, VIRTIO_PCI_CAP_ISR_CFG, VIRTIO_PCI_CAP_SHARED_MEMORY_CFG,
 };
 use virtio_drivers::queue::VirtQueue;
 use virtio_drivers::transport::pci::bus::{ConfigurationAccess, DeviceFunction, PciRoot};
 use virtio_drivers::transport::pci::PciTransport;
 use virtio_drivers::transport::{DeviceStatus, Transport};
-use virtio_drivers::{BufferDirection, Hal};
+use virtio_drivers::Hal;
 
 use super::config::DxgkConfigAccess;
-use super::hal::WdkHal;
+use super::hal::{DmaBuffer, WdkHal};
 use super::VirtioError;
 use crate::dxgk::DXGKRNL_INTERFACE;
 
@@ -45,21 +65,49 @@ use crate::dxgk::DXGKRNL_INTERFACE;
 const CTRL_QUEUE: u16 = 0;
 /// Control-queue ring size — power of two, conservatively ≤ the device's max.
 const CTRL_QUEUE_SIZE: usize = 64;
-/// One page of contiguous DMA scratch, split into request/response halves.
+/// One page of contiguous DMA scratch for `init`'s inline polled round-trip.
 const SCRATCH_BYTES: usize = 4096;
-/// Busy-poll bound for a control-queue round-trip (used-ring completion).
-/// Each iteration is a volatile used-ring read + `spin_loop` (~10 ns), so the
-/// bound is on the order of a second — generous for a healthy host (responses
-/// are decoder-level acks, µs–ms), but finite for a wedged one. These
-/// round-trips can run at DISPATCH_LEVEL under the device spinlock, where the
-/// previous UNBOUNDED poll (`add_notify_wait_pop`) meant a wedged host became
-/// a 0x101/0x133 bugcheck or a hard guest hang (observed 2026-07-03 04:0x).
-/// One timeout poisons the transport (see `VirtioGpu::failed`).
+/// Busy-poll bound for `init`'s inline GET_DISPLAY_INFO round-trip — the ONLY
+/// polled wait left (PASSIVE, pre-interrupt, single-threaded bring-up; every
+/// runtime wait is a PASSIVE KEVENT wait in `virtio::ctrl`). Each iteration is
+/// a volatile used-ring read + `spin_loop` (~10 ns) → bound ≈ 1 s.
 const CTRL_POLL_SPINS: u64 = 100_000_000;
 
-/// DISPATCH-safe count of control-queue round-trip timeouts (→ poison). Read
-/// by `DxgkDdiCollectDbgInfo`; nonzero means the host stopped answering.
+/// Count of synchronous control-command timeouts (a passive waiter gave up and
+/// abandoned its in-flight slot). Unlike the old model this does NOT poison
+/// the transport — the slot is reaped when the completion eventually arrives —
+/// but nonzero still means the host stopped answering in time. Read by
+/// `DxgkDdiCollectDbgInfo` / `HELIOS_ESCAPE_QUERY_STATS` (acceptance: stays 0).
 pub static CTRL_TIMEOUT_COUNT: AtomicU32 = AtomicU32::new(0);
+
+// ── C3/M3.4 async-transport telemetry (all DISPATCH-safe atomics) ────────────
+
+/// Async SUBMIT_3D enqueues.
+pub static ASYNC_SUBMIT_COUNT: AtomicU32 = AtomicU32::new(0);
+/// Async SUBMIT_3D completions drained from the used ring.
+pub static ASYNC_COMPLETE_COUNT: AtomicU32 = AtomicU32::new(0);
+/// Async SUBMIT_3D completions whose ctrl response was not RESP_OK.
+pub static ASYNC_RESP_ERRORS: AtomicU32 = AtomicU32::new(0);
+/// WAIT_FENCE waiters registered (fence was still in flight at wait time).
+pub static FENCE_WAIT_REGISTERED: AtomicU32 = AtomicU32::new(0);
+/// WAIT_FENCE waits that timed out.
+pub static FENCE_WAIT_TIMEOUTS: AtomicU32 = AtomicU32::new(0);
+/// Used-ring completions whose token matched no in-flight entry (ring state
+/// corrupt → transport latches failed).
+pub static DRAIN_BAD_TOKEN: AtomicU32 = AtomicU32::new(0);
+/// Enqueue attempts refused because the queue/parked tables were full.
+pub static QUEUE_FULL_RETRIES: AtomicU32 = AtomicU32::new(0);
+/// WDDM pending-fence FIFO overflows (degraded to immediate completion).
+pub static WDDM_PENDING_OVERFLOWS: AtomicU32 = AtomicU32::new(0);
+/// High-water of concurrently in-flight control-queue entries.
+pub static INFLIGHT_HIGH_WATER: AtomicU32 = AtomicU32::new(0);
+/// High-water of parked (completed, awaiting PASSIVE free) entries.
+pub static PARKED_HIGH_WATER: AtomicU32 = AtomicU32::new(0);
+/// Parked entries force-forgotten because the parked table was full (leaked
+/// DMA memory — must stay 0; the enqueue gate makes this unreachable).
+pub static PARKED_LEAKS: AtomicU32 = AtomicU32::new(0);
+/// WDDM submissions completed by the DPC (real venus-driven fences).
+pub static WDDM_FENCE_FROM_DPC: AtomicU32 = AtomicU32::new(0);
 
 // ── DISPATCH-safe resource-table telemetry ──────────────────────────────────
 // All updated under the device spinlock (DISPATCH_LEVEL), so they must be
@@ -322,6 +370,11 @@ struct BlobSlot {
     size: u64,
     /// RESOURCE_MAP_BLOB succeeded and must be paired with RESOURCE_UNMAP_BLOB.
     mapped: bool,
+    /// A RESOURCE_MAP_BLOB round-trip is in flight for this slot (the window
+    /// range is reserved; concurrent mappers must wait — see `blob_map_begin`).
+    map_pending: bool,
+    /// Host caching nibble from RESP_OK_MAP_INFO (valid once `mapped`).
+    map_cache: u32,
     /// Host-visible window offset used for RESOURCE_MAP_BLOB.
     map_offset: u64,
     /// Rounded mapped length in the host-visible window.
@@ -357,15 +410,176 @@ struct ContextSlot {
     ctx_id: u32,
 }
 
+// ── C3/M3.4 async submission machinery ───────────────────────────────────────
+
+/// Max in-flight control-queue entries. Tokens are descriptor-chain heads, so
+/// they are always `< CTRL_QUEUE_SIZE`; each chain uses ≥ 2 descriptors, which
+/// caps real concurrency at half this.
+pub const MAX_INFLIGHT: usize = CTRL_QUEUE_SIZE;
+/// Parked (completed, awaiting PASSIVE free) entry capacity. Enqueues are
+/// refused once `parked` crosses [`PARKED_ENQUEUE_GATE`], and one drain can
+/// park at most `MAX_INFLIGHT` entries, so this bound is never exceeded.
+pub const MAX_PARKED: usize = 4 * MAX_INFLIGHT;
+/// Enqueue refusal threshold for the parked table (forces the PASSIVE caller
+/// to reap before submitting more).
+const PARKED_ENQUEUE_GATE: usize = MAX_PARKED - MAX_INFLIGHT;
+/// Max concurrent WAIT_FENCE waiters.
+const MAX_FENCE_WAITERS: usize = 64;
+/// Max WDDM submissions pending on venus completion.
+const MAX_WDDM_PENDING: usize = 256;
+/// Max response bytes a synchronous command may expect (copied into the
+/// waiter's [`SyncWaitBlock`]; the largest runtime response is
+/// `VirtioGpuRespMapInfo`. `init`'s big GET_DISPLAY_INFO reply stays on the
+/// inline polled path and does not ride this machinery).
+pub const SYNC_RESP_MAX: usize = 64;
+/// Bytes for an async submit's metadata buffer: the device-read SUBMIT_3D
+/// header followed by the device-written ctrl response.
+pub const SUBMIT_META_BYTES: usize =
+    core::mem::size_of::<VirtioGpuCmdSubmit>() + core::mem::size_of::<VirtioGpuCtrlHdr>();
+
+/// `NotificationEvent` (`EVENT_TYPE` value 0): stays signaled until cleared —
+/// the right semantics for one-shot completion events.
+const NOTIFICATION_EVENT: i32 = 0;
+/// `IO_NO_INCREMENT` priority boost for `KeSetEvent`.
+const IO_NO_INCREMENT: i32 = 0;
+
+/// A PASSIVE waiter's completion block. Lives on the waiter's stack; the
+/// registered pointer stays valid because the waiter ALWAYS deregisters (or
+/// observes completion) under the device spinlock before returning.
+pub struct SyncWaitBlock {
+    /// Signaled (under the device spinlock) when the entry completes.
+    pub event: KEVENT,
+    /// Set (Release) before the event is signaled; the waiter reads it
+    /// (Acquire) after the wait / under the lock.
+    done: AtomicBool,
+    /// The device-written response bytes, copied out of the entry's DMA buffer
+    /// by `drain_used` before the event is signaled.
+    resp: UnsafeCell<[u8; SYNC_RESP_MAX]>,
+}
+
+impl SyncWaitBlock {
+    /// A zeroed block. MUST be `init`ed (in place, at its final address) before
+    /// registration; must not move until deregistered.
+    pub fn new_zeroed() -> Self {
+        // SAFETY: a zeroed KEVENT/AtomicBool/byte-array is a valid *inert*
+        // value; `init` initializes the dispatcher header before any use.
+        unsafe { core::mem::zeroed() }
+    }
+
+    /// Initialize the embedded KEVENT (NotificationEvent, unsignaled).
+    ///
+    /// # Safety
+    /// `self` must be at its final (pinned) address.
+    pub unsafe fn init(&mut self) {
+        // SAFETY: valid, stable KEVENT storage per the fn contract.
+        unsafe { KeInitializeEvent(&mut self.event, NOTIFICATION_EVENT, 0) };
+        self.done.store(false, Ordering::Relaxed);
+    }
+
+    /// Whether the entry completed (Acquire — pairs with the drain's Release).
+    pub fn is_done(&self) -> bool {
+        self.done.load(Ordering::Acquire)
+    }
+
+    /// Copy the response bytes out (only valid once [`Self::is_done`]).
+    pub fn copy_resp(&self, out: &mut [u8]) {
+        let n = out.len().min(SYNC_RESP_MAX);
+        // SAFETY: `resp` is only written by the drain BEFORE `done` is set
+        // (Release); the caller reads AFTER observing `done` (Acquire).
+        let src = unsafe { &*self.resp.get() };
+        out[..n].copy_from_slice(&src[..n]);
+    }
+}
+
+/// What an in-flight entry is.
+enum InFlightKind {
+    /// A synchronous control command; `waiter` (if any) is signaled on
+    /// completion. `None` = the waiter timed out and abandoned the entry.
+    Sync { waiter: Option<NonNull<SyncWaitBlock>> },
+    /// An async fenced SUBMIT_3D carrying `fence_id` (KMD-assigned wire id).
+    AsyncVenus { fence_id: u64 },
+}
+
+/// One outstanding control-queue submission. Owns its device-visible buffers
+/// for as long as the device may DMA them (until `pop_used`); afterwards the
+/// entry is parked and dropped at PASSIVE_LEVEL (DmaBuffer frees are
+/// PASSIVE-only).
+pub struct InFlight {
+    /// Descriptor-chain head returned by `VirtQueue::add` (the pop_used token).
+    token: u16,
+    kind: InFlightKind,
+    /// `[in0 | in1? | resp]` — request span(s) followed by the device-written
+    /// response span, all in one contiguous DMA buffer.
+    meta: DmaBuffer,
+    in0_len: usize,
+    /// Second device-read span inside `meta` (0 = absent). Used by the
+    /// in-kernel venus client's SUBMIT_3D (header + small stream).
+    in1_len: usize,
+    resp_len: usize,
+    /// Separate device-read venus payload (async submits).
+    venus: Option<DmaBuffer>,
+    venus_len: usize,
+}
+
+/// A registered WAIT_FENCE waiter.
+struct FenceWaiter {
+    fence_id: u64,
+    block: NonNull<SyncWaitBlock>,
+}
+
+/// A WDDM submission whose `DXGK_INTERRUPT_DMA_COMPLETED` is gated on venus
+/// completion: it may signal once every async wire fence `< watermark` has
+/// retired (and strictly in FIFO order — SubmissionFenceIds are watermarks to
+/// dxgkrnl, so they must complete monotonically).
+struct WddmPending {
+    fence: u32,
+    watermark: u64,
+}
+
+/// Result of [`VirtioGpu::fence_wait_prepare`].
+pub enum FenceWaitPrep {
+    /// The fence already completed (or the id predates the tracked window).
+    Complete,
+    /// Registered; wait on the block's event.
+    Registered,
+    /// The id was never assigned by this transport instance.
+    Invalid,
+    /// Waiter table full — retry after a short PASSIVE sleep.
+    TableFull,
+}
+
+/// Result of [`VirtioGpu::blob_map_begin`].
+pub enum BlobMapBegin {
+    /// Already mapped — here is the existing mapping.
+    Mapped(BlobMapPrep),
+    /// Range reserved; the caller must run the RESOURCE_MAP_BLOB round-trip and
+    /// then call [`VirtioGpu::blob_map_finish`].
+    Start { offset: u64, len: u64 },
+    /// Another mapper's round-trip is in flight — retry after a PASSIVE sleep.
+    Busy,
+    /// Unknown resource / no host-visible window / size out of range / window
+    /// exhausted.
+    Failed(VirtioError),
+}
+
+/// Result of [`VirtioGpu::blob_map_finish`].
+pub enum BlobMapFinish {
+    /// Mapping recorded.
+    Done(BlobMapPrep),
+    /// The host rejected the map (range returned to the allocator).
+    HostRejected,
+    /// The slot vanished mid-map (owner teardown raced the round-trip): the
+    /// caller must issue RESOURCE_UNMAP_BLOB and return the range via
+    /// [`VirtioGpu::free_window_range_pub`].
+    SlotGone,
+}
+
 /// An initialized virtio-gpu transport.
 pub struct VirtioGpu {
     /// The virtio-modern PCI transport (owns the mapped cfg-region VAs).
     transport: PciTransport,
     /// Control virtqueue (queue 0) — all GPU commands ride this.
     control: VirtQueue<WdkHal, CTRL_QUEUE_SIZE>,
-    /// Contiguous DMA scratch page for synchronous command buffers. Freed in
-    /// teardown (M6).
-    scratch: NonNull<u8>,
     /// Next virtio-gpu 3D context id to hand out (guest-assigned; 0 is the
     /// reserved global context, so we start at 1). Phase 3.
     next_ctx_id: AtomicU32,
@@ -383,11 +597,17 @@ pub struct VirtioGpu {
     /// Tracked blobs (resource_id → size/mapping state). Heap-reserved to MAX_BLOBS
     /// at init so `push` under the spinlock never reallocates (the 0x7F lesson).
     blobs: Vec<BlobSlot>,
+    /// Blob-table slots reserved by in-flight (multi-phase) creates, counted
+    /// against MAX_BLOBS so a burst of concurrent creates cannot overshoot the
+    /// reserved capacity (push under the spinlock must never reallocate).
+    blobs_reserved: usize,
     /// Every host-live virtio resource id created through this transport.
     /// Removal is one-shot and gates CTX_DETACH_RESOURCE/RESOURCE_UNREF, avoiding
     /// qemu `RESOURCE_UNREF: resource does not exist` errors from duplicate DDI
     /// teardown paths.
     resources: Vec<u32>,
+    /// Live-resource slots reserved by in-flight creates (see `blobs_reserved`).
+    resources_reserved: usize,
     /// Live virtio-gpu contexts, tagged with the owning device handle, so
     /// `DxgkDdiDestroyDevice` can `CTX_DESTROY` any context an ICD created but did
     /// not tear down (crash / skipped CTX_DESTROY) — otherwise leaked contexts
@@ -398,12 +618,25 @@ pub struct VirtioGpu {
     next_window_offset: u64,
     /// Coalescing free list for released window ranges (bounded by MAX_WINDOW_RANGES).
     free_window_ranges: Vec<WindowRange>,
-    /// Poison latch: set when a control-queue round-trip times out (wedged
-    /// host/device). A timed-out descriptor is still in flight — the device may
-    /// complete it at any time — so the ring state is no longer trustworthy and
-    /// every subsequent command fails fast with `DeviceError` instead of
-    /// re-spinning at DISPATCH_LEVEL under the device spinlock (the 2026-07-03
-    /// guest wedge: each new call burned another full spin budget).
+    /// In-flight control-queue entries (token-matched; capacity MAX_INFLIGHT,
+    /// reserved at init — pushes never reallocate under the spinlock).
+    inflight: Vec<InFlight>,
+    /// Completed entries awaiting a PASSIVE reap (`swap_parked`). Capacity
+    /// MAX_PARKED, reserved at init.
+    parked: Vec<InFlight>,
+    /// Registered WAIT_FENCE waiters (capacity MAX_FENCE_WAITERS).
+    fence_waiters: Vec<FenceWaiter>,
+    /// Next wire fence id to assign (globally monotonic, starts at 1; 0 is
+    /// never a valid wire fence).
+    next_wire_fence: u64,
+    /// WDDM submissions pending on venus completion, FIFO (capacity
+    /// MAX_WDDM_PENDING, reserved at init).
+    wddm_pending: VecDeque<WddmPending>,
+    /// Ring-corruption latch: set when the used ring returns a token we do not
+    /// track or `pop_used` fails structurally. The ring state is then
+    /// untrustworthy and every subsequent command fails fast. NOTE: unlike the
+    /// old model, a slow host does NOT set this — waiter timeouts abandon
+    /// their entry and the transport keeps working.
     failed: bool,
 }
 
@@ -465,15 +698,11 @@ impl VirtioGpu {
         // Request + response live in one contiguous page so each buffer is
         // physically contiguous for the device (our Hal::share is identity — no
         // bounce buffer). Halves are disjoint (split_at_mut): request is read by
-        // the device, response is written by it.
-        let (scratch_pa, scratch) = WdkHal::dma_alloc(1, BufferDirection::Both);
-        if scratch_pa == 0 {
-            // dma_alloc signals failure with a zero physaddr + dangling ptr;
-            // bail rather than write into the dangling page.
-            return Err(VirtioError::OutOfMemory);
-        }
-        // SAFETY: `scratch` is a freshly-allocated, owned, contiguous page.
-        let buf = unsafe { core::slice::from_raw_parts_mut(scratch.as_ptr(), SCRATCH_BYTES) };
+        // the device, response is written by it. The page is a local RAII
+        // `DmaBuffer` — the runtime paths own per-command buffers instead
+        // (C3/M3.4), so no shared scratch survives init.
+        let mut scratch = DmaBuffer::new(SCRATCH_BYTES).ok_or(VirtioError::OutOfMemory)?;
+        let buf = scratch.as_mut_slice();
         let (req_buf, resp_buf) = buf.split_at_mut(SCRATCH_BYTES / 2);
 
         let hdr_len = core::mem::size_of::<VirtioGpuCtrlHdr>();
@@ -534,121 +763,165 @@ impl VirtioGpu {
             0x0B00_00E6
         });
 
-        let mut gpu = Self {
+        let gpu = Self {
             transport,
             control,
-            scratch,
             next_ctx_id: AtomicU32::new(1),
             next_resource_id: AtomicU32::new(1),
             host_visible,
             isr_status_va,
             blobs: Vec::with_capacity(MAX_BLOBS),
+            blobs_reserved: 0,
             resources: Vec::with_capacity(MAX_RESOURCES),
+            resources_reserved: 0,
             contexts: Vec::with_capacity(MAX_CONTEXTS),
             next_window_offset: 0,
             free_window_ranges: Vec::with_capacity(MAX_WINDOW_RANGES),
+            inflight: Vec::with_capacity(MAX_INFLIGHT),
+            parked: Vec::with_capacity(MAX_PARKED),
+            fence_waiters: Vec::with_capacity(MAX_FENCE_WAITERS),
+            next_wire_fence: 1,
+            wddm_pending: VecDeque::with_capacity(MAX_WDDM_PENDING),
             failed: false,
         };
+        // (The old Gate-2 venus ctx self-test is gone: the StartDevice venus
+        // client bring-up right after transport init exercises the full context
+        // + blob lifecycle for real.)
 
-        // Gate-2 bring-up validation (diagnostic; runs at PASSIVE_LEVEL from
-        // StartDevice, so the diag registry tracer is safe here): prove the venus
-        // 3D-context lifecycle works on the live device — a real prerequisite for
-        // the venus-backed allocation flow. Records 0x1100 on success / 0xFFFFFFFF
-        // on failure. Never gates StartDevice — Gate 1 stays start-safe.
-        // (A HOST3D blob can't be smoke-tested standalone: it needs a venus memory
-        // id from the UMD's vkAllocateMemory; confirmed by the .56 ERR_UNSPEC run
-        // and the proven System-class kmd::alloc_blob reference.)
-        // TODO(gate2): remove once CreateAllocation/UMD own the resource lifecycle.
-        let resp = gpu.self_test_venus_context();
-        crate::diag::record(0x0B00_0010);
-        crate::diag::record(resp);
-
-        // Read-to-clear the ISR-status register once: the GET_DISPLAY_INFO + venus
-        // self-test commands above completed via the polled path, which never
-        // touches this register, so the device may still be asserting INTx from
-        // those completions. Clear it now (PASSIVE) so the line starts deasserted
-        // before dxgkrnl connects our interrupt.
+        // Read-to-clear the ISR-status register once: the GET_DISPLAY_INFO
+        // round-trip above completed via the polled path, which never touches
+        // this register, so the device may still be asserting INTx from that
+        // completion. Clear it now (PASSIVE) so the line starts deasserted
+        // before the interrupt-driven runtime paths take over.
         if gpu.isr_status_va != 0 {
             // SAFETY: `isr_status_va` is the mapped MMIO VA of the 1-byte
             // read-to-clear ISR-status register; a volatile read clears it.
             let _ = unsafe { core::ptr::read_volatile(gpu.isr_status_va as *const u8) };
         }
 
+        // `scratch` (the init round-trip page) drops here — the descriptor
+        // chain it backed was popped above, so the device no longer references
+        // it.
+        drop(scratch);
         Ok(gpu)
     }
 
-    // ── Venus control path (Phase 3, M3.2) ──────────────────────────────────
+    // ── C3/M3.4 queue machinery ──────────────────────────────────────────────
     //
-    // All three methods drive the control virtqueue *synchronously* via
-    // `add_notify_wait_pop` (polled used-ring round-trip), like `init`. They take
-    // `&mut self` and assume the caller holds the AdapterContext spinlock so the
-    // shared `scratch` page and control queue are not touched concurrently
-    // (escape submits at PASSIVE today; the DPC drain arrives in M3.4). They run
-    // under that spinlock at DISPATCH_LEVEL, so they perform NO allocation — any
-    // payload buffer (the Venus stream) is allocated by the caller at PASSIVE and
-    // passed in already contiguous.
+    // Every method here runs under the AdapterContext virtio spinlock at
+    // DISPATCH_LEVEL and NEVER waits, allocates, or frees DMA memory. Waiting
+    // happens in `virtio::ctrl` (PASSIVE, KEVENT); freeing happens when a
+    // PASSIVE caller reaps the parked list.
 
-    /// Create a virtio-gpu 3D context bound to `capset_id` (Venus = 4) and return
-    /// the guest-assigned context id. `owner` is the D3D device handle that owns
-    /// the context, recorded so `DxgkDdiDestroyDevice` can reclaim a context the
-    /// ICD created but never explicitly destroyed.
-    pub fn ctx_create(&mut self, capset_id: u32, owner: usize) -> Result<u32, VirtioError> {
-        let ctx_id = self.next_ctx_id.fetch_add(1, Ordering::Relaxed);
-        let mut cmd = VirtioGpuCtxCreate::zeroed();
-        cmd.hdr.type_ = VIRTIO_GPU_CMD_CTX_CREATE;
-        cmd.hdr.ctx_id = ctx_id;
-        // With VIRTIO_GPU_F_CONTEXT_INIT, context_init carries the capset id.
-        cmd.context_init = capset_id;
-        // A debug name helps host-side (virglrenderer) logs; purely cosmetic.
-        const NAME: &[u8] = b"helios";
-        cmd.nlen = NAME.len() as u32;
-        cmd.debug_name[..NAME.len()].copy_from_slice(NAME);
-        crate::diag::record(0x0D20_0000 | (ctx_id & 0xFFFF));
-        let resp = self.ctrl_roundtrip_typed(bytemuck::bytes_of(&cmd))?;
-        crate::diag::record(0x0D21_0000 | (resp & 0xFFFF));
-        if !resp_is_ok(resp) {
-            return Err(VirtioError::DeviceError);
-        }
-        // Track for device-teardown reclamation. `push` stays within the reserved
-        // capacity (no realloc under the spinlock); if the registry is somehow full
-        // we still hand back the context — it just won't be auto-reclaimed.
-        if self.contexts.len() < MAX_CONTEXTS {
-            self.contexts.push(ContextSlot { owner, ctx_id });
-        } else {
-            CONTEXT_FULL_DROPS.fetch_add(1, Ordering::Relaxed);
-        }
-        Ok(ctx_id)
+    /// Ring-corruption latch (a wedged-slow host does NOT set this).
+    pub fn transport_failed(&self) -> bool {
+        self.failed
     }
 
-    /// Destroy a previously created 3D context and drop its tracking slot.
-    pub fn ctx_destroy(&mut self, ctx_id: u32) -> Result<(), VirtioError> {
-        if let Some(idx) = self.contexts.iter().position(|c| c.ctx_id == ctx_id) {
-            self.contexts.swap_remove(idx);
+    /// Enqueue a synchronous control command. `meta` = `[in0 | in1? | resp]`
+    /// (one contiguous DMA buffer); the entry owns it until completion. The
+    /// waiter's block is signaled (resp copied in) by [`Self::drain_used`].
+    /// On `QueueFull` the buffer is handed back for a PASSIVE retry.
+    pub fn enqueue_sync(
+        &mut self,
+        meta: DmaBuffer,
+        in0_len: usize,
+        in1_len: usize,
+        resp_len: usize,
+        waiter: NonNull<SyncWaitBlock>,
+    ) -> Result<u16, (DmaBuffer, VirtioError)> {
+        if self.failed {
+            return Err((meta, VirtioError::DeviceError));
         }
-        let mut cmd = VirtioGpuCtxDestroy::zeroed();
-        cmd.hdr.type_ = VIRTIO_GPU_CMD_CTX_DESTROY;
-        cmd.hdr.ctx_id = ctx_id;
-        self.ctrl_roundtrip(bytemuck::bytes_of(&cmd))
+        let total = in0_len
+            .checked_add(in1_len)
+            .and_then(|n| n.checked_add(resp_len));
+        match total {
+            Some(t) if in0_len > 0 && resp_len > 0 && resp_len <= SYNC_RESP_MAX
+                && t <= meta.as_slice().len() => {}
+            _ => return Err((meta, VirtioError::DeviceError)),
+        }
+        if self.inflight.len() >= MAX_INFLIGHT || self.parked.len() >= PARKED_ENQUEUE_GATE {
+            QUEUE_FULL_RETRIES.fetch_add(1, Ordering::Relaxed);
+            return Err((meta, VirtioError::QueueFull));
+        }
+        let base = meta.as_slice().as_ptr();
+        // SAFETY: the spans are disjoint sub-ranges of `meta`, which the
+        // InFlight entry owns until the matching pop_used (moving the DmaBuffer
+        // moves the owning struct, not the DMA bytes). The borrows end at `add`.
+        let added = unsafe {
+            let in0 = core::slice::from_raw_parts(base, in0_len);
+            let resp = core::slice::from_raw_parts_mut(
+                base.add(in0_len + in1_len) as *mut u8,
+                resp_len,
+            );
+            if in1_len > 0 {
+                let in1 = core::slice::from_raw_parts(base.add(in0_len), in1_len);
+                self.control.add(&[in0, in1], &mut [resp])
+            } else {
+                self.control.add(&[in0], &mut [resp])
+            }
+        };
+        let token = match added {
+            Ok(t) => t,
+            Err(virtio_drivers::Error::QueueFull) => {
+                QUEUE_FULL_RETRIES.fetch_add(1, Ordering::Relaxed);
+                return Err((meta, VirtioError::QueueFull));
+            }
+            Err(_) => {
+                self.failed = true;
+                return Err((meta, VirtioError::DeviceError));
+            }
+        };
+        if self.control.should_notify() {
+            self.transport.notify(CTRL_QUEUE);
+        }
+        self.inflight.push(InFlight {
+            token,
+            kind: InFlightKind::Sync {
+                waiter: Some(waiter),
+            },
+            meta,
+            in0_len,
+            in1_len,
+            resp_len,
+            venus: None,
+            venus_len: 0,
+        });
+        bump_high_water(&INFLIGHT_HIGH_WATER, self.inflight.len());
+        Ok(token)
     }
 
-    /// Submit an opaque Venus command stream to `ctx_id`, fenced with `fence_id`.
-    ///
-    /// `venus` MUST be physically contiguous (carve it from a [`DmaBuffer`]) — it
-    /// rides a single device-readable descriptor. The command is fenced and this
-    /// blocks (polled) until the device acknowledges it on the used ring, so by
-    /// the time it returns the work is host-visible-complete (interim sync fence
-    /// model; the async/KEVENT model lands in M3.4).
-    pub fn submit_venus(
+    /// Enqueue an ASYNC fenced SUBMIT_3D and return the KMD-assigned wire
+    /// fence id. Returns at queue time — completion arrives on the used ring
+    /// (interrupt DPC), which signals WAIT_FENCE waiters and advances the WDDM
+    /// pending FIFO. `meta` carries `[SUBMIT_3D hdr | ctrl resp]`; `venus` is
+    /// the opaque stream (second device-read descriptor — kept split so the
+    /// host never mis-parses the submit header as another control command).
+    pub fn enqueue_async_submit(
         &mut self,
         ctx_id: u32,
-        fence_id: u64,
         ring_idx: u32,
-        venus: &[u8],
-    ) -> Result<(), VirtioError> {
-        if venus.is_empty() {
-            return Err(VirtioError::DeviceError);
+        mut meta: DmaBuffer,
+        venus: DmaBuffer,
+        venus_len: usize,
+    ) -> Result<u64, (DmaBuffer, DmaBuffer, VirtioError)> {
+        let hdr_len = core::mem::size_of::<VirtioGpuCmdSubmit>();
+        let resp_len = core::mem::size_of::<VirtioGpuCtrlHdr>();
+        if self.failed {
+            return Err((meta, venus, VirtioError::DeviceError));
         }
-        crate::diag::record(0x0D10_0000 | ((venus.len() as u32) & 0xFFFF));
+        if venus_len == 0
+            || venus_len > venus.as_slice().len()
+            || hdr_len + resp_len > meta.as_slice().len()
+        {
+            return Err((meta, venus, VirtioError::DeviceError));
+        }
+        if self.inflight.len() >= MAX_INFLIGHT || self.parked.len() >= PARKED_ENQUEUE_GATE {
+            QUEUE_FULL_RETRIES.fetch_add(1, Ordering::Relaxed);
+            return Err((meta, venus, VirtioError::QueueFull));
+        }
+        let fence_id = self.next_wire_fence;
         let mut cmd = VirtioGpuCmdSubmit::zeroed();
         cmd.hdr.type_ = VIRTIO_GPU_CMD_SUBMIT_3D;
         cmd.hdr.flags = VIRTIO_GPU_FLAG_FENCE;
@@ -658,87 +931,443 @@ impl VirtioGpu {
             cmd.hdr.flags |= VIRTIO_GPU_FLAG_INFO_RING_IDX;
             cmd.hdr.ring_idx = ring_idx.min(u8::MAX as u32) as u8;
         }
-        cmd.size = venus.len() as u32;
+        cmd.size = venus_len as u32;
+        meta.as_mut_slice()[..hdr_len].copy_from_slice(bytemuck::bytes_of(&cmd));
 
-        let hdr_len = core::mem::size_of::<VirtioGpuCmdSubmit>();
-        let resp_len = core::mem::size_of::<VirtioGpuCtrlHdr>();
-        // SAFETY: `scratch` is our owned contiguous page; the low half holds the
-        // submit request (device-read), the high half the response (device-write).
-        // Disjoint halves; serialized by the caller's spinlock.
-        let buf = unsafe { core::slice::from_raw_parts_mut(self.scratch.as_ptr(), SCRATCH_BYTES) };
-        let (req_buf, resp_buf) = buf.split_at_mut(SCRATCH_BYTES / 2);
-        req_buf[..hdr_len].copy_from_slice(bytemuck::bytes_of(&cmd));
+        let meta_base = meta.as_slice().as_ptr();
+        let venus_base = venus.as_slice().as_ptr();
+        // SAFETY: spans live inside `meta`/`venus`, owned by the InFlight entry
+        // until pop_used; the borrows end at `add`.
+        let added = unsafe {
+            let hdr = core::slice::from_raw_parts(meta_base, hdr_len);
+            let stream = core::slice::from_raw_parts(venus_base, venus_len);
+            let resp =
+                core::slice::from_raw_parts_mut(meta_base.add(hdr_len) as *mut u8, resp_len);
+            self.control.add(&[hdr, stream], &mut [resp])
+        };
+        let token = match added {
+            Ok(t) => t,
+            Err(virtio_drivers::Error::QueueFull) => {
+                QUEUE_FULL_RETRIES.fetch_add(1, Ordering::Relaxed);
+                return Err((meta, venus, VirtioError::QueueFull));
+            }
+            Err(_) => {
+                self.failed = true;
+                return Err((meta, venus, VirtioError::DeviceError));
+            }
+        };
+        if self.control.should_notify() {
+            self.transport.notify(CTRL_QUEUE);
+        }
+        self.next_wire_fence += 1;
+        self.inflight.push(InFlight {
+            token,
+            kind: InFlightKind::AsyncVenus { fence_id },
+            meta,
+            in0_len: hdr_len,
+            in1_len: 0,
+            resp_len,
+            venus: Some(venus),
+            venus_len,
+        });
+        ASYNC_SUBMIT_COUNT.fetch_add(1, Ordering::Relaxed);
+        bump_high_water(&INFLIGHT_HIGH_WATER, self.inflight.len());
+        Ok(fence_id)
+    }
 
-        // SUBMIT_3D is a virtio-gpu command header plus a second device-readable
-        // descriptor containing the opaque Venus stream. Keep this split to match
-        // the proven system KMD transport and avoid the host mis-parsing a 32-byte
-        // submit header as another control command.
-        crate::diag::record(0x0D12_0000 | ((venus.len() as u32) & 0xFFFF));
-        self.ctrl_queue_bounded_roundtrip(
-            &[&req_buf[..hdr_len], venus],
-            &mut [&mut resp_buf[..resp_len]],
-        )?;
-        let resp: &VirtioGpuCtrlHdr = bytemuck::from_bytes(&resp_buf[..resp_len]);
-        if resp_is_ok(resp.type_) {
-            Ok(())
-        } else {
-            Err(VirtioError::DeviceError)
+    /// Drain every completed entry off the used ring: pop the descriptor chain
+    /// (token-matched), signal sync/fence waiters, and park the entry for a
+    /// PASSIVE reap. The ONLY used-ring consumer (interrupt DPC + opportunistic
+    /// callers under the same spinlock).
+    pub fn drain_used(&mut self) {
+        if self.failed {
+            return;
+        }
+        loop {
+            let Some(token) = self.control.peek_used() else {
+                return;
+            };
+            let Some(idx) = self.inflight.iter().position(|e| e.token == token) else {
+                // A completion we do not track: the ring state is corrupt.
+                DRAIN_BAD_TOKEN.fetch_add(1, Ordering::Relaxed);
+                self.failed = true;
+                return;
+            };
+            // Copy raw pointers/lengths so no borrow of `self.inflight` is held
+            // across the `self.control` call.
+            let (meta_base, in0_len, in1_len, resp_len, venus_base, venus_len) = {
+                let e = &self.inflight[idx];
+                (
+                    e.meta.as_slice().as_ptr(),
+                    e.in0_len,
+                    e.in1_len,
+                    e.resp_len,
+                    e.venus
+                        .as_ref()
+                        .map_or(core::ptr::null(), |v| v.as_slice().as_ptr()),
+                    e.venus_len,
+                )
+            };
+            // SAFETY: exactly the spans `add` was called with; the entry still
+            // owns both buffers.
+            let popped = unsafe {
+                let in0 = core::slice::from_raw_parts(meta_base, in0_len);
+                let resp = core::slice::from_raw_parts_mut(
+                    meta_base.add(in0_len + in1_len) as *mut u8,
+                    resp_len,
+                );
+                if venus_len > 0 {
+                    let stream = core::slice::from_raw_parts(venus_base, venus_len);
+                    self.control.pop_used(token, &[in0, stream], &mut [resp])
+                } else if in1_len > 0 {
+                    let in1 = core::slice::from_raw_parts(meta_base.add(in0_len), in1_len);
+                    self.control.pop_used(token, &[in0, in1], &mut [resp])
+                } else {
+                    self.control.pop_used(token, &[in0], &mut [resp])
+                }
+            };
+            if popped.is_err() {
+                self.failed = true;
+                return;
+            }
+            let entry = self.inflight.swap_remove(idx);
+            // First u32 of the device-written response = VIRTIO_GPU_RESP_*.
+            // SAFETY: the resp span is within the entry-owned meta buffer.
+            let resp_type = unsafe {
+                core::ptr::read_unaligned(meta_base.add(in0_len + in1_len) as *const u32)
+            };
+            match entry.kind {
+                InFlightKind::Sync { waiter } => {
+                    if let Some(block) = waiter {
+                        // SAFETY: a registered SyncWaitBlock stays valid until
+                        // its owner deregisters under this same lock
+                        // (`abandon_sync`) — which has not happened (waiter is
+                        // still Some). Response copied BEFORE the Release store
+                        // on `done`; KeSetEvent is DISPATCH-safe (Wait=FALSE).
+                        // Signaling under the lock is required: after a release,
+                        // the block's stack frame may be reused immediately.
+                        unsafe {
+                            let b = block.as_ptr();
+                            let n = resp_len.min(SYNC_RESP_MAX);
+                            core::ptr::copy_nonoverlapping(
+                                meta_base.add(in0_len + in1_len),
+                                (*b).resp.get() as *mut u8,
+                                n,
+                            );
+                            (*b).done.store(true, Ordering::Release);
+                            KeSetEvent(&mut (*b).event, IO_NO_INCREMENT, 0);
+                        }
+                    }
+                }
+                InFlightKind::AsyncVenus { fence_id } => {
+                    ASYNC_COMPLETE_COUNT.fetch_add(1, Ordering::Relaxed);
+                    if !resp_is_ok(resp_type) {
+                        ASYNC_RESP_ERRORS.fetch_add(1, Ordering::Relaxed);
+                    }
+                    // Wake every waiter registered on this wire fence.
+                    let mut j = 0;
+                    while j < self.fence_waiters.len() {
+                        if self.fence_waiters[j].fence_id == fence_id {
+                            let w = self.fence_waiters.swap_remove(j);
+                            // SAFETY: registered blocks stay valid until
+                            // deregistration (`fence_wait_cancel`), which removes
+                            // them from this list under the same lock.
+                            unsafe {
+                                let b = w.block.as_ptr();
+                                (*b).done.store(true, Ordering::Release);
+                                KeSetEvent(&mut (*b).event, IO_NO_INCREMENT, 0);
+                            }
+                        } else {
+                            j += 1;
+                        }
+                    }
+                }
+            }
+            // Park the entry for a PASSIVE reap (DmaBuffer frees are
+            // PASSIVE-only).
+            if self.parked.len() < MAX_PARKED {
+                self.parked.push(entry);
+                bump_high_water(&PARKED_HIGH_WATER, self.parked.len());
+            } else {
+                // Unreachable given PARKED_ENQUEUE_GATE; never reallocate or
+                // free under the spinlock — leak loudly instead.
+                PARKED_LEAKS.fetch_add(1, Ordering::Relaxed);
+                core::mem::forget(entry);
+            }
         }
     }
 
-    // ── Resource lifecycle (Gate 2) ─────────────────────────────────────────
-    //
-    // Like the Venus control path above, these drive the control virtqueue
-    // synchronously and assume the caller holds the AdapterContext spinlock so
-    // the shared scratch page / control queue are not touched concurrently. The
-    // resource id is guest-assigned (we own the namespace), so it is known before
-    // the round-trip and returned on a successful create.
+    /// Number of completed entries awaiting a PASSIVE reap.
+    pub fn parked_len(&self) -> usize {
+        self.parked.len()
+    }
 
-    /// Create a HOST3D virtio-gpu blob resource in venus context `ctx_id`,
-    /// referencing venus device-memory `blob_id`, and attach it to the context.
-    /// Returns the guest-assigned resource id.
-    ///
-    /// Mirrors the proven System-class `kmd::alloc_blob` sequence
-    /// (create_blob → ctx_attach_resource). A HOST3D mappable blob with
-    /// `blob_id = 0` is rejected by the host with `RESP_ERR_UNSPEC` (it has no
-    /// venus memory to bind), so `blob_id` must be a real venus mem id obtained
-    /// from the UMD's `vkAllocateMemory` venus stream — i.e. this is only callable
-    /// once the UMD allocation path supplies one. `blob_mem`/`blob_flags` are
-    /// `VIRTIO_GPU_BLOB_MEM_*` / `VIRTIO_GPU_BLOB_FLAG_*`. `nr_entries = 0`: HOST3D
-    /// blobs are host-backed, so no guest page list follows the command.
-    pub fn resource_create_blob(
-        &mut self,
-        ctx_id: u32,
-        blob_mem: u32,
-        blob_flags: u32,
-        blob_id: u64,
-        size: u64,
-    ) -> Result<u32, VirtioError> {
-        // The live-resource table is load-bearing (OpenAllocation / ATTACH
-        // liveness validation reads it), so an untracked-but-live resource must
-        // never exist: refuse the create when the table is full instead of
-        // creating and silently dropping the tracking entry.
-        if self.resources.len() >= MAX_RESOURCES {
-            // Atomic, not diag::record — this runs under the device spinlock at
-            // DISPATCH_LEVEL, where the registry tracer is illegal.
-            RESOURCE_FULL_REJECTS.fetch_add(1, Ordering::Relaxed);
-            return Err(VirtioError::OutOfMemory);
+    /// Swap the parked list for a fresh (pre-reserved) one; the caller drops
+    /// the returned entries at PASSIVE_LEVEL.
+    pub fn swap_parked(&mut self, fresh: Vec<InFlight>) -> Vec<InFlight> {
+        core::mem::replace(&mut self.parked, fresh)
+    }
+
+    /// Abandon a timed-out synchronous entry: detach its waiter so the eventual
+    /// completion signals nobody (the entry itself is reaped when it completes).
+    /// Returns `true` if the entry had ALREADY completed — the wait raced the
+    /// drain and the caller should treat it as success.
+    pub fn abandon_sync(&mut self, token: u16, block: NonNull<SyncWaitBlock>) -> bool {
+        for e in self.inflight.iter_mut() {
+            if e.token != token {
+                continue;
+            }
+            if let InFlightKind::Sync { waiter } = &mut e.kind {
+                if *waiter == Some(block) {
+                    *waiter = None;
+                    return false;
+                }
+            }
         }
-        let resource_id = self.next_resource_id.fetch_add(1, Ordering::Relaxed);
-        let mut cmd = VirtioGpuResourceCreateBlob::zeroed();
-        cmd.hdr.type_ = VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB;
-        cmd.hdr.ctx_id = ctx_id;
-        cmd.resource_id = resource_id;
-        cmd.blob_mem = blob_mem;
-        cmd.blob_flags = blob_flags;
-        cmd.nr_entries = 0;
-        cmd.blob_id = blob_id;
-        cmd.size = size;
-        self.ctrl_roundtrip(bytemuck::bytes_of(&cmd))?;
-        self.ctx_attach_resource(ctx_id, resource_id)?;
+        true
+    }
+
+    // ── Wire-fence table (WAIT_FENCE) ────────────────────────────────────────
+
+    /// Prepare a wait on wire fence `fence_id`, registering `block` if the
+    /// fence is still in flight. Runs under the device spinlock — the
+    /// in-flight check and the registration are atomic with respect to
+    /// [`Self::drain_used`], so a completion can never fall between them.
+    ///
+    /// Completion predicate (System-class phase4e model): wire ids are
+    /// assigned by this transport, monotonic and never reused, and every
+    /// assigned id lives in `inflight` until its used-ring completion — so
+    /// `id < next_wire_fence && not in-flight` ⇒ complete.
+    pub fn fence_wait_prepare(
+        &mut self,
+        fence_id: u64,
+        block: NonNull<SyncWaitBlock>,
+    ) -> FenceWaitPrep {
+        if fence_id == 0 || fence_id >= self.next_wire_fence {
+            return FenceWaitPrep::Invalid;
+        }
+        let in_flight = self.inflight.iter().any(|e| match e.kind {
+            InFlightKind::AsyncVenus { fence_id: f } => f == fence_id,
+            _ => false,
+        });
+        if !in_flight {
+            return FenceWaitPrep::Complete;
+        }
+        if self.fence_waiters.len() >= MAX_FENCE_WAITERS {
+            return FenceWaitPrep::TableFull;
+        }
+        self.fence_waiters.push(FenceWaiter { fence_id, block });
+        FENCE_WAIT_REGISTERED.fetch_add(1, Ordering::Relaxed);
+        FenceWaitPrep::Registered
+    }
+
+    /// Deregister a timed-out fence waiter. Returns `true` if the fence had
+    /// ALREADY completed (the drain signaled + removed the waiter first).
+    pub fn fence_wait_cancel(&mut self, block: NonNull<SyncWaitBlock>) -> bool {
+        if let Some(i) = self.fence_waiters.iter().position(|w| w.block == block) {
+            self.fence_waiters.swap_remove(i);
+            false
+        } else {
+            true
+        }
+    }
+
+    // ── WDDM pending-fence FIFO (SubmitCommand → DPC completion) ─────────────
+
+    /// Whether every async wire fence `< watermark` has retired.
+    fn async_retired_up_to(&self, watermark: u64) -> bool {
+        watermark == 0
+            || !self.inflight.iter().any(|e| match e.kind {
+                InFlightKind::AsyncVenus { fence_id } => fence_id < watermark,
+                _ => false,
+            })
+    }
+
+    /// Record a WDDM submission (`SubmissionFenceId = fence`). Returns `true`
+    /// if the caller should signal DMA_COMPLETED immediately (no venus work
+    /// outstanding, nothing queued ahead); otherwise the interrupt DPC
+    /// completes it via [`Self::take_ready_wddm`] once every async submission
+    /// queued before it has retired. Paging buffers carry no venus work
+    /// (watermark 0) but still queue FIFO behind earlier render submissions —
+    /// SubmissionFenceIds are watermarks to dxgkrnl and must complete
+    /// monotonically.
+    pub fn note_wddm_submission(&mut self, fence: u32, paging: bool) -> bool {
+        let watermark = if paging { 0 } else { self.next_wire_fence };
+        if self.wddm_pending.is_empty() && self.async_retired_up_to(watermark) {
+            return true;
+        }
+        if self.wddm_pending.len() >= MAX_WDDM_PENDING {
+            // Degrade to the old immediate model for this fence — signaling the
+            // newest (monotonically largest) fence implicitly completes the
+            // queued older ones, so drop them too. Loud, counted, and
+            // practically unreachable (VidSch queues far fewer than 256).
+            WDDM_PENDING_OVERFLOWS.fetch_add(1, Ordering::Relaxed);
+            self.wddm_pending.clear();
+            return true;
+        }
+        self.wddm_pending.push_back(WddmPending { fence, watermark });
+        false
+    }
+
+    /// Pop every head-of-FIFO WDDM submission whose venus watermark has been
+    /// reached, up to `out.len()` of them. The DPC signals DMA_COMPLETED for
+    /// each, in order, OUTSIDE the device spinlock.
+    pub fn take_ready_wddm(&mut self, out: &mut [u32]) -> usize {
+        let mut n = 0;
+        while n < out.len() {
+            let Some(head) = self.wddm_pending.front() else {
+                break;
+            };
+            if !self.async_retired_up_to(head.watermark) {
+                break;
+            }
+            out[n] = head.fence;
+            self.wddm_pending.pop_front();
+            n += 1;
+        }
+        if n > 0 {
+            WDDM_FENCE_FROM_DPC.fetch_add(n as u32, Ordering::Relaxed);
+        }
+        n
+    }
+
+    /// Preemption: drop every pending WDDM submission (dxgkrnl resubmits the
+    /// unfinished DMA buffers with fresh fence ids after the preempt completes;
+    /// the underlying venus work keeps executing host-side). Returns the count
+    /// dropped.
+    pub fn preempt_flush(&mut self) -> u32 {
+        let n = self.wddm_pending.len() as u32;
+        self.wddm_pending.clear();
+        n
+    }
+
+    // ── Table helpers (Gate 2 → C3/M3.4 phased flows) ────────────────────────
+    //
+    // The control round-trips themselves live in `virtio::ctrl` (PASSIVE
+    // waits); these lock-context helpers keep the bounded tables consistent
+    // across the multi-phase flows. Reservation counters guarantee `push`
+    // never exceeds the capacity reserved at init (no realloc under the
+    // spinlock), even with concurrent multi-phase creates.
+
+    /// Allocate a fresh guest context id (namespace owned by the KMD).
+    pub fn alloc_ctx_id(&self) -> u32 {
+        self.next_ctx_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Allocate a fresh guest resource id (namespace owned by the KMD).
+    pub fn alloc_resource_id(&self) -> u32 {
+        self.next_resource_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Track a live context for device-teardown reclamation (best-effort: on a
+    /// full table the context still works, it just is not auto-reclaimed).
+    pub fn track_context(&mut self, owner: usize, ctx_id: u32) {
+        if self.contexts.len() < MAX_CONTEXTS {
+            self.contexts.push(ContextSlot { owner, ctx_id });
+        } else {
+            CONTEXT_FULL_DROPS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Drop a context's tracking slot (explicit CTX_DESTROY path).
+    pub fn untrack_context(&mut self, ctx_id: u32) {
+        if let Some(idx) = self.contexts.iter().position(|c| c.ctx_id == ctx_id) {
+            self.contexts.swap_remove(idx);
+        }
+    }
+
+    /// Pop one context still owned by `owner` (device-teardown reclamation
+    /// iterates this, running the CTX_DESTROY round-trip outside the lock).
+    pub fn take_context_for_owner(&mut self, owner: usize) -> Option<u32> {
+        let idx = self.contexts.iter().position(|c| c.owner == owner)?;
+        Some(self.contexts.swap_remove(idx).ctx_id)
+    }
+
+    /// Reserve a live-resource table slot for an in-flight create. The table is
+    /// load-bearing (OpenAllocation / ATTACH liveness validation reads it), so
+    /// an untracked-but-live resource must never exist: refuse the create when
+    /// the table is full instead of creating and dropping the tracking entry.
+    pub fn reserve_resource_slot(&mut self) -> bool {
+        if self.resources.len() + self.resources_reserved >= MAX_RESOURCES {
+            RESOURCE_FULL_REJECTS.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        self.resources_reserved += 1;
+        true
+    }
+
+    /// Commit a reserved resource slot with the now-host-live id.
+    pub fn commit_resource(&mut self, resource_id: u32) {
+        self.resources_reserved = self.resources_reserved.saturating_sub(1);
         self.resources.push(resource_id);
         bump_high_water(&RESOURCE_HIGH_WATER, self.resources.len());
-        Ok(resource_id)
+    }
+
+    /// Release a reserved resource slot after a failed create.
+    pub fn cancel_resource_reservation(&mut self) {
+        self.resources_reserved = self.resources_reserved.saturating_sub(1);
+    }
+
+    /// Reserve a blob-table slot for an in-flight ALLOC_BLOB.
+    pub fn reserve_blob_slot(&mut self) -> bool {
+        if self.blobs.len() + self.blobs_reserved >= MAX_BLOBS {
+            BLOB_FULL_REJECTS.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        self.blobs_reserved += 1;
+        true
+    }
+
+    /// Commit a reserved blob slot.
+    pub fn commit_blob(&mut self, owner: usize, ctx_id: u32, resource_id: u32, size: u64) {
+        self.blobs_reserved = self.blobs_reserved.saturating_sub(1);
+        self.blobs.push(BlobSlot {
+            owner,
+            ctx_id,
+            resource_id,
+            size,
+            mapped: false,
+            map_pending: false,
+            map_cache: 0,
+            map_offset: 0,
+            map_len: 0,
+        });
+        bump_high_water(&BLOB_HIGH_WATER, self.blobs.len());
+    }
+
+    /// Release a reserved blob slot after a failed create.
+    pub fn cancel_blob_reservation(&mut self) {
+        self.blobs_reserved = self.blobs_reserved.saturating_sub(1);
+    }
+
+    /// Pop the blob slot matching (`owner`, `ctx_id`, `resource_id`) — the
+    /// RELEASE_BLOB path. The caller unmaps/detaches/unrefs outside the lock
+    /// and returns the window range via [`Self::free_window_range_pub`].
+    pub fn take_blob_matching(
+        &mut self,
+        owner: usize,
+        ctx_id: u32,
+        resource_id: u32,
+    ) -> Option<(u32, bool, u64, u64)> {
+        let idx = self.blobs.iter().position(|s| {
+            s.owner == owner && s.ctx_id == ctx_id && s.resource_id == resource_id
+        })?;
+        let slot = self.blobs.swap_remove(idx);
+        Some((slot.resource_id, slot.mapped, slot.map_offset, slot.map_len))
+    }
+
+    /// Pop one blob still owned by `owner` (device-teardown reclamation).
+    /// Returns `(ctx_id, resource_id, mapped, map_offset, map_len)`.
+    pub fn take_blob_for_owner(&mut self, owner: usize) -> Option<(u32, u32, bool, u64, u64)> {
+        let idx = self.blobs.iter().position(|s| s.owner == owner)?;
+        let slot = self.blobs.swap_remove(idx);
+        Some((
+            slot.ctx_id,
+            slot.resource_id,
+            slot.mapped,
+            slot.map_offset,
+            slot.map_len,
+        ))
     }
 
     /// Whether `resource_id` is alive host-side, per the KMD's authoritative
@@ -773,51 +1402,17 @@ impl VirtioGpu {
         true
     }
 
-    /// `HELIOS_ESCAPE_ALLOC_BLOB` — create a HOST3D blob (create + ctx-attach) and
-    /// record its size so a later MAP_BLOB can size the MDL. Returns the resource id.
-    pub fn alloc_blob(
-        &mut self,
-        ctx_id: u32,
-        blob_mem: u32,
-        blob_flags: u32,
-        blob_id: u64,
-        size: u64,
-        owner: usize,
-    ) -> Result<u32, VirtioError> {
-        if size == 0 {
-            return Err(VirtioError::DeviceError);
-        }
-        if self.blobs.len() >= MAX_BLOBS {
-            BLOB_FULL_REJECTS.fetch_add(1, Ordering::Relaxed);
-            return Err(VirtioError::OutOfMemory);
-        }
-        let resource_id = self.resource_create_blob(ctx_id, blob_mem, blob_flags, blob_id, size)?;
-        // `push` stays within the reserved capacity (no realloc under the lock).
-        self.blobs.push(BlobSlot {
-            owner,
-            ctx_id,
-            resource_id,
-            size,
-            mapped: false,
-            map_offset: 0,
-            map_len: 0,
-        });
-        bump_high_water(&BLOB_HIGH_WATER, self.blobs.len());
-        Ok(resource_id)
-    }
-
-    /// Record a blob's size in the tracking table so a later [`map_blob_prepare`]
-    /// can size the mapping. Used by the in-kernel venus client, which creates its
-    /// ring/reply/page-table blobs via `resource_create_blob` directly (it owns the
-    /// resource lifecycle for the device lifetime rather than per-escape) and must
-    /// register the size the same way [`alloc_blob`] does for the escape path.
-    /// `owner = 0` marks a KMD-internal blob (not reclaimed by an escape owner).
-    /// No-ops (counted) if the table is full — the map_prepare then fails honestly.
+    /// Record a blob's size in the tracking table so a later map can size the
+    /// mapping. Used by the in-kernel venus client, which creates its
+    /// ring/reply/page-table blobs directly (it owns the resource lifecycle for
+    /// the device lifetime rather than per-escape). `owner = 0` marks a
+    /// KMD-internal blob (not reclaimed by an escape owner). No-ops (counted)
+    /// if the table is full — a later map then fails honestly.
     pub fn note_blob_size(&mut self, resource_id: u32, size: u64) {
         if self.blobs.iter().any(|s| s.resource_id == resource_id) {
             return;
         }
-        if self.blobs.len() >= MAX_BLOBS {
+        if self.blobs.len() + self.blobs_reserved >= MAX_BLOBS {
             BLOB_FULL_REJECTS.fetch_add(1, Ordering::Relaxed);
             return;
         }
@@ -829,6 +1424,8 @@ impl VirtioGpu {
             resource_id,
             size,
             mapped: false,
+            map_pending: false,
+            map_cache: 0,
             map_offset: 0,
             map_len: 0,
         });
@@ -845,29 +1442,99 @@ impl VirtioGpu {
             .map(|s| (s.owner, s.size, s.mapped))
     }
 
-    /// Kernel-side view of a blob for the software GDI executor: the guest-physical
-    /// range of its host-visible mapping, mapping the blob into the window on first
-    /// use (same `RESOURCE_MAP_BLOB` path as the user-mode escape). Any-owner lookup:
-    /// GDI surfaces are KMD-self-backed standard allocations, so the executor
-    /// resolves them by resource id alone.
-    pub fn blob_kernel_range(&mut self, resource_id: u32) -> Result<BlobMapPrep, VirtioError> {
-        let window = self.host_visible.ok_or(VirtioError::DeviceError)?;
-        let slot = self
-            .blobs
-            .iter()
-            .find(|s| s.resource_id == resource_id)
-            .copied()
-            .ok_or(VirtioError::DeviceError)?;
-        if slot.mapped {
-            return Ok(BlobMapPrep {
-                gpa: window.base + slot.map_offset,
-                size: slot.map_len,
-                // Host-visible venus memory is WB (see `KernelMap::new`); the nibble
-                // is only consulted for the caching type, so CACHED is correct here.
-                map_cache: VIRTIO_GPU_MAP_CACHE_CACHED,
+    /// Begin mapping a blob into the host-visible window: if already mapped,
+    /// return the mapping; otherwise reserve a window range and hand the
+    /// RESOURCE_MAP_BLOB round-trip to the caller (PASSIVE, outside this lock),
+    /// who then calls [`Self::blob_map_finish`]. `owner = None` resolves by
+    /// resource id alone (the GDI executor's any-owner lookup); `Some(o)` is
+    /// the owner-scoped escape path (resource ids can repeat across adapter
+    /// restarts while stale clients unwind).
+    pub fn blob_map_begin(&mut self, owner: Option<usize>, resource_id: u32) -> BlobMapBegin {
+        let Some(window) = self.host_visible else {
+            return BlobMapBegin::Failed(VirtioError::DeviceError);
+        };
+        let Some(idx) = self.blobs.iter().position(|s| {
+            s.resource_id == resource_id && owner.map_or(true, |o| s.owner == o)
+        }) else {
+            return BlobMapBegin::Failed(VirtioError::DeviceError);
+        };
+        if self.blobs[idx].mapped {
+            let s = &self.blobs[idx];
+            return BlobMapBegin::Mapped(BlobMapPrep {
+                gpa: window.base + s.map_offset,
+                size: s.map_len,
+                map_cache: s.map_cache,
             });
         }
-        self.map_blob_prepare_for_owner(slot.owner, resource_id)
+        if self.blobs[idx].map_pending {
+            return BlobMapBegin::Busy;
+        }
+        let map_len = round_up_page(self.blobs[idx].size);
+        if map_len == 0 || map_len > MAX_BLOB_MAP_BYTES {
+            return BlobMapBegin::Failed(VirtioError::DeviceError);
+        }
+        let offset = match self.alloc_window_range(map_len, window.len) {
+            Ok(o) => o,
+            Err(e) => return BlobMapBegin::Failed(e),
+        };
+        let s = &mut self.blobs[idx];
+        s.map_pending = true;
+        s.map_offset = offset;
+        s.map_len = map_len;
+        BlobMapBegin::Start {
+            offset,
+            len: map_len,
+        }
+    }
+
+    /// Finish a [`Self::blob_map_begin`] `Start`: record the host's verdict.
+    /// `cache = Some(nibble)` on RESP_OK_MAP_INFO; `None` on host rejection
+    /// (the reserved range is returned to the allocator).
+    pub fn blob_map_finish(
+        &mut self,
+        resource_id: u32,
+        offset: u64,
+        len: u64,
+        cache: Option<u32>,
+    ) -> BlobMapFinish {
+        let Some(idx) = self.blobs.iter().position(|s| {
+            s.resource_id == resource_id && s.map_pending && s.map_offset == offset
+        }) else {
+            // Owner teardown raced the round-trip and took the slot. The caller
+            // must undo the host mapping (UNMAP round-trip) and then return the
+            // range via `free_window_range_pub`.
+            if cache.is_none() {
+                self.free_window_range(offset, len);
+                return BlobMapFinish::HostRejected;
+            }
+            return BlobMapFinish::SlotGone;
+        };
+        let window_base = self.host_visible.map_or(0, |w| w.base);
+        let s = &mut self.blobs[idx];
+        s.map_pending = false;
+        match cache {
+            Some(c) => {
+                s.mapped = true;
+                s.map_cache = c;
+                BlobMapFinish::Done(BlobMapPrep {
+                    gpa: window_base + offset,
+                    size: len,
+                    map_cache: c,
+                })
+            }
+            None => {
+                s.map_offset = 0;
+                s.map_len = 0;
+                self.free_window_range(offset, len);
+                BlobMapFinish::HostRejected
+            }
+        }
+    }
+
+    /// Return a window range to the allocator (PASSIVE flows that unmapped a
+    /// blob outside the lock).
+    pub fn free_window_range_pub(&mut self, offset: u64, len: u64) {
+        self.free_window_range(offset, len);
     }
 
     /// Transfer a blob's lifetime ownership from its escape owner (the D3DKMT
@@ -901,120 +1568,20 @@ impl VirtioGpu {
     }
 
     /// Drop the KMD-internal (owner-0) tracking slot for an allocation's blob at
-    /// DestroyAllocation time, unmapping the host-visible window mapping the GDI
-    /// executor may have opened and returning its window range. Host detach/unref
-    /// stays with the caller (the allocation owns the resource lifetime). Returns
-    /// `true` if a live mapping was unmapped here (so the caller must not send a
-    /// second host unmap for the same resource).
-    pub fn forget_allocation_blob(&mut self, resource_id: u32) -> bool {
-        let Some(idx) = self
+    /// DestroyAllocation time. Returns `Some((mapped, map_offset, map_len))` if
+    /// the slot existed — when `mapped`, the caller (PASSIVE, outside the lock)
+    /// must run the RESOURCE_UNMAP_BLOB round-trip and then return the range
+    /// via [`Self::free_window_range_pub`]. Host detach/unref stays with the
+    /// caller (the allocation owns the resource lifetime).
+    pub fn forget_allocation_blob(&mut self, resource_id: u32) -> Option<(bool, u64, u64)> {
+        let idx = self
             .blobs
             .iter()
-            .position(|s| s.owner == 0 && s.resource_id == resource_id)
-        else {
-            return false;
-        };
+            .position(|s| s.owner == 0 && s.resource_id == resource_id)?;
         let slot = self.blobs.swap_remove(idx);
-        if slot.mapped {
-            let _ = self.resource_unmap_blob(slot.resource_id);
-            self.free_window_range(slot.map_offset, slot.map_len);
-            return true;
-        }
-        false
+        Some((slot.mapped, slot.map_offset, slot.map_len))
     }
 
-    /// `HELIOS_ESCAPE_MAP_BLOB` under-lock phase: pick a window offset, issue
-    /// `RESOURCE_MAP_BLOB`, and return the guest-physical range + host caching for the
-    /// caller to map into user space (PASSIVE, outside the lock). The guest chooses
-    /// the window offset, so VidMm is never involved — the host backs exactly the
-    /// `host_visible.base + offset` range we report back.
-    pub fn map_blob_prepare(&mut self, resource_id: u32) -> Result<BlobMapPrep, VirtioError> {
-        self.map_blob_prepare_for_owner(0, resource_id)
-    }
-
-    /// Owner-scoped variant used by user-mode escapes. Resource ids can repeat
-    /// after adapter restart while stale clients are still unwinding, so escape
-    /// callers must not map another D3DKMT device handle's new blob by id alone.
-    pub fn map_blob_prepare_for_owner(
-        &mut self,
-        owner: usize,
-        resource_id: u32,
-    ) -> Result<BlobMapPrep, VirtioError> {
-        let window = self.host_visible.ok_or(VirtioError::DeviceError)?;
-        let size = self
-            .blobs
-            .iter()
-            .find(|s| s.owner == owner && s.resource_id == resource_id)
-            .map(|s| s.size)
-            .ok_or(VirtioError::DeviceError)?;
-        let map_len = round_up_page(size);
-        if map_len == 0 || map_len > MAX_BLOB_MAP_BYTES {
-            return Err(VirtioError::DeviceError);
-        }
-        let offset = self.alloc_window_range(map_len, window.len)?;
-
-        // Host round-trip before recording the blob as mapped; on rejection return
-        // the reserved window range for later reuse.
-        let map_cache = match self.resource_map_blob(resource_id, offset) {
-            Ok(c) => c,
-            Err(e) => {
-                self.free_window_range(offset, map_len);
-                return Err(e);
-            }
-        };
-
-        if let Some(slot) = self
-            .blobs
-            .iter_mut()
-            .find(|s| s.owner == owner && s.resource_id == resource_id)
-        {
-            slot.mapped = true;
-            slot.map_offset = offset;
-            slot.map_len = map_len;
-        }
-        Ok(BlobMapPrep {
-            gpa: window.base + offset,
-            size: map_len,
-            map_cache,
-        })
-    }
-
-    /// `HELIOS_ESCAPE_RELEASE_BLOB` — unmap (if mapped) + detach + unref a blob and
-    /// drop its tracking slot, returning its window range to the free list.
-    pub fn release_blob_for_owner(
-        &mut self,
-        owner: usize,
-        ctx_id: u32,
-        resource_id: u32,
-    ) -> Result<(), VirtioError> {
-        let Some(idx) = self
-            .blobs
-            .iter()
-            .position(|s| s.owner == owner && s.ctx_id == ctx_id && s.resource_id == resource_id)
-        else {
-            return Ok(());
-        };
-        let slot = self.blobs.swap_remove(idx);
-        if slot.mapped {
-            let _ = self.resource_unmap_blob(slot.resource_id);
-            self.free_window_range(slot.map_offset, slot.map_len);
-        }
-        if self.take_live_resource(slot.resource_id) {
-            let _ = self.ctx_detach_resource(slot.ctx_id, slot.resource_id);
-            self.resource_unref(slot.resource_id)
-        } else {
-            Ok(())
-        }
-    }
-
-    /// Reclaim every blob still owned by `owner` (a destroyed D3D device handle):
-    /// unmap (if mapped), detach, unref, and return the window range. This is the
-    /// KMD-side safety net for an ICD that crashes or skips RELEASE_BLOB — without
-    /// it the bounded blob table (`MAX_BLOBS`) fills across device creations and
-    /// later allocations fail with `STATUS_INSUFFICIENT_RESOURCES`, which manifests
-    /// as spurious render corruption / "venus wedge". Returns the count reclaimed.
-    /// Called under the virtio spinlock at `DxgkDdiDestroyDevice`; `swap_remove`
-    /// never reallocates, so it stays lock-safe.
     /// Current number of tracked blob slots (diagnostics).
     pub fn blob_count(&self) -> usize {
         self.blobs.len()
@@ -1031,51 +1598,6 @@ impl VirtioGpu {
             window_used: self.next_window_offset.saturating_sub(free),
             window_len: self.host_visible.map_or(0, |w| w.len),
         }
-    }
-
-    pub fn release_blobs_for_owner(&mut self, owner: usize) -> u32 {
-        let mut reclaimed = 0u32;
-        let mut i = 0;
-        while i < self.blobs.len() {
-            if self.blobs[i].owner != owner {
-                i += 1;
-                continue;
-            }
-            let slot = self.blobs.swap_remove(i);
-            if slot.mapped {
-                let _ = self.resource_unmap_blob(slot.resource_id);
-                self.free_window_range(slot.map_offset, slot.map_len);
-            }
-            if self.take_live_resource(slot.resource_id) {
-                let _ = self.ctx_detach_resource(slot.ctx_id, slot.resource_id);
-                let _ = self.resource_unref(slot.resource_id);
-            }
-            reclaimed += 1;
-            // Do not advance `i`: `swap_remove` moved the last element into slot `i`.
-        }
-        reclaimed
-    }
-
-    /// `CTX_DESTROY` and drop every context still owned by `owner`. Complements
-    /// [`release_blobs_for_owner`]; together they leave the host with no dangling
-    /// venus state for a device that tore down uncleanly. Returns the count.
-    pub fn destroy_contexts_for_owner(&mut self, owner: usize) -> u32 {
-        let mut destroyed = 0u32;
-        let mut i = 0;
-        while i < self.contexts.len() {
-            if self.contexts[i].owner != owner {
-                i += 1;
-                continue;
-            }
-            let slot = self.contexts.swap_remove(i);
-            let mut cmd = VirtioGpuCtxDestroy::zeroed();
-            cmd.hdr.type_ = VIRTIO_GPU_CMD_CTX_DESTROY;
-            cmd.hdr.ctx_id = slot.ctx_id;
-            let _ = self.ctrl_roundtrip(bytemuck::bytes_of(&cmd));
-            destroyed += 1;
-            // Do not advance `i`: `swap_remove` filled slot `i` with the last entry.
-        }
-        destroyed
     }
 
     /// Allocate a page-rounded `len`-byte range in the host-visible window: reuse a
@@ -1140,42 +1662,6 @@ impl VirtioGpu {
         }
     }
 
-    /// Bind a resource to its 3D context (`VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE`).
-    /// Required before a HOST3D blob can be mapped or used by the venus ring (the
-    /// resource id namespace is per-context for venus).
-    pub fn ctx_attach_resource(
-        &mut self,
-        ctx_id: u32,
-        resource_id: u32,
-    ) -> Result<(), VirtioError> {
-        let mut cmd = VirtioGpuCtxResource::zeroed();
-        cmd.hdr.type_ = VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE;
-        cmd.hdr.ctx_id = ctx_id;
-        cmd.resource_id = resource_id;
-        self.ctrl_roundtrip(bytemuck::bytes_of(&cmd))
-    }
-
-    /// Detach a resource from its 3D context (inverse of `ctx_attach_resource`).
-    pub fn ctx_detach_resource(
-        &mut self,
-        ctx_id: u32,
-        resource_id: u32,
-    ) -> Result<(), VirtioError> {
-        let mut cmd = VirtioGpuCtxResource::zeroed();
-        cmd.hdr.type_ = VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE;
-        cmd.hdr.ctx_id = ctx_id;
-        cmd.resource_id = resource_id;
-        self.ctrl_roundtrip(bytemuck::bytes_of(&cmd))
-    }
-
-    /// Drop the host's reference to a resource (inverse of a create).
-    pub fn resource_unref(&mut self, resource_id: u32) -> Result<(), VirtioError> {
-        let mut cmd = VirtioGpuResourceUnref::zeroed();
-        cmd.hdr.type_ = VIRTIO_GPU_CMD_RESOURCE_UNREF;
-        cmd.resource_id = resource_id;
-        self.ctrl_roundtrip(bytemuck::bytes_of(&cmd))
-    }
-
     /// The host-visible blob window, or `None` if the device exposes none.
     /// `DxgkDdiQueryAdapterInfo` uses `base`/`len` to describe the CPU-visible
     /// memory segment, and `DxgkDdiBuildPagingBuffer` adds the VidMm-assigned
@@ -1191,170 +1677,21 @@ impl VirtioGpu {
         self.isr_status_va
     }
 
-    /// Map a HOST3D mappable blob into the host-visible window at `offset` — for
-    /// the WDDM path, the offset VidMm assigned the allocation within the
-    /// CPU-visible segment, so the host backing lands exactly where dxgkrnl will
-    /// expose the pages on `D3DKMTLock2`. Returns the host caching nibble
-    /// (`VIRTIO_GPU_MAP_CACHE_*`). Caller holds the AdapterContext spinlock.
-    pub fn resource_map_blob(&mut self, resource_id: u32, offset: u64) -> Result<u32, VirtioError> {
-        let mut cmd = VirtioGpuResourceMapBlob::zeroed();
-        cmd.hdr.type_ = VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB;
-        cmd.resource_id = resource_id;
-        cmd.offset = offset;
-        let map_info = self.map_blob_roundtrip(&cmd)?;
-        Ok(map_info & VIRTIO_GPU_MAP_CACHE_MASK)
-    }
-
-    /// Tear down a blob's host-visible mapping (inverse of `resource_map_blob`).
-    pub fn resource_unmap_blob(&mut self, resource_id: u32) -> Result<(), VirtioError> {
-        let mut cmd = VirtioGpuResourceUnmapBlob::zeroed();
-        cmd.hdr.type_ = VIRTIO_GPU_CMD_RESOURCE_UNMAP_BLOB;
-        cmd.resource_id = resource_id;
-        self.ctrl_roundtrip(bytemuck::bytes_of(&cmd))
-    }
-
-    /// `RESOURCE_MAP_BLOB` round-trip that reads the host's `map_info` caching
-    /// word from the `RESP_OK_MAP_INFO` reply (the generic `ctrl_roundtrip` only
-    /// reads the header). Reuses the scratch page (req low / resp high).
-    fn map_blob_roundtrip(&mut self, cmd: &VirtioGpuResourceMapBlob) -> Result<u32, VirtioError> {
-        let req = bytemuck::bytes_of(cmd);
-        let resp_len = core::mem::size_of::<VirtioGpuRespMapInfo>();
-        // SAFETY: owned contiguous page; disjoint req/resp halves, serialized by
-        // the caller's spinlock.
-        let buf = unsafe { core::slice::from_raw_parts_mut(self.scratch.as_ptr(), SCRATCH_BYTES) };
-        let (req_buf, resp_buf) = buf.split_at_mut(SCRATCH_BYTES / 2);
-        if req.len() > req_buf.len() || resp_len > resp_buf.len() {
-            return Err(VirtioError::DeviceError);
-        }
-        req_buf[..req.len()].copy_from_slice(req);
-        self.ctrl_queue_bounded_roundtrip(
-            &[&req_buf[..req.len()]],
-            &mut [&mut resp_buf[..resp_len]],
-        )?;
-        let resp: &VirtioGpuRespMapInfo = bytemuck::from_bytes(&resp_buf[..resp_len]);
-        if resp_is_ok(resp.hdr.type_) {
-            Ok(resp.map_info)
-        } else {
-            Err(VirtioError::DeviceError)
-        }
-    }
-
-    /// Gate-2 bring-up validation: prove the venus 3D-context lifecycle works on
-    /// the live device — create a context bound to the Venus capset, then destroy
-    /// it. Returns `VIRTIO_GPU_RESP_OK_NODATA` (0x1100) on success or `0xFFFF_FFFF`
-    /// on failure. This is a real prerequisite for the venus-backed allocation
-    /// flow; a standalone HOST3D blob can't be smoke-tested here because it needs a
-    /// venus memory id that only the UMD's `vkAllocateMemory` can produce.
-    pub fn self_test_venus_context(&mut self) -> u32 {
-        // owner = 0: this diagnostic context is destroyed immediately below, so it
-        // needs no device-teardown reclamation; ctx_destroy deregisters it anyway.
-        match self.ctx_create(VIRTIO_GPU_CAPSET_VENUS, 0) {
-            Ok(ctx) => {
-                // Best-effort cleanup; ignore the destroy result (diagnostic path).
-                let _ = self.ctx_destroy(ctx);
-                0x1100
-            }
-            Err(_) => 0xFFFF_FFFF,
-        }
-    }
-
-    /// Bounded synchronous round-trip on the control queue: add → notify →
-    /// poll the used ring (bounded by [`CTRL_POLL_SPINS`]) → pop. Replaces the
-    /// virtio-drivers `add_notify_wait_pop`, whose used-ring poll has NO bound
-    /// — with a wedged host that spin ran forever at DISPATCH_LEVEL under the
-    /// device spinlock.
-    ///
-    /// On timeout the transport is POISONED (`self.failed = true`) and every
-    /// later round-trip fails fast: the timed-out descriptor is still owned by
-    /// the device (it may complete at any time), so the ring state cannot be
-    /// trusted again. The request buffers a late completion would DMA-read
-    /// live in our owned scratch page (never freed until Drop); the one
-    /// exception is the venus payload in `submit_venus`, which the caller owns
-    /// — a documented residual risk, removed for good when the C3 async
-    /// submission path (ISR/DPC-driven fences) replaces these polled trips.
-    fn ctrl_queue_bounded_roundtrip<'a>(
-        &mut self,
-        inputs: &'a [&'a [u8]],
-        outputs: &'a mut [&'a mut [u8]],
-    ) -> Result<(), VirtioError> {
-        if self.failed {
-            return Err(VirtioError::DeviceError);
-        }
-        // SAFETY: the buffers remain borrowed for the whole call; we either pop
-        // the same token below or poison the transport so the in-flight
-        // descriptor slot is never handed out again.
-        let token = match unsafe { self.control.add(inputs, outputs) } {
-            Ok(t) => t,
-            Err(_) => return Err(VirtioError::DeviceError),
-        };
-        if self.control.should_notify() {
-            self.transport.notify(CTRL_QUEUE);
-        }
-        let mut spins = 0u64;
-        while !self.control.can_pop() {
-            spins += 1;
-            if spins >= CTRL_POLL_SPINS {
-                self.failed = true;
-                CTRL_TIMEOUT_COUNT.fetch_add(1, Ordering::Relaxed);
-                return Err(VirtioError::DeviceError);
-            }
-            core::hint::spin_loop();
-        }
-        // SAFETY: same buffers as `add`, still valid; `can_pop()` returned true.
-        match unsafe { self.control.pop_used(token, inputs, outputs) } {
-            Ok(_len) => Ok(()),
-            Err(_) => Err(VirtioError::DeviceError),
-        }
-    }
-
-    /// Send a single-buffer control command (already serialized to `req` bytes)
-    /// and return the device's response header `type_` (a `VIRTIO_GPU_RESP_*`
-    /// code). `Err` only when the round-trip itself fails to complete. Reuses the
-    /// scratch page (request in the low half, response in the high half).
-    fn ctrl_roundtrip_typed(&mut self, req: &[u8]) -> Result<u32, VirtioError> {
-        let resp_len = core::mem::size_of::<VirtioGpuCtrlHdr>();
-        // SAFETY: owned contiguous page; disjoint req/resp halves, serialized by
-        // the caller's spinlock.
-        let buf = unsafe { core::slice::from_raw_parts_mut(self.scratch.as_ptr(), SCRATCH_BYTES) };
-        let (req_buf, resp_buf) = buf.split_at_mut(SCRATCH_BYTES / 2);
-        if req.len() > req_buf.len() || resp_len > resp_buf.len() {
-            return Err(VirtioError::DeviceError);
-        }
-        req_buf[..req.len()].copy_from_slice(req);
-        self.ctrl_queue_bounded_roundtrip(
-            &[&req_buf[..req.len()]],
-            &mut [&mut resp_buf[..resp_len]],
-        )?;
-        let resp: &VirtioGpuCtrlHdr = bytemuck::from_bytes(&resp_buf[..resp_len]);
-        Ok(resp.type_)
-    }
-
-    /// Send a control command and require a success response.
-    fn ctrl_roundtrip(&mut self, req: &[u8]) -> Result<(), VirtioError> {
-        if resp_is_ok(self.ctrl_roundtrip_typed(req)?) {
-            Ok(())
-        } else {
-            Err(VirtioError::DeviceError)
-        }
-    }
 }
 
 impl Drop for VirtioGpu {
     fn drop(&mut self) {
-        // Quiesce the device (resets queues) so it stops touching the rings we
-        // are about to free.
-        self.transport.set_status(DeviceStatus::empty());
-        // Free the DMA scratch page. The control `VirtQueue` frees its own ring
-        // memory on its own drop (via `Hal::dma_dealloc`).
+        // Quiesce the device (resets queues) so it stops touching the rings and
+        // the in-flight/parked entry buffers we are about to free. Runs at
+        // PASSIVE_LEVEL (StopDevice / set_virtio(None) drops outside the lock),
+        // so the InFlight DmaBuffers in `inflight`/`parked` free legally as
+        // part of this struct's drop.
         //
         // The BAR MMIO mappings made inside `PciTransport` are intentionally NOT
         // freed here: `WdkHal` caches them by physical address and reuses them on
         // the next StartDevice (the BARs are stable across stop/start), so there
         // is no per-cycle leak. The cache is released wholesale in
         // `DxgkDdiUnload` via `WdkHal::unmap_all`.
-        //
-        // SAFETY: `scratch` was returned by `WdkHal::dma_alloc(1, ..)` in `init`
-        // and is freed exactly once (here, when the VirtioGpu is dropped).
-        unsafe { WdkHal::dma_dealloc(0, self.scratch, 1) };
+        self.transport.set_status(DeviceStatus::empty());
     }
 }

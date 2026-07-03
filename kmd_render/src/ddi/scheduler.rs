@@ -69,6 +69,9 @@ pub unsafe extern "C" fn dxgkddi_reset_engine(
     }
 
     let adapter = unsafe { &*(h_adapter as *const AdapterContext) };
+    // Engine reset aborts the node's outstanding submissions: drop the pending
+    // venus-gated WDDM fences (dxgkrnl resubmits what it still wants done).
+    let _ = adapter.with_virtio(|v| v.preempt_flush());
     reset.LastAbortedFenceId = adapter
         .last_completed_fence
         .load(core::sync::atomic::Ordering::Acquire) as UINT;

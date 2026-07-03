@@ -81,10 +81,19 @@ impl HeliosEscapeHeader {
 /// matching context+ring timeline (`virgl_renderer_context_create_fence`) — which
 /// is what venus waits on for a queue (vkQueueWaitIdle). Without it the host
 /// signals only the global fence and the per-queue wait never completes.
+///
+/// C3/M3.4 async transport: `fence_id` is IN/OUT. The caller's value is
+/// ignored (kept for wire compat with the old synchronous KMD, which forwarded
+/// it verbatim); the KMD assigns a globally-monotonic WIRE fence id, submits
+/// the venus stream fenced with it, and writes it back here. The escape
+/// returns at QUEUE time — completion is observed via `WAIT_FENCE` on the
+/// returned wire id.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub struct HeliosEscapeSubmitVenus {
     pub hdr: HeliosEscapeHeader,
+    /// in: ICD-local fence id (legacy KMD forwards it) / out: KMD-assigned wire
+    /// fence id (async KMD overwrites it — wait on THIS value).
     pub fence_id: u64,
     pub ctx_id: u32,
     pub buffer_size: u32,
@@ -166,13 +175,34 @@ pub struct HeliosEscapeAttachResource {
     pub resource_id: u32,
 }
 
-/// `HELIOS_ESCAPE_WAIT_FENCE`. 32 bytes.
+/// `HELIOS_ESCAPE_WAIT_FENCE`. 40 bytes (v2 shape — see below).
+///
+/// C3/M3.4 async transport: SUBMIT_VENUS no longer blocks until host
+/// completion, so this escape is a REAL wait — the KMD blocks (PASSIVE, KEVENT)
+/// until the wire fence completes on the virtio used ring or `timeout_ns`
+/// elapses, and reports the outcome in `out_completed`.
+///
+/// `fence_id` is the KMD-assigned WIRE fence id returned by SUBMIT_VENUS (the
+/// KMD writes the assigned id back into `HeliosEscapeSubmitVenus.fence_id`).
+/// ICD-local fence counters collide across processes; wire ids are globally
+/// monotonic and never reused.
+///
+/// DEPLOY-ORDER COMPAT: callers MUST initialize `out_completed = 1`. The old
+/// (synchronous-transport) KMD validates the shape and returns SUCCESS without
+/// writing the buffer — the pre-set 1 then correctly reports "complete"
+/// (synchronous submits were host-complete by return). The new KMD accepts the
+/// legacy 32-byte shape too (waits, but can only report timeout via a failure
+/// NTSTATUS).
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub struct HeliosEscapeWaitFence {
     pub hdr: HeliosEscapeHeader,
     pub fence_id: u64,
     pub timeout_ns: u64,
+    /// out: 1 = fence complete, 0 = timed out. Pre-set to 1 by the caller (see
+    /// the deploy-order note above).
+    pub out_completed: u32,
+    pub _pad: u32,
 }
 
 /// `HELIOS_ESCAPE_PRESENT_BLOB` — throwaway Phase-7 gate op (DISPLAY.md §8). Bind
@@ -241,6 +271,6 @@ const _: () = {
     assert!(core::mem::size_of::<HeliosEscapeMapBlob>() == 32);
     assert!(core::mem::size_of::<HeliosEscapeReleaseBlob>() == 32);
     assert!(core::mem::size_of::<HeliosEscapeAttachResource>() == 24);
-    assert!(core::mem::size_of::<HeliosEscapeWaitFence>() == 32);
+    assert!(core::mem::size_of::<HeliosEscapeWaitFence>() == 40);
     assert!(core::mem::size_of::<HeliosEscapePresentBlob>() == 40);
 };

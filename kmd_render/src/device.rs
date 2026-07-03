@@ -96,15 +96,15 @@ pub unsafe extern "C" fn dxgkddi_destroy_device(h_device: *mut c_void) -> NTSTAT
         // per-call breadcrumbs, so mirror the latest cross-adapter present args
         // here at PASSIVE_LEVEL.
         crate::ddi::diag_dump_present_atomics();
-        let _ = adapter.with_virtio(|v| {
-            let before = v.blob_count() as u32;
-            let blobs = v.release_blobs_for_owner(owner);
-            let contexts = v.destroy_contexts_for_owner(owner);
-            // 0x0E02_BBBB = blob-table size BEFORE reclaim (saturated to 16 bits).
-            crate::diag::record(0x0E02_0000 | before.min(0xFFFF));
-            // 0x0E03_RRCC = reclaimed blobs (RR) + contexts (CC).
-            crate::diag::record(0x0E03_0000 | ((blobs.min(0xFF) << 8) | contexts.min(0xFF)));
-        });
+        let before = adapter.with_virtio(|v| v.blob_count() as u32).unwrap_or(0);
+        let blobs = crate::virtio::ctrl::release_blobs_for_owner(adapter, owner);
+        let contexts = crate::virtio::ctrl::destroy_contexts_for_owner(adapter, owner);
+        // Opportunistic PASSIVE reap of completed transport entries.
+        crate::virtio::ctrl::reap_parked(adapter);
+        // 0x0E02_BBBB = blob-table size BEFORE reclaim (saturated to 16 bits).
+        crate::diag::record(0x0E02_0000 | before.min(0xFFFF));
+        // 0x0E03_RRCC = reclaimed blobs (RR) + contexts (CC).
+        crate::diag::record(0x0E03_0000 | ((blobs.min(0xFF) << 8) | contexts.min(0xFF)));
         // SAFETY: produced by Box::into_raw in create_device; destroyed exactly once.
         drop(unsafe { Box::from_raw(h_device as *mut DeviceContext) });
     }

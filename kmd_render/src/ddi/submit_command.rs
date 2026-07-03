@@ -67,6 +67,25 @@ pub fn diag_dump_engine_atomics() {
     crate::diag::record(0x0F10_0000 | (DMA_QUEUE_DPC_COUNT.load(Ordering::Relaxed) & 0xFFFF));
     crate::diag::record(0x0F11_0000 | (DMA_SYNC_STATUS_LOW.load(Ordering::Relaxed) & 0xFFFF));
     crate::diag::record(0x0F12_0000 | (DMA_SYNC_RET.load(Ordering::Relaxed) & 0xFFFF));
+    // C3/M3.4 async-transport atoms:
+    //   0x0F13_NNNN = async SUBMIT_3D enqueues   0x0F14_NNNN = completions
+    //   0x0F15_NNNN = WDDM fences completed from the DPC
+    //   0x0F16_NNNN = WAIT_FENCE timeouts        0x0F17_NNNN = sync cmd timeouts
+    crate::diag::record(
+        0x0F13_0000 | (crate::virtio::gpu::ASYNC_SUBMIT_COUNT.load(Ordering::Relaxed) & 0xFFFF),
+    );
+    crate::diag::record(
+        0x0F14_0000 | (crate::virtio::gpu::ASYNC_COMPLETE_COUNT.load(Ordering::Relaxed) & 0xFFFF),
+    );
+    crate::diag::record(
+        0x0F15_0000 | (crate::virtio::gpu::WDDM_FENCE_FROM_DPC.load(Ordering::Relaxed) & 0xFFFF),
+    );
+    crate::diag::record(
+        0x0F16_0000 | (crate::virtio::gpu::FENCE_WAIT_TIMEOUTS.load(Ordering::Relaxed) & 0xFFFF),
+    );
+    crate::diag::record(
+        0x0F17_0000 | (crate::virtio::gpu::CTRL_TIMEOUT_COUNT.load(Ordering::Relaxed) & 0xFFFF),
+    );
 }
 
 /// Context handed to [`notify_dma_completed_routine`] across the
@@ -103,23 +122,17 @@ unsafe extern "C" fn notify_dma_completed_routine(context: *mut c_void) -> BOOLE
     1 // TRUE
 }
 
-/// Signal `DXGK_INTERRUPT_DMA_COMPLETED` for `fence` at the correct IRQL: fill the
-/// packet, hand it to `DxgkCbNotifyInterrupt` from inside a `DxgkCbSynchronizeExecution`
-/// callback (which raises to the device's DIRQL), then `DxgkCbQueueDpc` so dxgkrnl
-/// drains the packet and advances the software fence. Callable at <= DIRQL.
-unsafe fn signal_dma_completed(dxgkrnl: &DXGKRNL_INTERFACE, fence: u32) -> NTSTATUS {
-    let mut interrupt = unsafe { core::mem::zeroed::<DXGKARGCB_NOTIFY_INTERRUPT_DATA>() };
-    interrupt.InterruptType = DXGK_INTERRUPT_DMA_COMPLETED;
-    // SAFETY: bindgen lowered the per-type union to __BindgenUnionField accessors;
-    // DmaCompleted is the correct arm for DXGK_INTERRUPT_DMA_COMPLETED.
-    let completed = unsafe { interrupt.__bindgen_anon_1.DmaCompleted.as_mut() };
-    completed.SubmissionFenceId = fence;
-    completed.NodeOrdinal = 0;
-    completed.EngineOrdinal = 0;
-
+/// Deliver a prepared `DXGKARGCB_NOTIFY_INTERRUPT_DATA` packet at the correct
+/// IRQL: hand it to `DxgkCbNotifyInterrupt` from inside a
+/// `DxgkCbSynchronizeExecution` callback (which raises to the device's DIRQL),
+/// then `DxgkCbQueueDpc` so dxgkrnl drains the packet. Callable at <= DIRQL.
+unsafe fn notify_at_dirql(
+    dxgkrnl: &DXGKRNL_INTERFACE,
+    interrupt: &mut DXGKARGCB_NOTIFY_INTERRUPT_DATA,
+) -> NTSTATUS {
     let ctx = NotifyDmaCompletedCtx {
         dxgkrnl: dxgkrnl as *const DXGKRNL_INTERFACE,
-        interrupt: &mut interrupt as *mut DXGKARGCB_NOTIFY_INTERRUPT_DATA,
+        interrupt: interrupt as *mut DXGKARGCB_NOTIFY_INTERRUPT_DATA,
     };
 
     if let Some(sync) = dxgkrnl.DxgkCbSynchronizeExecution {
@@ -148,6 +161,66 @@ unsafe fn signal_dma_completed(dxgkrnl: &DXGKRNL_INTERFACE, fence: u32) -> NTSTA
     STATUS_SUCCESS
 }
 
+/// Signal `DXGK_INTERRUPT_DMA_COMPLETED` for `fence` (see [`notify_at_dirql`]).
+/// Called from the interrupt DPC for venus-gated submissions (C3/M3.4) and
+/// directly for submissions with no venus work outstanding.
+pub(crate) unsafe fn signal_dma_completed(dxgkrnl: &DXGKRNL_INTERFACE, fence: u32) -> NTSTATUS {
+    let mut interrupt = unsafe { core::mem::zeroed::<DXGKARGCB_NOTIFY_INTERRUPT_DATA>() };
+    interrupt.InterruptType = DXGK_INTERRUPT_DMA_COMPLETED;
+    // SAFETY: bindgen lowered the per-type union to __BindgenUnionField accessors;
+    // DmaCompleted is the correct arm for DXGK_INTERRUPT_DMA_COMPLETED.
+    let completed = unsafe { interrupt.__bindgen_anon_1.DmaCompleted.as_mut() };
+    completed.SubmissionFenceId = fence;
+    completed.NodeOrdinal = 0;
+    completed.EngineOrdinal = 0;
+    // SAFETY: fully-initialized packet, live for the call.
+    unsafe { notify_at_dirql(dxgkrnl, &mut interrupt) }
+}
+
+/// Signal `DXGK_INTERRUPT_DMA_PREEMPTED` (see [`notify_at_dirql`]): the node's
+/// pending submissions are released back to the scheduler, which resubmits the
+/// incomplete ones later.
+unsafe fn signal_dma_preempted(
+    dxgkrnl: &DXGKRNL_INTERFACE,
+    preempt_fence: u32,
+    last_completed: u32,
+) -> NTSTATUS {
+    let mut interrupt = unsafe { core::mem::zeroed::<DXGKARGCB_NOTIFY_INTERRUPT_DATA>() };
+    interrupt.InterruptType = _DXGK_INTERRUPT_TYPE::DXGK_INTERRUPT_DMA_PREEMPTED;
+    // SAFETY: DmaPreempted is the correct arm for DXGK_INTERRUPT_DMA_PREEMPTED.
+    let preempted = unsafe { interrupt.__bindgen_anon_1.DmaPreempted.as_mut() };
+    preempted.PreemptionFenceId = preempt_fence;
+    preempted.LastCompletedFenceId = last_completed;
+    preempted.NodeOrdinal = 0;
+    preempted.EngineOrdinal = 0;
+    // SAFETY: fully-initialized packet, live for the call.
+    unsafe { notify_at_dirql(dxgkrnl, &mut interrupt) }
+}
+
+/// Common submission handling (C3/M3.4): record the WDDM fence behind the venus
+/// work outstanding at submit time. Signals `DMA_COMPLETED` immediately only
+/// when nothing gates it (no async venus in flight, FIFO empty — e.g. paging
+/// during bring-up) or the transport is down; otherwise the interrupt DPC
+/// completes it once every async venus submission queued before it has retired
+/// (the real venus-driven WDDM fence — WDDM_FAKE_VIDMM_RESEARCH §C).
+fn note_and_maybe_signal(adapter: &AdapterContext, fence: u32, is_paging: bool) -> NTSTATUS {
+    let dxgkrnl = match adapter.dxgkrnl() {
+        Ok(interface) => interface,
+        Err(_) => return STATUS_DEVICE_NOT_READY,
+    };
+    let signal_now = adapter
+        .with_virtio(|v| v.note_wddm_submission(fence, is_paging))
+        // Transport down (bring-up / teardown): no venus work can gate it.
+        .unwrap_or(true);
+    if signal_now {
+        adapter.last_completed_fence.store(fence, Ordering::Release);
+        // SAFETY: dxgkrnl is the live callback interface; signal at correct IRQL.
+        unsafe { signal_dma_completed(dxgkrnl, fence) }
+    } else {
+        STATUS_SUCCESS
+    }
+}
+
 /// `DxgkDdiSubmitCommandVirtual` — submit a DMA buffer addressed by GPU virtual
 /// address. Because Helios declares the GpuMmu model (`VirtualAddressingSupported`
 /// + `GpuMmuSupported`), VidSch routes a GpuMmu context's command buffers HERE, not
@@ -157,10 +230,11 @@ unsafe fn signal_dma_completed(dxgkrnl: &DXGKRNL_INTERFACE, fence: u32) -> NTSTA
 /// NOT_SUPPORTED (0xC00000BB), and bugchecks **0x119 (VIDEO_SCHEDULER_INTERNAL_ERROR)
 /// Arg1=2** ("driver failed upon submission of a command") — observed live.
 ///
-/// Same null-engine completion as `dxgkddi_submit_command`: there is no guest GPU to
-/// program (the host owns the real MMU; venus addresses by resource id), so retire
-/// the fence via `DxgkCbNotifyInterrupt`(DMA_COMPLETED) at the device DIRQL. Runs at
-/// DISPATCH_LEVEL. (Real venus forwarding of render buffers is the deferred §C work.)
+/// There is no guest GPU to program (the host owns the real MMU; venus addresses
+/// by resource id — the actual work rides the venus Escape channel), but since
+/// C3/M3.4 the fence is NOT lied about: it queues behind the venus work
+/// outstanding at submit time and completes from the interrupt DPC. Runs at
+/// DISPATCH_LEVEL.
 pub unsafe extern "C" fn dxgkddi_submit_command_virtual(
     h_adapter: *mut c_void,
     submit_command: *const DXGKARG_SUBMITCOMMANDVIRTUAL,
@@ -180,20 +254,13 @@ pub unsafe extern "C" fn dxgkddi_submit_command_virtual(
         SUBMIT_PAGING_COUNT.fetch_add(1, Ordering::Relaxed);
     }
 
-    adapter.last_completed_fence.store(fence, Ordering::Release);
-    let dxgkrnl = match adapter.dxgkrnl() {
-        Ok(interface) => interface,
-        Err(_) => return STATUS_DEVICE_NOT_READY,
-    };
-    // SAFETY: dxgkrnl is the live callback interface; signal at correct IRQL.
-    unsafe { signal_dma_completed(dxgkrnl, fence) }
+    note_and_maybe_signal(adapter, fence, is_paging)
 }
 
 /// `DxgkDdiSubmitCommand` — submit a DMA buffer to the GPU. Critically, this is
 /// also how Dxgkrnl queues *paging* buffers (built by DxgkDdiBuildPagingBuffer,
 /// with `hDevice == NULL`); since we register paging, this slot must be present.
-// Runs at DISPATCH_LEVEL. Once this path is reachable, it must not fail in
-// normal operation; until then, the driver must not advertise render capability.
+// Runs at DISPATCH_LEVEL. Same C3/M3.4 completion model as SubmitCommandVirtual.
 pub unsafe extern "C" fn dxgkddi_submit_command(
     h_adapter: IN_CONST_HANDLE,
     submit_command: IN_CONST_PDXGKARG_SUBMITCOMMAND,
@@ -206,7 +273,6 @@ pub unsafe extern "C" fn dxgkddi_submit_command(
     let submit = unsafe { &*submit_command };
     let fence = submit.SubmissionFenceId;
 
-    // Instrument: which submissions does VidSch actually drive during bring-up?
     SUBMIT_COUNT.fetch_add(1, Ordering::Relaxed);
     SUBMIT_LAST_FENCE.store(fence, Ordering::Relaxed);
     // Flags.Paging is bit 0 of the flags word; read it via the union's `Value`
@@ -217,35 +283,16 @@ pub unsafe extern "C" fn dxgkddi_submit_command(
         SUBMIT_PAGING_COUNT.fetch_add(1, Ordering::Relaxed);
     }
 
-    // Coherent completion model (Step-2 gate scope):
-    //
-    //   * Paging / null-engine buffers (Flags.Paging == 1, or any buffer carrying
-    //     no venus stream) have no host work — the decorative GpuMmu has nothing
-    //     to program — so we complete the fence directly. This keeps dxgkrnl's
-    //     paging path from timing out and is the only submission VidSch issues
-    //     during adapter bring-up.
-    //   * Venus render buffers (produced by a UMD via DxgkDdiRender, with a
-    //     HeliosWddmCmdBuf at the head) would be forwarded to the host here, then
-    //     completed. That forwarding is DEFERRED until a UMD actually drives the
-    //     render path: it cannot be exercised during VidSch init (which submits
-    //     only paging/null buffers), and the venus stream sits in the GPU-VA /
-    //     physical DMA buffer (no CPU VA in DXGKARG_SUBMITCOMMAND), so wiring it
-    //     correctly belongs with the UMD bring-up, not this scheduler-gate pass.
-    //     See WDDM_FAKE_VIDMM_RESEARCH.md §A6.9 / §C.1 Option 1.
-    //
-    // In all cases the fence is signaled via DxgkCbNotifyInterrupt at the device's
-    // DIRQL (DxgkCbSynchronizeExecution), NOT directly at DISPATCH_LEVEL — the
-    // earlier direct call was an IRQL contract violation (A6.5/A6.6).
-    adapter.last_completed_fence.store(fence, Ordering::Release);
-
-    let dxgkrnl = match adapter.dxgkrnl() {
-        Ok(interface) => interface,
-        Err(_) => return STATUS_DEVICE_NOT_READY,
-    };
-    // SAFETY: dxgkrnl is the live callback interface; signal at correct IRQL.
-    unsafe { signal_dma_completed(dxgkrnl, fence) }
+    note_and_maybe_signal(adapter, fence, is_paging)
 }
 
+/// `DxgkDdiPreemptCommand` — VidSch wants the node's pending submissions back
+/// (TDR probe or priority scheduling). We cannot abort host venus work, but we
+/// CAN release the pending WDDM fences: drop them (the scheduler resubmits the
+/// incomplete DMA buffers later; the venus work keeps executing and the fresh
+/// submissions re-queue behind whatever is still outstanding) and acknowledge
+/// with `DMA_PREEMPTED`. Without this ack, a validate-slow venus fence
+/// (> TdrDelay) escalates straight to ResetFromTimeout. Runs at DISPATCH_LEVEL.
 pub unsafe extern "C" fn dxgkddi_preempt_command(
     h_adapter: *mut c_void,
     preempt_command: *const DXGKARG_PREEMPTCOMMAND,
@@ -254,23 +301,28 @@ pub unsafe extern "C" fn dxgkddi_preempt_command(
     if h_adapter.is_null() || preempt_command.is_null() {
         return STATUS_INVALID_PARAMETER;
     }
+    let adapter = unsafe { &*(h_adapter as *const AdapterContext) };
+    let preempt = unsafe { &*preempt_command };
 
-    // Null-engine bring-up: every submitted fence is completed synchronously, so
-    // there is no hardware queue to interrupt. Reporting success keeps VidSch's
-    // preempt/TDR path coherent instead of escalating on NOT_IMPLEMENTED.
-    STATUS_SUCCESS
+    let _dropped = adapter.with_virtio(|v| v.preempt_flush()).unwrap_or(0);
+    let last_completed = adapter.last_completed_fence.load(Ordering::Acquire);
+    let dxgkrnl = match adapter.dxgkrnl() {
+        Ok(interface) => interface,
+        Err(_) => return STATUS_DEVICE_NOT_READY,
+    };
+    // SAFETY: live callback interface; the packet is delivered at DIRQL.
+    unsafe { signal_dma_preempted(dxgkrnl, preempt.PreemptionFenceId, last_completed) }
 }
 
-/// `DxgkDdiResetFromTimeout` — TDR recovery (no engines to reset yet).
+/// `DxgkDdiResetFromTimeout` — TDR recovery. There is no hardware engine state
+/// to reset (the host owns the GPU); drop every pending WDDM fence so dxgkrnl's
+/// post-reset accounting starts clean (it discards outstanding submissions).
 pub unsafe extern "C" fn dxgkddi_reset_from_timeout(h_adapter: *mut c_void) -> NTSTATUS {
     if h_adapter.is_null() {
         return STATUS_INVALID_PARAMETER;
     }
-
-    // The current KMD model retires paging/render submissions immediately via
-    // DMA_COMPLETED notifications and has no hardware engine state to reset.
-    // Returning NOT_SUPPORTED here makes dxgkrnl's TDR recovery fail-fast with
-    // VIDEO_TDR_FAILURE Arg3=STATUS_NOT_SUPPORTED.
+    let adapter = unsafe { &*(h_adapter as *const AdapterContext) };
+    let _ = adapter.with_virtio(|v| v.preempt_flush());
     STATUS_SUCCESS
 }
 
@@ -571,9 +623,9 @@ pub unsafe extern "C" fn dxgkddi_collect_dbg_info(
         let adapter = unsafe { &*(h_adapter as *const AdapterContext) };
         adapter.last_completed_fence.load(Ordering::Relaxed) as u32
     };
-    let report: [u32; 21] = [
+    let report: [u32; 33] = [
         0x4844_4247, // 'HDBG'
-        2,           // report version (2: + resource-table telemetry)
+        3,           // report version (3: + C3/M3.4 async-transport telemetry)
         args.Reason,
         SUBMIT_COUNT.load(Ordering::Relaxed),
         SUBMIT_LAST_FENCE.load(Ordering::Relaxed),
@@ -584,9 +636,9 @@ pub unsafe extern "C" fn dxgkddi_collect_dbg_info(
         DMA_NOTIFY_COUNT.load(Ordering::Relaxed),
         DMA_QUEUE_DPC_COUNT.load(Ordering::Relaxed),
         last_fence,
-        // Nonzero = the virtio control queue timed out and the transport is
-        // poisoned (host stopped answering) — the likely reason for the TDR
-        // this dump belongs to.
+        // Nonzero = synchronous control commands timed out their PASSIVE wait
+        // budget (host stopped answering in time) — no longer a transport
+        // poison, but still the likely reason for the TDR this dump belongs to.
         crate::virtio::gpu::CTRL_TIMEOUT_COUNT.load(Ordering::Relaxed),
         // v2: bounded-table telemetry (the 2026-07-03 MAX_BLOBS exhaustion class).
         crate::virtio::gpu::BLOB_HIGH_WATER.load(Ordering::Relaxed),
@@ -597,8 +649,21 @@ pub unsafe extern "C" fn dxgkddi_collect_dbg_info(
         crate::virtio::gpu::WINDOW_RANGE_DROPS.load(Ordering::Relaxed),
         crate::virtio::gpu::TAKE_LIVE_MISSES.load(Ordering::Relaxed),
         crate::virtio::gpu::ADOPT_DEAD_REJECTS.load(Ordering::Relaxed),
+        // v3: C3/M3.4 async-transport telemetry.
+        crate::virtio::gpu::ASYNC_SUBMIT_COUNT.load(Ordering::Relaxed),
+        crate::virtio::gpu::ASYNC_COMPLETE_COUNT.load(Ordering::Relaxed),
+        crate::virtio::gpu::ASYNC_RESP_ERRORS.load(Ordering::Relaxed),
+        crate::virtio::gpu::FENCE_WAIT_REGISTERED.load(Ordering::Relaxed),
+        crate::virtio::gpu::FENCE_WAIT_TIMEOUTS.load(Ordering::Relaxed),
+        crate::virtio::gpu::DRAIN_BAD_TOKEN.load(Ordering::Relaxed),
+        crate::virtio::gpu::QUEUE_FULL_RETRIES.load(Ordering::Relaxed),
+        crate::virtio::gpu::WDDM_PENDING_OVERFLOWS.load(Ordering::Relaxed),
+        crate::virtio::gpu::INFLIGHT_HIGH_WATER.load(Ordering::Relaxed),
+        crate::virtio::gpu::PARKED_HIGH_WATER.load(Ordering::Relaxed),
+        crate::virtio::gpu::PARKED_LEAKS.load(Ordering::Relaxed),
+        crate::virtio::gpu::WDDM_FENCE_FROM_DPC.load(Ordering::Relaxed),
     ];
-    let report_bytes = size_of::<[u32; 21]>();
+    let report_bytes = size_of::<[u32; 33]>();
     let copy_len = core::cmp::min(report_bytes, buf_len);
     // SAFETY: copy_len <= BufferSize (writable, checked above) and
     // copy_len <= size_of report (readable local array).

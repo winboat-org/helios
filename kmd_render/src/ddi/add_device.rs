@@ -30,9 +30,13 @@ pub unsafe extern "C" fn dxgkddi_add_device(
 
     // Leak the context to a raw pointer; Dxgkrnl returns it to us on every DDI
     // and we reclaim it in DxgkDdiRemoveDevice.
-    let raw = Box::into_raw(Box::new(ctx)) as *mut c_void;
+    let raw = Box::into_raw(Box::new(ctx));
+    // Kernel dispatcher objects (the venus PASSIVE mutex) must be initialized
+    // at the context's FINAL address — a KEVENT's header is self-referential.
+    // SAFETY: `raw` is the final heap address; no other thread sees it yet.
+    unsafe { (*raw).init_kernel_events() };
     // SAFETY: miniport_device_context is a valid out-pointer per the DDI contract.
-    unsafe { *miniport_device_context = raw };
+    unsafe { *miniport_device_context = raw as *mut c_void };
 
     crate::diag::record(0x0A00_0002);
     STATUS_SUCCESS

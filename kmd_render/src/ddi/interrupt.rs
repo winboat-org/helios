@@ -1,9 +1,18 @@
-//! ISR / DPC DDIs.
+//! ISR / DPC DDIs — the C3/M3.4 interrupt-driven used-ring drain.
 //!
-//! Registered now so the DDI table is complete, but inert until the virtqueue +
-//! MSI-X path lands (Phase 2/3). The ISR runs at DIRQL: no allocations, no
-//! pageable calls. It will read the virtio ISR status, drain the used ring, and
-//! call DxgkCbNotifyInterrupt for each completed fence (see KMD.md Phase 3).
+//! The virtio-gpu device is line-based INTx (`MSISupported=0`), i.e. *level*-
+//! triggered: it asserts the shared INTx line when it pushes used-ring entries
+//! and keeps it asserted until the driver reads the read-to-clear virtio
+//! ISR-status register. The ISR reads that register (deasserting the line),
+//! claims the interrupt, and queues the DPC via `DxgkCbQueueDpc`; the DPC
+//! drains the used ring under the device spinlock (`VirtioGpu::drain_used` —
+//! signaling sync/fence KEVENT waiters) and then completes every WDDM
+//! submission whose venus watermark has been reached
+//! (`DXGK_INTERRUPT_DMA_COMPLETED` at DIRQL via `signal_dma_completed`).
+//!
+//! IRQL: the ISR runs at the device's DIRQL — no allocations, no spinlocks, no
+//! pageable calls; it touches only the lock-free published ISR-status VA and
+//! the saved dxgkrnl callback table. The DPC runs at DISPATCH_LEVEL.
 
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -11,13 +20,10 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use crate::adapter::AdapterContext;
 use crate::dxgk::*;
 
-// ── DIRQL/DISPATCH-safe instrumentation (Step-2 coherent-fence bring-up) ─────
+// ── DIRQL/DISPATCH-safe instrumentation ──────────────────────────────────────
 // `diag::record` is PASSIVE-only (RtlWriteRegistryValue), so the ISR/DPC cannot
 // touch the registry ring. These atomics are incremented here at DIRQL/DISPATCH
-// and dumped into the PASSIVE diag ring at DxgkDdiDestroyDevice — they tell us
-// whether dxgkrnl/VidSch ever delivers a virtio interrupt or schedules our DPC
-// during adapter bring-up (the open question behind the VidSchTerminateAdapter
-// Code-43: does VidSch exercise the engine at all before it bails?).
+// and dumped into the PASSIVE diag ring at DxgkDdiDestroyDevice.
 pub static INT_ROUTINE_COUNT: AtomicU32 = AtomicU32::new(0);
 pub static DPC_ROUTINE_COUNT: AtomicU32 = AtomicU32::new(0);
 pub static CONTROL_INT_COUNT: AtomicU32 = AtomicU32::new(0);
@@ -25,21 +31,13 @@ pub static CONTROL_INT_COUNT: AtomicU32 = AtomicU32::new(0);
 /// `DxgkDdiInterruptRoutine` — runs at the device's DIRQL; returns TRUE if the
 /// interrupt was ours.
 //
-// The virtio-gpu device is line-based INTx (`MSISupported=0`), i.e. *level*-
-// triggered: it asserts the shared INTx line and keeps it asserted until the
-// driver reads the read-to-clear virtio ISR-status register. Our submission path
-// is polled (`add_notify_wait_pop` drains the used ring synchronously), so it
-// never reads that register — leaving the line asserted after every completed
-// command. dxgkrnl re-dispatches the still-asserted line into this routine; the
-// previous stub returned FALSE without acking, so the line never dropped and the
-// OS interrupt-storm detector disabled the adapter (observed: ~10000 unclaimed
-// ISR calls/bring-up → Code 43).
-//
-// Fix: read the ISR-status register (which DEASSERTS the line) and, if a bit was
-// pending, claim the interrupt (return TRUE). We do NOT queue a DPC: the polled
-// submission path already owns and drains the used ring, so a DPC drain here
-// would double-pop. The register VA is published lock-free by StartDevice; a
-// volatile byte read at DIRQL takes no lock (the spinlock would be illegal here).
+// Read the ISR-status register (which DEASSERTS the level-triggered line), and
+// if a bit was pending, claim the interrupt and queue the DPC. Without the
+// read-to-clear, the line stays asserted and Windows' interrupt-storm detector
+// disables the adapter (observed pre-fix: ~10000 unclaimed ISR calls → Code 43).
+// The register VA is published lock-free by StartDevice (`isr_status`, Release)
+// BEFORE the transport goes live, and `adapter.dxgkrnl` is written before that
+// — so a nonzero `isr_status` implies a valid callback table.
 pub unsafe extern "C" fn dxgkddi_interrupt_routine(
     miniport_device_context: *mut c_void,
     _message_number: u32,
@@ -63,21 +61,73 @@ pub unsafe extern "C" fn dxgkddi_interrupt_routine(
         return 0;
     }
     INT_ROUTINE_COUNT.fetch_add(1, Ordering::Relaxed);
+    // Bit 0 = used-ring progress: queue the DPC to drain it. (Bit 1 = config
+    // change — nothing to service, but the read above already acked it.)
+    if status & 0x1 != 0 {
+        if let Some(dxgkrnl) = adapter.dxgkrnl.as_ref() {
+            if let Some(queue_dpc) = dxgkrnl.DxgkCbQueueDpc {
+                // SAFETY: DxgkCbQueueDpc is callable from the ISR at DIRQL;
+                // DeviceHandle is the live dxgkrnl device handle.
+                unsafe { queue_dpc(dxgkrnl.DeviceHandle) };
+            }
+        }
+    }
     1 // claimed + acknowledged (line now deasserted)
 }
 
-/// `DxgkDdiDpcRoutine` — runs at DISPATCH_LEVEL after the ISR queues a DPC.
-pub unsafe extern "C" fn dxgkddi_dpc_routine(_miniport_device_context: *mut c_void) {
+/// `DxgkDdiDpcRoutine` — runs at DISPATCH_LEVEL after the ISR (or a
+/// `signal_dma_completed` notify pair) queues a DPC.
+pub unsafe extern "C" fn dxgkddi_dpc_routine(miniport_device_context: *mut c_void) {
     DPC_ROUTINE_COUNT.fetch_add(1, Ordering::Relaxed);
-    // No-op: the polled submission path owns the used ring; draining here would
-    // double-pop. (Lands when submission moves to the async used-ring model.)
+    if miniport_device_context.is_null() {
+        return;
+    }
+    // SAFETY: our AdapterContext, valid for the device's lifetime.
+    let adapter = unsafe { &*(miniport_device_context as *const AdapterContext) };
+
+    // Let dxgkrnl process any interrupt data queued by DxgkCbNotifyInterrupt
+    // (the WDDM fence completions signaled below re-queue this DPC, and this
+    // call drains their packets — the viogpu3d NotifyDpcRoutine ordering).
+    if let Some(dxgkrnl) = adapter.dxgkrnl.as_ref() {
+        if let Some(notify_dpc) = dxgkrnl.DxgkCbNotifyDpc {
+            // SAFETY: DISPATCH_LEVEL DPC context; live device handle.
+            unsafe { notify_dpc(dxgkrnl.DeviceHandle) };
+        }
+    }
+
+    // Drain the used ring: completes in-flight entries, copies sync responses,
+    // signals sync/fence KEVENT waiters, parks retired buffers for a PASSIVE
+    // reap. KeSetEvent at DISPATCH (Wait=FALSE) is legal.
+    let _ = adapter.with_virtio(|v| v.drain_used());
+
+    // Complete every WDDM submission whose venus watermark has been reached —
+    // strictly FIFO (SubmissionFenceIds are watermarks to dxgkrnl). The
+    // DIRQL notify (DxgkCbSynchronizeExecution → DxgkCbNotifyInterrupt →
+    // DxgkCbQueueDpc) must run OUTSIDE the device spinlock.
+    loop {
+        let mut ready = [0u32; 8];
+        let n = adapter
+            .with_virtio(|v| v.take_ready_wddm(&mut ready))
+            .unwrap_or(0);
+        if n == 0 {
+            break;
+        }
+        for &fence in &ready[..n] {
+            adapter.last_completed_fence.store(fence, Ordering::Release);
+            if let Some(dxgkrnl) = adapter.dxgkrnl.as_ref() {
+                // SAFETY: live callback interface; signal at the correct IRQL
+                // (DxgkCbSynchronizeExecution raises to DIRQL internally).
+                let _ = unsafe { super::submit_command::signal_dma_completed(dxgkrnl, fence) };
+            }
+        }
+    }
 }
 
 /// `DxgkDdiControlInterrupt` — enable/disable a class of GPU interrupts.
-// STUB: Phase 3. The OS only ever passes DXGK_INTERRUPT_CRTC_VSYNC here, and
-// MSDN requires STATUS_NOT_IMPLEMENTED for any type the driver does not service.
-// A render-only adapter (0 video-present sources) drives no VSYNC, so we
-// implement none yet — the virtio-gpu used-ring interrupt gating lands in Phase 3.
+// The OS only ever passes DXGK_INTERRUPT_CRTC_VSYNC here, and MSDN requires
+// STATUS_NOT_IMPLEMENTED for any type the driver does not service. A
+// render-only adapter (0 video-present sources) drives no VSYNC; the virtio
+// used-ring interrupt is not an OS-controlled class.
 pub unsafe extern "C" fn dxgkddi_control_interrupt(
     _h_adapter: IN_CONST_HANDLE,
     _interrupt_type: IN_CONST_DXGK_INTERRUPT_TYPE,

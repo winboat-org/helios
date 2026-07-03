@@ -9,10 +9,11 @@ use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU32, AtomicUsize};
 
 use wdk_sys::ntddk::{
-    KeAcquireSpinLockRaiseToDpc, KeReleaseSpinLock, MmAllocateContiguousMemory,
-    MmFreeContiguousMemory, MmGetPhysicalAddress,
+    KeAcquireSpinLockRaiseToDpc, KeInitializeEvent, KeReleaseSpinLock, KeSetEvent,
+    KeWaitForSingleObject, MmAllocateContiguousMemory, MmFreeContiguousMemory,
+    MmGetPhysicalAddress,
 };
-use wdk_sys::{KSPIN_LOCK, PHYSICAL_ADDRESS};
+use wdk_sys::{KEVENT, KSPIN_LOCK, PHYSICAL_ADDRESS, PVOID};
 
 use crate::dxgk::*;
 use crate::error::DriverError;
@@ -84,8 +85,17 @@ pub struct AdapterContext {
     /// The persistent venus client (ring/reply BAR mappings + Vulkan ids) kept
     /// alive for the device lifetime so the page-table blob stays mapped. `None`
     /// until/unless the StartDevice venus bring-up succeeds. Its `Drop` unmaps the
-    /// ring/reply kernel mappings; cleared (dropped) in StopDevice.
+    /// ring/reply kernel mappings; cleared (dropped) in StopDevice. Guarded by
+    /// [`Self::venus_mutex`] — a PASSIVE mutex, NOT the virtio spinlock: client
+    /// operations block on host round-trips / ring progress (C3/M3.4) and must
+    /// never hold a spinlock across those waits.
     venus_client: UnsafeCell<Option<crate::virtio::venus::VenusClient>>,
+    /// PASSIVE mutex serializing `venus_client` access: a SynchronizationEvent
+    /// (auto-clearing) that starts signaled. Initialized IN PLACE by
+    /// [`Self::init_kernel_events`] after the context reaches its final heap
+    /// address (a KEVENT's dispatcher header is self-referential once
+    /// initialized — it must never be moved afterwards).
+    venus_mutex: UnsafeCell<KEVENT>,
     /// The persistent venus 3D context id (`VIRTIO_GPU_CAPSET_VENUS`) the venus
     /// client rides, created in StartDevice and destroyed in StopDevice. `0` = none.
     pub venus_ctx_id: u32,
@@ -112,8 +122,65 @@ impl AdapterContext {
             paging_ram: None,
             page_table_window: None,
             venus_client: UnsafeCell::new(None),
+            // Zeroed placeholder — the real dispatcher header is written by
+            // `init_kernel_events` once the context is at its final address.
+            venus_mutex: UnsafeCell::new(unsafe { core::mem::zeroed() }),
             venus_ctx_id: 0,
         })
+    }
+
+    /// Initialize the embedded kernel dispatcher objects. MUST be called once,
+    /// after the context reaches its final (heap) address and before any DDI
+    /// can run — `dxgkddi_add_device` calls it right after boxing.
+    ///
+    /// # Safety
+    /// `self` must be at its final address and not yet visible to any other
+    /// thread.
+    pub unsafe fn init_kernel_events(&self) {
+        // SAFETY: per the fn contract; SynchronizationEvent (type 1), initially
+        // signaled (the mutex starts free).
+        unsafe { KeInitializeEvent(self.venus_mutex.get(), 1, 1) };
+    }
+
+    /// Acquire the PASSIVE venus mutex (blocks; PASSIVE_LEVEL only).
+    fn acquire_venus_mutex(&self) {
+        // SAFETY: the event was initialized in place by `init_kernel_events`;
+        // an infinite Executive/KernelMode wait at PASSIVE_LEVEL. The
+        // SynchronizationEvent auto-clears on a satisfied wait (mutex acquire).
+        let _ = unsafe {
+            KeWaitForSingleObject(
+                self.venus_mutex.get() as PVOID,
+                0, // Executive
+                0, // KernelMode
+                0, // non-alertable
+                core::ptr::null_mut(),
+            )
+        };
+    }
+
+    /// Release the PASSIVE venus mutex.
+    fn release_venus_mutex(&self) {
+        // SAFETY: initialized event; KeSetEvent with Wait=FALSE is callable at
+        // <= DISPATCH_LEVEL (we are at PASSIVE).
+        unsafe { KeSetEvent(self.venus_mutex.get(), 0, 0) };
+    }
+
+    /// Run `f` against the persistent venus client under the PASSIVE venus
+    /// mutex. Returns `DeviceNotFound` if no client is installed. PASSIVE_LEVEL
+    /// only — `f` may block on host round-trips (`virtio::ctrl`) and venus ring
+    /// progress.
+    pub fn with_venus_client<R>(
+        &self,
+        f: impl FnOnce(&mut crate::virtio::venus::VenusClient) -> R,
+    ) -> Result<R, DriverError> {
+        self.acquire_venus_mutex();
+        // SAFETY: the venus mutex gives exclusive access to the cell.
+        let result = match unsafe { &mut *self.venus_client.get() } {
+            Some(client) => Ok(f(client)),
+            None => Err(DriverError::DeviceNotFound),
+        };
+        self.release_venus_mutex();
+        result
     }
 
     /// Allocate the real-RAM-backed paging/page-table segment. Called from
@@ -189,80 +256,16 @@ impl AdapterContext {
         result
     }
 
-    /// Run `f` against the live virtio transport WITHOUT holding `virtio_lock`.
-    ///
-    /// PASSIVE_LEVEL, single-threaded-bring-up ONLY. The in-kernel venus client
-    /// (`virtio::venus`) needs this for two reasons the spinlock path forbids:
-    /// it calls `MmMapIoSpace` (PASSIVE-only, illegal at the DISPATCH_LEVEL the
-    /// spinlock raises to) and it busy-polls the venus ring head for potentially
-    /// many iterations (holding a spinlock across that would block every other CPU).
-    /// This is sound because Dxgkrnl serializes the device-lifecycle DDIs and no
-    /// escape/DPC path touches the transport during StartDevice — the only caller.
-    ///
-    /// Returns `DeviceNotFound` if the transport is not currently up.
-    ///
-    /// # Safety
-    /// The caller MUST be at PASSIVE_LEVEL inside StartDevice (or another single-
-    /// threaded bring-up DDI) where no other thread can access the transport. Using
-    /// this once concurrent escape/DPC paths are live would race `virtio`.
-    pub unsafe fn with_virtio_passive<R>(
-        &self,
-        f: impl FnOnce(&mut VirtioGpu) -> R,
-    ) -> Result<R, DriverError> {
-        // SAFETY: per the function contract, the caller guarantees single-threaded
-        // PASSIVE access, so this exclusive borrow of the cell does not alias.
-        match unsafe { &mut *self.virtio.get() } {
-            Some(v) => Ok(f(v)),
-            None => Err(DriverError::DeviceNotFound),
-        }
-    }
-
-    /// Install or clear the persistent KMD Venus client. Device-lifecycle only.
-    pub unsafe fn set_venus_client(&self, client: Option<crate::virtio::venus::VenusClient>) {
-        *self.venus_client.get() = client;
-    }
-
-    /// Run `f` against both the live virtio transport and persistent Venus client.
-    ///
-    /// # Safety
-    /// This performs unlocked mutable access and must only be used at PASSIVE_LEVEL
-    /// from paths that are externally serialized. It is intentionally narrow for
-    /// standard WDDM allocations while the composition path is being brought up.
-    pub unsafe fn with_virtio_and_venus_passive<R>(
-        &self,
-        f: impl FnOnce(&mut VirtioGpu, &mut crate::virtio::venus::VenusClient) -> R,
-    ) -> Result<R, DriverError> {
-        let virtio = unsafe { &mut *self.virtio.get() };
-        let venus = unsafe { &mut *self.venus_client.get() };
-        match (virtio, venus) {
-            (Some(v), Some(c)) => Ok(f(v, c)),
-            _ => Err(DriverError::DeviceNotFound),
-        }
-    }
-
-    /// Run `f` against both the live virtio transport and the persistent Venus
-    /// client while holding `virtio_lock` — the [`with_virtio`] discipline, so it
-    /// cannot race concurrent escape/DPC transport users. `f` runs at
-    /// DISPATCH_LEVEL: everything the venus client does on the allocation path
-    /// (fixed-buffer ring writes, bounded ring polls, ctrl-queue submits) is
-    /// DISPATCH-safe — the same pattern as the synchronous venus-over-escape path.
-    /// Used by standard-allocation create/destroy (KMD-backed venus memory blobs).
-    pub fn with_virtio_and_venus_locked<R>(
-        &self,
-        f: impl FnOnce(&mut VirtioGpu, &mut crate::virtio::venus::VenusClient) -> R,
-    ) -> Result<R, DriverError> {
-        // SAFETY: spinlock-guarded exclusive access to both cells' contents for
-        // the duration of the critical section (the venus client is only ever
-        // installed/cleared at device lifecycle, under external serialization).
-        let irql = unsafe { KeAcquireSpinLockRaiseToDpc(self.virtio_lock.get()) };
-        let virtio = unsafe { &mut *self.virtio.get() };
-        let venus = unsafe { &mut *self.venus_client.get() };
-        let result = match (virtio, venus) {
-            (Some(v), Some(c)) => Ok(f(v, c)),
-            _ => Err(DriverError::DeviceNotFound),
-        };
-        unsafe { KeReleaseSpinLock(self.virtio_lock.get(), irql) };
-        result
+    /// Install or clear the persistent KMD Venus client, under the PASSIVE
+    /// venus mutex (so an in-flight `with_venus_client` cannot be raced by
+    /// StopDevice teardown). Device-lifecycle callers only; the previous client
+    /// (if any) drops OUTSIDE the mutex, at PASSIVE_LEVEL.
+    pub fn set_venus_client(&self, client: Option<crate::virtio::venus::VenusClient>) {
+        self.acquire_venus_mutex();
+        // SAFETY: the venus mutex gives exclusive access to the cell.
+        let old = core::mem::replace(unsafe { &mut *self.venus_client.get() }, client);
+        self.release_venus_mutex();
+        drop(old);
     }
 }
 

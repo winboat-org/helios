@@ -78,50 +78,42 @@ pub unsafe extern "C" fn dxgkddi_start_device(
             // Self-allocate a 16-MiB HOST_VISIBLE|HOST_COHERENT VkDeviceMemory over
             // venus and expose it as a BAR-backed, CPU-coherent region VidMm can
             // register as the page-table segment (VidMm drops a system-RAM segment;
-            // it accepts device-BAR memory backed by real host memory). Runs at
-            // PASSIVE in this single-threaded StartDevice, so we take the transport
-            // WITHOUT the DISPATCH spinlock (MmMapIoSpace + ring busy-polls are
-            // illegal under it). On any failure we record diag and leave
+            // it accepts device-BAR memory backed by real host memory). PASSIVE
+            // inside StartDevice; the flows ride `virtio::ctrl` (locked enqueues +
+            // PASSIVE waits), so they coexist with the interrupt DPC, which may
+            // already be live. On any failure we record diag and leave
             // page_table_window = None — never fail StartDevice (Gate 1 stays
             // start-safe). See virtio::venus.
-            // SAFETY: PASSIVE_LEVEL inside StartDevice; Dxgkrnl serializes the
-            // lifecycle DDIs and no escape/DPC path touches the transport yet, so
-            // the unlocked transport access is single-threaded.
             if !VENUS_ALLOC_ENABLED {
                 // venus page-table allocation disabled — boot-safe build.
                 adapter.venus_ctx_id = 0;
                 adapter.set_venus_client(None);
                 adapter.page_table_window = None;
             } else {
-                let venus_result = unsafe {
-                    adapter.with_virtio_passive(|v| {
-                        // Persistent venus context for the device lifetime (owner 0:
-                        // KMD-internal, destroyed explicitly in StopDevice).
-                        let ctx_id = v.ctx_create(helios_protocol::VIRTIO_GPU_CAPSET_VENUS, 0)?;
-                        let (client, blob) =
-                            crate::virtio::venus::allocate_host_visible_blob(v, ctx_id)?;
-                        Ok::<_, crate::virtio::VirtioError>((ctx_id, client, blob))
-                    })
-                };
+                // Persistent venus context for the device lifetime (owner 0:
+                // KMD-internal, destroyed explicitly in StopDevice).
+                let venus_result = crate::virtio::ctrl::ctx_create(
+                    adapter,
+                    helios_protocol::VIRTIO_GPU_CAPSET_VENUS,
+                    0,
+                )
+                .and_then(|ctx_id| {
+                    let (client, blob) =
+                        crate::virtio::venus::allocate_host_visible_blob(adapter, ctx_id)?;
+                    Ok((ctx_id, client, blob))
+                });
                 match venus_result {
-                    Ok(Ok((ctx_id, client, blob))) => {
+                    Ok((ctx_id, client, blob)) => {
                         crate::diag::record(0x0B00_0007);
                         adapter.venus_ctx_id = ctx_id;
                         adapter.set_venus_client(Some(client));
                         adapter.page_table_window = Some((blob.gpa, blob.size));
                     }
-                    Ok(Err(e)) => {
+                    Err(e) => {
                         // venus bring-up failed; transport is up but no page-table window.
                         let status: NTSTATUS = e.into();
                         crate::diag::record(0x0B00_00E7);
                         crate::diag::record(status as u32);
-                        adapter.venus_ctx_id = 0;
-                        adapter.set_venus_client(None);
-                        adapter.page_table_window = None;
-                    }
-                    Err(_) => {
-                        // Transport not up (should not happen — we just set it).
-                        crate::diag::record(0x0B00_00E8);
                         adapter.venus_ctx_id = 0;
                         adapter.set_venus_client(None);
                         adapter.page_table_window = None;
@@ -172,15 +164,17 @@ pub unsafe extern "C" fn dxgkddi_stop_device(miniport_device_context: *mut c_voi
         adapter.venus_ctx_id = 0;
         if venus_ctx != 0 {
             // Best-effort: unref every KMD-internal blob (owner 0) and destroy the
-            // venus context. Done under the spinlock (control-queue round-trips).
-            let _ = adapter.with_virtio(|v| {
-                v.release_blobs_for_owner(0);
-                let _ = v.ctx_destroy(venus_ctx);
-            });
+            // venus context (PASSIVE flows through virtio::ctrl).
+            let _ = crate::virtio::ctrl::release_blobs_for_owner(adapter, 0);
+            let _ = crate::virtio::ctrl::ctx_destroy(adapter, venus_ctx);
         }
+        // Free any parked completed entries at PASSIVE before the transport
+        // (and the buffers still in flight inside it) is dropped.
+        crate::virtio::ctrl::reap_parked(adapter);
 
         // Tear down the virtio transport: VirtioGpu::drop resets the device and
-        // frees its rings + scratch. A later StartDevice re-initializes.
+        // frees its rings (plus any in-flight/parked entry buffers). A later
+        // StartDevice re-initializes.
         adapter.set_virtio(None);
     }
     STATUS_SUCCESS
