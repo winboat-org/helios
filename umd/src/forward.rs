@@ -123,6 +123,23 @@ fn d3dddi_to_dxgi_format(format: u32) -> DXGI_FORMAT {
     }
 }
 
+/// Bytes per pixel of an (uncompressed) `DXGI_FORMAT`, for computing the WDDM
+/// surface pitch. Only the single-byte channel block (R8_*/A8/R1, 60..=66) and
+/// the wider HDR/deep formats matter for DWM composition; everything else
+/// defaults to 4 (32-bpp BGRA/RGBA — the historical assumption). Over-reporting
+/// is safe (the pitch only pads `linear_size`); under-reporting an A8 mask as
+/// 4bpp is what made openers size these surfaces 4x too large.
+fn dxgi_bytes_per_pixel(format: u32) -> u32 {
+    match format {
+        1..=4 => 16,   // R32G32B32A32_*
+        5..=8 => 12,   // R32G32B32_*
+        9..=14 => 8,   // R16G16B16A16_*
+        15..=19 => 8,  // R32G32_*, R32G8X24 depth
+        60..=66 => 1,  // R8_TYPELESS/UNORM/UINT/SNORM/SINT, A8_UNORM, R1_UNORM
+        _ => 4,
+    }
+}
+
 /// Parse the meta trailer at `base_off` bytes into the buffer, tolerating the
 /// two legacy (shorter) layouts. Returns a zero-extended [`HeliosWddmAllocMeta`].
 unsafe fn read_alloc_meta(ptr: *const c_void, size: u32, base_off: usize) -> Option<HeliosWddmAllocMeta> {
@@ -142,7 +159,7 @@ unsafe fn read_alloc_meta(ptr: *const c_void, size: u32, base_off: usize) -> Opt
             misc_flags: legacy.misc_flags,
             venus_alloc_size: 0,
             memory_type_index: 0,
-            reserved: 0,
+            dxgi_format: 0,
         });
     }
     if avail >= core::mem::size_of::<StandardAllocMetaV1>() {
@@ -159,7 +176,7 @@ unsafe fn read_alloc_meta(ptr: *const c_void, size: u32, base_off: usize) -> Opt
             misc_flags: 0,
             venus_alloc_size: 0,
             memory_type_index: 0,
-            reserved: 0,
+            dxgi_format: 0,
         });
     }
     None
@@ -683,7 +700,7 @@ unsafe fn allocate_wddm_resource(
     }
 
     const CROSS_ADAPTER_PITCH_ALIGN: u32 = 256;
-    let raw_pitch = mip0.TexelWidth.saturating_mul(4);
+    let raw_pitch = mip0.TexelWidth.saturating_mul(dxgi_bytes_per_pixel(a.Format as u32));
     let pitch =
         raw_pitch.saturating_add(CROSS_ADAPTER_PITCH_ALIGN - 1) & !(CROSS_ADAPTER_PITCH_ALIGN - 1);
     let linear_size = (pitch as u64)
@@ -730,7 +747,11 @@ unsafe fn allocate_wddm_resource(
             // fills them at CreateAllocation from its kernel venus client.
             venus_alloc_size,
             memory_type_index,
-            reserved: 0,
+            // Carry the creator's EXACT DXGI format so a cross-process opener
+            // rebuilds the image with the same bpp/layout instead of a squashed
+            // BGRA (the `format` field below is a lossy D3DDDIFORMAT for the
+            // KMD's DescribeAllocation). `a.Format` is already a DXGI_FORMAT.
+            dxgi_format: a.Format as u32,
         },
     };
     if backing_blob_id != 0 && backing_resource_id != 0 {
@@ -1152,7 +1173,7 @@ unsafe extern "C" fn open_resource(
         misc_flags: 0,
         venus_alloc_size: 0,
         memory_type_index: 0,
-        reserved: 0,
+        dxgi_format: 0,
     });
 
     if a.hKMResource.handle == 0 {
@@ -1182,15 +1203,26 @@ unsafe extern "C" fn open_resource(
     } else {
         meta.venus_alloc_size
     };
+    // Rebuild the image with the creator's EXACT DXGI format. Falls back to the
+    // lossy D3DDDIFORMAT translation only when the creator did not record a DXGI
+    // format (0 = legacy trailer / KMD standard allocation, which are BGRA). The
+    // old unconditional `d3dddi_to_dxgi_format(meta.format)` collapsed every
+    // surface to BGRA — an A8/R8 mask then rebuilt as 4bpp needed 4x the memory
+    // and its (correctly sized) import was refused as "undersized".
+    let open_dxgi_format = if meta.dxgi_format != 0 {
+        meta.dxgi_format
+    } else {
+        d3dddi_to_dxgi_format(meta.format).0 as u32
+    };
     log_line(&format!(
-        "DDI open_resource identity: res_id={} alloc_size={} mem_type={} kind={} ctx={} meta_bind=0x{:x} meta_misc=0x{:x} open_bind=0x{:x} open_misc=0x{:x}",
+        "DDI open_resource identity: res_id={} alloc_size={} mem_type={} kind={} ctx={} meta_bind=0x{:x} meta_misc=0x{:x} open_bind=0x{:x} open_misc=0x{:x} dxgi_fmt={} d3dddi_fmt={}",
         ident.resource_id, venus_alloc_size, ident.memory_type_index, ident.kind, ident.ctx_id,
-        meta.bind_flags, meta.misc_flags, open_bind, open_misc
+        meta.bind_flags, meta.misc_flags, open_bind, open_misc, open_dxgi_format, meta.format
     ));
     let raw = dev.dxvk.open_ddi_texture2d(
         meta.width.max(1),
         meta.height.max(1),
-        d3dddi_to_dxgi_format(meta.format).0 as u32,
+        open_dxgi_format,
         open_bind,
         open_misc,
         a.hKMResource.handle,

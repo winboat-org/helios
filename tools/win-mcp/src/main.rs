@@ -45,13 +45,21 @@ const SSH_HOST: &str = "win";
 const MESA_SRC: &str = "Z:\\icd\\mesa";
 /// Local build dir for the Mesa venus ICD (ninja writes artifacts to local disk).
 const MESA_BUILD: &str = "C:\\Users\\Rupansh\\helios-mesa-build";
-/// VS 2022 x64 dev environment (vcvars). Kept for the clang-cl ALTERNATIVE
-/// toolchain (icd/win-build/clang-cl-native.ini), which needs the MSVC SDK libs;
-/// the recommended mingw build does not use it. Drive clang-cl manually via
-/// win_exec if needed.
-#[allow(dead_code)]
+/// VS 2022 x64 dev environment (vcvars). Provides the MSVC archiver/linker
+/// (`lib.exe`/`link.exe`) + SDK libs the clang-cl DXVK build links against
+/// (icd/win-build/clang-cl-native.ini). Used by `win_dxvk`.
 const VCVARS: &str =
     "C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\VC\\Auxiliary\\Build\\vcvars64.bat";
+/// LLVM bin (clang-cl) — the DXVK C++ engine compiles with clang-cl (MSVC ABI).
+/// Same directory as LIBCLANG_PATH; named separately for the `win_dxvk` toolchain.
+const LLVM_BIN: &str = "C:\\Program Files\\LLVM\\bin";
+/// DXVK-helios C++ engine source on the share. The meson build reads a LOCAL git
+/// checkout (DXVK_MIRROR), NOT Z:\ directly, so `win_dxvk` robocopy-mirrors the
+/// source first, then builds into DXVK_BUILD. The Rust UMD (`win_cargo
+/// crate_dir:"umd"`) links the resulting prebuilt `.a` archives.
+const DXVK_SRC: &str = "Z:\\dxvk-helios";
+const DXVK_MIRROR: &str = "C:\\Users\\Rupansh\\dxvk-helios";
+const DXVK_BUILD: &str = "C:\\Users\\Rupansh\\dxvk-build";
 /// mingw-w64 (WinLibs UCRT gcc 16.1) bin dir — the RECOMMENDED venus toolchain
 /// (icd/win-build/mingw-native.ini). gcc compiles venus's GNU-isms natively and
 /// builds straight from Z:\. Installed via `winget install BrechtSanders.WinLibs.POSIX.UCRT`.
@@ -281,6 +289,38 @@ struct WinLookingGlassIddArgs {
     timeout_secs: Option<u64>,
 }
 
+#[derive(Deserialize, schemars::JsonSchema)]
+struct WinDxvkArgs {
+    /// meson argv run in the DXVK build dir. Empty defaults to
+    /// `compile -C C:\Users\Rupansh\dxvk-build` (the common case: rebuild after a
+    /// source edit). Reconfiguration is rare (the build dir is already set up with
+    /// the clang-cl native file); pass a full `["setup", ...]` argv only if needed.
+    #[serde(default)]
+    args: Vec<String>,
+    /// Skip the Z:\dxvk-helios -> local-checkout source mirror and build only.
+    /// Default false (always mirror first, so share edits are picked up).
+    #[serde(default)]
+    no_sync: bool,
+    /// Timeout in seconds. Defaults to 1800 (a header change recompiles many TUs).
+    #[serde(default)]
+    timeout_secs: Option<u64>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+struct WinInstallUmdArgs {
+    /// Flags passed through to `tools\hotplug-helios-umd.ps1`. Empty = the script's
+    /// default ProgramData hotplug (leaves the adapter running; new D3D processes
+    /// pick up the DLL, existing ones keep the old one until the device restarts).
+    /// Common sets: ["-PlanOnly"] (dry run); ["-KillUmdUsers","-RestartDevice",
+    /// "-NoProbe"] (force existing UMD users + an adapter restart to load the new
+    /// DLL now). See HELIOS_DRIVER_DEPLOYMENT.md.
+    #[serde(default)]
+    args: Vec<String>,
+    /// Timeout in seconds. Defaults to 600.
+    #[serde(default)]
+    timeout_secs: Option<u64>,
+}
+
 fn ps_join_path(root: &str, rel: &str) -> String {
     if root.ends_with(['\\', '/']) {
         format!("{root}{rel}")
@@ -483,6 +523,64 @@ impl WinHost {
         )
         .await
         {
+            Ok(o) => format_output(&o),
+            Err(e) => format!("error launching ssh: {e}"),
+        }
+    }
+
+    #[tool(
+        description = "Build the DXVK-helios C++ engine (the UMD's render backend) on win11 with the clang-cl (MSVC ABI) toolchain. Mirrors the source Z:\\dxvk-helios -> the local git checkout C:\\Users\\Rupansh\\dxvk-helios (the meson build reads the LOCAL copy, NOT the Z:\\ share) with robocopy, then runs meson in the pre-configured build dir C:\\Users\\Rupansh\\dxvk-build. CRITICAL and the reason this tool exists: it prepends LLVM (clang-cl) to PATH BEFORE calling vcvars64 (which supplies MSVC lib.exe/link.exe). The reverse order silently drops the MSVC archiver because cmd expands %PATH% at PARSE time, and the archive step then fails 'CreateProcess failed'. Empty `args` defaults to `compile -C <build dir>` (the common rebuild-after-edit). After this, relink the UMD with `win_cargo crate_dir:\"umd\" args:[\"build\"]` (its build.rs reruns on the changed .a archives), then deploy with win_install_umd. Edit DXVK sources on the Linux/Z:\\ side; the mirror re-syncs on every call."
+    )]
+    async fn win_dxvk(&self, Parameters(a): Parameters<WinDxvkArgs>) -> String {
+        let meson_args = if a.args.is_empty() {
+            format!("compile -C {DXVK_BUILD}")
+        } else {
+            a.args.join(" ")
+        };
+        // Mirror the DXVK source share -> local checkout. /XD+/XF .git skip all git
+        // metadata (submodule .git dirs AND the submodule .git pointer files), so
+        // the local checkouts' git state is never touched. The meson BUILD dir is
+        // separate (DXVK_BUILD), so the source tree carries no build artifacts.
+        let sync = if a.no_sync {
+            "\"win_dxvk: no_sync — skipping source mirror\"".to_string()
+        } else {
+            format!(
+                "robocopy {DXVK_SRC} {DXVK_MIRROR} /MIR /XJ /XD .git /XF .git /NFL /NDL /NJH /NJS /NP /R:1 /W:1\n\
+                 $rc = $LASTEXITCODE\n\
+                 if ($rc -ge 8) {{ \"win_dxvk: robocopy DXVK source mirror failed (exit $rc)\"; exit $rc }}"
+            )
+        };
+        // clang-cl (LLVM) MUST precede `call vcvars64`: cmd expands %PATH% at PARSE
+        // time, so `set PATH=LLVM;%PATH%` placed AFTER vcvars captures the
+        // pre-vcvars PATH and discards vcvars' MSVC bin (lib.exe/link.exe vanish ->
+        // "CreateProcess failed" at the archive step). Order: LLVM first, then
+        // vcvars (prepends MSVC), then meson. clang-cl resolves from LLVM, the
+        // archiver/linker from MSVC.
+        let command = format!(
+            "{sync}\n\
+             cmd /c 'set \"PATH={LLVM_BIN};%PATH%\" && call \"{VCVARS}\" && meson {meson_args}'"
+        );
+        match run_ssh(&command, None, &HashMap::new(), a.timeout_secs.unwrap_or(1800)).await {
+            Ok(o) => format_output(&o),
+            Err(e) => format!("error launching ssh: {e}"),
+        }
+    }
+
+    #[tool(
+        description = "Install/hotplug the Helios UMD (helios_umd.dll) on win11 by running tools\\hotplug-helios-umd.ps1 via `powershell -NoProfile -ExecutionPolicy Bypass -File`. The -ExecutionPolicy Bypass is REQUIRED: the VM's machine ExecutionPolicy is Restricted, so invoking the .ps1 any other way silently no-ops (no output, no deploy). Build the UMD first: `win_cargo crate_dir:\"umd\" args:[\"build\"]`. The script copies the build to C:\\ProgramData\\HeliosUmd, rewrites the display software key (UserModeDriverName), syncs the active DriverStore copy, verifies the destination SHA256 against the source, and prints final state. Pass script flags via `args`: [] = default ProgramData hotplug; [\"-PlanOnly\"] = dry run; [\"-KillUmdUsers\",\"-RestartDevice\",\"-NoProbe\"] = force existing UMD users off + an adapter restart so the new DLL loads immediately. NOTE: dxgkrnl caches the UMD path at DEVICE start, so without -RestartDevice (or a reboot) already-running processes keep the old DLL. See HELIOS_DRIVER_DEPLOYMENT.md."
+    )]
+    async fn win_install_umd(&self, Parameters(a): Parameters<WinInstallUmdArgs>) -> String {
+        let extra = a.args.join(" ");
+        // Nested `powershell -ExecutionPolicy Bypass -File` — REQUIRED because the
+        // machine ExecutionPolicy is Restricted, so a bare `& script.ps1` (which is
+        // effectively what run_ssh's outer -EncodedCommand shell would do) silently
+        // fails to run the .ps1. Running it as a child process also makes the
+        // script's Write-Host output visible (captured as the child's stdout),
+        // unlike same-process Write-Host which goes to an uncaptured host stream.
+        let command = format!(
+            "& powershell -NoProfile -ExecutionPolicy Bypass -File '{PROJECT_DRIVE}tools\\hotplug-helios-umd.ps1' {extra}"
+        );
+        match run_ssh(&command, None, &HashMap::new(), a.timeout_secs.unwrap_or(600)).await {
             Ok(o) => format_output(&o),
             Err(e) => format!("error launching ssh: {e}"),
         }

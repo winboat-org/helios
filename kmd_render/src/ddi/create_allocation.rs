@@ -995,7 +995,10 @@ pub unsafe extern "C" fn dxgkddi_get_standard_allocation_driver_data(
         // client has actually allocated the backing memory.
         venus_alloc_size: 0,
         memory_type_index: 0,
-        reserved: 0,
+        // KMD standard allocations are BGRA composition surfaces; leave the DXGI
+        // format hint 0 so the UMD opener uses its BGRA fallback. (Field formerly
+        // named `reserved`; same on-wire slot.)
+        dxgi_format: 0,
     };
 
     // SAFETY: AllocationPrivateDriverDataSize bytes (>= PRIV_SIZE) are writable.

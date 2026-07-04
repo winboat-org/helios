@@ -151,7 +151,16 @@ pub struct HeliosWddmAllocMeta {
     pub venus_alloc_size: u64,
     /// Creator's venus `memoryTypeIndex` for the backing memory.
     pub memory_type_index: u32,
-    pub reserved: u32,
+    /// Exact `DXGI_FORMAT` the creator built the resource with (0 = unknown, e.g.
+    /// KMD standard allocations and legacy trailers — the opener then falls back
+    /// to translating the D3DDDIFORMAT `format` field). Carrying the DXGI format
+    /// verbatim is required because the `format` field is a *lossy* D3DDDIFORMAT
+    /// (the KMD reports it to dxgkrnl from `DxgkDdiDescribeAllocation`), and the
+    /// D3DDDIFORMAT<->DXGI stubs collapse every non-BGRA surface to BGRA — which
+    /// made openers rebuild e.g. A8 masks as 4bpp BGRA and refuse the (correctly
+    /// sized, smaller) import. Occupies the former `reserved` u32, so the on-wire
+    /// layout is unchanged and older KMD binaries (which zero it) stay compatible.
+    pub dxgi_format: u32,
 }
 
 /// `'HIDN'` — magic of [`HeliosWddmOpenIdentity`].
