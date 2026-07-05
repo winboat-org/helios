@@ -162,7 +162,12 @@ Plan:
   `syms/<name>.pdb/<GUID+age>/<name>.sym`; fix the MODULE line name if the pdb
   was renamed). The deployed UMD build's PDB must GUID-match the dump's module
   (check with `llvm-pdbutil dump --summary`).
-- **Deploy**: `win_cargo` → `tools/install-helios-kmd.ps1` (ExecutionPolicy
-  Bypass, `-AllowRebootRequired`); version bump = build.rs numerics + strings
-  + Cargo.make stampinf (all three or FAILED_ADD); backups under
-  `C:\ProgramData\HeliosDeployBackups`.
+- **KMD build/deploy**: `win_build_kmd` (bumps the three version sites with a
+  coherence check, then cargo-make package build) → `win_install_kmd`
+  (install script + recommended, toggleable graceful guest reboot — the only
+  reliable activation path). Manual fallback: `win_cargo` +
+  `tools/install-helios-kmd.ps1` (ExecutionPolicy Bypass,
+  `-AllowRebootRequired`); version bump = build.rs numerics + strings +
+  Cargo.make stampinf (all three or FAILED_ADD); backups under
+  `C:\ProgramData\HeliosDeployBackups`. New tools appear after the win MCP
+  server restarts (new session).
