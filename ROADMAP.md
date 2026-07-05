@@ -34,15 +34,23 @@ ring≠0; the vn win32-sync signal path never fires; cross-process sync is dxvk-
 
 Open defects, roughly ordered:
 
-1. **Stall (primary, owner-visible as freeze/slowness)**: per-present full device drain in
-   `HeliosDxvkDevice::rotate_resource_backings` (bring-up shim, self-documented as awaiting the
-   async-fence rework); plus a suspected next-frame-unblocks-previous-frame wait chain
-   (mid-stall dump: all dxvk threads idle while host timeline sits behind for 8 s).
-   MEASURE FIRST: `HELIOS_PERF`/`HELIOS_QUEUE_PERF` (machine env + dwm restart).
-2. **dxvk-helios device-loss hygiene** (fixes the permanent-wedge escalation):
-   (a) dropped post-loss submissions must still `notifyObjects()`;
-   (b) `waitForResource`/`synchronizeUntil` must bail on `m_lastError == DEVICE_LOST`;
-   (c) on lost, skip `vkResetCommandPool` of pending pools (leak deliberately).
+1. **Stall (primary, owner-visible as freeze/slowness)** — first numbers (2026-07-05 fresh
+   boot, flasher = 10 Hz damage): dwm presents ~6/s (~170 ms interval); the
+   `rotate_resource_backings` full-device drain measures **15–25 ms** of that (`rotate-perf`
+   telemetry landed, a4d1103) — real but NOT dominant. The 8 s sem-deadline strikes continue
+   on a fresh boot and even WHILE presents flow (dwm+explorer+WUDFHost striking in the same
+   second) → a specific semaphore/queue stalls independently of the visible present chain
+   (suspect: the IDD-pair device chain, not the main compositor device).
+   NEXT LEVER: per-slot attribution in the ICD strike log (log the VkSemaphore/queue and
+   the waiting call site: vn_queue.c strike message) + `HELIOS_QUEUE_PERF` machine env
+   (needs a reboot to propagate to dwm's environment).
+2. **dxvk-helios device-loss hygiene — FIXED (11a30110, deployed 2026-07-05):**
+   (a) dropped post-loss submissions now `notifyObjects()` + recycle (was: permanent in-use
+   ref leak → dwm compositor wedge); (b) `waitForResource` bails on DEVICE_LOST (loud warn);
+   (c) on lost, bounded 2 s grace wait then deliberate cmdlist leak instead of resetting a
+   pool with host-pending buffers (was: the vkResetCommandPool VUs). Loss-path behavior not
+   yet exercised end-to-end (needs a forced-loss test: VN_HELIOS_SEM_DEADLINE_MS=1 on a
+   probe process).
 3. **dwm shared-resource creation failure**: `create_resource(tex2d): DXVK
    memory not importable (res_id=0, offset≠0)` — suballocated VkDeviceMemory
    cannot be exported/shared; DXVK must use dedicated allocations for
@@ -60,7 +68,14 @@ Open defects, roughly ordered:
    pairing is resilient now but the race window is still there.
 7. **In-place KMD update flakiness** — CM_PROB_FAILED_POST_START limbo until
    reboot is expected, but keep the version-coherence gotcha (three sites) and
-   backup ladder in mind.
+   backup ladder in mind. 2026-07-05 state note: after the freeze-recovery cold boot +
+   UMD hotplugs, the ACTIVE driver is **oem56.inf = 22.22.49 (pkg 04e18fa9)**, not
+   22.22.50/621a0c75 (registry `BarSegMode=10` keeps behavior identical);
+   `UserModeDriverName` points at the ProgramData hotplug DLL
+   (`helios_umd_1f94461bfa434740.dll` = fixes + rotate-perf telemetry); the 04e18fa9
+   DriverStore UMD copy is STALE and was lock-protected during hotplug — do not trust
+   DriverStore file timestamps as "deployed" evidence; check the loaded-module path of a
+   fresh dwm instead.
 8. **Mechanism question (understand before optimizing)**: post-cold-boot, GDI
    content renders while RenderGdi (GdiE), MapCpuHostAperture (ChMn) and
    paging (Pg*) counters all stay idle, yet 8 standard allocations sit in
