@@ -46,6 +46,37 @@ static SKIP_NO_SLOT: AtomicU32 = AtomicU32::new(0); // MAX_MAPPINGS exhausted
 static SKIP_NO_BLOB: AtomicU32 = AtomicU32::new(0); // blob_kernel_range failed
 static SKIP_NO_MAP: AtomicU32 = AtomicU32::new(0); // MmMapIoSpace returned null
 static LAST_SKIP_RESID: AtomicU32 = AtomicU32::new(0);
+/// Commands whose declared payload does not fit the remaining batch bytes
+/// (registry-visible as GdTc) and StretchBlts with an empty source rect,
+/// executed as no-ops (GdDs). Both were previously SILENT skip paths; GdTc in
+/// particular hid a systematic drop: the old guard required the FULL
+/// `DXGK_RENDERKM_COMMAND` struct (whose union is sized by the largest arm) to
+/// fit the buffer, so the final command of a tightly-sized batch was dropped
+/// whenever its arm was smaller — e.g. the lone COLORFILL that paints the
+/// desktop background (1 skip per desktop repaint, ~48% of all ops by
+/// 2026-07-05). Validation is now per-arm.
+static SKIP_TRUNC_CMD: AtomicU32 = AtomicU32::new(0);
+static DEGENERATE_STRETCH: AtomicU32 = AtomicU32::new(0);
+
+/// Where does the desktop plate fill go? (black-desktop hunt, 15th session)
+/// Large ops only (dst area >= 64k px) to keep registry churn low:
+/// GdCn/GdCr/GdCc/GdCg = large-COLORFILL count / last dst resid / color / geom
+/// (w<<16|h); GdBn/GdBr/GdBg = same for large BITBLTs. GdXn/GdXz/GdXr = total
+/// CLEARTYPEBLEND ops / ops whose sampled alpha row was ALL-ZERO / last alpha
+/// resid — tests the "glyph atlas is an empty blob → text invisible" theory.
+static BIG_FILL_COUNT: AtomicU32 = AtomicU32::new(0);
+static BIG_FILL_RESID: AtomicU32 = AtomicU32::new(0);
+static BIG_FILL_COLOR: AtomicU32 = AtomicU32::new(0);
+static BIG_FILL_GEOM: AtomicU32 = AtomicU32::new(0);
+static BIG_BLT_COUNT: AtomicU32 = AtomicU32::new(0);
+static BIG_BLT_RESID: AtomicU32 = AtomicU32::new(0);
+static BIG_BLT_GEOM: AtomicU32 = AtomicU32::new(0);
+static CT_COUNT: AtomicU32 = AtomicU32::new(0);
+static CT_ALPHA_ZERO: AtomicU32 = AtomicU32::new(0);
+static CT_ALPHA_RESID: AtomicU32 = AtomicU32::new(0);
+
+/// Threshold above which a fill/blt is "large" (the desktop plate is ~1.9M px).
+const BIG_OP_AREA: i64 = 65536;
 
 /// Cap on sub-rect list length; a longer list is truncated.
 const MAX_SUBRECTS: usize = 1024;
@@ -66,6 +97,7 @@ struct SurfView {
     width: i32,
     height: i32,
     pitch: usize,
+    resource_id: u32,
 }
 
 /// Execute every op in the batch. Never fails: unexecutable ops are skipped
@@ -79,7 +111,6 @@ pub unsafe fn execute(adapter: &AdapterContext, args: &DXGKARG_RENDERGDI) {
 
     let base = args.pCommand as *const u8;
     let total = args.CommandLength as usize;
-    let cmd_size = core::mem::size_of::<DXGK_RENDERKM_COMMAND>();
     let mut off = 0usize;
     while off + 8 <= total {
         // SAFETY: off+8 <= total; OpCode/CommandSize are the first two u32s.
@@ -89,12 +120,11 @@ pub unsafe fn execute(adapter: &AdapterContext, args: &DXGKARG_RENDERGDI) {
         if csize < 8 || off + csize > total {
             break;
         }
-        // The union member reads below need the whole struct in range.
-        if off + cmd_size <= total {
-            unsafe { dispatch(adapter, args, &mut maps, opcode, cmd) };
-        } else {
-            OPS_SKIPPED.fetch_add(1, Ordering::Relaxed);
-        }
+        // Payload bounds are validated PER UNION ARM inside dispatch (read_arm):
+        // requiring the whole DXGK_RENDERKM_COMMAND here dropped the final
+        // command of every tightly-sized batch whose arm was smaller than the
+        // largest union member (the desktop-background COLORFILL among them).
+        unsafe { dispatch(adapter, args, &mut maps, opcode, cmd, total - off) };
         off += csize;
     }
 
@@ -110,6 +140,37 @@ pub unsafe fn execute(adapter: &AdapterContext, args: &DXGKARG_RENDERGDI) {
     crate::diag::record_named_bytes(b"GdFb", SKIP_NO_BLOB.load(Ordering::Relaxed));
     crate::diag::record_named_bytes(b"GdFm", SKIP_NO_MAP.load(Ordering::Relaxed));
     crate::diag::record_named_bytes(b"GdFr", LAST_SKIP_RESID.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"GdTc", SKIP_TRUNC_CMD.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"GdDs", DEGENERATE_STRETCH.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"GdCn", BIG_FILL_COUNT.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"GdCr", BIG_FILL_RESID.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"GdCc", BIG_FILL_COLOR.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"GdCg", BIG_FILL_GEOM.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"GdBn", BIG_BLT_COUNT.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"GdBr", BIG_BLT_RESID.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"GdBg", BIG_BLT_GEOM.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"GdXn", CT_COUNT.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"GdXz", CT_ALPHA_ZERO.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"GdXr", CT_ALPHA_RESID.load(Ordering::Relaxed));
+}
+
+/// Read the command's union payload as a `T`, validating that `T` fits the
+/// bytes remaining in the batch (`avail` = buffer bytes from the command's
+/// start). `None` (counted in GdTc) means the runtime supplied fewer bytes
+/// than the arm needs — never read past the buffer on a tight final command.
+unsafe fn read_arm<T>(cmd: *const DXGK_RENDERKM_COMMAND, avail: usize) -> Option<T> {
+    // The union payload starts right after the two u32 header fields.
+    let payload_off = core::mem::offset_of!(DXGK_RENDERKM_COMMAND, Command);
+    if avail < payload_off + core::mem::size_of::<T>() {
+        SKIP_TRUNC_CMD.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    // SAFETY: avail bytes at `cmd` are within the command buffer (caller), and
+    // payload_off + size_of::<T>() <= avail was checked above. addr_of! avoids
+    // materializing a reference to the full (possibly short) struct.
+    Some(unsafe {
+        core::ptr::read_unaligned(core::ptr::addr_of!((*cmd).Command) as *const T)
+    })
 }
 
 unsafe fn dispatch(
@@ -118,31 +179,44 @@ unsafe fn dispatch(
     maps: &mut [Option<SurfMap>; MAX_MAPPINGS],
     opcode: DXGK_RENDERKM_OPERATION,
     cmd: *const DXGK_RENDERKM_COMMAND,
+    avail: usize,
 ) {
     let ok = match opcode {
         _DXGK_RENDERKM_OPERATION::DXGK_GDIOP_BITBLT => {
-            let a = unsafe { core::ptr::read_unaligned(&(*cmd).Command.BitBlt) };
-            unsafe { op_bitblt(adapter, args, maps, &a) }
+            match unsafe { read_arm::<DXGK_GDIARG_BITBLT>(cmd, avail) } {
+                Some(a) => unsafe { op_bitblt(adapter, args, maps, &a) },
+                None => false,
+            }
         }
         _DXGK_RENDERKM_OPERATION::DXGK_GDIOP_COLORFILL => {
-            let a = unsafe { core::ptr::read_unaligned(&(*cmd).Command.ColorFill) };
-            unsafe { op_colorfill(adapter, args, maps, &a) }
+            match unsafe { read_arm::<DXGK_GDIARG_COLORFILL>(cmd, avail) } {
+                Some(a) => unsafe { op_colorfill(adapter, args, maps, &a) },
+                None => false,
+            }
         }
         _DXGK_RENDERKM_OPERATION::DXGK_GDIOP_ALPHABLEND => {
-            let a = unsafe { core::ptr::read_unaligned(&(*cmd).Command.AlphaBlend) };
-            unsafe { op_alphablend(adapter, args, maps, &a) }
+            match unsafe { read_arm::<DXGK_GDIARG_ALPHABLEND>(cmd, avail) } {
+                Some(a) => unsafe { op_alphablend(adapter, args, maps, &a) },
+                None => false,
+            }
         }
         _DXGK_RENDERKM_OPERATION::DXGK_GDIOP_STRETCHBLT => {
-            let a = unsafe { core::ptr::read_unaligned(&(*cmd).Command.StretchBlt) };
-            unsafe { op_stretchblt(adapter, args, maps, &a) }
+            match unsafe { read_arm::<DXGK_GDIARG_STRETCHBLT>(cmd, avail) } {
+                Some(a) => unsafe { op_stretchblt(adapter, args, maps, &a) },
+                None => false,
+            }
         }
         _DXGK_RENDERKM_OPERATION::DXGK_GDIOP_TRANSPARENTBLT => {
-            let a = unsafe { core::ptr::read_unaligned(&(*cmd).Command.TransparentBlt) };
-            unsafe { op_transparentblt(adapter, args, maps, &a) }
+            match unsafe { read_arm::<DXGK_GDIARG_TRANSPARENTBLT>(cmd, avail) } {
+                Some(a) => unsafe { op_transparentblt(adapter, args, maps, &a) },
+                None => false,
+            }
         }
         _DXGK_RENDERKM_OPERATION::DXGK_GDIOP_CLEARTYPEBLEND => {
-            let a = unsafe { core::ptr::read_unaligned(&(*cmd).Command.ClearTypeBlend) };
-            unsafe { op_cleartypeblend(adapter, args, maps, &a) }
+            match unsafe { read_arm::<DXGK_GDIARG_CLEARTYPEBLEND>(cmd, avail) } {
+                Some(a) => unsafe { op_cleartypeblend(adapter, args, maps, &a) },
+                None => false,
+            }
         }
         // DXGK_GDIOP_ESCAPE and anything unknown: driver ignores by contract.
         _ => true,
@@ -216,6 +290,7 @@ unsafe fn surface(
         width: info.width as i32,
         height: info.height as i32,
         pitch: cross_adapter_pitch(info.width) as usize,
+        resource_id: info.resource_id,
     };
     maps[slot] = Some(SurfMap {
         resource_id: info.resource_id,
@@ -330,6 +405,18 @@ unsafe fn op_colorfill(
     };
     let bounds = surf_rect(&d);
     let color = a.Color;
+    let area = (a.DstRect.right - a.DstRect.left) as i64
+        * (a.DstRect.bottom - a.DstRect.top) as i64;
+    if area >= BIG_OP_AREA {
+        BIG_FILL_COUNT.fetch_add(1, Ordering::Relaxed);
+        BIG_FILL_RESID.store(d.resource_id, Ordering::Relaxed);
+        BIG_FILL_COLOR.store(color, Ordering::Relaxed);
+        BIG_FILL_GEOM.store(
+            (((a.DstRect.right - a.DstRect.left) as u32) << 16)
+                | ((a.DstRect.bottom - a.DstRect.top) as u32 & 0xFFFF),
+            Ordering::Relaxed,
+        );
+    }
     for_each_dst_rect(&a.DstRect, a.NumSubRects, a.pSubRects, |r| {
         let c = r.clip(&bounds);
         if c.empty() {
@@ -365,6 +452,17 @@ unsafe fn op_bitblt(
     let dp = pitch_or(&d, a.DstPitch);
     let s_bounds = surf_rect(&s);
     let d_bounds = surf_rect(&d);
+    let blt_area = (a.DstRect.right - a.DstRect.left) as i64
+        * (a.DstRect.bottom - a.DstRect.top) as i64;
+    if blt_area >= BIG_OP_AREA {
+        BIG_BLT_COUNT.fetch_add(1, Ordering::Relaxed);
+        BIG_BLT_RESID.store(d.resource_id, Ordering::Relaxed);
+        BIG_BLT_GEOM.store(
+            (((a.DstRect.right - a.DstRect.left) as u32) << 16)
+                | ((a.DstRect.bottom - a.DstRect.top) as u32 & 0xFFFF),
+            Ordering::Relaxed,
+        );
+    }
     let rop = a.Rop as i32;
     let dx0 = a.DstRect.left;
     let dy0 = a.DstRect.top;
@@ -576,7 +674,10 @@ unsafe fn op_stretchblt(
     let sw = (a.SrcRect.right - a.SrcRect.left) as i64;
     let sh = (a.SrcRect.bottom - a.SrcRect.top) as i64;
     if sw <= 0 || sh <= 0 {
-        return false;
+        // An empty source rect stretches nothing — a valid no-op, not a skip
+        // (counted separately so this path can never hide work again).
+        DEGENERATE_STRETCH.fetch_add(1, Ordering::Relaxed);
+        return true;
     }
     // Bitfield union: bit16 = MirrorX, bit17 = MirrorY (Mode occupies bits 0-15).
     let flags = unsafe { a.__bindgen_anon_1.Flags };
@@ -643,6 +744,27 @@ unsafe fn op_cleartypeblend(
     // Approximation: per-channel blend of the gamma-corrected foreground color
     // with the 32-bpp per-channel ClearType alpha surface; gamma tables ignored.
     let fg = a.Color;
+    // Diagnostic: is the glyph alpha source EMPTY? Sample the first alpha row
+    // this op reads; an all-zero row on every text op = the "glyph atlas never
+    // written" theory (text invisible everywhere while fills render).
+    CT_COUNT.fetch_add(1, Ordering::Relaxed);
+    CT_ALPHA_RESID.store(al.resource_id, Ordering::Relaxed);
+    {
+        let w = (a.DstRect.right - a.DstRect.left).max(1);
+        let ax = a.DstRect.left + a.DstToAlphaOffsetX;
+        let ay = a.DstRect.top + a.DstToAlphaOffsetY;
+        let p = row_ptr(&al, ap, ax.max(0), ay.max(0), w.min(al.width));
+        if !p.is_null() {
+            let mut acc = 0u8;
+            for i in 0..((w.min(al.width) as usize) * 4) {
+                // SAFETY: row_ptr bounds-checked w.min(al.width) pixels at p.
+                acc |= unsafe { core::ptr::read_unaligned(p.add(i)) };
+            }
+            if acc == 0 {
+                CT_ALPHA_ZERO.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
     for_each_dst_rect(&a.DstRect, a.NumSubRects, a.pSubRects, |r| {
         let c = r.clip(&d_bounds);
         if c.empty() {
