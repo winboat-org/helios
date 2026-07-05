@@ -78,6 +78,14 @@ static CT_ALPHA_RESID: AtomicU32 = AtomicU32::new(0);
 /// Threshold above which a fill/blt is "large" (the desktop plate is ~1.9M px).
 const BIG_OP_AREA: i64 = 65536;
 
+/// Batches executed (drives the deferred counter flush below).
+static BATCH_COUNT: AtomicU32 = AtomicU32::new(0);
+
+/// Registry counter flush cadence at `DiagLevel` 0 (power of two). The
+/// per-batch dump is 20 synchronous kernel registry writes on the hottest
+/// GDI path (PSC WS2); `DiagLevel >= 1` restores the per-batch flush.
+const FLUSH_EVERY: u32 = 64;
+
 /// Cap on sub-rect list length; a longer list is truncated.
 const MAX_SUBRECTS: usize = 1024;
 /// Distinct surfaces mappable per command batch.
@@ -131,6 +139,14 @@ pub unsafe fn execute(adapter: &AdapterContext, args: &DXGKARG_RENDERGDI) {
     for m in maps.iter().flatten() {
         // SAFETY: `va` came from MmMapIoSpace in `surface`; unmapped once here.
         unsafe { MmUnmapIoSpace(m.view.va as *mut c_void, m.view.len as u64) };
+    }
+    // Counters accumulate in atomics always; the registry flush (20 writes)
+    // is deferred to every 64th batch at DiagLevel 0. Failure counters still
+    // surface within FLUSH_EVERY batches — and the TDR debug report reads the
+    // atomics directly, so nothing is lost on a hang.
+    let batch = BATCH_COUNT.fetch_add(1, Ordering::Relaxed);
+    if crate::diag::level() == 0 && batch % FLUSH_EVERY != 0 {
+        return;
     }
     crate::diag::record_named_bytes(b"GdiE", OPS_EXECUTED.load(Ordering::Relaxed));
     crate::diag::record_named_bytes(b"GdiS", OPS_SKIPPED.load(Ordering::Relaxed));

@@ -25,6 +25,27 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 use wdk_sys::ntddk::RtlWriteRegistryValue;
 
+/// Cached `DiagLevel` service-key knob (u32::MAX = not read yet).
+/// Level 0 (default, PSC stage): the `S<idx>` breadcrumb ring is OFF — it is
+/// bring-up archaeology, and its steady-state writers (QueryAdapterInfo
+/// polling, paging/allocation paths) each cost a synchronous kernel registry
+/// write. Level >= 1 restores full breadcrumb tracing. Named counters
+/// (`record_named*`) are NOT gated here — their callers decide (see
+/// `gdi_blit`'s deferred flush); failure counters must stay loud.
+static DIAG_LEVEL: AtomicU32 = AtomicU32::new(u32::MAX);
+
+/// Read (once) and cache the `DiagLevel` knob. PASSIVE_LEVEL only — every
+/// legal [`record`] caller already is. Benign race on first concurrent calls.
+pub fn level() -> u32 {
+    let cached = DIAG_LEVEL.load(Ordering::Relaxed);
+    if cached != u32::MAX {
+        return cached;
+    }
+    let level = read_config_dword(b"DiagLevel", 0);
+    DIAG_LEVEL.store(level, Ordering::Relaxed);
+    level
+}
+
 /// `RTL_REGISTRY_SERVICES` — Path is relative to
 /// `\Registry\Machine\System\CurrentControlSet\Services`.
 const RTL_REGISTRY_SERVICES: u32 = 1;
@@ -140,7 +161,11 @@ pub fn read_config_dword(name: &[u8], default: u32) -> u32 {
 }
 
 /// Append one DWORD breadcrumb. Cheap and lossy by design (best-effort tracing).
+/// No-op at `DiagLevel` 0 (the default) — see [`level`].
 pub fn record(mut code: u32) {
+    if level() == 0 {
+        return;
+    }
     let idx = STEP.fetch_add(1, Ordering::Relaxed);
     if idx >= MAX_STEPS {
         return;
