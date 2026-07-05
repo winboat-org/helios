@@ -74,12 +74,19 @@ Open defects, roughly ordered:
    per-acquire re-resolve is the alias-staging refresh design, not a missing-export symptom.
    Residual noise, harmless: dwm warns `Failed to write shared resource info` 9× (dxvk shared
    metadata runs before the UMD stamps KMT handles; WINE-escape fallback fails by design).
-4. **KMD wire-fence semantics**: ring-0 used-ring returns complete WDDM DMA fences at host
-   *decode* time (virglrenderer 1.3.0: ring 0 retires immediately; ring ≥ 1 = real GPU
-   completion via vkr queue sync threads). Violates the "never signal a wire fence before host
-   completion" invariant at the dxgkrnl level. Guest already assigns per-queue ring_idx ≥ 1 +
-   `VkDeviceQueueTimelineInfoMESA`; unused on the SUBMIT_3D wire today. Also:
-   `helios_sync_append_locked(fence_id=0)` blind-signals + clears older pendings (latent).
+4. **KMD wire-fence semantics** (now also the GHOSTING architectural fix): ring-0 used-ring
+   returns complete WDDM DMA fences at host *decode* time (virglrenderer 1.3.0: ring 0
+   retires immediately; ring ≥ 1 = real GPU completion via vkr queue sync threads). Violates
+   the "never signal a wire fence before host completion" invariant at the dxgkrnl level.
+   18th-session scoping: the ICD ALREADY puts `ring_idx` in the SUBMIT_VENUS escape header
+   (`helios_ioctl_submit_cs`, vn_renderer_helios.c:1092), and vn queues carry ring_idx ≥ 1 —
+   but with semaphore/fence FEEDBACK active (the default) vn never submits per-queue-fence
+   batches, so everything on the wire is ring-0 ring-notify traffic (the 0/251,810 stat).
+   Work: KMD honors hdr.ring_idx (VIRTIO_GPU_FLAG_INFO_RING_IDX + per-ring in-flight fence
+   table), then cross-process present→IDD ordering via win32-sync external semaphores riding
+   ring≥1 wire fences (replaces the interim present gate, moves the wait to the consumer,
+   GPU-side). Also: `helios_sync_append_locked(fence_id=0)` blind-signals + clears older
+   pendings (latent).
 5. **dxgkrnl "Driver returned an invalid NTSTATUS 0xC00000BB"** (ETW
    AzureTriage) — some query answered STATUS_NOT_SUPPORTED where that return
    is illegal. Tolerated today; find and fix the query.
@@ -103,17 +110,28 @@ Open defects, roughly ordered:
 
 ## Workstream 2 — Performance
 
-- **Per-present full-GPU drain — FIXED (18th session, `3579ef7`):**
+- **Per-present full-GPU drain — FIXED (18th session, `3579ef7` + `ef6689b`):**
   `rotate_resource_backings` drained the whole device (event query + `Sleep(1)` spin —
   the timer quantization WAS the 15–25 ms) on dwm's present thread every present. Now a
-  CS-side identity rotation mirroring upstream `D3D11SwapChain::RotateBackBuffers`
-  (`SynchronizeCsThread` to dispatch the open chunk, then injected
-  `DxvkContext::invalidateImage` swap — CPU-only ordering, zero GPU sync). Before/after via
-  the same `rotate-perf` key: 15–25 ms avg → **max <1 ms steady state** (occasional
-  100 µs-class avgs); presents now track damage rate (~10/s under the 10 Hz flasher, was
-  ~6/s). WARNING for future work: do NOT per-image `waitForResource` on the present
-  thread — a bound backbuffer RTV is re-recorded into every new open cmdlist, so
-  `isInUse` never clears and dwm wedges (proven with a live minidump).
+  CS-side identity rotation mirroring upstream `D3D11SwapChain::RotateBackBuffers` via
+  `InjectCsOrderedAfterPending` (dispatch open chunk + ordered inject, NO CS-thread wait —
+  the first iteration's `SynchronizeCsThread` blocked up to **1.9 s/present** behind login-
+  churn CS backlogs = the post-cold-boot "occasional framerate dips"). `rotate-perf` after:
+  **1–4 µs/rotation**; presents track damage rate (~10/s under the 10 Hz flasher, was ~6/s).
+  WARNING for future work: do NOT per-image `waitForResource` on the present thread — a
+  bound backbuffer RTV is re-recorded into every new open cmdlist, so `isInUse` never
+  clears and dwm wedges (proven with a live minidump).
+- **Ghosting after the drain removal — GATED (18th session cont., `4f0a96c`):** the drain
+  had been accidentally serializing dwm's GPU work against the IddCx consumer's per-acquire
+  copy; with it gone, the copy occasionally read a just-presented buffer whose GPU writes
+  were in flight (dwm's venus rendering produces NO dxgkrnl-visible DMA fences — nothing
+  else orders the cross-process read). Fix: bounded frame-completion gate in the DXGI
+  present DDI (`HeliosWaitFrameComplete`: flush, then poll the submission fence — signals
+  at GPU completion) before `pfnPresentCb` makes the flip visible.
+  `HKLM\SOFTWARE\Helios!PresentGateUs` (default 32000; 0 = off, the A/B lever). Measured:
+  avg 3.6–5.3 ms, timeouts only during startup churn, present rate unaffected
+  (`present-gate:` telemetry, 1 line/128). The ARCHITECTURAL fix stays WS1 #4: per-ring
+  wire fences + cross-process win32-sync so the consumer waits GPU-side.
 - **Release-profile UMD deployed (18th session, `32cf4a4`):** dev profile was opt-level 1;
   deploys now build `--release` (opt 2 + thin LTO, `debug="full"` keeps the GUID-matched
   PDB for minidump symbolization). Deploy with
