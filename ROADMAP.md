@@ -96,11 +96,11 @@ Open defects, roughly ordered:
    reboot is expected, but keep the version-coherence gotcha (three sites) and
    backup ladder in mind. 2026-07-06 state: ACTIVE driver = **oem58.inf = 22.22.51
    (pkg c393e58c1b189688)**; `UserModeDriverName` → ProgramData
-   `helios_umd_1b4e26b65f718522.dll` (RELEASE profile, CS-side rotation + log fixes);
-   the DriverStore UMD copy in c393e58c is stale/lock-protected — do not trust
-   DriverStore file timestamps as "deployed" evidence; check the loaded-module path of a
-   fresh dwm instead. Active ICD = `vulkan_virtio-7c94d802f270.dll` (strike attribution +
-   pending-window deadline fix, mesa f7a816f182f).
+   `helios_umd_b3615be0ce9de13e.dll` (RELEASE profile: no-wait CS rotation + present
+   gate + log fixes; DriverStore copy synced this time, but still verify deploys by the
+   loaded-module path of a fresh dwm, not file timestamps). Active ICD =
+   `vulkan_virtio-7c94d802f270.dll` (strike attribution + pending-window deadline fix,
+   mesa f7a816f182f).
 8. **Mechanism question (understand before optimizing)**: post-cold-boot, GDI
    content renders while RenderGdi (GdiE), MapCpuHostAperture (ChMn) and
    paging (Pg*) counters all stay idle, yet 8 standard allocations sit in
