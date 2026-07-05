@@ -37,6 +37,7 @@ use crate::ddi;
 use crate::device_funcs::HeliosDevice;
 use crate::log_line;
 use crate::present_gate_us;
+use crate::present_sync_publish_enabled;
 use crate::trace_line;
 
 type Hdevice = ddi::D3D10DDI_HDEVICE;
@@ -361,6 +362,20 @@ unsafe fn load_resource(handle_priv: *mut c_void) -> Option<ManuallyDrop<ID3D11R
     Some(ManuallyDrop::new(ID3D11Resource::from_raw(
         (*state).com_raw as *mut c_void,
     )))
+}
+
+/// Raw ID3D11Resource COM pointer behind a DDI resource private handle
+/// (0 when absent) — for bridge calls that inspect the DXVK image without
+/// taking a COM reference.
+unsafe fn resource_com_raw(handle_priv: *mut c_void) -> usize {
+    if handle_priv.is_null() {
+        return 0;
+    }
+    let state = *(handle_priv as *const *mut ResourceState);
+    if state.is_null() {
+        return 0;
+    }
+    (*state).com_raw
 }
 
 unsafe fn resource_allocation(handle_priv: *mut c_void) -> ddi::D3DKMT_HANDLE {
@@ -5416,6 +5431,7 @@ unsafe extern "C" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT) -> i32 {
     let dst_alloc = resource_allocation(dst_h.pDrvPrivate);
     let mut copied = false;
     let mut present_hr = 0;
+    let mut sync_value: u64 = 0;
 
     if let Some(context) = &context {
         if let (Some(dst), Some(src)) = (
@@ -5424,6 +5440,18 @@ unsafe extern "C" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT) -> i32 {
         ) {
             context.CopySubresourceRegion(&*dst, 0, 0, 0, 0, &*src, 0, None);
             copied = true;
+        }
+        // WS1 #4 producer: record the named-present-fence signal BEFORE the
+        // flush so it submits WITH the frame's last work, and publish
+        // (resid -> pid, value) for the IddCx consumer's bounded wait.
+        // `HKLM\SOFTWARE\Helios!PresentSyncPublish = 0` kills the path.
+        if present_sync_publish_enabled() {
+            if let Some(dev) = helios_device(h) {
+                sync_value = dev.dxvk.present_sync_publish(
+                    resource_com_raw(src_h.pDrvPrivate),
+                    resource_com_raw(dst_h.pDrvPrivate),
+                );
+            }
         }
         context.Flush();
     }
@@ -5477,7 +5505,8 @@ unsafe extern "C" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT) -> i32 {
     let ordinal = PRESENT_ORDINAL.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     trace_line!(
         "DXGI Present: #{} src=0x{:x} dst=0x{:x} copied={} flags=0x{:x} presentCb=0x{:08x} \
-         hSurf={:p} srcSub={} hDstRes={:p} dstSub={} flipInterval={} dxgiCtx={:p} hContext={:p}",
+         hSurf={:p} srcSub={} hDstRes={:p} dstSub={} flipInterval={} dxgiCtx={:p} hContext={:p} \
+         syncVal={}",
         ordinal,
         src_alloc,
         dst_alloc,
@@ -5490,7 +5519,8 @@ unsafe extern "C" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT) -> i32 {
         a.DstSubResourceIndex,
         a.FlipInterval,
         a.pDXGIContext,
-        dev_context_for_log(h)
+        dev_context_for_log(h),
+        sync_value
     );
     present_hr
 }

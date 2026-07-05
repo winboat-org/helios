@@ -95,6 +95,17 @@ pub mod ffi {
         /// IddCx consumer never copies a buffer whose writes are in flight.
         /// Returns false on timeout (caller proceeds — bounded by design).
         unsafe fn present_frame_gate(self: &HeliosDxvkDevice, timeout_us: u32) -> bool;
+        /// WS1 #4 producer: record a named-present-fence signal on the
+        /// frame's open command list (submits with the caller's following
+        /// Flush; retires at host GPU completion) and publish
+        /// (resid -> pid, value) for the presented resources. NO wait on the
+        /// present thread. Returns the published value, or 0 when the path
+        /// is unavailable (caller keeps relying on the present gate).
+        unsafe fn present_sync_publish(
+            self: &HeliosDxvkDevice,
+            src_resource_ptr: usize,
+            dst_resource_ptr: usize,
+        ) -> u64;
         unsafe fn create_geometry_shader(
             self: &HeliosDxvkDevice,
             code: *const u8,

@@ -8,6 +8,7 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include <sddl.h>
 
 #include <cstdio>
 #include <cstdlib>
@@ -20,6 +21,7 @@
 #include <array>
 #include <atomic>
 #include <cstring>
+#include <mutex>
 #include <d3d11.h>
 #include <dxgi.h>
 #include <fstream>
@@ -30,6 +32,8 @@
 #include "dxvk_instance.h"
 #include "dxvk_adapter.h"
 #include "dxvk_device.h"
+#include "dxvk_fence.h"
+#include "dxvk_helios_present_sync.h"
 #include "../src/util/util_error.h"
 #include "dxbc/dxbc_container.h"
 
@@ -622,6 +626,14 @@ struct HeliosDxvkDeviceImpl {
   ID3D11DeviceContext* context = nullptr; // immediate context
   std::uint32_t venus_ctx_id = 0;
 
+  // WS1 #4 producer state (present_sync_publish). The named fence is
+  // device-wide: all presents ride one VkQueue, so a single monotonic
+  // counter orders every published (resid, value) pair correctly.
+  dxvk::Rc<dxvk::DxvkFence> presentFence;
+  std::uint64_t presentValue = 0;
+  bool presentSyncDisabled = false;
+  std::mutex presentSyncMutex;
+
   ~HeliosDxvkDeviceImpl() {
     if (context) context->Release();
     if (d3d11) d3d11->Release();
@@ -1185,6 +1197,113 @@ bool HeliosDxvkDevice::present_frame_gate(std::uint32_t timeout_us) const {
     umd_log("unknown exception in present_frame_gate");
   }
   return false;
+}
+
+std::uint64_t HeliosDxvkDevice::present_sync_publish(
+    std::size_t src_resource_ptr,
+    std::size_t dst_resource_ptr) const {
+  if (!impl || !impl->device.ptr() || !impl->context)
+    return 0;
+
+  try {
+    // Venus resource ids of the presented surfaces. The src is the flip
+    // buffer the IddCx consumer imports; a copy-model dst (when distinct)
+    // is published too — both become GPU-final at this frame's completion.
+    const auto residOf = [] (std::size_t ptr) -> std::uint32_t {
+      if (!ptr)
+        return 0u;
+      auto* texture = dxvk::GetCommonTexture(reinterpret_cast<ID3D11Resource*>(ptr));
+      if (!texture || texture->GetImage() == nullptr)
+        return 0u;
+      return texture->GetImage()->info().sharing.heliosResourceId;
+    };
+
+    const std::uint32_t residSrc = residOf(src_resource_ptr);
+    const std::uint32_t residDst = residOf(dst_resource_ptr);
+
+    if (!residSrc && !residDst) {
+      static std::atomic<std::uint32_t> s_noResid{0};
+      const std::uint32_t n = s_noResid.fetch_add(1, std::memory_order_relaxed) + 1;
+      if (n == 1 || (n % 512u) == 0)
+        umd_log("present_sync_publish: presented resources carry no venus resid");
+      return 0;
+    }
+
+    std::uint64_t value;
+    dxvk::Rc<dxvk::DxvkFence> fence;
+
+    {
+      std::lock_guard<std::mutex> lock(impl->presentSyncMutex);
+
+      if (impl->presentSyncDisabled)
+        return 0;
+
+      if (impl->presentFence == nullptr) {
+        // Named so the consumer can import without any handle traveling;
+        // Global\ so a session-0 consumer resolves it (dwm holds
+        // SeCreateGlobalPrivilege — verified on its live token). The DACL
+        // grants Everyone access: WUDFHost runs as another principal, and
+        // the object is a presentation-pacing hint — worst-case abuse is a
+        // mis-paced copy, which the consumer bounds anyway.
+        const std::wstring name = L"Global\\HeliosPresentFence_"
+                                + std::to_wstring(GetCurrentProcessId());
+
+        SECURITY_ATTRIBUTES sa = { };
+        sa.nLength = sizeof(sa);
+        PSECURITY_DESCRIPTOR sd = nullptr;
+        if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
+              L"D:(A;;GA;;;WD)", SDDL_REVISION_1, &sd, nullptr)) {
+          impl->presentSyncDisabled = true;
+          umd_log("present_sync_publish: DACL build FAILED — path disabled");
+          return 0;
+        }
+        sa.lpSecurityDescriptor = sd;
+
+        try {
+          dxvk::DxvkFenceCreateInfo fenceInfo = { };
+          fenceInfo.initialValue = 0;
+          fenceInfo.sharedType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT;
+          fenceInfo.ntExportName = name.c_str();
+          fenceInfo.ntSecurityAttributes = &sa;
+          impl->presentFence = impl->device->createFence(fenceInfo);
+        } catch (const dxvk::DxvkError& e) {
+          LocalFree(sd);
+          impl->presentSyncDisabled = true;
+          umd_log(("present_sync_publish: named fence creation FAILED — "
+                   "path disabled (gate stays): " + e.message()).c_str());
+          return 0;
+        }
+        LocalFree(sd);
+        umd_log("present_sync_publish: named present fence created "
+                "(Global\\HeliosPresentFence_<pid>)");
+      }
+
+      value = ++impl->presentValue;
+      fence = impl->presentFence;
+    }
+
+    // The signal rides the OPEN command list: it submits with the frame's
+    // pending work under the caller's following Flush, and the ICD retires
+    // it at host GPU completion (ring>=1 wire fence + retire thread).
+    static_cast<dxvk::D3D11ImmediateContext*>(impl->context)
+      ->HeliosSignalPresentFence(fence, value);
+
+    const std::uint32_t pid = GetCurrentProcessId();
+    bool published = false;
+    if (residSrc)
+      published |= dxvk::HeliosPresentSync::publish(residSrc, pid, value);
+    if (residDst && residDst != residSrc)
+      published |= dxvk::HeliosPresentSync::publish(residDst, pid, value);
+
+    return published ? value : 0;
+  } catch (const dxvk::DxvkError& e) {
+    umd_log(("present_sync_publish DxvkError: " + e.message()).c_str());
+  } catch (const std::exception& e) {
+    umd_log(e.what());
+  } catch (...) {
+    umd_log("unknown exception in present_sync_publish");
+  }
+  return 0;
 }
 
 std::size_t HeliosDxvkDevice::create_hull_shader(const std::uint8_t* code, std::size_t len) const {

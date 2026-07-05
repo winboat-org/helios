@@ -88,6 +88,22 @@ struct HeliosDxvkDevice {
   // D3D11ImmediateContext::HeliosWaitFrameComplete). Returns true when the
   // frame completed within the timeout, false on timeout/error.
   bool present_frame_gate(std::uint32_t timeout_us) const;
+
+  // WS1 #4 producer: lazily create the device-wide NAMED present fence
+  // (Global\HeliosPresentFence_<pid>, permissive DACL — the IddCx consumer
+  // runs as another principal), record a signal of value = ++present counter
+  // on the frame's OPEN command list (rides the caller's following Flush;
+  // the ICD retires it at host GPU completion), and publish
+  // (resid -> pid, value) for the presented src/dst resources in the shared
+  // present-sync table. NO wait happens on the present thread.
+  // Returns the published value, or 0 when unavailable (no venus resid on
+  // the resources, table unavailable, or named-fence creation failed —
+  // failure disables the path loudly and permanently for this device, and
+  // the caller keeps using the bounded present gate instead).
+  std::uint64_t present_sync_publish(
+      std::size_t src_resource_ptr,
+      std::size_t dst_resource_ptr) const;
+
   std::size_t create_hull_shader(const std::uint8_t* code, std::size_t len) const;
   std::size_t create_domain_shader(const std::uint8_t* code, std::size_t len) const;
   std::size_t create_compute_shader(const std::uint8_t* code, std::size_t len) const;

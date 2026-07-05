@@ -925,6 +925,47 @@ pub(crate) fn present_gate_us() -> u32 {
     })
 }
 
+/// WS1 #4 producer kill-switch: `HKLM\SOFTWARE\Helios!PresentSyncPublish`
+/// (REG_DWORD). Read once per process. Absent = 1 (publish the per-present
+/// named-fence signal + (resid, pid, value) slots); 0 disables the new path
+/// entirely, leaving only the bounded `PresentGateUs` gate — the stability
+/// rollback lever while the consumer-side wait soaks.
+pub(crate) fn present_sync_publish_enabled() -> bool {
+    use std::sync::OnceLock;
+    static VALUE: OnceLock<bool> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        #[link(name = "advapi32")]
+        unsafe extern "system" {
+            fn RegGetValueA(
+                hkey: usize,
+                sub_key: *const u8,
+                value: *const u8,
+                flags: u32,
+                type_out: *mut u32,
+                data: *mut c_void,
+                data_len: *mut u32,
+            ) -> i32;
+        }
+        const HKEY_LOCAL_MACHINE: usize = 0x8000_0002;
+        const RRF_RT_REG_DWORD: u32 = 0x10;
+        let mut value: u32 = 0;
+        let mut len: u32 = 4;
+        // SAFETY: NUL-terminated key/value names; `value`/`len` outlive the call.
+        let rc = unsafe {
+            RegGetValueA(
+                HKEY_LOCAL_MACHINE,
+                c"SOFTWARE\\Helios".as_ptr().cast(),
+                c"PresentSyncPublish".as_ptr().cast(),
+                RRF_RT_REG_DWORD,
+                core::ptr::null_mut(),
+                (&mut value as *mut u32).cast(),
+                &mut len,
+            )
+        };
+        if rc == 0 { value != 0 } else { true }
+    })
+}
+
 /// Per-frame/per-op trace logging, gated by [`trace_enabled`]. The format
 /// arguments are not evaluated when tracing is off.
 macro_rules! trace_line {
