@@ -631,6 +631,7 @@ struct HeliosDxvkDeviceImpl {
   // counter orders every published (resid, value) pair correctly.
   dxvk::Rc<dxvk::DxvkFence> presentFence;
   std::uint64_t presentValue = 0;
+  std::uint32_t presentFenceId = 0; // process-unique name discriminator
   bool presentSyncDisabled = false;
   std::mutex presentSyncMutex;
 
@@ -1209,13 +1210,22 @@ std::uint64_t HeliosDxvkDevice::present_sync_publish(
     // Venus resource ids of the presented surfaces. The src is the flip
     // buffer the IddCx consumer imports; a copy-model dst (when distinct)
     // is published too — both become GPU-final at this frame's completion.
+    // The resid is resolved from the image's CURRENT storage memory (the
+    // ICD's per-VkDeviceMemory id) — sharing.heliosResourceId is only
+    // stamped on the IMPORT side, and identity rotation moves storages
+    // between textures, so a per-texture cache would go stale.
     const auto residOf = [] (std::size_t ptr) -> std::uint32_t {
       if (!ptr)
         return 0u;
       auto* texture = dxvk::GetCommonTexture(reinterpret_cast<ID3D11Resource*>(ptr));
-      if (!texture || texture->GetImage() == nullptr)
+      if (!texture || texture->GetImage() == nullptr
+       || texture->GetImage()->storage() == nullptr)
         return 0u;
-      return texture->GetImage()->info().sharing.heliosResourceId;
+      const auto& image = texture->GetImage();
+      if (const std::uint32_t resid = image->info().sharing.heliosResourceId)
+        return resid;
+      const auto memInfo = image->storage()->getMemoryInfo();
+      return venus_memory_resource_id_from_handle(memInfo.memory);
     };
 
     const std::uint32_t residSrc = residOf(src_resource_ptr);
@@ -1245,8 +1255,15 @@ std::uint64_t HeliosDxvkDevice::present_sync_publish(
         // grants Everyone access: WUDFHost runs as another principal, and
         // the object is a presentation-pacing hint — worst-case abuse is a
         // mis-paced copy, which the consumer bounds anyway.
+        // The fence id makes the name unique across the SEVERAL D3D11
+        // devices one process creates (dwm has multiple; a per-pid-only
+        // name collides — proven live: the second device's create failed).
+        static std::atomic<std::uint32_t> s_presentFenceIds{0};
+        impl->presentFenceId =
+          s_presentFenceIds.fetch_add(1, std::memory_order_relaxed) + 1;
         const std::wstring name = L"Global\\HeliosPresentFence_"
-                                + std::to_wstring(GetCurrentProcessId());
+                                + std::to_wstring(GetCurrentProcessId())
+                                + L"_" + std::to_wstring(impl->presentFenceId);
 
         SECURITY_ATTRIBUTES sa = { };
         sa.nLength = sizeof(sa);
@@ -1274,8 +1291,11 @@ std::uint64_t HeliosDxvkDevice::present_sync_publish(
           return 0;
         }
         LocalFree(sd);
-        umd_log("present_sync_publish: named present fence created "
-                "(Global\\HeliosPresentFence_<pid>)");
+        char created[96];
+        std::snprintf(created, sizeof(created),
+          "present_sync_publish: named present fence %u created",
+          impl->presentFenceId);
+        umd_log(created);
       }
 
       value = ++impl->presentValue;
@@ -1289,11 +1309,12 @@ std::uint64_t HeliosDxvkDevice::present_sync_publish(
       ->HeliosSignalPresentFence(fence, value);
 
     const std::uint32_t pid = GetCurrentProcessId();
+    const std::uint32_t fenceId = impl->presentFenceId;
     bool published = false;
     if (residSrc)
-      published |= dxvk::HeliosPresentSync::publish(residSrc, pid, value);
+      published |= dxvk::HeliosPresentSync::publish(residSrc, pid, fenceId, value);
     if (residDst && residDst != residSrc)
-      published |= dxvk::HeliosPresentSync::publish(residDst, pid, value);
+      published |= dxvk::HeliosPresentSync::publish(residDst, pid, fenceId, value);
 
     return published ? value : 0;
   } catch (const dxvk::DxvkError& e) {
