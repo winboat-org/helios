@@ -50,10 +50,26 @@ static double qpc_ms(LARGE_INTEGER a, LARGE_INTEGER b, LARGE_INTEGER f)
     }                                                                        \
   } while (0)
 
-int main()
+int main(int argc, char **argv)
 {
   LARGE_INTEGER freq;
   QueryPerformanceFrequency(&freq);
+
+  // "named" arg (or HELIOS_PROBE_NAMED env) exercises the NAMED NT flavor:
+  // sem1 is exported under a Global\ kernel object name
+  // (VkExportSemaphoreWin32HandleInfoKHR::name) and sem2 imports it BY NAME
+  // with a null handle — the exact WS1 #4 production rendezvous (dwm
+  // publishes (resid, pid, value); the IDD-side consumer derives the name and
+  // never touches a handle). KMT/global-DWORD sharing is impossible for
+  // monitored fences (dxgkrnl 0xc000000d), hence names. Default stays the
+  // plain NT-handle chain.
+  const bool use_named =
+    (argc > 1 && strcmp(argv[1], "named") == 0) || getenv("HELIOS_PROBE_NAMED");
+  const VkExternalSemaphoreHandleTypeFlagBits handle_type =
+    VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT;
+  static const wchar_t probe_sem_name[] = L"Global\\HeliosRingProbeFence";
+  printf("mode: %s\n", use_named ? "OPAQUE_WIN32 NAMED (Global\\HeliosRingProbeFence)"
+                                 : "OPAQUE_WIN32 (NT handle)");
 
   VkApplicationInfo app = { VK_STRUCTURE_TYPE_APPLICATION_INFO };
   app.pApplicationName = "vk_ring_fence_probe";
@@ -86,10 +102,10 @@ int main()
     VkSemaphoreTypeCreateInfo tci = { VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO };
     tci.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
     VkPhysicalDeviceExternalSemaphoreInfo esi = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_SEMAPHORE_INFO, &tci };
-    esi.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT;
+    esi.handleType = handle_type;
     VkExternalSemaphoreProperties esp = { VK_STRUCTURE_TYPE_EXTERNAL_SEMAPHORE_PROPERTIES };
     vkGetPhysicalDeviceExternalSemaphoreProperties(pd, &esi, &esp);
-    printf("timeline OPAQUE_WIN32 features=0x%x\n", esp.externalSemaphoreFeatures);
+    printf("timeline external features=0x%x\n", esp.externalSemaphoreFeatures);
     if (!(esp.externalSemaphoreFeatures & VK_EXTERNAL_SEMAPHORE_FEATURE_EXPORTABLE_BIT)) {
       printf("FAIL timeline semaphore not exportable\n");
       return 1;
@@ -228,27 +244,36 @@ int main()
   VkSemaphoreTypeCreateInfo tci = { VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO };
   tci.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
   tci.initialValue = 0;
-  VkExportSemaphoreCreateInfo esci = { VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO, &tci };
-  esci.handleTypes = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT;
+  VkExportSemaphoreWin32HandleInfoKHR eswi = { VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_WIN32_HANDLE_INFO_KHR, &tci };
+  eswi.name = use_named ? probe_sem_name : NULL;
+  VkExportSemaphoreCreateInfo esci = { VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO };
+  esci.pNext = use_named ? (const void *)&eswi : (const void *)&tci;
+  esci.handleTypes = handle_type;
   VkSemaphoreCreateInfo sci = { VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, &esci };
   VkSemaphore sem1;
   CHECK(vkCreateSemaphore(dev, &sci, NULL, &sem1));
 
-  VkSemaphoreGetWin32HandleInfoKHR ghi = { VK_STRUCTURE_TYPE_SEMAPHORE_GET_WIN32_HANDLE_INFO_KHR };
-  ghi.semaphore = sem1;
-  ghi.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT;
   HANDLE h = NULL;
-  CHECK(pGetSemWin32(dev, &ghi, &h));
-  printf("exported sem1 NT handle %p\n", h);
+  if (!use_named) {
+    VkSemaphoreGetWin32HandleInfoKHR ghi = { VK_STRUCTURE_TYPE_SEMAPHORE_GET_WIN32_HANDLE_INFO_KHR };
+    ghi.semaphore = sem1;
+    ghi.handleType = handle_type;
+    CHECK(pGetSemWin32(dev, &ghi, &h));
+    printf("exported sem1 NT handle %p\n", h);
+  } else {
+    printf("exported sem1 under kernel name Global\\HeliosRingProbeFence\n");
+  }
 
   VkSemaphoreTypeCreateInfo tci2 = tci;
+  tci2.pNext = NULL;
   VkSemaphoreCreateInfo sci2 = { VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, &tci2 };
   VkSemaphore sem2;
   CHECK(vkCreateSemaphore(dev, &sci2, NULL, &sem2));
   VkImportSemaphoreWin32HandleInfoKHR ihi = { VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_WIN32_HANDLE_INFO_KHR };
   ihi.semaphore = sem2;
-  ihi.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT;
-  ihi.handle = h; // ownership passes to the driver
+  ihi.handleType = handle_type;
+  ihi.handle = use_named ? NULL : h; // NT: ownership passes to the driver
+  ihi.name = use_named ? probe_sem_name : NULL;
   CHECK(pImportSemWin32(dev, &ihi));
   printf("imported as sem2 (consumer path: helios_wait -> WDDM monitored fence)\n");
 
