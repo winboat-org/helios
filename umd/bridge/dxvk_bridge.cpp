@@ -38,6 +38,7 @@
 // to ID3D11Device / ID3D11DeviceContext.
 #include "d3d11_device.h"
 #include "d3d11_texture.h"
+#include "d3d11_context_imm.h"
 
 namespace dxbc_spv::dxbc {
   util::md5::Digest hashDxbcBinary(const void* data, size_t size);
@@ -976,8 +977,9 @@ bool HeliosDxvkDevice::rotate_resource_backings(
   try {
     // Collect the DXVK images first; refuse the whole rotation if any entry
     // is not a storage-backed texture (a partial rotation would corrupt the
-    // swapchain identity mapping).
-    std::vector<dxvk::DxvkImage*> images;
+    // swapchain identity mapping). Rc refs: the swap executes later on the
+    // CS thread and must not race resource destruction.
+    std::vector<dxvk::Rc<dxvk::DxvkImage>> images;
     images.reserve(count);
     for (std::size_t i = 0; i < count; ++i) {
       auto* resource = reinterpret_cast<ID3D11Resource*>(d3d11_resource_ptrs[i]);
@@ -986,57 +988,49 @@ bool HeliosDxvkDevice::rotate_resource_backings(
         umd_log("rotate_resource_backings: entry without image storage");
         return false;
       }
-      images.push_back(texture->GetImage().ptr());
+      images.push_back(texture->GetImage());
     }
 
-    // Full device sync: the storages must not be referenced by in-flight CS
-    // or GPU work while they move between images. Presents on this stack are
-    // low-rate during bring-up; revisit with the C3 async-fence work.
-    //
-    // The wait MUST be bounded: this runs on dwm's present thread inside a
-    // runtime DDI, and a query that never signals (renderer context killed
-    // host-side, e.g. Xid 109) otherwise wedges composition process-wide
-    // (observed 2026-07-03: 80+ minutes at 100% of a core).
-    D3D11_QUERY_DESC qd = { D3D11_QUERY_EVENT, 0 };
-    ID3D11Query* query = nullptr;
-    if (FAILED(impl->d3d11->CreateQuery(&qd, &query)) || !query) {
-      umd_log("rotate_resource_backings: event query creation failed");
-      return false;
-    }
+    // CS-side identity rotation (18th session), mirroring upstream
+    // D3D11SwapChain::RotateBackBuffers: swap the storages ON the CS thread
+    // via DxvkContext::invalidateImage. No GPU drain is needed — every
+    // already-recorded command holds its own storage ref and keeps targeting
+    // the pre-rotation memory; the swap applies in CS order for everything
+    // recorded after this DDI. The two rejected designs, for the record:
+    //  - whole-device event-query drain (bring-up shim): 15-25 ms per
+    //    present, dominated by Sleep(1) timer quantization;
+    //  - per-image waitForResource on the present thread: WEDGES dwm — the
+    //    bound backbuffer RTV is re-recorded into every new open cmdlist, so
+    //    isInUse(Read) never clears for a bound render target (proven live
+    //    with a dwm minidump, thread 1 parked in synchronizeUntil).
     LARGE_INTEGER qpcFreq, qpcT0;
     QueryPerformanceFrequency(&qpcFreq);
     QueryPerformanceCounter(&qpcT0);
-    impl->context->End(query);
-    impl->context->Flush();
-    constexpr ULONGLONG kSyncDeadlineMs = 30000;
-    const ULONGLONG syncStart = GetTickCount64();
-    HRESULT syncHr;
-    for (uint32_t spin = 0; (syncHr = impl->context->GetData(query, nullptr, 0, 0)) == S_FALSE; ++spin) {
-      if ((spin & 0xff) == 0xff) {
-        HRESULT removed = impl->d3d11->GetDeviceRemovedReason();
-        if (FAILED(removed)) {
-          umd_log("rotate_resource_backings: device removed during sync, skipping rotation");
-          query->Release();
-          return false;
-        }
-        if (GetTickCount64() - syncStart >= kSyncDeadlineMs) {
-          umd_log("rotate_resource_backings: sync deadline exceeded (device wedged?), skipping rotation");
-          query->Release();
-          return false;
-        }
-      }
-      // stay hot briefly for the common sub-millisecond completion, then
-      // yield the core so a slow/dead GPU does not peg the present thread
-      ::Sleep(spin < 1024 ? 0 : 1);
-    }
-    query->Release();
-    if (syncHr != S_OK) {
-      umd_log("rotate_resource_backings: event query GetData failed, skipping rotation");
-      return false;
-    }
 
-    // Drain-cost telemetry (measure-first, PSC WS2): the full-device drain
-    // above is the prime frame-rate suspect. One log line per 32 rotations.
+    // Dispatch the current recording chunk to the CS queue first: InjectCs
+    // bypasses the open chunk, and the swap must order AFTER commands
+    // recorded before this DDI. The wait is CPU-only (CS drain), not a GPU
+    // sync.
+    auto* immediateContext = static_cast<dxvk::D3D11ImmediateContext*>(impl->context);
+    immediateContext->SynchronizeCsThread(dxvk::DxvkCsThread::SynchronizeAll);
+
+    immediateContext->InjectCs(dxvk::DxvkCsQueue::Ordered, [
+      cImages = std::move(images)
+    ] (dxvk::DxvkContext* ctx) {
+      auto first = cImages[0]->storage();
+
+      for (std::size_t i = 0; i + 1 < cImages.size(); ++i) {
+        ctx->invalidateImage(cImages[i], cImages[i + 1]->storage(),
+          cImages[i + 1]->info().layout);
+      }
+
+      ctx->invalidateImage(cImages[cImages.size() - 1u],
+        std::move(first), cImages[0]->info().layout);
+    });
+
+    // Drain-cost telemetry (measure-first, PSC WS2): same key and format as
+    // the old whole-device drain so before/after numbers compare directly.
+    // One log line per 32 rotations.
     {
       LARGE_INTEGER qpcT1;
       QueryPerformanceCounter(&qpcT1);
@@ -1064,11 +1058,11 @@ bool HeliosDxvkDevice::rotate_resource_backings(
       }
     }
 
-    // Debug instrument (registry-gated, off by default): sample the surface
-    // that was JUST presented (resource[0], pre-rotation) while the device is
-    // fully idle — write-side ground truth for "does the composed frame carry
-    // pixels". HKLM\SOFTWARE\Helios!RotateSample (DWORD) = sample every Nth
-    // rotation.
+    // Debug instrument (registry-gated, off by default): sample the ring
+    // buffers — write-side ground truth for "does the composed frame carry
+    // pixels". Records after the injected swap, so slots are POST-rotation
+    // identities. HKLM\SOFTWARE\Helios!RotateSample (DWORD) = sample every
+    // Nth rotation.
     static std::atomic<std::uint32_t> s_sampleEvery{~0u};
     static std::atomic<std::uint32_t> s_rotateCount{0};
     std::uint32_t sampleEvery = s_sampleEvery.load(std::memory_order_relaxed);
@@ -1130,13 +1124,8 @@ bool HeliosDxvkDevice::rotate_resource_backings(
       }
     }
 
-    // resource[i] takes resource[i+1]'s storage; the last takes the first's.
-    std::vector<dxvk::Rc<dxvk::DxvkResourceAllocation>> storages;
-    storages.reserve(count);
-    for (std::size_t i = 0; i < count; ++i)
-      storages.push_back(images[i]->storage());
-    for (std::size_t i = 0; i < count; ++i)
-      images[i]->assignStorage(std::move(storages[(i + 1) % count]));
+    // The storage swap itself (resource[i] takes resource[i+1]'s, the last
+    // takes the first's) executes in the injected CS command above.
     return true;
   } catch (const dxvk::DxvkError& e) {
     umd_log(("rotate_resource_backings DxvkError: " + e.message()).c_str());
