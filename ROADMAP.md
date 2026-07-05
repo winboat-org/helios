@@ -19,34 +19,49 @@ in `NTOSEYE.md` and `BRINGUP_QUIRKS.md`.*
 - Doom 2016 previously verified 120+ fps through venus on the NVIDIA host
   (offscreen path; pre-WDDM-desktop milestone).
 
-## Workstream 1 — Stability (NEXT SESSION'S FOCUS)
+## Workstream 1 — Stability
+
+**IDD frame freeze: DIAGNOSED 2026-07-05 (17th session), live on the frozen boot** — full chain
+in memory `idd-freeze-root-cause-chain`. Summary: (1) routine multi-second completion stalls
+(per-present full-GPU drain in `rotate_resource_backings` + event-cadence desktop) →
+(2) the 4×8 s sem-deadline latch declares CONTEXT LOST on a healthy-but-slow stack →
+(3) dxvk teardown on DEVICE_LOST resets command pools with host work pending (= the
+`vkResetCommandPool` VUs; symptom, not cause) → (4) post-loss, `submitCmdLists` drops cmdlists
+WITHOUT `notifyObjects()` → in-use refs leak → next `Map` → `waitForResource` (no timeout, no
+lost-check) wedges dwm permanently; win32k session-1 GDI hangs behind it. Falsified: the
+early-fence/helios_sync theory for the steady-state stall — 0 of 251,810 submissions carry
+ring≠0; the vn win32-sync signal path never fires; cross-process sync is dxvk-helios-internal.
 
 Open defects, roughly ordered:
 
-1. **IDD frame freeze** (live at stage start). Evidence bundle:
-   `C:\ProgramData\Helios\freeze_evidence_20260705\` +
-   `tmp/freeze_evidence_20260705/qemu-stderr-tail.log`. Snapshot: IDD
-   (WUDFHost) loops `ResolveSharedResource` on the same 1896x1030 alloc; dwm
-   presented to #1561 then went log-quiet; host shows live
-   `vkResetCommandPool ... is in use` validation errors.
-2. **Early-fence suspicion**: host `vkResetCommandPool`-while-pending VUs
-   correlate with explorer `VK_ERROR_DEVICE_LOST` bursts — suspected guest
-   fence signaling before host completion in the async-transport wire-fence
-   path (`kmd_render` C3/M3.4). This may be the root of both #1 and the
-   DEVICE_LOST bursts.
+1. **Stall (primary, owner-visible as freeze/slowness)**: per-present full device drain in
+   `HeliosDxvkDevice::rotate_resource_backings` (bring-up shim, self-documented as awaiting the
+   async-fence rework); plus a suspected next-frame-unblocks-previous-frame wait chain
+   (mid-stall dump: all dxvk threads idle while host timeline sits behind for 8 s).
+   MEASURE FIRST: `HELIOS_PERF`/`HELIOS_QUEUE_PERF` (machine env + dwm restart).
+2. **dxvk-helios device-loss hygiene** (fixes the permanent-wedge escalation):
+   (a) dropped post-loss submissions must still `notifyObjects()`;
+   (b) `waitForResource`/`synchronizeUntil` must bail on `m_lastError == DEVICE_LOST`;
+   (c) on lost, skip `vkResetCommandPool` of pending pools (leak deliberately).
 3. **dwm shared-resource creation failure**: `create_resource(tex2d): DXVK
    memory not importable (res_id=0, offset≠0)` — suballocated VkDeviceMemory
    cannot be exported/shared; DXVK must use dedicated allocations for
-   shareable resources. Seen in the freeze-window dwm log.
-4. **dxgkrnl "Driver returned an invalid NTSTATUS 0xC00000BB"** (ETW
+   shareable resources. Likely drives the IDD's per-frame `ResolveSharedResource` loop.
+4. **KMD wire-fence semantics**: ring-0 used-ring returns complete WDDM DMA fences at host
+   *decode* time (virglrenderer 1.3.0: ring 0 retires immediately; ring ≥ 1 = real GPU
+   completion via vkr queue sync threads). Violates the "never signal a wire fence before host
+   completion" invariant at the dxgkrnl level. Guest already assigns per-queue ring_idx ≥ 1 +
+   `VkDeviceQueueTimelineInfoMESA`; unused on the SUBMIT_3D wire today. Also:
+   `helios_sync_append_locked(fence_id=0)` blind-signals + clears older pendings (latent).
+5. **dxgkrnl "Driver returned an invalid NTSTATUS 0xC00000BB"** (ETW
    AzureTriage) — some query answered STATUS_NOT_SUPPORTED where that return
    is illegal. Tolerated today; find and fix the query.
-5. **WUDFRd cold-boot race** ("SCM not ready", boot+23s) — LGIdd loads late;
+6. **WUDFRd cold-boot race** ("SCM not ready", boot+23s) — LGIdd loads late;
    pairing is resilient now but the race window is still there.
-6. **In-place KMD update flakiness** — CM_PROB_FAILED_POST_START limbo until
+7. **In-place KMD update flakiness** — CM_PROB_FAILED_POST_START limbo until
    reboot is expected, but keep the version-coherence gotcha (three sites) and
    backup ladder in mind.
-7. **Mechanism question (understand before optimizing)**: post-cold-boot, GDI
+8. **Mechanism question (understand before optimizing)**: post-cold-boot, GDI
    content renders while RenderGdi (GdiE), MapCpuHostAperture (ChMn) and
    paging (Pg*) counters all stay idle, yet 8 standard allocations sit in
    segment 2. Which path carries the GDI bytes? Candidates: UMD Lock → ICD
@@ -114,6 +129,14 @@ Plan:
   `helios_paintcap` (screenshot → `Z:\tmp\screen_copy.png`), `helios_repaint`,
   `helios_flasher`, `helios_dstate`, `helios_enum_windows`, `helios_regedit`.
   `FindWindow('Progman')` is broken on this box — EnumWindows only.
+- **User-mode stack dumps**: `tools/take-minidump.ps1 -ProcessId <pid> -Path <dmp>`
+  (P/Invoke MiniDumpWriteDump; the `rundll32 comsvcs.dll,MiniDump` trick writes
+  TRUNCATED dumps on this box — do not use). Analyze on Linux:
+  `~/.cargo/bin/minidump-stackwalk --symbols-path <breakpad-syms> <dmp>`;
+  make syms with `~/.cargo/bin/dump_syms <pdb>` (dir layout
+  `syms/<name>.pdb/<GUID+age>/<name>.sym`; fix the MODULE line name if the pdb
+  was renamed). The deployed UMD build's PDB must GUID-match the dump's module
+  (check with `llvm-pdbutil dump --summary`).
 - **Deploy**: `win_cargo` → `tools/install-helios-kmd.ps1` (ExecutionPolicy
   Bypass, `-AllowRebootRequired`); version bump = build.rs numerics + strings
   + Cargo.make stampinf (all three or FAILED_ADD); backups under
