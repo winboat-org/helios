@@ -133,10 +133,24 @@ Open defects, roughly ordered:
    ~4 % bounded timeouts in bursts when dwm's CS runs >100 ms behind (structural:
    the consumer chases the latest published value; bounded + loud by design), ZERO
    strikes, desktop paintcap-clean, submit_avg ~4 µs unchanged.
-   **Remaining:** multi-hour soak with gate=0 (ghosting eyeballs via Looking Glass,
-   timeout-rate baseline vs budget — consider 32 ms to cap IDD stall bursts), then
-   retire `PresentGateUs` (flip compiled default to 0) and drop the gate from the hot
-   path. Known residue: old-ICD probe runs leaked 4 idle render-server workers
+   **Owner cold-boot report (same session): ghosting + frame drops PERSISTED — the
+   WUDFHost-only scoping was WRONG.** The old gate had been ordering EVERY producer's
+   present (apps included), so registry gate=0 also unordered the app-backbuffer →
+   dwm-composition edge; the artifacts were in dwm's OWN composed primary (stale
+   sliver + content overhang in the owner's screenshot). Fix (dxvk `90b76c5c`, UMD
+   `helios_umd_f2c6f833d7d293eb.dll`): `heliosPresentWaitUs` defaults to **32000 for
+   every consumer** — the wait fires only for imported surfaces with a published
+   slot (dwm/IDD cross-process edges), the wait DAG is acyclic (IDD → dwm → apps),
+   every edge bounded; uniform 32 ms also caps the IDD stall bursts that read as
+   frame drops (was 100 ms). Verified live: dwm imports app producer fences
+   ("imported fence 1 of producer pid <app>"), zero dwm-side timeouts, churn
+   paintcaps coherent. Timeout warns now log the fence's current value — churn
+   bursts are retire-lag (publish outruns GPU completion by a few frames).
+   **Remaining:** owner eyeball via Looking Glass + multi-hour soak with gate=0;
+   then retire `PresentGateUs` (flip compiled default to 0) and drop the gate from
+   the hot path. Differential levers if ghosting recurs: `DXVK_CONFIG
+   "dxvk.heliosPresentWaitUs = N"` per process, or registry `PresentGateUs=32000`
+   restore. Known residue: old-ICD probe runs leaked 4 idle render-server workers
    host-side (virgl-63/65/95/97); clears on VM restart, did not recur with the new ICD.
 5. **dxgkrnl "Driver returned an invalid NTSTATUS 0xC00000BB"** (ETW
    AzureTriage) — some query answered STATUS_NOT_SUPPORTED where that return
