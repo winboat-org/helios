@@ -1137,6 +1137,56 @@ bool HeliosDxvkDevice::rotate_resource_backings(
   return false;
 }
 
+bool HeliosDxvkDevice::present_frame_gate(std::uint32_t timeout_us) const {
+  if (!impl || !impl->context)
+    return false;
+  try {
+    LARGE_INTEGER qpcFreq, qpcT0, qpcT1;
+    QueryPerformanceFrequency(&qpcFreq);
+    QueryPerformanceCounter(&qpcT0);
+
+    auto* immediateContext = static_cast<dxvk::D3D11ImmediateContext*>(impl->context);
+    const bool completed = immediateContext->HeliosWaitFrameComplete(timeout_us);
+
+    // Gate-cost telemetry (PSC WS2 discipline): one line per 128 presents.
+    QueryPerformanceCounter(&qpcT1);
+    const std::uint64_t us = std::uint64_t(qpcT1.QuadPart - qpcT0.QuadPart)
+      * 1000000ull / std::uint64_t(qpcFreq.QuadPart);
+    static std::atomic<std::uint64_t> s_gateTotalUs{0};
+    static std::atomic<std::uint64_t> s_gateMaxUs{0};
+    static std::atomic<std::uint32_t> s_gateCount{0};
+    static std::atomic<std::uint32_t> s_gateTimeouts{0};
+    s_gateTotalUs.fetch_add(us, std::memory_order_relaxed);
+    if (!completed)
+      s_gateTimeouts.fetch_add(1, std::memory_order_relaxed);
+    std::uint64_t prevMax = s_gateMaxUs.load(std::memory_order_relaxed);
+    while (us > prevMax &&
+           !s_gateMaxUs.compare_exchange_weak(prevMax, us, std::memory_order_relaxed)) {}
+    const std::uint32_t n = s_gateCount.fetch_add(1, std::memory_order_relaxed) + 1;
+    if ((n & 127u) == 0) {
+      char msg[160];
+      std::snprintf(msg, sizeof(msg),
+                    "present-gate: n=%u avg_us=%llu max_us=%llu timeouts=%u",
+                    n,
+                    static_cast<unsigned long long>(
+                        s_gateTotalUs.load(std::memory_order_relaxed) / n),
+                    static_cast<unsigned long long>(
+                        s_gateMaxUs.load(std::memory_order_relaxed)),
+                    s_gateTimeouts.load(std::memory_order_relaxed));
+      umd_log(msg);
+      s_gateMaxUs.store(0, std::memory_order_relaxed);
+    }
+    return completed;
+  } catch (const dxvk::DxvkError& e) {
+    umd_log(("present_frame_gate DxvkError: " + e.message()).c_str());
+  } catch (const std::exception& e) {
+    umd_log(e.what());
+  } catch (...) {
+    umd_log("unknown exception in present_frame_gate");
+  }
+  return false;
+}
+
 std::size_t HeliosDxvkDevice::create_hull_shader(const std::uint8_t* code, std::size_t len) const {
   if (!impl || !impl->d3d11 || !code || !len)
     return 0;

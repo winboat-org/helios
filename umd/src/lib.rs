@@ -883,6 +883,48 @@ pub(crate) fn trace_enabled() -> bool {
     })
 }
 
+/// Present-path frame-completion gate cap in microseconds:
+/// `HKLM\SOFTWARE\Helios!PresentGateUs` (REG_DWORD). Read once per process.
+/// Absent = 32000 (two 60 Hz frames — the typical wait is 1-5 ms, so the cap
+/// rarely binds); 0 disables the gate entirely (A/B lever for the
+/// ghosting-vs-latency trade).
+pub(crate) fn present_gate_us() -> u32 {
+    use std::sync::OnceLock;
+    static VALUE: OnceLock<u32> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        #[link(name = "advapi32")]
+        unsafe extern "system" {
+            fn RegGetValueA(
+                hkey: usize,
+                sub_key: *const u8,
+                value: *const u8,
+                flags: u32,
+                type_out: *mut u32,
+                data: *mut c_void,
+                data_len: *mut u32,
+            ) -> i32;
+        }
+        const HKEY_LOCAL_MACHINE: usize = 0x8000_0002;
+        const RRF_RT_REG_DWORD: u32 = 0x10;
+        const DEFAULT_US: u32 = 32_000;
+        let mut value: u32 = 0;
+        let mut len: u32 = 4;
+        // SAFETY: NUL-terminated key/value names; `value`/`len` outlive the call.
+        let rc = unsafe {
+            RegGetValueA(
+                HKEY_LOCAL_MACHINE,
+                c"SOFTWARE\\Helios".as_ptr().cast(),
+                c"PresentGateUs".as_ptr().cast(),
+                RRF_RT_REG_DWORD,
+                core::ptr::null_mut(),
+                (&mut value as *mut u32).cast(),
+                &mut len,
+            )
+        };
+        if rc == 0 { value } else { DEFAULT_US }
+    })
+}
+
 /// Per-frame/per-op trace logging, gated by [`trace_enabled`]. The format
 /// arguments are not evaluated when tracing is off.
 macro_rules! trace_line {

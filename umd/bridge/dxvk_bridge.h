@@ -77,11 +77,17 @@ struct HeliosDxvkDevice {
 
   // Flip-model identity rotation (DXGI pfnRotateResourceIdentities): each
   // texture takes the DXVK storage (memory + VkImage + KMT handles) of the
-  // NEXT one in the list, the last takes the first's. Fully synchronizes the
-  // device first (event query) so no in-flight work references the storages.
+  // NEXT one in the list, the last takes the first's. The swap executes on
+  // the CS thread (ordered), no device drain.
   bool rotate_resource_backings(
       const std::size_t* d3d11_resource_ptrs,
       std::size_t count) const;
+
+  // Present-path frame-completion gate: bounded wait until the current
+  // flush's submission completes on the GPU (see
+  // D3D11ImmediateContext::HeliosWaitFrameComplete). Returns true when the
+  // frame completed within the timeout, false on timeout/error.
+  bool present_frame_gate(std::uint32_t timeout_us) const;
   std::size_t create_hull_shader(const std::uint8_t* code, std::size_t len) const;
   std::size_t create_domain_shader(const std::uint8_t* code, std::size_t len) const;
   std::size_t create_compute_shader(const std::uint8_t* code, std::size_t len) const;

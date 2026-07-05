@@ -36,6 +36,7 @@ use helios_protocol::{
 use crate::ddi;
 use crate::device_funcs::HeliosDevice;
 use crate::log_line;
+use crate::present_gate_us;
 use crate::trace_line;
 
 type Hdevice = ddi::D3D10DDI_HDEVICE;
@@ -5425,6 +5426,21 @@ unsafe extern "C" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT) -> i32 {
             copied = true;
         }
         context.Flush();
+    }
+
+    // Frame-completion gate BEFORE the kernel flip becomes visible: dwm's
+    // venus rendering produces no dxgkrnl-visible DMA fences, so nothing else
+    // orders the IddCx consumer's per-acquire copy against in-flight GPU
+    // writes of the presented buffer (the old whole-device rotate drain
+    // masked this race; removing it surfaced occasional ghosting). Bounded:
+    // on timeout the present proceeds — a rare one-frame ghost self-heals at
+    // the next acquire refresh. `HKLM\SOFTWARE\Helios!PresentGateUs` (DWORD)
+    // overrides the cap; 0 disables. Cost telemetry: `present-gate:` lines.
+    let gate_us = present_gate_us();
+    if gate_us != 0 {
+        if let Some(dev) = helios_device(h) {
+            dev.dxvk.present_frame_gate(gate_us);
+        }
     }
 
     if let Some(dev) = helios_device(h) {

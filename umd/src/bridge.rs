@@ -84,12 +84,17 @@ pub mod ffi {
         ) -> usize;
         /// Flip-model identity rotation: texture i takes texture i+1's DXVK
         /// storage (memory + VkImage + KMT handles); the last takes the
-        /// first's. Synchronizes the device before swapping.
+        /// first's. The swap executes on the CS thread (ordered); no drain.
         unsafe fn rotate_resource_backings(
             self: &HeliosDxvkDevice,
             d3d11_resource_ptrs: *const usize,
             count: usize,
         ) -> bool;
+        /// Present-path frame-completion gate: bounded wait (timeout_us)
+        /// until the current flush's submission completes on the GPU, so the
+        /// IddCx consumer never copies a buffer whose writes are in flight.
+        /// Returns false on timeout (caller proceeds — bounded by design).
+        unsafe fn present_frame_gate(self: &HeliosDxvkDevice, timeout_us: u32) -> bool;
         unsafe fn create_geometry_shader(
             self: &HeliosDxvkDevice,
             code: *const u8,
