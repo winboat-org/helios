@@ -120,14 +120,17 @@ Open defects, roughly ordered:
    pairing is resilient now but the race window is still there.
 7. **In-place KMD update flakiness** — CM_PROB_FAILED_POST_START limbo until
    reboot is expected, but keep the version-coherence gotcha (three sites) and
-   backup ladder in mind. 2026-07-06 state (19th session): ACTIVE driver = **oem58.inf =
-   22.22.51 (pkg c393e58c1b189688)**; **22.22.52 package BUILT but NOT installed**
-   (per-ring watermark + counters — install via win_install_kmd with the owner-consented
-   reboot). `UserModeDriverName` → ProgramData `helios_umd_b3615be0ce9de13e.dll`
-   (RELEASE profile; verify deploys by the loaded-module path of a fresh dwm, not file
-   timestamps). Registry ICD = **`vulkan_virtio-5535366186bd.dll`** (mesa `4a6aa14f17b`:
-   external-sync retire thread + blind-signal fix; new processes only — dwm keeps
-   `7c94d802f270` until its next restart/reboot; probe-verified on the registry path).
+   backup ladder in mind. 2026-07-06 state (19th session END, reboot-verified): ACTIVE
+   driver = **oem59.inf = 22.22.52 (pkg 155b7345f9360525)** — per-ring watermark +
+   counters live. `UserModeDriverName` → ProgramData `helios_umd_b3615be0ce9de13e.dll`
+   (RELEASE profile), dwm ICD = **`vulkan_virtio-5535366186bd.dll`** (retire thread) —
+   both verified by the fresh dwm's loaded-module list + paintcap. **NEW GOTCHA: a KMD
+   `devcon update` install creates a new DriverStore dir and RESETS `UserModeDriverName`
+   to the DriverStore copy, which ships the package's DEBUG-profile UMD — after EVERY
+   KMD install, rerun `win_install_umd` (release dll + `-KillUmdUsers -RestartDevice
+   -NoProbe`) and re-verify dwm's loaded module. The DriverStore UMD copy staying locked
+   during that redeploy (script exit 1) is benign — ProgramData + registry are what
+   load.** Backup: `C:\ProgramData\HeliosDeployBackups\20260706-021734`.
 8. **Mechanism question (understand before optimizing)**: post-cold-boot, GDI
    content renders while RenderGdi (GdiE), MapCpuHostAperture (ChMn) and
    paging (Pg*) counters all stay idle, yet 8 standard allocations sit in
