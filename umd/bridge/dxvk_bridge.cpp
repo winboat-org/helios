@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
+#include <share.h>
 #include <tlhelp32.h>
 
 #include "dxvk_bridge.h"
@@ -344,8 +345,14 @@ namespace {
   }
 
   void umd_log(const char* msg) {
-    FILE* f = nullptr;
-    if (fopen_s(&f, umd_log_file(), "a") == 0 && f) {
+    // _fsopen with _SH_DENYNO, NOT fopen_s: fopen_s opens in _SH_SECURE
+    // (deny-sharing) mode, and the Rust side holds a persistent handle to the
+    // same umd-<pid>.log since e88f2c6 — fopen_s then fails on EVERY call and
+    // all bridge logging (incl. rotate-perf telemetry) silently vanishes
+    // (found 18th session: DriverStore UMD had the strings, logs had no
+    // [dxvk-bridge] lines).
+    FILE* f = _fsopen(umd_log_file(), "a", _SH_DENYNO);
+    if (f) {
       fprintf(f, "[dxvk-bridge] %s\n", msg);
       fclose(f);
     }
