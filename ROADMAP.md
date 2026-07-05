@@ -170,12 +170,25 @@ Open defects, roughly ordered:
    -NoProbe`) and re-verify dwm's loaded module. The DriverStore UMD copy staying locked
    during that redeploy (script exit 1) is benign — ProgramData + registry are what
    load.** Backup: `C:\ProgramData\HeliosDeployBackups\20260706-021734`.
-8. **Mechanism question (understand before optimizing)**: post-cold-boot, GDI
-   content renders while RenderGdi (GdiE), MapCpuHostAperture (ChMn) and
-   paging (Pg*) counters all stay idle, yet 8 standard allocations sit in
-   segment 2. Which path carries the GDI bytes? Candidates: UMD Lock → ICD
-   escape blob mapping (coherent by construction), or dwm-side dxvk GDI
-   staging. Answer determines what is hot-path and what is dead code.
+8. **GDI byte-path / executor retirement (REFRAMED 20th session)**: post-cold-boot,
+   GDI content renders while RenderGdi (GdiE), MapCpuHostAperture (ChMn) and
+   paging (Pg*) counters all stay idle — the canonical CPU path likely already
+   carries the bytes. RESEARCH CONFIRMED (2026-07-06): GDI HW acceleration is
+   OPTIONAL (`SupportKernelModeCommandBuffer` is a "should… only if" per
+   gdi-hardware-acceleration.md); **viogpu3d** (vendored kvm-guest-drivers, the
+   closest existing WDDM driver to Helios, near-identical cap set) never sets the
+   bit and implements NO RenderKm/RenderGdi; WARP works render-only in the IDD
+   slot. The in-tree "LOAD-MANDATORY" bisect (query_adapter_info.rs:166,
+   2026-07-02 v22.22.34) predates Option A and is confounded by the then-broken
+   CPU-visible story — retest under BarSegMode 10 via a new `GdiAccelMode`
+   service-key knob + pnputil restart-device (AzureTriage names any FAILED_ADD).
+   If the desktop renders accel-off: verify byte flow (GdXn stays 0, watch for a
+   two-memory-split regression = black/stale GDI windows), verify the BAR CPU
+   mapping is WB-cacheable (CPU GDI is read-modify-write), re-run the Doom
+   stutter differential (its WSI BitBlt storm currently traverses the executor),
+   then retire the gdi_blit executor (a guest-CPU blitter behind a DMA round
+   trip — strictly worse than win32k's rasterizer, source of the 48%-drop bug
+   class).
 
 ## Workstream 2 — Performance
 
