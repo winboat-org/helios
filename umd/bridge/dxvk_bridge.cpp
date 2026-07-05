@@ -996,6 +996,9 @@ bool HeliosDxvkDevice::rotate_resource_backings(
       umd_log("rotate_resource_backings: event query creation failed");
       return false;
     }
+    LARGE_INTEGER qpcFreq, qpcT0;
+    QueryPerformanceFrequency(&qpcFreq);
+    QueryPerformanceCounter(&qpcT0);
     impl->context->End(query);
     impl->context->Flush();
     constexpr ULONGLONG kSyncDeadlineMs = 30000;
@@ -1023,6 +1026,35 @@ bool HeliosDxvkDevice::rotate_resource_backings(
     if (syncHr != S_OK) {
       umd_log("rotate_resource_backings: event query GetData failed, skipping rotation");
       return false;
+    }
+
+    // Drain-cost telemetry (measure-first, PSC WS2): the full-device drain
+    // above is the prime frame-rate suspect. One log line per 32 rotations.
+    {
+      LARGE_INTEGER qpcT1;
+      QueryPerformanceCounter(&qpcT1);
+      const std::uint64_t us = std::uint64_t(qpcT1.QuadPart - qpcT0.QuadPart)
+        * 1000000ull / std::uint64_t(qpcFreq.QuadPart);
+      static std::atomic<std::uint64_t> s_drainTotalUs{0};
+      static std::atomic<std::uint64_t> s_drainMaxUs{0};
+      static std::atomic<std::uint32_t> s_drainCount{0};
+      s_drainTotalUs.fetch_add(us, std::memory_order_relaxed);
+      std::uint64_t prevMax = s_drainMaxUs.load(std::memory_order_relaxed);
+      while (us > prevMax &&
+             !s_drainMaxUs.compare_exchange_weak(prevMax, us, std::memory_order_relaxed)) {}
+      const std::uint32_t n = s_drainCount.fetch_add(1, std::memory_order_relaxed) + 1;
+      if ((n & 31u) == 0) {
+        char msg[128];
+        std::snprintf(msg, sizeof(msg),
+                      "rotate-perf: n=%u drain_avg_us=%llu drain_max_us=%llu",
+                      n,
+                      static_cast<unsigned long long>(
+                          s_drainTotalUs.load(std::memory_order_relaxed) / n),
+                      static_cast<unsigned long long>(
+                          s_drainMaxUs.load(std::memory_order_relaxed)));
+        umd_log(msg);
+        s_drainMaxUs.store(0, std::memory_order_relaxed);
+      }
     }
 
     // Debug instrument (registry-gated, off by default): sample the surface
