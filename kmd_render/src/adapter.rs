@@ -40,6 +40,35 @@ pub struct PagingRam {
     pub size: u64,
 }
 
+/// The BAR memory segment (segment 3): the head of the host-visible venus
+/// window, reserved as dxgkrnl's CPU-host-aperture region. Blobs are mapped
+/// into it at dxgkrnl-chosen aperture offsets by `DxgkDdiMapCpuHostAperture`
+/// (`cpu_host_aperture.rs`). See the two-memory-split root cause
+/// (HANDOFF_GDI_EXECUTOR_2026_07_05.md ★FINAL).
+pub struct BarSegment {
+    /// Guest-physical base = the host-visible window base (partition offset 0),
+    /// or the probe RAM block's base under `BarSegMode` 5.
+    pub gpa: u64,
+    /// Partition length in bytes (== reported segment Size/CommitLimit == the
+    /// declared `DXGK_CPUHOSTAPERTURE` span == the `reserve_window_prefix`
+    /// given to the blob-window allocator).
+    pub size: u64,
+    /// The WDDM segment id this region is reported as (3 in the default
+    /// topology; 2 under `BarSegMode` 10/11 where it replaces/precedes the
+    /// paging-RAM segment). All BAR-segment consumers key off this field.
+    pub seg_id: u32,
+    /// The `BarSegMode` topology this segment was configured under (10 = two
+    /// segments, BAR replaces RAM as id 2; 11 = three segments, BAR id 2 +
+    /// RAM id 3; anything else = default aperture/RAM/BAR = ids 1/2/3).
+    pub topo: u32,
+    /// AddAdapter-acceptance probe only (`BarSegMode` 5: RAM-backed region):
+    /// the segment is reported but NO allocation is ever placed in it
+    /// (`create_allocation` keeps everything on the aperture) and
+    /// MapCpuHostAperture refuses it — the aperture region is not the venus
+    /// window, so blob maps cannot back it.
+    pub probe_only: bool,
+}
+
 pub struct AdapterContext {
     /// Physical device object for the virtio-gpu device.
     pub pdo: PDEVICE_OBJECT,
@@ -82,6 +111,15 @@ pub struct AdapterContext {
     /// segment (segment id 2) — real device-BAR memory backed by real host memory,
     /// which VidMm accepts where it drops a system-RAM segment. See `venus.rs`.
     pub page_table_window: Option<(u64, u64)>,
+    /// BAR memory segment (segment 3) — the head partition of the host-visible
+    /// window, reserved as dxgkrnl's CPU-host-aperture region at StartDevice.
+    /// `None` if the window is absent/too small; segment 3 is then not
+    /// reported and standard allocations stay on the aperture (old behavior).
+    pub bar_segment: Option<BarSegment>,
+    /// RAM block backing the `BarSegMode` 5 AddAdapter-acceptance probe (the
+    /// segment-3 aperture region is then real RAM instead of the BAR window).
+    /// Freed in Drop.
+    pub bar_probe_ram: Option<PagingRam>,
     /// The persistent venus client (ring/reply BAR mappings + Vulkan ids) kept
     /// alive for the device lifetime so the page-table blob stays mapped. `None`
     /// until/unless the StartDevice venus bring-up succeeds. Its `Drop` unmaps the
@@ -121,6 +159,8 @@ impl AdapterContext {
             mappings: crate::mapping::MappingTable::new(),
             paging_ram: None,
             page_table_window: None,
+            bar_segment: None,
+            bar_probe_ram: None,
             venus_client: UnsafeCell::new(None),
             // Zeroed placeholder — the real dispatcher header is written by
             // `init_kernel_events` once the context is at its final address.
@@ -183,22 +223,20 @@ impl AdapterContext {
         result
     }
 
-    /// Allocate the real-RAM-backed paging/page-table segment. Called from
-    /// StartDevice, after PnP has accepted the display miniport context, so AddDevice
-    /// stays a cheap context-allocation step.
-    pub(crate) fn alloc_paging_ram() -> Option<PagingRam> {
+    /// Allocate a zeroed, physically-contiguous non-paged RAM block. PASSIVE.
+    pub(crate) fn alloc_contiguous_ram(size: usize) -> Option<PagingRam> {
         // Permit the contiguous block anywhere in the 64-bit physical space.
         let mut highest: PHYSICAL_ADDRESS = unsafe { core::mem::zeroed() };
         highest.QuadPart = i64::MAX;
-        // SAFETY: PASSIVE_LEVEL; allocates `PAGING_RAM_SIZE` of physically-
+        // SAFETY: PASSIVE_LEVEL; allocates `size` bytes of physically-
         // contiguous non-paged memory, or null on failure.
-        let va = unsafe { MmAllocateContiguousMemory(PAGING_RAM_SIZE as u64, highest) };
+        let va = unsafe { MmAllocateContiguousMemory(size as u64, highest) };
         let Some(va) = NonNull::new(va as *mut u8) else {
             crate::diag::record(0x0A00_00E3);
             return None;
         };
-        // SAFETY: zero the region so VidMm never reads stale page-table bytes.
-        unsafe { core::ptr::write_bytes(va.as_ptr(), 0, PAGING_RAM_SIZE) };
+        // SAFETY: zero the region so VidMm never reads stale bytes.
+        unsafe { core::ptr::write_bytes(va.as_ptr(), 0, size) };
         // SAFETY: `va` is a valid non-paged kernel address.
         let phys = unsafe { MmGetPhysicalAddress(va.as_ptr() as *mut _).QuadPart } as u64;
         crate::diag::record(0x0A00_0003);
@@ -206,8 +244,15 @@ impl AdapterContext {
         Some(PagingRam {
             va,
             phys,
-            size: PAGING_RAM_SIZE as u64,
+            size: size as u64,
         })
+    }
+
+    /// Allocate the real-RAM-backed paging/page-table segment. Called from
+    /// StartDevice, after PnP has accepted the display miniport context, so AddDevice
+    /// stays a cheap context-allocation step.
+    pub(crate) fn alloc_paging_ram() -> Option<PagingRam> {
+        Self::alloc_contiguous_ram(PAGING_RAM_SIZE)
     }
 
     /// Borrow the Dxgkrnl interface, or fail if StartDevice has not run yet.
@@ -277,6 +322,10 @@ impl Drop for AdapterContext {
         if let Some(pr) = self.paging_ram.take() {
             // SAFETY: `va` came from MmAllocateContiguousMemory in `alloc_paging_ram`
             // and is freed exactly once here.
+            unsafe { MmFreeContiguousMemory(pr.va.as_ptr() as *mut _) };
+        }
+        if let Some(pr) = self.bar_probe_ram.take() {
+            // SAFETY: same contract as paging_ram (alloc_contiguous_ram), freed once.
             unsafe { MmFreeContiguousMemory(pr.va.as_ptr() as *mut _) };
         }
     }

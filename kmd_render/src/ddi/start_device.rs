@@ -17,6 +17,84 @@ use crate::dxgk::*;
 /// debugging the venus path with ntoseye attached (so a wedge is catchable).
 const VENUS_ALLOC_ENABLED: bool = true;
 
+/// Size cap for the VidMm-owned head partition of the host-visible window (the
+/// CPU-visible BAR memory segment, id 3). The window is 8 GiB on the current
+/// QEMU config (`hostmem=8G`); 1 GiB comfortably holds the CPU-rasterized
+/// GDI/shadow/staging/shared-primary standard allocations (a full-screen
+/// surface is ~8 MiB) while leaving the rest to the KMD/ICD blob allocator.
+const BAR_SEGMENT_MAX_BYTES: u64 = 1 << 30;
+
+/// Configure the segment-3 shape per the `BarSegMode` registry DWORD (service
+/// key; read once per StartDevice, so experiments iterate via `reg add` +
+/// `devcon restart` — AddAdapter re-runs without a rebuild/reboot). The knob
+/// exists because BOTH initial shapes (classic CpuVisible 22.22.45,
+/// CpuHostAperture 22.22.46) were rejected at AddAdapter right after the
+/// segment queries, and each blind retry costs an owner reboot.
+///
+///   0  = no BAR segment (baseline recovery shape — always binds)
+///   1  = 3 segments (aperture/RAM/BAR id 3) — REJECTED by dxgmms: a
+///        SupportsCpuHostAperture segment must be the LAST segment, so ANY
+///        segment after the RAM cpu-host segment fails AddAdapter with
+///        "Invalid flags specified for segment #2" (ETW AzureTriage, 2026-07-05)
+///   2  = 3 segments, BAR id 3, 64 MiB   (historic size-bisect arm; rejected)
+///   5  = 3 segments, RAM probe id 3     (historic backing-bisect arm; rejected)
+///   10 = 2 segments: aperture + BAR as SEGMENT ID 2, paging-RAM segment
+///        dropped (it was vestigial: page tables live in system segment 0,
+///        paging buffers in the aperture). **THE PRODUCTION SHAPE** — binds,
+///        and with GDI surfaces in this device segment win32k routes their
+///        rasterization through DxgkDdiRenderGdi (the executor writes the
+///        blob bytes dwm samples) instead of CPU raster into aperture pages:
+///        the two-memory-split fix. First full desktop 2026-07-05 20:53.
+///   11 = 3 segments swapped: aperture + BAR id 2 + RAM id 3 (rejected —
+///        confirms the must-be-last rule; the BAR cpu-host seg isn't last)
+fn setup_bar_segment(
+    adapter: &mut crate::adapter::AdapterContext,
+) -> Option<crate::adapter::BarSegment> {
+    let mode = crate::diag::read_config_dword(b"BarSegMode", 10);
+    crate::diag::record_named_bytes(b"BarM", mode);
+    if mode == 0 {
+        return None;
+    }
+    let seg_id = if mode == 10 || mode == 11 { 2 } else { 3 };
+    if mode == 5 {
+        // RAM-backed acceptance probe: is the rejection about the BAR GPA?
+        let ram = crate::adapter::AdapterContext::alloc_contiguous_ram(16 << 20)?;
+        let (gpa, size) = (ram.phys, ram.size);
+        adapter.bar_probe_ram = Some(ram);
+        crate::diag::record(0x0B00_0008);
+        crate::diag::record(((size >> 20) & 0xFFFF_FFFF) as u32);
+        return Some(crate::adapter::BarSegment {
+            gpa,
+            size,
+            seg_id,
+            topo: mode,
+            probe_only: true,
+        });
+    }
+    let window = adapter.with_virtio(|v| v.host_visible()).ok().flatten()?;
+    let size = match mode {
+        2 => 64 << 20,
+        // 1, 10, 11, or any unknown value → the default partition size.
+        _ => (window.len / 2).min(BAR_SEGMENT_MAX_BYTES) & !4095,
+    };
+    if size < (16 << 20) || size > window.len {
+        crate::diag::record(0x0B00_00E8);
+        return None;
+    }
+    // The KMD blob-window allocator must never hand out offsets inside the
+    // aperture region (dxgkrnl's CPU-host-aperture allocator owns them).
+    let _ = adapter.with_virtio(|v| v.reserve_window_prefix(size));
+    crate::diag::record(0x0B00_0008);
+    crate::diag::record(((size >> 20) & 0xFFFF_FFFF) as u32);
+    Some(crate::adapter::BarSegment {
+        gpa: window.base,
+        size,
+        seg_id,
+        topo: mode,
+        probe_only: false,
+    })
+}
+
 /// `DxgkDdiStartDevice` — bring the adapter online.
 pub unsafe extern "C" fn dxgkddi_start_device(
     miniport_device_context: *mut c_void,
@@ -73,6 +151,12 @@ pub unsafe extern "C" fn dxgkddi_start_device(
                 .isr_status
                 .store(gpu.isr_status_addr(), core::sync::atomic::Ordering::Release);
             adapter.set_virtio(Some(gpu));
+
+            // ── BAR memory segment / CPU host aperture (segment 3) ───────────
+            // Reserve the window head BEFORE any blob map can allocate a
+            // window offset, and before dxgkrnl queries segments.
+            // Two-memory-split fix (Option A).
+            adapter.bar_segment = setup_bar_segment(adapter);
 
             // ── Venus-backed page-table memory (best-effort) ─────────────────
             // Self-allocate a 16-MiB HOST_VISIBLE|HOST_COHERENT VkDeviceMemory over
@@ -176,6 +260,7 @@ pub unsafe extern "C" fn dxgkddi_stop_device(miniport_device_context: *mut c_voi
         // frees its rings (plus any in-flight/parked entry buffers). A later
         // StartDevice re-initializes.
         adapter.set_virtio(None);
+        adapter.bar_segment = None;
     }
     STATUS_SUCCESS
 }

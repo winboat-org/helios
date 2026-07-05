@@ -92,6 +92,53 @@ pub fn record_named_bytes(name: &[u8], value: u32) {
     record_named(&buf[..=n], value);
 }
 
+/// `RTL_QUERY_REGISTRY_DIRECT` — store the value straight into EntryContext
+/// (for REG_DWORD data that fits a ULONG). No callback routine.
+const RTL_QUERY_REGISTRY_DIRECT: u32 = 0x20;
+
+/// Read a REG_DWORD config value from the service key (the same key the
+/// breadcrumbs live under), or `default` if absent/unreadable. The value name
+/// is ASCII (≤14 chars). PASSIVE_LEVEL only. Bring-up experiment knobs: lets
+/// AddAdapter-shape experiments iterate via `reg add` + `devcon restart`
+/// instead of a rebuild+reboot per variant.
+///
+/// The value MUST be REG_DWORD (RTL_QUERY_REGISTRY_DIRECT without TYPECHECK
+/// interprets string data as a UNICODE_STRING buffer — only this driver's own
+/// documented knobs are read here).
+pub fn read_config_dword(name: &[u8], default: u32) -> u32 {
+    let mut name_buf = [0u16; 16];
+    let n = name.len().min(14);
+    let mut i = 0;
+    while i < n {
+        name_buf[i] = name[i] as u16;
+        i += 1;
+    }
+    name_buf[n] = 0;
+
+    let mut value: u32 = default;
+    // SAFETY: zeroed RTL_QUERY_REGISTRY_TABLE entries are valid; the second,
+    // all-zero entry terminates the table (Name == NULL, QueryRoutine == NULL).
+    let mut table: [wdk_sys::RTL_QUERY_REGISTRY_TABLE; 2] = unsafe { core::mem::zeroed() };
+    table[0].Flags = RTL_QUERY_REGISTRY_DIRECT;
+    table[0].Name = name_buf.as_ptr() as *mut u16;
+    table[0].EntryContext = (&mut value as *mut u32).cast();
+    // DefaultType/DefaultData stay zero (REG_NONE): an absent value leaves
+    // `value` at `default`.
+    // SAFETY: PASSIVE_LEVEL; Path is the NUL-terminated service subkey relative
+    // to RTL_REGISTRY_SERVICES; the table is NUL-entry-terminated; EntryContext
+    // points at a live ULONG for the duration of the call.
+    unsafe {
+        let _ = wdk_sys::ntddk::RtlQueryRegistryValues(
+            RTL_REGISTRY_SERVICES,
+            SERVICE_NAME.as_ptr(),
+            table.as_mut_ptr(),
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+        );
+    }
+    value
+}
+
 /// Append one DWORD breadcrumb. Cheap and lossy by design (best-effort tracing).
 pub fn record(mut code: u32) {
     let idx = STEP.fetch_add(1, Ordering::Relaxed);

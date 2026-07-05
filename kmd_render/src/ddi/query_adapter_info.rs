@@ -501,6 +501,70 @@ unsafe fn write_cpu_host_memory_descriptor(seg: *mut DXGK_SEGMENTDESCRIPTOR4, ba
     }
 }
 
+/// Segment-3 descriptor, FULLY KNOB-DRIVEN (AddAdapter shape bisect: both the
+/// classic-CpuVisible and CpuHostAperture shapes were rejected identically, as
+/// were 64 MiB and RAM-backed variants — the remaining hypotheses are flag
+/// combinations and GPU-physical BaseAddress overlap with segment 2, and each
+/// compiled-in variant costs an owner reboot; registry knobs + devcon restart
+/// cost nothing).
+///
+///   `BarSegFlags` (REG_DWORD, default 0x1C = CacheCoherent |
+///                  SupportsCpuHostAperture | SupportsCachedCpuHostAperture):
+///     bit0 Aperture   bit1 CpuVisible(CpuTranslatedAddress=gpa)
+///     bit2 CacheCoherent    bit3 SupportsCpuHostAperture
+///     bit4 SupportsCachedCpuHostAperture   bit5 DirectFlip
+///     bit6 PopulatedFromSystemMemory
+///   `BarSegBaseMB` (REG_DWORD, default 0): GPU-physical BaseAddress in MiB —
+///     segment 2 sits at 0; a nonzero value (e.g. 8192 = 0x2_0000_0000) tests
+///     the BaseAddress-overlap hypothesis.
+///
+/// SAFETY: `seg` points to a writable `DXGK_SEGMENTDESCRIPTOR4`.
+unsafe fn write_bar_knob_descriptor(seg: *mut DXGK_SEGMENTDESCRIPTOR4, gpa: u64, len: u64) {
+    let flags = crate::diag::read_config_dword(b"BarSegFlags", 0x1C);
+    let base_mb = crate::diag::read_config_dword(b"BarSegBaseMB", 0);
+    crate::diag::record_named_bytes(b"BarF", flags);
+    crate::diag::record_named_bytes(b"BarB", base_mb);
+    unsafe {
+        core::ptr::write_bytes(seg as *mut u8, 0, size_of::<DXGK_SEGMENTDESCRIPTOR4>());
+        let s = &mut *seg;
+        s.BaseAddress.QuadPart = (base_mb as i64) << 20;
+        let f = &mut s.Flags.__bindgen_anon_1.__bindgen_anon_1;
+        if flags & 0x01 != 0 {
+            f.set_Aperture(1);
+        }
+        if flags & 0x02 != 0 {
+            f.set_CpuVisible(1);
+            (*s.__bindgen_anon_1.CpuTranslatedAddress.as_mut()).QuadPart = gpa as i64;
+        }
+        if flags & 0x04 != 0 {
+            f.set_CacheCoherent(1);
+        }
+        if flags & 0x08 != 0 {
+            f.set_SupportsCpuHostAperture(1);
+        }
+        if flags & 0x10 != 0 {
+            f.set_SupportsCachedCpuHostAperture(1);
+        }
+        if flags & 0x20 != 0 {
+            f.set_DirectFlip(1);
+        }
+        if flags & 0x40 != 0 {
+            f.set_PopulatedFromSystemMemory(1);
+        }
+        if flags & 0x08 != 0 && flags & 0x02 == 0 {
+            // CpuHostAperture and CpuTranslatedAddress share a union — only
+            // write the aperture region when CpuVisible didn't claim it.
+            let cpu_host = DXGK_CPUHOSTAPERTURE {
+                PhysicalAddress: gpa,
+                SizeInPages: (len / 4096).min(u32::MAX as u64) as u32,
+            };
+            *s.__bindgen_anon_1.CpuHostAperture.as_mut() = cpu_host;
+        }
+        s.Size = len as SIZE_T;
+        s.CommitLimit = len as SIZE_T;
+    }
+}
+
 unsafe fn query_segments(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTERINFO) -> NTSTATUS {
     if (args.OutputDataSize as usize) < size_of::<DXGK_QUERYSEGMENTOUT4>() {
         return STATUS_BUFFER_TOO_SMALL;
@@ -541,6 +605,10 @@ unsafe fn query_segments(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTERIN
         // when VidMm builds its segment table. If the contiguous RAM allocation was
         // unavailable, fall back to NbSegment=1 (aperture only).
         let page_table = adapter.paging_ram();
+        let bar = adapter
+            .bar_segment
+            .as_ref()
+            .map(|b| (b.gpa, b.size, b.topo));
         crate::diag::record(if descriptors.is_null() {
             0x0901_0000
         } else {
@@ -551,25 +619,66 @@ unsafe fn query_segments(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTERIN
         } else {
             0x0902_0000
         });
-        out.NbSegment = if page_table.is_some() { 2 } else { 1 };
-        // Paging buffers come from segdesc[0] (the aperture) — InitDmaPools
-        // validates the FIRST segment for paging-buffer-host capability.
+        crate::diag::record(if bar.is_some() { 0x0905_0001 } else { 0x0905_0000 });
+
+        // Segment TABLE per topology (`BarSegMode` — see `setup_bar_segment`).
+        // The list is (writer, args) per positional slot; ids are positional
+        // (index 0 = id 1). The aperture is ALWAYS first (InitDmaPools
+        // validates segdesc[0] for paging-buffer-host capability).
+        enum Seg {
+            Aperture,
+            RamCpuHost(u64, u64),
+            Bar(u64, u64),
+        }
+        let mut table: [Option<Seg>; 3] = [Some(Seg::Aperture), None, None];
+        match (bar, page_table) {
+            // Topo 10: aperture + BAR as id 2 (RAM segment dropped).
+            (Some((gpa, size, 10)), _) => {
+                table[1] = Some(Seg::Bar(gpa, size));
+            }
+            // Topo 11: aperture + BAR id 2 + RAM id 3 (order swap).
+            (Some((gpa, size, 11)), Some((rgpa, rsize))) => {
+                table[1] = Some(Seg::Bar(gpa, size));
+                table[2] = Some(Seg::RamCpuHost(rgpa, rsize));
+            }
+            // Default topo: aperture + RAM id 2 + BAR id 3. The BAR segment
+            // must be id 3, so it is only reported when the RAM segment is.
+            (Some((gpa, size, _)), Some((rgpa, rsize))) => {
+                table[1] = Some(Seg::RamCpuHost(rgpa, rsize));
+                table[2] = Some(Seg::Bar(gpa, size));
+            }
+            (_, Some((rgpa, rsize))) => {
+                table[1] = Some(Seg::RamCpuHost(rgpa, rsize));
+            }
+            _ => {}
+        }
+        out.NbSegment = table.iter().flatten().count() as u32;
         out.PagingBufferSegmentId = gpummu::APERTURE_SEGMENT_ID;
         if !descriptors.is_null() {
-            // SAFETY: the second QUERYSEGMENT4 call provides NbSegment descriptors.
-            unsafe { write_aperture_descriptor(descriptors as *mut DXGK_SEGMENTDESCRIPTOR4) };
-            if let Some((gpa, size)) = page_table {
-                crate::diag::record(0x0903_0000 | (((gpa >> 12) as u32) & 0xFFFF));
-                crate::diag::record(0x0904_0000 | (((size >> 12) as u32) & 0xFFFF));
-                // SAFETY: index 1 is in bounds (NbSegment == 2).
-                let seg2 = unsafe { (descriptors as *mut u8).add(stride) };
-                unsafe {
-                    write_cpu_host_memory_descriptor(
-                        seg2 as *mut DXGK_SEGMENTDESCRIPTOR4,
-                        gpa,
-                        size,
-                    )
+            for (idx, seg) in table.iter().flatten().enumerate() {
+                // SAFETY: the second QUERYSEGMENT4 call provides NbSegment
+                // descriptors; idx < NbSegment by construction.
+                let d = unsafe {
+                    (descriptors as *mut u8).add(idx * stride) as *mut DXGK_SEGMENTDESCRIPTOR4
                 };
+                match seg {
+                    Seg::Aperture => unsafe { write_aperture_descriptor(d) },
+                    Seg::RamCpuHost(gpa, size) => {
+                        crate::diag::record(0x0903_0000 | (((gpa >> 12) as u32) & 0xFFFF));
+                        crate::diag::record(0x0904_0000 | (((size >> 12) as u32) & 0xFFFF));
+                        // SAFETY: d is a writable descriptor slot (above).
+                        unsafe { write_cpu_host_memory_descriptor(d, *gpa, *size) };
+                    }
+                    Seg::Bar(gpa, size) => {
+                        crate::diag::record(0x0906_0000 | (((size >> 20) as u32) & 0xFFFF));
+                        // Knob-driven descriptor (BarSegFlags/BarSegBaseMB) —
+                        // the AddAdapter shape bisect. The production shape is
+                        // CpuHostAperture-like: DxgkDdiMapCpuHostAperture maps
+                        // each allocation's venus blob at the dxgkrnl-chosen
+                        // aperture offset within this window.
+                        unsafe { write_bar_knob_descriptor(d, *gpa, *size) };
+                    }
+                }
             }
         }
     } else {

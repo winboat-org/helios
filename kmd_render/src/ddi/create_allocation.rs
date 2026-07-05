@@ -31,9 +31,18 @@ use crate::dxgk::_D3DKMDT_STANDARDALLOCATION_TYPE::{
 };
 use crate::dxgk::*;
 
+/// `AllocationContext::magic` — validates `hAllocation` casts in paging DDIs
+/// (a garbage dereference in BuildPagingBuffer is a bugcheck).
+const ALLOCATION_CTX_MAGIC: u32 = 0x4841_4C43; // "HALC"
+
+/// Sentinel for [`AllocationContext::bar_placed`]: not placed in the BAR segment.
+pub(crate) const BAR_UNPLACED: u64 = u64::MAX;
+
 /// Per-allocation KMD state: the venus context + virtio resource backing it, plus
 /// the host-visible window mapping (filled in Stage 2b by BuildPagingBuffer).
 struct AllocationContext {
+    /// [`ALLOCATION_CTX_MAGIC`] — must be the FIRST field (paging-DDI cast check).
+    magic: u32,
     ctx_id: u32,
     resource_id: u32,
     owns_resource: bool,
@@ -59,6 +68,14 @@ struct AllocationContext {
     /// authoritative record travels in the private-data trailer / open identity.
     venus_alloc_size: u64,
     memory_type_index: u32,
+    /// VidMm-assigned SegmentAddress in the CPU-visible BAR segment (id 3), or
+    /// [`BAR_UNPLACED`]. Written by `BuildPagingBuffer` when it maps the blob at
+    /// the assigned offset; atomic because paging DDIs run concurrently with
+    /// allocation DDIs. Only meaningful for `bar_eligible` allocations.
+    bar_placed: core::sync::atomic::AtomicU64,
+    /// This allocation was reported to VidMm as BAR-segment-only (KMD-backed
+    /// standard allocation with a mappable venus blob, BAR segment active).
+    bar_eligible: bool,
 }
 
 /// Per-resource KMD state. Dxgkrnl requires a non-null KMD resource handle for
@@ -116,6 +133,51 @@ pub unsafe fn present_alloc_info(h: HANDLE) -> Option<PresentAllocInfo> {
         height: open.height,
         format: open.format,
     })
+}
+
+/// Snapshot of the [`AllocationContext`] fields `BuildPagingBuffer` needs to
+/// service content/placement ops against the CPU-visible BAR segment.
+#[derive(Clone, Copy)]
+pub(crate) struct PagingAllocInfo {
+    pub resource_id: u32,
+    pub size: u64,
+    pub bar_eligible: bool,
+    /// Current placement ([`BAR_UNPLACED`] if none).
+    pub bar_placed: u64,
+}
+
+/// Resolve a paging-op `hAllocation` (the handle this driver returned from
+/// `DxgkDdiCreateAllocation`) to its paging view. Returns `None` for null or
+/// magic-mismatched handles — a garbage dereference here would bugcheck.
+///
+/// SAFETY: `h` must be an in-flight paging op's `hAllocation` (dxgkrnl keeps
+/// the allocation alive across its paging operations).
+pub(crate) unsafe fn paging_alloc_info(h: HANDLE) -> Option<PagingAllocInfo> {
+    if h.is_null() {
+        return None;
+    }
+    let ctx = unsafe { &*(h as *const AllocationContext) };
+    if ctx.magic != ALLOCATION_CTX_MAGIC {
+        return None;
+    }
+    Some(PagingAllocInfo {
+        resource_id: ctx.resource_id,
+        size: ctx.size as u64,
+        bar_eligible: ctx.bar_eligible,
+        bar_placed: ctx.bar_placed.load(Ordering::Acquire),
+    })
+}
+
+/// Record (or clear, with [`BAR_UNPLACED`]) an allocation's VidMm-assigned BAR
+/// SegmentAddress. SAFETY: same contract as [`paging_alloc_info`].
+pub(crate) unsafe fn set_bar_placement(h: HANDLE, offset: u64) {
+    if h.is_null() {
+        return;
+    }
+    let ctx = unsafe { &*(h as *const AllocationContext) };
+    if ctx.magic == ALLOCATION_CTX_MAGIC {
+        ctx.bar_placed.store(offset, Ordering::Release);
+    }
 }
 
 const PAGE: SIZE_T = 4096;
@@ -519,7 +581,22 @@ unsafe fn create_one(
     } else {
         ap.size as SIZE_T
     });
+    // CPU-rasterized surfaces (GDI/shadow/staging/shared-primary standard
+    // allocations, KMD-backed by a mappable venus blob) go to the BAR memory
+    // segment (id 3): CPU raster then lands in the SAME bytes the allocation's
+    // venus blob exposes (two-memory-split fix). UMD/venus-backed (adopted)
+    // allocations keep the aperture — their CPU access rides the ICD's escape
+    // blob mapping, and device-local blobs are not mappable. Bisect arms
+    // (probe_only RAM region / classic descriptor) never receive allocations.
+    let bar_seg_id = adapter
+        .bar_segment
+        .as_ref()
+        .filter(|b| !b.probe_only)
+        .map(|b| b.seg_id);
+    let bar_eligible = venus_memory_id != 0 && bar_seg_id.is_some();
+
     let ctx = Box::new(AllocationContext {
+        magic: ALLOCATION_CTX_MAGIC,
         ctx_id: ap.ctx_id,
         resource_id,
         owns_resource,
@@ -534,13 +611,24 @@ unsafe fn create_one(
         format: meta.format,
         venus_alloc_size: meta.venus_alloc_size,
         memory_type_index: meta.memory_type_index,
+        bar_placed: core::sync::atomic::AtomicU64::new(BAR_UNPLACED),
+        bar_eligible,
     });
 
-    // ── VidMm metadata: a CPU-host-aperture-backed blob in the memory segment ─
+    // ── VidMm metadata: segment placement + CPU visibility ──────────────────
     info.hAllocation = Box::into_raw(ctx) as HANDLE;
     info.Size = size;
     info.PitchAlignedSize = size;
-    let supported_segments = 1u32 << (crate::ddi::gpummu::APERTURE_SEGMENT_ID - 1);
+    let (preferred_segment, supported_segments) = if let (true, Some(seg_id)) =
+        (bar_eligible, bar_seg_id)
+    {
+        (seg_id, 1u32 << (seg_id - 1))
+    } else {
+        (
+            crate::ddi::gpummu::APERTURE_SEGMENT_ID,
+            1u32 << (crate::ddi::gpummu::APERTURE_SEGMENT_ID - 1),
+        )
+    };
     info.SupportedWriteSegmentSet = supported_segments;
     info.EvictionSegmentSet = 0;
     info.HintedBank.__bindgen_anon_1.Value = 0;
@@ -551,7 +639,7 @@ unsafe fn create_one(
         info.PreferredSegment
             .__bindgen_anon_1
             .__bindgen_anon_1
-            .set_SegmentId0(crate::ddi::gpummu::APERTURE_SEGMENT_ID);
+            .set_SegmentId0(preferred_segment);
         info.__bindgen_anon_2.SupportedReadSegmentSet = supported_segments;
         info.__bindgen_anon_3.MaximumRenamingListLength = 0;
         info.__bindgen_anon_3.PhysicalAdapterIndex = 0;
