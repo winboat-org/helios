@@ -1007,14 +1007,14 @@ bool HeliosDxvkDevice::rotate_resource_backings(
     QueryPerformanceFrequency(&qpcFreq);
     QueryPerformanceCounter(&qpcT0);
 
-    // Dispatch the current recording chunk to the CS queue first: InjectCs
-    // bypasses the open chunk, and the swap must order AFTER commands
-    // recorded before this DDI. The wait is CPU-only (CS drain), not a GPU
-    // sync.
+    // InjectCsOrderedAfterPending dispatches the open recording chunk and
+    // appends the swap on the ordered CS queue WITHOUT waiting for the CS
+    // thread: the earlier SynchronizeCsThread variant blocked the present
+    // thread behind the whole CS queue — up to 1.9 s per present during
+    // login churn (rotate-perf) — the owner-visible "occasional dips".
     auto* immediateContext = static_cast<dxvk::D3D11ImmediateContext*>(impl->context);
-    immediateContext->SynchronizeCsThread(dxvk::DxvkCsThread::SynchronizeAll);
 
-    immediateContext->InjectCs(dxvk::DxvkCsQueue::Ordered, [
+    immediateContext->InjectCsOrderedAfterPending([
       cImages = std::move(images)
     ] (dxvk::DxvkContext* ctx) {
       auto first = cImages[0]->storage();
