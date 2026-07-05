@@ -108,6 +108,12 @@ pub static PARKED_HIGH_WATER: AtomicU32 = AtomicU32::new(0);
 pub static PARKED_LEAKS: AtomicU32 = AtomicU32::new(0);
 /// WDDM submissions completed by the DPC (real venus-driven fences).
 pub static WDDM_FENCE_FROM_DPC: AtomicU32 = AtomicU32::new(0);
+/// Fenced SUBMIT_3D enqueues carrying ring_idx >= 1 (GPU-completion fences —
+/// WS1 #4 consumer-side ordering; these retire at host GPU completion, not
+/// decode, so they legally stay in flight for the full GPU-work duration).
+pub static RING_SUBMIT_COUNT: AtomicU32 = AtomicU32::new(0);
+/// ring_idx >= 1 completions drained from the used ring.
+pub static RING_COMPLETE_COUNT: AtomicU32 = AtomicU32::new(0);
 
 // ── DISPATCH-safe resource-table telemetry ──────────────────────────────────
 // All updated under the device spinlock (DISPATCH_LEVEL), so they must be
@@ -497,7 +503,10 @@ enum InFlightKind {
     /// completion. `None` = the waiter timed out and abandoned the entry.
     Sync { waiter: Option<NonNull<SyncWaitBlock>> },
     /// An async fenced SUBMIT_3D carrying `fence_id` (KMD-assigned wire id).
-    AsyncVenus { fence_id: u64 },
+    /// `ring_idx` 0 = host CPU ring (retires at decode); >= 1 = a per-queue
+    /// GPU-completion fence (virglrenderer vkr sync thread) that legally stays
+    /// in flight for the full GPU-work duration.
+    AsyncVenus { fence_id: u64, ring_idx: u8 },
 }
 
 /// One outstanding control-queue submission. Owns its device-visible buffers
@@ -985,9 +994,13 @@ impl VirtioGpu {
             self.transport.notify(CTRL_QUEUE);
         }
         self.next_wire_fence += 1;
+        let ring = cmd.hdr.ring_idx;
         self.inflight.push(InFlight {
             token,
-            kind: InFlightKind::AsyncVenus { fence_id },
+            kind: InFlightKind::AsyncVenus {
+                fence_id,
+                ring_idx: ring,
+            },
             meta,
             in0_len: hdr_len,
             in1_len: 0,
@@ -996,6 +1009,9 @@ impl VirtioGpu {
             venus_len,
         });
         ASYNC_SUBMIT_COUNT.fetch_add(1, Ordering::Relaxed);
+        if ring != 0 {
+            RING_SUBMIT_COUNT.fetch_add(1, Ordering::Relaxed);
+        }
         bump_high_water(&INFLIGHT_HIGH_WATER, self.inflight.len());
         Ok(fence_id)
     }
@@ -1084,8 +1100,11 @@ impl VirtioGpu {
                         }
                     }
                 }
-                InFlightKind::AsyncVenus { fence_id } => {
+                InFlightKind::AsyncVenus { fence_id, ring_idx } => {
                     ASYNC_COMPLETE_COUNT.fetch_add(1, Ordering::Relaxed);
+                    if ring_idx != 0 {
+                        RING_COMPLETE_COUNT.fetch_add(1, Ordering::Relaxed);
+                    }
                     if !resp_is_ok(resp_type) {
                         ASYNC_RESP_ERRORS.fetch_add(1, Ordering::Relaxed);
                     }
@@ -1172,7 +1191,7 @@ impl VirtioGpu {
             return FenceWaitPrep::Invalid;
         }
         let in_flight = self.inflight.iter().any(|e| match e.kind {
-            InFlightKind::AsyncVenus { fence_id: f } => f == fence_id,
+            InFlightKind::AsyncVenus { fence_id: f, .. } => f == fence_id,
             _ => false,
         });
         if !in_flight {
@@ -1199,11 +1218,21 @@ impl VirtioGpu {
 
     // ── WDDM pending-fence FIFO (SubmitCommand → DPC completion) ─────────────
 
-    /// Whether every async wire fence `< watermark` has retired.
+    /// Whether every RING-0 async wire fence `< watermark` has retired.
+    ///
+    /// Ring-0 only: the WDDM pending FIFO exists to order DMA_COMPLETED behind
+    /// the venus escape traffic queued before it, and ring-0 fences retire at
+    /// host DECODE — the ordering domain that contract was built on. ring >= 1
+    /// fences (WS1 #4) retire at host GPU COMPLETION and stay in flight for
+    /// the full GPU-work duration; counting them here would couple every WDDM
+    /// DMA fence (GDI/paging pacing) to unrelated multi-ms GPU work. Consumers
+    /// that need GPU completion wait on those fences explicitly (WAIT_FENCE).
     fn async_retired_up_to(&self, watermark: u64) -> bool {
         watermark == 0
             || !self.inflight.iter().any(|e| match e.kind {
-                InFlightKind::AsyncVenus { fence_id } => fence_id < watermark,
+                InFlightKind::AsyncVenus { fence_id, ring_idx } => {
+                    ring_idx == 0 && fence_id < watermark
+                }
                 _ => false,
             })
     }

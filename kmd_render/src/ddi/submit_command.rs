@@ -623,9 +623,9 @@ pub unsafe extern "C" fn dxgkddi_collect_dbg_info(
         let adapter = unsafe { &*(h_adapter as *const AdapterContext) };
         adapter.last_completed_fence.load(Ordering::Relaxed) as u32
     };
-    let report: [u32; 33] = [
+    let report: [u32; 35] = [
         0x4844_4247, // 'HDBG'
-        3,           // report version (3: + C3/M3.4 async-transport telemetry)
+        4,           // report version (4: + per-ring fence telemetry, WS1 #4)
         args.Reason,
         SUBMIT_COUNT.load(Ordering::Relaxed),
         SUBMIT_LAST_FENCE.load(Ordering::Relaxed),
@@ -662,8 +662,11 @@ pub unsafe extern "C" fn dxgkddi_collect_dbg_info(
         crate::virtio::gpu::PARKED_HIGH_WATER.load(Ordering::Relaxed),
         crate::virtio::gpu::PARKED_LEAKS.load(Ordering::Relaxed),
         crate::virtio::gpu::WDDM_FENCE_FROM_DPC.load(Ordering::Relaxed),
+        // v4: ring_idx >= 1 GPU-completion fences (WS1 #4).
+        crate::virtio::gpu::RING_SUBMIT_COUNT.load(Ordering::Relaxed),
+        crate::virtio::gpu::RING_COMPLETE_COUNT.load(Ordering::Relaxed),
     ];
-    let report_bytes = size_of::<[u32; 33]>();
+    let report_bytes = size_of::<[u32; 35]>();
     let copy_len = core::cmp::min(report_bytes, buf_len);
     // SAFETY: copy_len <= BufferSize (writable, checked above) and
     // copy_len <= size_of report (readable local array).
