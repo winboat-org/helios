@@ -28,6 +28,10 @@ use tokio::process::Command;
 
 /// Shared project root on the Windows side (the Z: drive maps the Linux tree).
 const PROJECT_DRIVE: &str = "Z:\\";
+/// The same tree on the Linux side (where this server runs). Used by tools that
+/// edit sources before a build (e.g. the KMD version bump); the robocopy mirror
+/// then carries the edits to the Windows build.
+const LINUX_PROJECT_ROOT: &str = "/home/rupansh/helios-vgpu";
 /// Local build mirror. cargo/wdk build IO fails on the Z:\ 9p share (OS error 87,
 /// see windows-drivers-rs#481), so win_cargo robocopy-syncs here and builds on
 /// local disk. Edit sources on Linux/Z:\; the mirror is re-synced each build.
@@ -321,6 +325,124 @@ struct WinInstallUmdArgs {
     timeout_secs: Option<u64>,
 }
 
+#[derive(Deserialize, schemars::JsonSchema)]
+struct WinBuildKmdArgs {
+    /// Explicit new version as "a.b.c.d" (e.g. "22.22.52.0"). Default: bump the
+    /// third component of the current version by one.
+    #[serde(default)]
+    version: Option<String>,
+    /// Rebuild at the CURRENT version without bumping (e.g. after a failed
+    /// build of an already-bumped tree). Coherence across the three sites is
+    /// still verified.
+    #[serde(default)]
+    no_bump: bool,
+    /// Timeout in seconds. Defaults to 1800.
+    #[serde(default)]
+    timeout_secs: Option<u64>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+struct WinInstallKmdArgs {
+    /// Gracefully reboot the guest after a successful install (RECOMMENDED,
+    /// default true): a new KMD image only loads at boot — without the reboot
+    /// the device sits in CM_PROB_FAILED_POST_START limbo on the old image.
+    /// Set false to install now and let the user reboot later.
+    #[serde(default)]
+    restart_vm: Option<bool>,
+    /// Extra flags passed through to `tools\install-helios-kmd.ps1` in
+    /// addition to the always-passed -AllowRebootRequired (e.g. ["-PlanOnly"],
+    /// ["-BinaryOnly"], ["-SkipSign"]).
+    #[serde(default)]
+    args: Vec<String>,
+    /// Timeout in seconds for the install step. Defaults to 900.
+    #[serde(default)]
+    timeout_secs: Option<u64>,
+}
+
+/// Bump (or verify) the KMD version at its three coherence-critical sites:
+/// `build.rs` FILEVERSION/PRODUCTVERSION numerics, `build.rs`
+/// FileVersion/ProductVersion strings, and the Cargo.make.toml stampinf `-v`.
+/// A mismatch between the INF DriverVer and the image FILEVERSION fails
+/// AddAdapter with 0xc0000182 (FAILED_ADD), so any incoherence is a hard error.
+/// Returns (old_version, new_version) as dotted strings.
+fn bump_kmd_version(explicit: Option<&str>, no_bump: bool) -> Result<(String, String), String> {
+    bump_kmd_version_at(LINUX_PROJECT_ROOT, explicit, no_bump)
+}
+
+fn bump_kmd_version_at(
+    root: &str,
+    explicit: Option<&str>,
+    no_bump: bool,
+) -> Result<(String, String), String> {
+    let build_rs_path = format!("{root}/kmd_render/build.rs");
+    let make_path = format!("{root}/kmd_render/Cargo.make.toml");
+    let build_rs = std::fs::read_to_string(&build_rs_path)
+        .map_err(|e| format!("read {build_rs_path}: {e}"))?;
+    let make = std::fs::read_to_string(&make_path).map_err(|e| format!("read {make_path}: {e}"))?;
+
+    // Current version: parse `FILEVERSION a,b,c,d` from build.rs.
+    let cur: Vec<u32> = build_rs
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("FILEVERSION "))
+        .ok_or("no FILEVERSION line in build.rs")?
+        .trim()
+        .split(',')
+        .map(|p| p.trim().parse::<u32>())
+        .collect::<Result<_, _>>()
+        .map_err(|e| format!("unparsable FILEVERSION: {e}"))?;
+    if cur.len() != 4 {
+        return Err(format!("FILEVERSION has {} fields, expected 4", cur.len()));
+    }
+    let cur_dotted = format!("{}.{}.{}.{}", cur[0], cur[1], cur[2], cur[3]);
+    let cur_comma = format!("{},{},{},{}", cur[0], cur[1], cur[2], cur[3]);
+
+    // Coherence check BEFORE touching anything: all three sites must agree.
+    let numeric_sites = build_rs.matches(&cur_comma).count();
+    let string_sites = build_rs.matches(&cur_dotted).count();
+    let stampinf_sites = make.matches(&cur_dotted).count();
+    if numeric_sites < 2 || string_sites < 2 || stampinf_sites < 1 {
+        return Err(format!(
+            "version sites INCOHERENT for {cur_dotted}: build.rs numerics={numeric_sites} \
+             (need >=2), build.rs strings={string_sites} (need >=2), Cargo.make.toml \
+             stampinf={stampinf_sites} (need >=1). Fix manually before building — an \
+             INF/FILEVERSION mismatch is FAILED_ADD 0xc0000182."
+        ));
+    }
+
+    if no_bump {
+        return Ok((cur_dotted.clone(), cur_dotted));
+    }
+
+    let new: Vec<u32> = match explicit {
+        Some(v) => {
+            let parts: Vec<u32> = v
+                .split('.')
+                .map(|p| p.parse::<u32>())
+                .collect::<Result<_, _>>()
+                .map_err(|e| format!("bad explicit version {v:?}: {e}"))?;
+            if parts.len() != 4 {
+                return Err(format!("explicit version {v:?} must be a.b.c.d"));
+            }
+            parts
+        }
+        None => vec![cur[0], cur[1], cur[2] + 1, cur[3]],
+    };
+    let new_dotted = format!("{}.{}.{}.{}", new[0], new[1], new[2], new[3]);
+    let new_comma = format!("{},{},{},{}", new[0], new[1], new[2], new[3]);
+    if new_dotted == cur_dotted {
+        return Err(format!("new version equals current ({cur_dotted})"));
+    }
+
+    let new_build_rs = build_rs
+        .replace(&cur_comma, &new_comma)
+        .replace(&cur_dotted, &new_dotted);
+    let new_make = make.replace(&cur_dotted, &new_dotted);
+    std::fs::write(&build_rs_path, new_build_rs)
+        .map_err(|e| format!("write {build_rs_path}: {e}"))?;
+    std::fs::write(&make_path, new_make).map_err(|e| format!("write {make_path}: {e}"))?;
+    Ok((cur_dotted, new_dotted))
+}
+
 fn ps_join_path(root: &str, rel: &str) -> String {
     if root.ends_with(['\\', '/']) {
         format!("{root}{rel}")
@@ -585,6 +707,90 @@ impl WinHost {
             Err(e) => format!("error launching ssh: {e}"),
         }
     }
+
+    #[tool(
+        description = "Bump the Helios KMD (kmd_render) version and build the signed driver package. Handles the three-site version-coherence invariant automatically (build.rs FILEVERSION/PRODUCTVERSION numerics + FileVersion/ProductVersion strings + Cargo.make.toml stampinf -v — an INF/FILEVERSION mismatch is FAILED_ADD 0xc0000182): it verifies the sites agree, bumps the third component by default (or uses `version`, or `no_bump` to rebuild the current version), edits the Linux-side sources, then mirrors + runs `cargo make --makefile Cargo.make.toml` on the VM (build, inf2cat, test-sign, package). Output starts with the old -> new version line; the package lands in kmd_render\\target\\debug\\helios_kmd_render_package on the VM mirror. Deploy with win_install_kmd. The version edit persists on the Linux tree — commit it with the change it ships."
+    )]
+    async fn win_build_kmd(&self, Parameters(a): Parameters<WinBuildKmdArgs>) -> String {
+        let (old_v, new_v) = match bump_kmd_version(a.version.as_deref(), a.no_bump) {
+            Ok(v) => v,
+            Err(e) => return format!("win_build_kmd: version bump failed: {e}"),
+        };
+        let header = if a.no_bump {
+            format!("KMD version: {old_v} (no bump, coherence verified)\n")
+        } else {
+            format!("KMD version: {old_v} -> {new_v}\n")
+        };
+        let mut env = HashMap::new();
+        env.insert("LIBCLANG_PATH".to_string(), LIBCLANG_PATH.to_string());
+        // Same mirror-then-build flow as win_cargo (see its comments) with the
+        // kmd_render package makefile.
+        let command = format!(
+            "robocopy {PROJECT_DRIVE} {MIRROR_ROOT} /MIR /XJ /XD target .git \"{MESA_SRC}\" dxvk dxvk-research-only vkd3d-proton virtio-research-only-3d windows-driver-docs-research-only /NFL /NDL /NJH /NJS /NP /R:1 /W:1\n\
+             $robocopyExit = $LASTEXITCODE\n\
+             if ($robocopyExit -ge 8) {{ \"win_build_kmd: robocopy mirror sync failed (exit $robocopyExit)\"; exit $robocopyExit }}\n\
+             Set-Location -LiteralPath '{MIRROR_ROOT}\\kmd_render'\n\
+             cargo make --makefile Cargo.make.toml"
+        );
+        match run_ssh(&command, None, &env, a.timeout_secs.unwrap_or(1800)).await {
+            Ok(o) => format!("{header}{}", format_output(&o)),
+            Err(e) => format!("{header}error launching ssh: {e}"),
+        }
+    }
+
+    #[tool(
+        description = "Install the built Helios KMD package on win11 via `tools\\install-helios-kmd.ps1 -AllowRebootRequired` (ExecutionPolicy Bypass — required, machine policy is Restricted; the script re-signs, backs up the active DriverStore files to C:\\ProgramData\\HeliosDeployBackups\\<stamp>, and publishes with devcon). Build first with win_build_kmd. A new KMD image only loads at BOOT, so by default (restart_vm=true, RECOMMENDED) a successful install is followed by a graceful guest reboot (`shutdown /r /t 5`) — SSH drops for 1-3 minutes; poll win_exec until it returns, then verify DriverVersion + CM_PROB_NONE + a paintcap screenshot. Pass restart_vm=false to install now and reboot later (the device may sit in FAILED_POST_START limbo on the old image until then). Only invoke with the user's consent to the reboot, or with restart_vm=false."
+    )]
+    async fn win_install_kmd(&self, Parameters(a): Parameters<WinInstallKmdArgs>) -> String {
+        let extra = a.args.join(" ");
+        let command = format!(
+            "& powershell -NoProfile -ExecutionPolicy Bypass -File '{PROJECT_DRIVE}tools\\install-helios-kmd.ps1' -AllowRebootRequired {extra}"
+        );
+        let install = match run_ssh(&command, None, &HashMap::new(), a.timeout_secs.unwrap_or(900))
+            .await
+        {
+            Ok(o) => o,
+            Err(e) => return format!("error launching ssh: {e}"),
+        };
+        let installed_ok = install.code == Some(0) && !install.timed_out;
+        let mut out = format_output(&install);
+
+        let plan_only = a.args.iter().any(|f| f.eq_ignore_ascii_case("-PlanOnly"));
+        if a.restart_vm.unwrap_or(true) && !plan_only {
+            if installed_ok {
+                let reboot = run_ssh(
+                    "shutdown /r /t 5 /c 'Helios KMD activation reboot'",
+                    None,
+                    &HashMap::new(),
+                    30,
+                )
+                .await;
+                out.push_str(match reboot {
+                    Ok(o) if o.code == Some(0) => {
+                        "\n\nwin_install_kmd: REBOOT ISSUED (shutdown /r /t 5) — the guest \
+                         goes down in ~5 s and SSH returns in 1-3 min. Poll with win_exec, \
+                         then verify DriverVersion and CM_PROB_NONE."
+                    }
+                    _ => {
+                        "\n\nwin_install_kmd: install OK but the reboot command FAILED — \
+                         reboot the guest manually to activate the new KMD."
+                    }
+                });
+            } else {
+                out.push_str(
+                    "\n\nwin_install_kmd: install did not exit 0 — SKIPPING the reboot. \
+                     Inspect the output above; the DriverStore backup path is printed there.",
+                );
+            }
+        } else if installed_ok && !plan_only {
+            out.push_str(
+                "\n\nwin_install_kmd: installed WITHOUT reboot (restart_vm=false) — the new \
+                 KMD activates on the next boot; until then the device may sit in \
+                 FAILED_POST_START limbo on the old image.",
+            );
+        }
+        out
+    }
 }
 
 #[tool_handler]
@@ -600,6 +806,54 @@ impl ServerHandler for WinHost {
             capabilities: ServerCapabilities::builder().enable_tools().build(),
             ..Default::default()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bump_kmd_version_at;
+
+    /// Copy the real kmd_render version-site files into a temp root and
+    /// exercise verify (no_bump), auto-bump, and explicit-bump against them.
+    #[test]
+    fn kmd_version_bump_roundtrip() {
+        let tmp = std::env::temp_dir().join(format!("winmcp-bump-test-{}", std::process::id()));
+        let kmd = tmp.join("kmd_render");
+        std::fs::create_dir_all(&kmd).unwrap();
+        for f in ["build.rs", "Cargo.make.toml"] {
+            std::fs::copy(
+                format!("{}/kmd_render/{f}", super::LINUX_PROJECT_ROOT),
+                kmd.join(f),
+            )
+            .unwrap();
+        }
+        let root = tmp.to_str().unwrap();
+
+        // Verify-only: real tree must be coherent.
+        let (old_v, same) = bump_kmd_version_at(root, None, true).unwrap();
+        assert_eq!(old_v, same);
+
+        // Auto-bump increments the third component.
+        let (from, to) = bump_kmd_version_at(root, None, false).unwrap();
+        assert_eq!(from, old_v);
+        let f: Vec<u32> = from.split('.').map(|p| p.parse().unwrap()).collect();
+        let t: Vec<u32> = to.split('.').map(|p| p.parse().unwrap()).collect();
+        assert_eq!((t[0], t[1], t[2], t[3]), (f[0], f[1], f[2] + 1, f[3]));
+
+        // The bumped tree is coherent at the new version; no old remnants.
+        let (v2, _) = bump_kmd_version_at(root, None, true).unwrap();
+        assert_eq!(v2, to);
+        let build_rs = std::fs::read_to_string(kmd.join("build.rs")).unwrap();
+        assert!(!build_rs.contains(&from));
+
+        // Explicit version.
+        let (_, v3) = bump_kmd_version_at(root, Some("30.0.1.2"), false).unwrap();
+        assert_eq!(v3, "30.0.1.2");
+
+        // Bad explicit version is rejected.
+        assert!(bump_kmd_version_at(root, Some("30.0.1"), false).is_err());
+
+        std::fs::remove_dir_all(&tmp).unwrap();
     }
 }
 
