@@ -562,6 +562,23 @@ pub enum BlobMapBegin {
     Failed(VirtioError),
 }
 
+/// Result of [`VirtioGpu::blob_remap_begin`] (fixed-offset, VidMm-dictated maps
+/// for the CPU-visible BAR memory segment — `build_paging_buffer.rs`).
+pub enum BlobRemapBegin {
+    /// Already mapped at exactly the requested offset — nothing to do.
+    Mapped(BlobMapPrep),
+    /// Reserved. The caller must (1) RESOURCE_UNMAP_BLOB if `old` is
+    /// `Some((offset, len))` and return that range via
+    /// [`VirtioGpu::free_window_range_pub`] (a no-op for VidMm-partition
+    /// offsets), (2) RESOURCE_MAP_BLOB at the new offset, then (3) call
+    /// [`VirtioGpu::blob_map_finish`] with the new offset.
+    Start { old: Option<(u64, u64)>, len: u64 },
+    /// Another mapper's round-trip is in flight — retry after a PASSIVE sleep.
+    Busy,
+    /// Unknown resource / out-of-partition target / bad size.
+    Failed(VirtioError),
+}
+
 /// Result of [`VirtioGpu::blob_map_finish`].
 pub enum BlobMapFinish {
     /// Mapping recorded.
@@ -616,6 +633,13 @@ pub struct VirtioGpu {
     contexts: Vec<ContextSlot>,
     /// Bump high-water for the host-visible window offset allocator.
     next_window_offset: u64,
+    /// First `vidmm_reserved` bytes of the host-visible window are OWNED BY
+    /// VIDMM (the CPU-visible BAR memory segment, `query_adapter_info`): VidMm's
+    /// segment allocator assigns offsets there and `BuildPagingBuffer` maps each
+    /// allocation's blob at the assigned offset. The KMD bump/free allocator
+    /// never hands out or reclaims offsets below this mark (see
+    /// [`Self::reserve_window_prefix`] / [`Self::free_window_range`]).
+    vidmm_reserved: u64,
     /// Coalescing free list for released window ranges (bounded by MAX_WINDOW_RANGES).
     free_window_ranges: Vec<WindowRange>,
     /// In-flight control-queue entries (token-matched; capacity MAX_INFLIGHT,
@@ -776,6 +800,7 @@ impl VirtioGpu {
             resources_reserved: 0,
             contexts: Vec::with_capacity(MAX_CONTEXTS),
             next_window_offset: 0,
+            vidmm_reserved: 0,
             free_window_ranges: Vec::with_capacity(MAX_WINDOW_RANGES),
             inflight: Vec::with_capacity(MAX_INFLIGHT),
             parked: Vec::with_capacity(MAX_PARKED),
@@ -1537,6 +1562,122 @@ impl VirtioGpu {
         self.free_window_range(offset, len);
     }
 
+    /// Reserve the first `len` bytes of the host-visible window for VidMm (the
+    /// CPU-visible BAR memory segment). Called once from StartDevice, before
+    /// any blob is mapped: the KMD offset allocator starts past the partition,
+    /// and freed ranges inside it are never recycled by the KMD side.
+    pub fn reserve_window_prefix(&mut self, len: u64) {
+        self.vidmm_reserved = len;
+        if self.next_window_offset < len {
+            self.next_window_offset = len;
+        }
+    }
+
+    /// Begin a fixed-offset (re)map of a blob at the VidMm-assigned window
+    /// offset `offset` (must lie inside the VidMm partition). Unlike
+    /// [`Self::blob_map_begin`] the offset is dictated by the caller, and an
+    /// existing mapping at a DIFFERENT offset is handed back for unmapping —
+    /// blob content is intrinsic to the host memory object, so a remap is
+    /// content-preserving. Any-owner resolve (kernel path, like the executor).
+    pub fn blob_remap_begin(&mut self, resource_id: u32, offset: u64) -> BlobRemapBegin {
+        if self.host_visible.is_none() {
+            return BlobRemapBegin::Failed(VirtioError::DeviceError);
+        }
+        let window_base = self.host_visible.map_or(0, |w| w.base);
+        let Some(idx) = self.blobs.iter().position(|s| s.resource_id == resource_id) else {
+            return BlobRemapBegin::Failed(VirtioError::DeviceError);
+        };
+        if self.blobs[idx].map_pending {
+            return BlobRemapBegin::Busy;
+        }
+        if self.blobs[idx].mapped && self.blobs[idx].map_offset == offset {
+            let s = &self.blobs[idx];
+            return BlobRemapBegin::Mapped(BlobMapPrep {
+                gpa: window_base + s.map_offset,
+                size: s.map_len,
+                map_cache: s.map_cache,
+            });
+        }
+        let map_len = round_up_page(self.blobs[idx].size);
+        if map_len == 0 || map_len > MAX_BLOB_MAP_BYTES {
+            return BlobRemapBegin::Failed(VirtioError::DeviceError);
+        }
+        // The target range must sit entirely inside the VidMm partition —
+        // anything else would collide with the KMD-side offset allocator.
+        if offset % BLOB_PAGE != 0
+            || offset.checked_add(map_len).map_or(true, |e| e > self.vidmm_reserved)
+        {
+            return BlobRemapBegin::Failed(VirtioError::DeviceError);
+        }
+        let old = if self.blobs[idx].mapped {
+            Some((self.blobs[idx].map_offset, self.blobs[idx].map_len))
+        } else {
+            None
+        };
+        let s = &mut self.blobs[idx];
+        s.map_pending = true;
+        s.mapped = false;
+        s.map_offset = offset;
+        s.map_len = map_len;
+        BlobRemapBegin::Start { old, len: map_len }
+    }
+
+    /// Blobs currently mapped overlapping `[offset, offset+len)` inside the
+    /// VidMm partition, EXCLUDING `keep_resource_id`. Such mappings are stale
+    /// VidMm placements (an eviction this driver missed or dropped): VidMm
+    /// never double-books segment ranges, so before mapping a new blob into
+    /// the range the caller must RESOURCE_UNMAP_BLOB each returned id and
+    /// clear it via [`Self::blob_note_unmapped`]. Bounded scan under the lock.
+    pub fn blobs_overlapping(
+        &self,
+        offset: u64,
+        len: u64,
+        keep_resource_id: u32,
+        out: &mut [u32],
+    ) -> usize {
+        let end = offset.saturating_add(len);
+        let mut n = 0;
+        for s in self.blobs.iter() {
+            if s.mapped
+                && s.resource_id != keep_resource_id
+                && s.map_offset < self.vidmm_reserved
+                && s.map_offset < end
+                && s.map_offset.saturating_add(s.map_len) > offset
+            {
+                if n < out.len() {
+                    out[n] = s.resource_id;
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+
+    /// The blob currently mapped exactly at window `offset`, if any. Used by
+    /// `DxgkDdiUnmapCpuHostAperture`, which names aperture pages but not the
+    /// allocation.
+    pub fn blob_resid_at_offset(&self, offset: u64) -> Option<u32> {
+        self.blobs
+            .iter()
+            .find(|s| s.mapped && s.map_offset == offset)
+            .map(|s| s.resource_id)
+    }
+
+    /// Record that a blob's host mapping was torn down outside the normal
+    /// release path (stale-placement eviction in `map_blob_at`). No window
+    /// range is freed here — VidMm-partition offsets never enter the free list.
+    pub fn blob_note_unmapped(&mut self, resource_id: u32) {
+        if let Some(s) = self
+            .blobs
+            .iter_mut()
+            .find(|s| s.resource_id == resource_id && s.mapped)
+        {
+            s.mapped = false;
+            s.map_offset = 0;
+            s.map_len = 0;
+        }
+    }
+
     /// Transfer a blob's lifetime ownership from its escape owner (the D3DKMT
     /// device handle the ICD allocated it under) to the WDDM allocation adopting
     /// it in `DxgkDdiCreateAllocation`. Returns whether the resource is LIVE —
@@ -1627,6 +1768,14 @@ impl VirtioGpu {
     /// silently leak if the bounded free list is full — bring-up acceptable).
     fn free_window_range(&mut self, offset: u64, len: u64) {
         if len == 0 {
+            return;
+        }
+        // VidMm-partition offsets are owned by VidMm's segment allocator — they
+        // must never enter the KMD free list (a later KMD-side map would collide
+        // with a VidMm placement). Every release path funnels here, so this one
+        // guard covers DestroyAllocation/ReleaseBlob/teardown of VidMm-placed
+        // blobs uniformly.
+        if offset < self.vidmm_reserved {
             return;
         }
         if offset.checked_add(len) == Some(self.next_window_offset) {

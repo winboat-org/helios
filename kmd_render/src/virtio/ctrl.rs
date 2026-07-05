@@ -27,8 +27,8 @@ use wdk_sys::ntddk::{KeDelayExecutionThread, KeWaitForSingleObject};
 use wdk_sys::{LARGE_INTEGER, PVOID, STATUS_SUCCESS};
 
 use super::gpu::{
-    BlobMapBegin, BlobMapFinish, BlobMapPrep, FenceWaitPrep, InFlight, SyncWaitBlock,
-    CTRL_TIMEOUT_COUNT, FENCE_WAIT_TIMEOUTS, MAX_PARKED, SUBMIT_META_BYTES,
+    BlobMapBegin, BlobMapFinish, BlobMapPrep, BlobRemapBegin, FenceWaitPrep, InFlight,
+    SyncWaitBlock, CTRL_TIMEOUT_COUNT, FENCE_WAIT_TIMEOUTS, MAX_PARKED, SUBMIT_META_BYTES,
 };
 use super::hal::DmaBuffer;
 use super::VirtioError;
@@ -485,6 +485,81 @@ pub fn map_blob_prepare(
                         let _ = resource_unmap_blob(adapter, resource_id);
                         let _ =
                             adapter.with_virtio(|v| v.free_window_range_pub(offset, len));
+                        Err(VirtioError::DeviceError)
+                    }
+                };
+            }
+        }
+    }
+}
+
+/// Map a blob at the FIXED window offset VidMm assigned (the CPU-visible BAR
+/// memory segment, `build_paging_buffer.rs`). Inverts the normal order: instead
+/// of the KMD allocator picking the offset, the blob is placed where VidMm put
+/// the allocation, so CPU raster (through the segment's CpuTranslatedAddress),
+/// the GDI executor, and the host all address the same bytes.
+///
+/// A pre-existing mapping at another offset is torn down first (blob content is
+/// intrinsic to the host memory object — a remap is content-preserving), and
+/// any STALE other-blob mapping overlapping the target range (an eviction this
+/// driver missed) is unmapped so host window subregions never overlap.
+/// PASSIVE_LEVEL only (host round-trips).
+pub fn map_blob_at(
+    adapter: &AdapterContext,
+    resource_id: u32,
+    window_offset: u64,
+) -> Result<BlobMapPrep, VirtioError> {
+    // Evict stale overlapping placements before reserving our own slot.
+    let (_, blob_size, _) = adapter
+        .with_virtio(|v| v.blob_lookup(resource_id))
+        .map_err(|_| VirtioError::DeviceError)?
+        .ok_or(VirtioError::DeviceError)?;
+    let map_len = blob_size.saturating_add(4095) & !4095;
+    let mut stale = [0u32; 8];
+    let n = adapter
+        .with_virtio(|v| v.blobs_overlapping(window_offset, map_len, resource_id, &mut stale))
+        .unwrap_or(0);
+    for &res in stale[..n].iter() {
+        let _ = resource_unmap_blob(adapter, res);
+        let _ = adapter.with_virtio(|v| v.blob_note_unmapped(res));
+    }
+
+    let mut busy_retries = 0u32;
+    loop {
+        let begin = adapter
+            .with_virtio(|v| v.blob_remap_begin(resource_id, window_offset))
+            .map_err(|_| VirtioError::DeviceError)?;
+        match begin {
+            BlobRemapBegin::Mapped(prep) => return Ok(prep),
+            BlobRemapBegin::Failed(e) => return Err(e),
+            BlobRemapBegin::Busy => {
+                busy_retries += 1;
+                if busy_retries > MAP_BUSY_RETRY_MAX {
+                    return Err(VirtioError::Timeout);
+                }
+                sleep_ms(1);
+            }
+            BlobRemapBegin::Start { old, len } => {
+                if let Some((old_offset, old_len)) = old {
+                    // Content-preserving move: unmap the previous placement and
+                    // (for KMD-partition offsets only — the free guard ignores
+                    // VidMm-partition ones) return its range.
+                    let _ = resource_unmap_blob(adapter, resource_id);
+                    let _ = adapter
+                        .with_virtio(|v| v.free_window_range_pub(old_offset, old_len));
+                }
+                let cache = resource_map_blob_roundtrip(adapter, resource_id, window_offset);
+                let cache_ok = cache.as_ref().ok().copied();
+                let fin = adapter
+                    .with_virtio(|v| v.blob_map_finish(resource_id, window_offset, len, cache_ok))
+                    .map_err(|_| VirtioError::DeviceError)?;
+                return match fin {
+                    BlobMapFinish::Done(prep) => Ok(prep),
+                    BlobMapFinish::HostRejected => {
+                        Err(cache.err().unwrap_or(VirtioError::DeviceError))
+                    }
+                    BlobMapFinish::SlotGone => {
+                        let _ = resource_unmap_blob(adapter, resource_id);
                         Err(VirtioError::DeviceError)
                     }
                 };
