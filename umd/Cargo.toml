@@ -30,3 +30,6 @@ opt-level = 1
 panic = "abort"
 lto = "thin"
 opt-level = 2
+# Full debug info: the minidump symbolization workflow (dump_syms +
+# minidump-stackwalk) requires a GUID-matched PDB for the deployed DLL.
+debug = "full"
