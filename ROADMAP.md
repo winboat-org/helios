@@ -100,19 +100,44 @@ Open defects, roughly ordered:
    WDDM pending-FIFO watermark now counts ring-0 fences only (ring≥1 stay in flight for
    the whole GPU-work duration; counting them would couple GDI/paging DMA pacing to
    multi-ms GPU work) + RING_SUBMIT/RING_COMPLETE counters (TDR report v4).
-   **Remaining work — the production integration (replaces `PresentGateUs`):**
-   (a) dxvk-helios: per-swapchain exportable timeline semaphore (KMT — `wddm_global` is a
-   plain DWORD, publishable via shared memory; `helios_wddm_sync_create(nt_shared=false)`);
-   present path signals value=present-counter on the frame's last submission INSTEAD of
-   gating — zero wait on the present thread. (b) UMD: publish (sem KMT handle, target
-   value) per resid in a small shared section, written before `pfnPresentCb`. (c) LGIdd:
-   at per-acquire resolve, import the semaphore once (cache), read the resid's value,
-   `vkWaitSemaphores(imported, value, bounded ~100 ms)` before the copy; on timeout copy
-   anyway + loud counter (never wedge the IDD). Sequencing: install KMD 22.22.52 BEFORE
-   dwm rides per-present ring-1 fences. Cost per present: one ~24-byte ring-1 submit +
-   one retire-thread WAIT_FENCE escape (µs-class). Known residue: old-ICD probe runs
-   leaked 4 idle render-server workers host-side (virgl-63/65/95/97, tied to the
-   pre-retire-thread timeout path); clears on VM restart, did not recur with the new ICD.
+   **PRODUCTION INTEGRATION DEPLOYED (20th session, 2026-07-06) — A/B running with
+   `PresentGateUs=0`.** The design changed twice against reality:
+   - **KMT is impossible**: dxgkrnl rejects a MONITORED fence with `Shared=1` and no
+     `NtSecuritySharing` (0xc000000d, proven live), i.e. no global-DWORD flavor exists.
+     The ICD's legacy-D3DDDI_FENCE fallback silently produced syncs whose FromCpu waits
+     hang forever (wedged the probe) — fallback REMOVED, KMT semaphore caps no longer
+     advertised (mesa `d5d698aaec5`). Rendezvous = **NAMED NT sharing**: standard
+     `VkExportSemaphoreWin32HandleInfoKHR::name` / import-by-name
+     (`D3DKMTShareObjects` w/ named OBJECT_ATTRIBUTES → `D3DKMTOpenSyncObjectNtHandleFromName`).
+     dwm CAN create `Global\` names (SeCreateGlobalPrivilege verified on its token).
+     `vk_ring_fence_probe named` rc=0 (98 % of T_gpu; NT regression 97 %).
+   - **LGIdd needed NO changes**: its per-acquire copy runs on OUR UMD/dxvk inside
+     WUDFHost (that instance imports dwm's backbuffers as alias images — resids
+     probe-verified) — the consumer wait lives in dxvk-helios's
+     `refreshHeliosStagedImages`, `dxvk.heliosPresentWaitUs` (default 0, WUDFHost.exe
+     profile = 100000; imported-mode images only, so dwm never grows a CS-thread wait).
+   Shipped shape: producer (`present_sync_publish`, umd `9d22620`+`a7f2dfa`, dxvk
+   `b15bc42f`+`8c612b3d`) creates one named fence per D3D11 device
+   (`Global\HeliosPresentFence_<pid>_<fenceId>` — dwm owns SEVERAL devices, per-pid
+   names collided live; Everyone-DACL), records signalFence(++counter) on the frame's
+   OPEN cmdlist (no present-thread wait), publishes (resid → pid, fenceId, value) in a
+   seqlock-slotted mapped FILE `C:\ProgramData\Helios\helios_present_sync.bin` (both
+   principals have ProgramData rights; do NOT delete the live file — mapped views
+   split-brain until the mappers restart). Consumer imports by name (cached per
+   pid+fenceId), `getValue` fast-path, bounded wait, timeout → copy anyway + loud
+   `present-wait:` telemetry. Kill switches: `HKLM\SOFTWARE\Helios!PresentSyncPublish=0`
+   (producer), `dxvk.heliosPresentWaitUs=0` (consumer). Deployed: UMD
+   `helios_umd_8301bc9779a48b99.dll`, ICD `vulkan_virtio-cf1280da750c.dll`, verified in
+   dwm+WUDFHost; cross-session import proven live ("imported fence of producer pid").
+   First numbers (gate=0, 10 Hz flasher stress): ~900 consumer waits, avg 5–6 ms,
+   ~4 % bounded timeouts in bursts when dwm's CS runs >100 ms behind (structural:
+   the consumer chases the latest published value; bounded + loud by design), ZERO
+   strikes, desktop paintcap-clean, submit_avg ~4 µs unchanged.
+   **Remaining:** multi-hour soak with gate=0 (ghosting eyeballs via Looking Glass,
+   timeout-rate baseline vs budget — consider 32 ms to cap IDD stall bursts), then
+   retire `PresentGateUs` (flip compiled default to 0) and drop the gate from the hot
+   path. Known residue: old-ICD probe runs leaked 4 idle render-server workers
+   host-side (virgl-63/65/95/97); clears on VM restart, did not recur with the new ICD.
 5. **dxgkrnl "Driver returned an invalid NTSTATUS 0xC00000BB"** (ETW
    AzureTriage) — some query answered STATUS_NOT_SUPPORTED where that return
    is illegal. Tolerated today; find and fix the query.
@@ -272,8 +297,11 @@ Plan:
   phase averages) to `C:\ProgramData\Helios\helios_queue_perf.log`.
 - **Ring-fence probe**: `tools/vk_ring_fence_probe.cpp` → schtasks
   `helios_ringprobe` (wrapper `C:\Users\Rupansh\helios-probe\run_ring_probe.cmd`,
-  `/rl LIMITED`). Proves/regression-tests the WS1 #4 chain: rc=0 + "consumer wait
-  tracked GPU completion". **GOTCHA (cost a diagnosis detour): the Vulkan loader
+  `/rl LIMITED`; `helios_ringprobe_named` runs the NAMED-import mode against the
+  dev ICD build via `icd_devbuild.json`). Proves/regression-tests the WS1 #4
+  chain: rc=0 + "consumer wait tracked GPU completion". Build on the VM with
+  the WinLibs g++ (`g++ -O2 -o ... Z:\tools\vk_ring_fence_probe.cpp -I <VulkanSDK>\Include
+  C:\Windows\System32\vulkan-1.dll`) — no clang-cl on the box. **GOTCHA (cost a diagnosis detour): the Vulkan loader
   silently ignores `VK_DRIVER_FILES`/`VK_ICD_FILENAMES` in ELEVATED processes** —
   win_exec/SSH shells are High-IL (and `runas /trustlevel:0x20000` still reads as
   elevated), so an "env-override" probe actually tests the REGISTRY ICD. Run ICD
