@@ -90,10 +90,20 @@ Known costs, unmeasured — measure before optimizing:
 - **Frame-update slowness** (owner-visible): known suspects = dxvk-helios
   persistent-refresh (14th session, alias-image staging + per-frame refresh)
   and the diagnostic probes. Quantify, then decide what to gate/remove.
-- **Diagnostics overhead**: per-batch registry writes (RenderGdi counter
-  dumps), per-op logging, the 11.1-DDI log budget. Introduce a master
-  diag kill-switch (registry knob, like `BarSegMode`) and default it off
-  once stability holds.
+- **Diagnostics overhead — GATED 2026-07-05** (default quiet; knobs restore):
+  UMD per-op log I/O was open/write/close per line on per-frame paths → now a
+  persistent handle + `trace_line!` behind `HKLM\SOFTWARE\Helios!UmdTrace`
+  (e88f2c6; umd log 8612→681 lines/30 s under churn). ICD submit/shmem trace
+  (33 MB+1.9 MB per session, fopen per submission) behind `HELIOS_SUBMIT_TRACE`
+  env (mesa 4bb43194e5d). KMD: S-ring `diag::record` off + gdi_blit's 20-value
+  per-batch registry dump deferred to every 64th batch behind service-key
+  `DiagLevel` (bf0ab37, 22.22.51 — **built + signed, NOT yet installed**;
+  needs a reboot to activate). Also cleared the stale
+  `HKLM\SOFTWARE\Helios!RotateSample=16` debug knob (was CPU-reading back the
+  whole swapchain ring every 16 rotations). GOTCHA found while measuring: pids
+  get reused and `umd-<pid>.log` appends — delete logs before comparing runs.
+  Present-rate deltas across dwm restarts are confounded by IDD-pairing state;
+  compare within one dwm session only.
 - **Venus submit/fence latency**: ARCH.md's original benchmark item. The
   async/interrupt transport (C3/M3.4) landed; measure round-trip and
   present-to-scanout latency.
