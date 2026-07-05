@@ -52,16 +52,24 @@ Open defects, roughly ordered:
    (Xid-109: pending forever) still latches at strikes×deadline. RESULT: strikes went from
    ~1/min/process to ZERO across dwm+explorer+WUDFHost (fixed ICD, ~10 min incl. idle).
    The second stall contributor — the rotate drain — is fixed under WS2 (presents now track
-   damage rate: ~10/s under the 10 Hz flasher vs ~6/s before). Remaining: soak + cold-boot
-   verification; `HELIOS_QUEUE_PERF=1` + `HELIOS_PERF_FILE` are set machine-wide and reach
-   dwm at the next reboot for steady-state submit-phase numbers.
-2. **dxvk-helios device-loss hygiene — FIXED (11a30110, deployed 2026-07-05):**
-   (a) dropped post-loss submissions now `notifyObjects()` + recycle (was: permanent in-use
-   ref leak → dwm compositor wedge); (b) `waitForResource` bails on DEVICE_LOST (loud warn);
-   (c) on lost, bounded 2 s grace wait then deliberate cmdlist leak instead of resetting a
-   pool with host-pending buffers (was: the vkResetCommandPool VUs). Loss-path behavior not
-   yet exercised end-to-end (needs a forced-loss test: VN_HELIOS_SEM_DEADLINE_MS=1 on a
-   probe process).
+   damage rate: ~10/s under the 10 Hz flasher vs ~6/s before). 19th-session soak data
+   point (2026-07-06, warm boot): ZERO non-forced strikes and zero DEVICE_LOST over the
+   whole session (~1 h incl. heavy GPU probe workloads); present-gate timeouts flat at the
+   startup value; rotate-perf 1–4 µs; HELIOS_QUEUE_PERF live in dwm, submit phases all
+   µs-class (submit_avg ~4 µs). Remaining: multi-hour/day soak.
+2. **dxvk-helios device-loss hygiene — FIXED and FORCED-LOSS-VERIFIED (19th session,
+   2026-07-06):** (a) dropped post-loss submissions now `notifyObjects()` + recycle (was:
+   permanent in-use ref leak → dwm compositor wedge); (b) `waitForResource` bails on
+   DEVICE_LOST (loud warn); (c) on lost, bounded 2 s grace wait then deliberate cmdlist
+   leak instead of resetting a pool with host-pending buffers (was: the vkResetCommandPool
+   VUs). End-to-end forced-loss test PASSED (`VN_HELIOS_SEM_DEADLINE_MS=1` +
+   `_STRIKES=1` on d3d11_upload_integrity_probe): latch fired on the first genuine 1 ms
+   pending window with full attribution, probe ran to completion with loud FAILs (reads
+   return zeros post-loss) and exited — no wedge; all three hygiene paths logged in the
+   dxvk log (`leaking command list with unretired host work`, `waitForResource aborted`,
+   repeated loud submit failures); dwm untouched. Note: once the ICD latches, host
+   retirement becomes unobservable, so the deliberate leak fires even on a healthy host —
+   by design.
 3. **dwm shared-resource creation failure — FALSIFIED as written (18th session, 2026-07-05)**:
    every `DXVK memory not importable` line (current boot AND the freeze-evidence tail) belongs
    to `misc=0x0` PRIVATE textures, where suballocation is correct. Shared/present creations
@@ -74,19 +82,37 @@ Open defects, roughly ordered:
    per-acquire re-resolve is the alias-staging refresh design, not a missing-export symptom.
    Residual noise, harmless: dwm warns `Failed to write shared resource info` 9× (dxvk shared
    metadata runs before the UMD stamps KMT handles; WINE-escape fallback fails by design).
-4. **KMD wire-fence semantics** (now also the GHOSTING architectural fix): ring-0 used-ring
-   returns complete WDDM DMA fences at host *decode* time (virglrenderer 1.3.0: ring 0
-   retires immediately; ring ≥ 1 = real GPU completion via vkr queue sync threads). Violates
-   the "never signal a wire fence before host completion" invariant at the dxgkrnl level.
-   18th-session scoping: the ICD ALREADY puts `ring_idx` in the SUBMIT_VENUS escape header
-   (`helios_ioctl_submit_cs`, vn_renderer_helios.c:1092), and vn queues carry ring_idx ≥ 1 —
-   but with semaphore/fence FEEDBACK active (the default) vn never submits per-queue-fence
-   batches, so everything on the wire is ring-0 ring-notify traffic (the 0/251,810 stat).
-   Work: KMD honors hdr.ring_idx (VIRTIO_GPU_FLAG_INFO_RING_IDX + per-ring in-flight fence
-   table), then cross-process present→IDD ordering via win32-sync external semaphores riding
-   ring≥1 wire fences (replaces the interim present gate, moves the wait to the consumer,
-   GPU-side). Also: `helios_sync_append_locked(fence_id=0)` blind-signals + clears older
-   pendings (latent).
+4. **KMD wire-fence semantics / consumer-side present ordering — MECHANISM PROVEN
+   END-TO-END (19th session, 2026-07-06).** `tools/vk_ring_fence_probe.cpp` (schtasks
+   `helios_ringprobe`, MEDIUM integrity — see tooling gotcha) demonstrates the full chain
+   on the live stack: vkQueueSubmit2 signaling an exported win32 timeline semaphore →
+   vn ring_idx≥1 fence-only SUBMIT_VENUS (`vkWaitRingSeqnoMESA` cs, orders the fence
+   behind the ring-decoded queue submission) → KMD INFO_RING_IDX wire fence (the transport
+   already honored ring_idx; in-flight table is per-fence token-matched, out-of-order-safe)
+   → QEMU 11.0.1 → proxy → render-server vkr queue sync thread → host GPU completion
+   (qemu fence trace: retire at 263 ms on a 269 ms workload; ring-0 retires in µs at
+   decode) → used-ring completion → **new ICD retire thread** (mesa `4a6aa14f17b`: on
+   every SHARED-sync signal, a per-renderer thread WAIT_FENCEs the wire fence and signals
+   the shared WDDM monitored fence in retire order; helios_sync now refcounted; also fixed
+   the `helios_sync_append_locked(fence_id=0)` blind-signal that cleared older pendings)
+   → consumer `vkWaitSemaphores` on the re-imported semaphore returns at 97–98 % of
+   T_gpu, never early. KMD `22.22.52` (BUILT, NOT yet installed — needs owner reboot):
+   WDDM pending-FIFO watermark now counts ring-0 fences only (ring≥1 stay in flight for
+   the whole GPU-work duration; counting them would couple GDI/paging DMA pacing to
+   multi-ms GPU work) + RING_SUBMIT/RING_COMPLETE counters (TDR report v4).
+   **Remaining work — the production integration (replaces `PresentGateUs`):**
+   (a) dxvk-helios: per-swapchain exportable timeline semaphore (KMT — `wddm_global` is a
+   plain DWORD, publishable via shared memory; `helios_wddm_sync_create(nt_shared=false)`);
+   present path signals value=present-counter on the frame's last submission INSTEAD of
+   gating — zero wait on the present thread. (b) UMD: publish (sem KMT handle, target
+   value) per resid in a small shared section, written before `pfnPresentCb`. (c) LGIdd:
+   at per-acquire resolve, import the semaphore once (cache), read the resid's value,
+   `vkWaitSemaphores(imported, value, bounded ~100 ms)` before the copy; on timeout copy
+   anyway + loud counter (never wedge the IDD). Sequencing: install KMD 22.22.52 BEFORE
+   dwm rides per-present ring-1 fences. Cost per present: one ~24-byte ring-1 submit +
+   one retire-thread WAIT_FENCE escape (µs-class). Known residue: old-ICD probe runs
+   leaked 4 idle render-server workers host-side (virgl-63/65/95/97, tied to the
+   pre-retire-thread timeout path); clears on VM restart, did not recur with the new ICD.
 5. **dxgkrnl "Driver returned an invalid NTSTATUS 0xC00000BB"** (ETW
    AzureTriage) — some query answered STATUS_NOT_SUPPORTED where that return
    is illegal. Tolerated today; find and fix the query.
@@ -94,13 +120,14 @@ Open defects, roughly ordered:
    pairing is resilient now but the race window is still there.
 7. **In-place KMD update flakiness** — CM_PROB_FAILED_POST_START limbo until
    reboot is expected, but keep the version-coherence gotcha (three sites) and
-   backup ladder in mind. 2026-07-06 state: ACTIVE driver = **oem58.inf = 22.22.51
-   (pkg c393e58c1b189688)**; `UserModeDriverName` → ProgramData
-   `helios_umd_b3615be0ce9de13e.dll` (RELEASE profile: no-wait CS rotation + present
-   gate + log fixes; DriverStore copy synced this time, but still verify deploys by the
-   loaded-module path of a fresh dwm, not file timestamps). Active ICD =
-   `vulkan_virtio-7c94d802f270.dll` (strike attribution + pending-window deadline fix,
-   mesa f7a816f182f).
+   backup ladder in mind. 2026-07-06 state (19th session): ACTIVE driver = **oem58.inf =
+   22.22.51 (pkg c393e58c1b189688)**; **22.22.52 package BUILT but NOT installed**
+   (per-ring watermark + counters — install via win_install_kmd with the owner-consented
+   reboot). `UserModeDriverName` → ProgramData `helios_umd_b3615be0ce9de13e.dll`
+   (RELEASE profile; verify deploys by the loaded-module path of a fresh dwm, not file
+   timestamps). Registry ICD = **`vulkan_virtio-5535366186bd.dll`** (mesa `4a6aa14f17b`:
+   external-sync retire thread + blind-signal fix; new processes only — dwm keeps
+   `7c94d802f270` until its next restart/reboot; probe-verified on the registry path).
 8. **Mechanism question (understand before optimizing)**: post-cold-boot, GDI
    content renders while RenderGdi (GdiE), MapCpuHostAperture (ChMn) and
    paging (Pg*) counters all stay idle, yet 8 standard allocations sit in
@@ -237,6 +264,22 @@ Plan:
   positive (should no longer happen post-f7a816f182f); large `pending_ms` = a
   genuinely stuck host channel.
 - **Queue-submit phase timing**: `HELIOS_QUEUE_PERF=1` + `HELIOS_PERF_FILE`
-  machine env (SET, active for dwm after the next reboot) — one aggregate line
+  machine env (live in dwm since the 2026-07-06 reboot) — one aggregate line
   per 300 vkQueueSubmit2 calls (tls/wsi-flush/cache-flush/submit/fence-wait
   phase averages) to `C:\ProgramData\Helios\helios_queue_perf.log`.
+- **Ring-fence probe**: `tools/vk_ring_fence_probe.cpp` → schtasks
+  `helios_ringprobe` (wrapper `C:\Users\Rupansh\helios-probe\run_ring_probe.cmd`,
+  `/rl LIMITED`). Proves/regression-tests the WS1 #4 chain: rc=0 + "consumer wait
+  tracked GPU completion". **GOTCHA (cost a diagnosis detour): the Vulkan loader
+  silently ignores `VK_DRIVER_FILES`/`VK_ICD_FILENAMES` in ELEVATED processes** —
+  win_exec/SSH shells are High-IL (and `runas /trustlevel:0x20000` still reads as
+  elevated), so an "env-override" probe actually tests the REGISTRY ICD. Run ICD
+  A/B probes through a `/rl LIMITED` scheduled task.
+- **QEMU fence tracing without restart**: QMP on `/tmp/helios-tpm/mon.sock` →
+  `trace-event-set-state` for `virtio_gpu_fence_ctrl`/`virtio_gpu_fence_resp`
+  (output → `/tmp/helios-qemu-stderr.log`; ctrl→resp gap per fence id = decode-
+  vs GPU-completion retirement; disable after use — it logs 2 lines per fence).
+  NOTE: `-d guest_errors` is already on, but virglrenderer's vkr_log/proxy_log
+  are INFO-level = SILENT on the release build — absence of host log lines
+  proves nothing below WARNING; a real host-side bisect needs a relaunch with
+  `VIRGL_LOG_LEVEL=debug`.
