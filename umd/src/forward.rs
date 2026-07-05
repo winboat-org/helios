@@ -997,11 +997,32 @@ unsafe extern "C" fn create_resource(
                                 if memory != 0 && memory_offset == 0 && memory <= u32::MAX as u64 {
                                     (memory, memory_size, resource_id)
                                 } else {
-                                    if memory != 0 {
+                                    // Only resources that get a WDDM allocation (shared /
+                                    // keyed-mutex / present / primary) NEED an importable
+                                    // backing — for those a suballocated DXVK memory means
+                                    // a cross-process opener sees a disconnected KMD blob
+                                    // (two-memory split), so shout. Private textures are
+                                    // suballocated by design; that used to log here too and
+                                    // got misread as a shared-resource defect (18th session).
+                                    const DDI_BIND_PRESENT: u32 = 0x0000_0080;
+                                    const DDI_MISC_SHARED: u32 = 0x0000_0002;
+                                    const DDI_MISC_SHARED_KEYEDMUTEX: u32 = 0x0000_0100;
+                                    let needs_importable = !a.pPrimaryDesc.is_null()
+                                        || (a.BindFlags & DDI_BIND_PRESENT) != 0
+                                        || (a.MiscFlags
+                                            & (DDI_MISC_SHARED | DDI_MISC_SHARED_KEYEDMUTEX))
+                                            != 0;
+                                    if memory != 0 && needs_importable {
                                         log_line(&format!(
-                                            "DDI create_resource(tex2d): DXVK memory not importable memory=0x{:x} res_id={} size={} offset={}",
-                                            memory, resource_id, memory_size, memory_offset
+                                            "DDI create_resource(tex2d): SHARED RESOURCE WITHOUT IMPORTABLE BACKING memory=0x{:x} res_id={} size={} offset={} bind=0x{:x} misc=0x{:x}",
+                                            memory, resource_id, memory_size, memory_offset,
+                                            a.BindFlags, a.MiscFlags
                                         ));
+                                    } else if memory != 0 {
+                                        trace_line!(
+                                            "DDI create_resource(tex2d): private suballocated memory=0x{:x} size={} offset={}",
+                                            memory, memory_size, memory_offset
+                                        );
                                     }
                                     (0, 0, 0)
                                 };
