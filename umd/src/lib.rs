@@ -822,14 +822,77 @@ pub(crate) fn umd_log_path() -> &'static std::path::Path {
 }
 
 pub(crate) fn log_line(message: &str) {
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(umd_log_path())
-    {
-        let _ = writeln!(file, "[pid={}] {}", std::process::id(), message);
+    use std::sync::{Mutex, OnceLock};
+    // One handle per process: the old open/append/close-per-line pattern cost
+    // a full CreateFile round trip on every logged DDI call — measurable on
+    // per-frame paths (PSC WS2). Unbuffered File writes keep crash durability.
+    static FILE: OnceLock<Option<Mutex<std::fs::File>>> = OnceLock::new();
+    let file = FILE.get_or_init(|| {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(umd_log_path())
+            .ok()
+            .map(Mutex::new)
+    });
+    if let Some(lock) = file {
+        if let Ok(mut f) = lock.lock() {
+            let _ = writeln!(f, "[pid={}] {}", std::process::id(), message);
+        }
     }
 }
+
+/// Whether per-frame/per-op DDI chatter (`trace_line!`) is enabled:
+/// `HKLM\SOFTWARE\Helios!UmdTrace` (REG_DWORD) != 0. Read once per process.
+/// Errors, one-shots and refusals keep using [`log_line`] unconditionally —
+/// only known-hot repeat traffic (Present, OMSetRenderTargets,
+/// ResolveSharedResource, per-op stamps) sits behind this gate.
+pub(crate) fn trace_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        #[link(name = "advapi32")]
+        unsafe extern "system" {
+            fn RegGetValueA(
+                hkey: usize,
+                sub_key: *const u8,
+                value: *const u8,
+                flags: u32,
+                type_out: *mut u32,
+                data: *mut c_void,
+                data_len: *mut u32,
+            ) -> i32;
+        }
+        const HKEY_LOCAL_MACHINE: usize = 0x8000_0002;
+        const RRF_RT_REG_DWORD: u32 = 0x10;
+        let mut value: u32 = 0;
+        let mut len: u32 = 4;
+        // SAFETY: NUL-terminated key/value names; `value`/`len` outlive the call.
+        let rc = unsafe {
+            RegGetValueA(
+                HKEY_LOCAL_MACHINE,
+                c"SOFTWARE\\Helios".as_ptr().cast(),
+                c"UmdTrace".as_ptr().cast(),
+                RRF_RT_REG_DWORD,
+                core::ptr::null_mut(),
+                (&mut value as *mut u32).cast(),
+                &mut len,
+            )
+        };
+        rc == 0 && value != 0
+    })
+}
+
+/// Per-frame/per-op trace logging, gated by [`trace_enabled`]. The format
+/// arguments are not evaluated when tracing is off.
+macro_rules! trace_line {
+    ($($arg:tt)*) => {
+        if crate::trace_enabled() {
+            crate::log_line(&format!($($arg)*));
+        }
+    };
+}
+pub(crate) use trace_line;
 
 /// Log which DLL file THIS code is running from, once per process. Multiple
 /// UMD copies exist on disk (DriverStore package, ProgramData versioned

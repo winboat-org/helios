@@ -36,6 +36,7 @@ use helios_protocol::{
 use crate::ddi;
 use crate::device_funcs::HeliosDevice;
 use crate::log_line;
+use crate::trace_line;
 
 type Hdevice = ddi::D3D10DDI_HDEVICE;
 
@@ -319,13 +320,13 @@ unsafe fn stamp_dxvk_resource_kmt_handles(
     local: ddi::D3DKMT_HANDLE,
     global: ddi::D3DKMT_HANDLE,
 ) {
-    log_line(&format!(
+    trace_line!(
         "DDI resource KMT stamp enter: raw_local=0x{:x} raw_global=0x{:x}",
         local, global
-    ));
+    );
     let local = if local != 0 { local } else { global };
     if local == 0 {
-        log_line("DDI resource KMT stamp skipped: no usable handle");
+        trace_line!("DDI resource KMT stamp skipped: no usable handle");
         return;
     }
     let Some(dev) = helios_device(h) else {
@@ -518,14 +519,14 @@ unsafe fn release_resource(h: Hdevice, handle_priv: *mut c_void) {
                         };
                         if !dealloc.hResource.is_null() || dealloc.NumAllocations != 0 {
                             let hr = deallocate_cb(dev.h_rt_device, &mut dealloc);
-                            log_line(&format!(
+                            trace_line!(
                                 "DDI deallocate_resource: hr=0x{:08x} alloc=0x{:x} km=0x{:x} rt={:p} owned={}",
                                 hr as u32,
                                 (*state).allocation,
                                 (*state).km_resource,
                                 (*state).rt_resource,
                                 (*state).owns_allocation
-                            ));
+                            );
                         }
                     }
                 }
@@ -1044,14 +1045,14 @@ unsafe extern "C" fn create_resource(
                                     }
                                 }
                             }
-                            log_line(&format!(
+                            trace_line!(
                                 "DDI create_resource(tex2d): before KMT stamp km=0x{:x} alloc=0x{:x} blob=0x{:x} res_id={} blob_size={}",
                                 km_resource, allocation, backing_blob_id, backing_resource_id, backing_blob_size
-                            ));
+                            );
                             stamp_dxvk_resource_kmt_handles(h, &res, allocation, km_resource);
                             let n = RESOURCE_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
                             if n < 128 {
-                                log_line(&format!(
+                                trace_line!(
                                     "DDI create_resource(tex2d) ok after-stamp-call: {}x{} fmt={} usage={} bind=0x{:x} misc=0x{:x} sample={}x{}",
                                     mip0.TexelWidth,
                                     mip0.TexelHeight,
@@ -1061,7 +1062,7 @@ unsafe extern "C" fn create_resource(
                                     misc,
                                     a.SampleDesc.Count,
                                     a.SampleDesc.Quality
-                                ));
+                                );
                             }
                             store_resource(
                                 h_resource.pDrvPrivate,
@@ -1301,10 +1302,10 @@ unsafe extern "C" fn dxgi_resolve_shared_resource(
     let resource = dxgi_resource_handle(h_resource as ddi::DXGI_DDI_HRESOURCE);
     let alloc = resource_allocation(resource.pDrvPrivate);
     let (width, height) = resource_dimensions(resource.pDrvPrivate);
-    log_line(&format!(
+    trace_line!(
         "DXGI ResolveSharedResource: hDevice=0x{:x} hResource=0x{:x} alloc=0x{:x} {}x{}",
         h_device, h_resource, alloc, width, height
-    ));
+    );
     if let Some(context) = d3d11_context(Hdevice {
         pDrvPrivate: h_device as *mut c_void,
     }) {
@@ -1815,7 +1816,7 @@ unsafe extern "C" fn resource_map(
             let allocation = resource_allocation(h_resource.pDrvPrivate);
             let n = MAP_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
             if n < 256 || allocation != 0 {
-                log_line(&format!(
+                trace_line!(
                     "DDI resource_map ok alloc=0x{:x} sub={} map={} rowPitch={} depthPitch={} pData={:p}",
                     allocation,
                     subresource,
@@ -1823,7 +1824,7 @@ unsafe extern "C" fn resource_map(
                     out.RowPitch,
                     out.DepthPitch,
                     out.pData
-                ));
+                );
             }
             if !mapped.is_null() {
                 (*mapped).pData = out.pData;
@@ -2536,7 +2537,7 @@ unsafe extern "C" fn vs_set_shader(h: Hdevice, h_shader: ddi::D3D10DDI_HSHADER) 
     }
     let n = SHADER_BIND_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
     if n < 128 {
-        log_line(&format!("DDI VSSetShader raw=0x{com:x}"));
+        trace_line!("DDI VSSetShader raw=0x{com:x}");
     }
     let Some(context) = d3d11_context(h) else {
         return;
@@ -2558,7 +2559,7 @@ unsafe extern "C" fn ps_set_shader(h: Hdevice, h_shader: ddi::D3D10DDI_HSHADER) 
     }
     let n = SHADER_BIND_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
     if n < 128 {
-        log_line(&format!("DDI PSSetShader raw=0x{com:x}"));
+        trace_line!("DDI PSSetShader raw=0x{com:x}");
     }
     let Some(context) = d3d11_context(h) else {
         return;
@@ -2706,10 +2707,10 @@ unsafe extern "C" fn set_render_targets(
     }
     let n = OM_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
     if n < 256 || rt0.0 != 0 {
-        log_line(&format!(
+        trace_line!(
             "DDI OMSetRenderTargets num={} rt0_alloc=0x{:x} rt0={}x{} fmt={}",
             num_views, rt0.0, rt0.1, rt0.2, rt0.3
-        ));
+        );
     }
     let depth = load_com::<ID3D11DepthStencilView>(dsv.pDrvPrivate).map(|m| (*m).clone());
     context.OMSetRenderTargets(Some(&views), depth.as_ref());
@@ -2789,7 +2790,7 @@ unsafe fn log_draw_state(
         return;
     };
     let ia = dev.ia.borrow();
-    log_line(&format!(
+    trace_line!(
         "DDI {kind}: a={} b={} c={} d={} vs=0x{:x} ps=0x{:x} rt0_alloc=0x{:x} rt0={}x{} fmt={} layout=0x{:x}",
         count0,
         start0,
@@ -2802,7 +2803,7 @@ unsafe fn log_draw_state(
         ia.current_rt0_height,
         ia.current_rt0_format,
         ia.current_layout
-    ));
+    );
 }
 
 unsafe extern "C" fn draw(h: Hdevice, vertex_count: u32, start_vertex: u32) {
@@ -3098,10 +3099,10 @@ unsafe extern "C" fn create_srv(
                 let n = VIEW_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
                 if n < 256 || allocation != 0 {
                     let (width, height) = resource_dimensions(a.hDrvResource.pDrvPrivate);
-                    log_line(&format!(
+                    trace_line!(
                         "DDI create_srv ok: hpriv={:p} alloc=0x{:x} dim={} fmt={} {}x{}",
                         h_srv.pDrvPrivate, allocation, a.ResourceDimension, a.Format, width, height
-                    ));
+                    );
                 }
                 store_com(h_srv.pDrvPrivate, v);
             }
@@ -3658,10 +3659,10 @@ unsafe extern "C" fn ps_set_shader_resources(
                     }
                 }
             }
-            log_line(&format!(
+            trace_line!(
                 "DDI PSSetShaderResources start={} num={} nonnull={} first={:p} second={:p}",
                 start, num, nonnull, first_priv, second_priv
-            ));
+            );
         }
         c.PSSetShaderResources(start, Some(&collect_srvs(num, srvs)));
     }
@@ -5112,9 +5113,9 @@ unsafe fn resolve_vs_input_variant(h: Hdevice, lp: usize, vp: usize) {
     dev.ia.borrow_mut().bound_vs_com = desired;
     let n = SHADER_BIND_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
     if n < 256 {
-        log_line(&format!(
+        trace_line!(
             "DDI VS input-class variant bound: vs=0x{vp:x} -> 0x{desired:x}"
-        ));
+        );
     }
 }
 
@@ -5437,7 +5438,7 @@ unsafe extern "C" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT) -> i32 {
     // a per-process present ordinal so cycles can be told apart.
     static PRESENT_ORDINAL: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
     let ordinal = PRESENT_ORDINAL.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    log_line(&format!(
+    trace_line!(
         "DXGI Present: #{} src=0x{:x} dst=0x{:x} copied={} flags=0x{:x} presentCb=0x{:08x} \
          hSurf={:p} srcSub={} hDstRes={:p} dstSub={} flipInterval={} dxgiCtx={:p} hContext={:p}",
         ordinal,
@@ -5453,7 +5454,7 @@ unsafe extern "C" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT) -> i32 {
         a.FlipInterval,
         a.pDXGIContext,
         dev_context_for_log(h)
-    ));
+    );
     present_hr
 }
 
@@ -5584,11 +5585,11 @@ unsafe extern "C" fn dxgi_rotate_resource_identities(
 
     let c = ROTATE_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
     if c < 64 {
-        log_line(&format!(
+        trace_line!(
             "DXGI RotateResourceIdentities: rotated {} resources, alloc[0]=0x{:x}",
             n,
             (*states[0]).allocation
-        ));
+        );
     }
     0
 }
