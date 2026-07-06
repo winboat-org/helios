@@ -851,17 +851,25 @@ Open defects, roughly ordered:
     self-heals = P3/P4); vehicle named release fence created LAZILY
     inside present #1 (dxvk_bridge.cpp:1434) + consumer import-failure
     negative-cache of 256 LOOKUPS (dxvk_context.cpp:9482) = long
-    unordered window at chain birth. FIX DIRECTION (kick-independence,
-    in order): 1) retire thread: replace the 60 s WFMO with short sliced
-    waits interleaved with a WAIT_FENCE poll escape (whose inline
-    drain_used self-heals any lost wakeup, ctrl.rs:108 pattern);
-    2) KMD backstop: self-rearming short timer DPC while the
-    fence_events table is non-empty; 3) create the vehicle's named fence
-    EAGERLY at vehicle init; 4) make the fence-import negative cache
-    time-based, not 256-lookup-based. Verify: dwm-pid consumer-wait
-    timeout lines in dwm's dxvk log + KMD FENCE_EVENT_* / INT_ROUTINE
-    counters during one alternation repro (paintcap_hidden diffs detect
-    it without owner eyeball).
+    unordered window at chain birth. SOLUTION CHOSEN (owner: NO HACKS):
+    prove the failing link with ONE owner repro, then fix that link at
+    its ROOT — (a) event registered-but-never-signaled + INT_ROUTINE
+    stalled ⇒ interrupt delivery ⇒ MSI-X (MSISupported=0 is a bring-up
+    leftover); (b) used entry never posted ⇒ submission/doorbell path;
+    (c) event signaled but fence behind ⇒ ICD retire logic. The sliced-
+    polling retire wait + KMD timer backstop are REJECTED as hacks;
+    eager vehicle fence + time-based import retry are clean but staged
+    AFTER the repro so they cannot mask it. Evidence kit already
+    complete: dwm_helios_umd_dxvk.log present-wait lines (import lines
+    prove the channel live; ZERO timeout lines in healthy runs),
+    helios_icd_diag.log retire "GIVING UP ... stays UNSIGNALED" lines
+    (PROVEN to fire — 2 instances 2026-07-06), QUERY_STATS v2
+    FENCE_EVENT_*/INT_ROUTINE via tools/blob_map_size_probe.c,
+    paintcap_hidden content diffs. REPRO IS OWNER-ONLY: schtasks
+    launches always take foreground (fg=1 across 4 steal attempts), and
+    automated probing IS the curing activity (self-defeating). Owner
+    recipe: reproduce the alternation, hands off ~90 s (>60 s arms the
+    GIVING-UP diag), note the time; then read the four channels.
 - **Capture path**: IddCx frame drop policy vs D3D12 copy queue saturation;
   KVMFR bandwidth; 10 bpc default.
 - Candidates list from the NVIDIA fix era lives in ICD.md.
