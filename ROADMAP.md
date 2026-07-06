@@ -713,6 +713,21 @@ Open defects, roughly ordered:
     (same primitive): producer-fence wait before the copy flush retires
     the 7 ms copy-time CPU wait. Ladder: wait-honored telemetry → flip
     gate CPU path off → owner stutter eyeball → fps before/after.
+    **IMPLEMENTED + WEDGED (main `e9cdae6`, default OFF; VM registry
+    VehicleKernelFlipWait=0 guards the deployed default-ON UMD
+    `fb564d5072f8a58e`).** First live test (vkcube): present #1 armed +
+    queued OK, but the enqueueWait signal NEVER fired (exported present
+    fence counter never read ≥1 in the producer's own process — likely
+    an untested vn_GetSemaphoreCounterValue/vn_WaitSemaphores
+    exported-win32 path), the watchdog unwedge released the flip but the
+    app never presented again (the WSI worker parks on something after
+    pfnPresentCb — find it), and TerminateProcess on the wedged instance
+    HUNG THE ENTIRE GUEST — no bugcheck, no dump (kernel deadlock;
+    dxgkrnl/KMD teardown of a context with a parked queue + queued
+    monitored-fence wait whose signal source died). QMP system_reset
+    recovered. **26TH-SESSION TOP PRIORITY: root-cause + fix all three
+    (see the flip-kwait-wedge memory: NMI-crash/live-KD recipe, suspect
+    KMD teardown paths, retire-thread-signal design fallback).**
 - **Capture path**: IddCx frame drop policy vs D3D12 copy queue saturation;
   KVMFR bandwidth; 10 bpc default.
 - Candidates list from the NVIDIA fix era lives in ICD.md.
