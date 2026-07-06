@@ -769,6 +769,52 @@ Open defects, roughly ordered:
     freeze self-converts to dump+reboot (testsigning + ntoseye/gdbstub
     unaffected). Registry knob back to 0; ICD fix deployed + desktop
     cold-verified healthy on it.
+    **26TH SESSION CONT.: THE DEADLOCK CLASS KILLED — ERESOURCE HOLDER
+    NAMED AND FIXED (mesa `2cc63d82468`, deployed ICD
+    `vulkan_virtio-178211300d5f`; bcdedit /debug off applied).** The
+    owner-approved second NMI (full kernel dump, CrashDumpEnabled=2)
+    caught it red-handed: the exclusive holder of all 3 contended
+    ERESOURCEs was the process's own next VENUS ESCAPE —
+    HardwareAccess=1 escapes run dxgkrnl
+    AcquireCoreResourceExclusive → DXGPROCESS::FlushAllDevice →
+    VidSchWaitForCompletionEvent, i.e. they WAIT FOR EVERY CONTEXT
+    QUEUE TO DRAIN while holding the core resource; with a kwait-parked
+    queue whose signal comes from user mode, every
+    SignalSynchronizationObjectFromCpu (dxvk waiter, watchdog — user
+    dump caught the watchdog parked IN the signal syscall, so the
+    25th-session "unwedge released the flip" was FALSE — and the ICD
+    retire thread) convoys behind it = deadlock; wedge point #1/#2/#3
+    varied by race. Fix = unit 3's HardwareAccess=0 (correctness, not
+    just perf; `HELIOS_ESCAPE_HW=1` env kill switch) + the exported-sem
+    fold + a signalTo monotonicity guard (main `6d41f8e`, deployed UMD
+    `helios_umd_3b4a9e66394e9523`). **LADDER RESULTS (2026-07-07
+    02:45-02:53): 24,064 kwait presents, 0 wedges / 0 arm fails /
+    0 queue fails / 0 signal fails; mid-run kill (owner) → clean
+    teardown, no zombie, guest healthy. BUT THE OWNER EYEBALL RUNG
+    FAILED: vkcube showed the Doom-class STALE-FRAME STUTTER from
+    ~40 s in — kernel flip ordering alone does NOT close the stale
+    class. Plus a new observation: a freshly launched (unfocused)
+    vkcube alternates between TWO stale frames until the window is
+    clicked, then rendering progresses. DEFAULTS STAY OFF
+    (VehicleKernelFlipWait code default OFF, registry knob back to 0).**
+    **OWNER CONFIRMED: both issues are ABSENT on the sw present path**
+    — they are properties of the dcomp VEHICLE presentation layer, not
+    of fences/venus in general (matches the A/B: sw 200 fps zero
+    stale). 27th-session hypotheses, vehicle-layer-first:
+    (c1) DXGI_STATUS_OCCLUDED — Present() on an occluded/background
+    window returns a SUCCESS status (0x087A0001) and does not display;
+    wsi_win32_queue_present_vehicle checks only FAILED(hr)
+    (wsi_common_win32.cpp:1985-1995) so occluded presents "succeed"
+    silently → add per-present hr!=S_OK logging (cheap, likely explains
+    the click-gated launch behavior); (c2) dwm/dcomp consumption pacing
+    for background visuals, direct-flip vs composed transitions;
+    (a) backbuffer clobber — the venus copy lands at Present-call time
+    while up to frame-latency flips sit parked, so rotation may
+    overwrite a buffer whose flip has not scanned out (instrument
+    backbuffer ptr + flip completion pacing; consider bounding armed
+    depth); (b) U:=V fires at ring-fence retirement measured at 97-98%
+    of T_gpu — check the tail. First step: knob=0 vehicle A/B of the
+    unfocused-launch behavior + the hr logging.
 - **Capture path**: IddCx frame drop policy vs D3D12 copy queue saturation;
   KVMFR bandwidth; 10 bpc default.
 - Candidates list from the NVIDIA fix era lives in ICD.md.
