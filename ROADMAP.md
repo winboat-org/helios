@@ -685,9 +685,34 @@ Open defects, roughly ordered:
     map-pages / window-alloc) in QUERY_STATS v2.
     `tools/blob_map_size_probe.c` = size sweep + concurrent-headroom +
     v2 stats reader (gcc on the VM, no vcvars needed).
-- **Venus submit/fence latency**: ARCH.md's original benchmark item. The
-  async/interrupt transport (C3/M3.4) landed; measure round-trip and
-  present-to-scanout latency.
+    **STALE-FRAME A/B VERDICT + KERNEL-ENFORCED FLIP ORDERING PROVEN
+    (25th session cont., 2026-07-07; main `77dffe2`).** Owner A/B on the
+    fence-event stack: **sw path 200 fps (was 160 — the event waits
+    bought sw +40 fps) with ZERO stale frames; vehicle path 120-130 fps
+    with stale-frame stutter still present** → the leak is the
+    vehicle/UMD flip path, pre-existing, fps-scaled. Counted leak sites
+    that window: flip gate 11 timeouts + acquire gate 3 timeouts per
+    ~41k presents (each "proceeds loudly" = a stale flip candidate);
+    fence-event machinery itself clean (0 fallbacks/0 lost). NEXT ROAD —
+    **kernel-enforced vehicle flip ordering** (replaces the bounded CPU
+    worker gate): queue D3DKMTWaitForSynchronizationObjectFromGpu on the
+    copy's monitored fence AHEAD of the present packet, so dxgkrnl holds
+    the flip until the retire thread's CPU signal lands — no usermode
+    cap to leak, and the 6.6 ms worker serial gate retires (fps win).
+    `tools/vehicle_flipwait_probe.c` PROVES the primitive live on our
+    software-scheduled adapter (queued signal held behind an unsatisfied
+    wait, drained ~10 ms after the CPU signal; ZERO KMD changes) and the
+    topology: raw cross-device sync handles are REJECTED 0xC000000D —
+    the fence must be NT-shared (D3DKMTShareObjects) and reopened via
+    OpenSyncObjectFromNtHandle2 on the device owning the waiting context
+    (the WS1 #4 named-share consumer pattern). Implementation sketch:
+    UMD opens the vehicle fence (fence_id known from the present result)
+    on the device owning `dev.h_context`, queues the wait right before
+    pfnPresentCb; CPU gate kept as fallback knob + wedge watchdog
+    (a never-signaled fence would park the context queue). Second half
+    (same primitive): producer-fence wait before the copy flush retires
+    the 7 ms copy-time CPU wait. Ladder: wait-honored telemetry → flip
+    gate CPU path off → owner stutter eyeball → fps before/after.
 - **Capture path**: IddCx frame drop policy vs D3D12 copy queue saturation;
   KVMFR bandwidth; 10 bpc default.
 - Candidates list from the NVIDIA fix era lives in ICD.md.
