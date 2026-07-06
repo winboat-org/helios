@@ -25,6 +25,9 @@ set HELIOS_WSI_PERF=1
 set HELIOS_WSI_PERF_INTERVAL=300
 set HELIOS_WSI_PERF_FILE=%USERPROFILE%\helios-doom-wsi-perf.txt
 set HELIOS_WSI_DIRECT_MAP=1
+rem Road-4 dcomp present vehicle (23rd session): flip-model HW present for
+rem the Vulkan class. Kill switch: delete this line (sw async worker path).
+set HELIOS_WSI_DCOMP_PRESENT=1
 
 del "%HELIOS_PERF_FILE%" >NUL 2>NUL
 del "%HELIOS_WSI_PERF_FILE%" >NUL 2>NUL
