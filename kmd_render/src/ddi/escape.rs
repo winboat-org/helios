@@ -22,11 +22,14 @@ use core::mem::size_of;
 use bytemuck::{bytes_of, pod_read_unaligned};
 use helios_protocol::{
     HeliosEscapeAllocBlob, HeliosEscapeAttachResource, HeliosEscapeCtxCreate,
-    HeliosEscapeCtxDestroy, HeliosEscapeHeader, HeliosEscapeMapBlob, HeliosEscapeQueryStats,
-    HeliosEscapeReleaseBlob, HeliosEscapeSubmitVenus, HeliosEscapeWaitFence,
-    HELIOS_ESCAPE_ALLOC_BLOB, HELIOS_ESCAPE_ATTACH_RESOURCE, HELIOS_ESCAPE_CTX_CREATE,
-    HELIOS_ESCAPE_CTX_DESTROY, HELIOS_ESCAPE_MAP_BLOB, HELIOS_ESCAPE_QUERY_STATS,
-    HELIOS_ESCAPE_RELEASE_BLOB, HELIOS_ESCAPE_SUBMIT_VENUS, HELIOS_ESCAPE_WAIT_FENCE,
+    HeliosEscapeCtxDestroy, HeliosEscapeFenceEvent, HeliosEscapeHeader, HeliosEscapeMapBlob,
+    HeliosEscapeQueryStats, HeliosEscapeQueryStatsV2, HeliosEscapeReleaseBlob,
+    HeliosEscapeSubmitVenus, HeliosEscapeWaitFence, HELIOS_ESCAPE_ALLOC_BLOB,
+    HELIOS_ESCAPE_ATTACH_RESOURCE, HELIOS_ESCAPE_CTX_CREATE, HELIOS_ESCAPE_CTX_DESTROY,
+    HELIOS_ESCAPE_MAP_BLOB, HELIOS_ESCAPE_QUERY_STATS, HELIOS_ESCAPE_REGISTER_FENCE_EVENT,
+    HELIOS_ESCAPE_RELEASE_BLOB, HELIOS_ESCAPE_SUBMIT_VENUS, HELIOS_ESCAPE_UNREGISTER_FENCE_EVENT,
+    HELIOS_ESCAPE_WAIT_FENCE, HELIOS_FENCE_EVENT_ALREADY_COMPLETE, HELIOS_FENCE_EVENT_CANCELLED,
+    HELIOS_FENCE_EVENT_NOT_FOUND, HELIOS_FENCE_EVENT_PROBE_ACK, HELIOS_FENCE_EVENT_REGISTERED,
 };
 
 use super::blob_map::{
@@ -80,29 +83,203 @@ pub unsafe extern "C" fn dxgkddi_escape(
         HELIOS_ESCAPE_RELEASE_BLOB => escape_release_blob(adapter, buf, owner),
         HELIOS_ESCAPE_ATTACH_RESOURCE => escape_attach_resource(adapter, buf),
         HELIOS_ESCAPE_QUERY_STATS => escape_query_stats(adapter, buf),
+        HELIOS_ESCAPE_REGISTER_FENCE_EVENT => escape_register_fence_event(adapter, buf),
+        HELIOS_ESCAPE_UNREGISTER_FENCE_EVENT => escape_unregister_fence_event(adapter, buf),
         // Unknown verbs are rejected.
         _ => STATUS_NOT_IMPLEMENTED,
     }
 }
 
+// ── Fence events (KMD 22.22.54, PSC WS2) ────────────────────────────────────
+// Usermode replacement for blocking WAIT_FENCE escapes: register an event,
+// wait in usermode, cancel on timeout. No thread ever parks inside an escape,
+// so the dxgkrnl escape layer never convoys this process's SUBMIT_VENUS
+// escapes behind a wait again (measured 24th session: 2.9 ms → µs).
+
+/// `EVENT_MODIFY_STATE` — the only access the KMD needs (KeSetEvent).
+const EVENT_MODIFY_STATE: u32 = 0x0002;
+/// `UserMode` (`KPROCESSOR_MODE`) — the handle is validated against the
+/// CALLER's handle table with user-mode access checks (trust boundary).
+const USER_MODE: i8 = 1;
+
+extern "C" {
+    /// `extern POBJECT_TYPE *ExEventObjectType;` (wdm.h) — the executive event
+    /// object type, for ObReferenceObjectByHandle type validation. Not in the
+    /// wdk-sys ntddk bindings (data export, ntoskrnl.lib), so declared here.
+    static ExEventObjectType: *mut wdk_sys::POBJECT_TYPE;
+}
+
+/// Resolve a guest-supplied event handle to a referenced KEVENT. PASSIVE, in
+/// the calling process (DxgkDdiEscape runs in the caller's context — the same
+/// contract MAP_BLOB relies on). Returns `None` (counted) on any failure.
+fn reference_user_event(event_handle: u64) -> Option<core::ptr::NonNull<wdk_sys::KEVENT>> {
+    use core::sync::atomic::Ordering;
+    let mut object: wdk_sys::PVOID = core::ptr::null_mut();
+    // SAFETY: PASSIVE_LEVEL escape in the caller's process. UserMode access
+    // mode makes the object manager validate the handle, its type
+    // (ExEventObjectType) and EVENT_MODIFY_STATE access; on success we hold a
+    // reference that keeps the KEVENT alive until we deref it.
+    let status = unsafe {
+        wdk_sys::ntddk::ObReferenceObjectByHandle(
+            event_handle as wdk_sys::HANDLE,
+            EVENT_MODIFY_STATE,
+            *ExEventObjectType,
+            USER_MODE,
+            &mut object,
+            core::ptr::null_mut(),
+        )
+    };
+    if status != STATUS_SUCCESS || object.is_null() {
+        crate::virtio::gpu::FENCE_EVENT_INVALID.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    core::ptr::NonNull::new(object as *mut wdk_sys::KEVENT)
+}
+
+/// Drop an event reference at PASSIVE (registration-failure / unregister
+/// paths; the DISPATCH drain path uses ObDereferenceObjectDeferDelete).
+fn dereference_user_event(event: core::ptr::NonNull<wdk_sys::KEVENT>) {
+    // SAFETY: `event` holds a reference we own; PASSIVE_LEVEL.
+    unsafe { wdk_sys::ntddk::ObfDereferenceObject(event.as_ptr() as wdk_sys::PVOID) };
+}
+
+/// `HELIOS_ESCAPE_REGISTER_FENCE_EVENT` — park a usermode event for one-shot
+/// signaling at wire-fence retirement. Non-blocking. `fence_id == 0 &&
+/// event_handle == 0` is the capability probe (PROBE_ACK; old KMDs fail the
+/// escape with STATUS_NOT_IMPLEMENTED at the dispatcher).
+fn escape_register_fence_event(adapter: &AdapterContext, buf: &mut [u8]) -> NTSTATUS {
+    use crate::virtio::gpu::FenceEventReg;
+    use core::sync::atomic::Ordering;
+
+    let sz = size_of::<HeliosEscapeFenceEvent>();
+    if buf.len() < sz {
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+    let req: HeliosEscapeFenceEvent = pod_read_unaligned(&buf[..sz]);
+    let write_state = |buf: &mut [u8], state: u32| {
+        let mut out = req;
+        out.out_state = state;
+        buf[..sz].copy_from_slice(bytes_of(&out));
+    };
+
+    if req.fence_id == 0 && req.event_handle == 0 {
+        write_state(buf, HELIOS_FENCE_EVENT_PROBE_ACK);
+        return STATUS_SUCCESS;
+    }
+    if req.fence_id == 0 || req.event_handle == 0 {
+        crate::virtio::gpu::FENCE_EVENT_INVALID.fetch_add(1, Ordering::Relaxed);
+        return STATUS_INVALID_PARAMETER;
+    }
+    let Some(event) = reference_user_event(req.event_handle) else {
+        return STATUS_INVALID_PARAMETER;
+    };
+
+    // The completion check and the table insert are one atomic step against
+    // the retirement drain (device spinlock) — no lost-wakeup window.
+    let reg = adapter.with_virtio(|v| v.fence_event_register(req.fence_id, event));
+    match reg {
+        Ok(FenceEventReg::Registered) => {
+            // The table now owns the reference; the drain signals + derefs.
+            write_state(buf, HELIOS_FENCE_EVENT_REGISTERED);
+            STATUS_SUCCESS
+        }
+        Ok(FenceEventReg::AlreadyComplete) => {
+            // Signal-or-report immediately: do both, so even a caller that
+            // skips out_state cannot miss the wakeup. PASSIVE KeSetEvent.
+            // SAFETY: we still own the reference; the KEVENT is live.
+            unsafe { wdk_sys::ntddk::KeSetEvent(event.as_ptr(), 0, 0) };
+            dereference_user_event(event);
+            write_state(buf, HELIOS_FENCE_EVENT_ALREADY_COMPLETE);
+            STATUS_SUCCESS
+        }
+        Ok(FenceEventReg::Invalid) => {
+            dereference_user_event(event);
+            crate::virtio::gpu::FENCE_EVENT_INVALID.fetch_add(1, Ordering::Relaxed);
+            STATUS_INVALID_PARAMETER
+        }
+        Ok(FenceEventReg::TableFull) => {
+            // Counted in fence_event_register; the ICD falls back to the
+            // blocking-escape wait for this one.
+            dereference_user_event(event);
+            STATUS_INSUFFICIENT_RESOURCES
+        }
+        Ok(FenceEventReg::Duplicate) => {
+            dereference_user_event(event);
+            STATUS_INVALID_DEVICE_REQUEST
+        }
+        Err(de) => {
+            dereference_user_event(event);
+            de.into()
+        }
+    }
+}
+
+/// `HELIOS_ESCAPE_UNREGISTER_FENCE_EVENT` — cancel a parked registration after
+/// a usermode wait timeout. CANCELLED = removed (the KMD will not signal);
+/// NOT_FOUND = the drain consumed it (event signaled) or nothing was parked —
+/// the caller disambiguates by the event's own state, so a teardown-purged
+/// registration (unsignaled event) reads as failure, never fake completion.
+fn escape_unregister_fence_event(adapter: &AdapterContext, buf: &mut [u8]) -> NTSTATUS {
+    use core::sync::atomic::Ordering;
+
+    let sz = size_of::<HeliosEscapeFenceEvent>();
+    if buf.len() < sz {
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+    let req: HeliosEscapeFenceEvent = pod_read_unaligned(&buf[..sz]);
+    if req.fence_id == 0 || req.event_handle == 0 {
+        crate::virtio::gpu::FENCE_EVENT_INVALID.fetch_add(1, Ordering::Relaxed);
+        return STATUS_INVALID_PARAMETER;
+    }
+    let Some(event) = reference_user_event(req.event_handle) else {
+        return STATUS_INVALID_PARAMETER;
+    };
+
+    let removed = adapter
+        .with_virtio(|v| v.fence_event_unregister(req.fence_id, event))
+        .unwrap_or(false);
+    if removed {
+        // The table's reference transfers back to us: drop it plus our lookup
+        // reference.
+        dereference_user_event(event);
+    }
+    dereference_user_event(event);
+
+    let mut out = req;
+    out.out_state = if removed {
+        HELIOS_FENCE_EVENT_CANCELLED
+    } else {
+        HELIOS_FENCE_EVENT_NOT_FOUND
+    };
+    buf[..sz].copy_from_slice(bytes_of(&out));
+    STATUS_SUCCESS
+}
+
 /// `HELIOS_ESCAPE_QUERY_STATS` → read-only snapshot of the bounded resource
 /// tables (occupancy under the device lock) and the DISPATCH-safe rejection /
 /// high-water counters. Diagnostic observability for the 2026-07-03 blob-table
-/// exhaustion class; no device state is modified.
+/// exhaustion class; no device state is modified. Accepts BOTH struct sizes:
+/// a v1 (88-byte) caller gets the v1 fields, a v2 (22.22.54+) caller also gets
+/// the fence-event table counters.
 fn escape_query_stats(adapter: &AdapterContext, buf: &mut [u8]) -> NTSTATUS {
     use core::sync::atomic::Ordering;
 
     use crate::virtio::gpu::{
         ADOPT_DEAD_REJECTS, BLOB_FULL_REJECTS, BLOB_HIGH_WATER, CONTEXT_FULL_DROPS,
-        CTRL_TIMEOUT_COUNT, RESOURCE_FULL_REJECTS, RESOURCE_HIGH_WATER, TAKE_LIVE_MISSES,
+        CTRL_TIMEOUT_COUNT, FENCE_EVENT_ALREADY_COMPLETE, FENCE_EVENT_CANCELS,
+        FENCE_EVENT_DUP_REJECTS, FENCE_EVENT_HIGH_WATER, FENCE_EVENT_INVALID,
+        FENCE_EVENT_OVERFLOWS, FENCE_EVENT_REGISTERS, FENCE_EVENT_SIGNALS,
+        FENCE_EVENT_TEARDOWN_DROPS, RESOURCE_FULL_REJECTS, RESOURCE_HIGH_WATER, TAKE_LIVE_MISSES,
         WINDOW_RANGE_DROPS,
     };
 
     let sz = size_of::<HeliosEscapeQueryStats>();
+    let sz2 = size_of::<HeliosEscapeQueryStatsV2>();
     if buf.len() < sz {
         return STATUS_BUFFER_TOO_SMALL;
     }
-    let stats = match adapter.with_virtio(|v| v.table_stats()) {
+    let v2 = buf.len() >= sz2;
+    let (stats, fence_events_live) = match adapter.with_virtio(|v| (v.table_stats(), v.fence_events_live())) {
         Ok(s) => s,
         Err(de) => return de.into(),
     };
@@ -123,7 +300,23 @@ fn escape_query_stats(adapter: &AdapterContext, buf: &mut [u8]) -> NTSTATUS {
     out.out_ctrl_timeouts = CTRL_TIMEOUT_COUNT.load(Ordering::Relaxed);
     out.out_take_live_misses = TAKE_LIVE_MISSES.load(Ordering::Relaxed);
     out.out_adopt_dead_rejects = ADOPT_DEAD_REJECTS.load(Ordering::Relaxed);
-    buf[..sz].copy_from_slice(bytes_of(&out));
+    if !v2 {
+        buf[..sz].copy_from_slice(bytes_of(&out));
+        return STATUS_SUCCESS;
+    }
+    let mut out2: HeliosEscapeQueryStatsV2 = pod_read_unaligned(&buf[..sz2]);
+    out2.v1 = out;
+    out2.out_fence_events_live = fence_events_live;
+    out2.out_fence_events_high_water = FENCE_EVENT_HIGH_WATER.load(Ordering::Relaxed);
+    out2.out_fence_event_registers = FENCE_EVENT_REGISTERS.load(Ordering::Relaxed);
+    out2.out_fence_event_signals = FENCE_EVENT_SIGNALS.load(Ordering::Relaxed);
+    out2.out_fence_event_already_complete = FENCE_EVENT_ALREADY_COMPLETE.load(Ordering::Relaxed);
+    out2.out_fence_event_overflows = FENCE_EVENT_OVERFLOWS.load(Ordering::Relaxed);
+    out2.out_fence_event_dup_rejects = FENCE_EVENT_DUP_REJECTS.load(Ordering::Relaxed);
+    out2.out_fence_event_invalid = FENCE_EVENT_INVALID.load(Ordering::Relaxed);
+    out2.out_fence_event_cancels = FENCE_EVENT_CANCELS.load(Ordering::Relaxed);
+    out2.out_fence_event_teardown_drops = FENCE_EVENT_TEARDOWN_DROPS.load(Ordering::Relaxed);
+    buf[..sz2].copy_from_slice(bytes_of(&out2));
     STATUS_SUCCESS
 }
 

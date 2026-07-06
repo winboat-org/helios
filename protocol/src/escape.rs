@@ -44,6 +44,13 @@ pub const HELIOS_ESCAPE_ATTACH_RESOURCE: u32 = 0x0009;
 /// (2026-07-03: MAX_BLOBS=256 filled → every new venus ring/shmem/export
 /// alloc failed guest-side with STATUS_INSUFFICIENT_RESOURCES).
 pub const HELIOS_ESCAPE_QUERY_STATS: u32 = 0x000A;
+/// Register a usermode event to be signaled when a wire fence retires
+/// (KMD 22.22.54+, PSC WS2: kills the escape-park convoy — no thread ever
+/// blocks inside an escape again). Non-blocking; see [`HeliosEscapeFenceEvent`].
+pub const HELIOS_ESCAPE_REGISTER_FENCE_EVENT: u32 = 0x000B;
+/// Cancel a [`HELIOS_ESCAPE_REGISTER_FENCE_EVENT`] registration that has not
+/// signaled yet (wait timed out usermode-side). See [`HeliosEscapeFenceEvent`].
+pub const HELIOS_ESCAPE_UNREGISTER_FENCE_EVENT: u32 = 0x000C;
 
 /// Header for all escape commands. 16 bytes.
 #[repr(C)]
@@ -224,6 +231,62 @@ pub struct HeliosEscapePresentBlob {
     pub offset: u32,      // in: plane-0 byte offset into the blob
 }
 
+/// Registration outcome values for [`HeliosEscapeFenceEvent::out_state`].
+///
+/// REGISTER: the event handle was referenced and parked in the KMD's
+/// fence-event table; the KMD signals it (KeSetEvent from the retirement DPC)
+/// when the wire fence completes, then drops its reference (one-shot — the
+/// registration is consumed by the signal).
+pub const HELIOS_FENCE_EVENT_REGISTERED: u32 = 0;
+/// REGISTER: the fence had ALREADY retired. The event was signaled immediately
+/// and NOT registered (no reference kept). The caller must not wait.
+pub const HELIOS_FENCE_EVENT_ALREADY_COMPLETE: u32 = 1;
+/// REGISTER probe (`fence_id == 0 && event_handle == 0`): the KMD supports
+/// fence events. Old KMDs fail the whole escape with STATUS_NOT_IMPLEMENTED —
+/// that is the capability signal.
+pub const HELIOS_FENCE_EVENT_PROBE_ACK: u32 = 2;
+/// UNREGISTER: the registration was found and removed; the event was NOT
+/// signaled by the KMD (and never will be — the reference is dropped).
+pub const HELIOS_FENCE_EVENT_CANCELLED: u32 = 3;
+/// UNREGISTER: no matching registration. Either the fence retired (the event
+/// was signaled — check the event state) or nothing was ever registered.
+pub const HELIOS_FENCE_EVENT_NOT_FOUND: u32 = 4;
+
+/// `HELIOS_ESCAPE_REGISTER_FENCE_EVENT` / `HELIOS_ESCAPE_UNREGISTER_FENCE_EVENT`.
+/// 40 bytes. NON-BLOCKING both ways — this is the replacement for parking a
+/// thread inside a blocking WAIT_FENCE escape (PSC WS2: parked escapes convoy
+/// the process's SUBMIT_VENUS escapes at the dxgkrnl escape layer, measured
+/// 2.9 ms → µs when no parks).
+///
+/// REGISTER: `event_handle` is a usermode event HANDLE (CreateEvent) in the
+/// CALLING process; the KMD resolves it via ObReferenceObjectByHandle
+/// (EVENT_MODIFY_STATE, UserMode) so a bogus handle fails loudly and the KMD's
+/// reference keeps the object alive across process death. The check "already
+/// retired?" and the table insert are atomic against retirement (device
+/// spinlock) — a wakeup can never be lost. One-shot: signal auto-unregisters.
+/// The caller must reset the event before registering (manual-reset events
+/// stay signaled).
+///
+/// UNREGISTER (after a usermode wait timeout): same `{fence_id, event_handle}`
+/// pair. `HELIOS_FENCE_EVENT_CANCELLED` = the KMD did not and will not signal;
+/// `HELIOS_FENCE_EVENT_NOT_FOUND` + a signaled event = the fence retired.
+///
+/// Capability probe: REGISTER with `fence_id == 0 && event_handle == 0` →
+/// `HELIOS_FENCE_EVENT_PROBE_ACK` on a supporting KMD; the escape itself fails
+/// (STATUS_NOT_IMPLEMENTED) on older KMDs.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct HeliosEscapeFenceEvent {
+    pub hdr: HeliosEscapeHeader,
+    /// in: wire fence id (from `HeliosEscapeSubmitVenus.fence_id` writeback).
+    pub fence_id: u64,
+    /// in: usermode event handle, zero-extended to 64 bits.
+    pub event_handle: u64,
+    /// out: one of `HELIOS_FENCE_EVENT_*`.
+    pub out_state: u32,
+    pub _pad: u32,
+}
+
 /// `HELIOS_ESCAPE_QUERY_STATS` — read-only snapshot of the KMD's bounded
 /// resource tables and rejection counters. Output-only (the caller sends a
 /// zeroed body); 88 bytes. Values are point-in-time under the device lock for
@@ -262,6 +325,36 @@ pub struct HeliosEscapeQueryStats {
     pub out_adopt_dead_rejects: u32,
 }
 
+/// `HELIOS_ESCAPE_QUERY_STATS` v2 (KMD 22.22.54+): the v1 struct plus the
+/// fence-event table counters. The KMD accepts BOTH sizes — a v1 caller gets
+/// the v1 prefix, a v2 caller against an old KMD gets its extension fields
+/// back untouched (pre-zero them; fence-event support is detected via the
+/// REGISTER probe, not via this struct).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct HeliosEscapeQueryStatsV2 {
+    pub v1: HeliosEscapeQueryStats,
+    /// Registrations currently parked in the fence-event table.
+    pub out_fence_events_live: u32,
+    pub out_fence_events_high_water: u32,
+    /// Successful REGISTERs (parked in the table), monotonic.
+    pub out_fence_event_registers: u32,
+    /// Events signaled at wire-fence retirement (DPC), monotonic.
+    pub out_fence_event_signals: u32,
+    /// REGISTERs answered ALREADY_COMPLETE (signaled inline, not parked).
+    pub out_fence_event_already_complete: u32,
+    /// REGISTERs refused because the table was full.
+    pub out_fence_event_overflows: u32,
+    /// REGISTERs refused as duplicates of a parked (fence_id, event) pair.
+    pub out_fence_event_dup_rejects: u32,
+    /// REGISTER/UNREGISTER rejected: bad fence id / unreferencable handle.
+    pub out_fence_event_invalid: u32,
+    /// UNREGISTERs that found and removed a parked registration.
+    pub out_fence_event_cancels: u32,
+    /// Registrations dropped (dereferenced UNSIGNALED) at transport teardown.
+    pub out_fence_event_teardown_drops: u32,
+}
+
 const _: () = {
     assert!(core::mem::size_of::<HeliosEscapeHeader>() == 16);
     assert!(core::mem::size_of::<HeliosEscapeQueryStats>() == 88);
@@ -273,4 +366,6 @@ const _: () = {
     assert!(core::mem::size_of::<HeliosEscapeAttachResource>() == 24);
     assert!(core::mem::size_of::<HeliosEscapeWaitFence>() == 40);
     assert!(core::mem::size_of::<HeliosEscapePresentBlob>() == 40);
+    assert!(core::mem::size_of::<HeliosEscapeFenceEvent>() == 40);
+    assert!(core::mem::size_of::<HeliosEscapeQueryStatsV2>() == 128);
 };

@@ -42,8 +42,8 @@ use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use bytemuck::Zeroable;
-use wdk_sys::ntddk::{KeInitializeEvent, KeSetEvent};
-use wdk_sys::KEVENT;
+use wdk_sys::ntddk::{KeInitializeEvent, KeSetEvent, ObDereferenceObjectDeferDelete};
+use wdk_sys::{KEVENT, PVOID};
 use helios_protocol::{
     resp_is_ok, VirtioGpuCmdSubmit, VirtioGpuCtrlHdr, VirtioGpuRespDisplayInfo,
     HELIOS_OPTIONAL_FEATURES, HELIOS_REQUIRED_FEATURES, VIRTIO_GPU_CMD_GET_DISPLAY_INFO,
@@ -114,6 +114,33 @@ pub static WDDM_FENCE_FROM_DPC: AtomicU32 = AtomicU32::new(0);
 pub static RING_SUBMIT_COUNT: AtomicU32 = AtomicU32::new(0);
 /// ring_idx >= 1 completions drained from the used ring.
 pub static RING_COMPLETE_COUNT: AtomicU32 = AtomicU32::new(0);
+
+// ── Fence-event table telemetry (REGISTER_FENCE_EVENT, KMD 22.22.54) ────────
+// The usermode-event replacement for blocking WAIT_FENCE escapes (PSC WS2:
+// parked escapes convoy the process's SUBMIT_VENUS escapes at the dxgkrnl
+// escape layer). All named per the loud-failure rule; read by QUERY_STATS v2.
+
+/// REGISTERs parked in the table (event will be signaled by the drain).
+pub static FENCE_EVENT_REGISTERS: AtomicU32 = AtomicU32::new(0);
+/// Events signaled at wire-fence retirement (drain path, DISPATCH).
+pub static FENCE_EVENT_SIGNALS: AtomicU32 = AtomicU32::new(0);
+/// REGISTERs answered ALREADY_COMPLETE (fence had retired; signaled inline).
+pub static FENCE_EVENT_ALREADY_COMPLETE: AtomicU32 = AtomicU32::new(0);
+/// REGISTERs refused because the fence-event table was full.
+pub static FENCE_EVENT_OVERFLOWS: AtomicU32 = AtomicU32::new(0);
+/// REGISTERs refused as duplicates of a parked (fence_id, event) pair.
+pub static FENCE_EVENT_DUP_REJECTS: AtomicU32 = AtomicU32::new(0);
+/// REGISTER/UNREGISTER rejections: fence id never assigned / handle failed
+/// ObReferenceObjectByHandle (bumped by the escape handler at PASSIVE).
+pub static FENCE_EVENT_INVALID: AtomicU32 = AtomicU32::new(0);
+/// UNREGISTERs that found and removed a parked registration.
+pub static FENCE_EVENT_CANCELS: AtomicU32 = AtomicU32::new(0);
+/// Registrations dropped UNSIGNALED at transport teardown (loud: a waiter's
+/// deadline will expire and its unregister will report NOT_FOUND with an
+/// unsignaled event — the ICD must treat that as failure, not completion).
+pub static FENCE_EVENT_TEARDOWN_DROPS: AtomicU32 = AtomicU32::new(0);
+/// High-water of `fence_events.len()` since driver start.
+pub static FENCE_EVENT_HIGH_WATER: AtomicU32 = AtomicU32::new(0);
 
 // ── DISPATCH-safe resource-table telemetry ──────────────────────────────────
 // All updated under the device spinlock (DISPATCH_LEVEL), so they must be
@@ -431,6 +458,11 @@ pub const MAX_PARKED: usize = 4 * MAX_INFLIGHT;
 const PARKED_ENQUEUE_GATE: usize = MAX_PARKED - MAX_INFLIGHT;
 /// Max concurrent WAIT_FENCE waiters.
 const MAX_FENCE_WAITERS: usize = 64;
+/// Max parked fence-event registrations (REGISTER_FENCE_EVENT). Sized for
+/// every venus process (dwm + apps + WUDFHost) to park several waits each
+/// (retire thread + app fence waits + flip/acquire gates); overflow is
+/// counted and the ICD falls back to the blocking-escape wait.
+const MAX_FENCE_EVENTS: usize = 256;
 /// Max WDDM submissions pending on venus completion.
 const MAX_WDDM_PENDING: usize = 256;
 /// Max response bytes a synchronous command may expect (copied into the
@@ -534,6 +566,33 @@ pub struct InFlight {
 struct FenceWaiter {
     fence_id: u64,
     block: NonNull<SyncWaitBlock>,
+}
+
+/// A usermode event registered for one-shot signaling at wire-fence retirement
+/// (REGISTER_FENCE_EVENT, KMD 22.22.54). `event` is the executive event
+/// object's body (a `KEVENT`) from `ObReferenceObjectByHandle` — the escape
+/// handler took a reference, so the object outlives the registering process;
+/// whoever removes the entry MUST dereference it (the drain uses
+/// `ObDereferenceObjectDeferDelete` — a plain deref at DISPATCH could run the
+/// object's PASSIVE-only deletion if it drops the last reference).
+struct FenceEventEntry {
+    fence_id: u64,
+    event: NonNull<KEVENT>,
+}
+
+/// Result of [`VirtioGpu::fence_event_register`].
+pub enum FenceEventReg {
+    /// Parked; the drain will KeSetEvent + deref at retirement.
+    Registered,
+    /// The fence has already retired. NOT parked, no reference kept by the
+    /// table — the caller signals + derefs.
+    AlreadyComplete,
+    /// The id was never assigned by this transport instance.
+    Invalid,
+    /// Table full (counted) — the caller falls back to the blocking wait.
+    TableFull,
+    /// This (fence_id, event) pair is already parked (counted, refused).
+    Duplicate,
 }
 
 /// A WDDM submission whose `DXGK_INTERRUPT_DMA_COMPLETED` is gated on venus
@@ -659,6 +718,10 @@ pub struct VirtioGpu {
     parked: Vec<InFlight>,
     /// Registered WAIT_FENCE waiters (capacity MAX_FENCE_WAITERS).
     fence_waiters: Vec<FenceWaiter>,
+    /// Usermode events awaiting wire-fence retirement (capacity
+    /// MAX_FENCE_EVENTS, reserved at init — pushes never reallocate under the
+    /// spinlock). Entries hold an object reference each.
+    fence_events: Vec<FenceEventEntry>,
     /// Next wire fence id to assign (globally monotonic, starts at 1; 0 is
     /// never a valid wire fence).
     next_wire_fence: u64,
@@ -814,6 +877,7 @@ impl VirtioGpu {
             inflight: Vec::with_capacity(MAX_INFLIGHT),
             parked: Vec::with_capacity(MAX_PARKED),
             fence_waiters: Vec::with_capacity(MAX_FENCE_WAITERS),
+            fence_events: Vec::with_capacity(MAX_FENCE_EVENTS),
             next_wire_fence: 1,
             wddm_pending: VecDeque::with_capacity(MAX_WDDM_PENDING),
             failed: false,
@@ -1125,6 +1189,29 @@ impl VirtioGpu {
                             j += 1;
                         }
                     }
+                    // Signal + consume every usermode fence-event registration
+                    // on this wire fence (one-shot). Runs at DISPATCH under the
+                    // device spinlock: KeSetEvent (Wait=FALSE) is legal, and the
+                    // deref MUST be ObDereferenceObjectDeferDelete — dropping
+                    // the LAST reference with a plain deref at DISPATCH would
+                    // run the object's PASSIVE-only deletion (the registering
+                    // process may have exited and closed its handle).
+                    let mut j = 0;
+                    while j < self.fence_events.len() {
+                        if self.fence_events[j].fence_id == fence_id {
+                            let e = self.fence_events.swap_remove(j);
+                            // SAFETY: the entry holds an object reference taken
+                            // by the escape handler, so `event` is a live KEVENT
+                            // regardless of the registering process's fate.
+                            unsafe {
+                                KeSetEvent(e.event.as_ptr(), IO_NO_INCREMENT, 0);
+                                ObDereferenceObjectDeferDelete(e.event.as_ptr() as PVOID);
+                            }
+                            FENCE_EVENT_SIGNALS.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            j += 1;
+                        }
+                    }
                 }
             }
             // Park the entry for a PASSIVE reap (DmaBuffer frees are
@@ -1214,6 +1301,74 @@ impl VirtioGpu {
         } else {
             true
         }
+    }
+
+    // ── Fence-event table (REGISTER_FENCE_EVENT, KMD 22.22.54) ──────────────
+
+    /// Park `event` for one-shot signaling when wire fence `fence_id` retires.
+    /// Runs under the device spinlock — the completion check and the insert
+    /// are atomic against [`Self::drain_used`], so a wakeup can never be lost
+    /// (same predicate as [`Self::fence_wait_prepare`]: assigned ids live in
+    /// `inflight` until their used-ring completion).
+    ///
+    /// Ownership: on `Registered` the TABLE owns the caller's object
+    /// reference (released by the drain / unregister / teardown). On every
+    /// other outcome the caller still owns it and must deref.
+    pub fn fence_event_register(
+        &mut self,
+        fence_id: u64,
+        event: NonNull<KEVENT>,
+    ) -> FenceEventReg {
+        if fence_id == 0 || fence_id >= self.next_wire_fence {
+            return FenceEventReg::Invalid;
+        }
+        let in_flight = self.inflight.iter().any(|e| match e.kind {
+            InFlightKind::AsyncVenus { fence_id: f, .. } => f == fence_id,
+            _ => false,
+        });
+        if !in_flight {
+            FENCE_EVENT_ALREADY_COMPLETE.fetch_add(1, Ordering::Relaxed);
+            return FenceEventReg::AlreadyComplete;
+        }
+        if self
+            .fence_events
+            .iter()
+            .any(|e| e.fence_id == fence_id && e.event == event)
+        {
+            FENCE_EVENT_DUP_REJECTS.fetch_add(1, Ordering::Relaxed);
+            return FenceEventReg::Duplicate;
+        }
+        if self.fence_events.len() >= MAX_FENCE_EVENTS {
+            FENCE_EVENT_OVERFLOWS.fetch_add(1, Ordering::Relaxed);
+            return FenceEventReg::TableFull;
+        }
+        self.fence_events.push(FenceEventEntry { fence_id, event });
+        bump_high_water(&FENCE_EVENT_HIGH_WATER, self.fence_events.len());
+        FENCE_EVENT_REGISTERS.fetch_add(1, Ordering::Relaxed);
+        FenceEventReg::Registered
+    }
+
+    /// Remove a parked (fence_id, event) registration. Returns `true` if it
+    /// was found and removed — the TABLE's object reference transfers back to
+    /// the caller (who must deref it); `false` = no such entry (the drain
+    /// consumed it — the event was signaled — or it was never parked).
+    pub fn fence_event_unregister(&mut self, fence_id: u64, event: NonNull<KEVENT>) -> bool {
+        if let Some(i) = self
+            .fence_events
+            .iter()
+            .position(|e| e.fence_id == fence_id && e.event == event)
+        {
+            self.fence_events.swap_remove(i);
+            FENCE_EVENT_CANCELS.fetch_add(1, Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Current fence-event table occupancy (QUERY_STATS v2).
+    pub fn fence_events_live(&self) -> u32 {
+        self.fence_events.len() as u32
     }
 
     // ── WDDM pending-fence FIFO (SubmitCommand → DPC completion) ─────────────
@@ -1859,6 +2014,19 @@ impl VirtioGpu {
 
 impl Drop for VirtioGpu {
     fn drop(&mut self) {
+        // Drop any fence-event registrations still parked: dereference WITHOUT
+        // signaling (the fences will never retire on a dead transport, and a
+        // signal here would report fake completion — the waiter's own deadline
+        // fires instead, and its unregister sees NOT_FOUND with an UNSIGNALED
+        // event, which the ICD treats as failure). PASSIVE_LEVEL, outside the
+        // device lock, so the deferred-delete variant is not required — but it
+        // is unconditionally legal, and using it keeps a single deref path.
+        for e in self.fence_events.drain(..) {
+            FENCE_EVENT_TEARDOWN_DROPS.fetch_add(1, Ordering::Relaxed);
+            // SAFETY: the entry owns an object reference taken at registration.
+            unsafe { ObDereferenceObjectDeferDelete(e.event.as_ptr() as PVOID) };
+        }
+
         // Quiesce the device (resets queues) so it stops touching the rings and
         // the in-flight/parked entry buffers we are about to free. Runs at
         // PASSIVE_LEVEL (StopDevice / set_virtio(None) drops outside the lock),

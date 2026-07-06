@@ -54,7 +54,7 @@ args = [
   "-d", "*",
   "-a", "amd64",
   "-c", "${CARGO_MAKE_CRATE_FS_NAME}.cat",
-  "-v", "22.22.53.0",
+  "-v", "22.22.54.0",
 ]
 
 [tasks.inf2cat]
