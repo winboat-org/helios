@@ -137,6 +137,20 @@ pub struct AdapterContext {
     /// The persistent venus 3D context id (`VIRTIO_GPU_CAPSET_VENUS`) the venus
     /// client rides, created in StartDevice and destroyed in StopDevice. `0` = none.
     pub venus_ctx_id: u32,
+    /// `GdiAccelMode` service-key knob (read once in StartDevice; default 1).
+    /// 0 = do not advertise `SupportKernelModeCommandBuffer` (GDI HW accel):
+    /// win32k then rasterizes GDI on the CPU into CpuVisible allocations and
+    /// the RenderGdi executor goes idle. Retests the 2026-07-02
+    /// "LOAD-MANDATORY" bisect, which predates the Option A BAR segment
+    /// (ROADMAP WS1 #8); viogpu3d never sets the bit and loads fine.
+    pub gdi_accel_mode: u32,
+    /// `AllocCached` service-key knob (read once in StartDevice; default 1).
+    /// When set, CpuVisible allocations are additionally flagged `Cached` so
+    /// dxgkrnl maps CPU views write-back instead of write-combined. The BAR
+    /// window is RAM-backed host shmem (x86 cache-coherent for all agents on
+    /// the same physical pages); WC reads measured ~200 MB/s in the IDD
+    /// readback (36 ms per 7.8 MiB frame, 2026-07-06). 0 = kill switch.
+    pub alloc_cached: bool,
 }
 
 // SAFETY: `dxgkrnl` is written only during the device-lifecycle DDIs, which
@@ -166,6 +180,8 @@ impl AdapterContext {
             // `init_kernel_events` once the context is at its final address.
             venus_mutex: UnsafeCell::new(unsafe { core::mem::zeroed() }),
             venus_ctx_id: 0,
+            gdi_accel_mode: 1,
+            alloc_cached: true,
         })
     }
 

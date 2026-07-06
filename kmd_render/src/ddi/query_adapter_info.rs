@@ -51,7 +51,7 @@ pub unsafe extern "C" fn dxgkddi_query_adapter_info(
     }
 
     match args.Type {
-        DXGKQAITYPE_DRIVERCAPS => unsafe { query_driver_caps(args) },
+        DXGKQAITYPE_DRIVERCAPS => unsafe { query_driver_caps(adapter, args) },
         DXGKQAITYPE_QUERYSEGMENT => unsafe { query_segments_legacy(args) },
         DXGKQAITYPE_QUERYSEGMENT3 => unsafe { query_segments3(args) },
         DXGKQAITYPE_QUERYSEGMENT4 => unsafe { query_segments(adapter, args) },
@@ -97,7 +97,10 @@ pub unsafe extern "C" fn dxgkddi_query_adapter_info(
     }
 }
 
-unsafe fn query_driver_caps(args: &DXGKARG_QUERYADAPTERINFO) -> NTSTATUS {
+unsafe fn query_driver_caps(
+    adapter: &AdapterContext,
+    args: &DXGKARG_QUERYADAPTERINFO,
+) -> NTSTATUS {
     const REQUIRED_DRIVER_CAPS_SIZE: usize =
         offset_of!(DXGK_DRIVERCAPS, SupportDirectFlip) + size_of::<BOOLEAN>();
 
@@ -163,12 +166,16 @@ unsafe fn query_driver_caps(args: &DXGKARG_QUERYADAPTERINFO) -> NTSTATUS {
     // DxgkDdiRenderGdi, which records-and-discards them (null engine) → every window
     // surface stays zero → DWM correctly composes a black desktop → black frames in
     // the IDD/Looking Glass even though clears/readback (helios_clear_test) work.
-    // BISECTED 2026-07-02 (v22.22.34.0): dropping the bit regresses the adapter to
-    // CM_PROB_FAILED_ADD — SupportKernelModeCommandBuffer is LOAD-MANDATORY for this
-    // WDDM 3.2 render adapter shape, same as FlipOnVSyncMmIo. There is no CPU-GDI
-    // fallback to buy; the fix is executing the GDI ops in DxgkDdiRenderGdi
-    // (software blitter over the host-visible blob memory).
-    const ADVERTISE_GDI_HW_ACCELERATION: bool = true;
+    // BISECTED 2026-07-02 (v22.22.34.0): dropping the bit regressed the adapter to
+    // CM_PROB_FAILED_ADD. RETEST (WS1 #8, 2026-07-06): that bisect predates the
+    // Option A BAR segment (BarSegMode 10) and was confounded by the then-broken
+    // CPU-visible story — GDI HW acceleration is documented as OPTIONAL
+    // ("should… only if", gdi-hardware-acceleration.md) and viogpu3d (the closest
+    // WDDM driver to Helios, near-identical cap set) never sets the bit. The
+    // `GdiAccelMode` service-key knob (default 1 = advertise, the proven shape)
+    // re-runs the experiment via `reg add` + `devcon restart`; a FAILED_ADD
+    // under mode 0 is named in plain text by the ETW AzureTriage recipe.
+    let advertise_gdi_hw_acceleration: bool = adapter.gdi_accel_mode != 0;
     const FLIPCAPS_FLIP_ON_VSYNC_MMIO: u32 = 1 << 1;
     const SCHEDULINGCAPS_MULTI_ENGINE_AWARE: u32 = 1 << 0;
     const SCHEDULINGCAPS_PREEMPTION_AWARE: u32 = 1 << 2;
@@ -209,7 +216,7 @@ unsafe fn query_driver_caps(args: &DXGKARG_QUERYADAPTERINFO) -> NTSTATUS {
             | MEMORYMANAGEMENTCAPS_GPU_MMU_SUPPORTED;
     }
 
-    caps.PresentationCaps.__bindgen_anon_1.Value = if ADVERTISE_GDI_HW_ACCELERATION {
+    caps.PresentationCaps.__bindgen_anon_1.Value = if advertise_gdi_hw_acceleration {
         PRESENTATIONCAPS_SUPPORT_KERNEL_MODE_COMMAND_BUFFER
     } else {
         0

@@ -648,6 +648,20 @@ unsafe fn create_one(
             .__bindgen_anon_1
             .__bindgen_anon_1
             .set_CpuVisible(1);
+        // WB-cacheable CPU views: without `Cached`, dxgkrnl maps user views of
+        // these allocations write-combined; WC READS of the BAR window measured
+        // ~200 MB/s (36 ms per 7.8 MiB IDD readback frame, 2026-07-06). The BAR
+        // is RAM-backed host shmem — cache-coherent on x86 for every agent on
+        // the same physical pages, and the host reports the venus blobs
+        // CACHED (blob_map honors the same hint for kernel maps). Service-key
+        // `AllocCached=0` is the kill switch (read at StartDevice).
+        if adapter.alloc_cached {
+            info.__bindgen_anon_4
+                .FlagsWddm2
+                .__bindgen_anon_1
+                .__bindgen_anon_1
+                .set_Cached(1);
+        }
     }
     crate::diag::record(0x0C12_0000 | ((size >> 12).min(0xFFFF) as u32));
     crate::diag::record(

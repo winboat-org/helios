@@ -121,6 +121,14 @@ pub unsafe extern "C" fn dxgkddi_start_device(
     adapter.dxgkrnl = Some(unsafe { *dxgkrnl_interface });
     crate::diag::record(0x0B00_0002);
 
+    // Service-key knobs, read once per StartDevice (same iteration model as
+    // `BarSegMode`: `reg add` + `devcon restart` re-runs this without a
+    // reboot). See the field docs in `adapter.rs`.
+    adapter.gdi_accel_mode = crate::diag::read_config_dword(b"GdiAccelMode", 1);
+    adapter.alloc_cached = crate::diag::read_config_dword(b"AllocCached", 1) != 0;
+    crate::diag::record_named_bytes(b"GdiM", adapter.gdi_accel_mode);
+    crate::diag::record_named_bytes(b"AlcC", adapter.alloc_cached as u32);
+
     if adapter.paging_ram.is_none() {
         adapter.paging_ram = AdapterContext::alloc_paging_ram();
     }
