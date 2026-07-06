@@ -728,6 +728,47 @@ Open defects, roughly ordered:
     recovered. **26TH-SESSION TOP PRIORITY: root-cause + fix all three
     (see the flip-kwait-wedge memory: NMI-crash/live-KD recipe, suspect
     KMD teardown paths, retire-thread-signal design fallback).**
+    **26TH SESSION (2026-07-07): DEFECT (a) ROOT-CAUSED + FIXED (mesa
+    `b2f47c780d2`, deployed ICD `vulkan_virtio-e31ec528ac79`); the
+    GUEST "HANG" CLASS SOLVED — it was the SERIAL KERNEL DEBUGGER.**
+    (a) The producer's EXPORTED present fence was unobservable in its
+    own process: `is_external` skips the feedback slot, the queue
+    signal routes out-of-band onto the helios_sync/WDDM fence (retire
+    thread only), and both vn_GetSemaphoreCounterValue (host ring
+    round-trip: 0 forever) and vn_WaitSemaphores (win32 fast-path was
+    imported-only) never read the WDDM fence. Fix: fold
+    vn_renderer_sync_read into the counter read for ANY win32-backed
+    payload + widen the wait fast-path (event wait); host-counter sync
+    stays imported-only (exported host object has a pending GPU signal
+    op). Verified: knob=1 vkcube presents #1-2 armed AND RELEASED
+    (was: #1 wedged); first-rescue diag `wddm=852/1307 host=0`.
+    (c) The whole-guest freeze reproduced WITHOUT any kill (knob=1
+    vkcube after ONE wedge+watchdog-unwedge cycle, ~3 min fuse) —
+    QMP `inject-nmi` → bugcheck 0x80 minidump `070726-4890-01.dmp`
+    (copy in Z:\tmp): 15/16 vCPUs in nt!KiFreezeTargetExecution, CPU#6
+    polling kdcom!READ_PORT_UCHAR — the guest had dropped into the
+    SERIAL KERNEL DEBUGGER (bcdedit debug=Serial port 1, NO kdcom
+    client exists — ntoseye is a gdbstub) and froze forever. With KD
+    enabled, dxgkrnl asserts / the ERESOURCE deadlock detector / TDR
+    BREAK instead of bugchecking — that is why neither hang ever left
+    a dump. TerminateProcess was never the root cause.
+    (b) Caught red-handed in the same dump (stack scavenge of the
+    frozen vkcube thread): a runtime thread inside
+    DxgkWaitForSynchronizationObjectFromGpu blocked MINUTES in
+    nt!ExpWaitForResource on a dxgkrnl ERESOURCE (holder unknown —
+    triage dump has one stack) until nt!ExpResourceTimeoutCaptureLiveDump
+    → KiBreakpointTrap → KD entry. So the worker's forever-park after a
+    flip-kwait stall = a dxgkrnl-internal ERESOURCE convoy seeded by
+    the stalled flip, not a WSI wait (all WSI waits audited bounded).
+    RESIDUAL OPEN: present #3's wire fence never retired (fence stalled
+    at 2 with 3 queued; #1-2 clean) — the remaining true stall; and the
+    WSI perf-counter oddity (presents=0/ready=0 while 3 vehicle
+    presents + gate-ARM demonstrably ran). TOOLKIT NOW ARMED:
+    CrashDumpEnabled=2 (full kernel dump next time → !locks names the
+    ERESOURCE holder); PROPOSED: bcdedit /debug off so every future
+    freeze self-converts to dump+reboot (testsigning + ntoseye/gdbstub
+    unaffected). Registry knob back to 0; ICD fix deployed + desktop
+    cold-verified healthy on it.
 - **Capture path**: IddCx frame drop policy vs D3D12 copy queue saturation;
   KVMFR bandwidth; 10 bpc default.
 - Candidates list from the NVIDIA fix era lives in ICD.md.
