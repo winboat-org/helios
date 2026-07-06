@@ -104,6 +104,13 @@ struct HeliosDxvkDevice {
       std::size_t src_resource_ptr,
       std::size_t dst_resource_ptr) const;
 
+  // Name discriminator of this device's WS1 #4 named present fence
+  // (Global\HeliosPresentFence_<pid>_<id>), 0 until the first successful
+  // present_sync_publish created it (or when the path is disabled). The
+  // dcomp-vehicle recycle gate pairs it with publish's returned value so
+  // the ICD can import the fence by name and gate image reuse at acquire.
+  std::uint32_t present_sync_fence_id() const;
+
   // Dcomp present vehicle (road 4 unit 2): record an image-level copy of the
   // imported ICD frame (src) into the vehicle backbuffer texture (dst) on
   // the open command list. Sources the import's LIVE storage (the

@@ -106,6 +106,10 @@ pub mod ffi {
             src_resource_ptr: usize,
             dst_resource_ptr: usize,
         ) -> u64;
+        /// Name discriminator of this device's named present fence; 0 until
+        /// the first successful publish created it (or path disabled). Pairs
+        /// with publish's value for the vehicle acquire-side recycle gate.
+        unsafe fn present_sync_fence_id(self: &HeliosDxvkDevice) -> u32;
         /// Dcomp present vehicle: image-level copy of the imported ICD frame
         /// (src) into the vehicle backbuffer texture (dst), sourcing the
         /// import's LIVE storage (staging alias when present). The copy-time

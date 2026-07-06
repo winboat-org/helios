@@ -228,6 +228,28 @@ pub extern "system" fn helios_umd_wait_last_present(timeout_us: u32) -> i32 {
     forward::wait_last_present(timeout_us)
 }
 
+/// Companion export: take the last MINTED vehicle present's recycle-gate
+/// identity — the vehicle device's named present fence
+/// (Global\HeliosPresentFence_<pid>_<fence_id>) and the value its frame-copy
+/// signal retires at (host GPU completion). Same-thread contract as the
+/// pair above; consuming. The ICD imports the fence by name once per chain
+/// and gates frame-image reuse on (fence, value) at ACQUIRE — replacing the
+/// worker-serial wait_last_present. Returns 0 = taken, -1 = none pending
+/// (failed present / publish unavailable / contract violation, counted) —
+/// the caller must fall back to helios_umd_wait_last_present.
+#[no_mangle]
+pub extern "system" fn helios_umd_get_present_result(
+    fence_id: *mut u32,
+    value: *mut u64,
+) -> i32 {
+    if fence_id.is_null() || value.is_null() {
+        return -1;
+    }
+    // SAFETY: null-checked above; the ICD caller owns both out-params for
+    // the duration of the call (same-thread, synchronous contract).
+    unsafe { forward::take_present_result(&mut *fence_id, &mut *value) }
+}
+
 /// TEMPORARY (Gate 5b bring-up): out-of-band smoke test of the DXVK bridge from a
 /// normal process — no WDDM/INF/devcon/DWM involvement. Returns 0 if DXVK brought
 /// up a logical device on the venus adapter, 1 otherwise. Remove once the DDI path

@@ -5440,6 +5440,15 @@ thread_local! {
     /// after a failed vehicle present.
     static LAST_VEHICLE_DEVICE: core::cell::Cell<usize> =
         const { core::cell::Cell::new(0) };
+    /// (fenceId, value) of the last MINTED vehicle present on this thread —
+    /// the vehicle device's named present fence signal that retires when the
+    /// frame copy completes on the host GPU. Consumed (taken) by
+    /// `helios_umd_get_present_result`; the ICD imports the fence by name
+    /// and gates frame-image reuse on it at ACQUIRE instead of a serial
+    /// post-present CPU wait. Same-thread contract as PRESENT_SOURCE; None
+    /// after a failed present or when the publish path is unavailable.
+    static PRESENT_RESULT: core::cell::Cell<Option<(u32, u64)>> =
+        const { core::cell::Cell::new(None) };
 }
 
 static EXT_PRESENTS: AtomicUsize = AtomicUsize::new(0);
@@ -5448,6 +5457,13 @@ static EXT_COPY_FAILS: AtomicUsize = AtomicUsize::new(0);
 static EXT_GEOM_MISMATCH: AtomicUsize = AtomicUsize::new(0);
 static EXT_OVERWRITES: AtomicUsize = AtomicUsize::new(0);
 static EXT_NO_DEVICE: AtomicUsize = AtomicUsize::new(0);
+/// get_present_result called with no pending result (contract violation or
+/// a present that failed / published nothing — the ICD falls back to the
+/// serial wait).
+static EXT_RESULT_MISSES: AtomicUsize = AtomicUsize::new(0);
+/// A minted present's result was never consumed before the next one — an
+/// ICD that predates the acquire-gate (deploy skew) or a dropped consume.
+static EXT_RESULT_OVERWRITES: AtomicUsize = AtomicUsize::new(0);
 
 /// Backing for the `helios_umd_set_present_source` C export.
 pub fn set_present_source(
@@ -5514,16 +5530,38 @@ pub fn wait_last_present(timeout_us: u32) -> i32 {
     }
 }
 
+/// Backing for the `helios_umd_get_present_result` C export: take the last
+/// minted vehicle present's (fenceId, value). 0 = taken, -1 = none pending
+/// (failed present, publish unavailable, or contract violation — counted;
+/// the ICD falls back to the serial wait).
+pub fn take_present_result(fence_id: &mut u32, value: &mut u64) -> i32 {
+    match PRESENT_RESULT.with(|c| c.take()) {
+        Some((fid, val)) => {
+            *fence_id = fid;
+            *value = val;
+            0
+        }
+        None => {
+            let n = EXT_RESULT_MISSES.fetch_add(1, Ordering::Relaxed);
+            if n < 16 || n % 512 == 0 {
+                log_line(&format!("get_present_result: none pending (x{})", n + 1));
+            }
+            -1
+        }
+    }
+}
+
 /// The vehicle present body: cached alias-import of the ICD frame, image
 /// copy into the backbuffer, backbuffer publish with this device's fence.
-/// Returns the published sync value; on error the caller must FAIL the
-/// present (no pfnPresentCb) so the ICD latches its sw fallback instead of
-/// flipping a stale backbuffer.
+/// Returns (published sync value, fence name id) — both 0 when the publish
+/// path is unavailable; on error the caller must FAIL the present (no
+/// pfnPresentCb) so the ICD latches its sw fallback instead of flipping a
+/// stale backbuffer.
 unsafe fn vehicle_present_prepare(
     h: Hdevice,
     backbuffer_h: ddi::D3D10DDI_HRESOURCE,
     info: &PresentSource,
-) -> Result<u64, i32> {
+) -> Result<(u64, u32), i32> {
     let Some(dev) = helios_device(h) else {
         EXT_NO_DEVICE.fetch_add(1, Ordering::Relaxed);
         log_line("vehicle present FAILED: no Helios device");
@@ -5614,10 +5652,14 @@ unsafe fn vehicle_present_prepare(
     // Publish the BACKBUFFER slot with this device's own fence, recorded
     // AFTER the copy on the open command list so the value orders the copy.
     let mut sync_value = 0u64;
+    let mut fence_id = 0u32;
     if present_sync_publish_enabled() {
         sync_value = dev.dxvk.present_sync_publish(backbuffer_raw, 0);
+        if sync_value != 0 {
+            fence_id = dev.dxvk.present_sync_fence_id();
+        }
     }
-    Ok(sync_value)
+    Ok((sync_value, fence_id))
 }
 
 // --- DXGI present -----------------------------------------------------------
@@ -5660,16 +5702,19 @@ unsafe extern "C" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT) -> i32 {
     // fallback instead of flipping a stale backbuffer.
     let ext_source = PRESENT_SOURCE.with(|c| c.take());
     let is_vehicle_present = ext_source.is_some();
+    let mut vehicle_fence_id: u32 = 0;
 
     if let Some(context) = &context {
         if let Some(ref src_info) = ext_source {
             match vehicle_present_prepare(h, src_h, src_info) {
-                Ok(value) => {
+                Ok((value, fence_id)) => {
                     sync_value = value;
+                    vehicle_fence_id = fence_id;
                     copied = true;
                 }
                 Err(hr) => {
                     LAST_VEHICLE_DEVICE.with(|c| c.set(0));
+                    PRESENT_RESULT.with(|c| c.set(None));
                     return hr;
                 }
             }
@@ -5699,6 +5744,7 @@ unsafe extern "C" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT) -> i32 {
     } else if is_vehicle_present {
         // No immediate context = nothing was copied or published.
         LAST_VEHICLE_DEVICE.with(|c| c.set(0));
+        PRESENT_RESULT.with(|c| c.set(None));
         EXT_NO_DEVICE.fetch_add(1, Ordering::Relaxed);
         return E_FAIL;
     }
@@ -5752,6 +5798,21 @@ unsafe extern "C" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT) -> i32 {
     if is_vehicle_present {
         // wait_last_present targets this device; count only minted presents.
         LAST_VEHICLE_DEVICE.with(|c| c.set(h.pDrvPrivate as usize));
+        // The recycle-gate result: only a minted present with a live publish
+        // carries one — otherwise leave None so the ICD's consume MISSES and
+        // it falls back to the serial wait.
+        let result = (vehicle_fence_id != 0 && sync_value != 0)
+            .then_some((vehicle_fence_id, sync_value));
+        let prev = PRESENT_RESULT.with(|c| c.replace(result));
+        if prev.is_some() {
+            let n = EXT_RESULT_OVERWRITES.fetch_add(1, Ordering::Relaxed);
+            if n < 16 || n % 512 == 0 {
+                log_line(&format!(
+                    "vehicle present: unconsumed present result overwritten (x{})",
+                    n + 1
+                ));
+            }
+        }
         let n = EXT_PRESENTS.fetch_add(1, Ordering::Relaxed);
         if n < 4 || (n + 1) % 512 == 0 {
             log_line(&format!(

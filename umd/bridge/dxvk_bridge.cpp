@@ -1418,6 +1418,13 @@ std::uint64_t HeliosDxvkDevice::present_sync_publish(
   return 0;
 }
 
+std::uint32_t HeliosDxvkDevice::present_sync_fence_id() const {
+  if (!impl)
+    return 0;
+  std::lock_guard<std::mutex> lock(impl->presentSyncMutex);
+  return impl->presentSyncDisabled ? 0 : impl->presentFenceId;
+}
+
 std::size_t HeliosDxvkDevice::create_hull_shader(const std::uint8_t* code, std::size_t len) const {
   if (!impl || !impl->d3d11 || !code || !len)
     return 0;
