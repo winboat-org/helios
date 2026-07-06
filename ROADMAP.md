@@ -496,15 +496,30 @@ Open defects, roughly ordered:
     copies its frame into the current backbuffer GPU-side with its OWN venus
     device (import-by-resid, the dwm/WUDFHost machinery), then Present() on
     the vehicle device mints the token via pfnPresentCb (flip model → the
-    UMD's dst-copy no-ops). Remaining engineering, bounded: (a) lazy vehicle
-    device creation from the ICD outside its locks (D3D11CreateDevice +
-    factory + dcomp), (b) a private texture→venus-resid query on the UMD
-    (C1 identity trailer already knows it), (c) ICD-side WS1 #4 publish of
-    (backbuffer resid, copy-fence value) — dwm's consumer wait then orders
-    the read with ZERO dwm-side changes, (d) present-mode mapping (immediate
-    = ALLOW_TEARING + Present(0), fifo = Present(1)), (e) swapchain
-    resize/teardown lifecycle. The async sw worker stays as fallback for
-    windows where the vehicle fails.
+    UMD's dst-copy no-ops).
+    **DESIGN REFINED (owner, 2026-07-06): reverse the import direction and
+    special-case in the UMD present DDI via D3D10DDI_HRESOURCE.** The ICD
+    never learns backbuffer resids (kills the COM→DDI texture-query problem
+    entirely): the ICD publishes ITS OWN frame resid + fence value (WS1 #4
+    slot), hands (resid, value, geometry) to a tiny in-process UMD export
+    that stores it in TLS, and calls Present() on the same thread.
+    `dxgi_present` consumes the TLS slot: the vehicle's DXVK imports the ICD
+    frame by resid — the battle-tested alias-import path INCLUDING the
+    `6eab004c` copy-time consumer wait, so the published slot orders the
+    copy against the ICD's GPU writes for free — copies into
+    `hSurfaceToPresent`'s pDrvPrivate DXVK texture, and publishes with its
+    OWN fence (correct: the vehicle genuinely wrote the backbuffer). The
+    double-publish conflict stops existing — single writer, single
+    publisher, gate on the real writing device. Same GPU copy count, zero
+    CPU bytes; WSI images become device-local/tiled (no linear cpu_map
+    constraint — a rendering win). Remaining engineering: (a) vehicle
+    lifecycle off the ICD hot path (the residual-risk contract), (b) the
+    UMD export + TLS present-source slot + dxgi_present special case,
+    (c) ICD publish of its frame resid (C writer for the seqlock format),
+    (d) present-mode mapping, (e) resize/teardown lifecycle. Verify item:
+    the ICD's WSI images must be created as shared-importable dedicated
+    blobs (wire resources) so the vehicle context can import them. The
+    async sw worker stays as fallback wherever the vehicle fails.
 - **Venus submit/fence latency**: ARCH.md's original benchmark item. The
   async/interrupt transport (C3/M3.4) landed; measure round-trip and
   present-to-scanout latency.
