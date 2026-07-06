@@ -520,6 +520,53 @@ Open defects, roughly ordered:
     the ICD's WSI images must be created as shared-importable dedicated
     blobs (wire resources) so the vehicle context can import them. The
     async sw worker stays as fallback wherever the vehicle fails.
+    **ROAD 4 IMPLEMENTED END-TO-END (23rd session, 2026-07-06; mesa
+    `8a4e331ea9e..737cb2309b3`, dxvk-helios `6069f323`, main `6521d93` +
+    `41fa1c4`). Kill switch `HELIOS_WSI_DCOMP_PRESENT`, DEFAULT OFF —
+    flip-on is owner-gated (ladder e). Shipped shape:** vehicle lifecycle
+    on a dedicated worker (parks after READY and owns the COM release, so
+    the nested D3D11→UMD→DXVK→ICD2 teardown never runs on an ICD1 thread);
+    frame images stay OPTIMAL buffer-blit images but their dedicated memory
+    exports OPAQUE_FD → USE_SHAREABLE blobs; per-chain named present-order
+    timeline (`Global\HeliosPresentFence_<pid>_<0x8000_0000|n>` — ICD id
+    space is the high-bit half, the UMD producer counter owns the low half)
+    signaled on every pre-present submit; seqlock publish from a
+    byte-compatible C writer (wsi_helios_present_sync.c); UMD exports
+    `helios_umd_set_present_source`/`_wait_last_present` (TLS, same-thread
+    contract); dxgi_present special case alias-imports the frame by resid
+    (typed identity, per-resid cache — 3 imports per geometry for 30k+
+    presents) and copies at the DXVK image level from the LIVE storage
+    (staging ALIAS if present; the COM CopySubresourceRegion path would
+    read the never-refreshed private image), publishes the backbuffer with
+    the vehicle's own fence, no gate, pfnPresentCb as today. Ladder:
+    (a) probe PASS 1082 presents; (b) vkcube READY→LIVE, ~64 fps FIFO
+    vsync-paced, 30k+ presents ZERO import/copy/geometry/overwrite
+    failures, copy-time wait timeouts=0 noslot=0, dwm imports the vehicle
+    backbuffers + fence (val tracking live), venus ctx destroyed at exit,
+    resize-recreate exercised live (800x600→1896x959); (d) mover-churn
+    paintcap clean, WUDFHost timeouts=0, BARRIER=0. **Flip no-copy
+    invariant CONFIRMED: every vehicle 'DXGI Present:' has dst=0x0.**
+    GOTCHAS: a maximized vehicle chain gets promoted to direct/independent
+    flip — correct on the display but ABSENT from GDI-based paintcaps
+    (eyeball via Looking Glass; owner-confirmed live); UmdTrace was ON for
+    the invariant check — it confounds fps measurements.
+    **Doom (immediate, menu): 40 fps v1 → 75 fps** after two measured
+    fixes (frame-latency-waitable DROP for non-FIFO — windowed Present()
+    otherwise blocks at dwm's compose pace; skip the worker's 4.1 ms
+    frame-fence wait while the vehicle serves — ordering is the copy-time
+    wait + pre-present throttle). Remaining gap to the 160 sw baseline is
+    the image-recycle guard `wait_last_present` (6.1 ms serial,
+    present-gate telemetry) stacked on the copy-time wait (8.4 ms
+    overlapped): both are venus fence-OBSERVATION latency (ring≥1 retire →
+    retire thread → NT signal; ICD2 submission-fence poll), not GPU time
+    (~0.3 ms copy). NEXT LEVERS: (1) GPU-side recycle gating — export the
+    vehicle's (fenceId, value) back through the UMD, import the named
+    fence in ICD1 once, and make image reuse a timeline WAIT at acquire
+    instead of a worker-serial CPU wait (fully pipelined; the run-ahead
+    absorbs the latency); (2) shave the retire→signal path itself (helps
+    every WS1 #4 consumer). sw async worker remains the default and the
+    per-frame fallback (the pre-present blit still runs in vehicle mode —
+    skip it only with numbers, it is what makes fallback seamless).
 - **Venus submit/fence latency**: ARCH.md's original benchmark item. The
   async/interrupt transport (C3/M3.4) landed; measure round-trip and
   present-to-scanout latency.
