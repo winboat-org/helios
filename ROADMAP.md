@@ -450,7 +450,24 @@ Open defects, roughly ordered:
     mint real flip tokens = true zero-copy dwm flip for windowed too; high
     RE effort, build-pinned fragility. (3) sw path stays the composed-window
     contract (already async; blit 0.7 ms; the dwm-side staged upload is the
-    remaining per-composite cost).
+    remaining per-composite cost). **(4) NEW — the dzn/zink-style dcomp road
+    (in-tree PROOF in wsi_common_win32.cpp's dxgi branch, used by dzn):
+    flip-model presents WITHOUT minting tokens — DXGI + DirectComposition
+    mint them: `CreateSwapChainForComposition(device_or_queue, FLIP_SEQUENTIAL,
+    ALLOW_TEARING)` + `DCompositionCreateDevice(NULL)` (dcomp needs NO
+    rendering device) + `CreateTargetForHwnd(hwnd)` → `visual->SetContent
+    (swapchain)` → `Commit()` — all documented public API. The one real
+    device required is the swapchain's presenting device; a WARP D3D11
+    device satisfies it with NO helios_umd recursion (d3d10warp.dll,
+    self-contained). Frame flow: venus host-visible frame (cached mapping)
+    → CPU copy into the WARP backbuffer → Present(0); dwm opens the WARP
+    buffer cross-adapter (proven path — this box ran a WARP-composited
+    desktop pre-milestone). Throughput ≈ the sw path (the bytes still cross
+    guest→host once per composite, plus one extra CPU copy vs StretchDIBits);
+    the wins are flip-model pacing/damage semantics, tear control, and no
+    GDI redirection surface. Zink itself is only a consumer: it rides the
+    underlying ICD's VK_KHR_win32_surface via kopper — on venus that is our
+    sw path; dzn is the driver that exercises the dcomp branch.**
 - **Venus submit/fence latency**: ARCH.md's original benchmark item. The
   async/interrupt transport (C3/M3.4) landed; measure round-trip and
   present-to-scanout latency.
