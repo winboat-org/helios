@@ -20,10 +20,44 @@ use crate::log_line;
 use core::ffi::c_void;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+/// One cached dcomp-vehicle present source (road 4): an alias-imported D3D11
+/// texture over the producing ICD's frame blob, keyed by venus resid. Owns
+/// one COM ref on the imported resource, released on drop (eviction,
+/// geometry change, or device teardown).
+pub struct PresentSrcEntry {
+    pub resid: u32,
+    pub width: u32,
+    pub height: u32,
+    pub dxgi_format: u32,
+    /// Owned `ID3D11Resource` COM pointer from `open_ddi_texture2d`.
+    pub resource_raw: usize,
+}
+
+impl Drop for PresentSrcEntry {
+    fn drop(&mut self) {
+        use windows::core::Interface;
+        if self.resource_raw != 0 {
+            // SAFETY: `resource_raw` is the owned COM ref returned by
+            // open_ddi_texture2d; from_raw adopts it so drop releases it.
+            unsafe {
+                drop(
+                    windows::Win32::Graphics::Direct3D11::ID3D11Resource::from_raw(
+                        self.resource_raw as *mut c_void,
+                    ),
+                );
+            }
+        }
+    }
+}
+
 /// Per-device UMD state, constructed in-place in the runtime-allocated private
 /// device memory (size = [`device_private_size`]). Owns the DXVK device the cxx
 /// bridge created on the Helios venus adapter.
 pub struct HeliosDevice {
+    /// Dcomp present-vehicle source cache (declared before `dxvk` so entries
+    /// release their D3D11 textures before the bridge device drops). Same
+    /// single-threaded-DDI RefCell contract as `ia`.
+    pub present_src_cache: core::cell::RefCell<Vec<PresentSrcEntry>>,
     pub dxvk: cxx::UniquePtr<bridge::ffi::HeliosDxvkDevice>,
     pub h_rt_device: ddi::HANDLE,
     pub h_context: ddi::HANDLE,

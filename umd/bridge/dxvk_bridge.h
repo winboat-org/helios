@@ -104,6 +104,20 @@ struct HeliosDxvkDevice {
       std::size_t src_resource_ptr,
       std::size_t dst_resource_ptr) const;
 
+  // Dcomp present vehicle (road 4 unit 2): record an image-level copy of the
+  // imported ICD frame (src) into the vehicle backbuffer texture (dst) on
+  // the open command list. Sources the import's LIVE storage (the
+  // direct-bind staging alias for device-local imports) so no
+  // refresh-arming is needed, and DxvkContext::copyImage fires the bounded
+  // copy-time consumer present-wait for the imported source — the published
+  // (resid -> fence, value) slot orders the copy against the producing
+  // ICD's GPU writes. Returns 0 on success, 1 on a (copied, loud) geometry
+  // mismatch, negative on failure — the caller must fail the present loudly
+  // rather than flip a stale backbuffer.
+  std::int32_t present_vehicle_copy(
+      std::size_t dst_resource_ptr,
+      std::size_t src_resource_ptr) const;
+
   std::size_t create_hull_shader(const std::uint8_t* code, std::size_t len) const;
   std::size_t create_domain_shader(const std::uint8_t* code, std::size_t len) const;
   std::size_t create_compute_shader(const std::uint8_t* code, std::size_t len) const;

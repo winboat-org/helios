@@ -188,6 +188,46 @@ pub struct D3d12DdiTableRequest {
 
 static mut ADAPTER_COOKIE: usize = 0x4845_4c49_4f53_554d; // "HELIOSUM"
 
+/// Dcomp present vehicle (road 4 unit 2), in-process export for the ICD's
+/// WSI: hand over the frame to present — venus resid + WS1 #4 fence value +
+/// geometry + the creator's exact allocation identity — immediately before
+/// calling Present() on the vehicle swapchain ON THE SAME THREAD. The next
+/// dxgi_present on this thread consumes the slot (see
+/// forward::set_present_source / vehicle_present_prepare).
+/// Returns 0 = stored, 1 = stored but overwrote a pending source (counted
+/// contract violation), -1 = refused (zero resid/geometry).
+#[no_mangle]
+pub extern "system" fn helios_umd_set_present_source(
+    resid: u32,
+    fence_value: u64,
+    width: u32,
+    height: u32,
+    dxgi_format: u32,
+    alloc_size: u64,
+    memory_type_index: u32,
+) -> i32 {
+    forward::set_present_source(
+        resid,
+        fence_value,
+        width,
+        height,
+        dxgi_format,
+        alloc_size,
+        memory_type_index,
+    )
+}
+
+/// Companion export: bounded wait (µs) until the last vehicle present on
+/// THIS thread — the frame copy included — completed on the GPU. The ICD's
+/// present worker calls this after Present() returns and only then recycles
+/// the frame image, closing the copy-vs-rerender race. Returns 0 =
+/// complete, 1 = timeout (counted caller-side), -1 = no vehicle present
+/// recorded on this thread.
+#[no_mangle]
+pub extern "system" fn helios_umd_wait_last_present(timeout_us: u32) -> i32 {
+    forward::wait_last_present(timeout_us)
+}
+
 /// TEMPORARY (Gate 5b bring-up): out-of-band smoke test of the DXVK bridge from a
 /// normal process — no WDDM/INF/devcon/DWM involvement. Returns 0 if DXVK brought
 /// up a logical device on the venus adapter, 1 otherwise. Remove once the DDI path
@@ -646,6 +686,7 @@ unsafe extern "system" fn create_device(
         core::ptr::write(
             create.h_drv_device as *mut device_funcs::HeliosDevice,
             device_funcs::HeliosDevice {
+                present_src_cache: core::cell::RefCell::new(Vec::new()),
                 dxvk,
                 h_rt_device: create.h_rt_device,
                 h_context: core::ptr::null_mut(),

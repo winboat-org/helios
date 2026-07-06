@@ -106,6 +106,17 @@ pub mod ffi {
             src_resource_ptr: usize,
             dst_resource_ptr: usize,
         ) -> u64;
+        /// Dcomp present vehicle: image-level copy of the imported ICD frame
+        /// (src) into the vehicle backbuffer texture (dst), sourcing the
+        /// import's LIVE storage (staging alias when present). The copy-time
+        /// consumer present-wait orders it against the producer's GPU
+        /// writes. 0 = ok, 1 = copied with a (counted) geometry mismatch,
+        /// negative = failure — fail the present loudly, do not flip.
+        unsafe fn present_vehicle_copy(
+            self: &HeliosDxvkDevice,
+            dst_resource_ptr: usize,
+            src_resource_ptr: usize,
+        ) -> i32;
         unsafe fn create_geometry_shader(
             self: &HeliosDxvkDevice,
             code: *const u8,

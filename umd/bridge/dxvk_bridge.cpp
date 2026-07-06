@@ -18,6 +18,7 @@
 
 #include "dxvk_bridge.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstring>
@@ -299,6 +300,31 @@ namespace {
     }
 
     return ctx;
+  }
+
+  // Instance-scoped venus ctx id (23rd-session audit): the process-global
+  // "current" export is last-writer-wins, and with the dcomp present vehicle
+  // a game process holds TWO live venus instances — a concurrent instance
+  // create (overlays) between our device init and this read would mis-stamp
+  // every WDDM allocation identity this device creates. Resolve through OUR
+  // VkInstance; fall back to the process-global export against an older ICD.
+  std::uint32_t read_instance_venus_context_id(VkInstance instance) {
+    using Fn = std::uint32_t (__cdecl*)(VkInstance);
+    if (instance) {
+      if (auto fn = find_helios_icd_export<Fn>("helios_venus_instance_ctx_id")) {
+        const auto ctx = fn(instance);
+        if (ctx) {
+          char msg[128];
+          std::snprintf(msg, sizeof(msg),
+            "Venus instance-scoped ctx export returned ctx_id=%u", ctx);
+          umd_log(msg);
+          return ctx;
+        }
+      }
+    }
+    umd_log("instance-scoped venus ctx export unavailable; "
+            "falling back to process-global current_ctx_id");
+    return read_current_venus_context_id();
   }
 
   // Minimal IDXGIAdapter the D3D11DXGIDevice constructor stores (it is not
@@ -1200,6 +1226,71 @@ bool HeliosDxvkDevice::present_frame_gate(std::uint32_t timeout_us) const {
   return false;
 }
 
+std::int32_t HeliosDxvkDevice::present_vehicle_copy(
+    std::size_t dst_resource_ptr,
+    std::size_t src_resource_ptr) const {
+  if (!impl || !impl->context || !dst_resource_ptr || !src_resource_ptr)
+    return -1;
+
+  try {
+    auto* dstTex = dxvk::GetCommonTexture(
+      reinterpret_cast<ID3D11Resource*>(dst_resource_ptr));
+    auto* srcTex = dxvk::GetCommonTexture(
+      reinterpret_cast<ID3D11Resource*>(src_resource_ptr));
+    if (!dstTex || !dstTex->GetImage() || !srcTex || !srcTex->GetImage()) {
+      umd_log("present_vehicle_copy: non-texture resource");
+      return -1;
+    }
+
+    dxvk::Rc<dxvk::DxvkImage> dstImage = dstTex->GetImage();
+    dxvk::Rc<dxvk::DxvkImage> srcImage = srcTex->GetImage();
+
+    // Source the LIVE storage: device-local imports carry the creator's
+    // pixels in the direct-bind staging ALIAS image; the texture's own image
+    // is a private surface refreshed only when a prior read armed it (frame 1
+    // would be undefined). Direct (non-staged) imports read their own image.
+    if (srcImage->heliosStagingImage() != nullptr)
+      srcImage = srcImage->heliosStagingImage();
+
+    const VkExtent3D dstExtent = dstImage->info().extent;
+    const VkExtent3D srcExtent = srcImage->info().extent;
+    const VkExtent3D extent = {
+      std::min(dstExtent.width,  srcExtent.width),
+      std::min(dstExtent.height, srcExtent.height),
+      1u,
+    };
+
+    static_cast<dxvk::D3D11ImmediateContext*>(impl->context)
+      ->HeliosCopyExternalFrame(dstImage, srcImage, extent);
+
+    // Geometry mismatch is copyable (min region) but must be loud — during
+    // resize churn one letterboxed frame is fine, a silent steady state of
+    // them is a caller bug.
+    const bool mismatch = dstExtent.width != srcExtent.width
+                       || dstExtent.height != srcExtent.height;
+    if (mismatch) {
+      static std::atomic<std::uint32_t> s_mismatch{0};
+      const std::uint32_t n = s_mismatch.fetch_add(1, std::memory_order_relaxed) + 1;
+      if (n == 1 || (n % 128u) == 0) {
+        char msg[160];
+        std::snprintf(msg, sizeof(msg),
+          "present_vehicle_copy: geometry mismatch dst=%ux%u src=%ux%u (x%u)",
+          dstExtent.width, dstExtent.height, srcExtent.width, srcExtent.height, n);
+        umd_log(msg);
+      }
+      return 1;
+    }
+    return 0;
+  } catch (const dxvk::DxvkError& e) {
+    umd_log(("present_vehicle_copy DxvkError: " + e.message()).c_str());
+  } catch (const std::exception& e) {
+    umd_log(e.what());
+  } catch (...) {
+    umd_log("unknown exception in present_vehicle_copy");
+  }
+  return -1;
+}
+
 std::uint64_t HeliosDxvkDevice::present_sync_publish(
     std::size_t src_resource_ptr,
     std::size_t dst_resource_ptr) const {
@@ -1448,7 +1539,7 @@ std::unique_ptr<HeliosDxvkDevice> helios_dxvk_create_device(
       umd_log("DxvkAdapter::createDevice returned null");
       return nullptr;
     }
-    d.venus_ctx_id = read_current_venus_context_id();
+    d.venus_ctx_id = read_instance_venus_context_id(d.instance->handle());
     if (!d.venus_ctx_id)
       umd_log("DXVK device created but Venus context export returned 0");
     umd_log("DxvkDevice created on venus adapter OK");

@@ -5400,6 +5400,226 @@ unsafe extern "C" fn destroy_blend_state(_h: Hdevice, h_bs: ddi::D3D10DDI_HBLEND
     release_com(h_bs.pDrvPrivate);
 }
 
+// --- Dcomp present vehicle (road 4 unit 2) ----------------------------------
+//
+// The ICD (mesa WSI) presents a Vulkan frame through a D3D11 composition
+// swapchain it owns (the "vehicle"): it publishes its frame's
+// (resid -> pid, fenceId, value) in the WS1 #4 seqlock table, hands
+// (resid, value, geometry, allocation identity) to
+// `helios_umd_set_present_source` — stored per-THREAD below — and calls
+// Present() on the vehicle ON THE SAME THREAD. The next dxgi_present on
+// that thread consumes the slot: instead of the normal src->dst copy it
+// alias-imports the ICD frame by resid (cached per resid), image-copies it
+// into hSurfaceToPresent's DXVK texture (the copy-time consumer wait orders
+// the copy against the ICD's GPU writes via the published slot), publishes
+// the BACKBUFFER slot with THIS device's own fence (correct: the vehicle
+// wrote the backbuffer; dwm's consumer wait needs zero changes), then mints
+// the token via pfnPresentCb exactly as any flip-model present.
+
+/// Pending vehicle present source (one per thread; same-thread contract).
+#[derive(Clone, Copy)]
+pub struct PresentSource {
+    pub resid: u32,
+    pub fence_value: u64,
+    pub width: u32,
+    pub height: u32,
+    pub dxgi_format: u32,
+    /// Creator's exact vkAllocateMemory size/type — the typed import
+    /// identity (vkr's OPAQUE-fd import needs an exact-size match; importing
+    /// at the opener's own requirements is the wrong-size failure mode).
+    pub alloc_size: u64,
+    pub memory_type_index: u32,
+}
+
+thread_local! {
+    static PRESENT_SOURCE: core::cell::Cell<Option<PresentSource>> =
+        const { core::cell::Cell::new(None) };
+    /// HeliosDevice pointer of the last vehicle present on this thread, for
+    /// `helios_umd_wait_last_present`. Valid ONLY inside the ICD's
+    /// present-call window (set-source -> Present -> wait, one thread); 0
+    /// after a failed vehicle present.
+    static LAST_VEHICLE_DEVICE: core::cell::Cell<usize> =
+        const { core::cell::Cell::new(0) };
+}
+
+static EXT_PRESENTS: AtomicUsize = AtomicUsize::new(0);
+static EXT_IMPORT_FAILS: AtomicUsize = AtomicUsize::new(0);
+static EXT_COPY_FAILS: AtomicUsize = AtomicUsize::new(0);
+static EXT_GEOM_MISMATCH: AtomicUsize = AtomicUsize::new(0);
+static EXT_OVERWRITES: AtomicUsize = AtomicUsize::new(0);
+static EXT_NO_DEVICE: AtomicUsize = AtomicUsize::new(0);
+
+/// Backing for the `helios_umd_set_present_source` C export.
+pub fn set_present_source(
+    resid: u32,
+    fence_value: u64,
+    width: u32,
+    height: u32,
+    dxgi_format: u32,
+    alloc_size: u64,
+    memory_type_index: u32,
+) -> i32 {
+    if resid == 0 || width == 0 || height == 0 || dxgi_format == 0 {
+        log_line(&format!(
+            "set_present_source REFUSED: resid={} {}x{} fmt={}",
+            resid, width, height, dxgi_format
+        ));
+        return -1;
+    }
+    let prev = PRESENT_SOURCE.with(|c| {
+        c.replace(Some(PresentSource {
+            resid,
+            fence_value,
+            width,
+            height,
+            dxgi_format,
+            alloc_size,
+            memory_type_index,
+        }))
+    });
+    if prev.is_some() {
+        // A pending source nobody consumed: a Present() that never reached
+        // our DDI, or a same-thread-contract violation. Count loudly; the
+        // new source replaces it.
+        let n = EXT_OVERWRITES.fetch_add(1, Ordering::Relaxed);
+        if n < 16 || n % 512 == 0 {
+            log_line(&format!(
+                "set_present_source: overwrote a pending source (x{})",
+                n + 1
+            ));
+        }
+        return 1;
+    }
+    0
+}
+
+/// Backing for the `helios_umd_wait_last_present` C export: bounded wait for
+/// the last vehicle present's submission (frame copy included) to complete
+/// on the GPU. 0 = complete, 1 = timeout, -1 = no vehicle present recorded
+/// on this thread.
+pub fn wait_last_present(timeout_us: u32) -> i32 {
+    let dev_ptr = LAST_VEHICLE_DEVICE.with(|c| c.get());
+    if dev_ptr == 0 {
+        return -1;
+    }
+    // SAFETY: same-thread contract — the ICD calls this immediately after
+    // the vehicle Present() returned on this thread, so the device the
+    // present ran on is still alive (the ICD holds the vehicle D3D11
+    // device reference).
+    let dev = unsafe { &*(dev_ptr as *const HeliosDevice) };
+    if unsafe { dev.dxvk.present_frame_gate(timeout_us) } {
+        0
+    } else {
+        1
+    }
+}
+
+/// The vehicle present body: cached alias-import of the ICD frame, image
+/// copy into the backbuffer, backbuffer publish with this device's fence.
+/// Returns the published sync value; on error the caller must FAIL the
+/// present (no pfnPresentCb) so the ICD latches its sw fallback instead of
+/// flipping a stale backbuffer.
+unsafe fn vehicle_present_prepare(
+    h: Hdevice,
+    backbuffer_h: ddi::D3D10DDI_HRESOURCE,
+    info: &PresentSource,
+) -> Result<u64, i32> {
+    let Some(dev) = helios_device(h) else {
+        EXT_NO_DEVICE.fetch_add(1, Ordering::Relaxed);
+        log_line("vehicle present FAILED: no Helios device");
+        return Err(E_FAIL);
+    };
+    let backbuffer_raw = resource_com_raw(backbuffer_h.pDrvPrivate);
+    if backbuffer_raw == 0 {
+        EXT_NO_DEVICE.fetch_add(1, Ordering::Relaxed);
+        log_line("vehicle present FAILED: backbuffer has no COM resource");
+        return Err(E_FAIL);
+    }
+
+    // Cached alias-import by resid; geometry/format change invalidates the
+    // entry (swapchain recreates give new resids, so also cap the cache).
+    let mut imported_raw = {
+        let mut cache = dev.present_src_cache.borrow_mut();
+        match cache.iter().position(|e| e.resid == info.resid) {
+            Some(pos)
+                if cache[pos].width == info.width
+                    && cache[pos].height == info.height
+                    && cache[pos].dxgi_format == info.dxgi_format =>
+            {
+                cache[pos].resource_raw
+            }
+            Some(pos) => {
+                cache.remove(pos); // drop releases the stale import
+                0
+            }
+            None => 0,
+        }
+    };
+    if imported_raw == 0 {
+        let raw = dev.dxvk.open_ddi_texture2d(
+            info.width,
+            info.height,
+            info.dxgi_format,
+            D3D11_BIND_SHADER_RESOURCE.0 as u32,
+            0,
+            // `global` is log-only in the bridge but must be nonzero; there
+            // is no KMT handle on this in-process path — carry the resid.
+            info.resid,
+            info.resid,
+            info.alloc_size,
+            info.memory_type_index,
+        );
+        if raw == 0 {
+            let n = EXT_IMPORT_FAILS.fetch_add(1, Ordering::Relaxed);
+            if n < 16 || n % 512 == 0 {
+                log_line(&format!(
+                    "vehicle present FAILED: import resid={} {}x{} fmt={} alloc={} type={} (x{})",
+                    info.resid, info.width, info.height, info.dxgi_format,
+                    info.alloc_size, info.memory_type_index, n + 1
+                ));
+            }
+            return Err(E_FAIL);
+        }
+        let mut cache = dev.present_src_cache.borrow_mut();
+        if cache.len() >= 16 {
+            cache.remove(0);
+        }
+        cache.push(crate::device_funcs::PresentSrcEntry {
+            resid: info.resid,
+            width: info.width,
+            height: info.height,
+            dxgi_format: info.dxgi_format,
+            resource_raw: raw,
+        });
+        imported_raw = raw;
+    }
+
+    match dev.dxvk.present_vehicle_copy(backbuffer_raw, imported_raw) {
+        0 => {}
+        1 => {
+            EXT_GEOM_MISMATCH.fetch_add(1, Ordering::Relaxed);
+        }
+        rc => {
+            let n = EXT_COPY_FAILS.fetch_add(1, Ordering::Relaxed);
+            if n < 16 || n % 512 == 0 {
+                log_line(&format!(
+                    "vehicle present FAILED: copy rc={} resid={} (x{})",
+                    rc, info.resid, n + 1
+                ));
+            }
+            return Err(E_FAIL);
+        }
+    }
+
+    // Publish the BACKBUFFER slot with this device's own fence, recorded
+    // AFTER the copy on the open command list so the value orders the copy.
+    let mut sync_value = 0u64;
+    if present_sync_publish_enabled() {
+        sync_value = dev.dxvk.present_sync_publish(backbuffer_raw, 0);
+    }
+    Ok(sync_value)
+}
+
 // --- DXGI present -----------------------------------------------------------
 
 unsafe fn dxgi_device_handle(h: ddi::DXGI_DDI_HDEVICE) -> Hdevice {
@@ -5433,27 +5653,54 @@ unsafe extern "C" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT) -> i32 {
     let mut present_hr = 0;
     let mut sync_value: u64 = 0;
 
+    // Dcomp present vehicle (road 4): a pending TLS source means THIS
+    // present is the vehicle carrying an ICD frame — replace the normal
+    // src->dst copy, publish and gate with the vehicle body; a vehicle
+    // failure FAILS the present (no token minted) so the ICD latches its sw
+    // fallback instead of flipping a stale backbuffer.
+    let ext_source = PRESENT_SOURCE.with(|c| c.take());
+    let is_vehicle_present = ext_source.is_some();
+
     if let Some(context) = &context {
-        if let (Some(dst), Some(src)) = (
-            load_resource(dst_h.pDrvPrivate),
-            load_resource(src_h.pDrvPrivate),
-        ) {
-            context.CopySubresourceRegion(&*dst, 0, 0, 0, 0, &*src, 0, None);
-            copied = true;
-        }
-        // WS1 #4 producer: record the named-present-fence signal BEFORE the
-        // flush so it submits WITH the frame's last work, and publish
-        // (resid -> pid, value) for the IddCx consumer's bounded wait.
-        // `HKLM\SOFTWARE\Helios!PresentSyncPublish = 0` kills the path.
-        if present_sync_publish_enabled() {
-            if let Some(dev) = helios_device(h) {
-                sync_value = dev.dxvk.present_sync_publish(
-                    resource_com_raw(src_h.pDrvPrivate),
-                    resource_com_raw(dst_h.pDrvPrivate),
-                );
+        if let Some(ref src_info) = ext_source {
+            match vehicle_present_prepare(h, src_h, src_info) {
+                Ok(value) => {
+                    sync_value = value;
+                    copied = true;
+                }
+                Err(hr) => {
+                    LAST_VEHICLE_DEVICE.with(|c| c.set(0));
+                    return hr;
+                }
             }
+            context.Flush();
+        } else {
+            if let (Some(dst), Some(src)) = (
+                load_resource(dst_h.pDrvPrivate),
+                load_resource(src_h.pDrvPrivate),
+            ) {
+                context.CopySubresourceRegion(&*dst, 0, 0, 0, 0, &*src, 0, None);
+                copied = true;
+            }
+            // WS1 #4 producer: record the named-present-fence signal BEFORE the
+            // flush so it submits WITH the frame's last work, and publish
+            // (resid -> pid, value) for the IddCx consumer's bounded wait.
+            // `HKLM\SOFTWARE\Helios!PresentSyncPublish = 0` kills the path.
+            if present_sync_publish_enabled() {
+                if let Some(dev) = helios_device(h) {
+                    sync_value = dev.dxvk.present_sync_publish(
+                        resource_com_raw(src_h.pDrvPrivate),
+                        resource_com_raw(dst_h.pDrvPrivate),
+                    );
+                }
+            }
+            context.Flush();
         }
-        context.Flush();
+    } else if is_vehicle_present {
+        // No immediate context = nothing was copied or published.
+        LAST_VEHICLE_DEVICE.with(|c| c.set(0));
+        EXT_NO_DEVICE.fetch_add(1, Ordering::Relaxed);
+        return E_FAIL;
     }
 
     // Frame-completion gate BEFORE the kernel flip becomes visible: dwm's
@@ -5464,10 +5711,15 @@ unsafe extern "C" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT) -> i32 {
     // on timeout the present proceeds — a rare one-frame ghost self-heals at
     // the next acquire refresh. `HKLM\SOFTWARE\Helios!PresentGateUs` (DWORD)
     // overrides the cap; 0 disables. Cost telemetry: `present-gate:` lines.
-    let gate_us = present_gate_us();
-    if gate_us != 0 {
-        if let Some(dev) = helios_device(h) {
-            dev.dxvk.present_frame_gate(gate_us);
+    // Vehicle presents SKIP the gate: their ordering is the published
+    // backbuffer fence plus the consumer-side copy-time wait, and the ICD
+    // does its own bounded wait_last_present off the present thread.
+    if !is_vehicle_present {
+        let gate_us = present_gate_us();
+        if gate_us != 0 {
+            if let Some(dev) = helios_device(h) {
+                dev.dxvk.present_frame_gate(gate_us);
+            }
         }
     }
 
@@ -5493,6 +5745,22 @@ unsafe extern "C" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT) -> i32 {
                 dev.dxgi_callbacks.is_null(),
                 src_alloc,
                 dev.h_context
+            ));
+        }
+    }
+
+    if is_vehicle_present {
+        // wait_last_present targets this device; count only minted presents.
+        LAST_VEHICLE_DEVICE.with(|c| c.set(h.pDrvPrivate as usize));
+        let n = EXT_PRESENTS.fetch_add(1, Ordering::Relaxed);
+        if n < 4 || (n + 1) % 512 == 0 {
+            log_line(&format!(
+                "vehicle present #{}: imports_failed={} copies_failed={} geom_mismatch={} overwrites={}",
+                n + 1,
+                EXT_IMPORT_FAILS.load(Ordering::Relaxed),
+                EXT_COPY_FAILS.load(Ordering::Relaxed),
+                EXT_GEOM_MISMATCH.load(Ordering::Relaxed),
+                EXT_OVERWRITES.load(Ordering::Relaxed),
             ));
         }
     }
