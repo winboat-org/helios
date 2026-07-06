@@ -677,11 +677,23 @@ struct HeliosFlipWaitCtx {
     std::lock_guard<std::mutex> lock(mutex);
     if (!alive || !signal)
       return;
+    // Monotonicity guard: the inline enqueueWait fast-path (present thread)
+    // races the fence-waiter thread's callbacks, so a HIGHER value can land
+    // first and a stale lower signal then fails E_INVALIDARG (observed 16 per
+    // 1536 presents, 26th session). A stale signal's wait is satisfied by
+    // definition (U >= value already) — skip the syscall instead of counting
+    // a false failure. cpuVa is the fence's live mapped value.
+    if (cpuVa && *cpuVa >= value)
+      return;
     const std::uint32_t h = hFence;
     const std::uint64_t v = value;
     HeliosCbSignalSyncFromCpu arg = { 1u, &h, &v };
     const long hr = signal(hDevice, &arg);
     if (hr < 0) {
+      // Re-check for the smaller in-window race (value landed between the
+      // guard read and the syscall): still satisfied, still benign.
+      if (cpuVa && *cpuVa >= value)
+        return;
       const std::uint32_t n =
         signalFails.fetch_add(1, std::memory_order_relaxed) + 1;
       if (n <= 16 || (n % 512u) == 0) {
