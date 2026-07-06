@@ -5464,6 +5464,10 @@ static EXT_RESULT_MISSES: AtomicUsize = AtomicUsize::new(0);
 /// A minted present's result was never consumed before the next one — an
 /// ICD that predates the acquire-gate (deploy skew) or a dropped consume.
 static EXT_RESULT_OVERWRITES: AtomicUsize = AtomicUsize::new(0);
+/// Bounded flip-ordering gate expiries (the flip proceeds; a stale frame on
+/// a direct-flip window beats a wedged worker). Steady-state nonzero =
+/// the retire→signal chain is slower than the gate bound.
+static EXT_FLIP_GATE_TIMEOUTS: AtomicUsize = AtomicUsize::new(0);
 
 /// Backing for the `helios_umd_set_present_source` C export.
 pub fn set_present_source(
@@ -5757,14 +5761,32 @@ unsafe extern "C" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT) -> i32 {
     // on timeout the present proceeds — a rare one-frame ghost self-heals at
     // the next acquire refresh. `HKLM\SOFTWARE\Helios!PresentGateUs` (DWORD)
     // overrides the cap; 0 disables. Cost telemetry: `present-gate:` lines.
-    // Vehicle presents SKIP the gate: their ordering is the published
-    // backbuffer fence plus the consumer-side copy-time wait, and the ICD
-    // does its own bounded wait_last_present off the present thread.
-    if !is_vehicle_present {
-        let gate_us = present_gate_us();
-        if gate_us != 0 {
-            if let Some(dev) = helios_device(h) {
-                dev.dxvk.present_frame_gate(gate_us);
+    //
+    // Vehicle presents gate on their own knob (`VehicleFlipGateUs`): the
+    // 23rd-session skip assumed the published backbuffer fence + consumer
+    // copy-time wait order every read — TRUE for composed presents, FALSE
+    // for direct/independent flip, where the flip is ordered only on the
+    // KMD's decode-complete DMA fence and the backbuffer scans out before
+    // the venus copy lands (the previous occupant "pops out": the
+    // 24th-session gameplay stutter). This waits the copy's host-GPU
+    // completion on the WORKER thread — the app runs ahead; drops absorb.
+    // Pipelined replacement (dxgkrnl WaitForSynchronizationObjectFromGpu on
+    // the present packet) is the recorded next lever.
+    let gate_us = if is_vehicle_present {
+        crate::vehicle_flip_gate_us()
+    } else {
+        present_gate_us()
+    };
+    if gate_us != 0 {
+        if let Some(dev) = helios_device(h) {
+            if !dev.dxvk.present_frame_gate(gate_us) && is_vehicle_present {
+                let n = EXT_FLIP_GATE_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
+                if n < 16 || n % 512 == 0 {
+                    log_line(&format!(
+                        "vehicle flip gate TIMEOUT (x{}) — flipping anyway",
+                        n + 1
+                    ));
+                }
             }
         }
     }
