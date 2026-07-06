@@ -870,6 +870,46 @@ Open defects, roughly ordered:
     automated probing IS the curing activity (self-defeating). Owner
     recipe: reproduce the alternation, hands off ~90 s (>60 s arms the
     GIVING-UP diag), note the time; then read the four channels.
+    **27TH SESSION VERDICT + FIX DEPLOYED (KMD 22.22.56, main `1a07814`).**
+    Owner repro delivered the discriminator: during a LIVE two-frame
+    alternation (~60 s, hands-off recovery) EVERY sync in the DAG was
+    green — vkcube 60 fps/acquire-gate 64 µs/0 timeouts, vehicle 29k
+    copies 0 fails/flip-gate 390 µs, dwm waits 7.9 ms 0 timeouts 0
+    noslot on the live chain, WUDFHost 6.3 ms 0/0 — so the fence class
+    was EXONERATED (retire/interrupt fixes rejected as the wrong tree).
+    Second audit pair: our flip-emulation identity rotation is provably
+    self-consistent (copy dst == flip src per present; storage+identity
+    rotations = same permutation; publish resid tracks rotation; no
+    in-tree pairing skew), BUT the caps surface lied:
+    `DXGK_DRIVERCAPS.SupportDirectFlip=1` (NO bisect provenance — never
+    load-mandatory) + aperture-segment DirectFlip flags, on an adapter
+    with ZERO scanout displaying through IddCx-captured COMPOSITION.
+    dwm promotes the eligible dcomp vehicle visual (flip-model +
+    IGNORE-alpha + unoccluded) to direct/independent flip and STOPS
+    COMPOSING it — two alternating stale frames = dwm's last composed
+    pair; any dirty-region recompose demotes it (taskbar clock minute
+    repaint = the hands-off ~60 s recovery; console-overlapped schtasks
+    launches never repro'd because occlusion kills eligibility; the
+    23rd-session "maximized chains vanish from paintcaps" was the same
+    promotion). The UMD already denied CheckDirectFlipSupport — the KMD
+    now agrees: SupportDirectFlip + the 3 aperture DirectFlip flags are
+    DENIED by default behind the `DirectFlipCaps` service knob (0 =
+    deny, 1 = legacy A/B via reg add + devcon restart; state in diag
+    0x01D7 bit 2, DiagLevel-gated). Display-less-adapter guidance
+    (mcdm-implementation-guidelines.md) mandates 0. DEPLOYED + cold-boot
+    verified: 22.22.56 CM_PROB_NONE, release UMD re-pinned
+    (helios_umd_3b4a9e66394e9523; devcon reset it to debug — known
+    trap; DriverStore copy sync failed file-in-use, cosmetic), desktop
+    composited healthy. AWAITING owner repro verdict (clean vkcube
+    launch, hands off): expect NO two-frame dance, NO old-frames
+    stutter. Then the ladder resumes (Doom fps vs 120-130 baseline —
+    note: denying promotion may cost the direct-scanout perf that never
+    actually worked; measure), and the deferred cleanups: per-present
+    sw-fallback insurance blit on vehicle chains (2nd full-frame copy,
+    "measure before removing"), in-process present-sync slot/named-fence
+    round-trips (set_source carries a dead fence_value; vehicle+release
+    fences imported by NT name in-process), eager vehicle fence at init,
+    time-based import negative cache.
 - **Capture path**: IddCx frame drop policy vs D3D12 copy queue saturation;
   KVMFR bandwidth; 10 bpc default.
 - Candidates list from the NVIDIA fix era lives in ICD.md.
