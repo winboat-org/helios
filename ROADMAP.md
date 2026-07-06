@@ -38,6 +38,67 @@ Remaining: cold-boot + multi-hour soak, and the forced-loss test for the loss pa
 
 Open defects, roughly ordered:
 
+0a. **Ghosting — ROOT-CAUSED AND FIXED IN LAYERS (21st session, 2026-07-06).** Owner
+   insight proved out: the dirty-rect *attribution* was fine; STUTTER caused the
+   ghosting. Evidence chain (all same-day): dwm's composed primary is paintcap-CLEAN
+   under a bouncing-window probe while the LG client trails catastrophically → the
+   corruption is in the IDD→KVMFR→client delivery; 1843 consecutive IddCx acquires
+   show frame-delta exactly 1 (no skipped presents) and zero move-regions; WUDFHost
+   consumer waits showed timeouts=0 while trails persisted → the wait "succeeded"
+   against the WRONG instant. Root cause: the WS1 #4 consumer wait ran at cmdlist
+   START (refreshHeliosStagedImages), re-reading the publish slot when the list
+   BEGAN — under load that predates the acquire the list's copy serves by a full
+   consumer cycle, so the wait targeted an already-retired value and the copy read
+   ring-stale content inside freshly-reported damage rects. Fixes landed:
+   - dxvk-helios `6eab004c`: bounded present-wait ON THE CS THREAD at copy-execution
+     time (copyImage/copyImageToBuffer, imported sources). The acquired buffer can't
+     be re-presented while held, so the slot value at that moment IS the acquired
+     present's value. Silent no-slot returns (unordered reads) + fast-path hits now
+     counted in the `present-wait:` line (`fast=`, `noslot=`).
+   - dxvk-helios `35fe0912`: WUDFHost.exe app profile heliosPresentWaitUs=500000 —
+     the copy-time wait exposed real producer lag (dwm fence frozen 250ms+ behind
+     its publishes under churn; 32ms bound timed out exactly when ordering mattered).
+     dwm keeps the tight 32ms default.
+   - LGIdd `13630d7f`: D3D11 readback path (the ACTIVE path — D3D12 device creation
+     fails 0x887A0004 by design, the D3D12 partial-copy path is DEAD code) finishes
+     the acquired frame AFTER the staging Map (was: at CopyResource submit — dwm
+     could re-render the buffer before the copy executed), reuses the staging
+     texture (was: CreateTexture2D per frame = venus alloc/free per frame), adds
+     per-stage QPC telemetry (`D3D11 path stats:` 1 line/300 frames), and a
+     `HeliosForceFullDamage` registry knob (diagnostic; owner-verified to hide
+     ghosting).
+   - LGIdd `37356f83`: pending-damage debt — frames dropped after their dirty rects
+     were consumed (LGMP queue full fired exactly at the login→desktop transition:
+     giant permanent cold-boot ghosts, owner screenshot) bank their damage for the
+     next delivered frame; new-subscriber re-post now carries full damage
+     (damageRectsCount=0) instead of the last frame's partial rects.
+   - LGIdd `5d36c512`: IddCx MOVE REGIONS delivered as damage (DestRect per move) —
+     previously never queried, silently dropped (window drags are moves+edge-dirt;
+     zero moves observed from programmatic MoveWindow, so this wasn't the trail
+     cause, but it was a real hole).
+   - LG client `b27eb1d0`: malformed frames (zero geometry) and transient
+     onFrameFormat failures skip-and-retry instead of exiting — a client exit tears
+     down the whole VM via the launcher (observed live: render-server killed dwm's
+     venus context → torn frame → client exit → VM shutdown).
+   Remaining for 60fps IDD (owner target): the serialized IDD cycle measured
+   map(wait-inclusive)+memcpy ≈ 60-95ms under churn. `AllocCached` KMD fix (22.22.53)
+   targets the 36ms WC-read memcpy; producer completion lag (dwm CS submission lag +
+   a RECURRING ~1.49s stall, constant across configs — hunt with QMP fence tracing)
+   is the other half. See WS2.
+
+0b. **NEW DEFECT — venus pipeline-layout lookup failure killed dwm's context
+   (2026-07-06, host-side evidence).** virgl render server:
+   `vkr: failed to look up object 626238 of type 19 (pipeline layout)` →
+   `vkCreateGraphicsPipelines resulted in CS error` → fatal decoder state → context
+   1613 (dwm.exe) destroyed → all subsequent blob creates refused → LG client choked
+   on the torn frame and exited → launcher shut the VM down. First host-side proof
+   of a guest venus protocol violation. Suspect: vn TLS-ring pipeline creates
+   (vn_get_target_ring) order against the primary ring ONLY via vn_ring_wait_all —
+   our fork added early-out paths (helios_ring_shared_valid false / fatal-bit
+   abandon in vn_ring_wait_seqno, commit 5db3cea4290) that would break the
+   create-create barrier; also audit vn_tls_get_ring + the relaxed tail load. One
+   observation so far; keep VIRGL_LOG_LEVEL=debug in mind for a repro relaunch.
+
 1. **Stall — ROOT-CAUSED AND FIXED (18th session, 2026-07-06).** The strike attribution
    (mesa `f7a816f182f`: sem id, wait reason, signal queue/family/ring, signal value+age in the
    strike line) cracked it in one boot: **every observed strike had `sig_age_ms ≤ 14`** — the
@@ -189,8 +250,42 @@ Open defects, roughly ordered:
    then retire the gdi_blit executor (a guest-CPU blitter behind a DMA round
    trip — strictly worse than win32k's rasterizer, source of the 48%-drop bug
    class).
+   **21st session (2026-07-06): both knobs SHIPPED in 22.22.53** (`85ad16a`):
+   `GdiAccelMode` (default 1) gates SupportKernelModeCommandBuffer per the plan
+   above; `AllocCached` (default 1) additionally answers the WB-cacheable
+   question for ALL CpuVisible allocations — user views were mapped WC (only
+   CpuVisible was set at create_allocation; the WDDM2 `Cached` flag was never
+   set), measured at ~200 MB/s reads = 36 ms per 7.8 MiB IDD readback frame.
+   The GdiAccelMode=0 A/B itself has NOT run yet.
 
 ## Workstream 2 — Performance
+
+- **IDD delivered-frame cycle — MEASURED (21st session, `D3D11 path stats:` line,
+  1/300 frames in the LGIdd log):** the swapchain thread is fully serialized, so
+  stage sums ARE the delivered fps. Under a 50Hz bouncing-window probe:
+  rects ~14µs | staging ~0 (reuse landed; was a venus CreateTexture2D per frame) |
+  copy-submit ~25µs | map 13-59ms avg with a RECURRING ~1.5s max (suspiciously
+  constant across configs/builds — a fixed timeout somewhere; hunt with QMP fence
+  tracing `virtio_gpu_fence_ctrl/resp` during a mover run) | memcpy 34-38ms
+  (7.8 MiB at ~200 MB/s = WC reads) | lgmp ~0. Owner target: 60fps IDD.
+  **RESOLVED IN TWO STEPS (same session):** (1) `AllocCached` (22.22.53) did NOT
+  move the stage — the ICD maps venus blobs through its own escape path using the
+  host's per-blob map_info (the WDDM2 Cached flag only affects dxgkrnl-owned
+  mappings); a one-shot BW probe (now permanent in LGIdd) split the sides:
+  src strided-read 622 MB/s, memcpy 157 MB/s, IVSHMEM memset 27 GB/s — the READS
+  of the WC venus mapping were the whole cost. (2) LGIdd `1d03b685`: MOVNTDQA
+  streaming loads (CopyFromWC) → probe streamcpy 5.5 GB/s, frame memcpy stage
+  36.5ms → **1.4ms**, delivered rate 14-18fps → **32fps = the probe's damage
+  rate** (map now ~8ms avg; pipeline headroom ~100fps — a 60Hz producer should
+  see 60). REMAINING: the ~1.5s map spike (above) is now the dominant visible
+  hitch, plus dwm-side completion lag under churn.
+- **Producer (dwm) completion lag:** publishes outrun the fence by 1-4+ presents
+  under churn; fence observed FROZEN 250ms-1.5s then catching up (the same ~1.5s
+  signature as the map max). vkQueueSubmit2 phases are µs-class (queue_perf), so
+  the lag is dxvk-CS-thread backlog + venus decode/retire path, NOT the submit
+  call. Next: instrument dwm CS latency (record→execute) and the ICD retire
+  thread's WAIT_FENCE throughput; consider moving dwm's own consumer waits from
+  list-start to copy/sample-time like the IDD fix.
 
 - **Per-present full-GPU drain — FIXED (18th session, `3579ef7` + `ef6689b`):**
   `rotate_resource_backings` drained the whole device (event query + `Sleep(1)` spin —
