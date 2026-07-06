@@ -408,13 +408,15 @@ Open defects, roughly ordered:
   init ×2 (idTech sizes per-image arrays to the REQUESTED count — unhandled
   C++ FatalError, Crash.00003/00004). Spec-legal ≠ app-safe; extra depth is
   now opt-in `HELIOS_WSI_EXTRA_IMAGES=N` (default 0), for engines that
-  re-query.** Remaining to 200 fps: worker cycle = fence-retire tracking
-  (~4.3 ms ≈ GPU frame + retire latency) + blit 0.73 ms + scheduling
-  (~0.8 ms) → next levers: split waiter/blitter pipelining, retire-latency
-  measurement (guest fence signal vs host resp), and gameplay (not menu)
-  numbers from the owner. Host-side during Doom: p50 fence 0.05 ms; a tight
-  ~10.7 ms class at 53/s = ring≥1 GPU-completion fences seeing the
-  pipelined queue backlog (healthy, not a stall).
+  re-query.** OWNER DECISION (2026-07-06): the sw present path is FROZEN at
+  160 fps — no further ICD sw-present optimization; the next present work is
+  the HW-ACCELERATED PRESENT (D3DKMT redirected presents, no UMD recursion:
+  ICD presents the swapchain allocation via D3DKMTPresent against the HWND;
+  win32k present-history token routes it to dwm; dwm opens + composes the
+  allocation through the existing WS1 #4 import/present-fence machinery).
+  The async sw worker remains the fallback path + kill switches. Host-side
+  during Doom: p50 fence 0.05 ms; a tight ~10.7 ms class at 53/s = ring≥1
+  GPU-completion fences seeing the pipelined queue backlog (healthy).
 - **Venus submit/fence latency**: ARCH.md's original benchmark item. The
   async/interrupt transport (C3/M3.4) landed; measure round-trip and
   present-to-scanout latency.
