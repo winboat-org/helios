@@ -567,6 +567,48 @@ Open defects, roughly ordered:
     every WS1 #4 consumer). sw async worker remains the default and the
     per-frame fallback (the pre-present blit still runs in vehicle mode —
     skip it only with numbers, it is what makes fallback seamless).
+    **LEVER 1 IMPLEMENTED (24th session, 2026-07-06; mesa `10f72c50104` +
+    `3e5fa9eb1ce`, main `1c34671`; UMD `helios_umd_c78f1a7e01df20b4`, ICD
+    `vulkan_virtio-d49cd875438d`).** dxgi_present hands the vehicle's
+    (fenceId, value) back via `helios_umd_get_present_result` (TLS,
+    same-thread, counted misses/overwrites); the WSI imports
+    `Global\HeliosPresentFence_<pid>_<fenceId>` once per chain and gates
+    image reuse at ACQUIRE (bound `HELIOS_WSI_VEHICLE_WAIT_US`, 0=off;
+    `acquire-gate:` diag telemetry per 512; drops recycle ungated;
+    fallback = the old serial wait, `gate_fb` counter; teardown drains max
+    pending value). Measured: worker cycle 13→4.4 ms, present-gate serial
+    lines GONE, gate avg 2.7 ms overlapped, timeouts 0, gate_fb 0; vkcube
+    FIFO ~60 clean; ladder clean (mover, WUDFHost timeouts flat,
+    BARRIER=0).
+    **CRASH FOUND+FIXED en route (first gated vkcube run froze the guest
+    and degraded the whole desktop): vkr resolves vkSignalSemaphore only
+    for >=1.2 devices or with KHR_timeline_semaphore enabled at create and
+    dispatches it with NO null check** — vn_WaitSemaphores' imported-win32
+    post-wait counter sync on a Vulkan 1.0 app (vkcube) = ip=0 segfault of
+    the per-context render worker (`journalctl: vkr-ring-<ctx> segfault at
+    0`), which the guest NEVER sees: qemu logs only
+    `virgl_renderer_context_create_fence: Operation not permitted`
+    (proxy_context_submit_fence → dead worker socket → -1), the poisoned
+    submission's fence never retires, the app wedges in vkWaitForFences
+    and everything else crawls on the backpressure. Fix (mesa
+    `3e5fa9eb1ce`): append KHR_timeline_semaphore at device create for WSI
+    devices on <1.2 instances (also legitimizes the pre-existing
+    present-order timeline signals on 1.0/1.1 apps) + skip the host
+    counter sync when the procs cannot exist. dwm/probe never hit it (1.3
+    devices). Recovery for a wedged desktop: Stop-Process dwm.
+    **OPEN — Doom menu capped at exactly 60.0 fps on BOTH paths today**
+    (sw AND vehicle, gate on/off identical, QMP fence-trace on/off
+    identical, foreground attempt identical; drops=0, gate timeouts=0,
+    worker 4.4 ms, sw wait_avg 3.7 ms — nothing visible adds to 16.6 ms).
+    The 22nd/23rd 120/160/75 numbers came from the same unattended
+    launcher, so this is a NEW environmental cap, not the acquire gate
+    (gate-off A/B proves it). Suspects to disambiguate with the owner:
+    idTech background/unfocused throttle state, Steam relaunch settings,
+    LGIdd/dwm restart state vs yesterday's boot. Tool:
+    `tools/read-vehicle-counters.ps1` samples live minted/drops/gate
+    counters from a running process (the perf line never prints on
+    pure-vehicle runs); `Z:\tmp\movewin_target.txt` + helios_movewin
+    foregrounds an arbitrary window title.
 - **Venus submit/fence latency**: ARCH.md's original benchmark item. The
   async/interrupt transport (C3/M3.4) landed; measure round-trip and
   present-to-scanout latency.
