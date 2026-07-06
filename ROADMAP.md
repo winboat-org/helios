@@ -484,6 +484,27 @@ Open defects, roughly ordered:
     surface; that missing hand-off IS the entire gap roads (1)/(2)/(4) exist
     to fill. Gotcha: `UmdTrace` is cached at device init — toggling it needs
     a process restart to take effect.**
+    **ROAD 4 ON OUR OWN ADAPTER — PROVEN LIVE (2026-07-06,
+    `tools/dcomp_present_probe.cpp`, schtask `helios_dcomp_probe`):** a D3D11
+    device on the HELIOS adapter (our UMD; owner-approved vehicle use — the
+    nesting is bounded and dwm already runs multiple DXVK→ICD stacks per
+    process) + `CreateSwapChainForComposition(FLIP_SEQUENTIAL)` + dcomp
+    target/visual on the HWND: every call S_OK, 1023 flip presents, dwm
+    composes the animation (paintcap ×2, gradient advancing). This upgrades
+    road 4 from "WARP + CPU copy" to the REAL zero-CPU-byte design:
+    the DXGI backbuffers are OUR KMD allocations = venus blobs, so the ICD
+    copies its frame into the current backbuffer GPU-side with its OWN venus
+    device (import-by-resid, the dwm/WUDFHost machinery), then Present() on
+    the vehicle device mints the token via pfnPresentCb (flip model → the
+    UMD's dst-copy no-ops). Remaining engineering, bounded: (a) lazy vehicle
+    device creation from the ICD outside its locks (D3D11CreateDevice +
+    factory + dcomp), (b) a private texture→venus-resid query on the UMD
+    (C1 identity trailer already knows it), (c) ICD-side WS1 #4 publish of
+    (backbuffer resid, copy-fence value) — dwm's consumer wait then orders
+    the read with ZERO dwm-side changes, (d) present-mode mapping (immediate
+    = ALLOW_TEARING + Present(0), fifo = Present(1)), (e) swapchain
+    resize/teardown lifecycle. The async sw worker stays as fallback for
+    windows where the vehicle fails.
 - **Venus submit/fence latency**: ARCH.md's original benchmark item. The
   async/interrupt transport (C3/M3.4) landed; measure round-trip and
   present-to-scanout latency.
