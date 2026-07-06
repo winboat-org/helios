@@ -84,7 +84,8 @@ Open defects, roughly ordered:
    map(wait-inclusive)+memcpy ≈ 60-95ms under churn. `AllocCached` KMD fix (22.22.53)
    targets the 36ms WC-read memcpy; producer completion lag (dwm CS submission lag +
    a RECURRING ~1.49s stall, constant across configs — hunt with QMP fence tracing)
-   is the other half. See WS2.
+   is the other half. See WS2. **22nd session: the ~1.49s stall is ROOT-CAUSED AND
+   FIXED (our own staged-probe diagnostics — see WS2); present-wait timeouts now 0.**
 
 0b. **NEW DEFECT — venus pipeline-layout lookup failure killed dwm's context
    (2026-07-06, host-side evidence).** virgl render server:
@@ -92,12 +93,32 @@ Open defects, roughly ordered:
    `vkCreateGraphicsPipelines resulted in CS error` → fatal decoder state → context
    1613 (dwm.exe) destroyed → all subsequent blob creates refused → LG client choked
    on the torn frame and exited → launcher shut the VM down. First host-side proof
-   of a guest venus protocol violation. Suspect: vn TLS-ring pipeline creates
-   (vn_get_target_ring) order against the primary ring ONLY via vn_ring_wait_all —
-   our fork added early-out paths (helios_ring_shared_valid false / fatal-bit
-   abandon in vn_ring_wait_seqno, commit 5db3cea4290) that would break the
-   create-create barrier; also audit vn_tls_get_ring + the relaxed tail load. One
-   observation so far; keep VIRGL_LOG_LEVEL=debug in mind for a repro relaunch.
+   of a guest venus protocol violation.
+   **22nd session (2026-07-06): the fork-early-out suspicion is FALSIFIED as the
+   cause.** Static audit: vn_pipeline.c/vn_common.c are byte-identical to upstream
+   (the relaxed tail load in wait_all is upstream's own); the fork's divergence is
+   confined to vn_ring.c. Evidence: the never-read ring-diag file at
+   `C:\Windows\Temp\helios_icd_diag.log` (13.5 MB across 6 boots) shows the
+   shared-valid early-out NEVER fired and the wait_seqno fatal-abandon fired
+   exactly twice — both AFTER the host had already latched ring-FATAL
+   (consequences of the CS error, not causes; on the death boot the first
+   guest-side anomaly IS the post-FATAL abandon, head frozen at 141452 with
+   ~1.2 KB undecoded). The sync-vs-async structure is also sound: TLS-ring
+   pipeline creates are `vn_call_` (synchronous), so destroy-after-create races
+   are excluded. The initiating violation left NO guest-side trace. Landed
+   (mesa `a0412461012`, ICD `vulkan_virtio-7c9ddf378055` deployed):
+   `vn_ring_wait_all` barrier skips/abandons now log LOUD
+   (`BARRIER SKIPPED/ABANDONED in wait_all`) to the ProgramData diag log —
+   either line on a healthy process is the smoking gun; ring diag rerouted
+   from `C:\Windows\Temp` (unwritable for WUDFHost — its ring diags silently
+   vanished) to `C:\ProgramData\Helios\helios_icd_diag.log`; post-fatal
+   per-submit spam rate-limited (power-of-two); NEW env knob
+   `VN_HELIOS_PIPELINE_TRACE` traces (ring, primary_tail seqno, object id)
+   for layout create/destroy + the barrier + pipeline creates. NEXT on
+   recurrence: read the BARRIER/PL-TRACE lines before theorizing; host-side
+   `HELIOS_VKR_DEBUG=validate` relaunch (ask owner) — NOT VIRGL_LOG_LEVEL
+   (HOST.md §5.1: venus runs in the render-server child; only WARN+ reaches
+   the qemu stderr log).
 
 1. **Stall — ROOT-CAUSED AND FIXED (18th session, 2026-07-06).** The strike attribution
    (mesa `f7a816f182f`: sem id, wait reason, signal queue/family/ring, signal value+age in the
@@ -256,7 +277,18 @@ Open defects, roughly ordered:
    question for ALL CpuVisible allocations — user views were mapped WC (only
    CpuVisible was set at create_allocation; the WDDM2 `Cached` flag was never
    set), measured at ~200 MB/s reads = 36 ms per 7.8 MiB IDD readback frame.
-   The GdiAccelMode=0 A/B itself has NOT run yet.
+   **22nd session: GdiAccelMode=0 A/B PASSED — the 2026-07-02 "LOAD-MANDATORY"
+   bisect is OVERTURNED under BarSegMode 10.** Evidence (all same-boot, via
+   `pnputil /restart-device`): adapter re-adds `CM_PROB_NONE`; desktop composes;
+   classic-GDI text renders (fresh cmd-console canary echoes + regedit tree text
+   + desktop-listview labels, paintcap-verified); every Gd* counter FROZEN this
+   boot (GdiE 339, GdXn 24 — zero executor traffic; the KMD's `GdiM` mirror
+   flipped 1→0 proving the mode took); no two-memory-split regression under
+   mover churn across three device restarts. **The knob is LIVE at 0 for soak**
+   (service-key value set; revert = `reg delete ...\helios_kmd_render /v
+   GdiAccelMode /f` + restart-device). NEXT: owner-attended Doom stutter
+   differential (its WSI BitBlt storm no longer traverses the executor), then
+   retire the gdi_blit executor + flip the compiled default.
 
 ## Workstream 2 — Performance
 
@@ -277,13 +309,38 @@ Open defects, roughly ordered:
   streaming loads (CopyFromWC) → probe streamcpy 5.5 GB/s, frame memcpy stage
   36.5ms → **1.4ms**, delivered rate 14-18fps → **32fps = the probe's damage
   rate** (map now ~8ms avg; pipeline headroom ~100fps — a 60Hz producer should
-  see 60). REMAINING: the ~1.5s map spike (above) is now the dominant visible
-  hitch, plus dwm-side completion lag under churn.
+  see 60).
+- **The RECURRING ~1.5s stall — ROOT-CAUSED AND FIXED (22nd session,
+  2026-07-06, dxvk-helios `bdbbc2ea`): it was OUR OWN staged-content-probe
+  diagnostics.** QMP fence tracing (`virtio_gpu_fence_ctrl/resp` during a mover
+  run) split it in one pass: host ctrl→resp ≤ 11.5 ms across 7891 fences (p50
+  0.17 ms — host exonerated again), but ALL guest submissions went SILENT in
+  ~1.49 s beats, 3 per cluster, every 600 IddCx frames, landing at tick
+  600k+30 = the probe HARVEST tick (`HeliosProbeRecurTick=600`,
+  `HeliosProbeHarvestTick=30` in refreshHeliosStagedImages). The harvest
+  scanned the ~7.8 MiB probe readback BYTE-WISE through the WC venus mapping
+  ON THE CS THREAD (~0.75 s per probe at WC single-byte rates × 2 probes per
+  staged image × 3 imported dwm backbuffers = 3 beats/cluster), while WUDFHost
+  held the acquired IddCx frame — starving dwm and every producer behind it.
+  Corroboration: probe issue/result log lines at ticks 2400/3000/3600 match
+  the stall frames exactly; the 48-probe cap matched the observed stall
+  cutoff (last cluster at tick 3600, none after); this also explains the
+  "constant across configs" property (the probes shipped in every build), the
+  LGIdd map-max 1.47-1.54 s, the "dwm fence frozen ≥500 ms" producer-lag
+  signature, AND all 10 consumer present-wait timeouts (fence exactly one
+  behind = dwm's next signal parked behind the block). FIX:
+  `dxvk.heliosStagedProbes` config knob, default OFF (re-enable per process
+  via DXVK_CONFIG for black-surface triage); harvest now bulk-copies WC →
+  cacheable before scanning (~50 ms, not ~1.5 s, if ever re-enabled).
+  VERIFIED live (mover churn re-trace, UMD `helios_umd_81a033e237bef769.dll`):
+  max silence 48.5 ms (was 1493 ms), submission rate flat through every
+  600-frame boundary, `present-wait: timeouts=0`, desktop paintcap-clean.
 - **Producer (dwm) completion lag:** publishes outrun the fence by 1-4+ presents
-  under churn; fence observed FROZEN 250ms-1.5s then catching up (the same ~1.5s
-  signature as the map max). vkQueueSubmit2 phases are µs-class (queue_perf), so
-  the lag is dxvk-CS-thread backlog + venus decode/retire path, NOT the submit
-  call. Next: instrument dwm CS latency (record→execute) and the ICD retire
+  under churn; vkQueueSubmit2 phases are µs-class (queue_perf), so any residual
+  lag is dxvk-CS-thread backlog + venus decode/retire path, NOT the submit
+  call. The dominant "frozen fence" signature was the staged-probe stall
+  (above, fixed). RE-MEASURE under 60Hz content before more work here;
+  if residue: instrument dwm CS latency (record→execute) and the ICD retire
   thread's WAIT_FENCE throughput; consider moving dwm's own consumer waits from
   list-start to copy/sample-time like the IDD fix.
 
@@ -405,6 +462,15 @@ Plan:
   Cargo.make stampinf (all three or FAILED_ADD); backups under
   `C:\ProgramData\HeliosDeployBackups`. New tools appear after the win MCP
   server restarts (new session).
+- **dxvk staged-content probes** (`dxvk.heliosStagedProbes`, default OFF since
+  `bdbbc2ea` — they were the ~1.5 s stall): full-surface raw+post-copy readback
+  characterization at fixed refresh ticks for black-surface triage. Re-enable
+  per process via `DXVK_CONFIG "dxvk.heliosStagedProbes = True"` (no rebuild).
+- **Venus pipeline object trace** (`VN_HELIOS_PIPELINE_TRACE` env, per-process,
+  default off): (ring, primary_tail seqno, object id) lines in the ICD diag log
+  for pipeline-layout create/destroy, the vn_get_target_ring wait_all barrier,
+  and graphics-pipeline creates — the defect-0b recurrence kit. The barrier
+  skip/abandon lines (`BARRIER SKIPPED/ABANDONED in wait_all`) are ALWAYS on.
 - **ICD sem-deadline strike log** (`helios_icd_diag.log`, always on): each strike
   line carries `sem=` (venus object id), `reason=` (vn_relax reason),
   `sig_queue=/family=/ring=` + `sig_value=/sig_age_ms=` (the most recent submitted
