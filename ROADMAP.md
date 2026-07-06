@@ -644,6 +644,47 @@ Open defects, roughly ordered:
     version bump; ICD unit: register/park/cancel in helios_ioctl_wait_fence
     path. Deployed at session end: UMD `helios_umd_89e95497a7d6d08f`, ICD
     `vulkan_virtio-2900b457e859`, dxvk `7255c1e6`, mesa `fbf38f4cc63`.
+    **USERMODE FENCE EVENTS SHIPPED (25th session, 2026-07-06; main
+    `16da0eb` = KMD 22.22.54, mesa `e5f35c18bf9`; deployed ICD
+    `vulkan_virtio-9384eb059a8f`, UMD unchanged `89e95497a7d6d08f`).**
+    REGISTER/UNREGISTER_FENCE_EVENT escapes: PASSIVE
+    ObReferenceObjectByHandle → bounded (fence_id → PKEVENT) table;
+    retirement DPC KeSetEvent + ObDereferenceObjectDeferDelete; one-shot;
+    already-retired = atomic check under the device spinlock (no lost
+    wakeups); capability probe (fence_id=0/handle=0 → PROBE_ACK, old KMD
+    → NOT_IMPLEMENTED → loud diag + blocking-escape fallback). ICD:
+    per-thread tss event, register → WaitForSingleObject → cancel;
+    UNREGISTER NOT_FOUND + signaled event = raced (complete), +
+    unsignaled = teardown purge (loud, INCOMPLETE). Retire thread: 2 ms
+    slice stopgap retired from the event path — one WFMO on {fence
+    event, retire_stop_event}, 60 s deadline; slice loop survives only
+    as the old-KMD fallback. All counters in QUERY_STATS v2 + a
+    `fence_events` perf-summary line.
+    **BEFORE/AFTER (Doom vehicle, unit-0 baseline 23:00 → post-deploy
+    23:35): submit_phases escape 465-786 µs → 111-126 µs; QueueSubmit2
+    [prep 11.2/ring 45.5/win32 351 µs] → [5.2/2.3/87 µs] (submit_avg
+    390 → 89 µs); acquire-gate (vkcube) 2.6-2.9 ms avg max 11-21 ms →
+    196-273 µs avg max <1 ms; fence_events waits=2455 imm=245 raced=0
+    timeouts=0 fallbacks=0 lost=0; vkcube FIFO ~60 clean; WUDFHost/dwm
+    timeouts 0, BARRIER 0.** Gates passed: escape µs-class ✓, win32
+    <100 µs ✓. PENDING: owner Doom gameplay fps + stale-frame stutter
+    eyeball on the new stack (baseline gameplay flip-gate max was
+    20-29.7 ms = the 2-3-vblank hitch signature; event waits should
+    collapse it), present/flip-gate gameplay averages, ladder e soak.
+    **DOOM LEVEL-LOAD FATAL ROOT-CAUSED + FIXED (same session; main
+    `aedd8ba` = KMD 22.22.55): "Cannot map buffer with usage BU_STATIC"
+    = MAP_BLOB → STATUS_INSUFFICIENT_RESOURCES = the adapter-global
+    user-VA MappingTable still sized to the ORIGINAL MAX_BLOBS (256)
+    after blobs grew to 8192** — desktop held ~223 mappings, the level
+    load's vkMapMemory burst blew the remaining ~33 (probe-proven:
+    map-and-hold refused at held=33 with 0xC000009A; size sweep 1-256
+    MiB all passed, falsifying the MDL-CSHORT hypothesis; failure
+    signature present at 05:28 pre-change = NOT a fence-event
+    regression). Fix: MAX_MAPPINGS 8192 + the three indistinguishable
+    0xC000009A refusal sites individually counted (mapping-full /
+    map-pages / window-alloc) in QUERY_STATS v2.
+    `tools/blob_map_size_probe.c` = size sweep + concurrent-headroom +
+    v2 stats reader (gcc on the VM, no vcvars needed).
 - **Venus submit/fence latency**: ARCH.md's original benchmark item. The
   async/interrupt transport (C3/M3.4) landed; measure round-trip and
   present-to-scanout latency.
