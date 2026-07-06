@@ -468,6 +468,22 @@ Open defects, roughly ordered:
     GDI redirection surface. Zink itself is only a consumer: it rides the
     underlying ICD's VK_KHR_win32_surface via kopper — on venus that is our
     sw path; dzn is the driver that exercises the dcomp branch.**
+    **OUR OWN D3D11 PRESENT MODEL (read 2026-07-06, umd forward.rs
+    `dxgi_present`): windowed D3D11 is ALREADY hardware-presented end-to-end.
+    The DXGI runtime solves the rendezvous FOR the UMD — `DXGI_DDI_ARG_PRESENT`
+    delivers BOTH `hSurfaceToPresent` and `hDstResource` (the win32k
+    redirection/destination surface as a first-class UMD resource); the UMD
+    does `CopySubresourceRegion(dst←src)` = the present blit runs GPU-side
+    through venus (zero CPU bytes), then WS1 #4 present-fence publish + the
+    bounded frame gate + `pfnPresentCb(hSrc, hDst)` — the KERNEL mints the
+    history token (allowed in kernel mode; that's why DxgkDdiPresent never
+    fires — the blit already happened in the UMD). dwm's own presents are
+    flip-model onto the IddCx buffers (no dst → copy no-ops). CONSEQUENCE:
+    only the VULKAN client class (native VK games + vkd3d-proton D3D12) lacks
+    a HW present — a Vulkan ICD has no runtime handing it the destination
+    surface; that missing hand-off IS the entire gap roads (1)/(2)/(4) exist
+    to fill. Gotcha: `UmdTrace` is cached at device init — toggling it needs
+    a process restart to take effect.**
 - **Venus submit/fence latency**: ARCH.md's original benchmark item. The
   async/interrupt transport (C3/M3.4) landed; measure round-trip and
   present-to-scanout latency.
