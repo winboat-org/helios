@@ -395,6 +395,26 @@ Open defects, roughly ordered:
   rotate-perf were silently dead in post-e88f2c6 builds; bridge now uses
   `_fsopen(_SH_DENYNO)`. If a telemetry stream goes quiet, check for a
   string-in-binary vs lines-in-log mismatch before trusting it.
+- **Doom present path — async WSI worker LANDED (22nd session cont.,
+  mesa `808c7e4a786`, ICD `vulkan_virtio-1b44e8d36fe4` deployed): 120 → 160 fps.**
+  The sw WSI present serialized the frame-fence wait (5-6 ms: GPU frame +
+  venus retire) + StretchDIBits (0.65-0.75 ms) on Doom's present thread
+  (`helios-doom-wsi-perf.txt` wait_avg/stretch_avg = the 120 fps ceiling).
+  Now: per-swapchain worker thread does wait+invalidate+blit; acquire's
+  IDLE condvar is the back-pressure (run-ahead = image_count-1); kill
+  switch `HELIOS_WSI_ASYNC_PRESENT=0`. vkcube 6,600 fps; worker wait_avg
+  4.3 ms now overlaps the app's next frame. **CRASH POST-MORTEM in the same
+  arc: an unconditional 5-image sw-swapchain bump crashed Doom at renderer
+  init ×2 (idTech sizes per-image arrays to the REQUESTED count — unhandled
+  C++ FatalError, Crash.00003/00004). Spec-legal ≠ app-safe; extra depth is
+  now opt-in `HELIOS_WSI_EXTRA_IMAGES=N` (default 0), for engines that
+  re-query.** Remaining to 200 fps: worker cycle = fence-retire tracking
+  (~4.3 ms ≈ GPU frame + retire latency) + blit 0.73 ms + scheduling
+  (~0.8 ms) → next levers: split waiter/blitter pipelining, retire-latency
+  measurement (guest fence signal vs host resp), and gameplay (not menu)
+  numbers from the owner. Host-side during Doom: p50 fence 0.05 ms; a tight
+  ~10.7 ms class at 53/s = ring≥1 GPU-completion fences seeing the
+  pipelined queue backlog (healthy, not a stall).
 - **Venus submit/fence latency**: ARCH.md's original benchmark item. The
   async/interrupt transport (C3/M3.4) landed; measure round-trip and
   present-to-scanout latency.
