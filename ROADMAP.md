@@ -409,14 +409,48 @@ Open defects, roughly ordered:
   C++ FatalError, Crash.00003/00004). Spec-legal ≠ app-safe; extra depth is
   now opt-in `HELIOS_WSI_EXTRA_IMAGES=N` (default 0), for engines that
   re-query.** OWNER DECISION (2026-07-06): the sw present path is FROZEN at
-  160 fps — no further ICD sw-present optimization; the next present work is
-  the HW-ACCELERATED PRESENT (D3DKMT redirected presents, no UMD recursion:
-  ICD presents the swapchain allocation via D3DKMTPresent against the HWND;
-  win32k present-history token routes it to dwm; dwm opens + composes the
-  allocation through the existing WS1 #4 import/present-fence machinery).
-  The async sw worker remains the fallback path + kill switches. Host-side
-  during Doom: p50 fence 0.05 ms; a tight ~10.7 ms class at 53/s = ring≥1
-  GPU-completion fences seeing the pipelined queue backlog (healthy).
+  160 fps; the next present work is HW-accelerated present. The async sw
+  worker remains the fallback path + kill switches. Host-side during Doom:
+  p50 fence 0.05 ms; a tight ~10.7 ms class at 53/s = ring≥1 GPU-completion
+  fences seeing the pipelined queue backlog (healthy).
+  **D3DKMTPresent FEASIBILITY RESEARCH (same session, 26100 SDK d3dkmthk.h +
+  live-counter evidence):**
+  - `D3DKMT_PRESENT` itself is fully documented (hContext — gate5a already
+    owns one — hWindow, hSource allocation, Flags, INLINE PresentHistoryToken
+    built by the CALLER). The wall is the TOKEN: every redirected model
+    (GDI/GDI_SYSMEM/BLT/FLIP/COMPOSITION) requires `hLogicalSurface`/
+    `hPhysicalSurface` (win32k logical-surface handles) or dxgi-private
+    rendezvous state (`dxgContext`, `hCompSurf`, `confirmationCookie`,
+    `PresentLimitSemaphoreId`) minted only by the D3D runtimes through
+    win32k-private (win32u NtGdiDdDDI*) calls. NO documented path lets an
+    ICD mint a valid redirected token.
+  - **Blt-model is DEAD on 26100 regardless**: the KMD's DxgkDdiPresent
+    feasibility trace (display.rs PBcall/PBsrc/PBdst, present since .34-era)
+    has NEVER fired across weeks of desktop uptime (dwm, steamwebhelper,
+    Settings, taskmgr, D3D11 apps) — modern win32k drives flip/composition
+    models exclusively; a real KMD present-blit would serve a path Windows
+    no longer invokes. (Also: a KMD GPU blit needs venus Vulkan encoding —
+    viogpu3d's equivalent rides VIRGL_CCMD_RESOURCE_COPY_REGION, a virgl
+    primitive venus lacks; a kernel venus Vulkan client is weeks of work
+    for that dead path.)
+  - Composition-swapchain API (documented "present from Vulkan" API) needs
+    a real D3D11/D3D12 device at CreatePresentationFactory → recursion veto
+    (and no D3D12 UMD exists). DEAD.
+  - **Viable roads, pick after owner gameplay numbers:** (1) Helios-private
+    independent-flip-at-the-consumer: for an unoccluded fullscreen-sized
+    Vulkan window, the ICD publishes (resid, fence, geometry) via the WS1 #4
+    present-sync channel and LGIdd's per-acquire copy sources the APP's blob
+    instead of dwm's composition — semantically DXGI independent flip
+    implemented at the IDD; every piece exists (publisher wire format,
+    LGIdd dxvk import-by-resid, bounded consumer waits); the ONE design risk
+    is the foreground/occlusion contract (must provably fall back to dwm
+    composition the moment the window isn't the whole visible screen).
+    (2) Pinned-build flip-model RE: reverse the dxgi↔win32k rendezvous
+    (win32u NtGdiDdDDI* on 26100, which Helios pins as the guest build) to
+    mint real flip tokens = true zero-copy dwm flip for windowed too; high
+    RE effort, build-pinned fragility. (3) sw path stays the composed-window
+    contract (already async; blit 0.7 ms; the dwm-side staged upload is the
+    remaining per-composite cost).
 - **Venus submit/fence latency**: ARCH.md's original benchmark item. The
   async/interrupt transport (C3/M3.4) landed; measure round-trip and
   present-to-scanout latency.
