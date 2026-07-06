@@ -229,7 +229,22 @@ unsafe fn query_driver_caps(
     // second field of DXGK_VIDMMCAPS, after the flags union; the zero-fill at the
     // top of this fn already leaves it 0, which is what we want.
     caps.MaxQueuedFlipOnVSync = 1;
-    caps.SupportDirectFlip = 1;
+    // DIRECT-FLIP DENIAL (27th session, 2026-07-07): SupportDirectFlip=1 was an
+    // unbacked bring-up advertisement (no bisect ever showed it load-mandatory —
+    // the STEP-0 bisect above proved only FlipOnVSyncMmIo). On this adapter it is
+    // a LIE: Helios has zero scanout (all VidPn DDIs NOT_SUPPORTED; the display
+    // is an IddCx driver capturing dwm's COMPOSED output), so a dwm direct/
+    // independent-flip promotion of an eligible visual (flip-model + IGNORE-alpha
+    // + unoccluded — exactly the dcomp vehicle chain) makes dwm STOP COMPOSING it
+    // while every fence stays green: the owner-reproduced two-stale-frame
+    // alternation + old-frames-flashing stutter, cured by any dirty-region
+    // recompose (the taskbar clock's minute repaint = the hands-off ~60 s
+    // recovery). The UMD already denies CheckDirectFlipSupport unconditionally;
+    // this makes the KMD agree. Display-less-adapter guidance
+    // (mcdm-implementation-guidelines.md) requires 0 here. `DirectFlipCaps`
+    // service knob (default 0) restores the legacy advertisement for A/B via
+    // reg add + devcon restart; value lands in the 0x01D7 diag record bit 2.
+    caps.SupportDirectFlip = if direct_flip_advertised() { 1 } else { 0 };
     caps.GpuEngineTopology.NbAsymetricProcessingNodes = 1;
 
     crate::diag::record(0x01D0_0000 | ((caps.WDDMVersion as u32) & 0xFFFF));
@@ -410,6 +425,17 @@ pub(crate) const DECLARE_CROSS_ADAPTER_RESOURCE: bool = false;
 /// known-good 1.3 surface. See `WDDM_SYNC_REDESIGN.md` M1.
 pub(crate) const RAISE_WDDM_3_2_GPUMMU: bool = true;
 
+/// `DirectFlipCaps` service knob (REG_DWORD, default 0): 0 = deny direct flip
+/// everywhere (adapter cap + aperture segment flags — the truthful surface for
+/// a zero-scanout render adapter; see the SupportDirectFlip comment in
+/// `query_driver_caps`), nonzero = restore the legacy bring-up advertisement.
+/// Read at AddAdapter/QUERYSEGMENT time (PASSIVE), same pattern as BarSegFlags.
+/// The BAR knob descriptor is independently governed by BarSegFlags bit 5
+/// (default off) and is not gated here.
+fn direct_flip_advertised() -> bool {
+    crate::diag::read_config_dword(b"DirectFlipCaps", 0) != 0
+}
+
 /// Write the viogpu3d-style linear aperture descriptor (paging-buffer host).
 /// SAFETY: `seg` points to a writable `DXGK_SEGMENTDESCRIPTOR4`.
 unsafe fn write_aperture_descriptor(seg: *mut DXGK_SEGMENTDESCRIPTOR4) {
@@ -421,7 +447,9 @@ unsafe fn write_aperture_descriptor(seg: *mut DXGK_SEGMENTDESCRIPTOR4) {
             .__bindgen_anon_1
             .__bindgen_anon_1
             .set_CacheCoherent(1);
-        s.Flags.__bindgen_anon_1.__bindgen_anon_1.set_DirectFlip(1);
+        if direct_flip_advertised() {
+            s.Flags.__bindgen_anon_1.__bindgen_anon_1.set_DirectFlip(1);
+        }
         // CpuVisible deliberately 0 — an aperture holds no bits (viogpu3d :558).
         s.BaseAddress.QuadPart = APERTURE_BASE_ADDRESS;
         s.Size = APERTURE_SEGMENT_SIZE;
@@ -441,7 +469,9 @@ unsafe fn write_aperture_descriptor3(seg: *mut DXGK_SEGMENTDESCRIPTOR3) {
             .__bindgen_anon_1
             .__bindgen_anon_1
             .set_CacheCoherent(1);
-        s.Flags.__bindgen_anon_1.__bindgen_anon_1.set_DirectFlip(1);
+        if direct_flip_advertised() {
+            s.Flags.__bindgen_anon_1.__bindgen_anon_1.set_DirectFlip(1);
+        }
         // CpuVisible deliberately 0 — a linear aperture redirects system-memory
         // MDLs through MAP_APERTURE_SEGMENT instead of exposing device memory.
         s.BaseAddress.QuadPart = APERTURE_BASE_ADDRESS;
@@ -462,7 +492,9 @@ unsafe fn write_aperture_descriptor_legacy(seg: *mut DXGK_SEGMENTDESCRIPTOR) {
             .__bindgen_anon_1
             .__bindgen_anon_1
             .set_CacheCoherent(1);
-        s.Flags.__bindgen_anon_1.__bindgen_anon_1.set_DirectFlip(1);
+        if direct_flip_advertised() {
+            s.Flags.__bindgen_anon_1.__bindgen_anon_1.set_DirectFlip(1);
+        }
         s.BaseAddress.QuadPart = APERTURE_BASE_ADDRESS;
         s.Size = APERTURE_SEGMENT_SIZE;
         s.CommitLimit = APERTURE_SEGMENT_SIZE;
