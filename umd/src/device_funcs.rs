@@ -72,6 +72,17 @@ pub struct HeliosDevice {
     /// bytecode that `ID3D11Device::CreateInputLayout` requires, so we stash the
     /// element descs + the bound VS bytecode and create the layout lazily at draw.
     pub ia: core::cell::RefCell<IaState>,
+    /// Kernel-enforced vehicle flip ordering (forward.rs::flip_wait_setup):
+    /// 0 = unprobed, 1 = ready, 2 = disabled (knob off / setup failed —
+    /// counted + logged once; the bounded CPU gate serves instead). Same
+    /// single-threaded-DDI Cell contract as the rest of the device state.
+    pub flip_wait_state: core::cell::Cell<u8>,
+    /// Runtime-device monitored fence (D3DKMT_HANDLE) the present context's
+    /// queued GPU waits target; CPU-signaled by the bridge when the present
+    /// fence reaches the copy's value.
+    pub flip_wait_fence: core::cell::Cell<u32>,
+    /// Last flip value queued as a GPU wait (monotonic per device).
+    pub flip_wait_next_value: core::cell::Cell<u64>,
 }
 
 /// Deferred input-assembler binding state (see [`HeliosDevice::ia`]).

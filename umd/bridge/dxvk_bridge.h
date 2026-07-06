@@ -111,6 +111,25 @@ struct HeliosDxvkDevice {
   // the ICD can import the fence by name and gate image reuse at acquire.
   std::uint32_t present_sync_fence_id() const;
 
+  // Kernel flip-wait plumbing (25th session): the UMD created a monitored
+  // fence on the RUNTIME's kernel device (the only device scope the present
+  // context's queued GPU waits accept) and hands over the runtime's
+  // pfnSignalSynchronizationObjectFromCpuCb (raw fn address), the runtime
+  // device handle, the fence handle, and its CPU value VA. The bridge owns
+  // the signal side: present_flip_wait_arm enqueues "CPU-signal the flip
+  // fence to flip_value when the present fence reaches target_value" on the
+  // fence-waiter thread, and a watchdog thread unwedges a stalled chain by
+  // signaling the flip fence forward (bounded failure = today's stale-frame
+  // semantics, never a forever-parked present context).
+  bool present_flip_wait_setup(
+      std::size_t signal_cb,
+      std::size_t h_rt_device,
+      std::uint32_t h_fence,
+      std::size_t fence_cpu_va) const;
+  bool present_flip_wait_arm(
+      std::uint64_t target_value,
+      std::uint64_t flip_value) const;
+
   // Dcomp present vehicle (road 4 unit 2): record an image-level copy of the
   // imported ICD frame (src) into the vehicle backbuffer texture (dst) on
   // the open command list. Sources the import's LIVE storage (the

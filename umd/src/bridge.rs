@@ -110,6 +110,33 @@ pub mod ffi {
         /// the first successful publish created it (or path disabled). Pairs
         /// with publish's value for the vehicle acquire-side recycle gate.
         unsafe fn present_sync_fence_id(self: &HeliosDxvkDevice) -> u32;
+        /// Kernel flip-wait plumbing (25th session): hand the bridge the
+        /// runtime's pfnSignalSynchronizationObjectFromCpuCb (as a raw fn
+        /// address), the runtime device handle, the runtime-device monitored
+        /// fence to signal, and its CPU value VA. The bridge owns the signal
+        /// path (present-fence enqueueWait callbacks) and a wedge watchdog
+        /// (CPU-signals the fence forward when the copy chain stalls, so a
+        /// poisoned fence degrades to today's stale-frame semantics instead
+        /// of parking the present context forever). Returns false when the
+        /// producer fence path is disabled (caller keeps the CPU gate).
+        unsafe fn present_flip_wait_setup(
+            self: &HeliosDxvkDevice,
+            signal_cb: usize,
+            h_rt_device: usize,
+            h_fence: u32,
+            fence_cpu_va: usize,
+        ) -> bool;
+        /// Arm one present's kernel flip wait: when this device's present
+        /// fence reaches `target_value` (the copy's completion, signaled by
+        /// the ICD retire thread), CPU-signal the flip fence to
+        /// `flip_value`. Enqueue-only — never waits. Returns false when the
+        /// present fence is unavailable (caller falls back to the CPU gate
+        /// for this present and must NOT queue the GPU wait).
+        unsafe fn present_flip_wait_arm(
+            self: &HeliosDxvkDevice,
+            target_value: u64,
+            flip_value: u64,
+        ) -> bool;
         /// Dcomp present vehicle: image-level copy of the imported ICD frame
         /// (src) into the vehicle backbuffer texture (dst), sourcing the
         /// import's LIVE storage (staging alias when present). The copy-time

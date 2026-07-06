@@ -21,8 +21,11 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstring>
+#include <memory>
 #include <mutex>
+#include <thread>
 #include <d3d11.h>
 #include <dxgi.h>
 #include <fstream>
@@ -642,6 +645,57 @@ namespace {
 
 }
 
+// ── Kernel flip-wait (25th session) ─────────────────────────────────────────
+// Hand-declared WDDM runtime-callback ABI: this TU compiles without the WDK's
+// d3dumddi.h, and the shape below is the stable WDDM2
+// D3DDDICB_SIGNALSYNCHRONIZATIONOBJECTFROMCPU (verified against 10.0.26100 —
+// ObjectCount / D3DKMT_HANDLE* / UINT64*, natural x64 padding).
+struct HeliosCbSignalSyncFromCpu {
+  std::uint32_t        ObjectCount;
+  const std::uint32_t* ObjectHandleArray; // D3DKMT_HANDLE = UINT
+  const std::uint64_t* FenceValueArray;
+};
+typedef long (__stdcall *HeliosSignalSyncFromCpuCb)(
+    void* hDevice, const HeliosCbSignalSyncFromCpu*);
+
+// Shared between the device impl, the present-fence waiter callbacks, and the
+// wedge watchdog. Outlives the device via shared_ptr; `alive` (mutex-guarded)
+// fences every touch of the runtime callback after device teardown.
+struct HeliosFlipWaitCtx {
+  std::mutex                     mutex;
+  bool                           alive   = true;
+  HeliosSignalSyncFromCpuCb      signal  = nullptr;
+  void*                          hDevice = nullptr;
+  std::uint32_t                  hFence  = 0;
+  const volatile std::uint64_t*  cpuVa   = nullptr;
+  std::atomic<std::uint64_t>     queuedValue{0};
+  std::atomic<std::uint32_t>     unwedges{0};
+  std::atomic<std::uint32_t>     signalFails{0};
+  std::atomic<bool>              stop{false};
+
+  void signalTo(std::uint64_t value) {
+    std::lock_guard<std::mutex> lock(mutex);
+    if (!alive || !signal)
+      return;
+    const std::uint32_t h = hFence;
+    const std::uint64_t v = value;
+    HeliosCbSignalSyncFromCpu arg = { 1u, &h, &v };
+    const long hr = signal(hDevice, &arg);
+    if (hr < 0) {
+      const std::uint32_t n =
+        signalFails.fetch_add(1, std::memory_order_relaxed) + 1;
+      if (n <= 16 || (n % 512u) == 0) {
+        char msg[128];
+        std::snprintf(msg, sizeof(msg),
+          "flip-kwait: CPU signal FAILED hr=0x%08lx v=%llu (x%u)",
+          static_cast<unsigned long>(hr),
+          static_cast<unsigned long long>(v), n);
+        umd_log(msg);
+      }
+    }
+  }
+};
+
 // Opaque to the public header / cxx glue; owns the DXVK Rc<> objects + the DXVK
 // D3D11 COM device the DDI forwards to.
 struct HeliosDxvkDeviceImpl {
@@ -661,7 +715,23 @@ struct HeliosDxvkDeviceImpl {
   bool presentSyncDisabled = false;
   std::mutex presentSyncMutex;
 
+  // Kernel flip-wait signal context + wedge watchdog (see the ctx above).
+  std::shared_ptr<HeliosFlipWaitCtx> flipWait;
+  std::thread flipWaitWatchdog;
+
   ~HeliosDxvkDeviceImpl() {
+    // Silence the flip-wait machinery BEFORE the runtime device dies (the
+    // impl is destroyed inside the UMD's DestroyDevice DDI, so the runtime
+    // callback + fence CPU VA are still valid here — and never after).
+    if (flipWait) {
+      {
+        std::lock_guard<std::mutex> lock(flipWait->mutex);
+        flipWait->alive = false;
+      }
+      flipWait->stop.store(true, std::memory_order_relaxed);
+      if (flipWaitWatchdog.joinable())
+        flipWaitWatchdog.join();
+    }
     if (context) context->Release();
     if (d3d11) d3d11->Release();
   }
@@ -1423,6 +1493,103 @@ std::uint32_t HeliosDxvkDevice::present_sync_fence_id() const {
     return 0;
   std::lock_guard<std::mutex> lock(impl->presentSyncMutex);
   return impl->presentSyncDisabled ? 0 : impl->presentFenceId;
+}
+
+bool HeliosDxvkDevice::present_flip_wait_setup(
+    std::size_t signal_cb,
+    std::size_t h_rt_device,
+    std::uint32_t h_fence,
+    std::size_t fence_cpu_va) const {
+  if (!impl || !signal_cb || !h_fence || !fence_cpu_va)
+    return false;
+  {
+    std::lock_guard<std::mutex> lock(impl->presentSyncMutex);
+    if (impl->presentSyncDisabled)
+      return false; // no producer fence will ever signal — CPU gate serves
+  }
+  if (impl->flipWait)
+    return true;
+
+  auto ctx = std::make_shared<HeliosFlipWaitCtx>();
+  ctx->signal  = reinterpret_cast<HeliosSignalSyncFromCpuCb>(signal_cb);
+  ctx->hDevice = reinterpret_cast<void*>(h_rt_device);
+  ctx->hFence  = h_fence;
+  ctx->cpuVa   = reinterpret_cast<const volatile std::uint64_t*>(fence_cpu_va);
+  impl->flipWait = ctx;
+
+  // Wedge watchdog: queued GPU waits park the present CONTEXT, not a thread,
+  // so a poisoned copy chain (present fence never reaching its target) would
+  // otherwise wedge every later present forever — strictly worse than the
+  // CPU gate's bounded-timeout stale frame. Unwedge by signaling the flip
+  // fence forward after ~1 s without progress; loud and counted.
+  impl->flipWaitWatchdog = std::thread([ctx] {
+    std::uint64_t lastSeen = 0;
+    std::uint32_t stalledTicks = 0;
+    while (!ctx->stop.load(std::memory_order_relaxed)) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(250));
+      const std::uint64_t queued =
+        ctx->queuedValue.load(std::memory_order_relaxed);
+      const std::uint64_t current = *ctx->cpuVa;
+      if (queued > current && current == lastSeen) {
+        if (++stalledTicks >= 4) {
+          const std::uint32_t n =
+            ctx->unwedges.fetch_add(1, std::memory_order_relaxed) + 1;
+          char msg[160];
+          std::snprintf(msg, sizeof(msg),
+            "flip-kwait WEDGE: fence stalled at %llu with %llu queued — "
+            "signaling forward (x%u)",
+            static_cast<unsigned long long>(current),
+            static_cast<unsigned long long>(queued), n);
+          umd_log(msg);
+          ctx->signalTo(queued);
+          stalledTicks = 0;
+        }
+      } else {
+        stalledTicks = 0;
+      }
+      lastSeen = current;
+    }
+  });
+
+  umd_log("flip-kwait: kernel flip-wait READY (runtime-device fence armed)");
+  return true;
+}
+
+bool HeliosDxvkDevice::present_flip_wait_arm(
+    std::uint64_t target_value,
+    std::uint64_t flip_value) const {
+  if (!impl || !impl->flipWait)
+    return false;
+
+  dxvk::Rc<dxvk::DxvkFence> fence;
+  {
+    std::lock_guard<std::mutex> lock(impl->presentSyncMutex);
+    if (impl->presentSyncDisabled || impl->presentFence == nullptr)
+      return false;
+    fence = impl->presentFence;
+  }
+
+  auto ctx = impl->flipWait;
+  // Publish the queued target BEFORE enqueueing so the watchdog never sees a
+  // wait it does not know about. flip_value is monotonic per device.
+  std::uint64_t prev = ctx->queuedValue.load(std::memory_order_relaxed);
+  while (prev < flip_value &&
+         !ctx->queuedValue.compare_exchange_weak(
+            prev, flip_value, std::memory_order_relaxed)) {}
+
+  try {
+    // Fires inline when the fence already passed target_value (enqueueWait
+    // runs the event synchronously in that case) — no lost-signal window.
+    fence->enqueueWait(target_value,
+      [ctx, flip_value] { ctx->signalTo(flip_value); });
+  } catch (const dxvk::DxvkError& e) {
+    umd_log(("present_flip_wait_arm DxvkError: " + e.message()).c_str());
+    return false;
+  } catch (...) {
+    umd_log("unknown exception in present_flip_wait_arm");
+    return false;
+  }
+  return true;
 }
 
 std::size_t HeliosDxvkDevice::create_hull_shader(const std::uint8_t* code, std::size_t len) const {

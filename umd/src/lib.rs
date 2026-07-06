@@ -718,6 +718,9 @@ unsafe extern "system" fn create_device(
                 h_rt_core_layer: create.h_rt_core_layer,
                 um_callbacks: create.p_um_callbacks,
                 ia: core::cell::RefCell::new(device_funcs::IaState::default()),
+                flip_wait_state: core::cell::Cell::new(0),
+                flip_wait_fence: core::cell::Cell::new(0),
+                flip_wait_next_value: core::cell::Cell::new(0),
             },
         );
         device_funcs::create_runtime_context(
@@ -1031,6 +1034,55 @@ pub(crate) fn vehicle_flip_gate_us() -> u32 {
             )
         };
         if rc == 0 { value } else { DEFAULT_US }
+    })
+}
+
+/// Kernel-enforced vehicle flip ordering opt-in:
+/// `HKLM\SOFTWARE\Helios!VehicleKernelFlipWait` (REG_DWORD). Read once per
+/// process. **Absent = 0 (OFF): the first live test (2026-07-07, vkcube)
+/// wedged present #1 — the enqueueWait signal never fired, the watchdog
+/// unwedge did not revive the app, and killing the wedged process HUNG THE
+/// WHOLE GUEST (no bugcheck, no dump — a kernel-side deadlock). Root-cause
+/// before re-enabling.** =1: vehicle presents queue a dxgkrnl GPU-side wait
+/// on the copy's completion (a runtime-device monitored fence CPU-signaled
+/// when the present fence reaches the copy's value) AHEAD of the present
+/// packet — the flip physically cannot execute before the venus copy lands,
+/// closing the bounded CPU gate's timeout leak (the 25th-session A/B stale
+/// frames). Probe-proven primitive (tools/vehicle_flipwait_probe.c); the
+/// integration is what wedges.
+pub(crate) fn vehicle_kernel_flip_wait() -> bool {
+    use std::sync::OnceLock;
+    static VALUE: OnceLock<bool> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        #[link(name = "advapi32")]
+        unsafe extern "system" {
+            fn RegGetValueA(
+                hkey: usize,
+                sub_key: *const u8,
+                value: *const u8,
+                flags: u32,
+                type_out: *mut u32,
+                data: *mut c_void,
+                data_len: *mut u32,
+            ) -> i32;
+        }
+        const HKEY_LOCAL_MACHINE: usize = 0x8000_0002;
+        const RRF_RT_REG_DWORD: u32 = 0x10;
+        let mut value: u32 = 0;
+        let mut len: u32 = 4;
+        // SAFETY: NUL-terminated key/value names; `value`/`len` outlive the call.
+        let rc = unsafe {
+            RegGetValueA(
+                HKEY_LOCAL_MACHINE,
+                c"SOFTWARE\\Helios".as_ptr().cast(),
+                c"VehicleKernelFlipWait".as_ptr().cast(),
+                RRF_RT_REG_DWORD,
+                core::ptr::null_mut(),
+                (&mut value as *mut u32).cast(),
+                &mut len,
+            )
+        };
+        rc == 0 && value != 0
     })
 }
 

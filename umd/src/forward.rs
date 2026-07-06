@@ -5468,6 +5468,84 @@ static EXT_RESULT_OVERWRITES: AtomicUsize = AtomicUsize::new(0);
 /// a direct-flip window beats a wedged worker). Steady-state nonzero =
 /// the retire→signal chain is slower than the gate bound.
 static EXT_FLIP_GATE_TIMEOUTS: AtomicUsize = AtomicUsize::new(0);
+/// Kernel flip-waits queued ahead of the present packet (the ordering is
+/// dxgkrnl-enforced for these presents; the CPU gate is skipped).
+static EXT_KWAIT_ARMED: AtomicUsize = AtomicUsize::new(0);
+/// Bridge arm refusals (present fence unavailable) — the present falls back
+/// to the bounded CPU gate.
+static EXT_KWAIT_ARM_FAILS: AtomicUsize = AtomicUsize::new(0);
+/// pfnWaitForSynchronizationObjectFromGpuCb failures AFTER a successful arm
+/// (the stray future signal is harmless — monotonic, no waiter) — CPU-gate
+/// fallback for the present.
+static EXT_KWAIT_QUEUE_FAILS: AtomicUsize = AtomicUsize::new(0);
+
+/// Lazy per-device setup for the kernel-enforced flip ordering: create a
+/// monitored fence on the RUNTIME's kernel device (the only scope the
+/// present context's queued GPU waits accept — raw cross-device handles are
+/// rejected 0xC000000D, probe-proven) via pfnCreateSynchronizationObject2Cb,
+/// then hand the signal side (runtime CPU-signal callback + fence + CPU VA)
+/// to the bridge, which fires it from the present-fence waiter and runs the
+/// wedge watchdog. Any missing piece disables the path loudly ONCE for the
+/// device; the bounded CPU gate serves instead.
+unsafe fn flip_wait_setup(dev: &crate::device_funcs::HeliosDevice) -> bool {
+    match dev.flip_wait_state.get() {
+        1 => return true,
+        2 => return false,
+        _ => {}
+    }
+    let disable = |reason: &str| {
+        dev.flip_wait_state.set(2);
+        log_line(&format!(
+            "flip-kwait DISABLED for this device: {reason} — bounded CPU gate serves"
+        ));
+        false
+    };
+    if !crate::vehicle_kernel_flip_wait() {
+        return disable("VehicleKernelFlipWait=0");
+    }
+    if dev.kt_callbacks.is_null() || dev.h_context.is_null() {
+        return disable("no runtime callbacks/context");
+    }
+    let cbs = &*dev.kt_callbacks;
+    let Some(create_cb) = cbs.pfnCreateSynchronizationObject2Cb else {
+        return disable("pfnCreateSynchronizationObject2Cb missing");
+    };
+    let Some(signal_cb) = cbs.pfnSignalSynchronizationObjectFromCpuCb else {
+        return disable("pfnSignalSynchronizationObjectFromCpuCb missing");
+    };
+    if cbs.pfnWaitForSynchronizationObjectFromGpuCb.is_none() {
+        return disable("pfnWaitForSynchronizationObjectFromGpuCb missing");
+    }
+
+    let mut arg: ddi::D3DDDICB_CREATESYNCHRONIZATIONOBJECT2 = core::mem::zeroed();
+    arg.Info.Type = ddi::_D3DDDI_SYNCHRONIZATIONOBJECT_TYPE_D3DDDI_MONITORED_FENCE;
+    arg.Info.__bindgen_anon_1.MonitoredFence.InitialFenceValue = 0;
+    let hr = create_cb(dev.h_rt_device, &mut arg);
+    if hr < 0 {
+        return disable(&format!("CreateSynchronizationObject2Cb hr=0x{:08x}", hr as u32));
+    }
+    let h_fence = arg.hSyncObject;
+    let cpu_va = arg.Info.__bindgen_anon_1.MonitoredFence.FenceValueCPUVirtualAddress as usize;
+    if h_fence == 0 || cpu_va == 0 {
+        return disable("monitored fence returned no handle/CPU VA");
+    }
+
+    if !dev.dxvk.present_flip_wait_setup(
+        signal_cb as usize,
+        dev.h_rt_device as usize,
+        h_fence,
+        cpu_va,
+    ) {
+        return disable("bridge setup refused (present fence path disabled?)");
+    }
+    dev.flip_wait_fence.set(h_fence);
+    dev.flip_wait_state.set(1);
+    log_line(&format!(
+        "flip-kwait READY: runtime-device fence 0x{h_fence:x} — vehicle flips are \
+         kernel-ordered on the copy's completion (CPU gate retired for this device)"
+    ));
+    true
+}
 
 /// Backing for the `helios_umd_set_present_source` C export.
 pub fn set_present_source(
@@ -5762,22 +5840,66 @@ unsafe extern "C" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT) -> i32 {
     // the next acquire refresh. `HKLM\SOFTWARE\Helios!PresentGateUs` (DWORD)
     // overrides the cap; 0 disables. Cost telemetry: `present-gate:` lines.
     //
-    // Vehicle presents gate on their own knob (`VehicleFlipGateUs`): the
-    // 23rd-session skip assumed the published backbuffer fence + consumer
-    // copy-time wait order every read — TRUE for composed presents, FALSE
-    // for direct/independent flip, where the flip is ordered only on the
-    // KMD's decode-complete DMA fence and the backbuffer scans out before
-    // the venus copy lands (the previous occupant "pops out": the
-    // 24th-session gameplay stutter). This waits the copy's host-GPU
-    // completion on the WORKER thread — the app runs ahead; drops absorb.
-    // Pipelined replacement (dxgkrnl WaitForSynchronizationObjectFromGpu on
-    // the present packet) is the recorded next lever.
+    // Vehicle flip ordering, kernel-enforced (25th session, replaces the
+    // bounded CPU gate's leak): queue a dxgkrnl GPU-side WAIT on the flip
+    // fence AHEAD of the present packet, so the flip physically cannot
+    // execute before the venus copy lands — the CPU gate's 32 ms timeout
+    // leaked a stale flip per expiry (A/B-proven stutter source). The flip
+    // fence is CPU-signaled by the bridge when the present fence reaches
+    // this present's publish value (the ICD retire thread signals that at
+    // host-GPU copy completion), and a watchdog unwedges a poisoned chain.
+    // ARM BEFORE QUEUE: an armed-but-unqueued signal is harmless (monotonic,
+    // no waiter); a queued-but-unarmed wait would park the context forever.
+    let mut kernel_wait_armed = false;
+    if is_vehicle_present && sync_value != 0 {
+        if let Some(dev) = helios_device(h) {
+            if flip_wait_setup(dev) {
+                let v = dev.flip_wait_next_value.get() + 1;
+                dev.flip_wait_next_value.set(v);
+                if dev.dxvk.present_flip_wait_arm(sync_value, v) {
+                    let handles = [dev.flip_wait_fence.get()];
+                    let values = [v];
+                    let mut warg: ddi::D3DDDICB_WAITFORSYNCHRONIZATIONOBJECTFROMGPU =
+                        core::mem::zeroed();
+                    warg.hContext = dev.h_context;
+                    warg.ObjectCount = 1;
+                    warg.ObjectHandleArray = handles.as_ptr();
+                    warg.__bindgen_anon_1.MonitoredFenceValueArray = values.as_ptr();
+                    // Checked present in flip_wait_setup.
+                    let wait_cb =
+                        (*dev.kt_callbacks).pfnWaitForSynchronizationObjectFromGpuCb.unwrap();
+                    let hr = wait_cb(dev.h_rt_device, &warg);
+                    if hr >= 0 {
+                        EXT_KWAIT_ARMED.fetch_add(1, Ordering::Relaxed);
+                        kernel_wait_armed = true;
+                    } else {
+                        let n = EXT_KWAIT_QUEUE_FAILS.fetch_add(1, Ordering::Relaxed);
+                        if n < 16 || n % 512 == 0 {
+                            log_line(&format!(
+                                "flip-kwait: GPU-wait queue FAILED hr=0x{:08x} (x{}) — \
+                                 CPU gate serves this present",
+                                hr as u32,
+                                n + 1
+                            ));
+                        }
+                    }
+                } else {
+                    EXT_KWAIT_ARM_FAILS.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+
+    // Bounded CPU gate (`VehicleFlipGateUs` / `PresentGateUs`): the fallback
+    // ordering when the kernel wait is off/unavailable/refused — and the only
+    // ordering for non-vehicle presents. Timeout = proceed loudly (a stale
+    // frame beats a wedged worker); the kernel-wait path has no such leak.
     let gate_us = if is_vehicle_present {
         crate::vehicle_flip_gate_us()
     } else {
         present_gate_us()
     };
-    if gate_us != 0 {
+    if !kernel_wait_armed && gate_us != 0 {
         if let Some(dev) = helios_device(h) {
             if !dev.dxvk.present_frame_gate(gate_us) && is_vehicle_present {
                 let n = EXT_FLIP_GATE_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
@@ -5838,12 +5960,16 @@ unsafe extern "C" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT) -> i32 {
         let n = EXT_PRESENTS.fetch_add(1, Ordering::Relaxed);
         if n < 4 || (n + 1) % 512 == 0 {
             log_line(&format!(
-                "vehicle present #{}: imports_failed={} copies_failed={} geom_mismatch={} overwrites={}",
+                "vehicle present #{}: imports_failed={} copies_failed={} geom_mismatch={} \
+                 overwrites={} kwait_armed={} kwait_arm_fails={} kwait_queue_fails={}",
                 n + 1,
                 EXT_IMPORT_FAILS.load(Ordering::Relaxed),
                 EXT_COPY_FAILS.load(Ordering::Relaxed),
                 EXT_GEOM_MISMATCH.load(Ordering::Relaxed),
                 EXT_OVERWRITES.load(Ordering::Relaxed),
+                EXT_KWAIT_ARMED.load(Ordering::Relaxed),
+                EXT_KWAIT_ARM_FAILS.load(Ordering::Relaxed),
+                EXT_KWAIT_QUEUE_FAILS.load(Ordering::Relaxed),
             ));
         }
     }
