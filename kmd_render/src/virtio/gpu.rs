@@ -167,6 +167,14 @@ pub static TAKE_LIVE_MISSES: AtomicU32 = AtomicU32::new(0);
 /// `adopt_blob_for_allocation` rejections of a dead resource id. Replaces the
 /// in-lock `diag::record(0x0D20_00E2)` breadcrumb.
 pub static ADOPT_DEAD_REJECTS: AtomicU32 = AtomicU32::new(0);
+/// `alloc_window_range` refusals (host-visible window offset space exhausted /
+/// fragmented past the request). Each one fails a user MAP_BLOB with
+/// STATUS_INSUFFICIENT_RESOURCES — loud-failure rule (2026-07-06 Doom triage:
+/// three uncounted refusal sites all mapped to the same 0xC000009A).
+pub static WINDOW_ALLOC_REJECTS: AtomicU32 = AtomicU32::new(0);
+/// `map_io_pages_to_user` failures (MDL alloc / MmMapLockedPagesSpecifyCache
+/// raise caught by the SEH shim). Bumped by the escape handler at PASSIVE.
+pub static MAP_PAGES_FAILS: AtomicU32 = AtomicU32::new(0);
 
 /// Raise `hw` to at least `n` (relaxed; approximate under concurrency is fine
 /// for telemetry).
@@ -1939,10 +1947,13 @@ impl VirtioGpu {
             return Ok(offset);
         }
         let offset = self.next_window_offset;
-        let end = offset.checked_add(len).ok_or(VirtioError::OutOfMemory)?;
-        if end > window_len {
-            return Err(VirtioError::OutOfMemory);
-        }
+        let end = match offset.checked_add(len) {
+            Some(e) if e <= window_len => e,
+            _ => {
+                WINDOW_ALLOC_REJECTS.fetch_add(1, Ordering::Relaxed);
+                return Err(VirtioError::OutOfMemory);
+            }
+        };
         self.next_window_offset = end;
         Ok(offset)
     }

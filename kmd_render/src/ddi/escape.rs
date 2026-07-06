@@ -316,6 +316,13 @@ fn escape_query_stats(adapter: &AdapterContext, buf: &mut [u8]) -> NTSTATUS {
     out2.out_fence_event_invalid = FENCE_EVENT_INVALID.load(Ordering::Relaxed);
     out2.out_fence_event_cancels = FENCE_EVENT_CANCELS.load(Ordering::Relaxed);
     out2.out_fence_event_teardown_drops = FENCE_EVENT_TEARDOWN_DROPS.load(Ordering::Relaxed);
+    out2.out_mappings_live = adapter.mappings.live();
+    out2.out_mappings_cap = crate::mapping::MAX_MAPPINGS_CAP;
+    out2.out_mappings_high_water = crate::mapping::MAPPINGS_HIGH_WATER.load(Ordering::Relaxed);
+    out2.out_mapping_full_rejects = crate::mapping::MAPPING_FULL_REJECTS.load(Ordering::Relaxed);
+    out2.out_map_pages_fails = crate::virtio::gpu::MAP_PAGES_FAILS.load(Ordering::Relaxed);
+    out2.out_window_alloc_rejects =
+        crate::virtio::gpu::WINDOW_ALLOC_REJECTS.load(Ordering::Relaxed);
     buf[..sz2].copy_from_slice(bytes_of(&out2));
     STATUS_SUCCESS
 }
@@ -498,7 +505,11 @@ fn escape_map_blob(adapter: &AdapterContext, buf: &mut [u8], owner: usize) -> NT
     // host-injected window range from RESOURCE_MAP_BLOB.
     let (user_va, mdl) = match unsafe { map_io_pages_to_user(prep.gpa, prep.size, cache) } {
         Some(x) => x,
-        None => return STATUS_INSUFFICIENT_RESOURCES,
+        None => {
+            crate::virtio::gpu::MAP_PAGES_FAILS
+                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
     };
 
     // Phase 3 — record for handle-close teardown. Table full → undo immediately.

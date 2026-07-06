@@ -29,16 +29,30 @@
 //! but the no-realloc-under-lock invariant still matters.)
 
 use core::cell::UnsafeCell;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use alloc::vec::Vec;
 
 use wdk_sys::ntddk::{KeAcquireSpinLockRaiseToDpc, KeReleaseSpinLock};
 use wdk_sys::KSPIN_LOCK;
 
-/// Maximum concurrently-mapped host-visible blobs per device. Generous for
-/// bring-up; the ICD's mapped working set (command rings + a few host-visible
-/// device-memory BOs) is far smaller. Table-full → `MAP_BLOB` fails cleanly.
-const MAX_MAPPINGS: usize = 256;
+/// Maximum concurrently-mapped host-visible blobs per ADAPTER (the table is
+/// adapter-global: dwm + WUDFHost + every game share it). Matches MAX_BLOBS —
+/// every live mappable blob may legally be mapped. The original 256 (sized to
+/// the pre-2026-07-03 MAX_BLOBS) was the 2026-07-06 Doom level-load fatal:
+/// the desktop held ~223 mappings, the load burst past the remaining ~33 →
+/// MAP_BLOB → STATUS_INSUFFICIENT_RESOURCES → vkMapMemory returned no address
+/// → idTech "Cannot map buffer with usage BU_STATIC" FatalError (probe-proven:
+/// map-and-hold refused at exactly held=33 with 0xC000009A).
+const MAX_MAPPINGS: usize = 8192;
+
+/// `insert` refusals because the table was at capacity (each one is a failed
+/// user MAP_BLOB — loud-failure rule; reported via QUERY_STATS v2).
+pub static MAPPING_FULL_REJECTS: AtomicU32 = AtomicU32::new(0);
+/// High-water of live mappings since driver start.
+pub static MAPPINGS_HIGH_WATER: AtomicU32 = AtomicU32::new(0);
+/// `MAX_MAPPINGS` for QUERY_STATS reporting.
+pub const MAX_MAPPINGS_CAP: u32 = MAX_MAPPINGS as u32;
 
 /// One recorded user-space blob mapping.
 #[derive(Clone, Copy)]
@@ -110,12 +124,26 @@ impl MappingTable {
                 user_va,
                 mdl,
             });
+            let n = entries.len() as u32;
+            if MAPPINGS_HIGH_WATER.load(Ordering::Relaxed) < n {
+                MAPPINGS_HIGH_WATER.store(n, Ordering::Relaxed);
+            }
             true
         } else {
+            MAPPING_FULL_REJECTS.fetch_add(1, Ordering::Relaxed);
             false
         };
         unsafe { KeReleaseSpinLock(self.lock.get(), irql) };
         ok
+    }
+
+    /// Current live-mapping count (QUERY_STATS v2).
+    pub fn live(&self) -> u32 {
+        let irql = unsafe { KeAcquireSpinLockRaiseToDpc(self.lock.get()) };
+        // SAFETY: spinlock-guarded read of the entries.
+        let n = unsafe { &*self.entries.get() }.len() as u32;
+        unsafe { KeReleaseSpinLock(self.lock.get(), irql) };
+        n
     }
 
     /// Pop one live mapping OWNED BY `owner` for teardown, returning `(user_va, mdl)`.

@@ -353,6 +353,18 @@ pub struct HeliosEscapeQueryStatsV2 {
     pub out_fence_event_cancels: u32,
     /// Registrations dropped (dereferenced UNSIGNALED) at transport teardown.
     pub out_fence_event_teardown_drops: u32,
+    /// Live user-VA blob mappings (adapter-global MappingTable).
+    pub out_mappings_live: u32,
+    /// MappingTable capacity (MAX_MAPPINGS).
+    pub out_mappings_cap: u32,
+    pub out_mappings_high_water: u32,
+    /// MAP_BLOB refusals because the mapping table was full (the 2026-07-06
+    /// Doom "Cannot map buffer BU_STATIC" level-load fatal).
+    pub out_mapping_full_rejects: u32,
+    /// map_io_pages_to_user failures (MDL alloc / user-map raise).
+    pub out_map_pages_fails: u32,
+    /// alloc_window_range refusals (window space exhausted / fragmented).
+    pub out_window_alloc_rejects: u32,
 }
 
 const _: () = {
@@ -367,5 +379,5 @@ const _: () = {
     assert!(core::mem::size_of::<HeliosEscapeWaitFence>() == 40);
     assert!(core::mem::size_of::<HeliosEscapePresentBlob>() == 40);
     assert!(core::mem::size_of::<HeliosEscapeFenceEvent>() == 40);
-    assert!(core::mem::size_of::<HeliosEscapeQueryStatsV2>() == 128);
+    assert!(core::mem::size_of::<HeliosEscapeQueryStatsV2>() == 152);
 };
