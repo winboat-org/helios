@@ -815,6 +815,53 @@ Open defects, roughly ordered:
     depth); (b) U:=V fires at ring-fence retirement measured at 97-98%
     of T_gpu — check the tail. First step: knob=0 vehicle A/B of the
     unfocused-launch behavior + the hr logging.
+    **27TH SESSION (2026-07-07): (c1) FALSIFIED + full static analysis of
+    the HW present path.** hr-transition/drop-streak instrumentation
+    deployed (mesa `e3d2fdf61c1`, ICD `vulkan_virtio-1545839fc535`;
+    `odd_hr` counter in the perf line; paintcap_hidden schtask = capture
+    without the console occluder/focus steal): under a 45 s full-screen
+    occluder the knob=0 chain presented at a steady 60 Hz, hr == S_OK
+    throughout, acquire-gate timeouts 0 — composition swapchains never
+    report OCCLUDED and dwm keeps consuming occluded chains; presents
+    flowing says NOTHING about display. Owner clarified the property set:
+    launch alternation + random self-healing stutter are both cured by ANY
+    rendering activity (notepad open — no focus change!) ⇒ the lever is
+    activity, not focus. Static analysis (3-leg map, agent reports in the
+    session transcript): every vehicle ordering protection is a bounded
+    32 ms wait that LEAKS stale on timeout (consumer copy-wait
+    dxvk_context.cpp:9507 "copying anyway"; flip gate forward.rs:5902
+    "flipping anyway"; acquire release-gate wsi_common_win32.cpp:1683
+    proceed; dwm-side staged-refresh wait ditto) — all funnel into named-
+    fence advancement by the per-process ICD retire thread, whose event
+    wait is the ONE chain link with NO self-heal: KMD fence events are
+    interrupt-edge-driven (drain_used from the ISR/DPC or opportunistic
+    drains on the process's OWN escape traffic only; no KMD timer;
+    register-vs-retire race proven closed, gpu.rs:1317/escape.rs:186), so
+    a lost/deferred INTx for a mostly-IDLE process (dwm on a static
+    desktop!) parks its retire thread ≤60 s with nothing to kick it.
+    PRIME SUSPECT (fits all 4 properties + why vkcube-side counters were
+    all clean): the stall is in DWM's process — dwm consumes the vehicle
+    backbuffers through the alias-staging refresh + 32 ms consumer wait;
+    a parked dwm retire thread ⇒ dwm composes stale staged copies of the
+    2 ever-refreshed backbuffers (= the TWO alternating frames) while the
+    app's flips rotate healthily; dwm idle ⇒ few escapes ⇒ no drains ⇒
+    self-sustaining until any dirty region makes dwm submit (notepad,
+    click) ⇒ drain ⇒ unstick. Secondary: retire-thread serial FIFO
+    convoy (one stuck head delays every later signal = stutter burst,
+    self-heals = P3/P4); vehicle named release fence created LAZILY
+    inside present #1 (dxvk_bridge.cpp:1434) + consumer import-failure
+    negative-cache of 256 LOOKUPS (dxvk_context.cpp:9482) = long
+    unordered window at chain birth. FIX DIRECTION (kick-independence,
+    in order): 1) retire thread: replace the 60 s WFMO with short sliced
+    waits interleaved with a WAIT_FENCE poll escape (whose inline
+    drain_used self-heals any lost wakeup, ctrl.rs:108 pattern);
+    2) KMD backstop: self-rearming short timer DPC while the
+    fence_events table is non-empty; 3) create the vehicle's named fence
+    EAGERLY at vehicle init; 4) make the fence-import negative cache
+    time-based, not 256-lookup-based. Verify: dwm-pid consumer-wait
+    timeout lines in dwm's dxvk log + KMD FENCE_EVENT_* / INT_ROUTINE
+    counters during one alternation repro (paintcap_hidden diffs detect
+    it without owner eyeball).
 - **Capture path**: IddCx frame drop policy vs D3D12 copy queue saturation;
   KVMFR bandwidth; 10 bpc default.
 - Candidates list from the NVIDIA fix era lives in ICD.md.
