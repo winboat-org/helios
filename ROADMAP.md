@@ -608,7 +608,42 @@ Open defects, roughly ordered:
     `tools/read-vehicle-counters.ps1` samples live minted/drops/gate
     counters from a running process (the perf line never prints on
     pure-vehicle runs); `Z:\tmp\movewin_target.txt` + helios_movewin
-    foregrounds an arbitrary window title.
+    foregrounds an arbitrary window title. Owner gameplay: ~70-80 fps.
+    **STALE-FRAME STUTTER FIXED (24th session, cont.; owner-confirmed
+    "much better"; main `5a9d5d5`).** Root cause: direct/independent-flip
+    presents (Doom's near-fullscreen window) are ordered only on the KMD's
+    decode-complete DMA fence — the backbuffer scanned out before the
+    venus copy landed, showing the buffer's 3-presents-old occupant. dwm's
+    consumer wait protects only COMPOSED presents. Fix: vehicle presents
+    now run the frame-completion gate on the WORKER before pfnPresentCb
+    (`VehicleFlipGateUs`, default 32 ms, 0=off; 6.7 ms avg = the copy's
+    fence-observation latency; acquire-gate wait dropped 2.7→1.7 ms).
+    Pipelined follow-up: dxgkrnl WaitForSynchronizationObjectFromGpu on
+    the present packet + the producer fence before the copy flush (also
+    retires the copy-time CPU wait for vehicle copies). Related cleanup
+    (dxvk `7255c1e6`): the redundant pre-6eab004c list-start consumer wait
+    in refreshHeliosStagedImages removed for the alias variant.
+    **THE 200-fps LEVER FOUND — escape-parked fence waits convoy submits
+    (mesa `fbf38f4cc63` has the telemetry + stopgap).** Phase splits
+    ([prep/ring/win32] on QueueSubmit2, [mutex/escape/sync] on
+    helios_submit) proved: the pre-present submit's 2.5-2.9 ms is entirely
+    the win32-signal SUBMIT_VENUS D3DKMTEscape, which serializes at the
+    dxgkrnl escape layer behind the retire thread's blocking WAIT_FENCE
+    escapes (parked up to 250 ms/slice; processes with no parked waits —
+    dwm, the sw path — submit at 3-5 µs). Slice 250 ms → 2 ms bounded the
+    convoy (escape 2.9 → ~1.0-1.6 ms) and CONFIRMED the mechanism; Doom
+    stays ~60-70 because its OWN vkWaitForFences ride the same parked
+    escapes. NEXT SESSION (the fix): **KMD-signaled usermode fence
+    events** — non-blocking REGISTER_FENCE_EVENT escape (fence_id, event
+    HANDLE), KMD DPC KeSetEvent at wire-fence retirement (in-flight table
+    already has ISR→DPC), retire thread + helios_wait park on the EVENT
+    in usermode. Kills the convoy class entirely AND collapses the
+    fence-observation latency every consumer pays (app fence waits, flip
+    gate, acquire gate, retire→signal chain). KMD unit: event table with
+    ObReferenceObjectByHandle lifetime + process-teardown cleanup +
+    version bump; ICD unit: register/park/cancel in helios_ioctl_wait_fence
+    path. Deployed at session end: UMD `helios_umd_89e95497a7d6d08f`, ICD
+    `vulkan_virtio-2900b457e859`, dxvk `7255c1e6`, mesa `fbf38f4cc63`.
 - **Venus submit/fence latency**: ARCH.md's original benchmark item. The
   async/interrupt transport (C3/M3.4) landed; measure round-trip and
   present-to-scanout latency.
