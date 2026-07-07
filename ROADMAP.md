@@ -1114,6 +1114,39 @@ Open defects, roughly ordered:
     `helios_vkcube_imm` (immediate-mode cube, perf files
     vkcube_imm_*); helios_vkcube now also sets HELIOS_PERF →
     vkcube_renderer_perf.txt.
+    **29TH SESSION cont. (owner-collaborative) — REFINED + WORKAROUND
+    SHIPPED: feedback-shadow retire (mesa `b578e7d42a3`, ICD
+    `vulkan_virtio-32e87a6fc919` deployed, device restarted, desktop
+    verified).** Refinements from live host debugging (owner gdb/strace/
+    sysctls): the async fence path IS configured (proxy flags 962);
+    worker retires fences in 50-150 µs (strace); the io_uring fdmon
+    theory was FALSIFIED (kernel.io_uring_disabled=2 + reboot: epoll
+    shows kick→IRQ p50 33 µs yet guest retire_lat unchanged); vkr ring
+    thread + guest KMD interrupt handling audited clean (spec + Linux
+    virtgpu cross-checked by the owner; real non-10 ms inefficiencies
+    noted: INTx shares IRQ 22 with the balloon → KMD MSI-X someday;
+    serial retire-thread waits). Guest no-WSI probe
+    (tools/vk_fence_wake_probe_win.c): the vn FEEDBACK channel is
+    0.61 ms while the WIRE-fence channel carries the 10-20 ms class.
+    DOOM (instrumented, owner run): copy-lat 11.4 ms avg (65% in
+    10-20 ms, 0% <1 ms), acquire-gate 6.9 ms of the 9.5 ms frame, game
+    device 97% of fences 6-20 ms — CONFIRMED as THE fps ceiling.
+    OWNER DECISION: QEMU fix out of scope → WORKAROUND: the ICD retire
+    thread now observes exported-fence completion via the semaphore's
+    GPU-written vn feedback slot (slots now allocated for exported
+    timelines — self-signaled only on this stack; counter VA attached to
+    the sync, detached before pool recycling; poll ladder yield/Sleep to
+    a 50 ms budget; wire path = fallback + kill switch).
+    `HELIOS_RETIRE_FEEDBACK` DEFAULT ON, =0 restores wire behavior
+    (A/B-proven). vkcube: retire_lat 5.6-9.2 ms → 0.25-0.33 ms (100%
+    <1 ms, fb fast=100%); copy-lat 13.6 ms → 0.8 ms; content advancing;
+    kill-switch run bimodal again. retire_fb fast/fallback/wire counters
+    in the perf summary. PENDING: owner Doom re-run (expect the acquire
+    gate to collapse and fps to rise toward the ~200 sw-path bound);
+    HELIOS_RING_NOTIFY_EAGER diag knob (mesa `4d0c7d21514`, default off,
+    falsified as a lever); host sysctls to revert when debugging ends:
+    kernel.yama.ptrace_scope=0 (→1), kernel.io_uring_disabled=2 (owner's
+    call — QEMU fence behavior identical either way).
 - **Capture path**: IddCx frame drop policy vs D3D12 copy queue saturation;
   KVMFR bandwidth; 10 bpc default.
 - Candidates list from the NVIDIA fix era lives in ICD.md.
