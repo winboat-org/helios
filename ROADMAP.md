@@ -1034,6 +1034,25 @@ Open defects, roughly ordered:
     insurance knob keep (no measurable cost either way at Doom res —
     the copy hides under GPU latency); DCOMP default AFTER the dwm
     stutter fix.
+    **STUTTER FIX IMPLEMENTED + DEPLOYED (dxvk `6bcbd282`, main
+    `83f9697`; UMD `helios_umd_b70f3e5b23cc5e03`): skip-if-unretired
+    staged refresh for kwait-ordered publishes.** Producers advertise
+    kernel-held flips in the present-sync slot (fenceId bit 30 — free
+    in both id spaces; UMD sets it on vehicle publishes when
+    flip_wait_setup succeeded, never on dwm→IddCx publishes; mesa
+    publishes never set it); the consumer refresh keeps its current
+    staged bytes for an unretired kwait value (that image cannot be
+    the sampled front buffer — dxgkrnl holds its flip), re-arms the
+    bind-time gate, counts (refresh_skips in the present-wait line;
+    dxvk.heliosSkipUnretiredRefresh default ON = kill switch).
+    heliosProducerFence factors the import cache; VehicleKernelFlipWait
+    CODE DEFAULT NOW ON (registry 0 = kill switch). VERIFIED LIVE:
+    dwm skips ~60/s on vkcube's 3 backbuffers with ZERO blocking waits
+    since restart and content advancing (paintcap pair); WUDFHost
+    refresh_skips=0, waits unchanged 5.8 ms/0 timeouts (the IddCx
+    orderer untouched); vkcube kwait 4096/4096 armed via the code
+    default. AWAITING owner windowed-Doom eyeball: the 8.9 ms dwm CS
+    stalls are gone — stutter verdict decides the DCOMP default next.
 - **Capture path**: IddCx frame drop policy vs D3D12 copy queue saturation;
   KVMFR bandwidth; 10 bpc default.
 - Candidates list from the NVIDIA fix era lives in ICD.md.
