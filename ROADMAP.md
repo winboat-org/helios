@@ -974,6 +974,34 @@ Open defects, roughly ordered:
     (acquire-gate 0 timeouts). The honest fullscreen-vehicle Doom A/B
     is now unblocked (owner run — expect creates=2 fails=0 and the
     fullscreen chain LIVE instead of the 0x88980800 latch).
+    **28TH SESSION cont. — kwait rung 1 GREEN + copy-side wait FALSIFIED
+    + both cleanup counters live (mesa `06e27a05ea3`, dxvk `7c82271f`;
+    deployed ICD `vulkan_virtio-43feb2709167`, UMD
+    `helios_umd_801a8571aff69c67`, `VehicleKernelFlipWait=1` in the
+    registry).** (a) Kernel flip-wait smoke: vkcube dcomp 4608/4608
+    presents kwait_armed, 0 arm/queue fails, acquire-gate 66 µs avg
+    0 timeouts, 40 s no wedge, content advancing in paintcap diffs —
+    the 5.6 ms worker-serial flip gate is retired whenever the knob is
+    on; Doom A/B vs the 105 fps baseline = OWNER RUNG (knob already
+    live). (b) The 25th-session "producer-fence wait before copy flush"
+    idea is FALSIFIED as a lever: Doom's 28k-present run logged ZERO
+    copy-time consumer waits (no present-wait/unordered/noslot lines in
+    umd-9444.log) — the copy-time CPU wait always fast-paths; the
+    4.06 ms acquire gate is copy COMPLETION+OBSERVATION latency, not a
+    CS-thread wait. Not built (measure-first). (c) Insurance blit:
+    HELIOS_WSI_INSURANCE_BLIT=0 skips the per-present image->buffer
+    fallback blit on vehicle-serving chains (insurance_skipped counter
+    in the common perf line; vkcube A/B clean, 2780 skips, content
+    correct) — default ON until the Doom A/B numbers land. (d)
+    dwm-side staleness-gate cost now visible: gate_flushes in the
+    present-wait line — ~50 flushes / 13.7k consumer reads (~0.4%) on
+    a live desktop, the 27th-session fix is cheap. OWNER LADDER: Doom
+    windowed (kwait live) fps + gates vs 105; fullscreen re-try
+    (target-registry fix) — expect vehicle LIVE, honest fullscreen
+    number vs the 200 fps sw path; optional HELIOS_WSI_INSURANCE_BLIT=0
+    leg; stale class must stay dead throughout (vkcube shows no
+    regression). THEN: kwait + DCOMP default decisions, residual
+    stutter triage (105-vs-60 Hz judder, gate max-spikes).
 - **Capture path**: IddCx frame drop policy vs D3D12 copy queue saturation;
   KVMFR bandwidth; 10 bpc default.
 - Candidates list from the NVIDIA fix era lives in ICD.md.
