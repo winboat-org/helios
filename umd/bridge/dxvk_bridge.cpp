@@ -673,6 +673,88 @@ struct HeliosFlipWaitCtx {
   std::atomic<std::uint32_t>     signalFails{0};
   std::atomic<bool>              stop{false};
 
+  // Copy-latency decomposition (WS2 fps lever): t0 stamped at publish (the
+  // copy's fence signal recorded on the open CS, present thread), t1 when the
+  // present-fence waiter observes the value retire — t1-t0 spans CS dispatch →
+  // venus submit → host decode/queue/execute → wire-fence retire → guest
+  // observation. Slots are a value-indexed ring; in-flight depth is bounded by
+  // the swapchain (<< 64), so overwrite of an unobserved slot is a counted
+  // miss, not a wrong number.
+  struct LatSlot {
+    std::atomic<std::uint64_t> value{0};
+    std::atomic<std::int64_t>  t0{0};
+  };
+  static constexpr std::uint32_t kLatSlots = 64;
+  LatSlot latSlots[kLatSlots];
+  std::atomic<std::uint64_t> latCount{0};
+  std::atomic<std::uint64_t> latTotalUs{0};
+  std::atomic<std::int64_t>  latMaxUs{0};
+  std::atomic<std::uint64_t> latHist[6] = {}; // <1,1-3,3-6,6-10,10-20,>=20 ms
+  std::atomic<std::uint64_t> latMisses{0};
+
+  static std::int64_t latTicksToUs(std::int64_t ticks) {
+    static const std::int64_t freq = [] {
+      LARGE_INTEGER f;
+      QueryPerformanceFrequency(&f);
+      return static_cast<std::int64_t>(f.QuadPart);
+    }();
+    return freq ? ticks * 1000000 / freq : 0;
+  }
+
+  void latRecordPublish(std::uint64_t value) {
+    LARGE_INTEGER t;
+    QueryPerformanceCounter(&t);
+    LatSlot& slot = latSlots[value % kLatSlots];
+    slot.t0.store(t.QuadPart, std::memory_order_relaxed);
+    slot.value.store(value, std::memory_order_release);
+  }
+
+  void latObserve(std::uint64_t value) {
+    LatSlot& slot = latSlots[value % kLatSlots];
+    if (slot.value.load(std::memory_order_acquire) != value) {
+      latMisses.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
+    LARGE_INTEGER t;
+    QueryPerformanceCounter(&t);
+    const std::int64_t us =
+      latTicksToUs(t.QuadPart - slot.t0.load(std::memory_order_relaxed));
+    if (us < 0)
+      return;
+    latTotalUs.fetch_add(static_cast<std::uint64_t>(us),
+                         std::memory_order_relaxed);
+    std::int64_t prevMax = latMaxUs.load(std::memory_order_relaxed);
+    while (us > prevMax &&
+           !latMaxUs.compare_exchange_weak(prevMax, us,
+                                           std::memory_order_relaxed)) {}
+    const std::uint32_t bucket =
+      us < 1000 ? 0 : us < 3000 ? 1 : us < 6000 ? 2 :
+      us < 10000 ? 3 : us < 20000 ? 4 : 5;
+    latHist[bucket].fetch_add(1, std::memory_order_relaxed);
+    const std::uint64_t n =
+      latCount.fetch_add(1, std::memory_order_relaxed) + 1;
+    if ((n % 512u) == 0) {
+      char msg[256];
+      std::snprintf(msg, sizeof(msg),
+        "copy-lat: n=%llu avg_us=%llu max_us=%lld "
+        "hist_ms[<1,1-3,3-6,6-10,10-20,20+]=%llu/%llu/%llu/%llu/%llu/%llu "
+        "misses=%llu",
+        static_cast<unsigned long long>(n),
+        static_cast<unsigned long long>(
+          latTotalUs.load(std::memory_order_relaxed) / n),
+        static_cast<long long>(latMaxUs.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(latHist[0].load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(latHist[1].load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(latHist[2].load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(latHist[3].load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(latHist[4].load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(latHist[5].load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(latMisses.load(std::memory_order_relaxed)));
+      umd_log(msg);
+      latMaxUs.store(0, std::memory_order_relaxed);
+    }
+  }
+
   void signalTo(std::uint64_t value) {
     std::lock_guard<std::mutex> lock(mutex);
     if (!alive || !signal)
@@ -1482,6 +1564,11 @@ std::uint64_t HeliosDxvkDevice::present_sync_publish(
     static_cast<dxvk::D3D11ImmediateContext*>(impl->context)
       ->HeliosSignalPresentFence(fence, value);
 
+    // Vehicle devices only (flipWait exists there): stamp the publish time
+    // for the copy-latency decomposition, observed at the waiter callback.
+    if (auto latCtx = impl->flipWait)
+      latCtx->latRecordPublish(value);
+
     const std::uint32_t pid = GetCurrentProcessId();
     const std::uint32_t fenceId = impl->presentFenceId;
     bool published = false;
@@ -1596,7 +1683,10 @@ bool HeliosDxvkDevice::present_flip_wait_arm(
     // Fires inline when the fence already passed target_value (enqueueWait
     // runs the event synchronously in that case) — no lost-signal window.
     fence->enqueueWait(target_value,
-      [ctx, flip_value] { ctx->signalTo(flip_value); });
+      [ctx, target_value, flip_value] {
+        ctx->latObserve(target_value);
+        ctx->signalTo(flip_value);
+      });
   } catch (const dxvk::DxvkError& e) {
     umd_log(("present_flip_wait_arm DxvkError: " + e.message()).c_str());
     return false;
