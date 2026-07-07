@@ -19,6 +19,58 @@ in `NTOSEYE.md` and `BRINGUP_QUIRKS.md`.*
 - Doom 2016 previously verified 120+ fps through venus on the NVIDIA host
   (offscreen path; pre-WDDM-desktop milestone).
 
+## Current priorities (2026-07-07, 33rd session — owner-set, in order)
+
+These supersede the day-to-day defect lists below where they conflict; the
+workstream sections hold the detailed evidence.
+
+1. **D3D11 windowed apps render transparent — investigate & fix.** Windowed
+   D3D11 swapchains (FaceWorks, Fire Strike windowed) show a transparent/black
+   client area even when placed on-screen at the right size, while the desktop
+   and window frames composite fine. Established this session: the app DOES
+   render correct content (`HELIOS_PRESENT_READBACK` source non-black at
+   1264×681); it is NOT alpha (`HELIOS_PRESENT_FORCE_OPAQUE` no-op, owner-
+   confirmed); it is NOT a two-memory split (the KMD adopt path backs the alloc
+   with the DXVK venus image — an earlier "KMD zeroes the resid" reading was a
+   UMD struct-layout misread, see below); and it is NOT the IDD (both the D3D11
+   fallback and the dead D3D12 path capture the same single composed IddCx
+   surface — D3D12 is dead only because our UMD has no D3D12). The live thread:
+   **DXGI `EnumOutputs`/`GetDisplayModeList` racily return `0x887a0022`** on the
+   Helios adapters, DWM never imports the app's flip backbuffer (its max
+   imported resid trails the app's), and there are **two identically-named
+   "Helios vGPU Render Adapter" DXGI entries that both resolve to the same
+   physical WDDM adapter** — a stale-LUID residue from repeated device restarts.
+   CCD pins the live output to one LUID; the other is a phantom. NEXT: reboot to
+   clear stale adapter LUIDs (owner approval), re-run
+   `adapter_live_probe`/`ccd_adapter_probe`/`dxgi_output_modes_probe`; if a
+   single clean adapter still fails `EnumOutputs`, fix the render-adapter↔IddCx
+   output exposure so DXGI enumerates the desktop output (31st-session split,
+   broader). Detail: memory `phantom-adapter-luid-enumoutputs-33rd`,
+   `faceworks-black-d3dflip-twomemory-split-33rd`.
+
+2. **Slow first-paint on some windows — our UMD makes DWM wait.** Settings app,
+   parts of Explorer on fresh open, and (easiest repro) the **UAC dimmed
+   window** take several seconds to render. Suspected a UMD-side present/consumer
+   wait or a per-window gate stalling DWM's first composition of these surfaces.
+   Likely related to #1's consumer/import path. NEXT: measure — instrument the
+   present-wait / gate-flush / consumer-wait counters against a UAC-window repro,
+   find which wait blocks and why it only bites first-paint.
+
+3. **Codebase cleanup (HIGH).** Many paths accreted across bring-up sessions add
+   overhead or cause minor misbehaviours: retired diagnostic scaffolding, dead
+   knobs, superseded present/staging paths, force-* diagnostics, staged-probe
+   machinery, and now-falsified experiments (e.g. the `DECLARE_CROSS_ADAPTER_RESOURCE`
+   line, broad-adopted-BAR remnants). Audit the UMD present path, dxvk-helios
+   staging/refresh layers, and KMD segment/adopt code; delete or gate what is not
+   load-bearing, with before/after behaviour verified. Do this before large new
+   feature work so #1/#2/#4 land on a clean base.
+
+4. **Performance — Fire Strike fullscreen (~100 fps @1080p, GT1).** Owner
+   believes near-2× is reachable. Render path is healthy (fullscreen renders
+   correctly). Measure first (venus submit/fence latency, copy/acquire gates,
+   present-to-scanout) then remove known costs. See WS2 for the levers already
+   mapped (feedback-shadow retire, dcomp vehicle, copy-latency).
+
 ## Workstream 1 — Stability
 
 **IDD frame freeze: DIAGNOSED 2026-07-05 (17th session), live on the frozen boot** — full chain
@@ -1199,6 +1251,118 @@ root-caused.**
   `ff14979` (WIP, un-deployed source; the all-count MSAA-log build was not
   installed). Probe: `tools/d3d11_fl_probe.cpp`, schtasks `helios_flprobe`,
   session 1 (session-0 win_exec fails all levels for a context reason, not FL).
+
+**31st session (2026-07-07) — Fire Strike launch blocker moved past FL11:
+legacy DXGI output mode-list fails on the IddCx logical output.**
+
+- Owner rebooted after an IDD/client wedge; desktop composition is healthy again
+  (`HeliosRenderAdapter=1`, both Display devices `OK`, IDD frames flowing with
+  dirty-rect D3D11 fallback copies). The latest Fire Strike result
+  (`3DMark-FireStrike-FAILED-20260707155504.3dmark-result`) exits both Demo and
+  GT1 during `SINGLE_INIT_BEGIN` before workload rendering:
+  `IDXGIOutput::GetDisplayModeList` returns `DXGI_ERROR_NOT_CURRENTLY_AVAILABLE`
+  (`0x887a0022`), then 3DMark reports "Workload produced no results".
+- Repro probe on the same boot: DXGI enumerates `\\.\DISPLAY6` under a fixed
+  logical Helios adapter LUID `00000000:000078c5`; every
+  `IDXGIOutput::GetDisplayModeList` / `GetDisplayModeList1` call returns
+  `0x887a0022` for the tested formats. `D3DKMTOpenAdapterFromGdiDisplayName` on
+  that same `\\.\DISPLAY6` opens the real Helios render adapter LUID
+  `00000000:0038c127`, and `D3DKMTGetDisplayModeList` succeeds with 1064 modes.
+  DXGI ETW around the probe records `IDXGIOutput_GetDisplayModeList` stop events
+  with `m_Ret=2289696802` (`0x887a0022`) and the output object bound to
+  `\\.\DISPLAY6`, but no richer rejection string.
+- Falsified: RDP/session-context cause. The workload and probes run in active
+  console session 1, not an RDS session. Also falsified: missing IDD modes in
+  general (CCD/KMT mode lists exist), and UMD WDDM1.3 Present1/MPO callback
+  table as the immediate launch blocker (current UMD logs show the DXGI 1.3 base
+  table populated and D3D11 device creation succeeds in probes).
+- Current read: this is the architectural split between the IddCx/IndirectKmd
+  display adapter that owns the output and the real Helios render adapter that
+  owns D3D/Venus. Fire Strike's legacy fullscreen init assumes
+  `IDXGIOutput::GetDisplayModeList` works on the visible output. A proper fix is
+  not a UMD present-path hack; it likely requires a real display/VidPN owner for
+  the visible output (or equivalent OS-supported path that makes DXGI's output
+  mode-list resolve on the render/display adapter pair). If reviving KMD display
+  ownership, use the archived viogpu3d/VidPN research and treat it as a full
+  display-miniport implementation, not as stubbed VidPN callbacks.
+
+**32nd session (2026-07-07) — Fire Strike/FaceWorks missing surfaces: first
+real D3D11 correctness bug fixed, owner visual validation pending.**
+
+- Owner used Windows Settings -> Display -> Detect multiple displays; there was
+  no visible display change, but Fire Strike moved past the legacy
+  `IDXGIOutput::GetDisplayModeList` launch blocker and now reaches fullscreen
+  rendering. Current symptom: many missing surfaces. Do not spend time on
+  `DxgkDdiPresent`: this is a render-only adapter path, and the desktop already
+  proves the presentation/capture leg is alive.
+- FaceWorks is the faster repro. Its initial dxbc-spv assertion in
+  `shd_instruction.cpp` came from D3D11 DDI tessellation patch-constant sysval
+  names; `umd/bridge/dxvk_bridge.cpp` now remaps the DDI tess-factor sysvals to
+  DXBC `SV_TessFactor` / `SV_InsideTessFactor` signatures. The sample then
+  opened a black window in owner-visible testing. A scheduled-task run is not a
+  valid visual proxy yet: it exits during DXUT validation before any present.
+- Concrete bug found in `umd/src/forward.rs`: DDI Texture2D views were always
+  translated to non-MS D3D11 view dimensions. For multisampled Texture2D
+  resources this is wrong: RTV/DSV/SRV must use
+  `TEXTURE2DMS`/`TEXTURE2DMSARRAY`, not `TEXTURE2D`/`TEXTURE2DARRAY`. This is a
+  real correctness hole for Fire Strike-class MSAA workloads and can make view
+  creation fail or bind the wrong resource interpretation.
+- Fix deployed in UMD `helios_umd_ac10566f81de7294.dll` (SHA256
+  `AC10566F81DE72944B472131DF1AE8CBAD719938DCC804C9A936FC14F6643B19`):
+  `rtv_desc`, `dsv_desc`, and `srv_desc` now query the underlying
+  `ID3D11Texture2D::GetDesc().SampleDesc.Count` and select the MSAA view
+  dimensions/unions when `Count > 1`. Adapter hotplug only; no guest reboot.
+  Active registry and live DWM/explorer modules point at the new ProgramData
+  UMD, Helios device is `CM_PROB_NONE`.
+- Evidence: new `tools/d3d11_msaa_view_probe.cpp` passes on Helios FL11_0. It
+  creates 4x `R8G8B8A8_UNORM` RT/SRV and `D24_UNORM_S8_UINT` depth resources,
+  creates explicit 2DMS RTV/SRV/DSV views, clears, resolves, stages, maps, and
+  reads pixel `64,127,191,255`. UMD log for pid 10120 shows
+  `MSAA q fmt=28 c=4 -> 1`, successful `create_rtv`, `create_srv`, and
+  `create_dsv` on `dim=3` MSAA resources. **NEXT:** owner reruns FaceWorks and
+  Fire Strike against this UMD; if surfaces are still missing, inspect fresh UMD
+  logs for failed Create*View, ResolveSubresource, Copy/Discard/ClearView, and
+  noop-DDI counter movement.
+
+**33rd session (2026-07-07) — FaceWorks/Fire Strike "missing surfaces" reframed:
+render is FINE, the problem is windowed compositing. Two earlier theories
+FALSIFIED.**
+
+- **FaceWorks is not a render/coherence bug.** `HELIOS_PRESENT_READBACK` shows the
+  present source non-black at 1264×681 (multi-pass scene: 1060 draws to the
+  backbuffer, 937 to a 184×161 SSS RT, DrawIndexed to 1024×1024).
+  `tools/d3d11_shared_draw_probe.cpp` proves float + SINT-indexed+CB + textured/
+  blend draws propagate cross-device via OpenSharedResource1. Owner: **Fire Strike
+  renders fine fullscreen** — the render pipeline is healthy.
+- **FALSIFIED — "two-memory split / KMD zeroes the adopted resid."** The UMD's
+  `allocate_wddm_resource` "private mutated" log (`res_id 22301→0, blob→0x3b4000`)
+  is the UMD reading the KMD's NEW `HeliosWddmOpenIdentity` writeback with the OLD
+  `HeliosWddmAllocPrivate` layout — offset 0 is `venus_alloc_size` (0x3b4000 =
+  3883008), and the fields it prints as res_id/kind are `reserved` words. The KMD
+  adopt path (`create_allocation.rs adopt_blob_for_allocation`) preserves resid
+  22301 and mints no redundant blob; the allocation IS backed by the DXVK venus
+  image. Do not re-chase this.
+- **FALSIFIED — alpha.** Owner confirmed `HELIOS_PRESENT_FORCE_OPAQUE` changes
+  nothing; DWM composites the flip swapchain opaque.
+- **FALSIFIED — the IDD.** Both the live D3D11 fallback (`SwapChainNewFrameD3D11`)
+  and the D3D12 path capture the same single composed IddCx surface; the D3D12
+  path is dead only because our UMD implements no D3D12. The IDD faithfully
+  forwards whatever DWM composited (`CopyFromScreen`/paintcap show the same black
+  client area).
+- **The live root cause is the render-adapter / DXGI-output topology (→ priority
+  #1 above).** DXGI enumerates TWO identically-named "Helios vGPU Render Adapter"
+  entries (LUIDs …fba8, …7896) that both resolve to the same physical WDDM adapter
+  (a stale-LUID residue from repeated device restarts) plus 2× WARP; every
+  adapter's `EnumOutputs` returns `0x887a0022` intermittently (one run showed
+  `outputs=1` on …7896). CCD `QueryDisplayConfig(ONLY_ACTIVE_PATHS)` pins the live
+  Looking Glass output to …fba8 (`\\.\DISPLAY2`), while `QDC_ALL_PATHS` fails
+  `ERROR_GEN_FAILURE` on a broken second path (ghost QEMU/DEFAULT monitors). Apps
+  that need an `IDXGIOutput` get `NOT_CURRENTLY_AVAILABLE`, fabricate a mode, and
+  drop the window off-screen; and DWM never imports the app's flip backbuffer.
+  Probes: `tools/{dxgi_output_modes,ccd_adapter}_probe.cpp` (session 1). Memory:
+  `phantom-adapter-luid-enumoutputs-33rd`, `faceworks-black-d3dflip-twomemory-split-33rd`.
+- KMD 22.22.61: `create_allocation` now writes the `HeliosWddmOpenIdentity`
+  trailer for adopted allocations too (live resid for cross-process openers).
 
 Current state (surveyed 2026-07-05):
 
