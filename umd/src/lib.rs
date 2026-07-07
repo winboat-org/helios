@@ -830,34 +830,41 @@ unsafe extern "system" fn get_caps(
                     unsafe { *(args.p_data as *mut u32) = 0 };
                     log_line("  GetCaps: THREADING caps = 0");
                 }
-                // D3D11DDI_SHADER_CAPS::Caps. Zero means no optional shader
-                // caps such as double precision.
+                // D3D11DDI_SHADER_CAPS::Caps. FL11 mandates compute shaders;
+                // the runtime rejects the adapter with "Driver doesn't support
+                // compute on FL11" (0x887a0020) if this doesn't advertise
+                // compute. Bit 0x2 =
+                // D3D11DDICAPS_SHADER_COMPUTE_PLUS_RAW_AND_STRUCTURED_BUFFERS_IN_SHADER_4_X
+                // is the driver's compute-capability signal; dxvk/venus back
+                // full CS 5.0. FL10 profile stays 0 (no optional shader caps).
                 D3D11DDICAPS_SHADER if args.data_size >= 4 => {
-                    unsafe { *(args.p_data as *mut u32) = 0 };
-                    log_line("  GetCaps: SHADER caps = 0");
+                    const SHADER_COMPUTE: u32 = 0x2;
+                    let caps = if feature_level_mode() >= 1 { SHADER_COMPUTE } else { 0 };
+                    unsafe { *(args.p_data as *mut u32) = caps };
+                    log_line(&format!("  GetCaps: SHADER caps = 0x{caps:x}"));
                 }
-                // D3D11DDI_3DPIPELINESUPPORT_CAPS::Caps is a
-                // D3D11DDI_3DPIPELINELEVEL enum (WDK 10.0.26100: _10_0=0,
-                // _10_1=1, _11_0=2). This is the MAX pipeline level the driver
-                // claims; the runtime then settles down per the format/MSAA
-                // caps. Default profile advertises 10_1 (settles at FL10_0 —
-                // advertising exactly 10_0 makes the runtime remove the device
-                // before CreateDevice completes on this stack). With
-                // FeatureLevel11 set, claim 11_0 and let the now-unmasked MSAA
-                // and format caps carry it to a full FL11_0 device.
+                // D3D11DDI_3DPIPELINESUPPORT_CAPS::Caps is a BITMASK, NOT the
+                // bare D3D11DDI_3DPIPELINELEVEL enum: each supported level sets
+                // one bit, D3D11DDI_ENCODE_3DPIPELINESUPPORT_CAP(Level)=(1<<Level),
+                // OR'd contiguously from 10_0 up (WDK 10.0.26100 d3d10umddi.h).
+                // Enum: 10_0=0, 10_1=1, 11_0=2. Writing the bare enum value was
+                // THE FL11 bug: value 2 = bit1 only = "10_1 without 10_0" = an
+                // invalid mask, which d3d11.dll rejects with "Driver returned
+                // invalid pipeline caps" (0x887a0020) → "Failed to find DDI to
+                // drive requested feature levels" (0x887a0004) for EVERY level.
+                // (The old FL10 path wrote 1 == (1<<0) == the 10_0 bit, so it
+                // worked by coincidence and produced an FL10_0 device.)
                 D3D11DDICAPS_3DPIPELINESUPPORT if args.data_size >= 4 => {
-                    const D3D11DDI_3DPIPELINELEVEL_10_1: u32 = 1;
-                    const D3D11DDI_3DPIPELINELEVEL_11_0: u32 = 2;
-                    let level = if feature_level_11_enabled() {
-                        D3D11DDI_3DPIPELINELEVEL_11_0
+                    const LVL_10_0: u32 = 1 << 0;
+                    const LVL_10_1: u32 = 1 << 1;
+                    const LVL_11_0: u32 = 1 << 2;
+                    let caps = if feature_level_mode() >= 1 {
+                        LVL_10_0 | LVL_10_1 | LVL_11_0 // 0x7: max FL11_0
                     } else {
-                        D3D11DDI_3DPIPELINELEVEL_10_1
+                        LVL_10_0 // 0x1: max FL10_0 (the proven baseline)
                     };
-                    unsafe { *(args.p_data as *mut u32) = level };
-                    log_line(&format!(
-                        "  GetCaps: 3DPIPELINESUPPORT = {}",
-                        if level == D3D11DDI_3DPIPELINELEVEL_11_0 { "11_0" } else { "10_1" }
-                    ));
+                    unsafe { *(args.p_data as *mut u32) = caps };
+                    log_line(&format!("  GetCaps: 3DPIPELINESUPPORT bitmask=0x{caps:x}"));
                 }
                 // D3D11.1 optional caps. The zeroed structs are valid
                 // conservative answers: no logic-op, no debug binary support,
@@ -991,10 +998,16 @@ pub(crate) fn trace_enabled() -> bool {
 /// KMD-side work (reboot territory) — that is the remaining FL11 blocker. The
 /// UMD caps below are the correct, verified UMD half (knob=0 A/B reproduces the
 /// exact FL10_0 baseline: FL_10_0/9_1/default all create).
-pub(crate) fn feature_level_11_enabled() -> bool {
+///   0 = FL10_0 profile (default)
+///   1 = full FL11_0 (pipeline 11_0 + real MSAA + unmasked format bits)
+///   2 = DIAGNOSTIC: pipeline claims 11_0 but keeps the FL10 MSAA/format caps —
+///       isolates whether the runtime rejects the 11_0 pipeline CLAIM itself
+///       (bails before CreateDevice, adapter-level ceiling) vs the FL11 caps
+///       (proceeds to CreateDevice, then validates format/MSAA coherence).
+pub(crate) fn feature_level_mode() -> u32 {
     use std::sync::OnceLock;
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
+    static MODE: OnceLock<u32> = OnceLock::new();
+    *MODE.get_or_init(|| {
         #[link(name = "advapi32")]
         unsafe extern "system" {
             fn RegGetValueA(
@@ -1023,7 +1036,7 @@ pub(crate) fn feature_level_11_enabled() -> bool {
                 &mut len,
             )
         };
-        rc == 0 && value != 0
+        if rc == 0 { value } else { 0 }
     })
 }
 

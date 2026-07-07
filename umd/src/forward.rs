@@ -3968,19 +3968,37 @@ unsafe fn helios_multisample_quality_levels(
     fmt: ddi::DXGI_FORMAT,
     sample_count: u32,
 ) -> u32 {
-    if !crate::feature_level_11_enabled() {
+    if crate::feature_level_mode() != 1 {
         return if sample_count == 1 { 1 } else { 0 };
     }
     if sample_count == 0 {
         return 0;
     }
-    if let Some(device) = d3d11_device(h) {
-        if let Ok(n) = device.CheckMultisampleQualityLevels(DXGI_FORMAT(fmt as i32), sample_count) {
-            return n;
-        }
-    }
-    // DXVK unreachable: fall back to the conservative single-sample answer.
-    if sample_count == 1 { 1 } else { 0 }
+    let Some(device) = d3d11_device(h) else {
+        // DXVK unreachable: fall back to the conservative single-sample answer.
+        return if sample_count == 1 { 1 } else { 0 };
+    };
+    let dxvk = device
+        .CheckMultisampleQualityLevels(DXGI_FORMAT(fmt as i32), sample_count)
+        .unwrap_or(0);
+    // FL11 enforces "render-target format => 4x MSAA quality > 0" and does NOT
+    // exempt the exotic 96-bit R32G32B32 formats the way the spec's MSAA-exempt
+    // list would suggest; a render target reporting 0 fails the adapter with
+    // "MSAA quality reported to be 0" (0x887a0020). For render-target formats,
+    // floor the standard sample counts (1/2/4/8) to at least one quality level
+    // even where venus/NVIDIA doesn't back MSAA on that format (an actual
+    // unsupported MSAA resource create still fails at the format-support layer).
+    let is_rt = matches!(
+        device.CheckFormatSupport(DXGI_FORMAT(fmt as i32)),
+        Ok(c) if c & 0x20 != 0
+    );
+    let val = if is_rt && matches!(sample_count, 1 | 2 | 4 | 8) {
+        dxvk.max(1)
+    } else {
+        dxvk
+    };
+    log_line(&format!("MSAA q fmt={fmt} c={sample_count} rt={is_rt} dxvk={dxvk} -> {val}"));
+    val
 }
 
 unsafe extern "C" fn check_multisample_quality_levels(
@@ -4106,11 +4124,18 @@ unsafe extern "C" fn check_format_support(h: Hdevice, fmt: ddi::DXGI_FORMAT, out
     // Keep format support coherent with the active feature-level profile.
     // API D3D11_FORMAT_SUPPORT: MULTISAMPLE_RESOLVE=0x40000,
     // MULTISAMPLE_RENDERTARGET=0x200000, MULTISAMPLE_LOAD=0x400000.
-    // At FL10.0 we strip the multisample bits (the no-MSAA profile); FL11_0
-    // requires multisample support, so forward DXVK's real bits — coherent
-    // with check_multisample_quality_levels, which forwards the same source.
-    if !crate::feature_level_11_enabled() {
-        caps &= !0x0064_0000u32;
+    const MSAA_BITS: u32 = 0x0064_0000; // RESOLVE|RENDERTARGET|LOAD
+    const MSAA_RENDERTARGET: u32 = 0x0020_0000;
+    const RENDER_TARGET: u32 = 0x20;
+    if crate::feature_level_mode() != 1 {
+        // FL10.0 profile (and diagnostic mode 2): strip the multisample bits.
+        caps &= !MSAA_BITS;
+    } else if caps & RENDER_TARGET != 0 {
+        // FL11: every render-target format supports MSAA (see
+        // check_multisample_quality_levels — it floors render targets to a
+        // valid quality level). Advertise the multisample-render-target bit so
+        // the two stay coherent, even for formats DXVK doesn't natively MSAA.
+        caps |= MSAA_RENDERTARGET;
     }
 
     // The Microsoft D3D11 runtime validates some typeless/depth format families
