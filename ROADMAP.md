@@ -940,6 +940,22 @@ Open defects, roughly ordered:
     slot/named-fence round-trips (set_source carries a dead
     fence_value), eager vehicle fence at init, time-based import
     negative cache, DirectFlipCaps knob retirement decision.
+    **FIX CONFIRMED (owner: "working very well"); 28TH SESSION =
+    WINDOWED DOOM PERF.** Doom telemetry (pid 9444, 1880x943 windowed
+    vehicle, immediate/tearing=1, ~105 fps): flip gate avg 5.57 ms
+    (worker-serial) + acquire gate avg 4.06 ms (app), both timeouts=0 —
+    pure fence-observation latency of the vehicle copy;
+    queue_present_avg 5.96 ms. FULLSCREEN "200 fps rock-stable" = THE
+    SW PATH: the fullscreen (1896x1030) chain's vehicle build FAILED at
+    stage='dcomp target/visual' hr=0x88980800 and latched → sw direct
+    path at ~0.85 ms/frame CPU (creates=2 fails=1 in
+    helios-doom-wsi-perf.txt). NEW DEFECT: vehicle re-create for the
+    same hwnd fails (one-dcomp-target-per-hwnd on resize/fullscreen;
+    vkd3d likely creates a NEW VkSurface for the same hwnd → per-surface
+    target cache misses → second CreateTargetForHwnd fails). dwm
+    post-fix: noslot=54 (was 68k), fence_events 0 fallbacks/0 lost,
+    escape 64 µs. Doom perf files: C:\Users\Rupansh\helios-doom-perf.txt
+    + helios-doom-wsi-perf.txt (owner's launcher tees them).
 - **Capture path**: IddCx frame drop policy vs D3D12 copy queue saturation;
   KVMFR bandwidth; 10 bpc default.
 - Candidates list from the NVIDIA fix era lives in ICD.md.
