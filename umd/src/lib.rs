@@ -21,6 +21,7 @@ const E_FAIL: Hresult = 0x8000_4005u32 as i32;
 const E_NOTIMPL: Hresult = 0x8000_4001u32 as i32;
 const E_OUTOFMEMORY: Hresult = 0x8007_000eu32 as i32;
 const DXGI_ERROR_UNSUPPORTED: Hresult = 0x887a_0020u32 as i32;
+const DXGI_STATUS_NO_REDIRECTION: Hresult = 0x087a_0004u32 as i32;
 
 const fn ddi_supported(major: u64, minor: u64, build: u64) -> u64 {
     let interface = (major << 16) | minor;
@@ -31,6 +32,7 @@ const fn ddi_supported(major: u64, minor: u64, build: u64) -> u64 {
 // DDIs (notably ResolveSharedResource) and the extended resource-sharing path
 // DWM/IddCx require. Keep D3D11.0 as a fallback for older/runtime-selected paths.
 const SUPPORTED_DDI_VERSIONS: &[u64] = &[
+    ddi_supported(11, 16, 1), // D3DWDDM1_3_DDI_SUPPORTED
     ddi_supported(11, 15, 0), // D3D11_1_DDI_SUPPORTED
     ddi_supported(11, 10, 2), // D3D11_0_DDI_SUPPORTED
 ];
@@ -238,10 +240,7 @@ pub extern "system" fn helios_umd_wait_last_present(timeout_us: u32) -> i32 {
 /// (failed present / publish unavailable / contract violation, counted) —
 /// the caller must fall back to helios_umd_wait_last_present.
 #[no_mangle]
-pub extern "system" fn helios_umd_get_present_result(
-    fence_id: *mut u32,
-    value: *mut u64,
-) -> i32 {
+pub extern "system" fn helios_umd_get_present_result(fence_id: *mut u32, value: *mut u64) -> i32 {
     if fence_id.is_null() || value.is_null() {
         return -1;
     }
@@ -674,7 +673,9 @@ unsafe extern "system" fn create_device(
         let q = args as *const u64;
         let mut raw = String::from("CreateDevice raw args:");
         for i in 0..12 {
-            raw.push_str(&format!(" [{}]=0x{:016x}", i, unsafe { q.add(i).read_unaligned() }));
+            raw.push_str(&format!(" [{}]=0x{:016x}", i, unsafe {
+                q.add(i).read_unaligned()
+            }));
         }
         log_line(&raw);
     }
@@ -739,9 +740,17 @@ unsafe extern "system" fn create_device(
             device_funcs::fill_wddm2_1_device_funcs(
                 create.p_device_funcs as *mut ddi::D3DWDDM2_1DDI_DEVICEFUNCS,
             );
-            device_funcs::fill_dxgi_1_1_base_funcs(
+            device_funcs::fill_dxgi_1_3_base_funcs(
                 create.dxgi_base_ddi.p_dxgi_ddi_base_functions
-                    as *mut ddi::DXGI1_1_DDI_BASE_FUNCTIONS,
+                    as *mut ddi::DXGI1_3_DDI_BASE_FUNCTIONS,
+            );
+        } else if create.interface >= 0x000b_0010 {
+            device_funcs::fill_wddm1_3_device_funcs(
+                create.p_device_funcs as *mut ddi::D3DWDDM1_3DDI_DEVICEFUNCS,
+            );
+            device_funcs::fill_dxgi_1_3_base_funcs(
+                create.dxgi_base_ddi.p_dxgi_ddi_base_functions
+                    as *mut ddi::DXGI1_3_DDI_BASE_FUNCTIONS,
             );
         } else if create.interface >= 0x000b_000f {
             device_funcs::fill_d3d11_1_device_funcs(
@@ -761,8 +770,13 @@ unsafe extern "system" fn create_device(
         }
     }
 
-    log_line("  CreateDevice -> S_OK (DXVK device + D3D11 funcs table installed)");
-    S_OK
+    if std::env::var_os("HELIOS_DXGI_NO_REDIRECTION").is_some() {
+        log_line("  CreateDevice -> DXGI_STATUS_NO_REDIRECTION (env-gated; DXGI desktop fallback)");
+        DXGI_STATUS_NO_REDIRECTION
+    } else {
+        log_line("  CreateDevice -> S_OK (DXVK device + D3D11 funcs table installed)");
+        S_OK
+    }
 }
 
 unsafe extern "system" fn close_adapter(_h_adapter: D3d10DdiAdapterHandle) -> Hresult {
@@ -812,6 +826,8 @@ unsafe extern "system" fn get_caps(
     const D3D11_1DDICAPS_D3D11_OPTIONS: u32 = 131;
     const D3D11_1DDICAPS_ARCHITECTURE_INFO: u32 = 132;
     const D3D11_1DDICAPS_SHADER_MIN_PRECISION_SUPPORT: u32 = 134;
+    const D3DWDDM1_3DDICAPS_D3D11_OPTIONS1: u32 = 136;
+    const D3DWDDM1_3DDICAPS_MARKER: u32 = 137;
 
     if !args.is_null() {
         let args = unsafe { &*args };
@@ -836,10 +852,17 @@ unsafe extern "system" fn get_caps(
                 // compute. Bit 0x2 =
                 // D3D11DDICAPS_SHADER_COMPUTE_PLUS_RAW_AND_STRUCTURED_BUFFERS_IN_SHADER_4_X
                 // is the driver's compute-capability signal; dxvk/venus back
-                // full CS 5.0. FL10 profile stays 0 (no optional shader caps).
+                // full CS 5.0. FL12_0 additionally requires the D3D11.3 typed
+                // UAV-load additional-formats bit. FL10 profile stays 0 (no
+                // optional shader caps).
                 D3D11DDICAPS_SHADER if args.data_size >= 4 => {
                     const SHADER_COMPUTE: u32 = 0x2;
-                    let caps = if feature_level_mode() >= 1 { SHADER_COMPUTE } else { 0 };
+                    const SHADER_TYPED_UAV_LOAD_ADDITIONAL_FORMATS: u32 = 0x20;
+                    let caps = if feature_level_mode() >= 1 {
+                        SHADER_COMPUTE | SHADER_TYPED_UAV_LOAD_ADDITIONAL_FORMATS
+                    } else {
+                        0
+                    };
                     unsafe { *(args.p_data as *mut u32) = caps };
                     log_line(&format!("  GetCaps: SHADER caps = 0x{caps:x}"));
                 }
@@ -847,30 +870,39 @@ unsafe extern "system" fn get_caps(
                 // bare D3D11DDI_3DPIPELINELEVEL enum: each supported level sets
                 // one bit, D3D11DDI_ENCODE_3DPIPELINESUPPORT_CAP(Level)=(1<<Level),
                 // OR'd contiguously from 10_0 up (WDK 10.0.26100 d3d10umddi.h).
-                // Enum: 10_0=0, 10_1=1, 11_0=2. Writing the bare enum value was
-                // THE FL11 bug: value 2 = bit1 only = "10_1 without 10_0" = an
-                // invalid mask, which d3d11.dll rejects with "Driver returned
-                // invalid pipeline caps" (0x887a0020) → "Failed to find DDI to
-                // drive requested feature levels" (0x887a0004) for EVERY level.
-                // (The old FL10 path wrote 1 == (1<<0) == the 10_0 bit, so it
-                // worked by coincidence and produced an FL10_0 device.)
+                // Enum: 10_0=0, 10_1=1, 11_0=2, 11_1=3, 12_0=7, 12_1=8.
+                // FL12_0 requires tiled-resource tier 2+; GetCaps(OPTIONS1)
+                // below advertises tier 2 and the WDDM1.3 function table
+                // forwards the tile DDIs to DXVK's sparse-resource path. Do
+                // not advertise FL12_1 until ROV support is plumbed.
+                // Writing the bare enum value was THE FL11 bug: value 2 =
+                // bit1 only = "10_1 without 10_0" = an invalid mask, which
+                // d3d11.dll rejects with "Driver returned invalid pipeline
+                // caps" (0x887a0020) → "Failed to find DDI to drive requested
+                // feature levels" (0x887a0004) for EVERY level. (The old FL10
+                // path wrote 1 == (1<<0) == the 10_0 bit, so it worked by
+                // coincidence and produced an FL10_0 device.)
                 D3D11DDICAPS_3DPIPELINESUPPORT if args.data_size >= 4 => {
                     const LVL_10_0: u32 = 1 << 0;
                     const LVL_10_1: u32 = 1 << 1;
                     const LVL_11_0: u32 = 1 << 2;
+                    const LVL_11_1: u32 = 1 << 3;
+                    const LVL_12_0: u32 = 1 << 7;
                     let caps = if feature_level_mode() >= 1 {
-                        LVL_10_0 | LVL_10_1 | LVL_11_0 // 0x7: max FL11_0
+                        LVL_10_0 | LVL_10_1 | LVL_11_0 | LVL_11_1 | LVL_12_0
                     } else {
                         LVL_10_0 // 0x1: max FL10_0 (the proven baseline)
                     };
                     unsafe { *(args.p_data as *mut u32) = caps };
                     log_line(&format!("  GetCaps: 3DPIPELINESUPPORT bitmask=0x{caps:x}"));
                 }
-                // D3D11.1 optional caps. The zeroed structs are valid
-                // conservative answers: no logic-op, no debug binary support,
-                // immediate-mode renderer, no shader min-precision support.
+                // D3D11.1 caps. FL11_1 requires output-merger logic ops; the
+                // 11.1 blend-state forwarder maps LogicOpEnable/LogicOp to
+                // ID3D11Device1::CreateBlendState1. Keep debug binary support
+                // and shader min-precision support disabled.
                 D3D11_1DDICAPS_D3D11_OPTIONS if args.data_size >= 8 => {
-                    log_line("  GetCaps: D3D11_OPTIONS = zero");
+                    unsafe { *(args.p_data as *mut u32) = 1 };
+                    log_line("  GetCaps: D3D11_OPTIONS OutputMergerLogicOp=TRUE");
                 }
                 D3D11_1DDICAPS_ARCHITECTURE_INFO if args.data_size >= 4 => {
                     log_line("  GetCaps: ARCHITECTURE_INFO = zero");
@@ -878,7 +910,29 @@ unsafe extern "system" fn get_caps(
                 D3D11_1DDICAPS_SHADER_MIN_PRECISION_SUPPORT if args.data_size >= 8 => {
                     log_line("  GetCaps: SHADER_MIN_PRECISION_SUPPORT = zero");
                 }
-                _ => {}
+                D3DWDDM1_3DDICAPS_D3D11_OPTIONS1 if args.data_size >= 4 => {
+                    const TILED_RESOURCES_TIER_2_SUPPORTED: u32 = 0x2;
+                    let caps = if feature_level_mode() >= 1 {
+                        TILED_RESOURCES_TIER_2_SUPPORTED
+                    } else {
+                        0
+                    };
+                    unsafe { *(args.p_data as *mut u32) = caps };
+                    log_line(&format!(
+                        "  GetCaps: D3D11_OPTIONS1 TiledResourcesSupportFlags=0x{caps:x}"
+                    ));
+                }
+                D3DWDDM1_3DDICAPS_MARKER if args.data_size >= 4 => {
+                    const D3DWDDM1_3DDI_MARKER_TYPE_NONE: u32 = 0;
+                    unsafe { *(args.p_data as *mut u32) = D3DWDDM1_3DDI_MARKER_TYPE_NONE };
+                    log_line("  GetCaps: MARKER type = NONE");
+                }
+                other => {
+                    log_line(&format!(
+                        "  GetCaps: unsupported cap type {} (zeroed {} bytes)",
+                        other, args.data_size
+                    ));
+                }
             }
         }
     } else {
@@ -970,10 +1024,9 @@ pub(crate) fn trace_enabled() -> bool {
 
 /// Whether the adapter advertises D3D11 feature level 11_0 instead of the
 /// conservative FL10_0 profile: `HKLM\SOFTWARE\Helios!FeatureLevel11`
-/// (REG_DWORD) != 0. Absent/0 = FL10_0 (the safe default; the desktop needs
-/// nothing higher). Read once per process, so an already-running dwm keeps the
-/// level it created its device at while a freshly-launched app (3DMark Fire
-/// Strike wants FL11_0) picks up the new value.
+/// (REG_DWORD). Absent = full FL11_0; explicit 0 = FL10_0 opt-out. Read once
+/// per process, so an already-running dwm keeps the level it created its
+/// device at while freshly-launched apps pick up the new value.
 ///
 /// This gate MUST cover the three caps together — the 3DPIPELINESUPPORT
 /// pipeline level, `check_format_support`'s multisample bits, and
@@ -983,27 +1036,17 @@ pub(crate) fn trace_enabled() -> bool {
 /// DXGI_ERROR_UNSUPPORTED. FL11_0 additionally requires real multisample
 /// support, which the FL10_0 profile deliberately suppresses.
 ///
-/// ⚠️ NOT YET FUNCTIONAL — keep this 0. 30th-session finding (2026-07-07):
-/// with the knob on, the D3D runtime rejects the adapter at the ADAPTER level.
-/// The query trail (umd log) is `OpenAdapter → GetCaps(3DPIPELINESUPPORT=11_0)
-/// → GetSupportedVersions → CloseAdapter`: it NEVER reaches CreateDevice and
-/// D3D11CreateDevice returns 0x887a0004 for EVERY requested level (11_0 down to
-/// 9_1 and the default). So the rejection is the 11_0 pipeline claim itself,
-/// not caps coherence (MSAA/format are never even queried) and not the DDI
-/// versions (D3D11_0=0x000b000a00020000 / D3D11_1=0x000b000f00000000 are
-/// advertised correctly and both are FL11-capable). The ceiling is imposed
-/// BELOW the UMD — dxgkrnl/KMD adapter feature-level eligibility; the prime
-/// suspect is the KMD's null execution engine (query_adapter_info.rs rejects
-/// PHYSICALADAPTERCAPS for the same reason). Raising the ceiling needs
-/// KMD-side work (reboot territory) — that is the remaining FL11 blocker. The
-/// UMD caps below are the correct, verified UMD half (knob=0 A/B reproduces the
-/// exact FL10_0 baseline: FL_10_0/9_1/default all create).
-///   0 = FL10_0 profile (default)
+/// 30th/31st-session ETW evidence (Microsoft-Windows-DXGI) showed this is a UMD
+/// caps sequence, not a KMD/adapter ceiling: the runtime reaches
+/// CreateDevice/venus CTX_CREATE and rejects each bad caps contract with a
+/// concrete string. Gates fixed so far: 3DPIPELINESUPPORT is a bitmask
+/// (FL11=0x7), SHADER compute cap is 0x2, and MSAA/format support must match
+/// D3D11.3 §19.2.5. knob=0 remains the exact FL10_0 baseline opt-out for A/B.
+///   absent = full FL11_0 profile (default)
+///   0 = FL10_0 profile (opt-out)
 ///   1 = full FL11_0 (pipeline 11_0 + real MSAA + unmasked format bits)
 ///   2 = DIAGNOSTIC: pipeline claims 11_0 but keeps the FL10 MSAA/format caps —
-///       isolates whether the runtime rejects the 11_0 pipeline CLAIM itself
-///       (bails before CreateDevice, adapter-level ceiling) vs the FL11 caps
-///       (proceeds to CreateDevice, then validates format/MSAA coherence).
+///       isolates pipeline-level validation from the later FL11 caps gates.
 pub(crate) fn feature_level_mode() -> u32 {
     use std::sync::OnceLock;
     static MODE: OnceLock<u32> = OnceLock::new();
@@ -1036,7 +1079,11 @@ pub(crate) fn feature_level_mode() -> u32 {
                 &mut len,
             )
         };
-        if rc == 0 { value } else { 0 }
+        if rc == 0 {
+            value
+        } else {
+            1
+        }
     })
 }
 
@@ -1078,7 +1125,11 @@ pub(crate) fn present_gate_us() -> u32 {
                 &mut len,
             )
         };
-        if rc == 0 { value } else { DEFAULT_US }
+        if rc == 0 {
+            value
+        } else {
+            DEFAULT_US
+        }
     })
 }
 
@@ -1124,7 +1175,11 @@ pub(crate) fn vehicle_flip_gate_us() -> u32 {
                 &mut len,
             )
         };
-        if rc == 0 { value } else { DEFAULT_US }
+        if rc == 0 {
+            value
+        } else {
+            DEFAULT_US
+        }
     })
 }
 
@@ -1219,7 +1274,11 @@ pub(crate) fn present_sync_publish_enabled() -> bool {
                 &mut len,
             )
         };
-        if rc == 0 { value != 0 } else { true }
+        if rc == 0 {
+            value != 0
+        } else {
+            true
+        }
     })
 }
 
@@ -1248,11 +1307,8 @@ fn log_self_module_path() {
     }
     #[link(name = "kernel32")]
     unsafe extern "system" {
-        fn GetModuleHandleExW(
-            flags: u32,
-            module_name: *const u16,
-            module: *mut *mut c_void,
-        ) -> i32;
+        fn GetModuleHandleExW(flags: u32, module_name: *const u16, module: *mut *mut c_void)
+            -> i32;
         fn GetModuleFileNameW(module: *mut c_void, filename: *mut u16, size: u32) -> u32;
     }
     const FROM_ADDRESS: u32 = 0x4; // GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS

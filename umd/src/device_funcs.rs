@@ -105,6 +105,23 @@ pub struct IaState {
     pub current_vs: usize,
     /// Currently-bound pixel shader's COM pointer.
     pub current_ps: usize,
+    /// Currently-bound geometry shader's COM pointer.
+    pub current_gs: usize,
+    /// Currently-bound hull shader's COM pointer.
+    pub current_hs: usize,
+    /// Currently-bound domain shader's COM pointer.
+    pub current_ds: usize,
+    /// Currently-bound compute shader's COM pointer.
+    pub current_cs: usize,
+    /// Currently-bound primitive topology and first IA buffer state, for draw
+    /// diagnostics on complex D3D11 content.
+    pub current_topology: u32,
+    pub current_vb0: usize,
+    pub current_vb0_stride: u32,
+    pub current_vb0_offset: u32,
+    pub current_ib: usize,
+    pub current_ib_format: u32,
+    pub current_ib_offset: u32,
     /// Allocation behind RTV slot 0, for live composition diagnostics.
     pub current_rt0_alloc: u32,
     /// Dimensions/format behind RTV slot 0, for live composition diagnostics.
@@ -127,6 +144,8 @@ type UniformFn = unsafe extern "C" fn(usize) -> usize;
 
 static DEVICE_NOOP_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 static DXGI_NOOP_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
+static WDDM13_TABLE_AUDIT_COUNT: AtomicUsize = AtomicUsize::new(0);
+static DXGI13_TABLE_AUDIT_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 #[link(name = "kernel32")]
 extern "system" {
@@ -207,6 +226,16 @@ unsafe extern "C" fn ddi_relocate_device_funcs_11_1(
     }
 }
 
+unsafe extern "C" fn ddi_relocate_device_funcs_wddm1_3(
+    _h_device: ddi::D3D10DDI_HDEVICE,
+    funcs: *mut ddi::D3DWDDM1_3DDI_DEVICEFUNCS,
+) {
+    log_line("DDI RelocateDeviceFuncs(WDDM1.3)");
+    if !funcs.is_null() {
+        fill_wddm1_3_device_funcs(funcs);
+    }
+}
+
 unsafe extern "C" fn ddi_relocate_device_funcs_wddm2_1(
     _h_device: ddi::D3D10DDI_HDEVICE,
     funcs: *mut ddi::D3DWDDM2_1DDI_DEVICEFUNCS,
@@ -214,6 +243,116 @@ unsafe extern "C" fn ddi_relocate_device_funcs_wddm2_1(
     log_line("DDI RelocateDeviceFuncs(WDDM2.1)");
     if !funcs.is_null() {
         fill_wddm2_1_device_funcs(funcs);
+    }
+}
+
+unsafe fn audit_wddm1_3_device_funcs(tag: &str, funcs: *mut ddi::D3DWDDM1_3DDI_DEVICEFUNCS) {
+    let hit = WDDM13_TABLE_AUDIT_COUNT.fetch_add(1, Ordering::Relaxed);
+    if hit >= 32 {
+        return;
+    }
+
+    let n = core::mem::size_of::<ddi::D3DWDDM1_3DDI_DEVICEFUNCS>() / core::mem::size_of::<usize>();
+    let slots = funcs as *const usize;
+    log_line(&format!(
+        "{tag}: WDDM1.3 funcs table={funcs:p} slots={n} audit={}",
+        hit + 1
+    ));
+
+    const EXT_NAMES: [&str; 9] = [
+        "UpdateTileMappings",
+        "CopyTileMappings",
+        "CopyTiles",
+        "UpdateTiles",
+        "TiledResourceBarrier",
+        "GetMipPacking",
+        "ResizeTilePool",
+        "SetMarker",
+        "SetMarkerMode",
+    ];
+    for (offset, name) in EXT_NAMES.iter().enumerate() {
+        let index = 155 + offset;
+        if index < n {
+            log_line(&format!(
+                "{tag}: WDDM1.3 slot[{index:03}] {name}=0x{:016x}",
+                *slots.add(index)
+            ));
+        }
+    }
+
+    let mut bad = 0usize;
+    for i in 0..n {
+        let value = *slots.add(i);
+        if value == 0 || value < 0x0000_0001_0000_0000 {
+            bad += 1;
+            if bad <= 16 {
+                log_line(&format!(
+                    "{tag}: WDDM1.3 suspicious slot[{i:03}]=0x{value:016x}"
+                ));
+            }
+        }
+    }
+    if bad != 0 {
+        log_line(&format!("{tag}: WDDM1.3 suspicious slot count={bad}"));
+    }
+}
+
+unsafe fn audit_dxgi_1_3_base_funcs(tag: &str, funcs: *mut ddi::DXGI1_3_DDI_BASE_FUNCTIONS) {
+    let hit = DXGI13_TABLE_AUDIT_COUNT.fetch_add(1, Ordering::Relaxed);
+    if hit >= 32 {
+        return;
+    }
+
+    let n = core::mem::size_of::<ddi::DXGI1_3_DDI_BASE_FUNCTIONS>() / core::mem::size_of::<usize>();
+    let slots = funcs as *const usize;
+    log_line(&format!(
+        "{tag}: DXGI1.3 funcs table={funcs:p} slots={n} audit={}",
+        hit + 1
+    ));
+
+    const NAMES: [&str; 18] = [
+        "Present",
+        "GetGammaCaps",
+        "SetDisplayMode",
+        "SetResourcePriority",
+        "QueryResourceResidency",
+        "RotateResourceIdentities",
+        "Blt",
+        "ResolveSharedResource",
+        "Blt1",
+        "OfferResources",
+        "ReclaimResources",
+        "GetMultiplaneOverlayCaps",
+        "GetMultiplaneOverlayGroupCaps",
+        "Reserved1",
+        "PresentMultiplaneOverlay",
+        "Reserved2",
+        "Present1",
+        "CheckPresentDurationSupport",
+    ];
+    for (i, name) in NAMES.iter().enumerate() {
+        if i < n {
+            log_line(&format!(
+                "{tag}: DXGI1.3 slot[{i:02}] {name}=0x{:016x}",
+                *slots.add(i)
+            ));
+        }
+    }
+
+    let mut bad = 0usize;
+    for i in 0..n {
+        let value = *slots.add(i);
+        if value == 0 || value < 0x0000_0001_0000_0000 {
+            bad += 1;
+            if bad <= 16 {
+                log_line(&format!(
+                    "{tag}: DXGI1.3 suspicious slot[{i:02}]=0x{value:016x}"
+                ));
+            }
+        }
+    }
+    if bad != 0 {
+        log_line(&format!("{tag}: DXGI1.3 suspicious slot count={bad}"));
     }
 }
 
@@ -366,6 +505,50 @@ pub unsafe fn fill_d3d11_1_device_funcs(funcs: *mut ddi::D3D11_1DDI_DEVICEFUNCS)
     crate::forward::install_11_1(funcs);
 }
 
+pub unsafe fn fill_wddm1_3_device_funcs(funcs: *mut ddi::D3DWDDM1_3DDI_DEVICEFUNCS) {
+    let n = core::mem::size_of::<ddi::D3DWDDM1_3DDI_DEVICEFUNCS>() / core::mem::size_of::<usize>();
+    let slots = funcs as *mut Option<UniformFn>;
+    for i in 0..n {
+        *slots.add(i) = Some(ddi_noop_device);
+    }
+
+    let f = &mut *(funcs as *mut ddi::D3D11DDI_DEVICEFUNCS);
+
+    macro_rules! calc {
+        ($($field:ident),* $(,)?) => {$(
+            f.$field = core::mem::transmute::<UniformFn, _>(ddi_calc_size as UniformFn);
+        )*};
+    }
+    calc!(
+        pfnCalcPrivateResourceSize,
+        pfnCalcPrivateOpenedResourceSize,
+        pfnCalcPrivateShaderResourceViewSize,
+        pfnCalcPrivateRenderTargetViewSize,
+        pfnCalcPrivateDepthStencilViewSize,
+        pfnCalcPrivateElementLayoutSize,
+        pfnCalcPrivateBlendStateSize,
+        pfnCalcPrivateDepthStencilStateSize,
+        pfnCalcPrivateRasterizerStateSize,
+        pfnCalcPrivateShaderSize,
+        pfnCalcPrivateGeometryShaderWithStreamOutput,
+        pfnCalcPrivateSamplerSize,
+        pfnCalcPrivateQuerySize,
+        pfnCheckDeferredContextHandleSizes,
+        pfnCalcDeferredContextHandleSize,
+        pfnCalcPrivateDeferredContextSize,
+        pfnCalcPrivateCommandListSize,
+        pfnCalcPrivateTessellationShaderSize,
+        pfnCalcPrivateUnorderedAccessViewSize,
+    );
+
+    f.pfnDestroyDevice = Some(ddi_destroy_device);
+    (*funcs).pfnRelocateDeviceFuncs = Some(ddi_relocate_device_funcs_wddm1_3);
+    crate::forward::install(f);
+    crate::forward::install_11_1(funcs as *mut ddi::D3D11_1DDI_DEVICEFUNCS);
+    crate::forward::install_wddm1_3(funcs);
+    audit_wddm1_3_device_funcs("FillDeviceFuncs", funcs);
+}
+
 pub unsafe fn fill_wddm2_1_device_funcs(funcs: *mut ddi::D3DWDDM2_1DDI_DEVICEFUNCS) {
     let n = core::mem::size_of::<ddi::D3DWDDM2_1DDI_DEVICEFUNCS>() / core::mem::size_of::<usize>();
     let slots = funcs as *mut Option<UniformFn>;
@@ -406,6 +589,7 @@ pub unsafe fn fill_wddm2_1_device_funcs(funcs: *mut ddi::D3DWDDM2_1DDI_DEVICEFUN
     (*funcs).pfnRelocateDeviceFuncs = Some(ddi_relocate_device_funcs_wddm2_1);
     crate::forward::install(f);
     crate::forward::install_11_1(funcs as *mut ddi::D3D11_1DDI_DEVICEFUNCS);
+    crate::forward::install_wddm1_3(funcs as *mut ddi::D3DWDDM1_3DDI_DEVICEFUNCS);
     crate::forward::install_wddm2_1(funcs);
 }
 
@@ -440,4 +624,22 @@ pub unsafe fn fill_dxgi_1_1_base_funcs(funcs: *mut ddi::DXGI1_1_DDI_BASE_FUNCTIO
     }
     crate::forward::install_dxgi(funcs as *mut ddi::DXGI_DDI_BASE_FUNCTIONS);
     crate::forward::install_dxgi_1_1(funcs);
+}
+
+/// Fill the DXGI 1.3 base table required by WDDM1.3 devices. DWM can call the
+/// later Present1/MPO/residency slots immediately after CreateDevice; handing it
+/// only the DXGI 1.1 prefix leaves uninitialized callback pointers past slot 7.
+pub unsafe fn fill_dxgi_1_3_base_funcs(funcs: *mut ddi::DXGI1_3_DDI_BASE_FUNCTIONS) {
+    if funcs.is_null() {
+        return;
+    }
+    let n = core::mem::size_of::<ddi::DXGI1_3_DDI_BASE_FUNCTIONS>() / core::mem::size_of::<usize>();
+    let slots = funcs as *mut Option<UniformFn>;
+    for i in 0..n {
+        *slots.add(i) = Some(ddi_noop_dxgi);
+    }
+    crate::forward::install_dxgi(funcs as *mut ddi::DXGI_DDI_BASE_FUNCTIONS);
+    crate::forward::install_dxgi_1_1(funcs as *mut ddi::DXGI1_1_DDI_BASE_FUNCTIONS);
+    crate::forward::install_dxgi_1_3(funcs);
+    audit_dxgi_1_3_base_funcs("FillDXGIBaseFuncs", funcs);
 }

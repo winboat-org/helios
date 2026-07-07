@@ -74,6 +74,18 @@ struct HeliosDxvkDevice {
       std::size_t len,
       const std::uint32_t* sig_words,
       std::size_t sig_words_len) const;
+  // Signature-carrying tessellation shader create. `kind`: 0 = hull,
+  // 1 = domain. `sig_words` = [n_in, n_out, n_patch, then entries for each
+  // group as (sysval, register, mask, comptype, stream)]. D3D11 tessellation
+  // DDI signatures do not carry component type/stream, so the Rust side passes
+  // zeros there and the DXBC wrapper uses the same fallback rules as the 11.1
+  // shader path.
+  std::size_t create_tess_shader_sig(
+      std::uint32_t kind,
+      const std::uint8_t* code,
+      std::size_t len,
+      const std::uint32_t* sig_words,
+      std::size_t sig_words_len) const;
 
   // Flip-model identity rotation (DXGI pfnRotateResourceIdentities): each
   // texture takes the DXVK storage (memory + VkImage + KMT handles) of the

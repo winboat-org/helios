@@ -14,13 +14,14 @@ use core::mem::ManuallyDrop;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use windows::core::{IUnknown, Interface, PCSTR};
-use windows::Win32::Foundation::RECT;
+use windows::Win32::Foundation::{BOOL, RECT};
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D::{
     D3D11_SRV_DIMENSION_BUFFER, D3D11_SRV_DIMENSION_BUFFEREX, D3D11_SRV_DIMENSION_TEXTURE1D,
     D3D11_SRV_DIMENSION_TEXTURE1DARRAY, D3D11_SRV_DIMENSION_TEXTURE2D,
-    D3D11_SRV_DIMENSION_TEXTURE2DARRAY, D3D11_SRV_DIMENSION_TEXTURE3D,
+    D3D11_SRV_DIMENSION_TEXTURE2DARRAY, D3D11_SRV_DIMENSION_TEXTURE2DMS,
+    D3D11_SRV_DIMENSION_TEXTURE2DMSARRAY, D3D11_SRV_DIMENSION_TEXTURE3D,
     D3D11_SRV_DIMENSION_TEXTURECUBE, D3D11_SRV_DIMENSION_TEXTURECUBEARRAY,
 };
 use windows::Win32::Graphics::Direct3D11::*;
@@ -49,8 +50,22 @@ static D3D11_1_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 static COPY_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 static MAP_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 static SHADER_BIND_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
+static SHADER_SET_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
+static SRV_CREATE_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
+static SRV_BIND_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 static DRAW_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 static OM_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
+static UPDATE_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
+static DISPATCH_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
+static HANDLE_MISS_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
+static UAV_BIND_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
+static CLEAR_RTV_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
+static VIEWPORT_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
+static SCISSOR_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
+static RASTER_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
+static IA_BIND_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
+static PRESENT_READBACK_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
+static PRESENT_FORCE_OPAQUE_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 struct ResourceState {
     com_raw: usize,
@@ -79,6 +94,11 @@ struct RtvState {
 struct RuntimeAllocPrivate {
     alloc: HeliosWddmAllocPrivate,
     meta: HeliosWddmAllocMeta,
+}
+
+#[inline]
+fn env_flag(name: &str) -> bool {
+    std::env::var_os(name).is_some()
 }
 
 /// Legacy 24-byte trailer (geometry + bind/misc, no venus identity) written by
@@ -134,22 +154,132 @@ fn d3dddi_to_dxgi_format(format: u32) -> DXGI_FORMAT {
 /// 4bpp is what made openers size these surfaces 4x too large.
 fn dxgi_bytes_per_pixel(format: u32) -> u32 {
     match format {
-        1..=4 => 16,   // R32G32B32A32_*
-        5..=8 => 12,   // R32G32B32_*
-        9..=14 => 8,   // R16G16B16A16_*
-        15..=19 => 8,  // R32G32_*, R32G8X24 depth
-        60..=66 => 1,  // R8_TYPELESS/UNORM/UINT/SNORM/SINT, A8_UNORM, R1_UNORM
+        1..=4 => 16,  // R32G32B32A32_*
+        5..=8 => 12,  // R32G32B32_*
+        9..=14 => 8,  // R16G16B16A16_*
+        15..=19 => 8, // R32G32_*, R32G8X24 depth
+        60..=66 => 1, // R8_TYPELESS/UNORM/UINT/SNORM/SINT, A8_UNORM, R1_UNORM
         _ => 4,
     }
 }
 
+/// Bits per sample for the uncompressed DXGI formats that can participate in
+/// D3D11 output/MSAA validation. Compressed/video-only formats are intentionally
+/// absent because the runtime must not require MSAA for them.
+fn dxgi_bits_per_sample(format: u32) -> Option<u32> {
+    match format {
+        1..=4 => Some(128),        // R32G32B32A32_*
+        5..=8 => Some(96),         // R32G32B32_*
+        9..=18 => Some(64),        // R16G16B16A16_*, R32G32_*
+        19..=22 => Some(64),       // R32G8X24 / D32_FLOAT_S8X24 family
+        23..=32 => Some(32),       // R10G10B10A2, R11G11B10, R8G8B8A8
+        33..=47 => Some(32),       // R16G16, R32, R24G8
+        48..=59 => Some(16),       // R8G8, R16 / D16
+        60..=65 => Some(8),        // R8, A8
+        85 | 86 | 115 => Some(16), // B5G6R5, B5G5R5A1, B4G4R4A4
+        87..=93 => Some(32),       // BGRA/RGBX and XR_BIAS
+        _ => None,
+    }
+}
+
+fn dxgi_output_family_bits(format: u32) -> Option<u32> {
+    match format {
+        1..=4 => Some(128),            // R32G32B32A32 family
+        5..=8 => Some(96),             // R32G32B32 family
+        9..=18 => Some(64),            // R16G16B16A16 / R32G32 families
+        19..=22 => Some(64),           // R32G8X24 / D32_FLOAT_S8X24 family
+        23..=32 => Some(32),           // R10G10B10A2, R8G8B8A8 families
+        33..=47 => Some(32),           // R16G16, R32, R24G8 families
+        48..=59 => Some(16),           // R8G8, R16 / D16 families
+        60..=64 => Some(8),            // R8 family
+        87 | 88 | 90..=93 => Some(32), // BGRA/RGBX families
+        _ => None,
+    }
+}
+
+fn dxgi_output_bits_per_sample(format: u32, caps: u32) -> Option<u32> {
+    const D3D11_FORMAT_SUPPORT_RENDER_TARGET: u32 = 0x0000_4000;
+    const D3D11_FORMAT_SUPPORT_DEPTH_STENCIL: u32 = 0x0001_0000;
+
+    if caps & (D3D11_FORMAT_SUPPORT_RENDER_TARGET | D3D11_FORMAT_SUPPORT_DEPTH_STENCIL) != 0 {
+        dxgi_bits_per_sample(format)
+    } else {
+        dxgi_output_family_bits(format)
+    }
+}
+
+fn dxgi_msaa_bits_per_sample(format: u32, caps: u32) -> Option<u32> {
+    match format {
+        // Depth-resource read/view formats are format-support siblings of the
+        // MSAA-capable typeless/depth formats, but WARP reports zero quality
+        // levels above 1x and the runtime rejects advertising them as MSAA RTs.
+        21 | 22 | 46 | 47 => None,
+        _ => dxgi_output_bits_per_sample(format, caps),
+    }
+}
+
+fn dxgi_resolve_required(format: u32) -> bool {
+    match format {
+        // FLOAT families.
+        2 | 6 | 10 | 16 | 26 | 34 | 41 | 54 => true,
+        // UNORM / UNORM_SRGB families.
+        11 | 24 | 28 | 29 | 35 | 45 | 46 | 49 | 55 | 56 | 61 | 85 | 86 | 87 | 88 | 89 | 91 | 93
+        | 115 => true,
+        // SNORM families.
+        13 | 31 | 37 | 51 | 58 | 63 => true,
+        // Typeless parents whose output views include at least one resolvable
+        // UNORM/SNORM/FLOAT interpretation.
+        1 | 5 | 9 | 15 | 19 | 23 | 27 | 33 | 39 | 44 | 48 | 53 | 60 | 90 | 92 => true,
+        _ => false,
+    }
+}
+
+fn dxgi_color_typeless_parent(format: u32) -> bool {
+    matches!(
+        format,
+        1 | 5 | 9 | 15 | 23 | 27 | 33 | 48 | 53 | 60 | 90 | 92
+    )
+}
+
+fn dxgi_integer_typed_format(format: u32) -> bool {
+    matches!(
+        format,
+        3 | 4
+            | 7
+            | 8
+            | 12
+            | 14
+            | 17
+            | 18
+            | 25
+            | 30
+            | 32
+            | 36
+            | 38
+            | 42
+            | 43
+            | 50
+            | 52
+            | 57
+            | 59
+            | 62
+            | 64
+    )
+}
+
 /// Parse the meta trailer at `base_off` bytes into the buffer, tolerating the
 /// two legacy (shorter) layouts. Returns a zero-extended [`HeliosWddmAllocMeta`].
-unsafe fn read_alloc_meta(ptr: *const c_void, size: u32, base_off: usize) -> Option<HeliosWddmAllocMeta> {
+unsafe fn read_alloc_meta(
+    ptr: *const c_void,
+    size: u32,
+    base_off: usize,
+) -> Option<HeliosWddmAllocMeta> {
     let avail = (size as usize).checked_sub(base_off)?;
     let meta_ptr = (ptr as *const u8).add(base_off);
     if avail >= core::mem::size_of::<HeliosWddmAllocMeta>() {
-        return Some(core::ptr::read_unaligned(meta_ptr as *const HeliosWddmAllocMeta));
+        return Some(core::ptr::read_unaligned(
+            meta_ptr as *const HeliosWddmAllocMeta,
+        ));
     }
     if avail >= core::mem::size_of::<StandardAllocMetaV2>() {
         let legacy = core::ptr::read_unaligned(meta_ptr as *const StandardAllocMetaV2);
@@ -232,6 +362,7 @@ unsafe fn helios_device<'a>(h: Hdevice) -> Option<&'a HeliosDevice> {
 
 const E_FAIL: i32 = 0x8000_4005u32 as i32;
 const E_INVALIDARG: i32 = 0x8007_0057u32 as i32;
+const DXGI_ERROR_UNSUPPORTED: i32 = 0x887a_0004u32 as i32;
 
 /// Report an error to the D3D11 runtime for a VOID-returning DDI via the
 /// corelayer `pfnSetErrorCb`. The runtime fails the API call that invoked the
@@ -278,6 +409,16 @@ unsafe fn d3d11_context1(h: Hdevice) -> Option<ID3D11DeviceContext1> {
     (*context).cast::<ID3D11DeviceContext1>().ok()
 }
 
+unsafe fn d3d11_context2(h: Hdevice) -> Option<ID3D11DeviceContext2> {
+    let context = d3d11_context(h)?;
+    (*context).cast::<ID3D11DeviceContext2>().ok()
+}
+
+unsafe fn d3d11_device2(h: Hdevice) -> Option<ID3D11Device2> {
+    let device = d3d11_device(h)?;
+    (*device).cast::<ID3D11Device2>().ok()
+}
+
 /// Store a COM interface's raw pointer (ownership transferred) in a DDI handle.
 unsafe fn store_com<T: Interface>(handle_priv: *mut c_void, obj: T) {
     *(handle_priv as *mut *mut c_void) = obj.into_raw();
@@ -293,6 +434,13 @@ unsafe fn clear_handle(handle_priv: *mut c_void) {
     if !handle_priv.is_null() {
         *(handle_priv as *mut *mut c_void) = core::ptr::null_mut();
     }
+}
+
+unsafe fn handle_com_raw(handle_priv: *mut c_void) -> usize {
+    if handle_priv.is_null() {
+        return 0;
+    }
+    *(handle_priv as *const usize)
 }
 
 unsafe fn store_resource(
@@ -324,7 +472,8 @@ unsafe fn stamp_dxvk_resource_kmt_handles(
 ) {
     trace_line!(
         "DDI resource KMT stamp enter: raw_local=0x{:x} raw_global=0x{:x}",
-        local, global
+        local,
+        global
     );
     let local = if local != 0 { local } else { global };
     if local == 0 {
@@ -421,6 +570,69 @@ unsafe fn resource_dimensions(handle_priv: *mut c_void) -> (u32, u32) {
     let mut desc = D3D11_TEXTURE2D_DESC::default();
     tex.GetDesc(&mut desc);
     (desc.Width, desc.Height)
+}
+
+unsafe fn resource_sample_count(handle_priv: *mut c_void) -> u32 {
+    let Some(res) = load_resource(handle_priv) else {
+        return 1;
+    };
+    let Ok(tex) = (*res).cast::<ID3D11Texture2D>() else {
+        return 1;
+    };
+    let mut desc = D3D11_TEXTURE2D_DESC::default();
+    tex.GetDesc(&mut desc);
+    desc.SampleDesc.Count.max(1)
+}
+
+unsafe fn resource_dxgi_format(handle_priv: *mut c_void) -> DXGI_FORMAT {
+    let Some(res) = load_resource(handle_priv) else {
+        return DXGI_FORMAT(0);
+    };
+    let Ok(tex) = (*res).cast::<ID3D11Texture2D>() else {
+        return DXGI_FORMAT(0);
+    };
+    let mut desc = D3D11_TEXTURE2D_DESC::default();
+    tex.GetDesc(&mut desc);
+    desc.Format
+}
+
+unsafe fn resource_summary(
+    handle_priv: *mut c_void,
+) -> (ddi::D3DKMT_HANDLE, &'static str, u32, u32, u32, u32) {
+    let allocation = resource_allocation(handle_priv);
+    let Some(res) = load_resource(handle_priv) else {
+        return (allocation, "missing", 0, 0, 0, 0);
+    };
+    if let Ok(buf) = (*res).cast::<ID3D11Buffer>() {
+        let mut desc = D3D11_BUFFER_DESC::default();
+        buf.GetDesc(&mut desc);
+        return (allocation, "buffer", desc.ByteWidth, 1, 1, 0);
+    }
+    if let Ok(tex) = (*res).cast::<ID3D11Texture2D>() {
+        let mut desc = D3D11_TEXTURE2D_DESC::default();
+        tex.GetDesc(&mut desc);
+        return (
+            allocation,
+            "tex2d",
+            desc.Width,
+            desc.Height,
+            desc.ArraySize,
+            desc.Format.0 as u32,
+        );
+    }
+    if let Ok(tex) = (*res).cast::<ID3D11Texture3D>() {
+        let mut desc = D3D11_TEXTURE3D_DESC::default();
+        tex.GetDesc(&mut desc);
+        return (
+            allocation,
+            "tex3d",
+            desc.Width,
+            desc.Height,
+            desc.Depth,
+            desc.Format.0 as u32,
+        );
+    }
+    (allocation, "resource", 0, 0, 0, 0)
 }
 
 unsafe fn store_rtv(
@@ -621,15 +833,26 @@ fn api_misc_flags(ddi_misc: u32, ddi_bind: u32, is_buffer: bool) -> u32 {
     const DDI_MISC_RESOURCE_CLAMP: u32 = 0x0000_0080;
     const DDI_MISC_SHARED_KEYEDMUTEX: u32 = 0x0000_0100;
     const DDI_MISC_GDI_COMPATIBLE: u32 = 0x0000_0200;
+    const DDI_MISC_TILED: u32 = 0x0000_4000;
+    const DDI_MISC_TILE_POOL: u32 = 0x0000_8000;
     const DDI_BIND_PRESENT: u32 = 0x0000_0080;
     const API_MISC_SHARED_NTHANDLE: u32 = 0x0000_0800;
+    const API_MISC_TILE_POOL: u32 = 0x0002_0000;
+    const API_MISC_TILED: u32 = 0x0004_0000;
 
     if is_buffer {
-        ddi_misc
+        let mut out = ddi_misc
             & (DDI_MISC_DRAWINDIRECT_ARGS
                 | DDI_MISC_BUFFER_ALLOW_RAW_VIEWS
                 | DDI_MISC_BUFFER_STRUCTURED
-                | DDI_MISC_RESOURCE_CLAMP)
+                | DDI_MISC_RESOURCE_CLAMP);
+        if ddi_misc & DDI_MISC_TILE_POOL != 0 {
+            out |= API_MISC_TILE_POOL;
+        }
+        if ddi_misc & DDI_MISC_TILED != 0 {
+            out |= API_MISC_TILED;
+        }
+        out
     } else {
         let mut out = ddi_misc
             & (DDI_MISC_AUTO_GEN_MIP_MAP
@@ -646,6 +869,9 @@ fn api_misc_flags(ddi_misc: u32, ddi_bind: u32, is_buffer: bool) -> u32 {
         }
         if ddi_misc & DDI_MISC_SHARED_KEYEDMUTEX != 0 || ddi_bind & DDI_BIND_PRESENT != 0 {
             out |= DDI_MISC_SHARED;
+        }
+        if ddi_misc & DDI_MISC_TILED != 0 {
+            out |= API_MISC_TILED;
         }
         out
     }
@@ -717,7 +943,9 @@ unsafe fn allocate_wddm_resource(
     }
 
     const CROSS_ADAPTER_PITCH_ALIGN: u32 = 256;
-    let raw_pitch = mip0.TexelWidth.saturating_mul(dxgi_bytes_per_pixel(a.Format as u32));
+    let raw_pitch = mip0
+        .TexelWidth
+        .saturating_mul(dxgi_bytes_per_pixel(a.Format as u32));
     let pitch =
         raw_pitch.saturating_add(CROSS_ADAPTER_PITCH_ALIGN - 1) & !(CROSS_ADAPTER_PITCH_ALIGN - 1);
     let linear_size = (pitch as u64)
@@ -774,13 +1002,35 @@ unsafe fn allocate_wddm_resource(
     if backing_blob_id != 0 && backing_resource_id != 0 {
         private.alloc._pad = backing_resource_id;
     }
+    let pre_private_alloc = private.alloc;
+    let pre_private_meta = private.meta;
+
+    let pre_n = WDDM_ALLOC_LOG_COUNT.load(Ordering::Relaxed);
+    if pre_n < 128 {
+        log_line(&format!(
+            "DDI allocate_wddm_resource pre: blob=0x{:x} res_id={} ctx={} kind={} size={} alloc_size={} mti={} {}x{} fmt={} bind=0x{:x} misc=0x{:x} primary_desc={}",
+            private.alloc.blob_id,
+            private.alloc._pad,
+            private.alloc.ctx_id,
+            private.alloc.kind,
+            private.alloc.size,
+            venus_alloc_size,
+            memory_type_index,
+            mip0.TexelWidth,
+            mip0.TexelHeight,
+            a.Format,
+            a.BindFlags,
+            a.MiscFlags,
+            !a.pPrimaryDesc.is_null()
+        ));
+    }
 
     let mut allocation_info = ddi::D3DDDI_ALLOCATIONINFO2::default();
     let private_ptr = (&mut private as *mut RuntimeAllocPrivate).cast();
     let private_size = core::mem::size_of::<RuntimeAllocPrivate>() as u32;
     allocation_info.pPrivateDriverData = private_ptr;
     allocation_info.PrivateDriverDataSize = private_size;
-    let _is_present = (a.BindFlags & DDI_BIND_PRESENT) != 0;
+    let is_present = (a.BindFlags & DDI_BIND_PRESENT) != 0;
     let is_primary_allocation = !a.pPrimaryDesc.is_null();
     allocation_info.VidPnSourceId = if !a.pPrimaryDesc.is_null() {
         (*a.pPrimaryDesc).VidPnSourceId
@@ -801,10 +1051,12 @@ unsafe fn allocate_wddm_resource(
 
     let hr = allocate_cb(dev.h_rt_device, &mut alloc);
     let h_allocation = allocation_info.hAllocation;
+    let post_private_alloc = private.alloc;
+    let post_private_meta = private.meta;
     let n = WDDM_ALLOC_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
     if n < 128 || hr != 0 {
         log_line(&format!(
-            "DDI allocate_wddm_resource: hr=0x{:08x} alloc=0x{:x} km=0x{:x} rt={:p} assoc={:p} info={} rpriv={} size={} pitch={} blob=0x{:x} res_id={} ctx={} kind={} primary={} vidpn={} {}x{} fmt={} bind=0x{:x} misc=0x{:x}",
+            "DDI allocate_wddm_resource: hr=0x{:08x} alloc=0x{:x} km=0x{:x} rt={:p} assoc={:p} info={} rpriv={} size={} pitch={} blob=0x{:x} res_id={} ctx={} kind={} primary={} present={} vidpn={} {}x{} fmt={} bind=0x{:x} misc=0x{:x}",
             hr as u32,
             h_allocation,
             alloc.hKMResource,
@@ -819,6 +1071,7 @@ unsafe fn allocate_wddm_resource(
             private.alloc.ctx_id,
             private.alloc.kind,
             is_primary_allocation,
+            is_present,
             allocation_info.VidPnSourceId,
             mip0.TexelWidth,
             mip0.TexelHeight,
@@ -826,6 +1079,29 @@ unsafe fn allocate_wddm_resource(
             a.BindFlags,
             a.MiscFlags
         ));
+        if pre_private_alloc._pad != post_private_alloc._pad
+            || pre_private_alloc.kind != post_private_alloc.kind
+            || pre_private_alloc.ctx_id != post_private_alloc.ctx_id
+            || pre_private_alloc.blob_id != post_private_alloc.blob_id
+            || pre_private_meta.venus_alloc_size != post_private_meta.venus_alloc_size
+            || pre_private_meta.memory_type_index != post_private_meta.memory_type_index
+        {
+            log_line(&format!(
+                "DDI allocate_wddm_resource private mutated: pre blob=0x{:x} res_id={} ctx={} kind={} vas={} mti={} -> post blob=0x{:x} res_id={} ctx={} kind={} vas={} mti={}",
+                pre_private_alloc.blob_id,
+                pre_private_alloc._pad,
+                pre_private_alloc.ctx_id,
+                pre_private_alloc.kind,
+                pre_private_meta.venus_alloc_size,
+                pre_private_meta.memory_type_index,
+                post_private_alloc.blob_id,
+                post_private_alloc._pad,
+                post_private_alloc.ctx_id,
+                post_private_alloc.kind,
+                post_private_meta.venus_alloc_size,
+                post_private_meta.memory_type_index
+            ));
+        }
     }
     if hr == 0 {
         (h_allocation, alloc.hKMResource)
@@ -901,7 +1177,8 @@ unsafe extern "C" fn create_resource(
                 MiscFlags: misc,
                 StructureByteStride: a.ByteStride,
             };
-            let (allocation, km_resource) = allocate_wddm_resource(h, a, &mip0, h_rt, 0, 0, 0, 0, 0);
+            let (allocation, km_resource) =
+                allocate_wddm_resource(h, a, &mip0, h_rt, 0, 0, 0, 0, 0);
             let mut buf: Option<ID3D11Buffer> = None;
             match device.CreateBuffer(&desc, init_ptr, Some(&mut buf)) {
                 Ok(()) => {
@@ -1121,6 +1398,71 @@ unsafe extern "C" fn create_resource(
                 Err(e) => log_line(&format!("DDI create_resource(tex2d) failed: {e:?}")),
             }
         }
+        RES_TEX3D => {
+            let bind = api_bind_flags(a.BindFlags);
+            let misc = api_misc_flags(a.MiscFlags, a.BindFlags, false);
+            log_line(&format!(
+                "DDI create_resource(tex3d): {}x{}x{} fmt={} usage={} bind 0x{:x}->0x{:x} misc 0x{:x}->0x{:x} init={} mips={}",
+                mip0.TexelWidth,
+                mip0.TexelHeight,
+                mip0.TexelDepth,
+                a.Format,
+                a.Usage,
+                a.BindFlags,
+                bind,
+                a.MiscFlags,
+                misc,
+                init_ptr.is_some(),
+                a.MipLevels
+            ));
+            let desc = D3D11_TEXTURE3D_DESC {
+                Width: mip0.TexelWidth,
+                Height: mip0.TexelHeight,
+                Depth: mip0.TexelDepth.max(1),
+                MipLevels: a.MipLevels,
+                Format: DXGI_FORMAT(a.Format as i32),
+                Usage: D3D11_USAGE(a.Usage as i32),
+                BindFlags: bind,
+                CPUAccessFlags: cpu,
+                MiscFlags: misc,
+            };
+            let mut tex: Option<ID3D11Texture3D> = None;
+            match device.CreateTexture3D(&desc, init_ptr, Some(&mut tex)) {
+                Ok(()) => {
+                    if let Some(t) = tex {
+                        if let Ok(res) = t.cast::<ID3D11Resource>() {
+                            let (allocation, km_resource) =
+                                allocate_wddm_resource(h, a, &mip0, h_rt, 0, 0, 0, 0, 0);
+                            stamp_dxvk_resource_kmt_handles(h, &res, allocation, km_resource);
+                            log_line(&format!(
+                                "DDI create_resource(tex3d) ok: {}x{}x{} fmt={} bind=0x{:x} misc=0x{:x}",
+                                mip0.TexelWidth,
+                                mip0.TexelHeight,
+                                mip0.TexelDepth,
+                                a.Format,
+                                bind,
+                                misc
+                            ));
+                            store_resource(
+                                h_resource.pDrvPrivate,
+                                res,
+                                allocation,
+                                km_resource,
+                                h_rt.handle,
+                                true,
+                            );
+                        } else {
+                            log_line("DDI create_resource(tex3d): cast to ID3D11Resource failed");
+                        }
+                    } else {
+                        log_line(
+                            "DDI create_resource(tex3d): DXVK CreateTexture3D returned no texture",
+                        );
+                    }
+                }
+                Err(e) => log_line(&format!("DDI create_resource(tex3d) failed: {e:?}")),
+            }
+        }
         other => log_line(&format!("DDI create_resource: unhandled dimension {other}")),
     }
 }
@@ -1152,9 +1494,7 @@ unsafe extern "C" fn open_resource(
     // into the open-time private data in DxgkDdiOpenAllocation, after
     // validating the backing venus resource is LIVE. Prefer the per-allocation
     // buffer; fall back to the resource-level one. No `_pad` heuristics.
-    let mut identity = unsafe {
-        read_open_identity(a.pPrivateDriverData, a.PrivateDriverDataSize)
-    };
+    let mut identity = unsafe { read_open_identity(a.pPrivateDriverData, a.PrivateDriverDataSize) };
     if !info.is_null() {
         let i = &*info;
         allocation = i.hAllocation;
@@ -1341,7 +1681,11 @@ unsafe extern "C" fn dxgi_resolve_shared_resource(
     let (width, height) = resource_dimensions(resource.pDrvPrivate);
     trace_line!(
         "DXGI ResolveSharedResource: hDevice=0x{:x} hResource=0x{:x} alloc=0x{:x} {}x{}",
-        h_device, h_resource, alloc, width, height
+        h_device,
+        h_resource,
+        alloc,
+        width,
+        height
     );
     if let Some(context) = d3d11_context(Hdevice {
         pDrvPrivate: h_device as *mut c_void,
@@ -1368,7 +1712,7 @@ unsafe extern "C" fn create_rtv(
         log_line("DDI create_rtv: resource handle empty");
         return;
     };
-    let Some(desc) = rtv_desc(a) else {
+    let Some(desc) = rtv_desc(a, a.hDrvResource.pDrvPrivate) else {
         log_line(&format!(
             "DDI create_rtv: unsupported resource dimension {} fmt={}",
             a.ResourceDimension, a.Format
@@ -1407,6 +1751,7 @@ unsafe extern "C" fn create_rtv(
 
 unsafe fn rtv_desc(
     a: &ddi::D3D10DDIARG_CREATERENDERTARGETVIEW,
+    resource_priv: *mut c_void,
 ) -> Option<D3D11_RENDER_TARGET_VIEW_DESC> {
     let format = DXGI_FORMAT(a.Format as i32);
     match a.ResourceDimension {
@@ -1455,7 +1800,29 @@ unsafe fn rtv_desc(
         }
         RES_TEX2D => {
             let t = a.__bindgen_anon_1.Tex2D;
-            if t.ArraySize > 1 {
+            let is_msaa = resource_sample_count(resource_priv) > 1;
+            if is_msaa && t.ArraySize > 1 {
+                Some(D3D11_RENDER_TARGET_VIEW_DESC {
+                    Format: format,
+                    ViewDimension: D3D11_RTV_DIMENSION_TEXTURE2DMSARRAY,
+                    Anonymous: D3D11_RENDER_TARGET_VIEW_DESC_0 {
+                        Texture2DMSArray: D3D11_TEX2DMS_ARRAY_RTV {
+                            FirstArraySlice: t.FirstArraySlice,
+                            ArraySize: t.ArraySize,
+                        },
+                    },
+                })
+            } else if is_msaa {
+                Some(D3D11_RENDER_TARGET_VIEW_DESC {
+                    Format: format,
+                    ViewDimension: D3D11_RTV_DIMENSION_TEXTURE2DMS,
+                    Anonymous: D3D11_RENDER_TARGET_VIEW_DESC_0 {
+                        Texture2DMS: D3D11_TEX2DMS_RTV {
+                            UnusedField_NothingToDefine: 0,
+                        },
+                    },
+                })
+            } else if t.ArraySize > 1 {
                 Some(D3D11_RENDER_TARGET_VIEW_DESC {
                     Format: format,
                     ViewDimension: D3D11_RTV_DIMENSION_TEXTURE2DARRAY,
@@ -1539,7 +1906,7 @@ unsafe extern "C" fn create_dsv(
         log_line("DDI create_dsv: resource handle empty");
         return;
     };
-    let Some(desc) = dsv_desc(a) else {
+    let Some(desc) = dsv_desc(a, a.hDrvResource.pDrvPrivate) else {
         log_line(&format!(
             "DDI create_dsv: unsupported resource dimension {} fmt={}",
             a.ResourceDimension, a.Format
@@ -1569,6 +1936,7 @@ unsafe extern "C" fn create_dsv(
 
 unsafe fn dsv_desc(
     a: &ddi::D3D11DDIARG_CREATEDEPTHSTENCILVIEW,
+    resource_priv: *mut c_void,
 ) -> Option<D3D11_DEPTH_STENCIL_VIEW_DESC> {
     let format = DXGI_FORMAT(a.Format as i32);
     match a.ResourceDimension {
@@ -1602,7 +1970,31 @@ unsafe fn dsv_desc(
         }
         RES_TEX2D => {
             let t = a.__bindgen_anon_1.Tex2D;
-            if t.ArraySize > 1 {
+            let is_msaa = resource_sample_count(resource_priv) > 1;
+            if is_msaa && t.ArraySize > 1 {
+                Some(D3D11_DEPTH_STENCIL_VIEW_DESC {
+                    Format: format,
+                    ViewDimension: D3D11_DSV_DIMENSION_TEXTURE2DMSARRAY,
+                    Flags: a.Flags,
+                    Anonymous: D3D11_DEPTH_STENCIL_VIEW_DESC_0 {
+                        Texture2DMSArray: D3D11_TEX2DMS_ARRAY_DSV {
+                            FirstArraySlice: t.FirstArraySlice,
+                            ArraySize: t.ArraySize,
+                        },
+                    },
+                })
+            } else if is_msaa {
+                Some(D3D11_DEPTH_STENCIL_VIEW_DESC {
+                    Format: format,
+                    ViewDimension: D3D11_DSV_DIMENSION_TEXTURE2DMS,
+                    Flags: a.Flags,
+                    Anonymous: D3D11_DEPTH_STENCIL_VIEW_DESC_0 {
+                        Texture2DMS: D3D11_TEX2DMS_DSV {
+                            UnusedField_NothingToDefine: 0,
+                        },
+                    },
+                })
+            } else if t.ArraySize > 1 {
                 Some(D3D11_DEPTH_STENCIL_VIEW_DESC {
                     Format: format,
                     ViewDimension: D3D11_DSV_DIMENSION_TEXTURE2DARRAY,
@@ -1667,6 +2059,26 @@ unsafe extern "C" fn clear_rtv(
     } else {
         [*color, *color.add(1), *color.add(2), *color.add(3)]
     };
+    if !h_rtv.pDrvPrivate.is_null() {
+        let state = *(h_rtv.pDrvPrivate as *const *mut RtvState);
+        if !state.is_null() {
+            let n = CLEAR_RTV_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+            if n < 64 || (n + 1) % 512 == 0 {
+                log_line(&format!(
+                    "DDI ClearRenderTargetView #{} alloc=0x{:x} {}x{} fmt={} rgba=({:.3},{:.3},{:.3},{:.3})",
+                    n + 1,
+                    (*state).allocation,
+                    (*state).width,
+                    (*state).height,
+                    (*state).format,
+                    rgba[0],
+                    rgba[1],
+                    rgba[2],
+                    rgba[3]
+                ));
+            }
+        }
+    }
     context.ClearRenderTargetView(&*rtv, &rgba);
 }
 
@@ -2258,8 +2670,16 @@ unsafe fn flatten_stage_io_signatures(
     let s = &*sig;
     let p_in = s.__bindgen_anon_1.pInputSignature;
     let p_out = s.__bindgen_anon_2.pOutputSignature;
-    let n_in = if p_in.is_null() { 0 } else { s.NumInputSignatureEntries };
-    let n_out = if p_out.is_null() { 0 } else { s.NumOutputSignatureEntries };
+    let n_in = if p_in.is_null() {
+        0
+    } else {
+        s.NumInputSignatureEntries
+    };
+    let n_out = if p_out.is_null() {
+        0
+    } else {
+        s.NumOutputSignatureEntries
+    };
     words[0] = n_in;
     words[1] = n_out;
     for i in 0..n_in as usize {
@@ -2283,6 +2703,151 @@ unsafe fn flatten_stage_io_signatures(
         ]);
     }
     words
+}
+
+/// Flatten a D3D11 tessellation signature block into the bridge wire layout:
+/// [n_in, n_out, n_patch, entries...]. The D3D11 tessellation DDI uses the
+/// older D3D10 signature entry shape, so component type and stream are not
+/// available; pass zeros and let the bridge's DXBC signature writer use its
+/// existing UNKNOWN-component fallback.
+unsafe fn flatten_tess_io_signatures(
+    sig: *const ddi::D3D11DDIARG_TESSELLATION_IO_SIGNATURES,
+) -> Vec<u32> {
+    let mut words = vec![0u32, 0u32, 0u32];
+    if sig.is_null() {
+        return words;
+    }
+    let s = &*sig;
+    let p_in = s.pInputSignature;
+    let p_out = s.pOutputSignature;
+    let p_patch = s.pPatchConstantSignature;
+    let n_in = if p_in.is_null() {
+        0
+    } else {
+        s.NumInputSignatureEntries
+    };
+    let n_out = if p_out.is_null() {
+        0
+    } else {
+        s.NumOutputSignatureEntries
+    };
+    let n_patch = if p_patch.is_null() {
+        0
+    } else {
+        s.NumPatchConstantSignatureEntries
+    };
+    words[0] = n_in;
+    words[1] = n_out;
+    words[2] = n_patch;
+    for i in 0..n_in as usize {
+        let e = &*p_in.add(i);
+        words.extend_from_slice(&[e.SystemValue as u32, e.Register, e.Mask as u32, 0, 0]);
+    }
+    for i in 0..n_out as usize {
+        let e = &*p_out.add(i);
+        words.extend_from_slice(&[e.SystemValue as u32, e.Register, e.Mask as u32, 0, 0]);
+    }
+    for i in 0..n_patch as usize {
+        let e = &*p_patch.add(i);
+        words.extend_from_slice(&[e.SystemValue as u32, e.Register, e.Mask as u32, 0, 0]);
+    }
+    words
+}
+
+/// Flatten a >=11.1 tessellation signature block into the bridge wire layout:
+/// [n_in, n_out, n_patch, entries...]. The 11.1 tessellation callbacks use
+/// ENTRY2, so register component type and stream are available just like the
+/// non-tessellation 11.1 shader creates.
+unsafe fn flatten_tess_io_signatures_11_1(
+    sig: *const ddi::D3D11_1DDIARG_TESSELLATION_IO_SIGNATURES,
+) -> Vec<u32> {
+    let mut words = vec![0u32, 0u32, 0u32];
+    if sig.is_null() {
+        return words;
+    }
+    let s = &*sig;
+    let p_in = s.__bindgen_anon_1.pInputSignature;
+    let p_out = s.__bindgen_anon_2.pOutputSignature;
+    let p_patch = s.__bindgen_anon_3.pPatchConstantSignature;
+    let n_in = if p_in.is_null() {
+        0
+    } else {
+        s.NumInputSignatureEntries
+    };
+    let n_out = if p_out.is_null() {
+        0
+    } else {
+        s.NumOutputSignatureEntries
+    };
+    let n_patch = if p_patch.is_null() {
+        0
+    } else {
+        s.NumPatchConstantSignatureEntries
+    };
+    words[0] = n_in;
+    words[1] = n_out;
+    words[2] = n_patch;
+    for i in 0..n_in as usize {
+        let e = &*p_in.add(i);
+        words.extend_from_slice(&[
+            e.SystemValue as u32,
+            e.Register,
+            e.Mask as u32,
+            e.RegisterComponentType as u32,
+            e.Stream as u32,
+        ]);
+    }
+    for i in 0..n_out as usize {
+        let e = &*p_out.add(i);
+        words.extend_from_slice(&[
+            e.SystemValue as u32,
+            e.Register,
+            e.Mask as u32,
+            e.RegisterComponentType as u32,
+            e.Stream as u32,
+        ]);
+    }
+    for i in 0..n_patch as usize {
+        let e = &*p_patch.add(i);
+        words.extend_from_slice(&[
+            e.SystemValue as u32,
+            e.Register,
+            e.Mask as u32,
+            e.RegisterComponentType as u32,
+            e.Stream as u32,
+        ]);
+    }
+    words
+}
+
+unsafe fn log_tess_sig_summary(name: &str, sig_words: &[u32]) {
+    if sig_words.len() < 3 {
+        return;
+    }
+    let n_in = sig_words[0] as usize;
+    let n_out = sig_words[1] as usize;
+    let n_patch = sig_words[2] as usize;
+    let mut dump = format!("DDI {name} tess sig counts: in={n_in} out={n_out} patch={n_patch}");
+    let groups = [
+        ("i", 3usize, n_in),
+        ("o", 3usize + n_in * 5, n_out),
+        ("p", 3usize + (n_in + n_out) * 5, n_patch),
+    ];
+    for (tag, start, count) in groups {
+        for i in 0..count.min(4) {
+            let base = start + i * 5;
+            if base + 2 >= sig_words.len() {
+                break;
+            }
+            dump.push_str(&format!(
+                " {tag}[r{} m0x{:x} sv{}]",
+                sig_words[base + 1],
+                sig_words[base + 2],
+                sig_words[base]
+            ));
+        }
+    }
+    log_line(&dump);
 }
 
 /// Shared body for the >=11.1 typed shader creates. `kind`: 0 = vertex,
@@ -2471,12 +3036,20 @@ unsafe extern "C" fn calc_size_tess_shader(
     8
 }
 
+unsafe extern "C" fn calc_size_tess_shader_11_1(
+    _h: Hdevice,
+    _code: *const u32,
+    _sig: *const ddi::D3D11_1DDIARG_TESSELLATION_IO_SIGNATURES,
+) -> u64 {
+    8
+}
+
 unsafe extern "C" fn create_hull_shader(
     h: Hdevice,
     code: *const u32,
     h_shader: ddi::D3D10DDI_HSHADER,
     _hrt: ddi::D3D10DDI_HRTSHADER,
-    _sig: *const ddi::D3D11DDIARG_TESSELLATION_IO_SIGNATURES,
+    sig: *const ddi::D3D11DDIARG_TESSELLATION_IO_SIGNATURES,
 ) {
     clear_handle(h_shader.pDrvPrivate);
     let Some(dev) = helios_device(h) else {
@@ -2492,11 +3065,64 @@ unsafe extern "C" fn create_hull_shader(
     let Some(dxvk) = dev.dxvk.as_ref() else {
         return;
     };
-    let raw = dxvk.create_hull_shader(bytes.as_ptr(), bytes.len());
+    let sig_words = flatten_tess_io_signatures(sig);
+    log_tess_sig_summary("create_hull_shader", &sig_words);
+    let mut raw = dxvk.create_tess_shader_sig(
+        0,
+        bytes.as_ptr(),
+        bytes.len(),
+        sig_words.as_ptr(),
+        sig_words.len(),
+    );
+    if raw == 0 {
+        log_line("DDI create_hull_shader signature path failed; falling back to raw bytecode");
+        raw = dxvk.create_hull_shader(bytes.as_ptr(), bytes.len());
+    }
     if raw != 0 {
         store_raw_com(h_shader.pDrvPrivate, raw);
     } else {
         log_line("DDI create_hull_shader failed");
+    }
+}
+
+unsafe extern "C" fn create_hull_shader_11_1(
+    h: Hdevice,
+    code: *const u32,
+    h_shader: ddi::D3D10DDI_HSHADER,
+    _hrt: ddi::D3D10DDI_HRTSHADER,
+    sig: *const ddi::D3D11_1DDIARG_TESSELLATION_IO_SIGNATURES,
+) {
+    clear_handle(h_shader.pDrvPrivate);
+    let Some(dev) = helios_device(h) else {
+        return;
+    };
+    let len = shader_code_len(code);
+    log_shader_code("create_hull_shader_11_1", code, len);
+    if len == 0 {
+        log_line("DDI create_hull_shader_11_1 failed: unknown shader length");
+        return;
+    }
+    let bytes = core::slice::from_raw_parts(code as *const u8, len);
+    let Some(dxvk) = dev.dxvk.as_ref() else {
+        return;
+    };
+    let sig_words = flatten_tess_io_signatures_11_1(sig);
+    log_tess_sig_summary("create_hull_shader_11_1", &sig_words);
+    let mut raw = dxvk.create_tess_shader_sig(
+        0,
+        bytes.as_ptr(),
+        bytes.len(),
+        sig_words.as_ptr(),
+        sig_words.len(),
+    );
+    if raw == 0 {
+        log_line("DDI create_hull_shader_11_1 signature path failed; falling back to raw bytecode");
+        raw = dxvk.create_hull_shader(bytes.as_ptr(), bytes.len());
+    }
+    if raw != 0 {
+        store_raw_com(h_shader.pDrvPrivate, raw);
+    } else {
+        log_line("DDI create_hull_shader_11_1 failed");
     }
 }
 
@@ -2505,7 +3131,7 @@ unsafe extern "C" fn create_domain_shader(
     code: *const u32,
     h_shader: ddi::D3D10DDI_HSHADER,
     _hrt: ddi::D3D10DDI_HRTSHADER,
-    _sig: *const ddi::D3D11DDIARG_TESSELLATION_IO_SIGNATURES,
+    sig: *const ddi::D3D11DDIARG_TESSELLATION_IO_SIGNATURES,
 ) {
     clear_handle(h_shader.pDrvPrivate);
     let Some(dev) = helios_device(h) else {
@@ -2521,11 +3147,66 @@ unsafe extern "C" fn create_domain_shader(
     let Some(dxvk) = dev.dxvk.as_ref() else {
         return;
     };
-    let raw = dxvk.create_domain_shader(bytes.as_ptr(), bytes.len());
+    let sig_words = flatten_tess_io_signatures(sig);
+    log_tess_sig_summary("create_domain_shader", &sig_words);
+    let mut raw = dxvk.create_tess_shader_sig(
+        1,
+        bytes.as_ptr(),
+        bytes.len(),
+        sig_words.as_ptr(),
+        sig_words.len(),
+    );
+    if raw == 0 {
+        log_line("DDI create_domain_shader signature path failed; falling back to raw bytecode");
+        raw = dxvk.create_domain_shader(bytes.as_ptr(), bytes.len());
+    }
     if raw != 0 {
         store_raw_com(h_shader.pDrvPrivate, raw);
     } else {
         log_line("DDI create_domain_shader failed");
+    }
+}
+
+unsafe extern "C" fn create_domain_shader_11_1(
+    h: Hdevice,
+    code: *const u32,
+    h_shader: ddi::D3D10DDI_HSHADER,
+    _hrt: ddi::D3D10DDI_HRTSHADER,
+    sig: *const ddi::D3D11_1DDIARG_TESSELLATION_IO_SIGNATURES,
+) {
+    clear_handle(h_shader.pDrvPrivate);
+    let Some(dev) = helios_device(h) else {
+        return;
+    };
+    let len = shader_code_len(code);
+    log_shader_code("create_domain_shader_11_1", code, len);
+    if len == 0 {
+        log_line("DDI create_domain_shader_11_1 failed: unknown shader length");
+        return;
+    }
+    let bytes = core::slice::from_raw_parts(code as *const u8, len);
+    let Some(dxvk) = dev.dxvk.as_ref() else {
+        return;
+    };
+    let sig_words = flatten_tess_io_signatures_11_1(sig);
+    log_tess_sig_summary("create_domain_shader_11_1", &sig_words);
+    let mut raw = dxvk.create_tess_shader_sig(
+        1,
+        bytes.as_ptr(),
+        bytes.len(),
+        sig_words.as_ptr(),
+        sig_words.len(),
+    );
+    if raw == 0 {
+        log_line(
+            "DDI create_domain_shader_11_1 signature path failed; falling back to raw bytecode",
+        );
+        raw = dxvk.create_domain_shader(bytes.as_ptr(), bytes.len());
+    }
+    if raw != 0 {
+        store_raw_com(h_shader.pDrvPrivate, raw);
+    } else {
+        log_line("DDI create_domain_shader_11_1 failed");
     }
 }
 
@@ -2562,19 +3243,15 @@ unsafe extern "C" fn destroy_shader(_h: Hdevice, h_shader: ddi::D3D10DDI_HSHADER
 }
 
 unsafe extern "C" fn vs_set_shader(h: Hdevice, h_shader: ddi::D3D10DDI_HSHADER) {
-    let com = if h_shader.pDrvPrivate.is_null() {
-        0
-    } else {
-        *(h_shader.pDrvPrivate as *const usize)
-    };
+    let com = handle_com_raw(h_shader.pDrvPrivate);
     if let Some(dev) = helios_device(h) {
         let mut ia = dev.ia.borrow_mut();
         ia.current_vs = com;
         ia.bound_vs_com = com;
     }
-    let n = SHADER_BIND_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-    if n < 128 {
-        trace_line!("DDI VSSetShader raw=0x{com:x}");
+    let n = SHADER_SET_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+    if n < 512 {
+        log_line(&format!("DDI VSSetShader raw=0x{com:x}"));
     }
     let Some(context) = d3d11_context(h) else {
         return;
@@ -2586,17 +3263,13 @@ unsafe extern "C" fn vs_set_shader(h: Hdevice, h_shader: ddi::D3D10DDI_HSHADER) 
 }
 
 unsafe extern "C" fn ps_set_shader(h: Hdevice, h_shader: ddi::D3D10DDI_HSHADER) {
-    let com = if h_shader.pDrvPrivate.is_null() {
-        0
-    } else {
-        *(h_shader.pDrvPrivate as *const usize)
-    };
+    let com = handle_com_raw(h_shader.pDrvPrivate);
     if let Some(dev) = helios_device(h) {
         dev.ia.borrow_mut().current_ps = com;
     }
-    let n = SHADER_BIND_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-    if n < 128 {
-        trace_line!("DDI PSSetShader raw=0x{com:x}");
+    let n = SHADER_SET_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+    if n < 512 {
+        log_line(&format!("DDI PSSetShader raw=0x{com:x}"));
     }
     let Some(context) = d3d11_context(h) else {
         return;
@@ -2608,6 +3281,14 @@ unsafe extern "C" fn ps_set_shader(h: Hdevice, h_shader: ddi::D3D10DDI_HSHADER) 
 }
 
 unsafe extern "C" fn gs_set_shader(h: Hdevice, h_shader: ddi::D3D10DDI_HSHADER) {
+    let com = handle_com_raw(h_shader.pDrvPrivate);
+    if let Some(dev) = helios_device(h) {
+        dev.ia.borrow_mut().current_gs = com;
+    }
+    let n = SHADER_SET_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+    if n < 512 {
+        log_line(&format!("DDI GSSetShader raw=0x{com:x}"));
+    }
     let Some(context) = d3d11_context(h) else {
         return;
     };
@@ -2618,6 +3299,14 @@ unsafe extern "C" fn gs_set_shader(h: Hdevice, h_shader: ddi::D3D10DDI_HSHADER) 
 }
 
 unsafe extern "C" fn hs_set_shader(h: Hdevice, h_shader: ddi::D3D10DDI_HSHADER) {
+    let com = handle_com_raw(h_shader.pDrvPrivate);
+    if let Some(dev) = helios_device(h) {
+        dev.ia.borrow_mut().current_hs = com;
+    }
+    let n = SHADER_SET_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+    if n < 512 {
+        log_line(&format!("DDI HSSetShader raw=0x{com:x}"));
+    }
     let Some(context) = d3d11_context(h) else {
         return;
     };
@@ -2628,6 +3317,14 @@ unsafe extern "C" fn hs_set_shader(h: Hdevice, h_shader: ddi::D3D10DDI_HSHADER) 
 }
 
 unsafe extern "C" fn ds_set_shader(h: Hdevice, h_shader: ddi::D3D10DDI_HSHADER) {
+    let com = handle_com_raw(h_shader.pDrvPrivate);
+    if let Some(dev) = helios_device(h) {
+        dev.ia.borrow_mut().current_ds = com;
+    }
+    let n = SHADER_SET_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+    if n < 512 {
+        log_line(&format!("DDI DSSetShader raw=0x{com:x}"));
+    }
     let Some(context) = d3d11_context(h) else {
         return;
     };
@@ -2638,6 +3335,14 @@ unsafe extern "C" fn ds_set_shader(h: Hdevice, h_shader: ddi::D3D10DDI_HSHADER) 
 }
 
 unsafe extern "C" fn cs_set_shader(h: Hdevice, h_shader: ddi::D3D10DDI_HSHADER) {
+    let com = handle_com_raw(h_shader.pDrvPrivate);
+    if let Some(dev) = helios_device(h) {
+        dev.ia.borrow_mut().current_cs = com;
+    }
+    let n = SHADER_SET_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+    if n < 512 {
+        log_line(&format!("DDI CSSetShader raw=0x{com:x}"));
+    }
     let Some(context) = d3d11_context(h) else {
         return;
     };
@@ -2716,24 +3421,32 @@ unsafe extern "C" fn set_render_targets(
     num_views: u32,
     _clear_slots: u32,
     dsv: ddi::D3D10DDI_HDEPTHSTENCILVIEW,
-    _uavs: *const ddi::D3D11DDI_HUNORDEREDACCESSVIEW,
-    _uav_counts: *const u32,
-    _uav_start: u32,
-    _num_uavs: u32,
-    _uav_first: u32,
-    _uav_count: u32,
+    uavs: *const ddi::D3D11DDI_HUNORDEREDACCESSVIEW,
+    uav_counts: *const u32,
+    uav_start: u32,
+    num_uavs: u32,
+    uav_range_start: u32,
+    uav_range_size: u32,
 ) {
     let Some(context) = d3d11_context(h) else {
         return;
     };
     let mut views: Vec<Option<ID3D11RenderTargetView>> = Vec::with_capacity(num_views as usize);
     let mut rt0 = (0, 0, 0, 0);
+    let mut rt_nonnull = 0u32;
+    let mut rt_missing = 0u32;
     for i in 0..num_views as usize {
         let p = (*rtvs.add(i)).pDrvPrivate;
         if i == 0 {
             rt0 = rtv_info(p);
         }
-        views.push(load_rtv(p).map(|m| (*m).clone()));
+        let view = load_rtv(p).map(|m| (*m).clone());
+        if view.is_some() {
+            rt_nonnull += 1;
+        } else if !p.is_null() {
+            rt_missing += 1;
+        }
+        views.push(view);
     }
     if let Some(dev) = helios_device(h) {
         let mut ia = dev.ia.borrow_mut();
@@ -2743,14 +3456,69 @@ unsafe extern "C" fn set_render_targets(
         ia.current_rt0_format = rt0.3;
     }
     let n = OM_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-    if n < 256 || rt0.0 != 0 {
-        trace_line!(
-            "DDI OMSetRenderTargets num={} rt0_alloc=0x{:x} rt0={}x{} fmt={}",
-            num_views, rt0.0, rt0.1, rt0.2, rt0.3
-        );
+    if n < 1024 || rt_missing != 0 || rt0.0 != 0 {
+        log_line(&format!(
+            "DDI OMSetRenderTargets num={} rt_nonnull={} rt_missing={} rt0_alloc=0x{:x} rt0={}x{} fmt={} dsv_raw=0x{:x} uav_start={} num_uavs={} uav_range={}:{}",
+            num_views,
+            rt_nonnull,
+            rt_missing,
+            rt0.0,
+            rt0.1,
+            rt0.2,
+            rt0.3,
+            handle_com_raw(dsv.pDrvPrivate),
+            uav_start,
+            num_uavs,
+            uav_range_start,
+            uav_range_size
+        ));
     }
     let depth = load_com::<ID3D11DepthStencilView>(dsv.pDrvPrivate).map(|m| (*m).clone());
-    context.OMSetRenderTargets(Some(&views), depth.as_ref());
+    if num_uavs != 0 {
+        let mut uav_views: Vec<Option<ID3D11UnorderedAccessView>> =
+            Vec::with_capacity(num_uavs as usize);
+        let mut uav_nonnull = 0u32;
+        let mut uav_missing = 0u32;
+        for i in 0..num_uavs as usize {
+            if uavs.is_null() {
+                uav_views.push(None);
+            } else {
+                let p = (*uavs.add(i)).pDrvPrivate;
+                let view = load_com::<ID3D11UnorderedAccessView>(p).map(|m| (*m).clone());
+                if view.is_some() {
+                    uav_nonnull += 1;
+                } else if !p.is_null() {
+                    uav_missing += 1;
+                }
+                uav_views.push(view);
+            }
+        }
+        if n < 1024 || uav_missing != 0 || uavs.is_null() {
+            log_line(&format!(
+                "DDI OMSetRenderTargets UAV summary start={} num={} nonnull={} missing={} uavs_null={} counts_ptr={}",
+                uav_start,
+                num_uavs,
+                uav_nonnull,
+                uav_missing,
+                uavs.is_null(),
+                !uav_counts.is_null()
+            ));
+        }
+        context.OMSetRenderTargetsAndUnorderedAccessViews(
+            Some(&views),
+            depth.as_ref(),
+            uav_start,
+            num_uavs,
+            Some(uav_views.as_ptr()),
+            if uav_counts.is_null() {
+                None
+            } else {
+                Some(uav_counts)
+            },
+        );
+    } else {
+        context.OMSetRenderTargets(Some(&views), depth.as_ref());
+    }
 }
 
 unsafe extern "C" fn set_viewports(
@@ -2773,6 +3541,20 @@ unsafe extern "C" fn set_viewports(
             MinDepth: v.MinDepth,
             MaxDepth: v.MaxDepth,
         });
+    }
+    let n = VIEWPORT_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+    if n < 64 || num == 0 {
+        if let Some(v) = out.first() {
+            log_line(&format!(
+                "DDI RSSetViewports num={} clear={} first=({},{} {}x{} depth={:.3}..{:.3})",
+                num, _clear, v.TopLeftX, v.TopLeftY, v.Width, v.Height, v.MinDepth, v.MaxDepth
+            ));
+        } else {
+            log_line(&format!(
+                "DDI RSSetViewports num={} clear={} empty",
+                num, _clear
+            ));
+        }
     }
     context.RSSetViewports(Some(&out));
 }
@@ -2798,12 +3580,35 @@ unsafe extern "C" fn set_scissor_rects(
             });
         }
     }
+    let n = SCISSOR_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+    if n < 64 || num == 0 {
+        if let Some(r) = out.first() {
+            log_line(&format!(
+                "DDI RSSetScissorRects num={} clear={} first=({},{}-{}, {})",
+                num, _clear, r.left, r.top, r.right, r.bottom
+            ));
+        } else {
+            log_line(&format!(
+                "DDI RSSetScissorRects num={} clear={} empty rects_null={}",
+                num,
+                _clear,
+                rects.is_null()
+            ));
+        }
+    }
     context.RSSetScissorRects(Some(&out));
 }
 
 unsafe extern "C" fn set_text_filter_size(_h: Hdevice, _w: u32, _hgt: u32) {}
 
 unsafe extern "C" fn ia_set_topology(h: Hdevice, topo: ddi::D3D10_DDI_PRIMITIVE_TOPOLOGY) {
+    if let Some(dev) = helios_device(h) {
+        dev.ia.borrow_mut().current_topology = topo as u32;
+    }
+    let n = IA_BIND_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+    if n < 64 {
+        log_line(&format!("DDI IASetTopology topo={}", topo as u32));
+    }
     if let Some(context) = d3d11_context(h) {
         context.IASetPrimitiveTopology(windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY(
             topo as i32,
@@ -2820,27 +3625,37 @@ unsafe fn log_draw_state(
     start1: u32,
 ) {
     let n = DRAW_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-    if n >= 512 && (n % 512) != 0 {
+    if n >= 1024 && (n % 1024) != 0 {
         return;
     }
     let Some(dev) = helios_device(h) else {
         return;
     };
     let ia = dev.ia.borrow();
-    trace_line!(
-        "DDI {kind}: a={} b={} c={} d={} vs=0x{:x} ps=0x{:x} rt0_alloc=0x{:x} rt0={}x{} fmt={} layout=0x{:x}",
+    log_line(&format!(
+        "DDI {kind}: a={} b={} c={} d={} topo={} vb0=0x{:x}/{}+{} ib=0x{:x}/fmt{}+{} vs=0x{:x} ps=0x{:x} gs=0x{:x} hs=0x{:x} ds=0x{:x} rt0_alloc=0x{:x} rt0={}x{} fmt={} layout=0x{:x}",
         count0,
         start0,
         count1,
         start1,
+        ia.current_topology,
+        ia.current_vb0,
+        ia.current_vb0_stride,
+        ia.current_vb0_offset,
+        ia.current_ib,
+        ia.current_ib_format,
+        ia.current_ib_offset,
         ia.current_vs,
         ia.current_ps,
+        ia.current_gs,
+        ia.current_hs,
+        ia.current_ds,
         ia.current_rt0_alloc,
         ia.current_rt0_width,
         ia.current_rt0_height,
         ia.current_rt0_format,
         ia.current_layout
-    );
+    ));
 }
 
 unsafe extern "C" fn draw(h: Hdevice, vertex_count: u32, start_vertex: u32) {
@@ -2927,6 +3742,7 @@ unsafe extern "C" fn draw_indexed_instanced(
 
 unsafe extern "C" fn draw_auto(h: Hdevice) {
     bind_input_layout(h);
+    log_draw_state(h, "DrawAuto", 0, 0, 0, 0);
     if let Some(context) = d3d11_context(h) {
         context.DrawAuto();
     }
@@ -2938,14 +3754,30 @@ unsafe extern "C" fn draw_instanced_indirect(
     aligned_byte_offset: u32,
 ) {
     bind_input_layout(h);
+    log_draw_state(h, "DrawInstancedIndirect", aligned_byte_offset, 0, 0, 0);
     let Some(context) = d3d11_context(h) else {
         return;
     };
-    let Some(buf) =
-        load_resource(h_args.pDrvPrivate).and_then(|r| (*r).cast::<ID3D11Buffer>().ok())
-    else {
+    let (alloc, kind, width, height, depth, fmt) = resource_summary(h_args.pDrvPrivate);
+    let Some(res) = load_resource(h_args.pDrvPrivate) else {
+        log_line(&format!(
+            "DDI DrawInstancedIndirect skipped: args missing alloc=0x{alloc:x} offset={aligned_byte_offset}"
+        ));
         return;
     };
+    let Ok(buf) = (*res).cast::<ID3D11Buffer>() else {
+        log_line(&format!(
+            "DDI DrawInstancedIndirect skipped: args not buffer kind={kind} dims={}x{}x{} fmt={} alloc=0x{alloc:x} offset={aligned_byte_offset}",
+            width, height, depth, fmt
+        ));
+        return;
+    };
+    let n = DRAW_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+    if n < 2048 {
+        log_line(&format!(
+            "DDI DrawInstancedIndirect args: alloc=0x{alloc:x} bytes={width} offset={aligned_byte_offset}"
+        ));
+    }
     context.DrawInstancedIndirect(&buf, aligned_byte_offset);
 }
 
@@ -2955,14 +3787,37 @@ unsafe extern "C" fn draw_indexed_instanced_indirect(
     aligned_byte_offset: u32,
 ) {
     bind_input_layout(h);
+    log_draw_state(
+        h,
+        "DrawIndexedInstancedIndirect",
+        aligned_byte_offset,
+        0,
+        0,
+        0,
+    );
     let Some(context) = d3d11_context(h) else {
         return;
     };
-    let Some(buf) =
-        load_resource(h_args.pDrvPrivate).and_then(|r| (*r).cast::<ID3D11Buffer>().ok())
-    else {
+    let (alloc, kind, width, height, depth, fmt) = resource_summary(h_args.pDrvPrivate);
+    let Some(res) = load_resource(h_args.pDrvPrivate) else {
+        log_line(&format!(
+            "DDI DrawIndexedInstancedIndirect skipped: args missing alloc=0x{alloc:x} offset={aligned_byte_offset}"
+        ));
         return;
     };
+    let Ok(buf) = (*res).cast::<ID3D11Buffer>() else {
+        log_line(&format!(
+            "DDI DrawIndexedInstancedIndirect skipped: args not buffer kind={kind} dims={}x{}x{} fmt={} alloc=0x{alloc:x} offset={aligned_byte_offset}",
+            width, height, depth, fmt
+        ));
+        return;
+    };
+    let n = DRAW_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+    if n < 2048 {
+        log_line(&format!(
+            "DDI DrawIndexedInstancedIndirect args: alloc=0x{alloc:x} bytes={width} offset={aligned_byte_offset}"
+        ));
+    }
     context.DrawIndexedInstancedIndirect(&buf, aligned_byte_offset);
 }
 
@@ -3024,6 +3879,21 @@ unsafe extern "C" fn create_rasterizer_state(
         MultisampleEnable: windows::Win32::Foundation::BOOL(d.MultisampleEnable),
         AntialiasedLineEnable: windows::Win32::Foundation::BOOL(d.AntialiasedLineEnable),
     };
+    let n = RASTER_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+    if n < 64 {
+        log_line(&format!(
+            "DDI CreateRasterizerState fill={} cull={} front_ccw={} depth_clip={} scissor={} msaa={} aaline={} bias={} slope_bias={:.3}",
+            d.FillMode,
+            d.CullMode,
+            d.FrontCounterClockwise,
+            d.DepthClipEnable,
+            d.ScissorEnable,
+            d.MultisampleEnable,
+            d.AntialiasedLineEnable,
+            d.DepthBias,
+            d.SlopeScaledDepthBias
+        ));
+    }
     let mut rs: Option<ID3D11RasterizerState> = None;
     if device.CreateRasterizerState(&rd, Some(&mut rs)).is_ok() {
         if let Some(s) = rs {
@@ -3036,6 +3906,13 @@ unsafe extern "C" fn set_rasterizer_state(h: Hdevice, h_rs: ddi::D3D10DDI_HRASTE
     let Some(context) = d3d11_context(h) else {
         return;
     };
+    let n = RASTER_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+    if n < 128 {
+        log_line(&format!(
+            "DDI RSSetState raw=0x{:x}",
+            handle_com_raw(h_rs.pDrvPrivate)
+        ));
+    }
     match load_com::<ID3D11RasterizerState>(h_rs.pDrvPrivate) {
         Some(s) => context.RSSetState(&*s),
         None => context.RSSetState(None),
@@ -3119,9 +3996,13 @@ unsafe extern "C" fn create_srv(
     };
     let a = &*arg;
     let Some(res) = load_resource(a.hDrvResource.pDrvPrivate) else {
+        log_line(&format!(
+            "DDI create_srv: resource handle empty dim={} fmt={} hpriv={:p}",
+            a.ResourceDimension, a.Format, a.hDrvResource.pDrvPrivate
+        ));
         return;
     };
-    let Some(desc) = srv_desc(a) else {
+    let Some(desc) = srv_desc(a, a.hDrvResource.pDrvPrivate) else {
         log_line(&format!(
             "DDI create_srv: unsupported resource dimension {} fmt={}",
             a.ResourceDimension, a.Format
@@ -3133,13 +4014,13 @@ unsafe extern "C" fn create_srv(
         Ok(()) => {
             if let Some(v) = srv {
                 let allocation = resource_allocation(a.hDrvResource.pDrvPrivate);
-                let n = VIEW_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-                if n < 256 || allocation != 0 {
+                let n = SRV_CREATE_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+                if n < 1024 || allocation != 0 {
                     let (width, height) = resource_dimensions(a.hDrvResource.pDrvPrivate);
-                    trace_line!(
+                    log_line(&format!(
                         "DDI create_srv ok: hpriv={:p} alloc=0x{:x} dim={} fmt={} {}x{}",
                         h_srv.pDrvPrivate, allocation, a.ResourceDimension, a.Format, width, height
-                    );
+                    ));
                 }
                 store_com(h_srv.pDrvPrivate, v);
             }
@@ -3153,6 +4034,7 @@ unsafe extern "C" fn create_srv(
 
 unsafe fn srv_desc(
     a: &ddi::D3D11DDIARG_CREATESHADERRESOURCEVIEW,
+    resource_priv: *mut c_void,
 ) -> Option<D3D11_SHADER_RESOURCE_VIEW_DESC> {
     let format = DXGI_FORMAT(a.Format as i32);
     match a.ResourceDimension {
@@ -3217,7 +4099,29 @@ unsafe fn srv_desc(
         }
         RES_TEX2D => {
             let t = a.__bindgen_anon_1.Tex2D;
-            if t.ArraySize > 1 {
+            let is_msaa = resource_sample_count(resource_priv) > 1;
+            if is_msaa && t.ArraySize > 1 {
+                Some(D3D11_SHADER_RESOURCE_VIEW_DESC {
+                    Format: format,
+                    ViewDimension: D3D11_SRV_DIMENSION_TEXTURE2DMSARRAY,
+                    Anonymous: D3D11_SHADER_RESOURCE_VIEW_DESC_0 {
+                        Texture2DMSArray: D3D11_TEX2DMS_ARRAY_SRV {
+                            FirstArraySlice: t.FirstArraySlice,
+                            ArraySize: t.ArraySize,
+                        },
+                    },
+                })
+            } else if is_msaa {
+                Some(D3D11_SHADER_RESOURCE_VIEW_DESC {
+                    Format: format,
+                    ViewDimension: D3D11_SRV_DIMENSION_TEXTURE2DMS,
+                    Anonymous: D3D11_SHADER_RESOURCE_VIEW_DESC_0 {
+                        Texture2DMS: D3D11_TEX2DMS_SRV {
+                            UnusedField_NothingToDefine: 0,
+                        },
+                    },
+                })
+            } else if t.ArraySize > 1 {
                 Some(D3D11_SHADER_RESOURCE_VIEW_DESC {
                     Format: format,
                     ViewDimension: D3D11_SRV_DIMENSION_TEXTURE2DARRAY,
@@ -3323,14 +4227,155 @@ unsafe extern "C" fn create_uav(
     let Some(res) = load_resource(a.hDrvResource.pDrvPrivate) else {
         return;
     };
+    let Some(desc) = uav_desc(a) else {
+        log_line(&format!(
+            "DDI create_uav: unsupported resource dimension {} fmt={}",
+            a.ResourceDimension, a.Format
+        ));
+        return;
+    };
     let mut uav: Option<ID3D11UnorderedAccessView> = None;
-    match device.CreateUnorderedAccessView(&*res, None, Some(&mut uav)) {
+    match device.CreateUnorderedAccessView(&*res, Some(&desc), Some(&mut uav)) {
         Ok(()) => {
             if let Some(v) = uav {
+                let n = VIEW_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+                if n < 256 {
+                    log_line(&format!(
+                        "DDI create_uav ok: dim={} fmt={} alloc=0x{:x}",
+                        a.ResourceDimension,
+                        a.Format,
+                        resource_allocation(a.hDrvResource.pDrvPrivate)
+                    ));
+                }
                 store_com(h_uav.pDrvPrivate, v);
             }
         }
-        Err(e) => log_line(&format!("DDI create_uav failed: {e:?}")),
+        Err(e) => {
+            let detail = match a.ResourceDimension {
+                RES_BUFFER | RES_BUFFEREX => {
+                    let b = a.__bindgen_anon_1.Buffer;
+                    format!(
+                        "buffer first={} num={} flags=0x{:x}",
+                        b.FirstElement, b.NumElements, b.Flags
+                    )
+                }
+                RES_TEX1D => {
+                    let t = a.__bindgen_anon_1.Tex1D;
+                    format!(
+                        "tex1d mip={} first={} array={}",
+                        t.MipSlice, t.FirstArraySlice, t.ArraySize
+                    )
+                }
+                RES_TEX2D => {
+                    let t = a.__bindgen_anon_1.Tex2D;
+                    format!(
+                        "tex2d mip={} first={} array={}",
+                        t.MipSlice, t.FirstArraySlice, t.ArraySize
+                    )
+                }
+                RES_TEX3D => {
+                    let t = a.__bindgen_anon_1.Tex3D;
+                    format!(
+                        "tex3d mip={} first_w={} wsize={}",
+                        t.MipSlice, t.FirstW, t.WSize
+                    )
+                }
+                _ => String::from("unknown"),
+            };
+            log_line(&format!(
+                "DDI create_uav failed: dim={} fmt={} {} {e:?}",
+                a.ResourceDimension, a.Format, detail
+            ));
+        }
+    }
+}
+
+unsafe fn uav_desc(
+    a: &ddi::D3D11DDIARG_CREATEUNORDEREDACCESSVIEW,
+) -> Option<D3D11_UNORDERED_ACCESS_VIEW_DESC> {
+    let format = DXGI_FORMAT(a.Format as i32);
+    match a.ResourceDimension {
+        RES_BUFFER | RES_BUFFEREX => {
+            let b = a.__bindgen_anon_1.Buffer;
+            Some(D3D11_UNORDERED_ACCESS_VIEW_DESC {
+                Format: format,
+                ViewDimension: D3D11_UAV_DIMENSION_BUFFER,
+                Anonymous: D3D11_UNORDERED_ACCESS_VIEW_DESC_0 {
+                    Buffer: D3D11_BUFFER_UAV {
+                        FirstElement: b.FirstElement,
+                        NumElements: b.NumElements,
+                        Flags: b.Flags,
+                    },
+                },
+            })
+        }
+        RES_TEX1D => {
+            let t = a.__bindgen_anon_1.Tex1D;
+            if t.ArraySize > 1 {
+                Some(D3D11_UNORDERED_ACCESS_VIEW_DESC {
+                    Format: format,
+                    ViewDimension: D3D11_UAV_DIMENSION_TEXTURE1DARRAY,
+                    Anonymous: D3D11_UNORDERED_ACCESS_VIEW_DESC_0 {
+                        Texture1DArray: D3D11_TEX1D_ARRAY_UAV {
+                            MipSlice: t.MipSlice,
+                            FirstArraySlice: t.FirstArraySlice,
+                            ArraySize: t.ArraySize,
+                        },
+                    },
+                })
+            } else {
+                Some(D3D11_UNORDERED_ACCESS_VIEW_DESC {
+                    Format: format,
+                    ViewDimension: D3D11_UAV_DIMENSION_TEXTURE1D,
+                    Anonymous: D3D11_UNORDERED_ACCESS_VIEW_DESC_0 {
+                        Texture1D: D3D11_TEX1D_UAV {
+                            MipSlice: t.MipSlice,
+                        },
+                    },
+                })
+            }
+        }
+        RES_TEX2D => {
+            let t = a.__bindgen_anon_1.Tex2D;
+            if t.ArraySize > 1 {
+                Some(D3D11_UNORDERED_ACCESS_VIEW_DESC {
+                    Format: format,
+                    ViewDimension: D3D11_UAV_DIMENSION_TEXTURE2DARRAY,
+                    Anonymous: D3D11_UNORDERED_ACCESS_VIEW_DESC_0 {
+                        Texture2DArray: D3D11_TEX2D_ARRAY_UAV {
+                            MipSlice: t.MipSlice,
+                            FirstArraySlice: t.FirstArraySlice,
+                            ArraySize: t.ArraySize,
+                        },
+                    },
+                })
+            } else {
+                Some(D3D11_UNORDERED_ACCESS_VIEW_DESC {
+                    Format: format,
+                    ViewDimension: D3D11_UAV_DIMENSION_TEXTURE2D,
+                    Anonymous: D3D11_UNORDERED_ACCESS_VIEW_DESC_0 {
+                        Texture2D: D3D11_TEX2D_UAV {
+                            MipSlice: t.MipSlice,
+                        },
+                    },
+                })
+            }
+        }
+        RES_TEX3D => {
+            let t = a.__bindgen_anon_1.Tex3D;
+            Some(D3D11_UNORDERED_ACCESS_VIEW_DESC {
+                Format: format,
+                ViewDimension: D3D11_UAV_DIMENSION_TEXTURE3D,
+                Anonymous: D3D11_UNORDERED_ACCESS_VIEW_DESC_0 {
+                    Texture3D: D3D11_TEX3D_UAV {
+                        MipSlice: t.MipSlice,
+                        FirstWSlice: t.FirstW,
+                        WSize: t.WSize,
+                    },
+                },
+            })
+        }
+        _ => None,
     }
 }
 
@@ -3387,13 +4432,40 @@ unsafe extern "C" fn cs_set_uavs(
         return;
     };
     let mut out: Vec<Option<ID3D11UnorderedAccessView>> = Vec::with_capacity(num as usize);
-    if !uavs.is_null() {
-        for i in 0..num as usize {
+    let mut nonnull = 0u32;
+    let mut missing = 0u32;
+    for i in 0..num as usize {
+        if uavs.is_null() {
+            out.push(None);
+        } else {
             let p = (*uavs.add(i)).pDrvPrivate;
-            out.push(load_com::<ID3D11UnorderedAccessView>(p).map(|m| (*m).clone()));
+            let view = load_com::<ID3D11UnorderedAccessView>(p).map(|m| (*m).clone());
+            if view.is_some() {
+                nonnull += 1;
+            } else if !p.is_null() {
+                missing += 1;
+            }
+            out.push(view);
         }
     }
-    context.CSSetUnorderedAccessViews(start, num, Some(out.as_ptr()), Some(counts));
+    let n = UAV_BIND_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+    if n < 1024 || missing != 0 || uavs.is_null() {
+        log_line(&format!(
+            "DDI CSSetUnorderedAccessViews start={} num={} nonnull={} missing={} uavs_null={} counts_ptr={}",
+            start,
+            num,
+            nonnull,
+            missing,
+            uavs.is_null(),
+            !counts.is_null()
+        ));
+    }
+    context.CSSetUnorderedAccessViews(
+        start,
+        num,
+        Some(out.as_ptr()),
+        if counts.is_null() { None } else { Some(counts) },
+    );
 }
 
 unsafe extern "C" fn copy_structure_count(
@@ -3472,11 +4544,47 @@ unsafe fn collect_srvs(
     h: *const ddi::D3D10DDI_HSHADERRESOURCEVIEW,
 ) -> Vec<Option<ID3D11ShaderResourceView>> {
     let mut v = Vec::with_capacity(num as usize);
+    if h.is_null() {
+        for _ in 0..num as usize {
+            v.push(None);
+        }
+        return v;
+    }
     for i in 0..num as usize {
         let p = (*h.add(i)).pDrvPrivate;
         v.push(load_com::<ID3D11ShaderResourceView>(p).map(|m| (*m).clone()));
     }
     v
+}
+
+unsafe fn srv_bind_summary(
+    num: u32,
+    h: *const ddi::D3D10DDI_HSHADERRESOURCEVIEW,
+) -> (u32, u32, usize, *mut c_void) {
+    if h.is_null() {
+        return (0, num, 0, core::ptr::null_mut());
+    }
+    let mut nonnull = 0u32;
+    let mut missing = 0u32;
+    let mut first_raw = 0usize;
+    let mut first_priv: *mut c_void = core::ptr::null_mut();
+    for i in 0..num as usize {
+        let p = (*h.add(i)).pDrvPrivate;
+        if p.is_null() {
+            continue;
+        }
+        let raw = handle_com_raw(p);
+        if raw == 0 {
+            missing += 1;
+            continue;
+        }
+        nonnull += 1;
+        if first_raw == 0 {
+            first_raw = raw;
+            first_priv = p;
+        }
+    }
+    (nonnull, missing, first_raw, first_priv)
 }
 unsafe fn collect_samplers(
     num: u32,
@@ -3679,29 +4787,36 @@ unsafe extern "C" fn ps_set_shader_resources(
     num: u32,
     srvs: *const ddi::D3D10DDI_HSHADERRESOURCEVIEW,
 ) {
-    if let Some(c) = d3d11_context(h) {
-        let n = SHADER_BIND_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-        if n < 256 && !srvs.is_null() {
-            let mut nonnull = 0u32;
-            let mut first_priv: *mut c_void = core::ptr::null_mut();
-            let mut second_priv: *mut c_void = core::ptr::null_mut();
-            for i in 0..num as usize {
-                let p = (*srvs.add(i)).pDrvPrivate;
-                if !p.is_null() && !(*(p as *const *mut c_void)).is_null() {
-                    nonnull += 1;
-                    if first_priv.is_null() {
-                        first_priv = p;
-                    } else if second_priv.is_null() {
-                        second_priv = p;
-                    }
-                }
-            }
-            trace_line!(
-                "DDI PSSetShaderResources start={} num={} nonnull={} first={:p} second={:p}",
-                start, num, nonnull, first_priv, second_priv
-            );
-        }
-        c.PSSetShaderResources(start, Some(&collect_srvs(num, srvs)));
+    set_shader_resources_common(h, "PS", start, num, srvs);
+}
+
+unsafe fn set_shader_resources_common(
+    h: Hdevice,
+    stage: &str,
+    start: u32,
+    num: u32,
+    srvs: *const ddi::D3D10DDI_HSHADERRESOURCEVIEW,
+) {
+    let Some(c) = d3d11_context(h) else {
+        return;
+    };
+    let views = collect_srvs(num, srvs);
+    let (nonnull, missing, first_raw, first_priv) = srv_bind_summary(num, srvs);
+    let n = SRV_BIND_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+    if n < 2048 || missing != 0 {
+        log_line(&format!(
+            "DDI {stage}SetShaderResources start={} num={} nonnull={} missing={} first_raw=0x{:x} first_priv={:p}",
+            start, num, nonnull, missing, first_raw, first_priv
+        ));
+    }
+    match stage {
+        "VS" => c.VSSetShaderResources(start, Some(&views)),
+        "PS" => c.PSSetShaderResources(start, Some(&views)),
+        "GS" => c.GSSetShaderResources(start, Some(&views)),
+        "HS" => c.HSSetShaderResources(start, Some(&views)),
+        "DS" => c.DSSetShaderResources(start, Some(&views)),
+        "CS" => c.CSSetShaderResources(start, Some(&views)),
+        _ => {}
     }
 }
 unsafe extern "C" fn vs_set_shader_resources(
@@ -3710,9 +4825,7 @@ unsafe extern "C" fn vs_set_shader_resources(
     num: u32,
     srvs: *const ddi::D3D10DDI_HSHADERRESOURCEVIEW,
 ) {
-    if let Some(c) = d3d11_context(h) {
-        c.VSSetShaderResources(start, Some(&collect_srvs(num, srvs)));
-    }
+    set_shader_resources_common(h, "VS", start, num, srvs);
 }
 unsafe extern "C" fn gs_set_shader_resources(
     h: Hdevice,
@@ -3720,9 +4833,7 @@ unsafe extern "C" fn gs_set_shader_resources(
     num: u32,
     srvs: *const ddi::D3D10DDI_HSHADERRESOURCEVIEW,
 ) {
-    if let Some(c) = d3d11_context(h) {
-        c.GSSetShaderResources(start, Some(&collect_srvs(num, srvs)));
-    }
+    set_shader_resources_common(h, "GS", start, num, srvs);
 }
 unsafe extern "C" fn hs_set_shader_resources(
     h: Hdevice,
@@ -3730,9 +4841,7 @@ unsafe extern "C" fn hs_set_shader_resources(
     num: u32,
     srvs: *const ddi::D3D10DDI_HSHADERRESOURCEVIEW,
 ) {
-    if let Some(c) = d3d11_context(h) {
-        c.HSSetShaderResources(start, Some(&collect_srvs(num, srvs)));
-    }
+    set_shader_resources_common(h, "HS", start, num, srvs);
 }
 unsafe extern "C" fn ds_set_shader_resources(
     h: Hdevice,
@@ -3740,9 +4849,7 @@ unsafe extern "C" fn ds_set_shader_resources(
     num: u32,
     srvs: *const ddi::D3D10DDI_HSHADERRESOURCEVIEW,
 ) {
-    if let Some(c) = d3d11_context(h) {
-        c.DSSetShaderResources(start, Some(&collect_srvs(num, srvs)));
-    }
+    set_shader_resources_common(h, "DS", start, num, srvs);
 }
 unsafe extern "C" fn cs_set_shader_resources(
     h: Hdevice,
@@ -3750,9 +4857,7 @@ unsafe extern "C" fn cs_set_shader_resources(
     num: u32,
     srvs: *const ddi::D3D10DDI_HSHADERRESOURCEVIEW,
 ) {
-    if let Some(c) = d3d11_context(h) {
-        c.CSSetShaderResources(start, Some(&collect_srvs(num, srvs)));
-    }
+    set_shader_resources_common(h, "CS", start, num, srvs);
 }
 unsafe extern "C" fn ps_set_samplers(
     h: Hdevice,
@@ -3828,8 +4933,33 @@ unsafe extern "C" fn resource_update_subresource(
         return;
     };
     let Some(res) = load_resource(h_res.pDrvPrivate) else {
+        let n = HANDLE_MISS_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+        if n < 256 {
+            log_line(&format!(
+                "DDI UpdateSubresource missing resource hpriv={:p} sub={} data={:p}",
+                h_res.pDrvPrivate, subresource, data
+            ));
+        }
         return;
     };
+    let (alloc, kind, width, height, depth, fmt) = resource_summary(h_res.pDrvPrivate);
+    let n = UPDATE_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+    if n < 1024 || alloc != 0 {
+        log_line(&format!(
+            "DDI UpdateSubresource alloc=0x{:x} kind={} dims={}x{}x{} fmt={} sub={} box={} data={:p} row_pitch={} depth_pitch={}",
+            alloc,
+            kind,
+            width,
+            height,
+            depth,
+            fmt,
+            subresource,
+            !box_.is_null(),
+            data,
+            row_pitch,
+            depth_pitch
+        ));
+    }
     let bx;
     let bx_ptr = if box_.is_null() {
         None
@@ -3859,6 +4989,314 @@ unsafe extern "C" fn resource_update_subresource_11_1(
     _copy_flags: u32,
 ) {
     resource_update_subresource(h, h_res, subresource, box_, data, row_pitch, depth_pitch);
+}
+
+fn tile_coord(
+    coord: &ddi::D3DWDDM1_3DDI_TILED_RESOURCE_COORDINATE,
+) -> D3D11_TILED_RESOURCE_COORDINATE {
+    D3D11_TILED_RESOURCE_COORDINATE {
+        X: coord.X,
+        Y: coord.Y,
+        Z: coord.Z,
+        Subresource: coord.Subresource,
+    }
+}
+
+fn tile_region(size: &ddi::D3DWDDM1_3DDI_TILE_REGION_SIZE) -> D3D11_TILE_REGION_SIZE {
+    D3D11_TILE_REGION_SIZE {
+        NumTiles: size.NumTiles,
+        bUseBox: BOOL(size.bUseBox),
+        Width: size.Width,
+        Height: size.Height,
+        Depth: size.Depth,
+    }
+}
+
+unsafe fn tile_coords(
+    ptr: *const ddi::D3DWDDM1_3DDI_TILED_RESOURCE_COORDINATE,
+    count: u32,
+) -> Vec<D3D11_TILED_RESOURCE_COORDINATE> {
+    if ptr.is_null() || count == 0 {
+        return Vec::new();
+    }
+    (0..count)
+        .map(|i| tile_coord(&*ptr.add(i as usize)))
+        .collect()
+}
+
+unsafe fn tile_regions(
+    ptr: *const ddi::D3DWDDM1_3DDI_TILE_REGION_SIZE,
+    count: u32,
+) -> Vec<D3D11_TILE_REGION_SIZE> {
+    if ptr.is_null() || count == 0 {
+        return Vec::new();
+    }
+    (0..count)
+        .map(|i| tile_region(&*ptr.add(i as usize)))
+        .collect()
+}
+
+unsafe fn resource_as_buffer(
+    h_resource: ddi::D3D10DDI_HRESOURCE,
+) -> Option<ManuallyDrop<ID3D11Buffer>> {
+    let res = load_resource(h_resource.pDrvPrivate)?;
+    (*res).cast::<ID3D11Buffer>().ok().map(ManuallyDrop::new)
+}
+
+unsafe extern "C" fn update_tile_mappings(
+    h: Hdevice,
+    h_tiled_resource: ddi::D3D10DDI_HRESOURCE,
+    region_count: u32,
+    region_start_coords: *const ddi::D3DWDDM1_3DDI_TILED_RESOURCE_COORDINATE,
+    region_sizes: *const ddi::D3DWDDM1_3DDI_TILE_REGION_SIZE,
+    h_tile_pool: ddi::D3D10DDI_HRESOURCE,
+    range_count: u32,
+    range_flags: *const u32,
+    tile_pool_start_offsets: *const u32,
+    range_tile_counts: *const u32,
+    flags: u32,
+) {
+    let Some(context) = d3d11_context2(h) else {
+        return;
+    };
+    let Some(tiled_resource) = load_resource(h_tiled_resource.pDrvPrivate) else {
+        return;
+    };
+    let coords = tile_coords(region_start_coords, region_count);
+    let sizes = tile_regions(region_sizes, region_count);
+    let tile_pool = resource_as_buffer(h_tile_pool);
+    let tile_pool_ref: Option<&ID3D11Buffer> = tile_pool.as_ref().map(|p| &**p);
+    let sizes_ptr = if sizes.is_empty() {
+        None
+    } else {
+        Some(sizes.as_ptr())
+    };
+    let coords_ptr = if coords.is_empty() {
+        None
+    } else {
+        Some(coords.as_ptr())
+    };
+    let _ = context.UpdateTileMappings(
+        &*tiled_resource,
+        region_count,
+        coords_ptr,
+        sizes_ptr,
+        tile_pool_ref,
+        range_count,
+        (!range_flags.is_null()).then_some(range_flags),
+        (!tile_pool_start_offsets.is_null()).then_some(tile_pool_start_offsets),
+        (!range_tile_counts.is_null()).then_some(range_tile_counts),
+        flags,
+    );
+}
+
+unsafe extern "C" fn copy_tile_mappings(
+    h: Hdevice,
+    h_dst_resource: ddi::D3D10DDI_HRESOURCE,
+    dst_start_coord: *const ddi::D3DWDDM1_3DDI_TILED_RESOURCE_COORDINATE,
+    h_src_resource: ddi::D3D10DDI_HRESOURCE,
+    src_start_coord: *const ddi::D3DWDDM1_3DDI_TILED_RESOURCE_COORDINATE,
+    region_size: *const ddi::D3DWDDM1_3DDI_TILE_REGION_SIZE,
+    flags: u32,
+) {
+    let Some(context) = d3d11_context2(h) else {
+        return;
+    };
+    let Some(dst) = load_resource(h_dst_resource.pDrvPrivate) else {
+        return;
+    };
+    let Some(src) = load_resource(h_src_resource.pDrvPrivate) else {
+        return;
+    };
+    if dst_start_coord.is_null() || src_start_coord.is_null() || region_size.is_null() {
+        return;
+    }
+    let dst_coord = tile_coord(&*dst_start_coord);
+    let src_coord = tile_coord(&*src_start_coord);
+    let size = tile_region(&*region_size);
+    let _ = context.CopyTileMappings(&*dst, &dst_coord, &*src, &src_coord, &size, flags);
+}
+
+unsafe extern "C" fn copy_tiles(
+    h: Hdevice,
+    h_tiled_resource: ddi::D3D10DDI_HRESOURCE,
+    region_start_coord: *const ddi::D3DWDDM1_3DDI_TILED_RESOURCE_COORDINATE,
+    region_size: *const ddi::D3DWDDM1_3DDI_TILE_REGION_SIZE,
+    h_buffer: ddi::D3D10DDI_HRESOURCE,
+    buffer_start_offset: u64,
+    flags: u32,
+) {
+    let Some(context) = d3d11_context2(h) else {
+        return;
+    };
+    let Some(tiled_resource) = load_resource(h_tiled_resource.pDrvPrivate) else {
+        return;
+    };
+    let Some(buffer) = resource_as_buffer(h_buffer) else {
+        return;
+    };
+    if region_start_coord.is_null() || region_size.is_null() {
+        return;
+    }
+    let coord = tile_coord(&*region_start_coord);
+    let size = tile_region(&*region_size);
+    context.CopyTiles(
+        &*tiled_resource,
+        &coord,
+        &size,
+        &*buffer,
+        buffer_start_offset,
+        flags,
+    );
+}
+
+unsafe extern "C" fn update_tiles(
+    h: Hdevice,
+    h_dst_resource: ddi::D3D10DDI_HRESOURCE,
+    dst_start_coord: *const ddi::D3DWDDM1_3DDI_TILED_RESOURCE_COORDINATE,
+    dst_region_size: *const ddi::D3DWDDM1_3DDI_TILE_REGION_SIZE,
+    src_tile_data: *const c_void,
+    flags: u32,
+) {
+    let Some(context) = d3d11_context2(h) else {
+        return;
+    };
+    let Some(dst) = load_resource(h_dst_resource.pDrvPrivate) else {
+        return;
+    };
+    if dst_start_coord.is_null() || dst_region_size.is_null() || src_tile_data.is_null() {
+        return;
+    }
+    let coord = tile_coord(&*dst_start_coord);
+    let size = tile_region(&*dst_region_size);
+    context.UpdateTiles(&*dst, &coord, &size, src_tile_data, flags);
+}
+
+unsafe fn tiled_barrier_child(
+    handle_type: ddi::D3D11DDI_HANDLETYPE,
+    handle: *mut c_void,
+) -> Option<ID3D11DeviceChild> {
+    match handle_type {
+        ddi::D3D11DDI_HANDLETYPE_D3D10DDI_HT_RESOURCE => {
+            let res = load_resource(handle)?;
+            (*res).cast::<ID3D11DeviceChild>().ok()
+        }
+        ddi::D3D11DDI_HANDLETYPE_D3D10DDI_HT_SHADERRESOURCEVIEW => {
+            let view = load_com::<ID3D11ShaderResourceView>(handle)?;
+            (*view).cast::<ID3D11DeviceChild>().ok()
+        }
+        ddi::D3D11DDI_HANDLETYPE_D3D10DDI_HT_RENDERTARGETVIEW => {
+            let view = load_rtv(handle)?;
+            (*view).cast::<ID3D11DeviceChild>().ok()
+        }
+        ddi::D3D11DDI_HANDLETYPE_D3D10DDI_HT_DEPTHSTENCILVIEW => {
+            let view = load_com::<ID3D11DepthStencilView>(handle)?;
+            (*view).cast::<ID3D11DeviceChild>().ok()
+        }
+        ddi::D3D11DDI_HANDLETYPE_D3D11DDI_HT_UNORDEREDACCESSVIEW => {
+            let view = load_com::<ID3D11UnorderedAccessView>(handle)?;
+            (*view).cast::<ID3D11DeviceChild>().ok()
+        }
+        _ => None,
+    }
+}
+
+unsafe extern "C" fn tiled_resource_barrier(
+    h: Hdevice,
+    before_type: ddi::D3D11DDI_HANDLETYPE,
+    before: *mut c_void,
+    after_type: ddi::D3D11DDI_HANDLETYPE,
+    after: *mut c_void,
+) {
+    let Some(context) = d3d11_context2(h) else {
+        return;
+    };
+    let before_child = tiled_barrier_child(before_type, before);
+    let after_child = tiled_barrier_child(after_type, after);
+    context.TiledResourceBarrier(before_child.as_ref(), after_child.as_ref());
+}
+
+unsafe extern "C" fn get_mip_packing(
+    h: Hdevice,
+    h_tiled_resource: ddi::D3D10DDI_HRESOURCE,
+    packed_mips: *mut u32,
+    tiles_for_packed_mips: *mut u32,
+) {
+    if !packed_mips.is_null() {
+        *packed_mips = 0;
+    }
+    if !tiles_for_packed_mips.is_null() {
+        *tiles_for_packed_mips = 0;
+    }
+    let Some(device) = d3d11_device2(h) else {
+        return;
+    };
+    let Some(resource) = load_resource(h_tiled_resource.pDrvPrivate) else {
+        return;
+    };
+    let mut total_tiles = 0u32;
+    let mut packed = D3D11_PACKED_MIP_DESC::default();
+    let mut shape = D3D11_TILE_SHAPE::default();
+    let mut subresource_count = 0u32;
+    device.GetResourceTiling(
+        &*resource,
+        Some(&mut total_tiles),
+        Some(&mut packed),
+        Some(&mut shape),
+        Some(&mut subresource_count),
+        0,
+        core::ptr::null_mut(),
+    );
+    if !packed_mips.is_null() {
+        *packed_mips = packed.NumPackedMips as u32;
+    }
+    if !tiles_for_packed_mips.is_null() {
+        *tiles_for_packed_mips = packed.NumTilesForPackedMips;
+    }
+}
+
+unsafe extern "C" fn resize_tile_pool(
+    h: Hdevice,
+    h_tile_pool: ddi::D3D10DDI_HRESOURCE,
+    new_size: u64,
+) {
+    let Some(context) = d3d11_context2(h) else {
+        return;
+    };
+    let Some(tile_pool) = resource_as_buffer(h_tile_pool) else {
+        return;
+    };
+    let _ = context.ResizeTilePool(&*tile_pool, new_size);
+}
+
+static WDDM13_MARKER_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+unsafe extern "C" fn set_marker(h: Hdevice) {
+    let n = WDDM13_MARKER_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+    if n < 16 || n % 1024 == 0 {
+        log_line(&format!(
+            "WDDM1.3 SetMarker h={:p} hit={}",
+            h.pDrvPrivate,
+            n + 1
+        ));
+    }
+}
+
+unsafe extern "C" fn set_marker_mode(
+    h: Hdevice,
+    marker_type: ddi::D3DWDDM1_3DDI_MARKER_TYPE,
+    flags: u32,
+) {
+    let n = WDDM13_MARKER_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+    if n < 16 || n % 1024 == 0 {
+        log_line(&format!(
+            "WDDM1.3 SetMarkerMode h={:p} type={} flags=0x{:x} hit={}",
+            h.pDrvPrivate,
+            marker_type,
+            flags,
+            n + 1
+        ));
+    }
 }
 
 // --- Queries / counters -----------------------------------------------------
@@ -3958,11 +5396,10 @@ unsafe extern "C" fn set_predication(
 /// `CheckMultisampleQualityLevels` as a coherent feature-level contract during
 /// `CDevice::LLOCompleteLayerConstruction`. The FL10.0 profile expresses a
 /// no-multisample device (1x only) coherently with `check_format_support`
-/// stripping the multisample bits — forwarding DXVK's host-derived MSAA caps
-/// while those bits are stripped is the incoherence that historically got the
-/// adapter rejected with `DXGI_ERROR_UNSUPPORTED`. The FL11_0 profile forwards
-/// DXVK's real quality levels (FL11 requires multisample support), which is
-/// coherent because `check_format_support` also stops masking under FL11.
+/// stripping the multisample bits. The FL11_0 profile implements the D3D11.3
+/// §19.2.5 floor: 1x, 4x for every output-capable format and 8x for output
+/// formats below 128 bits/sample. The runtime also accepts optional standard
+/// patterns (2x/16x) but rejects arbitrary non-power-of-two sample counts.
 unsafe fn helios_multisample_quality_levels(
     h: Hdevice,
     fmt: ddi::DXGI_FORMAT,
@@ -3978,26 +5415,21 @@ unsafe fn helios_multisample_quality_levels(
         // DXVK unreachable: fall back to the conservative single-sample answer.
         return if sample_count == 1 { 1 } else { 0 };
     };
-    let dxvk = device
-        .CheckMultisampleQualityLevels(DXGI_FORMAT(fmt as i32), sample_count)
+    let caps = device
+        .CheckFormatSupport(DXGI_FORMAT(fmt as i32))
         .unwrap_or(0);
-    // FL11 enforces "render-target format => 4x MSAA quality > 0" and does NOT
-    // exempt the exotic 96-bit R32G32B32 formats the way the spec's MSAA-exempt
-    // list would suggest; a render target reporting 0 fails the adapter with
-    // "MSAA quality reported to be 0" (0x887a0020). For render-target formats,
-    // floor the standard sample counts (1/2/4/8) to at least one quality level
-    // even where venus/NVIDIA doesn't back MSAA on that format (an actual
-    // unsupported MSAA resource create still fails at the format-support layer).
-    let is_rt = matches!(
-        device.CheckFormatSupport(DXGI_FORMAT(fmt as i32)),
-        Ok(c) if c & 0x20 != 0
-    );
-    let val = if is_rt && matches!(sample_count, 1 | 2 | 4 | 8) {
-        dxvk.max(1)
-    } else {
-        dxvk
+    let output_bits = dxgi_msaa_bits_per_sample(fmt as u32, caps);
+    let required = match (sample_count, output_bits) {
+        (1 | 2 | 4 | 16, Some(_)) => true,
+        (8, Some(_)) => true,
+        _ => false,
     };
-    log_line(&format!("MSAA q fmt={fmt} c={sample_count} rt={is_rt} dxvk={dxvk} -> {val}"));
+    let val = if required { 1 } else { 0 };
+    if required || sample_count <= 8 {
+        log_line(&format!(
+            "MSAA q fmt={fmt} c={sample_count} output_bits={output_bits:?} required={required} -> {val}"
+        ));
+    }
     val
 }
 
@@ -4008,7 +5440,11 @@ unsafe extern "C" fn check_multisample_quality_levels(
     out: *mut u32,
 ) {
     if !out.is_null() {
-        *out = helios_multisample_quality_levels(h, fmt, sample_count);
+        let val = helios_multisample_quality_levels(h, fmt, sample_count);
+        *out = val;
+        log_line(&format!(
+            "MSAA out fmt={fmt} c={sample_count} flags=legacy out={out:p} val={val}"
+        ));
     }
 }
 
@@ -4020,7 +5456,11 @@ unsafe extern "C" fn check_multisample_quality_levels_wddm1_3(
     out: *mut u32,
 ) {
     if !out.is_null() {
-        *out = helios_multisample_quality_levels(h, fmt, sample_count);
+        let val = helios_multisample_quality_levels(h, fmt, sample_count);
+        *out = val;
+        log_line(&format!(
+            "MSAA out fmt={fmt} c={sample_count} flags=0x{_flags:x} out={out:p} val={val}"
+        ));
     }
 }
 
@@ -4074,6 +5514,23 @@ unsafe extern "C" fn check_counter(
 // --- Compute ---------------------------------------------------------------
 
 unsafe extern "C" fn dispatch(h: Hdevice, x: u32, y: u32, z: u32) {
+    let n = DISPATCH_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+    if n < 1024 || (n % 1024) == 0 {
+        if let Some(dev) = helios_device(h) {
+            let ia = dev.ia.borrow();
+            log_line(&format!(
+                "DDI Dispatch x={} y={} z={} cs=0x{:x} rt0_alloc=0x{:x} rt0={}x{} fmt={}",
+                x,
+                y,
+                z,
+                ia.current_cs,
+                ia.current_rt0_alloc,
+                ia.current_rt0_width,
+                ia.current_rt0_height,
+                ia.current_rt0_format
+            ));
+        }
+    }
     if let Some(context) = d3d11_context(h) {
         context.Dispatch(x, y, z);
     }
@@ -4084,6 +5541,14 @@ unsafe extern "C" fn dispatch_indirect(
     h_args: ddi::D3D10DDI_HRESOURCE,
     aligned_byte_offset: u32,
 ) {
+    let n = DISPATCH_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+    if n < 1024 || (n % 1024) == 0 {
+        log_line(&format!(
+            "DDI DispatchIndirect args_alloc=0x{:x} offset={}",
+            resource_allocation(h_args.pDrvPrivate),
+            aligned_byte_offset
+        ));
+    }
     let Some(context) = d3d11_context(h) else {
         return;
     };
@@ -4121,21 +5586,74 @@ unsafe extern "C" fn check_format_support(h: Hdevice, fmt: ddi::DXGI_FORMAT, out
             caps = c;
         }
     }
-    // Keep format support coherent with the active feature-level profile.
-    // API D3D11_FORMAT_SUPPORT: MULTISAMPLE_RESOLVE=0x40000,
-    // MULTISAMPLE_RENDERTARGET=0x200000, MULTISAMPLE_LOAD=0x400000.
-    const MSAA_BITS: u32 = 0x0064_0000; // RESOLVE|RENDERTARGET|LOAD
+    let raw_caps = caps;
+    // Keep format support coherent with the active feature-level profile and
+    // D3D11.3 §19.2.5. API D3D11_FORMAT_SUPPORT:
+    // MULTISAMPLE_RESOLVE=0x40000, MULTISAMPLE_RENDERTARGET=0x200000,
+    // MULTISAMPLE_LOAD=0x400000.
+    const MSAA_RESOLVE: u32 = 0x0004_0000;
     const MSAA_RENDERTARGET: u32 = 0x0020_0000;
-    const RENDER_TARGET: u32 = 0x20;
+    const MSAA_LOAD: u32 = 0x0040_0000;
+    const MSAA_BITS: u32 = MSAA_RESOLVE | MSAA_RENDERTARGET | MSAA_LOAD;
+    const DDI_MSAA_RENDERTARGET: u32 = 0x0000_0008;
+    const DDI_MSAA_LOAD: u32 = 0x0000_0010;
+    const VIDEO_BITS: u32 = 0x0800_0000 | 0x1000_0000 | 0x2000_0000 | 0x4000_0000;
+    const TYPELESS_PARENT_TEXTURE_CAPS: u32 = 0x0012_10f0;
+    const TEXTURE1D: u32 = 0x0000_0010;
+    const TEXTURE3D: u32 = 0x0000_0040;
+    const SHADER_SAMPLE: u32 = 0x0000_0200;
+    const SHADER_SAMPLE_COMPARISON: u32 = 0x0000_0400;
+    const MIP_AUTOGEN: u32 = 0x0000_2000;
+    const RENDER_TARGET: u32 = 0x0000_4000;
+    const BLENDABLE: u32 = 0x0000_8000;
+    const DEPTH_STENCIL: u32 = 0x0001_0000;
+    const SHADER_GATHER: u32 = 0x0080_0000;
+    const SHADER_GATHER_COMPARISON: u32 = 0x0400_0000;
     if crate::feature_level_mode() != 1 {
         // FL10.0 profile (and diagnostic mode 2): strip the multisample bits.
         caps &= !MSAA_BITS;
-    } else if caps & RENDER_TARGET != 0 {
-        // FL11: every render-target format supports MSAA (see
-        // check_multisample_quality_levels — it floors render targets to a
-        // valid quality level). Advertise the multisample-render-target bit so
-        // the two stay coherent, even for formats DXVK doesn't natively MSAA.
+    } else if dxgi_msaa_bits_per_sample(fmt as u32, caps).is_some() {
+        // FL11: every output-capable format supports at least 4x MSAA. Expose
+        // the generic multisample bit for those formats; load/resolve are
+        // narrower and follow the §19.2 resource-load/resolve rules.
         caps |= MSAA_RENDERTARGET;
+        // The D3D11 UMD callback uses DDI-format-support low bits even though
+        // our backing query is API-style. Preserve the API-style bits for the
+        // proven path, but also set the DDI MSAA bits the runtime validates
+        // during FL11 device construction.
+        caps |= DDI_MSAA_RENDERTARGET;
+        if caps & DEPTH_STENCIL == 0 {
+            caps |= MSAA_LOAD;
+            caps |= DDI_MSAA_LOAD;
+        }
+        if dxgi_resolve_required(fmt as u32) {
+            caps |= MSAA_RESOLVE;
+        }
+        // Helios does not implement the D3D11 video DDI. DXVK's API-level
+        // CheckFormatSupport marks ordinary sampled/output formats as video
+        // processor inputs/outputs, but the Microsoft runtime validates those
+        // bits as part of the UMD feature contract.
+        caps &= !VIDEO_BITS;
+        if dxgi_color_typeless_parent(fmt as u32) {
+            caps = TYPELESS_PARENT_TEXTURE_CAPS;
+        }
+        if dxgi_integer_typed_format(fmt as u32) {
+            caps &= !(SHADER_SAMPLE
+                | SHADER_SAMPLE_COMPARISON
+                | MIP_AUTOGEN
+                | MSAA_RESOLVE
+                | SHADER_GATHER
+                | SHADER_GATHER_COMPARISON);
+        }
+        // D3D11 requires the 96-bit R32G32B32 typed output formats as ordinary
+        // texture/render-target formats. Vulkan/DXVK under-reports several of
+        // these bits; WARP exposes them and the runtime validates the family as
+        // part of the FL11 construction path before it reaches application code.
+        match fmt as u32 {
+            6 => caps |= TEXTURE1D | TEXTURE3D | MIP_AUTOGEN | RENDER_TARGET | BLENDABLE,
+            7 | 8 => caps |= TEXTURE1D | TEXTURE3D | RENDER_TARGET,
+            _ => {}
+        }
     }
 
     // The Microsoft D3D11 runtime validates some typeless/depth format families
@@ -4176,6 +5694,30 @@ unsafe extern "C" fn check_format_support(h: Hdevice, fmt: ddi::DXGI_FORMAT, out
     ) {
         caps &= !D3D11_FORMAT_SUPPORT_SO_BUFFER;
     }
+    if crate::feature_level_mode() == 1 {
+        match fmt as u32 {
+            // Match WARP's API-visible caps for depth-format families; the
+            // DDI-only MSAA RT bit is re-applied immediately below where
+            // required. DXVK over-reports the read/view siblings here, and the
+            // FL11 constructor rejects that before issuing an MSAA query.
+            19 | 44 => caps = 0x0012_10b0,
+            20 | 40 | 45 | 55 => caps = 0x0033_10b0,
+            21 | 46 => caps = 0x04d2_17b0,
+            22 | 47 => caps = 0x0052_11b0,
+            _ => {}
+        }
+    }
+    if crate::feature_level_mode() == 1 && dxgi_msaa_bits_per_sample(fmt as u32, caps).is_some() {
+        // In the D3D10/11 UMD callback, low bit 0x8 is
+        // D3D10_DDI_FORMAT_SUPPORT_MULTISAMPLE_RENDERTARGET, not API
+        // SO_BUFFER. Re-assert it after the API-style compatibility scrubs
+        // above so FL11's MSAA validation sees a coherent format-support /
+        // quality-level pair, including depth-stencil families.
+        caps |= DDI_MSAA_RENDERTARGET;
+        if caps & DEPTH_STENCIL == 0 {
+            caps |= DDI_MSAA_LOAD;
+        }
+    }
 
     // `DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM` (89) is the one format the WDDM
     // runtime validates specially during device creation: the driver MUST signal
@@ -4192,6 +5734,12 @@ unsafe extern "C" fn check_format_support(h: Hdevice, fmt: ddi::DXGI_FORMAT, out
     const DDI_FORMAT_SUPPORT_NOT_SUPPORTED: u32 = 0x8000_0000;
     if fmt == DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM && caps == 0 {
         caps = DDI_FORMAT_SUPPORT_NOT_SUPPORTED;
+    }
+    if crate::feature_level_mode() == 1 {
+        log_line(&format!(
+            "FormatSupport fmt={fmt} raw=0x{raw_caps:08x} final=0x{caps:08x} output_bits={:?}",
+            dxgi_output_bits_per_sample(fmt as u32, caps)
+        ));
     }
     if !out.is_null() {
         *out = caps;
@@ -4901,8 +6449,7 @@ fn build_layout_signature_blob(registers: &[u32], tokens: &[u8]) -> Vec<u8> {
     blob[36..40].copy_from_slice(&(code_chunk_off as u32).to_le_bytes());
 
     blob[isgn_chunk_off..isgn_chunk_off + 4].copy_from_slice(b"ISGN");
-    blob[isgn_chunk_off + 4..isgn_chunk_off + 8]
-        .copy_from_slice(&(isgn_len as u32).to_le_bytes());
+    blob[isgn_chunk_off + 4..isgn_chunk_off + 8].copy_from_slice(&(isgn_len as u32).to_le_bytes());
     let data = isgn_chunk_off + 8;
     blob[data..data + 4].copy_from_slice(&(entry_count as u32).to_le_bytes());
     blob[data + 4..data + 8].copy_from_slice(&8u32.to_le_bytes());
@@ -5133,10 +6680,10 @@ fn dxgi_vertex_class(format: i32) -> u32 {
 /// Component mask of a DXGI vertex format (for synthesized ISGN entries).
 fn dxgi_vertex_mask(format: i32) -> u32 {
     match format {
-        1..=4 | 9..=14 | 19..=32 => 0xf,          // 4-component families
-        5..=8 => 0x7,                             // R32G32B32
-        15..=18 | 33..=38 | 48..=52 => 0x3,       // 2-component families
-        _ => 0x1,                                 // scalars and the rest
+        1..=4 | 9..=14 | 19..=32 => 0xf,    // 4-component families
+        5..=8 => 0x7,                       // R32G32B32
+        15..=18 | 33..=38 | 48..=52 => 0x3, // 2-component families
+        _ => 0x1,                           // scalars and the rest
     }
 }
 
@@ -5183,7 +6730,11 @@ unsafe fn resolve_vs_input_variant(h: Hdevice, lp: usize, vp: usize) {
                 v
             }
         };
-        if variant != 0 { variant } else { vp }
+        if variant != 0 {
+            variant
+        } else {
+            vp
+        }
     };
 
     if dev.ia.borrow().bound_vs_com == desired {
@@ -5197,9 +6748,7 @@ unsafe fn resolve_vs_input_variant(h: Hdevice, lp: usize, vp: usize) {
     dev.ia.borrow_mut().bound_vs_com = desired;
     let n = SHADER_BIND_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
     if n < 256 {
-        trace_line!(
-            "DDI VS input-class variant bound: vs=0x{vp:x} -> 0x{desired:x}"
-        );
+        trace_line!("DDI VS input-class variant bound: vs=0x{vp:x} -> 0x{desired:x}");
     }
 }
 
@@ -5287,6 +6836,40 @@ unsafe extern "C" fn ia_set_vertex_buffers(
         let p = (*buffers.add(i)).pDrvPrivate;
         bufs.push(load_resource(p).and_then(|r| (*r).cast::<ID3D11Buffer>().ok()));
     }
+    if let Some(dev) = helios_device(h) {
+        let mut ia = dev.ia.borrow_mut();
+        if start == 0 && num != 0 {
+            ia.current_vb0 = bufs
+                .first()
+                .and_then(|b| b.as_ref())
+                .map(|b| b.as_raw() as usize)
+                .unwrap_or(0);
+            ia.current_vb0_stride = if strides.is_null() { 0 } else { *strides };
+            ia.current_vb0_offset = if offsets.is_null() { 0 } else { *offsets };
+        }
+    }
+    let n = IA_BIND_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+    if n < 128 || num == 0 {
+        let first_stride = if num != 0 && !strides.is_null() {
+            *strides
+        } else {
+            0
+        };
+        let first_offset = if num != 0 && !offsets.is_null() {
+            *offsets
+        } else {
+            0
+        };
+        let first_raw = bufs
+            .first()
+            .and_then(|b| b.as_ref())
+            .map(|b| b.as_raw() as usize)
+            .unwrap_or(0);
+        log_line(&format!(
+            "DDI IASetVertexBuffers start={} num={} first=0x{:x} stride={} offset={}",
+            start, num, first_raw, first_stride, first_offset
+        ));
+    }
     context.IASetVertexBuffers(
         start,
         num,
@@ -5306,6 +6889,21 @@ unsafe extern "C" fn ia_set_index_buffer(
         return;
     };
     let buf = load_resource(h_buf.pDrvPrivate).and_then(|r| (*r).cast::<ID3D11Buffer>().ok());
+    if let Some(dev) = helios_device(h) {
+        let mut ia = dev.ia.borrow_mut();
+        ia.current_ib = buf.as_ref().map(|b| b.as_raw() as usize).unwrap_or(0);
+        ia.current_ib_format = format as u32;
+        ia.current_ib_offset = offset;
+    }
+    let n = IA_BIND_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+    if n < 128 {
+        log_line(&format!(
+            "DDI IASetIndexBuffer raw=0x{:x} fmt={} offset={}",
+            buf.as_ref().map(|b| b.as_raw() as usize).unwrap_or(0),
+            format as u32,
+            offset
+        ));
+    }
     context.IASetIndexBuffer(buf.as_ref(), DXGI_FORMAT(format as i32), offset);
 }
 
@@ -5569,10 +7167,17 @@ unsafe fn flip_wait_setup(dev: &crate::device_funcs::HeliosDevice) -> bool {
     arg.Info.__bindgen_anon_1.MonitoredFence.InitialFenceValue = 0;
     let hr = create_cb(dev.h_rt_device, &mut arg);
     if hr < 0 {
-        return disable(&format!("CreateSynchronizationObject2Cb hr=0x{:08x}", hr as u32));
+        return disable(&format!(
+            "CreateSynchronizationObject2Cb hr=0x{:08x}",
+            hr as u32
+        ));
     }
     let h_fence = arg.hSyncObject;
-    let cpu_va = arg.Info.__bindgen_anon_1.MonitoredFence.FenceValueCPUVirtualAddress as usize;
+    let cpu_va = arg
+        .Info
+        .__bindgen_anon_1
+        .MonitoredFence
+        .FenceValueCPUVirtualAddress as usize;
     if h_fence == 0 || cpu_va == 0 {
         return disable("monitored fence returned no handle/CPU VA");
     }
@@ -5741,8 +7346,13 @@ unsafe fn vehicle_present_prepare(
             if n < 16 || n % 512 == 0 {
                 log_line(&format!(
                     "vehicle present FAILED: import resid={} {}x{} fmt={} alloc={} type={} (x{})",
-                    info.resid, info.width, info.height, info.dxgi_format,
-                    info.alloc_size, info.memory_type_index, n + 1
+                    info.resid,
+                    info.width,
+                    info.height,
+                    info.dxgi_format,
+                    info.alloc_size,
+                    info.memory_type_index,
+                    n + 1
                 ));
             }
             return Err(E_FAIL);
@@ -5771,7 +7381,9 @@ unsafe fn vehicle_present_prepare(
             if n < 16 || n % 512 == 0 {
                 log_line(&format!(
                     "vehicle present FAILED: copy rc={} resid={} (x{})",
-                    rc, info.resid, n + 1
+                    rc,
+                    info.resid,
+                    n + 1
                 ));
             }
             return Err(E_FAIL);
@@ -5788,7 +7400,9 @@ unsafe fn vehicle_present_prepare(
     let mut sync_value = 0u64;
     let mut fence_id = 0u32;
     if present_sync_publish_enabled() {
-        sync_value = dev.dxvk.present_sync_publish(backbuffer_raw, 0, kwait_ordered);
+        sync_value = dev
+            .dxvk
+            .present_sync_publish(backbuffer_raw, 0, kwait_ordered);
         if sync_value != 0 {
             fence_id = dev.dxvk.present_sync_fence_id();
         }
@@ -5807,6 +7421,318 @@ unsafe fn dxgi_device_handle(h: ddi::DXGI_DDI_HDEVICE) -> Hdevice {
 unsafe fn dxgi_resource_handle(h: ddi::DXGI_DDI_HRESOURCE) -> ddi::D3D10DDI_HRESOURCE {
     ddi::D3D10DDI_HRESOURCE {
         pDrvPrivate: h as *mut c_void,
+    }
+}
+
+unsafe fn maybe_log_present_readback(h: Hdevice, src_h: ddi::D3D10DDI_HRESOURCE) {
+    if std::env::var_os("HELIOS_PRESENT_READBACK").is_none() {
+        return;
+    }
+    let n = PRESENT_READBACK_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+    if n >= 8 {
+        return;
+    }
+    let Some(device) = d3d11_device(h) else {
+        log_line("DXGI Present readback: no D3D11 device");
+        return;
+    };
+    let Some(context) = d3d11_context(h) else {
+        log_line("DXGI Present readback: no D3D11 context");
+        return;
+    };
+    let Some(res) = load_resource(src_h.pDrvPrivate) else {
+        log_line("DXGI Present readback: source resource missing");
+        return;
+    };
+    let Ok(tex) = (*res).cast::<ID3D11Texture2D>() else {
+        log_line("DXGI Present readback: source is not Texture2D");
+        return;
+    };
+    let mut desc = D3D11_TEXTURE2D_DESC::default();
+    tex.GetDesc(&mut desc);
+    if desc.Width == 0 || desc.Height == 0 || desc.SampleDesc.Count != 1 {
+        log_line(&format!(
+            "DXGI Present readback: unsupported {}x{} fmt={} sample={}x{}",
+            desc.Width, desc.Height, desc.Format.0, desc.SampleDesc.Count, desc.SampleDesc.Quality
+        ));
+        return;
+    }
+
+    let mut staging_desc = desc;
+    staging_desc.MipLevels = 1;
+    staging_desc.ArraySize = 1;
+    staging_desc.Usage = D3D11_USAGE_STAGING;
+    staging_desc.BindFlags = 0;
+    staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
+    staging_desc.MiscFlags = 0;
+    let mut staging: Option<ID3D11Texture2D> = None;
+    if let Err(e) = device.CreateTexture2D(&staging_desc, None, Some(&mut staging)) {
+        log_line(&format!(
+            "DXGI Present readback: staging create failed {e:?}"
+        ));
+        return;
+    }
+    let Some(staging) = staging else {
+        log_line("DXGI Present readback: staging create returned None");
+        return;
+    };
+    let Ok(staging_res) = staging.cast::<ID3D11Resource>() else {
+        log_line("DXGI Present readback: staging cast failed");
+        return;
+    };
+    context.CopyResource(&staging_res, &*res);
+
+    let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+    if let Err(e) = context.Map(&staging_res, 0, D3D11_MAP_READ, 0, Some(&mut mapped)) {
+        log_line(&format!("DXGI Present readback: map failed {e:?}"));
+        return;
+    }
+    let bpp = dxgi_bytes_per_pixel(desc.Format.0 as u32).max(1) as usize;
+    let row_pitch = mapped.RowPitch as usize;
+    let data = mapped.pData as *const u8;
+    let mut sum: u64 = 0;
+    let mut nonzero = 0u32;
+    for y in 0..4u32 {
+        for x in 0..4u32 {
+            let sx = ((desc.Width - 1) as u64 * x as u64 / 3) as usize;
+            let sy = ((desc.Height - 1) as u64 * y as u64 / 3) as usize;
+            let p = data.add(sy * row_pitch + sx * bpp);
+            let mut px = 0u32;
+            for c in 0..bpp.min(4) {
+                let v = *p.add(c) as u32;
+                px |= v << (c * 8);
+                sum += v as u64;
+            }
+            if px != 0 {
+                nonzero += 1;
+            }
+        }
+    }
+    let cx = (desc.Width / 2) as usize;
+    let cy = (desc.Height / 2) as usize;
+    let cp = data.add(cy * row_pitch + cx * bpp);
+    let mut center = 0u32;
+    for c in 0..bpp.min(4) {
+        center |= (*cp.add(c) as u32) << (c * 8);
+    }
+    let mut frame_sum: u64 = 0;
+    let mut frame_nonzero = 0u64;
+    if std::env::var_os("HELIOS_PRESENT_DUMP_DIR").is_some() {
+        for y in 0..desc.Height as usize {
+            for x in 0..desc.Width as usize {
+                let p = data.add(y * row_pitch + x * bpp);
+                let mut px = 0u32;
+                for c in 0..bpp.min(4) {
+                    let v = *p.add(c) as u32;
+                    px |= v << (c * 8);
+                    frame_sum = frame_sum.wrapping_add(v as u64);
+                }
+                if px != 0 {
+                    frame_nonzero += 1;
+                }
+            }
+        }
+        if bpp >= 4 {
+            if let Some(dir) = std::env::var_os("HELIOS_PRESENT_DUMP_DIR") {
+                let _ = std::fs::create_dir_all(&dir);
+                let pid = std::process::id();
+                let path = std::path::PathBuf::from(dir).join(format!(
+                    "present-{pid}-{:03}-{}x{}-fmt{}.bmp",
+                    n + 1,
+                    desc.Width,
+                    desc.Height,
+                    desc.Format.0
+                ));
+                if let Err(e) = write_bgra32_bmp(&path, data, row_pitch, desc.Width, desc.Height) {
+                    log_line(&format!("DXGI Present readback dump failed: {e}"));
+                } else {
+                    log_line(&format!("DXGI Present readback dump: {}", path.display()));
+                }
+            }
+        } else {
+            log_line(&format!(
+                "DXGI Present readback dump skipped: bpp={} unsupported",
+                bpp
+            ));
+        }
+    }
+    context.Unmap(&staging_res, 0);
+    log_line(&format!(
+        "DXGI Present readback #{}: {}x{} fmt={} bpp={} grid_sum={} nonzero={} center=0x{:08x} frame_sum={} frame_nonzero={}",
+        n + 1,
+        desc.Width,
+        desc.Height,
+        desc.Format.0,
+        bpp,
+        sum,
+        nonzero,
+        center,
+        frame_sum,
+        frame_nonzero
+    ));
+}
+
+unsafe fn write_bgra32_bmp(
+    path: &std::path::Path,
+    data: *const u8,
+    row_pitch: usize,
+    width: u32,
+    height: u32,
+) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let row_bytes = width as usize * 4;
+    let image_size = row_bytes * height as usize;
+    let file_size = 14usize + 40usize + image_size;
+
+    let mut file = std::fs::File::create(path)?;
+    file.write_all(b"BM")?;
+    file.write_all(&(file_size as u32).to_le_bytes())?;
+    file.write_all(&0u16.to_le_bytes())?;
+    file.write_all(&0u16.to_le_bytes())?;
+    file.write_all(&54u32.to_le_bytes())?;
+
+    file.write_all(&40u32.to_le_bytes())?;
+    file.write_all(&(width as i32).to_le_bytes())?;
+    // Negative height stores top-down rows, matching D3D's mapped row order.
+    file.write_all(&(-(height as i32)).to_le_bytes())?;
+    file.write_all(&1u16.to_le_bytes())?;
+    file.write_all(&32u16.to_le_bytes())?;
+    file.write_all(&0u32.to_le_bytes())?;
+    file.write_all(&(image_size as u32).to_le_bytes())?;
+    file.write_all(&2835i32.to_le_bytes())?;
+    file.write_all(&2835i32.to_le_bytes())?;
+    file.write_all(&0u32.to_le_bytes())?;
+    file.write_all(&0u32.to_le_bytes())?;
+
+    for y in 0..height as usize {
+        let row = std::slice::from_raw_parts(data.add(y * row_pitch), row_bytes);
+        file.write_all(row)?;
+    }
+
+    Ok(())
+}
+
+unsafe fn maybe_force_present_alpha_opaque(h: Hdevice, src_h: ddi::D3D10DDI_HRESOURCE) {
+    if std::env::var_os("HELIOS_PRESENT_FORCE_OPAQUE").is_none() {
+        return;
+    }
+
+    let n = PRESENT_FORCE_OPAQUE_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+    let Some(device) = d3d11_device(h) else {
+        if n < 8 {
+            log_line("DXGI Present force-opaque: no D3D11 device");
+        }
+        return;
+    };
+    let Some(context) = d3d11_context(h) else {
+        if n < 8 {
+            log_line("DXGI Present force-opaque: no D3D11 context");
+        }
+        return;
+    };
+    let Some(res) = load_resource(src_h.pDrvPrivate) else {
+        if n < 8 {
+            log_line("DXGI Present force-opaque: source resource missing");
+        }
+        return;
+    };
+    let Ok(tex) = (*res).cast::<ID3D11Texture2D>() else {
+        if n < 8 {
+            log_line("DXGI Present force-opaque: source is not Texture2D");
+        }
+        return;
+    };
+
+    let mut desc = D3D11_TEXTURE2D_DESC::default();
+    tex.GetDesc(&mut desc);
+    let bpp = dxgi_bytes_per_pixel(desc.Format.0 as u32);
+    if desc.Width == 0 || desc.Height == 0 || desc.SampleDesc.Count != 1 || bpp != 4 {
+        if n < 8 {
+            log_line(&format!(
+                "DXGI Present force-opaque: unsupported {}x{} fmt={} bpp={} sample={}x{}",
+                desc.Width,
+                desc.Height,
+                desc.Format.0,
+                bpp,
+                desc.SampleDesc.Count,
+                desc.SampleDesc.Quality
+            ));
+        }
+        return;
+    }
+
+    let mut staging_desc = desc;
+    staging_desc.MipLevels = 1;
+    staging_desc.ArraySize = 1;
+    staging_desc.Usage = D3D11_USAGE_STAGING;
+    staging_desc.BindFlags = 0;
+    staging_desc.CPUAccessFlags = (D3D11_CPU_ACCESS_READ.0 | D3D11_CPU_ACCESS_WRITE.0) as u32;
+    staging_desc.MiscFlags = 0;
+
+    let mut staging: Option<ID3D11Texture2D> = None;
+    if let Err(e) = device.CreateTexture2D(&staging_desc, None, Some(&mut staging)) {
+        if n < 8 {
+            log_line(&format!(
+                "DXGI Present force-opaque: staging create failed {e:?}"
+            ));
+        }
+        return;
+    }
+    let Some(staging) = staging else {
+        if n < 8 {
+            log_line("DXGI Present force-opaque: staging create returned None");
+        }
+        return;
+    };
+    let Ok(staging_res) = staging.cast::<ID3D11Resource>() else {
+        if n < 8 {
+            log_line("DXGI Present force-opaque: staging cast failed");
+        }
+        return;
+    };
+
+    context.CopyResource(&staging_res, &*res);
+
+    let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+    if let Err(e) = context.Map(&staging_res, 0, D3D11_MAP_READ_WRITE, 0, Some(&mut mapped)) {
+        if n < 8 {
+            log_line(&format!("DXGI Present force-opaque: map failed {e:?}"));
+        }
+        return;
+    }
+
+    let row_pitch = mapped.RowPitch as usize;
+    let data = mapped.pData as *mut u8;
+    let mut alpha_zero = 0u64;
+    let mut alpha_non_opaque = 0u64;
+    for y in 0..desc.Height as usize {
+        for x in 0..desc.Width as usize {
+            let alpha = data.add(y * row_pitch + x * 4 + 3);
+            let old = *alpha;
+            if old == 0 {
+                alpha_zero += 1;
+            }
+            if old != 0xff {
+                alpha_non_opaque += 1;
+                *alpha = 0xff;
+            }
+        }
+    }
+    context.Unmap(&staging_res, 0);
+    context.CopyResource(&*res, &staging_res);
+    context.Flush();
+
+    if n < 8 || (n + 1) % 512 == 0 {
+        log_line(&format!(
+            "DXGI Present force-opaque #{}: {}x{} fmt={} alpha_zero={} alpha_non_opaque={}",
+            n + 1,
+            desc.Width,
+            desc.Height,
+            desc.Format.0,
+            alpha_zero,
+            alpha_non_opaque
+        ));
     }
 }
 
@@ -5888,6 +7814,9 @@ unsafe extern "C" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT) -> i32 {
         return E_FAIL;
     }
 
+    maybe_force_present_alpha_opaque(h, src_h);
+    maybe_log_present_readback(h, src_h);
+
     // Frame-completion gate BEFORE the kernel flip becomes visible: dwm's
     // venus rendering produces no dxgkrnl-visible DMA fences, so nothing else
     // orders the IddCx consumer's per-acquire copy against in-flight GPU
@@ -5923,8 +7852,9 @@ unsafe extern "C" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT) -> i32 {
                     warg.ObjectHandleArray = handles.as_ptr();
                     warg.__bindgen_anon_1.MonitoredFenceValueArray = values.as_ptr();
                     // Checked present in flip_wait_setup.
-                    let wait_cb =
-                        (*dev.kt_callbacks).pfnWaitForSynchronizationObjectFromGpuCb.unwrap();
+                    let wait_cb = (*dev.kt_callbacks)
+                        .pfnWaitForSynchronizationObjectFromGpuCb
+                        .unwrap();
                     let hr = wait_cb(dev.h_rt_device, &warg);
                     if hr >= 0 {
                         EXT_KWAIT_ARMED.fetch_add(1, Ordering::Relaxed);
@@ -5981,7 +7911,11 @@ unsafe extern "C" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT) -> i32 {
                 cb.BroadcastContextCount = 0;
                 cb.PrivateDriverDataSize = 0;
                 cb.pPrivateDriverData = core::ptr::null_mut();
-                cb.bOptimizeForComposition = 0;
+                cb.bOptimizeForComposition = if env_flag("HELIOS_PRESENT_OPTIMIZE_COMPOSITION") {
+                    1
+                } else {
+                    0
+                };
                 present_hr = present_cb(dev.h_rt_device, &mut cb);
             } else {
                 log_line("DXGI Present: pfnPresentCb missing");
@@ -6002,8 +7936,8 @@ unsafe extern "C" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT) -> i32 {
         // The recycle-gate result: only a minted present with a live publish
         // carries one — otherwise leave None so the ICD's consume MISSES and
         // it falls back to the serial wait.
-        let result = (vehicle_fence_id != 0 && sync_value != 0)
-            .then_some((vehicle_fence_id, sync_value));
+        let result =
+            (vehicle_fence_id != 0 && sync_value != 0).then_some((vehicle_fence_id, sync_value));
         let prev = PRESENT_RESULT.with(|c| c.replace(result));
         if prev.is_some() {
             let n = EXT_RESULT_OVERWRITES.fetch_add(1, Ordering::Relaxed);
@@ -6037,25 +7971,28 @@ unsafe extern "C" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT) -> i32 {
     // a per-process present ordinal so cycles can be told apart.
     static PRESENT_ORDINAL: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
     let ordinal = PRESENT_ORDINAL.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    trace_line!(
-        "DXGI Present: #{} src=0x{:x} dst=0x{:x} copied={} flags=0x{:x} presentCb=0x{:08x} \
-         hSurf={:p} srcSub={} hDstRes={:p} dstSub={} flipInterval={} dxgiCtx={:p} hContext={:p} \
-         syncVal={}",
-        ordinal,
-        src_alloc,
-        dst_alloc,
-        copied,
-        *(&a.Flags as *const ddi::DXGI_DDI_PRESENT_FLAGS as *const u32),
-        present_hr as u32,
-        src_h.pDrvPrivate,
-        a.SrcSubResourceIndex,
-        dst_h.pDrvPrivate,
-        a.DstSubResourceIndex,
-        a.FlipInterval,
-        a.pDXGIContext,
-        dev_context_for_log(h),
-        sync_value
-    );
+    if ordinal < 64 || (ordinal + 1) % 512 == 0 {
+        log_line(&format!(
+            "DXGI Present: #{} src=0x{:x} dst=0x{:x} copied={} flags=0x{:x} opt_comp={} presentCb=0x{:08x} \
+             hSurf={:p} srcSub={} hDstRes={:p} dstSub={} flipInterval={} dxgiCtx={:p} hContext={:p} \
+             syncVal={}",
+            ordinal,
+            src_alloc,
+            dst_alloc,
+            copied,
+            *(&a.Flags as *const ddi::DXGI_DDI_PRESENT_FLAGS as *const u32),
+            env_flag("HELIOS_PRESENT_OPTIMIZE_COMPOSITION") as u32,
+            present_hr as u32,
+            src_h.pDrvPrivate,
+            a.SrcSubResourceIndex,
+            dst_h.pDrvPrivate,
+            a.DstSubResourceIndex,
+            a.FlipInterval,
+            a.pDXGIContext,
+            dev_context_for_log(h),
+            sync_value
+        ));
+    }
     present_hr
 }
 
@@ -6196,6 +8133,12 @@ unsafe extern "C" fn dxgi_rotate_resource_identities(
 }
 
 static ROTATE_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
+static BLT1_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
+static RESIDENCY_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
+static MPO_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
+static PRESENT1_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
+static DXGI13_RESERVED_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
+const DXGI_MPO_MAX_PLANES: u32 = 16;
 
 unsafe extern "C" fn dxgi_blt(arg: *mut ddi::DXGI_DDI_ARG_BLT) -> i32 {
     if arg.is_null() {
@@ -6235,6 +8178,480 @@ unsafe extern "C" fn dxgi_blt(arg: *mut ddi::DXGI_DDI_ARG_BLT) -> i32 {
     0
 }
 
+unsafe extern "C" fn dxgi_blt1(arg: *mut ddi::DXGI_DDI_ARG_BLT1) -> i32 {
+    if arg.is_null() {
+        return 0;
+    }
+    let a = &*arg;
+    let Some(context) = d3d11_context(dxgi_device_handle(a.hDevice)) else {
+        return 0;
+    };
+    let dst_h = dxgi_resource_handle(a.hDstResource);
+    let src_h = dxgi_resource_handle(a.hSrcResource);
+    let (Some(dst), Some(src)) = (
+        load_resource(dst_h.pDrvPrivate),
+        load_resource(src_h.pDrvPrivate),
+    ) else {
+        log_line(&format!(
+            "DXGI Blt1: missing resource dst=0x{:x} src=0x{:x}",
+            a.hDstResource, a.hSrcResource
+        ));
+        return E_INVALIDARG;
+    };
+
+    const BLT_RESOLVE: u32 = 0x1;
+    const BLT_CONVERT: u32 = 0x2;
+    const BLT_STRETCH: u32 = 0x4;
+    let flags = a.Flags.__bindgen_anon_1.Value;
+    if flags & BLT_CONVERT != 0 {
+        log_line(&format!("DXGI Blt1: convert unsupported flags=0x{flags:x}"));
+        return DXGI_ERROR_UNSUPPORTED;
+    }
+
+    let src_w = a.SrcRight.saturating_sub(a.SrcLeft);
+    let src_h_px = a.SrcBottom.saturating_sub(a.SrcTop);
+    let dst_w = a.DstRight.saturating_sub(a.DstLeft);
+    let dst_h_px = a.DstBottom.saturating_sub(a.DstTop);
+
+    if flags & BLT_RESOLVE != 0 {
+        let format = resource_dxgi_format(dst_h.pDrvPrivate);
+        if format.0 == 0 {
+            log_line("DXGI Blt1: resolve has unknown destination format");
+            return E_INVALIDARG;
+        }
+        context.ResolveSubresource(&*dst, a.DstSubresource, &*src, a.SrcSubresource, format);
+        context.Flush();
+        return 0;
+    }
+
+    if flags & BLT_STRETCH != 0
+        || (src_w != 0 && dst_w != 0 && (src_w != dst_w || src_h_px != dst_h_px))
+    {
+        log_line(&format!(
+            "DXGI Blt1: stretch unsupported src={}x{} dst={}x{} flags=0x{flags:x}",
+            src_w, src_h_px, dst_w, dst_h_px
+        ));
+        return DXGI_ERROR_UNSUPPORTED;
+    }
+
+    let bx;
+    let bx_ptr = if a.SrcRight > a.SrcLeft && a.SrcBottom > a.SrcTop {
+        bx = D3D11_BOX {
+            left: a.SrcLeft,
+            top: a.SrcTop,
+            front: 0,
+            right: a.SrcRight,
+            bottom: a.SrcBottom,
+            back: 1,
+        };
+        Some(&bx as *const D3D11_BOX)
+    } else {
+        None
+    };
+
+    let n = BLT1_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+    if n < 32 {
+        trace_line!(
+            "DXGI Blt1: copy src={}x{} dst={}x{} flags=0x{flags:x}",
+            src_w,
+            src_h_px,
+            dst_w,
+            dst_h_px
+        );
+    }
+
+    context.CopySubresourceRegion(
+        &*dst,
+        a.DstSubresource,
+        a.DstLeft,
+        a.DstTop,
+        0,
+        &*src,
+        a.SrcSubresource,
+        bx_ptr,
+    );
+    context.Flush();
+    0
+}
+
+unsafe extern "C" fn dxgi_offer_resources(arg: *mut ddi::DXGI_DDI_ARG_OFFERRESOURCES) -> i32 {
+    if arg.is_null() {
+        return 0;
+    }
+    let a = &*arg;
+    let n = RESIDENCY_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+    if n < 32 {
+        log_line(&format!(
+            "DXGI OfferResources: resources={} priority={} (kept resident)",
+            a.Resources, a.Priority
+        ));
+    }
+    0
+}
+
+unsafe extern "C" fn dxgi_reclaim_resources(arg: *mut ddi::DXGI_DDI_ARG_RECLAIMRESOURCES) -> i32 {
+    if arg.is_null() {
+        return 0;
+    }
+    let a = &*arg;
+    if !a.pDiscarded.is_null() {
+        for i in 0..a.Resources as usize {
+            *a.pDiscarded.add(i) = 0;
+        }
+    }
+    let n = RESIDENCY_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+    if n < 32 {
+        log_line(&format!(
+            "DXGI ReclaimResources: resources={} discarded=FALSE",
+            a.Resources
+        ));
+    }
+    0
+}
+
+unsafe extern "C" fn dxgi_get_mpo_caps(
+    arg: *mut ddi::DXGI_DDI_ARG_GETMULTIPLANEOVERLAYCAPS,
+) -> i32 {
+    if arg.is_null() {
+        return 0;
+    }
+    let a = &mut *arg;
+    a.MultiplaneOverlayCaps = ddi::DXGI_DDI_MULTIPLANE_OVERLAY_CAPS {
+        MaxPlanes: DXGI_MPO_MAX_PLANES,
+        NumCapabilityGroups: 1,
+    };
+    let n = MPO_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+    if n < 16 {
+        log_line(&format!(
+            "DXGI GetMultiplaneOverlayCaps: MaxPlanes={} groups=1",
+            DXGI_MPO_MAX_PLANES
+        ));
+    }
+    0
+}
+
+unsafe extern "C" fn dxgi_get_mpo_group_caps(
+    arg: *mut ddi::DXGI_DDI_ARG_GETMULTIPLANEOVERLAYGROUPCAPS,
+) -> i32 {
+    if arg.is_null() {
+        return 0;
+    }
+    let a = &mut *arg;
+    const RGB: u32 =
+        ddi::DXGI_DDI_MULTIPLANE_OVERLAY_FEATURE_CAPS_DXGI_DDI_MULTIPLANE_OVERLAY_FEATURE_CAPS_RGB
+            as u32;
+    const BILINEAR: u32 = ddi::DXGI_DDI_MULTIPLANE_OVERLAY_FEATURE_CAPS_DXGI_DDI_MULTIPLANE_OVERLAY_FEATURE_CAPS_BILINEAR_FILTER
+        as u32;
+    const SHARED: u32 =
+        ddi::DXGI_DDI_MULTIPLANE_OVERLAY_FEATURE_CAPS_DXGI_DDI_MULTIPLANE_OVERLAY_FEATURE_CAPS_SHARED
+            as u32;
+    const IMMEDIATE: u32 = ddi::DXGI_DDI_MULTIPLANE_OVERLAY_FEATURE_CAPS_DXGI_DDI_MULTIPLANE_OVERLAY_FEATURE_CAPS_IMMEDIATE
+        as u32;
+    a.MultiplaneOverlayGroupCaps = if a.GroupIndex == 0 {
+        ddi::DXGI_DDI_MULTIPLANE_OVERLAY_GROUP_CAPS {
+            NumPlanes: DXGI_MPO_MAX_PLANES,
+            MaxStretchFactor: 16.0,
+            MaxShrinkFactor: 16.0,
+            OverlayCaps: RGB | BILINEAR | SHARED | IMMEDIATE,
+            StereoCaps: 0,
+        }
+    } else {
+        ddi::DXGI_DDI_MULTIPLANE_OVERLAY_GROUP_CAPS::default()
+    };
+    let n = MPO_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+    if n < 16 {
+        log_line(&format!(
+            "DXGI GetMultiplaneOverlayGroupCaps: group={} planes={} caps=0x{:x}",
+            a.GroupIndex,
+            a.MultiplaneOverlayGroupCaps.NumPlanes,
+            a.MultiplaneOverlayGroupCaps.OverlayCaps
+        ));
+    }
+    0
+}
+
+unsafe extern "C" fn dxgi_present_mpo(arg: *mut ddi::DXGI_DDI_ARG_PRESENTMULTIPLANEOVERLAY) -> i32 {
+    if arg.is_null() {
+        return E_INVALIDARG;
+    }
+    let a = &*arg;
+    if a.PresentPlaneCount == 0 || a.pPresentPlanes.is_null() {
+        log_line("DXGI PresentMultiplaneOverlay: no present planes");
+        return E_INVALIDARG;
+    }
+    if a.PresentPlaneCount > DXGI_MPO_MAX_PLANES {
+        log_line(&format!(
+            "DXGI PresentMultiplaneOverlay: too many planes {}",
+            a.PresentPlaneCount
+        ));
+        return E_INVALIDARG;
+    }
+
+    let h = dxgi_device_handle(a.hDevice);
+    let Some(dev) = helios_device(h) else {
+        return E_INVALIDARG;
+    };
+    if dev.dxgi_callbacks.is_null() || dev.h_context.is_null() {
+        log_line("DXGI PresentMultiplaneOverlay: no DXGI callbacks/context");
+        return DXGI_ERROR_UNSUPPORTED;
+    }
+    let Some(present_cb) = (*dev.dxgi_callbacks).pfnPresentMultiplaneOverlayCb else {
+        log_line("DXGI PresentMultiplaneOverlay: pfnPresentMultiplaneOverlayCb missing");
+        return DXGI_ERROR_UNSUPPORTED;
+    };
+
+    let mut cb = ddi::DXGIDDICB_PRESENT_MULTIPLANE_OVERLAY::default();
+    cb.pDXGIContext = a.pDXGIContext;
+    cb.hContext = dev.h_context;
+    cb.BroadcastContextCount = 0;
+
+    for i in 0..a.PresentPlaneCount as usize {
+        let plane = &*a.pPresentPlanes.add(i);
+        let attrs = &plane.PlaneAttributes;
+        let n = MPO_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+        if n < 128 {
+            trace_line!(
+                "DXGI MPO plane {}: enabled={} hRes=0x{:x} sub={} flags=0x{:x} \
+                 src=({},{}-{}, {}) dst=({},{}-{}, {}) clip=({},{}-{}, {}) rot={} blend={} \
+                 dirty={} ycbcr=0x{:x} stretch={}",
+                i,
+                plane.Enabled,
+                plane.hResource,
+                plane.SubResourceIndex,
+                attrs.Flags,
+                attrs.SrcRect.left,
+                attrs.SrcRect.top,
+                attrs.SrcRect.right,
+                attrs.SrcRect.bottom,
+                attrs.DstRect.left,
+                attrs.DstRect.top,
+                attrs.DstRect.right,
+                attrs.DstRect.bottom,
+                attrs.ClipRect.left,
+                attrs.ClipRect.top,
+                attrs.ClipRect.right,
+                attrs.ClipRect.bottom,
+                attrs.Rotation,
+                attrs.Blend,
+                attrs.DirtyRectCount,
+                attrs.YCbCrFlags,
+                attrs.StretchQuality
+            );
+        }
+        if plane.Enabled == 0 {
+            continue;
+        }
+        if cb.AllocationInfoCount as usize >= cb.AllocationInfo.len() {
+            return E_INVALIDARG;
+        }
+        let resource = dxgi_resource_handle(plane.hResource);
+        let alloc = resource_allocation(resource.pDrvPrivate);
+        if alloc == 0 {
+            log_line(&format!(
+                "DXGI PresentMultiplaneOverlay: plane {} has no allocation hResource=0x{:x}",
+                i, plane.hResource
+            ));
+            return E_INVALIDARG;
+        }
+        let slot = cb.AllocationInfoCount as usize;
+        cb.AllocationInfo[slot].PresentAllocation = alloc;
+        cb.AllocationInfo[slot].SubResourceIndex = plane.SubResourceIndex;
+        let n = MPO_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+        if n < 128 {
+            trace_line!(
+                "DXGI MPO plane {} -> allocation=0x{:x} slot={}",
+                i,
+                alloc,
+                slot
+            );
+        }
+        cb.AllocationInfoCount += 1;
+    }
+
+    if cb.AllocationInfoCount == 0 {
+        log_line("DXGI PresentMultiplaneOverlay: no enabled planes");
+        return E_INVALIDARG;
+    }
+
+    if let Some(context) = d3d11_context(h) {
+        context.Flush();
+    }
+
+    let hr = present_cb(dev.h_rt_device, &cb);
+    let n = MPO_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+    if n < 64 {
+        trace_line!(
+            "DXGI PresentMultiplaneOverlay: planes={} enabled={} presentCb=0x{:08x} ctx={:p}",
+            a.PresentPlaneCount,
+            cb.AllocationInfoCount,
+            hr as u32,
+            dev.h_context
+        );
+    }
+    hr
+}
+
+unsafe extern "C" fn dxgi_reserved_unsupported(_arg: *mut c_void) -> i32 {
+    let n = DXGI13_RESERVED_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+    if n < 16 {
+        log_line("DXGI reserved callback -> DXGI_ERROR_UNSUPPORTED");
+    }
+    DXGI_ERROR_UNSUPPORTED
+}
+
+unsafe extern "C" fn dxgi_present1(arg: *mut ddi::DXGI_DDI_ARG_PRESENT1) -> i32 {
+    if arg.is_null() {
+        return E_INVALIDARG;
+    }
+    let a = &*arg;
+    if a.SurfacesToPresent == 0 || a.phSurfacesToPresent.is_null() {
+        log_line("DXGI Present1: no source surfaces");
+        return E_INVALIDARG;
+    }
+
+    if a.SurfacesToPresent == 1 {
+        let source = *a.phSurfacesToPresent;
+        let mut present = ddi::DXGI_DDI_ARG_PRESENT {
+            hDevice: a.hDevice,
+            hSurfaceToPresent: source.hSurface,
+            SrcSubResourceIndex: source.SubResourceIndex,
+            hDstResource: a.hDstResource,
+            DstSubResourceIndex: a.DstSubResourceIndex,
+            pDXGIContext: a.pDXGIContext,
+            Flags: a.Flags,
+            FlipInterval: a.FlipInterval,
+        };
+        return dxgi_present(&mut present);
+    }
+
+    // WDDM 1.3 Present1's surface array is not an old single-source Present.
+    // Earlier entries are part of the DXGI display/release list; the documented
+    // callback contract for a many-resource present is specifically to translate
+    // only the last source handle into DXGIDDICB_PRESENT. Dirty rects are hints
+    // and must never be a failure reason.
+    let source_index = a.SurfacesToPresent as usize - 1;
+    let source = *a.phSurfacesToPresent.add(source_index);
+    let h = dxgi_device_handle(a.hDevice);
+    let src_h = dxgi_resource_handle(source.hSurface);
+    let dst_h = dxgi_resource_handle(a.hDstResource);
+    let src_alloc = resource_allocation(src_h.pDrvPrivate);
+    let dst_alloc = resource_allocation(dst_h.pDrvPrivate);
+    let n = PRESENT1_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+    if n < 64 {
+        trace_line!(
+            "DXGI Present1 multi: surfaces={} callback_src={} src={:p}/{} alloc=0x{:x} \
+             dst={:p}/{} dstAlloc=0x{:x} dirty={} multiplicity={} flags=0x{:x}",
+            a.SurfacesToPresent,
+            source_index,
+            source.hSurface as *mut c_void,
+            source.SubResourceIndex,
+            src_alloc,
+            a.hDstResource as *mut c_void,
+            a.DstSubResourceIndex,
+            dst_alloc,
+            a.DirtyRects,
+            a.BackBufferMultiplicity,
+            *(&a.Flags as *const ddi::DXGI_DDI_PRESENT_FLAGS as *const u32),
+        );
+    }
+
+    if src_alloc == 0 {
+        log_line(&format!(
+            "DXGI Present1 multi: callback source has no allocation hResource=0x{:x}",
+            source.hSurface
+        ));
+        return E_INVALIDARG;
+    }
+
+    if let Some(context) = d3d11_context(h) {
+        context.Flush();
+    }
+
+    let mut sync_value = 0;
+    if present_sync_publish_enabled() {
+        if let Some(dev) = helios_device(h) {
+            sync_value = dev.dxvk.present_sync_publish(
+                resource_com_raw(src_h.pDrvPrivate),
+                resource_com_raw(dst_h.pDrvPrivate),
+                false,
+            );
+        }
+    }
+
+    let gate_us = present_gate_us();
+    if gate_us != 0 {
+        if let Some(dev) = helios_device(h) {
+            dev.dxvk.present_frame_gate(gate_us);
+        }
+    }
+
+    let mut present_hr = E_INVALIDARG;
+    if let Some(dev) = helios_device(h) {
+        if dev.dxgi_callbacks.is_null() || dev.h_context.is_null() {
+            log_line(&format!(
+                "DXGI Present1 multi: missing callback table/context callbacks={} hContext={:p}",
+                dev.dxgi_callbacks.is_null(),
+                dev.h_context
+            ));
+            return DXGI_ERROR_UNSUPPORTED;
+        }
+        if let Some(present_cb) = (*dev.dxgi_callbacks).pfnPresentCb {
+            let mut cb = ddi::DXGIDDICB_PRESENT::default();
+            cb.hSrcAllocation = src_alloc;
+            cb.hDstAllocation = dst_alloc;
+            cb.pDXGIContext = a.pDXGIContext;
+            cb.hContext = dev.h_context;
+            cb.BroadcastContextCount = 0;
+            cb.PrivateDriverDataSize = 0;
+            cb.pPrivateDriverData = core::ptr::null_mut();
+            cb.bOptimizeForComposition = if env_flag("HELIOS_PRESENT_OPTIMIZE_COMPOSITION") {
+                1
+            } else {
+                0
+            };
+            present_hr = present_cb(dev.h_rt_device, &mut cb);
+        } else {
+            log_line("DXGI Present1 multi: pfnPresentCb missing");
+            return DXGI_ERROR_UNSUPPORTED;
+        }
+    }
+
+    let n = PRESENT1_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+    if n < 64 {
+        trace_line!(
+            "DXGI Present1 multi: presentCb=0x{:08x} srcAlloc=0x{:x} dstAlloc=0x{:x} opt_comp={} \
+             dxgiCtx={:p} hContext={:p} syncVal={}",
+            present_hr as u32,
+            src_alloc,
+            dst_alloc,
+            env_flag("HELIOS_PRESENT_OPTIMIZE_COMPOSITION") as u32,
+            a.pDXGIContext,
+            dev_context_for_log(h),
+            sync_value
+        );
+    }
+    present_hr
+}
+
+unsafe extern "C" fn dxgi_check_present_duration_support(
+    arg: *mut ddi::DXGI_DDI_ARG_CHECKPRESENTDURATIONSUPPORT,
+) -> i32 {
+    if arg.is_null() {
+        return 0;
+    }
+    let a = &mut *arg;
+    a.ClosestSmallerDuration = 0;
+    a.ClosestLargerDuration = 0;
+    let n = PRESENT1_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+    if n < 16 {
+        log_line(&format!(
+            "DXGI CheckPresentDurationSupport: desired={} smaller=0 larger=0",
+            a.DesiredPresentDuration
+        ));
+    }
+    0
+}
+
 /// Install typed DXGI base-DDI handlers over the stub fill.
 pub unsafe fn install_dxgi(funcs: *mut ddi::DXGI_DDI_BASE_FUNCTIONS) {
     let f = &mut *funcs;
@@ -6250,6 +8667,20 @@ pub unsafe fn install_dxgi(funcs: *mut ddi::DXGI_DDI_BASE_FUNCTIONS) {
 pub unsafe fn install_dxgi_1_1(funcs: *mut ddi::DXGI1_1_DDI_BASE_FUNCTIONS) {
     let f = &mut *funcs;
     f.pfnResolveSharedResource = Some(dxgi_resolve_shared_resource);
+}
+
+pub unsafe fn install_dxgi_1_3(funcs: *mut ddi::DXGI1_3_DDI_BASE_FUNCTIONS) {
+    let f = &mut *funcs;
+    f.pfnBlt1 = Some(dxgi_blt1);
+    f.pfnOfferResources = Some(dxgi_offer_resources);
+    f.pfnReclaimResources = Some(dxgi_reclaim_resources);
+    f.pfnGetMultiplaneOverlayCaps = Some(dxgi_get_mpo_caps);
+    f.pfnGetMultiplaneOverlayGroupCaps = Some(dxgi_get_mpo_group_caps);
+    f.pfnReserved1 = Some(dxgi_reserved_unsupported);
+    f.pfnPresentMultiplaneOverlay = Some(dxgi_present_mpo);
+    f.pfnReserved2 = Some(dxgi_reserved_unsupported);
+    f.pfnPresent1 = Some(dxgi_present1);
+    f.pfnCheckPresentDurationSupport = Some(dxgi_check_present_duration_support);
 }
 
 /// Install the implemented forwarders into the device-funcs table (over the
@@ -6433,12 +8864,28 @@ pub unsafe fn install_11_1(funcs: *mut ddi::D3D11_1DDI_DEVICEFUNCS) {
     // The >=11.1 shader creates carry TYPED signature entries
     // (D3D11_1DDIARG_SIGNATURE_ENTRY2.RegisterComponentType); forward them so
     // dxbc-spv declares correctly-typed shader I/O instead of assuming
-    // float32 for everything (hull/domain use a different tessellation
-    // signatures struct and compute has none — those keep the shared
-    // handlers).
+    // float32 for everything. Hull/domain use a different 11.1 tessellation
+    // signatures struct, so override those ABI-specific slots as well.
     f.pfnCreateVertexShader = Some(create_vertex_shader_11_1);
     f.pfnCreatePixelShader = Some(create_pixel_shader_11_1);
     f.pfnCreateGeometryShader = Some(create_geometry_shader_11_1);
+    f.pfnCalcPrivateTessellationShaderSize = Some(calc_size_tess_shader_11_1);
+    f.pfnCreateHullShader = Some(create_hull_shader_11_1);
+    f.pfnCreateDomainShader = Some(create_domain_shader_11_1);
+}
+
+pub unsafe fn install_wddm1_3(funcs: *mut ddi::D3DWDDM1_3DDI_DEVICEFUNCS) {
+    let f = &mut *funcs;
+    f.pfnCheckMultisampleQualityLevels = Some(check_multisample_quality_levels_wddm1_3);
+    f.pfnUpdateTileMappings = Some(update_tile_mappings);
+    f.pfnCopyTileMappings = Some(copy_tile_mappings);
+    f.pfnCopyTiles = Some(copy_tiles);
+    f.pfnUpdateTiles = Some(update_tiles);
+    f.pfnTiledResourceBarrier = Some(tiled_resource_barrier);
+    f.pfnGetMipPacking = Some(get_mip_packing);
+    f.pfnResizeTilePool = Some(resize_tile_pool);
+    f.pfnSetMarker = Some(set_marker);
+    f.pfnSetMarkerMode = Some(set_marker_mode);
 }
 
 pub unsafe fn install_wddm2_1(funcs: *mut ddi::D3DWDDM2_1DDI_DEVICEFUNCS) {

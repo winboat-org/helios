@@ -82,6 +82,18 @@ pub mod ffi {
             sig_words: *const u32,
             sig_words_len: usize,
         ) -> usize;
+        /// Tessellation shader create carrying input/output/patch-constant
+        /// signatures. `kind`: 0 = hull, 1 = domain. `sig_words` layout:
+        /// [n_in, n_out, n_patch, then (sysval, register, mask, comptype,
+        /// stream) entries for each group].
+        unsafe fn create_tess_shader_sig(
+            self: &HeliosDxvkDevice,
+            kind: u32,
+            code: *const u8,
+            len: usize,
+            sig_words: *const u32,
+            sig_words_len: usize,
+        ) -> usize;
         /// Flip-model identity rotation: texture i takes texture i+1's DXVK
         /// storage (memory + VkImage + KMT handles); the last takes the
         /// first's. The swap executes on the CS thread (ordered); no drain.

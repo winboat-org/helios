@@ -305,6 +305,13 @@ namespace {
     return ctx;
   }
 
+  bool plausible_venus_context_id(std::uint32_t ctx) {
+    // KMD-assigned context ids are small monotonically allocated integers. A
+    // value such as 0xcccccc00 means the instance-scoped export decoded the
+    // wrong handle/object, not a real Venus context.
+    return ctx != 0 && ctx < 0x01000000u && (ctx & 0xff000000u) != 0xcc000000u;
+  }
+
   // Instance-scoped venus ctx id (23rd-session audit): the process-global
   // "current" export is last-writer-wins, and with the dcomp present vehicle
   // a game process holds TWO live venus instances — a concurrent instance
@@ -316,12 +323,19 @@ namespace {
     if (instance) {
       if (auto fn = find_helios_icd_export<Fn>("helios_venus_instance_ctx_id")) {
         const auto ctx = fn(instance);
-        if (ctx) {
+        if (plausible_venus_context_id(ctx)) {
           char msg[128];
           std::snprintf(msg, sizeof(msg),
             "Venus instance-scoped ctx export returned ctx_id=%u", ctx);
           umd_log(msg);
           return ctx;
+        }
+        if (ctx) {
+          char msg[160];
+          std::snprintf(msg, sizeof(msg),
+            "Venus instance-scoped ctx export returned implausible ctx_id=%u; falling back",
+            ctx);
+          umd_log(msg);
         }
       }
     }
@@ -390,6 +404,53 @@ namespace {
       fprintf(f, "[dxvk-bridge] %s\n", msg);
       fclose(f);
     }
+  }
+
+  const char* shader_bytecode_dump_path() {
+    static std::string path = [] {
+      char value[MAX_PATH] = {};
+      DWORD size = sizeof(value);
+      if (RegGetValueA(HKEY_LOCAL_MACHINE, "SOFTWARE\\Helios", "ShaderBytecodeDumpPath",
+                       RRF_RT_REG_SZ, nullptr, value, &size) != ERROR_SUCCESS ||
+          !value[0])
+        return std::string();
+
+      CreateDirectoryA(value, nullptr);
+      return std::string(value);
+    }();
+
+    return path.empty() ? nullptr : path.c_str();
+  }
+
+  void dump_shader_bytecode(
+      const char* stage,
+      const char* form,
+      const void* data,
+      std::size_t len) {
+    const char* dir = shader_bytecode_dump_path();
+    if (!dir || !data || !len)
+      return;
+
+    static std::atomic<std::uint32_t> s_seq { 0u };
+    const auto seq = s_seq.fetch_add(1u, std::memory_order_relaxed);
+
+    char path[MAX_PATH] = {};
+    _snprintf_s(path, sizeof(path), _TRUNCATE,
+      "%s\\shader-%lu-%05u-%s-%s-%zu.dxbc",
+      dir,
+      static_cast<unsigned long>(GetCurrentProcessId()),
+      seq,
+      stage,
+      form,
+      len);
+
+    std::ofstream file(path, std::ios_base::out | std::ios_base::binary | std::ios_base::trunc);
+    if (!file) {
+      umd_log("shader bytecode dump open failed");
+      return;
+    }
+
+    file.write(reinterpret_cast<const char*>(data), len);
   }
 
   struct ShaderBytecode {
@@ -473,6 +534,49 @@ namespace {
   // (SystemValue, Register, Mask, RegisterComponentType, Stream).
   constexpr std::size_t kSigEntryWords = 5;
 
+  struct EncodedSignatureEntry {
+    const char* semantic_name;
+    std::uint32_t semantic_index;
+    std::uint32_t system_value;
+  };
+
+  bool is_patch_signature_chunk(const char tag[4]) {
+    return std::memcmp(tag, "PCSG", 4) == 0 || std::memcmp(tag, "PSG1", 4) == 0;
+  }
+
+  EncodedSignatureEntry encode_signature_entry(const char tag[4],
+                                               std::uint32_t sysval,
+                                               std::uint32_t reg) {
+    EncodedSignatureEntry encoded = { "TEXCOORD", reg, sysval };
+
+    if (!is_patch_signature_chunk(tag))
+      return encoded;
+
+    // D3D11 DDI tessellation signatures carry D3D10_SB_NAME token values
+    // (individual final edge/inside factors: 11..22). DXBC container
+    // signatures carry the collapsed D3D_NAME reflection values used by
+    // dxbc-spv (edge/inside semantic plus semantic index). Without this
+    // translation, hull shader tess factors are not declared as SPIR-V
+    // TessLevelOuter/Inner built-ins and tessellated draws can disappear.
+    switch (sysval) {
+      case 11: encoded = { "SV_TessFactor",       0u, 11u }; break; // quad U0 edge
+      case 12: encoded = { "SV_TessFactor",       1u, 11u }; break; // quad V0 edge
+      case 13: encoded = { "SV_TessFactor",       2u, 11u }; break; // quad U1 edge
+      case 14: encoded = { "SV_TessFactor",       3u, 11u }; break; // quad V1 edge
+      case 15: encoded = { "SV_InsideTessFactor", 0u, 12u }; break; // quad U inside
+      case 16: encoded = { "SV_InsideTessFactor", 1u, 12u }; break; // quad V inside
+      case 17: encoded = { "SV_TessFactor",       0u, 13u }; break; // tri U edge
+      case 18: encoded = { "SV_TessFactor",       1u, 13u }; break; // tri V edge
+      case 19: encoded = { "SV_TessFactor",       2u, 13u }; break; // tri W edge
+      case 20: encoded = { "SV_InsideTessFactor", 0u, 14u }; break; // tri inside
+      case 21: encoded = { "SV_TessFactor",       0u, 15u }; break; // line detail
+      case 22: encoded = { "SV_InsideTessFactor", 0u, 16u }; break; // line density
+      default: break;
+    }
+
+    return encoded;
+  }
+
   // Append one 24-byte DXBC signature chunk (ISGN/OSGN) built from flattened
   // D3D11_1DDIARG_SIGNATURE_ENTRY2 values. Semantic names are synthesized as
   // "TEXCOORD<register>" — names are only a matching key (the input-layout
@@ -485,10 +589,23 @@ namespace {
                               const char tag[4],
                               const std::uint32_t* entries,
                               std::uint32_t count) {
-    constexpr const char kName[] = "TEXCOORD";  // + NUL = 9 bytes
     const std::uint32_t entries_size = count * 24u;
-    const std::uint32_t name_off = 8u + entries_size;  // relative to chunk data
-    std::uint32_t data_len = name_off + sizeof(kName);
+    const std::uint32_t name_base = 8u + entries_size;  // relative to chunk data
+    std::vector<EncodedSignatureEntry> encoded_entries;
+    std::vector<std::uint32_t> name_offsets;
+    encoded_entries.reserve(count);
+    name_offsets.reserve(count);
+
+    std::uint32_t names_size = 0u;
+    for (std::uint32_t i = 0; i < count; ++i) {
+      const std::uint32_t* e = entries + std::size_t(i) * kSigEntryWords;
+      auto encoded = encode_signature_entry(tag, e[0], e[1]);
+      encoded_entries.push_back(encoded);
+      name_offsets.push_back(name_base + names_size);
+      names_size += std::uint32_t(std::strlen(encoded.semantic_name) + 1u);
+    }
+
+    std::uint32_t data_len = name_base + names_size;
     data_len = (data_len + 3u) & ~3u;
 
     auto put32 = [&blob](std::uint32_t v) {
@@ -508,6 +625,7 @@ namespace {
       const std::uint32_t sysval = e[0];
       const std::uint32_t reg = e[1];
       const std::uint32_t mask = e[2] & 0xFu;
+      const auto encoded = encoded_entries.at(i);
       // UNKNOWN(0) component type: default to float32 (matches the previous
       // behaviour and the D3D convention for untyped registers).
       const std::uint32_t comptype = e[3] ? e[3] : 3u;
@@ -517,14 +635,28 @@ namespace {
                       "shader signature entry reg=%u has stream=%u (unencoded)", reg, e[4]);
         umd_log(msg);
       }
-      put32(name_off);
-      put32(reg);  // semantic index = register (TEXCOORD<reg> convention)
-      put32(sysval);
+      put32(name_offsets.at(i));
+      put32(encoded.semantic_index);
+      put32(encoded.system_value);
       put32(comptype);
       put32(reg);
       put32(mask | (mask << 8));  // mask | read/write mask, 2 pad bytes
+      if (encoded.system_value != sysval || encoded.semantic_index != reg) {
+        static std::atomic<std::uint32_t> s_tess_sig_remap_logs { 0u };
+        const auto n = s_tess_sig_remap_logs.fetch_add(1u, std::memory_order_relaxed);
+        if (n < 64u) {
+          char msg[160];
+          std::snprintf(msg, sizeof(msg),
+            "shader patch signature remap: raw_sv=%u reg=%u -> sig_sv=%u sem=%s%u",
+            sysval, reg, encoded.system_value, encoded.semantic_name, encoded.semantic_index);
+          umd_log(msg);
+        }
+      }
     }
-    blob.insert(blob.end(), kName, kName + sizeof(kName));
+    for (const auto& e : encoded_entries) {
+      const auto len = std::strlen(e.semantic_name) + 1u;
+      blob.insert(blob.end(), e.semantic_name, e.semantic_name + len);
+    }
     while ((blob.size() - data_start) < data_len)
       blob.push_back(0);
   }
@@ -557,6 +689,66 @@ namespace {
     append_signature_chunk(chunks, "ISGN", in_entries, n_in);
     chunk_offsets.at(chunk_count++) = std::uint32_t(chunks.size());
     append_signature_chunk(chunks, "OSGN", out_entries, n_out);
+    chunk_offsets.at(chunk_count++) = std::uint32_t(chunks.size());
+    chunks.insert(chunks.end(), code_tag, code_tag + 4);
+    {
+      std::uint32_t v = std::uint32_t(len);
+      chunks.push_back(std::uint8_t(v));
+      chunks.push_back(std::uint8_t(v >> 8));
+      chunks.push_back(std::uint8_t(v >> 16));
+      chunks.push_back(std::uint8_t(v >> 24));
+    }
+    chunks.insert(chunks.end(), code, code + len);
+
+    const std::uint32_t file_header_size = 32u;
+    const std::uint32_t offset_table_size = chunk_count * sizeof(std::uint32_t);
+    const std::uint32_t chunk_base = file_header_size + offset_table_size;
+    const std::uint32_t file_size = chunk_base + std::uint32_t(chunks.size());
+
+    result.owned.resize(file_size);
+    std::memcpy(&result.owned[0], "DXBC", 4);
+    write_le(result.owned, 20u, std::uint32_t(1u));
+    write_le(result.owned, 24u, file_size);
+    write_le(result.owned, 28u, chunk_count);
+    for (std::uint32_t i = 0; i < chunk_count; ++i)
+      write_le(result.owned, 32u + 4u * i, chunk_base + chunk_offsets.at(i));
+    std::memcpy(&result.owned[chunk_base], chunks.data(), chunks.size());
+
+    auto digest = dxbc_spv::dxbc::hashDxbcBinary(result.owned.data(), result.owned.size());
+    std::memcpy(&result.owned[4], digest.data.data(), digest.data.size());
+
+    result.data = result.owned.data();
+    result.len = result.owned.size();
+    return result;
+  }
+
+  ShaderBytecode prepare_shader_bytecode_with_tess_sigs(
+      const std::uint8_t* code, std::size_t len,
+      const std::uint32_t* in_entries, std::uint32_t n_in,
+      const std::uint32_t* out_entries, std::uint32_t n_out,
+      const std::uint32_t* patch_entries, std::uint32_t n_patch) {
+    ShaderBytecode result = { };
+    if (!code || !len || len < 8 || (len & 3u))
+      return result;
+
+    const auto* dwords = reinterpret_cast<const std::uint32_t*>(code);
+    const std::uint32_t major = (dwords[0] >> 4u) & 0xfu;
+    if (std::size_t(dwords[1]) * sizeof(std::uint32_t) != len) {
+      umd_log("raw shader bytecode dword count mismatch (tess sig wrap)");
+      return result;
+    }
+    const char* code_tag = major >= 5u ? "SHEX" : "SHDR";
+
+    std::vector<std::uint8_t> chunks;
+    std::array<std::uint32_t, 4> chunk_offsets = { };
+    std::uint32_t chunk_count = 0;
+
+    chunk_offsets.at(chunk_count++) = std::uint32_t(chunks.size());
+    append_signature_chunk(chunks, "ISGN", in_entries, n_in);
+    chunk_offsets.at(chunk_count++) = std::uint32_t(chunks.size());
+    append_signature_chunk(chunks, "OSGN", out_entries, n_out);
+    chunk_offsets.at(chunk_count++) = std::uint32_t(chunks.size());
+    append_signature_chunk(chunks, "PCSG", patch_entries, n_patch);
     chunk_offsets.at(chunk_count++) = std::uint32_t(chunks.size());
     chunks.insert(chunks.end(), code_tag, code_tag + 4);
     {
@@ -1053,6 +1245,8 @@ std::size_t HeliosDxvkDevice::create_vertex_shader(const std::uint8_t* code, std
     auto bytecode = prepare_shader_bytecode(code, len);
     if (!bytecode)
       return 0;
+    dump_shader_bytecode("vs", "raw", code, len);
+    dump_shader_bytecode("vs", "wrapped", bytecode.data, bytecode.len);
     HRESULT hr = impl->d3d11->CreateVertexShader(bytecode.data, bytecode.len, nullptr, &shader);
     if (FAILED(hr)) {
       umd_log("CreateVertexShader returned failure");
@@ -1077,6 +1271,8 @@ std::size_t HeliosDxvkDevice::create_pixel_shader(const std::uint8_t* code, std:
     auto bytecode = prepare_shader_bytecode(code, len);
     if (!bytecode)
       return 0;
+    dump_shader_bytecode("ps", "raw", code, len);
+    dump_shader_bytecode("ps", "wrapped", bytecode.data, bytecode.len);
     HRESULT hr = impl->d3d11->CreatePixelShader(bytecode.data, bytecode.len, nullptr, &shader);
     if (FAILED(hr)) {
       umd_log("CreatePixelShader returned failure");
@@ -1101,6 +1297,8 @@ std::size_t HeliosDxvkDevice::create_geometry_shader(const std::uint8_t* code, s
     auto bytecode = prepare_shader_bytecode(code, len);
     if (!bytecode)
       return 0;
+    dump_shader_bytecode("gs", "raw", code, len);
+    dump_shader_bytecode("gs", "wrapped", bytecode.data, bytecode.len);
     HRESULT hr = impl->d3d11->CreateGeometryShader(bytecode.data, bytecode.len, nullptr, &shader);
     if (FAILED(hr)) {
       umd_log("CreateGeometryShader returned failure");
@@ -1138,6 +1336,9 @@ std::size_t HeliosDxvkDevice::create_shader_sig(
         code, len, in_entries, n_in, out_entries, n_out);
     if (!bytecode)
       return 0;
+    const char* stage = kind == 0 ? "vs-sig" : kind == 1 ? "ps-sig" : "gs-sig";
+    dump_shader_bytecode(stage, "raw", code, len);
+    dump_shader_bytecode(stage, "wrapped", bytecode.data, bytecode.len);
     HRESULT hr = E_FAIL;
     void* shader = nullptr;
     switch (kind) {
@@ -1168,6 +1369,62 @@ std::size_t HeliosDxvkDevice::create_shader_sig(
     umd_log(e.what());
   } catch (...) {
     umd_log("unknown exception in create_shader_sig");
+  }
+  return 0;
+}
+
+std::size_t HeliosDxvkDevice::create_tess_shader_sig(
+    std::uint32_t kind,
+    const std::uint8_t* code,
+    std::size_t len,
+    const std::uint32_t* sig_words,
+    std::size_t sig_words_len) const {
+  if (!impl || !impl->d3d11 || !code || !len || !sig_words || sig_words_len < 3)
+    return 0;
+  const std::uint32_t n_in = sig_words[0];
+  const std::uint32_t n_out = sig_words[1];
+  const std::uint32_t n_patch = sig_words[2];
+  if (sig_words_len != 3 + std::size_t(n_in + n_out + n_patch) * kSigEntryWords) {
+    umd_log("create_tess_shader_sig: signature word count mismatch");
+    return 0;
+  }
+  const std::uint32_t* in_entries = sig_words + 3;
+  const std::uint32_t* out_entries = in_entries + std::size_t(n_in) * kSigEntryWords;
+  const std::uint32_t* patch_entries = out_entries + std::size_t(n_out) * kSigEntryWords;
+  try {
+    auto bytecode = prepare_shader_bytecode_with_tess_sigs(
+        code, len, in_entries, n_in, out_entries, n_out, patch_entries, n_patch);
+    if (!bytecode)
+      return 0;
+    const char* stage = kind == 0 ? "hs-sig" : "ds-sig";
+    dump_shader_bytecode(stage, "raw", code, len);
+    dump_shader_bytecode(stage, "wrapped", bytecode.data, bytecode.len);
+    HRESULT hr = E_FAIL;
+    void* shader = nullptr;
+    switch (kind) {
+      case 0:
+        hr = impl->d3d11->CreateHullShader(bytecode.data, bytecode.len, nullptr,
+                                           reinterpret_cast<ID3D11HullShader**>(&shader));
+        break;
+      case 1:
+        hr = impl->d3d11->CreateDomainShader(bytecode.data, bytecode.len, nullptr,
+                                             reinterpret_cast<ID3D11DomainShader**>(&shader));
+        break;
+      default:
+        umd_log("create_tess_shader_sig: unknown shader kind");
+        return 0;
+    }
+    if (FAILED(hr)) {
+      umd_log("create_tess_shader_sig: shader creation returned failure");
+      return 0;
+    }
+    return reinterpret_cast<std::size_t>(shader);
+  } catch (const dxvk::DxvkError& e) {
+    umd_log(("create_tess_shader_sig DxvkError: " + e.message()).c_str());
+  } catch (const std::exception& e) {
+    umd_log(e.what());
+  } catch (...) {
+    umd_log("unknown exception in create_tess_shader_sig");
   }
   return 0;
 }
@@ -1705,6 +1962,8 @@ std::size_t HeliosDxvkDevice::create_hull_shader(const std::uint8_t* code, std::
     auto bytecode = prepare_shader_bytecode(code, len);
     if (!bytecode)
       return 0;
+    dump_shader_bytecode("hs", "raw", code, len);
+    dump_shader_bytecode("hs", "wrapped", bytecode.data, bytecode.len);
     HRESULT hr = impl->d3d11->CreateHullShader(bytecode.data, bytecode.len, nullptr, &shader);
     if (FAILED(hr)) {
       umd_log("CreateHullShader returned failure");
@@ -1729,6 +1988,8 @@ std::size_t HeliosDxvkDevice::create_domain_shader(const std::uint8_t* code, std
     auto bytecode = prepare_shader_bytecode(code, len);
     if (!bytecode)
       return 0;
+    dump_shader_bytecode("ds", "raw", code, len);
+    dump_shader_bytecode("ds", "wrapped", bytecode.data, bytecode.len);
     HRESULT hr = impl->d3d11->CreateDomainShader(bytecode.data, bytecode.len, nullptr, &shader);
     if (FAILED(hr)) {
       umd_log("CreateDomainShader returned failure");
@@ -1753,6 +2014,8 @@ std::size_t HeliosDxvkDevice::create_compute_shader(const std::uint8_t* code, st
     auto bytecode = prepare_shader_bytecode(code, len);
     if (!bytecode)
       return 0;
+    dump_shader_bytecode("cs", "raw", code, len);
+    dump_shader_bytecode("cs", "wrapped", bytecode.data, bytecode.len);
     HRESULT hr = impl->d3d11->CreateComputeShader(bytecode.data, bytecode.len, nullptr, &shader);
     if (FAILED(hr)) {
       umd_log("CreateComputeShader returned failure");
