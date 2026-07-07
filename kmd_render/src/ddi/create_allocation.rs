@@ -549,18 +549,24 @@ unsafe fn create_one(
     if meta.venus_alloc_size == 0 {
         meta.venus_alloc_size = ap.size;
     }
-    if !adopt_supplied_resource && priv_len >= size_of::<HeliosWddmAllocPrivate>() {
+    if priv_len >= size_of::<HeliosWddmOpenIdentity>() {
         // Create-time write-back into dxgkrnl's per-allocation buffer (the copy
-        // OpenAllocation later reads): the created resid in `_pad`, and — when
-        // the trailer fits — the venus identity fields recorded above.
-        ap._pad = resource_id;
-        let dst = unsafe {
-            core::slice::from_raw_parts_mut(
-                priv_ptr as *mut u8,
-                size_of::<HeliosWddmAllocPrivate>(),
-            )
+        // OpenAllocation later reads). This must happen for BOTH KMD-created
+        // standard allocations and UMD/Venus-backed adopted allocations:
+        // windowed DXGI presents hand DWM an allocation token, and the opener
+        // can only import the rendered Venus image if this buffer carries the
+        // live resource id plus exact vkAllocateMemory identity.
+        let ident = ParsedAllocIdentity {
+            resource_id,
+            blob_size: ap.size,
+            venus_alloc_size: meta.venus_alloc_size,
+            memory_type_index: meta.memory_type_index,
+            ctx_id: ap.ctx_id,
+            kind: ap.kind,
         };
-        dst.copy_from_slice(bytes_of(&ap));
+        unsafe {
+            write_open_identity(priv_ptr as *mut c_void, priv_len as UINT, &ident);
+        }
         if priv_len >= size_of::<HeliosWddmAllocPrivate>() + size_of::<HeliosWddmAllocMeta>() {
             // SAFETY: bounds-checked; trailer follows the 48-byte prefix in the
             // same runtime-owned buffer.
@@ -583,11 +589,12 @@ unsafe fn create_one(
     });
     // CPU-rasterized surfaces (GDI/shadow/staging/shared-primary standard
     // allocations, KMD-backed by a mappable venus blob) go to the BAR memory
-    // segment (id 3): CPU raster then lands in the SAME bytes the allocation's
-    // venus blob exposes (two-memory-split fix). UMD/venus-backed (adopted)
-    // allocations keep the aperture — their CPU access rides the ICD's escape
-    // blob mapping, and device-local blobs are not mappable. Bisect arms
-    // (probe_only RAM region / classic descriptor) never receive allocations.
+    // segment: CPU raster then lands in the SAME bytes the allocation's venus
+    // blob exposes (two-memory-split fix). UMD/venus-backed adopted allocations
+    // stay off this path for now: making every adopted present/shared resource
+    // BAR-eligible destabilized the LogonUI/DWM boot path, so the 3D-present
+    // equivalent needs a narrower resource-class gate. Bisect arms (probe_only
+    // RAM region / classic descriptor) never receive allocations.
     let bar_seg_id = adapter
         .bar_segment
         .as_ref()

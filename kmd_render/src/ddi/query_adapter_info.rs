@@ -398,12 +398,14 @@ const REPORT_APERTURE_PAGING_SEGMENT: bool = true;
 /// `SupportKernelModeCommandBuffer` cap — and our `RenderKm` returned
 /// `STATUS_NOT_IMPLEMENTED`, so dxgkrnl `call`ed a null DMA/submission pointer
 /// (`dxgkrnl!ADAPTER_RENDER::DdiRenderGdi+0x140`, `call rax` rax=0 → kernel
-/// 0xC0000005). FIX (this build): `dxgkddi_render_km` now records the command into
-/// the DMA buffer + advances the output pointer + returns SUCCESS
+/// 0xC0000005). FIX: `dxgkddi_render_km`/`dxgkddi_render_gdi` now record the command
+/// into the DMA buffer + advance the output pointer + return SUCCESS
 /// (`submit_command.rs`), satisfying the GDI-HW-accel DDI contract
 /// (`gdi-hardware-acceleration.md`: CreateAllocation + GetStandardAllocationDriverData
-/// + RenderKm). Re-enabled to test whether the OS now builds the display path. Flip
-/// `false` + redeploy to revert if it still destabilizes boot.
+/// + RenderKm). Re-tested with the cap enabled in build 22.22.57.0: DXGI still
+/// presented with hDstRes=0 and no Blt/Blt1 destination, while restart churn hit
+/// venus/DWM/explorer crashes. Keep disabled until we have a resource-allocation
+/// contract that specifically requires it.
 pub(crate) const DECLARE_CROSS_ADAPTER_RESOURCE: bool = false;
 
 /// WDDM-sync-redesign M1 (2026-06-25): raise the adapter from the bring-up WDDM 1.3
