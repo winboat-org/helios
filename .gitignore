@@ -25,3 +25,20 @@ System\ Volume\ Information
 
 # Windows share junk
 $RECYCLE.BIN/
+
+# Research-only checkouts (reference material, not part of the build)
+/dx-samples-research-only/
+/dxvk-research-only/
+/dxvk/
+/virtio-research-only-3d/
+/vkd3d-proton/
+/windows-driver-docs-research-only/
+/D3D11_3_FunctionalSpec.htm
+
+# Session scratch + external tool config
+/tmp/
+/.codex/
+/opencode.json
+
+# Stray compiled probe objects
+*.obj

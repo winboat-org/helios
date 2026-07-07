@@ -373,6 +373,9 @@ int main() {
     }
   }
 
+  unsigned final_in = 0, final_out = 0;
+  if (readback(dev1, ctx1, tex, td, "[dev1 final]", &final_in, &final_out)) return 42;
+
   IDXGIResource1* res1 = nullptr;
   if (FAILED(tex->QueryInterface(IID_PPV_ARGS(&res1)))) return 15;
   HANDLE handle = nullptr;
@@ -388,8 +391,9 @@ int main() {
   if (FAILED(hr) || !opened) return 18;
   if (readback(dev2, ctx2, opened, td, "[dev2 opened]", &in2, &out2)) return 19;
 
-  bool draw_ok = (in1 == 0xCC336699u) && (out1 == 0xFFFFFFFFu);
-  bool prop_ok = (in2 == in1) && (out2 == out1);
+  bool draw_ok = (in1 == 0xCC336699u) && (out1 == 0xFFFFFFFFu) &&
+                 (final_in == 0xCC336699u) && (final_out == 0xFFFF00FFu);
+  bool prop_ok = (in2 == final_in) && (out2 == final_out);
   printf("RESULT: draw(dev1)=%s propagate(dev2)=%s\n",
          draw_ok ? "PASS" : "FAIL", prop_ok ? "PASS" : "FAIL");
   return (draw_ok && prop_ok) ? 0 : 20;
