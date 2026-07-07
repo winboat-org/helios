@@ -1153,6 +1153,51 @@ Open defects, roughly ordered:
 
 ## Workstream 3 — D3D11 Conformance
 
+**30th session (2026-07-07) — 3DMark bring-up: LUID gap FIXED, FL11 ceiling
+root-caused.**
+
+- **Vulkan/DXGI LUID identity gap — FIXED, DEPLOYED, VERIFIED (mesa
+  `23b10bb6d80`, main `e0b462f`; ICD `vulkan_virtio-c2919595f95d`).** The venus
+  ICD reported `VkPhysicalDeviceIDProperties::deviceLUIDValid=false` ("Phase 6
+  concern" stub in `helios_init_renderer_info`), so no VkPhysicalDevice carried
+  the guest WDDM adapter LUID that DXGI reports. UL/3DMark Steel Nomad (Vulkan)
+  selects an adapter via DXGI then matches into Vulkan by `deviceLUID` → found
+  nothing → "VkPhysicalDevice with device LUID X not found". Fix: plumb
+  `helios->adapter_luid` (captured from D3DKMTEnumAdapters2 at open, == the DXGI
+  AdapterLuid) into `info->id` (has_luid=true, node_mask=1, luid verbatim).
+  Verified same-boot: vulkaninfo `deviceLUID dfb16300-00000000` == WDDM adapter
+  `luid 00000000:0063b1df`, `deviceLUIDValid=true`. (LUIDs change per
+  device-restart — the fix reads adapter_luid dynamically, tracks it. dxvk's
+  own findAdapterByLuid / D3DKMTOpenAdapterFromLuid also benefit.) **Owner to
+  re-test Steel Nomad.**
+- **Fire Strike (D3D11 FL11_0) "no GPU" — the Helios adapter is capped at
+  FL10_0; root-caused to an ADAPTER-LEVEL ceiling below the UMD.** dxdiag and a
+  D3D11CreateDevice probe (`tools/d3d11_fl_probe.cpp`, run via schtasks LIMITED
+  session 1 — session-0/elevated D3D11 device create is a separate matter but
+  the probe reproduces in both) confirm max FL10_0. The engine is genuinely
+  FL11 (bridge creates the dxvk device at `D3D_FEATURE_LEVEL_11_0`; all FL11
+  DDIs — hull/domain/compute/UAV/dispatch — are wired). The UMD deliberately
+  caps to FL10.0 via three coherent caps (3DPIPELINESUPPORT=10_1,
+  check_format_support masks multisample bits, CheckMultisampleQualityLevels
+  returns 1x-only). **UMD FL11 scaffolding SHIPPED behind
+  `HKLM\SOFTWARE\Helios!FeatureLevel11` (main `9f52367`, DEFAULT 0 / not
+  functional — keep 0):** advertises 11_0, forwards DXVK's real MSAA + format
+  caps coherently. A/B PROVEN: knob=0 = exact FL10_0 baseline (FL_10_0/9_1/
+  default all create); **knob=1 → the runtime rejects at the ADAPTER level** —
+  umd-log trail `OpenAdapter → GetCaps(3DPIPELINESUPPORT=11_0) →
+  GetSupportedVersions → CloseAdapter`, NEVER CreateDevice, `0x887a0004`
+  (DXGI_ERROR_UNSUPPORTED) for EVERY requested level incl. 9_1/default.
+  **Therefore the block is the 11_0 pipeline claim itself, NOT caps coherence
+  (MSAA/format never queried) and NOT the DDI versions (D3D11_0
+  0x000b000a00020000 / D3D11_1 0x000b000f00000000 advertised correctly, both
+  FL11-capable — verified vs WDK 10.0.26100 d3d10umddi.h).** The ceiling is
+  imposed below the UMD by dxgkrnl/KMD adapter feature-level eligibility; prime
+  suspect = the KMD's **null execution engine** (query_adapter_info.rs already
+  rejects PHYSICALADAPTERCAPS for the same reason — dxgmms wants a real node
+  structure). Raising FL11 is KMD-side, reboot-territory work — OPEN, owner
+  decision. (dxdiag "Feature Levels: <blank>" right after a device restart is a
+  transient artifact, not evidence — the probe is authoritative.)
+
 Current state (surveyed 2026-07-05):
 
 - UMD (`umd/`, Rust d3d10umddi frontend → cxx bridge → DXVK C++ engine):
