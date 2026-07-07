@@ -1,5 +1,13 @@
 # TRANSPORT.md — VirtIO-GPU + Venus Wire Protocol
 
+> **⚠️ PARTIALLY SUPERSEDED (2026-07-05).** The Venus wire format and virtio-gpu
+> CMD_SUBMIT_3D details below remain accurate, but the **carrier is wrong**: the
+> active driver does NOT reach the KMD via `DeviceIoControl`/`GUID_DEVINTERFACE_HELIOS`.
+> User mode reaches the WDDM render miniport (`kmd_render/`) through the **dxgkrnl
+> DDI + venus-over-`D3DKMTEscape`** (`kmd_render/src/ddi/escape.rs`, `submit_command`).
+> Treat the "ICD → DeviceIoControl → KMD" spine as archived; **CLAUDE.md/ROADMAP.md
+> are authoritative** for transport.
+
 ## Overview
 
 This document describes the exact wire format used to send Vulkan commands from the Windows guest (ICD) through the KMD and virtio-gpu device to virglrenderer on the Linux host.

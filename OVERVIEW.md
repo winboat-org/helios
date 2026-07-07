@@ -1,5 +1,14 @@
 # OVERVIEW.md — Helios vGPU Architecture
 
+> **⚠️ SUPERSEDED (2026-07-05) — ARCHIVED REFERENCE ONLY.** This document
+> describes the abandoned System-class KMDF + `DeviceIoControl` design and states
+> the driver does NOT composite the desktop. Both are now false: the active
+> project is a **WDDM 3.2 render-only miniport + DXVK-bridged D3D11 UMD + Mesa-
+> Venus ICD (`vulkan_virtio.dll`) + IddCx/Looking Glass**, and **DWM composites
+> the whole Windows desktop on Helios** (the milestone, met 2026-07-05). The Rust
+> `helios_icd.dll` named below no longer exists (the ICD is a C Mesa-Venus port).
+> **CLAUDE.md and ROADMAP.md are authoritative.** Read below as history only.
+
 > **DIRECTION RESET (2026-06-07):** the active project direction is again
 > **System-class KMDF + DeviceIoControl + Mesa Venus**. The WDDM DOD/display pivot is archived, not deleted;
 > see [`SYSTEM_CLASS_REFOCUS_2026_06_07.md`](SYSTEM_CLASS_REFOCUS_2026_06_07.md) for the decision record.

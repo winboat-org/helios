@@ -6,7 +6,7 @@ is over; this stage makes it reliable, fast, and D3D11-conformant. Archived
 bring-up knowledge lives in `docs/archive/`; operational debug knowledge stays
 in `NTOSEYE.md` and `BRINGUP_QUIRKS.md`.*
 
-## Verified baseline (2026-07-05, KMD 22.22.50)
+## Verified baseline (2026-07-05, KMD 22.22.50 — current build 22.22.61)
 
 - Adapter binds `CM_PROB_NONE` across cold boots and `devcon restart`.
 - Segment topology: aperture (id 1) + **BAR window head as CpuHostAperture

@@ -9,7 +9,7 @@ The Linux host side of the Helios vGPU project consists of:
 
 You do NOT write a custom host-side daemon for the primary path — virglrenderer handles everything. The `host/` crate in this repo is for diagnostics and optional custom transport.
 
-The host stack is identical regardless of the guest driver model: the current System-class KMDF + DeviceIoControl guest uses the exact same venus/virglrenderer host setup described here as the earlier guest design did, so nothing in this document changes with the guest carrier.
+The host stack is identical regardless of the guest driver model: the active WDDM render-miniport guest (`kmd_render/` + Mesa-Venus ICD) uses the exact same venus/virglrenderer host setup described here as every earlier guest design did, so nothing in this document changes with the guest carrier.
 
 ---
 

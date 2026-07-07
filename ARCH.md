@@ -1,12 +1,22 @@
 # Helios Architecture v2: System-class KMDF + IOCTL + Venus
 
+> **⚠️ SUPERSEDED (2026-07-05) — ARCHIVED REFERENCE ONLY.** This document
+> describes the System-class KMDF + `DeviceIoControl` architecture, which was
+> abandoned. The active project is a **WDDM 3.2 render-only miniport**
+> (`kmd_render/`) binding virtio-gpu via dxgkrnl, a **DXVK-bridged D3D11 UMD**
+> (`umd/`), the **Mesa-Venus ICD** (`vulkan_virtio.dll`), and an **IddCx /
+> Looking Glass** display. It uses the full dxgkrnl DDI table, GpuMmu, monitored
+> fences, CpuHostAperture segments, and venus-over-`D3DKMTEscape`. **CLAUDE.md
+> and ROADMAP.md are authoritative for the live architecture and current state.**
+> Everything below (and the 2026-06-07 reset banner) is historical.
+
 > **DIRECTION RESET (2026-06-07):** this file is again canonical for the active project direction.
 > The WDDM Display-Only Driver pivot is archived as reference only. Read
 > [`SYSTEM_CLASS_REFOCUS_2026_06_07.md`](SYSTEM_CLASS_REFOCUS_2026_06_07.md) for the decision record and
 > [`DISPLAY.md`](DISPLAY.md) / [`PHASE7_DISPLAY_HANDOVER.md`](PHASE7_DISPLAY_HANDOVER.md) only for historical
 > DOD/display findings. The active path is System-class KMDF + DeviceIoControl + Mesa Venus.
 
-**Status:** CANONICAL. This is the source of truth all the other docs are written against. It supersedes every WDDM/dxgkrnl/D3DKMTEscape active-plan passage in OVERVIEW.md, KMD.md, ICD.md, TRANSPORT.md, TOOLCHAIN.md, CLAUDE.md (HOST.md is unaffected). The WDDM render-miniport approach remains abandoned: a WDDM render adapter would need a native D3D-to-venus UMD and WDDM scheduling/memory contracts that do not help the Venus renderer. The DOD/display-only work is archived, not deleted, because its dxgk bindings and VidPN findings may be useful later.
+**Status:** ARCHIVED / historical (see the superseded banner above). This was once declared canonical for the System-class direction, but the project has since shipped the WDDM render miniport; CLAUDE.md and ROADMAP.md are now the source of truth. The paragraph below records the (since-reversed) reasoning for abandoning the WDDM render miniport — kept for history: a WDDM render adapter would need a native D3D-to-venus UMD and WDDM scheduling/memory contracts that do not help the Venus renderer. The DOD/display-only work is archived, not deleted, because its dxgk bindings and VidPN findings may be useful later.
 
 ## 0. The Pivot in One Paragraph
 

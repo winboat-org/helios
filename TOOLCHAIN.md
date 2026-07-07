@@ -1,5 +1,15 @@
 # TOOLCHAIN.md — Build Environment Setup
 
+> **⚠️ SUPERSEDED (2026-07-05) — install/verify steps are for the abandoned
+> System-class driver.** The active driver is the **WDDM render miniport**
+> (crate `kmd_render`, service/INF `helios_kmd_render`, `helios_kmd_render.cat`),
+> a render/display-class adapter that carries `UserModeDriverName` and sits at
+> **Code 43 during bring-up** — NOT a System-class device, and it DOES appear
+> under Display adapters. The ICD builds as the C **Mesa-Venus** port
+> (`vulkan_virtio.dll` via `win_meson`), not a Rust `icd` crate. Use the
+> platform build rules and `win_*` MCP tooling in **CLAUDE.md** and the deploy
+> steps in **HELIOS_DRIVER_DEPLOYMENT.md**; those are authoritative.
+
 > **DIRECTION RESET (2026-06-07):** active KMD work is System-class KMDF + DeviceIoControl + Mesa Venus.
 > DOD/dxgk build artifacts may remain as archived reference, but the active build should follow `ARCH.md` and
 > `SYSTEM_CLASS_REFOCUS_2026_06_07.md`.
