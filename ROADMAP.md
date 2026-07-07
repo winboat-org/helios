@@ -1069,6 +1069,51 @@ Open defects, roughly ordered:
     slot round-trips (dead set_source fence_value), eager vehicle
     fence at init, WSI perf-counter oddity, cold-boot re-verify,
     GdiAccelMode retirement, DirectFlipCaps knob retirement.**
+    **29TH SESSION — COPY-LATENCY ROOT CAUSE FOUND: QEMU delivers venus
+    wire-fence completions by POLLING (10 ms fence_poll timer + an
+    opportunistic poll on every guest ctrl-queue kick); the async
+    fence-callback path is NOT active in the running config.** The whole
+    stack below it is fast. Measurement chain (all landed, deployed):
+    (a) `copy-lat` in the umd bridge (publish→waiter-observation of the
+    vehicle copy fence; umd log, every 512): vkcube on an IDLE GPU avg
+    ~13.6 ms, dominant bucket 10-20 ms — the Doom 7.69 ms acquire gate is
+    just the tail of this past the app's natural slack. (b) `retire_lat`
+    in the ICD (submit→wire-fence-retirement-observed, HELIOS_PERF
+    summary + histogram): BIMODAL — ~half <1 ms, ~half 10-20 ms, max
+    ≈11 ms (vehicle) / ≈16 ms (producer), RATE-INDEPENDENT (260 fps
+    immediate-mode vkcube: slow mode persists and stacks, max 28 ms).
+    (c) Host driver EXONERATED: tools/vk_fence_wake_probe.c (Linux,
+    empty vkQueueSubmit+WaitForFences on the idle NVIDIA queue) =
+    0.23 ms avg / 0.48 ms worst. (d) HOST-SIDE PROOF from the 07-06
+    traced run in /tmp/helios-qemu-stderr.log (virtio_gpu_fence_ctrl/
+    resp): a lone in-flight fence gets its response +10.5 ms; two
+    fences submitted together both complete fast (the second submit's
+    handle_ctrl kick polls the first through) — the exact
+    poll+kick signature of hw/display/virtio-gpu-gl.c
+    virtio_gpu_gl_handle_ctrl → virtio_gpu_virgl_fence_poll and the
+    10 ms fence_poll timer. QEMU 11.0.1 enables async fences only when
+    `qemu_egl_display` is set + virglrenderer ≥1.1.2 (both look
+    satisfied: egl-headless display, virgl 1.3.0, callbacks v4) — WHY
+    it is not active is the open host-side question (verify via gdb
+    `print qemu_egl_display` on the live process or a traced relaunch:
+    `--trace 'virtio_gpu_fence_*'`). FIX DIRECTION (owner decision, VM
+    relaunch territory): get VIRGL_RENDERER_ASYNC_FENCE_CB active —
+    expected win: every venus fence wait in the system (vehicle copy
+    observation, dwm consumer waits avg 8.9 ms, IddCx waits 5.8 ms,
+    D3D11 fence waits) drops from ~5-15 ms to sub-ms; the ~105 fps
+    windowed Doom ceiling should lift substantially. Vkr map (host,
+    for later levers): per-context worker PROCESSES, no cross-context
+    CPU locks; per-guest-queue host VkQueue, family passed verbatim;
+    ring≥1 retirement = empty marker submit + per-queue sync thread;
+    VK_EXT/KHR_global_priority plumbed end-to-end; transfer-family
+    queues map 1:1 (both usable if GPU-side contention ever becomes
+    the limiter — it is NOT today). Waiter named: the vehicle device's
+    `wait_calls fast=0 timeout≈2571` = DxvkFence::run() (dxvk_fence.cpp
+    10 ms slice loop) servicing present_flip_wait_arm enqueueWaits —
+    slices are benign event-backed re-loops. New tooling: schtask
+    `helios_vkcube_imm` (immediate-mode cube, perf files
+    vkcube_imm_*); helios_vkcube now also sets HELIOS_PERF →
+    vkcube_renderer_perf.txt.
 - **Capture path**: IddCx frame drop policy vs D3D12 copy queue saturation;
   KVMFR bandwidth; 10 bpc default.
 - Candidates list from the NVIDIA fix era lives in ICD.md.
