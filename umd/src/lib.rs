@@ -1037,19 +1037,23 @@ pub(crate) fn vehicle_flip_gate_us() -> u32 {
     })
 }
 
-/// Kernel-enforced vehicle flip ordering opt-in:
+/// Kernel-enforced vehicle flip ordering:
 /// `HKLM\SOFTWARE\Helios!VehicleKernelFlipWait` (REG_DWORD). Read once per
-/// process. **Absent = 0 (OFF): the first live test (2026-07-07, vkcube)
-/// wedged present #1 — the enqueueWait signal never fired, the watchdog
-/// unwedge did not revive the app, and killing the wedged process HUNG THE
-/// WHOLE GUEST (no bugcheck, no dump — a kernel-side deadlock). Root-cause
-/// before re-enabling.** =1: vehicle presents queue a dxgkrnl GPU-side wait
-/// on the copy's completion (a runtime-device monitored fence CPU-signaled
-/// when the present fence reaches the copy's value) AHEAD of the present
-/// packet — the flip physically cannot execute before the venus copy lands,
-/// closing the bounded CPU gate's timeout leak (the 25th-session A/B stale
-/// frames). Probe-proven primitive (tools/vehicle_flipwait_probe.c); the
-/// integration is what wedges.
+/// process. **Absent = 1 (ON — default flipped 28th session)**: vehicle
+/// presents queue a dxgkrnl GPU-side wait on the copy's completion (a
+/// runtime-device monitored fence CPU-signaled when the present fence
+/// reaches the copy's value) AHEAD of the present packet — the flip
+/// physically cannot execute before the venus copy lands, closing the
+/// bounded CPU gate's timeout leak AND retiring the worker-serial flip
+/// gate (5.6 ms/present measured under Doom). =0 = kill switch (bounded
+/// CPU gate serves instead). It also underwrites the consumers'
+/// skip-if-unretired refresh (the kwait bit in the present-sync slot).
+/// History: the first integration (2026-07-07) wedged the guest — root
+/// cause was HardwareAccess=1 escapes convoying dxgkrnl's core resource
+/// against the kwait-parked queue, killed in the 26th session (escapes
+/// HardwareAccess=0 + exported-sem fold + signalTo monotonicity guard);
+/// since then 24k probe + 6k Doom + 4.6k vkcube presents, zero
+/// wedges/arm fails.
 pub(crate) fn vehicle_kernel_flip_wait() -> bool {
     use std::sync::OnceLock;
     static VALUE: OnceLock<bool> = OnceLock::new();
@@ -1082,7 +1086,8 @@ pub(crate) fn vehicle_kernel_flip_wait() -> bool {
                 &mut len,
             )
         };
-        rc == 0 && value != 0
+        // Absent/unreadable = ON; an explicit 0 is the kill switch.
+        rc != 0 || value != 0
     })
 }
 

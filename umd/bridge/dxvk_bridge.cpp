@@ -1375,7 +1375,8 @@ std::int32_t HeliosDxvkDevice::present_vehicle_copy(
 
 std::uint64_t HeliosDxvkDevice::present_sync_publish(
     std::size_t src_resource_ptr,
-    std::size_t dst_resource_ptr) const {
+    std::size_t dst_resource_ptr,
+    bool kwait_ordered) const {
   if (!impl || !impl->device.ptr() || !impl->context)
     return 0;
 
@@ -1485,9 +1486,11 @@ std::uint64_t HeliosDxvkDevice::present_sync_publish(
     const std::uint32_t fenceId = impl->presentFenceId;
     bool published = false;
     if (residSrc)
-      published |= dxvk::HeliosPresentSync::publish(residSrc, pid, fenceId, value);
+      published |= dxvk::HeliosPresentSync::publish(residSrc, pid, fenceId, value,
+        kwait_ordered);
     if (residDst && residDst != residSrc)
-      published |= dxvk::HeliosPresentSync::publish(residDst, pid, fenceId, value);
+      published |= dxvk::HeliosPresentSync::publish(residDst, pid, fenceId, value,
+        kwait_ordered);
 
     return published ? value : 0;
   } catch (const dxvk::DxvkError& e) {

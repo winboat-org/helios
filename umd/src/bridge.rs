@@ -101,10 +101,14 @@ pub mod ffi {
         /// (resid -> pid, value) for the presented resources. NO wait on the
         /// present thread. Returns the published value, or 0 when the path
         /// is unavailable (caller keeps relying on the present gate).
+        /// `kwait_ordered` advertises in the slot (fenceId bit 30) that this
+        /// present's flip is kernel-held until the value retires, so staged
+        /// consumers may skip an unretired re-stage instead of blocking.
         unsafe fn present_sync_publish(
             self: &HeliosDxvkDevice,
             src_resource_ptr: usize,
             dst_resource_ptr: usize,
+            kwait_ordered: bool,
         ) -> u64;
         /// Name discriminator of this device's named present fence; 0 until
         /// the first successful publish created it (or path disabled). Pairs

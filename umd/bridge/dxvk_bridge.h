@@ -100,9 +100,15 @@ struct HeliosDxvkDevice {
   // the resources, table unavailable, or named-fence creation failed —
   // failure disables the path loudly and permanently for this device, and
   // the caller keeps using the bounded present gate instead).
+  // kwait_ordered advertises (slot fenceId bit 30) that this present's flip
+  // is kernel-held until the published value retires — consumers may then
+  // skip a staged re-stage of an unretired value instead of blocking (the
+  // dwm 9 ms composition stalls). Only set it for presents whose flip WILL
+  // queue the dxgkrnl GPU-side wait.
   std::uint64_t present_sync_publish(
       std::size_t src_resource_ptr,
-      std::size_t dst_resource_ptr) const;
+      std::size_t dst_resource_ptr,
+      bool kwait_ordered) const;
 
   // Name discriminator of this device's WS1 #4 named present fence
   // (Global\HeliosPresentFence_<pid>_<id>), 0 until the first successful

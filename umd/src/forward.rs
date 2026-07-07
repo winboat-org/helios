@@ -5733,10 +5733,15 @@ unsafe fn vehicle_present_prepare(
 
     // Publish the BACKBUFFER slot with this device's own fence, recorded
     // AFTER the copy on the open command list so the value orders the copy.
+    // The kwait advertisement is optimistic: setup succeeding means the
+    // caller WILL queue the dxgkrnl wait for this present; a per-present
+    // queue failure (kwait_queue_fails, 0 observed live) degrades one frame
+    // to consumer-side bounded semantics — counted, self-healing.
+    let kwait_ordered = flip_wait_setup(dev);
     let mut sync_value = 0u64;
     let mut fence_id = 0u32;
     if present_sync_publish_enabled() {
-        sync_value = dev.dxvk.present_sync_publish(backbuffer_raw, 0);
+        sync_value = dev.dxvk.present_sync_publish(backbuffer_raw, 0, kwait_ordered);
         if sync_value != 0 {
             fence_id = dev.dxvk.present_sync_fence_id();
         }
@@ -5815,9 +5820,14 @@ unsafe extern "C" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT) -> i32 {
             // `HKLM\SOFTWARE\Helios!PresentSyncPublish = 0` kills the path.
             if present_sync_publish_enabled() {
                 if let Some(dev) = helios_device(h) {
+                    // Non-vehicle flips carry NO kernel wait — the IddCx
+                    // consumer's bounded wait stays the orderer; never
+                    // advertise kwait here (a skipping consumer on an idle
+                    // desktop would freeze the host display one frame back).
                     sync_value = dev.dxvk.present_sync_publish(
                         resource_com_raw(src_h.pDrvPrivate),
                         resource_com_raw(dst_h.pDrvPrivate),
+                        false,
                     );
                 }
             }
