@@ -1002,6 +1002,38 @@ Open defects, roughly ordered:
     leg; stale class must stay dead throughout (vkcube shows no
     regression). THEN: kwait + DCOMP default decisions, residual
     stutter triage (105-vs-60 Hz judder, gate max-spikes).
+    **OWNER DOOM VERDICT (same-process windowed→fullscreen, kwait=1 +
+    insurance=0): no fps change; stutter still present WINDOWED, GONE
+    FULLSCREEN.** Evidence (pid 6220): the fullscreen 1896x1030 chain
+    went VEHICLE (READY+LIVE on the same hwnd as the windowed chain —
+    the target-registry fix confirmed in the wild); kwait_armed
+    6144/6144, 0 arm/queue fails, no wedge; insurance_skipped
+    13176/13200; queue_present_avg 5.96→2.81 ms (flip gate retired) BUT
+    acquire-gate 4.06→7.69 ms avg (max ~20 ms, timeouts 0) — the
+    latency the worker gate used to absorb moved to acquire: the fps
+    limiter is the vehicle copy's COMPLETION+OBSERVATION latency
+    (~1 host-GPU frame at saturation), not CPU gates. Gates are now
+    honest pipeline measurements, nothing left to delete guest-CPU-side.
+    STUTTER LOCALIZED: same process/gates/fps, stutter only when dwm
+    COMPOSES the chain (windowed); fullscreen (no dwm compose leg)
+    smooth ⇒ the stutter lives in dwm's consumption leg. dwm telemetry
+    during the run: gate_flushes 2480 (~60/s — the freshness gate does
+    per-frame work under a game, expected) and consumer waits avg
+    8.9 ms when they fire (~8% of reads) — 9 ms stalls ON DWM'S CS
+    THREAD = composition hitches. HYPOTHESIS (next session): the
+    staged-refresh loop re-stages ALL enrolled vehicle backbuffers at
+    list start, including the just-presented one whose copy is still
+    in flight — dwm waits ~9 ms for a buffer it is not composing this
+    frame. Fix shape (no hacks — matches real-hw dwm semantics of
+    composing the newest COMPLETE frame): skip-if-unretired in the
+    refresh (keep the current staged bytes, let the bind-time gate
+    force the re-stage next list) instead of the bounded 32 ms wait;
+    kwait guarantees the flip itself never outruns its copy, so
+    skipping cannot resurrect the stale class. DEFAULTS PROPOSAL:
+    kwait code-default ON (Doom+vkcube green, deadlock class dead);
+    insurance knob keep (no measurable cost either way at Doom res —
+    the copy hides under GPU latency); DCOMP default AFTER the dwm
+    stutter fix.
 - **Capture path**: IddCx frame drop policy vs D3D12 copy queue saturation;
   KVMFR bandwidth; 10 bpc default.
 - Candidates list from the NVIDIA fix era lives in ICD.md.
