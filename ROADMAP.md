@@ -1170,33 +1170,35 @@ root-caused.**
   device-restart — the fix reads adapter_luid dynamically, tracks it. dxvk's
   own findAdapterByLuid / D3DKMTOpenAdapterFromLuid also benefit.) **Owner to
   re-test Steel Nomad.**
-- **Fire Strike (D3D11 FL11_0) "no GPU" — the Helios adapter is capped at
-  FL10_0; root-caused to an ADAPTER-LEVEL ceiling below the UMD.** dxdiag and a
-  D3D11CreateDevice probe (`tools/d3d11_fl_probe.cpp`, run via schtasks LIMITED
-  session 1 — session-0/elevated D3D11 device create is a separate matter but
-  the probe reproduces in both) confirm max FL10_0. The engine is genuinely
-  FL11 (bridge creates the dxvk device at `D3D_FEATURE_LEVEL_11_0`; all FL11
-  DDIs — hull/domain/compute/UAV/dispatch — are wired). The UMD deliberately
-  caps to FL10.0 via three coherent caps (3DPIPELINESUPPORT=10_1,
-  check_format_support masks multisample bits, CheckMultisampleQualityLevels
-  returns 1x-only). **UMD FL11 scaffolding SHIPPED behind
-  `HKLM\SOFTWARE\Helios!FeatureLevel11` (main `9f52367`, DEFAULT 0 / not
-  functional — keep 0):** advertises 11_0, forwards DXVK's real MSAA + format
-  caps coherently. A/B PROVEN: knob=0 = exact FL10_0 baseline (FL_10_0/9_1/
-  default all create); **knob=1 → the runtime rejects at the ADAPTER level** —
-  umd-log trail `OpenAdapter → GetCaps(3DPIPELINESUPPORT=11_0) →
-  GetSupportedVersions → CloseAdapter`, NEVER CreateDevice, `0x887a0004`
-  (DXGI_ERROR_UNSUPPORTED) for EVERY requested level incl. 9_1/default.
-  **Therefore the block is the 11_0 pipeline claim itself, NOT caps coherence
-  (MSAA/format never queried) and NOT the DDI versions (D3D11_0
-  0x000b000a00020000 / D3D11_1 0x000b000f00000000 advertised correctly, both
-  FL11-capable — verified vs WDK 10.0.26100 d3d10umddi.h).** The ceiling is
-  imposed below the UMD by dxgkrnl/KMD adapter feature-level eligibility; prime
-  suspect = the KMD's **null execution engine** (query_adapter_info.rs already
-  rejects PHYSICALADAPTERCAPS for the same reason — dxgmms wants a real node
-  structure). Raising FL11 is KMD-side, reboot-territory work — OPEN, owner
-  decision. (dxdiag "Feature Levels: <blank>" right after a device restart is a
-  transient artifact, not evidence — the probe is authoritative.)
+- **Fire Strike (D3D11 FL11_0) "no GPU" — the Helios adapter is FL10_0; being
+  raised gate-by-gate. It is NOT a KMD/adapter ceiling (that theory falsified)
+  — it's a sequence of UMD caps bugs.** The engine is genuinely FL11 (bridge
+  creates the dxvk device at `D3D_FEATURE_LEVEL_11_0`; all FL11 DDIs wired).
+  Everything is behind `HKLM\SOFTWARE\Helios!FeatureLevel11`, now an integer
+  MODE (0=FL10 default/proven, 1=full FL11, 2=diagnostic pipeline-only); knob=0
+  = exact FL10 baseline, dwm-safe. **THE tool that cracked it: the
+  `Microsoft-Windows-DXGI` ETW provider prints d3d11.dll's exact rejection
+  string** (the debug layer / DXGI InfoQueue / DBWIN / DxgKrnl-AzureTriage all
+  gave 0 messages — the failure is device-less). Recipe: `logman start
+  helios_dxgi -p Microsoft-Windows-DXGI 0xFFFFFFFFFFFFFFFF 0xff -o x.etl -ets` +
+  `logman update helios_dxgi -p Microsoft-Windows-Direct3D11 ... -ets`, run the
+  probe, `logman stop`, `tracerpt x.etl -o x.xml -of XML -y`, read `<Data
+  Name="Message">`/`Code`. Gates cleared: (1) **"Driver returned invalid
+  pipeline caps"** — 3DPIPELINESUPPORT is a BITMASK
+  `(1<<Level)` OR'd, not the bare enum; we wrote 11_0=2 = bit1-only = invalid;
+  fixed FL11=0x7, FL10=0x1 (the old 10_1=1 worked by luck = the 10_0 bit).
+  (2) **"Driver doesn't support compute on FL11"** — SHADER caps now advertise
+  0x2 (compute). (3) **"MSAA quality reported to be 0"** — FL11 requires every
+  render-target format to support 4x MSAA and does NOT exempt 96-bit R32G32B32;
+  CheckMultisampleQualityLevels now floors RT formats to >=1 at 1/2/4/8 +
+  check_format_support advertises MULTISAMPLE_RENDERTARGET for RTs — PARTIAL:
+  the runtime advances past formats 5-8 but still hits the MSAA error on a later
+  format/count. **NEXT (owner directive): conform to the D3D11.3 functional
+  spec** (https://microsoft.github.io/DirectX-Specs/d3d/archive/D3D11_3_FunctionalSpec.htm)
+  — exact per-format/per-sample-count FL11 MSAA requirements. Committed main
+  `ff14979` (WIP, un-deployed source; the all-count MSAA-log build was not
+  installed). Probe: `tools/d3d11_fl_probe.cpp`, schtasks `helios_flprobe`,
+  session 1 (session-0 win_exec fails all levels for a context reason, not FL).
 
 Current state (surveyed 2026-07-05):
 
