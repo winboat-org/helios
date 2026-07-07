@@ -956,6 +956,24 @@ Open defects, roughly ordered:
     post-fix: noslot=54 (was 68k), fence_events 0 fallbacks/0 lost,
     escape 64 µs. Doom perf files: C:\Users\Rupansh\helios-doom-perf.txt
     + helios-doom-wsi-perf.txt (owner's launcher tees them).
+    **28TH SESSION: the dcomp target re-create defect FIXED (mesa
+    `bbf5e33f314`, ICD `vulkan_virtio-437986e5fcc4` deployed).** One
+    composition target per hwnd is a Windows rule; the target/visual
+    cache was per-VkSurface, so a new VkSurface for the same hwnd
+    (vkd3d resize/fullscreen) failed CreateTargetForHwnd 0x88980800 and
+    latched onto the sw path. Fix: process-global refcounted
+    hwnd→target registry under the vehicle runtime mutex; the visual's
+    content owner (current_swapchain) lives on the shared entry so a
+    retired chain on the OLD surface cannot blank the new chain's
+    content; `tgt_reuse` counter added to the perf line. Proven by
+    tools/vk_surface_recreate_probe.cpp (schtask `helios_vk_recreate`,
+    session 1, time-based phases — frame-count phases finish before the
+    ~5 s async vehicle build, first attempt exercised nothing): chain A
+    LIVE holding the target → chain B (new surface, SAME hwnd, A alive)
+    READY+LIVE → chain+surface A destroyed under live B, B presented on
+    (acquire-gate 0 timeouts). The honest fullscreen-vehicle Doom A/B
+    is now unblocked (owner run — expect creates=2 fails=0 and the
+    fullscreen chain LIVE instead of the 0x88980800 latch).
 - **Capture path**: IddCx frame drop policy vs D3D12 copy queue saturation;
   KVMFR bandwidth; 10 bpc default.
 - Candidates list from the NVIDIA fix era lives in ICD.md.
