@@ -900,16 +900,46 @@ Open defects, roughly ordered:
     verified: 22.22.56 CM_PROB_NONE, release UMD re-pinned
     (helios_umd_3b4a9e66394e9523; devcon reset it to debug — known
     trap; DriverStore copy sync failed file-in-use, cosmetic), desktop
-    composited healthy. AWAITING owner repro verdict (clean vkcube
-    launch, hands off): expect NO two-frame dance, NO old-frames
-    stutter. Then the ladder resumes (Doom fps vs 120-130 baseline —
-    note: denying promotion may cost the direct-scanout perf that never
-    actually worked; measure), and the deferred cleanups: per-present
-    sw-fallback insurance blit on vehicle chains (2nd full-frame copy,
-    "measure before removing"), in-process present-sync slot/named-fence
-    round-trips (set_source carries a dead fence_value; vehicle+release
-    fences imported by NT name in-process), eager vehicle fence at init,
-    time-based import negative cache.
+    composited healthy. OWNER VERDICT: NO CHANGE — direct-flip denial
+    falsified as the mechanism (kept as the truthful cap surface).
+    **TRUE ROOT CAUSE FOUND + FIX DEPLOYED (dxvk `1cdf0837`, mesa
+    `10cefe67c64`; UMD `helios_umd_746b0242cf664825`, ICD
+    `vulkan_virtio-390d1b583dba`).** Discriminating evidence: owner
+    repro with per-window counter sampling — during a LIVE dance dwm
+    performed ZERO consumer reads for 20+ s while composing 60 fps
+    (waits/fast/noslot all frozen), and mouse movement cured it
+    INSTANTLY (both dance and stutter) — consumer freshness tracked
+    dxvk COMMAND-LIST CADENCE, not producer progress: staged imports
+    re-stage only at list starts, an idle dwm's CS chunks span many
+    frames (~60 s to fill when idle = the hands-off recovery), so its
+    sampled staged copies froze while every fence stayed green; the
+    front-buffer rotation cycled 2-3 differently-aged frozen copies =
+    the two-frame dance; chunk-threshold oscillation = the stutter;
+    activity = per-frame flushes = cure. sw path immune because
+    GdiAccelMode=0 routes GDI content via CPU redirection surfaces
+    (not our staged imports). THE FIX (dxvk-helios, 3 parts):
+    (1) bind-time staleness gate — staged-SRV binds arm a sticky
+    per-context flag; draws/dispatches on the immediate context compare
+    each bound staged image's published present-sync value against the
+    value its last re-stage observed and Flush() when the producer
+    advanced (≤1 flush per published value per image via a claim CAS;
+    non-consumer processes pay one branch per draw); (2) zombie-refresh
+    unenroll — texture dtor flags the image, the refresh loop erases it
+    (was: 15k+ no-slot full-image copies per DEAD vkcube chain until
+    the 3600-tick prune, Rc-pinning the corpse's venus resources);
+    (3) present-sync slot recycling by PRODUCER CREATION TIME
+    (reserved2 repurposed; pid liveness alone let cross-boot pid reuse
+    keep 64/64 slots stale — publishes were being DROPPED table-full).
+    Along the way: 366-368-vs-389-391 resid "mismatch" resolved as two
+    chain generations (live-chain publish/lookup rendezvous verified
+    healthy, 3 rotating slots advancing per frame). AWAITING owner
+    verdict on the fix. Then: ladder rungs (Doom fps vs 120-130,
+    kwait default decision, HELIOS_WSI_DCOMP_PRESENT default), and the
+    deferred cleanups: per-present sw-fallback insurance blit on
+    vehicle chains ("measure before removing"), in-process present-sync
+    slot/named-fence round-trips (set_source carries a dead
+    fence_value), eager vehicle fence at init, time-based import
+    negative cache, DirectFlipCaps knob retirement decision.
 - **Capture path**: IddCx frame drop policy vs D3D12 copy queue saturation;
   KVMFR bandwidth; 10 bpc default.
 - Candidates list from the NVIDIA fix era lives in ICD.md.
