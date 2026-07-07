@@ -1053,6 +1053,22 @@ Open defects, roughly ordered:
     orderer untouched); vkcube kwait 4096/4096 armed via the code
     default. AWAITING owner windowed-Doom eyeball: the 8.9 ms dwm CS
     stalls are gone — stutter verdict decides the DCOMP default next.
+    **OWNER VERDICT: STUTTER FIXED (fps ~same, as expected — the
+    limiter is copy completion+observation, a separate lever). DCOMP
+    DEFAULT FLIPPED ON (mesa `f5037d701ad`, ICD
+    `vulkan_virtio-d6e68f7a3322` deployed): the vehicle now serves
+    every Vulkan swapchain by default; HELIOS_WSI_DCOMP_PRESENT=0 =
+    per-process kill switch. Verified: env-free vkcube goes vehicle
+    LIVE, kwait 1536/1536 armed, acquire-gate 84 µs / 0 timeouts,
+    content advancing (paintcap pair). The vehicle class (WS2 road 4)
+    is DONE: kwait ON by default, skip-if-unretired ON by default,
+    hwnd→target registry, insurance knob available. REMAINING WS2
+    PERF LEVER: the vehicle copy's completion+observation latency
+    (acquire gate ≈ 7.7 ms under Doom ≈ 1 host-GPU frame) — measure
+    host-side scheduling before touching. Deferred cleanups: in-process
+    slot round-trips (dead set_source fence_value), eager vehicle
+    fence at init, WSI perf-counter oddity, cold-boot re-verify,
+    GdiAccelMode retirement, DirectFlipCaps knob retirement.**
 - **Capture path**: IddCx frame drop policy vs D3D12 copy queue saturation;
   KVMFR bandwidth; 10 bpc default.
 - Candidates list from the NVIDIA fix era lives in ICD.md.
