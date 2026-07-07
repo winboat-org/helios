@@ -3952,40 +3952,57 @@ unsafe extern "C" fn set_predication(
     context.SetPredication(predicate.as_ref(), predicate_value != 0);
 }
 
-/// Current D3D11 caps profile for Helios: expose a conservative FL10.0 device
-/// with no multisample render targets. The Microsoft runtime validates
-/// `CheckFormatSupport` and `CheckMultisampleQualityLevels` as a coherent
-/// feature-level contract during `CDevice::LLOCompleteLayerConstruction`; forwarding
-/// DXVK's host-derived MSAA caps over-reports support for some formats and makes
-/// the runtime reject the adapter with `DXGI_ERROR_UNSUPPORTED`.
-fn helios_multisample_quality_levels(_fmt: ddi::DXGI_FORMAT, sample_count: u32) -> u32 {
-    if sample_count == 1 {
-        1
-    } else {
-        0
+/// D3D11 multisample-quality caps, keyed off the active feature-level profile.
+///
+/// The Microsoft runtime validates `CheckFormatSupport` and
+/// `CheckMultisampleQualityLevels` as a coherent feature-level contract during
+/// `CDevice::LLOCompleteLayerConstruction`. The FL10.0 profile expresses a
+/// no-multisample device (1x only) coherently with `check_format_support`
+/// stripping the multisample bits — forwarding DXVK's host-derived MSAA caps
+/// while those bits are stripped is the incoherence that historically got the
+/// adapter rejected with `DXGI_ERROR_UNSUPPORTED`. The FL11_0 profile forwards
+/// DXVK's real quality levels (FL11 requires multisample support), which is
+/// coherent because `check_format_support` also stops masking under FL11.
+unsafe fn helios_multisample_quality_levels(
+    h: Hdevice,
+    fmt: ddi::DXGI_FORMAT,
+    sample_count: u32,
+) -> u32 {
+    if !crate::feature_level_11_enabled() {
+        return if sample_count == 1 { 1 } else { 0 };
     }
+    if sample_count == 0 {
+        return 0;
+    }
+    if let Some(device) = d3d11_device(h) {
+        if let Ok(n) = device.CheckMultisampleQualityLevels(DXGI_FORMAT(fmt as i32), sample_count) {
+            return n;
+        }
+    }
+    // DXVK unreachable: fall back to the conservative single-sample answer.
+    if sample_count == 1 { 1 } else { 0 }
 }
 
 unsafe extern "C" fn check_multisample_quality_levels(
-    _h: Hdevice,
+    h: Hdevice,
     fmt: ddi::DXGI_FORMAT,
     sample_count: u32,
     out: *mut u32,
 ) {
     if !out.is_null() {
-        *out = helios_multisample_quality_levels(fmt, sample_count);
+        *out = helios_multisample_quality_levels(h, fmt, sample_count);
     }
 }
 
 unsafe extern "C" fn check_multisample_quality_levels_wddm1_3(
-    _h: Hdevice,
+    h: Hdevice,
     fmt: ddi::DXGI_FORMAT,
     sample_count: u32,
     _flags: u32,
     out: *mut u32,
 ) {
     if !out.is_null() {
-        *out = helios_multisample_quality_levels(fmt, sample_count);
+        *out = helios_multisample_quality_levels(h, fmt, sample_count);
     }
 }
 
@@ -4086,10 +4103,15 @@ unsafe extern "C" fn check_format_support(h: Hdevice, fmt: ddi::DXGI_FORMAT, out
             caps = c;
         }
     }
-    // Keep format support coherent with the current FL10.0/no-MSAA profile.
+    // Keep format support coherent with the active feature-level profile.
     // API D3D11_FORMAT_SUPPORT: MULTISAMPLE_RESOLVE=0x40000,
     // MULTISAMPLE_RENDERTARGET=0x200000, MULTISAMPLE_LOAD=0x400000.
-    caps &= !0x0064_0000u32;
+    // At FL10.0 we strip the multisample bits (the no-MSAA profile); FL11_0
+    // requires multisample support, so forward DXVK's real bits — coherent
+    // with check_multisample_quality_levels, which forwards the same source.
+    if !crate::feature_level_11_enabled() {
+        caps &= !0x0064_0000u32;
+    }
 
     // The Microsoft D3D11 runtime validates some typeless/depth format families
     // as a group during CDevice::LLOCompleteLayerConstruction. DXVK reports the

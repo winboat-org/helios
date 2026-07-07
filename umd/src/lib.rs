@@ -837,15 +837,27 @@ unsafe extern "system" fn get_caps(
                     log_line("  GetCaps: SHADER caps = 0");
                 }
                 // D3D11DDI_3DPIPELINESUPPORT_CAPS::Caps is a
-                // D3D11DDI_3DPIPELINELEVEL enum. Advertising 10_1 lets the
-                // runtime enter CreateDevice; the stricter MSAA/format caps then
-                // make it settle on FL10_0 for this adapter. Advertising exactly
-                // 10_0 makes the runtime remove the device before CreateDevice
-                // completes on this stack.
+                // D3D11DDI_3DPIPELINELEVEL enum (WDK 10.0.26100: _10_0=0,
+                // _10_1=1, _11_0=2). This is the MAX pipeline level the driver
+                // claims; the runtime then settles down per the format/MSAA
+                // caps. Default profile advertises 10_1 (settles at FL10_0 —
+                // advertising exactly 10_0 makes the runtime remove the device
+                // before CreateDevice completes on this stack). With
+                // FeatureLevel11 set, claim 11_0 and let the now-unmasked MSAA
+                // and format caps carry it to a full FL11_0 device.
                 D3D11DDICAPS_3DPIPELINESUPPORT if args.data_size >= 4 => {
                     const D3D11DDI_3DPIPELINELEVEL_10_1: u32 = 1;
-                    unsafe { *(args.p_data as *mut u32) = D3D11DDI_3DPIPELINELEVEL_10_1 };
-                    log_line("  GetCaps: 3DPIPELINESUPPORT = 10_1");
+                    const D3D11DDI_3DPIPELINELEVEL_11_0: u32 = 2;
+                    let level = if feature_level_11_enabled() {
+                        D3D11DDI_3DPIPELINELEVEL_11_0
+                    } else {
+                        D3D11DDI_3DPIPELINELEVEL_10_1
+                    };
+                    unsafe { *(args.p_data as *mut u32) = level };
+                    log_line(&format!(
+                        "  GetCaps: 3DPIPELINESUPPORT = {}",
+                        if level == D3D11DDI_3DPIPELINELEVEL_11_0 { "11_0" } else { "10_1" }
+                    ));
                 }
                 // D3D11.1 optional caps. The zeroed structs are valid
                 // conservative answers: no logic-op, no debug binary support,
@@ -939,6 +951,72 @@ pub(crate) fn trace_enabled() -> bool {
                 HKEY_LOCAL_MACHINE,
                 c"SOFTWARE\\Helios".as_ptr().cast(),
                 c"UmdTrace".as_ptr().cast(),
+                RRF_RT_REG_DWORD,
+                core::ptr::null_mut(),
+                (&mut value as *mut u32).cast(),
+                &mut len,
+            )
+        };
+        rc == 0 && value != 0
+    })
+}
+
+/// Whether the adapter advertises D3D11 feature level 11_0 instead of the
+/// conservative FL10_0 profile: `HKLM\SOFTWARE\Helios!FeatureLevel11`
+/// (REG_DWORD) != 0. Absent/0 = FL10_0 (the safe default; the desktop needs
+/// nothing higher). Read once per process, so an already-running dwm keeps the
+/// level it created its device at while a freshly-launched app (3DMark Fire
+/// Strike wants FL11_0) picks up the new value.
+///
+/// This gate MUST cover the three caps together — the 3DPIPELINESUPPORT
+/// pipeline level, `check_format_support`'s multisample bits, and
+/// `CheckMultisampleQualityLevels` — because the Microsoft runtime validates
+/// them as one coherent feature-level contract during
+/// `CDevice::LLOCompleteLayerConstruction`; a partial change is rejected with
+/// DXGI_ERROR_UNSUPPORTED. FL11_0 additionally requires real multisample
+/// support, which the FL10_0 profile deliberately suppresses.
+///
+/// ⚠️ NOT YET FUNCTIONAL — keep this 0. 30th-session finding (2026-07-07):
+/// with the knob on, the D3D runtime rejects the adapter at the ADAPTER level.
+/// The query trail (umd log) is `OpenAdapter → GetCaps(3DPIPELINESUPPORT=11_0)
+/// → GetSupportedVersions → CloseAdapter`: it NEVER reaches CreateDevice and
+/// D3D11CreateDevice returns 0x887a0004 for EVERY requested level (11_0 down to
+/// 9_1 and the default). So the rejection is the 11_0 pipeline claim itself,
+/// not caps coherence (MSAA/format are never even queried) and not the DDI
+/// versions (D3D11_0=0x000b000a00020000 / D3D11_1=0x000b000f00000000 are
+/// advertised correctly and both are FL11-capable). The ceiling is imposed
+/// BELOW the UMD — dxgkrnl/KMD adapter feature-level eligibility; the prime
+/// suspect is the KMD's null execution engine (query_adapter_info.rs rejects
+/// PHYSICALADAPTERCAPS for the same reason). Raising the ceiling needs
+/// KMD-side work (reboot territory) — that is the remaining FL11 blocker. The
+/// UMD caps below are the correct, verified UMD half (knob=0 A/B reproduces the
+/// exact FL10_0 baseline: FL_10_0/9_1/default all create).
+pub(crate) fn feature_level_11_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        #[link(name = "advapi32")]
+        unsafe extern "system" {
+            fn RegGetValueA(
+                hkey: usize,
+                sub_key: *const u8,
+                value: *const u8,
+                flags: u32,
+                type_out: *mut u32,
+                data: *mut c_void,
+                data_len: *mut u32,
+            ) -> i32;
+        }
+        const HKEY_LOCAL_MACHINE: usize = 0x8000_0002;
+        const RRF_RT_REG_DWORD: u32 = 0x10;
+        let mut value: u32 = 0;
+        let mut len: u32 = 4;
+        // SAFETY: NUL-terminated key/value names; `value`/`len` outlive the call.
+        let rc = unsafe {
+            RegGetValueA(
+                HKEY_LOCAL_MACHINE,
+                c"SOFTWARE\\Helios".as_ptr().cast(),
+                c"FeatureLevel11".as_ptr().cast(),
                 RRF_RT_REG_DWORD,
                 core::ptr::null_mut(),
                 (&mut value as *mut u32).cast(),
