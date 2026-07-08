@@ -1386,7 +1386,9 @@ unsafe extern "C" fn create_resource(
                 MiscFlags: misc,
             };
             const DDI_BIND_PRESENT: u32 = 0x0000_0080;
+            // Only BGRA/BGRX scan-out formats (SET_SCANOUT_BLOB's accepted set) may become DRM-modifier images; A8_UNORM etc. under modifier tiling have zero host format features -> CS error.
             let is_scanout = env_flag("HELIOS_SCANOUT_MODIFIER")
+                && matches!(a.Format as u32, 87 | 88)
                 && (!a.pPrimaryDesc.is_null() || (a.BindFlags & DDI_BIND_PRESENT) != 0);
             let mut handled = false;
             if is_scanout {
@@ -1675,6 +1677,16 @@ unsafe extern "C" fn open_resource(
         ident.resource_id, venus_alloc_size, ident.memory_type_index, ident.kind, ident.ctx_id,
         meta.bind_flags, meta.misc_flags, open_bind, open_misc, open_dxgi_format, meta.format
     ));
+    // Fix B: when HELIOS_SCANOUT_MODIFIER is set, rebuild a scan-out-primary
+    // import (creator's RAW bind still carries DDI_BIND_PRESENT 0x80 — the
+    // api-translated `open_bind` above strips it) as a DRM_FORMAT_MODIFIER(LINEAR)
+    // + DMA_BUF image, symmetric with the create-path export, so its size matches
+    // the exporter's and DXVK's undersize-import guard passes. Unset env → false
+    // → byte-identical OPTIMAL import as before.
+    // Only BGRA/BGRX scan-out formats (SET_SCANOUT_BLOB's accepted set) may become DRM-modifier images; A8_UNORM etc. under modifier tiling have zero host format features -> CS error.
+    let import_scanout = env_flag("HELIOS_SCANOUT_MODIFIER")
+        && matches!(meta.dxgi_format, 87 | 88)
+        && (meta.bind_flags & 0x0000_0080) != 0;
     let raw = dev.dxvk.open_ddi_texture2d(
         meta.width.max(1),
         meta.height.max(1),
@@ -1685,6 +1697,7 @@ unsafe extern "C" fn open_resource(
         ident.resource_id,
         venus_alloc_size,
         ident.memory_type_index,
+        import_scanout,
     );
     if raw == 0 {
         // Import of a KMD-validated-live resource failed: a real bug, not a
@@ -7418,6 +7431,8 @@ unsafe fn vehicle_present_prepare(
             info.resid,
             info.alloc_size,
             info.memory_type_index,
+            // Not the DWM scan-out primary import; keep the plain OPTIMAL path.
+            false,
         );
         if raw == 0 {
             let n = EXT_IMPORT_FAILS.fetch_add(1, Ordering::Relaxed);

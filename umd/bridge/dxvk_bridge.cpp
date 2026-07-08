@@ -1163,7 +1163,8 @@ std::size_t HeliosDxvkDevice::open_ddi_texture2d(
     std::uint32_t global,
     std::uint32_t renderer_resource_id,
     std::uint64_t venus_alloc_size,
-    std::uint32_t memory_type_index) const {
+    std::uint32_t memory_type_index,
+    bool scanout_modifier) const {
   if (!impl || !impl->d3d11 || !global || !renderer_resource_id || !width || !height)
     return 0;
 
@@ -1203,6 +1204,9 @@ std::size_t HeliosDxvkDevice::open_ddi_texture2d(
     // as a (size, type) pair, so size == 0 means "no recorded identity" and
     // the type must not be applied as an override either.
     importInfo.MemoryTypeIndex = venus_alloc_size ? memory_type_index : ~0u;
+    // Fix B: rebuild this import as a DRM_FORMAT_MODIFIER(LINEAR)+DMA_BUF image
+    // (symmetric with the scan-out-primary export) when the caller flags it.
+    importInfo.ModifierLinear  = scanout_modifier;
 
     auto* device = reinterpret_cast<dxvk::D3D11Device*>(impl->d3d11);
     auto* texture = new dxvk::D3D11Texture2D(

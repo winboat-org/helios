@@ -58,6 +58,7 @@ pub mod ffi {
             renderer_resource_id: u32,
             venus_alloc_size: u64,
             memory_type_index: u32,
+            scanout_modifier: bool,
         ) -> usize;
 
         /// Create the DWM scan-out primary as a DRM_FORMAT_MODIFIER(LINEAR) +

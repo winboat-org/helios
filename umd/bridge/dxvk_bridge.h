@@ -54,7 +54,8 @@ struct HeliosDxvkDevice {
       std::uint32_t global,
       std::uint32_t renderer_resource_id,
       std::uint64_t venus_alloc_size,
-      std::uint32_t memory_type_index) const;
+      std::uint32_t memory_type_index,
+      bool scanout_modifier) const;
 
   // Create the DWM scan-out primary as a DRM_FORMAT_MODIFIER(LINEAR) +
   // DMA_BUF-exportable image (via the D3D11_HELIOS_CREATE_INFO scan-out marker),
