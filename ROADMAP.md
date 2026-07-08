@@ -37,16 +37,22 @@ workstream sections hold the detailed evidence.
    surface — D3D12 is dead only because our UMD has no D3D12). The live thread:
    **DXGI `EnumOutputs`/`GetDisplayModeList` racily return `0x887a0022`** on the
    Helios adapters, DWM never imports the app's flip backbuffer (its max
-   imported resid trails the app's), and there are **two identically-named
-   "Helios vGPU Render Adapter" DXGI entries that both resolve to the same
-   physical WDDM adapter** — a stale-LUID residue from repeated device restarts.
-   CCD pins the live output to one LUID; the other is a phantom. NEXT: reboot to
-   clear stale adapter LUIDs (owner approval), re-run
-   `adapter_live_probe`/`ccd_adapter_probe`/`dxgi_output_modes_probe`; if a
-   single clean adapter still fails `EnumOutputs`, fix the render-adapter↔IddCx
-   output exposure so DXGI enumerates the desktop output (31st-session split,
-   broader). Detail: memory `phantom-adapter-luid-enumoutputs-33rd`,
-   `faceworks-black-d3dflip-twomemory-split-33rd`.
+   imported resid trails the app's). **ROOT-CAUSED 2026-07-08 (34th) — see
+   `WINDOWED_BLT_DESIGN.md` (full design + implementation plan) and memory
+   `windowed-blt-occluded-root-34th-session`.** It is specifically the legacy
+   **`DXGI_SWAP_EFFECT_DISCARD` (BLT) swap model** returning `DXGI_STATUS_OCCLUDED`;
+   **flip composites fine** (proven with `tools/d3d11_triangle.cpp`). Falsified:
+   alpha, IDD, two-memory-split, phantom-LUID/EnumOutputs, adapter selection, AND
+   the cross-adapter cap (present is same-adapter, not cross). Real cause: a legacy
+   DISCARD windowed present needs a **real active VidPn output** in the path; ours
+   has none — the only monitor is the indirect IddCx one, enumerated on Helios's
+   **runtime-synthesized *facade* output** (`NumOfSources=0`), and there is no real
+   display adapter to cross-adapter to. FIX = give Helios a **real (virtual) VidPn
+   source** (RDP/display-miniport model) so DISCARD resolves a real output; do the
+   **Stage-0 WARP A/B first** (WINDOWED_BLT_DESIGN.md §6). The "two Helios adapters"
+   are the Helios render adapter + the Looking Glass IddCx adapter (which inherits
+   the render adapter's name) — NOT stale residue. Deployed: KMD v22.22.62.0 +
+   reverted `CrossAdaptCaps` knob.
 
 2. **Slow first-paint on some windows — our UMD makes DWM wait.** Settings app,
    parts of Explorer on fresh open, and (easiest repro) the **UAC dimmed
