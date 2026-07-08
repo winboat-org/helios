@@ -271,9 +271,60 @@ Recommend prototyping **(i)** first (least invasive); fall back to **(ii)**.
   prints `present_hr`, NOT a pointer — `umd/src/forward.rs:7976`).
 
 ## 9. Current deployed state
-- KMD **v22.22.62.0** (`CrossAdaptCaps` knob, reverted to 0) — commit-worthy.
-- Uncommitted: `kmd_render/{build.rs,Cargo.make.toml,src/ddi/query_adapter_info.rs}`,
-  `tools/d3d11_triangle.cpp` (topmost), `tools/adapter_type_probe.cpp` (new).
+
+> **✅ 36th SESSION (2026-07-08) — VidPn-source ACTIVATION fix built as KMD v22.22.66.0
+> (DisplayHalf-gated, awaiting owner install+reboot).** The 35th-session blocker (OS never
+> activates the source → never calls `SetVidPnSourceAddress` → scanout never runs → SDL
+> "not active", mode-set retry loop) was root-caused against **viogpu3d** (the virtio-gpu
+> render+display miniport = Helios's exact analog). A working virtio-gpu display miniport has
+> **three** things the 35th display half lacked — any one causes the retry loop:
+> 1. **Monitor EDID** — `QueryDeviceDescriptor` now serves a valid EDID (was
+>    `CHILD_DESCRIPTOR_NOT_SUPPORTED` → EDID-less default monitor).
+> 2. **Real `CommitVidPn`** — inspects the pinned source mode (was a bare `return SUCCESS`
+>    that never checks the pin — viogpu3d `viogpu_vidpn.cpp:270` is exactly this failure).
+> 3. **⭐ CRTC_VSYNC heartbeat** — a 16 ms `KTIMER`/`KDPC` synthesizes
+>    `DXGK_INTERRUPT_CRTC_VSYNC` (viogpu3d FlipThread `:1977`), the flip-queue heartbeat a
+>    render-only adapter lacks; `ControlInterrupt` now services CRTC_VSYNC.
+> Plus (owner's steer) the mode + EDID now come from the host: `GET_DISPLAY_INFO` `pmodes[0]`
+> (already fetched at init, previously discarded) → `adapter.display_mode()` → runtime
+> `build_edid(w,h)`. Downstream `SET_SCANOUT_BLOB` is already wired; the DISPLAY.md §8 export
+> gate is the next gate. Diag records `DpInf`/`DspMd` (host/adopted mode), `VpCP`/`VpCW`
+> (pinned source mode?), `ScVs` (VSync count), `VpSA`→`ScSet` (scanout) distinguish which
+> piece worked this boot. Memory: `windowed-blt-vidpn-activation-36th`.
+
+
+> **✅ STAGE 1 IMPLEMENTED + BUILT (2026-07-08, 35th session) — KMD v22.22.63.0,
+> behind the `DisplayHalf` knob (default 0). NOT yet installed/tested.**
+> §6.3 resolved from the MS docs: a VidPn source+target+monitor must be
+> same-adapter (`enumerating-child-devices-of-a-display-adapter.md:19,39`), so
+> §6.3(i) (headless source → IddCx monitor) is **impossible**; Stage 1 gives
+> Helios its **own** 2nd (virtual, no-scanout) monitor — owner-approved ("IDD
+> renders unchanged; I can't observe the 2nd monitor"). Also: Helios is **not**
+> strictly MCDM (it already registers the display DDI table, no ComputeOnly), so
+> the MCDM "VidPn DDIs prohibited" rule does not apply. Honest caveat: the
+> presentation-path docs don't tie OCCLUDED to a VidPn source, so the knob A/B —
+> not the docs — is the arbiter (Stage 0 WARP result is the real support).
+>
+> Implemented (all gated on `DisplayHalf`, default 0 = today's surface):
+> `adapter.display_half`; `start_device` sources/children=1 + child DDIs
+> (QueryChildRelations TypeVideoOutput, QueryChildStatus connected,
+> QueryDeviceDescriptor→CHILD_DESCRIPTOR_NOT_SUPPORTED default monitor,
+> new GetChildContainerId); new `ddi/vidpn.rs` (viogpudo-style
+> EnumVidPnCofuncModality + RecommendMonitorModes, single 1920x1080@60 mode);
+> `display.rs` VidPn DDIs (IsSupportedVidPn=TRUE, RecommendFunctionalVidPn=
+> NO_RECOMMENDED, Commit/SetAddr/SetVisibility/UpdatePath=SUCCESS no-op,
+> QueryVidPnHWCapability=zeroed). See memory `windowed-blt-display-half-implemented-35th`.
+>
+> **Test procedure:** `win_install_kmd` (reboot; still DisplayHalf 0 → healthy) →
+> `reg add HKLM\SYSTEM\CurrentControlSet\Services\helios_kmd_render /v DisplayHalf
+> /t REG_DWORD /d 1 /f` → `pnputil /restart-device` on the Helios PCI device (no
+> reboot) → confirm LG desktop still primary + rendering → run `helios_triangle`
+> `default blt 20` + `helios_capture_faceworks`. GREEN = BLT Present S_OK +
+> composites. Revert via SSH: DisplayHalf=0 + restart-device.
+
+- KMD **v22.22.63.0** (adds the `DisplayHalf` display half; default 0) — commit-worthy.
+- Also uncommitted from 34th: `tools/d3d11_triangle.cpp` (topmost),
+  `tools/adapter_type_probe.cpp` (new), the `CrossAdaptCaps` knob (reverted to 0).
 - `HeliosRenderAdapter=1` (DWM on Helios). Desktop healthy.
 
 ## 10. Open questions to answer in the next session

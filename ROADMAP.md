@@ -51,8 +51,22 @@ workstream sections hold the detailed evidence.
    source** (RDP/display-miniport model) so DISCARD resolves a real output; do the
    **Stage-0 WARP A/B first** (WINDOWED_BLT_DESIGN.md §6). The "two Helios adapters"
    are the Helios render adapter + the Looking Glass IddCx adapter (which inherits
-   the render adapter's name) — NOT stale residue. Deployed: KMD v22.22.62.0 +
-   reverted `CrossAdaptCaps` knob.
+   the render adapter's name) — NOT stale residue.
+   **STAGE 0 DONE + STAGE 1 IMPLEMENTED (2026-07-08, 35th):** Stage 0 validated
+   Option A on-screen (disable Helios → WARP presentable → BLT composites). §6.3
+   resolved from MS docs — a VidPn source+target+monitor must be same-adapter, so
+   Helios gets its OWN 2nd (virtual, no-scanout) monitor (owner-approved; IDD
+   renders unchanged, monitor unobserved). **Built KMD v22.22.63.0** with the full
+   display half behind a `DisplayHalf` REG_DWORD knob (default 0 = today's
+   render-only surface): `start_device` sources/children=1 + child DDIs +
+   GetChildContainerId; new `ddi/vidpn.rs` (viogpudo-style
+   EnumVidPnCofuncModality/RecommendMonitorModes, single 1920x1080@60); VidPn DDIs
+   in `display.rs` (IsSupportedVidPn=TRUE, RecommendFunctionalVidPn=NO_RECOMMENDED,
+   Commit/SetAddr/SetVisibility=SUCCESS no-op scanout). Compiles + signed; NOT yet
+   installed. **NEXT: owner install (reboot) → `DisplayHalf`=1 + `pnputil
+   /restart-device` → BLT triangle un-occlusion test** (WINDOWED_BLT_DESIGN.md §9,
+   memory `windowed-blt-display-half-implemented-35th`). Honest caveat: docs don't
+   tie OCCLUDED to a VidPn source — the knob A/B is the arbiter.
 
 2. **Slow first-paint on some windows — our UMD makes DWM wait.** Settings app,
    parts of Explorer on fresh open, and (easiest repro) the **UAC dimmed

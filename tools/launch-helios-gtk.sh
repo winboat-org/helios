@@ -53,7 +53,7 @@ fi
 USER_NAME=${SUDO_USER:-rupansh}; USER_UID=$(id -u "$USER_NAME")
 DISK=/var/lib/libvirt/images/win11.qcow2; NVRAM=/var/lib/libvirt/qemu/nvram/win11_VARS.fd
 SWSRC=/var/lib/libvirt/swtpm/bfe8dc1f-8c5b-435c-8045-1ef3a5c19053/tpm2; TPMDIR=/tmp/helios-tpm; SHARE=/home/rupansh/helios-vgpu
-DISPLAY_MODE=${HELIOS_DISPLAY:-gtk}
+DISPLAY_MODE=${HELIOS_DISPLAY:-sdl}
 QEMU_RENDER_GPU=${HELIOS_QEMU_RENDER_GPU:-intel}
 DISABLE_VIRTIO_GPU=${HELIOS_DISABLE_VIRTIO_GPU:-0}
 INTEL_RENDER_NODE=${HELIOS_INTEL_RENDER_NODE:-/dev/dri/renderD129}
@@ -220,7 +220,7 @@ VIRTIOFSD_PID=$!
 /usr/bin/swtpm socket --tpmstate dir="$TPMDIR/state" --ctrl type=unixio,path="$TPMDIR/swtpm-sock" --tpm2 --daemon --pid file="$TPMDIR/swtpm.pid"
 sleep 1
 
-qemu_display_args=(-display gtk,gl=on)
+qemu_display_args=(-display sdl,gl=on)
 qemu_lg_args=()
 qemu_gpu_args=()
 qemu_env_prefix=(env)
