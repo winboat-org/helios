@@ -56,6 +56,20 @@ struct HeliosDxvkDevice {
       std::uint64_t venus_alloc_size,
       std::uint32_t memory_type_index) const;
 
+  // Create the DWM scan-out primary as a DRM_FORMAT_MODIFIER(LINEAR) +
+  // DMA_BUF-exportable image (via the D3D11_HELIOS_CREATE_INFO scan-out marker),
+  // and report its real memory-plane-0 row pitch + offset (from
+  // vkGetImageSubresourceLayout) so the KMD programs SET_SCANOUT_BLOB with the
+  // exact host layout. Returns an owned ID3D11Resource* (as usize), or 0.
+  std::size_t create_ddi_scanout_texture2d(
+      std::uint32_t width,
+      std::uint32_t height,
+      std::uint32_t format,
+      std::uint32_t bind_flags,
+      std::uint32_t misc_flags,
+      std::uint64_t* out_row_pitch,
+      std::uint64_t* out_offset) const;
+
   // Shader creation wrappers. DXVK may throw dxvk::DxvkError while compiling
   // shader modules; these methods catch it and return 0 so exceptions never
   // cross the D3D UMD ABI.

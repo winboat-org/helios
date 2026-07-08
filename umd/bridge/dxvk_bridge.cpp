@@ -1237,6 +1237,105 @@ std::size_t HeliosDxvkDevice::open_ddi_texture2d(
   return 0;
 }
 
+std::size_t HeliosDxvkDevice::create_ddi_scanout_texture2d(
+    std::uint32_t width,
+    std::uint32_t height,
+    std::uint32_t format,
+    std::uint32_t bind_flags,
+    std::uint32_t misc_flags,
+    std::uint64_t* out_row_pitch,
+    std::uint64_t* out_offset) const {
+  if (out_row_pitch) *out_row_pitch = 0;
+  if (out_offset)    *out_offset = 0;
+  if (!impl || !impl->d3d11 || !width || !height)
+    return 0;
+
+  try {
+    {
+      char msg[192];
+      std::snprintf(msg, sizeof(msg),
+        "CreateDdiScanoutTexture2D begin %ux%u fmt=%u bind=0x%08x misc=0x%08x",
+        width, height, format, bind_flags, misc_flags);
+      umd_log(msg);
+    }
+
+    // Build a plain 2D DEFAULT-usage description. The scan-out primary is a
+    // device-local render target the host scans out of; sharing is driven by
+    // the D3D11_HELIOS_CREATE_INFO marker (Export + DMA_BUF + DRM modifier),
+    // NOT by the desc's D3D11 MiscFlags, so we do not force MISC_SHARED here.
+    dxvk::D3D11_COMMON_TEXTURE_DESC desc = { };
+    desc.Width          = width;
+    desc.Height         = height;
+    desc.Depth          = 1;
+    desc.MipLevels      = 1;
+    desc.ArraySize      = 1;
+    desc.Format         = static_cast<DXGI_FORMAT>(format);
+    desc.SampleDesc.Count   = 1;
+    desc.SampleDesc.Quality = 0;
+    desc.Usage          = D3D11_USAGE_DEFAULT;
+    desc.BindFlags      = bind_flags;
+    desc.CPUAccessFlags = 0;
+    desc.MiscFlags      = misc_flags;
+    desc.TextureLayout  = D3D11_TEXTURE_LAYOUT_UNDEFINED;
+
+    dxvk::D3D11_HELIOS_CREATE_INFO createInfo = { };
+    createInfo.ScanoutPrimary = true;
+
+    auto* device = reinterpret_cast<dxvk::D3D11Device*>(impl->d3d11);
+    // Fresh Export create: no imported vkImage, no shared handle, no import
+    // identity. The last argument marks it as the DWM scan-out primary.
+    auto* texture = new dxvk::D3D11Texture2D(
+        device, &desc, nullptr,
+        INVALID_HANDLE_VALUE,
+        nullptr,       // pHeliosImport
+        &createInfo);  // pHeliosCreate → ScanoutPrimary
+
+    ID3D11Resource* resource = nullptr;
+    HRESULT hr = texture->QueryInterface(
+        __uuidof(ID3D11Resource),
+        reinterpret_cast<void**>(&resource));
+    if (FAILED(hr) || !resource) {
+      umd_log("CreateDdiScanoutTexture2D: QI(ID3D11Resource) failed");
+      return 0;
+    }
+
+    // Query the REAL DRM-modifier plane-0 row pitch + offset so the KMD can
+    // program SET_SCANOUT_BLOB with the exact host layout instead of a
+    // width*4 / cross-adapter guess (a wrong stride/offset shears the image).
+    auto* common = dxvk::GetCommonTexture(resource);
+    if (common && common->GetImage() != nullptr) {
+      VkImageSubresource sub = { };
+      sub.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; // overridden to MEMORY_PLANE_0 for the scan-out primary
+      sub.mipLevel   = 0;
+      sub.arrayLayer = 0;
+      VkSubresourceLayout layout =
+        device->GetDXVKDevice()->queryImageSubresourceLayout(common->GetImage()->info(), sub);
+      if (out_row_pitch) *out_row_pitch = layout.rowPitch;
+      if (out_offset)    *out_offset = layout.offset;
+
+      char msg[192];
+      std::snprintf(msg, sizeof(msg),
+        "CreateDdiScanoutTexture2D %ux%u fmt=%u rowPitch=%llu offset=%llu resource=%p",
+        width, height, format,
+        static_cast<unsigned long long>(layout.rowPitch),
+        static_cast<unsigned long long>(layout.offset), resource);
+      umd_log(msg);
+    } else {
+      umd_log("CreateDdiScanoutTexture2D: no DxvkImage to query layout");
+    }
+
+    return reinterpret_cast<std::size_t>(resource);
+  } catch (const dxvk::DxvkError& e) {
+    umd_log(("CreateDdiScanoutTexture2D DxvkError: " + e.message()).c_str());
+  } catch (const std::exception& e) {
+    umd_log(e.what());
+  } catch (...) {
+    umd_log("unknown exception in CreateDdiScanoutTexture2D");
+  }
+
+  return 0;
+}
+
 std::size_t HeliosDxvkDevice::create_vertex_shader(const std::uint8_t* code, std::size_t len) const {
   if (!impl || !impl->d3d11 || !code || !len)
     return 0;

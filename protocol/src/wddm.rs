@@ -136,7 +136,9 @@ impl HeliosWddmCmdBuf {
 /// import the backing venus memory with the creator's EXACT allocation size and
 /// memory type — vkr's OPAQUE-fd import requires an exact-size match, and the
 /// memory type must be one the host driver accepts for the exported handle.
-/// 40 bytes, padding-free (six u32 = 24 bytes, so the u64 lands 8-aligned).
+/// 48 bytes, padding-free (six u32 = 24 bytes, then `venus_alloc_size` u64 lands
+/// 8-aligned; two u32 close the 40-byte core; `plane_offset` u64 lands 8-aligned
+/// at offset 40 for a 48-byte total).
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy, Pod, Zeroable)]
 pub struct HeliosWddmAllocMeta {
@@ -161,6 +163,13 @@ pub struct HeliosWddmAllocMeta {
     /// sized, smaller) import. Occupies the former `reserved` u32, so the on-wire
     /// layout is unchanged and older KMD binaries (which zero it) stay compatible.
     pub dxgi_format: u32,
+    /// Byte offset of memory-plane-0 within the backing allocation, from
+    /// `vkGetImageSubresourceLayout` on the DRM-format-modifier scan-out primary
+    /// (0 for every non-scan-out surface and for layouts whose data starts at
+    /// offset 0). `SET_SCANOUT_BLOB` adds this to the blob base so the host reads
+    /// the first row at the right place. Grows the trailer by 8 bytes; the UMD
+    /// and KMD are rebuilt together, so the on-wire layout stays in sync.
+    pub plane_offset: u64,
 }
 
 /// `'HIDN'` — magic of [`HeliosWddmOpenIdentity`].
@@ -212,7 +221,7 @@ impl HeliosWddmOpenIdentity {
 const _: () = {
     assert!(core::mem::size_of::<HeliosWddmAllocPrivate>() == 48);
     assert!(core::mem::size_of::<HeliosWddmCmdBuf>() == 32);
-    assert!(core::mem::size_of::<HeliosWddmAllocMeta>() == 40);
+    assert!(core::mem::size_of::<HeliosWddmAllocMeta>() == 48);
     // The identity record must fit exactly over the HeliosWddmAllocPrivate
     // region so the meta trailer's offset is unchanged for openers.
     assert!(

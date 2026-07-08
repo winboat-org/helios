@@ -60,6 +60,21 @@ pub mod ffi {
             memory_type_index: u32,
         ) -> usize;
 
+        /// Create the DWM scan-out primary as a DRM_FORMAT_MODIFIER(LINEAR) +
+        /// DMA_BUF-exportable image and report its real memory-plane-0 row pitch
+        /// + offset (from `vkGetImageSubresourceLayout`) for `SET_SCANOUT_BLOB`.
+        /// Returns an owned `ID3D11Resource*` (as usize), or 0 on failure.
+        unsafe fn create_ddi_scanout_texture2d(
+            self: &HeliosDxvkDevice,
+            width: u32,
+            height: u32,
+            format: u32,
+            bind_flags: u32,
+            misc_flags: u32,
+            out_row_pitch: *mut u64,
+            out_offset: *mut u64,
+        ) -> usize;
+
         unsafe fn create_vertex_shader(
             self: &HeliosDxvkDevice,
             code: *const u8,

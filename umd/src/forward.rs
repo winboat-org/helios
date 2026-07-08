@@ -293,6 +293,7 @@ unsafe fn read_alloc_meta(
             venus_alloc_size: 0,
             memory_type_index: 0,
             dxgi_format: 0,
+            plane_offset: 0,
         });
     }
     if avail >= core::mem::size_of::<StandardAllocMetaV1>() {
@@ -310,6 +311,7 @@ unsafe fn read_alloc_meta(
             venus_alloc_size: 0,
             memory_type_index: 0,
             dxgi_format: 0,
+            plane_offset: 0,
         });
     }
     None
@@ -913,6 +915,11 @@ unsafe fn allocate_wddm_resource(
     backing_resource_id: u32,
     venus_alloc_size: u64,
     memory_type_index: u32,
+    // Scan-out primary only: the exact DRM-modifier memory-plane-0 row pitch +
+    // byte offset from `vkGetImageSubresourceLayout` (0/0 for every other
+    // resource, which keeps the cross-adapter pitch and a 0 plane offset).
+    scanout_pitch: u32,
+    scanout_offset: u64,
 ) -> (ddi::D3DKMT_HANDLE, ddi::D3DKMT_HANDLE) {
     const DDI_BIND_PRESENT: u32 = 0x0000_0080;
     const DDI_MISC_SHARED: u32 = 0x0000_0002;
@@ -948,6 +955,11 @@ unsafe fn allocate_wddm_resource(
         .saturating_mul(dxgi_bytes_per_pixel(a.Format as u32));
     let pitch =
         raw_pitch.saturating_add(CROSS_ADAPTER_PITCH_ALIGN - 1) & !(CROSS_ADAPTER_PITCH_ALIGN - 1);
+    // The scan-out primary reports its EXACT DRM-modifier memory-plane-0 row
+    // pitch (from `vkGetImageSubresourceLayout`); use it verbatim so
+    // `SET_SCANOUT_BLOB` reads rows at the true host stride instead of the
+    // cross-adapter guess (a wrong stride shears the scanned-out image).
+    let pitch = if scanout_pitch != 0 { scanout_pitch } else { pitch };
     let linear_size = (pitch as u64)
         .saturating_mul(mip0.TexelHeight.max(1) as u64)
         .max(4096);
@@ -997,6 +1009,9 @@ unsafe fn allocate_wddm_resource(
             // BGRA (the `format` field below is a lossy D3DDDIFORMAT for the
             // KMD's DescribeAllocation). `a.Format` is already a DXGI_FORMAT.
             dxgi_format: a.Format as u32,
+            // Scan-out primary's real memory-plane-0 offset (0 for everything
+            // else); the KMD adds it to the blob base in SET_SCANOUT_BLOB.
+            plane_offset: scanout_offset,
         },
     };
     if backing_blob_id != 0 && backing_resource_id != 0 {
@@ -1037,7 +1052,17 @@ unsafe fn allocate_wddm_resource(
     } else {
         0
     };
-    allocation_info.Flags.Value = if is_primary_allocation { 1 } else { 0 };
+    // Do NOT set the legacy `Primary` flag (D3DDDI_ALLOCATIONINFOFLAGS2 bit 0). DWM's
+    // flip-model swapchain primaries are already managed by the runtime as
+    // ManagedPrimary, and dxgkrnl rejects the combination — verbatim ETW
+    // (37th session): "PermanentSysMem, Cached, ExistingSysMem, ExistingKernelSysMem
+    // and Primary flags can't be specified with ManagedPrimary." That reject was
+    // E_INVALIDARG (0x80070057) on 143/143 dwm primary allocations, so the composed
+    // desktop never became a scannable primary and the scan-out stayed on the stale
+    // initial primary (blank SDL). The `VidPnSourceId` association above is what ties
+    // the allocation to our source; the runtime's ManagedPrimary handles the primary
+    // designation and the flip → SetVidPnSourceAddress → SET_SCANOUT_BLOB path.
+    allocation_info.Flags.Value = 0;
     let mut alloc = ddi::D3DDDICB_ALLOCATE::default();
     // pfnAllocateCb expects the runtime resource handle for the resource whose
     // surfaces are being allocated. Shared resources additionally return an
@@ -1110,6 +1135,114 @@ unsafe fn allocate_wddm_resource(
     }
 }
 
+/// Common tail for a freshly created 2D texture resource (normal or scan-out
+/// primary): record the venus backing identity, make the paired WDDM/KMD
+/// allocation (carrying the scan-out row pitch + plane offset for a primary),
+/// transfer venus-resource ownership to that allocation, KMT-stamp the DXVK
+/// resource, and store it in the DDI handle. `scanout_pitch`/`scanout_offset`
+/// are the DRM-modifier plane-0 layout for the scan-out primary, else 0/0.
+unsafe fn finish_wddm_tex2d(
+    h: Hdevice,
+    a: &ddi::D3D11DDIARG_CREATERESOURCE,
+    mip0: &ddi::D3D10DDI_MIPINFO,
+    h_rt: ddi::D3D10DDI_HRTRESOURCE,
+    h_resource: ddi::D3D10DDI_HRESOURCE,
+    res: ID3D11Resource,
+    scanout_pitch: u32,
+    scanout_offset: u64,
+) {
+    let (memory, memory_size, memory_offset, resource_id) = dxvk_resource_memory_info(h, &res);
+    let (backing_blob_id, backing_blob_size, backing_resource_id) =
+        if memory != 0 && memory_offset == 0 && memory <= u32::MAX as u64 {
+            (memory, memory_size, resource_id)
+        } else {
+            // Only resources that get a WDDM allocation (shared / keyed-mutex /
+            // present / primary) NEED an importable backing — for those a
+            // suballocated DXVK memory means a cross-process opener sees a
+            // disconnected KMD blob (two-memory split), so shout. Private
+            // textures are suballocated by design (18th session).
+            const DDI_BIND_PRESENT: u32 = 0x0000_0080;
+            const DDI_MISC_SHARED: u32 = 0x0000_0002;
+            const DDI_MISC_SHARED_KEYEDMUTEX: u32 = 0x0000_0100;
+            let needs_importable = !a.pPrimaryDesc.is_null()
+                || (a.BindFlags & DDI_BIND_PRESENT) != 0
+                || (a.MiscFlags & (DDI_MISC_SHARED | DDI_MISC_SHARED_KEYEDMUTEX)) != 0;
+            if memory != 0 && needs_importable {
+                log_line(&format!(
+                    "DDI create_resource(tex2d): SHARED RESOURCE WITHOUT IMPORTABLE BACKING memory=0x{:x} res_id={} size={} offset={} bind=0x{:x} misc=0x{:x}",
+                    memory, resource_id, memory_size, memory_offset, a.BindFlags, a.MiscFlags
+                ));
+            } else if memory != 0 {
+                trace_line!(
+                    "DDI create_resource(tex2d): private suballocated memory=0x{:x} size={} offset={}",
+                    memory, memory_size, memory_offset
+                );
+            }
+            (0, 0, 0)
+        };
+    // C1: record the creating vkAllocateMemory's exact size + memory type into
+    // the allocation trailer so cross-process openers import with them.
+    let (mut venus_alloc_size, mut memory_type_index) = (0u64, 0u32);
+    if backing_resource_id != 0 {
+        if let Some(dev) = helios_device(h) {
+            if !dev.dxvk.get_resource_alloc_identity(
+                res.as_raw() as usize,
+                &mut venus_alloc_size,
+                &mut memory_type_index,
+            ) {
+                log_line(&format!(
+                    "DDI create_resource(tex2d): no venus alloc identity for res_id={}",
+                    backing_resource_id
+                ));
+            }
+        }
+    }
+    let (allocation, km_resource) = allocate_wddm_resource(
+        h,
+        a,
+        mip0,
+        h_rt,
+        backing_blob_id,
+        backing_blob_size,
+        backing_resource_id,
+        venus_alloc_size,
+        memory_type_index,
+        scanout_pitch,
+        scanout_offset,
+    );
+    if allocation != 0 && backing_resource_id != 0 {
+        if let Some(dev) = helios_device(h) {
+            if !dev.dxvk.transfer_resource_ownership(res.as_raw() as usize) {
+                log_line(&format!(
+                    "DDI create_resource(tex2d): ownership transfer failed res_id={}",
+                    backing_resource_id
+                ));
+            }
+        }
+    }
+    trace_line!(
+        "DDI create_resource(tex2d): before KMT stamp km=0x{:x} alloc=0x{:x} blob=0x{:x} res_id={} blob_size={}",
+        km_resource, allocation, backing_blob_id, backing_resource_id, backing_blob_size
+    );
+    stamp_dxvk_resource_kmt_handles(h, &res, allocation, km_resource);
+    let n = RESOURCE_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+    if n < 128 {
+        trace_line!(
+            "DDI create_resource(tex2d) ok after-stamp-call: {}x{} fmt={} usage={} bind=0x{:x} misc=0x{:x} sample={}x{}",
+            mip0.TexelWidth, mip0.TexelHeight, a.Format, a.Usage, a.BindFlags,
+            a.MiscFlags, a.SampleDesc.Count, a.SampleDesc.Quality
+        );
+    }
+    store_resource(
+        h_resource.pDrvPrivate,
+        res,
+        allocation,
+        km_resource,
+        h_rt.handle,
+        true, // allocated via pfnAllocateCb above
+    );
+}
+
 unsafe extern "C" fn create_resource(
     h: Hdevice,
     arg: *const ddi::D3D11DDIARG_CREATERESOURCE,
@@ -1178,7 +1311,7 @@ unsafe extern "C" fn create_resource(
                 StructureByteStride: a.ByteStride,
             };
             let (allocation, km_resource) =
-                allocate_wddm_resource(h, a, &mip0, h_rt, 0, 0, 0, 0, 0);
+                allocate_wddm_resource(h, a, &mip0, h_rt, 0, 0, 0, 0, 0, 0, 0);
             let mut buf: Option<ID3D11Buffer> = None;
             match device.CreateBuffer(&desc, init_ptr, Some(&mut buf)) {
                 Ok(()) => {
@@ -1252,150 +1385,94 @@ unsafe extern "C" fn create_resource(
                 CPUAccessFlags: cpu,
                 MiscFlags: misc,
             };
-            let mut tex: Option<ID3D11Texture2D> = None;
-            if mip0.TexelWidth >= 1024 || mip0.TexelHeight >= 576 || misc != 0 {
-                log_line(&format!(
-                    "DDI create_resource(tex2d): calling DXVK CreateTexture2D {}x{} fmt={} bind=0x{:x} misc=0x{:x} init={} hrt={:p} mips={} array={} usage={} cpu=0x{:x} sample={}x{}",
-                    mip0.TexelWidth,
-                    mip0.TexelHeight,
-                    a.Format,
-                    bind,
-                    misc,
-                    init_ptr.is_some(),
-                    h_rt.handle,
-                    desc.MipLevels,
-                    desc.ArraySize,
-                    a.Usage,
-                    cpu,
-                    a.SampleDesc.Count,
-                    a.SampleDesc.Quality
-                ));
-            }
-            match device.CreateTexture2D(&desc, init_ptr, Some(&mut tex)) {
-                Ok(()) => {
-                    if mip0.TexelWidth >= 1024 || mip0.TexelHeight >= 576 || misc != 0 {
-                        log_line(&format!(
-                            "DDI create_resource(tex2d): DXVK CreateTexture2D returned S_OK tex_present={}",
-                            tex.is_some()
-                        ));
-                    }
-                    if let Some(t) = tex {
-                        if let Ok(res) = t.cast::<ID3D11Resource>() {
-                            if mip0.TexelWidth >= 1024 || mip0.TexelHeight >= 576 || misc != 0 {
-                                log_line("DDI create_resource(tex2d): cast to ID3D11Resource OK");
-                            }
-                            let (memory, memory_size, memory_offset, resource_id) =
-                                dxvk_resource_memory_info(h, &res);
-                            let (backing_blob_id, backing_blob_size, backing_resource_id) =
-                                if memory != 0 && memory_offset == 0 && memory <= u32::MAX as u64 {
-                                    (memory, memory_size, resource_id)
-                                } else {
-                                    // Only resources that get a WDDM allocation (shared /
-                                    // keyed-mutex / present / primary) NEED an importable
-                                    // backing — for those a suballocated DXVK memory means
-                                    // a cross-process opener sees a disconnected KMD blob
-                                    // (two-memory split), so shout. Private textures are
-                                    // suballocated by design; that used to log here too and
-                                    // got misread as a shared-resource defect (18th session).
-                                    const DDI_BIND_PRESENT: u32 = 0x0000_0080;
-                                    const DDI_MISC_SHARED: u32 = 0x0000_0002;
-                                    const DDI_MISC_SHARED_KEYEDMUTEX: u32 = 0x0000_0100;
-                                    let needs_importable = !a.pPrimaryDesc.is_null()
-                                        || (a.BindFlags & DDI_BIND_PRESENT) != 0
-                                        || (a.MiscFlags
-                                            & (DDI_MISC_SHARED | DDI_MISC_SHARED_KEYEDMUTEX))
-                                            != 0;
-                                    if memory != 0 && needs_importable {
-                                        log_line(&format!(
-                                            "DDI create_resource(tex2d): SHARED RESOURCE WITHOUT IMPORTABLE BACKING memory=0x{:x} res_id={} size={} offset={} bind=0x{:x} misc=0x{:x}",
-                                            memory, resource_id, memory_size, memory_offset,
-                                            a.BindFlags, a.MiscFlags
-                                        ));
-                                    } else if memory != 0 {
-                                        trace_line!(
-                                            "DDI create_resource(tex2d): private suballocated memory=0x{:x} size={} offset={}",
-                                            memory, memory_size, memory_offset
-                                        );
-                                    }
-                                    (0, 0, 0)
-                                };
-                            // C1: record the creating vkAllocateMemory's exact
-                            // size + memory type into the allocation trailer so
-                            // cross-process openers import with them.
-                            let (mut venus_alloc_size, mut memory_type_index) = (0u64, 0u32);
-                            if backing_resource_id != 0 {
-                                if let Some(dev) = helios_device(h) {
-                                    if !dev.dxvk.get_resource_alloc_identity(
-                                        res.as_raw() as usize,
-                                        &mut venus_alloc_size,
-                                        &mut memory_type_index,
-                                    ) {
-                                        log_line(&format!(
-                                            "DDI create_resource(tex2d): no venus alloc identity for res_id={}",
-                                            backing_resource_id
-                                        ));
-                                    }
-                                }
-                            }
-                            let (allocation, km_resource) = allocate_wddm_resource(
-                                h,
-                                a,
-                                &mip0,
-                                h_rt,
-                                backing_blob_id,
-                                backing_blob_size,
-                                backing_resource_id,
-                                venus_alloc_size,
-                                memory_type_index,
-                            );
-                            if allocation != 0 && backing_resource_id != 0 {
-                                if let Some(dev) = helios_device(h) {
-                                    if !dev.dxvk.transfer_resource_ownership(res.as_raw() as usize)
-                                    {
-                                        log_line(&format!(
-                                            "DDI create_resource(tex2d): ownership transfer failed res_id={}",
-                                            backing_resource_id
-                                        ));
-                                    }
-                                }
-                            }
-                            trace_line!(
-                                "DDI create_resource(tex2d): before KMT stamp km=0x{:x} alloc=0x{:x} blob=0x{:x} res_id={} blob_size={}",
-                                km_resource, allocation, backing_blob_id, backing_resource_id, backing_blob_size
-                            );
-                            stamp_dxvk_resource_kmt_handles(h, &res, allocation, km_resource);
-                            let n = RESOURCE_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-                            if n < 128 {
-                                trace_line!(
-                                    "DDI create_resource(tex2d) ok after-stamp-call: {}x{} fmt={} usage={} bind=0x{:x} misc=0x{:x} sample={}x{}",
-                                    mip0.TexelWidth,
-                                    mip0.TexelHeight,
-                                    a.Format,
-                                    a.Usage,
-                                    bind,
-                                    misc,
-                                    a.SampleDesc.Count,
-                                    a.SampleDesc.Quality
-                                );
-                            }
-                            store_resource(
-                                h_resource.pDrvPrivate,
-                                res,
-                                allocation,
-                                km_resource,
-                                h_rt.handle,
-                                true, // allocated via pfnAllocateCb above
-                            );
-                        } else if mip0.TexelWidth >= 1024 || mip0.TexelHeight >= 576 || misc != 0 {
-                            log_line("DDI create_resource(tex2d): cast to ID3D11Resource failed");
-                        }
-                    } else if mip0.TexelWidth >= 1024 || mip0.TexelHeight >= 576 || misc != 0 {
-                        log_line(
-                            "DDI create_resource(tex2d): DXVK CreateTexture2D returned no texture",
-                        );
-                    }
+            const DDI_BIND_PRESENT: u32 = 0x0000_0080;
+            let is_scanout = env_flag("HELIOS_SCANOUT_MODIFIER")
+                && (!a.pPrimaryDesc.is_null() || (a.BindFlags & DDI_BIND_PRESENT) != 0);
+            let mut handled = false;
+            if is_scanout {
+                // The DWM scan-out primary must be a DRM-format-modifier + DMA_BUF
+                // image — a plain OPTIMAL/LINEAR image exports as MOD_INVALID and
+                // the host scans it out black. Build it via the dedicated bridge
+                // path, which also returns the true memory-plane-0 row pitch +
+                // offset from vkGetImageSubresourceLayout.
+                let mut rp: u64 = 0;
+                let mut off: u64 = 0;
+                let raw = match helios_device(h) {
+                    Some(dev) => dev.dxvk.create_ddi_scanout_texture2d(
+                        mip0.TexelWidth,
+                        mip0.TexelHeight,
+                        a.Format as u32,
+                        bind,
+                        misc,
+                        &mut rp,
+                        &mut off,
+                    ),
+                    None => 0,
+                };
+                if raw != 0 {
+                    log_line(&format!(
+                        "DDI create_resource(tex2d): scan-out primary {}x{} fmt={} rowPitch={} offset={} (DRM-modifier DMA_BUF)",
+                        mip0.TexelWidth, mip0.TexelHeight, a.Format, rp, off
+                    ));
+                    let res = ID3D11Resource::from_raw(raw as *mut c_void);
+                    finish_wddm_tex2d(h, a, &mip0, h_rt, h_resource, res, rp as u32, off);
+                } else {
+                    // Loud failure over fake success: do NOT fall back to a plain
+                    // primary — that reintroduces the black scan-out as a "working"
+                    // desktop. The probe proved modifier+DMA_BUF+full-usage is
+                    // host-supported, so a failure here is a real regression.
+                    log_line(&format!(
+                        "DDI create_resource(tex2d): SCAN-OUT PRIMARY CREATE FAILED {}x{} fmt={} bind=0x{:x} -> no primary (modifier/dmabuf rejected?)",
+                        mip0.TexelWidth, mip0.TexelHeight, a.Format, bind
+                    ));
                 }
-                Err(e) => log_line(&format!("DDI create_resource(tex2d) failed: {e:?}")),
+                handled = true;
+            }
+            if !handled {
+                let mut tex: Option<ID3D11Texture2D> = None;
+                if mip0.TexelWidth >= 1024 || mip0.TexelHeight >= 576 || misc != 0 {
+                    log_line(&format!(
+                        "DDI create_resource(tex2d): calling DXVK CreateTexture2D {}x{} fmt={} bind=0x{:x} misc=0x{:x} init={} hrt={:p} mips={} array={} usage={} cpu=0x{:x} sample={}x{}",
+                        mip0.TexelWidth,
+                        mip0.TexelHeight,
+                        a.Format,
+                        bind,
+                        misc,
+                        init_ptr.is_some(),
+                        h_rt.handle,
+                        desc.MipLevels,
+                        desc.ArraySize,
+                        a.Usage,
+                        cpu,
+                        a.SampleDesc.Count,
+                        a.SampleDesc.Quality
+                    ));
+                }
+                match device.CreateTexture2D(&desc, init_ptr, Some(&mut tex)) {
+                    Ok(()) => {
+                        if mip0.TexelWidth >= 1024 || mip0.TexelHeight >= 576 || misc != 0 {
+                            log_line(&format!(
+                                "DDI create_resource(tex2d): DXVK CreateTexture2D returned S_OK tex_present={}",
+                                tex.is_some()
+                            ));
+                        }
+                        if let Some(t) = tex {
+                            if let Ok(res) = t.cast::<ID3D11Resource>() {
+                                if mip0.TexelWidth >= 1024 || mip0.TexelHeight >= 576 || misc != 0 {
+                                    log_line("DDI create_resource(tex2d): cast to ID3D11Resource OK");
+                                }
+                                finish_wddm_tex2d(h, a, &mip0, h_rt, h_resource, res, 0, 0);
+                            } else if mip0.TexelWidth >= 1024 || mip0.TexelHeight >= 576 || misc != 0 {
+                                log_line("DDI create_resource(tex2d): cast to ID3D11Resource failed");
+                            }
+                        } else if mip0.TexelWidth >= 1024 || mip0.TexelHeight >= 576 || misc != 0 {
+                            log_line(
+                                "DDI create_resource(tex2d): DXVK CreateTexture2D returned no texture",
+                            );
+                        }
+                    }
+                    Err(e) => log_line(&format!("DDI create_resource(tex2d) failed: {e:?}")),
+                }
             }
         }
         RES_TEX3D => {
@@ -1432,7 +1509,7 @@ unsafe extern "C" fn create_resource(
                     if let Some(t) = tex {
                         if let Ok(res) = t.cast::<ID3D11Resource>() {
                             let (allocation, km_resource) =
-                                allocate_wddm_resource(h, a, &mip0, h_rt, 0, 0, 0, 0, 0);
+                                allocate_wddm_resource(h, a, &mip0, h_rt, 0, 0, 0, 0, 0, 0, 0);
                             stamp_dxvk_resource_kmt_handles(h, &res, allocation, km_resource);
                             log_line(&format!(
                                 "DDI create_resource(tex3d) ok: {}x{}x{} fmt={} bind=0x{:x} misc=0x{:x}",
@@ -1552,6 +1629,7 @@ unsafe extern "C" fn open_resource(
         venus_alloc_size: 0,
         memory_type_index: 0,
         dxgi_format: 0,
+        plane_offset: 0,
     });
 
     if a.hKMResource.handle == 0 {
