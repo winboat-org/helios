@@ -124,6 +124,9 @@ fn build_ddi_table() -> DRIVER_INITIALIZATION_DATA {
     data.DxgkDdiQueryChildRelations = Some(ddi::dxgkddi_query_child_relations);
     data.DxgkDdiQueryChildStatus = Some(ddi::dxgkddi_query_child_status);
     data.DxgkDdiQueryDeviceDescriptor = Some(ddi::dxgkddi_query_device_descriptor);
+    // Child container id — only meaningful when the DisplayHalf child video
+    // output is advertised; returns NOT_SUPPORTED otherwise (Option A, #1).
+    data.DxgkDdiGetChildContainerId = Some(ddi::dxgkddi_get_child_container_id);
     data.DxgkDdiQueryAdapterInfo = Some(ddi::dxgkddi_query_adapter_info);
     data.DxgkDdiStopDeviceAndReleasePostDisplayOwnership =
         Some(ddi::dxgkddi_stop_device_and_release_post_display_ownership);
@@ -191,6 +194,9 @@ fn build_ddi_table() -> DRIVER_INITIALIZATION_DATA {
     data.DxgkDdiRecommendMonitorModes = Some(ddi::dxgkddi_recommend_monitor_modes);
     data.DxgkDdiQueryVidPnHWCapability = Some(ddi::dxgkddi_query_vidpn_hw_capability);
     data.DxgkDdiGetScanLine = Some(ddi::dxgkddi_get_scan_line);
+    // MANDATORY once a monitor target is advertised (Option A, #1): a NULL slot
+    // fails StartAdapter with Code 43 (StartAdapter_DxgkDdiUpdateMonitorLinkInfoIsNull).
+    data.DxgkDdiUpdateMonitorLinkInfo = Some(ddi::dxgkddi_update_monitor_link_info);
     data.DxgkDdiExchangePreStartInfo = Some(ddi::dxgkddi_exchange_pre_start_info);
 
     // ── Render-path & GPU-VA DDIs. They are registered so the table shape is

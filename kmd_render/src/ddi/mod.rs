@@ -10,11 +10,13 @@ mod display;
 mod escape;
 mod gdi_blit;
 mod gpummu;
+pub(crate) mod hpd;
 mod interrupt;
 pub(crate) mod query_adapter_info;
 mod scheduler;
 mod start_device;
 mod submit_command;
+pub(crate) mod vidpn;
 
 pub use add_device::dxgkddi_add_device;
 pub use blob_map::unmap_io_pages_from_user;
@@ -22,7 +24,9 @@ pub use build_paging_buffer::{
     diag_dump_gpummu_atomics, dxgkddi_build_paging_buffer, dxgkddi_get_root_page_table_size,
     dxgkddi_set_root_page_table,
 };
-pub use cpu_host_aperture::{dxgkddi_map_cpu_host_aperture, dxgkddi_unmap_cpu_host_aperture};
+pub use cpu_host_aperture::{
+    diag_dump_cpu_host_atomics, dxgkddi_map_cpu_host_aperture, dxgkddi_unmap_cpu_host_aperture,
+};
 pub use create_allocation::{
     dxgkddi_close_allocation, dxgkddi_create_allocation, dxgkddi_describe_allocation,
     dxgkddi_destroy_allocation, dxgkddi_get_standard_allocation_driver_data,
@@ -36,6 +40,7 @@ pub use display::{
     dxgkddi_set_vidpn_source_address, dxgkddi_set_vidpn_source_visibility,
     dxgkddi_stop_device_and_release_post_display_ownership, dxgkddi_system_display_enable,
     dxgkddi_system_display_write, dxgkddi_update_active_vidpn_present_path,
+    dxgkddi_update_monitor_link_info,
 };
 pub use escape::dxgkddi_escape;
 pub use interrupt::{dxgkddi_control_interrupt, dxgkddi_dpc_routine, dxgkddi_interrupt_routine};
@@ -50,10 +55,11 @@ pub use scheduler::{
     dxgkddi_submit_command_to_hw_queue, dxgkddi_switch_to_hw_context_list,
 };
 pub use start_device::{
-    dxgkddi_control_etw_logging, dxgkddi_dispatch_io_request, dxgkddi_notify_acpi_event,
-    dxgkddi_query_child_relations, dxgkddi_query_child_status, dxgkddi_query_device_descriptor,
-    dxgkddi_query_interface, dxgkddi_remove_device, dxgkddi_reset_device, dxgkddi_set_power_state,
-    dxgkddi_start_device, dxgkddi_stop_device, dxgkddi_unload,
+    dxgkddi_control_etw_logging, dxgkddi_dispatch_io_request, dxgkddi_get_child_container_id,
+    dxgkddi_notify_acpi_event, dxgkddi_query_child_relations, dxgkddi_query_child_status,
+    dxgkddi_query_device_descriptor, dxgkddi_query_interface, dxgkddi_remove_device,
+    dxgkddi_reset_device, dxgkddi_set_power_state, dxgkddi_start_device, dxgkddi_stop_device,
+    dxgkddi_unload, vsync_dpc_routine,
 };
 pub use submit_command::{
     diag_dump_engine_atomics, dxgkddi_collect_dbg_info, dxgkddi_patch, dxgkddi_preempt_command,

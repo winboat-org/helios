@@ -742,6 +742,12 @@ pub struct VirtioGpu {
     /// old model, a slow host does NOT set this — waiter timeouts abandon
     /// their entry and the transport keeps working.
     failed: bool,
+    /// Scanout-0 preferred size `(width, height)` reported by the host in the
+    /// `GET_DISPLAY_INFO` reply at `init` (`pmodes[0]`), or `None` if the host
+    /// reported nothing usable. The display half uses this as the VidPn mode +
+    /// generated-EDID native resolution so we present the size QEMU actually wants
+    /// on scanout 0 (instead of a hardcoded guess). Read once by StartDevice.
+    display_mode: Option<(u32, u32)>,
 }
 
 impl VirtioGpu {
@@ -847,6 +853,25 @@ impl VirtioGpu {
             return Err(VirtioError::DeviceError);
         }
         crate::kmsg(c"Helios: virtio-gpu GET_DISPLAY_INFO OK\n");
+        // Remember scanout 0's host-preferred size for the display half's VidPn
+        // mode + generated EDID. QEMU reports it in `pmodes[0].r` even before a
+        // scanout is bound; take it only when both dimensions look sane (a
+        // 0×0 / not-yet-configured scanout falls back to the default in
+        // StartDevice). Recorded so the host's report is visible live.
+        let m0 = resp.pmodes[0].r;
+        let display_mode = if m0.width >= 320
+            && m0.height >= 240
+            && m0.width <= 16384
+            && m0.height <= 16384
+        {
+            Some((m0.width, m0.height))
+        } else {
+            None
+        };
+        crate::diag::record_named_bytes(
+            b"DpInf",
+            (m0.width.min(0xFFFF) << 16) | (m0.height & 0xFFFF),
+        );
 
         // Discover the host-visible blob window (a fresh config accessor — the
         // original `access` was moved into `PciRoot` above; `DxgkConfigAccess` is
@@ -889,6 +914,7 @@ impl VirtioGpu {
             next_wire_fence: 1,
             wddm_pending: VecDeque::with_capacity(MAX_WDDM_PENDING),
             failed: false,
+            display_mode,
         };
         // (The old Gate-2 venus ctx self-test is gone: the StartDevice venus
         // client bring-up right after transport init exercises the full context
@@ -2012,6 +2038,13 @@ impl VirtioGpu {
     /// segment offset to `base` for the user mapping. Gate 5a Stage 2.
     pub fn host_visible(&self) -> Option<HostVisibleWindow> {
         self.host_visible
+    }
+
+    /// Scanout-0 preferred `(width, height)` from the host's `GET_DISPLAY_INFO` at
+    /// init, or `None` if the host reported nothing usable. The display half drives
+    /// its VidPn mode + generated EDID from this so it presents the size QEMU wants.
+    pub fn display_mode(&self) -> Option<(u32, u32)> {
+        self.display_mode
     }
 
     /// Mapped kernel VA of the virtio ISR-status register (read-to-clear), or 0 if

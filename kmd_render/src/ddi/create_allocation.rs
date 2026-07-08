@@ -63,6 +63,21 @@ struct AllocationContext {
     width: u32,
     height: u32,
     format: u32, // D3DDDIFORMAT
+    /// Row pitch in bytes as the UMD laid the surface out (`cross_adapter_pitch`,
+    /// 256-aligned — NOT `width*4`). `SetVidPnSourceAddress`'s `SET_SCANOUT_BLOB`
+    /// must use THIS stride so the host reads rows at the right offset (a `width*4`
+    /// stride shears the scan-out: 1896×4=7584 vs the real 7680). 0 for allocations
+    /// with no geometry trailer.
+    pitch: u32,
+    /// Exact DXGI format the creator used (`meta.dxgi_format`) — the D3DDDIFORMAT
+    /// `format` field above is lossy (both B8G8R8A8 and R8G8B8A8 collapse to
+    /// A8R8G8B8), so the scan-out format is resolved from this.
+    dxgi_format: u32,
+    /// Byte offset of memory-plane-0 within the backing allocation (from the
+    /// UMD's `vkGetImageSubresourceLayout` on the DRM-modifier scan-out primary).
+    /// `SetVidPnSourceAddress`'s `SET_SCANOUT_BLOB` uses it as the plane offset;
+    /// 0 for surfaces whose data starts at offset 0.
+    plane_offset: u64,
     /// C1 identity: the creator's exact `vkAllocateMemory` size + memory type
     /// (what a cross-process opener must import with). Diagnostic copies — the
     /// authoritative record travels in the private-data trailer / open identity.
@@ -168,6 +183,43 @@ pub(crate) unsafe fn paging_alloc_info(h: HANDLE) -> Option<PagingAllocInfo> {
     })
 }
 
+/// Geometry + layout of a scan-out primary, resolved from its `hAllocation`.
+#[derive(Clone, Copy)]
+pub(crate) struct ScanoutInfo {
+    pub resource_id: u32,
+    pub width: u32,
+    pub height: u32,
+    /// Row pitch the UMD laid the surface out with (bytes) — the stride
+    /// `SET_SCANOUT_BLOB` must use, NOT `width*4`. 0 if unknown.
+    pub pitch: u32,
+    /// Exact DXGI format (lossless) for resolving the virtio scan-out format.
+    pub dxgi_format: u32,
+    /// Memory-plane-0 byte offset for `SET_SCANOUT_BLOB` (0 if data starts at 0).
+    pub plane_offset: u64,
+}
+
+/// Resolve a primary allocation's `hAllocation` (the CreateAllocation handle
+/// dxgkrnl passes in `SetVidPnSourceAddress`) to its scan-out geometry + layout
+/// for `SET_SCANOUT_BLOB`. Returns `None` for a null/foreign handle or an
+/// unbacked allocation. SAFETY: same contract as [`paging_alloc_info`].
+pub(crate) unsafe fn scanout_alloc_info(h: HANDLE) -> Option<ScanoutInfo> {
+    if h.is_null() {
+        return None;
+    }
+    let ctx = unsafe { &*(h as *const AllocationContext) };
+    if ctx.magic != ALLOCATION_CTX_MAGIC || ctx.resource_id == 0 {
+        return None;
+    }
+    Some(ScanoutInfo {
+        resource_id: ctx.resource_id,
+        width: ctx.width,
+        height: ctx.height,
+        pitch: ctx.pitch,
+        dxgi_format: ctx.dxgi_format,
+        plane_offset: ctx.plane_offset,
+    })
+}
+
 /// Record (or clear, with [`BAR_UNPLACED`]) an allocation's VidMm-assigned BAR
 /// SegmentAddress. SAFETY: same contract as [`paging_alloc_info`].
 pub(crate) unsafe fn set_bar_placement(h: HANDLE, offset: u64) {
@@ -190,6 +242,15 @@ const D3DDDI_ALLOCATIONPRIORITY_NORMAL: UINT = 0x7800_0000;
 /// so its backing must be linear with this pitch for the IndirectKMD adapter to
 /// open the same surface. PATH-A (2026-06-22).
 const CROSS_ADAPTER_PITCH_ALIGN: u32 = 256;
+
+/// Meta `misc_flags` bit (KMD-internal, bit 31 — clear of any D3D11
+/// `D3D11_RESOURCE_MISC_*` value the UMD sets in the low bits) marking a
+/// `SHAREDPRIMARYSURFACE` standard allocation as a scan-out PRIMARY. dxgkrnl
+/// rejects `Cached` (and PermanentSysMem/ExistingSysMem/ExistingKernelSysMem/
+/// ManagedPrimary) on a Primary allocation ("...can't be specified with Primary",
+/// AzureTriage — 36th session), which silently fails primary creation → no VidPn
+/// path. `create_one` reads this bit and suppresses `Cached` for the primary.
+const HELIOS_ALLOC_MISC_PRIMARY: u32 = 0x8000_0000;
 
 fn round_up_page(n: SIZE_T) -> SIZE_T {
     n.saturating_add(PAGE - 1) & !(PAGE - 1)
@@ -616,6 +677,9 @@ unsafe fn create_one(
         width: meta.width,
         height: meta.height,
         format: meta.format,
+        pitch: meta.pitch,
+        dxgi_format: meta.dxgi_format,
+        plane_offset: meta.plane_offset,
         venus_alloc_size: meta.venus_alloc_size,
         memory_type_index: meta.memory_type_index,
         bar_placed: core::sync::atomic::AtomicU64::new(BAR_UNPLACED),
@@ -626,15 +690,42 @@ unsafe fn create_one(
     info.hAllocation = Box::into_raw(ctx) as HANDLE;
     info.Size = size;
     info.PitchAlignedSize = size;
+    // The scan-out display primary (CpuVisible SHAREDPRIMARYSURFACE) needs special
+    // handling: dxgkrnl rejects it unless the supported segment set includes an
+    // APERTURE segment ("CPUVisible allocations must include an aperture segment in
+    // the supported segment set" — ETW-confirmed 36th session), which without it
+    // fails the whole VidPn commit → 0-path VidPn → display never activates.
+    let is_primary = ap.kind == HELIOS_WDDM_ALLOC_KIND_STANDARD
+        && (meta.misc_flags & HELIOS_ALLOC_MISC_PRIMARY) != 0;
+    let aperture_bit = 1u32 << (crate::ddi::gpummu::APERTURE_SEGMENT_ID - 1);
     let (preferred_segment, supported_segments) = if let (true, Some(seg_id)) =
         (bar_eligible, bar_seg_id)
     {
-        (seg_id, 1u32 << (seg_id - 1))
+        // Prefer the BAR (the two-memory-split fix keeps CPU raster in the venus
+        // blob's bytes). These allocations are CpuVisible (set below) in a
+        // NON-CPU-accessible memory segment — the BAR exposes CPU access only via
+        // the CpuHostAperture (segment CpuVisible=0) — and WDDM REQUIRES every such
+        // allocation to list an aperture segment in its supported set so VidMm can
+        // always obtain a CPU virtual address, falling back to system memory if the
+        // CpuHostAperture is full (allocation-usage-tracking.md: "all CPU-accessible
+        // allocations in non-CPU-accessible memory segments must contain an aperture
+        // segment in their supported segment set"). v71 added it to the PRIMARY only;
+        // the other CpuVisible surfaces (SHADOW/STAGING/GDI) shipped BAR-only and
+        // dxgkrnl rejected them ("CPUVisible allocations must include an aperture
+        // segment", ETW-confirmed v71/v72 — 10 `0x0202` violators in the S-ring) →
+        // the whole VidPn commit failed. Gated on the display half so the proven
+        // render-only surface (DisplayHalf off) stays byte-identical: it never hit
+        // the rejection because its CpuHostAperture always had space, so the fallback
+        // was never demanded. PreferredSegment stays the BAR — with a 1 GiB BAR vs a
+        // ~200 MB CpuVisible working set, content lives in the venus blob in steady
+        // state and the aperture (which VidMm upgrades to the implicit system-memory
+        // segment without AccessedPhysically, iommu-dma-remapping.md) is an
+        // eviction-only fallback not exercised at this scale — negligible runtime cost.
+        let needs_aperture = is_primary || adapter.display_half;
+        let supp = 1u32 << (seg_id - 1);
+        (seg_id, if needs_aperture { supp | aperture_bit } else { supp })
     } else {
-        (
-            crate::ddi::gpummu::APERTURE_SEGMENT_ID,
-            1u32 << (crate::ddi::gpummu::APERTURE_SEGMENT_ID - 1),
-        )
+        (crate::ddi::gpummu::APERTURE_SEGMENT_ID, aperture_bit)
     };
     info.SupportedWriteSegmentSet = supported_segments;
     info.EvictionSegmentSet = 0;
@@ -662,7 +753,13 @@ unsafe fn create_one(
         // the same physical pages, and the host reports the venus blobs
         // CACHED (blob_map honors the same hint for kernel maps). Service-key
         // `AllocCached=0` is the kill switch (read at StartDevice).
-        if adapter.alloc_cached {
+        // Omit `Cached` on the scan-out primary: dxgkrnl rejects Cached-with-Primary
+        // (AzureTriage; 36th-session primary-creation failure → no VidPn path). The
+        // primary is host-scanned-out, not CPU-read-hot, so write-combined is fine.
+        if is_primary {
+            crate::diag::record(0x0C3E_0000 | (resource_id & 0xFFFF));
+        }
+        if adapter.alloc_cached && !is_primary {
             info.__bindgen_anon_4
                 .FlagsWddm2
                 .__bindgen_anon_1
@@ -1038,6 +1135,8 @@ pub unsafe extern "C" fn dxgkddi_get_standard_allocation_driver_data(
     // ── Phase 2: extract geometry from the per-type union; set out Pitch ─────
     // SAFETY: the union arm is selected by StandardAllocationType; dxgkrnl
     // guarantees the matching surface-data pointer is valid for the fill call.
+    let is_primary =
+        args.StandardAllocationType == D3DKMDT_STANDARDALLOCATION_SHAREDPRIMARYSURFACE;
     let (width, height, format): (u32, u32, u32) = match args.StandardAllocationType {
         D3DKMDT_STANDARDALLOCATION_SHAREDPRIMARYSURFACE => {
             let sd = unsafe { &*args.__bindgen_anon_1.pCreateSharedPrimarySurfaceData };
@@ -1099,7 +1198,9 @@ pub unsafe extern "C" fn dxgkddi_get_standard_allocation_driver_data(
         // cross-adapter surfaces usable by the UMD when another process opens
         // them through the shared-resource path.
         bind_flags: 0x0000_0008 | 0x0000_0020,
-        misc_flags: 0,
+        // Flag a shared-primary surface so create_one omits the illegal
+        // `Cached`-with-Primary flag on the scanout primary.
+        misc_flags: if is_primary { HELIOS_ALLOC_MISC_PRIMARY } else { 0 },
         // Filled by DxgkDdiCreateAllocation's write-back once the kernel venus
         // client has actually allocated the backing memory.
         venus_alloc_size: 0,
@@ -1108,6 +1209,8 @@ pub unsafe extern "C" fn dxgkddi_get_standard_allocation_driver_data(
         // format hint 0 so the UMD opener uses its BGRA fallback. (Field formerly
         // named `reserved`; same on-wire slot.)
         dxgi_format: 0,
+        // KMD standard allocations carry no scan-out plane offset.
+        plane_offset: 0,
     };
 
     // SAFETY: AllocationPrivateDriverDataSize bytes (>= PRIV_SIZE) are writable.

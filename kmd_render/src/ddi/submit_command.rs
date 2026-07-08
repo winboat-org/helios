@@ -177,6 +177,26 @@ pub(crate) unsafe fn signal_dma_completed(dxgkrnl: &DXGKRNL_INTERFACE, fence: u3
     unsafe { notify_at_dirql(dxgkrnl, &mut interrupt) }
 }
 
+/// Synthesize a `DXGK_INTERRUPT_CRTC_VSYNC` for the display half's single target
+/// (viogpu3d FlipThread analog, `viogpu_vidpn.cpp:1977-1983`). `physical_address`
+/// is the primary currently bound via `SetVidPnSourceAddress` (0 before the first
+/// bind); dxgkrnl retires the queued flip whose address matches. `target_id` is the
+/// video-present target the VSync belongs to. Callable at <= DIRQL (the DPC path).
+pub(crate) unsafe fn signal_crtc_vsync(
+    dxgkrnl: &DXGKRNL_INTERFACE,
+    physical_address: i64,
+    target_id: u32,
+) -> NTSTATUS {
+    let mut interrupt = unsafe { core::mem::zeroed::<DXGKARGCB_NOTIFY_INTERRUPT_DATA>() };
+    interrupt.InterruptType = _DXGK_INTERRUPT_TYPE::DXGK_INTERRUPT_CRTC_VSYNC;
+    // SAFETY: CrtcVsync is the correct union arm for DXGK_INTERRUPT_CRTC_VSYNC.
+    let vsync = unsafe { interrupt.__bindgen_anon_1.CrtcVsync.as_mut() };
+    vsync.VidPnTargetId = target_id;
+    vsync.PhysicalAddress.QuadPart = physical_address;
+    // SAFETY: fully-initialized packet, live for the call.
+    unsafe { notify_at_dirql(dxgkrnl, &mut interrupt) }
+}
+
 /// Signal `DXGK_INTERRUPT_DMA_PREEMPTED` (see [`notify_at_dirql`]): the node's
 /// pending submissions are released back to the scheduler, which resubmits the
 /// incomplete ones later.

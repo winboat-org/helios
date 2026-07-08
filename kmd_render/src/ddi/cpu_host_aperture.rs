@@ -56,6 +56,13 @@ static BAR_AP_ERR_SPARSE: AtomicU32 = AtomicU32::new(0); // aperture pages not c
 static BAR_AP_ERR_BOUNDS: AtomicU32 = AtomicU32::new(0); // outside the declared region
 static BAR_AP_ERR_MAP: AtomicU32 = AtomicU32::new(0); // map_blob_at failed
 static BAR_AP_ERR_UNRESOLVED_UNMAP: AtomicU32 = AtomicU32::new(0); // no blob at unmap offset
+// Last IRQL a raised-IRQL Map/Unmap arrived at (2 = DISPATCH). Recorded at DIRQL;
+// flushed to the registry (`ChIq`) from a PASSIVE context (`diag_dump`).
+static BAR_AP_LAST_IRQL: AtomicU32 = AtomicU32::new(0);
+// Times the raised-IRQL Map path acknowledged because the blob was ALREADY mapped
+// at the requested offset (idempotent SUCCESS) vs. had to defer to a PASSIVE retry.
+static BAR_AP_IRQL_ACK: AtomicU32 = AtomicU32::new(0);
+static BAR_AP_IRQL_DEFER: AtomicU32 = AtomicU32::new(0);
 
 /// Mirror the segment-3 aperture counters into the registry. PASSIVE only.
 fn dump_bar_ap_counters() {
@@ -71,6 +78,19 @@ fn dump_bar_ap_counters() {
     crate::diag::record_named_bytes(b"ChEb", BAR_AP_ERR_BOUNDS.load(Ordering::Relaxed));
     crate::diag::record_named_bytes(b"ChEm", BAR_AP_ERR_MAP.load(Ordering::Relaxed));
     crate::diag::record_named_bytes(b"ChEu", BAR_AP_ERR_UNRESOLVED_UNMAP.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"ChMc", CPU_HOST_MAP_COUNT.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"ChIq", BAR_AP_LAST_IRQL.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"ChIa", BAR_AP_IRQL_ACK.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"ChId", BAR_AP_IRQL_DEFER.load(Ordering::Relaxed));
+}
+
+/// PASSIVE-only flush of the CPU-host-aperture counters into the registry ring.
+/// The raised-IRQL Map path (below) can record its atomics but cannot touch the
+/// registry, so a PASSIVE DDI on the mode-set path (`DxgkDdiCommitVidPn`) calls
+/// this to surface `ChIq`/`ChEi`/`ChMc` — proving whether `MapCpuHostAperture` is
+/// driven at DISPATCH during display activation.
+pub fn diag_dump_cpu_host_atomics() {
+    dump_bar_ap_counters();
 }
 
 const PASSIVE_LEVEL_IRQL: u8 = 0;
@@ -108,21 +128,62 @@ pub unsafe extern "C" fn dxgkddi_map_cpu_host_aperture(
     // read/write UNBACKED window offsets (dropped writes / 0xFF reads) — the
     // exact silent-content-loss class this fix exists to kill.
     // SAFETY: KeGetCurrentIrql is callable at any IRQL.
-    if unsafe { KeGetCurrentIrql() } != PASSIVE_LEVEL_IRQL {
+    let irql = unsafe { KeGetCurrentIrql() };
+    if irql != PASSIVE_LEVEL_IRQL {
+        // Documented PASSIVE, but display activation drives it at DISPATCH on the
+        // scan-out primary (ETW-confirmed v71: a registered DDI returned 0xC0000001
+        // ×40 during CommitVidPn). `map_blob_at` needs a host round-trip (PASSIVE),
+        // so a NEW mapping can't be established here. Contract rules for the return:
+        //  1. NEVER return `STATUS_UNSUCCESSFUL` — it is OUT of this DDI's legal set,
+        //     so dxgkrnl flags a driver bug and DISCARDS THE ENTIRE VidPn → 0-path
+        //     commit → the display never activates (the exact v71 blocker).
+        //  2. If the blob is ALREADY host-mapped at the aperture offset dxgkrnl
+        //     chose (the PASSIVE paging path established it, `bar_placed`), the CPU
+        //     window is live → acknowledge (idempotent SUCCESS). Reads only:
+        //     `paging_alloc_info` derefs the handle; `blob_resid_at_offset` runs
+        //     under the DISPATCH spinlock — both DISPATCH-safe.
+        //  3. Otherwise defer with a LEGAL, retryable status (`STATUS_NO_MEMORY`) so
+        //     dxgkrnl re-issues the map at PASSIVE, where the round-trip can run.
         BAR_AP_ERR_IRQL.fetch_add(1, Ordering::Relaxed);
-        return STATUS_UNSUCCESSFUL;
+        BAR_AP_LAST_IRQL.store(irql as u32, Ordering::Relaxed);
+        let already_mapped = unsafe { paging_alloc_info(args.hAllocation) }
+            .filter(|a| {
+                a.bar_eligible
+                    && args.NumberOfPages != 0
+                    && !args.pCpuHostAperturePages.is_null()
+                    // whole-allocation, same shape as the PASSIVE map contract below
+                    && args.NumberOfPages as u64 == (a.size.saturating_add(4095) >> 12).max(1)
+            })
+            .map(|a| {
+                // SAFETY: pCpuHostAperturePages holds >=1 entry (checked above).
+                let page0 =
+                    unsafe { core::ptr::read_unaligned(args.pCpuHostAperturePages) } as u64;
+                let offset = page0 << 12;
+                adapter
+                    .with_virtio(|v| v.blob_resid_at_offset(offset))
+                    .ok()
+                    .flatten()
+                    == Some(a.resource_id)
+            })
+            .unwrap_or(false);
+        if already_mapped {
+            BAR_AP_IRQL_ACK.fetch_add(1, Ordering::Relaxed);
+            return STATUS_SUCCESS;
+        }
+        BAR_AP_IRQL_DEFER.fetch_add(1, Ordering::Relaxed);
+        return STATUS_NO_MEMORY;
     }
     let Some(alloc) = (unsafe { paging_alloc_info(args.hAllocation) }) else {
         BAR_AP_ERR_ALLOC.fetch_add(1, Ordering::Relaxed);
         dump_bar_ap_counters();
-        return STATUS_UNSUCCESSFUL;
+        return STATUS_NO_MEMORY;
     };
     let n = args.NumberOfPages;
     let blob_pages = (alloc.size.saturating_add(4095) >> 12).max(1);
     if n == 0 || args.pCpuHostAperturePages.is_null() {
         BAR_AP_ERR_PARTIAL.fetch_add(1, Ordering::Relaxed);
         dump_bar_ap_counters();
-        return STATUS_UNSUCCESSFUL;
+        return STATUS_NO_MEMORY;
     }
     // Whole-allocation only: a blob maps at one offset, whole-blob — a partial
     // map would spill blob pages over neighboring aperture assignments.
@@ -130,7 +191,7 @@ pub unsafe extern "C" fn dxgkddi_map_cpu_host_aperture(
         BAR_AP_ERR_PARTIAL.fetch_add(1, Ordering::Relaxed);
         BAR_AP_LAST_RESID.store(alloc.resource_id, Ordering::Relaxed);
         dump_bar_ap_counters();
-        return STATUS_UNSUCCESSFUL;
+        return STATUS_NO_MEMORY;
     }
     // SAFETY: pCpuHostAperturePages holds NumberOfPages entries for the call.
     let page0 = unsafe { core::ptr::read_unaligned(args.pCpuHostAperturePages) } as u64;
@@ -141,14 +202,14 @@ pub unsafe extern "C" fn dxgkddi_map_cpu_host_aperture(
         if p != page0 + i {
             BAR_AP_ERR_SPARSE.fetch_add(1, Ordering::Relaxed);
             dump_bar_ap_counters();
-            return STATUS_UNSUCCESSFUL;
+            return STATUS_NO_MEMORY;
         }
     }
     let offset = page0 << 12;
     if offset.saturating_add(n << 12) > bar.size {
         BAR_AP_ERR_BOUNDS.fetch_add(1, Ordering::Relaxed);
         dump_bar_ap_counters();
-        return STATUS_UNSUCCESSFUL;
+        return STATUS_NO_MEMORY;
     }
 
     match crate::virtio::ctrl::map_blob_at(adapter, alloc.resource_id, offset) {
@@ -163,7 +224,9 @@ pub unsafe extern "C" fn dxgkddi_map_cpu_host_aperture(
             BAR_AP_ERR_MAP.fetch_add(1, Ordering::Relaxed);
             BAR_AP_LAST_RESID.store(alloc.resource_id, Ordering::Relaxed);
             dump_bar_ap_counters();
-            STATUS_UNSUCCESSFUL
+            // Legal (retryable) status, NOT the out-of-contract STATUS_UNSUCCESSFUL
+            // that dxgkrnl treats as a driver bug and discards the whole VidPn for.
+            STATUS_NO_MEMORY
         }
     }
 }

@@ -10,6 +10,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use crate::adapter::AdapterContext;
 use crate::ddi::create_allocation::present_alloc_info;
 use crate::dxgk::*;
+use wdk_sys::ntddk::KeGetCurrentIrql;
 
 /// Write a DWORD to a fixed (non-ring) registry value so a rare DDI's trace
 /// survives the `S<idx>` ring's steady-state QueryAdapterInfo flood. PASSIVE only.
@@ -217,7 +218,15 @@ pub unsafe extern "C" fn dxgkddi_set_pointer_position(
     if !position.is_null() {
         crate::diag::record(0x1310_0000 | unsafe { (*position).VidPnSourceId & 0xFFFF });
     }
-    STATUS_NOT_SUPPORTED
+    // SetPointerPosition's legal set does NOT include STATUS_NOT_SUPPORTED — an
+    // illegal return here is logged as a driver bug during the modeset (AzureTriage,
+    // 36th session). With the display half up, accept the (software-cursor) position
+    // as a no-op; render-only never receives this call.
+    if unsafe { display_half_on(_adapter) } {
+        STATUS_SUCCESS
+    } else {
+        STATUS_NOT_SUPPORTED
+    }
 }
 
 pub unsafe extern "C" fn dxgkddi_set_pointer_shape(
@@ -228,7 +237,23 @@ pub unsafe extern "C" fn dxgkddi_set_pointer_shape(
     if !shape.is_null() {
         crate::diag::record(0x1311_0000 | unsafe { (*shape).VidPnSourceId & 0xFFFF });
     }
-    STATUS_NOT_SUPPORTED
+    // As with SetPointerPosition: NOT_SUPPORTED is illegal for this DDI. Accept as a
+    // no-op with the display half up (the OS software-composes the cursor).
+    if unsafe { display_half_on(_adapter) } {
+        STATUS_SUCCESS
+    } else {
+        STATUS_NOT_SUPPORTED
+    }
+}
+
+/// True when the `DisplayHalf` knob was on at StartDevice (Option A, #1). The
+/// VidPn DDIs stay NOT_SUPPORTED (render-only) unless this returns true.
+///
+/// # Safety
+/// `h` is the miniport adapter handle dxgkrnl passes to a display DDI.
+unsafe fn display_half_on(h: IN_CONST_HANDLE) -> bool {
+    let p = h as *const AdapterContext;
+    !p.is_null() && unsafe { (*p).display_half }
 }
 
 pub unsafe extern "C" fn dxgkddi_is_supported_vidpn(
@@ -241,7 +266,31 @@ pub unsafe extern "C" fn dxgkddi_is_supported_vidpn(
             0x1312_0000 | unsafe { ((*is_supported).hDesiredVidPn as usize as u32) & 0xFFFF },
         );
     }
-    STATUS_NOT_SUPPORTED
+    let p = _adapter as *const AdapterContext;
+    if p.is_null() || !unsafe { (*p).display_half } {
+        return STATUS_GRAPHICS_INVALID_VIDPN;
+    }
+    if is_supported.is_null() {
+        return STATUS_GRAPHICS_INVALID_VIDPN;
+    }
+    // Diagnostic: latch the max path count across every VidPn the OS validates.
+    // `VpISp`>=1 ⇒ the OS DOES propose a 1-path VidPn we accept — so an empty COMMIT
+    // (VpCN=0) means the OS rejects activation *after* our TRUE (flip/scanout/MPO
+    // side), not a topology-synthesis gap. `VpISp`=0 ⇒ it only ever asks about the
+    // empty VidPn (a topology/target problem persists).
+    let adapter = unsafe { &*p };
+    let pc = unsafe {
+        crate::ddi::vidpn::topology_path_count(adapter, (*is_supported).hDesiredVidPn)
+    };
+    if pc != u32::MAX {
+        static MAX_PC: AtomicU32 = AtomicU32::new(0);
+        MAX_PC.fetch_max(pc, Ordering::Relaxed);
+        crate::diag::record_named_bytes(b"VpISp", MAX_PC.load(Ordering::Relaxed));
+    }
+    // A single source + single target adapter can only ever be handed the
+    // trivial (or empty) VidPn, so accept it.
+    unsafe { (*is_supported).IsVidPnSupported = 1 };
+    STATUS_SUCCESS
 }
 
 pub unsafe extern "C" fn dxgkddi_recommend_functional_vidpn(
@@ -249,7 +298,12 @@ pub unsafe extern "C" fn dxgkddi_recommend_functional_vidpn(
     _recommend: IN_CONST_PDXGKARG_RECOMMENDFUNCTIONALVIDPN_CONST,
 ) -> NTSTATUS {
     crate::diag::record(0x1300_0005);
-    STATUS_NOT_SUPPORTED
+    if !unsafe { display_half_on(_adapter) } {
+        return STATUS_NOT_SUPPORTED;
+    }
+    // Decline: let the OS synthesize the simple one-path VidPn it then validates
+    // via IsSupportedVidPn (enumerating-child-devices-of-a-display-adapter.md).
+    crate::ddi::vidpn::STATUS_GRAPHICS_NO_RECOMMENDED_FUNCTIONAL_VIDPN
 }
 
 pub unsafe extern "C" fn dxgkddi_enum_vidpn_cofunc_modality(
@@ -262,7 +316,12 @@ pub unsafe extern "C" fn dxgkddi_enum_vidpn_cofunc_modality(
             0x1313_0000 | unsafe { (*enum_modality).EnumPivotType as u32 & 0xFFFF },
         );
     }
-    STATUS_NOT_SUPPORTED
+    let p = _adapter as *const AdapterContext;
+    if p.is_null() || !unsafe { (*p).display_half } {
+        return STATUS_NOT_SUPPORTED;
+    }
+    let adapter = unsafe { &*p };
+    unsafe { crate::ddi::vidpn::enum_cofunc_modality(adapter, enum_modality) }
 }
 
 pub unsafe extern "C" fn dxgkddi_set_vidpn_source_visibility(
@@ -273,7 +332,12 @@ pub unsafe extern "C" fn dxgkddi_set_vidpn_source_visibility(
     if !visibility.is_null() {
         crate::diag::record(0x1314_0000 | unsafe { (*visibility).VidPnSourceId & 0xFFFF });
     }
-    STATUS_NOT_SUPPORTED
+    // No scanout: visibility is a no-op we simply accept.
+    if unsafe { display_half_on(_adapter) } {
+        STATUS_SUCCESS
+    } else {
+        STATUS_NOT_SUPPORTED
+    }
 }
 
 pub unsafe extern "C" fn dxgkddi_commit_vidpn(
@@ -285,7 +349,25 @@ pub unsafe extern "C" fn dxgkddi_commit_vidpn(
         crate::diag::record(0x1315_0000 | unsafe { (*commit).AffectedVidPnSourceId & 0xFFFF });
         crate::diag::record(0x1316_0000 | unsafe { (*commit).Flags.PathPoweredOff() & 0xFFFF });
     }
-    STATUS_NOT_SUPPORTED
+    let p = _adapter as *const AdapterContext;
+    if p.is_null() || !unsafe { (*p).display_half } {
+        return STATUS_NOT_SUPPORTED;
+    }
+    crate::diag::record_named_bytes(b"VpCM", 1);
+    // Surface the CPU-host-aperture counters from a PASSIVE point on the mode-set
+    // path: the raised-IRQL Map path records its atomics (`ChIq`/`ChEi`/`ChIa`/
+    // `ChId`/`ChMc`) but cannot write the registry itself. This proves on hardware
+    // whether `MapCpuHostAperture` is driven at DISPATCH during activation (the
+    // suspected 0xC0000001 source, ETW-confirmed v71).
+    crate::ddi::diag_dump_cpu_host_atomics();
+    // Inspect + validate the committed VidPn and record whether the OS pinned a
+    // source mode on our source (the mode-set-retry-loop resolver — a bare
+    // `return SUCCESS` that never checks the pin is exactly viogpu3d's "commit but
+    // light nothing" failure). Scanout itself is issued from SetVidPnSourceAddress.
+    let adapter = unsafe { &*p };
+    crate::ddi::vidpn::legalize_vidpn(unsafe {
+        crate::ddi::vidpn::commit_vidpn(adapter, commit as *const DXGKARG_COMMITVIDPN)
+    })
 }
 
 pub unsafe extern "C" fn dxgkddi_update_active_vidpn_present_path(
@@ -301,7 +383,11 @@ pub unsafe extern "C" fn dxgkddi_update_active_vidpn_present_path(
             0x1318_0000 | unsafe { (*path).VidPnPresentPathInfo.VidPnTargetId & 0xFFFF },
         );
     }
-    STATUS_NOT_SUPPORTED
+    if unsafe { display_half_on(_adapter) } {
+        STATUS_SUCCESS
+    } else {
+        STATUS_NOT_SUPPORTED
+    }
 }
 
 pub unsafe extern "C" fn dxgkddi_set_vidpn_source_address(
@@ -312,7 +398,88 @@ pub unsafe extern "C" fn dxgkddi_set_vidpn_source_address(
     if !address.is_null() {
         crate::diag::record(0x1319_0000 | unsafe { (*address).VidPnSourceId & 0xFFFF });
     }
-    STATUS_NOT_SUPPORTED
+    let p = _adapter as *const AdapterContext;
+    if p.is_null() || !unsafe { (*p).display_half } {
+        return STATUS_NOT_SUPPORTED;
+    }
+    let adapter = unsafe { &*p };
+    crate::diag::record_named_bytes(b"VpSA", 1);
+    // Remember the primary's physical address so the CRTC_VSYNC heartbeat reports
+    // it (dxgkrnl retires the queued flip whose address matches — viogpu3d
+    // `m_sourceAddress`).
+    if !address.is_null() {
+        let phys = unsafe { (*address).PrimaryAddress.QuadPart };
+        adapter
+            .last_primary_address
+            .store(phys as u64, Ordering::Release);
+    }
+
+    // Scan out the DWM-composed primary to virtio-gpu scanout 0 = the QEMU
+    // gtk/sdl display (SET_SCANOUT_BLOB + RESOURCE_FLUSH), so the desktop appears
+    // in QEMU's own window and the Helios monitor is a real presentable output.
+    // The control round-trip WAITS, so only at PASSIVE_LEVEL — a DISPATCH-level
+    // VSync flip records the geometry and defers (a later PASSIVE source-address
+    // rebinds). Export gate (DISPLAY.md §8): a non-exportable primary → ScSet=0xE.
+    if address.is_null() {
+        return STATUS_SUCCESS;
+    }
+    let h_alloc = unsafe { (*address).hAllocation };
+    let Some(sc) = (unsafe { crate::ddi::create_allocation::scanout_alloc_info(h_alloc) })
+    else {
+        crate::diag::record_named_bytes(b"ScRid", 0);
+        return STATUS_SUCCESS;
+    };
+    let (mode_w, mode_h) = adapter.display_mode();
+    let width = if sc.width != 0 { sc.width } else { mode_w };
+    let height = if sc.height != 0 { sc.height } else { mode_h };
+    crate::diag::record_named_bytes(b"ScRid", sc.resource_id);
+    crate::diag::record_named_bytes(b"ScWH", (width << 16) | (height & 0xFFFF));
+    // SAFETY: KeGetCurrentIrql is callable at any IRQL.
+    let irql = unsafe { KeGetCurrentIrql() };
+    if irql != 0 {
+        crate::diag::record_named_bytes(b"ScIrq", irql as u32);
+        return STATUS_SUCCESS;
+    }
+    // Stride MUST match the UMD's actual row pitch (`cross_adapter_pitch`,
+    // 256-aligned), NOT `width*4`: for 1896 wide that is 7680 vs 7584, and a wrong
+    // stride shears the scan-out so the host reads each row 96 bytes short. Fall
+    // back to the same alignment the UMD uses if the allocation carried no pitch.
+    let stride = if sc.pitch != 0 {
+        sc.pitch
+    } else {
+        crate::ddi::create_allocation::cross_adapter_pitch(width)
+    };
+    crate::diag::record_named_bytes(b"ScPch", stride);
+    // Resolve the scan-out format from the creator's EXACT DXGI format (the KMD
+    // D3DDDIFORMAT is lossy — B8G8R8A8 and R8G8B8A8 both collapse to A8R8G8B8).
+    // Only B8G8R8A8 is wired on the virtio side; the DWM primary is DXGI 87
+    // (B8G8R8A8), which matches. A non-BGRA primary is recorded loudly (`ScFmt`)
+    // and still scanned as BGRA rather than silently producing swapped colors.
+    const DXGI_FORMAT_B8G8R8A8_UNORM: u32 = 87;
+    const DXGI_FORMAT_B8G8R8X8_UNORM: u32 = 88;
+    let vformat = helios_protocol::VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM;
+    if sc.dxgi_format != 0
+        && sc.dxgi_format != DXGI_FORMAT_B8G8R8A8_UNORM
+        && sc.dxgi_format != DXGI_FORMAT_B8G8R8X8_UNORM
+    {
+        crate::diag::record_named_bytes(b"ScFmt", sc.dxgi_format);
+    }
+    crate::diag::record_named_bytes(b"ScOff", sc.plane_offset as u32);
+    let set = crate::virtio::ctrl::set_scanout_blob(
+        adapter,
+        sc.resource_id,
+        width,
+        height,
+        vformat,
+        stride,
+        sc.plane_offset as u32,
+    );
+    crate::diag::record_named_bytes(b"ScSet", if set.is_ok() { 1 } else { 0xE });
+    if set.is_ok() {
+        let flush = crate::virtio::ctrl::resource_flush(adapter, sc.resource_id, width, height);
+        crate::diag::record_named_bytes(b"ScFlu", if flush.is_ok() { 1 } else { 0xE });
+    }
+    STATUS_SUCCESS
 }
 
 pub unsafe extern "C" fn dxgkddi_recommend_monitor_modes(
@@ -320,15 +487,56 @@ pub unsafe extern "C" fn dxgkddi_recommend_monitor_modes(
     _recommend: IN_CONST_PDXGKARG_RECOMMENDMONITORMODES_CONST,
 ) -> NTSTATUS {
     crate::diag::record(0x1300_000B);
-    STATUS_NOT_SUPPORTED
+    let p = _adapter as *const AdapterContext;
+    if p.is_null() || !unsafe { (*p).display_half } {
+        return STATUS_NOT_SUPPORTED;
+    }
+    let adapter = unsafe { &*p };
+    // Clamp to the DDI's legal return set: an out-of-contract NTSTATUS makes
+    // dxgkrnl discard every VidPn (AzureTriage; 36th-session 0-paths root cause).
+    crate::ddi::vidpn::legalize_vidpn(unsafe {
+        crate::ddi::vidpn::recommend_monitor_modes(adapter, _recommend)
+    })
 }
 
 pub unsafe extern "C" fn dxgkddi_query_vidpn_hw_capability(
     _adapter: IN_CONST_HANDLE,
-    _caps: INOUT_PDXGKARG_QUERYVIDPNHWCAPABILITY,
+    caps: INOUT_PDXGKARG_QUERYVIDPNHWCAPABILITY,
 ) -> NTSTATUS {
     crate::diag::record(0x1300_000C);
-    STATUS_NOT_SUPPORTED
+    if !unsafe { display_half_on(_adapter) } {
+        return STATUS_NOT_SUPPORTED;
+    }
+    if caps.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    // Advertise no HW interpolation/enhancements: the OS handles scaling/rotation
+    // in software (there is no real scanout engine to do it).
+    unsafe {
+        core::ptr::write_bytes(
+            core::ptr::addr_of_mut!((*caps).VidPnHWCaps) as *mut u8,
+            0,
+            core::mem::size_of::<D3DKMDT_VIDPN_HW_CAPABILITY>(),
+        );
+    }
+    STATUS_SUCCESS
+}
+
+/// `DxgkDdiUpdateMonitorLinkInfo` — MANDATORY (non-null) once the adapter reports
+/// a monitor target: dxgkrnl's StartAdapter fails the whole adapter with
+/// `StartAdapter_DxgkDdiUpdateMonitorLinkInfoIsNull` (Code 43 FAILED_POST_START,
+/// AzureTriage-confirmed 2026-07-08) if this slot is NULL. The virtual monitor
+/// exposes no special link capabilities (no HDR/DSC/link-rate constraints), so we
+/// accept and leave the caller's `MonitorLinkInfo` unchanged.
+pub unsafe extern "C" fn dxgkddi_update_monitor_link_info(
+    _adapter: IN_CONST_HANDLE,
+    link_info: INOUT_PDXGKARG_UPDATEMONITORLINKINFO,
+) -> NTSTATUS {
+    crate::diag::record(0x1300_0010);
+    if !link_info.is_null() {
+        crate::diag::record(0x131D_0000 | unsafe { (*link_info).VideoPresentTargetId & 0xFFFF });
+    }
+    STATUS_SUCCESS
 }
 
 pub unsafe extern "C" fn dxgkddi_get_scan_line(
@@ -339,7 +547,19 @@ pub unsafe extern "C" fn dxgkddi_get_scan_line(
     if !scan_line.is_null() {
         crate::diag::record(0x131A_0000 | unsafe { (*scan_line).VidPnTargetId & 0xFFFF });
     }
-    STATUS_NOT_SUPPORTED
+    // NOT_SUPPORTED is illegal for GetScanLine. With the display half up, report a
+    // benign "in vertical blank" (no real scanout engine to read a line from).
+    if unsafe { display_half_on(_adapter) } {
+        if !scan_line.is_null() {
+            unsafe {
+                (*scan_line).InVerticalBlank = 1;
+                (*scan_line).ScanLine = 0;
+            }
+        }
+        STATUS_SUCCESS
+    } else {
+        STATUS_NOT_SUPPORTED
+    }
 }
 
 pub unsafe extern "C" fn dxgkddi_stop_device_and_release_post_display_ownership(

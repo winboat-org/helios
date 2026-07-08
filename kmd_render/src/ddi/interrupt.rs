@@ -61,9 +61,16 @@ pub unsafe extern "C" fn dxgkddi_interrupt_routine(
         return 0;
     }
     INT_ROUTINE_COUNT.fetch_add(1, Ordering::Relaxed);
-    // Bit 0 = used-ring progress: queue the DPC to drain it. (Bit 1 = config
-    // change — nothing to service, but the read above already acked it.)
-    if status & 0x1 != 0 {
+    // Bit 1 = configuration change: the virtio-gpu raises it on a
+    // VIRTIO_GPU_EVENT_DISPLAY (monitor connect / mode change). Latch it for the
+    // DPC, which wakes the HPD worker to (re-)indicate the child connected — the
+    // viogpu3d ISR_REASON_CHANGE path (`viogpu_adapter.cpp:1531`).
+    if status & 0x2 != 0 {
+        adapter.config_change_pending.store(1, Ordering::Release);
+    }
+    // Bit 0 = used-ring progress (drain), bit 1 = config change: either needs the
+    // DPC. (The ISR-status read above already deasserted the line for both.)
+    if status & 0x3 != 0 {
         if let Some(dxgkrnl) = adapter.dxgkrnl.as_ref() {
             if let Some(queue_dpc) = dxgkrnl.DxgkCbQueueDpc {
                 // SAFETY: DxgkCbQueueDpc is callable from the ISR at DIRQL;
@@ -84,6 +91,12 @@ pub unsafe extern "C" fn dxgkddi_dpc_routine(miniport_device_context: *mut c_voi
     }
     // SAFETY: our AdapterContext, valid for the device's lifetime.
     let adapter = unsafe { &*(miniport_device_context as *const AdapterContext) };
+
+    // A latched config-change (ISR bit 1): wake the HPD worker to re-indicate the
+    // child connected. KeSetEvent (Wait=FALSE) is legal at DISPATCH_LEVEL.
+    if adapter.config_change_pending.swap(0, Ordering::AcqRel) != 0 {
+        adapter.signal_hpd();
+    }
 
     // Let dxgkrnl process any interrupt data queued by DxgkCbNotifyInterrupt
     // (the WDDM fence completions signaled below re-queue this DPC, and this
@@ -123,16 +136,33 @@ pub unsafe extern "C" fn dxgkddi_dpc_routine(miniport_device_context: *mut c_voi
     }
 }
 
-/// `DxgkDdiControlInterrupt` — enable/disable a class of GPU interrupts.
-// The OS only ever passes DXGK_INTERRUPT_CRTC_VSYNC here, and MSDN requires
-// STATUS_NOT_IMPLEMENTED for any type the driver does not service. A
-// render-only adapter (0 video-present sources) drives no VSYNC; the virtio
+/// `DxgkDdiControlInterrupt` — enable/disable a class of GPU interrupts. Called at
+/// up to DIRQL, so this path touches only atomics (no registry / pageable calls).
+//
+// The OS drives CRTC_VSYNC here. The display half (DisplayHalf on) services it: it
+// toggles the free-running VSync heartbeat's delivery gate and returns SUCCESS.
+// A render-only adapter (0 video-present sources) drives no VSYNC → NOT_IMPLEMENTED
+// (MSDN requires that for any type the driver does not service); the virtio
 // used-ring interrupt is not an OS-controlled class.
 pub unsafe extern "C" fn dxgkddi_control_interrupt(
-    _h_adapter: IN_CONST_HANDLE,
-    _interrupt_type: IN_CONST_DXGK_INTERRUPT_TYPE,
-    _enable: IN_BOOLEAN,
+    h_adapter: IN_CONST_HANDLE,
+    interrupt_type: IN_CONST_DXGK_INTERRUPT_TYPE,
+    enable: IN_BOOLEAN,
 ) -> NTSTATUS {
-    CONTROL_INT_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    CONTROL_INT_COUNT.fetch_add(1, Ordering::Relaxed);
+    let p = h_adapter as *const AdapterContext;
+    if !p.is_null()
+        && interrupt_type == _DXGK_INTERRUPT_TYPE::DXGK_INTERRUPT_CRTC_VSYNC
+        // SAFETY: dxgkrnl hands our AdapterContext; `display_half` is a plain bool
+        // set once at StartDevice.
+        && unsafe { (*p).display_half }
+    {
+        // SAFETY: valid for the device lifetime.
+        let adapter = unsafe { &*p };
+        adapter
+            .vsync_enabled
+            .store((enable != 0) as u32, Ordering::Release);
+        return STATUS_SUCCESS;
+    }
     STATUS_NOT_IMPLEMENTED
 }

@@ -6,18 +6,26 @@
 
 use core::cell::UnsafeCell;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicU32, AtomicUsize};
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize};
 
 use wdk_sys::ntddk::{
     KeAcquireSpinLockRaiseToDpc, KeInitializeEvent, KeReleaseSpinLock, KeSetEvent,
     KeWaitForSingleObject, MmAllocateContiguousMemory, MmFreeContiguousMemory,
     MmGetPhysicalAddress,
 };
-use wdk_sys::{KEVENT, KSPIN_LOCK, PHYSICAL_ADDRESS, PVOID};
+use wdk_sys::{KDPC, KEVENT, KSPIN_LOCK, KTIMER, PHYSICAL_ADDRESS, PVOID};
 
 use crate::dxgk::*;
 use crate::error::DriverError;
 use crate::virtio::VirtioGpu;
+
+extern "C" {
+    /// `extern POBJECT_TYPE *PsThreadType;` (ntddk.h) — the thread object type, for
+    /// `ObReferenceObjectByHandle` validation when joining the HPD worker. A data
+    /// export (ntoskrnl.lib), not in the wdk-sys function bindings, so declared here
+    /// (same pattern as `ExEventObjectType` in `ddi/escape.rs`).
+    static PsThreadType: *mut wdk_sys::POBJECT_TYPE;
+}
 
 /// Size of the real-RAM-backed segment Helios reports for VidMm's page tables and
 /// paging buffers. The host-visible venus BAR (segment 1) is a CpuVisible MEMORY
@@ -151,6 +159,72 @@ pub struct AdapterContext {
     /// the same physical pages); WC reads measured ~200 MB/s in the IDD
     /// readback (36 ms per 7.8 MiB frame, 2026-07-06). 0 = kill switch.
     pub alloc_cached: bool,
+    /// `DisplayHalf` service-key knob (REG_DWORD, read once in StartDevice;
+    /// default 0 = OFF, the boot-proven render-only surface). When nonzero,
+    /// StartDevice advertises ONE video-present source + ONE child video-output
+    /// and the VidPn/child DDIs in `ddi::display`/`ddi::vidpn`/`ddi::start_device`
+    /// stand up a real (virtual, no-scanout) VidPn output + default monitor,
+    /// instead of returning NOT_SUPPORTED. This is priority #1's Option A: give
+    /// Helios a genuine presentable output so legacy BLT-model windowed present
+    /// (DXUT/FaceWorks, older 3DMark) resolves a real output instead of being
+    /// declared DXGI_STATUS_OCCLUDED (WINDOWED_BLT_DESIGN.md §6.2). Default 0
+    /// keeps every build bootable and the desktop unchanged; A/B via
+    /// `reg add ... /v DisplayHalf /t REG_DWORD /d 1` + `pnputil /restart-device`
+    /// (re-runs StartDevice → child enumeration) with NO reboot once deployed.
+    /// The paired Looking Glass IddCx keeps rendering the desktop as before; the
+    /// new Helios monitor is a second, unobserved virtual display (owner-approved,
+    /// 35th session). Value mirrored to the `DspH` fixed diag record at StartDevice.
+    pub display_half: bool,
+    /// VSync heartbeat timer for the display half. A `SynchronizationTimer` fired
+    /// every ~16 ms (`vsync_dpc`) whose DPC synthesizes `DXGK_INTERRUPT_CRTC_VSYNC`
+    /// so dxgkrnl advances the flip queue and issues `SetVidPnSourceAddress` — the
+    /// heartbeat a render-only adapter structurally lacks (the viogpu3d FlipThread
+    /// analog, `viogpu_vidpn.cpp:1977`). Both are zeroed here and initialized in
+    /// place by [`Self::init_vsync`] at StartDevice (a KTIMER/KDPC is
+    /// self-referential once initialized — never move it afterwards); the timer is
+    /// cancelled at StopDevice. Only armed when `display_half`.
+    pub vsync_timer: UnsafeCell<KTIMER>,
+    pub vsync_dpc: UnsafeCell<KDPC>,
+    /// CRTC_VSYNC delivery gate: default 1 once the display half arms the timer,
+    /// toggled by `DxgkDdiControlInterrupt(DXGK_INTERRUPT_CRTC_VSYNC, enable)`.
+    /// The DPC only synthesizes an interrupt while this is nonzero.
+    pub vsync_enabled: AtomicU32,
+    /// Count of CRTC_VSYNC interrupts synthesized this boot (diag `ScVs`).
+    pub vsync_count: AtomicU32,
+    /// Physical address of the last primary bound by `SetVidPnSourceAddress`,
+    /// reported in each CRTC_VSYNC packet so dxgkrnl can retire the matching queued
+    /// flip (viogpu3d `m_sourceAddress`). 0 until the first source-address bind.
+    pub last_primary_address: AtomicU64,
+    /// 1 once [`Self::init_vsync`] has armed the timer (StopDevice cancels once).
+    pub vsync_armed: AtomicU32,
+    /// Scanout-0 mode the display half presents, taken from the host's
+    /// `GET_DISPLAY_INFO` (`VirtioGpu::display_mode`) at StartDevice, or 0/0 if the
+    /// host reported nothing usable (then [`Self::display_mode`] falls back to
+    /// 1920×1080). The VidPn source/target/monitor modes and the generated EDID all
+    /// derive from this, so Helios advertises the size QEMU actually wants on
+    /// scanout 0 instead of a hardcoded guess.
+    pub display_w: u32,
+    pub display_h: u32,
+    /// EDID served by `DxgkDdiQueryDeviceDescriptor`, generated at StartDevice for
+    /// [`Self::display_mode`] via [`crate::ddi::vidpn::build_edid`] (valid checksum,
+    /// native detailed timing == the mode). Zeroed until the display half fills it.
+    pub edid: [u8; 128],
+    /// HPD worker event. `DxgkCbIndicateChildStatus` — which tells the OS the child
+    /// video-output is *connected*, the transition that makes the target available
+    /// for a VidPn path — is PASSIVE-only and MUST NOT be called during StartDevice,
+    /// so a dedicated system thread ([`crate::ddi::hpd::hpd_thread_routine`], the
+    /// viogpu3d ThreadWorkRoutine analog) does it. This SynchronizationEvent wakes
+    /// that thread: once shortly after start (initial indication) and again on every
+    /// virtio config-change interrupt (`VIRTIO_GPU_EVENT_DISPLAY`, ISR bit 1 → DPC).
+    pub hpd_event: UnsafeCell<KEVENT>,
+    /// PsCreateSystemThread handle for the HPD worker (0 = not started). StopDevice
+    /// signals `hpd_stop` + `hpd_event`, joins the thread on this handle, then closes it.
+    hpd_thread: AtomicUsize,
+    /// Tells the HPD worker to terminate (StopDevice / teardown).
+    pub hpd_stop: AtomicU32,
+    /// Set by the ISR when the virtio config-change bit (ISR status bit 1) fires; the
+    /// DPC consumes it and signals `hpd_event` so the worker re-indicates connection.
+    pub config_change_pending: AtomicU32,
 }
 
 // SAFETY: `dxgkrnl` is written only during the device-lifecycle DDIs, which
@@ -182,7 +256,172 @@ impl AdapterContext {
             venus_ctx_id: 0,
             gdi_accel_mode: 1,
             alloc_cached: true,
+            display_half: false,
+            // Zeroed placeholders — the real KTIMER/KDPC dispatcher state is
+            // written by `init_vsync` once the context is at its final address.
+            vsync_timer: UnsafeCell::new(unsafe { core::mem::zeroed() }),
+            vsync_dpc: UnsafeCell::new(unsafe { core::mem::zeroed() }),
+            vsync_enabled: AtomicU32::new(0),
+            vsync_count: AtomicU32::new(0),
+            last_primary_address: AtomicU64::new(0),
+            vsync_armed: AtomicU32::new(0),
+            display_w: 0,
+            display_h: 0,
+            edid: [0u8; 128],
+            // Zeroed placeholder — the real KEVENT is written by init_kernel_events.
+            hpd_event: UnsafeCell::new(unsafe { core::mem::zeroed() }),
+            hpd_thread: AtomicUsize::new(0),
+            hpd_stop: AtomicU32::new(0),
+            config_change_pending: AtomicU32::new(0),
         })
+    }
+
+    /// Start the HPD worker thread (StartDevice, display half). PASSIVE_LEVEL.
+    /// Idempotent-ish: does nothing if a thread handle is already stored.
+    ///
+    /// # Safety
+    /// `self` must be at its final heap address and `dxgkrnl` already saved.
+    pub unsafe fn init_hpd(&self) {
+        use core::sync::atomic::Ordering;
+        if self.hpd_thread.load(Ordering::Acquire) != 0 {
+            return;
+        }
+        self.hpd_stop.store(0, Ordering::Release);
+        let mut handle: wdk_sys::HANDLE = core::ptr::null_mut();
+        const THREAD_ALL_ACCESS: u32 = 0x001F_FFFF;
+        // SAFETY: PASSIVE_LEVEL; a kernel system thread in the system process
+        // running `hpd_thread_routine` with this stable context as its argument.
+        let st = unsafe {
+            wdk_sys::ntddk::PsCreateSystemThread(
+                &mut handle,
+                THREAD_ALL_ACCESS,
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+                Some(crate::ddi::hpd::hpd_thread_routine),
+                self as *const _ as PVOID,
+            )
+        };
+        if st == STATUS_SUCCESS && !handle.is_null() {
+            self.hpd_thread.store(handle as usize, Ordering::Release);
+        } else {
+            crate::diag::record(0x0B00_00E7);
+        }
+    }
+
+    /// Wake the HPD worker to re-indicate connection (from the interrupt DPC at
+    /// DISPATCH_LEVEL — KeSetEvent with Wait=FALSE is legal there).
+    pub fn signal_hpd(&self) {
+        // SAFETY: hpd_event was initialized in place by init_kernel_events.
+        unsafe { KeSetEvent(self.hpd_event.get(), 0, 0) };
+    }
+
+    /// Stop + join the HPD worker before teardown (StopDevice / Drop). Idempotent.
+    /// PASSIVE_LEVEL — it blocks on the worker's exit.
+    pub fn stop_hpd(&self) {
+        use core::sync::atomic::Ordering;
+        let h = self.hpd_thread.swap(0, Ordering::AcqRel);
+        if h == 0 {
+            return;
+        }
+        self.hpd_stop.store(1, Ordering::Release);
+        // SAFETY: initialized event; wake the worker so it observes hpd_stop.
+        unsafe { KeSetEvent(self.hpd_event.get(), 0, 0) };
+        // Join: reference the thread object from its handle, wait for it to exit,
+        // deref, then close the handle. Without the join, RemoveDevice could free
+        // this context while the worker still runs → UAF.
+        const SYNCHRONIZE: u32 = 0x0010_0000;
+        const KERNEL_MODE: i8 = 0;
+        let mut obj: PVOID = core::ptr::null_mut();
+        // SAFETY: `h` is a live thread handle from PsCreateSystemThread; PsThreadType
+        // validates it. On success we hold a reference to the ETHREAD.
+        let st = unsafe {
+            wdk_sys::ntddk::ObReferenceObjectByHandle(
+                h as wdk_sys::HANDLE,
+                SYNCHRONIZE,
+                *PsThreadType,
+                KERNEL_MODE,
+                &mut obj,
+                core::ptr::null_mut(),
+            )
+        };
+        if st == STATUS_SUCCESS && !obj.is_null() {
+            // SAFETY: waiting on the ETHREAD dispatcher object at PASSIVE_LEVEL.
+            unsafe {
+                let _ = KeWaitForSingleObject(obj, 0, 0, 0, core::ptr::null_mut());
+                wdk_sys::ntddk::ObfDereferenceObject(obj);
+            }
+        }
+        // SAFETY: closing the thread handle we created.
+        let _ = unsafe { wdk_sys::ntddk::ZwClose(h as wdk_sys::HANDLE) };
+    }
+
+    /// The display half's scanout-0 mode `(width, height)`: the host-reported size
+    /// if usable, else the 1920×1080 fallback. Every VidPn mode + the generated
+    /// EDID derive from this so they stay mutually consistent (cofunctional).
+    pub fn display_mode(&self) -> (u32, u32) {
+        if self.display_w >= 320 && self.display_h >= 240 {
+            (self.display_w, self.display_h)
+        } else {
+            (
+                crate::ddi::vidpn::DEFAULT_MODE_WIDTH,
+                crate::ddi::vidpn::DEFAULT_MODE_HEIGHT,
+            )
+        }
+    }
+
+    /// Arm the display-half VSync heartbeat: initialize the embedded KDPC/KTIMER
+    /// in place and start a periodic ~16 ms `SynchronizationTimer` whose DPC
+    /// (`vsync_dpc_routine`) synthesizes `DXGK_INTERRUPT_CRTC_VSYNC`. Idempotent
+    /// (no-op if already armed). PASSIVE_LEVEL only (StartDevice).
+    ///
+    /// # Safety
+    /// `self` must be at its final heap address (dxgkrnl holds it as the miniport
+    /// device context) and `dxgkrnl` must already be saved (StartDevice ordering).
+    pub unsafe fn init_vsync(&self) {
+        use wdk_sys::ntddk::{KeInitializeDpc, KeInitializeTimerEx, KeSetTimerEx};
+        if self.vsync_armed.swap(1, core::sync::atomic::Ordering::AcqRel) != 0 {
+            return;
+        }
+        self.vsync_enabled
+            .store(1, core::sync::atomic::Ordering::Release);
+        // SAFETY: the KDPC/KTIMER live in this stable boxed context; the DPC
+        // context is the adapter pointer, valid for the device lifetime.
+        unsafe {
+            KeInitializeDpc(
+                self.vsync_dpc.get(),
+                Some(crate::ddi::vsync_dpc_routine),
+                self as *const _ as PVOID,
+            );
+            KeInitializeTimerEx(
+                self.vsync_timer.get(),
+                wdk_sys::_TIMER_TYPE::SynchronizationTimer,
+            );
+            // Relative due time -16 ms (100 ns units); Period 16 ms (recurring).
+            let mut due: wdk_sys::LARGE_INTEGER = core::mem::zeroed();
+            due.QuadPart = -160_000;
+            KeSetTimerEx(self.vsync_timer.get(), due, 16, self.vsync_dpc.get());
+        }
+    }
+
+    /// Cancel the VSync heartbeat timer (StopDevice / teardown). Idempotent.
+    /// PASSIVE_LEVEL. After the flush returns, no VSync DPC is running or queued —
+    /// so it is safe for a subsequent RemoveDevice to free this context.
+    pub fn cancel_vsync(&self) {
+        use core::sync::atomic::Ordering;
+        if self.vsync_armed.swap(0, Ordering::AcqRel) == 0 {
+            return;
+        }
+        self.vsync_enabled.store(0, Ordering::Release);
+        // SAFETY: the timer was initialized by `init_vsync`; KeCancelTimer is
+        // callable at <= DISPATCH_LEVEL and safe on an idle timer. KeFlushQueuedDpcs
+        // (PASSIVE_LEVEL only — StopDevice is PASSIVE) then drains any DPC the timer
+        // already queued on another CPU before we return, closing the free-after-DPC
+        // window against RemoveDevice.
+        unsafe {
+            wdk_sys::ntddk::KeCancelTimer(self.vsync_timer.get());
+            wdk_sys::ntddk::KeFlushQueuedDpcs();
+        }
     }
 
     /// Initialize the embedded kernel dispatcher objects. MUST be called once,
@@ -196,6 +435,11 @@ impl AdapterContext {
         // SAFETY: per the fn contract; SynchronizationEvent (type 1), initially
         // signaled (the mutex starts free).
         unsafe { KeInitializeEvent(self.venus_mutex.get(), 1, 1) };
+        // HPD worker wake event: SynchronizationEvent (auto-clears on a satisfied
+        // wait), initially unsignaled — the worker's own timeout drives the first
+        // indication; later signals come from the config-change DPC.
+        // SAFETY: per the fn contract; stable in-place KEVENT storage.
+        unsafe { KeInitializeEvent(self.hpd_event.get(), 1, 0) };
     }
 
     /// Acquire the PASSIVE venus mutex (blocks; PASSIVE_LEVEL only).
@@ -332,6 +576,12 @@ impl AdapterContext {
 
 impl Drop for AdapterContext {
     fn drop(&mut self) {
+        // Cancel + drain the VSync heartbeat and join the HPD worker before this
+        // context's memory (which embeds the KTIMER/KDPC/KEVENT the worker touches)
+        // is freed, in case StopDevice was skipped. No-ops if never started.
+        // PASSIVE_LEVEL (RemoveDevice).
+        self.cancel_vsync();
+        self.stop_hpd();
         // Free the contiguous paging-RAM segment. RemoveDevice (which drops the
         // boxed AdapterContext) runs at PASSIVE_LEVEL, where MmFreeContiguousMemory
         // is legal.

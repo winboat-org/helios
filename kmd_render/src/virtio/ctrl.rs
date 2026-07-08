@@ -36,12 +36,13 @@ use crate::adapter::AdapterContext;
 use core::sync::atomic::Ordering;
 use helios_protocol::{
     resp_is_ok, VirtioGpuCtrlHdr, VirtioGpuCtxCreate, VirtioGpuCtxDestroy, VirtioGpuCtxResource,
-    VirtioGpuResourceCreateBlob, VirtioGpuResourceMapBlob, VirtioGpuResourceUnmapBlob,
-    VirtioGpuResourceUnref, VirtioGpuRespMapInfo, VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE,
-    VIRTIO_GPU_CMD_CTX_CREATE, VIRTIO_GPU_CMD_CTX_DESTROY, VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE,
-    VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB, VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB,
-    VIRTIO_GPU_CMD_RESOURCE_UNMAP_BLOB, VIRTIO_GPU_CMD_RESOURCE_UNREF,
-    VIRTIO_GPU_MAP_CACHE_MASK,
+    VirtioGpuRect, VirtioGpuResourceCreateBlob, VirtioGpuResourceFlush, VirtioGpuResourceMapBlob,
+    VirtioGpuResourceUnmapBlob, VirtioGpuResourceUnref, VirtioGpuRespMapInfo,
+    VirtioGpuSetScanoutBlob, VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE, VIRTIO_GPU_CMD_CTX_CREATE,
+    VIRTIO_GPU_CMD_CTX_DESTROY, VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE,
+    VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB, VIRTIO_GPU_CMD_RESOURCE_FLUSH,
+    VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB, VIRTIO_GPU_CMD_RESOURCE_UNMAP_BLOB,
+    VIRTIO_GPU_CMD_RESOURCE_UNREF, VIRTIO_GPU_CMD_SET_SCANOUT_BLOB, VIRTIO_GPU_MAP_CACHE_MASK,
 };
 
 /// `KernelMode` (`KPROCESSOR_MODE`).
@@ -299,6 +300,62 @@ pub fn ctx_detach_resource(
 }
 
 /// Drop the host's reference to a resource.
+/// Bind a venus blob `resource_id` to scanout 0 (the QEMU gtk/sdl display) via
+/// `SET_SCANOUT_BLOB` — the Phase-7 zero-copy display path (DISPLAY.md §8), now
+/// driven from the WDDM VidPn scanout DDI. The blob must be a dmabuf-exportable
+/// HOST3D resource (the host's venus render-server exports its `dmabuf_fd`, e.g.
+/// via ANV); a non-exportable/wrong-layout resource is rejected host-side and
+/// surfaces here as `VirtioError::DeviceError` — that IS the export-gate signal.
+/// `stride`/`offset` are plane-0 geometry of the LINEAR image. Device-global
+/// (`hdr.ctx_id = 0`). PASSIVE_LEVEL only (control round-trip).
+pub fn set_scanout_blob(
+    adapter: &AdapterContext,
+    resource_id: u32,
+    width: u32,
+    height: u32,
+    format: u32,
+    stride: u32,
+    offset: u32,
+) -> Result<(), VirtioError> {
+    let mut cmd = VirtioGpuSetScanoutBlob::zeroed();
+    cmd.hdr.type_ = VIRTIO_GPU_CMD_SET_SCANOUT_BLOB;
+    cmd.r = VirtioGpuRect {
+        x: 0,
+        y: 0,
+        width,
+        height,
+    };
+    cmd.scanout_id = 0;
+    cmd.resource_id = resource_id;
+    cmd.width = width;
+    cmd.height = height;
+    cmd.format = format;
+    cmd.strides[0] = stride;
+    cmd.offsets[0] = offset;
+    ctrl_roundtrip_ok(adapter, bytes_of(&cmd), None)
+}
+
+/// Flush scanout 0's bound resource to the host display (`RESOURCE_FLUSH`) — for
+/// a GL/blob scanout this is what drives the actual host present. Device-global.
+/// PASSIVE_LEVEL only (control round-trip).
+pub fn resource_flush(
+    adapter: &AdapterContext,
+    resource_id: u32,
+    width: u32,
+    height: u32,
+) -> Result<(), VirtioError> {
+    let mut cmd = VirtioGpuResourceFlush::zeroed();
+    cmd.hdr.type_ = VIRTIO_GPU_CMD_RESOURCE_FLUSH;
+    cmd.r = VirtioGpuRect {
+        x: 0,
+        y: 0,
+        width,
+        height,
+    };
+    cmd.resource_id = resource_id;
+    ctrl_roundtrip_ok(adapter, bytes_of(&cmd), None)
+}
+
 pub fn resource_unref(adapter: &AdapterContext, resource_id: u32) -> Result<(), VirtioError> {
     let mut cmd = VirtioGpuResourceUnref::zeroed();
     cmd.hdr.type_ = VIRTIO_GPU_CMD_RESOURCE_UNREF;
