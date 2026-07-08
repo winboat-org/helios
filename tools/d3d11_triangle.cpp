@@ -90,7 +90,12 @@ int main(int argc, char** argv) {
     rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top,
     nullptr, nullptr, wc.hInstance, nullptr);
   ShowWindow(hwnd, SW_SHOW); UpdateWindow(hwnd);
-  L("hwnd=%p rect=%ld,%ld", hwnd, rc.left, rc.top);
+  // Force the window above any stray console so the on-screen capture is
+  // unoccluded (topmost does not change DWM's flip-model composition path,
+  // so it cannot mask a genuine transparency defect).
+  SetWindowPos(hwnd, HWND_TOPMOST, rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top, SWP_SHOWWINDOW);
+  SetForegroundWindow(hwnd);
+  L("hwnd=%p rect=%ld,%ld foreground=%p", hwnd, rc.left, rc.top, GetForegroundWindow());
 
   // --- factory + adapter ---
   IDXGIFactory2* factory = nullptr;
