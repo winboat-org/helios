@@ -208,7 +208,7 @@ unsafe fn query_driver_caps(
     const MEMORYMANAGEMENTCAPS_GPU_MMU_SUPPORTED: u32 = 1 << 6;
 
     let mut mem_caps = MEMORYMANAGEMENTCAPS_SECTION_BACKED_PRIMARY;
-    if DECLARE_CROSS_ADAPTER_RESOURCE {
+    if DECLARE_CROSS_ADAPTER_RESOURCE || cross_adapter_advertised() {
         mem_caps |= MEMORYMANAGEMENTCAPS_CROSS_ADAPTER_RESOURCE;
     }
     if RAISE_WDDM_3_2_GPUMMU {
@@ -436,6 +436,25 @@ pub(crate) const RAISE_WDDM_3_2_GPUMMU: bool = true;
 /// (default off) and is not gated here.
 fn direct_flip_advertised() -> bool {
     crate::diag::read_config_dword(b"DirectFlipCaps", 0) != 0
+}
+
+/// `CrossAdaptCaps` service knob (REG_DWORD, default 0): nonzero advertises the
+/// `DXGK_VIDMMCAPS.CrossAdapterResource` bit (tier-1 cross-adapter copy support).
+/// Without that bit the OS never attempts the cross-adapter *redirected-bitblt*
+/// windowed present, so every legacy BLT-model swapchain (DXUT/FaceWorks, older
+/// 3DMark) is declared `DXGI_STATUS_OCCLUDED` and renders transparent (priority #1,
+/// root-caused 2026-07-08 with `tools/d3d11_triangle.cpp`: FLIP composites, BLT
+/// occludes). The redirection-surface machinery already exists — GDISURFACE is
+/// handled in `GetStandardAllocationDriverData` and backed by a real venus blob in
+/// `create_one`; this cap is the only gate. Kept OFF by default (the compiled
+/// `DECLARE_CROSS_ADAPTER_RESOURCE` const stays false, boot-proven surface); the
+/// knob is read at AddAdapter (PASSIVE), same pattern as `DirectFlipCaps`, so it
+/// A/Bs via `reg add ... /v CrossAdaptCaps /t REG_DWORD /d 1` + `pnputil
+/// /restart-device` with NO reboot once this KMD is deployed. Its value is visible
+/// in the `0x01D4` MemoryManagementCaps diag record (CrossAdapterResource = bit 4).
+/// NB: `read_config_dword` truncates names to 14 chars — this name is exactly 14.
+fn cross_adapter_advertised() -> bool {
+    crate::diag::read_config_dword(b"CrossAdaptCaps", 0) != 0
 }
 
 /// Write the viogpu3d-style linear aperture descriptor (paging-buffer host).
