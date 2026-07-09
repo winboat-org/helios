@@ -7,6 +7,9 @@
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicU32, Ordering};
 
+use bytemuck::pod_read_unaligned;
+use helios_protocol::HeliosPresentPrivateData;
+
 use crate::adapter::AdapterContext;
 use crate::ddi::create_allocation::present_alloc_info;
 use crate::dxgk::*;
@@ -35,6 +38,65 @@ pub static PRESENT_LAST_SRC_OPEN_LOW: AtomicU32 = AtomicU32::new(0);
 pub static PRESENT_LAST_DST_OPEN_LOW: AtomicU32 = AtomicU32::new(0);
 pub static PRESENT_LAST_FLAGS: AtomicU32 = AtomicU32::new(0);
 pub static PRESENT_LAST_STATUS: AtomicU32 = AtomicU32::new(0);
+
+unsafe fn present_private_data(args: &DXGKARG_PRESENT) -> Option<HeliosPresentPrivateData> {
+    if args.pPrivateDriverData.is_null()
+        || (args.PrivateDriverDataSize as usize) < core::mem::size_of::<HeliosPresentPrivateData>()
+    {
+        return None;
+    }
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            args.pPrivateDriverData as *const u8,
+            core::mem::size_of::<HeliosPresentPrivateData>(),
+        )
+    };
+    let data: HeliosPresentPrivateData = pod_read_unaligned(bytes);
+    data.is_valid().then_some(data)
+}
+
+pub(crate) fn issue_present_scanout(
+    _adapter: &AdapterContext,
+    resource_id: u32,
+    mut width: u32,
+    mut height: u32,
+    pitch: u32,
+    dxgi_format: u32,
+    plane_offset: u64,
+    via: u32,
+) {
+    let (mode_w, mode_h) = _adapter.display_mode();
+    if width == 0 {
+        width = mode_w;
+    }
+    if height == 0 {
+        height = mode_h;
+    }
+    let stride = if pitch != 0 {
+        pitch
+    } else {
+        crate::ddi::create_allocation::cross_adapter_pitch(width)
+    };
+    const DXGI_FORMAT_B8G8R8A8_UNORM: u32 = 87;
+    const DXGI_FORMAT_B8G8R8X8_UNORM: u32 = 88;
+    rec_named(b"PScVia", via);
+    rec_named(b"PScRid", resource_id);
+    rec_named(b"PScWH", (width << 16) | (height & 0xFFFF));
+    rec_named(b"PScPch", stride);
+    rec_named(b"PScOff", plane_offset as u32);
+    if dxgi_format != 0
+        && dxgi_format != DXGI_FORMAT_B8G8R8A8_UNORM
+        && dxgi_format != DXGI_FORMAT_B8G8R8X8_UNORM
+    {
+        rec_named(b"PScFmt", dxgi_format);
+        return;
+    }
+    // Present source allocations are often intermediate DWM/render targets, not
+    // the committed VidPn primary. Promoting them to scanout produces partial
+    // overlays/corruption. Keep Present as a scheduler operation; scanout changes
+    // only happen from the primary-address path.
+    rec_named(b"PScSet", 0xD);
+}
 
 /// Mirror present-path tracers into the PASSIVE registry ring.
 ///
@@ -108,17 +170,17 @@ pub unsafe extern "C" fn dxgkddi_present(
     }
 
     let allocation_list = unsafe { args.__bindgen_anon_1.pAllocationList };
+    let present_private = unsafe { present_private_data(args) };
+    rec_named(b"PBpdsz", args.PrivateDriverDataSize);
     if !allocation_list.is_null() {
         let src = unsafe { allocation_list.add(DXGK_PRESENT_SOURCE_INDEX as usize) };
         let dst = unsafe { allocation_list.add(DXGK_PRESENT_DESTINATION_INDEX as usize) };
+        let dst_handle = unsafe { (*dst).hDeviceSpecificAllocation };
         PRESENT_LAST_SRC_OPEN_LOW.store(
             (*src).hDeviceSpecificAllocation as usize as u32,
             Ordering::Relaxed,
         );
-        PRESENT_LAST_DST_OPEN_LOW.store(
-            (*dst).hDeviceSpecificAllocation as usize as u32,
-            Ordering::Relaxed,
-        );
+        PRESENT_LAST_DST_OPEN_LOW.store(dst_handle as usize as u32, Ordering::Relaxed);
 
         // Present-blit feasibility trace (read-only). Resolve the composition
         // source + IddCx destination surfaces to their venus resource ids /
@@ -126,8 +188,30 @@ pub unsafe extern "C" fn dxgkddi_present(
         // blob the KMD could CPU-map for a coherence copy. Fixed value names so
         // the data survives the diag ring flood; read live from the service key.
         let adapter = unsafe { &*(_adapter as *const AdapterContext) };
+        let src_scanout = unsafe {
+            crate::ddi::create_allocation::present_scanout_alloc_info(
+                (*src).hDeviceSpecificAllocation,
+            )
+        };
+        rec_named(
+            b"PBsrcH",
+            ((*src).hDeviceSpecificAllocation as usize as u32) & 0xFFFF,
+        );
+        rec_named(b"PBdstH", (dst_handle as usize as u32) & 0xFFFF);
         let src_info = unsafe { present_alloc_info((*src).hDeviceSpecificAllocation) };
-        let dst_info = unsafe { present_alloc_info((*dst).hDeviceSpecificAllocation) };
+        let dst_info = unsafe { present_alloc_info(dst_handle) };
+        if let Some(sc) = src_scanout {
+            issue_present_scanout(
+                adapter,
+                sc.resource_id,
+                sc.width,
+                sc.height,
+                sc.pitch,
+                sc.dxgi_format,
+                sc.plane_offset,
+                1,
+            );
+        }
         if let Some(s) = src_info {
             rec_named(b"PBsrc", s.resource_id);
             rec_named(b"PBsw", s.width);
@@ -159,6 +243,21 @@ pub unsafe extern "C" fn dxgkddi_present(
         } else {
             rec_named(b"PBdst", 0);
         }
+    } else if let Some(sc) = present_private {
+        let adapter = unsafe { &*(_adapter as *const AdapterContext) };
+        rec_named(b"PBsrc", sc.resource_id);
+        rec_named(b"PBsw", sc.width);
+        rec_named(b"PBsh", sc.height);
+        issue_present_scanout(
+            adapter,
+            sc.resource_id,
+            sc.width,
+            sc.height,
+            sc.pitch,
+            sc.dxgi_format,
+            sc.plane_offset,
+            2,
+        );
     }
 
     if !args.pPatchLocationListOut.is_null() && args.PatchLocationListOutSize >= 2 {
@@ -279,9 +378,8 @@ pub unsafe extern "C" fn dxgkddi_is_supported_vidpn(
     // side), not a topology-synthesis gap. `VpISp`=0 ⇒ it only ever asks about the
     // empty VidPn (a topology/target problem persists).
     let adapter = unsafe { &*p };
-    let pc = unsafe {
-        crate::ddi::vidpn::topology_path_count(adapter, (*is_supported).hDesiredVidPn)
-    };
+    let pc =
+        unsafe { crate::ddi::vidpn::topology_path_count(adapter, (*is_supported).hDesiredVidPn) };
     if pc != u32::MAX {
         static MAX_PC: AtomicU32 = AtomicU32::new(0);
         MAX_PC.fetch_max(pc, Ordering::Relaxed);
@@ -424,8 +522,7 @@ pub unsafe extern "C" fn dxgkddi_set_vidpn_source_address(
         return STATUS_SUCCESS;
     }
     let h_alloc = unsafe { (*address).hAllocation };
-    let Some(sc) = (unsafe { crate::ddi::create_allocation::scanout_alloc_info(h_alloc) })
-    else {
+    let Some(sc) = (unsafe { crate::ddi::create_allocation::scanout_alloc_info(h_alloc) }) else {
         crate::diag::record_named_bytes(b"ScRid", 0);
         return STATUS_SUCCESS;
     };
@@ -452,12 +549,15 @@ pub unsafe extern "C" fn dxgkddi_set_vidpn_source_address(
     crate::diag::record_named_bytes(b"ScPch", stride);
     // Resolve the scan-out format from the creator's EXACT DXGI format (the KMD
     // D3DDDIFORMAT is lossy — B8G8R8A8 and R8G8B8A8 both collapse to A8R8G8B8).
-    // Only B8G8R8A8 is wired on the virtio side; the DWM primary is DXGI 87
-    // (B8G8R8A8), which matches. A non-BGRA primary is recorded loudly (`ScFmt`)
-    // and still scanned as BGRA rather than silently producing swapped colors.
+    // Preserve A-vs-X on the virtio scanout contract: DRM AR24/XR24 both map to
+    // BGRA byte storage, but the host import path sees them as distinct formats.
     const DXGI_FORMAT_B8G8R8A8_UNORM: u32 = 87;
     const DXGI_FORMAT_B8G8R8X8_UNORM: u32 = 88;
-    let vformat = helios_protocol::VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM;
+    let vformat = if sc.dxgi_format == DXGI_FORMAT_B8G8R8X8_UNORM {
+        helios_protocol::VIRTIO_GPU_FORMAT_B8G8R8X8_UNORM
+    } else {
+        helios_protocol::VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM
+    };
     if sc.dxgi_format != 0
         && sc.dxgi_format != DXGI_FORMAT_B8G8R8A8_UNORM
         && sc.dxgi_format != DXGI_FORMAT_B8G8R8X8_UNORM
@@ -465,6 +565,9 @@ pub unsafe extern "C" fn dxgkddi_set_vidpn_source_address(
         crate::diag::record_named_bytes(b"ScFmt", sc.dxgi_format);
     }
     crate::diag::record_named_bytes(b"ScOff", sc.plane_offset as u32);
+    if crate::ddi::scanout_diag::rebind_if_forced(adapter, 11) {
+        return STATUS_SUCCESS;
+    }
     let set = crate::virtio::ctrl::set_scanout_blob(
         adapter,
         sc.resource_id,
@@ -476,6 +579,7 @@ pub unsafe extern "C" fn dxgkddi_set_vidpn_source_address(
     );
     crate::diag::record_named_bytes(b"ScSet", if set.is_ok() { 1 } else { 0xE });
     if set.is_ok() {
+        adapter.remember_scanout_blob(sc.resource_id, width, height);
         let flush = crate::virtio::ctrl::resource_flush(adapter, sc.resource_id, width, height);
         crate::diag::record_named_bytes(b"ScFlu", if flush.is_ok() { 1 } else { 0xE });
     }

@@ -21,6 +21,7 @@ use helios_protocol::{
     HeliosWddmAllocMeta, HeliosWddmAllocPrivate, HeliosWddmOpenIdentity,
     HELIOS_WDDM_ALLOC_KIND_DEVICE_MEMORY, HELIOS_WDDM_ALLOC_KIND_STANDARD,
     VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE, VIRTIO_GPU_BLOB_MEM_HOST3D, VIRTIO_GPU_MAP_CACHE_CACHED,
+    VIRTIO_GPU_MAP_CACHE_WC,
 };
 
 use crate::adapter::AdapterContext;
@@ -51,6 +52,9 @@ struct AllocationContext {
     /// `VkDeviceMemory` object id behind the blob, freed (`vkFreeMemory`) at
     /// DestroyAllocation after the resource unref.
     venus_memory_id: u64,
+    /// Nonzero when the standard allocation's memory is bound to a kernel-created
+    /// Venus `VkImage` (the shared-primary scanout path).
+    venus_image_id: u64,
     size: SIZE_T,
     /// Host-visible window byte offset this blob is mapped at (Stage 2b).
     map_offset: u64,
@@ -104,7 +108,10 @@ struct ResourceContext {
 /// `DXGK_OPENALLOCATIONINFO` is its non-device-specific allocation handle; the
 /// miniport must return its own device-specific handle here and later receives it
 /// in command allocation lists / CloseAllocation.
+const OPEN_ALLOCATION_CTX_MAGIC: u32 = 0x484F_504E; // "HOPN"
+
 struct OpenAllocationContext {
+    magic: u32,
     allocation: D3DKMT_HANDLE,
     private_size: u32,
     /// Venus resource id (from `HeliosWddmAllocPrivate._pad`) + geometry, captured
@@ -139,6 +146,9 @@ pub unsafe fn present_alloc_info(h: HANDLE) -> Option<PresentAllocInfo> {
         return None;
     }
     let open = unsafe { &*(h as *const OpenAllocationContext) };
+    if open.magic != OPEN_ALLOCATION_CTX_MAGIC {
+        return None;
+    }
     if open.resource_id == 0 {
         return None;
     }
@@ -148,6 +158,23 @@ pub unsafe fn present_alloc_info(h: HANDLE) -> Option<PresentAllocInfo> {
         height: open.height,
         format: open.format,
     })
+}
+
+/// Resolve a Present allocation-list entry's device-specific allocation handle
+/// to the create-time allocation scanout metadata. Present does not carry the
+/// raw `hAllocation`; it carries the per-device handle we returned from
+/// `DxgkDdiOpenAllocation`, so use that open context as the contract bridge.
+///
+/// SAFETY: same contract as [`present_alloc_info`].
+pub(crate) unsafe fn present_scanout_alloc_info(h: HANDLE) -> Option<ScanoutInfo> {
+    if h.is_null() {
+        return None;
+    }
+    let open = unsafe { &*(h as *const OpenAllocationContext) };
+    if open.magic != OPEN_ALLOCATION_CTX_MAGIC {
+        return None;
+    }
+    unsafe { scanout_alloc_info(open.allocation as HANDLE) }
 }
 
 /// Snapshot of the [`AllocationContext`] fields `BuildPagingBuffer` needs to
@@ -251,6 +278,63 @@ const CROSS_ADAPTER_PITCH_ALIGN: u32 = 256;
 /// AzureTriage — 36th session), which silently fails primary creation → no VidPn
 /// path. `create_one` reads this bit and suppresses `Cached` for the primary.
 const HELIOS_ALLOC_MISC_PRIMARY: u32 = 0x8000_0000;
+
+fn bind_created_scanout(adapter: &AdapterContext, resource_id: u32, meta: &HeliosWddmAllocMeta) {
+    if !adapter.display_half || resource_id == 0 {
+        return;
+    }
+    let (mode_w, mode_h) = adapter.display_mode();
+    let width = if meta.width != 0 { meta.width } else { mode_w };
+    let height = if meta.height != 0 {
+        meta.height
+    } else {
+        mode_h
+    };
+    let stride = if meta.pitch != 0 {
+        meta.pitch
+    } else {
+        cross_adapter_pitch(width)
+    };
+    const DXGI_FORMAT_B8G8R8A8_UNORM: u32 = 87;
+    const DXGI_FORMAT_B8G8R8X8_UNORM: u32 = 88;
+    let vformat = if meta.dxgi_format == DXGI_FORMAT_B8G8R8X8_UNORM {
+        helios_protocol::VIRTIO_GPU_FORMAT_B8G8R8X8_UNORM
+    } else {
+        helios_protocol::VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM
+    };
+    if meta.dxgi_format != 0
+        && meta.dxgi_format != DXGI_FORMAT_B8G8R8A8_UNORM
+        && meta.dxgi_format != DXGI_FORMAT_B8G8R8X8_UNORM
+    {
+        crate::diag::record_named_bytes(b"CScFmt", meta.dxgi_format);
+    }
+    crate::diag::record_named_bytes(b"CScRid", resource_id);
+    crate::diag::record_named_bytes(b"CScWH", (width << 16) | (height & 0xFFFF));
+    crate::diag::record_named_bytes(b"CScPch", stride);
+    crate::diag::record_named_bytes(b"CScOff", meta.plane_offset as u32);
+    if width != mode_w || height != mode_h || meta.dxgi_format != DXGI_FORMAT_B8G8R8X8_UNORM {
+        crate::diag::record_named_bytes(b"CScSet", 0xD);
+        return;
+    }
+    if crate::ddi::scanout_diag::rebind_if_forced(adapter, 10) {
+        return;
+    }
+    let set = crate::virtio::ctrl::set_scanout_blob(
+        adapter,
+        resource_id,
+        width,
+        height,
+        vformat,
+        stride,
+        meta.plane_offset as u32,
+    );
+    crate::diag::record_named_bytes(b"CScSet", if set.is_ok() { 1 } else { 0xE });
+    if set.is_ok() {
+        adapter.remember_scanout_blob(resource_id, width, height);
+        let flush = crate::virtio::ctrl::resource_flush(adapter, resource_id, width, height);
+        crate::diag::record_named_bytes(b"CScFlu", if flush.is_ok() { 1 } else { 0xE });
+    }
+}
 
 fn round_up_page(n: SIZE_T) -> SIZE_T {
     n.saturating_add(PAGE - 1) & !(PAGE - 1)
@@ -416,14 +500,16 @@ unsafe fn destroy_allocation_ctx(adapter: &AdapterContext, ctx: Box<AllocationCo
             let _ = crate::virtio::ctrl::ctx_detach_resource(adapter, ctx.ctx_id, ctx.resource_id);
             let _ = crate::virtio::ctrl::resource_unref(adapter, ctx.resource_id);
         }
+        if ctx.venus_image_id != 0 {
+            let _ = adapter.with_venus_client(|c| c.destroy_image(adapter, ctx.venus_image_id));
+        }
         if ctx.venus_memory_id != 0 {
             // KMD-backed standard allocation: after the RESOURCE teardown above
             // (the host blob holds a reference into the memory object),
             // vkFreeMemory the venus memory. Best-effort: if the venus client
             // is already gone (device teardown), the host context destruction
             // reclaims everything anyway.
-            let _ =
-                adapter.with_venus_client(|c| c.free_memory_blob(adapter, ctx.venus_memory_id));
+            let _ = adapter.with_venus_client(|c| c.free_memory_blob(adapter, ctx.venus_memory_id));
         }
     }
     drop(ctx);
@@ -498,6 +584,8 @@ unsafe fn create_one(
     crate::diag::record(0x0C01_0010 | (ap.kind & 0xFF));
     let adopt_supplied_resource = supplied_resource_id != 0;
     let mut venus_memory_id = 0u64;
+    let mut venus_image_id = 0u64;
+    let is_primary = (meta.misc_flags & HELIOS_ALLOC_MISC_PRIMARY) != 0;
     let resource_id = if adopt_supplied_resource {
         // C1 lifetime fix: adopting transfers the blob's ownership from the
         // ICD's escape owner (D3DKMT device handle) to THIS allocation, so a
@@ -527,6 +615,29 @@ unsafe fn create_one(
                 return Err(STATUS_DEVICE_NOT_READY);
             }
         }
+    } else if ap.kind == HELIOS_WDDM_ALLOC_KIND_STANDARD && is_primary {
+        match adapter.with_venus_client(|c| {
+            c.allocate_linear_scanout_image_blob(adapter, meta.width, meta.height)
+        }) {
+            Ok(Ok(scanout)) => {
+                venus_memory_id = scanout.blob.blob_id;
+                venus_image_id = scanout.image_id;
+                meta.pitch = scanout.row_pitch;
+                meta.plane_offset = scanout.plane_offset as u64;
+                meta.venus_alloc_size = scanout.blob.size;
+                meta.memory_type_index = scanout.memory_type_index;
+                ap.size = scanout.blob.size;
+                scanout.blob.res_id
+            }
+            Ok(Err(_ve)) => {
+                crate::diag::record(0x0C01_00E5);
+                return Err(STATUS_NO_MEMORY);
+            }
+            Err(_de) => {
+                crate::diag::record(0x0C01_00E1);
+                return Err(STATUS_DEVICE_NOT_READY);
+            }
+        }
     } else if ap.kind == HELIOS_WDDM_ALLOC_KIND_STANDARD {
         // KMD-originated standard allocation (indirect-swapchain backbuffer, GDI
         // redirection/staging surface). Back it with a REAL venus `VkDeviceMemory`
@@ -539,7 +650,7 @@ unsafe fn create_one(
         // (owner 0), which the GDI executor's `blob_kernel_range` resolves.
         // PASSIVE flow under the venus mutex (never the DISPATCH spinlock).
         match adapter.with_venus_client(|c| {
-            c.allocate_memory_blob(adapter, ap.size, true)
+            c.allocate_memory_blob(adapter, ap.size, true, is_primary)
                 .map(|b| (b, c.memory_type_index()))
         }) {
             Ok(Ok((blob, kernel_mti))) => {
@@ -670,6 +781,7 @@ unsafe fn create_one(
         owns_resource,
         blob_id: ap.blob_id,
         venus_memory_id,
+        venus_image_id,
         size,
         map_offset: 0,
         map_len: 0,
@@ -695,38 +807,42 @@ unsafe fn create_one(
     // APERTURE segment ("CPUVisible allocations must include an aperture segment in
     // the supported segment set" — ETW-confirmed 36th session), which without it
     // fails the whole VidPn commit → 0-path VidPn → display never activates.
-    let is_primary = ap.kind == HELIOS_WDDM_ALLOC_KIND_STANDARD
-        && (meta.misc_flags & HELIOS_ALLOC_MISC_PRIMARY) != 0;
     let aperture_bit = 1u32 << (crate::ddi::gpummu::APERTURE_SEGMENT_ID - 1);
-    let (preferred_segment, supported_segments) = if let (true, Some(seg_id)) =
-        (bar_eligible, bar_seg_id)
-    {
-        // Prefer the BAR (the two-memory-split fix keeps CPU raster in the venus
-        // blob's bytes). These allocations are CpuVisible (set below) in a
-        // NON-CPU-accessible memory segment — the BAR exposes CPU access only via
-        // the CpuHostAperture (segment CpuVisible=0) — and WDDM REQUIRES every such
-        // allocation to list an aperture segment in its supported set so VidMm can
-        // always obtain a CPU virtual address, falling back to system memory if the
-        // CpuHostAperture is full (allocation-usage-tracking.md: "all CPU-accessible
-        // allocations in non-CPU-accessible memory segments must contain an aperture
-        // segment in their supported segment set"). v71 added it to the PRIMARY only;
-        // the other CpuVisible surfaces (SHADOW/STAGING/GDI) shipped BAR-only and
-        // dxgkrnl rejected them ("CPUVisible allocations must include an aperture
-        // segment", ETW-confirmed v71/v72 — 10 `0x0202` violators in the S-ring) →
-        // the whole VidPn commit failed. Gated on the display half so the proven
-        // render-only surface (DisplayHalf off) stays byte-identical: it never hit
-        // the rejection because its CpuHostAperture always had space, so the fallback
-        // was never demanded. PreferredSegment stays the BAR — with a 1 GiB BAR vs a
-        // ~200 MB CpuVisible working set, content lives in the venus blob in steady
-        // state and the aperture (which VidMm upgrades to the implicit system-memory
-        // segment without AccessedPhysically, iommu-dma-remapping.md) is an
-        // eviction-only fallback not exercised at this scale — negligible runtime cost.
-        let needs_aperture = is_primary || adapter.display_half;
-        let supp = 1u32 << (seg_id - 1);
-        (seg_id, if needs_aperture { supp | aperture_bit } else { supp })
-    } else {
-        (crate::ddi::gpummu::APERTURE_SEGMENT_ID, aperture_bit)
-    };
+    let (preferred_segment, supported_segments) =
+        if let (true, Some(seg_id)) = (bar_eligible, bar_seg_id) {
+            // Prefer the BAR (the two-memory-split fix keeps CPU raster in the venus
+            // blob's bytes). These allocations are CpuVisible (set below) in a
+            // NON-CPU-accessible memory segment — the BAR exposes CPU access only via
+            // the CpuHostAperture (segment CpuVisible=0) — and WDDM REQUIRES every such
+            // allocation to list an aperture segment in its supported set so VidMm can
+            // always obtain a CPU virtual address, falling back to system memory if the
+            // CpuHostAperture is full (allocation-usage-tracking.md: "all CPU-accessible
+            // allocations in non-CPU-accessible memory segments must contain an aperture
+            // segment in their supported segment set"). v71 added it to the PRIMARY only;
+            // the other CpuVisible surfaces (SHADOW/STAGING/GDI) shipped BAR-only and
+            // dxgkrnl rejected them ("CPUVisible allocations must include an aperture
+            // segment", ETW-confirmed v71/v72 — 10 `0x0202` violators in the S-ring) →
+            // the whole VidPn commit failed. Gated on the display half so the proven
+            // render-only surface (DisplayHalf off) stays byte-identical: it never hit
+            // the rejection because its CpuHostAperture always had space, so the fallback
+            // was never demanded. PreferredSegment stays the BAR — with a 1 GiB BAR vs a
+            // ~200 MB CpuVisible working set, content lives in the venus blob in steady
+            // state and the aperture (which VidMm upgrades to the implicit system-memory
+            // segment without AccessedPhysically, iommu-dma-remapping.md) is an
+            // eviction-only fallback not exercised at this scale — negligible runtime cost.
+            let needs_aperture = is_primary || adapter.display_half;
+            let supp = 1u32 << (seg_id - 1);
+            (
+                seg_id,
+                if needs_aperture {
+                    supp | aperture_bit
+                } else {
+                    supp
+                },
+            )
+        } else {
+            (crate::ddi::gpummu::APERTURE_SEGMENT_ID, aperture_bit)
+        };
     info.SupportedWriteSegmentSet = supported_segments;
     info.EvictionSegmentSet = 0;
     info.HintedBank.__bindgen_anon_1.Value = 0;
@@ -766,6 +882,9 @@ unsafe fn create_one(
                 .__bindgen_anon_1
                 .set_Cached(1);
         }
+    }
+    if is_primary {
+        bind_created_scanout(adapter, resource_id, &meta);
     }
     crate::diag::record(0x0C12_0000 | ((size >> 12).min(0xFFFF) as u32));
     crate::diag::record(
@@ -899,9 +1018,7 @@ pub unsafe extern "C" fn dxgkddi_open_allocation(
     }
     // SAFETY: hDevice is the DeviceContext we returned from DxgkDdiCreateDevice;
     // its adapter back-pointer is valid for the device's lifetime.
-    let adapter = unsafe {
-        &*(*(h_device as *const crate::device::DeviceContext)).adapter
-    };
+    let adapter = unsafe { &*(*(h_device as *const crate::device::DeviceContext)).adapter };
     // SAFETY: valid per the DDI contract; `pOpenAllocation` is a `*mut` array of
     // `NumAllocations` entries whose `hDeviceSpecificAllocation` we fill.
     // The struct has output fields (`Pitch`, `SubresourceOffset`) despite the WDK
@@ -966,6 +1083,7 @@ pub unsafe extern "C" fn dxgkddi_open_allocation(
         }
 
         let open = Box::new(OpenAllocationContext {
+            magic: OPEN_ALLOCATION_CTX_MAGIC,
             allocation: info.hAllocation,
             private_size: info.PrivateDriverDataSize,
             resource_id,
@@ -1135,8 +1253,7 @@ pub unsafe extern "C" fn dxgkddi_get_standard_allocation_driver_data(
     // ── Phase 2: extract geometry from the per-type union; set out Pitch ─────
     // SAFETY: the union arm is selected by StandardAllocationType; dxgkrnl
     // guarantees the matching surface-data pointer is valid for the fill call.
-    let is_primary =
-        args.StandardAllocationType == D3DKMDT_STANDARDALLOCATION_SHAREDPRIMARYSURFACE;
+    let is_primary = args.StandardAllocationType == D3DKMDT_STANDARDALLOCATION_SHAREDPRIMARYSURFACE;
     let (width, height, format): (u32, u32, u32) = match args.StandardAllocationType {
         D3DKMDT_STANDARDALLOCATION_SHAREDPRIMARYSURFACE => {
             let sd = unsafe { &*args.__bindgen_anon_1.pCreateSharedPrimarySurfaceData };
@@ -1180,6 +1297,11 @@ pub unsafe extern "C" fn dxgkddi_get_standard_allocation_driver_data(
         .saturating_add(64 * 1024)
         .max(PAGE as u64);
 
+    let map_cache = if is_primary {
+        VIRTIO_GPU_MAP_CACHE_WC
+    } else {
+        VIRTIO_GPU_MAP_CACHE_CACHED
+    };
     let ap = HeliosWddmAllocPrivate::new(
         HELIOS_WDDM_ALLOC_KIND_STANDARD,
         adapter.venus_ctx_id,
@@ -1187,7 +1309,7 @@ pub unsafe extern "C" fn dxgkddi_get_standard_allocation_driver_data(
         size,
         VIRTIO_GPU_BLOB_MEM_HOST3D,
         VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE,
-        VIRTIO_GPU_MAP_CACHE_CACHED,
+        map_cache,
     );
     let meta = HeliosWddmAllocMeta {
         width,
@@ -1200,15 +1322,21 @@ pub unsafe extern "C" fn dxgkddi_get_standard_allocation_driver_data(
         bind_flags: 0x0000_0008 | 0x0000_0020,
         // Flag a shared-primary surface so create_one omits the illegal
         // `Cached`-with-Primary flag on the scanout primary.
-        misc_flags: if is_primary { HELIOS_ALLOC_MISC_PRIMARY } else { 0 },
+        misc_flags: if is_primary {
+            HELIOS_ALLOC_MISC_PRIMARY
+        } else {
+            0
+        },
         // Filled by DxgkDdiCreateAllocation's write-back once the kernel venus
         // client has actually allocated the backing memory.
         venus_alloc_size: 0,
         memory_type_index: 0,
-        // KMD standard allocations are BGRA composition surfaces; leave the DXGI
-        // format hint 0 so the UMD opener uses its BGRA fallback. (Field formerly
-        // named `reserved`; same on-wire slot.)
-        dxgi_format: 0,
+        // The display primary must scan out as XR24/XRGB on the virtio-gpu
+        // contract. The Linux virtio primary plane advertises XRGB only, and the
+        // matching CachyOS dma-buf probe reached egl-headless only with XR24.
+        // Non-primary standard allocations keep the legacy zero hint so UMD
+        // openers use the existing BGRA fallback.
+        dxgi_format: if is_primary { 88 } else { 0 },
         // KMD standard allocations carry no scan-out plane offset.
         plane_offset: 0,
     };

@@ -33,7 +33,8 @@
 use core::sync::atomic::{compiler_fence, fence, Ordering};
 
 use helios_protocol::{
-    VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE, VIRTIO_GPU_BLOB_MEM_HOST3D, VIRTIO_GPU_MAP_CACHE_CACHED,
+    VIRTIO_GPU_BLOB_FLAG_USE_CROSS_DEVICE, VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE,
+    VIRTIO_GPU_BLOB_FLAG_USE_SHAREABLE, VIRTIO_GPU_BLOB_MEM_HOST3D, VIRTIO_GPU_MAP_CACHE_CACHED,
     VIRTIO_GPU_MAP_CACHE_UNCACHED, VIRTIO_GPU_MAP_CACHE_WC,
 };
 use wdk_sys::ntddk::{MmMapIoSpace, MmUnmapIoSpace};
@@ -49,8 +50,24 @@ const CMD_CREATE_INSTANCE: u32 = 0;
 const CMD_ENUMERATE_PHYSICAL_DEVICES: u32 = 2;
 const CMD_GET_PHYSICAL_DEVICE_MEMORY_PROPERTIES: u32 = 8;
 const CMD_CREATE_DEVICE: u32 = 11;
+const CMD_QUEUE_SUBMIT: u32 = 18;
 const CMD_ALLOCATE_MEMORY: u32 = 21;
 const CMD_FREE_MEMORY: u32 = 22;
+const CMD_BIND_IMAGE_MEMORY: u32 = 29;
+const CMD_GET_IMAGE_MEMORY_REQUIREMENTS: u32 = 31;
+const CMD_CREATE_FENCE: u32 = 35;
+const CMD_WAIT_FOR_FENCES: u32 = 39;
+const CMD_CREATE_IMAGE: u32 = 54;
+const CMD_DESTROY_IMAGE: u32 = 55;
+const CMD_GET_IMAGE_SUBRESOURCE_LAYOUT: u32 = 56;
+const CMD_CREATE_COMMAND_POOL: u32 = 85;
+const CMD_DESTROY_COMMAND_POOL: u32 = 86;
+const CMD_ALLOCATE_COMMAND_BUFFERS: u32 = 88;
+const CMD_BEGIN_COMMAND_BUFFER: u32 = 90;
+const CMD_END_COMMAND_BUFFER: u32 = 91;
+const CMD_CLEAR_COLOR_IMAGE: u32 = 119;
+const CMD_PIPELINE_BARRIER: u32 = 126;
+const CMD_GET_DEVICE_QUEUE_2: u32 = 155;
 const CMD_SET_REPLY_COMMAND_STREAM_MESA: u32 = 178;
 const CMD_CREATE_RING_MESA: u32 = 188;
 const CMD_NOTIFY_RING_MESA: u32 = 190;
@@ -65,10 +82,54 @@ const CMD_FLAG_GENERATE_REPLY: u32 = 0x1;
 const ST_INSTANCE_CREATE_INFO: i32 = 1;
 const ST_DEVICE_QUEUE_CREATE_INFO: i32 = 2;
 const ST_DEVICE_CREATE_INFO: i32 = 3;
+const ST_SUBMIT_INFO: i32 = 4;
 const ST_MEMORY_ALLOCATE_INFO: i32 = 5;
+const ST_FENCE_CREATE_INFO: i32 = 8;
+const ST_IMAGE_CREATE_INFO: i32 = 14;
+const ST_COMMAND_POOL_CREATE_INFO: i32 = 39;
+const ST_COMMAND_BUFFER_ALLOCATE_INFO: i32 = 40;
+const ST_COMMAND_BUFFER_BEGIN_INFO: i32 = 42;
+const ST_IMAGE_MEMORY_BARRIER: i32 = 45;
+const ST_DEVICE_QUEUE_INFO_2: i32 = 1000145003;
+const ST_EXTERNAL_MEMORY_IMAGE_CREATE_INFO: i32 = 1000072001;
+const ST_EXPORT_MEMORY_ALLOCATE_INFO: i32 = 1000072002;
+const ST_MEMORY_DEDICATED_ALLOCATE_INFO: i32 = 1000127001;
+const ST_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO: i32 = 1000158003;
 const ST_RING_CREATE_INFO_MESA: i32 = 1000384000;
+const ST_DEVICE_QUEUE_TIMELINE_INFO_MESA: i32 = 1000384005;
+
+/// `VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT`.
+const EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF: u32 = 0x0000_0200;
+const DRM_FORMAT_MOD_LINEAR: u64 = 0;
+const IMAGE_TYPE_2D: u32 = 1;
+const FORMAT_B8G8R8A8_UNORM: u32 = 44;
+// VK_IMAGE_TILING_OPTIMAL = 0, VK_IMAGE_TILING_LINEAR = 1. This was 0 (OPTIMAL),
+// so create_linear_scanout_image built a TILED image → device-local-only
+// memoryTypeBits (0x3, no host-visible) → choose_host_visible_memory_type failed
+// (ScanoutDiag=16 SdgErr=2 / SdgLStg=3). Confirmed against Mesa venus on the same
+// NVIDIA host: LINEAR→typebits=0xf (scans out), OPTIMAL→typebits=0x3 (no host-visible).
+const IMAGE_TILING_LINEAR: u32 = 1;
+const IMAGE_TILING_DRM_FORMAT_MODIFIER: u32 = 1000158000;
+const IMAGE_USAGE_TRANSFER_SRC: u32 = 0x0000_0001;
+const IMAGE_USAGE_TRANSFER_DST: u32 = 0x0000_0002;
+const SHARING_MODE_EXCLUSIVE: u32 = 0;
+const IMAGE_LAYOUT_UNDEFINED: u32 = 0;
+const IMAGE_LAYOUT_GENERAL: u32 = 1;
+const IMAGE_LAYOUT_PREINITIALIZED: u32 = 8;
+const SAMPLE_COUNT_1: u32 = 0x0000_0001;
+const IMAGE_ASPECT_COLOR: u32 = 0x0000_0001;
+const IMAGE_ASPECT_MEMORY_PLANE_0: u32 = 0x0000_0080;
+const QUEUE_FAMILY_IGNORED: u32 = u32::MAX;
+const QUEUE_FAMILY_FOREIGN_EXT: u32 = u32::MAX - 1;
+const COMMAND_BUFFER_LEVEL_PRIMARY: u32 = 0;
+const COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT: u32 = 0x0000_0001;
+const PIPELINE_STAGE_TOP_OF_PIPE: u32 = 0x0000_0001;
+const PIPELINE_STAGE_TRANSFER: u32 = 0x0000_1000;
+const PIPELINE_STAGE_BOTTOM_OF_PIPE: u32 = 0x0000_2000;
+const ACCESS_TRANSFER_WRITE: u32 = 0x0000_1000;
 
 // ── VkMemoryPropertyFlags bits we require ────────────────────────────────────
+const MEMORY_PROPERTY_DEVICE_LOCAL: u32 = 0x1;
 const MEMORY_PROPERTY_HOST_VISIBLE: u32 = 0x2;
 const MEMORY_PROPERTY_HOST_COHERENT: u32 = 0x4;
 
@@ -133,6 +194,14 @@ pub struct HostVisibleBlob {
     pub gpa: u64,
     /// Page-rounded size mapped into the window.
     pub size: u64,
+}
+
+pub struct ScanoutImageBlob {
+    pub blob: HostVisibleBlob,
+    pub image_id: u64,
+    pub memory_type_index: u32,
+    pub row_pitch: u32,
+    pub plane_offset: u32,
 }
 
 /// A kernel mapping of a guest-physical sub-range of the host-visible BAR window.
@@ -282,6 +351,15 @@ impl Writer {
         self.u64(if present { 1 } else { 0 });
     }
 
+    fn bytes_padded(&mut self, bytes: &[u8]) {
+        let padded = (bytes.len() + 3) & !3;
+        self.buf[self.len..self.len + bytes.len()].copy_from_slice(bytes);
+        for i in bytes.len()..padded {
+            self.buf[self.len + i] = 0;
+        }
+        self.len += padded;
+    }
+
     /// The command header: `VkCommandTypeEXT | VkCommandFlagsEXT`.
     fn header(&mut self, cmd_type: u32, flags: u32) {
         self.u32(cmd_type);
@@ -385,8 +463,13 @@ pub struct VenusClient {
     instance_id: u64,
     /// venus device handle.
     device_id: u64,
+    /// Graphics queue handle from family 0, queue 0.
+    queue_id: u64,
     /// HOST_VISIBLE|HOST_COHERENT memory type chosen during bring-up.
     memory_type_index: u32,
+    /// Raw VkMemoryPropertyFlags for physical-device memory types.
+    memory_type_flags: [u32; VK_MAX_MEMORY_TYPES as usize],
+    memory_type_count: u32,
     /// Poison latch: set when a ring wait hits its spin bound or the host
     /// reports RING_STATUS_FATAL. A wedged/fatal ring never recovers, and the
     /// allocation path reaches these waits at DISPATCH_LEVEL under the device
@@ -455,10 +538,7 @@ impl VenusClient {
     /// PASSIVE ring-progress wait: run `ready()` until it returns true, with a
     /// short spin burst then 1 ms sleeps, bounded by [`RING_WAIT_TIMEOUT_MS`].
     /// Checks the ring FATAL status each round. Latches `fatal` on timeout.
-    fn ring_wait_until(
-        &mut self,
-        ready: impl Fn(&Self) -> bool,
-    ) -> Result<(), VirtioError> {
+    fn ring_wait_until(&mut self, ready: impl Fn(&Self) -> bool) -> Result<(), VirtioError> {
         if self.fatal {
             return Err(VirtioError::DeviceError);
         }
@@ -587,6 +667,7 @@ impl VenusClient {
         adapter: &AdapterContext,
         size: u64,
         mappable: bool,
+        shareable: bool,
     ) -> Result<HostVisibleBlob, VirtioError> {
         let size = round_up_page(size.max(4096));
         let memory_id = self.alloc_handle();
@@ -596,7 +677,14 @@ impl VenusClient {
             w.u64(self.device_id);
             w.count(true);
             w.i32(ST_MEMORY_ALLOCATE_INFO);
-            w.u64(0);
+            if shareable {
+                w.count(true);
+                w.i32(ST_EXPORT_MEMORY_ALLOCATE_INFO);
+                w.count(false);
+                w.u32(EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF);
+            } else {
+                w.count(false);
+            }
             w.u64(size);
             w.u32(self.memory_type_index);
             w.count(false);
@@ -617,11 +705,13 @@ impl VenusClient {
             }
         }
 
-        let flags = if mappable {
-            VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE
-        } else {
-            0
-        };
+        let mut flags = 0;
+        if mappable {
+            flags |= VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE;
+        }
+        if shareable {
+            flags |= VIRTIO_GPU_BLOB_FLAG_USE_SHAREABLE;
+        }
         let res_id = ctrl::resource_create_blob(
             adapter,
             self.ctx_id,
@@ -637,6 +727,951 @@ impl VenusClient {
             gpa: 0,
             size,
         })
+    }
+
+    fn choose_host_visible_memory_type(&self, memory_type_bits: u32) -> Option<u32> {
+        let mut fallback = None;
+        let mut i = 0;
+        while i < self.memory_type_count && i < VK_MAX_MEMORY_TYPES {
+            if (memory_type_bits & (1u32 << i)) != 0 {
+                let flags = self.memory_type_flags[i as usize];
+                if (flags & MEMORY_PROPERTY_HOST_VISIBLE) != 0 {
+                    if fallback.is_none() {
+                        fallback = Some(i);
+                    }
+                    if (flags & MEMORY_PROPERTY_HOST_COHERENT) != 0 {
+                        return Some(i);
+                    }
+                }
+            }
+            i += 1;
+        }
+        fallback
+    }
+
+    fn choose_device_local_memory_type(&self, memory_type_bits: u32) -> Option<u32> {
+        let mut fallback = None;
+        let mut i = 0;
+        while i < self.memory_type_count && i < VK_MAX_MEMORY_TYPES {
+            if (memory_type_bits & (1u32 << i)) != 0 {
+                let flags = self.memory_type_flags[i as usize];
+                if fallback.is_none() {
+                    fallback = Some(i);
+                }
+                if (flags & MEMORY_PROPERTY_DEVICE_LOCAL) != 0
+                    && (flags & MEMORY_PROPERTY_HOST_VISIBLE) == 0
+                {
+                    return Some(i);
+                }
+            }
+            i += 1;
+        }
+        i = 0;
+        while i < self.memory_type_count && i < VK_MAX_MEMORY_TYPES {
+            if (memory_type_bits & (1u32 << i)) != 0 {
+                let flags = self.memory_type_flags[i as usize];
+                if (flags & MEMORY_PROPERTY_DEVICE_LOCAL) != 0 {
+                    return Some(i);
+                }
+            }
+            i += 1;
+        }
+        fallback
+    }
+
+    fn create_scanout_image(
+        &mut self,
+        adapter: &AdapterContext,
+        width: u32,
+        height: u32,
+    ) -> Result<u64, VirtioError> {
+        let image_id = self.alloc_handle();
+        let mut w = Writer::new();
+        w.header(CMD_CREATE_IMAGE, CMD_FLAG_GENERATE_REPLY);
+        w.u64(self.device_id);
+        w.count(true);
+        w.i32(ST_IMAGE_CREATE_INFO);
+        // VkExternalMemoryImageCreateInfo -> VkImageDrmFormatModifierListCreateInfoEXT.
+        w.count(true);
+        w.i32(ST_EXTERNAL_MEMORY_IMAGE_CREATE_INFO);
+        w.count(true);
+        w.i32(ST_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO);
+        w.count(false);
+        w.u32(1);
+        w.u64(1);
+        w.u64(DRM_FORMAT_MOD_LINEAR);
+        w.u32(EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF);
+        w.u32(0); // flags
+        w.u32(IMAGE_TYPE_2D);
+        w.u32(FORMAT_B8G8R8A8_UNORM);
+        w.u32(width);
+        w.u32(height);
+        w.u32(1); // depth
+        w.u32(1); // mipLevels
+        w.u32(1); // arrayLayers
+        w.u32(SAMPLE_COUNT_1);
+        w.u32(IMAGE_TILING_DRM_FORMAT_MODIFIER);
+        w.u32(IMAGE_USAGE_TRANSFER_DST);
+        w.u32(SHARING_MODE_EXCLUSIVE);
+        w.u32(0); // queueFamilyIndexCount
+        w.count(false);
+        w.u32(IMAGE_LAYOUT_UNDEFINED);
+        w.count(false); // pAllocator
+        w.count(true);
+        w.u64(image_id);
+        self.ring_command_reply(adapter, w.as_slice())?;
+
+        let mut r = ReplyReader::new(&self.reply_map);
+        let cmd = r.read_i32()?;
+        if cmd as u32 != CMD_CREATE_IMAGE {
+            diag(0x0101);
+            return Err(VirtioError::DeviceError);
+        }
+        let result = r.read_i32()?;
+        if result != 0 {
+            diag(0x0102);
+            return Err(VirtioError::DeviceError);
+        }
+        if r.read_u64()? == 0 || r.read_u64()? == 0 {
+            diag(0x0103);
+            return Err(VirtioError::DeviceError);
+        }
+        Ok(image_id)
+    }
+
+    fn create_linear_scanout_image(
+        &mut self,
+        adapter: &AdapterContext,
+        width: u32,
+        height: u32,
+    ) -> Result<u64, VirtioError> {
+        let image_id = self.alloc_handle();
+        let mut w = Writer::new();
+        w.header(CMD_CREATE_IMAGE, CMD_FLAG_GENERATE_REPLY);
+        w.u64(self.device_id);
+        w.count(true);
+        w.i32(ST_IMAGE_CREATE_INFO);
+        // VkExternalMemoryImageCreateInfo only. This matches the Linux KMS probe
+        // that reached QEMU's egl-headless dmabuf import on NVIDIA.
+        w.count(true);
+        w.i32(ST_EXTERNAL_MEMORY_IMAGE_CREATE_INFO);
+        w.count(false);
+        w.u32(EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF);
+        w.u32(0); // flags
+        w.u32(IMAGE_TYPE_2D);
+        w.u32(FORMAT_B8G8R8A8_UNORM);
+        w.u32(width);
+        w.u32(height);
+        w.u32(1); // depth
+        w.u32(1); // mipLevels
+        w.u32(1); // arrayLayers
+        w.u32(SAMPLE_COUNT_1);
+        w.u32(IMAGE_TILING_LINEAR);
+        w.u32(IMAGE_USAGE_TRANSFER_SRC | IMAGE_USAGE_TRANSFER_DST);
+        w.u32(SHARING_MODE_EXCLUSIVE);
+        w.u32(0); // queueFamilyIndexCount
+        w.count(false);
+        w.u32(IMAGE_LAYOUT_PREINITIALIZED);
+        w.count(false); // pAllocator
+        w.count(true);
+        w.u64(image_id);
+        self.ring_command_reply(adapter, w.as_slice())?;
+
+        let mut r = ReplyReader::new(&self.reply_map);
+        let cmd = r.read_i32()?;
+        if cmd as u32 != CMD_CREATE_IMAGE {
+            crate::diag::record_named_bytes(b"SdgLImg", 0xE0);
+            diag(0x0120);
+            return Err(VirtioError::DeviceError);
+        }
+        let result = r.read_i32()?;
+        if result != 0 {
+            // Raw VkResult of the LINEAR external-DMA_BUF image create — this is
+            // the most likely NVIDIA-venus rejection point for the CachyOS shape.
+            crate::diag::record_named_bytes(b"SdgLImg", result as u32);
+            diag(0x0121);
+            return Err(VirtioError::DeviceError);
+        }
+        if r.read_u64()? == 0 || r.read_u64()? == 0 {
+            crate::diag::record_named_bytes(b"SdgLImg", 0xE1);
+            diag(0x0122);
+            return Err(VirtioError::DeviceError);
+        }
+        Ok(image_id)
+    }
+
+    fn image_memory_requirements(
+        &mut self,
+        adapter: &AdapterContext,
+        image_id: u64,
+    ) -> Result<(u64, u32), VirtioError> {
+        let mut w = Writer::new();
+        w.header(CMD_GET_IMAGE_MEMORY_REQUIREMENTS, CMD_FLAG_GENERATE_REPLY);
+        w.u64(self.device_id);
+        w.u64(image_id);
+        w.count(true);
+        self.ring_command_reply(adapter, w.as_slice())?;
+
+        let mut r = ReplyReader::new(&self.reply_map);
+        let cmd = r.read_i32()?;
+        if cmd as u32 != CMD_GET_IMAGE_MEMORY_REQUIREMENTS {
+            diag(0x0104);
+            return Err(VirtioError::DeviceError);
+        }
+        if r.read_u64()? == 0 {
+            diag(0x0105);
+            return Err(VirtioError::DeviceError);
+        }
+        let size = r.read_u64()?;
+        let _alignment = r.read_u64()?;
+        let memory_type_bits = r.read_u32()?;
+        Ok((size, memory_type_bits))
+    }
+
+    fn allocate_dedicated_image_memory(
+        &mut self,
+        adapter: &AdapterContext,
+        image_id: u64,
+        size: u64,
+        memory_type_index: u32,
+    ) -> Result<u64, VirtioError> {
+        let memory_id = self.alloc_handle();
+        let mut w = Writer::new();
+        w.header(CMD_ALLOCATE_MEMORY, CMD_FLAG_GENERATE_REPLY);
+        w.u64(self.device_id);
+        w.count(true);
+        w.i32(ST_MEMORY_ALLOCATE_INFO);
+        // VkExportMemoryAllocateInfo -> VkMemoryDedicatedAllocateInfo.
+        w.count(true);
+        w.i32(ST_EXPORT_MEMORY_ALLOCATE_INFO);
+        w.count(true);
+        w.i32(ST_MEMORY_DEDICATED_ALLOCATE_INFO);
+        w.count(false);
+        w.u64(image_id);
+        w.u64(0); // buffer
+        w.u32(EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF);
+        w.u64(size);
+        w.u32(memory_type_index);
+        w.count(false);
+        w.count(true);
+        w.u64(memory_id);
+        self.ring_command_reply(adapter, w.as_slice())?;
+
+        let mut r = ReplyReader::new(&self.reply_map);
+        let cmd = r.read_i32()?;
+        if cmd as u32 != CMD_ALLOCATE_MEMORY {
+            diag(0x0106);
+            return Err(VirtioError::DeviceError);
+        }
+        if r.read_i32()? != 0 {
+            diag(0x0107);
+            return Err(VirtioError::DeviceError);
+        }
+        Ok(memory_id)
+    }
+
+    fn allocate_export_image_memory(
+        &mut self,
+        adapter: &AdapterContext,
+        size: u64,
+        memory_type_index: u32,
+    ) -> Result<u64, VirtioError> {
+        let memory_id = self.alloc_handle();
+        let mut w = Writer::new();
+        w.header(CMD_ALLOCATE_MEMORY, CMD_FLAG_GENERATE_REPLY);
+        w.u64(self.device_id);
+        w.count(true);
+        w.i32(ST_MEMORY_ALLOCATE_INFO);
+        w.count(true);
+        w.i32(ST_EXPORT_MEMORY_ALLOCATE_INFO);
+        w.count(false);
+        w.u32(EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF);
+        w.u64(size);
+        w.u32(memory_type_index);
+        w.count(false);
+        w.count(true);
+        w.u64(memory_id);
+        self.ring_command_reply(adapter, w.as_slice())?;
+
+        let mut r = ReplyReader::new(&self.reply_map);
+        let cmd = r.read_i32()?;
+        if cmd as u32 != CMD_ALLOCATE_MEMORY {
+            crate::diag::record_named_bytes(b"SdgLMem", 0xE0);
+            diag(0x0123);
+            return Err(VirtioError::DeviceError);
+        }
+        let result = r.read_i32()?;
+        if result != 0 {
+            // Raw VkResult of the exportable-DMA_BUF allocation for the linear
+            // scanout image (dedicated-less export alloc).
+            crate::diag::record_named_bytes(b"SdgLMem", result as u32);
+            diag(0x0124);
+            return Err(VirtioError::DeviceError);
+        }
+        Ok(memory_id)
+    }
+
+    fn bind_image_memory(
+        &mut self,
+        adapter: &AdapterContext,
+        image_id: u64,
+        memory_id: u64,
+    ) -> Result<(), VirtioError> {
+        let mut w = Writer::new();
+        w.header(CMD_BIND_IMAGE_MEMORY, CMD_FLAG_GENERATE_REPLY);
+        w.u64(self.device_id);
+        w.u64(image_id);
+        w.u64(memory_id);
+        w.u64(0);
+        self.ring_command_reply(adapter, w.as_slice())?;
+
+        let mut r = ReplyReader::new(&self.reply_map);
+        let cmd = r.read_i32()?;
+        if cmd as u32 != CMD_BIND_IMAGE_MEMORY {
+            diag(0x0108);
+            return Err(VirtioError::DeviceError);
+        }
+        if r.read_i32()? != 0 {
+            diag(0x0109);
+            return Err(VirtioError::DeviceError);
+        }
+        Ok(())
+    }
+
+    fn image_subresource_layout(
+        &mut self,
+        adapter: &AdapterContext,
+        image_id: u64,
+        aspect_mask: u32,
+    ) -> Result<(u64, u64), VirtioError> {
+        let mut w = Writer::new();
+        w.header(CMD_GET_IMAGE_SUBRESOURCE_LAYOUT, CMD_FLAG_GENERATE_REPLY);
+        w.u64(self.device_id);
+        w.u64(image_id);
+        w.count(true);
+        w.u32(aspect_mask);
+        w.u32(0);
+        w.u32(0);
+        w.count(true);
+        self.ring_command_reply(adapter, w.as_slice())?;
+
+        let mut r = ReplyReader::new(&self.reply_map);
+        let cmd = r.read_i32()?;
+        if cmd as u32 != CMD_GET_IMAGE_SUBRESOURCE_LAYOUT {
+            diag(0x010A);
+            return Err(VirtioError::DeviceError);
+        }
+        if r.read_u64()? == 0 {
+            diag(0x010B);
+            return Err(VirtioError::DeviceError);
+        }
+        let offset = r.read_u64()?;
+        let _size = r.read_u64()?;
+        let row_pitch = r.read_u64()?;
+        let _array_pitch = r.read_u64()?;
+        let _depth_pitch = r.read_u64()?;
+        Ok((offset, row_pitch))
+    }
+
+    fn get_device_queue(&mut self, adapter: &AdapterContext) -> Result<(), VirtioError> {
+        let queue_id = self.alloc_handle();
+        let mut w = Writer::new();
+        w.header(CMD_GET_DEVICE_QUEUE_2, CMD_FLAG_GENERATE_REPLY);
+        w.u64(self.device_id);
+        w.count(true); // pQueueInfo
+        w.i32(ST_DEVICE_QUEUE_INFO_2);
+        w.count(true); // pNext: VkDeviceQueueTimelineInfoMESA
+        w.i32(ST_DEVICE_QUEUE_TIMELINE_INFO_MESA);
+        w.count(false);
+        w.u32(1); // ringIdx; 0 is the renderer's CPU timeline.
+        w.u32(0); // flags
+        w.u32(0); // queueFamilyIndex
+        w.u32(0); // queueIndex
+        w.count(true);
+        w.u64(queue_id);
+        self.ring_command_reply(adapter, w.as_slice())?;
+
+        let mut r = ReplyReader::new(&self.reply_map);
+        let cmd = r.read_i32()?;
+        if cmd as u32 != CMD_GET_DEVICE_QUEUE_2 {
+            diag(0x0110);
+            return Err(VirtioError::DeviceError);
+        }
+        if r.read_u64()? == 0 {
+            diag(0x0111);
+            return Err(VirtioError::DeviceError);
+        }
+        let returned = r.read_u64()?;
+        self.queue_id = if returned != 0 { returned } else { queue_id };
+        Ok(())
+    }
+
+    fn create_command_pool(&mut self, adapter: &AdapterContext) -> Result<u64, VirtioError> {
+        let pool_id = self.alloc_handle();
+        let mut w = Writer::new();
+        w.header(CMD_CREATE_COMMAND_POOL, CMD_FLAG_GENERATE_REPLY);
+        w.u64(self.device_id);
+        w.count(true);
+        w.i32(ST_COMMAND_POOL_CREATE_INFO);
+        w.count(false);
+        w.u32(0); // flags
+        w.u32(0); // queueFamilyIndex
+        w.count(false); // pAllocator
+        w.count(true);
+        w.u64(pool_id);
+        self.ring_command_reply(adapter, w.as_slice())?;
+
+        let mut r = ReplyReader::new(&self.reply_map);
+        let cmd = r.read_i32()?;
+        if cmd as u32 != CMD_CREATE_COMMAND_POOL {
+            diag(0x0112);
+            return Err(VirtioError::DeviceError);
+        }
+        if r.read_i32()? != 0 {
+            diag(0x0113);
+            return Err(VirtioError::DeviceError);
+        }
+        if r.read_u64()? == 0 {
+            diag(0x0114);
+            return Err(VirtioError::DeviceError);
+        }
+        let returned = r.read_u64()?;
+        Ok(if returned != 0 { returned } else { pool_id })
+    }
+
+    fn destroy_command_pool(
+        &mut self,
+        adapter: &AdapterContext,
+        pool_id: u64,
+    ) -> Result<(), VirtioError> {
+        let mut w = Writer::new();
+        w.header(CMD_DESTROY_COMMAND_POOL, 0);
+        w.u64(self.device_id);
+        w.u64(pool_id);
+        w.count(false);
+        self.ring_command_noreply(adapter, w.as_slice())
+    }
+
+    fn allocate_command_buffer(
+        &mut self,
+        adapter: &AdapterContext,
+        pool_id: u64,
+    ) -> Result<u64, VirtioError> {
+        let command_buffer_id = self.alloc_handle();
+        let mut w = Writer::new();
+        w.header(CMD_ALLOCATE_COMMAND_BUFFERS, CMD_FLAG_GENERATE_REPLY);
+        w.u64(self.device_id);
+        w.count(true);
+        w.i32(ST_COMMAND_BUFFER_ALLOCATE_INFO);
+        w.count(false);
+        w.u64(pool_id);
+        w.u32(COMMAND_BUFFER_LEVEL_PRIMARY);
+        w.u32(1);
+        w.u64(1); // pCommandBuffers array_size
+        w.u64(command_buffer_id);
+        self.ring_command_reply(adapter, w.as_slice())?;
+
+        let mut r = ReplyReader::new(&self.reply_map);
+        let cmd = r.read_i32()?;
+        if cmd as u32 != CMD_ALLOCATE_COMMAND_BUFFERS {
+            diag(0x0115);
+            return Err(VirtioError::DeviceError);
+        }
+        if r.read_i32()? != 0 {
+            diag(0x0116);
+            return Err(VirtioError::DeviceError);
+        }
+        if r.read_u64()? == 0 {
+            diag(0x0117);
+            return Err(VirtioError::DeviceError);
+        }
+        let returned = r.read_u64()?;
+        Ok(if returned != 0 {
+            returned
+        } else {
+            command_buffer_id
+        })
+    }
+
+    fn begin_command_buffer(
+        &mut self,
+        adapter: &AdapterContext,
+        command_buffer_id: u64,
+    ) -> Result<(), VirtioError> {
+        let mut w = Writer::new();
+        w.header(CMD_BEGIN_COMMAND_BUFFER, CMD_FLAG_GENERATE_REPLY);
+        w.u64(command_buffer_id);
+        w.count(true);
+        w.i32(ST_COMMAND_BUFFER_BEGIN_INFO);
+        w.count(false);
+        w.u32(COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT);
+        w.count(false);
+        self.ring_command_reply(adapter, w.as_slice())?;
+
+        let mut r = ReplyReader::new(&self.reply_map);
+        let cmd = r.read_i32()?;
+        if cmd as u32 != CMD_BEGIN_COMMAND_BUFFER {
+            diag(0x0118);
+            return Err(VirtioError::DeviceError);
+        }
+        if r.read_i32()? != 0 {
+            diag(0x0119);
+            return Err(VirtioError::DeviceError);
+        }
+        Ok(())
+    }
+
+    fn cmd_image_barrier(
+        &mut self,
+        adapter: &AdapterContext,
+        command_buffer_id: u64,
+        image_id: u64,
+        src_stage: u32,
+        dst_stage: u32,
+        src_access: u32,
+        dst_access: u32,
+        old_layout: u32,
+        new_layout: u32,
+        src_queue_family: u32,
+        dst_queue_family: u32,
+    ) -> Result<(), VirtioError> {
+        let mut w = Writer::new();
+        w.header(CMD_PIPELINE_BARRIER, 0);
+        w.u64(command_buffer_id);
+        w.u32(src_stage);
+        w.u32(dst_stage);
+        w.u32(0); // dependencyFlags
+        w.u32(0); // memoryBarrierCount
+        w.count(false);
+        w.u32(0); // bufferMemoryBarrierCount
+        w.count(false);
+        w.u32(1); // imageMemoryBarrierCount
+        w.u64(1); // pImageMemoryBarriers array_size
+        w.i32(ST_IMAGE_MEMORY_BARRIER);
+        w.count(false);
+        w.u32(src_access);
+        w.u32(dst_access);
+        w.u32(old_layout);
+        w.u32(new_layout);
+        w.u32(src_queue_family);
+        w.u32(dst_queue_family);
+        w.u64(image_id);
+        w.u32(IMAGE_ASPECT_COLOR);
+        w.u32(0);
+        w.u32(1);
+        w.u32(0);
+        w.u32(1);
+        self.ring_command_noreply(adapter, w.as_slice())
+    }
+
+    fn cmd_clear_color_image(
+        &mut self,
+        adapter: &AdapterContext,
+        command_buffer_id: u64,
+        image_id: u64,
+    ) -> Result<(), VirtioError> {
+        let one = 1.0f32.to_bits();
+        let zero = 0.0f32.to_bits();
+        let mut w = Writer::new();
+        w.header(CMD_CLEAR_COLOR_IMAGE, 0);
+        w.u64(command_buffer_id);
+        w.u64(image_id);
+        w.u32(IMAGE_LAYOUT_GENERAL);
+        w.count(true);
+        w.u32(2); // VkClearColorValue union tag: uint32[4]
+        w.u64(4); // array_size
+        w.u32(one); // R
+        w.u32(zero); // G
+        w.u32(one); // B
+        w.u32(one); // A
+        w.u32(1); // rangeCount
+        w.u64(1); // pRanges array_size
+        w.u32(IMAGE_ASPECT_COLOR);
+        w.u32(0);
+        w.u32(1);
+        w.u32(0);
+        w.u32(1);
+        self.ring_command_noreply(adapter, w.as_slice())
+    }
+
+    fn end_command_buffer(
+        &mut self,
+        adapter: &AdapterContext,
+        command_buffer_id: u64,
+    ) -> Result<(), VirtioError> {
+        let mut w = Writer::new();
+        w.header(CMD_END_COMMAND_BUFFER, CMD_FLAG_GENERATE_REPLY);
+        w.u64(command_buffer_id);
+        self.ring_command_reply(adapter, w.as_slice())?;
+
+        let mut r = ReplyReader::new(&self.reply_map);
+        let cmd = r.read_i32()?;
+        if cmd as u32 != CMD_END_COMMAND_BUFFER {
+            diag(0x011A);
+            return Err(VirtioError::DeviceError);
+        }
+        if r.read_i32()? != 0 {
+            diag(0x011B);
+            return Err(VirtioError::DeviceError);
+        }
+        Ok(())
+    }
+
+    fn create_fence(&mut self, adapter: &AdapterContext) -> Result<u64, VirtioError> {
+        let fence_id = self.alloc_handle();
+        let mut w = Writer::new();
+        w.header(CMD_CREATE_FENCE, CMD_FLAG_GENERATE_REPLY);
+        w.u64(self.device_id);
+        w.count(true);
+        w.i32(ST_FENCE_CREATE_INFO);
+        w.count(false);
+        w.u32(0); // flags
+        w.count(false); // pAllocator
+        w.count(true);
+        w.u64(fence_id);
+        self.ring_command_reply(adapter, w.as_slice())?;
+
+        let mut r = ReplyReader::new(&self.reply_map);
+        let cmd = r.read_i32()?;
+        if cmd as u32 != CMD_CREATE_FENCE {
+            diag(0x011E);
+            return Err(VirtioError::DeviceError);
+        }
+        if r.read_i32()? != 0 {
+            diag(0x011F);
+            return Err(VirtioError::DeviceError);
+        }
+        if r.read_u64()? == 0 {
+            diag(0x0120);
+            return Err(VirtioError::DeviceError);
+        }
+        let returned = r.read_u64()?;
+        if returned != fence_id {
+            diag(0x0121);
+            return Err(VirtioError::DeviceError);
+        }
+        Ok(fence_id)
+    }
+
+    fn wait_for_fence(
+        &mut self,
+        adapter: &AdapterContext,
+        fence_id: u64,
+    ) -> Result<(), VirtioError> {
+        let mut w = Writer::new();
+        w.header(CMD_WAIT_FOR_FENCES, CMD_FLAG_GENERATE_REPLY);
+        w.u64(self.device_id);
+        w.u32(1); // fenceCount
+        w.u64(1); // pFences array_size
+        w.u64(fence_id);
+        w.u32(1); // waitAll
+        w.u64(5_000_000_000); // 5 s
+        self.ring_command_reply(adapter, w.as_slice())?;
+
+        let mut r = ReplyReader::new(&self.reply_map);
+        let cmd = r.read_i32()?;
+        if cmd as u32 != CMD_WAIT_FOR_FENCES {
+            diag(0x0122);
+            return Err(VirtioError::DeviceError);
+        }
+        let result = r.read_i32()?;
+        if result != 0 {
+            diag(0x0123);
+            return Err(VirtioError::DeviceError);
+        }
+        Ok(())
+    }
+
+    fn queue_submit_clear(
+        &mut self,
+        adapter: &AdapterContext,
+        command_buffer_id: u64,
+        fence_id: u64,
+    ) -> Result<(), VirtioError> {
+        let mut submit = Writer::new();
+        submit.header(CMD_QUEUE_SUBMIT, CMD_FLAG_GENERATE_REPLY);
+        submit.u64(self.queue_id);
+        submit.u32(1); // submitCount
+        submit.u64(1); // pSubmits array_size
+        submit.i32(ST_SUBMIT_INFO);
+        submit.count(false);
+        submit.u32(0); // waitSemaphoreCount
+        submit.count(false);
+        submit.count(false);
+        submit.u32(1); // commandBufferCount
+        submit.u64(1);
+        submit.u64(command_buffer_id);
+        submit.u32(0); // signalSemaphoreCount
+        submit.count(false);
+        submit.u64(fence_id); // fence
+        self.ring_command_reply(adapter, submit.as_slice())?;
+
+        let mut r = ReplyReader::new(&self.reply_map);
+        let cmd = r.read_i32()?;
+        if cmd as u32 != CMD_QUEUE_SUBMIT {
+            diag(0x011C);
+            return Err(VirtioError::DeviceError);
+        }
+        if r.read_i32()? != 0 {
+            diag(0x011D);
+            return Err(VirtioError::DeviceError);
+        }
+
+        Ok(())
+    }
+
+    /// Diagnostic-only GPU fill for scanout images. The image is KMD-owned and
+    /// never enters the production present path; this proves whether QEMU's GL
+    /// console consumes pixels written by the host GPU rather than by the guest CPU.
+    pub fn gpu_clear_scanout_image(
+        &mut self,
+        adapter: &AdapterContext,
+        image_id: u64,
+    ) -> Result<(), VirtioError> {
+        crate::diag::record_named_bytes(b"SdgGpS", 1);
+        let pool_id = self.create_command_pool(adapter)?;
+        crate::diag::record_named_bytes(b"SdgGpP", 1);
+        let command_buffer_id = match self.allocate_command_buffer(adapter, pool_id) {
+            Ok(command_buffer_id) => {
+                crate::diag::record_named_bytes(b"SdgGpB", 1);
+                command_buffer_id
+            }
+            Err(e) => {
+                let _ = self.destroy_command_pool(adapter, pool_id);
+                return Err(e);
+            }
+        };
+        let result = (|| {
+            self.begin_command_buffer(adapter, command_buffer_id)?;
+            crate::diag::record_named_bytes(b"SdgGpBeg", 1);
+            self.cmd_image_barrier(
+                adapter,
+                command_buffer_id,
+                image_id,
+                PIPELINE_STAGE_TOP_OF_PIPE,
+                PIPELINE_STAGE_TRANSFER,
+                0,
+                ACCESS_TRANSFER_WRITE,
+                IMAGE_LAYOUT_UNDEFINED,
+                IMAGE_LAYOUT_GENERAL,
+                QUEUE_FAMILY_IGNORED,
+                QUEUE_FAMILY_IGNORED,
+            )?;
+            crate::diag::record_named_bytes(b"SdgGpBa", 1);
+            self.cmd_clear_color_image(adapter, command_buffer_id, image_id)?;
+            crate::diag::record_named_bytes(b"SdgGpClr", 1);
+            self.cmd_image_barrier(
+                adapter,
+                command_buffer_id,
+                image_id,
+                PIPELINE_STAGE_TRANSFER,
+                PIPELINE_STAGE_BOTTOM_OF_PIPE,
+                ACCESS_TRANSFER_WRITE,
+                0,
+                IMAGE_LAYOUT_GENERAL,
+                IMAGE_LAYOUT_GENERAL,
+                0,
+                QUEUE_FAMILY_FOREIGN_EXT,
+            )?;
+            crate::diag::record_named_bytes(b"SdgGpBb", 1);
+            self.end_command_buffer(adapter, command_buffer_id)?;
+            crate::diag::record_named_bytes(b"SdgGpEnd", 1);
+            let fence_id = if crate::diag::read_config_dword(b"ScanoutDiag", 0) >= 6 {
+                let fence_id = self.create_fence(adapter)?;
+                crate::diag::record_named_bytes(b"SdgGpF", 1);
+                fence_id
+            } else {
+                0
+            };
+            self.queue_submit_clear(adapter, command_buffer_id, fence_id)?;
+            crate::diag::record_named_bytes(b"SdgGpSub", 1);
+            if fence_id != 0 {
+                self.wait_for_fence(adapter, fence_id)?;
+                crate::diag::record_named_bytes(b"SdgGpW", 1);
+            }
+            Ok(())
+        })();
+        result?;
+        // Keep the command pool/buffer alive. This diagnostic submits a GPU
+        // ownership release to the host scanout path but has no nonblocking
+        // completion primitive in KMD yet; destroying immediately can race the
+        // queue work and vkQueueWaitIdle poisons the venus decoder on NVIDIA.
+        crate::diag::record_named_bytes(b"SdgGpDst", 2);
+        Ok(())
+    }
+
+    /// Diagnostic-only scanout allocation: DRM_FORMAT_MODIFIER(LINEAR) BGRA image
+    /// backed by dedicated, DMA-BUF-exportable memory, exposed as a HOST3D blob.
+    pub fn allocate_scanout_image_blob(
+        &mut self,
+        adapter: &AdapterContext,
+        width: u32,
+        height: u32,
+    ) -> Result<ScanoutImageBlob, VirtioError> {
+        let image_id = self.create_scanout_image(adapter, width, height)?;
+        let (req_size, memory_type_bits) = self.image_memory_requirements(adapter, image_id)?;
+        let diag_mode = crate::diag::read_config_dword(b"ScanoutDiag", 0);
+        let cpu_filled_cross_device_blob = diag_mode == 9 || diag_mode == 11;
+        let prefer_device_local = diag_mode >= 5 && !cpu_filled_cross_device_blob;
+        let memory_type_index = if prefer_device_local {
+            self.choose_device_local_memory_type(memory_type_bits)
+        } else {
+            self.choose_host_visible_memory_type(memory_type_bits)
+        }
+        .ok_or(VirtioError::DeviceError)?;
+        crate::diag::record_named_bytes(b"SdgMt", memory_type_index);
+        crate::diag::record_named_bytes(
+            b"SdgMf",
+            self.memory_type_flags[memory_type_index as usize],
+        );
+        let alloc_size = round_up_page(req_size.max(4096));
+        let memory_id =
+            self.allocate_dedicated_image_memory(adapter, image_id, alloc_size, memory_type_index)?;
+        self.bind_image_memory(adapter, image_id, memory_id)?;
+        let (offset, row_pitch) =
+            self.image_subresource_layout(adapter, image_id, IMAGE_ASPECT_MEMORY_PLANE_0)?;
+        if row_pitch == 0 || row_pitch > u32::MAX as u64 || offset > u32::MAX as u64 {
+            diag(0x010C);
+            return Err(VirtioError::DeviceError);
+        }
+
+        let mut blob_flags = VIRTIO_GPU_BLOB_FLAG_USE_SHAREABLE;
+        if !prefer_device_local {
+            blob_flags |= VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE;
+        }
+        if diag_mode >= 8 {
+            blob_flags |= VIRTIO_GPU_BLOB_FLAG_USE_CROSS_DEVICE;
+        }
+        crate::diag::record_named_bytes(b"SdgBFl", blob_flags);
+        let res_id = ctrl::resource_create_blob(
+            adapter,
+            self.ctx_id,
+            VIRTIO_GPU_BLOB_MEM_HOST3D,
+            blob_flags,
+            memory_id,
+            alloc_size,
+        )?;
+        if (blob_flags & VIRTIO_GPU_BLOB_FLAG_USE_CROSS_DEVICE) != 0 && diag_mode == 10 {
+            ctrl::resource_assign_uuid(adapter, res_id)?;
+            crate::diag::record_named_bytes(b"SdgUuid", 1);
+        } else if (blob_flags & VIRTIO_GPU_BLOB_FLAG_USE_CROSS_DEVICE) != 0 {
+            crate::diag::record_named_bytes(b"SdgUuid", 2);
+        } else {
+            crate::diag::record_named_bytes(b"SdgUuid", 0);
+        }
+        let _ = adapter.with_virtio(|v| v.note_blob_size(res_id, alloc_size));
+        Ok(ScanoutImageBlob {
+            blob: HostVisibleBlob {
+                blob_id: memory_id,
+                res_id,
+                gpa: 0,
+                size: alloc_size,
+            },
+            image_id,
+            memory_type_index,
+            row_pitch: row_pitch as u32,
+            plane_offset: offset as u32,
+        })
+    }
+
+    /// Diagnostic scanout allocation matching the working Linux probe: a plain
+    /// LINEAR external DMA_BUF image, host-visible memory, and a HOST3D
+    /// MAPPABLE|SHAREABLE blob referencing that memory.
+    pub fn allocate_linear_scanout_image_blob(
+        &mut self,
+        adapter: &AdapterContext,
+        width: u32,
+        height: u32,
+    ) -> Result<ScanoutImageBlob, VirtioError> {
+        // Stage breadcrumb: `SdgLStg` holds the stage last ENTERED. On an early
+        // `?` return it names the exact Venus call that rejected the CachyOS
+        // shared-primary shape (mode 16 / real primary), turning the opaque
+        // `SdgErr=2` into a precise failing stage. Companion values: `SdgLReq`
+        // (mem-req size), `SdgLBit` (memoryTypeBits), `SdgLTyc` (type count),
+        // `SdgLImg`/`SdgLMem` (raw VkResults), `SdgLPch`/`SdgLOff` (layout).
+        //   1=create image  2=mem-req  3=choose host-visible type
+        //   4=alloc export mem  5=bind  6=subresource layout
+        //   7=validate pitch/offset  8=create blob  0x10=done
+        crate::diag::record_named_bytes(b"SdgLStg", 1);
+        let image_id = self.create_linear_scanout_image(adapter, width, height)?;
+
+        crate::diag::record_named_bytes(b"SdgLStg", 2);
+        let (req_size, memory_type_bits) = self.image_memory_requirements(adapter, image_id)?;
+        crate::diag::record_named_bytes(b"SdgLReq", req_size as u32);
+        crate::diag::record_named_bytes(b"SdgLBit", memory_type_bits);
+        crate::diag::record_named_bytes(b"SdgLTyc", self.memory_type_count);
+
+        crate::diag::record_named_bytes(b"SdgLStg", 3);
+        let memory_type_index = self
+            .choose_host_visible_memory_type(memory_type_bits)
+            .ok_or(VirtioError::DeviceError)?;
+        crate::diag::record_named_bytes(b"SdgMt", memory_type_index);
+        crate::diag::record_named_bytes(
+            b"SdgMf",
+            self.memory_type_flags[memory_type_index as usize],
+        );
+        let alloc_size = round_up_page(req_size.max(4096));
+
+        crate::diag::record_named_bytes(b"SdgLStg", 4);
+        let memory_id =
+            self.allocate_export_image_memory(adapter, alloc_size, memory_type_index)?;
+
+        crate::diag::record_named_bytes(b"SdgLStg", 5);
+        self.bind_image_memory(adapter, image_id, memory_id)?;
+
+        crate::diag::record_named_bytes(b"SdgLStg", 6);
+        let (offset, row_pitch) =
+            self.image_subresource_layout(adapter, image_id, IMAGE_ASPECT_COLOR)?;
+        crate::diag::record_named_bytes(b"SdgLPch", row_pitch as u32);
+        crate::diag::record_named_bytes(b"SdgLOff", offset as u32);
+
+        crate::diag::record_named_bytes(b"SdgLStg", 7);
+        if row_pitch == 0 || row_pitch > u32::MAX as u64 || offset > u32::MAX as u64 {
+            diag(0x0125);
+            return Err(VirtioError::DeviceError);
+        }
+
+        let blob_flags = VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE | VIRTIO_GPU_BLOB_FLAG_USE_SHAREABLE;
+        crate::diag::record_named_bytes(b"SdgBFl", blob_flags);
+        crate::diag::record_named_bytes(b"SdgLStg", 8);
+        let res_id = ctrl::resource_create_blob(
+            adapter,
+            self.ctx_id,
+            VIRTIO_GPU_BLOB_MEM_HOST3D,
+            blob_flags,
+            memory_id,
+            alloc_size,
+        )?;
+        let _ = adapter.with_virtio(|v| v.note_blob_size(res_id, alloc_size));
+        crate::diag::record_named_bytes(b"SdgLStg", 0x10);
+        Ok(ScanoutImageBlob {
+            blob: HostVisibleBlob {
+                blob_id: memory_id,
+                res_id,
+                gpa: 0,
+                size: alloc_size,
+            },
+            image_id,
+            memory_type_index,
+            row_pitch: row_pitch as u32,
+            plane_offset: offset as u32,
+        })
+    }
+
+    /// Destroy a Venus `VkImage` allocated by the kernel Venus client. Best
+    /// effort: allocation teardown must not wedge if the host context is already
+    /// being destroyed.
+    pub fn destroy_image(
+        &mut self,
+        adapter: &AdapterContext,
+        image_id: u64,
+    ) -> Result<(), VirtioError> {
+        let mut w = Writer::new();
+        w.header(CMD_DESTROY_IMAGE, 0);
+        w.u64(self.device_id);
+        w.u64(image_id);
+        w.count(false);
+        self.submit_direct(adapter, w.as_slice())
     }
 
     /// Free a venus `VkDeviceMemory` allocated by [`Self::allocate_memory_blob`]
@@ -725,7 +1760,10 @@ pub fn allocate_host_visible_blob(
         ctx_id,
         instance_id: 0,
         device_id: 0,
+        queue_id: 0,
         memory_type_index: 0,
+        memory_type_flags: [0; VK_MAX_MEMORY_TYPES as usize],
+        memory_type_count: 0,
         fatal: false,
     };
 
@@ -906,9 +1944,11 @@ pub fn allocate_host_visible_blob(
             return Err(VirtioError::DeviceError);
         }
         let mut chosen: Option<u32> = None;
+        client.memory_type_count = type_count;
         for i in 0..VK_MAX_MEMORY_TYPES {
             let property_flags = r.read_u32()?;
             let _heap_index = r.read_u32()?;
+            client.memory_type_flags[i as usize] = property_flags;
             if chosen.is_none()
                 && i < type_count
                 && property_flags & MEMORY_PROPERTY_HOST_VISIBLE != 0
@@ -930,9 +1970,45 @@ pub fn allocate_host_visible_blob(
     diag(0x0008);
 
     // ── 7. vkCreateDevice — one queue, family 0, priority 1.0 ─────────────────
-    let device_id = client.alloc_handle();
-    client.device_id = device_id;
-    {
+    // Device-extension ladder. The proven scanout/export shape
+    // (/tmp/vk-dmabuf-scanout.c, the CachyOS NVIDIA egl-headless success) needs
+    // only the external-memory + DMA_BUF trio; the DRM-modifier image path
+    // (scanout_diag modes 4-11) additionally wants image_drm_format_modifier +
+    // image_format_list. Previously this was all-or-nothing: if the host
+    // rejected the full 5-ext set, we dropped straight to a ZERO-ext device,
+    // which then silently rejects every DMA_BUF export op (the whole scanout
+    // path dies with no visible reason, since the S-ring is off at DiagLevel 0).
+    // Now we step down full → export-trio → none, so linear scanout (mode 16)
+    // still gets its export exts even when the modifier exts are unavailable.
+    // The tier that stuck (and any knock-down VkResult) is recorded to fixed
+    // registry names so a `reg query` reveals it without the S-ring.
+    const EXT_FULL: [&[u8]; 5] = [
+        b"VK_KHR_external_memory\0",
+        b"VK_KHR_external_memory_fd\0",
+        b"VK_KHR_image_format_list\0",
+        b"VK_EXT_external_memory_dma_buf\0",
+        b"VK_EXT_image_drm_format_modifier\0",
+    ];
+    const EXT_EXPORT: [&[u8]; 3] = [
+        b"VK_KHR_external_memory\0",
+        b"VK_KHR_external_memory_fd\0",
+        b"VK_EXT_external_memory_dma_buf\0",
+    ];
+    let want_scanout_exts = crate::diag::read_config_dword(b"ScanoutDiag", 0) >= 4;
+    // Clear the knock-down VkResult so a clean full-tier success leaves it 0 and
+    // a prior boot's value can't be mistaken for this boot's (names persist).
+    crate::diag::record_named_bytes(b"SdgDevR", 0);
+    // Tier 0 = full, 1 = export-only, 2 = none. Production (scanout off) starts
+    // at 2, exactly the old render-only, no-ext behaviour.
+    let mut ext_tier: u32 = if want_scanout_exts { 0 } else { 2 };
+    loop {
+        let exts: &[&[u8]] = match ext_tier {
+            0 => &EXT_FULL,
+            1 => &EXT_EXPORT,
+            _ => &[],
+        };
+        let device_id = client.alloc_handle();
+        client.device_id = device_id;
         let mut w = Writer::new();
         w.header(CMD_CREATE_DEVICE, CMD_FLAG_GENERATE_REPLY);
         w.u64(phys_dev_id); // VkPhysicalDevice
@@ -954,8 +2030,17 @@ pub fn allocate_host_visible_blob(
                     // back to VkDeviceCreateInfo:
         w.u32(0); // enabledLayerCount
         w.count(false); // ppEnabledLayerNames array_size 0
-        w.u32(0); // enabledExtensionCount
-        w.count(false); // ppEnabledExtensionNames array_size 0
+        if exts.is_empty() {
+            w.u32(0); // enabledExtensionCount
+            w.count(false); // ppEnabledExtensionNames array_size 0
+        } else {
+            w.u32(exts.len() as u32);
+            w.u64(exts.len() as u64);
+            for ext in exts {
+                w.u64(ext.len() as u64);
+                w.bytes_padded(ext);
+            }
+        }
         w.count(false); // simple_pointer(pEnabledFeatures) NULL
         w.count(false); // simple_pointer(pAllocator) NULL
         w.count(true); // simple_pointer(pDevice)
@@ -970,18 +2055,33 @@ pub fn allocate_host_visible_blob(
             return Err(VirtioError::DeviceError);
         }
         let result = r.read_i32()?;
-        if result != 0 {
-            // If this fails, the host may require a VkDeviceQueueTimelineInfoMESA
-            // pNext on the queue-create — see the handover notes.
-            diag(0x00F3);
-            return Err(VirtioError::DeviceError);
+        if result == 0 {
+            // Which extension tier the device actually got. mode 16 needs >= 1
+            // (export trio); a value of 2 means NO export exts → scanout can't
+            // work and SdgLImg/SdgLMem will show the rejection downstream.
+            crate::diag::record_named_bytes(b"SdgDevX", ext_tier);
+            break;
         }
+        // Record the VkResult that knocked this tier down before stepping down.
+        crate::diag::record_named_bytes(b"SdgDevR", result as u32);
+        if ext_tier < 2 {
+            diag(0x00F4);
+            ext_tier += 1;
+            continue;
+        }
+        // If this fails, the host may require a VkDeviceQueueTimelineInfoMESA
+        // pNext on the queue-create — see the handover notes.
+        diag(0x00F3);
+        return Err(VirtioError::DeviceError);
     }
     diag(0x0009);
 
+    client.get_device_queue(adapter)?;
+    diag(0x000D);
+
     // ── 8. vkAllocateMemory — 16 MiB of the chosen HOST_VISIBLE|COHERENT type ──
     // The memory handle id we pick IS the virtio-gpu blob_id used below.
-    let blob = client.allocate_memory_blob(adapter, PAGE_TABLE_ALLOC_SIZE, true)?;
+    let blob = client.allocate_memory_blob(adapter, PAGE_TABLE_ALLOC_SIZE, true, false)?;
     diag(0x000A);
 
     // ── 9. Create + map the page-table blob backed by the venus memory id ─────

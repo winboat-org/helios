@@ -20,6 +20,7 @@
 
 use core::mem::size_of;
 use core::ptr::NonNull;
+use core::sync::atomic::AtomicU64;
 
 use alloc::vec::Vec;
 use bytemuck::{bytes_of, Zeroable};
@@ -40,9 +41,11 @@ use helios_protocol::{
     VirtioGpuResourceUnmapBlob, VirtioGpuResourceUnref, VirtioGpuRespMapInfo,
     VirtioGpuSetScanoutBlob, VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE, VIRTIO_GPU_CMD_CTX_CREATE,
     VIRTIO_GPU_CMD_CTX_DESTROY, VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE,
-    VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB, VIRTIO_GPU_CMD_RESOURCE_FLUSH,
-    VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB, VIRTIO_GPU_CMD_RESOURCE_UNMAP_BLOB,
-    VIRTIO_GPU_CMD_RESOURCE_UNREF, VIRTIO_GPU_CMD_SET_SCANOUT_BLOB, VIRTIO_GPU_MAP_CACHE_MASK,
+    VIRTIO_GPU_CMD_RESOURCE_ASSIGN_UUID, VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING,
+    VIRTIO_GPU_CMD_RESOURCE_CREATE_2D, VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB,
+    VIRTIO_GPU_CMD_RESOURCE_FLUSH, VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB,
+    VIRTIO_GPU_CMD_RESOURCE_UNMAP_BLOB, VIRTIO_GPU_CMD_RESOURCE_UNREF, VIRTIO_GPU_CMD_SET_SCANOUT,
+    VIRTIO_GPU_CMD_SET_SCANOUT_BLOB, VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D, VIRTIO_GPU_MAP_CACHE_MASK,
 };
 
 /// `KernelMode` (`KPROCESSOR_MODE`).
@@ -63,6 +66,83 @@ const ENQUEUE_RETRY_MAX: u32 = 5_000;
 const WAIT_FENCE_MAX_MS: u64 = 120_000;
 /// Bound on waiting out another mapper's in-flight RESOURCE_MAP_BLOB.
 const MAP_BUSY_RETRY_MAX: u32 = 30_000;
+static VIRGL_DIAG_BLOB_ID: AtomicU64 = AtomicU64::new(1);
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct VirtioGpuResourceCreate2d {
+    hdr: VirtioGpuCtrlHdr,
+    resource_id: u32,
+    format: u32,
+    width: u32,
+    height: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct VirtioGpuSetScanout {
+    hdr: VirtioGpuCtrlHdr,
+    r: VirtioGpuRect,
+    scanout_id: u32,
+    resource_id: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct VirtioGpuTransferToHost2d {
+    hdr: VirtioGpuCtrlHdr,
+    r: VirtioGpuRect,
+    offset: u64,
+    resource_id: u32,
+    padding: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct VirtioGpuResourceAttachBacking {
+    hdr: VirtioGpuCtrlHdr,
+    resource_id: u32,
+    nr_entries: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct VirtioGpuResourceAssignUuid {
+    hdr: VirtioGpuCtrlHdr,
+    resource_id: u32,
+    padding: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct VirtioGpuMemEntry {
+    addr: u64,
+    length: u32,
+    padding: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct VirtioGpuBox3d {
+    x: u32,
+    y: u32,
+    z: u32,
+    w: u32,
+    h: u32,
+    d: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct VirtioGpuTransferHost3d {
+    hdr: VirtioGpuCtrlHdr,
+    box_: VirtioGpuBox3d,
+    offset: u64,
+    resource_id: u32,
+    level: u32,
+    stride: u32,
+    layer_stride: u32,
+}
 
 /// PASSIVE sleep for ~`ms` milliseconds.
 pub(crate) fn sleep_ms(ms: u64) {
@@ -356,11 +436,456 @@ pub fn resource_flush(
     ctrl_roundtrip_ok(adapter, bytes_of(&cmd), None)
 }
 
+pub fn set_scanout_2d(
+    adapter: &AdapterContext,
+    resource_id: u32,
+    width: u32,
+    height: u32,
+) -> Result<(), VirtioError> {
+    let mut set = VirtioGpuSetScanout::zeroed();
+    set.hdr.type_ = VIRTIO_GPU_CMD_SET_SCANOUT;
+    set.r = VirtioGpuRect {
+        x: 0,
+        y: 0,
+        width,
+        height,
+    };
+    set.scanout_id = 0;
+    set.resource_id = resource_id;
+    ctrl_roundtrip_ok(adapter, bytes_of(&set), None)
+}
+
 pub fn resource_unref(adapter: &AdapterContext, resource_id: u32) -> Result<(), VirtioError> {
     let mut cmd = VirtioGpuResourceUnref::zeroed();
     cmd.hdr.type_ = VIRTIO_GPU_CMD_RESOURCE_UNREF;
     cmd.resource_id = resource_id;
     ctrl_roundtrip_ok(adapter, bytes_of(&cmd), None)
+}
+
+/// Linux virtio-gpu assigns a resource UUID when a blob is created with
+/// `USE_CROSS_DEVICE`. Keep the full 40-byte response buffer because the OK
+/// reply carries the UUID after the control header.
+pub fn resource_assign_uuid(adapter: &AdapterContext, resource_id: u32) -> Result<(), VirtioError> {
+    let mut cmd = VirtioGpuResourceAssignUuid::zeroed();
+    cmd.hdr.type_ = VIRTIO_GPU_CMD_RESOURCE_ASSIGN_UUID;
+    cmd.resource_id = resource_id;
+
+    let mut resp = [0u8; size_of::<VirtioGpuCtrlHdr>() + 16];
+    ctrl_roundtrip(
+        adapter,
+        bytes_of(&cmd),
+        None,
+        &mut resp,
+        SYNC_ROUNDTRIP_TIMEOUT_MS,
+    )?;
+    let resp_type = u32::from_le_bytes([resp[0], resp[1], resp[2], resp[3]]);
+    if resp_is_ok(resp_type) {
+        Ok(())
+    } else {
+        Err(VirtioError::DeviceError)
+    }
+}
+
+/// Diagnostic classic virtio-gpu 2D scanout. This avoids GL dmabuf import
+/// entirely and proves whether QEMU's display frontend can show scanout 0 on
+/// the current host. The backing allocation is intentionally leaked so the host
+/// can continue scanning it out after this PASSIVE one-shot returns.
+pub fn diagnostic_2d_scanout(
+    adapter: &AdapterContext,
+    width: u32,
+    height: u32,
+) -> Result<u32, VirtioError> {
+    let pitch = (width as usize)
+        .checked_mul(4)
+        .ok_or(VirtioError::OutOfMemory)?;
+    let size = pitch
+        .checked_mul(height as usize)
+        .ok_or(VirtioError::OutOfMemory)?;
+    if size > u32::MAX as usize {
+        return Err(VirtioError::OutOfMemory);
+    }
+
+    let mut backing = DmaBuffer::new(size).ok_or(VirtioError::OutOfMemory)?;
+    {
+        let buf = backing.as_mut_slice();
+        let mut y = 0usize;
+        while y < height as usize {
+            let mut x = 0usize;
+            while x < width as usize {
+                let color = if x < width as usize / 3 {
+                    0xFFFF00FFu32
+                } else if x < (width as usize * 2) / 3 {
+                    0xFF00FFFFu32
+                } else {
+                    0xFF00FF00u32
+                };
+                let off = y * pitch + x * 4;
+                buf[off..off + 4].copy_from_slice(&color.to_le_bytes());
+                x += 1;
+            }
+            y += 1;
+        }
+    }
+
+    let resource_id = adapter
+        .with_virtio(|v| v.alloc_resource_id())
+        .map_err(|_| VirtioError::DeviceError)?;
+
+    let mut create = VirtioGpuResourceCreate2d::zeroed();
+    create.hdr.type_ = VIRTIO_GPU_CMD_RESOURCE_CREATE_2D;
+    create.resource_id = resource_id;
+    create.format = helios_protocol::VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM;
+    create.width = width;
+    create.height = height;
+    ctrl_roundtrip_ok(adapter, bytes_of(&create), None)?;
+
+    let mut attach = VirtioGpuResourceAttachBacking::zeroed();
+    attach.hdr.type_ = VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING;
+    attach.resource_id = resource_id;
+    attach.nr_entries = 1;
+    let entry = VirtioGpuMemEntry {
+        addr: backing.physical_address(),
+        length: size as u32,
+        padding: 0,
+    };
+    ctrl_roundtrip_ok(adapter, bytes_of(&attach), Some(bytes_of(&entry)))?;
+
+    set_scanout_2d(adapter, resource_id, width, height)?;
+
+    let mut xfer = VirtioGpuTransferToHost2d::zeroed();
+    xfer.hdr.type_ = VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D;
+    xfer.r = VirtioGpuRect {
+        x: 0,
+        y: 0,
+        width,
+        height,
+    };
+    xfer.offset = 0;
+    xfer.resource_id = resource_id;
+    ctrl_roundtrip_ok(adapter, bytes_of(&xfer), None)?;
+    resource_flush(adapter, resource_id, width, height)?;
+
+    core::mem::forget(backing);
+    Ok(resource_id)
+}
+
+/// Diagnostic guest-memory blob scanout. This still uses SET_SCANOUT_BLOB, but
+/// avoids HOST3D/Venus dma-buf export by backing the blob directly with guest
+/// RAM. The backing allocation is intentionally leaked while scanned out.
+pub fn diagnostic_guest_blob_scanout(
+    adapter: &AdapterContext,
+    width: u32,
+    height: u32,
+    format: u32,
+    blob_mem: u32,
+) -> Result<(u32, u32), VirtioError> {
+    let pitch = width.checked_mul(4).ok_or(VirtioError::OutOfMemory)?;
+    let size = (pitch as usize)
+        .checked_mul(height as usize)
+        .ok_or(VirtioError::OutOfMemory)?;
+    if size == 0 || size > u32::MAX as usize {
+        return Err(VirtioError::OutOfMemory);
+    }
+
+    let mut backing = DmaBuffer::new(size).ok_or(VirtioError::OutOfMemory)?;
+    {
+        let buf = backing.as_mut_slice();
+        let mut y = 0usize;
+        while y < height as usize {
+            let mut x = 0usize;
+            while x < width as usize {
+                let bar = (x * 4) / (width as usize).max(1);
+                let checker = ((x >> 5) ^ (y >> 5)) & 1;
+                let color = match bar {
+                    0 => 0xFFFF00FFu32,
+                    1 => 0xFF00FF00u32,
+                    2 => 0xFFFFFFFFu32,
+                    _ => {
+                        if checker == 0 {
+                            0xFF000000u32
+                        } else {
+                            0xFF404040u32
+                        }
+                    }
+                };
+                let off = y * pitch as usize + x * 4;
+                buf[off..off + 4].copy_from_slice(&color.to_le_bytes());
+                x += 1;
+            }
+            y += 1;
+        }
+    }
+
+    let reserved = adapter
+        .with_virtio(|v| v.reserve_resource_slot())
+        .map_err(|_| VirtioError::DeviceError)?;
+    if !reserved {
+        return Err(VirtioError::OutOfMemory);
+    }
+    let resource_id = match adapter.with_virtio(|v| v.alloc_resource_id()) {
+        Ok(id) => id,
+        Err(_) => {
+            let _ = adapter.with_virtio(|v| v.cancel_resource_reservation());
+            return Err(VirtioError::DeviceError);
+        }
+    };
+
+    let mut create = VirtioGpuResourceCreateBlob::zeroed();
+    create.hdr.type_ = VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB;
+    create.hdr.ctx_id = 0;
+    create.resource_id = resource_id;
+    create.blob_mem = blob_mem;
+    create.blob_flags = helios_protocol::VIRTIO_GPU_BLOB_FLAG_USE_SHAREABLE;
+    create.nr_entries = 1;
+    create.blob_id = 0;
+    create.size = size as u64;
+    let entry = VirtioGpuMemEntry {
+        addr: backing.physical_address(),
+        length: size as u32,
+        padding: 0,
+    };
+    if let Err(e) = ctrl_roundtrip_ok(adapter, bytes_of(&create), Some(bytes_of(&entry))) {
+        let _ = adapter.with_virtio(|v| v.cancel_resource_reservation());
+        return Err(e);
+    }
+
+    let _ = adapter.with_virtio(|v| v.commit_resource(resource_id));
+    if let Err(e) = set_scanout_blob(adapter, resource_id, width, height, format, pitch, 0) {
+        let _ = resource_unref(adapter, resource_id);
+        return Err(e);
+    }
+    core::mem::forget(backing);
+    resource_flush(adapter, resource_id, width, height)?;
+    Ok((resource_id, pitch))
+}
+
+pub fn diagnostic_virgl_host3d_blob(
+    adapter: &AdapterContext,
+    width: u32,
+    height: u32,
+    format: u32,
+) -> Result<(u32, u64, u32), VirtioError> {
+    let pitch = width.checked_mul(4).ok_or(VirtioError::OutOfMemory)?;
+    let size = (pitch as u64)
+        .checked_mul(height as u64)
+        .ok_or(VirtioError::OutOfMemory)?;
+    if size == 0 || size > u32::MAX as u64 {
+        return Err(VirtioError::OutOfMemory);
+    }
+    let aligned_size = (size + 0xFFF) & !0xFFF;
+    let blob_id = VIRGL_DIAG_BLOB_ID.fetch_add(1, Ordering::Relaxed);
+    let ctx_id = ctx_create(adapter, helios_protocol::VIRTIO_GPU_CAPSET_VIRGL, 0)?;
+
+    const VIRGL_CCMD_PIPE_RESOURCE_CREATE: u32 = 48;
+    const VIRGL_PIPE_RES_CREATE_SIZE: u32 = 11;
+    const PIPE_TEXTURE_2D: u32 = 2;
+    const VIRGL_BIND_RENDER_TARGET: u32 = 1 << 1;
+    const VIRGL_BIND_DISPLAY_TARGET: u32 = 1 << 7;
+    const VIRGL_BIND_SCANOUT: u32 = 1 << 18;
+    const VIRGL_BIND_SHARED: u32 = 1 << 20;
+    const VIRGL_BIND_LINEAR: u32 = 1 << 22;
+    const VIRGL_RESOURCE_FLAG_MAP_PERSISTENT: u32 = 1 << 1;
+    const VIRGL_RESOURCE_FLAG_MAP_COHERENT: u32 = 1 << 2;
+
+    let bind = VIRGL_BIND_RENDER_TARGET
+        | VIRGL_BIND_DISPLAY_TARGET
+        | VIRGL_BIND_SCANOUT
+        | VIRGL_BIND_SHARED
+        | VIRGL_BIND_LINEAR;
+    let flags = VIRGL_RESOURCE_FLAG_MAP_PERSISTENT | VIRGL_RESOURCE_FLAG_MAP_COHERENT;
+    let mut stream = [0u32; 12];
+    stream[0] = VIRGL_CCMD_PIPE_RESOURCE_CREATE | (VIRGL_PIPE_RES_CREATE_SIZE << 16);
+    stream[1] = PIPE_TEXTURE_2D;
+    stream[2] = format;
+    stream[3] = bind;
+    stream[4] = width;
+    stream[5] = height;
+    stream[6] = 1;
+    stream[7] = 1;
+    stream[8] = 0;
+    stream[9] = 0;
+    stream[10] = flags;
+    stream[11] = blob_id as u32;
+
+    // SAFETY: `stream` is a plain u32 command array; exposing its initialized
+    // bytes for SUBMIT_3D preserves alignment and lifetime for this call.
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            stream.as_ptr() as *const u8,
+            stream.len() * size_of::<u32>(),
+        )
+    };
+    if let Err(e) = submit_3d_sync(adapter, ctx_id, bytes) {
+        let _ = ctx_destroy(adapter, ctx_id);
+        return Err(e);
+    }
+
+    let blob_flags = helios_protocol::VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE;
+    match alloc_blob(
+        adapter,
+        ctx_id,
+        helios_protocol::VIRTIO_GPU_BLOB_MEM_HOST3D,
+        blob_flags,
+        blob_id,
+        aligned_size,
+        0,
+    ) {
+        Ok(resource_id) => Ok((resource_id, blob_id, pitch)),
+        Err(e) => {
+            let _ = ctx_destroy(adapter, ctx_id);
+            Err(e)
+        }
+    }
+}
+
+pub fn diagnostic_virgl_host3d_guest_scanout(
+    adapter: &AdapterContext,
+    width: u32,
+    height: u32,
+    format: u32,
+) -> Result<(u32, u64, u32), VirtioError> {
+    let pitch = width.checked_mul(4).ok_or(VirtioError::OutOfMemory)?;
+    let size = (pitch as u64)
+        .checked_mul(height as u64)
+        .ok_or(VirtioError::OutOfMemory)?;
+    if size == 0 || size > u32::MAX as u64 {
+        return Err(VirtioError::OutOfMemory);
+    }
+    let aligned_size = (size + 0xFFF) & !0xFFF;
+
+    let mut backing = DmaBuffer::new(aligned_size as usize).ok_or(VirtioError::OutOfMemory)?;
+    {
+        let buf = backing.as_mut_slice();
+        let mut y = 0usize;
+        while y < height as usize {
+            let mut x = 0usize;
+            while x < width as usize {
+                let bar = (x * 4) / (width as usize).max(1);
+                let checker = ((x >> 5) ^ (y >> 5)) & 1;
+                let color = match bar {
+                    0 => 0xFFFF00FFu32,
+                    1 => 0xFF00FF00u32,
+                    2 => 0xFFFFFFFFu32,
+                    _ => {
+                        if checker == 0 {
+                            0xFF000000u32
+                        } else {
+                            0xFF404040u32
+                        }
+                    }
+                };
+                let off = y * pitch as usize + x * 4;
+                buf[off..off + 4].copy_from_slice(&color.to_le_bytes());
+                x += 1;
+            }
+            y += 1;
+        }
+    }
+
+    let blob_id = VIRGL_DIAG_BLOB_ID.fetch_add(1, Ordering::Relaxed);
+    let ctx_id = ctx_create(adapter, helios_protocol::VIRTIO_GPU_CAPSET_VIRGL, 0)?;
+
+    const VIRGL_CCMD_PIPE_RESOURCE_CREATE: u32 = 48;
+    const VIRGL_PIPE_RES_CREATE_SIZE: u32 = 11;
+    const PIPE_TEXTURE_2D: u32 = 2;
+    const VIRGL_BIND_RENDER_TARGET: u32 = 1 << 1;
+    const VIRGL_BIND_DISPLAY_TARGET: u32 = 1 << 7;
+    const VIRGL_BIND_SCANOUT: u32 = 1 << 18;
+    const VIRGL_BIND_SHARED: u32 = 1 << 20;
+    const VIRGL_BIND_LINEAR: u32 = 1 << 22;
+
+    let bind = VIRGL_BIND_RENDER_TARGET
+        | VIRGL_BIND_DISPLAY_TARGET
+        | VIRGL_BIND_SCANOUT
+        | VIRGL_BIND_SHARED
+        | VIRGL_BIND_LINEAR;
+    let mut stream = [0u32; 12];
+    stream[0] = VIRGL_CCMD_PIPE_RESOURCE_CREATE | (VIRGL_PIPE_RES_CREATE_SIZE << 16);
+    stream[1] = PIPE_TEXTURE_2D;
+    stream[2] = format;
+    stream[3] = bind;
+    stream[4] = width;
+    stream[5] = height;
+    stream[6] = 1;
+    stream[7] = 1;
+    stream[8] = 0;
+    stream[9] = 0;
+    stream[10] = 0;
+    stream[11] = blob_id as u32;
+
+    // SAFETY: `stream` is an initialized u32 command array exposed as bytes for
+    // the synchronous SUBMIT_3D call.
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            stream.as_ptr() as *const u8,
+            stream.len() * size_of::<u32>(),
+        )
+    };
+    if let Err(e) = submit_3d_sync(adapter, ctx_id, bytes) {
+        let _ = ctx_destroy(adapter, ctx_id);
+        return Err(e);
+    }
+
+    let reserved = adapter
+        .with_virtio(|v| v.reserve_resource_slot())
+        .map_err(|_| VirtioError::DeviceError)?;
+    if !reserved {
+        let _ = ctx_destroy(adapter, ctx_id);
+        return Err(VirtioError::OutOfMemory);
+    }
+    let resource_id = match adapter.with_virtio(|v| v.alloc_resource_id()) {
+        Ok(id) => id,
+        Err(_) => {
+            let _ = adapter.with_virtio(|v| v.cancel_resource_reservation());
+            let _ = ctx_destroy(adapter, ctx_id);
+            return Err(VirtioError::DeviceError);
+        }
+    };
+
+    let mut create = VirtioGpuResourceCreateBlob::zeroed();
+    create.hdr.type_ = VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB;
+    create.hdr.ctx_id = ctx_id;
+    create.resource_id = resource_id;
+    create.blob_mem = helios_protocol::VIRTIO_GPU_BLOB_MEM_HOST3D_GUEST;
+    create.blob_flags = helios_protocol::VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE;
+    create.nr_entries = 1;
+    create.blob_id = blob_id;
+    create.size = aligned_size;
+    let entry = VirtioGpuMemEntry {
+        addr: backing.physical_address(),
+        length: aligned_size as u32,
+        padding: 0,
+    };
+    if let Err(e) = ctrl_roundtrip_ok(adapter, bytes_of(&create), Some(bytes_of(&entry))) {
+        let _ = adapter.with_virtio(|v| v.cancel_resource_reservation());
+        let _ = ctx_destroy(adapter, ctx_id);
+        return Err(e);
+    }
+    let _ = adapter.with_virtio(|v| v.commit_resource(resource_id));
+
+    let mut xfer = VirtioGpuTransferHost3d::zeroed();
+    xfer.hdr.type_ = helios_protocol::VIRTIO_GPU_CMD_TRANSFER_TO_HOST_3D;
+    xfer.hdr.ctx_id = ctx_id;
+    xfer.box_ = VirtioGpuBox3d {
+        x: 0,
+        y: 0,
+        z: 0,
+        w: width,
+        h: height,
+        d: 1,
+    };
+    xfer.offset = 0;
+    xfer.resource_id = resource_id;
+    xfer.level = 0;
+    xfer.stride = pitch;
+    xfer.layer_stride = pitch.saturating_mul(height);
+    if let Err(e) = ctrl_roundtrip_ok(adapter, bytes_of(&xfer), None) {
+        let _ = resource_unref(adapter, resource_id);
+        return Err(e);
+    }
+
+    core::mem::forget(backing);
+    Ok((resource_id, blob_id, pitch))
 }
 
 /// Attach an EXISTING live resource id to a context without taking ownership
@@ -540,8 +1065,7 @@ pub fn map_blob_prepare(
                         // Owner teardown raced the map: undo the host mapping
                         // and return the reserved range.
                         let _ = resource_unmap_blob(adapter, resource_id);
-                        let _ =
-                            adapter.with_virtio(|v| v.free_window_range_pub(offset, len));
+                        let _ = adapter.with_virtio(|v| v.free_window_range_pub(offset, len));
                         Err(VirtioError::DeviceError)
                     }
                 };
@@ -602,8 +1126,7 @@ pub fn map_blob_at(
                     // (for KMD-partition offsets only — the free guard ignores
                     // VidMm-partition ones) return its range.
                     let _ = resource_unmap_blob(adapter, resource_id);
-                    let _ = adapter
-                        .with_virtio(|v| v.free_window_range_pub(old_offset, old_len));
+                    let _ = adapter.with_virtio(|v| v.free_window_range_pub(old_offset, old_len));
                 }
                 let cache = resource_map_blob_roundtrip(adapter, resource_id, window_offset);
                 let cache_ok = cache.as_ref().ok().copied();
@@ -707,7 +1230,7 @@ pub fn forget_allocation_blob(adapter: &AdapterContext, resource_id: u32) -> boo
 /// acks the command on the used ring (decode-level; the client's real waits
 /// are its ring-head polls). `fence_id` stays 0 (parity with the proven
 /// System-class `submit_direct` shape).
-pub fn submit_venus_sync(
+pub fn submit_3d_sync(
     adapter: &AdapterContext,
     ctx_id: u32,
     stream: &[u8],
@@ -723,6 +1246,14 @@ pub fn submit_venus_sync(
     // The stream rides a second device-read descriptor (kept split so the host
     // never mis-parses the submit header as another control command).
     ctrl_roundtrip_ok(adapter, bytes_of(&cmd), Some(stream))
+}
+
+pub fn submit_venus_sync(
+    adapter: &AdapterContext,
+    ctx_id: u32,
+    stream: &[u8],
+) -> Result<(), VirtioError> {
+    submit_3d_sync(adapter, ctx_id, stream)
 }
 
 /// ASYNC venus SUBMIT_3D (the ICD escape path): stage the stream into DMA
@@ -748,7 +1279,9 @@ pub fn submit_venus_async(
     let mut attempts = 0u32;
     loop {
         let m = meta_slot.take().expect("meta returned on every retry path");
-        let vn = venus_slot.take().expect("venus returned on every retry path");
+        let vn = venus_slot
+            .take()
+            .expect("venus returned on every retry path");
         let res = adapter.with_virtio(move |v| {
             v.drain_used();
             v.enqueue_async_submit(ctx_id, ring_idx, m, vn, venus_len)

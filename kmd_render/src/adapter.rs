@@ -195,6 +195,20 @@ pub struct AdapterContext {
     /// reported in each CRTC_VSYNC packet so dxgkrnl can retire the matching queued
     /// flip (viogpu3d `m_sourceAddress`). 0 until the first source-address bind.
     pub last_primary_address: AtomicU64,
+    /// Active virtio scanout-0 blob selected by the display half. The KMD has no
+    /// hardware scan engine, so the PASSIVE HPD worker periodically flushes this
+    /// resource to make DWM writes visible in QEMU's SDL/GTK display.
+    pub active_scanout_resource: AtomicU32,
+    pub active_scanout_wh: AtomicU64,
+    /// Diagnostic scanout blob selected by `ScanoutDiag >= 2`. This is a
+    /// KMD-owned, CPU-filled color-bars blob used only to prove whether QEMU can
+    /// display any blob from this miniport after boot.
+    pub diag_scanout_resource: AtomicU32,
+    pub diag_scanout_wh: AtomicU64,
+    /// Diagnostic scanout row pitch (high 32) and byte offset (low 32).
+    pub diag_scanout_layout: AtomicU64,
+    pub scanout_refresh_count: AtomicU32,
+    pub scanout_refresh_fail: AtomicU32,
     /// 1 once [`Self::init_vsync`] has armed the timer (StopDevice cancels once).
     pub vsync_armed: AtomicU32,
     /// Scanout-0 mode the display half presents, taken from the host's
@@ -264,6 +278,13 @@ impl AdapterContext {
             vsync_enabled: AtomicU32::new(0),
             vsync_count: AtomicU32::new(0),
             last_primary_address: AtomicU64::new(0),
+            active_scanout_resource: AtomicU32::new(0),
+            active_scanout_wh: AtomicU64::new(0),
+            diag_scanout_resource: AtomicU32::new(0),
+            diag_scanout_wh: AtomicU64::new(0),
+            diag_scanout_layout: AtomicU64::new(0),
+            scanout_refresh_count: AtomicU32::new(0),
+            scanout_refresh_fail: AtomicU32::new(0),
             vsync_armed: AtomicU32::new(0),
             display_w: 0,
             display_h: 0,
@@ -370,6 +391,93 @@ impl AdapterContext {
         }
     }
 
+    /// Remember the blob currently selected for scanout 0. PASSIVE callers bind
+    /// the blob via SET_SCANOUT_BLOB first, then publish it here for the worker's
+    /// periodic RESOURCE_FLUSH.
+    pub fn remember_scanout_blob(&self, resource_id: u32, width: u32, height: u32) {
+        let wh = ((width as u64) << 32) | height as u64;
+        self.active_scanout_wh
+            .store(wh, core::sync::atomic::Ordering::Release);
+        self.active_scanout_resource
+            .store(resource_id, core::sync::atomic::Ordering::Release);
+    }
+
+    /// Remember the KMD-owned diagnostic blob. The production scanout can still
+    /// change in mode 1; mode 2 callers rebind this blob after each OS scanout
+    /// attempt so the host display should show color bars if blob scanout works.
+    pub fn remember_diag_scanout_blob(
+        &self,
+        resource_id: u32,
+        width: u32,
+        height: u32,
+        pitch: u32,
+        offset: u32,
+    ) {
+        let wh = ((width as u64) << 32) | height as u64;
+        let layout = ((pitch as u64) << 32) | offset as u64;
+        self.diag_scanout_wh
+            .store(wh, core::sync::atomic::Ordering::Release);
+        self.diag_scanout_layout
+            .store(layout, core::sync::atomic::Ordering::Release);
+        self.diag_scanout_resource
+            .store(resource_id, core::sync::atomic::Ordering::Release);
+    }
+
+    /// Flush the active scanout blob once from PASSIVE_LEVEL. Returns false when
+    /// there is no selected blob yet or the transport is already stopped.
+    pub fn refresh_active_scanout(&self) -> bool {
+        let diag_2d = crate::diag::read_config_dword(b"ScanoutDiag", 0) == 7;
+        let diag_resource = self
+            .diag_scanout_resource
+            .load(core::sync::atomic::Ordering::Acquire);
+        let resource_id = if diag_2d && diag_resource != 0 {
+            diag_resource
+        } else {
+            self.active_scanout_resource
+                .load(core::sync::atomic::Ordering::Acquire)
+        };
+        let wh = if diag_2d && diag_resource != 0 {
+            self.diag_scanout_wh
+                .load(core::sync::atomic::Ordering::Acquire)
+        } else {
+            self.active_scanout_wh
+                .load(core::sync::atomic::Ordering::Acquire)
+        };
+        let width = (wh >> 32) as u32;
+        let height = wh as u32;
+        if !self.display_half || resource_id == 0 || width == 0 || height == 0 {
+            return false;
+        }
+        let ok = if diag_2d && diag_resource != 0 {
+            crate::virtio::ctrl::set_scanout_2d(self, resource_id, width, height)
+                .and_then(|()| {
+                    crate::virtio::ctrl::resource_flush(self, resource_id, width, height)
+                })
+                .is_ok()
+        } else {
+            crate::virtio::ctrl::resource_flush(self, resource_id, width, height).is_ok()
+        };
+        let n = self
+            .scanout_refresh_count
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+            .wrapping_add(1);
+        if !ok {
+            self.scanout_refresh_fail
+                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
+        if n == 1 || (n % 60) == 0 || !ok {
+            crate::diag::record_named_bytes(b"RfRid", resource_id);
+            crate::diag::record_named_bytes(b"RfWH", (width << 16) | (height & 0xFFFF));
+            crate::diag::record_named_bytes(b"RfCnt", n);
+            crate::diag::record_named_bytes(
+                b"RfFail",
+                self.scanout_refresh_fail
+                    .load(core::sync::atomic::Ordering::Relaxed),
+            );
+        }
+        ok
+    }
+
     /// Arm the display-half VSync heartbeat: initialize the embedded KDPC/KTIMER
     /// in place and start a periodic ~16 ms `SynchronizationTimer` whose DPC
     /// (`vsync_dpc_routine`) synthesizes `DXGK_INTERRUPT_CRTC_VSYNC`. Idempotent
@@ -380,7 +488,11 @@ impl AdapterContext {
     /// device context) and `dxgkrnl` must already be saved (StartDevice ordering).
     pub unsafe fn init_vsync(&self) {
         use wdk_sys::ntddk::{KeInitializeDpc, KeInitializeTimerEx, KeSetTimerEx};
-        if self.vsync_armed.swap(1, core::sync::atomic::Ordering::AcqRel) != 0 {
+        if self
+            .vsync_armed
+            .swap(1, core::sync::atomic::Ordering::AcqRel)
+            != 0
+        {
             return;
         }
         self.vsync_enabled

@@ -97,10 +97,7 @@ pub unsafe extern "C" fn dxgkddi_query_adapter_info(
     }
 }
 
-unsafe fn query_driver_caps(
-    adapter: &AdapterContext,
-    args: &DXGKARG_QUERYADAPTERINFO,
-) -> NTSTATUS {
+unsafe fn query_driver_caps(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTERINFO) -> NTSTATUS {
     const REQUIRED_DRIVER_CAPS_SIZE: usize =
         offset_of!(DXGK_DRIVERCAPS, SupportDirectFlip) + size_of::<BOOLEAN>();
 
@@ -679,7 +676,11 @@ unsafe fn query_segments(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTERIN
         } else {
             0x0902_0000
         });
-        crate::diag::record(if bar.is_some() { 0x0905_0001 } else { 0x0905_0000 });
+        crate::diag::record(if bar.is_some() {
+            0x0905_0001
+        } else {
+            0x0905_0000
+        });
 
         // Segment TABLE per topology (`BarSegMode` — see `setup_bar_segment`).
         // The list is (writer, args) per positional slot; ids are positional

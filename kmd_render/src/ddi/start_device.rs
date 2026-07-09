@@ -254,6 +254,7 @@ pub unsafe extern "C" fn dxgkddi_start_device(
         let (w, h) = adapter.display_mode();
         adapter.edid = crate::ddi::vidpn::build_edid(w, h);
         crate::diag::record_named_bytes(b"DspMd", (w << 16) | (h & 0xFFFF));
+        crate::ddi::scanout_diag::maybe_run(adapter);
 
         // Arm the CRTC_VSYNC heartbeat: without a free-running VSync, dxgkrnl never
         // retires a flip and so never issues SetVidPnSourceAddress (viogpu3d
@@ -304,11 +305,7 @@ pub unsafe extern "C" fn vsync_dpc_routine(
     // SAFETY: live callback interface; signal_crtc_vsync raises to DIRQL internally
     // via DxgkCbSynchronizeExecution and delivers the CRTC_VSYNC packet.
     let _ = unsafe {
-        crate::ddi::submit_command::signal_crtc_vsync(
-            dxgkrnl,
-            phys,
-            crate::ddi::vidpn::CHILD_UID,
-        )
+        crate::ddi::submit_command::signal_crtc_vsync(dxgkrnl, phys, crate::ddi::vidpn::CHILD_UID)
     };
     adapter.vsync_count.fetch_add(1, Ordering::Relaxed);
 }
@@ -455,8 +452,10 @@ pub unsafe extern "C" fn dxgkddi_query_child_relations(
         // (36th-session root cause). viogpu3d's non-VGA output is likewise VOT_HD15.
         d.ChildCapabilities.Type.VideoOutput.InterfaceTechnology =
             _D3DKMDT_VIDEO_OUTPUT_TECHNOLOGY::D3DKMDT_VOT_HD15;
-        d.ChildCapabilities.Type.VideoOutput.MonitorOrientationAwareness =
-            _D3DKMDT_MONITOR_ORIENTATION_AWARENESS::D3DKMDT_MOA_NONE;
+        d.ChildCapabilities
+            .Type
+            .VideoOutput
+            .MonitorOrientationAwareness = _D3DKMDT_MONITOR_ORIENTATION_AWARENESS::D3DKMDT_MOA_NONE;
         d.ChildCapabilities.Type.VideoOutput.SupportsSdtvModes = 0;
         d.AcpiUid = 0;
         d.ChildUid = crate::ddi::vidpn::CHILD_UID;
@@ -582,7 +581,11 @@ pub unsafe extern "C" fn dxgkddi_get_child_container_id(
     // SAFETY: dxgkrnl provides a writable DXGK_CHILD_CONTAINER_ID.
     unsafe {
         let cid = &mut *container_id;
-        core::ptr::write_bytes(cid as *mut _ as *mut u8, 0, core::mem::size_of::<DXGK_CHILD_CONTAINER_ID>());
+        core::ptr::write_bytes(
+            cid as *mut _ as *mut u8,
+            0,
+            core::mem::size_of::<DXGK_CHILD_CONTAINER_ID>(),
+        );
         cid.ContainerId = crate::ddi::vidpn::HELIOS_MONITOR_CONTAINER_ID;
     }
     STATUS_SUCCESS

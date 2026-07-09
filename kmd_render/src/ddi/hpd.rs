@@ -17,6 +17,8 @@ use crate::adapter::AdapterContext;
 use crate::dxgk::*;
 use wdk_sys::ntddk::{KeWaitForSingleObject, PsTerminateSystemThread};
 
+const STATUS_TIMEOUT: NTSTATUS = 0x0000_0102;
+
 /// Indicate the single child video-output's connection state to the OS. PASSIVE.
 fn indicate_child_status(adapter: &AdapterContext, connected: bool) {
     let Some(dxgkrnl) = adapter.dxgkrnl.as_ref() else {
@@ -61,7 +63,7 @@ pub unsafe extern "C" fn hpd_thread_routine(context: *mut c_void) {
     // A boot config-change wakes us early; otherwise the timeout drives it.
     let mut initial_timeout: LARGE_INTEGER = unsafe { core::mem::zeroed() };
     initial_timeout.QuadPart = -5_000_000; // 500 ms relative (100 ns units)
-    // SAFETY: waiting on the initialized hpd_event with a relative timeout.
+                                           // SAFETY: waiting on the initialized hpd_event with a relative timeout.
     let _ = unsafe {
         KeWaitForSingleObject(
             adapter.hpd_event.get() as PVOID,
@@ -78,22 +80,24 @@ pub unsafe extern "C" fn hpd_thread_routine(context: *mut c_void) {
     }
     indicate_child_status(adapter, true);
 
-    // Steady state: re-indicate on each config-change wake; exit on stop.
+    // Steady state: re-indicate on each config-change wake; between wakes, flush
+    // the selected scanout blob. This thread is PASSIVE_LEVEL and joined before
+    // teardown, so it is the right place for the blocking virtio control roundtrip.
     loop {
-        // SAFETY: infinite wait on the initialized hpd_event.
-        let _ = unsafe {
-            KeWaitForSingleObject(
-                adapter.hpd_event.get() as PVOID,
-                0,
-                0,
-                0,
-                core::ptr::null_mut(),
-            )
+        let mut timeout: LARGE_INTEGER = unsafe { core::mem::zeroed() };
+        timeout.QuadPart = -160_000; // 16 ms relative (100 ns units)
+                                     // SAFETY: timed wait on the initialized hpd_event.
+        let wait_status = unsafe {
+            KeWaitForSingleObject(adapter.hpd_event.get() as PVOID, 0, 0, 0, &mut timeout)
         };
         if adapter.hpd_stop.load(Ordering::Acquire) != 0 {
             // SAFETY: terminates the current system thread; does not return.
             let _ = unsafe { PsTerminateSystemThread(STATUS_SUCCESS) };
             return;
+        }
+        if wait_status == STATUS_TIMEOUT {
+            let _ = adapter.refresh_active_scanout();
+            continue;
         }
         // A virtio display event may have changed the mode; re-indicate connected
         // so the OS re-reads the monitor (QueryChildStatus/QueryDeviceDescriptor).

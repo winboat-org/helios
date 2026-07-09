@@ -89,7 +89,7 @@ pub fn build_edid(w: u32, h: u32) -> [u8; 128] {
     d[9] = (hsw & 0xFF) as u8;
     d[10] = (((vfp & 0xF) << 4) | (vsw & 0xF)) as u8;
     d[17] = 0x1E; // digital separate sync, +H +V
-    // Descriptor 2: monitor range limits (0xFD).
+                  // Descriptor 2: monitor range limits (0xFD).
     e[72..90].copy_from_slice(&[
         0x00, 0x00, 0x00, 0xFD, 0x00, 0x32, 0x4B, 0x1E, 0x50, 0x14, 0x00, 0x0A, 0x20, 0x20, 0x20,
         0x20, 0x20, 0x20,
@@ -174,7 +174,10 @@ unsafe fn vidpn_interface(
     adapter: &AdapterContext,
     h_vidpn: D3DKMDT_HVIDPN,
 ) -> Result<*const DXGK_VIDPN_INTERFACE, NTSTATUS> {
-    let dxgkrnl = adapter.dxgkrnl.as_ref().ok_or(STATUS_GRAPHICS_INVALID_VIDPN)?;
+    let dxgkrnl = adapter
+        .dxgkrnl
+        .as_ref()
+        .ok_or(STATUS_GRAPHICS_INVALID_VIDPN)?;
     let query = dxgkrnl
         .DxgkCbQueryVidPnInterface
         .ok_or(STATUS_GRAPHICS_INVALID_VIDPN)?;
@@ -188,7 +191,11 @@ unsafe fn vidpn_interface(
         )
     };
     if !ok(st) || iface.is_null() {
-        return Err(if ok(st) { STATUS_GRAPHICS_INVALID_VIDPN } else { st });
+        return Err(if ok(st) {
+            STATUS_GRAPHICS_INVALID_VIDPN
+        } else {
+            st
+        });
     }
     Ok(iface)
 }
@@ -227,16 +234,22 @@ unsafe fn add_single_source_mode(
 ) -> NTSTATUS {
     // SAFETY: iface valid per the fn contract.
     let iface = unsafe { &*iface };
-    let (Some(create), Some(add), Some(release)) =
-        (iface.pfnCreateNewModeInfo, iface.pfnAddMode, iface.pfnReleaseModeInfo)
-    else {
+    let (Some(create), Some(add), Some(release)) = (
+        iface.pfnCreateNewModeInfo,
+        iface.pfnAddMode,
+        iface.pfnReleaseModeInfo,
+    ) else {
         return STATUS_GRAPHICS_INVALID_VIDPN;
     };
     let mut mode: *mut D3DKMDT_VIDPN_SOURCE_MODE = null_mut();
     // SAFETY: valid out-pointer.
     let st = unsafe { create(h_set, &mut mode) };
     if !ok(st) || mode.is_null() {
-        return if ok(st) { STATUS_GRAPHICS_INVALID_VIDPN } else { st };
+        return if ok(st) {
+            STATUS_GRAPHICS_INVALID_VIDPN
+        } else {
+            st
+        };
     }
     // SAFETY: `mode` is a writable source-mode the OS just allocated. `.Format`
     // is a Copy union; the Graphics arm is the one source modes use.
@@ -275,16 +288,22 @@ unsafe fn add_single_target_mode(
 ) -> NTSTATUS {
     // SAFETY: iface valid per the fn contract.
     let iface = unsafe { &*iface };
-    let (Some(create), Some(add), Some(release)) =
-        (iface.pfnCreateNewModeInfo, iface.pfnAddMode, iface.pfnReleaseModeInfo)
-    else {
+    let (Some(create), Some(add), Some(release)) = (
+        iface.pfnCreateNewModeInfo,
+        iface.pfnAddMode,
+        iface.pfnReleaseModeInfo,
+    ) else {
         return STATUS_GRAPHICS_INVALID_VIDPN;
     };
     let mut mode: *mut D3DKMDT_VIDPN_TARGET_MODE = null_mut();
     // SAFETY: valid out-pointer.
     let st = unsafe { create(h_set, &mut mode) };
     if !ok(st) || mode.is_null() {
-        return if ok(st) { STATUS_GRAPHICS_INVALID_VIDPN } else { st };
+        return if ok(st) {
+            STATUS_GRAPHICS_INVALID_VIDPN
+        } else {
+            st
+        };
     }
     // SAFETY: `mode` is writable; Preference lives in the Copy union's bitfield arm.
     unsafe {
@@ -327,9 +346,11 @@ pub unsafe fn recommend_monitor_modes(
     }
     // SAFETY: dxgkrnl-provided interface, valid for the call.
     let iface = unsafe { &*a.pMonitorSourceModeSetInterface };
-    let (Some(create), Some(add), Some(release)) =
-        (iface.pfnCreateNewModeInfo, iface.pfnAddMode, iface.pfnReleaseModeInfo)
-    else {
+    let (Some(create), Some(add), Some(release)) = (
+        iface.pfnCreateNewModeInfo,
+        iface.pfnAddMode,
+        iface.pfnReleaseModeInfo,
+    ) else {
         return STATUS_GRAPHICS_INVALID_VIDPN;
     };
     let h_set = a.hMonitorSourceModeSet;
@@ -337,7 +358,11 @@ pub unsafe fn recommend_monitor_modes(
     // SAFETY: valid out-pointer.
     let st = unsafe { create(h_set, &mut mode) };
     if !ok(st) || mode.is_null() {
-        return if ok(st) { STATUS_GRAPHICS_INVALID_VIDPN } else { st };
+        return if ok(st) {
+            STATUS_GRAPHICS_INVALID_VIDPN
+        } else {
+            st
+        };
     }
     // SAFETY: `mode` is writable.
     unsafe {
@@ -419,7 +444,11 @@ pub unsafe fn enum_cofunc_modality(
             rec(b"VpECe", st as u32);
             rec(b"VpECf", 2);
         }
-        return if ok(st) { STATUS_GRAPHICS_INVALID_VIDPN } else { legalize_vidpn(st) };
+        return if ok(st) {
+            STATUS_GRAPHICS_INVALID_VIDPN
+        } else {
+            legalize_vidpn(st)
+        };
     }
     // SAFETY: valid for the call.
     let topo = unsafe { &*topo_iface };
@@ -733,10 +762,7 @@ pub unsafe fn topology_path_count(adapter: &AdapterContext, h_vidpn: D3DKMDT_HVI
 ///
 /// # Safety
 /// `arg` points to a valid `DXGKARG_COMMITVIDPN` for the call.
-pub unsafe fn commit_vidpn(
-    adapter: &AdapterContext,
-    arg: *const DXGKARG_COMMITVIDPN,
-) -> NTSTATUS {
+pub unsafe fn commit_vidpn(adapter: &AdapterContext, arg: *const DXGKARG_COMMITVIDPN) -> NTSTATUS {
     if arg.is_null() {
         return STATUS_INVALID_PARAMETER;
     }

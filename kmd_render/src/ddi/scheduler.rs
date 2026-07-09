@@ -7,13 +7,52 @@
 
 use alloc::boxed::Box;
 use core::mem::size_of;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::adapter::AdapterContext;
+use crate::device::DeviceContext;
 use crate::dxgk::*;
 
-struct HwContext;
+const HW_CONTEXT_MAGIC: u32 = 0x4843_5458; // "HCTX"
+const HW_QUEUE_MAGIC: u32 = 0x4851_5545; // "HQUE"
 
-struct HwQueue;
+#[repr(C)]
+struct HwContext {
+    magic: u32,
+    adapter: *mut AdapterContext,
+}
+
+#[repr(C)]
+struct HwQueue {
+    magic: u32,
+    adapter: *mut AdapterContext,
+}
+
+static PRESENT_HWQ_COUNT: AtomicU32 = AtomicU32::new(0);
+
+unsafe fn hw_queue_adapter(h_hw_queue: IN_CONST_HANDLE) -> Option<*mut AdapterContext> {
+    if h_hw_queue.is_null() {
+        return None;
+    }
+
+    // SAFETY: Dxgkrnl passes back the opaque hHwQueue value returned from
+    // DxgkDdiCreateHwQueue. The magic is the first field in both structs.
+    let queue = unsafe { &*(h_hw_queue as *const HwQueue) };
+    if queue.magic == HW_QUEUE_MAGIC && !queue.adapter.is_null() {
+        return Some(queue.adapter);
+    }
+
+    // Some WDDM documentation names this first parameter generically as a
+    // context handle. Accept our HW context too so diagnostics keep working if
+    // the OS routes this callback through hHwContext on a different build.
+    // SAFETY: Same opaque-handle contract; HwContext also starts with magic.
+    let context = unsafe { &*(h_hw_queue as *const HwContext) };
+    if context.magic == HW_CONTEXT_MAGIC && !context.adapter.is_null() {
+        return Some(context.adapter);
+    }
+
+    None
+}
 
 pub unsafe extern "C" fn dxgkddi_query_dependent_engine_group(
     _h_adapter: IN_CONST_HANDLE,
@@ -92,7 +131,17 @@ pub unsafe extern "C" fn dxgkddi_create_hw_context(
         return STATUS_INVALID_PARAMETER;
     }
 
-    let ctx = Box::new(HwContext);
+    // SAFETY: h_device is the DeviceContext pointer returned from
+    // DxgkDdiCreateDevice for this adapter.
+    let device = unsafe { &*(h_device as *const DeviceContext) };
+    if device.adapter.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    let ctx = Box::new(HwContext {
+        magic: HW_CONTEXT_MAGIC,
+        adapter: device.adapter,
+    });
     args.hHwContext = Box::into_raw(ctx) as HANDLE;
     STATUS_SUCCESS
 }
@@ -114,8 +163,18 @@ pub unsafe extern "C" fn dxgkddi_create_hw_queue(
         return STATUS_INVALID_PARAMETER;
     }
 
+    // SAFETY: h_hw_context is the HwContext pointer returned from
+    // DxgkDdiCreateHwContext.
+    let hw_context = unsafe { &*(h_hw_context as *const HwContext) };
+    if hw_context.magic != HW_CONTEXT_MAGIC || hw_context.adapter.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+
     let args = unsafe { &mut *args };
-    let queue = Box::new(HwQueue);
+    let queue = Box::new(HwQueue {
+        magic: HW_QUEUE_MAGIC,
+        adapter: hw_context.adapter,
+    });
     args.hHwQueue = Box::into_raw(queue) as HANDLE;
     STATUS_SUCCESS
 }
@@ -158,15 +217,111 @@ pub unsafe extern "C" fn dxgkddi_switch_to_hw_context_list(
 }
 
 pub unsafe extern "C" fn dxgkddi_present_to_hw_queue(
-    _h_context: IN_CONST_HANDLE,
+    h_hw_queue: IN_CONST_HANDLE,
     args: INOUT_PDXGKARG_PRESENT,
 ) -> NTSTATUS {
     crate::diag::record(0x0700_0007);
-    if args.is_null() {
+    PRESENT_HWQ_COUNT.fetch_add(1, Ordering::Relaxed);
+    crate::diag::record_named_bytes(b"PHQcall", PRESENT_HWQ_COUNT.load(Ordering::Relaxed));
+
+    if h_hw_queue.is_null() || args.is_null() {
+        crate::diag::record_named_bytes(b"PHQst", STATUS_INVALID_PARAMETER as u32);
         return STATUS_INVALID_PARAMETER;
     }
 
-    STATUS_NOT_SUPPORTED
+    let Some(adapter_ptr) = (unsafe { hw_queue_adapter(h_hw_queue) }) else {
+        crate::diag::record_named_bytes(b"PHQst", STATUS_INVALID_PARAMETER as u32);
+        return STATUS_INVALID_PARAMETER;
+    };
+    // SAFETY: hw_queue_adapter validated this is the adapter pointer captured
+    // from DeviceContext while creating the HW queue/context.
+    let adapter = unsafe { &*adapter_ptr };
+    let args = unsafe { &mut *args };
+    let present_flags = unsafe { args.Flags.__bindgen_anon_1.Value };
+    crate::diag::record_named_bytes(b"PHQflag", present_flags);
+    crate::diag::record_named_bytes(
+        b"PHQcnt",
+        (args.NumSrcAllocations << 16) | (args.NumDstAllocations & 0xFFFF),
+    );
+
+    let allocation_list = unsafe { args.__bindgen_anon_1.pAllocationList };
+    crate::diag::record_named_bytes(b"PHQalst", if allocation_list.is_null() { 0 } else { 1 });
+
+    if (present_flags & (1 << 2)) == 0 && !allocation_list.is_null() {
+        // SAFETY: Per DXGKARG_PRESENT, indices 1 and 2 carry the present source
+        // and destination allocation entries when pAllocationList is non-null.
+        let src = unsafe { allocation_list.add(DXGK_PRESENT_SOURCE_INDEX as usize) };
+        let dst = unsafe { allocation_list.add(DXGK_PRESENT_DESTINATION_INDEX as usize) };
+        let src_handle = unsafe { (*src).hDeviceSpecificAllocation };
+        let dst_handle = unsafe { (*dst).hDeviceSpecificAllocation };
+        crate::diag::record_named_bytes(b"PHQsrcH", (src_handle as usize as u32) & 0xFFFF);
+        crate::diag::record_named_bytes(b"PHQdstH", (dst_handle as usize as u32) & 0xFFFF);
+
+        let src_scanout =
+            unsafe { super::create_allocation::present_scanout_alloc_info(src_handle) };
+        if let Some(sc) = src_scanout {
+            crate::diag::record_named_bytes(b"PHQsrc", sc.resource_id);
+            super::display::issue_present_scanout(
+                adapter,
+                sc.resource_id,
+                sc.width,
+                sc.height,
+                sc.pitch,
+                sc.dxgi_format,
+                sc.plane_offset,
+                3,
+            );
+        } else {
+            crate::diag::record_named_bytes(b"PHQsrc", 0);
+        }
+    }
+
+    if !args.pPatchLocationListOut.is_null() && args.PatchLocationListOutSize >= 2 {
+        let patch = args.pPatchLocationListOut;
+        unsafe {
+            // SAFETY: dxgkrnl supplied at least two writable patch entries.
+            core::ptr::write_bytes(patch, 0, 2);
+
+            (*patch).AllocationIndex = DXGK_PRESENT_DESTINATION_INDEX;
+            (*patch).__bindgen_anon_1.Value = 1;
+            (*patch).DriverId = 1;
+            (*patch).AllocationOffset = 0;
+            (*patch).PatchOffset = 0;
+            (*patch).SplitOffset = 0;
+
+            let patch1 = patch.add(1);
+            (*patch1).AllocationIndex = DXGK_PRESENT_SOURCE_INDEX;
+            (*patch1).__bindgen_anon_1.Value = 2;
+            (*patch1).DriverId = 2;
+            (*patch1).AllocationOffset = 0;
+            (*patch1).PatchOffset = 0;
+            (*patch1).SplitOffset = 0;
+
+            args.pPatchLocationListOut = patch.add(2);
+        }
+    }
+
+    if !args.pDmaBuffer.is_null() {
+        const PRESENT_NOP_DWORDS: usize = 4;
+        let bytes = (PRESENT_NOP_DWORDS * core::mem::size_of::<u32>()) as UINT;
+        if args.DmaSize < bytes {
+            crate::diag::record_named_bytes(b"PHQst", STATUS_BUFFER_TOO_SMALL as u32);
+            return STATUS_BUFFER_TOO_SMALL;
+        }
+        let dma = args.pDmaBuffer as *mut u32;
+        unsafe {
+            // SAFETY: DmaSize was checked for the four DWORD no-op record.
+            *dma.add(0) = 0x5150_4548; // "HEPQ"
+            *dma.add(1) = DXGK_PRESENT_SOURCE_INDEX;
+            *dma.add(2) = DXGK_PRESENT_DESTINATION_INDEX;
+            *dma.add(3) = present_flags;
+            args.pDmaBuffer = (args.pDmaBuffer as *mut u8).add(bytes as usize).cast();
+        }
+        args.MultipassOffset = 0;
+    }
+
+    crate::diag::record_named_bytes(b"PHQst", STATUS_SUCCESS as u32);
+    STATUS_SUCCESS
 }
 
 pub unsafe extern "C" fn dxgkddi_cancel_command(

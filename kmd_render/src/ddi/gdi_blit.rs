@@ -184,9 +184,7 @@ unsafe fn read_arm<T>(cmd: *const DXGK_RENDERKM_COMMAND, avail: usize) -> Option
     // SAFETY: avail bytes at `cmd` are within the command buffer (caller), and
     // payload_off + size_of::<T>() <= avail was checked above. addr_of! avoids
     // materializing a reference to the full (possibly short) struct.
-    Some(unsafe {
-        core::ptr::read_unaligned(core::ptr::addr_of!((*cmd).Command) as *const T)
-    })
+    Some(unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*cmd).Command) as *const T) })
 }
 
 unsafe fn dispatch(
@@ -421,8 +419,8 @@ unsafe fn op_colorfill(
     };
     let bounds = surf_rect(&d);
     let color = a.Color;
-    let area = (a.DstRect.right - a.DstRect.left) as i64
-        * (a.DstRect.bottom - a.DstRect.top) as i64;
+    let area =
+        (a.DstRect.right - a.DstRect.left) as i64 * (a.DstRect.bottom - a.DstRect.top) as i64;
     if area >= BIG_OP_AREA {
         BIG_FILL_COUNT.fetch_add(1, Ordering::Relaxed);
         BIG_FILL_RESID.store(d.resource_id, Ordering::Relaxed);
@@ -468,8 +466,8 @@ unsafe fn op_bitblt(
     let dp = pitch_or(&d, a.DstPitch);
     let s_bounds = surf_rect(&s);
     let d_bounds = surf_rect(&d);
-    let blt_area = (a.DstRect.right - a.DstRect.left) as i64
-        * (a.DstRect.bottom - a.DstRect.top) as i64;
+    let blt_area =
+        (a.DstRect.right - a.DstRect.left) as i64 * (a.DstRect.bottom - a.DstRect.top) as i64;
     if blt_area >= BIG_OP_AREA {
         BIG_BLT_COUNT.fetch_add(1, Ordering::Relaxed);
         BIG_BLT_RESID.store(d.resource_id, Ordering::Relaxed);
@@ -500,8 +498,7 @@ unsafe fn op_bitblt(
         while (down && y >= c.t) || (!down && y < c.b) {
             let sx = sx0 + (c.l - dx0);
             let sy = sy0 + (y - dy0);
-            if sy >= s_bounds.t && sy < s_bounds.b && sx >= s_bounds.l && sx + w <= s_bounds.r
-            {
+            if sy >= s_bounds.t && sy < s_bounds.b && sx >= s_bounds.l && sx + w <= s_bounds.r {
                 let sptr = row_ptr(&s, sp, sx, sy, w);
                 let dptr = row_ptr(&d, dp, c.l, y, w);
                 if !sptr.is_null() && !dptr.is_null() {
@@ -512,9 +509,7 @@ unsafe fn op_bitblt(
                             | _DXGK_GDIROP_BITBLT::DXGK_GDIROP_SRCAND
                             | _DXGK_GDIROP_BITBLT::DXGK_GDIROP_SRCOR => {
                                 for x in 0..w as usize {
-                                    let sv = core::ptr::read_unaligned(
-                                        (sptr as *const u32).add(x),
-                                    );
+                                    let sv = core::ptr::read_unaligned((sptr as *const u32).add(x));
                                     let dpx = (dptr as *mut u32).add(x);
                                     let dv = core::ptr::read_unaligned(dpx);
                                     let nv = match rop {
@@ -588,27 +583,19 @@ unsafe fn op_alphablend(
                         let sa = scale8(sv >> 24, const_a);
                         let inv = 255 - sa;
                         let b = scale8(sv & 0xFF, const_a) + scale8(dv & 0xFF, inv);
-                        let g =
-                            scale8((sv >> 8) & 0xFF, const_a) + scale8((dv >> 8) & 0xFF, inv);
-                        let r8 = scale8((sv >> 16) & 0xFF, const_a)
-                            + scale8((dv >> 16) & 0xFF, inv);
+                        let g = scale8((sv >> 8) & 0xFF, const_a) + scale8((dv >> 8) & 0xFF, inv);
+                        let r8 =
+                            scale8((sv >> 16) & 0xFF, const_a) + scale8((dv >> 16) & 0xFF, inv);
                         let a8 = sa + scale8(dv >> 24, inv);
-                        (a8.min(255) << 24)
-                            | (r8.min(255) << 16)
-                            | (g.min(255) << 8)
-                            | b.min(255)
+                        (a8.min(255) << 24) | (r8.min(255) << 16) | (g.min(255) << 8) | b.min(255)
                     } else {
                         let inv = 255 - const_a;
                         let b = scale8(sv & 0xFF, const_a) + scale8(dv & 0xFF, inv);
-                        let g =
-                            scale8((sv >> 8) & 0xFF, const_a) + scale8((dv >> 8) & 0xFF, inv);
-                        let r8 = scale8((sv >> 16) & 0xFF, const_a)
-                            + scale8((dv >> 16) & 0xFF, inv);
+                        let g = scale8((sv >> 8) & 0xFF, const_a) + scale8((dv >> 8) & 0xFF, inv);
+                        let r8 =
+                            scale8((sv >> 16) & 0xFF, const_a) + scale8((dv >> 16) & 0xFF, inv);
                         let a8 = scale8(sv >> 24, const_a) + scale8(dv >> 24, inv);
-                        (a8.min(255) << 24)
-                            | (r8.min(255) << 16)
-                            | (g.min(255) << 8)
-                            | b.min(255)
+                        (a8.min(255) << 24) | (r8.min(255) << 16) | (g.min(255) << 8) | b.min(255)
                     };
                     core::ptr::write_unaligned(dpx, nv);
                 }
@@ -790,8 +777,7 @@ unsafe fn op_cleartypeblend(
         for y in c.t..c.b {
             let ax0 = c.l + a.DstToAlphaOffsetX;
             let ay = y + a.DstToAlphaOffsetY;
-            if ay < a_bounds.t || ay >= a_bounds.b || ax0 < a_bounds.l || ax0 + w > a_bounds.r
-            {
+            if ay < a_bounds.t || ay >= a_bounds.b || ax0 < a_bounds.l || ax0 + w > a_bounds.r {
                 continue;
             }
             let aptr = row_ptr(&al, ap, ax0, ay, w);
@@ -810,12 +796,9 @@ unsafe fn op_cleartypeblend(
                     let ar = (av >> 16) & 0xFF;
                     let b = scale8(fg & 0xFF, ab) + scale8(dv & 0xFF, 255 - ab);
                     let g = scale8((fg >> 8) & 0xFF, ag) + scale8((dv >> 8) & 0xFF, 255 - ag);
-                    let r8 =
-                        scale8((fg >> 16) & 0xFF, ar) + scale8((dv >> 16) & 0xFF, 255 - ar);
-                    let nv = (dv & 0xFF00_0000)
-                        | (r8.min(255) << 16)
-                        | (g.min(255) << 8)
-                        | b.min(255);
+                    let r8 = scale8((fg >> 16) & 0xFF, ar) + scale8((dv >> 16) & 0xFF, 255 - ar);
+                    let nv =
+                        (dv & 0xFF00_0000) | (r8.min(255) << 16) | (g.min(255) << 8) | b.min(255);
                     core::ptr::write_unaligned(dpx, nv);
                 }
             }

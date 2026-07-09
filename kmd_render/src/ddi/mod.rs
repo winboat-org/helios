@@ -13,6 +13,7 @@ mod gpummu;
 pub(crate) mod hpd;
 mod interrupt;
 pub(crate) mod query_adapter_info;
+mod scanout_diag;
 mod scheduler;
 mod start_device;
 mod submit_command;

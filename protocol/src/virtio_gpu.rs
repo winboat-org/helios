@@ -115,6 +115,9 @@ pub const VIRTIO_GPU_MAX_SCANOUTS: usize = 16;
 /// BGRA8888, matching Vulkan `VK_FORMAT_B8G8R8A8_UNORM` — the format Helios
 /// scans out venus blobs with. (virtio_gpu_formats enum value 1.)
 pub const VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM: u32 = 1;
+/// BGRX8888, matching Vulkan `VK_FORMAT_B8G8R8A8_UNORM` storage while telling
+/// the display backend to ignore alpha. (virtio_gpu_formats enum value 2.)
+pub const VIRTIO_GPU_FORMAT_B8G8R8X8_UNORM: u32 = 2;
 
 /// Control command header — prepended to every virtio-gpu command and response.
 /// 24 bytes, 8-byte aligned, no implicit padding.

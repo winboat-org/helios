@@ -56,8 +56,8 @@ static BAR_AP_ERR_SPARSE: AtomicU32 = AtomicU32::new(0); // aperture pages not c
 static BAR_AP_ERR_BOUNDS: AtomicU32 = AtomicU32::new(0); // outside the declared region
 static BAR_AP_ERR_MAP: AtomicU32 = AtomicU32::new(0); // map_blob_at failed
 static BAR_AP_ERR_UNRESOLVED_UNMAP: AtomicU32 = AtomicU32::new(0); // no blob at unmap offset
-// Last IRQL a raised-IRQL Map/Unmap arrived at (2 = DISPATCH). Recorded at DIRQL;
-// flushed to the registry (`ChIq`) from a PASSIVE context (`diag_dump`).
+                                                                   // Last IRQL a raised-IRQL Map/Unmap arrived at (2 = DISPATCH). Recorded at DIRQL;
+                                                                   // flushed to the registry (`ChIq`) from a PASSIVE context (`diag_dump`).
 static BAR_AP_LAST_IRQL: AtomicU32 = AtomicU32::new(0);
 // Times the raised-IRQL Map path acknowledged because the blob was ALREADY mapped
 // at the requested offset (idempotent SUCCESS) vs. had to defer to a PASSIVE retry.
@@ -156,8 +156,7 @@ pub unsafe extern "C" fn dxgkddi_map_cpu_host_aperture(
             })
             .map(|a| {
                 // SAFETY: pCpuHostAperturePages holds >=1 entry (checked above).
-                let page0 =
-                    unsafe { core::ptr::read_unaligned(args.pCpuHostAperturePages) } as u64;
+                let page0 = unsafe { core::ptr::read_unaligned(args.pCpuHostAperturePages) } as u64;
                 let offset = page0 << 12;
                 adapter
                     .with_virtio(|v| v.blob_resid_at_offset(offset))
@@ -196,9 +195,8 @@ pub unsafe extern "C" fn dxgkddi_map_cpu_host_aperture(
     // SAFETY: pCpuHostAperturePages holds NumberOfPages entries for the call.
     let page0 = unsafe { core::ptr::read_unaligned(args.pCpuHostAperturePages) } as u64;
     for i in 1..n {
-        let p = unsafe {
-            core::ptr::read_unaligned(args.pCpuHostAperturePages.add(i as usize))
-        } as u64;
+        let p =
+            unsafe { core::ptr::read_unaligned(args.pCpuHostAperturePages.add(i as usize)) } as u64;
         if p != page0 + i {
             BAR_AP_ERR_SPARSE.fetch_add(1, Ordering::Relaxed);
             dump_bar_ap_counters();
@@ -254,10 +252,9 @@ pub unsafe extern "C" fn dxgkddi_unmap_cpu_host_aperture(
     // hAllocation in this DDI — resolve by aperture offset.
     // SAFETY: our AdapterContext (DDI contract).
     let adapter = unsafe { &*(h_adapter as *const AdapterContext) };
-    let is_bar = adapter
-        .bar_segment
-        .as_ref()
-        .map_or(false, |b| !b.probe_only && b.seg_id == args.SegmentId as u32);
+    let is_bar = adapter.bar_segment.as_ref().map_or(false, |b| {
+        !b.probe_only && b.seg_id == args.SegmentId as u32
+    });
     if !is_bar {
         return STATUS_SUCCESS;
     }

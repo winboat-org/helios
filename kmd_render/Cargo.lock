@@ -304,6 +304,7 @@ version = "0.1.0"
 dependencies = [
  "bindgen",
  "bytemuck",
+ "cc",
  "helios_protocol",
  "virtio-drivers",
  "wdk",

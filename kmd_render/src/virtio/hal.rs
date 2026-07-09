@@ -74,6 +74,11 @@ impl DmaBuffer {
         // SAFETY: as above; `&mut self` guarantees exclusive access.
         unsafe { core::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
     }
+
+    /// Guest-physical base address suitable for virtio descriptor payloads.
+    pub fn physical_address(&self) -> u64 {
+        self.pa as u64
+    }
 }
 
 impl Drop for DmaBuffer {

@@ -375,9 +375,7 @@ unsafe fn bar_harvest_page_table(
     // aperture maps ever need placement-relative offsets).
     let n = u.NumPageTableEntries as u64;
     if n >= 2 {
-        let last = unsafe {
-            core::ptr::read_unaligned(u.pPageTableEntries.add((n - 1) as usize))
-        };
+        let last = unsafe { core::ptr::read_unaligned(u.pPageTableEntries.add((n - 1) as usize)) };
         let last_valid = unsafe { last.__bindgen_anon_1.__bindgen_anon_1 }.Valid() != 0;
         if last_valid && unsafe { last.__bindgen_anon_2.PageAddress } != page0 + (n - 1) {
             BAR_ERR_DISCONTIG.fetch_add(1, Ordering::Relaxed);
@@ -471,9 +469,7 @@ pub unsafe extern "C" fn dxgkddi_build_paging_buffer(
         PagingOp::DXGK_OPERATION_DISCARD_CONTENT => {
             // SAFETY: union arm selected by Operation.
             let d = unsafe { args.__bindgen_anon_1.DiscardContent.as_ref() };
-            if d.SegmentId == bar.seg_id
-                && unsafe { paging_alloc_info(d.hAllocation) }.is_some()
-            {
+            if d.SegmentId == bar.seg_id && unsafe { paging_alloc_info(d.hAllocation) }.is_some() {
                 // Content lives in the blob; nothing to release here (aperture
                 // unmaps handle CPU visibility). Counted for the op census.
                 BAR_DISCARDS.fetch_add(1, Ordering::Relaxed);

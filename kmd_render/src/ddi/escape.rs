@@ -279,10 +279,11 @@ fn escape_query_stats(adapter: &AdapterContext, buf: &mut [u8]) -> NTSTATUS {
         return STATUS_BUFFER_TOO_SMALL;
     }
     let v2 = buf.len() >= sz2;
-    let (stats, fence_events_live) = match adapter.with_virtio(|v| (v.table_stats(), v.fence_events_live())) {
-        Ok(s) => s,
-        Err(de) => return de.into(),
-    };
+    let (stats, fence_events_live) =
+        match adapter.with_virtio(|v| (v.table_stats(), v.fence_events_live())) {
+            Ok(s) => s,
+            Err(de) => return de.into(),
+        };
     let mut out: HeliosEscapeQueryStats = pod_read_unaligned(&buf[..sz]);
     out.out_window_used = stats.window_used;
     out.out_window_len = stats.window_len;
@@ -506,8 +507,7 @@ fn escape_map_blob(adapter: &AdapterContext, buf: &mut [u8], owner: usize) -> NT
     let (user_va, mdl) = match unsafe { map_io_pages_to_user(prep.gpa, prep.size, cache) } {
         Some(x) => x,
         None => {
-            crate::virtio::gpu::MAP_PAGES_FAILS
-                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            crate::virtio::gpu::MAP_PAGES_FAILS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             return STATUS_INSUFFICIENT_RESOURCES;
         }
     };

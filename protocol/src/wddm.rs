@@ -48,16 +48,16 @@ pub const HELIOS_WDDM_ALLOC_KIND_STANDARD: u32 = 2;
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub struct HeliosWddmAllocPrivate {
-    pub blob_id: u64,    // in:  venus device-memory id backing the blob (0 = scratch shmem)
-    pub size: u64,       // in:  blob size in bytes
-    pub magic: u32,      // == HELIOS_WDDM_MAGIC
-    pub version: u32,    // == HELIOS_WDDM_VERSION
-    pub blob_mem: u32,   // in:  VIRTIO_GPU_BLOB_MEM_* (HOST3D)
+    pub blob_id: u64, // in:  venus device-memory id backing the blob (0 = scratch shmem)
+    pub size: u64,    // in:  blob size in bytes
+    pub magic: u32,   // == HELIOS_WDDM_MAGIC
+    pub version: u32, // == HELIOS_WDDM_VERSION
+    pub blob_mem: u32, // in:  VIRTIO_GPU_BLOB_MEM_* (HOST3D)
     pub blob_flags: u32, // in:  VIRTIO_GPU_BLOB_FLAG_* (USE_MAPPABLE)
-    pub ctx_id: u32,     // in:  owning venus context id
-    pub map_cache: u32,  // in/out: requested/effective VIRTIO_GPU_MAP_CACHE_*
-    pub kind: u32,       // in:  HELIOS_WDDM_ALLOC_KIND_*
-    pub _pad: u32,       // in:  optional existing virtio resource id to adopt
+    pub ctx_id: u32,  // in:  owning venus context id
+    pub map_cache: u32, // in/out: requested/effective VIRTIO_GPU_MAP_CACHE_*
+    pub kind: u32,    // in:  HELIOS_WDDM_ALLOC_KIND_*
+    pub _pad: u32,    // in:  optional existing virtio resource id to adopt
 }
 
 impl HeliosWddmAllocPrivate {
@@ -213,8 +213,41 @@ pub struct HeliosWddmOpenIdentity {
 impl HeliosWddmOpenIdentity {
     #[inline]
     pub fn is_valid(&self) -> bool {
-        self.magic == HELIOS_WDDM_IDENTITY_MAGIC
-            && self.version == HELIOS_WDDM_IDENTITY_VERSION
+        self.magic == HELIOS_WDDM_IDENTITY_MAGIC && self.version == HELIOS_WDDM_IDENTITY_VERSION
+    }
+}
+
+/// `'HPRS'` — magic of [`HeliosPresentPrivateData`].
+pub const HELIOS_PRESENT_PRIVATE_MAGIC: u32 = 0x4850_5253;
+/// Current present-private-data ABI version.
+pub const HELIOS_PRESENT_PRIVATE_VERSION: u32 = 1;
+
+/// Private payload carried through `DXGIDDICB_PRESENT::pPrivateDriverData` to
+/// `DxgkDdiPresent`.
+///
+/// This is a normal DXGI present callback contract field, not an escape path. It
+/// is used when dxgkrnl calls the KMD present hook without populating source
+/// allocation-list entries for the composed DWM scanout allocation.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct HeliosPresentPrivateData {
+    pub plane_offset: u64,
+    pub magic: u32,
+    pub version: u32,
+    pub resource_id: u32,
+    pub width: u32,
+    pub height: u32,
+    pub pitch: u32,
+    pub dxgi_format: u32,
+    pub reserved: u32,
+}
+
+impl HeliosPresentPrivateData {
+    #[inline]
+    pub fn is_valid(&self) -> bool {
+        self.magic == HELIOS_PRESENT_PRIVATE_MAGIC
+            && self.version == HELIOS_PRESENT_PRIVATE_VERSION
+            && self.resource_id != 0
     }
 }
 
@@ -222,6 +255,7 @@ const _: () = {
     assert!(core::mem::size_of::<HeliosWddmAllocPrivate>() == 48);
     assert!(core::mem::size_of::<HeliosWddmCmdBuf>() == 32);
     assert!(core::mem::size_of::<HeliosWddmAllocMeta>() == 48);
+    assert!(core::mem::size_of::<HeliosPresentPrivateData>() == 40);
     // The identity record must fit exactly over the HeliosWddmAllocPrivate
     // region so the meta trailer's offset is unchanged for openers.
     assert!(

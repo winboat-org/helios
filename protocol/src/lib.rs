@@ -20,10 +20,10 @@
 #![no_std]
 #![allow(non_camel_case_types, non_upper_case_globals)]
 
-pub mod virtio_gpu;
 pub mod escape;
 pub mod features;
 pub mod ioctl;
+pub mod virtio_gpu;
 pub mod wddm;
 
 pub use escape::*;

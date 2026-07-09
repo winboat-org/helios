@@ -42,8 +42,6 @@ use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use bytemuck::Zeroable;
-use wdk_sys::ntddk::{KeInitializeEvent, KeSetEvent, ObDereferenceObjectDeferDelete};
-use wdk_sys::{KEVENT, PVOID};
 use helios_protocol::{
     resp_is_ok, VirtioGpuCmdSubmit, VirtioGpuCtrlHdr, VirtioGpuRespDisplayInfo,
     HELIOS_OPTIONAL_FEATURES, HELIOS_REQUIRED_FEATURES, VIRTIO_GPU_CMD_GET_DISPLAY_INFO,
@@ -55,6 +53,8 @@ use virtio_drivers::transport::pci::bus::{ConfigurationAccess, DeviceFunction, P
 use virtio_drivers::transport::pci::PciTransport;
 use virtio_drivers::transport::{DeviceStatus, Transport};
 use virtio_drivers::Hal;
+use wdk_sys::ntddk::{KeInitializeEvent, KeSetEvent, ObDereferenceObjectDeferDelete};
+use wdk_sys::{KEVENT, PVOID};
 
 use super::config::DxgkConfigAccess;
 use super::hal::{DmaBuffer, WdkHal};
@@ -541,7 +541,9 @@ impl SyncWaitBlock {
 enum InFlightKind {
     /// A synchronous control command; `waiter` (if any) is signaled on
     /// completion. `None` = the waiter timed out and abandoned the entry.
-    Sync { waiter: Option<NonNull<SyncWaitBlock>> },
+    Sync {
+        waiter: Option<NonNull<SyncWaitBlock>>,
+    },
     /// An async fenced SUBMIT_3D carrying `fence_id` (KMD-assigned wire id).
     /// `ring_idx` 0 = host CPU ring (retires at decode); >= 1 = a per-queue
     /// GPU-completion fence (virglrenderer vkr sync thread) that legally stays
@@ -830,8 +832,8 @@ impl VirtioGpu {
             let outputs: &mut [&mut [u8]] = &mut [&mut resp_buf[..resp_len]];
             // SAFETY: the scratch-page buffers stay valid for the whole block;
             // on timeout we bail out of init and never reuse this queue.
-            let token = unsafe { control.add(inputs, outputs) }
-                .map_err(|_| VirtioError::DeviceError)?;
+            let token =
+                unsafe { control.add(inputs, outputs) }.map_err(|_| VirtioError::DeviceError)?;
             if control.should_notify() {
                 transport.notify(CTRL_QUEUE);
             }
@@ -859,15 +861,12 @@ impl VirtioGpu {
         // 0×0 / not-yet-configured scanout falls back to the default in
         // StartDevice). Recorded so the host's report is visible live.
         let m0 = resp.pmodes[0].r;
-        let display_mode = if m0.width >= 320
-            && m0.height >= 240
-            && m0.width <= 16384
-            && m0.height <= 16384
-        {
-            Some((m0.width, m0.height))
-        } else {
-            None
-        };
+        let display_mode =
+            if m0.width >= 320 && m0.height >= 240 && m0.width <= 16384 && m0.height <= 16384 {
+                Some((m0.width, m0.height))
+            } else {
+                None
+            };
         crate::diag::record_named_bytes(
             b"DpInf",
             (m0.width.min(0xFFFF) << 16) | (m0.height & 0xFFFF),
@@ -969,8 +968,11 @@ impl VirtioGpu {
             .checked_add(in1_len)
             .and_then(|n| n.checked_add(resp_len));
         match total {
-            Some(t) if in0_len > 0 && resp_len > 0 && resp_len <= SYNC_RESP_MAX
-                && t <= meta.as_slice().len() => {}
+            Some(t)
+                if in0_len > 0
+                    && resp_len > 0
+                    && resp_len <= SYNC_RESP_MAX
+                    && t <= meta.as_slice().len() => {}
             _ => return Err((meta, VirtioError::DeviceError)),
         }
         if self.inflight.len() >= MAX_INFLIGHT || self.parked.len() >= PARKED_ENQUEUE_GATE {
@@ -983,10 +985,8 @@ impl VirtioGpu {
         // moves the owning struct, not the DMA bytes). The borrows end at `add`.
         let added = unsafe {
             let in0 = core::slice::from_raw_parts(base, in0_len);
-            let resp = core::slice::from_raw_parts_mut(
-                base.add(in0_len + in1_len) as *mut u8,
-                resp_len,
-            );
+            let resp =
+                core::slice::from_raw_parts_mut(base.add(in0_len + in1_len) as *mut u8, resp_len);
             if in1_len > 0 {
                 let in1 = core::slice::from_raw_parts(base.add(in0_len), in1_len);
                 self.control.add(&[in0, in1], &mut [resp])
@@ -1073,8 +1073,7 @@ impl VirtioGpu {
         let added = unsafe {
             let hdr = core::slice::from_raw_parts(meta_base, hdr_len);
             let stream = core::slice::from_raw_parts(venus_base, venus_len);
-            let resp =
-                core::slice::from_raw_parts_mut(meta_base.add(hdr_len) as *mut u8, resp_len);
+            let resp = core::slice::from_raw_parts_mut(meta_base.add(hdr_len) as *mut u8, resp_len);
             self.control.add(&[hdr, stream], &mut [resp])
         };
         let token = match added {
@@ -1348,11 +1347,7 @@ impl VirtioGpu {
     /// Ownership: on `Registered` the TABLE owns the caller's object
     /// reference (released by the drain / unregister / teardown). On every
     /// other outcome the caller still owns it and must deref.
-    pub fn fence_event_register(
-        &mut self,
-        fence_id: u64,
-        event: NonNull<KEVENT>,
-    ) -> FenceEventReg {
+    pub fn fence_event_register(&mut self, fence_id: u64, event: NonNull<KEVENT>) -> FenceEventReg {
         if fence_id == 0 || fence_id >= self.next_wire_fence {
             return FenceEventReg::Invalid;
         }
@@ -1448,7 +1443,8 @@ impl VirtioGpu {
             self.wddm_pending.clear();
             return true;
         }
-        self.wddm_pending.push_back(WddmPending { fence, watermark });
+        self.wddm_pending
+            .push_back(WddmPending { fence, watermark });
         false
     }
 
@@ -1592,9 +1588,10 @@ impl VirtioGpu {
         ctx_id: u32,
         resource_id: u32,
     ) -> Option<(u32, bool, u64, u64)> {
-        let idx = self.blobs.iter().position(|s| {
-            s.owner == owner && s.ctx_id == ctx_id && s.resource_id == resource_id
-        })?;
+        let idx = self
+            .blobs
+            .iter()
+            .position(|s| s.owner == owner && s.ctx_id == ctx_id && s.resource_id == resource_id)?;
         let slot = self.blobs.swap_remove(idx);
         Some((slot.resource_id, slot.mapped, slot.map_offset, slot.map_len))
     }
@@ -1696,9 +1693,11 @@ impl VirtioGpu {
         let Some(window) = self.host_visible else {
             return BlobMapBegin::Failed(VirtioError::DeviceError);
         };
-        let Some(idx) = self.blobs.iter().position(|s| {
-            s.resource_id == resource_id && owner.map_or(true, |o| s.owner == o)
-        }) else {
+        let Some(idx) = self
+            .blobs
+            .iter()
+            .position(|s| s.resource_id == resource_id && owner.map_or(true, |o| s.owner == o))
+        else {
             return BlobMapBegin::Failed(VirtioError::DeviceError);
         };
         if self.blobs[idx].mapped {
@@ -1740,9 +1739,11 @@ impl VirtioGpu {
         len: u64,
         cache: Option<u32>,
     ) -> BlobMapFinish {
-        let Some(idx) = self.blobs.iter().position(|s| {
-            s.resource_id == resource_id && s.map_pending && s.map_offset == offset
-        }) else {
+        let Some(idx) = self
+            .blobs
+            .iter()
+            .position(|s| s.resource_id == resource_id && s.map_pending && s.map_offset == offset)
+        else {
             // Owner teardown raced the round-trip and took the slot. The caller
             // must undo the host mapping (UNMAP round-trip) and then return the
             // range via `free_window_range_pub`.
@@ -1823,7 +1824,9 @@ impl VirtioGpu {
         // The target range must sit entirely inside the VidMm partition —
         // anything else would collide with the KMD-side offset allocator.
         if offset % BLOB_PAGE != 0
-            || offset.checked_add(map_len).map_or(true, |e| e > self.vidmm_reserved)
+            || offset
+                .checked_add(map_len)
+                .map_or(true, |e| e > self.vidmm_reserved)
         {
             return BlobRemapBegin::Failed(VirtioError::DeviceError);
         }
@@ -1916,11 +1919,7 @@ impl VirtioGpu {
             ADOPT_DEAD_REJECTS.fetch_add(1, Ordering::Relaxed);
             return false;
         }
-        if let Some(slot) = self
-            .blobs
-            .iter_mut()
-            .find(|s| s.resource_id == resource_id)
-        {
+        if let Some(slot) = self.blobs.iter_mut().find(|s| s.resource_id == resource_id) {
             slot.owner = 0;
         }
         true
@@ -2053,7 +2052,6 @@ impl VirtioGpu {
     pub fn isr_status_addr(&self) -> usize {
         self.isr_status_va
     }
-
 }
 
 impl Drop for VirtioGpu {
