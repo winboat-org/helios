@@ -1,117 +1,70 @@
 # ROADMAP — Stage: Performance, Stability, Conformance (PSC)
 
-*Started 2026-07-05, the day the desktop first rendered end-to-end under Helios
-(DWM composites on Helios → venus → host GPU → IddCx → Looking Glass). Bring-up
-is over; this stage makes it reliable, fast, and D3D11-conformant. Archived
-bring-up knowledge lives in `docs/archive/`; operational debug knowledge stays
-in `NTOSEYE.md` and `BRINGUP_QUIRKS.md`.*
+*The desktop first rendered end-to-end on 2026-07-05. The active architecture
+changed on 2026-07-09: Helios is now a WDDM render+display adapter and owns the
+virtio-gpu scanout; IddCx/Looking Glass is no longer the active display path.*
 
-## Verified baseline (2026-07-05, KMD 22.22.50)
+## Current verified baseline (2026-07-11, KMD 22.22.140.0)
 
-- Adapter binds `CM_PROB_NONE` across cold boots and `devcon restart`.
-- Segment topology: aperture (id 1) + **BAR window head as CpuHostAperture
-  memory segment (id 2, 1 GiB)** — `BarSegMode 10`, the compiled default.
-  Rule discovered via ETW: dxgmms requires a SupportsCpuHostAperture segment
-  to be the LAST segment; the classic CpuVisible shape is rejected outright.
-- Desktop renders: solid-color plate, icons with ClearType labels, taskbar/tray
-  text, live window updates, regedit classic-GDI text. dwm/explorer on
-  `helios_umd.dll` (no WARP).
-- Doom 2016 previously verified 120+ fps through venus on the NVIDIA host
-  (offscreen path; pre-WDDM-desktop milestone).
+- `DisplayHalf=1` exposes one connected child and one VidPn source. DWM composes
+  the whole desktop on Helios and `SetVidPnSourceAddress` selects the real
+  primary for `SET_SCANOUT_BLOB`.
+- `ScanoutDiag` is **deleted/off**. Mode 16 remains a diagnostic only and must
+  never overwrite the real primary during a desktop test.
+- The LINEAR diagnostic image is proven on NVIDIA. The old failure was a guest
+  constant bug (`VK_IMAGE_TILING_LINEAR` was encoded as `0`; it is `1`). After
+  the fix, same-boot breadcrumbs reached `SdgLStg=0x10`, host-visible/coherent
+  memory was selected, and the owner saw its fill pattern in VNC.
+- The real DWM primary is a dedicated, DMA_BUF-exportable Venus
+  `VK_IMAGE_TILING_OPTIMAL` allocation. The UMD marks the actual
+  `CDD_SHAREDPRIMARYSURFACE`; the KMD uses that allocation in
+  `SetVidPnSourceAddress`. There is no heuristic selection and no guest-side
+  primary-to-scanout copy.
+- The QEMU fork propagates virglrenderer DMA_BUF modifier metadata and the
+  existing `RESOURCE_CREATE_BLOB.size` internally, without changing the public
+  virtio-gpu wire ABI. Plain OPTIMAL exports currently arrive as
+  `DRM_FORMAT_MOD_INVALID`; EGL cannot describe that layout. QEMU reconstructs
+  the exact producer VkImage, verifies its Vulkan memory requirement equals the
+  original blob allocation size, copies image-to-staging on the host GPU, and
+  publishes a CPU `DisplaySurface` to VNC. This is direct guest-primary scanout,
+  but **not end-to-end zero-copy** because the host display backend reads back.
+- Visible desktop output is verified. A DComp scheduled-task probe completed
+  1576 Presents in 25 seconds (63.0 fps). All three rotating primary buffers
+  advanced at about 63 fps; measured 1280x800 host readback was 0.5–1.1 ms.
+  Therefore the earlier 2.4 fps symptom is not present in the driver cadence;
+  remaining perceived lag must be measured at VNC/network/client boundaries.
+- The old synchronous KMD `RESOURCE_FLUSH` control roundtrip is gone from the
+  frame path. One interrupt-completed async bind/flush is allowed in flight and
+  later flips coalesce. Control DMA buffers are reaped/reused outside the
+  spinlock. Mesa's Windows ring notifies an idle renderer eagerly, folds
+  side-effect-free wait-only timeline submits on the guest, and reuses its
+  escape staging buffer; per-submit shape logging is opt-in.
+- The same exact OPTIMAL Vulkan fallback is shared by `egl-headless`, GTK EGL,
+  GTK GLArea, and SDL OpenGL. `egl-headless`+VNC is visually verified; GTK and
+  SDL are compile/link verified but not visually tested in the remote-only setup.
 
-## Current priorities (2026-07-07, 33rd session — owner-set, in order)
+## Current priorities
 
-These supersede the day-to-day defect lists below where they conflict; the
-workstream sections hold the detailed evidence.
+1. Soak the current direct-primary path across DWM buffer rotation, resize,
+   suspend/resume, device restart, and cold boot. Treat a moved same-boot
+   breadcrumb plus visible output as evidence; persistent registry names alone
+   are not evidence.
+2. Profile end-to-end VNC latency if interaction still feels slow. Do not infer a
+   guest/KMD problem from remote-client latency while the DComp and flush cadence
+   remain near 60 Hz.
+3. Pursue true host zero-copy only with a layout contract the display importer
+   can consume. An explicit DRM modifier is one possible route, but enabling the
+   modifier/DMA_BUF extensions on every DXVK device is prohibited: it inflated
+   ordinary shared OPTIMAL import requirements and caused valid undersized-import
+   refusal, DWM failures, and NVIDIA Xid 31 when bypassed.
+4. Continue D3D11 stability and conformance work after display soak.
 
-### Display Pivot State (2026-07-09, handoff for next session)
+## Historical PSC workstreams
 
-Owner pivoted Helios from render-only + IDD/LG capture to a real render+display
-adapter. IDD and DoD-style paths are explicitly out of scope. Current target:
-Helios owns the virtio-gpu display output and QEMU exposes it through
-`egl-headless` + VNC. Long-term scanout path remains `SET_SCANOUT_BLOB`.
-
-**Most important external proof:** the host/QEMU/NVIDIA `egl-headless` path is
-not the blocker. A CachyOS guest/userspace experiment with the same QEMU Venus
-shape displayed correctly in VNC when the guest created a scanout blob matching
-Linux's working pattern:
-
-- Vulkan image: `VK_IMAGE_TILING_LINEAR`, external DMA_BUF image memory,
-  host-visible/coherent memory, exportable as DMA_BUF.
-- Virtio resource: `VIRTIO_GPU_BLOB_MEM_HOST3D` with
-  `USE_MAPPABLE | USE_SHAREABLE`, `blob_id != 0` (the Venus `VkDeviceMemory`
-  handle), then `SET_SCANOUT_BLOB`.
-- KMS/scanout metadata: `DRM_FORMAT_XRGB8888` / virtio XR24
-  (`VIRTIO_GPU_FORMAT_B8G8R8X8_UNORM`), no modifier, stride 5120 for
-  1280x720/1280x800-class tests where applicable.
-- QEMU trace shape for success: `create_blob ... blob_mem=2 blob_flags=0x3
-  blob_id=<nonzero>`, then `set_scanout_blob ... fmt=0x2 strides=...`, then
-  `scanout dmabuf ... fourcc=0x34325258`, then `egl-headless scanout_dmabuf`.
-
-Negative evidence from the same run: raw guest/shared blobs and raw
-`HOST3D|MAPPABLE` blobs can produce fds/mappings, but they are not sufficient
-for the NVIDIA `egl-headless` scanout path. The successful path is an
-image-backed Venus allocation, not just memory sized like an image.
-
-Windows state at handoff:
-
-- KMD 22.22.115.0 was built/installed/booted. It adds an experimental
-  shared-primary path that tries `allocate_linear_scanout_image_blob()` for the
-  primary, plus `vkDestroyImage` teardown tracking.
-- The active display path is still not correct. VNC shows incorrect/partial
-  scanout. Earlier corruption from smaller AR24 intermediate surfaces was
-  mitigated by refusing non-mode/non-XR24 scanout candidates (`CScSet=13`) and
-  by making Present/HWQ scanout diagnostic-only (`PScSet=13`), but the primary
-  content/layout issue remains.
-- `ScanoutDiag=16` failed early with the opaque `SdgErr=2` (=
-  `allocate_linear_scanout_image_blob` returned an inner Err with no stage info).
-- Beware stale evidence: registry fixed names persist across boots, and after a
-  guest reboot under the same QEMU process, traces showed `RESOURCE_FLUSH res=4`
-  before the new boot recreated resource 4. Trust a fresh QEMU log slice
-  containing `create_blob` + `SET_SCANOUT_BLOB` for the same boot over registry
-  values alone.
-
-**39th session (2026-07-10) — ROOT CAUSE FOUND & FIXED (one-line), KMD
-22.22.117.0 STAGED (restart_vm=false), AWAITING REBOOT to verify.**
-
-The bug: `kmd_render/src/virtio/venus.rs:106` defined
-`const IMAGE_TILING_LINEAR: u32 = 0;` — but `0 = VK_IMAGE_TILING_OPTIMAL`;
-`VK_IMAGE_TILING_LINEAR = 1`. So `create_linear_scanout_image` had been building a
-**tiled (OPTIMAL) image**, whose `memoryTypeBits` on NVIDIA are device-local-only
-(`0x3`, no host-visible), so `choose_host_visible_memory_type` returned None →
-`SdgErr=2` at stage 3. **Fixed to `1`** (the only use site is line 864).
-
-How it was pinned (method worth reusing):
-1. Instrumented `allocate_linear_scanout_image_blob` with fixed-name breadcrumbs
-   (`SdgLStg` stage, `SdgLBit`/`SdgLTyc`/`SdgLReq`, `SdgLImg`/`SdgLMem` VkResults,
-   `SdgDevX`/`SdgDevR` device-ext tier) — read via `reg query`, S-ring-independent.
-   Booted .116: `SdgLStg=3`, `SdgLBit=0x3`, `SdgDevX=0` (device got FULL exts →
-   the device-ext-fallback theory was WRONG/exonerated; that ladder change is
-   benign and stays). Failure = no host-visible memory type for the image.
-2. Falsified the follow-on "NVIDIA can't host-visible-map LINEAR external images"
-   theory by DIRECT test: CachyOS live ISO, venus on the **same NVIDIA GPU**
-   (renderD128, RTX PRO 6000 Blackwell), ran `/tmp/vk-dmabuf-scanout.c` — reported
-   `typebits=0xf`, `SET_CRTC` succeeded, **color bars displayed in VNC**. NVIDIA +
-   Mesa venus works; the bug is 100% guest-KMD.
-3. A/B on the working Mesa stack: adding the KMD's extra device exts kept
-   `typebits=0xf` (exts exonerated); flipping the probe image to
-   `VK_IMAGE_TILING_OPTIMAL` reproduced the KMD's **exact** signature
-   (`typebits=0x3` + "no host-visible compatible memory type"). → tiling constant.
-
-Also confirmed same session: the KMD's own `fill_bgra_bars` pattern
-(magenta/green/white/checker) displays on the NVIDIA VNC via a blob scanout path
-(owner screenshot) — the `set_scanout_blob` → egl-headless dmabuf transport works
-on NVIDIA; only the mode-16 image *allocation* was blocked.
-
-Next step (post-reboot on .117): set `DisplayHalf=1`,`ScanoutDiag=16` (already
-set), reboot, then `reg query
-"HKLM\SYSTEM\CurrentControlSet\Services\helios_kmd_render"` — expect `SdgLStg`
-to reach `0x10`, `SdgLBit` to become host-visible-inclusive (e.g. `0xf`),
-`SdgSet=1`/`SdgFlu=1`; and confirm same-boot `/tmp/helios-qemu-stderr.log` shows
-`create_blob blob_mem=2 blob_flags=0x3 blob_id=<nonzero>` + `set_scanout_blob
-fmt=0x2` + `scanout dmabuf fourcc=0x34325258` + `egl-headless scanout_dmabuf`.
-Then wire the same LINEAR-image scanout into the real shared primary (not just the
-diagnostic). Memory: `scanout-linear-stage-instrumentation-39th`.
+The dated IDD/Looking Glass investigations below explain how the display pivot
+was reached. They are historical evidence, not descriptions of the active
+display architecture, and are superseded by the baseline above wherever they
+conflict.
 
 1. **D3D11 windowed apps render transparent — investigate & fix.** Windowed
    D3D11 swapchains (FaceWorks, Fire Strike windowed) show a transparent/black
@@ -1517,7 +1470,8 @@ Plan:
   CPU-filled cross-device image/blob variants; `11` and `16` use XR24; `12`
   and `13` test guest/host3d-guest blob memory; `14`/`15` test virgl HOST3D
   guest scanout helpers; `16` is the Linux/CachyOS-style LINEAR external DMA_BUF
-  image path. Current Windows result: `ScanoutDiag=16` fails with `SdgErr=2`.
+  image path. Mode 16 is verified working after the tiling-constant fix, but the
+  active value must remain absent/0 so it cannot overwrite the DWM primary.
 - **Scanout counters** (service key fixed names): `Sc*` =
   `SetVidPnSourceAddress` scanout, `CSc*` = create-time scanout bind attempt,
   `PSc*` = Present/HWQ diagnostic-only scanout candidate, `Sdg*` = diagnostic
@@ -1528,13 +1482,14 @@ Plan:
   AE* (8-slot allocation create/open ring: resid, dimensions, ctx/open marker)
   — all failure counters must stay 0; S-ring breadcrumbs persist across boots
   and high indices go stale after short boots.
-- **Launcher/display workarounds**: `tools/launch-helios-gtk.sh` now supports
+- **Launcher/display path**: `tools/launch-helios-gtk.sh` supports
   `HELIOS_DISPLAY=egl-vnc` for `-display egl-headless` + VNC, intended as the
-  reliable display-output inspection path. `HELIOS_QEMU_RENDER_GPU=nvidia` is
-  the current owner preference; render node defaults are tracked in the script.
-  `HELIOS_EGL_FORCE_LINEAR=1` was disabled in-script because the EGL shim crashed
-  NVIDIA imports. `HELIOS_QEMU_DMABUF_LINEAR_MOD=1` LD_PRELOADs the QEMU dmabuf
-  linear-mod shim for host experiments only. `HELIOS_QEMU_TRACE` can enable
+  reliable display-output inspection path. It uses the `qemu-helios` submodule
+  build, whose egl-headless/GTK/SDL OpenGL backends share exact OPTIMAL Vulkan
+  readback when EGL cannot import a modifier-less native image.
+  `HELIOS_QEMU_RENDER_GPU=nvidia` is the current owner preference; render-node
+  defaults are tracked in the script. The old force-LINEAR LD_PRELOAD shims were
+  experiments, not supported display paths. `HELIOS_QEMU_TRACE` can enable
   `virtio_gpu_cmd_set_scanout_blob`, `virtio_gpu_cmd_res_flush`,
   `virtio_gpu_cmd_res_create_blob`, and `virtio_gpu_cmd_ctx_submit`; the trace
   file `/tmp/helios-qemu-stderr.log` is ground truth for scanout shape.

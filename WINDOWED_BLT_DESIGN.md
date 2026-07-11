@@ -1,5 +1,10 @@
 # WINDOWED_BLT_DESIGN.md — Legacy BLT-model windowed present on Helios (priority #1)
 
+> **RESOLVED/HISTORICAL (2026-07-11):** this investigation motivated the display
+> pivot. Helios now owns a real VidPn source and virtio-gpu scanout; IddCx and its
+> facade output are no longer the active topology. The evidence below explains
+> the old BLT occlusion, but its proposed stages are not current work items.
+
 **Status:** root-caused end-to-end (2026-07-08, 34th session). This doc is the
 design + implementation plan for the fix. It is grounded in the Microsoft driver
 docs under `windows-driver-docs-research-only/windows-driver-docs-pr/display/`

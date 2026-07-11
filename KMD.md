@@ -1,11 +1,11 @@
 # KMD.md — Kernel-Mode Driver Implementation Guide
 
-> **⚠️ SUPERSEDED (2026-07-05) — ARCHIVED REFERENCE ONLY.** This guide covers the
+> **⚠️ SUPERSEDED (updated 2026-07-11) — HISTORICAL REFERENCE ONLY.** This guide covers the
 > abandoned System-class KMDF `kmd/` crate (IOCTL device interface, no dxgkrnl).
-> The active kernel driver is the **WDDM 3.2 render-only miniport `kmd_render/`**:
+> The active kernel driver is the **WDDM 3.2 render+display miniport `kmd_render/`**:
 > it binds via dxgkrnl, implements the full DDI table (`query_adapter_info`,
 > `create_allocation`, `build_paging_buffer`, `submit_command`, `escape`, …), and
-> uses GpuMmu + monitored fences + CpuHostAperture segments + venus-over-
+> uses VidPn/scanout DDIs + GpuMmu + monitored fences + CpuHostAperture segments + venus-over-
 > `D3DKMTEscape`. **CLAUDE.md and ROADMAP.md are authoritative** (references below
 > to `ARCH.md` as "canonical" are stale — ARCH.md is itself archived).
 

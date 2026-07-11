@@ -6,6 +6,11 @@ records how to use it for Helios bring-up debugging and the **quirks that will w
 if you don't know them. Pairs with [BRINGUP_QUIRKS.md](BRINGUP_QUIRKS.md) (build/deploy/VM
 mechanics) — read both before a debug session.
 
+> **Architecture note (2026-07-11):** the current KMD is a live render+display
+> adapter. Dated examples below that call it render-only or assume an IddCx
+> output describe earlier bring-up configurations; do not use those claims to
+> justify present-day disable/restart operations.
+
 > Hard-won during the Step-2 GpuMmu bring-up (2026-06-18/19), where it root-caused the Code-43
 > failure to `dxgmms2!VidSchTerminateAdapter`. See the `step2-gpummu-implemented` memory.
 

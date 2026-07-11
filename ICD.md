@@ -1,5 +1,11 @@
 # ICD.md — Vulkan ICD Implementation Guide
 
+> **CURRENT ARCHITECTURE NOTE (2026-07-11):** the active ICD is the Mesa Venus
+> fork at `icd/mesa`, reached through the WDDM miniport's escape/submit paths.
+> Helios is now a render+display adapter and owns virtio-gpu scanout; statements
+> below saying the KMD is not a display miniport or that Looking Glass is the
+> active output are historical. The ICD does not define the scanout protocol ABI.
+
 > **⚠️ The HAND-WRITTEN ICD described below is SUPERSEDED by a port of Mesa's `venus` driver** (ARCH.md §5; `mesa-venus-icd-port` memory). The chosen ICD reuses Mesa's mature, byte-correct `vn_protocol_driver_*` Venus encoder and adds only a `vn_renderer_helios.c` backend over the IOCTL channel — we do **not** hand-roll the encoder. Treat the encoder/instance/device sections here as background. What REMAINS authoritative is the **ICD↔KMD contract**: the Vulkan-loader registration (Khronos registry JSON), the required `vk_icd*` exports, and the `DeviceIoControl` / `GUID_DEVINTERFACE_HELIOS` transport (§2.2) that `vn_renderer_helios.c` drives.
 >
 > **➡️ The Phase 5 implementation brief is [`icd/PHASE5_HANDOVER.md`](icd/PHASE5_HANDOVER.md)** — start there. It has the concrete, verified port plan: the vn_renderer→IOCTL vtable mapping, the exact meson edits + `meson setup` command + configure gates, the hardcoded `vn_renderer_info` (Helios has no GET_CAPSET IOCTL), the MSVC `.def` export requirement, and the ranked risks (the ring-shmem `abort()` / `blob_id=0` re-verify first). Mesa is vendored as a submodule at `icd/mesa` (fork: github.com/rupansh/mesa-helios).

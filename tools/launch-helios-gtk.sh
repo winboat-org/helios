@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 # tools/launch-helios-gtk.sh — standalone QEMU for win11.
 #
-# Default mode keeps the original GTK GL console:
+# Default mode uses the SDL GL console:
 #   bash tools/launch-helios-gtk.sh
+#
+# GTK GL console:
+#   HELIOS_DISPLAY=gtk bash tools/launch-helios-gtk.sh
 #
 # Looking Glass mode adds KVMFR ivshmem + SPICE input and starts the git-built
 # client on the host:
@@ -20,6 +23,20 @@
 #
 # Host GPU used by QEMU/virglrenderer/Venus:
 #   HELIOS_QEMU_RENDER_GPU=nvidia HELIOS_DISPLAY=looking-glass bash tools/launch-helios-gtk.sh
+#
+# Headless QEMU GL scanout with VNC viewer transport:
+#   HELIOS_QEMU_RENDER_GPU=nvidia HELIOS_DISPLAY=egl-vnc bash tools/launch-helios-gtk.sh
+#
+# Override the QEMU binary, for example to compare stock QEMU:
+#   HELIOS_QEMU_BIN=/tmp/qemu-ref/build-helios/qemu-system-x86_64 HELIOS_DISPLAY=egl-vnc bash tools/launch-helios-gtk.sh
+#
+# Override QEMU's data directory for keymaps/ROMs:
+#   HELIOS_QEMU_DATADIR=/tmp/qemu-ref/pc-bios HELIOS_QEMU_BIN=/tmp/qemu-ref/build-helios/qemu-system-x86_64 bash tools/launch-helios-gtk.sh
+# Out-of-tree modular builds are detected beside HELIOS_QEMU_BIN. Override with:
+#   HELIOS_QEMU_MODULE_DIR=/tmp/qemu-ref/build-helios
+#
+# If another VNC server is holding 5900:
+#   HELIOS_VNC_ADDR=127.0.0.1:1 HELIOS_DISPLAY=egl-vnc bash tools/launch-helios-gtk.sh
 #
 # Temporarily boot without the Helios virtio-gpu PCI device:
 #   HELIOS_DISABLE_VIRTIO_GPU=1 HELIOS_DISPLAY=looking-glass bash tools/launch-helios-gtk.sh
@@ -46,7 +63,7 @@
 set -uo pipefail
 
 if [ "${HELIOS_PHASE:-}" != "user" ] && [ "$(id -u)" -ne 0 ]; then
-  exec sudo --preserve-env=HELIOS_DISPLAY,HELIOS_QEMU_RENDER_GPU,HELIOS_DISABLE_VIRTIO_GPU,HELIOS_INTEL_RENDER_NODE,HELIOS_NVIDIA_RENDER_NODE,HELIOS_LG_TRANSPORT,HELIOS_SPICE_PORT,HELIOS_KVMFR_DEV,HELIOS_KVMFR_SIZE,HELIOS_LG_CLIENT,HELIOS_LG_RENDER_GPU,HELIOS_LG_DISPLAY_SERVER,HELIOS_LG_RENDERER,HELIOS_LG_ALLOW_DMA,HELIOS_LG_START_CLIENT,HELIOS_LG_RESTART_CLIENT,HELIOS_LG_CLIENT_DELAY,HELIOS_LG_CLIENT_LOG,HELIOS_INT_ACTION,HELIOS_SMP,HELIOS_SOCKETS,HELIOS_CORES,HELIOS_THREADS,HELIOS_VKR_DEBUG,HELIOS_QEMU_LOG,HELIOS_KD_SERIAL,HELIOS_KD_SOCKET,DISPLAY,WAYLAND_DISPLAY,GDK_BACKEND,SDL_VIDEODRIVER \
+  exec sudo --preserve-env=HELIOS_DISPLAY,HELIOS_QEMU_BIN,HELIOS_QEMU_DATADIR,HELIOS_QEMU_MODULE_DIR,HELIOS_QEMU_RENDER_GPU,HELIOS_DISABLE_VIRTIO_GPU,HELIOS_INTEL_RENDER_NODE,HELIOS_NVIDIA_RENDER_NODE,HELIOS_LG_TRANSPORT,HELIOS_SPICE_PORT,HELIOS_VNC_ADDR,HELIOS_KVMFR_DEV,HELIOS_KVMFR_SIZE,HELIOS_LG_CLIENT,HELIOS_LG_RENDER_GPU,HELIOS_LG_DISPLAY_SERVER,HELIOS_LG_RENDERER,HELIOS_LG_ALLOW_DMA,HELIOS_LG_START_CLIENT,HELIOS_LG_RESTART_CLIENT,HELIOS_LG_CLIENT_DELAY,HELIOS_LG_CLIENT_LOG,HELIOS_INT_ACTION,HELIOS_SMP,HELIOS_SOCKETS,HELIOS_CORES,HELIOS_THREADS,HELIOS_VKR_DEBUG,HELIOS_QEMU_LOG,HELIOS_QEMU_TRACE,HELIOS_KD_SERIAL,HELIOS_KD_SOCKET,DISPLAY,WAYLAND_DISPLAY,GDK_BACKEND,SDL_VIDEODRIVER \
     bash "$0" "$@"
 fi
 
@@ -54,12 +71,24 @@ USER_NAME=${SUDO_USER:-rupansh}; USER_UID=$(id -u "$USER_NAME")
 DISK=/var/lib/libvirt/images/win11.qcow2; NVRAM=/var/lib/libvirt/qemu/nvram/win11_VARS.fd
 SWSRC=/var/lib/libvirt/swtpm/bfe8dc1f-8c5b-435c-8045-1ef3a5c19053/tpm2; TPMDIR=/tmp/helios-tpm; SHARE=/home/rupansh/helios-vgpu
 DISPLAY_MODE=${HELIOS_DISPLAY:-sdl}
+QEMU_BIN=${HELIOS_QEMU_BIN:-$SHARE/qemu-helios/build-helios/qemu-system-x86_64}
+QEMU_DATADIR=${HELIOS_QEMU_DATADIR:-$SHARE/qemu-helios/pc-bios}
+QEMU_MODULE_DIR_OVERRIDE=${HELIOS_QEMU_MODULE_DIR:-}
+if [ -z "$QEMU_MODULE_DIR_OVERRIDE" ] && [ -e "$(dirname "$QEMU_BIN")/ui-egl-headless.so" ]; then
+  QEMU_MODULE_DIR_OVERRIDE=$(dirname "$QEMU_BIN")
+fi
+if [ ! -x "$QEMU_BIN" ]; then
+  echo "missing executable QEMU binary: $QEMU_BIN" >&2
+  echo "build qemu-helios/build-helios or set HELIOS_QEMU_BIN explicitly" >&2
+  exit 1
+fi
 QEMU_RENDER_GPU=${HELIOS_QEMU_RENDER_GPU:-intel}
 DISABLE_VIRTIO_GPU=${HELIOS_DISABLE_VIRTIO_GPU:-0}
 INTEL_RENDER_NODE=${HELIOS_INTEL_RENDER_NODE:-/dev/dri/renderD129}
 NVIDIA_RENDER_NODE=${HELIOS_NVIDIA_RENDER_NODE:-/dev/dri/renderD128}
 LG_TRANSPORT=${HELIOS_LG_TRANSPORT:-kvmfr}
 SPICE_PORT=${HELIOS_SPICE_PORT:-5900}
+VNC_ADDR=${HELIOS_VNC_ADDR:-127.0.0.1:0}
 KVMFR_DEV=${HELIOS_KVMFR_DEV:-/dev/kvmfr0}
 KVMFR_SIZE=${HELIOS_KVMFR_SIZE:-536870912}
 LG_CLIENT=${HELIOS_LG_CLIENT:-$SHARE/LookingGlass/client/build/looking-glass-client}
@@ -120,13 +149,14 @@ if [ "${HELIOS_PHASE:-}" != "user" ]; then
   ip link set heltap0 master virbr0 && ip link set heltap0 up
   sudo -u "$USER_NAME" env HELIOS_PHASE=user XDG_RUNTIME_DIR=/run/user/$USER_UID \
     DISPLAY=${DISPLAY:-:0} WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-wayland-1} GDK_BACKEND=${GDK_BACKEND:-wayland,x11,*} SDL_VIDEODRIVER=${SDL_VIDEODRIVER:-wayland} \
-    HELIOS_DISPLAY="$DISPLAY_MODE" HELIOS_QEMU_RENDER_GPU="$QEMU_RENDER_GPU" HELIOS_DISABLE_VIRTIO_GPU="$DISABLE_VIRTIO_GPU" HELIOS_INTEL_RENDER_NODE="$INTEL_RENDER_NODE" HELIOS_NVIDIA_RENDER_NODE="$NVIDIA_RENDER_NODE" HELIOS_LG_TRANSPORT="$LG_TRANSPORT" HELIOS_SPICE_PORT="$SPICE_PORT" HELIOS_KVMFR_DEV="$KVMFR_DEV" \
+    HELIOS_DISPLAY="$DISPLAY_MODE" HELIOS_QEMU_RENDER_GPU="$QEMU_RENDER_GPU" HELIOS_DISABLE_VIRTIO_GPU="$DISABLE_VIRTIO_GPU" HELIOS_INTEL_RENDER_NODE="$INTEL_RENDER_NODE" HELIOS_NVIDIA_RENDER_NODE="$NVIDIA_RENDER_NODE" HELIOS_LG_TRANSPORT="$LG_TRANSPORT" HELIOS_SPICE_PORT="$SPICE_PORT" HELIOS_VNC_ADDR="$VNC_ADDR" HELIOS_KVMFR_DEV="$KVMFR_DEV" \
+    HELIOS_QEMU_BIN="$QEMU_BIN" HELIOS_QEMU_DATADIR="$QEMU_DATADIR" HELIOS_QEMU_MODULE_DIR="$QEMU_MODULE_DIR_OVERRIDE" \
     HELIOS_KVMFR_SIZE="$KVMFR_SIZE" HELIOS_LG_CLIENT="$LG_CLIENT" \
     HELIOS_LG_RENDER_GPU="$LG_RENDER_GPU" HELIOS_LG_DISPLAY_SERVER="$LG_DISPLAY_SERVER" HELIOS_LG_RENDERER="$LG_RENDERER" HELIOS_LG_ALLOW_DMA="$LG_ALLOW_DMA" \
     HELIOS_LG_START_CLIENT="$LG_START_CLIENT" HELIOS_LG_RESTART_CLIENT="$LG_RESTART_CLIENT" \
     HELIOS_LG_CLIENT_DELAY="$LG_CLIENT_DELAY" HELIOS_LG_CLIENT_LOG="$LG_CLIENT_LOG" \
     HELIOS_INT_ACTION="$INT_ACTION" HELIOS_SMP="$SMP" HELIOS_SOCKETS="$SOCKETS" HELIOS_CORES="$CORES" HELIOS_THREADS="$THREADS" \
-    HELIOS_VKR_DEBUG="${HELIOS_VKR_DEBUG:-}" HELIOS_QEMU_LOG="${HELIOS_QEMU_LOG:-}" \
+    HELIOS_VKR_DEBUG="${HELIOS_VKR_DEBUG:-}" HELIOS_QEMU_LOG="${HELIOS_QEMU_LOG:-}" HELIOS_QEMU_TRACE="${HELIOS_QEMU_TRACE:-}" \
     HELIOS_KD_SERIAL="$KD_SERIAL" HELIOS_KD_SOCKET="$KD_SOCKET" \
     bash "$0" &
   USER_PHASE_PID=$!
@@ -220,9 +250,11 @@ VIRTIOFSD_PID=$!
 /usr/bin/swtpm socket --tpmstate dir="$TPMDIR/state" --ctrl type=unixio,path="$TPMDIR/swtpm-sock" --tpm2 --daemon --pid file="$TPMDIR/swtpm.pid"
 sleep 1
 
-qemu_display_args=(-display sdl,gl=on)
+qemu_display_args=()
 qemu_lg_args=()
 qemu_gpu_args=()
+qemu_vnc_args=()
+qemu_trace_args=()
 qemu_env_prefix=(env)
 qemu_serial_args=()
 lg_client_args=()
@@ -260,6 +292,25 @@ elif [ "$QEMU_RENDER_GPU" != "default" ]; then
     exit 1
   fi
 fi
+
+case "$DISPLAY_MODE" in
+  sdl)
+    qemu_display_args=(-display sdl,gl=on)
+    ;;
+  gtk)
+    qemu_display_args=(-display gtk,gl=on)
+    ;;
+  spice-app)
+    qemu_display_args=(-display spice-app,gl=on)
+    ;;
+  looking-glass|egl-vnc|vnc)
+    # These modes are finalized after their transport-specific arguments.
+    ;;
+  *)
+    echo "unknown HELIOS_DISPLAY=$DISPLAY_MODE (expected sdl, gtk, spice-app, looking-glass, egl-vnc, or vnc)"
+    exit 1
+    ;;
+esac
 
 case "$KD_SERIAL" in
   pty)
@@ -401,6 +452,12 @@ if [ "$DISPLAY_MODE" = "looking-glass" ]; then
   fi
 fi
 
+if [ "$DISPLAY_MODE" = "egl-vnc" ] || [ "$DISPLAY_MODE" = "vnc" ]; then
+  qemu_display_args=(-display "$qemu_egl_headless")
+  qemu_vnc_args=(-vnc "$VNC_ADDR")
+  echo ">>> VNC display: $VNC_ADDR (127.0.0.1:0 is TCP 5900) <<<"
+fi
+
 if [ "$DISABLE_VIRTIO_GPU" = "1" ] || [ "$DISABLE_VIRTIO_GPU" = "yes" ]; then
   echo ">>> HELIOS_DISABLE_VIRTIO_GPU=$DISABLE_VIRTIO_GPU: omitting virtio-gpu-gl-pci device <<<"
   QEMU_GPU_LABEL="virtio-gpu disabled"
@@ -412,7 +469,7 @@ else
   QEMU_GPU_LABEL="virtio-gpu-gl-pci"
 fi
 
-echo ">>> QEMU ($DISPLAY_MODE, $QEMU_GPU_LABEL, host GPU: $QEMU_RENDER_GPU). Z:\\ = repo. SSH 192.168.122.120 <<<"
+echo ">>> QEMU ($DISPLAY_MODE, $QEMU_GPU_LABEL, host GPU: $QEMU_RENDER_GPU, bin: $QEMU_BIN, datadir: $QEMU_DATADIR). Z:\\ = repo. SSH 192.168.122.120 <<<"
 # Capture QEMU + virgl_render_server (vkr_log) stderr; render-server diagnostics
 # like "failed to look up object" / "mem fd export failed" land here. Optional
 # HELIOS_VKR_DEBUG (e.g. "validate" / "all") enables vkr debugging incl. host-side
@@ -423,7 +480,17 @@ echo ">>> QEMU/render-server stderr tee'd to $QEMU_LOG <<<"
 if [ -n "${HELIOS_VKR_DEBUG:-}" ]; then
   qemu_env_prefix+=("VKR_DEBUG=${HELIOS_VKR_DEBUG}")
 fi
-setsid "${qemu_env_prefix[@]}" /usr/bin/qemu-system-x86_64 \
+if [ -n "$QEMU_MODULE_DIR_OVERRIDE" ]; then
+  qemu_env_prefix+=("QEMU_MODULE_DIR=$QEMU_MODULE_DIR_OVERRIDE")
+fi
+if [ -n "${HELIOS_QEMU_TRACE:-}" ]; then
+  for trace_event in $HELIOS_QEMU_TRACE; do
+    qemu_trace_args+=(-trace "$trace_event")
+  done
+fi
+setsid "${qemu_env_prefix[@]}" "$QEMU_BIN" \
+  -L \
+  "$QEMU_DATADIR" \
   -name \
   guest=win11,debug-threads=on \
   -blockdev \
@@ -531,6 +598,7 @@ setsid "${qemu_env_prefix[@]}" /usr/bin/qemu-system-x86_64 \
   ICH9-LPC.noreboot=off \
   -watchdog-action \
   reset \
+  "${qemu_vnc_args[@]}" \
   -device \
   '{"driver":"virtio-balloon-pci","id":"balloon0","bus":"pci.4","addr":"0x0"}' \
   -d \
@@ -539,6 +607,7 @@ setsid "${qemu_env_prefix[@]}" /usr/bin/qemu-system-x86_64 \
   off \
   -msg \
   timestamp=on \
+  "${qemu_trace_args[@]}" \
   "${qemu_display_args[@]}" 2> >(tee -a "$QEMU_LOG" >&2) &
 QEMU_PID=$!
 while kill -0 "$QEMU_PID" 2>/dev/null; do

@@ -1,33 +1,32 @@
 # CLAUDE.md — Primary Implementor Instructions
 
-## Project: Helios vGPU — Windows WDDM render driver over virtio-gpu/Venus
+## Project: Helios vGPU — Windows WDDM render+display driver over virtio-gpu/Venus
 
 You are the **primary author** of this project. The human overseer has OS/driver/Rust expertise and
 will review your work, but you must drive all implementation decisions, write all code, and flag
 blockers proactively.
 
 **What Helios is (2026-07):** a Windows 11 guest graphics stack for QEMU/KVM on a Linux host.
-A **WDDM 3.2 render-only miniport** (`kmd_render/`, Rust) binds the virtio-gpu PCI device
+A **WDDM 3.2 render+display miniport** (`kmd_render/`, Rust) binds the virtio-gpu PCI device
 (PCI\VEN_1AF4&DEV_1050) and speaks **Venus** (Vulkan serialization) to the host's virglrenderer
 render server; a **D3D11 UMD** (`umd/`, Rust d3d10umddi frontend bridged via cxx to a forked
 **DXVK** engine at `dxvk-helios/`) gives dwm and apps D3D11 on top of the Mesa Venus ICD
-(`icd/mesa` fork); the desktop reaches the host through **Looking Glass** (IddCx indirect display
-`LookingGlass/idd` + KVMFR/ivshmem). The older System-class KMDF + DeviceIoControl driver (`kmd/`,
-hand-written `icd/src` tree) still exists as the proven offscreen-Venus reference but is not the
-active display path.
+(`icd/mesa` fork). Helios owns a real VidPn source and sends DWM's shared primary through
+`SET_SCANOUT_BLOB` to the in-tree **`qemu-helios/` fork**, normally displayed by
+`egl-headless` + VNC. IddCx/Looking Glass and the older System-class KMDF + DeviceIoControl
+driver (`kmd/`, hand-written `icd/src`) remain historical/reference paths, not the active display.
 
 ## Stage: Performance, Stability, Conformance (PSC) — since 2026-07-05
 
-The hardware-accelerated desktop MILESTONE IS MET: DWM composites the whole desktop on Helios →
-venus → host GPU, cold-boot-verified (KMD 22.22.50, BAR CpuHostAperture segment id 2,
-`BarSegMode 10`). Bring-up is over. The stage's charter, in priority order:
+The hardware-accelerated desktop milestone is met: DWM composites the whole desktop on Helios →
+Venus → host GPU → virtio-gpu scanout. The direct primary is visible through VNC on the
+current KMD/QEMU stack. The stage's charter, in priority order:
 
-1. **Stability** — IDD frame freeze, suspected early-fence signaling (host
-   `vkResetCommandPool`-while-pending VUs ↔ explorer DEVICE_LOST), dwm shared-resource creation
-   failures, TDR/recovery contracts. No hacks; loud failure over fake success.
-2. **Performance** — measure first (venus submit/fence latency, present-to-scanout), then remove
-   known costs: persistent-refresh staging, diagnostic probe overhead (gate diag behind a registry
-   kill-switch), capture-path tuning.
+1. **Stability** — direct-primary buffer rotation, resize, suspend/resume, device restart,
+   cold boot, DWM recovery, and TDR contracts. No hacks; loud failure over fake success.
+2. **Performance** — measure present-to-scanout and VNC delivery separately. The current DComp
+   probe and QEMU flush cadence are about 63 fps; do not attribute remote-client lag to the guest
+   without a regression in those measurements.
 3. **D3D11 conformance** — drive the noop-DDI hit counters to zero against real workloads,
    dxvk-tests / samples / 3DMark, DXGI format coverage, remaining 11.1 DDI plumbing.
 
@@ -98,7 +97,7 @@ helios-vgpu/
 │                             WDDM_*, DISPLAY*, PHASE*, HANDOFF_*). Read-only
 │                             history; code comments may cite them by name.
 │
-├── kmd_render/             ← ACTIVE: WDDM 3.2 render-only miniport (Rust, no_std)
+├── kmd_render/             ← ACTIVE: WDDM 3.2 render+display miniport (Rust, no_std)
 │   └── src/ddi/            ← DDI surface (query_adapter_info = caps/segments,
 │                             create_allocation, cpu_host_aperture, gdi_blit =
 │                             RenderGdi executor, build_paging_buffer, escape,
@@ -107,7 +106,8 @@ helios-vgpu/
 ├── umd/                    ← ACTIVE: D3D11 UMD (d3d10umddi frontend, cxx bridge)
 ├── dxvk-helios/            ← ACTIVE: forked DXVK engine (venus import model, GDI staging)
 ├── icd/mesa                ← ACTIVE: Mesa fork — Venus Vulkan ICD (build via win_meson)
-├── LookingGlass/           ← host client + idd/ (IddCx indirect display driver)
+├── qemu-helios/            ← ACTIVE: QEMU fork — modifier metadata + native OPTIMAL readback
+├── LookingGlass/           ← HISTORICAL: former IddCx capture path
 ├── protocol/               ← shared guest/host wire structs (builds on BOTH platforms)
 ├── tools/                  ← launcher, deploy scripts, guest probe .ps1 toolkit
 │

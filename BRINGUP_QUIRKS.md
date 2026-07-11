@@ -5,6 +5,11 @@ Every item here cost real time to discover. Pairs with [NTOSEYE.md](NTOSEYE.md) 
 debugging). The win11 guest IS the build host — drive it via the **win MCP** (`win_cargo`,
 `win_exec`), not raw ssh (see CLAUDE.md / TOOLCHAIN.md).
 
+> **Architecture note (2026-07-11):** Helios is now the live render+display
+> adapter and drives `SET_SCANOUT_BLOB` through `qemu-helios`. Sections describing
+> Code 43 on a render-only adapter or IddCx/Looking Glass behavior are dated
+> bring-up evidence, not safe assumptions for the current VM.
+
 > Captured during the Step-2 GpuMmu bring-up (2026-06-18/19). See the
 > `step2-gpummu-implemented` memory for the debugging narrative.
 

@@ -4,6 +4,10 @@ This file is the canonical deployment procedure. Do not rediscover KMD, UMD, or 
 mechanics during graphics debugging. Use the scripts, and fix the scripts if a new edge case is
 found.
 
+**Active display mode (2026-07-11):** Helios owns the VidPn/virtio-gpu output and
+the VM uses `qemu-helios`, normally with egl-headless + VNC. Looking Glass/IddCx
+instructions below are retained only for restoring or diagnosing the former mode.
+
 ## Rules
 
 - KMD, UMD, and Vulkan ICD deployment are separate operations.
@@ -13,8 +17,8 @@ found.
   catalog/package state and can leave Windows bound to stale or inconsistent package metadata.
 - ProgramData is the normal UMD/ICD hotplug location because those paths are selected by registry
   values read by new user-mode clients.
-- In Looking Glass IDD mode, keep `Looking Glass (host)` stopped/disabled. Only `LGIddHelper`
-  should run.
+- In the historical Looking Glass IDD mode, keep `Looking Glass (host)`
+  stopped/disabled. Only `LGIddHelper` should run.
 - The VM exposes no reliable ICMP. SSH failing with ping-like checks is not proof the guest is down.
 
 ## Microsoft Rules That Matter

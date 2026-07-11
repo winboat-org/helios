@@ -7,6 +7,10 @@
 > DDI + venus-over-`D3DKMTEscape`** (`kmd_render/src/ddi/escape.rs`, `submit_command`).
 > Treat the "ICD → DeviceIoControl → KMD" spine as archived; **CLAUDE.md/ROADMAP.md
 > are authoritative** for transport.
+>
+> **Current display transport (2026-07-11):** the same control queue also carries
+> `SET_SCANOUT_BLOB` and `RESOURCE_FLUSH` for the DWM primary. The QEMU fork keeps
+> modifier/allocation-size metadata internally; it adds no public virtio wire ABI.
 
 ## Overview
 
@@ -92,7 +96,7 @@ VirtIO GPU has 2 queues:
 | Index | Name | Purpose |
 |-------|------|---------|
 | 0 | controlq | All GPU commands (3D, resource mgmt, etc.) |
-| 1 | cursorq | Cursor updates (we ignore this — render-only) |
+| 1 | cursorq | Cursor updates (separate display work; not evidence that the adapter is render-only) |
 
 For each queue, write to CommonCfg:
 ```

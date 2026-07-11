@@ -1,19 +1,39 @@
-# SCANOUT_DRM_MODIFIER_DESIGN.md — make the DWM primary a DRM-modifier DMA_BUF image (priority #1, scanout content)
+# SCANOUT_DRM_MODIFIER_DESIGN.md — historical DRM-modifier primary proposal
 
-**Status:** root-caused end-to-end (2026-07-08, 37th session), grounded in our own proven
-Gate-7 scanout (`icd/win-build/helios_vk_present.c`) + two exhaustive code sweeps of the
-Mesa venus ICD and the DXVK fork. This is the implementation plan. Companion memory:
-`windowed-blt-mapcpuhostaperture-dispatch-37th`.
+**Status: SUPERSEDED by measured results (2026-07-11).** This file records the
+37th-session hypothesis and is not an implementation plan. Its central claim
+that every Venus DMA_BUF scanout needs an explicit DRM modifier is false:
+
+- A dedicated, external-memory `VK_IMAGE_TILING_LINEAR` image with
+  `DRM_FORMAT_MOD_INVALID` displayed correctly on the NVIDIA host in both the
+  CachyOS oracle and KMD `ScanoutDiag=16`.
+- A plain DWM `VK_IMAGE_TILING_OPTIMAL` primary also exports with
+  `DRM_FORMAT_MOD_INVALID`, but EGL cannot infer its opaque tiling. That is a
+  missing layout description at the display importer, not proof that LINEAR is
+  invalid.
+- Enabling DRM-modifier/DMA_BUF extensions on every DXVK device changed the
+  import-side memory requirements of ordinary shared OPTIMAL images. DXVK's
+  undersized-import check correctly refused them; bypassing it caused NVIDIA
+  Xid 31. Do not restore or weaken that path.
+- The current path directly selects the real OPTIMAL DWM primary. `qemu-helios`
+  reconstructs its exact VkImage using the original blob allocation size and
+  performs host Vulkan readback for VNC. No guest copy and no public virtio ABI
+  addition are required, but the host readback means this is not end-to-end
+  zero-copy.
+
+An explicit DRM modifier remains a possible future contract for true host
+zero-copy if it can be introduced only for the primary without regressing
+ordinary shared imports. Every prescriptive statement below is retained as
+historical reasoning and is superseded where it conflicts with the facts above.
 
 ---
 
 ## 1. TL;DR
 
-Helios now **activates the display and scans out** end-to-end (v22.22.73.0 KMD + the UMD
-`Flags.Primary` fix, this session): the SDL window is **active**, `VpCN=1 / VpSA=1 /
-ScSet=1 / ScFlu=1`, the desktop is **fully composited** (paintcap = wallpaper + icons +
-taskbar), vsync runs at 60 Hz, and the scanout follows DWM's flips. **The one remaining
-defect is that the SDL shows BLACK**, because:
+At the time of this proposal, Helios activated display and scanout end-to-end
+(v22.22.73.0 KMD + the UMD `Flags.Primary` fix): `VpCN=1 / VpSA=1 /
+ScSet=1 / ScFlu=1`, and paintcap showed the fully composed desktop. The session
+then made the following hypothesis, which later evidence disproved:
 
 > A venus **DMA_BUF scanout image must be created with `VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT`
 > + an explicit DRM modifier.** A plain OPTIMAL *or* plain LINEAR image → exported dmabuf is
@@ -21,15 +41,9 @@ defect is that the SDL shows BLACK**, because:
 > — `helios_vk_present.c:251-254` (verbatim): *"venus REJECTS a DMA_BUF scanout image whose
 > tiling isn't TILING_DRM_FORMAT_MODIFIER_EXT ... a plain LINEAR image -> MOD_INVALID -> black."*
 
-DWM's primary is a plain DXVK render target (OPTIMAL, OPAQUE_FD-exportable, no DRM modifier),
-so its exported dmabuf is uninterpretable → black. **This is not a flip, format, stride,
-DxgkDdiPresent, or tiling-vs-linear problem** (all ruled out this session — see the memory).
-The fix: create the DWM primary/present surface as a **`DRM_FORMAT_MOD_LINEAR` modifier,
-DMA_BUF-exportable** image, mirroring the proven recipe, and report its **real** `rowPitch`
-+ `offset` to `SET_SCANOUT_BLOB`.
-
-The owner's framing is exactly right: *"the host owns the blob so it must know how to handle
-the tiled layout"* — TRUE, **but only via the DRM modifier**; the guest image must CARRY one.
+DWM's primary is a plain OPTIMAL DXVK render target with no explicit DRM
+modifier. The historical proposal below attempted to make it a LINEAR modifier
+image. That implementation direction is no longer active.
 
 ---
 

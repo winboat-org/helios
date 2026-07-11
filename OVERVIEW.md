@@ -1,11 +1,13 @@
 # OVERVIEW.md — Helios vGPU Architecture
 
-> **⚠️ SUPERSEDED (2026-07-05) — ARCHIVED REFERENCE ONLY.** This document
+> **⚠️ SUPERSEDED (updated 2026-07-11) — HISTORICAL REFERENCE ONLY.** This document
 > describes the abandoned System-class KMDF + `DeviceIoControl` design and states
 > the driver does NOT composite the desktop. Both are now false: the active
-> project is a **WDDM 3.2 render-only miniport + DXVK-bridged D3D11 UMD + Mesa-
-> Venus ICD (`vulkan_virtio.dll`) + IddCx/Looking Glass**, and **DWM composites
-> the whole Windows desktop on Helios** (the milestone, met 2026-07-05). The Rust
+> project is a **WDDM 3.2 render+display miniport + DXVK-bridged D3D11 UMD +
+> Mesa-Venus ICD (`vulkan_virtio.dll`) + `qemu-helios` scanout**, and **DWM
+> composites the whole Windows desktop on Helios**. The active output is
+> virtio-gpu `SET_SCANOUT_BLOB` through QEMU, normally egl-headless + VNC; the
+> former IddCx/Looking Glass path is historical. The Rust
 > `helios_icd.dll` named below no longer exists (the ICD is a C Mesa-Venus port).
 > **CLAUDE.md and ROADMAP.md are authoritative.** Read below as history only.
 

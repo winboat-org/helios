@@ -1,10 +1,10 @@
 # TOOLCHAIN.md — Build Environment Setup
 
 > **⚠️ SUPERSEDED (2026-07-05) — install/verify steps are for the abandoned
-> System-class driver.** The active driver is the **WDDM render miniport**
+> System-class driver.** The active driver is the **WDDM render+display miniport**
 > (crate `kmd_render`, service/INF `helios_kmd_render`, `helios_kmd_render.cat`),
-> a render/display-class adapter that carries `UserModeDriverName` and sits at
-> **Code 43 during bring-up** — NOT a System-class device, and it DOES appear
+> a display-class adapter that carries `UserModeDriverName` and owns one VidPn
+> source — NOT a System-class device, and it DOES appear
 > under Display adapters. The ICD builds as the C **Mesa-Venus** port
 > (`vulkan_virtio.dll` via `win_meson`), not a Rust `icd` crate. Use the
 > platform build rules and `win_*` MCP tooling in **CLAUDE.md** and the deploy
@@ -30,7 +30,7 @@ The Windows dev VM can be a separate VM from the target VM, or the same one if y
 
 - Linux kernel **6.13+** (required for KVM page-fault fixes with blob resources)
 - Vulkan 1.3-capable GPU with a compliant driver (RADV for AMD, ANV for Intel)
-- QEMU **9.2.0+** (first version with upstream Venus support)
+- The pinned **`qemu-helios`** submodule (based on QEMU 11.0.1)
 - virglrenderer built from source with Venus enabled
 
 Check your kernel:
@@ -76,31 +76,30 @@ virgl_test_server --help 2>&1 | grep venus
 # Should show: --venus   Enable Venus (VirtIO-GPU Vulkan)
 ```
 
-### 1.3 Build QEMU 9.2+ with virglrenderer
+### 1.3 Build the pinned QEMU fork
 
 ```bash
-# If distro QEMU is already ≥ 9.2, you may be able to use it
-# But it must find the virglrenderer you just built
-qemu-system-x86_64 --version
-
-# If building from source:
+# Stock QEMU is useful for renderer A/B tests, but it is not the active Windows
+# display binary: it cannot reconstruct the modifier-less OPTIMAL DWM primary.
 sudo apt install -y \
   libglib2.0-dev libpixman-1-dev libssl-dev \
   libslirp-dev libcap-ng-dev libattr1-dev \
   python3-pip python3-setuptools ninja-build
 
-git clone --depth 1 -b v9.2.0 https://gitlab.com/qemu-project/qemu.git
-cd qemu
-mkdir build && cd build
+git submodule update --init --recursive qemu-helios
+cd qemu-helios
+mkdir -p build-helios && cd build-helios
 ../configure \
-  --prefix=/usr/local \
   --target-list=x86_64-softmmu \
   --enable-kvm \
   --enable-opengl \
   --enable-virglrenderer \
-  --enable-gtk
-make -j$(nproc)
-sudo make install
+  --enable-gtk \
+  --enable-sdl \
+  --enable-vnc \
+  --enable-modules \
+  --disable-docs
+ninja
 ```
 
 ### 1.4 QEMU Launch Command for Development
@@ -112,36 +111,15 @@ run the VM. This matters because the launcher often needs the user's desktop ses
 environment, and active display state.
 
 ```bash
-#!/bin/bash
-# launch-vm.sh — launch the Windows 11 target VM
+# egl-headless + VNC (visually verified)
+HELIOS_QEMU_RENDER_GPU=nvidia HELIOS_DISPLAY=egl-vnc \
+  bash tools/launch-helios-gtk.sh
 
-DISK="windows11.qcow2"   # your Windows 11 disk image
-RAM="16G"
-CORES="8"
-HOSTMEM="8G"             # virtio-gpu blob memory exposed to guest
-
-qemu-system-x86_64 \
-  -enable-kvm \
-  -m ${RAM} \
-  -smp ${CORES},sockets=1,cores=${CORES},threads=1 \
-  -cpu host \
-  \
-  -drive file=${DISK},if=virtio,format=qcow2 \
-  \
-  -device virtio-gpu-gl,\
-hostmem=${HOSTMEM},\
-blob=on,\
-venus=on \
-  -display gtk,gl=on \
-  \
-  -device virtio-net-pci,netdev=net0 \
-  -netdev user,id=net0,hostfwd=tcp::3389-:3389 \
-  \
-  -machine q35,accel=kvm \
-  -bios /usr/share/OVMF/OVMF_CODE.fd \
-  \
-  -serial mon:stdio \
-  -monitor telnet:127.0.0.1:4444,server,nowait
+# Local-window smoke tests use the same fork and shared OPTIMAL fallback.
+HELIOS_QEMU_RENDER_GPU=nvidia HELIOS_DISPLAY=gtk \
+  bash tools/launch-helios-gtk.sh
+HELIOS_QEMU_RENDER_GPU=nvidia HELIOS_DISPLAY=sdl \
+  bash tools/launch-helios-gtk.sh
 ```
 
 **Key flags explained:**

@@ -1,11 +1,11 @@
 # Helios Architecture v2: System-class KMDF + IOCTL + Venus
 
-> **⚠️ SUPERSEDED (2026-07-05) — ARCHIVED REFERENCE ONLY.** This document
+> **⚠️ SUPERSEDED (updated 2026-07-11) — HISTORICAL REFERENCE ONLY.** This document
 > describes the System-class KMDF + `DeviceIoControl` architecture, which was
-> abandoned. The active project is a **WDDM 3.2 render-only miniport**
+> abandoned. The active project is a **WDDM 3.2 render+display miniport**
 > (`kmd_render/`) binding virtio-gpu via dxgkrnl, a **DXVK-bridged D3D11 UMD**
-> (`umd/`), the **Mesa-Venus ICD** (`vulkan_virtio.dll`), and an **IddCx /
-> Looking Glass** display. It uses the full dxgkrnl DDI table, GpuMmu, monitored
+> (`umd/`), the **Mesa-Venus ICD** (`vulkan_virtio.dll`), and the in-tree
+> **`qemu-helios`** scanout path. It uses the full dxgkrnl DDI table, GpuMmu, monitored
 > fences, CpuHostAperture segments, and venus-over-`D3DKMTEscape`. **CLAUDE.md
 > and ROADMAP.md are authoritative for the live architecture and current state.**
 > Everything below (and the 2026-06-07 reset banner) is historical.
@@ -107,8 +107,8 @@ Presentation is explicitly separate from Venus command execution. The active ren
 fast offscreen (submit/fence/blob throughput, render-to-image, readback checks). Windowed Win32 WSI via
 software blit is known to be slow and is not a reliable performance metric for the renderer.
 
-The DOD `SET_SCANOUT_BLOB` path is archived as a possible future display integration strategy, not the current
-driver model. If revisited, prove the smallest possible `SET_SCANOUT_BLOB` experiment first and only then decide
+The following sentence is historical and superseded: the DOD `SET_SCANOUT_BLOB` path was once
+archived as a possible future strategy. It is now the active display transport. The original plan was to prove the smallest possible `SET_SCANOUT_BLOB` experiment first and only then decide
 whether a display miniport is worth the cost.
 
 ## 9. INF (System-class KMDF)

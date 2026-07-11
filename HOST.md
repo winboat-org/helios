@@ -3,13 +3,17 @@
 ## Overview
 
 The Linux host side of the Helios vGPU project consists of:
-1. **QEMU 9.2+** with virtio-gpu-gl device, Venus enabled
+1. The in-tree **`qemu-helios` fork** with virtio-gpu-gl, Venus, blob, and
+   native OPTIMAL scanout support
 2. **virglrenderer** built with Venus support
 3. **Host Vulkan driver** (RADV for AMD, ANV for Intel, or NVIDIA proprietary)
 
-You do NOT write a custom host-side daemon for the primary path — virglrenderer handles everything. The `host/` crate in this repo is for diagnostics and optional custom transport.
+You do NOT write a custom host-side daemon for the primary path — virglrenderer handles Venus and
+`qemu-helios` handles display export/readback. The `host/` crate is diagnostic only.
 
-The host stack is identical regardless of the guest driver model: the active WDDM render-miniport guest (`kmd_render/` + Mesa-Venus ICD) uses the exact same venus/virglrenderer host setup described here as every earlier guest design did, so nothing in this document changes with the guest carrier.
+The Vulkan renderer remains the proven Venus/virglrenderer stack. The active display path does
+depend on the QEMU fork: stock QEMU cannot correctly display the current modifier-less OPTIMAL DWM
+primary through egl-headless/GTK/SDL.
 
 ---
 
@@ -38,8 +42,8 @@ vulkaninfo --summary
 # NVIDIA: NVK (open) or proprietary
 
 # ── QEMU ─────────────────────────────────────────────────────────────────────
-qemu-system-x86_64 --version
-# Required: 9.2.0+
+./qemu-helios/build-helios/qemu-system-x86_64 --version
+# Required for the active display path: the pinned qemu-helios submodule build
 
 # ── virglrenderer ─────────────────────────────────────────────────────────────
 pkg-config --modversion virglrenderer
@@ -50,7 +54,12 @@ pkg-config --modversion virglrenderer
 
 ## 2. QEMU Configuration
 
-### 2.1 Recommended QEMU Arguments
+### 2.1 Generic argument reference
+
+The authoritative launcher is `tools/launch-helios-gtk.sh`. It defaults to the
+`qemu-helios/build-helios` binary and automatically selects its module/data
+directories. The standalone example below is a generic reference, not the
+current win11 VM definition.
 
 ```bash
 #!/bin/bash
@@ -65,7 +74,7 @@ VM_RAM="16G"
 VM_CPUS="8"
 BLOB_MEM="8G"       # host memory exposed as GPU VRAM; max: your RAM - VM RAM
 
-qemu-system-x86_64 \
+./qemu-helios/build-helios/qemu-system-x86_64 \
   \
   # ── Machine type ──────────────────────────────────────────────────────────
   -machine q35,accel=kvm,smm=on \

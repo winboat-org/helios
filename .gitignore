@@ -42,3 +42,7 @@ $RECYCLE.BIN/
 
 # Stray compiled probe objects
 *.obj
+/tools/*.so
+
+# Local clean-tree comparison mirror
+/umd_clean/
