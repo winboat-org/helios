@@ -56,6 +56,7 @@ const CMD_FREE_MEMORY: u32 = 22;
 const CMD_BIND_IMAGE_MEMORY: u32 = 29;
 const CMD_GET_IMAGE_MEMORY_REQUIREMENTS: u32 = 31;
 const CMD_CREATE_FENCE: u32 = 35;
+const CMD_DESTROY_FENCE: u32 = 36;
 const CMD_WAIT_FOR_FENCES: u32 = 39;
 const CMD_CREATE_IMAGE: u32 = 54;
 const CMD_DESTROY_IMAGE: u32 = 55;
@@ -65,6 +66,7 @@ const CMD_DESTROY_COMMAND_POOL: u32 = 86;
 const CMD_ALLOCATE_COMMAND_BUFFERS: u32 = 88;
 const CMD_BEGIN_COMMAND_BUFFER: u32 = 90;
 const CMD_END_COMMAND_BUFFER: u32 = 91;
+const CMD_COPY_IMAGE: u32 = 113;
 const CMD_CLEAR_COLOR_IMAGE: u32 = 119;
 const CMD_PIPELINE_BARRIER: u32 = 126;
 const CMD_GET_DEVICE_QUEUE_2: u32 = 155;
@@ -97,7 +99,14 @@ const ST_MEMORY_DEDICATED_ALLOCATE_INFO: i32 = 1000127001;
 const ST_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO: i32 = 1000158003;
 const ST_RING_CREATE_INFO_MESA: i32 = 1000384000;
 const ST_DEVICE_QUEUE_TIMELINE_INFO_MESA: i32 = 1000384005;
+const ST_IMPORT_MEMORY_RESOURCE_INFO_MESA: i32 = 1000384002;
 
+/// `VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT`.
+///
+/// Ordinary Helios/DXVK shared images use the renderer's OPAQUE_FD export path;
+/// the KMD alias must carry the same external-image handle type even though the
+/// actual memory import is named by `VkImportMemoryResourceInfoMESA`.
+const EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD: u32 = 0x0000_0001;
 /// `VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT`.
 const EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF: u32 = 0x0000_0200;
 const DRM_FORMAT_MOD_LINEAR: u64 = 0;
@@ -112,6 +121,10 @@ const IMAGE_TILING_LINEAR: u32 = 1;
 const IMAGE_TILING_DRM_FORMAT_MODIFIER: u32 = 1000158000;
 const IMAGE_USAGE_TRANSFER_SRC: u32 = 0x0000_0001;
 const IMAGE_USAGE_TRANSFER_DST: u32 = 0x0000_0002;
+const IMAGE_USAGE_SAMPLED: u32 = 0x0000_0004;
+const IMAGE_USAGE_STORAGE: u32 = 0x0000_0008;
+const IMAGE_USAGE_COLOR_ATTACHMENT: u32 = 0x0000_0010;
+const IMAGE_CREATE_MUTABLE_FORMAT: u32 = 0x0000_0008;
 const SHARING_MODE_EXCLUSIVE: u32 = 0;
 const IMAGE_LAYOUT_UNDEFINED: u32 = 0;
 const IMAGE_LAYOUT_GENERAL: u32 = 1;
@@ -120,13 +133,18 @@ const SAMPLE_COUNT_1: u32 = 0x0000_0001;
 const IMAGE_ASPECT_COLOR: u32 = 0x0000_0001;
 const IMAGE_ASPECT_MEMORY_PLANE_0: u32 = 0x0000_0080;
 const QUEUE_FAMILY_IGNORED: u32 = u32::MAX;
+const QUEUE_FAMILY_EXTERNAL: u32 = u32::MAX - 1;
+// Kept for the older diagnostic call sites. Its numeric value has always been
+// VK_QUEUE_FAMILY_EXTERNAL (`~1U`), despite the historical name.
 const QUEUE_FAMILY_FOREIGN_EXT: u32 = u32::MAX - 1;
 const COMMAND_BUFFER_LEVEL_PRIMARY: u32 = 0;
 const COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT: u32 = 0x0000_0001;
+const COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE: u32 = 0x0000_0004;
 const PIPELINE_STAGE_TOP_OF_PIPE: u32 = 0x0000_0001;
 const PIPELINE_STAGE_TRANSFER: u32 = 0x0000_1000;
 const PIPELINE_STAGE_BOTTOM_OF_PIPE: u32 = 0x0000_2000;
 const ACCESS_TRANSFER_WRITE: u32 = 0x0000_1000;
+const ACCESS_TRANSFER_READ: u32 = 0x0000_0800;
 
 // ── VkMemoryPropertyFlags bits we require ────────────────────────────────────
 const MEMORY_PROPERTY_DEVICE_LOCAL: u32 = 0x1;
@@ -202,6 +220,38 @@ pub struct ScanoutImageBlob {
     pub memory_type_index: u32,
     pub row_pitch: u32,
     pub plane_offset: u32,
+}
+
+/// Persistent Vulkan objects for copying one authoritative WDDM primary into
+/// the adapter-owned LINEAR scanout image.
+///
+/// Creation is deliberately expensive and submission deliberately cheap:
+/// [`VenusClient::prepare_optimal_bgra_copy`] imports the primary once and
+/// records one `SIMULTANEOUS_USE` command buffer; each display tick then calls
+/// [`VenusClient::submit_prepared_image_copy`], which only enqueues that already
+/// recorded buffer. The object must remain alive until
+/// [`VenusClient::destroy_prepared_image_copy`] has drained the queue.
+#[derive(Clone, Copy)]
+pub struct PreparedImageCopy {
+    /// True when preparation created/attached/imported the source objects below.
+    /// False for a borrowed KMD-created LINEAR source image.
+    pub owns_source_alias: bool,
+    /// Virtio-gpu resource attached to the kernel Venus context and imported as
+    /// `memory_id`. Zero for a borrowed KMD-created source.
+    pub source_resource_id: u32,
+    /// KMD-device OPTIMAL alias of the source allocation.
+    pub source_image_id: u64,
+    /// `VkDeviceMemory` imported through `VkImportMemoryResourceInfoMESA`, or
+    /// zero for a borrowed source.
+    pub source_memory_id: u64,
+    /// Pool owning `command_buffer_id`; retained while submissions may be live.
+    pub command_pool_id: u64,
+    /// Reusable source-acquire/copy/release command buffer.
+    pub command_buffer_id: u64,
+    /// Persistent adapter-owned destination image baked into the command buffer.
+    pub target_image_id: u64,
+    pub width: u32,
+    pub height: u32,
 }
 
 /// A kernel mapping of a guest-physical sub-range of the host-visible BAR window.
@@ -477,6 +527,13 @@ pub struct VenusClient {
     /// RING_POLL_SPINS budget (~1 s each), which is the 2026-07-03 guest
     /// wedge. Once set, every ring command fails fast with `DeviceError`.
     fatal: bool,
+    /// One-time PREINITIALIZED -> GENERAL -> EXTERNAL setup for the persistent
+    /// LINEAR scanout target. The pool/buffer remain live because setup is
+    /// intentionally submitted without a fence wait; queue order makes every
+    /// later copy execute after it.
+    copy_target_image_id: u64,
+    copy_target_init_pool_id: u64,
+    copy_target_init_command_buffer_id: u64,
 }
 
 impl VenusClient {
@@ -900,6 +957,90 @@ impl VenusClient {
         Ok(image_id)
     }
 
+    /// Rebuild the exact ordinary Helios/DXVK shared-primary image shape in the
+    /// kernel Venus device. `ddi_bind_flags` is the authoritative CreateResource
+    /// value retained by the allocation context; deriving usage from geometry
+    /// would be a content-corrupting heuristic on NVIDIA.
+    fn create_optimal_bgra_source_alias(
+        &mut self,
+        adapter: &AdapterContext,
+        width: u32,
+        height: u32,
+        ddi_bind_flags: u32,
+    ) -> Result<u64, VirtioError> {
+        // D3D11/DXVK starts every texture with transfer source+destination. The
+        // DDI pipeline bits are numerically identical for SRV (0x8) and RTV
+        // (0x20); DDI UAV (0x100) is translated to API UAV (0x80), hence the
+        // separate test below. PRESENT (0x80) is deliberately not STORAGE.
+        const DDI_BIND_SHADER_RESOURCE: u32 = 0x0000_0008;
+        const DDI_BIND_RENDER_TARGET: u32 = 0x0000_0020;
+        const DDI_BIND_UNORDERED_ACCESS: u32 = 0x0000_0100;
+        let mut usage = IMAGE_USAGE_TRANSFER_SRC | IMAGE_USAGE_TRANSFER_DST;
+        if ddi_bind_flags & DDI_BIND_SHADER_RESOURCE != 0 {
+            usage |= IMAGE_USAGE_SAMPLED;
+        }
+        if ddi_bind_flags & DDI_BIND_RENDER_TARGET != 0 {
+            usage |= IMAGE_USAGE_COLOR_ATTACHMENT;
+        }
+        if ddi_bind_flags & DDI_BIND_UNORDERED_ACCESS != 0 {
+            usage |= IMAGE_USAGE_STORAGE;
+        }
+
+        let image_id = self.alloc_handle();
+        let mut w = Writer::new();
+        w.header(CMD_CREATE_IMAGE, CMD_FLAG_GENERATE_REPLY);
+        w.u64(self.device_id);
+        w.count(true);
+        w.i32(ST_IMAGE_CREATE_INFO);
+        // This matches DXVK's ordinary KMT-shared resource shape. Its memory is
+        // imported below by venus resource id, but VkImage external compatibility
+        // is still keyed by OPAQUE_FD on the renderer device.
+        w.count(true);
+        w.i32(ST_EXTERNAL_MEMORY_IMAGE_CREATE_INFO);
+        w.count(false);
+        w.u32(EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD);
+        // Shared BGRA retains MUTABLE_FORMAT but intentionally has no format-list
+        // pNext (DXVK suppresses that list to disable per-image compression
+        // metadata which cannot survive cross-device imports).
+        w.u32(IMAGE_CREATE_MUTABLE_FORMAT);
+        w.u32(IMAGE_TYPE_2D);
+        w.u32(FORMAT_B8G8R8A8_UNORM);
+        w.u32(width);
+        w.u32(height);
+        w.u32(1); // depth
+        w.u32(1); // mipLevels
+        w.u32(1); // arrayLayers
+        w.u32(SAMPLE_COUNT_1);
+        w.u32(0); // VK_IMAGE_TILING_OPTIMAL
+        w.u32(usage);
+        w.u32(SHARING_MODE_EXCLUSIVE);
+        w.u32(0); // queueFamilyIndexCount
+        w.count(false);
+        w.u32(IMAGE_LAYOUT_UNDEFINED);
+        w.count(false); // pAllocator
+        w.count(true);
+        w.u64(image_id);
+        self.ring_command_reply(adapter, w.as_slice())?;
+
+        let mut r = ReplyReader::new(&self.reply_map);
+        let cmd = r.read_i32()?;
+        if cmd as u32 != CMD_CREATE_IMAGE {
+            diag(0x0130);
+            return Err(VirtioError::DeviceError);
+        }
+        let result = r.read_i32()?;
+        if result != 0 {
+            crate::diag::record_named_bytes(b"CpImgVr", result as u32);
+            diag(0x0131);
+            return Err(VirtioError::DeviceError);
+        }
+        if r.read_u64()? == 0 || r.read_u64()? == 0 {
+            diag(0x0132);
+            return Err(VirtioError::DeviceError);
+        }
+        Ok(image_id)
+    }
+
     fn image_memory_requirements(
         &mut self,
         adapter: &AdapterContext,
@@ -1006,6 +1147,48 @@ impl VenusClient {
             // scanout image (dedicated-less export alloc).
             crate::diag::record_named_bytes(b"SdgLMem", result as u32);
             diag(0x0124);
+            return Err(VirtioError::DeviceError);
+        }
+        Ok(memory_id)
+    }
+
+    /// Import an already-live HOST3D resource into this kernel Venus device.
+    /// The resource must first be attached to `self.ctx_id`.
+    fn allocate_imported_resource_memory(
+        &mut self,
+        adapter: &AdapterContext,
+        resource_id: u32,
+        allocation_size: u64,
+        memory_type_index: u32,
+    ) -> Result<u64, VirtioError> {
+        let memory_id = self.alloc_handle();
+        let mut w = Writer::new();
+        w.header(CMD_ALLOCATE_MEMORY, CMD_FLAG_GENERATE_REPLY);
+        w.u64(self.device_id);
+        w.count(true);
+        w.i32(ST_MEMORY_ALLOCATE_INFO);
+        // VkImportMemoryResourceInfoMESA
+        w.count(true);
+        w.i32(ST_IMPORT_MEMORY_RESOURCE_INFO_MESA);
+        w.count(false);
+        w.u32(resource_id);
+        w.u64(allocation_size);
+        w.u32(memory_type_index);
+        w.count(false); // pAllocator
+        w.count(true);
+        w.u64(memory_id);
+        self.ring_command_reply(adapter, w.as_slice())?;
+
+        let mut r = ReplyReader::new(&self.reply_map);
+        let cmd = r.read_i32()?;
+        if cmd as u32 != CMD_ALLOCATE_MEMORY {
+            diag(0x0133);
+            return Err(VirtioError::DeviceError);
+        }
+        let result = r.read_i32()?;
+        if result != 0 {
+            crate::diag::record_named_bytes(b"CpMemVr", result as u32);
+            diag(0x0134);
             return Err(VirtioError::DeviceError);
         }
         Ok(memory_id)
@@ -1198,13 +1381,26 @@ impl VenusClient {
         adapter: &AdapterContext,
         command_buffer_id: u64,
     ) -> Result<(), VirtioError> {
+        self.begin_command_buffer_with_flags(
+            adapter,
+            command_buffer_id,
+            COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT,
+        )
+    }
+
+    fn begin_command_buffer_with_flags(
+        &mut self,
+        adapter: &AdapterContext,
+        command_buffer_id: u64,
+        usage_flags: u32,
+    ) -> Result<(), VirtioError> {
         let mut w = Writer::new();
         w.header(CMD_BEGIN_COMMAND_BUFFER, CMD_FLAG_GENERATE_REPLY);
         w.u64(command_buffer_id);
         w.count(true);
         w.i32(ST_COMMAND_BUFFER_BEGIN_INFO);
         w.count(false);
-        w.u32(COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT);
+        w.u32(usage_flags);
         w.count(false);
         self.ring_command_reply(adapter, w.as_slice())?;
 
@@ -1260,6 +1456,49 @@ impl VenusClient {
         w.u32(0);
         w.u32(1);
         w.u32(0);
+        w.u32(1);
+        self.ring_command_noreply(adapter, w.as_slice())
+    }
+
+    fn cmd_copy_image(
+        &mut self,
+        adapter: &AdapterContext,
+        command_buffer_id: u64,
+        source_image_id: u64,
+        target_image_id: u64,
+        width: u32,
+        height: u32,
+    ) -> Result<(), VirtioError> {
+        let mut w = Writer::new();
+        w.header(CMD_COPY_IMAGE, 0);
+        w.u64(command_buffer_id);
+        w.u64(source_image_id);
+        w.u32(IMAGE_LAYOUT_GENERAL);
+        w.u64(target_image_id);
+        w.u32(IMAGE_LAYOUT_GENERAL);
+        w.u32(1); // regionCount
+        w.u64(1); // pRegions array_size
+                  // VkImageCopy.srcSubresource
+        w.u32(IMAGE_ASPECT_COLOR);
+        w.u32(0); // mipLevel
+        w.u32(0); // baseArrayLayer
+        w.u32(1); // layerCount
+                  // srcOffset
+        w.i32(0);
+        w.i32(0);
+        w.i32(0);
+        // dstSubresource
+        w.u32(IMAGE_ASPECT_COLOR);
+        w.u32(0);
+        w.u32(0);
+        w.u32(1);
+        // dstOffset
+        w.i32(0);
+        w.i32(0);
+        w.i32(0);
+        // extent
+        w.u32(width);
+        w.u32(height);
         w.u32(1);
         self.ring_command_noreply(adapter, w.as_slice())
     }
@@ -1382,7 +1621,43 @@ impl VenusClient {
         Ok(())
     }
 
-    fn queue_submit_clear(
+    fn destroy_fence(
+        &mut self,
+        adapter: &AdapterContext,
+        fence_id: u64,
+    ) -> Result<(), VirtioError> {
+        let mut w = Writer::new();
+        w.header(CMD_DESTROY_FENCE, 0);
+        w.u64(self.device_id);
+        w.u64(fence_id);
+        w.count(false); // pAllocator
+        self.ring_command_noreply(adapter, w.as_slice())
+    }
+
+    /// Enqueue an empty fence marker. A later wait on this fence completes only
+    /// after every previously submitted copy on the ordered graphics queue.
+    fn queue_submit_fence_marker(
+        &mut self,
+        adapter: &AdapterContext,
+        fence_id: u64,
+    ) -> Result<(), VirtioError> {
+        let mut submit = Writer::new();
+        submit.header(CMD_QUEUE_SUBMIT, CMD_FLAG_GENERATE_REPLY);
+        submit.u64(self.queue_id);
+        submit.u32(0); // submitCount
+        submit.count(false); // pSubmits
+        submit.u64(fence_id);
+        self.ring_command_reply(adapter, submit.as_slice())?;
+
+        let mut r = ReplyReader::new(&self.reply_map);
+        if r.read_i32()? as u32 != CMD_QUEUE_SUBMIT || r.read_i32()? != 0 {
+            diag(0x0135);
+            return Err(VirtioError::DeviceError);
+        }
+        Ok(())
+    }
+
+    fn queue_submit_command_buffer(
         &mut self,
         adapter: &AdapterContext,
         command_buffer_id: u64,
@@ -1418,6 +1693,480 @@ impl VenusClient {
         }
 
         Ok(())
+    }
+
+    fn destroy_image_on_ring(
+        &mut self,
+        adapter: &AdapterContext,
+        image_id: u64,
+    ) -> Result<(), VirtioError> {
+        let mut w = Writer::new();
+        w.header(CMD_DESTROY_IMAGE, 0);
+        w.u64(self.device_id);
+        w.u64(image_id);
+        w.count(false);
+        self.ring_command_noreply(adapter, w.as_slice())
+    }
+
+    fn cleanup_imported_source_alias(
+        &mut self,
+        adapter: &AdapterContext,
+        resource_id: u32,
+        image_id: u64,
+        memory_id: u64,
+    ) -> Result<(), VirtioError> {
+        if image_id != 0 {
+            self.destroy_image_on_ring(adapter, image_id)?;
+        }
+        if memory_id != 0 {
+            self.free_memory_blob(adapter, memory_id)?;
+        }
+        ctrl::ctx_detach_resource(adapter, self.ctx_id, resource_id)
+    }
+
+    /// Put the persistent KMD LINEAR image into GENERAL layout and external
+    /// ownership exactly once. The setup submission is nonblocking and its
+    /// command objects remain alive for the Venus-client lifetime; all later
+    /// copies use the same ordered queue and therefore execute after setup.
+    fn ensure_linear_copy_target_ready(
+        &mut self,
+        adapter: &AdapterContext,
+        target_image_id: u64,
+    ) -> Result<(), VirtioError> {
+        if self.copy_target_image_id == target_image_id {
+            return Ok(());
+        }
+        if target_image_id == 0 || self.copy_target_image_id != 0 {
+            // Production owns one dedicated target for the adapter lifetime.
+            // Silently switching would leak an in-flight pool and make layout
+            // ownership unknowable, so fail loudly instead.
+            diag(0x0136);
+            return Err(VirtioError::DeviceError);
+        }
+
+        let pool_id = self.create_command_pool(adapter)?;
+        let command_buffer_id = match self.allocate_command_buffer(adapter, pool_id) {
+            Ok(id) => id,
+            Err(e) => {
+                let _ = self.destroy_command_pool(adapter, pool_id);
+                return Err(e);
+            }
+        };
+        let record_result = (|| {
+            self.begin_command_buffer(adapter, command_buffer_id)?;
+            self.cmd_image_barrier(
+                adapter,
+                command_buffer_id,
+                target_image_id,
+                PIPELINE_STAGE_TOP_OF_PIPE,
+                PIPELINE_STAGE_TRANSFER,
+                0,
+                ACCESS_TRANSFER_WRITE,
+                IMAGE_LAYOUT_PREINITIALIZED,
+                IMAGE_LAYOUT_GENERAL,
+                QUEUE_FAMILY_IGNORED,
+                QUEUE_FAMILY_IGNORED,
+            )?;
+            self.cmd_image_barrier(
+                adapter,
+                command_buffer_id,
+                target_image_id,
+                PIPELINE_STAGE_TRANSFER,
+                PIPELINE_STAGE_BOTTOM_OF_PIPE,
+                ACCESS_TRANSFER_WRITE,
+                0,
+                IMAGE_LAYOUT_GENERAL,
+                IMAGE_LAYOUT_GENERAL,
+                0,
+                QUEUE_FAMILY_EXTERNAL,
+            )?;
+            self.end_command_buffer(adapter, command_buffer_id)
+        })();
+        if let Err(e) = record_result {
+            let _ = self.destroy_command_pool(adapter, pool_id);
+            return Err(e);
+        }
+
+        // Publish lifetime before queue submit: if transport failure makes the
+        // submission result ambiguous, retaining the pool is always safe while
+        // destroying a possibly-pending command buffer is not.
+        self.copy_target_image_id = target_image_id;
+        self.copy_target_init_pool_id = pool_id;
+        self.copy_target_init_command_buffer_id = command_buffer_id;
+        self.queue_submit_command_buffer(adapter, command_buffer_id, 0)
+    }
+
+    /// Record the common reusable EXTERNAL-acquire, GENERAL-layout image copy,
+    /// and EXTERNAL-release sequence. Both source forms (imported OPTIMAL alias
+    /// and borrowed KMD LINEAR image) use this exact ownership protocol.
+    fn record_reusable_image_copy(
+        &mut self,
+        adapter: &AdapterContext,
+        source_image_id: u64,
+        target_image_id: u64,
+        width: u32,
+        height: u32,
+    ) -> Result<(u64, u64), VirtioError> {
+        if source_image_id == 0
+            || target_image_id == 0
+            || source_image_id == target_image_id
+            || width == 0
+            || height == 0
+        {
+            return Err(VirtioError::DeviceError);
+        }
+
+        let command_pool_id = self.create_command_pool(adapter)?;
+        let command_buffer_id = match self.allocate_command_buffer(adapter, command_pool_id) {
+            Ok(id) => id,
+            Err(e) => {
+                let _ = self.destroy_command_pool(adapter, command_pool_id);
+                return Err(e);
+            }
+        };
+
+        let record_result = (|| {
+            self.begin_command_buffer_with_flags(
+                adapter,
+                command_buffer_id,
+                COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE,
+            )?;
+            self.cmd_image_barrier(
+                adapter,
+                command_buffer_id,
+                source_image_id,
+                PIPELINE_STAGE_TOP_OF_PIPE,
+                PIPELINE_STAGE_TRANSFER,
+                0,
+                ACCESS_TRANSFER_READ,
+                IMAGE_LAYOUT_GENERAL,
+                IMAGE_LAYOUT_GENERAL,
+                QUEUE_FAMILY_EXTERNAL,
+                0,
+            )?;
+            self.cmd_image_barrier(
+                adapter,
+                command_buffer_id,
+                target_image_id,
+                PIPELINE_STAGE_TOP_OF_PIPE,
+                PIPELINE_STAGE_TRANSFER,
+                0,
+                ACCESS_TRANSFER_WRITE,
+                IMAGE_LAYOUT_GENERAL,
+                IMAGE_LAYOUT_GENERAL,
+                QUEUE_FAMILY_EXTERNAL,
+                0,
+            )?;
+            self.cmd_copy_image(
+                adapter,
+                command_buffer_id,
+                source_image_id,
+                target_image_id,
+                width,
+                height,
+            )?;
+            self.cmd_image_barrier(
+                adapter,
+                command_buffer_id,
+                source_image_id,
+                PIPELINE_STAGE_TRANSFER,
+                PIPELINE_STAGE_BOTTOM_OF_PIPE,
+                ACCESS_TRANSFER_READ,
+                0,
+                IMAGE_LAYOUT_GENERAL,
+                IMAGE_LAYOUT_GENERAL,
+                0,
+                QUEUE_FAMILY_EXTERNAL,
+            )?;
+            self.cmd_image_barrier(
+                adapter,
+                command_buffer_id,
+                target_image_id,
+                PIPELINE_STAGE_TRANSFER,
+                PIPELINE_STAGE_BOTTOM_OF_PIPE,
+                ACCESS_TRANSFER_WRITE,
+                0,
+                IMAGE_LAYOUT_GENERAL,
+                IMAGE_LAYOUT_GENERAL,
+                0,
+                QUEUE_FAMILY_EXTERNAL,
+            )?;
+            self.end_command_buffer(adapter, command_buffer_id)
+        })();
+        if let Err(e) = record_result {
+            let _ = self.destroy_command_pool(adapter, command_pool_id);
+            return Err(e);
+        }
+        Ok((command_pool_id, command_buffer_id))
+    }
+
+    /// Import an authoritative WDDM primary and record its reusable GPU copy to
+    /// the adapter-owned LINEAR scanout image.
+    ///
+    /// This is a setup operation, not a per-frame operation. The caller should
+    /// cache the returned object in the allocation context, submit it with
+    /// [`Self::submit_prepared_image_copy`], and destroy it only through
+    /// [`Self::destroy_prepared_image_copy`].
+    pub fn prepare_optimal_bgra_copy(
+        &mut self,
+        adapter: &AdapterContext,
+        source_resource_id: u32,
+        source_allocation_size: u64,
+        source_memory_type_index: u32,
+        width: u32,
+        height: u32,
+        ddi_bind_flags: u32,
+        target_image_id: u64,
+    ) -> Result<PreparedImageCopy, VirtioError> {
+        if source_resource_id == 0
+            || source_allocation_size == 0
+            || width == 0
+            || height == 0
+            || target_image_id == 0
+            || source_memory_type_index >= self.memory_type_count
+        {
+            diag(0x0137);
+            return Err(VirtioError::DeviceError);
+        }
+
+        crate::diag::record_named_bytes(b"CpImpSt", 1);
+        ctrl::attach_resource_checked(adapter, self.ctx_id, source_resource_id)?;
+
+        crate::diag::record_named_bytes(b"CpImpSt", 2);
+        let source_image_id =
+            match self.create_optimal_bgra_source_alias(adapter, width, height, ddi_bind_flags) {
+                Ok(id) => id,
+                Err(e) => {
+                    let _ = ctrl::ctx_detach_resource(adapter, self.ctx_id, source_resource_id);
+                    return Err(e);
+                }
+            };
+
+        crate::diag::record_named_bytes(b"CpImpSt", 3);
+        let (required_size, memory_type_bits) =
+            match self.image_memory_requirements(adapter, source_image_id) {
+                Ok(req) => req,
+                Err(e) => {
+                    let _ = self.cleanup_imported_source_alias(
+                        adapter,
+                        source_resource_id,
+                        source_image_id,
+                        0,
+                    );
+                    return Err(e);
+                }
+            };
+        crate::diag::record_named_bytes(b"CpReq", required_size as u32);
+        crate::diag::record_named_bytes(b"CpBit", memory_type_bits);
+        if required_size > source_allocation_size
+            || (memory_type_bits & (1u32 << source_memory_type_index)) == 0
+        {
+            crate::diag::record_named_bytes(b"CpImpSt", 0xE3);
+            let _ =
+                self.cleanup_imported_source_alias(adapter, source_resource_id, source_image_id, 0);
+            return Err(VirtioError::DeviceError);
+        }
+
+        crate::diag::record_named_bytes(b"CpImpSt", 4);
+        let source_memory_id = match self.allocate_imported_resource_memory(
+            adapter,
+            source_resource_id,
+            source_allocation_size,
+            source_memory_type_index,
+        ) {
+            Ok(id) => id,
+            Err(e) => {
+                let _ = self.cleanup_imported_source_alias(
+                    adapter,
+                    source_resource_id,
+                    source_image_id,
+                    0,
+                );
+                return Err(e);
+            }
+        };
+
+        crate::diag::record_named_bytes(b"CpImpSt", 5);
+        if let Err(e) = self.bind_image_memory(adapter, source_image_id, source_memory_id) {
+            let _ = self.cleanup_imported_source_alias(
+                adapter,
+                source_resource_id,
+                source_image_id,
+                source_memory_id,
+            );
+            return Err(e);
+        }
+
+        crate::diag::record_named_bytes(b"CpImpSt", 6);
+        if let Err(e) = self.ensure_linear_copy_target_ready(adapter, target_image_id) {
+            let _ = self.cleanup_imported_source_alias(
+                adapter,
+                source_resource_id,
+                source_image_id,
+                source_memory_id,
+            );
+            return Err(e);
+        }
+
+        crate::diag::record_named_bytes(b"CpImpSt", 7);
+        let (command_pool_id, command_buffer_id) = match self.record_reusable_image_copy(
+            adapter,
+            source_image_id,
+            target_image_id,
+            width,
+            height,
+        ) {
+            Ok(ids) => ids,
+            Err(e) => {
+                let _ = self.cleanup_imported_source_alias(
+                    adapter,
+                    source_resource_id,
+                    source_image_id,
+                    source_memory_id,
+                );
+                return Err(e);
+            }
+        };
+
+        crate::diag::record_named_bytes(b"CpImpSt", 0x10);
+        Ok(PreparedImageCopy {
+            owns_source_alias: true,
+            source_resource_id,
+            source_image_id,
+            source_memory_id,
+            command_pool_id,
+            command_buffer_id,
+            target_image_id,
+            width,
+            height,
+        })
+    }
+
+    /// Record a reusable copy from an existing KMD-created LINEAR primary.
+    ///
+    /// Unlike [`Self::prepare_optimal_bgra_copy`], this borrows the source
+    /// `VkImage`; the owning allocation keeps its image, memory and virtio
+    /// resource alive. Teardown drains the queue and destroys only the recorded
+    /// command pool.
+    pub fn prepare_existing_linear_source_copy(
+        &mut self,
+        adapter: &AdapterContext,
+        source_image_id: u64,
+        width: u32,
+        height: u32,
+        target_image_id: u64,
+    ) -> Result<PreparedImageCopy, VirtioError> {
+        if source_image_id == 0
+            || source_image_id == target_image_id
+            || width == 0
+            || height == 0
+            || target_image_id == 0
+        {
+            return Err(VirtioError::DeviceError);
+        }
+        self.ensure_linear_copy_target_ready(adapter, target_image_id)?;
+        let (command_pool_id, command_buffer_id) = self.record_reusable_image_copy(
+            adapter,
+            source_image_id,
+            target_image_id,
+            width,
+            height,
+        )?;
+        Ok(PreparedImageCopy {
+            owns_source_alias: false,
+            source_resource_id: 0,
+            source_image_id,
+            source_memory_id: 0,
+            command_pool_id,
+            command_buffer_id,
+            target_image_id,
+            width,
+            height,
+        })
+    }
+
+    /// Nonblocking per-frame enqueue of a pre-recorded primary-to-LINEAR copy.
+    /// No fence is created or waited here; `SIMULTANEOUS_USE` makes repeated
+    /// submissions legal while older frames are still pending on the same queue.
+    pub fn submit_prepared_image_copy(
+        &mut self,
+        adapter: &AdapterContext,
+        copy: &PreparedImageCopy,
+    ) -> Result<u64, VirtioError> {
+        if copy.command_buffer_id == 0
+            || copy.source_image_id == 0
+            || copy.target_image_id != self.copy_target_image_id
+        {
+            return Err(VirtioError::DeviceError);
+        }
+        // Encode vkQueueSubmit directly into the outer SUBMIT_3D stream. The
+        // outer virtio fence uses ring_idx=1, so its completion callback fires
+        // only after this Vulkan queue work completes; that callback—not this
+        // enqueue—marks scanout dirty and wakes the RESOURCE_FLUSH worker.
+        // Keeping VK_COMMAND_GENERATE_REPLY_BIT_EXT clear is essential: there is
+        // no reply-shmem transaction on this direct, fire-and-forget path.
+        let mut submit = Writer::new();
+        submit.header(CMD_QUEUE_SUBMIT, 0);
+        submit.u64(self.queue_id);
+        submit.u32(1); // submitCount
+        submit.u64(1); // pSubmits array_size
+        submit.i32(ST_SUBMIT_INFO);
+        submit.count(false); // pNext
+        submit.u32(0); // waitSemaphoreCount
+        submit.count(false); // pWaitSemaphores
+        submit.count(false); // pWaitDstStageMask
+        submit.u32(1); // commandBufferCount
+        submit.u64(1); // pCommandBuffers array_size
+        submit.u64(copy.command_buffer_id);
+        submit.u32(0); // signalSemaphoreCount
+        submit.count(false); // pSignalSemaphores
+        submit.u64(0); // fence
+        ctrl::submit_venus_async_scanout(adapter, self.ctx_id, submit.as_slice())
+    }
+
+    /// Drain the ordered copy queue and release every object retained for one
+    /// allocation. This may block (up to the existing 5-second fence timeout),
+    /// so it belongs only in PASSIVE allocation teardown, never the frame path.
+    pub fn destroy_prepared_image_copy(
+        &mut self,
+        adapter: &AdapterContext,
+        copy: PreparedImageCopy,
+        last_wire_fence_id: u64,
+    ) -> Result<(), VirtioError> {
+        // The reusable command buffer is submitted through an outer async
+        // SUBMIT_3D. Drain its latest GPU-completion fence before enqueuing the
+        // inner Vulkan marker; otherwise the marker could be decoded first on a
+        // different Venus dispatch path and let us destroy a still-referenced
+        // command pool.
+        if last_wire_fence_id != 0 {
+            match ctrl::wait_fence(adapter, last_wire_fence_id, 5_000_000_000) {
+                ctrl::WaitFenceOutcome::Complete => {}
+                ctrl::WaitFenceOutcome::TimedOut | ctrl::WaitFenceOutcome::Invalid => {
+                    return Err(VirtioError::DeviceError);
+                }
+            }
+        }
+        let fence_id = self.create_fence(adapter)?;
+        if let Err(e) = self.queue_submit_fence_marker(adapter, fence_id) {
+            // Submission outcome is ambiguous. Keep all referenced objects live;
+            // context teardown will reclaim them without a use-after-free.
+            return Err(e);
+        }
+        if let Err(e) = self.wait_for_fence(adapter, fence_id) {
+            return Err(e);
+        }
+        self.destroy_fence(adapter, fence_id)?;
+        self.destroy_command_pool(adapter, copy.command_pool_id)?;
+        if copy.owns_source_alias {
+            self.cleanup_imported_source_alias(
+                adapter,
+                copy.source_resource_id,
+                copy.source_image_id,
+                copy.source_memory_id,
+            )
+        } else {
+            Ok(())
+        }
     }
 
     /// Diagnostic-only GPU fill for scanout images. The image is KMD-owned and
@@ -1483,7 +2232,7 @@ impl VenusClient {
             } else {
                 0
             };
-            self.queue_submit_clear(adapter, command_buffer_id, fence_id)?;
+            self.queue_submit_command_buffer(adapter, command_buffer_id, fence_id)?;
             crate::diag::record_named_bytes(b"SdgGpSub", 1);
             if fence_id != 0 {
                 self.wait_for_fence(adapter, fence_id)?;
@@ -1765,6 +2514,9 @@ pub fn allocate_host_visible_blob(
         memory_type_flags: [0; VK_MAX_MEMORY_TYPES as usize],
         memory_type_count: 0,
         fatal: false,
+        copy_target_image_id: 0,
+        copy_target_init_pool_id: 0,
+        copy_target_init_command_buffer_id: 0,
     };
 
     // ── 3. vkCreateRingMESA (direct) — register the ring with the host ────────
@@ -1994,13 +2746,23 @@ pub fn allocate_host_visible_blob(
         b"VK_KHR_external_memory_fd\0",
         b"VK_EXT_external_memory_dma_buf\0",
     ];
-    let want_scanout_exts = crate::diag::read_config_dword(b"ScanoutDiag", 0) >= 4;
+    let scanout_diag = crate::diag::read_config_dword(b"ScanoutDiag", 0);
+    // Production DisplayHalf needs only the export trio for its dedicated plain
+    // LINEAR DMA_BUF image. The modifier/image-format-list tier remains strictly
+    // diagnostic; never enable it merely because real scanout is active.
+    let want_scanout_exts = client.ctx_id != 0 && (adapter.display_half || scanout_diag >= 4);
     // Clear the knock-down VkResult so a clean full-tier success leaves it 0 and
     // a prior boot's value can't be mistaken for this boot's (names persist).
     crate::diag::record_named_bytes(b"SdgDevR", 0);
     // Tier 0 = full, 1 = export-only, 2 = none. Production (scanout off) starts
     // at 2, exactly the old render-only, no-ext behaviour.
-    let mut ext_tier: u32 = if want_scanout_exts { 0 } else { 2 };
+    let mut ext_tier: u32 = if scanout_diag >= 4 {
+        0
+    } else if want_scanout_exts {
+        1
+    } else {
+        2
+    };
     loop {
         let exts: &[&[u8]] = match ext_tier {
             0 => &EXT_FULL,

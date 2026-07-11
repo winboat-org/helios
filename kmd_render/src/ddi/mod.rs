@@ -11,7 +11,7 @@ mod escape;
 mod gdi_blit;
 mod gpummu;
 pub(crate) mod hpd;
-mod interrupt;
+pub(crate) mod interrupt;
 pub(crate) mod query_adapter_info;
 mod scanout_diag;
 mod scheduler;
@@ -33,6 +33,7 @@ pub use create_allocation::{
     dxgkddi_destroy_allocation, dxgkddi_get_standard_allocation_driver_data,
     dxgkddi_open_allocation,
 };
+pub(crate) use display::VIDPN_SOURCE_ADDRESS_COUNT;
 pub use display::{
     diag_dump_present_atomics, dxgkddi_commit_vidpn, dxgkddi_enum_vidpn_cofunc_modality,
     dxgkddi_exchange_pre_start_info, dxgkddi_get_scan_line, dxgkddi_is_supported_vidpn,
@@ -62,6 +63,7 @@ pub use start_device::{
     dxgkddi_reset_device, dxgkddi_set_power_state, dxgkddi_start_device, dxgkddi_stop_device,
     dxgkddi_unload, vsync_dpc_routine,
 };
+pub(crate) use submit_command::DMA_STALE_SKIP_COUNT;
 pub use submit_command::{
     diag_dump_engine_atomics, dxgkddi_collect_dbg_info, dxgkddi_patch, dxgkddi_preempt_command,
     dxgkddi_query_current_fence, dxgkddi_render, dxgkddi_render_gdi, dxgkddi_render_km,

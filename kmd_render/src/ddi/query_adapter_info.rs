@@ -1,9 +1,7 @@
 //! `DxgkDdiQueryAdapterInfo` — report adapter capabilities.
 //!
-//! Gate-1 render-only adapter capability reporting.
-//!
-//! This deliberately reports only base driver caps until the segment, GPU-VA,
-//! paging, and scheduler paths are real. No fake aperture/GPU-MMU caps.
+//! Capability reporting for the active render+display adapter. The legacy
+//! knob-off render-only shape remains available for recovery/A-B testing.
 //!
 //! Reference: https://learn.microsoft.com/windows-hardware/drivers/ddi/d3dkmddi/nc-d3dkmddi-dxgkddi_queryadapterinfo
 
@@ -20,7 +18,7 @@ use crate::dxgk::_DXGK_QUERYADAPTERINFOTYPE::{
     DXGKQAITYPE_QUERYSEGMENT, DXGKQAITYPE_QUERYSEGMENT3, DXGKQAITYPE_QUERYSEGMENT4,
     DXGKQAITYPE_WDDMDEVICECAPS,
 };
-use crate::dxgk::_DXGK_WDDMVERSION::{DXGKDDI_WDDMv1_3, DXGKDDI_WDDMv3_2};
+use crate::dxgk::_DXGK_WDDMVERSION::{DXGKDDI_WDDMv1_3, DXGKDDI_WDDMv2_1, DXGKDDI_WDDMv3_2};
 use crate::dxgk::*;
 
 use crate::adapter::AdapterContext;
@@ -122,7 +120,11 @@ unsafe fn query_driver_caps(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTE
     // DRIVER_INITIALIZATION_DATA.Version. Dxgkrnl rejects internally
     // inconsistent version/capability surfaces during AddAdapter.
     caps.WDDMVersion = if RAISE_WDDM_3_2_GPUMMU {
-        DXGKDDI_WDDMv3_2
+        if USE_WDDM_2_1_DISPLAY_SURFACE {
+            DXGKDDI_WDDMv2_1
+        } else {
+            DXGKDDI_WDDMv3_2
+        }
     } else {
         DXGKDDI_WDDMv1_3
     };
@@ -281,7 +283,11 @@ unsafe fn query_wddm_device_caps(args: &DXGKARG_QUERYADAPTERINFO) -> NTSTATUS {
     let caps = unsafe { &mut *(args.pOutputData as *mut DXGK_WDDMDEVICECAPS) };
     unsafe { core::ptr::write_bytes(args.pOutputData as *mut u8, 0, args.OutputDataSize as usize) };
     caps.WDDMVersion = if RAISE_WDDM_3_2_GPUMMU {
-        DXGKDDI_WDDMv3_2
+        if USE_WDDM_2_1_DISPLAY_SURFACE {
+            DXGKDDI_WDDMv2_1
+        } else {
+            DXGKDDI_WDDMv3_2
+        }
     } else {
         DXGKDDI_WDDMv1_3
     };
@@ -422,7 +428,17 @@ pub(crate) const DECLARE_CROSS_ADAPTER_RESOURCE: bool = false;
 /// VidMm paging path that historically bugchecked (InitDmaPools Code-43,
 /// 0x10E:0x49). If boot destabilizes, flip `false` + redeploy to revert to the
 /// known-good 1.3 surface. See `WDDM_SYNC_REDESIGN.md` M1.
+// Keep the coherent GPU-VA/GpuMmu contract enabled: the DisplayHalf activation
+// commit was proven on this modern memory model, while the 1.3 fallback commits
+// the enumerated monitor as a zero-path/powered-off VidPn on Windows 11 24H2.
 pub(crate) const RAISE_WDDM_3_2_GPUMMU: bool = true;
+
+// DWM treats a WDDM 2.2+ display adapter as a Display-Core/MPO3 presentation
+// device. Helios does not register the MPO3 KMD interface, so 3.2 makes DWM call
+// CDDisplaySwapChain's unimplemented legacy-present slot and fail-fast with
+// E_NOTIMPL. WDDM 2.1 is the truthful middle contract: modern GpuMmu/ManagedPrimary
+// activation, but below the MPO3 requirement boundary.
+pub(crate) const USE_WDDM_2_1_DISPLAY_SURFACE: bool = true;
 
 /// `DirectFlipCaps` service knob (REG_DWORD, default 0): 0 = deny direct flip
 /// everywhere (adapter cap + aperture segment flags — the truthful surface for

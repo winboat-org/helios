@@ -19,6 +19,7 @@ use crate::ddi;
 use crate::log_line;
 use core::ffi::c_void;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use windows::Win32::Graphics::Direct3D11::ID3D11Resource;
 
 /// One cached dcomp-vehicle present source (road 4): an alias-imported D3D11
 /// texture over the producing ICD's frame blob, keyed by venus resid. Owns
@@ -61,8 +62,40 @@ pub struct HeliosDevice {
     pub dxvk: cxx::UniquePtr<bridge::ffi::HeliosDxvkDevice>,
     pub h_rt_device: ddi::HANDLE,
     pub h_context: ddi::HANDLE,
+    /// Runtime-owned legacy command buffers returned by pfnCreateContextCb and
+    /// recycled by pfnRenderCb. DXVK submits the real Venus work separately,
+    /// but DXGI Present still needs a WDDM submission so dxgkrnl drives the
+    /// display flip queue.
+    pub command_buffer: core::cell::Cell<*mut core::ffi::c_void>,
+    pub command_buffer_size: core::cell::Cell<u32>,
+    pub allocation_list: core::cell::Cell<*mut ddi::D3DDDI_ALLOCATIONLIST>,
+    pub allocation_list_size: core::cell::Cell<u32>,
+    pub patch_list: core::cell::Cell<*mut ddi::D3DDDI_PATCHLOCATIONLIST>,
+    pub patch_list_size: core::cell::Cell<u32>,
     pub kt_callbacks: *const ddi::D3DDDI_DEVICECALLBACKS,
     pub dxgi_callbacks: *mut ddi::DXGI_DDI_BASE_CALLBACKS,
+    /// Non-owning pointer to the largest scanout primary resource this UMD
+    /// created for the device. DXGI sometimes calls Present with no destination
+    /// allocation; in that case the UMD must still make the displayed primary
+    /// contain the source pixels before asking the KMD/runtime to present it.
+    pub scanout_resource_raw: core::cell::Cell<usize>,
+    pub scanout_resource_id: core::cell::Cell<u32>,
+    pub scanout_allocation: core::cell::Cell<u32>,
+    pub scanout_width: core::cell::Cell<u32>,
+    pub scanout_height: core::cell::Cell<u32>,
+    pub scanout_format: core::cell::Cell<u32>,
+    /// Owned direct-LINEAR import of the KMD VidPn primary. Only DWM creates
+    /// this; ordinary application devices never query or touch scanout 0.
+    pub scanout_import: core::cell::RefCell<Option<ID3D11Resource>>,
+    pub scanout_generation: core::cell::Cell<u32>,
+    /// Exact pPrimaryDesc allocation identity -> Venus scanout metadata.
+    /// DXGI can present a stable resource object while rotating its allocation
+    /// handle, so the allocation is the authoritative lookup key.
+    pub direct_scanout_allocations:
+        core::cell::RefCell<Vec<(u32, helios_protocol::HeliosPresentPrivateData)>>,
+    /// Owned reference to DWM's currently-bound full-mode optimal render target.
+    pub composition_source: core::cell::RefCell<Option<ID3D11Resource>>,
+    pub scanout_copy_count: core::cell::Cell<u64>,
     /// Runtime corelayer handle + callbacks (pfnSetErrorCb) so VOID-returning
     /// DDIs can report failures to the runtime instead of leaving null handles.
     pub h_rt_core_layer: *mut core::ffi::c_void,
@@ -406,6 +439,12 @@ pub unsafe fn create_runtime_context(dev: &mut HeliosDevice) {
     ));
     if hr == 0 {
         dev.h_context = arg.hContext;
+        dev.command_buffer.set(arg.pCommandBuffer);
+        dev.command_buffer_size.set(arg.CommandBufferSize);
+        dev.allocation_list.set(arg.pAllocationList);
+        dev.allocation_list_size.set(arg.AllocationListSize);
+        dev.patch_list.set(arg.pPatchLocationList);
+        dev.patch_list_size.set(arg.PatchLocationListSize);
     }
 }
 

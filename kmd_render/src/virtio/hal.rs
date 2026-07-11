@@ -79,6 +79,23 @@ impl DmaBuffer {
     pub fn physical_address(&self) -> u64 {
         self.pa as u64
     }
+
+    /// Page-rounded allocation capacity. Reuse callers may request any logical
+    /// length up to this value without another contiguous-memory allocation.
+    pub fn capacity(&self) -> usize {
+        self.pages * PAGE_SIZE
+    }
+
+    /// Prepare a completed buffer for a new command. Returns false when the new
+    /// logical length does not fit. Callers overwrite every device-read byte;
+    /// the device overwrites every response byte, so no clearing is required.
+    pub fn reset(&mut self, len: usize) -> bool {
+        if len == 0 || len > self.capacity() {
+            return false;
+        }
+        self.len = len;
+        true
+    }
 }
 
 impl Drop for DmaBuffer {

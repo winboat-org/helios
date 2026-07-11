@@ -55,6 +55,16 @@ struct AllocationContext {
     /// Nonzero when the standard allocation's memory is bound to a kernel-created
     /// Venus `VkImage` (the shared-primary scanout path).
     venus_image_id: u64,
+    /// Lazily-created kernel-Venus alias of an adopted UMD OPTIMAL image. The
+    /// alias imports `resource_id` memory and exists solely so the KMD can copy
+    /// the exact SetVidPn primary into its durable LINEAR scanout image.
+    scanout_copy_image_id: core::sync::atomic::AtomicU64,
+    scanout_copy_memory_id: core::sync::atomic::AtomicU64,
+    scanout_copy_pool_id: core::sync::atomic::AtomicU64,
+    scanout_copy_command_buffer_id: core::sync::atomic::AtomicU64,
+    scanout_copy_target_image_id: core::sync::atomic::AtomicU64,
+    scanout_copy_last_fence: core::sync::atomic::AtomicU64,
+    scanout_copy_owns_source_alias: AtomicU32,
     size: SIZE_T,
     /// Host-visible window byte offset this blob is mapped at (Stage 2b).
     map_offset: u64,
@@ -67,6 +77,10 @@ struct AllocationContext {
     width: u32,
     height: u32,
     format: u32, // D3DDDIFORMAT
+    /// Exact D3D11 DDI bind flags supplied by the creator. The KMD Venus
+    /// source alias must reproduce the OPTIMAL image's usage contract for
+    /// external-memory aliasing on NVIDIA.
+    bind_flags: u32,
     /// Row pitch in bytes as the UMD laid the surface out (`cross_adapter_pitch`,
     /// 256-aligned — NOT `width*4`). `SetVidPnSourceAddress`'s `SET_SCANOUT_BLOB`
     /// must use THIS stride so the host reads rows at the right offset (a `width*4`
@@ -77,8 +91,11 @@ struct AllocationContext {
     /// `format` field above is lossy (both B8G8R8A8 and R8G8B8A8 collapse to
     /// A8R8G8B8), so the scan-out format is resolved from this.
     dxgi_format: u32,
-    /// Byte offset of memory-plane-0 within the backing allocation (from the
-    /// UMD's `vkGetImageSubresourceLayout` on the DRM-modifier scan-out primary).
+    /// The UMD created this exact `pPrimaryDesc` allocation as a plain LINEAR
+    /// DMA_BUF and recorded the verified direct-scanout marker in its meta.
+    direct_scanout: bool,
+    /// Byte offset of the plain-LINEAR COLOR plane within the backing allocation
+    /// (from the UMD's `vkGetImageSubresourceLayout` on a direct primary).
     /// `SetVidPnSourceAddress`'s `SET_SCANOUT_BLOB` uses it as the plane offset;
     /// 0 for surfaces whose data starts at offset 0.
     plane_offset: u64,
@@ -223,6 +240,10 @@ pub(crate) struct ScanoutInfo {
     pub dxgi_format: u32,
     /// Memory-plane-0 byte offset for `SET_SCANOUT_BLOB` (0 if data starts at 0).
     pub plane_offset: u64,
+    /// Exact Venus allocation identity used by cross-context imports.
+    pub venus_alloc_size: u64,
+    pub memory_type_index: u32,
+    pub direct_scanout: bool,
 }
 
 /// Resolve a primary allocation's `hAllocation` (the CreateAllocation handle
@@ -244,7 +265,168 @@ pub(crate) unsafe fn scanout_alloc_info(h: HANDLE) -> Option<ScanoutInfo> {
         pitch: ctx.pitch,
         dxgi_format: ctx.dxgi_format,
         plane_offset: ctx.plane_offset,
+        venus_alloc_size: ctx.venus_alloc_size,
+        memory_type_index: ctx.memory_type_index,
+        direct_scanout: ctx.direct_scanout,
     })
+}
+
+fn cached_prepared_copy(
+    ctx: &AllocationContext,
+) -> Option<crate::virtio::venus::PreparedImageCopy> {
+    let command_buffer_id = ctx.scanout_copy_command_buffer_id.load(Ordering::Acquire);
+    if command_buffer_id == 0 {
+        return None;
+    }
+    let owns_source_alias = ctx.scanout_copy_owns_source_alias.load(Ordering::Relaxed) != 0;
+    Some(crate::virtio::venus::PreparedImageCopy {
+        owns_source_alias,
+        source_resource_id: if owns_source_alias {
+            ctx.resource_id
+        } else {
+            0
+        },
+        source_image_id: ctx.scanout_copy_image_id.load(Ordering::Relaxed),
+        source_memory_id: ctx.scanout_copy_memory_id.load(Ordering::Relaxed),
+        command_pool_id: ctx.scanout_copy_pool_id.load(Ordering::Relaxed),
+        command_buffer_id,
+        target_image_id: ctx.scanout_copy_target_image_id.load(Ordering::Relaxed),
+        width: ctx.width,
+        height: ctx.height,
+    })
+}
+
+fn publish_prepared_copy(ctx: &AllocationContext, copy: &crate::virtio::venus::PreparedImageCopy) {
+    // command_buffer_id is the publish word. A reader that acquires a nonzero
+    // command id sees one coherent immutable PreparedImageCopy snapshot.
+    ctx.scanout_copy_owns_source_alias
+        .store(copy.owns_source_alias as u32, Ordering::Relaxed);
+    ctx.scanout_copy_image_id
+        .store(copy.source_image_id, Ordering::Relaxed);
+    ctx.scanout_copy_memory_id
+        .store(copy.source_memory_id, Ordering::Relaxed);
+    ctx.scanout_copy_pool_id
+        .store(copy.command_pool_id, Ordering::Relaxed);
+    ctx.scanout_copy_target_image_id
+        .store(copy.target_image_id, Ordering::Relaxed);
+    ctx.scanout_copy_command_buffer_id
+        .store(copy.command_buffer_id, Ordering::Release);
+}
+
+fn clear_prepared_copy(ctx: &AllocationContext) {
+    ctx.scanout_copy_command_buffer_id
+        .store(0, Ordering::Release);
+    ctx.scanout_copy_last_fence.store(0, Ordering::Relaxed);
+    ctx.scanout_copy_target_image_id.store(0, Ordering::Relaxed);
+    ctx.scanout_copy_pool_id.store(0, Ordering::Relaxed);
+    ctx.scanout_copy_memory_id.store(0, Ordering::Relaxed);
+    ctx.scanout_copy_image_id.store(0, Ordering::Relaxed);
+    ctx.scanout_copy_owns_source_alias
+        .store(0, Ordering::Relaxed);
+}
+
+/// Submit a GPU copy from the exact allocation selected by
+/// `SetVidPnSourceAddress` into the durable adapter-owned LINEAR scanout image.
+/// Setup (external-memory import + command recording) happens once per WDDM
+/// allocation; the frame path only queues the reusable command buffer and
+/// returns its ring-1 GPU-completion fence.
+///
+/// SAFETY: `h` is the live `hAllocation` passed by dxgkrnl to
+/// SetVidPnSourceAddress. PASSIVE_LEVEL only (the Venus client mutex may wait).
+pub(crate) unsafe fn submit_primary_scanout_copy(
+    adapter: &AdapterContext,
+    h: HANDLE,
+    target_image_id: u64,
+    width: u32,
+    height: u32,
+) -> Result<u64, NTSTATUS> {
+    if h.is_null() || target_image_id == 0 || width == 0 || height == 0 {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    let ctx = unsafe { &*(h as *const AllocationContext) };
+    if ctx.magic != ALLOCATION_CTX_MAGIC
+        || ctx.resource_id == 0
+        || ctx.width != width
+        || ctx.height != height
+    {
+        crate::diag::record_named_bytes(b"CpCpy", 0xE1);
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    const DXGI_FORMAT_B8G8R8A8_UNORM: u32 = 87;
+    const DXGI_FORMAT_B8G8R8X8_UNORM: u32 = 88;
+    if ctx.dxgi_format != DXGI_FORMAT_B8G8R8A8_UNORM
+        && ctx.dxgi_format != DXGI_FORMAT_B8G8R8X8_UNORM
+    {
+        crate::diag::record_named_bytes(b"CpFmt", ctx.dxgi_format);
+        crate::diag::record_named_bytes(b"CpCpy", 0xE2);
+        return Err(STATUS_NOT_SUPPORTED);
+    }
+
+    let result = adapter.with_venus_client(|client| {
+        let mut prepared = cached_prepared_copy(ctx);
+        if prepared
+            .as_ref()
+            .map(|p| p.target_image_id != target_image_id)
+            .unwrap_or(false)
+        {
+            let old = prepared.take().unwrap();
+            let last = ctx.scanout_copy_last_fence.load(Ordering::Acquire);
+            client.destroy_prepared_image_copy(adapter, old, last)?;
+            clear_prepared_copy(ctx);
+        }
+        let copy = match prepared {
+            Some(copy) => copy,
+            None => {
+                let copy = if ctx.venus_image_id != 0 {
+                    client.prepare_existing_linear_source_copy(
+                        adapter,
+                        ctx.venus_image_id,
+                        width,
+                        height,
+                        target_image_id,
+                    )?
+                } else {
+                    client.prepare_optimal_bgra_copy(
+                        adapter,
+                        ctx.resource_id,
+                        ctx.venus_alloc_size,
+                        ctx.memory_type_index,
+                        width,
+                        height,
+                        ctx.bind_flags,
+                        target_image_id,
+                    )?
+                };
+                publish_prepared_copy(ctx, &copy);
+                copy
+            }
+        };
+        let fence = client.submit_prepared_image_copy(adapter, &copy)?;
+        ctx.scanout_copy_last_fence.store(fence, Ordering::Release);
+        Ok::<u64, crate::virtio::VirtioError>(fence)
+    });
+
+    match result {
+        Ok(Ok(fence)) => {
+            let n = PRIMARY_COPY_SUBMIT_COUNT
+                .fetch_add(1, Ordering::Relaxed)
+                .wrapping_add(1);
+            if n == 1 || n % 600 == 0 {
+                crate::diag::record_named_bytes(b"CpCpy", 1);
+                crate::diag::record_named_bytes(b"CpFnc", fence as u32);
+                crate::diag::record_named_bytes(b"CpCnt", n);
+            }
+            Ok(fence)
+        }
+        Ok(Err(_)) => {
+            crate::diag::record_named_bytes(b"CpCpy", 0xE3);
+            Err(STATUS_DEVICE_NOT_READY)
+        }
+        Err(_) => {
+            crate::diag::record_named_bytes(b"CpCpy", 0xE4);
+            Err(STATUS_DEVICE_NOT_READY)
+        }
+    }
 }
 
 /// Record (or clear, with [`BAR_UNPLACED`]) an allocation's VidMm-assigned BAR
@@ -278,63 +460,9 @@ const CROSS_ADAPTER_PITCH_ALIGN: u32 = 256;
 /// AzureTriage — 36th session), which silently fails primary creation → no VidPn
 /// path. `create_one` reads this bit and suppresses `Cached` for the primary.
 const HELIOS_ALLOC_MISC_PRIMARY: u32 = 0x8000_0000;
-
-fn bind_created_scanout(adapter: &AdapterContext, resource_id: u32, meta: &HeliosWddmAllocMeta) {
-    if !adapter.display_half || resource_id == 0 {
-        return;
-    }
-    let (mode_w, mode_h) = adapter.display_mode();
-    let width = if meta.width != 0 { meta.width } else { mode_w };
-    let height = if meta.height != 0 {
-        meta.height
-    } else {
-        mode_h
-    };
-    let stride = if meta.pitch != 0 {
-        meta.pitch
-    } else {
-        cross_adapter_pitch(width)
-    };
-    const DXGI_FORMAT_B8G8R8A8_UNORM: u32 = 87;
-    const DXGI_FORMAT_B8G8R8X8_UNORM: u32 = 88;
-    let vformat = if meta.dxgi_format == DXGI_FORMAT_B8G8R8X8_UNORM {
-        helios_protocol::VIRTIO_GPU_FORMAT_B8G8R8X8_UNORM
-    } else {
-        helios_protocol::VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM
-    };
-    if meta.dxgi_format != 0
-        && meta.dxgi_format != DXGI_FORMAT_B8G8R8A8_UNORM
-        && meta.dxgi_format != DXGI_FORMAT_B8G8R8X8_UNORM
-    {
-        crate::diag::record_named_bytes(b"CScFmt", meta.dxgi_format);
-    }
-    crate::diag::record_named_bytes(b"CScRid", resource_id);
-    crate::diag::record_named_bytes(b"CScWH", (width << 16) | (height & 0xFFFF));
-    crate::diag::record_named_bytes(b"CScPch", stride);
-    crate::diag::record_named_bytes(b"CScOff", meta.plane_offset as u32);
-    if width != mode_w || height != mode_h || meta.dxgi_format != DXGI_FORMAT_B8G8R8X8_UNORM {
-        crate::diag::record_named_bytes(b"CScSet", 0xD);
-        return;
-    }
-    if crate::ddi::scanout_diag::rebind_if_forced(adapter, 10) {
-        return;
-    }
-    let set = crate::virtio::ctrl::set_scanout_blob(
-        adapter,
-        resource_id,
-        width,
-        height,
-        vformat,
-        stride,
-        meta.plane_offset as u32,
-    );
-    crate::diag::record_named_bytes(b"CScSet", if set.is_ok() { 1 } else { 0xE });
-    if set.is_ok() {
-        adapter.remember_scanout_blob(resource_id, width, height);
-        let flush = crate::virtio::ctrl::resource_flush(adapter, resource_id, width, height);
-        crate::diag::record_named_bytes(b"CScFlu", if flush.is_ok() { 1 } else { 0xE });
-    }
-}
+/// Set only by the UMD for the exact `pPrimaryDesc` surface after it has created
+/// the backing image as plain LINEAR + DMA_BUF and queried a valid COLOR layout.
+const HELIOS_ALLOC_MISC_DIRECT_SCANOUT: u32 = 0x4000_0000;
 
 fn round_up_page(n: SIZE_T) -> SIZE_T {
     n.saturating_add(PAGE - 1) & !(PAGE - 1)
@@ -353,6 +481,10 @@ pub(crate) fn cross_adapter_pitch(width: u32) -> u32 {
 /// venus resid ⇒ shared (sync problem), different ⇒ the surfaces never alias and
 /// the composed pixels are never copied into what the IDD reads.
 static ALLOC_EVENT_SEQ: AtomicU32 = AtomicU32::new(0);
+/// Successful exact-primary copy submissions. Fixed registry breadcrumbs are
+/// throttled from this counter; writing the registry per frame would itself
+/// throttle the display path.
+static PRIMARY_COPY_SUBMIT_COUNT: AtomicU32 = AtomicU32::new(0);
 
 fn record_alloc_event(resid: u32, width: u32, height: u32, ctx_id: u32, is_open: bool) {
     let i = (ALLOC_EVENT_SEQ.fetch_add(1, Ordering::Relaxed) % 8) as u8;
@@ -481,7 +613,38 @@ unsafe fn write_open_identity(
 /// PASSIVE_LEVEL (DxgkDdiDestroyAllocation) — the round-trips ride
 /// `virtio::ctrl`'s PASSIVE waits.
 unsafe fn destroy_allocation_ctx(adapter: &AdapterContext, ctx: Box<AllocationContext>) {
-    if ctx.resource_id != 0 && ctx.owns_resource {
+    // A prepared scanout copy owns a command buffer which may still be queued
+    // through the outer async SUBMIT_3D. Drain that GPU-completion fence and
+    // tear the prepared objects down BEFORE touching the allocation's resource,
+    // image, or memory. On an ambiguous drain failure, leak the allocation's
+    // host objects to Venus-context teardown rather than use-after-free them.
+    if let Some(copy) = cached_prepared_copy(&ctx) {
+        let last_fence = ctx.scanout_copy_last_fence.load(Ordering::Acquire);
+        let drained = adapter
+            .with_venus_client(|client| {
+                client.destroy_prepared_image_copy(adapter, copy, last_fence)
+            })
+            .map(|r| r.is_ok())
+            .unwrap_or(false);
+        if !drained {
+            crate::diag::record_named_bytes(b"CpDrn", 0xE);
+            drop(ctx);
+            return;
+        }
+        clear_prepared_copy(&ctx);
+        crate::diag::record_named_bytes(b"CpDrn", 1);
+    }
+
+    // A DWM import of the adapter-owned LINEAR target can acquire a transient
+    // WDDM AllocationContext carrying the same resource id.  That allocation
+    // is only an importer: destroying it must not clear, detach, unref, or
+    // destroy the adapter-owned scanout image/memory.
+    let adapter_owned_scanout = ctx.resource_id != 0
+        && adapter.dedicated_scanout_resource.load(Ordering::Acquire) == ctx.resource_id;
+    if ctx.resource_id != 0 && !adapter_owned_scanout {
+        adapter.forget_primary_scanout(ctx.resource_id);
+    }
+    if ctx.resource_id != 0 && ctx.owns_resource && !adapter_owned_scanout {
         // Drop the owner-0 tracking slot (registered at CreateAllocation, or
         // re-owned to the allocation at adopt), unmapping the GDI executor's
         // host-visible mapping if one is live.
@@ -511,6 +674,8 @@ unsafe fn destroy_allocation_ctx(adapter: &AdapterContext, ctx: Box<AllocationCo
             // reclaims everything anyway.
             let _ = adapter.with_venus_client(|c| c.free_memory_blob(adapter, ctx.venus_memory_id));
         }
+    } else if adapter_owned_scanout {
+        crate::diag::record_named_bytes(b"CpKeep", ctx.resource_id);
     }
     drop(ctx);
 }
@@ -782,6 +947,13 @@ unsafe fn create_one(
         blob_id: ap.blob_id,
         venus_memory_id,
         venus_image_id,
+        scanout_copy_image_id: core::sync::atomic::AtomicU64::new(0),
+        scanout_copy_memory_id: core::sync::atomic::AtomicU64::new(0),
+        scanout_copy_pool_id: core::sync::atomic::AtomicU64::new(0),
+        scanout_copy_command_buffer_id: core::sync::atomic::AtomicU64::new(0),
+        scanout_copy_target_image_id: core::sync::atomic::AtomicU64::new(0),
+        scanout_copy_last_fence: core::sync::atomic::AtomicU64::new(0),
+        scanout_copy_owns_source_alias: AtomicU32::new(0),
         size,
         map_offset: 0,
         map_len: 0,
@@ -789,8 +961,10 @@ unsafe fn create_one(
         width: meta.width,
         height: meta.height,
         format: meta.format,
+        bind_flags: meta.bind_flags,
         pitch: meta.pitch,
         dxgi_format: meta.dxgi_format,
+        direct_scanout: (meta.misc_flags & HELIOS_ALLOC_MISC_DIRECT_SCANOUT) != 0,
         plane_offset: meta.plane_offset,
         venus_alloc_size: meta.venus_alloc_size,
         memory_type_index: meta.memory_type_index,
@@ -883,9 +1057,9 @@ unsafe fn create_one(
                 .set_Cached(1);
         }
     }
-    if is_primary {
-        bind_created_scanout(adapter, resource_id, &meta);
-    }
+    // Allocation creation is not a scanout-selection event. Modern DWM creates
+    // and rotates multiple ManagedPrimary allocations; only
+    // SetVidPnSourceAddress identifies the one Windows selected for this flip.
     crate::diag::record(0x0C12_0000 | ((size >> 12).min(0xFFFF) as u32));
     crate::diag::record(
         0x0C13_0000

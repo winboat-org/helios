@@ -1,14 +1,13 @@
 //! Helios vGPU kernel-mode driver (KMD).
 //!
-//! A WDDM 3.2 render-only display miniport driver for the virtio-gpu device
+//! A WDDM 3.2 render+display miniport driver for the virtio-gpu device
 //! (VEN_1AF4 & DEV_1050). `DriverEntry` registers our DDI table with Dxgkrnl via
 //! `DxgkInitialize`; from there Dxgkrnl drives the device lifecycle through the
 //! callbacks below.
 //!
-//! Implementation status: Gate 1 bring-up. This crate is intentionally separate
-//! from the working System-class `kmd` crate. It starts the WDDM render miniport
-//! path and bindgen/build plumbing without pretending the render, paging,
-//! scheduler, or UMD contracts are implemented.
+//! The active path implements rendering, scheduling, memory management, VidPn,
+//! and direct primary scanout. The older System-class `kmd` crate is reference
+//! material only.
 
 #![no_std]
 #![allow(non_snake_case, non_camel_case_types, non_upper_case_globals)]
@@ -95,7 +94,11 @@ fn build_ddi_table() -> DRIVER_INITIALIZATION_DATA {
     // 24H2 user-mode driver (STATUS_REVISION_MISMATCH), and the struct ABI we
     // bindgen is already the 26100/WDDM-3.2 shape.
     data.Version = if crate::ddi::query_adapter_info::RAISE_WDDM_3_2_GPUMMU {
-        DXGKDDI_INTERFACE_VERSION_WDDM3_2
+        if crate::ddi::query_adapter_info::USE_WDDM_2_1_DISPLAY_SURFACE {
+            DXGKDDI_INTERFACE_VERSION_WDDM2_1
+        } else {
+            DXGKDDI_INTERFACE_VERSION_WDDM3_2
+        }
     } else {
         DXGKDDI_INTERFACE_VERSION_WDDM1_3
     };

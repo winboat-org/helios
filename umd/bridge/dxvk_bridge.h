@@ -55,10 +55,21 @@ struct HeliosDxvkDevice {
       std::uint32_t renderer_resource_id,
       std::uint64_t venus_alloc_size,
       std::uint32_t memory_type_index,
-      bool scanout_modifier) const;
+      bool scanout_linear,
+      bool linear_scanout_target) const;
 
-  // Create the DWM scan-out primary as a DRM_FORMAT_MODIFIER(LINEAR) +
-  // DMA_BUF-exportable image (via the D3D11_HELIOS_CREATE_INFO scan-out marker),
+  // Query the KMD's currently-bound LINEAR VidPn primary through this device's
+  // Venus instance, import it as a direct LINEAR transfer destination, and
+  // return one owned ID3D11Resource reference. Zero means not yet available.
+  std::size_t open_kmd_scanout_target(
+      std::uint32_t* out_resource_id,
+      std::uint32_t* out_width,
+      std::uint32_t* out_height,
+      std::uint32_t* out_pitch,
+      std::uint32_t* out_generation) const;
+
+  // Create the DWM scan-out primary as a dedicated DMA_BUF-exportable image
+  // (via the D3D11_HELIOS_CREATE_INFO scan-out marker),
   // and report its real memory-plane-0 row pitch + offset (from
   // vkGetImageSubresourceLayout) so the KMD programs SET_SCANOUT_BLOB with the
   // exact host layout. Returns an owned ID3D11Resource* (as usize), or 0.
@@ -68,6 +79,7 @@ struct HeliosDxvkDevice {
       std::uint32_t format,
       std::uint32_t bind_flags,
       std::uint32_t misc_flags,
+      bool optimal_scanout,
       std::uint64_t* out_row_pitch,
       std::uint64_t* out_offset) const;
 

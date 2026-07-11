@@ -7,7 +7,7 @@ use core::ffi::c_void;
 use core::mem::size_of;
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use crate::adapter::AdapterContext;
+use crate::adapter::{AdapterContext, WddmNotifyGuard};
 use crate::ddi::gdi_blit;
 use crate::dxgk::_DXGK_INTERRUPT_TYPE::DXGK_INTERRUPT_DMA_COMPLETED;
 use crate::dxgk::*;
@@ -30,6 +30,9 @@ pub static DMA_NOTIFY_COUNT: AtomicU32 = AtomicU32::new(0);
 pub static DMA_QUEUE_DPC_COUNT: AtomicU32 = AtomicU32::new(0);
 pub static DMA_SYNC_STATUS_LOW: AtomicU32 = AtomicU32::new(0);
 pub static DMA_SYNC_RET: AtomicU32 = AtomicU32::new(0);
+/// Older DMA_COMPLETED packets suppressed after a newer watermark won the
+/// cross-CPU notification race. The newer watermark implicitly retires them.
+pub static DMA_STALE_SKIP_COUNT: AtomicU32 = AtomicU32::new(0);
 
 /// Mirror the DISPATCH-safe engine tracers into the PASSIVE diag ring. Call ONLY
 /// from a PASSIVE DDI (DxgkDdiDestroyDevice). Codes (continuing the 0x0F.. space
@@ -67,6 +70,7 @@ pub fn diag_dump_engine_atomics() {
     crate::diag::record(0x0F10_0000 | (DMA_QUEUE_DPC_COUNT.load(Ordering::Relaxed) & 0xFFFF));
     crate::diag::record(0x0F11_0000 | (DMA_SYNC_STATUS_LOW.load(Ordering::Relaxed) & 0xFFFF));
     crate::diag::record(0x0F12_0000 | (DMA_SYNC_RET.load(Ordering::Relaxed) & 0xFFFF));
+    crate::diag::record(0x0F18_0000 | (DMA_STALE_SKIP_COUNT.load(Ordering::Relaxed) & 0xFFFF));
     // C3/M3.4 async-transport atoms:
     //   0x0F13_NNNN = async SUBMIT_3D enqueues   0x0F14_NNNN = completions
     //   0x0F15_NNNN = WDDM fences completed from the DPC
@@ -164,7 +168,34 @@ unsafe fn notify_at_dirql(
 /// Signal `DXGK_INTERRUPT_DMA_COMPLETED` for `fence` (see [`notify_at_dirql`]).
 /// Called from the interrupt DPC for venus-gated submissions (C3/M3.4) and
 /// directly for submissions with no venus work outstanding.
-pub(crate) unsafe fn signal_dma_completed(dxgkrnl: &DXGKRNL_INTERFACE, fence: u32) -> NTSTATUS {
+pub(crate) unsafe fn signal_dma_completed(
+    adapter: &AdapterContext,
+    dxgkrnl: &DXGKRNL_INTERFACE,
+    fence: u32,
+) -> NTSTATUS {
+    adapter.with_wddm_notify_lock(|guard| unsafe {
+        signal_dma_completed_locked(guard, dxgkrnl, fence)
+    })
+}
+
+/// Same notification with the adapter's WDDM notification lock already held.
+/// Queue arbitration and the callback must be one critical section; otherwise
+/// a DPC can pop fence N, a concurrent submit can observe an empty FIFO and
+/// report N+1 first, and VidSch bugchecks 0x119/1.
+pub(crate) unsafe fn signal_dma_completed_locked(
+    guard: &WddmNotifyGuard<'_>,
+    dxgkrnl: &DXGKRNL_INTERFACE,
+    fence: u32,
+) -> NTSTATUS {
+    let last = guard.completed_fence();
+    // Sequence comparison remains correct across u32 wrap: a forward id is
+    // within the next half of the sequence space; equal/backward is stale.
+    let forward = fence != last && fence.wrapping_sub(last) < 0x8000_0000;
+    if !forward {
+        DMA_STALE_SKIP_COUNT.fetch_add(1, Ordering::Relaxed);
+        return STATUS_SUCCESS;
+    }
+
     let mut interrupt = unsafe { core::mem::zeroed::<DXGKARGCB_NOTIFY_INTERRUPT_DATA>() };
     interrupt.InterruptType = DXGK_INTERRUPT_DMA_COMPLETED;
     // SAFETY: bindgen lowered the per-type union to __BindgenUnionField accessors;
@@ -174,7 +205,11 @@ pub(crate) unsafe fn signal_dma_completed(dxgkrnl: &DXGKRNL_INTERFACE, fence: u3
     completed.NodeOrdinal = 0;
     completed.EngineOrdinal = 0;
     // SAFETY: fully-initialized packet, live for the call.
-    unsafe { notify_at_dirql(dxgkrnl, &mut interrupt) }
+    let status = unsafe { notify_at_dirql(dxgkrnl, &mut interrupt) };
+    if status == STATUS_SUCCESS {
+        guard.set_completed_fence(fence);
+    }
+    status
 }
 
 /// Synthesize a `DXGK_INTERRUPT_CRTC_VSYNC` for the display half's single target
@@ -200,17 +235,17 @@ pub(crate) unsafe fn signal_crtc_vsync(
 /// Signal `DXGK_INTERRUPT_DMA_PREEMPTED` (see [`notify_at_dirql`]): the node's
 /// pending submissions are released back to the scheduler, which resubmits the
 /// incomplete ones later.
-unsafe fn signal_dma_preempted(
+unsafe fn signal_dma_preempted_locked(
+    guard: &WddmNotifyGuard<'_>,
     dxgkrnl: &DXGKRNL_INTERFACE,
     preempt_fence: u32,
-    last_completed: u32,
 ) -> NTSTATUS {
     let mut interrupt = unsafe { core::mem::zeroed::<DXGKARGCB_NOTIFY_INTERRUPT_DATA>() };
     interrupt.InterruptType = _DXGK_INTERRUPT_TYPE::DXGK_INTERRUPT_DMA_PREEMPTED;
     // SAFETY: DmaPreempted is the correct arm for DXGK_INTERRUPT_DMA_PREEMPTED.
     let preempted = unsafe { interrupt.__bindgen_anon_1.DmaPreempted.as_mut() };
     preempted.PreemptionFenceId = preempt_fence;
-    preempted.LastCompletedFenceId = last_completed;
+    preempted.LastCompletedFenceId = guard.completed_fence();
     preempted.NodeOrdinal = 0;
     preempted.EngineOrdinal = 0;
     // SAFETY: fully-initialized packet, live for the call.
@@ -223,22 +258,31 @@ unsafe fn signal_dma_preempted(
 /// during bring-up) or the transport is down; otherwise the interrupt DPC
 /// completes it once every async venus submission queued before it has retired
 /// (the real venus-driven WDDM fence — WDDM_FAKE_VIDMM_RESEARCH §C).
-fn note_and_maybe_signal(adapter: &AdapterContext, fence: u32, is_paging: bool) -> NTSTATUS {
+fn note_and_maybe_signal(
+    adapter: &AdapterContext,
+    fence: u32,
+    is_paging: bool,
+    wait_gpu: bool,
+) -> NTSTATUS {
     let dxgkrnl = match adapter.dxgkrnl() {
         Ok(interface) => interface,
         Err(_) => return STATUS_DEVICE_NOT_READY,
     };
-    let signal_now = adapter
-        .with_virtio(|v| v.note_wddm_submission(fence, is_paging))
-        // Transport down (bring-up / teardown): no venus work can gate it.
-        .unwrap_or(true);
-    if signal_now {
-        adapter.last_completed_fence.store(fence, Ordering::Release);
-        // SAFETY: dxgkrnl is the live callback interface; signal at correct IRQL.
-        unsafe { signal_dma_completed(dxgkrnl, fence) }
-    } else {
-        STATUS_SUCCESS
-    }
+    adapter.with_wddm_notify_lock(|guard| {
+        let signal_now = adapter
+            .with_virtio(|v| v.note_wddm_submission(guard, fence, is_paging, wait_gpu))
+            // Transport down (bring-up / teardown): no venus work can gate it.
+            .unwrap_or(true);
+        if signal_now {
+            if wait_gpu {
+                adapter.request_scanout_refresh();
+            }
+            // SAFETY: the notification lock is held and dxgkrnl is live.
+            unsafe { signal_dma_completed_locked(guard, dxgkrnl, fence) }
+        } else {
+            STATUS_SUCCESS
+        }
+    })
 }
 
 /// `DxgkDdiSubmitCommandVirtual` — submit a DMA buffer addressed by GPU virtual
@@ -274,7 +318,13 @@ pub unsafe extern "C" fn dxgkddi_submit_command_virtual(
         SUBMIT_PAGING_COUNT.fetch_add(1, Ordering::Relaxed);
     }
 
-    note_and_maybe_signal(adapter, fence, is_paging)
+    let wait_gpu = if submit.hContext.is_null() {
+        false
+    } else {
+        let context = unsafe { &*(submit.hContext as *const crate::device::ContextContext) };
+        context.direct_present_pending.swap(0, Ordering::AcqRel) != 0
+    };
+    note_and_maybe_signal(adapter, fence, is_paging, wait_gpu)
 }
 
 /// `DxgkDdiSubmitCommand` — submit a DMA buffer to the GPU. Critically, this is
@@ -303,7 +353,7 @@ pub unsafe extern "C" fn dxgkddi_submit_command(
         SUBMIT_PAGING_COUNT.fetch_add(1, Ordering::Relaxed);
     }
 
-    note_and_maybe_signal(adapter, fence, is_paging)
+    note_and_maybe_signal(adapter, fence, is_paging, false)
 }
 
 /// `DxgkDdiPreemptCommand` — VidSch wants the node's pending submissions back
@@ -324,14 +374,25 @@ pub unsafe extern "C" fn dxgkddi_preempt_command(
     let adapter = unsafe { &*(h_adapter as *const AdapterContext) };
     let preempt = unsafe { &*preempt_command };
 
-    let _dropped = adapter.with_virtio(|v| v.preempt_flush()).unwrap_or(0);
-    let last_completed = adapter.last_completed_fence.load(Ordering::Acquire);
     let dxgkrnl = match adapter.dxgkrnl() {
         Ok(interface) => interface,
         Err(_) => return STATUS_DEVICE_NOT_READY,
     };
-    // SAFETY: live callback interface; the packet is delivered at DIRQL.
-    unsafe { signal_dma_preempted(dxgkrnl, preempt.PreemptionFenceId, last_completed) }
+    // Preemption participates in the same VidSch fence stream as
+    // DMA_COMPLETED.  Keep clearing the pending FIFO, sampling the completed
+    // watermark, and reporting DMA_PREEMPTED in one notification critical
+    // section.  Otherwise a completion DPC can advance `last_completed_fence`
+    // after the FIFO is cleared but before this packet is built, causing the
+    // preemption packet to claim the preemption fence itself as already
+    // completed.  Dxgkrnl rejects that one-fence leap with bugcheck 0x119/1
+    // (observed: expected 0x17a, received 0x17b).
+    adapter.with_wddm_notify_lock(|guard| {
+        let _dropped = adapter.with_virtio(|v| v.preempt_flush(guard)).unwrap_or(0);
+        // SAFETY: the WDDM notification lock serializes this packet with every
+        // DMA_COMPLETED packet; the callback interface is live and delivery is
+        // raised to DIRQL by notify_at_dirql.
+        unsafe { signal_dma_preempted_locked(guard, dxgkrnl, preempt.PreemptionFenceId) }
+    })
 }
 
 /// `DxgkDdiResetFromTimeout` — TDR recovery. There is no hardware engine state
@@ -342,7 +403,12 @@ pub unsafe extern "C" fn dxgkddi_reset_from_timeout(h_adapter: *mut c_void) -> N
         return STATUS_INVALID_PARAMETER;
     }
     let adapter = unsafe { &*(h_adapter as *const AdapterContext) };
-    let _ = adapter.with_virtio(|v| v.preempt_flush());
+    // Prevent a DPC from taking a fence out of the pending FIFO while reset is
+    // discarding that same scheduler epoch.  Dxgkrnl owns the post-reset fence
+    // state; no completion from the abandoned epoch may escape concurrently.
+    adapter.with_wddm_notify_lock(|guard| {
+        let _ = adapter.with_virtio(|v| v.preempt_flush(guard));
+    });
     STATUS_SUCCESS
 }
 
@@ -370,7 +436,7 @@ pub unsafe extern "C" fn dxgkddi_restart_from_timeout(h_adapter: *mut c_void) ->
 /// yet); present so the render-capable DDI contract is real rather than a
 /// NOT_IMPLEMENTED stub.
 pub unsafe extern "C" fn dxgkddi_render(
-    _h_context: IN_CONST_HANDLE,
+    h_context: IN_CONST_HANDLE,
     render: INOUT_PDXGKARG_RENDER,
 ) -> NTSTATUS {
     RENDER_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -389,6 +455,79 @@ pub unsafe extern "C" fn dxgkddi_render(
     if cmd_len > dma_cap {
         // Buffer too small for the recorded command: ask the runtime to grow it.
         return STATUS_BUFFER_TOO_SMALL;
+    }
+
+    if cmd_len >= size_of::<helios_protocol::HeliosPresentRefreshCmd>() {
+        let command = unsafe {
+            core::ptr::read_unaligned(
+                args.pCommand
+                    .cast::<helios_protocol::HeliosPresentRefreshCmd>(),
+            )
+        };
+        if command.is_valid() {
+            if !h_context.is_null() {
+                let context = unsafe { &*(h_context as *const crate::device::ContextContext) };
+                if !context.device.is_null() && !unsafe { (*context.device).adapter.is_null() } {
+                    // The allocation identity was fixed once by
+                    // SetVidPnSourceAddress.  Ordinary presents only dirty that
+                    // durable target; they must never select a resource from
+                    // stale bytes beyond the 16-byte command.
+                    unsafe { &*(*context.device).adapter }.request_scanout_refresh();
+                }
+            }
+        }
+    }
+
+    if cmd_len >= size_of::<helios_protocol::HeliosPresentRenderCmd>() {
+        let command = unsafe {
+            core::ptr::read_unaligned(
+                args.pCommand
+                    .cast::<helios_protocol::HeliosPresentRenderCmd>(),
+            )
+        };
+        if command.is_valid() {
+            static PRESENT_RENDER_DIAG_COUNT: AtomicU32 = AtomicU32::new(0);
+            let diag = PRESENT_RENDER_DIAG_COUNT.fetch_add(1, Ordering::Relaxed) < 4;
+            if h_context.is_null() {
+                if diag {
+                    crate::diag::record_named_bytes(b"PRset", 0xE1);
+                }
+            } else {
+                let context = unsafe { &*(h_context as *const crate::device::ContextContext) };
+                if context.device.is_null() || unsafe { (*context.device).adapter.is_null() } {
+                    if diag {
+                        crate::diag::record_named_bytes(b"PRset", 0xE2);
+                    }
+                } else {
+                    let private = command.present;
+                    let direct_scanout = private.reserved
+                        & helios_protocol::HELIOS_PRESENT_PRIVATE_FLAG_DIRECT_SCANOUT
+                        != 0;
+                    let required_size = private.plane_offset.saturating_add(
+                        (private.pitch as u64).saturating_mul(private.height as u64),
+                    );
+                    if diag {
+                        crate::diag::record_named_bytes(b"PRsrc", private.resource_id);
+                        crate::diag::record_named_bytes(b"PRset", 1);
+                    }
+                    let published = super::display::issue_present_scanout(
+                        unsafe { &*(*context.device).adapter },
+                        private.resource_id,
+                        private.width,
+                        private.height,
+                        private.pitch,
+                        private.dxgi_format,
+                        private.plane_offset,
+                        required_size,
+                        direct_scanout,
+                        4,
+                    );
+                    if published {
+                        context.direct_present_pending.store(1, Ordering::Release);
+                    }
+                }
+            }
+        }
     }
 
     if args.PatchLocationListInSize > args.PatchLocationListOutSize {
@@ -598,7 +737,7 @@ pub unsafe extern "C" fn dxgkddi_query_current_fence(
             size_of::<DXGKARG_QUERYCURRENTFENCE>(),
         );
     }
-    query.CurrentFence = adapter.last_completed_fence.load(Ordering::Acquire);
+    query.CurrentFence = adapter.completed_fence();
     query.NodeOrdinal = 0;
     query.EngineOrdinal = 0;
     STATUS_SUCCESS
@@ -641,7 +780,7 @@ pub unsafe extern "C" fn dxgkddi_collect_dbg_info(
         // SAFETY: dxgkrnl passes the adapter context handle it got from
         // DxgkDdiAddDevice; valid for the adapter's lifetime. Atomic load only.
         let adapter = unsafe { &*(h_adapter as *const AdapterContext) };
-        adapter.last_completed_fence.load(Ordering::Relaxed) as u32
+        adapter.completed_fence()
     };
     let report: [u32; 35] = [
         0x4844_4247, // 'HDBG'

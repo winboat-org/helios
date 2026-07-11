@@ -28,7 +28,7 @@
 //!     blocks at PASSIVE_LEVEL in `virtio::ctrl`, NEVER at DISPATCH under the
 //!     device spinlock (the 2026-07-04 Escape-convoy root cause).
 //!   * Completed entries are parked (their `DmaBuffer`s are PASSIVE-only to
-//!     free) and reaped by PASSIVE callers via [`VirtioGpu::swap_parked`].
+//!     free) and reaped by PASSIVE callers via [`VirtioGpu::begin_parked_reap`].
 //!
 //! The used-ring consumer is [`VirtioGpu::drain_used`], called from the
 //! interrupt DPC (`ddi/interrupt.rs`) and opportunistically (under the same
@@ -114,6 +114,22 @@ pub static WDDM_FENCE_FROM_DPC: AtomicU32 = AtomicU32::new(0);
 pub static RING_SUBMIT_COUNT: AtomicU32 = AtomicU32::new(0);
 /// ring_idx >= 1 completions drained from the used ring.
 pub static RING_COMPLETE_COUNT: AtomicU32 = AtomicU32::new(0);
+/// Fire-and-forget control commands queued by PASSIVE workers (currently the
+/// scanout RESOURCE_FLUSH path).  These own their DMA buffers until the normal
+/// used-ring drain retires them, but never park a stack waiter.
+pub static ASYNC_CTRL_COUNT: AtomicU32 = AtomicU32::new(0);
+/// Completed fire-and-forget control commands.
+pub static ASYNC_CTRL_COMPLETE_COUNT: AtomicU32 = AtomicU32::new(0);
+/// Fire-and-forget control responses that were not VIRTIO_GPU_RESP_OK_*.
+pub static ASYNC_CTRL_RESP_ERRORS: AtomicU32 = AtomicU32::new(0);
+/// Reused PASSIVE-allocated command buffers served from the bounded DMA pool.
+pub static DMA_POOL_HITS: AtomicU32 = AtomicU32::new(0);
+/// Command buffers that required a fresh PASSIVE allocation.
+pub static DMA_POOL_MISSES: AtomicU32 = AtomicU32::new(0);
+/// Completed buffers not cached because they exceeded a pool bound.
+pub static DMA_POOL_DROPS: AtomicU32 = AtomicU32::new(0);
+/// Current bytes retained in the DMA pool (page-rounded capacities).
+pub static DMA_POOL_CACHED_BYTES: AtomicU32 = AtomicU32::new(0);
 
 // ── Fence-event table telemetry (REGISTER_FENCE_EVENT, KMD 22.22.54) ────────
 // The usermode-event replacement for blocking WAIT_FENCE escapes (PSC WS2:
@@ -461,6 +477,12 @@ pub const MAX_INFLIGHT: usize = CTRL_QUEUE_SIZE;
 /// refused once `parked` crosses [`PARKED_ENQUEUE_GATE`], and one drain can
 /// park at most `MAX_INFLIGHT` entries, so this bound is never exceeded.
 pub const MAX_PARKED: usize = 4 * MAX_INFLIGHT;
+/// Completed command buffers retained for reuse. Count, individual capacity,
+/// and total bytes are all bounded: a rare large Venus CS must never pin a
+/// correspondingly large physically-contiguous allocation for device lifetime.
+const MAX_DMA_POOL: usize = 128;
+const MAX_DMA_POOL_BUFFER_BYTES: usize = 64 * 1024;
+const MAX_DMA_POOL_BYTES: usize = 2 * 1024 * 1024;
 /// Enqueue refusal threshold for the parked table (forces the PASSIVE caller
 /// to reap before submitting more).
 const PARKED_ENQUEUE_GATE: usize = MAX_PARKED - MAX_INFLIGHT;
@@ -501,6 +523,15 @@ pub struct SyncWaitBlock {
     /// The device-written response bytes, copied out of the entry's DMA buffer
     /// by `drain_used` before the event is signaled.
     resp: UnsafeCell<[u8; SYNC_RESP_MAX]>,
+}
+
+/// Stable adapter-owned notification target for a scanout copy submitted on a
+/// GPU-completion ring. The used-ring drain sets `pending` and wakes `event`
+/// only after a successful ring-1 SUBMIT_3D completion.
+#[derive(Clone, Copy)]
+pub struct AsyncScanoutNotify {
+    pub pending: NonNull<AtomicU32>,
+    pub event: NonNull<KEVENT>,
 }
 
 impl SyncWaitBlock {
@@ -548,7 +579,23 @@ enum InFlightKind {
     /// `ring_idx` 0 = host CPU ring (retires at decode); >= 1 = a per-queue
     /// GPU-completion fence (virglrenderer vkr sync thread) that legally stays
     /// in flight for the full GPU-work duration.
-    AsyncVenus { fence_id: u64, ring_idx: u8 },
+    AsyncVenus {
+        fence_id: u64,
+        ring_idx: u8,
+        scanout_notify: Option<AsyncScanoutNotify>,
+    },
+    /// A control command whose caller must not wait for the host response.
+    /// `completion` is a stable adapter-owned 0/1 gate; the used-ring drain
+    /// clears it and wakes the stable worker event.  This lets scanout refresh
+    /// coalesce to one outstanding RESOURCE_FLUSH without a synchronous ctrl
+    /// round-trip limiting presentation cadence.
+    AsyncControl {
+        completion: NonNull<AtomicU32>,
+        completion_errors: NonNull<AtomicU32>,
+        wake_event: NonNull<KEVENT>,
+        success_store: Option<(NonNull<AtomicU32>, u32)>,
+        resubmit: Option<NonNull<AtomicU32>>,
+    },
 }
 
 /// One outstanding control-queue submission. Owns its device-visible buffers
@@ -570,6 +617,14 @@ pub struct InFlight {
     /// Separate device-read venus payload (async submits).
     venus: Option<DmaBuffer>,
     venus_len: usize,
+}
+
+impl InFlight {
+    /// Recover the entry-owned DMA buffers after the device has consumed them.
+    /// Called only by the PASSIVE reaper after the entry leaves `parked`.
+    pub fn into_dma_buffers(self) -> (DmaBuffer, Option<DmaBuffer>) {
+        (self.meta, self.venus)
+    }
 }
 
 /// A registered WAIT_FENCE waiter.
@@ -612,6 +667,14 @@ pub enum FenceEventReg {
 struct WddmPending {
     fence: u32,
     watermark: u64,
+    wait_gpu: bool,
+    refresh_scanout: bool,
+}
+
+#[derive(Clone, Copy)]
+pub struct WddmReady {
+    pub fence: u32,
+    pub refresh_scanout: bool,
 }
 
 /// Result of [`VirtioGpu::fence_wait_prepare`].
@@ -726,6 +789,15 @@ pub struct VirtioGpu {
     /// Completed entries awaiting a PASSIVE reap (`swap_parked`). Capacity
     /// MAX_PARKED, reserved at init.
     parked: Vec<InFlight>,
+    /// Empty pre-reserved vectors swapped through the PASSIVE reaper. This
+    /// removes two kernel-heap allocations from every tiny Venus completion.
+    parked_spare: Vec<InFlight>,
+    reap_buffers_spare: Vec<DmaBuffer>,
+    reap_in_progress: bool,
+    /// PASSIVE-reaped DMA buffers ready for another command. Accessed under the
+    /// existing virtio spinlock, but allocation/free never occurs there.
+    dma_pool: Vec<DmaBuffer>,
+    dma_pool_bytes: usize,
     /// Registered WAIT_FENCE waiters (capacity MAX_FENCE_WAITERS).
     fence_waiters: Vec<FenceWaiter>,
     /// Usermode events awaiting wire-fence retirement (capacity
@@ -799,6 +871,10 @@ impl VirtioGpu {
             /* event_idx */ false,
         )
         .map_err(|_| VirtioError::DeviceError)?;
+        // Runtime ctrl completion is interrupt-driven. Be explicit instead of
+        // relying on the freshly-zeroed avail.flags value: bit 0 clear asks the
+        // device to interrupt after it adds a used element.
+        control.set_dev_notify(true);
         transport.set_status(
             DeviceStatus::ACKNOWLEDGE
                 | DeviceStatus::DRIVER
@@ -908,6 +984,11 @@ impl VirtioGpu {
             free_window_ranges: Vec::with_capacity(MAX_WINDOW_RANGES),
             inflight: Vec::with_capacity(MAX_INFLIGHT),
             parked: Vec::with_capacity(MAX_PARKED),
+            parked_spare: Vec::with_capacity(MAX_PARKED),
+            reap_buffers_spare: Vec::with_capacity(2 * MAX_PARKED),
+            reap_in_progress: false,
+            dma_pool: Vec::with_capacity(MAX_DMA_POOL),
+            dma_pool_bytes: 0,
             fence_waiters: Vec::with_capacity(MAX_FENCE_WAITERS),
             fence_events: Vec::with_capacity(MAX_FENCE_EVENTS),
             next_wire_fence: 1,
@@ -1024,6 +1105,84 @@ impl VirtioGpu {
         Ok(token)
     }
 
+    /// Enqueue a control command without a blocking waiter.  Completion still
+    /// consumes and validates the device response in [`Self::drain_used`], owns
+    /// `meta` until then, clears the adapter-owned `completion` gate, and wakes
+    /// `wake_event`.  The pointed-to objects must remain live until transport
+    /// teardown; the scanout caller uses fields embedded in `AdapterContext`,
+    /// whose lifetime encloses the virtio transport.
+    pub fn enqueue_async_control(
+        &mut self,
+        meta: DmaBuffer,
+        in0_len: usize,
+        resp_len: usize,
+        completion: NonNull<AtomicU32>,
+        completion_errors: NonNull<AtomicU32>,
+        wake_event: NonNull<KEVENT>,
+        success_store: Option<(NonNull<AtomicU32>, u32)>,
+        resubmit: Option<NonNull<AtomicU32>>,
+    ) -> Result<(), (DmaBuffer, VirtioError)> {
+        if self.failed {
+            return Err((meta, VirtioError::DeviceError));
+        }
+        let total = in0_len.checked_add(resp_len);
+        match total {
+            Some(t)
+                if in0_len > 0
+                    && resp_len > 0
+                    && resp_len <= SYNC_RESP_MAX
+                    && t <= meta.as_slice().len() => {}
+            _ => return Err((meta, VirtioError::DeviceError)),
+        }
+        if self.inflight.len() >= MAX_INFLIGHT || self.parked.len() >= PARKED_ENQUEUE_GATE {
+            QUEUE_FULL_RETRIES.fetch_add(1, Ordering::Relaxed);
+            return Err((meta, VirtioError::QueueFull));
+        }
+        let base = meta.as_slice().as_ptr();
+        // SAFETY: the request/response spans are disjoint inside `meta`, which
+        // moves into the InFlight entry and remains device-owned until pop_used.
+        let added = unsafe {
+            let input = core::slice::from_raw_parts(base, in0_len);
+            let response = core::slice::from_raw_parts_mut(base.add(in0_len) as *mut u8, resp_len);
+            self.control.add(&[input], &mut [response])
+        };
+        let token = match added {
+            Ok(t) => t,
+            Err(virtio_drivers::Error::QueueFull) => {
+                QUEUE_FULL_RETRIES.fetch_add(1, Ordering::Relaxed);
+                return Err((meta, VirtioError::QueueFull));
+            }
+            Err(_) => {
+                self.failed = true;
+                return Err((meta, VirtioError::DeviceError));
+            }
+        };
+        self.inflight.push(InFlight {
+            token,
+            kind: InFlightKind::AsyncControl {
+                completion,
+                completion_errors,
+                wake_event,
+                success_store,
+                resubmit,
+            },
+            meta,
+            in0_len,
+            in1_len: 0,
+            resp_len,
+            venus: None,
+            venus_len: 0,
+        });
+        ASYNC_CTRL_COUNT.fetch_add(1, Ordering::Relaxed);
+        bump_high_water(&INFLIGHT_HIGH_WATER, self.inflight.len());
+        // Publish token ownership before ringing the device doorbell: a fast
+        // host may complete immediately and enter the ISR/DPC on another CPU.
+        if self.control.should_notify() {
+            self.transport.notify(CTRL_QUEUE);
+        }
+        Ok(())
+    }
+
     /// Enqueue an ASYNC fenced SUBMIT_3D and return the KMD-assigned wire
     /// fence id. Returns at queue time — completion arrives on the used ring
     /// (interrupt DPC), which signals WAIT_FENCE waiters and advances the WDDM
@@ -1037,6 +1196,7 @@ impl VirtioGpu {
         mut meta: DmaBuffer,
         venus: DmaBuffer,
         venus_len: usize,
+        scanout_notify: Option<AsyncScanoutNotify>,
     ) -> Result<u64, (DmaBuffer, DmaBuffer, VirtioError)> {
         let hdr_len = core::mem::size_of::<VirtioGpuCmdSubmit>();
         let resp_len = core::mem::size_of::<VirtioGpuCtrlHdr>();
@@ -1087,9 +1247,6 @@ impl VirtioGpu {
                 return Err((meta, venus, VirtioError::DeviceError));
             }
         };
-        if self.control.should_notify() {
-            self.transport.notify(CTRL_QUEUE);
-        }
         self.next_wire_fence += 1;
         let ring = cmd.hdr.ring_idx;
         self.inflight.push(InFlight {
@@ -1097,6 +1254,7 @@ impl VirtioGpu {
             kind: InFlightKind::AsyncVenus {
                 fence_id,
                 ring_idx: ring,
+                scanout_notify,
             },
             meta,
             in0_len: hdr_len,
@@ -1110,6 +1268,11 @@ impl VirtioGpu {
             RING_SUBMIT_COUNT.fetch_add(1, Ordering::Relaxed);
         }
         bump_high_water(&INFLIGHT_HIGH_WATER, self.inflight.len());
+        // Publish token/fence/callback ownership before the device can race a
+        // completion into the ISR/DPC on another CPU.
+        if self.control.should_notify() {
+            self.transport.notify(CTRL_QUEUE);
+        }
         Ok(fence_id)
     }
 
@@ -1197,13 +1360,61 @@ impl VirtioGpu {
                         }
                     }
                 }
-                InFlightKind::AsyncVenus { fence_id, ring_idx } => {
+                InFlightKind::AsyncControl {
+                    completion,
+                    completion_errors,
+                    wake_event,
+                    success_store,
+                    resubmit,
+                } => {
+                    ASYNC_CTRL_COMPLETE_COUNT.fetch_add(1, Ordering::Relaxed);
+                    let response_ok = resp_is_ok(resp_type);
+                    if !response_ok {
+                        ASYNC_CTRL_RESP_ERRORS.fetch_add(1, Ordering::Relaxed);
+                        // SAFETY: adapter-owned atomic; see enqueue contract.
+                        unsafe { completion_errors.as_ref() }.fetch_add(1, Ordering::Relaxed);
+                    } else if let Some((target, value)) = success_store {
+                        // Publish which scanout the host accepted before the
+                        // worker consumes the follow-up dirty edge.
+                        unsafe { target.as_ref() }.store(value, Ordering::Release);
+                    }
+                    // Publish completion before waking the coalescing worker.
+                    // SAFETY: both pointers refer to stable AdapterContext
+                    // fields whose lifetime encloses this transport entry.
+                    unsafe {
+                        if let Some(pending) = resubmit {
+                            pending.as_ref().store(1, Ordering::Release);
+                        }
+                        completion.as_ref().store(0, Ordering::Release);
+                        KeSetEvent(wake_event.as_ptr(), IO_NO_INCREMENT, 0);
+                    }
+                }
+                InFlightKind::AsyncVenus {
+                    fence_id,
+                    ring_idx,
+                    scanout_notify,
+                } => {
                     ASYNC_COMPLETE_COUNT.fetch_add(1, Ordering::Relaxed);
                     if ring_idx != 0 {
                         RING_COMPLETE_COUNT.fetch_add(1, Ordering::Relaxed);
                     }
-                    if !resp_is_ok(resp_type) {
+                    let response_ok = resp_is_ok(resp_type);
+                    if !response_ok {
                         ASYNC_RESP_ERRORS.fetch_add(1, Ordering::Relaxed);
+                    }
+                    // ring_idx=1 is the GPU-completion domain. Queue the host
+                    // display refresh only after the copy has really completed;
+                    // a decode-level or failed submit must never publish pixels.
+                    if response_ok && ring_idx == 1 {
+                        if let Some(notify) = scanout_notify {
+                            // SAFETY: both pointers name stable AdapterContext
+                            // fields; the adapter owns this transport and outlives
+                            // every in-flight entry.
+                            unsafe {
+                                notify.pending.as_ref().store(1, Ordering::Release);
+                                KeSetEvent(notify.event.as_ptr(), IO_NO_INCREMENT, 0);
+                            }
+                        }
                     }
                     // Wake every waiter registered on this wire fence.
                     let mut j = 0;
@@ -1266,10 +1477,77 @@ impl VirtioGpu {
         self.parked.len()
     }
 
-    /// Swap the parked list for a fresh (pre-reserved) one; the caller drops
-    /// the returned entries at PASSIVE_LEVEL.
-    pub fn swap_parked(&mut self, fresh: Vec<InFlight>) -> Vec<InFlight> {
-        core::mem::replace(&mut self.parked, fresh)
+    /// Begin one PASSIVE reap by swapping in the empty pre-reserved parked
+    /// vector and lending the pre-reserved DMA-buffer scratch vector. A second
+    /// caller returns None and leaves the active reaper to finish.
+    pub fn begin_parked_reap(&mut self) -> Option<(Vec<InFlight>, Vec<DmaBuffer>)> {
+        if self.reap_in_progress || self.parked.is_empty() {
+            return None;
+        }
+        self.reap_in_progress = true;
+        let fresh = core::mem::take(&mut self.parked_spare);
+        debug_assert!(fresh.capacity() >= MAX_PARKED);
+        let dead = core::mem::replace(&mut self.parked, fresh);
+        let buffers = core::mem::take(&mut self.reap_buffers_spare);
+        debug_assert!(buffers.capacity() >= 2 * MAX_PARKED);
+        Some((dead, buffers))
+    }
+
+    /// Return the emptied pre-reserved reap vectors after excess DMA buffers
+    /// were dropped at PASSIVE_LEVEL.
+    pub fn finish_parked_reap(&mut self, entries: Vec<InFlight>, buffers: Vec<DmaBuffer>) {
+        debug_assert!(entries.is_empty());
+        debug_assert!(buffers.is_empty());
+        debug_assert!(self.reap_in_progress);
+        self.parked_spare = entries;
+        self.reap_buffers_spare = buffers;
+        self.reap_in_progress = false;
+    }
+
+    /// Take one already-allocated DMA buffer whose page capacity covers `len`.
+    /// The caller allocates a new buffer at PASSIVE only when this returns None.
+    pub fn take_dma_buffer(&mut self, len: usize) -> Option<DmaBuffer> {
+        let Some((idx, _)) = self
+            .dma_pool
+            .iter()
+            .enumerate()
+            .filter(|(_, buf)| buf.capacity() >= len)
+            .min_by_key(|(_, buf)| buf.capacity())
+        else {
+            DMA_POOL_MISSES.fetch_add(1, Ordering::Relaxed);
+            return None;
+        };
+        let mut buf = self.dma_pool.swap_remove(idx);
+        self.dma_pool_bytes = self.dma_pool_bytes.saturating_sub(buf.capacity());
+        DMA_POOL_CACHED_BYTES.store(self.dma_pool_bytes as u32, Ordering::Relaxed);
+        if !buf.reset(len) {
+            DMA_POOL_MISSES.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        DMA_POOL_HITS.fetch_add(1, Ordering::Relaxed);
+        Some(buf)
+    }
+
+    /// Move eligible completed buffers into the bounded pool without allocation.
+    /// Any excess remains in `buffers` and is returned for PASSIVE-level drop.
+    pub fn recycle_dma_buffers(&mut self, mut buffers: Vec<DmaBuffer>) -> Vec<DmaBuffer> {
+        let mut i = 0;
+        while i < buffers.len() {
+            let capacity = buffers[i].capacity();
+            let eligible = capacity <= MAX_DMA_POOL_BUFFER_BYTES
+                && self.dma_pool.len() < MAX_DMA_POOL
+                && self.dma_pool_bytes.saturating_add(capacity) <= MAX_DMA_POOL_BYTES;
+            if !eligible {
+                DMA_POOL_DROPS.fetch_add(1, Ordering::Relaxed);
+                i += 1;
+                continue;
+            }
+            let buf = buffers.swap_remove(i);
+            self.dma_pool_bytes += capacity;
+            self.dma_pool.push(buf);
+        }
+        DMA_POOL_CACHED_BYTES.store(self.dma_pool_bytes as u32, Ordering::Relaxed);
+        buffers
     }
 
     /// Abandon a timed-out synchronous entry: detach its waiter so the eventual
@@ -1411,12 +1689,12 @@ impl VirtioGpu {
     /// the full GPU-work duration; counting them here would couple every WDDM
     /// DMA fence (GDI/paging pacing) to unrelated multi-ms GPU work. Consumers
     /// that need GPU completion wait on those fences explicitly (WAIT_FENCE).
-    fn async_retired_up_to(&self, watermark: u64) -> bool {
+    fn async_retired_up_to(&self, watermark: u64, wait_gpu: bool) -> bool {
         watermark == 0
             || !self.inflight.iter().any(|e| match e.kind {
-                InFlightKind::AsyncVenus { fence_id, ring_idx } => {
-                    ring_idx == 0 && fence_id < watermark
-                }
+                InFlightKind::AsyncVenus {
+                    fence_id, ring_idx, ..
+                } => fence_id < watermark && (wait_gpu || ring_idx == 0),
                 _ => false,
             })
     }
@@ -1429,9 +1707,15 @@ impl VirtioGpu {
     /// (watermark 0) but still queue FIFO behind earlier render submissions —
     /// SubmissionFenceIds are watermarks to dxgkrnl and must complete
     /// monotonically.
-    pub fn note_wddm_submission(&mut self, fence: u32, paging: bool) -> bool {
+    pub fn note_wddm_submission(
+        &mut self,
+        _notify_guard: &crate::adapter::WddmNotifyGuard<'_>,
+        fence: u32,
+        paging: bool,
+        wait_gpu: bool,
+    ) -> bool {
         let watermark = if paging { 0 } else { self.next_wire_fence };
-        if self.wddm_pending.is_empty() && self.async_retired_up_to(watermark) {
+        if self.wddm_pending.is_empty() && self.async_retired_up_to(watermark, wait_gpu) {
             return true;
         }
         if self.wddm_pending.len() >= MAX_WDDM_PENDING {
@@ -1443,24 +1727,35 @@ impl VirtioGpu {
             self.wddm_pending.clear();
             return true;
         }
-        self.wddm_pending
-            .push_back(WddmPending { fence, watermark });
+        self.wddm_pending.push_back(WddmPending {
+            fence,
+            watermark,
+            wait_gpu,
+            refresh_scanout: wait_gpu,
+        });
         false
     }
 
     /// Pop every head-of-FIFO WDDM submission whose venus watermark has been
     /// reached, up to `out.len()` of them. The DPC signals DMA_COMPLETED for
     /// each, in order, OUTSIDE the device spinlock.
-    pub fn take_ready_wddm(&mut self, out: &mut [u32]) -> usize {
+    pub fn take_ready_wddm(
+        &mut self,
+        _notify_guard: &crate::adapter::WddmNotifyGuard<'_>,
+        out: &mut [WddmReady],
+    ) -> usize {
         let mut n = 0;
         while n < out.len() {
             let Some(head) = self.wddm_pending.front() else {
                 break;
             };
-            if !self.async_retired_up_to(head.watermark) {
+            if !self.async_retired_up_to(head.watermark, head.wait_gpu) {
                 break;
             }
-            out[n] = head.fence;
+            out[n] = WddmReady {
+                fence: head.fence,
+                refresh_scanout: head.refresh_scanout,
+            };
             self.wddm_pending.pop_front();
             n += 1;
         }
@@ -1474,7 +1769,7 @@ impl VirtioGpu {
     /// unfinished DMA buffers with fresh fence ids after the preempt completes;
     /// the underlying venus work keeps executing host-side). Returns the count
     /// dropped.
-    pub fn preempt_flush(&mut self) -> u32 {
+    pub fn preempt_flush(&mut self, _notify_guard: &crate::adapter::WddmNotifyGuard<'_>) -> u32 {
         let n = self.wddm_pending.len() as u32;
         self.wddm_pending.clear();
         n

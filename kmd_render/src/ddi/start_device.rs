@@ -1,9 +1,8 @@
-//! Adapter PnP / power lifecycle DDIs and the render-only child queries.
+//! Adapter PnP / power lifecycle DDIs and display child queries.
 //!
-//! Phase 1: StartDevice saves the Dxgkrnl interface and reports a render-only
-//! adapter (zero video present sources, zero children). The virtio-gpu hardware
-//! bring-up (PCI cap scan, BAR mapping, feature negotiation, virtqueue init) is
-//! added in Phase 2 (task #4) where the STUB marker is below.
+//! `StartDevice` saves the Dxgkrnl interface, initializes virtio-gpu, and reports
+//! either the production one-source/one-child display topology or the explicit
+//! knob-off render-only recovery topology.
 
 use alloc::boxed::Box;
 use core::ffi::c_void;
@@ -228,9 +227,8 @@ pub unsafe extern "C" fn dxgkddi_start_device(
     }
 
     // Source/child count. Default (render-only): 0 scanout sources, 0 children.
-    // With the `DisplayHalf` knob on (Option A, WINDOWED_BLT_DESIGN.md §6.2): ONE
-    // video-present source + ONE child video-output, so the VidPn/child DDIs stand
-    // up a real (no-scanout) presentable output for legacy BLT windowed present.
+    // With the `DisplayHalf` knob on: one video-present source + one child
+    // video-output, with the VidPn/child DDIs driving virtio-gpu scanout.
     // SAFETY: out-pointers validated non-null above.
     unsafe {
         if adapter.display_half {

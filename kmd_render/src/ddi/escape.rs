@@ -23,12 +23,13 @@ use bytemuck::{bytes_of, pod_read_unaligned};
 use helios_protocol::{
     HeliosEscapeAllocBlob, HeliosEscapeAttachResource, HeliosEscapeCtxCreate,
     HeliosEscapeCtxDestroy, HeliosEscapeFenceEvent, HeliosEscapeHeader, HeliosEscapeMapBlob,
-    HeliosEscapeQueryStats, HeliosEscapeQueryStatsV2, HeliosEscapeReleaseBlob,
-    HeliosEscapeSubmitVenus, HeliosEscapeWaitFence, HELIOS_ESCAPE_ALLOC_BLOB,
-    HELIOS_ESCAPE_ATTACH_RESOURCE, HELIOS_ESCAPE_CTX_CREATE, HELIOS_ESCAPE_CTX_DESTROY,
-    HELIOS_ESCAPE_MAP_BLOB, HELIOS_ESCAPE_QUERY_STATS, HELIOS_ESCAPE_REGISTER_FENCE_EVENT,
-    HELIOS_ESCAPE_RELEASE_BLOB, HELIOS_ESCAPE_SUBMIT_VENUS, HELIOS_ESCAPE_UNREGISTER_FENCE_EVENT,
-    HELIOS_ESCAPE_WAIT_FENCE, HELIOS_FENCE_EVENT_ALREADY_COMPLETE, HELIOS_FENCE_EVENT_CANCELLED,
+    HeliosEscapeQueryScanout, HeliosEscapeQueryStats, HeliosEscapeQueryStatsV2,
+    HeliosEscapeReleaseBlob, HeliosEscapeSubmitVenus, HeliosEscapeWaitFence,
+    HELIOS_ESCAPE_ALLOC_BLOB, HELIOS_ESCAPE_ATTACH_RESOURCE, HELIOS_ESCAPE_CTX_CREATE,
+    HELIOS_ESCAPE_CTX_DESTROY, HELIOS_ESCAPE_MAP_BLOB, HELIOS_ESCAPE_QUERY_SCANOUT,
+    HELIOS_ESCAPE_QUERY_STATS, HELIOS_ESCAPE_REGISTER_FENCE_EVENT, HELIOS_ESCAPE_RELEASE_BLOB,
+    HELIOS_ESCAPE_SUBMIT_VENUS, HELIOS_ESCAPE_UNREGISTER_FENCE_EVENT, HELIOS_ESCAPE_WAIT_FENCE,
+    HELIOS_FENCE_EVENT_ALREADY_COMPLETE, HELIOS_FENCE_EVENT_CANCELLED,
     HELIOS_FENCE_EVENT_NOT_FOUND, HELIOS_FENCE_EVENT_PROBE_ACK, HELIOS_FENCE_EVENT_REGISTERED,
 };
 
@@ -83,11 +84,59 @@ pub unsafe extern "C" fn dxgkddi_escape(
         HELIOS_ESCAPE_RELEASE_BLOB => escape_release_blob(adapter, buf, owner),
         HELIOS_ESCAPE_ATTACH_RESOURCE => escape_attach_resource(adapter, buf),
         HELIOS_ESCAPE_QUERY_STATS => escape_query_stats(adapter, buf),
+        HELIOS_ESCAPE_QUERY_SCANOUT => escape_query_scanout(adapter, buf),
         HELIOS_ESCAPE_REGISTER_FENCE_EVENT => escape_register_fence_event(adapter, buf),
         HELIOS_ESCAPE_UNREGISTER_FENCE_EVENT => escape_unregister_fence_event(adapter, buf),
         // Unknown verbs are rejected.
         _ => STATUS_NOT_IMPLEMENTED,
     }
+}
+
+/// Read-only snapshot of the production LINEAR primary currently published by
+/// `SetVidPnSourceAddress`. The diagnostic resource is deliberately excluded:
+/// consumers must never mistake color bars for the DWM copy destination.
+fn escape_query_scanout(adapter: &AdapterContext, buf: &mut [u8]) -> NTSTATUS {
+    use core::sync::atomic::Ordering;
+
+    let sz = size_of::<HeliosEscapeQueryScanout>();
+    if buf.len() < sz {
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+    let mut out: HeliosEscapeQueryScanout = pod_read_unaligned(&buf[..sz]);
+    let resource_id = adapter.primary_scanout_resource.load(Ordering::Acquire);
+    let live = resource_id != 0
+        && adapter
+            .with_virtio(|v| v.resource_is_live(resource_id))
+            .unwrap_or(false);
+    if !live {
+        out.out_alloc_size = 0;
+        out.out_resource_id = 0;
+        out.out_width = 0;
+        out.out_height = 0;
+        out.out_dxgi_format = 0;
+        out.out_pitch = 0;
+        out.out_plane_offset = 0;
+        out.out_memory_type_index = 0;
+        out.out_generation = adapter.primary_scanout_generation.load(Ordering::Relaxed);
+        out.reserved = [0; 2];
+        buf[..sz].copy_from_slice(bytes_of(&out));
+        return STATUS_SUCCESS;
+    }
+
+    let wh = adapter.primary_scanout_wh.load(Ordering::Relaxed);
+    let layout = adapter.primary_scanout_layout.load(Ordering::Relaxed);
+    out.out_alloc_size = adapter.primary_scanout_alloc_size.load(Ordering::Relaxed);
+    out.out_resource_id = resource_id;
+    out.out_width = (wh >> 32) as u32;
+    out.out_height = wh as u32;
+    out.out_dxgi_format = adapter.primary_scanout_dxgi_format.load(Ordering::Relaxed);
+    out.out_pitch = (layout >> 32) as u32;
+    out.out_plane_offset = layout as u32;
+    out.out_memory_type_index = adapter.primary_scanout_memory_type.load(Ordering::Relaxed);
+    out.out_generation = adapter.primary_scanout_generation.load(Ordering::Relaxed);
+    out.reserved = [0; 2];
+    buf[..sz].copy_from_slice(bytes_of(&out));
+    STATUS_SUCCESS
 }
 
 // ── Fence events (KMD 22.22.54, PSC WS2) ────────────────────────────────────

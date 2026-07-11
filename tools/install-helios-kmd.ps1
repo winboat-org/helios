@@ -65,7 +65,7 @@ function Find-DevCon {
 
 function Get-HeliosHardwareId([string]$InstanceId) {
   $prop = Get-PnpDeviceProperty -InstanceId $InstanceId -KeyName DEVPKEY_Device_HardwareIds -ErrorAction SilentlyContinue
-  if ($prop -and $prop.Data) {
+  if ($prop -and $prop.PSObject.Properties["Data"] -and $prop.Data) {
     foreach ($hwid in @($prop.Data)) {
       if ([string]$hwid -like "PCI\VEN_1AF4&DEV_1050*") { return [string]$hwid }
     }
@@ -312,11 +312,13 @@ Sign-HeliosPackage $sys $cat
 
 if (-not $BinaryOnly) {
   $backup = Backup-HeliosActiveFiles $store $copyNames
-  $oldImagePath = (Get-ItemProperty -LiteralPath "HKLM:\SYSTEM\CurrentControlSet\Services\helios_kmd_render" -ErrorAction SilentlyContinue).ImagePath
+  $oldSvc = Get-ItemProperty -LiteralPath "HKLM:\SYSTEM\CurrentControlSet\Services\helios_kmd_render" -ErrorAction SilentlyContinue
+  $oldImagePath = if ($oldSvc -and $oldSvc.PSObject.Properties["ImagePath"]) { $oldSvc.ImagePath } else { $null }
   $update = Invoke-HeliosPackageUpdate $inf $id
   $newActiveInf = Get-HeliosActiveInfName $id
   $newStore = Get-HeliosActiveStoreDir $id $newActiveInf
-  $newImagePath = (Get-ItemProperty -LiteralPath "HKLM:\SYSTEM\CurrentControlSet\Services\helios_kmd_render" -ErrorAction SilentlyContinue).ImagePath
+  $newSvc = Get-ItemProperty -LiteralPath "HKLM:\SYSTEM\CurrentControlSet\Services\helios_kmd_render" -ErrorAction SilentlyContinue
+  $newImagePath = if ($newSvc -and $newSvc.PSObject.Properties["ImagePath"]) { $newSvc.ImagePath } else { $null }
   $activeSys = Join-Path $newStore "helios_kmd_render.sys"
   $packageSysHash = Get-HeliosFileHash $sys
   $activeSysHash = Get-HeliosFileHash $activeSys

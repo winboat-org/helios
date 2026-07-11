@@ -51,6 +51,10 @@ pub const HELIOS_ESCAPE_REGISTER_FENCE_EVENT: u32 = 0x000B;
 /// Cancel a [`HELIOS_ESCAPE_REGISTER_FENCE_EVENT`] registration that has not
 /// signaled yet (wait timed out usermode-side). See [`HeliosEscapeFenceEvent`].
 pub const HELIOS_ESCAPE_UNREGISTER_FENCE_EVENT: u32 = 0x000C;
+/// Query the optional KMD-owned LINEAR fallback currently bound as the VidPn
+/// primary. The DWM UMD may import it as a transfer-only destination when a
+/// directly exportable primary is unavailable.
+pub const HELIOS_ESCAPE_QUERY_SCANOUT: u32 = 0x000D;
 
 /// Header for all escape commands. 16 bytes.
 #[repr(C)]
@@ -287,6 +291,29 @@ pub struct HeliosEscapeFenceEvent {
     pub _pad: u32,
 }
 
+/// `HELIOS_ESCAPE_QUERY_SCANOUT` — read-only identity of the optional KMD-owned
+/// LINEAR fallback selected by `SetVidPnSourceAddress`. The allocation size
+/// and memory type are the exact `vkAllocateMemory` identity required by a
+/// Venus `VkImportMemoryResourceInfoMESA` import.  A zero `out_resource_id`
+/// means no production primary is currently bound. 64 bytes.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct HeliosEscapeQueryScanout {
+    pub hdr: HeliosEscapeHeader,
+    pub out_alloc_size: u64,
+    pub out_resource_id: u32,
+    pub out_width: u32,
+    pub out_height: u32,
+    /// Exact DXGI format recorded for the primary (normally B8G8R8X8_UNORM).
+    pub out_dxgi_format: u32,
+    pub out_pitch: u32,
+    pub out_plane_offset: u32,
+    pub out_memory_type_index: u32,
+    /// Changes whenever the active primary identity is published or removed.
+    pub out_generation: u32,
+    pub reserved: [u32; 2],
+}
+
 /// `HELIOS_ESCAPE_QUERY_STATS` — read-only snapshot of the KMD's bounded
 /// resource tables and rejection counters. Output-only (the caller sends a
 /// zeroed body); 88 bytes. Values are point-in-time under the device lock for
@@ -379,5 +406,6 @@ const _: () = {
     assert!(core::mem::size_of::<HeliosEscapeWaitFence>() == 40);
     assert!(core::mem::size_of::<HeliosEscapePresentBlob>() == 40);
     assert!(core::mem::size_of::<HeliosEscapeFenceEvent>() == 40);
+    assert!(core::mem::size_of::<HeliosEscapeQueryScanout>() == 64);
     assert!(core::mem::size_of::<HeliosEscapeQueryStatsV2>() == 152);
 };

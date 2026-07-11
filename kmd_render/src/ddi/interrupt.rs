@@ -28,6 +28,47 @@ pub static INT_ROUTINE_COUNT: AtomicU32 = AtomicU32::new(0);
 pub static DPC_ROUTINE_COUNT: AtomicU32 = AtomicU32::new(0);
 pub static CONTROL_INT_COUNT: AtomicU32 = AtomicU32::new(0);
 
+/// Drain used control-queue entries and retire any WDDM fences whose Venus
+/// watermark is now complete. Normally called from the device DPC; the
+/// scanout worker may also call it at PASSIVE_LEVEL as a bounded fallback
+/// while one fire-and-forget RESOURCE_FLUSH is outstanding. Keeping fence
+/// retirement here prevents an opportunistic drain from consuming a Venus
+/// completion without notifying VidSch.
+pub(crate) fn drain_used_and_complete(adapter: &AdapterContext) {
+    let _ = adapter.with_virtio(|v| v.drain_used());
+
+    adapter.with_wddm_notify_lock(|guard| {
+        loop {
+            let mut ready = [crate::virtio::gpu::WddmReady {
+                fence: 0,
+                refresh_scanout: false,
+            }; 8];
+            let n = adapter
+                .with_virtio(|v| v.take_ready_wddm(guard, &mut ready))
+                .unwrap_or(0);
+            if n == 0 {
+                break;
+            }
+            for ready in &ready[..n] {
+                if ready.refresh_scanout {
+                    adapter.request_scanout_refresh();
+                }
+                if let Some(dxgkrnl) = adapter.dxgkrnl.as_ref() {
+                    // SAFETY: the WDDM notification lock is held; the helper
+                    // raises to DIRQL for the callback without re-locking.
+                    let _ = unsafe {
+                        super::submit_command::signal_dma_completed_locked(
+                            guard,
+                            dxgkrnl,
+                            ready.fence,
+                        )
+                    };
+                }
+            }
+        }
+    });
+}
+
 /// `DxgkDdiInterruptRoutine` — runs at the device's DIRQL; returns TRUE if the
 /// interrupt was ours.
 //
@@ -94,7 +135,7 @@ pub unsafe extern "C" fn dxgkddi_dpc_routine(miniport_device_context: *mut c_voi
 
     // A latched config-change (ISR bit 1): wake the HPD worker to re-indicate the
     // child connected. KeSetEvent (Wait=FALSE) is legal at DISPATCH_LEVEL.
-    if adapter.config_change_pending.swap(0, Ordering::AcqRel) != 0 {
+    if adapter.config_change_pending.load(Ordering::Acquire) != 0 {
         adapter.signal_hpd();
     }
 
@@ -108,32 +149,9 @@ pub unsafe extern "C" fn dxgkddi_dpc_routine(miniport_device_context: *mut c_voi
         }
     }
 
-    // Drain the used ring: completes in-flight entries, copies sync responses,
-    // signals sync/fence KEVENT waiters, parks retired buffers for a PASSIVE
-    // reap. KeSetEvent at DISPATCH (Wait=FALSE) is legal.
-    let _ = adapter.with_virtio(|v| v.drain_used());
-
-    // Complete every WDDM submission whose venus watermark has been reached —
-    // strictly FIFO (SubmissionFenceIds are watermarks to dxgkrnl). The
-    // DIRQL notify (DxgkCbSynchronizeExecution → DxgkCbNotifyInterrupt →
-    // DxgkCbQueueDpc) must run OUTSIDE the device spinlock.
-    loop {
-        let mut ready = [0u32; 8];
-        let n = adapter
-            .with_virtio(|v| v.take_ready_wddm(&mut ready))
-            .unwrap_or(0);
-        if n == 0 {
-            break;
-        }
-        for &fence in &ready[..n] {
-            adapter.last_completed_fence.store(fence, Ordering::Release);
-            if let Some(dxgkrnl) = adapter.dxgkrnl.as_ref() {
-                // SAFETY: live callback interface; signal at the correct IRQL
-                // (DxgkCbSynchronizeExecution raises to DIRQL internally).
-                let _ = unsafe { super::submit_command::signal_dma_completed(dxgkrnl, fence) };
-            }
-        }
-    }
+    // Drain the used ring, wake ctrl/fence waiters, and retire every WDDM
+    // submission whose Venus watermark has been reached.
+    drain_used_and_complete(adapter);
 }
 
 /// `DxgkDdiControlInterrupt` — enable/disable a class of GPU interrupts. Called at

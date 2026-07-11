@@ -1,14 +1,15 @@
-//! Display/VidPn DDIs required for a complete WDDM table shape.
+//! Display/VidPn DDIs for the active Helios render+display adapter.
 //!
-//! Helios targets render-only WDDM. These callbacks therefore do not implement
-//! scanout; they make unsupported display paths explicit instead of leaving a
-//! large part of the display-miniport table NULL during bring-up.
+//! Windows identifies the primary through `SetVidPnSourceAddress`; Helios then
+//! binds that exact allocation to virtio-gpu scanout. A dedicated LINEAR image
+//! remains a compatibility fallback for a primary that is not directly
+//! exportable.
 
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use bytemuck::pod_read_unaligned;
-use helios_protocol::HeliosPresentPrivateData;
+use helios_protocol::{HeliosPresentPrivateData, HELIOS_PRESENT_PRIVATE_FLAG_DIRECT_SCANOUT};
 
 use crate::adapter::AdapterContext;
 use crate::ddi::create_allocation::present_alloc_info;
@@ -38,6 +39,89 @@ pub static PRESENT_LAST_SRC_OPEN_LOW: AtomicU32 = AtomicU32::new(0);
 pub static PRESENT_LAST_DST_OPEN_LOW: AtomicU32 = AtomicU32::new(0);
 pub static PRESENT_LAST_FLAGS: AtomicU32 = AtomicU32::new(0);
 pub static PRESENT_LAST_STATUS: AtomicU32 = AtomicU32::new(0);
+static PRESENT_SCANOUT_SUCCESS_COUNT: AtomicU32 = AtomicU32::new(0);
+pub(crate) static VIDPN_SOURCE_ADDRESS_COUNT: AtomicU32 = AtomicU32::new(0);
+
+fn production_linear_scanout(
+    adapter: &AdapterContext,
+    width: u32,
+    height: u32,
+) -> Result<crate::ddi::create_allocation::ScanoutInfo, NTSTATUS> {
+    use core::sync::atomic::Ordering;
+
+    let resource_id = adapter.dedicated_scanout_resource.load(Ordering::Acquire);
+    let image_id = adapter.dedicated_scanout_image.load(Ordering::Acquire);
+    let wh = adapter.primary_scanout_wh.load(Ordering::Relaxed);
+    let live = resource_id != 0
+        && image_id != 0
+        && wh == (((width as u64) << 32) | height as u64)
+        && adapter
+            .with_virtio(|v| v.resource_is_live(resource_id))
+            .unwrap_or(false);
+    if live {
+        let layout = adapter.primary_scanout_layout.load(Ordering::Relaxed);
+        return Ok(crate::ddi::create_allocation::ScanoutInfo {
+            resource_id,
+            width,
+            height,
+            pitch: (layout >> 32) as u32,
+            dxgi_format: adapter.primary_scanout_dxgi_format.load(Ordering::Relaxed),
+            plane_offset: layout as u32 as u64,
+            venus_alloc_size: adapter.primary_scanout_alloc_size.load(Ordering::Relaxed),
+            memory_type_index: adapter.primary_scanout_memory_type.load(Ordering::Relaxed),
+            direct_scanout: false,
+        });
+    }
+
+    let scanout = match adapter.with_venus_client(|client| {
+        client.allocate_linear_scanout_image_blob(adapter, width, height)
+    }) {
+        Ok(Ok(scanout)) => scanout,
+        Ok(Err(_)) => {
+            crate::diag::record_named_bytes(b"CpErr", 1);
+            return Err(STATUS_NO_MEMORY);
+        }
+        Err(_) => {
+            crate::diag::record_named_bytes(b"CpErr", 2);
+            return Err(STATUS_DEVICE_NOT_READY);
+        }
+    };
+
+    const DXGI_FORMAT_B8G8R8A8_UNORM: u32 = 87;
+    adapter.remember_primary_scanout(
+        scanout.blob.res_id,
+        width,
+        height,
+        scanout.row_pitch,
+        scanout.plane_offset,
+        scanout.blob.size,
+        scanout.memory_type_index,
+        DXGI_FORMAT_B8G8R8A8_UNORM,
+    );
+    adapter
+        .dedicated_scanout_memory
+        .store(scanout.blob.blob_id, Ordering::Relaxed);
+    adapter
+        .dedicated_scanout_image
+        .store(scanout.image_id, Ordering::Relaxed);
+    adapter
+        .dedicated_scanout_resource
+        .store(scanout.blob.res_id, Ordering::Release);
+    crate::diag::record_named_bytes(b"CpRid", scanout.blob.res_id);
+    crate::diag::record_named_bytes(b"CpBid", scanout.blob.blob_id as u32);
+    crate::diag::record_named_bytes(b"CpPch", scanout.row_pitch);
+    Ok(crate::ddi::create_allocation::ScanoutInfo {
+        resource_id: scanout.blob.res_id,
+        width,
+        height,
+        pitch: scanout.row_pitch,
+        dxgi_format: DXGI_FORMAT_B8G8R8A8_UNORM,
+        plane_offset: scanout.plane_offset as u64,
+        venus_alloc_size: scanout.blob.size,
+        memory_type_index: scanout.memory_type_index,
+        direct_scanout: false,
+    })
+}
 
 unsafe fn present_private_data(args: &DXGKARG_PRESENT) -> Option<HeliosPresentPrivateData> {
     if args.pPrivateDriverData.is_null()
@@ -56,16 +140,18 @@ unsafe fn present_private_data(args: &DXGKARG_PRESENT) -> Option<HeliosPresentPr
 }
 
 pub(crate) fn issue_present_scanout(
-    _adapter: &AdapterContext,
+    adapter: &AdapterContext,
     resource_id: u32,
     mut width: u32,
     mut height: u32,
     pitch: u32,
     dxgi_format: u32,
     plane_offset: u64,
+    venus_alloc_size: u64,
+    direct_scanout: bool,
     via: u32,
-) {
-    let (mode_w, mode_h) = _adapter.display_mode();
+) -> bool {
+    let (mode_w, mode_h) = adapter.display_mode();
     if width == 0 {
         width = mode_w;
     }
@@ -79,23 +165,62 @@ pub(crate) fn issue_present_scanout(
     };
     const DXGI_FORMAT_B8G8R8A8_UNORM: u32 = 87;
     const DXGI_FORMAT_B8G8R8X8_UNORM: u32 = 88;
-    rec_named(b"PScVia", via);
-    rec_named(b"PScRid", resource_id);
-    rec_named(b"PScWH", (width << 16) | (height & 0xFFFF));
-    rec_named(b"PScPch", stride);
-    rec_named(b"PScOff", plane_offset as u32);
     if dxgi_format != 0
         && dxgi_format != DXGI_FORMAT_B8G8R8A8_UNORM
         && dxgi_format != DXGI_FORMAT_B8G8R8X8_UNORM
     {
+        rec_named(b"PScVia", via);
+        rec_named(b"PScRid", resource_id);
         rec_named(b"PScFmt", dxgi_format);
-        return;
+        return false;
     }
-    // Present source allocations are often intermediate DWM/render targets, not
-    // the committed VidPn primary. Promoting them to scanout produces partial
-    // overlays/corruption. Keep Present as a scheduler operation; scanout changes
-    // only happen from the primary-address path.
-    rec_named(b"PScSet", 0xD);
+    // The exact pPrimaryDesc marker survives in AllocationContext. Ordinary
+    // app/intermediate present sources remain rejected; only the Windows-owned
+    // desktop primary can enter this asynchronous scanout path.
+    if !direct_scanout {
+        rec_named(b"PScVia", via);
+        rec_named(b"PScRid", resource_id);
+        rec_named(b"PScSet", 0xD);
+        return false;
+    }
+    let min_size = plane_offset.saturating_add((stride as u64).saturating_mul(height as u64));
+    if width != mode_w
+        || height != mode_h
+        || stride < width.saturating_mul(4)
+        || stride & 3 != 0
+        || plane_offset > u32::MAX as u64
+        || venus_alloc_size < min_size
+    {
+        rec_named(b"PScVia", via);
+        rec_named(b"PScRid", resource_id);
+        rec_named(b"PScWH", (width << 16) | (height & 0xFFFF));
+        rec_named(b"PScPch", stride);
+        rec_named(b"PScOff", plane_offset as u32);
+        rec_named(b"PScSet", 0xE3);
+        return false;
+    }
+    let vformat = helios_protocol::VIRTIO_GPU_FORMAT_B8G8R8X8_UNORM;
+    adapter.publish_scanout_candidate(
+        resource_id,
+        width,
+        height,
+        vformat,
+        stride,
+        plane_offset as u32,
+    );
+    // Do not flush here: DxgkDdiRender only records the present. The matching
+    // SubmitCommandVirtual gates the dirty edge on all preceding Venus queue
+    // submissions reaching GPU completion.
+    let n = PRESENT_SCANOUT_SUCCESS_COUNT.fetch_add(1, Ordering::Relaxed);
+    if n < 8 || n & 0x3FF == 0 {
+        rec_named(b"PScVia", via);
+        rec_named(b"PScRid", resource_id);
+        rec_named(b"PScWH", (width << 16) | (height & 0xFFFF));
+        rec_named(b"PScPch", stride);
+        rec_named(b"PScOff", plane_offset as u32);
+        rec_named(b"PScSet", 2);
+    }
+    true
 }
 
 /// Mirror present-path tracers into the PASSIVE registry ring.
@@ -201,7 +326,7 @@ pub unsafe extern "C" fn dxgkddi_present(
         let src_info = unsafe { present_alloc_info((*src).hDeviceSpecificAllocation) };
         let dst_info = unsafe { present_alloc_info(dst_handle) };
         if let Some(sc) = src_scanout {
-            issue_present_scanout(
+            let _ = issue_present_scanout(
                 adapter,
                 sc.resource_id,
                 sc.width,
@@ -209,6 +334,8 @@ pub unsafe extern "C" fn dxgkddi_present(
                 sc.pitch,
                 sc.dxgi_format,
                 sc.plane_offset,
+                sc.venus_alloc_size,
+                sc.direct_scanout,
                 1,
             );
         }
@@ -248,7 +375,11 @@ pub unsafe extern "C" fn dxgkddi_present(
         rec_named(b"PBsrc", sc.resource_id);
         rec_named(b"PBsw", sc.width);
         rec_named(b"PBsh", sc.height);
-        issue_present_scanout(
+        let direct_scanout = sc.reserved & HELIOS_PRESENT_PRIVATE_FLAG_DIRECT_SCANOUT != 0;
+        let required_size = sc
+            .plane_offset
+            .saturating_add((sc.pitch as u64).saturating_mul(sc.height as u64));
+        let _ = issue_present_scanout(
             adapter,
             sc.resource_id,
             sc.width,
@@ -256,6 +387,8 @@ pub unsafe extern "C" fn dxgkddi_present(
             sc.pitch,
             sc.dxgi_format,
             sc.plane_offset,
+            required_size,
+            direct_scanout,
             2,
         );
     }
@@ -285,21 +418,26 @@ pub unsafe extern "C" fn dxgkddi_present(
     }
 
     if !args.pDmaBuffer.is_null() {
-        const PRESENT_NOP_DWORDS: usize = 4;
-        let bytes = (PRESENT_NOP_DWORDS * core::mem::size_of::<u32>()) as UINT;
+        let bytes = core::mem::size_of::<helios_protocol::HeliosPresentRefreshCmd>() as UINT;
         if args.DmaSize < bytes {
             PRESENT_LAST_STATUS.store(STATUS_BUFFER_TOO_SMALL as u32, Ordering::Relaxed);
             return STATUS_BUFFER_TOO_SMALL;
         }
-        let dma = args.pDmaBuffer as *mut u32;
+        let command = helios_protocol::HeliosPresentRefreshCmd {
+            magic: helios_protocol::HELIOS_PRESENT_REFRESH_MAGIC,
+            version: helios_protocol::HELIOS_PRESENT_REFRESH_VERSION,
+            source_index: DXGK_PRESENT_SOURCE_INDEX,
+            destination_index: DXGK_PRESENT_DESTINATION_INDEX,
+        };
         unsafe {
-            // "HEPR" + source/destination allocation indices. SubmitCommand is
-            // still a null engine, but the non-empty DMA buffer is structurally
-            // important for the scheduler present path.
-            *dma.add(0) = 0x5250_4548;
-            *dma.add(1) = DXGK_PRESENT_SOURCE_INDEX;
-            *dma.add(2) = DXGK_PRESENT_DESTINATION_INDEX;
-            *dma.add(3) = args.Flags.__bindgen_anon_1.Value;
+            // Keep the DMA record structurally non-empty, and give Render an
+            // unambiguous per-present dirty edge for the stable LINEAR target.
+            // Never reuse the typed allocation command's HEPR magic here.
+            core::ptr::write_unaligned(
+                args.pDmaBuffer
+                    .cast::<helios_protocol::HeliosPresentRefreshCmd>(),
+                command,
+            );
             args.pDmaBuffer = (args.pDmaBuffer as *mut u8).add(bytes as usize).cast();
         }
         args.MultipassOffset = 0;
@@ -501,7 +639,13 @@ pub unsafe extern "C" fn dxgkddi_set_vidpn_source_address(
         return STATUS_NOT_SUPPORTED;
     }
     let adapter = unsafe { &*p };
-    crate::diag::record_named_bytes(b"VpSA", 1);
+    let source_address_n = VIDPN_SOURCE_ADDRESS_COUNT
+        .fetch_add(1, Ordering::Relaxed)
+        .wrapping_add(1);
+    let trace_tick = source_address_n == 1 || source_address_n % 600 == 0;
+    if trace_tick {
+        crate::diag::record_named_bytes(b"VpSA", source_address_n);
+    }
     // Remember the primary's physical address so the CRTC_VSYNC heartbeat reports
     // it (dxgkrnl retires the queued flip whose address matches — viogpu3d
     // `m_sourceAddress`).
@@ -512,76 +656,185 @@ pub unsafe extern "C" fn dxgkddi_set_vidpn_source_address(
             .store(phys as u64, Ordering::Release);
     }
 
-    // Scan out the DWM-composed primary to virtio-gpu scanout 0 = the QEMU
-    // gtk/sdl display (SET_SCANOUT_BLOB + RESOURCE_FLUSH), so the desktop appears
-    // in QEMU's own window and the Helios monitor is a real presentable output.
-    // The control round-trip WAITS, so only at PASSIVE_LEVEL — a DISPATCH-level
-    // VSync flip records the geometry and defers (a later PASSIVE source-address
-    // rebinds). Export gate (DISPLAY.md §8): a non-exportable primary → ScSet=0xE.
+    // Windows names the authoritative desktop primary here. This—not resource
+    // dimensions, OM bindings, process name, or an arbitrary Present call—is the
+    // only allocation the KMD may bind directly or copy into the fallback image.
     if address.is_null() {
         return STATUS_SUCCESS;
     }
     let h_alloc = unsafe { (*address).hAllocation };
-    let Some(sc) = (unsafe { crate::ddi::create_allocation::scanout_alloc_info(h_alloc) }) else {
+    let Some(source) = (unsafe { crate::ddi::create_allocation::scanout_alloc_info(h_alloc) })
+    else {
         crate::diag::record_named_bytes(b"ScRid", 0);
         return STATUS_SUCCESS;
     };
     let (mode_w, mode_h) = adapter.display_mode();
-    let width = if sc.width != 0 { sc.width } else { mode_w };
-    let height = if sc.height != 0 { sc.height } else { mode_h };
-    crate::diag::record_named_bytes(b"ScRid", sc.resource_id);
-    crate::diag::record_named_bytes(b"ScWH", (width << 16) | (height & 0xFFFF));
+    let width = if source.width != 0 {
+        source.width
+    } else {
+        mode_w
+    };
+    let height = if source.height != 0 {
+        source.height
+    } else {
+        mode_h
+    };
+    if trace_tick {
+        crate::diag::record_named_bytes(b"ScSrc", source.resource_id);
+        crate::diag::record_named_bytes(b"ScWH", (width << 16) | (height & 0xFFFF));
+        crate::diag::record_named_bytes(b"ScDir", source.direct_scanout as u32);
+    }
     // SAFETY: KeGetCurrentIrql is callable at any IRQL.
     let irql = unsafe { KeGetCurrentIrql() };
     if irql != 0 {
         crate::diag::record_named_bytes(b"ScIrq", irql as u32);
         return STATUS_SUCCESS;
     }
+    if width != mode_w || height != mode_h {
+        crate::diag::record_named_bytes(b"ScSet", 0xD);
+        return STATUS_INVALID_PARAMETER;
+    }
+    // A UMD-created exact pPrimaryDesc may already have the proven scan-out
+    // shape: DMA_BUF-exportable, dedicated device-local memory, and validated
+    // extent/metadata. It may be the current plain OPTIMAL export; QEMU validates
+    // that opaque native layout against the original blob allocation size.
+    // Other primaries retain the adapter-owned LINEAR target + GPU-copy fallback.
+    let target = if source.direct_scanout {
+        let min_size = source
+            .plane_offset
+            .saturating_add((source.pitch as u64).saturating_mul(height as u64));
+        let valid = source.pitch >= width.saturating_mul(4)
+            && source.pitch & 3 == 0
+            && source.plane_offset <= u32::MAX as u64
+            && source.venus_alloc_size >= min_size
+            && matches!(source.dxgi_format, 87 | 88);
+        if !valid {
+            crate::diag::record_named_bytes(b"ScSet", 0xE3);
+            return STATUS_INVALID_PARAMETER;
+        }
+        source
+    } else {
+        match production_linear_scanout(adapter, width, height) {
+            Ok(target) => target,
+            Err(status) => {
+                crate::diag::record_named_bytes(b"ScSet", 0xE1);
+                return status;
+            }
+        }
+    };
     // Stride MUST match the UMD's actual row pitch (`cross_adapter_pitch`,
     // 256-aligned), NOT `width*4`: for 1896 wide that is 7680 vs 7584, and a wrong
     // stride shears the scan-out so the host reads each row 96 bytes short. Fall
     // back to the same alignment the UMD uses if the allocation carried no pitch.
-    let stride = if sc.pitch != 0 {
-        sc.pitch
+    let stride = if target.pitch != 0 {
+        target.pitch
     } else {
         crate::ddi::create_allocation::cross_adapter_pitch(width)
     };
-    crate::diag::record_named_bytes(b"ScPch", stride);
     // Resolve the scan-out format from the creator's EXACT DXGI format (the KMD
     // D3DDDIFORMAT is lossy — B8G8R8A8 and R8G8B8A8 both collapse to A8R8G8B8).
     // Preserve A-vs-X on the virtio scanout contract: DRM AR24/XR24 both map to
     // BGRA byte storage, but the host import path sees them as distinct formats.
     const DXGI_FORMAT_B8G8R8A8_UNORM: u32 = 87;
     const DXGI_FORMAT_B8G8R8X8_UNORM: u32 = 88;
-    let vformat = if sc.dxgi_format == DXGI_FORMAT_B8G8R8X8_UNORM {
-        helios_protocol::VIRTIO_GPU_FORMAT_B8G8R8X8_UNORM
-    } else {
-        helios_protocol::VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM
-    };
-    if sc.dxgi_format != 0
-        && sc.dxgi_format != DXGI_FORMAT_B8G8R8A8_UNORM
-        && sc.dxgi_format != DXGI_FORMAT_B8G8R8X8_UNORM
+    let vformat = helios_protocol::VIRTIO_GPU_FORMAT_B8G8R8X8_UNORM;
+    if source.dxgi_format != 0
+        && source.dxgi_format != DXGI_FORMAT_B8G8R8A8_UNORM
+        && source.dxgi_format != DXGI_FORMAT_B8G8R8X8_UNORM
     {
-        crate::diag::record_named_bytes(b"ScFmt", sc.dxgi_format);
+        crate::diag::record_named_bytes(b"ScFmt", source.dxgi_format);
     }
-    crate::diag::record_named_bytes(b"ScOff", sc.plane_offset as u32);
     if crate::ddi::scanout_diag::rebind_if_forced(adapter, 11) {
         return STATUS_SUCCESS;
     }
-    let set = crate::virtio::ctrl::set_scanout_blob(
-        adapter,
-        sc.resource_id,
-        width,
-        height,
-        vformat,
-        stride,
-        sc.plane_offset as u32,
-    );
-    crate::diag::record_named_bytes(b"ScSet", if set.is_ok() { 1 } else { 0xE });
-    if set.is_ok() {
-        adapter.remember_scanout_blob(sc.resource_id, width, height);
-        let flush = crate::virtio::ctrl::resource_flush(adapter, sc.resource_id, width, height);
-        crate::diag::record_named_bytes(b"ScFlu", if flush.is_ok() { 1 } else { 0xE });
+    let bound_wh = adapter.active_scanout_wh.load(Ordering::Acquire);
+    let already_bound = adapter.active_scanout_resource.load(Ordering::Acquire)
+        == target.resource_id
+        && bound_wh == (((width as u64) << 32) | height as u64);
+    if !already_bound || trace_tick {
+        crate::diag::record_named_bytes(b"ScRid", target.resource_id);
+        crate::diag::record_named_bytes(b"ScPch", stride);
+        crate::diag::record_named_bytes(b"ScOff", target.plane_offset as u32);
+    }
+    if !already_bound {
+        let set = crate::virtio::ctrl::set_scanout_blob(
+            adapter,
+            target.resource_id,
+            width,
+            height,
+            vformat,
+            stride,
+            target.plane_offset as u32,
+        );
+        if set.is_err() {
+            crate::diag::record_named_bytes(b"ScSet", 0xE);
+            return STATUS_DEVICE_NOT_READY;
+        }
+        // Keep the adapter-owned fallback cache separate from a rotating DWM
+        // direct primary. The latter is tracked by active_scanout_resource and
+        // dies with its WDDM allocation; publishing it here would overwrite the
+        // durable target's cached Venus identity.
+        if !target.direct_scanout {
+            adapter.remember_primary_scanout(
+                target.resource_id,
+                width,
+                height,
+                stride,
+                target.plane_offset as u32,
+                target.venus_alloc_size,
+                target.memory_type_index,
+                target.dxgi_format,
+            );
+        }
+        adapter.remember_scanout_blob(target.resource_id, width, height);
+        crate::diag::record_named_bytes(b"ScPub", target.resource_id);
+    }
+    if !already_bound || trace_tick {
+        crate::diag::record_named_bytes(b"ScSet", 1);
+    }
+
+    if source.resource_id == target.resource_id {
+        // True zero-copy primary. Never submit vkCmdCopyImage with the same
+        // image as source and destination. SetVidPn only binds/publishes the
+        // candidate; the matching Render -> SubmitCommandVirtual GPU-completion
+        // token is the sole producer of the dirty edge. This prevents the host
+        // from sampling an OPTIMAL primary before DWM's Venus work completes.
+        if !already_bound {
+            crate::diag::record_named_bytes(b"ScCpy", 2);
+            crate::diag::record_named_bytes(b"ScFlu", 3);
+        }
+        return STATUS_SUCCESS;
+    }
+
+    let target_image_id = adapter.dedicated_scanout_image.load(Ordering::Acquire);
+    if target_image_id == 0 {
+        crate::diag::record_named_bytes(b"ScSet", 0xE2);
+        return STATUS_DEVICE_NOT_READY;
+    }
+
+    // The returned outer wire fence completes in the ring-1 GPU domain. Its DPC
+    // callback—not this enqueue—marks scanout dirty and wakes the coalescing
+    // async RESOURCE_FLUSH worker, so VNC never samples ahead of the copy.
+    match unsafe {
+        crate::ddi::create_allocation::submit_primary_scanout_copy(
+            adapter,
+            h_alloc,
+            target_image_id,
+            width,
+            height,
+        )
+    } {
+        Ok(fence) => {
+            if !already_bound {
+                crate::diag::record_named_bytes(b"ScCpy", 1);
+                crate::diag::record_named_bytes(b"ScFnc", fence as u32);
+                crate::diag::record_named_bytes(b"ScFlu", 2); // async completion path
+            }
+        }
+        Err(status) => {
+            crate::diag::record_named_bytes(b"ScCpy", 0xE);
+            return status;
+        }
     }
     STATUS_SUCCESS
 }

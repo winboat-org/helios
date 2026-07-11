@@ -163,8 +163,8 @@ pub struct HeliosWddmAllocMeta {
     /// sized, smaller) import. Occupies the former `reserved` u32, so the on-wire
     /// layout is unchanged and older KMD binaries (which zero it) stay compatible.
     pub dxgi_format: u32,
-    /// Byte offset of memory-plane-0 within the backing allocation, from
-    /// `vkGetImageSubresourceLayout` on the DRM-format-modifier scan-out primary
+    /// Byte offset of the scan-out image within the backing allocation, from
+    /// `vkGetImageSubresourceLayout` for a queryable LINEAR/modifier image
     /// (0 for every non-scan-out surface and for layouts whose data starts at
     /// offset 0). `SET_SCANOUT_BLOB` adds this to the blob base so the host reads
     /// the first row at the right place. Grows the trailer by 8 bytes; the UMD
@@ -221,6 +221,22 @@ impl HeliosWddmOpenIdentity {
 pub const HELIOS_PRESENT_PRIVATE_MAGIC: u32 = 0x4850_5253;
 /// Current present-private-data ABI version.
 pub const HELIOS_PRESENT_PRIVATE_VERSION: u32 = 1;
+/// `HeliosPresentPrivateData::reserved` bit: the payload came from the exact
+/// exportable `pPrimaryDesc` allocation and may be scanned out directly. The
+/// bit does not promise a LINEAR layout; the host validates native metadata.
+pub const HELIOS_PRESENT_PRIVATE_FLAG_DIRECT_SCANOUT: u32 = 1 << 0;
+/// `'HEPR'` — magic of [`HeliosPresentRenderCmd`].
+pub const HELIOS_PRESENT_RENDER_MAGIC: u32 = 0x5250_4548;
+/// Current inline present-render command ABI version.
+pub const HELIOS_PRESENT_RENDER_VERSION: u32 = 1;
+/// `'HERF'` — magic of [`HeliosPresentRefreshCmd`].  This is deliberately
+/// distinct from [`HELIOS_PRESENT_RENDER_MAGIC`]: the legacy 16-byte present
+/// marker used to start with `HEPR`, so `DxgkDdiRender` could misread the
+/// runtime's larger command-buffer capacity (including stale tail bytes) as a
+/// valid 48-byte typed scanout command.
+pub const HELIOS_PRESENT_REFRESH_MAGIC: u32 = 0x4652_4548;
+/// Current stable-scanout refresh command ABI version.
+pub const HELIOS_PRESENT_REFRESH_VERSION: u32 = 1;
 
 /// Private payload carried through `DXGIDDICB_PRESENT::pPrivateDriverData` to
 /// `DxgkDdiPresent`.
@@ -251,11 +267,54 @@ impl HeliosPresentPrivateData {
     }
 }
 
+/// Tiny command submitted through `pfnRenderCb` after DXGI accepts a present.
+/// The payload is created only for the exact `pPrimaryDesc` allocation and is
+/// consumed by `DxgkDdiRender`; ordinary application presents use the legacy
+/// four-byte marker and cannot enter the scanout path.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct HeliosPresentRenderCmd {
+    pub magic: u32,
+    pub version: u32,
+    pub present: HeliosPresentPrivateData,
+}
+
+impl HeliosPresentRenderCmd {
+    #[inline]
+    pub fn is_valid(&self) -> bool {
+        self.magic == HELIOS_PRESENT_RENDER_MAGIC
+            && self.version == HELIOS_PRESENT_RENDER_VERSION
+            && self.present.is_valid()
+    }
+}
+
+/// Per-present marker emitted by `DxgkDdiPresent` for ordinary desktop
+/// presents.  It never identifies or rebinds an allocation; `DxgkDdiRender`
+/// only uses it to dirty the adapter-owned, already-bound LINEAR scanout after
+/// the UMD has submitted the desktop copy.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct HeliosPresentRefreshCmd {
+    pub magic: u32,
+    pub version: u32,
+    pub source_index: u32,
+    pub destination_index: u32,
+}
+
+impl HeliosPresentRefreshCmd {
+    #[inline]
+    pub fn is_valid(&self) -> bool {
+        self.magic == HELIOS_PRESENT_REFRESH_MAGIC && self.version == HELIOS_PRESENT_REFRESH_VERSION
+    }
+}
+
 const _: () = {
     assert!(core::mem::size_of::<HeliosWddmAllocPrivate>() == 48);
     assert!(core::mem::size_of::<HeliosWddmCmdBuf>() == 32);
     assert!(core::mem::size_of::<HeliosWddmAllocMeta>() == 48);
     assert!(core::mem::size_of::<HeliosPresentPrivateData>() == 40);
+    assert!(core::mem::size_of::<HeliosPresentRenderCmd>() == 48);
+    assert!(core::mem::size_of::<HeliosPresentRefreshCmd>() == 16);
     // The identity record must fit exactly over the HeliosWddmAllocPrivate
     // region so the meta trailer's offset is unchanged for openers.
     assert!(

@@ -344,6 +344,19 @@ namespace {
     return read_current_venus_context_id();
   }
 
+  struct HeliosVenusScanoutInfo {
+    std::uint64_t allocSize;
+    std::uint32_t resourceId;
+    std::uint32_t width;
+    std::uint32_t height;
+    std::uint32_t dxgiFormat;
+    std::uint32_t pitch;
+    std::uint32_t planeOffset;
+    std::uint32_t memoryTypeIndex;
+    std::uint32_t generation;
+  };
+  static_assert(sizeof(HeliosVenusScanoutInfo) == 40);
+
   // Minimal IDXGIAdapter the D3D11DXGIDevice constructor stores (it is not
   // queried during construction — the Dxvk objects are passed directly).
   class HeliosStubAdapter : public IDXGIAdapter {
@@ -1164,7 +1177,8 @@ std::size_t HeliosDxvkDevice::open_ddi_texture2d(
     std::uint32_t renderer_resource_id,
     std::uint64_t venus_alloc_size,
     std::uint32_t memory_type_index,
-    bool scanout_modifier) const {
+    bool scanout_linear,
+    bool linear_scanout_target) const {
   if (!impl || !impl->d3d11 || !global || !renderer_resource_id || !width || !height)
     return 0;
 
@@ -1204,9 +1218,9 @@ std::size_t HeliosDxvkDevice::open_ddi_texture2d(
     // as a (size, type) pair, so size == 0 means "no recorded identity" and
     // the type must not be applied as an override either.
     importInfo.MemoryTypeIndex = venus_alloc_size ? memory_type_index : ~0u;
-    // Fix B: rebuild this import as a DRM_FORMAT_MODIFIER(LINEAR)+DMA_BUF image
-    // (symmetric with the scan-out-primary export) when the caller flags it.
-    importInfo.ModifierLinear  = scanout_modifier;
+    // Rebuild a flagged primary as the creator's plain LINEAR+DMA_BUF image.
+    importInfo.ScanoutLinear   = scanout_linear;
+    importInfo.LinearScanoutTarget = linear_scanout_target;
 
     auto* device = reinterpret_cast<dxvk::D3D11Device*>(impl->d3d11);
     auto* texture = new dxvk::D3D11Texture2D(
@@ -1241,12 +1255,66 @@ std::size_t HeliosDxvkDevice::open_ddi_texture2d(
   return 0;
 }
 
+std::size_t HeliosDxvkDevice::open_kmd_scanout_target(
+    std::uint32_t* out_resource_id,
+    std::uint32_t* out_width,
+    std::uint32_t* out_height,
+    std::uint32_t* out_pitch,
+    std::uint32_t* out_generation) const {
+  if (out_resource_id) *out_resource_id = 0;
+  if (out_width)       *out_width = 0;
+  if (out_height)      *out_height = 0;
+  if (out_pitch)       *out_pitch = 0;
+  if (out_generation)  *out_generation = 0;
+  if (!impl || !impl->instance || !impl->d3d11)
+    return 0;
+
+  using Fn = bool (__cdecl*)(VkInstance, HeliosVenusScanoutInfo*);
+  auto query = find_helios_icd_export<Fn>("helios_venus_query_scanout");
+  if (!query) {
+    umd_log("helios_venus_query_scanout export unavailable");
+    return 0;
+  }
+
+  HeliosVenusScanoutInfo info = { };
+  if (!query(impl->instance->handle(), &info) || !info.resourceId ||
+      !info.allocSize || !info.width || !info.height || !info.pitch)
+    return 0;
+
+  // The KMD image uses VkFormat B8G8R8A8_UNORM while scanout advertises XR24.
+  // Rebuild the D3D transfer alias as BGRA so CopyResource from DWM's BGRA
+  // composition target is format-compatible; alpha is ignored by XR24 scanout.
+  constexpr std::uint32_t DXGI_FORMAT_B8G8R8A8_UNORM_VALUE = 87u;
+  const auto resource = open_ddi_texture2d(
+    info.width, info.height, DXGI_FORMAT_B8G8R8A8_UNORM_VALUE,
+    0u, 0u, info.resourceId, info.resourceId, info.allocSize,
+    info.memoryTypeIndex, false, true);
+  if (!resource)
+    return 0;
+
+  if (out_resource_id) *out_resource_id = info.resourceId;
+  if (out_width)       *out_width = info.width;
+  if (out_height)      *out_height = info.height;
+  if (out_pitch)       *out_pitch = info.pitch;
+  if (out_generation)  *out_generation = info.generation;
+
+  char msg[224];
+  std::snprintf(msg, sizeof(msg),
+    "open_kmd_scanout_target res=%u %ux%u pitch=%u off=%u alloc=%llu mti=%u gen=%u resource=%p",
+    info.resourceId, info.width, info.height, info.pitch, info.planeOffset,
+    static_cast<unsigned long long>(info.allocSize), info.memoryTypeIndex,
+    info.generation, reinterpret_cast<void*>(resource));
+  umd_log(msg);
+  return resource;
+}
+
 std::size_t HeliosDxvkDevice::create_ddi_scanout_texture2d(
     std::uint32_t width,
     std::uint32_t height,
     std::uint32_t format,
     std::uint32_t bind_flags,
     std::uint32_t misc_flags,
+    bool optimal_scanout,
     std::uint64_t* out_row_pitch,
     std::uint64_t* out_offset) const {
   if (out_row_pitch) *out_row_pitch = 0;
@@ -1265,8 +1333,8 @@ std::size_t HeliosDxvkDevice::create_ddi_scanout_texture2d(
 
     // Build a plain 2D DEFAULT-usage description. The scan-out primary is a
     // device-local render target the host scans out of; sharing is driven by
-    // the D3D11_HELIOS_CREATE_INFO marker (Export + DMA_BUF + DRM modifier),
-    // NOT by the desc's D3D11 MiscFlags, so we do not force MISC_SHARED here.
+    // the D3D11_HELIOS_CREATE_INFO marker (Export + DMA_BUF), not by the desc's
+    // D3D11 MiscFlags, so we do not force MISC_SHARED here.
     dxvk::D3D11_COMMON_TEXTURE_DESC desc = { };
     desc.Width          = width;
     desc.Height         = height;
@@ -1283,7 +1351,8 @@ std::size_t HeliosDxvkDevice::create_ddi_scanout_texture2d(
     desc.TextureLayout  = D3D11_TEXTURE_LAYOUT_UNDEFINED;
 
     dxvk::D3D11_HELIOS_CREATE_INFO createInfo = { };
-    createInfo.ScanoutPrimary = true;
+    createInfo.ScanoutPrimary       = !optimal_scanout;
+    createInfo.DirectOptimalScanout = optimal_scanout;
 
     auto* device = reinterpret_cast<dxvk::D3D11Device*>(impl->d3d11);
     // Fresh Export create: no imported vkImage, no shared handle, no import
@@ -1303,7 +1372,19 @@ std::size_t HeliosDxvkDevice::create_ddi_scanout_texture2d(
       return 0;
     }
 
-    // Query the REAL DRM-modifier plane-0 row pitch + offset so the KMD can
+    if (optimal_scanout) {
+      const std::uint64_t pitch = (std::uint64_t(width) * 4u + 255u) & ~255ull;
+      if (out_row_pitch) *out_row_pitch = pitch;
+      if (out_offset)    *out_offset = 0;
+      char msg[192];
+      std::snprintf(msg, sizeof(msg),
+        "CreateDdiScanoutTexture2D OPTIMAL %ux%u fmt=%u logicalPitch=%llu resource=%p",
+        width, height, format, static_cast<unsigned long long>(pitch), resource);
+      umd_log(msg);
+      return reinterpret_cast<std::size_t>(resource);
+    }
+
+    // Query the REAL LINEAR plane-0 row pitch + offset so the KMD can
     // program SET_SCANOUT_BLOB with the exact host layout instead of a
     // width*4 / cross-adapter guess (a wrong stride/offset shears the image).
     auto* common = dxvk::GetCommonTexture(resource);

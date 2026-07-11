@@ -20,16 +20,15 @@
 
 use core::mem::size_of;
 use core::ptr::NonNull;
-use core::sync::atomic::AtomicU64;
+use core::sync::atomic::{AtomicU32, AtomicU64};
 
-use alloc::vec::Vec;
 use bytemuck::{bytes_of, Zeroable};
 use wdk_sys::ntddk::{KeDelayExecutionThread, KeWaitForSingleObject};
-use wdk_sys::{LARGE_INTEGER, PVOID, STATUS_SUCCESS};
+use wdk_sys::{KEVENT, LARGE_INTEGER, PVOID, STATUS_SUCCESS};
 
 use super::gpu::{
-    BlobMapBegin, BlobMapFinish, BlobMapPrep, BlobRemapBegin, FenceWaitPrep, InFlight,
-    SyncWaitBlock, CTRL_TIMEOUT_COUNT, FENCE_WAIT_TIMEOUTS, MAX_PARKED, SUBMIT_META_BYTES,
+    AsyncScanoutNotify, BlobMapBegin, BlobMapFinish, BlobMapPrep, BlobRemapBegin, FenceWaitPrep,
+    SyncWaitBlock, CTRL_TIMEOUT_COUNT, FENCE_WAIT_TIMEOUTS, SUBMIT_META_BYTES,
 };
 use super::hal::DmaBuffer;
 use super::VirtioError;
@@ -191,16 +190,31 @@ fn wait_block(adapter: &AdapterContext, block: NonNull<SyncWaitBlock>, total_ms:
     }
 }
 
-/// Reap completed (parked) entries and free their DMA buffers at PASSIVE.
+/// Reap completed entries at PASSIVE and retain their DMA buffers for reuse.
+/// `MmAllocateContiguousMemory` per tiny Venus submission dominated DWM's
+/// command rate; recycling page-backed buffers removes that steady-state cost.
 pub fn reap_parked(adapter: &AdapterContext) {
-    let parked = adapter.with_virtio(|v| v.parked_len()).unwrap_or(0);
-    if parked == 0 {
+    let work = adapter.with_virtio(|v| v.begin_parked_reap());
+    let Ok(Some((mut dead, mut buffers))) = work else {
         return;
+    };
+    debug_assert!(buffers.capacity() >= dead.len().saturating_mul(2));
+    for entry in dead.drain(..) {
+        let (meta, venus) = entry.into_dma_buffers();
+        buffers.push(meta);
+        if let Some(venus) = venus {
+            buffers.push(venus);
+        }
     }
-    let fresh: Vec<InFlight> = Vec::with_capacity(MAX_PARKED);
-    let dead = adapter.with_virtio(move |v| v.swap_parked(fresh));
-    // Dropped here, at PASSIVE_LEVEL, outside the lock.
-    drop(dead);
+    // Moving buffers into the pre-reserved pool is allocation-free under the
+    // spinlock. Excess buffers are returned and dropped here at PASSIVE.
+    let Ok(mut excess) = adapter.with_virtio(move |v| v.recycle_dma_buffers(buffers)) else {
+        return;
+    };
+    // Drop only the retained elements at PASSIVE while preserving the vector's
+    // allocation for the next reap.
+    excess.clear();
+    let _ = adapter.with_virtio(move |v| v.finish_parked_reap(dead, excess));
 }
 
 /// One synchronous control round-trip: `req` (+ optional second device-read
@@ -434,6 +448,117 @@ pub fn resource_flush(
     };
     cmd.resource_id = resource_id;
     ctrl_roundtrip_ok(adapter, bytes_of(&cmd), None)
+}
+
+/// Queue a RESOURCE_FLUSH without synchronously waiting for its ctrl response.
+/// The used-ring drain validates the response, clears `completion`, and wakes
+/// `wake_event`.  This is intentionally limited to scanout refresh: unlike
+/// lifecycle commands, the caller does not need response data before it can
+/// continue, and blocking here previously imposed the observed ~0.41 s/frame
+/// cadence when ctrl interrupts were delayed.
+pub fn resource_flush_async(
+    adapter: &AdapterContext,
+    resource_id: u32,
+    width: u32,
+    height: u32,
+    completion: NonNull<AtomicU32>,
+    completion_errors: NonNull<AtomicU32>,
+    wake_event: NonNull<KEVENT>,
+) -> Result<(), VirtioError> {
+    let mut cmd = VirtioGpuResourceFlush::zeroed();
+    cmd.hdr.type_ = VIRTIO_GPU_CMD_RESOURCE_FLUSH;
+    cmd.r = VirtioGpuRect {
+        x: 0,
+        y: 0,
+        width,
+        height,
+    };
+    cmd.resource_id = resource_id;
+
+    reap_parked(adapter);
+    let request = bytes_of(&cmd);
+    let response_len = size_of::<VirtioGpuCtrlHdr>();
+    let mut meta = DmaBuffer::new(request.len() + response_len).ok_or(VirtioError::OutOfMemory)?;
+    meta.as_mut_slice()[..request.len()].copy_from_slice(request);
+
+    let queued = adapter.with_virtio(move |v| {
+        v.drain_used();
+        v.enqueue_async_control(
+            meta,
+            request.len(),
+            response_len,
+            completion,
+            completion_errors,
+            wake_event,
+            None,
+            None,
+        )
+    });
+    match queued {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err((_meta, e))) => Err(e),
+        Err(_) => Err(VirtioError::DeviceError),
+    }
+}
+
+/// Queue SET_SCANOUT_BLOB without waiting for its ctrl response. A successful
+/// response publishes `resource_id` through `host_bound`; completion always
+/// re-arms `refresh_pending` so the worker either flushes the newly-bound image
+/// or retries the latest coalesced primary after a failure/rotation.
+pub fn set_scanout_blob_async(
+    adapter: &AdapterContext,
+    resource_id: u32,
+    width: u32,
+    height: u32,
+    format: u32,
+    stride: u32,
+    offset: u32,
+    completion: NonNull<AtomicU32>,
+    completion_errors: NonNull<AtomicU32>,
+    host_bound: NonNull<AtomicU32>,
+    refresh_pending: NonNull<AtomicU32>,
+    wake_event: NonNull<KEVENT>,
+) -> Result<(), VirtioError> {
+    let mut cmd = VirtioGpuSetScanoutBlob::zeroed();
+    cmd.hdr.type_ = VIRTIO_GPU_CMD_SET_SCANOUT_BLOB;
+    cmd.r = VirtioGpuRect {
+        x: 0,
+        y: 0,
+        width,
+        height,
+    };
+    cmd.scanout_id = 0;
+    cmd.resource_id = resource_id;
+    cmd.width = width;
+    cmd.height = height;
+    cmd.format = format;
+    cmd.strides[0] = stride;
+    cmd.offsets[0] = offset;
+
+    reap_parked(adapter);
+    let request = bytes_of(&cmd);
+    let response_len = size_of::<VirtioGpuCtrlHdr>();
+    let mut meta = DmaBuffer::new(request.len() + response_len).ok_or(VirtioError::OutOfMemory)?;
+    meta.as_mut_slice()[..request.len()].copy_from_slice(request);
+
+    let queued = adapter.with_virtio(move |v| {
+        v.drain_used();
+        v.enqueue_async_control(
+            meta,
+            request.len(),
+            response_len,
+            completion,
+            completion_errors,
+            wake_event,
+            Some((host_bound, resource_id)),
+            Some(refresh_pending),
+        )
+    });
+    match queued {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err((_meta, e))) => Err(e),
+        Err(_) => Err(VirtioError::DeviceError),
+    }
 }
 
 pub fn set_scanout_2d(
@@ -1269,8 +1394,18 @@ pub fn submit_venus_async(
         return Err(VirtioError::DeviceError);
     }
     reap_parked(adapter);
-    let meta = DmaBuffer::new(SUBMIT_META_BYTES).ok_or(VirtioError::OutOfMemory)?;
-    let mut venus = DmaBuffer::new(stream.len()).ok_or(VirtioError::OutOfMemory)?;
+    let meta = adapter
+        .with_virtio(|v| v.take_dma_buffer(SUBMIT_META_BYTES))
+        .ok()
+        .flatten()
+        .or_else(|| DmaBuffer::new(SUBMIT_META_BYTES))
+        .ok_or(VirtioError::OutOfMemory)?;
+    let mut venus = adapter
+        .with_virtio(|v| v.take_dma_buffer(stream.len()))
+        .ok()
+        .flatten()
+        .or_else(|| DmaBuffer::new(stream.len()))
+        .ok_or(VirtioError::OutOfMemory)?;
     venus.as_mut_slice()[..stream.len()].copy_from_slice(stream);
     let venus_len = stream.len();
 
@@ -1284,7 +1419,7 @@ pub fn submit_venus_async(
             .expect("venus returned on every retry path");
         let res = adapter.with_virtio(move |v| {
             v.drain_used();
-            v.enqueue_async_submit(ctx_id, ring_idx, m, vn, venus_len)
+            v.enqueue_async_submit(ctx_id, ring_idx, m, vn, venus_len, None)
         });
         match res {
             Err(_) => return Err(VirtioError::DeviceError), // transport gone
@@ -1301,6 +1436,46 @@ pub fn submit_venus_async(
             }
             Ok(Err((_m, _v, e))) => return Err(e), // buffers dropped at PASSIVE
         }
+    }
+}
+
+/// Nonblocking KMD scanout-copy submission. `stream` is the already encoded
+/// Venus vkQueueSubmit command; the outer virtio SUBMIT_3D is fenced on
+/// ring_idx=1, whose used-ring completion represents GPU completion. Only a
+/// successful completion marks scanout dirty and wakes the refresh worker.
+///
+/// Unlike the user escape path above, this per-frame display path never sleeps
+/// for queue backpressure: one enqueue attempt either succeeds or reports
+/// QueueFull to the caller. That keeps SetVidPnSourceAddress out of a hidden
+/// multi-second retry loop.
+pub fn submit_venus_async_scanout(
+    adapter: &AdapterContext,
+    ctx_id: u32,
+    stream: &[u8],
+) -> Result<u64, VirtioError> {
+    if stream.is_empty() {
+        return Err(VirtioError::DeviceError);
+    }
+    reap_parked(adapter);
+    let meta = DmaBuffer::new(SUBMIT_META_BYTES).ok_or(VirtioError::OutOfMemory)?;
+    let mut venus = DmaBuffer::new(stream.len()).ok_or(VirtioError::OutOfMemory)?;
+    venus.as_mut_slice()[..stream.len()].copy_from_slice(stream);
+    let venus_len = stream.len();
+    let notify = AsyncScanoutNotify {
+        pending: NonNull::from(&adapter.scanout_refresh_pending),
+        // SAFETY: hpd_event is embedded in the stable adapter and initialized
+        // before StartDevice creates any Venus submissions.
+        event: unsafe { NonNull::new_unchecked(adapter.hpd_event.get()) },
+    };
+
+    let queued = adapter.with_virtio(move |v| {
+        v.drain_used();
+        v.enqueue_async_submit(ctx_id, 1, meta, venus, venus_len, Some(notify))
+    });
+    match queued {
+        Ok(Ok(fence_id)) => Ok(fence_id),
+        Ok(Err((_meta, _venus, e))) => Err(e),
+        Err(_) => Err(VirtioError::DeviceError),
     }
 }
 

@@ -6,7 +6,7 @@
 
 use core::cell::UnsafeCell;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize};
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use wdk_sys::ntddk::{
     KeAcquireSpinLockRaiseToDpc, KeInitializeEvent, KeReleaseSpinLock, KeSetEvent,
@@ -84,7 +84,13 @@ pub struct AdapterContext {
     /// Written once during the (serialized) StartDevice lifecycle DDI.
     pub dxgkrnl: Option<DXGKRNL_INTERFACE>,
     /// Last fence completed by the bring-up scheduler path.
-    pub last_completed_fence: AtomicU32,
+    last_completed_fence: AtomicU32,
+    /// Serializes DMA_COMPLETED notification and its monotonic fence update.
+    /// A DPC can take an older ready fence out of the virtio FIFO while a new
+    /// SubmitCommand concurrently takes the immediate-completion path; without
+    /// this lock the newer fence can reach VidSch first and the delayed older
+    /// notify bugchecks 0x119/1 (invalid fence id).
+    wddm_notify_lock: UnsafeCell<KSPIN_LOCK>,
     /// Mapped kernel VA of the virtio ISR-status register (read-to-clear), or 0
     /// until StartDevice wires it. `DxgkDdiInterruptRoutine` reads this at DIRQL to
     /// acknowledge the level-triggered INTx line (the device is `MSISupported=0`);
@@ -163,13 +169,10 @@ pub struct AdapterContext {
     /// default 0 = OFF, the boot-proven render-only surface). When nonzero,
     /// StartDevice advertises ONE video-present source + ONE child video-output
     /// and the VidPn/child DDIs in `ddi::display`/`ddi::vidpn`/`ddi::start_device`
-    /// stand up a real (virtual, no-scanout) VidPn output + default monitor,
-    /// instead of returning NOT_SUPPORTED. This is priority #1's Option A: give
-    /// Helios a genuine presentable output so legacy BLT-model windowed present
-    /// (DXUT/FaceWorks, older 3DMark) resolves a real output instead of being
-    /// declared DXGI_STATUS_OCCLUDED (WINDOWED_BLT_DESIGN.md §6.2). Default 0
-    /// keeps every build bootable and the desktop unchanged; A/B via
-    /// `reg add ... /v DisplayHalf /t REG_DWORD /d 1` + `pnputil /restart-device`
+    /// stand up a real virtual VidPn output + default monitor and drive
+    /// virtio-gpu scanout, instead of returning NOT_SUPPORTED. Default 0 keeps
+    /// the render-only recovery shape available; production sets it to 1 via
+    /// `reg add ... /v DisplayHalf /t REG_DWORD /d 1` + a guest reboot
     /// (re-runs StartDevice → child enumeration) with NO reboot once deployed.
     /// The paired Looking Glass IddCx keeps rendering the desktop as before; the
     /// new Helios monitor is a second, unobserved virtual display (owner-approved,
@@ -195,11 +198,42 @@ pub struct AdapterContext {
     /// reported in each CRTC_VSYNC packet so dxgkrnl can retire the matching queued
     /// flip (viogpu3d `m_sourceAddress`). 0 until the first source-address bind.
     pub last_primary_address: AtomicU64,
-    /// Active virtio scanout-0 blob selected by the display half. The KMD has no
-    /// hardware scan engine, so the PASSIVE HPD worker periodically flushes this
-    /// resource to make DWM writes visible in QEMU's SDL/GTK display.
+    /// Active virtio scanout-0 blob selected by the display half. The PASSIVE
+    /// display worker flushes it only after a completed primary-to-LINEAR GPU
+    /// copy marks scanout dirty.
     pub active_scanout_resource: AtomicU32,
     pub active_scanout_wh: AtomicU64,
+    /// Row pitch (high 32), plane offset (low 32), and virtio format for the
+    /// desired scanout. `active_scanout_resource` is the publish word.
+    pub active_scanout_layout: AtomicU64,
+    pub active_scanout_format: AtomicU32,
+    /// Host-accepted binding and one-command async SET_SCANOUT_BLOB gate. A
+    /// rotating DWM primary only publishes the newest desired resource; the
+    /// worker coalesces intermediate flips without blocking in a ctrl roundtrip.
+    pub host_bound_scanout_resource: AtomicU32,
+    pub scanout_bind_inflight: AtomicU32,
+    pub scanout_bind_fail: AtomicU32,
+    /// Import identity of the optional KMD-owned LINEAR fallback. DWM may query
+    /// this through `HELIOS_ESCAPE_QUERY_SCANOUT` when the primary cannot be
+    /// bound directly. The resource id is the publish word: writers store every
+    /// companion field first, then release it.
+    pub primary_scanout_resource: AtomicU32,
+    pub primary_scanout_wh: AtomicU64,
+    /// Row pitch (high 32) and plane offset (low 32).
+    pub primary_scanout_layout: AtomicU64,
+    pub primary_scanout_alloc_size: AtomicU64,
+    pub primary_scanout_memory_type: AtomicU32,
+    pub primary_scanout_dxgi_format: AtomicU32,
+    pub primary_scanout_generation: AtomicU32,
+    /// Adapter-owned production LINEAR target. Unlike the bootstrap standard
+    /// primary allocation, this resource is never reclaimed by VidMm while DWM
+    /// replaces the primary with its private OPTIMAL render target.
+    pub dedicated_scanout_resource: AtomicU32,
+    /// Kernel-Venus object identities backing `dedicated_scanout_resource`.
+    /// The image is the destination of the KMD copy issued for the exact
+    /// allocation selected by `SetVidPnSourceAddress`.
+    pub dedicated_scanout_image: AtomicU64,
+    pub dedicated_scanout_memory: AtomicU64,
     /// Diagnostic scanout blob selected by `ScanoutDiag >= 2`. This is a
     /// KMD-owned, CPU-filled color-bars blob used only to prove whether QEMU can
     /// display any blob from this miniport after boot.
@@ -209,6 +243,12 @@ pub struct AdapterContext {
     pub diag_scanout_layout: AtomicU64,
     pub scanout_refresh_count: AtomicU32,
     pub scanout_refresh_fail: AtomicU32,
+    /// Dirty/coalescing state for real scanout refresh. A completed primary
+    /// copy sets `scanout_refresh_pending` and wakes the HPD/scanout worker.
+    /// At most one fire-and-forget RESOURCE_FLUSH is outstanding; its used-ring
+    /// completion clears `scanout_flush_inflight` and wakes the same worker.
+    pub scanout_refresh_pending: AtomicU32,
+    pub scanout_flush_inflight: AtomicU32,
     /// 1 once [`Self::init_vsync`] has armed the timer (StopDevice cancels once).
     pub vsync_armed: AtomicU32,
     /// Scanout-0 mode the display half presents, taken from the host's
@@ -228,16 +268,17 @@ pub struct AdapterContext {
     /// for a VidPn path — is PASSIVE-only and MUST NOT be called during StartDevice,
     /// so a dedicated system thread ([`crate::ddi::hpd::hpd_thread_routine`], the
     /// viogpu3d ThreadWorkRoutine analog) does it. This SynchronizationEvent wakes
-    /// that thread: once shortly after start (initial indication) and again on every
-    /// virtio config-change interrupt (`VIRTIO_GPU_EVENT_DISPLAY`, ISR bit 1 → DPC).
+    /// that thread: once shortly after start, on virtio config changes, after a
+    /// completed scanout copy, and after async RESOURCE_FLUSH completion.
     pub hpd_event: UnsafeCell<KEVENT>,
     /// PsCreateSystemThread handle for the HPD worker (0 = not started). StopDevice
     /// signals `hpd_stop` + `hpd_event`, joins the thread on this handle, then closes it.
     hpd_thread: AtomicUsize,
     /// Tells the HPD worker to terminate (StopDevice / teardown).
     pub hpd_stop: AtomicU32,
-    /// Set by the ISR when the virtio config-change bit (ISR status bit 1) fires; the
-    /// DPC consumes it and signals `hpd_event` so the worker re-indicates connection.
+    /// Set by the ISR when the virtio config-change bit (ISR status bit 1) fires;
+    /// the DPC signals `hpd_event`, then the PASSIVE worker consumes this bit and
+    /// re-indicates connection.
     pub config_change_pending: AtomicU32,
 }
 
@@ -249,12 +290,43 @@ pub struct AdapterContext {
 unsafe impl Send for AdapterContext {}
 unsafe impl Sync for AdapterContext {}
 
+/// Proof that this adapter's WDDM notification spinlock is currently held.
+///
+/// The fields are private and the type is neither `Copy` nor `Clone`, so safe
+/// code can obtain a usable reference only inside [`AdapterContext::with_wddm_notify_lock`].
+/// Fence-queue mutation and VidSch fence notifications accept this token rather
+/// than relying on a caller-side comment or naming convention.
+pub(crate) struct WddmNotifyGuard<'a> {
+    adapter: &'a AdapterContext,
+}
+
+impl WddmNotifyGuard<'_> {
+    pub(crate) fn completed_fence(&self) -> u32 {
+        self.adapter.last_completed_fence.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn set_completed_fence(&self, fence: u32) {
+        self.adapter
+            .last_completed_fence
+            .store(fence, Ordering::Release);
+    }
+}
+
+/// Outcome of trying to queue one coalesced scanout refresh.
+pub(crate) enum ScanoutRefreshQueue {
+    Queued,
+    Busy,
+    Failed,
+    Unavailable,
+}
+
 impl AdapterContext {
     pub fn new(pdo: PDEVICE_OBJECT) -> Result<Self, DriverError> {
         Ok(Self {
             pdo,
             dxgkrnl: None,
             last_completed_fence: AtomicU32::new(0),
+            wddm_notify_lock: UnsafeCell::new(0),
             isr_status: AtomicUsize::new(0),
             virtio_lock: UnsafeCell::new(0),
             virtio: UnsafeCell::new(None),
@@ -280,11 +352,28 @@ impl AdapterContext {
             last_primary_address: AtomicU64::new(0),
             active_scanout_resource: AtomicU32::new(0),
             active_scanout_wh: AtomicU64::new(0),
+            active_scanout_layout: AtomicU64::new(0),
+            active_scanout_format: AtomicU32::new(0),
+            host_bound_scanout_resource: AtomicU32::new(0),
+            scanout_bind_inflight: AtomicU32::new(0),
+            scanout_bind_fail: AtomicU32::new(0),
+            primary_scanout_resource: AtomicU32::new(0),
+            primary_scanout_wh: AtomicU64::new(0),
+            primary_scanout_layout: AtomicU64::new(0),
+            primary_scanout_alloc_size: AtomicU64::new(0),
+            primary_scanout_memory_type: AtomicU32::new(0),
+            primary_scanout_dxgi_format: AtomicU32::new(0),
+            primary_scanout_generation: AtomicU32::new(0),
+            dedicated_scanout_resource: AtomicU32::new(0),
+            dedicated_scanout_image: AtomicU64::new(0),
+            dedicated_scanout_memory: AtomicU64::new(0),
             diag_scanout_resource: AtomicU32::new(0),
             diag_scanout_wh: AtomicU64::new(0),
             diag_scanout_layout: AtomicU64::new(0),
             scanout_refresh_count: AtomicU32::new(0),
             scanout_refresh_fail: AtomicU32::new(0),
+            scanout_refresh_pending: AtomicU32::new(0),
+            scanout_flush_inflight: AtomicU32::new(0),
             vsync_armed: AtomicU32::new(0),
             display_w: 0,
             display_h: 0,
@@ -308,6 +397,10 @@ impl AdapterContext {
             return;
         }
         self.hpd_stop.store(0, Ordering::Release);
+        self.scanout_refresh_pending.store(0, Ordering::Release);
+        self.scanout_flush_inflight.store(0, Ordering::Release);
+        self.scanout_bind_inflight.store(0, Ordering::Release);
+        self.host_bound_scanout_resource.store(0, Ordering::Release);
         let mut handle: wdk_sys::HANDLE = core::ptr::null_mut();
         const THREAD_ALL_ACCESS: u32 = 0x001F_FFFF;
         // SAFETY: PASSIVE_LEVEL; a kernel system thread in the system process
@@ -334,6 +427,17 @@ impl AdapterContext {
     /// DISPATCH_LEVEL — KeSetEvent with Wait=FALSE is legal there).
     pub fn signal_hpd(&self) {
         // SAFETY: hpd_event was initialized in place by init_kernel_events.
+        unsafe { KeSetEvent(self.hpd_event.get(), 0, 0) };
+    }
+
+    /// Mark already-completed scanout contents dirty. The normal copied path
+    /// does this from the ring-1 GPU-completion DPC; the direct-primary
+    /// zero-copy case has no KMD GPU submission, so SetVidPn uses this after
+    /// Windows has handed it the completed primary.
+    pub fn request_scanout_refresh(&self) {
+        self.scanout_refresh_pending.store(1, Ordering::Release);
+        // SAFETY: hpd_event is initialized in place and stable for the adapter
+        // lifetime; KeSetEvent(Wait=FALSE) is legal through DISPATCH_LEVEL.
         unsafe { KeSetEvent(self.hpd_event.get(), 0, 0) };
     }
 
@@ -392,14 +496,95 @@ impl AdapterContext {
     }
 
     /// Remember the blob currently selected for scanout 0. PASSIVE callers bind
-    /// the blob via SET_SCANOUT_BLOB first, then publish it here for the worker's
-    /// periodic RESOURCE_FLUSH.
+    /// it via SET_SCANOUT_BLOB first, then publish it here for dirty-driven
+    /// RESOURCE_FLUSH after completed copies.
     pub fn remember_scanout_blob(&self, resource_id: u32, width: u32, height: u32) {
         let wh = ((width as u64) << 32) | height as u64;
         self.active_scanout_wh
             .store(wh, core::sync::atomic::Ordering::Release);
         self.active_scanout_resource
             .store(resource_id, core::sync::atomic::Ordering::Release);
+        // Existing callers invoke this only after a synchronous successful
+        // SET_SCANOUT_BLOB (diagnostic/bootstrap paths).
+        self.host_bound_scanout_resource
+            .store(resource_id, core::sync::atomic::Ordering::Release);
+    }
+
+    /// Publish the newest exact-primary scanout candidate without claiming the
+    /// host has bound it. The PASSIVE worker performs/coalesces the asynchronous
+    /// SET_SCANOUT_BLOB and subsequent RESOURCE_FLUSH.
+    pub fn publish_scanout_candidate(
+        &self,
+        resource_id: u32,
+        width: u32,
+        height: u32,
+        format: u32,
+        pitch: u32,
+        offset: u32,
+    ) {
+        let wh = ((width as u64) << 32) | height as u64;
+        let layout = ((pitch as u64) << 32) | offset as u64;
+        self.active_scanout_wh.store(wh, Ordering::Relaxed);
+        self.active_scanout_layout.store(layout, Ordering::Relaxed);
+        self.active_scanout_format.store(format, Ordering::Relaxed);
+        self.active_scanout_resource
+            .store(resource_id, Ordering::Release);
+    }
+
+    /// Publish the exact Venus import identity of the KMD-owned LINEAR primary.
+    /// `resource_id` is stored last so an acquire reader never combines a new id
+    /// with stale geometry or allocation parameters.
+    pub fn remember_primary_scanout(
+        &self,
+        resource_id: u32,
+        width: u32,
+        height: u32,
+        pitch: u32,
+        plane_offset: u32,
+        alloc_size: u64,
+        memory_type_index: u32,
+        dxgi_format: u32,
+    ) {
+        use core::sync::atomic::Ordering;
+        self.primary_scanout_wh
+            .store(((width as u64) << 32) | height as u64, Ordering::Relaxed);
+        self.primary_scanout_layout.store(
+            ((pitch as u64) << 32) | plane_offset as u64,
+            Ordering::Relaxed,
+        );
+        self.primary_scanout_alloc_size
+            .store(alloc_size, Ordering::Relaxed);
+        self.primary_scanout_memory_type
+            .store(memory_type_index, Ordering::Relaxed);
+        self.primary_scanout_dxgi_format
+            .store(dxgi_format, Ordering::Relaxed);
+        self.primary_scanout_generation
+            .fetch_add(1, Ordering::Relaxed);
+        self.primary_scanout_resource
+            .store(resource_id, Ordering::Release);
+    }
+
+    /// Remove a published primary identity only if it still names `resource_id`.
+    pub fn forget_primary_scanout(&self, resource_id: u32) {
+        use core::sync::atomic::Ordering;
+        // The dedicated LINEAR scanout belongs to the adapter, not to any
+        // transient WDDM allocation that imports its Venus resource id.  DWM
+        // creates and destroys several device/allocation generations during
+        // startup; letting one of those destroys clear this identity leaves
+        // scanout 0 bound to live-but-unpublishable stale pixels.
+        if resource_id != 0
+            && self.dedicated_scanout_resource.load(Ordering::Acquire) == resource_id
+        {
+            return;
+        }
+        if self
+            .primary_scanout_resource
+            .compare_exchange(resource_id, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            self.primary_scanout_generation
+                .fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Remember the KMD-owned diagnostic blob. The production scanout can still
@@ -423,59 +608,207 @@ impl AdapterContext {
             .store(resource_id, core::sync::atomic::Ordering::Release);
     }
 
-    /// Flush the active scanout blob once from PASSIVE_LEVEL. Returns false when
-    /// there is no selected blob yet or the transport is already stopped.
-    pub fn refresh_active_scanout(&self) -> bool {
-        let diag_2d = crate::diag::read_config_dword(b"ScanoutDiag", 0) == 7;
-        let diag_resource = self
-            .diag_scanout_resource
-            .load(core::sync::atomic::Ordering::Acquire);
-        let resource_id = if diag_2d && diag_resource != 0 {
-            diag_resource
-        } else {
-            self.active_scanout_resource
-                .load(core::sync::atomic::Ordering::Acquire)
-        };
-        let wh = if diag_2d && diag_resource != 0 {
-            self.diag_scanout_wh
-                .load(core::sync::atomic::Ordering::Acquire)
-        } else {
-            self.active_scanout_wh
-                .load(core::sync::atomic::Ordering::Acquire)
-        };
+    /// Queue one non-blocking RESOURCE_FLUSH for the selected scanout.  The
+    /// the exact-primary copy's ring-1 completion DPC sets the dirty bit and
+    /// wakes the worker only after the Venus GPU copy has completed. One
+    /// in-flight command is the backpressure boundary.
+    pub(crate) fn queue_active_scanout_refresh(&self) -> ScanoutRefreshQueue {
+        use core::sync::atomic::Ordering;
+
+        // This is the production path only. Diagnostic fills issue their own
+        // explicit one-shot flushes; never query the registry on every frame.
+        let resource_id = self.active_scanout_resource.load(Ordering::Acquire);
+        let wh = self.active_scanout_wh.load(Ordering::Relaxed);
+        let layout = self.active_scanout_layout.load(Ordering::Relaxed);
+        let format = self.active_scanout_format.load(Ordering::Relaxed);
+        // A newer present may publish while we sample the companion fields.
+        // Retry from the worker rather than combine two primary identities.
+        if self.active_scanout_resource.load(Ordering::Acquire) != resource_id {
+            return ScanoutRefreshQueue::Busy;
+        }
         let width = (wh >> 32) as u32;
         let height = wh as u32;
+        let stride = (layout >> 32) as u32;
+        let offset = layout as u32;
         if !self.display_half || resource_id == 0 || width == 0 || height == 0 {
-            return false;
+            return ScanoutRefreshQueue::Unavailable;
         }
-        let ok = if diag_2d && diag_resource != 0 {
-            crate::virtio::ctrl::set_scanout_2d(self, resource_id, width, height)
-                .and_then(|()| {
-                    crate::virtio::ctrl::resource_flush(self, resource_id, width, height)
-                })
-                .is_ok()
-        } else {
-            crate::virtio::ctrl::resource_flush(self, resource_id, width, height).is_ok()
-        };
+        if self.scanout_bind_inflight.load(Ordering::Acquire) != 0
+            || self.scanout_flush_inflight.load(Ordering::Acquire) != 0
+        {
+            return ScanoutRefreshQueue::Busy;
+        }
+
+        if self.host_bound_scanout_resource.load(Ordering::Acquire) != resource_id {
+            if stride == 0 || format == 0 {
+                return ScanoutRefreshQueue::Unavailable;
+            }
+            if self
+                .scanout_bind_inflight
+                .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                return ScanoutRefreshQueue::Busy;
+            }
+            let result = crate::virtio::ctrl::set_scanout_blob_async(
+                self,
+                resource_id,
+                width,
+                height,
+                format,
+                stride,
+                offset,
+                NonNull::from(&self.scanout_bind_inflight),
+                NonNull::from(&self.scanout_bind_fail),
+                NonNull::from(&self.host_bound_scanout_resource),
+                NonNull::from(&self.scanout_refresh_pending),
+                // SAFETY: embedded initialized event; adapter outlives entry.
+                unsafe { NonNull::new_unchecked(self.hpd_event.get()) },
+            );
+            if result.is_err() {
+                self.scanout_bind_inflight.store(0, Ordering::Release);
+                let failed = self
+                    .scanout_bind_fail
+                    .fetch_add(1, Ordering::Relaxed)
+                    .wrapping_add(1);
+                if failed == 1 || (failed % 60) == 0 {
+                    crate::diag::record_named_bytes(b"RbRid", resource_id);
+                    crate::diag::record_named_bytes(b"RbFail", failed);
+                }
+                return ScanoutRefreshQueue::Failed;
+            }
+            return ScanoutRefreshQueue::Queued;
+        }
+
+        if self
+            .scanout_flush_inflight
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return ScanoutRefreshQueue::Busy;
+        }
+
+        let result = crate::virtio::ctrl::resource_flush_async(
+            self,
+            resource_id,
+            width,
+            height,
+            NonNull::from(&self.scanout_flush_inflight),
+            NonNull::from(&self.scanout_refresh_fail),
+            // SAFETY: hpd_event is an embedded, in-place initialized KEVENT and
+            // the adapter outlives every transport entry that holds this pointer.
+            unsafe { NonNull::new_unchecked(self.hpd_event.get()) },
+        );
+        if result.is_err() {
+            self.scanout_flush_inflight.store(0, Ordering::Release);
+            let failed = self
+                .scanout_refresh_fail
+                .fetch_add(1, Ordering::Relaxed)
+                .wrapping_add(1);
+            if failed == 1 || (failed % 60) == 0 {
+                crate::diag::record_named_bytes(b"RfRid", resource_id);
+                crate::diag::record_named_bytes(b"RfFail", failed);
+            }
+            return ScanoutRefreshQueue::Failed;
+        }
+
         let n = self
             .scanout_refresh_count
-            .fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+            .fetch_add(1, Ordering::Relaxed)
             .wrapping_add(1);
-        if !ok {
-            self.scanout_refresh_fail
-                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        }
-        if n == 1 || (n % 60) == 0 || !ok {
+        // Registry writes are synchronous and must not become a once-per-second
+        // frame-path tax at 60 Hz. Refresh live telemetry every ~10 seconds.
+        if n == 1 || (n % 600) == 0 {
             crate::diag::record_named_bytes(b"RfRid", resource_id);
             crate::diag::record_named_bytes(b"RfWH", (width << 16) | (height & 0xFFFF));
             crate::diag::record_named_bytes(b"RfCnt", n);
             crate::diag::record_named_bytes(
                 b"RfFail",
-                self.scanout_refresh_fail
-                    .load(core::sync::atomic::Ordering::Relaxed),
+                self.scanout_refresh_fail.load(Ordering::Relaxed),
+            );
+            // Live proof that ctrl completions are reaching the real IRQ/DPC
+            // path; these atomics otherwise become visible only at teardown.
+            crate::diag::record_named_bytes(
+                b"IrqN",
+                crate::ddi::interrupt::INT_ROUTINE_COUNT.load(Ordering::Relaxed),
+            );
+            crate::diag::record_named_bytes(
+                b"DpcN",
+                crate::ddi::interrupt::DPC_ROUTINE_COUNT.load(Ordering::Relaxed),
+            );
+            crate::diag::record_named_bytes(
+                b"RfDone",
+                crate::virtio::gpu::ASYNC_CTRL_COMPLETE_COUNT.load(Ordering::Relaxed),
             );
         }
-        ok
+        // Low-rate live pacing telemetry. These counters are updated at
+        // DISPATCH/DIRQL and otherwise become visible only at device teardown;
+        // one PASSIVE snapshot per 16 queued scanout operations is cheap enough
+        // to keep while making a 2.4-fps stall diagnosable in the live boot.
+        if n == 1 || (n % 16) == 0 {
+            crate::diag::record_named_bytes(b"VsCnt", self.vsync_count.load(Ordering::Relaxed));
+            crate::diag::record_named_bytes(b"VsEn", self.vsync_enabled.load(Ordering::Relaxed));
+            crate::diag::record_named_bytes(
+                b"SaCnt",
+                crate::ddi::VIDPN_SOURCE_ADDRESS_COUNT.load(Ordering::Relaxed),
+            );
+            let primary_address = self.last_primary_address.load(Ordering::Relaxed);
+            crate::diag::record_named_bytes(b"SaLo", primary_address as u32);
+            crate::diag::record_named_bytes(b"SaHi", (primary_address >> 32) as u32);
+            crate::diag::record_named_bytes(
+                b"AsSub",
+                crate::virtio::gpu::ASYNC_SUBMIT_COUNT.load(Ordering::Relaxed),
+            );
+            crate::diag::record_named_bytes(
+                b"AsDone",
+                crate::virtio::gpu::ASYNC_COMPLETE_COUNT.load(Ordering::Relaxed),
+            );
+            crate::diag::record_named_bytes(
+                b"WfDone",
+                crate::virtio::gpu::WDDM_FENCE_FROM_DPC.load(Ordering::Relaxed),
+            );
+            crate::diag::record_named_bytes(
+                b"WtOut",
+                crate::virtio::gpu::FENCE_WAIT_TIMEOUTS.load(Ordering::Relaxed),
+            );
+            crate::diag::record_named_bytes(
+                b"CtOut",
+                crate::virtio::gpu::CTRL_TIMEOUT_COUNT.load(Ordering::Relaxed),
+            );
+            crate::diag::record_named_bytes(
+                b"DpHit",
+                crate::virtio::gpu::DMA_POOL_HITS.load(Ordering::Relaxed),
+            );
+            crate::diag::record_named_bytes(
+                b"DpMis",
+                crate::virtio::gpu::DMA_POOL_MISSES.load(Ordering::Relaxed),
+            );
+            crate::diag::record_named_bytes(
+                b"DpDrp",
+                crate::virtio::gpu::DMA_POOL_DROPS.load(Ordering::Relaxed),
+            );
+            crate::diag::record_named_bytes(
+                b"DpByt",
+                crate::virtio::gpu::DMA_POOL_CACHED_BYTES.load(Ordering::Relaxed),
+            );
+            crate::diag::record_named_bytes(
+                b"DmStl",
+                crate::ddi::DMA_STALE_SKIP_COUNT.load(Ordering::Relaxed),
+            );
+            crate::diag::record_named_bytes(
+                b"QfRet",
+                crate::virtio::gpu::QUEUE_FULL_RETRIES.load(Ordering::Relaxed),
+            );
+            crate::diag::record_named_bytes(
+                b"IfHi",
+                crate::virtio::gpu::INFLIGHT_HIGH_WATER.load(Ordering::Relaxed),
+            );
+            crate::diag::record_named_bytes(
+                b"PkHi",
+                crate::virtio::gpu::PARKED_HIGH_WATER.load(Ordering::Relaxed),
+            );
+        }
+        ScanoutRefreshQueue::Queued
     }
 
     /// Arm the display-half VSync heartbeat: initialize the embedded KDPC/KTIMER
@@ -630,6 +963,25 @@ impl AdapterContext {
     /// Borrow the Dxgkrnl interface, or fail if StartDevice has not run yet.
     pub fn dxgkrnl(&self) -> Result<&DXGKRNL_INTERFACE, DriverError> {
         self.dxgkrnl.as_ref().ok_or(DriverError::DeviceNotFound)
+    }
+
+    /// Lock-free observation for query/diagnostic paths. Mutation is exposed
+    /// only through [`WddmNotifyGuard`], so advancing the scheduler watermark
+    /// statically requires ownership of the notification-lock proof.
+    pub(crate) fn completed_fence(&self) -> u32 {
+        self.last_completed_fence.load(Ordering::Acquire)
+    }
+
+    /// Serialize one scheduler notification at DISPATCH_LEVEL. The closure
+    /// must not wait or allocate; it may raise further to the device DIRQL via
+    /// `DxgkCbSynchronizeExecution`. The closure receives an unforgeable proof
+    /// token required by every operation whose contract depends on this lock.
+    pub(crate) fn with_wddm_notify_lock<R>(&self, f: impl FnOnce(&WddmNotifyGuard<'_>) -> R) -> R {
+        let irql = unsafe { KeAcquireSpinLockRaiseToDpc(self.wddm_notify_lock.get()) };
+        let guard = WddmNotifyGuard { adapter: self };
+        let result = f(&guard);
+        unsafe { KeReleaseSpinLock(self.wddm_notify_lock.get(), irql) };
+        result
     }
 
     /// Install (or clear) the virtio transport under the lock.

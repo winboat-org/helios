@@ -713,9 +713,26 @@ unsafe extern "system" fn create_device(
                 dxvk,
                 h_rt_device: create.h_rt_device,
                 h_context: core::ptr::null_mut(),
+                command_buffer: core::cell::Cell::new(core::ptr::null_mut()),
+                command_buffer_size: core::cell::Cell::new(0),
+                allocation_list: core::cell::Cell::new(core::ptr::null_mut()),
+                allocation_list_size: core::cell::Cell::new(0),
+                patch_list: core::cell::Cell::new(core::ptr::null_mut()),
+                patch_list_size: core::cell::Cell::new(0),
                 kt_callbacks: create.p_kt_callbacks as *const ddi::D3DDDI_DEVICECALLBACKS,
                 dxgi_callbacks: create.dxgi_base_ddi.p_dxgi_base_callbacks
                     as *mut ddi::DXGI_DDI_BASE_CALLBACKS,
+                scanout_resource_raw: core::cell::Cell::new(0),
+                scanout_resource_id: core::cell::Cell::new(0),
+                scanout_allocation: core::cell::Cell::new(0),
+                scanout_width: core::cell::Cell::new(0),
+                scanout_height: core::cell::Cell::new(0),
+                scanout_format: core::cell::Cell::new(0),
+                scanout_import: core::cell::RefCell::new(None),
+                scanout_generation: core::cell::Cell::new(0),
+                direct_scanout_allocations: core::cell::RefCell::new(Vec::new()),
+                composition_source: core::cell::RefCell::new(None),
+                scanout_copy_count: core::cell::Cell::new(0),
                 h_rt_core_layer: create.h_rt_core_layer,
                 um_callbacks: create.p_um_callbacks,
                 ia: core::cell::RefCell::new(device_funcs::IaState::default()),
@@ -1024,7 +1041,8 @@ pub(crate) fn trace_enabled() -> bool {
 
 /// Whether the adapter advertises D3D11 feature level 11_0 instead of the
 /// conservative FL10_0 profile: `HKLM\SOFTWARE\Helios!FeatureLevel11`
-/// (REG_DWORD). Absent = full FL11_0; explicit 0 = FL10_0 opt-out. Read once
+/// (REG_DWORD). Absent = FL10_0 while the display path is stabilized; explicit
+/// 1 = full FL11_0 opt-in. Read once
 /// per process, so an already-running dwm keeps the level it created its
 /// device at while freshly-launched apps pick up the new value.
 ///
@@ -1042,8 +1060,8 @@ pub(crate) fn trace_enabled() -> bool {
 /// concrete string. Gates fixed so far: 3DPIPELINESUPPORT is a bitmask
 /// (FL11=0x7), SHADER compute cap is 0x2, and MSAA/format support must match
 /// D3D11.3 §19.2.5. knob=0 remains the exact FL10_0 baseline opt-out for A/B.
-///   absent = full FL11_0 profile (default)
-///   0 = FL10_0 profile (opt-out)
+///   absent = FL10_0 profile (display-stability default)
+///   0 = FL10_0 profile
 ///   1 = full FL11_0 (pipeline 11_0 + real MSAA + unmasked format bits)
 ///   2 = DIAGNOSTIC: pipeline claims 11_0 but keeps the FL10 MSAA/format caps —
 ///       isolates pipeline-level validation from the later FL11 caps gates.
@@ -1082,16 +1100,16 @@ pub(crate) fn feature_level_mode() -> u32 {
         if rc == 0 {
             value
         } else {
-            1
+            0
         }
     })
 }
 
 /// Present-path frame-completion gate cap in microseconds:
 /// `HKLM\SOFTWARE\Helios!PresentGateUs` (REG_DWORD). Read once per process.
-/// Absent = 32000 (two 60 Hz frames — the typical wait is 1-5 ms, so the cap
-/// rarely binds); 0 disables the gate entirely (A/B lever for the
-/// ghosting-vs-latency trade).
+/// Absent = 0 for the real display-adapter path. The old 32 ms default ordered
+/// an IddCx consumer that is no longer present and visibly throttled DWM.
+/// A nonzero value remains available as an explicit diagnostic override.
 pub(crate) fn present_gate_us() -> u32 {
     use std::sync::OnceLock;
     static VALUE: OnceLock<u32> = OnceLock::new();
@@ -1110,7 +1128,7 @@ pub(crate) fn present_gate_us() -> u32 {
         }
         const HKEY_LOCAL_MACHINE: usize = 0x8000_0002;
         const RRF_RT_REG_DWORD: u32 = 0x10;
-        const DEFAULT_US: u32 = 32_000;
+        const DEFAULT_US: u32 = 0;
         let mut value: u32 = 0;
         let mut len: u32 = 4;
         // SAFETY: NUL-terminated key/value names; `value`/`len` outlive the call.
@@ -1237,11 +1255,10 @@ pub(crate) fn vehicle_kernel_flip_wait() -> bool {
     })
 }
 
-/// WS1 #4 producer kill-switch: `HKLM\SOFTWARE\Helios!PresentSyncPublish`
-/// (REG_DWORD). Read once per process. Absent = 1 (publish the per-present
-/// named-fence signal + (resid, pid, value) slots); 0 disables the new path
-/// entirely, leaving only the bounded `PresentGateUs` gate — the stability
-/// rollback lever while the consumer-side wait soaks.
+/// Legacy IddCx producer switch: `HKLM\SOFTWARE\Helios!PresentSyncPublish`
+/// (REG_DWORD). Read once per process. Absent = 0 because the real Helios
+/// display adapter has no cross-process IDD consumer. Enabling it creates a
+/// Win32 external semaphore and an extra D3DKMTEscape on every frame.
 pub(crate) fn present_sync_publish_enabled() -> bool {
     use std::sync::OnceLock;
     static VALUE: OnceLock<bool> = OnceLock::new();
@@ -1274,11 +1291,7 @@ pub(crate) fn present_sync_publish_enabled() -> bool {
                 &mut len,
             )
         };
-        if rc == 0 {
-            value != 0
-        } else {
-            true
-        }
+        rc == 0 && value != 0
     })
 }
 

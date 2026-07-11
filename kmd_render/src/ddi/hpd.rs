@@ -13,7 +13,7 @@
 use core::ffi::c_void;
 use core::sync::atomic::Ordering;
 
-use crate::adapter::AdapterContext;
+use crate::adapter::{AdapterContext, ScanoutRefreshQueue};
 use crate::dxgk::*;
 use wdk_sys::ntddk::{KeWaitForSingleObject, PsTerminateSystemThread};
 
@@ -79,28 +79,81 @@ pub unsafe extern "C" fn hpd_thread_routine(context: *mut c_void) {
         return;
     }
     indicate_child_status(adapter, true);
+    // The initial timed/event wake already covered any config change that raced
+    // StartDevice. Do not carry that bit into the steady-state event mux.
+    adapter.config_change_pending.store(0, Ordering::Release);
 
-    // Steady state: re-indicate on each config-change wake; between wakes, flush
-    // the selected scanout blob. This thread is PASSIVE_LEVEL and joined before
-    // teardown, so it is the right place for the blocking virtio control roundtrip.
+    // Steady state is event/dirty driven. A real virtio display-change wakes us
+    // to re-indicate the child; a completed primary GPU copy wakes us to queue
+    // exactly one asynchronous RESOURCE_FLUSH. While that one command is in
+    // flight, use a short used-ring poll only as interrupt-loss tolerance. This
+    // never emits another flush by itself, so an idle desktop produces no ctrl
+    // spam and a delayed synchronous response cannot cap presentation at 2.4 Hz.
+    let mut reported_fail = 0u32;
     loop {
+        let flush_inflight = adapter.scanout_flush_inflight.load(Ordering::Acquire) != 0;
+        let bind_inflight = adapter.scanout_bind_inflight.load(Ordering::Acquire) != 0;
+        let ctrl_inflight = flush_inflight || bind_inflight;
+        let retry_pending =
+            adapter.scanout_refresh_pending.load(Ordering::Acquire) != 0 && !ctrl_inflight;
         let mut timeout: LARGE_INTEGER = unsafe { core::mem::zeroed() };
-        timeout.QuadPart = -160_000; // 16 ms relative (100 ns units)
-                                     // SAFETY: timed wait on the initialized hpd_event.
+        let timeout_ptr = if ctrl_inflight {
+            timeout.QuadPart = -40_000; // 4 ms: bounded lost-interrupt fallback.
+            &mut timeout
+        } else if retry_pending {
+            timeout.QuadPart = -160_000; // 16 ms retry after a loud enqueue failure.
+            &mut timeout
+        } else {
+            core::ptr::null_mut()
+        };
+        // SAFETY: wait on the initialized event; NULL timeout means sleep until
+        // config change, scanout dirty, completion, or StopDevice.
         let wait_status = unsafe {
-            KeWaitForSingleObject(adapter.hpd_event.get() as PVOID, 0, 0, 0, &mut timeout)
+            KeWaitForSingleObject(adapter.hpd_event.get() as PVOID, 0, 0, 0, timeout_ptr)
         };
         if adapter.hpd_stop.load(Ordering::Acquire) != 0 {
             // SAFETY: terminates the current system thread; does not return.
             let _ = unsafe { PsTerminateSystemThread(STATUS_SUCCESS) };
             return;
         }
-        if wait_status == STATUS_TIMEOUT {
-            let _ = adapter.refresh_active_scanout();
-            continue;
+
+        // The KEVENT is the primary completion path (ISR -> DPC -> drain ->
+        // signal). If that device interrupt is delayed, poll only while one
+        // async flush owns descriptors; also do one poll when a new dirty frame
+        // arrives behind it. This frees the coalescing gate without waiting for
+        // the old exponential synchronous-roundtrip slices.
+        if (wait_status == STATUS_TIMEOUT && ctrl_inflight)
+            || ((adapter.scanout_flush_inflight.load(Ordering::Acquire) != 0
+                || adapter.scanout_bind_inflight.load(Ordering::Acquire) != 0)
+                && adapter.scanout_refresh_pending.load(Ordering::Acquire) != 0)
+        {
+            crate::ddi::interrupt::drain_used_and_complete(adapter);
         }
-        // A virtio display event may have changed the mode; re-indicate connected
-        // so the OS re-reads the monitor (QueryChildStatus/QueryDeviceDescriptor).
-        indicate_child_status(adapter, true);
+
+        // The ISR owns setting this bit; the PASSIVE worker consumes it after
+        // the DPC's wake so a scanout-completion wake cannot masquerade as HPD.
+        if adapter.config_change_pending.swap(0, Ordering::AcqRel) != 0 {
+            indicate_child_status(adapter, true);
+        }
+
+        if adapter.scanout_refresh_pending.swap(0, Ordering::AcqRel) != 0 {
+            match adapter.queue_active_scanout_refresh() {
+                ScanoutRefreshQueue::Queued => {}
+                ScanoutRefreshQueue::Busy | ScanoutRefreshQueue::Failed => {
+                    // Preserve the first dirty frame. Busy completion wakes us;
+                    // an enqueue failure gets the bounded retry timeout above.
+                    adapter.scanout_refresh_pending.store(1, Ordering::Release);
+                }
+                // No bound scanout: there is nothing meaningful to flush. A
+                // later completed copy will publish a fresh dirty edge.
+                ScanoutRefreshQueue::Unavailable => {}
+            }
+        }
+
+        let failed = adapter.scanout_refresh_fail.load(Ordering::Relaxed);
+        if failed != reported_fail && (failed == 1 || (failed != 0 && (failed % 60) == 0)) {
+            crate::diag::record_named_bytes(b"RfFail", failed);
+            reported_fail = failed;
+        }
     }
 }

@@ -110,10 +110,12 @@ pub unsafe extern "C" fn dxgkddi_reset_engine(
     let adapter = unsafe { &*(h_adapter as *const AdapterContext) };
     // Engine reset aborts the node's outstanding submissions: drop the pending
     // venus-gated WDDM fences (dxgkrnl resubmits what it still wants done).
-    let _ = adapter.with_virtio(|v| v.preempt_flush());
-    reset.LastAbortedFenceId = adapter
-        .last_completed_fence
-        .load(core::sync::atomic::Ordering::Acquire) as UINT;
+    // The queue mutation requires the notification-lock proof token, so no DMA
+    // completion from the abandoned scheduler epoch can escape concurrently.
+    adapter.with_wddm_notify_lock(|guard| {
+        let _ = adapter.with_virtio(|v| v.preempt_flush(guard));
+        reset.LastAbortedFenceId = guard.completed_fence() as UINT;
+    });
     STATUS_SUCCESS
 }
 
@@ -261,7 +263,7 @@ pub unsafe extern "C" fn dxgkddi_present_to_hw_queue(
             unsafe { super::create_allocation::present_scanout_alloc_info(src_handle) };
         if let Some(sc) = src_scanout {
             crate::diag::record_named_bytes(b"PHQsrc", sc.resource_id);
-            super::display::issue_present_scanout(
+            let _ = super::display::issue_present_scanout(
                 adapter,
                 sc.resource_id,
                 sc.width,
@@ -269,6 +271,8 @@ pub unsafe extern "C" fn dxgkddi_present_to_hw_queue(
                 sc.pitch,
                 sc.dxgi_format,
                 sc.plane_offset,
+                sc.venus_alloc_size,
+                sc.direct_scanout,
                 3,
             );
         } else {

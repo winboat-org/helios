@@ -1,14 +1,9 @@
-//! VidPn topology / mode-enumeration helpers for the optional display half
-//! (priority #1 windowed-BLT fix, Option A — `WINDOWED_BLT_DESIGN.md` §6).
+//! VidPn topology / mode-enumeration helpers for the active display half.
 //!
-//! Helios is normally render-only (0 sources / 0 children; all VidPn DDIs
-//! NOT_SUPPORTED). With the `DisplayHalf` service knob on, `StartDevice`
-//! advertises ONE video-present source + ONE child video-output and these
-//! helpers stand up a single fixed-mode, **no-scanout** VidPn output + default
-//! monitor. The goal is only to make Helios a *presentable* adapter so DXGI
-//! stops declaring legacy BLT-model windowed presents `DXGI_STATUS_OCCLUDED`;
-//! we never physically scan out (the Looking Glass IddCx keeps capturing the
-//! DWM composition), so `SetVidPnSourceAddress`/`CommitVidPn` are no-ops.
+//! With the production `DisplayHalf` service knob on, `StartDevice` advertises
+//! one video-present source and one child output. `CommitVidPn` validates the
+//! fixed mode and `SetVidPnSourceAddress` selects the authoritative primary for
+//! virtio-gpu scanout. Knob-off render-only behavior remains a recovery mode.
 //!
 //! The VidPn iteration mirrors the proven virtio-gpu display-only miniport
 //! (`virtio-research-only-3d/viogpu/viogpudo`) `EnumVidPnCofuncModality`. A
@@ -658,6 +653,11 @@ pub unsafe fn enum_cofunc_modality(
                 );
             }
             local.ContentTransformation.RotationSupport.set_Identity(1);
+            // WDDM 1.3 path-independent rotation and later require every
+            // primary clone path to advertise exactly one offset.  A
+            // test-signed driver that reports none is deliberately bugchecked
+            // by dxgkrnl while UpdatePathSupportInfo validates the path.
+            local.ContentTransformation.RotationSupport.set_Offset0(1);
             modified = true;
         }
         if modified {

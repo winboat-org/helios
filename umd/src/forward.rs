@@ -28,7 +28,10 @@ use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_SAMPLE_DESC};
 
 use helios_protocol::{
-    HeliosWddmAllocMeta, HeliosWddmAllocPrivate, HeliosWddmOpenIdentity,
+    HeliosPresentPrivateData, HeliosPresentRefreshCmd, HeliosPresentRenderCmd, HeliosWddmAllocMeta,
+    HeliosWddmAllocPrivate, HeliosWddmOpenIdentity, HELIOS_PRESENT_PRIVATE_FLAG_DIRECT_SCANOUT,
+    HELIOS_PRESENT_PRIVATE_MAGIC, HELIOS_PRESENT_PRIVATE_VERSION, HELIOS_PRESENT_REFRESH_MAGIC,
+    HELIOS_PRESENT_REFRESH_VERSION, HELIOS_PRESENT_RENDER_MAGIC, HELIOS_PRESENT_RENDER_VERSION,
     HELIOS_WDDM_ALLOC_KIND_DEVICE_MEMORY, HELIOS_WDDM_ALLOC_KIND_STANDARD,
     VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE, VIRTIO_GPU_BLOB_FLAG_USE_SHAREABLE,
     VIRTIO_GPU_BLOB_MEM_HOST3D, VIRTIO_GPU_MAP_CACHE_CACHED,
@@ -67,6 +70,12 @@ static IA_BIND_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 static PRESENT_READBACK_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 static PRESENT_FORCE_OPAQUE_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 
+/// KMD-private meta bit matching `HELIOS_ALLOC_MISC_PRIMARY` in
+/// `kmd_render/src/ddi/create_allocation.rs`. This bit is not a D3D11 misc flag;
+/// open_resource masks it out before recreating an API texture.
+const HELIOS_ALLOC_MISC_PRIMARY: u32 = 0x8000_0000;
+const HELIOS_ALLOC_MISC_DIRECT_SCANOUT: u32 = 0x4000_0000;
+
 struct ResourceState {
     com_raw: usize,
     allocation: ddi::D3DKMT_HANDLE,
@@ -79,10 +88,13 @@ struct ResourceState {
     /// handles that way is what returned 0x80070057 and leaked the runtime's
     /// side of the open.
     owns_allocation: bool,
+    present_private: HeliosPresentPrivateData,
 }
 
 struct RtvState {
     com_raw: usize,
+    /// Non-owning resource pointer; the RTV itself keeps the resource alive.
+    resource_raw: usize,
     allocation: ddi::D3DKMT_HANDLE,
     width: u32,
     height: u32,
@@ -99,6 +111,20 @@ struct RuntimeAllocPrivate {
 #[inline]
 fn env_flag(name: &str) -> bool {
     std::env::var_os(name).is_some()
+}
+
+fn empty_present_private() -> HeliosPresentPrivateData {
+    HeliosPresentPrivateData {
+        plane_offset: 0,
+        magic: 0,
+        version: 0,
+        resource_id: 0,
+        width: 0,
+        height: 0,
+        pitch: 0,
+        dxgi_format: 0,
+        reserved: 0,
+    }
 }
 
 /// Legacy 24-byte trailer (geometry + bind/misc, no venus identity) written by
@@ -452,6 +478,7 @@ unsafe fn store_resource(
     km_resource: ddi::D3DKMT_HANDLE,
     rt_resource: ddi::HANDLE,
     owns_allocation: bool,
+    present_private: HeliosPresentPrivateData,
 ) {
     if handle_priv.is_null() {
         return;
@@ -462,6 +489,7 @@ unsafe fn store_resource(
         km_resource,
         rt_resource,
         owns_allocation,
+        present_private,
     });
     *(handle_priv as *mut *mut c_void) = Box::into_raw(state) as *mut c_void;
 }
@@ -539,6 +567,310 @@ unsafe fn resource_allocation(handle_priv: *mut c_void) -> ddi::D3DKMT_HANDLE {
     } else {
         (*state).allocation
     }
+}
+
+unsafe fn resource_present_private(handle_priv: *mut c_void) -> Option<HeliosPresentPrivateData> {
+    if handle_priv.is_null() {
+        return None;
+    }
+    let state = *(handle_priv as *const *mut ResourceState);
+    if state.is_null() {
+        return None;
+    }
+    let p = (*state).present_private;
+    p.is_valid().then_some(p)
+}
+
+/// Resolve scanout metadata by the allocation Windows is actually presenting.
+/// DXGI may keep one stable resource object while rotating its `hAllocation`
+/// among the pPrimaryDesc ring, so resource-local metadata alone is not enough.
+unsafe fn presented_primary_private(
+    h: Hdevice,
+    handle_priv: *mut c_void,
+) -> Option<HeliosPresentPrivateData> {
+    if let Some(private) = unsafe { resource_present_private(handle_priv) } {
+        return Some(private);
+    }
+    let allocation = unsafe { resource_allocation(handle_priv) };
+    if allocation == 0 {
+        return None;
+    }
+    let dev = unsafe { helios_device(h) }?;
+    dev.direct_scanout_allocations
+        .borrow()
+        .iter()
+        .find_map(|(candidate, private)| (*candidate == allocation).then_some(*private))
+}
+
+unsafe fn remember_direct_scanout_allocation(
+    h: Hdevice,
+    allocation: ddi::D3DKMT_HANDLE,
+    private: HeliosPresentPrivateData,
+) {
+    if allocation == 0 || !private.is_valid() {
+        return;
+    }
+    let Some(dev) = (unsafe { helios_device(h) }) else {
+        return;
+    };
+    let mut entries = dev.direct_scanout_allocations.borrow_mut();
+    entries.retain(|(candidate, _)| *candidate != allocation);
+    entries.push((allocation, private));
+}
+
+unsafe fn remember_scanout_target(
+    h: Hdevice,
+    raw: usize,
+    allocation: ddi::D3DKMT_HANDLE,
+    private: HeliosPresentPrivateData,
+) {
+    if raw == 0 || allocation == 0 || !private.is_valid() {
+        return;
+    }
+    let Some(dev) = helios_device(h) else {
+        return;
+    };
+    let area = (private.width as u64).saturating_mul(private.height as u64);
+    let current_area =
+        (dev.scanout_width.get() as u64).saturating_mul(dev.scanout_height.get() as u64);
+    if current_area != 0 && area < current_area {
+        return;
+    }
+    dev.scanout_resource_raw.set(raw);
+    dev.scanout_resource_id.set(private.resource_id);
+    dev.scanout_allocation.set(allocation);
+    dev.scanout_width.set(private.width);
+    dev.scanout_height.set(private.height);
+    dev.scanout_format.set(private.dxgi_format);
+    log_line(&format!(
+        "DDI scanout target: raw=0x{raw:x} alloc=0x{allocation:x} res_id={} {}x{} fmt={} pitch={}",
+        private.resource_id, private.width, private.height, private.dxgi_format, private.pitch
+    ));
+}
+
+unsafe fn clear_scanout_target_if_matches(h: Hdevice, raw: usize) {
+    if raw == 0 {
+        return;
+    }
+    let Some(dev) = helios_device(h) else {
+        return;
+    };
+    if dev.scanout_resource_raw.get() == raw {
+        dev.scanout_resource_raw.set(0);
+        dev.scanout_resource_id.set(0);
+        dev.scanout_allocation.set(0);
+        dev.scanout_width.set(0);
+        dev.scanout_height.set(0);
+        dev.scanout_format.set(0);
+        log_line("DDI scanout target cleared");
+    }
+}
+
+fn is_dwm_process() -> bool {
+    use std::sync::OnceLock;
+    static IS_DWM: OnceLock<bool> = OnceLock::new();
+    *IS_DWM.get_or_init(|| {
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .map(|n| n.eq_ignore_ascii_case("dwm.exe"))
+            .unwrap_or(false)
+    })
+}
+
+/// Lazily query and import the KMD-owned LINEAR primary into DWM's existing
+/// Venus device. The bridge uses this VkInstance's D3DKMT handles, so the import
+/// and its resource attachment cannot accidentally land in another live Venus
+/// instance hosted by the process.
+unsafe fn ensure_kmd_scanout_target(h: Hdevice) -> bool {
+    if !is_dwm_process() {
+        return false;
+    }
+    let Some(dev) = helios_device(h) else {
+        return false;
+    };
+    if dev.scanout_import.borrow().is_some() {
+        return true;
+    }
+
+    let mut resource_id = 0u32;
+    let mut width = 0u32;
+    let mut height = 0u32;
+    let mut pitch = 0u32;
+    let mut generation = 0u32;
+    let raw = unsafe {
+        dev.dxvk.open_kmd_scanout_target(
+            &mut resource_id,
+            &mut width,
+            &mut height,
+            &mut pitch,
+            &mut generation,
+        )
+    };
+    if raw == 0 {
+        return false;
+    }
+
+    // SAFETY: the bridge returns one owned ID3D11Resource reference.
+    let target = unsafe { ID3D11Resource::from_raw(raw as *mut c_void) };
+    dev.scanout_resource_raw.set(raw);
+    dev.scanout_resource_id.set(resource_id);
+    dev.scanout_allocation.set(0);
+    dev.scanout_width.set(width);
+    dev.scanout_height.set(height);
+    // The target VkImage is BGRA; virtio scanout ignores alpha as XR24.
+    dev.scanout_format.set(87);
+    dev.scanout_generation.set(generation);
+    dev.scanout_import.replace(Some(target));
+    log_line(&format!(
+        "DWM KMD scanout import ready: res_id={} {}x{} pitch={} gen={}",
+        resource_id, width, height, pitch, generation
+    ));
+    true
+}
+
+/// Remember a full-mode BGRA render target as DWM's current private optimal
+/// composition surface. Holding our own COM reference makes the pointer safe
+/// across the later Flush callback even if DWM releases the RTV first.
+unsafe fn track_dwm_composition_target(
+    h: Hdevice,
+    resource_raw: usize,
+    allocation: ddi::D3DKMT_HANDLE,
+    width: u32,
+    height: u32,
+    format: u32,
+) {
+    // An exact Windows-designated primary already is the scanout backing.
+    // Never create/select the legacy LINEAR copy target for it.
+    let direct_primary = unsafe { helios_device(h) }.is_some_and(|dev| {
+        dev.direct_scanout_allocations
+            .borrow()
+            .iter()
+            .any(|(candidate, _)| *candidate == allocation)
+    });
+    if resource_raw == 0 || direct_primary || !unsafe { ensure_kmd_scanout_target(h) } {
+        return;
+    }
+    let Some(dev) = helios_device(h) else {
+        return;
+    };
+    if width != dev.scanout_width.get()
+        || height != dev.scanout_height.get()
+        || format != dev.scanout_format.get()
+        || resource_raw == dev.scanout_resource_raw.get()
+    {
+        return;
+    }
+
+    if dev
+        .composition_source
+        .borrow()
+        .as_ref()
+        .map(|r| r.as_raw() as usize == resource_raw)
+        .unwrap_or(false)
+    {
+        return;
+    }
+    // SAFETY: `resource_raw` is kept alive by the bound RTV. ManuallyDrop makes
+    // this a borrowed COM wrapper; clone takes the owned reference we retain.
+    let borrowed =
+        ManuallyDrop::new(unsafe { ID3D11Resource::from_raw(resource_raw as *mut c_void) });
+    dev.composition_source.replace(Some((*borrowed).clone()));
+    log_line(&format!(
+        "DWM composition target selected: raw=0x{:x} {}x{} fmt={}",
+        resource_raw, width, height, format
+    ));
+}
+
+/// Record the one required per-frame GPU copy on DWM's own command stream.
+/// The following `ID3D11DeviceContext::Flush` submits both DWM's rendering and
+/// this copy in order; DXVK then releases the shared LINEAR target externally.
+unsafe fn publish_dwm_composition(context: &ID3D11DeviceContext, h: Hdevice) -> bool {
+    if !unsafe { ensure_kmd_scanout_target(h) } {
+        return false;
+    }
+    let Some(dev) = helios_device(h) else {
+        return false;
+    };
+    let source = dev.composition_source.borrow();
+    let target = dev.scanout_import.borrow();
+    let (Some(source), Some(target)) = (source.as_ref(), target.as_ref()) else {
+        return false;
+    };
+    if source.as_raw() == target.as_raw() {
+        return false;
+    }
+    context.CopySubresourceRegion(target, 0, 0, 0, 0, source, 0, None);
+    let n = dev.scanout_copy_count.get().wrapping_add(1);
+    dev.scanout_copy_count.set(n);
+    if n <= 8 || n % 600 == 0 {
+        log_line(&format!(
+            "DWM desktop->LINEAR scanout copy #{} res_id={} {}x{}",
+            n,
+            dev.scanout_resource_id.get(),
+            dev.scanout_width.get(),
+            dev.scanout_height.get()
+        ));
+    }
+    true
+}
+
+unsafe fn copy_to_scanout_target(
+    context: &ID3D11DeviceContext,
+    h: Hdevice,
+    src_h: ddi::D3D10DDI_HRESOURCE,
+) -> bool {
+    let Some(dev) = helios_device(h) else {
+        return false;
+    };
+    let dst_raw = dev.scanout_resource_raw.get();
+    if dst_raw == 0 || dst_raw == resource_com_raw(src_h.pDrvPrivate) {
+        return false;
+    }
+    let Some(src) = load_resource(src_h.pDrvPrivate) else {
+        return false;
+    };
+    let dst = ManuallyDrop::new(ID3D11Resource::from_raw(dst_raw as *mut c_void));
+    let (Ok(src_tex), Ok(dst_tex)) = (
+        (*src).cast::<ID3D11Texture2D>(),
+        (*dst).cast::<ID3D11Texture2D>(),
+    ) else {
+        return false;
+    };
+    let mut src_desc = D3D11_TEXTURE2D_DESC::default();
+    let mut dst_desc = D3D11_TEXTURE2D_DESC::default();
+    src_tex.GetDesc(&mut src_desc);
+    dst_tex.GetDesc(&mut dst_desc);
+    if src_desc.Format != dst_desc.Format
+        || src_desc.SampleDesc.Count != 1
+        || dst_desc.SampleDesc.Count != 1
+    {
+        log_line(&format!(
+            "DXGI Present scanout-copy skipped: src {}x{} fmt={} dst {}x{} fmt={}",
+            src_desc.Width,
+            src_desc.Height,
+            src_desc.Format.0,
+            dst_desc.Width,
+            dst_desc.Height,
+            dst_desc.Format.0
+        ));
+        return false;
+    }
+    let w = src_desc.Width.min(dst_desc.Width);
+    let hgt = src_desc.Height.min(dst_desc.Height);
+    if w == 0 || hgt == 0 {
+        return false;
+    }
+    let bx = D3D11_BOX {
+        left: 0,
+        top: 0,
+        front: 0,
+        right: w,
+        bottom: hgt,
+        back: 1,
+    };
+    context.CopySubresourceRegion(&*dst, 0, 0, 0, 0, &*src, 0, Some(&bx as *const D3D11_BOX));
+    true
 }
 
 unsafe fn dxvk_resource_memory_info(h: Hdevice, obj: &ID3D11Resource) -> (u64, u64, u64, u32) {
@@ -640,6 +972,7 @@ unsafe fn resource_summary(
 unsafe fn store_rtv(
     handle_priv: *mut c_void,
     obj: ID3D11RenderTargetView,
+    resource_raw: usize,
     allocation: ddi::D3DKMT_HANDLE,
     width: u32,
     height: u32,
@@ -650,6 +983,7 @@ unsafe fn store_rtv(
     }
     let state = Box::new(RtvState {
         com_raw: obj.into_raw() as usize,
+        resource_raw,
         allocation,
         width,
         height,
@@ -671,19 +1005,20 @@ unsafe fn load_rtv(handle_priv: *mut c_void) -> Option<ManuallyDrop<ID3D11Render
     )))
 }
 
-unsafe fn rtv_info(handle_priv: *mut c_void) -> (ddi::D3DKMT_HANDLE, u32, u32, u32) {
+unsafe fn rtv_info(handle_priv: *mut c_void) -> (ddi::D3DKMT_HANDLE, u32, u32, u32, usize) {
     if handle_priv.is_null() {
-        return (0, 0, 0, 0);
+        return (0, 0, 0, 0, 0);
     }
     let state = *(handle_priv as *const *mut RtvState);
     if state.is_null() {
-        (0, 0, 0, 0)
+        (0, 0, 0, 0, 0)
     } else {
         (
             (*state).allocation,
             (*state).width,
             (*state).height,
             (*state).format,
+            (*state).resource_raw,
         )
     }
 }
@@ -708,6 +1043,7 @@ unsafe fn release_resource(h: Hdevice, handle_priv: *mut c_void) {
     }
     let state = *(handle_priv as *mut *mut ResourceState);
     if !state.is_null() {
+        clear_scanout_target_if_matches(h, (*state).com_raw);
         if (*state).allocation != 0 || !(*state).rt_resource.is_null() {
             if let Some(dev) = helios_device(h) {
                 if !dev.kt_callbacks.is_null() {
@@ -915,9 +1251,10 @@ unsafe fn allocate_wddm_resource(
     backing_resource_id: u32,
     venus_alloc_size: u64,
     memory_type_index: u32,
-    // Scan-out primary only: the exact DRM-modifier memory-plane-0 row pitch +
-    // byte offset from `vkGetImageSubresourceLayout` (0/0 for every other
-    // resource, which keeps the cross-adapter pitch and a 0 plane offset).
+    direct_scanout_primary: bool,
+    // Scan-out primary metadata. LINEAR paths use the queried COLOR row pitch;
+    // direct OPTIMAL uses a logical scanout stride while QEMU validates the
+    // opaque allocation with its exact Vulkan allocation size.
     scanout_pitch: u32,
     scanout_offset: u64,
 ) -> (ddi::D3DKMT_HANDLE, ddi::D3DKMT_HANDLE) {
@@ -955,11 +1292,14 @@ unsafe fn allocate_wddm_resource(
         .saturating_mul(dxgi_bytes_per_pixel(a.Format as u32));
     let pitch =
         raw_pitch.saturating_add(CROSS_ADAPTER_PITCH_ALIGN - 1) & !(CROSS_ADAPTER_PITCH_ALIGN - 1);
-    // The scan-out primary reports its EXACT DRM-modifier memory-plane-0 row
-    // pitch (from `vkGetImageSubresourceLayout`); use it verbatim so
+    // A LINEAR scan-out primary reports its exact COLOR row pitch; use it verbatim so
     // `SET_SCANOUT_BLOB` reads rows at the true host stride instead of the
     // cross-adapter guess (a wrong stride shears the scanned-out image).
-    let pitch = if scanout_pitch != 0 { scanout_pitch } else { pitch };
+    let pitch = if scanout_pitch != 0 {
+        scanout_pitch
+    } else {
+        pitch
+    };
     let linear_size = (pitch as u64)
         .saturating_mul(mip0.TexelHeight.max(1) as u64)
         .max(4096);
@@ -967,6 +1307,19 @@ unsafe fn allocate_wddm_resource(
         backing_blob_size
     } else {
         linear_size
+    };
+
+    // pPrimaryDesc is the runtime's authoritative primary classification.
+    // A dedicated-copy source is intentionally OPTIMAL and has no scanout
+    // pitch, but it still must be a WDDM primary or DXGI rejects every Flip
+    // before DxgkDdiPresent with "Source of Flip must be primary".
+    let marks_scanout_primary = !a.pPrimaryDesc.is_null();
+    let meta_misc_flags = if direct_scanout_primary {
+        a.MiscFlags | HELIOS_ALLOC_MISC_PRIMARY | HELIOS_ALLOC_MISC_DIRECT_SCANOUT
+    } else if marks_scanout_primary {
+        a.MiscFlags | HELIOS_ALLOC_MISC_PRIMARY
+    } else {
+        a.MiscFlags
     };
 
     let mut private = RuntimeAllocPrivate {
@@ -997,7 +1350,7 @@ unsafe fn allocate_wddm_resource(
             format: dxgi_to_d3dddi_format(a.Format as u32),
             pitch,
             bind_flags: a.BindFlags,
-            misc_flags: a.MiscFlags,
+            misc_flags: meta_misc_flags,
             // C1 identity: the creating vkAllocateMemory's exact parameters for
             // adopted venus-backed resources (a cross-process opener must import
             // with them). Zero for KMD-backed standard allocations — the KMD
@@ -1052,17 +1405,9 @@ unsafe fn allocate_wddm_resource(
     } else {
         0
     };
-    // Do NOT set the legacy `Primary` flag (D3DDDI_ALLOCATIONINFOFLAGS2 bit 0). DWM's
-    // flip-model swapchain primaries are already managed by the runtime as
-    // ManagedPrimary, and dxgkrnl rejects the combination — verbatim ETW
-    // (37th session): "PermanentSysMem, Cached, ExistingSysMem, ExistingKernelSysMem
-    // and Primary flags can't be specified with ManagedPrimary." That reject was
-    // E_INVALIDARG (0x80070057) on 143/143 dwm primary allocations, so the composed
-    // desktop never became a scannable primary and the scan-out stayed on the stale
-    // initial primary (blank SDL). The `VidPnSourceId` association above is what ties
-    // the allocation to our source; the runtime's ManagedPrimary handles the primary
-    // designation and the flip → SetVidPnSourceAddress → SET_SCANOUT_BLOB path.
-    allocation_info.Flags.Value = 0;
+    // A pPrimaryDesc resource is a real WDDM primary regardless of whether its
+    // backing is directly scannable or copied into the KMD-owned LINEAR target.
+    allocation_info.Flags.Value = if is_primary_allocation { 1 } else { 0 };
     let mut alloc = ddi::D3DDDICB_ALLOCATE::default();
     // pfnAllocateCb expects the runtime resource handle for the resource whose
     // surfaces are being allocated. Shared resources additionally return an
@@ -1140,7 +1485,8 @@ unsafe fn allocate_wddm_resource(
 /// allocation (carrying the scan-out row pitch + plane offset for a primary),
 /// transfer venus-resource ownership to that allocation, KMT-stamp the DXVK
 /// resource, and store it in the DDI handle. `scanout_pitch`/`scanout_offset`
-/// are the DRM-modifier plane-0 layout for the scan-out primary, else 0/0.
+/// are either the LINEAR COLOR layout or the direct-OPTIMAL logical scanout
+/// metadata; they are 0/0 for non-primary resources.
 unsafe fn finish_wddm_tex2d(
     h: Hdevice,
     a: &ddi::D3D11DDIARG_CREATERESOURCE,
@@ -1148,38 +1494,43 @@ unsafe fn finish_wddm_tex2d(
     h_rt: ddi::D3D10DDI_HRTRESOURCE,
     h_resource: ddi::D3D10DDI_HRESOURCE,
     res: ID3D11Resource,
+    direct_scanout_primary: bool,
     scanout_pitch: u32,
     scanout_offset: u64,
 ) {
     let (memory, memory_size, memory_offset, resource_id) = dxvk_resource_memory_info(h, &res);
-    let (backing_blob_id, backing_blob_size, backing_resource_id) =
-        if memory != 0 && memory_offset == 0 && memory <= u32::MAX as u64 {
-            (memory, memory_size, resource_id)
-        } else {
-            // Only resources that get a WDDM allocation (shared / keyed-mutex /
-            // present / primary) NEED an importable backing — for those a
-            // suballocated DXVK memory means a cross-process opener sees a
-            // disconnected KMD blob (two-memory split), so shout. Private
-            // textures are suballocated by design (18th session).
-            const DDI_BIND_PRESENT: u32 = 0x0000_0080;
-            const DDI_MISC_SHARED: u32 = 0x0000_0002;
-            const DDI_MISC_SHARED_KEYEDMUTEX: u32 = 0x0000_0100;
-            let needs_importable = !a.pPrimaryDesc.is_null()
-                || (a.BindFlags & DDI_BIND_PRESENT) != 0
-                || (a.MiscFlags & (DDI_MISC_SHARED | DDI_MISC_SHARED_KEYEDMUTEX)) != 0;
-            if memory != 0 && needs_importable {
-                log_line(&format!(
+    let (backing_blob_id, backing_blob_size, backing_resource_id) = if memory != 0
+        && memory_offset == 0
+        && memory <= u32::MAX as u64
+    {
+        (memory, memory_size, resource_id)
+    } else {
+        // Only resources that get a WDDM allocation (shared / keyed-mutex /
+        // present / primary) NEED an importable backing — for those a
+        // suballocated DXVK memory means a cross-process opener sees a
+        // disconnected KMD blob (two-memory split), so shout. Private
+        // textures are suballocated by design (18th session).
+        const DDI_BIND_PRESENT: u32 = 0x0000_0080;
+        const DDI_MISC_SHARED: u32 = 0x0000_0002;
+        const DDI_MISC_SHARED_KEYEDMUTEX: u32 = 0x0000_0100;
+        let needs_importable = !a.pPrimaryDesc.is_null()
+            || (a.BindFlags & DDI_BIND_PRESENT) != 0
+            || (a.MiscFlags & (DDI_MISC_SHARED | DDI_MISC_SHARED_KEYEDMUTEX)) != 0;
+        if memory != 0 && needs_importable {
+            log_line(&format!(
                     "DDI create_resource(tex2d): SHARED RESOURCE WITHOUT IMPORTABLE BACKING memory=0x{:x} res_id={} size={} offset={} bind=0x{:x} misc=0x{:x}",
                     memory, resource_id, memory_size, memory_offset, a.BindFlags, a.MiscFlags
                 ));
-            } else if memory != 0 {
-                trace_line!(
-                    "DDI create_resource(tex2d): private suballocated memory=0x{:x} size={} offset={}",
-                    memory, memory_size, memory_offset
-                );
-            }
-            (0, 0, 0)
-        };
+        } else if memory != 0 {
+            trace_line!(
+                "DDI create_resource(tex2d): private suballocated memory=0x{:x} size={} offset={}",
+                memory,
+                memory_size,
+                memory_offset
+            );
+        }
+        (0, 0, 0)
+    };
     // C1: record the creating vkAllocateMemory's exact size + memory type into
     // the allocation trailer so cross-process openers import with them.
     let (mut venus_alloc_size, mut memory_type_index) = (0u64, 0u32);
@@ -1207,6 +1558,7 @@ unsafe fn finish_wddm_tex2d(
         backing_resource_id,
         venus_alloc_size,
         memory_type_index,
+        direct_scanout_primary,
         scanout_pitch,
         scanout_offset,
     );
@@ -1225,6 +1577,26 @@ unsafe fn finish_wddm_tex2d(
         km_resource, allocation, backing_blob_id, backing_resource_id, backing_blob_size
     );
     stamp_dxvk_resource_kmt_handles(h, &res, allocation, km_resource);
+    // Only the exact runtime-designated primary may identify itself through
+    // PresentCb private data. Ordinary shared/pitched DWM sources are copied to
+    // the KMD-owned LINEAR target and must use the identity-free refresh path.
+    let present_private =
+        if direct_scanout_primary && backing_resource_id != 0 && scanout_pitch != 0 {
+            HeliosPresentPrivateData {
+                plane_offset: scanout_offset,
+                magic: HELIOS_PRESENT_PRIVATE_MAGIC,
+                version: HELIOS_PRESENT_PRIVATE_VERSION,
+                resource_id: backing_resource_id,
+                width: mip0.TexelWidth,
+                height: mip0.TexelHeight,
+                pitch: scanout_pitch,
+                dxgi_format: a.Format as u32,
+                reserved: HELIOS_PRESENT_PRIVATE_FLAG_DIRECT_SCANOUT,
+            }
+        } else {
+            empty_present_private()
+        };
+    let scanout_raw = res.as_raw() as usize;
     let n = RESOURCE_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
     if n < 128 {
         trace_line!(
@@ -1240,7 +1612,12 @@ unsafe fn finish_wddm_tex2d(
         km_resource,
         h_rt.handle,
         true, // allocated via pfnAllocateCb above
+        present_private,
     );
+    if present_private.is_valid() {
+        unsafe { remember_direct_scanout_allocation(h, allocation, present_private) };
+        remember_scanout_target(h, scanout_raw, allocation, present_private);
+    }
 }
 
 unsafe extern "C" fn create_resource(
@@ -1311,7 +1688,7 @@ unsafe extern "C" fn create_resource(
                 StructureByteStride: a.ByteStride,
             };
             let (allocation, km_resource) =
-                allocate_wddm_resource(h, a, &mip0, h_rt, 0, 0, 0, 0, 0, 0, 0);
+                allocate_wddm_resource(h, a, &mip0, h_rt, 0, 0, 0, 0, 0, false, 0, 0);
             let mut buf: Option<ID3D11Buffer> = None;
             match device.CreateBuffer(&desc, init_ptr, Some(&mut buf)) {
                 Ok(()) => {
@@ -1332,6 +1709,7 @@ unsafe extern "C" fn create_resource(
                                 km_resource,
                                 h_rt.handle,
                                 true, // allocated via pfnAllocateCb above
+                                empty_present_private(),
                             );
                         }
                     }
@@ -1385,18 +1763,16 @@ unsafe extern "C" fn create_resource(
                 CPUAccessFlags: cpu,
                 MiscFlags: misc,
             };
-            const DDI_BIND_PRESENT: u32 = 0x0000_0080;
-            // Only BGRA/BGRX scan-out formats (SET_SCANOUT_BLOB's accepted set) may become DRM-modifier images; A8_UNORM etc. under modifier tiling have zero host format features -> CS error.
-            let is_scanout = env_flag("HELIOS_SCANOUT_MODIFIER")
-                && matches!(a.Format as u32, 87 | 88)
-                && (!a.pPrimaryDesc.is_null() || (a.BindFlags & DDI_BIND_PRESENT) != 0);
+            // Windows' pPrimaryDesc is the authoritative, non-heuristic marker
+            // for the rotating DWM desktop primaries. Only BGRA/BGRX primaries
+            // become dedicated OPTIMAL DMA_BUF exports for direct scanout.
+            let is_scanout = !a.pPrimaryDesc.is_null() && matches!(a.Format as u32, 87 | 88);
             let mut handled = false;
             if is_scanout {
-                // The DWM scan-out primary must be a DRM-format-modifier + DMA_BUF
-                // image — a plain OPTIMAL/LINEAR image exports as MOD_INVALID and
-                // the host scans it out black. Build it via the dedicated bridge
-                // path, which also returns the true memory-plane-0 row pitch +
-                // offset from vkGetImageSubresourceLayout.
+                // The QEMU fork reconstructs this exact same-driver OPTIMAL
+                // DMA_BUF with the original blob allocation size. This avoids a
+                // guest copy and any virtio protocol field or global modifier
+                // extension. The host display backend currently reads it back.
                 let mut rp: u64 = 0;
                 let mut off: u64 = 0;
                 let raw = match helios_device(h) {
@@ -1406,6 +1782,7 @@ unsafe extern "C" fn create_resource(
                         a.Format as u32,
                         bind,
                         misc,
+                        true,
                         &mut rp,
                         &mut off,
                     ),
@@ -1413,18 +1790,17 @@ unsafe extern "C" fn create_resource(
                 };
                 if raw != 0 {
                     log_line(&format!(
-                        "DDI create_resource(tex2d): scan-out primary {}x{} fmt={} rowPitch={} offset={} (DRM-modifier DMA_BUF)",
+                        "DDI create_resource(tex2d): direct scan-out primary {}x{} fmt={} logicalPitch={} offset={} (OPTIMAL DMA_BUF)",
                         mip0.TexelWidth, mip0.TexelHeight, a.Format, rp, off
                     ));
                     let res = ID3D11Resource::from_raw(raw as *mut c_void);
-                    finish_wddm_tex2d(h, a, &mip0, h_rt, h_resource, res, rp as u32, off);
+                    finish_wddm_tex2d(h, a, &mip0, h_rt, h_resource, res, true, rp as u32, off);
                 } else {
                     // Loud failure over fake success: do NOT fall back to a plain
                     // primary — that reintroduces the black scan-out as a "working"
-                    // desktop. The probe proved modifier+DMA_BUF+full-usage is
-                    // host-supported, so a failure here is a real regression.
+                    // desktop. A failure here is a real direct-scanout regression.
                     log_line(&format!(
-                        "DDI create_resource(tex2d): SCAN-OUT PRIMARY CREATE FAILED {}x{} fmt={} bind=0x{:x} -> no primary (modifier/dmabuf rejected?)",
+                        "DDI create_resource(tex2d): SCAN-OUT PRIMARY CREATE FAILED {}x{} fmt={} bind=0x{:x} -> no primary (optimal/dmabuf rejected?)",
                         mip0.TexelWidth, mip0.TexelHeight, a.Format, bind
                     ));
                 }
@@ -1461,11 +1837,18 @@ unsafe extern "C" fn create_resource(
                         if let Some(t) = tex {
                             if let Ok(res) = t.cast::<ID3D11Resource>() {
                                 if mip0.TexelWidth >= 1024 || mip0.TexelHeight >= 576 || misc != 0 {
-                                    log_line("DDI create_resource(tex2d): cast to ID3D11Resource OK");
+                                    log_line(
+                                        "DDI create_resource(tex2d): cast to ID3D11Resource OK",
+                                    );
                                 }
-                                finish_wddm_tex2d(h, a, &mip0, h_rt, h_resource, res, 0, 0);
-                            } else if mip0.TexelWidth >= 1024 || mip0.TexelHeight >= 576 || misc != 0 {
-                                log_line("DDI create_resource(tex2d): cast to ID3D11Resource failed");
+                                finish_wddm_tex2d(h, a, &mip0, h_rt, h_resource, res, false, 0, 0);
+                            } else if mip0.TexelWidth >= 1024
+                                || mip0.TexelHeight >= 576
+                                || misc != 0
+                            {
+                                log_line(
+                                    "DDI create_resource(tex2d): cast to ID3D11Resource failed",
+                                );
                             }
                         } else if mip0.TexelWidth >= 1024 || mip0.TexelHeight >= 576 || misc != 0 {
                             log_line(
@@ -1510,8 +1893,9 @@ unsafe extern "C" fn create_resource(
                 Ok(()) => {
                     if let Some(t) = tex {
                         if let Ok(res) = t.cast::<ID3D11Resource>() {
-                            let (allocation, km_resource) =
-                                allocate_wddm_resource(h, a, &mip0, h_rt, 0, 0, 0, 0, 0, 0, 0);
+                            let (allocation, km_resource) = allocate_wddm_resource(
+                                h, a, &mip0, h_rt, 0, 0, 0, 0, 0, false, 0, 0,
+                            );
                             stamp_dxvk_resource_kmt_handles(h, &res, allocation, km_resource);
                             log_line(&format!(
                                 "DDI create_resource(tex3d) ok: {}x{}x{} fmt={} bind=0x{:x} misc=0x{:x}",
@@ -1529,6 +1913,7 @@ unsafe extern "C" fn create_resource(
                                 km_resource,
                                 h_rt.handle,
                                 true,
+                                empty_present_private(),
                             );
                         } else {
                             log_line("DDI create_resource(tex3d): cast to ID3D11Resource failed");
@@ -1677,16 +2062,9 @@ unsafe extern "C" fn open_resource(
         ident.resource_id, venus_alloc_size, ident.memory_type_index, ident.kind, ident.ctx_id,
         meta.bind_flags, meta.misc_flags, open_bind, open_misc, open_dxgi_format, meta.format
     ));
-    // Fix B: when HELIOS_SCANOUT_MODIFIER is set, rebuild a scan-out-primary
-    // import (creator's RAW bind still carries DDI_BIND_PRESENT 0x80 — the
-    // api-translated `open_bind` above strips it) as a DRM_FORMAT_MODIFIER(LINEAR)
-    // + DMA_BUF image, symmetric with the create-path export, so its size matches
-    // the exporter's and DXVK's undersize-import guard passes. Unset env → false
-    // → byte-identical OPTIMAL import as before.
-    // Only BGRA/BGRX scan-out formats (SET_SCANOUT_BLOB's accepted set) may become DRM-modifier images; A8_UNORM etc. under modifier tiling have zero host format features -> CS error.
-    let import_scanout = env_flag("HELIOS_SCANOUT_MODIFIER")
-        && matches!(meta.dxgi_format, 87 | 88)
-        && (meta.bind_flags & 0x0000_0080) != 0;
+    // Ordinary shared images always retain their creator's OPTIMAL contract.
+    // Production scanout uses a separate KMD-owned plain-LINEAR target; never
+    // rebuild DWM imports as DRM-modifier images (the .38 regression).
     let raw = dev.dxvk.open_ddi_texture2d(
         meta.width.max(1),
         meta.height.max(1),
@@ -1697,7 +2075,8 @@ unsafe extern "C" fn open_resource(
         ident.resource_id,
         venus_alloc_size,
         ident.memory_type_index,
-        import_scanout,
+        false,
+        false,
     );
     if raw == 0 {
         // Import of a KMD-validated-live resource failed: a real bug, not a
@@ -1723,6 +2102,7 @@ unsafe extern "C" fn open_resource(
         a.hKMResource.handle,
         h_rt.handle,
         false, // opened: runtime owns these allocation handles
+        empty_present_private(),
     );
 }
 
@@ -1826,6 +2206,7 @@ unsafe extern "C" fn create_rtv(
                 store_rtv(
                     h_rtv.pDrvPrivate,
                     v,
+                    resource_com_raw(a.hDrvResource.pDrvPrivate),
                     allocation,
                     width,
                     height,
@@ -2486,6 +2867,7 @@ unsafe extern "C" fn release_resource_2_1(
 
 unsafe extern "C" fn flush(h: Hdevice) {
     if let Some(context) = d3d11_context(h) {
+        let _ = unsafe { publish_dwm_composition(&context, h) };
         context.Flush();
     }
 }
@@ -3523,7 +3905,7 @@ unsafe extern "C" fn set_render_targets(
         return;
     };
     let mut views: Vec<Option<ID3D11RenderTargetView>> = Vec::with_capacity(num_views as usize);
-    let mut rt0 = (0, 0, 0, 0);
+    let mut rt0 = (0, 0, 0, 0, 0);
     let mut rt_nonnull = 0u32;
     let mut rt_missing = 0u32;
     for i in 0..num_views as usize {
@@ -3546,6 +3928,7 @@ unsafe extern "C" fn set_render_targets(
         ia.current_rt0_height = rt0.2;
         ia.current_rt0_format = rt0.3;
     }
+    unsafe { track_dwm_composition_target(h, rt0.4, rt0.0, rt0.1, rt0.2, rt0.3) };
     let n = OM_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
     if n < 1024 || rt_missing != 0 || rt0.0 != 0 {
         log_line(&format!(
@@ -7433,6 +7816,7 @@ unsafe fn vehicle_present_prepare(
             info.memory_type_index,
             // Not the DWM scan-out primary import; keep the plain OPTIMAL path.
             false,
+            false,
         );
         if raw == 0 {
             let n = EXT_IMPORT_FAILS.fetch_add(1, Ordering::Relaxed);
@@ -7829,6 +8213,89 @@ unsafe fn maybe_force_present_alpha_opaque(h: Hdevice, src_h: ddi::D3D10DDI_HRES
     }
 }
 
+/// Submit the runtime-owned WDDM command buffer after pfnPresentCb accepts a
+/// DXGI present. pfnPresentCb records the pending flip; pfnRenderCb is the
+/// submission boundary that makes dxgkrnl invoke the KMD present/render path.
+/// The actual rendering has already been submitted through Venus.
+unsafe fn submit_runtime_present(
+    dev: &crate::device_funcs::HeliosDevice,
+    present_private: Option<HeliosPresentPrivateData>,
+) -> i32 {
+    static LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+    if dev.kt_callbacks.is_null() || dev.h_context.is_null() {
+        return E_FAIL;
+    }
+    let Some(render_cb) = (*dev.kt_callbacks).pfnRenderCb else {
+        log_line("DXGI Present: pfnRenderCb missing");
+        return E_FAIL;
+    };
+    let command = dev.command_buffer.get();
+    let command_length = if present_private.is_some() {
+        core::mem::size_of::<HeliosPresentRenderCmd>() as u32
+    } else {
+        core::mem::size_of::<HeliosPresentRefreshCmd>() as u32
+    };
+    if command.is_null() || dev.command_buffer_size.get() < command_length {
+        log_line("DXGI Present: no runtime command buffer");
+        return E_FAIL;
+    }
+
+    if let Some(private) = present_private {
+        (command as *mut HeliosPresentRenderCmd).write_unaligned(HeliosPresentRenderCmd {
+            magic: HELIOS_PRESENT_RENDER_MAGIC,
+            version: HELIOS_PRESENT_RENDER_VERSION,
+            present: private,
+        });
+    } else {
+        // pfnPresentCb's KMD DMA buffer is distinct from this runtime-owned UMD
+        // command buffer. Emit the stable-target refresh marker explicitly so
+        // every accepted ordinary present reaches DxgkDdiRender and dirties the
+        // already-bound LINEAR scanout.
+        (command as *mut HeliosPresentRefreshCmd).write_unaligned(HeliosPresentRefreshCmd {
+            magic: HELIOS_PRESENT_REFRESH_MAGIC,
+            version: HELIOS_PRESENT_REFRESH_VERSION,
+            source_index: 0,
+            destination_index: 0,
+        });
+    }
+
+    let mut render = ddi::D3DDDICB_RENDER::default();
+    render.CommandLength = command_length;
+    render.CommandOffset = 0;
+    render.NumAllocations = 0;
+    render.NumPatchLocations = 0;
+    render.hContext = dev.h_context;
+    let hr = render_cb(dev.h_rt_device, &mut render);
+
+    if hr >= 0 {
+        if !render.pNewCommandBuffer.is_null() && render.NewCommandBufferSize != 0 {
+            dev.command_buffer.set(render.pNewCommandBuffer);
+            dev.command_buffer_size.set(render.NewCommandBufferSize);
+        }
+        if !render.pNewAllocationList.is_null() && render.NewAllocationListSize != 0 {
+            dev.allocation_list.set(render.pNewAllocationList);
+            dev.allocation_list_size.set(render.NewAllocationListSize);
+        }
+        if !render.pNewPatchLocationList.is_null() && render.NewPatchLocationListSize != 0 {
+            dev.patch_list.set(render.pNewPatchLocationList);
+            dev.patch_list_size.set(render.NewPatchLocationListSize);
+        }
+    }
+
+    let n = LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+    if n < 64 || hr < 0 {
+        log_line(&format!(
+            "DXGI Present: pfnRenderCb hr=0x{:08x} queued={} next_cmd={:p}/{}",
+            hr as u32,
+            render.QueuedBufferCount,
+            render.pNewCommandBuffer,
+            render.NewCommandBufferSize,
+        ));
+    }
+    hr
+}
+
 /// DXGI `pfnPresent`: copy the source resource to the destination resource when
 /// DXGI provides both handles, then flush submitted GPU work.
 unsafe extern "C" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT) -> i32 {
@@ -7871,14 +8338,34 @@ unsafe extern "C" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT) -> i32 {
                     return hr;
                 }
             }
+            let _ = unsafe { publish_dwm_composition(context, h) };
             context.Flush();
         } else {
-            if let (Some(dst), Some(src)) = (
-                load_resource(dst_h.pDrvPrivate),
-                load_resource(src_h.pDrvPrivate),
-            ) {
+            // A direct primary already is the scanout backing. Do not copy it
+            // through the adapter-owned LINEAR target; Present will publish its
+            // rotated resource id after flushing DWM's rendering.
+            let mut published_to_scanout =
+                presented_primary_private(h, src_h.pDrvPrivate).is_some();
+            let copy_pair = if published_to_scanout {
+                None
+            } else {
+                match (
+                    load_resource(dst_h.pDrvPrivate),
+                    load_resource(src_h.pDrvPrivate),
+                ) {
+                    (Some(dst), Some(src)) => Some((dst, src)),
+                    _ => None,
+                }
+            };
+            if let Some((dst, src)) = copy_pair {
                 context.CopySubresourceRegion(&*dst, 0, 0, 0, 0, &*src, 0, None);
                 copied = true;
+            } else if !published_to_scanout
+                && dst_alloc == 0
+                && copy_to_scanout_target(context, h, src_h)
+            {
+                copied = true;
+                published_to_scanout = true;
             }
             // WS1 #4 producer: record the named-present-fence signal BEFORE the
             // flush so it submits WITH the frame's last work, and publish
@@ -7896,6 +8383,12 @@ unsafe extern "C" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT) -> i32 {
                         false,
                     );
                 }
+            }
+            // The DXGI Present source is the authoritative completed desktop.
+            // Use the RTV-tracking fallback only when no present source could
+            // be copied, otherwise this records the same full-frame copy twice.
+            if !published_to_scanout {
+                let _ = unsafe { publish_dwm_composition(context, h) };
             }
             context.Flush();
         }
@@ -7997,19 +8490,31 @@ unsafe extern "C" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT) -> i32 {
         if !dev.dxgi_callbacks.is_null() && src_alloc != 0 && !dev.h_context.is_null() {
             if let Some(present_cb) = (*dev.dxgi_callbacks).pfnPresentCb {
                 let mut cb = ddi::DXGIDDICB_PRESENT::default();
+                let present_private = presented_primary_private(h, src_h.pDrvPrivate);
                 cb.hSrcAllocation = src_alloc;
                 cb.hDstAllocation = dst_alloc;
                 cb.pDXGIContext = a.pDXGIContext;
                 cb.hContext = dev.h_context;
                 cb.BroadcastContextCount = 0;
-                cb.PrivateDriverDataSize = 0;
-                cb.pPrivateDriverData = core::ptr::null_mut();
+                if let Some(ref private) = present_private {
+                    cb.PrivateDriverDataSize =
+                        core::mem::size_of::<HeliosPresentPrivateData>() as u32;
+                    cb.pPrivateDriverData = (private as *const HeliosPresentPrivateData)
+                        .cast_mut()
+                        .cast();
+                } else {
+                    cb.PrivateDriverDataSize = 0;
+                    cb.pPrivateDriverData = core::ptr::null_mut();
+                }
                 cb.bOptimizeForComposition = if env_flag("HELIOS_PRESENT_OPTIMIZE_COMPOSITION") {
                     1
                 } else {
                     0
                 };
                 present_hr = present_cb(dev.h_rt_device, &mut cb);
+                if present_hr >= 0 {
+                    present_hr = submit_runtime_present(dev, present_private);
+                }
             } else {
                 log_line("DXGI Present: pfnPresentCb missing");
             }
@@ -8118,7 +8623,9 @@ unsafe extern "C" fn dxgi_set_display_mode(arg: *mut ddi::DXGI_DDI_ARG_SETDISPLA
         return 0;
     }
     let a = &*arg;
-    if let Some(context) = d3d11_context(dxgi_device_handle(a.hDevice)) {
+    let h = dxgi_device_handle(a.hDevice);
+    if let Some(context) = d3d11_context(h) {
+        let _ = unsafe { publish_dwm_composition(&context, h) };
         context.Flush();
     }
     0
@@ -8204,22 +8711,31 @@ unsafe extern "C" fn dxgi_rotate_resource_identities(
         (*states[0]).allocation,
         (*states[0]).km_resource,
         (*states[0]).owns_allocation,
+        (*states[0]).present_private,
     );
     for i in 0..n - 1 {
         (*states[i]).allocation = (*states[i + 1]).allocation;
         (*states[i]).km_resource = (*states[i + 1]).km_resource;
         (*states[i]).owns_allocation = (*states[i + 1]).owns_allocation;
+        // Present private data identifies the backing allocation (Venus
+        // resource id, layout and extent), not the stable D3D resource object.
+        // DXGI rotates that backing identity together with the allocation and
+        // DXVK storage. Leaving this behind makes a flip scan out the previous
+        // resource's memory after the first RotateResourceIdentities call.
+        (*states[i]).present_private = (*states[i + 1]).present_private;
     }
     (*states[n - 1]).allocation = first.0;
     (*states[n - 1]).km_resource = first.1;
     (*states[n - 1]).owns_allocation = first.2;
+    (*states[n - 1]).present_private = first.3;
 
     let c = ROTATE_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
     if c < 64 {
         trace_line!(
-            "DXGI RotateResourceIdentities: rotated {} resources, alloc[0]=0x{:x}",
+            "DXGI RotateResourceIdentities: rotated {} resources, alloc[0]=0x{:x} scanout_res[0]={}",
             n,
-            (*states[0]).allocation
+            (*states[0]).allocation,
+            (*states[0]).present_private.resource_id
         );
     }
     0
@@ -8567,6 +9083,7 @@ unsafe extern "C" fn dxgi_present_mpo(arg: *mut ddi::DXGI_DDI_ARG_PRESENTMULTIPL
     }
 
     if let Some(context) = d3d11_context(h) {
+        let _ = unsafe { publish_dwm_composition(&context, h) };
         context.Flush();
     }
 
@@ -8657,6 +9174,11 @@ unsafe extern "C" fn dxgi_present1(arg: *mut ddi::DXGI_DDI_ARG_PRESENT1) -> i32 
     }
 
     if let Some(context) = d3d11_context(h) {
+        let published_to_scanout = presented_primary_private(h, src_h.pDrvPrivate).is_some()
+            || (dst_alloc == 0 && copy_to_scanout_target(&context, h, src_h));
+        if !published_to_scanout {
+            let _ = unsafe { publish_dwm_composition(&context, h) };
+        }
         context.Flush();
     }
 
@@ -8690,19 +9212,30 @@ unsafe extern "C" fn dxgi_present1(arg: *mut ddi::DXGI_DDI_ARG_PRESENT1) -> i32 
         }
         if let Some(present_cb) = (*dev.dxgi_callbacks).pfnPresentCb {
             let mut cb = ddi::DXGIDDICB_PRESENT::default();
+            let present_private = presented_primary_private(h, src_h.pDrvPrivate);
             cb.hSrcAllocation = src_alloc;
             cb.hDstAllocation = dst_alloc;
             cb.pDXGIContext = a.pDXGIContext;
             cb.hContext = dev.h_context;
             cb.BroadcastContextCount = 0;
-            cb.PrivateDriverDataSize = 0;
-            cb.pPrivateDriverData = core::ptr::null_mut();
+            if let Some(ref private) = present_private {
+                cb.PrivateDriverDataSize = core::mem::size_of::<HeliosPresentPrivateData>() as u32;
+                cb.pPrivateDriverData = (private as *const HeliosPresentPrivateData)
+                    .cast_mut()
+                    .cast();
+            } else {
+                cb.PrivateDriverDataSize = 0;
+                cb.pPrivateDriverData = core::ptr::null_mut();
+            }
             cb.bOptimizeForComposition = if env_flag("HELIOS_PRESENT_OPTIMIZE_COMPOSITION") {
                 1
             } else {
                 0
             };
             present_hr = present_cb(dev.h_rt_device, &mut cb);
+            if present_hr >= 0 {
+                present_hr = submit_runtime_present(dev, present_private);
+            }
         } else {
             log_line("DXGI Present1 multi: pfnPresentCb missing");
             return DXGI_ERROR_UNSUPPORTED;

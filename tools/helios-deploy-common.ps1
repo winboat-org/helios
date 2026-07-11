@@ -146,7 +146,7 @@ function Get-HeliosInstanceId([string]$InstanceId = "") {
 
 function Get-HeliosActiveInfName([string]$InstanceId) {
   $prop = Get-PnpDeviceProperty -InstanceId $InstanceId -KeyName DEVPKEY_Device_DriverInfPath -ErrorAction SilentlyContinue
-  if ($prop -and $prop.Data) { return [string]$prop.Data }
+  if ($prop -and $prop.PSObject.Properties["Data"] -and $prop.Data) { return [string]$prop.Data }
   $text = & pnputil.exe /enum-devices /instanceid "$InstanceId" /drivers
   $line = $text | Where-Object { $_ -match "Driver Name:\s+(oem\d+\.inf)" } | Select-Object -First 1
   if ($line -match "Driver Name:\s+(oem\d+\.inf)") { return $Matches[1] }
@@ -170,7 +170,7 @@ function Get-HeliosClassKey([string]$InstanceId) {
 
 function Get-HeliosActiveStoreDir([string]$InstanceId, [string]$ActiveInfName) {
   $svc = Get-ItemProperty -LiteralPath "HKLM:\SYSTEM\CurrentControlSet\Services\helios_kmd_render" -ErrorAction SilentlyContinue
-  if ($svc -and $svc.ImagePath) {
+  if ($svc -and $svc.PSObject.Properties["ImagePath"] -and $svc.ImagePath) {
     $imagePath = [string]$svc.ImagePath
     $imagePath = $imagePath -replace "^\\SystemRoot", $env:windir
     $imagePath = [Environment]::ExpandEnvironmentVariables($imagePath)
