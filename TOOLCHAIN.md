@@ -115,10 +115,16 @@ environment, and active display state.
 HELIOS_QEMU_RENDER_GPU=nvidia HELIOS_DISPLAY=egl-vnc \
   bash tools/launch-helios-gtk.sh
 
-# Local-window smoke tests use the same fork and shared OPTIMAL fallback.
-HELIOS_QEMU_RENDER_GPU=nvidia HELIOS_DISPLAY=gtk \
+# Native Wayland SDL is the verified accelerated local-window path. Interactive
+# UI EGL follows the compositor's vendor; the launcher pins only Venus/readback
+# Vulkan to NVIDIA.
+SDL_VIDEODRIVER=wayland \
+  HELIOS_QEMU_RENDER_GPU=nvidia HELIOS_DISPLAY=sdl \
   bash tools/launch-helios-gtk.sh
-HELIOS_QEMU_RENDER_GPU=nvidia HELIOS_DISPLAY=sdl \
+
+# GTK uses the same fallback code but is not currently operational for a full
+# Windows run: GDK later reports repeated eglMakeCurrent failures.
+HELIOS_QEMU_RENDER_GPU=nvidia HELIOS_DISPLAY=gtk \
   bash tools/launch-helios-gtk.sh
 ```
 
@@ -126,7 +132,9 @@ HELIOS_QEMU_RENDER_GPU=nvidia HELIOS_DISPLAY=sdl \
 - `blob=on` — enables blob resource support (zero-copy memory between guest and virglrenderer)
 - `hostmem=8G` — dedicates 8 GB of host memory as the blob/hostmem region
 - `venus=on` — enables Venus capset (Vulkan over virtio-gpu)
-- `-display gtk,gl=on` — host display via GTK with OpenGL (required for virglrenderer)
+- `-display sdl,gl=on` — verified native-Wayland OpenGL window
+- `-display gtk,gl=on` — compiled fallback frontend; currently blocked by the
+  GTK/GDK `eglMakeCurrent` failure above
 
 ### 1.5 Verify Venus Is Working (Linux Guest First)
 

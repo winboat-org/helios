@@ -285,6 +285,20 @@ fn note_and_maybe_signal(
     })
 }
 
+/// Order one coalesced host refresh after every Venus command submitted before
+/// the UMD's marker. The guard required by `note_scanout_refresh` statically
+/// enforces the scheduler/transport lock order instead of relying on callers.
+fn arm_scanout_refresh_after_current_venus(adapter: &AdapterContext) {
+    let ready = adapter.with_wddm_notify_lock(|guard| {
+        adapter
+            .with_virtio(|v| v.note_scanout_refresh(guard))
+            .unwrap_or(false)
+    });
+    if ready {
+        adapter.request_scanout_refresh();
+    }
+}
+
 /// `DxgkDdiSubmitCommandVirtual` — submit a DMA buffer addressed by GPU virtual
 /// address. Because Helios declares the GpuMmu model (`VirtualAddressingSupported`
 /// + `GpuMmuSupported`), VidSch routes a GpuMmu context's command buffers HERE, not
@@ -318,13 +332,7 @@ pub unsafe extern "C" fn dxgkddi_submit_command_virtual(
         SUBMIT_PAGING_COUNT.fetch_add(1, Ordering::Relaxed);
     }
 
-    let wait_gpu = if submit.hContext.is_null() {
-        false
-    } else {
-        let context = unsafe { &*(submit.hContext as *const crate::device::ContextContext) };
-        context.direct_present_pending.swap(0, Ordering::AcqRel) != 0
-    };
-    note_and_maybe_signal(adapter, fence, is_paging, wait_gpu)
+    note_and_maybe_signal(adapter, fence, is_paging, false)
 }
 
 /// `DxgkDdiSubmitCommand` — submit a DMA buffer to the GPU. Critically, this is
@@ -467,12 +475,12 @@ pub unsafe extern "C" fn dxgkddi_render(
         if command.is_valid() {
             if !h_context.is_null() {
                 let context = unsafe { &*(h_context as *const crate::device::ContextContext) };
+                // The allocation identity was fixed once by
+                // SetVidPnSourceAddress. Ordinary presents only dirty that
+                // durable target; they must never select a resource from stale
+                // bytes beyond the 16-byte command.
                 if !context.device.is_null() && !unsafe { (*context.device).adapter.is_null() } {
-                    // The allocation identity was fixed once by
-                    // SetVidPnSourceAddress.  Ordinary presents only dirty that
-                    // durable target; they must never select a resource from
-                    // stale bytes beyond the 16-byte command.
-                    unsafe { &*(*context.device).adapter }.request_scanout_refresh();
+                    arm_scanout_refresh_after_current_venus(unsafe { &*(*context.device).adapter });
                 }
             }
         }
@@ -523,7 +531,9 @@ pub unsafe extern "C" fn dxgkddi_render(
                         4,
                     );
                     if published {
-                        context.direct_present_pending.store(1, Ordering::Release);
+                        arm_scanout_refresh_after_current_venus(unsafe {
+                            &*(*context.device).adapter
+                        });
                     }
                 }
             }

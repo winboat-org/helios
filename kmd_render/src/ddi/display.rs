@@ -208,9 +208,9 @@ pub(crate) fn issue_present_scanout(
         stride,
         plane_offset as u32,
     );
-    // Do not flush here: DxgkDdiRender only records the present. The matching
-    // SubmitCommandVirtual gates the dirty edge on all preceding Venus queue
-    // submissions reaching GPU completion.
+    // Do not flush here: DxgkDdiRender captures the current Venus wire-fence
+    // watermark. The used-ring DPC emits the coalesced dirty edge only after
+    // every preceding Venus submission retires.
     let n = PRESENT_SCANOUT_SUCCESS_COUNT.fetch_add(1, Ordering::Relaxed);
     if n < 8 || n & 0x3FF == 0 {
         rec_named(b"PScVia", via);
@@ -796,9 +796,9 @@ pub unsafe extern "C" fn dxgkddi_set_vidpn_source_address(
     if source.resource_id == target.resource_id {
         // True zero-copy primary. Never submit vkCmdCopyImage with the same
         // image as source and destination. SetVidPn only binds/publishes the
-        // candidate; the matching Render -> SubmitCommandVirtual GPU-completion
-        // token is the sole producer of the dirty edge. This prevents the host
-        // from sampling an OPTIMAL primary before DWM's Venus work completes.
+        // candidate; the matching Render marker and used-ring retirement are
+        // the sole producers of the dirty edge. This prevents the host from
+        // sampling an OPTIMAL primary before DWM's Venus work completes.
         if !already_bound {
             crate::diag::record_named_bytes(b"ScCpy", 2);
             crate::diag::record_named_bytes(b"ScFlu", 3);

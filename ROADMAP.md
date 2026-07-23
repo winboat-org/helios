@@ -4,7 +4,7 @@
 changed on 2026-07-09: Helios is now a WDDM render+display adapter and owns the
 virtio-gpu scanout; IddCx/Looking Glass is no longer the active display path.*
 
-## Current verified baseline (2026-07-11, KMD 22.22.140.0)
+## Current verified baseline (2026-07-23, KMD 22.22.142.0)
 
 - `DisplayHalf=1` exposes one connected child and one VidPn source. DWM composes
   the whole desktop on Helios and `SetVidPnSourceAddress` selects the real
@@ -29,10 +29,29 @@ virtio-gpu scanout; IddCx/Looking Glass is no longer the active display path.*
   publishes a CPU `DisplaySurface` to VNC. This is direct guest-primary scanout,
   but **not end-to-end zero-copy** because the host display backend reads back.
 - Visible desktop output is verified. A DComp scheduled-task probe completed
-  1576 Presents in 25 seconds (63.0 fps). All three rotating primary buffers
-  advanced at about 63 fps; measured 1280x800 host readback was 0.5–1.1 ms.
-  Therefore the earlier 2.4 fps symptom is not present in the driver cadence;
-  remaining perceived lag must be measured at VNC/network/client boundaries.
+  1576 Presents in 25 seconds (63.0 fps), and interaction was responsive while
+  that continuous producer ran. This isolated the perceived lag to the
+  idle-to-active scanout edge, not steady-state GPU throughput. The UMD now
+  emits a refresh marker after the exact DWM primary operation. KMD
+  `DxgkDdiRender` captures the current Venus wire-fence watermark under the
+  statically witnessed notification lock; the used-ring DPC coalesces markers
+  and dirties scanout only after all preceding Venus work retires. This does not
+  depend on VidSch choosing `SubmitCommand` versus `SubmitCommandVirtual`.
+- The v142 wake test advanced the live 16-refresh telemetry snapshot
+  (`AsSub`/`AsDone` caught up, `WtOut=CtOut=QfRet=0`). Same-boot QEMU evidence
+  then rebound the real 1896x1030 OPTIMAL primary and completed Vulkan readback
+  in about 1.0–1.9 ms. The owner confirmed excellent idle-to-active
+  responsiveness.
+- The KMD watermark orders Venus commands which already exist when the marker
+  reaches `DxgkDdiRender`; it cannot cover work still queued on DXVK's
+  submission thread. With `PresentGateUs=0`, fast cursor motion exposed that
+  producer race as stale cursor replicas. A 5 ms A/B still leaked six stale
+  frames in one 128-present burst, so the direct-primary default is now a
+  bounded 10 ms `HeliosWaitFrameComplete` before the kernel present callback.
+  It sleeps on DXVK's submission-fence condition variable instead of polling.
+  The 10 ms A/B measured 0.48 ms cumulative average after 384 presents and
+  zero timeouts after its six startup expirations. The owner confirmed both
+  excellent responsiveness and no cursor ghosting.
 - The old synchronous KMD `RESOURCE_FLUSH` control roundtrip is gone from the
   frame path. One interrupt-completed async bind/flush is allowed in flight and
   later flips coalesce. Control DMA buffers are reaped/reused outside the
@@ -40,24 +59,40 @@ virtio-gpu scanout; IddCx/Looking Glass is no longer the active display path.*
   side-effect-free wait-only timeline submits on the guest, and reuses its
   escape staging buffer; per-submit shape logging is opt-in.
 - The same exact OPTIMAL Vulkan fallback is shared by `egl-headless`, GTK EGL,
-  GTK GLArea, and SDL OpenGL. `egl-headless`+VNC is visually verified; GTK and
-  SDL are compile/link verified but not visually tested in the remote-only setup.
+  GTK GLArea, and SDL OpenGL. `egl-headless`+VNC and SDL OpenGL on native
+  Wayland are visually verified. The launcher leaves interactive EGL vendor
+  selection to the compositor while pinning Venus/readback Vulkan to NVIDIA.
+  GTK/Wayland still fails during the full run with repeated GDK
+  `eglMakeCurrent` errors and remains unverified.
 
 ## Current priorities
 
-1. Soak the current direct-primary path across DWM buffer rotation, resize,
-   suspend/resume, device restart, and cold boot. Treat a moved same-boot
-   breadcrumb plus visible output as evidence; persistent registry names alone
-   are not evidence.
-2. Profile end-to-end VNC latency if interaction still feels slow. Do not infer a
-   guest/KMD problem from remote-client latency while the DComp and flush cadence
-   remain near 60 Hz.
-3. Pursue true host zero-copy only with a layout contract the display importer
+1. Run parallel adversarial reviews of `kmd_render` and `umd`. Identify
+   oversized files, mixed responsibilities, duplicate paths, weak invariants,
+   obsolete architecture, and timing-dependent behavior. Record small,
+   dependency-ordered, preferably atomic recommendations in a dedicated review
+   document before changing behavior. Every significant runtime-only invariant
+   must be evaluated for a real static guarantee using ownership, newtypes,
+   exhaustive state, typestate, lifetimes, guards, or proof tokens; wrappers
+   which merely hide the same unchecked cast do not qualify.
+2. Implement the reviewed refactors atomically. Preserve the current direct
+   primary, completion ordering, loud-failure contracts, registry ABI, and
+   diagnostic names unless a reviewed change explicitly migrates them. Replace
+   arbitrary `Sleep`/poll loops with event, interrupt, fence, or
+   condition-variable contracts; do not remove bounded safety timeouts merely
+   because they wait.
+3. Regression-test each tranche and the final driver against visible desktop
+   output, idle wake, rapid cursor motion, DComp cadence, DWM stability,
+   same-boot KMD breadcrumbs, and host scanout evidence. Keep
+   `ScanoutDiag` absent during primary tests.
+4. Continue soaking the current direct-primary path across DWM buffer rotation,
+   resize, suspend/resume, device restart, and cold boot.
+5. Pursue true host zero-copy only with a layout contract the display importer
    can consume. An explicit DRM modifier is one possible route, but enabling the
    modifier/DMA_BUF extensions on every DXVK device is prohibited: it inflated
    ordinary shared OPTIMAL import requirements and caused valid undersized-import
    refusal, DWM failures, and NVIDIA Xid 31 when bypassed.
-4. Continue D3D11 stability and conformance work after display soak.
+6. Continue D3D11 stability and conformance work after the quality pass.
 
 ## Historical PSC workstreams
 
@@ -1482,11 +1517,20 @@ Plan:
   AE* (8-slot allocation create/open ring: resid, dimensions, ctx/open marker)
   — all failure counters must stay 0; S-ring breadcrumbs persist across boots
   and high indices go stale after short boots.
+- **Direct-primary producer gate** (`HKLM\SOFTWARE\Helios`, not the service
+  key): `PresentGateUs` is absent by default and the UMD uses 10000 µs. `0` is
+  the ordering A/B disable. The wait is condition-variable-backed; inspect
+  `present-gate:` in the current DWM UMD log for cost and timeouts.
 - **Launcher/display path**: `tools/launch-helios-gtk.sh` supports
   `HELIOS_DISPLAY=egl-vnc` for `-display egl-headless` + VNC, intended as the
-  reliable display-output inspection path. It uses the `qemu-helios` submodule
-  build, whose egl-headless/GTK/SDL OpenGL backends share exact OPTIMAL Vulkan
-  readback when EGL cannot import a modifier-less native image.
+  reliable display-output inspection path, and `HELIOS_DISPLAY=sdl` is visually
+  verified on native Wayland. It uses the `qemu-helios` submodule build, whose
+  egl-headless/GTK/SDL OpenGL backends share exact OPTIMAL Vulkan readback when
+  EGL cannot import a modifier-less native image. Interactive modes leave EGL
+  vendor selection to the compositor while NVIDIA remains selected for
+  Venus/readback Vulkan; globally forcing NVIDIA EGL breaks Wayland context
+  creation on the development host. GTK is still blocked by its later GDK
+  `eglMakeCurrent` failure.
   `HELIOS_QEMU_RENDER_GPU=nvidia` is the current owner preference; render-node
   defaults are tracked in the script. The old force-LINEAR LD_PRELOAD shims were
   experiments, not supported display paths. `HELIOS_QEMU_TRACE` can enable

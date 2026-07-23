@@ -2867,8 +2867,17 @@ unsafe extern "C" fn release_resource_2_1(
 
 unsafe extern "C" fn flush(h: Hdevice) {
     if let Some(context) = d3d11_context(h) {
-        let _ = unsafe { publish_dwm_composition(&context, h) };
+        let published = unsafe { publish_dwm_composition(&context, h) };
         context.Flush();
+        if published {
+            if let Some(dev) = helios_device(h) {
+                // This marker is the exact dirty edge for the fallback scanout
+                // copy recorded immediately above. The KMD captures its Venus
+                // watermark in Render and emits RESOURCE_FLUSH from the
+                // used-ring DPC only after all preceding work retires.
+                let _ = unsafe { submit_runtime_present(dev, None) };
+            }
+        }
     }
 }
 
@@ -8403,14 +8412,15 @@ unsafe extern "C" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT) -> i32 {
     maybe_force_present_alpha_opaque(h, src_h);
     maybe_log_present_readback(h, src_h);
 
-    // Frame-completion gate BEFORE the kernel flip becomes visible: dwm's
-    // venus rendering produces no dxgkrnl-visible DMA fences, so nothing else
-    // orders the IddCx consumer's per-acquire copy against in-flight GPU
-    // writes of the presented buffer (the old whole-device rotate drain
-    // masked this race; removing it surfaced occasional ghosting). Bounded:
-    // on timeout the present proceeds — a rare one-frame ghost self-heals at
-    // the next acquire refresh. `HKLM\SOFTWARE\Helios!PresentGateUs` (DWORD)
-    // overrides the cap; 0 disables. Cost telemetry: `present-gate:` lines.
+    // Frame-completion gate BEFORE the kernel present becomes visible. The
+    // direct-primary KMD marker can order Venus commands which have reached the
+    // transport, but `context.Flush()` may return while matching work is still
+    // queued on DXVK's submission thread. Waiting for DXVK's submission fence
+    // closes that future-work gap before dxgkrnl publishes the primary.
+    // Bounded: on timeout the present proceeds loudly and the next full-frame
+    // refresh self-heals. `HKLM\SOFTWARE\Helios!PresentGateUs` (DWORD)
+    // overrides the 10 ms default; 0 disables. Cost telemetry:
+    // `present-gate:` lines.
     //
     // Vehicle flip ordering, kernel-enforced (25th session, replaces the
     // bounded CPU gate's leak): queue a dxgkrnl GPU-side WAIT on the flip
@@ -8464,9 +8474,10 @@ unsafe extern "C" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT) -> i32 {
     }
 
     // Bounded CPU gate (`VehicleFlipGateUs` / `PresentGateUs`): the fallback
-    // ordering when the kernel wait is off/unavailable/refused — and the only
-    // ordering for non-vehicle presents. Timeout = proceed loudly (a stale
-    // frame beats a wedged worker); the kernel-wait path has no such leak.
+    // ordering when the vehicle kernel wait is off/unavailable/refused, and
+    // the producer-ordering gate for direct-primary/non-vehicle presents.
+    // Timeout = proceed loudly (a stale frame beats a wedged worker); the
+    // vehicle kernel-wait path has no such leak.
     let gate_us = if is_vehicle_present {
         crate::vehicle_flip_gate_us()
     } else {

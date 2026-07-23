@@ -9,7 +9,7 @@
 
 use alloc::boxed::Box;
 use core::ffi::c_void;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::Ordering;
 
 use crate::adapter::AdapterContext;
 use crate::dxgk::*;
@@ -24,10 +24,6 @@ pub struct DeviceContext {
 pub struct ContextContext {
     /// Back-pointer to the owning device (valid for the context's lifetime).
     pub device: *mut DeviceContext,
-    /// Set by DxgkDdiRender when the UMD records a direct-primary present.
-    /// SubmitCommandVirtual consumes it so that WDDM completion and the host
-    /// refresh wait for every preceding Venus GPU-timeline submission.
-    pub direct_present_pending: AtomicU32,
 }
 
 /// State for one GPU process object (WDDM 2.0 GPU-VA requirement). We keep no
@@ -135,7 +131,6 @@ pub unsafe extern "C" fn dxgkddi_create_context(
     let args = unsafe { &mut *create_context };
     let ctx = Box::new(ContextContext {
         device: h_device as *mut DeviceContext,
-        direct_present_pending: AtomicU32::new(0),
     });
     args.hContext = Box::into_raw(ctx) as HANDLE;
 
@@ -159,15 +154,7 @@ pub unsafe extern "C" fn dxgkddi_create_context(
 pub unsafe extern "C" fn dxgkddi_destroy_context(h_context: *mut c_void) -> NTSTATUS {
     crate::diag::record(0x0800_0002);
     if !h_context.is_null() {
-        let context = unsafe { Box::from_raw(h_context as *mut ContextContext) };
-        let abandoned = context.direct_present_pending.swap(0, Ordering::AcqRel);
-        if abandoned != 0 {
-            // Loud proof that a direct Present marker never reached the
-            // SubmitCommandVirtual completion path; silently dropping it would
-            // leave the host bound to a permanently stale primary.
-            crate::diag::record_named_bytes(b"DpLost", abandoned);
-        }
-        drop(context);
+        drop(unsafe { Box::from_raw(h_context as *mut ContextContext) });
     }
     STATUS_SUCCESS
 }

@@ -243,8 +243,9 @@ pub struct AdapterContext {
     pub diag_scanout_layout: AtomicU64,
     pub scanout_refresh_count: AtomicU32,
     pub scanout_refresh_fail: AtomicU32,
-    /// Dirty/coalescing state for real scanout refresh. A completed primary
-    /// copy sets `scanout_refresh_pending` and wakes the HPD/scanout worker.
+    /// Dirty/coalescing state for real scanout refresh. A completion-ordered
+    /// primary marker sets `scanout_refresh_pending` and wakes the HPD/scanout
+    /// worker.
     /// At most one fire-and-forget RESOURCE_FLUSH is outstanding; its used-ring
     /// completion clears `scanout_flush_inflight` and wakes the same worker.
     pub scanout_refresh_pending: AtomicU32,
@@ -269,7 +270,7 @@ pub struct AdapterContext {
     /// so a dedicated system thread ([`crate::ddi::hpd::hpd_thread_routine`], the
     /// viogpu3d ThreadWorkRoutine analog) does it. This SynchronizationEvent wakes
     /// that thread: once shortly after start, on virtio config changes, after a
-    /// completed scanout copy, and after async RESOURCE_FLUSH completion.
+    /// completion-ordered scanout marker, and after async RESOURCE_FLUSH completion.
     pub hpd_event: UnsafeCell<KEVENT>,
     /// PsCreateSystemThread handle for the HPD worker (0 = not started). StopDevice
     /// signals `hpd_stop` + `hpd_event`, joins the thread on this handle, then closes it.

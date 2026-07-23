@@ -1107,9 +1107,11 @@ pub(crate) fn feature_level_mode() -> u32 {
 
 /// Present-path frame-completion gate cap in microseconds:
 /// `HKLM\SOFTWARE\Helios!PresentGateUs` (REG_DWORD). Read once per process.
-/// Absent = 0 for the real display-adapter path. The old 32 ms default ordered
-/// an IddCx consumer that is no longer present and visibly throttled DWM.
-/// A nonzero value remains available as an explicit diagnostic override.
+/// Absent = 10000 for the direct-primary display path. `context.Flush()` can
+/// return before DXVK's submission thread has entered the matching Venus work,
+/// so the KMD cannot capture that future command in its completion watermark.
+/// This bounded, condition-variable-backed gate closes that producer race
+/// without restoring the old 32 ms polling throttle. 0 remains the A/B disable.
 pub(crate) fn present_gate_us() -> u32 {
     use std::sync::OnceLock;
     static VALUE: OnceLock<u32> = OnceLock::new();
@@ -1128,7 +1130,7 @@ pub(crate) fn present_gate_us() -> u32 {
         }
         const HKEY_LOCAL_MACHINE: usize = 0x8000_0002;
         const RRF_RT_REG_DWORD: u32 = 0x10;
-        const DEFAULT_US: u32 = 0;
+        const DEFAULT_US: u32 = 10000;
         let mut value: u32 = 0;
         let mut len: u32 = 4;
         // SAFETY: NUL-terminated key/value names; `value`/`len` outlive the call.

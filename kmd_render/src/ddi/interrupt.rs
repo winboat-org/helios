@@ -38,6 +38,13 @@ pub(crate) fn drain_used_and_complete(adapter: &AdapterContext) {
     let _ = adapter.with_virtio(|v| v.drain_used());
 
     adapter.with_wddm_notify_lock(|guard| {
+        let refresh_ready = adapter
+            .with_virtio(|v| v.take_ready_scanout_refresh(guard))
+            .unwrap_or(false);
+        if refresh_ready {
+            adapter.request_scanout_refresh();
+        }
+
         loop {
             let mut ready = [crate::virtio::gpu::WddmReady {
                 fence: 0,

@@ -260,16 +260,24 @@ qemu_serial_args=()
 lg_client_args=()
 lg_client_env_prefix=(env)
 qemu_egl_headless=egl-headless
+qemu_uses_compositor_gl=0
+
+case "$DISPLAY_MODE" in
+  sdl|gtk|spice-app)
+    qemu_uses_compositor_gl=1
+    ;;
+esac
 
 if [ "$QEMU_RENDER_GPU" = "intel" ]; then
   [ -e "$INTEL_RENDER_NODE" ] || { echo "missing Intel render node $INTEL_RENDER_NODE"; exit 1; }
-  qemu_env_prefix=(
-    env
-    __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/50_mesa.json
-    __GLX_VENDOR_LIBRARY_NAME=mesa
-    DRI_PRIME=pci-0000_00_02_0
-    MESA_LOADER_DRIVER_OVERRIDE=iris
-  )
+  qemu_env_prefix=(env DRI_PRIME=pci-0000_00_02_0)
+  if [ "$qemu_uses_compositor_gl" = "0" ]; then
+    qemu_env_prefix+=(
+      __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/50_mesa.json
+      __GLX_VENDOR_LIBRARY_NAME=mesa
+      MESA_LOADER_DRIVER_OVERRIDE=iris
+    )
+  fi
   qemu_egl_headless="egl-headless,rendernode=$INTEL_RENDER_NODE"
 elif [ "$QEMU_RENDER_GPU" != "default" ]; then
   if [ "$QEMU_RENDER_GPU" = "nvidia" ]; then
@@ -280,12 +288,16 @@ elif [ "$QEMU_RENDER_GPU" != "default" ]; then
     fi
     qemu_env_prefix=(
       env
-      __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json
-      __GLX_VENDOR_LIBRARY_NAME=nvidia
       __VK_LAYER_NV_optimus=NVIDIA_only
       VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/nvidia_icd.json
-      GBM_BACKEND=nvidia-drm
     )
+    if [ "$qemu_uses_compositor_gl" = "0" ]; then
+      qemu_env_prefix+=(
+        __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json
+        __GLX_VENDOR_LIBRARY_NAME=nvidia
+        GBM_BACKEND=nvidia-drm
+      )
+    fi
     qemu_egl_headless="egl-headless,rendernode=$NVIDIA_RENDER_NODE"
   else
     echo "unknown HELIOS_QEMU_RENDER_GPU=$QEMU_RENDER_GPU (expected default, intel, or nvidia)"

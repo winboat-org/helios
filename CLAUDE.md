@@ -25,8 +25,11 @@ current KMD/QEMU stack. The stage's charter, in priority order:
 1. **Stability** — direct-primary buffer rotation, resize, suspend/resume, device restart,
    cold boot, DWM recovery, and TDR contracts. No hacks; loud failure over fake success.
 2. **Performance** — measure present-to-scanout and VNC delivery separately. The current DComp
-   probe and QEMU flush cadence are about 63 fps; do not attribute remote-client lag to the guest
-   without a regression in those measurements.
+   probe sustains about 63 fps, but that does not prove the idle-to-active dirty edge. KMD v142
+   orders the exact DWM refresh marker on a Venus completion watermark; the UMD's bounded 10 ms
+   condition-variable frame gate closes the earlier DXVK-submission-thread producer race at about
+   0.48 ms steady-state average. Measure wake latency and steady-state cadence separately before
+   assigning blame to the guest, frontend, or remote client.
 3. **D3D11 conformance** — drive the noop-DDI hit counters to zero against real workloads,
    dxvk-tests / samples / 3DMark, DXGI format coverage, remaining 11.1 DDI plumbing.
 

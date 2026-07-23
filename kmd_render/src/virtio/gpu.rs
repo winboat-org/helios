@@ -810,6 +810,10 @@ pub struct VirtioGpu {
     /// WDDM submissions pending on venus completion, FIFO (capacity
     /// MAX_WDDM_PENDING, reserved at init).
     wddm_pending: VecDeque<WddmPending>,
+    /// Latest DWM/primary dirty marker waiting for every Venus wire fence that
+    /// preceded it to retire. Markers coalesce to the newest watermark so idle
+    /// wakeups do not depend on which WDDM SubmitCommand DDI VidSch selects.
+    scanout_refresh_watermark: Option<u64>,
     /// Ring-corruption latch: set when the used ring returns a token we do not
     /// track or `pop_used` fails structurally. The ring state is then
     /// untrustworthy and every subsequent command fails fast. NOTE: unlike the
@@ -993,6 +997,7 @@ impl VirtioGpu {
             fence_events: Vec::with_capacity(MAX_FENCE_EVENTS),
             next_wire_fence: 1,
             wddm_pending: VecDeque::with_capacity(MAX_WDDM_PENDING),
+            scanout_refresh_watermark: None,
             failed: false,
             display_mode,
         };
@@ -1679,6 +1684,42 @@ impl VirtioGpu {
     }
 
     // ── WDDM pending-fence FIFO (SubmitCommand → DPC completion) ─────────────
+
+    /// Capture the exact Venus ordering boundary for a scanout dirty marker.
+    ///
+    /// The notification-lock proof makes the lock order (`wddm_notify` before
+    /// `virtio`) part of the type contract. Returns true when all preceding GPU
+    /// work has already retired and the caller may refresh immediately.
+    pub fn note_scanout_refresh(
+        &mut self,
+        _notify_guard: &crate::adapter::WddmNotifyGuard<'_>,
+    ) -> bool {
+        let watermark = self.next_wire_fence;
+        if self.async_retired_up_to(watermark, true) {
+            self.scanout_refresh_watermark = None;
+            true
+        } else {
+            self.scanout_refresh_watermark = Some(watermark);
+            false
+        }
+    }
+
+    /// Consume a completion-ordered scanout marker after the used-ring drain.
+    /// Must be called under the same statically witnessed notification lock as
+    /// [`Self::note_scanout_refresh`].
+    pub fn take_ready_scanout_refresh(
+        &mut self,
+        _notify_guard: &crate::adapter::WddmNotifyGuard<'_>,
+    ) -> bool {
+        let Some(watermark) = self.scanout_refresh_watermark else {
+            return false;
+        };
+        if !self.async_retired_up_to(watermark, true) {
+            return false;
+        }
+        self.scanout_refresh_watermark = None;
+        true
+    }
 
     /// Whether every RING-0 async wire fence `< watermark` has retired.
     ///
