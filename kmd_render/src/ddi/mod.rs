@@ -12,6 +12,7 @@ mod gdi_blit;
 mod gpummu;
 pub(crate) mod hpd;
 pub(crate) mod interrupt;
+mod present_packet;
 pub(crate) mod query_adapter_info;
 mod scanout_diag;
 mod scheduler;
@@ -21,6 +22,7 @@ pub(crate) mod vidpn;
 
 pub use add_device::dxgkddi_add_device;
 pub use blob_map::unmap_io_pages_from_user;
+pub(crate) use build_paging_buffer::PagingPteShadow;
 pub use build_paging_buffer::{
     diag_dump_gpummu_atomics, dxgkddi_build_paging_buffer, dxgkddi_get_root_page_table_size,
     dxgkddi_set_root_page_table,
@@ -63,10 +65,10 @@ pub use start_device::{
     dxgkddi_reset_device, dxgkddi_set_power_state, dxgkddi_start_device, dxgkddi_stop_device,
     dxgkddi_unload, vsync_dpc_routine,
 };
-pub(crate) use submit_command::DMA_STALE_SKIP_COUNT;
 pub use submit_command::{
     diag_dump_engine_atomics, dxgkddi_collect_dbg_info, dxgkddi_patch, dxgkddi_preempt_command,
     dxgkddi_query_current_fence, dxgkddi_render, dxgkddi_render_gdi, dxgkddi_render_km,
     dxgkddi_reset_from_timeout, dxgkddi_restart_from_timeout, dxgkddi_submit_command,
     dxgkddi_submit_command_virtual,
 };
+pub(crate) use submit_command::{record_present_handoff_telemetry, DMA_STALE_SKIP_COUNT};

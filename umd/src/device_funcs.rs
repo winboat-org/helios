@@ -19,6 +19,7 @@ use crate::ddi;
 use crate::log_line;
 use core::ffi::c_void;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use windows::core::{IUnknown, Interface};
 use windows::Win32::Graphics::Direct3D11::ID3D11Resource;
 
 /// One cached dcomp-vehicle present source (road 4): an alias-imported D3D11
@@ -36,7 +37,6 @@ pub struct PresentSrcEntry {
 
 impl Drop for PresentSrcEntry {
     fn drop(&mut self) {
-        use windows::core::Interface;
         if self.resource_raw != 0 {
             // SAFETY: `resource_raw` is the owned COM ref returned by
             // open_ddi_texture2d; from_raw adopts it so drop releases it.
@@ -49,6 +49,18 @@ impl Drop for PresentSrcEntry {
             }
         }
     }
+}
+
+/// WDDM 2.x paging queue used to order explicit residency operations.
+///
+/// The non-zero handles and non-null monitored-fence mapping are validated at
+/// construction, so any allocation carrying a residency reference can rely on
+/// this queue being usable without repeating raw-handle checks.
+#[derive(Clone, Copy)]
+pub struct RuntimePagingQueue {
+    pub handle: core::num::NonZeroU32,
+    pub sync_object: core::num::NonZeroU32,
+    pub fence_value_cpu: core::ptr::NonNull<u64>,
 }
 
 /// Per-device UMD state, constructed in-place in the runtime-allocated private
@@ -73,6 +85,10 @@ pub struct HeliosDevice {
     pub patch_list: core::cell::Cell<*mut ddi::D3DDDI_PATCHLOCATIONLIST>,
     pub patch_list_size: core::cell::Cell<u32>,
     pub kt_callbacks: *const ddi::D3DDDI_DEVICECALLBACKS,
+    /// Created once with pfnCreatePagingQueueCb. WDDM 2.x residency is an
+    /// explicit per-device list; allocation/patch lists do not make resources
+    /// resident.
+    pub paging_queue: Option<RuntimePagingQueue>,
     pub dxgi_callbacks: *mut ddi::DXGI_DDI_BASE_CALLBACKS,
     /// Non-owning pointer to the largest scanout primary resource this UMD
     /// created for the device. DXGI sometimes calls Present with no destination
@@ -166,6 +182,63 @@ pub struct IaState {
     /// Cache of created input layouts keyed by (layout_ptr, vs_ptr) → owned
     /// `ID3D11InputLayout` raw pointer.
     pub layout_cache: std::collections::HashMap<(usize, usize), usize>,
+}
+
+impl IaState {
+    /// Release the owned COM references held by the lazy IA caches.
+    ///
+    /// Cache keys and the remaining IA fields are non-owning runtime/DXVK
+    /// identities. Only the cache values own references transferred by
+    /// `CreateInputLayout` and `create_shader_sig`.
+    pub fn release_owned_com(&mut self) -> (usize, usize) {
+        let variant_count = self
+            .vs_variants
+            .values()
+            .filter(|&&raw| raw != 0)
+            .count();
+        let layout_count = self
+            .layout_cache
+            .values()
+            .filter(|&&raw| raw != 0)
+            .count();
+        let mut owned = std::collections::HashSet::new();
+        owned.extend(self.vs_variants.drain().filter_map(
+            |(_, raw)| {
+                if raw == 0 {
+                    None
+                } else {
+                    Some(raw)
+                }
+            },
+        ));
+        owned.extend(self.layout_cache.drain().filter_map(
+            |(_, raw)| {
+                if raw == 0 {
+                    None
+                } else {
+                    Some(raw)
+                }
+            },
+        ));
+        for raw in owned {
+            // SAFETY: cache values are owned COM references whose ownership
+            // was transferred into the cache with `into_raw` or returned by
+            // the bridge's Create* call. `from_raw` adopts exactly that ref.
+            unsafe {
+                drop(IUnknown::from_raw(raw as *mut c_void));
+            }
+        }
+        self.bound_vs_com = 0;
+        (variant_count, layout_count)
+    }
+}
+
+impl Drop for IaState {
+    fn drop(&mut self) {
+        // Normal DestroyDevice calls this explicitly before the DXVK bridge
+        // drops. Keep Drop as rollback/panic-path ownership protection.
+        self.release_owned_com();
+    }
 }
 
 pub fn device_private_size() -> usize {
@@ -395,7 +468,36 @@ unsafe extern "C" fn ddi_destroy_device(h_device: ddi::D3D10DDI_HDEVICE) {
     log_line("DDI: DestroyDevice");
     if !h_device.pDrvPrivate.is_null() {
         let dev = &mut *(h_device.pDrvPrivate as *mut HeliosDevice);
-        if !dev.h_context.is_null() && !dev.kt_callbacks.is_null() {
+        let (variants, layouts) = dev.ia.get_mut().release_owned_com();
+        log_line(&format!(
+            "DDI DestroyDevice: released IA cache variants={} layouts={}",
+            variants, layouts
+        ));
+        destroy_runtime_objects(dev);
+        core::ptr::drop_in_place(h_device.pDrvPrivate as *mut HeliosDevice);
+    }
+}
+
+/// Destroy runtime-owned kernel objects while the runtime device handle and
+/// callback table are still valid. This is shared by normal DestroyDevice and
+/// the CreateDevice rollback path.
+pub unsafe fn destroy_runtime_objects(dev: &mut HeliosDevice) {
+    if !dev.kt_callbacks.is_null() {
+        if let Some(queue) = dev.paging_queue.take() {
+            if let Some(destroy_queue_cb) = (*dev.kt_callbacks).pfnDestroyPagingQueueCb {
+                let arg = ddi::D3DDDI_DESTROYPAGINGQUEUE {
+                    hPagingQueue: queue.handle.get(),
+                };
+                let hr = destroy_queue_cb(dev.h_rt_device, &arg);
+                log_line(&format!(
+                    "DDI DestroyDevice: DestroyPagingQueue hQueue=0x{:x} hr=0x{:08x}",
+                    queue.handle.get(),
+                    hr as u32
+                ));
+            }
+        }
+
+        if !dev.h_context.is_null() {
             if let Some(destroy_context_cb) = (*dev.kt_callbacks).pfnDestroyContextCb {
                 let arg = ddi::D3DDDICB_DESTROYCONTEXT {
                     hContext: dev.h_context,
@@ -408,7 +510,6 @@ unsafe extern "C" fn ddi_destroy_device(h_device: ddi::D3D10DDI_HDEVICE) {
             }
             dev.h_context = core::ptr::null_mut();
         }
-        core::ptr::drop_in_place(h_device.pDrvPrivate as *mut HeliosDevice);
     }
 }
 
@@ -446,6 +547,60 @@ pub unsafe fn create_runtime_context(dev: &mut HeliosDevice) {
         dev.patch_list.set(arg.pPatchLocationList);
         dev.patch_list_size.set(arg.PatchLocationListSize);
     }
+}
+
+/// Create the monitored-fence paging queue required by WDDM 2.x
+/// pfnMakeResidentCb. Returns an HRESULT and leaves `paging_queue` empty on
+/// failure.
+pub unsafe fn create_runtime_paging_queue(dev: &mut HeliosDevice) -> i32 {
+    const E_FAIL: i32 = 0x8000_4005u32 as i32;
+
+    if dev.kt_callbacks.is_null() {
+        log_line("CreateDevice: no KT callbacks for CreatePagingQueue");
+        return E_FAIL;
+    }
+    let Some(create_queue_cb) = (*dev.kt_callbacks).pfnCreatePagingQueueCb else {
+        log_line("CreateDevice: pfnCreatePagingQueueCb missing");
+        return E_FAIL;
+    };
+
+    let mut arg = ddi::D3DDDICB_CREATEPAGINGQUEUE::default();
+    // D3DDDI_PAGINGQUEUE_PRIORITY_NORMAL == 0.
+    arg.Priority = 0;
+    arg.PhysicalAdapterIndex = 0;
+    let hr = create_queue_cb(dev.h_rt_device, &mut arg);
+    log_line(&format!(
+        "CreateDevice: CreatePagingQueue hr=0x{:08x} hQueue=0x{:x} hSync=0x{:x} fence={:p}",
+        hr as u32, arg.hPagingQueue, arg.hSyncObject, arg.FenceValueCPUVirtualAddress
+    ));
+    if hr != 0 {
+        return hr;
+    }
+
+    let queue = core::num::NonZeroU32::new(arg.hPagingQueue);
+    let sync_object = core::num::NonZeroU32::new(arg.hSyncObject);
+    let fence_value_cpu = core::ptr::NonNull::new(arg.FenceValueCPUVirtualAddress.cast::<u64>());
+    let (Some(handle), Some(sync_object), Some(fence_value_cpu)) =
+        (queue, sync_object, fence_value_cpu)
+    else {
+        log_line("CreateDevice: CreatePagingQueue returned invalid outputs");
+        if let Some(destroy_queue_cb) = (*dev.kt_callbacks).pfnDestroyPagingQueueCb {
+            if arg.hPagingQueue != 0 {
+                let destroy = ddi::D3DDDI_DESTROYPAGINGQUEUE {
+                    hPagingQueue: arg.hPagingQueue,
+                };
+                let _ = destroy_queue_cb(dev.h_rt_device, &destroy);
+            }
+        }
+        return E_FAIL;
+    };
+
+    dev.paging_queue = Some(RuntimePagingQueue {
+        handle,
+        sync_object,
+        fence_value_cpu,
+    });
+    0
 }
 
 /// Fill all 152 entries of a `D3D11DDI_DEVICEFUNCS` table with safe stubs, then

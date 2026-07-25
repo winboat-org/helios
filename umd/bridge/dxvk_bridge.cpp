@@ -1178,7 +1178,8 @@ std::size_t HeliosDxvkDevice::open_ddi_texture2d(
     std::uint64_t venus_alloc_size,
     std::uint32_t memory_type_index,
     bool scanout_linear,
-    bool linear_scanout_target) const {
+    bool linear_scanout_target,
+    bool cross_context_optimal) const {
   if (!impl || !impl->d3d11 || !global || !renderer_resource_id || !width || !height)
     return 0;
 
@@ -1221,6 +1222,7 @@ std::size_t HeliosDxvkDevice::open_ddi_texture2d(
     // Rebuild a flagged primary as the creator's plain LINEAR+DMA_BUF image.
     importInfo.ScanoutLinear   = scanout_linear;
     importInfo.LinearScanoutTarget = linear_scanout_target;
+    importInfo.CrossContextOptimal = cross_context_optimal;
 
     auto* device = reinterpret_cast<dxvk::D3D11Device*>(impl->d3d11);
     auto* texture = new dxvk::D3D11Texture2D(
@@ -1288,7 +1290,7 @@ std::size_t HeliosDxvkDevice::open_kmd_scanout_target(
   const auto resource = open_ddi_texture2d(
     info.width, info.height, DXGI_FORMAT_B8G8R8A8_UNORM_VALUE,
     0u, 0u, info.resourceId, info.resourceId, info.allocSize,
-    info.memoryTypeIndex, false, true);
+    info.memoryTypeIndex, false, true, false);
   if (!resource)
     return 0;
 
@@ -1314,7 +1316,6 @@ std::size_t HeliosDxvkDevice::create_ddi_scanout_texture2d(
     std::uint32_t format,
     std::uint32_t bind_flags,
     std::uint32_t misc_flags,
-    bool optimal_scanout,
     std::uint64_t* out_row_pitch,
     std::uint64_t* out_offset) const {
   if (out_row_pitch) *out_row_pitch = 0;
@@ -1351,8 +1352,7 @@ std::size_t HeliosDxvkDevice::create_ddi_scanout_texture2d(
     desc.TextureLayout  = D3D11_TEXTURE_LAYOUT_UNDEFINED;
 
     dxvk::D3D11_HELIOS_CREATE_INFO createInfo = { };
-    createInfo.ScanoutPrimary       = !optimal_scanout;
-    createInfo.DirectOptimalScanout = optimal_scanout;
+    createInfo.DirectOptimalScanout = true;
 
     auto* device = reinterpret_cast<dxvk::D3D11Device*>(impl->d3d11);
     // Fresh Export create: no imported vkImage, no shared handle, no import
@@ -1361,7 +1361,7 @@ std::size_t HeliosDxvkDevice::create_ddi_scanout_texture2d(
         device, &desc, nullptr,
         INVALID_HANDLE_VALUE,
         nullptr,       // pHeliosImport
-        &createInfo);  // pHeliosCreate → ScanoutPrimary
+        &createInfo);  // pHeliosCreate → DirectOptimalScanout
 
     ID3D11Resource* resource = nullptr;
     HRESULT hr = texture->QueryInterface(
@@ -1372,43 +1372,14 @@ std::size_t HeliosDxvkDevice::create_ddi_scanout_texture2d(
       return 0;
     }
 
-    if (optimal_scanout) {
-      const std::uint64_t pitch = (std::uint64_t(width) * 4u + 255u) & ~255ull;
-      if (out_row_pitch) *out_row_pitch = pitch;
-      if (out_offset)    *out_offset = 0;
-      char msg[192];
-      std::snprintf(msg, sizeof(msg),
-        "CreateDdiScanoutTexture2D OPTIMAL %ux%u fmt=%u logicalPitch=%llu resource=%p",
-        width, height, format, static_cast<unsigned long long>(pitch), resource);
-      umd_log(msg);
-      return reinterpret_cast<std::size_t>(resource);
-    }
-
-    // Query the REAL LINEAR plane-0 row pitch + offset so the KMD can
-    // program SET_SCANOUT_BLOB with the exact host layout instead of a
-    // width*4 / cross-adapter guess (a wrong stride/offset shears the image).
-    auto* common = dxvk::GetCommonTexture(resource);
-    if (common && common->GetImage() != nullptr) {
-      VkImageSubresource sub = { };
-      sub.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; // overridden to MEMORY_PLANE_0 for the scan-out primary
-      sub.mipLevel   = 0;
-      sub.arrayLayer = 0;
-      VkSubresourceLayout layout =
-        device->GetDXVKDevice()->queryImageSubresourceLayout(common->GetImage()->info(), sub);
-      if (out_row_pitch) *out_row_pitch = layout.rowPitch;
-      if (out_offset)    *out_offset = layout.offset;
-
-      char msg[192];
-      std::snprintf(msg, sizeof(msg),
-        "CreateDdiScanoutTexture2D %ux%u fmt=%u rowPitch=%llu offset=%llu resource=%p",
-        width, height, format,
-        static_cast<unsigned long long>(layout.rowPitch),
-        static_cast<unsigned long long>(layout.offset), resource);
-      umd_log(msg);
-    } else {
-      umd_log("CreateDdiScanoutTexture2D: no DxvkImage to query layout");
-    }
-
+    const std::uint64_t pitch = (std::uint64_t(width) * 4u + 255u) & ~255ull;
+    if (out_row_pitch) *out_row_pitch = pitch;
+    if (out_offset)    *out_offset = 0;
+    char msg[192];
+    std::snprintf(msg, sizeof(msg),
+      "CreateDdiScanoutTexture2D OPTIMAL %ux%u fmt=%u logicalPitch=%llu resource=%p",
+      width, height, format, static_cast<unsigned long long>(pitch), resource);
+    umd_log(msg);
     return reinterpret_cast<std::size_t>(resource);
   } catch (const dxvk::DxvkError& e) {
     umd_log(("CreateDdiScanoutTexture2D DxvkError: " + e.message()).c_str());

@@ -1324,8 +1324,9 @@ root-caused.**
   — it's a sequence of UMD caps bugs.** The engine is genuinely FL11 (bridge
   creates the dxvk device at `D3D_FEATURE_LEVEL_11_0`; all FL11 DDIs wired).
   Everything is behind `HKLM\SOFTWARE\Helios!FeatureLevel11`, now an integer
-  MODE (0=FL10 default/proven, 1=full FL11, 2=diagnostic pipeline-only); knob=0
-  = exact FL10 baseline, dwm-safe. **THE tool that cracked it: the
+  MODE (0=explicit FL10 fallback, 1=full FL11 and the absent-value default as
+  of 2026-07-24, 2=diagnostic pipeline-only); knob=0 = exact FL10 baseline,
+  dwm-safe. **THE tool that cracked it: the
   `Microsoft-Windows-DXGI` ETW provider prints d3d11.dll's exact rejection
   string** (the debug layer / DXGI InfoQueue / DBWIN / DxgKrnl-AzureTriage all
   gave 0 messages — the failure is device-less). Recipe: `logman start

@@ -14,11 +14,12 @@
 //       -ld3d11 -ldxgi -ld3dcompiler -ldxguid -lgdi32 -luser32
 //
 // Run (MUST be session 1 — schtasks /IT; session 0 has no desktop):
-//   d3d11_triangle.exe [adapter] [swap] [seconds]
+//   d3d11_triangle.exe [adapter] [swap] [seconds] [after-first-present-delay-ms]
 //     adapter : "default" (nullptr) | index N | "helios" (first name match) |
 //               "heliosout" (the Helios adapter whose EnumOutputs succeeds)
 //     swap    : "flip" (FLIP_DISCARD, default) | "blt" (legacy DISCARD)
 //     seconds : run duration before auto-exit (default 20)
+//     after-first-present-delay-ms : diagnostic pause after Present #0 (default 0)
 //   Logs to stdout AND C:\Users\Rupansh\d3d11_triangle.txt
 //
 // Capture the result with helios_capture_faceworks (CopyFromScreen ->
@@ -76,9 +77,10 @@ int main(int argc, char** argv) {
   const char* selAdapter = argc > 1 ? argv[1] : "default";
   const char* selSwap    = argc > 2 ? argv[2] : "flip";
   int seconds            = argc > 3 ? atoi(argv[3]) : 20;
+  int firstPresentDelayMs = argc > 4 ? atoi(argv[4]) : 0;
   bool useFlip = _stricmp(selSwap, "blt") != 0;
-  L("d3d11_triangle pid=%lu adapter=%s swap=%s seconds=%d",
-    GetCurrentProcessId(), selAdapter, selSwap, seconds);
+  L("d3d11_triangle pid=%lu adapter=%s swap=%s seconds=%d firstPresentDelayMs=%d",
+    GetCurrentProcessId(), selAdapter, selSwap, seconds, firstPresentDelayMs);
 
   // --- window ---
   WNDCLASSA wc = {}; wc.lpfnWndProc = WndProc; wc.hInstance = GetModuleHandle(nullptr);
@@ -104,11 +106,10 @@ int main(int argc, char** argv) {
   IDXGIAdapter1* adapter = PickAdapter((IDXGIFactory1*)factory, selAdapter);
 
   // --- device ---
-  D3D_FEATURE_LEVEL lv[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1};
   D3D_FEATURE_LEVEL got{};
   ID3D11Device* dev = nullptr; ID3D11DeviceContext* ctx = nullptr;
   hr = D3D11CreateDevice(adapter, adapter ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE,
-    nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT, lv, _countof(lv), D3D11_SDK_VERSION, &dev, &got, &ctx);
+    nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT, nullptr, 0, D3D11_SDK_VERSION, &dev, &got, &ctx);
   L("D3D11CreateDevice hr=0x%08x level=0x%x", (unsigned)hr, (unsigned)got);
   if (FAILED(hr)) return 2;
 
@@ -188,6 +189,10 @@ int main(int argc, char** argv) {
 
     hr = sc->Present(1,0);
     if (frame < 4 || (frame % 240)==0) L("Present #%u hr=0x%08x", frame, (unsigned)hr);
+    if (frame == 0 && firstPresentDelayMs > 0) {
+      L("pausing %d ms after Present #0", firstPresentDelayMs);
+      Sleep((DWORD)firstPresentDelayMs);
+    }
     frame++;
   }
 done:

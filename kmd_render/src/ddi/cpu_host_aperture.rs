@@ -177,6 +177,15 @@ pub unsafe extern "C" fn dxgkddi_map_cpu_host_aperture(
         dump_bar_ap_counters();
         return STATUS_NO_MEMORY;
     };
+    if !alloc.bar_eligible {
+        // The allocation contract says this object is device-local/opaque.
+        // Never reinterpret it as CPU-addressable blob bytes even if VidMm
+        // supplies a BAR-segment aperture request.
+        BAR_AP_ERR_ALLOC.fetch_add(1, Ordering::Relaxed);
+        BAR_AP_LAST_RESID.store(alloc.resource_id, Ordering::Relaxed);
+        dump_bar_ap_counters();
+        return STATUS_NO_MEMORY;
+    }
     let n = args.NumberOfPages;
     let blob_pages = (alloc.size.saturating_add(4095) >> 12).max(1);
     if n == 0 || args.pCpuHostAperturePages.is_null() {

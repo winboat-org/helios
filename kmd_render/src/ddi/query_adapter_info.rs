@@ -171,9 +171,11 @@ unsafe fn query_driver_caps(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTE
     // CPU-visible story — GDI HW acceleration is documented as OPTIONAL
     // ("should… only if", gdi-hardware-acceleration.md) and viogpu3d (the closest
     // WDDM driver to Helios, near-identical cap set) never sets the bit. The
-    // `GdiAccelMode` service-key knob (default 1 = advertise, the proven shape)
-    // re-runs the experiment via `reg add` + `devcon restart`; a FAILED_ADD
-    // under mode 0 is named in plain text by the ETW AzureTriage recipe.
+    // The 2026-07-06 `GdiAccelMode=0` A/B overturned that result: the adapter
+    // starts and Windows' canonical CPU redirection path renders correctly
+    // without any RenderGdi traffic. Mode 0 is therefore the production
+    // default. Explicit mode 1 remains only as a diagnostic rollback until the
+    // obsolete KMD CPU blitter is removed.
     let advertise_gdi_hw_acceleration: bool = adapter.gdi_accel_mode != 0;
     const FLIPCAPS_FLIP_ON_VSYNC_MMIO: u32 = 1 << 1;
     const SCHEDULINGCAPS_MULTI_ENGINE_AWARE: u32 = 1 << 0;

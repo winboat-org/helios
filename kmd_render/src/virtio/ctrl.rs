@@ -502,9 +502,10 @@ pub fn resource_flush_async(
 }
 
 /// Queue SET_SCANOUT_BLOB without waiting for its ctrl response. A successful
-/// response publishes `resource_id` through `host_bound`; completion always
-/// re-arms `refresh_pending` so the worker either flushes the newly-bound image
-/// or retries the latest coalesced primary after a failure/rotation.
+/// response publishes `resource_id` through `host_bound` and re-arms
+/// `refresh_pending` so the worker flushes the newly-bound image. A rejected
+/// bind does not self-resubmit: only a new Windows-selected candidate or a new
+/// completion-ordered dirty edge may request another attempt.
 pub fn set_scanout_blob_async(
     adapter: &AdapterContext,
     resource_id: u32,
@@ -1452,6 +1453,7 @@ pub fn submit_venus_async_scanout(
     adapter: &AdapterContext,
     ctx_id: u32,
     stream: &[u8],
+    primary_address: u64,
 ) -> Result<u64, VirtioError> {
     if stream.is_empty() {
         return Err(VirtioError::DeviceError);
@@ -1463,6 +1465,9 @@ pub fn submit_venus_async_scanout(
     let venus_len = stream.len();
     let notify = AsyncScanoutNotify {
         pending: NonNull::from(&adapter.scanout_refresh_pending),
+        displayed_primary: NonNull::from(&adapter.last_primary_address),
+        programming: NonNull::from(&adapter.vidpn_programming),
+        primary_address,
         // SAFETY: hpd_event is embedded in the stable adapter and initialized
         // before StartDevice creates any Venus submissions.
         event: unsafe { NonNull::new_unchecked(adapter.hpd_event.get()) },
@@ -1471,6 +1476,36 @@ pub fn submit_venus_async_scanout(
     let queued = adapter.with_virtio(move |v| {
         v.drain_used();
         v.enqueue_async_submit(ctx_id, 1, meta, venus, venus_len, Some(notify))
+    });
+    match queued {
+        Ok(Ok(fence_id)) => Ok(fence_id),
+        Ok(Err((_meta, _venus, e))) => Err(e),
+        Err(_) => Err(VirtioError::DeviceError),
+    }
+}
+
+/// Nonblocking KMD Present-BLT submission.
+///
+/// Like the scanout copy path, ring_idx=1 makes used-ring retirement represent
+/// GPU completion. Unlike scanout, an ordinary app/DWM BLT must not mark the
+/// physical scanout dirty or wake the display refresh worker.
+pub fn submit_venus_async_present(
+    adapter: &AdapterContext,
+    ctx_id: u32,
+    stream: &[u8],
+) -> Result<u64, VirtioError> {
+    if stream.is_empty() {
+        return Err(VirtioError::DeviceError);
+    }
+    reap_parked(adapter);
+    let meta = DmaBuffer::new(SUBMIT_META_BYTES).ok_or(VirtioError::OutOfMemory)?;
+    let mut venus = DmaBuffer::new(stream.len()).ok_or(VirtioError::OutOfMemory)?;
+    venus.as_mut_slice()[..stream.len()].copy_from_slice(stream);
+    let venus_len = stream.len();
+
+    let queued = adapter.with_virtio(move |v| {
+        v.drain_used();
+        v.enqueue_async_submit(ctx_id, 1, meta, venus, venus_len, None)
     });
     match queued {
         Ok(Ok(fence_id)) => Ok(fence_id),

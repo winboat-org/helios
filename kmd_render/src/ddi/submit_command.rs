@@ -9,6 +9,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::adapter::{AdapterContext, WddmNotifyGuard};
 use crate::ddi::gdi_blit;
+use crate::ddi::present_packet::PresentSubmissionPrivate;
 use crate::dxgk::_DXGK_INTERRUPT_TYPE::DXGK_INTERRUPT_DMA_COMPLETED;
 use crate::dxgk::*;
 
@@ -33,6 +34,50 @@ pub static DMA_SYNC_RET: AtomicU32 = AtomicU32::new(0);
 /// Older DMA_COMPLETED packets suppressed after a newer watermark won the
 /// cross-CPU notification race. The newer watermark implicitly retires them.
 pub static DMA_STALE_SKIP_COUNT: AtomicU32 = AtomicU32::new(0);
+
+// Present private-data handoff diagnostics. These are atomics because both
+// SubmitCommand entry points run at DISPATCH_LEVEL; a throttled PASSIVE scanout
+// telemetry site mirrors them to the registry.
+pub static SUBMIT_VIRTUAL_COUNT: AtomicU32 = AtomicU32::new(0);
+pub static SUBMIT_LEGACY_COUNT: AtomicU32 = AtomicU32::new(0);
+pub static PRESENT_MARKER_HITS: AtomicU32 = AtomicU32::new(0);
+pub static PRESENT_MARKER_SCAN_HITS: AtomicU32 = AtomicU32::new(0);
+pub static PRESENT_MARKER_LAST_OFFSET: AtomicU32 = AtomicU32::new(u32::MAX);
+pub static PRESENT_PRIVATE_LAST_TOTAL: AtomicU32 = AtomicU32::new(0);
+pub static PRESENT_PRIVATE_LAST_UMD: AtomicU32 = AtomicU32::new(0);
+pub static PRESENT_PRIVATE_LAST_START: AtomicU32 = AtomicU32::new(0);
+pub static PRESENT_PRIVATE_LAST_END: AtomicU32 = AtomicU32::new(0);
+pub static PRESENT_PRIVATE_LAST_BASE_WORD: AtomicU32 = AtomicU32::new(0);
+pub static PRESENT_PRIVATE_LAST_EXPECTED_WORD: AtomicU32 = AtomicU32::new(0);
+static PRESENT_MARKER_SCAN_ATTEMPTS: AtomicU32 = AtomicU32::new(0);
+
+/// Mirror the scheduler private-data handoff evidence at PASSIVE_LEVEL.
+pub(crate) fn record_present_handoff_telemetry() {
+    use crate::ddi::present_packet::{
+        PRESENT_MARKER_LAST_FENCE, PRESENT_MARKER_LAST_SIZE, PRESENT_MARKER_WRITES,
+    };
+
+    crate::diag::record_named_bytes(b"PmWr", PRESENT_MARKER_WRITES.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"PmWFn", PRESENT_MARKER_LAST_FENCE.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"PmWSz", PRESENT_MARKER_LAST_SIZE.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"PmHit", PRESENT_MARKER_HITS.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"PmScan", PRESENT_MARKER_SCAN_HITS.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"PmOff", PRESENT_MARKER_LAST_OFFSET.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"PmVir", SUBMIT_VIRTUAL_COUNT.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"PmLeg", SUBMIT_LEGACY_COUNT.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"PmTot", PRESENT_PRIVATE_LAST_TOTAL.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"PmUmd", PRESENT_PRIVATE_LAST_UMD.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"PmSta", PRESENT_PRIVATE_LAST_START.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"PmEnd", PRESENT_PRIVATE_LAST_END.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(
+        b"PmB0",
+        PRESENT_PRIVATE_LAST_BASE_WORD.load(Ordering::Relaxed),
+    );
+    crate::diag::record_named_bytes(
+        b"PmX0",
+        PRESENT_PRIVATE_LAST_EXPECTED_WORD.load(Ordering::Relaxed),
+    );
+}
 
 /// Mirror the DISPATCH-safe engine tracers into the PASSIVE diag ring. Call ONLY
 /// from a PASSIVE DDI (DxgkDdiDestroyDevice). Codes (continuing the 0x0F.. space
@@ -262,7 +307,8 @@ fn note_and_maybe_signal(
     adapter: &AdapterContext,
     fence: u32,
     is_paging: bool,
-    wait_gpu: bool,
+    gpu_completion_fence: Option<u64>,
+    refresh_scanout: bool,
 ) -> NTSTATUS {
     let dxgkrnl = match adapter.dxgkrnl() {
         Ok(interface) => interface,
@@ -270,11 +316,19 @@ fn note_and_maybe_signal(
     };
     adapter.with_wddm_notify_lock(|guard| {
         let signal_now = adapter
-            .with_virtio(|v| v.note_wddm_submission(guard, fence, is_paging, wait_gpu))
+            .with_virtio(|v| {
+                v.note_wddm_submission(
+                    guard,
+                    fence,
+                    is_paging,
+                    gpu_completion_fence,
+                    refresh_scanout,
+                )
+            })
             // Transport down (bring-up / teardown): no venus work can gate it.
             .unwrap_or(true);
         if signal_now {
-            if wait_gpu {
+            if refresh_scanout {
                 adapter.request_scanout_refresh();
             }
             // SAFETY: the notification lock is held and dxgkrnl is live.
@@ -283,6 +337,113 @@ fn note_and_maybe_signal(
             STATUS_SUCCESS
         }
     })
+}
+
+unsafe fn decode_virtual_present_fence(submit: &DXGKARG_SUBMITCOMMANDVIRTUAL) -> Option<u64> {
+    let base = submit.pDmaBufferPrivateData as *const u8;
+    let total = submit.DmaBufferPrivateDataSize as usize;
+    let umd = submit.DmaBufferUmdPrivateDataSize as usize;
+    SUBMIT_VIRTUAL_COUNT.fetch_add(1, Ordering::Relaxed);
+    PRESENT_PRIVATE_LAST_TOTAL.store(total.min(u32::MAX as usize) as u32, Ordering::Relaxed);
+    PRESENT_PRIVATE_LAST_UMD.store(umd.min(u32::MAX as usize) as u32, Ordering::Relaxed);
+    PRESENT_PRIVATE_LAST_START.store(0, Ordering::Relaxed);
+    PRESENT_PRIVATE_LAST_END.store(0, Ordering::Relaxed);
+    PRESENT_PRIVATE_LAST_BASE_WORD.store(
+        unsafe { diagnostic_private_word(base, total, 0) },
+        Ordering::Relaxed,
+    );
+    PRESENT_PRIVATE_LAST_EXPECTED_WORD.store(
+        unsafe { diagnostic_private_word(base, total, umd) },
+        Ordering::Relaxed,
+    );
+    if !base.is_null() && umd <= total {
+        let kmd_size = total - umd;
+        if let Some(fence) =
+            unsafe { PresentSubmissionPrivate::decode(base.add(umd).cast(), kmd_size as u32) }
+        {
+            PRESENT_MARKER_HITS.fetch_add(1, Ordering::Relaxed);
+            PRESENT_MARKER_LAST_OFFSET.store(umd as u32, Ordering::Relaxed);
+            return Some(fence);
+        }
+    }
+    if let Some(fence) = unsafe {
+        PresentSubmissionPrivate::decode(
+            submit.pDmaBufferPrivateData,
+            submit.DmaBufferPrivateDataSize,
+        )
+    } {
+        PRESENT_MARKER_HITS.fetch_add(1, Ordering::Relaxed);
+        PRESENT_MARKER_LAST_OFFSET.store(0, Ordering::Relaxed);
+        return Some(fence);
+    }
+    unsafe { diagnostic_scan_present_private(base, total) };
+    None
+}
+
+unsafe fn decode_legacy_present_fence(submit: &DXGKARG_SUBMITCOMMAND) -> Option<u64> {
+    let base = submit.pDmaBufferPrivateData as *const u8;
+    let total = submit.DmaBufferPrivateDataSize as usize;
+    let start = submit.DmaBufferPrivateDataSubmissionStartOffset as usize;
+    let end = submit.DmaBufferPrivateDataSubmissionEndOffset as usize;
+    SUBMIT_LEGACY_COUNT.fetch_add(1, Ordering::Relaxed);
+    PRESENT_PRIVATE_LAST_TOTAL.store(total.min(u32::MAX as usize) as u32, Ordering::Relaxed);
+    PRESENT_PRIVATE_LAST_UMD.store(0, Ordering::Relaxed);
+    PRESENT_PRIVATE_LAST_START.store(start.min(u32::MAX as usize) as u32, Ordering::Relaxed);
+    PRESENT_PRIVATE_LAST_END.store(end.min(u32::MAX as usize) as u32, Ordering::Relaxed);
+    PRESENT_PRIVATE_LAST_BASE_WORD.store(
+        unsafe { diagnostic_private_word(base, total, 0) },
+        Ordering::Relaxed,
+    );
+    PRESENT_PRIVATE_LAST_EXPECTED_WORD.store(
+        unsafe { diagnostic_private_word(base, total, start) },
+        Ordering::Relaxed,
+    );
+    if !base.is_null() && start <= end && end <= total {
+        if let Some(fence) = unsafe {
+            PresentSubmissionPrivate::decode(base.add(start).cast(), (end - start) as u32)
+        } {
+            PRESENT_MARKER_HITS.fetch_add(1, Ordering::Relaxed);
+            PRESENT_MARKER_LAST_OFFSET.store(start as u32, Ordering::Relaxed);
+            return Some(fence);
+        }
+    }
+    if let Some(fence) = unsafe {
+        PresentSubmissionPrivate::decode(
+            submit.pDmaBufferPrivateData,
+            submit.DmaBufferPrivateDataSize,
+        )
+    } {
+        PRESENT_MARKER_HITS.fetch_add(1, Ordering::Relaxed);
+        PRESENT_MARKER_LAST_OFFSET.store(0, Ordering::Relaxed);
+        return Some(fence);
+    }
+    unsafe { diagnostic_scan_present_private(base, total) };
+    None
+}
+
+/// Read one diagnostic word without extending the trusted private-data range.
+unsafe fn diagnostic_private_word(base: *const u8, total: usize, offset: usize) -> u32 {
+    if base.is_null() || offset > total || total - offset < size_of::<u32>() {
+        return 0;
+    }
+    unsafe { core::ptr::read_unaligned(base.add(offset).cast::<u32>()) }
+}
+
+/// Bounded evidence-only scan. A discovered offset is reported but never used
+/// to gate a WDDM fence; correctness must use one explicit documented offset.
+unsafe fn diagnostic_scan_present_private(base: *const u8, total: usize) {
+    if crate::ddi::present_packet::PRESENT_MARKER_WRITES.load(Ordering::Relaxed) == 0
+        || PRESENT_MARKER_SCAN_ATTEMPTS.fetch_add(1, Ordering::Relaxed) >= 256
+    {
+        return;
+    }
+    let size = total.min(u32::MAX as usize) as u32;
+    if let Some(offset) =
+        unsafe { PresentSubmissionPrivate::diagnostic_find_offset(base.cast(), size) }
+    {
+        PRESENT_MARKER_SCAN_HITS.fetch_add(1, Ordering::Relaxed);
+        PRESENT_MARKER_LAST_OFFSET.store(offset, Ordering::Relaxed);
+    }
 }
 
 /// Order one coalesced host refresh after every Venus command submitted before
@@ -332,7 +493,8 @@ pub unsafe extern "C" fn dxgkddi_submit_command_virtual(
         SUBMIT_PAGING_COUNT.fetch_add(1, Ordering::Relaxed);
     }
 
-    note_and_maybe_signal(adapter, fence, is_paging, false)
+    let present_fence = unsafe { decode_virtual_present_fence(submit) };
+    note_and_maybe_signal(adapter, fence, is_paging, present_fence, false)
 }
 
 /// `DxgkDdiSubmitCommand` — submit a DMA buffer to the GPU. Critically, this is
@@ -361,7 +523,8 @@ pub unsafe extern "C" fn dxgkddi_submit_command(
         SUBMIT_PAGING_COUNT.fetch_add(1, Ordering::Relaxed);
     }
 
-    note_and_maybe_signal(adapter, fence, is_paging, false)
+    let present_fence = unsafe { decode_legacy_present_fence(submit) };
+    note_and_maybe_signal(adapter, fence, is_paging, present_fence, false)
 }
 
 /// `DxgkDdiPreemptCommand` — VidSch wants the node's pending submissions back
@@ -508,33 +671,16 @@ pub unsafe extern "C" fn dxgkddi_render(
                     }
                 } else {
                     let private = command.present;
-                    let direct_scanout = private.reserved
-                        & helios_protocol::HELIOS_PRESENT_PRIVATE_FLAG_DIRECT_SCANOUT
-                        != 0;
-                    let required_size = private.plane_offset.saturating_add(
-                        (private.pitch as u64).saturating_mul(private.height as u64),
-                    );
                     if diag {
                         crate::diag::record_named_bytes(b"PRsrc", private.resource_id);
-                        crate::diag::record_named_bytes(b"PRset", 1);
+                        crate::diag::record_named_bytes(b"PRset", 2);
                     }
-                    let published = super::display::issue_present_scanout(
-                        unsafe { &*(*context.device).adapter },
-                        private.resource_id,
-                        private.width,
-                        private.height,
-                        private.pitch,
-                        private.dxgi_format,
-                        private.plane_offset,
-                        required_size,
-                        direct_scanout,
-                        4,
-                    );
-                    if published {
-                        arm_scanout_refresh_after_current_venus(unsafe {
-                            &*(*context.device).adapter
-                        });
-                    }
+                    // DxgkDdiPresent selects the exact source from
+                    // dxgkrnl's allocation list. This command is only the
+                    // completion/dirty edge for the Venus work submitted
+                    // before pfnPresentCb; its private bytes are not a second
+                    // scanout selector.
+                    arm_scanout_refresh_after_current_venus(unsafe { &*(*context.device).adapter });
                 }
             }
         }

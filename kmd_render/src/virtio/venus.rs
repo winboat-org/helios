@@ -30,6 +30,7 @@
 //! of the 2026-07-04 convoy/poison classes. NOTHING here ever holds the virtio
 //! spinlock across a wait.
 
+use alloc::vec::Vec;
 use core::sync::atomic::{compiler_fence, fence, Ordering};
 
 use helios_protocol::{
@@ -54,10 +55,14 @@ const CMD_QUEUE_SUBMIT: u32 = 18;
 const CMD_ALLOCATE_MEMORY: u32 = 21;
 const CMD_FREE_MEMORY: u32 = 22;
 const CMD_BIND_IMAGE_MEMORY: u32 = 29;
+const CMD_BIND_BUFFER_MEMORY: u32 = 28;
+const CMD_GET_BUFFER_MEMORY_REQUIREMENTS: u32 = 30;
 const CMD_GET_IMAGE_MEMORY_REQUIREMENTS: u32 = 31;
 const CMD_CREATE_FENCE: u32 = 35;
 const CMD_DESTROY_FENCE: u32 = 36;
 const CMD_WAIT_FOR_FENCES: u32 = 39;
+const CMD_CREATE_BUFFER: u32 = 50;
+const CMD_DESTROY_BUFFER: u32 = 51;
 const CMD_CREATE_IMAGE: u32 = 54;
 const CMD_DESTROY_IMAGE: u32 = 55;
 const CMD_GET_IMAGE_SUBRESOURCE_LAYOUT: u32 = 56;
@@ -67,6 +72,8 @@ const CMD_ALLOCATE_COMMAND_BUFFERS: u32 = 88;
 const CMD_BEGIN_COMMAND_BUFFER: u32 = 90;
 const CMD_END_COMMAND_BUFFER: u32 = 91;
 const CMD_COPY_IMAGE: u32 = 113;
+const CMD_BLIT_IMAGE: u32 = 114;
+const CMD_COPY_IMAGE_TO_BUFFER: u32 = 116;
 const CMD_CLEAR_COLOR_IMAGE: u32 = 119;
 const CMD_PIPELINE_BARRIER: u32 = 126;
 const CMD_GET_DEVICE_QUEUE_2: u32 = 155;
@@ -86,11 +93,13 @@ const ST_DEVICE_QUEUE_CREATE_INFO: i32 = 2;
 const ST_DEVICE_CREATE_INFO: i32 = 3;
 const ST_SUBMIT_INFO: i32 = 4;
 const ST_MEMORY_ALLOCATE_INFO: i32 = 5;
+const ST_BUFFER_CREATE_INFO: i32 = 12;
 const ST_FENCE_CREATE_INFO: i32 = 8;
 const ST_IMAGE_CREATE_INFO: i32 = 14;
 const ST_COMMAND_POOL_CREATE_INFO: i32 = 39;
 const ST_COMMAND_BUFFER_ALLOCATE_INFO: i32 = 40;
 const ST_COMMAND_BUFFER_BEGIN_INFO: i32 = 42;
+const ST_BUFFER_MEMORY_BARRIER: i32 = 44;
 const ST_IMAGE_MEMORY_BARRIER: i32 = 45;
 const ST_DEVICE_QUEUE_INFO_2: i32 = 1000145003;
 const ST_EXTERNAL_MEMORY_IMAGE_CREATE_INFO: i32 = 1000072001;
@@ -109,9 +118,34 @@ const ST_IMPORT_MEMORY_RESOURCE_INFO_MESA: i32 = 1000384002;
 const EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD: u32 = 0x0000_0001;
 /// `VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT`.
 const EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF: u32 = 0x0000_0200;
+
+/// External-memory transport used for an OPTIMAL image and its backing blob.
+///
+/// Keeping this as one value prevents the image-create, memory-export and
+/// import contract from drifting apart. Direct-optimal scanout images use the
+/// DMA_BUF variant; ordinary UMD images use OPAQUE_FD.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OptimalImageTransport {
+    OpaqueFd,
+    CrossContextDmaBuf,
+}
+
+impl OptimalImageTransport {
+    const fn handle_type(self) -> u32 {
+        match self {
+            Self::OpaqueFd => EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD,
+            Self::CrossContextDmaBuf => EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF,
+        }
+    }
+}
 const DRM_FORMAT_MOD_LINEAR: u64 = 0;
 const IMAGE_TYPE_2D: u32 = 1;
+const FORMAT_R8G8B8A8_UNORM: u32 = 37;
+const FORMAT_R8G8B8A8_SRGB: u32 = 43;
 const FORMAT_B8G8R8A8_UNORM: u32 = 44;
+const FORMAT_B8G8R8A8_SRGB: u32 = 50;
+const FORMAT_A2B10G10R10_UNORM_PACK32: u32 = 64;
+const FORMAT_R16G16B16A16_SFLOAT: u32 = 97;
 // VK_IMAGE_TILING_OPTIMAL = 0, VK_IMAGE_TILING_LINEAR = 1. This was 0 (OPTIMAL),
 // so create_linear_scanout_image built a TILED image → device-local-only
 // memoryTypeBits (0x3, no host-visible) → choose_host_visible_memory_type failed
@@ -124,6 +158,7 @@ const IMAGE_USAGE_TRANSFER_DST: u32 = 0x0000_0002;
 const IMAGE_USAGE_SAMPLED: u32 = 0x0000_0004;
 const IMAGE_USAGE_STORAGE: u32 = 0x0000_0008;
 const IMAGE_USAGE_COLOR_ATTACHMENT: u32 = 0x0000_0010;
+const BUFFER_USAGE_TRANSFER_DST: u32 = 0x0000_0002;
 const IMAGE_CREATE_MUTABLE_FORMAT: u32 = 0x0000_0008;
 const SHARING_MODE_EXCLUSIVE: u32 = 0;
 const IMAGE_LAYOUT_UNDEFINED: u32 = 0;
@@ -222,11 +257,22 @@ pub struct ScanoutImageBlob {
     pub plane_offset: u32,
 }
 
+/// KMD-owned OPTIMAL image exported as a cross-context DMA_BUF resource.
+///
+/// Unlike [`ScanoutImageBlob`], this image has no linear row layout.  Its
+/// Vulkan image create-info and external-memory transport are the complete
+/// storage contract; callers must never reinterpret the backing as a buffer.
+pub struct OptimalImageBlob {
+    pub blob: HostVisibleBlob,
+    pub image_id: u64,
+    pub memory_type_index: u32,
+}
+
 /// Persistent Vulkan objects for copying one authoritative WDDM primary into
 /// the adapter-owned LINEAR scanout image.
 ///
 /// Creation is deliberately expensive and submission deliberately cheap:
-/// [`VenusClient::prepare_optimal_bgra_copy`] imports the primary once and
+/// [`VenusClient::prepare_optimal_scanout_copy`] imports the primary once and
 /// records one `SIMULTANEOUS_USE` command buffer; each display tick then calls
 /// [`VenusClient::submit_prepared_image_copy`], which only enqueues that already
 /// recorded buffer. The object must remain alive until
@@ -244,6 +290,13 @@ pub struct PreparedImageCopy {
     /// `VkDeviceMemory` imported through `VkImportMemoryResourceInfoMESA`, or
     /// zero for a borrowed source.
     pub source_memory_id: u64,
+    /// KMD-owned OPTIMAL BGRA scratch used only when the Windows-selected
+    /// primary format differs from the physical BGRA scanout format.
+    pub conversion_image_id: u64,
+    pub conversion_memory_id: u64,
+    /// Pool retaining the one-time UNDEFINED-to-GENERAL transition for the
+    /// conversion image.
+    pub conversion_init_pool_id: u64,
     /// Pool owning `command_buffer_id`; retained while submissions may be live.
     pub command_pool_id: u64,
     /// Reusable source-acquire/copy/release command buffer.
@@ -252,6 +305,311 @@ pub struct PreparedImageCopy {
     pub target_image_id: u64,
     pub width: u32,
     pub height: u32,
+}
+
+/// Exact external-allocation contract for recreating one ordinary Helios/DXVK
+/// shared OPTIMAL Present image in the kernel Venus device.
+///
+/// Construction validates the shape once. Cache equality includes every Vulkan
+/// memory-requirements input rather than relying on resource-id heuristics.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct OptimalPresentImageDesc {
+    resource_id: u32,
+    allocation_size: u64,
+    memory_type_index: u32,
+    width: u32,
+    height: u32,
+    ddi_bind_flags: u32,
+    dxgi_format: u32,
+    transport: OptimalImageTransport,
+}
+
+impl OptimalPresentImageDesc {
+    fn new(
+        resource_id: u32,
+        allocation_size: u64,
+        memory_type_index: u32,
+        width: u32,
+        height: u32,
+        ddi_bind_flags: u32,
+        dxgi_format: u32,
+        transport: OptimalImageTransport,
+    ) -> Option<Self> {
+        (resource_id != 0
+            && allocation_size != 0
+            && width != 0
+            && height != 0
+            && PresentPixelFormat::from_dxgi(dxgi_format).is_some())
+        .then_some(Self {
+            resource_id,
+            allocation_size,
+            memory_type_index,
+            width,
+            height,
+            ddi_bind_flags,
+            dxgi_format,
+            transport,
+        })
+    }
+
+    fn pixel_format(self) -> PresentPixelFormat {
+        PresentPixelFormat::from_dxgi(self.dxgi_format)
+            .expect("validated OptimalPresentImageDesc format")
+    }
+
+    /// Ordinary UMD-created shared images use the renderer's OPAQUE_FD
+    /// transport. Keeping this constructor distinct from the DMA_BUF variant
+    /// prevents Present from silently importing one allocation with the other
+    /// image-memory contract.
+    pub fn new_opaque_fd(
+        resource_id: u32,
+        allocation_size: u64,
+        memory_type_index: u32,
+        width: u32,
+        height: u32,
+        ddi_bind_flags: u32,
+        dxgi_format: u32,
+    ) -> Option<Self> {
+        Self::new(
+            resource_id,
+            allocation_size,
+            memory_type_index,
+            width,
+            height,
+            ddi_bind_flags,
+            dxgi_format,
+            OptimalImageTransport::OpaqueFd,
+        )
+    }
+
+    /// KMD GDI textures and direct-optimal scanout images are exported through
+    /// DMA_BUF/CROSS_DEVICE so render-server contexts can attach them.
+    pub fn new_cross_context_dma_buf(
+        resource_id: u32,
+        allocation_size: u64,
+        memory_type_index: u32,
+        width: u32,
+        height: u32,
+        ddi_bind_flags: u32,
+        dxgi_format: u32,
+    ) -> Option<Self> {
+        Self::new(
+            resource_id,
+            allocation_size,
+            memory_type_index,
+            width,
+            height,
+            ddi_bind_flags,
+            dxgi_format,
+            OptimalImageTransport::CrossContextDmaBuf,
+        )
+    }
+}
+
+/// Exact contract for a KMD-created standard Present destination.
+///
+/// These allocations are byte-addressed, host-visible Venus blobs. The UMD
+/// imports them as `VkBuffer` and performs its own pitch-correct
+/// buffer-to-private-image staging before sampling. Giving the same memory an
+/// OPTIMAL `VkImage` interpretation is invalid and was the `.146` Present
+/// failure on NVIDIA.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct PresentBufferDesc {
+    resource_id: u32,
+    allocation_size: u64,
+    memory_type_index: u32,
+    width: u32,
+    height: u32,
+    pitch: u32,
+    dxgi_format: u32,
+}
+
+impl PresentBufferDesc {
+    pub fn new(
+        resource_id: u32,
+        allocation_size: u64,
+        memory_type_index: u32,
+        width: u32,
+        height: u32,
+        pitch: u32,
+        dxgi_format: u32,
+    ) -> Option<Self> {
+        let pixel_format = PresentPixelFormat::from_dxgi(dxgi_format)?;
+        let row_bytes = width.checked_mul(pixel_format.bytes_per_pixel())?;
+        let content_size = u64::from(pitch).checked_mul(u64::from(height))?;
+        (resource_id != 0
+            && allocation_size != 0
+            && width != 0
+            && height != 0
+            && pitch >= row_bytes
+            && pitch % pixel_format.bytes_per_pixel() == 0
+            && content_size <= allocation_size)
+            .then_some(Self {
+                resource_id,
+                allocation_size,
+                memory_type_index,
+                width,
+                height,
+                pitch,
+                dxgi_format,
+            })
+    }
+
+    fn pixel_format(self) -> PresentPixelFormat {
+        PresentPixelFormat::from_dxgi(self.dxgi_format).expect("validated PresentBufferDesc format")
+    }
+}
+
+/// Exact destination interpretation selected from the KMD allocation's
+/// versioned `kind` field.
+///
+/// CPU-visible standard allocations are pitched byte buffers; the standard GDI
+/// texture subtype and ordinary UMD/Venus allocations are OPTIMAL images.
+/// Keeping the alternatives in the type system prevents the `.146` class of
+/// bugs where the same external memory was accidentally reinterpreted using the
+/// wrong Vulkan object type.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PresentDestinationDesc {
+    StandardBuffer(PresentBufferDesc),
+    OptimalImage(OptimalPresentImageDesc),
+}
+
+impl PresentDestinationDesc {
+    fn resource_id(self) -> u32 {
+        match self {
+            Self::StandardBuffer(desc) => desc.resource_id,
+            Self::OptimalImage(desc) => desc.resource_id,
+        }
+    }
+
+    fn width(self) -> u32 {
+        match self {
+            Self::StandardBuffer(desc) => desc.width,
+            Self::OptimalImage(desc) => desc.width,
+        }
+    }
+
+    fn height(self) -> u32 {
+        match self {
+            Self::StandardBuffer(desc) => desc.height,
+            Self::OptimalImage(desc) => desc.height,
+        }
+    }
+
+    fn dxgi_format(self) -> u32 {
+        match self {
+            Self::StandardBuffer(desc) => desc.dxgi_format,
+            Self::OptimalImage(desc) => desc.dxgi_format,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ImportedOptimalImage {
+    desc: OptimalPresentImageDesc,
+    image_id: u64,
+    memory_id: u64,
+}
+
+/// One `VkDeviceMemory` allocation created by [`VenusClient::allocate_memory_blob`]
+/// and exposed as exactly one HOST3D resource.
+///
+/// This is the authoritative same-device identity for a KMD standard allocation.
+/// Present may borrow this memory for a buffer binding; it must never manufacture
+/// a second imported `VkDeviceMemory` for the same resource.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct OwnedMemoryBlob {
+    resource_id: u32,
+    memory_id: u64,
+    allocation_size: u64,
+    memory_type_index: u32,
+}
+
+/// A Present destination buffer bound to KMD-owned memory.
+///
+/// The absence of an "owned memory" or "attached resource" variant is
+/// intentional: dropping this cache entry destroys only `buffer_id`. The
+/// AllocationContext remains the sole owner of the memory and virtio resource.
+#[derive(Clone, Copy)]
+struct BorrowedPresentBuffer {
+    desc: PresentBufferDesc,
+    buffer_id: u64,
+    memory: OwnedMemoryBlob,
+}
+
+struct PreparedPresentBlt {
+    source_resource_id: u32,
+    destination_resource_id: u32,
+    command_pool_id: u64,
+    command_buffer_id: u64,
+    /// Optional KMD-owned conversion scratch. It is an internal command
+    /// dependency only; it never substitutes for either Windows allocation.
+    conversion_image_id: u64,
+    conversion_memory_id: u64,
+    conversion_init_pool_id: u64,
+    last_wire_fence_id: u64,
+    submit_count: u32,
+    probe_done: bool,
+}
+
+const MAX_PRESENT_IMAGES: usize = 32;
+const MAX_PRESENT_BUFFERS: usize = 16;
+const MAX_PRESENT_BLITS: usize = 32;
+/// Every owned memory blob is also tracked by VirtioGpu's bounded blob table,
+/// so the transport's capacity is an exact upper bound rather than a second,
+/// divergent resource limit.
+const MAX_OWNED_MEMORY_BLOBS: usize = super::gpu::MAX_BLOBS;
+
+/// Complete D3D11/DXGI swapchain format set that Helios can recreate as an
+/// exact Vulkan image alias.
+///
+/// Values are selected only from the creator's retained DXGI format. Typeless,
+/// integer, depth, compressed, and XR-bias formats are intentionally excluded:
+/// DXVK does not expose them as importable D3D11 swapchain storage.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PresentPixelFormat {
+    Rgba8Unorm,
+    Rgba8Srgb,
+    Bgra8Unorm,
+    Bgrx8Unorm,
+    Bgra8Srgb,
+    Bgrx8Srgb,
+    Rgb10a2Unorm,
+    Rgba16Float,
+}
+
+impl PresentPixelFormat {
+    fn from_dxgi(dxgi_format: u32) -> Option<Self> {
+        match dxgi_format {
+            10 => Some(Self::Rgba16Float),
+            24 => Some(Self::Rgb10a2Unorm),
+            28 => Some(Self::Rgba8Unorm),
+            29 => Some(Self::Rgba8Srgb),
+            87 => Some(Self::Bgra8Unorm),
+            88 => Some(Self::Bgrx8Unorm),
+            91 => Some(Self::Bgra8Srgb),
+            93 => Some(Self::Bgrx8Srgb),
+            _ => None,
+        }
+    }
+
+    fn vk_format(self) -> u32 {
+        match self {
+            Self::Rgba8Unorm => FORMAT_R8G8B8A8_UNORM,
+            Self::Rgba8Srgb => FORMAT_R8G8B8A8_SRGB,
+            Self::Bgra8Unorm | Self::Bgrx8Unorm => FORMAT_B8G8R8A8_UNORM,
+            Self::Bgra8Srgb | Self::Bgrx8Srgb => FORMAT_B8G8R8A8_SRGB,
+            Self::Rgb10a2Unorm => FORMAT_A2B10G10R10_UNORM_PACK32,
+            Self::Rgba16Float => FORMAT_R16G16B16A16_SFLOAT,
+        }
+    }
+
+    fn bytes_per_pixel(self) -> u32 {
+        match self {
+            Self::Rgba16Float => 8,
+            _ => 4,
+        }
+    }
 }
 
 /// A kernel mapping of a guest-physical sub-range of the host-visible BAR window.
@@ -534,6 +892,18 @@ pub struct VenusClient {
     copy_target_image_id: u64,
     copy_target_init_pool_id: u64,
     copy_target_init_command_buffer_id: u64,
+    /// App/DWM BLT imports and recorded copies. Both vectors are preallocated
+    /// and capacity-bounded. Every access is serialized by
+    /// AdapterContext::with_venus_client, so setup/submission/teardown cannot
+    /// race through incidental call ordering.
+    present_images: Vec<ImportedOptimalImage>,
+    present_buffers: Vec<BorrowedPresentBuffer>,
+    present_blits: Vec<PreparedPresentBlt>,
+    /// Exact identities of `allocate_memory_blob` allocations. This registry
+    /// turns a standard Present destination into a checked borrow of the
+    /// already-live local `VkDeviceMemory`; no resource-id heuristic or
+    /// same-device re-import is permitted.
+    owned_memory_blobs: Vec<OwnedMemoryBlob>,
 }
 
 impl VenusClient {
@@ -726,6 +1096,9 @@ impl VenusClient {
         mappable: bool,
         shareable: bool,
     ) -> Result<HostVisibleBlob, VirtioError> {
+        if self.owned_memory_blobs.len() >= MAX_OWNED_MEMORY_BLOBS {
+            return Err(VirtioError::OutOfMemory);
+        }
         let size = round_up_page(size.max(4096));
         let memory_id = self.alloc_handle();
         {
@@ -769,15 +1142,34 @@ impl VenusClient {
         if shareable {
             flags |= VIRTIO_GPU_BLOB_FLAG_USE_SHAREABLE;
         }
-        let res_id = ctrl::resource_create_blob(
+        let res_id = match ctrl::resource_create_blob(
             adapter,
             self.ctx_id,
             VIRTIO_GPU_BLOB_MEM_HOST3D,
             flags,
             memory_id,
             size,
-        )?;
+        ) {
+            Ok(resource_id) => resource_id,
+            Err(e) => {
+                // The Vulkan allocation exists but never became an owned blob.
+                // Reclaim it through the raw object path; registry-aware
+                // `free_memory_blob` is reserved for successfully published
+                // allocation identities.
+                let _ = self.free_memory_object(adapter, memory_id);
+                return Err(e);
+            }
+        };
         let _ = adapter.with_virtio(|v| v.note_blob_size(res_id, size));
+        // Capacity was reserved above, so push cannot allocate. Publish the
+        // identity only after both Vulkan allocation and resource creation
+        // succeeded.
+        self.owned_memory_blobs.push(OwnedMemoryBlob {
+            resource_id: res_id,
+            memory_id,
+            allocation_size: size,
+            memory_type_index: self.memory_type_index,
+        });
         Ok(HostVisibleBlob {
             blob_id: memory_id,
             res_id,
@@ -961,13 +1353,18 @@ impl VenusClient {
     /// kernel Venus device. `ddi_bind_flags` is the authoritative CreateResource
     /// value retained by the allocation context; deriving usage from geometry
     /// would be a content-corrupting heuristic on NVIDIA.
-    fn create_optimal_bgra_source_alias(
+    fn create_optimal_present_image_alias(
         &mut self,
         adapter: &AdapterContext,
         width: u32,
         height: u32,
         ddi_bind_flags: u32,
+        dxgi_format: u32,
+        transport: OptimalImageTransport,
     ) -> Result<u64, VirtioError> {
+        let vk_format = PresentPixelFormat::from_dxgi(dxgi_format)
+            .ok_or(VirtioError::DeviceError)?
+            .vk_format();
         // D3D11/DXVK starts every texture with transfer source+destination. The
         // DDI pipeline bits are numerically identical for SRV (0x8) and RTV
         // (0x20); DDI UAV (0x100) is translated to API UAV (0x80), hence the
@@ -992,19 +1389,19 @@ impl VenusClient {
         w.u64(self.device_id);
         w.count(true);
         w.i32(ST_IMAGE_CREATE_INFO);
-        // This matches DXVK's ordinary KMT-shared resource shape. Its memory is
-        // imported below by venus resource id, but VkImage external compatibility
-        // is still keyed by OPAQUE_FD on the renderer device.
+        // Imported ordinary UMD resources use OPAQUE_FD. KMD-created GDI
+        // textures use DMA_BUF because virglrenderer's render-server proxy can
+        // carry DMA_BUF, but cannot attach an OPAQUE_FD to another context.
         w.count(true);
         w.i32(ST_EXTERNAL_MEMORY_IMAGE_CREATE_INFO);
         w.count(false);
-        w.u32(EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD);
-        // Shared BGRA retains MUTABLE_FORMAT but intentionally has no format-list
-        // pNext (DXVK suppresses that list to disable per-image compression
-        // metadata which cannot survive cross-device imports).
+        w.u32(transport.handle_type());
+        // Shared color images retain MUTABLE_FORMAT but intentionally have no
+        // format-list pNext (DXVK suppresses that list to disable per-image
+        // compression metadata which cannot survive cross-device imports).
         w.u32(IMAGE_CREATE_MUTABLE_FORMAT);
         w.u32(IMAGE_TYPE_2D);
-        w.u32(FORMAT_B8G8R8A8_UNORM);
+        w.u32(vk_format);
         w.u32(width);
         w.u32(height);
         w.u32(1); // depth
@@ -1041,6 +1438,179 @@ impl VenusClient {
         Ok(image_id)
     }
 
+    /// Create a private OPTIMAL transfer image used only as an explicit
+    /// conversion step between the two allocations supplied by Windows.
+    ///
+    /// Unlike an imported Present image this has no external-memory pNext and
+    /// no virtio resource identity. It cannot be mistaken for, opened as, or
+    /// substituted for either the source or redirected destination.
+    fn create_present_conversion_image(
+        &mut self,
+        adapter: &AdapterContext,
+        width: u32,
+        height: u32,
+        vk_format: u32,
+    ) -> Result<u64, VirtioError> {
+        if width == 0 || height == 0 {
+            return Err(VirtioError::DeviceError);
+        }
+        let image_id = self.alloc_handle();
+        let mut w = Writer::new();
+        w.header(CMD_CREATE_IMAGE, CMD_FLAG_GENERATE_REPLY);
+        w.u64(self.device_id);
+        w.count(true);
+        w.i32(ST_IMAGE_CREATE_INFO);
+        w.count(false); // pNext: internal image, no external-memory contract
+        w.u32(0); // flags
+        w.u32(IMAGE_TYPE_2D);
+        w.u32(vk_format);
+        w.u32(width);
+        w.u32(height);
+        w.u32(1); // depth
+        w.u32(1); // mipLevels
+        w.u32(1); // arrayLayers
+        w.u32(SAMPLE_COUNT_1);
+        w.u32(0); // VK_IMAGE_TILING_OPTIMAL
+        w.u32(IMAGE_USAGE_TRANSFER_SRC | IMAGE_USAGE_TRANSFER_DST);
+        w.u32(SHARING_MODE_EXCLUSIVE);
+        w.u32(0); // queueFamilyIndexCount
+        w.count(false);
+        w.u32(IMAGE_LAYOUT_UNDEFINED);
+        w.count(false); // pAllocator
+        w.count(true);
+        w.u64(image_id);
+        self.ring_command_reply(adapter, w.as_slice())?;
+
+        let mut r = ReplyReader::new(&self.reply_map);
+        if r.read_i32()? as u32 != CMD_CREATE_IMAGE || r.read_i32()? != 0 {
+            return Err(VirtioError::DeviceError);
+        }
+        if r.read_u64()? == 0 || r.read_u64()? == 0 {
+            return Err(VirtioError::DeviceError);
+        }
+        Ok(image_id)
+    }
+
+    /// Allocate non-exported memory dedicated to an internal conversion image.
+    fn allocate_present_conversion_memory(
+        &mut self,
+        adapter: &AdapterContext,
+        image_id: u64,
+        size: u64,
+        memory_type_index: u32,
+    ) -> Result<u64, VirtioError> {
+        let memory_id = self.alloc_handle();
+        let mut w = Writer::new();
+        w.header(CMD_ALLOCATE_MEMORY, CMD_FLAG_GENERATE_REPLY);
+        w.u64(self.device_id);
+        w.count(true);
+        w.i32(ST_MEMORY_ALLOCATE_INFO);
+        w.count(true);
+        w.i32(ST_MEMORY_DEDICATED_ALLOCATE_INFO);
+        w.count(false);
+        w.u64(image_id);
+        w.u64(0); // buffer
+        w.u64(size);
+        w.u32(memory_type_index);
+        w.count(false); // pAllocator
+        w.count(true);
+        w.u64(memory_id);
+        self.ring_command_reply(adapter, w.as_slice())?;
+
+        let mut r = ReplyReader::new(&self.reply_map);
+        if r.read_i32()? as u32 != CMD_ALLOCATE_MEMORY || r.read_i32()? != 0 {
+            return Err(VirtioError::DeviceError);
+        }
+        Ok(memory_id)
+    }
+
+    /// Transition a newly-created conversion image to GENERAL exactly once.
+    /// Queue ordering makes every later reusable Present command execute after
+    /// this setup submission; retaining the pool preserves command lifetime.
+    fn initialize_present_conversion_image(
+        &mut self,
+        adapter: &AdapterContext,
+        image_id: u64,
+    ) -> Result<u64, VirtioError> {
+        let pool_id = self.create_command_pool(adapter)?;
+        let command_buffer_id = match self.allocate_command_buffer(adapter, pool_id) {
+            Ok(id) => id,
+            Err(e) => {
+                let _ = self.destroy_command_pool(adapter, pool_id);
+                return Err(e);
+            }
+        };
+        let record_result = (|| {
+            self.begin_command_buffer(adapter, command_buffer_id)?;
+            self.cmd_image_barrier(
+                adapter,
+                command_buffer_id,
+                image_id,
+                PIPELINE_STAGE_TOP_OF_PIPE,
+                PIPELINE_STAGE_TRANSFER,
+                0,
+                ACCESS_TRANSFER_WRITE,
+                IMAGE_LAYOUT_UNDEFINED,
+                IMAGE_LAYOUT_GENERAL,
+                QUEUE_FAMILY_IGNORED,
+                QUEUE_FAMILY_IGNORED,
+            )?;
+            self.end_command_buffer(adapter, command_buffer_id)
+        })();
+        if let Err(e) = record_result {
+            let _ = self.destroy_command_pool(adapter, pool_id);
+            return Err(e);
+        }
+        // On an ambiguous submission failure, leave the pool alive for Venus
+        // context teardown. Destroying it could free an in-flight command.
+        self.queue_submit_command_buffer(adapter, command_buffer_id, 0)?;
+        Ok(pool_id)
+    }
+
+    fn create_bound_present_conversion_image(
+        &mut self,
+        adapter: &AdapterContext,
+        width: u32,
+        height: u32,
+        format: PresentPixelFormat,
+    ) -> Result<(u64, u64), VirtioError> {
+        let image_id =
+            self.create_present_conversion_image(adapter, width, height, format.vk_format())?;
+        let (required_size, memory_type_bits) =
+            match self.image_memory_requirements(adapter, image_id) {
+                Ok(requirements) => requirements,
+                Err(e) => {
+                    let _ = self.destroy_image_on_ring(adapter, image_id);
+                    return Err(e);
+                }
+            };
+        let memory_type_index = match self.choose_device_local_memory_type(memory_type_bits) {
+            Some(index) => index,
+            None => {
+                let _ = self.destroy_image_on_ring(adapter, image_id);
+                return Err(VirtioError::DeviceError);
+            }
+        };
+        let memory_id = match self.allocate_present_conversion_memory(
+            adapter,
+            image_id,
+            required_size,
+            memory_type_index,
+        ) {
+            Ok(id) => id,
+            Err(e) => {
+                let _ = self.destroy_image_on_ring(adapter, image_id);
+                return Err(e);
+            }
+        };
+        if let Err(e) = self.bind_image_memory(adapter, image_id, memory_id) {
+            let _ = self.destroy_image_on_ring(adapter, image_id);
+            let _ = self.free_memory_object(adapter, memory_id);
+            return Err(e);
+        }
+        Ok((image_id, memory_id))
+    }
+
     fn image_memory_requirements(
         &mut self,
         adapter: &AdapterContext,
@@ -1061,6 +1631,73 @@ impl VenusClient {
         }
         if r.read_u64()? == 0 {
             diag(0x0105);
+            return Err(VirtioError::DeviceError);
+        }
+        let size = r.read_u64()?;
+        let _alignment = r.read_u64()?;
+        let memory_type_bits = r.read_u32()?;
+        Ok((size, memory_type_bits))
+    }
+
+    /// Create a plain local buffer for a same-device memory borrow.
+    ///
+    /// The allocation was created by this Venus device and is not being
+    /// imported here. Giving this buffer an external-memory create chain would
+    /// assert a second, false ownership/transport contract.
+    fn create_local_present_destination_buffer(
+        &mut self,
+        adapter: &AdapterContext,
+        size: u64,
+    ) -> Result<u64, VirtioError> {
+        let buffer_id = self.alloc_handle();
+        let mut w = Writer::new();
+        w.header(CMD_CREATE_BUFFER, CMD_FLAG_GENERATE_REPLY);
+        w.u64(self.device_id);
+        w.count(true);
+        w.i32(ST_BUFFER_CREATE_INFO);
+        w.count(false); // pNext: local buffer, no external-memory contract
+        w.u32(0); // VkBufferCreateFlags
+        w.u64(size);
+        w.u32(BUFFER_USAGE_TRANSFER_DST);
+        w.u32(SHARING_MODE_EXCLUSIVE);
+        w.u32(0); // queueFamilyIndexCount
+        w.count(false);
+        w.count(false); // pAllocator
+        w.count(true);
+        w.u64(buffer_id);
+        self.ring_command_reply(adapter, w.as_slice())?;
+
+        let mut r = ReplyReader::new(&self.reply_map);
+        let cmd = r.read_i32()?;
+        if cmd as u32 != CMD_CREATE_BUFFER {
+            return Err(VirtioError::DeviceError);
+        }
+        let result = r.read_i32()?;
+        if result != 0 {
+            crate::diag::record_named_bytes(b"PBBufVr", result as u32);
+            return Err(VirtioError::DeviceError);
+        }
+        if r.read_u64()? == 0 || r.read_u64()? == 0 {
+            return Err(VirtioError::DeviceError);
+        }
+        Ok(buffer_id)
+    }
+
+    fn buffer_memory_requirements(
+        &mut self,
+        adapter: &AdapterContext,
+        buffer_id: u64,
+    ) -> Result<(u64, u32), VirtioError> {
+        let mut w = Writer::new();
+        w.header(CMD_GET_BUFFER_MEMORY_REQUIREMENTS, CMD_FLAG_GENERATE_REPLY);
+        w.u64(self.device_id);
+        w.u64(buffer_id);
+        w.count(true);
+        self.ring_command_reply(adapter, w.as_slice())?;
+
+        let mut r = ReplyReader::new(&self.reply_map);
+        let cmd = r.read_i32()?;
+        if cmd as u32 != CMD_GET_BUFFER_MEMORY_REQUIREMENTS || r.read_u64()? == 0 {
             return Err(VirtioError::DeviceError);
         }
         let size = r.read_u64()?;
@@ -1216,6 +1853,28 @@ impl VenusClient {
         }
         if r.read_i32()? != 0 {
             diag(0x0109);
+            return Err(VirtioError::DeviceError);
+        }
+        Ok(())
+    }
+
+    fn bind_buffer_memory(
+        &mut self,
+        adapter: &AdapterContext,
+        buffer_id: u64,
+        memory_id: u64,
+    ) -> Result<(), VirtioError> {
+        let mut w = Writer::new();
+        w.header(CMD_BIND_BUFFER_MEMORY, CMD_FLAG_GENERATE_REPLY);
+        w.u64(self.device_id);
+        w.u64(buffer_id);
+        w.u64(memory_id);
+        w.u64(0);
+        self.ring_command_reply(adapter, w.as_slice())?;
+
+        let mut r = ReplyReader::new(&self.reply_map);
+        let cmd = r.read_i32()?;
+        if cmd as u32 != CMD_BIND_BUFFER_MEMORY || r.read_i32()? != 0 {
             return Err(VirtioError::DeviceError);
         }
         Ok(())
@@ -1460,6 +2119,43 @@ impl VenusClient {
         self.ring_command_noreply(adapter, w.as_slice())
     }
 
+    fn cmd_buffer_barrier(
+        &mut self,
+        adapter: &AdapterContext,
+        command_buffer_id: u64,
+        buffer_id: u64,
+        buffer_size: u64,
+        src_stage: u32,
+        dst_stage: u32,
+        src_access: u32,
+        dst_access: u32,
+        src_queue_family: u32,
+        dst_queue_family: u32,
+    ) -> Result<(), VirtioError> {
+        let mut w = Writer::new();
+        w.header(CMD_PIPELINE_BARRIER, 0);
+        w.u64(command_buffer_id);
+        w.u32(src_stage);
+        w.u32(dst_stage);
+        w.u32(0); // dependencyFlags
+        w.u32(0); // memoryBarrierCount
+        w.count(false);
+        w.u32(1); // bufferMemoryBarrierCount
+        w.u64(1); // pBufferMemoryBarriers array_size
+        w.i32(ST_BUFFER_MEMORY_BARRIER);
+        w.count(false);
+        w.u32(src_access);
+        w.u32(dst_access);
+        w.u32(src_queue_family);
+        w.u32(dst_queue_family);
+        w.u64(buffer_id);
+        w.u64(0); // offset
+        w.u64(buffer_size);
+        w.u32(0); // imageMemoryBarrierCount
+        w.count(false);
+        self.ring_command_noreply(adapter, w.as_slice())
+    }
+
     fn cmd_copy_image(
         &mut self,
         adapter: &AdapterContext,
@@ -1497,6 +2193,96 @@ impl VenusClient {
         w.i32(0);
         w.i32(0);
         // extent
+        w.u32(width);
+        w.u32(height);
+        w.u32(1);
+        self.ring_command_noreply(adapter, w.as_slice())
+    }
+
+    fn cmd_blit_image(
+        &mut self,
+        adapter: &AdapterContext,
+        command_buffer_id: u64,
+        source_image_id: u64,
+        target_image_id: u64,
+        width: u32,
+        height: u32,
+    ) -> Result<(), VirtioError> {
+        let width = i32::try_from(width).map_err(|_| VirtioError::DeviceError)?;
+        let height = i32::try_from(height).map_err(|_| VirtioError::DeviceError)?;
+        let mut w = Writer::new();
+        w.header(CMD_BLIT_IMAGE, 0);
+        w.u64(command_buffer_id);
+        w.u64(source_image_id);
+        w.u32(IMAGE_LAYOUT_GENERAL);
+        w.u64(target_image_id);
+        w.u32(IMAGE_LAYOUT_GENERAL);
+        w.u32(1); // regionCount
+        w.u64(1); // pRegions array_size
+                  // VkImageBlit.srcSubresource
+        w.u32(IMAGE_ASPECT_COLOR);
+        w.u32(0); // mipLevel
+        w.u32(0); // baseArrayLayer
+        w.u32(1); // layerCount
+        w.u64(2); // srcOffsets array_size
+        w.i32(0);
+        w.i32(0);
+        w.i32(0);
+        w.i32(width);
+        w.i32(height);
+        w.i32(1);
+        // VkImageBlit.dstSubresource
+        w.u32(IMAGE_ASPECT_COLOR);
+        w.u32(0);
+        w.u32(0);
+        w.u32(1);
+        w.u64(2); // dstOffsets array_size
+        w.i32(0);
+        w.i32(0);
+        w.i32(0);
+        w.i32(width);
+        w.i32(height);
+        w.i32(1);
+        w.u32(0); // VK_FILTER_NEAREST
+        self.ring_command_noreply(adapter, w.as_slice())
+    }
+
+    fn cmd_copy_image_to_buffer(
+        &mut self,
+        adapter: &AdapterContext,
+        command_buffer_id: u64,
+        source_image_id: u64,
+        destination_buffer_id: u64,
+        width: u32,
+        height: u32,
+        pitch: u32,
+        bytes_per_pixel: u32,
+    ) -> Result<(), VirtioError> {
+        if bytes_per_pixel == 0
+            || pitch < width.saturating_mul(bytes_per_pixel)
+            || pitch % bytes_per_pixel != 0
+        {
+            return Err(VirtioError::DeviceError);
+        }
+
+        let mut w = Writer::new();
+        w.header(CMD_COPY_IMAGE_TO_BUFFER, 0);
+        w.u64(command_buffer_id);
+        w.u64(source_image_id);
+        w.u32(IMAGE_LAYOUT_GENERAL);
+        w.u64(destination_buffer_id);
+        w.u32(1); // regionCount
+        w.u64(1); // pRegions array_size
+        w.u64(0); // bufferOffset
+        w.u32(pitch / bytes_per_pixel); // bufferRowLength in texels
+        w.u32(height); // bufferImageHeight in texels
+        w.u32(IMAGE_ASPECT_COLOR);
+        w.u32(0); // mipLevel
+        w.u32(0); // baseArrayLayer
+        w.u32(1); // layerCount
+        w.i32(0); // imageOffset.x
+        w.i32(0); // imageOffset.y
+        w.i32(0); // imageOffset.z
         w.u32(width);
         w.u32(height);
         w.u32(1);
@@ -1708,6 +2494,19 @@ impl VenusClient {
         self.ring_command_noreply(adapter, w.as_slice())
     }
 
+    fn destroy_buffer_on_ring(
+        &mut self,
+        adapter: &AdapterContext,
+        buffer_id: u64,
+    ) -> Result<(), VirtioError> {
+        let mut w = Writer::new();
+        w.header(CMD_DESTROY_BUFFER, 0);
+        w.u64(self.device_id);
+        w.u64(buffer_id);
+        w.count(false);
+        self.ring_command_noreply(adapter, w.as_slice())
+    }
+
     fn cleanup_imported_source_alias(
         &mut self,
         adapter: &AdapterContext,
@@ -1722,6 +2521,210 @@ impl VenusClient {
             self.free_memory_blob(adapter, memory_id)?;
         }
         ctrl::ctx_detach_resource(adapter, self.ctx_id, resource_id)
+    }
+
+    fn cleanup_borrowed_present_buffer(
+        &mut self,
+        adapter: &AdapterContext,
+        buffer_id: u64,
+    ) -> Result<(), VirtioError> {
+        if buffer_id != 0 {
+            self.destroy_buffer_on_ring(adapter, buffer_id)?;
+        }
+        Ok(())
+    }
+
+    /// Import one validated ordinary shared OPTIMAL image into the persistent
+    /// KMD Venus device. The imported image exactly reproduces the creator's
+    /// extent, usage and external-memory allocation contract.
+    fn import_optimal_present_image(
+        &mut self,
+        adapter: &AdapterContext,
+        desc: OptimalPresentImageDesc,
+    ) -> Result<ImportedOptimalImage, VirtioError> {
+        if desc.memory_type_index >= self.memory_type_count {
+            return Err(VirtioError::DeviceError);
+        }
+
+        ctrl::attach_resource_checked(adapter, self.ctx_id, desc.resource_id)?;
+        let image_id = match self.create_optimal_present_image_alias(
+            adapter,
+            desc.width,
+            desc.height,
+            desc.ddi_bind_flags,
+            desc.dxgi_format,
+            desc.transport,
+        ) {
+            Ok(image_id) => image_id,
+            Err(e) => {
+                let _ = ctrl::ctx_detach_resource(adapter, self.ctx_id, desc.resource_id);
+                return Err(e);
+            }
+        };
+
+        let (required_size, memory_type_bits) = match self
+            .image_memory_requirements(adapter, image_id)
+        {
+            Ok(requirements) => requirements,
+            Err(e) => {
+                let _ = self.cleanup_imported_source_alias(adapter, desc.resource_id, image_id, 0);
+                return Err(e);
+            }
+        };
+        if required_size > desc.allocation_size
+            || (memory_type_bits & (1u32 << desc.memory_type_index)) == 0
+        {
+            let _ = self.cleanup_imported_source_alias(adapter, desc.resource_id, image_id, 0);
+            return Err(VirtioError::DeviceError);
+        }
+
+        let memory_id = match self.allocate_imported_resource_memory(
+            adapter,
+            desc.resource_id,
+            desc.allocation_size,
+            desc.memory_type_index,
+        ) {
+            Ok(memory_id) => memory_id,
+            Err(e) => {
+                let _ = self.cleanup_imported_source_alias(adapter, desc.resource_id, image_id, 0);
+                return Err(e);
+            }
+        };
+        if let Err(e) = self.bind_image_memory(adapter, image_id, memory_id) {
+            let _ =
+                self.cleanup_imported_source_alias(adapter, desc.resource_id, image_id, memory_id);
+            return Err(e);
+        }
+
+        Ok(ImportedOptimalImage {
+            desc,
+            image_id,
+            memory_id,
+        })
+    }
+
+    /// Return a cached immutable import, creating it once if needed.
+    ///
+    /// A resource id observed with a different descriptor is rejected loudly:
+    /// reusing an alias with mismatched Vulkan requirements is memory unsafe,
+    /// while importing two conflicting shapes would make cache identity
+    /// heuristic.
+    fn ensure_present_image(
+        &mut self,
+        adapter: &AdapterContext,
+        desc: OptimalPresentImageDesc,
+    ) -> Result<ImportedOptimalImage, VirtioError> {
+        if let Some(image) = self
+            .present_images
+            .iter()
+            .find(|image| image.desc.resource_id == desc.resource_id)
+            .copied()
+        {
+            return if image.desc == desc {
+                Ok(image)
+            } else {
+                Err(VirtioError::DeviceError)
+            };
+        }
+        if self.present_images.len() >= MAX_PRESENT_IMAGES {
+            return Err(VirtioError::OutOfMemory);
+        }
+        let image = self.import_optimal_present_image(adapter, desc)?;
+        self.present_images.push(image);
+        Ok(image)
+    }
+
+    fn borrow_present_buffer(
+        &mut self,
+        adapter: &AdapterContext,
+        desc: PresentBufferDesc,
+    ) -> Result<BorrowedPresentBuffer, VirtioError> {
+        if desc.memory_type_index >= self.memory_type_count {
+            return Err(VirtioError::DeviceError);
+        }
+
+        crate::diag::record_named_bytes(b"PBImRs", desc.resource_id);
+        crate::diag::record_named_bytes(b"PBImSt", 1);
+        let Some(memory) = self
+            .owned_memory_blobs
+            .iter()
+            .find(|blob| blob.resource_id == desc.resource_id)
+            .copied()
+        else {
+            // PitchedStandardBuffer is a strict local-memory contract. A
+            // resource not created by allocate_memory_blob must be represented
+            // by another destination type; importing it heuristically here
+            // would recreate the failure this path is designed to prevent.
+            crate::diag::record_named_bytes(b"PBImSt", 0xE1);
+            return Err(VirtioError::DeviceError);
+        };
+        if memory.allocation_size != desc.allocation_size
+            || memory.memory_type_index != desc.memory_type_index
+        {
+            crate::diag::record_named_bytes(b"PBImSt", 0xE2);
+            return Err(VirtioError::DeviceError);
+        }
+
+        crate::diag::record_named_bytes(b"PBImSt", 2);
+        let buffer_id =
+            self.create_local_present_destination_buffer(adapter, desc.allocation_size)?;
+
+        crate::diag::record_named_bytes(b"PBImSt", 3);
+        let (required_size, memory_type_bits) =
+            match self.buffer_memory_requirements(adapter, buffer_id) {
+                Ok(requirements) => requirements,
+                Err(e) => {
+                    let _ = self.cleanup_borrowed_present_buffer(adapter, buffer_id);
+                    return Err(e);
+                }
+            };
+        crate::diag::record_named_bytes(b"PBImRq", required_size as u32);
+        crate::diag::record_named_bytes(b"PBImBt", memory_type_bits);
+        if required_size > desc.allocation_size
+            || (memory_type_bits & (1u32 << desc.memory_type_index)) == 0
+        {
+            crate::diag::record_named_bytes(b"PBImSt", 0xE3);
+            let _ = self.cleanup_borrowed_present_buffer(adapter, buffer_id);
+            return Err(VirtioError::DeviceError);
+        }
+
+        crate::diag::record_named_bytes(b"PBImSt", 4);
+        if let Err(e) = self.bind_buffer_memory(adapter, buffer_id, memory.memory_id) {
+            let _ = self.cleanup_borrowed_present_buffer(adapter, buffer_id);
+            return Err(e);
+        }
+        crate::diag::record_named_bytes(b"PBImSt", 0x10);
+
+        Ok(BorrowedPresentBuffer {
+            desc,
+            buffer_id,
+            memory,
+        })
+    }
+
+    fn ensure_present_buffer(
+        &mut self,
+        adapter: &AdapterContext,
+        desc: PresentBufferDesc,
+    ) -> Result<BorrowedPresentBuffer, VirtioError> {
+        if let Some(buffer) = self
+            .present_buffers
+            .iter()
+            .find(|buffer| buffer.desc.resource_id == desc.resource_id)
+            .copied()
+        {
+            return if buffer.desc == desc {
+                Ok(buffer)
+            } else {
+                Err(VirtioError::DeviceError)
+            };
+        }
+        if self.present_buffers.len() >= MAX_PRESENT_BUFFERS {
+            return Err(VirtioError::OutOfMemory);
+        }
+        let buffer = self.borrow_present_buffer(adapter, desc)?;
+        self.present_buffers.push(buffer);
+        Ok(buffer)
     }
 
     /// Put the persistent KMD LINEAR image into GENERAL layout and external
@@ -1900,6 +2903,506 @@ impl VenusClient {
         Ok((command_pool_id, command_buffer_id))
     }
 
+    /// Reusable external-image BLT for authoritative source/destination formats
+    /// that require Vulkan numeric/color conversion.
+    fn record_reusable_image_blit(
+        &mut self,
+        adapter: &AdapterContext,
+        source_image_id: u64,
+        target_image_id: u64,
+        width: u32,
+        height: u32,
+    ) -> Result<(u64, u64), VirtioError> {
+        if source_image_id == 0
+            || target_image_id == 0
+            || source_image_id == target_image_id
+            || width == 0
+            || height == 0
+        {
+            return Err(VirtioError::DeviceError);
+        }
+
+        let command_pool_id = self.create_command_pool(adapter)?;
+        let command_buffer_id = match self.allocate_command_buffer(adapter, command_pool_id) {
+            Ok(id) => id,
+            Err(e) => {
+                let _ = self.destroy_command_pool(adapter, command_pool_id);
+                return Err(e);
+            }
+        };
+        let record_result = (|| {
+            self.begin_command_buffer_with_flags(
+                adapter,
+                command_buffer_id,
+                COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE,
+            )?;
+            self.cmd_image_barrier(
+                adapter,
+                command_buffer_id,
+                source_image_id,
+                PIPELINE_STAGE_TOP_OF_PIPE,
+                PIPELINE_STAGE_TRANSFER,
+                0,
+                ACCESS_TRANSFER_READ,
+                IMAGE_LAYOUT_GENERAL,
+                IMAGE_LAYOUT_GENERAL,
+                QUEUE_FAMILY_EXTERNAL,
+                0,
+            )?;
+            self.cmd_image_barrier(
+                adapter,
+                command_buffer_id,
+                target_image_id,
+                PIPELINE_STAGE_TOP_OF_PIPE,
+                PIPELINE_STAGE_TRANSFER,
+                0,
+                ACCESS_TRANSFER_WRITE,
+                IMAGE_LAYOUT_GENERAL,
+                IMAGE_LAYOUT_GENERAL,
+                QUEUE_FAMILY_EXTERNAL,
+                0,
+            )?;
+            self.cmd_blit_image(
+                adapter,
+                command_buffer_id,
+                source_image_id,
+                target_image_id,
+                width,
+                height,
+            )?;
+            self.cmd_image_barrier(
+                adapter,
+                command_buffer_id,
+                source_image_id,
+                PIPELINE_STAGE_TRANSFER,
+                PIPELINE_STAGE_BOTTOM_OF_PIPE,
+                ACCESS_TRANSFER_READ,
+                0,
+                IMAGE_LAYOUT_GENERAL,
+                IMAGE_LAYOUT_GENERAL,
+                0,
+                QUEUE_FAMILY_EXTERNAL,
+            )?;
+            self.cmd_image_barrier(
+                adapter,
+                command_buffer_id,
+                target_image_id,
+                PIPELINE_STAGE_TRANSFER,
+                PIPELINE_STAGE_BOTTOM_OF_PIPE,
+                ACCESS_TRANSFER_WRITE,
+                0,
+                IMAGE_LAYOUT_GENERAL,
+                IMAGE_LAYOUT_GENERAL,
+                0,
+                QUEUE_FAMILY_EXTERNAL,
+            )?;
+            self.end_command_buffer(adapter, command_buffer_id)
+        })();
+        if let Err(e) = record_result {
+            let _ = self.destroy_command_pool(adapter, command_pool_id);
+            return Err(e);
+        }
+        Ok((command_pool_id, command_buffer_id))
+    }
+
+    /// Convert one authoritative primary into an OPTIMAL BGRA scratch image,
+    /// then copy that exact byte layout into the adapter-owned LINEAR scanout.
+    ///
+    /// Keeping the conversion destination OPTIMAL avoids assuming that the
+    /// physical device supports `VK_FORMAT_FEATURE_BLIT_DST_BIT` for a LINEAR
+    /// external image. The final copy is format-identical BGRA-to-BGRA.
+    fn record_reusable_converted_image_copy(
+        &mut self,
+        adapter: &AdapterContext,
+        source_image_id: u64,
+        conversion_image_id: u64,
+        target_image_id: u64,
+        width: u32,
+        height: u32,
+    ) -> Result<(u64, u64), VirtioError> {
+        if source_image_id == 0
+            || conversion_image_id == 0
+            || target_image_id == 0
+            || source_image_id == conversion_image_id
+            || conversion_image_id == target_image_id
+            || source_image_id == target_image_id
+            || width == 0
+            || height == 0
+        {
+            return Err(VirtioError::DeviceError);
+        }
+
+        let command_pool_id = self.create_command_pool(adapter)?;
+        let command_buffer_id = match self.allocate_command_buffer(adapter, command_pool_id) {
+            Ok(id) => id,
+            Err(e) => {
+                let _ = self.destroy_command_pool(adapter, command_pool_id);
+                return Err(e);
+            }
+        };
+        let record_result = (|| {
+            self.begin_command_buffer_with_flags(
+                adapter,
+                command_buffer_id,
+                COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE,
+            )?;
+            self.cmd_image_barrier(
+                adapter,
+                command_buffer_id,
+                source_image_id,
+                PIPELINE_STAGE_TOP_OF_PIPE,
+                PIPELINE_STAGE_TRANSFER,
+                0,
+                ACCESS_TRANSFER_READ,
+                IMAGE_LAYOUT_GENERAL,
+                IMAGE_LAYOUT_GENERAL,
+                QUEUE_FAMILY_EXTERNAL,
+                0,
+            )?;
+            self.cmd_image_barrier(
+                adapter,
+                command_buffer_id,
+                conversion_image_id,
+                PIPELINE_STAGE_TRANSFER,
+                PIPELINE_STAGE_TRANSFER,
+                ACCESS_TRANSFER_READ | ACCESS_TRANSFER_WRITE,
+                ACCESS_TRANSFER_WRITE,
+                IMAGE_LAYOUT_GENERAL,
+                IMAGE_LAYOUT_GENERAL,
+                QUEUE_FAMILY_IGNORED,
+                QUEUE_FAMILY_IGNORED,
+            )?;
+            self.cmd_image_barrier(
+                adapter,
+                command_buffer_id,
+                target_image_id,
+                PIPELINE_STAGE_TOP_OF_PIPE,
+                PIPELINE_STAGE_TRANSFER,
+                0,
+                ACCESS_TRANSFER_WRITE,
+                IMAGE_LAYOUT_GENERAL,
+                IMAGE_LAYOUT_GENERAL,
+                QUEUE_FAMILY_EXTERNAL,
+                0,
+            )?;
+            self.cmd_blit_image(
+                adapter,
+                command_buffer_id,
+                source_image_id,
+                conversion_image_id,
+                width,
+                height,
+            )?;
+            self.cmd_image_barrier(
+                adapter,
+                command_buffer_id,
+                conversion_image_id,
+                PIPELINE_STAGE_TRANSFER,
+                PIPELINE_STAGE_TRANSFER,
+                ACCESS_TRANSFER_WRITE,
+                ACCESS_TRANSFER_READ,
+                IMAGE_LAYOUT_GENERAL,
+                IMAGE_LAYOUT_GENERAL,
+                QUEUE_FAMILY_IGNORED,
+                QUEUE_FAMILY_IGNORED,
+            )?;
+            self.cmd_copy_image(
+                adapter,
+                command_buffer_id,
+                conversion_image_id,
+                target_image_id,
+                width,
+                height,
+            )?;
+            self.cmd_image_barrier(
+                adapter,
+                command_buffer_id,
+                source_image_id,
+                PIPELINE_STAGE_TRANSFER,
+                PIPELINE_STAGE_BOTTOM_OF_PIPE,
+                ACCESS_TRANSFER_READ,
+                0,
+                IMAGE_LAYOUT_GENERAL,
+                IMAGE_LAYOUT_GENERAL,
+                0,
+                QUEUE_FAMILY_EXTERNAL,
+            )?;
+            self.cmd_image_barrier(
+                adapter,
+                command_buffer_id,
+                target_image_id,
+                PIPELINE_STAGE_TRANSFER,
+                PIPELINE_STAGE_BOTTOM_OF_PIPE,
+                ACCESS_TRANSFER_WRITE,
+                0,
+                IMAGE_LAYOUT_GENERAL,
+                IMAGE_LAYOUT_GENERAL,
+                0,
+                QUEUE_FAMILY_EXTERNAL,
+            )?;
+            self.end_command_buffer(adapter, command_buffer_id)
+        })();
+        if let Err(e) = record_result {
+            let _ = self.destroy_command_pool(adapter, command_pool_id);
+            return Err(e);
+        }
+        Ok((command_pool_id, command_buffer_id))
+    }
+
+    /// Record one reusable full-surface Present BLT from an imported OPTIMAL
+    /// source image into the pitched buffer backing a KMD standard allocation.
+    fn record_reusable_present_blt(
+        &mut self,
+        adapter: &AdapterContext,
+        source_image_id: u64,
+        destination_buffer_id: u64,
+        destination_size: u64,
+        width: u32,
+        height: u32,
+        pitch: u32,
+        bytes_per_pixel: u32,
+    ) -> Result<(u64, u64), VirtioError> {
+        if source_image_id == 0
+            || destination_buffer_id == 0
+            || destination_size == 0
+            || width == 0
+            || height == 0
+            || bytes_per_pixel == 0
+            || pitch < width.saturating_mul(bytes_per_pixel)
+            || pitch % bytes_per_pixel != 0
+        {
+            return Err(VirtioError::DeviceError);
+        }
+
+        let command_pool_id = self.create_command_pool(adapter)?;
+        let command_buffer_id = match self.allocate_command_buffer(adapter, command_pool_id) {
+            Ok(id) => id,
+            Err(e) => {
+                let _ = self.destroy_command_pool(adapter, command_pool_id);
+                return Err(e);
+            }
+        };
+
+        let record_result = (|| {
+            self.begin_command_buffer_with_flags(
+                adapter,
+                command_buffer_id,
+                COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE,
+            )?;
+            self.cmd_image_barrier(
+                adapter,
+                command_buffer_id,
+                source_image_id,
+                PIPELINE_STAGE_TOP_OF_PIPE,
+                PIPELINE_STAGE_TRANSFER,
+                0,
+                ACCESS_TRANSFER_READ,
+                IMAGE_LAYOUT_GENERAL,
+                IMAGE_LAYOUT_GENERAL,
+                QUEUE_FAMILY_EXTERNAL,
+                0,
+            )?;
+            self.cmd_buffer_barrier(
+                adapter,
+                command_buffer_id,
+                destination_buffer_id,
+                destination_size,
+                PIPELINE_STAGE_TOP_OF_PIPE,
+                PIPELINE_STAGE_TRANSFER,
+                0,
+                ACCESS_TRANSFER_WRITE,
+                QUEUE_FAMILY_EXTERNAL,
+                0,
+            )?;
+            self.cmd_copy_image_to_buffer(
+                adapter,
+                command_buffer_id,
+                source_image_id,
+                destination_buffer_id,
+                width,
+                height,
+                pitch,
+                bytes_per_pixel,
+            )?;
+            self.cmd_image_barrier(
+                adapter,
+                command_buffer_id,
+                source_image_id,
+                PIPELINE_STAGE_TRANSFER,
+                PIPELINE_STAGE_BOTTOM_OF_PIPE,
+                ACCESS_TRANSFER_READ,
+                0,
+                IMAGE_LAYOUT_GENERAL,
+                IMAGE_LAYOUT_GENERAL,
+                0,
+                QUEUE_FAMILY_EXTERNAL,
+            )?;
+            self.cmd_buffer_barrier(
+                adapter,
+                command_buffer_id,
+                destination_buffer_id,
+                destination_size,
+                PIPELINE_STAGE_TRANSFER,
+                PIPELINE_STAGE_BOTTOM_OF_PIPE,
+                ACCESS_TRANSFER_WRITE,
+                0,
+                0,
+                QUEUE_FAMILY_EXTERNAL,
+            )?;
+            self.end_command_buffer(adapter, command_buffer_id)
+        })();
+        if let Err(e) = record_result {
+            let _ = self.destroy_command_pool(adapter, command_pool_id);
+            return Err(e);
+        }
+        Ok((command_pool_id, command_buffer_id))
+    }
+
+    /// Convert the authoritative source into a KMD-owned scratch image carrying
+    /// the exact destination format, then copy those bytes into Windows'
+    /// redirected standard allocation.
+    fn record_reusable_converted_present_blt(
+        &mut self,
+        adapter: &AdapterContext,
+        source_image_id: u64,
+        conversion_image_id: u64,
+        destination_buffer_id: u64,
+        destination_size: u64,
+        width: u32,
+        height: u32,
+        pitch: u32,
+        bytes_per_pixel: u32,
+    ) -> Result<(u64, u64), VirtioError> {
+        if source_image_id == 0
+            || conversion_image_id == 0
+            || destination_buffer_id == 0
+            || destination_size == 0
+            || width == 0
+            || height == 0
+            || bytes_per_pixel == 0
+            || pitch < width.saturating_mul(bytes_per_pixel)
+            || pitch % bytes_per_pixel != 0
+        {
+            return Err(VirtioError::DeviceError);
+        }
+
+        let command_pool_id = self.create_command_pool(adapter)?;
+        let command_buffer_id = match self.allocate_command_buffer(adapter, command_pool_id) {
+            Ok(id) => id,
+            Err(e) => {
+                let _ = self.destroy_command_pool(adapter, command_pool_id);
+                return Err(e);
+            }
+        };
+        let record_result = (|| {
+            self.begin_command_buffer_with_flags(
+                adapter,
+                command_buffer_id,
+                COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE,
+            )?;
+            self.cmd_image_barrier(
+                adapter,
+                command_buffer_id,
+                source_image_id,
+                PIPELINE_STAGE_TOP_OF_PIPE,
+                PIPELINE_STAGE_TRANSFER,
+                0,
+                ACCESS_TRANSFER_READ,
+                IMAGE_LAYOUT_GENERAL,
+                IMAGE_LAYOUT_GENERAL,
+                QUEUE_FAMILY_EXTERNAL,
+                0,
+            )?;
+            self.cmd_image_barrier(
+                adapter,
+                command_buffer_id,
+                conversion_image_id,
+                PIPELINE_STAGE_TRANSFER,
+                PIPELINE_STAGE_TRANSFER,
+                ACCESS_TRANSFER_READ | ACCESS_TRANSFER_WRITE,
+                ACCESS_TRANSFER_WRITE,
+                IMAGE_LAYOUT_GENERAL,
+                IMAGE_LAYOUT_GENERAL,
+                QUEUE_FAMILY_IGNORED,
+                QUEUE_FAMILY_IGNORED,
+            )?;
+            self.cmd_buffer_barrier(
+                adapter,
+                command_buffer_id,
+                destination_buffer_id,
+                destination_size,
+                PIPELINE_STAGE_TOP_OF_PIPE,
+                PIPELINE_STAGE_TRANSFER,
+                0,
+                ACCESS_TRANSFER_WRITE,
+                QUEUE_FAMILY_EXTERNAL,
+                0,
+            )?;
+            self.cmd_blit_image(
+                adapter,
+                command_buffer_id,
+                source_image_id,
+                conversion_image_id,
+                width,
+                height,
+            )?;
+            self.cmd_image_barrier(
+                adapter,
+                command_buffer_id,
+                conversion_image_id,
+                PIPELINE_STAGE_TRANSFER,
+                PIPELINE_STAGE_TRANSFER,
+                ACCESS_TRANSFER_WRITE,
+                ACCESS_TRANSFER_READ,
+                IMAGE_LAYOUT_GENERAL,
+                IMAGE_LAYOUT_GENERAL,
+                QUEUE_FAMILY_IGNORED,
+                QUEUE_FAMILY_IGNORED,
+            )?;
+            self.cmd_copy_image_to_buffer(
+                adapter,
+                command_buffer_id,
+                conversion_image_id,
+                destination_buffer_id,
+                width,
+                height,
+                pitch,
+                bytes_per_pixel,
+            )?;
+            self.cmd_image_barrier(
+                adapter,
+                command_buffer_id,
+                source_image_id,
+                PIPELINE_STAGE_TRANSFER,
+                PIPELINE_STAGE_BOTTOM_OF_PIPE,
+                ACCESS_TRANSFER_READ,
+                0,
+                IMAGE_LAYOUT_GENERAL,
+                IMAGE_LAYOUT_GENERAL,
+                0,
+                QUEUE_FAMILY_EXTERNAL,
+            )?;
+            self.cmd_buffer_barrier(
+                adapter,
+                command_buffer_id,
+                destination_buffer_id,
+                destination_size,
+                PIPELINE_STAGE_TRANSFER,
+                PIPELINE_STAGE_BOTTOM_OF_PIPE,
+                ACCESS_TRANSFER_WRITE,
+                0,
+                0,
+                QUEUE_FAMILY_EXTERNAL,
+            )?;
+            self.end_command_buffer(adapter, command_buffer_id)
+        })();
+        if let Err(e) = record_result {
+            let _ = self.destroy_command_pool(adapter, command_pool_id);
+            return Err(e);
+        }
+        Ok((command_pool_id, command_buffer_id))
+    }
+
     /// Import an authoritative WDDM primary and record its reusable GPU copy to
     /// the adapter-owned LINEAR scanout image.
     ///
@@ -1907,7 +3410,7 @@ impl VenusClient {
     /// cache the returned object in the allocation context, submit it with
     /// [`Self::submit_prepared_image_copy`], and destroy it only through
     /// [`Self::destroy_prepared_image_copy`].
-    pub fn prepare_optimal_bgra_copy(
+    pub fn prepare_optimal_scanout_copy(
         &mut self,
         adapter: &AdapterContext,
         source_resource_id: u32,
@@ -1915,6 +3418,7 @@ impl VenusClient {
         source_memory_type_index: u32,
         width: u32,
         height: u32,
+        source_dxgi_format: u32,
         ddi_bind_flags: u32,
         target_image_id: u64,
     ) -> Result<PreparedImageCopy, VirtioError> {
@@ -1928,19 +3432,28 @@ impl VenusClient {
             diag(0x0137);
             return Err(VirtioError::DeviceError);
         }
+        let source_pixel_format =
+            PresentPixelFormat::from_dxgi(source_dxgi_format).ok_or(VirtioError::DeviceError)?;
+        let target_pixel_format = PresentPixelFormat::Bgra8Unorm;
 
         crate::diag::record_named_bytes(b"CpImpSt", 1);
         ctrl::attach_resource_checked(adapter, self.ctx_id, source_resource_id)?;
 
         crate::diag::record_named_bytes(b"CpImpSt", 2);
-        let source_image_id =
-            match self.create_optimal_bgra_source_alias(adapter, width, height, ddi_bind_flags) {
-                Ok(id) => id,
-                Err(e) => {
-                    let _ = ctrl::ctx_detach_resource(adapter, self.ctx_id, source_resource_id);
-                    return Err(e);
-                }
-            };
+        let source_image_id = match self.create_optimal_present_image_alias(
+            adapter,
+            width,
+            height,
+            ddi_bind_flags,
+            source_dxgi_format,
+            OptimalImageTransport::OpaqueFd,
+        ) {
+            Ok(id) => id,
+            Err(e) => {
+                let _ = ctrl::ctx_detach_resource(adapter, self.ctx_id, source_resource_id);
+                return Err(e);
+            }
+        };
 
         crate::diag::record_named_bytes(b"CpImpSt", 3);
         let (required_size, memory_type_bits) =
@@ -2009,22 +3522,89 @@ impl VenusClient {
         }
 
         crate::diag::record_named_bytes(b"CpImpSt", 7);
-        let (command_pool_id, command_buffer_id) = match self.record_reusable_image_copy(
-            adapter,
-            source_image_id,
-            target_image_id,
-            width,
-            height,
-        ) {
-            Ok(ids) => ids,
-            Err(e) => {
-                let _ = self.cleanup_imported_source_alias(
-                    adapter,
-                    source_resource_id,
-                    source_image_id,
-                    source_memory_id,
-                );
-                return Err(e);
+        let mut conversion_image_id = 0;
+        let mut conversion_memory_id = 0;
+        let mut conversion_init_pool_id = 0;
+        let requires_conversion =
+            source_pixel_format.vk_format() != target_pixel_format.vk_format();
+        let (command_pool_id, command_buffer_id) = if requires_conversion {
+            let conversion = match self.create_bound_present_conversion_image(
+                adapter,
+                width,
+                height,
+                target_pixel_format,
+            ) {
+                Ok(conversion) => conversion,
+                Err(e) => {
+                    let _ = self.cleanup_imported_source_alias(
+                        adapter,
+                        source_resource_id,
+                        source_image_id,
+                        source_memory_id,
+                    );
+                    return Err(e);
+                }
+            };
+            conversion_image_id = conversion.0;
+            conversion_memory_id = conversion.1;
+            let command = match self.record_reusable_converted_image_copy(
+                adapter,
+                source_image_id,
+                conversion_image_id,
+                target_image_id,
+                width,
+                height,
+            ) {
+                Ok(command) => command,
+                Err(e) => {
+                    let _ = self.destroy_image_on_ring(adapter, conversion_image_id);
+                    let _ = self.free_memory_object(adapter, conversion_memory_id);
+                    let _ = self.cleanup_imported_source_alias(
+                        adapter,
+                        source_resource_id,
+                        source_image_id,
+                        source_memory_id,
+                    );
+                    return Err(e);
+                }
+            };
+            conversion_init_pool_id =
+                match self.initialize_present_conversion_image(adapter, conversion_image_id) {
+                    Ok(pool_id) => pool_id,
+                    Err(e) => {
+                        // The initializer's submission result is ambiguous.
+                        // Its scratch objects must survive until Venus-context
+                        // teardown, but the never-submitted reusable command and
+                        // source alias are safe to release.
+                        let _ = self.destroy_command_pool(adapter, command.0);
+                        let _ = self.cleanup_imported_source_alias(
+                            adapter,
+                            source_resource_id,
+                            source_image_id,
+                            source_memory_id,
+                        );
+                        return Err(e);
+                    }
+                };
+            command
+        } else {
+            match self.record_reusable_image_copy(
+                adapter,
+                source_image_id,
+                target_image_id,
+                width,
+                height,
+            ) {
+                Ok(ids) => ids,
+                Err(e) => {
+                    let _ = self.cleanup_imported_source_alias(
+                        adapter,
+                        source_resource_id,
+                        source_image_id,
+                        source_memory_id,
+                    );
+                    return Err(e);
+                }
             }
         };
 
@@ -2034,6 +3614,9 @@ impl VenusClient {
             source_resource_id,
             source_image_id,
             source_memory_id,
+            conversion_image_id,
+            conversion_memory_id,
+            conversion_init_pool_id,
             command_pool_id,
             command_buffer_id,
             target_image_id,
@@ -2044,7 +3627,7 @@ impl VenusClient {
 
     /// Record a reusable copy from an existing KMD-created LINEAR primary.
     ///
-    /// Unlike [`Self::prepare_optimal_bgra_copy`], this borrows the source
+    /// Unlike [`Self::prepare_optimal_scanout_copy`], this borrows the source
     /// `VkImage`; the owning allocation keeps its image, memory and virtio
     /// resource alive. Teardown drains the queue and destroys only the recorded
     /// command pool.
@@ -2054,6 +3637,7 @@ impl VenusClient {
         source_image_id: u64,
         width: u32,
         height: u32,
+        source_dxgi_format: u32,
         target_image_id: u64,
     ) -> Result<PreparedImageCopy, VirtioError> {
         if source_image_id == 0
@@ -2064,19 +3648,64 @@ impl VenusClient {
         {
             return Err(VirtioError::DeviceError);
         }
+        let source_pixel_format =
+            PresentPixelFormat::from_dxgi(source_dxgi_format).ok_or(VirtioError::DeviceError)?;
+        let target_pixel_format = PresentPixelFormat::Bgra8Unorm;
         self.ensure_linear_copy_target_ready(adapter, target_image_id)?;
-        let (command_pool_id, command_buffer_id) = self.record_reusable_image_copy(
-            adapter,
-            source_image_id,
-            target_image_id,
-            width,
-            height,
-        )?;
+        let mut conversion_image_id = 0;
+        let mut conversion_memory_id = 0;
+        let mut conversion_init_pool_id = 0;
+        let (command_pool_id, command_buffer_id) =
+            if source_pixel_format.vk_format() != target_pixel_format.vk_format() {
+                let conversion = self.create_bound_present_conversion_image(
+                    adapter,
+                    width,
+                    height,
+                    target_pixel_format,
+                )?;
+                conversion_image_id = conversion.0;
+                conversion_memory_id = conversion.1;
+                let command = match self.record_reusable_converted_image_copy(
+                    adapter,
+                    source_image_id,
+                    conversion_image_id,
+                    target_image_id,
+                    width,
+                    height,
+                ) {
+                    Ok(command) => command,
+                    Err(e) => {
+                        let _ = self.destroy_image_on_ring(adapter, conversion_image_id);
+                        let _ = self.free_memory_object(adapter, conversion_memory_id);
+                        return Err(e);
+                    }
+                };
+                conversion_init_pool_id =
+                    match self.initialize_present_conversion_image(adapter, conversion_image_id) {
+                        Ok(pool_id) => pool_id,
+                        Err(e) => {
+                            let _ = self.destroy_command_pool(adapter, command.0);
+                            return Err(e);
+                        }
+                    };
+                command
+            } else {
+                self.record_reusable_image_copy(
+                    adapter,
+                    source_image_id,
+                    target_image_id,
+                    width,
+                    height,
+                )?
+            };
         Ok(PreparedImageCopy {
             owns_source_alias: false,
             source_resource_id: 0,
             source_image_id,
             source_memory_id: 0,
+            conversion_image_id,
+            conversion_memory_id,
+            conversion_init_pool_id,
             command_pool_id,
             command_buffer_id,
             target_image_id,
@@ -2092,6 +3721,7 @@ impl VenusClient {
         &mut self,
         adapter: &AdapterContext,
         copy: &PreparedImageCopy,
+        primary_address: u64,
     ) -> Result<u64, VirtioError> {
         if copy.command_buffer_id == 0
             || copy.source_image_id == 0
@@ -2121,7 +3751,380 @@ impl VenusClient {
         submit.u32(0); // signalSemaphoreCount
         submit.count(false); // pSignalSemaphores
         submit.u64(0); // fence
-        ctrl::submit_venus_async_scanout(adapter, self.ctx_id, submit.as_slice())
+        ctrl::submit_venus_async_scanout(adapter, self.ctx_id, submit.as_slice(), primary_address)
+    }
+
+    fn encode_command_buffer_submit(&self, command_buffer_id: u64) -> Writer {
+        let mut submit = Writer::new();
+        submit.header(CMD_QUEUE_SUBMIT, 0);
+        submit.u64(self.queue_id);
+        submit.u32(1); // submitCount
+        submit.u64(1); // pSubmits array_size
+        submit.i32(ST_SUBMIT_INFO);
+        submit.count(false); // pNext
+        submit.u32(0); // waitSemaphoreCount
+        submit.count(false); // pWaitSemaphores
+        submit.count(false); // pWaitDstStageMask
+        submit.u32(1); // commandBufferCount
+        submit.u64(1); // pCommandBuffers array_size
+        submit.u64(command_buffer_id);
+        submit.u32(0); // signalSemaphoreCount
+        submit.count(false); // pSignalSemaphores
+        submit.u64(0); // fence
+        submit
+    }
+
+    /// Copy one complete, same-sized Present source into dxgkrnl's exact
+    /// destination allocation, converting across the supported D3D11
+    /// swapchain-format set when the Vulkan storage formats differ.
+    ///
+    /// Setup is cached by exact resource descriptors. The steady-state path
+    /// only encodes one vkQueueSubmit and performs one nonblocking ring-1
+    /// enqueue; no sleep or synchronous ctrl round-trip occurs per frame.
+    pub fn submit_present_blt(
+        &mut self,
+        adapter: &AdapterContext,
+        source: OptimalPresentImageDesc,
+        destination: PresentDestinationDesc,
+    ) -> Result<u64, VirtioError> {
+        if source.resource_id == destination.resource_id()
+            || source.width != destination.width()
+            || source.height != destination.height()
+        {
+            return Err(VirtioError::DeviceError);
+        }
+        let source_pixel_format = source.pixel_format();
+        let destination_pixel_format = match destination {
+            PresentDestinationDesc::StandardBuffer(desc) => desc.pixel_format(),
+            PresentDestinationDesc::OptimalImage(desc) => desc.pixel_format(),
+        };
+        let requires_conversion =
+            source_pixel_format.vk_format() != destination_pixel_format.vk_format();
+
+        // A resource has one immutable interpretation for the cache lifetime.
+        // Reject role changes explicitly instead of allowing the same backing
+        // memory to be attached once as an OPTIMAL image and again as a buffer.
+        let source_was_buffer = self
+            .present_buffers
+            .iter()
+            .any(|buffer| buffer.desc.resource_id == source.resource_id);
+        let destination_has_conflicting_role = match destination {
+            PresentDestinationDesc::StandardBuffer(desc) => self
+                .present_images
+                .iter()
+                .any(|image| image.desc.resource_id == desc.resource_id),
+            PresentDestinationDesc::OptimalImage(desc) => self
+                .present_buffers
+                .iter()
+                .any(|buffer| buffer.desc.resource_id == desc.resource_id),
+        };
+        if source_was_buffer || destination_has_conflicting_role {
+            return Err(VirtioError::DeviceError);
+        }
+
+        let existing = self.present_blits.iter().position(|blt| {
+            blt.source_resource_id == source.resource_id
+                && blt.destination_resource_id == destination.resource_id()
+        });
+        if existing.is_none() && self.present_blits.len() >= MAX_PRESENT_BLITS {
+            return Err(VirtioError::OutOfMemory);
+        }
+        // Validate the complete descriptors on every call, including cache
+        // hits. A recycled/mutated resource id can therefore never select a
+        // command buffer recorded for a different allocation contract.
+        let source_image = self.ensure_present_image(adapter, source)?;
+        let (destination_buffer, destination_image) = match destination {
+            PresentDestinationDesc::StandardBuffer(desc) => {
+                (Some(self.ensure_present_buffer(adapter, desc)?), None)
+            }
+            PresentDestinationDesc::OptimalImage(desc) => {
+                (None, Some(self.ensure_present_image(adapter, desc)?))
+            }
+        };
+        let blt_index = match existing {
+            Some(index) => index,
+            None => {
+                let mut conversion_image_id = 0;
+                let mut conversion_memory_id = 0;
+                let mut conversion_init_pool_id = 0;
+                let command_result = match destination {
+                    PresentDestinationDesc::StandardBuffer(desc) => {
+                        let destination_buffer =
+                            destination_buffer.ok_or(VirtioError::DeviceError)?;
+                        if requires_conversion {
+                            let conversion = self.create_bound_present_conversion_image(
+                                adapter,
+                                source.width,
+                                source.height,
+                                destination_pixel_format,
+                            )?;
+                            conversion_image_id = conversion.0;
+                            conversion_memory_id = conversion.1;
+                            let command = match self.record_reusable_converted_present_blt(
+                                adapter,
+                                source_image.image_id,
+                                conversion_image_id,
+                                destination_buffer.buffer_id,
+                                desc.allocation_size,
+                                source.width,
+                                source.height,
+                                desc.pitch,
+                                destination_pixel_format.bytes_per_pixel(),
+                            ) {
+                                Ok(command) => command,
+                                Err(error) => {
+                                    // The scratch image has never been submitted,
+                                    // so a recording failure is safe to unwind
+                                    // completely and cannot leak once per frame.
+                                    let _ =
+                                        self.destroy_image_on_ring(adapter, conversion_image_id);
+                                    let _ = self.free_memory_object(adapter, conversion_memory_id);
+                                    return Err(error);
+                                }
+                            };
+                            conversion_init_pool_id = self.initialize_present_conversion_image(
+                                adapter,
+                                conversion_image_id,
+                            )?;
+                            Ok(command)
+                        } else {
+                            self.record_reusable_present_blt(
+                                adapter,
+                                source_image.image_id,
+                                destination_buffer.buffer_id,
+                                desc.allocation_size,
+                                source.width,
+                                source.height,
+                                desc.pitch,
+                                destination_pixel_format.bytes_per_pixel(),
+                            )
+                        }
+                    }
+                    PresentDestinationDesc::OptimalImage(_) => {
+                        let destination_image =
+                            destination_image.ok_or(VirtioError::DeviceError)?;
+                        if requires_conversion {
+                            self.record_reusable_image_blit(
+                                adapter,
+                                source_image.image_id,
+                                destination_image.image_id,
+                                source.width,
+                                source.height,
+                            )
+                        } else {
+                            self.record_reusable_image_copy(
+                                adapter,
+                                source_image.image_id,
+                                destination_image.image_id,
+                                source.width,
+                                source.height,
+                            )
+                        }
+                    }
+                };
+                let (command_pool_id, command_buffer_id) = match command_result {
+                    Ok(command) => command,
+                    Err(error) => {
+                        // A submitted conversion initializer may still be in
+                        // flight. Retain its objects for context teardown rather
+                        // than risking destruction of live Vulkan state.
+                        return Err(error);
+                    }
+                };
+                self.present_blits.push(PreparedPresentBlt {
+                    source_resource_id: source.resource_id,
+                    destination_resource_id: destination.resource_id(),
+                    command_pool_id,
+                    command_buffer_id,
+                    conversion_image_id,
+                    conversion_memory_id,
+                    conversion_init_pool_id,
+                    last_wire_fence_id: 0,
+                    submit_count: 0,
+                    // Only a standard buffer is CPU-mappable for the diagnostic.
+                    probe_done: matches!(destination, PresentDestinationDesc::OptimalImage(_)),
+                });
+                self.present_blits.len() - 1
+            }
+        };
+
+        let command_buffer_id = self.present_blits[blt_index].command_buffer_id;
+        let submit = self.encode_command_buffer_submit(command_buffer_id);
+        let fence_id = ctrl::submit_venus_async_present(adapter, self.ctx_id, submit.as_slice())?;
+        let run_probe = {
+            let blt = &mut self.present_blits[blt_index];
+            blt.last_wire_fence_id = fence_id;
+            blt.submit_count = blt.submit_count.saturating_add(1);
+            if adapter.present_probe && blt.submit_count >= 8 && !blt.probe_done {
+                // Claim the one-shot before doing any fallible work. Even a
+                // failed diagnostic can therefore never turn into a recurring
+                // Present-path stall.
+                blt.probe_done = true;
+                true
+            } else {
+                false
+            }
+        };
+        if run_probe {
+            if let PresentDestinationDesc::StandardBuffer(destination) = destination {
+                Self::probe_present_destination(adapter, destination, fence_id);
+            }
+        }
+        Ok(fence_id)
+    }
+
+    /// One-shot diagnostic proving whether the completed Vulkan copy populated
+    /// dxgkrnl's host-visible Present destination. This is deliberately not a
+    /// correctness mechanism: all failures are loud breadcrumbs, and the
+    /// caller's per-pair `probe_done` bit prevents retry loops.
+    fn probe_present_destination(
+        adapter: &AdapterContext,
+        destination: PresentBufferDesc,
+        fence_id: u64,
+    ) {
+        crate::diag::record_named_bytes(b"PBPrF", 1);
+        match ctrl::wait_fence(adapter, fence_id, 5_000_000_000) {
+            ctrl::WaitFenceOutcome::Complete => {
+                crate::diag::record_named_bytes(b"PBPrF", 2);
+            }
+            ctrl::WaitFenceOutcome::TimedOut => {
+                crate::diag::record_named_bytes(b"PBPrF", 0xE1);
+                return;
+            }
+            ctrl::WaitFenceOutcome::Invalid => {
+                crate::diag::record_named_bytes(b"PBPrF", 0xE2);
+                return;
+            }
+        }
+
+        let prep = match ctrl::map_blob_prepare(adapter, None, destination.resource_id) {
+            Ok(prep) => prep,
+            Err(_) => {
+                crate::diag::record_named_bytes(b"PBPrF", 0xE3);
+                return;
+            }
+        };
+        if prep.size < destination.allocation_size {
+            crate::diag::record_named_bytes(b"PBPrF", 0xE4);
+            return;
+        }
+        let map = match KernelMap::new(prep.gpa, prep.size, prep.map_cache) {
+            Some(map) => map,
+            None => {
+                crate::diag::record_named_bytes(b"PBPrF", 0xE5);
+                return;
+            }
+        };
+        crate::diag::record_named_bytes(b"PBPrF", 3);
+
+        const GRID: u64 = 8;
+        let bytes_per_pixel = u64::from(destination.pixel_format().bytes_per_pixel());
+        let mut nonblack = 0u32;
+        let mut rgb_sum = 0u32;
+        for gy in 0..GRID {
+            let y = u64::from(destination.height - 1) * gy / (GRID - 1);
+            for gx in 0..GRID {
+                let x = u64::from(destination.width - 1) * gx / (GRID - 1);
+                let offset = y * u64::from(destination.pitch) + x * bytes_per_pixel;
+                // PresentBufferDesc::new proves the complete pitched image is
+                // within allocation_size, and prep.size covers that allocation.
+                let b = u32::from(map.read_byte(offset));
+                let g = u32::from(map.read_byte(offset + 1));
+                let r = u32::from(map.read_byte(offset + 2));
+                let pixel_sum = r + g + b;
+                rgb_sum = rgb_sum.saturating_add(pixel_sum);
+                nonblack += u32::from(pixel_sum != 0);
+            }
+        }
+        let center_offset = u64::from(destination.height / 2) * u64::from(destination.pitch)
+            + u64::from(destination.width / 2) * bytes_per_pixel;
+        let center = u32::from(map.read_byte(center_offset))
+            | (u32::from(map.read_byte(center_offset + 1)) << 8)
+            | (u32::from(map.read_byte(center_offset + 2)) << 16)
+            | (u32::from(map.read_byte(center_offset + 3)) << 24);
+        crate::diag::record_named_bytes(b"PBPrNz", nonblack);
+        crate::diag::record_named_bytes(b"PBPrSum", rgb_sum);
+        crate::diag::record_named_bytes(b"PBPrCtr", center);
+        crate::diag::record_named_bytes(b"PBPrF", 0x10);
+    }
+
+    /// Drain and destroy every cached app/DWM Present BLT import.
+    ///
+    /// Allocation teardown calls this before a backing resource can disappear.
+    /// Flushing the bounded cache as one ownership unit avoids detach/refcount
+    /// ambiguity when multiple swapchain images share one destination.
+    pub fn release_present_blits_for_resource(
+        &mut self,
+        adapter: &AdapterContext,
+        resource_id: u32,
+    ) -> Result<(), VirtioError> {
+        if !self
+            .present_images
+            .iter()
+            .any(|image| image.desc.resource_id == resource_id)
+            && !self
+                .present_buffers
+                .iter()
+                .any(|buffer| buffer.desc.resource_id == resource_id)
+        {
+            return Ok(());
+        }
+        if self.present_blits.is_empty()
+            && self.present_images.is_empty()
+            && self.present_buffers.is_empty()
+        {
+            return Ok(());
+        }
+
+        // Validate completion of every outer ring-1 fence before destroying any
+        // baked command object. On failure, retain the complete cache for Venus
+        // context teardown rather than partially freeing live objects.
+        for blt in &self.present_blits {
+            if blt.last_wire_fence_id != 0 {
+                match ctrl::wait_fence(adapter, blt.last_wire_fence_id, 5_000_000_000) {
+                    ctrl::WaitFenceOutcome::Complete => {}
+                    ctrl::WaitFenceOutcome::TimedOut | ctrl::WaitFenceOutcome::Invalid => {
+                        return Err(VirtioError::DeviceError);
+                    }
+                }
+            }
+        }
+
+        // One queue marker orders all Vulkan work before object destruction.
+        let marker = self.create_fence(adapter)?;
+        if let Err(e) = self.queue_submit_fence_marker(adapter, marker) {
+            return Err(e);
+        }
+        if let Err(e) = self.wait_for_fence(adapter, marker) {
+            return Err(e);
+        }
+        self.destroy_fence(adapter, marker)?;
+
+        while let Some(blt) = self.present_blits.pop() {
+            self.destroy_command_pool(adapter, blt.command_pool_id)?;
+            if blt.conversion_init_pool_id != 0 {
+                self.destroy_command_pool(adapter, blt.conversion_init_pool_id)?;
+            }
+            if blt.conversion_image_id != 0 {
+                self.destroy_image_on_ring(adapter, blt.conversion_image_id)?;
+            }
+            if blt.conversion_memory_id != 0 {
+                self.free_memory_object(adapter, blt.conversion_memory_id)?;
+            }
+        }
+        while let Some(image) = self.present_images.pop() {
+            self.destroy_image_on_ring(adapter, image.image_id)?;
+            self.free_memory_blob(adapter, image.memory_id)?;
+            // Each resource occurs exactly once in present_images.
+            ctrl::ctx_detach_resource(adapter, self.ctx_id, image.desc.resource_id)?;
+        }
+        while let Some(buffer) = self.present_buffers.pop() {
+            self.destroy_buffer_on_ring(adapter, buffer.buffer_id)?;
+            // `BorrowedPresentBuffer` carries no ownership capability. The
+            // allocation teardown which called us remains solely responsible
+            // for freeing `buffer.memory` and unref'ing its resource.
+        }
+        Ok(())
     }
 
     /// Drain the ordered copy queue and release every object retained for one
@@ -2157,6 +4160,15 @@ impl VenusClient {
         }
         self.destroy_fence(adapter, fence_id)?;
         self.destroy_command_pool(adapter, copy.command_pool_id)?;
+        if copy.conversion_init_pool_id != 0 {
+            self.destroy_command_pool(adapter, copy.conversion_init_pool_id)?;
+        }
+        if copy.conversion_image_id != 0 {
+            self.destroy_image_on_ring(adapter, copy.conversion_image_id)?;
+        }
+        if copy.conversion_memory_id != 0 {
+            self.free_memory_object(adapter, copy.conversion_memory_id)?;
+        }
         if copy.owns_source_alias {
             self.cleanup_imported_source_alias(
                 adapter,
@@ -2323,6 +4335,97 @@ impl VenusClient {
         })
     }
 
+    /// Allocate a KMD-owned GDI texture with the storage contract Windows
+    /// requested for `D3DKMDT_GDISURFACE_TEXTURE`: an OPTIMAL BGRA image,
+    /// device-local dedicated memory, and DMA_BUF/CROSS_DEVICE export.
+    ///
+    /// The returned resource is attachable by DWM's renderer-server context.
+    /// It is deliberately not mappable and has no row pitch; CPU-visible GDI
+    /// surface variants continue to use the separate pitched-buffer path.
+    pub fn allocate_optimal_gdi_image_blob(
+        &mut self,
+        adapter: &AdapterContext,
+        width: u32,
+        height: u32,
+        ddi_bind_flags: u32,
+        dxgi_format: u32,
+    ) -> Result<OptimalImageBlob, VirtioError> {
+        if width == 0 || height == 0 || !matches!(dxgi_format, 87 | 88) {
+            return Err(VirtioError::DeviceError);
+        }
+
+        let image_id = self.create_optimal_present_image_alias(
+            adapter,
+            width,
+            height,
+            ddi_bind_flags,
+            dxgi_format,
+            OptimalImageTransport::CrossContextDmaBuf,
+        )?;
+        let (required_size, memory_type_bits) =
+            match self.image_memory_requirements(adapter, image_id) {
+                Ok(requirements) => requirements,
+                Err(error) => {
+                    let _ = self.destroy_image(adapter, image_id);
+                    return Err(error);
+                }
+            };
+        let memory_type_index = match self.choose_device_local_memory_type(memory_type_bits) {
+            Some(index) => index,
+            None => {
+                let _ = self.destroy_image(adapter, image_id);
+                return Err(VirtioError::DeviceError);
+            }
+        };
+        let allocation_size = round_up_page(required_size.max(4096));
+        let memory_id = match self.allocate_dedicated_image_memory(
+            adapter,
+            image_id,
+            allocation_size,
+            memory_type_index,
+        ) {
+            Ok(id) => id,
+            Err(error) => {
+                let _ = self.destroy_image(adapter, image_id);
+                return Err(error);
+            }
+        };
+        if let Err(error) = self.bind_image_memory(adapter, image_id, memory_id) {
+            let _ = self.destroy_image(adapter, image_id);
+            let _ = self.free_memory_blob(adapter, memory_id);
+            return Err(error);
+        }
+
+        let blob_flags = VIRTIO_GPU_BLOB_FLAG_USE_SHAREABLE | VIRTIO_GPU_BLOB_FLAG_USE_CROSS_DEVICE;
+        let resource_id = match ctrl::resource_create_blob(
+            adapter,
+            self.ctx_id,
+            VIRTIO_GPU_BLOB_MEM_HOST3D,
+            blob_flags,
+            memory_id,
+            allocation_size,
+        ) {
+            Ok(id) => id,
+            Err(error) => {
+                let _ = self.destroy_image(adapter, image_id);
+                let _ = self.free_memory_blob(adapter, memory_id);
+                return Err(error);
+            }
+        };
+        let _ = adapter.with_virtio(|v| v.note_blob_size(resource_id, allocation_size));
+
+        Ok(OptimalImageBlob {
+            blob: HostVisibleBlob {
+                blob_id: memory_id,
+                res_id: resource_id,
+                gpa: 0,
+                size: allocation_size,
+            },
+            image_id,
+            memory_type_index,
+        })
+    }
+
     /// Diagnostic scanout allocation matching the working Linux probe: a plain
     /// LINEAR external DMA_BUF image, host-visible memory, and a HOST3D
     /// MAPPABLE|SHAREABLE blob referencing that memory.
@@ -2423,12 +4526,8 @@ impl VenusClient {
         self.submit_direct(adapter, w.as_slice())
     }
 
-    /// Free a venus `VkDeviceMemory` allocated by [`Self::allocate_memory_blob`]
-    /// (`vkFreeMemory` over the ring — cmd 22, wire shape per
-    /// `vn_encode_vkFreeMemory`: device id, memory id, null pAllocator). The
-    /// caller unrefs the blob RESOURCE separately, before this, so the host drops
-    /// the blob's reference on the memory first.
-    pub fn free_memory_blob(
+    /// Enqueue a raw Venus `vkFreeMemory` command.
+    fn free_memory_object(
         &mut self,
         adapter: &AdapterContext,
         memory_id: u64,
@@ -2439,6 +4538,36 @@ impl VenusClient {
         w.u64(memory_id);
         w.count(false); // pAllocator = NULL
         self.ring_command_noreply(adapter, w.as_slice())
+    }
+
+    /// Free a Venus `VkDeviceMemory`, removing its local blob identity only
+    /// after the free command has been accepted by the ring.
+    ///
+    /// A memory object borrowed by a cached Present buffer cannot be freed.
+    /// Allocation teardown must first drain `release_present_blits_for_resource`;
+    /// this check turns that lifetime contract into an enforced invariant.
+    pub fn free_memory_blob(
+        &mut self,
+        adapter: &AdapterContext,
+        memory_id: u64,
+    ) -> Result<(), VirtioError> {
+        if self
+            .present_buffers
+            .iter()
+            .any(|buffer| buffer.memory.memory_id == memory_id)
+        {
+            crate::diag::record_named_bytes(b"PBFree", 0xE1);
+            return Err(VirtioError::DeviceError);
+        }
+        let owned_index = self
+            .owned_memory_blobs
+            .iter()
+            .position(|blob| blob.memory_id == memory_id);
+        self.free_memory_object(adapter, memory_id)?;
+        if let Some(index) = owned_index {
+            self.owned_memory_blobs.swap_remove(index);
+        }
+        Ok(())
     }
 }
 
@@ -2517,6 +4646,10 @@ pub fn allocate_host_visible_blob(
         copy_target_image_id: 0,
         copy_target_init_pool_id: 0,
         copy_target_init_command_buffer_id: 0,
+        present_images: Vec::with_capacity(MAX_PRESENT_IMAGES),
+        present_buffers: Vec::with_capacity(MAX_PRESENT_BUFFERS),
+        present_blits: Vec::with_capacity(MAX_PRESENT_BLITS),
+        owned_memory_blobs: Vec::with_capacity(MAX_OWNED_MEMORY_BLOBS),
     };
 
     // ── 3. vkCreateRingMESA (direct) — register the ring with the host ────────

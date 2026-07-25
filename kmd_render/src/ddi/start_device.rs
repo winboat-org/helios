@@ -123,11 +123,13 @@ pub unsafe extern "C" fn dxgkddi_start_device(
     // Service-key knobs, read once per StartDevice (same iteration model as
     // `BarSegMode`: `reg add` + `devcon restart` re-runs this without a
     // reboot). See the field docs in `adapter.rs`.
-    adapter.gdi_accel_mode = crate::diag::read_config_dword(b"GdiAccelMode", 1);
+    adapter.gdi_accel_mode = crate::diag::read_config_dword(b"GdiAccelMode", 0);
     adapter.alloc_cached = crate::diag::read_config_dword(b"AllocCached", 1) != 0;
+    adapter.present_probe = crate::diag::read_config_dword(b"PresentProbe", 0) != 0;
     adapter.display_half = crate::diag::read_config_dword(b"DisplayHalf", 0) != 0;
     crate::diag::record_named_bytes(b"GdiM", adapter.gdi_accel_mode);
     crate::diag::record_named_bytes(b"AlcC", adapter.alloc_cached as u32);
+    crate::diag::record_named_bytes(b"PBPrEn", adapter.present_probe as u32);
     crate::diag::record_named_bytes(b"DspH", adapter.display_half as u32);
 
     if adapter.paging_ram.is_none() {
@@ -299,12 +301,30 @@ pub unsafe extern "C" fn vsync_dpc_routine(
     let Some(dxgkrnl) = adapter.dxgkrnl.as_ref() else {
         return;
     };
+    // SetVidPnSourceAddress can hand us a new exact primary from inside the
+    // preceding synchronized VSync callback. Its host bind/copy continues at
+    // PASSIVE_LEVEL. Do not send another VSync carrying the old address while
+    // that display-engine operation is outstanding; the next notification must
+    // describe the primary that is actually programmed.
+    if adapter.vidpn_programming.load(Ordering::Acquire) != 0 {
+        if adapter.pending_vidpn_allocation.load(Ordering::Acquire) != 0 {
+            adapter.signal_hpd();
+        }
+        return;
+    }
     let phys = adapter.last_primary_address.load(Ordering::Acquire) as i64;
     // SAFETY: live callback interface; signal_crtc_vsync raises to DIRQL internally
     // via DxgkCbSynchronizeExecution and delivers the CRTC_VSYNC packet.
     let _ = unsafe {
         crate::ddi::submit_command::signal_crtc_vsync(dxgkrnl, phys, crate::ddi::vidpn::CHILD_UID)
     };
+    // SetVidPnSourceAddress may run inside the synchronized MMIO-flip callback
+    // above at DIRQL. It can only publish the exact hAllocation there. Back at
+    // this timer DPC's DISPATCH_LEVEL, wake the PASSIVE worker that is allowed
+    // to take the Venus mutex and issue the host scanout commands.
+    if adapter.pending_vidpn_allocation.load(Ordering::Acquire) != 0 {
+        adapter.signal_hpd();
+    }
     adapter.vsync_count.fetch_add(1, Ordering::Relaxed);
 }
 

@@ -288,16 +288,13 @@ elif [ "$QEMU_RENDER_GPU" != "default" ]; then
     fi
     qemu_env_prefix=(
       env
+      __NV_PRIME_RENDER_OFFLOAD=1
+      __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json
+      __GLX_VENDOR_LIBRARY_NAME=nvidia
       __VK_LAYER_NV_optimus=NVIDIA_only
       VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/nvidia_icd.json
+      GBM_BACKEND=nvidia-drm
     )
-    if [ "$qemu_uses_compositor_gl" = "0" ]; then
-      qemu_env_prefix+=(
-        __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json
-        __GLX_VENDOR_LIBRARY_NAME=nvidia
-        GBM_BACKEND=nvidia-drm
-      )
-    fi
     qemu_egl_headless="egl-headless,rendernode=$NVIDIA_RENDER_NODE"
   else
     echo "unknown HELIOS_QEMU_RENDER_GPU=$QEMU_RENDER_GPU (expected default, intel, or nvidia)"

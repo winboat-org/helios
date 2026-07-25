@@ -9,7 +9,6 @@
 
 use alloc::boxed::Box;
 use core::ffi::c_void;
-use core::sync::atomic::Ordering;
 
 use crate::adapter::AdapterContext;
 use crate::dxgk::*;
@@ -24,6 +23,30 @@ pub struct DeviceContext {
 pub struct ContextContext {
     /// Back-pointer to the owning device (valid for the context's lifetime).
     pub device: *mut DeviceContext,
+}
+
+/// Typed borrowed view of a scheduler context handle.
+///
+/// DDI handle types are all C `HANDLE`s, so a direct cast can compile even when
+/// the callback actually received an hContext rather than an hAdapter. Keeping
+/// the only Present-path traversal here makes the ownership chain explicit:
+/// ContextContext -> DeviceContext -> AdapterContext.
+pub struct ContextHandleRef<'a> {
+    context: &'a ContextContext,
+}
+
+impl<'a> ContextHandleRef<'a> {
+    /// # Safety
+    /// `handle` must be a live hContext returned by [`dxgkddi_create_context`].
+    pub unsafe fn from_raw(handle: HANDLE) -> Option<Self> {
+        let context = unsafe { (handle as *const ContextContext).as_ref() }?;
+        Some(Self { context })
+    }
+
+    pub fn adapter(&self) -> Option<&'a AdapterContext> {
+        let device = unsafe { self.context.device.as_ref() }?;
+        unsafe { device.adapter.as_ref() }
+    }
 }
 
 /// State for one GPU process object (WDDM 2.0 GPU-VA requirement). We keep no

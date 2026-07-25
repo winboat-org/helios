@@ -99,8 +99,8 @@ fn compile_version_resource() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::write(
         &rc_path,
         r#"1 VERSIONINFO
-FILEVERSION 22,22,142,0
-PRODUCTVERSION 22,22,142,0
+FILEVERSION 22,22,176,0
+PRODUCTVERSION 22,22,176,0
 FILEFLAGSMASK 0x3fL
 FILEFLAGS 0
 FILEOS 0x00040004L
@@ -113,11 +113,11 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "Helios Project\0"
             VALUE "FileDescription", "Helios vGPU WDDM render miniport\0"
-            VALUE "FileVersion", "22.22.142.0\0"
+            VALUE "FileVersion", "22.22.176.0\0"
             VALUE "InternalName", "helios_kmd_render.sys\0"
             VALUE "OriginalFilename", "helios_kmd_render.sys\0"
             VALUE "ProductName", "Helios vGPU\0"
-            VALUE "ProductVersion", "22.22.142.0\0"
+            VALUE "ProductVersion", "22.22.176.0\0"
         END
     END
     BLOCK "VarFileInfo"

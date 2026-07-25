@@ -118,6 +118,12 @@ pub const VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM: u32 = 1;
 /// BGRX8888, matching Vulkan `VK_FORMAT_B8G8R8A8_UNORM` storage while telling
 /// the display backend to ignore alpha. (virtio_gpu_formats enum value 2.)
 pub const VIRTIO_GPU_FORMAT_B8G8R8X8_UNORM: u32 = 2;
+/// RGBA8888, matching Vulkan `VK_FORMAT_R8G8B8A8_UNORM`.
+/// (`virtio_gpu_formats` enum value 67.)
+pub const VIRTIO_GPU_FORMAT_R8G8B8A8_UNORM: u32 = 67;
+/// RGBX8888, matching Vulkan `VK_FORMAT_R8G8B8A8_UNORM` storage while telling
+/// the display backend to ignore alpha. (`virtio_gpu_formats` enum value 134.)
+pub const VIRTIO_GPU_FORMAT_R8G8B8X8_UNORM: u32 = 134;
 
 /// Control command header — prepended to every virtio-gpu command and response.
 /// 24 bytes, 8-byte aligned, no implicit padding.

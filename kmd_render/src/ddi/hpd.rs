@@ -136,6 +136,12 @@ pub unsafe extern "C" fn hpd_thread_routine(context: *mut c_void) {
             indicate_child_status(adapter, true);
         }
 
+        // Consume only the allocation identity supplied by Windows through
+        // SetVidPnSourceAddress. The DDI can be called at DIRQL, where neither
+        // Venus waits nor registry diagnostics are legal; this worker is the
+        // PASSIVE continuation for that exact callback.
+        crate::ddi::display::process_deferred_vidpn_source_address(adapter);
+
         if adapter.scanout_refresh_pending.swap(0, Ordering::AcqRel) != 0 {
             match adapter.queue_active_scanout_refresh() {
                 ScanoutRefreshQueue::Queued => {}

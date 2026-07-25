@@ -217,15 +217,16 @@ fn video_signal_info(w: u32, h: u32) -> D3DKMDT_VIDEO_SIGNAL_INFO {
     sig
 }
 
-/// Create + add our single source mode into `h_set`.
+/// Create + add one source mode into `h_set`.
 ///
 /// # Safety
 /// `iface` is a live `DXGK_VIDPNSOURCEMODESET_INTERFACE` for `h_set`.
-unsafe fn add_single_source_mode(
+unsafe fn add_source_mode(
     iface: *const DXGK_VIDPNSOURCEMODESET_INTERFACE,
     h_set: D3DKMDT_HVIDPNSOURCEMODESET,
     w: u32,
     h: u32,
+    pixel_format: D3DDDIFORMAT,
 ) -> NTSTATUS {
     // SAFETY: iface valid per the fn contract.
     let iface = unsafe { &*iface };
@@ -255,7 +256,7 @@ unsafe fn add_single_source_mode(
         g.PrimSurfSize.cy = h;
         g.VisibleRegionSize = g.PrimSurfSize;
         g.Stride = w * 4;
-        g.PixelFormat = _D3DDDIFORMAT::D3DDDIFMT_A8R8G8B8;
+        g.PixelFormat = pixel_format;
         g.ColorBasis = _D3DKMDT_COLOR_BASIS::D3DKMDT_CB_SCRGB;
         g.PixelValueAccessMode = _D3DKMDT_PIXEL_VALUE_ACCESS_MODE::D3DKMDT_PVAM_DIRECT;
     }
@@ -267,6 +268,32 @@ unsafe fn add_single_source_mode(
             return STATUS_SUCCESS;
         }
         return st;
+    }
+    STATUS_SUCCESS
+}
+
+/// Publish the two 32-bit source formats Helios carries end-to-end.
+///
+/// DXGI mode enumeration filters the VidPn source-mode set by the caller's
+/// requested format. Advertising only A8R8G8B8 therefore makes an RGBA8
+/// `GetDisplayModeList` call succeed with zero modes even though RGBA8 is a
+/// valid D3D11 display format. Each mode here is backed by the exact
+/// SetVidPnSourceAddress allocation format; the display copy path converts
+/// A8B8G8R8 into the adapter-owned BGRA scanout image.
+unsafe fn add_source_modes(
+    iface: *const DXGK_VIDPNSOURCEMODESET_INTERFACE,
+    h_set: D3DKMDT_HVIDPNSOURCEMODESET,
+    w: u32,
+    h: u32,
+) -> NTSTATUS {
+    for pixel_format in [
+        _D3DDDIFORMAT::D3DDDIFMT_A8R8G8B8,
+        _D3DDDIFORMAT::D3DDDIFMT_A8B8G8R8,
+    ] {
+        let status = unsafe { add_source_mode(iface, h_set, w, h, pixel_format) };
+        if !ok(status) {
+            return status;
+        }
     }
     STATUS_SUCCESS
 }
@@ -517,7 +544,8 @@ pub unsafe fn enum_cofunc_modality(
                 break;
             }
             if pinned.is_null() {
-                // No pinned source mode → replace the set with our single mode.
+                // No pinned source mode → replace the set with every format the
+                // primary/scanout path carries end-to-end.
                 // SAFETY: releasing/creating with valid handles.
                 status = unsafe { release_src(h_vidpn, h_set) };
                 if !ok(status) {
@@ -530,7 +558,7 @@ pub unsafe fn enum_cofunc_modality(
                     fp = 14;
                     break;
                 }
-                status = unsafe { add_single_source_mode(set_iface, h_set, mode_w, mode_h) };
+                status = unsafe { add_source_modes(set_iface, h_set, mode_w, mode_h) };
                 if !ok(status) {
                     fp = 15;
                     let _ = unsafe { release_src(h_vidpn, h_set) };

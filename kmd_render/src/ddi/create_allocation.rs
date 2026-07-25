@@ -14,18 +14,22 @@
 use alloc::boxed::Box;
 use core::ffi::c_void;
 use core::mem::size_of;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use bytemuck::{bytes_of, pod_read_unaligned, Zeroable};
 use helios_protocol::{
     HeliosWddmAllocMeta, HeliosWddmAllocPrivate, HeliosWddmOpenIdentity,
     HELIOS_WDDM_ALLOC_KIND_DEVICE_MEMORY, HELIOS_WDDM_ALLOC_KIND_STANDARD,
+    HELIOS_WDDM_ALLOC_MISC_DIRECT_SCANOUT, HELIOS_WDDM_ALLOC_MISC_GDI_TYPE_MASK,
+    HELIOS_WDDM_ALLOC_MISC_GDI_TYPE_SHIFT, HELIOS_WDDM_ALLOC_MISC_OPTIMAL_GDI_TEXTURE,
+    HELIOS_WDDM_ALLOC_MISC_PRIMARY, HELIOS_WDDM_ALLOC_MISC_RESOURCE_ASSOCIATED,
+    HELIOS_WDDM_ALLOC_MISC_STANDARD_TYPE_MASK, HELIOS_WDDM_ALLOC_MISC_STANDARD_TYPE_SHIFT,
     VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE, VIRTIO_GPU_BLOB_MEM_HOST3D, VIRTIO_GPU_MAP_CACHE_CACHED,
     VIRTIO_GPU_MAP_CACHE_WC,
 };
 
 use crate::adapter::AdapterContext;
-use crate::dxgk::_D3DDDIFORMAT::D3DDDIFMT_A8R8G8B8;
+use crate::dxgk::_D3DDDIFORMAT::{D3DDDIFMT_A8B8G8R8, D3DDDIFMT_A8R8G8B8, D3DDDIFMT_X8R8G8B8};
 use crate::dxgk::_D3DKMDT_STANDARDALLOCATION_TYPE::{
     D3DKMDT_STANDARDALLOCATION_GDISURFACE, D3DKMDT_STANDARDALLOCATION_SHADOWSURFACE,
     D3DKMDT_STANDARDALLOCATION_SHAREDPRIMARYSURFACE, D3DKMDT_STANDARDALLOCATION_STAGINGSURFACE,
@@ -60,11 +64,25 @@ struct AllocationContext {
     /// the exact SetVidPn primary into its durable LINEAR scanout image.
     scanout_copy_image_id: core::sync::atomic::AtomicU64,
     scanout_copy_memory_id: core::sync::atomic::AtomicU64,
+    scanout_copy_conversion_image_id: core::sync::atomic::AtomicU64,
+    scanout_copy_conversion_memory_id: core::sync::atomic::AtomicU64,
+    scanout_copy_conversion_init_pool_id: core::sync::atomic::AtomicU64,
     scanout_copy_pool_id: core::sync::atomic::AtomicU64,
     scanout_copy_command_buffer_id: core::sync::atomic::AtomicU64,
     scanout_copy_target_image_id: core::sync::atomic::AtomicU64,
     scanout_copy_last_fence: core::sync::atomic::AtomicU64,
     scanout_copy_owns_source_alias: AtomicU32,
+    /// Exact segment-relative address supplied by Windows in
+    /// `DXGKARG_SETVIDPNSOURCEADDRESS` for this allocation. Keeping it on the
+    /// allocation makes the raised-IRQL callback's deferred handle and address
+    /// one identity; the worker never combines an allocation with a global
+    /// "latest address" from another flip.
+    vidpn_primary_address: AtomicU64,
+    /// Exact WDDM segment containing `vidpn_primary_address`, supplied in the
+    /// same `DXGKARG_SETVIDPNSOURCEADDRESS` callback.
+    vidpn_primary_segment: AtomicU32,
+    /// Exact `DXGK_SETVIDPNSOURCEADDRESS_FLAGS::Value` paired with the callback.
+    vidpn_primary_flags: AtomicU32,
     size: SIZE_T,
     /// Host-visible window byte offset this blob is mapped at (Stage 2b).
     map_offset: u64,
@@ -127,28 +145,110 @@ struct ResourceContext {
 /// in command allocation lists / CloseAllocation.
 const OPEN_ALLOCATION_CTX_MAGIC: u32 = 0x484F_504E; // "HOPN"
 
+/// Opaque allocation token owned by dxgkrnl.
+///
+/// This is deliberately not a pointer-shaped type. `DXGK_OPENALLOCATIONINFO`
+/// calls the field `hAllocation`, but its type is `D3DKMT_HANDLE` (a 32-bit
+/// runtime token), not the miniport's `AllocationContext*` returned from
+/// `DxgkDdiCreateAllocation`. Keeping the token behind a newtype prevents open
+/// allocation code from accidentally casting it back to a KMD context.
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+struct RuntimeAllocationHandle(D3DKMT_HANDLE);
+
 struct OpenAllocationContext {
     magic: u32,
-    allocation: D3DKMT_HANDLE,
+    runtime_allocation: RuntimeAllocationHandle,
     private_size: u32,
-    /// Venus resource id (from `HeliosWddmAllocPrivate._pad`) + geometry, captured
-    /// from the open-time private data so the Present blit can resolve the
-    /// composition source / IddCx destination surfaces by `hDeviceSpecificAllocation`
-    /// (dxgkrnl gives Present only this device-specific handle, not `hAllocation`).
-    resource_id: u32,
-    width: u32,
-    height: u32,
-    format: u32,
+    /// Validated immutable view captured from open-time private data. Present
+    /// receives only this device-specific open handle, so it must use this
+    /// snapshot rather than trying to reinterpret dxgkrnl's runtime token as an
+    /// `AllocationContext*`.
+    present: Option<PresentAllocInfo>,
 }
 
 /// Surface identity + geometry for a Present allocation-list entry, resolved from
 /// its `hDeviceSpecificAllocation` ([`present_alloc_info`]).
 #[derive(Clone, Copy)]
 pub struct PresentAllocInfo {
+    /// Per-device runtime allocation token supplied by dxgkrnl in
+    /// `DXGK_OPENALLOCATIONINFO::hAllocation`.
+    pub runtime_allocation: u32,
     pub resource_id: u32,
+    /// Versioned allocation kind from the creator/open identity. Present uses
+    /// this explicit contract to choose image-vs-buffer interpretation; a
+    /// resource id is never guessed from geometry or memory visibility.
+    pub kind: u32,
     pub width: u32,
     pub height: u32,
+    /// Authoritative byte stride of KMD-created standard allocations. Ordinary
+    /// UMD OPTIMAL images leave this at zero because they have no linear row
+    /// layout; Present destinations backed by the GDI staging contract carry
+    /// the exact 256-byte-aligned pitch.
+    pub pitch: u32,
+    /// Exact memory-plane-0 offset carried in the allocation private data.
+    pub plane_offset: u64,
+    /// Authoritative legacy D3DDDIFORMAT supplied for KMD-created standard
+    /// allocations. Some such allocations predate an exact DXGI trailer.
     pub format: u32,
+    /// Exact creator-side DXGI format; unlike D3DDDIFORMAT, this preserves
+    /// BGRA alpha-vs-X identity.
+    pub dxgi_format: u32,
+    /// Exact D3D11 DDI bind flags used to create the ordinary OPTIMAL image.
+    pub bind_flags: u32,
+    /// The creator's image/buffer storage contract, captured from authoritative
+    /// private data. Present must match this exhaustively; a STANDARD allocation
+    /// is not inherently a linear byte buffer.
+    pub storage: PresentAllocationStorage,
+    /// Exact external allocation contract required by Venus import.
+    pub venus_alloc_size: u64,
+    pub memory_type_index: u32,
+    /// Exact `D3DKMDT_STANDARDALLOCATION_TYPE` supplied by Windows, or zero for
+    /// a UMD-created allocation.
+    pub standard_allocation_type: u32,
+    /// Exact `D3DKMDT_GDISURFACETYPE` supplied by Windows, or zero when the
+    /// standard allocation is not a GDI surface.
+    pub standard_gdi_surface_type: u32,
+    /// Exact `DXGK_OPENALLOCATIONFLAGS::Value` supplied by dxgkrnl.
+    pub open_flags: u32,
+    /// Whether `DXGK_CREATEALLOCATIONFLAGS::Resource` was set for the
+    /// allocation's create call.
+    pub resource_associated: bool,
+    pub allocation_private_size: u32,
+    pub resource_private_size: u32,
+    /// The allocation was created from the runtime's documented
+    /// `pPrimaryDesc` contract and explicitly exported for direct scanout.
+    pub direct_scanout: bool,
+}
+
+#[repr(u32)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PresentAllocationStorage {
+    /// Ordinary UMD shared OPTIMAL image, imported through OPAQUE_FD.
+    OptimalOpaqueFdImage = 0,
+    /// Cross-context DMA_BUF image (direct primary or a KMD-created GDI
+    /// redirection texture).
+    OptimalCrossContextImage = 1,
+    /// KMD-created standard CPU-visible surface with an authoritative pitch.
+    PitchedStandardBuffer = 2,
+}
+
+impl PresentAllocInfo {
+    /// Resolve the exact Vulkan/DXGI Present format without
+    /// geometry/content heuristics.
+    ///
+    /// UMD-created allocations carry an exact DXGI value. KMD-created standard
+    /// allocations may carry only the authoritative D3DDDIFORMAT; use the same
+    /// fixed mapping as UMD `d3d_format_to_dxgi`.
+    pub fn resolved_dxgi_format(self) -> Option<u32> {
+        match self.dxgi_format {
+            exact if exact != 0 => Some(exact),
+            0 if self.format == D3DDDIFMT_A8B8G8R8 as u32 => Some(28),
+            0 if self.format == D3DDDIFMT_A8R8G8B8 as u32 => Some(87),
+            0 if self.format == D3DDDIFMT_X8R8G8B8 as u32 => Some(88),
+            _ => None,
+        }
+    }
 }
 
 /// Resolve a Present allocation-list entry's `hDeviceSpecificAllocation` (an
@@ -166,32 +266,7 @@ pub unsafe fn present_alloc_info(h: HANDLE) -> Option<PresentAllocInfo> {
     if open.magic != OPEN_ALLOCATION_CTX_MAGIC {
         return None;
     }
-    if open.resource_id == 0 {
-        return None;
-    }
-    Some(PresentAllocInfo {
-        resource_id: open.resource_id,
-        width: open.width,
-        height: open.height,
-        format: open.format,
-    })
-}
-
-/// Resolve a Present allocation-list entry's device-specific allocation handle
-/// to the create-time allocation scanout metadata. Present does not carry the
-/// raw `hAllocation`; it carries the per-device handle we returned from
-/// `DxgkDdiOpenAllocation`, so use that open context as the contract bridge.
-///
-/// SAFETY: same contract as [`present_alloc_info`].
-pub(crate) unsafe fn present_scanout_alloc_info(h: HANDLE) -> Option<ScanoutInfo> {
-    if h.is_null() {
-        return None;
-    }
-    let open = unsafe { &*(h as *const OpenAllocationContext) };
-    if open.magic != OPEN_ALLOCATION_CTX_MAGIC {
-        return None;
-    }
-    unsafe { scanout_alloc_info(open.allocation as HANDLE) }
+    open.present
 }
 
 /// Snapshot of the [`AllocationContext`] fields `BuildPagingBuffer` needs to
@@ -244,6 +319,39 @@ pub(crate) struct ScanoutInfo {
     pub venus_alloc_size: u64,
     pub memory_type_index: u32,
     pub direct_scanout: bool,
+    /// Exact `PrimarySegment` paired with this hAllocation by Windows.
+    pub primary_segment: u32,
+    /// Exact `PrimaryAddress` paired with this hAllocation by Windows.
+    pub primary_address: u64,
+    /// Exact `DXGK_SETVIDPNSOURCEADDRESS_FLAGS::Value` supplied by Windows.
+    pub primary_flags: u32,
+}
+
+/// Preserve the exact segment, address, and flags Windows paired with a
+/// SetVidPn allocation.
+///
+/// SAFETY: `h` is the live KMD allocation handle supplied by dxgkrnl to
+/// `DxgkDdiSetVidPnSourceAddress`.
+pub(crate) unsafe fn set_vidpn_primary_address(
+    h: HANDLE,
+    primary_segment: u32,
+    primary_address: u64,
+    primary_flags: u32,
+) -> bool {
+    if h.is_null() {
+        return false;
+    }
+    let ctx = unsafe { &*(h as *const AllocationContext) };
+    if ctx.magic != ALLOCATION_CTX_MAGIC {
+        return false;
+    }
+    ctx.vidpn_primary_segment
+        .store(primary_segment, Ordering::Relaxed);
+    ctx.vidpn_primary_flags
+        .store(primary_flags, Ordering::Relaxed);
+    ctx.vidpn_primary_address
+        .store(primary_address, Ordering::Release);
+    true
 }
 
 /// Resolve a primary allocation's `hAllocation` (the CreateAllocation handle
@@ -268,6 +376,9 @@ pub(crate) unsafe fn scanout_alloc_info(h: HANDLE) -> Option<ScanoutInfo> {
         venus_alloc_size: ctx.venus_alloc_size,
         memory_type_index: ctx.memory_type_index,
         direct_scanout: ctx.direct_scanout,
+        primary_segment: ctx.vidpn_primary_segment.load(Ordering::Relaxed),
+        primary_address: ctx.vidpn_primary_address.load(Ordering::Acquire),
+        primary_flags: ctx.vidpn_primary_flags.load(Ordering::Relaxed),
     })
 }
 
@@ -288,6 +399,13 @@ fn cached_prepared_copy(
         },
         source_image_id: ctx.scanout_copy_image_id.load(Ordering::Relaxed),
         source_memory_id: ctx.scanout_copy_memory_id.load(Ordering::Relaxed),
+        conversion_image_id: ctx.scanout_copy_conversion_image_id.load(Ordering::Relaxed),
+        conversion_memory_id: ctx
+            .scanout_copy_conversion_memory_id
+            .load(Ordering::Relaxed),
+        conversion_init_pool_id: ctx
+            .scanout_copy_conversion_init_pool_id
+            .load(Ordering::Relaxed),
         command_pool_id: ctx.scanout_copy_pool_id.load(Ordering::Relaxed),
         command_buffer_id,
         target_image_id: ctx.scanout_copy_target_image_id.load(Ordering::Relaxed),
@@ -305,6 +423,12 @@ fn publish_prepared_copy(ctx: &AllocationContext, copy: &crate::virtio::venus::P
         .store(copy.source_image_id, Ordering::Relaxed);
     ctx.scanout_copy_memory_id
         .store(copy.source_memory_id, Ordering::Relaxed);
+    ctx.scanout_copy_conversion_image_id
+        .store(copy.conversion_image_id, Ordering::Relaxed);
+    ctx.scanout_copy_conversion_memory_id
+        .store(copy.conversion_memory_id, Ordering::Relaxed);
+    ctx.scanout_copy_conversion_init_pool_id
+        .store(copy.conversion_init_pool_id, Ordering::Relaxed);
     ctx.scanout_copy_pool_id
         .store(copy.command_pool_id, Ordering::Relaxed);
     ctx.scanout_copy_target_image_id
@@ -319,6 +443,12 @@ fn clear_prepared_copy(ctx: &AllocationContext) {
     ctx.scanout_copy_last_fence.store(0, Ordering::Relaxed);
     ctx.scanout_copy_target_image_id.store(0, Ordering::Relaxed);
     ctx.scanout_copy_pool_id.store(0, Ordering::Relaxed);
+    ctx.scanout_copy_conversion_init_pool_id
+        .store(0, Ordering::Relaxed);
+    ctx.scanout_copy_conversion_memory_id
+        .store(0, Ordering::Relaxed);
+    ctx.scanout_copy_conversion_image_id
+        .store(0, Ordering::Relaxed);
     ctx.scanout_copy_memory_id.store(0, Ordering::Relaxed);
     ctx.scanout_copy_image_id.store(0, Ordering::Relaxed);
     ctx.scanout_copy_owns_source_alias
@@ -339,6 +469,7 @@ pub(crate) unsafe fn submit_primary_scanout_copy(
     target_image_id: u64,
     width: u32,
     height: u32,
+    primary_address: u64,
 ) -> Result<u64, NTSTATUS> {
     if h.is_null() || target_image_id == 0 || width == 0 || height == 0 {
         return Err(STATUS_INVALID_PARAMETER);
@@ -354,7 +485,9 @@ pub(crate) unsafe fn submit_primary_scanout_copy(
     }
     const DXGI_FORMAT_B8G8R8A8_UNORM: u32 = 87;
     const DXGI_FORMAT_B8G8R8X8_UNORM: u32 = 88;
-    if ctx.dxgi_format != DXGI_FORMAT_B8G8R8A8_UNORM
+    const DXGI_FORMAT_R8G8B8A8_UNORM: u32 = 28;
+    if ctx.dxgi_format != DXGI_FORMAT_R8G8B8A8_UNORM
+        && ctx.dxgi_format != DXGI_FORMAT_B8G8R8A8_UNORM
         && ctx.dxgi_format != DXGI_FORMAT_B8G8R8X8_UNORM
     {
         crate::diag::record_named_bytes(b"CpFmt", ctx.dxgi_format);
@@ -383,16 +516,18 @@ pub(crate) unsafe fn submit_primary_scanout_copy(
                         ctx.venus_image_id,
                         width,
                         height,
+                        ctx.dxgi_format,
                         target_image_id,
                     )?
                 } else {
-                    client.prepare_optimal_bgra_copy(
+                    client.prepare_optimal_scanout_copy(
                         adapter,
                         ctx.resource_id,
                         ctx.venus_alloc_size,
                         ctx.memory_type_index,
                         width,
                         height,
+                        ctx.dxgi_format,
                         ctx.bind_flags,
                         target_image_id,
                     )?
@@ -401,7 +536,7 @@ pub(crate) unsafe fn submit_primary_scanout_copy(
                 copy
             }
         };
-        let fence = client.submit_prepared_image_copy(adapter, &copy)?;
+        let fence = client.submit_prepared_image_copy(adapter, &copy, primary_address)?;
         ctx.scanout_copy_last_fence.store(fence, Ordering::Release);
         Ok::<u64, crate::virtio::VirtioError>(fence)
     });
@@ -451,18 +586,6 @@ const D3DDDI_ALLOCATIONPRIORITY_NORMAL: UINT = 0x7800_0000;
 /// so its backing must be linear with this pitch for the IndirectKMD adapter to
 /// open the same surface. PATH-A (2026-06-22).
 const CROSS_ADAPTER_PITCH_ALIGN: u32 = 256;
-
-/// Meta `misc_flags` bit (KMD-internal, bit 31 — clear of any D3D11
-/// `D3D11_RESOURCE_MISC_*` value the UMD sets in the low bits) marking a
-/// `SHAREDPRIMARYSURFACE` standard allocation as a scan-out PRIMARY. dxgkrnl
-/// rejects `Cached` (and PermanentSysMem/ExistingSysMem/ExistingKernelSysMem/
-/// ManagedPrimary) on a Primary allocation ("...can't be specified with Primary",
-/// AzureTriage — 36th session), which silently fails primary creation → no VidPn
-/// path. `create_one` reads this bit and suppresses `Cached` for the primary.
-const HELIOS_ALLOC_MISC_PRIMARY: u32 = 0x8000_0000;
-/// Set only by the UMD for the exact `pPrimaryDesc` surface after it has created
-/// the backing image as plain LINEAR + DMA_BUF and queried a valid COLOR layout.
-const HELIOS_ALLOC_MISC_DIRECT_SCANOUT: u32 = 0x4000_0000;
 
 fn round_up_page(n: SIZE_T) -> SIZE_T {
     n.saturating_add(PAGE - 1) & !(PAGE - 1)
@@ -613,6 +736,16 @@ unsafe fn write_open_identity(
 /// PASSIVE_LEVEL (DxgkDdiDestroyAllocation) — the round-trips ride
 /// `virtio::ctrl`'s PASSIVE waits.
 unsafe fn destroy_allocation_ctx(adapter: &AdapterContext, ctx: Box<AllocationContext>) {
+    let allocation_handle = (&*ctx as *const AllocationContext) as usize;
+    // Retire the exact Windows/KMD allocation identity before any backing
+    // resource, Venus image, or cached copy can be torn down. If QEMU cannot
+    // confirm resource_id=0 scanout disable, retain every host object until
+    // device teardown rather than leave scanout 0 pointing at an unref'd blob.
+    if !adapter.retire_scanout_allocation(allocation_handle, ctx.resource_id) {
+        drop(ctx);
+        return;
+    }
+    adapter.system_backings.remove(ctx.resource_id);
     // A prepared scanout copy owns a command buffer which may still be queued
     // through the outer async SUBMIT_3D. Drain that GPU-completion fence and
     // tear the prepared objects down BEFORE touching the allocation's resource,
@@ -633,6 +766,24 @@ unsafe fn destroy_allocation_ctx(adapter: &AdapterContext, ctx: Box<AllocationCo
         }
         clear_prepared_copy(&ctx);
         crate::diag::record_named_bytes(b"CpDrn", 1);
+    }
+
+    // Present BLT command buffers bake imported aliases of ordinary WDDM
+    // resources. Drain the cache before any one backing resource can be
+    // detached/unref'd. The cache is intentionally one ownership unit because
+    // several swapchain sources may share the same DWM destination.
+    let present_drained = adapter
+        .with_venus_client(|client| {
+            client.release_present_blits_for_resource(adapter, ctx.resource_id)
+        })
+        .map(|result| result.is_ok())
+        .unwrap_or(false);
+    if !present_drained {
+        crate::diag::record_named_bytes(b"PBDrn", 0xE);
+        // Ambiguous GPU completion: retain the allocation and all host objects
+        // until Venus-context teardown rather than risk a GPU use-after-free.
+        drop(ctx);
+        return;
     }
 
     // A DWM import of the adapter-owned LINEAR target can acquire a transient
@@ -687,6 +838,7 @@ unsafe fn create_one(
     resource_private: *const c_void,
     resource_private_size: UINT,
     info: &mut DXGK_ALLOCATIONINFO,
+    resource_associated: bool,
 ) -> Result<(), NTSTATUS> {
     // ── Read + validate the ICD's private driver data ───────────────────────
     let mut priv_ptr = info.pPrivateDriverData as *const u8;
@@ -720,6 +872,9 @@ unsafe fn create_one(
     // context — which must be live (it is at Code 0; defensive otherwise).
     let mut meta = unsafe { read_standard_meta(priv_ptr as *const c_void, priv_len as UINT) }
         .unwrap_or_else(HeliosWddmAllocMeta::zeroed);
+    if resource_associated {
+        meta.misc_flags |= HELIOS_WDDM_ALLOC_MISC_RESOURCE_ASSOCIATED;
+    }
     let mut ap = ap;
     let mut supplied_resource_id = 0u32;
     if ap.kind == HELIOS_WDDM_ALLOC_KIND_STANDARD {
@@ -750,7 +905,9 @@ unsafe fn create_one(
     let adopt_supplied_resource = supplied_resource_id != 0;
     let mut venus_memory_id = 0u64;
     let mut venus_image_id = 0u64;
-    let is_primary = (meta.misc_flags & HELIOS_ALLOC_MISC_PRIMARY) != 0;
+    let is_primary = (meta.misc_flags & HELIOS_WDDM_ALLOC_MISC_PRIMARY) != 0;
+    let is_optimal_gdi_texture = ap.kind == HELIOS_WDDM_ALLOC_KIND_STANDARD
+        && (meta.misc_flags & HELIOS_WDDM_ALLOC_MISC_OPTIMAL_GDI_TEXTURE) != 0;
     let resource_id = if adopt_supplied_resource {
         // C1 lifetime fix: adopting transfers the blob's ownership from the
         // ICD's escape owner (D3DKMT device handle) to THIS allocation, so a
@@ -800,6 +957,49 @@ unsafe fn create_one(
             }
             Err(_de) => {
                 crate::diag::record(0x0C01_00E1);
+                return Err(STATUS_DEVICE_NOT_READY);
+            }
+        }
+    } else if is_optimal_gdi_texture {
+        // D3DKMDT_GDISURFACE_TEXTURE is a shared, non-CPU-visible texture used
+        // as both a DWM sample source and a DirectX render target. Preserve that
+        // contract with a real cross-context OPTIMAL image. Reinterpreting this
+        // allocation as pitched host bytes makes DWM sample tiled memory as a
+        // different resource shape and produces a black redirected window.
+        let dxgi_format = match meta.format {
+            value if value == D3DDDIFMT_A8R8G8B8 as u32 => 87,
+            value if value == D3DDDIFMT_X8R8G8B8 as u32 => 88,
+            _ => {
+                crate::diag::record_named_bytes(b"GdiOFmt", meta.format);
+                return Err(STATUS_NOT_SUPPORTED);
+            }
+        };
+        match adapter.with_venus_client(|client| {
+            client.allocate_optimal_gdi_image_blob(
+                adapter,
+                meta.width,
+                meta.height,
+                meta.bind_flags,
+                dxgi_format,
+            )
+        }) {
+            Ok(Ok(image)) => {
+                venus_memory_id = image.blob.blob_id;
+                venus_image_id = image.image_id;
+                meta.pitch = 0;
+                meta.plane_offset = 0;
+                meta.dxgi_format = dxgi_format;
+                meta.venus_alloc_size = image.blob.size;
+                meta.memory_type_index = image.memory_type_index;
+                ap.size = image.blob.size;
+                image.blob.res_id
+            }
+            Ok(Err(_ve)) => {
+                crate::diag::record_named_bytes(b"GdiOImg", 0xE1);
+                return Err(STATUS_NO_MEMORY);
+            }
+            Err(_de) => {
+                crate::diag::record_named_bytes(b"GdiOImg", 0xE2);
                 return Err(STATUS_DEVICE_NOT_READY);
             }
         }
@@ -937,7 +1137,7 @@ unsafe fn create_one(
         .as_ref()
         .filter(|b| !b.probe_only)
         .map(|b| b.seg_id);
-    let bar_eligible = venus_memory_id != 0 && bar_seg_id.is_some();
+    let bar_eligible = venus_memory_id != 0 && !is_optimal_gdi_texture && bar_seg_id.is_some();
 
     let ctx = Box::new(AllocationContext {
         magic: ALLOCATION_CTX_MAGIC,
@@ -949,11 +1149,17 @@ unsafe fn create_one(
         venus_image_id,
         scanout_copy_image_id: core::sync::atomic::AtomicU64::new(0),
         scanout_copy_memory_id: core::sync::atomic::AtomicU64::new(0),
+        scanout_copy_conversion_image_id: core::sync::atomic::AtomicU64::new(0),
+        scanout_copy_conversion_memory_id: core::sync::atomic::AtomicU64::new(0),
+        scanout_copy_conversion_init_pool_id: core::sync::atomic::AtomicU64::new(0),
         scanout_copy_pool_id: core::sync::atomic::AtomicU64::new(0),
         scanout_copy_command_buffer_id: core::sync::atomic::AtomicU64::new(0),
         scanout_copy_target_image_id: core::sync::atomic::AtomicU64::new(0),
         scanout_copy_last_fence: core::sync::atomic::AtomicU64::new(0),
         scanout_copy_owns_source_alias: AtomicU32::new(0),
+        vidpn_primary_address: AtomicU64::new(0),
+        vidpn_primary_segment: AtomicU32::new(0),
+        vidpn_primary_flags: AtomicU32::new(0),
         size,
         map_offset: 0,
         map_len: 0,
@@ -964,7 +1170,7 @@ unsafe fn create_one(
         bind_flags: meta.bind_flags,
         pitch: meta.pitch,
         dxgi_format: meta.dxgi_format,
-        direct_scanout: (meta.misc_flags & HELIOS_ALLOC_MISC_DIRECT_SCANOUT) != 0,
+        direct_scanout: (meta.misc_flags & HELIOS_WDDM_ALLOC_MISC_DIRECT_SCANOUT) != 0,
         plane_offset: meta.plane_offset,
         venus_alloc_size: meta.venus_alloc_size,
         memory_type_index: meta.memory_type_index,
@@ -1035,7 +1241,20 @@ unsafe fn create_one(
             .FlagsWddm2
             .__bindgen_anon_1
             .__bindgen_anon_1
-            .set_CpuVisible(1);
+            .set_CpuVisible(u32::from(!is_optimal_gdi_texture));
+        // A D3DDDI primary is selected by the display engine using the physical
+        // address delivered in SetVidPnSourceAddress. Tell VidMm that exact
+        // access model so it allocates the primary contiguously in a
+        // GPU-addressable segment rather than at a non-identifiable implicit
+        // system-memory address. `is_primary` comes only from Windows'
+        // pPrimaryDesc/standard-allocation contract preserved in private data.
+        if is_primary {
+            info.__bindgen_anon_4
+                .FlagsWddm2
+                .__bindgen_anon_1
+                .__bindgen_anon_1
+                .set_AccessedPhysically(1);
+        }
         // WB-cacheable CPU views: without `Cached`, dxgkrnl maps user views of
         // these allocations write-combined; WC READS of the BAR window measured
         // ~200 MB/s (36 ms per 7.8 MiB IDD readback frame, 2026-07-06). The BAR
@@ -1049,7 +1268,7 @@ unsafe fn create_one(
         if is_primary {
             crate::diag::record(0x0C3E_0000 | (resource_id & 0xFFFF));
         }
-        if adapter.alloc_cached && !is_primary {
+        if adapter.alloc_cached && !is_primary && !is_optimal_gdi_texture {
             info.__bindgen_anon_4
                 .FlagsWddm2
                 .__bindgen_anon_1
@@ -1094,6 +1313,13 @@ pub unsafe extern "C" fn dxgkddi_create_allocation(
     // SAFETY: Dxgkrnl passes our adapter context and a valid args struct.
     let adapter = unsafe { &*(h_adapter as *const AdapterContext) };
     let args = unsafe { &mut *create_allocation };
+    let create_flags = unsafe { args.Flags.__bindgen_anon_1.Value };
+    let input_resource = args.hResource as usize as u64;
+    crate::diag::record_named_bytes(b"CARFlg", create_flags);
+    crate::diag::record_named_bytes(b"CARNum", args.NumAllocations);
+    crate::diag::record_named_bytes(b"CARRSz", args.PrivateDriverDataSize);
+    crate::diag::record_named_bytes(b"CARInLo", input_resource as u32);
+    crate::diag::record_named_bytes(b"CARInHi", (input_resource >> 32) as u32);
     crate::diag::record(0x0C10_0000 | ((args.NumAllocations as u32).min(0xFFFF)));
     crate::diag::record(0x0C33_0000 | ((args.PrivateDriverDataSize as u32).min(0xFFFF)));
     crate::diag::record(0x0C34_0000 | (unsafe { args.Flags.__bindgen_anon_1.Value } & 0xFFFF));
@@ -1111,16 +1337,21 @@ pub unsafe extern "C" fn dxgkddi_create_allocation(
         crate::diag::record(0x0C01_0030);
         crate::diag::record(0x0C3D_0000 | ((args.hResource as usize as u32) & 0xFFFF));
     }
+    let output_resource = args.hResource as usize as u64;
+    crate::diag::record_named_bytes(b"CAROutLo", output_resource as u32);
+    crate::diag::record_named_bytes(b"CAROutHi", (output_resource >> 32) as u32);
 
     for i in 0..args.NumAllocations as usize {
         // SAFETY: pAllocationInfo points to NumAllocations elements.
         let info = unsafe { &mut *args.pAllocationInfo.add(i) };
+        crate::diag::record_named_bytes(b"CARAPSz", info.PrivateDriverDataSize);
         if let Err(status) = unsafe {
             create_one(
                 adapter,
                 args.pPrivateDriverData,
                 args.PrivateDriverDataSize,
                 info,
+                wants_resource,
             )
         } {
             // Unwind the allocations already created in this call.
@@ -1256,14 +1487,50 @@ pub unsafe extern "C" fn dxgkddi_open_allocation(
             }
         }
 
+        let open_flags = unsafe { args.Flags.__bindgen_anon_1.Value };
+        let present = ident.map(|identity| {
+            let misc_flags = meta.map(|m| m.misc_flags).unwrap_or(0);
+            let storage = if identity.kind == HELIOS_WDDM_ALLOC_KIND_STANDARD {
+                if misc_flags & HELIOS_WDDM_ALLOC_MISC_OPTIMAL_GDI_TEXTURE != 0 {
+                    PresentAllocationStorage::OptimalCrossContextImage
+                } else {
+                    PresentAllocationStorage::PitchedStandardBuffer
+                }
+            } else if misc_flags & HELIOS_WDDM_ALLOC_MISC_DIRECT_SCANOUT != 0 {
+                PresentAllocationStorage::OptimalCrossContextImage
+            } else {
+                PresentAllocationStorage::OptimalOpaqueFdImage
+            };
+            PresentAllocInfo {
+                runtime_allocation: info.hAllocation,
+                resource_id,
+                kind: identity.kind,
+                width: meta.map(|m| m.width).unwrap_or(0),
+                height: meta.map(|m| m.height).unwrap_or(0),
+                pitch: meta.map(|m| m.pitch).unwrap_or(0),
+                plane_offset: meta.map(|m| m.plane_offset).unwrap_or(0),
+                format: meta.map(|m| m.format).unwrap_or(0),
+                dxgi_format: meta.map(|m| m.dxgi_format).unwrap_or(0),
+                bind_flags: meta.map(|m| m.bind_flags).unwrap_or(0),
+                storage,
+                venus_alloc_size: identity.venus_alloc_size,
+                memory_type_index: identity.memory_type_index,
+                standard_allocation_type: (misc_flags & HELIOS_WDDM_ALLOC_MISC_STANDARD_TYPE_MASK)
+                    >> HELIOS_WDDM_ALLOC_MISC_STANDARD_TYPE_SHIFT,
+                standard_gdi_surface_type: (misc_flags & HELIOS_WDDM_ALLOC_MISC_GDI_TYPE_MASK)
+                    >> HELIOS_WDDM_ALLOC_MISC_GDI_TYPE_SHIFT,
+                open_flags,
+                resource_associated: misc_flags & HELIOS_WDDM_ALLOC_MISC_RESOURCE_ASSOCIATED != 0,
+                allocation_private_size: info.PrivateDriverDataSize,
+                resource_private_size: args.PrivateDriverSize,
+                direct_scanout: misc_flags & HELIOS_WDDM_ALLOC_MISC_DIRECT_SCANOUT != 0,
+            }
+        });
         let open = Box::new(OpenAllocationContext {
             magic: OPEN_ALLOCATION_CTX_MAGIC,
-            allocation: info.hAllocation,
+            runtime_allocation: RuntimeAllocationHandle(info.hAllocation),
             private_size: info.PrivateDriverDataSize,
-            resource_id,
-            width: meta.map(|m| m.width).unwrap_or(0),
-            height: meta.map(|m| m.height).unwrap_or(0),
-            format: meta.map(|m| m.format).unwrap_or(0),
+            present,
         });
         record_alloc_event(
             resource_id,
@@ -1303,7 +1570,9 @@ pub unsafe extern "C" fn dxgkddi_open_allocation(
 
         if let Some(meta) = meta {
             args.SubresourceOffset = 0;
-            args.Pitch = if meta.pitch != 0 {
+            args.Pitch = if meta.misc_flags & HELIOS_WDDM_ALLOC_MISC_OPTIMAL_GDI_TEXTURE != 0 {
+                0
+            } else if meta.pitch != 0 {
                 meta.pitch
             } else {
                 cross_adapter_pitch(meta.width)
@@ -1331,7 +1600,7 @@ pub unsafe extern "C" fn dxgkddi_close_allocation(
         if !handle.is_null() {
             crate::diag::record(0x0C37_0000 | ((handle as usize as u32) & 0xFFFF));
             let open = unsafe { Box::from_raw(handle as *mut OpenAllocationContext) };
-            let _ = (open.allocation, open.private_size);
+            let _ = (open.runtime_allocation, open.private_size);
         }
     }
     STATUS_SUCCESS
@@ -1404,6 +1673,8 @@ pub unsafe extern "C" fn dxgkddi_get_standard_allocation_driver_data(
     // SAFETY: dxgkrnl hands back our AdapterContext and a writable args struct.
     let adapter = unsafe { &*(h_adapter as *const AdapterContext) };
     let args = unsafe { &mut *standard_allocation };
+    let standard_allocation_type = args.StandardAllocationType as u32;
+    crate::diag::record_named_bytes(b"StdType", standard_allocation_type);
     crate::diag::record(0x0C02_0002 | ((args.StandardAllocationType as u32 & 0xFF) << 4));
 
     const PRIV_SIZE: u32 =
@@ -1413,8 +1684,14 @@ pub unsafe extern "C" fn dxgkddi_get_standard_allocation_driver_data(
     if args.pAllocationPrivateDriverData.is_null() {
         args.AllocationPrivateDriverDataSize = PRIV_SIZE;
         args.ResourcePrivateDriverDataSize = PRIV_SIZE;
+        crate::diag::record_named_bytes(b"StdPhase", 1);
+        crate::diag::record_named_bytes(b"StdAPSz", PRIV_SIZE);
+        crate::diag::record_named_bytes(b"StdRPSz", PRIV_SIZE);
         return STATUS_SUCCESS;
     }
+    crate::diag::record_named_bytes(b"StdPhase", 2);
+    crate::diag::record_named_bytes(b"StdAPSz", args.AllocationPrivateDriverDataSize);
+    crate::diag::record_named_bytes(b"StdRPSz", args.ResourcePrivateDriverDataSize);
     if (args.AllocationPrivateDriverDataSize as usize) < PRIV_SIZE as usize {
         return STATUS_INVALID_PARAMETER;
     }
@@ -1428,6 +1705,8 @@ pub unsafe extern "C" fn dxgkddi_get_standard_allocation_driver_data(
     // SAFETY: the union arm is selected by StandardAllocationType; dxgkrnl
     // guarantees the matching surface-data pointer is valid for the fill call.
     let is_primary = args.StandardAllocationType == D3DKMDT_STANDARDALLOCATION_SHAREDPRIMARYSURFACE;
+    let mut is_optimal_gdi_texture = false;
+    let mut gdi_surface_type = 0u32;
     let (width, height, format): (u32, u32, u32) = match args.StandardAllocationType {
         D3DKMDT_STANDARDALLOCATION_SHAREDPRIMARYSURFACE => {
             let sd = unsafe { &*args.__bindgen_anon_1.pCreateSharedPrimarySurfaceData };
@@ -1445,7 +1724,18 @@ pub unsafe extern "C" fn dxgkddi_get_standard_allocation_driver_data(
         }
         D3DKMDT_STANDARDALLOCATION_GDISURFACE => {
             let sd = unsafe { &mut *args.__bindgen_anon_1.pCreateGdiSurfaceData };
-            sd.Pitch = cross_adapter_pitch(sd.Width);
+            gdi_surface_type = sd.Type as u32;
+            crate::diag::record_named_bytes(b"GdiType", gdi_surface_type);
+            // D3DKMDT_GDISURFACE_TEXTURE (enum value 1) is explicitly not
+            // CPU-visible and has no linear-pitch contract. The CPU-visible
+            // staging variants are the only GDI types for which Windows
+            // requires the miniport to return a pitch.
+            is_optimal_gdi_texture = gdi_surface_type == 1;
+            sd.Pitch = if is_optimal_gdi_texture {
+                0
+            } else {
+                cross_adapter_pitch(sd.Width)
+            };
             (sd.Width, sd.Height, sd.Format as u32)
         }
         _ => {
@@ -1454,7 +1744,11 @@ pub unsafe extern "C" fn dxgkddi_get_standard_allocation_driver_data(
         }
     };
 
-    let pitch = cross_adapter_pitch(width);
+    let pitch = if is_optimal_gdi_texture {
+        0
+    } else {
+        cross_adapter_pitch(width)
+    };
     // Size the blob past pitch×height: these blobs get imported as LINEAR
     // VkImages on the host, and NVIDIA's external-linear image requirements
     // round the row count up to GOB granularity plus opaque tail slack
@@ -1466,10 +1760,19 @@ pub unsafe extern "C" fn dxgkddi_get_standard_allocation_driver_data(
     // importer refuses undersized imports loudly, so an insufficient bound
     // here surfaces as a failed open, never a GPU fault.
     let padded_rows = ((height as u64) + 127) & !127;
-    let size = (pitch as u64)
-        .saturating_mul(padded_rows)
-        .saturating_add(64 * 1024)
-        .max(PAGE as u64);
+    let size = if is_optimal_gdi_texture {
+        // CreateAllocation replaces this estimate with Vulkan's exact memory
+        // requirement before reporting Size to VidMm.
+        (width as u64)
+            .saturating_mul(height as u64)
+            .saturating_mul(4)
+            .max(PAGE as u64)
+    } else {
+        (pitch as u64)
+            .saturating_mul(padded_rows)
+            .saturating_add(64 * 1024)
+            .max(PAGE as u64)
+    };
 
     let map_cache = if is_primary {
         VIRTIO_GPU_MAP_CACHE_WC
@@ -1496,11 +1799,17 @@ pub unsafe extern "C" fn dxgkddi_get_standard_allocation_driver_data(
         bind_flags: 0x0000_0008 | 0x0000_0020,
         // Flag a shared-primary surface so create_one omits the illegal
         // `Cached`-with-Primary flag on the scanout primary.
-        misc_flags: if is_primary {
-            HELIOS_ALLOC_MISC_PRIMARY
-        } else {
-            0
-        },
+        misc_flags: ((standard_allocation_type << HELIOS_WDDM_ALLOC_MISC_STANDARD_TYPE_SHIFT)
+            & HELIOS_WDDM_ALLOC_MISC_STANDARD_TYPE_MASK)
+            | ((gdi_surface_type << HELIOS_WDDM_ALLOC_MISC_GDI_TYPE_SHIFT)
+                & HELIOS_WDDM_ALLOC_MISC_GDI_TYPE_MASK)
+            | if is_primary {
+                HELIOS_WDDM_ALLOC_MISC_PRIMARY
+            } else if is_optimal_gdi_texture {
+                HELIOS_WDDM_ALLOC_MISC_OPTIMAL_GDI_TEXTURE
+            } else {
+                0
+            },
         // Filled by DxgkDdiCreateAllocation's write-back once the kernel venus
         // client has actually allocated the backing memory.
         venus_alloc_size: 0,
@@ -1510,7 +1819,15 @@ pub unsafe extern "C" fn dxgkddi_get_standard_allocation_driver_data(
         // matching CachyOS dma-buf probe reached egl-headless only with XR24.
         // Non-primary standard allocations keep the legacy zero hint so UMD
         // openers use the existing BGRA fallback.
-        dxgi_format: if is_primary { 88 } else { 0 },
+        dxgi_format: if is_primary {
+            88
+        } else if format == D3DDDIFMT_A8R8G8B8 as u32 {
+            87
+        } else if format == D3DDDIFMT_X8R8G8B8 as u32 {
+            88
+        } else {
+            0
+        },
         // KMD standard allocations carry no scan-out plane offset.
         plane_offset: 0,
     };

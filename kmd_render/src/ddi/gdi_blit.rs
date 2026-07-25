@@ -45,6 +45,8 @@ static SKIP_NO_GEOM: AtomicU32 = AtomicU32::new(0); // zero width/height
 static SKIP_NO_SLOT: AtomicU32 = AtomicU32::new(0); // MAX_MAPPINGS exhausted
 static SKIP_NO_BLOB: AtomicU32 = AtomicU32::new(0); // blob_kernel_range failed
 static SKIP_NO_MAP: AtomicU32 = AtomicU32::new(0); // MmMapIoSpace returned null
+/// Allocation has an opaque device-image identity, not CPU-addressable bytes.
+static SKIP_DEVICE_IMAGE: AtomicU32 = AtomicU32::new(0);
 static LAST_SKIP_RESID: AtomicU32 = AtomicU32::new(0);
 /// Commands whose declared payload does not fit the remaining batch bytes
 /// (registry-visible as GdTc) and StretchBlts with an empty source rect,
@@ -155,6 +157,7 @@ pub unsafe fn execute(adapter: &AdapterContext, args: &DXGKARG_RENDERGDI) {
     crate::diag::record_named_bytes(b"GdFs", SKIP_NO_SLOT.load(Ordering::Relaxed));
     crate::diag::record_named_bytes(b"GdFb", SKIP_NO_BLOB.load(Ordering::Relaxed));
     crate::diag::record_named_bytes(b"GdFm", SKIP_NO_MAP.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"GdFi", SKIP_DEVICE_IMAGE.load(Ordering::Relaxed));
     crate::diag::record_named_bytes(b"GdFr", LAST_SKIP_RESID.load(Ordering::Relaxed));
     crate::diag::record_named_bytes(b"GdTc", SKIP_TRUNC_CMD.load(Ordering::Relaxed));
     crate::diag::record_named_bytes(b"GdDs", DEGENERATE_STRETCH.load(Ordering::Relaxed));
@@ -263,6 +266,14 @@ unsafe fn surface(
     };
     if info.width == 0 || info.height == 0 {
         SKIP_NO_GEOM.fetch_add(1, Ordering::Relaxed);
+        LAST_SKIP_RESID.store(info.resource_id, Ordering::Relaxed);
+        return None;
+    }
+    if info.kind == helios_protocol::HELIOS_WDDM_ALLOC_KIND_DEVICE_MEMORY {
+        // The CPU GDI executor accepts only byte-addressable allocation roles.
+        // An OPTIMAL image must be handled by a GPU command path; mapping its
+        // OPAQUE_FD blob is invalid and poisons the DWM Venus context.
+        SKIP_DEVICE_IMAGE.fetch_add(1, Ordering::Relaxed);
         LAST_SKIP_RESID.store(info.resource_id, Ordering::Relaxed);
         return None;
     }

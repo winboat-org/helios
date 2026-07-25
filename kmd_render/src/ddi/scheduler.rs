@@ -10,6 +10,7 @@ use core::mem::size_of;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::adapter::AdapterContext;
+use crate::ddi::present_packet::{PresentAllocations, STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER};
 use crate::device::DeviceContext;
 use crate::dxgk::*;
 
@@ -231,13 +232,10 @@ pub unsafe extern "C" fn dxgkddi_present_to_hw_queue(
         return STATUS_INVALID_PARAMETER;
     }
 
-    let Some(adapter_ptr) = (unsafe { hw_queue_adapter(h_hw_queue) }) else {
+    let Some(_adapter_ptr) = (unsafe { hw_queue_adapter(h_hw_queue) }) else {
         crate::diag::record_named_bytes(b"PHQst", STATUS_INVALID_PARAMETER as u32);
         return STATUS_INVALID_PARAMETER;
     };
-    // SAFETY: hw_queue_adapter validated this is the adapter pointer captured
-    // from DeviceContext while creating the HW queue/context.
-    let adapter = unsafe { &*adapter_ptr };
     let args = unsafe { &mut *args };
     let present_flags = unsafe { args.Flags.__bindgen_anon_1.Value };
     crate::diag::record_named_bytes(b"PHQflag", present_flags);
@@ -247,70 +245,42 @@ pub unsafe extern "C" fn dxgkddi_present_to_hw_queue(
     );
 
     let allocation_list = unsafe { args.__bindgen_anon_1.pAllocationList };
+    let present_allocations = unsafe { PresentAllocations::from_allocation_list(allocation_list) };
     crate::diag::record_named_bytes(b"PHQalst", if allocation_list.is_null() { 0 } else { 1 });
 
     if (present_flags & (1 << 2)) == 0 && !allocation_list.is_null() {
-        // SAFETY: Per DXGKARG_PRESENT, indices 1 and 2 carry the present source
-        // and destination allocation entries when pAllocationList is non-null.
-        let src = unsafe { allocation_list.add(DXGK_PRESENT_SOURCE_INDEX as usize) };
-        let dst = unsafe { allocation_list.add(DXGK_PRESENT_DESTINATION_INDEX as usize) };
-        let src_handle = unsafe { (*src).hDeviceSpecificAllocation };
-        let dst_handle = unsafe { (*dst).hDeviceSpecificAllocation };
+        let src_handle = present_allocations
+            .source()
+            .map(|allocation| allocation.handle())
+            .unwrap_or(core::ptr::null_mut());
+        let dst_handle = present_allocations
+            .destination()
+            .map(|allocation| allocation.handle())
+            .unwrap_or(core::ptr::null_mut());
         crate::diag::record_named_bytes(b"PHQsrcH", (src_handle as usize as u32) & 0xFFFF);
         crate::diag::record_named_bytes(b"PHQdstH", (dst_handle as usize as u32) & 0xFFFF);
 
-        let src_scanout =
-            unsafe { super::create_allocation::present_scanout_alloc_info(src_handle) };
-        if let Some(sc) = src_scanout {
-            crate::diag::record_named_bytes(b"PHQsrc", sc.resource_id);
-            let _ = super::display::issue_present_scanout(
-                adapter,
-                sc.resource_id,
-                sc.width,
-                sc.height,
-                sc.pitch,
-                sc.dxgi_format,
-                sc.plane_offset,
-                sc.venus_alloc_size,
-                sc.direct_scanout,
-                3,
-            );
-        } else {
-            crate::diag::record_named_bytes(b"PHQsrc", 0);
-        }
+        // Ordinary allocation-list presents identify application/DWM work for
+        // VidSch residency and patching only. They must never rebind scanout:
+        // SetVidPnSourceAddress is the authoritative desktop-primary identity,
+        // and the typed refresh command below only dirties that durable target.
+        crate::diag::record_named_bytes(b"PHQsrc", 0);
     }
 
-    if !args.pPatchLocationListOut.is_null() && args.PatchLocationListOutSize >= 2 {
-        let patch = args.pPatchLocationListOut;
-        unsafe {
-            // SAFETY: dxgkrnl supplied at least two writable patch entries.
-            core::ptr::write_bytes(patch, 0, 2);
-
-            (*patch).AllocationIndex = DXGK_PRESENT_DESTINATION_INDEX;
-            (*patch).__bindgen_anon_1.Value = 1;
-            (*patch).DriverId = 1;
-            (*patch).AllocationOffset = 0;
-            (*patch).PatchOffset = 0;
-            (*patch).SplitOffset = 0;
-
-            let patch1 = patch.add(1);
-            (*patch1).AllocationIndex = DXGK_PRESENT_SOURCE_INDEX;
-            (*patch1).__bindgen_anon_1.Value = 2;
-            (*patch1).DriverId = 2;
-            (*patch1).AllocationOffset = 0;
-            (*patch1).PatchOffset = 0;
-            (*patch1).SplitOffset = 0;
-
-            args.pPatchLocationListOut = patch.add(2);
-        }
+    if let Err(status) = unsafe { present_allocations.write_patch_references(args) } {
+        crate::diag::record_named_bytes(b"PHQst", status as u32);
+        return status;
     }
 
     if !args.pDmaBuffer.is_null() {
         const PRESENT_NOP_DWORDS: usize = 4;
         let bytes = (PRESENT_NOP_DWORDS * core::mem::size_of::<u32>()) as UINT;
         if args.DmaSize < bytes {
-            crate::diag::record_named_bytes(b"PHQst", STATUS_BUFFER_TOO_SMALL as u32);
-            return STATUS_BUFFER_TOO_SMALL;
+            crate::diag::record_named_bytes(
+                b"PHQst",
+                STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER as u32,
+            );
+            return STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER;
         }
         let dma = args.pDmaBuffer as *mut u32;
         unsafe {

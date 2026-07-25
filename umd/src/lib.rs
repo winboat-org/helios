@@ -720,6 +720,7 @@ unsafe extern "system" fn create_device(
                 patch_list: core::cell::Cell::new(core::ptr::null_mut()),
                 patch_list_size: core::cell::Cell::new(0),
                 kt_callbacks: create.p_kt_callbacks as *const ddi::D3DDDI_DEVICECALLBACKS,
+                paging_queue: None,
                 dxgi_callbacks: create.dxgi_base_ddi.p_dxgi_base_callbacks
                     as *mut ddi::DXGI_DDI_BASE_CALLBACKS,
                 scanout_resource_raw: core::cell::Cell::new(0),
@@ -744,6 +745,17 @@ unsafe extern "system" fn create_device(
         device_funcs::create_runtime_context(
             &mut *(create.h_drv_device as *mut device_funcs::HeliosDevice),
         );
+        let dev = &mut *(create.h_drv_device as *mut device_funcs::HeliosDevice);
+        let paging_hr = device_funcs::create_runtime_paging_queue(dev);
+        if paging_hr != S_OK {
+            log_line(&format!(
+                "  CreateDevice: paging queue creation failed hr=0x{:08x}",
+                paging_hr as u32
+            ));
+            device_funcs::destroy_runtime_objects(dev);
+            core::ptr::drop_in_place(dev);
+            return paging_hr;
+        }
     }
 
     // 3) Fill the device-funcs table (Interface == D3D11_0 -> p11DeviceFuncs) and
@@ -1039,10 +1051,10 @@ pub(crate) fn trace_enabled() -> bool {
     })
 }
 
-/// Whether the adapter advertises D3D11 feature level 11_0 instead of the
-/// conservative FL10_0 profile: `HKLM\SOFTWARE\Helios!FeatureLevel11`
-/// (REG_DWORD). Absent = FL10_0 while the display path is stabilized; explicit
-/// 1 = full FL11_0 opt-in. Read once
+/// Selects whether the adapter advertises the full D3D11 feature-level profile
+/// or the conservative FL10_0 fallback:
+/// `HKLM\SOFTWARE\Helios!FeatureLevel11` (REG_DWORD). Absent = full FL11
+/// profile; explicit 0 = FL10_0 opt-out. Read once
 /// per process, so an already-running dwm keeps the level it created its
 /// device at while freshly-launched apps pick up the new value.
 ///
@@ -1057,10 +1069,10 @@ pub(crate) fn trace_enabled() -> bool {
 /// 30th/31st-session ETW evidence (Microsoft-Windows-DXGI) showed this is a UMD
 /// caps sequence, not a KMD/adapter ceiling: the runtime reaches
 /// CreateDevice/venus CTX_CREATE and rejects each bad caps contract with a
-/// concrete string. Gates fixed so far: 3DPIPELINESUPPORT is a bitmask
-/// (FL11=0x7), SHADER compute cap is 0x2, and MSAA/format support must match
-/// D3D11.3 §19.2.5. knob=0 remains the exact FL10_0 baseline opt-out for A/B.
-///   absent = FL10_0 profile (display-stability default)
+/// concrete string. Gates fixed so far: 3DPIPELINESUPPORT is a bitmask,
+/// SHADER compute cap is 0x2, and MSAA/format support must match D3D11.3
+/// §19.2.5. knob=0 remains the exact FL10_0 baseline opt-out for A/B.
+///   absent = full FL11 profile
 ///   0 = FL10_0 profile
 ///   1 = full FL11_0 (pipeline 11_0 + real MSAA + unmasked format bits)
 ///   2 = DIAGNOSTIC: pipeline claims 11_0 but keeps the FL10 MSAA/format caps —
@@ -1100,7 +1112,7 @@ pub(crate) fn feature_level_mode() -> u32 {
         if rc == 0 {
             value
         } else {
-            0
+            1
         }
     })
 }

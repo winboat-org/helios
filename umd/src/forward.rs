@@ -33,8 +33,9 @@ use helios_protocol::{
     HELIOS_PRESENT_PRIVATE_MAGIC, HELIOS_PRESENT_PRIVATE_VERSION, HELIOS_PRESENT_REFRESH_MAGIC,
     HELIOS_PRESENT_REFRESH_VERSION, HELIOS_PRESENT_RENDER_MAGIC, HELIOS_PRESENT_RENDER_VERSION,
     HELIOS_WDDM_ALLOC_KIND_DEVICE_MEMORY, HELIOS_WDDM_ALLOC_KIND_STANDARD,
-    VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE, VIRTIO_GPU_BLOB_FLAG_USE_SHAREABLE,
-    VIRTIO_GPU_BLOB_MEM_HOST3D, VIRTIO_GPU_MAP_CACHE_CACHED,
+    HELIOS_WDDM_ALLOC_MISC_DIRECT_SCANOUT, HELIOS_WDDM_ALLOC_MISC_OPTIMAL_GDI_TEXTURE,
+    HELIOS_WDDM_ALLOC_MISC_PRIMARY, VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE,
+    VIRTIO_GPU_BLOB_FLAG_USE_SHAREABLE, VIRTIO_GPU_BLOB_MEM_HOST3D, VIRTIO_GPU_MAP_CACHE_CACHED,
 };
 
 use crate::ddi;
@@ -47,10 +48,12 @@ use crate::trace_line;
 type Hdevice = ddi::D3D10DDI_HDEVICE;
 
 static RESOURCE_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
+static CREATE_RESOURCE_IDENTITY_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 static VIEW_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 static WDDM_ALLOC_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 static D3D11_1_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 static COPY_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
+static COPY_REGION_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 static MAP_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 static SHADER_BIND_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 static SHADER_SET_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -69,16 +72,14 @@ static RASTER_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 static IA_BIND_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 static PRESENT_READBACK_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 static PRESENT_FORCE_OPAQUE_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
-
-/// KMD-private meta bit matching `HELIOS_ALLOC_MISC_PRIMARY` in
-/// `kmd_render/src/ddi/create_allocation.rs`. This bit is not a D3D11 misc flag;
-/// open_resource masks it out before recreating an API texture.
-const HELIOS_ALLOC_MISC_PRIMARY: u32 = 0x8000_0000;
-const HELIOS_ALLOC_MISC_DIRECT_SCANOUT: u32 = 0x4000_0000;
+static PRESENT_CB_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 struct ResourceState {
     com_raw: usize,
-    allocation: ddi::D3DKMT_HANDLE,
+    /// A WDDM allocation is stored only after pfnMakeResidentCb has added one
+    /// device-residency reference. Dropping the guard removes exactly that
+    /// reference before the allocation is deallocated.
+    allocation: Option<ResidentAllocation>,
     km_resource: ddi::D3DKMT_HANDLE,
     rt_resource: ddi::HANDLE,
     /// True when this UMD allocated `allocation` itself (pfnAllocateCb in
@@ -89,6 +90,46 @@ struct ResourceState {
     /// side of the open.
     owns_allocation: bool,
     present_private: HeliosPresentPrivateData,
+}
+
+type EvictCallback = unsafe extern "C" fn(ddi::HANDLE, *mut ddi::D3DDDICB_EVICT) -> ddi::HRESULT;
+
+/// One persistent WDDM 2.x device-residency reference.
+///
+/// This type is deliberately non-Clone and non-Copy: every successful
+/// pfnMakeResidentCb call creates exactly one guard, and moving/dropping that
+/// guard is the only way the reference can change ownership or be evicted.
+struct ResidentAllocation {
+    handle: core::num::NonZeroU32,
+    h_rt_device: ddi::HANDLE,
+    evict_cb: EvictCallback,
+}
+
+impl ResidentAllocation {
+    fn handle(&self) -> ddi::D3DKMT_HANDLE {
+        self.handle.get()
+    }
+}
+
+impl Drop for ResidentAllocation {
+    fn drop(&mut self) {
+        let handle = self.handle.get();
+        let mut evict = ddi::D3DDDICB_EVICT::default();
+        evict.NumAllocations = 1;
+        evict.AllocationList = &handle;
+        let hr = unsafe { (self.evict_cb)(self.h_rt_device, &mut evict) };
+        trace_line!(
+            "WDDM residency: Evict alloc=0x{:x} hr=0x{:08x}",
+            handle,
+            hr as u32
+        );
+        if hr != 0 {
+            log_line(&format!(
+                "WDDM residency: Evict FAILED alloc=0x{:x} hr=0x{:08x}",
+                handle, hr as u32
+            ));
+        }
+    }
 }
 
 struct RtvState {
@@ -152,22 +193,25 @@ struct StandardAllocMetaV1 {
 
 fn dxgi_to_d3dddi_format(format: u32) -> u32 {
     // KMD DescribeAllocation consumes legacy D3DDDIFORMAT values, not DXGI_FORMAT.
-    // DWM/LG composition surfaces are 32-bpp BGRA, represented as A8R8G8B8 there.
     const DXGI_FORMAT_R8G8B8A8_UNORM: u32 = 28;
     const DXGI_FORMAT_B8G8R8A8_UNORM: u32 = 87;
     const D3DDDIFMT_A8R8G8B8: u32 = 21;
+    const D3DDDIFMT_A8B8G8R8: u32 = 32;
 
     match format {
-        DXGI_FORMAT_R8G8B8A8_UNORM | DXGI_FORMAT_B8G8R8A8_UNORM => D3DDDIFMT_A8R8G8B8,
+        DXGI_FORMAT_R8G8B8A8_UNORM => D3DDDIFMT_A8B8G8R8,
+        DXGI_FORMAT_B8G8R8A8_UNORM => D3DDDIFMT_A8R8G8B8,
         _ => 0,
     }
 }
 
 fn d3dddi_to_dxgi_format(format: u32) -> DXGI_FORMAT {
     const D3DDDIFMT_A8R8G8B8: u32 = 21;
+    const D3DDDIFMT_A8B8G8R8: u32 = 32;
 
     match format {
         D3DDDIFMT_A8R8G8B8 => windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
+        D3DDDIFMT_A8B8G8R8 => windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM,
         _ => windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
     }
 }
@@ -474,7 +518,7 @@ unsafe fn handle_com_raw(handle_priv: *mut c_void) -> usize {
 unsafe fn store_resource(
     handle_priv: *mut c_void,
     obj: ID3D11Resource,
-    allocation: ddi::D3DKMT_HANDLE,
+    allocation: Option<ResidentAllocation>,
     km_resource: ddi::D3DKMT_HANDLE,
     rt_resource: ddi::HANDLE,
     owns_allocation: bool,
@@ -565,7 +609,25 @@ unsafe fn resource_allocation(handle_priv: *mut c_void) -> ddi::D3DKMT_HANDLE {
     if state.is_null() {
         0
     } else {
-        (*state).allocation
+        (*state)
+            .allocation
+            .as_ref()
+            .map(ResidentAllocation::handle)
+            .unwrap_or(0)
+    }
+}
+
+unsafe fn resource_parent_handles(
+    handle_priv: *mut c_void,
+) -> (ddi::HANDLE, ddi::D3DKMT_HANDLE) {
+    if handle_priv.is_null() {
+        return (core::ptr::null_mut(), 0);
+    }
+    let state = *(handle_priv as *const *mut ResourceState);
+    if state.is_null() {
+        (core::ptr::null_mut(), 0)
+    } else {
+        ((*state).rt_resource, (*state).km_resource)
     }
 }
 
@@ -676,6 +738,16 @@ fn is_dwm_process() -> bool {
             .map(|n| n.eq_ignore_ascii_case("dwm.exe"))
             .unwrap_or(false)
     })
+}
+
+fn needs_wddm_texture_allocation(a: &ddi::D3D11DDIARG_CREATERESOURCE) -> bool {
+    const DDI_BIND_PRESENT: u32 = 0x0000_0080;
+    const DDI_MISC_SHARED: u32 = 0x0000_0002;
+    const DDI_MISC_SHARED_KEYEDMUTEX: u32 = 0x0000_0100;
+
+    !a.pPrimaryDesc.is_null()
+        || (a.BindFlags & DDI_BIND_PRESENT) != 0
+        || (a.MiscFlags & (DDI_MISC_SHARED | DDI_MISC_SHARED_KEYEDMUTEX)) != 0
 }
 
 /// Lazily query and import the KMD-owned LINEAR primary into DWM's existing
@@ -1044,7 +1116,16 @@ unsafe fn release_resource(h: Hdevice, handle_priv: *mut c_void) {
     let state = *(handle_priv as *mut *mut ResourceState);
     if !state.is_null() {
         clear_scanout_target_if_matches(h, (*state).com_raw);
-        if (*state).allocation != 0 || !(*state).rt_resource.is_null() {
+        let allocation = (*state)
+            .allocation
+            .as_ref()
+            .map(ResidentAllocation::handle)
+            .unwrap_or(0);
+        // Evict while the allocation and runtime device are both still valid.
+        // Option::take makes it impossible for ResourceState::drop to evict a
+        // second time after pfnDeallocateCb.
+        drop((*state).allocation.take());
+        if allocation != 0 || !(*state).rt_resource.is_null() {
             if let Some(dev) = helios_device(h) {
                 if !dev.kt_callbacks.is_null() {
                     if let Some(deallocate_cb) = (*dev.kt_callbacks).pfnDeallocateCb {
@@ -1054,7 +1135,7 @@ unsafe fn release_resource(h: Hdevice, handle_priv: *mut c_void) {
                         // NumAllocations+HandleList with hResource NULL. Both
                         // together is E_INVALIDARG (the old 0x80070057, which
                         // also leaked opened resources).
-                        let mut allocation = (*state).allocation;
+                        let mut allocation = allocation;
                         let mut dealloc = if !(*state).rt_resource.is_null() {
                             ddi::D3DDDICB_DEALLOCATE {
                                 hResource: (*state).rt_resource,
@@ -1074,7 +1155,7 @@ unsafe fn release_resource(h: Hdevice, handle_priv: *mut c_void) {
                             // legally deallocate.
                             log_line(&format!(
                                 "DDI deallocate_resource skip: not owner alloc=0x{:x} km=0x{:x}",
-                                (*state).allocation,
+                                allocation,
                                 (*state).km_resource
                             ));
                             ddi::D3DDDICB_DEALLOCATE {
@@ -1088,7 +1169,7 @@ unsafe fn release_resource(h: Hdevice, handle_priv: *mut c_void) {
                             trace_line!(
                                 "DDI deallocate_resource: hr=0x{:08x} alloc=0x{:x} km=0x{:x} rt={:p} owned={}",
                                 hr as u32,
-                                (*state).allocation,
+                                allocation,
                                 (*state).km_resource,
                                 (*state).rt_resource,
                                 (*state).owns_allocation
@@ -1241,6 +1322,122 @@ const RES_TEX3D: ddi::D3D10DDIRESOURCE_TYPE = ddi::D3D10DDIRESOURCE_TYPE_D3D10DD
 const RES_TEXCUBE: ddi::D3D10DDIRESOURCE_TYPE =
     ddi::D3D10DDIRESOURCE_TYPE_D3D10DDIRESOURCE_TEXTURECUBE;
 
+/// Add one allocation to the WDDM 2.x device residency list.
+///
+/// E_PENDING is completed with a blocking monitored-fence wait through the
+/// runtime callback. No command referencing the allocation may be submitted
+/// before that fence reaches `PagingFenceValue`.
+unsafe fn make_resident(
+    dev: &crate::device_funcs::HeliosDevice,
+    handle: ddi::D3DKMT_HANDLE,
+) -> Result<ResidentAllocation, i32> {
+    const E_PENDING: i32 = 0x8000_000Au32 as i32;
+
+    let Some(handle) = core::num::NonZeroU32::new(handle) else {
+        log_line("WDDM residency: zero allocation handle");
+        return Err(E_INVALIDARG);
+    };
+    let Some(queue) = dev.paging_queue else {
+        log_line("WDDM residency: device has no paging queue");
+        return Err(E_FAIL);
+    };
+    if dev.kt_callbacks.is_null() {
+        log_line("WDDM residency: no runtime callbacks");
+        return Err(E_FAIL);
+    }
+    let Some(make_resident_cb) = (*dev.kt_callbacks).pfnMakeResidentCb else {
+        log_line("WDDM residency: pfnMakeResidentCb missing");
+        return Err(E_FAIL);
+    };
+    let Some(evict_cb) = (*dev.kt_callbacks).pfnEvictCb else {
+        // Do not acquire a residency reference that cannot be balanced.
+        log_line("WDDM residency: pfnEvictCb missing");
+        return Err(E_FAIL);
+    };
+
+    let allocation = handle.get();
+    let mut arg = ddi::D3DDDI_MAKERESIDENT::default();
+    arg.hPagingQueue = queue.handle.get();
+    arg.NumAllocations = 1;
+    arg.AllocationList = &allocation;
+    let hr = make_resident_cb(dev.h_rt_device, &mut arg);
+    trace_line!(
+        "WDDM residency: MakeResident alloc=0x{:x} hr=0x{:08x} fence={} trim={}",
+        allocation,
+        hr as u32,
+        arg.PagingFenceValue,
+        arg.NumBytesToTrim
+    );
+    if hr != 0 && hr != E_PENDING {
+        log_line(&format!(
+            "WDDM residency: MakeResident FAILED alloc=0x{:x} hr=0x{:08x} trim={}",
+            allocation, hr as u32, arg.NumBytesToTrim
+        ));
+        return Err(hr);
+    }
+
+    let resident = ResidentAllocation {
+        handle,
+        h_rt_device: dev.h_rt_device,
+        evict_cb,
+    };
+    if hr == E_PENDING {
+        let Some(wait_cb) = (*dev.kt_callbacks).pfnWaitForSynchronizationObjectFromCpuCb else {
+            log_line("WDDM residency: E_PENDING but CPU fence-wait callback is missing");
+            drop(resident);
+            return Err(E_FAIL);
+        };
+        let sync_object = queue.sync_object.get();
+        let fence_value = arg.PagingFenceValue;
+        let mut wait = ddi::D3DDDICB_WAITFORSYNCHRONIZATIONOBJECTFROMCPU::default();
+        wait.ObjectCount = 1;
+        wait.ObjectHandleArray = &sync_object;
+        wait.FenceValueArray = &fence_value;
+        // hAsyncEvent == NULL selects the blocking, non-polling form.
+        let wait_hr = wait_cb(dev.h_rt_device, &wait);
+        trace_line!(
+            "WDDM residency: wait alloc=0x{:x} fence={} observed={} hr=0x{:08x}",
+            allocation,
+            fence_value,
+            queue.fence_value_cpu.as_ptr().read_volatile(),
+            wait_hr as u32
+        );
+        if wait_hr != 0 {
+            log_line(&format!(
+                "WDDM residency: paging-fence wait FAILED alloc=0x{:x} fence={} hr=0x{:08x}",
+                allocation, fence_value, wait_hr as u32
+            ));
+            drop(resident);
+            return Err(wait_hr);
+        }
+    }
+
+    Ok(resident)
+}
+
+unsafe fn deallocate_standalone(
+    dev: &crate::device_funcs::HeliosDevice,
+    allocation: ddi::D3DKMT_HANDLE,
+) {
+    if dev.kt_callbacks.is_null() {
+        return;
+    }
+    let Some(deallocate_cb) = (*dev.kt_callbacks).pfnDeallocateCb else {
+        return;
+    };
+    let mut allocation = allocation;
+    let mut arg = ddi::D3DDDICB_DEALLOCATE {
+        hResource: core::ptr::null_mut(),
+        NumAllocations: 1,
+        HandleList: &mut allocation,
+    };
+    let hr = deallocate_cb(dev.h_rt_device, &mut arg);
+    log_line(&format!(
+        "DDI allocate rollback: alloc=0x{:x} hr=0x{:08x}",
+        allocation, hr as u32
+    ));
+}
+
 unsafe fn allocate_wddm_resource(
     h: Hdevice,
     a: &ddi::D3D11DDIARG_CREATERESOURCE,
@@ -1257,28 +1454,24 @@ unsafe fn allocate_wddm_resource(
     // opaque allocation with its exact Vulkan allocation size.
     scanout_pitch: u32,
     scanout_offset: u64,
-) -> (ddi::D3DKMT_HANDLE, ddi::D3DKMT_HANDLE) {
+) -> Result<(Option<ResidentAllocation>, ddi::D3DKMT_HANDLE), i32> {
     const DDI_BIND_PRESENT: u32 = 0x0000_0080;
-    const DDI_MISC_SHARED: u32 = 0x0000_0002;
-    const DDI_MISC_SHARED_KEYEDMUTEX: u32 = 0x0000_0100;
 
-    let needs_allocation = !a.pPrimaryDesc.is_null()
-        || (a.BindFlags & DDI_BIND_PRESENT) != 0
-        || (a.MiscFlags & (DDI_MISC_SHARED | DDI_MISC_SHARED_KEYEDMUTEX)) != 0;
+    let needs_allocation = needs_wddm_texture_allocation(a);
     if !needs_allocation {
-        return (0, 0);
+        return Ok((None, 0));
     }
 
     let Some(dev) = helios_device(h) else {
-        return (0, 0);
+        return Err(E_FAIL);
     };
     if dev.kt_callbacks.is_null() {
         log_line("DDI allocate_wddm_resource: no KT callbacks");
-        return (0, 0);
+        return Err(E_FAIL);
     }
     let Some(allocate_cb) = (*dev.kt_callbacks).pfnAllocateCb else {
         log_line("DDI allocate_wddm_resource: pfnAllocateCb missing");
-        return (0, 0);
+        return Err(E_FAIL);
     };
 
     let venus_ctx_id = dev.dxvk.venus_context_id();
@@ -1315,9 +1508,9 @@ unsafe fn allocate_wddm_resource(
     // before DxgkDdiPresent with "Source of Flip must be primary".
     let marks_scanout_primary = !a.pPrimaryDesc.is_null();
     let meta_misc_flags = if direct_scanout_primary {
-        a.MiscFlags | HELIOS_ALLOC_MISC_PRIMARY | HELIOS_ALLOC_MISC_DIRECT_SCANOUT
+        a.MiscFlags | HELIOS_WDDM_ALLOC_MISC_PRIMARY | HELIOS_WDDM_ALLOC_MISC_DIRECT_SCANOUT
     } else if marks_scanout_primary {
-        a.MiscFlags | HELIOS_ALLOC_MISC_PRIMARY
+        a.MiscFlags | HELIOS_WDDM_ALLOC_MISC_PRIMARY
     } else {
         a.MiscFlags
     };
@@ -1423,6 +1616,8 @@ unsafe fn allocate_wddm_resource(
     let h_allocation = allocation_info.hAllocation;
     let post_private_alloc = private.alloc;
     let post_private_meta = private.meta;
+    let post_open_identity =
+        unsafe { read_open_identity(private_ptr, private_size) };
     let n = WDDM_ALLOC_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
     if n < 128 || hr != 0 {
         log_line(&format!(
@@ -1472,11 +1667,45 @@ unsafe fn allocate_wddm_resource(
                 post_private_meta.memory_type_index
             ));
         }
+        if let Some((ident, meta)) = post_open_identity {
+            let meta = meta.unwrap_or_default();
+            log_line(&format!(
+                "DDI allocate_wddm_resource callback private: hRT={:p} hKM=0x{:x} \
+                 hAlloc=0x{:x} identity=res_id:{} kind:{} ctx:{} blob_size:{} \
+                 venus_size:{} mem_type:{} meta={}x{} pitch:{} d3dfmt:{} \
+                 dxgifmt:{} bind:0x{:x} misc:0x{:x}",
+                h_rt.handle,
+                alloc.hKMResource,
+                h_allocation,
+                ident.resource_id,
+                ident.kind,
+                ident.ctx_id,
+                ident.blob_size,
+                ident.venus_alloc_size,
+                ident.memory_type_index,
+                meta.width,
+                meta.height,
+                meta.pitch,
+                meta.format,
+                meta.dxgi_format,
+                meta.bind_flags,
+                meta.misc_flags,
+            ));
+        }
     }
-    if hr == 0 {
-        (h_allocation, alloc.hKMResource)
-    } else {
-        (0, 0)
+    if hr != 0 {
+        return Err(hr);
+    }
+
+    match unsafe { make_resident(dev, h_allocation) } {
+        Ok(resident) => Ok((Some(resident), alloc.hKMResource)),
+        Err(resident_hr) => {
+            // pfnAllocateCb succeeded, so this UMD owns the allocation even
+            // though residency failed. Roll it back before surfacing the
+            // failure; no partially initialized ResourceState is created.
+            unsafe { deallocate_standalone(dev, h_allocation) };
+            Err(resident_hr)
+        }
     }
 }
 
@@ -1510,12 +1739,7 @@ unsafe fn finish_wddm_tex2d(
         // suballocated DXVK memory means a cross-process opener sees a
         // disconnected KMD blob (two-memory split), so shout. Private
         // textures are suballocated by design (18th session).
-        const DDI_BIND_PRESENT: u32 = 0x0000_0080;
-        const DDI_MISC_SHARED: u32 = 0x0000_0002;
-        const DDI_MISC_SHARED_KEYEDMUTEX: u32 = 0x0000_0100;
-        let needs_importable = !a.pPrimaryDesc.is_null()
-            || (a.BindFlags & DDI_BIND_PRESENT) != 0
-            || (a.MiscFlags & (DDI_MISC_SHARED | DDI_MISC_SHARED_KEYEDMUTEX)) != 0;
+        let needs_importable = needs_wddm_texture_allocation(a);
         if memory != 0 && needs_importable {
             log_line(&format!(
                     "DDI create_resource(tex2d): SHARED RESOURCE WITHOUT IMPORTABLE BACKING memory=0x{:x} res_id={} size={} offset={} bind=0x{:x} misc=0x{:x}",
@@ -1548,7 +1772,7 @@ unsafe fn finish_wddm_tex2d(
             }
         }
     }
-    let (allocation, km_resource) = allocate_wddm_resource(
+    let (allocation, km_resource) = match allocate_wddm_resource(
         h,
         a,
         mip0,
@@ -1561,8 +1785,22 @@ unsafe fn finish_wddm_tex2d(
         direct_scanout_primary,
         scanout_pitch,
         scanout_offset,
-    );
-    if allocation != 0 && backing_resource_id != 0 {
+    ) {
+        Ok(allocation) => allocation,
+        Err(hr) => {
+            log_line(&format!(
+                "DDI create_resource(tex2d): WDDM allocation/residency failed hr=0x{:08x}",
+                hr as u32
+            ));
+            set_runtime_error(h, hr);
+            return;
+        }
+    };
+    let allocation_handle = allocation
+        .as_ref()
+        .map(ResidentAllocation::handle)
+        .unwrap_or(0);
+    if allocation_handle != 0 && backing_resource_id != 0 {
         if let Some(dev) = helios_device(h) {
             if !dev.dxvk.transfer_resource_ownership(res.as_raw() as usize) {
                 log_line(&format!(
@@ -1574,9 +1812,13 @@ unsafe fn finish_wddm_tex2d(
     }
     trace_line!(
         "DDI create_resource(tex2d): before KMT stamp km=0x{:x} alloc=0x{:x} blob=0x{:x} res_id={} blob_size={}",
-        km_resource, allocation, backing_blob_id, backing_resource_id, backing_blob_size
+        km_resource,
+        allocation_handle,
+        backing_blob_id,
+        backing_resource_id,
+        backing_blob_size
     );
-    stamp_dxvk_resource_kmt_handles(h, &res, allocation, km_resource);
+    stamp_dxvk_resource_kmt_handles(h, &res, allocation_handle, km_resource);
     // Only the exact runtime-designated primary may identify itself through
     // PresentCb private data. Ordinary shared/pitched DWM sources are copied to
     // the KMD-owned LINEAR target and must use the identity-free refresh path.
@@ -1615,8 +1857,8 @@ unsafe fn finish_wddm_tex2d(
         present_private,
     );
     if present_private.is_valid() {
-        unsafe { remember_direct_scanout_allocation(h, allocation, present_private) };
-        remember_scanout_target(h, scanout_raw, allocation, present_private);
+        unsafe { remember_direct_scanout_allocation(h, allocation_handle, present_private) };
+        remember_scanout_target(h, scanout_raw, allocation_handle, present_private);
     }
 }
 
@@ -1627,6 +1869,11 @@ unsafe extern "C" fn create_resource(
     h_rt: ddi::D3D10DDI_HRTRESOURCE,
 ) {
     clear_handle(h_resource.pDrvPrivate);
+    if arg.is_null() {
+        log_line("DDI CreateResource identity: null args");
+        set_runtime_error(h, E_INVALIDARG);
+        return;
+    }
     let Some(device) = d3d11_device(h) else {
         return;
     };
@@ -1646,6 +1893,81 @@ unsafe extern "C" fn create_resource(
 
     // Build initial-data array if provided (one entry per subresource).
     let num_sub = (a.MipLevels.max(1) * a.ArraySize.max(1)) as usize;
+    let identity_n = CREATE_RESOURCE_IDENTITY_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+    if identity_n < 512 || (identity_n + 1) % 2048 == 0 {
+        trace_line!(
+            "DDI CreateResource identity: #{} hDrv={:p} hRT={:p} hDevice={:p} \
+             dim={} fmt={} texel={}x{}x{} physical={}x{}x{} usage={} map=0x{:x} \
+             bind=0x{:x} misc=0x{:x} mips={} array={} sample={}x{} byte_stride={} \
+             decoder_type={} texture_layout={} initial={:p}/{} primary={:p}",
+            identity_n,
+            h_resource.pDrvPrivate,
+            h_rt.handle,
+            h.pDrvPrivate,
+            a.ResourceDimension,
+            a.Format,
+            mip0.TexelWidth,
+            mip0.TexelHeight,
+            mip0.TexelDepth,
+            mip0.PhysicalWidth,
+            mip0.PhysicalHeight,
+            mip0.PhysicalDepth,
+            a.Usage,
+            a.MapFlags,
+            a.BindFlags,
+            a.MiscFlags,
+            a.MipLevels,
+            a.ArraySize,
+            a.SampleDesc.Count,
+            a.SampleDesc.Quality,
+            a.ByteStride,
+            a.DecoderBufferType,
+            a.TextureLayout,
+            a.pInitialDataUP,
+            if a.pInitialDataUP.is_null() {
+                0
+            } else {
+                num_sub
+            },
+            a.pPrimaryDesc,
+        );
+        if !a.pPrimaryDesc.is_null() {
+            let primary = &*a.pPrimaryDesc;
+            let mode = &primary.ModeDesc;
+            trace_line!(
+                "DDI CreateResource primary: #{} hRT={:p} flags=0x{:x} vidpn={} \
+                 mode={}x{} fmt={} refresh={}/{} scanline={} rotation={} scaling={} \
+                 driver_flags=0x{:x}",
+                identity_n,
+                h_rt.handle,
+                primary.Flags,
+                primary.VidPnSourceId,
+                mode.Width,
+                mode.Height,
+                mode.Format,
+                mode.RefreshRate.Numerator,
+                mode.RefreshRate.Denominator,
+                mode.ScanlineOrdering,
+                mode.Rotation,
+                mode.Scaling,
+                primary.DriverFlags,
+            );
+        }
+        if !a.pInitialDataUP.is_null() {
+            for subresource in 0..num_sub.min(16) {
+                let up = &*a.pInitialDataUP.add(subresource);
+                trace_line!(
+                    "DDI CreateResource initial: #{} subresource={} sysmem={:p} \
+                     row_pitch={} slice_pitch={}",
+                    identity_n,
+                    subresource,
+                    up.pSysMem,
+                    up.SysMemPitch,
+                    up.SysMemSlicePitch,
+                );
+            }
+        }
+    }
     let mut init: Vec<D3D11_SUBRESOURCE_DATA> = Vec::new();
     if !a.pInitialDataUP.is_null() {
         for i in 0..num_sub {
@@ -1688,13 +2010,32 @@ unsafe extern "C" fn create_resource(
                 StructureByteStride: a.ByteStride,
             };
             let (allocation, km_resource) =
-                allocate_wddm_resource(h, a, &mip0, h_rt, 0, 0, 0, 0, 0, false, 0, 0);
+                match allocate_wddm_resource(h, a, &mip0, h_rt, 0, 0, 0, 0, 0, false, 0, 0) {
+                    Ok(allocation) => allocation,
+                    Err(hr) => {
+                        log_line(&format!(
+                        "DDI create_resource(buffer): WDDM allocation/residency failed hr=0x{:08x}",
+                        hr as u32
+                    ));
+                        set_runtime_error(h, hr);
+                        return;
+                    }
+                };
+            let allocation_handle = allocation
+                .as_ref()
+                .map(ResidentAllocation::handle)
+                .unwrap_or(0);
             let mut buf: Option<ID3D11Buffer> = None;
             match device.CreateBuffer(&desc, init_ptr, Some(&mut buf)) {
                 Ok(()) => {
                     if let Some(b) = buf {
                         if let Ok(res) = b.cast::<ID3D11Resource>() {
-                            stamp_dxvk_resource_kmt_handles(h, &res, allocation, km_resource);
+                            stamp_dxvk_resource_kmt_handles(
+                                h,
+                                &res,
+                                allocation_handle,
+                                km_resource,
+                            );
                             let n = RESOURCE_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
                             if n < 128 {
                                 log_line(&format!(
@@ -1764,9 +2105,10 @@ unsafe extern "C" fn create_resource(
                 MiscFlags: misc,
             };
             // Windows' pPrimaryDesc is the authoritative, non-heuristic marker
-            // for the rotating DWM desktop primaries. Only BGRA/BGRX primaries
-            // become dedicated OPTIMAL DMA_BUF exports for direct scanout.
-            let is_scanout = !a.pPrimaryDesc.is_null() && matches!(a.Format as u32, 87 | 88);
+            // for a scan-out primary. The supported 32-bit Windows primary
+            // formats become dedicated OPTIMAL DMA_BUF exports.
+            let is_scanout =
+                !a.pPrimaryDesc.is_null() && matches!(a.Format as u32, 28 | 87 | 88);
             let mut handled = false;
             if is_scanout {
                 // The QEMU fork reconstructs this exact same-driver OPTIMAL
@@ -1782,7 +2124,6 @@ unsafe extern "C" fn create_resource(
                         a.Format as u32,
                         bind,
                         misc,
-                        true,
                         &mut rp,
                         &mut off,
                     ),
@@ -1893,10 +2234,29 @@ unsafe extern "C" fn create_resource(
                 Ok(()) => {
                     if let Some(t) = tex {
                         if let Ok(res) = t.cast::<ID3D11Resource>() {
-                            let (allocation, km_resource) = allocate_wddm_resource(
+                            let (allocation, km_resource) = match allocate_wddm_resource(
                                 h, a, &mip0, h_rt, 0, 0, 0, 0, 0, false, 0, 0,
+                            ) {
+                                Ok(allocation) => allocation,
+                                Err(hr) => {
+                                    log_line(&format!(
+                                            "DDI create_resource(tex3d): WDDM allocation/residency failed hr=0x{:08x}",
+                                            hr as u32
+                                        ));
+                                    set_runtime_error(h, hr);
+                                    return;
+                                }
+                            };
+                            let allocation_handle = allocation
+                                .as_ref()
+                                .map(ResidentAllocation::handle)
+                                .unwrap_or(0);
+                            stamp_dxvk_resource_kmt_handles(
+                                h,
+                                &res,
+                                allocation_handle,
+                                km_resource,
                             );
-                            stamp_dxvk_resource_kmt_handles(h, &res, allocation, km_resource);
                             log_line(&format!(
                                 "DDI create_resource(tex3d) ok: {}x{}x{} fmt={} bind=0x{:x} misc=0x{:x}",
                                 mip0.TexelWidth,
@@ -1950,47 +2310,80 @@ unsafe extern "C" fn open_resource(
     }
 
     let a = &*arg;
-    let info = unsafe { a.__bindgen_anon_1.pOpenAllocationInfo };
     let info2 = unsafe { a.__bindgen_anon_1.pOpenAllocationInfo2 };
-    let mut detail = String::new();
     let mut allocation: ddi::D3DKMT_HANDLE = 0;
     // C1 identity ABI: the KMD wrote a versioned HeliosWddmOpenIdentity record
     // into the open-time private data in DxgkDdiOpenAllocation, after
     // validating the backing venus resource is LIVE. Prefer the per-allocation
     // buffer; fall back to the resource-level one. No `_pad` heuristics.
     let mut identity = unsafe { read_open_identity(a.pPrivateDriverData, a.PrivateDriverDataSize) };
-    if !info.is_null() {
-        let i = &*info;
-        allocation = i.hAllocation;
-        if identity.is_none() {
-            identity = unsafe { read_open_identity(i.pPrivateDriverData, i.PrivateDriverDataSize) };
-        }
-        detail.push_str(&format!(
-            " info.hAlloc=0x{:x} info.private=0x{:x}/{}",
-            i.hAllocation, i.pPrivateDriverData as usize, i.PrivateDriverDataSize
-        ));
+    if a.NumAllocations != 0 && info2.is_null() {
+        log_line("DDI open_resource FAILED: allocation array is null");
+        set_runtime_error(h, E_INVALIDARG);
+        return;
     }
-    if !info2.is_null() {
-        let i = &*info2;
-        allocation = i.hAllocation;
-        if identity.is_none() {
-            identity = unsafe { read_open_identity(i.pPrivateDriverData, i.PrivateDriverDataSize) };
+    for index in 0..a.NumAllocations as usize {
+        let info = &*info2.add(index);
+        if index == 0 {
+            allocation = info.hAllocation;
         }
-        detail.push_str(&format!(
-            " info2.hAlloc=0x{:x} info2.private=0x{:x}/{} gpuva=0x{:x}",
-            i.hAllocation,
-            i.pPrivateDriverData as usize,
-            i.PrivateDriverDataSize,
-            i.GpuVirtualAddress
-        ));
+        let allocation_identity =
+            unsafe { read_open_identity(info.pPrivateDriverData, info.PrivateDriverDataSize) };
+        if identity.is_none() {
+            identity = allocation_identity;
+        }
+        if let Some((ident, meta)) = allocation_identity {
+            let meta = meta.unwrap_or_default();
+            log_line(&format!(
+                "DDI OpenResource allocation: index={} hDrv={:p} hRT={:p} hKM=0x{:x} \
+                 hAlloc=0x{:x} private={:p}/{} gpuva=0x{:x} res_id={} kind={} ctx={} \
+                 blob_size={} venus_size={} mem_type={} {}x{} pitch={} d3dfmt={} \
+                 dxgifmt={} bind=0x{:x} misc=0x{:x}",
+                index,
+                h_resource.pDrvPrivate,
+                h_rt.handle,
+                a.hKMResource.handle,
+                info.hAllocation,
+                info.pPrivateDriverData,
+                info.PrivateDriverDataSize,
+                info.GpuVirtualAddress,
+                ident.resource_id,
+                ident.kind,
+                ident.ctx_id,
+                ident.blob_size,
+                ident.venus_alloc_size,
+                ident.memory_type_index,
+                meta.width,
+                meta.height,
+                meta.pitch,
+                meta.format,
+                meta.dxgi_format,
+                meta.bind_flags,
+                meta.misc_flags,
+            ));
+        } else {
+            log_line(&format!(
+                "DDI OpenResource allocation: index={} hDrv={:p} hRT={:p} hKM=0x{:x} \
+                 hAlloc=0x{:x} private={:p}/{} gpuva=0x{:x} identity=missing",
+                index,
+                h_resource.pDrvPrivate,
+                h_rt.handle,
+                a.hKMResource.handle,
+                info.hAllocation,
+                info.pPrivateDriverData,
+                info.PrivateDriverDataSize,
+                info.GpuVirtualAddress,
+            ));
+        }
     }
     log_line(&format!(
-        "DDI open_resource: num_alloc={} hKM={:?} private=0x{:x}/{}{}",
+        "DDI OpenResource resource: hDrv={:p} hRT={:p} num_alloc={} hKM=0x{:x} private={:p}/{}",
+        h_resource.pDrvPrivate,
+        h_rt.handle,
         a.NumAllocations,
-        a.hKMResource,
-        a.pPrivateDriverData as usize,
+        a.hKMResource.handle,
+        a.pPrivateDriverData,
         a.PrivateDriverDataSize,
-        detail
     ));
 
     // A shared open without a KMD identity record cannot alias the real
@@ -2057,6 +2450,8 @@ unsafe extern "C" fn open_resource(
     } else {
         d3dddi_to_dxgi_format(meta.format).0 as u32
     };
+    let cross_context_optimal = ident.kind == HELIOS_WDDM_ALLOC_KIND_STANDARD
+        && meta.misc_flags & HELIOS_WDDM_ALLOC_MISC_OPTIMAL_GDI_TEXTURE != 0;
     log_line(&format!(
         "DDI open_resource identity: res_id={} alloc_size={} mem_type={} kind={} ctx={} meta_bind=0x{:x} meta_misc=0x{:x} open_bind=0x{:x} open_misc=0x{:x} dxgi_fmt={} d3dddi_fmt={}",
         ident.resource_id, venus_alloc_size, ident.memory_type_index, ident.kind, ident.ctx_id,
@@ -2077,6 +2472,7 @@ unsafe extern "C" fn open_resource(
         ident.memory_type_index,
         false,
         false,
+        cross_context_optimal,
     );
     if raw == 0 {
         // Import of a KMD-validated-live resource failed: a real bug, not a
@@ -2091,6 +2487,17 @@ unsafe extern "C" fn open_resource(
 
     let res = ID3D11Resource::from_raw(raw as *mut c_void);
     stamp_dxvk_resource_kmt_handles(h, &res, allocation, a.hKMResource.handle);
+    let resident = match unsafe { make_resident(dev, allocation) } {
+        Ok(resident) => resident,
+        Err(hr) => {
+            log_line(&format!(
+                "DDI open_resource FAILED: MakeResident alloc=0x{:x} hr=0x{:08x}",
+                allocation, hr as u32
+            ));
+            set_runtime_error(h, hr);
+            return;
+        }
+    };
     log_line(&format!(
         "DDI open_resource ddi-shared ok: {}x{} d3dfmt={} alloc=0x{:x} hKM={:?} raw=0x{:x}",
         meta.width, meta.height, meta.format, allocation, a.hKMResource, raw
@@ -2098,7 +2505,7 @@ unsafe extern "C" fn open_resource(
     store_resource(
         h_resource.pDrvPrivate,
         res,
-        allocation,
+        Some(resident),
         a.hKMResource.handle,
         h_rt.handle,
         false, // opened: runtime owns these allocation handles
@@ -2619,10 +3026,45 @@ unsafe extern "C" fn resource_copy_region(
     let Some(context) = d3d11_context(h) else {
         return;
     };
-    let (Some(dst), Some(src)) = (
-        load_resource(h_dst.pDrvPrivate),
-        load_resource(h_src.pDrvPrivate),
-    ) else {
+    let dst = load_resource(h_dst.pDrvPrivate);
+    let src = load_resource(h_src.pDrvPrivate);
+    let dst_summary = resource_summary(h_dst.pDrvPrivate);
+    let src_summary = resource_summary(h_src.pDrvPrivate);
+    let (dst_rt, dst_km) = resource_parent_handles(h_dst.pDrvPrivate);
+    let (src_rt, src_km) = resource_parent_handles(h_src.pDrvPrivate);
+    let n = COPY_REGION_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+    if n < 1024 || dst.is_none() || src.is_none() {
+        log_line(&format!(
+            "DDI ResourceCopyRegion: #{} dstDrv={:p} dstRT={:p} dstKM=0x{:x} \
+             dstAlloc=0x{:x} dst={}x{} fmt={} srcDrv={:p} srcRT={:p} srcKM=0x{:x} \
+             srcAlloc=0x{:x} src={}x{} fmt={} dstSub={} xyz={},{},{} srcSub={} box={:p} \
+             dstOk={} srcOk={}",
+            n,
+            h_dst.pDrvPrivate,
+            dst_rt,
+            dst_km,
+            dst_summary.0,
+            dst_summary.2,
+            dst_summary.3,
+            dst_summary.5,
+            h_src.pDrvPrivate,
+            src_rt,
+            src_km,
+            src_summary.0,
+            src_summary.2,
+            src_summary.3,
+            src_summary.5,
+            dst_subresource,
+            dst_x,
+            dst_y,
+            dst_z,
+            src_subresource,
+            box_,
+            dst.is_some(),
+            src.is_some(),
+        ));
+    }
+    let (Some(dst), Some(src)) = (dst, src) else {
         return;
     };
     let bx;
@@ -2875,7 +3317,7 @@ unsafe extern "C" fn flush(h: Hdevice) {
                 // copy recorded immediately above. The KMD captures its Venus
                 // watermark in Render and emits RESOURCE_FLUSH from the
                 // used-ring DPC only after all preceding work retires.
-                let _ = unsafe { submit_runtime_present(dev, None) };
+                let _ = unsafe { submit_runtime_refresh(dev) };
             }
         }
     }
@@ -3720,7 +4162,61 @@ unsafe extern "C" fn create_compute_shader(
     }
 }
 
-unsafe extern "C" fn destroy_shader(_h: Hdevice, h_shader: ddi::D3D10DDI_HSHADER) {
+unsafe extern "C" fn destroy_shader(h: Hdevice, h_shader: ddi::D3D10DDI_HSHADER) {
+    let raw = handle_com_raw(h_shader.pDrvPrivate);
+    if raw != 0 {
+        if let Some(dev) = helios_device(h) {
+            let mut owned = std::collections::HashSet::new();
+            let was_vertex_shader = {
+                let mut ia = dev.ia.borrow_mut();
+                let had_bytecode = ia.vs_bytecode.remove(&raw).is_some();
+                let had_signature = ia.vs_sig_words.remove(&raw).is_some();
+                let was_vertex_shader = had_bytecode || had_signature;
+                if was_vertex_shader {
+                    ia.vs_variants.retain(|&(vs, _), variant| {
+                        if vs == raw {
+                            if *variant != 0 {
+                                owned.insert(*variant);
+                            }
+                            false
+                        } else {
+                            true
+                        }
+                    });
+                    ia.layout_cache.retain(|&(_, vs), layout| {
+                        if vs == raw {
+                            if *layout != 0 {
+                                owned.insert(*layout);
+                            }
+                            false
+                        } else {
+                            true
+                        }
+                    });
+                    if ia.current_vs == raw {
+                        ia.current_vs = 0;
+                    }
+                    if ia.bound_vs_com == raw || owned.contains(&ia.bound_vs_com) {
+                        ia.bound_vs_com = 0;
+                    }
+                }
+                was_vertex_shader
+            };
+            for cached in &owned {
+                // SAFETY: the cache owns the COM reference returned by its
+                // Create* operation. Removing the entry transfers that one
+                // reference here for release.
+                drop(IUnknown::from_raw(*cached as *mut c_void));
+            }
+            if was_vertex_shader {
+                trace_line!(
+                    "DDI DestroyShader: VS raw=0x{:x} released_cached={}",
+                    raw,
+                    owned.len()
+                );
+            }
+        }
+    }
     release_com(h_shader.pDrvPrivate);
 }
 
@@ -5426,10 +5922,47 @@ unsafe extern "C" fn resource_update_subresource(
         return;
     };
     let (alloc, kind, width, height, depth, fmt) = resource_summary(h_res.pDrvPrivate);
+    let (rt_resource, km_resource) = resource_parent_handles(h_res.pDrvPrivate);
+    let (box_left, box_top, box_right, box_bottom) = if box_.is_null() {
+        (
+            0i32,
+            0i32,
+            i32::try_from(width).unwrap_or(i32::MAX),
+            i32::try_from(height).unwrap_or(i32::MAX),
+        )
+    } else {
+        let b = &*box_;
+        (b.left, b.top, b.right, b.bottom)
+    };
+    let source_width = u32::try_from(box_right.saturating_sub(box_left)).unwrap_or(0);
+    let source_height = u32::try_from(box_bottom.saturating_sub(box_top)).unwrap_or(0);
+    let source_samples = if !data.is_null()
+        && kind == "tex2d"
+        && matches!(fmt, 28 | 87 | 88)
+        && source_width != 0
+        && source_height != 0
+        && row_pitch >= source_width.saturating_mul(4)
+    {
+        let center_offset = (source_height as usize / 2)
+            .saturating_mul(row_pitch as usize)
+            .saturating_add((source_width as usize / 2).saturating_mul(4));
+        Some((
+            core::ptr::read_unaligned(data.cast::<u32>()),
+            core::ptr::read_unaligned((data as *const u8).add(center_offset).cast::<u32>()),
+        ))
+    } else {
+        None
+    };
     let n = UPDATE_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
     if n < 1024 || alloc != 0 {
         log_line(&format!(
-            "DDI UpdateSubresource alloc=0x{:x} kind={} dims={}x{}x{} fmt={} sub={} box={} data={:p} row_pitch={} depth_pitch={}",
+            "DDI UpdateSubresource #{} hDrv={:p} hRT={:p} hKM=0x{:x} alloc=0x{:x} \
+             kind={} dims={}x{}x{} fmt={} sub={} box={},{},{},{} data={:p} \
+             row_pitch={} depth_pitch={} sample0={} sample_center={}",
+            n,
+            h_res.pDrvPrivate,
+            rt_resource,
+            km_resource,
             alloc,
             kind,
             width,
@@ -5437,10 +5970,19 @@ unsafe extern "C" fn resource_update_subresource(
             depth,
             fmt,
             subresource,
-            !box_.is_null(),
+            box_left,
+            box_top,
+            box_right,
+            box_bottom,
             data,
             row_pitch,
-            depth_pitch
+            depth_pitch,
+            source_samples
+                .map(|samples| format!("0x{:08x}", samples.0))
+                .unwrap_or_else(|| "n/a".to_string()),
+            source_samples
+                .map(|samples| format!("0x{:08x}", samples.1))
+                .unwrap_or_else(|| "n/a".to_string()),
         ));
     }
     let bx;
@@ -6986,12 +7528,39 @@ unsafe extern "C" fn create_element_layout(
     *(h_el.pDrvPrivate as *mut usize) = Box::into_raw(boxed) as usize;
 }
 
-unsafe extern "C" fn destroy_element_layout(_h: Hdevice, h_el: ddi::D3D10DDI_HELEMENTLAYOUT) {
+unsafe extern "C" fn destroy_element_layout(h: Hdevice, h_el: ddi::D3D10DDI_HELEMENTLAYOUT) {
     if h_el.pDrvPrivate.is_null() {
         return;
     }
     let p = *(h_el.pDrvPrivate as *const usize);
     if p != 0 {
+        let mut owned = std::collections::HashSet::new();
+        if let Some(dev) = helios_device(h) {
+            let mut ia = dev.ia.borrow_mut();
+            ia.layout_cache.retain(|&(layout, _), cached| {
+                if layout == p {
+                    if *cached != 0 {
+                        owned.insert(*cached);
+                    }
+                    false
+                } else {
+                    true
+                }
+            });
+            if ia.current_layout == p {
+                ia.current_layout = 0;
+            }
+        }
+        for cached in &owned {
+            // SAFETY: each removed cache value owns one CreateInputLayout
+            // reference, adopted here and released exactly once.
+            drop(IUnknown::from_raw(*cached as *mut c_void));
+        }
+        trace_line!(
+            "DDI DestroyElementLayout: layout=0x{:x} released_cached={}",
+            p,
+            owned.len()
+        );
         drop(Box::from_raw(p as *mut LayoutData));
         *(h_el.pDrvPrivate as *mut usize) = 0;
     }
@@ -7826,6 +8395,7 @@ unsafe fn vehicle_present_prepare(
             // Not the DWM scan-out primary import; keep the plain OPTIMAL path.
             false,
             false,
+            false,
         );
         if raw == 0 {
             let n = EXT_IMPORT_FAILS.fetch_add(1, Ordering::Relaxed);
@@ -8222,13 +8792,83 @@ unsafe fn maybe_force_present_alpha_opaque(h: Hdevice, src_h: ddi::D3D10DDI_HRES
     }
 }
 
-/// Submit the runtime-owned WDDM command buffer after pfnPresentCb accepts a
-/// DXGI present. pfnPresentCb records the pending flip; pfnRenderCb is the
-/// submission boundary that makes dxgkrnl invoke the KMD present/render path.
-/// The actual rendering has already been submitted through Venus.
-unsafe fn submit_runtime_present(
+#[derive(Clone, Copy)]
+struct RuntimePresentDependencies {
+    source: core::num::NonZeroU32,
+    destination: Option<core::num::NonZeroU32>,
+}
+
+impl RuntimePresentDependencies {
+    fn new(source: ddi::D3DKMT_HANDLE, destination: ddi::D3DKMT_HANDLE) -> Option<Self> {
+        Some(Self {
+            source: core::num::NonZeroU32::new(source)?,
+            destination: core::num::NonZeroU32::new(destination),
+        })
+    }
+
+    fn count(self) -> u32 {
+        1 + u32::from(self.destination.is_some())
+    }
+
+    /// Populate the runtime-owned legacy allocation list used by pfnRenderCb.
+    ///
+    /// # Safety
+    /// The list pointer and capacity came from pfnCreateContextCb or the
+    /// preceding successful pfnRenderCb. This method validates both before
+    /// writing exactly `count()` initialized entries.
+    unsafe fn write_to(self, dev: &crate::device_funcs::HeliosDevice) -> Result<u32, i32> {
+        let required = self.count();
+        let list = dev.allocation_list.get();
+        if list.is_null() || dev.allocation_list_size.get() < required {
+            log_line(&format!(
+                "DXGI Present: runtime allocation list unavailable ptr={:p} capacity={} required={}",
+                list,
+                dev.allocation_list_size.get(),
+                required
+            ));
+            return Err(E_FAIL);
+        }
+
+        let mut source = ddi::D3DDDI_ALLOCATIONLIST::default();
+        source.hAllocation = self.source.get();
+        // Value bit 0 is WriteOperation. The present source is read-only.
+        source.__bindgen_anon_1.Value = 0;
+        list.write(source);
+
+        if let Some(destination) = self.destination {
+            let mut entry = ddi::D3DDDI_ALLOCATIONLIST::default();
+            entry.hAllocation = destination.get();
+            // The present destination is written by the copy operation.
+            entry.__bindgen_anon_1.Value = 1;
+            list.add(1).write(entry);
+        }
+
+        Ok(required)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum RuntimeSubmission {
+    /// A pending DXGI present. The typed dependency value makes a
+    /// source-allocation-free present submission unrepresentable.
+    Present {
+        dependencies: RuntimePresentDependencies,
+        private: Option<HeliosPresentPrivateData>,
+    },
+    /// An allocation-free dirty marker for an already-published scanout.
+    Refresh,
+}
+
+/// Submit a runtime-owned WDDM command buffer.
+///
+/// The legacy pfnRenderCb allocation list is mandatory for a DXGI present even
+/// though Helios's marker contains no guest GPU address. VidMm uses that list
+/// to make the present source/destination resident and keep them live through
+/// the pending operation. A standalone refresh has no pending allocation and
+/// deliberately submits an empty list.
+unsafe fn submit_runtime_submission(
     dev: &crate::device_funcs::HeliosDevice,
-    present_private: Option<HeliosPresentPrivateData>,
+    submission: RuntimeSubmission,
 ) -> i32 {
     static LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 
@@ -8236,43 +8876,73 @@ unsafe fn submit_runtime_present(
         return E_FAIL;
     }
     let Some(render_cb) = (*dev.kt_callbacks).pfnRenderCb else {
-        log_line("DXGI Present: pfnRenderCb missing");
+        log_line("DXGI submission: pfnRenderCb missing");
         return E_FAIL;
     };
     let command = dev.command_buffer.get();
-    let command_length = if present_private.is_some() {
-        core::mem::size_of::<HeliosPresentRenderCmd>() as u32
-    } else {
-        core::mem::size_of::<HeliosPresentRefreshCmd>() as u32
+    let (command_length, label) = match submission {
+        RuntimeSubmission::Present {
+            private: Some(_), ..
+        } => (
+            core::mem::size_of::<HeliosPresentRenderCmd>() as u32,
+            "Present",
+        ),
+        RuntimeSubmission::Present { private: None, .. } => (
+            core::mem::size_of::<HeliosPresentRefreshCmd>() as u32,
+            "Present",
+        ),
+        RuntimeSubmission::Refresh => (
+            core::mem::size_of::<HeliosPresentRefreshCmd>() as u32,
+            "refresh",
+        ),
     };
     if command.is_null() || dev.command_buffer_size.get() < command_length {
-        log_line("DXGI Present: no runtime command buffer");
+        log_line(&format!("DXGI {label}: no runtime command buffer"));
         return E_FAIL;
     }
 
-    if let Some(private) = present_private {
-        (command as *mut HeliosPresentRenderCmd).write_unaligned(HeliosPresentRenderCmd {
-            magic: HELIOS_PRESENT_RENDER_MAGIC,
-            version: HELIOS_PRESENT_RENDER_VERSION,
-            present: private,
-        });
-    } else {
-        // pfnPresentCb's KMD DMA buffer is distinct from this runtime-owned UMD
-        // command buffer. Emit the stable-target refresh marker explicitly so
-        // every accepted ordinary present reaches DxgkDdiRender and dirties the
-        // already-bound LINEAR scanout.
-        (command as *mut HeliosPresentRefreshCmd).write_unaligned(HeliosPresentRefreshCmd {
-            magic: HELIOS_PRESENT_REFRESH_MAGIC,
-            version: HELIOS_PRESENT_REFRESH_VERSION,
-            source_index: 0,
-            destination_index: 0,
-        });
-    }
+    let allocation_count = match submission {
+        RuntimeSubmission::Present {
+            dependencies,
+            private,
+        } => {
+            let count = match dependencies.write_to(dev) {
+                Ok(count) => count,
+                Err(hr) => return hr,
+            };
+            if let Some(private) = private {
+                (command as *mut HeliosPresentRenderCmd).write_unaligned(HeliosPresentRenderCmd {
+                    magic: HELIOS_PRESENT_RENDER_MAGIC,
+                    version: HELIOS_PRESENT_RENDER_VERSION,
+                    present: private,
+                });
+            } else {
+                (command as *mut HeliosPresentRefreshCmd).write_unaligned(
+                    HeliosPresentRefreshCmd {
+                        magic: HELIOS_PRESENT_REFRESH_MAGIC,
+                        version: HELIOS_PRESENT_REFRESH_VERSION,
+                        source_index: 0,
+                        destination_index: 0,
+                    },
+                );
+            }
+            count
+        }
+        RuntimeSubmission::Refresh => {
+            (command as *mut HeliosPresentRefreshCmd).write_unaligned(HeliosPresentRefreshCmd {
+                magic: HELIOS_PRESENT_REFRESH_MAGIC,
+                version: HELIOS_PRESENT_REFRESH_VERSION,
+                source_index: 0,
+                destination_index: 0,
+            });
+            0
+        }
+    };
 
     let mut render = ddi::D3DDDICB_RENDER::default();
     render.CommandLength = command_length;
     render.CommandOffset = 0;
-    render.NumAllocations = 0;
+    render.NumAllocations = allocation_count;
     render.NumPatchLocations = 0;
     render.hContext = dev.h_context;
     let hr = render_cb(dev.h_rt_device, &mut render);
@@ -8295,14 +8965,64 @@ unsafe fn submit_runtime_present(
     let n = LOG_COUNT.fetch_add(1, Ordering::Relaxed);
     if n < 64 || hr < 0 {
         log_line(&format!(
-            "DXGI Present: pfnRenderCb hr=0x{:08x} queued={} next_cmd={:p}/{}",
+            "DXGI {label}: pfnRenderCb hr=0x{:08x} allocations={} queued={} next_cmd={:p}/{}",
             hr as u32,
+            allocation_count,
             render.QueuedBufferCount,
             render.pNewCommandBuffer,
             render.NewCommandBufferSize,
         ));
     }
     hr
+}
+
+unsafe fn submit_runtime_present(
+    dev: &crate::device_funcs::HeliosDevice,
+    dependencies: RuntimePresentDependencies,
+    private: Option<HeliosPresentPrivateData>,
+) -> i32 {
+    submit_runtime_submission(
+        dev,
+        RuntimeSubmission::Present {
+            dependencies,
+            private,
+        },
+    )
+}
+
+/// Submit all pending WDDM render dependencies before asking dxgkrnl to
+/// present them.
+///
+/// The DXGI DDI requires `pfnRenderCb` to precede `pfnPresentCb`.  Keeping the
+/// two callbacks in one helper makes it impossible for the ordinary Present
+/// and Present1 paths to accidentally reverse that ordering again.  The typed
+/// dependency value also makes a source-allocation-free present
+/// unrepresentable.
+unsafe fn submit_runtime_present_then_call(
+    dev: &crate::device_funcs::HeliosDevice,
+    dependencies: RuntimePresentDependencies,
+    private: Option<HeliosPresentPrivateData>,
+    callback_args: &mut ddi::DXGIDDICB_PRESENT,
+) -> i32 {
+    if dev.dxgi_callbacks.is_null() {
+        log_line("DXGI Present: callback table missing");
+        return E_FAIL;
+    }
+    let Some(present_cb) = (*dev.dxgi_callbacks).pfnPresentCb else {
+        log_line("DXGI Present: pfnPresentCb missing");
+        return E_FAIL;
+    };
+
+    let render_hr = submit_runtime_present(dev, dependencies, private);
+    if render_hr < 0 {
+        return render_hr;
+    }
+
+    present_cb(dev.h_rt_device, callback_args)
+}
+
+unsafe fn submit_runtime_refresh(dev: &crate::device_funcs::HeliosDevice) -> i32 {
+    submit_runtime_submission(dev, RuntimeSubmission::Refresh)
 }
 
 /// DXGI `pfnPresent`: copy the source resource to the destination resource when
@@ -8499,36 +9219,60 @@ unsafe extern "C" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT) -> i32 {
 
     if let Some(dev) = helios_device(h) {
         if !dev.dxgi_callbacks.is_null() && src_alloc != 0 && !dev.h_context.is_null() {
-            if let Some(present_cb) = (*dev.dxgi_callbacks).pfnPresentCb {
-                let mut cb = ddi::DXGIDDICB_PRESENT::default();
-                let present_private = presented_primary_private(h, src_h.pDrvPrivate);
-                cb.hSrcAllocation = src_alloc;
-                cb.hDstAllocation = dst_alloc;
-                cb.pDXGIContext = a.pDXGIContext;
-                cb.hContext = dev.h_context;
-                cb.BroadcastContextCount = 0;
-                if let Some(ref private) = present_private {
-                    cb.PrivateDriverDataSize =
-                        core::mem::size_of::<HeliosPresentPrivateData>() as u32;
-                    cb.pPrivateDriverData = (private as *const HeliosPresentPrivateData)
-                        .cast_mut()
-                        .cast();
-                } else {
-                    cb.PrivateDriverDataSize = 0;
-                    cb.pPrivateDriverData = core::ptr::null_mut();
-                }
-                cb.bOptimizeForComposition = if env_flag("HELIOS_PRESENT_OPTIMIZE_COMPOSITION") {
-                    1
-                } else {
-                    0
-                };
-                present_hr = present_cb(dev.h_rt_device, &mut cb);
-                if present_hr >= 0 {
-                    present_hr = submit_runtime_present(dev, present_private);
-                }
+            let mut cb = ddi::DXGIDDICB_PRESENT::default();
+            let present_private = presented_primary_private(h, src_h.pDrvPrivate);
+            cb.hSrcAllocation = src_alloc;
+            cb.hDstAllocation = dst_alloc;
+            cb.pDXGIContext = a.pDXGIContext;
+            cb.hContext = dev.h_context;
+            cb.BroadcastContextCount = 0;
+            if let Some(ref private) = present_private {
+                cb.PrivateDriverDataSize = core::mem::size_of::<HeliosPresentPrivateData>() as u32;
+                cb.pPrivateDriverData = (private as *const HeliosPresentPrivateData)
+                    .cast_mut()
+                    .cast();
             } else {
-                log_line("DXGI Present: pfnPresentCb missing");
+                cb.PrivateDriverDataSize = 0;
+                cb.pPrivateDriverData = core::ptr::null_mut();
             }
+            cb.bOptimizeForComposition = if env_flag("HELIOS_PRESENT_OPTIMIZE_COMPOSITION") {
+                1
+            } else {
+                0
+            };
+            let Some(dependencies) = RuntimePresentDependencies::new(src_alloc, dst_alloc) else {
+                log_line("DXGI Present: nonzero source allocation invariant lost");
+                return E_FAIL;
+            };
+            let cb_n = PRESENT_CB_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+            if cb_n < 128 || (cb_n + 1) % 512 == 0 {
+                let (src_rt, src_km) = resource_parent_handles(src_h.pDrvPrivate);
+                let (dst_rt, dst_km) = resource_parent_handles(dst_h.pDrvPrivate);
+                trace_line!(
+                    "DXGI PresentCb identity: #{} src_alloc=0x{:x} dst_alloc=0x{:x} \
+                     src_hDrv={:p} src_hRT={:p} src_hKM=0x{:x} dst_hDrv={:p} \
+                     dst_hRT={:p} dst_hKM=0x{:x} hContext={:p} dxgi_context={:p} \
+                     flags=0x{:x} broadcast={} private={:p}/{} optimize={}",
+                    cb_n,
+                    cb.hSrcAllocation,
+                    cb.hDstAllocation,
+                    src_h.pDrvPrivate,
+                    src_rt,
+                    src_km,
+                    dst_h.pDrvPrivate,
+                    dst_rt,
+                    dst_km,
+                    cb.hContext,
+                    cb.pDXGIContext,
+                    *(&a.Flags as *const ddi::DXGI_DDI_PRESENT_FLAGS as *const u32),
+                    cb.BroadcastContextCount,
+                    cb.pPrivateDriverData,
+                    cb.PrivateDriverDataSize,
+                    cb.bOptimizeForComposition,
+                );
+            }
+            present_hr =
+                submit_runtime_present_then_call(dev, dependencies, present_private, &mut cb);
         } else {
             log_line(&format!(
                 "DXGI Present: skip PresentCb callbacks={} src=0x{:x} hContext={:p}",
@@ -8631,15 +9375,55 @@ unsafe extern "C" fn dxgi_get_gamma_caps(
 
 unsafe extern "C" fn dxgi_set_display_mode(arg: *mut ddi::DXGI_DDI_ARG_SETDISPLAYMODE) -> i32 {
     if arg.is_null() {
-        return 0;
+        return E_INVALIDARG;
     }
     let a = &*arg;
     let h = dxgi_device_handle(a.hDevice);
+    let Some(dev) = helios_device(h) else {
+        log_line("DXGI SetDisplayMode: missing device");
+        return E_INVALIDARG;
+    };
+    if dev.kt_callbacks.is_null() {
+        log_line("DXGI SetDisplayMode: missing runtime callbacks");
+        return E_FAIL;
+    }
+    let Some(set_display_mode_cb) = (*dev.kt_callbacks).pfnSetDisplayModeCb else {
+        log_line("DXGI SetDisplayMode: pfnSetDisplayModeCb missing");
+        return E_FAIL;
+    };
+
+    // Windows supplies the authoritative primary resource and subresource for
+    // the fullscreen transition. Translate that exact runtime resource to the
+    // allocation created for it; pfnSetDisplayModeCb then asks dxgkrnl to make
+    // that allocation the scan-out primary and initiates the VidPn commit.
+    let resource = dxgi_resource_handle(a.hResource);
+    let allocation = resource_allocation(resource.pDrvPrivate);
+    if allocation == 0 {
+        log_line(&format!(
+            "DXGI SetDisplayMode: resource=0x{:x} sub={} has no WDDM allocation",
+            a.hResource, a.SubResourceIndex
+        ));
+        return E_INVALIDARG;
+    }
+
     if let Some(context) = d3d11_context(h) {
         let _ = unsafe { publish_dwm_composition(&context, h) };
         context.Flush();
     }
-    0
+    let mut callback = ddi::D3DDDICB_SETDISPLAYMODE {
+        hPrimaryAllocation: allocation,
+        PrivateDriverFormatAttribute: 0,
+    };
+    let hr = set_display_mode_cb(dev.h_rt_device, &mut callback);
+    log_line(&format!(
+        "DXGI SetDisplayMode: resource=0x{:x} sub={} allocation=0x{:x} hr=0x{:08x} private_format=0x{:x}",
+        a.hResource,
+        a.SubResourceIndex,
+        allocation,
+        hr as u32,
+        callback.PrivateDriverFormatAttribute
+    ));
+    hr
 }
 
 unsafe extern "C" fn dxgi_set_resource_priority(
@@ -8718,14 +9502,12 @@ unsafe extern "C" fn dxgi_rotate_resource_identities(
     }
 
     // Rotate the WDDM identity records in lockstep with the storages.
-    let first = (
-        (*states[0]).allocation,
-        (*states[0]).km_resource,
-        (*states[0]).owns_allocation,
-        (*states[0]).present_private,
-    );
+    let first_allocation = (*states[0]).allocation.take();
+    let first_km_resource = (*states[0]).km_resource;
+    let first_owns_allocation = (*states[0]).owns_allocation;
+    let first_present_private = (*states[0]).present_private;
     for i in 0..n - 1 {
-        (*states[i]).allocation = (*states[i + 1]).allocation;
+        (*states[i]).allocation = (*states[i + 1]).allocation.take();
         (*states[i]).km_resource = (*states[i + 1]).km_resource;
         (*states[i]).owns_allocation = (*states[i + 1]).owns_allocation;
         // Present private data identifies the backing allocation (Venus
@@ -8735,17 +9517,22 @@ unsafe extern "C" fn dxgi_rotate_resource_identities(
         // resource's memory after the first RotateResourceIdentities call.
         (*states[i]).present_private = (*states[i + 1]).present_private;
     }
-    (*states[n - 1]).allocation = first.0;
-    (*states[n - 1]).km_resource = first.1;
-    (*states[n - 1]).owns_allocation = first.2;
-    (*states[n - 1]).present_private = first.3;
+    (*states[n - 1]).allocation = first_allocation;
+    (*states[n - 1]).km_resource = first_km_resource;
+    (*states[n - 1]).owns_allocation = first_owns_allocation;
+    (*states[n - 1]).present_private = first_present_private;
 
     let c = ROTATE_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
     if c < 64 {
+        let first_handle = (*states[0])
+            .allocation
+            .as_ref()
+            .map(ResidentAllocation::handle)
+            .unwrap_or(0);
         trace_line!(
             "DXGI RotateResourceIdentities: rotated {} resources, alloc[0]=0x{:x} scanout_res[0]={}",
             n,
-            (*states[0]).allocation,
+            first_handle,
             (*states[0]).present_private.resource_id
         );
     }
@@ -8753,6 +9540,7 @@ unsafe extern "C" fn dxgi_rotate_resource_identities(
 }
 
 static ROTATE_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
+static BLT_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 static BLT1_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 static RESIDENCY_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 static MPO_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -8780,6 +9568,39 @@ unsafe extern "C" fn dxgi_blt(arg: *mut ddi::DXGI_DDI_ARG_BLT) -> i32 {
         ));
         return 0;
     };
+
+    let n = BLT_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+    if n < 128 || (n + 1) % 512 == 0 {
+        let mut src_desc = D3D11_TEXTURE2D_DESC::default();
+        let mut dst_desc = D3D11_TEXTURE2D_DESC::default();
+        let src_tex = (*src).cast::<ID3D11Texture2D>().ok();
+        let dst_tex = (*dst).cast::<ID3D11Texture2D>().ok();
+        if let Some(tex) = &src_tex {
+            tex.GetDesc(&mut src_desc);
+        }
+        if let Some(tex) = &dst_tex {
+            tex.GetDesc(&mut dst_desc);
+        }
+        trace_line!(
+            "DXGI Blt: #{} src={:p}/{} alloc=0x{:x} {}x{} fmt={} -> \
+             dst={:p}/{} alloc=0x{:x} {}x{} fmt={} flags=0x{:x} rotate={}",
+            n,
+            src_h.pDrvPrivate,
+            a.SrcSubresource,
+            resource_allocation(src_h.pDrvPrivate),
+            src_desc.Width,
+            src_desc.Height,
+            src_desc.Format.0,
+            dst_h.pDrvPrivate,
+            a.DstSubresource,
+            resource_allocation(dst_h.pDrvPrivate),
+            dst_desc.Width,
+            dst_desc.Height,
+            dst_desc.Format.0,
+            a.Flags.__bindgen_anon_1.Value,
+            a.Rotate,
+        );
+    }
 
     // The DXGI 1.0 blit DDI has no source rectangle. For DWM/windowed present
     // setup the runtime uses it to move between compatible proxy/front-buffer
@@ -9221,36 +10042,59 @@ unsafe extern "C" fn dxgi_present1(arg: *mut ddi::DXGI_DDI_ARG_PRESENT1) -> i32 
             ));
             return DXGI_ERROR_UNSUPPORTED;
         }
-        if let Some(present_cb) = (*dev.dxgi_callbacks).pfnPresentCb {
-            let mut cb = ddi::DXGIDDICB_PRESENT::default();
-            let present_private = presented_primary_private(h, src_h.pDrvPrivate);
-            cb.hSrcAllocation = src_alloc;
-            cb.hDstAllocation = dst_alloc;
-            cb.pDXGIContext = a.pDXGIContext;
-            cb.hContext = dev.h_context;
-            cb.BroadcastContextCount = 0;
-            if let Some(ref private) = present_private {
-                cb.PrivateDriverDataSize = core::mem::size_of::<HeliosPresentPrivateData>() as u32;
-                cb.pPrivateDriverData = (private as *const HeliosPresentPrivateData)
-                    .cast_mut()
-                    .cast();
-            } else {
-                cb.PrivateDriverDataSize = 0;
-                cb.pPrivateDriverData = core::ptr::null_mut();
-            }
-            cb.bOptimizeForComposition = if env_flag("HELIOS_PRESENT_OPTIMIZE_COMPOSITION") {
-                1
-            } else {
-                0
-            };
-            present_hr = present_cb(dev.h_rt_device, &mut cb);
-            if present_hr >= 0 {
-                present_hr = submit_runtime_present(dev, present_private);
-            }
+        let mut cb = ddi::DXGIDDICB_PRESENT::default();
+        let present_private = presented_primary_private(h, src_h.pDrvPrivate);
+        cb.hSrcAllocation = src_alloc;
+        cb.hDstAllocation = dst_alloc;
+        cb.pDXGIContext = a.pDXGIContext;
+        cb.hContext = dev.h_context;
+        cb.BroadcastContextCount = 0;
+        if let Some(ref private) = present_private {
+            cb.PrivateDriverDataSize = core::mem::size_of::<HeliosPresentPrivateData>() as u32;
+            cb.pPrivateDriverData = (private as *const HeliosPresentPrivateData)
+                .cast_mut()
+                .cast();
         } else {
-            log_line("DXGI Present1 multi: pfnPresentCb missing");
-            return DXGI_ERROR_UNSUPPORTED;
+            cb.PrivateDriverDataSize = 0;
+            cb.pPrivateDriverData = core::ptr::null_mut();
         }
+        cb.bOptimizeForComposition = if env_flag("HELIOS_PRESENT_OPTIMIZE_COMPOSITION") {
+            1
+        } else {
+            0
+        };
+        let Some(dependencies) = RuntimePresentDependencies::new(src_alloc, dst_alloc) else {
+            log_line("DXGI Present1 multi: nonzero source allocation invariant lost");
+            return E_FAIL;
+        };
+        let cb_n = PRESENT_CB_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+        if cb_n < 128 || (cb_n + 1) % 512 == 0 {
+            let (src_rt, src_km) = resource_parent_handles(src_h.pDrvPrivate);
+            let (dst_rt, dst_km) = resource_parent_handles(dst_h.pDrvPrivate);
+            trace_line!(
+                "DXGI Present1 PresentCb identity: #{} src_alloc=0x{:x} dst_alloc=0x{:x} \
+                 src_hDrv={:p} src_hRT={:p} src_hKM=0x{:x} dst_hDrv={:p} \
+                 dst_hRT={:p} dst_hKM=0x{:x} hContext={:p} dxgi_context={:p} \
+                 flags=0x{:x} broadcast={} private={:p}/{} optimize={}",
+                cb_n,
+                cb.hSrcAllocation,
+                cb.hDstAllocation,
+                src_h.pDrvPrivate,
+                src_rt,
+                src_km,
+                dst_h.pDrvPrivate,
+                dst_rt,
+                dst_km,
+                cb.hContext,
+                cb.pDXGIContext,
+                *(&a.Flags as *const ddi::DXGI_DDI_PRESENT_FLAGS as *const u32),
+                cb.BroadcastContextCount,
+                cb.pPrivateDriverData,
+                cb.PrivateDriverDataSize,
+                cb.bOptimizeForComposition,
+            );
+        }
+        present_hr = submit_runtime_present_then_call(dev, dependencies, present_private, &mut cb);
     }
 
     let n = PRESENT1_LOG_COUNT.fetch_add(1, Ordering::Relaxed);

@@ -60,6 +60,7 @@ pub mod ffi {
             memory_type_index: u32,
             scanout_linear: bool,
             linear_scanout_target: bool,
+            cross_context_optimal: bool,
         ) -> usize;
 
         unsafe fn open_kmd_scanout_target(
@@ -71,9 +72,9 @@ pub mod ffi {
             out_generation: *mut u32,
         ) -> usize;
 
-        /// Create the DWM scan-out primary as a dedicated DMA_BUF-exportable
-        /// image. `optimal_scanout=false` reports the real LINEAR COLOR layout;
-        /// `true` reports logical scanout metadata for exact host reconstruction.
+        /// Create the DWM scan-out primary as a dedicated OPTIMAL,
+        /// DMA_BUF-exportable image and report logical scanout metadata for
+        /// exact host reconstruction.
         /// Returns an owned `ID3D11Resource*` (as usize), or 0 on failure.
         unsafe fn create_ddi_scanout_texture2d(
             self: &HeliosDxvkDevice,
@@ -82,7 +83,6 @@ pub mod ffi {
             format: u32,
             bind_flags: u32,
             misc_flags: u32,
-            optimal_scanout: bool,
             out_row_pitch: *mut u64,
             out_offset: *mut u64,
         ) -> usize;

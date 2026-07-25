@@ -37,7 +37,7 @@
 
 use core::cell::UnsafeCell;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
@@ -378,7 +378,7 @@ const BLOB_PAGE: u64 = 4096;
 /// once at init. Exhaustion is now counted (`BLOB_FULL_REJECTS`) and visible
 /// via `HELIOS_ESCAPE_QUERY_STATS`; hitting the new cap indicates a leak, not
 /// a workload.
-const MAX_BLOBS: usize = 8192;
+pub(crate) const MAX_BLOBS: usize = 8192;
 /// Max live virtio resources. This covers both escape blobs and KMD/WDDM standard
 /// allocations, so teardown can suppress duplicate RESOURCE_UNREF commands. Must
 /// be ≥ MAX_BLOBS (every blob is a live resource; non-blob resources add more).
@@ -531,6 +531,13 @@ pub struct SyncWaitBlock {
 #[derive(Clone, Copy)]
 pub struct AsyncScanoutNotify {
     pub pending: NonNull<AtomicU32>,
+    /// Address of the Windows primary whose compatibility copy this submission
+    /// performs. Published as displayed only on successful GPU completion.
+    pub displayed_primary: NonNull<AtomicU64>,
+    /// Exact SetVidPnSourceAddress programming gate. Cleared after the copy
+    /// succeeds or fails so VSync can resume with authoritative state.
+    pub programming: NonNull<AtomicU32>,
+    pub primary_address: u64,
     pub event: NonNull<KEVENT>,
 }
 
@@ -1387,8 +1394,14 @@ impl VirtioGpu {
                     // SAFETY: both pointers refer to stable AdapterContext
                     // fields whose lifetime encloses this transport entry.
                     unsafe {
-                        if let Some(pending) = resubmit {
-                            pending.as_ref().store(1, Ordering::Release);
+                        // A rejected SET_SCANOUT_BLOB must not become a
+                        // self-sustaining retry loop. New exact-primary/dirty
+                        // publication is the only retry trigger; successful
+                        // binds re-arm once to issue their first flush.
+                        if response_ok {
+                            if let Some(pending) = resubmit {
+                                pending.as_ref().store(1, Ordering::Release);
+                            }
                         }
                         completion.as_ref().store(0, Ordering::Release);
                         KeSetEvent(wake_event.as_ptr(), IO_NO_INCREMENT, 0);
@@ -1410,13 +1423,20 @@ impl VirtioGpu {
                     // ring_idx=1 is the GPU-completion domain. Queue the host
                     // display refresh only after the copy has really completed;
                     // a decode-level or failed submit must never publish pixels.
-                    if response_ok && ring_idx == 1 {
+                    if ring_idx == 1 {
                         if let Some(notify) = scanout_notify {
                             // SAFETY: both pointers name stable AdapterContext
                             // fields; the adapter owns this transport and outlives
                             // every in-flight entry.
                             unsafe {
-                                notify.pending.as_ref().store(1, Ordering::Release);
+                                if response_ok {
+                                    notify
+                                        .displayed_primary
+                                        .as_ref()
+                                        .store(notify.primary_address, Ordering::Release);
+                                    notify.pending.as_ref().store(1, Ordering::Release);
+                                }
+                                notify.programming.as_ref().store(0, Ordering::Release);
                                 KeSetEvent(notify.event.as_ptr(), IO_NO_INCREMENT, 0);
                             }
                         }
@@ -1753,9 +1773,26 @@ impl VirtioGpu {
         _notify_guard: &crate::adapter::WddmNotifyGuard<'_>,
         fence: u32,
         paging: bool,
-        wait_gpu: bool,
+        gpu_completion_fence: Option<u64>,
+        refresh_scanout: bool,
     ) -> bool {
-        let watermark = if paging { 0 } else { self.next_wire_fence };
+        let wait_gpu = gpu_completion_fence.is_some();
+        let watermark = if paging {
+            0
+        } else if let Some(gpu_fence_id) = gpu_completion_fence {
+            // async_retired_up_to uses an exclusive watermark. A marker written
+            // by Present names the exact ring-1 fence that owns its copy.
+            if gpu_fence_id != 0 && gpu_fence_id < self.next_wire_fence {
+                gpu_fence_id.saturating_add(1)
+            } else {
+                // A malformed/stale private marker must not manufacture an
+                // impossible future dependency. Conservatively gate on all
+                // work actually enqueued before this WDDM submission.
+                self.next_wire_fence
+            }
+        } else {
+            self.next_wire_fence
+        };
         if self.wddm_pending.is_empty() && self.async_retired_up_to(watermark, wait_gpu) {
             return true;
         }
@@ -1772,7 +1809,7 @@ impl VirtioGpu {
             fence,
             watermark,
             wait_gpu,
-            refresh_scanout: wait_gpu,
+            refresh_scanout,
         });
         false
     }

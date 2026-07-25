@@ -4,6 +4,9 @@
 //! `DxgkDdiRemoveDevice`. Dxgkrnl hands this back to us as the opaque
 //! `MiniportDeviceContext` in every subsequent DDI call.
 
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+
 use core::cell::UnsafeCell;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -77,6 +80,98 @@ pub struct BarSegment {
     pub probe_only: bool,
 }
 
+/// Exact system-memory backing Windows supplied for one allocation in a paging
+/// TRANSFER from the BAR segment to segment 0.
+///
+/// The physical pages come directly from the locked MDL in the transfer
+/// request. They remain the allocation's authoritative system backing until
+/// Windows issues the inverse transfer or destroys the allocation.
+#[derive(Clone)]
+pub(crate) struct SystemBackingSnapshot {
+    pub resource_id: u32,
+    pub blob_offset: u64,
+    pub size: u64,
+    pub first_page_offset: u32,
+    pub pages: Arc<[u64]>,
+}
+
+/// Per-adapter resource-id -> Windows system-backing association.
+///
+/// Entries use `Arc<[u64]>` so Present can take an allocation-free snapshot
+/// while the spinlock is held. New page arrays are built before the lock is
+/// acquired; the entry vector is pre-reserved and never grows while locked.
+pub(crate) struct SystemBackingTable {
+    lock: UnsafeCell<KSPIN_LOCK>,
+    entries: UnsafeCell<Vec<SystemBackingSnapshot>>,
+}
+
+unsafe impl Send for SystemBackingTable {}
+unsafe impl Sync for SystemBackingTable {}
+
+impl SystemBackingTable {
+    const MAX_ENTRIES: usize = 128;
+
+    pub fn new() -> Self {
+        Self {
+            lock: UnsafeCell::new(0),
+            entries: UnsafeCell::new(Vec::with_capacity(Self::MAX_ENTRIES)),
+        }
+    }
+
+    pub fn replace(&self, backing: SystemBackingSnapshot) -> bool {
+        let irql = unsafe { KeAcquireSpinLockRaiseToDpc(self.lock.get()) };
+        let entries = unsafe { &mut *self.entries.get() };
+        let mut old = None;
+        let success = if let Some(index) = entries
+            .iter()
+            .position(|entry| entry.resource_id == backing.resource_id)
+        {
+            old = Some(core::mem::replace(&mut entries[index], backing));
+            true
+        } else if entries.len() < entries.capacity() {
+            entries.push(backing);
+            true
+        } else {
+            false
+        };
+        unsafe { KeReleaseSpinLock(self.lock.get(), irql) };
+        // Releasing the old Arc can free pool memory; do that after dropping
+        // back to the caller's original IRQL.
+        drop(old);
+        success
+    }
+
+    pub fn snapshot(&self, resource_id: u32) -> Option<SystemBackingSnapshot> {
+        let irql = unsafe { KeAcquireSpinLockRaiseToDpc(self.lock.get()) };
+        let result = unsafe { &*self.entries.get() }
+            .iter()
+            .find(|entry| entry.resource_id == resource_id)
+            .cloned();
+        unsafe { KeReleaseSpinLock(self.lock.get(), irql) };
+        result
+    }
+
+    pub fn contains(&self, resource_id: u32) -> bool {
+        let irql = unsafe { KeAcquireSpinLockRaiseToDpc(self.lock.get()) };
+        let result = unsafe { &*self.entries.get() }
+            .iter()
+            .any(|entry| entry.resource_id == resource_id);
+        unsafe { KeReleaseSpinLock(self.lock.get(), irql) };
+        result
+    }
+
+    pub fn remove(&self, resource_id: u32) {
+        let irql = unsafe { KeAcquireSpinLockRaiseToDpc(self.lock.get()) };
+        let entries = unsafe { &mut *self.entries.get() };
+        let removed = entries
+            .iter()
+            .position(|entry| entry.resource_id == resource_id)
+            .map(|index| entries.swap_remove(index));
+        unsafe { KeReleaseSpinLock(self.lock.get(), irql) };
+        drop(removed);
+    }
+}
+
 pub struct AdapterContext {
     /// Physical device object for the virtio-gpu device.
     pub pdo: PDEVICE_OBJECT,
@@ -109,11 +204,27 @@ pub struct AdapterContext {
     /// The virtio-gpu transport, brought up in `DxgkDdiStartDevice` (Phase 2).
     /// Guarded by `virtio_lock`; `None` until StartDevice (and after StopDevice).
     virtio: UnsafeCell<Option<VirtioGpu>>,
+    /// PASSIVE-level serialization for scanout selection versus allocation
+    /// destruction. A Windows primary can be replaced while an asynchronous
+    /// SET_SCANOUT_BLOB/RESOURCE_FLUSH is outstanding; destruction must first
+    /// retire that exact resource from scanout 0 and drain the control queue
+    /// before RESOURCE_UNREF. This event is an in-place synchronization mutex,
+    /// separate from the DISPATCH-safe virtio spinlock because the protected
+    /// operations may perform synchronous host round-trips.
+    scanout_mutex: UnsafeCell<KEVENT>,
     /// Live host-visible blob → user-VA mappings (Gate 5a Stage 2b). Tagged by the
     /// owning D3D device handle (`DXGKARG_ESCAPE.hDevice`); `DxgkDdiDestroyDevice`
     /// drains and unmaps them. Has its own spinlock, independent of `virtio_lock`,
     /// so teardown works even after the transport is gone.
     pub mappings: crate::mapping::MappingTable,
+    /// Exact paging-process system-memory leaf PTEs supplied by VidMm for
+    /// virtual content transfers. This is the software VA-walk state used by
+    /// `DxgkDdiBuildPagingBuffer`, independent of the decorative hardware page
+    /// tables that venus never reads.
+    pub paging_pte_shadow: crate::ddi::PagingPteShadow,
+    /// Exact system-memory pages Windows associates with a BAR allocation
+    /// through paging TRANSFER requests.
+    pub(crate) system_backings: SystemBackingTable,
     /// Real-RAM-backed segment for VidMm page tables / paging buffers (segment 2).
     /// `None` if the contiguous allocation failed (then we fall back to the old
     /// single-segment shape). Allocated in `new`, freed in `Drop`.
@@ -151,12 +262,14 @@ pub struct AdapterContext {
     /// The persistent venus 3D context id (`VIRTIO_GPU_CAPSET_VENUS`) the venus
     /// client rides, created in StartDevice and destroyed in StopDevice. `0` = none.
     pub venus_ctx_id: u32,
-    /// `GdiAccelMode` service-key knob (read once in StartDevice; default 1).
+    /// `GdiAccelMode` service-key diagnostic rollback knob (read once in
+    /// StartDevice; default 0).
     /// 0 = do not advertise `SupportKernelModeCommandBuffer` (GDI HW accel):
     /// win32k then rasterizes GDI on the CPU into CpuVisible allocations and
-    /// the RenderGdi executor goes idle. Retests the 2026-07-02
-    /// "LOAD-MANDATORY" bisect, which predates the Option A BAR segment
-    /// (ROADMAP WS1 #8); viogpu3d never sets the bit and loads fine.
+    /// the RenderGdi executor stays unreachable. The 2026-07-06 mode-0 A/B
+    /// overturned the earlier "LOAD-MANDATORY" result and proved the canonical
+    /// CPU redirection path; explicit mode 1 remains only for diagnostics until
+    /// the obsolete KMD CPU blitter is removed.
     pub gdi_accel_mode: u32,
     /// `AllocCached` service-key knob (read once in StartDevice; default 1).
     /// When set, CpuVisible allocations are additionally flagged `Cached` so
@@ -165,6 +278,13 @@ pub struct AdapterContext {
     /// the same physical pages); WC reads measured ~200 MB/s in the IDD
     /// readback (36 ms per 7.8 MiB frame, 2026-07-06). 0 = kill switch.
     pub alloc_cached: bool,
+    /// `PresentProbe` service-key knob (read once in StartDevice; default 0).
+    /// When enabled, each exact Present source/destination pair performs one
+    /// bounded, fence-ordered CPU sample of the destination after its eighth
+    /// submission. This is a diagnostic only: the steady-state path never
+    /// waits or maps a frame, and the per-pair `probe_done` state statically
+    /// prevents repeated readbacks.
+    pub present_probe: bool,
     /// `DisplayHalf` service-key knob (REG_DWORD, read once in StartDevice;
     /// default 0 = OFF, the boot-proven render-only surface). When nonzero,
     /// StartDevice advertises ONE video-present source + ONE child video-output
@@ -194,10 +314,24 @@ pub struct AdapterContext {
     pub vsync_enabled: AtomicU32,
     /// Count of CRTC_VSYNC interrupts synthesized this boot (diag `ScVs`).
     pub vsync_count: AtomicU32,
-    /// Physical address of the last primary bound by `SetVidPnSourceAddress`,
-    /// reported in each CRTC_VSYNC packet so dxgkrnl can retire the matching queued
-    /// flip (viogpu3d `m_sourceAddress`). 0 until the first source-address bind.
+    /// Physical address of the last primary actually programmed for display,
+    /// reported in each CRTC_VSYNC packet so dxgkrnl can retire the matching
+    /// queued flip (viogpu3d `m_sourceAddress`). Direct scanout publishes only
+    /// after SET_SCANOUT_BLOB succeeds; the copy fallback publishes from the
+    /// ring-1 GPU-completion DPC. 0 until the first completed source switch.
     pub last_primary_address: AtomicU64,
+    /// Exact WDDM allocation handle supplied by `SetVidPnSourceAddress` when
+    /// dxgkrnl invokes that DDI from its synchronized MMIO-flip path at DIRQL.
+    /// DIRQL may only publish this pointer-sized identity. The periodic VSync
+    /// DPC wakes the PASSIVE display worker, which consumes the newest handle
+    /// and performs the Venus import/copy plus host scanout programming.
+    pub pending_vidpn_allocation: AtomicUsize,
+    /// Nonzero while the exact primary supplied by `SetVidPnSourceAddress` is
+    /// being programmed for scanout. A CRTC_VSYNC must not report the preceding
+    /// primary again during this interval: dxgkrnl treats that notification as
+    /// the display engine's authoritative completion state and can retire the
+    /// newly queued flip before its PASSIVE host bind/copy finishes.
+    pub vidpn_programming: AtomicU32,
     /// Active virtio scanout-0 blob selected by the display half. The PASSIVE
     /// display worker flushes it only after a completed primary-to-LINEAR GPU
     /// copy marks scanout dirty.
@@ -331,7 +465,11 @@ impl AdapterContext {
             isr_status: AtomicUsize::new(0),
             virtio_lock: UnsafeCell::new(0),
             virtio: UnsafeCell::new(None),
+            // Zeroed placeholder — initialized in place by init_kernel_events.
+            scanout_mutex: UnsafeCell::new(unsafe { core::mem::zeroed() }),
             mappings: crate::mapping::MappingTable::new(),
+            paging_pte_shadow: crate::ddi::PagingPteShadow::new(),
+            system_backings: SystemBackingTable::new(),
             paging_ram: None,
             page_table_window: None,
             bar_segment: None,
@@ -341,8 +479,9 @@ impl AdapterContext {
             // `init_kernel_events` once the context is at its final address.
             venus_mutex: UnsafeCell::new(unsafe { core::mem::zeroed() }),
             venus_ctx_id: 0,
-            gdi_accel_mode: 1,
+            gdi_accel_mode: 0,
             alloc_cached: true,
+            present_probe: false,
             display_half: false,
             // Zeroed placeholders — the real KTIMER/KDPC dispatcher state is
             // written by `init_vsync` once the context is at its final address.
@@ -376,6 +515,8 @@ impl AdapterContext {
             scanout_refresh_pending: AtomicU32::new(0),
             scanout_flush_inflight: AtomicU32::new(0),
             vsync_armed: AtomicU32::new(0),
+            pending_vidpn_allocation: AtomicUsize::new(0),
+            vidpn_programming: AtomicU32::new(0),
             display_w: 0,
             display_h: 0,
             edid: [0u8; 128],
@@ -511,27 +652,6 @@ impl AdapterContext {
             .store(resource_id, core::sync::atomic::Ordering::Release);
     }
 
-    /// Publish the newest exact-primary scanout candidate without claiming the
-    /// host has bound it. The PASSIVE worker performs/coalesces the asynchronous
-    /// SET_SCANOUT_BLOB and subsequent RESOURCE_FLUSH.
-    pub fn publish_scanout_candidate(
-        &self,
-        resource_id: u32,
-        width: u32,
-        height: u32,
-        format: u32,
-        pitch: u32,
-        offset: u32,
-    ) {
-        let wh = ((width as u64) << 32) | height as u64;
-        let layout = ((pitch as u64) << 32) | offset as u64;
-        self.active_scanout_wh.store(wh, Ordering::Relaxed);
-        self.active_scanout_layout.store(layout, Ordering::Relaxed);
-        self.active_scanout_format.store(format, Ordering::Relaxed);
-        self.active_scanout_resource
-            .store(resource_id, Ordering::Release);
-    }
-
     /// Publish the exact Venus import identity of the KMD-owned LINEAR primary.
     /// `resource_id` is stored last so an acquire reader never combines a new id
     /// with stale geometry or allocation parameters.
@@ -614,6 +734,13 @@ impl AdapterContext {
     /// wakes the worker only after the Venus GPU copy has completed. One
     /// in-flight command is the backpressure boundary.
     pub(crate) fn queue_active_scanout_refresh(&self) -> ScanoutRefreshQueue {
+        self.with_scanout_lifecycle(|| self.queue_active_scanout_refresh_locked())
+    }
+
+    /// Scanout refresh implementation. The caller holds `scanout_mutex`, which
+    /// prevents a matching WDDM allocation from being unbound/unref'd between
+    /// the liveness check and control-queue submission.
+    fn queue_active_scanout_refresh_locked(&self) -> ScanoutRefreshQueue {
         use core::sync::atomic::Ordering;
 
         // This is the production path only. Diagnostic fills issue their own
@@ -632,6 +759,27 @@ impl AdapterContext {
         let stride = (layout >> 32) as u32;
         let offset = layout as u32;
         if !self.display_half || resource_id == 0 || width == 0 || height == 0 {
+            return ScanoutRefreshQueue::Unavailable;
+        }
+        let live = self
+            .with_virtio(|v| v.resource_is_live(resource_id))
+            .unwrap_or(false);
+        if !live {
+            // Only clear the identity we sampled. A newer Windows primary may
+            // have been published concurrently by the Present path.
+            let _ = self.active_scanout_resource.compare_exchange(
+                resource_id,
+                0,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+            if self
+                .host_bound_scanout_resource
+                .compare_exchange(resource_id, 0, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                crate::diag::record_named_bytes(b"ScDead", resource_id);
+            }
             return ScanoutRefreshQueue::Unavailable;
         }
         if self.scanout_bind_inflight.load(Ordering::Acquire) != 0
@@ -808,6 +956,7 @@ impl AdapterContext {
                 b"PkHi",
                 crate::virtio::gpu::PARKED_HIGH_WATER.load(Ordering::Relaxed),
             );
+            crate::ddi::record_present_handoff_telemetry();
         }
         ScanoutRefreshQueue::Queued
     }
@@ -881,6 +1030,10 @@ impl AdapterContext {
         // SAFETY: per the fn contract; SynchronizationEvent (type 1), initially
         // signaled (the mutex starts free).
         unsafe { KeInitializeEvent(self.venus_mutex.get(), 1, 1) };
+        // Same synchronization-event mutex shape as `venus_mutex`, but with a
+        // distinct lock order and purpose: scanout lifecycle operations never
+        // hold this while acquiring it recursively.
+        unsafe { KeInitializeEvent(self.scanout_mutex.get(), 1, 1) };
         // HPD worker wake event: SynchronizationEvent (auto-clears on a satisfied
         // wait), initially unsignaled — the worker's own timeout drives the first
         // indication; later signals come from the config-change DPC.
@@ -909,6 +1062,101 @@ impl AdapterContext {
         // SAFETY: initialized event; KeSetEvent with Wait=FALSE is callable at
         // <= DISPATCH_LEVEL (we are at PASSIVE).
         unsafe { KeSetEvent(self.venus_mutex.get(), 0, 0) };
+    }
+
+    /// Serialize a PASSIVE scanout operation against exact-resource retirement.
+    ///
+    /// The closure may block on virtio/Venus work, so this cannot use the
+    /// DISPATCH-safe transport spinlock. Callers must not invoke it recursively.
+    pub(crate) fn with_scanout_lifecycle<R>(&self, f: impl FnOnce() -> R) -> R {
+        // SAFETY: initialized in place by `init_kernel_events`; all callers are
+        // PASSIVE-level display worker or allocation-lifecycle paths.
+        let _ = unsafe {
+            KeWaitForSingleObject(
+                self.scanout_mutex.get() as PVOID,
+                0, // Executive
+                0, // KernelMode
+                0, // non-alertable
+                core::ptr::null_mut(),
+            )
+        };
+        let result = f();
+        // SAFETY: release the synchronization-event mutex acquired above.
+        unsafe { KeSetEvent(self.scanout_mutex.get(), 0, 0) };
+        result
+    }
+
+    /// Retire one exact Windows allocation/resource identity from scanout 0.
+    ///
+    /// Returns false only when the mandatory host unbind could not be
+    /// confirmed. The caller must then retain the host resource until device
+    /// teardown rather than RESOURCE_UNREF a blob QEMU may still sample.
+    pub(crate) fn retire_scanout_allocation(
+        &self,
+        allocation_handle: usize,
+        resource_id: u32,
+    ) -> bool {
+        use core::sync::atomic::Ordering;
+
+        self.with_scanout_lifecycle(|| {
+            // SetVidPnSourceAddress can publish its exact KMD allocation handle
+            // at DIRQL for later PASSIVE processing. DestroyAllocation owns the
+            // same exact pointer; cancel it while serialized with the worker's
+            // swap-and-dereference before the Box can be freed.
+            if allocation_handle != 0 {
+                let _ = self.pending_vidpn_allocation.compare_exchange(
+                    allocation_handle,
+                    0,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                );
+            }
+            if resource_id == 0 {
+                return true;
+            }
+
+            let was_active = self
+                .active_scanout_resource
+                .compare_exchange(resource_id, 0, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok();
+            let was_host_bound =
+                self.host_bound_scanout_resource.load(Ordering::Acquire) == resource_id;
+            if !was_active && !was_host_bound {
+                return true;
+            }
+            if !was_host_bound {
+                // The retiring allocation was only a newer desired candidate;
+                // a different resource is still bound on the host. Clearing
+                // the candidate above is sufficient. Sending scanout-disable
+                // here would blank the unrelated Windows-selected primary.
+                crate::diag::record_named_bytes(b"ScRet", resource_id);
+                return true;
+            }
+
+            // QEMU's virtio-gpu SET_SCANOUT_BLOB contract treats resource_id=0
+            // as scanout disable before any resource lookup. Because this
+            // synchronous command is queued after all earlier async scanout
+            // commands, its response is the lifetime barrier before UNREF.
+            let unbound = crate::virtio::ctrl::set_scanout_blob(self, 0, 0, 0, 0, 0, 0).is_ok();
+            if !unbound {
+                crate::diag::record_named_bytes(b"ScRet", 0xE);
+                crate::diag::record_named_bytes(b"ScDead", resource_id);
+                return false;
+            }
+
+            self.host_bound_scanout_resource.store(0, Ordering::Release);
+            self.scanout_refresh_pending.store(0, Ordering::Release);
+            crate::diag::record_named_bytes(b"ScRet", resource_id);
+
+            // The DISPATCH Present path can publish a newer exact Windows
+            // primary without taking this PASSIVE lock. If that happened while
+            // the old resource was retiring, make the new identity drive a
+            // fresh bind instead of treating the just-issued unbind as final.
+            if self.active_scanout_resource.load(Ordering::Acquire) != 0 {
+                self.request_scanout_refresh();
+            }
+            true
+        })
     }
 
     /// Run `f` against the persistent venus client under the PASSIVE venus

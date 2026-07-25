@@ -33,11 +33,44 @@ pub const HELIOS_WDDM_ALLOC_KIND_SHMEM: u32 = 0;
 pub const HELIOS_WDDM_ALLOC_KIND_DEVICE_MEMORY: u32 = 1;
 /// [`HeliosWddmAllocPrivate::kind`] — a runtime "standard" allocation (the
 /// shared-primary / shadow / staging / GDI surfaces DWM and IddCx create). The KMD
-/// self-fills this private data in `DxgkDdiGetStandardAllocationDriverData` and
-/// self-backs it with a host-allocated HOST3D mappable blob (`blob_id == 0`,
-/// `ctx_id` = the KMD's internal venus context). The geometry the runtime supplied
-/// (width/height/format) is appended after this struct as a KMD-private trailer.
+/// self-fills this private data in `DxgkDdiGetStandardAllocationDriverData`.
+/// The meta trailer selects the exact backing: CPU-visible variants use a
+/// pitched HOST3D blob, while `D3DKMDT_GDISURFACE_TEXTURE` uses a non-CPU-visible
+/// shared OPTIMAL image. The geometry the runtime supplied
+/// (width/height/format) is appended after this struct.
 pub const HELIOS_WDDM_ALLOC_KIND_STANDARD: u32 = 2;
+
+/// [`HeliosWddmAllocMeta::misc_flags`] — the standard allocation is the exact
+/// VidPn primary selected for direct scanout.
+///
+/// These high bits are guest-private metadata, not D3D11 resource flags. Keep
+/// their definitions in the shared protocol crate so the KMD writer and UMD
+/// reader cannot silently drift.
+pub const HELIOS_WDDM_ALLOC_MISC_PRIMARY: u32 = 0x8000_0000;
+/// [`HeliosWddmAllocMeta::misc_flags`] — the primary has the direct-scanout
+/// external-memory contract.
+pub const HELIOS_WDDM_ALLOC_MISC_DIRECT_SCANOUT: u32 = 0x4000_0000;
+/// [`HeliosWddmAllocMeta::misc_flags`] — a
+/// `D3DKMDT_GDISURFACE_TEXTURE` standard allocation is a non-CPU-visible,
+/// cross-context OPTIMAL image rather than a pitched byte buffer.
+pub const HELIOS_WDDM_ALLOC_MISC_OPTIMAL_GDI_TEXTURE: u32 = 0x2000_0000;
+/// [`HeliosWddmAllocMeta::misc_flags`] — dxgkrnl asked the KMD to create a
+/// resource object for this allocation (`DXGK_CREATEALLOCATIONFLAGS::Resource`).
+///
+/// This is preserved from the Windows callback verbatim so later
+/// `OpenAllocation`/`Present` diagnostics can distinguish a resource-associated
+/// allocation from a device-associated allocation without inferring anything
+/// from its dimensions, process, or creation order.
+pub const HELIOS_WDDM_ALLOC_MISC_RESOURCE_ASSOCIATED: u32 = 0x1000_0000;
+/// Bit range in [`HeliosWddmAllocMeta::misc_flags`] carrying the exact
+/// `D3DKMDT_STANDARDALLOCATION_TYPE` supplied by Windows.
+pub const HELIOS_WDDM_ALLOC_MISC_STANDARD_TYPE_MASK: u32 = 0x0F00_0000;
+pub const HELIOS_WDDM_ALLOC_MISC_STANDARD_TYPE_SHIFT: u32 = 24;
+/// Bit range in [`HeliosWddmAllocMeta::misc_flags`] carrying the exact
+/// `D3DKMDT_GDISURFACETYPE` supplied by Windows when the standard allocation
+/// type is `D3DKMDT_STANDARDALLOCATION_GDISURFACE`.
+pub const HELIOS_WDDM_ALLOC_MISC_GDI_TYPE_MASK: u32 = 0x00F0_0000;
+pub const HELIOS_WDDM_ALLOC_MISC_GDI_TYPE_SHIFT: u32 = 20;
 
 /// Private driver data for one allocation created via `D3DKMTCreateAllocation`.
 ///
@@ -267,7 +300,7 @@ impl HeliosPresentPrivateData {
     }
 }
 
-/// Tiny command submitted through `pfnRenderCb` after DXGI accepts a present.
+/// Tiny command submitted through `pfnRenderCb` before `pfnPresentCb`.
 /// The payload is created only for the exact `pPrimaryDesc` allocation and is
 /// consumed by `DxgkDdiRender`; ordinary application presents use the legacy
 /// four-byte marker and cannot enter the scanout path.

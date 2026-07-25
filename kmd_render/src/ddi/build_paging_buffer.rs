@@ -2,14 +2,22 @@
 //!
 //! Helios declares a **decorative** GpuMmu (WDDM_FAKE_VIDMM_RESEARCH.md §A3.7):
 //! the host GPU owns the real MMU and venus addresses resources by opaque id, so
-//! the guest page-table *content* is never read by any hardware. What VidMm still
+//! the guest page-table *content* is never read by hardware. What VidMm still
 //! requires is that every page-table DDI exist, succeed, and return values
-//! consistent with the declared `ddi::gpummu` geometry. So:
+//! consistent with the declared `ddi::gpummu` geometry. One part of that content
+//! is nevertheless authoritative to the CPU paging executor: leaf PTEs for the
+//! paging-process virtual addresses used by `VIRTUAL_TRANSFER`. So:
 //!
 //!   - For the aperture / page-table segments `BuildPagingBuffer` stays a
 //!     **null engine**: it consumes the operation and returns success **without
 //!     writing DMA / advancing `pDmaBuffer`**. The accompanying `SubmitCommand`
 //!     retires the fence, so VidMm believes the operation ran.
+//!   - Leaf `UPDATE_PAGE_TABLE` calls retain the exact system-memory
+//!     `FirstPteVirtualAddress` → `DXGK_PTE::PageAddress` mappings supplied by
+//!     VidMm for Helios blob allocations. `VIRTUAL_TRANSFER` uses those mappings
+//!     to copy allocation content between the blob and the locked system pages.
+//!     This is the software implementation of the paging GPU's VA walk; it does
+//!     not classify resources or infer an identity.
 //!   - `GetRootPageTableSize` returns a byte size consistent with the declared
 //!     PTE size, so VidMm carves a correctly-sized root page table.
 //!   - `SetRootPageTable` records-and-ignores (the root address is decorative).
@@ -19,7 +27,8 @@
 //! content IS its venus blob (the CPU host aperture exposes the blob bytes —
 //! `cpu_host_aperture.rs`), so:
 //!
-//!   - Content TRANSFERs (system MDL ↔ segment) execute synchronously here as
+//!   - Content TRANSFERs (system MDL ↔ segment) and VIRTUAL_TRANSFERs
+//!     (paging-process GPU VA ↔ segment) execute synchronously here as
 //!     CPU copies between the MDL and a transient kernel map of the blob,
 //!     BEFORE the paging fence retires — VidMm's content model stays truthful
 //!     across eviction/re-commit. FILL / VIRTUAL_FILL pattern-fill the blob.
@@ -35,15 +44,20 @@
 //! a DISPATCH-illegal call. `SetRootPageTable` can run at DISPATCH_LEVEL and
 //! keeps its atomics-only tracing.
 
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+
+use core::cell::UnsafeCell;
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use wdk_sys::ntddk::{
-    KeGetCurrentIrql, MmMapIoSpace, MmMapLockedPagesSpecifyCache, MmUnmapIoSpace,
+    KeAcquireSpinLockRaiseToDpc, KeGetCurrentIrql, KeReleaseSpinLock, MmGetPhysicalAddress,
+    MmMapIoSpace, MmMapLockedPagesSpecifyCache, MmUnmapIoSpace,
 };
-use wdk_sys::{_MEMORY_CACHING_TYPE, PHYSICAL_ADDRESS, PMDL};
+use wdk_sys::{_MEMORY_CACHING_TYPE, KSPIN_LOCK, PHYSICAL_ADDRESS, PMDL};
 
-use crate::adapter::AdapterContext;
+use crate::adapter::{AdapterContext, SystemBackingSnapshot};
 use crate::ddi::create_allocation::{paging_alloc_info, set_bar_placement};
 use crate::dxgk::*;
 
@@ -111,8 +125,18 @@ static BAR_ERR_IRQL: AtomicU32 = AtomicU32::new(0); // content op arrived > PASS
 static BAR_ERR_MAP: AtomicU32 = AtomicU32::new(0); // blob map / kernel map failed
 static BAR_ERR_BOUNDS: AtomicU32 = AtomicU32::new(0); // op range outside the blob
 static BAR_ERR_DISCONTIG: AtomicU32 = AtomicU32::new(0); // leaf PTEs not contiguous
-static BAR_ERR_VIRTUAL: AtomicU32 = AtomicU32::new(0); // unresolvable VIRTUAL_TRANSFER
+static BAR_ERR_VIRTUAL: AtomicU32 = AtomicU32::new(0); // unresolved paging-process VA
 static BAR_ERR_MDL: AtomicU32 = AtomicU32::new(0); // system-MDL kernel map failed
+static BAR_ERR_SHADOW_FULL: AtomicU32 = AtomicU32::new(0); // PTE shadow capacity exhausted
+static BAR_VIRTUAL_PTES: AtomicU32 = AtomicU32::new(0); // system PTEs retained
+static BAR_LAST_VIRTUAL_SRC: AtomicU64 = AtomicU64::new(0);
+static BAR_LAST_VIRTUAL_DST: AtomicU64 = AtomicU64::new(0);
+/// Paging content op named a device-local/opaque allocation. Such resources
+/// have no CPU byte mapping; attempting RESOURCE_MAP_BLOB is a contract error.
+static BAR_DEVICE_OP_SKIPS: AtomicU32 = AtomicU32::new(0);
+static BAR_SYSTEM_BACKING_CAPTURES: AtomicU32 = AtomicU32::new(0);
+static BAR_SYSTEM_BACKING_MIRRORS: AtomicU32 = AtomicU32::new(0);
+static BAR_SYSTEM_BACKING_ERRORS: AtomicU32 = AtomicU32::new(0);
 
 /// Mirror the BAR paging counters into the registry (PASSIVE only — callers
 /// gate on IRQL). Named-value writes, same style as the GDI executor counters.
@@ -133,6 +157,158 @@ fn dump_bar_counters() {
     crate::diag::record_named_bytes(b"PgEc", BAR_ERR_DISCONTIG.load(Ordering::Relaxed));
     crate::diag::record_named_bytes(b"PgEv", BAR_ERR_VIRTUAL.load(Ordering::Relaxed));
     crate::diag::record_named_bytes(b"PgEx", BAR_ERR_MDL.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"PgEf", BAR_ERR_SHADOW_FULL.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"PgVp", BAR_VIRTUAL_PTES.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"PgVs", BAR_LAST_VIRTUAL_SRC.load(Ordering::Relaxed) as u32);
+    crate::diag::record_named_bytes(b"PgVd", BAR_LAST_VIRTUAL_DST.load(Ordering::Relaxed) as u32);
+    crate::diag::record_named_bytes(b"PgDi", BAR_DEVICE_OP_SKIPS.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"PgSc", BAR_SYSTEM_BACKING_CAPTURES.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"PgSm", BAR_SYSTEM_BACKING_MIRRORS.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"PgSe", BAR_SYSTEM_BACKING_ERRORS.load(Ordering::Relaxed));
+}
+
+// ── Paging-process leaf-PTE shadow ──────────────────────────────────────────
+
+/// Maximum concurrently-live system-memory PTEs retained per adapter.
+///
+/// VidMm maps a bounded paging-process scratch range around each virtual content
+/// operation and unmaps it immediately afterward. 65,536 4-KiB pages covers
+/// 256 MiB of simultaneous transfers. Exhaustion is returned to VidMm as
+/// `STATUS_INSUFFICIENT_RESOURCES`; it is never silently treated as success.
+const MAX_PAGING_SYSTEM_PTES: usize = 65_536;
+
+#[derive(Clone, Copy)]
+struct PagingSystemPte {
+    /// Paging-process GPU virtual page number.
+    gpu_page: u64,
+    /// System-memory physical page number from `DXGK_PTE::PageAddress`.
+    physical_page: u64,
+}
+
+/// Exact system-memory leaf mappings supplied by VidMm in
+/// `DXGK_OPERATION_UPDATE_PAGE_TABLE`.
+///
+/// The table retains no resource classification. `update_leaf` first removes
+/// every old entry in the Windows-supplied VA range, then retains an entry only
+/// when the update names a live Helios blob allocation and its exact PTE is
+/// valid, non-zero, and in segment 0 (system memory).
+pub(crate) struct PagingPteShadow {
+    lock: UnsafeCell<KSPIN_LOCK>,
+    entries: UnsafeCell<Vec<PagingSystemPte>>,
+}
+
+// SAFETY: every access to `entries` is serialized by `lock`; entries are POD.
+unsafe impl Send for PagingPteShadow {}
+unsafe impl Sync for PagingPteShadow {}
+
+impl PagingPteShadow {
+    /// Reserve once at adapter construction (PASSIVE_LEVEL); no update allocates
+    /// while the spinlock is held.
+    pub(crate) fn new() -> Self {
+        Self {
+            lock: UnsafeCell::new(0),
+            entries: UnsafeCell::new(Vec::with_capacity(MAX_PAGING_SYSTEM_PTES)),
+        }
+    }
+
+    /// Apply one authoritative leaf-page-table update.
+    ///
+    /// Returns `false` if retaining all supplied system PTEs would exceed the
+    /// fixed non-paged table. The caller must fail the paging operation instead
+    /// of retiring an incomplete mapping.
+    unsafe fn update_leaf(
+        &self,
+        update: &DXGK_BUILDPAGINGBUFFER_UPDATEPAGETABLE,
+        track_system_pages: bool,
+    ) -> bool {
+        if update.PageTableLevel != 0
+            || update.pPageTableEntries.is_null()
+            || update.NumPageTableEntries == 0
+        {
+            return true;
+        }
+
+        let first_page = update.FirstPteVirtualAddress >> 12;
+        let page_count = update.NumPageTableEntries as u64;
+        let end_page = first_page.saturating_add(page_count);
+        let irql = unsafe { KeAcquireSpinLockRaiseToDpc(self.lock.get()) };
+        // SAFETY: exclusive spinlock ownership.
+        let entries = unsafe { &mut *self.entries.get() };
+
+        // The new update replaces this exact Windows-supplied VA range even if
+        // it maps a non-Helios allocation, a device segment, or invalid PTEs.
+        entries.retain(|entry| entry.gpu_page < first_page || entry.gpu_page >= end_page);
+
+        let mut ok = true;
+        if track_system_pages {
+            let repeat = update.Flags.Repeat() != 0;
+            for i in 0..update.NumPageTableEntries as usize {
+                // Repeat means pPageTableEntries names one value replicated
+                // across the whole update; otherwise it names Num entries.
+                let pte_index = if repeat { 0 } else { i };
+                // SAFETY: index follows the DXGK_UPDATEPAGETABLEFLAGS contract.
+                let pte =
+                    unsafe { core::ptr::read_unaligned(update.pPageTableEntries.add(pte_index)) };
+                let bits = unsafe { pte.__bindgen_anon_1.__bindgen_anon_1 };
+                let valid = bits.Valid() != 0;
+                let zero = bits.Zero() != 0;
+                let segment = bits.Segment() as u32;
+                if !valid || zero || segment != 0 {
+                    continue;
+                }
+                if entries.len() == MAX_PAGING_SYSTEM_PTES {
+                    ok = false;
+                    break;
+                }
+                entries.push(PagingSystemPte {
+                    gpu_page: first_page + i as u64,
+                    physical_page: unsafe { pte.__bindgen_anon_2.PageAddress },
+                });
+            }
+            entries.sort_unstable_by_key(|entry| entry.gpu_page);
+        }
+        BAR_VIRTUAL_PTES.store(entries.len() as u32, Ordering::Relaxed);
+        unsafe { KeReleaseSpinLock(self.lock.get(), irql) };
+
+        if !ok {
+            BAR_ERR_SHADOW_FULL.fetch_add(1, Ordering::Relaxed);
+        }
+        ok
+    }
+
+    /// Resolve a paging-process GPU-VA byte range to the exact ordered physical
+    /// pages currently supplied by VidMm.
+    fn resolve(&self, virtual_address: u64, size: u64) -> Option<Vec<u64>> {
+        if size == 0 {
+            return Some(Vec::new());
+        }
+        let first_page = virtual_address >> 12;
+        let last_byte = (virtual_address & 0xFFF).checked_add(size - 1)?;
+        let page_count = (last_byte >> 12).checked_add(1)?;
+        let page_count_usize = usize::try_from(page_count).ok()?;
+
+        let mut pages = Vec::new();
+        if pages.try_reserve_exact(page_count_usize).is_err() {
+            return None;
+        }
+
+        let irql = unsafe { KeAcquireSpinLockRaiseToDpc(self.lock.get()) };
+        // SAFETY: shared read while holding the table spinlock.
+        let entries = unsafe { &*self.entries.get() };
+        let mut resolved = true;
+        for i in 0..page_count {
+            let gpu_page = first_page + i;
+            match entries.binary_search_by_key(&gpu_page, |entry| entry.gpu_page) {
+                Ok(index) => pages.push(entries[index].physical_page),
+                Err(_) => {
+                    resolved = false;
+                    break;
+                }
+            }
+        }
+        unsafe { KeReleaseSpinLock(self.lock.get(), irql) };
+        resolved.then_some(pages)
+    }
 }
 
 /// `NormalPagePriority | MdlMappingNoExecute` for the system-MDL kernel map.
@@ -207,6 +383,280 @@ unsafe fn with_blob_bytes(
     true
 }
 
+/// Copy between a mapped blob range and the exact locked system pages named by
+/// a paging-process PTE range. Adjacent physical pages are mapped as one run to
+/// avoid one `MmMapIoSpace` round-trip per 4-KiB page.
+///
+/// `system_pages` comes either from [`PagingPteShadow::resolve`] for the current
+/// virtual transfer or from the exact locked MDL captured when Windows paged
+/// this allocation to system memory. It covers
+/// `system_virtual_address..+size` in order. `blob_offset..+size` must already
+/// have been bounds-checked against the blob mapping.
+unsafe fn copy_blob_system_pages(
+    blob: *mut u8,
+    blob_offset: u64,
+    system_pages: &[u64],
+    system_virtual_address: u64,
+    size: u64,
+    blob_to_system: bool,
+) -> bool {
+    if size == 0 {
+        return true;
+    }
+    let mut page_index = 0usize;
+    let mut system_page_offset = (system_virtual_address & 0xFFF) as usize;
+    let mut copied = 0u64;
+
+    while copied < size {
+        if page_index >= system_pages.len() {
+            BAR_ERR_VIRTUAL.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+
+        // Coalesce the physical run that Windows supplied. The pages remain
+        // locked for the paging operation's lifetime.
+        let mut run_pages = 1usize;
+        while page_index + run_pages < system_pages.len()
+            && system_pages[page_index + run_pages]
+                == system_pages[page_index + run_pages - 1].saturating_add(1)
+        {
+            run_pages += 1;
+        }
+        let Some(physical_address) = system_pages[page_index].checked_shl(12) else {
+            BAR_ERR_VIRTUAL.fetch_add(1, Ordering::Relaxed);
+            return false;
+        };
+        let map_size = (run_pages as u64) << 12;
+        let mut pa: PHYSICAL_ADDRESS = unsafe { core::mem::zeroed() };
+        pa.QuadPart = physical_address as i64;
+        // SAFETY: the pages are either locked for the current paging operation
+        // or remain owned by the allocation's system backing until the inverse
+        // transfer/destroy removes their recorded association.
+        let system =
+            unsafe { MmMapIoSpace(pa, map_size, _MEMORY_CACHING_TYPE::MmCached) } as *mut u8;
+        if system.is_null() {
+            BAR_ERR_MAP.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+
+        let available = map_size.saturating_sub(system_page_offset as u64);
+        let chunk = (size - copied).min(available);
+        // SAFETY: blob bounds were checked by the caller; system is a mapping
+        // of map_size bytes and system_page_offset + chunk <= map_size.
+        unsafe {
+            let blob_ptr = blob.add((blob_offset + copied) as usize);
+            let system_ptr = system.add(system_page_offset);
+            if blob_to_system {
+                core::ptr::copy_nonoverlapping(blob_ptr, system_ptr, chunk as usize);
+            } else {
+                core::ptr::copy_nonoverlapping(system_ptr, blob_ptr, chunk as usize);
+            }
+        }
+        // SAFETY: exact mapping returned above.
+        unsafe { MmUnmapIoSpace(system as *mut c_void, map_size) };
+
+        copied += chunk;
+        page_index += run_pages;
+        system_page_offset = 0;
+    }
+    true
+}
+
+/// Capture the exact physical pages in a Windows paging-transfer MDL.
+///
+/// `system_start` is the mapped byte at which this allocation range begins.
+/// Every page number comes from `MmGetPhysicalAddress` while the MDL is locked;
+/// no allocation dimensions, process identity, or placement ordering is used.
+unsafe fn remember_system_backing(
+    adapter: &AdapterContext,
+    resource_id: u32,
+    blob_offset: u64,
+    size: u64,
+    system_start: *mut u8,
+) -> bool {
+    if size == 0 || system_start.is_null() {
+        return false;
+    }
+    let first_pa = unsafe { MmGetPhysicalAddress(system_start.cast()) }.QuadPart as u64;
+    let first_page_offset = (first_pa & 0xFFF) as u32;
+    let page_count = (u64::from(first_page_offset)
+        .saturating_add(size)
+        .saturating_add(4095))
+        >> 12;
+    let Ok(page_count) = usize::try_from(page_count) else {
+        BAR_SYSTEM_BACKING_ERRORS.fetch_add(1, Ordering::Relaxed);
+        return false;
+    };
+    let mut pages = Vec::new();
+    if pages.try_reserve_exact(page_count).is_err() {
+        BAR_SYSTEM_BACKING_ERRORS.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
+    pages.push(first_pa >> 12);
+    for index in 1..page_count {
+        let delta = (4096usize - first_page_offset as usize)
+            .saturating_add((index - 1).saturating_mul(4096));
+        let pa = unsafe { MmGetPhysicalAddress(system_start.add(delta).cast()) }.QuadPart as u64;
+        if pa & 0xFFF != 0 {
+            BAR_SYSTEM_BACKING_ERRORS.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        pages.push(pa >> 12);
+    }
+    let backing = SystemBackingSnapshot {
+        resource_id,
+        blob_offset,
+        size,
+        first_page_offset,
+        pages: Arc::from(pages.into_boxed_slice()),
+    };
+    if adapter.system_backings.replace(backing) {
+        BAR_SYSTEM_BACKING_CAPTURES.fetch_add(1, Ordering::Relaxed);
+        true
+    } else {
+        BAR_SYSTEM_BACKING_ERRORS.fetch_add(1, Ordering::Relaxed);
+        false
+    }
+}
+
+/// Mirror a completed Present destination blob into the exact system-memory
+/// backing Windows previously supplied for that allocation.
+///
+/// `None` means the allocation is no longer system-backed (for example Windows
+/// paged it back into the BAR before this Present). `Some(false)` is a real
+/// mapping/copy failure and must not be silently treated as a successful frame.
+pub(crate) unsafe fn mirror_present_system_backing(
+    adapter: &AdapterContext,
+    resource_id: u32,
+) -> Option<bool> {
+    let backing = adapter.system_backings.snapshot(resource_id)?;
+    let mut copied = false;
+    let mapped = unsafe {
+        with_blob_bytes(adapter, resource_id, |blob, len| {
+            if backing.blob_offset.saturating_add(backing.size) > len {
+                return;
+            }
+            copied = copy_blob_system_pages(
+                blob,
+                backing.blob_offset,
+                backing.pages.as_ref(),
+                u64::from(backing.first_page_offset),
+                backing.size,
+                true,
+            );
+        })
+    };
+    let ok = mapped && copied;
+    if ok {
+        BAR_SYSTEM_BACKING_MIRRORS.fetch_add(1, Ordering::Relaxed);
+    } else {
+        BAR_SYSTEM_BACKING_ERRORS.fetch_add(1, Ordering::Relaxed);
+    }
+    Some(ok)
+}
+
+/// WDDM 2.x `VIRTUAL_TRANSFER` for a Helios blob allocation.
+///
+/// The allocation handle, direction, VAs, size, and the leaf PTEs resolving the
+/// system-memory side are all supplied by VidMm. The allocation offset applies
+/// only to the blob and is deliberately not added to either virtual address, as
+/// required by `DXGK_BUILDPAGINGBUFFER_TRANSFERVIRTUAL`.
+unsafe fn bar_virtual_transfer(
+    adapter: &AdapterContext,
+    transfer: &DXGK_BUILDPAGINGBUFFER_TRANSFERVIRTUAL,
+) -> bool {
+    let Some(alloc) = (unsafe { paging_alloc_info(transfer.hAllocation) }) else {
+        BAR_ERR_VIRTUAL.fetch_add(1, Ordering::Relaxed);
+        return false;
+    };
+    if !alloc.bar_eligible {
+        // Device-local optimal resources cannot be interpreted as linear bytes.
+        // This preserves the existing host-owned-content behavior; the software
+        // content engine applies only to allocations KMD made blob-linear.
+        BAR_DEVICE_OP_SKIPS.fetch_add(1, Ordering::Relaxed);
+        return true;
+    }
+
+    let offset = transfer.AllocationOffsetInBytes;
+    let size = transfer.TransferSizeInBytes;
+    if offset.checked_add(size).is_none_or(|end| end > alloc.size) {
+        BAR_ERR_BOUNDS.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
+    BAR_LAST_XFER_OFF.store(offset as u32, Ordering::Relaxed);
+    BAR_LAST_XFER_FLAGS.store(
+        unsafe { transfer.Flags.__bindgen_anon_1.Flags },
+        Ordering::Relaxed,
+    );
+    BAR_LAST_VIRTUAL_SRC.store(transfer.SourceVirtualAddress, Ordering::Relaxed);
+    BAR_LAST_VIRTUAL_DST.store(transfer.DestinationVirtualAddress, Ordering::Relaxed);
+
+    use crate::dxgk::_DXGK_MEMORY_TRANSFER_DIRECTION as Direction;
+    let (system_va, blob_to_system) = match transfer.TransferDirection {
+        Direction::DXGK_MEMORY_TRANSFER_LOCAL_TO_SYSTEM => {
+            (transfer.DestinationVirtualAddress, true)
+        }
+        Direction::DXGK_MEMORY_TRANSFER_SYSTEM_TO_LOCAL => (transfer.SourceVirtualAddress, false),
+        Direction::DXGK_MEMORY_TRANSFER_LOCAL_TO_LOCAL => {
+            // The allocation's bytes are intrinsic to its venus blob; a VidMm
+            // placement move does not move or alias that host memory object.
+            BAR_XFER_MOVE.fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
+        _ => {
+            BAR_ERR_VIRTUAL.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+    };
+
+    let Some(system_pages) = adapter.paging_pte_shadow.resolve(system_va, size) else {
+        BAR_ERR_VIRTUAL.fetch_add(1, Ordering::Relaxed);
+        return false;
+    };
+
+    let mut copied = false;
+    let mapped = unsafe {
+        with_blob_bytes(adapter, alloc.resource_id, |blob, blob_size| {
+            if offset.checked_add(size).is_none_or(|end| end > blob_size) {
+                BAR_ERR_BOUNDS.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            copied = copy_blob_system_pages(
+                blob,
+                offset,
+                &system_pages,
+                system_va,
+                size,
+                blob_to_system,
+            );
+        })
+    };
+    if mapped && copied {
+        if blob_to_system {
+            let backing = SystemBackingSnapshot {
+                resource_id: alloc.resource_id,
+                blob_offset: offset,
+                size,
+                first_page_offset: (system_va & 0xFFF) as u32,
+                pages: Arc::from(system_pages.into_boxed_slice()),
+            };
+            if adapter.system_backings.replace(backing) {
+                BAR_SYSTEM_BACKING_CAPTURES.fetch_add(1, Ordering::Relaxed);
+            } else {
+                BAR_SYSTEM_BACKING_ERRORS.fetch_add(1, Ordering::Relaxed);
+                return false;
+            }
+            BAR_XFER_OUT.fetch_add(1, Ordering::Relaxed);
+        } else {
+            adapter.system_backings.remove(alloc.resource_id);
+            BAR_XFER_IN.fetch_add(1, Ordering::Relaxed);
+        }
+        true
+    } else {
+        false
+    }
+}
+
 /// Classic TRANSFER touching the BAR segment: content copy between the
 /// allocation's blob and its system-memory backing (synchronous — done before
 /// the paging fence retires, so VidMm's content model stays truthful across
@@ -224,6 +674,13 @@ unsafe fn bar_transfer(
     let Some(alloc) = (unsafe { paging_alloc_info(t.hAllocation) }) else {
         return;
     };
+    if !alloc.bar_eligible {
+        // A device-local OPTIMAL image cannot be interpreted as linear bytes.
+        // VidMm placement bookkeeping is decorative for this host-owned memory;
+        // never issue RESOURCE_MAP_BLOB for it.
+        BAR_DEVICE_OP_SKIPS.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
     let flags = unsafe { t.Flags.__bindgen_anon_1.Value };
     BAR_LAST_XFER_FLAGS.store(flags, Ordering::Relaxed);
     BAR_LAST_XFER_OFF.store(t.TransferOffset, Ordering::Relaxed);
@@ -244,6 +701,7 @@ unsafe fn bar_transfer(
             let Some(src) = (unsafe { mdl_system_va(mdl.cast()) }) else {
                 return;
             };
+            let mut copied = false;
             let ok = unsafe {
                 with_blob_bytes(adapter, alloc.resource_id, |dst, len| {
                     if blob_off.saturating_add(bytes) > len {
@@ -259,9 +717,12 @@ unsafe fn bar_transfer(
                             bytes as usize,
                         );
                     }
+                    copied = true;
                 })
             };
-            if ok {
+            if ok && copied {
+                // The inverse transfer makes the BAR blob authoritative again.
+                adapter.system_backings.remove(alloc.resource_id);
                 BAR_XFER_IN.fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -272,6 +733,7 @@ unsafe fn bar_transfer(
             let Some(dst) = (unsafe { mdl_system_va(mdl.cast()) }) else {
                 return;
             };
+            let mut copied = false;
             let ok = unsafe {
                 with_blob_bytes(adapter, alloc.resource_id, |src, len| {
                     if blob_off.saturating_add(bytes) > len {
@@ -287,9 +749,20 @@ unsafe fn bar_transfer(
                             bytes as usize,
                         );
                     }
+                    copied = true;
                 })
             };
-            if ok {
+            if ok && copied {
+                let system_start = unsafe { dst.add(mdl_off as usize) };
+                let _ = unsafe {
+                    remember_system_backing(
+                        adapter,
+                        alloc.resource_id,
+                        blob_off,
+                        bytes,
+                        system_start,
+                    )
+                };
                 BAR_XFER_OUT.fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -318,6 +791,10 @@ unsafe fn bar_fill(
     let Some(alloc) = (unsafe { paging_alloc_info(f.hAllocation) }) else {
         return;
     };
+    if !alloc.bar_eligible {
+        BAR_DEVICE_OP_SKIPS.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
     let fill_len = f.FillSize as u64;
     let pattern = f.FillPattern;
     let ok = unsafe {
@@ -374,7 +851,7 @@ unsafe fn bar_harvest_page_table(
     // range; discontiguous PTEs are counted (they would matter if partial
     // aperture maps ever need placement-relative offsets).
     let n = u.NumPageTableEntries as u64;
-    if n >= 2 {
+    if n >= 2 && u.Flags.Repeat() == 0 {
         let last = unsafe { core::ptr::read_unaligned(u.pPageTableEntries.add((n - 1) as usize)) };
         let last_valid = unsafe { last.__bindgen_anon_1.__bindgen_anon_1 }.Valid() != 0;
         if last_valid && unsafe { last.__bindgen_anon_2.PageAddress } != page0 + (n - 1) {
@@ -427,13 +904,21 @@ pub unsafe extern "C" fn dxgkddi_build_paging_buffer(
     // Placement harvest is DISPATCH-safe (atomic store only) — no IRQL gate.
     if args.Operation == PagingOp::DXGK_OPERATION_UPDATE_PAGE_TABLE {
         // SAFETY: union arm selected by Operation.
-        unsafe {
-            bar_harvest_page_table(
-                bar.seg_id,
-                bar.size,
-                args.__bindgen_anon_1.UpdatePageTable.as_ref(),
-            )
-        };
+        let update = unsafe { args.__bindgen_anon_1.UpdatePageTable.as_ref() };
+        let track_system_pages = unsafe { paging_alloc_info(update.hAllocation) }
+            .is_some_and(|alloc| alloc.bar_eligible);
+        // Preserve the exact leaf mapping before retiring the page-table update.
+        // Every update clears its Windows-supplied VA range first, including
+        // updates for unrelated allocations and explicit unmaps.
+        if !unsafe {
+            adapter
+                .paging_pte_shadow
+                .update_leaf(update, track_system_pages)
+        } {
+            dump_bar_counters();
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+        unsafe { bar_harvest_page_table(bar.seg_id, bar.size, update) };
         return STATUS_SUCCESS;
     }
 
@@ -457,6 +942,7 @@ pub unsafe extern "C" fn dxgkddi_build_paging_buffer(
         return STATUS_SUCCESS;
     }
 
+    let mut status = STATUS_SUCCESS;
     match args.Operation {
         PagingOp::DXGK_OPERATION_TRANSFER => {
             // SAFETY: union arm selected by Operation.
@@ -469,6 +955,9 @@ pub unsafe extern "C" fn dxgkddi_build_paging_buffer(
         PagingOp::DXGK_OPERATION_DISCARD_CONTENT => {
             // SAFETY: union arm selected by Operation.
             let d = unsafe { args.__bindgen_anon_1.DiscardContent.as_ref() };
+            if let Some(alloc) = unsafe { paging_alloc_info(d.hAllocation) } {
+                adapter.system_backings.remove(alloc.resource_id);
+            }
             if d.SegmentId == bar.seg_id && unsafe { paging_alloc_info(d.hAllocation) }.is_some() {
                 // Content lives in the blob; nothing to release here (aperture
                 // unmaps handle CPU visibility). Counted for the op census.
@@ -506,18 +995,14 @@ pub unsafe extern "C" fn dxgkddi_build_paging_buffer(
         PagingOp::DXGK_OPERATION_VIRTUAL_TRANSFER => {
             // SAFETY: union arm selected by Operation.
             let tv = unsafe { args.__bindgen_anon_1.TransferVirtual.as_ref() };
-            if let Some(alloc) = unsafe { paging_alloc_info(tv.hAllocation) } {
-                if alloc.bar_eligible {
-                    // The system side is only expressed as paging-process GPU
-                    // VAs — unresolvable without a full PTE shadow. Loud.
-                    BAR_ERR_VIRTUAL.fetch_add(1, Ordering::Relaxed);
-                }
+            if !unsafe { bar_virtual_transfer(adapter, tv) } {
+                status = STATUS_UNSUCCESSFUL;
             }
         }
         _ => {}
     }
     dump_bar_counters();
-    STATUS_SUCCESS
+    status
 }
 
 // ── GpuMmu root page-table DDIs. ─────────────────────────────────────────────
