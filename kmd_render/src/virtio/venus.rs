@@ -769,6 +769,25 @@ impl ImportedOptimalImage {
     }
 }
 
+impl BorrowedPresentBuffer {
+    /// Destroy the `VkBuffer` this record owns, handing the record back on
+    /// failure. See [`PreparedPresentBlt::release`].
+    ///
+    /// Only the buffer: `BorrowedPresentBuffer` carries no ownership
+    /// capability, and the allocation teardown that called us remains solely
+    /// responsible for freeing `memory` and unref'ing its resource.
+    fn release(
+        self,
+        client: &mut VenusClient,
+        adapter: &AdapterContext,
+    ) -> Result<(), (Self, VirtioError)> {
+        match client.destroy_buffer_on_ring(adapter, self.buffer_id) {
+            Ok(()) => Ok(()),
+            Err(e) => Err((self, e)),
+        }
+    }
+}
+
 const MAX_PRESENT_IMAGES: usize = 32;
 const MAX_PRESENT_BUFFERS: usize = 16;
 const MAX_PRESENT_BLITS: usize = 32;
@@ -4627,10 +4646,11 @@ impl VenusClient {
             }
         }
         while let Some(buffer) = self.present_buffers.pop() {
-            self.destroy_buffer_on_ring(adapter, buffer.buffer_id)?;
-            // `BorrowedPresentBuffer` carries no ownership capability. The
-            // allocation teardown which called us remains solely responsible
-            // for freeing `buffer.memory` and unref'ing its resource.
+            if let Err((buffer, error)) = buffer.release(self, adapter) {
+                self.present_buffers.push(buffer);
+                crate::diag::record_named_bytes(b"PBTdErr", resource_id);
+                return Err(error);
+            }
         }
         Ok(())
     }
