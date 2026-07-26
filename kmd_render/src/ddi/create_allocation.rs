@@ -35,6 +35,7 @@ use crate::dxgk::_D3DKMDT_STANDARDALLOCATION_TYPE::{
     D3DKMDT_STANDARDALLOCATION_SHAREDPRIMARYSURFACE, D3DKMDT_STANDARDALLOCATION_STAGINGSURFACE,
 };
 use crate::dxgk::*;
+use helios_kmd_logic::ScanoutFormat;
 
 /// `AllocationContext::magic` — validates `hAllocation` casts in paging DDIs
 /// (a garbage dereference in BuildPagingBuffer is a bugcheck).
@@ -614,13 +615,7 @@ pub(crate) unsafe fn submit_primary_scanout_copy(
         crate::diag::record_named_bytes(b"CpCpy", 0xE1);
         return Err(STATUS_INVALID_PARAMETER);
     }
-    const DXGI_FORMAT_B8G8R8A8_UNORM: u32 = 87;
-    const DXGI_FORMAT_B8G8R8X8_UNORM: u32 = 88;
-    const DXGI_FORMAT_R8G8B8A8_UNORM: u32 = 28;
-    if ctx.dxgi_format != DXGI_FORMAT_R8G8B8A8_UNORM
-        && ctx.dxgi_format != DXGI_FORMAT_B8G8R8A8_UNORM
-        && ctx.dxgi_format != DXGI_FORMAT_B8G8R8X8_UNORM
-    {
+    if ScanoutFormat::from_dxgi(ctx.dxgi_format).is_none() {
         crate::diag::record_named_bytes(b"CpFmt", ctx.dxgi_format);
         crate::diag::record_named_bytes(b"CpCpy", 0xE2);
         return Err(STATUS_NOT_SUPPORTED);

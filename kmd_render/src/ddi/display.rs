@@ -22,6 +22,7 @@ use crate::device::ContextHandleRef;
 use crate::dxgk::*;
 use crate::virtio::venus::{OptimalPresentImageDesc, PresentBufferDesc, PresentDestinationDesc};
 use crate::virtio::VirtioError;
+use helios_kmd_logic::ScanoutFormat;
 use wdk_sys::ntddk::KeGetCurrentIrql;
 
 pub static PRESENT_COUNT: AtomicU32 = AtomicU32::new(0);
@@ -39,14 +40,17 @@ pub static PRESENT_LAST_FLAGS: AtomicU32 = AtomicU32::new(0);
 pub static PRESENT_LAST_STATUS: AtomicU32 = AtomicU32::new(0);
 pub(crate) static VIDPN_SOURCE_ADDRESS_COUNT: AtomicU32 = AtomicU32::new(0);
 
-fn virtio_scanout_format(dxgi_format: u32) -> Option<u32> {
-    match dxgi_format {
-        0 | 88 => Some(helios_protocol::VIRTIO_GPU_FORMAT_B8G8R8X8_UNORM),
-        28 => Some(helios_protocol::VIRTIO_GPU_FORMAT_R8G8B8A8_UNORM),
-        87 => Some(helios_protocol::VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM),
-        _ => None,
-    }
-}
+/// Pin `kmd_logic`'s hand-written virtio values to the wire constants.
+///
+/// `kmd_logic` is deliberately dependency-free (it has to build under a host
+/// libtest harness), so it spells the three `VIRTIO_GPU_FORMAT_*` values as
+/// literals. This is where they are checked against the single source of truth;
+/// a drift is a build failure, not a black scan-out.
+const _: () = {
+    assert!(ScanoutFormat::Bgra8.virtio() == helios_protocol::VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM);
+    assert!(ScanoutFormat::Bgrx8.virtio() == helios_protocol::VIRTIO_GPU_FORMAT_B8G8R8X8_UNORM);
+    assert!(ScanoutFormat::Rgba8.virtio() == helios_protocol::VIRTIO_GPU_FORMAT_R8G8B8A8_UNORM);
+};
 
 fn production_linear_scanout(
     adapter: &AdapterContext,
@@ -100,7 +104,6 @@ fn production_linear_scanout(
         }
     };
 
-    const DXGI_FORMAT_B8G8R8A8_UNORM: u32 = 87;
     adapter.remember_primary_scanout(
         scanout.blob.res_id,
         width,
@@ -109,7 +112,7 @@ fn production_linear_scanout(
         scanout.plane_offset,
         scanout.blob.size,
         scanout.memory_type_index,
-        DXGI_FORMAT_B8G8R8A8_UNORM,
+        ScanoutFormat::Bgra8.dxgi(),
     );
     adapter
         .dedicated_scanout_memory
@@ -128,7 +131,7 @@ fn production_linear_scanout(
         width,
         height,
         pitch: scanout.row_pitch,
-        dxgi_format: DXGI_FORMAT_B8G8R8A8_UNORM,
+        dxgi_format: ScanoutFormat::Bgra8.dxgi(),
         plane_offset: scanout.plane_offset as u64,
         venus_alloc_size: scanout.blob.size,
         memory_type_index: scanout.memory_type_index,
@@ -989,7 +992,7 @@ unsafe fn apply_vidpn_source_address_locked(
             && source.pitch & 3 == 0
             && source.plane_offset <= u32::MAX as u64
             && source.venus_alloc_size >= min_size
-            && matches!(source.dxgi_format, 28 | 87 | 88);
+            && ScanoutFormat::from_dxgi(source.dxgi_format).is_some();
         if !valid {
             crate::diag::record_named_bytes(b"ScSet", 0xE3);
             adapter.vidpn_programming.store(0, Ordering::Release);
@@ -1020,7 +1023,9 @@ unsafe fn apply_vidpn_source_address_locked(
     // Preserve the exact allocation storage format on the standard virtio
     // scanout contract. The target can differ from the Windows source when the
     // KMD-owned compatibility copy is selected.
-    let Some(vformat) = virtio_scanout_format(target.dxgi_format) else {
+    let Some(vformat) =
+        ScanoutFormat::from_dxgi_or_legacy_zero(target.dxgi_format).map(ScanoutFormat::virtio)
+    else {
         crate::diag::record_named_bytes(b"ScFmt", target.dxgi_format);
         adapter.vidpn_programming.store(0, Ordering::Release);
         return STATUS_NOT_SUPPORTED;

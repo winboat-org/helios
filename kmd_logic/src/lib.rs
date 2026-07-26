@@ -193,6 +193,93 @@ pub const fn seq_read(before: u32, after: u32) -> SeqRead {
 /// escape thread could hold the CPU while the publisher is descheduled.
 pub const SEQ_READ_ATTEMPTS: u32 = 8;
 
+/// The scan-out surface formats Helios can put on virtio-gpu scanout 0.
+///
+/// This is the one place the DXGI-to-wire mapping is written down. It used to be
+/// spelled four times with bare integers — `display.rs`'s `virtio_scanout_format`
+/// match, a function-local `const DXGI_FORMAT_B8G8R8A8_UNORM: u32 = 87` used
+/// twice, the `matches!(dxgi_format, 28 | 87 | 88)` direct-scan-out allowlist,
+/// and three more local consts plus a three-way `!=` chain gating the copy path
+/// in `create_allocation.rs`. A format added to three of those four surfaces as
+/// an opaque `ScSet=0xE3` or `ScFmt` trace.
+///
+/// The virtio values are literals rather than a `helios_protocol` import because
+/// this crate's whole contract is that it has no dependency edge (see the
+/// Cargo.toml comment); `kmd_render` pins them to `helios_protocol` with a
+/// compile-time assertion, so a drift is a build failure, not a runtime bug.
+///
+/// NOT merged in, on purpose, because they answer different questions:
+/// `create_allocation::resolved_dxgi_format` (D3DDDIFORMAT -> DXGI),
+/// `venus::PresentPixelFormat::from_dxgi` (the wider render-side set), and
+/// `scanout_diag::scanout_format` (keyed on the *diag mode*, returning a virtio
+/// constant directly — it is not a fourth DXGI mapping).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScanoutFormat {
+    /// DXGI 88 `B8G8R8X8_UNORM` -> virtio 2.
+    Bgrx8,
+    /// DXGI 87 `B8G8R8A8_UNORM` -> virtio 1.
+    Bgra8,
+    /// DXGI 28 `R8G8B8A8_UNORM` -> virtio 67.
+    Rgba8,
+}
+
+impl ScanoutFormat {
+    /// The DXGI formats a scan-out surface may *declare*.
+    ///
+    /// This is the strict set — exactly the three the direct-scan-out validator
+    /// and the copy-path gate accept today. DXGI 0 is deliberately NOT here; see
+    /// [`Self::from_dxgi_or_legacy_zero`].
+    pub const fn from_dxgi(dxgi: u32) -> Option<Self> {
+        match dxgi {
+            28 => Some(Self::Rgba8),
+            87 => Some(Self::Bgra8),
+            88 => Some(Self::Bgrx8),
+            _ => None,
+        }
+    }
+
+    /// [`Self::from_dxgi`] plus the legacy `0 -> Bgrx8` arm.
+    ///
+    /// The wire-format converter has always accepted DXGI 0 while both
+    /// validators reject it, so collapsing all four sites onto one acceptance
+    /// set would have *changed which formats are accepted*. That divergence is
+    /// preserved verbatim here and named, so it is greppable instead of latent:
+    /// only the converter calls this, and its `0` arm has no reachable producer
+    /// today (a direct-scan-out primary always carries the UMD's exact DXGI
+    /// format from the same private-data record, and the LINEAR arm's format is
+    /// [`Self::Bgra8`] by construction). Deleting the arm is a separate,
+    /// counter-backed commit.
+    pub const fn from_dxgi_or_legacy_zero(dxgi: u32) -> Option<Self> {
+        if dxgi == 0 {
+            Some(Self::Bgrx8)
+        } else {
+            Self::from_dxgi(dxgi)
+        }
+    }
+
+    /// The `VIRTIO_GPU_FORMAT_*` value for `SET_SCANOUT_BLOB`.
+    pub const fn virtio(self) -> u32 {
+        match self {
+            Self::Bgra8 => 1,  // VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM
+            Self::Bgrx8 => 2,  // VIRTIO_GPU_FORMAT_B8G8R8X8_UNORM
+            Self::Rgba8 => 67, // VIRTIO_GPU_FORMAT_R8G8B8A8_UNORM
+        }
+    }
+
+    /// The canonical DXGI format value.
+    ///
+    /// Note this is not a round trip for the legacy zero arm:
+    /// `from_dxgi_or_legacy_zero(0).unwrap().dxgi() == 88`. That is the existing
+    /// behaviour — the converter maps 0 and 88 onto the same wire format.
+    pub const fn dxgi(self) -> u32 {
+        match self {
+            Self::Bgrx8 => 88,
+            Self::Bgra8 => 87,
+            Self::Rgba8 => 28,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -387,5 +474,67 @@ mod tests {
         const PAGES: u64 = round_up_page(4097);
         assert_eq!(PITCH, 7680);
         assert_eq!(PAGES, 8192);
+    }
+
+    /// The four sites `ScanoutFormat` replaces, reproduced by hand from the
+    /// pre-R503 code so this test fails if the enum ever changes which formats
+    /// are accepted or what they encode to.
+    ///
+    /// Site 1, `display.rs::virtio_scanout_format` (the wire-format converter):
+    ///     0 | 88 => B8G8R8X8 (2), 28 => R8G8B8A8 (67), 87 => B8G8R8A8 (1),
+    ///     _ => None
+    /// Site 2, `display.rs`'s two uses of a function-local
+    ///     `const DXGI_FORMAT_B8G8R8A8_UNORM: u32 = 87`.
+    /// Site 3, `display.rs`'s direct-scan-out allowlist:
+    ///     `matches!(dxgi_format, 28 | 87 | 88)` — note 0 is REJECTED here.
+    /// Site 4, `create_allocation.rs`'s copy gate: the same {28, 87, 88} set.
+    #[test]
+    fn scanout_format_reproduces_all_four_pre_r503_sites() {
+        fn site1_converter(dxgi: u32) -> Option<u32> {
+            match dxgi {
+                0 | 88 => Some(2),
+                28 => Some(67),
+                87 => Some(1),
+                _ => None,
+            }
+        }
+        fn site3_and_4_allowlist(dxgi: u32) -> bool {
+            matches!(dxgi, 28 | 87 | 88)
+        }
+
+        // Every value the review names, plus the neighbours most likely to be
+        // added by mistake.
+        for dxgi in [0u32, 28, 87, 88, 10, 24, 91, 93, 1, 2, 67, 134, u32::MAX] {
+            assert_eq!(
+                ScanoutFormat::from_dxgi_or_legacy_zero(dxgi).map(ScanoutFormat::virtio),
+                site1_converter(dxgi),
+                "converter disagrees for DXGI {dxgi}"
+            );
+            assert_eq!(
+                ScanoutFormat::from_dxgi(dxgi).is_some(),
+                site3_and_4_allowlist(dxgi),
+                "validator acceptance set disagrees for DXGI {dxgi}"
+            );
+        }
+
+        // Site 2: the LINEAR fallback's hard-coded 87.
+        assert_eq!(ScanoutFormat::Bgra8.dxgi(), 87);
+
+        // The strict set is a subset of the converter set, so a format that
+        // passes a validator always has a virtio encoding — that is the
+        // "unrepresentable" half of the guarantee.
+        for dxgi in 0..=256u32 {
+            if ScanoutFormat::from_dxgi(dxgi).is_some() {
+                assert!(ScanoutFormat::from_dxgi_or_legacy_zero(dxgi).is_some());
+            }
+        }
+
+        // The legacy zero arm is deliberately not a round trip.
+        assert_eq!(
+            ScanoutFormat::from_dxgi_or_legacy_zero(0),
+            Some(ScanoutFormat::Bgrx8)
+        );
+        assert_eq!(ScanoutFormat::from_dxgi(0), None);
+        assert_eq!(ScanoutFormat::Bgrx8.dxgi(), 88);
     }
 }
