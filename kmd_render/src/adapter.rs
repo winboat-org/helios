@@ -562,6 +562,7 @@ impl AdapterContext {
             self.hpd_thread.store(handle as usize, Ordering::Release);
         } else {
             crate::diag::record(0x0B00_00E7);
+            crate::diag::fault(crate::diag::FaultCounter::StHpd, st as u32);
         }
     }
 
@@ -1187,6 +1188,7 @@ impl AdapterContext {
         let va = unsafe { MmAllocateContiguousMemory(size as u64, highest) };
         let Some(va) = NonNull::new(va as *mut u8) else {
             crate::diag::record(0x0A00_00E3);
+            crate::diag::fault(crate::diag::FaultCounter::StRam, size as u32);
             return None;
         };
         // SAFETY: zero the region so VidMm never reads stale bytes.

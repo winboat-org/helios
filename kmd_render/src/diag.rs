@@ -99,6 +99,78 @@ pub fn record_named(name: &[u16], mut code: u32) {
     }
 }
 
+/// A lifecycle failure that must stay visible on a **default** boot.
+///
+/// [`record`] returns early when `DiagLevel` is 0 (the default), so a refusal
+/// reported through it leaves no trace at all in production — the driver starts
+/// degraded and silent. The module contract at the top of this file already says
+/// failure counters must stay loud; this enum is how that is enforced. A
+/// `FaultCounter` cannot be passed to the gated ring, and a raw `u32` breadcrumb
+/// cannot be passed to [`fault`], so at every converted site "this failure is
+/// reported through the lossy mechanism" is a type error.
+///
+/// It does not stop a future author from reaching for [`record`] on a *new*
+/// failure path; that remains a review rule.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum FaultCounter {
+    /// `VirtioGpu::init` failed — value is the resulting NTSTATUS. The adapter
+    /// starts render-only with no transport.
+    StVio,
+    /// Venus bring-up failed — value is the resulting NTSTATUS. Transport is up
+    /// but there is no page-table window.
+    StVnu,
+    /// The HPD worker thread could not be created — value is the NTSTATUS.
+    StHpd,
+    /// `MmAllocateContiguousMemory` for the paging RAM returned null — value is
+    /// the requested size in bytes.
+    StRam,
+    /// The BAR segment size was rejected — value is the rejected size in MiB.
+    StBar,
+}
+
+impl FaultCounter {
+    /// Registry value name. Must stay ≤14 bytes: [`record_named_bytes`]
+    /// truncates beyond that, which would silently merge two counters.
+    const fn name(self) -> &'static [u8] {
+        match self {
+            FaultCounter::StVio => b"StVio",
+            FaultCounter::StVnu => b"StVnu",
+            FaultCounter::StHpd => b"StHpd",
+            FaultCounter::StRam => b"StRam",
+            FaultCounter::StBar => b"StBar",
+        }
+    }
+
+    /// Every counter, so StartDevice can zero the whole set in one place.
+    const ALL: &'static [FaultCounter] = &[
+        FaultCounter::StVio,
+        FaultCounter::StVnu,
+        FaultCounter::StHpd,
+        FaultCounter::StRam,
+        FaultCounter::StBar,
+    ];
+}
+
+/// Report a lifecycle failure through the **ungated** named-counter path.
+/// PASSIVE_LEVEL only, like every other writer here.
+pub fn fault(counter: FaultCounter, value: u32) {
+    record_named_bytes(counter.name(), value);
+}
+
+/// Zero every [`FaultCounter`] once, at StartDevice entry.
+///
+/// Registry values persist across boots, so without this a stale nonzero value
+/// from an earlier boot is indistinguishable from a fault that happened on this
+/// one. The gate's rule is "verify a counter moved this boot"; this is what
+/// makes that rule applicable.
+pub fn reset_fault_counters() {
+    let mut i = 0;
+    while i < FaultCounter::ALL.len() {
+        record_named_bytes(FaultCounter::ALL[i].name(), 0);
+        i += 1;
+    }
+}
+
 /// `record_named` convenience: build the UTF-16 value name from an ASCII byte
 /// slice (≤14 chars). PASSIVE_LEVEL only.
 pub fn record_named_bytes(name: &[u8], value: u32) {

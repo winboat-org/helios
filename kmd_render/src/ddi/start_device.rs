@@ -78,6 +78,7 @@ fn setup_bar_segment(
     };
     if size < (16 << 20) || size > window.len {
         crate::diag::record(0x0B00_00E8);
+        crate::diag::fault(crate::diag::FaultCounter::StBar, (size >> 20) as u32);
         return None;
     }
     // The KMD blob-window allocator must never hand out offsets inside the
@@ -131,6 +132,12 @@ pub unsafe extern "C" fn dxgkddi_start_device(
     crate::diag::record_named_bytes(b"AlcC", adapter.alloc_cached as u32);
     crate::diag::record_named_bytes(b"PBPrEn", adapter.present_probe as u32);
     crate::diag::record_named_bytes(b"DspH", adapter.display_half as u32);
+
+    // Registry values persist across boots, so a stale nonzero fault counter is
+    // indistinguishable from a fault on THIS boot. Zero the whole set once here,
+    // before anything can fail, so the gate's "verify movement, not presence"
+    // rule applies to every counter below.
+    crate::diag::reset_fault_counters();
 
     if adapter.paging_ram.is_none() {
         adapter.paging_ram = AdapterContext::alloc_paging_ram();
@@ -209,6 +216,7 @@ pub unsafe extern "C" fn dxgkddi_start_device(
                         let status: NTSTATUS = e.into();
                         crate::diag::record(0x0B00_00E7);
                         crate::diag::record(status as u32);
+                        crate::diag::fault(crate::diag::FaultCounter::StVnu, status as u32);
                         adapter.venus_ctx_id = 0;
                         adapter.set_venus_client(None);
                         adapter.page_table_window = None;
@@ -221,6 +229,7 @@ pub unsafe extern "C" fn dxgkddi_start_device(
             let status: NTSTATUS = e.into();
             crate::diag::record(0x0B00_00E0);
             crate::diag::record(status as u32);
+            crate::diag::fault(crate::diag::FaultCounter::StVio, status as u32);
             adapter
                 .isr_status
                 .store(0, core::sync::atomic::Ordering::Release);
