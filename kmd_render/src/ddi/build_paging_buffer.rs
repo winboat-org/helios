@@ -128,6 +128,12 @@ static BAR_ERR_DISCONTIG: AtomicU32 = AtomicU32::new(0); // leaf PTEs not contig
 static BAR_ERR_VIRTUAL: AtomicU32 = AtomicU32::new(0); // unresolved paging-process VA
 static BAR_ERR_MDL: AtomicU32 = AtomicU32::new(0); // system-MDL kernel map failed
 static BAR_ERR_SHADOW_FULL: AtomicU32 = AtomicU32::new(0); // PTE shadow capacity exhausted
+/// A classic TRANSFER (`PgEh`) / FILL (`PgFh`) named an `hAllocation` that does
+/// not resolve to a live Helios allocation. Both were bare `return`s: the op did
+/// not run, nothing was counted, and the DDI still answered STATUS_SUCCESS, so
+/// VidMm retired the paging fence believing content had moved.
+static BAR_ERR_XFER_HANDLE: AtomicU32 = AtomicU32::new(0);
+static BAR_ERR_FILL_HANDLE: AtomicU32 = AtomicU32::new(0);
 static BAR_VIRTUAL_PTES: AtomicU32 = AtomicU32::new(0); // system PTEs retained
 static BAR_LAST_VIRTUAL_SRC: AtomicU64 = AtomicU64::new(0);
 static BAR_LAST_VIRTUAL_DST: AtomicU64 = AtomicU64::new(0);
@@ -158,6 +164,8 @@ fn dump_bar_counters() {
     crate::diag::record_named_bytes(b"PgEv", BAR_ERR_VIRTUAL.load(Ordering::Relaxed));
     crate::diag::record_named_bytes(b"PgEx", BAR_ERR_MDL.load(Ordering::Relaxed));
     crate::diag::record_named_bytes(b"PgEf", BAR_ERR_SHADOW_FULL.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"PgEh", BAR_ERR_XFER_HANDLE.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"PgFh", BAR_ERR_FILL_HANDLE.load(Ordering::Relaxed));
     crate::diag::record_named_bytes(b"PgVp", BAR_VIRTUAL_PTES.load(Ordering::Relaxed));
     crate::diag::record_named_bytes(b"PgVs", BAR_LAST_VIRTUAL_SRC.load(Ordering::Relaxed) as u32);
     crate::diag::record_named_bytes(b"PgVd", BAR_LAST_VIRTUAL_DST.load(Ordering::Relaxed) as u32);
@@ -672,6 +680,10 @@ unsafe fn bar_transfer(
         return; // aperture/system transfer — null engine, as before
     }
     let Some(alloc) = (unsafe { paging_alloc_info(t.hAllocation) }) else {
+        // The transfer names the BAR segment but no live Helios allocation:
+        // there is nothing this driver can copy, and the caller must not read
+        // that as "content moved".
+        BAR_ERR_XFER_HANDLE.fetch_add(1, Ordering::Relaxed);
         return;
     };
     if !alloc.bar_eligible {
@@ -789,6 +801,9 @@ unsafe fn bar_fill(
         return;
     }
     let Some(alloc) = (unsafe { paging_alloc_info(f.hAllocation) }) else {
+        // Same class as PgEh on the transfer side: a BAR-segment fill naming no
+        // live allocation is a refusal, not a no-op.
+        BAR_ERR_FILL_HANDLE.fetch_add(1, Ordering::Relaxed);
         return;
     };
     if !alloc.bar_eligible {
