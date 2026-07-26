@@ -124,11 +124,9 @@ pub unsafe extern "C" fn dxgkddi_start_device(
     // Service-key knobs, read once per StartDevice (same iteration model as
     // `BarSegMode`: `reg add` + `devcon restart` re-runs this without a
     // reboot). See the field docs in `adapter.rs`.
-    adapter.gdi_accel_mode = crate::diag::read_config_dword(b"GdiAccelMode", 0);
     adapter.alloc_cached = crate::diag::read_config_dword(b"AllocCached", 1) != 0;
     adapter.present_probe = crate::diag::read_config_dword(b"PresentProbe", 0) != 0;
     adapter.display_half = crate::diag::read_config_dword(b"DisplayHalf", 0) != 0;
-    crate::diag::record_named_bytes(b"GdiM", adapter.gdi_accel_mode);
     crate::diag::record_named_bytes(b"AlcC", adapter.alloc_cached as u32);
     crate::diag::record_named_bytes(b"PBPrEn", adapter.present_probe as u32);
     crate::diag::record_named_bytes(b"DspH", adapter.display_half as u32);

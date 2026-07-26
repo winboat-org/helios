@@ -95,7 +95,13 @@ pub unsafe extern "C" fn dxgkddi_query_adapter_info(
     }
 }
 
-unsafe fn query_driver_caps(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTERINFO) -> NTSTATUS {
+/// The caps surface is a pure function of the build's compile-time levers and
+/// the two service knobs read below, so it no longer reads adapter state; the
+/// parameter stays so the dispatcher's arms remain uniform.
+unsafe fn query_driver_caps(
+    _adapter: &AdapterContext,
+    args: &DXGKARG_QUERYADAPTERINFO,
+) -> NTSTATUS {
     const REQUIRED_DRIVER_CAPS_SIZE: usize =
         offset_of!(DXGK_DRIVERCAPS, SupportDirectFlip) + size_of::<BOOLEAN>();
 
@@ -158,25 +164,24 @@ unsafe fn query_driver_caps(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTE
     // MANDATORY for dxgkrnl render-adapter load even on a render-only adapter —
     // these caps are NOT over-advertised and cannot be honestly dropped; they
     // must be BACKED with real impl (Gate 2/3). Full mandatory set restored below.
-    const PRESENTATIONCAPS_SUPPORT_KERNEL_MODE_COMMAND_BUFFER: u32 = 1 << 2;
-    // GDI HW-ACCELERATION LEVER (2026-07-02): SupportKernelModeCommandBuffer is the
-    // GDI hardware-acceleration opt-in. With it set, ALL window content (explorer,
-    // shell, LogonUI — everything GDI-drawn) arrives as DXGK_RENDERKM_COMMAND ops in
-    // DxgkDdiRenderGdi, which records-and-discards them (null engine) → every window
-    // surface stays zero → DWM correctly composes a black desktop → black frames in
-    // the IDD/Looking Glass even though clears/readback (helios_clear_test) work.
-    // BISECTED 2026-07-02 (v22.22.34.0): dropping the bit regressed the adapter to
-    // CM_PROB_FAILED_ADD. RETEST (WS1 #8, 2026-07-06): that bisect predates the
-    // Option A BAR segment (BarSegMode 10) and was confounded by the then-broken
-    // CPU-visible story — GDI HW acceleration is documented as OPTIONAL
-    // ("should… only if", gdi-hardware-acceleration.md) and viogpu3d (the closest
-    // WDDM driver to Helios, near-identical cap set) never sets the bit. The
-    // The 2026-07-06 `GdiAccelMode=0` A/B overturned that result: the adapter
-    // starts and Windows' canonical CPU redirection path renders correctly
-    // without any RenderGdi traffic. Mode 0 is therefore the production
-    // default. Explicit mode 1 remains only as a diagnostic rollback until the
-    // obsolete KMD CPU blitter is removed.
-    let advertise_gdi_hw_acceleration: bool = adapter.gdi_accel_mode != 0;
+    // GDI HW ACCELERATION IS NOT ADVERTISED, and there is no configuration in
+    // which it can be. `DXGK_PRESENTATIONCAPS::SupportKernelModeCommandBuffer`
+    // (bit 2) is the opt-in that makes dxgkrnl route all GDI-drawn window content
+    // through `DxgkDdiRenderGdi`; Helios does not implement a GDI raster engine, so
+    // the honest answer is 0 and win32k rasterizes GDI on the CPU into CpuVisible
+    // allocations instead (Windows' canonical redirection path).
+    //
+    // History, because the bit was once believed load-mandatory: bisected
+    // 2026-07-02 (v22.22.34.0) as dropping it => CM_PROB_FAILED_ADD; that result
+    // was overturned by the 2026-07-06 `GdiAccelMode=0` A/B, which bound Code 0 and
+    // rendered the desktop correctly with zero RenderGdi traffic. GDI HW
+    // acceleration is documented as OPTIONAL (gdi-hardware-acceleration.md) and
+    // viogpu3d — the closest WDDM driver to Helios — never sets it. The mode-0
+    // default shipped from then on, and the KMD CPU blitter it kept alive was
+    // deleted in 22.22.180.0 together with the `GdiAccelMode` rollback knob
+    // (reachability re-proven the same boot: with every `Gd*` service value
+    // deleted, a full GDI-heavy session — explorer restart, maximized notepad, GDI
+    // canary, repaint, paintcap — reproduced none of them).
     const FLIPCAPS_FLIP_ON_VSYNC_MMIO: u32 = 1 << 1;
     const SCHEDULINGCAPS_MULTI_ENGINE_AWARE: u32 = 1 << 0;
     const SCHEDULINGCAPS_PREEMPTION_AWARE: u32 = 1 << 2;
@@ -217,11 +222,9 @@ unsafe fn query_driver_caps(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTE
             | MEMORYMANAGEMENTCAPS_GPU_MMU_SUPPORTED;
     }
 
-    caps.PresentationCaps.__bindgen_anon_1.Value = if advertise_gdi_hw_acceleration {
-        PRESENTATIONCAPS_SUPPORT_KERNEL_MODE_COMMAND_BUFFER
-    } else {
-        0
-    };
+    // No GDI hardware acceleration (see the note above): every documented
+    // DXGK_PRESENTATIONCAPS bit stays clear.
+    caps.PresentationCaps.__bindgen_anon_1.Value = 0;
     caps.FlipCaps.__bindgen_anon_1.Value = FLIPCAPS_FLIP_ON_VSYNC_MMIO;
     caps.SchedulingCaps.__bindgen_anon_1.Value =
         SCHEDULINGCAPS_MULTI_ENGINE_AWARE | SCHEDULINGCAPS_PREEMPTION_AWARE;
