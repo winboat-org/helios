@@ -1104,13 +1104,39 @@ impl AdapterContext {
             // at DIRQL for later PASSIVE processing. DestroyAllocation owns the
             // same exact pointer; cancel it while serialized with the worker's
             // swap-and-dereference before the Box can be freed.
-            if allocation_handle != 0 {
-                let _ = self.pending_vidpn_allocation.compare_exchange(
-                    allocation_handle,
-                    0,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                );
+            if allocation_handle != 0
+                && self
+                    .pending_vidpn_allocation
+                    .compare_exchange(allocation_handle, 0, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+            {
+                // We just cancelled a deferred SetVidPnSourceAddress, so the HPD
+                // worker's swap() will now yield 0 and
+                // process_deferred_vidpn_source_address will return None -
+                // meaning nobody reaches any of the ten sites that clear
+                // `vidpn_programming`. A gate left at 1 makes vsync_dpc_routine
+                // early-return on every 16 ms tick before it increments
+                // vsync_count, so CRTC_VSYNC stops, dxgkrnl never retires the
+                // queued flip, and it therefore never issues the next
+                // SetVidPnSourceAddress that would re-arm the gate. The display
+                // is wedged for the rest of the boot.
+                //
+                // Both conditions below are load-bearing. SetVidPnSourceAddress
+                // runs at DIRQL and does NOT take the scanout lifecycle lock, so
+                // a NEWER program can raise the gate immediately after our CAS -
+                // re-read `pending` and only act while it is still 0. And
+                // compare_exchange(1, 0) rather than store(0) keeps us from
+                // clearing a gate we never observed set, which is the stale-clear
+                // window that would let the VSync DPC report a primary address
+                // the host has not sampled yet.
+                if self.pending_vidpn_allocation.load(Ordering::Acquire) == 0
+                    && self
+                        .vidpn_programming
+                        .compare_exchange(1, 0, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                {
+                    crate::diag::record_named_bytes(b"VpCncl", allocation_handle as u32);
+                }
             }
             if resource_id == 0 {
                 return true;
