@@ -108,6 +108,9 @@ pub(crate) struct SystemBackingTable {
 unsafe impl Send for SystemBackingTable {}
 unsafe impl Sync for SystemBackingTable {}
 
+/// Ticks the scanout pacing snapshot (R318). One rate for the whole block.
+static SCANOUT_PACING_TICKS: AtomicU32 = AtomicU32::new(0);
+
 impl SystemBackingTable {
     const MAX_ENTRIES: usize = 128;
 
@@ -878,7 +881,130 @@ impl AdapterContext {
     /// wakes the worker only after the Venus GPU copy has completed. One
     /// in-flight command is the backpressure boundary.
     pub(crate) fn queue_active_scanout_refresh(&self) -> ScanoutRefreshQueue {
-        self.with_scanout_lifecycle(|| self.queue_active_scanout_refresh_locked())
+        let outcome = self.with_scanout_lifecycle(|| self.queue_active_scanout_refresh_locked());
+        // R318: the pacing snapshot runs OUTSIDE `scanout_mutex`. It used to run
+        // inside it — 32 synchronous registry transactions every 16 queued
+        // refreshes, roughly 3.75 bursts per second at 60 Hz, on the PASSIVE
+        // display worker while holding the lock DestroyAllocation must acquire
+        // to retire a primary. Every counter read is an independent atomic, so
+        // sampling them outside the lock changes no value any consumer compares
+        // against another.
+        if matches!(outcome, ScanoutRefreshQueue::Queued) {
+            self.pacing_snapshot();
+        }
+        outcome
+    }
+
+    /// Low-rate mirror of the DISPATCH/DIRQL-updated pacing counters, which
+    /// otherwise become visible only at device teardown.
+    ///
+    /// ONE rate now (~600 refreshes, about 10 s at 60 Hz): the 16-period set is
+    /// folded in. `RfFail`, `RbFail`/`RfUnb` and `ScDead` are deliberately NOT
+    /// here — those stay loud and in place at their own sites.
+    fn pacing_snapshot(&self) {
+        use core::sync::atomic::Ordering;
+
+        let n = self.scanout_refresh_count.load(Ordering::Relaxed);
+        let resource_id = self.active_scanout_resource.load(Ordering::Acquire);
+        let wh = self.active_scanout_wh.load(Ordering::Relaxed);
+        let width = (wh >> 32) as u32;
+        let height = wh as u32;
+        if !crate::diag::sample_tick(&SCANOUT_PACING_TICKS) {
+            return;
+        }
+
+        crate::diag::record_named_bytes(b"RfRid", resource_id);
+        crate::diag::record_named_bytes(b"RfWH", (width << 16) | (height & 0xFFFF));
+        crate::diag::record_named_bytes(b"RfCnt", n);
+        crate::diag::record_named_bytes(
+            b"RfFail",
+            self.scanout_refresh_fail.load(Ordering::Relaxed),
+        );
+        // R315: the BIND-side failure counter, emitted from the SAME periodic
+        // block as the flush-side one. Its only other writer is the enqueue
+        // failure path above, which T6's k-lifecycle-02 shows is statically
+        // unreachable — so a host-REJECTED SET_SCANOUT_BLOB (counted through
+        // the DPC's completion_errors into scanout_bind_fail) used to leave
+        // the display silently frozen with no counter movement visible over
+        // SSH.
+        crate::diag::record_named_bytes(b"RbFail", self.scanout_bind_fail.load(Ordering::Relaxed));
+        // Live proof that ctrl completions are reaching the real IRQ/DPC
+        // path; these atomics otherwise become visible only at teardown.
+        crate::diag::record_named_bytes(
+            b"IrqN",
+            crate::ddi::interrupt::INT_ROUTINE_COUNT.load(Ordering::Relaxed),
+        );
+        crate::diag::record_named_bytes(
+            b"DpcN",
+            crate::ddi::interrupt::DPC_ROUTINE_COUNT.load(Ordering::Relaxed),
+        );
+        crate::diag::record_named_bytes(
+            b"RfDone",
+            crate::virtio::gpu::ASYNC_CTRL_COMPLETE_COUNT.load(Ordering::Relaxed),
+        );
+
+        crate::diag::record_named_bytes(b"VsCnt", self.vsync_count.load(Ordering::Relaxed));
+        crate::diag::record_named_bytes(b"VsEn", self.vsync_enabled.load(Ordering::Relaxed));
+        crate::diag::record_named_bytes(
+            b"SaCnt",
+            crate::ddi::VIDPN_SOURCE_ADDRESS_COUNT.load(Ordering::Relaxed),
+        );
+        let primary_address = self.last_primary_address.load(Ordering::Relaxed);
+        crate::diag::record_named_bytes(b"SaLo", primary_address as u32);
+        crate::diag::record_named_bytes(b"SaHi", (primary_address >> 32) as u32);
+        crate::diag::record_named_bytes(
+            b"AsSub",
+            crate::virtio::gpu::ASYNC_SUBMIT_COUNT.load(Ordering::Relaxed),
+        );
+        crate::diag::record_named_bytes(
+            b"AsDone",
+            crate::virtio::gpu::ASYNC_COMPLETE_COUNT.load(Ordering::Relaxed),
+        );
+        crate::diag::record_named_bytes(
+            b"WfDone",
+            crate::virtio::gpu::WDDM_FENCE_FROM_DPC.load(Ordering::Relaxed),
+        );
+        crate::diag::record_named_bytes(
+            b"WtOut",
+            crate::virtio::gpu::FENCE_WAIT_TIMEOUTS.load(Ordering::Relaxed),
+        );
+        crate::diag::record_named_bytes(
+            b"CtOut",
+            crate::virtio::gpu::CTRL_TIMEOUT_COUNT.load(Ordering::Relaxed),
+        );
+        crate::diag::record_named_bytes(
+            b"DpHit",
+            crate::virtio::gpu::DMA_POOL_HITS.load(Ordering::Relaxed),
+        );
+        crate::diag::record_named_bytes(
+            b"DpMis",
+            crate::virtio::gpu::DMA_POOL_MISSES.load(Ordering::Relaxed),
+        );
+        crate::diag::record_named_bytes(
+            b"DpDrp",
+            crate::virtio::gpu::DMA_POOL_DROPS.load(Ordering::Relaxed),
+        );
+        crate::diag::record_named_bytes(
+            b"DpByt",
+            crate::virtio::gpu::DMA_POOL_CACHED_BYTES.load(Ordering::Relaxed),
+        );
+        crate::diag::record_named_bytes(
+            b"DmStl",
+            crate::ddi::DMA_STALE_SKIP_COUNT.load(Ordering::Relaxed),
+        );
+        crate::diag::record_named_bytes(
+            b"QfRet",
+            crate::virtio::gpu::QUEUE_FULL_RETRIES.load(Ordering::Relaxed),
+        );
+        crate::diag::record_named_bytes(
+            b"IfHi",
+            crate::virtio::gpu::INFLIGHT_HIGH_WATER.load(Ordering::Relaxed),
+        );
+        crate::diag::record_named_bytes(
+            b"PkHi",
+            crate::virtio::gpu::PARKED_HIGH_WATER.load(Ordering::Relaxed),
+        );
+        crate::ddi::record_present_handoff_telemetry();
     }
 
     /// Scanout refresh implementation. The caller holds `scanout_mutex`, which
@@ -1005,114 +1131,10 @@ impl AdapterContext {
             return ScanoutRefreshQueue::Failed;
         }
 
-        let n = self
-            .scanout_refresh_count
-            .fetch_add(1, Ordering::Relaxed)
-            .wrapping_add(1);
-        // Registry writes are synchronous and must not become a once-per-second
-        // frame-path tax at 60 Hz. Refresh live telemetry every ~10 seconds.
-        if n == 1 || (n % 600) == 0 {
-            crate::diag::record_named_bytes(b"RfRid", resource_id);
-            crate::diag::record_named_bytes(b"RfWH", (width << 16) | (height & 0xFFFF));
-            crate::diag::record_named_bytes(b"RfCnt", n);
-            crate::diag::record_named_bytes(
-                b"RfFail",
-                self.scanout_refresh_fail.load(Ordering::Relaxed),
-            );
-            // R315: the BIND-side failure counter, emitted from the SAME periodic
-            // block as the flush-side one. Its only other writer is the enqueue
-            // failure path above, which T6's k-lifecycle-02 shows is statically
-            // unreachable — so a host-REJECTED SET_SCANOUT_BLOB (counted through
-            // the DPC's completion_errors into scanout_bind_fail) used to leave
-            // the display silently frozen with no counter movement visible over
-            // SSH.
-            crate::diag::record_named_bytes(
-                b"RbFail",
-                self.scanout_bind_fail.load(Ordering::Relaxed),
-            );
-            // Live proof that ctrl completions are reaching the real IRQ/DPC
-            // path; these atomics otherwise become visible only at teardown.
-            crate::diag::record_named_bytes(
-                b"IrqN",
-                crate::ddi::interrupt::INT_ROUTINE_COUNT.load(Ordering::Relaxed),
-            );
-            crate::diag::record_named_bytes(
-                b"DpcN",
-                crate::ddi::interrupt::DPC_ROUTINE_COUNT.load(Ordering::Relaxed),
-            );
-            crate::diag::record_named_bytes(
-                b"RfDone",
-                crate::virtio::gpu::ASYNC_CTRL_COMPLETE_COUNT.load(Ordering::Relaxed),
-            );
-        }
-        // Low-rate live pacing telemetry. These counters are updated at
-        // DISPATCH/DIRQL and otherwise become visible only at device teardown;
-        // one PASSIVE snapshot per 16 queued scanout operations is cheap enough
-        // to keep while making a 2.4-fps stall diagnosable in the live boot.
-        if n == 1 || (n % 16) == 0 {
-            crate::diag::record_named_bytes(b"VsCnt", self.vsync_count.load(Ordering::Relaxed));
-            crate::diag::record_named_bytes(b"VsEn", self.vsync_enabled.load(Ordering::Relaxed));
-            crate::diag::record_named_bytes(
-                b"SaCnt",
-                crate::ddi::VIDPN_SOURCE_ADDRESS_COUNT.load(Ordering::Relaxed),
-            );
-            let primary_address = self.last_primary_address.load(Ordering::Relaxed);
-            crate::diag::record_named_bytes(b"SaLo", primary_address as u32);
-            crate::diag::record_named_bytes(b"SaHi", (primary_address >> 32) as u32);
-            crate::diag::record_named_bytes(
-                b"AsSub",
-                crate::virtio::gpu::ASYNC_SUBMIT_COUNT.load(Ordering::Relaxed),
-            );
-            crate::diag::record_named_bytes(
-                b"AsDone",
-                crate::virtio::gpu::ASYNC_COMPLETE_COUNT.load(Ordering::Relaxed),
-            );
-            crate::diag::record_named_bytes(
-                b"WfDone",
-                crate::virtio::gpu::WDDM_FENCE_FROM_DPC.load(Ordering::Relaxed),
-            );
-            crate::diag::record_named_bytes(
-                b"WtOut",
-                crate::virtio::gpu::FENCE_WAIT_TIMEOUTS.load(Ordering::Relaxed),
-            );
-            crate::diag::record_named_bytes(
-                b"CtOut",
-                crate::virtio::gpu::CTRL_TIMEOUT_COUNT.load(Ordering::Relaxed),
-            );
-            crate::diag::record_named_bytes(
-                b"DpHit",
-                crate::virtio::gpu::DMA_POOL_HITS.load(Ordering::Relaxed),
-            );
-            crate::diag::record_named_bytes(
-                b"DpMis",
-                crate::virtio::gpu::DMA_POOL_MISSES.load(Ordering::Relaxed),
-            );
-            crate::diag::record_named_bytes(
-                b"DpDrp",
-                crate::virtio::gpu::DMA_POOL_DROPS.load(Ordering::Relaxed),
-            );
-            crate::diag::record_named_bytes(
-                b"DpByt",
-                crate::virtio::gpu::DMA_POOL_CACHED_BYTES.load(Ordering::Relaxed),
-            );
-            crate::diag::record_named_bytes(
-                b"DmStl",
-                crate::ddi::DMA_STALE_SKIP_COUNT.load(Ordering::Relaxed),
-            );
-            crate::diag::record_named_bytes(
-                b"QfRet",
-                crate::virtio::gpu::QUEUE_FULL_RETRIES.load(Ordering::Relaxed),
-            );
-            crate::diag::record_named_bytes(
-                b"IfHi",
-                crate::virtio::gpu::INFLIGHT_HIGH_WATER.load(Ordering::Relaxed),
-            );
-            crate::diag::record_named_bytes(
-                b"PkHi",
-                crate::virtio::gpu::PARKED_HIGH_WATER.load(Ordering::Relaxed),
-            );
-            crate::ddi::record_present_handoff_telemetry();
-        }
+        // Count the refresh here (under the lock, where the identity is stable);
+        // the TELEMETRY SNAPSHOT is taken by the caller AFTER the lock is
+        // released — see `queue_active_scanout_refresh` (R318).
+        self.scanout_refresh_count.fetch_add(1, Ordering::Relaxed);
         ScanoutRefreshQueue::Queued
     }
 

@@ -102,9 +102,12 @@ virtio-gpu scanout; IddCx/Looking Glass is no longer the active display path.*
    freed a context a live thread still touched. Every one of them was previously invisible
    at the default `DiagLevel`, which is why R201 (ungated `diag::fault` + `FaultCounter`)
    landed first. **15 new fault counters, all zero on a healthy boot.**
-   ⚠ **`VsCnt`/`SaCnt` are mirrored to the registry only from `queue_active_scanout_refresh`'s
-   pacing block (`n==1 || n%16==0`)** — on an idle desktop they stop being written and a short
-   sample reads delta 0. Provoke presentation before trusting them.
+   ⚠ **`VsCnt`/`SaCnt` are mirrored to the registry only from the scanout pacing snapshot** —
+   on an idle desktop they stop being written and a short sample reads delta 0. Provoke
+   presentation before trusting them. **As of 22.22.180.0 (R318) that snapshot runs OUTSIDE
+   the scanout mutex and at ONE rate, `n==1 || n%600==0` (was `n%16`), so the provocation
+   must be long enough to cross the period** — a 25 s `helios_dcomp_probe` run (~1250
+   refreshes at ~50 fps) crosses it twice.
 4. **NEXT — T1b** (`REFACTOR_REVIEW.md` §T1b): 30 items, R301–R320 + ten minor items, one KMD
    image and one reboot. Two halves, and the ordering between them is load-bearing: **every bug
    commit precedes every telemetry commit**, so the before/after cadence numbers are taken against
