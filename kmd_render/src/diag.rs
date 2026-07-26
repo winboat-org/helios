@@ -126,6 +126,13 @@ pub enum FaultCounter {
     StRam,
     /// The BAR segment size was rejected — value is the rejected size in MiB.
     StBar,
+    /// The display half asked the host for its scan-out mode but the transport
+    /// was gone — value is the NTSTATUS. The mode falls back to a fabricated
+    /// default, so the OS is told about a monitor whose size we invented.
+    StTxG,
+    /// The transport answered the mode query but reported nothing usable —
+    /// value is 1. Same fallback, different cause.
+    StMdB,
 }
 
 impl FaultCounter {
@@ -138,6 +145,8 @@ impl FaultCounter {
             FaultCounter::StHpd => b"StHpd",
             FaultCounter::StRam => b"StRam",
             FaultCounter::StBar => b"StBar",
+            FaultCounter::StTxG => b"StTxG",
+            FaultCounter::StMdB => b"StMdB",
         }
     }
 
@@ -148,6 +157,8 @@ impl FaultCounter {
         FaultCounter::StHpd,
         FaultCounter::StRam,
         FaultCounter::StBar,
+        FaultCounter::StTxG,
+        FaultCounter::StMdB,
     ];
 }
 

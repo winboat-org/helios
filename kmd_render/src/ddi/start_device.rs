@@ -261,9 +261,24 @@ pub unsafe extern "C" fn dxgkddi_start_device(
         // init) as the VidPn mode + generated-EDID native resolution, so Helios
         // presents the size QEMU actually wants on scanout 0. Falls back to the
         // default in `display_mode()` if the host reported nothing usable.
-        if let Ok(Some((w, h))) = adapter.with_virtio(|v| v.display_mode()) {
-            adapter.display_w = w;
-            adapter.display_h = h;
+        //
+        // The two failure arms are NOT the same thing and neither is benign: the
+        // fallback fabricates a mode, so the OS is handed an EDID for a monitor
+        // whose size we invented. Distinguish them - `Err` means the transport is
+        // gone (and therefore nothing can ever scan out), `Ok(None)` means the
+        // host answered but reported nothing usable.
+        match adapter.with_virtio(|v| v.display_mode()) {
+            Ok(Some((w, h))) => {
+                adapter.display_w = w;
+                adapter.display_h = h;
+            }
+            Ok(None) => {
+                crate::diag::fault(crate::diag::FaultCounter::StMdB, 1);
+            }
+            Err(e) => {
+                let status: NTSTATUS = e.into();
+                crate::diag::fault(crate::diag::FaultCounter::StTxG, status as u32);
+            }
         }
         let (w, h) = adapter.display_mode();
         adapter.edid = crate::ddi::vidpn::build_edid(w, h);
