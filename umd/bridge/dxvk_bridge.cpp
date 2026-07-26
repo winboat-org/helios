@@ -280,18 +280,99 @@ namespace {
     return nullptr;
   }
 
+  // The seven Mesa-ICD exports this bridge resolves, as a process-wide table.
+  //
+  // `find_helios_icd_export` used to cache NOTHING. Every call took a full
+  // TH32CS_SNAPMODULE snapshot and called GetProcAddress on every loaded module
+  // until it reached the Mesa ICD — which is late in the load order, so most of
+  // the list gets walked — and on a miss it then walked the Vulkan ICD manifest
+  // list, read and parsed JSON off disk, and LoadLibraryA'd each candidate with
+  // NO matching FreeLibrary, so a persistent miss also grew module refcounts
+  // without bound. `get_resource_memory_info` alone costs two lookups per call.
+  //
+  // CRITICAL: cache SUCCESSES ONLY, per export. A std::call_once or a magic
+  // static over the resolution would latch an early nullptr — the Mesa ICD is
+  // not loaded until `new dxvk::DxvkInstance`, and helios_venus_query_scanout in
+  // particular can legitimately miss before the KMD has a bound primary — and
+  // that would permanently disable the venus identity plumbing for the process.
+  // Failure retries exactly as it did before; the per-slot std::atomic is what
+  // makes retry-on-failure race-free without a mutex. No code path stores
+  // nullptr into a slot.
+  //
+  // FreeLibrary is deliberately still absent: the cached pointer is INTO that
+  // module. Caching is what bounds the loads, not a matching free.
+  enum class HeliosIcdExport : std::size_t {
+    CurrentCtxId = 0,
+    InstanceCtxId,
+    MemoryId,
+    MemoryResId,
+    MemoryTransferOwnership,
+    MemoryAllocInfo,
+    QueryScanout,
+    Count,
+  };
+
+  constexpr std::size_t kHeliosIcdExportCount =
+    static_cast<std::size_t>(HeliosIcdExport::Count);
+
+  const char* helios_icd_export_name(HeliosIcdExport slot) {
+    switch (slot) {
+    case HeliosIcdExport::CurrentCtxId:  return "helios_venus_current_ctx_id";
+    case HeliosIcdExport::InstanceCtxId: return "helios_venus_instance_ctx_id";
+    case HeliosIcdExport::MemoryId:      return "helios_venus_memory_id";
+    case HeliosIcdExport::MemoryResId:   return "helios_venus_memory_res_id";
+    case HeliosIcdExport::MemoryTransferOwnership:
+      return "helios_venus_memory_transfer_resource_ownership";
+    case HeliosIcdExport::MemoryAllocInfo: return "helios_venus_memory_alloc_info";
+    case HeliosIcdExport::QueryScanout:    return "helios_venus_query_scanout";
+    default: return "";
+    }
+  }
+
+  // Discovery order is unchanged, so a resolution that works today still works.
+  void* resolve_helios_icd_export(HeliosIcdExport slot) {
+    static std::atomic<void*> s_cache[kHeliosIcdExportCount];
+    const auto index = static_cast<std::size_t>(slot);
+    if (index >= kHeliosIcdExportCount)
+      return nullptr;
+    if (void* cached = s_cache[index].load(std::memory_order_acquire))
+      return cached;
+
+    const char* export_name = helios_icd_export_name(slot);
+    void* fn = find_export_in_loaded_modules<void*>(export_name);
+    if (!fn)
+      fn = find_export_via_vulkan_icd_manifests<void*>(export_name);
+    if (fn)
+      s_cache[index].store(fn, std::memory_order_release);
+    return fn;
+  }
+
   template<typename Fn>
-  Fn find_helios_icd_export(const char* export_name) {
-    if (auto fn = find_export_in_loaded_modules<Fn>(export_name))
-      return fn;
-    return find_export_via_vulkan_icd_manifests<Fn>(export_name);
+  Fn helios_icd_export(HeliosIcdExport slot) {
+    return reinterpret_cast<Fn>(resolve_helios_icd_export(slot));
+  }
+
+  // The "export unavailable" lines were per-call file I/O on a path that runs
+  // once or twice per resource create; rate-limit them the way the rest of the
+  // bridge telemetry is limited.
+  void log_export_unavailable(HeliosIcdExport slot) {
+    static std::atomic<std::uint32_t> s_counts[kHeliosIcdExportCount];
+    const auto index = static_cast<std::size_t>(slot);
+    if (index >= kHeliosIcdExportCount)
+      return;
+    const std::uint32_t n =
+      s_counts[index].fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n == 1 || (n % 512u) == 0) {
+      char msg[192];
+      std::snprintf(msg, sizeof(msg), "%s export unavailable (x%u)",
+        helios_icd_export_name(slot), n);
+      umd_log(msg);
+    }
   }
 
   std::uint32_t read_current_venus_context_id() {
     using Fn = std::uint32_t (__cdecl*)();
-    constexpr const char* export_name = "helios_venus_current_ctx_id";
-
-    auto fn = find_helios_icd_export<Fn>(export_name);
+    auto fn = helios_icd_export<Fn>(HeliosIcdExport::CurrentCtxId);
     if (!fn)
       return 0;
 
@@ -321,7 +402,7 @@ namespace {
   std::uint32_t read_instance_venus_context_id(VkInstance instance) {
     using Fn = std::uint32_t (__cdecl*)(VkInstance);
     if (instance) {
-      if (auto fn = find_helios_icd_export<Fn>("helios_venus_instance_ctx_id")) {
+      if (auto fn = helios_icd_export<Fn>(HeliosIcdExport::InstanceCtxId)) {
         const auto ctx = fn(instance);
         if (plausible_venus_context_id(ctx)) {
           char msg[128];
@@ -529,12 +610,10 @@ namespace {
       return 0;
 
     using Fn = std::uint64_t (__cdecl*)(VkDeviceMemory);
-    constexpr const char* export_name = "helios_venus_memory_id";
-
-    if (auto fn = find_helios_icd_export<Fn>(export_name))
+    if (auto fn = helios_icd_export<Fn>(HeliosIcdExport::MemoryId))
       return fn(memory);
 
-    umd_log("helios_venus_memory_id export unavailable");
+    log_export_unavailable(HeliosIcdExport::MemoryId);
     return 0;
   }
 
@@ -543,9 +622,7 @@ namespace {
       return 0;
 
     using Fn = std::uint32_t (__cdecl*)(VkDeviceMemory);
-    constexpr const char* export_name = "helios_venus_memory_res_id";
-
-    if (auto fn = find_helios_icd_export<Fn>(export_name))
+    if (auto fn = helios_icd_export<Fn>(HeliosIcdExport::MemoryResId))
       return fn(memory);
 
     return 0;
@@ -556,12 +633,10 @@ namespace {
       return 0;
 
     using Fn = std::uint32_t (__cdecl*)(VkDeviceMemory);
-    constexpr const char* export_name = "helios_venus_memory_transfer_resource_ownership";
-
-    if (auto fn = find_helios_icd_export<Fn>(export_name))
+    if (auto fn = helios_icd_export<Fn>(HeliosIcdExport::MemoryTransferOwnership))
       return fn(memory);
 
-    umd_log("helios_venus_memory_transfer_resource_ownership export unavailable");
+    log_export_unavailable(HeliosIcdExport::MemoryTransferOwnership);
     return 0;
   }
 
@@ -576,12 +651,10 @@ namespace {
       return false;
 
     using Fn = bool (__cdecl*)(VkDeviceMemory, std::uint64_t*, std::uint32_t*);
-    constexpr const char* export_name = "helios_venus_memory_alloc_info";
-
-    if (auto fn = find_helios_icd_export<Fn>(export_name))
+    if (auto fn = helios_icd_export<Fn>(HeliosIcdExport::MemoryAllocInfo))
       return fn(memory, alloc_size, memory_type_index);
 
-    umd_log("helios_venus_memory_alloc_info export unavailable");
+    log_export_unavailable(HeliosIcdExport::MemoryAllocInfo);
     return false;
   }
 
@@ -1323,9 +1396,9 @@ std::size_t HeliosDxvkDevice::open_kmd_scanout_target(
       return 0;
 
     using Fn = bool (__cdecl*)(VkInstance, HeliosVenusScanoutInfo*);
-    auto query = find_helios_icd_export<Fn>("helios_venus_query_scanout");
+    auto query = helios_icd_export<Fn>(HeliosIcdExport::QueryScanout);
     if (!query) {
-      umd_log("helios_venus_query_scanout export unavailable");
+      log_export_unavailable(HeliosIcdExport::QueryScanout);
       return 0;
     }
 
