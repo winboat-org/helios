@@ -25,6 +25,7 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <thread>
 #include <d3d11.h>
 #include <dxgi.h>
@@ -370,6 +371,66 @@ namespace {
     }
   }
 
+  // The rotate-sample instrument reads rows as std::uint32_t, so it is only
+  // valid against a 32-bit-per-pixel format.
+  bool is_32bpp_dxgi_format(DXGI_FORMAT format) {
+    switch (format) {
+    case DXGI_FORMAT_R8G8B8A8_TYPELESS:
+    case DXGI_FORMAT_R8G8B8A8_UNORM:
+    case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+    case DXGI_FORMAT_R8G8B8A8_UINT:
+    case DXGI_FORMAT_R8G8B8A8_SNORM:
+    case DXGI_FORMAT_R8G8B8A8_SINT:
+    case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+    case DXGI_FORMAT_B8G8R8A8_UNORM:
+    case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+    case DXGI_FORMAT_B8G8R8X8_TYPELESS:
+    case DXGI_FORMAT_B8G8R8X8_UNORM:
+    case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB:
+    case DXGI_FORMAT_R10G10B10A2_TYPELESS:
+    case DXGI_FORMAT_R10G10B10A2_UNORM:
+    case DXGI_FORMAT_R10G10B10A2_UINT:
+    case DXGI_FORMAT_R11G11B10_FLOAT:
+    case DXGI_FORMAT_R16G16_TYPELESS:
+    case DXGI_FORMAT_R16G16_FLOAT:
+    case DXGI_FORMAT_R16G16_UNORM:
+    case DXGI_FORMAT_R16G16_UINT:
+    case DXGI_FORMAT_R16G16_SNORM:
+    case DXGI_FORMAT_R16G16_SINT:
+    case DXGI_FORMAT_R32_TYPELESS:
+    case DXGI_FORMAT_R32_FLOAT:
+    case DXGI_FORMAT_R32_UINT:
+    case DXGI_FORMAT_R32_SINT:
+      return true;
+    default:
+      return false;
+    }
+  }
+
+  // First `first` occurrences, then every `every`-th — the idiom the periodic
+  // bridge telemetry already uses. The per-create lines below were
+  // unconditional, and each one is an _fsopen + fprintf + fclose.
+  bool bridge_log_budget(std::atomic<std::uint32_t>& counter,
+                         std::uint32_t first,
+                         std::uint32_t every) {
+    const std::uint32_t n = counter.fetch_add(1, std::memory_order_relaxed) + 1;
+    return n <= first || (every != 0 && (n % every) == 0);
+  }
+
+
+  bool plausible_venus_context_id(std::uint32_t ctx) {
+    // KMD-assigned context ids are small monotonically allocated integers. A
+    // value such as 0xcccccc00 means the instance-scoped export decoded the
+    // wrong handle/object, not a real Venus context.
+    //
+    // The `(ctx & 0xff000000u) != 0xcc000000u` conjunct that used to be here was
+    // provably inert: `ctx < 0x01000000u` already forces the top byte to zero,
+    // so it excluded nothing the range check had not already excluded.
+    return ctx != 0 && ctx < 0x01000000u;
+  }
+
+  std::atomic<std::uint32_t> g_venusCtxFallbackImplausible{0};
+
   std::uint32_t read_current_venus_context_id() {
     using Fn = std::uint32_t (__cdecl*)();
     auto fn = helios_icd_export<Fn>(HeliosIcdExport::CurrentCtxId);
@@ -377,6 +438,22 @@ namespace {
       return 0;
 
     const auto ctx = fn();
+    // The process-global export is last-writer-wins across two live venus
+    // instances, so its result was the LEAST trustworthy of the two and was the
+    // only one no plausibility test was applied to. Return 0 on an implausible
+    // value so the caller's loud "Venus context export returned 0" path fires
+    // instead of a silent wrong stamp on every WDDM allocation identity this
+    // device creates.
+    if (ctx && !plausible_venus_context_id(ctx)) {
+      const std::uint32_t n =
+        g_venusCtxFallbackImplausible.fetch_add(1, std::memory_order_relaxed) + 1;
+      char msg[160];
+      std::snprintf(msg, sizeof(msg),
+        "process-global venus ctx export returned implausible ctx_id=%u -> 0 (x%u)",
+        ctx, n);
+      umd_log(msg);
+      return 0;
+    }
     if (ctx) {
       char msg[128];
       std::snprintf(msg, sizeof(msg), "Venus context export returned ctx_id=%u", ctx);
@@ -384,13 +461,6 @@ namespace {
     }
 
     return ctx;
-  }
-
-  bool plausible_venus_context_id(std::uint32_t ctx) {
-    // KMD-assigned context ids are small monotonically allocated integers. A
-    // value such as 0xcccccc00 means the instance-scoped export decoded the
-    // wrong handle/object, not a real Venus context.
-    return ctx != 0 && ctx < 0x01000000u && (ctx & 0xff000000u) != 0xcc000000u;
   }
 
   // Instance-scoped venus ctx id (23rd-session audit): the process-global
@@ -411,6 +481,8 @@ namespace {
           umd_log(msg);
           return ctx;
         }
+        // Mutually exclusive with the "unavailable" line below: printing both
+        // gave triage two contradicting causes for the same fallback.
         if (ctx) {
           char msg[160];
           std::snprintf(msg, sizeof(msg),
@@ -418,6 +490,7 @@ namespace {
             ctx);
           umd_log(msg);
         }
+        return read_current_venus_context_id();
       }
     }
     umd_log("instance-scoped venus ctx export unavailable; "
@@ -447,6 +520,9 @@ namespace {
   std::atomic<std::uint32_t> g_scanoutQueryUnavailable{0};
   std::atomic<std::uint32_t> g_scanoutImportFailed{0};
   std::atomic<std::uint32_t> g_scanoutFormatRefused{0};
+  /// The direct-scanout PRIMARY create's QI failure — the one whose silent zero
+  /// R401 now reports to the runtime.
+  std::atomic<std::uint32_t> g_scanoutPrimaryQiFailed{0};
   std::atomic<std::uint32_t> g_scanoutPlaneOffsetRefused{0};
 
   void log_scanout_refusal(const char* what, std::atomic<std::uint32_t>& counter) {
@@ -466,6 +542,26 @@ namespace {
       umd_log(msg);
     }
   }
+
+  // Owns one COM reference until it is deliberately released. Non-copyable, so
+  // the reference cannot be duplicated into a second owner by accident.
+  template <typename T>
+  class ComRelease {
+  public:
+    explicit ComRelease(T* ptr) : m_ptr(ptr) {}
+    ComRelease(const ComRelease&) = delete;
+    ComRelease& operator=(const ComRelease&) = delete;
+    ~ComRelease() { reset(); }
+    T* get() const { return m_ptr; }
+    void reset() {
+      if (m_ptr) {
+        m_ptr->Release();
+        m_ptr = nullptr;
+      }
+    }
+  private:
+    T* m_ptr = nullptr;
+  };
 
   // Minimal IDXGIAdapter the D3D11DXGIDevice constructor stores (it is not
   // queried during construction — the Dxvk objects are passed directly).
@@ -504,15 +600,20 @@ namespace {
   // lib.rs). The restricted IddCx host process cannot write C:\Windows\Temp, so
   // its DXVK-bridge log lines vanished; ProgramData is standard-user writable and
   // the per-pid name keeps each process's file owned by that process.
+  // Magic static, matching `shader_bytecode_dump_path()` in this same anonymous
+  // namespace — the lazy `if (path[0] == 0)` form it used was an
+  // unsynchronised write to shared storage, and the file already contradicted
+  // itself on this point.
   const char* umd_log_file() {
-    static char path[MAX_PATH] = {0};
-    if (path[0] == 0) {
+    static const std::string path = [] {
       CreateDirectoryA("C:\\ProgramData\\Helios", nullptr);
-      _snprintf_s(path, sizeof(path), _TRUNCATE,
+      char buf[MAX_PATH] = {};
+      _snprintf_s(buf, sizeof(buf), _TRUNCATE,
                   "C:\\ProgramData\\Helios\\umd-%lu.log",
                   (unsigned long)GetCurrentProcessId());
-    }
-    return path;
+      return std::string(buf);
+    }();
+    return path.c_str();
   }
 
   void umd_log(const char* msg) {
@@ -691,6 +792,27 @@ namespace {
   // (SystemValue, Register, Mask, RegisterComponentType, Stream).
   constexpr std::size_t kSigEntryWords = 5;
 
+  // D3D11 has at most 32 input/output registers per stage; a few hundred is
+  // generous. The bound exists so the length check below cannot be satisfied by
+  // a wrapped sum, since it is the only thing standing between caller-supplied
+  // counts and the indexing that follows.
+  constexpr std::uint32_t kMaxSignatureEntries = 512u;
+
+  std::atomic<std::uint32_t> g_signatureCountRefused{0};
+
+  bool signature_count_ok(const char* what, std::uint32_t count) {
+    if (count <= kMaxSignatureEntries)
+      return true;
+    const std::uint32_t n =
+      g_signatureCountRefused.fetch_add(1, std::memory_order_relaxed) + 1;
+    char msg[160];
+    std::snprintf(msg, sizeof(msg),
+      "%s REFUSED: signature entry count %u exceeds %u (x%u)",
+      what, count, kMaxSignatureEntries, n);
+    umd_log(msg);
+    return false;
+  }
+
   struct EncodedSignatureEntry {
     const char* semantic_name;
     std::uint32_t semantic_index;
@@ -746,6 +868,10 @@ namespace {
                               const char tag[4],
                               const std::uint32_t* entries,
                               std::uint32_t count) {
+    // 24 bytes per entry, widened: `count` is caller-supplied and the result
+    // feeds `name_base` and every offset written into the chunk.
+    if (!signature_count_ok("append_signature_chunk", count))
+      return;
     const std::uint32_t entries_size = count * 24u;
     const std::uint32_t name_base = 8u + entries_size;  // relative to chunk data
     std::vector<EncodedSignatureEntry> encoded_entries;
@@ -1104,6 +1230,22 @@ struct HeliosFlipWaitCtx {
     }
   }
 
+  // One guarded accessor for both readers of the runtime fence's mapped CPU
+  // value. The mutex does NOT protect the mapping's contents — those are
+  // kernel-written and read through a volatile pointer — it protects
+  // `alive`/`signal`/`hFence`, and the missing `alive` test in the watchdog was
+  // the real gap: `alive` is documented as fencing every touch of the runtime
+  // callback after device teardown, and the watchdog honoured neither it nor
+  // the mutex. Not constructible today (the destructor's join runs inside
+  // DestroyDevice while the mapping is still live), so this is hardening
+  // against the watchdog ever being detached or the join being moved.
+  std::optional<std::uint64_t> readFenceValue() {
+    std::lock_guard<std::mutex> lock(mutex);
+    if (!alive || !cpuVa)
+      return std::nullopt;
+    return *cpuVa;
+  }
+
   void signalTo(std::uint64_t value) {
     std::lock_guard<std::mutex> lock(mutex);
     if (!alive || !signal)
@@ -1211,11 +1353,14 @@ bool HeliosDxvkDevice::set_resource_kmt_handles(
 
     texture->GetImage()->storage()->setKmtHandles(local, global);
 
-    char msg[160];
-    std::snprintf(msg, sizeof(msg),
-      "set_resource_kmt_handles resource=%p local=0x%08x global=0x%08x",
-      resource, local, global);
-    umd_log(msg);
+    static std::atomic<std::uint32_t> s_setKmtLogs{0};
+    if (bridge_log_budget(s_setKmtLogs, 64, 512)) {
+      char msg[160];
+      std::snprintf(msg, sizeof(msg),
+        "set_resource_kmt_handles resource=%p local=0x%08x global=0x%08x",
+        resource, local, global);
+      umd_log(msg);
+    }
     return true;
   });
 }
@@ -1257,16 +1402,19 @@ bool HeliosDxvkDevice::get_resource_memory_info(
     if (resource_id)
       *resource_id = resourceId;
 
-    char msg[256];
-    std::snprintf(msg, sizeof(msg),
-      "get_resource_memory_info resource=%p memory_raw=0x%llx venus_id=0x%llx res_id=%u size=%llu offset=%llu",
-      resource,
-      static_cast<unsigned long long>(rawMemory),
-      static_cast<unsigned long long>(venusId),
-      resourceId,
-      static_cast<unsigned long long>(info.size),
-      static_cast<unsigned long long>(info.offset));
-    umd_log(msg);
+    static std::atomic<std::uint32_t> s_memInfoLogs{0};
+    if (bridge_log_budget(s_memInfoLogs, 64, 512)) {
+      char msg[256];
+      std::snprintf(msg, sizeof(msg),
+        "get_resource_memory_info resource=%p memory_raw=0x%llx venus_id=0x%llx res_id=%u size=%llu offset=%llu",
+        resource,
+        static_cast<unsigned long long>(rawMemory),
+        static_cast<unsigned long long>(venusId),
+        resourceId,
+        static_cast<unsigned long long>(info.size),
+        static_cast<unsigned long long>(info.offset));
+      umd_log(msg);
+    }
     return venusId != 0 && info.size != 0;
   });
 }
@@ -1308,13 +1456,16 @@ bool HeliosDxvkDevice::transfer_resource_ownership(
     auto info = texture->GetImage()->storage()->getMemoryInfo();
     const auto resourceId = venus_memory_transfer_resource_ownership(info.memory);
 
-    char msg[192];
-    std::snprintf(msg, sizeof(msg),
-      "transfer_resource_ownership resource=%p memory=0x%llx res_id=%u",
-      resource,
-      static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(info.memory)),
-      resourceId);
-    umd_log(msg);
+    static std::atomic<std::uint32_t> s_xferOwnLogs{0};
+    if (bridge_log_budget(s_xferOwnLogs, 64, 512)) {
+      char msg[192];
+      std::snprintf(msg, sizeof(msg),
+        "transfer_resource_ownership resource=%p memory=0x%llx res_id=%u",
+        resource,
+        static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(info.memory)),
+        resourceId);
+      umd_log(msg);
+    }
     return resourceId != 0;
   });
 }
@@ -1337,12 +1488,15 @@ std::size_t HeliosDxvkDevice::open_ddi_texture2d(
 
   try {
     {
-      char msg[256];
-      std::snprintf(msg, sizeof(msg),
-        "OpenDdiTexture2D begin %ux%u fmt=%u bind=0x%08x misc=0x%08x global=0x%08x renderer_res=%u alloc_size=%llu mem_type=%u",
-        width, height, format, bind_flags, misc_flags, global, renderer_resource_id,
-        static_cast<unsigned long long>(venus_alloc_size), memory_type_index);
-      umd_log(msg);
+      static std::atomic<std::uint32_t> s_openBeginLogs{0};
+      if (bridge_log_budget(s_openBeginLogs, 64, 512)) {
+        char msg[256];
+        std::snprintf(msg, sizeof(msg),
+          "OpenDdiTexture2D begin %ux%u fmt=%u bind=0x%08x misc=0x%08x global=0x%08x renderer_res=%u alloc_size=%llu mem_type=%u",
+          width, height, format, bind_flags, misc_flags, global, renderer_resource_id,
+          static_cast<unsigned long long>(venus_alloc_size), memory_type_index);
+        umd_log(msg);
+      }
     }
 
     dxvk::D3D11_COMMON_TEXTURE_DESC desc = { };
@@ -1387,12 +1541,15 @@ std::size_t HeliosDxvkDevice::open_ddi_texture2d(
         __uuidof(ID3D11Resource),
         reinterpret_cast<void**>(&resource));
 
-    char msg[224];
-    std::snprintf(msg, sizeof(msg),
-      "OpenDdiTexture2D %ux%u fmt=%u bind=0x%08x misc=0x%08x global=0x%08x renderer_res=%u hr=0x%08lx resource=%p",
-      width, height, format, bind_flags, misc_flags, global, renderer_resource_id,
-      static_cast<unsigned long>(hr), resource);
-    umd_log(msg);
+    static std::atomic<std::uint32_t> s_openDoneLogs{0};
+    if (bridge_log_budget(s_openDoneLogs, 64, 512)) {
+      char msg[224];
+      std::snprintf(msg, sizeof(msg),
+        "OpenDdiTexture2D %ux%u fmt=%u bind=0x%08x misc=0x%08x global=0x%08x renderer_res=%u hr=0x%08lx resource=%p",
+        width, height, format, bind_flags, misc_flags, global, renderer_resource_id,
+        static_cast<unsigned long>(hr), resource);
+      umd_log(msg);
+    }
 
     if (FAILED(hr) || !resource)
       return 0;
@@ -1515,11 +1672,14 @@ std::size_t HeliosDxvkDevice::create_ddi_scanout_texture2d(
 
   try {
     {
-      char msg[192];
-      std::snprintf(msg, sizeof(msg),
-        "CreateDdiScanoutTexture2D begin %ux%u fmt=%u bind=0x%08x misc=0x%08x",
-        width, height, format, bind_flags, misc_flags);
-      umd_log(msg);
+      static std::atomic<std::uint32_t> s_scanBeginLogs{0};
+      if (bridge_log_budget(s_scanBeginLogs, 64, 512)) {
+        char msg[192];
+        std::snprintf(msg, sizeof(msg),
+          "CreateDdiScanoutTexture2D begin %ux%u fmt=%u bind=0x%08x misc=0x%08x",
+          width, height, format, bind_flags, misc_flags);
+        umd_log(msg);
+      }
     }
 
     // Build a plain 2D DEFAULT-usage description. The scan-out primary is a
@@ -1558,18 +1718,29 @@ std::size_t HeliosDxvkDevice::create_ddi_scanout_texture2d(
         __uuidof(ID3D11Resource),
         reinterpret_cast<void**>(&resource));
     if (FAILED(hr) || !resource) {
-      umd_log("CreateDdiScanoutTexture2D: QI(ID3D11Resource) failed");
+      // Counted, not just logged: `open_ddi_texture2d` has no counter on its
+      // equivalent branch either, and a failing QI here returns a silent zero
+      // that reads exactly like "no primary was asked for".
+      const std::uint32_t n =
+        g_scanoutPrimaryQiFailed.fetch_add(1, std::memory_order_relaxed) + 1;
+      char qimsg[128];
+      std::snprintf(qimsg, sizeof(qimsg),
+        "CreateDdiScanoutTexture2D: QI(ID3D11Resource) failed (x%u)", n);
+      umd_log(qimsg);
       return 0;
     }
 
     const std::uint64_t pitch = (std::uint64_t(width) * 4u + 255u) & ~255ull;
     if (out_row_pitch) *out_row_pitch = pitch;
     if (out_offset)    *out_offset = 0;
-    char msg[192];
-    std::snprintf(msg, sizeof(msg),
-      "CreateDdiScanoutTexture2D OPTIMAL %ux%u fmt=%u logicalPitch=%llu resource=%p",
-      width, height, format, static_cast<unsigned long long>(pitch), resource);
-    umd_log(msg);
+    static std::atomic<std::uint32_t> s_scanDoneLogs{0};
+    if (bridge_log_budget(s_scanDoneLogs, 64, 512)) {
+      char msg[192];
+      std::snprintf(msg, sizeof(msg),
+        "CreateDdiScanoutTexture2D OPTIMAL %ux%u fmt=%u logicalPitch=%llu resource=%p",
+        width, height, format, static_cast<unsigned long long>(pitch), resource);
+      umd_log(msg);
+    }
     return reinterpret_cast<std::size_t>(resource);
   } catch (const dxvk::DxvkError& e) {
     umd_log(("CreateDdiScanoutTexture2D DxvkError: " + e.message()).c_str());
@@ -1670,7 +1841,13 @@ std::size_t HeliosDxvkDevice::create_shader_sig(
     return 0;
   const std::uint32_t n_in = sig_words[0];
   const std::uint32_t n_out = sig_words[1];
-  if (sig_words_len != 2 + std::size_t(n_in + n_out) * kSigEntryWords) {
+  if (!signature_count_ok("create_shader_sig", n_in) ||
+      !signature_count_ok("create_shader_sig", n_out))
+    return 0;
+  // Widen BEFORE adding: `n_in + n_out` was evaluated in std::uint32_t and only
+  // then promoted, so a wrapped sum could satisfy the check the indexing below
+  // depends on.
+  if (sig_words_len != 2 + (std::size_t(n_in) + std::size_t(n_out)) * kSigEntryWords) {
     umd_log("create_shader_sig: signature word count mismatch");
     return 0;
   }
@@ -1729,7 +1906,12 @@ std::size_t HeliosDxvkDevice::create_tess_shader_sig(
   const std::uint32_t n_in = sig_words[0];
   const std::uint32_t n_out = sig_words[1];
   const std::uint32_t n_patch = sig_words[2];
-  if (sig_words_len != 3 + std::size_t(n_in + n_out + n_patch) * kSigEntryWords) {
+  if (!signature_count_ok("create_tess_shader_sig", n_in) ||
+      !signature_count_ok("create_tess_shader_sig", n_out) ||
+      !signature_count_ok("create_tess_shader_sig", n_patch))
+    return 0;
+  if (sig_words_len !=
+      3 + (std::size_t(n_in) + std::size_t(n_out) + std::size_t(n_patch)) * kSigEntryWords) {
     umd_log("create_tess_shader_sig: signature word count mismatch");
     return 0;
   }
@@ -1889,22 +2071,45 @@ bool HeliosDxvkDevice::rotate_resource_backings(
         auto* res = reinterpret_cast<ID3D11Resource*>(d3d11_resource_ptrs[s]);
         ID3D11Texture2D* tex = nullptr;
         if (FAILED(res->QueryInterface(__uuidof(ID3D11Texture2D),
-                                       reinterpret_cast<void**>(&tex))))
+                                       reinterpret_cast<void**>(&tex)))) {
+          char skipmsg[128];
+          std::snprintf(skipmsg, sizeof(skipmsg),
+                        "rotate-sample: slot=%zu/%zu SKIPPED (not a Texture2D)", s, count);
+          umd_log(skipmsg);
           continue;
+        }
         D3D11_TEXTURE2D_DESC td = {};
         tex->GetDesc(&td);
+        // The old code forced MipLevels/ArraySize to 1 on the staging desc while
+        // copying from the real one. With ArraySize > 1 the descriptions
+        // mismatch, CopyResource is a silent no-op, and the tool reports
+        // nonzero=0/N — the exact false conclusion ("the composition draws write
+        // nothing") it exists to test for. And the rows below are read as
+        // std::uint32_t, i.e. 32bpp is assumed: against a 16bpp ring the 4-byte
+        // column stride reads past the last row, which is an OOB read, not
+        // merely a wrong number. Skip and SAY SO instead.
+        if (td.MipLevels != 1 || td.ArraySize != 1 || !is_32bpp_dxgi_format(td.Format)) {
+          char skipmsg[192];
+          std::snprintf(skipmsg, sizeof(skipmsg),
+                        "rotate-sample: slot=%zu/%zu SKIPPED (mips=%u array=%u fmt=%u — "
+                        "needs a single-subresource 32bpp texture)",
+                        s, count, td.MipLevels, td.ArraySize,
+                        static_cast<unsigned>(td.Format));
+          umd_log(skipmsg);
+          tex->Release();
+          continue;
+        }
         D3D11_TEXTURE2D_DESC sd = td;
         sd.BindFlags = 0;
         sd.MiscFlags = 0;
         sd.Usage = D3D11_USAGE_STAGING;
         sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-        sd.MipLevels = 1;
-        sd.ArraySize = 1;
         ID3D11Texture2D* staging = nullptr;
         if (SUCCEEDED(impl->d3d11->CreateTexture2D(&sd, nullptr, &staging)) && staging) {
           impl->context->CopyResource(staging, tex);
           D3D11_MAPPED_SUBRESOURCE map = {};
-          if (SUCCEEDED(impl->context->Map(staging, 0, D3D11_MAP_READ, 0, &map))) {
+          if (SUCCEEDED(impl->context->Map(staging, 0, D3D11_MAP_READ, 0, &map)) &&
+              map.pData != nullptr) {
             const auto* base = static_cast<const std::uint8_t*>(map.pData);
             std::uint32_t nonzero = 0, samples = 0;
             for (UINT y = 0; y < td.Height; y += 64) {
@@ -1922,8 +2127,20 @@ bool HeliosDxvkDevice::rotate_resource_backings(
                               base + std::size_t(td.Height / 2) * map.RowPitch)[td.Width / 2]);
             umd_log(msg);
             impl->context->Unmap(staging, 0);
+          } else {
+            char skipmsg[128];
+            std::snprintf(skipmsg, sizeof(skipmsg),
+                          "rotate-sample: slot=%zu/%zu SKIPPED (staging Map returned no data)",
+                          s, count);
+            umd_log(skipmsg);
           }
           staging->Release();
+        } else {
+          char skipmsg[128];
+          std::snprintf(skipmsg, sizeof(skipmsg),
+                        "rotate-sample: slot=%zu/%zu SKIPPED (staging CreateTexture2D failed)",
+                        s, count);
+          umd_log(skipmsg);
         }
         tex->Release();
       }
@@ -2270,7 +2487,10 @@ bool HeliosDxvkDevice::present_flip_wait_setup(
         std::this_thread::sleep_for(std::chrono::milliseconds(250));
         const std::uint64_t queued =
           ctx->queuedValue.load(std::memory_order_relaxed);
-        const std::uint64_t current = *ctx->cpuVa;
+        const auto observed = ctx->readFenceValue();
+        if (!observed)
+          break;  // device torn down: the mapping is no longer ours to read
+        const std::uint64_t current = *observed;
         if (queued > current && current == lastSeen) {
           if (++stalledTicks >= 4) {
             const std::uint32_t n =
@@ -2471,12 +2691,17 @@ std::unique_ptr<HeliosDxvkDevice> helios_dxvk_create_device(
 
     // Instantiate DXVK's full D3D11 COM device from the DxvkDevice. The DDI
     // device-funcs forward to this ID3D11Device / its immediate context.
-    HeliosStubAdapter* stubAdapter = new HeliosStubAdapter();
+    // `new HeliosStubAdapter()` starts at refcount 1 and is only released AFTER
+    // the D3D11DXGIDevice constructor returns — but that constructor builds the
+    // D3D11 device and its immediate context and can throw dxvk::DxvkError, in
+    // which case the catch below returns nullptr and the Release() never runs.
+    // The guard makes the zero-refcount window exit through exactly one path.
+    ComRelease<HeliosStubAdapter> stubAdapter(new HeliosStubAdapter());
     auto* dxgiDevice = new dxvk::D3D11DXGIDevice(
-        stubAdapter, nullptr, nullptr,
+        stubAdapter.get(), nullptr, nullptr,
         d.instance, d.adapter, d.device,
         D3D_FEATURE_LEVEL_11_0, 0);
-    stubAdapter->Release(); // dxgiDevice holds its own ref now
+    stubAdapter.reset(); // dxgiDevice holds its own ref now
 
     HRESULT hr = dxgiDevice->QueryInterface(__uuidof(ID3D11Device),
                                             reinterpret_cast<void**>(&d.d3d11));
