@@ -17,7 +17,7 @@ The next workstream is a behavior-preserving quality refactor of
 
 ## Frozen baseline
 
-- KMD `22.22.142.0` is active.
+- KMD `22.22.176.0` is active.
 - DWM renders directly into the exact Windows-designated OPTIMAL primary; there
   is no guest primary-to-scanout copy.
 - KMD refresh markers capture a Venus wire-fence watermark under the
@@ -26,8 +26,6 @@ The next workstream is a behavior-preserving quality refactor of
   variable-backed 10 ms frame-completion gate. This is not a polling `Sleep`
   loop: normal completion wakes immediately and measured steady average was
   about 0.48 ms.
-- QEMU reconstructs the modifier-less OPTIMAL image and reads it back for the
-  display frontend without changing the virtio-gpu protocol ABI.
 - SDL OpenGL on native Wayland and egl-headless plus VNC have visible-output
   verification. GTK/Wayland remains blocked by GDK `eglMakeCurrent` failures.
 - The owner confirmed excellent responsiveness and no fast-cursor ghosting.

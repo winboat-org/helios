@@ -67,15 +67,18 @@ virtio-gpu scanout; IddCx/Looking Glass is no longer the active display path.*
 
 ## Current priorities
 
-1. Run parallel adversarial reviews of `kmd_render` and `umd`. Identify
-   oversized files, mixed responsibilities, duplicate paths, weak invariants,
-   obsolete architecture, and timing-dependent behavior. Record small,
-   dependency-ordered, preferably atomic recommendations in a dedicated review
-   document before changing behavior. Every significant runtime-only invariant
-   must be evaluated for a real static guarantee using ownership, newtypes,
-   exhaustive state, typestate, lifetimes, guards, or proof tokens; wrappers
-   which merely hide the same unchecked cast do not qualify.
-2. Implement the reviewed refactors atomically. Preserve the current direct
+1. **DONE (2026-07-26) — `REFACTOR_REVIEW.md`.** The parallel adversarial review of
+   `kmd_render` and `umd` (including the cxx `dxvk_bridge`) is complete: 300 verified
+   findings, 177 recommendations, eleven dependency-ordered tranches T0–T8, each with
+   its own regression gate. A refute-first verification pass re-opened every cited
+   line and rewrote 185 findings, refuted 3, and settled the high-severity count at
+   26. Three results shape the plan: there are **no unit tests** in either crate, a
+   default deploy ships and measures the **debug** UMD, and many failure breadcrumbs
+   are invisible at the default `DiagLevel`. The review also carries the
+   implicit-ordering register and the static-guarantee catalogue (organised by
+   mechanism, with an explicit *rejected as cosmetic* list).
+2. Implement the reviewed refactors atomically, in tranche order, one recommendation
+   per commit; never fold a `BUG` fix into a structure move. Preserve the current direct
    primary, completion ordering, loud-failure contracts, registry ABI, and
    diagnostic names unless a reviewed change explicitly migrates them. Replace
    arbitrary `Sleep`/poll loops with event, interrupt, fence, or
