@@ -219,6 +219,33 @@ fn env_flag(name: &str) -> bool {
     std::env::var_os(name).is_some()
 }
 
+/// The three present-path debug knobs, read ONCE per process.
+///
+/// Each was an uncached `GetEnvironmentVariableW` plus an `OsString`
+/// allocation on every present: two from the debug hooks and one for
+/// `bOptimizeForComposition`. OBSERVABLE CHANGE, stated deliberately: these
+/// become read-once-per-process, so setting them on a live process no longer
+/// takes effect — they must be set before the process starts, like every
+/// registry knob in `lib.rs`, all of which already use `OnceLock`.
+///
+/// Cost honesty (the review asks for it): three env reads per present against
+/// a 10 ms frame gate is not where the present path spends its time. This is
+/// removing avoidable per-frame work, not a measured win.
+fn present_readback_enabled() -> bool {
+    static VALUE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *VALUE.get_or_init(|| env_flag("HELIOS_PRESENT_READBACK"))
+}
+
+fn present_force_opaque_enabled() -> bool {
+    static VALUE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *VALUE.get_or_init(|| env_flag("HELIOS_PRESENT_FORCE_OPAQUE"))
+}
+
+fn present_optimize_composition_enabled() -> bool {
+    static VALUE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *VALUE.get_or_init(|| env_flag("HELIOS_PRESENT_OPTIMIZE_COMPOSITION"))
+}
+
 fn empty_present_private() -> HeliosPresentPrivateData {
     HeliosPresentPrivateData {
         plane_offset: 0,
@@ -3898,8 +3925,19 @@ unsafe fn shader_code_len(code: *const u32) -> usize {
     }
 
     // D3D API bytecode is a DXBC container with the total size at byte offset 24.
+    // Bound it the same way the SHDR arm below is bounded: the dword at offset
+    // 24 is read BEFORE anything is known about the container's real size, and
+    // ten call sites build a `from_raw_parts` slice out of the result. Require
+    // at least the 32-byte container header and at most 1 << 20 dwords.
     if *code == u32::from_le_bytes(*b"DXBC") {
-        return *code.add(6) as usize;
+        let total = *code.add(6) as usize;
+        if total < 32 || total > (1 << 20) * core::mem::size_of::<u32>() {
+            log_line(&format!(
+                "DDI shader_code_len: rejecting DXBC total size {total}"
+            ));
+            return 0;
+        }
+        return total;
     }
 
     // D3D UMD callbacks receive raw SHDR/SHEX token streams. The second DWORD
@@ -7914,6 +7952,12 @@ unsafe fn isgn_lookup(dxbc: &[u8], register: u32) -> Option<(std::ffi::CString, 
             let reg = u32::from_le_bytes(dxbc[ep + 16..ep + 20].try_into().ok()?);
             if reg == register {
                 let nstart = data + name_off;
+                // Every other offset in this function is checked; this one was
+                // not, and `&v[a..a]` with `a > len` is out of bounds in Rust —
+                // a panic in a DDI is a silent graphics deadlock.
+                if nstart >= dxbc.len() {
+                    return None;
+                }
                 let mut nend = nstart;
                 while nend < dxbc.len() && dxbc[nend] != 0 {
                     nend += 1;
@@ -7926,6 +7970,18 @@ unsafe fn isgn_lookup(dxbc: &[u8], register: u32) -> Option<(std::ffi::CString, 
     }
     None
 }
+
+// R423 note: the review asks for a host-target unit test asserting that
+// `isgn_lookup` returns None (rather than panicking) for a `name_off` past the
+// chunk. It is not addable in T2: this crate is `crate-type = ["cdylib"]`, so
+// `cargo test` has no lib target, and adding `rlib` is not enough — the test
+// harness then fails to link because build.rs passes the DXVK static archives
+// through `cargo:rustc-link-arg-cdylib`, and this cargo rejects
+// `rustc-link-arg-tests` as an invalid instruction. Switching them to a plain
+// `rustc-link-arg` would change the SHIPPING cdylib's link line, which is not a
+// trade worth making for one test. The analogue of T0's host-testable
+// `kmd_logic` crate does not exist for the UMD; creating one is a file-split
+// change and belongs with T8. The bounds check itself is in `isgn_lookup`.
 
 /// Build a minimal DXBC container with a synthetic `ISGN` chunk for the given
 /// input registers, followed by the raw SM4/SM5 token stream (SHDR/SHEX).
@@ -9227,7 +9283,7 @@ unsafe fn dxgi_resource_handle(h: ddi::DXGI_DDI_HRESOURCE) -> ddi::D3D10DDI_HRES
 }
 
 unsafe fn maybe_log_present_readback(h: Hdevice, src_h: ddi::D3D10DDI_HRESOURCE) {
-    if std::env::var_os("HELIOS_PRESENT_READBACK").is_none() {
+    if !present_readback_enabled() {
         return;
     }
     let n = PRESENT_READBACK_LOG_COUNT.next();
@@ -9416,7 +9472,7 @@ unsafe fn write_bgra32_bmp(
 }
 
 unsafe fn maybe_force_present_alpha_opaque(h: Hdevice, src_h: ddi::D3D10DDI_HRESOURCE) {
-    if std::env::var_os("HELIOS_PRESENT_FORCE_OPAQUE").is_none() {
+    if !present_force_opaque_enabled() {
         return;
     }
 
@@ -9980,7 +10036,7 @@ unsafe extern "C" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT) -> i32 {
                 cb.PrivateDriverDataSize = 0;
                 cb.pPrivateDriverData = core::ptr::null_mut();
             }
-            cb.bOptimizeForComposition = if env_flag("HELIOS_PRESENT_OPTIMIZE_COMPOSITION") {
+            cb.bOptimizeForComposition = if present_optimize_composition_enabled() {
                 1
             } else {
                 0
@@ -10092,7 +10148,7 @@ unsafe extern "C" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT) -> i32 {
             dst_alloc,
             copied,
             *(&a.Flags as *const ddi::DXGI_DDI_PRESENT_FLAGS as *const u32),
-            env_flag("HELIOS_PRESENT_OPTIMIZE_COMPOSITION") as u32,
+            present_optimize_composition_enabled() as u32,
             present_hr as u32,
             src_h.pDrvPrivate,
             a.SrcSubResourceIndex,
@@ -10910,7 +10966,7 @@ unsafe extern "C" fn dxgi_present1(arg: *mut ddi::DXGI_DDI_ARG_PRESENT1) -> i32 
             cb.PrivateDriverDataSize = 0;
             cb.pPrivateDriverData = core::ptr::null_mut();
         }
-        cb.bOptimizeForComposition = if env_flag("HELIOS_PRESENT_OPTIMIZE_COMPOSITION") {
+        cb.bOptimizeForComposition = if present_optimize_composition_enabled() {
             1
         } else {
             0
@@ -10955,7 +11011,7 @@ unsafe extern "C" fn dxgi_present1(arg: *mut ddi::DXGI_DDI_ARG_PRESENT1) -> i32 
             present_hr as u32,
             src_alloc,
             dst_alloc,
-            env_flag("HELIOS_PRESENT_OPTIMIZE_COMPOSITION") as u32,
+            present_optimize_composition_enabled() as u32,
             a.pDXGIContext,
             dev_context_for_log(h),
             sync_value
