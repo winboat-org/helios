@@ -4747,12 +4747,18 @@ unsafe extern "C" fn set_render_targets(
     let Some(context) = d3d11_context(h) else {
         return;
     };
+    // The RTV array was dereferenced unconditionally in the same function that
+    // checks `uavs.is_null()` and logs a `uavs_null=` field.
+    let rtv_slice = DdiSlice::new(rtvs, num_views);
     let mut views: Vec<Option<ID3D11RenderTargetView>> = Vec::with_capacity(num_views as usize);
     let mut rt0 = (0, 0, 0, 0, 0);
     let mut rt_nonnull = 0u32;
     let mut rt_missing = 0u32;
     for i in 0..num_views as usize {
-        let p = (*rtvs.add(i)).pDrvPrivate;
+        let p = match rtv_slice.as_ref().and_then(|s| s.get(i)) {
+            Some(handle) => handle.pDrvPrivate,
+            None => core::ptr::null_mut(),
+        };
         if i == 0 {
             rt0 = rtv_info(p);
         }
@@ -4792,32 +4798,34 @@ unsafe extern "C" fn set_render_targets(
     }
     let depth = load_com::<ID3D11DepthStencilView>(dsv.pDrvPrivate).map(|m| (*m).clone());
     if num_uavs != 0 {
+        let uav_slice = DdiSlice::new(uavs, num_uavs);
         let mut uav_views: Vec<Option<ID3D11UnorderedAccessView>> =
             Vec::with_capacity(num_uavs as usize);
         let mut uav_nonnull = 0u32;
         let mut uav_missing = 0u32;
         for i in 0..num_uavs as usize {
-            if uavs.is_null() {
-                uav_views.push(None);
-            } else {
-                let p = (*uavs.add(i)).pDrvPrivate;
-                let view = load_com::<ID3D11UnorderedAccessView>(p).map(|m| (*m).clone());
-                if view.is_some() {
-                    uav_nonnull += 1;
-                } else if !p.is_null() {
-                    uav_missing += 1;
+            uav_views.push(match uav_slice.as_ref().and_then(|s| s.get(i)) {
+                Some(handle) => {
+                    let p = handle.pDrvPrivate;
+                    let view = load_com::<ID3D11UnorderedAccessView>(p).map(|m| (*m).clone());
+                    if view.is_some() {
+                        uav_nonnull += 1;
+                    } else if !p.is_null() {
+                        uav_missing += 1;
+                    }
+                    view
                 }
-                uav_views.push(view);
-            }
+                None => None,
+            });
         }
-        if n < 1024 || uav_missing != 0 || uavs.is_null() {
+        if n < 1024 || uav_missing != 0 || uav_slice.is_none() {
             log_line(&format!(
                 "DDI OMSetRenderTargets UAV summary start={} num={} nonnull={} missing={} uavs_null={} counts_ptr={}",
                 uav_start,
                 num_uavs,
                 uav_nonnull,
                 uav_missing,
-                uavs.is_null(),
+                uav_slice.is_none(),
                 !uav_counts.is_null()
             ));
         }
@@ -5148,14 +5156,19 @@ unsafe extern "C" fn so_set_targets(
     let Some(context) = d3d11_context(h) else {
         return;
     };
-    let mut out: Vec<Option<ID3D11Buffer>> = Vec::with_capacity(num as usize);
-    if !buffers.is_null() {
-        for i in 0..num as usize {
-            let p = (*buffers.add(i)).pDrvPrivate;
-            out.push(load_resource(p).and_then(|r| (*r).cast::<ID3D11Buffer>().ok()));
-        }
-    }
-    context.SOSetTargets(num, Some(out.as_ptr()), Some(offsets));
+    // Was: skip the fill loop for a null array but still pass `num` and
+    // `out.as_ptr()`. `out.len()` was then 0 with `out.capacity() == num`, so
+    // DXVK read `num` uninitialised words as ID3D11Buffer* and AddRef'd them.
+    // `offsets` was passed as `Some(..)` with no null check while every sibling
+    // path checked theirs.
+    let out = collect_slots(DdiSlice::new(buffers, num), num, |handle| {
+        load_resource(handle.pDrvPrivate).and_then(|r| (*r).cast::<ID3D11Buffer>().ok())
+    });
+    context.SOSetTargets(
+        num,
+        Some(out.as_ptr()),
+        if offsets.is_null() { None } else { Some(offsets) },
+    );
 }
 
 // --- Rasterizer / depth-stencil state ---------------------------------------
@@ -5747,32 +5760,34 @@ unsafe extern "C" fn cs_set_uavs(
     let Some(context) = d3d11_context(h) else {
         return;
     };
+    let slice = DdiSlice::new(uavs, num);
     let mut out: Vec<Option<ID3D11UnorderedAccessView>> = Vec::with_capacity(num as usize);
     let mut nonnull = 0u32;
     let mut missing = 0u32;
     for i in 0..num as usize {
-        if uavs.is_null() {
-            out.push(None);
-        } else {
-            let p = (*uavs.add(i)).pDrvPrivate;
-            let view = load_com::<ID3D11UnorderedAccessView>(p).map(|m| (*m).clone());
-            if view.is_some() {
-                nonnull += 1;
-            } else if !p.is_null() {
-                missing += 1;
+        out.push(match slice.as_ref().and_then(|s| s.get(i)) {
+            Some(handle) => {
+                let p = handle.pDrvPrivate;
+                let view = load_com::<ID3D11UnorderedAccessView>(p).map(|m| (*m).clone());
+                if view.is_some() {
+                    nonnull += 1;
+                } else if !p.is_null() {
+                    missing += 1;
+                }
+                view
             }
-            out.push(view);
-        }
+            None => None,
+        });
     }
     let n = UAV_BIND_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-    if n < 1024 || missing != 0 || uavs.is_null() {
+    if n < 1024 || missing != 0 || slice.is_none() {
         log_line(&format!(
             "DDI CSSetUnorderedAccessViews start={} num={} nonnull={} missing={} uavs_null={} counts_ptr={}",
             start,
             num,
             nonnull,
             missing,
-            uavs.is_null(),
+            slice.is_none(),
             !counts.is_null()
         ));
     }
@@ -5842,35 +5857,84 @@ unsafe extern "C" fn destroy_sampler(_h: Hdevice, h_sampler: ddi::D3D10DDI_HSAMP
     release_com(h_sampler.pDrvPrivate);
 }
 
+/// A runtime-supplied DDI handle array, with the null check moved into the type.
+///
+/// Four incompatible conventions for this exact shape used to coexist in this
+/// file: push `None` per slot (correct), skip the fill but still pass `num`
+/// (`so_set_targets` — DXVK then read `num` uninitialised words as COM pointers
+/// and AddRef'd them), dereference unconditionally (`collect_buffers`,
+/// `collect_samplers`, `set_render_targets`'s RTV loop), and early-return a
+/// count (`srv_bind_summary`). `new` is the only constructor and it is the only
+/// place the null test lives, so a call site cannot forget it: the raw pointer
+/// is never in scope again.
+struct DdiSlice<H> {
+    ptr: *const H,
+    len: usize,
+}
+
+impl<H> DdiSlice<H> {
+    /// `None` = the runtime handed us a null array.
+    ///
+    /// SAFETY: the caller asserts the DDI contract that a non-null array really
+    /// has `num` elements. That part is not encodable from the driver side.
+    unsafe fn new(ptr: *const H, num: u32) -> Option<Self> {
+        if ptr.is_null() {
+            None
+        } else {
+            Some(DdiSlice {
+                ptr,
+                len: num as usize,
+            })
+        }
+    }
+
+    /// Panic-free element access: bounds-checked, no indexing, no `unwrap`.
+    ///
+    /// SAFETY: as [`DdiSlice::new`].
+    unsafe fn get(&self, index: usize) -> Option<&H> {
+        if index >= self.len {
+            None
+        } else {
+            Some(&*self.ptr.add(index))
+        }
+    }
+}
+
+/// Decode `num` slots of a runtime handle array. A null array yields `None` for
+/// every slot — that is the one policy: "no bindings", never "read `num`
+/// uninitialised pointers".
+unsafe fn collect_slots<H, T>(
+    slice: Option<DdiSlice<H>>,
+    num: u32,
+    decode: impl Fn(&H) -> Option<T>,
+) -> Vec<Option<T>> {
+    let mut out = Vec::with_capacity(num as usize);
+    for index in 0..num as usize {
+        out.push(match slice.as_ref().and_then(|s| s.get(index)) {
+            Some(handle) => decode(handle),
+            None => None,
+        });
+    }
+    out
+}
+
 unsafe fn collect_buffers(
     start: u32,
     num: u32,
     h: *const ddi::D3D10DDI_HRESOURCE,
 ) -> Vec<Option<ID3D11Buffer>> {
     let _ = start;
-    let mut v = Vec::with_capacity(num as usize);
-    for i in 0..num as usize {
-        let p = (*h.add(i)).pDrvPrivate;
-        v.push(load_resource(p).and_then(|r| (*r).cast::<ID3D11Buffer>().ok()));
-    }
-    v
+    collect_slots(DdiSlice::new(h, num), num, |handle| {
+        load_resource(handle.pDrvPrivate).and_then(|r| (*r).cast::<ID3D11Buffer>().ok())
+    })
 }
 unsafe fn collect_srvs(
     num: u32,
     h: *const ddi::D3D10DDI_HSHADERRESOURCEVIEW,
 ) -> Vec<Option<ID3D11ShaderResourceView>> {
-    let mut v = Vec::with_capacity(num as usize);
-    if h.is_null() {
-        for _ in 0..num as usize {
-            v.push(None);
-        }
-        return v;
-    }
-    for i in 0..num as usize {
-        let p = (*h.add(i)).pDrvPrivate;
-        v.push(load_com::<ID3D11ShaderResourceView>(p).map(|m| (*m).clone()));
-    }
-    v
+    collect_slots(DdiSlice::new(h, num), num, |handle| {
+        load_com::<ID3D11ShaderResourceView>(handle.pDrvPrivate).map(|m| (*m).clone())
+    })
 }
 
 unsafe fn srv_bind_summary(
@@ -5906,12 +5970,9 @@ unsafe fn collect_samplers(
     num: u32,
     h: *const ddi::D3D10DDI_HSAMPLER,
 ) -> Vec<Option<ID3D11SamplerState>> {
-    let mut v = Vec::with_capacity(num as usize);
-    for i in 0..num as usize {
-        let p = (*h.add(i)).pDrvPrivate;
-        v.push(load_com::<ID3D11SamplerState>(p).map(|m| (*m).clone()));
-    }
-    v
+    collect_slots(DdiSlice::new(h, num), num, |handle| {
+        load_com::<ID3D11SamplerState>(handle.pDrvPrivate).map(|m| (*m).clone())
+    })
 }
 
 unsafe extern "C" fn ps_set_constant_buffers(
