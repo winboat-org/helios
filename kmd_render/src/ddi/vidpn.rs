@@ -159,39 +159,86 @@ pub(crate) fn legalize_vidpn(s: NTSTATUS) -> NTSTATUS {
     STATUS_GRAPHICS_INVALID_VIDPN
 }
 
-/// Resolve the OS VidPn interface for `h_vidpn` via `DxgkCbQueryVidPnInterface`.
-/// Returns a raw `*const DXGK_VIDPN_INTERFACE` (borrowed from dxgkrnl, valid for
-/// the duration of the DDI call) or an error NTSTATUS.
+/// The OS VidPn interface for one `h_vidpn`, borrowed for a bounded window.
 ///
-/// # Safety
-/// `adapter.dxgkrnl` must be the live interface saved at StartDevice.
-unsafe fn vidpn_interface(
-    adapter: &AdapterContext,
+/// The interface used to be handed out as a bare `*const DXGK_VIDPN_INTERFACE`
+/// whose validity window — "borrowed from dxgkrnl, valid for the duration of the
+/// DDI call" — was stated only in a doc comment. Nothing stopped it being stored
+/// on the adapter or returned upward, and each of the three callers restated the
+/// assumption in its own SAFETY comment and re-dereferenced with its own
+/// `unsafe { &* }`.
+///
+/// `'a` is derived from a borrow the caller ALREADY holds and which genuinely
+/// cannot outlive the call — the DDI argument struct. It is deliberately NOT
+/// `'static`: making it so to get the code to compile would delete the entire
+/// invariant.
+///
+/// Honest about what this is: a proxy. It prevents the interface reference from
+/// being stored on the adapter or returned upward, and collapses three
+/// `unsafe { &* }` sites into one per acquisition. It does NOT prove dxgkrnl's
+/// own validity window — it substitutes a Rust-checkable proxy for an unprovable
+/// contract.
+pub(crate) struct VidPn<'a> {
+    iface: &'a DXGK_VIDPN_INTERFACE,
     h_vidpn: D3DKMDT_HVIDPN,
-) -> Result<*const DXGK_VIDPN_INTERFACE, NTSTATUS> {
-    let dxgkrnl = adapter
-        .dxgkrnl_opt()
-        .ok_or(STATUS_GRAPHICS_INVALID_VIDPN)?;
-    let query = dxgkrnl
-        .DxgkCbQueryVidPnInterface
-        .ok_or(STATUS_GRAPHICS_INVALID_VIDPN)?;
-    let mut iface: *const DXGK_VIDPN_INTERFACE = null();
-    // SAFETY: PASSIVE-level callback; `iface` is a valid out-pointer.
-    let st = unsafe {
-        query(
+}
+
+impl<'a> VidPn<'a> {
+    /// Resolve the interface via `DxgkCbQueryVidPnInterface`, tying the result's
+    /// lifetime to `witness`.
+    ///
+    /// `witness` is any borrow that cannot outlive the DDI call — normally the
+    /// `&DXGKARG_*` the caller already dereferenced. It is never read; its only
+    /// job is to be the lifetime the returned `VidPn` is parented to.
+    ///
+    /// # Safety
+    /// `h_vidpn` is the handle dxgkrnl supplied to the DDI this call is
+    /// servicing, and `witness` really is bounded by that call.
+    unsafe fn open<W: ?Sized>(
+        adapter: &AdapterContext,
+        h_vidpn: D3DKMDT_HVIDPN,
+        witness: &'a W,
+    ) -> Result<Self, NTSTATUS> {
+        let _ = witness;
+        let dxgkrnl = adapter
+            .dxgkrnl_opt()
+            .ok_or(STATUS_GRAPHICS_INVALID_VIDPN)?;
+        let query = dxgkrnl
+            .DxgkCbQueryVidPnInterface
+            .ok_or(STATUS_GRAPHICS_INVALID_VIDPN)?;
+        let mut iface: *const DXGK_VIDPN_INTERFACE = null();
+        // SAFETY: PASSIVE-level callback; `iface` is a valid out-pointer.
+        let st = unsafe {
+            query(
+                h_vidpn,
+                _DXGK_VIDPN_INTERFACE_VERSION::DXGK_VIDPN_INTERFACE_VERSION_V1,
+                &mut iface,
+            )
+        };
+        if !ok(st) || iface.is_null() {
+            return Err(if ok(st) {
+                STATUS_GRAPHICS_INVALID_VIDPN
+            } else {
+                st
+            });
+        }
+        // The ONE conversion of the dxgkrnl out-pointer to a reference, checked
+        // non-null above. Every caller now reads the callbacks as safe field
+        // accesses on this reference.
+        // SAFETY: non-null and valid for the call per the DDI contract.
+        Ok(Self {
+            iface: unsafe { &*iface },
             h_vidpn,
-            _DXGK_VIDPN_INTERFACE_VERSION::DXGK_VIDPN_INTERFACE_VERSION_V1,
-            &mut iface,
-        )
-    };
-    if !ok(st) || iface.is_null() {
-        return Err(if ok(st) {
-            STATUS_GRAPHICS_INVALID_VIDPN
-        } else {
-            st
-        });
+        })
     }
-    Ok(iface)
+
+    fn iface(&self) -> &'a DXGK_VIDPN_INTERFACE {
+        self.iface
+    }
+
+    fn handle(&self) -> D3DKMDT_HVIDPN {
+        self.h_vidpn
+    }
 }
 
 /// Build a fully-specified 1080p60 progressive video signal (source and target
@@ -726,16 +773,18 @@ pub unsafe fn enum_cofunc_modality(
     let (mode_w, mode_h) = adapter.display_mode();
 
     // Resolve the VidPn + topology interfaces (nothing held yet → early return).
-    let vidpn = match unsafe { vidpn_interface(adapter, h_vidpn) } {
-        Ok(p) => p,
+    // The borrow that bounds the interface: the DDI argument struct, which
+    // dxgkrnl owns for exactly the duration of this call.
+    // SAFETY: `h_vidpn` came from `a`, and `a` is bounded by this call.
+    let vidpn = match unsafe { VidPn::open(adapter, h_vidpn, a) } {
+        Ok(v) => v,
         Err(e) => {
             rec(b"VpECe", e as u32);
             rec(b"VpECf", CofuncStage::VidPnInterface.code());
             return legalize_vidpn(e);
         }
     };
-    // SAFETY: valid for the call.
-    let vidpn = unsafe { &*vidpn };
+    let vidpn = vidpn.iface();
     let Some(get_topology) = vidpn.pfnGetTopology else {
         return STATUS_GRAPHICS_INVALID_VIDPN;
     };
@@ -1046,11 +1095,17 @@ pub unsafe fn topology_path_count(adapter: &AdapterContext, h_vidpn: D3DKMDT_HVI
     if h_vidpn.is_null() {
         return 0;
     }
-    let Ok(vidpn) = (unsafe { vidpn_interface(adapter, h_vidpn) }) else {
+    // This DDI has no argument struct to borrow, so the interface is parented
+    // to the caller's `&AdapterContext` instead. That is the WEAKER of the two
+    // proxies — the adapter outlives the call, so the lifetime does not bound
+    // the interface as tightly as the argument-struct borrow does elsewhere. It
+    // still prevents storing the reference beyond this function, which is the
+    // hazard the item exists for. Stated rather than glossed.
+    // SAFETY: `h_vidpn` is valid for the call per the DDI contract.
+    let Ok(vidpn) = (unsafe { VidPn::open(adapter, h_vidpn, adapter) }) else {
         return u32::MAX;
     };
-    // SAFETY: valid for the call.
-    let vidpn = unsafe { &*vidpn };
+    let vidpn = vidpn.iface();
     let Some(get_topo) = vidpn.pfnGetTopology else {
         return u32::MAX;
     };
@@ -1100,16 +1155,17 @@ pub unsafe fn commit_vidpn(adapter: &AdapterContext, arg: *const DXGKARG_COMMITV
     let h_vidpn = a.hFunctionalVidPn;
     let source_id = a.AffectedVidPnSourceId;
 
-    let vidpn = match unsafe { vidpn_interface(adapter, h_vidpn) } {
-        Ok(p) => p,
+    // SAFETY: `h_vidpn` came from `a`, and `a` is bounded by this call.
+    let vidpn = match unsafe { VidPn::open(adapter, h_vidpn, a) } {
+        Ok(v) => v,
         // Malformed handle: accept the commit but record we couldn't inspect it.
         Err(_) => {
             rec(b"VpCP", 0xE);
             return STATUS_SUCCESS;
         }
     };
-    // SAFETY: valid for the call.
-    let vidpn = unsafe { &*vidpn };
+    let h_vidpn = vidpn.handle();
+    let vidpn = vidpn.iface();
 
     // Path count (diagnostic only).
     if let (Some(get_topo), Some(_)) = (vidpn.pfnGetTopology, vidpn.pfnAcquireSourceModeSet) {
