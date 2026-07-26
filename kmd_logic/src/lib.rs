@@ -193,6 +193,32 @@ pub const fn seq_read(before: u32, after: u32) -> SeqRead {
 /// escape thread could hold the CPU while the publisher is descheduled.
 pub const SEQ_READ_ATTEMPTS: u32 = 8;
 
+/// Pack the VidPn programming gate: generation in the high 32 bits, the active
+/// flag in the low 32.
+///
+/// The gate used to be a bare `AtomicU32` flag, so nothing identified WHICH
+/// programming interval a completion belonged to. Because the DIRQL half of
+/// `SetVidPnSourceAddress` takes no lock, a second call can raise the gate for
+/// interval N+1 while copy N is still outstanding; copy N's completion then
+/// cleared the gate belonging to N+1. Pairing the flag with its generation in
+/// ONE word makes raise and "clear only my interval" single atomic operations.
+///
+/// The low half keeps the exact 0/1 meaning the flag had, so every existing
+/// breadcrumb that reports the gate still reports 0 or 1.
+pub const fn gate_pack(seq: u32, active: bool) -> u64 {
+    ((seq as u64) << 32) | (active as u64)
+}
+
+/// The generation half of a packed gate word.
+pub const fn gate_seq(word: u64) -> u32 {
+    (word >> 32) as u32
+}
+
+/// The active half of a packed gate word — what the VSync DPC tests.
+pub const fn gate_active(word: u64) -> bool {
+    (word & 0xFFFF_FFFF) != 0
+}
+
 /// The scan-out surface formats Helios can put on virtio-gpu scanout 0.
 ///
 /// This is the one place the DXGI-to-wire mapping is written down. It used to be
@@ -536,5 +562,56 @@ mod tests {
         );
         assert_eq!(ScanoutFormat::from_dxgi(0), None);
         assert_eq!(ScanoutFormat::Bgrx8.dxgi(), 88);
+    }
+
+    #[test]
+    fn gate_pack_round_trips_and_keeps_the_flag_in_the_low_half() {
+        for seq in [0u32, 1, 2, 0x7FFF_FFFF, 0x8000_0000, u32::MAX] {
+            for active in [false, true] {
+                let word = gate_pack(seq, active);
+                assert_eq!(gate_seq(word), seq, "seq lost for {seq}/{active}");
+                assert_eq!(gate_active(word), active, "flag lost for {seq}/{active}");
+            }
+        }
+        // A fresh adapter (word 0) is generation 0, inactive — the same "no
+        // programming outstanding" answer the bare AtomicU32 flag gave.
+        assert_eq!(gate_pack(0, false), 0);
+        assert!(!gate_active(0));
+        // The VSync DPC tests only the low half, so a raised gate at ANY
+        // generation reads active. This is the check that would fail if a reader
+        // were left comparing the packed word against 0/1.
+        assert!(gate_active(gate_pack(12345, true)));
+        // ...and a CLEARED gate at a nonzero generation must read inactive even
+        // though the word itself is nonzero. A missed reader here would suppress
+        // VSync forever.
+        assert!(!gate_active(gate_pack(12345, false)));
+        assert_ne!(gate_pack(12345, false), 0);
+    }
+
+    /// The three transitions the gate's correctness rests on, as the
+    /// compare-exchange operands the driver actually uses.
+    #[test]
+    fn gate_transitions_reject_a_stale_clear() {
+        // Raise N -> N+1, active.
+        let empty = gate_pack(0, false);
+        let n1 = gate_pack(gate_seq(empty).wrapping_add(1), true);
+        assert_eq!(n1, gate_pack(1, true));
+
+        // The owner of interval 1 clears it: CAS (1,true) -> (1,false) matches.
+        assert_eq!(n1, gate_pack(1, true));
+
+        // A SECOND raise lands first, making the gate interval 2.
+        let n2 = gate_pack(gate_seq(n1).wrapping_add(1), true);
+        assert_eq!(n2, gate_pack(2, true));
+
+        // Interval 1's completion now tries its clear. Its expected operand no
+        // longer matches the live word, so the CAS fails and the gate stays
+        // raised for interval 2 — which is the whole point.
+        assert_ne!(n2, gate_pack(1, true));
+
+        // Generation wrap must not alias a live interval with a stale one.
+        let wrapped = gate_pack(u32::MAX, true);
+        assert_eq!(gate_seq(wrapped).wrapping_add(1), 0);
+        assert_ne!(gate_pack(0, true), wrapped);
     }
 }

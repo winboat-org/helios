@@ -330,7 +330,10 @@ pub struct AdapterContext {
     /// primary again during this interval: dxgkrnl treats that notification as
     /// the display engine's authoritative completion state and can retire the
     /// newly queued flip before its PASSIVE host bind/copy finishes.
-    pub vidpn_programming: AtomicU32,
+    /// Packed as `(seq << 32) | active` — see [`gate_pack`]. Widened from a bare
+    /// flag by R509 so "raise" and "clear only MY interval" are single atomic
+    /// operations rather than two independent stores.
+    pub vidpn_programming: AtomicU64,
     /// Active virtio scanout-0 blob selected by the display half. The PASSIVE
     /// display worker flushes it only after a completed primary-to-LINEAR GPU
     /// copy marks scanout dirty.
@@ -551,6 +554,40 @@ impl ScanoutGuard<'_> {
     }
 }
 
+/// Identity of ONE programming interval.
+///
+/// The generation half of the packed `vidpn_programming` word. Nothing used to
+/// identify which interval a completion belonged to: because the DIRQL half
+/// takes no lock, a second `SetVidPnSourceAddress` can raise the gate for
+/// interval N+1 while copy N is still outstanding, and copy N's completion then
+/// cleared the gate belonging to N+1 — after which the next CRTC_VSYNC reports
+/// addr(N) although N+1's programming has not run. Stated precisely: addr(N) is
+/// truthful for what the host is scanning out, so dxgkrnl retires N rather than
+/// the wrong flip; what breaks is the gate's no-stale-report contract, and one
+/// flip's completion is signalled early relative to the newer queued flip.
+/// The field is private and there is no public constructor: a ticket can only
+/// come from [`AdapterContext::raise_programming_gate`] or be copied from one
+/// that did, so a clear cannot be performed against a made-up generation.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProgrammingTicket(u32);
+
+// The pack/unpack rules live in `helios_kmd_logic` — pure functions of their
+// arguments, so they carry host unit tests for the transitions this gate's
+// correctness depends on.
+pub(crate) use helios_kmd_logic::{gate_active, gate_pack, gate_seq};
+
+/// Bound on the DIRQL raise's CAS loop. A CAS loop is legal at DIRQL — bounded,
+/// no allocation, no callbacks — but only if it is genuinely bounded.
+const GATE_RAISE_CAS_ATTEMPTS: u32 = 8;
+
+/// A completion or drop tried to clear a gate that is no longer its own
+/// interval's (diag `ScStale`). Must read 0 on a normal boot: it proves the
+/// DIRQL/PASSIVE interleave does not occur today.
+pub(crate) static GATE_STALE_CLEARS: AtomicU32 = AtomicU32::new(0);
+/// The DIRQL raise exhausted its bounded CAS budget and published
+/// unconditionally (diag `ScGateCx`).
+pub(crate) static GATE_RAISE_CAS_GIVEUPS: AtomicU32 = AtomicU32::new(0);
+
 /// Ownership of one raised `vidpn_programming` interval.
 ///
 /// The gate is raised at exactly one place — the DIRQL half of
@@ -572,18 +609,37 @@ impl ScanoutGuard<'_> {
 /// hand-off in `retire_scanout_allocation_locked` (`VpCncl`).
 #[must_use]
 pub(crate) struct ProgrammingInterval<'a> {
-    gate: &'a AtomicU32,
+    gate: &'a AtomicU64,
+    /// The generation this interval owns. Its drop clears ONLY this one.
+    ticket: ProgrammingTicket,
     /// Makes the interval `!Send`: it is lowered on the thread that adopted it.
     _not_send: PhantomData<*const ()>,
 }
 
 impl<'a> ProgrammingInterval<'a> {
-    /// Take ownership of the already-raised gate for the duration of this scope.
-    pub(crate) fn adopt(gate: &'a AtomicU32) -> Self {
+    /// Take ownership of the already-raised gate for the duration of this scope,
+    /// capturing the generation it currently carries.
+    ///
+    /// Honest residual: the DIRQL half takes no lock, so a raise for a NEWER
+    /// primary can land between the worker's `pending` swap and this adopt. The
+    /// interval then holds the newer ticket while programming the older handle,
+    /// and its drop clears the newer generation. That window is inherent to the
+    /// DIRQL/PASSIVE split and is NOT what this ticket closes — what it closes is
+    /// the COMPLETION side, where a copy's DPC used to clear whatever gate it
+    /// found. The DPC now carries the ticket captured here, by value, so a stale
+    /// completion fails its CAS and counts instead of clobbering.
+    pub(crate) fn adopt(gate: &'a AtomicU64) -> Self {
+        let ticket = ProgrammingTicket(gate_seq(gate.load(Ordering::Acquire)));
         Self {
             gate,
+            ticket,
             _not_send: PhantomData,
         }
+    }
+
+    /// The generation this interval owns, for handing to the completion DPC.
+    pub(crate) fn ticket(&self) -> ProgrammingTicket {
+        self.ticket
     }
 
     /// Hand the interval to the ring-1 GPU-completion DPC, which clears the gate
@@ -641,8 +697,36 @@ impl Drop for ProgrammingInterval<'_> {
         // Release, and last: every arm records its diag breadcrumb before this
         // runs, and the same-resource success arm stores `last_primary_address`
         // first. Drop-at-end-of-scope preserves both orders.
-        self.gate.store(0, Ordering::Release);
+        //
+        // Ticketed: clears MY generation or nothing. A newer DIRQL raise means
+        // the gate is no longer mine to lower, and lowering it would let a
+        // CRTC_VSYNC report a primary whose programming has not run.
+        clear_programming_gate(self.gate, self.ticket);
     }
+}
+
+/// Clear the gate iff it still carries `ticket`'s generation and is active.
+///
+/// Returns true if this call did the clearing. A mismatch increments `ScStale`
+/// rather than silently clobbering — the ticket is a value, so a stale ticket is
+/// *detectable* rather than impossible, and that is the honest limit of the
+/// encoding.
+///
+/// Safe at any IRQL: one `compare_exchange` on an `AtomicU64` (lock-free on x64),
+/// no allocation, no callbacks.
+pub(crate) fn clear_programming_gate(gate: &AtomicU64, ticket: ProgrammingTicket) -> bool {
+    let cleared = gate
+        .compare_exchange(
+            gate_pack(ticket.0, true),
+            gate_pack(ticket.0, false),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_ok();
+    if !cleared {
+        GATE_STALE_CLEARS.fetch_add(1, Ordering::Relaxed);
+    }
+    cleared
 }
 
 /// Outcome of trying to queue one coalesced scanout refresh.
@@ -715,7 +799,7 @@ impl AdapterContext {
             scanout_flush_inflight: AtomicU32::new(0),
             vsync_armed: AtomicU32::new(0),
             pending_vidpn_allocation: AtomicUsize::new(0),
-            vidpn_programming: AtomicU32::new(0),
+            vidpn_programming: AtomicU64::new(0),
             display_w: 0,
             display_h: 0,
             edid: [0u8; 128],
@@ -764,7 +848,9 @@ impl AdapterContext {
         // Capture before zeroing: a nonzero pre-reset gate is the evidence that
         // sequence 1 above was live, and the pre-reset resource id identifies
         // the generation being abandoned.
-        let was_programming = self.vidpn_programming.load(Ordering::Acquire);
+        // Report the ACTIVE FLAG, not the packed word, so `StRst` keeps the
+        // exact 0/1 value it has always had (R509 widened the field).
+        let was_programming = gate_active(self.vidpn_programming.load(Ordering::Acquire)) as u32;
         let was_resource = self.active_scanout_resource.load(Ordering::Acquire);
 
         self.vidpn_programming.store(0, Ordering::Release);
@@ -965,6 +1051,67 @@ impl AdapterContext {
         }
     }
 
+    /// Raise the programming gate for a NEW interval and return its ticket.
+    ///
+    /// Runs at DIRQL. A bounded CAS loop is legal there — no allocation, no
+    /// callbacks, and `GATE_RAISE_CAS_ATTEMPTS` caps the spin. Incrementing the
+    /// generation and setting the active flag in ONE publication is the point:
+    /// as two independent stores there was no way for a completion to tell which
+    /// interval it belonged to.
+    pub(crate) fn raise_programming_gate(&self) -> ProgrammingTicket {
+        let mut current = self.vidpn_programming.load(Ordering::Acquire);
+        for _ in 0..GATE_RAISE_CAS_ATTEMPTS {
+            let seq = gate_seq(current).wrapping_add(1);
+            match self.vidpn_programming.compare_exchange_weak(
+                current,
+                gate_pack(seq, true),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return ProgrammingTicket(seq),
+                Err(observed) => current = observed,
+            }
+        }
+        // Budget exhausted. Publish unconditionally — that is exactly what the
+        // pre-R509 bare `store(1)` did on every call — and count it, because a
+        // contended raise means some other agent is racing the gate.
+        let seq = gate_seq(current).wrapping_add(1);
+        self.vidpn_programming
+            .store(gate_pack(seq, true), Ordering::Release);
+        GATE_RAISE_CAS_GIVEUPS.fetch_add(1, Ordering::Relaxed);
+        ProgrammingTicket(seq)
+    }
+
+    /// Whether a programming interval is currently outstanding.
+    ///
+    /// The VSync DPC's gate: while this is true it must not report
+    /// `last_primary_address`, because a newer primary is mid-programming.
+    pub(crate) fn programming_active(&self) -> bool {
+        gate_active(self.vidpn_programming.load(Ordering::Acquire))
+    }
+
+    /// Clear whichever interval is currently active, whoever owns it.
+    ///
+    /// This is the DestroyAllocation cancel path: it is not clearing its OWN
+    /// interval, it is abandoning someone else's because the allocation that
+    /// interval names is being destroyed. Semantics are exactly the pre-R509
+    /// `compare_exchange(1, 0)`: only clear a gate we OBSERVED set, and fail if
+    /// it changed under us.
+    pub(crate) fn cancel_programming_gate(&self) -> bool {
+        let current = self.vidpn_programming.load(Ordering::Acquire);
+        if !gate_active(current) {
+            return false;
+        }
+        self.vidpn_programming
+            .compare_exchange(
+                current,
+                gate_pack(gate_seq(current), false),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
     /// Mint the notification target for one scan-out copy.
     ///
     /// Deliberately NOT a `#[repr(C)] ScanoutNotifyBlock` embedded in the
@@ -973,8 +1120,12 @@ impl AdapterContext {
     /// nesting them would turn a transport-API fix into a crate-wide rename.
     /// One construction site buys the same same-adapter guarantee at a fraction
     /// of the blast radius.
-    pub(crate) fn scanout_notify(&self, primary_address: u64) -> crate::virtio::ScanoutNotify {
-        crate::virtio::ScanoutNotify::for_adapter(self, primary_address)
+    pub(crate) fn scanout_notify(
+        &self,
+        primary_address: u64,
+        ticket: ProgrammingTicket,
+    ) -> crate::virtio::ScanoutNotify {
+        crate::virtio::ScanoutNotify::for_adapter(self, primary_address, ticket)
     }
 
     /// Publish the address the CRTC_VSYNC packet reports as the display
@@ -1554,10 +1705,7 @@ impl AdapterContext {
             // window that would let the VSync DPC report a primary address
             // the host has not sampled yet.
             if self.pending_vidpn_allocation.load(Ordering::Acquire) == 0
-                && self
-                    .vidpn_programming
-                    .compare_exchange(1, 0, Ordering::AcqRel, Ordering::Acquire)
-                    .is_ok()
+                && self.cancel_programming_gate()
             {
                 crate::diag::record_named_bytes(b"VpCncl", allocation_handle as u32);
             }

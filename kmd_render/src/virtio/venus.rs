@@ -3781,6 +3781,7 @@ impl VenusClient {
         adapter: &AdapterContext,
         copy: &PreparedImageCopy,
         primary_address: u64,
+        ticket: crate::adapter::ProgrammingTicket,
     ) -> Result<u64, VirtioError> {
         if copy.command_buffer_id == 0
             || copy.source_image_id == 0
@@ -3810,7 +3811,13 @@ impl VenusClient {
         submit.u32(0); // signalSemaphoreCount
         submit.count(false); // pSignalSemaphores
         submit.u64(0); // fence
-        ctrl::submit_venus_async_scanout(adapter, self.ctx_id, submit.as_slice(), primary_address)
+        ctrl::submit_venus_async_scanout(
+            adapter,
+            self.ctx_id,
+            submit.as_slice(),
+            primary_address,
+            ticket,
+        )
     }
 
     fn encode_command_buffer_submit(&self, command_buffer_id: u64) -> Writer {

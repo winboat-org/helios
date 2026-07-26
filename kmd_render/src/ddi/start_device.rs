@@ -367,7 +367,7 @@ pub unsafe extern "C" fn vsync_dpc_routine(
     // PASSIVE_LEVEL. Do not send another VSync carrying the old address while
     // that display-engine operation is outstanding; the next notification must
     // describe the primary that is actually programmed.
-    if adapter.vidpn_programming.load(Ordering::Acquire) != 0 {
+    if adapter.programming_active() {
         if adapter.pending_vidpn_allocation.load(Ordering::Acquire) != 0 {
             adapter.signal_hpd();
         }

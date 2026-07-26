@@ -663,9 +663,16 @@ pub struct ScanoutNotify {
     /// Address of the Windows primary whose compatibility copy this submission
     /// performs. Published as displayed only on successful GPU completion.
     displayed_primary: NonNull<AtomicU64>,
-    /// Exact SetVidPnSourceAddress programming gate. Cleared after the copy
-    /// succeeds or fails so VSync can resume with authoritative state.
-    programming: NonNull<AtomicU32>,
+    /// Exact SetVidPnSourceAddress programming gate, packed `(seq << 32) | active`.
+    /// Cleared after the copy succeeds or fails so VSync can resume with
+    /// authoritative state — but only for THIS submission's interval, named by
+    /// `ticket`.
+    programming: NonNull<AtomicU64>,
+    /// The programming generation this submission belongs to, carried BY VALUE
+    /// rather than only as a pointer to the gate. A completion that arrives
+    /// after a newer interval was raised fails its compare-exchange and counts
+    /// `ScStale` instead of clearing a gate that is not its own.
+    ticket: crate::adapter::ProgrammingTicket,
     primary_address: u64,
     event: NonNull<KEVENT>,
 }
@@ -676,11 +683,13 @@ impl ScanoutNotify {
     pub(crate) fn for_adapter(
         adapter: &crate::adapter::AdapterContext,
         primary_address: u64,
+        ticket: crate::adapter::ProgrammingTicket,
     ) -> Self {
         Self {
             pending: NonNull::from(&adapter.scanout_refresh_pending),
             displayed_primary: NonNull::from(&adapter.last_primary_address),
             programming: NonNull::from(&adapter.vidpn_programming),
+            ticket,
             primary_address,
             // SAFETY: hpd_event is embedded in the stable adapter and
             // initialized by init_kernel_events before StartDevice creates any
@@ -1581,11 +1590,16 @@ impl VirtioGpu {
                     if let Some(notify) = scanout_notify {
                         // Publish nothing as displayed - the copy did not happen -
                         // but DO clear the programming gate, or the VSync
-                        // heartbeat stops exactly as in R202.
+                        // heartbeat stops exactly as in R202. Ticketed: if a
+                        // newer interval was raised meanwhile, that gate is not
+                        // ours to lower.
                         // SAFETY: stable AdapterContext fields; the adapter owns
                         // this transport and outlives every in-flight entry.
                         unsafe {
-                            notify.programming.as_ref().store(0, Ordering::Release);
+                            crate::adapter::clear_programming_gate(
+                                notify.programming.as_ref(),
+                                notify.ticket,
+                            );
                             KeSetEvent(notify.event.as_ptr(), IO_NO_INCREMENT, 0);
                         }
                     }
@@ -1778,7 +1792,17 @@ impl VirtioGpu {
                                         .store(notify.primary_address, Ordering::Release);
                                     notify.pending.as_ref().store(1, Ordering::Release);
                                 }
-                                notify.programming.as_ref().store(0, Ordering::Release);
+                                // Ticketed clear, unconditional on response_ok
+                                // exactly as before: a failed copy must still
+                                // release OUR interval or VSync stops. What it
+                                // must NOT do is release a NEWER interval that a
+                                // second SetVidPnSourceAddress raised while this
+                                // copy was outstanding — that is the stale clear
+                                // this ticket exists to reject.
+                                crate::adapter::clear_programming_gate(
+                                    notify.programming.as_ref(),
+                                    notify.ticket,
+                                );
                                 KeSetEvent(notify.event.as_ptr(), IO_NO_INCREMENT, 0);
                             }
                         }

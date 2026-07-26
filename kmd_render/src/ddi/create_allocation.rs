@@ -791,6 +791,7 @@ pub(crate) unsafe fn submit_primary_scanout_copy(
     target_image_id: u64,
     width: u32,
     height: u32,
+    ticket: crate::adapter::ProgrammingTicket,
 ) -> Result<u64, NTSTATUS> {
     let primary_address = primary.primary_address;
     if h.is_null() || target_image_id == 0 || width == 0 || height == 0 {
@@ -854,7 +855,7 @@ pub(crate) unsafe fn submit_primary_scanout_copy(
                 copy
             }
         };
-        let fence = client.submit_prepared_image_copy(adapter, &copy, primary_address)?;
+        let fence = client.submit_prepared_image_copy(adapter, &copy, primary_address, ticket)?;
         ctx.scanout_copy_last_fence.store(fence, Ordering::Release);
         Ok::<u64, crate::virtio::VirtioError>(fence)
     });

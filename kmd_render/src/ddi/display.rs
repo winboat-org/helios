@@ -935,7 +935,10 @@ unsafe fn set_vidpn_source_address_dirql(
     // This exact Windows handoff is now pending display-engine programming.
     // Keep the periodic VSync path from reporting the preceding physical
     // address while the DIRQL callback is deferred to PASSIVE_LEVEL.
-    adapter.vidpn_programming.store(1, Ordering::Release);
+    //
+    // Raising bumps the generation and sets the active flag in ONE publication,
+    // so a completion can tell which interval it belongs to.
+    let _ticket = adapter.raise_programming_gate();
     true
 }
 
@@ -988,7 +991,7 @@ unsafe fn apply_deferred_vidpn_source_address_locked(
     h_alloc: HANDLE,
 ) -> NTSTATUS {
     let interval = crate::adapter::ProgrammingInterval::adopt(&adapter.vidpn_programming);
-    match unsafe { program_vidpn_source(adapter, lock, h_alloc) } {
+    match unsafe { program_vidpn_source(adapter, lock, h_alloc, interval.ticket()) } {
         Ok(ScanoutOutcome::Programmed) => {
             clear_retry_state();
             STATUS_SUCCESS
@@ -1232,6 +1235,15 @@ pub(crate) fn record_scanout_reject_counters() {
     crate::diag::record_named_bytes(b"ScUnav", SC_UNAVAILABLE.load(Relaxed));
     crate::diag::record_named_bytes(b"ScRetry", SC_RETRY.load(Relaxed));
     crate::diag::record_named_bytes(b"ScGaveUp", SC_GAVE_UP.load(Relaxed));
+    // R509: gate-generation health. Both must read 0 on a normal boot.
+    crate::diag::record_named_bytes(
+        b"ScStale",
+        crate::adapter::GATE_STALE_CLEARS.load(Relaxed),
+    );
+    crate::diag::record_named_bytes(
+        b"ScGateCx",
+        crate::adapter::GATE_RAISE_CAS_GIVEUPS.load(Relaxed),
+    );
 }
 
 /// Zero every refusal counter. StartDevice only.
@@ -1253,6 +1265,8 @@ pub(crate) fn reset_scanout_reject_counters() {
         &SC_UNAVAILABLE,
         &SC_RETRY,
         &SC_GAVE_UP,
+        &crate::adapter::GATE_STALE_CLEARS,
+        &crate::adapter::GATE_RAISE_CAS_GIVEUPS,
     ] {
         c.store(0, Relaxed);
     }
@@ -1276,7 +1290,7 @@ unsafe fn apply_vidpn_source_address_locked(
     // function, i.e. after the reject breadcrumb below — preserving the
     // record-then-lower order every arm had before R504.
     let interval = crate::adapter::ProgrammingInterval::adopt(&adapter.vidpn_programming);
-    match unsafe { program_vidpn_source(adapter, lock, h_alloc) } {
+    match unsafe { program_vidpn_source(adapter, lock, h_alloc, interval.ticket()) } {
         Ok(ScanoutOutcome::Programmed) => STATUS_SUCCESS,
         Ok(ScanoutOutcome::CopyQueued) => {
             // THE one hand-off. The copy is queued on ring 1 and its completion
@@ -1302,6 +1316,7 @@ unsafe fn program_vidpn_source(
     adapter: &AdapterContext,
     lock: &ScanoutGuard<'_>,
     h_alloc: HANDLE,
+    ticket: crate::adapter::ProgrammingTicket,
 ) -> Result<ScanoutOutcome, ScanoutReject> {
     crate::diag::record(0x1300_000A);
     let source_address_n = VIDPN_SOURCE_ADDRESS_COUNT
@@ -1447,6 +1462,7 @@ unsafe fn program_vidpn_source(
             target_image_id,
             width,
             height,
+            ticket,
         )
     } {
         Ok(fence) => {
