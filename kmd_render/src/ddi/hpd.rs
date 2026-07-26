@@ -83,10 +83,20 @@ pub unsafe extern "C" fn hpd_thread_routine(context: *mut c_void) {
         let _ = unsafe { PsTerminateSystemThread(STATUS_SUCCESS) };
         return;
     }
+    // SWAP BEFORE indicating, not store(0) after.
+    //
+    // The old order was: indicate, then unconditionally store 0. An ISR that set
+    // `config_change_pending` while `DxgkCbIndicateChildStatus` was in flight had
+    // its bit DISCARDED — and because `hpd_event` is a SynchronizationEvent, the
+    // DPC's signal then satisfied the loop's first wait, whose own swap returned
+    // 0, so nothing was indicated. That host mode change was never re-reported to
+    // the OS.
+    //
+    // Swapping first means a bit set DURING the indication survives to the next
+    // iteration and is acted on there. The steady-state loop already had this
+    // right; only this one-shot prologue did not.
+    adapter.config_change_pending.swap(0, Ordering::AcqRel);
     indicate_child_status(adapter, true);
-    // The initial timed/event wake already covered any config change that raced
-    // StartDevice. Do not carry that bit into the steady-state event mux.
-    adapter.config_change_pending.store(0, Ordering::Release);
 
     // Steady state is event/dirty driven. A real virtio display-change wakes us
     // to re-indicate the child; a completed primary GPU copy wakes us to queue
