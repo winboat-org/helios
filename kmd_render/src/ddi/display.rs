@@ -712,7 +712,7 @@ pub unsafe extern "C" fn dxgkddi_set_pointer_shape(
 /// `h` is the miniport adapter handle dxgkrnl passes to a display DDI.
 unsafe fn display_half_on(h: IN_CONST_HANDLE) -> bool {
     let p = h as *const AdapterContext;
-    !p.is_null() && unsafe { (*p).display_half }
+    !p.is_null() && unsafe { (*p).display_half() }
 }
 
 pub unsafe extern "C" fn dxgkddi_is_supported_vidpn(
@@ -726,7 +726,7 @@ pub unsafe extern "C" fn dxgkddi_is_supported_vidpn(
         );
     }
     let p = _adapter as *const AdapterContext;
-    if p.is_null() || !unsafe { (*p).display_half } {
+    if p.is_null() || !unsafe { (*p).display_half() } {
         return STATUS_GRAPHICS_INVALID_VIDPN;
     }
     if is_supported.is_null() {
@@ -775,7 +775,7 @@ pub unsafe extern "C" fn dxgkddi_enum_vidpn_cofunc_modality(
         );
     }
     let p = _adapter as *const AdapterContext;
-    if p.is_null() || !unsafe { (*p).display_half } {
+    if p.is_null() || !unsafe { (*p).display_half() } {
         return STATUS_NOT_SUPPORTED;
     }
     let adapter = unsafe { &*p };
@@ -808,7 +808,7 @@ pub unsafe extern "C" fn dxgkddi_commit_vidpn(
         crate::diag::record(0x1316_0000 | unsafe { (*commit).Flags.PathPoweredOff() & 0xFFFF });
     }
     let p = _adapter as *const AdapterContext;
-    if p.is_null() || !unsafe { (*p).display_half } {
+    if p.is_null() || !unsafe { (*p).display_half() } {
         return STATUS_NOT_SUPPORTED;
     }
     crate::diag::record_named_bytes(b"VpCM", 1);
@@ -853,7 +853,7 @@ pub unsafe extern "C" fn dxgkddi_set_vidpn_source_address(
     address: IN_CONST_PDXGKARG_SETVIDPNSOURCEADDRESS,
 ) -> NTSTATUS {
     let p = _adapter as *const AdapterContext;
-    if p.is_null() || !unsafe { (*p).display_half } {
+    if p.is_null() || !unsafe { (*p).display_half() } {
         return STATUS_NOT_SUPPORTED;
     }
     let adapter = unsafe { &*p };
@@ -1487,7 +1487,7 @@ pub unsafe extern "C" fn dxgkddi_recommend_monitor_modes(
 ) -> NTSTATUS {
     crate::diag::record(0x1300_000B);
     let p = _adapter as *const AdapterContext;
-    if p.is_null() || !unsafe { (*p).display_half } {
+    if p.is_null() || !unsafe { (*p).display_half() } {
         return STATUS_NOT_SUPPORTED;
     }
     let adapter = unsafe { &*p };

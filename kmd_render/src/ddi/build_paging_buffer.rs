@@ -1064,7 +1064,7 @@ pub unsafe extern "C" fn dxgkddi_build_paging_buffer(
 
     // SAFETY: dxgkrnl hands back our AdapterContext as the miniport context.
     let adapter = unsafe { &*(h_adapter as *const AdapterContext) };
-    let Some(bar) = adapter.bar_segment.as_ref() else {
+    let Some(bar) = adapter.bar_segment() else {
         return STATUS_SUCCESS; // BAR segment inactive → pure null engine
     };
 

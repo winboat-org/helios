@@ -137,7 +137,7 @@ pub(crate) fn maybe_run(adapter: &AdapterContext) {
     crate::diag::record_named_bytes(b"SdgLMem", 0);
     crate::diag::record_named_bytes(b"SdgLPch", 0);
     crate::diag::record_named_bytes(b"SdgLOff", 0);
-    if mode == 0 || !adapter.display_half {
+    if mode == 0 || !adapter.display_half() {
         return;
     }
 
@@ -484,7 +484,7 @@ pub(crate) fn maybe_run(adapter: &AdapterContext) {
 }
 
 pub(crate) fn rebind_if_forced(adapter: &AdapterContext, via: u32) -> bool {
-    if diag_mode() < 2 || !adapter.display_half {
+    if diag_mode() < 2 || !adapter.display_half() {
         return false;
     }
     let resource_id = adapter.diag_scanout_resource.load(Ordering::Acquire);

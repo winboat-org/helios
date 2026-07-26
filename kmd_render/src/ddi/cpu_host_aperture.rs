@@ -240,8 +240,7 @@ pub unsafe extern "C" fn dxgkddi_map_cpu_host_aperture(
     // SAFETY: dxgkrnl hands back our AdapterContext as the miniport context.
     let adapter = unsafe { &*(h_adapter as *const AdapterContext) };
     let bar_active = adapter
-        .bar_segment
-        .as_ref()
+        .bar_segment()
         .filter(|b| !b.probe_only && b.seg_id == args.SegmentId as u32);
     let Some(bar) = bar_active else {
         // Paging-RAM segment (or a probe arm): decorative identity aperture
@@ -368,7 +367,7 @@ pub unsafe extern "C" fn dxgkddi_unmap_cpu_host_aperture(
     // hAllocation in this DDI — resolve by aperture offset.
     // SAFETY: our AdapterContext (DDI contract).
     let adapter = unsafe { &*(h_adapter as *const AdapterContext) };
-    let is_bar = adapter.bar_segment.as_ref().map_or(false, |b| {
+    let is_bar = adapter.bar_segment().as_ref().map_or(false, |b| {
         !b.probe_only && b.seg_id == args.SegmentId as u32
     });
     if !is_bar {

@@ -4021,7 +4021,7 @@ impl VenusClient {
             let blt = &mut self.present_blits[blt_index];
             blt.last_wire_fence_id = fence_id;
             blt.submit_count = blt.submit_count.saturating_add(1);
-            if adapter.present_probe
+            if adapter.present_probe()
                 && blt.submit_count >= PRESENT_PROBE_AFTER_SUBMITS
                 && !blt.probe_done
             {
@@ -4976,7 +4976,7 @@ pub fn allocate_host_visible_blob(
     // Production DisplayHalf needs only the export trio for its dedicated plain
     // LINEAR DMA_BUF image. The modifier/image-format-list tier remains strictly
     // diagnostic; never enable it merely because real scanout is active.
-    let want_scanout_exts = client.ctx_id != 0 && (adapter.display_half || scanout_diag >= 4);
+    let want_scanout_exts = client.ctx_id != 0 && (adapter.display_half() || scanout_diag >= 4);
     // Clear the knock-down VkResult so a clean full-tier success leaves it 0 and
     // a prior boot's value can't be mistaken for this boot's (names persist).
     crate::diag::record_named_bytes(b"SdgDevR", 0);

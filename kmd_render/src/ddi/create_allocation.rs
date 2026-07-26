@@ -1255,7 +1255,7 @@ unsafe fn create_one(
     let mut supplied_resource_id = 0u32;
     if ap.kind == HELIOS_WDDM_ALLOC_KIND_STANDARD {
         if ap.ctx_id == 0 {
-            ap.ctx_id = adapter.venus_ctx_id;
+            ap.ctx_id = adapter.venus_ctx_id();
         }
         if ap.ctx_id == 0 {
             crate::diag::record(0x0C01_00E2);
@@ -1514,8 +1514,7 @@ unsafe fn create_one(
     // equivalent needs a narrower resource-class gate. Bisect arms (probe_only
     // RAM region / classic descriptor) never receive allocations.
     let bar_seg_id = adapter
-        .bar_segment
-        .as_ref()
+        .bar_segment()
         .filter(|b| !b.probe_only)
         .map(|b| b.seg_id);
     let bar_eligible = venus_memory_id != 0 && !is_optimal_gdi_texture && bar_seg_id.is_some();
@@ -1591,7 +1590,7 @@ unsafe fn create_one(
             // state and the aperture (which VidMm upgrades to the implicit system-memory
             // segment without AccessedPhysically, iommu-dma-remapping.md) is an
             // eviction-only fallback not exercised at this scale — negligible runtime cost.
-            let needs_aperture = is_primary || adapter.display_half;
+            let needs_aperture = is_primary || adapter.display_half();
             let supp = 1u32 << (seg_id - 1);
             (
                 seg_id,
@@ -1649,7 +1648,7 @@ unsafe fn create_one(
         if is_primary {
             crate::diag::record(0x0C3E_0000 | (resource_id & 0xFFFF));
         }
-        if adapter.alloc_cached && !is_primary && !is_optimal_gdi_texture {
+        if adapter.alloc_cached() && !is_primary && !is_optimal_gdi_texture {
             info.__bindgen_anon_4
                 .FlagsWddm2
                 .__bindgen_anon_1
@@ -2278,7 +2277,7 @@ pub unsafe extern "C" fn dxgkddi_get_standard_allocation_driver_data(
     };
     let ap = HeliosWddmAllocPrivate::new(
         HELIOS_WDDM_ALLOC_KIND_STANDARD,
-        adapter.venus_ctx_id,
+        adapter.venus_ctx_id(),
         0, // blob_id 0 → host-allocated HOST3D mappable blob (no UMD venus memory)
         size,
         VIRTIO_GPU_BLOB_MEM_HOST3D,

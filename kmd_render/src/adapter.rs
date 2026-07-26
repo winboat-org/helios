@@ -176,12 +176,164 @@ impl SystemBackingTable {
     }
 }
 
+/// Everything `DxgkDdiStartDevice` establishes, as one value published once.
+///
+/// StartDevice used to take a unique `&mut AdapterContext` that stayed live for
+/// the whole function and mutated ~a dozen plain fields through it — while the
+/// context pointer had been public to dxgkrnl since AddDevice and THREE
+/// concurrent agents build `&AdapterContext` from it. `init_vsync` arms a 16 ms
+/// timer and `init_hpd` starts a thread that both immediately take `&self` from
+/// the same address while the outer `&mut` is still in scope, and
+/// `set_virtio(Some(gpu))` enables the device so the DIRQL ISR can fire
+/// mid-function. That is an unambiguous Stacked-Borrows violation.
+///
+/// Split by LIFETIME, not by topic:
+///
+///   * the *sticky* half (everything outside `transport`) survives StopDevice.
+///     This is load-bearing and must not be "tidied up": StopDevice today does
+///     NOT clear the knobs, the mode or the EDID, and about two dozen sites
+///     branch on `display_half`. Clearing them at StopDevice would flip all of
+///     those from SUCCESS-shaped answers to NOT_SUPPORTED between StopDevice and
+///     RemoveDevice, which is exactly what the restart-device leg of the
+///     regression gate exercises.
+///   * `transport`, which StopDevice clears, holds everything whose meaning dies
+///     with the transport generation that produced it.
+pub(crate) struct StartedState {
+    /// Dxgkrnl callback interface, copied out of dxgkrnl's buffer at
+    /// StartDevice. Read lock-free by the ISR and both DPCs; publishing it as
+    /// part of this struct is what makes that visibility structural.
+    pub dxgkrnl: DXGKRNL_INTERFACE,
+    /// `AllocCached` service-key knob (read once in StartDevice; default 1).
+    /// When set, CpuVisible allocations are additionally flagged `Cached` so
+    /// dxgkrnl maps CPU views write-back instead of write-combined. The BAR
+    /// window is RAM-backed host shmem (x86 cache-coherent for all agents on
+    /// the same physical pages); WC reads measured ~200 MB/s in the IDD
+    /// readback (36 ms per 7.8 MiB frame, 2026-07-06). 0 = kill switch.
+    pub alloc_cached: bool,
+    /// `PresentProbe` service-key knob (read once in StartDevice; default 0).
+    /// When enabled, each exact Present source/destination pair performs one
+    /// bounded, fence-ordered CPU sample of the destination after its eighth
+    /// submission. This is a diagnostic only: the steady-state path never
+    /// waits or maps a frame, and the per-pair `probe_done` state statically
+    /// prevents repeated readbacks.
+    pub present_probe: bool,
+    /// `DisplayHalf` service-key knob (REG_DWORD, read once in StartDevice;
+    /// default 0 = OFF, the boot-proven render-only surface). When nonzero,
+    /// StartDevice advertises ONE video-present source + ONE child video-output
+    /// and the VidPn/child DDIs in `ddi::display`/`ddi::vidpn`/`ddi::start_device`
+    /// stand up a real virtual VidPn output + default monitor and drive
+    /// virtio-gpu scanout, instead of returning NOT_SUPPORTED. Default 0 keeps
+    /// the render-only recovery shape available; production sets it to 1 via
+    /// `reg add ... /v DisplayHalf /t REG_DWORD /d 1` + a guest reboot
+    /// (re-runs StartDevice → child enumeration) with NO reboot once deployed.
+    /// Demoted to 0 before publication if the transport never came up.
+    /// Value mirrored to the `DspH` fixed diag record at StartDevice.
+    pub display_half: bool,
+    /// Scanout-0 mode the display half presents, taken from the host's
+    /// `GET_DISPLAY_INFO` (`VirtioGpu::display_mode`) at StartDevice, or 0/0 if the
+    /// host reported nothing usable (then [`AdapterContext::display_mode`] falls
+    /// back to 1920×1080). The VidPn source/target/monitor modes and the generated
+    /// EDID all derive from this, so Helios advertises the size QEMU actually
+    /// wants on scanout 0 instead of a hardcoded guess.
+    pub display_w: u32,
+    pub display_h: u32,
+    /// EDID served by `DxgkDdiQueryDeviceDescriptor`, generated at StartDevice for
+    /// [`AdapterContext::display_mode`] via [`crate::ddi::vidpn::build_edid`]
+    /// (valid checksum, native detailed timing == the mode). Zeroed when the
+    /// display half is off.
+    pub edid: [u8; 128],
+    /// Real-RAM-backed segment for VidMm page tables / paging buffers (segment 2).
+    /// `None` if the contiguous allocation failed (then we fall back to the old
+    /// single-segment shape). Freed in `AdapterContext::drop`.
+    pub paging_ram: Option<PagingRam>,
+    /// RAM block backing the `BarSegMode` 5 AddAdapter-acceptance probe (the
+    /// segment-3 aperture region is then real RAM instead of the BAR window).
+    /// Freed in `AdapterContext::drop`.
+    pub bar_probe_ram: Option<PagingRam>,
+    /// The half StopDevice clears. `None` between StopDevice and the next
+    /// StartDevice.
+    transport: UnsafeCell<Option<TransportGeneration>>,
+}
+
+impl StartedState {
+    /// Build the sticky half. The transport half always starts empty and is
+    /// installed separately by [`AdapterContext::set_transport_generation`], so
+    /// "a state published with a stale transport generation" is unrepresentable.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        dxgkrnl: DXGKRNL_INTERFACE,
+        alloc_cached: bool,
+        present_probe: bool,
+        display_half: bool,
+        display_w: u32,
+        display_h: u32,
+        edid: [u8; 128],
+        paging_ram: Option<PagingRam>,
+        bar_probe_ram: Option<PagingRam>,
+    ) -> Self {
+        Self {
+            dxgkrnl,
+            alloc_cached,
+            present_probe,
+            display_half,
+            display_w,
+            display_h,
+            edid,
+            paging_ram,
+            bar_probe_ram,
+            transport: UnsafeCell::new(None),
+        }
+    }
+}
+
+/// State whose meaning dies with the transport generation that produced it.
+///
+/// Every resource id in here is meaningless in the next generation, whose ids
+/// restart at 1 and whose liveness test is bare membership — which is how a
+/// recycled id used to be accepted as the cached LINEAR scan-out target.
+pub(crate) struct TransportGeneration {
+    /// venus-backed, BAR-visible, CPU-coherent page-table region self-allocated at
+    /// StartDevice (`(gpa, size)`). `None` if the venus allocation was unavailable
+    /// or failed (StartDevice stays best-effort). When present and the aperture
+    /// shape is enabled, `query_segments` reports this as the VidMm page-table
+    /// segment (segment id 2) — real device-BAR memory backed by real host memory,
+    /// which VidMm accepts where it drops a system-RAM segment. See `venus.rs`.
+    ///
+    /// ⚠ WRITE-ONLY as of R510, which is the first time that is visible: the only
+    /// consumer would be `query_segments`, and it deliberately reports
+    /// `paging_ram` instead, because QuerySegment4 runs BEFORE StartDevice's venus
+    /// allocation. Kept and annotated rather than deleted — a deletion is a T6
+    /// dead-code commit with its own reachability evidence, not a side effect of
+    /// this refactor.
+    #[allow(dead_code)]
+    pub page_table_window: Option<(u64, u64)>,
+    /// BAR memory segment (segment 3) — the head partition of the host-visible
+    /// window, reserved as dxgkrnl's CPU-host-aperture region at StartDevice.
+    /// `None` if the window is absent/too small; segment 3 is then not
+    /// reported and standard allocations stay on the aperture (old behavior).
+    pub bar_segment: Option<BarSegment>,
+    /// The persistent venus 3D context id (`VIRTIO_GPU_CAPSET_VENUS`) the venus
+    /// client rides, created in StartDevice and destroyed in StopDevice. `0` = none.
+    pub venus_ctx_id: u32,
+}
+
 pub struct AdapterContext {
     /// Physical device object for the virtio-gpu device.
     pub pdo: PDEVICE_OBJECT,
-    /// Dxgkrnl callback interface, saved in StartDevice. `None` until then.
-    /// Written once during the (serialized) StartDevice lifecycle DDI.
-    pub dxgkrnl: Option<DXGKRNL_INTERFACE>,
+    /// Everything StartDevice establishes, published ONCE. See [`StartedState`].
+    ///
+    /// Reached only through [`Self::started`]; there is no `&mut` path to it, so
+    /// "mutate a started field from a DDI" does not compile and "read `dxgkrnl`
+    /// before StartDevice" does not compile either (there is no `StartedState` to
+    /// borrow).
+    started: UnsafeCell<Option<StartedState>>,
+    /// Publication flag for `started`. A reader that observes 1 with Acquire has
+    /// necessarily seen every store StartDevice made into the state — which makes
+    /// the callback-table visibility ordering structural for ALL THREE readers,
+    /// not just the ISR. Two of them (the device DPC and the VSync DPC) read the
+    /// table with no `isr_status` guard at all and used to rest on statement
+    /// order plus a comment.
+    started_published: AtomicU32,
     /// Last fence completed by the bring-up scheduler path.
     last_completed_fence: AtomicU32,
     /// Serializes DMA_COMPLETED notification and its monotonic fence update.
@@ -229,26 +381,6 @@ pub struct AdapterContext {
     /// Exact system-memory pages Windows associates with a BAR allocation
     /// through paging TRANSFER requests.
     pub(crate) system_backings: SystemBackingTable,
-    /// Real-RAM-backed segment for VidMm page tables / paging buffers (segment 2).
-    /// `None` if the contiguous allocation failed (then we fall back to the old
-    /// single-segment shape). Allocated in `new`, freed in `Drop`.
-    pub paging_ram: Option<PagingRam>,
-    /// venus-backed, BAR-visible, CPU-coherent page-table region self-allocated at
-    /// StartDevice (`(gpa, size)`). `None` if the venus allocation was unavailable
-    /// or failed (StartDevice stays best-effort). When present and the aperture
-    /// shape is enabled, `query_segments` reports this as the VidMm page-table
-    /// segment (segment id 2) — real device-BAR memory backed by real host memory,
-    /// which VidMm accepts where it drops a system-RAM segment. See `venus.rs`.
-    pub page_table_window: Option<(u64, u64)>,
-    /// BAR memory segment (segment 3) — the head partition of the host-visible
-    /// window, reserved as dxgkrnl's CPU-host-aperture region at StartDevice.
-    /// `None` if the window is absent/too small; segment 3 is then not
-    /// reported and standard allocations stay on the aperture (old behavior).
-    pub bar_segment: Option<BarSegment>,
-    /// RAM block backing the `BarSegMode` 5 AddAdapter-acceptance probe (the
-    /// segment-3 aperture region is then real RAM instead of the BAR window).
-    /// Freed in Drop.
-    pub bar_probe_ram: Option<PagingRam>,
     /// The persistent venus client (ring/reply BAR mappings + Vulkan ids) kept
     /// alive for the device lifetime so the page-table blob stays mapped. `None`
     /// until/unless the StartDevice venus bring-up succeeds. Its `Drop` unmaps the
@@ -263,40 +395,10 @@ pub struct AdapterContext {
     /// address (a KEVENT's dispatcher header is self-referential once
     /// initialized — it must never be moved afterwards).
     venus_mutex: UnsafeCell<KEVENT>,
-    /// The persistent venus 3D context id (`VIRTIO_GPU_CAPSET_VENUS`) the venus
-    /// client rides, created in StartDevice and destroyed in StopDevice. `0` = none.
-    pub venus_ctx_id: u32,
     /// A one-shot Present destination probe is armed inside the venus client and
     /// waiting for the PASSIVE display worker to drain it (R320). Only ever set
     /// when the `PresentProbe` knob is on.
     pub probe_pending: AtomicU32,
-    /// `AllocCached` service-key knob (read once in StartDevice; default 1).
-    /// When set, CpuVisible allocations are additionally flagged `Cached` so
-    /// dxgkrnl maps CPU views write-back instead of write-combined. The BAR
-    /// window is RAM-backed host shmem (x86 cache-coherent for all agents on
-    /// the same physical pages); WC reads measured ~200 MB/s in the IDD
-    /// readback (36 ms per 7.8 MiB frame, 2026-07-06). 0 = kill switch.
-    pub alloc_cached: bool,
-    /// `PresentProbe` service-key knob (read once in StartDevice; default 0).
-    /// When enabled, each exact Present source/destination pair performs one
-    /// bounded, fence-ordered CPU sample of the destination after its eighth
-    /// submission. This is a diagnostic only: the steady-state path never
-    /// waits or maps a frame, and the per-pair `probe_done` state statically
-    /// prevents repeated readbacks.
-    pub present_probe: bool,
-    /// `DisplayHalf` service-key knob (REG_DWORD, read once in StartDevice;
-    /// default 0 = OFF, the boot-proven render-only surface). When nonzero,
-    /// StartDevice advertises ONE video-present source + ONE child video-output
-    /// and the VidPn/child DDIs in `ddi::display`/`ddi::vidpn`/`ddi::start_device`
-    /// stand up a real virtual VidPn output + default monitor and drive
-    /// virtio-gpu scanout, instead of returning NOT_SUPPORTED. Default 0 keeps
-    /// the render-only recovery shape available; production sets it to 1 via
-    /// `reg add ... /v DisplayHalf /t REG_DWORD /d 1` + a guest reboot
-    /// (re-runs StartDevice → child enumeration) with NO reboot once deployed.
-    /// The paired Looking Glass IddCx keeps rendering the desktop as before; the
-    /// new Helios monitor is a second, unobserved virtual display (owner-approved,
-    /// 35th session). Value mirrored to the `DspH` fixed diag record at StartDevice.
-    pub display_half: bool,
     /// VSync heartbeat timer for the display half. A `SynchronizationTimer` fired
     /// every ~16 ms (`vsync_dpc`) whose DPC synthesizes `DXGK_INTERRUPT_CRTC_VSYNC`
     /// so dxgkrnl advances the flip queue and issues `SetVidPnSourceAddress` — the
@@ -396,18 +498,6 @@ pub struct AdapterContext {
     pub scanout_flush_inflight: AtomicU32,
     /// 1 once [`Self::init_vsync`] has armed the timer (StopDevice cancels once).
     pub vsync_armed: AtomicU32,
-    /// Scanout-0 mode the display half presents, taken from the host's
-    /// `GET_DISPLAY_INFO` (`VirtioGpu::display_mode`) at StartDevice, or 0/0 if the
-    /// host reported nothing usable (then [`Self::display_mode`] falls back to
-    /// 1920×1080). The VidPn source/target/monitor modes and the generated EDID all
-    /// derive from this, so Helios advertises the size QEMU actually wants on
-    /// scanout 0 instead of a hardcoded guess.
-    pub display_w: u32,
-    pub display_h: u32,
-    /// EDID served by `DxgkDdiQueryDeviceDescriptor`, generated at StartDevice for
-    /// [`Self::display_mode`] via [`crate::ddi::vidpn::build_edid`] (valid checksum,
-    /// native detailed timing == the mode). Zeroed until the display half fills it.
-    pub edid: [u8; 128],
     /// HPD worker event. `DxgkCbIndicateChildStatus` — which tells the OS the child
     /// video-output is *connected*, the transition that makes the target available
     /// for a VidPn path — is PASSIVE-only and MUST NOT be called during StartDevice,
@@ -437,11 +527,26 @@ pub struct AdapterContext {
     pub config_change_pending: AtomicU32,
 }
 
-// SAFETY: `dxgkrnl` is written only during the device-lifecycle DDIs, which
-// Dxgkrnl serializes. `virtio` is interior-mutable but every access goes through
-// `virtio_lock` (a kernel spinlock) via `with_virtio`/`set_virtio`, so concurrent
-// escape/DPC callers never alias it. This is the genuine lock-guarded state that
-// replaces Phase-2's hand-asserted-without-a-lock Send/Sync.
+// SAFETY (rewritten by R510 to name what is actually here now):
+//
+//   * `started` is an `UnsafeCell<Option<StartedState>>` written exactly once, by
+//     StartDevice, and published with a Release store to `started_published`.
+//     Every reader goes through `started()`, whose Acquire load pairs with it, so
+//     no reader can observe a partially-built state. There is no `&mut` path to
+//     it after publication — StartDevice no longer forms `&mut AdapterContext` at
+//     all, which is what makes the ISR, both DPCs and the HPD worker building
+//     `&AdapterContext` from the same pointer sound rather than a Stacked-Borrows
+//     violation.
+//   * `StartedState::transport` is interior-mutable and written only by
+//     StartDevice and StopDevice, which Dxgkrnl serializes against each other and
+//     against every DDI that reads it.
+//   * `virtio` is interior-mutable but every access goes through `virtio_lock`
+//     (a kernel spinlock) via `with_virtio`/`set_virtio`, so concurrent
+//     escape/DPC callers never alias it.
+//   * `venus_client` is guarded by the PASSIVE `venus_mutex`.
+//
+// This is the genuine lock-guarded state that replaces Phase-2's
+// hand-asserted-without-a-lock Send/Sync.
 unsafe impl Send for AdapterContext {}
 unsafe impl Sync for AdapterContext {}
 
@@ -741,7 +846,8 @@ impl AdapterContext {
     pub fn new(pdo: PDEVICE_OBJECT) -> Result<Self, DriverError> {
         Ok(Self {
             pdo,
-            dxgkrnl: None,
+            started: UnsafeCell::new(None),
+            started_published: AtomicU32::new(0),
             last_completed_fence: AtomicU32::new(0),
             wddm_notify_lock: UnsafeCell::new(0),
             isr_status: AtomicUsize::new(0),
@@ -752,19 +858,11 @@ impl AdapterContext {
             mappings: crate::mapping::MappingTable::new(),
             paging_pte_shadow: crate::ddi::PagingPteShadow::new(),
             system_backings: SystemBackingTable::new(),
-            paging_ram: None,
-            page_table_window: None,
-            bar_segment: None,
-            bar_probe_ram: None,
             venus_client: UnsafeCell::new(None),
             // Zeroed placeholder — the real dispatcher header is written by
             // `init_kernel_events` once the context is at its final address.
             venus_mutex: UnsafeCell::new(unsafe { core::mem::zeroed() }),
-            venus_ctx_id: 0,
             probe_pending: AtomicU32::new(0),
-            alloc_cached: true,
-            present_probe: false,
-            display_half: false,
             // Zeroed placeholders — the real KTIMER/KDPC dispatcher state is
             // written by `init_vsync` once the context is at its final address.
             vsync_timer: UnsafeCell::new(unsafe { core::mem::zeroed() }),
@@ -800,9 +898,6 @@ impl AdapterContext {
             vsync_armed: AtomicU32::new(0),
             pending_vidpn_allocation: AtomicUsize::new(0),
             vidpn_programming: AtomicU64::new(0),
-            display_w: 0,
-            display_h: 0,
-            edid: [0u8; 128],
             // Zeroed placeholder — the real KEVENT is written by init_kernel_events.
             hpd_event: UnsafeCell::new(unsafe { core::mem::zeroed() }),
             hpd_exited: UnsafeCell::new(unsafe { core::mem::zeroed() }),
@@ -1041,8 +1136,9 @@ impl AdapterContext {
     /// if usable, else the 1920×1080 fallback. Every VidPn mode + the generated
     /// EDID derive from this so they stay mutually consistent (cofunctional).
     pub fn display_mode(&self) -> (u32, u32) {
-        if self.display_w >= 320 && self.display_h >= 240 {
-            (self.display_w, self.display_h)
+        let (w, h) = self.started().map_or((0, 0), |s| (s.display_w, s.display_h));
+        if w >= 320 && h >= 240 {
+            (w, h)
         } else {
             (
                 crate::ddi::vidpn::DEFAULT_MODE_WIDTH,
@@ -1401,7 +1497,7 @@ impl AdapterContext {
         let height = wh as u32;
         let stride = (layout >> 32) as u32;
         let offset = layout as u32;
-        if !self.display_half || resource_id == 0 || width == 0 || height == 0 {
+        if !self.display_half() || resource_id == 0 || width == 0 || height == 0 {
             return ScanoutRefreshQueue::Unavailable;
         }
         let live = self
@@ -1808,9 +1904,148 @@ impl AdapterContext {
         Self::alloc_contiguous_ram(PAGING_RAM_SIZE)
     }
 
+    /// The state StartDevice established, or `None` before it ran.
+    ///
+    /// The `Acquire` pairs with the `Release` in [`Self::publish_started`], so a
+    /// caller that gets `Some` has necessarily observed every field — including
+    /// the multi-hundred-byte `DXGKRNL_INTERFACE` the ISR and both DPCs read
+    /// lock-free.
+    pub(crate) fn started(&self) -> Option<&StartedState> {
+        if self.started_published.load(Ordering::Acquire) == 0 {
+            return None;
+        }
+        // SAFETY: the slot is written exactly once, by `publish_started`, before
+        // the flag above is set with Release. Observing the flag with Acquire
+        // therefore happens-after that write, and nothing ever takes a `&mut` to
+        // the slot afterwards — the transport half has its own interior
+        // mutability and its own serialization (StartDevice/StopDevice, which
+        // dxgkrnl serializes).
+        unsafe { (*self.started.get()).as_ref() }
+    }
+
+    /// Take the contiguous RAM blocks out of a PREVIOUS start's state so the
+    /// next one can carry them forward.
+    ///
+    /// These blocks are allocated once and freed only in `Drop`; a stop/start
+    /// cycle on the same context must reuse them, not leak them and allocate
+    /// again. Today's code gets this by leaving the fields untouched across
+    /// StopDevice, which publish-once would otherwise lose.
+    ///
+    /// # Safety
+    /// PASSIVE_LEVEL, from `DxgkDdiStartDevice` only, which dxgkrnl serializes.
+    pub(crate) unsafe fn take_paging_ram(&self) -> Option<PagingRam> {
+        // SAFETY: per the fn contract — StartDevice is serialized against every
+        // other lifecycle DDI, and nothing reads `paging_ram` between the take
+        // and the republish inside the same call.
+        unsafe { (*self.started.get()).as_mut() }.and_then(|s| s.paging_ram.take())
+    }
+
+    /// As [`Self::take_paging_ram`], for the `BarSegMode` 5 probe block.
+    ///
+    /// # Safety
+    /// Same contract as [`Self::take_paging_ram`].
+    pub(crate) unsafe fn take_bar_probe_ram(&self) -> Option<PagingRam> {
+        // SAFETY: per the fn contract.
+        unsafe { (*self.started.get()).as_mut() }.and_then(|s| s.bar_probe_ram.take())
+    }
+
+    /// Free a contiguous RAM block that is being replaced rather than carried
+    /// forward. PASSIVE_LEVEL.
+    pub(crate) fn free_contiguous_ram(ram: PagingRam) {
+        // SAFETY: `va` came from MmAllocateContiguousMemory and is freed once.
+        unsafe { MmFreeContiguousMemory(ram.va.as_ptr() as *mut _) };
+    }
+
+    /// Publish the started state. StartDevice only, exactly once per start.
+    ///
+    /// # Safety
+    /// Must be called at PASSIVE_LEVEL from `DxgkDdiStartDevice`, which dxgkrnl
+    /// serializes against every other lifecycle DDI, and only while
+    /// [`Self::started`] is `None` for this start.
+    pub(crate) unsafe fn publish_started(&self, state: StartedState) {
+        // SAFETY: per the fn contract — StartDevice is serialized, and no reader
+        // can observe the slot until the Release store below.
+        unsafe { *self.started.get() = Some(state) };
+        self.started_published.store(1, Ordering::Release);
+    }
+
     /// Borrow the Dxgkrnl interface, or fail if StartDevice has not run yet.
     pub fn dxgkrnl(&self) -> Result<&DXGKRNL_INTERFACE, DriverError> {
-        self.dxgkrnl.as_ref().ok_or(DriverError::DeviceNotFound)
+        self.dxgkrnl_opt().ok_or(DriverError::DeviceNotFound)
+    }
+
+    /// The Dxgkrnl callback table, or `None` before StartDevice.
+    ///
+    /// Replaces the direct `adapter.dxgkrnl.as_ref()` field reads. Every caller
+    /// now goes through the published slot, so the ordering that makes the table
+    /// safe to read is the Acquire in [`Self::started`] rather than statement
+    /// order plus a comment.
+    pub fn dxgkrnl_opt(&self) -> Option<&DXGKRNL_INTERFACE> {
+        self.started().map(|s| &s.dxgkrnl)
+    }
+
+    /// `DisplayHalf`: whether the display DDIs answer for real. False before
+    /// StartDevice and on the render-only recovery shape.
+    pub fn display_half(&self) -> bool {
+        self.started().is_some_and(|s| s.display_half)
+    }
+
+    /// `AllocCached`. Defaults to TRUE before StartDevice, matching the value the
+    /// field was constructed with.
+    pub fn alloc_cached(&self) -> bool {
+        self.started().map_or(true, |s| s.alloc_cached)
+    }
+
+    /// `PresentProbe`. Defaults to false before StartDevice.
+    pub fn present_probe(&self) -> bool {
+        self.started().is_some_and(|s| s.present_probe)
+    }
+
+    /// The EDID served by `DxgkDdiQueryDeviceDescriptor`.
+    pub fn edid(&self) -> Option<&[u8; 128]> {
+        self.started().map(|s| &s.edid)
+    }
+
+    /// The current transport generation's state, or `None` between StopDevice
+    /// and the next StartDevice.
+    pub(crate) fn transport_generation(&self) -> Option<&TransportGeneration> {
+        // SAFETY: the cell is written only by StartDevice and StopDevice, which
+        // dxgkrnl serializes against each other and against every DDI that could
+        // read it. The reference borrows `self`, so it cannot outlive the
+        // adapter.
+        self.started()
+            .and_then(|s| unsafe { (*s.transport.get()).as_ref() })
+    }
+
+    /// Install the transport generation. StartDevice only.
+    ///
+    /// # Safety
+    /// PASSIVE_LEVEL, from `DxgkDdiStartDevice`, which dxgkrnl serializes.
+    pub(crate) unsafe fn set_transport_generation(&self, generation: Option<TransportGeneration>) {
+        let Some(state) = self.started() else {
+            return;
+        };
+        // SAFETY: per the fn contract.
+        unsafe { *state.transport.get() = generation };
+    }
+
+    /// The venus 3D context id for this transport generation, or 0.
+    pub fn venus_ctx_id(&self) -> u32 {
+        self.transport_generation().map_or(0, |t| t.venus_ctx_id)
+    }
+
+    /// The BAR memory segment for this transport generation, if any.
+    pub(crate) fn bar_segment(&self) -> Option<&BarSegment> {
+        self.transport_generation()
+            .and_then(|t| t.bar_segment.as_ref())
+    }
+
+    /// The venus-backed page-table window for this transport generation.
+    ///
+    /// See the field doc: no live consumer today.
+    #[allow(dead_code)]
+    pub fn page_table_window(&self) -> Option<(u64, u64)> {
+        self.transport_generation().and_then(|t| t.page_table_window)
     }
 
     /// Lock-free observation for query/diagnostic paths. Mutation is exposed
@@ -1852,7 +2087,9 @@ impl AdapterContext {
     /// The real-RAM paging/page-table segment backing, if it was allocated.
     /// `query_segments` reports it as segment 2 (`(phys_base, size)`).
     pub fn paging_ram(&self) -> Option<(u64, u64)> {
-        self.paging_ram.as_ref().map(|p| (p.phys, p.size))
+        self.started()
+            .and_then(|s| s.paging_ram.as_ref())
+            .map(|p| (p.phys, p.size))
     }
 
     /// Run `f` against the live virtio transport while holding `virtio_lock`.
@@ -1897,14 +2134,22 @@ impl Drop for AdapterContext {
         // Free the contiguous paging-RAM segment. RemoveDevice (which drops the
         // boxed AdapterContext) runs at PASSIVE_LEVEL, where MmFreeContiguousMemory
         // is legal.
-        if let Some(pr) = self.paging_ram.take() {
-            // SAFETY: `va` came from MmAllocateContiguousMemory in `alloc_paging_ram`
-            // and is freed exactly once here.
-            unsafe { MmFreeContiguousMemory(pr.va.as_ptr() as *mut _) };
-        }
-        if let Some(pr) = self.bar_probe_ram.take() {
-            // SAFETY: same contract as paging_ram (alloc_contiguous_ram), freed once.
-            unsafe { MmFreeContiguousMemory(pr.va.as_ptr() as *mut _) };
+        // The RAM blocks now live in `StartedState`. `&mut self` here is genuinely
+        // unique (RemoveDevice owns the box), so reaching into the cell is sound.
+        // SAFETY: exclusive access via `&mut self`; RemoveDevice runs after the
+        // VSync timer is cancelled and the HPD worker joined, so no other agent
+        // holds a reference into this context.
+        if let Some(state) = unsafe { (*self.started.get()).as_mut() } {
+            if let Some(pr) = state.paging_ram.take() {
+                // SAFETY: `va` came from MmAllocateContiguousMemory in
+                // `alloc_paging_ram` and is freed exactly once here.
+                unsafe { MmFreeContiguousMemory(pr.va.as_ptr() as *mut _) };
+            }
+            if let Some(pr) = state.bar_probe_ram.take() {
+                // SAFETY: same contract as paging_ram (alloc_contiguous_ram),
+                // freed once.
+                unsafe { MmFreeContiguousMemory(pr.va.as_ptr() as *mut _) };
+            }
         }
     }
 }

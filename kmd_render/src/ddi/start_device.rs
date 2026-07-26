@@ -46,31 +46,44 @@ const BAR_SEGMENT_MAX_BYTES: u64 = 1 << 30;
 ///        the two-memory-split fix. First full desktop 2026-07-05 20:53.
 ///   11 = 3 segments swapped: aperture + BAR id 2 + RAM id 3 (rejected —
 ///        confirms the must-be-last rule; the BAR cpu-host seg isn't last)
+///
+/// Returns the segment AND, for the `BarSegMode` 5 probe arm, the RAM block that
+/// backs it — instead of writing `bar_probe_ram` through a `&mut AdapterContext`.
+/// That write was one of the reasons StartDevice needed a unique borrow at all.
 fn setup_bar_segment(
-    adapter: &mut crate::adapter::AdapterContext,
-) -> Option<crate::adapter::BarSegment> {
+    adapter: &crate::adapter::AdapterContext,
+) -> (
+    Option<crate::adapter::BarSegment>,
+    Option<crate::adapter::PagingRam>,
+) {
     let mode = crate::diag::read_config_dword(b"BarSegMode", 10);
     crate::diag::record_named_bytes(b"BarM", mode);
     if mode == 0 {
-        return None;
+        return (None, None);
     }
     let seg_id = if mode == 10 || mode == 11 { 2 } else { 3 };
     if mode == 5 {
         // RAM-backed acceptance probe: is the rejection about the BAR GPA?
-        let ram = crate::adapter::AdapterContext::alloc_contiguous_ram(16 << 20)?;
+        let Some(ram) = crate::adapter::AdapterContext::alloc_contiguous_ram(16 << 20) else {
+            return (None, None);
+        };
         let (gpa, size) = (ram.phys, ram.size);
-        adapter.bar_probe_ram = Some(ram);
         crate::diag::record(0x0B00_0008);
         crate::diag::record(((size >> 20) & 0xFFFF_FFFF) as u32);
-        return Some(crate::adapter::BarSegment {
-            gpa,
-            size,
-            seg_id,
-            topo: mode,
-            probe_only: true,
-        });
+        return (
+            Some(crate::adapter::BarSegment {
+                gpa,
+                size,
+                seg_id,
+                topo: mode,
+                probe_only: true,
+            }),
+            Some(ram),
+        );
     }
-    let window = adapter.with_virtio(|v| v.host_visible()).ok().flatten()?;
+    let Some(window) = adapter.with_virtio(|v| v.host_visible()).ok().flatten() else {
+        return (None, None);
+    };
     let size = match mode {
         2 => 64 << 20,
         // 1, 10, 11, or any unknown value → the default partition size.
@@ -79,20 +92,23 @@ fn setup_bar_segment(
     if size < (16 << 20) || size > window.len {
         crate::diag::record(0x0B00_00E8);
         crate::diag::fault(crate::diag::FaultCounter::StBar, (size >> 20) as u32);
-        return None;
+        return (None, None);
     }
     // The KMD blob-window allocator must never hand out offsets inside the
     // aperture region (dxgkrnl's CPU-host-aperture allocator owns them).
     let _ = adapter.with_virtio(|v| v.reserve_window_prefix(size));
     crate::diag::record(0x0B00_0008);
     crate::diag::record(((size >> 20) & 0xFFFF_FFFF) as u32);
-    Some(crate::adapter::BarSegment {
-        gpa: window.base,
-        size,
-        seg_id,
-        topo: mode,
-        probe_only: false,
-    })
+    (
+        Some(crate::adapter::BarSegment {
+            gpa: window.base,
+            size,
+            seg_id,
+            topo: mode,
+            probe_only: false,
+        }),
+        None,
+    )
 }
 
 /// `DxgkDdiStartDevice` — bring the adapter online.
@@ -114,22 +130,32 @@ pub unsafe extern "C" fn dxgkddi_start_device(
         return STATUS_INVALID_PARAMETER;
     }
 
+    // SHARED borrow only. The context pointer has been public to dxgkrnl since
+    // AddDevice, and before this function returns the DIRQL ISR, the VSync timer
+    // DPC and the HPD worker all build `&AdapterContext` from the same address —
+    // `set_virtio(Some(gpu))` below enables the device mid-function, and
+    // `init_vsync`/`init_hpd` at the end start the other two. A unique `&mut`
+    // spanning that was an unambiguous Stacked-Borrows violation.
+    //
+    // Everything StartDevice establishes is therefore built as LOCALS and
+    // published once, near the end, through `publish_started`.
+    //
     // SAFETY: Dxgkrnl passes our adapter context and valid out-pointers.
-    let adapter = unsafe { &mut *(miniport_device_context as *mut AdapterContext) };
+    let adapter = unsafe { &*(miniport_device_context as *const AdapterContext) };
 
-    // Save the callback interface for the driver's lifetime (Copy struct).
-    adapter.dxgkrnl = Some(unsafe { *dxgkrnl_interface });
+    // The callback interface, copied for the driver's lifetime (Copy struct).
+    let dxgkrnl = unsafe { *dxgkrnl_interface };
     crate::diag::record(0x0B00_0002);
 
     // Service-key knobs, read once per StartDevice (same iteration model as
     // `BarSegMode`: `reg add` + `devcon restart` re-runs this without a
     // reboot). See the field docs in `adapter.rs`.
-    adapter.alloc_cached = crate::diag::read_config_dword(b"AllocCached", 1) != 0;
-    adapter.present_probe = crate::diag::read_config_dword(b"PresentProbe", 0) != 0;
-    adapter.display_half = crate::diag::read_config_dword(b"DisplayHalf", 0) != 0;
-    crate::diag::record_named_bytes(b"AlcC", adapter.alloc_cached as u32);
-    crate::diag::record_named_bytes(b"PBPrEn", adapter.present_probe as u32);
-    crate::diag::record_named_bytes(b"DspH", adapter.display_half as u32);
+    let alloc_cached = crate::diag::read_config_dword(b"AllocCached", 1) != 0;
+    let present_probe = crate::diag::read_config_dword(b"PresentProbe", 0) != 0;
+    let mut display_half = crate::diag::read_config_dword(b"DisplayHalf", 0) != 0;
+    crate::diag::record_named_bytes(b"AlcC", alloc_cached as u32);
+    crate::diag::record_named_bytes(b"PBPrEn", present_probe as u32);
+    crate::diag::record_named_bytes(b"DspH", display_half as u32);
 
     // Registry values persist across boots, so a stale nonzero fault counter is
     // indistinguishable from a fault on THIS boot. Zero the whole set once here,
@@ -137,8 +163,17 @@ pub unsafe extern "C" fn dxgkddi_start_device(
     // rule applies to every counter below.
     crate::diag::reset_fault_counters();
 
-    if adapter.paging_ram.is_none() {
-        adapter.paging_ram = AdapterContext::alloc_paging_ram();
+    // Carried over from a previous start on this same context, if any: these
+    // blocks are allocated once and freed only in Drop, and today's code gets
+    // that by leaving the fields untouched across StopDevice. Publish-once would
+    // otherwise leak them and allocate again.
+    // SAFETY: StartDevice, PASSIVE, serialized by dxgkrnl against every other
+    // lifecycle DDI; the blocks are republished below in the new state.
+    let mut paging_ram = unsafe { adapter.take_paging_ram() };
+    // SAFETY: same contract.
+    let carried_probe_ram = unsafe { adapter.take_bar_probe_ram() };
+    if paging_ram.is_none() {
+        paging_ram = AdapterContext::alloc_paging_ram();
     }
 
     // ── Phase 2: bring up the virtio-gpu transport ──────────────────────────
@@ -158,8 +193,13 @@ pub unsafe extern "C" fn dxgkddi_start_device(
     // Non-zero only if init below fails, so the display-half demotion can report
     // the status that actually killed the transport rather than a bare flag.
     let mut transport_fail_status: u32 = 0;
+    // The transport generation, built as locals and installed after publication.
+    let mut bar_segment = None;
+    let mut bar_probe_ram = None;
+    let mut venus_ctx_id = 0u32;
+    let mut page_table_window = None;
     // SAFETY: dxgkrnl_interface is valid per the DDI contract (also copied into
-    // adapter.dxgkrnl just above); init only borrows it for the call.
+    // the `dxgkrnl` local above); init only borrows it for the call.
     match crate::virtio::VirtioGpu::init(unsafe { &*dxgkrnl_interface }) {
         Ok(gpu) => {
             crate::kmsg(c"Helios: virtio-gpu transport up\n");
@@ -175,7 +215,7 @@ pub unsafe extern "C" fn dxgkddi_start_device(
             // Reserve the window head BEFORE any blob map can allocate a
             // window offset, and before dxgkrnl queries segments.
             // Two-memory-split fix (Option A).
-            adapter.bar_segment = setup_bar_segment(adapter);
+            (bar_segment, bar_probe_ram) = setup_bar_segment(adapter);
 
             // ── Venus-backed page-table memory (best-effort) ─────────────────
             // Self-allocate a 16-MiB HOST_VISIBLE|HOST_COHERENT VkDeviceMemory over
@@ -189,9 +229,7 @@ pub unsafe extern "C" fn dxgkddi_start_device(
             // start-safe). See virtio::venus.
             if !VENUS_ALLOC_ENABLED {
                 // venus page-table allocation disabled — boot-safe build.
-                adapter.venus_ctx_id = 0;
                 adapter.set_venus_client(None);
-                adapter.page_table_window = None;
             } else {
                 // Persistent venus context for the device lifetime (owner 0:
                 // KMD-internal, destroyed explicitly in StopDevice).
@@ -208,9 +246,9 @@ pub unsafe extern "C" fn dxgkddi_start_device(
                 match venus_result {
                     Ok((ctx_id, client, blob)) => {
                         crate::diag::record(0x0B00_0007);
-                        adapter.venus_ctx_id = ctx_id;
+                        venus_ctx_id = ctx_id;
                         adapter.set_venus_client(Some(client));
-                        adapter.page_table_window = Some((blob.gpa, blob.size));
+                        page_table_window = Some((blob.gpa, blob.size));
                     }
                     Err(e) => {
                         // venus bring-up failed; transport is up but no page-table window.
@@ -218,9 +256,7 @@ pub unsafe extern "C" fn dxgkddi_start_device(
                         crate::diag::record(0x0B00_00E7);
                         crate::diag::record(status as u32);
                         crate::diag::fault(crate::diag::FaultCounter::StVnu, status as u32);
-                        adapter.venus_ctx_id = 0;
                         adapter.set_venus_client(None);
-                        adapter.page_table_window = None;
                     }
                 }
             } // end if VENUS_ALLOC_ENABLED
@@ -251,8 +287,8 @@ pub unsafe extern "C" fn dxgkddi_start_device(
     // Turning the flag OFF - rather than merely reporting zero sources - is
     // required because ~20 display DDIs branch on the flag itself. StartDevice
     // still returns STATUS_SUCCESS: the render-only recovery shape is preserved.
-    if adapter.display_half && adapter.with_virtio(|_| ()).is_err() {
-        adapter.display_half = false;
+    if display_half && adapter.with_virtio(|_| ()).is_err() {
+        display_half = false;
         crate::diag::fault(
             crate::diag::FaultCounter::StNoTx,
             if transport_fail_status != 0 {
@@ -269,7 +305,7 @@ pub unsafe extern "C" fn dxgkddi_start_device(
     // video-output, with the VidPn/child DDIs driving virtio-gpu scanout.
     // SAFETY: out-pointers validated non-null above.
     unsafe {
-        if adapter.display_half {
+        if display_half {
             *number_of_video_present_sources = crate::ddi::vidpn::NUM_VIDPN_SOURCES;
             *number_of_children = crate::ddi::vidpn::NUM_CHILDREN;
         } else {
@@ -288,7 +324,11 @@ pub unsafe extern "C" fn dxgkddi_start_device(
     // this boot.
     crate::ddi::display::reset_scanout_reject_counters();
 
-    if adapter.display_half {
+    // The scan-out mode and its EDID, resolved BEFORE publication because
+    // `StartedState` is published exactly once.
+    let mut display_w = 0u32;
+    let mut display_h = 0u32;
+    if display_half {
         // Adopt the host's scanout-0 size (GET_DISPLAY_INFO, captured at transport
         // init) as the VidPn mode + generated-EDID native resolution, so Helios
         // presents the size QEMU actually wants on scanout 0. Falls back to the
@@ -301,8 +341,8 @@ pub unsafe extern "C" fn dxgkddi_start_device(
         // host answered but reported nothing usable.
         match adapter.with_virtio(|v| v.display_mode()) {
             Ok(Some((w, h))) => {
-                adapter.display_w = w;
-                adapter.display_h = h;
+                display_w = w;
+                display_h = h;
             }
             Ok(None) => {
                 crate::diag::fault(crate::diag::FaultCounter::StMdB, 1);
@@ -312,9 +352,54 @@ pub unsafe extern "C" fn dxgkddi_start_device(
                 crate::diag::fault(crate::diag::FaultCounter::StTxG, status as u32);
             }
         }
-        let (w, h) = adapter.display_mode();
-        adapter.edid = crate::ddi::vidpn::build_edid(w, h);
-        crate::diag::record_named_bytes(b"DspMd", (w << 16) | (h & 0xFFFF));
+    }
+    // Same rule `AdapterContext::display_mode` applies, evaluated here so the
+    // EDID and the mode are generated from ONE value.
+    let (mode_w, mode_h) = if display_w >= 320 && display_h >= 240 {
+        (display_w, display_h)
+    } else {
+        (
+            crate::ddi::vidpn::DEFAULT_MODE_WIDTH,
+            crate::ddi::vidpn::DEFAULT_MODE_HEIGHT,
+        )
+    };
+    let edid = if display_half {
+        crate::ddi::vidpn::build_edid(mode_w, mode_h)
+    } else {
+        [0u8; 128]
+    };
+
+    // ── Publish. Everything above was a local; from here the adapter answers. ──
+    // The RAM block the probe arm carried in is freed if this start did not take
+    // it (mode changed away from 5), rather than being dropped on the floor.
+    if bar_probe_ram.is_none() {
+        bar_probe_ram = carried_probe_ram;
+    } else if let Some(stale) = carried_probe_ram {
+        AdapterContext::free_contiguous_ram(stale);
+    }
+    // SAFETY: StartDevice, PASSIVE_LEVEL, serialized by dxgkrnl; published once
+    // per start, and every reader reaches it through the Acquire in `started()`.
+    unsafe {
+        adapter.publish_started(crate::adapter::StartedState::new(
+            dxgkrnl,
+            alloc_cached,
+            present_probe,
+            display_half,
+            display_w,
+            display_h,
+            edid,
+            paging_ram,
+            bar_probe_ram,
+        ));
+        adapter.set_transport_generation(Some(crate::adapter::TransportGeneration {
+            page_table_window,
+            bar_segment,
+            venus_ctx_id,
+        }));
+    }
+
+    if display_half {
+        crate::diag::record_named_bytes(b"DspMd", (mode_w << 16) | (mode_h & 0xFFFF));
         crate::ddi::scanout_diag::maybe_run(adapter);
 
         // Arm the CRTC_VSYNC heartbeat: without a free-running VSync, dxgkrnl never
@@ -322,7 +407,8 @@ pub unsafe extern "C" fn dxgkddi_start_device(
         // FlipThread analog). `dxgkrnl` was saved above so the DPC can synthesize
         // interrupts. Never armed on the render-only surface.
         // SAFETY: `adapter` is the final boxed context (dxgkrnl holds it as the
-        // miniport device context); the dxgkrnl interface is saved. PASSIVE_LEVEL.
+        // miniport device context); the started state — including the callback
+        // table the DPC needs — is published above. PASSIVE_LEVEL.
         unsafe { adapter.init_vsync() };
 
         // Start the HPD worker: it indicates the child connected shortly after this
@@ -356,10 +442,10 @@ pub unsafe extern "C" fn vsync_dpc_routine(
     // for the device lifetime (freed only in RemoveDevice, after the timer is
     // cancelled in StopDevice).
     let adapter = unsafe { &*(context as *const AdapterContext) };
-    if !adapter.display_half || adapter.vsync_enabled.load(Ordering::Acquire) == 0 {
+    if !adapter.display_half() || adapter.vsync_enabled.load(Ordering::Acquire) == 0 {
         return;
     }
-    let Some(dxgkrnl) = adapter.dxgkrnl.as_ref() else {
+    let Some(dxgkrnl) = adapter.dxgkrnl_opt() else {
         return;
     };
     // SetVidPnSourceAddress can hand us a new exact primary from inside the
@@ -393,8 +479,12 @@ pub unsafe extern "C" fn vsync_dpc_routine(
 pub unsafe extern "C" fn dxgkddi_stop_device(miniport_device_context: *mut c_void) -> NTSTATUS {
     crate::kmsg(c"Helios: StopDevice\n");
     if !miniport_device_context.is_null() {
+        // SHARED borrow, for the same reason StartDevice takes one: the ISR and
+        // the DPCs can still build `&AdapterContext` from this pointer while this
+        // function runs, and it does not stop being true just because we are
+        // tearing down.
         // SAFETY: our adapter context, handed back from AddDevice.
-        let adapter = unsafe { &mut *(miniport_device_context as *mut AdapterContext) };
+        let adapter = unsafe { &*(miniport_device_context as *const AdapterContext) };
         // Stop the ISR from touching the (about-to-be-reset) device first.
         adapter
             .isr_status
@@ -415,10 +505,8 @@ pub unsafe extern "C" fn dxgkddi_stop_device(miniport_device_context: *mut c_voi
         // Tear down the venus client + page-table blob + context BEFORE dropping
         // the transport (the unref/detach/destroy commands need the live device).
         // Drop the client first to unmap its ring/reply BAR kernel mappings.
-        let venus_ctx = adapter.venus_ctx_id;
+        let venus_ctx = adapter.venus_ctx_id();
         adapter.set_venus_client(None); // Drop → MmUnmapIoSpace ring + reply mappings.
-        adapter.page_table_window = None;
-        adapter.venus_ctx_id = 0;
         if venus_ctx != 0 {
             // Best-effort: unref every KMD-internal blob (owner 0) and destroy the
             // venus context (PASSIVE flows through virtio::ctrl).
@@ -435,7 +523,19 @@ pub unsafe extern "C" fn dxgkddi_stop_device(miniport_device_context: *mut c_voi
         // frees its rings (plus any in-flight/parked entry buffers). A later
         // StartDevice re-initializes.
         adapter.set_virtio(None);
-        adapter.bar_segment = None;
+
+        // Drop the whole transport generation in one store — `page_table_window`,
+        // `bar_segment` and `venus_ctx_id` together, since all three are
+        // meaningless in the next generation.
+        //
+        // The STICKY half is deliberately left alone. StopDevice has never
+        // cleared the knobs, the mode or the EDID, and about two dozen sites
+        // branch on `display_half`; clearing it here would flip all of them from
+        // SUCCESS-shaped answers to NOT_SUPPORTED between StopDevice and
+        // RemoveDevice. That is a behaviour change, not a tidy-up.
+        // SAFETY: StopDevice, PASSIVE_LEVEL, serialized by dxgkrnl against
+        // StartDevice and against every DDI that reads the generation.
+        unsafe { adapter.set_transport_generation(None) };
     }
     STATUS_SUCCESS
 }
@@ -533,7 +633,7 @@ pub unsafe extern "C" fn dxgkddi_set_power_state(
     // Compared against the bindgen discriminant rather than a hand-written
     // integer, so a WDK header change cannot silently invert this.
     if device_power_state == _DEVICE_POWER_STATE::PowerDeviceD0 {
-        if adapter.display_half {
+        if adapter.display_half() {
             // SAFETY: the context is the final boxed adapter (dxgkrnl holds it
             // as the miniport device context) and dxgkrnl was saved at
             // StartDevice. PASSIVE_LEVEL.
@@ -565,7 +665,7 @@ pub unsafe extern "C" fn dxgkddi_query_child_relations(
     }
     // SAFETY: dxgkrnl hands back our AdapterContext.
     let adapter = unsafe { &*(miniport_device_context as *const AdapterContext) };
-    if !adapter.display_half || child_relations.is_null() {
+    if !adapter.display_half() || child_relations.is_null() {
         // No connectors/monitors → leave the (already-zeroed) array untouched.
         return STATUS_SUCCESS;
     }
@@ -639,7 +739,7 @@ pub unsafe extern "C" fn dxgkddi_query_child_status(
     }
     // SAFETY: our AdapterContext.
     let adapter = unsafe { &*(miniport_device_context as *const AdapterContext) };
-    if !adapter.display_half {
+    if !adapter.display_half() {
         // We reported NumberOfChildren = 0, so there is no child whose status we
         // could answer. Returning SUCCESS with the caller's DXGK_CHILD_STATUS
         // untouched is a fake success; NOT_SUPPORTED is in the DDI's legal
@@ -686,7 +786,7 @@ pub unsafe extern "C" fn dxgkddi_query_device_descriptor(
     }
     // SAFETY: our AdapterContext.
     let adapter = unsafe { &*(miniport_device_context as *const AdapterContext) };
-    if !adapter.display_half {
+    if !adapter.display_half() {
         return STATUS_NOT_SUPPORTED;
     }
     if device_descriptor.is_null() {
@@ -697,7 +797,9 @@ pub unsafe extern "C" fn dxgkddi_query_device_descriptor(
     // the EDID-less "default monitor") is what makes the OS build a presentable
     // target — the 35th session's CHILD_DESCRIPTOR_NOT_SUPPORTED default-monitor
     // path is a suspect for the mode-set retry loop (WINDOWED_BLT_DESIGN §6.3).
-    let edid = &adapter.edid;
+    let Some(edid) = adapter.edid() else {
+        return STATUS_NOT_SUPPORTED;
+    };
     // SAFETY: non-null per the check; dxgkrnl provides a writable descriptor.
     let dd = unsafe { &mut *device_descriptor };
     let offset = dd.DescriptorOffset as usize;
@@ -740,7 +842,7 @@ pub unsafe extern "C" fn dxgkddi_get_child_container_id(
     }
     // SAFETY: our AdapterContext.
     let adapter = unsafe { &*(miniport_device_context as *const AdapterContext) };
-    if !adapter.display_half {
+    if !adapter.display_half() {
         return STATUS_NOT_SUPPORTED;
     }
     // SAFETY: dxgkrnl provides a writable DXGK_CHILD_CONTAINER_ID.

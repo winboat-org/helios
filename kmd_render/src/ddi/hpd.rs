@@ -21,7 +21,7 @@ const STATUS_TIMEOUT: NTSTATUS = 0x0000_0102;
 
 /// Indicate the single child video-output's connection state to the OS. PASSIVE.
 fn indicate_child_status(adapter: &AdapterContext, connected: bool) {
-    let Some(dxgkrnl) = adapter.dxgkrnl.as_ref() else {
+    let Some(dxgkrnl) = adapter.dxgkrnl_opt() else {
         return;
     };
     let Some(indicate) = dxgkrnl.DxgkCbIndicateChildStatus else {

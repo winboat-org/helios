@@ -170,8 +170,7 @@ unsafe fn vidpn_interface(
     h_vidpn: D3DKMDT_HVIDPN,
 ) -> Result<*const DXGK_VIDPN_INTERFACE, NTSTATUS> {
     let dxgkrnl = adapter
-        .dxgkrnl
-        .as_ref()
+        .dxgkrnl_opt()
         .ok_or(STATUS_GRAPHICS_INVALID_VIDPN)?;
     let query = dxgkrnl
         .DxgkCbQueryVidPnInterface

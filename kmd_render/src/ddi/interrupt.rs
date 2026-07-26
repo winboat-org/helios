@@ -65,7 +65,7 @@ pub(crate) fn drain_used_and_complete(adapter: &AdapterContext) {
             if ready.refresh_scanout() {
                 adapter.request_scanout_refresh();
             }
-            let Some(dxgkrnl) = adapter.dxgkrnl.as_ref() else {
+            let Some(dxgkrnl) = adapter.dxgkrnl_opt() else {
                 // No callback table: we cannot deliver and must not drop it.
                 let _ = guard.with_virtio(|o, v| v.requeue_wddm_front(o, ready));
                 break;
@@ -136,7 +136,7 @@ pub unsafe extern "C" fn dxgkddi_interrupt_routine(
     // Bit 0 = used-ring progress (drain), bit 1 = config change: either needs the
     // DPC. (The ISR-status read above already deasserted the line for both.)
     if status & 0x3 != 0 {
-        if let Some(dxgkrnl) = adapter.dxgkrnl.as_ref() {
+        if let Some(dxgkrnl) = adapter.dxgkrnl_opt() {
             if let Some(queue_dpc) = dxgkrnl.DxgkCbQueueDpc {
                 // SAFETY: DxgkCbQueueDpc is callable from the ISR at DIRQL;
                 // DeviceHandle is the live dxgkrnl device handle.
@@ -166,7 +166,7 @@ pub unsafe extern "C" fn dxgkddi_dpc_routine(miniport_device_context: *mut c_voi
     // Let dxgkrnl process any interrupt data queued by DxgkCbNotifyInterrupt
     // (the WDDM fence completions signaled below re-queue this DPC, and this
     // call drains their packets — the viogpu3d NotifyDpcRoutine ordering).
-    if let Some(dxgkrnl) = adapter.dxgkrnl.as_ref() {
+    if let Some(dxgkrnl) = adapter.dxgkrnl_opt() {
         if let Some(notify_dpc) = dxgkrnl.DxgkCbNotifyDpc {
             // SAFETY: DISPATCH_LEVEL DPC context; live device handle.
             unsafe { notify_dpc(dxgkrnl.DeviceHandle) };
@@ -197,7 +197,7 @@ pub unsafe extern "C" fn dxgkddi_control_interrupt(
         && interrupt_type == _DXGK_INTERRUPT_TYPE::DXGK_INTERRUPT_CRTC_VSYNC
         // SAFETY: dxgkrnl hands our AdapterContext; `display_half` is a plain bool
         // set once at StartDevice.
-        && unsafe { (*p).display_half }
+        && unsafe { (*p).display_half() }
     {
         // SAFETY: valid for the device lifetime.
         let adapter = unsafe { &*p };

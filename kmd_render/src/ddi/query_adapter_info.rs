@@ -683,10 +683,7 @@ unsafe fn query_segments(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTERIN
         // when VidMm builds its segment table. If the contiguous RAM allocation was
         // unavailable, fall back to NbSegment=1 (aperture only).
         let page_table = adapter.paging_ram();
-        let bar = adapter
-            .bar_segment
-            .as_ref()
-            .map(|b| (b.gpa, b.size, b.topo));
+        let bar = adapter.bar_segment().map(|b| (b.gpa, b.size, b.topo));
         crate::diag::record(if descriptors.is_null() {
             0x0901_0000
         } else {
