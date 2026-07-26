@@ -221,15 +221,74 @@ virtio-gpu scanout; IddCx/Looking Glass is no longer the active display path.*
    ⚠ **Observable knob change (R429):** `HELIOS_PRESENT_READBACK`, `HELIOS_PRESENT_FORCE_OPAQUE` and
    `HELIOS_PRESENT_OPTIMIZE_COMPOSITION` are now read ONCE per process; setting them on a live
    process no longer takes effect.
-6. **NEXT — T3** (`REFACTOR_REVIEW.md` §T3): 15 items R501–R515, **KMD image + reboot**.
-   **OWNER DECISION 2026-07-27: T3 goes before T4 and T5.** (T5 was the cheaper next step —
-   UMD-only, prereqs landed, and it reshapes code T2 just touched — but the owner chose the display
-   half first.) T3's three named prerequisites all landed in T1a: `k-display-01`, `k-display-03`
-   (R504's precondition) and `k-display-13` (R513's). It encodes the display/scanout invariants:
-   scanout-lifecycle proof tokens instead of prose-documented locks, one RAII `ProgrammingInterval`
-   replacing nine `vidpn_programming` clear sites, one exit + a reject enum + per-class counters for
-   the deferred programming path, a generation tag so a stale completion cannot clear a newer
-   interval, and `&mut AdapterContext` gone from StartDevice/StopDevice.
+6. **T3 LANDED — gate MOSTLY PASSED (2026-07-27, KMD `22.22.183.0`, 22 commits).** All 15 items
+   R501–R515, one commit each, R515 split into its two mandated commits. Prereqs verified in T1a
+   before starting: `k-display-01` (`58df173`), `k-display-03` (`a829eed`), `k-display-13`
+   (`2aa3bb8`). **OWNER DECISION: T3 went before T4/T5.**
+   Landed: R501 (`ScanoutGuard`; the 59-line `retire_scanout_allocation` body verified
+   line-identical), R502 (`NotifyOrdered` — **correction: NINE guard-scoped `with_virtio` sites and
+   SIX ordered methods, not seven/five; T1a split `take_ready_wddm`**), R503 (`ScanoutFormat` in
+   `kmd_logic`; **deviation — the review's single acceptance set would have CHANGED behaviour**, so
+   `from_dxgi` (strict {28,87,88}) and `from_dxgi_or_legacy_zero` (adds `0`) preserve both sets),
+   R504 (RAII `ProgrammingInterval`, nine `store(0)` sites gone, one `transfer_to_completion`),
+   R505 (`ScanoutReject`, 8 breadcrumb pairs + statuses diffed by hand, 9 new counters),
+   R506 (`ProgrammedPrimary` + per-variant `retryable()` + 4-attempt budget), R507
+   (`WindowsPrimary`/`ScanoutTarget`; **the undersize guard moved byte-identical**), R508
+   (`enqueue_scanout_submit`; store order and `response_ok` asymmetry diffed unchanged), R509
+   (packed `(seq<<32)|active` gate; **FOUR reader contexts — the review named one gpu.rs clear
+   site, there are TWO**), R510 (`StartedState` published once; **deviation — ONE commit, not three:
+   publish-once forbids continuing to mutate `dxgkrnl` through a live `&mut`, so sub-commits 1 and 2
+   are not separable**), R511, R512, R513 (four RAII guards + `CofuncStage`; `VpECf` codes verified
+   byte-identical), R514 (`VidPn<'a>`, **no `'static` anywhere — grep-verified**), R515 c1
+   (swap-before-indicate, the tranche's declared behaviour fix) and c2 (`start_complete` edge).
+   22 host tests in `kmd_logic` green.
+   **Gate evidence, all same boot (`22.22.183.0` pending; measured on `.182`, code-identical apart
+   from the knob name):** cold boot → `CM_PROB_NONE`, **visible composited desktop** (paintcap:
+   wallpaper, taskbar, window chrome, live clock). Per-flip diag over the fixed 60 s session
+   **identical to the pre-image baseline**: `VpSA` 1→1200→2400, `ScSet=1 ScFlu=3 VpDSt=0
+   DspMd=124257286 ScCpy=2 ScPch=7680 ScOff=0` at every snapshot (`ScRid` differs — it is a
+   per-boot resource id). All 15 new counters **0**, including `ScStale=0` (the DIRQL/PASSIVE
+   interleave does not occur), `ScGateCx=0` (the DIRQL CAS never exhausted) and **`HpdStTo=0`
+   (R515's real start edge fired, not the 500 ms fallback)**. `VpECf`/`VpECn` **absent** with
+   `VpECp=1` (R513 clean). Every fault counter 0. **7 consecutive `pnputil /restart-device`
+   cycles** all rebound `CM_PROB_NONE` with a working desktop — the R510/R511 blast radius.
+   present-gate **avg 2089 µs / 0.86 % timeouts** vs 2189 µs / 0.96 % before. Same-boot QEMU:
+   **18 × `OPTIMAL DMA-BUF ready 1896x1030`, `tiling=OPTIMAL size=8773632`**.
+   ⚠ **NOT YET PROVEN — the forced-refusal leg.** The gate instrument (`ScForceReject`) was named
+   `ScanoutForceReject` (18 chars) and `read_config_dword` truncates to 14, so it read as its
+   default 0 on every boot and not one exit was forced. Fixed in `.183` (see the knob-limit entry
+   below); the eight exits still need one run. Note exits 7 (`NoTarget`) and 8 (`CopyFailed`) live
+   on the copy/fallback arm, which a direct primary never takes — they need a forced-fallback build,
+   exactly as the review predicted.
+   ⚠ **DComp cadence: ~45 fps after (44.0/46.6/46.2/45.0, four 25 s runs) vs ~52 before
+   (53.4/50.4).** Within the documented 42–53 boot-to-boot spread and the `.180` measurement was on
+   a 5-hour-uptime box vs a fresh boot here, so this is **neither attributed to T3 nor cleared** —
+   a KMD A/B on one boot is impossible. Folds into the open WS2 cadence defect.
+   ⚠ **Not performed:** suspend/resume and the cursor-trail check (owner opted to run both; still
+   outstanding).
+   ⚠ **BOOT REGRESSION found and fixed — `22.22.181.0` did not boot** (`0xc0000001` / Startup
+   Repair, only with the virtio-gpu device present). **Kernel stack overflow in
+   `DxgkDdiStartDevice`**, measured from the images: StartDevice 8824 B (.180) → **9688 B** (.181),
+   and it calls `VirtioGpu::init` at 9112 B — **18800 B nested on a 24 KB kernel stack**, with
+   dxgkrnl's frames above. R510's 832-byte `StartedState` (which embeds a 576-byte
+   `DXGKRNL_INTERFACE`) was built and passed BY VALUE in that frame. Fixed by boxing it behind an
+   `#[inline(never)] StartedState::boxed` that takes the interface as a POINTER, plus an
+   `#[inline(never)] bring_up_venus`: **8376 B, nested 17488 B — below the known-good .180**.
+   Diagnostic notes: it ran FINE as a live `devcon` restart (shallower caller stack), and an early
+   double fault writes **no dump and logs no bugcheck event** — the absence was the clue. ⚠ **The
+   pair is still ~17.5 KB of 24 KB; `VirtioGpu::init` alone is 9112 B and is pre-existing. The next
+   change adding ~1 KB to either function re-breaks boot the same silent way** — shrink
+   `VirtioGpu::init`, or add a build-time frame check on the boot path.
+   ⚠ **Deploy trap hit:** `.181` was published before it was known bad, so its DriverStore package
+   had to be `pnputil /delete-driver`'d and the service `ImagePath` **and** the display key's
+   `UserModeDriverName`/`…Wow` repointed by hand — `win_install_kmd` refuses to run with the PCI
+   device absent, so the script's normal fixups never happened. Sweep `HKLM\SYSTEM` for the old
+   store-dir GUID after any manual driver surgery.
+   ⚠ **New durable guard:** `read_config_dword` now takes `&[u8; N]` and const-asserts
+   `N <= MAX_CONFIG_NAME` (14), so an over-long knob is a BUILD FAILURE instead of a knob that
+   silently reads as its default forever. Two shipped knobs (`CrossAdaptCaps`, `DirectFlipCaps`)
+   already sit exactly at the limit. The guard fires on `cargo build`, **not** `cargo check` — an
+   inline `const` in a generic fn is evaluated at monomorphisation.
    ⚠ One consequence for T5 sequencing: T5's **R805** renames `protocol/`'s `_pad` and four
    `kmd_render` read sites, so it is not UMD-only. Doing T3 first means R805 folds naturally into a
    KMD-deploy window instead of being an awkward exception to T5's "release UMD only" shape.
@@ -1749,6 +1808,29 @@ Plan:
   text. Found the segment rule in minutes.
 - **AddAdapter iteration**: `pnputil /restart-device` re-runs AddAdapter with
   the loaded image — registry-knob experiments need no reboot.
+- **T3 refusal instrument**: `ScForceReject` (service key, REG_DWORD, default 0
+  and absent in production) forces ONE deferred-programming refusal exit so its
+  counter can be proven to move: 1=BadAlloc 2=Extent 3=Layout 4=Format
+  5=LinearAllocFailed 6=SetFailed 7=NoTarget 8=CopyFailed. Read at StartDevice,
+  so `restart-device` between values — no reboot. Mirrored to `ScFrc`; a nonzero
+  `ScFrc` means the `Sc*Err` values in that dump were PROVOKED, not observed.
+  7 and 8 sit on the copy/fallback arm and are unreachable with a direct primary.
+  T6 deletion candidate. ⚠ Knob names are capped at **14 chars**
+  (`diag::MAX_CONFIG_NAME`) — now a build failure, previously a silent
+  always-default.
+- **T3 counters** (all must read 0; reset at StartDevice so movement is
+  this-boot): `ScBadAlc ScBadExt ScBadLay ScBadFmt ScLinErr ScSetErr ScNoTgt
+  ScCpyErr` (one per refusal class), `ScUnav` (HPD dropped a dirty bit),
+  `ScRetry`/`ScGaveUp` (R506's bounded retry), `ScStale` (a completion tried to
+  clear an interval that was not its own), `ScGateCx` (the DIRQL raise CAS
+  exhausted its budget), `HpdStTo` (the HPD prologue fell back to its 500 ms
+  bound instead of the real start edge).
+- ⚠ **Kernel stack budget on the boot path**: `DxgkDdiStartDevice` +
+  `VirtioGpu::init` are ~17.5 KB of a 24 KB kernel stack (8376 + 9112 as of
+  22.22.183.0). Overflow at boot = `0xc0000001`/Startup Repair with **no dump and
+  no bugcheck event**, and it does NOT reproduce on a live `devcon` restart.
+  Measure with `llvm-objdump -d` + the linker `.map`: find the function entry,
+  read the `movl $N, %eax; call __chkstk` prologue.
 - **Guest probes** (schtasks, session 1; SSH lands in session 0):
   `helios_paintcap` (screenshot → `Z:\tmp\screen_copy.png`), `helios_repaint`,
   `helios_flasher`, `helios_dstate`, `helios_enum_windows`, `helios_regedit`.
