@@ -425,21 +425,38 @@ unsafe fn audit_wddm1_3_device_funcs(tag: &str, funcs: *mut ddi::D3DWDDM1_3DDI_D
         }
     }
 
-    let mut bad = 0usize;
+    // Exact stub identities, not an ASLR assumption. `value < 0x1_0000_0000` was
+    // a guess about where modules load: it flagged every legitimately
+    // low-loaded pointer and said nothing about WHICH stub a slot held. Both
+    // addresses are already in scope here, so the classification is exact and
+    // per-slot — that is what answers "which DDI is still a stub", at fill
+    // time and by index, instead of a 32-frame backtrace at hit time.
+    let noop = ddi_noop_device as UniformFn as usize;
+    let calc = ddi_calc_size as UniformFn as usize;
+    let mut null_slots = 0usize;
+    let mut noop_slots = 0usize;
+    let mut calc_slots = 0usize;
     for i in 0..n {
         let value = *slots.add(i);
-        if value == 0 || value < 0x0000_0001_0000_0000 {
-            bad += 1;
-            if bad <= 16 {
-                log_line(&format!(
-                    "{tag}: WDDM1.3 suspicious slot[{i:03}]=0x{value:016x}"
-                ));
+        if value == 0 {
+            null_slots += 1;
+            log_line(&format!("{tag}: WDDM1.3 NULL slot[{i:03}]"));
+        } else if value == noop {
+            noop_slots += 1;
+            if noop_slots <= 32 {
+                log_line(&format!("{tag}: WDDM1.3 noop slot[{i:03}]"));
             }
+        } else if value == calc {
+            calc_slots += 1;
         }
     }
-    if bad != 0 {
-        log_line(&format!("{tag}: WDDM1.3 suspicious slot count={bad}"));
-    }
+    log_line(&format!(
+        "{tag}: WDDM1.3 slots real={} noop={} calc={} null={}",
+        n.saturating_sub(noop_slots + calc_slots + null_slots),
+        noop_slots,
+        calc_slots,
+        null_slots
+    ));
 }
 
 unsafe fn audit_dxgi_1_3_base_funcs(tag: &str, funcs: *mut ddi::DXGI1_3_DDI_BASE_FUNCTIONS) {
@@ -484,21 +501,29 @@ unsafe fn audit_dxgi_1_3_base_funcs(tag: &str, funcs: *mut ddi::DXGI1_3_DDI_BASE
         }
     }
 
-    let mut bad = 0usize;
+    // Same exact classification as the device-funcs auditor. `noop` here should
+    // never be found: install_dxgi/_1_1/_1_3 overwrite every slot of every DXGI
+    // table (the proof recorded on ddi_noop_dxgi), and this line is what would
+    // contradict that if it ever stopped holding.
+    let noop = ddi_noop_dxgi as UniformFn as usize;
+    let mut null_slots = 0usize;
+    let mut noop_slots = 0usize;
     for i in 0..n {
         let value = *slots.add(i);
-        if value == 0 || value < 0x0000_0001_0000_0000 {
-            bad += 1;
-            if bad <= 16 {
-                log_line(&format!(
-                    "{tag}: DXGI1.3 suspicious slot[{i:02}]=0x{value:016x}"
-                ));
-            }
+        if value == 0 {
+            null_slots += 1;
+            log_line(&format!("{tag}: DXGI1.3 NULL slot[{i:02}]"));
+        } else if value == noop {
+            noop_slots += 1;
+            log_line(&format!("{tag}: DXGI1.3 noop slot[{i:02}]"));
         }
     }
-    if bad != 0 {
-        log_line(&format!("{tag}: DXGI1.3 suspicious slot count={bad}"));
-    }
+    log_line(&format!(
+        "{tag}: DXGI1.3 slots real={} noop={} null={}",
+        n.saturating_sub(noop_slots + null_slots),
+        noop_slots,
+        null_slots
+    ));
 }
 
 /// Real DestroyDevice: drop the in-place HeliosDevice (releasing the DXVK device).
