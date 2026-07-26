@@ -83,7 +83,13 @@ static SERVICE_NAME: [u16; 18] = [
 /// so it is useless for one-shot tracing of a rare DDI (e.g. Present). A fixed
 /// name persists until the next write, so it can be read live from the registry.
 /// `name` must be a NUL-terminated UTF-16 value name. PASSIVE_LEVEL only.
-pub fn record_named(name: &[u16], mut code: u32) {
+///
+/// PRIVATE on purpose: [`record_named_bytes`] is the entry point. `display.rs`
+/// carried a byte-identical copy of that wrapper (`rec_named`) that called this
+/// directly, which is how 79 registry writes accumulated on the Present path
+/// outside every policy this module documents. With the raw writer private,
+/// a future bypass has to be a deliberate edit to this file.
+fn record_named(name: &[u16], mut code: u32) {
     // SAFETY: PASSIVE_LEVEL (see module note). `name` is a caller-provided
     // NUL-terminated UTF-16 value name; ValueData points to a 4-byte DWORD that
     // RtlWriteRegistryValue copies before returning.

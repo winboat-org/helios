@@ -24,20 +24,6 @@ use crate::virtio::venus::{OptimalPresentImageDesc, PresentBufferDesc, PresentDe
 use crate::virtio::VirtioError;
 use wdk_sys::ntddk::KeGetCurrentIrql;
 
-/// Write a DWORD to a fixed (non-ring) registry value so a rare DDI's trace
-/// survives the `S<idx>` ring's steady-state QueryAdapterInfo flood. PASSIVE only.
-fn rec_named(name: &[u8], value: u32) {
-    let mut buf = [0u16; 16];
-    let n = name.len().min(14);
-    let mut i = 0;
-    while i < n {
-        buf[i] = name[i] as u16;
-        i += 1;
-    }
-    buf[n] = 0;
-    crate::diag::record_named(&buf[..=n], value);
-}
-
 pub static PRESENT_COUNT: AtomicU32 = AtomicU32::new(0);
 pub static PRESENT_LAST_SRC_COUNT: AtomicU32 = AtomicU32::new(0);
 pub static PRESENT_LAST_DST_COUNT: AtomicU32 = AtomicU32::new(0);
@@ -192,7 +178,7 @@ pub unsafe extern "C" fn dxgkddi_present(
     let status = unsafe { dxgkddi_present_inner(h_context, present) };
     // Fixed-name telemetry survives the steady-state registry ring flood and
     // proves whether a failing UMD pfnPresentCb originated in this DDI.
-    rec_named(b"PBRet", status as u32);
+    crate::diag::record_named_bytes(b"PBRet", status as u32);
     status
 }
 
@@ -221,13 +207,13 @@ unsafe fn dxgkddi_present_inner(
     // is DxgkDdiPresent even the hook for the IddCx composition present, and with
     // what flags / src+dst counts / allocation-list presence? PBcall counts calls;
     // its absence means the IddCx present does NOT route through this DDI.
-    rec_named(b"PBcall", PRESENT_COUNT.load(Ordering::Relaxed));
-    rec_named(b"PBflag", present_flags);
-    rec_named(
+    crate::diag::record_named_bytes(b"PBcall", PRESENT_COUNT.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"PBflag", present_flags);
+    crate::diag::record_named_bytes(
         b"PBcnt",
         (args.NumSrcAllocations << 16) | (args.NumDstAllocations & 0xFFFF),
     );
-    rec_named(
+    crate::diag::record_named_bytes(
         b"PBalst",
         if unsafe { args.__bindgen_anon_1.pAllocationList }.is_null() {
             0
@@ -235,14 +221,14 @@ unsafe fn dxgkddi_present_inner(
             1
         },
     );
-    rec_named(b"PBDma", args.DmaSize);
-    rec_named(b"PBPatch", args.PatchLocationListOutSize);
+    crate::diag::record_named_bytes(b"PBDma", args.DmaSize);
+    crate::diag::record_named_bytes(b"PBPatch", args.PatchLocationListOutSize);
 
     let allocation_list = unsafe { args.__bindgen_anon_1.pAllocationList };
     let present_allocations = unsafe { PresentAllocations::from_allocation_list(allocation_list) };
     let present_private = unsafe { present_private_data(args) };
-    rec_named(b"PBpdsz", args.PrivateDriverDataSize);
-    rec_named(b"PBkpsz", args.DmaBufferPrivateDataSize);
+    crate::diag::record_named_bytes(b"PBpdsz", args.PrivateDriverDataSize);
+    crate::diag::record_named_bytes(b"PBkpsz", args.DmaBufferPrivateDataSize);
     let present_context = unsafe { ContextHandleRef::from_raw(h_context) };
     let adapter = present_context.as_ref().and_then(ContextHandleRef::adapter);
     let src_handle = present_allocations
@@ -264,27 +250,27 @@ unsafe fn dxgkddi_present_inner(
         // geometry, and report whether each is a tracked host-visible-mappable
         // blob the KMD could CPU-map for a coherence copy. Fixed value names so
         // the data survives the diag ring flood; read live from the service key.
-        rec_named(b"PBsrcH", (src_handle as usize as u32) & 0xFFFF);
-        rec_named(b"PBdstH", (dst_handle as usize as u32) & 0xFFFF);
+        crate::diag::record_named_bytes(b"PBsrcH", (src_handle as usize as u32) & 0xFFFF);
+        crate::diag::record_named_bytes(b"PBdstH", (dst_handle as usize as u32) & 0xFFFF);
         if let Some(s) = src_info {
-            rec_named(b"PBsRtA", s.runtime_allocation);
-            rec_named(b"PBsrc", s.resource_id);
-            rec_named(b"PBsw", s.width);
-            rec_named(b"PBsh", s.height);
-            rec_named(b"PBsPch", s.pitch);
-            rec_named(b"PBsFmt", s.dxgi_format);
-            rec_named(b"PBsD3F", s.format);
-            rec_named(b"PBsBnd", s.bind_flags);
-            rec_named(b"PBsSto", s.storage as u32);
-            rec_named(b"PBsKnd", s.kind);
-            rec_named(b"PBsMt", s.memory_type_index);
-            rec_named(b"PBsSz", s.venus_alloc_size as u32);
-            rec_named(b"PBsStd", s.standard_allocation_type);
-            rec_named(b"PBsGdi", s.standard_gdi_surface_type);
-            rec_named(b"PBsOF", s.open_flags);
-            rec_named(b"PBsRA", u32::from(s.resource_associated));
-            rec_named(b"PBsAPS", s.allocation_private_size);
-            rec_named(b"PBsRPS", s.resource_private_size);
+            crate::diag::record_named_bytes(b"PBsRtA", s.runtime_allocation);
+            crate::diag::record_named_bytes(b"PBsrc", s.resource_id);
+            crate::diag::record_named_bytes(b"PBsw", s.width);
+            crate::diag::record_named_bytes(b"PBsh", s.height);
+            crate::diag::record_named_bytes(b"PBsPch", s.pitch);
+            crate::diag::record_named_bytes(b"PBsFmt", s.dxgi_format);
+            crate::diag::record_named_bytes(b"PBsD3F", s.format);
+            crate::diag::record_named_bytes(b"PBsBnd", s.bind_flags);
+            crate::diag::record_named_bytes(b"PBsSto", s.storage as u32);
+            crate::diag::record_named_bytes(b"PBsKnd", s.kind);
+            crate::diag::record_named_bytes(b"PBsMt", s.memory_type_index);
+            crate::diag::record_named_bytes(b"PBsSz", s.venus_alloc_size as u32);
+            crate::diag::record_named_bytes(b"PBsStd", s.standard_allocation_type);
+            crate::diag::record_named_bytes(b"PBsGdi", s.standard_gdi_surface_type);
+            crate::diag::record_named_bytes(b"PBsOF", s.open_flags);
+            crate::diag::record_named_bytes(b"PBsRA", u32::from(s.resource_associated));
+            crate::diag::record_named_bytes(b"PBsAPS", s.allocation_private_size);
+            crate::diag::record_named_bytes(b"PBsRPS", s.resource_private_size);
             let lk = adapter
                 .and_then(|adapter| adapter.with_virtio(|v| v.blob_lookup(s.resource_id)).ok());
             // 0=untracked, else 0x1_0000 | (mapped<<8) | (size in 4KiB pages, low byte)
@@ -294,29 +280,29 @@ unsafe fn dxgkddi_present_inner(
                 }
                 _ => 0,
             };
-            rec_named(b"PBstrk", code);
+            crate::diag::record_named_bytes(b"PBstrk", code);
         } else {
-            rec_named(b"PBsrc", 0);
+            crate::diag::record_named_bytes(b"PBsrc", 0);
         }
         if let Some(d) = dst_info {
-            rec_named(b"PBdRtA", d.runtime_allocation);
-            rec_named(b"PBdst", d.resource_id);
-            rec_named(b"PBdw", d.width);
-            rec_named(b"PBdh", d.height);
-            rec_named(b"PBdPch", d.pitch);
-            rec_named(b"PBdFmt", d.dxgi_format);
-            rec_named(b"PBdD3F", d.format);
-            rec_named(b"PBdBnd", d.bind_flags);
-            rec_named(b"PBdSto", d.storage as u32);
-            rec_named(b"PBdKnd", d.kind);
-            rec_named(b"PBdMt", d.memory_type_index);
-            rec_named(b"PBdSz", d.venus_alloc_size as u32);
-            rec_named(b"PBdStd", d.standard_allocation_type);
-            rec_named(b"PBdGdi", d.standard_gdi_surface_type);
-            rec_named(b"PBdOF", d.open_flags);
-            rec_named(b"PBdRA", u32::from(d.resource_associated));
-            rec_named(b"PBdAPS", d.allocation_private_size);
-            rec_named(b"PBdRPS", d.resource_private_size);
+            crate::diag::record_named_bytes(b"PBdRtA", d.runtime_allocation);
+            crate::diag::record_named_bytes(b"PBdst", d.resource_id);
+            crate::diag::record_named_bytes(b"PBdw", d.width);
+            crate::diag::record_named_bytes(b"PBdh", d.height);
+            crate::diag::record_named_bytes(b"PBdPch", d.pitch);
+            crate::diag::record_named_bytes(b"PBdFmt", d.dxgi_format);
+            crate::diag::record_named_bytes(b"PBdD3F", d.format);
+            crate::diag::record_named_bytes(b"PBdBnd", d.bind_flags);
+            crate::diag::record_named_bytes(b"PBdSto", d.storage as u32);
+            crate::diag::record_named_bytes(b"PBdKnd", d.kind);
+            crate::diag::record_named_bytes(b"PBdMt", d.memory_type_index);
+            crate::diag::record_named_bytes(b"PBdSz", d.venus_alloc_size as u32);
+            crate::diag::record_named_bytes(b"PBdStd", d.standard_allocation_type);
+            crate::diag::record_named_bytes(b"PBdGdi", d.standard_gdi_surface_type);
+            crate::diag::record_named_bytes(b"PBdOF", d.open_flags);
+            crate::diag::record_named_bytes(b"PBdRA", u32::from(d.resource_associated));
+            crate::diag::record_named_bytes(b"PBdAPS", d.allocation_private_size);
+            crate::diag::record_named_bytes(b"PBdRPS", d.resource_private_size);
             let lk = adapter
                 .and_then(|adapter| adapter.with_virtio(|v| v.blob_lookup(d.resource_id)).ok());
             let code = match lk {
@@ -325,9 +311,9 @@ unsafe fn dxgkddi_present_inner(
                 }
                 _ => 0,
             };
-            rec_named(b"PBdtrk", code);
+            crate::diag::record_named_bytes(b"PBdtrk", code);
         } else {
-            rec_named(b"PBdst", 0);
+            crate::diag::record_named_bytes(b"PBdst", 0);
         }
 
         // DXGK_PRESENTFLAGS.Blt is bit 0. Dxgkrnl has already resolved both
@@ -361,7 +347,7 @@ unsafe fn dxgkddi_present_inner(
 
             let (Some(adapter), Some(source), Some(destination)) = (adapter, src_info, dst_info)
             else {
-                rec_named(b"PBCpy", 0xE1);
+                crate::diag::record_named_bytes(b"PBCpy", 0xE1);
                 PRESENT_LAST_STATUS.store(STATUS_INVALID_PARAMETER as u32, Ordering::Relaxed);
                 return STATUS_INVALID_PARAMETER;
             };
@@ -370,12 +356,12 @@ unsafe fn dxgkddi_present_inner(
             let (Some(source_dxgi_format), Some(destination_dxgi_format)) =
                 (source_dxgi_format, destination_dxgi_format)
             else {
-                rec_named(b"PBCpy", 0xE2);
+                crate::diag::record_named_bytes(b"PBCpy", 0xE2);
                 PRESENT_LAST_STATUS.store(STATUS_INVALID_PARAMETER as u32, Ordering::Relaxed);
                 return STATUS_INVALID_PARAMETER;
             };
             if source.kind != HELIOS_WDDM_ALLOC_KIND_DEVICE_MEMORY {
-                rec_named(b"PBCpy", 0xE6);
+                crate::diag::record_named_bytes(b"PBCpy", 0xE6);
                 PRESENT_LAST_STATUS.store(STATUS_INVALID_PARAMETER as u32, Ordering::Relaxed);
                 return STATUS_INVALID_PARAMETER;
             }
@@ -447,12 +433,12 @@ unsafe fn dxgkddi_present_inner(
             };
             let (Some(source_desc), Some(destination_desc)) = (source_desc, destination_desc)
             else {
-                rec_named(b"PBCpy", 0xE2);
+                crate::diag::record_named_bytes(b"PBCpy", 0xE2);
                 PRESENT_LAST_STATUS.store(STATUS_INVALID_PARAMETER as u32, Ordering::Relaxed);
                 return STATUS_INVALID_PARAMETER;
             };
             if source.width != destination.width || source.height != destination.height {
-                rec_named(b"PBCpy", 0xE3);
+                crate::diag::record_named_bytes(b"PBCpy", 0xE3);
                 PRESENT_LAST_STATUS.store(STATUS_INVALID_PARAMETER as u32, Ordering::Relaxed);
                 return STATUS_INVALID_PARAMETER;
             }
@@ -463,17 +449,17 @@ unsafe fn dxgkddi_present_inner(
             let gpu_fence = match copy {
                 Ok(Ok(fence)) => fence,
                 Ok(Err(VirtioError::OutOfMemory | VirtioError::QueueFull)) => {
-                    rec_named(b"PBCpy", 0xE4);
+                    crate::diag::record_named_bytes(b"PBCpy", 0xE4);
                     PRESENT_LAST_STATUS.store(STATUS_NO_MEMORY as u32, Ordering::Relaxed);
                     return STATUS_NO_MEMORY;
                 }
                 Ok(Err(_)) | Err(_) => {
-                    rec_named(b"PBCpy", 0xE5);
+                    crate::diag::record_named_bytes(b"PBCpy", 0xE5);
                     PRESENT_LAST_STATUS.store(STATUS_DEVICE_NOT_READY as u32, Ordering::Relaxed);
                     return STATUS_DEVICE_NOT_READY;
                 }
             };
-            rec_named(
+            crate::diag::record_named_bytes(
                 b"PBConv",
                 u32::from(source_dxgi_format != destination_dxgi_format),
             );
@@ -487,16 +473,16 @@ unsafe fn dxgkddi_present_inner(
             if has_system_backing {
                 match crate::virtio::ctrl::wait_fence(adapter, gpu_fence, 5_000_000_000) {
                     crate::virtio::ctrl::WaitFenceOutcome::Complete => {
-                        rec_named(b"PBSyWt", 1);
+                        crate::diag::record_named_bytes(b"PBSyWt", 1);
                     }
                     crate::virtio::ctrl::WaitFenceOutcome::TimedOut => {
-                        rec_named(b"PBSyWt", 0xE1);
+                        crate::diag::record_named_bytes(b"PBSyWt", 0xE1);
                         PRESENT_LAST_STATUS
                             .store(STATUS_DEVICE_NOT_READY as u32, Ordering::Relaxed);
                         return STATUS_DEVICE_NOT_READY;
                     }
                     crate::virtio::ctrl::WaitFenceOutcome::Invalid => {
-                        rec_named(b"PBSyWt", 0xE2);
+                        crate::diag::record_named_bytes(b"PBSyWt", 0xE2);
                         PRESENT_LAST_STATUS
                             .store(STATUS_DEVICE_NOT_READY as u32, Ordering::Relaxed);
                         return STATUS_DEVICE_NOT_READY;
@@ -510,20 +496,20 @@ unsafe fn dxgkddi_present_inner(
                         destination.resource_id,
                     )
                 } {
-                    Some(true) => rec_named(b"PBSyCp", 1),
+                    Some(true) => crate::diag::record_named_bytes(b"PBSyCp", 1),
                     // Windows may page the allocation back to the BAR between
                     // the pre-check and completed fence. With no system
                     // backing, the Venus destination is authoritative again.
-                    None => rec_named(b"PBSyCp", 2),
+                    None => crate::diag::record_named_bytes(b"PBSyCp", 2),
                     Some(false) => {
-                        rec_named(b"PBSyCp", 0xE1);
+                        crate::diag::record_named_bytes(b"PBSyCp", 0xE1);
                         PRESENT_LAST_STATUS
                             .store(STATUS_DEVICE_NOT_READY as u32, Ordering::Relaxed);
                         return STATUS_DEVICE_NOT_READY;
                     }
                 }
             } else {
-                rec_named(b"PBSyCp", 0);
+                crate::diag::record_named_bytes(b"PBSyCp", 0);
             }
             // Capacity was checked before host work was queued, so this cannot
             // fail. Merge preserves the newest fence if dxgkrnl batches more
@@ -535,12 +521,12 @@ unsafe fn dxgkddi_present_inner(
                     gpu_fence,
                 )
             } {
-                rec_named(b"PBCpy", 0xE6);
+                crate::diag::record_named_bytes(b"PBCpy", 0xE6);
                 PRESENT_LAST_STATUS.store(status as u32, Ordering::Relaxed);
                 return status;
             }
-            rec_named(b"PBCpy", 1);
-            rec_named(b"PBFnc", gpu_fence as u32);
+            crate::diag::record_named_bytes(b"PBCpy", 1);
+            crate::diag::record_named_bytes(b"PBFnc", gpu_fence as u32);
         }
     }
 
@@ -556,19 +542,19 @@ unsafe fn dxgkddi_present_inner(
         // private-data snapshot captured by OpenAllocation. In particular, do
         // not let the UMD command payload independently select a resource.
         let Some(source) = src_info else {
-            rec_named(b"PBFlip", 0xE1);
+            crate::diag::record_named_bytes(b"PBFlip", 0xE1);
             PRESENT_LAST_STATUS.store(STATUS_INVALID_PARAMETER as u32, Ordering::Relaxed);
             return STATUS_INVALID_PARAMETER;
         };
         let Some(dxgi_format) = source.resolved_dxgi_format() else {
-            rec_named(b"PBFlip", 0xE2);
+            crate::diag::record_named_bytes(b"PBFlip", 0xE2);
             PRESENT_LAST_STATUS.store(STATUS_INVALID_PARAMETER as u32, Ordering::Relaxed);
             return STATUS_INVALID_PARAMETER;
         };
-        rec_named(b"PBsrc", source.resource_id);
-        rec_named(b"PBsw", source.width);
-        rec_named(b"PBsh", source.height);
-        rec_named(b"PBsDir", u32::from(source.direct_scanout));
+        crate::diag::record_named_bytes(b"PBsrc", source.resource_id);
+        crate::diag::record_named_bytes(b"PBsw", source.width);
+        crate::diag::record_named_bytes(b"PBsh", source.height);
+        crate::diag::record_named_bytes(b"PBsDir", u32::from(source.direct_scanout));
 
         // The driver-private Present payload is retained only as a diagnostic
         // cross-check. It must never override the identity that Windows placed
@@ -583,7 +569,7 @@ unsafe fn dxgkddi_present_inner(
             })
             .map(u32::from)
             .unwrap_or(2);
-        rec_named(b"PBIdOk", private_match);
+        crate::diag::record_named_bytes(b"PBIdOk", private_match);
 
         // It must not program scanout here: dxgkrnl subsequently names the
         // allocation that actually reached the VidPn source through
@@ -591,7 +577,7 @@ unsafe fn dxgkddi_present_inner(
         // source into a different managed primary, so publishing both creates
         // two competing selectors and lets retirement of the transient source
         // tear down the real desktop scanout.
-        rec_named(b"PBFlip", 1);
+        crate::diag::record_named_bytes(b"PBFlip", 1);
 
         // FlipOnVSyncMmIo explicitly requires DxgkDdiPresent to generate no DMA
         // buffer. In that contract dxgkrnl passes pDmaBuffer == NULL and later
@@ -601,7 +587,7 @@ unsafe fn dxgkddi_present_inner(
         // Rejecting this zero-sized call as a depleted buffer makes the UMD's
         // otherwise valid pfnPresentCb fail before the VidPn handoff can occur.
         if args.pDmaBuffer.is_null() {
-            rec_named(b"PBMmio", 1);
+            crate::diag::record_named_bytes(b"PBMmio", 1);
             args.MultipassOffset = 0;
             PRESENT_LAST_STATUS.store(STATUS_SUCCESS as u32, Ordering::Relaxed);
             return STATUS_SUCCESS;
