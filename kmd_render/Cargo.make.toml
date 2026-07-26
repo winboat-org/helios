@@ -7,6 +7,17 @@
 # (this very copy) fails on the 9p/virtio share with OS error 87. See TOOLCHAIN.md.
 extend = "target/rust-driver-makefile.toml"
 
+# Single source of truth for the driver version (HELIOS_KMD_VERSION), shared with
+# kmd_render/build.rs and tools/win-mcp. Consumed by [tasks.stampinf] below.
+#
+# This is a TOP-LEVEL cargo-make key, NOT a [config] key: cargo-make silently
+# ignores an unknown key inside [config], and the failure mode is stampinf
+# receiving the literal "${HELIOS_KMD_VERSION}" and rejecting it with "version
+# string must have exactly 4 fields". Resolved relative to the working directory,
+# and both win_build_kmd and win_cargo do `Set-Location ...\kmd_render` before
+# invoking cargo make.
+env_files = ["./driver-version.env"]
+
 [config]
 load_script = '''
 #!@rust
@@ -97,7 +108,9 @@ args = [
   "-d", "*",
   "-a", "amd64",
   "-c", "${CARGO_MAKE_CRATE_FS_NAME}.cat",
-  "-v", "22.22.176.0",
+  # Stamps the INF DriverVer. Must equal the .sys FILEVERSION that build.rs
+  # renders from the same file — a mismatch is FAILED_ADD 0xc0000182 at install.
+  "-v", "${HELIOS_KMD_VERSION}",
 ]
 
 [tasks.inf2cat]

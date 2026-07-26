@@ -392,7 +392,8 @@ Open defects, roughly ordered:
 6. **WUDFRd cold-boot race** ("SCM not ready", boot+23s) — LGIdd loads late;
    pairing is resilient now but the race window is still there.
 7. **In-place KMD update flakiness** — CM_PROB_FAILED_POST_START limbo until
-   reboot is expected, but keep the version-coherence gotcha (three sites) and
+   reboot is expected, but keep the version-coherence gotcha (one site since
+   2026-07-26: `kmd_render/driver-version.env`) and
    backup ladder in mind. 2026-07-06 state (19th session END, reboot-verified): ACTIVE
    driver = **oem59.inf = 22.22.52 (pkg 155b7345f9360525)** — per-ring watermark +
    counters live. `UserModeDriverName` → ProgramData `helios_umd_b3615be0ce9de13e.dll`
@@ -1570,8 +1571,10 @@ Plan:
   (install script + recommended, toggleable graceful guest reboot — the only
   reliable activation path). Manual fallback: `win_cargo` +
   `tools/install-helios-kmd.ps1` (ExecutionPolicy Bypass,
-  `-AllowRebootRequired`); version bump = build.rs numerics + strings +
-  Cargo.make stampinf (all three or FAILED_ADD); backups under
+  `-AllowRebootRequired`); version bump = the single `HELIOS_KMD_VERSION` line in
+  `kmd_render/driver-version.env` (build.rs renders the FILEVERSION numerics and
+  the version strings from it; Cargo.make stampinf reads it via `env_files`);
+  backups under
   `C:\ProgramData\HeliosDeployBackups`. New tools appear after the win MCP
   server restarts (new session).
 - **dxvk staged-content probes** (`dxvk.heliosStagedProbes`, default OFF since

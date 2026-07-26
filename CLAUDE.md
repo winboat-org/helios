@@ -128,7 +128,7 @@ helios-vgpu/
 | A panic in any DDI = silent graphics deadlock — return errors, count, never `panic!`/`todo!` in release paths | proven repeatedly |
 | Blob window offsets below the VidMm/CpuHostAperture reserve belong to dxgkrnl — never recycle them in the KMD allocator | host subregion overlap |
 | A SupportsCpuHostAperture segment must be the LAST reported segment; classic CpuVisible memory segments are rejected | AddAdapter Code 43 (ETW-proven 2026-07-05) |
-| KMD version bumps touch all three sites (build.rs numerics + strings, Cargo.make stampinf) | INF/FILEVERSION mismatch = FAILED_ADD 0xc0000182 |
+| The KMD version lives at ONE site, `kmd_render/driver-version.env`; never reintroduce a literal into build.rs or Cargo.make stampinf | INF/FILEVERSION mismatch = FAILED_ADD 0xc0000182 |
 | Venus commands flush before fence signal; never signal a wire fence before host completion | suspected root of DEVICE_LOST/freeze (stability WS1) |
 
 ## When You're Stuck

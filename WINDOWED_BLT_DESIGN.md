@@ -249,8 +249,8 @@ Recommend prototyping **(i)** first (least invasive); fall back to **(ii)**.
   when 0. This lets each increment A/B via `reg` + reboot without risking an unbootable
   default.
 - KMD image loads only at BOOT → each Stage-1 increment needs an owner-consented reboot.
-  Bump the version at all three sites (`win_build_kmd` handles it) — INF/FILEVERSION
-  mismatch = FAILED_ADD 0xc0000182.
+  Bump the version at its single site, `kmd_render/driver-version.env`
+  (`win_build_kmd` handles it) — INF/FILEVERSION mismatch = FAILED_ADD 0xc0000182.
 - A panic in any VidPn DDI = silent graphics deadlock. No `panic!`/`todo!`; return only
   legal NTSTATUS from each DDI's documented set.
 

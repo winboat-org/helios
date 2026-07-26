@@ -382,6 +382,33 @@ sites textually unchanged.
 
 ### R103. Collapse the five KMD version literals to one file, and co-change `win_build_kmd`
 
+- **Status**: **LANDED, ADJUSTED** (2026-07-26). Two corrections; the second is a change of design,
+  made on owner instruction.
+  1. *The code wins on `env_files` placement.* The recommendation says to add
+     `env_files = ["./driver-version.env"]` **to `[config]`**. cargo-make's `env_files` is a
+     **top-level** makefile key; inside `[config]` it is silently ignored. Landed that way first and
+     the build failed exactly as it should have — stampinf received the literal
+     `${HELIOS_KMD_VERSION}` and refused it (*"version string must have exactly 4 fields"*). Moved
+     to the top level, above `[config]`.
+  2. *The coherence gate does not live in win-mcp.* The recommendation keeps the gate in
+     `bump_kmd_version_at`, i.e. inside a compiled MCP server that only the `win_build_kmd` path
+     runs — which is the same hole the recommendation itself identifies for the *old* gate ("a
+     hand-run `cargo make` bypasses it entirely") and does not close. Owner directive: **building
+     must not depend on win-mcp alone.** The gate is now `verify_version_wiring` in
+     `kmd_render/build.rs`, so it runs on every build however it was invoked; `bump_kmd_version_at`
+     is reduced to a convenience bumper (parse, validate four components, rewrite one line) and its
+     duplicate cross-file check is deleted rather than kept.
+  Validated on the VM: a plain `cargo make --makefile Cargo.make.toml` (no win-mcp version path)
+  stamps `DriverVer=07/26/2026,22.22.176.0`, the packaged INF is **byte-identical** to the archived
+  pre-change 22.22.176.0 reference (`C:\Users\Rupansh\helios-ref-pkg-22.22.176.0`), and the `.sys`
+  `FileVersion`/`ProductVersion` and their raw parts match. All three failure modes fail the build
+  with a named error at exit 101 — malformed version (`has 3 components, expected 4`), missing
+  top-level `env_files`, and a stampinf literal — and the restored tree builds clean.
+  `cargo test` green in `tools/win-mcp/`. **Owner action still required**: win-mcp is a compiled
+  server, so `win_build_kmd` fails against the old binary until it is rebuilt and restarted; use
+  `win_cargo crate_dir:"kmd_render" args:["make","--makefile","Cargo.make.toml"]` until then.
+  Also updated `WINDOWED_BLT_DESIGN.md:252` and `ROADMAP.md:1574`, two "three sites" claims the
+  recommendation did not list.
 - **Finding**: z-lead-03.
 - **Where**: `kmd_render/build.rs:102` (`FILEVERSION 22,22,176,0`), `:103`
   (`PRODUCTVERSION 22,22,176,0`), `:116` (`VALUE "FileVersion", "22.22.176.0\0"`), `:120`

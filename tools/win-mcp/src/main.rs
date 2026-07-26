@@ -359,55 +359,55 @@ struct WinInstallKmdArgs {
     timeout_secs: Option<u64>,
 }
 
-/// Bump (or verify) the KMD version at its three coherence-critical sites:
-/// `build.rs` FILEVERSION/PRODUCTVERSION numerics, `build.rs`
-/// FileVersion/ProductVersion strings, and the Cargo.make.toml stampinf `-v`.
-/// A mismatch between the INF DriverVer and the image FILEVERSION fails
-/// AddAdapter with 0xc0000182 (FAILED_ADD), so any incoherence is a hard error.
-/// Returns (old_version, new_version) as dotted strings.
+/// Bump (or verify) the KMD version at its single source of truth,
+/// `kmd_render/driver-version.env`. `build.rs` renders the .sys
+/// FILEVERSION/PRODUCTVERSION numerics and the FileVersion/ProductVersion
+/// strings from one parse of that file, and `Cargo.make.toml` reads it through
+/// cargo-make's top-level `env_files` for the stampinf `-v` that stamps the INF
+/// DriverVer.
+///
+/// This function is a convenience bumper, NOT the coherence gate. A mismatch
+/// between the INF DriverVer and the image FILEVERSION fails AddAdapter with
+/// 0xc0000182 (FAILED_ADD), and that gate lives in `kmd_render/build.rs`
+/// (`verify_version_wiring`) so it also covers a hand-run
+/// `cargo make --makefile Cargo.make.toml` — building must not depend on this
+/// server. All this does is parse, validate four components, and rewrite the one
+/// line. Returns (old_version, new_version) as dotted strings.
 fn bump_kmd_version(explicit: Option<&str>, no_bump: bool) -> Result<(String, String), String> {
     bump_kmd_version_at(LINUX_PROJECT_ROOT, explicit, no_bump)
 }
+
+/// The one line that carries the version.
+const KMD_VERSION_KEY: &str = "HELIOS_KMD_VERSION=";
 
 fn bump_kmd_version_at(
     root: &str,
     explicit: Option<&str>,
     no_bump: bool,
 ) -> Result<(String, String), String> {
-    let build_rs_path = format!("{root}/kmd_render/build.rs");
-    let make_path = format!("{root}/kmd_render/Cargo.make.toml");
-    let build_rs = std::fs::read_to_string(&build_rs_path)
-        .map_err(|e| format!("read {build_rs_path}: {e}"))?;
-    let make = std::fs::read_to_string(&make_path).map_err(|e| format!("read {make_path}: {e}"))?;
+    let version_path = format!("{root}/kmd_render/driver-version.env");
+    let version_file =
+        std::fs::read_to_string(&version_path).map_err(|e| format!("read {version_path}: {e}"))?;
 
-    // Current version: parse `FILEVERSION a,b,c,d` from build.rs.
-    let cur: Vec<u32> = build_rs
+    // Current version: parse `HELIOS_KMD_VERSION=a.b.c.d` from driver-version.env.
+    let cur_raw = version_file
         .lines()
-        .find_map(|l| l.trim().strip_prefix("FILEVERSION "))
-        .ok_or("no FILEVERSION line in build.rs")?
-        .trim()
-        .split(',')
+        .map(str::trim)
+        .find_map(|l| l.strip_prefix(KMD_VERSION_KEY))
+        .ok_or("no HELIOS_KMD_VERSION line in kmd_render/driver-version.env")?
+        .trim();
+    let cur: Vec<u32> = cur_raw
+        .split('.')
         .map(|p| p.trim().parse::<u32>())
         .collect::<Result<_, _>>()
-        .map_err(|e| format!("unparsable FILEVERSION: {e}"))?;
+        .map_err(|e| format!("unparsable HELIOS_KMD_VERSION: {e}"))?;
     if cur.len() != 4 {
-        return Err(format!("FILEVERSION has {} fields, expected 4", cur.len()));
-    }
-    let cur_dotted = format!("{}.{}.{}.{}", cur[0], cur[1], cur[2], cur[3]);
-    let cur_comma = format!("{},{},{},{}", cur[0], cur[1], cur[2], cur[3]);
-
-    // Coherence check BEFORE touching anything: all three sites must agree.
-    let numeric_sites = build_rs.matches(&cur_comma).count();
-    let string_sites = build_rs.matches(&cur_dotted).count();
-    let stampinf_sites = make.matches(&cur_dotted).count();
-    if numeric_sites < 2 || string_sites < 2 || stampinf_sites < 1 {
         return Err(format!(
-            "version sites INCOHERENT for {cur_dotted}: build.rs numerics={numeric_sites} \
-             (need >=2), build.rs strings={string_sites} (need >=2), Cargo.make.toml \
-             stampinf={stampinf_sites} (need >=1). Fix manually before building — an \
-             INF/FILEVERSION mismatch is FAILED_ADD 0xc0000182."
+            "HELIOS_KMD_VERSION has {} fields, expected 4",
+            cur.len()
         ));
     }
+    let cur_dotted = format!("{}.{}.{}.{}", cur[0], cur[1], cur[2], cur[3]);
 
     if no_bump {
         return Ok((cur_dotted.clone(), cur_dotted));
@@ -428,18 +428,31 @@ fn bump_kmd_version_at(
         None => vec![cur[0], cur[1], cur[2] + 1, cur[3]],
     };
     let new_dotted = format!("{}.{}.{}.{}", new[0], new[1], new[2], new[3]);
-    let new_comma = format!("{},{},{},{}", new[0], new[1], new[2], new[3]);
     if new_dotted == cur_dotted {
         return Err(format!("new version equals current ({cur_dotted})"));
     }
 
-    let new_build_rs = build_rs
-        .replace(&cur_comma, &new_comma)
-        .replace(&cur_dotted, &new_dotted);
-    let new_make = make.replace(&cur_dotted, &new_dotted);
-    std::fs::write(&build_rs_path, new_build_rs)
-        .map_err(|e| format!("write {build_rs_path}: {e}"))?;
-    std::fs::write(&make_path, new_make).map_err(|e| format!("write {make_path}: {e}"))?;
+    // Rewrite only the HELIOS_KMD_VERSION line, so the file's comments survive a
+    // bump and a version string appearing inside one is not rewritten.
+    let mut rewritten = false;
+    let mut new_version_file = String::with_capacity(version_file.len());
+    for line in version_file.lines() {
+        if !rewritten && line.trim().starts_with(KMD_VERSION_KEY) {
+            new_version_file.push_str(KMD_VERSION_KEY);
+            new_version_file.push_str(&new_dotted);
+            rewritten = true;
+        } else {
+            new_version_file.push_str(line);
+        }
+        new_version_file.push('\n');
+    }
+    if !rewritten {
+        return Err(format!(
+            "no HELIOS_KMD_VERSION line to rewrite in {version_path}"
+        ));
+    }
+    std::fs::write(&version_path, new_version_file)
+        .map_err(|e| format!("write {version_path}: {e}"))?;
     Ok((cur_dotted, new_dotted))
 }
 
@@ -682,7 +695,14 @@ impl WinHost {
             "{sync}\n\
              cmd /c 'set \"PATH={LLVM_BIN};%PATH%\" && call \"{VCVARS}\" && meson {meson_args}'"
         );
-        match run_ssh(&command, None, &HashMap::new(), a.timeout_secs.unwrap_or(1800)).await {
+        match run_ssh(
+            &command,
+            None,
+            &HashMap::new(),
+            a.timeout_secs.unwrap_or(1800),
+        )
+        .await
+        {
             Ok(o) => format_output(&o),
             Err(e) => format!("error launching ssh: {e}"),
         }
@@ -702,14 +722,21 @@ impl WinHost {
         let command = format!(
             "& powershell -NoProfile -ExecutionPolicy Bypass -File '{PROJECT_DRIVE}tools\\hotplug-helios-umd.ps1' {extra}"
         );
-        match run_ssh(&command, None, &HashMap::new(), a.timeout_secs.unwrap_or(600)).await {
+        match run_ssh(
+            &command,
+            None,
+            &HashMap::new(),
+            a.timeout_secs.unwrap_or(600),
+        )
+        .await
+        {
             Ok(o) => format_output(&o),
             Err(e) => format!("error launching ssh: {e}"),
         }
     }
 
     #[tool(
-        description = "Bump the Helios KMD (kmd_render) version and build the signed driver package. Handles the three-site version-coherence invariant automatically (build.rs FILEVERSION/PRODUCTVERSION numerics + FileVersion/ProductVersion strings + Cargo.make.toml stampinf -v — an INF/FILEVERSION mismatch is FAILED_ADD 0xc0000182): it verifies the sites agree, bumps the third component by default (or uses `version`, or `no_bump` to rebuild the current version), edits the Linux-side sources, then mirrors + runs `cargo make --makefile Cargo.make.toml` on the VM (build, inf2cat, test-sign, package). Output starts with the old -> new version line; the package lands in kmd_render\\target\\debug\\helios_kmd_render_package on the VM mirror. Deploy with win_install_kmd. The version edit persists on the Linux tree — commit it with the change it ships."
+        description = "Bump the Helios KMD (kmd_render) version and build the signed driver package. The version lives at ONE site, kmd_render/driver-version.env (HELIOS_KMD_VERSION): build.rs renders the .sys FILEVERSION/PRODUCTVERSION numerics and FileVersion/ProductVersion strings from one parse of it, and Cargo.make.toml reads it via cargo-make env_files for the stampinf -v that stamps the INF DriverVer — an INF/FILEVERSION mismatch is FAILED_ADD 0xc0000182. Coherence is enforced by kmd_render/build.rs itself (verify_version_wiring), so a hand-run `cargo make --makefile Cargo.make.toml` is covered too — this tool is only a convenience bumper. It bumps the third component by default (or uses `version`, or `no_bump` to rebuild the current version), edits the Linux-side source, then mirrors + runs `cargo make --makefile Cargo.make.toml` on the VM (build, inf2cat, test-sign, package). Output starts with the old -> new version line; the package lands in kmd_render\\target\\debug\\helios_kmd_render_package on the VM mirror. Deploy with win_install_kmd. The version edit persists on the Linux tree — commit it with the change it ships."
     )]
     async fn win_build_kmd(&self, Parameters(a): Parameters<WinBuildKmdArgs>) -> String {
         let (old_v, new_v) = match bump_kmd_version(a.version.as_deref(), a.no_bump) {
@@ -746,8 +773,13 @@ impl WinHost {
         let command = format!(
             "& powershell -NoProfile -ExecutionPolicy Bypass -File '{PROJECT_DRIVE}tools\\install-helios-kmd.ps1' -AllowRebootRequired {extra}"
         );
-        let install = match run_ssh(&command, None, &HashMap::new(), a.timeout_secs.unwrap_or(900))
-            .await
+        let install = match run_ssh(
+            &command,
+            None,
+            &HashMap::new(),
+            a.timeout_secs.unwrap_or(900),
+        )
+        .await
         {
             Ok(o) => o,
             Err(e) => return format!("error launching ssh: {e}"),
@@ -820,7 +852,7 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("winmcp-bump-test-{}", std::process::id()));
         let kmd = tmp.join("kmd_render");
         std::fs::create_dir_all(&kmd).unwrap();
-        for f in ["build.rs", "Cargo.make.toml"] {
+        for f in ["driver-version.env", "build.rs", "Cargo.make.toml"] {
             std::fs::copy(
                 format!("{}/kmd_render/{f}", super::LINUX_PROJECT_ROOT),
                 kmd.join(f),
@@ -843,8 +875,34 @@ mod tests {
         // The bumped tree is coherent at the new version; no old remnants.
         let (v2, _) = bump_kmd_version_at(root, None, true).unwrap();
         assert_eq!(v2, to);
+        // The single source now carries only the new version, and the bump left
+        // the file's comments intact.
+        let env = std::fs::read_to_string(kmd.join("driver-version.env")).unwrap();
+        assert!(env.contains(&format!("HELIOS_KMD_VERSION={to}")), "{env}");
+        assert!(
+            !env.contains(&format!("HELIOS_KMD_VERSION={from}")),
+            "{env}"
+        );
+        assert!(env.contains('#'), "bump dropped the file's comments: {env}");
+        // A bump must not need to touch any other file. The cross-file coherence
+        // gate is kmd_render/build.rs::verify_version_wiring, not this tool, so
+        // that a hand-run `cargo make` is covered too; all this asserts is that
+        // no other file carries a version literal to keep in step.
         let build_rs = std::fs::read_to_string(kmd.join("build.rs")).unwrap();
-        assert!(!build_rs.contains(&from));
+        assert!(
+            !build_rs.contains(&from),
+            "build.rs regained a version literal"
+        );
+        assert!(
+            !build_rs.contains(&to),
+            "build.rs regained a version literal"
+        );
+        let make = std::fs::read_to_string(kmd.join("Cargo.make.toml")).unwrap();
+        assert!(
+            !make.contains(&to),
+            "Cargo.make.toml regained a version literal"
+        );
+        assert!(make.contains("\"-v\", \"${HELIOS_KMD_VERSION}\""), "{make}");
 
         // Explicit version.
         let (_, v3) = bump_kmd_version_at(root, Some("30.0.1.2"), false).unwrap();
@@ -852,6 +910,20 @@ mod tests {
 
         // Bad explicit version is rejected.
         assert!(bump_kmd_version_at(root, Some("30.0.1"), false).is_err());
+
+        // A malformed single source is rejected in verify mode, before anything
+        // is written — this is the case that used to reach install as
+        // FAILED_ADD 0xc0000182.
+        std::fs::write(
+            kmd.join("driver-version.env"),
+            "HELIOS_KMD_VERSION=22.22.176\n",
+        )
+        .unwrap();
+        let err = bump_kmd_version_at(root, None, true).unwrap_err();
+        assert!(err.contains("expected 4"), "{err}");
+        std::fs::write(kmd.join("driver-version.env"), "# no version here\n").unwrap();
+        let err = bump_kmd_version_at(root, None, true).unwrap_err();
+        assert!(err.contains("no HELIOS_KMD_VERSION line"), "{err}");
 
         std::fs::remove_dir_all(&tmp).unwrap();
     }
