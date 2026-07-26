@@ -41,7 +41,7 @@ use helios_protocol::{
 use crate::ddi;
 use crate::device_funcs::HeliosDevice;
 use crate::device_funcs::KmdScanoutTarget;
-use crate::log_line;
+use crate::log_error;
 use crate::present_gate_us;
 use crate::present_sync_publish_enabled;
 use crate::trace_line;
@@ -189,10 +189,10 @@ impl Drop for ResidentAllocation {
             hr as u32
         );
         if hr != 0 {
-            log_line(&format!(
+            log_error!(
                 "WDDM residency: Evict FAILED alloc=0x{:x} hr=0x{:08x}",
                 handle, hr as u32
-            ));
+            );
         }
     }
 }
@@ -560,7 +560,7 @@ unsafe fn set_runtime_error(h: Hdevice, hr: i32) {
         return;
     };
     if dev.um_callbacks.is_null() {
-        log_line("set_runtime_error: no corelayer callbacks");
+        log_error!("set_runtime_error: no corelayer callbacks");
         return;
     }
     // pfnSetErrorCb is the first member of every D3D11DDI_CORELAYER_DEVICECALLBACKS
@@ -708,22 +708,22 @@ unsafe fn stamp_dxvk_resource_kmt_handles(
         return;
     }
     let Some(dev) = helios_device(h) else {
-        log_line("DDI resource KMT stamp skipped: missing device");
+        log_error!("DDI resource KMT stamp skipped: missing device");
         return;
     };
     if dev
         .dxvk
         .set_resource_kmt_handles(obj.as_raw() as usize, local, global)
     {
-        log_line(&format!(
+        log_error!(
             "DDI resource KMT handles stamped: local=0x{:x} global=0x{:x}",
             local, global
-        ));
+        );
     } else {
-        log_line(&format!(
+        log_error!(
             "DDI resource KMT handle stamp failed: local=0x{:x} global=0x{:x}",
             local, global
-        ));
+        );
     }
 }
 
@@ -885,10 +885,10 @@ unsafe fn remember_scanout_target(
     dev.scanout_width.set(private.width);
     dev.scanout_height.set(private.height);
     dev.scanout_format.set(private.dxgi_format);
-    log_line(&format!(
+    log_error!(
         "DDI scanout target: raw=0x{raw:x} alloc=0x{allocation:x} res_id={} {}x{} fmt={} pitch={}",
         private.resource_id, private.width, private.height, private.dxgi_format, private.pitch
-    ));
+    );
 }
 
 unsafe fn clear_scanout_target_if_matches(h: Hdevice, raw: usize) {
@@ -905,7 +905,7 @@ unsafe fn clear_scanout_target_if_matches(h: Hdevice, raw: usize) {
         dev.scanout_width.set(0);
         dev.scanout_height.set(0);
         dev.scanout_format.set(0);
-        log_line("DDI scanout target cleared");
+        log_error!("DDI scanout target cleared");
     }
 }
 
@@ -972,10 +972,10 @@ unsafe fn ensure_kmd_scanout_target(h: Hdevice) -> bool {
         dev.scanout_import
             .replace(KmdScanoutTarget::Unavailable { at_epoch: epoch });
         if let Some(n) = SCANOUT_UNAVAILABLE_LOG_COUNT.first_n_then_every(16, 512) {
-            log_line(&format!(
+            log_error!(
                 "DWM KMD scanout import unavailable at epoch {epoch} (x{}) — not re-probing until it moves",
                 n + 1
-            ));
+            );
         }
         return false;
     }
@@ -991,10 +991,10 @@ unsafe fn ensure_kmd_scanout_target(h: Hdevice) -> bool {
     dev.scanout_format.set(87);
     dev.scanout_generation.set(generation);
     dev.scanout_import.replace(KmdScanoutTarget::Ready(target));
-    log_line(&format!(
+    log_error!(
         "DWM KMD scanout import ready: res_id={} {}x{} pitch={} gen={}",
         resource_id, width, height, pitch, generation
-    ));
+    );
     true
 }
 
@@ -1053,10 +1053,10 @@ unsafe fn track_dwm_composition_target(
     let borrowed =
         ManuallyDrop::new(unsafe { ID3D11Resource::from_raw(resource_raw as *mut c_void) });
     dev.composition_source.replace(Some((*borrowed).clone()));
-    log_line(&format!(
+    log_error!(
         "DWM composition target selected: raw=0x{:x} {}x{} fmt={}",
         resource_raw, width, height, format
-    ));
+    );
 }
 
 /// Record the one required per-frame GPU copy on DWM's own command stream.
@@ -1086,19 +1086,19 @@ unsafe fn publish_dwm_composition(context: &ID3D11DeviceContext, h: Hdevice) -> 
         // either way, so nothing else distinguishes them. Merely opening the
         // LINEAR target does not qualify — that happens on every DWM boot while
         // this count stays 0.
-        log_line(
+        log_error!(
             "WARNING: DWM is compositing through the LEGACY LINEAR copy target — \
-             the direct primary is NOT the presented surface for this device",
+             the direct primary is NOT the presented surface for this device"
         );
     }
     if n <= 8 || n % 600 == 0 {
-        log_line(&format!(
+        log_error!(
             "DWM desktop->LINEAR scanout copy #{} res_id={} {}x{}",
             n,
             dev.scanout_resource_id.get(),
             dev.scanout_width.get(),
             dev.scanout_height.get()
-        ));
+        );
     }
     true
 }
@@ -1133,7 +1133,7 @@ unsafe fn copy_to_scanout_target(
         || src_desc.SampleDesc.Count != 1
         || dst_desc.SampleDesc.Count != 1
     {
-        log_line(&format!(
+        log_error!(
             "DXGI Present scanout-copy skipped: src {}x{} fmt={} dst {}x{} fmt={}",
             src_desc.Width,
             src_desc.Height,
@@ -1141,7 +1141,7 @@ unsafe fn copy_to_scanout_target(
             dst_desc.Width,
             dst_desc.Height,
             dst_desc.Format.0
-        ));
+        );
         return false;
     }
     let w = src_desc.Width.min(dst_desc.Width);
@@ -1346,9 +1346,9 @@ unsafe fn release_resource(h: Hdevice, handle_priv: *mut c_void) {
         // `clear_scanout_target_if_matches` above only clears the `scanout_*`
         // Cells; it never touched this Vec.
         if let Some((removed, remaining)) = forget_direct_scanout_allocation(h, allocation) {
-            log_line(&format!(
+            log_error!(
                 "DDI scanout registry: dropped {removed} entry alloc=0x{allocation:x} remaining={remaining}"
-            ));
+            );
         }
         // Evict while the allocation and runtime device are both still valid.
         // Option::take makes it impossible for ResourceState::drop to evict a
@@ -1382,11 +1382,11 @@ unsafe fn release_resource(h: Hdevice, handle_priv: *mut c_void) {
                             // An allocation handle we did not create and no
                             // runtime resource to hand back: nothing we may
                             // legally deallocate.
-                            log_line(&format!(
+                            log_error!(
                                 "DDI deallocate_resource skip: not owner alloc=0x{:x} km=0x{:x}",
                                 allocation,
                                 (*state).km_resource
-                            ));
+                            );
                             ddi::D3DDDICB_DEALLOCATE {
                                 hResource: core::ptr::null_mut(),
                                 NumAllocations: 0,
@@ -1589,24 +1589,24 @@ unsafe fn make_resident(
     const E_PENDING: i32 = 0x8000_000Au32 as i32;
 
     let Some(handle) = core::num::NonZeroU32::new(handle) else {
-        log_line("WDDM residency: zero allocation handle");
+        log_error!("WDDM residency: zero allocation handle");
         return Err(E_INVALIDARG);
     };
     let Some(queue) = dev.paging_queue else {
-        log_line("WDDM residency: device has no paging queue");
+        log_error!("WDDM residency: device has no paging queue");
         return Err(E_FAIL);
     };
     if dev.kt_callbacks.is_null() {
-        log_line("WDDM residency: no runtime callbacks");
+        log_error!("WDDM residency: no runtime callbacks");
         return Err(E_FAIL);
     }
     let Some(make_resident_cb) = (*dev.kt_callbacks).pfnMakeResidentCb else {
-        log_line("WDDM residency: pfnMakeResidentCb missing");
+        log_error!("WDDM residency: pfnMakeResidentCb missing");
         return Err(E_FAIL);
     };
     let Some(evict_cb) = (*dev.kt_callbacks).pfnEvictCb else {
         // Do not acquire a residency reference that cannot be balanced.
-        log_line("WDDM residency: pfnEvictCb missing");
+        log_error!("WDDM residency: pfnEvictCb missing");
         return Err(E_FAIL);
     };
 
@@ -1624,10 +1624,10 @@ unsafe fn make_resident(
         arg.NumBytesToTrim
     );
     if hr != 0 && hr != E_PENDING {
-        log_line(&format!(
+        log_error!(
             "WDDM residency: MakeResident FAILED alloc=0x{:x} hr=0x{:08x} trim={}",
             allocation, hr as u32, arg.NumBytesToTrim
-        ));
+        );
         return Err(hr);
     }
 
@@ -1638,7 +1638,7 @@ unsafe fn make_resident(
     };
     if hr == E_PENDING {
         let Some(wait_cb) = (*dev.kt_callbacks).pfnWaitForSynchronizationObjectFromCpuCb else {
-            log_line("WDDM residency: E_PENDING but CPU fence-wait callback is missing");
+            log_error!("WDDM residency: E_PENDING but CPU fence-wait callback is missing");
             drop(resident);
             return Err(E_FAIL);
         };
@@ -1658,10 +1658,10 @@ unsafe fn make_resident(
             wait_hr as u32
         );
         if wait_hr != 0 {
-            log_line(&format!(
+            log_error!(
                 "WDDM residency: paging-fence wait FAILED alloc=0x{:x} fence={} hr=0x{:08x}",
                 allocation, fence_value, wait_hr as u32
-            ));
+            );
             drop(resident);
             return Err(wait_hr);
         }
@@ -1687,10 +1687,10 @@ unsafe fn deallocate_standalone(
         HandleList: &mut allocation,
     };
     let hr = deallocate_cb(dev.h_rt_device, &mut arg);
-    log_line(&format!(
+    log_error!(
         "DDI allocate rollback: alloc=0x{:x} hr=0x{:08x}",
         allocation, hr as u32
-    ));
+    );
 }
 
 unsafe fn allocate_wddm_resource(
@@ -1721,17 +1721,17 @@ unsafe fn allocate_wddm_resource(
         return Err(E_FAIL);
     };
     if dev.kt_callbacks.is_null() {
-        log_line("DDI allocate_wddm_resource: no KT callbacks");
+        log_error!("DDI allocate_wddm_resource: no KT callbacks");
         return Err(E_FAIL);
     }
     let Some(allocate_cb) = (*dev.kt_callbacks).pfnAllocateCb else {
-        log_line("DDI allocate_wddm_resource: pfnAllocateCb missing");
+        log_error!("DDI allocate_wddm_resource: pfnAllocateCb missing");
         return Err(E_FAIL);
     };
 
     let venus_ctx_id = dev.dxvk.venus_context_id();
     if venus_ctx_id == 0 {
-        log_line("DDI allocate_wddm_resource: no Venus context id");
+        log_error!("DDI allocate_wddm_resource: no Venus context id");
     }
 
     const CROSS_ADAPTER_PITCH_ALIGN: u32 = 256;
@@ -1823,7 +1823,7 @@ unsafe fn allocate_wddm_resource(
 
     let pre_n = WDDM_ALLOC_LOG_COUNT.peek();
     if pre_n < 128 {
-        log_line(&format!(
+        log_error!(
             "DDI allocate_wddm_resource pre: blob=0x{:x} res_id={} ctx={} kind={} size={} alloc_size={} mti={} {}x{} fmt={} bind=0x{:x} misc=0x{:x} primary_desc={}",
             private.alloc.blob_id,
             private.alloc._pad,
@@ -1838,7 +1838,7 @@ unsafe fn allocate_wddm_resource(
             a.BindFlags,
             a.MiscFlags,
             !a.pPrimaryDesc.is_null()
-        ));
+        );
     }
 
     let mut allocation_info = ddi::D3DDDI_ALLOCATIONINFO2::default();
@@ -1875,7 +1875,7 @@ unsafe fn allocate_wddm_resource(
         unsafe { read_open_identity(private_ptr, private_size) };
     let n = WDDM_ALLOC_LOG_COUNT.next();
     if n < 128 || hr != 0 {
-        log_line(&format!(
+        log_error!(
             "DDI allocate_wddm_resource: hr=0x{:08x} alloc=0x{:x} km=0x{:x} rt={:p} assoc={:p} info={} rpriv={} size={} pitch={} blob=0x{:x} res_id={} ctx={} kind={} primary={} present={} vidpn={} {}x{} fmt={} bind=0x{:x} misc=0x{:x}",
             hr as u32,
             h_allocation,
@@ -1898,7 +1898,7 @@ unsafe fn allocate_wddm_resource(
             a.Format,
             a.BindFlags,
             a.MiscFlags
-        ));
+        );
         if pre_private_alloc._pad != post_private_alloc._pad
             || pre_private_alloc.kind != post_private_alloc.kind
             || pre_private_alloc.ctx_id != post_private_alloc.ctx_id
@@ -1906,7 +1906,7 @@ unsafe fn allocate_wddm_resource(
             || pre_private_meta.venus_alloc_size != post_private_meta.venus_alloc_size
             || pre_private_meta.memory_type_index != post_private_meta.memory_type_index
         {
-            log_line(&format!(
+            log_error!(
                 "DDI allocate_wddm_resource private mutated: pre blob=0x{:x} res_id={} ctx={} kind={} vas={} mti={} -> post blob=0x{:x} res_id={} ctx={} kind={} vas={} mti={}",
                 pre_private_alloc.blob_id,
                 pre_private_alloc._pad,
@@ -1920,11 +1920,11 @@ unsafe fn allocate_wddm_resource(
                 post_private_alloc.kind,
                 post_private_meta.venus_alloc_size,
                 post_private_meta.memory_type_index
-            ));
+            );
         }
         if let Some((ident, meta)) = post_open_identity {
             let meta = meta.unwrap_or_default();
-            log_line(&format!(
+            log_error!(
                 "DDI allocate_wddm_resource callback private: hRT={:p} hKM=0x{:x} \
                  hAlloc=0x{:x} identity=res_id:{} kind:{} ctx:{} blob_size:{} \
                  venus_size:{} mem_type:{} meta={}x{} pitch:{} d3dfmt:{} \
@@ -1945,7 +1945,7 @@ unsafe fn allocate_wddm_resource(
                 meta.dxgi_format,
                 meta.bind_flags,
                 meta.misc_flags,
-            ));
+            );
         }
     }
     if hr != 0 {
@@ -1996,10 +1996,10 @@ unsafe fn finish_wddm_tex2d(
         // textures are suballocated by design (18th session).
         let needs_importable = needs_wddm_texture_allocation(a);
         if memory != 0 && needs_importable {
-            log_line(&format!(
+            log_error!(
                     "DDI create_resource(tex2d): SHARED RESOURCE WITHOUT IMPORTABLE BACKING memory=0x{:x} res_id={} size={} offset={} bind=0x{:x} misc=0x{:x}",
                     memory, resource_id, memory_size, memory_offset, a.BindFlags, a.MiscFlags
-                ));
+                );
         } else if memory != 0 {
             trace_line!(
                 "DDI create_resource(tex2d): private suballocated memory=0x{:x} size={} offset={}",
@@ -2020,10 +2020,10 @@ unsafe fn finish_wddm_tex2d(
                 &mut venus_alloc_size,
                 &mut memory_type_index,
             ) {
-                log_line(&format!(
+                log_error!(
                     "DDI create_resource(tex2d): no venus alloc identity for res_id={}",
                     backing_resource_id
-                ));
+                );
             }
         }
     }
@@ -2043,10 +2043,10 @@ unsafe fn finish_wddm_tex2d(
     ) {
         Ok(allocation) => allocation,
         Err(hr) => {
-            log_line(&format!(
+            log_error!(
                 "DDI create_resource(tex2d): WDDM allocation/residency failed hr=0x{:08x}",
                 hr as u32
-            ));
+            );
             set_runtime_error(h, hr);
             return;
         }
@@ -2058,10 +2058,10 @@ unsafe fn finish_wddm_tex2d(
     if allocation_handle != 0 && backing_resource_id != 0 {
         if let Some(dev) = helios_device(h) {
             if !dev.dxvk.transfer_resource_ownership(res.as_raw() as usize) {
-                log_line(&format!(
+                log_error!(
                     "DDI create_resource(tex2d): ownership transfer failed res_id={}",
                     backing_resource_id
-                ));
+                );
             }
         }
     }
@@ -2124,7 +2124,7 @@ unsafe extern "C" fn create_resource(
 ) {
     clear_handle(h_resource.pDrvPrivate);
     if arg.is_null() {
-        log_line("DDI CreateResource identity: null args");
+        log_error!("DDI CreateResource identity: null args");
         set_runtime_error(h, E_INVALIDARG);
         return;
     }
@@ -2246,10 +2246,10 @@ unsafe extern "C" fn create_resource(
         // resource. Every later `load_resource` then returns None and the view
         // create / Map / Copy silently does nothing — "nothing draws", not an
         // error. E_INVALIDARG is in CreateTexture*'s documented return set.
-        log_line(&format!(
+        log_error!(
             "DDI create_resource: unhandled dimension {}",
             a.ResourceDimension
-        ));
+        );
         set_runtime_error(h, E_INVALIDARG);
         return;
     };
@@ -2258,14 +2258,14 @@ unsafe extern "C" fn create_resource(
             let bind = api_bind_flags(a.BindFlags);
             let misc = api_misc_flags(a.MiscFlags, a.BindFlags, true);
             if bind != a.BindFlags || misc != a.MiscFlags || !a.pPrimaryDesc.is_null() {
-                log_line(&format!(
+                log_error!(
                     "DDI create_resource(buffer): normalize bind 0x{:x}->0x{:x} misc 0x{:x}->0x{:x} primary={}",
                     a.BindFlags,
                     bind,
                     a.MiscFlags,
                     misc,
                     !a.pPrimaryDesc.is_null()
-                ));
+                );
             }
             let desc = D3D11_BUFFER_DESC {
                 ByteWidth: mip0.TexelWidth,
@@ -2279,10 +2279,10 @@ unsafe extern "C" fn create_resource(
                 match allocate_wddm_resource(h, a, &mip0, h_rt, 0, 0, 0, 0, 0, false, 0, 0) {
                     Ok(allocation) => allocation,
                     Err(hr) => {
-                        log_line(&format!(
+                        log_error!(
                         "DDI create_resource(buffer): WDDM allocation/residency failed hr=0x{:08x}",
                         hr as u32
-                    ));
+                    );
                         set_runtime_error(h, hr);
                         return;
                     }
@@ -2294,21 +2294,21 @@ unsafe extern "C" fn create_resource(
             let mut buf: Option<ID3D11Buffer> = None;
             let created = device.CreateBuffer(&desc, init_ptr, Some(&mut buf));
             if let Err(ref e) = created {
-                log_line(&format!("DDI create_resource(buffer) failed: {e:?}"));
+                log_error!("DDI create_resource(buffer) failed: {e:?}");
             }
             let res = match buf {
                 Some(b) => match b.cast::<ID3D11Resource>() {
                     Ok(r) => Some(r),
                     Err(e) => {
-                        log_line(&format!(
+                        log_error!(
                             "DDI create_resource(buffer): cast to ID3D11Resource failed: {e:?}"
-                        ));
+                        );
                         None
                     }
                 },
                 None => {
                     if created.is_ok() {
-                        log_line("DDI create_resource(buffer): DXVK CreateBuffer returned no buffer");
+                        log_error!("DDI create_resource(buffer): DXVK CreateBuffer returned no buffer");
                     }
                     None
                 }
@@ -2318,10 +2318,10 @@ unsafe extern "C" fn create_resource(
                 stored = true;
                 stamp_dxvk_resource_kmt_handles(h, &res, allocation_handle, km_resource);
                 if RESOURCE_LOG_COUNT.first_n(128).is_some() {
-                    log_line(&format!(
+                    log_error!(
                         "DDI create_resource(buffer) ok: bytes={} fmt={} usage={} bind=0x{:x} misc=0x{:x}",
                         mip0.TexelWidth, a.Format, a.Usage, bind, misc
-                    ));
+                    );
                 }
                 store_resource(
                     h_resource.pDrvPrivate,
@@ -2361,16 +2361,16 @@ unsafe extern "C" fn create_resource(
                 misc |= D3D11_RESOURCE_MISC_TEXTURECUBE.0 as u32;
             }
             if a.MiscFlags != 0 {
-                log_line(&format!(
+                log_error!(
                     "DDI misc translation v2: ddi_misc=0x{:x} ddi_bind=0x{:x} api_misc=0x{:x}",
                     a.MiscFlags, a.BindFlags, misc
-                ));
+                );
             }
             if bind != a.BindFlags
                 || (misc & !D3D11_RESOURCE_MISC_TEXTURECUBE.0 as u32) != a.MiscFlags
                 || !a.pPrimaryDesc.is_null()
             {
-                log_line(&format!(
+                log_error!(
                     "DDI create_resource(tex2d): {}x{} fmt={} usage={} bind 0x{:x}->0x{:x} misc 0x{:x}->0x{:x} primary={} sample={}x{}",
                     mip0.TexelWidth,
                     mip0.TexelHeight,
@@ -2383,7 +2383,7 @@ unsafe extern "C" fn create_resource(
                     !a.pPrimaryDesc.is_null(),
                     a.SampleDesc.Count,
                     a.SampleDesc.Quality
-                ));
+                );
             }
             let desc = D3D11_TEXTURE2D_DESC {
                 Width: mip0.TexelWidth,
@@ -2426,20 +2426,20 @@ unsafe extern "C" fn create_resource(
                     None => 0,
                 };
                 if raw != 0 {
-                    log_line(&format!(
+                    log_error!(
                         "DDI create_resource(tex2d): direct scan-out primary {}x{} fmt={} logicalPitch={} offset={} (OPTIMAL DMA_BUF)",
                         mip0.TexelWidth, mip0.TexelHeight, a.Format, rp, off
-                    ));
+                    );
                     let res = ID3D11Resource::from_raw(raw as *mut c_void);
                     finish_wddm_tex2d(h, a, &mip0, h_rt, h_resource, res, true, rp as u32, off);
                 } else {
                     // Loud failure over fake success: do NOT fall back to a plain
                     // primary — that reintroduces the black scan-out as a "working"
                     // desktop. A failure here is a real direct-scanout regression.
-                    log_line(&format!(
+                    log_error!(
                         "DDI create_resource(tex2d): SCAN-OUT PRIMARY CREATE FAILED {}x{} fmt={} bind=0x{:x} -> no primary (optimal/dmabuf rejected?)",
                         mip0.TexelWidth, mip0.TexelHeight, a.Format, bind
-                    ));
+                    );
                     // The loudness has to reach the runtime, not stop at the log
                     // file: this DDI returns void, so pfnSetErrorCb is the only
                     // way CreateTexture2D fails instead of handing the caller
@@ -2456,7 +2456,7 @@ unsafe extern "C" fn create_resource(
                 // name it once so the restructured arm cannot drift between them.
                 let big = mip0.TexelWidth >= 1024 || mip0.TexelHeight >= 576 || misc != 0;
                 if big {
-                    log_line(&format!(
+                    log_error!(
                         "DDI create_resource(tex2d): calling DXVK CreateTexture2D {}x{} fmt={} bind=0x{:x} misc=0x{:x} init={} hrt={:p} mips={} array={} usage={} cpu=0x{:x} sample={}x{}",
                         mip0.TexelWidth,
                         mip0.TexelHeight,
@@ -2471,32 +2471,32 @@ unsafe extern "C" fn create_resource(
                         cpu,
                         a.SampleDesc.Count,
                         a.SampleDesc.Quality
-                    ));
+                    );
                 }
                 let created = device.CreateTexture2D(&desc, init_ptr, Some(&mut tex));
                 match created {
                     Ok(()) => {
                         if big {
-                            log_line(&format!(
+                            log_error!(
                                 "DDI create_resource(tex2d): DXVK CreateTexture2D returned S_OK tex_present={}",
                                 tex.is_some()
-                            ));
+                            );
                         }
                     }
-                    Err(ref e) => log_line(&format!("DDI create_resource(tex2d) failed: {e:?}")),
+                    Err(ref e) => log_error!("DDI create_resource(tex2d) failed: {e:?}"),
                 }
                 let res = match tex {
                     Some(t) => match t.cast::<ID3D11Resource>() {
                         Ok(r) => {
                             if big {
-                                log_line("DDI create_resource(tex2d): cast to ID3D11Resource OK");
+                                log_error!("DDI create_resource(tex2d): cast to ID3D11Resource OK");
                             }
                             Some(r)
                         }
                         Err(_) => {
                             if big {
-                                log_line(
-                                    "DDI create_resource(tex2d): cast to ID3D11Resource failed",
+                                log_error!(
+                                    "DDI create_resource(tex2d): cast to ID3D11Resource failed"
                                 );
                             }
                             None
@@ -2504,8 +2504,8 @@ unsafe extern "C" fn create_resource(
                     },
                     None => {
                         if big && created.is_ok() {
-                            log_line(
-                                "DDI create_resource(tex2d): DXVK CreateTexture2D returned no texture",
+                            log_error!(
+                                "DDI create_resource(tex2d): DXVK CreateTexture2D returned no texture"
                             );
                         }
                         None
@@ -2525,7 +2525,7 @@ unsafe extern "C" fn create_resource(
             // catch-all reports.
             let bind = api_bind_flags(a.BindFlags);
             let misc = api_misc_flags(a.MiscFlags, a.BindFlags, false);
-            log_line(&format!(
+            log_error!(
                 "DDI create_resource(tex1d): {} fmt={} usage={} bind 0x{:x}->0x{:x} misc 0x{:x}->0x{:x} init={} mips={} array={}",
                 mip0.TexelWidth,
                 a.Format,
@@ -2537,7 +2537,7 @@ unsafe extern "C" fn create_resource(
                 init_ptr.is_some(),
                 a.MipLevels,
                 a.ArraySize
-            ));
+            );
             let desc = D3D11_TEXTURE1D_DESC {
                 Width: mip0.TexelWidth,
                 MipLevels: a.MipLevels,
@@ -2551,20 +2551,20 @@ unsafe extern "C" fn create_resource(
             let mut tex: Option<ID3D11Texture1D> = None;
             let created = device.CreateTexture1D(&desc, init_ptr, Some(&mut tex));
             if let Err(ref e) = created {
-                log_line(&format!("DDI create_resource(tex1d) failed: {e:?}"));
+                log_error!("DDI create_resource(tex1d) failed: {e:?}");
             }
             let res = match tex {
                 Some(t) => match t.cast::<ID3D11Resource>() {
                     Ok(r) => Some(r),
                     Err(_) => {
-                        log_line("DDI create_resource(tex1d): cast to ID3D11Resource failed");
+                        log_error!("DDI create_resource(tex1d): cast to ID3D11Resource failed");
                         None
                     }
                 },
                 None => {
                     if created.is_ok() {
-                        log_line(
-                            "DDI create_resource(tex1d): DXVK CreateTexture1D returned no texture",
+                        log_error!(
+                            "DDI create_resource(tex1d): DXVK CreateTexture1D returned no texture"
                         );
                     }
                     None
@@ -2575,10 +2575,10 @@ unsafe extern "C" fn create_resource(
                     match allocate_wddm_resource(h, a, &mip0, h_rt, 0, 0, 0, 0, 0, false, 0, 0) {
                         Ok(allocation) => allocation,
                         Err(hr) => {
-                            log_line(&format!(
+                            log_error!(
                                 "DDI create_resource(tex1d): WDDM allocation/residency failed hr=0x{:08x}",
                                 hr as u32
-                            ));
+                            );
                             set_runtime_error(h, hr);
                             return;
                         }
@@ -2588,10 +2588,10 @@ unsafe extern "C" fn create_resource(
                     .map(ResidentAllocation::handle)
                     .unwrap_or(0);
                 stamp_dxvk_resource_kmt_handles(h, &res, allocation_handle, km_resource);
-                log_line(&format!(
+                log_error!(
                     "DDI create_resource(tex1d) ok: {} fmt={} bind=0x{:x} misc=0x{:x}",
                     mip0.TexelWidth, a.Format, bind, misc
-                ));
+                );
                 store_resource(
                     h_resource.pDrvPrivate,
                     res,
@@ -2606,7 +2606,7 @@ unsafe extern "C" fn create_resource(
         ResourceDimension::Texture3D => {
             let bind = api_bind_flags(a.BindFlags);
             let misc = api_misc_flags(a.MiscFlags, a.BindFlags, false);
-            log_line(&format!(
+            log_error!(
                 "DDI create_resource(tex3d): {}x{}x{} fmt={} usage={} bind 0x{:x}->0x{:x} misc 0x{:x}->0x{:x} init={} mips={}",
                 mip0.TexelWidth,
                 mip0.TexelHeight,
@@ -2619,7 +2619,7 @@ unsafe extern "C" fn create_resource(
                 misc,
                 init_ptr.is_some(),
                 a.MipLevels
-            ));
+            );
             let desc = D3D11_TEXTURE3D_DESC {
                 Width: mip0.TexelWidth,
                 Height: mip0.TexelHeight,
@@ -2634,20 +2634,20 @@ unsafe extern "C" fn create_resource(
             let mut tex: Option<ID3D11Texture3D> = None;
             let created = device.CreateTexture3D(&desc, init_ptr, Some(&mut tex));
             if let Err(ref e) = created {
-                log_line(&format!("DDI create_resource(tex3d) failed: {e:?}"));
+                log_error!("DDI create_resource(tex3d) failed: {e:?}");
             }
             let res = match tex {
                 Some(t) => match t.cast::<ID3D11Resource>() {
                     Ok(r) => Some(r),
                     Err(_) => {
-                        log_line("DDI create_resource(tex3d): cast to ID3D11Resource failed");
+                        log_error!("DDI create_resource(tex3d): cast to ID3D11Resource failed");
                         None
                     }
                 },
                 None => {
                     if created.is_ok() {
-                        log_line(
-                            "DDI create_resource(tex3d): DXVK CreateTexture3D returned no texture",
+                        log_error!(
+                            "DDI create_resource(tex3d): DXVK CreateTexture3D returned no texture"
                         );
                     }
                     None
@@ -2662,10 +2662,10 @@ unsafe extern "C" fn create_resource(
                     match allocate_wddm_resource(h, a, &mip0, h_rt, 0, 0, 0, 0, 0, false, 0, 0) {
                         Ok(allocation) => allocation,
                         Err(hr) => {
-                            log_line(&format!(
+                            log_error!(
                                 "DDI create_resource(tex3d): WDDM allocation/residency failed hr=0x{:08x}",
                                 hr as u32
-                            ));
+                            );
                             set_runtime_error(h, hr);
                             return;
                         }
@@ -2675,10 +2675,10 @@ unsafe extern "C" fn create_resource(
                     .map(ResidentAllocation::handle)
                     .unwrap_or(0);
                 stamp_dxvk_resource_kmt_handles(h, &res, allocation_handle, km_resource);
-                log_line(&format!(
+                log_error!(
                     "DDI create_resource(tex3d) ok: {}x{}x{} fmt={} bind=0x{:x} misc=0x{:x}",
                     mip0.TexelWidth, mip0.TexelHeight, mip0.TexelDepth, a.Format, bind, misc
-                ));
+                );
                 store_resource(
                     h_resource.pDrvPrivate,
                     res,
@@ -2706,7 +2706,7 @@ unsafe extern "C" fn open_resource(
     clear_handle(h_resource.pDrvPrivate);
 
     if arg.is_null() {
-        log_line("DDI open_resource: null args");
+        log_error!("DDI open_resource: null args");
         set_runtime_error(h, E_INVALIDARG);
         return;
     }
@@ -2728,7 +2728,7 @@ unsafe extern "C" fn open_resource(
         Some((_, None))
     );
     if a.NumAllocations != 0 && info2.is_null() {
-        log_line("DDI open_resource FAILED: allocation array is null");
+        log_error!("DDI open_resource FAILED: allocation array is null");
         set_runtime_error(h, E_INVALIDARG);
         return;
     }
@@ -2758,7 +2758,7 @@ unsafe extern "C" fn open_resource(
         }
         if let Some((ident, meta)) = allocation_identity {
             let meta = meta.unwrap_or_default();
-            log_line(&format!(
+            log_error!(
                 "DDI OpenResource allocation: index={} hDrv={:p} hRT={:p} hKM=0x{:x} \
                  hAlloc=0x{:x} private={:p}/{} gpuva=0x{:x} res_id={} kind={} ctx={} \
                  blob_size={} venus_size={} mem_type={} {}x{} pitch={} d3dfmt={} \
@@ -2784,9 +2784,9 @@ unsafe extern "C" fn open_resource(
                 meta.dxgi_format,
                 meta.bind_flags,
                 meta.misc_flags,
-            ));
+            );
         } else {
-            log_line(&format!(
+            log_error!(
                 "DDI OpenResource allocation: index={} hDrv={:p} hRT={:p} hKM=0x{:x} \
                  hAlloc=0x{:x} private={:p}/{} gpuva=0x{:x} identity=missing",
                 index,
@@ -2797,10 +2797,10 @@ unsafe extern "C" fn open_resource(
                 info.pPrivateDriverData,
                 info.PrivateDriverDataSize,
                 info.GpuVirtualAddress,
-            ));
+            );
         }
     }
-    log_line(&format!(
+    log_error!(
         "DDI OpenResource resource: hDrv={:p} hRT={:p} num_alloc={} hKM=0x{:x} private={:p}/{}",
         h_resource.pDrvPrivate,
         h_rt.handle,
@@ -2808,7 +2808,7 @@ unsafe extern "C" fn open_resource(
         a.hKMResource.handle,
         a.pPrivateDriverData,
         a.PrivateDriverDataSize,
-    ));
+    );
 
     // A shared open without a KMD identity record cannot alias the real
     // surface. The old metadata-texture fallback fabricated a blank texture
@@ -2824,15 +2824,15 @@ unsafe extern "C" fn open_resource(
     // the 38th-session import regression cannot see it either.
     let Some(opened) = identity else {
         if identity_without_trailer {
-            log_line(&format!(
+            log_error!(
                 "DDI open_resource FAILED: venus identity carries no meta trailer (hKM={:?} alloc=0x{:x}) -> E_FAIL",
                 a.hKMResource, allocation
-            ));
+            );
         } else {
-            log_line(&format!(
+            log_error!(
                 "DDI open_resource FAILED: no venus identity record (hKM={:?} alloc=0x{:x}) -> E_FAIL",
                 a.hKMResource, allocation
-            ));
+            );
         }
         set_runtime_error(h, E_FAIL);
         return;
@@ -2841,16 +2841,16 @@ unsafe extern "C" fn open_resource(
     let meta = opened.meta;
 
     if a.hKMResource.handle == 0 {
-        log_line(&format!(
+        log_error!(
             "DDI open_resource FAILED: no hKMResource (res_id={}) -> E_FAIL",
             ident.resource_id
-        ));
+        );
         set_runtime_error(h, E_FAIL);
         return;
     }
 
     let Some(dev) = helios_device(h) else {
-        log_line("DDI open_resource FAILED: no Helios device -> E_FAIL");
+        log_error!("DDI open_resource FAILED: no Helios device -> E_FAIL");
         set_runtime_error(h, E_FAIL);
         return;
     };
@@ -2880,11 +2880,11 @@ unsafe extern "C" fn open_resource(
     };
     let cross_context_optimal = ident.kind == HELIOS_WDDM_ALLOC_KIND_STANDARD
         && meta.misc_flags & HELIOS_WDDM_ALLOC_MISC_OPTIMAL_GDI_TEXTURE != 0;
-    log_line(&format!(
+    log_error!(
         "DDI open_resource identity: res_id={} alloc_size={} mem_type={} kind={} ctx={} meta_bind=0x{:x} meta_misc=0x{:x} open_bind=0x{:x} open_misc=0x{:x} dxgi_fmt={} d3dddi_fmt={}",
         ident.resource_id, venus_alloc_size, ident.memory_type_index, ident.kind, ident.ctx_id,
         meta.bind_flags, meta.misc_flags, open_bind, open_misc, open_dxgi_format, meta.format
-    ));
+    );
     // Ordinary shared images always retain their creator's OPTIMAL contract.
     // Production scanout uses a separate KMD-owned plain-LINEAR target; never
     // rebuild DWM imports as DRM-modifier images (the .38 regression).
@@ -2905,10 +2905,10 @@ unsafe extern "C" fn open_resource(
     if raw == 0 {
         // Import of a KMD-validated-live resource failed: a real bug, not a
         // condition to paper over with substitute content (audit C1.3).
-        log_line(&format!(
+        log_error!(
             "DDI open_resource FAILED: ddi-shared import {}x{} d3dfmt={} alloc=0x{:x} hKM={:?} res_id={} -> E_FAIL",
             meta.width, meta.height, meta.format, allocation, a.hKMResource, ident.resource_id
-        ));
+        );
         set_runtime_error(h, E_FAIL);
         return;
     }
@@ -2918,18 +2918,18 @@ unsafe extern "C" fn open_resource(
     let resident = match unsafe { make_resident(dev, allocation) } {
         Ok(resident) => resident,
         Err(hr) => {
-            log_line(&format!(
+            log_error!(
                 "DDI open_resource FAILED: MakeResident alloc=0x{:x} hr=0x{:08x}",
                 allocation, hr as u32
-            ));
+            );
             set_runtime_error(h, hr);
             return;
         }
     };
-    log_line(&format!(
+    log_error!(
         "DDI open_resource ddi-shared ok: {}x{} d3dfmt={} alloc=0x{:x} hKM={:?} raw=0x{:x}",
         meta.width, meta.height, meta.format, allocation, a.hKMResource, raw
-    ));
+    );
     store_resource(
         h_resource.pDrvPrivate,
         res,
@@ -2962,10 +2962,10 @@ unsafe extern "C" fn resolve_shared_resource(
     };
     let alloc = resource_allocation(resource.pDrvPrivate);
     let (width, height) = resource_dimensions(resource.pDrvPrivate);
-    log_line(&format!(
+    log_error!(
         "DDI ResolveSharedResource: hDevice={:p} hResource={:p} alloc=0x{:x} {}x{}",
         h, h_resource, alloc, width, height
-    ));
+    );
     if let Some(context) = d3d11_context(Hdevice {
         pDrvPrivate: h as *mut c_void,
     }) {
@@ -3015,23 +3015,23 @@ unsafe extern "C" fn create_rtv(
     };
     let a = &*arg;
     let Some(res) = load_resource(a.hDrvResource.pDrvPrivate) else {
-        log_line("DDI create_rtv: resource handle empty");
+        log_error!("DDI create_rtv: resource handle empty");
         return;
     };
     let Some(desc) = rtv_desc(a, a.hDrvResource.pDrvPrivate) else {
-        log_line(&format!(
+        log_error!(
             "DDI create_rtv: unsupported resource dimension {} fmt={}",
             a.ResourceDimension, a.Format
-        ));
+        );
         return;
     };
     let mut rtv: Option<ID3D11RenderTargetView> = None;
     let created = device.CreateRenderTargetView(&*res, Some(&desc), Some(&mut rtv));
     if let Err(ref e) = created {
-        log_line(&format!(
+        log_error!(
             "DDI create_rtv failed: dim={} fmt={} {e:?}",
             a.ResourceDimension, a.Format
-        ));
+        );
     }
     finish_create(h, created, rtv, |v| {
         let n = VIEW_LOG_COUNT.next();
@@ -3209,23 +3209,23 @@ unsafe extern "C" fn create_dsv(
     };
     let a = &*arg;
     let Some(res) = load_resource(a.hDrvResource.pDrvPrivate) else {
-        log_line("DDI create_dsv: resource handle empty");
+        log_error!("DDI create_dsv: resource handle empty");
         return;
     };
     let Some(desc) = dsv_desc(a, a.hDrvResource.pDrvPrivate) else {
-        log_line(&format!(
+        log_error!(
             "DDI create_dsv: unsupported resource dimension {} fmt={}",
             a.ResourceDimension, a.Format
-        ));
+        );
         return;
     };
     let mut dsv: Option<ID3D11DepthStencilView> = None;
     let created = device.CreateDepthStencilView(&*res, Some(&desc), Some(&mut dsv));
     if let Err(ref e) = created {
-        log_line(&format!(
+        log_error!(
             "DDI create_dsv failed: dim={} fmt={} flags=0x{:x} {e:?}",
             a.ResourceDimension, a.Format, a.Flags
-        ));
+        );
     }
     finish_create(h, created, dsv, |v| {
         if VIEW_LOG_COUNT.first_n(128).is_some() {
@@ -3367,7 +3367,7 @@ unsafe extern "C" fn clear_rtv(
         let state = *(h_rtv.pDrvPrivate as *const *mut RtvState);
         if !state.is_null() {
             if let Some(n) = CLEAR_RTV_LOG_COUNT.first_n_then_every_from_one(64, 512) {
-                log_line(&format!(
+                log_error!(
                     "DDI ClearRenderTargetView #{} alloc=0x{:x} {}x{} fmt={} rgba=({:.3},{:.3},{:.3},{:.3})",
                     n + 1,
                     (*state).allocation,
@@ -3378,7 +3378,7 @@ unsafe extern "C" fn clear_rtv(
                     rgba[1],
                     rgba[2],
                     rgba[3]
-                ));
+                );
             }
         }
     }
@@ -3416,10 +3416,10 @@ unsafe extern "C" fn resource_copy(
         load_resource(h_src.pDrvPrivate),
     ) else {
         if COPY_LOG_COUNT.first_n(256).is_some() {
-            log_line(&format!(
+            log_error!(
                 "DDI resource_copy missing resource dst_priv={:p} src_priv={:p}",
                 h_dst.pDrvPrivate, h_src.pDrvPrivate
-            ));
+            );
         }
         return;
     };
@@ -3619,7 +3619,7 @@ unsafe extern "C" fn resource_map(
             }
         }
         Err(e) => {
-            log_line(&format!("DDI resource_map failed: {e:?}"));
+            log_error!("DDI resource_map failed: {e:?}");
             if !mapped.is_null() {
                 (*mapped).pData = core::ptr::null_mut();
             }
@@ -3690,15 +3690,15 @@ unsafe extern "C" fn resource_read_after_write_hazard(
 #[allow(dead_code)]
 unsafe fn sync_token_cb(h: Hdevice, arg: *const ddi::D3DDDIARG_SYNCTOKEN, release: bool) {
     let Some(dev) = helios_device(h) else {
-        log_line("DDI sync_token: missing device");
+        log_error!("DDI sync_token: missing device");
         return;
     };
     if dev.kt_callbacks.is_null() || arg.is_null() {
-        log_line(&format!(
+        log_error!(
             "DDI sync_token: missing callbacks={} arg={}",
             dev.kt_callbacks.is_null(),
             arg.is_null()
-        ));
+        );
         return;
     }
 
@@ -3714,17 +3714,17 @@ unsafe fn sync_token_cb(h: Hdevice, arg: *const ddi::D3DDDIARG_SYNCTOKEN, releas
         (*dev.kt_callbacks).pfnAcquireResourceCb
     };
     let Some(cb) = cb else {
-        log_line(&format!(
+        log_error!(
             "DDI sync_token: callback missing release={} resource={:p} token={:p}",
             release, a.hResource, a.hSyncToken
-        ));
+        );
         return;
     };
     let hr = cb(dev.h_rt_device, &cb_arg);
-    log_line(&format!(
+    log_error!(
         "DDI sync_token: release={} resource={:p} token={:p} hr=0x{:08x}",
         release, a.hResource, a.hSyncToken, hr as u32
-    ));
+    );
 }
 
 unsafe extern "C" fn acquire_resource(h: Hdevice, arg: *const ddi::D3DDDIARG_SYNCTOKEN) {
@@ -3871,9 +3871,9 @@ unsafe extern "C" fn check_direct_flip_support_11_1(
         *supported = 0;
     }
     if D3D11_1_LOG_COUNT.first_n(64).is_some() {
-        log_line(&format!(
+        log_error!(
             "DDI D3D11.1 CheckDirectFlipSupport: flags=0x{flags:x} -> no"
-        ));
+        );
     }
 }
 
@@ -3891,9 +3891,9 @@ unsafe extern "C" fn clear_view_11_1(
         );
     }
     if view_type != ddi::D3D11DDI_HANDLETYPE_D3D10DDI_HT_RENDERTARGETVIEW {
-        log_line(&format!(
+        log_error!(
             "DDI D3D11.1 ClearView UNSUPPORTED view type {view_type} — clear dropped"
-        ));
+        );
         return;
     }
     let Some(context) = d3d11_context1(h) else {
@@ -3943,9 +3943,9 @@ unsafe fn shader_code_len(code: *const u32) -> usize {
     if *code == u32::from_le_bytes(*b"DXBC") {
         let total = *code.add(6) as usize;
         if total < 32 || total > (1 << 20) * core::mem::size_of::<u32>() {
-            log_line(&format!(
+            log_error!(
                 "DDI shader_code_len: rejecting DXBC total size {total}"
-            ));
+            );
             return 0;
         }
         return total;
@@ -3963,7 +3963,7 @@ unsafe fn shader_code_len(code: *const u32) -> usize {
 
 unsafe fn log_shader_code(kind: &str, code: *const u32, len: usize) {
     if code.is_null() {
-        log_line(&format!("DDI {kind}: null shader code"));
+        log_error!("DDI {kind}: null shader code");
         return;
     }
     let d0 = *code.add(0);
@@ -3971,10 +3971,10 @@ unsafe fn log_shader_code(kind: &str, code: *const u32, len: usize) {
     let d2 = *code.add(2);
     let d3 = *code.add(3);
     let is_dxbc = d0 == u32::from_le_bytes(*b"DXBC");
-    log_line(&format!(
+    log_error!(
         "DDI {kind}: shader len={} dxbc={} tokens={:08x} {:08x} {:08x} {:08x}",
         len, is_dxbc, d0, d1, d2, d3
-    ));
+    );
 }
 
 unsafe extern "C" fn calc_size_shader(
@@ -3999,7 +3999,7 @@ unsafe extern "C" fn create_vertex_shader(
     let len = shader_code_len(code);
     log_shader_code("create_vertex_shader", code, len);
     if len == 0 {
-        log_line("DDI create_vertex_shader failed: unknown shader length");
+        log_error!("DDI create_vertex_shader failed: unknown shader length");
         return;
     }
     let bytes = core::slice::from_raw_parts(code as *const u8, len);
@@ -4009,16 +4009,16 @@ unsafe extern "C" fn create_vertex_shader(
     let raw = dxvk.create_vertex_shader(bytes.as_ptr(), bytes.len());
     if raw != 0 {
         if SHADER_BIND_LOG_COUNT.first_n(128).is_some() {
-            log_line(&format!(
+            log_error!(
                 "DDI create_vertex_shader ok: raw=0x{raw:x} len={len}"
-            ));
+            );
         }
         store_raw_com(h_shader.pDrvPrivate, raw);
         // Keep the bytecode so input layouts can be created lazily (the ISGN
         // supplies the semantic names CreateInputLayout requires).
         dev.ia.borrow_mut().vs_bytecode.insert(raw, bytes.to_vec());
     } else {
-        log_line("DDI create_vertex_shader failed");
+        log_error!("DDI create_vertex_shader failed");
     }
 }
 
@@ -4036,7 +4036,7 @@ unsafe extern "C" fn create_pixel_shader(
     let len = shader_code_len(code);
     log_shader_code("create_pixel_shader", code, len);
     if len == 0 {
-        log_line("DDI create_pixel_shader failed: unknown shader length");
+        log_error!("DDI create_pixel_shader failed: unknown shader length");
         return;
     }
     let bytes = core::slice::from_raw_parts(code as *const u8, len);
@@ -4046,13 +4046,13 @@ unsafe extern "C" fn create_pixel_shader(
     let raw = dxvk.create_pixel_shader(bytes.as_ptr(), bytes.len());
     if raw != 0 {
         if SHADER_BIND_LOG_COUNT.first_n(128).is_some() {
-            log_line(&format!(
+            log_error!(
                 "DDI create_pixel_shader ok: raw=0x{raw:x} len={len}"
-            ));
+            );
         }
         store_raw_com(h_shader.pDrvPrivate, raw);
     } else {
-        log_line("DDI create_pixel_shader failed");
+        log_error!("DDI create_pixel_shader failed");
     }
 }
 
@@ -4246,7 +4246,7 @@ unsafe fn log_tess_sig_summary(name: &str, sig_words: &[u32]) {
             ));
         }
     }
-    log_line(&dump);
+    log_error!("{dump}");
 }
 
 /// Shared body for the >=11.1 typed shader creates. `kind`: 0 = vertex,
@@ -4269,7 +4269,7 @@ unsafe fn create_shader_11_1_common(
     let len = shader_code_len(code);
     log_shader_code(name, code, len);
     if len == 0 {
-        log_line(&format!("DDI {name} failed: unknown shader length"));
+        log_error!("DDI {name} failed: unknown shader length");
         return;
     }
     let bytes = core::slice::from_raw_parts(code as *const u8, len);
@@ -4293,7 +4293,7 @@ unsafe fn create_shader_11_1_common(
                 sig_words[base + 3]
             ));
         }
-        log_line(&dump);
+        log_error!("{dump}");
     }
     let raw = dxvk.create_shader_sig(
         kind,
@@ -4304,10 +4304,10 @@ unsafe fn create_shader_11_1_common(
     );
     if raw != 0 {
         if SHADER_BIND_LOG_COUNT.first_n(128).is_some() {
-            log_line(&format!(
+            log_error!(
                 "DDI {name} ok: raw=0x{raw:x} len={len} sig_in={} sig_out={}",
                 sig_words[0], sig_words[1]
-            ));
+            );
         }
         store_raw_com(h_shader.pDrvPrivate, raw);
         if kind == 0 {
@@ -4319,7 +4319,7 @@ unsafe fn create_shader_11_1_common(
             ia.vs_sig_words.insert(raw, sig_words);
         }
     } else {
-        log_line(&format!("DDI {name} failed"));
+        log_error!("DDI {name} failed");
     }
 }
 
@@ -4367,7 +4367,7 @@ unsafe extern "C" fn create_geometry_shader(
     let len = shader_code_len(code);
     log_shader_code("create_geometry_shader", code, len);
     if len == 0 {
-        log_line("DDI create_geometry_shader failed: unknown shader length");
+        log_error!("DDI create_geometry_shader failed: unknown shader length");
         return;
     }
     let bytes = core::slice::from_raw_parts(code as *const u8, len);
@@ -4378,7 +4378,7 @@ unsafe extern "C" fn create_geometry_shader(
     if raw != 0 {
         store_raw_com(h_shader.pDrvPrivate, raw);
     } else {
-        log_line("DDI create_geometry_shader failed");
+        log_error!("DDI create_geometry_shader failed");
     }
 }
 
@@ -4408,7 +4408,7 @@ unsafe extern "C" fn create_geometry_shader_so(
     let len = shader_code_len(a.pShaderCode);
     log_shader_code("create_geometry_shader_so", a.pShaderCode, len);
     if len == 0 {
-        log_line("DDI create_geometry_shader_so failed: unknown shader length");
+        log_error!("DDI create_geometry_shader_so failed: unknown shader length");
         return;
     }
     let bytes = core::slice::from_raw_parts(a.pShaderCode as *const u8, len);
@@ -4422,7 +4422,7 @@ unsafe extern "C" fn create_geometry_shader_so(
     if raw != 0 {
         store_raw_com(h_shader.pDrvPrivate, raw);
     } else {
-        log_line("DDI create_geometry_shader_so failed");
+        log_error!("DDI create_geometry_shader_so failed");
     }
 }
 
@@ -4456,7 +4456,7 @@ unsafe extern "C" fn create_hull_shader(
     let len = shader_code_len(code);
     log_shader_code("create_hull_shader", code, len);
     if len == 0 {
-        log_line("DDI create_hull_shader failed: unknown shader length");
+        log_error!("DDI create_hull_shader failed: unknown shader length");
         return;
     }
     let bytes = core::slice::from_raw_parts(code as *const u8, len);
@@ -4473,13 +4473,13 @@ unsafe extern "C" fn create_hull_shader(
         sig_words.len(),
     );
     if raw == 0 {
-        log_line("DDI create_hull_shader signature path failed; falling back to raw bytecode");
+        log_error!("DDI create_hull_shader signature path failed; falling back to raw bytecode");
         raw = dxvk.create_hull_shader(bytes.as_ptr(), bytes.len());
     }
     if raw != 0 {
         store_raw_com(h_shader.pDrvPrivate, raw);
     } else {
-        log_line("DDI create_hull_shader failed");
+        log_error!("DDI create_hull_shader failed");
     }
 }
 
@@ -4497,7 +4497,7 @@ unsafe extern "C" fn create_hull_shader_11_1(
     let len = shader_code_len(code);
     log_shader_code("create_hull_shader_11_1", code, len);
     if len == 0 {
-        log_line("DDI create_hull_shader_11_1 failed: unknown shader length");
+        log_error!("DDI create_hull_shader_11_1 failed: unknown shader length");
         return;
     }
     let bytes = core::slice::from_raw_parts(code as *const u8, len);
@@ -4514,13 +4514,13 @@ unsafe extern "C" fn create_hull_shader_11_1(
         sig_words.len(),
     );
     if raw == 0 {
-        log_line("DDI create_hull_shader_11_1 signature path failed; falling back to raw bytecode");
+        log_error!("DDI create_hull_shader_11_1 signature path failed; falling back to raw bytecode");
         raw = dxvk.create_hull_shader(bytes.as_ptr(), bytes.len());
     }
     if raw != 0 {
         store_raw_com(h_shader.pDrvPrivate, raw);
     } else {
-        log_line("DDI create_hull_shader_11_1 failed");
+        log_error!("DDI create_hull_shader_11_1 failed");
     }
 }
 
@@ -4538,7 +4538,7 @@ unsafe extern "C" fn create_domain_shader(
     let len = shader_code_len(code);
     log_shader_code("create_domain_shader", code, len);
     if len == 0 {
-        log_line("DDI create_domain_shader failed: unknown shader length");
+        log_error!("DDI create_domain_shader failed: unknown shader length");
         return;
     }
     let bytes = core::slice::from_raw_parts(code as *const u8, len);
@@ -4555,13 +4555,13 @@ unsafe extern "C" fn create_domain_shader(
         sig_words.len(),
     );
     if raw == 0 {
-        log_line("DDI create_domain_shader signature path failed; falling back to raw bytecode");
+        log_error!("DDI create_domain_shader signature path failed; falling back to raw bytecode");
         raw = dxvk.create_domain_shader(bytes.as_ptr(), bytes.len());
     }
     if raw != 0 {
         store_raw_com(h_shader.pDrvPrivate, raw);
     } else {
-        log_line("DDI create_domain_shader failed");
+        log_error!("DDI create_domain_shader failed");
     }
 }
 
@@ -4579,7 +4579,7 @@ unsafe extern "C" fn create_domain_shader_11_1(
     let len = shader_code_len(code);
     log_shader_code("create_domain_shader_11_1", code, len);
     if len == 0 {
-        log_line("DDI create_domain_shader_11_1 failed: unknown shader length");
+        log_error!("DDI create_domain_shader_11_1 failed: unknown shader length");
         return;
     }
     let bytes = core::slice::from_raw_parts(code as *const u8, len);
@@ -4596,15 +4596,15 @@ unsafe extern "C" fn create_domain_shader_11_1(
         sig_words.len(),
     );
     if raw == 0 {
-        log_line(
-            "DDI create_domain_shader_11_1 signature path failed; falling back to raw bytecode",
+        log_error!(
+            "DDI create_domain_shader_11_1 signature path failed; falling back to raw bytecode"
         );
         raw = dxvk.create_domain_shader(bytes.as_ptr(), bytes.len());
     }
     if raw != 0 {
         store_raw_com(h_shader.pDrvPrivate, raw);
     } else {
-        log_line("DDI create_domain_shader_11_1 failed");
+        log_error!("DDI create_domain_shader_11_1 failed");
     }
 }
 
@@ -4621,7 +4621,7 @@ unsafe extern "C" fn create_compute_shader(
     let len = shader_code_len(code);
     log_shader_code("create_compute_shader", code, len);
     if len == 0 {
-        log_line("DDI create_compute_shader failed: unknown shader length");
+        log_error!("DDI create_compute_shader failed: unknown shader length");
         return;
     }
     let bytes = core::slice::from_raw_parts(code as *const u8, len);
@@ -4632,7 +4632,7 @@ unsafe extern "C" fn create_compute_shader(
     if raw != 0 {
         store_raw_com(h_shader.pDrvPrivate, raw);
     } else {
-        log_line("DDI create_compute_shader failed");
+        log_error!("DDI create_compute_shader failed");
     }
 }
 
@@ -5225,16 +5225,16 @@ unsafe extern "C" fn draw_instanced_indirect(
     };
     let (alloc, kind, width, height, depth, fmt) = resource_summary(h_args.pDrvPrivate);
     let Some(res) = load_resource(h_args.pDrvPrivate) else {
-        log_line(&format!(
+        log_error!(
             "DDI DrawInstancedIndirect skipped: args missing alloc=0x{alloc:x} offset={aligned_byte_offset}"
-        ));
+        );
         return;
     };
     let Ok(buf) = (*res).cast::<ID3D11Buffer>() else {
-        log_line(&format!(
+        log_error!(
             "DDI DrawInstancedIndirect skipped: args not buffer kind={kind} dims={}x{}x{} fmt={} alloc=0x{alloc:x} offset={aligned_byte_offset}",
             width, height, depth, fmt
-        ));
+        );
         return;
     };
     if DRAW_LOG_COUNT.first_n(2048).is_some() {
@@ -5264,16 +5264,16 @@ unsafe extern "C" fn draw_indexed_instanced_indirect(
     };
     let (alloc, kind, width, height, depth, fmt) = resource_summary(h_args.pDrvPrivate);
     let Some(res) = load_resource(h_args.pDrvPrivate) else {
-        log_line(&format!(
+        log_error!(
             "DDI DrawIndexedInstancedIndirect skipped: args missing alloc=0x{alloc:x} offset={aligned_byte_offset}"
-        ));
+        );
         return;
     };
     let Ok(buf) = (*res).cast::<ID3D11Buffer>() else {
-        log_line(&format!(
+        log_error!(
             "DDI DrawIndexedInstancedIndirect skipped: args not buffer kind={kind} dims={}x{}x{} fmt={} alloc=0x{alloc:x} offset={aligned_byte_offset}",
             width, height, depth, fmt
-        ));
+        );
         return;
     };
     if DRAW_LOG_COUNT.first_n(2048).is_some() {
@@ -5348,7 +5348,7 @@ unsafe extern "C" fn create_rasterizer_state(
         AntialiasedLineEnable: windows::Win32::Foundation::BOOL(d.AntialiasedLineEnable),
     };
     if RASTER_LOG_COUNT.first_n(64).is_some() {
-        log_line(&format!(
+        log_error!(
             "DDI CreateRasterizerState fill={} cull={} front_ccw={} depth_clip={} scissor={} msaa={} aaline={} bias={} slope_bias={:.3}",
             d.FillMode,
             d.CullMode,
@@ -5359,12 +5359,12 @@ unsafe extern "C" fn create_rasterizer_state(
             d.AntialiasedLineEnable,
             d.DepthBias,
             d.SlopeScaledDepthBias
-        ));
+        );
     }
     let mut rs: Option<ID3D11RasterizerState> = None;
     let created = device.CreateRasterizerState(&rd, Some(&mut rs));
     if let Err(ref e) = created {
-        log_line(&format!("DDI CreateRasterizerState failed: {e:?}"));
+        log_error!("DDI CreateRasterizerState failed: {e:?}");
     }
     finish_create(h, created, rs, |s| store_com(h_rs.pDrvPrivate, s));
 }
@@ -5418,7 +5418,7 @@ unsafe extern "C" fn create_depth_stencil_state(
     let mut ds: Option<ID3D11DepthStencilState> = None;
     let created = device.CreateDepthStencilState(&dd, Some(&mut ds));
     if let Err(ref e) = created {
-        log_line(&format!("DDI CreateDepthStencilState failed: {e:?}"));
+        log_error!("DDI CreateDepthStencilState failed: {e:?}");
     }
     finish_create(h, created, ds, |s| store_com(h_ds.pDrvPrivate, s));
 }
@@ -5462,26 +5462,26 @@ unsafe extern "C" fn create_srv(
     };
     let a = &*arg;
     let Some(res) = load_resource(a.hDrvResource.pDrvPrivate) else {
-        log_line(&format!(
+        log_error!(
             "DDI create_srv: resource handle empty dim={} fmt={} hpriv={:p}",
             a.ResourceDimension, a.Format, a.hDrvResource.pDrvPrivate
-        ));
+        );
         return;
     };
     let Some(desc) = srv_desc(a, a.hDrvResource.pDrvPrivate) else {
-        log_line(&format!(
+        log_error!(
             "DDI create_srv: unsupported resource dimension {} fmt={}",
             a.ResourceDimension, a.Format
-        ));
+        );
         return;
     };
     let mut srv: Option<ID3D11ShaderResourceView> = None;
     let created = device.CreateShaderResourceView(&*res, Some(&desc), Some(&mut srv));
     if let Err(ref e) = created {
-        log_line(&format!(
+        log_error!(
             "DDI create_srv failed: dim={} fmt={} {e:?}",
             a.ResourceDimension, a.Format
-        ));
+        );
     }
     finish_create(h, created, srv, |v| {
         let allocation = resource_allocation(a.hDrvResource.pDrvPrivate);
@@ -5693,10 +5693,10 @@ unsafe extern "C" fn create_uav(
         return;
     };
     let Some(desc) = uav_desc(a) else {
-        log_line(&format!(
+        log_error!(
             "DDI create_uav: unsupported resource dimension {} fmt={}",
             a.ResourceDimension, a.Format
-        ));
+        );
         return;
     };
     let mut uav: Option<ID3D11UnorderedAccessView> = None;
@@ -5735,10 +5735,10 @@ unsafe extern "C" fn create_uav(
                 }
                 _ => String::from("unknown"),
             };
-            log_line(&format!(
+            log_error!(
                 "DDI create_uav failed: dim={} fmt={} {} {e:?}",
                 a.ResourceDimension, a.Format, detail
-            ));
+            );
         }
     }
     finish_create(h, created, uav, |v| {
@@ -5983,7 +5983,7 @@ unsafe extern "C" fn create_sampler(
     let mut s: Option<ID3D11SamplerState> = None;
     let created = device.CreateSamplerState(&sd, Some(&mut s));
     if let Err(ref e) = created {
-        log_line(&format!("DDI CreateSamplerState failed: {e:?}"));
+        log_error!("DDI CreateSamplerState failed: {e:?}");
     }
     finish_create(h, created, s, |o| store_com(h_sampler.pDrvPrivate, o));
 }
@@ -6445,10 +6445,10 @@ unsafe extern "C" fn resource_update_subresource(
     };
     let Some(res) = load_resource(h_res.pDrvPrivate) else {
         if HANDLE_MISS_LOG_COUNT.first_n(256).is_some() {
-            log_line(&format!(
+            log_error!(
                 "DDI UpdateSubresource missing resource hpriv={:p} sub={} data={:p}",
                 h_res.pDrvPrivate, subresource, data
-            ));
+            );
         }
         return;
     };
@@ -6850,11 +6850,11 @@ static WDDM13_MARKER_LOG_COUNT: LogThrottle = LogThrottle::new();
 
 unsafe extern "C" fn set_marker(h: Hdevice) {
     if let Some(n) = WDDM13_MARKER_LOG_COUNT.first_n_then_every(16, 1024) {
-        log_line(&format!(
+        log_error!(
             "WDDM1.3 SetMarker h={:p} hit={}",
             h.pDrvPrivate,
             n + 1
-        ));
+        );
     }
 }
 
@@ -6864,13 +6864,13 @@ unsafe extern "C" fn set_marker_mode(
     flags: u32,
 ) {
     if let Some(n) = WDDM13_MARKER_LOG_COUNT.first_n_then_every(16, 1024) {
-        log_line(&format!(
+        log_error!(
             "WDDM1.3 SetMarkerMode h={:p} type={} flags=0x{:x} hit={}",
             h.pDrvPrivate,
             marker_type,
             flags,
             n + 1
-        ));
+        );
     }
 }
 
@@ -6902,7 +6902,7 @@ unsafe extern "C" fn create_query(
                 store_com(h_query.pDrvPrivate, query);
             }
         }
-        Err(e) => log_line(&format!("DDI create_query failed: {e:?}")),
+        Err(e) => log_error!("DDI create_query failed: {e:?}"),
     }
 }
 
@@ -7001,9 +7001,9 @@ unsafe fn helios_multisample_quality_levels(
     };
     let val = if required { 1 } else { 0 };
     if required || sample_count <= 8 {
-        log_line(&format!(
+        trace_line!(
             "MSAA q fmt={fmt} c={sample_count} output_bits={output_bits:?} required={required} -> {val}"
-        ));
+        );
     }
     val
 }
@@ -7017,9 +7017,9 @@ unsafe extern "C" fn check_multisample_quality_levels(
     if !out.is_null() {
         let val = helios_multisample_quality_levels(h, fmt, sample_count);
         *out = val;
-        log_line(&format!(
+        trace_line!(
             "MSAA out fmt={fmt} c={sample_count} flags=legacy out={out:p} val={val}"
-        ));
+        );
     }
 }
 
@@ -7033,9 +7033,9 @@ unsafe extern "C" fn check_multisample_quality_levels_wddm1_3(
     if !out.is_null() {
         let val = helios_multisample_quality_levels(h, fmt, sample_count);
         *out = val;
-        log_line(&format!(
+        trace_line!(
             "MSAA out fmt={fmt} c={sample_count} flags=0x{_flags:x} out={out:p} val={val}"
-        ));
+        );
     }
 }
 
@@ -7309,10 +7309,10 @@ unsafe extern "C" fn check_format_support(h: Hdevice, fmt: ddi::DXGI_FORMAT, out
         caps = DDI_FORMAT_SUPPORT_NOT_SUPPORTED;
     }
     if crate::feature_level_mode() == 1 {
-        log_line(&format!(
+        trace_line!(
             "FormatSupport fmt={fmt} raw=0x{raw_caps:08x} final=0x{caps:08x} output_bits={:?}",
             dxgi_output_bits_per_sample(fmt as u32, caps)
-        ));
+        );
     }
     if !out.is_null() {
         *out = caps;
@@ -7353,7 +7353,7 @@ pub unsafe fn selftest_offscreen_clear(h: Hdevice) -> i32 {
     };
     create_resource(h, &rt_desc, h_rt, Default::default());
     if rt_priv == 0 {
-        log_line("selftest_offscreen_clear: RT create failed");
+        log_error!("selftest_offscreen_clear: RT create failed");
         return 1;
     }
 
@@ -7367,7 +7367,7 @@ pub unsafe fn selftest_offscreen_clear(h: Hdevice) -> i32 {
     };
     create_rtv(h, &rtv_desc, h_rtv, Default::default());
     if rtv_priv == 0 {
-        log_line("selftest_offscreen_clear: RTV create failed");
+        log_error!("selftest_offscreen_clear: RTV create failed");
         return 2;
     }
 
@@ -7389,7 +7389,7 @@ pub unsafe fn selftest_offscreen_clear(h: Hdevice) -> i32 {
     };
     create_resource(h, &st_desc, h_st, Default::default());
     if st_priv == 0 {
-        log_line("selftest_offscreen_clear: staging create failed");
+        log_error!("selftest_offscreen_clear: staging create failed");
         return 3;
     }
 
@@ -7402,9 +7402,9 @@ pub unsafe fn selftest_offscreen_clear(h: Hdevice) -> i32 {
     if !mapped.pData.is_null() {
         let px = mapped.pData as *const u8;
         let (b, g, r, a) = (*px, *px.add(1), *px.add(2), *px.add(3));
-        log_line(&format!(
+        log_error!(
             "selftest_offscreen_clear: readback BGRA = {b} {g} {r} {a} (want ~191 128 64 255)"
-        ));
+        );
         let ok = (b as i32 - 191).abs() <= 2
             && (g as i32 - 128).abs() <= 2
             && (r as i32 - 64).abs() <= 2
@@ -7416,9 +7416,9 @@ pub unsafe fn selftest_offscreen_clear(h: Hdevice) -> i32 {
     destroy_resource(h, h_st);
     destroy_rtv(h, h_rtv);
     destroy_resource(h, h_rt);
-    log_line(&format!(
+    log_error!(
         "selftest_offscreen_clear: result={result} (0=PASS)"
-    ));
+    );
     result
 }
 
@@ -7442,10 +7442,10 @@ unsafe fn compile_hlsl(src: &[u8], entry: &[u8], target: &[u8]) -> Option<ID3DBl
         if let Some(e) = errs {
             let msg =
                 core::slice::from_raw_parts(e.GetBufferPointer() as *const u8, e.GetBufferSize());
-            log_line(&format!(
+            log_error!(
                 "D3DCompile error: {}",
                 String::from_utf8_lossy(msg)
-            ));
+            );
         }
         return None;
     }
@@ -7537,7 +7537,7 @@ pub unsafe fn selftest_triangle(h: Hdevice) -> i32 {
         core::ptr::null(),
     );
     if vs_priv == 0 || ps_priv == 0 {
-        log_line("selftest_triangle: shader create failed");
+        log_error!("selftest_triangle: shader create failed");
         return 14;
     }
     vs_set_shader(h, h_vs);
@@ -7599,9 +7599,9 @@ pub unsafe fn selftest_triangle(h: Hdevice) -> i32 {
         let off = 32 * mapped.RowPitch as usize + 32 * 4;
         let px = (mapped.pData as *const u8).add(off);
         let (b, g, r, a) = (*px, *px.add(1), *px.add(2), *px.add(3));
-        log_line(&format!(
+        log_error!(
             "selftest_triangle: center BGRA = {b} {g} {r} {a} (want red ~0 0 255 255)"
-        ));
+        );
         result = if r > 250 && g < 5 && b < 5 && a == 255 {
             0
         } else {
@@ -7614,7 +7614,7 @@ pub unsafe fn selftest_triangle(h: Hdevice) -> i32 {
     destroy_shader(h, h_vs);
     destroy_rtv(h, h_rtv);
     destroy_resource(h, h_rt);
-    log_line(&format!("selftest_triangle: result={result} (0=PASS)"));
+    log_error!("selftest_triangle: result={result} (0=PASS)");
     result
 }
 
@@ -7659,9 +7659,9 @@ pub unsafe fn selftest_cb_readback(h: Hdevice) -> i32 {
     };
     create_resource(h, &st, h_st, Default::default());
     if cb_priv == 0 || st_priv == 0 {
-        log_line(&format!(
+        log_error!(
             "cb_readback: create failed cb={cb_priv:#x} st={st_priv:#x}"
-        ));
+        );
         return 1;
     }
     resource_copy(h, h_st, h_cb);
@@ -7669,17 +7669,17 @@ pub unsafe fn selftest_cb_readback(h: Hdevice) -> i32 {
     let mut mapped = ddi::D3D10DDI_MAPPED_SUBRESOURCE::default();
     resource_map(h, h_st, 0, 1, 0, &mut mapped);
     if mapped.pData.is_null() {
-        log_line("cb_readback: map failed");
+        log_error!("cb_readback: map failed");
         return 2;
     }
     let f = mapped.pData as *const f32;
-    log_line(&format!(
+    log_error!(
         "cb_readback: floats = {} {} {} {} (want 1 0.25 0.5 1)",
         *f,
         *f.add(1),
         *f.add(2),
         *f.add(3)
-    ));
+    );
     resource_unmap(h, h_st, 0);
     destroy_resource(h, h_st);
     destroy_resource(h, h_cb);
@@ -7751,10 +7751,10 @@ pub unsafe fn selftest_triangle_cb(h: Hdevice) -> i32 {
     };
     create_resource(h, &cb, h_cb, Default::default());
     if cb_priv == 0 {
-        log_line("selftest_triangle_cb: CB create failed");
+        log_error!("selftest_triangle_cb: CB create failed");
         return 34;
     }
-    log_line(&format!("selftest_triangle_cb: CB COM ptr = {cb_priv:#x}"));
+    log_error!("selftest_triangle_cb: CB COM ptr = {cb_priv:#x}");
 
     // Shaders.
     let mut vs_priv = 0u64;
@@ -7807,13 +7807,13 @@ pub unsafe fn selftest_triangle_cb(h: Hdevice) -> i32 {
         match &bound[0] {
             Some(b) => {
                 let raw = b.as_raw() as usize;
-                log_line(&format!(
+                log_error!(
                     "selftest_triangle_cb: PSGetConstantBuffers[0] = {raw:#x} (CB was {cb_priv:#x}, match={})",
                     raw == cb_priv as usize
-                ));
+                );
             }
-            None => log_line(
-                "selftest_triangle_cb: PSGetConstantBuffers[0] = NULL (bind did NOT register!)",
+            None => log_error!(
+                "selftest_triangle_cb: PSGetConstantBuffers[0] = NULL (bind did NOT register!)"
             ),
         }
     }
@@ -7865,13 +7865,13 @@ pub unsafe fn selftest_triangle_cb(h: Hdevice) -> i32 {
         resource_map(h, h_cbst, 0, 1, 0, &mut m);
         if !m.pData.is_null() {
             let f = m.pData as *const f32;
-            log_line(&format!(
+            log_error!(
                 "selftest_triangle_cb: CB content at draw time = {} {} {} {} (want 0 1 0 1)",
                 *f,
                 *f.add(1),
                 *f.add(2),
                 *f.add(3)
-            ));
+            );
             resource_unmap(h, h_cbst, 0);
         }
         destroy_resource(h, h_cbst);
@@ -7892,9 +7892,9 @@ pub unsafe fn selftest_triangle_cb(h: Hdevice) -> i32 {
         let off = 32 * mapped.RowPitch as usize + 32 * 4;
         let px = (mapped.pData as *const u8).add(off);
         let (b, g, r, a) = (*px, *px.add(1), *px.add(2), *px.add(3));
-        log_line(&format!(
+        log_error!(
             "selftest_triangle_cb: center BGRA = {b} {g} {r} {a} (want green ~0 255 0 255)"
-        ));
+        );
         result = if g > 250 && r < 5 && b < 5 && a == 255 {
             0
         } else {
@@ -7908,7 +7908,7 @@ pub unsafe fn selftest_triangle_cb(h: Hdevice) -> i32 {
     destroy_resource(h, h_cb);
     destroy_rtv(h, h_rtv);
     destroy_resource(h, h_rt);
-    log_line(&format!("selftest_triangle_cb: result={result} (0=PASS)"));
+    log_error!("selftest_triangle_cb: result={result} (0=PASS)");
     result
 }
 
@@ -8155,10 +8155,10 @@ unsafe fn bind_input_layout(h: Hdevice) {
     };
     if lp == 0 || vp == 0 {
         if SHADER_BIND_LOG_COUNT.first_n(256).is_some() {
-            log_line(&format!(
+            log_error!(
                 "DDI bind_input_layout skipped: layout=0x{:x} vs=0x{:x}",
                 lp, vp
-            ));
+            );
         }
         return;
     }
@@ -8169,10 +8169,10 @@ unsafe fn bind_input_layout(h: Hdevice) {
             let bytecode = match dev.ia.borrow().vs_bytecode.get(&vp) {
                 Some(b) => b.clone(),
                 None => {
-                    log_line(&format!(
+                    log_error!(
                         "DDI bind_input_layout skipped: missing VS bytecode layout=0x{:x} vs=0x{:x}",
                         lp, vp
-                    ));
+                    );
                     return;
                 }
             };
@@ -8190,10 +8190,10 @@ unsafe fn bind_input_layout(h: Hdevice) {
                     match isgn_lookup(&bytecode, el.input_register) {
                         Some(v) => v,
                         None => {
-                            log_line(&format!(
+                            log_error!(
                                 "DDI bind_input_layout: no ISGN entry for input_register={} fmt={} slot={} offset={}",
                                 el.input_register, el.format, el.input_slot, el.aligned_byte_offset
-                            ));
+                            );
                             continue;
                         }
                     }
@@ -8222,11 +8222,11 @@ unsafe fn bind_input_layout(h: Hdevice) {
                 });
             }
             if descs.is_empty() {
-                log_line(&format!(
+                log_error!(
                     "DDI bind_input_layout skipped: empty descs elements={} vs_len={}",
                     layout.elements.len(),
                     bytecode.len()
-                ));
+                );
                 return;
             }
             let signature_blob;
@@ -8244,20 +8244,20 @@ unsafe fn bind_input_layout(h: Hdevice) {
                 Ok(()) => match il {
                     Some(l) => {
                         let raw = l.into_raw() as usize;
-                        log_line(&format!(
+                        log_error!(
                             "DDI CreateInputLayout ok: layout=0x{:x} vs=0x{:x} elems={} raw=0x{:x}",
                             lp,
                             vp,
                             descs.len(),
                             raw
-                        ));
+                        );
                         dev.ia.borrow_mut().layout_cache.insert((lp, vp), raw);
                         raw
                     }
                     None => return,
                 },
                 Err(e) => {
-                    log_line(&format!("CreateInputLayout failed: {e:?}"));
+                    log_error!("CreateInputLayout failed: {e:?}");
                     return;
                 }
             }
@@ -8379,7 +8379,7 @@ unsafe fn create_vs_input_variant(
     let (bytecode, mut words) = {
         let ia = dev.ia.borrow();
         let Some(b) = ia.vs_bytecode.get(&vp) else {
-            log_line(&format!("VS variant: no bytecode for vs=0x{vp:x}"));
+            log_error!("VS variant: no bytecode for vs=0x{vp:x}");
             return 0;
         };
         if b.len() >= 4 && &b[0..4] == b"DXBC" {
@@ -8429,10 +8429,10 @@ unsafe fn create_vs_input_variant(
         words.as_ptr(),
         words.len(),
     );
-    log_line(&format!(
+    log_error!(
         "VS input-class variant: vs=0x{vp:x} classes={:?} -> raw=0x{raw:x}",
         classes.iter().map(|c| (c.0, c.1)).collect::<Vec<_>>()
-    ));
+    );
     raw
 }
 
@@ -8561,7 +8561,7 @@ unsafe extern "C" fn create_blend_state(
     let mut bs: Option<ID3D11BlendState> = None;
     let created = device.CreateBlendState(&bd, Some(&mut bs));
     if let Err(ref e) = created {
-        log_line(&format!("DDI CreateBlendState failed: {e:?}"));
+        log_error!("DDI CreateBlendState failed: {e:?}");
     }
     finish_create(h, created, bs, |s| store_com(h_bs.pDrvPrivate, s));
 }
@@ -8596,7 +8596,7 @@ unsafe extern "C" fn create_blend_state_11_1(
         return;
     };
     let Ok(device1) = device.cast::<ID3D11Device1>() else {
-        log_line("DDI create_blend_state_11_1: ID3D11Device1 cast failed");
+        log_error!("DDI create_blend_state_11_1: ID3D11Device1 cast failed");
         return;
     };
     let d = &*desc;
@@ -8625,7 +8625,7 @@ unsafe extern "C" fn create_blend_state_11_1(
     let mut bs: Option<ID3D11BlendState1> = None;
     let created = device1.CreateBlendState1(&bd, Some(&mut bs));
     if created.is_err() {
-        log_line("DDI create_blend_state_11_1: CreateBlendState1 failed");
+        log_error!("DDI create_blend_state_11_1: CreateBlendState1 failed");
     }
     // `set_blend_state` loads an ID3D11BlendState from this slot; store the
     // base interface. A failed QI is a create failure like any other — folding
@@ -8634,9 +8634,9 @@ unsafe extern "C" fn create_blend_state_11_1(
         Some(s) => match s.cast::<ID3D11BlendState>() {
             Ok(b) => Some(b),
             Err(e) => {
-                log_line(&format!(
+                log_error!(
                     "DDI create_blend_state_11_1: ID3D11BlendState cast failed: {e:?}"
-                ));
+                );
                 None
             }
         },
@@ -8911,16 +8911,16 @@ unsafe fn run_present_frame_gate(
         // Unchanged text and cadence: this is the pre-existing vehicle line.
         let n = EXT_FLIP_GATE_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
         if n < 16 || n % 512 == 0 {
-            log_line(&format!(
+            log_error!(
                 "vehicle flip gate TIMEOUT (x{}) — flipping anyway",
                 n + 1
-            ));
+            );
         }
     } else {
         if PRESENT_GATE_LOG_COUNT.first_n_then_every(16, 512).is_some() {
-            log_line(&format!(
+            log_error!(
                 "present frame gate did not confirm completion (x{total}) — presenting anyway"
-            ));
+            );
         }
     }
     GateOutcome::NotConfirmed
@@ -8953,9 +8953,9 @@ unsafe fn flip_wait_setup(dev: &crate::device_funcs::HeliosDevice) -> bool {
     }
     let disable = |reason: &str| {
         dev.flip_wait_state.set(2);
-        log_line(&format!(
+        log_error!(
             "flip-kwait DISABLED for this device: {reason} — bounded CPU gate serves"
-        ));
+        );
         false
     };
     if !crate::vehicle_kernel_flip_wait() {
@@ -9005,10 +9005,10 @@ unsafe fn flip_wait_setup(dev: &crate::device_funcs::HeliosDevice) -> bool {
     }
     dev.flip_wait_fence.set(h_fence);
     dev.flip_wait_state.set(1);
-    log_line(&format!(
+    log_error!(
         "flip-kwait READY: runtime-device fence 0x{h_fence:x} — vehicle flips are \
          kernel-ordered on the copy's completion (CPU gate retired for this device)"
-    ));
+    );
     true
 }
 
@@ -9024,10 +9024,10 @@ pub fn set_present_source(
 ) -> i32 {
     if resid == 0 || width == 0 || height == 0 || dxgi_format == 0 {
         EXT_SOURCE_REFUSED.fetch_add(1, Ordering::Relaxed);
-        log_line(&format!(
+        log_error!(
             "set_present_source REFUSED: resid={} {}x{} fmt={}",
             resid, width, height, dxgi_format
-        ));
+        );
         return -1;
     }
     let prev = VEHICLE.with(|c| {
@@ -9048,10 +9048,10 @@ pub fn set_present_source(
             // new source replaces it.
             let n = EXT_OVERWRITES.fetch_add(1, Ordering::Relaxed);
             if n < 16 || n % 512 == 0 {
-                log_line(&format!(
+                log_error!(
                     "set_present_source: overwrote a pending source (x{})",
                     n + 1
-                ));
+                );
             }
             1
         }
@@ -9064,10 +9064,10 @@ pub fn set_present_source(
             // counters.
             let n = EXT_RESULT_OVERWRITES.fetch_add(1, Ordering::Relaxed);
             if n < 16 || n % 512 == 0 {
-                log_line(&format!(
+                log_error!(
                     "vehicle present: unconsumed present result overwritten (x{})",
                     n + 1
-                ));
+                );
             }
             0
         }
@@ -9094,10 +9094,10 @@ pub fn wait_last_present(timeout_us: u32) -> i32 {
         VEHICLE.with(|c| c.set(VehicleSlot::Idle));
         let n = EXT_WAIT_DEAD_DEVICE.fetch_add(1, Ordering::Relaxed);
         if n < 16 || n % 512 == 0 {
-            log_line(&format!(
+            log_error!(
                 "wait_last_present REFUSED: recorded device 0x{dev_ptr:x} is no longer live (x{})",
                 n + 1
-            ));
+            );
         }
         return -1;
     }
@@ -9143,7 +9143,7 @@ pub fn take_present_result(fence_id: &mut u32, value: &mut u64) -> i32 {
         None => {
             let n = EXT_RESULT_MISSES.fetch_add(1, Ordering::Relaxed);
             if n < 16 || n % 512 == 0 {
-                log_line(&format!("get_present_result: none pending (x{})", n + 1));
+                log_error!("get_present_result: none pending (x{})", n + 1);
             }
             -1
         }
@@ -9163,13 +9163,13 @@ unsafe fn vehicle_present_prepare(
 ) -> Result<(u64, u32), i32> {
     let Some(dev) = helios_device(h) else {
         EXT_NO_DEVICE.fetch_add(1, Ordering::Relaxed);
-        log_line("vehicle present FAILED: no Helios device");
+        log_error!("vehicle present FAILED: no Helios device");
         return Err(E_FAIL);
     };
     let backbuffer_raw = resource_com_raw(backbuffer_h.pDrvPrivate);
     if backbuffer_raw == 0 {
         EXT_NO_DEVICE.fetch_add(1, Ordering::Relaxed);
-        log_line("vehicle present FAILED: backbuffer has no COM resource");
+        log_error!("vehicle present FAILED: backbuffer has no COM resource");
         return Err(E_FAIL);
     }
 
@@ -9213,7 +9213,7 @@ unsafe fn vehicle_present_prepare(
         if raw == 0 {
             let n = EXT_IMPORT_FAILS.fetch_add(1, Ordering::Relaxed);
             if n < 16 || n % 512 == 0 {
-                log_line(&format!(
+                log_error!(
                     "vehicle present FAILED: import resid={} {}x{} fmt={} alloc={} type={} (x{})",
                     info.resid,
                     info.width,
@@ -9222,7 +9222,7 @@ unsafe fn vehicle_present_prepare(
                     info.alloc_size,
                     info.memory_type_index,
                     n + 1
-                ));
+                );
             }
             return Err(E_FAIL);
         }
@@ -9248,12 +9248,12 @@ unsafe fn vehicle_present_prepare(
         rc => {
             let n = EXT_COPY_FAILS.fetch_add(1, Ordering::Relaxed);
             if n < 16 || n % 512 == 0 {
-                log_line(&format!(
+                log_error!(
                     "vehicle present FAILED: copy rc={} resid={} (x{})",
                     rc,
                     info.resid,
                     n + 1
-                ));
+                );
             }
             return Err(E_FAIL);
         }
@@ -9302,28 +9302,28 @@ unsafe fn maybe_log_present_readback(h: Hdevice, src_h: ddi::D3D10DDI_HRESOURCE)
         return;
     }
     let Some(device) = d3d11_device(h) else {
-        log_line("DXGI Present readback: no D3D11 device");
+        log_error!("DXGI Present readback: no D3D11 device");
         return;
     };
     let Some(context) = d3d11_context(h) else {
-        log_line("DXGI Present readback: no D3D11 context");
+        log_error!("DXGI Present readback: no D3D11 context");
         return;
     };
     let Some(res) = load_resource(src_h.pDrvPrivate) else {
-        log_line("DXGI Present readback: source resource missing");
+        log_error!("DXGI Present readback: source resource missing");
         return;
     };
     let Ok(tex) = (*res).cast::<ID3D11Texture2D>() else {
-        log_line("DXGI Present readback: source is not Texture2D");
+        log_error!("DXGI Present readback: source is not Texture2D");
         return;
     };
     let mut desc = D3D11_TEXTURE2D_DESC::default();
     tex.GetDesc(&mut desc);
     if desc.Width == 0 || desc.Height == 0 || desc.SampleDesc.Count != 1 {
-        log_line(&format!(
+        log_error!(
             "DXGI Present readback: unsupported {}x{} fmt={} sample={}x{}",
             desc.Width, desc.Height, desc.Format.0, desc.SampleDesc.Count, desc.SampleDesc.Quality
-        ));
+        );
         return;
     }
 
@@ -9336,24 +9336,24 @@ unsafe fn maybe_log_present_readback(h: Hdevice, src_h: ddi::D3D10DDI_HRESOURCE)
     staging_desc.MiscFlags = 0;
     let mut staging: Option<ID3D11Texture2D> = None;
     if let Err(e) = device.CreateTexture2D(&staging_desc, None, Some(&mut staging)) {
-        log_line(&format!(
+        log_error!(
             "DXGI Present readback: staging create failed {e:?}"
-        ));
+        );
         return;
     }
     let Some(staging) = staging else {
-        log_line("DXGI Present readback: staging create returned None");
+        log_error!("DXGI Present readback: staging create returned None");
         return;
     };
     let Ok(staging_res) = staging.cast::<ID3D11Resource>() else {
-        log_line("DXGI Present readback: staging cast failed");
+        log_error!("DXGI Present readback: staging cast failed");
         return;
     };
     context.CopyResource(&staging_res, &*res);
 
     let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
     if let Err(e) = context.Map(&staging_res, 0, D3D11_MAP_READ, 0, Some(&mut mapped)) {
-        log_line(&format!("DXGI Present readback: map failed {e:?}"));
+        log_error!("DXGI Present readback: map failed {e:?}");
         return;
     }
     let bpp = dxgi_bytes_per_pixel(desc.Format.0 as u32).max(1) as usize;
@@ -9413,20 +9413,20 @@ unsafe fn maybe_log_present_readback(h: Hdevice, src_h: ddi::D3D10DDI_HRESOURCE)
                     desc.Format.0
                 ));
                 if let Err(e) = write_bgra32_bmp(&path, data, row_pitch, desc.Width, desc.Height) {
-                    log_line(&format!("DXGI Present readback dump failed: {e}"));
+                    log_error!("DXGI Present readback dump failed: {e}");
                 } else {
-                    log_line(&format!("DXGI Present readback dump: {}", path.display()));
+                    log_error!("DXGI Present readback dump: {}", path.display());
                 }
             }
         } else {
-            log_line(&format!(
+            log_error!(
                 "DXGI Present readback dump skipped: bpp={} unsupported",
                 bpp
-            ));
+            );
         }
     }
     context.Unmap(&staging_res, 0);
-    log_line(&format!(
+    log_error!(
         "DXGI Present readback #{}: {}x{} fmt={} bpp={} grid_sum={} nonzero={} center=0x{:08x} frame_sum={} frame_nonzero={}",
         n + 1,
         desc.Width,
@@ -9438,7 +9438,7 @@ unsafe fn maybe_log_present_readback(h: Hdevice, src_h: ddi::D3D10DDI_HRESOURCE)
         center,
         frame_sum,
         frame_nonzero
-    ));
+    );
 }
 
 unsafe fn write_bgra32_bmp(
@@ -9490,25 +9490,25 @@ unsafe fn maybe_force_present_alpha_opaque(h: Hdevice, src_h: ddi::D3D10DDI_HRES
     let n = PRESENT_FORCE_OPAQUE_LOG_COUNT.next();
     let Some(device) = d3d11_device(h) else {
         if n < 8 {
-            log_line("DXGI Present force-opaque: no D3D11 device");
+            log_error!("DXGI Present force-opaque: no D3D11 device");
         }
         return;
     };
     let Some(context) = d3d11_context(h) else {
         if n < 8 {
-            log_line("DXGI Present force-opaque: no D3D11 context");
+            log_error!("DXGI Present force-opaque: no D3D11 context");
         }
         return;
     };
     let Some(res) = load_resource(src_h.pDrvPrivate) else {
         if n < 8 {
-            log_line("DXGI Present force-opaque: source resource missing");
+            log_error!("DXGI Present force-opaque: source resource missing");
         }
         return;
     };
     let Ok(tex) = (*res).cast::<ID3D11Texture2D>() else {
         if n < 8 {
-            log_line("DXGI Present force-opaque: source is not Texture2D");
+            log_error!("DXGI Present force-opaque: source is not Texture2D");
         }
         return;
     };
@@ -9518,7 +9518,7 @@ unsafe fn maybe_force_present_alpha_opaque(h: Hdevice, src_h: ddi::D3D10DDI_HRES
     let bpp = dxgi_bytes_per_pixel(desc.Format.0 as u32);
     if desc.Width == 0 || desc.Height == 0 || desc.SampleDesc.Count != 1 || bpp != 4 {
         if n < 8 {
-            log_line(&format!(
+            log_error!(
                 "DXGI Present force-opaque: unsupported {}x{} fmt={} bpp={} sample={}x{}",
                 desc.Width,
                 desc.Height,
@@ -9526,7 +9526,7 @@ unsafe fn maybe_force_present_alpha_opaque(h: Hdevice, src_h: ddi::D3D10DDI_HRES
                 bpp,
                 desc.SampleDesc.Count,
                 desc.SampleDesc.Quality
-            ));
+            );
         }
         return;
     }
@@ -9542,21 +9542,21 @@ unsafe fn maybe_force_present_alpha_opaque(h: Hdevice, src_h: ddi::D3D10DDI_HRES
     let mut staging: Option<ID3D11Texture2D> = None;
     if let Err(e) = device.CreateTexture2D(&staging_desc, None, Some(&mut staging)) {
         if n < 8 {
-            log_line(&format!(
+            log_error!(
                 "DXGI Present force-opaque: staging create failed {e:?}"
-            ));
+            );
         }
         return;
     }
     let Some(staging) = staging else {
         if n < 8 {
-            log_line("DXGI Present force-opaque: staging create returned None");
+            log_error!("DXGI Present force-opaque: staging create returned None");
         }
         return;
     };
     let Ok(staging_res) = staging.cast::<ID3D11Resource>() else {
         if n < 8 {
-            log_line("DXGI Present force-opaque: staging cast failed");
+            log_error!("DXGI Present force-opaque: staging cast failed");
         }
         return;
     };
@@ -9566,7 +9566,7 @@ unsafe fn maybe_force_present_alpha_opaque(h: Hdevice, src_h: ddi::D3D10DDI_HRES
     let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
     if let Err(e) = context.Map(&staging_res, 0, D3D11_MAP_READ_WRITE, 0, Some(&mut mapped)) {
         if n < 8 {
-            log_line(&format!("DXGI Present force-opaque: map failed {e:?}"));
+            log_error!("DXGI Present force-opaque: map failed {e:?}");
         }
         return;
     }
@@ -9593,7 +9593,7 @@ unsafe fn maybe_force_present_alpha_opaque(h: Hdevice, src_h: ddi::D3D10DDI_HRES
     context.Flush();
 
     if n < 8 || (n + 1) % 512 == 0 {
-        log_line(&format!(
+        log_error!(
             "DXGI Present force-opaque #{}: {}x{} fmt={} alpha_zero={} alpha_non_opaque={}",
             n + 1,
             desc.Width,
@@ -9601,7 +9601,7 @@ unsafe fn maybe_force_present_alpha_opaque(h: Hdevice, src_h: ddi::D3D10DDI_HRES
             desc.Format.0,
             alpha_zero,
             alpha_non_opaque
-        ));
+        );
     }
 }
 
@@ -9633,12 +9633,12 @@ impl RuntimePresentDependencies {
         let required = self.count();
         let list = dev.allocation_list.get();
         if list.is_null() || dev.allocation_list_size.get() < required {
-            log_line(&format!(
+            log_error!(
                 "DXGI Present: runtime allocation list unavailable ptr={:p} capacity={} required={}",
                 list,
                 dev.allocation_list_size.get(),
                 required
-            ));
+            );
             return Err(E_FAIL);
         }
 
@@ -9689,7 +9689,7 @@ unsafe fn submit_runtime_submission(
         return E_FAIL;
     }
     let Some(render_cb) = (*dev.kt_callbacks).pfnRenderCb else {
-        log_line("DXGI submission: pfnRenderCb missing");
+        log_error!("DXGI submission: pfnRenderCb missing");
         return E_FAIL;
     };
     let command = dev.command_buffer.get();
@@ -9710,7 +9710,7 @@ unsafe fn submit_runtime_submission(
         ),
     };
     if command.is_null() || dev.command_buffer_size.get() < command_length {
-        log_line(&format!("DXGI {label}: no runtime command buffer"));
+        log_error!("DXGI {label}: no runtime command buffer");
         return E_FAIL;
     }
 
@@ -9777,14 +9777,14 @@ unsafe fn submit_runtime_submission(
 
     let n = LOG_COUNT.fetch_add(1, Ordering::Relaxed);
     if n < 64 || hr < 0 {
-        log_line(&format!(
+        log_error!(
             "DXGI {label}: pfnRenderCb hr=0x{:08x} allocations={} queued={} next_cmd={:p}/{}",
             hr as u32,
             allocation_count,
             render.QueuedBufferCount,
             render.pNewCommandBuffer,
             render.NewCommandBufferSize,
-        ));
+        );
     }
     hr
 }
@@ -9818,11 +9818,11 @@ unsafe fn submit_runtime_present_then_call(
     callback_args: &mut ddi::DXGIDDICB_PRESENT,
 ) -> i32 {
     if dev.dxgi_callbacks.is_null() {
-        log_line("DXGI Present: callback table missing");
+        log_error!("DXGI Present: callback table missing");
         return E_FAIL;
     }
     let Some(present_cb) = (*dev.dxgi_callbacks).pfnPresentCb else {
-        log_line("DXGI Present: pfnPresentCb missing");
+        log_error!("DXGI Present: pfnPresentCb missing");
         return E_FAIL;
     };
 
@@ -9998,12 +9998,12 @@ unsafe extern "C" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT) -> i32 {
                     } else {
                         let n = EXT_KWAIT_QUEUE_FAILS.fetch_add(1, Ordering::Relaxed);
                         if n < 16 || n % 512 == 0 {
-                            log_line(&format!(
+                            log_error!(
                                 "flip-kwait: GPU-wait queue FAILED hr=0x{:08x} (x{}) — \
                                  CPU gate serves this present",
                                 hr as u32,
                                 n + 1
-                            ));
+                            );
                         }
                     }
                 } else {
@@ -10053,7 +10053,7 @@ unsafe extern "C" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT) -> i32 {
                 0
             };
             let Some(dependencies) = RuntimePresentDependencies::new(src_alloc, dst_alloc) else {
-                log_line("DXGI Present: nonzero source allocation invariant lost");
+                log_error!("DXGI Present: nonzero source allocation invariant lost");
                 return E_FAIL;
             };
             if let Some(cb_n) = PRESENT_CB_LOG_COUNT.first_n_then_every_from_one(128, 512) {
@@ -10088,12 +10088,12 @@ unsafe extern "C" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT) -> i32 {
             // Rate cap: same message text and field set, fewer lines. Which of
             // the three preconditions failed now lives in the counters below.
             if PRESENT_SKIP_LOG_COUNT.first_n_then_every_from_one(64, 512).is_some() {
-                log_line(&format!(
+                log_error!(
                     "DXGI Present: skip PresentCb callbacks={} src=0x{:x} hContext={:p}",
                     dev.dxgi_callbacks.is_null(),
                     src_alloc,
                     dev.h_context
-                ));
+                );
             }
         }
     }
@@ -10120,15 +10120,15 @@ unsafe extern "C" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT) -> i32 {
         ) {
             let n = EXT_RESULT_OVERWRITES.fetch_add(1, Ordering::Relaxed);
             if n < 16 || n % 512 == 0 {
-                log_line(&format!(
+                log_error!(
                     "vehicle present: unconsumed present result overwritten (x{})",
                     n + 1
-                ));
+                );
             }
         }
         let n = EXT_PRESENTS.fetch_add(1, Ordering::Relaxed);
         if n < 4 || (n + 1) % 512 == 0 {
-            log_line(&format!(
+            log_error!(
                 "vehicle present #{}: imports_failed={} copies_failed={} geom_mismatch={} \
                  overwrites={} kwait_armed={} kwait_arm_fails={} kwait_queue_fails={}",
                 n + 1,
@@ -10139,7 +10139,7 @@ unsafe extern "C" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT) -> i32 {
                 EXT_KWAIT_ARMED.load(Ordering::Relaxed),
                 EXT_KWAIT_ARM_FAILS.load(Ordering::Relaxed),
                 EXT_KWAIT_QUEUE_FAILS.load(Ordering::Relaxed),
-            ));
+            );
         }
     }
 
@@ -10150,7 +10150,7 @@ unsafe extern "C" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT) -> i32 {
     static PRESENT_ORDINAL: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
     let ordinal = PRESENT_ORDINAL.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     if ordinal < 64 || (ordinal + 1) % 512 == 0 {
-        log_line(&format!(
+        log_error!(
             "DXGI Present: #{} src=0x{:x} dst=0x{:x} copied={} flags=0x{:x} opt_comp={} presentCb=0x{:08x} \
              hSurf={:p} srcSub={} hDstRes={:p} dstSub={} flipInterval={} dxgiCtx={:p} hContext={:p} \
              syncVal={} skips={}/{}/{} gate_nc={}",
@@ -10173,7 +10173,7 @@ unsafe extern "C" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT) -> i32 {
             PRESENT_SKIP_NO_CONTEXT.load(Ordering::Relaxed),
             PRESENT_SKIP_NO_SRC_ALLOC.load(Ordering::Relaxed),
             PRESENT_GATE_TIMEOUTS.load(Ordering::Relaxed),
-        ));
+        );
     }
     present_hr
 }
@@ -10209,15 +10209,15 @@ unsafe extern "C" fn dxgi_set_display_mode(arg: *mut ddi::DXGI_DDI_ARG_SETDISPLA
     let a = &*arg;
     let h = dxgi_device_handle(a.hDevice);
     let Some(dev) = helios_device(h) else {
-        log_line("DXGI SetDisplayMode: missing device");
+        log_error!("DXGI SetDisplayMode: missing device");
         return E_INVALIDARG;
     };
     if dev.kt_callbacks.is_null() {
-        log_line("DXGI SetDisplayMode: missing runtime callbacks");
+        log_error!("DXGI SetDisplayMode: missing runtime callbacks");
         return E_FAIL;
     }
     let Some(set_display_mode_cb) = (*dev.kt_callbacks).pfnSetDisplayModeCb else {
-        log_line("DXGI SetDisplayMode: pfnSetDisplayModeCb missing");
+        log_error!("DXGI SetDisplayMode: pfnSetDisplayModeCb missing");
         return E_FAIL;
     };
 
@@ -10228,10 +10228,10 @@ unsafe extern "C" fn dxgi_set_display_mode(arg: *mut ddi::DXGI_DDI_ARG_SETDISPLA
     let resource = dxgi_resource_handle(a.hResource);
     let allocation = resource_allocation(resource.pDrvPrivate);
     if allocation == 0 {
-        log_line(&format!(
+        log_error!(
             "DXGI SetDisplayMode: resource=0x{:x} sub={} has no WDDM allocation",
             a.hResource, a.SubResourceIndex
-        ));
+        );
         return E_INVALIDARG;
     }
 
@@ -10244,14 +10244,14 @@ unsafe extern "C" fn dxgi_set_display_mode(arg: *mut ddi::DXGI_DDI_ARG_SETDISPLA
         PrivateDriverFormatAttribute: 0,
     };
     let hr = set_display_mode_cb(dev.h_rt_device, &mut callback);
-    log_line(&format!(
+    log_error!(
         "DXGI SetDisplayMode: resource=0x{:x} sub={} allocation=0x{:x} hr=0x{:08x} private_format=0x{:x}",
         a.hResource,
         a.SubResourceIndex,
         allocation,
         hr as u32,
         callback.PrivateDriverFormatAttribute
-    ));
+    );
     hr
 }
 
@@ -10385,12 +10385,12 @@ unsafe extern "C" fn dxgi_rotate_resource_identities(
     if n < 2 || a.pResources.is_null() {
         let c = ROTATE_SKIPPED.fetch_add(1, Ordering::Relaxed);
         if c < 16 || c % 512 == 0 {
-            log_line(&format!(
+            log_error!(
                 "DXGI RotateResourceIdentities: skipped resources={} null_array={} ({})",
                 n,
                 a.pResources.is_null(),
                 rotate_counter_summary()
-            ));
+            );
         }
         return 0;
     }
@@ -10403,19 +10403,19 @@ unsafe extern "C" fn dxgi_rotate_resource_identities(
         let hr = dxgi_resource_handle(*a.pResources.add(i));
         if hr.pDrvPrivate.is_null() {
             ROTATE_UNTRACKED.fetch_add(1, Ordering::Relaxed);
-            log_line(&format!(
+            log_error!(
                 "DXGI RotateResourceIdentities: null resource handle ({})",
                 rotate_counter_summary()
-            ));
+            );
             return 0;
         }
         let state = *(hr.pDrvPrivate as *const *mut ResourceState);
         if state.is_null() {
             ROTATE_UNTRACKED.fetch_add(1, Ordering::Relaxed);
-            log_line(&format!(
+            log_error!(
                 "DXGI RotateResourceIdentities: untracked resource ({})",
                 rotate_counter_summary()
-            ));
+            );
             return 0;
         }
         states.push(state);
@@ -10429,10 +10429,10 @@ unsafe extern "C" fn dxgi_rotate_resource_identities(
         }
     };
     if outcome != RotationOutcome::Rotated {
-        log_line(&format!(
+        log_error!(
             "DXGI RotateResourceIdentities: backing rotation FAILED ({})",
             rotate_counter_summary()
-        ));
+        );
         return 0;
     }
 
@@ -10484,10 +10484,10 @@ unsafe extern "C" fn dxgi_blt(arg: *mut ddi::DXGI_DDI_ARG_BLT) -> i32 {
         load_resource(dst_h.pDrvPrivate),
         load_resource(src_h.pDrvPrivate),
     ) else {
-        log_line(&format!(
+        log_error!(
             "DXGI Blt: missing resource dst=0x{:x} src=0x{:x}",
             a.hDstResource, a.hSrcResource
-        ));
+        );
         return 0;
     };
 
@@ -10554,10 +10554,10 @@ unsafe extern "C" fn dxgi_blt1(arg: *mut ddi::DXGI_DDI_ARG_BLT1) -> i32 {
         load_resource(dst_h.pDrvPrivate),
         load_resource(src_h.pDrvPrivate),
     ) else {
-        log_line(&format!(
+        log_error!(
             "DXGI Blt1: missing resource dst=0x{:x} src=0x{:x}",
             a.hDstResource, a.hSrcResource
-        ));
+        );
         return E_INVALIDARG;
     };
 
@@ -10566,7 +10566,7 @@ unsafe extern "C" fn dxgi_blt1(arg: *mut ddi::DXGI_DDI_ARG_BLT1) -> i32 {
     const BLT_STRETCH: u32 = 0x4;
     let flags = a.Flags.__bindgen_anon_1.Value;
     if flags & BLT_CONVERT != 0 {
-        log_line(&format!("DXGI Blt1: convert unsupported flags=0x{flags:x}"));
+        log_error!("DXGI Blt1: convert unsupported flags=0x{flags:x}");
         return DXGI_ERROR_UNSUPPORTED;
     }
 
@@ -10578,7 +10578,7 @@ unsafe extern "C" fn dxgi_blt1(arg: *mut ddi::DXGI_DDI_ARG_BLT1) -> i32 {
     if flags & BLT_RESOLVE != 0 {
         let format = resource_dxgi_format(dst_h.pDrvPrivate);
         if format.0 == 0 {
-            log_line("DXGI Blt1: resolve has unknown destination format");
+            log_error!("DXGI Blt1: resolve has unknown destination format");
             return E_INVALIDARG;
         }
         context.ResolveSubresource(&*dst, a.DstSubresource, &*src, a.SrcSubresource, format);
@@ -10589,10 +10589,10 @@ unsafe extern "C" fn dxgi_blt1(arg: *mut ddi::DXGI_DDI_ARG_BLT1) -> i32 {
     if flags & BLT_STRETCH != 0
         || (src_w != 0 && dst_w != 0 && (src_w != dst_w || src_h_px != dst_h_px))
     {
-        log_line(&format!(
+        log_error!(
             "DXGI Blt1: stretch unsupported src={}x{} dst={}x{} flags=0x{flags:x}",
             src_w, src_h_px, dst_w, dst_h_px
-        ));
+        );
         return DXGI_ERROR_UNSUPPORTED;
     }
 
@@ -10641,10 +10641,10 @@ unsafe extern "C" fn dxgi_offer_resources(arg: *mut ddi::DXGI_DDI_ARG_OFFERRESOU
     }
     let a = &*arg;
     if RESIDENCY_LOG_COUNT.first_n(32).is_some() {
-        log_line(&format!(
+        log_error!(
             "DXGI OfferResources: resources={} priority={} (kept resident)",
             a.Resources, a.Priority
-        ));
+        );
     }
     0
 }
@@ -10660,10 +10660,10 @@ unsafe extern "C" fn dxgi_reclaim_resources(arg: *mut ddi::DXGI_DDI_ARG_RECLAIMR
         }
     }
     if RESIDENCY_LOG_COUNT.first_n(32).is_some() {
-        log_line(&format!(
+        log_error!(
             "DXGI ReclaimResources: resources={} discarded=FALSE",
             a.Resources
-        ));
+        );
     }
     0
 }
@@ -10680,10 +10680,10 @@ unsafe extern "C" fn dxgi_get_mpo_caps(
         NumCapabilityGroups: 1,
     };
     if MPO_LOG_COUNT.first_n(16).is_some() {
-        log_line(&format!(
+        log_error!(
             "DXGI GetMultiplaneOverlayCaps: MaxPlanes={} groups=1",
             DXGI_MPO_MAX_PLANES
-        ));
+        );
     }
     0
 }
@@ -10717,12 +10717,12 @@ unsafe extern "C" fn dxgi_get_mpo_group_caps(
         ddi::DXGI_DDI_MULTIPLANE_OVERLAY_GROUP_CAPS::default()
     };
     if MPO_LOG_COUNT.first_n(16).is_some() {
-        log_line(&format!(
+        log_error!(
             "DXGI GetMultiplaneOverlayGroupCaps: group={} planes={} caps=0x{:x}",
             a.GroupIndex,
             a.MultiplaneOverlayGroupCaps.NumPlanes,
             a.MultiplaneOverlayGroupCaps.OverlayCaps
-        ));
+        );
     }
     0
 }
@@ -10733,14 +10733,14 @@ unsafe extern "C" fn dxgi_present_mpo(arg: *mut ddi::DXGI_DDI_ARG_PRESENTMULTIPL
     }
     let a = &*arg;
     if a.PresentPlaneCount == 0 || a.pPresentPlanes.is_null() {
-        log_line("DXGI PresentMultiplaneOverlay: no present planes");
+        log_error!("DXGI PresentMultiplaneOverlay: no present planes");
         return E_INVALIDARG;
     }
     if a.PresentPlaneCount > DXGI_MPO_MAX_PLANES {
-        log_line(&format!(
+        log_error!(
             "DXGI PresentMultiplaneOverlay: too many planes {}",
             a.PresentPlaneCount
-        ));
+        );
         return E_INVALIDARG;
     }
 
@@ -10749,11 +10749,11 @@ unsafe extern "C" fn dxgi_present_mpo(arg: *mut ddi::DXGI_DDI_ARG_PRESENTMULTIPL
         return E_INVALIDARG;
     };
     if dev.dxgi_callbacks.is_null() || dev.h_context.is_null() {
-        log_line("DXGI PresentMultiplaneOverlay: no DXGI callbacks/context");
+        log_error!("DXGI PresentMultiplaneOverlay: no DXGI callbacks/context");
         return DXGI_ERROR_UNSUPPORTED;
     }
     let Some(present_cb) = (*dev.dxgi_callbacks).pfnPresentMultiplaneOverlayCb else {
-        log_line("DXGI PresentMultiplaneOverlay: pfnPresentMultiplaneOverlayCb missing");
+        log_error!("DXGI PresentMultiplaneOverlay: pfnPresentMultiplaneOverlayCb missing");
         return DXGI_ERROR_UNSUPPORTED;
     };
 
@@ -10803,10 +10803,10 @@ unsafe extern "C" fn dxgi_present_mpo(arg: *mut ddi::DXGI_DDI_ARG_PRESENTMULTIPL
         let resource = dxgi_resource_handle(plane.hResource);
         let alloc = resource_allocation(resource.pDrvPrivate);
         if alloc == 0 {
-            log_line(&format!(
+            log_error!(
                 "DXGI PresentMultiplaneOverlay: plane {} has no allocation hResource=0x{:x}",
                 i, plane.hResource
-            ));
+            );
             return E_INVALIDARG;
         }
         let slot = cb.AllocationInfoCount as usize;
@@ -10824,7 +10824,7 @@ unsafe extern "C" fn dxgi_present_mpo(arg: *mut ddi::DXGI_DDI_ARG_PRESENTMULTIPL
     }
 
     if cb.AllocationInfoCount == 0 {
-        log_line("DXGI PresentMultiplaneOverlay: no enabled planes");
+        log_error!("DXGI PresentMultiplaneOverlay: no enabled planes");
         return E_INVALIDARG;
     }
 
@@ -10848,7 +10848,7 @@ unsafe extern "C" fn dxgi_present_mpo(arg: *mut ddi::DXGI_DDI_ARG_PRESENTMULTIPL
 
 unsafe extern "C" fn dxgi_reserved_unsupported(_arg: *mut c_void) -> i32 {
     if DXGI13_RESERVED_LOG_COUNT.first_n(16).is_some() {
-        log_line("DXGI reserved callback -> DXGI_ERROR_UNSUPPORTED");
+        log_error!("DXGI reserved callback -> DXGI_ERROR_UNSUPPORTED");
     }
     DXGI_ERROR_UNSUPPORTED
 }
@@ -10859,7 +10859,7 @@ unsafe extern "C" fn dxgi_present1(arg: *mut ddi::DXGI_DDI_ARG_PRESENT1) -> i32 
     }
     let a = &*arg;
     if a.SurfacesToPresent == 0 || a.phSurfacesToPresent.is_null() {
-        log_line("DXGI Present1: no source surfaces");
+        log_error!("DXGI Present1: no source surfaces");
         return E_INVALIDARG;
     }
 
@@ -10909,10 +10909,10 @@ unsafe extern "C" fn dxgi_present1(arg: *mut ddi::DXGI_DDI_ARG_PRESENT1) -> i32 
     }
 
     if src_alloc == 0 {
-        log_line(&format!(
+        log_error!(
             "DXGI Present1 multi: callback source has no allocation hResource=0x{:x}",
             source.hSurface
-        ));
+        );
         return E_INVALIDARG;
     }
 
@@ -10954,11 +10954,11 @@ unsafe extern "C" fn dxgi_present1(arg: *mut ddi::DXGI_DDI_ARG_PRESENT1) -> i32 
         // src_alloc == 0 with E_INVALIDARG above. Unifying the two tails is
         // T7's u-forward-b-04.
         if let Err(_skip) = present_prerequisites(dev, src_alloc) {
-            log_line(&format!(
+            log_error!(
                 "DXGI Present1 multi: missing callback table/context callbacks={} hContext={:p}",
                 dev.dxgi_callbacks.is_null(),
                 dev.h_context
-            ));
+            );
             return DXGI_ERROR_UNSUPPORTED;
         }
         let mut cb = ddi::DXGIDDICB_PRESENT::default();
@@ -10983,7 +10983,7 @@ unsafe extern "C" fn dxgi_present1(arg: *mut ddi::DXGI_DDI_ARG_PRESENT1) -> i32 
             0
         };
         let Some(dependencies) = RuntimePresentDependencies::new(src_alloc, dst_alloc) else {
-            log_line("DXGI Present1 multi: nonzero source allocation invariant lost");
+            log_error!("DXGI Present1 multi: nonzero source allocation invariant lost");
             return E_FAIL;
         };
         if let Some(cb_n) = PRESENT_CB_LOG_COUNT.first_n_then_every_from_one(128, 512) {
@@ -11041,10 +11041,10 @@ unsafe extern "C" fn dxgi_check_present_duration_support(
     a.ClosestSmallerDuration = 0;
     a.ClosestLargerDuration = 0;
     if PRESENT1_LOG_COUNT.first_n(16).is_some() {
-        log_line(&format!(
+        log_error!(
             "DXGI CheckPresentDurationSupport: desired={} smaller=0 larger=0",
             a.DesiredPresentDuration
-        ));
+        );
     }
     0
 }

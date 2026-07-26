@@ -5,6 +5,15 @@
 //! Until the DXVK/VKD3D-backed adapter/device path exists, device creation still
 //! fails explicitly. The adapter-open handshake itself must succeed because
 //! dxgkrnl calls it during render-adapter start validation.
+// R420's static guarantee, at DENY level so it is a compile ERROR and not a
+// warning: `log_line` is `#[deprecated]` purely as an internal marker, and the
+// only things allowed to call it are the `trace_line!` and `log_error!` macros
+// (each wraps the call in `#[allow(deprecated)]`). A new per-op site therefore
+// cannot reach the unconditional writer by accident — it does not compile.
+// Verified by fault injection: a direct `crate::log_line(..)` yields
+// "error: use of deprecated function `log_line`: use log_error! ... or
+// trace_line! ...". No dependency trips this lint.
+#![deny(deprecated)]
 
 // This crate builds for Windows targets only. `src/ddi.rs` unconditionally
 // `include!`s `$OUT_DIR/d3d10umddi.rs`, which `build.rs` can only generate on
@@ -320,10 +329,10 @@ pub extern "system" fn helios_umd_get_present_result(fence_id: *mut u32, value: 
 /// is validated end-to-end.
 #[no_mangle]
 pub extern "system" fn helios_umd_selftest() -> i32 {
-    log_line("helios_umd_selftest: creating DXVK device on venus...");
+    log_error!("helios_umd_selftest: creating DXVK device on venus...");
     let dev = bridge::ffi::helios_dxvk_create_device(0, 0);
     let bridge_ok = !dev.is_null();
-    log_line(&format!("helios_umd_selftest: bridge ok={bridge_ok}"));
+    log_error!("helios_umd_selftest: bridge ok={bridge_ok}");
     if !bridge_ok {
         return 1;
     }
@@ -333,9 +342,9 @@ pub extern "system" fn helios_umd_selftest() -> i32 {
     {
         use windows::Win32::Graphics::Direct3D11::*;
         let dev_ptr = dev.d3d11_device_ptr();
-        log_line(&format!(
+        log_error!(
             "helios_umd_selftest: ID3D11Device* = 0x{dev_ptr:x}"
-        ));
+        );
         if dev_ptr != 0 {
             let device = core::mem::ManuallyDrop::new(unsafe {
                 <ID3D11Device as windows::core::Interface>::from_raw(dev_ptr as *mut _)
@@ -348,10 +357,10 @@ pub extern "system" fn helios_umd_selftest() -> i32 {
             };
             let mut buffer: Option<ID3D11Buffer> = None;
             let hr = unsafe { device.CreateBuffer(&desc, None, Some(&mut buffer)) };
-            log_line(&format!(
+            log_error!(
                 "helios_umd_selftest: windows-crate CreateBuffer -> {hr:?}, buffer_some={}",
                 buffer.is_some()
-            ));
+            );
         }
     }
     drop(dev);
@@ -387,9 +396,9 @@ pub extern "system" fn helios_umd_selftest() -> i32 {
     };
 
     let hr = unsafe { create_device(hadapter, &arg as *const _ as *mut c_void) };
-    log_line(&format!(
+    log_error!(
         "helios_umd_selftest: synthesized CreateDevice -> 0x{hr:08x}"
-    ));
+    );
     if hr != S_OK {
         return 2;
     }
@@ -400,24 +409,24 @@ pub extern "system" fn helios_umd_selftest() -> i32 {
     let null_slots = (0..n)
         .filter(|&i| unsafe { (*table.add(i)).is_none() })
         .count();
-    log_line(&format!(
+    log_error!(
         "helios_umd_selftest: device-funcs null slots = {null_slots} / {n}"
-    ));
+    );
 
     // Offscreen clear+readback through the real forwarders.
     let hdev = ddi::D3D10DDI_HDEVICE {
         pDrvPrivate: device_priv.as_mut_ptr().cast(),
     };
     let render_rc = unsafe { forward::selftest_offscreen_clear(hdev) };
-    log_line(&format!(
+    log_error!(
         "helios_umd_selftest: offscreen clear rc={render_rc}"
-    ));
+    );
     let tri_rc = unsafe { forward::selftest_triangle(hdev) };
-    log_line(&format!("helios_umd_selftest: triangle rc={tri_rc}"));
+    log_error!("helios_umd_selftest: triangle rc={tri_rc}");
     let cb_rc = unsafe { forward::selftest_cb_readback(hdev) };
-    log_line(&format!("helios_umd_selftest: cb_readback rc={cb_rc}"));
+    log_error!("helios_umd_selftest: cb_readback rc={cb_rc}");
     let cbtri_rc = unsafe { forward::selftest_triangle_cb(hdev) };
-    log_line(&format!("helios_umd_selftest: triangle_cb rc={cbtri_rc}"));
+    log_error!("helios_umd_selftest: triangle_cb rc={cbtri_rc}");
 
     // Tear the device back down via the real DestroyDevice entry.
     let device_funcs_table = funcs.as_ptr() as *const ddi::D3D11DDI_DEVICEFUNCS;
@@ -437,33 +446,33 @@ pub extern "system" fn helios_umd_selftest() -> i32 {
 
 #[no_mangle]
 pub unsafe extern "system" fn OpenAdapter10(open_data: *mut D3d10DdiArgOpenAdapter) -> Hresult {
-    log_line("OpenAdapter10");
+    log_error!("OpenAdapter10");
     unsafe { open_adapter_common(open_data, false) }
 }
 
 #[no_mangle]
 pub unsafe extern "system" fn OpenAdapter10_2(open_data: *mut D3d10DdiArgOpenAdapter) -> Hresult {
-    log_line("OpenAdapter10_2");
+    log_error!("OpenAdapter10_2");
     unsafe { open_adapter_common(open_data, true) }
 }
 
 #[no_mangle]
 pub unsafe extern "system" fn OpenAdapter12(open_data: *mut D3d12DdiArgOpenAdapter) -> Hresult {
-    log_line("OpenAdapter12");
-    log_line("OpenAdapter12 -> DXGI_ERROR_UNSUPPORTED (D3D12 DDI not implemented yet)");
+    log_error!("OpenAdapter12");
+    log_error!("OpenAdapter12 -> DXGI_ERROR_UNSUPPORTED (D3D12 DDI not implemented yet)");
     let _ = open_data;
     return DXGI_ERROR_UNSUPPORTED;
 
     #[allow(unreachable_code)]
     {
         if open_data.is_null() {
-            log_line("OpenAdapter12 null open_data -> E_NOTIMPL");
+            log_error!("OpenAdapter12 null open_data -> E_NOTIMPL");
             return E_NOTIMPL;
         }
 
         let open = unsafe { &mut *open_data };
         if open.p_adapter_funcs.is_null() {
-            log_line("OpenAdapter12 null pAdapterFuncs -> E_NOTIMPL");
+            log_error!("OpenAdapter12 null pAdapterFuncs -> E_NOTIMPL");
             return E_NOTIMPL;
         }
 
@@ -481,7 +490,7 @@ pub unsafe extern "system" fn OpenAdapter12(open_data: *mut D3d12DdiArgOpenAdapt
         funcs.pfn_fill_ddi_table = Some(d3d12_fill_ddi_table);
         funcs.pfn_destroy_device = Some(d3d12_destroy_device);
 
-        log_line("OpenAdapter12 -> S_OK (adapter funcs installed)");
+        log_error!("OpenAdapter12 -> S_OK (adapter funcs installed)");
         S_OK
     }
 }
@@ -491,13 +500,13 @@ unsafe extern "system" fn d3d12_calc_private_device_size(
     args: *const D3d12DdiArgCalcPrivateDeviceSize,
 ) -> usize {
     if args.is_null() {
-        log_line("D3D12 CalcPrivateDeviceSize null args -> 8");
+        log_error!("D3D12 CalcPrivateDeviceSize null args -> 8");
     } else {
         let args = unsafe { &*args };
-        log_line(&format!(
+        log_error!(
             "D3D12 CalcPrivateDeviceSize interface=0x{:08x} version=0x{:08x} flags=0x{:08x} -> 8",
             args.interface, args.version, args.flags
-        ));
+        );
     }
     core::mem::size_of::<usize>()
 }
@@ -507,10 +516,10 @@ unsafe extern "system" fn d3d12_create_device(
     args: *const D3d12DdiArgCreateDevice,
 ) -> Hresult {
     if args.is_null() {
-        log_line("D3D12 CreateDevice null args -> E_NOTIMPL");
+        log_error!("D3D12 CreateDevice null args -> E_NOTIMPL");
     } else {
         let args = unsafe { &*args };
-        log_line(&format!(
+        log_error!(
             "D3D12 CreateDevice interface=0x{:08x} version=0x{:08x} flags=0x{:08x} \
              hRTDevice={:p} hDrvDevice={:p} pKTCallbacks={:p} pUMCallbacks={:p} -> E_NOTIMPL",
             args.interface,
@@ -520,13 +529,13 @@ unsafe extern "system" fn d3d12_create_device(
             args.h_drv_device,
             args.p_kt_callbacks,
             args.p_um_callbacks,
-        ));
+        );
     }
     E_NOTIMPL
 }
 
 unsafe extern "system" fn d3d12_close_adapter(_h_adapter: D3d10DdiAdapterHandle) -> Hresult {
-    log_line("D3D12 CloseAdapter");
+    log_error!("D3D12 CloseAdapter");
     S_OK
 }
 
@@ -536,16 +545,16 @@ unsafe extern "system" fn d3d12_get_supported_versions(
     supported_versions: *mut u64,
 ) -> Hresult {
     if entries.is_null() {
-        log_line("D3D12 GetSupportedVersions null entries -> E_NOTIMPL");
+        log_error!("D3D12 GetSupportedVersions null entries -> E_NOTIMPL");
         return E_NOTIMPL;
     }
 
     let requested_entries = unsafe { *entries };
-    log_line(&format!(
+    log_error!(
         "D3D12 GetSupportedVersions requested={requested_entries} bufNull={} (advertising {:#018x?})",
         supported_versions.is_null(),
         D3D12_SUPPORTED_DDI_VERSIONS,
-    ));
+    );
     unsafe { *entries = D3D12_SUPPORTED_DDI_VERSIONS.len() as u32 };
 
     if supported_versions.is_null() {
@@ -575,15 +584,15 @@ unsafe extern "system" fn d3d12_get_caps(
     const D3D12DDI_3DPIPELINELEVEL_1_0_CORE: u32 = 2;
 
     if args.is_null() {
-        log_line("D3D12 GetCaps null args -> S_OK");
+        log_error!("D3D12 GetCaps null args -> S_OK");
         return S_OK;
     }
 
     let args = unsafe { &*args };
-    log_line(&format!(
+    log_error!(
         "D3D12 GetCaps type=0x{:08x} dataSize={} pInfo={:p}",
         args.caps_type, args.data_size, args.p_info,
-    ));
+    );
 
     if !args.p_data.is_null() && args.data_size != 0 {
         if args.caps_type == D3D12DDICAPS_TYPE_0081_3DPIPELINESUPPORT1 && args.data_size >= 8 {
@@ -593,10 +602,10 @@ unsafe extern "system" fn d3d12_get_caps(
             unsafe {
                 *data.add(1) = driver_max;
             }
-            log_line(&format!(
+            log_error!(
                 "  D3D12 GetCaps: 3DPIPELINESUPPORT1 runtimeMax={} driverMax={}",
                 runtime_max, driver_max
-            ));
+            );
             return S_OK;
         }
 
@@ -604,7 +613,7 @@ unsafe extern "system" fn d3d12_get_caps(
         match args.caps_type {
             D3D12DDICAPS_TYPE_3DPIPELINESUPPORT if args.data_size >= 4 => {
                 unsafe { *(args.p_data as *mut u32) = D3D12DDI_3DPIPELINELEVEL_1_0_CORE };
-                log_line("  D3D12 GetCaps: 3DPIPELINESUPPORT = 1_0_CORE");
+                log_error!("  D3D12 GetCaps: 3DPIPELINESUPPORT = 1_0_CORE");
             }
             D3D12DDICAPS_TYPE_MEMORY_ARCHITECTURE if args.data_size >= 12 => {
                 let data = args.p_data as *mut u32;
@@ -613,16 +622,16 @@ unsafe extern "system" fn d3d12_get_caps(
                     *data.add(1) = 1; // IO coherent
                     *data.add(2) = 1; // Cache coherent
                 }
-                log_line("  D3D12 GetCaps: MEMORY_ARCHITECTURE = UMA/IO/cache coherent");
+                log_error!("  D3D12 GetCaps: MEMORY_ARCHITECTURE = UMA/IO/cache coherent");
             }
             D3D12DDICAPS_TYPE_SHADER => {
-                log_line("  D3D12 GetCaps: SHADER = zero");
+                log_error!("  D3D12 GetCaps: SHADER = zero");
             }
             D3D12DDICAPS_TYPE_D3D12_OPTIONS => {
-                log_line("  D3D12 GetCaps: D3D12_OPTIONS = zero");
+                log_error!("  D3D12 GetCaps: D3D12_OPTIONS = zero");
             }
             D3D12DDICAPS_TYPE_ARCHITECTURE_INFO => {
-                log_line("  D3D12 GetCaps: ARCHITECTURE_INFO = zero");
+                log_error!("  D3D12 GetCaps: ARCHITECTURE_INFO = zero");
             }
             _ => {}
         }
@@ -637,15 +646,15 @@ unsafe extern "system" fn d3d12_get_optional_ddi_tables(
     requests: *mut D3d12DdiTableRequest,
 ) -> Hresult {
     if entries.is_null() {
-        log_line("D3D12 GetOptionalDDITables null entries -> E_NOTIMPL");
+        log_error!("D3D12 GetOptionalDDITables null entries -> E_NOTIMPL");
         return E_NOTIMPL;
     }
 
     let requested_entries = unsafe { *entries };
-    log_line(&format!(
+    log_error!(
         "D3D12 GetOptionalDDITables requested={requested_entries} requestsNull={} -> 0 tables",
         requests.is_null()
-    ));
+    );
     unsafe { *entries = 0 };
     S_OK
 }
@@ -658,32 +667,32 @@ unsafe extern "system" fn d3d12_fill_ddi_table(
     interface: u32,
     rt_table: *mut c_void,
 ) -> Hresult {
-    log_line(&format!(
+    log_error!(
         "D3D12 FillDDITable type={} table={:p} size={} interface=0x{:08x} rtTable={:p} -> E_NOTIMPL",
         table_type, table, table_size, interface, rt_table,
-    ));
+    );
     E_NOTIMPL
 }
 
 unsafe extern "system" fn d3d12_destroy_device(h_device: *mut c_void) {
-    log_line(&format!("D3D12 DestroyDevice hDevice={h_device:p}"));
+    log_error!("D3D12 DestroyDevice hDevice={h_device:p}");
 }
 
 unsafe fn open_adapter_common(open_data: *mut D3d10DdiArgOpenAdapter, with_10_2: bool) -> Hresult {
     if open_data.is_null() {
-        log_line("open_adapter_common null open_data");
+        log_error!("open_adapter_common null open_data");
         return E_NOTIMPL;
     }
 
     let open = unsafe { &mut *open_data };
     if open.p_adapter_funcs.is_null() {
-        log_line("open_adapter_common null p_adapter_funcs");
+        log_error!("open_adapter_common null p_adapter_funcs");
         return E_NOTIMPL;
     }
-    log_line(&format!(
+    log_error!(
         "open_adapter_common interface=0x{:08x} version=0x{:08x} with_10_2={}",
         open.interface, open.version, with_10_2
-    ));
+    );
     log_self_module_path();
 
     open.h_adapter = D3d10DdiAdapterHandle {
@@ -712,7 +721,7 @@ unsafe extern "system" fn calc_private_device_size(
     _args: *const c_void,
 ) -> usize {
     let size = device_funcs::device_private_size();
-    log_line(&format!("CalcPrivateDeviceSize -> {size}"));
+    log_error!("CalcPrivateDeviceSize -> {size}");
     size
 }
 
@@ -725,7 +734,7 @@ unsafe extern "system" fn create_device(
     // never write through it, so an E_NOTIMPL return leaves the runtime's state
     // untouched. We null-check defensively.
     if args.is_null() {
-        log_line("CreateDevice null args -> E_NOTIMPL");
+        log_error!("CreateDevice null args -> E_NOTIMPL");
         return E_NOTIMPL;
     }
     let create = unsafe { &*(args as *const D3d10DdiArgCreateDevice) };
@@ -759,9 +768,9 @@ unsafe extern "system" fn create_device(
                 q.add(i).read_unaligned()
             }));
         }
-        log_line(&raw);
+        trace_line!("{raw}");
     }
-    log_line(&format!(
+    log_error!(
         "CreateDevice interface=0x{:08x} version=0x{:08x} flags=0x{:08x} \
          pDeviceFuncs={:p} hDrvDevice={:p} pKTCallbacks={:p} pUMCallbacks={:p} pDXGIBaseFuncs={:p}",
         create.interface,
@@ -772,7 +781,7 @@ unsafe extern "system" fn create_device(
         create.p_kt_callbacks,
         create.p_um_callbacks,
         create.dxgi_base_ddi.p_dxgi_ddi_base_functions,
-    ));
+    );
 
     // 0) Validate every runtime-supplied pointer BEFORE constructing anything.
     //    Both of these checks used to run after construction: the hDrvDevice one
@@ -782,31 +791,31 @@ unsafe extern "system" fn create_device(
     //    queue per attempt, skipping both destroy_runtime_objects and
     //    drop_in_place. A crash-looping client exhausted them.
     if create.h_drv_device.is_null() {
-        log_line("  CreateDevice: null hDrvDevice -> E_FAIL");
+        log_error!("  CreateDevice: null hDrvDevice -> E_FAIL");
         return E_FAIL;
     }
     if create.p_device_funcs.is_null() {
-        log_line("  CreateDevice: null pDeviceFuncs -> E_FAIL");
+        log_error!("  CreateDevice: null pDeviceFuncs -> E_FAIL");
         return E_FAIL;
     }
     //    The negotiated interface is runtime-supplied too, and it selects the
     //    SHAPE of the table we write. Refuse anything outside the advertised
     //    set rather than defaulting to D3D11.0's 150-slot fill.
     let Some(negotiated) = NegotiatedInterface::from_interface(create.interface) else {
-        log_line(&format!(
+        log_error!(
             "  CreateDevice: unsupported interface 0x{:08x} (advertised 0x{:08x}/0x{:08x}/0x{:08x}) -> E_NOTIMPL",
             create.interface,
             NegotiatedInterface::WDDM1_3_INTERFACE,
             NegotiatedInterface::D3D11_1_INTERFACE,
             NegotiatedInterface::D3D11_0_INTERFACE,
-        ));
+        );
         return E_NOTIMPL;
     };
 
     // 1) Bring up the DXVK device on the Helios venus adapter.
     let dxvk = bridge::ffi::helios_dxvk_create_device(0, 0);
     if dxvk.is_null() {
-        log_line("  CreateDevice: DXVK device creation FAILED -> E_FAIL");
+        log_error!("  CreateDevice: DXVK device creation FAILED -> E_FAIL");
         return E_FAIL;
     }
 
@@ -864,28 +873,28 @@ unsafe extern "system" fn create_device(
         let dev = &mut *(create.h_drv_device as *mut device_funcs::HeliosDevice);
         let context_hr = device_funcs::create_runtime_context(dev);
         if context_hr != S_OK {
-            log_line(&format!(
+            log_error!(
                 "  CreateDevice: kernel context creation failed hr=0x{:08x}",
                 context_hr as u32
-            ));
+            );
             return context_hr;
         }
         let paging_hr = device_funcs::create_runtime_paging_queue(dev);
         if paging_hr != S_OK {
-            log_line(&format!(
+            log_error!(
                 "  CreateDevice: paging queue creation failed hr=0x{:08x}",
                 paging_hr as u32
-            ));
+            );
             return paging_hr;
         }
     }
 
     // 3) Fill the device-funcs table (Interface == D3D11_0 -> p11DeviceFuncs) and
     //    the DXGI base DDI table the runtime handed us.
-    log_line(&format!(
+    log_error!(
         "  CreateDevice: filling {} device-funcs table",
         negotiated.name()
-    ));
+    );
     unsafe {
         match negotiated {
             NegotiatedInterface::Wddm1_3 => {
@@ -926,10 +935,10 @@ unsafe extern "system" fn create_device(
     forward::register_live_device(create.h_drv_device as usize);
 
     if std::env::var_os("HELIOS_DXGI_NO_REDIRECTION").is_some() {
-        log_line("  CreateDevice -> DXGI_STATUS_NO_REDIRECTION (env-gated; DXGI desktop fallback)");
+        log_error!("  CreateDevice -> DXGI_STATUS_NO_REDIRECTION (env-gated; DXGI desktop fallback)");
         DXGI_STATUS_NO_REDIRECTION
     } else {
-        log_line("  CreateDevice -> S_OK (DXVK device + D3D11 funcs table installed)");
+        log_error!("  CreateDevice -> S_OK (DXVK device + D3D11 funcs table installed)");
         S_OK
     }
 }
@@ -972,7 +981,7 @@ impl Drop for DeviceUnderConstruction {
 }
 
 unsafe extern "system" fn close_adapter(_h_adapter: D3d10DdiAdapterHandle) -> Hresult {
-    log_line("CloseAdapter");
+    log_error!("CloseAdapter");
     S_OK
 }
 
@@ -982,16 +991,16 @@ unsafe extern "system" fn get_supported_versions(
     supported_versions: *mut u64,
 ) -> Hresult {
     if entries.is_null() {
-        log_line("GetSupportedVersions: null entries -> E_NOTIMPL");
+        log_error!("GetSupportedVersions: null entries -> E_NOTIMPL");
         return E_NOTIMPL;
     }
 
     let requested_entries = unsafe { *entries };
-    log_line(&format!(
+    log_error!(
         "GetSupportedVersions requested={requested_entries} bufNull={} (advertising {:#018x?})",
         supported_versions.is_null(),
         SUPPORTED_DDI_VERSIONS,
-    ));
+    );
     unsafe { *entries = SUPPORTED_DDI_VERSIONS.len() as u32 };
 
     if supported_versions.is_null() {
@@ -1023,10 +1032,10 @@ unsafe extern "system" fn get_caps(
 
     if !args.is_null() {
         let args = unsafe { &*args };
-        log_line(&format!(
+        log_error!(
             "GetCaps type=0x{:08x} dataSize={} pInfo={:p}",
             args.caps_type, args.data_size, args.p_info,
-        ));
+        );
         if !args.p_data.is_null() && args.data_size != 0 {
             // Default: zero the output.
             unsafe { core::ptr::write_bytes(args.p_data as *mut u8, 0, args.data_size as usize) };
@@ -1036,7 +1045,7 @@ unsafe extern "system" fn get_caps(
                 // serialize/emulate.
                 D3D11DDICAPS_THREADING if args.data_size >= 4 => {
                     unsafe { *(args.p_data as *mut u32) = 0 };
-                    log_line("  GetCaps: THREADING caps = 0");
+                    log_error!("  GetCaps: THREADING caps = 0");
                 }
                 // D3D11DDI_SHADER_CAPS::Caps. FL11 mandates compute shaders;
                 // the runtime rejects the adapter with "Driver doesn't support
@@ -1056,7 +1065,7 @@ unsafe extern "system" fn get_caps(
                         0
                     };
                     unsafe { *(args.p_data as *mut u32) = caps };
-                    log_line(&format!("  GetCaps: SHADER caps = 0x{caps:x}"));
+                    log_error!("  GetCaps: SHADER caps = 0x{caps:x}");
                 }
                 // D3D11DDI_3DPIPELINESUPPORT_CAPS::Caps is a BITMASK, NOT the
                 // bare D3D11DDI_3DPIPELINELEVEL enum: each supported level sets
@@ -1086,7 +1095,7 @@ unsafe extern "system" fn get_caps(
                         LVL_10_0 // 0x1: max FL10_0 (the proven baseline)
                     };
                     unsafe { *(args.p_data as *mut u32) = caps };
-                    log_line(&format!("  GetCaps: 3DPIPELINESUPPORT bitmask=0x{caps:x}"));
+                    log_error!("  GetCaps: 3DPIPELINESUPPORT bitmask=0x{caps:x}");
                 }
                 // D3D11.1 caps. FL11_1 requires output-merger logic ops; the
                 // 11.1 blend-state forwarder maps LogicOpEnable/LogicOp to
@@ -1094,13 +1103,13 @@ unsafe extern "system" fn get_caps(
                 // and shader min-precision support disabled.
                 D3D11_1DDICAPS_D3D11_OPTIONS if args.data_size >= 8 => {
                     unsafe { *(args.p_data as *mut u32) = 1 };
-                    log_line("  GetCaps: D3D11_OPTIONS OutputMergerLogicOp=TRUE");
+                    log_error!("  GetCaps: D3D11_OPTIONS OutputMergerLogicOp=TRUE");
                 }
                 D3D11_1DDICAPS_ARCHITECTURE_INFO if args.data_size >= 4 => {
-                    log_line("  GetCaps: ARCHITECTURE_INFO = zero");
+                    log_error!("  GetCaps: ARCHITECTURE_INFO = zero");
                 }
                 D3D11_1DDICAPS_SHADER_MIN_PRECISION_SUPPORT if args.data_size >= 8 => {
-                    log_line("  GetCaps: SHADER_MIN_PRECISION_SUPPORT = zero");
+                    log_error!("  GetCaps: SHADER_MIN_PRECISION_SUPPORT = zero");
                 }
                 D3DWDDM1_3DDICAPS_D3D11_OPTIONS1 if args.data_size >= 4 => {
                     const TILED_RESOURCES_TIER_2_SUPPORTED: u32 = 0x2;
@@ -1110,25 +1119,25 @@ unsafe extern "system" fn get_caps(
                         0
                     };
                     unsafe { *(args.p_data as *mut u32) = caps };
-                    log_line(&format!(
+                    log_error!(
                         "  GetCaps: D3D11_OPTIONS1 TiledResourcesSupportFlags=0x{caps:x}"
-                    ));
+                    );
                 }
                 D3DWDDM1_3DDICAPS_MARKER if args.data_size >= 4 => {
                     const D3DWDDM1_3DDI_MARKER_TYPE_NONE: u32 = 0;
                     unsafe { *(args.p_data as *mut u32) = D3DWDDM1_3DDI_MARKER_TYPE_NONE };
-                    log_line("  GetCaps: MARKER type = NONE");
+                    log_error!("  GetCaps: MARKER type = NONE");
                 }
                 other => {
-                    log_line(&format!(
+                    log_error!(
                         "  GetCaps: unsupported cap type {} (zeroed {} bytes)",
                         other, args.data_size
-                    ));
+                    );
                 }
             }
         }
     } else {
-        log_line("GetCaps: null args");
+        log_error!("GetCaps: null args");
     }
     S_OK
 }
@@ -1152,6 +1161,19 @@ pub(crate) fn umd_log_path() -> &'static std::path::Path {
     })
 }
 
+/// The unconditional log writer.
+///
+/// DO NOT CALL DIRECTLY — it is `#[deprecated]` purely as an internal marker so
+/// the compiler enforces that. Use one of the two macros, which is the whole
+/// point of R420's static guarantee: the choice between "this is an error, a
+/// one-shot or a refusal" and "this is per-op repeat traffic" has to be made
+/// explicitly at every site, and a new per-op site cannot reach the
+/// unconditional writer by accident.
+///
+/// - [`log_error!`] — errors, one-shots, refusals. Always written.
+/// - [`trace_line!`] — per-op repeat traffic. `UmdTrace`-gated, and it does not
+///   even evaluate its arguments when the knob is off.
+#[deprecated(note = "use log_error! (errors/one-shots/refusals) or trace_line! (per-op traffic)")]
 pub(crate) fn log_line(message: &str) {
     use std::sync::{Mutex, OnceLock};
     // One handle per process: the old open/append/close-per-line pattern cost
@@ -1477,11 +1499,25 @@ pub(crate) fn present_sync_publish_enabled() -> bool {
 macro_rules! trace_line {
     ($($arg:tt)*) => {
         if crate::trace_enabled() {
+            #[allow(deprecated)]
             crate::log_line(&format!($($arg)*));
         }
     };
 }
 pub(crate) use trace_line;
+
+/// Unconditional log line: errors, one-shots and refusals ONLY.
+///
+/// The counterpart to [`trace_line!`]. Per-op repeat traffic must not use this
+/// — that is what put a 21-argument `format!` plus a mutex-guarded unbuffered
+/// write on all seven draw entry points and on the caps-query path (R420).
+macro_rules! log_error {
+    ($($arg:tt)*) => {{
+        #[allow(deprecated)]
+        crate::log_line(&format!($($arg)*));
+    }};
+}
+pub(crate) use log_error;
 
 /// Log which DLL file THIS code is running from, once per process. Multiple
 /// UMD copies exist on disk (DriverStore package, ProgramData versioned
@@ -1515,13 +1551,13 @@ fn log_self_module_path() {
             let mut buf = [0u16; 512];
             let n = GetModuleFileNameW(hmod, buf.as_mut_ptr(), buf.len() as u32) as usize;
             if n > 0 && n < buf.len() {
-                log_line(&format!(
+                log_error!(
                     "UMD module: {}",
                     String::from_utf16_lossy(&buf[..n])
-                ));
+                );
                 return;
             }
         }
-        log_line("UMD module: <unresolvable>");
+        log_error!("UMD module: <unresolvable>");
     }
 }

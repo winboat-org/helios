@@ -16,7 +16,7 @@
 
 use crate::bridge;
 use crate::ddi;
-use crate::log_line;
+use crate::log_error;
 use core::ffi::c_void;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use windows::core::{IUnknown, Interface};
@@ -297,7 +297,7 @@ unsafe fn log_backtrace(tag: &str) {
     for i in 0..captured as usize {
         out.push_str(&format!(" #{i}=0x{:x}", frames[i] as usize));
     }
-    log_line(&format!("{tag} stack{out}"));
+    log_error!("{tag} stack{out}");
 }
 
 /// No-op DDI stub: returns 0 (S_OK for HRESULT funcs; ignored for void funcs).
@@ -314,7 +314,7 @@ unsafe extern "C" fn ddi_noop_device(_a: usize) -> usize {
         if n == 0 {
             log_backtrace("DDI noop(device)");
         } else {
-            log_line(&format!("DDI noop(device) hit={n}"));
+            log_error!("DDI noop(device) hit={n}");
         }
     }
     0
@@ -334,7 +334,7 @@ unsafe extern "C" fn ddi_noop_dxgi(_a: usize) -> usize {
         if n == 0 {
             log_backtrace("DDI noop(dxgi)");
         } else {
-            log_line(&format!("DDI noop(dxgi) hit={n}"));
+            log_error!("DDI noop(dxgi) hit={n}");
         }
     }
     0
@@ -351,7 +351,7 @@ unsafe extern "C" fn ddi_relocate_device_funcs(
     _h_device: ddi::D3D10DDI_HDEVICE,
     funcs: *mut ddi::D3D11DDI_DEVICEFUNCS,
 ) {
-    log_line("DDI RelocateDeviceFuncs(D3D11)");
+    log_error!("DDI RelocateDeviceFuncs(D3D11)");
     if !funcs.is_null() {
         fill_d3d11_device_funcs(funcs);
     }
@@ -361,7 +361,7 @@ unsafe extern "C" fn ddi_relocate_device_funcs_11_1(
     _h_device: ddi::D3D10DDI_HDEVICE,
     funcs: *mut ddi::D3D11_1DDI_DEVICEFUNCS,
 ) {
-    log_line("DDI RelocateDeviceFuncs(D3D11.1)");
+    log_error!("DDI RelocateDeviceFuncs(D3D11.1)");
     if !funcs.is_null() {
         fill_d3d11_1_device_funcs(funcs);
     }
@@ -371,7 +371,7 @@ unsafe extern "C" fn ddi_relocate_device_funcs_wddm1_3(
     _h_device: ddi::D3D10DDI_HDEVICE,
     funcs: *mut ddi::D3DWDDM1_3DDI_DEVICEFUNCS,
 ) {
-    log_line("DDI RelocateDeviceFuncs(WDDM1.3)");
+    log_error!("DDI RelocateDeviceFuncs(WDDM1.3)");
     if !funcs.is_null() {
         fill_wddm1_3_device_funcs(funcs);
     }
@@ -385,7 +385,7 @@ unsafe extern "C" fn ddi_relocate_device_funcs_wddm2_1(
     _h_device: ddi::D3D10DDI_HDEVICE,
     funcs: *mut ddi::D3DWDDM2_1DDI_DEVICEFUNCS,
 ) {
-    log_line("DDI RelocateDeviceFuncs(WDDM2.1)");
+    log_error!("DDI RelocateDeviceFuncs(WDDM2.1)");
     if !funcs.is_null() {
         fill_wddm2_1_device_funcs(funcs);
     }
@@ -399,10 +399,10 @@ unsafe fn audit_wddm1_3_device_funcs(tag: &str, funcs: *mut ddi::D3DWDDM1_3DDI_D
 
     let n = core::mem::size_of::<ddi::D3DWDDM1_3DDI_DEVICEFUNCS>() / core::mem::size_of::<usize>();
     let slots = funcs as *const usize;
-    log_line(&format!(
+    log_error!(
         "{tag}: WDDM1.3 funcs table={funcs:p} slots={n} audit={}",
         hit + 1
-    ));
+    );
 
     const EXT_NAMES: [&str; 9] = [
         "UpdateTileMappings",
@@ -418,10 +418,10 @@ unsafe fn audit_wddm1_3_device_funcs(tag: &str, funcs: *mut ddi::D3DWDDM1_3DDI_D
     for (offset, name) in EXT_NAMES.iter().enumerate() {
         let index = 155 + offset;
         if index < n {
-            log_line(&format!(
+            log_error!(
                 "{tag}: WDDM1.3 slot[{index:03}] {name}=0x{:016x}",
                 *slots.add(index)
-            ));
+            );
         }
     }
 
@@ -440,23 +440,23 @@ unsafe fn audit_wddm1_3_device_funcs(tag: &str, funcs: *mut ddi::D3DWDDM1_3DDI_D
         let value = *slots.add(i);
         if value == 0 {
             null_slots += 1;
-            log_line(&format!("{tag}: WDDM1.3 NULL slot[{i:03}]"));
+            log_error!("{tag}: WDDM1.3 NULL slot[{i:03}]");
         } else if value == noop {
             noop_slots += 1;
             if noop_slots <= 32 {
-                log_line(&format!("{tag}: WDDM1.3 noop slot[{i:03}]"));
+                log_error!("{tag}: WDDM1.3 noop slot[{i:03}]");
             }
         } else if value == calc {
             calc_slots += 1;
         }
     }
-    log_line(&format!(
+    log_error!(
         "{tag}: WDDM1.3 slots real={} noop={} calc={} null={}",
         n.saturating_sub(noop_slots + calc_slots + null_slots),
         noop_slots,
         calc_slots,
         null_slots
-    ));
+    );
 }
 
 unsafe fn audit_dxgi_1_3_base_funcs(tag: &str, funcs: *mut ddi::DXGI1_3_DDI_BASE_FUNCTIONS) {
@@ -467,10 +467,10 @@ unsafe fn audit_dxgi_1_3_base_funcs(tag: &str, funcs: *mut ddi::DXGI1_3_DDI_BASE
 
     let n = core::mem::size_of::<ddi::DXGI1_3_DDI_BASE_FUNCTIONS>() / core::mem::size_of::<usize>();
     let slots = funcs as *const usize;
-    log_line(&format!(
+    log_error!(
         "{tag}: DXGI1.3 funcs table={funcs:p} slots={n} audit={}",
         hit + 1
-    ));
+    );
 
     const NAMES: [&str; 18] = [
         "Present",
@@ -494,10 +494,10 @@ unsafe fn audit_dxgi_1_3_base_funcs(tag: &str, funcs: *mut ddi::DXGI1_3_DDI_BASE
     ];
     for (i, name) in NAMES.iter().enumerate() {
         if i < n {
-            log_line(&format!(
+            log_error!(
                 "{tag}: DXGI1.3 slot[{i:02}] {name}=0x{:016x}",
                 *slots.add(i)
-            ));
+            );
         }
     }
 
@@ -512,24 +512,24 @@ unsafe fn audit_dxgi_1_3_base_funcs(tag: &str, funcs: *mut ddi::DXGI1_3_DDI_BASE
         let value = *slots.add(i);
         if value == 0 {
             null_slots += 1;
-            log_line(&format!("{tag}: DXGI1.3 NULL slot[{i:02}]"));
+            log_error!("{tag}: DXGI1.3 NULL slot[{i:02}]");
         } else if value == noop {
             noop_slots += 1;
-            log_line(&format!("{tag}: DXGI1.3 noop slot[{i:02}]"));
+            log_error!("{tag}: DXGI1.3 noop slot[{i:02}]");
         }
     }
-    log_line(&format!(
+    log_error!(
         "{tag}: DXGI1.3 slots real={} noop={} null={}",
         n.saturating_sub(noop_slots + null_slots),
         noop_slots,
         null_slots
-    ));
+    );
 }
 
 /// Real DestroyDevice: drop the in-place HeliosDevice (releasing the DXVK device).
 /// The runtime owns the backing memory, so we only run the destructor.
 unsafe extern "C" fn ddi_destroy_device(h_device: ddi::D3D10DDI_HDEVICE) {
-    log_line("DDI: DestroyDevice");
+    log_error!("DDI: DestroyDevice");
     // Drop it from the liveness registry BEFORE anything is torn down, so a
     // concurrent `wait_last_present` on an ICD worker refuses rather than
     // dereferencing a block dxgkrnl is about to free and reuse (R415).
@@ -537,10 +537,10 @@ unsafe extern "C" fn ddi_destroy_device(h_device: ddi::D3D10DDI_HDEVICE) {
     if !h_device.pDrvPrivate.is_null() {
         let dev = &mut *(h_device.pDrvPrivate as *mut HeliosDevice);
         let (variants, layouts) = dev.ia.get_mut().release_owned_com();
-        log_line(&format!(
+        log_error!(
             "DDI DestroyDevice: released IA cache variants={} layouts={}",
             variants, layouts
-        ));
+        );
         destroy_runtime_objects(dev);
         core::ptr::drop_in_place(h_device.pDrvPrivate as *mut HeliosDevice);
     }
@@ -557,11 +557,11 @@ pub unsafe fn destroy_runtime_objects(dev: &mut HeliosDevice) {
                     hPagingQueue: queue.handle.get(),
                 };
                 let hr = destroy_queue_cb(dev.h_rt_device, &arg);
-                log_line(&format!(
+                log_error!(
                     "DDI DestroyDevice: DestroyPagingQueue hQueue=0x{:x} hr=0x{:08x}",
                     queue.handle.get(),
                     hr as u32
-                ));
+                );
             }
         }
 
@@ -571,10 +571,10 @@ pub unsafe fn destroy_runtime_objects(dev: &mut HeliosDevice) {
                     hContext: dev.h_context,
                 };
                 let hr = destroy_context_cb(dev.h_rt_device, &arg);
-                log_line(&format!(
+                log_error!(
                     "DDI DestroyDevice: DestroyContext hContext={:p} hr=0x{:08x}",
                     dev.h_context, hr as u32
-                ));
+                );
             }
             dev.h_context = core::ptr::null_mut();
         }
@@ -589,11 +589,11 @@ pub unsafe fn create_runtime_context(dev: &mut HeliosDevice) -> i32 {
     const E_FAIL: i32 = 0x8000_4005u32 as i32;
 
     if dev.kt_callbacks.is_null() {
-        log_line("CreateDevice: no KT callbacks for CreateContext");
+        log_error!("CreateDevice: no KT callbacks for CreateContext");
         return E_FAIL;
     }
     let Some(create_context_cb) = (*dev.kt_callbacks).pfnCreateContextCb else {
-        log_line("CreateDevice: pfnCreateContextCb missing");
+        log_error!("CreateDevice: pfnCreateContextCb missing");
         return E_FAIL;
     };
 
@@ -601,7 +601,7 @@ pub unsafe fn create_runtime_context(dev: &mut HeliosDevice) -> i32 {
     arg.NodeOrdinal = 0;
     arg.EngineAffinity = 0;
     let hr = create_context_cb(dev.h_rt_device, &mut arg);
-    log_line(&format!(
+    log_error!(
         "CreateDevice: CreateContext hr=0x{:08x} hContext={:p} cmd={:p}/{} allocList={:p}/{} patchList={:p}/{}",
         hr as u32,
         arg.hContext,
@@ -611,7 +611,7 @@ pub unsafe fn create_runtime_context(dev: &mut HeliosDevice) -> i32 {
         arg.AllocationListSize,
         arg.pPatchLocationList,
         arg.PatchLocationListSize
-    ));
+    );
     if hr != 0 {
         return hr;
     }
@@ -632,11 +632,11 @@ pub unsafe fn create_runtime_paging_queue(dev: &mut HeliosDevice) -> i32 {
     const E_FAIL: i32 = 0x8000_4005u32 as i32;
 
     if dev.kt_callbacks.is_null() {
-        log_line("CreateDevice: no KT callbacks for CreatePagingQueue");
+        log_error!("CreateDevice: no KT callbacks for CreatePagingQueue");
         return E_FAIL;
     }
     let Some(create_queue_cb) = (*dev.kt_callbacks).pfnCreatePagingQueueCb else {
-        log_line("CreateDevice: pfnCreatePagingQueueCb missing");
+        log_error!("CreateDevice: pfnCreatePagingQueueCb missing");
         return E_FAIL;
     };
 
@@ -645,10 +645,10 @@ pub unsafe fn create_runtime_paging_queue(dev: &mut HeliosDevice) -> i32 {
     arg.Priority = 0;
     arg.PhysicalAdapterIndex = 0;
     let hr = create_queue_cb(dev.h_rt_device, &mut arg);
-    log_line(&format!(
+    log_error!(
         "CreateDevice: CreatePagingQueue hr=0x{:08x} hQueue=0x{:x} hSync=0x{:x} fence={:p}",
         hr as u32, arg.hPagingQueue, arg.hSyncObject, arg.FenceValueCPUVirtualAddress
-    ));
+    );
     if hr != 0 {
         return hr;
     }
@@ -659,7 +659,7 @@ pub unsafe fn create_runtime_paging_queue(dev: &mut HeliosDevice) -> i32 {
     let (Some(handle), Some(sync_object), Some(fence_value_cpu)) =
         (queue, sync_object, fence_value_cpu)
     else {
-        log_line("CreateDevice: CreatePagingQueue returned invalid outputs");
+        log_error!("CreateDevice: CreatePagingQueue returned invalid outputs");
         if let Some(destroy_queue_cb) = (*dev.kt_callbacks).pfnDestroyPagingQueueCb {
             if arg.hPagingQueue != 0 {
                 let destroy = ddi::D3DDDI_DESTROYPAGINGQUEUE {
