@@ -1948,8 +1948,42 @@ std::uint64_t HeliosDxvkDevice::present_sync_publish(
       return venus_memory_resource_id_from_handle(memInfo.memory);
     };
 
+    // Measure-first instrument (PSC stage rule, and R416's precondition):
+    // residOf runs on the PRESENT thread once or twice per frame, and every
+    // miss of image->info().sharing.heliosResourceId — which is written ONLY on
+    // the import arm, so every CREATED surface misses — falls through to
+    // venus_memory_resource_id_from_handle -> find_helios_icd_export. Record
+    // what that costs per present so the export-table cache is judged on
+    // numbers, not on reasoning.
+    static std::atomic<std::uint64_t> s_residCalls{0};
+    static std::atomic<std::uint64_t> s_residTicks{0};
+    LARGE_INTEGER residT0 = {}, residT1 = {};
+    QueryPerformanceCounter(&residT0);
     const std::uint32_t residSrc = residOf(src_resource_ptr);
     const std::uint32_t residDst = residOf(dst_resource_ptr);
+    QueryPerformanceCounter(&residT1);
+    {
+      static const LARGE_INTEGER s_qpcFreq = [] {
+        LARGE_INTEGER f = {};
+        QueryPerformanceFrequency(&f);
+        return f;
+      }();
+      const std::uint64_t ticks =
+        static_cast<std::uint64_t>(residT1.QuadPart - residT0.QuadPart);
+      const std::uint64_t total =
+        s_residTicks.fetch_add(ticks, std::memory_order_relaxed) + ticks;
+      const std::uint64_t n = s_residCalls.fetch_add(1, std::memory_order_relaxed) + 1;
+      if ((n % 128u) == 0 && s_qpcFreq.QuadPart > 0) {
+        const auto freq = static_cast<std::uint64_t>(s_qpcFreq.QuadPart);
+        char msg[160];
+        std::snprintf(msg, sizeof(msg),
+          "resid-lookup: n=%llu avg_us=%llu last_us=%llu",
+          static_cast<unsigned long long>(n),
+          static_cast<unsigned long long>((total * 1000000ull) / (freq * n)),
+          static_cast<unsigned long long>((ticks * 1000000ull) / freq));
+        umd_log(msg);
+      }
+    }
 
     if (!residSrc && !residDst) {
       static std::atomic<std::uint32_t> s_noResid{0};
