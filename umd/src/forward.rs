@@ -741,6 +741,24 @@ unsafe fn remember_direct_scanout_allocation(
     entries.push((allocation, private));
 }
 
+/// Drop a destroyed allocation's direct-scanout entry. Returns
+/// `(removed, remaining)` when something was removed, so the caller can log the
+/// list length — the property that must stay bounded.
+unsafe fn forget_direct_scanout_allocation(
+    h: Hdevice,
+    allocation: ddi::D3DKMT_HANDLE,
+) -> Option<(usize, usize)> {
+    if allocation == 0 {
+        return None;
+    }
+    let dev = unsafe { helios_device(h) }?;
+    let mut entries = dev.direct_scanout_allocations.borrow_mut();
+    let before = entries.len();
+    entries.retain(|(candidate, _)| *candidate != allocation);
+    let removed = before - entries.len();
+    (removed != 0).then(|| (removed, entries.len()))
+}
+
 unsafe fn remember_scanout_target(
     h: Hdevice,
     raw: usize,
@@ -1182,6 +1200,19 @@ unsafe fn release_resource(h: Hdevice, handle_priv: *mut c_void) {
             .as_ref()
             .map(ResidentAllocation::handle)
             .unwrap_or(0);
+        // The direct-scanout registry was add-only: it grew without bound across
+        // mode changes and DWM primary generations inside one process, the
+        // per-present `presented_primary_private` lookup became a linear scan
+        // over dead entries, and if dxgkrnl reissues a freed D3DKMT_HANDLE the
+        // lookup returns the previous primary's resource_id/width/height/pitch
+        // for the new allocation — a stale scanout identity handed to the KMD.
+        // `clear_scanout_target_if_matches` above only clears the `scanout_*`
+        // Cells; it never touched this Vec.
+        if let Some((removed, remaining)) = forget_direct_scanout_allocation(h, allocation) {
+            log_line(&format!(
+                "DDI scanout registry: dropped {removed} entry alloc=0x{allocation:x} remaining={remaining}"
+            ));
+        }
         // Evict while the allocation and runtime device are both still valid.
         // Option::take makes it impossible for ResourceState::drop to evict a
         // second time after pfnDeallocateCb.
