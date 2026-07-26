@@ -1392,6 +1392,7 @@ const RES_TEXCUBE: ddi::D3D10DDIRESOURCE_TYPE =
 #[derive(Copy, Clone, PartialEq, Eq)]
 enum ResourceDimension {
     Buffer,
+    Texture1D,
     Texture2D,
     Texture3D,
 }
@@ -1400,6 +1401,7 @@ impl ResourceDimension {
     fn from_ddi(dimension: ddi::D3D10DDIRESOURCE_TYPE) -> Option<Self> {
         match dimension {
             RES_BUFFER | RES_BUFFEREX => Some(Self::Buffer),
+            RES_TEX1D => Some(Self::Texture1D),
             RES_TEX2D | RES_TEXCUBE => Some(Self::Texture2D),
             RES_TEX3D => Some(Self::Texture3D),
             _ => None,
@@ -2348,6 +2350,93 @@ unsafe extern "C" fn create_resource(
                     finish_wddm_tex2d(h, a, &mip0, h_rt, h_resource, res, false, 0, 0);
                 });
             }
+        }
+        ResourceDimension::Texture1D => {
+            // Same shape as the tex3d arm: create first, then allocate, then
+            // store — no fallible step between the allocation and the store, so
+            // it does not need R407's rollback. All four view translators
+            // already handle RES_TEX1D; this arm is what stops
+            // `CreateTexture1D` from being an outright failure now that the
+            // catch-all reports.
+            let bind = api_bind_flags(a.BindFlags);
+            let misc = api_misc_flags(a.MiscFlags, a.BindFlags, false);
+            log_line(&format!(
+                "DDI create_resource(tex1d): {} fmt={} usage={} bind 0x{:x}->0x{:x} misc 0x{:x}->0x{:x} init={} mips={} array={}",
+                mip0.TexelWidth,
+                a.Format,
+                a.Usage,
+                a.BindFlags,
+                bind,
+                a.MiscFlags,
+                misc,
+                init_ptr.is_some(),
+                a.MipLevels,
+                a.ArraySize
+            ));
+            let desc = D3D11_TEXTURE1D_DESC {
+                Width: mip0.TexelWidth,
+                MipLevels: a.MipLevels,
+                ArraySize: a.ArraySize.max(1),
+                Format: DXGI_FORMAT(a.Format as i32),
+                Usage: D3D11_USAGE(a.Usage as i32),
+                BindFlags: bind,
+                CPUAccessFlags: cpu,
+                MiscFlags: misc,
+            };
+            let mut tex: Option<ID3D11Texture1D> = None;
+            let created = device.CreateTexture1D(&desc, init_ptr, Some(&mut tex));
+            if let Err(ref e) = created {
+                log_line(&format!("DDI create_resource(tex1d) failed: {e:?}"));
+            }
+            let res = match tex {
+                Some(t) => match t.cast::<ID3D11Resource>() {
+                    Ok(r) => Some(r),
+                    Err(_) => {
+                        log_line("DDI create_resource(tex1d): cast to ID3D11Resource failed");
+                        None
+                    }
+                },
+                None => {
+                    if created.is_ok() {
+                        log_line(
+                            "DDI create_resource(tex1d): DXVK CreateTexture1D returned no texture",
+                        );
+                    }
+                    None
+                }
+            };
+            finish_create(h, created, res, |res| {
+                let (allocation, km_resource) =
+                    match allocate_wddm_resource(h, a, &mip0, h_rt, 0, 0, 0, 0, 0, false, 0, 0) {
+                        Ok(allocation) => allocation,
+                        Err(hr) => {
+                            log_line(&format!(
+                                "DDI create_resource(tex1d): WDDM allocation/residency failed hr=0x{:08x}",
+                                hr as u32
+                            ));
+                            set_runtime_error(h, hr);
+                            return;
+                        }
+                    };
+                let allocation_handle = allocation
+                    .as_ref()
+                    .map(ResidentAllocation::handle)
+                    .unwrap_or(0);
+                stamp_dxvk_resource_kmt_handles(h, &res, allocation_handle, km_resource);
+                log_line(&format!(
+                    "DDI create_resource(tex1d) ok: {} fmt={} bind=0x{:x} misc=0x{:x}",
+                    mip0.TexelWidth, a.Format, bind, misc
+                ));
+                store_resource(
+                    h_resource.pDrvPrivate,
+                    res,
+                    allocation,
+                    km_resource,
+                    h_rt.handle,
+                    true,
+                    empty_present_private(),
+                );
+            });
         }
         ResourceDimension::Texture3D => {
             let bind = api_bind_flags(a.BindFlags);
