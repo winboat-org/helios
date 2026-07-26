@@ -3332,10 +3332,10 @@ unsafe extern "C" fn resource_copy(
     let src_alloc = resource_allocation(h_src.pDrvPrivate);
     let n = COPY_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
     if n < 256 || dst_alloc != 0 || src_alloc != 0 {
-        log_line(&format!(
+        trace_line!(
             "DDI resource_copy dst_alloc=0x{:x} src_alloc=0x{:x}",
             dst_alloc, src_alloc
-        ));
+        );
     }
     context.CopyResource(&*dst, &*src);
 }
@@ -3362,7 +3362,7 @@ unsafe extern "C" fn resource_copy_region(
     let (src_rt, src_km) = resource_parent_handles(h_src.pDrvPrivate);
     let n = COPY_REGION_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
     if n < 1024 || dst.is_none() || src.is_none() {
-        log_line(&format!(
+        trace_line!(
             "DDI ResourceCopyRegion: #{} dstDrv={:p} dstRT={:p} dstKM=0x{:x} \
              dstAlloc=0x{:x} dst={}x{} fmt={} srcDrv={:p} srcRT={:p} srcKM=0x{:x} \
              srcAlloc=0x{:x} src={}x{} fmt={} dstSub={} xyz={},{},{} srcSub={} box={:p} \
@@ -3390,7 +3390,7 @@ unsafe extern "C" fn resource_copy_region(
             box_,
             dst.is_some(),
             src.is_some(),
-        ));
+        );
     }
     let (Some(dst), Some(src)) = (dst, src) else {
         return;
@@ -3711,9 +3711,9 @@ unsafe extern "C" fn discard_11_1(
 ) {
     let n = D3D11_1_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
     if n < 64 {
-        log_line(&format!(
+        trace_line!(
             "DDI D3D11.1 Discard: type={handle_type} rects={num_rects}"
-        ));
+        );
     }
 
     // A rect-limited discard invalidates ONLY the given sub-rects. D3D11's
@@ -3794,9 +3794,9 @@ unsafe extern "C" fn clear_view_11_1(
 ) {
     let n = D3D11_1_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
     if n < 64 {
-        log_line(&format!(
+        trace_line!(
             "DDI D3D11.1 ClearView: type={view_type} rects={num_rects}"
-        ));
+        );
     }
     if view_type != ddi::D3D11DDI_HANDLETYPE_D3D10DDI_HT_RENDERTARGETVIEW {
         log_line(&format!(
@@ -4816,7 +4816,7 @@ unsafe extern "C" fn set_render_targets(
     unsafe { track_dwm_composition_target(h, rt0.4, rt0.0, rt0.1, rt0.2, rt0.3) };
     let n = OM_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
     if n < 1024 || rt_missing != 0 || rt0.0 != 0 {
-        log_line(&format!(
+        trace_line!(
             "DDI OMSetRenderTargets num={} rt_nonnull={} rt_missing={} rt0_alloc=0x{:x} rt0={}x{} fmt={} dsv_raw=0x{:x} uav_start={} num_uavs={} uav_range={}:{}",
             num_views,
             rt_nonnull,
@@ -4830,7 +4830,7 @@ unsafe extern "C" fn set_render_targets(
             num_uavs,
             uav_range_start,
             uav_range_size
-        ));
+        );
     }
     let depth = load_com::<ID3D11DepthStencilView>(dsv.pDrvPrivate).map(|m| (*m).clone());
     if num_uavs != 0 {
@@ -4855,7 +4855,7 @@ unsafe extern "C" fn set_render_targets(
             });
         }
         if n < 1024 || uav_missing != 0 || uav_slice.is_none() {
-            log_line(&format!(
+            trace_line!(
                 "DDI OMSetRenderTargets UAV summary start={} num={} nonnull={} missing={} uavs_null={} counts_ptr={}",
                 uav_start,
                 num_uavs,
@@ -4863,7 +4863,7 @@ unsafe extern "C" fn set_render_targets(
                 uav_missing,
                 uav_slice.is_none(),
                 !uav_counts.is_null()
-            ));
+            );
         }
         context.OMSetRenderTargetsAndUnorderedAccessViews(
             Some(&views),
@@ -4985,6 +4985,17 @@ unsafe fn log_draw_state(
     count1: u32,
     start1: u32,
 ) {
+    // Gate the WHOLE function, not just the write: this runs from all seven
+    // draw entry points, and with tracing off it used to pay an atomic
+    // fetch_add on every draw plus a `dev.ia.borrow()` and a heap-allocating
+    // 21-argument `format!` on the first 1024 draws and every 1024th after —
+    // through the unconditional mutex-serialised writer. A game issuing 2000
+    // draws per frame at 60 fps meant ~120 file writes per second from the draw
+    // path after warm-up, and 1024 back-to-back writes during the first frames,
+    // which is exactly the startup window idle-to-active latency is measured in.
+    if !crate::trace_enabled() {
+        return;
+    }
     let n = DRAW_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
     if n >= 1024 && (n % 1024) != 0 {
         return;
@@ -4993,7 +5004,7 @@ unsafe fn log_draw_state(
         return;
     };
     let ia = dev.ia.borrow();
-    log_line(&format!(
+    trace_line!(
         "DDI {kind}: a={} b={} c={} d={} topo={} vb0=0x{:x}/{}+{} ib=0x{:x}/fmt{}+{} vs=0x{:x} ps=0x{:x} gs=0x{:x} hs=0x{:x} ds=0x{:x} rt0_alloc=0x{:x} rt0={}x{} fmt={} layout=0x{:x}",
         count0,
         start0,
@@ -5016,7 +5027,7 @@ unsafe fn log_draw_state(
         ia.current_rt0_height,
         ia.current_rt0_format,
         ia.current_layout
-    ));
+    );
 }
 
 unsafe extern "C" fn draw(h: Hdevice, vertex_count: u32, start_vertex: u32) {
@@ -5135,9 +5146,9 @@ unsafe extern "C" fn draw_instanced_indirect(
     };
     let n = DRAW_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
     if n < 2048 {
-        log_line(&format!(
+        trace_line!(
             "DDI DrawInstancedIndirect args: alloc=0x{alloc:x} bytes={width} offset={aligned_byte_offset}"
-        ));
+        );
     }
     context.DrawInstancedIndirect(&buf, aligned_byte_offset);
 }
@@ -5175,9 +5186,9 @@ unsafe extern "C" fn draw_indexed_instanced_indirect(
     };
     let n = DRAW_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
     if n < 2048 {
-        log_line(&format!(
+        trace_line!(
             "DDI DrawIndexedInstancedIndirect args: alloc=0x{alloc:x} bytes={width} offset={aligned_byte_offset}"
-        ));
+        );
     }
     context.DrawIndexedInstancedIndirect(&buf, aligned_byte_offset);
 }
@@ -5817,7 +5828,7 @@ unsafe extern "C" fn cs_set_uavs(
     }
     let n = UAV_BIND_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
     if n < 1024 || missing != 0 || slice.is_none() {
-        log_line(&format!(
+        trace_line!(
             "DDI CSSetUnorderedAccessViews start={} num={} nonnull={} missing={} uavs_null={} counts_ptr={}",
             start,
             num,
@@ -5825,7 +5836,7 @@ unsafe extern "C" fn cs_set_uavs(
             missing,
             slice.is_none(),
             !counts.is_null()
-        ));
+        );
     }
     context.CSSetUnorderedAccessViews(
         start,
@@ -6389,7 +6400,7 @@ unsafe extern "C" fn resource_update_subresource(
     };
     let n = UPDATE_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
     if n < 1024 || alloc != 0 {
-        log_line(&format!(
+        trace_line!(
             "DDI UpdateSubresource #{} hDrv={:p} hRT={:p} hKM=0x{:x} alloc=0x{:x} \
              kind={} dims={}x{}x{} fmt={} sub={} box={},{},{},{} data={:p} \
              row_pitch={} depth_pitch={} sample0={} sample_center={}",
@@ -6417,7 +6428,7 @@ unsafe extern "C" fn resource_update_subresource(
             source_samples
                 .map(|samples| format!("0x{:08x}", samples.1))
                 .unwrap_or_else(|| "n/a".to_string()),
-        ));
+        );
     }
     let bx;
     let bx_ptr = if box_.is_null() {
@@ -6977,7 +6988,7 @@ unsafe extern "C" fn dispatch(h: Hdevice, x: u32, y: u32, z: u32) {
     if n < 1024 || (n % 1024) == 0 {
         if let Some(dev) = helios_device(h) {
             let ia = dev.ia.borrow();
-            log_line(&format!(
+            trace_line!(
                 "DDI Dispatch x={} y={} z={} cs=0x{:x} rt0_alloc=0x{:x} rt0={}x{} fmt={}",
                 x,
                 y,
@@ -6987,7 +6998,7 @@ unsafe extern "C" fn dispatch(h: Hdevice, x: u32, y: u32, z: u32) {
                 ia.current_rt0_width,
                 ia.current_rt0_height,
                 ia.current_rt0_format
-            ));
+            );
         }
     }
     if let Some(context) = d3d11_context(h) {
@@ -7002,11 +7013,11 @@ unsafe extern "C" fn dispatch_indirect(
 ) {
     let n = DISPATCH_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
     if n < 1024 || (n % 1024) == 0 {
-        log_line(&format!(
+        trace_line!(
             "DDI DispatchIndirect args_alloc=0x{:x} offset={}",
             resource_allocation(h_args.pDrvPrivate),
             aligned_byte_offset
-        ));
+        );
     }
     let Some(context) = d3d11_context(h) else {
         return;
