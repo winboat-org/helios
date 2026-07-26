@@ -1628,16 +1628,15 @@ std::size_t HeliosDxvkDevice::open_kmd_scanout_target(
       return 0;
     }
 
-    // Entry into the COPY path is a silent regression away from the direct
-    // primary if it is not loud: the desktop still appears, so nothing else
-    // distinguishes it. One warning-level line, once.
+    // Importing the target only ARMS the fallback; it does not mean anything
+    // is being copied through it. `publish_dwm_composition` performs the copy
+    // only once a composition source has been selected, and THAT is the
+    // regression away from the direct primary — so the warning lives at the
+    // copy site (forward.rs), not here. Verified on the live stack: this import
+    // succeeds on every DWM boot while the LINEAR copy count stays 0.
     static std::atomic<std::uint32_t> s_copyTargetOpens{0};
     const std::uint32_t opens =
       s_copyTargetOpens.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (opens == 1) {
-      umd_log("WARNING: opening the LEGACY LINEAR copy target — this device is "
-              "no longer presenting the direct primary through the KMD scanout");
-    }
 
     if (out_resource_id) *out_resource_id = info.resourceId;
     if (out_width)       *out_width = info.width;

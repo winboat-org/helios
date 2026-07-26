@@ -1080,6 +1080,17 @@ unsafe fn publish_dwm_composition(context: &ID3D11DeviceContext, h: Hdevice) -> 
     context.CopySubresourceRegion(target, 0, 0, 0, 0, source, 0, None);
     let n = dev.scanout_copy_count.get().wrapping_add(1);
     dev.scanout_copy_count.set(n);
+    if n == 1 {
+        // THIS is entry into the COPY path, and it is a silent regression away
+        // from the direct primary if it is not loud: the desktop still appears
+        // either way, so nothing else distinguishes them. Merely opening the
+        // LINEAR target does not qualify — that happens on every DWM boot while
+        // this count stays 0.
+        log_line(
+            "WARNING: DWM is compositing through the LEGACY LINEAR copy target — \
+             the direct primary is NOT the presented surface for this device",
+        );
+    }
     if n <= 8 || n % 600 == 0 {
         log_line(&format!(
             "DWM desktop->LINEAR scanout copy #{} res_id={} {}x{}",
