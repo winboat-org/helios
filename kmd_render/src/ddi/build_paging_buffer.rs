@@ -108,6 +108,38 @@ pub fn diag_dump_gpummu_atomics() {
 /// (host round-trips, Mm mapping calls) may run.
 const PASSIVE_LEVEL_IRQL: u8 = 0;
 
+/// What one content-op executor did, as a value the dispatch must consume.
+///
+/// The executors used to return `()`: every failure inside them — an
+/// unresolvable handle, an MDL map failure, a blob map failure, an out-of-blob
+/// range — was discarded and `DxgkDdiBuildPagingBuffer` answered
+/// STATUS_SUCCESS. VidMm then retired the paging fence believing the content
+/// had moved, so a page-in left stale bytes in the BAR blob and an eviction
+/// lost the only copy of the allocation. Making the contribution part of the
+/// return type means a new executor cannot silently skip it.
+enum PagingOpOutcome {
+    /// The content operation ran to completion.
+    Executed,
+    /// The operation does not belong to this driver's content engine (another
+    /// segment, or a device-local allocation whose bytes are host-owned).
+    /// Reported as success, exactly as before — nothing was supposed to happen.
+    NotOurs,
+    /// The operation was ours and did not happen. Must reach the DDI status.
+    Failed(NTSTATUS),
+}
+
+/// The single failure status this DDI returns, for every arm.
+///
+/// STATUS_INSUFFICIENT_RESOURCES is the value the shadow-full arm of this same
+/// function already returns, and it is what two sibling DDIs
+/// (`create_allocation.rs`, `cpu_host_aperture.rs`) were changed to when
+/// STATUS_UNSUCCESSFUL was proven out of contract — dxgkrnl logged it as
+/// "Driver returned an invalid NTSTATUS" 197x with adapter resets. Routing every
+/// arm through one function keeps the legal-return set a one-line audit.
+const fn paging_failure() -> NTSTATUS {
+    STATUS_INSUFFICIENT_RESOURCES
+}
+
 // Counters (registry-visible after any BAR-segment op; atomics are the source
 // of truth and stay readable by symbol even if the registry write is skipped).
 static BAR_XFER_IN: AtomicU32 = AtomicU32::new(0); // system MDL → blob copies
@@ -673,25 +705,25 @@ unsafe fn bar_transfer(
     adapter: &AdapterContext,
     bar_id: u32,
     t: &_DXGKARG_BUILDPAGINGBUFFER__bindgen_ty_1__bindgen_ty_1,
-) {
+) -> PagingOpOutcome {
     let src_seg = t.Source.SegmentId;
     let dst_seg = t.Destination.SegmentId;
     if src_seg != bar_id && dst_seg != bar_id {
-        return; // aperture/system transfer — null engine, as before
+        return PagingOpOutcome::NotOurs; // aperture/system transfer — null engine
     }
     let Some(alloc) = (unsafe { paging_alloc_info(t.hAllocation) }) else {
         // The transfer names the BAR segment but no live Helios allocation:
         // there is nothing this driver can copy, and the caller must not read
         // that as "content moved".
         BAR_ERR_XFER_HANDLE.fetch_add(1, Ordering::Relaxed);
-        return;
+        return PagingOpOutcome::Failed(paging_failure());
     };
     if !alloc.bar_eligible {
         // A device-local OPTIMAL image cannot be interpreted as linear bytes.
         // VidMm placement bookkeeping is decorative for this host-owned memory;
         // never issue RESOURCE_MAP_BLOB for it.
         BAR_DEVICE_OP_SKIPS.fetch_add(1, Ordering::Relaxed);
-        return;
+        return PagingOpOutcome::NotOurs;
     }
     let flags = unsafe { t.Flags.__bindgen_anon_1.Value };
     BAR_LAST_XFER_FLAGS.store(flags, Ordering::Relaxed);
@@ -711,7 +743,9 @@ unsafe fn bar_transfer(
             // the dxgk-bindings MDL to the layout-identical wdk_sys MDL.
             let mdl = unsafe { *t.Source.__bindgen_anon_1.pMdl.as_ref() };
             let Some(src) = (unsafe { mdl_system_va(mdl.cast()) }) else {
-                return;
+                // PgEx counted inside mdl_system_va. The page-in did not happen,
+                // so the blob still holds stale bytes — never report success.
+                return PagingOpOutcome::Failed(paging_failure());
             };
             let mut copied = false;
             let ok = unsafe {
@@ -732,18 +766,23 @@ unsafe fn bar_transfer(
                     copied = true;
                 })
             };
-            if ok && copied {
-                // The inverse transfer makes the BAR blob authoritative again.
-                adapter.system_backings.remove(alloc.resource_id);
-                BAR_XFER_IN.fetch_add(1, Ordering::Relaxed);
+            if !(ok && copied) {
+                // PgEm (blob map) or PgEb (out-of-blob range) already counted.
+                return PagingOpOutcome::Failed(paging_failure());
             }
+            // The inverse transfer makes the BAR blob authoritative again.
+            adapter.system_backings.remove(alloc.resource_id);
+            BAR_XFER_IN.fetch_add(1, Ordering::Relaxed);
+            PagingOpOutcome::Executed
         }
         // Eviction: blob → system backing.
         (s, 0) if s == bar_id => {
             // SAFETY: Destination.pMdl arm is valid for SegmentId 0. Cast as above.
             let mdl = unsafe { *t.Destination.__bindgen_anon_1.pMdl.as_ref() };
             let Some(dst) = (unsafe { mdl_system_va(mdl.cast()) }) else {
-                return;
+                // PgEx counted inside mdl_system_va. The eviction did not happen;
+                // reporting success here would lose the allocation's only copy.
+                return PagingOpOutcome::Failed(paging_failure());
             };
             let mut copied = false;
             let ok = unsafe {
@@ -764,29 +803,28 @@ unsafe fn bar_transfer(
                     copied = true;
                 })
             };
-            if ok && copied {
-                let system_start = unsafe { dst.add(mdl_off as usize) };
-                let _ = unsafe {
-                    remember_system_backing(
-                        adapter,
-                        alloc.resource_id,
-                        blob_off,
-                        bytes,
-                        system_start,
-                    )
-                };
-                BAR_XFER_OUT.fetch_add(1, Ordering::Relaxed);
+            if !(ok && copied) {
+                // PgEm / PgEb already counted.
+                return PagingOpOutcome::Failed(paging_failure());
             }
+            let system_start = unsafe { dst.add(mdl_off as usize) };
+            let _ = unsafe {
+                remember_system_backing(adapter, alloc.resource_id, blob_off, bytes, system_start)
+            };
+            BAR_XFER_OUT.fetch_add(1, Ordering::Relaxed);
+            PagingOpOutcome::Executed
         }
         // Move within the segment: content is intrinsic to the blob; the CPU
         // view follows the aperture maps. Nothing to copy.
         (s, d) if s == bar_id && d == bar_id => {
             BAR_XFER_MOVE.fetch_add(1, Ordering::Relaxed);
+            PagingOpOutcome::Executed
         }
         // BAR ↔ aperture/paging-RAM combinations are not part of the declared
         // allocation segment sets; loud counter, no silent data motion.
         _ => {
             BAR_ERR_BOUNDS.fetch_add(1, Ordering::Relaxed);
+            PagingOpOutcome::Failed(paging_failure())
         }
     }
 }
@@ -796,31 +834,45 @@ unsafe fn bar_fill(
     adapter: &AdapterContext,
     bar_id: u32,
     f: &_DXGKARG_BUILDPAGINGBUFFER__bindgen_ty_1__bindgen_ty_2,
-) {
+) -> PagingOpOutcome {
     if f.Destination.SegmentId != bar_id {
-        return;
+        return PagingOpOutcome::NotOurs;
     }
     let Some(alloc) = (unsafe { paging_alloc_info(f.hAllocation) }) else {
         // Same class as PgEh on the transfer side: a BAR-segment fill naming no
         // live allocation is a refusal, not a no-op.
         BAR_ERR_FILL_HANDLE.fetch_add(1, Ordering::Relaxed);
-        return;
+        return PagingOpOutcome::Failed(paging_failure());
     };
     if !alloc.bar_eligible {
         BAR_DEVICE_OP_SKIPS.fetch_add(1, Ordering::Relaxed);
-        return;
+        return PagingOpOutcome::NotOurs;
     }
     let fill_len = f.FillSize as u64;
     let pattern = f.FillPattern;
+    let mut filled = false;
     let ok = unsafe {
         with_blob_bytes(adapter, alloc.resource_id, |dst, len| {
-            let n = fill_len.min(len);
-            fill_pattern(dst, n as usize, pattern);
+            // REFUSE, do not clamp (M8/k-paging-19). The VIRTUAL_FILL arm twelve
+            // lines below has always refused an over-long fill; clamping here
+            // meant one condition had two policies, and the clamped tail was a
+            // silent partial fill. The classic FILL arm carries no allocation
+            // offset, so "fill from blob start" stays correct — only
+            // clamp-versus-refuse changes.
+            if fill_len > len {
+                BAR_ERR_BOUNDS.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            fill_pattern(dst, fill_len as usize, pattern);
+            filled = true;
         })
     };
-    if ok {
-        BAR_FILLS.fetch_add(1, Ordering::Relaxed);
+    if !(ok && filled) {
+        // PgEm (blob map) or PgEb (oversized fill) already counted.
+        return PagingOpOutcome::Failed(paging_failure());
     }
+    BAR_FILLS.fetch_add(1, Ordering::Relaxed);
+    PagingOpOutcome::Executed
 }
 
 /// Write `pattern` (u32, repeated) over `len` bytes at `dst`.
@@ -959,21 +1011,32 @@ pub unsafe extern "C" fn dxgkddi_build_paging_buffer(
     // Content ops need PASSIVE (host round-trips, Mm mapping calls). The DDI
     // is documented PASSIVE; if that ever fails in practice this counter
     // fires and the op degrades to the old null engine — loud, not silent.
+    //
+    // IRQL-DEGRADE POLICY (decided here, where the status is chosen): this arm
+    // keeps STATUS_SUCCESS. It is the one place that cannot honestly fail,
+    // because the gate runs before the union is parsed — it covers content ops
+    // for allocations that are NOT ours (another segment, a device-local image)
+    // just as much as ours, and failing those would refuse work this driver was
+    // never asked to do. PgEi is the loud signal instead: it has never moved,
+    // and a same-boot nonzero value is a design-gap escalation, not something
+    // to absorb.
     // SAFETY: KeGetCurrentIrql is callable at any IRQL.
     if unsafe { KeGetCurrentIrql() } != PASSIVE_LEVEL_IRQL {
         BAR_ERR_IRQL.fetch_add(1, Ordering::Relaxed);
         return STATUS_SUCCESS;
     }
 
-    let mut status = STATUS_SUCCESS;
-    match args.Operation {
+    // Every content arm yields a `PagingOpOutcome`, so the match itself is the
+    // driver's answer: `Failed` is the only variant that reaches VidMm as a
+    // status, and every arm that produces one routes through `paging_failure()`.
+    let outcome = match args.Operation {
         PagingOp::DXGK_OPERATION_TRANSFER => {
             // SAFETY: union arm selected by Operation.
-            unsafe { bar_transfer(adapter, bar.seg_id, args.__bindgen_anon_1.Transfer.as_ref()) };
+            unsafe { bar_transfer(adapter, bar.seg_id, args.__bindgen_anon_1.Transfer.as_ref()) }
         }
         PagingOp::DXGK_OPERATION_FILL => {
             // SAFETY: union arm selected by Operation.
-            unsafe { bar_fill(adapter, bar.seg_id, args.__bindgen_anon_1.Fill.as_ref()) };
+            unsafe { bar_fill(adapter, bar.seg_id, args.__bindgen_anon_1.Fill.as_ref()) }
         }
         PagingOp::DXGK_OPERATION_DISCARD_CONTENT => {
             // SAFETY: union arm selected by Operation.
@@ -986,15 +1049,26 @@ pub unsafe extern "C" fn dxgkddi_build_paging_buffer(
                 // unmaps handle CPU visibility). Counted for the op census.
                 BAR_DISCARDS.fetch_add(1, Ordering::Relaxed);
             }
+            // Discard cannot fail: there is nothing to move.
+            PagingOpOutcome::Executed
         }
         PagingOp::DXGK_OPERATION_VIRTUAL_FILL => {
             // SAFETY: union arm selected by Operation.
             let fv = unsafe { args.__bindgen_anon_1.FillVirtual.as_ref() };
-            if let Some(alloc) = unsafe { paging_alloc_info(fv.hAllocation) } {
-                if alloc.bar_eligible {
+            match unsafe { paging_alloc_info(fv.hAllocation) } {
+                None => {
+                    BAR_ERR_FILL_HANDLE.fetch_add(1, Ordering::Relaxed);
+                    PagingOpOutcome::Failed(paging_failure())
+                }
+                Some(alloc) if !alloc.bar_eligible => {
+                    BAR_DEVICE_OP_SKIPS.fetch_add(1, Ordering::Relaxed);
+                    PagingOpOutcome::NotOurs
+                }
+                Some(alloc) => {
                     let off = fv.AllocationOffsetInBytes;
                     let fill_len = fv.FillSizeInBytes;
                     let pattern = fv.FillPattern;
+                    let mut filled = false;
                     let ok = unsafe {
                         with_blob_bytes(adapter, alloc.resource_id, |dst, len| {
                             if off.saturating_add(fill_len) > len {
@@ -1007,10 +1081,15 @@ pub unsafe extern "C" fn dxgkddi_build_paging_buffer(
                                 fill_len as usize,
                                 pattern,
                             );
+                            filled = true;
                         })
                     };
-                    if ok {
+                    if ok && filled {
                         BAR_FILLS.fetch_add(1, Ordering::Relaxed);
+                        PagingOpOutcome::Executed
+                    } else {
+                        // PgEm / PgEb already counted.
+                        PagingOpOutcome::Failed(paging_failure())
                     }
                 }
             }
@@ -1018,14 +1097,22 @@ pub unsafe extern "C" fn dxgkddi_build_paging_buffer(
         PagingOp::DXGK_OPERATION_VIRTUAL_TRANSFER => {
             // SAFETY: union arm selected by Operation.
             let tv = unsafe { args.__bindgen_anon_1.TransferVirtual.as_ref() };
-            if !unsafe { bar_virtual_transfer(adapter, tv) } {
-                status = STATUS_UNSUCCESSFUL;
+            if unsafe { bar_virtual_transfer(adapter, tv) } {
+                PagingOpOutcome::Executed
+            } else {
+                // Was STATUS_UNSUCCESSFUL — the crate's last use of a status two
+                // sibling DDIs carry comments about dxgkrnl logging as "Driver
+                // returned an invalid NTSTATUS" 197x with adapter resets.
+                PagingOpOutcome::Failed(paging_failure())
             }
         }
-        _ => {}
-    }
+        _ => PagingOpOutcome::NotOurs,
+    };
     dump_bar_counters();
-    status
+    match outcome {
+        PagingOpOutcome::Failed(reason) => reason,
+        PagingOpOutcome::Executed | PagingOpOutcome::NotOurs => STATUS_SUCCESS,
+    }
 }
 
 // ── GpuMmu root page-table DDIs. ─────────────────────────────────────────────
