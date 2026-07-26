@@ -56,7 +56,7 @@ use wdk_sys::ntddk::{KeInitializeEvent, KeSetEvent, ObDereferenceObjectDeferDele
 use wdk_sys::{KEVENT, PVOID};
 
 use super::config::DxgkConfigAccess;
-use super::hal::{DmaBuffer, WdkHal};
+use super::hal::{DmaBuffer, DmaSpan, WdkHal};
 use super::VirtioError;
 use crate::dxgk::DXGKRNL_INTERFACE;
 
@@ -788,14 +788,80 @@ pub struct InFlight {
     /// `[in0 | in1? | resp]` — request span(s) followed by the device-written
     /// response span, all in one contiguous DMA buffer.
     meta: DmaBuffer,
-    in0_len: usize,
-    /// Second device-read span inside `meta` (0 = absent). Used by the
-    /// in-kernel venus client's SUBMIT_3D (header + small stream).
-    in1_len: usize,
+    /// The exact shape `add` was called with. One value, matched exhaustively,
+    /// instead of three independent length fields the drain re-derived by hand.
+    chain: Chain,
     resp_len: usize,
     /// Separate device-read venus payload (async submits).
     venus: Option<DmaBuffer>,
-    venus_len: usize,
+}
+
+/// The descriptor-chain shape of one submission.
+///
+/// `add` and `pop_used` must be handed the SAME buffer list, and virtio-drivers
+/// does not validate that: `pop_used` -> `recycle_descriptors` walks the chain
+/// against the caller-supplied list and PANICS on a mismatch
+/// (`virtio-drivers-0.13.0/src/queue.rs:461,477,479,501`), which under
+/// `panic = "abort"` with `wdk_panic` is a `KeBugCheck` from the interrupt DPC
+/// while the device spinlock is held.
+///
+/// The agreement used to be expressed only by three independent length fields
+/// plus the comment "exactly the spans `add` was called with", re-derived in
+/// four separate blocks of raw-pointer arithmetic. As one exhaustively-matched
+/// value it is a compile error to add a shape without teaching both sides.
+#[derive(Clone, Copy)]
+enum Chain {
+    /// `[in0] -> [resp]`. Async control commands.
+    Meta1 { in0_len: usize },
+    /// `[in0, in1] -> [resp]`. Sync control with a second device-read span.
+    Meta2 { in0_len: usize, in1_len: usize },
+    /// `[hdr, venus stream] -> [resp]`, the stream in its own buffer.
+    MetaPlusVenus { hdr_len: usize, venus_len: usize },
+}
+
+impl Chain {
+    /// Byte offset of the response span inside `meta`.
+    ///
+    /// All three shapes place it immediately after the meta-resident request
+    /// spans, i.e. at `in0_len + in1_len` — preserved verbatim, because
+    /// `drain_used` reads the `VIRTIO_GPU_RESP_*` word and copies the sync
+    /// response from exactly this offset.
+    fn resp_offset(self) -> usize {
+        match self {
+            Self::Meta1 { in0_len } => in0_len,
+            Self::Meta2 { in0_len, in1_len } => in0_len + in1_len,
+            Self::MetaPlusVenus { hdr_len, .. } => hdr_len,
+        }
+    }
+
+    /// The device-READ spans (up to two) and the device-WRITTEN response span,
+    /// or `None` if any of them falls outside its buffer.
+    ///
+    /// The ONLY producer of the buffer list, so `add` and `pop_used` are handed
+    /// literally the same code and the arm selection cannot differ between
+    /// them. It also replaces the per-arm ad-hoc `t <= meta.as_slice().len()`
+    /// bounds checks: every span is proved in `DmaBuffer::span`.
+    fn spans(
+        self,
+        meta: &DmaBuffer,
+        venus: Option<&DmaBuffer>,
+        resp_len: usize,
+    ) -> Option<([DmaSpan; 2], usize, DmaSpan)> {
+        let resp = meta.span(self.resp_offset(), resp_len)?;
+        Some(match self {
+            Self::Meta1 { in0_len } => ([meta.span(0, in0_len)?, DmaSpan::EMPTY], 1, resp),
+            Self::Meta2 { in0_len, in1_len } => (
+                [meta.span(0, in0_len)?, meta.span(in0_len, in1_len)?],
+                2,
+                resp,
+            ),
+            Self::MetaPlusVenus { hdr_len, venus_len } => (
+                [meta.span(0, hdr_len)?, venus?.span(0, venus_len)?],
+                2,
+                resp,
+            ),
+        })
+    }
 }
 
 impl InFlight {
@@ -1276,35 +1342,34 @@ impl VirtioGpu {
         if self.failed {
             return Err((meta, VirtioError::DeviceError));
         }
-        let total = in0_len
-            .checked_add(in1_len)
-            .and_then(|n| n.checked_add(resp_len));
-        match total {
-            Some(t)
-                if in0_len > 0
-                    && resp_len > 0
-                    && resp_len <= SYNC_RESP_MAX
-                    && t <= meta.as_slice().len() => {}
-            _ => return Err((meta, VirtioError::DeviceError)),
+        // The shape is decided ONCE, here, and carried on the entry; the drain
+        // no longer re-derives it from `in1_len > 0`.
+        let chain = if in1_len > 0 {
+            Chain::Meta2 { in0_len, in1_len }
+        } else {
+            Chain::Meta1 { in0_len }
+        };
+        // Validate BEFORE the capacity gate, exactly as the old summed-total
+        // check did: a malformed request must report DeviceError even when the
+        // queue also happens to be full. The `t <= meta.as_slice().len()` test
+        // this replaces now lives in DmaBuffer::span, per span rather than on
+        // the sum.
+        if in0_len == 0 || resp_len == 0 || resp_len > SYNC_RESP_MAX {
+            return Err((meta, VirtioError::DeviceError));
         }
+        let Some((reads, count, resp)) = chain.spans(&meta, None, resp_len) else {
+            return Err((meta, VirtioError::DeviceError));
+        };
         if self.inflight.len() >= MAX_INFLIGHT || self.parked.len() >= PARKED_ENQUEUE_GATE {
             QUEUE_FULL_RETRIES.fetch_add(1, Ordering::Relaxed);
             return Err((meta, VirtioError::QueueFull));
         }
-        let base = meta.as_slice().as_ptr();
         // SAFETY: the spans are disjoint sub-ranges of `meta`, which the
         // InFlight entry owns until the matching pop_used (moving the DmaBuffer
         // moves the owning struct, not the DMA bytes). The borrows end at `add`.
         let added = unsafe {
-            let in0 = core::slice::from_raw_parts(base, in0_len);
-            let resp =
-                core::slice::from_raw_parts_mut(base.add(in0_len + in1_len) as *mut u8, resp_len);
-            if in1_len > 0 {
-                let in1 = core::slice::from_raw_parts(base.add(in0_len), in1_len);
-                self.control.add(&[in0, in1], &mut [resp])
-            } else {
-                self.control.add(&[in0], &mut [resp])
-            }
+            let reads = [reads[0].as_slice(), reads[1].as_slice()];
+            self.control.add(&reads[..count], &mut [resp.as_mut_slice()])
         };
         let token = match added {
             Ok(t) => t,
@@ -1326,11 +1391,9 @@ impl VirtioGpu {
                 waiter: Some(waiter),
             },
             meta,
-            in0_len,
-            in1_len,
+            chain,
             resp_len,
             venus: None,
-            venus_len: 0,
         });
         bump_high_water(&INFLIGHT_HIGH_WATER, self.inflight.len());
         Ok(token)
@@ -1356,26 +1419,23 @@ impl VirtioGpu {
         if self.failed {
             return Err((meta, VirtioError::DeviceError));
         }
-        let total = in0_len.checked_add(resp_len);
-        match total {
-            Some(t)
-                if in0_len > 0
-                    && resp_len > 0
-                    && resp_len <= SYNC_RESP_MAX
-                    && t <= meta.as_slice().len() => {}
-            _ => return Err((meta, VirtioError::DeviceError)),
+        let chain = Chain::Meta1 { in0_len };
+        // Validated before the capacity gate, as in enqueue_sync.
+        if in0_len == 0 || resp_len == 0 || resp_len > SYNC_RESP_MAX {
+            return Err((meta, VirtioError::DeviceError));
         }
+        let Some((reads, count, resp)) = chain.spans(&meta, None, resp_len) else {
+            return Err((meta, VirtioError::DeviceError));
+        };
         if self.inflight.len() >= MAX_INFLIGHT || self.parked.len() >= PARKED_ENQUEUE_GATE {
             QUEUE_FULL_RETRIES.fetch_add(1, Ordering::Relaxed);
             return Err((meta, VirtioError::QueueFull));
         }
-        let base = meta.as_slice().as_ptr();
         // SAFETY: the request/response spans are disjoint inside `meta`, which
         // moves into the InFlight entry and remains device-owned until pop_used.
         let added = unsafe {
-            let input = core::slice::from_raw_parts(base, in0_len);
-            let response = core::slice::from_raw_parts_mut(base.add(in0_len) as *mut u8, resp_len);
-            self.control.add(&[input], &mut [response])
+            let reads = [reads[0].as_slice(), reads[1].as_slice()];
+            self.control.add(&reads[..count], &mut [resp.as_mut_slice()])
         };
         let token = match added {
             Ok(t) => t,
@@ -1398,11 +1458,9 @@ impl VirtioGpu {
                 resubmit,
             },
             meta,
-            in0_len,
-            in1_len: 0,
+            chain,
             resp_len,
             venus: None,
-            venus_len: 0,
         });
         ASYNC_CTRL_COUNT.fetch_add(1, Ordering::Relaxed);
         bump_high_water(&INFLIGHT_HIGH_WATER, self.inflight.len());
@@ -1494,15 +1552,15 @@ impl VirtioGpu {
         cmd.size = venus_len as u32;
         meta.as_mut_slice()[..hdr_len].copy_from_slice(bytemuck::bytes_of(&cmd));
 
-        let meta_base = meta.as_slice().as_ptr();
-        let venus_base = venus.as_slice().as_ptr();
+        let chain = Chain::MetaPlusVenus { hdr_len, venus_len };
+        let Some((reads, count, resp)) = chain.spans(&meta, Some(&venus), resp_len) else {
+            return Err((meta, venus, VirtioError::DeviceError));
+        };
         // SAFETY: spans live inside `meta`/`venus`, owned by the InFlight entry
         // until pop_used; the borrows end at `add`.
         let added = unsafe {
-            let hdr = core::slice::from_raw_parts(meta_base, hdr_len);
-            let stream = core::slice::from_raw_parts(venus_base, venus_len);
-            let resp = core::slice::from_raw_parts_mut(meta_base.add(hdr_len) as *mut u8, resp_len);
-            self.control.add(&[hdr, stream], &mut [resp])
+            let reads = [reads[0].as_slice(), reads[1].as_slice()];
+            self.control.add(&reads[..count], &mut [resp.as_mut_slice()])
         };
         let token = match added {
             Ok(t) => t,
@@ -1525,11 +1583,9 @@ impl VirtioGpu {
                 scanout_notify,
             },
             meta,
-            in0_len: hdr_len,
-            in1_len: 0,
+            chain,
             resp_len,
             venus: Some(venus),
-            venus_len,
         });
         ASYNC_SUBMIT_COUNT.fetch_add(1, Ordering::Relaxed);
         if ring != 0 {
@@ -1673,49 +1729,40 @@ impl VirtioGpu {
                 self.latch_failed_and_fail_inflight();
                 return;
             };
-            // Copy raw pointers/lengths so no borrow of `self.inflight` is held
-            // across the `self.control` call.
-            let (meta_base, in0_len, in1_len, resp_len, venus_base, venus_len) = {
+            // Rebuild the spans through the SAME producer `add` used, so the
+            // two lists cannot drift. The result is copied out so no borrow of
+            // `self.inflight` is held across the `self.control` call.
+            let (spans, resp_len) = {
                 let e = &self.inflight[idx];
-                (
-                    e.meta.as_slice().as_ptr(),
-                    e.in0_len,
-                    e.in1_len,
-                    e.resp_len,
-                    e.venus
-                        .as_ref()
-                        .map_or(core::ptr::null(), |v| v.as_slice().as_ptr()),
-                    e.venus_len,
-                )
+                (e.chain.spans(&e.meta, e.venus.as_ref(), e.resp_len), e.resp_len)
+            };
+            // The entry's own spans were proved at enqueue and nothing has
+            // resized the buffers since, so this cannot fail; treat it as a
+            // corrupt entry rather than assuming.
+            let Some((reads, count, resp)) = spans else {
+                DRAIN_BAD_TOKEN.fetch_add(1, Ordering::Relaxed);
+                self.latch_failed_and_fail_inflight();
+                return;
             };
             // SAFETY: exactly the spans `add` was called with; the entry still
             // owns both buffers.
             let popped = unsafe {
-                let in0 = core::slice::from_raw_parts(meta_base, in0_len);
-                let resp = core::slice::from_raw_parts_mut(
-                    meta_base.add(in0_len + in1_len) as *mut u8,
-                    resp_len,
-                );
-                if venus_len > 0 {
-                    let stream = core::slice::from_raw_parts(venus_base, venus_len);
-                    self.control.pop_used(token, &[in0, stream], &mut [resp])
-                } else if in1_len > 0 {
-                    let in1 = core::slice::from_raw_parts(meta_base.add(in0_len), in1_len);
-                    self.control.pop_used(token, &[in0, in1], &mut [resp])
-                } else {
-                    self.control.pop_used(token, &[in0], &mut [resp])
-                }
+                let read_slices = [reads[0].as_slice(), reads[1].as_slice()];
+                self.control
+                    .pop_used(token, &read_slices[..count], &mut [resp.as_mut_slice()])
             };
             if popped.is_err() {
                 self.latch_failed_and_fail_inflight();
                 return;
             }
             let entry = self.inflight.swap_remove(idx);
-            // First u32 of the device-written response = VIRTIO_GPU_RESP_*.
-            // SAFETY: the resp span is within the entry-owned meta buffer.
-            let resp_type = unsafe {
-                core::ptr::read_unaligned(meta_base.add(in0_len + in1_len) as *const u32)
+            let resp_base = {
+                // SAFETY: the resp span is within the entry-owned meta buffer.
+                unsafe { resp.as_slice() }.as_ptr()
             };
+            // First u32 of the device-written response = VIRTIO_GPU_RESP_*.
+            // SAFETY: as above; unaligned because the offset is command-shaped.
+            let resp_type = unsafe { core::ptr::read_unaligned(resp_base as *const u32) };
             match entry.kind {
                 InFlightKind::Sync { waiter } => {
                     if let Some(block) = waiter {
@@ -1730,7 +1777,7 @@ impl VirtioGpu {
                             let b = block.as_ptr();
                             let n = resp_len.min(SYNC_RESP_MAX);
                             core::ptr::copy_nonoverlapping(
-                                meta_base.add(in0_len + in1_len),
+                                resp_base,
                                 (*b).resp.get() as *mut u8,
                                 n,
                             );

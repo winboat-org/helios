@@ -97,6 +97,68 @@ impl DmaBuffer {
         self.len = len;
         true
     }
+
+    /// A bounds-checked device-visible sub-range, or `None` if it does not fit.
+    ///
+    /// This is the only constructor of a [`DmaSpan`], which makes it the one
+    /// place `offset + len <= self.len` is proved. It used to be re-derived per
+    /// enqueue arm as an ad-hoc `t <= meta.as_slice().len()` before four
+    /// separate blocks of raw span arithmetic.
+    pub fn span(&self, offset: usize, len: usize) -> Option<DmaSpan> {
+        if offset.checked_add(len)? > self.len {
+            return None;
+        }
+        Some(DmaSpan {
+            // SAFETY: offset <= self.len, just proved, so the result is within
+            // the allocation (one-past-the-end is legal to form).
+            base: unsafe { self.ptr.as_ptr().add(offset) },
+            len,
+        })
+    }
+}
+
+/// A bounds-checked sub-range of a [`DmaBuffer`], produced only by
+/// [`DmaBuffer::span`].
+///
+/// This is the type `Hal::share`'s real precondition is about. Its SAFETY
+/// comment establishes only "valid kernel memory", but what the identity
+/// mapping actually relies on is that every buffer reaching `add`/`pop_used`
+/// is a sub-span of a `DmaBuffer` — i.e. `MmAllocateContiguousMemory`-backed
+/// and physically contiguous across its whole length, so one `share` yields one
+/// descriptor. Making this the only way to name such a span puts the check at
+/// the producer instead of restating it as an assumption at the consumer.
+#[derive(Clone, Copy)]
+pub struct DmaSpan {
+    base: *mut u8,
+    len: usize,
+}
+
+impl DmaSpan {
+    /// The unused second slot of a one-read-span chain. Zero length, so the
+    /// dangling base is never dereferenced (`from_raw_parts` with len 0 requires
+    /// only a non-null, aligned pointer).
+    pub const EMPTY: Self = Self {
+        base: NonNull::<u8>::dangling().as_ptr(),
+        len: 0,
+    };
+
+    /// # Safety
+    /// The owning [`DmaBuffer`] must outlive the returned slice, and the device
+    /// must not write this span concurrently. Both hold for a device-READ span
+    /// of an entry that owns its buffers until `pop_used`.
+    pub unsafe fn as_slice<'a>(&self) -> &'a [u8] {
+        unsafe { core::slice::from_raw_parts(self.base, self.len) }
+    }
+
+    /// # Safety
+    /// As [`DmaSpan::as_slice`], except that this IS the span the device writes:
+    /// the aliasing between our `&mut` and the device's DMA is inherent to
+    /// virtio and cannot be encoded. The entry owns the buffer until `pop_used`
+    /// consumes the completion, which is the synchronisation that makes the
+    /// read-back well defined.
+    pub unsafe fn as_mut_slice<'a>(&self) -> &'a mut [u8] {
+        unsafe { core::slice::from_raw_parts_mut(self.base, self.len) }
+    }
 }
 
 impl Drop for DmaBuffer {
