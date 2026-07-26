@@ -406,6 +406,12 @@ pub struct AdapterContext {
     /// that thread: once shortly after start, on virtio config changes, after a
     /// completion-ordered scanout marker, and after async RESOURCE_FLUSH completion.
     pub hpd_event: UnsafeCell<KEVENT>,
+    /// Set by the HPD worker immediately before `PsTerminateSystemThread`, at
+    /// BOTH of its exit sites. `stop_hpd` waits on this rather than depending on
+    /// `ObReferenceObjectByHandle` succeeding: a NotificationEvent stays
+    /// signalled, so the join cannot miss it and cannot be defeated by a failed
+    /// handle-to-object lookup.
+    pub hpd_exited: UnsafeCell<KEVENT>,
     /// PsCreateSystemThread handle for the HPD worker (0 = not started). StopDevice
     /// signals `hpd_stop` + `hpd_event`, joins the thread on this handle, then closes it.
     hpd_thread: AtomicUsize,
@@ -526,6 +532,7 @@ impl AdapterContext {
             edid: [0u8; 128],
             // Zeroed placeholder — the real KEVENT is written by init_kernel_events.
             hpd_event: UnsafeCell::new(unsafe { core::mem::zeroed() }),
+            hpd_exited: UnsafeCell::new(unsafe { core::mem::zeroed() }),
             hpd_thread: AtomicUsize::new(0),
             hpd_stop: AtomicU32::new(0),
             hpd_worker_leaked: AtomicU32::new(0),
@@ -703,13 +710,30 @@ impl AdapterContext {
         //
         // Both now mean "a worker may still be running", which is recorded and
         // latched so the free path can consult it.
-        let mut joined = false;
+        // 5 s, relative (negative = relative to now, in 100 ns units). Long
+        // enough for the worst observed set_scanout_blob round-trip, short
+        // enough that PnP stop does not hang indefinitely.
+        const JOIN_TIMEOUT_100NS: i64 = -50_000_000;
+
+        // Primary join: the worker's own "I exited" NotificationEvent, set at
+        // both of its exit sites immediately before PsTerminateSystemThread.
+        // This does NOT depend on the handle-to-object lookup below succeeding,
+        // which is the failure that used to skip the wait entirely. A
+        // NotificationEvent stays signalled, so the join cannot miss it.
+        let mut timeout: wdk_sys::LARGE_INTEGER = unsafe { core::mem::zeroed() };
+        timeout.QuadPart = JOIN_TIMEOUT_100NS;
+        // SAFETY: initialized in place by init_kernel_events; PASSIVE_LEVEL.
+        let exited =
+            unsafe { KeWaitForSingleObject(self.hpd_exited.get() as PVOID, 0, 0, 0, &mut timeout) };
+        let mut joined = exited == STATUS_SUCCESS;
+
         if st == STATUS_SUCCESS && !obj.is_null() {
-            // 5 s, relative (negative = relative to now, in 100 ns units). Long
-            // enough for the worst observed set_scanout_blob round-trip, short
-            // enough that PnP stop does not hang indefinitely.
+            // Secondary: the thread object itself. The exit event is set just
+            // BEFORE PsTerminateSystemThread, so this closes the remaining
+            // window between the two - the worker is not yet fully torn down
+            // when it signals.
             let mut timeout: wdk_sys::LARGE_INTEGER = unsafe { core::mem::zeroed() };
-            timeout.QuadPart = -50_000_000;
+            timeout.QuadPart = JOIN_TIMEOUT_100NS;
             // SAFETY: waiting on the ETHREAD dispatcher object at PASSIVE_LEVEL.
             let wait = unsafe { KeWaitForSingleObject(obj, 0, 0, 0, &mut timeout) };
             // SAFETY: releasing the reference taken above.
@@ -1151,6 +1175,11 @@ impl AdapterContext {
         // indication; later signals come from the config-change DPC.
         // SAFETY: per the fn contract; stable in-place KEVENT storage.
         unsafe { KeInitializeEvent(self.hpd_event.get(), 1, 0) };
+        // Worker-exited latch: NotificationEvent (type 0) so it STAYS signalled
+        // once set, initially unsignaled. A synchronization event would be
+        // consumed by the first waiter and a second stop_hpd would block.
+        // SAFETY: per the fn contract; stable in-place KEVENT storage.
+        unsafe { KeInitializeEvent(self.hpd_exited.get(), 0, 0) };
     }
 
     /// Acquire the PASSIVE venus mutex (blocks; PASSIVE_LEVEL only).

@@ -74,6 +74,11 @@ pub unsafe extern "C" fn hpd_thread_routine(context: *mut c_void) {
         )
     };
     if adapter.hpd_stop.load(Ordering::Acquire) != 0 {
+        // Publish "worker exited" BEFORE terminating, so stop_hpd's join does
+        // not depend on ObReferenceObjectByHandle succeeding.
+        // SAFETY: initialized NotificationEvent on the adapter, which outlives
+        // this thread by the leak rule in stop_hpd.
+        unsafe { wdk_sys::ntddk::KeSetEvent(adapter.hpd_exited.get(), 0, 0) };
         // SAFETY: terminates the current system thread; does not return.
         let _ = unsafe { PsTerminateSystemThread(STATUS_SUCCESS) };
         return;
@@ -112,6 +117,11 @@ pub unsafe extern "C" fn hpd_thread_routine(context: *mut c_void) {
             KeWaitForSingleObject(adapter.hpd_event.get() as PVOID, 0, 0, 0, timeout_ptr)
         };
         if adapter.hpd_stop.load(Ordering::Acquire) != 0 {
+            // Publish "worker exited" BEFORE terminating, so stop_hpd's join
+            // does not depend on ObReferenceObjectByHandle succeeding.
+            // SAFETY: initialized NotificationEvent on the adapter, which
+            // outlives this thread by the leak rule in stop_hpd.
+            unsafe { wdk_sys::ntddk::KeSetEvent(adapter.hpd_exited.get(), 0, 0) };
             // SAFETY: terminates the current system thread; does not return.
             let _ = unsafe { PsTerminateSystemThread(STATUS_SUCCESS) };
             return;
