@@ -147,45 +147,85 @@ virtio-gpu scanout; IddCx/Looking Glass is no longer the active display path.*
    no aperture maps this boot). Next session should force real eviction pressure (a completed Fire
    Strike run plus a working-set larger than the 1 GiB BAR partition) before trusting them.
    Cursor-trail check not performed (needs interactive mouse input).
-5. **NEXT — T2** (`REFACTOR_REVIEW.md` §T2): 30 items, R401–R426, **release UMD + adapter restart,
-   NO reboot and no KMD version bump** — the cheapest tranche to iterate (`win_cargo umd` release →
-   `win_install_umd -UmdDll ...\target\release` → `pnputil /restart-device`; no `win_dxvk`, no
-   `win_meson`). Prereqs T0 + T1a, both landed. Bug half: VOID-returning `Create*` failures never
-   reach `set_runtime_error` (R401 — worst case the direct-scanout PRIMARY returns S_OK with a null
-   driver resource); `open_resource` fabricates a 1×1 BGRA alias of a full-size shared surface
-   (R402); `pfnDynamicConstantBufferMapNoOverwrite` is left on the noop stub on every ≥11.1 device
-   (R403); the unbounded interface `else` arm writes 150 pointer slots into a 101/103-slot D3D10
-   table (R405); five cxx bridge methods are unguarded while cxx emits every shim `noexcept`, so
-   `std::bad_alloc` is `std::terminate` in dwm (R411). Cost half: `find_helios_icd_export` caches
-   nothing — a full toolhelp module walk 60–120×/s on the present thread plus a `LoadLibraryA` with
-   no `FreeLibrary` (R416, the largest measured per-frame win); the LINEAR scanout probe has no
-   negative cache (R417); 267 `log_line` vs 27 `trace_line!` sites with a 21-argument `format!` on
-   all seven draw entry points (R420).
-   ⚠ R420: grep `tools/`, `*.ps1`, `*.md`, `*.py`, `*.sh` for each line's text before converting
-   it. Checked 2026-07-26: **nothing automated reads a UMD log line**; the only line a documented
-   procedure depends on is the C++ `present-gate:` line, which R420 does not touch. ⚠ R417 commit (3)
-   is owner-gated: `track_dwm_composition_target` is the ONLY writer of `dev.composition_source`.
-   ⚠ The UMD has **no registry/escape counter surface** — a "named counter" is a process-global
-   `AtomicUsize` next to the `EXT_*` block plus a field in an existing periodic dump line.
-6. Implement the remaining reviewed refactors atomically, in tranche order, one recommendation
+5. **T2 LANDED — gate PASSED (2026-07-27, release UMD only, 33 commits on `wddm`).** All 30 items
+   R401–R430. **No KMD change: still `22.22.180.0`, no reboot.** Bug half landed and was verified on
+   hardware BEFORE the telemetry half, so the cadence numbers were taken against a functionally
+   known-good driver.
+   Landed: R401 (`finish_create` — VOID `Create*` failures now reach `set_runtime_error`, worst case
+   the direct-scanout PRIMARY), R402 (`OpenedAllocation` makes the meta trailer non-optional, so the
+   1×1 BGRA alias is unrepresentable), R403, R404 (`DeviceUnderConstruction` drop guard;
+   `create_runtime_context` returns an HRESULT), R405 (`NegotiatedInterface` + a `const` assert
+   against `SUPPORTED_DDI_VERSIONS`), R406, R407, R408 (+ a real TEX1D arm), R409, R410 (`DdiSlice`
+   + `collect_slots`), R411 (`bridge_guard`, 7 methods, `noexcept` in the header), R412–R415
+   (`PresentReady`, `rotate_ring`, `GateOutcome`, one `VehicleSlot` + a device-liveness refusal),
+   R416 (`HeliosIcdExports`, successes cached only), R417 c1, R418, R419, R420, R421, R422–R430.
+   **Gate evidence, all same boot:** desktop composited (paintcap ×3); Fire Strike ran to completion
+   and stored a result; the D3D11 knob + extra probe suites all `rc=0`, `upload_integrity` **30/30
+   PASS, 0 mismatches**, `shared_content`/`shared_draw`/xproc cross-process draw all PASS. **ZERO
+   refusals of any kind** — no create failure, no `no meta trailer`, no `unsupported interface`, no
+   `DDI noop` hit, no `suspicious slot`, no DXBC rejection — across idle + Fire Strike + 2 DComp
+   probes + both suites. dwm **modules flat at 81** and handles 1064→1061 over a ~10-minute soak
+   (the R416 `LoadLibraryA` / COM-leak proof). R409 proven live: `DDI scanout registry: dropped 1
+   entry … remaining=0..2` — bounded, where it used to only grow.
+   **Measured, identical procedure before/after (60 s idle + a 200 s Fire Strike run):**
+   `UmdTrace=0` dwm log growth **3,425 → 0 bytes/min idle** and **353,818 → 35,303 bytes/min under
+   Fire Strike (10×)**. DComp probe ×2: **42.4 / 44.4 → 44.7 / 50.8 fps**; present-gate avg
+   **2264 → 2101 µs**. ETW `Microsoft-Windows-DxgKrnl` + `DXGI`, same 260 s workload on both builds:
+   AzureTriage **1352 → 1342** events, i.e. **no new driver-bug entries**; both builds show only the
+   two pre-existing KMD-side codes, `0xC0000001` ×1254 and `0xC00000BB` ×114 (defect 5 below) — and
+   T2 changes no KMD code. R414 cross-check: the new `gate_nc=44` field **exactly equals** the C++
+   `present-gate: … timeouts=44` read at the same point.
+   ⚠ **Two review premises corrected against hardware** (both amended in `REFACTOR_REVIEW.md`):
+   (a) R416 is NOT a per-frame win here — all three `present_sync_publish` call sites are gated on
+   `PresentSyncPublish`, which defaults to 0 and is absent from the registry, so `residOf` never
+   runs on the present thread; 2432 dwm presents produced **zero** `resid-lookup:` lines. Its real
+   value is the create path plus the closed `LoadLibraryA` growth. (b) R420's `LogThrottle` cannot
+   be "instantiated per site" — 11 of the 37 statics are SHARED by sites with different budgets, so
+   the budget had to become a call argument; cadence identity was verified by diffing all 69 sites.
+   ⚠ **Not performed:** cursor-trail check (needs interactive mouse input); dxvk-tests (not
+   installed on this box — the in-tree D3D11 probe suites were the surrogate); idle-to-active wake
+   not timed separately (the zero idle log growth is the mechanism the review cites for it).
+   ⚠ **Pre-existing, NOT a T2 regression:** `tools/d3d11_shared_blob_truth_probe.cpp` prints
+   `IDENTITY PARSE FAILED` because `parse_identity` uses `fopen_s`, which opens deny-sharing against
+   a log the UMD holds open — the documented 18th-session trap. The needle it greps
+   (`open_resource identity: res_id=`) is still an unconditional `log_line` and is present in the
+   file. ⚠ `win_install_umd` cannot refresh the DriverStore copy while it is in use (`Copy-Item …
+   being used by another process`); the ProgramData path the software key points at IS updated, so
+   this only risks a stale copy at cold boot.
+   ⚠ R417 commit (3) remains **owner-gated and NOT done**: `track_dwm_composition_target` is the
+   ONLY writer of `dev.composition_source`, so deleting that call would silently disable both the
+   legacy LINEAR copy and the `flush()` refresh-marker submission.
+   ⚠ The UMD still has **no registry/escape counter surface** — a "named counter" is a process-global
+   `AtomicUsize` next to the `EXT_*` block plus a field in an existing periodic dump line. New in
+   T2: `skips=a/b/c` and `gate_nc=` on the `DXGI Present: #N` line, `resid-lookup:` and the
+   `slots real=/noop=/calc=/null=` classification (both `UmdTrace`-gated), and
+   `DDI scanout registry: dropped …`.
+   ⚠ **Observable knob change (R429):** `HELIOS_PRESENT_READBACK`, `HELIOS_PRESENT_FORCE_OPAQUE` and
+   `HELIOS_PRESENT_OPTIMIZE_COMPOSITION` are now read ONCE per process; setting them on a live
+   process no longer takes effect.
+6. **NEXT — T3** (KMD image + reboot) or **T5** (UMD-only, so it can be interleaved). T5's prereqs
+   T0 + T2 are both landed and it is the cheaper of the two; several T5 items reshape code T2 just
+   touched (`u-forward-a-06`'s probe cache, `u-core-02`'s interface enum, `u-bridge-16`'s
+   present-sync mutex), so the context is warm.
+7. Implement the remaining reviewed refactors atomically, in tranche order, one recommendation
    per commit; never fold a `BUG` fix into a structure move. Preserve the current direct
    primary, completion ordering, loud-failure contracts, registry ABI, and
    diagnostic names unless a reviewed change explicitly migrates them. Replace
    arbitrary `Sleep`/poll loops with event, interrupt, fence, or
    condition-variable contracts; do not remove bounded safety timeouts merely
    because they wait.
-7. Regression-test each tranche and the final driver against visible desktop
+8. Regression-test each tranche and the final driver against visible desktop
    output, idle wake, rapid cursor motion, DComp cadence, DWM stability,
    same-boot KMD breadcrumbs, and host scanout evidence. Keep
    `ScanoutDiag` absent during primary tests.
-8. Continue soaking the current direct-primary path across DWM buffer rotation,
+9. Continue soaking the current direct-primary path across DWM buffer rotation,
    resize, suspend/resume, device restart, and cold boot.
-9. Pursue true host zero-copy only with a layout contract the display importer
+10. Pursue true host zero-copy only with a layout contract the display importer
    can consume. An explicit DRM modifier is one possible route, but enabling the
    modifier/DMA_BUF extensions on every DXVK device is prohibited: it inflated
    ordinary shared OPTIMAL import requirements and caused valid undersized-import
    refusal, DWM failures, and NVIDIA Xid 31 when bypassed.
-10. Continue D3D11 stability and conformance work after the quality pass.
+11. Continue D3D11 stability and conformance work after the quality pass.
 
 ## Historical PSC workstreams
 
