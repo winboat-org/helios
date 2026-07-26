@@ -19,8 +19,12 @@
 
   and 0xNNNN is the frame size. This script finds each symbol's address in the
   .map and reads that prologue out of `llvm-objdump -d`, anchoring on the
-  `subq %rax, %rsp` rather than on the unnamed thunk. Functions with small
-  frames have no __chkstk call; they are reported as "<4096 (no chkstk)".
+  `subq %rax, %rsp` rather than on the unnamed thunk. A sub-page frame has no
+  __chkstk probe, only a direct `subq $0xNN, %rsp`, which is read instead.
+
+  The budget applies to a CHAIN of simultaneously live frames, not to the sum of
+  everything measured, so -Chains declares which symbols call which. Exits 1 if
+  the deepest declared chain is over the ceiling.
 
 .EXAMPLE
   powershell -ExecutionPolicy Bypass -File Z:\tools\kmd-frame-sizes.ps1
@@ -29,10 +33,30 @@
 param(
     [string]   $Package = 'C:\Users\Rupansh\helios-vgpu\kmd_render\target\debug\helios_kmd_render_package',
     [string]   $ObjDump = 'C:\Program Files\LLVM\bin\llvm-objdump.exe',
-    # Substrings matched against the mangled names in the .map. The defaults are
-    # the boot path: everything DxgkDdiStartDevice keeps live plus the callee
-    # that dominates it.
-    [string[]] $Symbols = @('12start_device20dxgkddi_start_device', '9VirtioGpu4init'),
+    # Substrings matched against the mangled names in the .map. Rust v0 mangling
+    # prefixes each identifier with its byte length, so '14bring_up_venus' means
+    # the 14-character name `bring_up_venus` — get the length wrong and the
+    # symbol simply is not found. The defaults are the boot path: the two
+    # functions whose sum is the budget, then the venus bring-up chain they
+    # call, which R608 split into per-stage frames.
+    [string[]] $Symbols = @(
+        '12start_device20dxgkddi_start_device',
+        '9VirtioGpu4init',
+        '14bring_up_venus',
+        '26allocate_host_visible_blob',
+        '9VenusRing8bring_up',
+        '9VenusRing13into_instance',
+        '13VenusInstance11into_device',
+        '13VenusInstance29create_device_with_ext_ladder'
+    ),
+    # Call chains to sum. The 24 KB budget applies to a CHAIN of simultaneously
+    # live frames, never to the sum of every symbol measured, so the chains are
+    # declared rather than inferred. Each entry is a comma-separated list of
+    # $Symbols entries, outermost first.
+    [string[]] $Chains = @(
+        '12start_device20dxgkddi_start_device,9VirtioGpu4init',
+        '12start_device20dxgkddi_start_device,14bring_up_venus,26allocate_host_visible_blob,13VenusInstance11into_device,13VenusInstance29create_device_with_ext_ladder'
+    ),
     [int]      $Window  = 24
 )
 
@@ -59,7 +83,7 @@ for ($i = 0; $i -lt $dis.Count; $i++) {
     }
 }
 
-$total = 0
+$frames = @{}
 foreach ($sym in $Symbols) {
     $hit = Select-String -Path $map -Pattern ([regex]::Escape($sym)) -SimpleMatch |
            Select-Object -First 1
@@ -74,19 +98,49 @@ foreach ($sym in $Symbols) {
 
     $start = $index[$key]
     $frame = $null
+    $small = $null
     $pending = $null
     for ($i = $start; $i -lt [Math]::Min($start + $Window, $dis.Count); $i++) {
         $t = $dis[$i]
         if ($t -match 'movl\s+\$0x([0-9a-f]+),\s*%eax') { $pending = [Convert]::ToInt32($matches[1], 16); continue }
         if ($t -match 'subq\s+%rax,\s*%rsp') { $frame = $pending; break }
+        # Sub-page frame: no __chkstk probe, just a direct adjustment. Take the
+        # FIRST one in the prologue; later ones belong to inlined blocks.
+        if ($null -eq $small -and $t -match 'subq\s+\$0x([0-9a-f]+),\s*%rsp') {
+            $small = [Convert]::ToInt32($matches[1], 16)
+        }
     }
 
-    if ($null -eq $frame) {
-        Write-Host ("{0,-40} <4096 (no chkstk in first {1} insns)" -f $sym, $Window)
+    if ($null -ne $frame) {
+        $frames[$sym] = $frame
+        Write-Host ("{0,-46} {1,6} bytes  (0x{1:x}, __chkstk)" -f $sym, $frame)
+    } elseif ($null -ne $small) {
+        $frames[$sym] = $small
+        Write-Host ("{0,-46} {1,6} bytes  (0x{1:x})" -f $sym, $small)
     } else {
-        Write-Host ("{0,-40} {1,6} bytes  (0x{1:x})" -f $sym, $frame)
-        $total += $frame
+        $frames[$sym] = 0
+        Write-Host ("{0,-46} {1,6} bytes  (leaf, no rsp adjustment)" -f $sym, 0)
     }
 }
 
-Write-Host ("{0,-40} {1,6} bytes  <-- keep <= 17936 (the 22.22.180.0 known-good ceiling)" -f 'NESTED TOTAL', $total)
+Write-Host ""
+Write-Host "--- chains (the 24 KB budget applies to these, not to the sum above) ---"
+$worst = 0
+foreach ($chain in $Chains) {
+    $parts = $chain -split ','
+    $sum = 0
+    $missing = $false
+    foreach ($part in $parts) {
+        if ($frames.ContainsKey($part)) { $sum += $frames[$part] } else { $missing = $true }
+    }
+    $names = ($parts | ForEach-Object { ($_ -replace '^[0-9]+', '') }) -join ' -> '
+    $note = if ($missing) { '  (INCOMPLETE: a symbol was not measured)' } else { '' }
+    Write-Host ("{0,6} bytes  {1}{2}" -f $sum, $names, $note)
+    if (-not $missing -and $sum -gt $worst) { $worst = $sum }
+}
+Write-Host ""
+if ($worst -gt 17936) {
+    Write-Host ("DEEPEST CHAIN {0} bytes  ** OVER the 17936-byte 22.22.180.0 ceiling **" -f $worst)
+    exit 1
+}
+Write-Host ("DEEPEST CHAIN {0} bytes  (ceiling 17936, headroom {1})" -f $worst, (17936 - $worst))

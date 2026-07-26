@@ -348,12 +348,20 @@ vk_handle!(
     /// `VkFence`.
     VkFenceId
 );
-// `VkQueue` and `VkDevice` deliberately have NO newtype here. They are the two
-// handles that exist in a "not yet valid, encoded as 0" state during bring-up,
-// and wrapping them without removing that state would only move the sentinel
-// behind an Option that every one of the ~40 encoders would have to unwrap.
-// R608's VenusRing -> VenusInstance -> VenusDevice typestate is where they
-// become non-optional, and that is where their newtypes belong.
+// `VkQueue` and `VkDevice` are the two handles that used to exist in a "not yet
+// valid, encoded as 0" state during bring-up. They are newtypes now because
+// R608's VenusRing -> VenusInstance -> VenusClient typestate removed that state:
+// a VenusClient without a device is unrepresentable, so no Option is needed and
+// no encoder has to unwrap one.
+vk_handle!(
+    /// `VkQueue`. Obtained from `vkGetDeviceQueue`, not minted, but it is still
+    /// a guest-assigned handle in the same space.
+    VkQueueId
+);
+vk_handle!(
+    /// `VkDevice`.
+    VkDeviceId
+);
 
 /// The result of [`allocate_host_visible_blob`]: a venus-backed, BAR-visible,
 /// CPU-coherent region for VidMm's page-table segment.
@@ -1057,16 +1065,26 @@ impl<'a> ReplyReader<'a> {
     }
 }
 
-/// The persistent venus client owned by the adapter for the device lifetime.
+/// Bring-up stage 1: the venus ring exists and is registered with the host, but
+/// no Vulkan object does.
 ///
-/// Holds the ring/reply BAR mappings and the live Vulkan object ids. Dropping it
-/// unmaps the kernel mappings; the host-side venus objects and blob resources are
-/// torn down implicitly when the persistent virtio context is destroyed (the
-/// caller destroys the context in StopDevice and unrefs the page-table blob).
-pub struct VenusClient {
+/// Splitting this out is the point of the typestate. `VenusClient` used to be
+/// constructed complete-looking at stage 2 and then mutated through seven more
+/// ordered stages; between them it was a perfectly valid `VenusClient` whose
+/// `device_id`/`queue_id`/`memory_type_index` were 0, and every one of its ~40
+/// methods would happily encode `VkDevice 0` into the wire stream — which the
+/// host answers by poisoning the ring. The ordering was enforced only by the
+/// linear layout of one 400-line function, so hoisting any helper above its
+/// stage (a capability probe before the CreateDevice ladder, say) compiled.
+///
+/// Now the stages are types and each transition consumes the previous value, so
+/// no stage can be skipped or reordered and no later stage's method is even
+/// nameable earlier.
+struct VenusRing {
     /// Guest-assigned ring handle token (reused everywhere the ring is named).
     ring_id: u64,
     /// Ring shmem blob resource id (for unref on teardown).
+    #[allow(dead_code)]
     ring_res_id: u32,
     /// Reply shmem blob resource id (for unref on teardown).
     reply_res_id: u32,
@@ -1086,71 +1104,19 @@ pub struct VenusClient {
     next_handle: NonZeroU64,
     /// The persistent venus 3D context id all commands ride.
     ctx_id: u32,
-    /// One-shot destination probe ARMED but not yet run (R320). The probe is a
-    /// blocking PASSIVE diagnostic — a 5 s fence wait, a host map round-trip
-    /// with 1 ms Busy sleeps, MmMapIoSpace, ~196 volatile reads and 7 registry
-    /// writes — and it used to run inside `submit_present_blt`, i.e. on the
-    /// Present path with the adapter venus mutex HELD. Since the one-shot is per
-    /// source/destination PAIR, a session with the knob enabled could pay that
-    /// up to MAX_PRESENT_BLITS times, each a potential multi-second stall of the
-    /// compositor. It is now recorded here and drained by the PASSIVE display
-    /// worker outside the mutex.
-    probe_pending: Option<(PresentBufferDesc, u64)>,
-    /// venus instance handle.
-    instance_id: u64,
-    /// venus device handle.
-    device_id: u64,
-    /// Graphics queue handle from family 0, queue 0.
-    queue_id: u64,
-    /// HOST_VISIBLE|HOST_COHERENT memory type chosen during bring-up.
-    memory_type_index: u32,
-    /// Raw VkMemoryPropertyFlags for physical-device memory types.
-    memory_type_flags: [u32; VK_MAX_MEMORY_TYPES as usize],
-    memory_type_count: u32,
     /// Poison latch: set when a ring wait exhausts [`RING_WAIT_TIMEOUT_MS`] or
     /// the host reports RING_STATUS_FATAL. A wedged/fatal ring never recovers,
     /// and without the latch every subsequent call re-burned the full wait
     /// budget, which is the 2026-07-03 guest wedge. Once set, every ring command
     /// fails fast with `DeviceError`.
     ///
-    /// Write it ONLY through [`VenusClient::latch_fatal`], which names the
-    /// reason in the registry. (The previous version of this comment claimed the
-    /// allocation path reaches these waits "at DISPATCH_LEVEL under the device
-    /// spinlock" and cited a `RING_POLL_SPINS` constant that no longer exists.
-    /// It is wrong on both counts and it is load-bearing here: `ring_wait_until`
-    /// sleeps via `ctrl::sleep_ms`, so these waits are PASSIVE-only, which is
-    /// what makes `latch_fatal`'s registry write legal.)
+    /// Write it ONLY through [`VenusRing::latch_fatal`], which names the reason
+    /// in the registry. These waits are PASSIVE-only (`ring_wait_until` sleeps
+    /// via `ctrl::sleep_ms`), which is what makes that registry write legal.
     fatal: bool,
-    /// One-time PREINITIALIZED -> GENERAL -> EXTERNAL setup for the persistent
-    /// LINEAR scanout target. The pool/buffer remain live because setup is
-    /// intentionally submitted without a fence wait; queue order makes every
-    /// later copy execute after it.
-    copy_target_image_id: Option<VkImageId>,
-    copy_target_init_pool_id: Option<VkCommandPoolId>,
-    copy_target_init_command_buffer_id: Option<VkCommandBufferId>,
-    /// App/DWM BLT imports and recorded copies. Both vectors are preallocated
-    /// and capacity-bounded. Every access is serialized by
-    /// AdapterContext::with_venus_client, so setup/submission/teardown cannot
-    /// race through incidental call ordering.
-    present_images: Vec<ImportedOptimalImage>,
-    present_buffers: Vec<BorrowedPresentBuffer>,
-    present_blits: Vec<PreparedPresentBlt>,
-    /// Exact identities of `allocate_memory_blob` allocations. This registry
-    /// turns a standard Present destination into a checked borrow of the
-    /// already-live local `VkDeviceMemory`; no resource-id heuristic or
-    /// same-device re-import is permitted.
-    owned_memory_blobs: Vec<OwnedMemoryBlob>,
 }
 
-impl VenusClient {
-    /// The HOST_VISIBLE|HOST_COHERENT venus `memoryTypeIndex` every
-    /// [`Self::allocate_memory_blob`] allocation uses — recorded into the
-    /// allocation identity so cross-process openers import with the creator's
-    /// exact memory type.
-    pub fn memory_type_index(&self) -> u32 {
-        self.memory_type_index
-    }
-
+impl VenusRing {
     /// Mint the next raw handle. Private: every caller goes through one of the
     /// typed constructors below, so a handle cannot be created without deciding
     /// what class of object it names.
@@ -1162,30 +1128,6 @@ impl VenusClient {
         // would collide with a live host object.
         self.next_handle = self.next_handle.checked_add(1).unwrap_or(self.next_handle);
         h
-    }
-
-    fn new_image_id(&mut self) -> VkImageId {
-        VkImageId(self.next_raw())
-    }
-
-    fn new_memory_id(&mut self) -> VkDeviceMemoryId {
-        VkDeviceMemoryId(self.next_raw())
-    }
-
-    fn new_buffer_id(&mut self) -> VkBufferId {
-        VkBufferId(self.next_raw())
-    }
-
-    fn new_command_pool_id(&mut self) -> VkCommandPoolId {
-        VkCommandPoolId(self.next_raw())
-    }
-
-    fn new_command_buffer_id(&mut self) -> VkCommandBufferId {
-        VkCommandBufferId(self.next_raw())
-    }
-
-    fn new_fence_id(&mut self) -> VkFenceId {
-        VkFenceId(self.next_raw())
     }
 
     /// Latch the ring poison, naming the reason in the registry.
@@ -1374,6 +1316,164 @@ impl VenusClient {
         wait.u64(seqno);
         self.submit_direct(adapter, wait.as_slice()?)
     }
+}
+
+/// Bring-up stage 2: an instance and a physical device exist on the ring.
+///
+/// Exists only between `VenusRing::into_instance` and `into_device`. Its only
+/// job is to make "we have an instance but not a device yet" a state you cannot
+/// call `allocate_memory_blob` from.
+struct VenusInstance {
+    ring: VenusRing,
+    instance_id: NonZeroU64,
+    phys_dev_id: NonZeroU64,
+}
+
+/// A `memoryTypeIndex` proven to be below the host's reported `memoryTypeCount`.
+///
+/// The bring-up used to leave this field 0 until stage 6, which is a *legal*
+/// index — so "not yet chosen" and "chose type 0" were the same value.
+#[derive(Clone, Copy)]
+struct MemoryTypeIndex(u32);
+
+/// The persistent venus client owned by the adapter for the device lifetime.
+///
+/// Holds the ring/reply BAR mappings and the live Vulkan object ids. Dropping it
+/// unmaps the kernel mappings; the host-side venus objects and blob resources are
+/// torn down implicitly when the persistent virtio context is destroyed (the
+/// caller destroys the context in StopDevice and unrefs the page-table blob).
+///
+/// Reaching this type at all means the full bring-up succeeded: there is no
+/// constructor other than [`VenusInstance::into_device`].
+pub struct VenusClient {
+    /// Stage-1 state. Every ring primitive lives here, so the ~40 methods below
+    /// reach it through the small delegating helpers rather than by owning the
+    /// fields directly.
+    ring: VenusRing,
+    /// One-shot destination probe ARMED but not yet run (R320). The probe is a
+    /// blocking PASSIVE diagnostic — a 5 s fence wait, a host map round-trip
+    /// with 1 ms Busy sleeps, MmMapIoSpace, ~196 volatile reads and 7 registry
+    /// writes — and it used to run inside `submit_present_blt`, i.e. on the
+    /// Present path with the adapter venus mutex HELD. Since the one-shot is per
+    /// source/destination PAIR, a session with the knob enabled could pay that
+    /// up to MAX_PRESENT_BLITS times, each a potential multi-second stall of the
+    /// compositor. It is now recorded here and drained by the PASSIVE display
+    /// worker outside the mutex.
+    probe_pending: Option<(PresentBufferDesc, u64)>,
+    /// venus instance handle.
+    #[allow(dead_code)]
+    instance_id: NonZeroU64,
+    /// venus physical-device handle.
+    #[allow(dead_code)]
+    phys_dev_id: NonZeroU64,
+    /// venus device handle. Not `Option`: a `VenusClient` without a device is
+    /// unrepresentable, which is the whole point of the typestate.
+    device_id: VkDeviceId,
+    /// Graphics queue handle from family 0, queue 0.
+    queue_id: VkQueueId,
+    /// HOST_VISIBLE|HOST_COHERENT memory type chosen during bring-up.
+    memory_type_index: MemoryTypeIndex,
+    /// Raw VkMemoryPropertyFlags for physical-device memory types.
+    memory_type_flags: [u32; VK_MAX_MEMORY_TYPES as usize],
+    memory_type_count: u32,
+    /// One-time PREINITIALIZED -> GENERAL -> EXTERNAL setup for the persistent
+    /// LINEAR scanout target. The pool/buffer remain live because setup is
+    /// intentionally submitted without a fence wait; queue order makes every
+    /// later copy execute after it.
+    copy_target_image_id: Option<VkImageId>,
+    copy_target_init_pool_id: Option<VkCommandPoolId>,
+    copy_target_init_command_buffer_id: Option<VkCommandBufferId>,
+    /// App/DWM BLT imports and recorded copies. Both vectors are preallocated
+    /// and capacity-bounded. Every access is serialized by
+    /// AdapterContext::with_venus_client, so setup/submission/teardown cannot
+    /// race through incidental call ordering.
+    present_images: Vec<ImportedOptimalImage>,
+    present_buffers: Vec<BorrowedPresentBuffer>,
+    present_blits: Vec<PreparedPresentBlt>,
+    /// Exact identities of `allocate_memory_blob` allocations. This registry
+    /// turns a standard Present destination into a checked borrow of the
+    /// already-live local `VkDeviceMemory`; no resource-id heuristic or
+    /// same-device re-import is permitted.
+    owned_memory_blobs: Vec<OwnedMemoryBlob>,
+}
+
+impl VenusClient {
+    /// The HOST_VISIBLE|HOST_COHERENT venus `memoryTypeIndex` every
+    /// [`Self::allocate_memory_blob`] allocation uses — recorded into the
+    /// allocation identity so cross-process openers import with the creator's
+    /// exact memory type.
+    pub fn memory_type_index(&self) -> u32 {
+        self.memory_type_index.0
+    }
+
+    // ── Stage-1 delegates ────────────────────────────────────────────────────
+    //
+    // The ring primitives belong to VenusRing, which exists before any Vulkan
+    // object does. These forwarders exist so the ~40 object methods below read
+    // as they did — the alternative was `self.ring.` on 200 lines, which would
+    // have buried the actual change.
+
+    /// The persistent venus 3D context id all commands ride.
+    fn ctx_id(&self) -> u32 {
+        self.ring.ctx_id
+    }
+
+    /// The reply shmem mapping, for a fresh [`ReplyReader`].
+    fn reply_map(&self) -> &KernelMap {
+        &self.ring.reply_map
+    }
+
+    fn submit_direct(&self, adapter: &AdapterContext, stream: &[u8]) -> Result<(), VirtioError> {
+        self.ring.submit_direct(adapter, stream)
+    }
+
+    fn ring_command_noreply(
+        &mut self,
+        adapter: &AdapterContext,
+        stream: &[u8],
+    ) -> Result<(), VirtioError> {
+        self.ring.ring_command_noreply(adapter, stream)
+    }
+
+    fn ring_command_reply(
+        &mut self,
+        adapter: &AdapterContext,
+        stream: &[u8],
+    ) -> Result<(), VirtioError> {
+        self.ring.ring_command_reply(adapter, stream)
+    }
+
+    /// Mint the next raw handle. Private: every caller goes through one of the
+    /// typed constructors below, so a handle cannot be created without deciding
+    /// what class of object it names. The counter itself lives on the ring,
+    /// which is the stage that exists before any Vulkan object does.
+    fn next_raw(&mut self) -> NonZeroU64 {
+        self.ring.next_raw()
+    }
+
+    fn new_image_id(&mut self) -> VkImageId {
+        VkImageId(self.next_raw())
+    }
+
+    fn new_memory_id(&mut self) -> VkDeviceMemoryId {
+        VkDeviceMemoryId(self.next_raw())
+    }
+
+    fn new_buffer_id(&mut self) -> VkBufferId {
+        VkBufferId(self.next_raw())
+    }
+
+    fn new_command_pool_id(&mut self) -> VkCommandPoolId {
+        VkCommandPoolId(self.next_raw())
+    }
+
+    fn new_command_buffer_id(&mut self) -> VkCommandBufferId {
+        VkCommandBufferId(self.next_raw())
+    }
+
+    fn new_fence_id(&mut self) -> VkFenceId {
+        VkFenceId(self.next_raw())
+    }
 
     /// Allocate HOST_VISIBLE|HOST_COHERENT Venus device memory and bind it to a
     /// HOST3D blob. Returns the memory id (`blob_id`) and virtio resource id.
@@ -1395,7 +1495,7 @@ impl VenusClient {
         {
             let mut w = Writer::new();
             w.header(CMD_ALLOCATE_MEMORY, CMD_FLAG_GENERATE_REPLY);
-            w.u64(self.device_id);
+            w.handle(self.device_id);
             w.count(true);
             w.i32(ST_MEMORY_ALLOCATE_INFO);
             if shareable {
@@ -1407,13 +1507,13 @@ impl VenusClient {
                 w.count(false);
             }
             w.u64(size);
-            w.u32(self.memory_type_index);
+            w.u32(self.memory_type_index.0);
             w.count(false);
             w.count(true);
             w.handle(memory_id);
             self.ring_command_reply(adapter, w.as_slice()?)?;
 
-            let mut r = ReplyReader::new(&self.reply_map);
+            let mut r = ReplyReader::new(self.reply_map());
             let cmd = r.read_i32()?;
             if cmd as u32 != CMD_ALLOCATE_MEMORY {
                 diag(0x00F6);
@@ -1435,7 +1535,7 @@ impl VenusClient {
         }
         let res_id = match ctrl::resource_create_blob(
             adapter,
-            self.ctx_id,
+            self.ctx_id(),
             VIRTIO_GPU_BLOB_MEM_HOST3D,
             flags,
             // The VkDeviceMemory handle IS the virtio blob_id for a
@@ -1462,7 +1562,7 @@ impl VenusClient {
             resource_id: res_id,
             memory_id,
             allocation_size: size,
-            memory_type_index: self.memory_type_index,
+            memory_type_index: self.memory_type_index.0,
         });
         Ok(HostVisibleBlob {
             blob_id: memory_id.get(),
@@ -1513,7 +1613,7 @@ impl VenusClient {
         let image_id = self.new_image_id();
         let mut w = Writer::new();
         w.header(CMD_CREATE_IMAGE, CMD_FLAG_GENERATE_REPLY);
-        w.u64(self.device_id);
+        w.handle(self.device_id);
         w.count(true);
         w.i32(ST_IMAGE_CREATE_INFO);
         // VkExternalMemoryImageCreateInfo -> VkImageDrmFormatModifierListCreateInfoEXT.
@@ -1546,7 +1646,7 @@ impl VenusClient {
         w.handle(image_id);
         self.ring_command_reply(adapter, w.as_slice()?)?;
 
-        let mut r = ReplyReader::new(&self.reply_map);
+        let mut r = ReplyReader::new(self.reply_map());
         let cmd = r.read_i32()?;
         if cmd as u32 != CMD_CREATE_IMAGE {
             diag(0x0101);
@@ -1573,7 +1673,7 @@ impl VenusClient {
         let image_id = self.new_image_id();
         let mut w = Writer::new();
         w.header(CMD_CREATE_IMAGE, CMD_FLAG_GENERATE_REPLY);
-        w.u64(self.device_id);
+        w.handle(self.device_id);
         w.count(true);
         w.i32(ST_IMAGE_CREATE_INFO);
         // VkExternalMemoryImageCreateInfo only. This matches the Linux KMS probe
@@ -1602,7 +1702,7 @@ impl VenusClient {
         w.handle(image_id);
         self.ring_command_reply(adapter, w.as_slice()?)?;
 
-        let mut r = ReplyReader::new(&self.reply_map);
+        let mut r = ReplyReader::new(self.reply_map());
         let cmd = r.read_i32()?;
         if cmd as u32 != CMD_CREATE_IMAGE {
             crate::diag::record_named_bytes(b"SdgLImg", 0xE0);
@@ -1662,7 +1762,7 @@ impl VenusClient {
         let image_id = self.new_image_id();
         let mut w = Writer::new();
         w.header(CMD_CREATE_IMAGE, CMD_FLAG_GENERATE_REPLY);
-        w.u64(self.device_id);
+        w.handle(self.device_id);
         w.count(true);
         w.i32(ST_IMAGE_CREATE_INFO);
         // Imported ordinary UMD resources use OPAQUE_FD. KMD-created GDI
@@ -1695,7 +1795,7 @@ impl VenusClient {
         w.handle(image_id);
         self.ring_command_reply(adapter, w.as_slice()?)?;
 
-        let mut r = ReplyReader::new(&self.reply_map);
+        let mut r = ReplyReader::new(self.reply_map());
         let cmd = r.read_i32()?;
         if cmd as u32 != CMD_CREATE_IMAGE {
             diag(0x0130);
@@ -1733,7 +1833,7 @@ impl VenusClient {
         let image_id = self.new_image_id();
         let mut w = Writer::new();
         w.header(CMD_CREATE_IMAGE, CMD_FLAG_GENERATE_REPLY);
-        w.u64(self.device_id);
+        w.handle(self.device_id);
         w.count(true);
         w.i32(ST_IMAGE_CREATE_INFO);
         w.count(false); // pNext: internal image, no external-memory contract
@@ -1757,7 +1857,7 @@ impl VenusClient {
         w.handle(image_id);
         self.ring_command_reply(adapter, w.as_slice()?)?;
 
-        let mut r = ReplyReader::new(&self.reply_map);
+        let mut r = ReplyReader::new(self.reply_map());
         if r.read_i32()? as u32 != CMD_CREATE_IMAGE || r.read_i32()? != 0 {
             return Err(VirtioError::DeviceError);
         }
@@ -1778,7 +1878,7 @@ impl VenusClient {
         let memory_id = self.new_memory_id();
         let mut w = Writer::new();
         w.header(CMD_ALLOCATE_MEMORY, CMD_FLAG_GENERATE_REPLY);
-        w.u64(self.device_id);
+        w.handle(self.device_id);
         w.count(true);
         w.i32(ST_MEMORY_ALLOCATE_INFO);
         w.count(true);
@@ -1793,7 +1893,7 @@ impl VenusClient {
         w.handle(memory_id);
         self.ring_command_reply(adapter, w.as_slice()?)?;
 
-        let mut r = ReplyReader::new(&self.reply_map);
+        let mut r = ReplyReader::new(self.reply_map());
         if r.read_i32()? as u32 != CMD_ALLOCATE_MEMORY || r.read_i32()? != 0 {
             return Err(VirtioError::DeviceError);
         }
@@ -1894,12 +1994,12 @@ impl VenusClient {
     ) -> Result<(u64, u32), VirtioError> {
         let mut w = Writer::new();
         w.header(CMD_GET_IMAGE_MEMORY_REQUIREMENTS, CMD_FLAG_GENERATE_REPLY);
-        w.u64(self.device_id);
+        w.handle(self.device_id);
         w.handle(image_id);
         w.count(true);
         self.ring_command_reply(adapter, w.as_slice()?)?;
 
-        let mut r = ReplyReader::new(&self.reply_map);
+        let mut r = ReplyReader::new(self.reply_map());
         let cmd = r.read_i32()?;
         if cmd as u32 != CMD_GET_IMAGE_MEMORY_REQUIREMENTS {
             diag(0x0104);
@@ -1928,7 +2028,7 @@ impl VenusClient {
         let buffer_id = self.new_buffer_id();
         let mut w = Writer::new();
         w.header(CMD_CREATE_BUFFER, CMD_FLAG_GENERATE_REPLY);
-        w.u64(self.device_id);
+        w.handle(self.device_id);
         w.count(true);
         w.i32(ST_BUFFER_CREATE_INFO);
         w.count(false); // pNext: local buffer, no external-memory contract
@@ -1943,7 +2043,7 @@ impl VenusClient {
         w.handle(buffer_id);
         self.ring_command_reply(adapter, w.as_slice()?)?;
 
-        let mut r = ReplyReader::new(&self.reply_map);
+        let mut r = ReplyReader::new(self.reply_map());
         let cmd = r.read_i32()?;
         if cmd as u32 != CMD_CREATE_BUFFER {
             return Err(VirtioError::DeviceError);
@@ -1966,12 +2066,12 @@ impl VenusClient {
     ) -> Result<(u64, u32), VirtioError> {
         let mut w = Writer::new();
         w.header(CMD_GET_BUFFER_MEMORY_REQUIREMENTS, CMD_FLAG_GENERATE_REPLY);
-        w.u64(self.device_id);
+        w.handle(self.device_id);
         w.handle(buffer_id);
         w.count(true);
         self.ring_command_reply(adapter, w.as_slice()?)?;
 
-        let mut r = ReplyReader::new(&self.reply_map);
+        let mut r = ReplyReader::new(self.reply_map());
         let cmd = r.read_i32()?;
         if cmd as u32 != CMD_GET_BUFFER_MEMORY_REQUIREMENTS || r.read_u64()? == 0 {
             return Err(VirtioError::DeviceError);
@@ -1992,7 +2092,7 @@ impl VenusClient {
         let memory_id = self.new_memory_id();
         let mut w = Writer::new();
         w.header(CMD_ALLOCATE_MEMORY, CMD_FLAG_GENERATE_REPLY);
-        w.u64(self.device_id);
+        w.handle(self.device_id);
         w.count(true);
         w.i32(ST_MEMORY_ALLOCATE_INFO);
         // VkExportMemoryAllocateInfo -> VkMemoryDedicatedAllocateInfo.
@@ -2011,7 +2111,7 @@ impl VenusClient {
         w.handle(memory_id);
         self.ring_command_reply(adapter, w.as_slice()?)?;
 
-        let mut r = ReplyReader::new(&self.reply_map);
+        let mut r = ReplyReader::new(self.reply_map());
         let cmd = r.read_i32()?;
         if cmd as u32 != CMD_ALLOCATE_MEMORY {
             diag(0x0106);
@@ -2033,7 +2133,7 @@ impl VenusClient {
         let memory_id = self.new_memory_id();
         let mut w = Writer::new();
         w.header(CMD_ALLOCATE_MEMORY, CMD_FLAG_GENERATE_REPLY);
-        w.u64(self.device_id);
+        w.handle(self.device_id);
         w.count(true);
         w.i32(ST_MEMORY_ALLOCATE_INFO);
         w.count(true);
@@ -2047,7 +2147,7 @@ impl VenusClient {
         w.handle(memory_id);
         self.ring_command_reply(adapter, w.as_slice()?)?;
 
-        let mut r = ReplyReader::new(&self.reply_map);
+        let mut r = ReplyReader::new(self.reply_map());
         let cmd = r.read_i32()?;
         if cmd as u32 != CMD_ALLOCATE_MEMORY {
             crate::diag::record_named_bytes(b"SdgLMem", 0xE0);
@@ -2077,7 +2177,7 @@ impl VenusClient {
         let memory_id = self.new_memory_id();
         let mut w = Writer::new();
         w.header(CMD_ALLOCATE_MEMORY, CMD_FLAG_GENERATE_REPLY);
-        w.u64(self.device_id);
+        w.handle(self.device_id);
         w.count(true);
         w.i32(ST_MEMORY_ALLOCATE_INFO);
         // VkImportMemoryResourceInfoMESA
@@ -2092,7 +2192,7 @@ impl VenusClient {
         w.handle(memory_id);
         self.ring_command_reply(adapter, w.as_slice()?)?;
 
-        let mut r = ReplyReader::new(&self.reply_map);
+        let mut r = ReplyReader::new(self.reply_map());
         let cmd = r.read_i32()?;
         if cmd as u32 != CMD_ALLOCATE_MEMORY {
             diag(0x0133);
@@ -2115,13 +2215,13 @@ impl VenusClient {
     ) -> Result<(), VirtioError> {
         let mut w = Writer::new();
         w.header(CMD_BIND_IMAGE_MEMORY, CMD_FLAG_GENERATE_REPLY);
-        w.u64(self.device_id);
+        w.handle(self.device_id);
         w.handle(image_id);
         w.handle(memory_id);
         w.u64(0);
         self.ring_command_reply(adapter, w.as_slice()?)?;
 
-        let mut r = ReplyReader::new(&self.reply_map);
+        let mut r = ReplyReader::new(self.reply_map());
         let cmd = r.read_i32()?;
         if cmd as u32 != CMD_BIND_IMAGE_MEMORY {
             diag(0x0108);
@@ -2142,13 +2242,13 @@ impl VenusClient {
     ) -> Result<(), VirtioError> {
         let mut w = Writer::new();
         w.header(CMD_BIND_BUFFER_MEMORY, CMD_FLAG_GENERATE_REPLY);
-        w.u64(self.device_id);
+        w.handle(self.device_id);
         w.handle(buffer_id);
         w.handle(memory_id);
         w.u64(0);
         self.ring_command_reply(adapter, w.as_slice()?)?;
 
-        let mut r = ReplyReader::new(&self.reply_map);
+        let mut r = ReplyReader::new(self.reply_map());
         let cmd = r.read_i32()?;
         if cmd as u32 != CMD_BIND_BUFFER_MEMORY || r.read_i32()? != 0 {
             return Err(VirtioError::DeviceError);
@@ -2164,7 +2264,7 @@ impl VenusClient {
     ) -> Result<(u64, u64), VirtioError> {
         let mut w = Writer::new();
         w.header(CMD_GET_IMAGE_SUBRESOURCE_LAYOUT, CMD_FLAG_GENERATE_REPLY);
-        w.u64(self.device_id);
+        w.handle(self.device_id);
         w.handle(image_id);
         w.count(true);
         w.u32(aspect_mask);
@@ -2173,7 +2273,7 @@ impl VenusClient {
         w.count(true);
         self.ring_command_reply(adapter, w.as_slice()?)?;
 
-        let mut r = ReplyReader::new(&self.reply_map);
+        let mut r = ReplyReader::new(self.reply_map());
         let cmd = r.read_i32()?;
         if cmd as u32 != CMD_GET_IMAGE_SUBRESOURCE_LAYOUT {
             diag(0x010A);
@@ -2191,44 +2291,11 @@ impl VenusClient {
         Ok((offset, row_pitch))
     }
 
-    fn get_device_queue(&mut self, adapter: &AdapterContext) -> Result<(), VirtioError> {
-        let queue_id = self.next_raw().get();
-        let mut w = Writer::new();
-        w.header(CMD_GET_DEVICE_QUEUE_2, CMD_FLAG_GENERATE_REPLY);
-        w.u64(self.device_id);
-        w.count(true); // pQueueInfo
-        w.i32(ST_DEVICE_QUEUE_INFO_2);
-        w.count(true); // pNext: VkDeviceQueueTimelineInfoMESA
-        w.i32(ST_DEVICE_QUEUE_TIMELINE_INFO_MESA);
-        w.count(false);
-        w.u32(1); // ringIdx; 0 is the renderer's CPU timeline.
-        w.u32(0); // flags
-        w.u32(0); // queueFamilyIndex
-        w.u32(0); // queueIndex
-        w.count(true);
-        w.u64(queue_id);
-        self.ring_command_reply(adapter, w.as_slice()?)?;
-
-        let mut r = ReplyReader::new(&self.reply_map);
-        let cmd = r.read_i32()?;
-        if cmd as u32 != CMD_GET_DEVICE_QUEUE_2 {
-            diag(0x0110);
-            return Err(VirtioError::DeviceError);
-        }
-        if r.read_u64()? == 0 {
-            diag(0x0111);
-            return Err(VirtioError::DeviceError);
-        }
-        let returned = r.read_u64()?;
-        self.queue_id = if returned != 0 { returned } else { queue_id };
-        Ok(())
-    }
-
     fn create_command_pool(&mut self, adapter: &AdapterContext) -> Result<VkCommandPoolId, VirtioError> {
         let pool_id = self.new_command_pool_id();
         let mut w = Writer::new();
         w.header(CMD_CREATE_COMMAND_POOL, CMD_FLAG_GENERATE_REPLY);
-        w.u64(self.device_id);
+        w.handle(self.device_id);
         w.count(true);
         w.i32(ST_COMMAND_POOL_CREATE_INFO);
         w.count(false);
@@ -2239,7 +2306,7 @@ impl VenusClient {
         w.handle(pool_id);
         self.ring_command_reply(adapter, w.as_slice()?)?;
 
-        let mut r = ReplyReader::new(&self.reply_map);
+        let mut r = ReplyReader::new(self.reply_map());
         let cmd = r.read_i32()?;
         if cmd as u32 != CMD_CREATE_COMMAND_POOL {
             diag(0x0112);
@@ -2267,7 +2334,7 @@ impl VenusClient {
     ) -> Result<(), VirtioError> {
         let mut w = Writer::new();
         w.header(CMD_DESTROY_COMMAND_POOL, 0);
-        w.u64(self.device_id);
+        w.handle(self.device_id);
         w.handle(pool_id);
         w.count(false);
         self.ring_command_noreply(adapter, w.as_slice()?)
@@ -2281,7 +2348,7 @@ impl VenusClient {
         let command_buffer_id = self.new_command_buffer_id();
         let mut w = Writer::new();
         w.header(CMD_ALLOCATE_COMMAND_BUFFERS, CMD_FLAG_GENERATE_REPLY);
-        w.u64(self.device_id);
+        w.handle(self.device_id);
         w.count(true);
         w.i32(ST_COMMAND_BUFFER_ALLOCATE_INFO);
         w.count(false);
@@ -2292,7 +2359,7 @@ impl VenusClient {
         w.handle(command_buffer_id);
         self.ring_command_reply(adapter, w.as_slice()?)?;
 
-        let mut r = ReplyReader::new(&self.reply_map);
+        let mut r = ReplyReader::new(self.reply_map());
         let cmd = r.read_i32()?;
         if cmd as u32 != CMD_ALLOCATE_COMMAND_BUFFERS {
             diag(0x0115);
@@ -2338,7 +2405,7 @@ impl VenusClient {
         w.count(false);
         self.ring_command_reply(adapter, w.as_slice()?)?;
 
-        let mut r = ReplyReader::new(&self.reply_map);
+        let mut r = ReplyReader::new(self.reply_map());
         let cmd = r.read_i32()?;
         if cmd as u32 != CMD_BEGIN_COMMAND_BUFFER {
             diag(0x0118);
@@ -2604,7 +2671,7 @@ impl VenusClient {
         w.handle(command_buffer_id);
         self.ring_command_reply(adapter, w.as_slice()?)?;
 
-        let mut r = ReplyReader::new(&self.reply_map);
+        let mut r = ReplyReader::new(self.reply_map());
         let cmd = r.read_i32()?;
         if cmd as u32 != CMD_END_COMMAND_BUFFER {
             diag(0x011A);
@@ -2621,7 +2688,7 @@ impl VenusClient {
         let fence_id = self.new_fence_id();
         let mut w = Writer::new();
         w.header(CMD_CREATE_FENCE, CMD_FLAG_GENERATE_REPLY);
-        w.u64(self.device_id);
+        w.handle(self.device_id);
         w.count(true);
         w.i32(ST_FENCE_CREATE_INFO);
         w.count(false);
@@ -2631,7 +2698,7 @@ impl VenusClient {
         w.handle(fence_id);
         self.ring_command_reply(adapter, w.as_slice()?)?;
 
-        let mut r = ReplyReader::new(&self.reply_map);
+        let mut r = ReplyReader::new(self.reply_map());
         let cmd = r.read_i32()?;
         if cmd as u32 != CMD_CREATE_FENCE {
             diag(0x011E);
@@ -2660,7 +2727,7 @@ impl VenusClient {
     ) -> Result<(), VirtioError> {
         let mut w = Writer::new();
         w.header(CMD_WAIT_FOR_FENCES, CMD_FLAG_GENERATE_REPLY);
-        w.u64(self.device_id);
+        w.handle(self.device_id);
         w.u32(1); // fenceCount
         w.u64(1); // pFences array_size
         w.handle(fence_id);
@@ -2668,7 +2735,7 @@ impl VenusClient {
         w.u64(5_000_000_000); // 5 s
         self.ring_command_reply(adapter, w.as_slice()?)?;
 
-        let mut r = ReplyReader::new(&self.reply_map);
+        let mut r = ReplyReader::new(self.reply_map());
         let cmd = r.read_i32()?;
         if cmd as u32 != CMD_WAIT_FOR_FENCES {
             diag(0x0122);
@@ -2689,7 +2756,7 @@ impl VenusClient {
     ) -> Result<(), VirtioError> {
         let mut w = Writer::new();
         w.header(CMD_DESTROY_FENCE, 0);
-        w.u64(self.device_id);
+        w.handle(self.device_id);
         w.handle(fence_id);
         w.count(false); // pAllocator
         self.ring_command_noreply(adapter, w.as_slice()?)
@@ -2704,13 +2771,13 @@ impl VenusClient {
     ) -> Result<(), VirtioError> {
         let mut submit = Writer::new();
         submit.header(CMD_QUEUE_SUBMIT, CMD_FLAG_GENERATE_REPLY);
-        submit.u64(self.queue_id);
+        submit.handle(self.queue_id);
         submit.u32(0); // submitCount
         submit.count(false); // pSubmits
         submit.handle(fence_id);
         self.ring_command_reply(adapter, submit.as_slice()?)?;
 
-        let mut r = ReplyReader::new(&self.reply_map);
+        let mut r = ReplyReader::new(self.reply_map());
         if r.read_i32()? as u32 != CMD_QUEUE_SUBMIT || r.read_i32()? != 0 {
             diag(0x0135);
             return Err(VirtioError::DeviceError);
@@ -2726,7 +2793,7 @@ impl VenusClient {
     ) -> Result<(), VirtioError> {
         let mut submit = Writer::new();
         submit.header(CMD_QUEUE_SUBMIT, CMD_FLAG_GENERATE_REPLY);
-        submit.u64(self.queue_id);
+        submit.handle(self.queue_id);
         submit.u32(1); // submitCount
         submit.u64(1); // pSubmits array_size
         submit.i32(ST_SUBMIT_INFO);
@@ -2744,7 +2811,7 @@ impl VenusClient {
         submit.u64(fence_id.map_or(0, VkFenceId::get)); // fence
         self.ring_command_reply(adapter, submit.as_slice()?)?;
 
-        let mut r = ReplyReader::new(&self.reply_map);
+        let mut r = ReplyReader::new(self.reply_map());
         let cmd = r.read_i32()?;
         if cmd as u32 != CMD_QUEUE_SUBMIT {
             diag(0x011C);
@@ -2765,7 +2832,7 @@ impl VenusClient {
     ) -> Result<(), VirtioError> {
         let mut w = Writer::new();
         w.header(CMD_DESTROY_IMAGE, 0);
-        w.u64(self.device_id);
+        w.handle(self.device_id);
         w.handle(image_id);
         w.count(false);
         self.ring_command_noreply(adapter, w.as_slice()?)
@@ -2778,7 +2845,7 @@ impl VenusClient {
     ) -> Result<(), VirtioError> {
         let mut w = Writer::new();
         w.header(CMD_DESTROY_BUFFER, 0);
-        w.u64(self.device_id);
+        w.handle(self.device_id);
         w.handle(buffer_id);
         w.count(false);
         self.ring_command_noreply(adapter, w.as_slice()?)
@@ -2799,7 +2866,7 @@ impl VenusClient {
         if let Some(memory_id) = memory_id {
             self.free_memory_blob(adapter, memory_id.get())?;
         }
-        ctrl::ctx_detach_resource(adapter, self.ctx_id, resource_id)
+        ctrl::ctx_detach_resource(adapter, self.ctx_id(), resource_id)
     }
 
     fn cleanup_borrowed_present_buffer(
@@ -2822,7 +2889,7 @@ impl VenusClient {
             return Err(VirtioError::DeviceError);
         }
 
-        ctrl::attach_resource_checked(adapter, self.ctx_id, desc.resource_id)?;
+        ctrl::attach_resource_checked(adapter, self.ctx_id(), desc.resource_id)?;
         let image_id = match self.create_optimal_present_image_alias(
             adapter,
             desc.width,
@@ -2833,7 +2900,7 @@ impl VenusClient {
         ) {
             Ok(image_id) => image_id,
             Err(e) => {
-                let _ = ctrl::ctx_detach_resource(adapter, self.ctx_id, desc.resource_id);
+                let _ = ctrl::ctx_detach_resource(adapter, self.ctx_id(), desc.resource_id);
                 return Err(e);
             }
         };
@@ -3739,7 +3806,7 @@ impl VenusClient {
         let target_pixel_format = PresentPixelFormat::Bgra8Unorm;
 
         crate::diag::record_named_bytes(b"CpImpSt", 1);
-        ctrl::attach_resource_checked(adapter, self.ctx_id, source_resource_id)?;
+        ctrl::attach_resource_checked(adapter, self.ctx_id(), source_resource_id)?;
 
         crate::diag::record_named_bytes(b"CpImpSt", 2);
         let source_image_id = match self.create_optimal_present_image_alias(
@@ -3752,7 +3819,7 @@ impl VenusClient {
         ) {
             Ok(id) => id,
             Err(e) => {
-                let _ = ctrl::ctx_detach_resource(adapter, self.ctx_id, source_resource_id);
+                let _ = ctrl::ctx_detach_resource(adapter, self.ctx_id(), source_resource_id);
                 return Err(e);
             }
         };
@@ -4041,7 +4108,7 @@ impl VenusClient {
         // no reply-shmem transaction on this direct, fire-and-forget path.
         let mut submit = Writer::new();
         submit.header(CMD_QUEUE_SUBMIT, 0);
-        submit.u64(self.queue_id);
+        submit.handle(self.queue_id);
         submit.u32(1); // submitCount
         submit.u64(1); // pSubmits array_size
         submit.i32(ST_SUBMIT_INFO);
@@ -4057,7 +4124,7 @@ impl VenusClient {
         submit.u64(0); // fence
         ctrl::submit_venus_async_scanout(
             adapter,
-            self.ctx_id,
+            self.ctx_id(),
             submit.as_slice()?,
             primary_address,
             ticket,
@@ -4067,7 +4134,7 @@ impl VenusClient {
     fn encode_command_buffer_submit(&self, command_buffer_id: VkCommandBufferId) -> Writer {
         let mut submit = Writer::new();
         submit.header(CMD_QUEUE_SUBMIT, 0);
-        submit.u64(self.queue_id);
+        submit.handle(self.queue_id);
         submit.u32(1); // submitCount
         submit.u64(1); // pSubmits array_size
         submit.i32(ST_SUBMIT_INFO);
@@ -4258,7 +4325,7 @@ impl VenusClient {
 
         let command_buffer_id = self.present_blits[blt_index].command_buffer_id;
         let submit = self.encode_command_buffer_submit(command_buffer_id);
-        let fence_id = ctrl::submit_venus_async_present(adapter, self.ctx_id, submit.as_slice()?)?;
+        let fence_id = ctrl::submit_venus_async_present(adapter, self.ctx_id(), submit.as_slice()?)?;
         let run_probe = {
             let blt = &mut self.present_blits[blt_index];
             blt.last_wire_fence_id = fence_id;
@@ -4460,7 +4527,7 @@ impl VenusClient {
             self.destroy_image_on_ring(adapter, image.image_id)?;
             self.free_memory_blob(adapter, image.memory_id.get())?;
             // Each resource occurs exactly once in present_images.
-            ctrl::ctx_detach_resource(adapter, self.ctx_id, image.desc.resource_id)?;
+            ctrl::ctx_detach_resource(adapter, self.ctx_id(), image.desc.resource_id)?;
         }
         while let Some(buffer) = self.present_buffers.pop() {
             self.destroy_buffer_on_ring(adapter, buffer.buffer_id)?;
@@ -4653,7 +4720,7 @@ impl VenusClient {
         crate::diag::record_named_bytes(b"SdgBFl", blob_flags);
         let res_id = ctrl::resource_create_blob(
             adapter,
-            self.ctx_id,
+            self.ctx_id(),
             VIRTIO_GPU_BLOB_MEM_HOST3D,
             blob_flags,
             memory_id.get(),
@@ -4746,7 +4813,7 @@ impl VenusClient {
         let blob_flags = VIRTIO_GPU_BLOB_FLAG_USE_SHAREABLE | VIRTIO_GPU_BLOB_FLAG_USE_CROSS_DEVICE;
         let resource_id = match ctrl::resource_create_blob(
             adapter,
-            self.ctx_id,
+            self.ctx_id(),
             VIRTIO_GPU_BLOB_MEM_HOST3D,
             blob_flags,
             memory_id.get(),
@@ -4836,7 +4903,7 @@ impl VenusClient {
         crate::diag::record_named_bytes(b"SdgLStg", 8);
         let res_id = ctrl::resource_create_blob(
             adapter,
-            self.ctx_id,
+            self.ctx_id(),
             VIRTIO_GPU_BLOB_MEM_HOST3D,
             blob_flags,
             memory_id.get(),
@@ -4869,7 +4936,7 @@ impl VenusClient {
         let image_id = VkImageId::from_raw(image_id).ok_or(VirtioError::DeviceError)?;
         let mut w = Writer::new();
         w.header(CMD_DESTROY_IMAGE, 0);
-        w.u64(self.device_id);
+        w.handle(self.device_id);
         w.handle(image_id);
         w.count(false);
         self.submit_direct(adapter, w.as_slice()?)
@@ -4883,7 +4950,7 @@ impl VenusClient {
     ) -> Result<(), VirtioError> {
         let mut w = Writer::new();
         w.header(CMD_FREE_MEMORY, 0);
-        w.u64(self.device_id);
+        w.handle(self.device_id);
         w.handle(memory_id);
         w.count(false); // pAllocator = NULL
         self.ring_command_noreply(adapter, w.as_slice()?)
@@ -4947,389 +5014,16 @@ pub fn allocate_host_visible_blob(
 ) -> Result<(VenusClient, HostVisibleBlob), VirtioError> {
     diag(0x0001);
 
-    // ── 1. Ring shmem: create blob + map into window + kernel-map + zero ──────
-    let ring_res_id = ctrl::resource_create_blob(
-        adapter,
-        ctx_id,
-        VIRTIO_GPU_BLOB_MEM_HOST3D,
-        VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE,
-        0, // blob_id 0: ring shmem is host-allocated (no venus mem binding)
-        RING_SHMEM_SIZE,
-    )?;
-    // Track the ring blob (owner 0) so the map below can size the mapping.
-    let _ = adapter.with_virtio(|v| v.note_blob_size(ring_res_id, RING_SHMEM_SIZE));
-    let ring_prep = ctrl::map_blob_prepare(adapter, super::gpu::OwnerFilter::Exactly(None), ring_res_id)?;
-    let ring_map = RingMap::new(ring_prep.gpa, ring_prep.size, ring_prep.map_cache)
-        .ok_or(VirtioError::MmioMapFailed)?;
-    ring_map.zero();
-    diag(0x0002);
-
-    // ── 2. Reply shmem: create blob + map + kernel-map + zero ─────────────────
-    let reply_res_id = ctrl::resource_create_blob(
-        adapter,
-        ctx_id,
-        VIRTIO_GPU_BLOB_MEM_HOST3D,
-        VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE,
-        0,
-        REPLY_SHMEM_SIZE,
-    )?;
-    let _ = adapter.with_virtio(|v| v.note_blob_size(reply_res_id, REPLY_SHMEM_SIZE));
-    let reply_prep = ctrl::map_blob_prepare(adapter, super::gpu::OwnerFilter::Exactly(None), reply_res_id)?;
-    let reply_map = KernelMap::new(reply_prep.gpa, reply_prep.size, reply_prep.map_cache)
-        .ok_or(VirtioError::MmioMapFailed)?;
-    reply_map.zero();
-    diag(0x0003);
-
-    let mut client = VenusClient {
-        // A distinctive, unique-enough ring token (any 64-bit value works).
-        ring_id: 0x4845_4C49_4F53_0001, // "HELIOS\0\x01"
-        ring_res_id,
-        reply_res_id,
-        ring_map,
-        reply_map,
-        cur: 0,
-        notify_seqno: 0,
-        roundtrip_seqno: 0,
-        next_handle: NonZeroU64::MIN,
-        ctx_id,
-        instance_id: 0,
-        device_id: 0,
-        queue_id: 0,
-        memory_type_index: 0,
-        memory_type_flags: [0; VK_MAX_MEMORY_TYPES as usize],
-        memory_type_count: 0,
-        fatal: false,
-        copy_target_image_id: None,
-        copy_target_init_pool_id: None,
-        copy_target_init_command_buffer_id: None,
-        present_images: Vec::with_capacity(MAX_PRESENT_IMAGES),
-        present_buffers: Vec::with_capacity(MAX_PRESENT_BUFFERS),
-        present_blits: Vec::with_capacity(MAX_PRESENT_BLITS),
-        probe_pending: None,
-        owned_memory_blobs: Vec::with_capacity(MAX_OWNED_MEMORY_BLOBS),
-    };
-
-    // ── 3. vkCreateRingMESA (direct) — register the ring with the host ────────
-    {
-        let mut w = Writer::new();
-        w.header(CMD_CREATE_RING_MESA, 0);
-        w.u64(client.ring_id);
-        w.count(true); // simple_pointer(pCreateInfo)
-                       // VkRingCreateInfoMESA:
-        w.i32(ST_RING_CREATE_INFO_MESA); // sType
-        w.u64(0); // pNext (encoded as simple_pointer NULL = u64 0)
-        w.u32(0); // flags
-        w.u32(ring_res_id); // resourceId
-        w.u64(0); // offset
-        w.u64(RING_SHMEM_SIZE); // size
-        w.u64(RING_IDLE_TIMEOUT_NS); // idleTimeout
-        w.u64(RING_HEAD_OFFSET); // headOffset
-        w.u64(RING_TAIL_OFFSET); // tailOffset
-        w.u64(RING_STATUS_OFFSET); // statusOffset
-        w.u64(RING_BUFFER_OFFSET); // bufferOffset
-        w.u64(RING_BUFFER_SIZE as u64); // bufferSize
-        w.u64(RING_EXTRA_OFFSET); // extraOffset
-        w.u64(RING_EXTRA_SIZE); // extraSize
-        client.submit_direct(adapter, w.as_slice()?)?;
-    }
-    diag(0x0004);
-
-    // ── 3b. (no warm-up) ──────────────────────────────────────────────────────
-    // The host maps the reply shmem when it processes vkSetReplyCommandStreamMESA
-    // on the ring, so no separate roundtrip is needed. The previous warm-up used a
-    // DIRECT vkWaitVirtqueueSeqnoMESA, which the host rejects ("must be called on
-    // ring dispatch") — removed.
-    diag(0x0005);
-
-    // ── 4. vkCreateInstance (ring, reply) ─────────────────────────────────────
-    let instance_id = client.next_raw().get();
-    client.instance_id = instance_id;
-    {
-        let mut w = Writer::new();
-        w.header(CMD_CREATE_INSTANCE, CMD_FLAG_GENERATE_REPLY);
-        w.count(true); // simple_pointer(pCreateInfo)
-                       // VkInstanceCreateInfo:
-        w.i32(ST_INSTANCE_CREATE_INFO); // sType
-        w.u64(0); // pNext NULL
-        w.u32(0); // flags
-        w.count(false); // simple_pointer(pApplicationInfo) NULL
-        w.u32(0); // enabledLayerCount
-        w.count(false); // ppEnabledLayerNames array_size 0
-        w.u32(0); // enabledExtensionCount
-        w.count(false); // ppEnabledExtensionNames array_size 0
-        w.count(false); // simple_pointer(pAllocator) NULL
-        w.count(true); // simple_pointer(pInstance)
-        w.u64(instance_id); // VkInstance handle
-        client.ring_command_reply(adapter, w.as_slice()?)?;
-    }
-    // Reply: [i32 cmd][i32 VkResult][simple_pointer u64][u64 instance]
-    {
-        let mut r = ReplyReader::new(&client.reply_map);
-        let cmd = r.read_i32()?;
-        if cmd as u32 != CMD_CREATE_INSTANCE {
-            diag(0x00E5);
-            return Err(VirtioError::DeviceError);
-        }
-        let result = r.read_i32()?;
-        if result != 0 {
-            diag(0x00E6);
-            return Err(VirtioError::DeviceError);
-        }
-    }
-    diag(0x0006);
-
-    // ── 5. vkEnumeratePhysicalDevices — count, then array (request 1) ─────────
-    // Count call first (some hosts require it before the array call).
-    {
-        let mut w = Writer::new();
-        w.header(CMD_ENUMERATE_PHYSICAL_DEVICES, CMD_FLAG_GENERATE_REPLY);
-        w.u64(instance_id); // VkInstance
-        w.count(true); // simple_pointer(pPhysicalDeviceCount)
-        w.u32(0); // *pPhysicalDeviceCount = 0
-        w.count(false); // pPhysicalDevices NULL → array_size 0
-        client.ring_command_reply(adapter, w.as_slice()?)?;
-        // We don't strictly need the count value; just validate the reply header.
-        let mut r = ReplyReader::new(&client.reply_map);
-        let cmd = r.read_i32()?;
-        if cmd as u32 != CMD_ENUMERATE_PHYSICAL_DEVICES {
-            diag(0x00E7);
-            return Err(VirtioError::DeviceError);
-        }
-    }
-    // Array call: request up to 1 physical device. Physical-device handles are
-    // GUEST-assigned like all venus handles (the host rejects a 0 placeholder with
-    // "invalid object id 0"), so pre-allocate an id for the slot.
-    let phys_dev_id = client.next_raw().get();
-    {
-        let mut w = Writer::new();
-        w.header(CMD_ENUMERATE_PHYSICAL_DEVICES, CMD_FLAG_GENERATE_REPLY);
-        w.u64(instance_id); // VkInstance
-        w.count(true); // simple_pointer(pPhysicalDeviceCount)
-        w.u32(1); // *pPhysicalDeviceCount = 1
-        w.count(true); // pPhysicalDevices present → array_size 1 follows
-        w.u64(phys_dev_id); // guest-assigned VkPhysicalDevice id for slot 0
-        client.ring_command_reply(adapter, w.as_slice()?)?;
-
-        // Reply: [i32 cmd][i32 VkResult][sp u64][u32 count][array_size u64][u64 id×N]
-        let mut r = ReplyReader::new(&client.reply_map);
-        let cmd = r.read_i32()?;
-        if cmd as u32 != CMD_ENUMERATE_PHYSICAL_DEVICES {
-            diag(0x00E8);
-            return Err(VirtioError::DeviceError);
-        }
-        let result = r.read_i32()?;
-        // VK_INCOMPLETE (5) is acceptable (more devices than we asked for).
-        if result != 0 && result != 5 {
-            diag(0x00E9);
-            return Err(VirtioError::DeviceError);
-        }
-        let sp_count = r.read_u64()?; // simple_pointer(pCount)
-        if sp_count == 0 {
-            diag(0x00EA);
-            return Err(VirtioError::DeviceError);
-        }
-        let count = r.read_u32()?;
-        if count == 0 {
-            diag(0x00EB);
-            return Err(VirtioError::DeviceError);
-        }
-        let arr = r.read_u64()?; // array_size
-        if arr == 0 {
-            diag(0x00EC);
-            return Err(VirtioError::DeviceError);
-        }
-        // Slot 0: the host echoes our guest-assigned id; validate it's present but
-        // keep using our `phys_dev_id` for subsequent commands.
-        let reply_pd = r.read_u64()?;
-        if reply_pd == 0 {
-            diag(0x00ED);
-            return Err(VirtioError::DeviceError);
-        }
-    }
-    diag(0x0007);
-
-    // ── 6. vkGetPhysicalDeviceMemoryProperties — pick a HOST_VISIBLE|COHERENT type ─
-    let memory_type_index;
-    {
-        let mut w = Writer::new();
-        w.header(
-            CMD_GET_PHYSICAL_DEVICE_MEMORY_PROPERTIES,
-            CMD_FLAG_GENERATE_REPLY,
-        );
-        w.u64(phys_dev_id); // VkPhysicalDevice
-        w.count(true); // simple_pointer(pMemoryProperties)
-                       // partial-encoded struct: array_size(32) then array_size(16).
-        w.u64(VK_MAX_MEMORY_TYPES as u64);
-        w.u64(VK_MAX_MEMORY_HEAPS as u64);
-        client.ring_command_reply(adapter, w.as_slice()?)?;
-
-        // Reply (NO VkResult): [i32 cmd][sp u64][u32 typeCount][array u64]
-        //   [ (u32 propertyFlags, u32 heapIndex) × 32 ]
-        //   [u32 heapCount][array u64][ (u64 size, u32 flags) × 16 ]
-        let mut r = ReplyReader::new(&client.reply_map);
-        let cmd = r.read_i32()?;
-        if cmd as u32 != CMD_GET_PHYSICAL_DEVICE_MEMORY_PROPERTIES {
-            diag(0x00EE);
-            return Err(VirtioError::DeviceError);
-        }
-        let sp = r.read_u64()?;
-        if sp == 0 {
-            diag(0x00EF);
-            return Err(VirtioError::DeviceError);
-        }
-        let type_count = r.read_u32()?;
-        let type_arr = r.read_u32()?; // array_size low 32 (always 32; read full u64)
-        let _type_arr_hi = r.read_u32()?;
-        // Validate the encoded array length is the fixed VK_MAX_MEMORY_TYPES.
-        if type_arr != VK_MAX_MEMORY_TYPES || type_count > VK_MAX_MEMORY_TYPES {
-            diag(0x00F0);
-            return Err(VirtioError::DeviceError);
-        }
-        let mut chosen: Option<u32> = None;
-        client.memory_type_count = type_count;
-        for i in 0..VK_MAX_MEMORY_TYPES {
-            let property_flags = r.read_u32()?;
-            let _heap_index = r.read_u32()?;
-            client.memory_type_flags[i as usize] = property_flags;
-            if chosen.is_none()
-                && i < type_count
-                && property_flags & MEMORY_PROPERTY_HOST_VISIBLE != 0
-                && property_flags & MEMORY_PROPERTY_HOST_COHERENT != 0
-            {
-                chosen = Some(i);
-            }
-        }
-        // Heap array is not needed; leave it unread (reply is one-shot).
-        match chosen {
-            Some(idx) => memory_type_index = idx,
-            None => {
-                diag(0x00F1);
-                return Err(VirtioError::DeviceError);
-            }
-        }
-    }
-    client.memory_type_index = memory_type_index;
-    diag(0x0008);
-
-    // ── 7. vkCreateDevice — one queue, family 0, priority 1.0 ─────────────────
-    // Device-extension ladder. The proven scanout/export shape
-    // (/tmp/vk-dmabuf-scanout.c, the CachyOS NVIDIA egl-headless success) needs
-    // only the external-memory + DMA_BUF trio; the DRM-modifier image path
-    // (scanout_diag modes 4-11) additionally wants image_drm_format_modifier +
-    // image_format_list. Previously this was all-or-nothing: if the host
-    // rejected the full 5-ext set, we dropped straight to a ZERO-ext device,
-    // which then silently rejects every DMA_BUF export op (the whole scanout
-    // path dies with no visible reason, since the S-ring is off at DiagLevel 0).
-    // Now we step down full → export-trio → none, so linear scanout (mode 16)
-    // still gets its export exts even when the modifier exts are unavailable.
-    // The tier that stuck (and any knock-down VkResult) is recorded to fixed
-    // registry names so a `reg query` reveals it without the S-ring.
-    const EXT_FULL: [&[u8]; 5] = [
-        b"VK_KHR_external_memory\0",
-        b"VK_KHR_external_memory_fd\0",
-        b"VK_KHR_image_format_list\0",
-        b"VK_EXT_external_memory_dma_buf\0",
-        b"VK_EXT_image_drm_format_modifier\0",
-    ];
-    const EXT_EXPORT: [&[u8]; 3] = [
-        b"VK_KHR_external_memory\0",
-        b"VK_KHR_external_memory_fd\0",
-        b"VK_EXT_external_memory_dma_buf\0",
-    ];
-    let scanout_diag = crate::diag::read_config_dword(b"ScanoutDiag", 0);
-    // Production DisplayHalf needs only the export trio for its dedicated plain
-    // LINEAR DMA_BUF image. The modifier/image-format-list tier remains strictly
-    // diagnostic; never enable it merely because real scanout is active.
-    let want_scanout_exts = client.ctx_id != 0 && (adapter.display_half() || scanout_diag >= 4);
-    // Clear the knock-down VkResult so a clean full-tier success leaves it 0 and
-    // a prior boot's value can't be mistaken for this boot's (names persist).
-    crate::diag::record_named_bytes(b"SdgDevR", 0);
-    // Tier 0 = full, 1 = export-only, 2 = none. Production (scanout off) starts
-    // at 2, exactly the old render-only, no-ext behaviour.
-    let mut ext_tier: u32 = if scanout_diag >= 4 {
-        0
-    } else if want_scanout_exts {
-        1
-    } else {
-        2
-    };
-    loop {
-        let exts: &[&[u8]] = match ext_tier {
-            0 => &EXT_FULL,
-            1 => &EXT_EXPORT,
-            _ => &[],
-        };
-        let device_id = client.next_raw().get();
-        client.device_id = device_id;
-        let mut w = Writer::new();
-        w.header(CMD_CREATE_DEVICE, CMD_FLAG_GENERATE_REPLY);
-        w.u64(phys_dev_id); // VkPhysicalDevice
-        w.count(true); // simple_pointer(pCreateInfo)
-                       // VkDeviceCreateInfo:
-        w.i32(ST_DEVICE_CREATE_INFO); // sType
-        w.u64(0); // pNext NULL
-        w.u32(0); // flags
-        w.u32(1); // queueCreateInfoCount
-        w.count(true); // array_size(1) for pQueueCreateInfos
-                       // VkDeviceQueueCreateInfo[0]:
-        w.i32(ST_DEVICE_QUEUE_CREATE_INFO); // sType
-        w.u64(0); // pNext NULL
-        w.u32(0); // flags
-        w.u32(0); // queueFamilyIndex
-        w.u32(1); // queueCount
-        w.count(true); // array_size(1) for pQueuePriorities
-        w.f32(1.0); // priority
-                    // back to VkDeviceCreateInfo:
-        w.u32(0); // enabledLayerCount
-        w.count(false); // ppEnabledLayerNames array_size 0
-        if exts.is_empty() {
-            w.u32(0); // enabledExtensionCount
-            w.count(false); // ppEnabledExtensionNames array_size 0
-        } else {
-            w.u32(exts.len() as u32);
-            w.u64(exts.len() as u64);
-            for ext in exts {
-                w.u64(ext.len() as u64);
-                w.bytes_padded(ext);
-            }
-        }
-        w.count(false); // simple_pointer(pEnabledFeatures) NULL
-        w.count(false); // simple_pointer(pAllocator) NULL
-        w.count(true); // simple_pointer(pDevice)
-        w.u64(device_id); // VkDevice handle
-        client.ring_command_reply(adapter, w.as_slice()?)?;
-
-        // Reply: [i32 cmd][i32 VkResult][sp u64][u64 device]
-        let mut r = ReplyReader::new(&client.reply_map);
-        let cmd = r.read_i32()?;
-        if cmd as u32 != CMD_CREATE_DEVICE {
-            diag(0x00F2);
-            return Err(VirtioError::DeviceError);
-        }
-        let result = r.read_i32()?;
-        if result == 0 {
-            // Which extension tier the device actually got. mode 16 needs >= 1
-            // (export trio); a value of 2 means NO export exts → scanout can't
-            // work and SdgLImg/SdgLMem will show the rejection downstream.
-            crate::diag::record_named_bytes(b"SdgDevX", ext_tier);
-            break;
-        }
-        // Record the VkResult that knocked this tier down before stepping down.
-        crate::diag::record_named_bytes(b"SdgDevR", result as u32);
-        if ext_tier < 2 {
-            diag(0x00F4);
-            ext_tier += 1;
-            continue;
-        }
-        // If this fails, the host may require a VkDeviceQueueTimelineInfoMESA
-        // pNext on the queue-create — see the handover notes.
-        diag(0x00F3);
-        return Err(VirtioError::DeviceError);
-    }
-    diag(0x0009);
-
-    client.get_device_queue(adapter)?;
-    diag(0x000D);
+    // Stage 1 -> 2 -> 3, each transition consuming the previous value. Every
+    // stage is #[inline(never)]: this runs on DxgkDdiStartDevice's stack, which
+    // is 24 KB shared with dxgkrnl's own frames above us, and 22.22.181.0
+    // proved what an extra kilobyte there costs (0xc0000001 at boot, with no
+    // dump and no bugcheck event, and NO reproduction on a live restart-device).
+    // Keeping each stage's locals in a transient frame is load-bearing, not
+    // style. See tools/kmd-frame-sizes.ps1.
+    let ring = VenusRing::bring_up(adapter, ctx_id)?;
+    let instance = ring.into_instance(adapter)?;
+    let mut client = instance.into_device(adapter)?;
 
     // ── 8. vkAllocateMemory — 16 MiB of the chosen HOST_VISIBLE|COHERENT type ──
     // The memory handle id we pick IS the virtio-gpu blob_id used below.
@@ -5348,4 +5042,492 @@ pub fn allocate_host_visible_blob(
     };
     diag(0x000C);
     Ok((client, blob))
+}
+
+impl VenusRing {
+    /// Bring-up stage 1: create and map the ring and reply shmem blobs, then
+    /// register the ring with the host (`vkCreateRingMESA`).
+    ///
+    /// Breadcrumbs 0x0002 (ring mapped), 0x0003 (reply mapped), 0x0004 (ring
+    /// registered), 0x0005 (no warm-up) — unchanged values, unchanged order.
+    #[inline(never)]
+    fn bring_up(adapter: &AdapterContext, ctx_id: u32) -> Result<Self, VirtioError> {
+        // ── 1. Ring shmem: create blob + map into window + kernel-map + zero ──
+        let ring_res_id = ctrl::resource_create_blob(
+            adapter,
+            ctx_id,
+            VIRTIO_GPU_BLOB_MEM_HOST3D,
+            VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE,
+            0, // blob_id 0: ring shmem is host-allocated (no venus mem binding)
+            RING_SHMEM_SIZE,
+        )?;
+        // Track the ring blob (owner 0) so the map below can size the mapping.
+        let _ = adapter.with_virtio(|v| v.note_blob_size(ring_res_id, RING_SHMEM_SIZE));
+        let ring_prep =
+            ctrl::map_blob_prepare(adapter, super::gpu::OwnerFilter::Exactly(None), ring_res_id)?;
+        let ring_map = RingMap::new(ring_prep.gpa, ring_prep.size, ring_prep.map_cache)
+            .ok_or(VirtioError::MmioMapFailed)?;
+        ring_map.zero();
+        diag(0x0002);
+
+        // ── 2. Reply shmem: create blob + map + kernel-map + zero ─────────────
+        let reply_res_id = ctrl::resource_create_blob(
+            adapter,
+            ctx_id,
+            VIRTIO_GPU_BLOB_MEM_HOST3D,
+            VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE,
+            0,
+            REPLY_SHMEM_SIZE,
+        )?;
+        let _ = adapter.with_virtio(|v| v.note_blob_size(reply_res_id, REPLY_SHMEM_SIZE));
+        let reply_prep =
+            ctrl::map_blob_prepare(adapter, super::gpu::OwnerFilter::Exactly(None), reply_res_id)?;
+        let reply_map = KernelMap::new(reply_prep.gpa, reply_prep.size, reply_prep.map_cache)
+            .ok_or(VirtioError::MmioMapFailed)?;
+        reply_map.zero();
+        diag(0x0003);
+
+        let ring = Self {
+            // A distinctive, unique-enough ring token (any 64-bit value works).
+            ring_id: 0x4845_4C49_4F53_0001, // "HELIOS\0\x01"
+            ring_res_id,
+            reply_res_id,
+            ring_map,
+            reply_map,
+            cur: 0,
+            notify_seqno: 0,
+            roundtrip_seqno: 0,
+            next_handle: NonZeroU64::MIN,
+            ctx_id,
+            fatal: false,
+        };
+
+        // ── 3. vkCreateRingMESA (direct) — register the ring with the host ────
+        {
+            let mut w = Writer::new();
+            w.header(CMD_CREATE_RING_MESA, 0);
+            w.u64(ring.ring_id);
+            w.count(true); // simple_pointer(pCreateInfo)
+                           // VkRingCreateInfoMESA:
+            w.i32(ST_RING_CREATE_INFO_MESA); // sType
+            w.u64(0); // pNext (encoded as simple_pointer NULL = u64 0)
+            w.u32(0); // flags
+            w.u32(ring_res_id); // resourceId
+            w.u64(0); // offset
+            w.u64(RING_SHMEM_SIZE); // size
+            w.u64(RING_IDLE_TIMEOUT_NS); // idleTimeout
+            w.u64(RING_HEAD_OFFSET); // headOffset
+            w.u64(RING_TAIL_OFFSET); // tailOffset
+            w.u64(RING_STATUS_OFFSET); // statusOffset
+            w.u64(RING_BUFFER_OFFSET); // bufferOffset
+            w.u64(RING_BUFFER_SIZE as u64); // bufferSize
+            w.u64(RING_EXTRA_OFFSET); // extraOffset
+            w.u64(RING_EXTRA_SIZE); // extraSize
+            ring.submit_direct(adapter, w.as_slice()?)?;
+        }
+        diag(0x0004);
+
+        // ── 3b. (no warm-up) ──────────────────────────────────────────────────
+        // The host maps the reply shmem when it processes
+        // vkSetReplyCommandStreamMESA on the ring, so no separate roundtrip is
+        // needed. The previous warm-up used a DIRECT vkWaitVirtqueueSeqnoMESA,
+        // which the host rejects ("must be called on ring dispatch") — removed.
+        diag(0x0005);
+        Ok(ring)
+    }
+
+    /// Bring-up stages 4-5: `vkCreateInstance`, then
+    /// `vkEnumeratePhysicalDevices` (count call, then array call).
+    ///
+    /// Consumes the ring, so no caller can keep a handle to the stage that
+    /// cannot encode a `VkInstance`.
+    #[inline(never)]
+    fn into_instance(mut self, adapter: &AdapterContext) -> Result<VenusInstance, VirtioError> {
+        // ── 4. vkCreateInstance (ring, reply) ─────────────────────────────────
+        let instance_id = self.next_raw();
+        {
+            let mut w = Writer::new();
+            w.header(CMD_CREATE_INSTANCE, CMD_FLAG_GENERATE_REPLY);
+            w.count(true); // simple_pointer(pCreateInfo)
+                           // VkInstanceCreateInfo:
+            w.i32(ST_INSTANCE_CREATE_INFO); // sType
+            w.u64(0); // pNext NULL
+            w.u32(0); // flags
+            w.count(false); // simple_pointer(pApplicationInfo) NULL
+            w.u32(0); // enabledLayerCount
+            w.count(false); // ppEnabledLayerNames array_size 0
+            w.u32(0); // enabledExtensionCount
+            w.count(false); // ppEnabledExtensionNames array_size 0
+            w.count(false); // simple_pointer(pAllocator) NULL
+            w.count(true); // simple_pointer(pInstance)
+            w.u64(instance_id.get()); // VkInstance handle
+            self.ring_command_reply(adapter, w.as_slice()?)?;
+        }
+        // Reply: [i32 cmd][i32 VkResult][simple_pointer u64][u64 instance]
+        {
+            let mut r = ReplyReader::new(&self.reply_map);
+            let cmd = r.read_i32()?;
+            if cmd as u32 != CMD_CREATE_INSTANCE {
+                diag(0x00E5);
+                return Err(VirtioError::DeviceError);
+            }
+            let result = r.read_i32()?;
+            if result != 0 {
+                diag(0x00E6);
+                return Err(VirtioError::DeviceError);
+            }
+        }
+        diag(0x0006);
+
+        // ── 5. vkEnumeratePhysicalDevices — count, then array (request 1) ─────
+        // Count call first (some hosts require it before the array call).
+        {
+            let mut w = Writer::new();
+            w.header(CMD_ENUMERATE_PHYSICAL_DEVICES, CMD_FLAG_GENERATE_REPLY);
+            w.u64(instance_id.get()); // VkInstance
+            w.count(true); // simple_pointer(pPhysicalDeviceCount)
+            w.u32(0); // *pPhysicalDeviceCount = 0
+            w.count(false); // pPhysicalDevices NULL → array_size 0
+            self.ring_command_reply(adapter, w.as_slice()?)?;
+            // We don't strictly need the count value; just validate the header.
+            let mut r = ReplyReader::new(&self.reply_map);
+            let cmd = r.read_i32()?;
+            if cmd as u32 != CMD_ENUMERATE_PHYSICAL_DEVICES {
+                diag(0x00E7);
+                return Err(VirtioError::DeviceError);
+            }
+        }
+        // Array call: request up to 1 physical device. Physical-device handles
+        // are GUEST-assigned like all venus handles (the host rejects a 0
+        // placeholder with "invalid object id 0"), so pre-allocate an id.
+        let phys_dev_id = self.next_raw();
+        {
+            let mut w = Writer::new();
+            w.header(CMD_ENUMERATE_PHYSICAL_DEVICES, CMD_FLAG_GENERATE_REPLY);
+            w.u64(instance_id.get()); // VkInstance
+            w.count(true); // simple_pointer(pPhysicalDeviceCount)
+            w.u32(1); // *pPhysicalDeviceCount = 1
+            w.count(true); // pPhysicalDevices present → array_size 1 follows
+            w.u64(phys_dev_id.get()); // guest-assigned VkPhysicalDevice for slot 0
+            self.ring_command_reply(adapter, w.as_slice()?)?;
+
+            // Reply: [i32 cmd][i32 VkResult][sp u64][u32 count][array u64][u64 id×N]
+            let mut r = ReplyReader::new(&self.reply_map);
+            let cmd = r.read_i32()?;
+            if cmd as u32 != CMD_ENUMERATE_PHYSICAL_DEVICES {
+                diag(0x00E8);
+                return Err(VirtioError::DeviceError);
+            }
+            let result = r.read_i32()?;
+            // VK_INCOMPLETE (5) is acceptable (more devices than we asked for).
+            if result != 0 && result != 5 {
+                diag(0x00E9);
+                return Err(VirtioError::DeviceError);
+            }
+            let sp_count = r.read_u64()?; // simple_pointer(pCount)
+            if sp_count == 0 {
+                diag(0x00EA);
+                return Err(VirtioError::DeviceError);
+            }
+            let count = r.read_u32()?;
+            if count == 0 {
+                diag(0x00EB);
+                return Err(VirtioError::DeviceError);
+            }
+            let arr = r.read_u64()?; // array_size
+            if arr == 0 {
+                diag(0x00EC);
+                return Err(VirtioError::DeviceError);
+            }
+            // Slot 0: the host echoes our guest-assigned id; validate it's
+            // present but keep using our `phys_dev_id` for later commands.
+            let reply_pd = r.read_u64()?;
+            if reply_pd == 0 {
+                diag(0x00ED);
+                return Err(VirtioError::DeviceError);
+            }
+        }
+        diag(0x0007);
+        Ok(VenusInstance {
+            ring: self,
+            instance_id,
+            phys_dev_id,
+        })
+    }
+}
+
+impl VenusInstance {
+    /// `vkGetDeviceQueue2` for family 0, queue 0 on ring 1.
+    ///
+    /// Takes the device id as an argument rather than reading a field: at this
+    /// point the device exists but the `VenusClient` that will own it does not,
+    /// which is exactly the window the old two-phase init left writable.
+    fn get_device_queue(
+        &mut self,
+        adapter: &AdapterContext,
+        device_id: VkDeviceId,
+    ) -> Result<VkQueueId, VirtioError> {
+        let queue_id = self.ring.next_raw();
+        let mut w = Writer::new();
+        w.header(CMD_GET_DEVICE_QUEUE_2, CMD_FLAG_GENERATE_REPLY);
+        w.handle(device_id);
+        w.count(true); // pQueueInfo
+        w.i32(ST_DEVICE_QUEUE_INFO_2);
+        w.count(true); // pNext: VkDeviceQueueTimelineInfoMESA
+        w.i32(ST_DEVICE_QUEUE_TIMELINE_INFO_MESA);
+        w.count(false);
+        w.u32(1); // ringIdx; 0 is the renderer's CPU timeline.
+        w.u32(0); // flags
+        w.u32(0); // queueFamilyIndex
+        w.u32(0); // queueIndex
+        w.count(true);
+        w.u64(queue_id.get());
+        self.ring.ring_command_reply(adapter, w.as_slice()?)?;
+
+        let mut r = ReplyReader::new(&self.ring.reply_map);
+        let cmd = r.read_i32()?;
+        if cmd as u32 != CMD_GET_DEVICE_QUEUE_2 {
+            diag(0x0110);
+            return Err(VirtioError::DeviceError);
+        }
+        if r.read_u64()? == 0 {
+            diag(0x0111);
+            return Err(VirtioError::DeviceError);
+        }
+        // The host may substitute its own handle; adopt it when it does.
+        let returned = r.read_u64()?;
+        Ok(VkQueueId::from_raw(returned).unwrap_or(VkQueueId(queue_id)))
+    }
+
+    /// Bring-up stages 6-7 plus the queue: memory properties, the CreateDevice
+    /// extension ladder, and `vkGetDeviceQueue2`.
+    ///
+    /// The ladder computes the device id in a LOCAL and returns it from the
+    /// loop; it can no longer write a half-built client mid-retry. Each attempt
+    /// still mints a FRESH handle — reusing one across tiers would make a retry
+    /// collide with the host's record of the failed device.
+    #[inline(never)]
+    fn into_device(mut self, adapter: &AdapterContext) -> Result<VenusClient, VirtioError> {
+        // ── 6. vkGetPhysicalDeviceMemoryProperties — pick HOST_VISIBLE|COHERENT
+        let mut memory_type_flags = [0u32; VK_MAX_MEMORY_TYPES as usize];
+        let memory_type_count;
+        let memory_type_index;
+        {
+            let mut w = Writer::new();
+            w.header(
+                CMD_GET_PHYSICAL_DEVICE_MEMORY_PROPERTIES,
+                CMD_FLAG_GENERATE_REPLY,
+            );
+            w.u64(self.phys_dev_id.get()); // VkPhysicalDevice
+            w.count(true); // simple_pointer(pMemoryProperties)
+                           // partial-encoded struct: array_size(32) then array_size(16).
+            w.u64(VK_MAX_MEMORY_TYPES as u64);
+            w.u64(VK_MAX_MEMORY_HEAPS as u64);
+            self.ring.ring_command_reply(adapter, w.as_slice()?)?;
+
+            // Reply (NO VkResult): [i32 cmd][sp u64][u32 typeCount][array u64]
+            //   [ (u32 propertyFlags, u32 heapIndex) × 32 ]
+            //   [u32 heapCount][array u64][ (u64 size, u32 flags) × 16 ]
+            let mut r = ReplyReader::new(&self.ring.reply_map);
+            let cmd = r.read_i32()?;
+            if cmd as u32 != CMD_GET_PHYSICAL_DEVICE_MEMORY_PROPERTIES {
+                diag(0x00EE);
+                return Err(VirtioError::DeviceError);
+            }
+            let sp = r.read_u64()?;
+            if sp == 0 {
+                diag(0x00EF);
+                return Err(VirtioError::DeviceError);
+            }
+            let type_count = r.read_u32()?;
+            let type_arr = r.read_u32()?; // array_size low 32 (always 32; read full u64)
+            let _type_arr_hi = r.read_u32()?;
+            // Validate the encoded array length is the fixed VK_MAX_MEMORY_TYPES.
+            if type_arr != VK_MAX_MEMORY_TYPES || type_count > VK_MAX_MEMORY_TYPES {
+                diag(0x00F0);
+                return Err(VirtioError::DeviceError);
+            }
+            let mut chosen: Option<u32> = None;
+            memory_type_count = type_count;
+            for i in 0..VK_MAX_MEMORY_TYPES {
+                let property_flags = r.read_u32()?;
+                let _heap_index = r.read_u32()?;
+                memory_type_flags[i as usize] = property_flags;
+                if chosen.is_none()
+                    && i < type_count
+                    && property_flags & MEMORY_PROPERTY_HOST_VISIBLE != 0
+                    && property_flags & MEMORY_PROPERTY_HOST_COHERENT != 0
+                {
+                    chosen = Some(i);
+                }
+            }
+            // Heap array is not needed; leave it unread (reply is one-shot).
+            match chosen {
+                // The index is < type_count by construction of the loop guard,
+                // which is what MemoryTypeIndex asserts.
+                Some(idx) => memory_type_index = MemoryTypeIndex(idx),
+                None => {
+                    diag(0x00F1);
+                    return Err(VirtioError::DeviceError);
+                }
+            }
+        }
+        diag(0x0008);
+
+        // ── 7. vkCreateDevice — one queue, family 0, priority 1.0 ─────────────
+        let device_id = self.create_device_with_ext_ladder(adapter)?;
+        diag(0x0009);
+
+        let queue_id = self.get_device_queue(adapter, device_id)?;
+        diag(0x000D);
+
+        Ok(VenusClient {
+            ring: self.ring,
+            probe_pending: None,
+            instance_id: self.instance_id,
+            phys_dev_id: self.phys_dev_id,
+            device_id,
+            queue_id,
+            memory_type_index,
+            memory_type_flags,
+            memory_type_count,
+            copy_target_image_id: None,
+            copy_target_init_pool_id: None,
+            copy_target_init_command_buffer_id: None,
+            present_images: Vec::with_capacity(MAX_PRESENT_IMAGES),
+            present_buffers: Vec::with_capacity(MAX_PRESENT_BUFFERS),
+            present_blits: Vec::with_capacity(MAX_PRESENT_BLITS),
+            owned_memory_blobs: Vec::with_capacity(MAX_OWNED_MEMORY_BLOBS),
+        })
+    }
+
+    /// The CreateDevice extension ladder: full → export-trio → none.
+    ///
+    /// The proven scanout/export shape (`/tmp/vk-dmabuf-scanout.c`, the CachyOS
+    /// NVIDIA egl-headless success) needs only the external-memory + DMA_BUF
+    /// trio; the DRM-modifier image path (scanout_diag modes 4-11) additionally
+    /// wants image_drm_format_modifier + image_format_list. This used to be
+    /// all-or-nothing: if the host rejected the full 5-ext set we dropped
+    /// straight to a ZERO-ext device, which then silently rejects every DMA_BUF
+    /// export op — the whole scanout path dies with no visible reason, since the
+    /// S-ring is off at DiagLevel 0. Stepping down keeps linear scanout (mode
+    /// 16) working when only the modifier exts are unavailable.
+    ///
+    /// The tier that stuck (`SdgDevX`) and every knock-down VkResult
+    /// (`SdgDevR`) go to fixed registry names so a `reg query` reveals them
+    /// without the S-ring. Both are owner bring-up ABI: do not collapse the
+    /// per-attempt `SdgDevR` record into a single write.
+    #[inline(never)]
+    fn create_device_with_ext_ladder(
+        &mut self,
+        adapter: &AdapterContext,
+    ) -> Result<VkDeviceId, VirtioError> {
+        const EXT_FULL: [&[u8]; 5] = [
+            b"VK_KHR_external_memory\0",
+            b"VK_KHR_external_memory_fd\0",
+            b"VK_KHR_image_format_list\0",
+            b"VK_EXT_external_memory_dma_buf\0",
+            b"VK_EXT_image_drm_format_modifier\0",
+        ];
+        const EXT_EXPORT: [&[u8]; 3] = [
+            b"VK_KHR_external_memory\0",
+            b"VK_KHR_external_memory_fd\0",
+            b"VK_EXT_external_memory_dma_buf\0",
+        ];
+        let scanout_diag = crate::diag::read_config_dword(b"ScanoutDiag", 0);
+        // Production DisplayHalf needs only the export trio for its dedicated
+        // plain LINEAR DMA_BUF image. The modifier/image-format-list tier
+        // remains strictly diagnostic; never enable it merely because real
+        // scanout is active.
+        let want_scanout_exts =
+            self.ring.ctx_id != 0 && (adapter.display_half() || scanout_diag >= 4);
+        // Clear the knock-down VkResult so a clean full-tier success leaves it 0
+        // and a prior boot's value can't be mistaken for this boot's (names
+        // persist across boots).
+        crate::diag::record_named_bytes(b"SdgDevR", 0);
+        // Tier 0 = full, 1 = export-only, 2 = none. Production (scanout off)
+        // starts at 2, exactly the old render-only, no-ext behaviour.
+        let mut ext_tier: u32 = if scanout_diag >= 4 {
+            0
+        } else if want_scanout_exts {
+            1
+        } else {
+            2
+        };
+        loop {
+            let exts: &[&[u8]] = match ext_tier {
+                0 => &EXT_FULL,
+                1 => &EXT_EXPORT,
+                _ => &[],
+            };
+            // A FRESH handle per attempt. Reusing one across tiers would make a
+            // retry collide with the host's record of the failed device.
+            let device_id = VkDeviceId(self.ring.next_raw());
+            let mut w = Writer::new();
+            w.header(CMD_CREATE_DEVICE, CMD_FLAG_GENERATE_REPLY);
+            w.u64(self.phys_dev_id.get()); // VkPhysicalDevice
+            w.count(true); // simple_pointer(pCreateInfo)
+                           // VkDeviceCreateInfo:
+            w.i32(ST_DEVICE_CREATE_INFO); // sType
+            w.u64(0); // pNext NULL
+            w.u32(0); // flags
+            w.u32(1); // queueCreateInfoCount
+            w.count(true); // array_size(1) for pQueueCreateInfos
+                           // VkDeviceQueueCreateInfo[0]:
+            w.i32(ST_DEVICE_QUEUE_CREATE_INFO); // sType
+            w.u64(0); // pNext NULL
+            w.u32(0); // flags
+            w.u32(0); // queueFamilyIndex
+            w.u32(1); // queueCount
+            w.count(true); // array_size(1) for pQueuePriorities
+            w.f32(1.0); // priority
+                        // back to VkDeviceCreateInfo:
+            w.u32(0); // enabledLayerCount
+            w.count(false); // ppEnabledLayerNames array_size 0
+            if exts.is_empty() {
+                w.u32(0); // enabledExtensionCount
+                w.count(false); // ppEnabledExtensionNames array_size 0
+            } else {
+                w.u32(exts.len() as u32);
+                w.u64(exts.len() as u64);
+                for ext in exts {
+                    w.u64(ext.len() as u64);
+                    w.bytes_padded(ext);
+                }
+            }
+            w.count(false); // simple_pointer(pEnabledFeatures) NULL
+            w.count(false); // simple_pointer(pAllocator) NULL
+            w.count(true); // simple_pointer(pDevice)
+            w.handle(device_id); // VkDevice handle
+            self.ring.ring_command_reply(adapter, w.as_slice()?)?;
+
+            // Reply: [i32 cmd][i32 VkResult][sp u64][u64 device]
+            let mut r = ReplyReader::new(&self.ring.reply_map);
+            let cmd = r.read_i32()?;
+            if cmd as u32 != CMD_CREATE_DEVICE {
+                diag(0x00F2);
+                return Err(VirtioError::DeviceError);
+            }
+            let result = r.read_i32()?;
+            if result == 0 {
+                // Which extension tier the device actually got. mode 16 needs
+                // >= 1 (export trio); a value of 2 means NO export exts →
+                // scanout can't work and SdgLImg/SdgLMem will show the
+                // rejection downstream.
+                crate::diag::record_named_bytes(b"SdgDevX", ext_tier);
+                return Ok(device_id);
+            }
+            // Record the VkResult that knocked this tier down before stepping.
+            crate::diag::record_named_bytes(b"SdgDevR", result as u32);
+            if ext_tier < 2 {
+                diag(0x00F4);
+                ext_tier += 1;
+                continue;
+            }
+            // If this fails, the host may require a VkDeviceQueueTimelineInfoMESA
+            // pNext on the queue-create — see the handover notes.
+            diag(0x00F3);
+            return Err(VirtioError::DeviceError);
+        }
+    }
 }
