@@ -221,10 +221,18 @@ virtio-gpu scanout; IddCx/Looking Glass is no longer the active display path.*
    ⚠ **Observable knob change (R429):** `HELIOS_PRESENT_READBACK`, `HELIOS_PRESENT_FORCE_OPAQUE` and
    `HELIOS_PRESENT_OPTIMIZE_COMPOSITION` are now read ONCE per process; setting them on a live
    process no longer takes effect.
-6. **NEXT — T3** (KMD image + reboot) or **T5** (UMD-only, so it can be interleaved). T5's prereqs
-   T0 + T2 are both landed and it is the cheaper of the two; several T5 items reshape code T2 just
-   touched (`u-forward-a-06`'s probe cache, `u-core-02`'s interface enum, `u-bridge-16`'s
-   present-sync mutex), so the context is warm.
+6. **NEXT — T3** (`REFACTOR_REVIEW.md` §T3): 15 items R501–R515, **KMD image + reboot**.
+   **OWNER DECISION 2026-07-27: T3 goes before T4 and T5.** (T5 was the cheaper next step —
+   UMD-only, prereqs landed, and it reshapes code T2 just touched — but the owner chose the display
+   half first.) T3's three named prerequisites all landed in T1a: `k-display-01`, `k-display-03`
+   (R504's precondition) and `k-display-13` (R513's). It encodes the display/scanout invariants:
+   scanout-lifecycle proof tokens instead of prose-documented locks, one RAII `ProgrammingInterval`
+   replacing nine `vidpn_programming` clear sites, one exit + a reject enum + per-class counters for
+   the deferred programming path, a generation tag so a stale completion cannot clear a newer
+   interval, and `&mut AdapterContext` gone from StartDevice/StopDevice.
+   ⚠ One consequence for T5 sequencing: T5's **R805** renames `protocol/`'s `_pad` and four
+   `kmd_render` read sites, so it is not UMD-only. Doing T3 first means R805 folds naturally into a
+   KMD-deploy window instead of being an awkward exception to T5's "release UMD only" shape.
 7. Implement the remaining reviewed refactors atomically, in tranche order, one recommendation
    per commit; never fold a `BUG` fix into a structure move. Preserve the current direct
    primary, completion ordering, loud-failure contracts, registry ABI, and
