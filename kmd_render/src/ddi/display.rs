@@ -265,10 +265,15 @@ unsafe fn dxgkddi_present_inner(
         // shape too (the flip arm reads src_info, resolved from the allocation
         // list), so it was genuinely per-frame.
         if sample {
+        // Trace-only identity, resolved ONLY here — inside the sampling gate.
+        let src_diag = unsafe { crate::ddi::create_allocation::present_alloc_diag(src_handle) };
+        let dst_diag = unsafe { crate::ddi::create_allocation::present_alloc_diag(dst_handle) };
         crate::diag::record_named_bytes(b"PBsrcH", (src_handle as usize as u32) & 0xFFFF);
         crate::diag::record_named_bytes(b"PBdstH", (dst_handle as usize as u32) & 0xFFFF);
         if let Some(s) = src_info {
-            crate::diag::record_named_bytes(b"PBsRtA", s.runtime_allocation);
+            if let Some(dg) = src_diag {
+                crate::diag::record_named_bytes(b"PBsRtA", dg.runtime_allocation);
+            }
             crate::diag::record_named_bytes(b"PBsrc", s.resource_id);
             crate::diag::record_named_bytes(b"PBsw", s.width);
             crate::diag::record_named_bytes(b"PBsh", s.height);
@@ -280,12 +285,14 @@ unsafe fn dxgkddi_present_inner(
             crate::diag::record_named_bytes(b"PBsKnd", s.kind);
             crate::diag::record_named_bytes(b"PBsMt", s.memory_type_index);
             crate::diag::record_named_bytes(b"PBsSz", s.venus_alloc_size as u32);
-            crate::diag::record_named_bytes(b"PBsStd", s.standard_allocation_type);
-            crate::diag::record_named_bytes(b"PBsGdi", s.standard_gdi_surface_type);
-            crate::diag::record_named_bytes(b"PBsOF", s.open_flags);
-            crate::diag::record_named_bytes(b"PBsRA", u32::from(s.resource_associated));
-            crate::diag::record_named_bytes(b"PBsAPS", s.allocation_private_size);
-            crate::diag::record_named_bytes(b"PBsRPS", s.resource_private_size);
+            if let Some(dg) = src_diag {
+                crate::diag::record_named_bytes(b"PBsStd", dg.standard_allocation_type);
+                crate::diag::record_named_bytes(b"PBsGdi", dg.standard_gdi_surface_type);
+                crate::diag::record_named_bytes(b"PBsOF", dg.open_flags);
+                crate::diag::record_named_bytes(b"PBsRA", u32::from(dg.resource_associated));
+                crate::diag::record_named_bytes(b"PBsAPS", dg.allocation_private_size);
+                crate::diag::record_named_bytes(b"PBsRPS", dg.resource_private_size);
+            }
             let lk = adapter
                 .and_then(|adapter| adapter.with_virtio(|v| v.blob_lookup(s.resource_id)).ok());
             // 0=untracked, else 0x1_0000 | (mapped<<8) | (size in 4KiB pages, low byte)
@@ -300,7 +307,9 @@ unsafe fn dxgkddi_present_inner(
             crate::diag::record_named_bytes(b"PBsrc", 0);
         }
         if let Some(d) = dst_info {
-            crate::diag::record_named_bytes(b"PBdRtA", d.runtime_allocation);
+            if let Some(dg) = dst_diag {
+                crate::diag::record_named_bytes(b"PBdRtA", dg.runtime_allocation);
+            }
             crate::diag::record_named_bytes(b"PBdst", d.resource_id);
             crate::diag::record_named_bytes(b"PBdw", d.width);
             crate::diag::record_named_bytes(b"PBdh", d.height);
@@ -312,12 +321,14 @@ unsafe fn dxgkddi_present_inner(
             crate::diag::record_named_bytes(b"PBdKnd", d.kind);
             crate::diag::record_named_bytes(b"PBdMt", d.memory_type_index);
             crate::diag::record_named_bytes(b"PBdSz", d.venus_alloc_size as u32);
-            crate::diag::record_named_bytes(b"PBdStd", d.standard_allocation_type);
-            crate::diag::record_named_bytes(b"PBdGdi", d.standard_gdi_surface_type);
-            crate::diag::record_named_bytes(b"PBdOF", d.open_flags);
-            crate::diag::record_named_bytes(b"PBdRA", u32::from(d.resource_associated));
-            crate::diag::record_named_bytes(b"PBdAPS", d.allocation_private_size);
-            crate::diag::record_named_bytes(b"PBdRPS", d.resource_private_size);
+            if let Some(dg) = dst_diag {
+                crate::diag::record_named_bytes(b"PBdStd", dg.standard_allocation_type);
+                crate::diag::record_named_bytes(b"PBdGdi", dg.standard_gdi_surface_type);
+                crate::diag::record_named_bytes(b"PBdOF", dg.open_flags);
+                crate::diag::record_named_bytes(b"PBdRA", u32::from(dg.resource_associated));
+                crate::diag::record_named_bytes(b"PBdAPS", dg.allocation_private_size);
+                crate::diag::record_named_bytes(b"PBdRPS", dg.resource_private_size);
+            }
             let lk = adapter
                 .and_then(|adapter| adapter.with_virtio(|v| v.blob_lookup(d.resource_id)).ok());
             let code = match lk {

@@ -180,15 +180,14 @@ struct OpenAllocationContext {
     /// snapshot rather than trying to reinterpret dxgkrnl's runtime token as an
     /// `AllocationContext*`.
     present: Option<PresentAllocInfo>,
+    /// Trace-only companion; never read by a decision path.
+    present_diag: Option<PresentAllocDiag>,
 }
 
 /// Surface identity + geometry for a Present allocation-list entry, resolved from
 /// its `hDeviceSpecificAllocation` ([`present_alloc_info`]).
 #[derive(Clone, Copy)]
 pub struct PresentAllocInfo {
-    /// Per-device runtime allocation token supplied by dxgkrnl in
-    /// `DXGK_OPENALLOCATIONINFO::hAllocation`.
-    pub runtime_allocation: u32,
     pub resource_id: u32,
     /// Versioned allocation kind from the creator/open identity. Present uses
     /// this explicit contract to choose image-vs-buffer interpretation; a
@@ -218,6 +217,25 @@ pub struct PresentAllocInfo {
     /// Exact external allocation contract required by Venus import.
     pub venus_alloc_size: u64,
     pub memory_type_index: u32,
+    /// The allocation was created from the runtime's documented
+    /// `pPrimaryDesc` contract and explicitly exported for direct scanout.
+    pub direct_scanout: bool,
+}
+
+/// TRACE-ONLY companion to [`PresentAllocInfo`], resolved by
+/// [`present_alloc_diag`].
+///
+/// These seven fields have no consumer outside the Present identity dump: they
+/// are read, formatted and written to the registry, and nothing branches on
+/// them. Splitting them out of the acted-upon struct is what makes that
+/// visible — the Present path can no longer accidentally make a decision on a
+/// value that exists only to be logged, and the trace resolves them only inside
+/// its own sampling gate.
+#[derive(Clone, Copy)]
+pub struct PresentAllocDiag {
+    /// Per-device runtime allocation token supplied by dxgkrnl in
+    /// `DXGK_OPENALLOCATIONINFO::hAllocation`.
+    pub runtime_allocation: u32,
     /// Exact `D3DKMDT_STANDARDALLOCATION_TYPE` supplied by Windows, or zero for
     /// a UMD-created allocation.
     pub standard_allocation_type: u32,
@@ -231,9 +249,6 @@ pub struct PresentAllocInfo {
     pub resource_associated: bool,
     pub allocation_private_size: u32,
     pub resource_private_size: u32,
-    /// The allocation was created from the runtime's documented
-    /// `pPrimaryDesc` contract and explicitly exported for direct scanout.
-    pub direct_scanout: bool,
 }
 
 #[repr(u32)]
@@ -282,6 +297,22 @@ pub unsafe fn present_alloc_info(h: HANDLE) -> Option<PresentAllocInfo> {
         return None;
     }
     open.present
+}
+
+/// Trace-only identity for a Present allocation-list entry. Call ONLY from
+/// inside a diag sampling gate — nothing here may influence a Present decision.
+///
+/// # Safety
+/// As [`present_alloc_info`].
+pub unsafe fn present_alloc_diag(h: HANDLE) -> Option<PresentAllocDiag> {
+    if h.is_null() {
+        return None;
+    }
+    let open = unsafe { &*(h as *const OpenAllocationContext) };
+    if open.magic != OPEN_ALLOCATION_CTX_MAGIC {
+        return None;
+    }
+    open.present_diag
 }
 
 /// Snapshot of the [`AllocationContext`] fields `BuildPagingBuffer` needs to
@@ -1718,7 +1749,6 @@ pub unsafe extern "C" fn dxgkddi_open_allocation(
                 PresentAllocationStorage::OptimalOpaqueFdImage
             };
             PresentAllocInfo {
-                runtime_allocation: info.hAllocation,
                 resource_id,
                 kind: identity.kind,
                 width: meta.map(|m| m.width).unwrap_or(0),
@@ -1731,6 +1761,15 @@ pub unsafe extern "C" fn dxgkddi_open_allocation(
                 storage,
                 venus_alloc_size: identity.venus_alloc_size,
                 memory_type_index: identity.memory_type_index,
+                direct_scanout: misc_flags & HELIOS_WDDM_ALLOC_MISC_DIRECT_SCANOUT != 0,
+            }
+        });
+        // Trace-only companion (R316): these seven values have no consumer
+        // outside the Present identity dump.
+        let present_diag = ident.map(|_| {
+            let misc_flags = meta.map(|m| m.misc_flags).unwrap_or(0);
+            PresentAllocDiag {
+                runtime_allocation: info.hAllocation,
                 standard_allocation_type: (misc_flags & HELIOS_WDDM_ALLOC_MISC_STANDARD_TYPE_MASK)
                     >> HELIOS_WDDM_ALLOC_MISC_STANDARD_TYPE_SHIFT,
                 standard_gdi_surface_type: (misc_flags & HELIOS_WDDM_ALLOC_MISC_GDI_TYPE_MASK)
@@ -1739,7 +1778,6 @@ pub unsafe extern "C" fn dxgkddi_open_allocation(
                 resource_associated: misc_flags & HELIOS_WDDM_ALLOC_MISC_RESOURCE_ASSOCIATED != 0,
                 allocation_private_size: info.PrivateDriverDataSize,
                 resource_private_size: args.PrivateDriverSize,
-                direct_scanout: misc_flags & HELIOS_WDDM_ALLOC_MISC_DIRECT_SCANOUT != 0,
             }
         });
         let open = Box::new(OpenAllocationContext {
@@ -1747,6 +1785,7 @@ pub unsafe extern "C" fn dxgkddi_open_allocation(
             runtime_allocation: RuntimeAllocationHandle(info.hAllocation),
             private_size: info.PrivateDriverDataSize,
             present,
+            present_diag,
         });
         record_alloc_event(
             resource_id,
