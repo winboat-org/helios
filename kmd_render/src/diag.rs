@@ -151,6 +151,10 @@ pub enum FaultCounter {
     /// the level-triggered line stays asserted and Windows' interrupt-storm
     /// detector Code-43s the adapter.
     StIsr,
+    /// A Venus LINEAR scan-out copy was requested with no target image — value
+    /// is 0. Previously reported only through the DiagLevel-gated `diag(0x0136)`,
+    /// so a default boot saw nothing but `ScCpy=0xE` / `CpCpy=0xE3`.
+    CpTgtE,
 }
 
 impl FaultCounter {
@@ -169,6 +173,7 @@ impl FaultCounter {
             FaultCounter::StVrp => b"StVrp",
             FaultCounter::StQcs => b"StQcs",
             FaultCounter::StIsr => b"StIsr",
+            FaultCounter::CpTgtE => b"CpTgtE",
         }
     }
 
@@ -185,6 +190,7 @@ impl FaultCounter {
         FaultCounter::StVrp,
         FaultCounter::StQcs,
         FaultCounter::StIsr,
+        FaultCounter::CpTgtE,
     ];
 }
 

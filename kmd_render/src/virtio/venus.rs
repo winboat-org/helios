@@ -2739,12 +2739,46 @@ impl VenusClient {
         if self.copy_target_image_id == target_image_id {
             return Ok(());
         }
-        if target_image_id == 0 || self.copy_target_image_id != 0 {
-            // Production owns one dedicated target for the adapter lifetime.
-            // Silently switching would leak an in-flight pool and make layout
-            // ownership unknowable, so fail loudly instead.
+        if target_image_id == 0 {
+            // No target to prepare against. Route through the ungated fault path:
+            // diag() is DiagLevel-gated, so on a default boot the old refusal was
+            // completely silent and surfaced only as ScCpy=0xE / CpCpy=0xE3.
             diag(0x0136);
+            crate::diag::fault(crate::diag::FaultCounter::CpTgtE, 0);
             return Err(VirtioError::DeviceError);
+        }
+        if self.copy_target_image_id != 0 {
+            // RETARGET, not a refusal. The old code failed here permanently, and
+            // the failure was reachable on any resolution change: on the fallback
+            // copy path production_linear_scanout mints a NEW LINEAR target
+            // whenever the cached extent stops matching, and
+            // submit_primary_scanout_copy explicitly handles a changed target by
+            // destroying the old PreparedImageCopy and preparing a new one. Both
+            // prepare entry points then hit this branch, so every subsequent
+            // SetVidPnSourceAddress returned STATUS_DEVICE_NOT_READY for the life
+            // of the VenusClient. Resize is item 1 of the stability charter.
+            //
+            // Drain first: the same fence sequence destroy_prepared_image_copy
+            // uses, so the host is provably done with the old pool before it is
+            // destroyed. This is a bounded wait on a real fence (5 s inside
+            // wait_fence), not a sleep - keep it.
+            let fence_id = self.create_fence(adapter)?;
+            self.queue_submit_fence_marker(adapter, fence_id)?;
+            self.wait_for_fence(adapter, fence_id)?;
+            self.destroy_fence(adapter, fence_id)?;
+            if self.copy_target_init_pool_id != 0 {
+                self.destroy_command_pool(adapter, self.copy_target_init_pool_id)?;
+            }
+            // NOT the old target image: it is owned by dedicated_scanout_image /
+            // the adapter's cache, never by this client.
+            self.copy_target_image_id = 0;
+            self.copy_target_init_pool_id = 0;
+            // WRITE-ONLY, see T6/k-venus-17: destroying the pool already freed
+            // its command buffer, so this field has no reader. Zeroed here for
+            // consistency rather than given an invented read.
+            self.copy_target_init_command_buffer_id = 0;
+            crate::diag::record_named_bytes(b"CpTgtSw", target_image_id as u32);
+            // Fall through to the normal first-time setup below.
         }
 
         let pool_id = self.create_command_pool(adapter)?;
