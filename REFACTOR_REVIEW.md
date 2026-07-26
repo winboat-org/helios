@@ -7110,6 +7110,34 @@ cargo test green in protocol/ and in the new build.rs-free no_std logic crate on
 
 ### T1a gate
 
+**RESULT: PASSED (2026-07-26).** KMD `22.22.179.0`, oem106 / DriverStore `..._bfa32acaf4e0af4e`,
+boot 19:48:46, `CM_PROB_NONE`.
+
+| Item | Result |
+|---|---|
+| All 15 new fault counters exist and read 0 | `StVio StVnu StHpd StRam StBar StTxG StMdB StNoTx StVrp StQcs StIsr CpTgtE StRing StHpdX StVioR` — all 0. Their *presence* proves R201's `reset_fault_counters` ran this boot, which is what makes "verify movement, not presence" applicable to them |
+| `StRst` / `StRstR` | 0 / 0 — **expected**, and the difference the recommendation predicts: `pnputil /restart-device` re-runs AddDevice with a fresh zeroed context, so there is no carried-over gate to report. A nonzero `StRst` needs a PnP stop/start on the *same* context |
+| `StHpdX` after a restart-device cycle | 0 — the bounded HPD join proved the worker exited, so RemoveDevice freed rather than leaked |
+| Display | `ScanoutDiag` ABSENT, `ScSet=1`, `VpSA` 1→1200, `ScRid` 37→40, `ScPch=7680`, `ScFmt=28`, `DspH=1`, `RfFail=0`, `PgEv=0`, `ChMc=0` |
+| Visible desktop | `helios_paintcap` on this boot, and again after `pnputil /restart-device` |
+| `VsCnt` across restart-device | 671 → 5727 (**+5056**) once presentation was provoked |
+| DComp cadence | 1131 / 1373 / 1260 frames per 25 s = 45.2 / 54.9 / 50.4 fps — matches the T0 release-UMD baseline (49.1 / 52.3) |
+| dwm `present-gate` | n=3072 avg **1896 µs** max **4159 µs** timeouts **20**, against the T0 baseline's n=3072 / 2018 µs / 14595 µs / 30. Same n, same procedure: no regression, and a markedly tighter tail |
+| Unprompted DWM crash | none |
+
+**A `VsCnt` reading trap worth keeping.** Read immediately after the restart it showed delta 0 over
+30 s and looked like a dead heartbeat. It is not: `VsCnt` and `SaCnt` are mirrored to the registry
+**only** from `queue_active_scanout_refresh`'s pacing block (`n == 1 || n % 16 == 0`), so on an idle
+desktop the registry value simply stops being written. Provoke presentation first, then read. The
+same applies to the 5-second sample at the T0 gate. This is the R202 validation note generalised,
+and it is the difference between "the gate caught a wedge" and "the gate misread its own counter".
+
+Not exercised on hardware, and honestly out of scope for a healthy-boot gate: the negative paths of
+R207 (MmMapIoSpace failure), R209/R210 (a failing `DxgkCbSynchronizeExecution`), R211 (a corrupt
+ring token), R213 (a failed `ObReferenceObjectByHandle`) and R215 (a device that never resets).
+Each needs a fault-injecting scratch build, which the recommendations call for individually; the
+evidence here is the unchanged happy path plus review of each new branch.
+
 KMD image + reboot. Same-boot proof that each new counter moves (registry counter values persist across boots - verify movement, not presence): VpCncl increments when the current primary allocation is destroyed while a DIRQL program is pending; StRst increments across a PnP stop/start and reports the pre-reset gate value; StVio/StVnu/StHpd/StRam/StBar exist and stay zero on a healthy boot. VsCnt advances continuously through: DestroyAllocation of the live primary, a stop/start without removal, and a pnputil /restart-device. ScanoutDiag absent with VpSA=1 and ScSet=1; visible desktop after cold boot and after restart-device; idle-to-active wake at or better than the T0 baseline; rapid cursor motion with no trails; DComp cadence near 63 fps; no new control-roundtrip or fence-wait timeout counters; no unprompted DWM crash; same-boot QEMU stderr shows SET_SCANOUT_BLOB against the exact OPTIMAL DWM primary.
 
 ### T1b gate

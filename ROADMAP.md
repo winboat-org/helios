@@ -91,25 +91,39 @@ virtio-gpu scanout; IddCx/Looking Glass is no longer the active display path.*
    already-published version can never produce a verifiable DriverStore image — the
    install script re-signs the package after the build signed it, so devcon's no-op
    publish leaves a hash mismatch and the bind check (correctly) refuses. Bump first.
-3. Implement the remaining reviewed refactors atomically, in tranche order, one recommendation
+3. **T1a DONE + gate PASSED (2026-07-26), KMD `22.22.179.0`.** Sixteen wedge-class KMD fixes
+   (R201–R216), one recommendation per commit. The class they share is a silent stop:
+   the `vidpn_programming` gate latching at 1 (DestroyAllocation cancel, the ScanoutDiag
+   hook, and state carried across StopDevice) which kills the CRTC_VSYNC heartbeat; the
+   `failed` ring latch making the WDDM pending FIFO undrainable into a TDR loop; the
+   one-shot Venus copy-target latch that failed every scanout after a resize; a WDDM
+   fence popped before its notification was attempted; the dangling `MmMapIoSpace`
+   sentinel published as a valid ISR register; an unbounded HPD-worker join whose failure
+   freed a context a live thread still touched. Every one of them was previously invisible
+   at the default `DiagLevel`, which is why R201 (ungated `diag::fault` + `FaultCounter`)
+   landed first. **15 new fault counters, all zero on a healthy boot.**
+   ⚠ **`VsCnt`/`SaCnt` are mirrored to the registry only from `queue_active_scanout_refresh`'s
+   pacing block (`n==1 || n%16==0`)** — on an idle desktop they stop being written and a short
+   sample reads delta 0. Provoke presentation before trusting them.
+4. Implement the remaining reviewed refactors atomically, in tranche order, one recommendation
    per commit; never fold a `BUG` fix into a structure move. Preserve the current direct
    primary, completion ordering, loud-failure contracts, registry ABI, and
    diagnostic names unless a reviewed change explicitly migrates them. Replace
    arbitrary `Sleep`/poll loops with event, interrupt, fence, or
    condition-variable contracts; do not remove bounded safety timeouts merely
    because they wait.
-4. Regression-test each tranche and the final driver against visible desktop
+5. Regression-test each tranche and the final driver against visible desktop
    output, idle wake, rapid cursor motion, DComp cadence, DWM stability,
    same-boot KMD breadcrumbs, and host scanout evidence. Keep
    `ScanoutDiag` absent during primary tests.
-5. Continue soaking the current direct-primary path across DWM buffer rotation,
+6. Continue soaking the current direct-primary path across DWM buffer rotation,
    resize, suspend/resume, device restart, and cold boot.
-6. Pursue true host zero-copy only with a layout contract the display importer
+7. Pursue true host zero-copy only with a layout contract the display importer
    can consume. An explicit DRM modifier is one possible route, but enabling the
    modifier/DMA_BUF extensions on every DXVK device is prohibited: it inflated
    ordinary shared OPTIMAL import requirements and caused valid undersized-import
    refusal, DWM failures, and NVIDIA Xid 31 when bypassed.
-7. Continue D3D11 stability and conformance work after the quality pass.
+8. Continue D3D11 stability and conformance work after the quality pass.
 
 ## Historical PSC workstreams
 
