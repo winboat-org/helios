@@ -48,32 +48,93 @@ use crate::trace_line;
 
 type Hdevice = ddi::D3D10DDI_HDEVICE;
 
-static RESOURCE_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
-static CREATE_RESOURCE_IDENTITY_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
-static VIEW_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
-static WDDM_ALLOC_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
-static D3D11_1_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
-static COPY_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
-static COPY_REGION_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
-static MAP_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
-static SHADER_BIND_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
-static SHADER_SET_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
-static SRV_CREATE_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
-static SRV_BIND_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
-static DRAW_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
-static OM_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
-static UPDATE_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
-static DISPATCH_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
-static HANDLE_MISS_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
-static UAV_BIND_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
-static CLEAR_RTV_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
-static VIEWPORT_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
-static SCISSOR_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
-static RASTER_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
-static IA_BIND_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
-static PRESENT_READBACK_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
-static PRESENT_FORCE_OPAQUE_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
-static PRESENT_CB_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
+/// One rate-limited log site's occurrence counter.
+///
+/// Replaces the hand-rolled `AtomicUsize` + threshold expression that was
+/// re-derived at every reference, in eleven different shapes (`n < 16`, `< 32`,
+/// `< 64`, `< 128`, `< 256`, `< 512`, `< 1024`, `< 2048`, `n % 512 == 0`,
+/// `n % 1024 == 0`, `(n + 1) % 512 == 0`, `(n + 1) % 2048 == 0`).
+///
+/// DEVIATION from the review, and the reason: it asks for the budget to live in
+/// the static, "instantiated per site with the site's current numbers so no
+/// site's cadence changes". That is not implementable — eleven of these statics
+/// are SHARED by sites with different budgets (`SHADER_BIND_LOG_COUNT` is used
+/// with both `< 128` and `< 256`, `MPO_LOG_COUNT` with `< 16`, `< 64` and
+/// `< 128`, `VIEW_LOG_COUNT` with `< 128` and `< 256`, `DRAW_LOG_COUNT` with
+/// `< 2048` and a `% 1024` shape). Giving each site its own counter would change
+/// the cadence of every one of them, which is precisely what must not happen.
+/// So the counter is shared exactly as today and the budget is a call argument.
+struct LogThrottle {
+    count: AtomicUsize,
+}
+
+impl LogThrottle {
+    const fn new() -> Self {
+        Self {
+            count: AtomicUsize::new(0),
+        }
+    }
+
+    /// Bump and return the occurrence ordinal with no rate decision, for sites
+    /// whose gate carries an extra escape clause (`|| alloc != 0`) or a shape
+    /// of its own.
+    fn next(&self) -> usize {
+        self.count.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Read the ordinal WITHOUT bumping it — one site logs a "pre" line under
+    /// the same budget as the "post" line that follows it.
+    fn peek(&self) -> usize {
+        self.count.load(Ordering::Relaxed)
+    }
+
+    /// The first `first` occurrences.
+    fn first_n(&self, first: usize) -> Option<usize> {
+        let n = self.next();
+        (n < first).then_some(n)
+    }
+
+    /// The first `first`, then every `every`-th counting from zero.
+    fn first_n_then_every(&self, first: usize, every: usize) -> Option<usize> {
+        let n = self.next();
+        (n < first || n % every == 0).then_some(n)
+    }
+
+    /// The first `first`, then every `every`-th counting from one. Distinct
+    /// from [`Self::first_n_then_every`]: it fires at n = every-1, 2*every-1,
+    /// not at n = 0, every, 2*every.
+    fn first_n_then_every_from_one(&self, first: usize, every: usize) -> Option<usize> {
+        let n = self.next();
+        (n < first || (n + 1) % every == 0).then_some(n)
+    }
+}
+
+static RESOURCE_LOG_COUNT: LogThrottle = LogThrottle::new();
+static CREATE_RESOURCE_IDENTITY_LOG_COUNT: LogThrottle = LogThrottle::new();
+static VIEW_LOG_COUNT: LogThrottle = LogThrottle::new();
+static WDDM_ALLOC_LOG_COUNT: LogThrottle = LogThrottle::new();
+static D3D11_1_LOG_COUNT: LogThrottle = LogThrottle::new();
+static COPY_LOG_COUNT: LogThrottle = LogThrottle::new();
+static COPY_REGION_LOG_COUNT: LogThrottle = LogThrottle::new();
+static MAP_LOG_COUNT: LogThrottle = LogThrottle::new();
+static SHADER_BIND_LOG_COUNT: LogThrottle = LogThrottle::new();
+static SHADER_SET_LOG_COUNT: LogThrottle = LogThrottle::new();
+static SRV_CREATE_LOG_COUNT: LogThrottle = LogThrottle::new();
+static SRV_BIND_LOG_COUNT: LogThrottle = LogThrottle::new();
+static DRAW_LOG_COUNT: LogThrottle = LogThrottle::new();
+static OM_LOG_COUNT: LogThrottle = LogThrottle::new();
+static UPDATE_LOG_COUNT: LogThrottle = LogThrottle::new();
+static DISPATCH_LOG_COUNT: LogThrottle = LogThrottle::new();
+static HANDLE_MISS_LOG_COUNT: LogThrottle = LogThrottle::new();
+static UAV_BIND_LOG_COUNT: LogThrottle = LogThrottle::new();
+static CLEAR_RTV_LOG_COUNT: LogThrottle = LogThrottle::new();
+static VIEWPORT_LOG_COUNT: LogThrottle = LogThrottle::new();
+static SCISSOR_LOG_COUNT: LogThrottle = LogThrottle::new();
+static RASTER_LOG_COUNT: LogThrottle = LogThrottle::new();
+static IA_BIND_LOG_COUNT: LogThrottle = LogThrottle::new();
+static PRESENT_READBACK_LOG_COUNT: LogThrottle = LogThrottle::new();
+static PRESENT_FORCE_OPAQUE_LOG_COUNT: LogThrottle = LogThrottle::new();
+static PRESENT_CB_LOG_COUNT: LogThrottle = LogThrottle::new();
 
 struct ResourceState {
     com_raw: usize,
@@ -880,8 +941,7 @@ unsafe fn ensure_kmd_scanout_target(h: Hdevice) -> bool {
     if raw == 0 {
         dev.scanout_import
             .replace(KmdScanoutTarget::Unavailable { at_epoch: epoch });
-        let n = SCANOUT_UNAVAILABLE_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-        if n < 16 || n % 512 == 0 {
+        if let Some(n) = SCANOUT_UNAVAILABLE_LOG_COUNT.first_n_then_every(16, 512) {
             log_line(&format!(
                 "DWM KMD scanout import unavailable at epoch {epoch} (x{}) — not re-probing until it moves",
                 n + 1
@@ -913,7 +973,7 @@ unsafe fn ensure_kmd_scanout_target(h: Hdevice) -> bool {
 /// is only readable THROUGH the probe this cache exists to avoid, so the
 /// trigger has to be the UMD's own observation: a direct-scanout primary
 /// appearing or going away is exactly what a mode change produces.
-static SCANOUT_UNAVAILABLE_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
+static SCANOUT_UNAVAILABLE_LOG_COUNT: LogThrottle = LogThrottle::new();
 
 
 /// Remember a full-mode BGRA render target as DWM's current private optimal
@@ -1720,7 +1780,7 @@ unsafe fn allocate_wddm_resource(
     let pre_private_alloc = private.alloc;
     let pre_private_meta = private.meta;
 
-    let pre_n = WDDM_ALLOC_LOG_COUNT.load(Ordering::Relaxed);
+    let pre_n = WDDM_ALLOC_LOG_COUNT.peek();
     if pre_n < 128 {
         log_line(&format!(
             "DDI allocate_wddm_resource pre: blob=0x{:x} res_id={} ctx={} kind={} size={} alloc_size={} mti={} {}x{} fmt={} bind=0x{:x} misc=0x{:x} primary_desc={}",
@@ -1772,7 +1832,7 @@ unsafe fn allocate_wddm_resource(
     let post_private_meta = private.meta;
     let post_open_identity =
         unsafe { read_open_identity(private_ptr, private_size) };
-    let n = WDDM_ALLOC_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+    let n = WDDM_ALLOC_LOG_COUNT.next();
     if n < 128 || hr != 0 {
         log_line(&format!(
             "DDI allocate_wddm_resource: hr=0x{:08x} alloc=0x{:x} km=0x{:x} rt={:p} assoc={:p} info={} rpriv={} size={} pitch={} blob=0x{:x} res_id={} ctx={} kind={} primary={} present={} vidpn={} {}x{} fmt={} bind=0x{:x} misc=0x{:x}",
@@ -1993,8 +2053,7 @@ unsafe fn finish_wddm_tex2d(
             empty_present_private()
         };
     let scanout_raw = res.as_raw() as usize;
-    let n = RESOURCE_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-    if n < 128 {
+    if RESOURCE_LOG_COUNT.first_n(128).is_some() {
         trace_line!(
             "DDI create_resource(tex2d) ok after-stamp-call: {}x{} fmt={} usage={} bind=0x{:x} misc=0x{:x} sample={}x{}",
             mip0.TexelWidth, mip0.TexelHeight, a.Format, a.Usage, a.BindFlags,
@@ -2047,8 +2106,7 @@ unsafe extern "C" fn create_resource(
 
     // Build initial-data array if provided (one entry per subresource).
     let num_sub = (a.MipLevels.max(1) * a.ArraySize.max(1)) as usize;
-    let identity_n = CREATE_RESOURCE_IDENTITY_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-    if identity_n < 512 || (identity_n + 1) % 2048 == 0 {
+    if let Some(identity_n) = CREATE_RESOURCE_IDENTITY_LOG_COUNT.first_n_then_every_from_one(512, 2048) {
         trace_line!(
             "DDI CreateResource identity: #{} hDrv={:p} hRT={:p} hDevice={:p} \
              dim={} fmt={} texel={}x{}x{} physical={}x{}x{} usage={} map=0x{:x} \
@@ -2218,8 +2276,7 @@ unsafe extern "C" fn create_resource(
             finish_create(h, created, res, |res| {
                 stored = true;
                 stamp_dxvk_resource_kmt_handles(h, &res, allocation_handle, km_resource);
-                let n = RESOURCE_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-                if n < 128 {
+                if RESOURCE_LOG_COUNT.first_n(128).is_some() {
                     log_line(&format!(
                         "DDI create_resource(buffer) ok: bytes={} fmt={} usage={} bind=0x{:x} misc=0x{:x}",
                         mip0.TexelWidth, a.Format, a.Usage, bind, misc
@@ -2936,7 +2993,7 @@ unsafe extern "C" fn create_rtv(
         ));
     }
     finish_create(h, created, rtv, |v| {
-        let n = VIEW_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+        let n = VIEW_LOG_COUNT.next();
         let allocation = resource_allocation(a.hDrvResource.pDrvPrivate);
         let (width, height) = resource_dimensions(a.hDrvResource.pDrvPrivate);
         if n < 128 {
@@ -3130,8 +3187,7 @@ unsafe extern "C" fn create_dsv(
         ));
     }
     finish_create(h, created, dsv, |v| {
-        let n = VIEW_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-        if n < 128 {
+        if VIEW_LOG_COUNT.first_n(128).is_some() {
             trace_line!(
                 "DDI create_dsv ok: dim={} fmt={} flags=0x{:x}",
                 a.ResourceDimension, a.Format, a.Flags
@@ -3269,8 +3325,7 @@ unsafe extern "C" fn clear_rtv(
     if !h_rtv.pDrvPrivate.is_null() {
         let state = *(h_rtv.pDrvPrivate as *const *mut RtvState);
         if !state.is_null() {
-            let n = CLEAR_RTV_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-            if n < 64 || (n + 1) % 512 == 0 {
+            if let Some(n) = CLEAR_RTV_LOG_COUNT.first_n_then_every_from_one(64, 512) {
                 log_line(&format!(
                     "DDI ClearRenderTargetView #{} alloc=0x{:x} {}x{} fmt={} rgba=({:.3},{:.3},{:.3},{:.3})",
                     n + 1,
@@ -3319,8 +3374,7 @@ unsafe extern "C" fn resource_copy(
         load_resource(h_dst.pDrvPrivate),
         load_resource(h_src.pDrvPrivate),
     ) else {
-        let n = COPY_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-        if n < 256 {
+        if COPY_LOG_COUNT.first_n(256).is_some() {
             log_line(&format!(
                 "DDI resource_copy missing resource dst_priv={:p} src_priv={:p}",
                 h_dst.pDrvPrivate, h_src.pDrvPrivate
@@ -3330,7 +3384,7 @@ unsafe extern "C" fn resource_copy(
     };
     let dst_alloc = resource_allocation(h_dst.pDrvPrivate);
     let src_alloc = resource_allocation(h_src.pDrvPrivate);
-    let n = COPY_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+    let n = COPY_LOG_COUNT.next();
     if n < 256 || dst_alloc != 0 || src_alloc != 0 {
         trace_line!(
             "DDI resource_copy dst_alloc=0x{:x} src_alloc=0x{:x}",
@@ -3360,7 +3414,7 @@ unsafe extern "C" fn resource_copy_region(
     let src_summary = resource_summary(h_src.pDrvPrivate);
     let (dst_rt, dst_km) = resource_parent_handles(h_dst.pDrvPrivate);
     let (src_rt, src_km) = resource_parent_handles(h_src.pDrvPrivate);
-    let n = COPY_REGION_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+    let n = COPY_REGION_LOG_COUNT.next();
     if n < 1024 || dst.is_none() || src.is_none() {
         trace_line!(
             "DDI ResourceCopyRegion: #{} dstDrv={:p} dstRT={:p} dstKM=0x{:x} \
@@ -3505,7 +3559,7 @@ unsafe extern "C" fn resource_map(
     ) {
         Ok(()) => {
             let allocation = resource_allocation(h_resource.pDrvPrivate);
-            let n = MAP_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+            let n = MAP_LOG_COUNT.next();
             if n < 256 || allocation != 0 {
                 trace_line!(
                     "DDI resource_map ok alloc=0x{:x} sub={} map={} rowPitch={} depthPitch={} pData={:p}",
@@ -3709,8 +3763,7 @@ unsafe extern "C" fn discard_11_1(
     _rects: *const ddi::D3D10_DDI_RECT,
     num_rects: u32,
 ) {
-    let n = D3D11_1_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-    if n < 64 {
+    if D3D11_1_LOG_COUNT.first_n(64).is_some() {
         trace_line!(
             "DDI D3D11.1 Discard: type={handle_type} rects={num_rects}"
         );
@@ -3776,8 +3829,7 @@ unsafe extern "C" fn check_direct_flip_support_11_1(
     if !supported.is_null() {
         *supported = 0;
     }
-    let n = D3D11_1_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-    if n < 64 {
+    if D3D11_1_LOG_COUNT.first_n(64).is_some() {
         log_line(&format!(
             "DDI D3D11.1 CheckDirectFlipSupport: flags=0x{flags:x} -> no"
         ));
@@ -3792,8 +3844,7 @@ unsafe extern "C" fn clear_view_11_1(
     rects: *const ddi::D3D10_DDI_RECT,
     num_rects: u32,
 ) {
-    let n = D3D11_1_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-    if n < 64 {
+    if D3D11_1_LOG_COUNT.first_n(64).is_some() {
         trace_line!(
             "DDI D3D11.1 ClearView: type={view_type} rects={num_rects}"
         );
@@ -3905,8 +3956,7 @@ unsafe extern "C" fn create_vertex_shader(
     };
     let raw = dxvk.create_vertex_shader(bytes.as_ptr(), bytes.len());
     if raw != 0 {
-        let n = SHADER_BIND_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-        if n < 128 {
+        if SHADER_BIND_LOG_COUNT.first_n(128).is_some() {
             log_line(&format!(
                 "DDI create_vertex_shader ok: raw=0x{raw:x} len={len}"
             ));
@@ -3943,8 +3993,7 @@ unsafe extern "C" fn create_pixel_shader(
     };
     let raw = dxvk.create_pixel_shader(bytes.as_ptr(), bytes.len());
     if raw != 0 {
-        let n = SHADER_BIND_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-        if n < 128 {
+        if SHADER_BIND_LOG_COUNT.first_n(128).is_some() {
             log_line(&format!(
                 "DDI create_pixel_shader ok: raw=0x{raw:x} len={len}"
             ));
@@ -4202,8 +4251,7 @@ unsafe fn create_shader_11_1_common(
         sig_words.len(),
     );
     if raw != 0 {
-        let n = SHADER_BIND_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-        if n < 128 {
+        if SHADER_BIND_LOG_COUNT.first_n(128).is_some() {
             log_line(&format!(
                 "DDI {name} ok: raw=0x{raw:x} len={len} sig_in={} sig_out={}",
                 sig_words[0], sig_words[1]
@@ -4601,8 +4649,7 @@ unsafe extern "C" fn vs_set_shader(h: Hdevice, h_shader: ddi::D3D10DDI_HSHADER) 
         ia.current_vs = com;
         ia.bound_vs_com = com;
     }
-    let n = SHADER_SET_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-    if n < 512 {
+    if SHADER_SET_LOG_COUNT.first_n(512).is_some() {
         trace_line!("DDI VSSetShader raw=0x{com:x}");
     }
     let Some(context) = d3d11_context(h) else {
@@ -4619,8 +4666,7 @@ unsafe extern "C" fn ps_set_shader(h: Hdevice, h_shader: ddi::D3D10DDI_HSHADER) 
     if let Some(dev) = helios_device(h) {
         dev.ia.borrow_mut().current_ps = com;
     }
-    let n = SHADER_SET_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-    if n < 512 {
+    if SHADER_SET_LOG_COUNT.first_n(512).is_some() {
         trace_line!("DDI PSSetShader raw=0x{com:x}");
     }
     let Some(context) = d3d11_context(h) else {
@@ -4637,8 +4683,7 @@ unsafe extern "C" fn gs_set_shader(h: Hdevice, h_shader: ddi::D3D10DDI_HSHADER) 
     if let Some(dev) = helios_device(h) {
         dev.ia.borrow_mut().current_gs = com;
     }
-    let n = SHADER_SET_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-    if n < 512 {
+    if SHADER_SET_LOG_COUNT.first_n(512).is_some() {
         trace_line!("DDI GSSetShader raw=0x{com:x}");
     }
     let Some(context) = d3d11_context(h) else {
@@ -4655,8 +4700,7 @@ unsafe extern "C" fn hs_set_shader(h: Hdevice, h_shader: ddi::D3D10DDI_HSHADER) 
     if let Some(dev) = helios_device(h) {
         dev.ia.borrow_mut().current_hs = com;
     }
-    let n = SHADER_SET_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-    if n < 512 {
+    if SHADER_SET_LOG_COUNT.first_n(512).is_some() {
         trace_line!("DDI HSSetShader raw=0x{com:x}");
     }
     let Some(context) = d3d11_context(h) else {
@@ -4673,8 +4717,7 @@ unsafe extern "C" fn ds_set_shader(h: Hdevice, h_shader: ddi::D3D10DDI_HSHADER) 
     if let Some(dev) = helios_device(h) {
         dev.ia.borrow_mut().current_ds = com;
     }
-    let n = SHADER_SET_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-    if n < 512 {
+    if SHADER_SET_LOG_COUNT.first_n(512).is_some() {
         trace_line!("DDI DSSetShader raw=0x{com:x}");
     }
     let Some(context) = d3d11_context(h) else {
@@ -4691,8 +4734,7 @@ unsafe extern "C" fn cs_set_shader(h: Hdevice, h_shader: ddi::D3D10DDI_HSHADER) 
     if let Some(dev) = helios_device(h) {
         dev.ia.borrow_mut().current_cs = com;
     }
-    let n = SHADER_SET_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-    if n < 512 {
+    if SHADER_SET_LOG_COUNT.first_n(512).is_some() {
         trace_line!("DDI CSSetShader raw=0x{com:x}");
     }
     let Some(context) = d3d11_context(h) else {
@@ -4814,7 +4856,7 @@ unsafe extern "C" fn set_render_targets(
         ia.current_rt0_format = rt0.3;
     }
     unsafe { track_dwm_composition_target(h, rt0.4, rt0.0, rt0.1, rt0.2, rt0.3) };
-    let n = OM_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+    let n = OM_LOG_COUNT.next();
     if n < 1024 || rt_missing != 0 || rt0.0 != 0 {
         trace_line!(
             "DDI OMSetRenderTargets num={} rt_nonnull={} rt_missing={} rt0_alloc=0x{:x} rt0={}x{} fmt={} dsv_raw=0x{:x} uav_start={} num_uavs={} uav_range={}:{}",
@@ -4903,7 +4945,7 @@ unsafe extern "C" fn set_viewports(
             MaxDepth: v.MaxDepth,
         });
     }
-    let n = VIEWPORT_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+    let n = VIEWPORT_LOG_COUNT.next();
     if n < 64 || num == 0 {
         if let Some(v) = out.first() {
             trace_line!(
@@ -4941,7 +4983,7 @@ unsafe extern "C" fn set_scissor_rects(
             });
         }
     }
-    let n = SCISSOR_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+    let n = SCISSOR_LOG_COUNT.next();
     if n < 64 || num == 0 {
         if let Some(r) = out.first() {
             trace_line!(
@@ -4966,8 +5008,7 @@ unsafe extern "C" fn ia_set_topology(h: Hdevice, topo: ddi::D3D10_DDI_PRIMITIVE_
     if let Some(dev) = helios_device(h) {
         dev.ia.borrow_mut().current_topology = topo as u32;
     }
-    let n = IA_BIND_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-    if n < 64 {
+    if IA_BIND_LOG_COUNT.first_n(64).is_some() {
         trace_line!("DDI IASetTopology topo={}", topo as u32);
     }
     if let Some(context) = d3d11_context(h) {
@@ -4996,7 +5037,7 @@ unsafe fn log_draw_state(
     if !crate::trace_enabled() {
         return;
     }
-    let n = DRAW_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+    let n = DRAW_LOG_COUNT.next();
     if n >= 1024 && (n % 1024) != 0 {
         return;
     }
@@ -5144,8 +5185,7 @@ unsafe extern "C" fn draw_instanced_indirect(
         ));
         return;
     };
-    let n = DRAW_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-    if n < 2048 {
+    if DRAW_LOG_COUNT.first_n(2048).is_some() {
         trace_line!(
             "DDI DrawInstancedIndirect args: alloc=0x{alloc:x} bytes={width} offset={aligned_byte_offset}"
         );
@@ -5184,8 +5224,7 @@ unsafe extern "C" fn draw_indexed_instanced_indirect(
         ));
         return;
     };
-    let n = DRAW_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-    if n < 2048 {
+    if DRAW_LOG_COUNT.first_n(2048).is_some() {
         trace_line!(
             "DDI DrawIndexedInstancedIndirect args: alloc=0x{alloc:x} bytes={width} offset={aligned_byte_offset}"
         );
@@ -5256,8 +5295,7 @@ unsafe extern "C" fn create_rasterizer_state(
         MultisampleEnable: windows::Win32::Foundation::BOOL(d.MultisampleEnable),
         AntialiasedLineEnable: windows::Win32::Foundation::BOOL(d.AntialiasedLineEnable),
     };
-    let n = RASTER_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-    if n < 64 {
+    if RASTER_LOG_COUNT.first_n(64).is_some() {
         log_line(&format!(
             "DDI CreateRasterizerState fill={} cull={} front_ccw={} depth_clip={} scissor={} msaa={} aaline={} bias={} slope_bias={:.3}",
             d.FillMode,
@@ -5283,8 +5321,7 @@ unsafe extern "C" fn set_rasterizer_state(h: Hdevice, h_rs: ddi::D3D10DDI_HRASTE
     let Some(context) = d3d11_context(h) else {
         return;
     };
-    let n = RASTER_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-    if n < 128 {
+    if RASTER_LOG_COUNT.first_n(128).is_some() {
         trace_line!(
             "DDI RSSetState raw=0x{:x}",
             handle_com_raw(h_rs.pDrvPrivate)
@@ -5396,7 +5433,7 @@ unsafe extern "C" fn create_srv(
     }
     finish_create(h, created, srv, |v| {
         let allocation = resource_allocation(a.hDrvResource.pDrvPrivate);
-        let n = SRV_CREATE_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+        let n = SRV_CREATE_LOG_COUNT.next();
         if n < 1024 || allocation != 0 {
             let (width, height) = resource_dimensions(a.hDrvResource.pDrvPrivate);
             trace_line!(
@@ -5653,8 +5690,7 @@ unsafe extern "C" fn create_uav(
         }
     }
     finish_create(h, created, uav, |v| {
-        let n = VIEW_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-        if n < 256 {
+        if VIEW_LOG_COUNT.first_n(256).is_some() {
             trace_line!(
                 "DDI create_uav ok: dim={} fmt={} alloc=0x{:x}",
                 a.ResourceDimension,
@@ -5826,7 +5862,7 @@ unsafe extern "C" fn cs_set_uavs(
             None => None,
         });
     }
-    let n = UAV_BIND_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+    let n = UAV_BIND_LOG_COUNT.next();
     if n < 1024 || missing != 0 || slice.is_none() {
         trace_line!(
             "DDI CSSetUnorderedAccessViews start={} num={} nonnull={} missing={} uavs_null={} counts_ptr={}",
@@ -6111,8 +6147,7 @@ unsafe fn set_constant_buffers1_common(
     } else {
         Some(num_constants)
     };
-    let n = SHADER_BIND_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-    if n < 256 {
+    if SHADER_BIND_LOG_COUNT.first_n(256).is_some() {
         let first0 = if first_constants.is_null() {
             0
         } else {
@@ -6226,7 +6261,7 @@ unsafe fn set_shader_resources_common(
     };
     let views = collect_srvs(num, srvs);
     let (nonnull, missing, first_raw, first_priv) = srv_bind_summary(num, srvs);
-    let n = SRV_BIND_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+    let n = SRV_BIND_LOG_COUNT.next();
     if n < 2048 || missing != 0 {
         trace_line!(
             "DDI {stage}SetShaderResources start={} num={} nonnull={} missing={} first_raw=0x{:x} first_priv={:p}",
@@ -6357,8 +6392,7 @@ unsafe extern "C" fn resource_update_subresource(
         return;
     };
     let Some(res) = load_resource(h_res.pDrvPrivate) else {
-        let n = HANDLE_MISS_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-        if n < 256 {
+        if HANDLE_MISS_LOG_COUNT.first_n(256).is_some() {
             log_line(&format!(
                 "DDI UpdateSubresource missing resource hpriv={:p} sub={} data={:p}",
                 h_res.pDrvPrivate, subresource, data
@@ -6398,7 +6432,7 @@ unsafe extern "C" fn resource_update_subresource(
     } else {
         None
     };
-    let n = UPDATE_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+    let n = UPDATE_LOG_COUNT.next();
     if n < 1024 || alloc != 0 {
         trace_line!(
             "DDI UpdateSubresource #{} hDrv={:p} hRT={:p} hKM=0x{:x} alloc=0x{:x} \
@@ -6739,11 +6773,10 @@ unsafe extern "C" fn resize_tile_pool(
     let _ = context.ResizeTilePool(&*tile_pool, new_size);
 }
 
-static WDDM13_MARKER_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
+static WDDM13_MARKER_LOG_COUNT: LogThrottle = LogThrottle::new();
 
 unsafe extern "C" fn set_marker(h: Hdevice) {
-    let n = WDDM13_MARKER_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-    if n < 16 || n % 1024 == 0 {
+    if let Some(n) = WDDM13_MARKER_LOG_COUNT.first_n_then_every(16, 1024) {
         log_line(&format!(
             "WDDM1.3 SetMarker h={:p} hit={}",
             h.pDrvPrivate,
@@ -6757,8 +6790,7 @@ unsafe extern "C" fn set_marker_mode(
     marker_type: ddi::D3DWDDM1_3DDI_MARKER_TYPE,
     flags: u32,
 ) {
-    let n = WDDM13_MARKER_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-    if n < 16 || n % 1024 == 0 {
+    if let Some(n) = WDDM13_MARKER_LOG_COUNT.first_n_then_every(16, 1024) {
         log_line(&format!(
             "WDDM1.3 SetMarkerMode h={:p} type={} flags=0x{:x} hit={}",
             h.pDrvPrivate,
@@ -6984,8 +7016,7 @@ unsafe extern "C" fn check_counter(
 // --- Compute ---------------------------------------------------------------
 
 unsafe extern "C" fn dispatch(h: Hdevice, x: u32, y: u32, z: u32) {
-    let n = DISPATCH_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-    if n < 1024 || (n % 1024) == 0 {
+    if DISPATCH_LOG_COUNT.first_n_then_every(1024, 1024).is_some() {
         if let Some(dev) = helios_device(h) {
             let ia = dev.ia.borrow();
             trace_line!(
@@ -7011,8 +7042,7 @@ unsafe extern "C" fn dispatch_indirect(
     h_args: ddi::D3D10DDI_HRESOURCE,
     aligned_byte_offset: u32,
 ) {
-    let n = DISPATCH_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-    if n < 1024 || (n % 1024) == 0 {
+    if DISPATCH_LOG_COUNT.first_n_then_every(1024, 1024).is_some() {
         trace_line!(
             "DDI DispatchIndirect args_alloc=0x{:x} offset={}",
             resource_allocation(h_args.pDrvPrivate),
@@ -8033,8 +8063,7 @@ unsafe fn bind_input_layout(h: Hdevice) {
         (ia.current_layout, ia.current_vs)
     };
     if lp == 0 || vp == 0 {
-        let n = SHADER_BIND_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-        if n < 256 {
+        if SHADER_BIND_LOG_COUNT.first_n(256).is_some() {
             log_line(&format!(
                 "DDI bind_input_layout skipped: layout=0x{:x} vs=0x{:x}",
                 lp, vp
@@ -8243,8 +8272,7 @@ unsafe fn resolve_vs_input_variant(h: Hdevice, lp: usize, vp: usize) {
     let s = ManuallyDrop::new(ID3D11VertexShader::from_raw(desired as *mut c_void));
     context.VSSetShader(&*s, None);
     dev.ia.borrow_mut().bound_vs_com = desired;
-    let n = SHADER_BIND_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-    if n < 256 {
+    if SHADER_BIND_LOG_COUNT.first_n(256).is_some() {
         trace_line!("DDI VS input-class variant bound: vs=0x{vp:x} -> 0x{desired:x}");
     }
 }
@@ -8345,7 +8373,7 @@ unsafe extern "C" fn ia_set_vertex_buffers(
             ia.current_vb0_offset = if offsets.is_null() { 0 } else { *offsets };
         }
     }
-    let n = IA_BIND_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+    let n = IA_BIND_LOG_COUNT.next();
     if n < 128 || num == 0 {
         let first_stride = if num != 0 && !strides.is_null() {
             *strides
@@ -8392,8 +8420,7 @@ unsafe extern "C" fn ia_set_index_buffer(
         ia.current_ib_format = format as u32;
         ia.current_ib_offset = offset;
     }
-    let n = IA_BIND_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-    if n < 128 {
+    if IA_BIND_LOG_COUNT.first_n(128).is_some() {
         trace_line!(
             "DDI IASetIndexBuffer raw=0x{:x} fmt={} offset={}",
             buf.as_ref().map(|b| b.as_raw() as usize).unwrap_or(0),
@@ -8725,7 +8752,7 @@ static PRESENT_SKIP_NO_SRC_ALLOC: AtomicUsize = AtomicUsize::new(0);
 /// Rate cap for the skip log line (declared diagnostic-volume change: a device
 /// that permanently lacks a context used to write one formatted line per
 /// present, at frame rate, through the unconditional writer).
-static PRESENT_SKIP_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
+static PRESENT_SKIP_LOG_COUNT: LogThrottle = LogThrottle::new();
 
 /// Resolve the present-callback preconditions, counting exactly which one
 /// failed. Deliberately no fourth "NoDevice" variant: `helios_device` returns
@@ -8775,7 +8802,7 @@ enum GateOutcome {
 /// counters and the stale-frame symptom got blamed on the KMD marker or the
 /// host.
 static PRESENT_GATE_TIMEOUTS: AtomicUsize = AtomicUsize::new(0);
-static PRESENT_GATE_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
+static PRESENT_GATE_LOG_COUNT: LogThrottle = LogThrottle::new();
 
 /// Run the bounded gate and count every non-confirmation. The present proceeds
 /// either way — a stale frame beats a wedged worker — so the outcome is
@@ -8799,8 +8826,7 @@ unsafe fn run_present_frame_gate(
             ));
         }
     } else {
-        let n = PRESENT_GATE_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-        if n < 16 || n % 512 == 0 {
+        if PRESENT_GATE_LOG_COUNT.first_n_then_every(16, 512).is_some() {
             log_line(&format!(
                 "present frame gate did not confirm completion (x{total}) — presenting anyway"
             ));
@@ -9180,7 +9206,7 @@ unsafe fn maybe_log_present_readback(h: Hdevice, src_h: ddi::D3D10DDI_HRESOURCE)
     if std::env::var_os("HELIOS_PRESENT_READBACK").is_none() {
         return;
     }
-    let n = PRESENT_READBACK_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+    let n = PRESENT_READBACK_LOG_COUNT.next();
     if n >= 8 {
         return;
     }
@@ -9370,7 +9396,7 @@ unsafe fn maybe_force_present_alpha_opaque(h: Hdevice, src_h: ddi::D3D10DDI_HRES
         return;
     }
 
-    let n = PRESENT_FORCE_OPAQUE_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+    let n = PRESENT_FORCE_OPAQUE_LOG_COUNT.next();
     let Some(device) = d3d11_device(h) else {
         if n < 8 {
             log_line("DXGI Present force-opaque: no D3D11 device");
@@ -9939,8 +9965,7 @@ unsafe extern "C" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT) -> i32 {
                 log_line("DXGI Present: nonzero source allocation invariant lost");
                 return E_FAIL;
             };
-            let cb_n = PRESENT_CB_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-            if cb_n < 128 || (cb_n + 1) % 512 == 0 {
+            if let Some(cb_n) = PRESENT_CB_LOG_COUNT.first_n_then_every_from_one(128, 512) {
                 let (src_rt, src_km) = resource_parent_handles(src_h.pDrvPrivate);
                 let (dst_rt, dst_km) = resource_parent_handles(dst_h.pDrvPrivate);
                 trace_line!(
@@ -9971,8 +9996,7 @@ unsafe extern "C" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT) -> i32 {
         } else {
             // Rate cap: same message text and field set, fewer lines. Which of
             // the three preconditions failed now lives in the counters below.
-            let n = PRESENT_SKIP_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-            if n < 64 || (n + 1) % 512 == 0 {
+            if PRESENT_SKIP_LOG_COUNT.first_n_then_every_from_one(64, 512).is_some() {
                 log_line(&format!(
                     "DXGI Present: skip PresentCb callbacks={} src=0x{:x} hContext={:p}",
                     dev.dxgi_callbacks.is_null(),
@@ -10321,8 +10345,7 @@ unsafe extern "C" fn dxgi_rotate_resource_identities(
         return 0;
     }
 
-    let c = ROTATE_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-    if c < 64 {
+    if ROTATE_LOG_COUNT.first_n(64).is_some() {
         let (first_handle, first_resource_id) = match states.first() {
             Some(&first) => (
                 (*first)
@@ -10347,13 +10370,13 @@ unsafe extern "C" fn dxgi_rotate_resource_identities(
     0
 }
 
-static ROTATE_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
-static BLT_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
-static BLT1_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
-static RESIDENCY_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
-static MPO_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
-static PRESENT1_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
-static DXGI13_RESERVED_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
+static ROTATE_LOG_COUNT: LogThrottle = LogThrottle::new();
+static BLT_LOG_COUNT: LogThrottle = LogThrottle::new();
+static BLT1_LOG_COUNT: LogThrottle = LogThrottle::new();
+static RESIDENCY_LOG_COUNT: LogThrottle = LogThrottle::new();
+static MPO_LOG_COUNT: LogThrottle = LogThrottle::new();
+static PRESENT1_LOG_COUNT: LogThrottle = LogThrottle::new();
+static DXGI13_RESERVED_LOG_COUNT: LogThrottle = LogThrottle::new();
 const DXGI_MPO_MAX_PLANES: u32 = 16;
 
 unsafe extern "C" fn dxgi_blt(arg: *mut ddi::DXGI_DDI_ARG_BLT) -> i32 {
@@ -10377,8 +10400,7 @@ unsafe extern "C" fn dxgi_blt(arg: *mut ddi::DXGI_DDI_ARG_BLT) -> i32 {
         return 0;
     };
 
-    let n = BLT_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-    if n < 128 || (n + 1) % 512 == 0 {
+    if let Some(n) = BLT_LOG_COUNT.first_n_then_every_from_one(128, 512) {
         let mut src_desc = D3D11_TEXTURE2D_DESC::default();
         let mut dst_desc = D3D11_TEXTURE2D_DESC::default();
         let src_tex = (*src).cast::<ID3D11Texture2D>().ok();
@@ -10498,8 +10520,7 @@ unsafe extern "C" fn dxgi_blt1(arg: *mut ddi::DXGI_DDI_ARG_BLT1) -> i32 {
         None
     };
 
-    let n = BLT1_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-    if n < 32 {
+    if BLT1_LOG_COUNT.first_n(32).is_some() {
         trace_line!(
             "DXGI Blt1: copy src={}x{} dst={}x{} flags=0x{flags:x}",
             src_w,
@@ -10528,8 +10549,7 @@ unsafe extern "C" fn dxgi_offer_resources(arg: *mut ddi::DXGI_DDI_ARG_OFFERRESOU
         return 0;
     }
     let a = &*arg;
-    let n = RESIDENCY_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-    if n < 32 {
+    if RESIDENCY_LOG_COUNT.first_n(32).is_some() {
         log_line(&format!(
             "DXGI OfferResources: resources={} priority={} (kept resident)",
             a.Resources, a.Priority
@@ -10548,8 +10568,7 @@ unsafe extern "C" fn dxgi_reclaim_resources(arg: *mut ddi::DXGI_DDI_ARG_RECLAIMR
             *a.pDiscarded.add(i) = 0;
         }
     }
-    let n = RESIDENCY_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-    if n < 32 {
+    if RESIDENCY_LOG_COUNT.first_n(32).is_some() {
         log_line(&format!(
             "DXGI ReclaimResources: resources={} discarded=FALSE",
             a.Resources
@@ -10569,8 +10588,7 @@ unsafe extern "C" fn dxgi_get_mpo_caps(
         MaxPlanes: DXGI_MPO_MAX_PLANES,
         NumCapabilityGroups: 1,
     };
-    let n = MPO_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-    if n < 16 {
+    if MPO_LOG_COUNT.first_n(16).is_some() {
         log_line(&format!(
             "DXGI GetMultiplaneOverlayCaps: MaxPlanes={} groups=1",
             DXGI_MPO_MAX_PLANES
@@ -10607,8 +10625,7 @@ unsafe extern "C" fn dxgi_get_mpo_group_caps(
     } else {
         ddi::DXGI_DDI_MULTIPLANE_OVERLAY_GROUP_CAPS::default()
     };
-    let n = MPO_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-    if n < 16 {
+    if MPO_LOG_COUNT.first_n(16).is_some() {
         log_line(&format!(
             "DXGI GetMultiplaneOverlayGroupCaps: group={} planes={} caps=0x{:x}",
             a.GroupIndex,
@@ -10657,8 +10674,7 @@ unsafe extern "C" fn dxgi_present_mpo(arg: *mut ddi::DXGI_DDI_ARG_PRESENTMULTIPL
     for i in 0..a.PresentPlaneCount as usize {
         let plane = &*a.pPresentPlanes.add(i);
         let attrs = &plane.PlaneAttributes;
-        let n = MPO_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-        if n < 128 {
+        if MPO_LOG_COUNT.first_n(128).is_some() {
             trace_line!(
                 "DXGI MPO plane {}: enabled={} hRes=0x{:x} sub={} flags=0x{:x} \
                  src=({},{}-{}, {}) dst=({},{}-{}, {}) clip=({},{}-{}, {}) rot={} blend={} \
@@ -10705,8 +10721,7 @@ unsafe extern "C" fn dxgi_present_mpo(arg: *mut ddi::DXGI_DDI_ARG_PRESENTMULTIPL
         let slot = cb.AllocationInfoCount as usize;
         cb.AllocationInfo[slot].PresentAllocation = alloc;
         cb.AllocationInfo[slot].SubResourceIndex = plane.SubResourceIndex;
-        let n = MPO_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-        if n < 128 {
+        if MPO_LOG_COUNT.first_n(128).is_some() {
             trace_line!(
                 "DXGI MPO plane {} -> allocation=0x{:x} slot={}",
                 i,
@@ -10728,8 +10743,7 @@ unsafe extern "C" fn dxgi_present_mpo(arg: *mut ddi::DXGI_DDI_ARG_PRESENTMULTIPL
     }
 
     let hr = present_cb(dev.h_rt_device, &cb);
-    let n = MPO_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-    if n < 64 {
+    if MPO_LOG_COUNT.first_n(64).is_some() {
         trace_line!(
             "DXGI PresentMultiplaneOverlay: planes={} enabled={} presentCb=0x{:08x} ctx={:p}",
             a.PresentPlaneCount,
@@ -10742,8 +10756,7 @@ unsafe extern "C" fn dxgi_present_mpo(arg: *mut ddi::DXGI_DDI_ARG_PRESENTMULTIPL
 }
 
 unsafe extern "C" fn dxgi_reserved_unsupported(_arg: *mut c_void) -> i32 {
-    let n = DXGI13_RESERVED_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-    if n < 16 {
+    if DXGI13_RESERVED_LOG_COUNT.first_n(16).is_some() {
         log_line("DXGI reserved callback -> DXGI_ERROR_UNSUPPORTED");
     }
     DXGI_ERROR_UNSUPPORTED
@@ -10786,8 +10799,7 @@ unsafe extern "C" fn dxgi_present1(arg: *mut ddi::DXGI_DDI_ARG_PRESENT1) -> i32 
     let dst_h = dxgi_resource_handle(a.hDstResource);
     let src_alloc = resource_allocation(src_h.pDrvPrivate);
     let dst_alloc = resource_allocation(dst_h.pDrvPrivate);
-    let n = PRESENT1_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-    if n < 64 {
+    if PRESENT1_LOG_COUNT.first_n(64).is_some() {
         trace_line!(
             "DXGI Present1 multi: surfaces={} callback_src={} src={:p}/{} alloc=0x{:x} \
              dst={:p}/{} dstAlloc=0x{:x} dirty={} multiplicity={} flags=0x{:x}",
@@ -10883,8 +10895,7 @@ unsafe extern "C" fn dxgi_present1(arg: *mut ddi::DXGI_DDI_ARG_PRESENT1) -> i32 
             log_line("DXGI Present1 multi: nonzero source allocation invariant lost");
             return E_FAIL;
         };
-        let cb_n = PRESENT_CB_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-        if cb_n < 128 || (cb_n + 1) % 512 == 0 {
+        if let Some(cb_n) = PRESENT_CB_LOG_COUNT.first_n_then_every_from_one(128, 512) {
             let (src_rt, src_km) = resource_parent_handles(src_h.pDrvPrivate);
             let (dst_rt, dst_km) = resource_parent_handles(dst_h.pDrvPrivate);
             trace_line!(
@@ -10913,8 +10924,7 @@ unsafe extern "C" fn dxgi_present1(arg: *mut ddi::DXGI_DDI_ARG_PRESENT1) -> i32 
         present_hr = submit_runtime_present_then_call(dev, dependencies, present_private, &mut cb);
     }
 
-    let n = PRESENT1_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-    if n < 64 {
+    if PRESENT1_LOG_COUNT.first_n(64).is_some() {
         trace_line!(
             "DXGI Present1 multi: presentCb=0x{:08x} srcAlloc=0x{:x} dstAlloc=0x{:x} opt_comp={} \
              dxgiCtx={:p} hContext={:p} syncVal={}",
@@ -10939,8 +10949,7 @@ unsafe extern "C" fn dxgi_check_present_duration_support(
     let a = &mut *arg;
     a.ClosestSmallerDuration = 0;
     a.ClosestLargerDuration = 0;
-    let n = PRESENT1_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-    if n < 16 {
+    if PRESENT1_LOG_COUNT.first_n(16).is_some() {
         log_line(&format!(
             "DXGI CheckPresentDurationSupport: desired={} smaller=0 larger=0",
             a.DesiredPresentDuration
