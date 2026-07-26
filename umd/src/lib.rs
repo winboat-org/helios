@@ -705,6 +705,22 @@ unsafe extern "system" fn create_device(
         create.dxgi_base_ddi.p_dxgi_ddi_base_functions,
     ));
 
+    // 0) Validate every runtime-supplied pointer BEFORE constructing anything.
+    //    Both of these checks used to run after construction: the hDrvDevice one
+    //    leaked the whole DXVK/Vulkan device, and the pDeviceFuncs one (which
+    //    ran after the device, the in-place HeliosDevice, the runtime context
+    //    and the paging queue all existed) leaked a kernel context and a paging
+    //    queue per attempt, skipping both destroy_runtime_objects and
+    //    drop_in_place. A crash-looping client exhausted them.
+    if create.h_drv_device.is_null() {
+        log_line("  CreateDevice: null hDrvDevice -> E_FAIL");
+        return E_FAIL;
+    }
+    if create.p_device_funcs.is_null() {
+        log_line("  CreateDevice: null pDeviceFuncs -> E_FAIL");
+        return E_FAIL;
+    }
+
     // 1) Bring up the DXVK device on the Helios venus adapter.
     let dxvk = bridge::ffi::helios_dxvk_create_device(0, 0);
     if dxvk.is_null() {
@@ -714,10 +730,6 @@ unsafe extern "system" fn create_device(
 
     // 2) Construct our device object in the runtime-allocated private memory
     //    (size came from CalcPrivateDeviceSize). hDrvDevice IS that pointer.
-    if create.h_drv_device.is_null() {
-        log_line("  CreateDevice: null hDrvDevice -> E_FAIL");
-        return E_FAIL;
-    }
     unsafe {
         core::ptr::write(
             create.h_drv_device as *mut device_funcs::HeliosDevice,
@@ -755,28 +767,36 @@ unsafe extern "system" fn create_device(
                 flip_wait_next_value: core::cell::Cell::new(0),
             },
         );
-        device_funcs::create_runtime_context(
-            &mut *(create.h_drv_device as *mut device_funcs::HeliosDevice),
-        );
+    }
+
+    // From here on every early return must tear down. The guard does it, so it
+    // is not something each new failure arm has to remember.
+    let guard = DeviceUnderConstruction {
+        dev: create.h_drv_device as *mut device_funcs::HeliosDevice,
+    };
+
+    unsafe {
         let dev = &mut *(create.h_drv_device as *mut device_funcs::HeliosDevice);
+        let context_hr = device_funcs::create_runtime_context(dev);
+        if context_hr != S_OK {
+            log_line(&format!(
+                "  CreateDevice: kernel context creation failed hr=0x{:08x}",
+                context_hr as u32
+            ));
+            return context_hr;
+        }
         let paging_hr = device_funcs::create_runtime_paging_queue(dev);
         if paging_hr != S_OK {
             log_line(&format!(
                 "  CreateDevice: paging queue creation failed hr=0x{:08x}",
                 paging_hr as u32
             ));
-            device_funcs::destroy_runtime_objects(dev);
-            core::ptr::drop_in_place(dev);
             return paging_hr;
         }
     }
 
     // 3) Fill the device-funcs table (Interface == D3D11_0 -> p11DeviceFuncs) and
     //    the DXGI base DDI table the runtime handed us.
-    if create.p_device_funcs.is_null() {
-        log_line("  CreateDevice: null pDeviceFuncs -> E_FAIL");
-        return E_FAIL;
-    }
     unsafe {
         if create.interface >= 0x000b_0022 {
             device_funcs::fill_wddm2_1_device_funcs(
@@ -812,12 +832,53 @@ unsafe extern "system" fn create_device(
         }
     }
 
+    // The device is handed to the runtime from here; it owns teardown through
+    // DestroyDevice.
+    guard.defuse();
+
     if std::env::var_os("HELIOS_DXGI_NO_REDIRECTION").is_some() {
         log_line("  CreateDevice -> DXGI_STATUS_NO_REDIRECTION (env-gated; DXGI desktop fallback)");
         DXGI_STATUS_NO_REDIRECTION
     } else {
         log_line("  CreateDevice -> S_OK (DXVK device + D3D11 funcs table installed)");
         S_OK
+    }
+}
+
+/// Owns the in-place-constructed `HeliosDevice` for the rest of `CreateDevice`.
+/// Any early return after construction tears down through `Drop`; the success
+/// path calls [`Self::defuse`] immediately before returning to the runtime.
+/// The compiler enforces it, rather than each failure arm remembering to —
+/// which is exactly what the two hoisted null checks did not do.
+///
+/// Teardown order matches the paging-queue rollback it replaces:
+/// `destroy_runtime_objects` (kernel context + paging queue, through the
+/// runtime callbacks) first, then `drop_in_place` (the DXVK device and the
+/// Rust-owned fields).
+struct DeviceUnderConstruction {
+    dev: *mut device_funcs::HeliosDevice,
+}
+
+impl DeviceUnderConstruction {
+    fn defuse(mut self) {
+        self.dev = core::ptr::null_mut();
+    }
+}
+
+impl Drop for DeviceUnderConstruction {
+    fn drop(&mut self) {
+        if self.dev.is_null() {
+            return;
+        }
+        // SAFETY: `dev` points at the runtime-owned private block this function
+        // wrote a `HeliosDevice` into with `core::ptr::write`, and it has not
+        // been dropped. The guard is the only owner while it is alive — the
+        // runtime does not see the handle until `defuse()` runs — so no other
+        // reference exists during teardown.
+        unsafe {
+            device_funcs::destroy_runtime_objects(&mut *self.dev);
+            core::ptr::drop_in_place(self.dev);
+        }
     }
 }
 

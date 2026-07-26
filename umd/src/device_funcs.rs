@@ -513,14 +513,20 @@ pub unsafe fn destroy_runtime_objects(dev: &mut HeliosDevice) {
     }
 }
 
-pub unsafe fn create_runtime_context(dev: &mut HeliosDevice) {
+/// Create the kernel context every present path submits through. Returns an
+/// HRESULT: a context-less device is not a usable device — its presents run the
+/// GPU copy and the flush, report S_OK to DXGI and never call `pfnPresentCb`,
+/// so the swapchain token is never minted and DXGI never falls back.
+pub unsafe fn create_runtime_context(dev: &mut HeliosDevice) -> i32 {
+    const E_FAIL: i32 = 0x8000_4005u32 as i32;
+
     if dev.kt_callbacks.is_null() {
         log_line("CreateDevice: no KT callbacks for CreateContext");
-        return;
+        return E_FAIL;
     }
     let Some(create_context_cb) = (*dev.kt_callbacks).pfnCreateContextCb else {
         log_line("CreateDevice: pfnCreateContextCb missing");
-        return;
+        return E_FAIL;
     };
 
     let mut arg = ddi::D3DDDICB_CREATECONTEXT::default();
@@ -538,15 +544,17 @@ pub unsafe fn create_runtime_context(dev: &mut HeliosDevice) {
         arg.pPatchLocationList,
         arg.PatchLocationListSize
     ));
-    if hr == 0 {
-        dev.h_context = arg.hContext;
-        dev.command_buffer.set(arg.pCommandBuffer);
-        dev.command_buffer_size.set(arg.CommandBufferSize);
-        dev.allocation_list.set(arg.pAllocationList);
-        dev.allocation_list_size.set(arg.AllocationListSize);
-        dev.patch_list.set(arg.pPatchLocationList);
-        dev.patch_list_size.set(arg.PatchLocationListSize);
+    if hr != 0 {
+        return hr;
     }
+    dev.h_context = arg.hContext;
+    dev.command_buffer.set(arg.pCommandBuffer);
+    dev.command_buffer_size.set(arg.CommandBufferSize);
+    dev.allocation_list.set(arg.pAllocationList);
+    dev.allocation_list_size.set(arg.AllocationListSize);
+    dev.patch_list.set(arg.pPatchLocationList);
+    dev.patch_list_size.set(arg.PatchLocationListSize);
+    0
 }
 
 /// Create the monitored-fence paging queue required by WDDM 2.x
