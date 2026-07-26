@@ -2,7 +2,6 @@
 //!
 //! Reference: https://learn.microsoft.com/windows-hardware/drivers/ddi/dispmprt/nc-dispmprt-dxgkddi_add_device
 
-use alloc::boxed::Box;
 use core::ffi::c_void;
 
 use crate::adapter::AdapterContext;
@@ -23,20 +22,15 @@ pub unsafe extern "C" fn dxgkddi_add_device(
     // leave a deterministic NULL out-pointer on every failure path after this.
     unsafe { *miniport_device_context = core::ptr::null_mut() };
 
-    let ctx = match AdapterContext::new(physical_device_object) {
-        Ok(c) => c,
-        Err(e) => return e.into_ntstatus(),
-    };
-
-    // Leak the context to a raw pointer; Dxgkrnl returns it to us on every DDI
-    // and we reclaim it in DxgkDdiRemoveDevice.
-    let raw = Box::into_raw(Box::new(ctx));
-    // Kernel dispatcher objects (the venus PASSIVE mutex) must be initialized
-    // at the context's FINAL address — a KEVENT's header is self-referential.
-    // SAFETY: `raw` is the final heap address; no other thread sees it yet.
-    unsafe { (*raw).init_kernel_events() };
+    // One call: allocate at the final heap address AND initialize the embedded
+    // kernel dispatcher objects there. `create` never hands back an
+    // `AdapterContext` by value, so a caller cannot skip the in-place init and
+    // cannot move the context afterwards. The context is leaked to a raw
+    // pointer; Dxgkrnl returns it to us on every DDI and we reclaim it in
+    // DxgkDdiRemoveDevice.
+    let raw = AdapterContext::create(physical_device_object);
     // SAFETY: miniport_device_context is a valid out-pointer per the DDI contract.
-    unsafe { *miniport_device_context = raw as *mut c_void };
+    unsafe { *miniport_device_context = raw.as_ptr() as *mut c_void };
 
     crate::diag::record(0x0A00_0002);
     STATUS_SUCCESS

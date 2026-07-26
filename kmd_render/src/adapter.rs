@@ -4,6 +4,7 @@
 //! `DxgkDdiRemoveDevice`. Dxgkrnl hands this back to us as the opaque
 //! `MiniportDeviceContext` in every subsequent DDI call.
 
+use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
@@ -843,8 +844,54 @@ pub(crate) enum ScanoutRefreshQueue {
 }
 
 impl AdapterContext {
-    pub fn new(pdo: PDEVICE_OBJECT) -> Result<Self, DriverError> {
-        Ok(Self {
+    /// Allocate a fully initialised adapter context and return only a pointer to
+    /// it.
+    ///
+    /// This is the ONLY way to obtain an `AdapterContext`, and it deliberately
+    /// never returns `Self`. `new` builds five self-referential kernel
+    /// dispatcher objects as zeroed placeholders (`scanout_mutex`,
+    /// `venus_mutex`, `vsync_timer`, `vsync_dpc`, `hpd_event`), so the real
+    /// headers can only be written once the context is at its final heap
+    /// address. As two public steps, this compiled:
+    ///
+    ///   let ctx = AdapterContext::new(pdo)?;
+    ///   let boxed = Box::new(ctx);
+    ///   /* no init_kernel_events */
+    ///   *out = Box::into_raw(boxed);
+    ///
+    /// and produced an adapter whose first `with_venus_client` would
+    /// `KeWaitForSingleObject` on an uninitialised KEVENT — typically an
+    /// unrecoverable hang, with no diagnostic. Equally,
+    /// `let moved = *Box::from_raw(raw);` after init moved initialised,
+    /// self-referential dispatcher objects.
+    ///
+    /// Folding the two phases into one private constructor makes the skip
+    /// unrepresentable for safe callers, and returning only `NonNull` — never
+    /// `Self` — is what makes the no-move invariant hold: a caller who never
+    /// obtains the value cannot move it. `PhantomPinned` is deliberately NOT
+    /// used as the guarantee; `!Unpin` affects only the `Pin` APIs and would not
+    /// stop `Box::new(ctx)` or `*Box::from_raw(raw)` from compiling.
+    ///
+    /// Infallible on purpose. `new` was `Result` but had no fallible operation,
+    /// so its `Err` arm was dead code; `Box::new` is not fallible today, and an
+    /// `Option` here would imply an allocation-failure path that does not exist.
+    /// If one is wanted later that is a `Box::try_new` change, not a signature
+    /// change now.
+    pub(crate) fn create(pdo: PDEVICE_OBJECT) -> NonNull<AdapterContext> {
+        let raw = Box::into_raw(Box::new(Self::new(pdo)));
+        // Kernel dispatcher objects must be initialized at the context's FINAL
+        // address — a KEVENT's header is self-referential.
+        // SAFETY: `raw` is the final heap address, freshly allocated, and no
+        // other thread can see it yet.
+        unsafe { (*raw).init_kernel_events() };
+        // SAFETY: `Box::into_raw` never returns null.
+        unsafe { NonNull::new_unchecked(raw) }
+    }
+
+    /// Private: an `AdapterContext` by value is only ever a transient inside
+    /// [`Self::create`], before the in-place dispatcher init runs.
+    fn new(pdo: PDEVICE_OBJECT) -> Self {
+        Self {
             pdo,
             started: UnsafeCell::new(None),
             started_published: AtomicU32::new(0),
@@ -905,7 +952,7 @@ impl AdapterContext {
             hpd_stop: AtomicU32::new(0),
             hpd_worker_leaked: AtomicU32::new(0),
             config_change_pending: AtomicU32::new(0),
-        })
+        }
     }
 
     /// Start the HPD worker thread (StartDevice, display half). PASSIVE_LEVEL.
