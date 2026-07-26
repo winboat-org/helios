@@ -137,6 +137,8 @@ struct AllocationContext {
     /// This allocation was reported to VidMm as BAR-segment-only (KMD-backed
     /// standard allocation with a mappable venus blob, BAR segment active).
     bar_eligible: bool,
+    /// Provenance of `size`. See [`BackingSize`].
+    size_provenance: BackingSize,
 }
 
 /// Per-resource KMD state. Dxgkrnl requires a non-null KMD resource handle for
@@ -331,6 +333,10 @@ pub unsafe fn present_alloc_diag(h: HANDLE) -> Option<PresentAllocDiag> {
 pub(crate) struct PagingAllocInfo {
     pub resource_id: u32,
     pub size: u64,
+    /// Where `size` came from. Carried so the aperture path can eventually
+    /// require [`BackingSize::HostAuthoritative`] in its signature rather than
+    /// inferring it; today it only feeds the `ChSzMm` cross-check.
+    pub size_provenance: BackingSize,
     pub bar_eligible: bool,
     /// Current placement ([`BAR_UNPLACED`] if none).
     pub bar_placed: u64,
@@ -434,6 +440,7 @@ pub(crate) unsafe fn paging_alloc_info(h: HANDLE) -> Option<PagingAllocInfo> {
     Some(PagingAllocInfo {
         resource_id: ctx.resource_id,
         size: ctx.size as u64,
+        size_provenance: ctx.size_provenance,
         bar_eligible: ctx.bar_eligible,
         bar_placed: ctx.bar_placed.load(Ordering::Acquire),
     })
@@ -1231,6 +1238,41 @@ unsafe fn destroy_allocation_ctx(adapter: &AdapterContext, ctx: Box<AllocationCo
     drop(ctx);
 }
 
+/// Where an allocation's backing size came from.
+///
+/// `PagingAllocInfo::size` is `round_up_page(ap.size)`, and `ap.size` is
+/// ICD-supplied for ADOPTED allocations — it is overwritten with a
+/// host-authoritative value only in the KMD-created arms. `MapCpuHostAperture`'s
+/// whole-allocation refusal computes its page count from that size while
+/// `map_blob_at` maps whatever length the TRACKED BLOB size implies, a
+/// different source. The refusal therefore compares dxgkrnl's page count
+/// against a number of different provenance.
+///
+/// That cannot bite today only because `bar_eligible` required
+/// `venus_memory_id != 0`, which only the KMD-created arms set — i.e. the safety
+/// of an aperture size check rested on an incidental property of an unrelated
+/// field. Making the provenance a value lets the aperture path eventually
+/// REQUIRE `HostAuthoritative` in its signature.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BackingSize {
+    /// The host allocated it and reported the size back.
+    HostAuthoritative(u64),
+    /// The creator claimed it; nothing has checked it against the host.
+    CreatorClaimed(u64),
+}
+
+impl BackingSize {
+    pub(crate) fn bytes(self) -> u64 {
+        match self {
+            Self::HostAuthoritative(n) | Self::CreatorClaimed(n) => n,
+        }
+    }
+
+    pub(crate) fn is_host_authoritative(self) -> bool {
+        matches!(self, Self::HostAuthoritative(_))
+    }
+}
+
 /// Everything one [`helios_protocol::AllocationBacking`] arm must answer.
 ///
 /// NO `Option` fields and NO `Default`, deliberately: that is what forces every
@@ -1253,9 +1295,10 @@ struct CreatedBacking {
     venus_alloc_size: u64,
     memory_type_index: u32,
     /// The value `ap.size` takes afterwards — the blob size the write-back
-    /// publishes and VidMm rounds up. NOT always the created blob's size: the
-    /// KMD standard-buffer arm keeps the requested size, as it always has.
-    blob_size: u64,
+    /// publishes and VidMm rounds up — WITH its provenance. NOT always the
+    /// created blob's size: the KMD standard-buffer arm keeps the requested
+    /// size, as it always has.
+    blob_size: BackingSize,
 }
 
 /// Produce the backing for one classified allocation.
@@ -1324,7 +1367,7 @@ fn build_backing(
                 dxgi_format: meta.dxgi_format,
                 venus_alloc_size: claimed_alloc_size,
                 memory_type_index: meta.memory_type_index,
-                blob_size: ap.size,
+                blob_size: BackingSize::CreatorClaimed(ap.size),
             })
         }
         Backing::KmdLinearPrimary { width, height } => {
@@ -1342,7 +1385,7 @@ fn build_backing(
                     dxgi_format: meta.dxgi_format,
                     venus_alloc_size: scanout.blob.size,
                     memory_type_index: scanout.memory_type_index,
-                    blob_size: scanout.blob.size,
+                    blob_size: BackingSize::HostAuthoritative(scanout.blob.size),
                 }),
                 Ok(Err(_ve)) => {
                     crate::diag::record(0x0C01_00E5);
@@ -1385,7 +1428,7 @@ fn build_backing(
                     dxgi_format,
                     venus_alloc_size: image.blob.size,
                     memory_type_index: image.memory_type_index,
-                    blob_size: image.blob.size,
+                    blob_size: BackingSize::HostAuthoritative(image.blob.size),
                 }),
                 Ok(Err(_ve)) => {
                     crate::diag::record_named_bytes(b"GdiOImg", 0xE1);
@@ -1425,8 +1468,12 @@ fn build_backing(
                     venus_alloc_size: blob.size,
                     memory_type_index: kernel_mti,
                     // NOT blob.size: this arm has always left `ap.size` at the
-                    // requested value.
-                    blob_size: ap.size,
+                    // requested value. Still HostAuthoritative — the host
+                    // allocated exactly this request and reported back a size
+                    // that is its page-rounded form, and this arm is part of
+                    // the `venus_memory_id != 0` set `bar_eligible` used to
+                    // test, so the eligible population is unchanged.
+                    blob_size: BackingSize::HostAuthoritative(ap.size),
                 }),
                 Ok(Err(_ve)) => {
                     crate::diag::record(0x0C01_00E3);
@@ -1462,7 +1509,7 @@ fn build_backing(
                     dxgi_format: meta.dxgi_format,
                     venus_alloc_size: claimed_alloc_size,
                     memory_type_index: meta.memory_type_index,
-                    blob_size: size,
+                    blob_size: BackingSize::CreatorClaimed(size),
                 })
             }
             Err(_ve) => {
@@ -1593,7 +1640,7 @@ unsafe fn create_one(
     meta.dxgi_format = created.dxgi_format;
     meta.venus_alloc_size = created.venus_alloc_size;
     meta.memory_type_index = created.memory_type_index;
-    ap.size = created.blob_size;
+    ap.size = created.blob_size.bytes();
 
     crate::diag::record(0x0C01_0020);
     crate::diag::record(resource_id);
@@ -1668,7 +1715,14 @@ unsafe fn create_one(
         .bar_segment()
         .filter(|b| !b.probe_only)
         .map(|b| b.seg_id);
-    let bar_eligible = venus_memory_id != 0 && !is_optimal_gdi_texture && bar_seg_id.is_some();
+    // Truth table verified identical to `venus_memory_id != 0 && ...`:
+    // HostAuthoritative is exactly the three KMD-created arms, which are exactly
+    // the arms that set venus_memory_id. What changes is that the aperture
+    // path's safety now rests on a stated fact rather than on an incidental
+    // property of an unrelated field.
+    let bar_eligible = created.blob_size.is_host_authoritative()
+        && !is_optimal_gdi_texture
+        && bar_seg_id.is_some();
 
     let ctx = Box::new(AllocationContext {
         magic: ALLOCATION_CTX_MAGIC,
@@ -1707,6 +1761,7 @@ unsafe fn create_one(
         memory_type_index: meta.memory_type_index,
         bar_placed: core::sync::atomic::AtomicU64::new(BAR_UNPLACED),
         bar_eligible,
+        size_provenance: created.blob_size,
     });
 
     // ── VidMm metadata: segment placement + CPU visibility ──────────────────

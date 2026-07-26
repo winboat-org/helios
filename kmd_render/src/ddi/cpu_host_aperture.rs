@@ -34,7 +34,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use wdk_sys::ntddk::KeGetCurrentIrql;
 
 use crate::adapter::AdapterContext;
-use crate::ddi::create_allocation::paging_alloc_info;
+use crate::ddi::create_allocation::{paging_alloc_info, PagingAllocInfo};
 use crate::dxgk::*;
 
 pub static CPU_HOST_MAP_COUNT: AtomicU32 = AtomicU32::new(0);
@@ -67,6 +67,25 @@ static BAR_AP_LAST_IRQL: AtomicU32 = AtomicU32::new(0);
 // at the requested offset (idempotent SUCCESS) vs. had to defer to a PASSIVE retry.
 static BAR_AP_IRQL_ACK: AtomicU32 = AtomicU32::new(0);
 static BAR_AP_IRQL_DEFER: AtomicU32 = AtomicU32::new(0);
+// R618: times the page count derived from the ALLOCATION's own size disagreed
+// with the page count implied by the TRACKED BLOB's size, and the last such
+// delta in pages. The whole-allocation refusal below computes `blob_pages` from
+// `alloc.size` while `map_blob_at` maps whatever length the tracked blob size
+// implies — two different sources for the same quantity. COUNTER ONLY: do not
+// switch the authoritative source until these prove the two agree on every
+// boot, because a host-rounded vs page-rounded difference would change the
+// BAR_AP_ERR_PARTIAL refusal population and make it a behaviour change.
+static BAR_AP_SIZE_MISMATCH: AtomicU32 = AtomicU32::new(0);
+static BAR_AP_SIZE_DELTA: AtomicU32 = AtomicU32::new(0);
+// R618: a BAR-eligible allocation whose size is NOT host-authoritative. That is
+// the state the aperture size check has always been unsafe in, and it was
+// prevented only incidentally, by `bar_eligible` requiring `venus_memory_id != 0`.
+// Making adopted DEVICE_MEMORY allocations BAR-eligible — explicitly
+// contemplated in create_allocation.rs — would open it, and a UMD reporting a
+// larger `ap.size` than the real blob would then get an aperture assignment of
+// blob_pages pages while the map covers only the real blob length, with the
+// CPU view's tail addressing unbacked window offsets. Must stay 0.
+static BAR_AP_SIZE_PROVENANCE: AtomicU32 = AtomicU32::new(0);
 
 /// The segment-3 aperture counter block, mirrored through the shared throttled
 /// emitter (R317). Same names and encodings; the cadence changes — this ran on
@@ -109,6 +128,9 @@ static AP_COUNTERS: crate::diag::CounterBlock = crate::diag::CounterBlock {
         e(b"ChIq", &BAR_AP_LAST_IRQL),
         e(b"ChIa", &BAR_AP_IRQL_ACK),
         e(b"ChId", &BAR_AP_IRQL_DEFER),
+        f(b"ChSzMm", &BAR_AP_SIZE_MISMATCH),
+        e(b"ChSzDl", &BAR_AP_SIZE_DELTA),
+        f(b"ChSzPv", &BAR_AP_SIZE_PROVENANCE),
     ],
     ticks: &AP_FLUSH_TICKS,
     failures: &AP_FLUSH_FAILURES,
@@ -175,6 +197,31 @@ impl ApertureRefusal {
         if let Some(res) = resource_id {
             BAR_AP_LAST_RESID.store(res, Ordering::Relaxed);
         }
+    }
+}
+
+/// Cross-check the allocation's own size against the tracked blob's, counting
+/// only.
+///
+/// Atomics only, so it is safe on the DISPATCH arm too — the registry mirror
+/// happens from the PASSIVE `dump` through [`AP_COUNTERS`], never here.
+/// `blob_lookup` runs under the device spinlock, which this path already takes
+/// for `blob_resid_at_offset`.
+fn note_size_provenance(adapter: &AdapterContext, alloc: &PagingAllocInfo) {
+    // The invariant this item makes explicit rather than incidental: only a
+    // host-authoritative size may become BAR-eligible. Counted, not asserted —
+    // a bugcheck here would be worse than the refusal that follows anyway.
+    if alloc.bar_eligible && !alloc.size_provenance.is_host_authoritative() {
+        BAR_AP_SIZE_PROVENANCE.fetch_add(1, Ordering::Relaxed);
+    }
+    let Ok(Some((_, tracked, _))) = adapter.with_virtio(|v| v.blob_lookup(alloc.resource_id)) else {
+        return;
+    };
+    let from_alloc = (alloc.size.saturating_add(4095) >> 12).max(1);
+    let from_blob = (tracked.saturating_add(4095) >> 12).max(1);
+    if from_alloc != from_blob {
+        BAR_AP_SIZE_MISMATCH.fetch_add(1, Ordering::Relaxed);
+        BAR_AP_SIZE_DELTA.store(from_alloc.abs_diff(from_blob) as u32, Ordering::Relaxed);
     }
 }
 
@@ -277,6 +324,7 @@ pub unsafe extern "C" fn dxgkddi_map_cpu_host_aperture(
         // violation R307 removed from the paging path.
         let already_mapped = unsafe { paging_alloc_info(args.hAllocation) }
             .filter(|a| a.bar_eligible)
+            .inspect(|a| note_size_provenance(adapter, a))
             .and_then(|a| {
                 // SAFETY: dxgkrnl owns the page array for the call; see the
                 // validator's safety note on reading it at DISPATCH.
@@ -308,6 +356,7 @@ pub unsafe extern "C" fn dxgkddi_map_cpu_host_aperture(
         dump_bar_ap_counters();
         return STATUS_NO_MEMORY;
     };
+    note_size_provenance(adapter, &alloc);
     if !alloc.bar_eligible {
         // The allocation contract says this object is device-local/opaque.
         // Never reinterpret it as CPU-addressable blob bytes even if VidMm
