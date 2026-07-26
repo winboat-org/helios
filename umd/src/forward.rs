@@ -8572,6 +8572,63 @@ static EXT_RESULT_OVERWRITES: AtomicUsize = AtomicUsize::new(0);
 /// a direct-flip window beats a wedged worker). Steady-state nonzero =
 /// the retire→signal chain is slower than the gate bound.
 static EXT_FLIP_GATE_TIMEOUTS: AtomicUsize = AtomicUsize::new(0);
+/// Why a present returned without minting a swapchain token. All three shapes
+/// used to share one log line and return S_OK to DXGI, so the failing stage was
+/// lost and the runtime never learned the present had not happened.
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum PresentSkip {
+    NoDxgiCallbacks,
+    NoContext,
+    NoSourceAllocation,
+}
+
+/// The three preconditions of the present-callback block, resolved once. The
+/// callback code is unreachable with any of them unmet, so "skipped" is
+/// distinguishable from "succeeded" at the type level even though the returned
+/// HRESULT is unchanged.
+struct PresentReady {
+    h_context: core::ptr::NonNull<c_void>,
+    src_alloc: core::num::NonZeroU32,
+}
+
+/// `dxgi_callbacks` was null: no DXGI base callback table on the device.
+static PRESENT_SKIP_NO_CALLBACKS: AtomicUsize = AtomicUsize::new(0);
+/// `h_context` was null: pfnCreateContextCb failed at CreateDevice. R404 closes
+/// the creation half (such a device is now refused); this counts the presents
+/// that reach here on a device that predates it or fails another way.
+static PRESENT_SKIP_NO_CONTEXT: AtomicUsize = AtomicUsize::new(0);
+/// The presented source resource carries no WDDM allocation.
+static PRESENT_SKIP_NO_SRC_ALLOC: AtomicUsize = AtomicUsize::new(0);
+/// Rate cap for the skip log line (declared diagnostic-volume change: a device
+/// that permanently lacks a context used to write one formatted line per
+/// present, at frame rate, through the unconditional writer).
+static PRESENT_SKIP_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// Resolve the present-callback preconditions, counting exactly which one
+/// failed. Deliberately no fourth "NoDevice" variant: `helios_device` returns
+/// None only for a null `pDrvPrivate`, which dxgkrnl does not pass.
+unsafe fn present_prerequisites(
+    dev: &crate::device_funcs::HeliosDevice,
+    src_alloc: u32,
+) -> Result<PresentReady, PresentSkip> {
+    if dev.dxgi_callbacks.is_null() {
+        PRESENT_SKIP_NO_CALLBACKS.fetch_add(1, Ordering::Relaxed);
+        return Err(PresentSkip::NoDxgiCallbacks);
+    }
+    let Some(h_context) = core::ptr::NonNull::new(dev.h_context) else {
+        PRESENT_SKIP_NO_CONTEXT.fetch_add(1, Ordering::Relaxed);
+        return Err(PresentSkip::NoContext);
+    };
+    let Some(src_alloc) = core::num::NonZeroU32::new(src_alloc) else {
+        PRESENT_SKIP_NO_SRC_ALLOC.fetch_add(1, Ordering::Relaxed);
+        return Err(PresentSkip::NoSourceAllocation);
+    };
+    Ok(PresentReady {
+        h_context,
+        src_alloc,
+    })
+}
+
 /// Kernel flip-waits queued ahead of the present packet (the ordering is
 /// dxgkrnl-enforced for these presents; the CPU gate is skipped).
 static EXT_KWAIT_ARMED: AtomicUsize = AtomicUsize::new(0);
@@ -9625,13 +9682,13 @@ unsafe extern "C" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT) -> i32 {
     }
 
     if let Some(dev) = helios_device(h) {
-        if !dev.dxgi_callbacks.is_null() && src_alloc != 0 && !dev.h_context.is_null() {
+        if let Ok(ready) = present_prerequisites(dev, src_alloc) {
             let mut cb = ddi::DXGIDDICB_PRESENT::default();
             let present_private = presented_primary_private(h, src_h.pDrvPrivate);
-            cb.hSrcAllocation = src_alloc;
+            cb.hSrcAllocation = ready.src_alloc.get();
             cb.hDstAllocation = dst_alloc;
             cb.pDXGIContext = a.pDXGIContext;
-            cb.hContext = dev.h_context;
+            cb.hContext = ready.h_context.as_ptr();
             cb.BroadcastContextCount = 0;
             if let Some(ref private) = present_private {
                 cb.PrivateDriverDataSize = core::mem::size_of::<HeliosPresentPrivateData>() as u32;
@@ -9681,12 +9738,17 @@ unsafe extern "C" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT) -> i32 {
             present_hr =
                 submit_runtime_present_then_call(dev, dependencies, present_private, &mut cb);
         } else {
-            log_line(&format!(
-                "DXGI Present: skip PresentCb callbacks={} src=0x{:x} hContext={:p}",
-                dev.dxgi_callbacks.is_null(),
-                src_alloc,
-                dev.h_context
-            ));
+            // Rate cap: same message text and field set, fewer lines. Which of
+            // the three preconditions failed now lives in the counters below.
+            let n = PRESENT_SKIP_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+            if n < 64 || (n + 1) % 512 == 0 {
+                log_line(&format!(
+                    "DXGI Present: skip PresentCb callbacks={} src=0x{:x} hContext={:p}",
+                    dev.dxgi_callbacks.is_null(),
+                    src_alloc,
+                    dev.h_context
+                ));
+            }
         }
     }
 
@@ -9735,7 +9797,7 @@ unsafe extern "C" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT) -> i32 {
         log_line(&format!(
             "DXGI Present: #{} src=0x{:x} dst=0x{:x} copied={} flags=0x{:x} opt_comp={} presentCb=0x{:08x} \
              hSurf={:p} srcSub={} hDstRes={:p} dstSub={} flipInterval={} dxgiCtx={:p} hContext={:p} \
-             syncVal={}",
+             syncVal={} skips={}/{}/{}",
             ordinal,
             src_alloc,
             dst_alloc,
@@ -9750,7 +9812,10 @@ unsafe extern "C" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT) -> i32 {
             a.FlipInterval,
             a.pDXGIContext,
             dev_context_for_log(h),
-            sync_value
+            sync_value,
+            PRESENT_SKIP_NO_CALLBACKS.load(Ordering::Relaxed),
+            PRESENT_SKIP_NO_CONTEXT.load(Ordering::Relaxed),
+            PRESENT_SKIP_NO_SRC_ALLOC.load(Ordering::Relaxed),
         ));
     }
     present_hr
@@ -10441,7 +10506,13 @@ unsafe extern "C" fn dxgi_present1(arg: *mut ddi::DXGI_DDI_ARG_PRESENT1) -> i32 
 
     let mut present_hr = E_INVALIDARG;
     if let Some(dev) = helios_device(h) {
-        if dev.dxgi_callbacks.is_null() || dev.h_context.is_null() {
+        // Same three preconditions, counted the same way. The HRESULTs this
+        // path returns are NOT changed here: Present1-multi rejects a missing
+        // callback table/context with DXGI_ERROR_UNSUPPORTED where
+        // dxgi_present logs and returns present_hr, and it already rejected
+        // src_alloc == 0 with E_INVALIDARG above. Unifying the two tails is
+        // T7's u-forward-b-04.
+        if let Err(_skip) = present_prerequisites(dev, src_alloc) {
             log_line(&format!(
                 "DXGI Present1 multi: missing callback table/context callbacks={} hContext={:p}",
                 dev.dxgi_callbacks.is_null(),
