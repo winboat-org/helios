@@ -31,6 +31,7 @@
 //! spinlock across a wait.
 
 use alloc::vec::Vec;
+use core::num::NonZeroU64;
 use core::sync::atomic::{compiler_fence, fence, Ordering};
 
 use helios_protocol::{
@@ -271,6 +272,88 @@ enum FatalReason {
 fn diag(code: u32) {
     crate::diag::record(0x0D00_0000 | (code & 0xFFFF));
 }
+
+// ── Guest-assigned Vulkan object handles ──────────────────────────────────────
+
+/// Declare one handle newtype per Vulkan object class.
+///
+/// One untyped counter minted every handle — images, memory, buffers, pools,
+/// command buffers, fences, queues and the device — and every id is a live
+/// handle in the SAME host object space. So a swapped argument does not fail
+/// loudly: it destroys or rebinds the wrong host object, and surfaces much later
+/// as a corrupt frame or a host decoder abort.
+/// `cleanup_imported_source_alias(adapter, resource_id, memory_id, image_id)`
+/// compiles today and would issue `vkDestroyImage` on a `VkDeviceMemory` handle
+/// and `vkFreeMemory` on a `VkImage` handle; the encoder accepts both, only the
+/// host notices. Likewise `bind_image_memory(memory_id, image_id)`.
+///
+/// `NonZeroU64` also retires the "0 means absent" convention and the ~30
+/// scattered `if x != 0` guards that implemented it: `Option<VkImageId>` is the
+/// same size as the `u64` it replaces, and "not yet valid" stops being encodable
+/// as a legal-looking handle the encoder will happily write into the stream.
+///
+/// The macro exists so eight identical definitions cannot drift; it expands to
+/// exactly the three items written below and nothing else.
+macro_rules! vk_handle {
+    ($(#[$attr:meta])* $name:ident) => {
+        $(#[$attr])*
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        pub struct $name(NonZeroU64);
+
+        impl $name {
+            /// The raw handle, for the wire encoder and for the `AtomicU64`
+            /// mirrors in `ddi/create_allocation.rs`.
+            pub fn get(self) -> u64 {
+                self.0.get()
+            }
+
+            /// Rebuild from a raw handle — a mirror read, or a value decoded
+            /// from a host reply. `0` is not a handle.
+            pub fn from_raw(raw: u64) -> Option<Self> {
+                NonZeroU64::new(raw).map(Self)
+            }
+        }
+
+        impl From<$name> for u64 {
+            fn from(id: $name) -> u64 {
+                id.get()
+            }
+        }
+    };
+}
+
+vk_handle!(
+    /// `VkImage`.
+    VkImageId
+);
+vk_handle!(
+    /// `VkDeviceMemory`. Doubles as the virtio-gpu `blob_id` for KMD-created
+    /// blobs — that coupling is real and deliberate, so the raw value still
+    /// crosses into `ctrl::resource_create_blob` as a `u64`.
+    VkDeviceMemoryId
+);
+vk_handle!(
+    /// `VkBuffer`.
+    VkBufferId
+);
+vk_handle!(
+    /// `VkCommandPool`.
+    VkCommandPoolId
+);
+vk_handle!(
+    /// `VkCommandBuffer`.
+    VkCommandBufferId
+);
+vk_handle!(
+    /// `VkFence`.
+    VkFenceId
+);
+// `VkQueue` and `VkDevice` deliberately have NO newtype here. They are the two
+// handles that exist in a "not yet valid, encoded as 0" state during bring-up,
+// and wrapping them without removing that state would only move the sentinel
+// behind an Option that every one of the ~40 encoders would have to unwrap.
+// R608's VenusRing -> VenusInstance -> VenusDevice typestate is where they
+// become non-optional, and that is where their newtypes belong.
 
 /// The result of [`allocate_host_visible_blob`]: a venus-backed, BAR-visible,
 /// CPU-coherent region for VidMm's page-table segment.
@@ -557,8 +640,8 @@ impl PresentDestinationDesc {
 #[derive(Clone, Copy)]
 struct ImportedOptimalImage {
     desc: OptimalPresentImageDesc,
-    image_id: u64,
-    memory_id: u64,
+    image_id: VkImageId,
+    memory_id: VkDeviceMemoryId,
 }
 
 /// One `VkDeviceMemory` allocation created by [`VenusClient::allocate_memory_blob`]
@@ -570,7 +653,7 @@ struct ImportedOptimalImage {
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct OwnedMemoryBlob {
     resource_id: u32,
-    memory_id: u64,
+    memory_id: VkDeviceMemoryId,
     allocation_size: u64,
     memory_type_index: u32,
 }
@@ -583,20 +666,22 @@ struct OwnedMemoryBlob {
 #[derive(Clone, Copy)]
 struct BorrowedPresentBuffer {
     desc: PresentBufferDesc,
-    buffer_id: u64,
+    buffer_id: VkBufferId,
     memory: OwnedMemoryBlob,
 }
 
 struct PreparedPresentBlt {
     source_resource_id: u32,
     destination_resource_id: u32,
-    command_pool_id: u64,
-    command_buffer_id: u64,
+    command_pool_id: VkCommandPoolId,
+    command_buffer_id: VkCommandBufferId,
     /// Optional KMD-owned conversion scratch. It is an internal command
     /// dependency only; it never substitutes for either Windows allocation.
-    conversion_image_id: u64,
-    conversion_memory_id: u64,
-    conversion_init_pool_id: u64,
+    /// `None` rather than 0: absent scratch is now a state of the type.
+    conversion_image_id: Option<VkImageId>,
+    conversion_memory_id: Option<VkDeviceMemoryId>,
+    conversion_init_pool_id: Option<VkCommandPoolId>,
+    /// A virtio WIRE fence id, NOT a `VkFence` — deliberately still a bare u64.
     last_wire_fence_id: u64,
     submit_count: u32,
     probe_done: bool,
@@ -992,8 +1077,10 @@ pub struct VenusClient {
     notify_seqno: u32,
     /// Monotonic virtqueue roundtrip seqno (for the reply-shmem warm-up).
     roundtrip_seqno: u64,
-    /// Next guest-assigned Vulkan handle id (0 = NULL, so start at 1).
-    next_handle: u64,
+    /// Next guest-assigned Vulkan handle id. `NonZeroU64` because 0 is
+    /// `VK_NULL_HANDLE`: it is the value the handle newtypes exist to keep out
+    /// of the wire stream, so the counter must not be able to produce it.
+    next_handle: NonZeroU64,
     /// The persistent venus 3D context id all commands ride.
     ctx_id: u32,
     /// One-shot destination probe ARMED but not yet run (R320). The probe is a
@@ -1035,9 +1122,9 @@ pub struct VenusClient {
     /// LINEAR scanout target. The pool/buffer remain live because setup is
     /// intentionally submitted without a fence wait; queue order makes every
     /// later copy execute after it.
-    copy_target_image_id: u64,
-    copy_target_init_pool_id: u64,
-    copy_target_init_command_buffer_id: u64,
+    copy_target_image_id: Option<VkImageId>,
+    copy_target_init_pool_id: Option<VkCommandPoolId>,
+    copy_target_init_command_buffer_id: Option<VkCommandBufferId>,
     /// App/DWM BLT imports and recorded copies. Both vectors are preallocated
     /// and capacity-bounded. Every access is serialized by
     /// AdapterContext::with_venus_client, so setup/submission/teardown cannot
@@ -1061,11 +1148,41 @@ impl VenusClient {
         self.memory_type_index
     }
 
-    /// Allocate a fresh guest handle id.
-    fn alloc_handle(&mut self) -> u64 {
+    /// Mint the next raw handle. Private: every caller goes through one of the
+    /// typed constructors below, so a handle cannot be created without deciding
+    /// what class of object it names.
+    fn next_raw(&mut self) -> NonZeroU64 {
         let h = self.next_handle;
-        self.next_handle += 1;
+        // Handles are never recycled, and must never wrap into the zero that
+        // means "absent". At one handle per Present the bound is unreachable;
+        // saturating is nevertheless the right failure mode, because reusing 1
+        // would collide with a live host object.
+        self.next_handle = self.next_handle.checked_add(1).unwrap_or(self.next_handle);
         h
+    }
+
+    fn new_image_id(&mut self) -> VkImageId {
+        VkImageId(self.next_raw())
+    }
+
+    fn new_memory_id(&mut self) -> VkDeviceMemoryId {
+        VkDeviceMemoryId(self.next_raw())
+    }
+
+    fn new_buffer_id(&mut self) -> VkBufferId {
+        VkBufferId(self.next_raw())
+    }
+
+    fn new_command_pool_id(&mut self) -> VkCommandPoolId {
+        VkCommandPoolId(self.next_raw())
+    }
+
+    fn new_command_buffer_id(&mut self) -> VkCommandBufferId {
+        VkCommandBufferId(self.next_raw())
+    }
+
+    fn new_fence_id(&mut self) -> VkFenceId {
+        VkFenceId(self.next_raw())
     }
 
     /// Latch the ring poison, naming the reason in the registry.
@@ -1271,7 +1388,7 @@ impl VenusClient {
             return Err(VirtioError::OutOfMemory);
         }
         let size = round_up_page(size.max(4096));
-        let memory_id = self.alloc_handle();
+        let memory_id = self.new_memory_id();
         {
             let mut w = Writer::new();
             w.header(CMD_ALLOCATE_MEMORY, CMD_FLAG_GENERATE_REPLY);
@@ -1290,7 +1407,7 @@ impl VenusClient {
             w.u32(self.memory_type_index);
             w.count(false);
             w.count(true);
-            w.u64(memory_id);
+            w.handle(memory_id);
             self.ring_command_reply(adapter, w.as_slice()?)?;
 
             let mut r = ReplyReader::new(&self.reply_map);
@@ -1318,7 +1435,10 @@ impl VenusClient {
             self.ctx_id,
             VIRTIO_GPU_BLOB_MEM_HOST3D,
             flags,
-            memory_id,
+            // The VkDeviceMemory handle IS the virtio blob_id for a
+            // KMD-created blob. That coupling is deliberate, so the raw value
+            // crosses the transport boundary here.
+            memory_id.get(),
             size,
         ) {
             Ok(resource_id) => resource_id,
@@ -1342,7 +1462,7 @@ impl VenusClient {
             memory_type_index: self.memory_type_index,
         });
         Ok(HostVisibleBlob {
-            blob_id: memory_id,
+            blob_id: memory_id.get(),
             res_id,
             gpa: 0,
             size,
@@ -1386,8 +1506,8 @@ impl VenusClient {
         adapter: &AdapterContext,
         width: u32,
         height: u32,
-    ) -> Result<u64, VirtioError> {
-        let image_id = self.alloc_handle();
+    ) -> Result<VkImageId, VirtioError> {
+        let image_id = self.new_image_id();
         let mut w = Writer::new();
         w.header(CMD_CREATE_IMAGE, CMD_FLAG_GENERATE_REPLY);
         w.u64(self.device_id);
@@ -1420,7 +1540,7 @@ impl VenusClient {
         w.u32(IMAGE_LAYOUT_UNDEFINED);
         w.count(false); // pAllocator
         w.count(true);
-        w.u64(image_id);
+        w.handle(image_id);
         self.ring_command_reply(adapter, w.as_slice()?)?;
 
         let mut r = ReplyReader::new(&self.reply_map);
@@ -1446,8 +1566,8 @@ impl VenusClient {
         adapter: &AdapterContext,
         width: u32,
         height: u32,
-    ) -> Result<u64, VirtioError> {
-        let image_id = self.alloc_handle();
+    ) -> Result<VkImageId, VirtioError> {
+        let image_id = self.new_image_id();
         let mut w = Writer::new();
         w.header(CMD_CREATE_IMAGE, CMD_FLAG_GENERATE_REPLY);
         w.u64(self.device_id);
@@ -1476,7 +1596,7 @@ impl VenusClient {
         w.u32(IMAGE_LAYOUT_PREINITIALIZED);
         w.count(false); // pAllocator
         w.count(true);
-        w.u64(image_id);
+        w.handle(image_id);
         self.ring_command_reply(adapter, w.as_slice()?)?;
 
         let mut r = ReplyReader::new(&self.reply_map);
@@ -1514,7 +1634,7 @@ impl VenusClient {
         ddi_bind_flags: u32,
         dxgi_format: u32,
         transport: OptimalImageTransport,
-    ) -> Result<u64, VirtioError> {
+    ) -> Result<VkImageId, VirtioError> {
         let vk_format = PresentPixelFormat::from_dxgi(dxgi_format)
             .ok_or(VirtioError::DeviceError)?
             .vk_format();
@@ -1536,7 +1656,7 @@ impl VenusClient {
             usage |= IMAGE_USAGE_STORAGE;
         }
 
-        let image_id = self.alloc_handle();
+        let image_id = self.new_image_id();
         let mut w = Writer::new();
         w.header(CMD_CREATE_IMAGE, CMD_FLAG_GENERATE_REPLY);
         w.u64(self.device_id);
@@ -1569,7 +1689,7 @@ impl VenusClient {
         w.u32(IMAGE_LAYOUT_UNDEFINED);
         w.count(false); // pAllocator
         w.count(true);
-        w.u64(image_id);
+        w.handle(image_id);
         self.ring_command_reply(adapter, w.as_slice()?)?;
 
         let mut r = ReplyReader::new(&self.reply_map);
@@ -1603,11 +1723,11 @@ impl VenusClient {
         width: u32,
         height: u32,
         vk_format: u32,
-    ) -> Result<u64, VirtioError> {
+    ) -> Result<VkImageId, VirtioError> {
         if width == 0 || height == 0 {
             return Err(VirtioError::DeviceError);
         }
-        let image_id = self.alloc_handle();
+        let image_id = self.new_image_id();
         let mut w = Writer::new();
         w.header(CMD_CREATE_IMAGE, CMD_FLAG_GENERATE_REPLY);
         w.u64(self.device_id);
@@ -1631,7 +1751,7 @@ impl VenusClient {
         w.u32(IMAGE_LAYOUT_UNDEFINED);
         w.count(false); // pAllocator
         w.count(true);
-        w.u64(image_id);
+        w.handle(image_id);
         self.ring_command_reply(adapter, w.as_slice()?)?;
 
         let mut r = ReplyReader::new(&self.reply_map);
@@ -1648,11 +1768,11 @@ impl VenusClient {
     fn allocate_present_conversion_memory(
         &mut self,
         adapter: &AdapterContext,
-        image_id: u64,
+        image_id: VkImageId,
         size: u64,
         memory_type_index: u32,
-    ) -> Result<u64, VirtioError> {
-        let memory_id = self.alloc_handle();
+    ) -> Result<VkDeviceMemoryId, VirtioError> {
+        let memory_id = self.new_memory_id();
         let mut w = Writer::new();
         w.header(CMD_ALLOCATE_MEMORY, CMD_FLAG_GENERATE_REPLY);
         w.u64(self.device_id);
@@ -1661,13 +1781,13 @@ impl VenusClient {
         w.count(true);
         w.i32(ST_MEMORY_DEDICATED_ALLOCATE_INFO);
         w.count(false);
-        w.u64(image_id);
+        w.handle(image_id);
         w.u64(0); // buffer
         w.u64(size);
         w.u32(memory_type_index);
         w.count(false); // pAllocator
         w.count(true);
-        w.u64(memory_id);
+        w.handle(memory_id);
         self.ring_command_reply(adapter, w.as_slice()?)?;
 
         let mut r = ReplyReader::new(&self.reply_map);
@@ -1683,8 +1803,8 @@ impl VenusClient {
     fn initialize_present_conversion_image(
         &mut self,
         adapter: &AdapterContext,
-        image_id: u64,
-    ) -> Result<u64, VirtioError> {
+        image_id: VkImageId,
+    ) -> Result<VkCommandPoolId, VirtioError> {
         let pool_id = self.create_command_pool(adapter)?;
         let command_buffer_id = match self.allocate_command_buffer(adapter, pool_id) {
             Ok(id) => id,
@@ -1716,7 +1836,7 @@ impl VenusClient {
         }
         // On an ambiguous submission failure, leave the pool alive for Venus
         // context teardown. Destroying it could free an in-flight command.
-        self.queue_submit_command_buffer(adapter, command_buffer_id, 0)?;
+        self.queue_submit_command_buffer(adapter, command_buffer_id, None)?;
         Ok(pool_id)
     }
 
@@ -1726,7 +1846,7 @@ impl VenusClient {
         width: u32,
         height: u32,
         format: PresentPixelFormat,
-    ) -> Result<(u64, u64), VirtioError> {
+    ) -> Result<(VkImageId, VkDeviceMemoryId), VirtioError> {
         let image_id =
             self.create_present_conversion_image(adapter, width, height, format.vk_format())?;
         let (required_size, memory_type_bits) =
@@ -1767,12 +1887,12 @@ impl VenusClient {
     fn image_memory_requirements(
         &mut self,
         adapter: &AdapterContext,
-        image_id: u64,
+        image_id: VkImageId,
     ) -> Result<(u64, u32), VirtioError> {
         let mut w = Writer::new();
         w.header(CMD_GET_IMAGE_MEMORY_REQUIREMENTS, CMD_FLAG_GENERATE_REPLY);
         w.u64(self.device_id);
-        w.u64(image_id);
+        w.handle(image_id);
         w.count(true);
         self.ring_command_reply(adapter, w.as_slice()?)?;
 
@@ -1801,8 +1921,8 @@ impl VenusClient {
         &mut self,
         adapter: &AdapterContext,
         size: u64,
-    ) -> Result<u64, VirtioError> {
-        let buffer_id = self.alloc_handle();
+    ) -> Result<VkBufferId, VirtioError> {
+        let buffer_id = self.new_buffer_id();
         let mut w = Writer::new();
         w.header(CMD_CREATE_BUFFER, CMD_FLAG_GENERATE_REPLY);
         w.u64(self.device_id);
@@ -1817,7 +1937,7 @@ impl VenusClient {
         w.count(false);
         w.count(false); // pAllocator
         w.count(true);
-        w.u64(buffer_id);
+        w.handle(buffer_id);
         self.ring_command_reply(adapter, w.as_slice()?)?;
 
         let mut r = ReplyReader::new(&self.reply_map);
@@ -1839,12 +1959,12 @@ impl VenusClient {
     fn buffer_memory_requirements(
         &mut self,
         adapter: &AdapterContext,
-        buffer_id: u64,
+        buffer_id: VkBufferId,
     ) -> Result<(u64, u32), VirtioError> {
         let mut w = Writer::new();
         w.header(CMD_GET_BUFFER_MEMORY_REQUIREMENTS, CMD_FLAG_GENERATE_REPLY);
         w.u64(self.device_id);
-        w.u64(buffer_id);
+        w.handle(buffer_id);
         w.count(true);
         self.ring_command_reply(adapter, w.as_slice()?)?;
 
@@ -1862,11 +1982,11 @@ impl VenusClient {
     fn allocate_dedicated_image_memory(
         &mut self,
         adapter: &AdapterContext,
-        image_id: u64,
+        image_id: VkImageId,
         size: u64,
         memory_type_index: u32,
-    ) -> Result<u64, VirtioError> {
-        let memory_id = self.alloc_handle();
+    ) -> Result<VkDeviceMemoryId, VirtioError> {
+        let memory_id = self.new_memory_id();
         let mut w = Writer::new();
         w.header(CMD_ALLOCATE_MEMORY, CMD_FLAG_GENERATE_REPLY);
         w.u64(self.device_id);
@@ -1878,14 +1998,14 @@ impl VenusClient {
         w.count(true);
         w.i32(ST_MEMORY_DEDICATED_ALLOCATE_INFO);
         w.count(false);
-        w.u64(image_id);
+        w.handle(image_id);
         w.u64(0); // buffer
         w.u32(EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF);
         w.u64(size);
         w.u32(memory_type_index);
         w.count(false);
         w.count(true);
-        w.u64(memory_id);
+        w.handle(memory_id);
         self.ring_command_reply(adapter, w.as_slice()?)?;
 
         let mut r = ReplyReader::new(&self.reply_map);
@@ -1906,8 +2026,8 @@ impl VenusClient {
         adapter: &AdapterContext,
         size: u64,
         memory_type_index: u32,
-    ) -> Result<u64, VirtioError> {
-        let memory_id = self.alloc_handle();
+    ) -> Result<VkDeviceMemoryId, VirtioError> {
+        let memory_id = self.new_memory_id();
         let mut w = Writer::new();
         w.header(CMD_ALLOCATE_MEMORY, CMD_FLAG_GENERATE_REPLY);
         w.u64(self.device_id);
@@ -1921,7 +2041,7 @@ impl VenusClient {
         w.u32(memory_type_index);
         w.count(false);
         w.count(true);
-        w.u64(memory_id);
+        w.handle(memory_id);
         self.ring_command_reply(adapter, w.as_slice()?)?;
 
         let mut r = ReplyReader::new(&self.reply_map);
@@ -1950,8 +2070,8 @@ impl VenusClient {
         resource_id: u32,
         allocation_size: u64,
         memory_type_index: u32,
-    ) -> Result<u64, VirtioError> {
-        let memory_id = self.alloc_handle();
+    ) -> Result<VkDeviceMemoryId, VirtioError> {
+        let memory_id = self.new_memory_id();
         let mut w = Writer::new();
         w.header(CMD_ALLOCATE_MEMORY, CMD_FLAG_GENERATE_REPLY);
         w.u64(self.device_id);
@@ -1966,7 +2086,7 @@ impl VenusClient {
         w.u32(memory_type_index);
         w.count(false); // pAllocator
         w.count(true);
-        w.u64(memory_id);
+        w.handle(memory_id);
         self.ring_command_reply(adapter, w.as_slice()?)?;
 
         let mut r = ReplyReader::new(&self.reply_map);
@@ -1987,14 +2107,14 @@ impl VenusClient {
     fn bind_image_memory(
         &mut self,
         adapter: &AdapterContext,
-        image_id: u64,
-        memory_id: u64,
+        image_id: VkImageId,
+        memory_id: VkDeviceMemoryId,
     ) -> Result<(), VirtioError> {
         let mut w = Writer::new();
         w.header(CMD_BIND_IMAGE_MEMORY, CMD_FLAG_GENERATE_REPLY);
         w.u64(self.device_id);
-        w.u64(image_id);
-        w.u64(memory_id);
+        w.handle(image_id);
+        w.handle(memory_id);
         w.u64(0);
         self.ring_command_reply(adapter, w.as_slice()?)?;
 
@@ -2014,14 +2134,14 @@ impl VenusClient {
     fn bind_buffer_memory(
         &mut self,
         adapter: &AdapterContext,
-        buffer_id: u64,
-        memory_id: u64,
+        buffer_id: VkBufferId,
+        memory_id: VkDeviceMemoryId,
     ) -> Result<(), VirtioError> {
         let mut w = Writer::new();
         w.header(CMD_BIND_BUFFER_MEMORY, CMD_FLAG_GENERATE_REPLY);
         w.u64(self.device_id);
-        w.u64(buffer_id);
-        w.u64(memory_id);
+        w.handle(buffer_id);
+        w.handle(memory_id);
         w.u64(0);
         self.ring_command_reply(adapter, w.as_slice()?)?;
 
@@ -2036,13 +2156,13 @@ impl VenusClient {
     fn image_subresource_layout(
         &mut self,
         adapter: &AdapterContext,
-        image_id: u64,
+        image_id: VkImageId,
         aspect_mask: u32,
     ) -> Result<(u64, u64), VirtioError> {
         let mut w = Writer::new();
         w.header(CMD_GET_IMAGE_SUBRESOURCE_LAYOUT, CMD_FLAG_GENERATE_REPLY);
         w.u64(self.device_id);
-        w.u64(image_id);
+        w.handle(image_id);
         w.count(true);
         w.u32(aspect_mask);
         w.u32(0);
@@ -2069,7 +2189,7 @@ impl VenusClient {
     }
 
     fn get_device_queue(&mut self, adapter: &AdapterContext) -> Result<(), VirtioError> {
-        let queue_id = self.alloc_handle();
+        let queue_id = self.next_raw().get();
         let mut w = Writer::new();
         w.header(CMD_GET_DEVICE_QUEUE_2, CMD_FLAG_GENERATE_REPLY);
         w.u64(self.device_id);
@@ -2101,8 +2221,8 @@ impl VenusClient {
         Ok(())
     }
 
-    fn create_command_pool(&mut self, adapter: &AdapterContext) -> Result<u64, VirtioError> {
-        let pool_id = self.alloc_handle();
+    fn create_command_pool(&mut self, adapter: &AdapterContext) -> Result<VkCommandPoolId, VirtioError> {
+        let pool_id = self.new_command_pool_id();
         let mut w = Writer::new();
         w.header(CMD_CREATE_COMMAND_POOL, CMD_FLAG_GENERATE_REPLY);
         w.u64(self.device_id);
@@ -2113,7 +2233,7 @@ impl VenusClient {
         w.u32(0); // queueFamilyIndex
         w.count(false); // pAllocator
         w.count(true);
-        w.u64(pool_id);
+        w.handle(pool_id);
         self.ring_command_reply(adapter, w.as_slice()?)?;
 
         let mut r = ReplyReader::new(&self.reply_map);
@@ -2130,19 +2250,22 @@ impl VenusClient {
             diag(0x0114);
             return Err(VirtioError::DeviceError);
         }
+        // The host may substitute its own handle; adopt it when it does. This
+        // "nonzero wins" rule is unchanged — see the k-venus-13 note on the
+        // three inconsistent echo checks in this file.
         let returned = r.read_u64()?;
-        Ok(if returned != 0 { returned } else { pool_id })
+        Ok(VkCommandPoolId::from_raw(returned).unwrap_or(pool_id))
     }
 
     fn destroy_command_pool(
         &mut self,
         adapter: &AdapterContext,
-        pool_id: u64,
+        pool_id: VkCommandPoolId,
     ) -> Result<(), VirtioError> {
         let mut w = Writer::new();
         w.header(CMD_DESTROY_COMMAND_POOL, 0);
         w.u64(self.device_id);
-        w.u64(pool_id);
+        w.handle(pool_id);
         w.count(false);
         self.ring_command_noreply(adapter, w.as_slice()?)
     }
@@ -2150,20 +2273,20 @@ impl VenusClient {
     fn allocate_command_buffer(
         &mut self,
         adapter: &AdapterContext,
-        pool_id: u64,
-    ) -> Result<u64, VirtioError> {
-        let command_buffer_id = self.alloc_handle();
+        pool_id: VkCommandPoolId,
+    ) -> Result<VkCommandBufferId, VirtioError> {
+        let command_buffer_id = self.new_command_buffer_id();
         let mut w = Writer::new();
         w.header(CMD_ALLOCATE_COMMAND_BUFFERS, CMD_FLAG_GENERATE_REPLY);
         w.u64(self.device_id);
         w.count(true);
         w.i32(ST_COMMAND_BUFFER_ALLOCATE_INFO);
         w.count(false);
-        w.u64(pool_id);
+        w.handle(pool_id);
         w.u32(COMMAND_BUFFER_LEVEL_PRIMARY);
         w.u32(1);
         w.u64(1); // pCommandBuffers array_size
-        w.u64(command_buffer_id);
+        w.handle(command_buffer_id);
         self.ring_command_reply(adapter, w.as_slice()?)?;
 
         let mut r = ReplyReader::new(&self.reply_map);
@@ -2181,17 +2304,13 @@ impl VenusClient {
             return Err(VirtioError::DeviceError);
         }
         let returned = r.read_u64()?;
-        Ok(if returned != 0 {
-            returned
-        } else {
-            command_buffer_id
-        })
+        Ok(VkCommandBufferId::from_raw(returned).unwrap_or(command_buffer_id))
     }
 
     fn begin_command_buffer(
         &mut self,
         adapter: &AdapterContext,
-        command_buffer_id: u64,
+        command_buffer_id: VkCommandBufferId,
     ) -> Result<(), VirtioError> {
         self.begin_command_buffer_with_flags(
             adapter,
@@ -2203,12 +2322,12 @@ impl VenusClient {
     fn begin_command_buffer_with_flags(
         &mut self,
         adapter: &AdapterContext,
-        command_buffer_id: u64,
+        command_buffer_id: VkCommandBufferId,
         usage_flags: u32,
     ) -> Result<(), VirtioError> {
         let mut w = Writer::new();
         w.header(CMD_BEGIN_COMMAND_BUFFER, CMD_FLAG_GENERATE_REPLY);
-        w.u64(command_buffer_id);
+        w.handle(command_buffer_id);
         w.count(true);
         w.i32(ST_COMMAND_BUFFER_BEGIN_INFO);
         w.count(false);
@@ -2232,8 +2351,8 @@ impl VenusClient {
     fn cmd_image_barrier(
         &mut self,
         adapter: &AdapterContext,
-        command_buffer_id: u64,
-        image_id: u64,
+        command_buffer_id: VkCommandBufferId,
+        image_id: VkImageId,
         src_stage: u32,
         dst_stage: u32,
         src_access: u32,
@@ -2245,7 +2364,7 @@ impl VenusClient {
     ) -> Result<(), VirtioError> {
         let mut w = Writer::new();
         w.header(CMD_PIPELINE_BARRIER, 0);
-        w.u64(command_buffer_id);
+        w.handle(command_buffer_id);
         w.u32(src_stage);
         w.u32(dst_stage);
         w.u32(0); // dependencyFlags
@@ -2263,7 +2382,7 @@ impl VenusClient {
         w.u32(new_layout);
         w.u32(src_queue_family);
         w.u32(dst_queue_family);
-        w.u64(image_id);
+        w.handle(image_id);
         w.u32(IMAGE_ASPECT_COLOR);
         w.u32(0);
         w.u32(1);
@@ -2275,8 +2394,8 @@ impl VenusClient {
     fn cmd_buffer_barrier(
         &mut self,
         adapter: &AdapterContext,
-        command_buffer_id: u64,
-        buffer_id: u64,
+        command_buffer_id: VkCommandBufferId,
+        buffer_id: VkBufferId,
         buffer_size: u64,
         src_stage: u32,
         dst_stage: u32,
@@ -2287,7 +2406,7 @@ impl VenusClient {
     ) -> Result<(), VirtioError> {
         let mut w = Writer::new();
         w.header(CMD_PIPELINE_BARRIER, 0);
-        w.u64(command_buffer_id);
+        w.handle(command_buffer_id);
         w.u32(src_stage);
         w.u32(dst_stage);
         w.u32(0); // dependencyFlags
@@ -2301,7 +2420,7 @@ impl VenusClient {
         w.u32(dst_access);
         w.u32(src_queue_family);
         w.u32(dst_queue_family);
-        w.u64(buffer_id);
+        w.handle(buffer_id);
         w.u64(0); // offset
         w.u64(buffer_size);
         w.u32(0); // imageMemoryBarrierCount
@@ -2312,18 +2431,18 @@ impl VenusClient {
     fn cmd_copy_image(
         &mut self,
         adapter: &AdapterContext,
-        command_buffer_id: u64,
-        source_image_id: u64,
-        target_image_id: u64,
+        command_buffer_id: VkCommandBufferId,
+        source_image_id: VkImageId,
+        target_image_id: VkImageId,
         width: u32,
         height: u32,
     ) -> Result<(), VirtioError> {
         let mut w = Writer::new();
         w.header(CMD_COPY_IMAGE, 0);
-        w.u64(command_buffer_id);
-        w.u64(source_image_id);
+        w.handle(command_buffer_id);
+        w.handle(source_image_id);
         w.u32(IMAGE_LAYOUT_GENERAL);
-        w.u64(target_image_id);
+        w.handle(target_image_id);
         w.u32(IMAGE_LAYOUT_GENERAL);
         w.u32(1); // regionCount
         w.u64(1); // pRegions array_size
@@ -2355,9 +2474,9 @@ impl VenusClient {
     fn cmd_blit_image(
         &mut self,
         adapter: &AdapterContext,
-        command_buffer_id: u64,
-        source_image_id: u64,
-        target_image_id: u64,
+        command_buffer_id: VkCommandBufferId,
+        source_image_id: VkImageId,
+        target_image_id: VkImageId,
         width: u32,
         height: u32,
     ) -> Result<(), VirtioError> {
@@ -2365,10 +2484,10 @@ impl VenusClient {
         let height = i32::try_from(height).map_err(|_| VirtioError::DeviceError)?;
         let mut w = Writer::new();
         w.header(CMD_BLIT_IMAGE, 0);
-        w.u64(command_buffer_id);
-        w.u64(source_image_id);
+        w.handle(command_buffer_id);
+        w.handle(source_image_id);
         w.u32(IMAGE_LAYOUT_GENERAL);
-        w.u64(target_image_id);
+        w.handle(target_image_id);
         w.u32(IMAGE_LAYOUT_GENERAL);
         w.u32(1); // regionCount
         w.u64(1); // pRegions array_size
@@ -2403,9 +2522,9 @@ impl VenusClient {
     fn cmd_copy_image_to_buffer(
         &mut self,
         adapter: &AdapterContext,
-        command_buffer_id: u64,
-        source_image_id: u64,
-        destination_buffer_id: u64,
+        command_buffer_id: VkCommandBufferId,
+        source_image_id: VkImageId,
+        destination_buffer_id: VkBufferId,
         width: u32,
         height: u32,
         pitch: u32,
@@ -2420,10 +2539,10 @@ impl VenusClient {
 
         let mut w = Writer::new();
         w.header(CMD_COPY_IMAGE_TO_BUFFER, 0);
-        w.u64(command_buffer_id);
-        w.u64(source_image_id);
+        w.handle(command_buffer_id);
+        w.handle(source_image_id);
         w.u32(IMAGE_LAYOUT_GENERAL);
-        w.u64(destination_buffer_id);
+        w.handle(destination_buffer_id);
         w.u32(1); // regionCount
         w.u64(1); // pRegions array_size
         w.u64(0); // bufferOffset
@@ -2445,15 +2564,15 @@ impl VenusClient {
     fn cmd_clear_color_image(
         &mut self,
         adapter: &AdapterContext,
-        command_buffer_id: u64,
-        image_id: u64,
+        command_buffer_id: VkCommandBufferId,
+        image_id: VkImageId,
     ) -> Result<(), VirtioError> {
         let one = 1.0f32.to_bits();
         let zero = 0.0f32.to_bits();
         let mut w = Writer::new();
         w.header(CMD_CLEAR_COLOR_IMAGE, 0);
-        w.u64(command_buffer_id);
-        w.u64(image_id);
+        w.handle(command_buffer_id);
+        w.handle(image_id);
         w.u32(IMAGE_LAYOUT_GENERAL);
         w.count(true);
         w.u32(2); // VkClearColorValue union tag: uint32[4]
@@ -2475,11 +2594,11 @@ impl VenusClient {
     fn end_command_buffer(
         &mut self,
         adapter: &AdapterContext,
-        command_buffer_id: u64,
+        command_buffer_id: VkCommandBufferId,
     ) -> Result<(), VirtioError> {
         let mut w = Writer::new();
         w.header(CMD_END_COMMAND_BUFFER, CMD_FLAG_GENERATE_REPLY);
-        w.u64(command_buffer_id);
+        w.handle(command_buffer_id);
         self.ring_command_reply(adapter, w.as_slice()?)?;
 
         let mut r = ReplyReader::new(&self.reply_map);
@@ -2495,8 +2614,8 @@ impl VenusClient {
         Ok(())
     }
 
-    fn create_fence(&mut self, adapter: &AdapterContext) -> Result<u64, VirtioError> {
-        let fence_id = self.alloc_handle();
+    fn create_fence(&mut self, adapter: &AdapterContext) -> Result<VkFenceId, VirtioError> {
+        let fence_id = self.new_fence_id();
         let mut w = Writer::new();
         w.header(CMD_CREATE_FENCE, CMD_FLAG_GENERATE_REPLY);
         w.u64(self.device_id);
@@ -2506,7 +2625,7 @@ impl VenusClient {
         w.u32(0); // flags
         w.count(false); // pAllocator
         w.count(true);
-        w.u64(fence_id);
+        w.handle(fence_id);
         self.ring_command_reply(adapter, w.as_slice()?)?;
 
         let mut r = ReplyReader::new(&self.reply_map);
@@ -2524,7 +2643,7 @@ impl VenusClient {
             return Err(VirtioError::DeviceError);
         }
         let returned = r.read_u64()?;
-        if returned != fence_id {
+        if returned != fence_id.get() {
             diag(0x0121);
             return Err(VirtioError::DeviceError);
         }
@@ -2534,14 +2653,14 @@ impl VenusClient {
     fn wait_for_fence(
         &mut self,
         adapter: &AdapterContext,
-        fence_id: u64,
+        fence_id: VkFenceId,
     ) -> Result<(), VirtioError> {
         let mut w = Writer::new();
         w.header(CMD_WAIT_FOR_FENCES, CMD_FLAG_GENERATE_REPLY);
         w.u64(self.device_id);
         w.u32(1); // fenceCount
         w.u64(1); // pFences array_size
-        w.u64(fence_id);
+        w.handle(fence_id);
         w.u32(1); // waitAll
         w.u64(5_000_000_000); // 5 s
         self.ring_command_reply(adapter, w.as_slice()?)?;
@@ -2563,12 +2682,12 @@ impl VenusClient {
     fn destroy_fence(
         &mut self,
         adapter: &AdapterContext,
-        fence_id: u64,
+        fence_id: VkFenceId,
     ) -> Result<(), VirtioError> {
         let mut w = Writer::new();
         w.header(CMD_DESTROY_FENCE, 0);
         w.u64(self.device_id);
-        w.u64(fence_id);
+        w.handle(fence_id);
         w.count(false); // pAllocator
         self.ring_command_noreply(adapter, w.as_slice()?)
     }
@@ -2578,14 +2697,14 @@ impl VenusClient {
     fn queue_submit_fence_marker(
         &mut self,
         adapter: &AdapterContext,
-        fence_id: u64,
+        fence_id: VkFenceId,
     ) -> Result<(), VirtioError> {
         let mut submit = Writer::new();
         submit.header(CMD_QUEUE_SUBMIT, CMD_FLAG_GENERATE_REPLY);
         submit.u64(self.queue_id);
         submit.u32(0); // submitCount
         submit.count(false); // pSubmits
-        submit.u64(fence_id);
+        submit.handle(fence_id);
         self.ring_command_reply(adapter, submit.as_slice()?)?;
 
         let mut r = ReplyReader::new(&self.reply_map);
@@ -2599,8 +2718,8 @@ impl VenusClient {
     fn queue_submit_command_buffer(
         &mut self,
         adapter: &AdapterContext,
-        command_buffer_id: u64,
-        fence_id: u64,
+        command_buffer_id: VkCommandBufferId,
+        fence_id: Option<VkFenceId>,
     ) -> Result<(), VirtioError> {
         let mut submit = Writer::new();
         submit.header(CMD_QUEUE_SUBMIT, CMD_FLAG_GENERATE_REPLY);
@@ -2614,10 +2733,12 @@ impl VenusClient {
         submit.count(false);
         submit.u32(1); // commandBufferCount
         submit.u64(1);
-        submit.u64(command_buffer_id);
+        submit.handle(command_buffer_id);
         submit.u32(0); // signalSemaphoreCount
         submit.count(false);
-        submit.u64(fence_id); // fence
+        // VK_NULL_HANDLE when no fence is wanted: `None` is the only way to
+        // write a zero here now, and it has to be spelled out.
+        submit.u64(fence_id.map_or(0, VkFenceId::get)); // fence
         self.ring_command_reply(adapter, submit.as_slice()?)?;
 
         let mut r = ReplyReader::new(&self.reply_map);
@@ -2637,12 +2758,12 @@ impl VenusClient {
     fn destroy_image_on_ring(
         &mut self,
         adapter: &AdapterContext,
-        image_id: u64,
+        image_id: VkImageId,
     ) -> Result<(), VirtioError> {
         let mut w = Writer::new();
         w.header(CMD_DESTROY_IMAGE, 0);
         w.u64(self.device_id);
-        w.u64(image_id);
+        w.handle(image_id);
         w.count(false);
         self.ring_command_noreply(adapter, w.as_slice()?)
     }
@@ -2650,12 +2771,12 @@ impl VenusClient {
     fn destroy_buffer_on_ring(
         &mut self,
         adapter: &AdapterContext,
-        buffer_id: u64,
+        buffer_id: VkBufferId,
     ) -> Result<(), VirtioError> {
         let mut w = Writer::new();
         w.header(CMD_DESTROY_BUFFER, 0);
         w.u64(self.device_id);
-        w.u64(buffer_id);
+        w.handle(buffer_id);
         w.count(false);
         self.ring_command_noreply(adapter, w.as_slice()?)
     }
@@ -2664,14 +2785,16 @@ impl VenusClient {
         &mut self,
         adapter: &AdapterContext,
         resource_id: u32,
-        image_id: u64,
-        memory_id: u64,
+        image_id: VkImageId,
+        // `None` on the partial-construction paths where the image exists but
+        // its memory allocation never succeeded. That was a bare 0 before, and
+        // it was indistinguishable from a caller that simply forgot the
+        // argument — which is the swap this whole item exists to prevent.
+        memory_id: Option<VkDeviceMemoryId>,
     ) -> Result<(), VirtioError> {
-        if image_id != 0 {
-            self.destroy_image_on_ring(adapter, image_id)?;
-        }
-        if memory_id != 0 {
-            self.free_memory_blob(adapter, memory_id)?;
+        self.destroy_image_on_ring(adapter, image_id)?;
+        if let Some(memory_id) = memory_id {
+            self.free_memory_blob(adapter, memory_id.get())?;
         }
         ctrl::ctx_detach_resource(adapter, self.ctx_id, resource_id)
     }
@@ -2679,12 +2802,9 @@ impl VenusClient {
     fn cleanup_borrowed_present_buffer(
         &mut self,
         adapter: &AdapterContext,
-        buffer_id: u64,
+        buffer_id: VkBufferId,
     ) -> Result<(), VirtioError> {
-        if buffer_id != 0 {
-            self.destroy_buffer_on_ring(adapter, buffer_id)?;
-        }
-        Ok(())
+        self.destroy_buffer_on_ring(adapter, buffer_id)
     }
 
     /// Import one validated ordinary shared OPTIMAL image into the persistent
@@ -2720,14 +2840,14 @@ impl VenusClient {
         {
             Ok(requirements) => requirements,
             Err(e) => {
-                let _ = self.cleanup_imported_source_alias(adapter, desc.resource_id, image_id, 0);
+                let _ = self.cleanup_imported_source_alias(adapter, desc.resource_id, image_id, None);
                 return Err(e);
             }
         };
         if required_size > desc.allocation_size
             || (memory_type_bits & (1u32 << desc.memory_type_index)) == 0
         {
-            let _ = self.cleanup_imported_source_alias(adapter, desc.resource_id, image_id, 0);
+            let _ = self.cleanup_imported_source_alias(adapter, desc.resource_id, image_id, None);
             return Err(VirtioError::DeviceError);
         }
 
@@ -2739,13 +2859,13 @@ impl VenusClient {
         ) {
             Ok(memory_id) => memory_id,
             Err(e) => {
-                let _ = self.cleanup_imported_source_alias(adapter, desc.resource_id, image_id, 0);
+                let _ = self.cleanup_imported_source_alias(adapter, desc.resource_id, image_id, None);
                 return Err(e);
             }
         };
         if let Err(e) = self.bind_image_memory(adapter, image_id, memory_id) {
             let _ =
-                self.cleanup_imported_source_alias(adapter, desc.resource_id, image_id, memory_id);
+                self.cleanup_imported_source_alias(adapter, desc.resource_id, image_id, Some(memory_id));
             return Err(e);
         }
 
@@ -2887,20 +3007,16 @@ impl VenusClient {
     fn ensure_linear_copy_target_ready(
         &mut self,
         adapter: &AdapterContext,
-        target_image_id: u64,
+        target_image_id: VkImageId,
     ) -> Result<(), VirtioError> {
-        if self.copy_target_image_id == target_image_id {
+        if self.copy_target_image_id == Some(target_image_id) {
             return Ok(());
         }
-        if target_image_id == 0 {
-            // No target to prepare against. Route through the ungated fault path:
-            // diag() is DiagLevel-gated, so on a default boot the old refusal was
-            // completely silent and surfaced only as ScCpy=0xE / CpCpy=0xE3.
-            diag(0x0136);
-            crate::diag::fault(crate::diag::FaultCounter::CpTgtE, 0);
-            return Err(VirtioError::DeviceError);
-        }
-        if self.copy_target_image_id != 0 {
+        // The old "target_image_id == 0" refusal (diag 0x0136 + FaultCounter
+        // CpTgtE) is GONE, not dropped: VkImageId is NonZeroU64, so a caller
+        // cannot reach here with a null target. The counter stays defined for
+        // any pre-existing service-key value; nothing increments it now.
+        if self.copy_target_image_id.is_some() {
             // RETARGET, not a refusal. The old code failed here permanently, and
             // the failure was reachable on any resolution change: on the fallback
             // copy path production_linear_scanout mints a NEW LINEAR target
@@ -2919,18 +3035,18 @@ impl VenusClient {
             self.queue_submit_fence_marker(adapter, fence_id)?;
             self.wait_for_fence(adapter, fence_id)?;
             self.destroy_fence(adapter, fence_id)?;
-            if self.copy_target_init_pool_id != 0 {
-                self.destroy_command_pool(adapter, self.copy_target_init_pool_id)?;
+            if let Some(pool_id) = self.copy_target_init_pool_id {
+                self.destroy_command_pool(adapter, pool_id)?;
             }
             // NOT the old target image: it is owned by dedicated_scanout_image /
             // the adapter's cache, never by this client.
-            self.copy_target_image_id = 0;
-            self.copy_target_init_pool_id = 0;
+            self.copy_target_image_id = None;
+            self.copy_target_init_pool_id = None;
             // WRITE-ONLY, see T6/k-venus-17: destroying the pool already freed
-            // its command buffer, so this field has no reader. Zeroed here for
+            // its command buffer, so this field has no reader. Cleared here for
             // consistency rather than given an invented read.
-            self.copy_target_init_command_buffer_id = 0;
-            crate::diag::record_named_bytes(b"CpTgtSw", target_image_id as u32);
+            self.copy_target_init_command_buffer_id = None;
+            crate::diag::record_named_bytes(b"CpTgtSw", target_image_id.get() as u32);
             // Fall through to the normal first-time setup below.
         }
 
@@ -2980,10 +3096,10 @@ impl VenusClient {
         // Publish lifetime before queue submit: if transport failure makes the
         // submission result ambiguous, retaining the pool is always safe while
         // destroying a possibly-pending command buffer is not.
-        self.copy_target_image_id = target_image_id;
-        self.copy_target_init_pool_id = pool_id;
-        self.copy_target_init_command_buffer_id = command_buffer_id;
-        self.queue_submit_command_buffer(adapter, command_buffer_id, 0)
+        self.copy_target_image_id = Some(target_image_id);
+        self.copy_target_init_pool_id = Some(pool_id);
+        self.copy_target_init_command_buffer_id = Some(command_buffer_id);
+        self.queue_submit_command_buffer(adapter, command_buffer_id, None)
     }
 
     /// Record the common reusable EXTERNAL-acquire, GENERAL-layout image copy,
@@ -2992,17 +3108,14 @@ impl VenusClient {
     fn record_reusable_image_copy(
         &mut self,
         adapter: &AdapterContext,
-        source_image_id: u64,
-        target_image_id: u64,
+        source_image_id: VkImageId,
+        target_image_id: VkImageId,
         width: u32,
         height: u32,
-    ) -> Result<(u64, u64), VirtioError> {
-        if source_image_id == 0
-            || target_image_id == 0
-            || source_image_id == target_image_id
-            || width == 0
-            || height == 0
-        {
+    ) -> Result<(VkCommandPoolId, VkCommandBufferId), VirtioError> {
+        // The `== 0` arms of this guard are gone: VkImageId is NonZeroU64, so
+        // a null source or target is no longer expressible here.
+        if source_image_id == target_image_id || width == 0 || height == 0 {
             return Err(VirtioError::DeviceError);
         }
 
@@ -3095,17 +3208,14 @@ impl VenusClient {
     fn record_reusable_image_blit(
         &mut self,
         adapter: &AdapterContext,
-        source_image_id: u64,
-        target_image_id: u64,
+        source_image_id: VkImageId,
+        target_image_id: VkImageId,
         width: u32,
         height: u32,
-    ) -> Result<(u64, u64), VirtioError> {
-        if source_image_id == 0
-            || target_image_id == 0
-            || source_image_id == target_image_id
-            || width == 0
-            || height == 0
-        {
+    ) -> Result<(VkCommandPoolId, VkCommandBufferId), VirtioError> {
+        // The `== 0` arms of this guard are gone: VkImageId is NonZeroU64, so
+        // a null source or target is no longer expressible here.
+        if source_image_id == target_image_id || width == 0 || height == 0 {
             return Err(VirtioError::DeviceError);
         }
 
@@ -3201,16 +3311,15 @@ impl VenusClient {
     fn record_reusable_converted_image_copy(
         &mut self,
         adapter: &AdapterContext,
-        source_image_id: u64,
-        conversion_image_id: u64,
-        target_image_id: u64,
+        source_image_id: VkImageId,
+        conversion_image_id: VkImageId,
+        target_image_id: VkImageId,
         width: u32,
         height: u32,
-    ) -> Result<(u64, u64), VirtioError> {
-        if source_image_id == 0
-            || conversion_image_id == 0
-            || target_image_id == 0
-            || source_image_id == conversion_image_id
+    ) -> Result<(VkCommandPoolId, VkCommandBufferId), VirtioError> {
+        // The three `== 0` arms are unrepresentable now; the distinctness and
+        // extent arms are the ones that still carry information.
+        if source_image_id == conversion_image_id
             || conversion_image_id == target_image_id
             || source_image_id == target_image_id
             || width == 0
@@ -3341,17 +3450,16 @@ impl VenusClient {
     fn record_reusable_present_blt(
         &mut self,
         adapter: &AdapterContext,
-        source_image_id: u64,
-        destination_buffer_id: u64,
+        source_image_id: VkImageId,
+        destination_buffer_id: VkBufferId,
         destination_size: u64,
         width: u32,
         height: u32,
         pitch: u32,
         bytes_per_pixel: u32,
-    ) -> Result<(u64, u64), VirtioError> {
-        if source_image_id == 0
-            || destination_buffer_id == 0
-            || destination_size == 0
+    ) -> Result<(VkCommandPoolId, VkCommandBufferId), VirtioError> {
+        // The two handle `== 0` arms are unrepresentable now.
+        if destination_size == 0
             || width == 0
             || height == 0
             || bytes_per_pixel == 0
@@ -3451,19 +3559,17 @@ impl VenusClient {
     fn record_reusable_converted_present_blt(
         &mut self,
         adapter: &AdapterContext,
-        source_image_id: u64,
-        conversion_image_id: u64,
-        destination_buffer_id: u64,
+        source_image_id: VkImageId,
+        conversion_image_id: VkImageId,
+        destination_buffer_id: VkBufferId,
         destination_size: u64,
         width: u32,
         height: u32,
         pitch: u32,
         bytes_per_pixel: u32,
-    ) -> Result<(u64, u64), VirtioError> {
-        if source_image_id == 0
-            || conversion_image_id == 0
-            || destination_buffer_id == 0
-            || destination_size == 0
+    ) -> Result<(VkCommandPoolId, VkCommandBufferId), VirtioError> {
+        // The three handle `== 0` arms are unrepresentable now.
+        if destination_size == 0
             || width == 0
             || height == 0
             || bytes_per_pixel == 0
@@ -3609,11 +3715,17 @@ impl VenusClient {
         ddi_bind_flags: u32,
         target_image_id: u64,
     ) -> Result<PreparedImageCopy, VirtioError> {
+        // The pub surface still speaks raw u64 (R607 commit 2 converts it); this
+        // is the one place the "0 is not a handle" rule is enforced, and it
+        // reproduces the `target_image_id == 0` arm of the old guard exactly.
+        let Some(target_image_id) = VkImageId::from_raw(target_image_id) else {
+            diag(0x0137);
+            return Err(VirtioError::DeviceError);
+        };
         if source_resource_id == 0
             || source_allocation_size == 0
             || width == 0
             || height == 0
-            || target_image_id == 0
             || source_memory_type_index >= self.memory_type_count
         {
             diag(0x0137);
@@ -3651,7 +3763,7 @@ impl VenusClient {
                         adapter,
                         source_resource_id,
                         source_image_id,
-                        0,
+                        None,
                     );
                     return Err(e);
                 }
@@ -3663,7 +3775,7 @@ impl VenusClient {
         {
             crate::diag::record_named_bytes(b"CpImpSt", 0xE3);
             let _ =
-                self.cleanup_imported_source_alias(adapter, source_resource_id, source_image_id, 0);
+                self.cleanup_imported_source_alias(adapter, source_resource_id, source_image_id, None);
             return Err(VirtioError::DeviceError);
         }
 
@@ -3680,7 +3792,7 @@ impl VenusClient {
                     adapter,
                     source_resource_id,
                     source_image_id,
-                    0,
+                    None,
                 );
                 return Err(e);
             }
@@ -3692,7 +3804,7 @@ impl VenusClient {
                 adapter,
                 source_resource_id,
                 source_image_id,
-                source_memory_id,
+                Some(source_memory_id),
             );
             return Err(e);
         }
@@ -3703,15 +3815,15 @@ impl VenusClient {
                 adapter,
                 source_resource_id,
                 source_image_id,
-                source_memory_id,
+                Some(source_memory_id),
             );
             return Err(e);
         }
 
         crate::diag::record_named_bytes(b"CpImpSt", 7);
-        let mut conversion_image_id = 0;
-        let mut conversion_memory_id = 0;
-        let mut conversion_init_pool_id = 0;
+        let mut conversion_image_id = None;
+        let mut conversion_memory_id = None;
+        let mut conversion_init_pool_id = None;
         let requires_conversion =
             source_pixel_format.vk_format() != target_pixel_format.vk_format();
         let (command_pool_id, command_buffer_id) = if requires_conversion {
@@ -3727,37 +3839,37 @@ impl VenusClient {
                         adapter,
                         source_resource_id,
                         source_image_id,
-                        source_memory_id,
+                        Some(source_memory_id),
                     );
                     return Err(e);
                 }
             };
-            conversion_image_id = conversion.0;
-            conversion_memory_id = conversion.1;
+            conversion_image_id = Some(conversion.0);
+            conversion_memory_id = Some(conversion.1);
             let command = match self.record_reusable_converted_image_copy(
                 adapter,
                 source_image_id,
-                conversion_image_id,
+                conversion.0,
                 target_image_id,
                 width,
                 height,
             ) {
                 Ok(command) => command,
                 Err(e) => {
-                    let _ = self.destroy_image_on_ring(adapter, conversion_image_id);
-                    let _ = self.free_memory_object(adapter, conversion_memory_id);
+                    let _ = self.destroy_image_on_ring(adapter, conversion.0);
+                    let _ = self.free_memory_object(adapter, conversion.1);
                     let _ = self.cleanup_imported_source_alias(
                         adapter,
                         source_resource_id,
                         source_image_id,
-                        source_memory_id,
+                        Some(source_memory_id),
                     );
                     return Err(e);
                 }
             };
             conversion_init_pool_id =
-                match self.initialize_present_conversion_image(adapter, conversion_image_id) {
-                    Ok(pool_id) => pool_id,
+                match self.initialize_present_conversion_image(adapter, conversion.0) {
+                    Ok(pool_id) => Some(pool_id),
                     Err(e) => {
                         // The initializer's submission result is ambiguous.
                         // Its scratch objects must survive until Venus-context
@@ -3768,7 +3880,7 @@ impl VenusClient {
                             adapter,
                             source_resource_id,
                             source_image_id,
-                            source_memory_id,
+                            Some(source_memory_id),
                         );
                         return Err(e);
                     }
@@ -3788,7 +3900,7 @@ impl VenusClient {
                         adapter,
                         source_resource_id,
                         source_image_id,
-                        source_memory_id,
+                        Some(source_memory_id),
                     );
                     return Err(e);
                 }
@@ -3796,17 +3908,19 @@ impl VenusClient {
         };
 
         crate::diag::record_named_bytes(b"CpImpSt", 0x10);
+        // PreparedImageCopy is still a bag of raw u64s; R607 commit (2)
+        // converts it and its AtomicU64 mirrors in create_allocation.rs.
         Ok(PreparedImageCopy {
             owns_source_alias: true,
             source_resource_id,
-            source_image_id,
-            source_memory_id,
-            conversion_image_id,
-            conversion_memory_id,
-            conversion_init_pool_id,
-            command_pool_id,
-            command_buffer_id,
-            target_image_id,
+            source_image_id: source_image_id.get(),
+            source_memory_id: source_memory_id.get(),
+            conversion_image_id: conversion_image_id.map_or(0, VkImageId::get),
+            conversion_memory_id: conversion_memory_id.map_or(0, VkDeviceMemoryId::get),
+            conversion_init_pool_id: conversion_init_pool_id.map_or(0, VkCommandPoolId::get),
+            command_pool_id: command_pool_id.get(),
+            command_buffer_id: command_buffer_id.get(),
+            target_image_id: target_image_id.get(),
             width,
             height,
         })
@@ -3827,21 +3941,24 @@ impl VenusClient {
         source_dxgi_format: u32,
         target_image_id: u64,
     ) -> Result<PreparedImageCopy, VirtioError> {
-        if source_image_id == 0
-            || source_image_id == target_image_id
-            || width == 0
-            || height == 0
-            || target_image_id == 0
-        {
+        // Same pub-boundary conversion as prepare_optimal_scanout_copy: the two
+        // `== 0` arms of the old guard become the two `from_raw` refusals.
+        let (Some(source_image_id), Some(target_image_id)) = (
+            VkImageId::from_raw(source_image_id),
+            VkImageId::from_raw(target_image_id),
+        ) else {
+            return Err(VirtioError::DeviceError);
+        };
+        if source_image_id == target_image_id || width == 0 || height == 0 {
             return Err(VirtioError::DeviceError);
         }
         let source_pixel_format =
             PresentPixelFormat::from_dxgi(source_dxgi_format).ok_or(VirtioError::DeviceError)?;
         let target_pixel_format = PresentPixelFormat::Bgra8Unorm;
         self.ensure_linear_copy_target_ready(adapter, target_image_id)?;
-        let mut conversion_image_id = 0;
-        let mut conversion_memory_id = 0;
-        let mut conversion_init_pool_id = 0;
+        let mut conversion_image_id = None;
+        let mut conversion_memory_id = None;
+        let mut conversion_init_pool_id = None;
         let (command_pool_id, command_buffer_id) =
             if source_pixel_format.vk_format() != target_pixel_format.vk_format() {
                 let conversion = self.create_bound_present_conversion_image(
@@ -3850,26 +3967,26 @@ impl VenusClient {
                     height,
                     target_pixel_format,
                 )?;
-                conversion_image_id = conversion.0;
-                conversion_memory_id = conversion.1;
+                conversion_image_id = Some(conversion.0);
+                conversion_memory_id = Some(conversion.1);
                 let command = match self.record_reusable_converted_image_copy(
                     adapter,
                     source_image_id,
-                    conversion_image_id,
+                    conversion.0,
                     target_image_id,
                     width,
                     height,
                 ) {
                     Ok(command) => command,
                     Err(e) => {
-                        let _ = self.destroy_image_on_ring(adapter, conversion_image_id);
-                        let _ = self.free_memory_object(adapter, conversion_memory_id);
+                        let _ = self.destroy_image_on_ring(adapter, conversion.0);
+                        let _ = self.free_memory_object(adapter, conversion.1);
                         return Err(e);
                     }
                 };
                 conversion_init_pool_id =
-                    match self.initialize_present_conversion_image(adapter, conversion_image_id) {
-                        Ok(pool_id) => pool_id,
+                    match self.initialize_present_conversion_image(adapter, conversion.0) {
+                        Ok(pool_id) => Some(pool_id),
                         Err(e) => {
                             let _ = self.destroy_command_pool(adapter, command.0);
                             return Err(e);
@@ -3888,14 +4005,14 @@ impl VenusClient {
         Ok(PreparedImageCopy {
             owns_source_alias: false,
             source_resource_id: 0,
-            source_image_id,
+            source_image_id: source_image_id.get(),
             source_memory_id: 0,
-            conversion_image_id,
-            conversion_memory_id,
-            conversion_init_pool_id,
-            command_pool_id,
-            command_buffer_id,
-            target_image_id,
+            conversion_image_id: conversion_image_id.map_or(0, VkImageId::get),
+            conversion_memory_id: conversion_memory_id.map_or(0, VkDeviceMemoryId::get),
+            conversion_init_pool_id: conversion_init_pool_id.map_or(0, VkCommandPoolId::get),
+            command_pool_id: command_pool_id.get(),
+            command_buffer_id: command_buffer_id.get(),
+            target_image_id: target_image_id.get(),
             width,
             height,
         })
@@ -3913,7 +4030,7 @@ impl VenusClient {
     ) -> Result<u64, VirtioError> {
         if copy.command_buffer_id == 0
             || copy.source_image_id == 0
-            || copy.target_image_id != self.copy_target_image_id
+            || Some(copy.target_image_id) != self.copy_target_image_id.map(VkImageId::get)
         {
             return Err(VirtioError::DeviceError);
         }
@@ -3948,7 +4065,7 @@ impl VenusClient {
         )
     }
 
-    fn encode_command_buffer_submit(&self, command_buffer_id: u64) -> Writer {
+    fn encode_command_buffer_submit(&self, command_buffer_id: VkCommandBufferId) -> Writer {
         let mut submit = Writer::new();
         submit.header(CMD_QUEUE_SUBMIT, 0);
         submit.u64(self.queue_id);
@@ -3961,7 +4078,7 @@ impl VenusClient {
         submit.count(false); // pWaitDstStageMask
         submit.u32(1); // commandBufferCount
         submit.u64(1); // pCommandBuffers array_size
-        submit.u64(command_buffer_id);
+        submit.handle(command_buffer_id);
         submit.u32(0); // signalSemaphoreCount
         submit.count(false); // pSignalSemaphores
         submit.u64(0); // fence
@@ -4038,9 +4155,9 @@ impl VenusClient {
         let blt_index = match existing {
             Some(index) => index,
             None => {
-                let mut conversion_image_id = 0;
-                let mut conversion_memory_id = 0;
-                let mut conversion_init_pool_id = 0;
+                let mut conversion_image_id = None;
+                let mut conversion_memory_id = None;
+                let mut conversion_init_pool_id = None;
                 let command_result = match destination {
                     PresentDestinationDesc::StandardBuffer(desc) => {
                         let destination_buffer =
@@ -4052,12 +4169,12 @@ impl VenusClient {
                                 source.height,
                                 destination_pixel_format,
                             )?;
-                            conversion_image_id = conversion.0;
-                            conversion_memory_id = conversion.1;
+                            conversion_image_id = Some(conversion.0);
+                            conversion_memory_id = Some(conversion.1);
                             let command = match self.record_reusable_converted_present_blt(
                                 adapter,
                                 source_image.image_id,
-                                conversion_image_id,
+                                conversion.0,
                                 destination_buffer.buffer_id,
                                 desc.allocation_size,
                                 source.width,
@@ -4070,16 +4187,14 @@ impl VenusClient {
                                     // The scratch image has never been submitted,
                                     // so a recording failure is safe to unwind
                                     // completely and cannot leak once per frame.
-                                    let _ =
-                                        self.destroy_image_on_ring(adapter, conversion_image_id);
-                                    let _ = self.free_memory_object(adapter, conversion_memory_id);
+                                    let _ = self.destroy_image_on_ring(adapter, conversion.0);
+                                    let _ = self.free_memory_object(adapter, conversion.1);
                                     return Err(error);
                                 }
                             };
-                            conversion_init_pool_id = self.initialize_present_conversion_image(
-                                adapter,
-                                conversion_image_id,
-                            )?;
+                            conversion_init_pool_id = Some(
+                                self.initialize_present_conversion_image(adapter, conversion.0)?,
+                            );
                             Ok(command)
                         } else {
                             self.record_reusable_present_blt(
@@ -4332,19 +4447,19 @@ impl VenusClient {
 
         while let Some(blt) = self.present_blits.pop() {
             self.destroy_command_pool(adapter, blt.command_pool_id)?;
-            if blt.conversion_init_pool_id != 0 {
-                self.destroy_command_pool(adapter, blt.conversion_init_pool_id)?;
+            if let Some(pool_id) = blt.conversion_init_pool_id {
+                self.destroy_command_pool(adapter, pool_id)?;
             }
-            if blt.conversion_image_id != 0 {
-                self.destroy_image_on_ring(adapter, blt.conversion_image_id)?;
+            if let Some(image_id) = blt.conversion_image_id {
+                self.destroy_image_on_ring(adapter, image_id)?;
             }
-            if blt.conversion_memory_id != 0 {
-                self.free_memory_object(adapter, blt.conversion_memory_id)?;
+            if let Some(memory_id) = blt.conversion_memory_id {
+                self.free_memory_object(adapter, memory_id)?;
             }
         }
         while let Some(image) = self.present_images.pop() {
             self.destroy_image_on_ring(adapter, image.image_id)?;
-            self.free_memory_blob(adapter, image.memory_id)?;
+            self.free_memory_blob(adapter, image.memory_id.get())?;
             // Each resource occurs exactly once in present_images.
             ctrl::ctx_detach_resource(adapter, self.ctx_id, image.desc.resource_id)?;
         }
@@ -4389,22 +4504,31 @@ impl VenusClient {
             return Err(e);
         }
         self.destroy_fence(adapter, fence_id)?;
-        self.destroy_command_pool(adapter, copy.command_pool_id)?;
-        if copy.conversion_init_pool_id != 0 {
-            self.destroy_command_pool(adapter, copy.conversion_init_pool_id)?;
+        // PreparedImageCopy is still raw u64 (R607 commit 2). Every `!= 0`
+        // guard below becomes a `from_raw`, which is the same test; the
+        // unconditional pool destroy becomes conditional, which is also the
+        // same behaviour, because vkDestroyCommandPool(VK_NULL_HANDLE) is a
+        // documented no-op.
+        if let Some(pool_id) = VkCommandPoolId::from_raw(copy.command_pool_id) {
+            self.destroy_command_pool(adapter, pool_id)?;
         }
-        if copy.conversion_image_id != 0 {
-            self.destroy_image_on_ring(adapter, copy.conversion_image_id)?;
+        if let Some(pool_id) = VkCommandPoolId::from_raw(copy.conversion_init_pool_id) {
+            self.destroy_command_pool(adapter, pool_id)?;
         }
-        if copy.conversion_memory_id != 0 {
-            self.free_memory_object(adapter, copy.conversion_memory_id)?;
+        if let Some(image_id) = VkImageId::from_raw(copy.conversion_image_id) {
+            self.destroy_image_on_ring(adapter, image_id)?;
+        }
+        if let Some(memory_id) = VkDeviceMemoryId::from_raw(copy.conversion_memory_id) {
+            self.free_memory_object(adapter, memory_id)?;
         }
         if copy.owns_source_alias {
+            let source_image_id =
+                VkImageId::from_raw(copy.source_image_id).ok_or(VirtioError::DeviceError)?;
             self.cleanup_imported_source_alias(
                 adapter,
                 copy.source_resource_id,
-                copy.source_image_id,
-                copy.source_memory_id,
+                source_image_id,
+                VkDeviceMemoryId::from_raw(copy.source_memory_id),
             )
         } else {
             Ok(())
@@ -4419,6 +4543,7 @@ impl VenusClient {
         adapter: &AdapterContext,
         image_id: u64,
     ) -> Result<(), VirtioError> {
+        let image_id = VkImageId::from_raw(image_id).ok_or(VirtioError::DeviceError)?;
         crate::diag::record_named_bytes(b"SdgGpS", 1);
         let pool_id = self.create_command_pool(adapter)?;
         crate::diag::record_named_bytes(b"SdgGpP", 1);
@@ -4470,13 +4595,13 @@ impl VenusClient {
             let fence_id = if crate::diag::read_config_dword(b"ScanoutDiag", 0) >= 6 {
                 let fence_id = self.create_fence(adapter)?;
                 crate::diag::record_named_bytes(b"SdgGpF", 1);
-                fence_id
+                Some(fence_id)
             } else {
-                0
+                None
             };
             self.queue_submit_command_buffer(adapter, command_buffer_id, fence_id)?;
             crate::diag::record_named_bytes(b"SdgGpSub", 1);
-            if fence_id != 0 {
+            if let Some(fence_id) = fence_id {
                 self.wait_for_fence(adapter, fence_id)?;
                 crate::diag::record_named_bytes(b"SdgGpW", 1);
             }
@@ -4541,7 +4666,7 @@ impl VenusClient {
             self.ctx_id,
             VIRTIO_GPU_BLOB_MEM_HOST3D,
             blob_flags,
-            memory_id,
+            memory_id.get(),
             alloc_size,
         )?;
         if (blob_flags & VIRTIO_GPU_BLOB_FLAG_USE_CROSS_DEVICE) != 0 && diag_mode == 10 {
@@ -4555,12 +4680,12 @@ impl VenusClient {
         let _ = adapter.with_virtio(|v| v.note_blob_size(res_id, alloc_size));
         Ok(ScanoutImageBlob {
             blob: HostVisibleBlob {
-                blob_id: memory_id,
+                blob_id: memory_id.get(),
                 res_id,
                 gpa: 0,
                 size: alloc_size,
             },
-            image_id,
+            image_id: image_id.get(),
             memory_type_index,
             row_pitch: row_pitch as u32,
             plane_offset: offset as u32,
@@ -4598,14 +4723,14 @@ impl VenusClient {
             match self.image_memory_requirements(adapter, image_id) {
                 Ok(requirements) => requirements,
                 Err(error) => {
-                    let _ = self.destroy_image(adapter, image_id);
+                    let _ = self.destroy_image(adapter, image_id.get());
                     return Err(error);
                 }
             };
         let memory_type_index = match self.choose_device_local_memory_type(memory_type_bits) {
             Some(choice) => Self::accept_memory_type(choice),
             None => {
-                let _ = self.destroy_image(adapter, image_id);
+                let _ = self.destroy_image(adapter, image_id.get());
                 return Err(VirtioError::DeviceError);
             }
         };
@@ -4618,13 +4743,13 @@ impl VenusClient {
         ) {
             Ok(id) => id,
             Err(error) => {
-                let _ = self.destroy_image(adapter, image_id);
+                let _ = self.destroy_image(adapter, image_id.get());
                 return Err(error);
             }
         };
         if let Err(error) = self.bind_image_memory(adapter, image_id, memory_id) {
-            let _ = self.destroy_image(adapter, image_id);
-            let _ = self.free_memory_blob(adapter, memory_id);
+            let _ = self.destroy_image(adapter, image_id.get());
+            let _ = self.free_memory_blob(adapter, memory_id.get());
             return Err(error);
         }
 
@@ -4634,13 +4759,13 @@ impl VenusClient {
             self.ctx_id,
             VIRTIO_GPU_BLOB_MEM_HOST3D,
             blob_flags,
-            memory_id,
+            memory_id.get(),
             allocation_size,
         ) {
             Ok(id) => id,
             Err(error) => {
-                let _ = self.destroy_image(adapter, image_id);
-                let _ = self.free_memory_blob(adapter, memory_id);
+                let _ = self.destroy_image(adapter, image_id.get());
+                let _ = self.free_memory_blob(adapter, memory_id.get());
                 return Err(error);
             }
         };
@@ -4648,12 +4773,12 @@ impl VenusClient {
 
         Ok(OptimalImageBlob {
             blob: HostVisibleBlob {
-                blob_id: memory_id,
+                blob_id: memory_id.get(),
                 res_id: resource_id,
                 gpa: 0,
                 size: allocation_size,
             },
-            image_id,
+            image_id: image_id.get(),
             memory_type_index,
         })
     }
@@ -4724,19 +4849,19 @@ impl VenusClient {
             self.ctx_id,
             VIRTIO_GPU_BLOB_MEM_HOST3D,
             blob_flags,
-            memory_id,
+            memory_id.get(),
             alloc_size,
         )?;
         let _ = adapter.with_virtio(|v| v.note_blob_size(res_id, alloc_size));
         crate::diag::record_named_bytes(b"SdgLStg", 0x10);
         Ok(ScanoutImageBlob {
             blob: HostVisibleBlob {
-                blob_id: memory_id,
+                blob_id: memory_id.get(),
                 res_id,
                 gpa: 0,
                 size: alloc_size,
             },
-            image_id,
+            image_id: image_id.get(),
             memory_type_index,
             row_pitch: row_pitch as u32,
             plane_offset: offset as u32,
@@ -4751,10 +4876,11 @@ impl VenusClient {
         adapter: &AdapterContext,
         image_id: u64,
     ) -> Result<(), VirtioError> {
+        let image_id = VkImageId::from_raw(image_id).ok_or(VirtioError::DeviceError)?;
         let mut w = Writer::new();
         w.header(CMD_DESTROY_IMAGE, 0);
         w.u64(self.device_id);
-        w.u64(image_id);
+        w.handle(image_id);
         w.count(false);
         self.submit_direct(adapter, w.as_slice()?)
     }
@@ -4763,12 +4889,12 @@ impl VenusClient {
     fn free_memory_object(
         &mut self,
         adapter: &AdapterContext,
-        memory_id: u64,
+        memory_id: VkDeviceMemoryId,
     ) -> Result<(), VirtioError> {
         let mut w = Writer::new();
         w.header(CMD_FREE_MEMORY, 0);
         w.u64(self.device_id);
-        w.u64(memory_id);
+        w.handle(memory_id);
         w.count(false); // pAllocator = NULL
         self.ring_command_noreply(adapter, w.as_slice()?)
     }
@@ -4784,6 +4910,7 @@ impl VenusClient {
         adapter: &AdapterContext,
         memory_id: u64,
     ) -> Result<(), VirtioError> {
+        let memory_id = VkDeviceMemoryId::from_raw(memory_id).ok_or(VirtioError::DeviceError)?;
         if self
             .present_buffers
             .iter()
@@ -4873,7 +5000,7 @@ pub fn allocate_host_visible_blob(
         cur: 0,
         notify_seqno: 0,
         roundtrip_seqno: 0,
-        next_handle: 1,
+        next_handle: NonZeroU64::MIN,
         ctx_id,
         instance_id: 0,
         device_id: 0,
@@ -4882,9 +5009,9 @@ pub fn allocate_host_visible_blob(
         memory_type_flags: [0; VK_MAX_MEMORY_TYPES as usize],
         memory_type_count: 0,
         fatal: false,
-        copy_target_image_id: 0,
-        copy_target_init_pool_id: 0,
-        copy_target_init_command_buffer_id: 0,
+        copy_target_image_id: None,
+        copy_target_init_pool_id: None,
+        copy_target_init_command_buffer_id: None,
         present_images: Vec::with_capacity(MAX_PRESENT_IMAGES),
         present_buffers: Vec::with_capacity(MAX_PRESENT_BUFFERS),
         present_blits: Vec::with_capacity(MAX_PRESENT_BLITS),
@@ -4925,7 +5052,7 @@ pub fn allocate_host_visible_blob(
     diag(0x0005);
 
     // ── 4. vkCreateInstance (ring, reply) ─────────────────────────────────────
-    let instance_id = client.alloc_handle();
+    let instance_id = client.next_raw().get();
     client.instance_id = instance_id;
     {
         let mut w = Writer::new();
@@ -4982,7 +5109,7 @@ pub fn allocate_host_visible_blob(
     // Array call: request up to 1 physical device. Physical-device handles are
     // GUEST-assigned like all venus handles (the host rejects a 0 placeholder with
     // "invalid object id 0"), so pre-allocate an id for the slot.
-    let phys_dev_id = client.alloc_handle();
+    let phys_dev_id = client.next_raw().get();
     {
         let mut w = Writer::new();
         w.header(CMD_ENUMERATE_PHYSICAL_DEVICES, CMD_FLAG_GENERATE_REPLY);
@@ -5142,7 +5269,7 @@ pub fn allocate_host_visible_blob(
             1 => &EXT_EXPORT,
             _ => &[],
         };
-        let device_id = client.alloc_handle();
+        let device_id = client.next_raw().get();
         client.device_id = device_id;
         let mut w = Writer::new();
         w.header(CMD_CREATE_DEVICE, CMD_FLAG_GENERATE_REPLY);

@@ -488,6 +488,14 @@ impl Writer {
         self.len += padded;
     }
 
+    /// A Vulkan object handle. Identical bytes to [`Writer::u64`]; the separate
+    /// name exists so the KMD's per-class handle newtypes can be written without
+    /// spelling out a conversion at every encoder, and so a reader can see at a
+    /// glance which 8-byte words in a stream are handles.
+    pub fn handle<H: Into<u64>>(&mut self, h: H) {
+        self.u64(h.into());
+    }
+
     /// The command header: `VkCommandTypeEXT | VkCommandFlagsEXT`.
     pub fn header(&mut self, cmd_type: u32, flags: u32) {
         self.u32(cmd_type);
