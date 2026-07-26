@@ -45,33 +45,50 @@ pub(crate) fn drain_used_and_complete(adapter: &AdapterContext) {
             adapter.request_scanout_refresh();
         }
 
+        // One at a time, so a failed notification can put its fence back. The
+        // old batch popped up to eight entries BEFORE attempting any delivery
+        // and then discarded every status with `let _ =`. A failed
+        // DxgkCbSynchronizeExecution therefore left the fence in no queue at
+        // all, with the completed watermark still below it and no counter
+        // recording the loss (DMA_SYNC_STATUS_LOW/DMA_SYNC_RET are
+        // last-value-wins, so a later successful notify erased the only trace).
+        // On an idle desktop VidSch then never sees that fence retire and
+        // escalates to TDR.
         loop {
-            let mut ready = [crate::virtio::gpu::WddmReady {
-                fence: 0,
-                refresh_scanout: false,
-            }; 8];
-            let n = adapter
-                .with_virtio(|v| v.take_ready_wddm(guard, &mut ready))
-                .unwrap_or(0);
-            if n == 0 {
+            let Some(ready) = adapter
+                .with_virtio(|v| v.take_one_ready_wddm(guard))
+                .ok()
+                .flatten()
+            else {
                 break;
+            };
+            if ready.refresh_scanout() {
+                adapter.request_scanout_refresh();
             }
-            for ready in &ready[..n] {
-                if ready.refresh_scanout {
-                    adapter.request_scanout_refresh();
-                }
-                if let Some(dxgkrnl) = adapter.dxgkrnl.as_ref() {
-                    // SAFETY: the WDDM notification lock is held; the helper
-                    // raises to DIRQL for the callback without re-locking.
-                    let _ = unsafe {
-                        super::submit_command::signal_dma_completed_locked(
-                            guard,
-                            dxgkrnl,
-                            ready.fence,
-                        )
-                    };
-                }
+            let Some(dxgkrnl) = adapter.dxgkrnl.as_ref() else {
+                // No callback table: we cannot deliver and must not drop it.
+                let _ = adapter.with_virtio(|v| v.requeue_wddm_front(guard, ready));
+                break;
+            };
+            // SAFETY: the WDDM notification lock is held; the helper
+            // raises to DIRQL for the callback without re-locking.
+            let status = unsafe {
+                super::submit_command::signal_dma_completed_locked(guard, dxgkrnl, ready.fence())
+            };
+            if status == STATUS_SUCCESS {
+                ready.delivered();
+                continue;
             }
+            super::submit_command::DMA_NOTIFY_FAILS.fetch_add(1, Ordering::Relaxed);
+            let _ = adapter.with_virtio(|v| v.requeue_wddm_front(guard, ready));
+            // Retry on the next DPC rather than spinning here: the failure is a
+            // stop/rebalance window, so give dxgkrnl a chance to make progress.
+            if let Some(queue_dpc) = dxgkrnl.DxgkCbQueueDpc {
+                // SAFETY: DxgkCbQueueDpc is callable at <= DIRQL with a valid
+                // DeviceHandle; we hold the notify lock, which it does not take.
+                unsafe { queue_dpc(dxgkrnl.DeviceHandle) };
+            }
+            break;
         }
     });
 }

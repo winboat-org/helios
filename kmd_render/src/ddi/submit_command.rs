@@ -31,6 +31,15 @@ pub static DMA_NOTIFY_COUNT: AtomicU32 = AtomicU32::new(0);
 pub static DMA_QUEUE_DPC_COUNT: AtomicU32 = AtomicU32::new(0);
 pub static DMA_SYNC_STATUS_LOW: AtomicU32 = AtomicU32::new(0);
 pub static DMA_SYNC_RET: AtomicU32 = AtomicU32::new(0);
+/// `DXGK_INTERRUPT_DMA_COMPLETED` deliveries that failed and whose fence was
+/// therefore put back at the head of the pending FIFO for a later DPC.
+///
+/// This is the counter that did not exist: `DMA_SYNC_STATUS_LOW`/`DMA_SYNC_RET`
+/// are last-value-wins, so a later successful notify erased the only trace that
+/// a fence had been lost. Nonzero means the retry path ran; a *rising* value on
+/// an otherwise healthy boot means dxgkrnl is repeatedly refusing the
+/// synchronized callback.
+pub static DMA_NOTIFY_FAILS: AtomicU32 = AtomicU32::new(0);
 /// Older DMA_COMPLETED packets suppressed after a newer watermark won the
 /// cross-CPU notification race. The newer watermark implicitly retires them.
 pub static DMA_STALE_SKIP_COUNT: AtomicU32 = AtomicU32::new(0);

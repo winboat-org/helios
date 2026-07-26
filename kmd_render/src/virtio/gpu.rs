@@ -693,10 +693,35 @@ struct WddmPending {
     refresh_scanout: bool,
 }
 
-#[derive(Clone, Copy)]
+/// A WDDM submission popped from the pending FIFO whose `DMA_COMPLETED` has not
+/// yet been delivered.
+///
+/// Deliberately **not** `Copy`, and consumed by exactly two operations
+/// ([`WddmReady::delivered`] and [`VirtioGpu::requeue_wddm_front`]). While this
+/// value is alive the entry is in no queue at all: the fence is out of
+/// `wddm_pending` and the completed watermark still points below it. Dropping it
+/// without doing either loses the fence permanently, VidSch never sees it retire,
+/// and the only symptom is a TDR. The `Copy` derive it used to have was what made
+/// the old `[WddmReady; 8]` batch array possible, which is why the one-at-a-time
+/// taker is a precondition of this encoding rather than a stylistic choice.
+#[must_use = "a popped WDDM fence must be delivered or requeued, never dropped"]
 pub struct WddmReady {
-    pub fence: u32,
-    pub refresh_scanout: bool,
+    pending: WddmPending,
+}
+
+impl WddmReady {
+    pub fn fence(&self) -> u32 {
+        self.pending.fence
+    }
+
+    pub fn refresh_scanout(&self) -> bool {
+        self.pending.refresh_scanout
+    }
+
+    /// Consume the token after `DMA_COMPLETED` was delivered successfully.
+    /// Exists so the success path *states* that it consumed the fence rather
+    /// than letting it fall out of scope.
+    pub fn delivered(self) {}
 }
 
 /// Result of [`VirtioGpu::fence_wait_prepare`].
@@ -1839,30 +1864,35 @@ impl VirtioGpu {
     /// Pop every head-of-FIFO WDDM submission whose venus watermark has been
     /// reached, up to `out.len()` of them. The DPC signals DMA_COMPLETED for
     /// each, in order, OUTSIDE the device spinlock.
-    pub fn take_ready_wddm(
+    pub fn take_one_ready_wddm(
         &mut self,
         _notify_guard: &crate::adapter::WddmNotifyGuard<'_>,
-        out: &mut [WddmReady],
-    ) -> usize {
-        let mut n = 0;
-        while n < out.len() {
-            let Some(head) = self.wddm_pending.front() else {
-                break;
-            };
-            if !self.async_retired_up_to(head.watermark, head.wait_gpu) {
-                break;
-            }
-            out[n] = WddmReady {
-                fence: head.fence,
-                refresh_scanout: head.refresh_scanout,
-            };
-            self.wddm_pending.pop_front();
-            n += 1;
+    ) -> Option<WddmReady> {
+        let (watermark, wait_gpu) = {
+            let head = self.wddm_pending.front()?;
+            (head.watermark, head.wait_gpu)
+        };
+        if !self.async_retired_up_to(watermark, wait_gpu) {
+            return None;
         }
-        if n > 0 {
-            WDDM_FENCE_FROM_DPC.fetch_add(n as u32, Ordering::Relaxed);
-        }
-        n
+        let pending = self.wddm_pending.pop_front()?;
+        WDDM_FENCE_FROM_DPC.fetch_add(1, Ordering::Relaxed);
+        Some(WddmReady { pending })
+    }
+
+    /// Put a popped-but-undelivered submission back at the head of the FIFO.
+    ///
+    /// dxgkrnl requires monotonic SubmissionFenceId completion, so the entry
+    /// must go back where it came from — `push_front` of the entry just popped
+    /// is the only correct form. It also cannot exceed the
+    /// `VecDeque::with_capacity(MAX_WDDM_PENDING)` reserve, so nothing
+    /// reallocates under the device spinlock.
+    pub fn requeue_wddm_front(
+        &mut self,
+        _notify_guard: &crate::adapter::WddmNotifyGuard<'_>,
+        ready: WddmReady,
+    ) {
+        self.wddm_pending.push_front(ready.pending);
     }
 
     /// Preemption: drop every pending WDDM submission (dxgkrnl resubmits the
