@@ -1995,12 +1995,17 @@ impl VirtioGpu {
 
     /// Capture the exact Venus ordering boundary for a scanout dirty marker.
     ///
-    /// The notification-lock proof makes the lock order (`wddm_notify` before
-    /// `virtio`) part of the type contract. Returns true when all preceding GPU
-    /// work has already retired and the caller may refresh immediately.
+    /// The `NotifyOrdered` token is mintable only inside
+    /// `WddmNotifyGuard::with_virtio`, so reaching this method proves that THIS
+    /// adapter's `wddm_notify` lock was taken before its `virtio` lock and is
+    /// still held. (The previous `&WddmNotifyGuard` parameter proved only that
+    /// SOME adapter's notify lock was held somewhere — it carried no
+    /// relationship to the `&mut VirtioGpu` being mutated.) Returns true when
+    /// all preceding GPU work has already retired and the caller may refresh
+    /// immediately.
     pub fn note_scanout_refresh(
         &mut self,
-        _notify_guard: &crate::adapter::WddmNotifyGuard<'_>,
+        _order: &crate::adapter::NotifyOrdered<'_>,
     ) -> bool {
         let watermark = self.next_wire_fence;
         if self.async_retired_up_to(watermark, true) {
@@ -2017,7 +2022,7 @@ impl VirtioGpu {
     /// [`Self::note_scanout_refresh`].
     pub fn take_ready_scanout_refresh(
         &mut self,
-        _notify_guard: &crate::adapter::WddmNotifyGuard<'_>,
+        _order: &crate::adapter::NotifyOrdered<'_>,
     ) -> bool {
         let Some(watermark) = self.scanout_refresh_watermark else {
             return false;
@@ -2058,7 +2063,7 @@ impl VirtioGpu {
     /// monotonically.
     pub fn note_wddm_submission(
         &mut self,
-        _notify_guard: &crate::adapter::WddmNotifyGuard<'_>,
+        _order: &crate::adapter::NotifyOrdered<'_>,
         fence: u32,
         paging: bool,
         gpu_completion_fence: Option<u64>,
@@ -2117,7 +2122,7 @@ impl VirtioGpu {
     /// each, in order, OUTSIDE the device spinlock.
     pub fn take_one_ready_wddm(
         &mut self,
-        _notify_guard: &crate::adapter::WddmNotifyGuard<'_>,
+        _order: &crate::adapter::NotifyOrdered<'_>,
     ) -> Option<WddmReady> {
         let (watermark, wait_gpu) = {
             let head = self.wddm_pending.front()?;
@@ -2140,7 +2145,7 @@ impl VirtioGpu {
     /// reallocates under the device spinlock.
     pub fn requeue_wddm_front(
         &mut self,
-        _notify_guard: &crate::adapter::WddmNotifyGuard<'_>,
+        _order: &crate::adapter::NotifyOrdered<'_>,
         ready: WddmReady,
     ) {
         self.wddm_pending.push_front(ready.pending);
@@ -2150,7 +2155,7 @@ impl VirtioGpu {
     /// unfinished DMA buffers with fresh fence ids after the preempt completes;
     /// the underlying venus work keeps executing host-side). Returns the count
     /// dropped.
-    pub fn preempt_flush(&mut self, _notify_guard: &crate::adapter::WddmNotifyGuard<'_>) -> u32 {
+    pub fn preempt_flush(&mut self, _order: &crate::adapter::NotifyOrdered<'_>) -> u32 {
         let n = self.wddm_pending.len() as u32;
         self.wddm_pending.clear();
         n

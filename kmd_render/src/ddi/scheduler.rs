@@ -114,7 +114,7 @@ pub unsafe extern "C" fn dxgkddi_reset_engine(
     // The queue mutation requires the notification-lock proof token, so no DMA
     // completion from the abandoned scheduler epoch can escape concurrently.
     adapter.with_wddm_notify_lock(|guard| {
-        let _ = adapter.with_virtio(|v| v.preempt_flush(guard));
+        let _ = guard.with_virtio(|o, v| v.preempt_flush(o));
         reset.LastAbortedFenceId = guard.completed_fence() as UINT;
     });
     STATUS_SUCCESS

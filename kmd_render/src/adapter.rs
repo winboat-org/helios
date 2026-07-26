@@ -452,6 +452,24 @@ pub(crate) struct WddmNotifyGuard<'a> {
     adapter: &'a AdapterContext,
 }
 
+/// Proof that `wddm_notify_lock` was taken BEFORE `virtio_lock`, on the SAME
+/// adapter, and is still held.
+///
+/// Mintable only inside [`WddmNotifyGuard::with_virtio`], which is the only way
+/// to reach the six [`VirtioGpu`] methods whose contract depends on the notify
+/// lock. That is what the plain `&WddmNotifyGuard` parameter used to claim and
+/// did not deliver: a guard carries no relationship to the `&mut VirtioGpu`
+/// being mutated, so `adapter_a.with_wddm_notify_lock(|g| adapter_b.with_virtio(
+/// |v| v.note_wddm_submission(g, ..)))` compiled and mutated B's fence FIFO
+/// under A's lock.
+///
+/// Honest gap: a caller that already holds `virtio_lock` and calls
+/// `guard.with_virtio` recursively acquires it and self-deadlocks. Rust cannot
+/// see that, so it stays a comment.
+pub(crate) struct NotifyOrdered<'a> {
+    _lock: PhantomData<&'a ()>,
+}
+
 impl WddmNotifyGuard<'_> {
     pub(crate) fn completed_fence(&self) -> u32 {
         self.adapter.last_completed_fence.load(Ordering::Acquire)
@@ -461,6 +479,31 @@ impl WddmNotifyGuard<'_> {
         self.adapter
             .last_completed_fence
             .store(fence, Ordering::Release);
+    }
+
+    /// Run `f` against this adapter's transport with the notify lock already
+    /// held, handing it the [`NotifyOrdered`] token the ordered transport
+    /// methods require.
+    ///
+    /// The closure receives no `&AdapterContext`, so it cannot re-enter the
+    /// notify lock; and because the same `&self` mints both borrows, the
+    /// cross-adapter call above stops compiling.
+    ///
+    /// ⚠ Do NOT grow this into a `with_notify_then_virtio` that holds both locks
+    /// for one closure: `drain_used_and_complete` deliberately makes several
+    /// separate `with_virtio` calls inside one notify scope and runs
+    /// `request_scanout_refresh()` and `signal_dma_completed_locked()` (which
+    /// raises to the device DIRQL via `DxgkCbSynchronizeExecution`) between
+    /// them. Folding those into one transport critical section would change
+    /// frame-path timing.
+    pub(crate) fn with_virtio<R>(
+        &self,
+        f: impl FnOnce(&NotifyOrdered<'_>, &mut VirtioGpu) -> R,
+    ) -> Result<R, DriverError> {
+        self.adapter.with_virtio(|v| {
+            let order = NotifyOrdered { _lock: PhantomData };
+            f(&order, v)
+        })
     }
 }
 

@@ -38,8 +38,8 @@ pub(crate) fn drain_used_and_complete(adapter: &AdapterContext) {
     let _ = adapter.with_virtio(|v| v.drain_used());
 
     adapter.with_wddm_notify_lock(|guard| {
-        let refresh_ready = adapter
-            .with_virtio(|v| v.take_ready_scanout_refresh(guard))
+        let refresh_ready = guard
+            .with_virtio(|o, v| v.take_ready_scanout_refresh(o))
             .unwrap_or(false);
         if refresh_ready {
             adapter.request_scanout_refresh();
@@ -55,8 +55,8 @@ pub(crate) fn drain_used_and_complete(adapter: &AdapterContext) {
         // On an idle desktop VidSch then never sees that fence retire and
         // escalates to TDR.
         loop {
-            let Some(ready) = adapter
-                .with_virtio(|v| v.take_one_ready_wddm(guard))
+            let Some(ready) = guard
+                .with_virtio(|o, v| v.take_one_ready_wddm(o))
                 .ok()
                 .flatten()
             else {
@@ -67,7 +67,7 @@ pub(crate) fn drain_used_and_complete(adapter: &AdapterContext) {
             }
             let Some(dxgkrnl) = adapter.dxgkrnl.as_ref() else {
                 // No callback table: we cannot deliver and must not drop it.
-                let _ = adapter.with_virtio(|v| v.requeue_wddm_front(guard, ready));
+                let _ = guard.with_virtio(|o, v| v.requeue_wddm_front(o, ready));
                 break;
             };
             // SAFETY: the WDDM notification lock is held; the helper
@@ -80,7 +80,7 @@ pub(crate) fn drain_used_and_complete(adapter: &AdapterContext) {
                 continue;
             }
             super::submit_command::DMA_NOTIFY_FAILS.fetch_add(1, Ordering::Relaxed);
-            let _ = adapter.with_virtio(|v| v.requeue_wddm_front(guard, ready));
+            let _ = guard.with_virtio(|o, v| v.requeue_wddm_front(o, ready));
             // Retry on the next DPC rather than spinning here: the failure is a
             // stop/rebalance window, so give dxgkrnl a chance to make progress.
             if let Some(queue_dpc) = dxgkrnl.DxgkCbQueueDpc {

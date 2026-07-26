@@ -391,15 +391,9 @@ fn note_and_maybe_signal(
         return SubmitAck::Accepted;
     };
     adapter.with_wddm_notify_lock(|guard| {
-        let signal_now = adapter
-            .with_virtio(|v| {
-                v.note_wddm_submission(
-                    guard,
-                    fence,
-                    is_paging,
-                    gpu_completion_fence,
-                    refresh_scanout,
-                )
+        let signal_now = guard
+            .with_virtio(|o, v| {
+                v.note_wddm_submission(o, fence, is_paging, gpu_completion_fence, refresh_scanout)
             })
             // Transport down (bring-up / teardown): no venus work can gate it.
             .unwrap_or(true);
@@ -548,8 +542,8 @@ unsafe fn diagnostic_scan_present_private(base: *const u8, total: usize) {
 /// enforces the scheduler/transport lock order instead of relying on callers.
 fn arm_scanout_refresh_after_current_venus(adapter: &AdapterContext) {
     let ready = adapter.with_wddm_notify_lock(|guard| {
-        adapter
-            .with_virtio(|v| v.note_scanout_refresh(guard))
+        guard
+            .with_virtio(|o, v| v.note_scanout_refresh(o))
             .unwrap_or(false)
     });
     if ready {
@@ -662,7 +656,7 @@ pub unsafe extern "C" fn dxgkddi_preempt_command(
     // completed.  Dxgkrnl rejects that one-fence leap with bugcheck 0x119/1
     // (observed: expected 0x17a, received 0x17b).
     adapter.with_wddm_notify_lock(|guard| {
-        let _dropped = adapter.with_virtio(|v| v.preempt_flush(guard)).unwrap_or(0);
+        let _dropped = guard.with_virtio(|o, v| v.preempt_flush(o)).unwrap_or(0);
         // SAFETY: the WDDM notification lock serializes this packet with every
         // DMA_COMPLETED packet; the callback interface is live and delivery is
         // raised to DIRQL by notify_at_dirql.
@@ -682,7 +676,7 @@ pub unsafe extern "C" fn dxgkddi_reset_from_timeout(h_adapter: *mut c_void) -> N
     // discarding that same scheduler epoch.  Dxgkrnl owns the post-reset fence
     // state; no completion from the abandoned epoch may escape concurrently.
     adapter.with_wddm_notify_lock(|guard| {
-        let _ = adapter.with_virtio(|v| v.preempt_flush(guard));
+        let _ = guard.with_virtio(|o, v| v.preempt_flush(o));
     });
     // Consume transport_failed(), which had zero callers repo-wide: a TDR
     // against a latched ring is the loop this tranche exists to break, and
