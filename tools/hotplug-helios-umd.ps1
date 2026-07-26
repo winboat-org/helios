@@ -1,5 +1,7 @@
 param(
-  [string]$UmdDll = "C:\Users\Rupansh\helios-vgpu\umd\target\debug\helios_umd.dll",
+  # RELEASE by default, matching install-helios-kmd.ps1. Pass
+  # -UmdDll ...\target\debug\helios_umd.dll for a deliberate debug deploy.
+  [string]$UmdDll = "C:\Users\Rupansh\helios-vgpu\umd\target\release\helios_umd.dll",
   [ValidateSet("ProgramData", "DriverStore", "PackageUpgrade")]
   [string]$Mode = "ProgramData",
   [string]$PackageDir = "C:\Users\Rupansh\helios-vgpu\kmd_render\target\debug\helios_kmd_render_package",

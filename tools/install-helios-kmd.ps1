@@ -1,6 +1,13 @@
 param(
   [string]$PackageDir = "C:\Users\Rupansh\helios-vgpu\kmd_render\target\debug\helios_kmd_render_package",
-  [string]$UmdDll = "C:\Users\Rupansh\helios-vgpu\umd\target\debug\helios_umd.dll",
+  # RELEASE by default. Sync-HeliosPackageUmd overwrites whatever
+  # copy-umd-to-package staged with THIS file before the catalog is created and
+  # signed, so this parameter — not the packaging task — decides which binary
+  # reaches the DriverStore. The PSC stage measures present-gate timing, and the
+  # debug profile is opt-level 1 with no LTO, so a debug default silently made
+  # every cadence and wake-latency number a measurement of the wrong binary.
+  # Pass -UmdDll ...\target\debug\helios_umd.dll for a deliberate debug deploy.
+  [string]$UmdDll = "C:\Users\Rupansh\helios-vgpu\umd\target\release\helios_umd.dll",
   [string]$InstanceId = "",
   [switch]$SkipSign,
   [switch]$BinaryOnly,
@@ -268,6 +275,7 @@ if ($StageOnly) {
   Write-HeliosPlan "Helios KMD stage-only install" @{
     PackageDir = $PackageDir
     UmdSource = $UmdDll
+    UmdProfile = (Split-Path -Leaf (Split-Path -Parent $UmdDll))
     StageOnly = [bool]$StageOnly
   }
   if ($PlanOnly) { return }
@@ -294,6 +302,7 @@ Write-HeliosPlan "Helios KMD install" @{
   ActiveInf = $activeInf
   DriverStore = $store
   UmdSource = $UmdDll
+  UmdProfile = (Split-Path -Leaf (Split-Path -Parent $UmdDll))
   BinaryOnly = [bool]$BinaryOnly
   IncludeUmd = [bool]$IncludeUmd
   AllowRebootRequired = [bool]$AllowRebootRequired

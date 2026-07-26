@@ -518,10 +518,17 @@ Open defects, roughly ordered:
   avg 3.6–5.3 ms, timeouts only during startup churn, present rate unaffected
   (`present-gate:` telemetry, 1 line/128). The ARCHITECTURAL fix stays WS1 #4: per-ring
   wire fences + cross-process win32-sync so the consumer waits GPU-side.
-- **Release-profile UMD deployed (18th session, `32cf4a4`):** dev profile was opt-level 1;
-  deploys now build `--release` (opt 2 + thin LTO, `debug="full"` keeps the GUID-matched
-  PDB for minidump symbolization). Deploy with
-  `win_install_umd ["-UmdDll","C:\\Users\\Rupansh\\helios-vgpu\\umd\\target\\release\\helios_umd.dll", ...]`.
+- **Release-profile UMD is the deploy default (18th session `32cf4a4`; made the actual
+  default 2026-07-26, T0/R102):** dev profile is opt-level 1; release is opt 2 + thin LTO,
+  with `debug="full"` keeping the GUID-matched PDB for minidump symbolization. Both
+  `tools\install-helios-kmd.ps1` and `tools\hotplug-helios-umd.ps1` now default `-UmdDll`
+  to `umd\target\release\helios_umd.dll`, and the install plan prints `UmdProfile` next to
+  `UmdSource` so the deployed profile is a line in the log. Until R102 the defaults were
+  `...\target\debug\...`, so a default `win_install_kmd` signed the DEBUG DLL into the
+  DriverStore while reporting success — every cadence and wake-latency number taken that
+  way measured the wrong binary. Build with `win_cargo crate_dir:"umd" args:["build","--release"]`;
+  pass `-UmdDll ...\target\debug\helios_umd.dll` for a deliberate debug deploy. A missing
+  release DLL now aborts the install (`UMD DLL not found`) instead of quietly shipping debug.
   dxvk-helios stays meson debugoptimized (-O2 already).
 - **Frame-update slowness** (owner-visible): remaining suspects after the drain fix =
   dxvk-helios persistent-refresh (14th session, alias-image staging + per-frame refresh).
