@@ -24,6 +24,7 @@ use helios_protocol::{
     HeliosEscapeAllocBlob, HeliosEscapeAttachResource, HeliosEscapeCtxCreate,
     HeliosEscapeCtxDestroy, HeliosEscapeFenceEvent, HeliosEscapeHeader, HeliosEscapeMapBlob,
     HeliosEscapeQueryScanout, HeliosEscapeQueryStats, HeliosEscapeQueryStatsV2,
+    HeliosEscapeQueryStatsV3,
     HeliosEscapeReleaseBlob, HeliosEscapeSubmitVenus, HeliosEscapeWaitFence,
     HELIOS_ESCAPE_ALLOC_BLOB, HELIOS_ESCAPE_ATTACH_RESOURCE, HELIOS_ESCAPE_CTX_CREATE,
     HELIOS_ESCAPE_CTX_DESTROY, HELIOS_ESCAPE_MAP_BLOB, HELIOS_ESCAPE_QUERY_SCANOUT,
@@ -51,6 +52,38 @@ use crate::virtio::gpu::{DeviceOwner, OwnerFilter};
 /// the caller's own process handle table, so it cannot be forged across
 /// processes. This must read 0 in normal operation.
 static ESCAPE_NO_DEVICE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Escape refusals that used to be silent. The project rule is that every
+/// skipped or refused path gets a named counter; without these an ICD/KMD
+/// protocol skew was invisible in QUERY_STATS — the unknown-verb arm, the
+/// magic/version/size rejection and all twelve short-buffer arms counted
+/// nothing (k-capsescape-10).
+pub(crate) static ESCAPE_BAD_HEADER: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+pub(crate) static ESCAPE_UNKNOWN_VERB: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+pub(crate) static ESCAPE_SHORT_BUFFER: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+/// Verbs that failed because the transport was gone, rather than fabricating a
+/// content answer that reads as "nothing published yet".
+pub(crate) static ESCAPE_DEVICE_GONE: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
+/// Refuse a verb whose caller buffer is shorter than the payload it needs.
+/// One place, so the twelve arms cannot drift.
+fn refuse_short_buffer() -> NTSTATUS {
+    ESCAPE_SHORT_BUFFER.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    STATUS_BUFFER_TOO_SMALL
+}
+
+/// The transport is gone (StopDevice tore it down). A real device-lost answer:
+/// `with_virtio` returns `DriverError::DeviceNotFound`, which maps to
+/// STATUS_DEVICE_DOES_NOT_EXIST — not a content answer that reads as "nothing
+/// published yet".
+fn escape_device_gone(de: crate::error::DriverError) -> NTSTATUS {
+    ESCAPE_DEVICE_GONE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    de.into()
+}
 
 /// QUERY_SCANOUT reads that gave up after SEQ_READ_ATTEMPTS because a publisher
 /// held the descriptor throughout (registry-visible as `QsRetry`). Expected 0 in
@@ -110,6 +143,7 @@ pub unsafe extern "C" fn dxgkddi_escape(
     // Reject bad magic/version, and any header that claims to be larger than the
     // buffer the runtime actually gave us.
     if !hdr.is_valid() || hdr.size as usize > buf_len {
+        ESCAPE_BAD_HEADER.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -161,8 +195,13 @@ pub unsafe extern "C" fn dxgkddi_escape(
         HELIOS_ESCAPE_QUERY_SCANOUT => escape_query_scanout(adapter, buf),
         HELIOS_ESCAPE_REGISTER_FENCE_EVENT => escape_register_fence_event(adapter, buf),
         HELIOS_ESCAPE_UNREGISTER_FENCE_EVENT => escape_unregister_fence_event(adapter, buf),
-        // Unknown verbs are rejected.
-        _ => STATUS_NOT_IMPLEMENTED,
+        // Unknown verbs are rejected — and counted, because an unhandled verb is
+        // how an ICD/KMD protocol skew presents (HELIOS_ESCAPE_PRESENT_BLOB
+        // = 0x0007 exists in the protocol and lands here).
+        _ => {
+            ESCAPE_UNKNOWN_VERB.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            STATUS_NOT_IMPLEMENTED
+        }
     }
 }
 
@@ -174,7 +213,7 @@ fn escape_query_scanout(adapter: &AdapterContext, buf: &mut [u8]) -> NTSTATUS {
 
     let sz = size_of::<HeliosEscapeQueryScanout>();
     if buf.len() < sz {
-        return STATUS_BUFFER_TOO_SMALL;
+        return refuse_short_buffer();
     }
     let mut out: HeliosEscapeQueryScanout = pod_read_unaligned(&buf[..sz]);
 
@@ -220,10 +259,17 @@ fn escape_query_scanout(adapter: &AdapterContext, buf: &mut [u8]) -> NTSTATUS {
         return STATUS_DEVICE_BUSY;
     };
 
-    let live = resource_id != 0
-        && adapter
-            .with_virtio(|v| v.resource_is_live(resource_id))
-            .unwrap_or(false);
+    // A torn-down transport is DEVICE-LOST, not "no primary published yet".
+    // Reporting the latter with STATUS_SUCCESS made the consumer keep polling
+    // instead of surfacing the real failing stage.
+    let live = if resource_id == 0 {
+        false
+    } else {
+        match adapter.with_virtio(|v| v.resource_is_live(resource_id)) {
+            Ok(live) => live,
+            Err(de) => return escape_device_gone(de),
+        }
+    };
     if !live {
         out.out_alloc_size = 0;
         out.out_resource_id = 0;
@@ -316,7 +362,7 @@ fn escape_register_fence_event(adapter: &AdapterContext, buf: &mut [u8]) -> NTST
 
     let sz = size_of::<HeliosEscapeFenceEvent>();
     if buf.len() < sz {
-        return STATUS_BUFFER_TOO_SMALL;
+        return refuse_short_buffer();
     }
     let req: HeliosEscapeFenceEvent = pod_read_unaligned(&buf[..sz]);
     let write_state = |buf: &mut [u8], state: u32| {
@@ -387,7 +433,7 @@ fn escape_unregister_fence_event(adapter: &AdapterContext, buf: &mut [u8]) -> NT
 
     let sz = size_of::<HeliosEscapeFenceEvent>();
     if buf.len() < sz {
-        return STATUS_BUFFER_TOO_SMALL;
+        return refuse_short_buffer();
     }
     let req: HeliosEscapeFenceEvent = pod_read_unaligned(&buf[..sz]);
     if req.fence_id == 0 || req.event_handle == 0 {
@@ -398,9 +444,15 @@ fn escape_unregister_fence_event(adapter: &AdapterContext, buf: &mut [u8]) -> NT
         return STATUS_INVALID_PARAMETER;
     };
 
-    let removed = adapter
-        .with_virtio(|v| v.fence_event_unregister(req.fence_id, event))
-        .unwrap_or(false);
+    // Same class: NOT_FOUND is documented as "the drain consumed it", so a
+    // teardown must not be reported through it.
+    let removed = match adapter.with_virtio(|v| v.fence_event_unregister(req.fence_id, event)) {
+        Ok(removed) => removed,
+        Err(de) => {
+            dereference_user_event(event);
+            return escape_device_gone(de);
+        }
+    };
     if removed {
         // The table's reference transfers back to us: drop it plus our lookup
         // reference.
@@ -438,10 +490,12 @@ fn escape_query_stats(adapter: &AdapterContext, buf: &mut [u8]) -> NTSTATUS {
 
     let sz = size_of::<HeliosEscapeQueryStats>();
     let sz2 = size_of::<HeliosEscapeQueryStatsV2>();
+    let sz3 = size_of::<HeliosEscapeQueryStatsV3>();
     if buf.len() < sz {
-        return STATUS_BUFFER_TOO_SMALL;
+        return refuse_short_buffer();
     }
     let v2 = buf.len() >= sz2;
+    let v3 = buf.len() >= sz3;
     let (stats, fence_events_live) =
         match adapter.with_virtio(|v| (v.table_stats(), v.fence_events_live())) {
             Ok(s) => s,
@@ -487,7 +541,31 @@ fn escape_query_stats(adapter: &AdapterContext, buf: &mut [u8]) -> NTSTATUS {
     out2.out_map_pages_fails = crate::virtio::gpu::MAP_PAGES_FAILS.load(Ordering::Relaxed);
     out2.out_window_alloc_rejects =
         crate::virtio::gpu::WINDOW_ALLOC_REJECTS.load(Ordering::Relaxed);
-    buf[..sz2].copy_from_slice(bytes_of(&out2));
+    if !v3 {
+        buf[..sz2].copy_from_slice(bytes_of(&out2));
+        return STATUS_SUCCESS;
+    }
+    // V3 is APPENDED after v2, so a v1/v2 probe keeps parsing byte-identically.
+    let mut out3: HeliosEscapeQueryStatsV3 = pod_read_unaligned(&buf[..sz3]);
+    out3.v2 = out2;
+    out3.out_escape_bad_header = ESCAPE_BAD_HEADER.load(Ordering::Relaxed);
+    out3.out_escape_unknown_verb = ESCAPE_UNKNOWN_VERB.load(Ordering::Relaxed);
+    out3.out_escape_short_buffer = ESCAPE_SHORT_BUFFER.load(Ordering::Relaxed);
+    out3.out_escape_device_gone = ESCAPE_DEVICE_GONE.load(Ordering::Relaxed);
+    out3.out_escape_no_device = ESCAPE_NO_DEVICE.load(Ordering::Relaxed);
+    out3.out_escape_foreign_ctx = ESCAPE_FOREIGN_CTX.load(Ordering::Relaxed);
+    // R315: write-only counters that no report carried. ASYNC_CTRL_RESP_ERRORS
+    // is the loud-failure counter for the direct-primary display path (a
+    // host-rejected SET_SCANOUT_BLOB or RESOURCE_FLUSH) and appeared nowhere.
+    out3.out_async_ctrl_resp_errors =
+        crate::virtio::gpu::ASYNC_CTRL_RESP_ERRORS.load(Ordering::Relaxed);
+    out3.out_cpu_host_unmap_count =
+        crate::ddi::cpu_host_aperture::CPU_HOST_UNMAP_COUNT.load(Ordering::Relaxed);
+    out3.out_dma_alloc_fails = crate::virtio::hal::DMA_ALLOC_FAILS.load(Ordering::Relaxed);
+    out3.out_mmio_map_fails = crate::virtio::hal::MMIO_MAP_FAILS.load(Ordering::Relaxed);
+    out3.out_mmio_cache_full = crate::virtio::hal::MMIO_CACHE_FULL.load(Ordering::Relaxed);
+    out3.out_query_scanout_retries = QUERY_SCANOUT_RETRY_GIVEUPS.load(Ordering::Relaxed);
+    buf[..sz3].copy_from_slice(bytes_of(&out3));
     STATUS_SUCCESS
 }
 
@@ -500,7 +578,7 @@ fn escape_ctx_create(
 ) -> NTSTATUS {
     let sz = size_of::<HeliosEscapeCtxCreate>();
     if buf.len() < sz {
-        return STATUS_BUFFER_TOO_SMALL;
+        return refuse_short_buffer();
     }
     let req: HeliosEscapeCtxCreate = pod_read_unaligned(&buf[..sz]);
     match ctrl::ctx_create(adapter, req.capset_id, Some(owner)) {
@@ -522,7 +600,7 @@ fn escape_ctx_destroy(
 ) -> NTSTATUS {
     let sz = size_of::<HeliosEscapeCtxDestroy>();
     if buf.len() < sz {
-        return STATUS_BUFFER_TOO_SMALL;
+        return refuse_short_buffer();
     }
     let req: HeliosEscapeCtxDestroy = pod_read_unaligned(&buf[..sz]);
     match ctrl::ctx_destroy(adapter, Some(owner), req.ctx_id) {
@@ -547,7 +625,7 @@ fn escape_submit_venus(
 ) -> NTSTATUS {
     let hsz = size_of::<HeliosEscapeSubmitVenus>();
     if buf.len() < hsz {
-        return STATUS_BUFFER_TOO_SMALL;
+        return refuse_short_buffer();
     }
     let req: HeliosEscapeSubmitVenus = pod_read_unaligned(&buf[..hsz]);
 
@@ -592,7 +670,7 @@ fn escape_wait_fence(adapter: &AdapterContext, buf: &mut [u8]) -> NTSTATUS {
     const LEGACY_SIZE: usize = 32;
     let sz = size_of::<HeliosEscapeWaitFence>();
     if buf.len() < LEGACY_SIZE {
-        return STATUS_BUFFER_TOO_SMALL;
+        return refuse_short_buffer();
     }
     let legacy = buf.len() < sz;
     // The legacy struct is a strict prefix of the v2 struct; read the common
@@ -628,7 +706,7 @@ fn escape_alloc_blob(
 ) -> NTSTATUS {
     let sz = size_of::<HeliosEscapeAllocBlob>();
     if buf.len() < sz {
-        return STATUS_BUFFER_TOO_SMALL;
+        return refuse_short_buffer();
     }
     let req: HeliosEscapeAllocBlob = pod_read_unaligned(&buf[..sz]);
     // DIAG: 0x0E04_HHHH = ALLOC_BLOB's owning handle (low 16 bits), to confirm it
@@ -666,7 +744,7 @@ fn escape_map_blob(
 ) -> NTSTATUS {
     let sz = size_of::<HeliosEscapeMapBlob>();
     if buf.len() < sz {
-        return STATUS_BUFFER_TOO_SMALL;
+        return refuse_short_buffer();
     }
     let req: HeliosEscapeMapBlob = pod_read_unaligned(&buf[..sz]);
     if req.resource_id == 0 {
@@ -726,7 +804,7 @@ fn escape_map_blob(
 fn escape_release_blob(adapter: &AdapterContext, buf: &[u8], owner: DeviceOwner) -> NTSTATUS {
     let sz = size_of::<HeliosEscapeReleaseBlob>();
     if buf.len() < sz {
-        return STATUS_BUFFER_TOO_SMALL;
+        return refuse_short_buffer();
     }
     // THE VERB THAT DESTROYS STATE: with a `usize` owner, a null hDevice matched
     // the slots the KMD adopts for live WDDM allocations — pop, unmap,
@@ -758,7 +836,7 @@ fn escape_release_blob(adapter: &AdapterContext, buf: &[u8], owner: DeviceOwner)
 fn escape_attach_resource(adapter: &AdapterContext, buf: &[u8]) -> NTSTATUS {
     let sz = size_of::<HeliosEscapeAttachResource>();
     if buf.len() < sz {
-        return STATUS_BUFFER_TOO_SMALL;
+        return refuse_short_buffer();
     }
     let req: HeliosEscapeAttachResource = pod_read_unaligned(&buf[..sz]);
     if req.ctx_id == 0 || req.resource_id == 0 {

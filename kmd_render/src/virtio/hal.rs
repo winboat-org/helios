@@ -190,6 +190,7 @@ unsafe impl Hal for WdkHal {
             }
             None => {
                 crate::kmsg(c"Helios: virtio dma_alloc FAILED\n");
+                DMA_ALLOC_FAILS.fetch_add(1, Ordering::Relaxed);
                 (0, NonNull::dangling())
             }
         }
@@ -221,6 +222,14 @@ unsafe impl Hal for WdkHal {
         // Nothing to revoke without an IOMMU.
     }
 }
+
+/// Contiguous-DMA allocation failures. The sibling `gpu.rs` maintains ~41 named
+/// counters under the same loud-failure rule; these three were kmsg-only, which
+/// is invisible without a kernel debugger attached.
+pub(crate) static DMA_ALLOC_FAILS: AtomicU32 = AtomicU32::new(0);
+/// MMIO tracking-cache overflows. The mapping stays valid but untracked, so
+/// `unmap_all` can never release it: a permanent system-PTE leak, now visible.
+pub(crate) static MMIO_CACHE_FULL: AtomicU32 = AtomicU32::new(0);
 
 /// Number of `MmMapIoSpace` failures seen by [`try_mmio_map`]. Reported through
 /// the ungated `diag::fault` path by the ISR-register mapping, because on this
@@ -304,6 +313,7 @@ pub(crate) unsafe fn try_mmio_map(paddr: PhysAddr, size: usize) -> Option<NonNul
         // mapping stays valid + usable, it just won't be reclaimed by
         // unmap_all. Logged after releasing the lock.
         crate::kmsg(c"Helios: virtio MMIO cache full\n");
+        MMIO_CACHE_FULL.fetch_add(1, Ordering::Relaxed);
     }
     Some(mapped)
 }

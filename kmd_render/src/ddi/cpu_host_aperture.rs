@@ -29,7 +29,7 @@
 //! (counted): a later `map_blob_at` self-heals via stale-overlap eviction.
 
 use core::ffi::c_void;
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use wdk_sys::ntddk::KeGetCurrentIrql;
 
@@ -38,9 +38,13 @@ use crate::ddi::create_allocation::paging_alloc_info;
 use crate::dxgk::*;
 
 pub static CPU_HOST_MAP_COUNT: AtomicU32 = AtomicU32::new(0);
+/// DDI-level unmap count. Reported as `ChUc` and through QUERY_STATS V3, so the
+/// map/unmap pairing can be checked against `ChMc`.
 pub static CPU_HOST_UNMAP_COUNT: AtomicU32 = AtomicU32::new(0);
-pub static CPU_HOST_LAST_MAP: AtomicU64 = AtomicU64::new(0);
-pub static CPU_HOST_LAST_UNMAP: AtomicU64 = AtomicU64::new(0);
+// CPU_HOST_LAST_MAP / CPU_HOST_LAST_UNMAP were write-only: nothing loaded them,
+// no report carried them and no ntoseye recipe named them (R315/x-dup-dead-22).
+// Their information — segment id, adapter index, page count — is in ChMr/ChMo
+// and the S-ring. Deleted rather than reported.
 
 // Segment-3 (BAR) aperture engine counters (registry-visible as Ch*).
 static BAR_AP_MAPS: AtomicU32 = AtomicU32::new(0); // blob maps performed
@@ -79,6 +83,9 @@ fn dump_bar_ap_counters() {
     crate::diag::record_named_bytes(b"ChEm", BAR_AP_ERR_MAP.load(Ordering::Relaxed));
     crate::diag::record_named_bytes(b"ChEu", BAR_AP_ERR_UNRESOLVED_UNMAP.load(Ordering::Relaxed));
     crate::diag::record_named_bytes(b"ChMc", CPU_HOST_MAP_COUNT.load(Ordering::Relaxed));
+    // DDI-level unmap count. ChUn is the INTERNAL unmap count, so without this
+    // the DDI map/unmap pairing could not be checked against ChMc at all.
+    crate::diag::record_named_bytes(b"ChUc", CPU_HOST_UNMAP_COUNT.load(Ordering::Relaxed));
     crate::diag::record_named_bytes(b"ChIq", BAR_AP_LAST_IRQL.load(Ordering::Relaxed));
     crate::diag::record_named_bytes(b"ChIa", BAR_AP_IRQL_ACK.load(Ordering::Relaxed));
     crate::diag::record_named_bytes(b"ChId", BAR_AP_IRQL_DEFER.load(Ordering::Relaxed));
@@ -201,12 +208,6 @@ pub unsafe extern "C" fn dxgkddi_map_cpu_host_aperture(
     // SAFETY: valid per DDI contract.
     let args = unsafe { &*map };
     CPU_HOST_MAP_COUNT.fetch_add(1, Ordering::Relaxed);
-    CPU_HOST_LAST_MAP.store(
-        ((args.SegmentId as u64) << 48)
-            | ((args.PhysicalAdapterIndex as u64) << 32)
-            | (args.NumberOfPages & 0xFFFF_FFFF),
-        Ordering::Relaxed,
-    );
 
     // SAFETY: dxgkrnl hands back our AdapterContext as the miniport context.
     let adapter = unsafe { &*(h_adapter as *const AdapterContext) };
@@ -330,12 +331,6 @@ pub unsafe extern "C" fn dxgkddi_unmap_cpu_host_aperture(
     // SAFETY: valid per DDI contract.
     let args = unsafe { &*unmap };
     CPU_HOST_UNMAP_COUNT.fetch_add(1, Ordering::Relaxed);
-    CPU_HOST_LAST_UNMAP.store(
-        ((args.SegmentId as u64) << 48)
-            | ((args.PhysicalAdapterIndex as u64) << 32)
-            | (args.NumberOfPages & 0xFFFF_FFFF),
-        Ordering::Relaxed,
-    );
 
     // Tear down the blob mapping backing this aperture range so dxgkrnl can
     // re-book the pages without overlapping host window subregions. No

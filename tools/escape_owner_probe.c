@@ -75,6 +75,28 @@ struct helios_escape_query_stats {
     UINT out_window_range_drops, out_ctrl_timeouts;
     UINT out_take_live_misses, out_adopt_dead_rejects;
 };
+/* v2 extension (KMD 22.22.54+) */
+struct helios_escape_query_stats_v2 {
+    struct helios_escape_query_stats v1;
+    UINT out_fence_events_live, out_fence_events_high_water;
+    UINT out_fence_event_registers, out_fence_event_signals;
+    UINT out_fence_event_already_complete, out_fence_event_overflows;
+    UINT out_fence_event_dup_rejects, out_fence_event_invalid;
+    UINT out_fence_event_cancels, out_fence_event_teardown_drops;
+    UINT out_mappings_live, out_mappings_cap, out_mappings_high_water;
+    UINT out_mapping_full_rejects, out_map_pages_fails, out_window_alloc_rejects;
+};
+/* v3 extension (KMD 22.22.180+, T1b): the escape-refusal family + the counters
+   R315 made reportable. */
+struct helios_escape_query_stats_v3 {
+    struct helios_escape_query_stats_v2 v2;
+    UINT out_escape_bad_header, out_escape_unknown_verb, out_escape_short_buffer;
+    UINT out_escape_device_gone, out_escape_no_device, out_escape_foreign_ctx;
+    UINT out_async_ctrl_resp_errors, out_cpu_host_unmap_count;
+    UINT out_dma_alloc_fails, out_mmio_map_fails, out_mmio_cache_full;
+    UINT out_query_scanout_retries;
+};
+
 /* HeliosEscapeQueryScanout */
 struct helios_escape_query_scanout {
     struct helios_escape_header hdr;
@@ -170,6 +192,10 @@ static int open_helios(UINT* out_ctx_a) {
 }
 
 static int dump_stats(const char* label, struct helios_escape_query_stats* out) {
+    struct helios_escape_query_stats_v3 v3;
+    memset(&v3, 0, sizeof(v3));
+    hdr_init(&v3.v2.v1.hdr, HELIOS_ESCAPE_QUERY_STATS, sizeof(v3));
+    NTSTATUS st3 = escape_on(g_device_a, &v3, sizeof(v3));
     struct helios_escape_query_stats qs;
     memset(&qs, 0, sizeof(qs));
     hdr_init(&qs.hdr, HELIOS_ESCAPE_QUERY_STATS, sizeof(qs));
@@ -177,6 +203,19 @@ static int dump_stats(const char* label, struct helios_escape_query_stats* out) 
     if (st != 0) {
         printf("[%s] QUERY_STATS st=0x%08x\n", label, (unsigned)st);
         return 1;
+    }
+    if (st3 == 0) {
+        printf("[%s] V3 escape_refusals: bad_header=%u unknown_verb=%u short_buffer=%u "
+               "device_gone=%u no_device=%u foreign_ctx=%u | ctrl_resp_errors=%u "
+               "ddi_unmaps=%u | hal: dma_fails=%u mmio_fails=%u cache_full=%u | "
+               "qs_retries=%u\n",
+               label, v3.out_escape_bad_header, v3.out_escape_unknown_verb,
+               v3.out_escape_short_buffer, v3.out_escape_device_gone, v3.out_escape_no_device,
+               v3.out_escape_foreign_ctx, v3.out_async_ctrl_resp_errors,
+               v3.out_cpu_host_unmap_count, v3.out_dma_alloc_fails, v3.out_mmio_map_fails,
+               v3.out_mmio_cache_full, v3.out_query_scanout_retries);
+    } else {
+        printf("[%s] V3 QUERY_STATS st=0x%08x (pre-22.22.180 KMD)\n", label, (unsigned)st3);
     }
     printf("[%s] blobs=%u/%u hw=%u rej=%u | resources=%u/%u hw=%u rej=%u | "
            "contexts=%u drops=%u | window=%llu/%llu rangedrops=%u | ctrl_timeouts=%u "

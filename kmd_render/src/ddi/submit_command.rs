@@ -986,9 +986,9 @@ pub unsafe extern "C" fn dxgkddi_collect_dbg_info(
         let adapter = unsafe { &*(h_adapter as *const AdapterContext) };
         adapter.completed_fence()
     };
-    let report: [u32; 35] = [
+    let report: [u32; 37] = [
         0x4844_4247, // 'HDBG'
-        4,           // report version (4: + per-ring fence telemetry, WS1 #4)
+        5,           // report version (5: + ctrl-path response errors, DDI unmaps)
         args.Reason,
         SUBMIT_COUNT.load(Ordering::Relaxed),
         SUBMIT_LAST_FENCE.load(Ordering::Relaxed),
@@ -1028,8 +1028,15 @@ pub unsafe extern "C" fn dxgkddi_collect_dbg_info(
         // v4: ring_idx >= 1 GPU-completion fences (WS1 #4).
         crate::virtio::gpu::RING_SUBMIT_COUNT.load(Ordering::Relaxed),
         crate::virtio::gpu::RING_COMPLETE_COUNT.load(Ordering::Relaxed),
+        // v5 (R315): the CONTROL-path response errors — a host-rejected
+        // SET_SCANOUT_BLOB or RESOURCE_FLUSH, i.e. the loud-failure counter for
+        // the direct-primary display path. It appeared in no report at all,
+        // while its submit-path sibling (ASYNC_RESP_ERRORS) was already here.
+        crate::virtio::gpu::ASYNC_CTRL_RESP_ERRORS.load(Ordering::Relaxed),
+        // DDI-level CpuHostAperture unmaps, for map/unmap pairing.
+        crate::ddi::cpu_host_aperture::CPU_HOST_UNMAP_COUNT.load(Ordering::Relaxed),
     ];
-    let report_bytes = size_of::<[u32; 35]>();
+    let report_bytes = size_of::<[u32; 37]>();
     let copy_len = core::cmp::min(report_bytes, buf_len);
     // SAFETY: copy_len <= BufferSize (writable, checked above) and
     // copy_len <= size_of report (readable local array).

@@ -1019,6 +1019,17 @@ impl AdapterContext {
                 b"RfFail",
                 self.scanout_refresh_fail.load(Ordering::Relaxed),
             );
+            // R315: the BIND-side failure counter, emitted from the SAME periodic
+            // block as the flush-side one. Its only other writer is the enqueue
+            // failure path above, which T6's k-lifecycle-02 shows is statically
+            // unreachable — so a host-REJECTED SET_SCANOUT_BLOB (counted through
+            // the DPC's completion_errors into scanout_bind_fail) used to leave
+            // the display silently frozen with no counter movement visible over
+            // SSH.
+            crate::diag::record_named_bytes(
+                b"RbFail",
+                self.scanout_bind_fail.load(Ordering::Relaxed),
+            );
             // Live proof that ctrl completions are reaching the real IRQ/DPC
             // path; these atomics otherwise become visible only at teardown.
             crate::diag::record_named_bytes(

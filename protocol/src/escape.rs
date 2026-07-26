@@ -394,6 +394,52 @@ pub struct HeliosEscapeQueryStatsV2 {
     pub out_window_alloc_rejects: u32,
 }
 
+/// `HELIOS_ESCAPE_QUERY_STATS` v3 (KMD 22.22.180+): the v2 struct plus the
+/// counters T1b made reportable — the escape-refusal family (an ICD/KMD
+/// protocol skew used to be invisible), the control-path response errors that
+/// are the loud-failure signal for the direct-primary display path, the
+/// DDI-level CPU-host-aperture unmap count, and the three hal.rs failures.
+///
+/// APPENDED, never overlaid on v2's fields: existing v1/v2 probes must keep
+/// parsing byte-identically, which is why this does not reuse reserved space.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct HeliosEscapeQueryStatsV3 {
+    pub v2: HeliosEscapeQueryStatsV2,
+    /// Escapes refused for a bad magic/version, or a header claiming to be
+    /// larger than the buffer the runtime supplied.
+    pub out_escape_bad_header: u32,
+    /// Escapes naming a verb this KMD does not implement (an ICD/KMD skew).
+    pub out_escape_unknown_verb: u32,
+    /// Verbs refused because the caller's buffer was shorter than the payload
+    /// the verb requires.
+    pub out_escape_short_buffer: u32,
+    /// Verbs that failed because the transport was gone (StopDevice), rather
+    /// than producing a content answer that reads as "nothing published yet".
+    pub out_escape_device_gone: u32,
+    /// Ownership-bearing verbs refused for a NULL hDevice (owner-0 forgery).
+    pub out_escape_no_device: u32,
+    /// Context verbs refused because the caller's device does not own the id.
+    pub out_escape_foreign_ctx: u32,
+    /// Async control responses the host rejected — SET_SCANOUT_BLOB /
+    /// RESOURCE_FLUSH failures. The loud-failure counter for the direct-primary
+    /// display path, previously in no report at all.
+    pub out_async_ctrl_resp_errors: u32,
+    /// `DxgkDdiUnmapCpuHostAperture` calls (DDI level, for map/unmap pairing
+    /// against ChMc — the internal unmap count ChUn is not the same thing).
+    pub out_cpu_host_unmap_count: u32,
+    /// `dma_alloc` failures in the virtio HAL (was kmsg-only).
+    pub out_dma_alloc_fails: u32,
+    /// `MmMapIoSpace` failures in the virtio HAL (was kmsg-only).
+    pub out_mmio_map_fails: u32,
+    /// MMIO tracking-cache overflows: the mapping stays valid but untracked, so
+    /// `unmap_all` can never release it — a permanent system-PTE leak, now at
+    /// least visible.
+    pub out_mmio_cache_full: u32,
+    /// QUERY_SCANOUT reads abandoned after the bounded seqlock retry.
+    pub out_query_scanout_retries: u32,
+}
+
 const _: () = {
     assert!(core::mem::size_of::<HeliosEscapeHeader>() == 16);
     assert!(core::mem::size_of::<HeliosEscapeQueryStats>() == 88);
@@ -408,4 +454,6 @@ const _: () = {
     assert!(core::mem::size_of::<HeliosEscapeFenceEvent>() == 40);
     assert!(core::mem::size_of::<HeliosEscapeQueryScanout>() == 64);
     assert!(core::mem::size_of::<HeliosEscapeQueryStatsV2>() == 152);
+    // v2 (152) + 12 u32 = 200. The v2 prefix must stay byte-identical.
+    assert!(core::mem::size_of::<HeliosEscapeQueryStatsV3>() == 200);
 };

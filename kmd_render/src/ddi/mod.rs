@@ -4,7 +4,7 @@
 mod add_device;
 mod blob_map;
 mod build_paging_buffer;
-mod cpu_host_aperture;
+pub(crate) mod cpu_host_aperture;
 mod create_allocation;
 mod display;
 mod escape;
