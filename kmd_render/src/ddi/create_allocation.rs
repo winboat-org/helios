@@ -1231,6 +1231,250 @@ unsafe fn destroy_allocation_ctx(adapter: &AdapterContext, ctx: Box<AllocationCo
     drop(ctx);
 }
 
+/// Everything one [`helios_protocol::AllocationBacking`] arm must answer.
+///
+/// NO `Option` fields and NO `Default`, deliberately: that is what forces every
+/// arm of [`build_backing`] to produce a COMPLETE descriptor, and what makes
+/// adding a backing class a compile error until it is handled. Arms that do not
+/// change a field pass the incoming `meta`/`ap` value through explicitly — the
+/// pass-through is the point, because the defect class here is an arm that
+/// forgets one (the historical `width*4` = 7584 pitch shear against the real
+/// 7680, and the exact-size import mismatches).
+///
+/// Do not add a field-wise mutation of this struct after construction. The
+/// guarantee holds only while it is built once and read once.
+struct CreatedBacking {
+    resource_id: u32,
+    venus_memory_id: u64,
+    venus_image_id: u64,
+    pitch: u32,
+    plane_offset: u64,
+    dxgi_format: u32,
+    venus_alloc_size: u64,
+    memory_type_index: u32,
+    /// The value `ap.size` takes afterwards — the blob size the write-back
+    /// publishes and VidMm rounds up. NOT always the created blob's size: the
+    /// KMD standard-buffer arm keeps the requested size, as it always has.
+    blob_size: u64,
+}
+
+/// Produce the backing for one classified allocation.
+///
+/// Every diag code and every returned NTSTATUS here is byte-identical to the
+/// if/else chain this replaces — including `STATUS_NO_MEMORY` rather than
+/// `STATUS_UNSUCCESSFUL`, because `0xC0000001` is not in `DxgkDdiCreateAllocation`'s
+/// legal return set and dxgkrnl logged it as "Driver returned an invalid
+/// NTSTATUS" (197x) and responded with adapter resets during boot.
+fn build_backing(
+    adapter: &AdapterContext,
+    backing: helios_protocol::AllocationBacking,
+    ap: &HeliosWddmAllocPrivate,
+    meta: &HeliosWddmAllocMeta,
+) -> Result<CreatedBacking, NTSTATUS> {
+    use helios_protocol::AllocationBacking as Backing;
+
+    // The venus identity a cross-process opener needs. For adopted and raw
+    // resources the UMD recorded it in the trailer at create time; a 0 there
+    // means unknown, and the (page-rounded) blob size is the documented
+    // fallback. The KMD-created arms below always answer with the real size, so
+    // this fallback belongs to those two arms and nowhere else — it used to be
+    // applied after the chain, where it silently covered for any arm that
+    // forgot.
+    let claimed_alloc_size = if meta.venus_alloc_size == 0 {
+        ap.size
+    } else {
+        meta.venus_alloc_size
+    };
+
+    match backing {
+        Backing::AdoptedUmdResource {
+            resource_id,
+            take_ownership,
+        } => {
+            // C1 lifetime fix: adopting transfers the blob's ownership from the
+            // ICD's escape owner (D3DKMT device handle) to THIS allocation, so a
+            // later DestroyDevice sweep of the creating process cannot unref a
+            // host resource that live shared WDDM allocations still denote (the
+            // res-45 invalid-import class). Adopting a DEAD resid is a hard
+            // error: succeeding here would create a permanently-black shared
+            // surface that poisons every opener's venus ring at import time.
+            match adapter.with_virtio(|v| {
+                if take_ownership {
+                    v.adopt_blob_for_allocation(resource_id)
+                } else {
+                    v.resource_is_live(resource_id)
+                }
+            }) {
+                Ok(true) => {}
+                Ok(false) => {
+                    crate::diag::record(0x0C01_00E4);
+                    return Err(STATUS_INVALID_PARAMETER);
+                }
+                Err(_de) => {
+                    crate::diag::record(0x0C01_00E1);
+                    return Err(STATUS_DEVICE_NOT_READY);
+                }
+            }
+            Ok(CreatedBacking {
+                resource_id,
+                venus_memory_id: 0,
+                venus_image_id: 0,
+                pitch: meta.pitch,
+                plane_offset: meta.plane_offset,
+                dxgi_format: meta.dxgi_format,
+                venus_alloc_size: claimed_alloc_size,
+                memory_type_index: meta.memory_type_index,
+                blob_size: ap.size,
+            })
+        }
+        Backing::KmdLinearPrimary { width, height } => {
+            match adapter
+                .with_venus_client(|c| c.allocate_linear_scanout_image_blob(adapter, width, height))
+            {
+                Ok(Ok(scanout)) => Ok(CreatedBacking {
+                    resource_id: scanout.blob.res_id,
+                    venus_memory_id: scanout.blob.blob_id,
+                    venus_image_id: scanout.image_id.get(),
+                    pitch: scanout.row_pitch,
+                    plane_offset: scanout.plane_offset as u64,
+                    // The primary arm never set this; the D3DDDIFORMAT stays
+                    // authoritative for it.
+                    dxgi_format: meta.dxgi_format,
+                    venus_alloc_size: scanout.blob.size,
+                    memory_type_index: scanout.memory_type_index,
+                    blob_size: scanout.blob.size,
+                }),
+                Ok(Err(_ve)) => {
+                    crate::diag::record(0x0C01_00E5);
+                    Err(STATUS_NO_MEMORY)
+                }
+                Err(_de) => {
+                    crate::diag::record(0x0C01_00E1);
+                    Err(STATUS_DEVICE_NOT_READY)
+                }
+            }
+        }
+        Backing::KmdOptimalGdiTexture {
+            width,
+            height,
+            dxgi_format,
+            bind_flags,
+        } => {
+            // D3DKMDT_GDISURFACE_TEXTURE is a shared, non-CPU-visible texture
+            // used as both a DWM sample source and a DirectX render target.
+            // Preserve that contract with a real cross-context OPTIMAL image.
+            // Reinterpreting this allocation as pitched host bytes makes DWM
+            // sample tiled memory as a different resource shape and produces a
+            // black redirected window.
+            match adapter.with_venus_client(|client| {
+                client.allocate_optimal_gdi_image_blob(
+                    adapter,
+                    width,
+                    height,
+                    bind_flags,
+                    dxgi_format,
+                )
+            }) {
+                Ok(Ok(image)) => Ok(CreatedBacking {
+                    resource_id: image.blob.res_id,
+                    venus_memory_id: image.blob.blob_id,
+                    venus_image_id: image.image_id.get(),
+                    // No row layout: this is a tiled image, not a byte buffer.
+                    pitch: 0,
+                    plane_offset: 0,
+                    dxgi_format,
+                    venus_alloc_size: image.blob.size,
+                    memory_type_index: image.memory_type_index,
+                    blob_size: image.blob.size,
+                }),
+                Ok(Err(_ve)) => {
+                    crate::diag::record_named_bytes(b"GdiOImg", 0xE1);
+                    Err(STATUS_NO_MEMORY)
+                }
+                Err(_de) => {
+                    crate::diag::record_named_bytes(b"GdiOImg", 0xE2);
+                    Err(STATUS_DEVICE_NOT_READY)
+                }
+            }
+        }
+        Backing::KmdStandardBuffer { size, primary } => {
+            // KMD-originated standard allocation (indirect-swapchain backbuffer,
+            // GDI redirection/staging surface). Back it with a REAL venus
+            // `VkDeviceMemory` blob through the kernel venus client: user-mode
+            // venus contexts (DWM opening the surface) import it by resource id
+            // and vkBindImageMemory2 against it — a raw `blob_id = 0` shmem blob
+            // has no memory object behind it, and that bind poisons the
+            // importer's venus ring (host: "failed to look up object of type 8"
+            // -> fatal decoder state -> context destroyed). `allocate_memory_blob`
+            // also registers the blob in the tracking table (owner 0), which the
+            // GDI executor's `blob_kernel_range` resolves. PASSIVE flow under the
+            // venus mutex (never the DISPATCH spinlock).
+            match adapter.with_venus_client(|c| {
+                c.allocate_memory_blob(adapter, size, true, primary)
+                    .map(|b| (b, c.memory_type_index()))
+            }) {
+                Ok(Ok((blob, kernel_mti))) => Ok(CreatedBacking {
+                    resource_id: blob.res_id,
+                    venus_memory_id: blob.blob_id,
+                    venus_image_id: 0,
+                    pitch: meta.pitch,
+                    plane_offset: meta.plane_offset,
+                    dxgi_format: meta.dxgi_format,
+                    // The EXACT venus allocation parameters, so cross-process
+                    // openers import with the creator's size + memory type.
+                    venus_alloc_size: blob.size,
+                    memory_type_index: kernel_mti,
+                    // NOT blob.size: this arm has always left `ap.size` at the
+                    // requested value.
+                    blob_size: ap.size,
+                }),
+                Ok(Err(_ve)) => {
+                    crate::diag::record(0x0C01_00E3);
+                    Err(STATUS_NO_MEMORY)
+                }
+                Err(_de) => {
+                    crate::diag::record(0x0C01_00E1);
+                    Err(STATUS_DEVICE_NOT_READY)
+                }
+            }
+        }
+        Backing::RawHost3dBlob {
+            ctx_id,
+            blob_mem,
+            blob_flags,
+            blob_id,
+            size,
+        } => match crate::virtio::ctrl::resource_create_blob(
+            adapter, ctx_id, blob_mem, blob_flags, blob_id, size,
+        ) {
+            Ok(rid) => {
+                // Register the blob in the tracking table (owner 0 =
+                // KMD-internal) so the GDI executor's `blob_kernel_range` can
+                // resolve and host-map this allocation by resource id. Removed
+                // again in `destroy_allocation_ctx` via `forget_allocation_blob`.
+                let _ = adapter.with_virtio(|v| v.note_blob_size(rid, size));
+                Ok(CreatedBacking {
+                    resource_id: rid,
+                    venus_memory_id: 0,
+                    venus_image_id: 0,
+                    pitch: meta.pitch,
+                    plane_offset: meta.plane_offset,
+                    dxgi_format: meta.dxgi_format,
+                    venus_alloc_size: claimed_alloc_size,
+                    memory_type_index: meta.memory_type_index,
+                    blob_size: size,
+                })
+            }
+            Err(_ve) => {
+                // Host rejected the blob (e.g. the .56 blob_id=0
+                // RESP_ERR_UNSPEC case).
+                crate::diag::record(0x0C01_00E0);
+                Err(STATUS_NO_MEMORY)
+            }
+        },
+    }
+}
+
 /// Create the virtio blob for one allocation and fill its VidMm metadata. On
 /// failure nothing is stored (the caller unwinds prior allocations).
 unsafe fn create_one(
@@ -1317,174 +1561,49 @@ unsafe fn create_one(
 
     // ── Create the backing virtio-gpu blob (create_blob + ctx_attach) ───────
     crate::diag::record(0x0C01_0010 | (ap.kind & 0xFF));
-    let adopt_supplied_resource = supplied_resource_id != 0;
-    let mut venus_memory_id = 0u64;
-    let mut venus_image_id = 0u64;
-    let is_primary = (meta.misc_flags & HELIOS_WDDM_ALLOC_MISC_PRIMARY) != 0;
-    let is_optimal_gdi_texture = ap.kind == HELIOS_WDDM_ALLOC_KIND_STANDARD
-        && (meta.misc_flags & HELIOS_WDDM_ALLOC_MISC_OPTIMAL_GDI_TEXTURE) != 0;
-    let resource_id = if adopt_supplied_resource {
-        // C1 lifetime fix: adopting transfers the blob's ownership from the
-        // ICD's escape owner (D3DKMT device handle) to THIS allocation, so a
-        // later DestroyDevice sweep of the creating process cannot unref a
-        // host resource that live shared WDDM allocations still denote (the
-        // res-45 invalid-import class). Adopting a DEAD resid is a hard error:
-        // succeeding here would create a permanently-black shared surface that
-        // poisons every opener's venus ring at import time. The re-own only
-        // happens for DEVICE_MEMORY adopts — the kinds whose lifetime this
-        // allocation actually takes (`owns_resource` below); anything else is
-        // liveness-validated only.
-        let take_ownership = ap.kind == HELIOS_WDDM_ALLOC_KIND_DEVICE_MEMORY;
-        match adapter.with_virtio(|v| {
-            if take_ownership {
-                v.adopt_blob_for_allocation(supplied_resource_id)
-            } else {
-                v.resource_is_live(supplied_resource_id)
-            }
-        }) {
-            Ok(true) => supplied_resource_id,
-            Ok(false) => {
-                crate::diag::record(0x0C01_00E4);
-                return Err(STATUS_INVALID_PARAMETER);
-            }
-            Err(_de) => {
-                crate::diag::record(0x0C01_00E1);
-                return Err(STATUS_DEVICE_NOT_READY);
-            }
-        }
-    } else if ap.kind == HELIOS_WDDM_ALLOC_KIND_STANDARD && is_primary {
-        match adapter.with_venus_client(|c| {
-            c.allocate_linear_scanout_image_blob(adapter, meta.width, meta.height)
-        }) {
-            Ok(Ok(scanout)) => {
-                venus_memory_id = scanout.blob.blob_id;
-                venus_image_id = scanout.image_id.get();
-                meta.pitch = scanout.row_pitch;
-                meta.plane_offset = scanout.plane_offset as u64;
-                meta.venus_alloc_size = scanout.blob.size;
-                meta.memory_type_index = scanout.memory_type_index;
-                ap.size = scanout.blob.size;
-                scanout.blob.res_id
-            }
-            Ok(Err(_ve)) => {
-                crate::diag::record(0x0C01_00E5);
-                return Err(STATUS_NO_MEMORY);
-            }
-            Err(_de) => {
-                crate::diag::record(0x0C01_00E1);
-                return Err(STATUS_DEVICE_NOT_READY);
-            }
-        }
-    } else if is_optimal_gdi_texture {
-        // D3DKMDT_GDISURFACE_TEXTURE is a shared, non-CPU-visible texture used
-        // as both a DWM sample source and a DirectX render target. Preserve that
-        // contract with a real cross-context OPTIMAL image. Reinterpreting this
-        // allocation as pitched host bytes makes DWM sample tiled memory as a
-        // different resource shape and produces a black redirected window.
-        let dxgi_format = match meta.format {
-            value if value == D3DDDIFMT_A8R8G8B8 as u32 => 87,
-            value if value == D3DDDIFMT_X8R8G8B8 as u32 => 88,
-            _ => {
-                crate::diag::record_named_bytes(b"GdiOFmt", meta.format);
-                return Err(STATUS_NOT_SUPPORTED);
-            }
-        };
-        match adapter.with_venus_client(|client| {
-            client.allocate_optimal_gdi_image_blob(
-                adapter,
-                meta.width,
-                meta.height,
-                meta.bind_flags,
-                dxgi_format,
-            )
-        }) {
-            Ok(Ok(image)) => {
-                venus_memory_id = image.blob.blob_id;
-                venus_image_id = image.image_id.get();
-                meta.pitch = 0;
-                meta.plane_offset = 0;
-                meta.dxgi_format = dxgi_format;
-                meta.venus_alloc_size = image.blob.size;
-                meta.memory_type_index = image.memory_type_index;
-                ap.size = image.blob.size;
-                image.blob.res_id
-            }
-            Ok(Err(_ve)) => {
-                crate::diag::record_named_bytes(b"GdiOImg", 0xE1);
-                return Err(STATUS_NO_MEMORY);
-            }
-            Err(_de) => {
-                crate::diag::record_named_bytes(b"GdiOImg", 0xE2);
-                return Err(STATUS_DEVICE_NOT_READY);
-            }
-        }
-    } else if ap.kind == HELIOS_WDDM_ALLOC_KIND_STANDARD {
-        // KMD-originated standard allocation (indirect-swapchain backbuffer, GDI
-        // redirection/staging surface). Back it with a REAL venus `VkDeviceMemory`
-        // blob through the kernel venus client: user-mode venus contexts (DWM
-        // opening the surface) import it by resource id and vkBindImageMemory2
-        // against it — a raw `blob_id = 0` shmem blob has no memory object behind
-        // it, and that bind poisons the importer's venus ring (host: "failed to
-        // look up object of type 8" → fatal decoder state → context destroyed).
-        // `allocate_memory_blob` also registers the blob in the tracking table
-        // (owner 0), which the GDI executor's `blob_kernel_range` resolves.
-        // PASSIVE flow under the venus mutex (never the DISPATCH spinlock).
-        match adapter.with_venus_client(|c| {
-            c.allocate_memory_blob(adapter, ap.size, true, is_primary)
-                .map(|b| (b, c.memory_type_index()))
-        }) {
-            Ok(Ok((blob, kernel_mti))) => {
-                venus_memory_id = blob.blob_id;
-                // Record the EXACT venus allocation parameters into the trailer
-                // (written back to the runtime's buffer below) so cross-process
-                // openers import with the creator's size + memory type.
-                meta.venus_alloc_size = blob.size;
-                meta.memory_type_index = kernel_mti;
-                blob.res_id
-            }
-            Ok(Err(_ve)) => {
-                // Host rejected the backing blob. STATUS_NO_MEMORY is the
-                // documented CreateAllocation failure status; STATUS_UNSUCCESSFUL
-                // (0xC0000001) is NOT in the DDI's legal return set — dxgkrnl
-                // logged it as "Driver returned an invalid NTSTATUS" (197×) and
-                // responded with adapter resets during boot.
-                crate::diag::record(0x0C01_00E3);
-                return Err(STATUS_NO_MEMORY);
-            }
-            Err(_de) => {
-                crate::diag::record(0x0C01_00E1);
-                return Err(STATUS_DEVICE_NOT_READY);
-            }
-        }
-    } else {
-        match crate::virtio::ctrl::resource_create_blob(
-            adapter,
-            ap.ctx_id,
-            ap.blob_mem,
-            ap.blob_flags,
-            ap.blob_id,
-            ap.size,
-        ) {
-            Ok(rid) => {
-                // Register the blob in the tracking table (owner 0 = KMD-internal)
-                // so the GDI executor's `blob_kernel_range` can resolve and
-                // host-map this allocation by resource id. Removed again in
-                // `destroy_allocation_ctx` via `forget_allocation_blob`.
-                let _ = adapter.with_virtio(|v| v.note_blob_size(rid, ap.size));
-                rid
-            }
-            Err(_ve) => {
-                // Host rejected the blob (e.g. the .56 blob_id=0 RESP_ERR_UNSPEC case).
-                // STATUS_NO_MEMORY, not STATUS_UNSUCCESSFUL — see the standard-alloc
-                // arm above (invalid-NTSTATUS → dxgkrnl adapter resets).
-                crate::diag::record(0x0C01_00E0);
-                return Err(STATUS_NO_MEMORY);
-            }
+    // Classify ONCE, build ONCE, update `meta`/`ap` at exactly ONE site.
+    let backing = match helios_protocol::classify(&ap, &meta, supplied_resource_id) {
+        Ok(backing) => backing,
+        Err(helios_protocol::ClassifyRefusal::UnsupportedGdiFormat { format }) => {
+            crate::diag::record_named_bytes(b"GdiOFmt", format);
+            return Err(STATUS_NOT_SUPPORTED);
         }
     };
+    let adopt_supplied_resource = matches!(
+        backing,
+        helios_protocol::AllocationBacking::AdoptedUmdResource { .. }
+    );
+    let is_primary = (meta.misc_flags & HELIOS_WDDM_ALLOC_MISC_PRIMARY) != 0;
+    // Deliberately the FLAG, not the backing arm. This is a VidMm policy input
+    // (CpuVisible=0, no Cached, not BAR-eligible), not a backing class, and
+    // deriving it from the arm would silently change policy for the unreachable
+    // PRIMARY | OPTIMAL_GDI_TEXTURE combination, which classifies as the primary.
+    let is_optimal_gdi_texture = ap.kind == HELIOS_WDDM_ALLOC_KIND_STANDARD
+        && (meta.misc_flags & HELIOS_WDDM_ALLOC_MISC_OPTIMAL_GDI_TEXTURE) != 0;
+    let created = build_backing(adapter, backing, &ap, &meta)?;
+
+    // THE one update site. `meta`/`ap` used to be mutated in place by each arm
+    // and read again 100-470 lines later, with nothing stating which fields an
+    // arm owed an answer for.
+    let resource_id = created.resource_id;
+    let venus_memory_id = created.venus_memory_id;
+    let venus_image_id = created.venus_image_id;
+    meta.pitch = created.pitch;
+    meta.plane_offset = created.plane_offset;
+    meta.dxgi_format = created.dxgi_format;
+    meta.venus_alloc_size = created.venus_alloc_size;
+    meta.memory_type_index = created.memory_type_index;
+    ap.size = created.blob_size;
+
     crate::diag::record(0x0C01_0020);
     crate::diag::record(resource_id);
-    let owns_resource = !adopt_supplied_resource || ap.kind == HELIOS_WDDM_ALLOC_KIND_DEVICE_MEMORY;
+    let owns_resource = match backing {
+        // Only DEVICE_MEMORY adopts take the blob's lifetime.
+        helios_protocol::AllocationBacking::AdoptedUmdResource { take_ownership, .. } => {
+            take_ownership
+        }
+        _ => true,
+    };
     if adopt_supplied_resource {
         // UMD/Venus-backed allocations arrive with a Mesa BO resource id in
         // `_pad`. The UMD transfers lifetime ownership from the ICD to this WDDM
@@ -1493,13 +1612,6 @@ unsafe fn create_one(
         // were not created through this CreateAllocation call. Cross-context
         // imports attach explicitly through HELIOS_ESCAPE_ATTACH_RESOURCE.
         crate::diag::record(0x0C3A_1000 | (resource_id & 0x0FFF));
-    }
-    // The venus identity a cross-process opener needs: exact vkAllocateMemory
-    // size + memory type. For adopted resources the UMD recorded them in the
-    // trailer at create; for KMD standard allocations they were filled from the
-    // kernel venus client above. Fallback: the (page-rounded) blob size.
-    if meta.venus_alloc_size == 0 {
-        meta.venus_alloc_size = ap.size;
     }
     if write_target_len >= size_of::<HeliosWddmOpenIdentity>() && !write_target.is_null() {
         // Create-time write-back into dxgkrnl's per-allocation buffer (the copy

@@ -355,3 +355,270 @@ const _: () = {
             == core::mem::size_of::<HeliosWddmAllocPrivate>()
     );
 };
+
+// ── Allocation backing classification ────────────────────────────────────────
+
+/// `D3DDDIFMT_A8R8G8B8`, the BGRA D3DDDIFORMAT the GDI surface path accepts.
+///
+/// Duplicated from the WDK enum on purpose: this crate has no bindgen edge, and
+/// the value is a frozen Windows ABI constant.
+pub const D3DDDIFMT_A8R8G8B8: u32 = 21;
+/// `D3DDDIFMT_X8R8G8B8`.
+pub const D3DDDIFMT_X8R8G8B8: u32 = 22;
+
+/// How one allocation's backing store is produced.
+///
+/// The backing class used to be four booleans (`adopt_supplied_resource`,
+/// `is_primary`, `is_optimal_gdi_texture`, `ap.kind == STANDARD`) evaluated as
+/// an ordered if/else chain, with each arm mutating the shared `meta`/`ap`
+/// locals in place and the write-back happening 100-470 lines later. Nothing
+/// stated which fields each arm had to set — the per-arm field obligation
+/// behind the historical pitch shear (`width*4` = 7584 vs the real 7680) and
+/// the import-size mismatches, enforced only by prose.
+///
+/// As an exhaustive value, adding a class fails to compile until it is handled,
+/// and the ordering between classes is stated once here instead of being an
+/// emergent property of an if/else chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AllocationBacking {
+    /// A live virtio resource created by the UMD/ICD, adopted by this
+    /// allocation. `take_ownership` re-owns the blob slot from the ICD's escape
+    /// owner; otherwise the resource is only liveness-validated.
+    AdoptedUmdResource { resource_id: u32, take_ownership: bool },
+    /// The VidPn primary: a KMD-created LINEAR scanout image blob.
+    KmdLinearPrimary { width: u32, height: u32 },
+    /// `D3DKMDT_GDISURFACE_TEXTURE`: a KMD-created cross-context OPTIMAL image.
+    KmdOptimalGdiTexture {
+        width: u32,
+        height: u32,
+        dxgi_format: u32,
+        bind_flags: u32,
+    },
+    /// Any other runtime standard allocation: a KMD-created mappable
+    /// `VkDeviceMemory` blob.
+    KmdStandardBuffer { size: u64, primary: bool },
+    /// A raw HOST3D blob created straight from the ICD's parameters.
+    RawHost3dBlob {
+        ctx_id: u32,
+        blob_mem: u32,
+        blob_flags: u32,
+        blob_id: u64,
+        size: u64,
+    },
+}
+
+/// Why [`classify`] refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClassifyRefusal {
+    /// A `D3DKMDT_GDISURFACE_TEXTURE` in a D3DDDIFORMAT with no BGRA DXGI
+    /// equivalent. Reinterpreting it would make DWM sample the wrong shape.
+    UnsupportedGdiFormat { format: u32 },
+}
+
+/// Decide one allocation's backing class. Pure: no adapter, no host round-trip,
+/// no side effect — which is what makes the five arms unit-testable.
+///
+/// `supplied_resource_id` is the id the UMD passed in `_pad`, already filtered
+/// by kind (STANDARD and DEVICE_MEMORY carry one; SHMEM does not).
+///
+/// ORDER IS LOAD-BEARING and reproduces the old if/else chain exactly:
+/// adopt wins over everything, then primary-standard, then GDI texture, then
+/// any other standard, then the raw blob. In particular a STANDARD allocation
+/// flagged BOTH `PRIMARY` and `OPTIMAL_GDI_TEXTURE` classifies as the primary —
+/// `GetStandardAllocationDriverData`'s own if/else makes that combination
+/// unreachable, and the test below pins it so a future writer cannot change the
+/// meaning by accident.
+pub fn classify(
+    ap: &HeliosWddmAllocPrivate,
+    meta: &HeliosWddmAllocMeta,
+    supplied_resource_id: u32,
+) -> Result<AllocationBacking, ClassifyRefusal> {
+    if supplied_resource_id != 0 {
+        return Ok(AllocationBacking::AdoptedUmdResource {
+            resource_id: supplied_resource_id,
+            // Only DEVICE_MEMORY adopts take the blob's lifetime; anything else
+            // is liveness-validated only.
+            take_ownership: ap.kind == HELIOS_WDDM_ALLOC_KIND_DEVICE_MEMORY,
+        });
+    }
+    let is_standard = ap.kind == HELIOS_WDDM_ALLOC_KIND_STANDARD;
+    let is_primary = (meta.misc_flags & HELIOS_WDDM_ALLOC_MISC_PRIMARY) != 0;
+    if is_standard && is_primary {
+        return Ok(AllocationBacking::KmdLinearPrimary {
+            width: meta.width,
+            height: meta.height,
+        });
+    }
+    if is_standard && (meta.misc_flags & HELIOS_WDDM_ALLOC_MISC_OPTIMAL_GDI_TEXTURE) != 0 {
+        let dxgi_format = match meta.format {
+            f if f == D3DDDIFMT_A8R8G8B8 => 87,
+            f if f == D3DDDIFMT_X8R8G8B8 => 88,
+            f => return Err(ClassifyRefusal::UnsupportedGdiFormat { format: f }),
+        };
+        return Ok(AllocationBacking::KmdOptimalGdiTexture {
+            width: meta.width,
+            height: meta.height,
+            dxgi_format,
+            bind_flags: meta.bind_flags,
+        });
+    }
+    if is_standard {
+        return Ok(AllocationBacking::KmdStandardBuffer {
+            size: ap.size,
+            primary: is_primary,
+        });
+    }
+    Ok(AllocationBacking::RawHost3dBlob {
+        ctx_id: ap.ctx_id,
+        blob_mem: ap.blob_mem,
+        blob_flags: ap.blob_flags,
+        blob_id: ap.blob_id,
+        size: ap.size,
+    })
+}
+
+#[cfg(test)]
+mod classify_tests {
+    use super::*;
+
+    fn private(kind: u32) -> HeliosWddmAllocPrivate {
+        HeliosWddmAllocPrivate::new(kind, 7, 0xBEEF, 4096, 3, 1, 0)
+    }
+
+    fn meta(misc_flags: u32) -> HeliosWddmAllocMeta {
+        HeliosWddmAllocMeta {
+            width: 1896,
+            height: 1030,
+            format: D3DDDIFMT_A8R8G8B8,
+            pitch: 7680,
+            bind_flags: 0x28,
+            misc_flags,
+            venus_alloc_size: 0,
+            memory_type_index: 0,
+            dxgi_format: 0,
+            plane_offset: 0,
+        }
+    }
+
+    /// An adopted resource wins over every flag, and only a DEVICE_MEMORY adopt
+    /// takes ownership.
+    #[test]
+    fn adopt_wins_and_only_device_memory_takes_ownership() {
+        assert_eq!(
+            classify(
+                &private(HELIOS_WDDM_ALLOC_KIND_DEVICE_MEMORY),
+                &meta(HELIOS_WDDM_ALLOC_MISC_PRIMARY),
+                42
+            ),
+            Ok(AllocationBacking::AdoptedUmdResource {
+                resource_id: 42,
+                take_ownership: true
+            })
+        );
+        assert_eq!(
+            classify(
+                &private(HELIOS_WDDM_ALLOC_KIND_STANDARD),
+                &meta(HELIOS_WDDM_ALLOC_MISC_PRIMARY),
+                42
+            ),
+            Ok(AllocationBacking::AdoptedUmdResource {
+                resource_id: 42,
+                take_ownership: false
+            })
+        );
+    }
+
+    #[test]
+    fn standard_primary_is_the_linear_scanout_image() {
+        assert_eq!(
+            classify(
+                &private(HELIOS_WDDM_ALLOC_KIND_STANDARD),
+                &meta(HELIOS_WDDM_ALLOC_MISC_PRIMARY),
+                0
+            ),
+            Ok(AllocationBacking::KmdLinearPrimary {
+                width: 1896,
+                height: 1030
+            })
+        );
+    }
+
+    #[test]
+    fn gdi_texture_maps_both_bgra_formats_and_refuses_the_rest() {
+        let m = meta(HELIOS_WDDM_ALLOC_MISC_OPTIMAL_GDI_TEXTURE);
+        assert_eq!(
+            classify(&private(HELIOS_WDDM_ALLOC_KIND_STANDARD), &m, 0),
+            Ok(AllocationBacking::KmdOptimalGdiTexture {
+                width: 1896,
+                height: 1030,
+                dxgi_format: 87,
+                bind_flags: 0x28,
+            })
+        );
+        let mut m2 = m;
+        m2.format = D3DDDIFMT_X8R8G8B8;
+        assert!(matches!(
+            classify(&private(HELIOS_WDDM_ALLOC_KIND_STANDARD), &m2, 0),
+            Ok(AllocationBacking::KmdOptimalGdiTexture {
+                dxgi_format: 88,
+                ..
+            })
+        ));
+        let mut m3 = m;
+        m3.format = 999;
+        assert_eq!(
+            classify(&private(HELIOS_WDDM_ALLOC_KIND_STANDARD), &m3, 0),
+            Err(ClassifyRefusal::UnsupportedGdiFormat { format: 999 })
+        );
+    }
+
+    /// PRIMARY | OPTIMAL_GDI_TEXTURE must stay unreachable in practice, and it
+    /// must resolve to the PRIMARY arm if it ever does occur — which is what the
+    /// old ordered if/else did.
+    #[test]
+    fn primary_beats_gdi_texture_when_both_bits_are_set() {
+        assert_eq!(
+            classify(
+                &private(HELIOS_WDDM_ALLOC_KIND_STANDARD),
+                &meta(HELIOS_WDDM_ALLOC_MISC_PRIMARY | HELIOS_WDDM_ALLOC_MISC_OPTIMAL_GDI_TEXTURE),
+                0
+            ),
+            Ok(AllocationBacking::KmdLinearPrimary {
+                width: 1896,
+                height: 1030
+            })
+        );
+    }
+
+    #[test]
+    fn plain_standard_is_a_kmd_buffer_and_everything_else_is_a_raw_blob() {
+        assert_eq!(
+            classify(&private(HELIOS_WDDM_ALLOC_KIND_STANDARD), &meta(0), 0),
+            Ok(AllocationBacking::KmdStandardBuffer {
+                size: 4096,
+                primary: false
+            })
+        );
+        assert_eq!(
+            classify(&private(HELIOS_WDDM_ALLOC_KIND_SHMEM), &meta(0), 0),
+            Ok(AllocationBacking::RawHost3dBlob {
+                ctx_id: 7,
+                blob_mem: 3,
+                blob_flags: 1,
+                blob_id: 0xBEEF,
+                size: 4096,
+            })
+        );
+        // A DEVICE_MEMORY allocation with no supplied id is also a raw blob.
+        assert_eq!(
+            classify(&private(HELIOS_WDDM_ALLOC_KIND_DEVICE_MEMORY), &meta(0), 0),
+            Ok(AllocationBacking::RawHost3dBlob {
+                ctx_id: 7,
+                blob_mem: 3,
+                blob_flags: 1,
+                blob_id: 0xBEEF,
+                size: 4096,
+            })
+        );
+    }
+}
