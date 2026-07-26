@@ -933,6 +933,50 @@ impl InFlight {
     }
 }
 
+/// A non-`Copy`, non-`Clone` receipt for one registered synchronous submission.
+///
+/// The token, the `NonNull<SyncWaitBlock>` and the block's own pinned storage
+/// are three values the caller had to keep in sync across enqueue / PASSIVE
+/// wait / abandon. Making the token move-only means it cannot be reused after
+/// the abandonment that consumes it.
+pub struct SyncTicket {
+    token: u16,
+}
+
+impl SyncTicket {
+    /// The raw descriptor-chain head, for a diagnostic breadcrumb only. Reading
+    /// it does not consume the ticket; `abandon_sync` still does.
+    pub fn raw(&self) -> u16 {
+        self.token
+    }
+}
+
+/// What [`VirtioGpu::abandon_sync`] found.
+///
+/// This replaces a bool whose fall-through returned `true` — "already
+/// completed, treat as success" — for EVERY case that was not an exact
+/// (token, Sync, same-waiter) match, including a token now owned by a different
+/// command and a kind mismatch. The caller then ran `copy_resp` on a block that
+/// may never have been written. That was safe only because (a) a token cannot
+/// be re-issued until its chain is popped, which implies the old waiter was
+/// signalled, and (b) `new_zeroed` leaves `resp` all-zero and 0 is not a
+/// RESP_OK code, so `ctrl_roundtrip_ok` still errored out — i.e. correctness
+/// rested on a virtio-ring property and a zero-init accident, neither of them
+/// stated at that function.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncOutcome {
+    /// No in-flight entry holds this token: the drain already completed and
+    /// signalled it. The response bytes are valid.
+    AlreadyCompleted,
+    /// The waiter was deregistered before completion. The response bytes were
+    /// never written.
+    Abandoned,
+    /// The token names an entry that is not this waiter's — a NEW error
+    /// population, and the one behaviour change in this item. It converts a
+    /// silent read of an unwritten buffer into a counted error.
+    NotOurs,
+}
+
 /// A registered WAIT_FENCE waiter.
 struct FenceWaiter {
     fence_id: u64,
@@ -1399,7 +1443,7 @@ impl VirtioGpu {
         in1_len: usize,
         resp_len: usize,
         waiter: NonNull<SyncWaitBlock>,
-    ) -> Result<u16, (DmaBuffer, VirtioError)> {
+    ) -> Result<SyncTicket, (DmaBuffer, VirtioError)> {
         if self.failed {
             return Err((meta, VirtioError::DeviceError));
         }
@@ -1457,7 +1501,7 @@ impl VirtioGpu {
             venus: None,
         });
         bump_high_water(&INFLIGHT_HIGH_WATER, self.inflight.len());
-        Ok(token)
+        Ok(SyncTicket { token })
     }
 
     /// Enqueue a control command without a blocking waiter.  Completion still
@@ -2093,19 +2137,24 @@ impl VirtioGpu {
     /// completion signals nobody (the entry itself is reaped when it completes).
     /// Returns `true` if the entry had ALREADY completed — the wait raced the
     /// drain and the caller should treat it as success.
-    pub fn abandon_sync(&mut self, token: u16, block: NonNull<SyncWaitBlock>) -> bool {
+    pub fn abandon_sync(&mut self, ticket: SyncTicket, block: NonNull<SyncWaitBlock>) -> SyncOutcome {
         for e in self.inflight.iter_mut() {
-            if e.token != token {
+            if e.token != ticket.token {
                 continue;
             }
             if let InFlightKind::Sync { waiter } = &mut e.kind {
                 if *waiter == Some(block) {
                     *waiter = None;
-                    return false;
+                    return SyncOutcome::Abandoned;
                 }
+                // The token is ours but the waiter is a DIFFERENT block, or the
+                // entry is not a Sync at all. Either way this waiter's response
+                // buffer was never written.
+                return SyncOutcome::NotOurs;
             }
+            return SyncOutcome::NotOurs;
         }
-        true
+        SyncOutcome::AlreadyCompleted
     }
 
     // ── Wire-fence table (WAIT_FENCE) ────────────────────────────────────────

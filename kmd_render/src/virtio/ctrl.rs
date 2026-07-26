@@ -29,7 +29,7 @@ use wdk_sys::{KEVENT, LARGE_INTEGER, PVOID, STATUS_SUCCESS};
 use super::gpu::{
     BlobMapBegin, BlobMapFinish, BlobMapPrep, BlobRemapBegin, DeviceOwner,
     FenceWaitPrep, OwnerFilter, SyncWaitBlock, WaitBlockRef, CTRL_TEARDOWN_ABANDONS,
-    CTRL_TIMEOUT_COUNT,
+    CTRL_TIMEOUT_COUNT, SyncOutcome, SyncTicket,
     FENCE_WAIT_TABLE_FULL, FENCE_WAIT_TIMEOUTS, SUBMIT_META_BYTES, TRANSPORT_GONE_AT_WAIT,
 };
 use super::hal::DmaBuffer;
@@ -270,14 +270,14 @@ fn ctrl_roundtrip(
         // is then a *compile* error, where the take-then-expect this replaces was a
         // `KeBugCheck` inside a DDI on the next iteration.
         let mut attempts = 0u32;
-        let token = loop {
+        let token: SyncTicket = loop {
             let res = adapter.with_virtio(move |v| {
                 v.drain_used();
                 v.enqueue_sync(meta, in0_len, in1_len, resp_len, block.as_ptr())
             });
             match res {
                 Err(_) => return Err(VirtioError::DeviceError), // transport gone
-                Ok(Ok(token)) => break token,
+                Ok(Ok(ticket)) => break ticket,
                 Ok(Err((m_back, VirtioError::QueueFull))) => {
                     meta = m_back;
                     attempts += 1;
@@ -291,6 +291,9 @@ fn ctrl_roundtrip(
             }
         };
 
+        // Kept for the refusal breadcrumb: SyncTicket is move-only, so it is
+        // consumed by abandon_sync and cannot be read afterwards.
+        let token_value = token.raw();
         if !wait_block(adapter, block, timeout_ms) {
             // Final race check + abandonment under the lock.
             // Three outcomes, not two. `unwrap_or(true)` folded Err(DeviceNotFound)
@@ -303,10 +306,19 @@ fn ctrl_roundtrip(
                 v.drain_used();
                 v.abandon_sync(token, block.as_ptr())
             }) {
-                Ok(true) => {}
-                Ok(false) => {
+                // The drain already signalled us; the response bytes are valid.
+                Ok(SyncOutcome::AlreadyCompleted) => {}
+                Ok(SyncOutcome::Abandoned) => {
                     CTRL_TIMEOUT_COUNT.fetch_add(1, Ordering::Relaxed);
                     return Err(VirtioError::Timeout);
+                }
+                // NEW population. The token names an entry that is not this
+                // waiter's, so `resp` was never written — do NOT copy it out.
+                // The old bool folded this into "already completed" and handed
+                // the caller a zeroed buffer.
+                Ok(SyncOutcome::NotOurs) => {
+                    crate::diag::record_named_bytes(b"CtNotOurs", u32::from(token_value));
+                    return Err(VirtioError::DeviceError);
                 }
                 Err(_) => {
                     CTRL_TEARDOWN_ABANDONS.fetch_add(1, Ordering::Relaxed);
