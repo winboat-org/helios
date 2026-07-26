@@ -157,6 +157,9 @@ pub unsafe extern "C" fn dxgkddi_start_device(
     // init keeps the ordering safe — otherwise assigning the new transport would
     // drop the old one (resetting the device) right after init configured it.
     adapter.set_virtio(None);
+    // Non-zero only if init below fails, so the display-half demotion can report
+    // the status that actually killed the transport rather than a bare flag.
+    let mut transport_fail_status: u32 = 0;
     // SAFETY: dxgkrnl_interface is valid per the DDI contract (also copied into
     // adapter.dxgkrnl just above); init only borrows it for the call.
     match crate::virtio::VirtioGpu::init(unsafe { &*dxgkrnl_interface }) {
@@ -230,11 +233,37 @@ pub unsafe extern "C" fn dxgkddi_start_device(
             crate::diag::record(0x0B00_00E0);
             crate::diag::record(status as u32);
             crate::diag::fault(crate::diag::FaultCounter::StVio, status as u32);
+            transport_fail_status = status as u32;
             adapter
                 .isr_status
                 .store(0, core::sync::atomic::Ordering::Release);
             adapter.set_virtio(None);
         }
+    }
+
+    // Gate 1 keeps the adapter startable without a transport (render-only
+    // recovery), but the display half has no such licence: with virtio=None
+    // nothing can ever reach a scanout. Left enabled it reports one source and
+    // one child, arms the CRTC_VSYNC heartbeat, and has the HPD worker tell the
+    // OS the monitor is CONNECTED - so the OS commits a path to a target that
+    // can never receive a frame. No allocation ever gets a resource id, so every
+    // SetVidPnSourceAddress exits with ScRid=0 and STATUS_SUCCESS: a permanently
+    // blank monitor whose only diagnostic was a DiagLevel-gated breadcrumb.
+    //
+    // Turning the flag OFF - rather than merely reporting zero sources - is
+    // required because ~20 display DDIs branch on the flag itself. StartDevice
+    // still returns STATUS_SUCCESS: the render-only recovery shape is preserved.
+    if adapter.display_half && adapter.with_virtio(|_| ()).is_err() {
+        adapter.display_half = false;
+        crate::diag::fault(
+            crate::diag::FaultCounter::StNoTx,
+            if transport_fail_status != 0 {
+                transport_fail_status
+            } else {
+                1
+            },
+        );
+        crate::diag::record_named_bytes(b"DspH", 0);
     }
 
     // Source/child count. Default (render-only): 0 scanout sources, 0 children.

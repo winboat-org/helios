@@ -133,6 +133,10 @@ pub enum FaultCounter {
     /// The transport answered the mode query but reported nothing usable —
     /// value is 1. Same fallback, different cause.
     StMdB,
+    /// The display half was demoted to render-only for this start because the
+    /// transport is absent — value is the NTSTATUS that killed it, or 1 if the
+    /// transport was already gone for another reason. The adapter still binds.
+    StNoTx,
 }
 
 impl FaultCounter {
@@ -147,6 +151,7 @@ impl FaultCounter {
             FaultCounter::StBar => b"StBar",
             FaultCounter::StTxG => b"StTxG",
             FaultCounter::StMdB => b"StMdB",
+            FaultCounter::StNoTx => b"StNoTx",
         }
     }
 
@@ -159,6 +164,7 @@ impl FaultCounter {
         FaultCounter::StBar,
         FaultCounter::StTxG,
         FaultCounter::StMdB,
+        FaultCounter::StNoTx,
     ];
 }
 
