@@ -883,6 +883,10 @@ pub struct VirtioGpu {
     resources: Vec<u32>,
     /// Live-resource slots reserved by in-flight creates (see `blobs_reserved`).
     resources_reserved: usize,
+    /// Context tracking slots reserved by in-flight CTX_CREATEs. Tracking is
+    /// MANDATORY (see `reserve_context_slot`), so a context is reserved before
+    /// the wire round-trip and committed after it.
+    contexts_reserved: usize,
     /// Live virtio-gpu contexts, tagged with the owning device handle, so
     /// `DxgkDdiDestroyDevice` can `CTX_DESTROY` any context an ICD created but did
     /// not tear down (crash / skipped CTX_DESTROY) — otherwise leaked contexts
@@ -1116,6 +1120,7 @@ impl VirtioGpu {
             blobs_reserved: 0,
             resources: Vec::with_capacity(MAX_RESOURCES),
             resources_reserved: 0,
+            contexts_reserved: 0,
             contexts: Vec::with_capacity(MAX_CONTEXTS),
             next_window_offset: 0,
             vidmm_reserved: 0,
@@ -2149,14 +2154,41 @@ impl VirtioGpu {
         self.next_resource_id.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// Track a live context for device-teardown reclamation (best-effort: on a
-    /// full table the context still works, it just is not auto-reclaimed).
-    pub fn track_context(&mut self, owner: Option<DeviceOwner>, ctx_id: u32) {
-        if self.contexts.len() < MAX_CONTEXTS {
-            self.contexts.push(ContextSlot { owner, ctx_id });
-        } else {
+    /// Reserve a context tracking slot for an in-flight CTX_CREATE.
+    ///
+    /// TRACKING IS MANDATORY, the same rule `reserve_resource_slot` already
+    /// applies to resources: refuse the create when the table is full rather
+    /// than creating a context that works but is untracked. Tracking used to be
+    /// best-effort, which had two consequences — an untracked context is never
+    /// reclaimed at device teardown, and (the reason this changed) an ownership
+    /// check against a best-effort table would have to trust an unknown id,
+    /// which is not a check at all. With reserve-then-commit, "live but
+    /// untracked" cannot exist, so `resolve_owned_ctx` is authoritative.
+    ///
+    /// Same-boot evidence for the safety of refusing: contexts_live = 9 against
+    /// MAX_CONTEXTS = 1024 with context_full_drops = 0 on a full desktop
+    /// (escape_owner_probe, 2026-07-26), so no live workload approaches the cap.
+    pub fn reserve_context_slot(&mut self) -> bool {
+        if self.contexts.len() + self.contexts_reserved >= MAX_CONTEXTS {
+            // Keeps its name and its QUERY_STATS field; the event it counts is
+            // now "CTX_CREATE refused because the table is full" rather than
+            // "tracking silently dropped".
             CONTEXT_FULL_DROPS.fetch_add(1, Ordering::Relaxed);
+            return false;
         }
+        self.contexts_reserved += 1;
+        true
+    }
+
+    /// Commit a reserved context slot once the host has created the context.
+    pub fn commit_context(&mut self, owner: Option<DeviceOwner>, ctx_id: u32) {
+        self.contexts_reserved = self.contexts_reserved.saturating_sub(1);
+        self.contexts.push(ContextSlot { owner, ctx_id });
+    }
+
+    /// Release a reserved context slot after a failed create.
+    pub fn cancel_context_reservation(&mut self) {
+        self.contexts_reserved = self.contexts_reserved.saturating_sub(1);
     }
 
     /// Drop a context's tracking slot (explicit CTX_DESTROY path).

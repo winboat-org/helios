@@ -341,6 +341,14 @@ pub fn ctx_create(
     let ctx_id = adapter
         .with_virtio(|v| v.alloc_ctx_id())
         .map_err(|_| VirtioError::DeviceError)?;
+    // Reserve the tracking slot BEFORE the host round-trip: tracking is
+    // mandatory, so a context this driver cannot track must not be created.
+    let reserved = adapter
+        .with_virtio(|v| v.reserve_context_slot())
+        .map_err(|_| VirtioError::DeviceError)?;
+    if !reserved {
+        return Err(VirtioError::OutOfMemory);
+    }
     let mut cmd = VirtioGpuCtxCreate::zeroed();
     cmd.hdr.type_ = VIRTIO_GPU_CMD_CTX_CREATE;
     cmd.hdr.ctx_id = ctx_id;
@@ -351,9 +359,12 @@ pub fn ctx_create(
     cmd.nlen = NAME.len() as u32;
     cmd.debug_name[..NAME.len()].copy_from_slice(NAME);
     crate::diag::record(0x0D20_0000 | (ctx_id & 0xFFFF));
-    ctrl_roundtrip_ok(adapter, bytes_of(&cmd), None)?;
+    if let Err(e) = ctrl_roundtrip_ok(adapter, bytes_of(&cmd), None) {
+        let _ = adapter.with_virtio(|v| v.cancel_context_reservation());
+        return Err(e);
+    }
     crate::diag::record(0x0D21_0000 | (ctx_id & 0xFFFF));
-    let _ = adapter.with_virtio(|v| v.track_context(owner, ctx_id));
+    let _ = adapter.with_virtio(|v| v.commit_context(owner, ctx_id));
     Ok(ctx_id)
 }
 
