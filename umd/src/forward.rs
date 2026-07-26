@@ -2066,37 +2066,46 @@ unsafe extern "C" fn create_resource(
                 .map(ResidentAllocation::handle)
                 .unwrap_or(0);
             let mut buf: Option<ID3D11Buffer> = None;
-            match device.CreateBuffer(&desc, init_ptr, Some(&mut buf)) {
-                Ok(()) => {
-                    if let Some(b) = buf {
-                        if let Ok(res) = b.cast::<ID3D11Resource>() {
-                            stamp_dxvk_resource_kmt_handles(
-                                h,
-                                &res,
-                                allocation_handle,
-                                km_resource,
-                            );
-                            let n = RESOURCE_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-                            if n < 128 {
-                                log_line(&format!(
-                                    "DDI create_resource(buffer) ok: bytes={} fmt={} usage={} bind=0x{:x} misc=0x{:x}",
-                                    mip0.TexelWidth, a.Format, a.Usage, bind, misc
-                                ));
-                            }
-                            store_resource(
-                                h_resource.pDrvPrivate,
-                                res,
-                                allocation,
-                                km_resource,
-                                h_rt.handle,
-                                true, // allocated via pfnAllocateCb above
-                                empty_present_private(),
-                            );
-                        }
-                    }
-                }
-                Err(e) => log_line(&format!("DDI create_resource(buffer) failed: {e:?}")),
+            let created = device.CreateBuffer(&desc, init_ptr, Some(&mut buf));
+            if let Err(ref e) = created {
+                log_line(&format!("DDI create_resource(buffer) failed: {e:?}"));
             }
+            let res = match buf {
+                Some(b) => match b.cast::<ID3D11Resource>() {
+                    Ok(r) => Some(r),
+                    Err(e) => {
+                        log_line(&format!(
+                            "DDI create_resource(buffer): cast to ID3D11Resource failed: {e:?}"
+                        ));
+                        None
+                    }
+                },
+                None => {
+                    if created.is_ok() {
+                        log_line("DDI create_resource(buffer): DXVK CreateBuffer returned no buffer");
+                    }
+                    None
+                }
+            };
+            finish_create(h, created, res, |res| {
+                stamp_dxvk_resource_kmt_handles(h, &res, allocation_handle, km_resource);
+                let n = RESOURCE_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+                if n < 128 {
+                    log_line(&format!(
+                        "DDI create_resource(buffer) ok: bytes={} fmt={} usage={} bind=0x{:x} misc=0x{:x}",
+                        mip0.TexelWidth, a.Format, a.Usage, bind, misc
+                    ));
+                }
+                store_resource(
+                    h_resource.pDrvPrivate,
+                    res,
+                    allocation,
+                    km_resource,
+                    h_rt.handle,
+                    true, // allocated via pfnAllocateCb above
+                    empty_present_private(),
+                );
+            });
         }
         RES_TEX2D | RES_TEXCUBE => {
             let bind = api_bind_flags(a.BindFlags);
@@ -2196,7 +2205,10 @@ unsafe extern "C" fn create_resource(
             }
             if !handled {
                 let mut tex: Option<ID3D11Texture2D> = None;
-                if mip0.TexelWidth >= 1024 || mip0.TexelHeight >= 576 || misc != 0 {
+                // The five existing tex2d trace gates are the same predicate;
+                // name it once so the restructured arm cannot drift between them.
+                let big = mip0.TexelWidth >= 1024 || mip0.TexelHeight >= 576 || misc != 0;
+                if big {
                     log_line(&format!(
                         "DDI create_resource(tex2d): calling DXVK CreateTexture2D {}x{} fmt={} bind=0x{:x} misc=0x{:x} init={} hrt={:p} mips={} array={} usage={} cpu=0x{:x} sample={}x{}",
                         mip0.TexelWidth,
@@ -2214,38 +2226,47 @@ unsafe extern "C" fn create_resource(
                         a.SampleDesc.Quality
                     ));
                 }
-                match device.CreateTexture2D(&desc, init_ptr, Some(&mut tex)) {
+                let created = device.CreateTexture2D(&desc, init_ptr, Some(&mut tex));
+                match created {
                     Ok(()) => {
-                        if mip0.TexelWidth >= 1024 || mip0.TexelHeight >= 576 || misc != 0 {
+                        if big {
                             log_line(&format!(
                                 "DDI create_resource(tex2d): DXVK CreateTexture2D returned S_OK tex_present={}",
                                 tex.is_some()
                             ));
                         }
-                        if let Some(t) = tex {
-                            if let Ok(res) = t.cast::<ID3D11Resource>() {
-                                if mip0.TexelWidth >= 1024 || mip0.TexelHeight >= 576 || misc != 0 {
-                                    log_line(
-                                        "DDI create_resource(tex2d): cast to ID3D11Resource OK",
-                                    );
-                                }
-                                finish_wddm_tex2d(h, a, &mip0, h_rt, h_resource, res, false, 0, 0);
-                            } else if mip0.TexelWidth >= 1024
-                                || mip0.TexelHeight >= 576
-                                || misc != 0
-                            {
+                    }
+                    Err(ref e) => log_line(&format!("DDI create_resource(tex2d) failed: {e:?}")),
+                }
+                let res = match tex {
+                    Some(t) => match t.cast::<ID3D11Resource>() {
+                        Ok(r) => {
+                            if big {
+                                log_line("DDI create_resource(tex2d): cast to ID3D11Resource OK");
+                            }
+                            Some(r)
+                        }
+                        Err(_) => {
+                            if big {
                                 log_line(
                                     "DDI create_resource(tex2d): cast to ID3D11Resource failed",
                                 );
                             }
-                        } else if mip0.TexelWidth >= 1024 || mip0.TexelHeight >= 576 || misc != 0 {
+                            None
+                        }
+                    },
+                    None => {
+                        if big && created.is_ok() {
                             log_line(
                                 "DDI create_resource(tex2d): DXVK CreateTexture2D returned no texture",
                             );
                         }
+                        None
                     }
-                    Err(e) => log_line(&format!("DDI create_resource(tex2d) failed: {e:?}")),
-                }
+                };
+                finish_create(h, created, res, |res| {
+                    finish_wddm_tex2d(h, a, &mip0, h_rt, h_resource, res, false, 0, 0);
+                });
             }
         }
         RES_TEX3D => {
@@ -2277,62 +2298,63 @@ unsafe extern "C" fn create_resource(
                 MiscFlags: misc,
             };
             let mut tex: Option<ID3D11Texture3D> = None;
-            match device.CreateTexture3D(&desc, init_ptr, Some(&mut tex)) {
-                Ok(()) => {
-                    if let Some(t) = tex {
-                        if let Ok(res) = t.cast::<ID3D11Resource>() {
-                            let (allocation, km_resource) = match allocate_wddm_resource(
-                                h, a, &mip0, h_rt, 0, 0, 0, 0, 0, false, 0, 0,
-                            ) {
-                                Ok(allocation) => allocation,
-                                Err(hr) => {
-                                    log_line(&format!(
-                                            "DDI create_resource(tex3d): WDDM allocation/residency failed hr=0x{:08x}",
-                                            hr as u32
-                                        ));
-                                    set_runtime_error(h, hr);
-                                    return;
-                                }
-                            };
-                            let allocation_handle = allocation
-                                .as_ref()
-                                .map(ResidentAllocation::handle)
-                                .unwrap_or(0);
-                            stamp_dxvk_resource_kmt_handles(
-                                h,
-                                &res,
-                                allocation_handle,
-                                km_resource,
-                            );
-                            log_line(&format!(
-                                "DDI create_resource(tex3d) ok: {}x{}x{} fmt={} bind=0x{:x} misc=0x{:x}",
-                                mip0.TexelWidth,
-                                mip0.TexelHeight,
-                                mip0.TexelDepth,
-                                a.Format,
-                                bind,
-                                misc
-                            ));
-                            store_resource(
-                                h_resource.pDrvPrivate,
-                                res,
-                                allocation,
-                                km_resource,
-                                h_rt.handle,
-                                true,
-                                empty_present_private(),
-                            );
-                        } else {
-                            log_line("DDI create_resource(tex3d): cast to ID3D11Resource failed");
-                        }
-                    } else {
+            let created = device.CreateTexture3D(&desc, init_ptr, Some(&mut tex));
+            if let Err(ref e) = created {
+                log_line(&format!("DDI create_resource(tex3d) failed: {e:?}"));
+            }
+            let res = match tex {
+                Some(t) => match t.cast::<ID3D11Resource>() {
+                    Ok(r) => Some(r),
+                    Err(_) => {
+                        log_line("DDI create_resource(tex3d): cast to ID3D11Resource failed");
+                        None
+                    }
+                },
+                None => {
+                    if created.is_ok() {
                         log_line(
                             "DDI create_resource(tex3d): DXVK CreateTexture3D returned no texture",
                         );
                     }
+                    None
                 }
-                Err(e) => log_line(&format!("DDI create_resource(tex3d) failed: {e:?}")),
-            }
+            };
+            finish_create(h, created, res, |res| {
+                // The allocation-failure arm below already reported through
+                // set_runtime_error; `return` leaves the closure, and this is
+                // the last statement of create_resource, so that is the same
+                // exit it was before.
+                let (allocation, km_resource) =
+                    match allocate_wddm_resource(h, a, &mip0, h_rt, 0, 0, 0, 0, 0, false, 0, 0) {
+                        Ok(allocation) => allocation,
+                        Err(hr) => {
+                            log_line(&format!(
+                                "DDI create_resource(tex3d): WDDM allocation/residency failed hr=0x{:08x}",
+                                hr as u32
+                            ));
+                            set_runtime_error(h, hr);
+                            return;
+                        }
+                    };
+                let allocation_handle = allocation
+                    .as_ref()
+                    .map(ResidentAllocation::handle)
+                    .unwrap_or(0);
+                stamp_dxvk_resource_kmt_handles(h, &res, allocation_handle, km_resource);
+                log_line(&format!(
+                    "DDI create_resource(tex3d) ok: {}x{}x{} fmt={} bind=0x{:x} misc=0x{:x}",
+                    mip0.TexelWidth, mip0.TexelHeight, mip0.TexelDepth, a.Format, bind, misc
+                ));
+                store_resource(
+                    h_resource.pDrvPrivate,
+                    res,
+                    allocation,
+                    km_resource,
+                    h_rt.handle,
+                    true,
+                    empty_present_private(),
+                );
+            });
         }
         other => log_line(&format!("DDI create_resource: unhandled dimension {other}")),
     }
@@ -2645,34 +2667,33 @@ unsafe extern "C" fn create_rtv(
         return;
     };
     let mut rtv: Option<ID3D11RenderTargetView> = None;
-    match device.CreateRenderTargetView(&*res, Some(&desc), Some(&mut rtv)) {
-        Ok(()) => {
-            if let Some(v) = rtv {
-                let n = VIEW_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-                let allocation = resource_allocation(a.hDrvResource.pDrvPrivate);
-                let (width, height) = resource_dimensions(a.hDrvResource.pDrvPrivate);
-                if n < 128 {
-                    log_line(&format!(
-                        "DDI create_rtv ok: dim={} fmt={} alloc=0x{:x} {}x{}",
-                        a.ResourceDimension, a.Format, allocation, width, height
-                    ));
-                }
-                store_rtv(
-                    h_rtv.pDrvPrivate,
-                    v,
-                    resource_com_raw(a.hDrvResource.pDrvPrivate),
-                    allocation,
-                    width,
-                    height,
-                    a.Format as u32,
-                );
-            }
-        }
-        Err(e) => log_line(&format!(
+    let created = device.CreateRenderTargetView(&*res, Some(&desc), Some(&mut rtv));
+    if let Err(ref e) = created {
+        log_line(&format!(
             "DDI create_rtv failed: dim={} fmt={} {e:?}",
             a.ResourceDimension, a.Format
-        )),
+        ));
     }
+    finish_create(h, created, rtv, |v| {
+        let n = VIEW_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+        let allocation = resource_allocation(a.hDrvResource.pDrvPrivate);
+        let (width, height) = resource_dimensions(a.hDrvResource.pDrvPrivate);
+        if n < 128 {
+            log_line(&format!(
+                "DDI create_rtv ok: dim={} fmt={} alloc=0x{:x} {}x{}",
+                a.ResourceDimension, a.Format, allocation, width, height
+            ));
+        }
+        store_rtv(
+            h_rtv.pDrvPrivate,
+            v,
+            resource_com_raw(a.hDrvResource.pDrvPrivate),
+            allocation,
+            width,
+            height,
+            a.Format as u32,
+        );
+    });
 }
 
 unsafe fn rtv_desc(
@@ -2840,24 +2861,23 @@ unsafe extern "C" fn create_dsv(
         return;
     };
     let mut dsv: Option<ID3D11DepthStencilView> = None;
-    match device.CreateDepthStencilView(&*res, Some(&desc), Some(&mut dsv)) {
-        Ok(()) => {
-            if let Some(v) = dsv {
-                let n = VIEW_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-                if n < 128 {
-                    log_line(&format!(
-                        "DDI create_dsv ok: dim={} fmt={} flags=0x{:x}",
-                        a.ResourceDimension, a.Format, a.Flags
-                    ));
-                }
-                store_com(h_dsv.pDrvPrivate, v);
-            }
-        }
-        Err(e) => log_line(&format!(
+    let created = device.CreateDepthStencilView(&*res, Some(&desc), Some(&mut dsv));
+    if let Err(ref e) = created {
+        log_line(&format!(
             "DDI create_dsv failed: dim={} fmt={} flags=0x{:x} {e:?}",
             a.ResourceDimension, a.Format, a.Flags
-        )),
+        ));
     }
+    finish_create(h, created, dsv, |v| {
+        let n = VIEW_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+        if n < 128 {
+            log_line(&format!(
+                "DDI create_dsv ok: dim={} fmt={} flags=0x{:x}",
+                a.ResourceDimension, a.Format, a.Flags
+            ));
+        }
+        store_com(h_dsv.pDrvPrivate, v);
+    });
 }
 
 unsafe fn dsv_desc(
@@ -5036,26 +5056,25 @@ unsafe extern "C" fn create_srv(
         return;
     };
     let mut srv: Option<ID3D11ShaderResourceView> = None;
-    match device.CreateShaderResourceView(&*res, Some(&desc), Some(&mut srv)) {
-        Ok(()) => {
-            if let Some(v) = srv {
-                let allocation = resource_allocation(a.hDrvResource.pDrvPrivate);
-                let n = SRV_CREATE_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-                if n < 1024 || allocation != 0 {
-                    let (width, height) = resource_dimensions(a.hDrvResource.pDrvPrivate);
-                    log_line(&format!(
-                        "DDI create_srv ok: hpriv={:p} alloc=0x{:x} dim={} fmt={} {}x{}",
-                        h_srv.pDrvPrivate, allocation, a.ResourceDimension, a.Format, width, height
-                    ));
-                }
-                store_com(h_srv.pDrvPrivate, v);
-            }
-        }
-        Err(e) => log_line(&format!(
+    let created = device.CreateShaderResourceView(&*res, Some(&desc), Some(&mut srv));
+    if let Err(ref e) = created {
+        log_line(&format!(
             "DDI create_srv failed: dim={} fmt={} {e:?}",
             a.ResourceDimension, a.Format
-        )),
+        ));
     }
+    finish_create(h, created, srv, |v| {
+        let allocation = resource_allocation(a.hDrvResource.pDrvPrivate);
+        let n = SRV_CREATE_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+        if n < 1024 || allocation != 0 {
+            let (width, height) = resource_dimensions(a.hDrvResource.pDrvPrivate);
+            log_line(&format!(
+                "DDI create_srv ok: hpriv={:p} alloc=0x{:x} dim={} fmt={} {}x{}",
+                h_srv.pDrvPrivate, allocation, a.ResourceDimension, a.Format, width, height
+            ));
+        }
+        store_com(h_srv.pDrvPrivate, v);
+    });
 }
 
 unsafe fn srv_desc(
@@ -5261,22 +5280,10 @@ unsafe extern "C" fn create_uav(
         return;
     };
     let mut uav: Option<ID3D11UnorderedAccessView> = None;
-    match device.CreateUnorderedAccessView(&*res, Some(&desc), Some(&mut uav)) {
-        Ok(()) => {
-            if let Some(v) = uav {
-                let n = VIEW_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-                if n < 256 {
-                    log_line(&format!(
-                        "DDI create_uav ok: dim={} fmt={} alloc=0x{:x}",
-                        a.ResourceDimension,
-                        a.Format,
-                        resource_allocation(a.hDrvResource.pDrvPrivate)
-                    ));
-                }
-                store_com(h_uav.pDrvPrivate, v);
-            }
-        }
-        Err(e) => {
+    let created = device.CreateUnorderedAccessView(&*res, Some(&desc), Some(&mut uav));
+    match created {
+        Ok(()) => {}
+        Err(ref e) => {
             let detail = match a.ResourceDimension {
                 RES_BUFFER | RES_BUFFEREX => {
                     let b = a.__bindgen_anon_1.Buffer;
@@ -5314,6 +5321,18 @@ unsafe extern "C" fn create_uav(
             ));
         }
     }
+    finish_create(h, created, uav, |v| {
+        let n = VIEW_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+        if n < 256 {
+            log_line(&format!(
+                "DDI create_uav ok: dim={} fmt={} alloc=0x{:x}",
+                a.ResourceDimension,
+                a.Format,
+                resource_allocation(a.hDrvResource.pDrvPrivate)
+            ));
+        }
+        store_com(h_uav.pDrvPrivate, v);
+    });
 }
 
 unsafe fn uav_desc(
