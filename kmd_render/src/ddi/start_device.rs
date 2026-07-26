@@ -484,7 +484,7 @@ pub unsafe extern "C" fn dxgkddi_dispatch_io_request(
 /// `DxgkDdiSetPowerState` — accept power transitions (nothing device-specific to
 /// do yet).
 pub unsafe extern "C" fn dxgkddi_set_power_state(
-    _miniport_device_context: *mut c_void,
+    miniport_device_context: *mut c_void,
     device_uid: u32,
     device_power_state: DEVICE_POWER_STATE,
     action_type: POWER_ACTION::Type,
@@ -492,6 +492,41 @@ pub unsafe extern "C" fn dxgkddi_set_power_state(
     crate::diag::record(0x0A11_0000 | (device_uid & 0xFFFF));
     crate::diag::record(0x0A12_0000 | ((device_power_state as u32) & 0xFFFF));
     crate::diag::record(0x0A13_0000 | ((action_type as u32) & 0xFFFF));
+    crate::diag::record_named_bytes(
+        b"PwrSt",
+        (((device_power_state as u32) & 0xFFFF) << 16) | ((action_type as u32) & 0xFFFF),
+    );
+
+    if miniport_device_context.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    // SAFETY: our adapter context, handed back from AddDevice.
+    let adapter = unsafe { &*(miniport_device_context as *const AdapterContext) };
+
+    // Before this, a D3 transition was accepted with no action at all, so the
+    // ~16 ms KTIMER kept synthesising CRTC_VSYNC through DxgkCbNotifyInterrupt
+    // for a source dxgkrnl had powered down - unless dxgkrnl happened to have
+    // called DxgkDdiControlInterrupt(CRTC_VSYNC, FALSE) first, which is a brake
+    // entirely under its control, not ours.
+    //
+    // Treat ANY non-D0 state as "cancel" and re-arm unconditionally on D0 when
+    // the display half is up. Both functions are already idempotent
+    // (`vsync_armed` swap; cancel flushes queued DPCs), so a repeated transition
+    // in either direction is a no-op. `vsync_enabled`, which ControlInterrupt
+    // writes at up to DIRQL, is untouched and keeps its meaning.
+    //
+    // Compared against the bindgen discriminant rather than a hand-written
+    // integer, so a WDK header change cannot silently invert this.
+    if device_power_state == _DEVICE_POWER_STATE::PowerDeviceD0 {
+        if adapter.display_half {
+            // SAFETY: the context is the final boxed adapter (dxgkrnl holds it
+            // as the miniport device context) and dxgkrnl was saved at
+            // StartDevice. PASSIVE_LEVEL.
+            unsafe { adapter.init_vsync() };
+        }
+    } else {
+        adapter.cancel_vsync();
+    }
     STATUS_SUCCESS
 }
 
