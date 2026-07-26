@@ -52,7 +52,6 @@ use virtio_drivers::queue::VirtQueue;
 use virtio_drivers::transport::pci::bus::{ConfigurationAccess, DeviceFunction, PciRoot};
 use virtio_drivers::transport::pci::PciTransport;
 use virtio_drivers::transport::{DeviceStatus, Transport};
-use virtio_drivers::Hal;
 use wdk_sys::ntddk::{KeInitializeEvent, KeSetEvent, ObDereferenceObjectDeferDelete};
 use wdk_sys::{KEVENT, PVOID};
 
@@ -346,9 +345,25 @@ fn map_isr_status_register(access: &DxgkConfigAccess) -> usize {
             let phys = base + offset;
             // SAFETY: maps a real device BAR sub-region (the ISR-status register)
             // at PASSIVE_LEVEL via the shared MMIO cache; non-cached MMIO.
+            //
+            // try_mmio_map, NOT the infallible Hal method: that one returns
+            // NonNull::dangling() (address 0x1) on failure, which this function
+            // would convert to a nonzero usize and return as a valid VA. `init`
+            // would then record the SUCCESS breadcrumb and read_volatile(1) to
+            // clear the register - a fault at PASSIVE inside StartDevice, where
+            // the documented degrade path 0x0B00_00E6 already existed.
             let va =
-                unsafe { <WdkHal as Hal>::mmio_phys_to_virt(phys as virtio_drivers::PhysAddr, 16) };
-            return va.as_ptr() as usize;
+                unsafe { crate::virtio::hal::try_mmio_map(phys as virtio_drivers::PhysAddr, 16) };
+            return match va {
+                Some(p) => p.as_ptr() as usize,
+                None => {
+                    // Distinct from "no ISR cap present" (0x0B00_00E6): the cap
+                    // is there and we failed to map it. 0x0B00_00E0/E5/E6/E7/E8
+                    // are all taken.
+                    crate::diag::record(0x0B00_00E9);
+                    0
+                }
+            };
         }
         cap = cap_next;
     }
@@ -977,6 +992,13 @@ impl VirtioGpu {
         } else {
             0x0B00_00E6
         });
+        // A map failure here is NOT a benign degrade on this INTx device: with no
+        // ISR ack the level-triggered line stays asserted and Windows' interrupt
+        // storm detector Code-43s the adapter. Report it ungated.
+        let mmio_fails = crate::virtio::hal::MMIO_MAP_FAILS.load(Ordering::Relaxed);
+        if mmio_fails != 0 {
+            crate::diag::fault(crate::diag::FaultCounter::StIsr, mmio_fails);
+        }
 
         let gpu = Self {
             transport,

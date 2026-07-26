@@ -146,6 +146,11 @@ pub enum FaultCounter {
     /// (`NumberOfChildren` is 0 in that configuration), so movement means the
     /// two are out of step.
     StQcs,
+    /// `MmMapIoSpace` failed for the virtio ISR-status register — value is the
+    /// failure count. NOT a benign degrade on this INTx device: with no ISR ack
+    /// the level-triggered line stays asserted and Windows' interrupt-storm
+    /// detector Code-43s the adapter.
+    StIsr,
 }
 
 impl FaultCounter {
@@ -163,6 +168,7 @@ impl FaultCounter {
             FaultCounter::StNoTx => b"StNoTx",
             FaultCounter::StVrp => b"StVrp",
             FaultCounter::StQcs => b"StQcs",
+            FaultCounter::StIsr => b"StIsr",
         }
     }
 
@@ -178,6 +184,7 @@ impl FaultCounter {
         FaultCounter::StNoTx,
         FaultCounter::StVrp,
         FaultCounter::StQcs,
+        FaultCounter::StIsr,
     ];
 }
 

@@ -22,6 +22,7 @@
 
 use core::cell::UnsafeCell;
 use core::ptr::NonNull;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use virtio_drivers::{BufferDirection, Hal, PhysAddr};
 
@@ -201,72 +202,12 @@ unsafe impl Hal for WdkHal {
     }
 
     unsafe fn mmio_phys_to_virt(paddr: PhysAddr, size: usize) -> NonNull<u8> {
-        // Physical addresses fit in usize on x64; cache + compare as usize.
-        let paddr = paddr as usize;
-        let lock = MMIO_CACHE.lock.get();
-
-        // Fast path: already mapped this BAR region?
-        // SAFETY: brief spinlock-guarded read of the cache.
-        let irql = unsafe { KeAcquireSpinLockRaiseToDpc(lock) };
-        let hit = unsafe { &*MMIO_CACHE.entries.get() }
-            .iter()
-            .flatten()
-            .find(|m| m.paddr == paddr && m.size >= size)
-            .map(|m| m.va);
-        unsafe { KeReleaseSpinLock(lock, irql) };
-        if let Some(va) = hit {
-            return NonNull::new(va as *mut u8).unwrap_or(NonNull::dangling());
-        }
-
-        // Miss: map at PASSIVE_LEVEL (MmMapIoSpace requires PASSIVE, so no lock
-        // is held here).
-        let mut pa: PHYSICAL_ADDRESS = unsafe { core::mem::zeroed() };
-        pa.QuadPart = paddr as i64;
-        // SAFETY: maps a device BAR region; non-cached, as required for MMIO.
-        let va = unsafe { MmMapIoSpace(pa, size as u64, _MEMORY_CACHING_TYPE::MmNonCached) };
-        let mapped = match NonNull::new(va as *mut u8) {
-            Some(p) => p,
-            None => {
-                crate::kmsg(c"Helios: virtio MmMapIoSpace FAILED\n");
-                return NonNull::dangling();
-            }
-        };
-
-        // Insert, double-checking for a concurrent map of the same region.
-        // SAFETY: spinlock-guarded mutation of the cache.
-        let irql = unsafe { KeAcquireSpinLockRaiseToDpc(lock) };
-        let entries = unsafe { &mut *MMIO_CACHE.entries.get() };
-        if let Some(va) = entries
-            .iter()
-            .flatten()
-            .find(|m| m.paddr == paddr && m.size >= size)
-            .map(|m| m.va)
-        {
-            // Lost the race — another thread mapped it. Drop our duplicate.
-            unsafe { KeReleaseSpinLock(lock, irql) };
-            unsafe { MmUnmapIoSpace(mapped.as_ptr() as *mut _, size as u64) };
-            return NonNull::new(va as *mut u8).unwrap_or(NonNull::dangling());
-        }
-        let full = if let Some(slot) = entries.iter_mut().find(|e| e.is_none()) {
-            *slot = Some(Mapping {
-                paddr,
-                va: mapped.as_ptr() as usize,
-                size,
-            });
-            false
-        } else {
-            true
-        };
-        unsafe { KeReleaseSpinLock(lock, irql) };
-        if full {
-            // Not expected for one virtio device (≤5 regions, 16 slots). The
-            // mapping stays valid + usable, it just won't be reclaimed by
-            // unmap_all. Logged after releasing the lock.
-            crate::kmsg(c"Helios: virtio MMIO cache full\n");
-        }
-        mapped
+        // The `virtio_drivers::Hal` signature has no failure channel, so the
+        // dangling sentinel survives HERE and only here. Every Helios-side
+        // caller must go through `try_mmio_map` instead.
+        // SAFETY: same contract as this trait method.
+        unsafe { try_mmio_map(paddr, size) }.unwrap_or(NonNull::dangling())
     }
-
     unsafe fn share(buffer: NonNull<[u8]>, _direction: BufferDirection) -> PhysAddr {
         // No IOMMU/bounce buffer: the device DMAs guest-physical memory directly.
         // Buffers handed to the queue are always `dma_alloc`'d (contiguous), so a
@@ -279,4 +220,90 @@ unsafe impl Hal for WdkHal {
     unsafe fn unshare(_paddr: PhysAddr, _buffer: NonNull<[u8]>, _direction: BufferDirection) {
         // Nothing to revoke without an IOMMU.
     }
+}
+
+/// Number of `MmMapIoSpace` failures seen by [`try_mmio_map`]. Reported through
+/// the ungated `diag::fault` path by the ISR-register mapping, because on this
+/// INTx device a missing ISR ack is not a benign degrade: the line stays
+/// asserted and Windows' interrupt-storm detector Code-43s the adapter.
+pub(crate) static MMIO_MAP_FAILS: AtomicU32 = AtomicU32::new(0);
+
+/// Map a device MMIO region, or `None` if `MmMapIoSpace` fails. PASSIVE_LEVEL.
+///
+/// This is the fallible form of [`WdkHal::mmio_phys_to_virt`]. The trait method
+/// cannot fail, so it returns `NonNull::dangling()` — address 0x1 — which a
+/// caller converting to `usize` cannot distinguish from a real mapping. That is
+/// how a failed ISR-region map became a *success* breadcrumb and then a
+/// `read_volatile(1)` fault at PASSIVE inside StartDevice, where a documented
+/// degrade path (`0x0B00_00E6`, "no ISR cap") already existed.
+///
+/// # Safety
+/// `paddr`/`size` must describe a real device MMIO region. The mapping is
+/// non-cached and is cached for the driver's lifetime (reclaimed by `unmap_all`).
+pub(crate) unsafe fn try_mmio_map(paddr: PhysAddr, size: usize) -> Option<NonNull<u8>> {
+    // Physical addresses fit in usize on x64; cache + compare as usize.
+    let paddr = paddr as usize;
+    let lock = MMIO_CACHE.lock.get();
+
+    // Fast path: already mapped this BAR region?
+    // SAFETY: brief spinlock-guarded read of the cache.
+    let irql = unsafe { KeAcquireSpinLockRaiseToDpc(lock) };
+    let hit = unsafe { &*MMIO_CACHE.entries.get() }
+        .iter()
+        .flatten()
+        .find(|m| m.paddr == paddr && m.size >= size)
+        .map(|m| m.va);
+    unsafe { KeReleaseSpinLock(lock, irql) };
+    if let Some(va) = hit {
+        return NonNull::new(va as *mut u8);
+    }
+
+    // Miss: map at PASSIVE_LEVEL (MmMapIoSpace requires PASSIVE, so no lock
+    // is held here).
+    let mut pa: PHYSICAL_ADDRESS = unsafe { core::mem::zeroed() };
+    pa.QuadPart = paddr as i64;
+    // SAFETY: maps a device BAR region; non-cached, as required for MMIO.
+    let va = unsafe { MmMapIoSpace(pa, size as u64, _MEMORY_CACHING_TYPE::MmNonCached) };
+    let mapped = match NonNull::new(va as *mut u8) {
+        Some(p) => p,
+        None => {
+            crate::kmsg(c"Helios: virtio MmMapIoSpace FAILED\n");
+            MMIO_MAP_FAILS.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+    };
+
+    // Insert, double-checking for a concurrent map of the same region.
+    // SAFETY: spinlock-guarded mutation of the cache.
+    let irql = unsafe { KeAcquireSpinLockRaiseToDpc(lock) };
+    let entries = unsafe { &mut *MMIO_CACHE.entries.get() };
+    if let Some(va) = entries
+        .iter()
+        .flatten()
+        .find(|m| m.paddr == paddr && m.size >= size)
+        .map(|m| m.va)
+    {
+        // Lost the race — another thread mapped it. Drop our duplicate.
+        unsafe { KeReleaseSpinLock(lock, irql) };
+        unsafe { MmUnmapIoSpace(mapped.as_ptr() as *mut _, size as u64) };
+        return NonNull::new(va as *mut u8);
+    }
+    let full = if let Some(slot) = entries.iter_mut().find(|e| e.is_none()) {
+        *slot = Some(Mapping {
+            paddr,
+            va: mapped.as_ptr() as usize,
+            size,
+        });
+        false
+    } else {
+        true
+    };
+    unsafe { KeReleaseSpinLock(lock, irql) };
+    if full {
+        // Not expected for one virtio device (≤5 regions, 16 slots). The
+        // mapping stays valid + usable, it just won't be reclaimed by
+        // unmap_all. Logged after releasing the lock.
+        crate::kmsg(c"Helios: virtio MMIO cache full\n");
+    }
+    Some(mapped)
 }
