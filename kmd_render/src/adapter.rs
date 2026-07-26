@@ -219,6 +219,24 @@ pub(crate) struct StartedState {
     /// waits or maps a frame, and the per-pair `probe_done` state statically
     /// prevents repeated readbacks.
     pub present_probe: bool,
+    /// `ScanoutForceReject` service-key knob (read once in StartDevice;
+    /// default 0 = OFF, and absent from the registry in the shipped baseline).
+    ///
+    /// GATE INSTRUMENT. The T3 gate requires each deferred-programming refusal
+    /// exit to be forced with its counter proven to move and `VsCnt` still
+    /// advancing — and seven of the eight cannot be provoked naturally on a
+    /// healthy box. This makes `program_vidpn_source` take one specific exit so
+    /// that can be shown per boot-cycle, with `pnputil /restart-device` between
+    /// values instead of eight reboots.
+    ///
+    ///   1 = BadAlloc   2 = Extent   3 = Layout           4 = Format
+    ///   5 = LinearAllocFailed       6 = SetFailed
+    ///   7 = NoTarget                8 = CopyFailed
+    ///
+    /// Costs one atomic-free field read per SetVidPnSourceAddress. Recorded as
+    /// `ScFrc` at StartDevice. Candidate for deletion in T6 alongside the other
+    /// experiment surfaces once the gate evidence is banked.
+    pub forced_reject: u32,
     /// `DisplayHalf` service-key knob (REG_DWORD, read once in StartDevice;
     /// default 0 = OFF, the boot-proven render-only surface). When nonzero,
     /// StartDevice advertises ONE video-present source + ONE child video-output
@@ -256,6 +274,7 @@ impl StartedState {
         dxgkrnl: DXGKRNL_INTERFACE,
         alloc_cached: bool,
         present_probe: bool,
+        forced_reject: u32,
         display_half: bool,
         scanout_mode: ScanoutMode,
         paging_ram: Option<PagingRam>,
@@ -265,6 +284,7 @@ impl StartedState {
             dxgkrnl,
             alloc_cached,
             present_probe,
+            forced_reject,
             display_half,
             scanout_mode,
             paging_ram,
@@ -2123,6 +2143,12 @@ impl AdapterContext {
     /// `PresentProbe`. Defaults to false before StartDevice.
     pub fn present_probe(&self) -> bool {
         self.started().is_some_and(|s| s.present_probe)
+    }
+
+    /// `ScanoutForceReject` — the T3 gate instrument. 0 = off (the shipped
+    /// default and the only value present in a production registry).
+    pub(crate) fn forced_reject(&self) -> u32 {
+        self.started().map_or(0, |s| s.forced_reject)
     }
 
     /// The EDID served by `DxgkDdiQueryDeviceDescriptor`.

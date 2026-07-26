@@ -161,9 +161,13 @@ pub unsafe extern "C" fn dxgkddi_start_device(
     // reboot). See the field docs in `adapter.rs`.
     let alloc_cached = crate::diag::read_config_dword(b"AllocCached", 1) != 0;
     let present_probe = crate::diag::read_config_dword(b"PresentProbe", 0) != 0;
+    // GATE INSTRUMENT (T3): forces one deferred-programming refusal exit. 0 = off
+    // and absent from a production registry. See `StartedState::forced_reject`.
+    let forced_reject = crate::diag::read_config_dword(b"ScanoutForceReject", 0);
     let mut display_half = crate::diag::read_config_dword(b"DisplayHalf", 0) != 0;
     crate::diag::record_named_bytes(b"AlcC", alloc_cached as u32);
     crate::diag::record_named_bytes(b"PBPrEn", present_probe as u32);
+    crate::diag::record_named_bytes(b"ScFrc", forced_reject);
     crate::diag::record_named_bytes(b"DspH", display_half as u32);
 
     // Registry values persist across boots, so a stale nonzero fault counter is
@@ -385,6 +389,7 @@ pub unsafe extern "C" fn dxgkddi_start_device(
             dxgkrnl,
             alloc_cached,
             present_probe,
+            forced_reject,
             display_half,
             scanout_mode,
             paging_ram,

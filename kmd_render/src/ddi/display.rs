@@ -1319,6 +1319,11 @@ unsafe fn program_vidpn_source(
     ticket: crate::adapter::ProgrammingTicket,
 ) -> Result<ScanoutOutcome, ScanoutReject> {
     crate::diag::record(0x1300_000A);
+    // GATE INSTRUMENT (T3), 0 in production. Read ONCE per call; each `forced ==
+    // N` below sits alongside the REAL condition at its own exit site, so the
+    // code preceding that exit still runs and it is the genuine exit that is
+    // exercised — not a short circuit at the top of the function.
+    let forced = adapter.forced_reject();
     let source_address_n = VIDPN_SOURCE_ADDRESS_COUNT
         .fetch_add(1, Ordering::Relaxed)
         .wrapping_add(1);
@@ -1327,9 +1332,9 @@ unsafe fn program_vidpn_source(
         crate::diag::record_named_bytes(b"VpSA", source_address_n);
     }
 
-    let Some(source) = (unsafe { crate::ddi::create_allocation::scanout_alloc_info(h_alloc) })
-    else {
-        return Err(ScanoutReject::BadAlloc);
+    let source = match unsafe { crate::ddi::create_allocation::scanout_alloc_info(h_alloc) } {
+        Some(source) if forced != 1 => source,
+        _ => return Err(ScanoutReject::BadAlloc),
     };
     let (mode_w, mode_h) = adapter.display_mode();
     let width = if source.width != 0 {
@@ -1351,7 +1356,7 @@ unsafe fn program_vidpn_source(
         crate::diag::record_named_bytes(b"SaHi", (source.primary_address >> 32) as u32);
         crate::diag::record_named_bytes(b"SaFlg", source.primary_flags);
     }
-    if width != mode_w || height != mode_h {
+    if width != mode_w || height != mode_h || forced == 2 {
         return Err(ScanoutReject::Extent);
     }
     // A UMD-created exact pPrimaryDesc may already have the proven scan-out
@@ -1364,6 +1369,15 @@ unsafe fn program_vidpn_source(
     // the wire format identically; a `ScanoutTarget` that exists is a target the
     // host can be told about, and it carries no primary address, so the fallback
     // arm cannot supply one to `publish_displayed_primary`.
+    if forced == 3 {
+        return Err(ScanoutReject::Layout);
+    }
+    if forced == 4 {
+        return Err(ScanoutReject::Format(source.dxgi_format));
+    }
+    if forced == 5 {
+        return Err(ScanoutReject::LinearAllocFailed(STATUS_NO_MEMORY));
+    }
     let target = if source.direct_scanout {
         ScanoutTarget::from_direct_primary(&source, width, height)?
     } else {
@@ -1391,7 +1405,7 @@ unsafe fn program_vidpn_source(
             target.pitch(),
             target.plane_offset(),
         );
-        if set.is_err() {
+        if set.is_err() || forced == 6 {
             return Err(ScanoutReject::SetFailed);
         }
         // Keep the adapter-owned fallback cache separate from a rotating DWM
@@ -1446,13 +1460,16 @@ unsafe fn program_vidpn_source(
     }
 
     let target_image_id = adapter.dedicated_scanout_image.load(Ordering::Acquire);
-    if target_image_id == 0 {
+    if target_image_id == 0 || forced == 7 {
         return Err(ScanoutReject::NoTarget);
     }
 
     // The returned outer wire fence completes in the ring-1 GPU domain. Its DPC
     // callback—not this enqueue—marks scanout dirty and wakes the coalescing
     // async RESOURCE_FLUSH worker, so VNC never samples ahead of the copy.
+    if forced == 8 {
+        return Err(ScanoutReject::CopyFailed(STATUS_DEVICE_NOT_READY));
+    }
     match unsafe {
         crate::ddi::create_allocation::submit_primary_scanout_copy(
             adapter,
