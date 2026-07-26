@@ -497,6 +497,45 @@ unsafe fn store_com<T: Interface>(handle_priv: *mut c_void, obj: T) {
     *(handle_priv as *mut *mut c_void) = obj.into_raw();
 }
 
+/// Map a DXVK create failure onto an HRESULT the invoking API is documented to
+/// return. Every `Create*` DDI this is used from documents exactly
+/// `E_OUTOFMEMORY` and `E_INVALIDARG`; an HRESULT outside that set is itself
+/// logged by the runtime as a driver bug, so a DXVK code outside it is
+/// substituted rather than passed through.
+fn create_error_hr(e: &windows::core::Error) -> i32 {
+    match e.code().0 {
+        hr @ (E_OUTOFMEMORY | E_INVALIDARG) => hr,
+        _ => E_OUTOFMEMORY,
+    }
+}
+
+/// The only way a VOID-returning `Create*` DDI may leave its handle slot:
+/// either `store` runs, or the runtime is told the invoking API call failed.
+///
+/// The DDI has no return value, so `pfnSetErrorCb` is the sole channel through
+/// which a failed create becomes a failed `CreateRasterizerState` /
+/// `CreateRenderTargetView` / `CreateTexture2D` instead of an S_OK with a null
+/// driver handle that the app then binds to nothing.
+///
+/// `result` is the DXVK call's `Result<()>` and `obj` its out-param: S_OK with
+/// no object is as much a fake success as an error HRESULT, so both report.
+/// Panic-free by construction (no `unwrap`, no indexing) — these are
+/// `extern "C"` entry points under `panic = "abort"`.
+unsafe fn finish_create<T: Interface>(
+    h: Hdevice,
+    result: windows::core::Result<()>,
+    obj: Option<T>,
+    store: impl FnOnce(T),
+) {
+    match result {
+        Ok(()) => match obj {
+            Some(o) => store(o),
+            None => set_runtime_error(h, E_OUTOFMEMORY),
+        },
+        Err(e) => set_runtime_error(h, create_error_hr(&e)),
+    }
+}
+
 unsafe fn store_raw_com(handle_priv: *mut c_void, raw: usize) {
     if !handle_priv.is_null() {
         *(handle_priv as *mut *mut c_void) = raw as *mut c_void;
@@ -4882,11 +4921,11 @@ unsafe extern "C" fn create_rasterizer_state(
         ));
     }
     let mut rs: Option<ID3D11RasterizerState> = None;
-    if device.CreateRasterizerState(&rd, Some(&mut rs)).is_ok() {
-        if let Some(s) = rs {
-            store_com(h_rs.pDrvPrivate, s);
-        }
+    let created = device.CreateRasterizerState(&rd, Some(&mut rs));
+    if let Err(ref e) = created {
+        log_line(&format!("DDI CreateRasterizerState failed: {e:?}"));
     }
+    finish_create(h, created, rs, |s| store_com(h_rs.pDrvPrivate, s));
 }
 
 unsafe extern "C" fn set_rasterizer_state(h: Hdevice, h_rs: ddi::D3D10DDI_HRASTERIZERSTATE) {
@@ -4937,11 +4976,11 @@ unsafe extern "C" fn create_depth_stencil_state(
         BackFace: cvt_stencilop(&d.BackFace),
     };
     let mut ds: Option<ID3D11DepthStencilState> = None;
-    if device.CreateDepthStencilState(&dd, Some(&mut ds)).is_ok() {
-        if let Some(s) = ds {
-            store_com(h_ds.pDrvPrivate, s);
-        }
+    let created = device.CreateDepthStencilState(&dd, Some(&mut ds));
+    if let Err(ref e) = created {
+        log_line(&format!("DDI CreateDepthStencilState failed: {e:?}"));
     }
+    finish_create(h, created, ds, |s| store_com(h_ds.pDrvPrivate, s));
 }
 
 unsafe extern "C" fn set_depth_stencil_state(
@@ -5502,11 +5541,11 @@ unsafe extern "C" fn create_sampler(
         MaxLOD: d.MaxLOD,
     };
     let mut s: Option<ID3D11SamplerState> = None;
-    if device.CreateSamplerState(&sd, Some(&mut s)).is_ok() {
-        if let Some(o) = s {
-            store_com(h_sampler.pDrvPrivate, o);
-        }
+    let created = device.CreateSamplerState(&sd, Some(&mut s));
+    if let Err(ref e) = created {
+        log_line(&format!("DDI CreateSamplerState failed: {e:?}"));
     }
+    finish_create(h, created, s, |o| store_com(h_sampler.pDrvPrivate, o));
 }
 
 unsafe extern "C" fn destroy_sampler(_h: Hdevice, h_sampler: ddi::D3D10DDI_HSAMPLER) {
@@ -8004,11 +8043,11 @@ unsafe extern "C" fn create_blend_state(
         RenderTarget: rt,
     };
     let mut bs: Option<ID3D11BlendState> = None;
-    if device.CreateBlendState(&bd, Some(&mut bs)).is_ok() {
-        if let Some(s) = bs {
-            store_com(h_bs.pDrvPrivate, s);
-        }
+    let created = device.CreateBlendState(&bd, Some(&mut bs));
+    if let Err(ref e) = created {
+        log_line(&format!("DDI CreateBlendState failed: {e:?}"));
     }
+    finish_create(h, created, bs, |s| store_com(h_bs.pDrvPrivate, s));
 }
 
 /// D3D11.1-interface `pfnCalcPrivateBlendStateSize` (same 8-byte COM-pointer
@@ -8068,17 +8107,26 @@ unsafe extern "C" fn create_blend_state_11_1(
         RenderTarget: rt,
     };
     let mut bs: Option<ID3D11BlendState1> = None;
-    if device1.CreateBlendState1(&bd, Some(&mut bs)).is_ok() {
-        if let Some(s) = bs {
-            // `set_blend_state` loads an ID3D11BlendState from this slot;
-            // store the base interface.
-            if let Ok(base) = s.cast::<ID3D11BlendState>() {
-                store_com(h_bs.pDrvPrivate, base);
-            }
-        }
-    } else {
+    let created = device1.CreateBlendState1(&bd, Some(&mut bs));
+    if created.is_err() {
         log_line("DDI create_blend_state_11_1: CreateBlendState1 failed");
     }
+    // `set_blend_state` loads an ID3D11BlendState from this slot; store the
+    // base interface. A failed QI is a create failure like any other — folding
+    // it into `None` routes it through the same report instead of dropping it.
+    let base = match bs {
+        Some(s) => match s.cast::<ID3D11BlendState>() {
+            Ok(b) => Some(b),
+            Err(e) => {
+                log_line(&format!(
+                    "DDI create_blend_state_11_1: ID3D11BlendState cast failed: {e:?}"
+                ));
+                None
+            }
+        },
+        None => None,
+    };
+    finish_create(h, created, base, |b| store_com(h_bs.pDrvPrivate, b));
 }
 
 unsafe extern "C" fn set_blend_state(
