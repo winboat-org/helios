@@ -6400,40 +6400,45 @@ unsafe extern "C" fn resource_update_subresource(
         }
         return;
     };
+    // `alloc` selects the gate below, so the summary read stays out here; every
+    // other operand is log-only and now lives inside it. The two
+    // `read_unaligned` probes in particular are two dependent cache misses into
+    // the CALLER's buffer, and they used to be paid on every BGRA/RGBA tex2d
+    // update purely to produce a log field.
     let (alloc, kind, width, height, depth, fmt) = resource_summary(h_res.pDrvPrivate);
-    let (rt_resource, km_resource) = resource_parent_handles(h_res.pDrvPrivate);
-    let (box_left, box_top, box_right, box_bottom) = if box_.is_null() {
-        (
-            0i32,
-            0i32,
-            i32::try_from(width).unwrap_or(i32::MAX),
-            i32::try_from(height).unwrap_or(i32::MAX),
-        )
-    } else {
-        let b = &*box_;
-        (b.left, b.top, b.right, b.bottom)
-    };
-    let source_width = u32::try_from(box_right.saturating_sub(box_left)).unwrap_or(0);
-    let source_height = u32::try_from(box_bottom.saturating_sub(box_top)).unwrap_or(0);
-    let source_samples = if !data.is_null()
-        && kind == "tex2d"
-        && matches!(fmt, 28 | 87 | 88)
-        && source_width != 0
-        && source_height != 0
-        && row_pitch >= source_width.saturating_mul(4)
-    {
-        let center_offset = (source_height as usize / 2)
-            .saturating_mul(row_pitch as usize)
-            .saturating_add((source_width as usize / 2).saturating_mul(4));
-        Some((
-            core::ptr::read_unaligned(data.cast::<u32>()),
-            core::ptr::read_unaligned((data as *const u8).add(center_offset).cast::<u32>()),
-        ))
-    } else {
-        None
-    };
     let n = UPDATE_LOG_COUNT.next();
-    if n < 1024 || alloc != 0 {
+    if crate::trace_enabled() && (n < 1024 || alloc != 0) {
+        let (rt_resource, km_resource) = resource_parent_handles(h_res.pDrvPrivate);
+        let (box_left, box_top, box_right, box_bottom) = if box_.is_null() {
+            (
+                0i32,
+                0i32,
+                i32::try_from(width).unwrap_or(i32::MAX),
+                i32::try_from(height).unwrap_or(i32::MAX),
+            )
+        } else {
+            let b = &*box_;
+            (b.left, b.top, b.right, b.bottom)
+        };
+        let source_width = u32::try_from(box_right.saturating_sub(box_left)).unwrap_or(0);
+        let source_height = u32::try_from(box_bottom.saturating_sub(box_top)).unwrap_or(0);
+        let source_samples = if !data.is_null()
+            && kind == "tex2d"
+            && matches!(fmt, 28 | 87 | 88)
+            && source_width != 0
+            && source_height != 0
+            && row_pitch >= source_width.saturating_mul(4)
+        {
+            let center_offset = (source_height as usize / 2)
+                .saturating_mul(row_pitch as usize)
+                .saturating_add((source_width as usize / 2).saturating_mul(4));
+            Some((
+                core::ptr::read_unaligned(data.cast::<u32>()),
+                core::ptr::read_unaligned((data as *const u8).add(center_offset).cast::<u32>()),
+            ))
+        } else {
+            None
+        };
         trace_line!(
             "DDI UpdateSubresource #{} hDrv={:p} hRT={:p} hKM=0x{:x} alloc=0x{:x} \
              kind={} dims={}x{}x{} fmt={} sub={} box={},{},{},{} data={:p} \
