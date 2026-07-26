@@ -1010,6 +1010,18 @@ pub enum FenceEventReg {
     Duplicate,
 }
 
+/// First wire fence id the NEXT transport instance will hand out.
+///
+/// Driver-global and monotonic across StartDevice/StopDevice cycles. Starts at
+/// 1 because 0 is the "no fence" sentinel every predicate tests for.
+static NEXT_WIRE_FENCE_BASE: AtomicU64 = AtomicU64::new(1);
+/// Gap between one instance's first id and the next instance's.
+///
+/// Far more than any instance can consume: at the ~10^5 fences a heavy session
+/// produces, 2^32 instances' worth of headroom remains, and a u64 counter
+/// cannot wrap in the machine's lifetime.
+const WIRE_FENCE_INSTANCE_STRIDE: u64 = 1 << 32;
+
 /// Which retirement domain a wait is against.
 ///
 /// The nine-line doc this replaces explained at length that the wait is ring-0
@@ -1140,9 +1152,9 @@ pub struct VirtioGpu {
     control: VirtQueue<WdkHal, CTRL_QUEUE_SIZE>,
     /// Next virtio-gpu 3D context id to hand out (guest-assigned; 0 is the
     /// reserved global context, so we start at 1). Phase 3.
-    next_ctx_id: AtomicU32,
+    next_ctx_id: u32,
     /// Next virtio-gpu resource id to hand out (0 is reserved). Phase 3 (M3.5).
-    next_resource_id: AtomicU32,
+    next_resource_id: u32,
     /// Host-visible blob window (SHARED_MEMORY_CFG/HOST_VISIBLE BAR), discovered
     /// in `init`. `None` if the device exposes no host-visible window — the WDDM
     /// blob-map path is then unavailable (Stage 2 fails honestly). Gate 5a Stage 2.
@@ -1395,8 +1407,8 @@ impl VirtioGpu {
         let gpu = Self {
             transport,
             control,
-            next_ctx_id: AtomicU32::new(1),
-            next_resource_id: AtomicU32::new(1),
+            next_ctx_id: 1,
+            next_resource_id: 1,
             host_visible,
             isr_status_va,
             blobs: Vec::with_capacity(MAX_BLOBS),
@@ -1417,7 +1429,20 @@ impl VirtioGpu {
             dma_pool_bytes: 0,
             fence_waiters: Vec::with_capacity(MAX_FENCE_WAITERS),
             fence_events: Vec::with_capacity(MAX_FENCE_EVENTS),
-            next_wire_fence: 1,
+            // NOT 1. Wire fence ids arrive from an untrusted usermode buffer
+            // at the WAIT_FENCE escape, and both `fence_wait_prepare` and
+            // `fence_event_register` decide "already complete" with the ordinal
+            // predicate `id < next_wire_fence && not in-flight`. Restarting the
+            // id space at 1 on every transport init makes a stale id from a
+            // PREVIOUS instance — an ICD that survived a `pnputil
+            // /restart-device` still holding fences — look Complete instead of
+            // Invalid. Striding the base at each init moves those ids into the
+            // `>= next_wire_fence` Invalid arm. Behaviour within one instance is
+            // unchanged; the predicate itself is sound there, because
+            // next_wire_fence is bumped only after `control.add` succeeds, in
+            // the same spinlock section as the `inflight` push.
+            next_wire_fence: NEXT_WIRE_FENCE_BASE
+                .fetch_add(WIRE_FENCE_INSTANCE_STRIDE, Ordering::Relaxed),
             wddm_pending: VecDeque::with_capacity(MAX_WDDM_PENDING),
             scanout_refresh_watermark: None,
             failed: false,
@@ -2115,6 +2140,20 @@ impl VirtioGpu {
     /// Take one already-allocated DMA buffer whose page capacity covers `len`.
     /// The caller allocates a new buffer at PASSIVE only when this returns None.
     pub fn take_dma_buffer(&mut self, len: usize) -> Option<DmaBuffer> {
+        // `reset(0)` fails, and the only failure return below dropped the
+        // DmaBuffer INSIDE the `with_virtio` closure — i.e. under
+        // KeAcquireSpinLockRaiseToDpc — where `DmaBuffer::drop` calls
+        // MmFreeContiguousMemory, which hal.rs states is PASSIVE-only. Every
+        // sibling API hands buffers back through `Err((DmaBuffer, VirtioError))`
+        // precisely so the free happens at PASSIVE; this was the one path that
+        // broke the convention. Reject len == 0 up front, and swap-remove only
+        // after the capacity filter has proved `reset` will succeed — which
+        // also closes the accounting hole where dma_pool_bytes and
+        // DMA_POOL_CACHED_BYTES were decremented before the failure return.
+        if len == 0 {
+            DMA_POOL_MISSES.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
         let Some((idx, _)) = self
             .dma_pool
             .iter()
@@ -2128,6 +2167,7 @@ impl VirtioGpu {
         let mut buf = self.dma_pool.swap_remove(idx);
         self.dma_pool_bytes = self.dma_pool_bytes.saturating_sub(buf.capacity());
         DMA_POOL_CACHED_BYTES.store(self.dma_pool_bytes as u32, Ordering::Relaxed);
+        // Infallible here: the filter proved capacity >= len, and len > 0.
         if !buf.reset(len) {
             DMA_POOL_MISSES.fetch_add(1, Ordering::Relaxed);
             return None;
@@ -2476,13 +2516,17 @@ impl VirtioGpu {
     // spinlock), even with concurrent multi-phase creates.
 
     /// Allocate a fresh guest context id (namespace owned by the KMD).
-    pub fn alloc_ctx_id(&self) -> u32 {
-        self.next_ctx_id.fetch_add(1, Ordering::Relaxed)
+    pub fn alloc_ctx_id(&mut self) -> u32 {
+        let id = self.next_ctx_id;
+        self.next_ctx_id = self.next_ctx_id.wrapping_add(1);
+        id
     }
 
     /// Allocate a fresh guest resource id (namespace owned by the KMD).
-    pub fn alloc_resource_id(&self) -> u32 {
-        self.next_resource_id.fetch_add(1, Ordering::Relaxed)
+    pub fn alloc_resource_id(&mut self) -> u32 {
+        let id = self.next_resource_id;
+        self.next_resource_id = self.next_resource_id.wrapping_add(1);
+        id
     }
 
     /// Reserve a context tracking slot for an in-flight CTX_CREATE.
