@@ -1594,6 +1594,15 @@ Plan:
   `PSc*` = Present/HWQ diagnostic-only scanout candidate, `Sdg*` = diagnostic
   scanout allocator/bind path, `Rf*` = periodic active-scanout refresh. Values
   persist across boots; trust movement plus same-boot QEMU traces.
+- **SAMPLED counters, 22.22.180.0+** (R316): the `PB*` IDENTITY values written by
+  `DxgkDdiPresent` — `PBcall PBflag PBcnt PBalst PBDma PBPatch PBpdsz PBkpsz`,
+  the `PBs*`/`PBd*` surface identity sets, `PBstrk`/`PBdtrk`, and the flip arm's
+  `PBsrc PBsw PBsh PBsDir PBIdOk PBFlip=1` — refresh on the 1st present and
+  every 600th thereafter at `DiagLevel=0`, NOT per frame. **A `PB*` identity
+  value can therefore be up to ~10 s stale; do not read one as live.** Set
+  `DiagLevel=1` (+ `pnputil /restart-device`) to restore the per-call cadence.
+  UNTHROTTLED, always current: `PBRet`, `PBCpy` (all arms), `PBFnc`, `PBSyWt`,
+  `PBSyCp`, and `PBFlip`'s `0xE1`/`0xE2` failure arms.
 - **RETIRED 22.22.180.0** (R903/x-dup-dead-20 — do not look for these; they are
   gone from the driver, and any value still in the service key is a stale
   leftover): the `GdiAccelMode` knob and the whole `Gd*` counter family —

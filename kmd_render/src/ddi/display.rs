@@ -25,6 +25,10 @@ use crate::virtio::VirtioError;
 use wdk_sys::ntddk::KeGetCurrentIrql;
 
 pub static PRESENT_COUNT: AtomicU32 = AtomicU32::new(0);
+/// Drives the throttle for this DDI's IDENTITY dumps (`diag::sample_tick`).
+/// Failure values — PBRet, PBCpy, PBSyWt, PBSyCp and PBFlip's error arms — are
+/// never sampled; they stay unconditional.
+static PRESENT_TRACE_TICK: AtomicU32 = AtomicU32::new(0);
 pub static PRESENT_LAST_SRC_COUNT: AtomicU32 = AtomicU32::new(0);
 pub static PRESENT_LAST_DST_COUNT: AtomicU32 = AtomicU32::new(0);
 pub static PRESENT_LAST_DMA_SIZE: AtomicU32 = AtomicU32::new(0);
@@ -203,32 +207,39 @@ unsafe fn dxgkddi_present_inner(
     let present_flags = unsafe { args.Flags.__bindgen_anon_1.Value };
     PRESENT_LAST_FLAGS.store(present_flags, Ordering::Relaxed);
 
-    // Unconditional present-path trace (fixed value names survive the ring flood):
-    // is DxgkDdiPresent even the hook for the IddCx composition present, and with
-    // what flags / src+dst counts / allocation-list presence? PBcall counts calls;
-    // its absence means the IddCx present does NOT route through this DDI.
-    crate::diag::record_named_bytes(b"PBcall", PRESENT_COUNT.load(Ordering::Relaxed));
-    crate::diag::record_named_bytes(b"PBflag", present_flags);
-    crate::diag::record_named_bytes(
-        b"PBcnt",
-        (args.NumSrcAllocations << 16) | (args.NumDstAllocations & 0xFFFF),
-    );
-    crate::diag::record_named_bytes(
-        b"PBalst",
-        if unsafe { args.__bindgen_anon_1.pAllocationList }.is_null() {
-            0
-        } else {
-            1
-        },
-    );
-    crate::diag::record_named_bytes(b"PBDma", args.DmaSize);
-    crate::diag::record_named_bytes(b"PBPatch", args.PatchLocationListOutSize);
+    // Present-path IDENTITY trace, SAMPLED (R316). These are per-call dumps of
+    // flags / counts / sizes that mattered during bring-up; at 60 Hz they were
+    // ~8 synchronous kernel registry writes per frame before the surface block
+    // below added ~40 more. One tick gates the whole DDI's identity output, so a
+    // sampled frame is internally consistent, and `DiagLevel >= 1` restores the
+    // per-call cadence.
+    let sample = crate::diag::sample_tick(&PRESENT_TRACE_TICK);
+    if sample {
+        crate::diag::record_named_bytes(b"PBcall", PRESENT_COUNT.load(Ordering::Relaxed));
+        crate::diag::record_named_bytes(b"PBflag", present_flags);
+        crate::diag::record_named_bytes(
+            b"PBcnt",
+            (args.NumSrcAllocations << 16) | (args.NumDstAllocations & 0xFFFF),
+        );
+        crate::diag::record_named_bytes(
+            b"PBalst",
+            if unsafe { args.__bindgen_anon_1.pAllocationList }.is_null() {
+                0
+            } else {
+                1
+            },
+        );
+        crate::diag::record_named_bytes(b"PBDma", args.DmaSize);
+        crate::diag::record_named_bytes(b"PBPatch", args.PatchLocationListOutSize);
+    }
 
     let allocation_list = unsafe { args.__bindgen_anon_1.pAllocationList };
     let present_allocations = unsafe { PresentAllocations::from_allocation_list(allocation_list) };
     let present_private = unsafe { present_private_data(args) };
-    crate::diag::record_named_bytes(b"PBpdsz", args.PrivateDriverDataSize);
-    crate::diag::record_named_bytes(b"PBkpsz", args.DmaBufferPrivateDataSize);
+    if sample {
+        crate::diag::record_named_bytes(b"PBpdsz", args.PrivateDriverDataSize);
+        crate::diag::record_named_bytes(b"PBkpsz", args.DmaBufferPrivateDataSize);
+    }
     let present_context = unsafe { ContextHandleRef::from_raw(h_context) };
     let adapter = present_context.as_ref().and_then(ContextHandleRef::adapter);
     let src_handle = present_allocations
@@ -245,11 +256,15 @@ unsafe fn dxgkddi_present_inner(
         PRESENT_LAST_SRC_OPEN_LOW.store(src_handle as usize as u32, Ordering::Relaxed);
         PRESENT_LAST_DST_OPEN_LOW.store(dst_handle as usize as u32, Ordering::Relaxed);
 
-        // Present-blit feasibility trace (read-only). Resolve the composition
-        // source + IddCx destination surfaces to their venus resource ids /
-        // geometry, and report whether each is a tracked host-visible-mappable
-        // blob the KMD could CPU-map for a coherence copy. Fixed value names so
-        // the data survives the diag ring flood; read live from the service key.
+        // Present-blit feasibility trace (read-only), SAMPLED. Resolves the
+        // composition source + destination surfaces to their venus resource ids
+        // and geometry, and reports whether each is a tracked
+        // host-visible-mappable blob. 38 registry writes plus two blob_lookup
+        // round-trips under the device lock — per present, for values that change
+        // only when the surface set changes. Note this block runs for the FLIP
+        // shape too (the flip arm reads src_info, resolved from the allocation
+        // list), so it was genuinely per-frame.
+        if sample {
         crate::diag::record_named_bytes(b"PBsrcH", (src_handle as usize as u32) & 0xFFFF);
         crate::diag::record_named_bytes(b"PBdstH", (dst_handle as usize as u32) & 0xFFFF);
         if let Some(s) = src_info {
@@ -314,6 +329,7 @@ unsafe fn dxgkddi_present_inner(
             crate::diag::record_named_bytes(b"PBdtrk", code);
         } else {
             crate::diag::record_named_bytes(b"PBdst", 0);
+        }
         }
 
         // DXGK_PRESENTFLAGS.Blt is bit 0. Dxgkrnl has already resolved both
@@ -525,6 +541,9 @@ unsafe fn dxgkddi_present_inner(
                 PRESENT_LAST_STATUS.store(status as u32, Ordering::Relaxed);
                 return status;
             }
+            // NOT sampled: PBCpy is the value a failed Present is read from
+            // (its 0xE1..0xE6 arms), so its success arm has to keep the same
+            // cadence or "last PBCpy" stops meaning "what the last BLT did".
             crate::diag::record_named_bytes(b"PBCpy", 1);
             crate::diag::record_named_bytes(b"PBFnc", gpu_fence as u32);
         }
@@ -551,10 +570,14 @@ unsafe fn dxgkddi_present_inner(
             PRESENT_LAST_STATUS.store(STATUS_INVALID_PARAMETER as u32, Ordering::Relaxed);
             return STATUS_INVALID_PARAMETER;
         };
-        crate::diag::record_named_bytes(b"PBsrc", source.resource_id);
-        crate::diag::record_named_bytes(b"PBsw", source.width);
-        crate::diag::record_named_bytes(b"PBsh", source.height);
-        crate::diag::record_named_bytes(b"PBsDir", u32::from(source.direct_scanout));
+        // Flip identity, SAMPLED (the 0xE1/0xE2 failure arms above stay
+        // unconditional — those are the values a failed Present is read from).
+        if sample {
+            crate::diag::record_named_bytes(b"PBsrc", source.resource_id);
+            crate::diag::record_named_bytes(b"PBsw", source.width);
+            crate::diag::record_named_bytes(b"PBsh", source.height);
+            crate::diag::record_named_bytes(b"PBsDir", u32::from(source.direct_scanout));
+        }
 
         // The driver-private Present payload is retained only as a diagnostic
         // cross-check. It must never override the identity that Windows placed
@@ -569,7 +592,9 @@ unsafe fn dxgkddi_present_inner(
             })
             .map(u32::from)
             .unwrap_or(2);
-        crate::diag::record_named_bytes(b"PBIdOk", private_match);
+        if sample {
+            crate::diag::record_named_bytes(b"PBIdOk", private_match);
+        }
 
         // It must not program scanout here: dxgkrnl subsequently names the
         // allocation that actually reached the VidPn source through
@@ -577,7 +602,9 @@ unsafe fn dxgkddi_present_inner(
         // source into a different managed primary, so publishing both creates
         // two competing selectors and lets retirement of the transient source
         // tear down the real desktop scanout.
-        crate::diag::record_named_bytes(b"PBFlip", 1);
+        if sample {
+            crate::diag::record_named_bytes(b"PBFlip", 1);
+        }
 
         // FlipOnVSyncMmIo explicitly requires DxgkDdiPresent to generate no DMA
         // buffer. In that contract dxgkrnl passes pDmaBuffer == NULL and later

@@ -240,6 +240,46 @@ pub fn reset_fault_counters() {
     }
 }
 
+/// Sampling period for [`sample_tick`] at the default `DiagLevel`.
+///
+/// 600 is the period this driver already uses for its other throttled
+/// telemetry (`create_allocation`'s breadcrumbs, the scanout pacing block), so
+/// a sampled value refreshes about every 10 seconds at 60 Hz.
+pub const SAMPLE_EVERY: u32 = 600;
+
+/// The THIRD diag channel, alongside [`fault`] (ungated named counter) and
+/// [`record`] (DiagLevel-gated ring): throttled named IDENTITY values.
+///
+/// Returns whether this call is a sampled one, so a whole identity block can be
+/// gated on a single tick and therefore stay internally consistent — every
+/// value in a sampled block comes from the same operation.
+///
+/// The problem it exists for: `record_named*` is one synchronous
+/// `RtlWriteRegistryValue` per call with no gate, and `dxgkddi_present_inner`
+/// performed ~30 of them for a DWM flip and ~55 for an app BLT — almost none of
+/// them failure counters, just per-call dumps of geometry, formats, handles and
+/// sizes that mattered during bring-up. That is a per-frame kernel registry tax
+/// on the exact path the PSC stage is trying to measure.
+///
+/// Policy, deliberately explicit at every call site:
+///   - a FAILURE goes through [`fault`] or an unconditional `record_named_bytes`;
+///   - an IDENTITY value goes through this;
+///   - bring-up archaeology goes through [`record`].
+/// At `DiagLevel >= 1` this returns true every time, restoring the per-call
+/// behaviour for a debugging session.
+pub fn sample_tick(ticks: &AtomicU32) -> bool {
+    let n = ticks.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+    level() >= 1 || n == 1 || n % SAMPLE_EVERY == 0
+}
+
+/// One-shot throttled identity value, for a site with no surrounding block.
+/// Same policy as [`sample_tick`].
+pub fn sample_named(name: &[u8], value: u32, ticks: &AtomicU32) {
+    if sample_tick(ticks) {
+        record_named_bytes(name, value);
+    }
+}
+
 /// `record_named` convenience: build the UTF-16 value name from an ASCII byte
 /// slice (≤14 chars). PASSIVE_LEVEL only.
 pub fn record_named_bytes(name: &[u8], value: u32) {
