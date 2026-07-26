@@ -14,7 +14,7 @@ use helios_protocol::{
 };
 
 use crate::adapter::{AdapterContext, ScanoutGuard};
-use crate::ddi::create_allocation::{present_alloc_info, PresentAllocationStorage};
+use crate::ddi::create_allocation::{present_alloc_info, PresentAllocationStorage, ScanoutTarget};
 use crate::ddi::present_packet::{
     PresentAllocations, PresentSubmissionPrivate, STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER,
 };
@@ -57,7 +57,7 @@ fn production_linear_scanout(
     lock: &ScanoutGuard<'_>,
     width: u32,
     height: u32,
-) -> Result<crate::ddi::create_allocation::ScanoutInfo, NTSTATUS> {
+) -> Result<ScanoutTarget, ScanoutReject> {
     use core::sync::atomic::Ordering;
 
     let resource_id = adapter.dedicated_scanout_resource.load(Ordering::Acquire);
@@ -71,20 +71,16 @@ fn production_linear_scanout(
             .unwrap_or(false);
     if live {
         let layout = adapter.primary_scanout_layout.load(Ordering::Relaxed);
-        return Ok(crate::ddi::create_allocation::ScanoutInfo {
+        return ScanoutTarget::adapter_linear(
             resource_id,
             width,
             height,
-            pitch: (layout >> 32) as u32,
-            dxgi_format: adapter.primary_scanout_dxgi_format.load(Ordering::Relaxed),
-            plane_offset: layout as u32 as u64,
-            venus_alloc_size: adapter.primary_scanout_alloc_size.load(Ordering::Relaxed),
-            memory_type_index: adapter.primary_scanout_memory_type.load(Ordering::Relaxed),
-            direct_scanout: false,
-            primary_segment: 0,
-            primary_address: 0,
-            primary_flags: 0,
-        });
+            (layout >> 32) as u32,
+            layout as u32 as u64,
+            adapter.primary_scanout_alloc_size.load(Ordering::Relaxed),
+            adapter.primary_scanout_memory_type.load(Ordering::Relaxed),
+            adapter.primary_scanout_dxgi_format.load(Ordering::Relaxed),
+        );
     }
 
     // Through the scanout token: this is one of the two Venus acquisitions that
@@ -96,11 +92,11 @@ fn production_linear_scanout(
         Ok(Ok(scanout)) => scanout,
         Ok(Err(_)) => {
             crate::diag::record_named_bytes(b"CpErr", 1);
-            return Err(STATUS_NO_MEMORY);
+            return Err(ScanoutReject::LinearAllocFailed(STATUS_NO_MEMORY));
         }
         Err(_) => {
             crate::diag::record_named_bytes(b"CpErr", 2);
-            return Err(STATUS_DEVICE_NOT_READY);
+            return Err(ScanoutReject::LinearAllocFailed(STATUS_DEVICE_NOT_READY));
         }
     };
 
@@ -126,20 +122,16 @@ fn production_linear_scanout(
     crate::diag::record_named_bytes(b"CpRid", scanout.blob.res_id);
     crate::diag::record_named_bytes(b"CpBid", scanout.blob.blob_id as u32);
     crate::diag::record_named_bytes(b"CpPch", scanout.row_pitch);
-    Ok(crate::ddi::create_allocation::ScanoutInfo {
-        resource_id: scanout.blob.res_id,
+    ScanoutTarget::adapter_linear(
+        scanout.blob.res_id,
         width,
         height,
-        pitch: scanout.row_pitch,
-        dxgi_format: ScanoutFormat::Bgra8.dxgi(),
-        plane_offset: scanout.plane_offset as u64,
-        venus_alloc_size: scanout.blob.size,
-        memory_type_index: scanout.memory_type_index,
-        direct_scanout: false,
-        primary_segment: 0,
-        primary_address: 0,
-        primary_flags: 0,
-    })
+        scanout.row_pitch,
+        scanout.plane_offset as u64,
+        scanout.blob.size,
+        scanout.memory_type_index,
+        ScanoutFormat::Bgra8.dxgi(),
+    )
 }
 
 unsafe fn present_private_data(args: &DXGKARG_PRESENT) -> Option<HeliosPresentPrivateData> {
@@ -1352,64 +1344,37 @@ unsafe fn program_vidpn_source(
     // extent/metadata. It may be the current plain OPTIMAL export; QEMU validates
     // that opaque native layout against the original blob allocation size.
     // Other primaries retain the adapter-owned LINEAR target + GPU-copy fallback.
+    //
+    // The arm IS the constructor. Both validate, resolve the pitch and resolve
+    // the wire format identically; a `ScanoutTarget` that exists is a target the
+    // host can be told about, and it carries no primary address, so the fallback
+    // arm cannot supply one to `publish_displayed_primary`.
     let target = if source.direct_scanout {
-        let min_size = source
-            .plane_offset
-            .saturating_add((source.pitch as u64).saturating_mul(height as u64));
-        let valid = source.pitch >= width.saturating_mul(4)
-            && source.pitch & 3 == 0
-            && source.plane_offset <= u32::MAX as u64
-            && source.venus_alloc_size >= min_size
-            && ScanoutFormat::from_dxgi(source.dxgi_format).is_some();
-        if !valid {
-            return Err(ScanoutReject::Layout);
-        }
-        source
+        ScanoutTarget::from_direct_primary(&source, width, height)?
     } else {
-        match production_linear_scanout(adapter, lock, width, height) {
-            Ok(target) => target,
-            Err(status) => {
-                return Err(ScanoutReject::LinearAllocFailed(status));
-            }
-        }
+        production_linear_scanout(adapter, lock, width, height)?
     };
-    // Stride MUST match the UMD's actual row pitch (`cross_adapter_pitch`,
-    // 256-aligned), NOT `width*4`: for 1896 wide that is 7680 vs 7584, and a wrong
-    // stride shears the scan-out so the host reads each row 96 bytes short. Fall
-    // back to the same alignment the UMD uses if the allocation carried no pitch.
-    let stride = if target.pitch != 0 {
-        target.pitch
-    } else {
-        crate::ddi::create_allocation::cross_adapter_pitch(width)
-    };
-    // Resolve the scan-out format from the creator's EXACT DXGI format (the KMD
-    // D3DDDIFORMAT is lossy — B8G8R8A8 and R8G8B8A8 both collapse to A8R8G8B8).
-    // Preserve the exact allocation storage format on the standard virtio
-    // scanout contract. The target can differ from the Windows source when the
-    // KMD-owned compatibility copy is selected.
-    let Some(vformat) =
-        ScanoutFormat::from_dxgi_or_legacy_zero(target.dxgi_format).map(ScanoutFormat::virtio)
-    else {
-        return Err(ScanoutReject::Format(target.dxgi_format));
-    };
+    // Read the geometry from the VALIDATED target from here on, not from the
+    // loose locals: the two are equal by construction (both constructors take
+    // the resolved extent) and using the target makes it the single source.
     let bound_wh = adapter.active_scanout_wh.load(Ordering::Acquire);
     let already_bound = adapter.active_scanout_resource.load(Ordering::Acquire)
-        == target.resource_id
-        && bound_wh == (((width as u64) << 32) | height as u64);
+        == target.resource_id()
+        && bound_wh == (((target.width() as u64) << 32) | target.height() as u64);
     if !already_bound || trace_tick {
-        crate::diag::record_named_bytes(b"ScRid", target.resource_id);
-        crate::diag::record_named_bytes(b"ScPch", stride);
-        crate::diag::record_named_bytes(b"ScOff", target.plane_offset as u32);
+        crate::diag::record_named_bytes(b"ScRid", target.resource_id());
+        crate::diag::record_named_bytes(b"ScPch", target.pitch());
+        crate::diag::record_named_bytes(b"ScOff", target.plane_offset());
     }
     if !already_bound {
         let set = crate::virtio::ctrl::set_scanout_blob(
             adapter,
-            target.resource_id,
-            width,
-            height,
-            vformat,
-            stride,
-            target.plane_offset as u32,
+            target.resource_id(),
+            target.width(),
+            target.height(),
+            target.format().virtio(),
+            target.pitch(),
+            target.plane_offset(),
         );
         if set.is_err() {
             return Err(ScanoutReject::SetFailed);
@@ -1418,26 +1383,29 @@ unsafe fn program_vidpn_source(
         // direct primary. The latter is tracked by active_scanout_resource and
         // dies with its WDDM allocation; publishing it here would overwrite the
         // durable target's cached Venus identity.
-        if !target.direct_scanout {
+        //
+        // Branches on the SOURCE's flag, which is equivalent: the direct arm is
+        // taken only when it is set, and the LINEAR arm only when it is clear.
+        if !source.direct_scanout {
             adapter.remember_primary_scanout(
-                target.resource_id,
-                width,
-                height,
-                stride,
-                target.plane_offset as u32,
-                target.venus_alloc_size,
-                target.memory_type_index,
-                target.dxgi_format,
+                target.resource_id(),
+                target.width(),
+                target.height(),
+                target.pitch(),
+                target.plane_offset(),
+                target.venus_alloc_size(),
+                target.memory_type_index(),
+                target.dxgi_format(),
             );
         }
-        adapter.remember_scanout_blob(target.resource_id, width, height);
-        crate::diag::record_named_bytes(b"ScPub", target.resource_id);
+        adapter.remember_scanout_blob(target.resource_id(), target.width(), target.height());
+        crate::diag::record_named_bytes(b"ScPub", target.resource_id());
     }
     if !already_bound || trace_tick {
         crate::diag::record_named_bytes(b"ScSet", 1);
     }
 
-    if source.resource_id == target.resource_id {
+    if source.resource_id == target.resource_id() {
         // True zero-copy primary. Never submit vkCmdCopyImage with the same
         // image as source and destination. SetVidPn only binds/publishes the
         // candidate; the matching Render marker and used-ring retirement are
@@ -1475,10 +1443,10 @@ unsafe fn program_vidpn_source(
             adapter,
             lock,
             h_alloc,
+            &source,
             target_image_id,
             width,
             height,
-            source.primary_address,
         )
     } {
         Ok(fence) => {

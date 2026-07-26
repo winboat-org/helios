@@ -34,6 +34,7 @@ use crate::dxgk::_D3DKMDT_STANDARDALLOCATION_TYPE::{
     D3DKMDT_STANDARDALLOCATION_GDISURFACE, D3DKMDT_STANDARDALLOCATION_SHADOWSURFACE,
     D3DKMDT_STANDARDALLOCATION_SHAREDPRIMARYSURFACE, D3DKMDT_STANDARDALLOCATION_STAGINGSURFACE,
 };
+use crate::ddi::display::ScanoutReject;
 use crate::dxgk::*;
 use helios_kmd_logic::ScanoutFormat;
 
@@ -433,9 +434,23 @@ pub(crate) unsafe fn paging_alloc_info(h: HANDLE) -> Option<PagingAllocInfo> {
     })
 }
 
-/// Geometry + layout of a scan-out primary, resolved from its `hAllocation`.
+/// The Windows-supplied identity of one specific `hAllocation`, plus the
+/// geometry and layout the UMD created it with.
+///
+/// This is the *unvalidated* half. It says what Windows named and what the
+/// allocation claims about itself; it does NOT say that any of it is a legal
+/// scan-out target. Produced only by [`scanout_alloc_info`].
+///
+/// It used to be the same type as the scan-out target
+/// (`ScanoutInfo`), which meant `production_linear_scanout` returned a value
+/// whose `primary_*` fields were meaningless zeros — twice — and the programming
+/// path then juggled a `source` and a `target` whose fields were valid in
+/// different subsets, with correctness resting on the author remembering to read
+/// the address from `source`. Writing `last_primary_address.store(
+/// target.primary_address, ..)` compiled and published 0 as the displayed
+/// address, making the flip unretirable.
 #[derive(Clone, Copy)]
-pub(crate) struct ScanoutInfo {
+pub(crate) struct WindowsPrimary {
     pub resource_id: u32,
     pub width: u32,
     pub height: u32,
@@ -449,13 +464,182 @@ pub(crate) struct ScanoutInfo {
     /// Exact Venus allocation identity used by cross-context imports.
     pub venus_alloc_size: u64,
     pub memory_type_index: u32,
+    /// Whether the UMD created this primary in the proven directly-scannable
+    /// shape. Kept HERE and not on the target: the programming path still
+    /// branches on it to decide whether to publish the fallback cache.
     pub direct_scanout: bool,
     /// Exact `PrimarySegment` paired with this hAllocation by Windows.
     pub primary_segment: u32,
-    /// Exact `PrimaryAddress` paired with this hAllocation by Windows.
+    /// Exact `PrimaryAddress` paired with this hAllocation by Windows. The ONLY
+    /// address that may ever be published as displayed.
     pub primary_address: u64,
     /// Exact `DXGK_SETVIDPNSOURCEADDRESS_FLAGS::Value` supplied by Windows.
     pub primary_flags: u32,
+}
+
+/// A scan-out surface that has been validated as legal for `SET_SCANOUT_BLOB`.
+///
+/// Private fields and exactly two constructors, both returning
+/// `Result<Self, ScanoutReject>`: [`Self::from_direct_primary`] and
+/// [`Self::adapter_linear`]. There is no way to partially initialise one, and it
+/// carries no `primary_address` — the fallback path cannot construct the type
+/// that publication needs.
+///
+/// The arm IS the constructor, so there is no `direct_scanout` flag here either.
+#[derive(Clone, Copy)]
+pub(crate) struct ScanoutTarget {
+    resource_id: u32,
+    width: u32,
+    height: u32,
+    /// Already resolved: the allocation's own pitch if it carried one, else the
+    /// same 256-byte alignment the UMD uses. Never 0.
+    pitch: u32,
+    plane_offset: u32,
+    venus_alloc_size: u64,
+    memory_type_index: u32,
+    format: ScanoutFormat,
+    /// The DXGI value this target was built from, preserved verbatim for the
+    /// fallback cache (`remember_primary_scanout`) so the published identity is
+    /// byte-identical to what it was before R507.
+    dxgi_format: u32,
+}
+
+impl ScanoutTarget {
+    /// Validate a UMD-created primary for DIRECT scan-out.
+    ///
+    /// ⚠ These checks are the guard that keeps QEMU from reading past the blob
+    /// (the undersize-guard lesson from the 38th session). They are moved
+    /// VERBATIM, saturating arithmetic included. Do not "simplify" them.
+    pub(crate) fn from_direct_primary(
+        primary: &WindowsPrimary,
+        width: u32,
+        height: u32,
+    ) -> Result<Self, ScanoutReject> {
+        let min_size = primary
+            .plane_offset
+            .saturating_add((primary.pitch as u64).saturating_mul(height as u64));
+        let valid = primary.pitch >= width.saturating_mul(4)
+            && primary.pitch & 3 == 0
+            && primary.plane_offset <= u32::MAX as u64
+            && primary.venus_alloc_size >= min_size
+            && ScanoutFormat::from_dxgi(primary.dxgi_format).is_some();
+        if !valid {
+            return Err(ScanoutReject::Layout);
+        }
+        Self::new(
+            primary.resource_id,
+            width,
+            height,
+            primary.pitch,
+            primary.plane_offset,
+            primary.venus_alloc_size,
+            primary.memory_type_index,
+            primary.dxgi_format,
+        )
+    }
+
+    /// Build the adapter-owned LINEAR fallback target.
+    ///
+    /// Same pitch resolution as the direct arm so the two behave identically,
+    /// even though the LINEAR pitch is never 0 in practice.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn adapter_linear(
+        resource_id: u32,
+        width: u32,
+        height: u32,
+        pitch: u32,
+        plane_offset: u64,
+        venus_alloc_size: u64,
+        memory_type_index: u32,
+        dxgi_format: u32,
+    ) -> Result<Self, ScanoutReject> {
+        Self::new(
+            resource_id,
+            width,
+            height,
+            pitch,
+            plane_offset,
+            venus_alloc_size,
+            memory_type_index,
+            dxgi_format,
+        )
+    }
+
+    /// The shared tail of both constructors: resolve the pitch, then resolve the
+    /// wire format.
+    ///
+    /// Order matters and matches the pre-R507 code: the pitch substitution ran
+    /// AFTER the direct arm's checks (which is why `from_direct_primary`
+    /// validates against the RAW pitch), and the format conversion ran after
+    /// both.
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        resource_id: u32,
+        width: u32,
+        height: u32,
+        pitch: u32,
+        plane_offset: u64,
+        venus_alloc_size: u64,
+        memory_type_index: u32,
+        dxgi_format: u32,
+    ) -> Result<Self, ScanoutReject> {
+        // Stride MUST match the UMD's actual row pitch (`cross_adapter_pitch`,
+        // 256-aligned), NOT `width*4`: for 1896 wide that is 7680 vs 7584, and a
+        // wrong stride shears the scan-out so the host reads each row 96 bytes
+        // short. Fall back to the same alignment the UMD uses if the allocation
+        // carried no pitch.
+        let pitch = if pitch != 0 {
+            pitch
+        } else {
+            cross_adapter_pitch(width)
+        };
+        // Resolve the scan-out format from the creator's EXACT DXGI format (the
+        // KMD D3DDDIFORMAT is lossy — B8G8R8A8 and R8G8B8A8 both collapse to
+        // A8R8G8B8). The legacy-zero arm is what the converter has always
+        // accepted; the direct arm's stricter validator already ran above.
+        let Some(format) = ScanoutFormat::from_dxgi_or_legacy_zero(dxgi_format) else {
+            return Err(ScanoutReject::Format(dxgi_format));
+        };
+        Ok(Self {
+            resource_id,
+            width,
+            height,
+            pitch,
+            plane_offset: plane_offset as u32,
+            venus_alloc_size,
+            memory_type_index,
+            format,
+            dxgi_format,
+        })
+    }
+
+    pub(crate) fn resource_id(&self) -> u32 {
+        self.resource_id
+    }
+    pub(crate) fn width(&self) -> u32 {
+        self.width
+    }
+    pub(crate) fn height(&self) -> u32 {
+        self.height
+    }
+    pub(crate) fn pitch(&self) -> u32 {
+        self.pitch
+    }
+    pub(crate) fn plane_offset(&self) -> u32 {
+        self.plane_offset
+    }
+    pub(crate) fn venus_alloc_size(&self) -> u64 {
+        self.venus_alloc_size
+    }
+    pub(crate) fn memory_type_index(&self) -> u32 {
+        self.memory_type_index
+    }
+    pub(crate) fn format(&self) -> ScanoutFormat {
+        self.format
+    }
+    pub(crate) fn dxgi_format(&self) -> u32 {
+        self.dxgi_format
+    }
 }
 
 /// Preserve the exact segment, address, and flags Windows paired with a
@@ -489,7 +673,7 @@ pub(crate) unsafe fn set_vidpn_primary_address(
 /// dxgkrnl passes in `SetVidPnSourceAddress`) to its scan-out geometry + layout
 /// for `SET_SCANOUT_BLOB`. Returns `None` for a null/foreign handle or an
 /// unbacked allocation. SAFETY: same contract as [`paging_alloc_info`].
-pub(crate) unsafe fn scanout_alloc_info(h: HANDLE) -> Option<ScanoutInfo> {
+pub(crate) unsafe fn scanout_alloc_info(h: HANDLE) -> Option<WindowsPrimary> {
     if h.is_null() {
         return None;
     }
@@ -497,7 +681,7 @@ pub(crate) unsafe fn scanout_alloc_info(h: HANDLE) -> Option<ScanoutInfo> {
     if ctx.magic != ALLOCATION_CTX_MAGIC || ctx.resource_id == 0 {
         return None;
     }
-    Some(ScanoutInfo {
+    Some(WindowsPrimary {
         resource_id: ctx.resource_id,
         width: ctx.width,
         height: ctx.height,
@@ -592,17 +776,23 @@ fn clear_prepared_copy(ctx: &AllocationContext) {
 /// allocation; the frame path only queues the reusable command buffer and
 /// returns its ring-1 GPU-completion fence.
 ///
+/// Takes the `WindowsPrimary` rather than a loose `(handle, address)` pair, so
+/// the address it hands the copy is provably the one Windows paired with THIS
+/// allocation instead of whatever the caller passed alongside the handle.
+///
 /// SAFETY: `h` is the live `hAllocation` passed by dxgkrnl to
-/// SetVidPnSourceAddress. PASSIVE_LEVEL only (the Venus client mutex may wait).
+/// SetVidPnSourceAddress, and `primary` is the identity resolved from that same
+/// handle. PASSIVE_LEVEL only (the Venus client mutex may wait).
 pub(crate) unsafe fn submit_primary_scanout_copy(
     adapter: &AdapterContext,
     lock: &ScanoutGuard<'_>,
     h: HANDLE,
+    primary: &WindowsPrimary,
     target_image_id: u64,
     width: u32,
     height: u32,
-    primary_address: u64,
 ) -> Result<u64, NTSTATUS> {
+    let primary_address = primary.primary_address;
     if h.is_null() || target_image_id == 0 || width == 0 || height == 0 {
         return Err(STATUS_INVALID_PARAMETER);
     }
