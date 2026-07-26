@@ -111,6 +111,49 @@ fn setup_bar_segment(
     )
 }
 
+/// Stand up the persistent venus context + page-table blob. Returns
+/// `(venus_ctx_id, page_table_window)`; `(0, None)` on any failure.
+///
+/// ⚠ `#[inline(never)]` is a STACK BUDGET decision, not style. `VenusClient` and
+/// the blob descriptors are large locals, and StartDevice's frame is already
+/// shared with `VirtioGpu::init`'s ~9.1 KB one on a 24 KB kernel stack. Keeping
+/// these in their own transient frame — which does not overlap
+/// `VirtioGpu::init` — is what keeps the nested peak inside the budget. See
+/// `StartedState::boxed` for the boot failure this class of growth caused.
+#[inline(never)]
+fn bring_up_venus(adapter: &AdapterContext) -> (u32, Option<(u64, u64)>) {
+    if !VENUS_ALLOC_ENABLED {
+        // venus page-table allocation disabled — boot-safe build.
+        adapter.set_venus_client(None);
+        return (0, None);
+    }
+    // Persistent venus context for the device lifetime (owner 0: KMD-internal,
+    // destroyed explicitly in StopDevice).
+    let venus_result =
+        crate::virtio::ctrl::ctx_create(adapter, helios_protocol::VIRTIO_GPU_CAPSET_VENUS, None)
+            .and_then(|ctx_id| {
+                let (client, blob) =
+                    crate::virtio::venus::allocate_host_visible_blob(adapter, ctx_id)?;
+                Ok((ctx_id, client, blob))
+            });
+    match venus_result {
+        Ok((ctx_id, client, blob)) => {
+            crate::diag::record(0x0B00_0007);
+            adapter.set_venus_client(Some(client));
+            (ctx_id, Some((blob.gpa, blob.size)))
+        }
+        Err(e) => {
+            // venus bring-up failed; transport is up but no page-table window.
+            let status: NTSTATUS = e.into();
+            crate::diag::record(0x0B00_00E7);
+            crate::diag::record(status as u32);
+            crate::diag::fault(crate::diag::FaultCounter::StVnu, status as u32);
+            adapter.set_venus_client(None);
+            (0, None)
+        }
+    }
+}
+
 /// `DxgkDdiStartDevice` — bring the adapter online.
 pub unsafe extern "C" fn dxgkddi_start_device(
     miniport_device_context: *mut c_void,
@@ -152,8 +195,10 @@ pub unsafe extern "C" fn dxgkddi_start_device(
         .start_complete
         .store(0, core::sync::atomic::Ordering::Release);
 
-    // The callback interface, copied for the driver's lifetime (Copy struct).
-    let dxgkrnl = unsafe { *dxgkrnl_interface };
+    // NOT copied here. `dxgkrnl_interface` is 576 bytes and this function's
+    // stack frame is shared with `VirtioGpu::init`'s ~9.1 KB one on a 24 KB
+    // kernel stack — see `StartedState::boxed`. The pointer is carried to the
+    // publication site and dereferenced straight into the heap allocation.
     crate::diag::record(0x0B00_0002);
 
     // Service-key knobs, read once per StartDevice (same iteration model as
@@ -240,39 +285,7 @@ pub unsafe extern "C" fn dxgkddi_start_device(
             // already be live. On any failure we record diag and leave
             // page_table_window = None — never fail StartDevice (Gate 1 stays
             // start-safe). See virtio::venus.
-            if !VENUS_ALLOC_ENABLED {
-                // venus page-table allocation disabled — boot-safe build.
-                adapter.set_venus_client(None);
-            } else {
-                // Persistent venus context for the device lifetime (owner 0:
-                // KMD-internal, destroyed explicitly in StopDevice).
-                let venus_result = crate::virtio::ctrl::ctx_create(
-                    adapter,
-                    helios_protocol::VIRTIO_GPU_CAPSET_VENUS,
-                    None,
-                )
-                .and_then(|ctx_id| {
-                    let (client, blob) =
-                        crate::virtio::venus::allocate_host_visible_blob(adapter, ctx_id)?;
-                    Ok((ctx_id, client, blob))
-                });
-                match venus_result {
-                    Ok((ctx_id, client, blob)) => {
-                        crate::diag::record(0x0B00_0007);
-                        venus_ctx_id = ctx_id;
-                        adapter.set_venus_client(Some(client));
-                        page_table_window = Some((blob.gpa, blob.size));
-                    }
-                    Err(e) => {
-                        // venus bring-up failed; transport is up but no page-table window.
-                        let status: NTSTATUS = e.into();
-                        crate::diag::record(0x0B00_00E7);
-                        crate::diag::record(status as u32);
-                        crate::diag::fault(crate::diag::FaultCounter::StVnu, status as u32);
-                        adapter.set_venus_client(None);
-                    }
-                }
-            } // end if VENUS_ALLOC_ENABLED
+            (venus_ctx_id, page_table_window) = bring_up_venus(adapter);
         }
         Err(e) => {
             crate::kmsg(c"Helios: virtio-gpu init FAILED\n");
@@ -384,13 +397,17 @@ pub unsafe extern "C" fn dxgkddi_start_device(
     }
     // SAFETY: StartDevice, PASSIVE_LEVEL, serialized by dxgkrnl; published once
     // per start, and every reader reaches it through the Acquire in `started()`.
+    // `boxed` builds on the HEAP in its own (transient) frame — never bind its
+    // value here, only the Box, or the 832-byte temporary comes back.
     unsafe {
-        adapter.publish_started(crate::adapter::StartedState::new(
-            dxgkrnl,
-            alloc_cached,
-            present_probe,
-            forced_reject,
-            display_half,
+        adapter.publish_started(crate::adapter::StartedState::boxed(
+            dxgkrnl_interface,
+            crate::adapter::StartedKnobs {
+                alloc_cached,
+                present_probe,
+                forced_reject,
+                display_half,
+            },
             scanout_mode,
             paging_ram,
             bar_probe_ram,

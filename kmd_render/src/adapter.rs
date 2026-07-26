@@ -265,32 +265,64 @@ pub(crate) struct StartedState {
     transport: UnsafeCell<Option<TransportGeneration>>,
 }
 
+/// The service-key knobs, as one small POD so they cross the
+/// [`StartedState::boxed`] boundary without a wide argument list.
+#[derive(Clone, Copy)]
+pub(crate) struct StartedKnobs {
+    pub alloc_cached: bool,
+    pub present_probe: bool,
+    pub forced_reject: u32,
+    pub display_half: bool,
+}
+
 impl StartedState {
-    /// Build the sticky half. The transport half always starts empty and is
-    /// installed separately by [`AdapterContext::set_transport_generation`], so
-    /// "a state published with a stale transport generation" is unrepresentable.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
-        dxgkrnl: DXGKRNL_INTERFACE,
-        alloc_cached: bool,
-        present_probe: bool,
-        forced_reject: u32,
-        display_half: bool,
+    /// Build the sticky half DIRECTLY ON THE HEAP.
+    ///
+    /// ⚠ STACK BUDGET — this is not a style preference. `DxgkDdiStartDevice`
+    /// calls `VirtioGpu::init`, whose own frame is ~9.1 KB, and the x64 kernel
+    /// stack is 24 KB total. Building this 832-byte struct (which embeds a
+    /// 576-byte `DXGKRNL_INTERFACE`) in StartDevice's frame — and passing it
+    /// there by value, which an unoptimised build materialises several times —
+    /// took StartDevice from 8824 to 9688 bytes and the nested pair to ~18.8 KB.
+    /// That overflowed the kernel stack during boot, where dxgkrnl's own frames
+    /// above us are deeper than on a live `devcon` restart: an early double
+    /// fault with no dump, presenting as `0xc0000001` at the recovery screen.
+    ///
+    /// `#[inline(never)]` is load-bearing: it keeps the temporary in THIS
+    /// frame, which is transient and does not overlap `VirtioGpu::init`.
+    /// Callers must never bind the value — only the `Box`.
+    ///
+    /// The dxgkrnl interface is taken as a POINTER and dereferenced here, so the
+    /// 576-byte copy goes straight into the heap allocation instead of living in
+    /// StartDevice for the whole call.
+    ///
+    /// The transport half always starts empty and is installed separately by
+    /// [`AdapterContext::set_transport_generation`], so "a state published with a
+    /// stale transport generation" is unrepresentable.
+    ///
+    /// # Safety
+    /// `dxgkrnl` must point to the live `DXGKRNL_INTERFACE` dxgkrnl passed to
+    /// `DxgkDdiStartDevice`, valid for this call.
+    #[inline(never)]
+    pub(crate) unsafe fn boxed(
+        dxgkrnl: *const DXGKRNL_INTERFACE,
+        knobs: StartedKnobs,
         scanout_mode: ScanoutMode,
         paging_ram: Option<PagingRam>,
         bar_probe_ram: Option<PagingRam>,
-    ) -> Self {
-        Self {
-            dxgkrnl,
-            alloc_cached,
-            present_probe,
-            forced_reject,
-            display_half,
+    ) -> Box<Self> {
+        Box::new(Self {
+            // SAFETY: per the fn contract; a plain POD copy of dxgkrnl's buffer.
+            dxgkrnl: unsafe { *dxgkrnl },
+            alloc_cached: knobs.alloc_cached,
+            present_probe: knobs.present_probe,
+            forced_reject: knobs.forced_reject,
+            display_half: knobs.display_half,
             scanout_mode,
             paging_ram,
             bar_probe_ram,
             transport: UnsafeCell::new(None),
-        }
+        })
     }
 }
 
@@ -396,7 +428,11 @@ pub struct AdapterContext {
     /// "mutate a started field from a DDI" does not compile and "read `dxgkrnl`
     /// before StartDevice" does not compile either (there is no `StartedState` to
     /// borrow).
-    started: UnsafeCell<Option<StartedState>>,
+    /// BOXED. The state is 832 bytes and embeds a 576-byte `DXGKRNL_INTERFACE`;
+    /// keeping it behind a pointer is what stops it — and its by-value
+    /// construction temporaries — from landing on `DxgkDdiStartDevice`'s stack
+    /// frame. See `StartedState::boxed`.
+    started: UnsafeCell<Option<Box<StartedState>>>,
     /// Publication flag for `started`. A reader that observes 1 with Acquire has
     /// necessarily seen every store StartDevice made into the state — which makes
     /// the callback-table visibility ordering structural for ALL THREE readers,
@@ -2064,7 +2100,7 @@ impl AdapterContext {
         // the slot afterwards — the transport half has its own interior
         // mutability and its own serialization (StartDevice/StopDevice, which
         // dxgkrnl serializes).
-        unsafe { (*self.started.get()).as_ref() }
+        unsafe { (*self.started.get()).as_deref() }
     }
 
     /// Take the contiguous RAM blocks out of a PREVIOUS start's state so the
@@ -2081,7 +2117,7 @@ impl AdapterContext {
         // SAFETY: per the fn contract — StartDevice is serialized against every
         // other lifecycle DDI, and nothing reads `paging_ram` between the take
         // and the republish inside the same call.
-        unsafe { (*self.started.get()).as_mut() }.and_then(|s| s.paging_ram.take())
+        unsafe { (*self.started.get()).as_deref_mut() }.and_then(|s| s.paging_ram.take())
     }
 
     /// As [`Self::take_paging_ram`], for the `BarSegMode` 5 probe block.
@@ -2090,7 +2126,7 @@ impl AdapterContext {
     /// Same contract as [`Self::take_paging_ram`].
     pub(crate) unsafe fn take_bar_probe_ram(&self) -> Option<PagingRam> {
         // SAFETY: per the fn contract.
-        unsafe { (*self.started.get()).as_mut() }.and_then(|s| s.bar_probe_ram.take())
+        unsafe { (*self.started.get()).as_deref_mut() }.and_then(|s| s.bar_probe_ram.take())
     }
 
     /// Free a contiguous RAM block that is being replaced rather than carried
@@ -2106,7 +2142,9 @@ impl AdapterContext {
     /// Must be called at PASSIVE_LEVEL from `DxgkDdiStartDevice`, which dxgkrnl
     /// serializes against every other lifecycle DDI, and only while
     /// [`Self::started`] is `None` for this start.
-    pub(crate) unsafe fn publish_started(&self, state: StartedState) {
+    pub(crate) unsafe fn publish_started(&self, state: Box<StartedState>) {
+        // Takes the Box, so only a pointer moves through this call — the 832-byte
+        // value is never copied through a caller's frame.
         // SAFETY: per the fn contract — StartDevice is serialized, and no reader
         // can observe the slot until the Release store below.
         unsafe { *self.started.get() = Some(state) };
@@ -2292,7 +2330,7 @@ impl Drop for AdapterContext {
         // SAFETY: exclusive access via `&mut self`; RemoveDevice runs after the
         // VSync timer is cancelled and the HPD worker joined, so no other agent
         // holds a reference into this context.
-        if let Some(state) = unsafe { (*self.started.get()).as_mut() } {
+        if let Some(state) = unsafe { (*self.started.get()).as_deref_mut() } {
             if let Some(pr) = state.paging_ram.take() {
                 // SAFETY: `va` came from MmAllocateContiguousMemory in
                 // `alloc_paging_ram` and is freed exactly once here.
