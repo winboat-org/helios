@@ -4574,11 +4574,16 @@ impl VenusClient {
         crate::diag::record_named_bytes(b"PBPrF", 0x10);
     }
 
-    /// Drain and destroy every cached app/DWM Present BLT import.
+    /// Drain and destroy the cached app/DWM Present BLT records belonging to one
+    /// resource.
     ///
     /// Allocation teardown calls this before a backing resource can disappear.
-    /// Flushing the bounded cache as one ownership unit avoids detach/refcount
-    /// ambiguity when multiple swapchain images share one destination.
+    ///
+    /// It used to drain EVERY cached entry regardless of `resource_id`, despite
+    /// the entry gate below testing only for `resource_id` — so tearing down A
+    /// destroyed B's objects too, and a failure partway through left B alive
+    /// with its cache record gone. Scoping makes the gate and the fast path
+    /// honest: what this function touches is now exactly what it says.
     pub fn release_present_blits_for_resource(
         &mut self,
         adapter: &AdapterContext,
@@ -4626,7 +4631,24 @@ impl VenusClient {
         }
         self.destroy_fence(adapter, marker)?;
 
-        while let Some(blt) = self.present_blits.pop() {
+        // Blits FIRST, and scoped by BOTH ends. A blit's command buffer is
+        // baked against its source image and its destination image/buffer, so
+        // releasing either end must take the blit with it — the set is derived
+        // from the resources actually being released, not from a single-sided
+        // compare on the blit. Several swapchain sources may share one DWM
+        // destination, so a one-sided test would leave a command buffer baked
+        // against a destroyed image.
+        let mut i = 0;
+        while i < self.present_blits.len() {
+            let touches = self.present_blits[i].source_resource_id == resource_id
+                || self.present_blits[i].destination_resource_id == resource_id;
+            if !touches {
+                i += 1;
+                continue;
+            }
+            // swap_remove puts the last element in slot i, so do NOT advance —
+            // the element that just moved here has not been tested yet.
+            let blt = self.present_blits.swap_remove(i);
             if let Err((blt, error)) = blt.release(self, adapter) {
                 // Reinsert: MAX_PRESENT_BLITS capacity is preallocated, so this
                 // push cannot allocate under any lock. The record must go back
@@ -4638,14 +4660,26 @@ impl VenusClient {
                 return Err(error);
             }
         }
-        while let Some(image) = self.present_images.pop() {
+        let mut i = 0;
+        while i < self.present_images.len() {
+            if self.present_images[i].desc.resource_id != resource_id {
+                i += 1;
+                continue;
+            }
+            let image = self.present_images.swap_remove(i);
             if let Err((image, error)) = image.release(self, adapter) {
                 self.present_images.push(image);
                 crate::diag::record_named_bytes(b"PBTdErr", resource_id);
                 return Err(error);
             }
         }
-        while let Some(buffer) = self.present_buffers.pop() {
+        let mut i = 0;
+        while i < self.present_buffers.len() {
+            if self.present_buffers[i].desc.resource_id != resource_id {
+                i += 1;
+                continue;
+            }
+            let buffer = self.present_buffers.swap_remove(i);
             if let Err((buffer, error)) = buffer.release(self, adapter) {
                 self.present_buffers.push(buffer);
                 crate::diag::record_named_bytes(b"PBTdErr", resource_id);
