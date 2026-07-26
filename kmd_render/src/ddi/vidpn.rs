@@ -415,8 +415,13 @@ pub unsafe fn recommend_monitor_modes(
 /// `DxgkDdiEnumVidPnCofuncModality` body — populate cofunctional source/target
 /// mode sets for every unpinned end of every path in the constraining VidPn,
 /// and advertise Identity scaling/rotation. Mirrors viogpudo's implementation
-/// (single mode). Function-scope handles are released in the final cleanup so a
-/// mid-loop error can't leak a mode set or path-info reference.
+/// (single mode).
+///
+/// Cleanup contract, corrected: the final cleanup releases the path-info
+/// reference ONLY. Every mode set created by `pfnCreateNewSourceModeSet` /
+/// `pfnCreateNewTargetModeSet` must be released on its own failure path, because
+/// a set that was never assigned stays acquired inside dxgkrnl for the lifetime
+/// of the constraining VidPn and poisons later acquires for the same source.
 ///
 /// # Safety
 /// `arg` points to a valid `DXGKARG_ENUMVIDPNCOFUNCMODALITY` for the call.
@@ -567,6 +572,15 @@ pub unsafe fn enum_cofunc_modality(
                 status = unsafe { assign_src(h_vidpn, source_id, h_set) };
                 if !ok(status) {
                     fp = 16;
+                    // The assign failed, so ownership did NOT transfer to the
+                    // VidPn and the final cleanup (which releases only `path`)
+                    // will not touch this set. Left unreleased it stays acquired
+                    // inside dxgkrnl for the constraining VidPn's lifetime, and
+                    // a later pfnAcquireSourceModeSet for the same source then
+                    // fails - turning a transient rejection into a persistent
+                    // 0-path VidPn, the exact failure mode this file exists to
+                    // avoid. The add-mode arm above already does this.
+                    let _ = unsafe { release_src(h_vidpn, h_set) };
                     break;
                 }
             } else {
@@ -634,6 +648,10 @@ pub unsafe fn enum_cofunc_modality(
                 status = unsafe { assign_tgt(h_vidpn, target_id, h_set) };
                 if !ok(status) {
                     fp = 26;
+                    // As in the source arm above: assign failed, so ownership
+                    // did not transfer and this set would otherwise be orphaned
+                    // inside dxgkrnl for the VidPn's lifetime.
+                    let _ = unsafe { release_tgt(h_vidpn, h_set) };
                     break;
                 }
             } else {
