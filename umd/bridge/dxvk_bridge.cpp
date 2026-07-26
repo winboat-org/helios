@@ -438,6 +438,35 @@ namespace {
   };
   static_assert(sizeof(HeliosVenusScanoutInfo) == 40);
 
+  // open_kmd_scanout_target is the entry point for the guest primary-to-scanout
+  // LINEAR COPY target. It returned 0 for three different reasons with a named
+  // counter for none of them, and two of the three were entirely silent, so
+  // "the query is failing every frame" was indistinguishable from "the query is
+  // not being made".
+  std::atomic<std::uint32_t> g_scanoutExportMissing{0};
+  std::atomic<std::uint32_t> g_scanoutQueryUnavailable{0};
+  std::atomic<std::uint32_t> g_scanoutImportFailed{0};
+  std::atomic<std::uint32_t> g_scanoutFormatRefused{0};
+  std::atomic<std::uint32_t> g_scanoutPlaneOffsetRefused{0};
+
+  void log_scanout_refusal(const char* what, std::atomic<std::uint32_t>& counter) {
+    const std::uint32_t n = counter.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n == 1 || (n % 512u) == 0) {
+      char msg[256];
+      std::snprintf(msg, sizeof(msg),
+        "open_kmd_scanout_target REFUSED: %s (x%u) "
+        "[export_missing=%u query_unavailable=%u import_failed=%u "
+        "format_refused=%u plane_offset_refused=%u]",
+        what, n,
+        g_scanoutExportMissing.load(std::memory_order_relaxed),
+        g_scanoutQueryUnavailable.load(std::memory_order_relaxed),
+        g_scanoutImportFailed.load(std::memory_order_relaxed),
+        g_scanoutFormatRefused.load(std::memory_order_relaxed),
+        g_scanoutPlaneOffsetRefused.load(std::memory_order_relaxed));
+      umd_log(msg);
+    }
+  }
+
   // Minimal IDXGIAdapter the D3D11DXGIDevice constructor stores (it is not
   // queried during construction — the Dxvk objects are passed directly).
   class HeliosStubAdapter : public IDXGIAdapter {
@@ -1399,24 +1428,59 @@ std::size_t HeliosDxvkDevice::open_kmd_scanout_target(
     auto query = helios_icd_export<Fn>(HeliosIcdExport::QueryScanout);
     if (!query) {
       log_export_unavailable(HeliosIcdExport::QueryScanout);
+      g_scanoutExportMissing.fetch_add(1, std::memory_order_relaxed);
       return 0;
     }
 
     HeliosVenusScanoutInfo info = { };
     if (!query(impl->instance->handle(), &info) || !info.resourceId ||
-        !info.allocSize || !info.width || !info.height || !info.pitch)
+        !info.allocSize || !info.width || !info.height || !info.pitch) {
+      log_scanout_refusal("no scanout published yet", g_scanoutQueryUnavailable);
       return 0;
+    }
 
-    // The KMD image uses VkFormat B8G8R8A8_UNORM while scanout advertises XR24.
-    // Rebuild the D3D transfer alias as BGRA so CopyResource from DWM's BGRA
-    // composition target is format-compatible; alpha is ignored by XR24 scanout.
-    constexpr std::uint32_t DXGI_FORMAT_B8G8R8A8_UNORM_VALUE = 87u;
+    // The ICD reports the format; the literal 87 that used to be substituted
+    // here silently disagreed with it if it ever reported anything else. The
+    // KMD image is VkFormat B8G8R8A8_UNORM while scanout advertises XR24, so
+    // BGRA remains the expected value: CopyResource from DWM's BGRA composition
+    // target stays format-compatible and alpha is ignored by XR24 scanout.
+    // Refuse anything outside the 32-bit Windows scan-out set rather than
+    // passing an unknown format through blind.
+    std::uint32_t aliasFormat = info.dxgiFormat;
+    if (aliasFormat == 0u)
+      aliasFormat = 87u;  // older ICDs left the field zero
+    if (aliasFormat != 28u && aliasFormat != 87u && aliasFormat != 88u) {
+      log_scanout_refusal("ICD reported a non-scanout dxgiFormat",
+                          g_scanoutFormatRefused);
+      return 0;
+    }
+    // planeOffset was fetched and thrown away. Nothing downstream applies it,
+    // so a non-zero value would alias the wrong bytes: refuse explicitly.
+    if (info.planeOffset != 0u) {
+      log_scanout_refusal("ICD reported a non-zero planeOffset",
+                          g_scanoutPlaneOffsetRefused);
+      return 0;
+    }
     const auto resource = open_ddi_texture2d(
-      info.width, info.height, DXGI_FORMAT_B8G8R8A8_UNORM_VALUE,
+      info.width, info.height, aliasFormat,
       0u, 0u, info.resourceId, info.resourceId, info.allocSize,
       info.memoryTypeIndex, false, true, false);
-    if (!resource)
+    if (!resource) {
+      log_scanout_refusal("import of the published scanout failed",
+                          g_scanoutImportFailed);
       return 0;
+    }
+
+    // Entry into the COPY path is a silent regression away from the direct
+    // primary if it is not loud: the desktop still appears, so nothing else
+    // distinguishes it. One warning-level line, once.
+    static std::atomic<std::uint32_t> s_copyTargetOpens{0};
+    const std::uint32_t opens =
+      s_copyTargetOpens.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (opens == 1) {
+      umd_log("WARNING: opening the LEGACY LINEAR copy target — this device is "
+              "no longer presenting the direct primary through the KMD scanout");
+    }
 
     if (out_resource_id) *out_resource_id = info.resourceId;
     if (out_width)       *out_width = info.width;
@@ -1426,10 +1490,11 @@ std::size_t HeliosDxvkDevice::open_kmd_scanout_target(
 
     char msg[224];
     std::snprintf(msg, sizeof(msg),
-      "open_kmd_scanout_target res=%u %ux%u pitch=%u off=%u alloc=%llu mti=%u gen=%u resource=%p",
+      "open_kmd_scanout_target res=%u %ux%u pitch=%u off=%u fmt=%u alloc=%llu mti=%u gen=%u resource=%p opens=%u",
       info.resourceId, info.width, info.height, info.pitch, info.planeOffset,
+      aliasFormat,
       static_cast<unsigned long long>(info.allocSize), info.memoryTypeIndex,
-      info.generation, reinterpret_cast<void*>(resource));
+      info.generation, reinterpret_cast<void*>(resource), opens);
     umd_log(msg);
     return resource;
   });
