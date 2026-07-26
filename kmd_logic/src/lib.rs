@@ -70,6 +70,33 @@ pub const fn window_range(len: u64, offset: u64, bytes: u64) -> Option<u64> {
     }
 }
 
+/// A physical page frame number, as supplied by `DXGK_PTE::PageAddress` or
+/// derived from `MmGetPhysicalAddress`.
+///
+/// Exists so the PFN-to-address conversion is written once, checked. The
+/// paging engine guarded it with `checked_shl(12)`, which is not an overflow
+/// guard at all: `u64::checked_shl` returns `None` only when the SHIFT COUNT is
+/// >= 64, so with a constant 12 it can never fail and the `BAR_ERR_VIRTUAL`
+/// counter documented for that failure was unreachable (k-paging-10).
+#[repr(transparent)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Pfn(pub u64);
+
+impl Pfn {
+    /// Byte address of this page frame, or `None` if it cannot be represented.
+    ///
+    /// Two rules, both load-bearing for the caller: the multiply must not
+    /// overflow, and the result must fit a POSITIVE `i64`, because it is
+    /// assigned to `PHYSICAL_ADDRESS.QuadPart` (an `i64`) and handed to
+    /// `MmMapIoSpace` — an address with bit 63 set would arrive negative.
+    pub const fn physical_address(self) -> Option<u64> {
+        match self.0.checked_mul(PAGE_BYTES) {
+            Some(address) if address <= i64::MAX as u64 => Some(address),
+            _ => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -157,6 +184,37 @@ mod tests {
         assert_eq!(window_range(4096, u64::MAX, 1), None);
         assert_eq!(window_range(4096, u64::MAX - 4095, 4096), None);
         assert_eq!(window_range(u64::MAX, u64::MAX, 1), None);
+    }
+
+    #[test]
+    fn pfn_physical_address_vectors() {
+        assert_eq!(Pfn(0).physical_address(), Some(0));
+        assert_eq!(Pfn(1).physical_address(), Some(4096));
+        assert_eq!(Pfn(0x1234).physical_address(), Some(0x1234 * 4096));
+        // Largest PFN whose address still has bit 63 clear.
+        assert_eq!(
+            Pfn((1 << 51) - 1).physical_address(),
+            Some(0x7FFF_FFFF_FFFF_F000)
+        );
+    }
+
+    /// The multiply overflows at 2^52 pages (2^52 * 4096 == 2^64), which is the
+    /// case `checked_shl(12)` could never catch.
+    #[test]
+    fn pfn_physical_address_rejects_overflow() {
+        assert_eq!(Pfn(1 << 52).physical_address(), None);
+        assert_eq!(Pfn(u64::MAX).physical_address(), None);
+    }
+
+    /// Deliberate deviation from the review's wording, which asked for both
+    /// "2^52 - 1 returns the right address" AND "the sign bit is rejected":
+    /// (2^52 - 1) * 4096 == 0xFFFF_FFFF_FFFF_F000, whose bit 63 IS set, so the
+    /// two rules cannot both hold for that input. The sign rule wins, because
+    /// the value's only consumer is an i64 QuadPart handed to MmMapIoSpace.
+    #[test]
+    fn pfn_physical_address_rejects_the_sign_bit() {
+        assert_eq!(Pfn((1 << 52) - 1).physical_address(), None);
+        assert_eq!(Pfn(1 << 51).physical_address(), None);
     }
 
     /// Both moved functions are `const fn`, so a future edit that reaches for

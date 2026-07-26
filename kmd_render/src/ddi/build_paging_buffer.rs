@@ -166,6 +166,17 @@ static BAR_ERR_SHADOW_FULL: AtomicU32 = AtomicU32::new(0); // PTE shadow capacit
 /// VidMm retired the paging fence believing content had moved.
 static BAR_ERR_XFER_HANDLE: AtomicU32 = AtomicU32::new(0);
 static BAR_ERR_FILL_HANDLE: AtomicU32 = AtomicU32::new(0);
+/// `VIRTUAL_FILL`s (`PgFv`) that arrived while the allocation was system-
+/// resident — evidence only, no behaviour change.
+///
+/// The VIRTUAL_FILL arm fills the blob at `AllocationOffsetInBytes` and never
+/// resolves `DestinationVirtualAddress` through the PTE shadow, the way
+/// `bar_virtual_transfer` does for the same class of address. While the
+/// allocation is paged out to system memory, the bytes VidMm means are the
+/// system pages, not the blob. Whether that is reachable at all is an open
+/// question this counter answers before anything is built for it: a nonzero
+/// value is the trigger for a VA-resolving implementation (k-paging-14).
+static BAR_VIRTUAL_FILL_SYSTEM: AtomicU32 = AtomicU32::new(0);
 static BAR_VIRTUAL_PTES: AtomicU32 = AtomicU32::new(0); // system PTEs retained
 static BAR_LAST_VIRTUAL_SRC: AtomicU64 = AtomicU64::new(0);
 static BAR_LAST_VIRTUAL_DST: AtomicU64 = AtomicU64::new(0);
@@ -198,6 +209,7 @@ fn dump_bar_counters() {
     crate::diag::record_named_bytes(b"PgEf", BAR_ERR_SHADOW_FULL.load(Ordering::Relaxed));
     crate::diag::record_named_bytes(b"PgEh", BAR_ERR_XFER_HANDLE.load(Ordering::Relaxed));
     crate::diag::record_named_bytes(b"PgFh", BAR_ERR_FILL_HANDLE.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"PgFv", BAR_VIRTUAL_FILL_SYSTEM.load(Ordering::Relaxed));
     crate::diag::record_named_bytes(b"PgVp", BAR_VIRTUAL_PTES.load(Ordering::Relaxed));
     crate::diag::record_named_bytes(b"PgVs", BAR_LAST_VIRTUAL_SRC.load(Ordering::Relaxed) as u32);
     crate::diag::record_named_bytes(b"PgVd", BAR_LAST_VIRTUAL_DST.load(Ordering::Relaxed) as u32);
@@ -497,7 +509,14 @@ unsafe fn copy_blob_system_pages(
         {
             run_pages += 1;
         }
-        let Some(physical_address) = system_pages[page_index].checked_shl(12) else {
+        // `checked_shl(12)` was not an overflow guard — it fails only for a
+        // shift count >= 64, so with a constant 12 this arm was dead and PgEv
+        // could never fire for it. `Pfn::physical_address` checks the multiply
+        // AND rejects an address whose i64 QuadPart cast would go negative
+        // (k-paging-10).
+        let Some(physical_address) =
+            helios_kmd_logic::Pfn(system_pages[page_index]).physical_address()
+        else {
             BAR_ERR_VIRTUAL.fetch_add(1, Ordering::Relaxed);
             return false;
         };
@@ -971,7 +990,12 @@ unsafe fn bar_harvest_page_table(
             return;
         }
     }
-    if let Some(base) = (page0 << 12)
+    // Same guard as the transfer path: an unchecked `page0 << 12` wraps.
+    let Some(page0_address) = helios_kmd_logic::Pfn(page0).physical_address() else {
+        BAR_ERR_VIRTUAL.fetch_add(1, Ordering::Relaxed);
+        return;
+    };
+    if let Some(base) = page0_address
         .checked_sub(u.AllocationOffsetInBytes)
         .filter(|b| *b < bar_size)
     {
@@ -1113,6 +1137,11 @@ pub unsafe extern "C" fn dxgkddi_build_paging_buffer(
                     let off = fv.AllocationOffsetInBytes;
                     let fill_len = fv.FillSizeInBytes;
                     let pattern = fv.FillPattern;
+                    // Evidence for the blob-versus-system-pages asymmetry
+                    // documented on PgFv; the fill below is unchanged.
+                    if adapter.system_backings.contains(alloc.resource_id) {
+                        BAR_VIRTUAL_FILL_SYSTEM.fetch_add(1, Ordering::Relaxed);
+                    }
                     let mut filled = false;
                     let ok = unsafe {
                         with_blob_bytes(adapter, alloc.resource_id, |dst, len| {
