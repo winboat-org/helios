@@ -815,17 +815,21 @@ pub(crate) unsafe fn submit_primary_scanout_copy(
     // Through the scanout token: the second of the two Venus acquisitions that
     // run under `scanout_mutex` (see `ScanoutGuard`).
     let result = lock.with_venus_client(|client| {
-        let mut prepared = cached_prepared_copy(ctx);
-        if prepared
-            .as_ref()
-            .map(|p| p.target_image_id != target_image_id)
-            .unwrap_or(false)
-        {
-            let old = prepared.take().unwrap();
-            let last = ctx.scanout_copy_last_fence.load(Ordering::Acquire);
-            client.destroy_prepared_image_copy(adapter, old, last)?;
-            clear_prepared_copy(ctx);
-        }
+        // Retarget: a cached copy baked against a *different* destination image
+        // is destroyed and rebuilt. Matching on the option directly replaces a
+        // map-then-unwrap_or guard followed by a take-then-unwrap — two
+        // statements that had to agree for the unwrap to be sound. Note the
+        // cache-HIT path must fall through with the value still in place; a bare
+        // `if let Some(old) = prepared.take()` would destroy it every frame.
+        let prepared = match cached_prepared_copy(ctx) {
+            Some(old) if old.target_image_id != target_image_id => {
+                let last = ctx.scanout_copy_last_fence.load(Ordering::Acquire);
+                client.destroy_prepared_image_copy(adapter, old, last)?;
+                clear_prepared_copy(ctx);
+                None
+            }
+            other => other,
+        };
         let copy = match prepared {
             Some(copy) => copy,
             None => {
