@@ -139,6 +139,21 @@ struct ResourceContext {
     _marker: u32,
 }
 
+/// `"HERC"` — the marker that says a `hResource` is one this driver minted.
+const RESOURCE_CTX_MARKER: u32 = 0x4845_5243;
+
+/// CreateAllocation calls that arrived with a non-null `hResource` (`RcIn`) and
+/// how many of those did not carry our marker (`RcBad`). `RcIn` staying 0 is
+/// what makes the "mint only over null" rule a provable no-op.
+static RESOURCE_INPUT_HANDLES: AtomicU32 = AtomicU32::new(0);
+static RESOURCE_FOREIGN_HANDLES: AtomicU32 = AtomicU32::new(0);
+
+/// OpenAllocation calls carrying more than one entry (`OaMulti`). The call-level
+/// OUT fields describe exactly one of them, so this is the population that would
+/// have to exist before anything is tuned for multi-surface opens. Every writer
+/// in this tree sets NumAllocations = 1.
+static MULTI_ENTRY_OPENS: AtomicU32 = AtomicU32::new(0);
+
 /// Per-device open state for an allocation. Dxgkrnl's `hAllocation` in
 /// `DXGK_OPENALLOCATIONINFO` is its non-device-specific allocation handle; the
 /// miniport must return its own device-specific handle here and later receives it
@@ -280,6 +295,93 @@ pub(crate) struct PagingAllocInfo {
     pub bar_placed: u64,
 }
 
+/// Allocation handles refused because they were null or failed the magic check
+/// (`DsBad` — DescribeAllocation) and reclaim sites that refused to reconstruct
+/// a `Box` from such a handle (`FreeBad`). Both must stay 0.
+static DESCRIBE_BAD_HANDLE: AtomicU32 = AtomicU32::new(0);
+static RECLAIM_BAD_HANDLE: AtomicU32 = AtomicU32::new(0);
+
+/// The ONE place a dxgkrnl allocation handle becomes an `&AllocationContext`.
+///
+/// Every accessor in this file open-codes the same null + magic pair, and
+/// `DxgkDdiDescribeAllocation` open-coded neither — it dereferenced the handle
+/// raw. Honest note on the guarantee: a magic check does NOT reliably detect a
+/// freed Box (freed non-paged pool often still reads back as "HALC"). What it
+/// buys is one owner for the cast plus a counter if a foreign handle ever shows
+/// up (k-alloc-02).
+///
+/// # Safety
+/// `h` must be a handle this driver returned from `DxgkDdiCreateAllocation` and
+/// that dxgkrnl still considers live.
+unsafe fn resolve_alloc(h: HANDLE) -> Option<&'static AllocationContext> {
+    if h.is_null() {
+        return None;
+    }
+    // SAFETY: non-null; the magic word is checked before any other field is
+    // trusted, and the caller guarantees the handle's provenance.
+    let ctx = unsafe { &*(h as *const AllocationContext) };
+    (ctx.magic == ALLOCATION_CTX_MAGIC).then_some(ctx)
+}
+
+/// Geometry `DxgkDdiDescribeAllocation` reports, from a magic-checked handle.
+pub(crate) struct DescribeInfo {
+    pub width: u32,
+    pub height: u32,
+    pub format: u32,
+}
+
+/// Reclaim ownership of an allocation handle's `Box`, but only if it still
+/// passes the magic check.
+///
+/// A handle that does not is LEAKED on purpose: reconstructing a `Box` from a
+/// pointer this driver did not mint would free foreign pool. Counted as
+/// `FreeBad`, which must stay 0.
+///
+/// # Safety
+/// `h` must be a handle from `DxgkDdiCreateAllocation` that dxgkrnl is handing
+/// back exactly once for reclamation.
+unsafe fn take_alloc_ctx(h: HANDLE) -> Option<Box<AllocationContext>> {
+    if unsafe { resolve_alloc(h) }.is_none() {
+        RECLAIM_BAD_HANDLE.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    // SAFETY: the magic check just proved this is one of our boxes, and the
+    // caller guarantees dxgkrnl hands each handle back once.
+    Some(unsafe { Box::from_raw(h as *mut AllocationContext) })
+}
+
+/// Reclaim an open-allocation handle's `Box`, magic-checked like
+/// [`take_alloc_ctx`]. A handle that fails is leaked and counted (`FreeBad`).
+///
+/// # Safety
+/// `h` must be a `hDeviceSpecificAllocation` this driver published, handed back
+/// exactly once.
+unsafe fn take_open_ctx(h: HANDLE) -> Option<Box<OpenAllocationContext>> {
+    if h.is_null() {
+        return None;
+    }
+    // SAFETY: non-null; magic is read before any other field is trusted.
+    let magic_ok = unsafe { (*(h as *const OpenAllocationContext)).magic }
+        == OPEN_ALLOCATION_CTX_MAGIC;
+    if !magic_ok {
+        RECLAIM_BAD_HANDLE.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    // SAFETY: as above, plus the caller's once-only guarantee.
+    Some(unsafe { Box::from_raw(h as *mut OpenAllocationContext) })
+}
+
+/// # Safety
+/// As [`resolve_alloc`].
+unsafe fn describe_alloc_info(h: HANDLE) -> Option<DescribeInfo> {
+    let ctx = unsafe { resolve_alloc(h) }?;
+    Some(DescribeInfo {
+        width: ctx.width,
+        height: ctx.height,
+        format: ctx.format,
+    })
+}
+
 /// Resolve a paging-op `hAllocation` (the handle this driver returned from
 /// `DxgkDdiCreateAllocation`) to its paging view. Returns `None` for null or
 /// magic-mismatched handles — a garbage dereference here would bugcheck.
@@ -287,13 +389,7 @@ pub(crate) struct PagingAllocInfo {
 /// SAFETY: `h` must be an in-flight paging op's `hAllocation` (dxgkrnl keeps
 /// the allocation alive across its paging operations).
 pub(crate) unsafe fn paging_alloc_info(h: HANDLE) -> Option<PagingAllocInfo> {
-    if h.is_null() {
-        return None;
-    }
-    let ctx = unsafe { &*(h as *const AllocationContext) };
-    if ctx.magic != ALLOCATION_CTX_MAGIC {
-        return None;
-    }
+    let ctx = unsafe { resolve_alloc(h) }?;
     Some(PagingAllocInfo {
         resource_id: ctx.resource_id,
         size: ctx.size as u64,
@@ -874,8 +970,23 @@ unsafe fn create_one(
     resource_associated: bool,
 ) -> Result<(), NTSTATUS> {
     // ── Read + validate the ICD's private driver data ───────────────────────
-    let mut priv_ptr = info.pPrivateDriverData as *const u8;
-    let mut priv_len = info.PrivateDriverDataSize as usize;
+    //
+    // TWO SEPARATE DECISIONS (M3/k-alloc-11). The READ may fall back to the
+    // resource-level buffer when it is the larger of the two; the WRITE-BACK
+    // below may not. Both HeliosWddmAllocPrivate and HeliosWddmOpenIdentity put
+    // `magic` at byte offset 16, so stamping the identity into the shared
+    // resource buffer makes the NEXT allocation in the same call fail
+    // HeliosWddmAllocPrivate::is_valid. `write_target` is therefore always the
+    // per-allocation buffer.
+    //
+    // The fallback is believed unreachable today (CARAPSz and CARRSz both read
+    // 96 on the live box, so `resource_private_size > priv_len` is false), but
+    // proving that needs DiagLevel >= 1 for the 0x0C01_0040 breadcrumb, so it is
+    // kept rather than deleted.
+    let write_target = info.pPrivateDriverData as *const u8;
+    let write_target_len = info.PrivateDriverDataSize as usize;
+    let mut priv_ptr = write_target;
+    let mut priv_len = write_target_len;
     if !resource_private.is_null() && (resource_private_size as usize) > priv_len {
         priv_ptr = resource_private as *const u8;
         priv_len = resource_private_size as usize;
@@ -1119,7 +1230,7 @@ unsafe fn create_one(
     if meta.venus_alloc_size == 0 {
         meta.venus_alloc_size = ap.size;
     }
-    if priv_len >= size_of::<HeliosWddmOpenIdentity>() {
+    if write_target_len >= size_of::<HeliosWddmOpenIdentity>() && !write_target.is_null() {
         // Create-time write-back into dxgkrnl's per-allocation buffer (the copy
         // OpenAllocation later reads). This must happen for BOTH KMD-created
         // standard allocations and UMD/Venus-backed adopted allocations:
@@ -1135,14 +1246,19 @@ unsafe fn create_one(
             kind: ap.kind,
         };
         unsafe {
-            write_open_identity(priv_ptr as *mut c_void, priv_len as UINT, &ident);
+            write_open_identity(
+                write_target as *mut c_void,
+                write_target_len as UINT,
+                &ident,
+            );
         }
-        if priv_len >= size_of::<HeliosWddmAllocPrivate>() + size_of::<HeliosWddmAllocMeta>() {
+        if write_target_len >= size_of::<HeliosWddmAllocPrivate>() + size_of::<HeliosWddmAllocMeta>()
+        {
             // SAFETY: bounds-checked; trailer follows the 48-byte prefix in the
-            // same runtime-owned buffer.
+            // per-allocation runtime-owned buffer.
             let meta_dst = unsafe {
                 core::slice::from_raw_parts_mut(
-                    (priv_ptr as *mut u8).add(size_of::<HeliosWddmAllocPrivate>()),
+                    (write_target as *mut u8).add(size_of::<HeliosWddmAllocPrivate>()),
                     size_of::<HeliosWddmAllocMeta>(),
                 )
             };
@@ -1361,13 +1477,38 @@ pub unsafe extern "C" fn dxgkddi_create_allocation(
     }
 
     let wants_resource = unsafe { args.Flags.__bindgen_anon_1.__bindgen_anon_1.Resource() } != 0;
+    // Mint a ResourceContext ONLY over a null input handle. A non-null
+    // args.hResource is an add-allocation-to-existing-resource call: overwriting
+    // it minted a second box for one resource and orphaned the first, since the
+    // only free path is keyed on Flags.DestroyResource and sees just the last
+    // handle. Evidence for the population: CARInLo/CARInHi read 0/0 on the live
+    // box, so no in-tree caller takes the new arm today — RcIn is the counter
+    // that proves it stays that way (k-alloc-V01).
+    let minted_resource = wants_resource && args.hResource.is_null();
     if wants_resource {
         crate::diag::record(0x0C3C_0000 | ((args.hResource as usize as u32) & 0xFFFF));
-        let resource = Box::new(ResourceContext {
-            _marker: 0x4845_5243, // "HERC"
-        });
-        args.hResource = Box::into_raw(resource) as HANDLE;
-        crate::diag::record(0x0C01_0030);
+        if minted_resource {
+            let resource = Box::new(ResourceContext {
+                _marker: RESOURCE_CTX_MARKER,
+            });
+            args.hResource = Box::into_raw(resource) as HANDLE;
+            crate::diag::record(0x0C01_0030);
+        } else {
+            // Keep the runtime's handle. Validate it is ours; a foreign value is
+            // counted and left untouched — never freed, never overwritten.
+            let ours = unsafe { (*(args.hResource as *const ResourceContext))._marker }
+                == RESOURCE_CTX_MARKER;
+            let n = RESOURCE_INPUT_HANDLES.fetch_add(1, Ordering::Relaxed) + 1;
+            if n == 1 || n % 64 == 0 {
+                crate::diag::record_named_bytes(b"RcIn", n);
+            }
+            if !ours {
+                let m = RESOURCE_FOREIGN_HANDLES.fetch_add(1, Ordering::Relaxed) + 1;
+                if m == 1 || m % 64 == 0 {
+                    crate::diag::record_named_bytes(b"RcBad", m);
+                }
+            }
+        }
         crate::diag::record(0x0C3D_0000 | ((args.hResource as usize as u32) & 0xFFFF));
     }
     let output_resource = args.hResource as usize as u64;
@@ -1387,14 +1528,21 @@ pub unsafe extern "C" fn dxgkddi_create_allocation(
                 wants_resource,
             )
         } {
-            // Unwind the allocations already created in this call.
+            // Unwind the allocations already created in this call, then the
+            // ResourceContext this call minted — leaving it published over a
+            // failed create handed dxgkrnl a handle to pool nothing would ever
+            // free (the only free path runs on DestroyAllocation with
+            // Flags.DestroyResource, which never arrives for a failed create).
             for j in 0..i {
                 let prev = unsafe { &mut *args.pAllocationInfo.add(j) };
-                if !prev.hAllocation.is_null() {
-                    let ctx = unsafe { Box::from_raw(prev.hAllocation as *mut AllocationContext) };
+                if let Some(ctx) = unsafe { take_alloc_ctx(prev.hAllocation) } {
                     unsafe { destroy_allocation_ctx(adapter, ctx) };
-                    prev.hAllocation = core::ptr::null_mut();
                 }
+                prev.hAllocation = core::ptr::null_mut();
+            }
+            if minted_resource {
+                drop(unsafe { Box::from_raw(args.hResource as *mut ResourceContext) });
+                args.hResource = input_resource as usize as HANDLE;
             }
             return status;
         }
@@ -1418,8 +1566,7 @@ pub unsafe extern "C" fn dxgkddi_destroy_allocation(
 
     for i in 0..args.NumAllocations as usize {
         let handle = unsafe { *args.pAllocationList.add(i) };
-        if !handle.is_null() {
-            let ctx = unsafe { Box::from_raw(handle as *mut AllocationContext) };
+        if let Some(ctx) = unsafe { take_alloc_ctx(handle) } {
             unsafe { destroy_allocation_ctx(adapter, ctx) };
         }
     }
@@ -1432,13 +1579,41 @@ pub unsafe extern "C" fn dxgkddi_destroy_allocation(
     } != 0;
     if destroy_resource && !args.hResource.is_null() {
         crate::diag::record(0x0C01_0031);
-        let _resource = unsafe { Box::from_raw(args.hResource as *mut ResourceContext) };
+        // Magic-checked like the allocation handles: a foreign value is counted
+        // and leaked rather than freed as if it were our pool.
+        let ours = unsafe { (*(args.hResource as *const ResourceContext))._marker }
+            == RESOURCE_CTX_MARKER;
+        if ours {
+            let _resource = unsafe { Box::from_raw(args.hResource as *mut ResourceContext) };
+        } else {
+            RECLAIM_BAD_HANDLE.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     STATUS_SUCCESS
 }
 
 // ── Allocation lifetime DDIs. ───────────────────────────────────────────────
+
+/// Free AND NULL every `hDeviceSpecificAllocation` published by entries
+/// `0..upto` of this OpenAllocation call.
+///
+/// Freeing and nulling together is what makes this safe under either dxgkrnl
+/// convention (whether or not it calls CloseAllocation for a failed open): a
+/// nulled slot cannot be double-freed, and a freed-but-published pointer cannot
+/// be dereferenced. It is the exact behaviour the liveness-refusal arm already
+/// had by hand; the transport-error arm had none at all (k-alloc-09).
+///
+/// # Safety
+/// `args.pOpenAllocation` must hold at least `upto` entries this call published.
+unsafe fn unwind_opens(args: &mut DXGKARG_OPENALLOCATION, upto: usize) {
+    for j in 0..upto {
+        // SAFETY: j < upto <= NumAllocations, checked by the caller.
+        let prev = unsafe { &mut *args.pOpenAllocation.add(j) };
+        drop(unsafe { take_open_ctx(prev.hDeviceSpecificAllocation) });
+        prev.hDeviceSpecificAllocation = core::ptr::null_mut();
+    }
+}
 
 /// `DxgkDdiOpenAllocation` — bind a device to allocations. dxgkrnl calls this for
 /// EVERY allocation (including ones the same device just created via
@@ -1465,6 +1640,21 @@ pub unsafe extern "C" fn dxgkddi_open_allocation(
     if args.NumAllocations != 0 && args.pOpenAllocation.is_null() {
         return STATUS_INVALID_PARAMETER;
     }
+    // Which entry the call-level OUT fields describe. SubresourceIndex exists in
+    // the binding and was never read; entry 0 is the fallback, which reproduces
+    // today's value exactly for the single-entry opens this tree produces
+    // (the UMD always sets NumAllocations = 1).
+    let subresource_entry = (args.SubresourceIndex as usize).min(
+        (args.NumAllocations as usize).saturating_sub(1),
+    );
+    if args.NumAllocations > 1 {
+        let n = MULTI_ENTRY_OPENS.fetch_add(1, Ordering::Relaxed) + 1;
+        if n == 1 || n % 64 == 0 {
+            crate::diag::record_named_bytes(b"OaMulti", n);
+        }
+    }
+    let mut subresource_meta = None;
+    let mut subresource_ident = None;
     for i in 0..args.NumAllocations as usize {
         let info = unsafe { &mut *args.pOpenAllocation.add(i) };
         crate::diag::record(0x0C21_0000 | ((info.PrivateDriverDataSize as u32).min(0xFFFF)));
@@ -1499,22 +1689,15 @@ pub unsafe extern "C" fn dxgkddi_open_allocation(
                     crate::diag::record(0x0C02_00E4);
                     crate::diag::record(0x0C3E_0000 | (resource_id & 0xFFFF));
                     record_alloc_event(resource_id, 0xDEAD, 0xDEAD, 0, true);
-                    // Unwind opens already handed out in this call.
-                    for j in 0..i {
-                        let prev = unsafe { &mut *args.pOpenAllocation.add(j) };
-                        if !prev.hDeviceSpecificAllocation.is_null() {
-                            drop(unsafe {
-                                Box::from_raw(
-                                    prev.hDeviceSpecificAllocation as *mut OpenAllocationContext,
-                                )
-                            });
-                            prev.hDeviceSpecificAllocation = core::ptr::null_mut();
-                        }
-                    }
+                    unsafe { unwind_opens(args, i) };
                     return STATUS_INVALID_PARAMETER;
                 }
                 Err(_de) => {
                     crate::diag::record(0x0C02_00E5);
+                    // Was a bare return: a transport error mid-OpenAllocation
+                    // leaked every OpenAllocationContext already published in
+                    // this call. Both failure arms unwind identically now.
+                    unsafe { unwind_opens(args, i) };
                     return STATUS_DEVICE_NOT_READY;
                 }
             }
@@ -1587,31 +1770,54 @@ pub unsafe extern "C" fn dxgkddi_open_allocation(
         // KMD-side point where the open-path buffers are reachable, and the
         // record is only written for a validated-live resource (gate above).
         if let Some(ident) = ident {
+            // Per-allocation buffer here; the RESOURCE-level copy is written
+            // once after the loop, from the designated entry only (M4) — it is
+            // one buffer shared by every entry in the call, so writing it per
+            // iteration meant the last entry silently won.
             unsafe {
                 write_open_identity(
                     info.pPrivateDriverData as *mut c_void,
                     info.PrivateDriverDataSize,
                     &ident,
                 );
-                write_open_identity(
-                    args.pPrivateDriverData as *mut c_void,
-                    args.PrivateDriverSize,
-                    &ident,
-                );
             }
         }
 
-        if let Some(meta) = meta {
-            args.SubresourceOffset = 0;
-            args.Pitch = if meta.misc_flags & HELIOS_WDDM_ALLOC_MISC_OPTIMAL_GDI_TEXTURE != 0 {
-                0
-            } else if meta.pitch != 0 {
-                meta.pitch
-            } else {
-                cross_adapter_pitch(meta.width)
-            };
-            crate::diag::record(0x0C38_0000 | (args.Pitch.min(0xFFFF) as u32));
+        // `Pitch` and `SubresourceOffset` are CALL-level OUT fields, not
+        // per-entry ones; writing them inside the loop meant the last entry won
+        // silently. They are computed once after the loop, from the entry
+        // args.SubresourceIndex designates (M4/k-alloc-12).
+        if i == subresource_entry {
+            subresource_meta = meta;
+            subresource_ident = ident;
         }
+    }
+
+    // The resource-level identity buffer is call-level, like Pitch: written once,
+    // from the designated entry. Load-bearing for KMD-created standard
+    // allocations, whose UMD-visible resource-level copy is otherwise the
+    // pristine GetStandardAllocationDriverData output — without this the UMD's
+    // pfnOpenResource cannot alias the venus resource.
+    if let Some(ident) = subresource_ident {
+        unsafe {
+            write_open_identity(
+                args.pPrivateDriverData as *mut c_void,
+                args.PrivateDriverSize,
+                &ident,
+            );
+        }
+    }
+
+    if let Some(meta) = subresource_meta {
+        args.SubresourceOffset = 0;
+        args.Pitch = if meta.misc_flags & HELIOS_WDDM_ALLOC_MISC_OPTIMAL_GDI_TEXTURE != 0 {
+            0
+        } else if meta.pitch != 0 {
+            meta.pitch
+        } else {
+            cross_adapter_pitch(meta.width)
+        };
+        crate::diag::record(0x0C38_0000 | (args.Pitch.min(0xFFFF) as u32));
     }
     STATUS_SUCCESS
 }
@@ -1632,8 +1838,9 @@ pub unsafe extern "C" fn dxgkddi_close_allocation(
         let handle = unsafe { *args.pOpenHandleList.add(i) };
         if !handle.is_null() {
             crate::diag::record(0x0C37_0000 | ((handle as usize as u32) & 0xFFFF));
-            let open = unsafe { Box::from_raw(handle as *mut OpenAllocationContext) };
-            let _ = (open.runtime_allocation, open.private_size);
+            if let Some(open) = unsafe { take_open_ctx(handle) } {
+                let _ = (open.runtime_allocation, open.private_size);
+            }
         }
     }
     STATUS_SUCCESS
@@ -1655,12 +1862,19 @@ pub unsafe extern "C" fn dxgkddi_describe_allocation(
     }
     // SAFETY: dxgkrnl passes a writable DXGKARG_DESCRIBEALLOCATION.
     let args = unsafe { &mut *describe_allocation };
-    if args.hAllocation.is_null() {
-        return STATUS_INVALID_PARAMETER;
-    }
+    // This DDI used to dereference hAllocation with no magic check at all —
+    // the only handle accessor in the file that trusted the pointer outright.
     // SAFETY: hAllocation is the AllocationContext pointer we returned from
     // CreateAllocation; dxgkrnl round-trips it back unmodified.
-    let ctx = unsafe { &*(args.hAllocation as *const AllocationContext) };
+    let Some(ctx) = (unsafe { describe_alloc_info(args.hAllocation) }) else {
+        let n = DESCRIBE_BAD_HANDLE.fetch_add(1, Ordering::Relaxed) + 1;
+        // First occurrence plus every 64th — never a per-call registry write on
+        // a path a caller could repeat.
+        if n == 1 || n % 64 == 0 {
+            crate::diag::record_named_bytes(b"DsBad", n);
+        }
+        return STATUS_INVALID_PARAMETER;
+    };
     crate::diag::record(0x0C20_0000 | (ctx.width.min(0xFFFF) as u32));
     crate::diag::record(0x0C22_0000 | (ctx.height.min(0xFFFF) as u32));
     crate::diag::record(0x0C23_0000 | (ctx.format & 0xFFFF));
