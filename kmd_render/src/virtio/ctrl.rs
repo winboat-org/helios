@@ -60,13 +60,60 @@ const EXECUTIVE: i32 = 0;
 /// and the command fails loudly (`VirtioError::Timeout`).
 const SYNC_ROUNDTRIP_TIMEOUT_MS: u64 = 30_000;
 /// Backpressure retry budget when the control queue / in-flight tables are
-/// full (1 ms PASSIVE sleep per retry).
-const ENQUEUE_RETRY_MAX: u32 = 5_000;
+/// full. MILLISECONDS, like its three siblings — it used to be a bare retry
+/// count that only *happened* to equal 5 s because the sleep is hard-coded to
+/// 1 ms.
+const ENQUEUE_RETRY_MAX_MS: u64 = 5_000;
 /// Hard cap on a single WAIT_FENCE escape (the ICD's own forward-progress
 /// deadline fires far earlier; this only bounds kernel-side thread residency).
 const WAIT_FENCE_MAX_MS: u64 = 120_000;
 /// Bound on waiting out another mapper's in-flight RESOURCE_MAP_BLOB.
-const MAP_BUSY_RETRY_MAX: u32 = 30_000;
+/// MILLISECONDS, as above.
+const MAP_BUSY_MAX_MS: u64 = 30_000;
+
+/// One PASSIVE retry slice. See [`sleep_ms`] for why this is not really 1 ms.
+const RETRY_SLICE_MS: u64 = 1;
+
+/// A retry budget in MILLISECONDS.
+///
+/// Two of the four sibling constants used to be millisecond budgets and two
+/// were bare retry counts that only *happened* to equal 5 s and 30 s because
+/// the sleep is hard-coded to 1 ms, and a fifth budget was an unnamed literal.
+/// A units mismatch like that makes every reader over-estimate how fast the
+/// driver gives up.
+///
+/// It counts NOMINAL slept milliseconds, not wall clock, which is exactly what
+/// the retry counters it replaces did — same numbers, same sleeps, same failure
+/// statuses. See [`sleep_ms`] for why nominal and actual differ by up to ~16x.
+struct Budget {
+    total_ms: u64,
+    spent_ms: u64,
+}
+
+impl Budget {
+    const fn new(total_ms: u64) -> Self {
+        Self {
+            total_ms,
+            spent_ms: 0,
+        }
+    }
+
+    /// Charge one slice. Returns true once the budget is exhausted, matching
+    /// the old `attempts > MAX` test exactly (charge first, then test).
+    fn charge_slice(&mut self) -> bool {
+        self.spent_ms = self.spent_ms.saturating_add(RETRY_SLICE_MS);
+        self.expired()
+    }
+
+    fn expired(&self) -> bool {
+        self.spent_ms > self.total_ms
+    }
+
+    #[allow(dead_code)]
+    fn elapsed_ms(&self) -> u64 {
+        self.spent_ms
+    }
+}
 static VIRGL_DIAG_BLOB_ID: AtomicU64 = AtomicU64::new(1);
 
 #[repr(C)]
@@ -152,6 +199,11 @@ pub(crate) fn sleep_ms(ms: u64) {
     // SAFETY: PASSIVE_LEVEL relative-timeout sleep.
     let _ = unsafe { KeDelayExecutionThread(KERNEL_MODE, 0, &mut interval) };
 }
+// ⚠ `KeDelayExecutionThread` with a small relative timeout rounds UP to the
+// system timer granularity — ~15.6 ms by default. A `sleep_ms(1)` therefore
+// costs up to ~16 ms of thread residency, so a [`Budget`] of N nominal
+// milliseconds can be up to ~16N of real time. Every budget in this module is
+// nominal for that reason; do not read one as wall clock.
 
 /// Wait on `block` for up to `total_ms`, in adaptive slices (1 ms → 1 s),
 /// opportunistically draining the used ring after each slice so a lost
@@ -269,7 +321,7 @@ fn ctrl_roundtrip(
         // checking accepts. A future retry arm that forgets to hand the buffer back
         // is then a *compile* error, where the take-then-expect this replaces was a
         // `KeBugCheck` inside a DDI on the next iteration.
-        let mut attempts = 0u32;
+        let mut budget = Budget::new(ENQUEUE_RETRY_MAX_MS);
         let token: SyncTicket = loop {
             let res = adapter.with_virtio(move |v| {
                 v.drain_used();
@@ -280,12 +332,11 @@ fn ctrl_roundtrip(
                 Ok(Ok(ticket)) => break ticket,
                 Ok(Err((m_back, VirtioError::QueueFull))) => {
                     meta = m_back;
-                    attempts += 1;
-                    if attempts > ENQUEUE_RETRY_MAX {
+                    if budget.charge_slice() {
                         return Err(VirtioError::QueueFull);
                     }
                     reap_parked(adapter);
-                    sleep_ms(1);
+                    sleep_ms(RETRY_SLICE_MS);
                 }
                 Ok(Err((_m, e))) => return Err(e), // dropped here at PASSIVE
             }
@@ -1234,7 +1285,7 @@ pub fn map_blob_prepare(
     owner: OwnerFilter,
     resource_id: u32,
 ) -> Result<BlobMapPrep, VirtioError> {
-    let mut busy_retries = 0u32;
+    let mut busy = Budget::new(MAP_BUSY_MAX_MS);
     loop {
         let begin = adapter
             .with_virtio(|v| v.blob_map_begin(owner, resource_id))
@@ -1243,11 +1294,10 @@ pub fn map_blob_prepare(
             BlobMapBegin::Mapped(prep) => return Ok(prep),
             BlobMapBegin::Failed(e) => return Err(e),
             BlobMapBegin::Busy => {
-                busy_retries += 1;
-                if busy_retries > MAP_BUSY_RETRY_MAX {
+                if busy.charge_slice() {
                     return Err(VirtioError::Timeout);
                 }
-                sleep_ms(1);
+                sleep_ms(RETRY_SLICE_MS);
             }
             BlobMapBegin::Start { offset, len } => {
                 let cache = resource_map_blob_roundtrip(adapter, resource_id, offset);
@@ -1313,7 +1363,7 @@ pub fn map_blob_at(
         let _ = adapter.with_virtio(|v| v.blob_note_unmapped(res));
     }
 
-    let mut busy_retries = 0u32;
+    let mut busy = Budget::new(MAP_BUSY_MAX_MS);
     loop {
         let begin = adapter
             .with_virtio(|v| v.blob_remap_begin(resource_id, window_offset))
@@ -1322,11 +1372,10 @@ pub fn map_blob_at(
             BlobRemapBegin::Mapped(prep) => return Ok(prep),
             BlobRemapBegin::Failed(e) => return Err(e),
             BlobRemapBegin::Busy => {
-                busy_retries += 1;
-                if busy_retries > MAP_BUSY_RETRY_MAX {
+                if busy.charge_slice() {
                     return Err(VirtioError::Timeout);
                 }
-                sleep_ms(1);
+                sleep_ms(RETRY_SLICE_MS);
             }
             BlobRemapBegin::Start { old, len } => {
                 if let Some((old_offset, old_len)) = old {
@@ -1507,7 +1556,7 @@ pub fn submit_venus_async(
     // `ctrl_roundtrip`: this loop has two of them, so an arm that returns only
     // one is exactly the maintenance mistake the take-then-expect pair used to
     // turn into a bugcheck. As loop values it does not compile.
-    let mut attempts = 0u32;
+    let mut budget = Budget::new(ENQUEUE_RETRY_MAX_MS);
     loop {
         let res = adapter.with_virtio(move |v| {
             v.drain_used();
@@ -1519,12 +1568,11 @@ pub fn submit_venus_async(
             Ok(Err((m_back, v_back, VirtioError::QueueFull))) => {
                 meta = m_back;
                 venus = v_back;
-                attempts += 1;
-                if attempts > ENQUEUE_RETRY_MAX {
+                if budget.charge_slice() {
                     return Err(VirtioError::QueueFull);
                 }
                 reap_parked(adapter);
-                sleep_ms(1);
+                sleep_ms(RETRY_SLICE_MS);
             }
             Ok(Err((_m, _v, e))) => return Err(e), // buffers dropped at PASSIVE
         }
