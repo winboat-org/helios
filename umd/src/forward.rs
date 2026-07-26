@@ -10126,6 +10126,91 @@ unsafe extern "C" fn dxgi_query_resource_residency(
 /// The old Flush-only stub pinned dwm's composition to ONE allocation while
 /// dxgkrnl/IddCx walked all three swapchain buffers — two of every three
 /// acquired frames were buffers dwm never rendered (black IDD output).
+/// Outcome of one swapchain identity rotation. Five exits used to `return 0`,
+/// which the DXGI DDI reads as success; this names them instead.
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum RotationOutcome {
+    Rotated,
+    /// `rotate_resource_backings` returned false — an entry with no DXVK image
+    /// storage, or a `DxvkError`/unknown exception swallowed into false.
+    BridgeRefused,
+    /// No Helios device behind the DXGI device handle.
+    NoDevice,
+}
+
+/// The DXVK backing rotation refused it.
+static ROTATE_REFUSED: AtomicUsize = AtomicUsize::new(0);
+/// A null resource handle or an untracked resource in the ring.
+static ROTATE_UNTRACKED: AtomicUsize = AtomicUsize::new(0);
+/// No Helios device behind the DXGI device handle.
+static ROTATE_NO_DEVICE: AtomicUsize = AtomicUsize::new(0);
+/// `Resources < 2` or a null array — the exit that had no log at all.
+static ROTATE_SKIPPED: AtomicUsize = AtomicUsize::new(0);
+
+fn rotate_counter_summary() -> String {
+    format!(
+        "refused={} untracked={} no_device={} skipped={}",
+        ROTATE_REFUSED.load(Ordering::Relaxed),
+        ROTATE_UNTRACKED.load(Ordering::Relaxed),
+        ROTATE_NO_DEVICE.load(Ordering::Relaxed),
+        ROTATE_SKIPPED.load(Ordering::Relaxed),
+    )
+}
+
+/// Both rotation phases, with NO return path between them.
+///
+/// The bridge rotation and the WDDM record rotation used to be two statements
+/// held in the right order purely by statement order. If the bridge refuses
+/// after the records moved — or vice versa — dwm composites into an allocation
+/// dxgkrnl no longer scans out, which is the historical black-IDD bug this
+/// DDI's own doc comment describes.
+///
+/// `states` is a slice of INDEPENDENT raw pointers, so a `&mut [ResourceState]`
+/// cannot be formed from it and this stays `unsafe`. Panic-free: no indexing,
+/// no `unwrap` — `first`/`last`/`windows` only.
+unsafe fn rotate_ring(
+    dev: &crate::device_funcs::HeliosDevice,
+    states: &[*mut ResourceState],
+) -> RotationOutcome {
+    let (Some(&first), Some(&last)) = (states.first(), states.last()) else {
+        // Unreachable: the caller validated len >= 2.
+        ROTATE_SKIPPED.fetch_add(1, Ordering::Relaxed);
+        return RotationOutcome::BridgeRefused;
+    };
+
+    let ptrs: Vec<usize> = states.iter().map(|s| (**s).com_raw).collect();
+    if !dev.dxvk.rotate_resource_backings(ptrs.as_ptr(), ptrs.len()) {
+        ROTATE_REFUSED.fetch_add(1, Ordering::Relaxed);
+        return RotationOutcome::BridgeRefused;
+    }
+
+    // Rotate the WDDM identity records in lockstep with the storages.
+    let first_allocation = (*first).allocation.take();
+    let first_km_resource = (*first).km_resource;
+    let first_owns_allocation = (*first).owns_allocation;
+    let first_present_private = (*first).present_private;
+    for pair in states.windows(2) {
+        let (Some(&cur), Some(&next)) = (pair.first(), pair.get(1)) else {
+            continue;
+        };
+        (*cur).allocation = (*next).allocation.take();
+        (*cur).km_resource = (*next).km_resource;
+        (*cur).owns_allocation = (*next).owns_allocation;
+        // Present private data identifies the backing allocation (Venus
+        // resource id, layout and extent), not the stable D3D resource object.
+        // DXGI rotates that backing identity together with the allocation and
+        // DXVK storage. Leaving this behind makes a flip scan out the previous
+        // resource's memory after the first RotateResourceIdentities call.
+        (*cur).present_private = (*next).present_private;
+    }
+    (*last).allocation = first_allocation;
+    (*last).km_resource = first_km_resource;
+    (*last).owns_allocation = first_owns_allocation;
+    (*last).present_private = first_present_private;
+
+    RotationOutcome::Rotated
+}
+
 unsafe extern "C" fn dxgi_rotate_resource_identities(
     arg: *mut ddi::DXGI_DDI_ARG_ROTATE_RESOURCE_IDENTITIES,
 ) -> i32 {
@@ -10136,6 +10221,15 @@ unsafe extern "C" fn dxgi_rotate_resource_identities(
     let h = dxgi_device_handle(a.hDevice);
     let n = a.Resources as usize;
     if n < 2 || a.pResources.is_null() {
+        let c = ROTATE_SKIPPED.fetch_add(1, Ordering::Relaxed);
+        if c < 16 || c % 512 == 0 {
+            log_line(&format!(
+                "DXGI RotateResourceIdentities: skipped resources={} null_array={} ({})",
+                n,
+                a.pResources.is_null(),
+                rotate_counter_summary()
+            ));
+        }
         return 0;
     }
 
@@ -10146,63 +10240,63 @@ unsafe extern "C" fn dxgi_rotate_resource_identities(
     for i in 0..n {
         let hr = dxgi_resource_handle(*a.pResources.add(i));
         if hr.pDrvPrivate.is_null() {
-            log_line("DXGI RotateResourceIdentities: null resource handle");
+            ROTATE_UNTRACKED.fetch_add(1, Ordering::Relaxed);
+            log_line(&format!(
+                "DXGI RotateResourceIdentities: null resource handle ({})",
+                rotate_counter_summary()
+            ));
             return 0;
         }
         let state = *(hr.pDrvPrivate as *const *mut ResourceState);
         if state.is_null() {
-            log_line("DXGI RotateResourceIdentities: untracked resource");
+            ROTATE_UNTRACKED.fetch_add(1, Ordering::Relaxed);
+            log_line(&format!(
+                "DXGI RotateResourceIdentities: untracked resource ({})",
+                rotate_counter_summary()
+            ));
             return 0;
         }
         states.push(state);
     }
 
-    let rotated = if let Some(dev) = helios_device(h) {
-        let ptrs: Vec<usize> = states.iter().map(|s| (**s).com_raw).collect();
-        dev.dxvk.rotate_resource_backings(ptrs.as_ptr(), ptrs.len())
-    } else {
-        false
+    let outcome = match helios_device(h) {
+        Some(dev) => rotate_ring(dev, &states),
+        None => {
+            ROTATE_NO_DEVICE.fetch_add(1, Ordering::Relaxed);
+            RotationOutcome::NoDevice
+        }
     };
-    if !rotated {
-        log_line("DXGI RotateResourceIdentities: backing rotation FAILED");
+    if outcome != RotationOutcome::Rotated {
+        log_line(&format!(
+            "DXGI RotateResourceIdentities: backing rotation FAILED ({})",
+            rotate_counter_summary()
+        ));
         return 0;
     }
 
-    // Rotate the WDDM identity records in lockstep with the storages.
-    let first_allocation = (*states[0]).allocation.take();
-    let first_km_resource = (*states[0]).km_resource;
-    let first_owns_allocation = (*states[0]).owns_allocation;
-    let first_present_private = (*states[0]).present_private;
-    for i in 0..n - 1 {
-        (*states[i]).allocation = (*states[i + 1]).allocation.take();
-        (*states[i]).km_resource = (*states[i + 1]).km_resource;
-        (*states[i]).owns_allocation = (*states[i + 1]).owns_allocation;
-        // Present private data identifies the backing allocation (Venus
-        // resource id, layout and extent), not the stable D3D resource object.
-        // DXGI rotates that backing identity together with the allocation and
-        // DXVK storage. Leaving this behind makes a flip scan out the previous
-        // resource's memory after the first RotateResourceIdentities call.
-        (*states[i]).present_private = (*states[i + 1]).present_private;
-    }
-    (*states[n - 1]).allocation = first_allocation;
-    (*states[n - 1]).km_resource = first_km_resource;
-    (*states[n - 1]).owns_allocation = first_owns_allocation;
-    (*states[n - 1]).present_private = first_present_private;
-
     let c = ROTATE_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
     if c < 64 {
-        let first_handle = (*states[0])
-            .allocation
-            .as_ref()
-            .map(ResidentAllocation::handle)
-            .unwrap_or(0);
+        let (first_handle, first_resource_id) = match states.first() {
+            Some(&first) => (
+                (*first)
+                    .allocation
+                    .as_ref()
+                    .map(ResidentAllocation::handle)
+                    .unwrap_or(0),
+                (*first).present_private.resource_id,
+            ),
+            None => (0, 0),
+        };
         trace_line!(
             "DXGI RotateResourceIdentities: rotated {} resources, alloc[0]=0x{:x} scanout_res[0]={}",
             n,
             first_handle,
-            (*states[0]).present_private.resource_id
+            first_resource_id
         );
     }
+    // HRESULT unchanged: every path returned 0 before and every path returns 0
+    // now. Making a refused rotation FAIL the DDI is a separate decision with
+    // its own blast radius.
     0
 }
 
