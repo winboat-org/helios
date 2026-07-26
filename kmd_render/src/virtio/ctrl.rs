@@ -1242,9 +1242,18 @@ pub fn map_blob_at(
         .ok_or(VirtioError::DeviceError)?;
     let map_len = blob_size.saturating_add(4095) & !4095;
     let mut stale = [0u32; 8];
+    // Two swallows used to live on this line. `.unwrap_or(0)` turned a torn-down
+    // transport into "no stale placements", skipping the eviction pass entirely
+    // instead of failing the map; and the scan itself silently stopped recording
+    // once `stale` was full, so a ninth overlapping mapping was neither unmapped
+    // nor reported and the RESOURCE_MAP_BLOB below created the overlapping host
+    // window subregion this pass exists to prevent. Both are now hard failures:
+    // refusing the aperture map / paging op is strictly better than two host
+    // resources sharing one window subregion (k-gputransport-04).
     let n = adapter
         .with_virtio(|v| v.blobs_overlapping(window_offset, map_len, resource_id, &mut stale))
-        .unwrap_or(0);
+        .map_err(|_| VirtioError::DeviceError)?
+        .map_err(|_truncated| VirtioError::DeviceError)?;
     for &res in stale[..n].iter() {
         let _ = resource_unmap_blob(adapter, res);
         let _ = adapter.with_virtio(|v| v.blob_note_unmapped(res));

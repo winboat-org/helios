@@ -207,6 +207,19 @@ pub static WINDOW_ALLOC_REJECTS: AtomicU32 = AtomicU32::new(0);
 /// `map_io_pages_to_user` failures (MDL alloc / MmMapLockedPagesSpecifyCache
 /// raise caught by the SEH shim). Bumped by the escape handler at PASSIVE.
 pub static MAP_PAGES_FAILS: AtomicU32 = AtomicU32::new(0);
+/// Stale-overlap scans that found more overlapping window placements than the
+/// caller's fixed buffer could hold. Nonzero means an eviction pass ran against
+/// an incomplete list and the map that followed it was REFUSED rather than
+/// allowed to create an overlapping host window subregion.
+pub static WINDOW_OVERLAP_TRUNCATED: AtomicU32 = AtomicU32::new(0);
+
+/// The stale-overlap scan could not report every overlapping placement.
+///
+/// A distinct type rather than a `usize` the caller may ignore: acting on a
+/// truncated list is what creates two host resources through one window
+/// subregion.
+#[derive(Clone, Copy, Debug)]
+pub struct WindowOverlapTruncated;
 
 /// Raise `hw` to at least `n` (relaxed; approximate under concurrency is fine
 /// for telemetry).
@@ -2447,13 +2460,23 @@ impl VirtioGpu {
     /// never double-books segment ranges, so before mapping a new blob into
     /// the range the caller must RESOURCE_UNMAP_BLOB each returned id and
     /// clear it via [`Self::blob_note_unmapped`]. Bounded scan under the lock.
+    ///
+    /// Returns `Err(WindowOverlapTruncated)` if a further overlap is found once
+    /// `out` is full. The scan used to stop RECORDING at that point and return
+    /// the truncated count, which the caller read as the complete set: a ninth
+    /// overlapping mapping was neither unmapped nor reported, and the
+    /// RESOURCE_MAP_BLOB that followed created exactly the overlapping host
+    /// window subregion the eviction pass exists to prevent — two host resources
+    /// through one window subregion, against the blob-window-offset invariant
+    /// (k-gputransport-04). The buffer deliberately stays fixed-size: this scan
+    /// runs under the device spinlock, where allocation is forbidden.
     pub fn blobs_overlapping(
         &self,
         offset: u64,
         len: u64,
         keep_resource_id: u32,
         out: &mut [u32],
-    ) -> usize {
+    ) -> Result<usize, WindowOverlapTruncated> {
         let end = offset.saturating_add(len);
         let mut n = 0;
         for s in self.blobs.iter() {
@@ -2463,13 +2486,15 @@ impl VirtioGpu {
                 && s.map_offset < end
                 && s.map_offset.saturating_add(s.map_len) > offset
             {
-                if n < out.len() {
-                    out[n] = s.resource_id;
-                    n += 1;
+                if n == out.len() {
+                    WINDOW_OVERLAP_TRUNCATED.fetch_add(1, Ordering::Relaxed);
+                    return Err(WindowOverlapTruncated);
                 }
+                out[n] = s.resource_id;
+                n += 1;
             }
         }
-        n
+        Ok(n)
     }
 
     /// The blob currently mapped exactly at window `offset`, if any. Used by
