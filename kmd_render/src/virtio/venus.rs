@@ -321,6 +321,13 @@ pub struct OptimalPresentImageDesc {
     height: u32,
     ddi_bind_flags: u32,
     dxgi_format: u32,
+    /// The parsed form of `dxgi_format`, stored at construction rather than
+    /// re-derived on every read. `new` already had to prove the format was
+    /// convertible; spending that proof on an `is_some` test and then
+    /// re-deriving it behind a panicking accessor made a `KeBugCheck` reachable
+    /// from any struct literal added inside this module (the fields are private
+    /// only *outside* `venus.rs`).
+    pixel_format: PresentPixelFormat,
     transport: OptimalImageTransport,
 }
 
@@ -335,12 +342,8 @@ impl OptimalPresentImageDesc {
         dxgi_format: u32,
         transport: OptimalImageTransport,
     ) -> Option<Self> {
-        (resource_id != 0
-            && allocation_size != 0
-            && width != 0
-            && height != 0
-            && PresentPixelFormat::from_dxgi(dxgi_format).is_some())
-        .then_some(Self {
+        let pixel_format = PresentPixelFormat::from_dxgi(dxgi_format)?;
+        (resource_id != 0 && allocation_size != 0 && width != 0 && height != 0).then_some(Self {
             resource_id,
             allocation_size,
             memory_type_index,
@@ -348,13 +351,13 @@ impl OptimalPresentImageDesc {
             height,
             ddi_bind_flags,
             dxgi_format,
+            pixel_format,
             transport,
         })
     }
 
     fn pixel_format(self) -> PresentPixelFormat {
-        PresentPixelFormat::from_dxgi(self.dxgi_format)
-            .expect("validated OptimalPresentImageDesc format")
+        self.pixel_format
     }
 
     /// Ordinary UMD-created shared images use the renderer's OPAQUE_FD
@@ -422,6 +425,9 @@ pub struct PresentBufferDesc {
     height: u32,
     pitch: u32,
     dxgi_format: u32,
+    /// Parsed once in `new`, which already binds it to size the row. See
+    /// [`OptimalPresentImageDesc::pixel_format`] for why this is a field.
+    pixel_format: PresentPixelFormat,
 }
 
 impl PresentBufferDesc {
@@ -458,11 +464,12 @@ impl PresentBufferDesc {
                 height,
                 pitch,
                 dxgi_format,
+                pixel_format,
             })
     }
 
     fn pixel_format(self) -> PresentPixelFormat {
-        PresentPixelFormat::from_dxgi(self.dxgi_format).expect("validated PresentBufferDesc format")
+        self.pixel_format
     }
 }
 
