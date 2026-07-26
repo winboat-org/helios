@@ -84,6 +84,12 @@ pub unsafe extern "C" fn dxgkddi_create_device(
 /// context of the thread destroying the device (the ICD's process), so the unmap is
 /// in-process. The mapping table is on the AdapterContext (independent spinlock), so
 /// teardown is correct even if the virtio transport is already gone.
+/// Mappings harvested per spinlock acquisition in DestroyDevice.
+///
+/// 64 pairs = 1 KiB of stack, which is affordable on the PASSIVE DestroyDevice
+/// frame and turns an 8192-mapping teardown from 8192 acquisitions into 128.
+const MAPPING_DRAIN_BATCH: usize = 64;
+
 pub unsafe extern "C" fn dxgkddi_destroy_device(h_device: *mut c_void) -> NTSTATUS {
     if !h_device.is_null() {
         // SAFETY: h_device came from Box::into_raw in create_device; its `adapter`
@@ -91,12 +97,22 @@ pub unsafe extern "C" fn dxgkddi_destroy_device(h_device: *mut c_void) -> NTSTAT
         let dev = unsafe { &*(h_device as *mut DeviceContext) };
         let adapter = unsafe { &*dev.adapter };
         let owner = h_device as usize;
-        // Drain THIS device's mappings one at a time, unmapping outside the table
-        // lock (MmUnmapLockedPages needs PASSIVE; the table lock raises to DISPATCH).
-        while let Some((user_va, mdl)) = adapter.mappings.take_one_for(owner) {
-            // SAFETY: PASSIVE_LEVEL in the creating process; pair from a prior
-            // MAP_BLOB on this device handle.
-            unsafe { crate::ddi::unmap_io_pages_from_user(user_va, mdl as *mut wdk_sys::MDL) };
+        // Drain THIS device's mappings in batches, unmapping outside the table
+        // lock (MmUnmapLockedPages needs PASSIVE; the table lock raises to
+        // DISPATCH). One acquisition per entry was O(n) acquisitions and O(n^2)
+        // comparisons, and MAX_MAPPINGS is 8192 because a DOOM level load really
+        // does hold thousands.
+        let mut batch = [(0u64, 0usize); MAPPING_DRAIN_BATCH];
+        loop {
+            let n = adapter.mappings.drain_for(owner, &mut batch);
+            if n == 0 {
+                break;
+            }
+            for &(user_va, mdl) in &batch[..n] {
+                // SAFETY: PASSIVE_LEVEL in the creating process; pair from a
+                // prior MAP_BLOB on this device handle.
+                unsafe { crate::ddi::unmap_io_pages_from_user(user_va, mdl as *mut wdk_sys::MDL) };
+            }
         }
         // Reclaim any virtio blobs / contexts this device allocated but did not
         // release (ICD crash, or a process that skipped RELEASE_BLOB/CTX_DESTROY —

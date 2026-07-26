@@ -17,7 +17,7 @@
 //! Each entry is **tagged with the owning `WDFFILEOBJECT`** (as an opaque `usize`).
 //! `EvtFileCleanup` runs per-file-object — one fires for *each* closed handle, not
 //! only the last — and a user mapping is valid only in the process that created it,
-//! so cleanup must unmap exactly that file object's mappings ([`take_one_for`]),
+//! so cleanup must unmap exactly that file object's mappings ([`MappingTable::drain_for`]),
 //! never another open handle's (which would unmap a foreign process's VA → 0x76 /
 //! corruption).
 //!
@@ -187,22 +187,43 @@ impl MappingTable {
         n
     }
 
-    /// Pop one live mapping OWNED BY `owner` for teardown, returning `(user_va, mdl)`.
-    /// `EvtFileCleanup` loops until this returns `None`, unmapping each entry at
-    /// PASSIVE_LEVEL *outside* the lock (`MmUnmapLockedPages` requires PASSIVE; the
-    /// lock raises to DISPATCH). Popping one at a time avoids a large on-stack
-    /// collection of all entries; `swap_remove` is O(1) and never reallocates, so it
-    /// stays spinlock-safe. Entries owned by OTHER open handles are left untouched.
-    pub fn take_one_for(&self, owner: usize) -> Option<(u64, usize)> {
+    /// Pop up to `out.len()` of `owner`'s mappings per acquisition, returning how
+    /// many were written.
+    ///
+    /// The one-at-a-time `take_one_for` this replaces took and released the
+    /// spinlock once per entry, so
+    /// draining a process holding N mappings costs N acquisitions and O(N^2)
+    /// comparisons — and MAX_MAPPINGS is 8192 because a DOOM level load really
+    /// does hold thousands. The caller still unmaps OUTSIDE the lock, which is
+    /// mandatory (`MmUnmapLockedPages` is PASSIVE-only, the lock raises to
+    /// DISPATCH); batching only changes how many entries one acquisition
+    /// harvests.
+    ///
+    /// `out` is a caller-provided stack array so nothing allocates here, and it
+    /// is deliberately small — a large on-stack collection of ALL entries is
+    /// what the one-at-a-time version was avoiding, and that reason still holds.
+    pub fn drain_for(&self, owner: usize, out: &mut [(u64, usize)]) -> usize {
+        if out.is_empty() {
+            return 0;
+        }
         let irql = unsafe { KeAcquireSpinLockRaiseToDpc(self.lock.get()) };
         // SAFETY: spinlock-guarded exclusive access to the entries.
         let entries = unsafe { &mut *self.entries.get() };
-        let popped = entries.iter().position(|m| m.owner == owner).map(|i| {
-            let m = entries.swap_remove(i);
-            (m.user_va, m.mdl)
-        });
+        let mut n = 0;
+        let mut i = 0;
+        while i < entries.len() && n < out.len() {
+            if entries[i].owner == owner {
+                // swap_remove moves the last element into slot i, so do NOT
+                // advance — it has not been tested yet.
+                let m = entries.swap_remove(i);
+                out[n] = (m.user_va, m.mdl);
+                n += 1;
+            } else {
+                i += 1;
+            }
+        }
         unsafe { KeReleaseSpinLock(self.lock.get(), irql) };
-        popped
+        n
     }
 
     /// Pop the mapping for `resource_id` owned by `owner`, if one exists. Used by
