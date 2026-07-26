@@ -251,6 +251,11 @@ pub unsafe extern "C" fn dxgkddi_start_device(
         }
     }
 
+    // Defensive: a StopDevice on this same context should already have done
+    // this, but a start that inherits a latched gate or a stale resource id from
+    // a previous transport generation is unrecoverable, so pay for it twice.
+    adapter.reset_display_publication_state();
+
     if adapter.display_half {
         // Adopt the host's scanout-0 size (GET_DISPLAY_INFO, captured at transport
         // init) as the VidPn mode + generated-EDID native resolution, so Helios
@@ -353,6 +358,12 @@ pub unsafe extern "C" fn dxgkddi_stop_device(miniport_device_context: *mut c_voi
         // the (about-to-be-torn-down) context.
         adapter.cancel_vsync();
         adapter.stop_hpd();
+        // AFTER stop_hpd, so the worker can no longer re-publish into the state
+        // we are about to clear. Every scanout identity below belongs to the
+        // transport generation being torn down; carrying it into the next
+        // StartDevice is how a latched gate kills CRTC_VSYNC and how a recycled
+        // resource id gets bound as the cached scan-out target.
+        adapter.reset_display_publication_state();
 
         // Tear down the venus client + page-table blob + context BEFORE dropping
         // the transport (the unref/detach/destroy commands need the live device).

@@ -529,6 +529,76 @@ impl AdapterContext {
     }
 
     /// Start the HPD worker thread (StartDevice, display half). PASSIVE_LEVEL.
+    /// Drop every piece of display publication state that is only meaningful
+    /// for the transport generation that produced it. PASSIVE_LEVEL.
+    ///
+    /// StopDevice tears the transport down but the `AdapterContext` itself
+    /// survives (it is freed only in RemoveDevice), so without this the whole
+    /// publication state machine carries into the next StartDevice. Two ways
+    /// that wedges the display:
+    ///
+    /// 1. A gate raised at DIRQL immediately before the stop is never cleared,
+    ///    because `stop_hpd` makes the worker exit before it runs its deferred
+    ///    continuation. The next StartDevice arms the timer and every
+    ///    `vsync_dpc_routine` tick early-returns on the inherited gate, so
+    ///    `VsCnt` never advances again.
+    /// 2. Every surviving resource id is meaningless in the new generation,
+    ///    whose ids restart at 1 and whose liveness test is bare membership. A
+    ///    recycled id can then be accepted as the cached LINEAR scan-out target
+    ///    and the desktop copied into an unrelated blob, while the copy is
+    ///    submitted against a Venus image from a destroyed context.
+    ///
+    /// Note `pnputil /restart-device` does NOT reproduce either sequence: it
+    /// re-runs AddDevice, which allocates a fresh zeroed context. The carry-over
+    /// path is a PnP stop/start on the same context.
+    ///
+    /// This is a hand-written list and its failure mode is a future field nobody
+    /// adds to it. The durable encoding is the transport-owned
+    /// `Option<ScanoutBinding>` (T3), after which dropping the transport
+    /// structurally drops every identity derived from it and this collapses to
+    /// one slot store. Keep it in ONE function so T3 has a single site to replace.
+    pub fn reset_display_publication_state(&self) {
+        use core::sync::atomic::Ordering;
+
+        // Capture before zeroing: a nonzero pre-reset gate is the evidence that
+        // sequence 1 above was live, and the pre-reset resource id identifies
+        // the generation being abandoned.
+        let was_programming = self.vidpn_programming.load(Ordering::Acquire);
+        let was_resource = self.active_scanout_resource.load(Ordering::Acquire);
+
+        self.vidpn_programming.store(0, Ordering::Release);
+        self.pending_vidpn_allocation.store(0, Ordering::Release);
+        self.active_scanout_resource.store(0, Ordering::Release);
+        self.active_scanout_wh.store(0, Ordering::Release);
+        self.active_scanout_layout.store(0, Ordering::Release);
+        self.active_scanout_format.store(0, Ordering::Release);
+        self.host_bound_scanout_resource.store(0, Ordering::Release);
+        self.last_primary_address.store(0, Ordering::Release);
+        self.dedicated_scanout_resource.store(0, Ordering::Release);
+        self.dedicated_scanout_image.store(0, Ordering::Release);
+        self.dedicated_scanout_memory.store(0, Ordering::Release);
+        self.primary_scanout_resource.store(0, Ordering::Release);
+        self.primary_scanout_wh.store(0, Ordering::Release);
+        self.primary_scanout_layout.store(0, Ordering::Release);
+        self.primary_scanout_alloc_size.store(0, Ordering::Release);
+        self.primary_scanout_memory_type.store(0, Ordering::Release);
+        self.primary_scanout_dxgi_format.store(0, Ordering::Release);
+        self.diag_scanout_resource.store(0, Ordering::Release);
+        self.diag_scanout_wh.store(0, Ordering::Release);
+        self.diag_scanout_layout.store(0, Ordering::Release);
+        self.scanout_refresh_pending.store(0, Ordering::Release);
+        self.scanout_flush_inflight.store(0, Ordering::Release);
+        self.scanout_bind_inflight.store(0, Ordering::Release);
+        // Consumers that cache a primary identity compare generations, so bump
+        // it rather than zeroing it: a wrapped-to-equal generation would let a
+        // stale cache look current.
+        self.primary_scanout_generation
+            .fetch_add(1, Ordering::AcqRel);
+
+        crate::diag::record_named_bytes(b"StRst", was_programming);
+        crate::diag::record_named_bytes(b"StRstR", was_resource);
+    }
+
     /// Idempotent-ish: does nothing if a thread handle is already stored.
     ///
     /// # Safety
