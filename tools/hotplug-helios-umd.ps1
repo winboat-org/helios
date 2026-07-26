@@ -112,8 +112,22 @@ if ($Mode -eq "PackageUpgrade") {
     if (Test-Path -LiteralPath $storeDll -PathType Leaf) {
       & takeown.exe /F $storeDll | Out-Null
       & icacls.exe $storeDll /grant "Administrators:F" | Out-Null
-      Copy-Item -LiteralPath $UmdDll -Destination $storeDll -Force
-      Write-Host "Synced DriverStore UMD: $storeDll"
+      # The package copy is routinely MAPPED by long-lived shell processes
+      # (observed 2026-07-27: ShellHost, SystemSettings, CrossDeviceResume), so
+      # the plain Copy-Item this replaces hit a sharing violation and every
+      # deploy of a session silently left the cold-boot copy stale — measured
+      # that day: store SHA 56473A67 against a current F0C7A2E6, last written
+      # eight hours and six deploys earlier. -DisplaceInUse renames the loaded
+      # image aside so the new one lands at the real path.
+      #
+      # Verified by hash like every other copy in this script, and it THROWS on
+      # failure instead of printing a red blob while the deploy reports success:
+      # a stale package copy is exactly the cold-boot hazard the comment above
+      # describes, so it must not be possible to miss it.
+      $storeCopy = Copy-HeliosFileVerified $UmdDll $storeDll 5 750 -DisplaceInUse
+      Write-Host "Synced DriverStore UMD: $($storeCopy.Destination)"
+      $reaped = Remove-HeliosDisplacedCopies $storeDll
+      if ($reaped -gt 0) { Write-Host "Reaped $reaped displaced DriverStore UMD copy(ies)." }
     } else {
       Write-Warning "DriverStore UMD not found at $storeDll - cold boots may load a stale UMD"
     }

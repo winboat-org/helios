@@ -85,7 +85,31 @@ function Get-HeliosFileUsers([string]$Path) {
   return $users
 }
 
-function Copy-HeliosFileVerified([string]$Source, [string]$Destination, [int]$Retries = 3, [int]$RetryDelayMs = 500) {
+function Remove-HeliosDisplacedCopies([string]$Destination) {
+  # Reap `<name>.inuse-<stamp>` files left by -DisplaceInUse once their holders
+  # have exited. Best effort: a file still mapped by a live process is skipped
+  # and picked up by a later deploy.
+  #
+  # Get-HeliosFileUsers is an OPTIMISTIC filter here, not an authority:
+  # ProcessModule.FileName reports the path as resolved at LOAD time and does
+  # not follow a rename, so a holder of the displaced image still reports the
+  # original name. The real backstop is Remove-Item itself — Windows refuses to
+  # delete a mapped image — which is why the removal is verified with Test-Path
+  # rather than assumed. Observed 2026-07-27: the first displaced copy survived
+  # its own deploy's reap for exactly this reason, which is the correct outcome.
+  $dir = Split-Path -Parent $Destination
+  if (-not (Test-Path -LiteralPath $dir -PathType Container)) { return 0 }
+  $leaf = [IO.Path]::GetFileName($Destination)
+  $removed = 0
+  foreach ($f in @(Get-ChildItem -LiteralPath $dir -Filter "$leaf.inuse-*" -ErrorAction SilentlyContinue)) {
+    if (@(Get-HeliosFileUsers $f.FullName).Count -gt 0) { continue }
+    Remove-Item -LiteralPath $f.FullName -Force -ErrorAction SilentlyContinue
+    if (-not (Test-Path -LiteralPath $f.FullName)) { $removed++ }
+  }
+  return $removed
+}
+
+function Copy-HeliosFileVerified([string]$Source, [string]$Destination, [int]$Retries = 3, [int]$RetryDelayMs = 500, [switch]$DisplaceInUse) {
   if (-not (Test-Path -LiteralPath $Source -PathType Leaf)) { throw "Missing source file $Source" }
   $destDir = Split-Path -Parent $Destination
   New-Item -ItemType Directory -Force -Path $destDir | Out-Null
@@ -116,6 +140,30 @@ function Copy-HeliosFileVerified([string]$Source, [string]$Destination, [int]$Re
       $lastError = $_
       if (-not (Test-Path -LiteralPath $tmp)) {
         Copy-Item -LiteralPath $Source -Destination $tmp -Force
+      }
+      if ($DisplaceInUse -and (Test-Path -LiteralPath $Destination -PathType Leaf)) {
+        # A LOADED image is held by the loader with no write sharing, so this is
+        # a SHARING violation, not an ACL one — takeown/icacls cannot clear it,
+        # and the holders may be processes we must not kill (on the DriverStore
+        # path they are shell infrastructure: ShellHost, SystemSettings,
+        # CrossDeviceResume, observed 2026-07-27).
+        #
+        # Windows does allow RENAMING an open file: the holders' handles follow
+        # the rename and keep running the old image, while the fresh file lands
+        # at the original path for every later load. That is what makes this
+        # safe without a reboot — and a reboot-scheduled replace is NOT an
+        # option here anyway, because Clear-HeliosPendingRenames deliberately
+        # strips any pending helios_umd rename at the start of every deploy.
+        $displaced = "{0}.inuse-{1}" -f $Destination, (Get-Date -Format "yyyyMMdd-HHmmss-fff")
+        try {
+          Grant-HeliosWritable $Destination
+          Move-Item -LiteralPath $Destination -Destination $displaced -Force -ErrorAction Stop
+          Write-Host "Displaced in-use $([IO.Path]::GetFileName($Destination)) -> $([IO.Path]::GetFileName($displaced))"
+        } catch {
+          # Fall through to the normal backoff/retry below; if the rename is
+          # refused too, the loop exhausts and the caller gets the loud throw
+          # naming the holders.
+        }
       }
       Start-Sleep -Milliseconds $RetryDelayMs
     }
