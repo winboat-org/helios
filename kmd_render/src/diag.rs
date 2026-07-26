@@ -164,6 +164,11 @@ pub enum FaultCounter {
     /// timed out instead). The adapter context is deliberately leaked rather
     /// than freed under a live worker.
     StHpdX,
+    /// The virtio device did not clear its status within the reset handshake's
+    /// spin bound — value is the spin count. Not reachable on the supported host
+    /// (QEMU services the status write synchronously inside `virtio_reset()`),
+    /// but every later assumption in `init` rests on that reset.
+    StVioR,
 }
 
 impl FaultCounter {
@@ -185,6 +190,7 @@ impl FaultCounter {
             FaultCounter::CpTgtE => b"CpTgtE",
             FaultCounter::StRing => b"StRing",
             FaultCounter::StHpdX => b"StHpdX",
+            FaultCounter::StVioR => b"StVioR",
         }
     }
 
@@ -204,6 +210,7 @@ impl FaultCounter {
         FaultCounter::CpTgtE,
         FaultCounter::StRing,
         FaultCounter::StHpdX,
+        FaultCounter::StVioR,
     ];
 }
 

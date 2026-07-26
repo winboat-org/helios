@@ -910,6 +910,16 @@ impl VirtioGpu {
         let mut spins = 0u32;
         while !transport.get_status().is_empty() && spins < 100_000 {
             spins += 1;
+            core::hint::spin_loop();
+        }
+        // The bound was previously indistinguishable from success: the loop fell
+        // through to ACKNOWLEDGE either way, so a device that never cleared its
+        // status was driven through the whole init as if it had reset. Every
+        // later assumption in this function rests on that reset. The sibling
+        // GET_DISPLAY_INFO poll below already returns Err on its own bound.
+        if !transport.get_status().is_empty() {
+            crate::diag::fault(crate::diag::FaultCounter::StVioR, spins);
+            return Err(VirtioError::DeviceError);
         }
         transport.set_status(DeviceStatus::ACKNOWLEDGE);
         transport.set_status(DeviceStatus::ACKNOWLEDGE | DeviceStatus::DRIVER);
