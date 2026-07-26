@@ -490,6 +490,17 @@ Open defects, roughly ordered:
    GdiAccelMode /f` + restart-device). NEXT: owner-attended Doom stutter
    differential (its WSI BitBlt storm no longer traverses the executor), then
    retire the gdi_blit executor + flip the compiled default.
+   **CLOSED 2026-07-26 (T1b, 22.22.180.0)** — owner directive: the driver does
+   not and should not advertise GDI acceleration, so both the advertisement and
+   the executor are gone (R903/x-dup-dead-20, pulled forward from T6).
+   Reachability was re-proven the same boot before deleting anything: every
+   `Gd*` service value deleted, then explorer restart + maximized notepad + GDI
+   canary + repaint + EnumWindows + two paintcaps, and **not one `Gd*` value
+   reappeared** (the executor flushes its block on its first batch, so absence
+   is proof, not throttling). `SupportKernelModeCommandBuffer` is now hard-coded
+   0; `DxgkDdiRenderGdi`/`RenderKm` stay registered as record-and-advance
+   (a null slot bugchecks — `DdiRenderGdi+0x140`). This also deletes T1b's
+   R301/R304/R305/R306, which only hardened the deleted executor.
 
 ## Workstream 2 — Performance
 
@@ -1561,12 +1572,11 @@ Plan:
 ## Tooling (keep alive; this stage depends on it)
 
 - **Registry knobs** (service key, active KMD reads): `DiagLevel`,
-  `GdiAccelMode`, `AllocCached`, `DisplayHalf`, `ScanoutDiag`,
+  `AllocCached`, `DisplayHalf`, `ScanoutDiag`,
   `DirectFlipCaps`, `CrossAdaptCaps`, `BarSegMode`, `BarSegFlags`,
   `BarSegBaseMB`.
   `DisplayHalf=1` enables the render+display adapter shape. `AllocCached=0`
-  is the CpuVisible cached-allocation kill switch. `GdiAccelMode=0` disables
-  the GDI HW-accel advertisement. `DirectFlipCaps` and `CrossAdaptCaps` are
+  is the CpuVisible cached-allocation kill switch. `DirectFlipCaps` and `CrossAdaptCaps` are
   explicit cap-advertisement probes; leave off unless bisecting. `BarSegMode`
   controls segment topology; `BarSegFlags`/`BarSegBaseMB` bisect BAR descriptor
   flags/base. `DiagLevel` enables the generic S-ring registry breadcrumbs.
@@ -1584,7 +1594,15 @@ Plan:
   `PSc*` = Present/HWQ diagnostic-only scanout candidate, `Sdg*` = diagnostic
   scanout allocator/bind path, `Rf*` = periodic active-scanout refresh. Values
   persist across boots; trust movement plus same-boot QEMU traces.
-- **Counters** (service key): Gd* (RenderGdi executor), Ch* (CpuHostAperture),
+- **RETIRED 22.22.180.0** (R903/x-dup-dead-20 — do not look for these; they are
+  gone from the driver, and any value still in the service key is a stale
+  leftover): the `GdiAccelMode` knob and the whole `Gd*` counter family —
+  `GdiM`, `GdiE`, `GdiS`, `GdFa`, `GdFg`, `GdFs`, `GdFb`, `GdFm`, `GdFi`,
+  `GdFr`, `GdTc`, `GdDs`, `GdCn`, `GdCr`, `GdCc`, `GdCg`, `GdBn`, `GdBr`,
+  `GdBg`, `GdXn`, `GdXz`, `GdXr`. The KMD no longer advertises
+  `SupportKernelModeCommandBuffer` in any configuration and no longer contains a
+  GDI raster executor; GDI renders through win32k's CPU redirection path.
+- **Counters** (service key): Ch* (CpuHostAperture),
   Pg* (paging engine; `PgEv` nonzero means unresolved virtual paging transfer),
   AE* (8-slot allocation create/open ring: resid, dimensions, ctx/open marker)
   — all failure counters must stay 0; S-ring breadcrumbs persist across boots

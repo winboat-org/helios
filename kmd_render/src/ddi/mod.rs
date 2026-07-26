@@ -8,7 +8,6 @@ mod cpu_host_aperture;
 mod create_allocation;
 mod display;
 mod escape;
-mod gdi_blit;
 mod gpummu;
 pub(crate) mod hpd;
 pub(crate) mod interrupt;

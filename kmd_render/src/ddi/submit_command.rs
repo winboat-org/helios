@@ -8,7 +8,6 @@ use core::mem::size_of;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::adapter::{AdapterContext, WddmNotifyGuard};
-use crate::ddi::gdi_blit;
 use crate::ddi::present_packet::PresentSubmissionPrivate;
 use crate::dxgk::_DXGK_INTERRUPT_TYPE::DXGK_INTERRUPT_DMA_COMPLETED;
 use crate::dxgk::*;
@@ -861,17 +860,20 @@ pub unsafe extern "C" fn dxgkddi_render_km(
 /// `ADAPTER_RENDER::DdiRenderGdi` actually invokes (through a CFG-guarded indirect
 /// call). Leaving the `DxgkDdiRenderGdi` field null (we previously registered only
 /// Render + RenderKm) made that call land on a null pointer and bugcheck
-/// (kernel `0xC0000005`, `DdiRenderGdi+0x140`, observed live). dxgkrnl drives it
-/// once we declare `CrossAdapterResource` together with the (mandatory-for-load)
-/// `SupportKernelModeCommandBuffer` cap: GDI rendering to the cross-adapter
-/// composition surface arrives here as `DXGK_RENDERKM_COMMAND` ops in `pCommand`.
+/// (kernel `0xC0000005`, `DdiRenderGdi+0x140`, observed live), which is why this
+/// entry point stays registered and answers SUCCESS even though the driver no
+/// longer opts into GDI hardware acceleration at all: as of 22.22.180.0
+/// `DXGK_PRESENTATIONCAPS::SupportKernelModeCommandBuffer` is hard-coded 0
+/// (`query_adapter_info`), so dxgkrnl routes GDI through win32k's CPU redirection
+/// path and never drives this DDI. The KMD CPU raster executor that used to run
+/// here (`gdi_blit.rs`) was deleted with it.
 ///
-/// Decorative-GpuMmu model (host GPU owns real rendering by resource id): record the
-/// opaque command bytes into the DMA buffer (so `DxgkDdiSubmitCommand` has a
-/// non-empty buffer to retire), advance the DMA write pointer, single pass, no
-/// GPU-VA patches → return SUCCESS. Same shape as `dxgkddi_render_km`.
+/// Body (identical in shape to `dxgkddi_render_km`, which is why T7 dedups them):
+/// record the opaque command bytes into the DMA buffer so `DxgkDdiSubmitCommand`
+/// has a non-empty buffer to retire, advance the DMA write pointer, single pass,
+/// no GPU-VA patches → SUCCESS.
 pub unsafe extern "C" fn dxgkddi_render_gdi(
-    h_context: IN_CONST_HANDLE,
+    _h_context: IN_CONST_HANDLE,
     render_gdi: INOUT_PDXGKARG_RENDERGDI,
 ) -> NTSTATUS {
     RENDER_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -882,25 +884,9 @@ pub unsafe extern "C" fn dxgkddi_render_gdi(
     if args.pDmaBuffer.is_null() {
         return STATUS_INVALID_PARAMETER;
     }
-
-    // Execute the raster ops on the CPU against the surfaces' host-visible venus
-    // blob memory (see `gdi_blit`) — the null engine will retire the recorded DMA
-    // below without running anything, so this is where the pixels actually land.
-    if !h_context.is_null() {
-        // SAFETY: h_context is the ContextContext we returned from CreateContext;
-        // its device/adapter back-pointers are valid for the context's lifetime.
-        // DxgkDdiRenderGdi runs at PASSIVE_LEVEL per its DDI annotation.
-        let ctx = unsafe { &*(h_context as *const crate::device::ContextContext) };
-        if !ctx.device.is_null() {
-            let dev = unsafe { &*ctx.device };
-            if !dev.adapter.is_null() {
-                let adapter = unsafe { &*dev.adapter };
-                unsafe { gdi_blit::execute(adapter, args) };
-            }
-        }
-    }
     let cmd_len = args.CommandLength as usize;
     let dma_cap = args.DmaSize as usize;
+    // Ask the runtime to grow the DMA buffer rather than truncating the stream.
     if cmd_len > dma_cap {
         return STATUS_BUFFER_TOO_SMALL;
     }

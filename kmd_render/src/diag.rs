@@ -30,8 +30,8 @@ use wdk_sys::ntddk::RtlWriteRegistryValue;
 /// bring-up archaeology, and its steady-state writers (QueryAdapterInfo
 /// polling, paging/allocation paths) each cost a synchronous kernel registry
 /// write. Level >= 1 restores full breadcrumb tracing. Named counters
-/// (`record_named*`) are NOT gated here — their callers decide (see
-/// `gdi_blit`'s deferred flush); failure counters must stay loud.
+/// (`record_named*`) are NOT gated here — each caller decides its own flush
+/// cadence; failure counters must stay loud.
 static DIAG_LEVEL: AtomicU32 = AtomicU32::new(u32::MAX);
 
 /// Read (once) and cache the `DiagLevel` knob. PASSIVE_LEVEL only — every
