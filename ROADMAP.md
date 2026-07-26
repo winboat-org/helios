@@ -105,25 +105,45 @@ virtio-gpu scanout; IddCx/Looking Glass is no longer the active display path.*
    ⚠ **`VsCnt`/`SaCnt` are mirrored to the registry only from `queue_active_scanout_refresh`'s
    pacing block (`n==1 || n%16==0`)** — on an idle desktop they stop being written and a short
    sample reads delta 0. Provoke presentation before trusting them.
-4. Implement the remaining reviewed refactors atomically, in tranche order, one recommendation
+4. **NEXT — T1b** (`REFACTOR_REVIEW.md` §T1b): 30 items, R301–R320 + ten minor items, one KMD
+   image and one reboot. Two halves, and the ordering between them is load-bearing: **every bug
+   commit precedes every telemetry commit**, so the before/after cadence numbers are taken against
+   a functionally known-good driver rather than one being fixed at the same time.
+   (a) Trust-boundary and status-contract fixes, 13 of them `BUG` — RenderGdi runs the raster
+   executor *before* its DMA-capacity check so a `STATUS_BUFFER_TOO_SMALL` retry re-applies
+   non-idempotent ROPs (R301); BuildPagingBuffer reports SUCCESS after a failed page-in or eviction
+   copy (R302); a registry flush sits on a DISPATCH-reachable path (R307); escape `owner == 0`
+   still means "KMD-owned" and CTX_DESTROY/SUBMIT_VENUS are not owner-scoped (R311 = 2 ordered
+   sub-commits, R312 = 3 — the first of each sizes the population before the strict check lands);
+   the primary scanout descriptor is published and read without a seqlock (R313).
+   (b) Telemetry cost — **R316 removes 77 unconditional `rec_named` registry writes from
+   `dxgkddi_present_inner`** (30–60 synchronous `RtlWriteRegistryValue` calls per Present), with the
+   same ungated dump pattern per aperture map and per paging content op (R317). A plausible
+   contributor to the DComp defect above, which is why the gate measures present-to-scanout and VNC
+   delivery separately, before and after.
+   Constraints: **no counter, breadcrumb or registry-value renames** — R316/R317 change write
+   *cadence* only; and R316's third throttled channel must not reclassify anything T1a made a
+   `FaultCounter` (those stay ungated and unthrottled). Several items are pure functions that
+   belong in T0's `kmd_logic/` crate, which is where their unit tests go.
+5. Implement the remaining reviewed refactors atomically, in tranche order, one recommendation
    per commit; never fold a `BUG` fix into a structure move. Preserve the current direct
    primary, completion ordering, loud-failure contracts, registry ABI, and
    diagnostic names unless a reviewed change explicitly migrates them. Replace
    arbitrary `Sleep`/poll loops with event, interrupt, fence, or
    condition-variable contracts; do not remove bounded safety timeouts merely
    because they wait.
-5. Regression-test each tranche and the final driver against visible desktop
+6. Regression-test each tranche and the final driver against visible desktop
    output, idle wake, rapid cursor motion, DComp cadence, DWM stability,
    same-boot KMD breadcrumbs, and host scanout evidence. Keep
    `ScanoutDiag` absent during primary tests.
-6. Continue soaking the current direct-primary path across DWM buffer rotation,
+7. Continue soaking the current direct-primary path across DWM buffer rotation,
    resize, suspend/resume, device restart, and cold boot.
-7. Pursue true host zero-copy only with a layout contract the display importer
+8. Pursue true host zero-copy only with a layout contract the display importer
    can consume. An explicit DRM modifier is one possible route, but enabling the
    modifier/DMA_BUF extensions on every DXVK device is prohibited: it inflated
    ordinary shared OPTIMAL import requirements and caused valid undersized-import
    refusal, DWM failures, and NVIDIA Xid 31 when bypassed.
-8. Continue D3D11 stability and conformance work after the quality pass.
+9. Continue D3D11 stability and conformance work after the quality pass.
 
 ## Historical PSC workstreams
 
