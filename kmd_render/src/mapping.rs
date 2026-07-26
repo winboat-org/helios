@@ -54,6 +54,21 @@ pub static MAPPINGS_HIGH_WATER: AtomicU32 = AtomicU32::new(0);
 /// `MAX_MAPPINGS` for QUERY_STATS reporting.
 pub const MAX_MAPPINGS_CAP: u32 = MAX_MAPPINGS as u32;
 
+/// Outcome of [`MappingTable::insert_unique`].
+///
+/// `Duplicate` and `Full` are both "the caller must unmap the view it just
+/// created", but they are different failures and the caller reports them
+/// differently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InsertResult {
+    Inserted,
+    /// `(owner, resource_id)` already had a live mapping. Authoritative: this
+    /// answer was produced under the same lock acquisition as the push.
+    Duplicate,
+    /// The table is at [`MAX_MAPPINGS`].
+    Full,
+}
+
 /// One recorded user-space blob mapping.
 #[derive(Clone, Copy)]
 struct Mapping {
@@ -108,16 +123,42 @@ impl MappingTable {
         found
     }
 
-    /// Record a freshly-created mapping owned by `owner` (the request's
-    /// `WDFFILEOBJECT`). Returns `false` (without allocating) if the table is at
-    /// capacity — the caller then unmaps the just-created mapping. The `push` stays
-    /// within the reserved capacity, so it makes no allocator call and is safe under
-    /// the spinlock.
-    pub fn insert(&self, owner: usize, resource_id: u32, user_va: u64, mdl: usize) -> bool {
+    /// Record a freshly-created mapping owned by `owner`, refusing a duplicate
+    /// under the SAME lock acquisition that inserts.
+    ///
+    /// The duplicate-map guard used to be check-then-act: `contains` (lock 1),
+    /// then `map_blob_prepare` + MDL + user map, then `insert` (lock 2).
+    /// `DxgkDdiEscape` is not serialised by dxgkrnl, so two threads on one
+    /// device handle could both pass `contains` and both `insert`. The
+    /// consequence is NOT a moved window offset — `map_blob_prepare` is
+    /// idempotent and `blob_map_begin` never re-places a mapped blob, so both
+    /// threads get the same offset — it is a DUPLICATE REGISTRATION: two MDLs
+    /// and two user VAs over one blob, two entries with the same
+    /// `(owner, resource_id)`. A later `RELEASE_BLOB` then pops one via
+    /// `take_for_resource` while `release_blob_for_owner` tears down the host
+    /// window mapping, leaving the second user VA live over a window offset that
+    /// is no longer backed — silent content loss until `DestroyDevice` reclaims
+    /// it.
+    ///
+    /// The scan and the push are one critical section now, so the commit-time
+    /// answer is authoritative. The `push` stays within the reserved capacity,
+    /// so it makes no allocator call and is safe under the spinlock.
+    pub fn insert_unique(
+        &self,
+        owner: usize,
+        resource_id: u32,
+        user_va: u64,
+        mdl: usize,
+    ) -> InsertResult {
         let irql = unsafe { KeAcquireSpinLockRaiseToDpc(self.lock.get()) };
         // SAFETY: spinlock-guarded exclusive access to the entries.
         let entries = unsafe { &mut *self.entries.get() };
-        let ok = if entries.len() < MAX_MAPPINGS {
+        let result = if entries
+            .iter()
+            .any(|m| m.owner == owner && m.resource_id == resource_id)
+        {
+            InsertResult::Duplicate
+        } else if entries.len() < MAX_MAPPINGS {
             entries.push(Mapping {
                 owner,
                 resource_id,
@@ -128,13 +169,13 @@ impl MappingTable {
             if MAPPINGS_HIGH_WATER.load(Ordering::Relaxed) < n {
                 MAPPINGS_HIGH_WATER.store(n, Ordering::Relaxed);
             }
-            true
+            InsertResult::Inserted
         } else {
             MAPPING_FULL_REJECTS.fetch_add(1, Ordering::Relaxed);
-            false
+            InsertResult::Full
         };
         unsafe { KeReleaseSpinLock(self.lock.get(), irql) };
-        ok
+        result
     }
 
     /// Current live-mapping count (QUERY_STATS v2).

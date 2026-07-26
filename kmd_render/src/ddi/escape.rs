@@ -750,8 +750,10 @@ fn escape_map_blob(
     if req.resource_id == 0 {
         return STATUS_INVALID_PARAMETER;
     }
-    // Reject a second map of an already-mapped resource (would claim a second
-    // window offset + leave a duplicate host mapping). The ICD maps each blob once.
+    // Cheap pre-check: reject a second map of an already-mapped resource before
+    // paying for the host round-trip. NOT authoritative — DxgkDdiEscape is not
+    // serialised by dxgkrnl, so two threads on one device handle can both pass
+    // here. `insert_unique` below is the answer that counts.
     if adapter.mappings.contains(owner.raw(), req.resource_id) {
         return STATUS_INVALID_DEVICE_REQUEST;
     }
@@ -782,14 +784,34 @@ fn escape_map_blob(
         }
     };
 
-    // Phase 3 — record for handle-close teardown. Table full → undo immediately.
-    if !adapter
+    // Phase 3 — record for handle-close teardown, refusing a duplicate under the
+    // same lock acquisition that inserts. Either failure undoes the view we just
+    // created, exactly as the table-full path always did.
+    match adapter
         .mappings
-        .insert(owner.raw(), req.resource_id, user_va, mdl as usize)
+        .insert_unique(owner.raw(), req.resource_id, user_va, mdl as usize)
     {
-        // SAFETY: still in the owning process at PASSIVE; pair returned just above.
-        unsafe { unmap_io_pages_from_user(user_va, mdl) };
-        return STATUS_INSUFFICIENT_RESOURCES;
+        crate::mapping::InsertResult::Inserted => {}
+        crate::mapping::InsertResult::Duplicate => {
+            // A concurrent MAP_BLOB for the same (owner, resource) won the race.
+            // Both threads got the SAME window offset (map_blob_prepare is
+            // idempotent and blob_map_begin never re-places a mapped blob), so
+            // this view is redundant, not wrong — unmap it and refuse with the
+            // same status the cheap pre-check uses.
+            //
+            // MapDup must stay 0: a nonzero value means a legitimate ICD really
+            // does map a blob twice concurrently, and that path is doing a
+            // wasted map/unmap plus a host round-trip.
+            crate::diag::record_named_bytes(b"MapDup", req.resource_id);
+            // SAFETY: still in the owning process at PASSIVE; pair returned just above.
+            unsafe { unmap_io_pages_from_user(user_va, mdl) };
+            return STATUS_INVALID_DEVICE_REQUEST;
+        }
+        crate::mapping::InsertResult::Full => {
+            // SAFETY: still in the owning process at PASSIVE; pair returned just above.
+            unsafe { unmap_io_pages_from_user(user_va, mdl) };
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
     }
 
     let mut out = req;
