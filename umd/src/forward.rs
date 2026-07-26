@@ -434,6 +434,7 @@ unsafe fn helios_device<'a>(h: Hdevice) -> Option<&'a HeliosDevice> {
 
 const E_FAIL: i32 = 0x8000_4005u32 as i32;
 const E_INVALIDARG: i32 = 0x8007_0057u32 as i32;
+const E_OUTOFMEMORY: i32 = 0x8007_000Eu32 as i32;
 const DXGI_ERROR_UNSUPPORTED: i32 = 0x887a_0004u32 as i32;
 
 /// Report an error to the D3D11 runtime for a VOID-returning DDI via the
@@ -2144,6 +2145,13 @@ unsafe extern "C" fn create_resource(
                         "DDI create_resource(tex2d): SCAN-OUT PRIMARY CREATE FAILED {}x{} fmt={} bind=0x{:x} -> no primary (optimal/dmabuf rejected?)",
                         mip0.TexelWidth, mip0.TexelHeight, a.Format, bind
                     ));
+                    // The loudness has to reach the runtime, not stop at the log
+                    // file: this DDI returns void, so pfnSetErrorCb is the only
+                    // way CreateTexture2D fails instead of handing the caller
+                    // S_OK with a null driver resource. E_OUTOFMEMORY is in
+                    // CreateTexture2D's documented return set; the bridge
+                    // returns 0 with no HRESULT to map through.
+                    set_runtime_error(h, E_OUTOFMEMORY);
                 }
                 handled = true;
             }
