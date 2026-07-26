@@ -411,6 +411,10 @@ pub struct AdapterContext {
     hpd_thread: AtomicUsize,
     /// Tells the HPD worker to terminate (StopDevice / teardown).
     pub hpd_stop: AtomicU32,
+    /// Set when `stop_hpd` could NOT prove the worker exited (the thread-object
+    /// reference failed, or the bounded join timed out). RemoveDevice must then
+    /// leak this context rather than free memory a live worker still touches.
+    pub hpd_worker_leaked: AtomicU32,
     /// Set by the ISR when the virtio config-change bit (ISR status bit 1) fires;
     /// the DPC signals `hpd_event`, then the PASSIVE worker consumes this bit and
     /// re-indicates connection.
@@ -524,6 +528,7 @@ impl AdapterContext {
             hpd_event: UnsafeCell::new(unsafe { core::mem::zeroed() }),
             hpd_thread: AtomicUsize::new(0),
             hpd_stop: AtomicU32::new(0),
+            hpd_worker_leaked: AtomicU32::new(0),
             config_change_pending: AtomicU32::new(0),
         })
     }
@@ -683,15 +688,51 @@ impl AdapterContext {
                 core::ptr::null_mut(),
             )
         };
+        // The join is the ONLY thing keeping RemoveDevice from freeing a context
+        // the worker still dereferences. Two ways it used to fail silently:
+        //
+        // 1. If ObReferenceObjectByHandle failed, the wait was skipped entirely,
+        //    the handle was closed, and stop_hpd returned () - success-shaped.
+        //    StopDevice then dropped the transport and RemoveDevice freed the
+        //    box while the worker was still touching adapter.hpd_event and the
+        //    scanout fields. A use-after-free with no breadcrumb.
+        // 2. The wait passed a NULL Timeout - the only unbounded wait in this
+        //    file - while the worker can be parked in a synchronous host
+        //    round-trip (set_scanout_blob) or under the venus mutex. A wedged
+        //    host hung PnP stop forever, again with no counter.
+        //
+        // Both now mean "a worker may still be running", which is recorded and
+        // latched so the free path can consult it.
+        let mut joined = false;
         if st == STATUS_SUCCESS && !obj.is_null() {
+            // 5 s, relative (negative = relative to now, in 100 ns units). Long
+            // enough for the worst observed set_scanout_blob round-trip, short
+            // enough that PnP stop does not hang indefinitely.
+            let mut timeout: wdk_sys::LARGE_INTEGER = unsafe { core::mem::zeroed() };
+            timeout.QuadPart = -50_000_000;
             // SAFETY: waiting on the ETHREAD dispatcher object at PASSIVE_LEVEL.
-            unsafe {
-                let _ = KeWaitForSingleObject(obj, 0, 0, 0, core::ptr::null_mut());
-                wdk_sys::ntddk::ObfDereferenceObject(obj);
-            }
+            let wait = unsafe { KeWaitForSingleObject(obj, 0, 0, 0, &mut timeout) };
+            // SAFETY: releasing the reference taken above.
+            unsafe { wdk_sys::ntddk::ObfDereferenceObject(obj) };
+            joined = wait == STATUS_SUCCESS;
+        }
+        if !joined {
+            // Trading a hang (or a UAF) for a permanent allocation leak plus a
+            // live worker. That is the correct trade for a kernel driver, but it
+            // must be counted: on a healthy host StHpdX never moves.
+            self.hpd_worker_leaked.store(1, Ordering::Release);
+            crate::diag::fault(crate::diag::FaultCounter::StHpdX, st as u32);
         }
         // SAFETY: closing the thread handle we created.
         let _ = unsafe { wdk_sys::ntddk::ZwClose(h as wdk_sys::HANDLE) };
+    }
+
+    /// True if [`Self::stop_hpd`] could not prove the worker exited, so this
+    /// context must never be freed. Consulted by `dxgkddi_remove_device`.
+    pub fn hpd_worker_may_be_running(&self) -> bool {
+        self.hpd_worker_leaked
+            .load(core::sync::atomic::Ordering::Acquire)
+            != 0
     }
 
     /// The display half's scanout-0 mode `(width, height)`: the host-reported size

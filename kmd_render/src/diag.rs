@@ -159,6 +159,11 @@ pub enum FaultCounter {
     /// `DRAIN_BAD_TOKEN`. Reported from `ResetFromTimeout`, on change only, so a
     /// TDR storm cannot become a registry write storm.
     StRing,
+    /// `stop_hpd` could not prove the HPD worker exited — value is the
+    /// `ObReferenceObjectByHandle` status (STATUS_SUCCESS means the bounded join
+    /// timed out instead). The adapter context is deliberately leaked rather
+    /// than freed under a live worker.
+    StHpdX,
 }
 
 impl FaultCounter {
@@ -179,6 +184,7 @@ impl FaultCounter {
             FaultCounter::StIsr => b"StIsr",
             FaultCounter::CpTgtE => b"CpTgtE",
             FaultCounter::StRing => b"StRing",
+            FaultCounter::StHpdX => b"StHpdX",
         }
     }
 
@@ -197,6 +203,7 @@ impl FaultCounter {
         FaultCounter::StIsr,
         FaultCounter::CpTgtE,
         FaultCounter::StRing,
+        FaultCounter::StHpdX,
     ];
 }
 

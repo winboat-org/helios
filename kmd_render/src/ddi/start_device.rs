@@ -440,8 +440,18 @@ pub unsafe extern "C" fn dxgkddi_remove_device(miniport_device_context: *mut c_v
     crate::kmsg(c"Helios: RemoveDevice\n");
     crate::diag::record(0x0C00_0001);
     if !miniport_device_context.is_null() {
-        // SAFETY: this pointer came from Box::into_raw in AddDevice; freed once.
-        drop(unsafe { Box::from_raw(miniport_device_context as *mut AdapterContext) });
+        // SAFETY: our adapter context; only read here.
+        let adapter = unsafe { &*(miniport_device_context as *const AdapterContext) };
+        if adapter.hpd_worker_may_be_running() {
+            // stop_hpd could not prove the worker exited, and the worker
+            // dereferences this context. Leak it deliberately: a permanent
+            // allocation leak is strictly better than freeing memory a live
+            // PASSIVE thread is still touching. StHpdX already recorded why.
+            crate::diag::record(0x0C00_00E1);
+        } else {
+            // SAFETY: this pointer came from Box::into_raw in AddDevice; freed once.
+            drop(unsafe { Box::from_raw(miniport_device_context as *mut AdapterContext) });
+        }
     }
     crate::diag::record(0x0C00_0002);
     STATUS_SUCCESS
