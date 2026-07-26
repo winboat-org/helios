@@ -419,6 +419,48 @@ namespace {
     }
   }
 
+  // cxx emits EVERY generated C++ shim `noexcept` (verified verbatim in the
+  // checked-in generated artifact, bridge.rs.cc), so an exception escaping a
+  // bridge method is std::terminate — dwm.exe dies instead of the DDI returning
+  // a failure. Most methods in this file are already wrapped in a three-arm
+  // catch triple; seven were not, and every one of them reaches code that
+  // allocates (find_helios_icd_export -> discover_vulkan_icd_manifests builds a
+  // std::vector<std::string>, runs ifstream/ostringstream over the manifest and
+  // concatenates strings; present_flip_wait_setup additionally takes a
+  // lock_guard, make_shared and constructs a std::thread). Defect class: a
+  // recoverable resource failure escalated to unconditional death of the
+  // compositor.
+  //
+  // Making this the only path that can return the sentinel collapses "error
+  // sentinel" and "escaped exception" into one code path. The compiler cannot
+  // prove a body is exception-free, so that is the honest limit of the
+  // guarantee.
+  //
+  // The catch arms must not allocate: a std::string built inside a
+  // std::bad_alloc handler can throw again. Fixed char[] + snprintf only —
+  // which is also why DxvkError::message() (returns std::string) is not called
+  // here.
+  template <typename R, typename Fn>
+  R bridge_guard(const char* what, R on_error, Fn&& fn) noexcept {
+    try {
+      return fn();
+    } catch (const dxvk::DxvkError&) {
+      char msg[160];
+      std::snprintf(msg, sizeof(msg), "%s: DxvkError", what);
+      umd_log(msg);
+    } catch (const std::exception& e) {
+      char msg[256];
+      std::snprintf(msg, sizeof(msg), "%s: exception: %s", what, e.what());
+      umd_log(msg);
+    } catch (...) {
+      char msg[160];
+      std::snprintf(msg, sizeof(msg), "%s: unknown exception", what);
+      umd_log(msg);
+    }
+    return on_error;
+  }
+
+
   const char* shader_bytecode_dump_path() {
     static std::string path = [] {
       char value[MAX_PATH] = {};
@@ -1055,23 +1097,25 @@ std::uint32_t HeliosDxvkDevice::venus_context_id() const {
 bool HeliosDxvkDevice::set_resource_kmt_handles(
     std::size_t d3d11_resource_ptr,
     std::uint32_t local,
-    std::uint32_t global) const {
-  if (!d3d11_resource_ptr || !local)
-    return false;
+    std::uint32_t global) const noexcept {
+  return bridge_guard("set_resource_kmt_handles", false, [&]() -> bool {
+    if (!d3d11_resource_ptr || !local)
+      return false;
 
-  auto* resource = reinterpret_cast<ID3D11Resource*>(d3d11_resource_ptr);
-  auto* texture = dxvk::GetCommonTexture(resource);
-  if (!texture || !texture->GetImage() || !texture->GetImage()->storage())
-    return false;
+    auto* resource = reinterpret_cast<ID3D11Resource*>(d3d11_resource_ptr);
+    auto* texture = dxvk::GetCommonTexture(resource);
+    if (!texture || !texture->GetImage() || !texture->GetImage()->storage())
+      return false;
 
-  texture->GetImage()->storage()->setKmtHandles(local, global);
+    texture->GetImage()->storage()->setKmtHandles(local, global);
 
-  char msg[160];
-  std::snprintf(msg, sizeof(msg),
-    "set_resource_kmt_handles resource=%p local=0x%08x global=0x%08x",
-    resource, local, global);
-  umd_log(msg);
-  return true;
+    char msg[160];
+    std::snprintf(msg, sizeof(msg),
+      "set_resource_kmt_handles resource=%p local=0x%08x global=0x%08x",
+      resource, local, global);
+    umd_log(msg);
+    return true;
+  });
 }
 
 bool HeliosDxvkDevice::get_resource_memory_info(
@@ -1079,92 +1123,98 @@ bool HeliosDxvkDevice::get_resource_memory_info(
     std::uint64_t* memory,
     std::uint64_t* size,
     std::uint64_t* offset,
-    std::uint32_t* resource_id) const {
-  if (memory)
-    *memory = 0;
-  if (size)
-    *size = 0;
-  if (offset)
-    *offset = 0;
-  if (resource_id)
-    *resource_id = 0;
+    std::uint32_t* resource_id) const noexcept {
+  return bridge_guard("get_resource_memory_info", false, [&]() -> bool {
+    if (memory)
+      *memory = 0;
+    if (size)
+      *size = 0;
+    if (offset)
+      *offset = 0;
+    if (resource_id)
+      *resource_id = 0;
 
-  if (!d3d11_resource_ptr)
-    return false;
+    if (!d3d11_resource_ptr)
+      return false;
 
-  auto* resource = reinterpret_cast<ID3D11Resource*>(d3d11_resource_ptr);
-  auto* texture = dxvk::GetCommonTexture(resource);
-  if (!texture || !texture->GetImage() || !texture->GetImage()->storage())
-    return false;
+    auto* resource = reinterpret_cast<ID3D11Resource*>(d3d11_resource_ptr);
+    auto* texture = dxvk::GetCommonTexture(resource);
+    if (!texture || !texture->GetImage() || !texture->GetImage()->storage())
+      return false;
 
-  auto info = texture->GetImage()->storage()->getMemoryInfo();
-  const auto rawMemory = reinterpret_cast<std::uintptr_t>(info.memory);
-  const auto venusId = venus_memory_id_from_handle(info.memory);
-  const auto resourceId = venus_memory_resource_id_from_handle(info.memory);
-  if (memory)
-    *memory = venusId;
-  if (size)
-    *size = info.size;
-  if (offset)
-    *offset = info.offset;
-  if (resource_id)
-    *resource_id = resourceId;
+    auto info = texture->GetImage()->storage()->getMemoryInfo();
+    const auto rawMemory = reinterpret_cast<std::uintptr_t>(info.memory);
+    const auto venusId = venus_memory_id_from_handle(info.memory);
+    const auto resourceId = venus_memory_resource_id_from_handle(info.memory);
+    if (memory)
+      *memory = venusId;
+    if (size)
+      *size = info.size;
+    if (offset)
+      *offset = info.offset;
+    if (resource_id)
+      *resource_id = resourceId;
 
-  char msg[256];
-  std::snprintf(msg, sizeof(msg),
-    "get_resource_memory_info resource=%p memory_raw=0x%llx venus_id=0x%llx res_id=%u size=%llu offset=%llu",
-    resource,
-    static_cast<unsigned long long>(rawMemory),
-    static_cast<unsigned long long>(venusId),
-    resourceId,
-    static_cast<unsigned long long>(info.size),
-    static_cast<unsigned long long>(info.offset));
-  umd_log(msg);
-  return venusId != 0 && info.size != 0;
+    char msg[256];
+    std::snprintf(msg, sizeof(msg),
+      "get_resource_memory_info resource=%p memory_raw=0x%llx venus_id=0x%llx res_id=%u size=%llu offset=%llu",
+      resource,
+      static_cast<unsigned long long>(rawMemory),
+      static_cast<unsigned long long>(venusId),
+      resourceId,
+      static_cast<unsigned long long>(info.size),
+      static_cast<unsigned long long>(info.offset));
+    umd_log(msg);
+    return venusId != 0 && info.size != 0;
+  });
 }
 
 bool HeliosDxvkDevice::get_resource_alloc_identity(
     std::size_t d3d11_resource_ptr,
     std::uint64_t* venus_alloc_size,
-    std::uint32_t* memory_type_index) const {
-  if (venus_alloc_size)
-    *venus_alloc_size = 0;
-  if (memory_type_index)
-    *memory_type_index = 0;
+    std::uint32_t* memory_type_index) const noexcept {
+  return bridge_guard("get_resource_alloc_identity", false, [&]() -> bool {
+    if (venus_alloc_size)
+      *venus_alloc_size = 0;
+    if (memory_type_index)
+      *memory_type_index = 0;
 
-  if (!d3d11_resource_ptr)
-    return false;
+    if (!d3d11_resource_ptr)
+      return false;
 
-  auto* resource = reinterpret_cast<ID3D11Resource*>(d3d11_resource_ptr);
-  auto* texture = dxvk::GetCommonTexture(resource);
-  if (!texture || !texture->GetImage() || !texture->GetImage()->storage())
-    return false;
+    auto* resource = reinterpret_cast<ID3D11Resource*>(d3d11_resource_ptr);
+    auto* texture = dxvk::GetCommonTexture(resource);
+    if (!texture || !texture->GetImage() || !texture->GetImage()->storage())
+      return false;
 
-  auto info = texture->GetImage()->storage()->getMemoryInfo();
-  return venus_memory_alloc_info_from_handle(info.memory, venus_alloc_size, memory_type_index);
+    auto info = texture->GetImage()->storage()->getMemoryInfo();
+    return venus_memory_alloc_info_from_handle(info.memory, venus_alloc_size, memory_type_index);
+  });
 }
 
 bool HeliosDxvkDevice::transfer_resource_ownership(
-    std::size_t d3d11_resource_ptr) const {
-  if (!d3d11_resource_ptr)
-    return false;
+    std::size_t d3d11_resource_ptr) const noexcept {
+  return bridge_guard("transfer_resource_ownership", false, [&]() -> bool {
+    if (!d3d11_resource_ptr)
+      return false;
 
-  auto* resource = reinterpret_cast<ID3D11Resource*>(d3d11_resource_ptr);
-  auto* texture = dxvk::GetCommonTexture(resource);
-  if (!texture || !texture->GetImage() || !texture->GetImage()->storage())
-    return false;
+    auto* resource = reinterpret_cast<ID3D11Resource*>(d3d11_resource_ptr);
+    auto* texture = dxvk::GetCommonTexture(resource);
+    if (!texture || !texture->GetImage() || !texture->GetImage()->storage())
+      return false;
 
-  auto info = texture->GetImage()->storage()->getMemoryInfo();
-  const auto resourceId = venus_memory_transfer_resource_ownership(info.memory);
+    auto info = texture->GetImage()->storage()->getMemoryInfo();
+    const auto resourceId = venus_memory_transfer_resource_ownership(info.memory);
 
-  char msg[192];
-  std::snprintf(msg, sizeof(msg),
-    "transfer_resource_ownership resource=%p memory=0x%llx res_id=%u",
-    resource,
-    static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(info.memory)),
-    resourceId);
-  umd_log(msg);
-  return resourceId != 0;
+    char msg[192];
+    std::snprintf(msg, sizeof(msg),
+      "transfer_resource_ownership resource=%p memory=0x%llx res_id=%u",
+      resource,
+      static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(info.memory)),
+      resourceId);
+    umd_log(msg);
+    return resourceId != 0;
+  });
 }
 
 std::size_t HeliosDxvkDevice::open_ddi_texture2d(
@@ -1262,52 +1312,54 @@ std::size_t HeliosDxvkDevice::open_kmd_scanout_target(
     std::uint32_t* out_width,
     std::uint32_t* out_height,
     std::uint32_t* out_pitch,
-    std::uint32_t* out_generation) const {
-  if (out_resource_id) *out_resource_id = 0;
-  if (out_width)       *out_width = 0;
-  if (out_height)      *out_height = 0;
-  if (out_pitch)       *out_pitch = 0;
-  if (out_generation)  *out_generation = 0;
-  if (!impl || !impl->instance || !impl->d3d11)
-    return 0;
+    std::uint32_t* out_generation) const noexcept {
+  return bridge_guard("open_kmd_scanout_target", std::size_t(0), [&]() -> std::size_t {
+    if (out_resource_id) *out_resource_id = 0;
+    if (out_width)       *out_width = 0;
+    if (out_height)      *out_height = 0;
+    if (out_pitch)       *out_pitch = 0;
+    if (out_generation)  *out_generation = 0;
+    if (!impl || !impl->instance || !impl->d3d11)
+      return 0;
 
-  using Fn = bool (__cdecl*)(VkInstance, HeliosVenusScanoutInfo*);
-  auto query = find_helios_icd_export<Fn>("helios_venus_query_scanout");
-  if (!query) {
-    umd_log("helios_venus_query_scanout export unavailable");
-    return 0;
-  }
+    using Fn = bool (__cdecl*)(VkInstance, HeliosVenusScanoutInfo*);
+    auto query = find_helios_icd_export<Fn>("helios_venus_query_scanout");
+    if (!query) {
+      umd_log("helios_venus_query_scanout export unavailable");
+      return 0;
+    }
 
-  HeliosVenusScanoutInfo info = { };
-  if (!query(impl->instance->handle(), &info) || !info.resourceId ||
-      !info.allocSize || !info.width || !info.height || !info.pitch)
-    return 0;
+    HeliosVenusScanoutInfo info = { };
+    if (!query(impl->instance->handle(), &info) || !info.resourceId ||
+        !info.allocSize || !info.width || !info.height || !info.pitch)
+      return 0;
 
-  // The KMD image uses VkFormat B8G8R8A8_UNORM while scanout advertises XR24.
-  // Rebuild the D3D transfer alias as BGRA so CopyResource from DWM's BGRA
-  // composition target is format-compatible; alpha is ignored by XR24 scanout.
-  constexpr std::uint32_t DXGI_FORMAT_B8G8R8A8_UNORM_VALUE = 87u;
-  const auto resource = open_ddi_texture2d(
-    info.width, info.height, DXGI_FORMAT_B8G8R8A8_UNORM_VALUE,
-    0u, 0u, info.resourceId, info.resourceId, info.allocSize,
-    info.memoryTypeIndex, false, true, false);
-  if (!resource)
-    return 0;
+    // The KMD image uses VkFormat B8G8R8A8_UNORM while scanout advertises XR24.
+    // Rebuild the D3D transfer alias as BGRA so CopyResource from DWM's BGRA
+    // composition target is format-compatible; alpha is ignored by XR24 scanout.
+    constexpr std::uint32_t DXGI_FORMAT_B8G8R8A8_UNORM_VALUE = 87u;
+    const auto resource = open_ddi_texture2d(
+      info.width, info.height, DXGI_FORMAT_B8G8R8A8_UNORM_VALUE,
+      0u, 0u, info.resourceId, info.resourceId, info.allocSize,
+      info.memoryTypeIndex, false, true, false);
+    if (!resource)
+      return 0;
 
-  if (out_resource_id) *out_resource_id = info.resourceId;
-  if (out_width)       *out_width = info.width;
-  if (out_height)      *out_height = info.height;
-  if (out_pitch)       *out_pitch = info.pitch;
-  if (out_generation)  *out_generation = info.generation;
+    if (out_resource_id) *out_resource_id = info.resourceId;
+    if (out_width)       *out_width = info.width;
+    if (out_height)      *out_height = info.height;
+    if (out_pitch)       *out_pitch = info.pitch;
+    if (out_generation)  *out_generation = info.generation;
 
-  char msg[224];
-  std::snprintf(msg, sizeof(msg),
-    "open_kmd_scanout_target res=%u %ux%u pitch=%u off=%u alloc=%llu mti=%u gen=%u resource=%p",
-    info.resourceId, info.width, info.height, info.pitch, info.planeOffset,
-    static_cast<unsigned long long>(info.allocSize), info.memoryTypeIndex,
-    info.generation, reinterpret_cast<void*>(resource));
-  umd_log(msg);
-  return resource;
+    char msg[224];
+    std::snprintf(msg, sizeof(msg),
+      "open_kmd_scanout_target res=%u %ux%u pitch=%u off=%u alloc=%llu mti=%u gen=%u resource=%p",
+      info.resourceId, info.width, info.height, info.pitch, info.planeOffset,
+      static_cast<unsigned long long>(info.allocSize), info.memoryTypeIndex,
+      info.generation, reinterpret_cast<void*>(resource));
+    umd_log(msg);
+    return resource;
+  });
 }
 
 std::size_t HeliosDxvkDevice::create_ddi_scanout_texture2d(
@@ -2002,71 +2054,75 @@ std::uint64_t HeliosDxvkDevice::present_sync_publish(
   return 0;
 }
 
-std::uint32_t HeliosDxvkDevice::present_sync_fence_id() const {
-  if (!impl)
-    return 0;
-  std::lock_guard<std::mutex> lock(impl->presentSyncMutex);
-  return impl->presentSyncDisabled ? 0 : impl->presentFenceId;
+std::uint32_t HeliosDxvkDevice::present_sync_fence_id() const noexcept {
+  return bridge_guard("present_sync_fence_id", std::uint32_t(0), [&]() -> std::uint32_t {
+    if (!impl)
+      return 0;
+    std::lock_guard<std::mutex> lock(impl->presentSyncMutex);
+    return impl->presentSyncDisabled ? 0 : impl->presentFenceId;
+  });
 }
 
 bool HeliosDxvkDevice::present_flip_wait_setup(
     std::size_t signal_cb,
     std::size_t h_rt_device,
     std::uint32_t h_fence,
-    std::size_t fence_cpu_va) const {
-  if (!impl || !signal_cb || !h_fence || !fence_cpu_va)
-    return false;
-  {
-    std::lock_guard<std::mutex> lock(impl->presentSyncMutex);
-    if (impl->presentSyncDisabled)
-      return false; // no producer fence will ever signal — CPU gate serves
-  }
-  if (impl->flipWait)
-    return true;
+    std::size_t fence_cpu_va) const noexcept {
+  return bridge_guard("present_flip_wait_setup", false, [&]() -> bool {
+    if (!impl || !signal_cb || !h_fence || !fence_cpu_va)
+      return false;
+    {
+      std::lock_guard<std::mutex> lock(impl->presentSyncMutex);
+      if (impl->presentSyncDisabled)
+        return false; // no producer fence will ever signal — CPU gate serves
+    }
+    if (impl->flipWait)
+      return true;
 
-  auto ctx = std::make_shared<HeliosFlipWaitCtx>();
-  ctx->signal  = reinterpret_cast<HeliosSignalSyncFromCpuCb>(signal_cb);
-  ctx->hDevice = reinterpret_cast<void*>(h_rt_device);
-  ctx->hFence  = h_fence;
-  ctx->cpuVa   = reinterpret_cast<const volatile std::uint64_t*>(fence_cpu_va);
-  impl->flipWait = ctx;
+    auto ctx = std::make_shared<HeliosFlipWaitCtx>();
+    ctx->signal  = reinterpret_cast<HeliosSignalSyncFromCpuCb>(signal_cb);
+    ctx->hDevice = reinterpret_cast<void*>(h_rt_device);
+    ctx->hFence  = h_fence;
+    ctx->cpuVa   = reinterpret_cast<const volatile std::uint64_t*>(fence_cpu_va);
+    impl->flipWait = ctx;
 
-  // Wedge watchdog: queued GPU waits park the present CONTEXT, not a thread,
-  // so a poisoned copy chain (present fence never reaching its target) would
-  // otherwise wedge every later present forever — strictly worse than the
-  // CPU gate's bounded-timeout stale frame. Unwedge by signaling the flip
-  // fence forward after ~1 s without progress; loud and counted.
-  impl->flipWaitWatchdog = std::thread([ctx] {
-    std::uint64_t lastSeen = 0;
-    std::uint32_t stalledTicks = 0;
-    while (!ctx->stop.load(std::memory_order_relaxed)) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(250));
-      const std::uint64_t queued =
-        ctx->queuedValue.load(std::memory_order_relaxed);
-      const std::uint64_t current = *ctx->cpuVa;
-      if (queued > current && current == lastSeen) {
-        if (++stalledTicks >= 4) {
-          const std::uint32_t n =
-            ctx->unwedges.fetch_add(1, std::memory_order_relaxed) + 1;
-          char msg[160];
-          std::snprintf(msg, sizeof(msg),
-            "flip-kwait WEDGE: fence stalled at %llu with %llu queued — "
-            "signaling forward (x%u)",
-            static_cast<unsigned long long>(current),
-            static_cast<unsigned long long>(queued), n);
-          umd_log(msg);
-          ctx->signalTo(queued);
+    // Wedge watchdog: queued GPU waits park the present CONTEXT, not a thread,
+    // so a poisoned copy chain (present fence never reaching its target) would
+    // otherwise wedge every later present forever — strictly worse than the
+    // CPU gate's bounded-timeout stale frame. Unwedge by signaling the flip
+    // fence forward after ~1 s without progress; loud and counted.
+    impl->flipWaitWatchdog = std::thread([ctx] {
+      std::uint64_t lastSeen = 0;
+      std::uint32_t stalledTicks = 0;
+      while (!ctx->stop.load(std::memory_order_relaxed)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        const std::uint64_t queued =
+          ctx->queuedValue.load(std::memory_order_relaxed);
+        const std::uint64_t current = *ctx->cpuVa;
+        if (queued > current && current == lastSeen) {
+          if (++stalledTicks >= 4) {
+            const std::uint32_t n =
+              ctx->unwedges.fetch_add(1, std::memory_order_relaxed) + 1;
+            char msg[160];
+            std::snprintf(msg, sizeof(msg),
+              "flip-kwait WEDGE: fence stalled at %llu with %llu queued — "
+              "signaling forward (x%u)",
+              static_cast<unsigned long long>(current),
+              static_cast<unsigned long long>(queued), n);
+            umd_log(msg);
+            ctx->signalTo(queued);
+            stalledTicks = 0;
+          }
+        } else {
           stalledTicks = 0;
         }
-      } else {
-        stalledTicks = 0;
+        lastSeen = current;
       }
-      lastSeen = current;
-    }
-  });
+    });
 
-  umd_log("flip-kwait: kernel flip-wait READY (runtime-device fence armed)");
-  return true;
+    umd_log("flip-kwait: kernel flip-wait READY (runtime-device fence armed)");
+    return true;
+  });
 }
 
 bool HeliosDxvkDevice::present_flip_wait_arm(

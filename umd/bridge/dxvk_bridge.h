@@ -30,21 +30,21 @@ struct HeliosDxvkDevice {
   bool set_resource_kmt_handles(
       std::size_t d3d11_resource_ptr,
       std::uint32_t local,
-      std::uint32_t global) const;
+      std::uint32_t global) const noexcept;
   bool get_resource_memory_info(
       std::size_t d3d11_resource_ptr,
       std::uint64_t* memory,
       std::uint64_t* size,
       std::uint64_t* offset,
-      std::uint32_t* resource_id) const;
+      std::uint32_t* resource_id) const noexcept;
   // C1 identity: the creating vkAllocateMemory's exact allocationSize and
   // memoryTypeIndex for the resource's backing venus memory (recorded into
   // the WDDM allocation trailer so cross-process openers import with them).
   bool get_resource_alloc_identity(
       std::size_t d3d11_resource_ptr,
       std::uint64_t* venus_alloc_size,
-      std::uint32_t* memory_type_index) const;
-  bool transfer_resource_ownership(std::size_t d3d11_resource_ptr) const;
+      std::uint32_t* memory_type_index) const noexcept;
+  bool transfer_resource_ownership(std::size_t d3d11_resource_ptr) const noexcept;
   std::size_t open_ddi_texture2d(
       std::uint32_t width,
       std::uint32_t height,
@@ -67,7 +67,7 @@ struct HeliosDxvkDevice {
       std::uint32_t* out_width,
       std::uint32_t* out_height,
       std::uint32_t* out_pitch,
-      std::uint32_t* out_generation) const;
+      std::uint32_t* out_generation) const noexcept;
 
   // Create the DWM scan-out primary as a dedicated OPTIMAL,
   // DMA_BUF-exportable image (via the D3D11_HELIOS_CREATE_INFO marker) and
@@ -153,7 +153,7 @@ struct HeliosDxvkDevice {
   // present_sync_publish created it (or when the path is disabled). The
   // dcomp-vehicle recycle gate pairs it with publish's returned value so
   // the ICD can import the fence by name and gate image reuse at acquire.
-  std::uint32_t present_sync_fence_id() const;
+  std::uint32_t present_sync_fence_id() const noexcept;
 
   // Kernel flip-wait plumbing (25th session): the UMD created a monitored
   // fence on the RUNTIME's kernel device (the only device scope the present
@@ -169,7 +169,7 @@ struct HeliosDxvkDevice {
       std::size_t signal_cb,
       std::size_t h_rt_device,
       std::uint32_t h_fence,
-      std::size_t fence_cpu_va) const;
+      std::size_t fence_cpu_va) const noexcept;
   bool present_flip_wait_arm(
       std::uint64_t target_value,
       std::uint64_t flip_value) const;
