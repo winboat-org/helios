@@ -358,21 +358,55 @@ const MDL_HAS_SYSTEM_VA: i16 = 0x0001 | 0x0004;
 /// `KernelMode` (`KPROCESSOR_MODE`).
 const KERNEL_MODE: i8 = 0;
 
-/// Kernel VA of a paging op's system-memory MDL (VidMm passes locked MDLs).
-/// Reuses an existing system mapping if the MDL has one; otherwise maps
+/// A paging op's system-memory MDL mapping, carrying the length the raw pointer
+/// does not.
+///
+/// The blob side of every copy has always been bounds-checked; the MDL side was
+/// not. `mdl_off` and `TransferSize` are VidMm-supplied and were applied raw,
+/// with a comment ("validated post-boot via PgTs/PgTd") standing in for the
+/// check — on the eviction arm that is a kernel-memory WRITE past the mapped
+/// buffer. `_MDL.ByteCount` is exactly the length of the described buffer and is
+/// one field read away, so the bound is now carried by construction
+/// (k-paging-03).
+#[derive(Clone, Copy)]
+struct MdlWindow {
+    va: core::ptr::NonNull<u8>,
+    len: u64,
+}
+
+impl MdlWindow {
+    /// Pointer to `bytes` mapped bytes at `offset`, or `None` (counted by the
+    /// caller as PgEb) if any part of that range leaves the mapping.
+    fn slice_at(&self, offset: u64, bytes: u64) -> Option<*mut u8> {
+        let offset = helios_kmd_logic::window_range(self.len, offset, bytes)?;
+        // SAFETY: offset + bytes <= len was just proven, so the result stays
+        // inside the buffer `va` describes.
+        Some(unsafe { self.va.as_ptr().add(offset as usize) })
+    }
+}
+
+/// Kernel VA + length of a paging op's system-memory MDL (VidMm passes locked
+/// MDLs). Reuses an existing system mapping if the MDL has one; otherwise maps
 /// KernelMode/cached (released when VidMm frees the MDL, the
 /// `MmGetSystemAddressForMdlSafe` pattern). Returns `None` (counted) on failure.
 ///
+/// `ByteOffset` is deliberately NOT added to the returned pointer: both branches
+/// already point at the start of the described buffer, whose length is exactly
+/// `ByteCount`, so adding it would itself introduce an off-by-`ByteOffset`
+/// overrun.
+///
 /// # Safety
 /// `mdl` must be a valid, locked MDL for the duration of the paging op.
-unsafe fn mdl_system_va(mdl: PMDL) -> Option<*mut u8> {
+unsafe fn mdl_system_va(mdl: PMDL) -> Option<MdlWindow> {
     if mdl.is_null() {
         return None;
     }
     // SAFETY: valid MDL per the fn contract.
     unsafe {
+        let len = u64::from((*mdl).ByteCount);
         if (*mdl).MdlFlags & MDL_HAS_SYSTEM_VA != 0 {
-            return Some((*mdl).MappedSystemVa as *mut u8);
+            return core::ptr::NonNull::new((*mdl).MappedSystemVa as *mut u8)
+                .map(|va| MdlWindow { va, len });
         }
         let va = MmMapLockedPagesSpecifyCache(
             mdl,
@@ -382,11 +416,12 @@ unsafe fn mdl_system_va(mdl: PMDL) -> Option<*mut u8> {
             0, // BugCheckOnFailure = FALSE → NULL return for KernelMode failure
             MDL_MAP_PRIORITY,
         );
-        if va.is_null() {
-            BAR_ERR_MDL.fetch_add(1, Ordering::Relaxed);
-            None
-        } else {
-            Some(va as *mut u8)
+        match core::ptr::NonNull::new(va as *mut u8) {
+            Some(va) => Some(MdlWindow { va, len }),
+            None => {
+                BAR_ERR_MDL.fetch_add(1, Ordering::Relaxed);
+                None
+            }
         }
     }
 }
@@ -742,9 +777,14 @@ unsafe fn bar_transfer(
             // SAFETY: Source.pMdl arm is valid for SegmentId 0. The cast maps
             // the dxgk-bindings MDL to the layout-identical wdk_sys MDL.
             let mdl = unsafe { *t.Source.__bindgen_anon_1.pMdl.as_ref() };
-            let Some(src) = (unsafe { mdl_system_va(mdl.cast()) }) else {
+            let Some(window) = (unsafe { mdl_system_va(mdl.cast()) }) else {
                 // PgEx counted inside mdl_system_va. The page-in did not happen,
                 // so the blob still holds stale bytes — never report success.
+                return PagingOpOutcome::Failed(paging_failure());
+            };
+            // The MDL side is range-checked exactly like the blob side.
+            let Some(src) = window.slice_at(mdl_off, bytes) else {
+                BAR_ERR_BOUNDS.fetch_add(1, Ordering::Relaxed);
                 return PagingOpOutcome::Failed(paging_failure());
             };
             let mut copied = false;
@@ -754,11 +794,11 @@ unsafe fn bar_transfer(
                         BAR_ERR_BOUNDS.fetch_add(1, Ordering::Relaxed);
                         return;
                     }
-                    // SAFETY: dst covers `len` blob bytes (bounds-checked);
-                    // src is the MDL's kernel mapping, valid for the op.
+                    // SAFETY: dst covers `len` blob bytes and src covers `bytes`
+                    // mapped MDL bytes, both checked above.
                     unsafe {
                         core::ptr::copy_nonoverlapping(
-                            src.add(mdl_off as usize),
+                            src,
                             dst.add(blob_off as usize),
                             bytes as usize,
                         );
@@ -779,9 +819,15 @@ unsafe fn bar_transfer(
         (s, 0) if s == bar_id => {
             // SAFETY: Destination.pMdl arm is valid for SegmentId 0. Cast as above.
             let mdl = unsafe { *t.Destination.__bindgen_anon_1.pMdl.as_ref() };
-            let Some(dst) = (unsafe { mdl_system_va(mdl.cast()) }) else {
+            let Some(window) = (unsafe { mdl_system_va(mdl.cast()) }) else {
                 // PgEx counted inside mdl_system_va. The eviction did not happen;
                 // reporting success here would lose the allocation's only copy.
+                return PagingOpOutcome::Failed(paging_failure());
+            };
+            // THE WRITE SIDE: an unchecked `mdl_off + bytes` here is a kernel
+            // memory write past the mapped buffer.
+            let Some(dst_start) = window.slice_at(mdl_off, bytes) else {
+                BAR_ERR_BOUNDS.fetch_add(1, Ordering::Relaxed);
                 return PagingOpOutcome::Failed(paging_failure());
             };
             let mut copied = false;
@@ -791,12 +837,12 @@ unsafe fn bar_transfer(
                         BAR_ERR_BOUNDS.fetch_add(1, Ordering::Relaxed);
                         return;
                     }
-                    // SAFETY: src covers `len` blob bytes (bounds-checked);
-                    // dst is the MDL's kernel mapping, valid for the op.
+                    // SAFETY: src covers `len` blob bytes and dst_start covers
+                    // `bytes` mapped MDL bytes, both checked above.
                     unsafe {
                         core::ptr::copy_nonoverlapping(
                             src.add(blob_off as usize),
-                            dst.add(mdl_off as usize),
+                            dst_start,
                             bytes as usize,
                         );
                     }
@@ -807,9 +853,8 @@ unsafe fn bar_transfer(
                 // PgEm / PgEb already counted.
                 return PagingOpOutcome::Failed(paging_failure());
             }
-            let system_start = unsafe { dst.add(mdl_off as usize) };
             let _ = unsafe {
-                remember_system_backing(adapter, alloc.resource_id, blob_off, bytes, system_start)
+                remember_system_backing(adapter, alloc.resource_id, blob_off, bytes, dst_start)
             };
             BAR_XFER_OUT.fetch_add(1, Ordering::Relaxed);
             PagingOpOutcome::Executed

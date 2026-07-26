@@ -54,6 +54,22 @@ pub const fn cross_adapter_pitch(width: u32) -> u32 {
     raw.saturating_add(CROSS_ADAPTER_PITCH_ALIGN - 1) & !(CROSS_ADAPTER_PITCH_ALIGN - 1)
 }
 
+/// Checked sub-range of a mapped byte window: is `offset .. offset + bytes`
+/// wholly inside a window of `len` bytes?
+///
+/// Returns the byte offset on success, `None` on any overflow or overrun. Both
+/// operands of every `copy_nonoverlapping` in the paging engine have to answer
+/// this question, and one of them (the MDL side of a classic TRANSFER) used to
+/// answer it with a comment instead — `MdlOffset`/`TransferSize` were applied
+/// raw to a pointer that carries no length, so an over-long eviction wrote
+/// kernel memory past the mapped buffer (k-paging-03).
+pub const fn window_range(len: u64, offset: u64, bytes: u64) -> Option<u64> {
+    match offset.checked_add(bytes) {
+        Some(end) if end <= len => Some(offset),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -109,6 +125,38 @@ mod tests {
         // One page below the clamp still rounds normally.
         assert_eq!(round_up_page(u64::MAX - 4096), 0xFFFF_FFFF_FFFF_F000);
         assert_eq!(round_up_page(0xFFFF_FFFF_FFFF_EFFF), 0xFFFF_FFFF_FFFF_F000);
+    }
+
+    /// The exact boundary the MDL bound rests on: a transfer that ends on the
+    /// last mapped byte is legal, one byte more is not.
+    #[test]
+    fn window_range_accepts_exact_fit_and_rejects_one_past() {
+        assert_eq!(window_range(4096, 0, 4096), Some(0));
+        assert_eq!(window_range(4096, 4095, 1), Some(4095));
+        assert_eq!(window_range(4096, 0, 4097), None);
+        assert_eq!(window_range(4096, 4096, 1), None);
+        assert_eq!(window_range(4096, 1, 4096), None);
+    }
+
+    /// A zero-byte op inside the window is fine; a zero-byte op at the far end
+    /// is still bounded by `len`.
+    #[test]
+    fn window_range_handles_empty_ranges() {
+        assert_eq!(window_range(4096, 0, 0), Some(0));
+        assert_eq!(window_range(4096, 4096, 0), Some(4096));
+        assert_eq!(window_range(4096, 4097, 0), None);
+        assert_eq!(window_range(0, 0, 0), Some(0));
+        assert_eq!(window_range(0, 0, 1), None);
+    }
+
+    /// The overflow case is the whole reason this is checked arithmetic:
+    /// `MdlOffset << 12` is a guest/VidMm-supplied quantity, so `offset + bytes`
+    /// must not be allowed to wrap and land back inside the window.
+    #[test]
+    fn window_range_rejects_wrapping_offsets() {
+        assert_eq!(window_range(4096, u64::MAX, 1), None);
+        assert_eq!(window_range(4096, u64::MAX - 4095, 4096), None);
+        assert_eq!(window_range(u64::MAX, u64::MAX, 1), None);
     }
 
     /// Both moved functions are `const fn`, so a future edit that reaches for
