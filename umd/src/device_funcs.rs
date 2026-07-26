@@ -470,6 +470,10 @@ unsafe fn audit_dxgi_1_3_base_funcs(tag: &str, funcs: *mut ddi::DXGI1_3_DDI_BASE
 /// The runtime owns the backing memory, so we only run the destructor.
 unsafe extern "C" fn ddi_destroy_device(h_device: ddi::D3D10DDI_HDEVICE) {
     log_line("DDI: DestroyDevice");
+    // Drop it from the liveness registry BEFORE anything is torn down, so a
+    // concurrent `wait_last_present` on an ICD worker refuses rather than
+    // dereferencing a block dxgkrnl is about to free and reuse (R415).
+    crate::forward::unregister_live_device(h_device.pDrvPrivate as usize);
     if !h_device.pDrvPrivate.is_null() {
         let dev = &mut *(h_device.pDrvPrivate as *mut HeliosDevice);
         let (variants, layouts) = dev.ia.get_mut().release_owned_com();

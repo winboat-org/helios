@@ -918,6 +918,9 @@ unsafe extern "system" fn create_device(
     // The device is handed to the runtime from here; it owns teardown through
     // DestroyDevice.
     guard.defuse();
+    // Record it live for `helios_umd_wait_last_present`, which dereferences a
+    // device pointer the ICD recorded on an earlier call (R415).
+    forward::register_live_device(create.h_drv_device as usize);
 
     if std::env::var_os("HELIOS_DXGI_NO_REDIRECTION").is_some() {
         log_line("  CreateDevice -> DXGI_STATUS_NO_REDIRECTION (env-gated; DXGI desktop fallback)");

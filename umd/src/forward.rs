@@ -8535,25 +8535,101 @@ pub struct PresentSource {
     pub memory_type_index: u32,
 }
 
-thread_local! {
-    static PRESENT_SOURCE: core::cell::Cell<Option<PresentSource>> =
-        const { core::cell::Cell::new(None) };
-    /// HeliosDevice pointer of the last vehicle present on this thread, for
-    /// `helios_umd_wait_last_present`. Valid ONLY inside the ICD's
-    /// present-call window (set-source -> Present -> wait, one thread); 0
-    /// after a failed vehicle present.
-    static LAST_VEHICLE_DEVICE: core::cell::Cell<usize> =
-        const { core::cell::Cell::new(0) };
-    /// (fenceId, value) of the last MINTED vehicle present on this thread —
-    /// the vehicle device's named present fence signal that retires when the
-    /// frame copy completes on the host GPU. Consumed (taken) by
-    /// `helios_umd_get_present_result`; the ICD imports the fence by name
-    /// and gates frame-image reuse on it at ACQUIRE instead of a serial
-    /// post-present CPU wait. Same-thread contract as PRESENT_SOURCE; None
-    /// after a failed present or when the publish path is unavailable.
-    static PRESENT_RESULT: core::cell::Cell<Option<(u32, u64)>> =
-        const { core::cell::Cell::new(None) };
+/// The dcomp-vehicle present protocol as ONE state machine.
+///
+/// It used to be three independent `Cell`s — a pending source, a raw
+/// `HeliosDevice` pointer, and a pending (fenceId, value) — each path had to
+/// remember to update in lockstep, with the ordering enforced only by comments
+/// and by counters that fire after the fact. Two failure arms cleared two of
+/// the three, and `dxgi_present` had an `E_FAIL` exit that cleared neither, so
+/// the ICD could consume frame N's `(fenceId, value)` for frame N+1 and recycle
+/// an image on a fence that had already retired.
+///
+/// Cross-DLL sequence, one thread, once per frame:
+/// `helios_umd_set_present_source` -> `Present` ->
+/// `helios_umd_get_present_result` -> optional `helios_umd_wait_last_present`.
+/// Every exit now has to name a next state.
+///
+/// `Copy` on purpose: a `Cell` cannot panic, where a `RefCell` can double-borrow
+/// — and these are reached from `extern "C"` exports under `panic = "abort"`.
+#[derive(Clone, Copy)]
+enum VehicleSlot {
+    Idle,
+    /// A source was armed and the vehicle `Present` has not consumed it yet.
+    Armed(PresentSource),
+    /// A vehicle present was MINTED on `device`. `result` is its
+    /// (fenceId, value) — the vehicle device's named present-fence signal that
+    /// retires when the frame copy completes on the host GPU — or `None` when
+    /// the publish path was unavailable, so the ICD's consume MISSES and it
+    /// falls back to the serial wait.
+    Minted {
+        device: usize,
+        result: Option<(u32, u64)>,
+    },
 }
+
+thread_local! {
+    static VEHICLE: core::cell::Cell<VehicleSlot> =
+        const { core::cell::Cell::new(VehicleSlot::Idle) };
+}
+
+/// Live `HeliosDevice` private blocks.
+///
+/// `wait_last_present` dereferences a device pointer recorded by an earlier
+/// DDI call, and nothing tied that pointer to the device's lifetime: the
+/// vehicle D3D11 device is per-swapchain and released on the ICD worker thread,
+/// and a SUCCESS-but-not-displayed `Present` status (DXGI_STATUS_OCCLUDED, which
+/// the ICD explicitly handles) means dxgkrnl never calls our present DDI, so the
+/// slot is neither updated nor cleared. The runtime-owned private block dxgkrnl
+/// frees can then be reused by an unrelated device.
+///
+/// This is a runtime-guarded REFUSAL, not a proof: a compile-time lifetime is
+/// not achievable across the `extern "C"` export boundary, and the ICD may
+/// still call on a thread whose device dies between the check and the
+/// dereference. Deliberately NOT a global epoch bumped on any destroy — a
+/// stale-epoch refusal returns -1, which the ICD reads as "no gate" and then
+/// performs no wait at all, reintroducing the 21st-session torn-copy class for
+/// unrelated devices.
+///
+/// The lock is taken once per wait and once per device create/destroy, never on
+/// a per-draw or per-present path.
+fn live_devices() -> &'static std::sync::Mutex<std::collections::HashSet<usize>> {
+    static LIVE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<usize>>> =
+        std::sync::OnceLock::new();
+    LIVE.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+pub(crate) fn register_live_device(device: usize) {
+    if device == 0 {
+        return;
+    }
+    if let Ok(mut live) = live_devices().lock() {
+        live.insert(device);
+    }
+}
+
+pub(crate) fn unregister_live_device(device: usize) {
+    if device == 0 {
+        return;
+    }
+    if let Ok(mut live) = live_devices().lock() {
+        live.remove(&device);
+    }
+}
+
+fn device_is_live(device: usize) -> bool {
+    match live_devices().lock() {
+        Ok(live) => live.contains(&device),
+        // `panic = "abort"` makes poisoning unreachable; refusing is the safe
+        // answer if it ever were not.
+        Err(_) => false,
+    }
+}
+
+/// `set_present_source` refusals (invalid geometry/resid from the ICD).
+static EXT_SOURCE_REFUSED: AtomicUsize = AtomicUsize::new(0);
+/// `wait_last_present` calls whose recorded device is no longer live.
+static EXT_WAIT_DEAD_DEVICE: AtomicUsize = AtomicUsize::new(0);
 
 static EXT_PRESENTS: AtomicUsize = AtomicUsize::new(0);
 static EXT_IMPORT_FAILS: AtomicUsize = AtomicUsize::new(0);
@@ -8783,14 +8859,15 @@ pub fn set_present_source(
     memory_type_index: u32,
 ) -> i32 {
     if resid == 0 || width == 0 || height == 0 || dxgi_format == 0 {
+        EXT_SOURCE_REFUSED.fetch_add(1, Ordering::Relaxed);
         log_line(&format!(
             "set_present_source REFUSED: resid={} {}x{} fmt={}",
             resid, width, height, dxgi_format
         ));
         return -1;
     }
-    let prev = PRESENT_SOURCE.with(|c| {
-        c.replace(Some(PresentSource {
+    let prev = VEHICLE.with(|c| {
+        c.replace(VehicleSlot::Armed(PresentSource {
             resid,
             fence_value,
             width,
@@ -8800,20 +8877,38 @@ pub fn set_present_source(
             memory_type_index,
         }))
     });
-    if prev.is_some() {
-        // A pending source nobody consumed: a Present() that never reached
-        // our DDI, or a same-thread-contract violation. Count loudly; the
-        // new source replaces it.
-        let n = EXT_OVERWRITES.fetch_add(1, Ordering::Relaxed);
-        if n < 16 || n % 512 == 0 {
-            log_line(&format!(
-                "set_present_source: overwrote a pending source (x{})",
-                n + 1
-            ));
+    match prev {
+        VehicleSlot::Armed(_) => {
+            // A pending source nobody consumed: a Present() that never reached
+            // our DDI, or a same-thread-contract violation. Count loudly; the
+            // new source replaces it.
+            let n = EXT_OVERWRITES.fetch_add(1, Ordering::Relaxed);
+            if n < 16 || n % 512 == 0 {
+                log_line(&format!(
+                    "set_present_source: overwrote a pending source (x{})",
+                    n + 1
+                ));
+            }
+            1
         }
-        return 1;
+        VehicleSlot::Minted {
+            result: Some(_), ..
+        } => {
+            // Arming over a result the ICD never consumed. Counted on the SAME
+            // counter the next present's overwrite used to hit, so the total
+            // stays one increment per lost result rather than moving between
+            // counters.
+            let n = EXT_RESULT_OVERWRITES.fetch_add(1, Ordering::Relaxed);
+            if n < 16 || n % 512 == 0 {
+                log_line(&format!(
+                    "vehicle present: unconsumed present result overwritten (x{})",
+                    n + 1
+                ));
+            }
+            0
+        }
+        VehicleSlot::Idle | VehicleSlot::Minted { result: None, .. } => 0,
     }
-    0
 }
 
 /// Backing for the `helios_umd_wait_last_present` C export: bounded wait for
@@ -8821,14 +8916,32 @@ pub fn set_present_source(
 /// on the GPU. 0 = complete, 1 = timeout, -1 = no vehicle present recorded
 /// on this thread.
 pub fn wait_last_present(timeout_us: u32) -> i32 {
-    let dev_ptr = LAST_VEHICLE_DEVICE.with(|c| c.get());
+    let dev_ptr = match VEHICLE.with(|c| c.get()) {
+        VehicleSlot::Minted { device, .. } => device,
+        VehicleSlot::Idle | VehicleSlot::Armed(_) => return -1,
+    };
     if dev_ptr == 0 {
+        return -1;
+    }
+    if !device_is_live(dev_ptr) {
+        // The recorded device was destroyed without this slot being cleared —
+        // dxgkrnl may already have reused its private block. Refuse rather than
+        // dereference it, and drop the slot so the refusal is not repeated.
+        VEHICLE.with(|c| c.set(VehicleSlot::Idle));
+        let n = EXT_WAIT_DEAD_DEVICE.fetch_add(1, Ordering::Relaxed);
+        if n < 16 || n % 512 == 0 {
+            log_line(&format!(
+                "wait_last_present REFUSED: recorded device 0x{dev_ptr:x} is no longer live (x{})",
+                n + 1
+            ));
+        }
         return -1;
     }
     // SAFETY: same-thread contract — the ICD calls this immediately after
     // the vehicle Present() returned on this thread, so the device the
     // present ran on is still alive (the ICD holds the vehicle D3D11
-    // device reference).
+    // device reference) — now backed by the liveness check above rather than
+    // by that contract alone.
     let dev = unsafe { &*(dev_ptr as *const HeliosDevice) };
     if unsafe { dev.dxvk.present_frame_gate(timeout_us) } {
         0
@@ -8842,7 +8955,22 @@ pub fn wait_last_present(timeout_us: u32) -> i32 {
 /// (failed present, publish unavailable, or contract violation — counted;
 /// the ICD falls back to the serial wait).
 pub fn take_present_result(fence_id: &mut u32, value: &mut u64) -> i32 {
-    match PRESENT_RESULT.with(|c| c.take()) {
+    let taken = VEHICLE.with(|c| match c.get() {
+        VehicleSlot::Minted {
+            device,
+            result: Some(pending),
+        } => {
+            // Consuming the result leaves the device recorded: a following
+            // wait_last_present still targets the present that minted it.
+            c.set(VehicleSlot::Minted {
+                device,
+                result: None,
+            });
+            Some(pending)
+        }
+        _ => None,
+    });
+    match taken {
         Some((fid, val)) => {
             *fence_id = fid;
             *value = val;
@@ -9570,7 +9698,16 @@ unsafe extern "C" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT) -> i32 {
     // src->dst copy, publish and gate with the vehicle body; a vehicle
     // failure FAILS the present (no token minted) so the ICD latches its sw
     // fallback instead of flipping a stale backbuffer.
-    let ext_source = PRESENT_SOURCE.with(|c| c.take());
+    let ext_source = VEHICLE.with(|c| match c.get() {
+        VehicleSlot::Armed(source) => {
+            // Consuming the arm returns the slot to Idle until this present
+            // either mints or fails. A non-vehicle present must NOT touch a
+            // pending Minted result, so only this arm writes.
+            c.set(VehicleSlot::Idle);
+            Some(source)
+        }
+        _ => None,
+    });
     let is_vehicle_present = ext_source.is_some();
     let mut vehicle_fence_id: u32 = 0;
 
@@ -9583,8 +9720,7 @@ unsafe extern "C" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT) -> i32 {
                     copied = true;
                 }
                 Err(hr) => {
-                    LAST_VEHICLE_DEVICE.with(|c| c.set(0));
-                    PRESENT_RESULT.with(|c| c.set(None));
+                    VEHICLE.with(|c| c.set(VehicleSlot::Idle));
                     return hr;
                 }
             }
@@ -9644,8 +9780,7 @@ unsafe extern "C" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT) -> i32 {
         }
     } else if is_vehicle_present {
         // No immediate context = nothing was copied or published.
-        LAST_VEHICLE_DEVICE.with(|c| c.set(0));
-        PRESENT_RESULT.with(|c| c.set(None));
+        VEHICLE.with(|c| c.set(VehicleSlot::Idle));
         EXT_NO_DEVICE.fetch_add(1, Ordering::Relaxed);
         return E_FAIL;
     }
@@ -9802,15 +9937,25 @@ unsafe extern "C" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT) -> i32 {
     }
 
     if is_vehicle_present {
-        // wait_last_present targets this device; count only minted presents.
-        LAST_VEHICLE_DEVICE.with(|c| c.set(h.pDrvPrivate as usize));
         // The recycle-gate result: only a minted present with a live publish
         // carries one — otherwise leave None so the ICD's consume MISSES and
-        // it falls back to the serial wait.
+        // it falls back to the serial wait. wait_last_present targets the
+        // device recorded here, and the two now move together by construction.
         let result =
             (vehicle_fence_id != 0 && sync_value != 0).then_some((vehicle_fence_id, sync_value));
-        let prev = PRESENT_RESULT.with(|c| c.replace(result));
-        if prev.is_some() {
+        let prev = VEHICLE.with(|c| {
+            c.replace(VehicleSlot::Minted {
+                device: h.pDrvPrivate as usize,
+                result,
+            })
+        });
+        if matches!(
+            prev,
+            VehicleSlot::Minted {
+                result: Some(_),
+                ..
+            }
+        ) {
             let n = EXT_RESULT_OVERWRITES.fetch_add(1, Ordering::Relaxed);
             if n < 16 || n % 512 == 0 {
                 log_line(&format!(
