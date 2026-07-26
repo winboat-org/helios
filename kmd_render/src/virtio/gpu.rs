@@ -1010,6 +1010,31 @@ pub enum FenceEventReg {
     Duplicate,
 }
 
+/// Which retirement domain a wait is against.
+///
+/// The nine-line doc this replaces explained at length that the wait is ring-0
+/// only and why counting ring >= 1 fences would be wrong — while sitting on a
+/// function whose `wait_gpu: bool` parameter did exactly that, undocumented,
+/// and whose three callers picked the mode three different ways (two hardcode
+/// true, one derives it from `gpu_completion_fence.is_some()`, one replays a
+/// stored value). Both values genuinely occur.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RetireDomain {
+    /// Ring-0 only: host DECODE retirement.
+    ///
+    /// This is the domain the WDDM pending FIFO's contract was built on. It
+    /// exists to order DMA_COMPLETED behind the venus escape traffic queued
+    /// before it, and ring-0 fences retire at decode. ring >= 1 fences (WS1 #4)
+    /// retire at host GPU COMPLETION and stay in flight for the full GPU-work
+    /// duration, so counting them here would couple every WDDM DMA fence
+    /// (GDI/paging pacing) to unrelated multi-ms GPU work. Consumers that need
+    /// GPU completion wait on those fences explicitly (WAIT_FENCE).
+    DecodeOnly,
+    /// Every ring: the caller genuinely needs host GPU completion, e.g. the
+    /// direct-primary refresh marker ordering on a Venus completion watermark.
+    IncludingGpu,
+}
+
 /// A WDDM submission whose `DXGK_INTERRUPT_DMA_COMPLETED` is gated on venus
 /// completion: it may signal once every async wire fence `< watermark` has
 /// retired (and strictly in FIFO order — SubmissionFenceIds are watermarks to
@@ -1017,7 +1042,7 @@ pub enum FenceEventReg {
 struct WddmPending {
     fence: u32,
     watermark: u64,
-    wait_gpu: bool,
+    domain: RetireDomain,
     refresh_scanout: bool,
 }
 
@@ -2287,7 +2312,7 @@ impl VirtioGpu {
         _order: &crate::adapter::NotifyOrdered<'_>,
     ) -> bool {
         let watermark = self.next_wire_fence;
-        if self.async_retired_up_to(watermark, true) {
+        if self.async_retired_up_to(watermark, RetireDomain::IncludingGpu) {
             self.scanout_refresh_watermark = None;
             true
         } else {
@@ -2306,28 +2331,26 @@ impl VirtioGpu {
         let Some(watermark) = self.scanout_refresh_watermark else {
             return false;
         };
-        if !self.async_retired_up_to(watermark, true) {
+        if !self.async_retired_up_to(watermark, RetireDomain::IncludingGpu) {
             return false;
         }
         self.scanout_refresh_watermark = None;
         true
     }
 
-    /// Whether every RING-0 async wire fence `< watermark` has retired.
-    ///
-    /// Ring-0 only: the WDDM pending FIFO exists to order DMA_COMPLETED behind
-    /// the venus escape traffic queued before it, and ring-0 fences retire at
-    /// host DECODE — the ordering domain that contract was built on. ring >= 1
-    /// fences (WS1 #4) retire at host GPU COMPLETION and stay in flight for
-    /// the full GPU-work duration; counting them here would couple every WDDM
-    /// DMA fence (GDI/paging pacing) to unrelated multi-ms GPU work. Consumers
-    /// that need GPU completion wait on those fences explicitly (WAIT_FENCE).
-    fn async_retired_up_to(&self, watermark: u64, wait_gpu: bool) -> bool {
+    /// Whether every async wire fence `< watermark` in `domain` has retired.
+    fn async_retired_up_to(&self, watermark: u64, domain: RetireDomain) -> bool {
         watermark == 0
             || !self.inflight.iter().any(|e| match e.kind {
                 InFlightKind::AsyncVenus {
                     fence_id, ring_idx, ..
-                } => fence_id < watermark && (wait_gpu || ring_idx == 0),
+                } => {
+                    fence_id < watermark
+                        && match domain {
+                            RetireDomain::IncludingGpu => true,
+                            RetireDomain::DecodeOnly => ring_idx == 0,
+                        }
+                }
                 _ => false,
             })
     }
@@ -2358,7 +2381,11 @@ impl VirtioGpu {
             self.wddm_pending.clear();
             return true;
         }
-        let wait_gpu = gpu_completion_fence.is_some();
+        let domain = if gpu_completion_fence.is_some() {
+            RetireDomain::IncludingGpu
+        } else {
+            RetireDomain::DecodeOnly
+        };
         let watermark = if paging {
             0
         } else if let Some(gpu_fence_id) = gpu_completion_fence {
@@ -2375,7 +2402,7 @@ impl VirtioGpu {
         } else {
             self.next_wire_fence
         };
-        if self.wddm_pending.is_empty() && self.async_retired_up_to(watermark, wait_gpu) {
+        if self.wddm_pending.is_empty() && self.async_retired_up_to(watermark, domain) {
             return true;
         }
         if self.wddm_pending.len() >= MAX_WDDM_PENDING {
@@ -2390,7 +2417,7 @@ impl VirtioGpu {
         self.wddm_pending.push_back(WddmPending {
             fence,
             watermark,
-            wait_gpu,
+            domain,
             refresh_scanout,
         });
         false
@@ -2403,11 +2430,11 @@ impl VirtioGpu {
         &mut self,
         _order: &crate::adapter::NotifyOrdered<'_>,
     ) -> Option<WddmReady> {
-        let (watermark, wait_gpu) = {
+        let (watermark, domain) = {
             let head = self.wddm_pending.front()?;
-            (head.watermark, head.wait_gpu)
+            (head.watermark, head.domain)
         };
-        if !self.async_retired_up_to(watermark, wait_gpu) {
+        if !self.async_retired_up_to(watermark, domain) {
             return None;
         }
         let pending = self.wddm_pending.pop_front()?;

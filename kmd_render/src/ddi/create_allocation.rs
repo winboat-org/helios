@@ -790,9 +790,17 @@ fn publish_prepared_copy(ctx: &AllocationContext, copy: &crate::virtio::venus::P
         .store(copy.command_buffer_id.get(), Ordering::Release);
 }
 
+/// The exact mirror of [`publish_prepared_copy`]: payload words Relaxed FIRST,
+/// then the publish word with Release.
+///
+/// The clear used to run in the opposite order — publish word first, payload
+/// after — so between the two a reader that acquired a *stale-nonzero* publish
+/// word could read half-cleared payload. That reader is not constructible
+/// today: the scanout-lifecycle mutex orders every access, and `take`-style
+/// readers hold it for their whole critical section. This removes a trap rather
+/// than fixing a race, and the trap is real — four call sites can each mutate
+/// these ten words, so any new writer outside the mutex would tear the slot.
 fn clear_prepared_copy(ctx: &AllocationContext) {
-    ctx.scanout_copy_command_buffer_id
-        .store(0, Ordering::Release);
     ctx.scanout_copy_last_fence.store(0, Ordering::Relaxed);
     ctx.scanout_copy_target_image_id.store(0, Ordering::Relaxed);
     ctx.scanout_copy_pool_id.store(0, Ordering::Relaxed);
@@ -806,6 +814,10 @@ fn clear_prepared_copy(ctx: &AllocationContext) {
     ctx.scanout_copy_image_id.store(0, Ordering::Relaxed);
     ctx.scanout_copy_owns_source_alias
         .store(0, Ordering::Relaxed);
+    // The publish word LAST, with Release — the mirror of publish's
+    // eight-Relaxed-then-one-Release protocol.
+    ctx.scanout_copy_command_buffer_id
+        .store(0, Ordering::Release);
 }
 
 /// Submit a GPU copy from the exact allocation selected by

@@ -268,6 +268,11 @@ enum FatalReason {
     HeadWaitTimeout { elapsed_ms: u64 },
 }
 
+/// Written into reply word 0 before every reply-generating ring command, so an
+/// unanswered reply cannot decode as the previous one. Not a legal
+/// `VkCommandTypeEXT`, so it fails every caller's existing command-type check.
+const REPLY_POISON: u32 = 0xFFFF_FFFF;
+
 /// Diagnostic breadcrumb base for venus bring-up (0x0D00_00xx).
 fn diag(code: u32) {
     crate::diag::record(0x0D00_0000 | (code & 0xFFFF));
@@ -927,7 +932,11 @@ impl KernelMap {
     fn store_u32_seqcst(&self, offset: u64, val: u32) {
         // Full barrier: all prior buffer writes are visible before the tail store.
         fence(Ordering::SeqCst);
-        // SAFETY: `offset+4 <= size`, discharged as for `load_u32_acquire`.
+        // SAFETY: `offset+4 <= size`. Two callers, each discharging it its own
+        // way: RingMap, where RingWord has no inhabitant above
+        // RING_STATUS_OFFSET and the map is >= RING_SHMEM_SIZE by construction;
+        // and the reply-poison write at offset 0, which any nonzero-size
+        // mapping admits.
         let p = unsafe { self.va.add(offset as usize) } as *mut u32;
         unsafe { core::ptr::write_volatile(p, val) };
         fence(Ordering::SeqCst);
@@ -1382,6 +1391,22 @@ impl VenusRing {
 
         // The real command, with GENERATE_REPLY.
         self.write_to_ring(cmd_stream)?;
+
+        // Poison the reply's command-type word before publishing.
+        //
+        // The reply shmem is zeroed EXACTLY ONCE, at bring-up, so a command
+        // whose reply the host never writes decodes as whatever the PREVIOUS
+        // reply left there — and every caller's first check is "is word 0 my
+        // command type?". After a `vkCreateImage` reply, a silently-unanswered
+        // second `vkCreateImage` passes that check and the caller goes on to
+        // read stale handles as if they were fresh. 0xFFFF_FFFF is not a legal
+        // VkCommandTypeEXT, so it fails every existing check with no new code.
+        //
+        // Deliberately NOT bundled: uniform strict handle validation. The three
+        // adopt sites accept a host-substituted handle and tightening them is a
+        // real behaviour change that could break bring-up on a host that
+        // legitimately returns a different handle.
+        self.reply_map.store_u32_seqcst(0, REPLY_POISON);
 
         let seqno = self.publish_and_notify(adapter)?;
         self.wait_seqno(seqno)?;
