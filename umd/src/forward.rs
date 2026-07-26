@@ -387,11 +387,26 @@ unsafe fn read_alloc_meta(
     None
 }
 
+/// A fully identified open: the KMD's identity record AND the creator's meta
+/// trailer. The trailer is non-optional by construction — the import geometry
+/// is read out of it, so there is no `Option` left to default at the
+/// `open_ddi_texture2d` call and the 1x1 alias cannot be reconstructed.
+#[derive(Clone, Copy)]
+struct OpenedAllocation {
+    ident: HeliosWddmOpenIdentity,
+    meta: HeliosWddmAllocMeta,
+}
+
 /// Parse the OPEN-time private data: the KMD's versioned [`HeliosWddmOpenIdentity`]
 /// record (written in `DxgkDdiOpenAllocation` after validating the venus resource
 /// is LIVE) plus the creator's meta trailer. This replaces the `_pad`-smuggling
 /// heuristics: an open-time buffer either carries a valid identity or the open is
 /// not backed by an identified venus resource.
+///
+/// This is the DIAGNOSTIC parse: it tolerates a missing trailer so the C1
+/// identity evidence lines can still print what the buffer actually held. An
+/// open must go through [`read_opened_allocation`] instead — an identity with
+/// no trailer carries no geometry and is not openable.
 unsafe fn read_open_identity(
     ptr: *const c_void,
     size: u32,
@@ -405,6 +420,12 @@ unsafe fn read_open_identity(
     }
     let meta = read_alloc_meta(ptr, size, core::mem::size_of::<HeliosWddmOpenIdentity>());
     Some((ident, meta))
+}
+
+/// The parse an OPEN may use: identity plus a present meta trailer, or nothing.
+unsafe fn read_opened_allocation(ptr: *const c_void, size: u32) -> Option<OpenedAllocation> {
+    let (ident, meta) = read_open_identity(ptr, size)?;
+    Some(OpenedAllocation { ident, meta: meta? })
 }
 
 // --- handle <-> COM helpers -------------------------------------------------
@@ -2385,7 +2406,15 @@ unsafe extern "C" fn open_resource(
     // into the open-time private data in DxgkDdiOpenAllocation, after
     // validating the backing venus resource is LIVE. Prefer the per-allocation
     // buffer; fall back to the resource-level one. No `_pad` heuristics.
-    let mut identity = unsafe { read_open_identity(a.pPrivateDriverData, a.PrivateDriverDataSize) };
+    let mut identity =
+        unsafe { read_opened_allocation(a.pPrivateDriverData, a.PrivateDriverDataSize) };
+    // Distinguishes "no identity anywhere" from "identity present, trailer
+    // absent" in the refusal below; the second is a producer/KMD bug that used
+    // to be swallowed by a 1x1 default.
+    let mut identity_without_trailer = matches!(
+        unsafe { read_open_identity(a.pPrivateDriverData, a.PrivateDriverDataSize) },
+        Some((_, None))
+    );
     if a.NumAllocations != 0 && info2.is_null() {
         log_line("DDI open_resource FAILED: allocation array is null");
         set_runtime_error(h, E_INVALIDARG);
@@ -2398,21 +2427,22 @@ unsafe extern "C" fn open_resource(
         }
         let allocation_identity =
             unsafe { read_open_identity(info.pPrivateDriverData, info.PrivateDriverDataSize) };
-        // Prefer the first candidate that carries the meta TRAILER, not merely
-        // the first that parses an identity. The KMD stamps the identity into
-        // both the per-allocation and the resource-level private buffer
+        // Only a candidate that carries the meta TRAILER can be selected — the
+        // type says so now. The KMD stamps the identity into both the
+        // per-allocation and the resource-level private buffer
         // (create_allocation.rs `write_open_identity`), but the resource-level
         // copy for KMD standard allocations is the pristine
         // GetStandardAllocationDriverData output whose size the KMD does not
-        // choose: it can hold a valid 48-byte identity with no 16-byte trailer
-        // and shadow a per-allocation buffer that carries both. Selecting it
-        // then loses the real geometry. No change for buffers that do carry a
-        // trailer.
-        if !matches!(identity, Some((_, Some(_)))) {
-            let candidate_has_meta = matches!(allocation_identity, Some((_, Some(_))));
-            if candidate_has_meta || identity.is_none() {
-                identity = allocation_identity;
+        // choose: it can hold a valid 48-byte identity with no 16-byte trailer,
+        // and selecting it loses the real geometry.
+        match allocation_identity {
+            Some((ident, Some(meta))) => {
+                if identity.is_none() {
+                    identity = Some(OpenedAllocation { ident, meta });
+                }
             }
+            Some((_, None)) => identity_without_trailer = true,
+            None => {}
         }
         if let Some((ident, meta)) = allocation_identity {
             let meta = meta.unwrap_or_default();
@@ -2473,26 +2503,30 @@ unsafe extern "C" fn open_resource(
     // here and stamped it with the real KMT handles — draws "succeeded" and
     // the shared content stayed black forever (audit U-B2). Fail loudly
     // instead so the producer-side bug gets found.
-    let Some((ident, meta)) = identity else {
-        log_line(&format!(
-            "DDI open_resource FAILED: no venus identity record (hKM={:?} alloc=0x{:x}) -> E_FAIL",
-            a.hKMResource, allocation
-        ));
+    //
+    // The trailer is part of that record, not an optional extra: it carries the
+    // width/height/pitch/format the import is built from. Defaulting it to
+    // 1x1 BGRA produced exactly the audited failure — a real-KMT-stamped,
+    // resident, storable alias whose geometry was wrong. Because that alias is
+    // UNDERSIZE relative to the true allocation, the oversize guard that caught
+    // the 38th-session import regression cannot see it either.
+    let Some(opened) = identity else {
+        if identity_without_trailer {
+            log_line(&format!(
+                "DDI open_resource FAILED: venus identity carries no meta trailer (hKM={:?} alloc=0x{:x}) -> E_FAIL",
+                a.hKMResource, allocation
+            ));
+        } else {
+            log_line(&format!(
+                "DDI open_resource FAILED: no venus identity record (hKM={:?} alloc=0x{:x}) -> E_FAIL",
+                a.hKMResource, allocation
+            ));
+        }
         set_runtime_error(h, E_FAIL);
         return;
     };
-    let meta = meta.unwrap_or(HeliosWddmAllocMeta {
-        width: 1,
-        height: 1,
-        format: 21,
-        pitch: 4,
-        bind_flags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
-        misc_flags: 0,
-        venus_alloc_size: 0,
-        memory_type_index: 0,
-        dxgi_format: 0,
-        plane_offset: 0,
-    });
+    let ident = opened.ident;
+    let meta = opened.meta;
 
     if a.hKMResource.handle == 0 {
         log_line(&format!(
