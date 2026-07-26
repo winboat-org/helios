@@ -23,6 +23,7 @@ use wdk_sys::{KDPC, KEVENT, KSPIN_LOCK, KTIMER, PHYSICAL_ADDRESS, PVOID};
 use crate::dxgk::*;
 use crate::error::DriverError;
 use crate::virtio::VirtioGpu;
+use helios_kmd_logic::DisplayMode;
 
 extern "C" {
     /// `extern POBJECT_TYPE *PsThreadType;` (ntddk.h) — the thread object type, for
@@ -230,19 +231,9 @@ pub(crate) struct StartedState {
     /// Demoted to 0 before publication if the transport never came up.
     /// Value mirrored to the `DspH` fixed diag record at StartDevice.
     pub display_half: bool,
-    /// Scanout-0 mode the display half presents, taken from the host's
-    /// `GET_DISPLAY_INFO` (`VirtioGpu::display_mode`) at StartDevice, or 0/0 if the
-    /// host reported nothing usable (then [`AdapterContext::display_mode`] falls
-    /// back to 1920×1080). The VidPn source/target/monitor modes and the generated
-    /// EDID all derive from this, so Helios advertises the size QEMU actually
-    /// wants on scanout 0 instead of a hardcoded guess.
-    pub display_w: u32,
-    pub display_h: u32,
-    /// EDID served by `DxgkDdiQueryDeviceDescriptor`, generated at StartDevice for
-    /// [`AdapterContext::display_mode`] via [`crate::ddi::vidpn::build_edid`]
-    /// (valid checksum, native detailed timing == the mode). Zeroed when the
-    /// display half is off.
-    pub edid: [u8; 128],
+    /// Scanout-0 mode the display half presents, together with the EDID
+    /// generated from it. See [`ScanoutMode`].
+    pub scanout_mode: ScanoutMode,
     /// Real-RAM-backed segment for VidMm page tables / paging buffers (segment 2).
     /// `None` if the contiguous allocation failed (then we fall back to the old
     /// single-segment shape). Freed in `AdapterContext::drop`.
@@ -266,9 +257,7 @@ impl StartedState {
         alloc_cached: bool,
         present_probe: bool,
         display_half: bool,
-        display_w: u32,
-        display_h: u32,
-        edid: [u8; 128],
+        scanout_mode: ScanoutMode,
         paging_ram: Option<PagingRam>,
         bar_probe_ram: Option<PagingRam>,
     ) -> Self {
@@ -277,15 +266,75 @@ impl StartedState {
             alloc_cached,
             present_probe,
             display_half,
-            display_w,
-            display_h,
-            edid,
+            scanout_mode,
             paging_ram,
             bar_probe_ram,
             transport: UnsafeCell::new(None),
         }
     }
 }
+
+/// The scan-out mode the display half presents, and the EDID that describes it.
+///
+/// The two used to be three independent fields — `display_w`, `display_h` and a
+/// 128-byte array — whose mutual consistency ("every VidPn mode + the generated
+/// EDID derive from this so they stay cofunctional") was a comment. A future
+/// write to the extent without regenerating the EDID would produce a monitor
+/// whose detailed timing disagrees with the modes the VidPn DDIs enumerate:
+/// the mismatch class that produced the mode-set retry loops.
+///
+/// The only constructor generates the EDID from the mode, so there is no way to
+/// obtain a `ScanoutMode` whose EDID disagrees with its extent.
+#[derive(Clone, Copy)]
+pub(crate) struct ScanoutMode {
+    mode: DisplayMode,
+    edid: [u8; 128],
+}
+
+impl ScanoutMode {
+    /// Adopt the host's extent if usable, else the 1920×1080 fallback, and
+    /// generate the matching EDID.
+    ///
+    /// `host` is `VirtioGpu::display_mode`'s answer — note that method and
+    /// `AdapterContext::display_mode` are different methods with the same name;
+    /// only the latter reads this value.
+    pub(crate) fn adopt(host: Option<(u32, u32)>) -> Self {
+        let mode = host
+            .and_then(|(w, h)| DisplayMode::from_host(w, h))
+            .unwrap_or(DEFAULT_SCANOUT_EXTENT);
+        Self {
+            mode,
+            edid: crate::ddi::vidpn::build_edid(mode.width(), mode.height()),
+        }
+    }
+
+    /// A zeroed-EDID mode for the render-only surface, where no monitor is
+    /// advertised and `QueryDeviceDescriptor` answers NOT_SUPPORTED.
+    pub(crate) fn render_only() -> Self {
+        Self {
+            mode: DEFAULT_SCANOUT_EXTENT,
+            edid: [0u8; 128],
+        }
+    }
+
+    pub(crate) fn edid(&self) -> &[u8; 128] {
+        &self.edid
+    }
+}
+
+/// The 1920×1080 fallback, validated at COMPILE time.
+///
+/// A `const` match, not a runtime `unwrap`: if the default mode were ever edited
+/// below the minimum extent this is a build failure, and no runtime panic path
+/// is generated — which matters because a panic in any DDI is a silent graphics
+/// deadlock.
+const DEFAULT_SCANOUT_EXTENT: DisplayMode = match DisplayMode::from_host(
+    crate::ddi::vidpn::DEFAULT_MODE_WIDTH,
+    crate::ddi::vidpn::DEFAULT_MODE_HEIGHT,
+) {
+    Some(mode) => mode,
+    None => panic!("the default VidPn mode must be at or above the minimum extent"),
+};
 
 /// State whose meaning dies with the transport generation that produced it.
 ///
@@ -1182,16 +1231,21 @@ impl AdapterContext {
     /// The display half's scanout-0 mode `(width, height)`: the host-reported size
     /// if usable, else the 1920×1080 fallback. Every VidPn mode + the generated
     /// EDID derive from this so they stay mutually consistent (cofunctional).
+    /// A field read now: the minimum-size check ran ONCE, in
+    /// [`ScanoutMode::adopt`], instead of re-running here on every call through
+    /// bare literals. Returns the same `(u32, u32)` tuple as before, so its five
+    /// consumers are untouched.
     pub fn display_mode(&self) -> (u32, u32) {
-        let (w, h) = self.started().map_or((0, 0), |s| (s.display_w, s.display_h));
-        if w >= 320 && h >= 240 {
-            (w, h)
-        } else {
-            (
-                crate::ddi::vidpn::DEFAULT_MODE_WIDTH,
-                crate::ddi::vidpn::DEFAULT_MODE_HEIGHT,
-            )
-        }
+        self.started()
+            .map_or(DEFAULT_SCANOUT_EXTENT, |s| s.scanout_mode.mode)
+            .into()
+    }
+
+    /// The packed `(w << 16) | h` the `DspMd` breadcrumb reports.
+    pub(crate) fn display_mode_packed(&self) -> u32 {
+        self.started()
+            .map_or(DEFAULT_SCANOUT_EXTENT, |s| s.scanout_mode.mode)
+            .packed()
     }
 
     /// Raise the programming gate for a NEW interval and return its ticket.
@@ -2049,8 +2103,11 @@ impl AdapterContext {
     }
 
     /// The EDID served by `DxgkDdiQueryDeviceDescriptor`.
+    ///
+    /// Generated from — and therefore always consistent with — the extent
+    /// `display_mode()` reports: they are one value.
     pub fn edid(&self) -> Option<&[u8; 128]> {
-        self.started().map(|s| &s.edid)
+        self.started().map(|s| s.scanout_mode.edid())
     }
 
     /// The current transport generation's state, or `None` between StopDevice

@@ -326,8 +326,7 @@ pub unsafe extern "C" fn dxgkddi_start_device(
 
     // The scan-out mode and its EDID, resolved BEFORE publication because
     // `StartedState` is published exactly once.
-    let mut display_w = 0u32;
-    let mut display_h = 0u32;
+    let mut host_mode = None;
     if display_half {
         // Adopt the host's scanout-0 size (GET_DISPLAY_INFO, captured at transport
         // init) as the VidPn mode + generated-EDID native resolution, so Helios
@@ -341,8 +340,7 @@ pub unsafe extern "C" fn dxgkddi_start_device(
         // host answered but reported nothing usable.
         match adapter.with_virtio(|v| v.display_mode()) {
             Ok(Some((w, h))) => {
-                display_w = w;
-                display_h = h;
+                host_mode = Some((w, h));
             }
             Ok(None) => {
                 crate::diag::fault(crate::diag::FaultCounter::StMdB, 1);
@@ -353,20 +351,14 @@ pub unsafe extern "C" fn dxgkddi_start_device(
             }
         }
     }
-    // Same rule `AdapterContext::display_mode` applies, evaluated here so the
-    // EDID and the mode are generated from ONE value.
-    let (mode_w, mode_h) = if display_w >= 320 && display_h >= 240 {
-        (display_w, display_h)
+    // ONE value: the constructor validates the extent and generates the matching
+    // EDID, so the two cannot disagree. The render-only surface advertises no
+    // monitor, so its EDID is zeroed and QueryDeviceDescriptor answers
+    // NOT_SUPPORTED before ever reading it.
+    let scanout_mode = if display_half {
+        crate::adapter::ScanoutMode::adopt(host_mode)
     } else {
-        (
-            crate::ddi::vidpn::DEFAULT_MODE_WIDTH,
-            crate::ddi::vidpn::DEFAULT_MODE_HEIGHT,
-        )
-    };
-    let edid = if display_half {
-        crate::ddi::vidpn::build_edid(mode_w, mode_h)
-    } else {
-        [0u8; 128]
+        crate::adapter::ScanoutMode::render_only()
     };
 
     // ── Publish. Everything above was a local; from here the adapter answers. ──
@@ -385,9 +377,7 @@ pub unsafe extern "C" fn dxgkddi_start_device(
             alloc_cached,
             present_probe,
             display_half,
-            display_w,
-            display_h,
-            edid,
+            scanout_mode,
             paging_ram,
             bar_probe_ram,
         ));
@@ -399,7 +389,7 @@ pub unsafe extern "C" fn dxgkddi_start_device(
     }
 
     if display_half {
-        crate::diag::record_named_bytes(b"DspMd", (mode_w << 16) | (mode_h & 0xFFFF));
+        crate::diag::record_named_bytes(b"DspMd", adapter.display_mode_packed());
         crate::ddi::scanout_diag::maybe_run(adapter);
 
         // Arm the CRTC_VSYNC heartbeat: without a free-running VSync, dxgkrnl never

@@ -193,6 +193,62 @@ pub const fn seq_read(before: u32, after: u32) -> SeqRead {
 /// escape thread could hold the CPU while the publisher is descheduled.
 pub const SEQ_READ_ATTEMPTS: u32 = 8;
 
+/// Smallest scan-out extent Helios will adopt from the host's `GET_DISPLAY_INFO`.
+///
+/// One named constant for what used to be two bare literals re-evaluated on
+/// every `display_mode()` call.
+pub const MIN_DISPLAY_WIDTH: u32 = 320;
+pub const MIN_DISPLAY_HEIGHT: u32 = 240;
+
+/// A scan-out extent that has passed the minimum-size check exactly once.
+///
+/// The mode used to be two unvalidated `u32`s whose validation re-ran on every
+/// read through bare literals. Making it a constructed value means there is no
+/// way to observe an unvalidated `(0, 0)` mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DisplayMode {
+    width: core::num::NonZeroU32,
+    height: core::num::NonZeroU32,
+}
+
+impl DisplayMode {
+    /// Adopt the host-reported extent, or `None` if it is unusable.
+    pub const fn from_host(width: u32, height: u32) -> Option<Self> {
+        if width < MIN_DISPLAY_WIDTH || height < MIN_DISPLAY_HEIGHT {
+            return None;
+        }
+        match (
+            core::num::NonZeroU32::new(width),
+            core::num::NonZeroU32::new(height),
+        ) {
+            (Some(width), Some(height)) => Some(Self { width, height }),
+            // Unreachable: both are >= the minimums above. Written as a match
+            // rather than `unwrap` because a panic in a DDI is a silent graphics
+            // deadlock.
+            _ => None,
+        }
+    }
+
+    pub const fn width(self) -> u32 {
+        self.width.get()
+    }
+
+    pub const fn height(self) -> u32 {
+        self.height.get()
+    }
+
+    /// The `(w << 16) | h` form the `DspMd` breadcrumb reports.
+    pub const fn packed(self) -> u32 {
+        (self.width.get() << 16) | (self.height.get() & 0xFFFF)
+    }
+}
+
+impl From<DisplayMode> for (u32, u32) {
+    fn from(mode: DisplayMode) -> Self {
+        (mode.width(), mode.height())
+    }
+}
+
 /// Pack the VidPn programming gate: generation in the high 32 bits, the active
 /// flag in the low 32.
 ///
@@ -562,6 +618,29 @@ mod tests {
         );
         assert_eq!(ScanoutFormat::from_dxgi(0), None);
         assert_eq!(ScanoutFormat::Bgrx8.dxgi(), 88);
+    }
+
+    /// The vectors the review names, plus the shipped mode.
+    #[test]
+    fn display_mode_from_host_validates_once() {
+        assert_eq!(DisplayMode::from_host(0, 0), None);
+        assert_eq!(DisplayMode::from_host(319, 240), None);
+        assert_eq!(DisplayMode::from_host(320, 239), None);
+        // The 320x240 boundary is INCLUSIVE, matching the pre-R512
+        // `>= 320 && >= 240` test exactly.
+        let min = DisplayMode::from_host(320, 240).expect("320x240 is the minimum");
+        assert_eq!((min.width(), min.height()), (320, 240));
+        let shipped = DisplayMode::from_host(1896, 1066).expect("the shipped primary");
+        assert_eq!((shipped.width(), shipped.height()), (1896, 1066));
+        let fallback = DisplayMode::from_host(1920, 1080).expect("the fallback mode");
+        assert_eq!(<(u32, u32)>::from(fallback), (1920, 1080));
+        // DspMd's packed form must not change.
+        assert_eq!(shipped.packed(), (1896 << 16) | 1066);
+        assert_eq!(fallback.packed(), (1920 << 16) | 1080);
+        // A height whose low 16 bits would alias must still round-trip its
+        // width, since DspMd masks only the height.
+        let wide = DisplayMode::from_host(4096, 2160).expect("4K");
+        assert_eq!(wide.packed() >> 16, 4096);
     }
 
     #[test]
