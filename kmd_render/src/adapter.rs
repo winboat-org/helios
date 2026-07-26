@@ -965,6 +965,18 @@ impl AdapterContext {
         }
     }
 
+    /// Mint the notification target for one scan-out copy.
+    ///
+    /// Deliberately NOT a `#[repr(C)] ScanoutNotifyBlock` embedded in the
+    /// adapter: `scanout_refresh_pending`, `last_primary_address`,
+    /// `vidpn_programming` and `hpd_event` have readers all over the crate, so
+    /// nesting them would turn a transport-API fix into a crate-wide rename.
+    /// One construction site buys the same same-adapter guarantee at a fraction
+    /// of the blast radius.
+    pub(crate) fn scanout_notify(&self, primary_address: u64) -> crate::virtio::ScanoutNotify {
+        crate::virtio::ScanoutNotify::for_adapter(self, primary_address)
+    }
+
     /// Publish the address the CRTC_VSYNC packet reports as the display
     /// engine's authoritative state.
     ///

@@ -27,7 +27,7 @@ use wdk_sys::ntddk::{KeDelayExecutionThread, KeWaitForSingleObject};
 use wdk_sys::{KEVENT, LARGE_INTEGER, PVOID, STATUS_SUCCESS};
 
 use super::gpu::{
-    AsyncScanoutNotify, BlobMapBegin, BlobMapFinish, BlobMapPrep, BlobRemapBegin, DeviceOwner,
+    BlobMapBegin, BlobMapFinish, BlobMapPrep, BlobRemapBegin, DeviceOwner,
     FenceWaitPrep, OwnerFilter, SyncWaitBlock, CTRL_TEARDOWN_ABANDONS, CTRL_TIMEOUT_COUNT,
     FENCE_WAIT_TIMEOUTS, SUBMIT_META_BYTES, TRANSPORT_GONE_AT_WAIT,
 };
@@ -1494,7 +1494,7 @@ pub fn submit_venus_async(
             .expect("venus returned on every retry path");
         let res = adapter.with_virtio(move |v| {
             v.drain_used();
-            v.enqueue_async_submit(ctx_id, ring_idx, m, vn, venus_len, None)
+            v.enqueue_async_submit(ctx_id, ring_idx, m, vn, venus_len)
         });
         match res {
             Err(_) => return Err(VirtioError::DeviceError), // transport gone
@@ -1537,19 +1537,14 @@ pub fn submit_venus_async_scanout(
     let mut venus = DmaBuffer::new(stream.len()).ok_or(VirtioError::OutOfMemory)?;
     venus.as_mut_slice()[..stream.len()].copy_from_slice(stream);
     let venus_len = stream.len();
-    let notify = AsyncScanoutNotify {
-        pending: NonNull::from(&adapter.scanout_refresh_pending),
-        displayed_primary: NonNull::from(&adapter.last_primary_address),
-        programming: NonNull::from(&adapter.vidpn_programming),
-        primary_address,
-        // SAFETY: hpd_event is embedded in the stable adapter and initialized
-        // before StartDevice creates any Venus submissions.
-        event: unsafe { NonNull::new_unchecked(adapter.hpd_event.get()) },
-    };
+    // One construction site, on the adapter, so all four pointers necessarily
+    // come from the same adapter; and `enqueue_scanout_submit` is the only way
+    // to attach it, so it necessarily lands on the ring the drain honours.
+    let notify = adapter.scanout_notify(primary_address);
 
     let queued = adapter.with_virtio(move |v| {
         v.drain_used();
-        v.enqueue_async_submit(ctx_id, 1, meta, venus, venus_len, Some(notify))
+        v.enqueue_scanout_submit(ctx_id, meta, venus, venus_len, notify)
     });
     match queued {
         Ok(Ok(fence_id)) => Ok(fence_id),
@@ -1579,7 +1574,7 @@ pub fn submit_venus_async_present(
 
     let queued = adapter.with_virtio(move |v| {
         v.drain_used();
-        v.enqueue_async_submit(ctx_id, 1, meta, venus, venus_len, None)
+        v.enqueue_async_submit(ctx_id, crate::virtio::gpu::SCANOUT_RING_IDX, meta, venus, venus_len)
     });
     match queued {
         Ok(Ok(fence_id)) => Ok(fence_id),

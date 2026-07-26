@@ -19,7 +19,7 @@ pub mod gpu;
 pub mod hal;
 pub mod venus;
 
-pub use gpu::VirtioGpu;
+pub use gpu::{ScanoutNotify, VirtioGpu};
 
 use wdk_sys::{
     NTSTATUS, STATUS_DEVICE_BUSY, STATUS_INSUFFICIENT_RESOURCES, STATUS_INVALID_DEVICE_REQUEST,

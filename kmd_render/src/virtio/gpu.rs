@@ -633,17 +633,61 @@ pub struct SyncWaitBlock {
 /// Stable adapter-owned notification target for a scanout copy submitted on a
 /// GPU-completion ring. The used-ring drain sets `pending` and wakes `event`
 /// only after a successful ring-1 SUBMIT_3D completion.
+///
+/// Fields are PRIVATE and there is exactly one constructor,
+/// [`Self::for_adapter`], which derives all four pointers from a single
+/// `&AdapterContext`. That is what makes "the four pointers always come from the
+/// same adapter" structural rather than assembled field by field.
+///
+/// It can only be attached to a submission through
+/// [`VirtioGpu::enqueue_scanout_submit`], which hard-codes ring 1 — the ring the
+/// drain actually honours. A notify on any other ring used to be silently
+/// discarded at completion with no counter, and because the drain is the ONLY
+/// clear of `vidpn_programming` on the copied-primary path, that left the gate at
+/// 1 and suppressed every further CRTC_VSYNC indefinitely.
+///
+/// The four `NonNull`s' validity rests on the adapter outliving the transport,
+/// which StopDevice enforces by ordering (`set_virtio(None)` after cancel/join),
+/// and on `init_kernel_events` having run before any `KeSetEvent` on `hpd_event`.
+/// Neither is encodable — the self-referential lifetime (`VirtioGpu` lives inside
+/// the `AdapterContext` it points back into) is what defeats it — so both are
+/// documented HERE, once, instead of on four fields.
+/// The virtio ring whose used-ring completion represents real host GPU
+/// completion, and therefore the only one on which a [`ScanoutNotify`] may be
+/// honoured. Ring 0 retires at host DECODE, which is too early to publish pixels.
+pub(crate) const SCANOUT_RING_IDX: u32 = 1;
+
 #[derive(Clone, Copy)]
-pub struct AsyncScanoutNotify {
-    pub pending: NonNull<AtomicU32>,
+pub struct ScanoutNotify {
+    pending: NonNull<AtomicU32>,
     /// Address of the Windows primary whose compatibility copy this submission
     /// performs. Published as displayed only on successful GPU completion.
-    pub displayed_primary: NonNull<AtomicU64>,
+    displayed_primary: NonNull<AtomicU64>,
     /// Exact SetVidPnSourceAddress programming gate. Cleared after the copy
     /// succeeds or fails so VSync can resume with authoritative state.
-    pub programming: NonNull<AtomicU32>,
-    pub primary_address: u64,
-    pub event: NonNull<KEVENT>,
+    programming: NonNull<AtomicU32>,
+    primary_address: u64,
+    event: NonNull<KEVENT>,
+}
+
+impl ScanoutNotify {
+    /// The ONE construction site. Reached through
+    /// `AdapterContext::scanout_notify`.
+    pub(crate) fn for_adapter(
+        adapter: &crate::adapter::AdapterContext,
+        primary_address: u64,
+    ) -> Self {
+        Self {
+            pending: NonNull::from(&adapter.scanout_refresh_pending),
+            displayed_primary: NonNull::from(&adapter.last_primary_address),
+            programming: NonNull::from(&adapter.vidpn_programming),
+            primary_address,
+            // SAFETY: hpd_event is embedded in the stable adapter and
+            // initialized by init_kernel_events before StartDevice creates any
+            // Venus submissions.
+            event: unsafe { NonNull::new_unchecked(adapter.hpd_event.get()) },
+        }
+    }
 }
 
 impl SyncWaitBlock {
@@ -694,7 +738,7 @@ enum InFlightKind {
     AsyncVenus {
         fence_id: u64,
         ring_idx: u8,
-        scanout_notify: Option<AsyncScanoutNotify>,
+        scanout_notify: Option<ScanoutNotify>,
     },
     /// A control command whose caller must not wait for the host response.
     /// `completion` is a stable adapter-owned 0/1 gate; the used-ring drain
@@ -1357,10 +1401,47 @@ impl VirtioGpu {
         &mut self,
         ctx_id: u32,
         ring_idx: u32,
+        meta: DmaBuffer,
+        venus: DmaBuffer,
+        venus_len: usize,
+    ) -> Result<u64, (DmaBuffer, DmaBuffer, VirtioError)> {
+        self.enqueue_submit_inner(ctx_id, ring_idx, meta, venus, venus_len, None)
+    }
+
+    /// Enqueue the scan-out copy: an ASYNC fenced SUBMIT_3D on ring 1 carrying
+    /// the notification target whose completion publishes the displayed primary
+    /// and clears the programming gate.
+    ///
+    /// The ring is NOT a parameter. It used to be, independently of the notify,
+    /// while the drain only honoured a notify on ring 1 — so
+    /// `enqueue_async_submit(ctx, 0, .., Some(notify))` compiled, completed
+    /// through the `ring_idx != 1` path, and silently discarded the notify with
+    /// no counter and no error. Because that drain is the ONLY clear of
+    /// `vidpn_programming` on the copied-primary path, the gate stayed at 1 and
+    /// every further CRTC_VSYNC was suppressed for the rest of the boot. Making
+    /// the ring an implicit property of this entry point takes the
+    /// `(ring, notify)` mismatch out of the type space entirely.
+    pub fn enqueue_scanout_submit(
+        &mut self,
+        ctx_id: u32,
+        meta: DmaBuffer,
+        venus: DmaBuffer,
+        venus_len: usize,
+        notify: ScanoutNotify,
+    ) -> Result<u64, (DmaBuffer, DmaBuffer, VirtioError)> {
+        self.enqueue_submit_inner(ctx_id, SCANOUT_RING_IDX, meta, venus, venus_len, Some(notify))
+    }
+
+    /// Shared body of the two entry points above. Private: the notify/ring
+    /// pairing is theirs to decide, not a caller's.
+    fn enqueue_submit_inner(
+        &mut self,
+        ctx_id: u32,
+        ring_idx: u32,
         mut meta: DmaBuffer,
         venus: DmaBuffer,
         venus_len: usize,
-        scanout_notify: Option<AsyncScanoutNotify>,
+        scanout_notify: Option<ScanoutNotify>,
     ) -> Result<u64, (DmaBuffer, DmaBuffer, VirtioError)> {
         let hdr_len = core::mem::size_of::<VirtioGpuCmdSubmit>();
         let resp_len = core::mem::size_of::<VirtioGpuCtrlHdr>();
@@ -1681,7 +1762,10 @@ impl VirtioGpu {
                     // ring_idx=1 is the GPU-completion domain. Queue the host
                     // display refresh only after the copy has really completed;
                     // a decode-level or failed submit must never publish pixels.
-                    if ring_idx == 1 {
+                    // A notify can now only exist on this ring
+                    // (`enqueue_scanout_submit`), so the test is a belt-and-braces
+                    // check rather than the sole guard it used to be.
+                    if ring_idx == SCANOUT_RING_IDX as u8 {
                         if let Some(notify) = scanout_notify {
                             // SAFETY: both pointers name stable AdapterContext
                             // fields; the adapter owns this transport and outlives
