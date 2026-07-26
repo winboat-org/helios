@@ -198,7 +198,7 @@ pub unsafe extern "C" fn dxgkddi_start_device(
                 let venus_result = crate::virtio::ctrl::ctx_create(
                     adapter,
                     helios_protocol::VIRTIO_GPU_CAPSET_VENUS,
-                    0,
+                    None,
                 )
                 .and_then(|ctx_id| {
                     let (client, blob) =
@@ -417,7 +417,9 @@ pub unsafe extern "C" fn dxgkddi_stop_device(miniport_device_context: *mut c_voi
         if venus_ctx != 0 {
             // Best-effort: unref every KMD-internal blob (owner 0) and destroy the
             // venus context (PASSIVE flows through virtio::ctrl).
-            let _ = crate::virtio::ctrl::release_blobs_for_owner(adapter, 0);
+            // The KMD-owned sweep — `None` here means exactly the KMD's own blobs, not
+            // "every owner".
+            let _ = crate::virtio::ctrl::release_blobs_for_owner(adapter, None);
             let _ = crate::virtio::ctrl::ctx_destroy(adapter, venus_ctx);
         }
         // Free any parked completed entries at PASSIVE before the transport

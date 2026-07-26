@@ -448,7 +448,11 @@ unsafe fn with_blob_bytes(
     f: impl FnOnce(*mut u8, u64),
 ) -> bool {
     BAR_LAST_RESID.store(resource_id, Ordering::Relaxed);
-    let prep = match crate::virtio::ctrl::map_blob_prepare(adapter, None, resource_id) {
+    let prep = match crate::virtio::ctrl::map_blob_prepare(
+        adapter,
+        crate::virtio::gpu::OwnerFilter::Any,
+        resource_id,
+    ) {
         Ok(p) => p,
         Err(_) => {
             BAR_ERR_MAP.fetch_add(1, Ordering::Relaxed);

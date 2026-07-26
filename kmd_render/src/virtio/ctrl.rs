@@ -27,9 +27,9 @@ use wdk_sys::ntddk::{KeDelayExecutionThread, KeWaitForSingleObject};
 use wdk_sys::{KEVENT, LARGE_INTEGER, PVOID, STATUS_SUCCESS};
 
 use super::gpu::{
-    AsyncScanoutNotify, BlobMapBegin, BlobMapFinish, BlobMapPrep, BlobRemapBegin, FenceWaitPrep,
-    SyncWaitBlock, CTRL_TEARDOWN_ABANDONS, CTRL_TIMEOUT_COUNT, FENCE_WAIT_TIMEOUTS,
-    SUBMIT_META_BYTES, TRANSPORT_GONE_AT_WAIT,
+    AsyncScanoutNotify, BlobMapBegin, BlobMapFinish, BlobMapPrep, BlobRemapBegin, DeviceOwner,
+    FenceWaitPrep, OwnerFilter, SyncWaitBlock, CTRL_TEARDOWN_ABANDONS, CTRL_TIMEOUT_COUNT,
+    FENCE_WAIT_TIMEOUTS, SUBMIT_META_BYTES, TRANSPORT_GONE_AT_WAIT,
 };
 use super::hal::DmaBuffer;
 use super::VirtioError;
@@ -336,7 +336,7 @@ fn ctrl_roundtrip_ok(
 pub fn ctx_create(
     adapter: &AdapterContext,
     capset_id: u32,
-    owner: usize,
+    owner: Option<DeviceOwner>,
 ) -> Result<u32, VirtioError> {
     let ctx_id = adapter
         .with_virtio(|v| v.alloc_ctx_id())
@@ -367,7 +367,7 @@ pub fn ctx_destroy(adapter: &AdapterContext, ctx_id: u32) -> Result<(), VirtioEr
 }
 
 /// `CTX_DESTROY` every context still owned by `owner` (device teardown).
-pub fn destroy_contexts_for_owner(adapter: &AdapterContext, owner: usize) -> u32 {
+pub fn destroy_contexts_for_owner(adapter: &AdapterContext, owner: Option<DeviceOwner>) -> u32 {
     let mut destroyed = 0u32;
     loop {
         let taken = adapter
@@ -819,7 +819,7 @@ pub fn diagnostic_virgl_host3d_blob(
     }
     let aligned_size = (size + 0xFFF) & !0xFFF;
     let blob_id = VIRGL_DIAG_BLOB_ID.fetch_add(1, Ordering::Relaxed);
-    let ctx_id = ctx_create(adapter, helios_protocol::VIRTIO_GPU_CAPSET_VIRGL, 0)?;
+    let ctx_id = ctx_create(adapter, helios_protocol::VIRTIO_GPU_CAPSET_VIRGL, None)?;
 
     const VIRGL_CCMD_PIPE_RESOURCE_CREATE: u32 = 48;
     const VIRGL_PIPE_RES_CREATE_SIZE: u32 = 11;
@@ -873,7 +873,7 @@ pub fn diagnostic_virgl_host3d_blob(
         blob_flags,
         blob_id,
         aligned_size,
-        0,
+        None,
     ) {
         Ok(resource_id) => Ok((resource_id, blob_id, pitch)),
         Err(e) => {
@@ -928,7 +928,7 @@ pub fn diagnostic_virgl_host3d_guest_scanout(
     }
 
     let blob_id = VIRGL_DIAG_BLOB_ID.fetch_add(1, Ordering::Relaxed);
-    let ctx_id = ctx_create(adapter, helios_protocol::VIRTIO_GPU_CAPSET_VIRGL, 0)?;
+    let ctx_id = ctx_create(adapter, helios_protocol::VIRTIO_GPU_CAPSET_VIRGL, None)?;
 
     const VIRGL_CCMD_PIPE_RESOURCE_CREATE: u32 = 48;
     const VIRGL_PIPE_RES_CREATE_SIZE: u32 = 11;
@@ -1113,7 +1113,7 @@ pub fn alloc_blob(
     blob_flags: u32,
     blob_id: u64,
     size: u64,
-    owner: usize,
+    owner: Option<DeviceOwner>,
 ) -> Result<u32, VirtioError> {
     if size == 0 {
         return Err(VirtioError::DeviceError);
@@ -1177,7 +1177,7 @@ pub fn resource_unmap_blob(adapter: &AdapterContext, resource_id: u32) -> Result
 /// `None` resolves by resource id alone (the GDI executor / kernel path).
 pub fn map_blob_prepare(
     adapter: &AdapterContext,
-    owner: Option<usize>,
+    owner: OwnerFilter,
     resource_id: u32,
 ) -> Result<BlobMapPrep, VirtioError> {
     let mut busy_retries = 0u32;
@@ -1306,7 +1306,7 @@ pub fn map_blob_at(
 /// drop its tracking slot, returning its window range to the free list.
 pub fn release_blob_for_owner(
     adapter: &AdapterContext,
-    owner: usize,
+    owner: DeviceOwner,
     ctx_id: u32,
     resource_id: u32,
 ) -> Result<(), VirtioError> {
@@ -1334,7 +1334,7 @@ pub fn release_blob_for_owner(
 /// Reclaim every blob still owned by `owner` (a destroyed D3D device handle):
 /// unmap (if mapped), detach, unref, and return the window range. KMD-side
 /// safety net for an ICD that crashes or skips RELEASE_BLOB. Returns the count.
-pub fn release_blobs_for_owner(adapter: &AdapterContext, owner: usize) -> u32 {
+pub fn release_blobs_for_owner(adapter: &AdapterContext, owner: Option<DeviceOwner>) -> u32 {
     let mut reclaimed = 0u32;
     loop {
         let taken = adapter

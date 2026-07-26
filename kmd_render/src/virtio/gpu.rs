@@ -457,15 +457,55 @@ pub struct BlobMapPrep {
 }
 
 /// One tracked blob resource.
+/// A device that can own escape-tracked state: dxgkrnl's `DXGKARG_ESCAPE.hDevice`
+/// for the escaping device, proven non-null.
+///
+/// The guest and kernel ownership domains used to share one `usize`
+/// representation, and 0 belonged to BOTH: it was a legal (forgeable) escape
+/// handle value AND the kernel's "KMD-owned, invisible to escape reclaim"
+/// sentinel. `NonZeroUsize` separates them — `Option<DeviceOwner>` costs no
+/// extra bytes (niche-optimised), `None` means KMD-owned, and an escape verb
+/// that takes a `DeviceOwner` cannot be handed the kernel sentinel at all
+/// (k-capsescape-01).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct DeviceOwner(core::num::NonZeroUsize);
+
+impl DeviceOwner {
+    /// `None` for a null handle — the caller must refuse rather than substitute.
+    pub fn new(raw: usize) -> Option<Self> {
+        core::num::NonZeroUsize::new(raw).map(Self)
+    }
+
+    /// The opaque handle value, for tables that are not owner-typed (the
+    /// user-mapping table) and for diagnostics.
+    pub fn raw(self) -> usize {
+        self.0.get()
+    }
+}
+
+/// Which slots a blob lookup may match.
+///
+/// The two "no owner" concepts are deliberately NOT the same value: `Any` is a
+/// wildcard used by kernel paths that resolve by resource id alone (the paging
+/// engine, the Present blit, the scan-out diagnostics), while
+/// `Exactly(None)` means specifically the KMD-owned slots. Collapsing them
+/// would either break the kernel lookups or hand escapes a wildcard.
+#[derive(Clone, Copy)]
+pub enum OwnerFilter {
+    Any,
+    Exactly(Option<DeviceOwner>),
+}
+
 #[derive(Clone, Copy)]
 struct BlobSlot {
-    /// The owning D3D device handle (`DXGKARG_ESCAPE.hDevice`, as an opaque
-    /// `usize`) that allocated this blob. `DxgkDdiDestroyDevice` reclaims every
+    /// The owner that allocated this blob: `Some(device)` for an escape-owned
+    /// blob, `None` for KMD-owned (venus infrastructure, or a blob adopted by a
+    /// WDDM allocation). `DxgkDdiDestroyDevice` reclaims every
     /// blob tagged with the destroyed handle, so a crashing/forgetful ICD (e.g.
     /// the crash-looping LogonUI, or any process that skips RELEASE_BLOB) cannot
     /// leak the bounded blob table (`MAX_BLOBS`) and false-trip later allocations
     /// with `STATUS_INSUFFICIENT_RESOURCES`.
-    owner: usize,
+    owner: Option<DeviceOwner>,
     ctx_id: u32,
     resource_id: u32,
     /// Blob size in bytes (from ALLOC_BLOB; MAP_BLOB needs it to size the MDL).
@@ -507,8 +547,8 @@ pub struct TableStats {
 /// device-teardown reclamation.
 #[derive(Clone, Copy)]
 struct ContextSlot {
-    /// Owning D3D device handle (`DXGKARG_ESCAPE.hDevice` as an opaque `usize`).
-    owner: usize,
+    /// Owning device, or `None` for the KMD's own persistent venus context.
+    owner: Option<DeviceOwner>,
     ctx_id: u32,
 }
 
@@ -2111,7 +2151,7 @@ impl VirtioGpu {
 
     /// Track a live context for device-teardown reclamation (best-effort: on a
     /// full table the context still works, it just is not auto-reclaimed).
-    pub fn track_context(&mut self, owner: usize, ctx_id: u32) {
+    pub fn track_context(&mut self, owner: Option<DeviceOwner>, ctx_id: u32) {
         if self.contexts.len() < MAX_CONTEXTS {
             self.contexts.push(ContextSlot { owner, ctx_id });
         } else {
@@ -2128,7 +2168,7 @@ impl VirtioGpu {
 
     /// Pop one context still owned by `owner` (device-teardown reclamation
     /// iterates this, running the CTX_DESTROY round-trip outside the lock).
-    pub fn take_context_for_owner(&mut self, owner: usize) -> Option<u32> {
+    pub fn take_context_for_owner(&mut self, owner: Option<DeviceOwner>) -> Option<u32> {
         let idx = self.contexts.iter().position(|c| c.owner == owner)?;
         Some(self.contexts.swap_remove(idx).ctx_id)
     }
@@ -2169,7 +2209,13 @@ impl VirtioGpu {
     }
 
     /// Commit a reserved blob slot.
-    pub fn commit_blob(&mut self, owner: usize, ctx_id: u32, resource_id: u32, size: u64) {
+    pub fn commit_blob(
+        &mut self,
+        owner: Option<DeviceOwner>,
+        ctx_id: u32,
+        resource_id: u32,
+        size: u64,
+    ) {
         self.blobs_reserved = self.blobs_reserved.saturating_sub(1);
         self.blobs.push(BlobSlot {
             owner,
@@ -2193,23 +2239,29 @@ impl VirtioGpu {
     /// Pop the blob slot matching (`owner`, `ctx_id`, `resource_id`) — the
     /// RELEASE_BLOB path. The caller unmaps/detaches/unrefs outside the lock
     /// and returns the window range via [`Self::free_window_range_pub`].
+    /// Takes a `DeviceOwner`, not an `Option`: the KMD-owned slots are
+    /// unreachable from this path by TYPE, which is the whole point — an escape
+    /// with a null hDevice used to match every blob the KMD had adopted for a
+    /// live WDDM allocation.
     pub fn take_blob_matching(
         &mut self,
-        owner: usize,
+        owner: DeviceOwner,
         ctx_id: u32,
         resource_id: u32,
     ) -> Option<(u32, bool, u64, u64)> {
-        let idx = self
-            .blobs
-            .iter()
-            .position(|s| s.owner == owner && s.ctx_id == ctx_id && s.resource_id == resource_id)?;
+        let idx = self.blobs.iter().position(|s| {
+            s.owner == Some(owner) && s.ctx_id == ctx_id && s.resource_id == resource_id
+        })?;
         let slot = self.blobs.swap_remove(idx);
         Some((slot.resource_id, slot.mapped, slot.map_offset, slot.map_len))
     }
 
     /// Pop one blob still owned by `owner` (device-teardown reclamation).
     /// Returns `(ctx_id, resource_id, mapped, map_offset, map_len)`.
-    pub fn take_blob_for_owner(&mut self, owner: usize) -> Option<(u32, u32, bool, u64, u64)> {
+    pub fn take_blob_for_owner(
+        &mut self,
+        owner: Option<DeviceOwner>,
+    ) -> Option<(u32, u32, bool, u64, u64)> {
         let idx = self.blobs.iter().position(|s| s.owner == owner)?;
         let slot = self.blobs.swap_remove(idx);
         Some((
@@ -2267,10 +2319,10 @@ impl VirtioGpu {
             BLOB_FULL_REJECTS.fetch_add(1, Ordering::Relaxed);
             return;
         }
-        // Record with ctx_id 0 / owner 0: these blobs are not driven by an escape
+        // Record with ctx_id 0 / KMD owner: these blobs are not driven by an escape
         // device handle; teardown unrefs them explicitly via the venus client.
         self.blobs.push(BlobSlot {
-            owner: 0,
+            owner: None,
             ctx_id: 0,
             resource_id,
             size,
@@ -2286,7 +2338,7 @@ impl VirtioGpu {
     /// `(owner, size, mapped)` if the resource is a tracked, host-visible-mappable
     /// blob. Used by the Present blit to decide whether the composition source /
     /// IddCx destination can be CPU-mapped for a coherence copy.
-    pub fn blob_lookup(&self, resource_id: u32) -> Option<(usize, u64, bool)> {
+    pub fn blob_lookup(&self, resource_id: u32) -> Option<(Option<DeviceOwner>, u64, bool)> {
         self.blobs
             .iter()
             .find(|s| s.resource_id == resource_id)
@@ -2296,18 +2348,25 @@ impl VirtioGpu {
     /// Begin mapping a blob into the host-visible window: if already mapped,
     /// return the mapping; otherwise reserve a window range and hand the
     /// RESOURCE_MAP_BLOB round-trip to the caller (PASSIVE, outside this lock),
-    /// who then calls [`Self::blob_map_finish`]. `owner = None` resolves by
-    /// resource id alone (the GDI executor's any-owner lookup); `Some(o)` is
-    /// the owner-scoped escape path (resource ids can repeat across adapter
-    /// restarts while stale clients unwind).
-    pub fn blob_map_begin(&mut self, owner: Option<usize>, resource_id: u32) -> BlobMapBegin {
+    /// who then calls [`Self::blob_map_finish`]. [`OwnerFilter::Any`] resolves by
+    /// resource id alone (the kernel paths' any-owner lookup); `Exactly` is the
+    /// owner-scoped escape path (resource ids can repeat across adapter restarts
+    /// while stale clients unwind) and also names the KMD-owned slots as
+    /// `Exactly(None)`.
+    pub fn blob_map_begin(&mut self, owner: OwnerFilter, resource_id: u32) -> BlobMapBegin {
         let Some(window) = self.host_visible else {
             return BlobMapBegin::Failed(VirtioError::DeviceError);
         };
         let Some(idx) = self
             .blobs
             .iter()
-            .position(|s| s.resource_id == resource_id && owner.map_or(true, |o| s.owner == o))
+            .position(|s| {
+                s.resource_id == resource_id
+                    && match owner {
+                        OwnerFilter::Any => true,
+                        OwnerFilter::Exactly(o) => s.owner == o,
+                    }
+            })
         else {
             return BlobMapBegin::Failed(VirtioError::DeviceError);
         };
@@ -2531,7 +2590,7 @@ impl VirtioGpu {
     /// re-tag, `DxgkDdiDestroyDevice`'s `release_blobs_for_owner` sweep unrefs
     /// the host resource when the CREATING process's device dies, even though
     /// the shared WDDM allocation (and its cross-process openers) still
-    /// reference it. Re-tagging to owner 0 removes it from every escape-owner
+    /// reference it. Re-tagging to the KMD owner removes it from every escape-owner
     /// reclaim path; from here the allocation destroy path
     /// (`destroy_allocation_ctx` → `forget_allocation_blob` + guarded unref)
     /// owns the lifetime, matching KMD-created standard allocations.
@@ -2543,12 +2602,12 @@ impl VirtioGpu {
             return false;
         }
         if let Some(slot) = self.blobs.iter_mut().find(|s| s.resource_id == resource_id) {
-            slot.owner = 0;
+            slot.owner = None;
         }
         true
     }
 
-    /// Drop the KMD-internal (owner-0) tracking slot for an allocation's blob at
+    /// Drop the KMD-internal (KMD-owned) tracking slot for an allocation's blob at
     /// DestroyAllocation time. Returns `Some((mapped, map_offset, map_len))` if
     /// the slot existed — when `mapped`, the caller (PASSIVE, outside the lock)
     /// must run the RESOURCE_UNMAP_BLOB round-trip and then return the range
@@ -2558,7 +2617,7 @@ impl VirtioGpu {
         let idx = self
             .blobs
             .iter()
-            .position(|s| s.owner == 0 && s.resource_id == resource_id)?;
+            .position(|s| s.owner.is_none() && s.resource_id == resource_id)?;
         let slot = self.blobs.swap_remove(idx);
         Some((slot.mapped, slot.map_offset, slot.map_len))
     }

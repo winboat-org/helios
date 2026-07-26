@@ -4031,7 +4031,11 @@ impl VenusClient {
             }
         }
 
-        let prep = match ctrl::map_blob_prepare(adapter, None, destination.resource_id) {
+        let prep = match ctrl::map_blob_prepare(
+            adapter,
+            super::gpu::OwnerFilter::Any,
+            destination.resource_id,
+        ) {
             Ok(prep) => prep,
             Err(_) => {
                 crate::diag::record_named_bytes(b"PBPrF", 0xE3);
@@ -4642,7 +4646,7 @@ pub fn allocate_host_visible_blob(
     )?;
     // Track the ring blob (owner 0) so the map below can size the mapping.
     let _ = adapter.with_virtio(|v| v.note_blob_size(ring_res_id, RING_SHMEM_SIZE));
-    let ring_prep = ctrl::map_blob_prepare(adapter, Some(0), ring_res_id)?;
+    let ring_prep = ctrl::map_blob_prepare(adapter, super::gpu::OwnerFilter::Exactly(None), ring_res_id)?;
     let ring_map = KernelMap::new(ring_prep.gpa, ring_prep.size, ring_prep.map_cache)
         .ok_or(VirtioError::MmioMapFailed)?;
     ring_map.zero();
@@ -4658,7 +4662,7 @@ pub fn allocate_host_visible_blob(
         REPLY_SHMEM_SIZE,
     )?;
     let _ = adapter.with_virtio(|v| v.note_blob_size(reply_res_id, REPLY_SHMEM_SIZE));
-    let reply_prep = ctrl::map_blob_prepare(adapter, Some(0), reply_res_id)?;
+    let reply_prep = ctrl::map_blob_prepare(adapter, super::gpu::OwnerFilter::Exactly(None), reply_res_id)?;
     let reply_map = KernelMap::new(reply_prep.gpa, reply_prep.size, reply_prep.map_cache)
         .ok_or(VirtioError::MmioMapFailed)?;
     reply_map.zero();
@@ -5020,7 +5024,7 @@ pub fn allocate_host_visible_blob(
     diag(0x000A);
 
     // ── 9. Create + map the page-table blob backed by the venus memory id ─────
-    let pt_prep = ctrl::map_blob_prepare(adapter, Some(0), blob.res_id)?;
+    let pt_prep = ctrl::map_blob_prepare(adapter, super::gpu::OwnerFilter::Exactly(None), blob.res_id)?;
     diag(0x000B);
 
     let blob = HostVisibleBlob {

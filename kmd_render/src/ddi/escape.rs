@@ -39,6 +39,7 @@ use super::blob_map::{
 use crate::adapter::AdapterContext;
 use crate::dxgk::*;
 use crate::virtio::ctrl;
+use crate::virtio::gpu::{DeviceOwner, OwnerFilter};
 
 /// Ownership-bearing escape verbs refused because `hDevice` was NULL
 /// (registry-visible as `EscNoDev`).
@@ -98,20 +99,36 @@ pub unsafe extern "C" fn dxgkddi_escape(
     //
     // ZERO IS NOT A NEUTRAL VALUE. It is the kernel's "KMD/allocation-owned,
     // removed from every escape reclaim path" sentinel: `adopt_blob_for_allocation`
-    // re-tags a blob with owner 0 when the KMD takes it over for a WDDM
+    // re-tags a blob to the KMD owner when the KMD takes it over for a WDDM
     // allocation. `hDevice` is optional at the D3DKMTEscape API, so NULL is the
-    // one owner value a caller can forge — and it collides with that sentinel,
-    // which is why each ownership-bearing verb rejects it below (k-capsescape-01).
-    let owner = args.hDevice as usize;
+    // one owner value a caller can forge — and it used to collide with that
+    // sentinel (k-capsescape-01).
+    //
+    // The token is minted ONCE, here, and every ownership-bearing verb takes a
+    // `DeviceOwner` rather than a `usize`, so the null case has to be answered at
+    // this one site and cannot reach a slot lookup at all.
+    let owner = crate::virtio::gpu::DeviceOwner::new(args.hDevice as usize);
 
     match hdr.cmd_type {
-        HELIOS_ESCAPE_CTX_CREATE => escape_ctx_create(adapter, buf, owner),
+        HELIOS_ESCAPE_CTX_CREATE => match owner {
+            Some(owner) => escape_ctx_create(adapter, buf, owner),
+            None => refuse_no_device(),
+        },
         HELIOS_ESCAPE_CTX_DESTROY => escape_ctx_destroy(adapter, buf),
         HELIOS_ESCAPE_SUBMIT_VENUS => escape_submit_venus(adapter, buf),
         HELIOS_ESCAPE_WAIT_FENCE => escape_wait_fence(adapter, buf),
-        HELIOS_ESCAPE_ALLOC_BLOB => escape_alloc_blob(adapter, buf, owner),
-        HELIOS_ESCAPE_MAP_BLOB => escape_map_blob(adapter, buf, owner),
-        HELIOS_ESCAPE_RELEASE_BLOB => escape_release_blob(adapter, buf, owner),
+        HELIOS_ESCAPE_ALLOC_BLOB => match owner {
+            Some(owner) => escape_alloc_blob(adapter, buf, owner),
+            None => refuse_no_device(),
+        },
+        HELIOS_ESCAPE_MAP_BLOB => match owner {
+            Some(owner) => escape_map_blob(adapter, buf, owner),
+            None => refuse_no_device(),
+        },
+        HELIOS_ESCAPE_RELEASE_BLOB => match owner {
+            Some(owner) => escape_release_blob(adapter, buf, owner),
+            None => refuse_no_device(),
+        },
         HELIOS_ESCAPE_ATTACH_RESOURCE => escape_attach_resource(adapter, buf),
         HELIOS_ESCAPE_QUERY_STATS => escape_query_stats(adapter, buf),
         HELIOS_ESCAPE_QUERY_SCANOUT => escape_query_scanout(adapter, buf),
@@ -409,16 +426,17 @@ fn escape_query_stats(adapter: &AdapterContext, buf: &mut [u8]) -> NTSTATUS {
 
 /// `HELIOS_ESCAPE_CTX_CREATE` → create a Venus virtio-gpu context; write the
 /// guest-assigned id back into the in/out buffer's `out_ctx_id`.
-fn escape_ctx_create(adapter: &AdapterContext, buf: &mut [u8], owner: usize) -> NTSTATUS {
+fn escape_ctx_create(
+    adapter: &AdapterContext,
+    buf: &mut [u8],
+    owner: DeviceOwner,
+) -> NTSTATUS {
     let sz = size_of::<HeliosEscapeCtxCreate>();
     if buf.len() < sz {
         return STATUS_BUFFER_TOO_SMALL;
     }
-    if owner == 0 {
-        return refuse_no_device();
-    }
     let req: HeliosEscapeCtxCreate = pod_read_unaligned(&buf[..sz]);
-    match ctrl::ctx_create(adapter, req.capset_id, owner) {
+    match ctrl::ctx_create(adapter, req.capset_id, Some(owner)) {
         Ok(ctx_id) => {
             let mut out = req;
             out.out_ctx_id = ctx_id;
@@ -520,21 +538,19 @@ fn escape_wait_fence(adapter: &AdapterContext, buf: &mut [u8]) -> NTSTATUS {
 
 /// `HELIOS_ESCAPE_ALLOC_BLOB` → create a HOST3D virtio-gpu blob (create + attach)
 /// and record its size; write the guest-assigned `out_resource_id` back.
-fn escape_alloc_blob(adapter: &AdapterContext, buf: &mut [u8], owner: usize) -> NTSTATUS {
+fn escape_alloc_blob(
+    adapter: &AdapterContext,
+    buf: &mut [u8],
+    owner: DeviceOwner,
+) -> NTSTATUS {
     let sz = size_of::<HeliosEscapeAllocBlob>();
     if buf.len() < sz {
         return STATUS_BUFFER_TOO_SMALL;
     }
-    if owner == 0 {
-        // An owner-0 blob would be tagged KMD-owned: invisible to the per-device
-        // reclaim sweep, holding a MAX_BLOBS slot until StopDevice's
-        // release_blobs_for_owner(0) tears the transport down.
-        return refuse_no_device();
-    }
     let req: HeliosEscapeAllocBlob = pod_read_unaligned(&buf[..sz]);
     // DIAG: 0x0E04_HHHH = ALLOC_BLOB's owning handle (low 16 bits), to confirm it
     // matches the handle DxgkDdiDestroyDevice reclaims under (0x0E01_HHHH).
-    crate::diag::record(0x0E04_0000 | ((owner as u32) & 0xFFFF));
+    crate::diag::record(0x0E04_0000 | ((owner.raw() as u32) & 0xFFFF));
     match ctrl::alloc_blob(
         adapter,
         req.ctx_id,
@@ -542,7 +558,7 @@ fn escape_alloc_blob(adapter: &AdapterContext, buf: &mut [u8], owner: usize) -> 
         req.blob_flags,
         req.blob_id,
         req.size,
-        owner,
+        Some(owner),
     ) {
         Ok(resource_id) => {
             let mut out = req;
@@ -560,25 +576,30 @@ fn escape_alloc_blob(adapter: &AdapterContext, buf: &mut [u8], owner: usize) -> 
 /// under the virtio spinlock (DISPATCH), then we build the MDL + map into user
 /// space at PASSIVE_LEVEL, in this thread's (the ICD's) process. The mapping is
 /// tagged with the owning device handle and unmapped at DxgkDdiDestroyDevice.
-fn escape_map_blob(adapter: &AdapterContext, buf: &mut [u8], owner: usize) -> NTSTATUS {
+fn escape_map_blob(
+    adapter: &AdapterContext,
+    buf: &mut [u8],
+    owner: DeviceOwner,
+) -> NTSTATUS {
     let sz = size_of::<HeliosEscapeMapBlob>();
     if buf.len() < sz {
         return STATUS_BUFFER_TOO_SMALL;
     }
     let req: HeliosEscapeMapBlob = pod_read_unaligned(&buf[..sz]);
-    if owner == 0 || req.resource_id == 0 {
+    if req.resource_id == 0 {
         return STATUS_INVALID_PARAMETER;
     }
     // Reject a second map of an already-mapped resource (would claim a second
     // window offset + leave a duplicate host mapping). The ICD maps each blob once.
-    if adapter.mappings.contains(owner, req.resource_id) {
+    if adapter.mappings.contains(owner.raw(), req.resource_id) {
         return STATUS_INVALID_DEVICE_REQUEST;
     }
 
     // Phase 1 — the RESOURCE_MAP_BLOB flow (PASSIVE waits in virtio::ctrl):
     // reserves a window offset, round-trips the map, returns the
     // guest-physical range + host caching.
-    let prep = match ctrl::map_blob_prepare(adapter, Some(owner), req.resource_id) {
+    let prep = match ctrl::map_blob_prepare(adapter, OwnerFilter::Exactly(Some(owner)), req.resource_id)
+    {
         Ok(p) => p,
         Err(ve) => return ve.into(),
     };
@@ -603,7 +624,7 @@ fn escape_map_blob(adapter: &AdapterContext, buf: &mut [u8], owner: usize) -> NT
     // Phase 3 — record for handle-close teardown. Table full → undo immediately.
     if !adapter
         .mappings
-        .insert(owner, req.resource_id, user_va, mdl as usize)
+        .insert(owner.raw(), req.resource_id, user_va, mdl as usize)
     {
         // SAFETY: still in the owning process at PASSIVE; pair returned just above.
         unsafe { unmap_io_pages_from_user(user_va, mdl) };
@@ -619,25 +640,25 @@ fn escape_map_blob(adapter: &AdapterContext, buf: &mut [u8], owner: usize) -> NT
 
 /// `HELIOS_ESCAPE_RELEASE_BLOB` → unmap this device's user view (if any), then
 /// detach + unref the blob. Symmetric to MAP_BLOB; runs in the owning process.
-fn escape_release_blob(adapter: &AdapterContext, buf: &[u8], owner: usize) -> NTSTATUS {
+fn escape_release_blob(adapter: &AdapterContext, buf: &[u8], owner: DeviceOwner) -> NTSTATUS {
     let sz = size_of::<HeliosEscapeReleaseBlob>();
     if buf.len() < sz {
         return STATUS_BUFFER_TOO_SMALL;
     }
-    if owner == 0 {
-        // THE ONE THAT DESTROYS STATE: an owner-0 RELEASE_BLOB matches a slot the
-        // KMD adopted for a live WDDM allocation, pops it, and runs
-        // RESOURCE_UNMAP_BLOB + take_live_resource + resource_unref behind the
-        // allocation's back — DestroyAllocation then finds nothing and the host
-        // logs "invalid res_id" (the boot-#3 DWM kill class).
-        return refuse_no_device();
-    }
+    // THE VERB THAT DESTROYS STATE: with a `usize` owner, a null hDevice matched
+    // the slots the KMD adopts for live WDDM allocations — pop, unmap,
+    // take_live_resource, unref, all behind the allocation's back, after which
+    // DestroyAllocation finds nothing and the host logs "invalid res_id" (the
+    // boot-#3 DWM kill class). `DeviceOwner` makes that unrepresentable.
     let req: HeliosEscapeReleaseBlob = pod_read_unaligned(&buf[..sz]);
     if req.ctx_id == 0 || req.resource_id == 0 {
         return STATUS_INVALID_PARAMETER;
     }
     // The user VA can only be unmapped in the process/device that created it.
-    if let Some((user_va, mdl)) = adapter.mappings.take_for_resource(owner, req.resource_id) {
+    if let Some((user_va, mdl)) = adapter
+        .mappings
+        .take_for_resource(owner.raw(), req.resource_id)
+    {
         // SAFETY: PASSIVE, in the creating process; pair from a prior MAP_BLOB.
         unsafe { unmap_io_pages_from_user(user_va, mdl as wdk_sys::PMDL) };
     }

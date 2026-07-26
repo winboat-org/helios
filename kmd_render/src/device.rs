@@ -121,8 +121,11 @@ pub unsafe extern "C" fn dxgkddi_destroy_device(h_device: *mut c_void) -> NTSTAT
         // here at PASSIVE_LEVEL.
         crate::ddi::diag_dump_present_atomics();
         let before = adapter.with_virtio(|v| v.blob_count() as u32).unwrap_or(0);
-        let blobs = crate::virtio::ctrl::release_blobs_for_owner(adapter, owner);
-        let contexts = crate::virtio::ctrl::destroy_contexts_for_owner(adapter, owner);
+        // Sweep exactly this device's slots. A null hDevice would sweep the
+        // KMD-owned ones, so the token is minted rather than cast.
+        let device_owner = crate::virtio::gpu::DeviceOwner::new(owner);
+        let blobs = crate::virtio::ctrl::release_blobs_for_owner(adapter, device_owner);
+        let contexts = crate::virtio::ctrl::destroy_contexts_for_owner(adapter, device_owner);
         // Opportunistic PASSIVE reap of completed transport entries.
         crate::virtio::ctrl::reap_parked(adapter);
         // 0x0E02_BBBB = blob-table size BEFORE reclaim (saturated to 16 bits).
