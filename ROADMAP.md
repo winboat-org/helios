@@ -147,25 +147,44 @@ virtio-gpu scanout; IddCx/Looking Glass is no longer the active display path.*
    no aperture maps this boot). Next session should force real eviction pressure (a completed Fire
    Strike run plus a working-set larger than the 1 GiB BAR partition) before trusting them.
    Cursor-trail check not performed (needs interactive mouse input).
-5. Implement the remaining reviewed refactors atomically, in tranche order, one recommendation
+5. **NEXT — T2** (`REFACTOR_REVIEW.md` §T2): 30 items, R401–R426, **release UMD + adapter restart,
+   NO reboot and no KMD version bump** — the cheapest tranche to iterate (`win_cargo umd` release →
+   `win_install_umd -UmdDll ...\target\release` → `pnputil /restart-device`; no `win_dxvk`, no
+   `win_meson`). Prereqs T0 + T1a, both landed. Bug half: VOID-returning `Create*` failures never
+   reach `set_runtime_error` (R401 — worst case the direct-scanout PRIMARY returns S_OK with a null
+   driver resource); `open_resource` fabricates a 1×1 BGRA alias of a full-size shared surface
+   (R402); `pfnDynamicConstantBufferMapNoOverwrite` is left on the noop stub on every ≥11.1 device
+   (R403); the unbounded interface `else` arm writes 150 pointer slots into a 101/103-slot D3D10
+   table (R405); five cxx bridge methods are unguarded while cxx emits every shim `noexcept`, so
+   `std::bad_alloc` is `std::terminate` in dwm (R411). Cost half: `find_helios_icd_export` caches
+   nothing — a full toolhelp module walk 60–120×/s on the present thread plus a `LoadLibraryA` with
+   no `FreeLibrary` (R416, the largest measured per-frame win); the LINEAR scanout probe has no
+   negative cache (R417); 267 `log_line` vs 27 `trace_line!` sites with a 21-argument `format!` on
+   all seven draw entry points (R420).
+   ⚠ **Blocking prerequisite for R420: confirm with the owner which currently-unconditional log
+   lines the triage recipes grep for BEFORE moving them behind `trace_line!`.** ⚠ R417 commit (3)
+   is owner-gated: `track_dwm_composition_target` is the ONLY writer of `dev.composition_source`.
+   ⚠ The UMD has **no registry/escape counter surface** — a "named counter" is a process-global
+   `AtomicUsize` next to the `EXT_*` block plus a field in an existing periodic dump line.
+6. Implement the remaining reviewed refactors atomically, in tranche order, one recommendation
    per commit; never fold a `BUG` fix into a structure move. Preserve the current direct
    primary, completion ordering, loud-failure contracts, registry ABI, and
    diagnostic names unless a reviewed change explicitly migrates them. Replace
    arbitrary `Sleep`/poll loops with event, interrupt, fence, or
    condition-variable contracts; do not remove bounded safety timeouts merely
    because they wait.
-6. Regression-test each tranche and the final driver against visible desktop
+7. Regression-test each tranche and the final driver against visible desktop
    output, idle wake, rapid cursor motion, DComp cadence, DWM stability,
    same-boot KMD breadcrumbs, and host scanout evidence. Keep
    `ScanoutDiag` absent during primary tests.
-7. Continue soaking the current direct-primary path across DWM buffer rotation,
+8. Continue soaking the current direct-primary path across DWM buffer rotation,
    resize, suspend/resume, device restart, and cold boot.
-8. Pursue true host zero-copy only with a layout contract the display importer
+9. Pursue true host zero-copy only with a layout contract the display importer
    can consume. An explicit DRM modifier is one possible route, but enabling the
    modifier/DMA_BUF extensions on every DXVK device is prohibited: it inflated
    ordinary shared OPTIMAL import requirements and caused valid undersized-import
    refusal, DWM failures, and NVIDIA Xid 31 when bypassed.
-9. Continue D3D11 stability and conformance work after the quality pass.
+10. Continue D3D11 stability and conformance work after the quality pass.
 
 ## Historical PSC workstreams
 
