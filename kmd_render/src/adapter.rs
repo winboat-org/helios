@@ -350,6 +350,14 @@ pub struct AdapterContext {
     pub primary_scanout_memory_type: AtomicU32,
     pub primary_scanout_dxgi_format: AtomicU32,
     pub primary_scanout_generation: AtomicU32,
+    /// Seqlock over the whole `primary_scanout_*` set: odd while a publisher is
+    /// mid-update, even when the fields are coherent. The publisher's
+    /// store-id-last ordering defends a FIRST publish; this defends a
+    /// REPUBLISH, where a reader could otherwise combine the old resource id
+    /// with the new geometry (k-capsescape-11). Atomic-field based on purpose —
+    /// a classic memcpy seqlock over an `UnsafeCell<T>` is a data race under the
+    /// Rust memory model, UB even when the sequence check discards the value.
+    pub primary_scanout_seq: AtomicU32,
     /// Adapter-owned production LINEAR target. Unlike the bootstrap standard
     /// primary allocation, this resource is never reclaimed by VidMm while DWM
     /// replaces the primary with its private OPTIMAL render target.
@@ -504,6 +512,7 @@ impl AdapterContext {
             primary_scanout_memory_type: AtomicU32::new(0),
             primary_scanout_dxgi_format: AtomicU32::new(0),
             primary_scanout_generation: AtomicU32::new(0),
+            primary_scanout_seq: AtomicU32::new(0),
             dedicated_scanout_resource: AtomicU32::new(0),
             dedicated_scanout_image: AtomicU64::new(0),
             dedicated_scanout_memory: AtomicU64::new(0),
@@ -579,12 +588,15 @@ impl AdapterContext {
         self.dedicated_scanout_resource.store(0, Ordering::Release);
         self.dedicated_scanout_image.store(0, Ordering::Release);
         self.dedicated_scanout_memory.store(0, Ordering::Release);
+        // Third mutator of the descriptor: same odd/even discipline.
+        self.primary_scanout_seq.fetch_add(1, Ordering::Release);
         self.primary_scanout_resource.store(0, Ordering::Release);
         self.primary_scanout_wh.store(0, Ordering::Release);
         self.primary_scanout_layout.store(0, Ordering::Release);
         self.primary_scanout_alloc_size.store(0, Ordering::Release);
         self.primary_scanout_memory_type.store(0, Ordering::Release);
         self.primary_scanout_dxgi_format.store(0, Ordering::Release);
+        self.primary_scanout_seq.fetch_add(1, Ordering::Release);
         self.diag_scanout_resource.store(0, Ordering::Release);
         self.diag_scanout_wh.store(0, Ordering::Release);
         self.diag_scanout_layout.store(0, Ordering::Release);
@@ -793,6 +805,8 @@ impl AdapterContext {
         dxgi_format: u32,
     ) {
         use core::sync::atomic::Ordering;
+        // Odd: readers must not use the fields between these two bumps.
+        self.primary_scanout_seq.fetch_add(1, Ordering::Release);
         self.primary_scanout_wh
             .store(((width as u64) << 32) | height as u64, Ordering::Relaxed);
         self.primary_scanout_layout.store(
@@ -809,6 +823,8 @@ impl AdapterContext {
             .fetch_add(1, Ordering::Relaxed);
         self.primary_scanout_resource
             .store(resource_id, Ordering::Release);
+        // Even: the set is coherent again.
+        self.primary_scanout_seq.fetch_add(1, Ordering::Release);
     }
 
     /// Remove a published primary identity only if it still names `resource_id`.
@@ -824,6 +840,7 @@ impl AdapterContext {
         {
             return;
         }
+        self.primary_scanout_seq.fetch_add(1, Ordering::Release);
         if self
             .primary_scanout_resource
             .compare_exchange(resource_id, 0, Ordering::AcqRel, Ordering::Acquire)
@@ -832,6 +849,7 @@ impl AdapterContext {
             self.primary_scanout_generation
                 .fetch_add(1, Ordering::Relaxed);
         }
+        self.primary_scanout_seq.fetch_add(1, Ordering::Release);
     }
 
     /// Remember the KMD-owned diagnostic blob. The production scanout can still

@@ -52,6 +52,12 @@ use crate::virtio::gpu::{DeviceOwner, OwnerFilter};
 /// processes. This must read 0 in normal operation.
 static ESCAPE_NO_DEVICE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
+/// QUERY_SCANOUT reads that gave up after SEQ_READ_ATTEMPTS because a publisher
+/// held the descriptor throughout (registry-visible as `QsRetry`). Expected 0 in
+/// steady state; it can only move under a mode-change loop.
+static QUERY_SCANOUT_RETRY_GIVEUPS: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
 /// Context verbs refused because the caller's device does not own the ctx_id
 /// (registry-visible as `EscCtxOwn`). Must read 0: every in-tree caller uses the
 /// context it created.
@@ -171,7 +177,49 @@ fn escape_query_scanout(adapter: &AdapterContext, buf: &mut [u8]) -> NTSTATUS {
         return STATUS_BUFFER_TOO_SMALL;
     }
     let mut out: HeliosEscapeQueryScanout = pod_read_unaligned(&buf[..sz]);
-    let resource_id = adapter.primary_scanout_resource.load(Ordering::Acquire);
+
+    // SEQLOCK READ. Loading the resource id first and everything else Relaxed
+    // was safe only against a FIRST publish; a republish landing between the
+    // loads returned generation N's id with generation N+1's
+    // pitch/plane_offset/memory_type, and out_generation (read last, Relaxed)
+    // could not expose the tear. The retry is BOUNDED — this reader is a PASSIVE
+    // escape but the publishers can run at raised IRQL on the VidPn path, so an
+    // unbounded spin would be a new wedge class.
+    let mut snapshot = None;
+    for _ in 0..helios_kmd_logic::SEQ_READ_ATTEMPTS {
+        let before = adapter.primary_scanout_seq.load(Ordering::Acquire);
+        let resource_id = adapter.primary_scanout_resource.load(Ordering::Relaxed);
+        let wh = adapter.primary_scanout_wh.load(Ordering::Relaxed);
+        let layout = adapter.primary_scanout_layout.load(Ordering::Relaxed);
+        let alloc_size = adapter.primary_scanout_alloc_size.load(Ordering::Relaxed);
+        let dxgi_format = adapter.primary_scanout_dxgi_format.load(Ordering::Relaxed);
+        let memory_type = adapter.primary_scanout_memory_type.load(Ordering::Relaxed);
+        let generation = adapter.primary_scanout_generation.load(Ordering::Relaxed);
+        let after = adapter.primary_scanout_seq.load(Ordering::Acquire);
+        if helios_kmd_logic::seq_read(before, after) == helios_kmd_logic::SeqRead::Stable {
+            snapshot = Some((
+                resource_id,
+                wh,
+                layout,
+                alloc_size,
+                dxgi_format,
+                memory_type,
+                generation,
+            ));
+            break;
+        }
+    }
+    let Some((resource_id, wh, layout, alloc_size, dxgi_format, memory_type, generation)) = snapshot
+    else {
+        // A publisher held the descriptor for every attempt. Report "no primary"
+        // rather than a torn one; the consumer polls.
+        let n = QUERY_SCANOUT_RETRY_GIVEUPS.fetch_add(1, Ordering::Relaxed) + 1;
+        if n == 1 || n % 64 == 0 {
+            crate::diag::record_named_bytes(b"QsRetry", n);
+        }
+        return STATUS_DEVICE_BUSY;
+    };
+
     let live = resource_id != 0
         && adapter
             .with_virtio(|v| v.resource_is_live(resource_id))
@@ -185,23 +233,21 @@ fn escape_query_scanout(adapter: &AdapterContext, buf: &mut [u8]) -> NTSTATUS {
         out.out_pitch = 0;
         out.out_plane_offset = 0;
         out.out_memory_type_index = 0;
-        out.out_generation = adapter.primary_scanout_generation.load(Ordering::Relaxed);
+        out.out_generation = generation;
         out.reserved = [0; 2];
         buf[..sz].copy_from_slice(bytes_of(&out));
         return STATUS_SUCCESS;
     }
 
-    let wh = adapter.primary_scanout_wh.load(Ordering::Relaxed);
-    let layout = adapter.primary_scanout_layout.load(Ordering::Relaxed);
-    out.out_alloc_size = adapter.primary_scanout_alloc_size.load(Ordering::Relaxed);
+    out.out_alloc_size = alloc_size;
     out.out_resource_id = resource_id;
     out.out_width = (wh >> 32) as u32;
     out.out_height = wh as u32;
-    out.out_dxgi_format = adapter.primary_scanout_dxgi_format.load(Ordering::Relaxed);
+    out.out_dxgi_format = dxgi_format;
     out.out_pitch = (layout >> 32) as u32;
     out.out_plane_offset = layout as u32;
-    out.out_memory_type_index = adapter.primary_scanout_memory_type.load(Ordering::Relaxed);
-    out.out_generation = adapter.primary_scanout_generation.load(Ordering::Relaxed);
+    out.out_memory_type_index = memory_type;
+    out.out_generation = generation;
     out.reserved = [0; 2];
     buf[..sz].copy_from_slice(bytes_of(&out));
     STATUS_SUCCESS

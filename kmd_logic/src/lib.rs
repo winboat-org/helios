@@ -157,6 +157,42 @@ impl TryFrom<usize> for MetaLayout {
     }
 }
 
+/// Verdict of one seqlock read attempt over a published descriptor.
+///
+/// The primary-scanout descriptor is published field by field and was read the
+/// same way, with the resource id loaded FIRST and everything else `Relaxed`:
+/// the publisher's store order defends a first publish, but a REPUBLISH landing
+/// between the reader's loads yields resource_id from generation N combined with
+/// pitch/format/plane_offset from N+1, and the consumer cannot detect it
+/// (k-capsescape-11).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SeqRead {
+    /// The snapshot is coherent.
+    Stable,
+    /// A publish was in flight (odd sequence) or landed mid-read — read again.
+    Retry,
+}
+
+/// Classify a seqlock read from the sequence value before and after the fields.
+///
+/// Odd `before` means a writer held the descriptor when the read started; a
+/// changed value means one landed during it. Both are retries; nothing else is.
+pub const fn seq_read(before: u32, after: u32) -> SeqRead {
+    if before % 2 != 0 || before != after {
+        SeqRead::Retry
+    } else {
+        SeqRead::Stable
+    }
+}
+
+/// Bound on seqlock read attempts before the reader gives up and reports "no
+/// coherent value" instead of spinning.
+///
+/// The reader is a PASSIVE escape but the publishers can run at raised IRQL on
+/// the VidPn path, so an unbounded spin here would be a new wedge class: the
+/// escape thread could hold the CPU while the publisher is descheduled.
+pub const SEQ_READ_ATTEMPTS: u32 = 8;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -304,6 +340,43 @@ mod tests {
             MetaLayout::from_trailer_len(96).unwrap().copy_bytes(),
             MetaLayout::FULL_BYTES
         );
+    }
+
+    #[test]
+    fn seq_read_accepts_only_an_even_unchanged_sequence() {
+        assert_eq!(seq_read(0, 0), SeqRead::Stable);
+        assert_eq!(seq_read(2, 2), SeqRead::Stable);
+        assert_eq!(seq_read(u32::MAX - 1, u32::MAX - 1), SeqRead::Stable);
+    }
+
+    #[test]
+    fn seq_read_retries_on_an_in_flight_or_landed_publish() {
+        // Writer held the descriptor when the read started.
+        assert_eq!(seq_read(1, 1), SeqRead::Retry);
+        assert_eq!(seq_read(3, 4), SeqRead::Retry);
+        // A publish landed during the read (the republish tear this fixes).
+        assert_eq!(seq_read(2, 4), SeqRead::Retry);
+        assert_eq!(seq_read(2, 3), SeqRead::Retry);
+        // Wrap is still a change.
+        assert_eq!(seq_read(u32::MAX - 1, 0), SeqRead::Retry);
+    }
+
+    /// A simulated writer that never stops must exhaust the bound rather than
+    /// spin: the reader is PASSIVE, the publishers can be at raised IRQL.
+    #[test]
+    fn seq_read_bound_terminates_against_a_live_writer() {
+        let mut attempts = 0;
+        let mut settled = false;
+        while attempts < SEQ_READ_ATTEMPTS {
+            attempts += 1;
+            // Always odd => always Retry.
+            if seq_read(2 * attempts + 1, 2 * attempts + 1) == SeqRead::Stable {
+                settled = true;
+                break;
+            }
+        }
+        assert!(!settled);
+        assert_eq!(attempts, SEQ_READ_ATTEMPTS);
     }
 
     /// Both moved functions are `const fn`, so a future edit that reaches for
