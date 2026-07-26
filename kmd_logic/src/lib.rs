@@ -97,6 +97,66 @@ impl Pfn {
     }
 }
 
+/// The private-data trailer layouts this driver actually accepts.
+///
+/// The trailer is guest-supplied (`D3DKMTCreateAllocation` private data), and
+/// the length test used to be a max-union bound — "at least 24, copy up to 48" —
+/// so any length in 25..=47 was accepted and copied into the MIDDLE of a field,
+/// zero-extending the remainder. A 30-byte trailer yielded
+/// `venus_alloc_size = real & 0x0000_FFFF_FFFF_FFFF` and `plane_offset = 0`: a
+/// plausible-looking but wrong exact import size, which is the undersize-import
+/// class that previously produced host Xid 31 FAULT_PTE. Per-arm validation,
+/// not max-union (k-alloc-03).
+///
+/// The byte counts are duplicated from `helios_protocol` because this crate
+/// deliberately has no dependency edge to it; `kmd_render` pins them together
+/// with a `const` assertion at the use site.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MetaLayout {
+    /// Geometry + bind/misc only, no venus identity fields. Exactly the first
+    /// 24 bytes of the full layout, so it parses into a zero-extended meta and
+    /// an allocation created by a pre-identity driver instance can still be
+    /// opened after a component update without a reboot.
+    Legacy24,
+    /// The full trailer. Longer buffers are accepted and the excess ignored —
+    /// that is how a future writer adds fields without breaking this one.
+    Full48,
+}
+
+impl MetaLayout {
+    pub const LEGACY_BYTES: usize = 24;
+    pub const FULL_BYTES: usize = 48;
+
+    /// Classify a trailer length, or `None` if it is not one of the two real
+    /// layouts. `None` must produce a refusal, never a partial read.
+    pub const fn from_trailer_len(len: usize) -> Option<Self> {
+        if len == Self::LEGACY_BYTES {
+            Some(Self::Legacy24)
+        } else if len >= Self::FULL_BYTES {
+            Some(Self::Full48)
+        } else {
+            None
+        }
+    }
+
+    /// How many bytes to copy. Comes from the layout, never from arithmetic on
+    /// the caller-supplied size.
+    pub const fn copy_bytes(self) -> usize {
+        match self {
+            Self::Legacy24 => Self::LEGACY_BYTES,
+            Self::Full48 => Self::FULL_BYTES,
+        }
+    }
+}
+
+impl TryFrom<usize> for MetaLayout {
+    type Error = ();
+
+    fn try_from(len: usize) -> Result<Self, Self::Error> {
+        Self::from_trailer_len(len).ok_or(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -215,6 +275,35 @@ mod tests {
     fn pfn_physical_address_rejects_the_sign_bit() {
         assert_eq!(Pfn((1 << 52) - 1).physical_address(), None);
         assert_eq!(Pfn(1 << 51).physical_address(), None);
+    }
+
+    #[test]
+    fn meta_layout_accepts_only_the_two_real_layouts() {
+        assert_eq!(MetaLayout::try_from(24), Ok(MetaLayout::Legacy24));
+        assert_eq!(MetaLayout::try_from(48), Ok(MetaLayout::Full48));
+        // 96 is what both live writers emit (48 prefix + 48 trailer).
+        assert_eq!(MetaLayout::try_from(96), Ok(MetaLayout::Full48));
+        assert_eq!(MetaLayout::try_from(usize::MAX), Ok(MetaLayout::Full48));
+    }
+
+    /// The whole point: a length that lands mid-field is refused, not truncated
+    /// into a plausible-looking wrong value.
+    #[test]
+    fn meta_layout_rejects_partial_trailers() {
+        for len in [0usize, 1, 8, 16, 23, 25, 30, 32, 40, 47] {
+            assert_eq!(MetaLayout::try_from(len), Err(()), "len {len}");
+        }
+    }
+
+    #[test]
+    fn meta_layout_copy_length_comes_from_the_layout() {
+        assert_eq!(MetaLayout::Legacy24.copy_bytes(), 24);
+        assert_eq!(MetaLayout::Full48.copy_bytes(), 48);
+        // A longer buffer copies the full layout, never `len`.
+        assert_eq!(
+            MetaLayout::from_trailer_len(96).unwrap().copy_bytes(),
+            MetaLayout::FULL_BYTES
+        );
     }
 
     /// Both moved functions are `const fn`, so a future edit that reaches for

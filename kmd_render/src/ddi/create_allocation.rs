@@ -623,23 +623,53 @@ fn record_alloc_event(resid: u32, width: u32, height: u32, ctx_id: u32, is_open:
     );
 }
 
+/// Trailer lengths that named neither real layout and were therefore refused
+/// (registry-visible as `MetaLen`). Zero is the expected value forever: the KMD
+/// reports PRIV_SIZE 48 + 48 = 96 and the UMD's RuntimeAllocPrivate is exactly
+/// 96 with NumAllocations = 1, so no live writer can produce one.
+static META_LEN_REJECTS: AtomicU32 = AtomicU32::new(0);
+
 unsafe fn read_standard_meta(
     private: *const c_void,
     private_size: UINT,
 ) -> Option<HeliosWddmAllocMeta> {
-    // Legacy 24-byte trailer (geometry + bind/misc, no venus identity fields):
-    // its layout is exactly the first 24 bytes of HeliosWddmAllocMeta, so a
-    // short trailer parses into a zero-extended meta. Allocations created by a
-    // pre-identity driver instance can still be opened after a component
-    // update without a reboot.
-    const LEGACY_META_SIZE: usize = 24;
+    use helios_kmd_logic::MetaLayout;
+
+    // The layout enum's byte counts are a copy of the protocol's (kmd_logic has
+    // no dependency edge to helios_protocol); this pins them together.
+    const _: () = assert!(size_of::<HeliosWddmAllocMeta>() == MetaLayout::FULL_BYTES);
+
     let base = size_of::<HeliosWddmAllocPrivate>();
-    if private.is_null() || (private_size as usize) < base + LEGACY_META_SIZE {
+    if private.is_null() {
         return None;
     }
-    let have = ((private_size as usize) - base).min(size_of::<HeliosWddmAllocMeta>());
+    let Some(trailer_len) = (private_size as usize).checked_sub(base) else {
+        return None;
+    };
+    // PER-ARM, not max-union: the copy length comes from the layout, never from
+    // arithmetic on an untrusted size, so a trailer that stops mid-field is
+    // refused instead of being zero-extended into a plausible wrong value.
+    let Ok(layout) = MetaLayout::try_from(trailer_len) else {
+        if trailer_len >= MetaLayout::LEGACY_BYTES {
+            // A trailer long enough to have been accepted by the old bound.
+            // Shorter ones are "no trailer at all" and keep their existing
+            // silent refusal.
+            let n = META_LEN_REJECTS.fetch_add(1, Ordering::Relaxed) + 1;
+            // PASSIVE (both call sites are PASSIVE DDIs). First occurrence plus
+            // every 64th: this path is guest-reachable, so it must not be able
+            // to turn into a registry-write storm.
+            if n == 1 || n % 64 == 0 {
+                crate::diag::record_named_bytes(b"MetaLen", n);
+            }
+        }
+        return None;
+    };
+    let have = layout.copy_bytes();
     let mut raw = [0u8; size_of::<HeliosWddmAllocMeta>()];
-    // SAFETY: bounds-checked; `have` bytes of trailer exist past the 48-byte prefix.
+    // SAFETY: `have` is 24 or 48 and `trailer_len >= have` was proven by the
+    // layout classification, so that many trailer bytes exist past the prefix.
+    // A Legacy24 read leaves the remaining 24 bytes zeroed, which is the
+    // documented zero-extension.
     unsafe {
         core::ptr::copy_nonoverlapping((private as *const u8).add(base), raw.as_mut_ptr(), have);
     }
