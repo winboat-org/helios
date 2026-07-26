@@ -1156,6 +1156,10 @@ impl AdapterContext {
             b"PkHi",
             crate::virtio::gpu::PARKED_HIGH_WATER.load(Ordering::Relaxed),
         );
+        // R505: the nine deferred-programming refusal counters. Flushed from
+        // HERE — a PASSIVE, already-throttled site — and never from the refusal
+        // path itself, which would be a registry write per refused frame.
+        crate::ddi::display::record_scanout_reject_counters();
         crate::ddi::record_present_handoff_telemetry();
     }
 

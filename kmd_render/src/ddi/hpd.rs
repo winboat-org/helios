@@ -206,8 +206,13 @@ pub unsafe extern "C" fn hpd_thread_routine(context: *mut c_void) {
                     adapter.scanout_refresh_pending.store(1, Ordering::Release);
                 }
                 // No bound scanout: there is nothing meaningful to flush. A
-                // later completed copy will publish a fresh dirty edge.
-                ScanoutRefreshQueue::Unavailable => {}
+                // later completed copy will publish a fresh dirty edge. This
+                // DROPS the dirty bit, so it is counted (`ScUnav`) rather than
+                // being a comment — a rising count here means dirty frames are
+                // being discarded because nothing is bound.
+                ScanoutRefreshQueue::Unavailable => {
+                    crate::ddi::display::SC_UNAVAILABLE.fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
 

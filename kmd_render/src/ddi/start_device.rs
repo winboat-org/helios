@@ -282,6 +282,11 @@ pub unsafe extern "C" fn dxgkddi_start_device(
     // this, but a start that inherits a latched gate or a stale resource id from
     // a previous transport generation is unrecoverable, so pay for it twice.
     adapter.reset_display_publication_state();
+    // R505: zero the deferred-programming refusal counters and write the zeros
+    // through. Registry counter values persist across boots, so without this a
+    // reader cannot tell a counter that is merely PRESENT from one that moved
+    // this boot.
+    crate::ddi::display::reset_scanout_reject_counters();
 
     if adapter.display_half {
         // Adopt the host's scanout-0 size (GET_DISPLAY_INFO, captured at transport

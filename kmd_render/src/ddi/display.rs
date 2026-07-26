@@ -971,18 +971,192 @@ unsafe fn apply_vidpn_source_address(adapter: &AdapterContext, h_alloc: HANDLE) 
     })
 }
 
+/// Why one deferred programming attempt refused to program the primary.
+///
+/// Every unhappy exit of [`program_vidpn_source`] produces one of these, and
+/// each variant owns BOTH its registry breadcrumb and its counter — so adding a
+/// refusal without a counter stops compiling. Before this, seven of the eight
+/// were visible only as `VpDSt`, a single overwritten DWORD, and the eighth (an
+/// `hAllocation` that does not resolve) returned STATUS_SUCCESS with no counter
+/// at all: the OS believed the primary was programmed and the only trace,
+/// `ScRid=0`, was overwritten by the next successful bind.
+///
+/// The two variants that carry an NTSTATUS do so because the current code
+/// propagates the callee's status rather than choosing one; collapsing them to
+/// a fixed status would change what the DDI returns.
+#[derive(Clone, Copy)]
+pub(crate) enum ScanoutReject {
+    /// `hAllocation` did not resolve to a backed KMD allocation.
+    BadAlloc,
+    /// The primary's extent does not match the mode we advertise.
+    Extent,
+    /// A direct-scan-out primary whose pitch/offset/size/format is not
+    /// exportable — the guard that keeps QEMU from reading past the blob.
+    Layout,
+    /// No virtio wire encoding for this DXGI format.
+    Format(u32),
+    /// The adapter-owned LINEAR fallback could not be allocated.
+    LinearAllocFailed(NTSTATUS),
+    /// The host refused SET_SCANOUT_BLOB.
+    SetFailed,
+    /// The LINEAR target has no Venus image to copy into.
+    NoTarget,
+    /// The primary-to-LINEAR GPU copy could not be submitted.
+    CopyFailed(NTSTATUS),
+}
+
+/// Refusal counters, one per [`ScanoutReject`] variant. All must read 0 across a
+/// healthy session — a nonzero value is a primary Windows named that Helios did
+/// not program. Flushed from the existing periodic PASSIVE tick, never from the
+/// refusal path itself: a registry write per refusal would be exactly the
+/// per-frame tax T1b removed elsewhere.
+static SC_BAD_ALLOC: AtomicU32 = AtomicU32::new(0);
+static SC_BAD_EXTENT: AtomicU32 = AtomicU32::new(0);
+static SC_BAD_LAYOUT: AtomicU32 = AtomicU32::new(0);
+static SC_BAD_FORMAT: AtomicU32 = AtomicU32::new(0);
+static SC_LINEAR_ERR: AtomicU32 = AtomicU32::new(0);
+static SC_SET_ERR: AtomicU32 = AtomicU32::new(0);
+static SC_NO_TARGET: AtomicU32 = AtomicU32::new(0);
+static SC_COPY_ERR: AtomicU32 = AtomicU32::new(0);
+/// The HPD worker's `ScanoutRefreshQueue::Unavailable` arm, which used to drop
+/// the dirty bit with only a comment.
+pub(crate) static SC_UNAVAILABLE: AtomicU32 = AtomicU32::new(0);
+
+impl ScanoutReject {
+    /// Reproduce the exact (name, value) breadcrumb this refusal emitted before
+    /// R505. These pairs are owner debugging ABI — do not renumber them.
+    fn record(self) {
+        match self {
+            Self::BadAlloc => crate::diag::record_named_bytes(b"ScRid", 0),
+            Self::Extent => crate::diag::record_named_bytes(b"ScSet", 0xD),
+            Self::Layout => crate::diag::record_named_bytes(b"ScSet", 0xE3),
+            Self::Format(f) => crate::diag::record_named_bytes(b"ScFmt", f),
+            Self::LinearAllocFailed(_) => crate::diag::record_named_bytes(b"ScSet", 0xE1),
+            Self::SetFailed => crate::diag::record_named_bytes(b"ScSet", 0xE),
+            Self::NoTarget => crate::diag::record_named_bytes(b"ScSet", 0xE2),
+            Self::CopyFailed(_) => crate::diag::record_named_bytes(b"ScCpy", 0xE),
+        }
+    }
+
+    fn counter(self) -> &'static AtomicU32 {
+        match self {
+            Self::BadAlloc => &SC_BAD_ALLOC,
+            Self::Extent => &SC_BAD_EXTENT,
+            Self::Layout => &SC_BAD_LAYOUT,
+            Self::Format(_) => &SC_BAD_FORMAT,
+            Self::LinearAllocFailed(_) => &SC_LINEAR_ERR,
+            Self::SetFailed => &SC_SET_ERR,
+            Self::NoTarget => &SC_NO_TARGET,
+            Self::CopyFailed(_) => &SC_COPY_ERR,
+        }
+    }
+
+    /// The NTSTATUS this refusal returned before R505.
+    ///
+    /// `BadAlloc` keeps STATUS_SUCCESS deliberately: returning
+    /// STATUS_INVALID_PARAMETER there is a separate, hardware-proven decision,
+    /// not part of this commit.
+    fn status(self) -> NTSTATUS {
+        match self {
+            Self::BadAlloc => STATUS_SUCCESS,
+            Self::Extent | Self::Layout => STATUS_INVALID_PARAMETER,
+            Self::Format(_) => STATUS_NOT_SUPPORTED,
+            Self::LinearAllocFailed(status) | Self::CopyFailed(status) => status,
+            Self::SetFailed | Self::NoTarget => STATUS_DEVICE_NOT_READY,
+        }
+    }
+}
+
+/// What a successful deferred programming did, and therefore who owns the gate.
+enum ScanoutOutcome {
+    /// The exact Windows primary is bound and its address published. The gate
+    /// is lowered on return.
+    Programmed,
+    /// A primary-to-LINEAR copy is queued on ring 1. Its used-ring completion
+    /// DPC publishes the displayed address and clears the gate.
+    CopyQueued,
+}
+
+/// Mirror the refusal counters into the registry. Called from the existing
+/// periodic PASSIVE snapshot, which already runs under a `sample_tick`.
+pub(crate) fn record_scanout_reject_counters() {
+    use core::sync::atomic::Ordering::Relaxed;
+    crate::diag::record_named_bytes(b"ScBadAlc", SC_BAD_ALLOC.load(Relaxed));
+    crate::diag::record_named_bytes(b"ScBadExt", SC_BAD_EXTENT.load(Relaxed));
+    crate::diag::record_named_bytes(b"ScBadLay", SC_BAD_LAYOUT.load(Relaxed));
+    crate::diag::record_named_bytes(b"ScBadFmt", SC_BAD_FORMAT.load(Relaxed));
+    crate::diag::record_named_bytes(b"ScLinErr", SC_LINEAR_ERR.load(Relaxed));
+    crate::diag::record_named_bytes(b"ScSetErr", SC_SET_ERR.load(Relaxed));
+    crate::diag::record_named_bytes(b"ScNoTgt", SC_NO_TARGET.load(Relaxed));
+    crate::diag::record_named_bytes(b"ScCpyErr", SC_COPY_ERR.load(Relaxed));
+    crate::diag::record_named_bytes(b"ScUnav", SC_UNAVAILABLE.load(Relaxed));
+}
+
+/// Zero every refusal counter. StartDevice only.
+///
+/// Registry counter values persist across boots, so a counter that is merely
+/// *present* proves nothing; these are reset so "it moved this boot" is the
+/// readable fact.
+pub(crate) fn reset_scanout_reject_counters() {
+    use core::sync::atomic::Ordering::Relaxed;
+    for c in [
+        &SC_BAD_ALLOC,
+        &SC_BAD_EXTENT,
+        &SC_BAD_LAYOUT,
+        &SC_BAD_FORMAT,
+        &SC_LINEAR_ERR,
+        &SC_SET_ERR,
+        &SC_NO_TARGET,
+        &SC_COPY_ERR,
+        &SC_UNAVAILABLE,
+    ] {
+        c.store(0, Relaxed);
+    }
+    record_scanout_reject_counters();
+}
+
 /// Apply one exact Windows source allocation while serialized against
 /// DestroyAllocation retirement of the same KMD allocation/resource identity.
+///
+/// This is the thin outer half: it owns the programming interval, turns the
+/// single `Err` into its breadcrumb + counter + NTSTATUS, and is the ONE place
+/// the gate is handed to the completion DPC. All the programming logic lives in
+/// [`program_vidpn_source`], whose only unhappy exit is a `ScanoutReject`.
 unsafe fn apply_vidpn_source_address_locked(
     adapter: &AdapterContext,
     lock: &ScanoutGuard<'_>,
     h_alloc: HANDLE,
 ) -> NTSTATUS {
-    crate::diag::record(0x1300_000A);
-    // Adopt the gate the DIRQL half raised. Every exit below now lowers it via
-    // this token's drop; the ONE exit that must not is the copy-submitted arm,
-    // which calls `transfer_to_completion()` to hand it to the ring-1 DPC.
+    // Adopt the gate the DIRQL half raised. It drops at the end of THIS
+    // function, i.e. after the reject breadcrumb below — preserving the
+    // record-then-lower order every arm had before R504.
     let interval = crate::adapter::ProgrammingInterval::adopt(&adapter.vidpn_programming);
+    match unsafe { program_vidpn_source(adapter, lock, h_alloc) } {
+        Ok(ScanoutOutcome::Programmed) => STATUS_SUCCESS,
+        Ok(ScanoutOutcome::CopyQueued) => {
+            // THE one hand-off. The copy is queued on ring 1 and its completion
+            // DPC owns the gate from here: it publishes the displayed address on
+            // success and clears the gate either way. Dropping the interval
+            // instead would clear the gate mid-programming and let a CRTC_VSYNC
+            // report the OLD address as authoritative.
+            interval.transfer_to_completion();
+            STATUS_SUCCESS
+        }
+        Err(reject) => {
+            reject.record();
+            reject.counter().fetch_add(1, Ordering::Relaxed);
+            reject.status()
+        }
+    }
+}
+
+/// The programming body. One happy shape, one unhappy shape.
+unsafe fn program_vidpn_source(
+    adapter: &AdapterContext,
+    lock: &ScanoutGuard<'_>,
+    h_alloc: HANDLE,
+) -> Result<ScanoutOutcome, ScanoutReject> {
+    crate::diag::record(0x1300_000A);
     let source_address_n = VIDPN_SOURCE_ADDRESS_COUNT
         .fetch_add(1, Ordering::Relaxed)
         .wrapping_add(1);
@@ -993,8 +1167,7 @@ unsafe fn apply_vidpn_source_address_locked(
 
     let Some(source) = (unsafe { crate::ddi::create_allocation::scanout_alloc_info(h_alloc) })
     else {
-        crate::diag::record_named_bytes(b"ScRid", 0);
-        return STATUS_SUCCESS;
+        return Err(ScanoutReject::BadAlloc);
     };
     let (mode_w, mode_h) = adapter.display_mode();
     let width = if source.width != 0 {
@@ -1017,8 +1190,7 @@ unsafe fn apply_vidpn_source_address_locked(
         crate::diag::record_named_bytes(b"SaFlg", source.primary_flags);
     }
     if width != mode_w || height != mode_h {
-        crate::diag::record_named_bytes(b"ScSet", 0xD);
-        return STATUS_INVALID_PARAMETER;
+        return Err(ScanoutReject::Extent);
     }
     // A UMD-created exact pPrimaryDesc may already have the proven scan-out
     // shape: DMA_BUF-exportable, dedicated device-local memory, and validated
@@ -1035,16 +1207,14 @@ unsafe fn apply_vidpn_source_address_locked(
             && source.venus_alloc_size >= min_size
             && ScanoutFormat::from_dxgi(source.dxgi_format).is_some();
         if !valid {
-            crate::diag::record_named_bytes(b"ScSet", 0xE3);
-            return STATUS_INVALID_PARAMETER;
+            return Err(ScanoutReject::Layout);
         }
         source
     } else {
         match production_linear_scanout(adapter, lock, width, height) {
             Ok(target) => target,
             Err(status) => {
-                crate::diag::record_named_bytes(b"ScSet", 0xE1);
-                return status;
+                return Err(ScanoutReject::LinearAllocFailed(status));
             }
         }
     };
@@ -1065,8 +1235,7 @@ unsafe fn apply_vidpn_source_address_locked(
     let Some(vformat) =
         ScanoutFormat::from_dxgi_or_legacy_zero(target.dxgi_format).map(ScanoutFormat::virtio)
     else {
-        crate::diag::record_named_bytes(b"ScFmt", target.dxgi_format);
-        return STATUS_NOT_SUPPORTED;
+        return Err(ScanoutReject::Format(target.dxgi_format));
     };
     let bound_wh = adapter.active_scanout_wh.load(Ordering::Acquire);
     let already_bound = adapter.active_scanout_resource.load(Ordering::Acquire)
@@ -1088,8 +1257,7 @@ unsafe fn apply_vidpn_source_address_locked(
             target.plane_offset as u32,
         );
         if set.is_err() {
-            crate::diag::record_named_bytes(b"ScSet", 0xE);
-            return STATUS_DEVICE_NOT_READY;
+            return Err(ScanoutReject::SetFailed);
         }
         // Keep the adapter-owned fallback cache separate from a rotating DWM
         // direct primary. The latter is tracked by active_scanout_resource and
@@ -1130,16 +1298,16 @@ unsafe fn apply_vidpn_source_address_locked(
         adapter
             .last_primary_address
             .store(source.primary_address, Ordering::Release);
-        // `interval` drops here, clearing the gate AFTER the matching physical
-        // address was published — the order the next VSync DPC depends on (it
-        // acquires the gate before sampling `last_primary_address`).
-        return STATUS_SUCCESS;
+        // The caller's `interval` drops AFTER this, clearing the gate once the
+        // matching physical address is published — the order the next VSync DPC
+        // depends on (it acquires the gate before sampling
+        // `last_primary_address`).
+        return Ok(ScanoutOutcome::Programmed);
     }
 
     let target_image_id = adapter.dedicated_scanout_image.load(Ordering::Acquire);
     if target_image_id == 0 {
-        crate::diag::record_named_bytes(b"ScSet", 0xE2);
-        return STATUS_DEVICE_NOT_READY;
+        return Err(ScanoutReject::NoTarget);
     }
 
     // The returned outer wire fence completes in the ring-1 GPU domain. Its DPC
@@ -1162,21 +1330,14 @@ unsafe fn apply_vidpn_source_address_locked(
                 crate::diag::record_named_bytes(b"ScFnc", fence as u32);
                 crate::diag::record_named_bytes(b"ScFlu", 2); // async completion path
             }
-            // THE one hand-off. The copy is queued on ring 1 and its used-ring
-            // completion DPC owns the gate from here: it publishes the displayed
-            // address on success and clears the gate either way. Dropping the
-            // interval here instead would clear the gate mid-programming and let
-            // a CRTC_VSYNC report the OLD address as authoritative.
-            interval.transfer_to_completion();
         }
         Err(status) => {
             // Nothing was queued, so no DPC will ever run for this interval;
-            // `interval` drops and the gate clears, keeping VSync alive.
-            crate::diag::record_named_bytes(b"ScCpy", 0xE);
-            return status;
+            // the caller drops it and the gate clears, keeping VSync alive.
+            return Err(ScanoutReject::CopyFailed(status));
         }
     }
-    STATUS_SUCCESS
+    Ok(ScanoutOutcome::CopyQueued)
 }
 
 pub unsafe extern "C" fn dxgkddi_recommend_monitor_modes(

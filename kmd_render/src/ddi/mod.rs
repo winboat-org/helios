@@ -14,7 +14,7 @@ mod blob_map;
 mod build_paging_buffer;
 pub(crate) mod cpu_host_aperture;
 mod create_allocation;
-mod display;
+pub(crate) mod display;
 mod escape;
 mod gpummu;
 pub(crate) mod hpd;
