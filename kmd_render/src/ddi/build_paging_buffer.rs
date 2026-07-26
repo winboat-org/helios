@@ -915,7 +915,15 @@ pub unsafe extern "C" fn dxgkddi_build_paging_buffer(
                 .paging_pte_shadow
                 .update_leaf(update, track_system_pages)
         } {
-            dump_bar_counters();
+            // NO REGISTRY FLUSH HERE. This branch is the one the comment above
+            // declares DISPATCH-safe, and `dump_bar_counters` is 24 synchronous
+            // `RtlWriteRegistryValue` calls — PASSIVE_LEVEL only. It stood
+            // directly against the driver's hardest invariant, twelve lines above
+            // a content path that installs a runtime IRQL gate precisely because
+            // the documented PASSIVE contract is not trusted (k-paging-05).
+            // Nothing is lost: `update_leaf` already stored `BAR_ERR_SHADOW_FULL`
+            // (PgEf) into its atomic, and the next PASSIVE content op mirrors the
+            // whole block, so only the latency of that one value changes.
             return STATUS_INSUFFICIENT_RESOURCES;
         }
         unsafe { bar_harvest_page_table(bar.seg_id, bar.size, update) };
