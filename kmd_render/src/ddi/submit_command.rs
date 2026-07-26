@@ -625,6 +625,83 @@ pub unsafe extern "C" fn dxgkddi_submit_command(
     STATUS_SUCCESS
 }
 
+/// Cumulative count of pending WDDM fences discarded by a scheduler epoch —
+/// engine reset, preemption, or TDR recovery.
+///
+/// Exactly the number a TDR post-mortem wants, and before R615 nothing recorded
+/// it: all three sites discarded `preempt_flush`'s return with `let _`.
+pub static ABANDONED_FENCES: AtomicU32 = AtomicU32::new(0);
+
+/// What the caller owes VidSch after the pending fences are dropped.
+///
+/// The three TDR-adjacent DDIs perform the SAME "take the notify lock, drop
+/// every pending WDDM fence" step and then do three different things
+/// afterwards, with the shared step named nowhere. Making the difference an
+/// exhaustive value forces any future TDR-adjacent DDI to declare which
+/// notification it owes; today the choice is invisible.
+pub(crate) enum AbandonOutcome<'a> {
+    /// `DxgkDdiResetFromTimeout`: dxgkrnl owns the post-reset fence state and
+    /// wants no packet.
+    Silent,
+    /// `DxgkDdiPreemptCommand`: acknowledge with a `DMA_PREEMPTED` packet.
+    Preempted {
+        dxgkrnl: &'a DXGKRNL_INTERFACE,
+        fence: u32,
+    },
+    /// `DxgkDdiResetEngine`: report the completed watermark.
+    ReportLastAborted { out: &'a mut UINT },
+}
+
+/// Drop every pending WDDM fence and settle what is owed to VidSch, in ONE
+/// notification critical section.
+///
+/// The one-critical-section rule is the load-bearing part and it used to be
+/// documented only inside `DxgkDdiPreemptCommand`, where a reader of
+/// `DxgkDdiResetEngine` would never see it: preemption participates in the same
+/// VidSch fence stream as DMA_COMPLETED, so if the FIFO is cleared and the
+/// watermark sampled in one section but the packet is built in another, a
+/// completion DPC can advance `last_completed_fence` in between and make the
+/// preemption packet claim the preemption fence itself as already completed.
+/// Dxgkrnl rejects that one-fence leap with bugcheck 0x119/1 (observed:
+/// expected 0x17a, received 0x17b).
+///
+/// Returns the number of fences dropped and the status to report.
+///
+/// ⚠ The count goes to an ATOMIC ONLY, never to `record_named_bytes` as the
+/// review proposed: all three callers run at DISPATCH_LEVEL, and a registry
+/// write above PASSIVE is one of the project's never-violate rules. The
+/// `AbnDrop` mirror is written from the PASSIVE telemetry flush in `adapter.rs`,
+/// the same way `WtOut` and `WtTbl` are.
+pub(crate) fn abandon_pending_submissions(
+    adapter: &AdapterContext,
+    outcome: AbandonOutcome<'_>,
+) -> (u32, NTSTATUS) {
+    adapter.with_wddm_notify_lock(|guard| {
+        let dropped = guard.with_virtio(|o, v| v.preempt_flush(o)).unwrap_or(0);
+        if dropped != 0 {
+            ABANDONED_FENCES.fetch_add(dropped, Ordering::Relaxed);
+        }
+        let status = match outcome {
+            AbandonOutcome::Silent => STATUS_SUCCESS,
+            AbandonOutcome::Preempted { dxgkrnl, fence } => {
+                // SAFETY: the WDDM notification lock serializes this packet with
+                // every DMA_COMPLETED packet; the callback interface is live and
+                // delivery is raised to DIRQL by notify_at_dirql.
+                unsafe { signal_dma_preempted_locked(guard, dxgkrnl, fence) }
+            }
+            AbandonOutcome::ReportLastAborted { out } => {
+                // Written INSIDE the guard, exactly as before. Do NOT change the
+                // value: whether DXGKARG_RESETENGINE wants the completed
+                // watermark or the first aborted fence is an OPEN QUESTION
+                // against the WDK header, deliberately not resolved here.
+                *out = guard.completed_fence() as UINT;
+                STATUS_SUCCESS
+            }
+        };
+        (dropped, status)
+    })
+}
+
 /// `DxgkDdiPreemptCommand` — VidSch wants the node's pending submissions back
 /// (TDR probe or priority scheduling). We cannot abort host venus work, but we
 /// CAN release the pending WDDM fences: drop them (the scheduler resubmits the
@@ -647,21 +724,17 @@ pub unsafe extern "C" fn dxgkddi_preempt_command(
         Ok(interface) => interface,
         Err(_) => return STATUS_DEVICE_NOT_READY,
     };
-    // Preemption participates in the same VidSch fence stream as
-    // DMA_COMPLETED.  Keep clearing the pending FIFO, sampling the completed
-    // watermark, and reporting DMA_PREEMPTED in one notification critical
-    // section.  Otherwise a completion DPC can advance `last_completed_fence`
-    // after the FIFO is cleared but before this packet is built, causing the
-    // preemption packet to claim the preemption fence itself as already
-    // completed.  Dxgkrnl rejects that one-fence leap with bugcheck 0x119/1
-    // (observed: expected 0x17a, received 0x17b).
-    adapter.with_wddm_notify_lock(|guard| {
-        let _dropped = guard.with_virtio(|o, v| v.preempt_flush(o)).unwrap_or(0);
-        // SAFETY: the WDDM notification lock serializes this packet with every
-        // DMA_COMPLETED packet; the callback interface is live and delivery is
-        // raised to DIRQL by notify_at_dirql.
-        unsafe { signal_dma_preempted_locked(guard, dxgkrnl, preempt.PreemptionFenceId) }
-    })
+    // The one-critical-section rationale now lives on
+    // `abandon_pending_submissions`, where DxgkDdiResetEngine's reader can see
+    // it too.
+    abandon_pending_submissions(
+        adapter,
+        AbandonOutcome::Preempted {
+            dxgkrnl,
+            fence: preempt.PreemptionFenceId,
+        },
+    )
+    .1
 }
 
 /// `DxgkDdiResetFromTimeout` — TDR recovery. There is no hardware engine state
@@ -675,9 +748,7 @@ pub unsafe extern "C" fn dxgkddi_reset_from_timeout(h_adapter: *mut c_void) -> N
     // Prevent a DPC from taking a fence out of the pending FIFO while reset is
     // discarding that same scheduler epoch.  Dxgkrnl owns the post-reset fence
     // state; no completion from the abandoned epoch may escape concurrently.
-    adapter.with_wddm_notify_lock(|guard| {
-        let _ = guard.with_virtio(|o, v| v.preempt_flush(o));
-    });
+    let _ = abandon_pending_submissions(adapter, AbandonOutcome::Silent);
     // Consume transport_failed(), which had zero callers repo-wide: a TDR
     // against a latched ring is the loop this tranche exists to break, and
     // without this the only evidence was a DiagLevel-gated breadcrumb. Reported

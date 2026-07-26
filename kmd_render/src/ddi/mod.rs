@@ -78,4 +78,7 @@ pub use submit_command::{
     dxgkddi_reset_from_timeout, dxgkddi_restart_from_timeout, dxgkddi_submit_command,
     dxgkddi_submit_command_virtual,
 };
-pub(crate) use submit_command::{record_present_handoff_telemetry, DMA_STALE_SKIP_COUNT};
+pub(crate) use submit_command::{
+    abandon_pending_submissions, record_present_handoff_telemetry, AbandonOutcome,
+    ABANDONED_FENCES, DMA_STALE_SKIP_COUNT,
+};

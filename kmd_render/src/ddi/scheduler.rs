@@ -113,10 +113,12 @@ pub unsafe extern "C" fn dxgkddi_reset_engine(
     // venus-gated WDDM fences (dxgkrnl resubmits what it still wants done).
     // The queue mutation requires the notification-lock proof token, so no DMA
     // completion from the abandoned scheduler epoch can escape concurrently.
-    adapter.with_wddm_notify_lock(|guard| {
-        let _ = guard.with_virtio(|o, v| v.preempt_flush(o));
-        reset.LastAbortedFenceId = guard.completed_fence() as UINT;
-    });
+    let _ = crate::ddi::abandon_pending_submissions(
+        adapter,
+        crate::ddi::AbandonOutcome::ReportLastAborted {
+            out: &mut reset.LastAbortedFenceId,
+        },
+    );
     STATUS_SUCCESS
 }
 

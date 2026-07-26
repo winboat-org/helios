@@ -1614,6 +1614,14 @@ impl AdapterContext {
         // into the CollectDbgInfo report, because otherwise the only way to read
         // it would be to provoke a TDR — and the point of the split is that this
         // condition is NOT a host fault and should be visible without one.
+        // R615: fences discarded by an engine reset / preemption / TDR epoch.
+        // Mirrored from HERE, a PASSIVE site, because all three abandon call
+        // sites run at DISPATCH_LEVEL and a registry write above PASSIVE is a
+        // never-violate rule.
+        crate::diag::record_named_bytes(
+            b"AbnDrop",
+            crate::ddi::ABANDONED_FENCES.load(Ordering::Relaxed),
+        );
         crate::diag::record_named_bytes(
             b"WtTbl",
             crate::virtio::gpu::FENCE_WAIT_TABLE_FULL.load(Ordering::Relaxed),
