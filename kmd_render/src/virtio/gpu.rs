@@ -392,10 +392,10 @@ const MAX_WINDOW_RANGES: usize = 1024;
 /// Per-map size cap (also bounds the `IoAllocateMdl` ULONG length on the caller).
 const MAX_BLOB_MAP_BYTES: u64 = 256 << 20;
 
-/// Round `n` up to the next [`BLOB_PAGE`] multiple (saturating).
-const fn round_up_page(n: u64) -> u64 {
-    n.saturating_add(BLOB_PAGE - 1) & !(BLOB_PAGE - 1)
-}
+// Rounds `n` up to the next `BLOB_PAGE` multiple (saturating). The body moved to
+// `helios_kmd_logic` (host unit-tested, no `wdk-sys` edge); `BLOB_PAGE` stays
+// here because the window allocator still uses it directly at `map_blob_prepare`.
+use helios_kmd_logic::round_up_page;
 
 /// Result of the under-lock phase of MAP_BLOB ([`VirtioGpu::map_blob_prepare`]): the
 /// guest-physical range to map and the host's requested caching. The user-space

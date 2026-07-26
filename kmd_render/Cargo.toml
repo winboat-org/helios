@@ -21,6 +21,11 @@ wdk-alloc = "0.4"
 wdk-panic = "0.4"
 # Shared wire-format definitions (no_std), so virtio-gpu structs match the ICD.
 helios_protocol = { path = "../protocol" }
+# Host-testable no_std leaf logic (page/pitch arithmetic). Deliberately has no
+# wdk-sys/bindgen edge so `cargo test` can run against it on the Linux host —
+# this crate cannot host a libtest harness itself (build.rs bindgen + rc.exe,
+# `panic = "abort"` cdylib).
+helios_kmd_logic = { path = "../kmd_logic" }
 # no_std; used to serialize helios_protocol command structs (Pod) into the DMA
 # scratch buffers. default-features=false keeps it std-free for the kernel target.
 bytemuck = { version = "1", default-features = false, features = ["derive"] }

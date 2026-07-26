@@ -579,22 +579,25 @@ pub(crate) unsafe fn set_bar_placement(h: HANDLE, offset: u64) {
 const PAGE: SIZE_T = 4096;
 const D3DDDI_ALLOCATIONPRIORITY_NORMAL: UINT = 0x7800_0000;
 
-/// Cross-adapter row-major textures require a 256-byte row-pitch alignment
-/// (`D3D12_TEXTURE_DATA_PITCH_ALIGNMENT`). The IddCx composition surface is a
-/// cross-adapter resource (created as a standard allocation, opened on the Helios
-/// render side — `rendering-on-a-discrete-gpu-using-cross-adapter-resources.md`),
-/// so its backing must be linear with this pitch for the IndirectKMD adapter to
-/// open the same surface. PATH-A (2026-06-22).
-const CROSS_ADAPTER_PITCH_ALIGN: u32 = 256;
+/// 32-bpp linear row pitch aligned to the cross-adapter requirement
+/// (`D3D12_TEXTURE_DATA_PITCH_ALIGNMENT`, 256 bytes). Re-exported so the existing
+/// `crate::ddi::create_allocation::cross_adapter_pitch` call paths in
+/// `ddi/display.rs`, `ddi/gdi_blit.rs` and `ddi/scanout_diag.rs` are unchanged.
+///
+/// The body now lives in `helios_kmd_logic`, which has no dependency edge to
+/// `wdk-sys` or the generated `dxgk` bindings and is covered by host unit tests —
+/// including the `1896 -> 7680` case `ddi/display.rs` names, i.e. the `.117`-era
+/// short-row scanout defect.
+pub(crate) use helios_kmd_logic::cross_adapter_pitch;
+
+/// `helios_kmd_logic::round_up_page` operates on `u64`; the callers here pass
+/// `SIZE_T`. The call below type-checks only while the two are the same type, and
+/// this assertion makes a future divergence a compile error rather than a silent
+/// widening of an allocation size.
+const _: () = assert!(core::mem::size_of::<SIZE_T>() == core::mem::size_of::<u64>());
 
 fn round_up_page(n: SIZE_T) -> SIZE_T {
-    n.saturating_add(PAGE - 1) & !(PAGE - 1)
-}
-
-/// 32-bpp linear row pitch aligned to the cross-adapter requirement.
-pub(crate) fn cross_adapter_pitch(width: u32) -> u32 {
-    let raw = width.saturating_mul(4);
-    raw.saturating_add(CROSS_ADAPTER_PITCH_ALIGN - 1) & !(CROSS_ADAPTER_PITCH_ALIGN - 1)
+    helios_kmd_logic::round_up_page(n)
 }
 
 /// Cycling 8-slot fixed-name registry ring of allocation create/open events, so a

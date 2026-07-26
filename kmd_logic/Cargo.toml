@@ -1,0 +1,18 @@
+[package]
+name = "helios_kmd_logic"
+version = "0.1.0"
+edition = "2021"
+description = "Host-testable no_std leaf logic shared with the Helios WDDM miniport. Deliberately dependency-free: no wdk-sys, no bindgen, no build.rs, so `cargo test` runs on the Linux host."
+
+[lib]
+# Pure argument-only functions: usable from the no_std kernel-mode KMD and from a
+# host libtest harness. `kmd_render` itself cannot host tests (build.rs runs
+# bindgen over ntddk.h/dispmprt.h/d3dkmddi.h and shells to rc.exe; the crate is a
+# `panic = "abort"` cdylib), which is why this logic lives out-of-crate.
+crate-type = ["lib"]
+
+[dependencies]
+# Intentionally empty. A dependency edge to `wdk-sys` or the generated `dxgk`
+# bindings would let this arithmetic read a DXGKARG_* field or an AdapterContext
+# atomic; keeping the edge absent makes the page/pitch rules expressible only as
+# functions of their arguments.

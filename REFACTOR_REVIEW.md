@@ -209,6 +209,14 @@ sites textually unchanged.
 
 ### R101. Stand up a host-testable `no_std` logic crate and move the page/pitch arithmetic into it
 
+- **Status**: **LANDED** (2026-07-26). `kmd_logic/` = `helios_kmd_logic`; 5 host tests green; KMD
+  rebuilt at `22.22.176.0` with `libhelios_kmd_logic` in the dep graph, so the `SIZE_T` = `u64`
+  identity the wrapper relies on is proven by the type checker on the real target, not just by the
+  added `size_of` assert. Two adjustments: the `gpu.rs` copy was already `const fn` (the review
+  quoted the non-`const` `create_allocation.rs` form), so the moved function is `pub const fn` and a
+  test pins const-evaluability; and the tranche's Minor item — the `DIVERGES` marker on the third,
+  non-saturating `round_up_page` in `venus.rs` — is included here, because the review makes not
+  unifying that copy R101's own responsibility.
 - **Finding**: z-lead-01.
 - **Where**: new crate `kmd_logic/` (package `helios_kmd_logic`), sibling to `protocol/`.
   Sources moved: `kmd_render/src/ddi/create_allocation.rs:579` (`const PAGE`), `:588-597`
