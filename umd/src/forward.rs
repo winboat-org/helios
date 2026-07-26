@@ -124,6 +124,9 @@ static SRV_BIND_LOG_COUNT: LogThrottle = LogThrottle::new();
 static DRAW_LOG_COUNT: LogThrottle = LogThrottle::new();
 static OM_LOG_COUNT: LogThrottle = LogThrottle::new();
 static UPDATE_LOG_COUNT: LogThrottle = LogThrottle::new();
+/// UpdateSubresource lines the rate cap dropped. Without this the cap would
+/// turn "no lines" into "nothing happened".
+static UPDATE_SUPPRESSED: AtomicUsize = AtomicUsize::new(0);
 static DISPATCH_LOG_COUNT: LogThrottle = LogThrottle::new();
 static HANDLE_MISS_LOG_COUNT: LogThrottle = LogThrottle::new();
 static UAV_BIND_LOG_COUNT: LogThrottle = LogThrottle::new();
@@ -6407,7 +6410,17 @@ unsafe extern "C" fn resource_update_subresource(
     // update purely to produce a log field.
     let (alloc, kind, width, height, depth, fmt) = resource_summary(h_res.pDrvPrivate);
     let n = UPDATE_LOG_COUNT.next();
-    if crate::trace_enabled() && (n < 1024 || alloc != 0) {
+    // DECLARED diagnostic change: the old gate's `|| alloc != 0` disjunct
+    // removed the rate cap entirely for exactly the shared/primary/present
+    // resources that update most often, so a steady stream of updates to a
+    // WDDM-allocated texture wrote one 21-argument formatted line per call.
+    // Allocation-backed updates stay observable without being unbounded, and
+    // what is no longer emitted is counted rather than silently dropped.
+    let rate_ok = n < 1024 || (alloc != 0 && n % 512 == 0);
+    if !rate_ok {
+        UPDATE_SUPPRESSED.fetch_add(1, Ordering::Relaxed);
+    }
+    if crate::trace_enabled() && rate_ok {
         let (rt_resource, km_resource) = resource_parent_handles(h_res.pDrvPrivate);
         let (box_left, box_top, box_right, box_bottom) = if box_.is_null() {
             (
@@ -6468,6 +6481,12 @@ unsafe extern "C" fn resource_update_subresource(
                 .map(|samples| format!("0x{:08x}", samples.1))
                 .unwrap_or_else(|| "n/a".to_string()),
         );
+        if UPDATE_SUPPRESSED.load(Ordering::Relaxed) != 0 {
+            trace_line!(
+                "DDI UpdateSubresource: {} update lines suppressed by the rate cap so far",
+                UPDATE_SUPPRESSED.load(Ordering::Relaxed)
+            );
+        }
     }
     let bx;
     let bx_ptr = if box_.is_null() {
