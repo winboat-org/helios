@@ -957,10 +957,80 @@ pub(crate) fn process_deferred_vidpn_source_address(adapter: &AdapterContext) {
         if raw == 0 {
             return None;
         }
-        Some(unsafe { apply_vidpn_source_address_locked(adapter, lock, raw as HANDLE) })
+        Some(unsafe { apply_deferred_vidpn_source_address_locked(adapter, lock, raw as HANDLE) })
     });
     if let Some(status) = status {
         crate::diag::record_named_bytes(b"VpDSt", status as u32);
+    }
+}
+
+/// The DEFERRED wrapper: same programming body, plus the forward-progress
+/// contract the DIRQL path needs.
+///
+/// On the deferred path the OS was told SUCCESS before any programming happened.
+/// Every failure exit then cleared the gate, recorded one overwritten value and
+/// returned — without updating `last_primary_address` and without re-arming the
+/// pending handle (the worker's swap already zeroed it). Since
+/// `last_primary_address` is exactly what the CRTC_VSYNC packet carries, the
+/// heartbeat kept reporting the PREVIOUSLY displayed address forever: the flip
+/// queued for the failed primary could never retire, dxgkrnl stopped issuing new
+/// source addresses, and the desktop froze.
+///
+/// ⚠ The freeze is derived from the driver's own documented model
+/// (`adapter.rs`'s `last_primary_address` contract and `start_device.rs`'s VSync
+/// DPC), NOT from a hardware observation.
+///
+/// A retryable refusal now re-arms the exact handle and keeps the gate raised;
+/// the VSync DPC's `pending_vidpn_allocation != 0` branch signals the worker,
+/// which is the existing wake path. The re-arm is safe against DestroyAllocation
+/// because it happens inside `with_scanout_lifecycle` — the same lock
+/// `retire_scanout_allocation_locked`'s cancel CAS and the worker's swap hold, so
+/// a destroy racing this either cancels before we re-arm or observes the re-armed
+/// handle and cancels it.
+///
+/// # Safety
+/// `h_alloc` is the exact allocation handle Windows published at DIRQL.
+unsafe fn apply_deferred_vidpn_source_address_locked(
+    adapter: &AdapterContext,
+    lock: &ScanoutGuard<'_>,
+    h_alloc: HANDLE,
+) -> NTSTATUS {
+    let interval = crate::adapter::ProgrammingInterval::adopt(&adapter.vidpn_programming);
+    match unsafe { program_vidpn_source(adapter, lock, h_alloc) } {
+        Ok(ScanoutOutcome::Programmed) => {
+            clear_retry_state();
+            STATUS_SUCCESS
+        }
+        Ok(ScanoutOutcome::CopyQueued) => {
+            clear_retry_state();
+            interval.transfer_to_completion();
+            STATUS_SUCCESS
+        }
+        Err(reject) => {
+            reject.report();
+            if reject.retryable() {
+                match note_retry_attempt(h_alloc) {
+                    RetryDecision::Again => {
+                        // Re-arm the EXACT handle and keep the gate raised. Note
+                        // the store is inside the scanout lock, so it cannot race
+                        // the DestroyAllocation cancel.
+                        adapter
+                            .pending_vidpn_allocation
+                            .store(h_alloc as usize, Ordering::Release);
+                        interval.retain_for_retry();
+                    }
+                    // Budget exhausted. Drop the interval: the gate clears and
+                    // the heartbeat resumes with the truthful OLD address, which
+                    // is a visibly stale desktop rather than a frozen one.
+                    RetryDecision::GaveUp => {}
+                }
+            } else {
+                // Permanent for this allocation. Retrying would hold the gate
+                // and suppress CRTC_VSYNC for nothing.
+                clear_retry_state();
+            }
+            reject.status()
+        }
     }
 }
 
@@ -1065,6 +1135,84 @@ impl ScanoutReject {
             Self::SetFailed | Self::NoTarget => STATUS_DEVICE_NOT_READY,
         }
     }
+
+    /// Emit the breadcrumb and bump the counter. One call so the two can never
+    /// drift apart at a call site.
+    fn report(self) {
+        self.record();
+        self.counter().fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Whether programming this exact allocation again could plausibly succeed.
+    ///
+    /// Classified per variant deliberately — there is no blanket answer.
+    /// Transport and allocation failures are transient (the host was busy, the
+    /// LINEAR target could not be minted yet, the ring was full). Validation
+    /// rejects are permanent FOR THAT ALLOCATION: its extent, layout and format
+    /// will not change, so retrying only burns the budget and holds the gate.
+    fn retryable(self) -> bool {
+        match self {
+            Self::LinearAllocFailed(_) | Self::SetFailed | Self::NoTarget | Self::CopyFailed(_) => {
+                true
+            }
+            Self::BadAlloc | Self::Extent | Self::Layout | Self::Format(_) => false,
+        }
+    }
+}
+
+/// Retry attempts allowed for one primary before the gate is dropped and the
+/// heartbeat resumes with the truthful old address.
+///
+/// A few, not hundreds: the gate suppresses CRTC_VSYNC for its whole duration,
+/// and the VSync DPC re-signals the worker every ~16 ms, so this is a bounded
+/// ~64 ms stall in the worst case rather than an unbounded one.
+const SCANOUT_RETRY_BUDGET: u32 = 4;
+
+/// Retry bookkeeping for the deferred path. Touched only under `scanout_mutex`
+/// (the deferred continuation holds it), so plain atomics need no extra
+/// ordering discipline beyond being atomics.
+static RETRY_HANDLE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static RETRY_ATTEMPTS: AtomicU32 = AtomicU32::new(0);
+/// Retryable refusals that were re-armed (diag `ScRetry`).
+static SC_RETRY: AtomicU32 = AtomicU32::new(0);
+/// Primaries abandoned after exhausting [`SCANOUT_RETRY_BUDGET`] (diag `ScGaveUp`).
+static SC_GAVE_UP: AtomicU32 = AtomicU32::new(0);
+
+enum RetryDecision {
+    /// Re-arm the handle and keep the gate raised.
+    Again,
+    /// Budget exhausted: drop the gate, count loudly, stop retrying.
+    GaveUp,
+}
+
+/// Charge one attempt against `h_alloc`'s budget. A different handle starts a
+/// fresh budget — a new primary is not the old one's retry.
+fn note_retry_attempt(h_alloc: HANDLE) -> RetryDecision {
+    use core::sync::atomic::Ordering::Relaxed;
+    let handle = h_alloc as usize;
+    let attempts = if RETRY_HANDLE.swap(handle, Relaxed) == handle {
+        RETRY_ATTEMPTS.fetch_add(1, Relaxed).wrapping_add(1)
+    } else {
+        RETRY_ATTEMPTS.store(1, Relaxed);
+        1
+    };
+    if attempts > SCANOUT_RETRY_BUDGET {
+        RETRY_HANDLE.store(0, Relaxed);
+        RETRY_ATTEMPTS.store(0, Relaxed);
+        SC_GAVE_UP.fetch_add(1, Relaxed);
+        RetryDecision::GaveUp
+    } else {
+        SC_RETRY.fetch_add(1, Relaxed);
+        RetryDecision::Again
+    }
+}
+
+/// Forget any in-progress retry: this primary either programmed or failed
+/// permanently, so the next retryable refusal starts from a full budget.
+fn clear_retry_state() {
+    use core::sync::atomic::Ordering::Relaxed;
+    RETRY_HANDLE.store(0, Relaxed);
+    RETRY_ATTEMPTS.store(0, Relaxed);
 }
 
 /// What a successful deferred programming did, and therefore who owns the gate.
@@ -1090,6 +1238,8 @@ pub(crate) fn record_scanout_reject_counters() {
     crate::diag::record_named_bytes(b"ScNoTgt", SC_NO_TARGET.load(Relaxed));
     crate::diag::record_named_bytes(b"ScCpyErr", SC_COPY_ERR.load(Relaxed));
     crate::diag::record_named_bytes(b"ScUnav", SC_UNAVAILABLE.load(Relaxed));
+    crate::diag::record_named_bytes(b"ScRetry", SC_RETRY.load(Relaxed));
+    crate::diag::record_named_bytes(b"ScGaveUp", SC_GAVE_UP.load(Relaxed));
 }
 
 /// Zero every refusal counter. StartDevice only.
@@ -1109,9 +1259,12 @@ pub(crate) fn reset_scanout_reject_counters() {
         &SC_NO_TARGET,
         &SC_COPY_ERR,
         &SC_UNAVAILABLE,
+        &SC_RETRY,
+        &SC_GAVE_UP,
     ] {
         c.store(0, Relaxed);
     }
+    clear_retry_state();
     record_scanout_reject_counters();
 }
 
@@ -1143,8 +1296,10 @@ unsafe fn apply_vidpn_source_address_locked(
             STATUS_SUCCESS
         }
         Err(reject) => {
-            reject.record();
-            reject.counter().fetch_add(1, Ordering::Relaxed);
+            // No retry on this path: the DDI ran at PASSIVE, so the refusal's
+            // NTSTATUS reaches dxgkrnl directly and is the truthful answer.
+            // Nothing was deferred, so there is nothing to re-arm.
+            reject.report();
             reject.status()
         }
     }
@@ -1294,10 +1449,12 @@ unsafe fn program_vidpn_source(
         }
         // SET_SCANOUT_BLOB has completed successfully, so this exact Windows
         // primary is now what the host pixel pipeline reads. Only now may the
-        // next CRTC_VSYNC retire the preceding flip.
-        adapter
-            .last_primary_address
-            .store(source.primary_address, Ordering::Release);
+        // next CRTC_VSYNC retire the preceding flip — and only here can a
+        // `ProgrammedPrimary` be minted, which is the only thing
+        // `publish_displayed_primary` accepts.
+        adapter.publish_displayed_primary(crate::adapter::ProgrammedPrimary::after_scanout_bind(
+            source.primary_address,
+        ));
         // The caller's `interval` drops AFTER this, clearing the gate once the
         // matching physical address is published — the order the next VSync DPC
         // depends on (it acquires the gate before sampling

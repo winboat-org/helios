@@ -590,13 +590,49 @@ impl<'a> ProgrammingInterval<'a> {
     /// when the scan-out copy retires (`gpu.rs`, through the notify's raw
     /// `NonNull<AtomicU32>`).
     ///
-    /// This is the ONE legitimate way for the gate to outlive this scope, and
-    /// making it a named call means the hand-off is greppable instead of being
-    /// an absence. The compiler cannot prove the DPC ever runs, so a lost
-    /// completion still leaves the gate raised; that residual is what R509's
-    /// generation tag turns into a detectable mismatch.
+    /// This is one of the two legitimate ways for the gate to outlive this
+    /// scope, and making it a named call means the hand-off is greppable instead
+    /// of being an absence. The compiler cannot prove the DPC ever runs, so a
+    /// lost completion still leaves the gate raised; that residual is what
+    /// R509's generation tag turns into a detectable mismatch.
     pub(crate) fn transfer_to_completion(self) {
         core::mem::forget(self);
+    }
+
+    /// Keep the gate raised because this exact primary will be programmed again.
+    ///
+    /// The other disposition, distinctly named so the two can never be confused
+    /// at a call site: nothing was queued and no DPC will clear this gate — the
+    /// caller has re-armed `pending_vidpn_allocation` and the VSync DPC's
+    /// `pending != 0` branch will signal the worker to retry. Only legal inside
+    /// a BOUNDED retry budget; exhausting it must drop the interval instead, or
+    /// the display stops.
+    pub(crate) fn retain_for_retry(self) {
+        core::mem::forget(self);
+    }
+}
+
+/// A primary the host has actually accepted for scan-out.
+///
+/// Constructible only from [`Self::after_scanout_bind`], which the programming
+/// path reaches only after `SET_SCANOUT_BLOB` has succeeded for that exact
+/// source, and it is the ONLY argument
+/// [`AdapterContext::publish_displayed_primary`] takes. So "a failed programming
+/// publishes no address" is a property of the signature: the failure type
+/// (`ScanoutReject`) cannot produce one of these.
+///
+/// Honest limit: `last_primary_address` stays crate-visible because `ctrl.rs`
+/// takes a `NonNull` to it for the completion DPC, so the field can still be
+/// stored to directly from inside the crate. The guarantee covers the KMD-side
+/// publication; R509 gives the DPC side its own ticket check.
+pub(crate) struct ProgrammedPrimary {
+    address: u64,
+}
+
+impl ProgrammedPrimary {
+    /// Only call this once the host has accepted the bind for this exact source.
+    pub(crate) fn after_scanout_bind(address: u64) -> Self {
+        Self { address }
     }
 }
 
@@ -927,6 +963,21 @@ impl AdapterContext {
                 crate::ddi::vidpn::DEFAULT_MODE_HEIGHT,
             )
         }
+    }
+
+    /// Publish the address the CRTC_VSYNC packet reports as the display
+    /// engine's authoritative state.
+    ///
+    /// Takes a [`ProgrammedPrimary`] and nothing else, which is what makes "a
+    /// failed programming publishes no address" structural. Before this, every
+    /// failure exit left `last_primary_address` naming the PREVIOUSLY displayed
+    /// primary, so the heartbeat kept reporting it forever: the flip queued for
+    /// the failed primary could never retire, dxgkrnl stopped issuing new source
+    /// addresses, and the desktop froze with two overwritten DWORDs as the only
+    /// trace — a failure indistinguishable from a hang.
+    pub(crate) fn publish_displayed_primary(&self, primary: ProgrammedPrimary) {
+        self.last_primary_address
+            .store(primary.address, Ordering::Release);
     }
 
     /// Remember the blob currently selected for scanout 0. PASSIVE callers bind
