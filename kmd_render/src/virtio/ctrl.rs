@@ -28,7 +28,8 @@ use wdk_sys::{KEVENT, LARGE_INTEGER, PVOID, STATUS_SUCCESS};
 
 use super::gpu::{
     BlobMapBegin, BlobMapFinish, BlobMapPrep, BlobRemapBegin, DeviceOwner,
-    FenceWaitPrep, OwnerFilter, SyncWaitBlock, CTRL_TEARDOWN_ABANDONS, CTRL_TIMEOUT_COUNT,
+    FenceWaitPrep, OwnerFilter, SyncWaitBlock, WaitBlockRef, CTRL_TEARDOWN_ABANDONS,
+    CTRL_TIMEOUT_COUNT,
     FENCE_WAIT_TABLE_FULL, FENCE_WAIT_TIMEOUTS, SUBMIT_META_BYTES, TRANSPORT_GONE_AT_WAIT,
 };
 use super::hal::DmaBuffer;
@@ -155,13 +156,13 @@ pub(crate) fn sleep_ms(ms: u64) {
 /// Wait on `block` for up to `total_ms`, in adaptive slices (1 ms → 1 s),
 /// opportunistically draining the used ring after each slice so a lost
 /// interrupt costs only slice latency. Returns whether the block completed.
-fn wait_block(adapter: &AdapterContext, block: NonNull<SyncWaitBlock>, total_ms: u64) -> bool {
+fn wait_block(adapter: &AdapterContext, block: &WaitBlockRef<'_>, total_ms: u64) -> bool {
     let mut waited: u64 = 0;
     let mut slice: u64 = 1;
     loop {
-        // SAFETY: `block` is a live stack SyncWaitBlock owned by this call
-        // chain; only the drain (under the device lock) writes it.
-        if unsafe { block.as_ref() }.is_done() {
+        // The borrow proves the block is alive for this whole call; only the
+        // drain (under the device lock) writes it, through atomics.
+        if block.is_done() {
             return true;
         }
         if waited >= total_ms {
@@ -174,7 +175,7 @@ fn wait_block(adapter: &AdapterContext, block: NonNull<SyncWaitBlock>, total_ms:
         // address and outlives the wait; PASSIVE_LEVEL.
         let status = unsafe {
             KeWaitForSingleObject(
-                core::ptr::addr_of_mut!((*block.as_ptr()).event) as PVOID,
+                core::ptr::addr_of_mut!((*block.as_ptr().as_ptr()).event) as PVOID,
                 EXECUTIVE,
                 KERNEL_MODE,
                 0,
@@ -255,66 +256,67 @@ fn ctrl_roundtrip(
         }
     }
 
-    let mut block = SyncWaitBlock::new_zeroed();
-    // SAFETY: `block` is at its final stack address for the whole call.
-    unsafe { block.init() };
-    let block_ptr = NonNull::from(&mut block);
-
-    // Enqueue, with PASSIVE backpressure while the queue is full.
-    //
-    // `meta` is carried as a loop value, not round-tripped through an
-    // `Option`. The enqueue moves it into the closure and the QueueFull arm
-    // reinitialises it before the back edge, which Rust's flow-sensitive move
-    // checking accepts. A future retry arm that forgets to hand the buffer back
-    // is then a *compile* error, where the take-then-expect this replaces was a
-    // `KeBugCheck` inside a DDI on the next iteration.
-    let mut attempts = 0u32;
-    let token = loop {
-        let res = adapter.with_virtio(move |v| {
-            v.drain_used();
-            v.enqueue_sync(meta, in0_len, in1_len, resp_len, block_ptr)
-        });
-        match res {
-            Err(_) => return Err(VirtioError::DeviceError), // transport gone
-            Ok(Ok(token)) => break token,
-            Ok(Err((m_back, VirtioError::QueueFull))) => {
-                meta = m_back;
-                attempts += 1;
-                if attempts > ENQUEUE_RETRY_MAX {
-                    return Err(VirtioError::QueueFull);
+    // The wait block is created, initialised and dropped inside `with`, so it
+    // is never nameable here: "registered before init" and "moved after init"
+    // are not expressible. The abandon-on-timeout epilogue is the closure's
+    // last statement, which is what keeps deregistration paired with the frame.
+    SyncWaitBlock::with(|block| {
+        // Enqueue, with PASSIVE backpressure while the queue is full.
+        //
+        // `meta` is carried as a loop value, not round-tripped through an
+        // `Option`. The enqueue moves it into the closure and the QueueFull arm
+        // reinitialises it before the back edge, which Rust's flow-sensitive move
+        // checking accepts. A future retry arm that forgets to hand the buffer back
+        // is then a *compile* error, where the take-then-expect this replaces was a
+        // `KeBugCheck` inside a DDI on the next iteration.
+        let mut attempts = 0u32;
+        let token = loop {
+            let res = adapter.with_virtio(move |v| {
+                v.drain_used();
+                v.enqueue_sync(meta, in0_len, in1_len, resp_len, block.as_ptr())
+            });
+            match res {
+                Err(_) => return Err(VirtioError::DeviceError), // transport gone
+                Ok(Ok(token)) => break token,
+                Ok(Err((m_back, VirtioError::QueueFull))) => {
+                    meta = m_back;
+                    attempts += 1;
+                    if attempts > ENQUEUE_RETRY_MAX {
+                        return Err(VirtioError::QueueFull);
+                    }
+                    reap_parked(adapter);
+                    sleep_ms(1);
                 }
-                reap_parked(adapter);
-                sleep_ms(1);
+                Ok(Err((_m, e))) => return Err(e), // dropped here at PASSIVE
             }
-            Ok(Err((_m, e))) => return Err(e), // dropped here at PASSIVE
-        }
-    };
+        };
 
-    if !wait_block(adapter, block_ptr, timeout_ms) {
-        // Final race check + abandonment under the lock.
-        // Three outcomes, not two. `unwrap_or(true)` folded Err(DeviceNotFound)
-        // - the transport was torn down under us - into "already completed
-        // successfully", which skipped the timeout counter and picked the wrong
-        // error class. The fake-success half is masked here because all three
-        // callers re-validate resp_is_ok on the returned bytes and a zeroed
-        // response fails that, but the missing evidence was real.
-        match adapter.with_virtio(|v| {
-            v.drain_used();
-            v.abandon_sync(token, block_ptr)
-        }) {
-            Ok(true) => {}
-            Ok(false) => {
-                CTRL_TIMEOUT_COUNT.fetch_add(1, Ordering::Relaxed);
-                return Err(VirtioError::Timeout);
-            }
-            Err(_) => {
-                CTRL_TEARDOWN_ABANDONS.fetch_add(1, Ordering::Relaxed);
-                return Err(VirtioError::DeviceError);
+        if !wait_block(adapter, block, timeout_ms) {
+            // Final race check + abandonment under the lock.
+            // Three outcomes, not two. `unwrap_or(true)` folded Err(DeviceNotFound)
+            // - the transport was torn down under us - into "already completed
+            // successfully", which skipped the timeout counter and picked the wrong
+            // error class. The fake-success half is masked here because all three
+            // callers re-validate resp_is_ok on the returned bytes and a zeroed
+            // response fails that, but the missing evidence was real.
+            match adapter.with_virtio(|v| {
+                v.drain_used();
+                v.abandon_sync(token, block.as_ptr())
+            }) {
+                Ok(true) => {}
+                Ok(false) => {
+                    CTRL_TIMEOUT_COUNT.fetch_add(1, Ordering::Relaxed);
+                    return Err(VirtioError::Timeout);
+                }
+                Err(_) => {
+                    CTRL_TEARDOWN_ABANDONS.fetch_add(1, Ordering::Relaxed);
+                    return Err(VirtioError::DeviceError);
+                }
             }
         }
-    }
-    block.copy_resp(resp_out);
-    Ok(())
+        block.copy_resp(resp_out);
+        Ok(())
+    })
 }
 
 /// Round-trip expecting a bare `VirtioGpuCtrlHdr` response; checks RESP_OK.
@@ -1613,75 +1615,77 @@ pub enum WaitFenceOutcome {
 /// Wait (PASSIVE, KEVENT) until wire fence `fence_id` completes or
 /// `timeout_ns` elapses. `timeout_ns == 0` is a poll.
 pub fn wait_fence(adapter: &AdapterContext, fence_id: u64, timeout_ns: u64) -> WaitFenceOutcome {
-    let mut block = SyncWaitBlock::new_zeroed();
-    // SAFETY: `block` is at its final stack address for the whole call.
-    unsafe { block.init() };
-    let block_ptr = NonNull::from(&mut block);
-
-    let mut full_retries = 0u32;
-    loop {
-        let prep = adapter.with_virtio(|v| {
-            v.drain_used();
-            v.fence_wait_prepare(fence_id, block_ptr)
-        });
-        match prep {
-            Err(_) => return WaitFenceOutcome::Invalid, // transport gone
-            Ok(FenceWaitPrep::Complete) => return WaitFenceOutcome::Complete,
-            Ok(FenceWaitPrep::Invalid) => return WaitFenceOutcome::Invalid,
-            Ok(FenceWaitPrep::TableFull) => {
-                full_retries += 1;
-                if full_retries > 1_000 {
-                    // NOT FENCE_WAIT_TIMEOUTS: the host may be perfectly
-                    // healthy and all MAX_FENCE_WAITERS slots simply occupied.
-                    // The outcome stays TimedOut so the ICD is untouched; only
-                    // the evidence is split. Note the budget is nominally 1 s
-                    // but KeDelayExecutionThread rounds a 1 ms relative timeout
-                    // up to the system timer granularity (~15.6 ms), so this is
-                    // up to ~16 s of thread residency.
-                    FENCE_WAIT_TABLE_FULL.fetch_add(1, Ordering::Relaxed);
-                    return WaitFenceOutcome::TimedOut;
+    // Scoped exactly as in `ctrl_roundtrip`. Every `return` below is a return
+    // from the closure, and the deregistration pairing is unchanged: the four
+    // early exits in the registration loop all happen BEFORE `Registered`, so
+    // there is no waiter to cancel, and both post-registration exits call
+    // `fence_wait_cancel`.
+    SyncWaitBlock::with(|block| {
+        let mut full_retries = 0u32;
+        loop {
+            let prep = adapter.with_virtio(|v| {
+                v.drain_used();
+                v.fence_wait_prepare(fence_id, block.as_ptr())
+            });
+            match prep {
+                Err(_) => return WaitFenceOutcome::Invalid, // transport gone
+                Ok(FenceWaitPrep::Complete) => return WaitFenceOutcome::Complete,
+                Ok(FenceWaitPrep::Invalid) => return WaitFenceOutcome::Invalid,
+                Ok(FenceWaitPrep::TableFull) => {
+                    full_retries += 1;
+                    if full_retries > 1_000 {
+                        // NOT FENCE_WAIT_TIMEOUTS: the host may be perfectly
+                        // healthy and all MAX_FENCE_WAITERS slots simply occupied.
+                        // The outcome stays TimedOut so the ICD is untouched; only
+                        // the evidence is split. Note the budget is nominally 1 s
+                        // but KeDelayExecutionThread rounds a 1 ms relative timeout
+                        // up to the system timer granularity (~15.6 ms), so this is
+                        // up to ~16 s of thread residency.
+                        FENCE_WAIT_TABLE_FULL.fetch_add(1, Ordering::Relaxed);
+                        return WaitFenceOutcome::TimedOut;
+                    }
+                    sleep_ms(1);
                 }
-                sleep_ms(1);
+                Ok(FenceWaitPrep::Registered) => break,
             }
-            Ok(FenceWaitPrep::Registered) => break,
         }
-    }
 
-    if timeout_ns == 0 {
-        // Poll: deregister immediately; completion may still have raced in.
-        return match adapter.with_virtio(|v| v.fence_wait_cancel(block_ptr)) {
+        if timeout_ns == 0 {
+            // Poll: deregister immediately; completion may still have raced in.
+            return match adapter.with_virtio(|v| v.fence_wait_cancel(block.as_ptr())) {
+                Ok(true) => WaitFenceOutcome::Complete,
+                Ok(false) => WaitFenceOutcome::TimedOut,
+                // Transport gone: the fence did NOT retire. Reporting Complete here
+                // made escape_wait_fence write out_completed = 1 and return
+                // STATUS_SUCCESS for an unretired wire fence - a direct violation of
+                // "never signal a wire fence before host completion". Invalid is
+                // already mapped to STATUS_INVALID_PARAMETER and already handled by
+                // the ICD.
+                Err(_) => {
+                    TRANSPORT_GONE_AT_WAIT.fetch_add(1, Ordering::Relaxed);
+                    WaitFenceOutcome::Invalid
+                }
+            };
+        }
+
+        let total_ms = (timeout_ns / 1_000_000).max(1).min(WAIT_FENCE_MAX_MS);
+        if wait_block(adapter, block, total_ms) {
+            return WaitFenceOutcome::Complete;
+        }
+        match adapter.with_virtio(|v| {
+            v.drain_used();
+            v.fence_wait_cancel(block.as_ptr())
+        }) {
             Ok(true) => WaitFenceOutcome::Complete,
-            Ok(false) => WaitFenceOutcome::TimedOut,
-            // Transport gone: the fence did NOT retire. Reporting Complete here
-            // made escape_wait_fence write out_completed = 1 and return
-            // STATUS_SUCCESS for an unretired wire fence - a direct violation of
-            // "never signal a wire fence before host completion". Invalid is
-            // already mapped to STATUS_INVALID_PARAMETER and already handled by
-            // the ICD.
+            Ok(false) => {
+                FENCE_WAIT_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
+                WaitFenceOutcome::TimedOut
+            }
+            // As in the poll exit above.
             Err(_) => {
                 TRANSPORT_GONE_AT_WAIT.fetch_add(1, Ordering::Relaxed);
                 WaitFenceOutcome::Invalid
             }
-        };
-    }
-
-    let total_ms = (timeout_ns / 1_000_000).max(1).min(WAIT_FENCE_MAX_MS);
-    if wait_block(adapter, block_ptr, total_ms) {
-        return WaitFenceOutcome::Complete;
-    }
-    match adapter.with_virtio(|v| {
-        v.drain_used();
-        v.fence_wait_cancel(block_ptr)
-    }) {
-        Ok(true) => WaitFenceOutcome::Complete,
-        Ok(false) => {
-            FENCE_WAIT_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
-            WaitFenceOutcome::TimedOut
         }
-        // As in the poll exit above.
-        Err(_) => {
-            TRANSPORT_GONE_AT_WAIT.fetch_add(1, Ordering::Relaxed);
-            WaitFenceOutcome::Invalid
-        }
-    }
+    })
 }

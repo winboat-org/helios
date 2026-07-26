@@ -36,6 +36,7 @@
 //! survive a lost interrupt with only slice-granularity latency.
 
 use core::cell::UnsafeCell;
+use core::marker::PhantomData;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
@@ -714,9 +715,43 @@ impl ScanoutNotify {
 }
 
 impl SyncWaitBlock {
-    /// A zeroed block. MUST be `init`ed (in place, at its final address) before
-    /// registration; must not move until deregistered.
-    pub fn new_zeroed() -> Self {
+    /// Run `f` with a wait block that is zeroed and initialised in place on
+    /// THIS frame and is never nameable by the caller.
+    ///
+    /// The three invariants — initialised before registration, never moved
+    /// after, always deregistered before the frame dies — used to be carried by
+    /// comments over a `new_zeroed()` -> `unsafe { init() }` ->
+    /// `NonNull::from(&mut block)` dance at two call sites. A KEVENT dispatcher
+    /// header is self-referential, so a move after `init` corrupts the wait list
+    /// silently, and BOTH misuses compiled with zero `unsafe`, because
+    /// `enqueue_sync` and `fence_wait_prepare` are safe fns taking a
+    /// `NonNull<SyncWaitBlock>`:
+    ///
+    ///     let mut b = SyncWaitBlock::new_zeroed();
+    ///     enqueue_sync(.., NonNull::from(&mut b));     // never init'ed
+    ///
+    /// and so did returning the block from a helper between `init` and
+    /// registration. Neither is expressible now: the value has no name outside
+    /// this function.
+    ///
+    /// Deregistration still depends on the caller's control flow, which is why
+    /// the abandon/cancel logic belongs in the closure's own epilogue.
+    pub fn with<R>(f: impl FnOnce(&WaitBlockRef<'_>) -> R) -> R {
+        let mut block = Self::new_zeroed();
+        // SAFETY: `block` is a local of THIS frame, so it is at its final
+        // address, and it is never moved afterwards — `f` only ever sees a
+        // `WaitBlockRef` borrowing it. It outlives the call to `f`.
+        unsafe { block.init() };
+        let block_ref = WaitBlockRef {
+            ptr: NonNull::from(&mut block),
+            _frame: PhantomData,
+        };
+        f(&block_ref)
+    }
+
+    /// A zeroed block. Private: reachable only through [`Self::with`], which is
+    /// what makes "registered but never initialised" unrepresentable.
+    fn new_zeroed() -> Self {
         // SAFETY: a zeroed KEVENT/AtomicBool/byte-array is a valid *inert*
         // value; `init` initializes the dispatcher header before any use.
         unsafe { core::mem::zeroed() }
@@ -726,24 +761,50 @@ impl SyncWaitBlock {
     ///
     /// # Safety
     /// `self` must be at its final (pinned) address.
-    pub unsafe fn init(&mut self) {
+    unsafe fn init(&mut self) {
         // SAFETY: valid, stable KEVENT storage per the fn contract.
         unsafe { KeInitializeEvent(&mut self.event, NOTIFICATION_EVENT, 0) };
         self.done.store(false, Ordering::Relaxed);
     }
 
     /// Whether the entry completed (Acquire — pairs with the drain's Release).
-    pub fn is_done(&self) -> bool {
+    fn is_done(&self) -> bool {
         self.done.load(Ordering::Acquire)
     }
 
     /// Copy the response bytes out (only valid once [`Self::is_done`]).
-    pub fn copy_resp(&self, out: &mut [u8]) {
+    fn copy_resp(&self, out: &mut [u8]) {
         let n = out.len().min(SYNC_RESP_MAX);
         // SAFETY: `resp` is only written by the drain BEFORE `done` is set
         // (Release); the caller reads AFTER observing `done` (Acquire).
         let src = unsafe { &*self.resp.get() };
         out[..n].copy_from_slice(&src[..n]);
+    }
+}
+
+/// The only handle a [`SyncWaitBlock::with`] closure gets: a pointer to hand
+/// the transport, plus the two reads the waiter needs. Borrows the block, so it
+/// cannot outlive the frame the block lives on.
+pub struct WaitBlockRef<'a> {
+    ptr: NonNull<SyncWaitBlock>,
+    _frame: PhantomData<&'a SyncWaitBlock>,
+}
+
+impl WaitBlockRef<'_> {
+    /// The registration pointer for `enqueue_sync` / `fence_wait_prepare`.
+    pub fn as_ptr(&self) -> NonNull<SyncWaitBlock> {
+        self.ptr
+    }
+
+    pub fn is_done(&self) -> bool {
+        // SAFETY: the block is alive for this borrow's whole lifetime; `done`
+        // is an atomic, so the concurrent DISPATCH-level writer is fine.
+        unsafe { self.ptr.as_ref() }.is_done()
+    }
+
+    pub fn copy_resp(&self, out: &mut [u8]) {
+        // SAFETY: as above; `copy_resp`'s own contract covers the ordering.
+        unsafe { self.ptr.as_ref() }.copy_resp(out);
     }
 }
 
