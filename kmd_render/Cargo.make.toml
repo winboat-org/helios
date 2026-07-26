@@ -100,6 +100,65 @@ std::fs::copy(&source, &destination).unwrap_or_else(|e| {
 });
 '''
 
+# A panic in any Helios DDI is a KeBugCheck (panic = "abort" + wdk-panic), i.e.
+# a silent graphics deadlock or a stop, so the crate must contain no runtime
+# panic source of the unwrap/expect class. R601 removed the last six; this keeps
+# them gone.
+#
+# It is a packaging-time task, not a build.rs check, deliberately: build.rs would
+# have to declare `rerun-if-changed=src`, which re-runs bindgen and the resource
+# compile on every source edit. Gating the packaged image is what matters — that
+# is the artifact that ships. `#![deny(clippy::unwrap_used, clippy::expect_used)]`
+# in lib.rs covers the same ground under `cargo clippy`.
+#
+# Line comments are stripped before matching so the prose may name the pattern.
+# Truncating at the first `//` can in principle hide a `.unwrap()` that appears
+# after a `//` INSIDE a string literal; no such string exists in this crate, and
+# the alternative is a Rust lexer in a build task.
+[tasks.verify-no-panics]
+script_runner = "@rust"
+script = '''
+use std::path::{Path, PathBuf};
+
+fn scan(dir: &Path, hits: &mut Vec<String>) {
+    let entries = std::fs::read_dir(dir).unwrap_or_else(|e| panic!("read_dir {dir:?}: {e}"));
+    for entry in entries {
+        let path = entry.expect("dir entry").path();
+        if path.is_dir() {
+            scan(&path, hits);
+        } else if path.extension().is_some_and(|e| e == "rs") {
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("read {path:?}: {e}"));
+            for (n, line) in text.lines().enumerate() {
+                let code = match line.find("//") {
+                    Some(i) => &line[..i],
+                    None => line,
+                };
+                if code.contains(".unwrap()") || code.contains(".expect(") {
+                    hits.push(format!("{}:{}: {}", path.display(), n + 1, line.trim()));
+                }
+            }
+        }
+    }
+}
+
+let src = PathBuf::from(std::env::var("CARGO_MAKE_WORKING_DIRECTORY").unwrap()).join("src");
+let mut hits = Vec::new();
+scan(&src, &mut hits);
+if !hits.is_empty() {
+    for h in &hits {
+        println!("cargo-make: panicking call site: {h}");
+    }
+    panic!(
+        "{} panicking call site(s) in kmd_render/src. A panic in a DDI is a \
+         KeBugCheck; return a documented NTSTATUS and count the refusal instead. \
+         See REFACTOR_REVIEW.md R601.",
+        hits.len()
+    );
+}
+println!("cargo-make: no unwrap/expect call sites in kmd_render/src");
+'''
+
 [tasks.stampinf]
 private = true
 command = "stampinf"
@@ -115,7 +174,12 @@ args = [
 
 [tasks.inf2cat]
 private = true
-dependencies = ["copy-driver-binary-to-package", "copy-inf-to-package", "copy-umd-to-package"]
+dependencies = [
+  "verify-no-panics",
+  "copy-driver-binary-to-package",
+  "copy-inf-to-package",
+  "copy-umd-to-package",
+]
 env = { "WDK_BUILD_INF2CAT_OS" = { source = "${CARGO_MAKE_CRATE_TARGET_TRIPLE}", default_value = "UNKNOWN", mapping = { "x86_64-pc-windows-msvc" = "10_x64", "aarch64-pc-windows-msvc" = "Server10_arm64" } } }
 command = "inf2cat"
 args = [

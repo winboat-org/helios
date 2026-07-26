@@ -11,6 +11,12 @@
 
 #![no_std]
 #![allow(non_snake_case, non_camel_case_types, non_upper_case_globals)]
+// A panic in any DDI is a KeBugCheck (see the `wdk_panic` note below), so the
+// crate carries no runtime panic source of this class. rustc accepts and ignores
+// tool lints, so this costs a plain `cargo build` nothing; it fails
+// `cargo clippy`, and `cargo make`'s `verify-no-panics` task fails the packaged
+// image build for the same reason.
+#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 extern crate alloc;
 
