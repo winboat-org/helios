@@ -632,6 +632,46 @@ allocation path.
 
 This tranche fixes every KMD defect whose end state is a silent stop: the three ways `vidpn_programming` latches at 1 and kills the CRTC_VSYNC heartbeat, the display publication state that survives a StopDevice into a new transport generation, the `failed` ring latch that makes the WDDM pending FIFO undrainable, the one-shot Venus copy-target latch that fails every scanout target after a resolution change, the dangling MmMapIoSpace VA published as a valid register, and the DMA_COMPLETED pair that either loses a fence or returns an out-of-contract NTSTATUS. It opens with the observability fix, because today every StartDevice/transport/venus/HPD failure breadcrumb goes through `diag::record`, a hard no-op at the default `DiagLevel=0`, so none of the other fixes here would be provable in a production boot. Every item is a small, local edit: no file moves, no type-level encoding of the display or transport invariants (those are T3/T4a/T4b), no UMD or bridge change (T2), no deletion (T6). Registry knob names, existing counter names and existing breadcrumb values are unchanged throughout; new named counters are additive and each one is explicitly zeroed at StartDevice so the gate's "verify movement, not presence" rule can be applied.
 
+### T1a status (2026-07-26) — all 16 entries landed, one sub-commit deferred
+
+Every entry below built clean on the VM before its commit; `cargo fmt --check` clean throughout.
+The tranche is 19 commits. Registry knob names, existing counter names and existing breadcrumb
+values are unchanged; every new counter is additive and zeroed at StartDevice by R201.
+
+| Entry | Status | Note |
+|---|---|---|
+| R201 | **LANDED** | `FaultCounter` enum + `diag::fault` + `reset_fault_counters`; five sites converted, existing `record` breadcrumbs kept |
+| R202 | **LANDED** | two-condition CAS in `retire_scanout_allocation`; `VpCncl` |
+| R203 | **LANDED** | hook deleted from `display.rs`, experiment relocated to the PASSIVE HPD worker; `grep scanout_diag ddi/display.rs` now empty |
+| R204 | **LANDED** | `reset_display_publication_state` + `StRst`/`StRstR`, called from StopDevice after `stop_hpd` and defensively from StartDevice |
+| R205 | **LANDED** (2 commits) | c1 `StTxG`/`StMdB`; c2 demotes `display_half` and records `StNoTx` + `DspH=0` |
+| R206 | **LANDED** (2 commits) | c1 VRP StatusBlock (`ERROR_INVALID_FUNCTION`, a Win32 code — VP_STATUS is not an NTSTATUS) + `QueryChildStatus` NOT_SUPPORTED; c2 D3 cancel / D0 re-arm + `PwrSt` |
+| R207 | **LANDED** | `try_mmio_map -> Option<NonNull<u8>>`; breadcrumb `0x0B00_00E9`, counter `StIsr` |
+| R208 | **LANDED** | retarget replaces the permanent refusal; `CpTgtSw`, `CpTgtE` |
+| R209 | **LANDED** | `take_one_ready_wddm` + `requeue_wddm_front`, non-`Copy` `WddmReady`, `DMA_NOTIFY_FAILS` |
+| R210 | **LANDED** | `SubmitAck`; both DDIs return STATUS_SUCCESS |
+| R211 | **LANDED** | `latch_failed_and_fail_inflight`; fence tables drained; `WDDM_SIGNAL_AFTER_FAILURE`, `StRing` |
+| R212 | **LANDED** | three-way match at all three sites; `CTRL_TEARDOWN_ABANDONS`, `TRANSPORT_GONE_AT_WAIT` |
+| R213 | **LANDED** (2 of 3) | c1 bounded join + `hpd_worker_leaked` + RemoveDevice leak + `StHpdX`; c2 `hpd_exited` NotificationEvent. **c3 DEFERRED to T3** — see below |
+| R214 | **LANDED** | two `release_*` calls + the corrected cleanup-contract doc |
+| R215 | **LANDED** | reset spin returns `Err`; `StVioR` (not `StRst`, taken by R204); the `depends_on: k-gputransport-12` is void as the recommendation states |
+| R216 | **LANDED** | `abort_parked_reap` + release-safe `finish_parked_reap` + `REAP_ABANDONED` |
+
+**R213 commit 3 — DEFERRED to T3, not skipped.** The recommendation asks for an
+`Option<WorkerToken>` field that `stop_hpd` must consume, so the free path consults a value
+instead of trusting a `()`-returning function. Commit 1 already achieves the *behaviour*
+(RemoveDevice consults `hpd_worker_may_be_running()` and leaks rather than frees). Making it a
+move-only token needs `&mut` access to `AdapterContext`, and `stop_hpd`/`Drop`/StopDevice all
+reach it through `&self`; the commit that reshapes exactly that access pattern is **R510** ("Stop
+forming `&mut AdapterContext` in StartDevice/StopDevice") in T3. Landing a token before R510 would
+mean adding an `UnsafeCell` purely to hold it, which relocates the unchecked assumption rather
+than removing it — the outcome the review's own *rejected as cosmetic* rule exists to prevent.
+
+Two counter-name collisions were avoided and are worth knowing: `StRst` is R204's (so R215 uses
+`StVioR`), and breadcrumb `0x0B00_00E7` is already both HPD-thread-create and venus-bring-up (so
+R207 uses `0x0B00_00E9`, exactly as its recommendation says and contrary to the underlying
+finding's suggestion).
+
 ### R201. Report every lifecycle failure through an ungated named counter, not the DiagLevel-gated ring
 
 - **Finding**: k-lifecycle-03. BUG (observability defect; no control flow changes).
