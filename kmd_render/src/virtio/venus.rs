@@ -738,6 +738,37 @@ impl PreparedPresentBlt {
     }
 }
 
+impl ImportedOptimalImage {
+    /// Destroy the host objects this import owns, handing the record back on
+    /// failure. See [`PreparedPresentBlt::release`].
+    ///
+    /// This is the record whose loss was worst: `OwnedMemoryBlob`'s own doc
+    /// forbids ever manufacturing a second imported `VkDeviceMemory` for one
+    /// resource, and a forgotten import does exactly that. The surviving
+    /// allocation's next Present re-enters `import_optimal_present_image`,
+    /// which calls `attach_resource_checked` on a resource that is still
+    /// attached (`ctx_attach_resource` does no dedup) plus a fresh
+    /// `allocate_imported_resource_memory` — a second VkDeviceMemory naming the
+    /// same backing.
+    fn release(
+        self,
+        client: &mut VenusClient,
+        adapter: &AdapterContext,
+    ) -> Result<(), (Self, VirtioError)> {
+        if let Err(e) = client.destroy_image_on_ring(adapter, self.image_id) {
+            return Err((self, e));
+        }
+        if let Err(e) = client.free_memory_blob(adapter, self.memory_id.get()) {
+            return Err((self, e));
+        }
+        // Each resource occurs exactly once in present_images.
+        if let Err(e) = ctrl::ctx_detach_resource(adapter, client.ctx_id(), self.desc.resource_id) {
+            return Err((self, e));
+        }
+        Ok(())
+    }
+}
+
 const MAX_PRESENT_IMAGES: usize = 32;
 const MAX_PRESENT_BUFFERS: usize = 16;
 const MAX_PRESENT_BLITS: usize = 32;
@@ -4589,10 +4620,11 @@ impl VenusClient {
             }
         }
         while let Some(image) = self.present_images.pop() {
-            self.destroy_image_on_ring(adapter, image.image_id)?;
-            self.free_memory_blob(adapter, image.memory_id.get())?;
-            // Each resource occurs exactly once in present_images.
-            ctrl::ctx_detach_resource(adapter, self.ctx_id(), image.desc.resource_id)?;
+            if let Err((image, error)) = image.release(self, adapter) {
+                self.present_images.push(image);
+                crate::diag::record_named_bytes(b"PBTdErr", resource_id);
+                return Err(error);
+            }
         }
         while let Some(buffer) = self.present_buffers.pop() {
             self.destroy_buffer_on_ring(adapter, buffer.buffer_id)?;
