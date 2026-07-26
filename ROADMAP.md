@@ -292,25 +292,58 @@ virtio-gpu scanout; IddCx/Looking Glass is no longer the active display path.*
    ⚠ One consequence for T5 sequencing: T5's **R805** renames `protocol/`'s `_pad` and four
    `kmd_render` read sites, so it is not UMD-only. Doing T3 first means R805 folds naturally into a
    KMD-deploy window instead of being an awkward exception to T5's "release UMD only" shape.
-7. Implement the remaining reviewed refactors atomically, in tranche order, one recommendation
+7. **T4a BUILT — gate NOT YET RUN (2026-07-27, KMD `22.22.184.0`, 27 commits).** 18 of the 19
+   items (R601–R613, R615–R619) plus **all 11 minor items** landed; **R614 is the one item NOT
+   done** (see below). New host tests: `kmd_logic` 28→34, `protocol` 3→8.
+   **Structure added:** the no-panic rule is now enforced twice (a `verify-no-panics` cargo-make
+   task that fails the PACKAGE build, plus `#![deny(clippy::unwrap_used, expect_used, panic)]`) —
+   `grep -rn '\.expect(\|\.unwrap()' kmd_render/src` is EMPTY. `Writer` moved to `kmd_logic`
+   with a sticky overflow flag; six per-class Vulkan id newtypes over `NonZeroU64` (`VkImageId`,
+   `VkDeviceMemoryId`, `VkBufferId`, `VkCommandPoolId`, `VkCommandBufferId`, `VkFenceId`) plus
+   `VkDeviceId`/`VkQueueId` from the bring-up typestate; `VenusRing → VenusInstance →
+   VenusClient`; `RingMap`/`RingWord`; `Chain`/`DmaSpan`; `SyncWaitBlock::with` +
+   `SyncTicket`/`SyncOutcome`; `AllocationBacking`/`classify` (in `protocol/`, host-tested) +
+   `CreatedBacking`; `BackingSize`; `WindowAllocator`; `RetireDomain`; `MappingTable::insert_unique`.
+   **New counters, all must read 0 or be absent:** `VnEncOvf VnRingFt VnRingWd VnRingSz VnMtDown
+   CpNoDrn PBTdErr CtNotOurs WtTbl AbnDrop ChSzMm ChSzDl ChSzPv MapDup PciCapOob WnRcf`.
+   CollectDbgInfo is **version 6**, `[u32; 38]`, with `FENCE_WAIT_TABLE_FULL` appended at index 37
+   (word 25 still `FENCE_WAIT_TIMEOUTS` — the report is decoded by index, never renumber).
+   ⚠ **Stack budget, measured before and after with the new `tools/kmd-frame-sizes.ps1`:**
+   `DxgkDdiStartDevice` 8376→**8408**, `VirtioGpu::init` 9112→**9160**, binding chain
+   17488→**17568** of the 17936-byte known-good ceiling — **368 bytes of headroom left, down from
+   448**. The script now reads sub-page frames, sums declared call CHAINS rather than every symbol,
+   and exits 1 over the ceiling; run it on every image. The venus bring-up is the shallower chain
+   at 12816 because R608 split it into `#[inline(never)]` per-stage frames.
+   ⚠ **R614 (the `PassiveLevel` proof token) is NOT DONE, deliberately.** The review sized it at
+   "33 signatures plus caller groups"; measured against the tree it is ~190 sites, because
+   `venus.rs` sits between the DDIs and `virtio::ctrl` and every one of its 95 `VenusClient`/
+   `VenusRing` methods transitively reaches `ctrl::sleep_ms` through `ring_wait_until`. Full cost:
+   34 ctrl entry points + 95 venus methods + 64 external `ctrl::` call sites + 23
+   `with_venus_client` sites. It is pure type-level change (identical counters, identical desktop),
+   the review itself schedules it last "so a partial revert does not strand other items", and it
+   needs its own image.
+   ⚠ Formatting: `cargo fmt` was NOT run — the crate was already unclean before T4a (`lib.rs` 49
+   hunks, `ddi/mod.rs` 26, `virtio/mod.rs` 20, all untouched here) and `cargo fmt` clean is T8's
+   gate criterion. T4a added ~5 hunks in files it edited.
+8. Implement the remaining reviewed refactors atomically, in tranche order, one recommendation
    per commit; never fold a `BUG` fix into a structure move. Preserve the current direct
    primary, completion ordering, loud-failure contracts, registry ABI, and
    diagnostic names unless a reviewed change explicitly migrates them. Replace
    arbitrary `Sleep`/poll loops with event, interrupt, fence, or
    condition-variable contracts; do not remove bounded safety timeouts merely
    because they wait.
-8. Regression-test each tranche and the final driver against visible desktop
+9. Regression-test each tranche and the final driver against visible desktop
    output, idle wake, rapid cursor motion, DComp cadence, DWM stability,
    same-boot KMD breadcrumbs, and host scanout evidence. Keep
    `ScanoutDiag` absent during primary tests.
-9. Continue soaking the current direct-primary path across DWM buffer rotation,
+10. Continue soaking the current direct-primary path across DWM buffer rotation,
    resize, suspend/resume, device restart, and cold boot.
-10. Pursue true host zero-copy only with a layout contract the display importer
+11. Pursue true host zero-copy only with a layout contract the display importer
    can consume. An explicit DRM modifier is one possible route, but enabling the
    modifier/DMA_BUF extensions on every DXVK device is prohibited: it inflated
    ordinary shared OPTIMAL import requirements and caused valid undersized-import
    refusal, DWM failures, and NVIDIA Xid 31 when bypassed.
-11. Continue D3D11 stability and conformance work after the quality pass.
+12. Continue D3D11 stability and conformance work after the quality pass.
 
 ## Historical PSC workstreams
 
@@ -1826,11 +1859,30 @@ Plan:
   exhausted its budget), `HpdStTo` (the HPD prologue fell back to its 500 ms
   bound instead of the real start edge).
 - ⚠ **Kernel stack budget on the boot path**: `DxgkDdiStartDevice` +
-  `VirtioGpu::init` are ~17.5 KB of a 24 KB kernel stack (8376 + 9112 as of
-  22.22.183.0). Overflow at boot = `0xc0000001`/Startup Repair with **no dump and
+  `VirtioGpu::init` are the binding chain — **17568 B of the 17936-B known-good
+  ceiling as of 22.22.184.0** (8408 + 9160), i.e. 368 B of headroom in a 24 KB
+  kernel stack. Overflow at boot = `0xc0000001`/Startup Repair with **no dump and
   no bugcheck event**, and it does NOT reproduce on a live `devcon` restart.
-  Measure with `llvm-objdump -d` + the linker `.map`: find the function entry,
-  read the `movl $N, %eax; call __chkstk` prologue.
+  **Run `tools/kmd-frame-sizes.ps1` on every image** — it reads the frames out of
+  the built `.sys` + linker `.map` with `llvm-objdump` (no PDB, no debugger),
+  handles sub-page frames, sums the declared call CHAINS rather than every symbol
+  measured, and **exits 1 over the ceiling**. `-Symbols`/`-Chains` extend it.
+- **Counter snapshots**: `tools/kmd-counter-snapshot.ps1 -Label <name>` dumps the
+  whole service key to `Z:\tmp\kmd-counters-<name>.txt` and prints the
+  transport/venus/scanout subset. Registry values PERSIST ACROSS BOOTS — take one
+  before a workload and one after and diff the files; a single read proves nothing.
+- **T4a counters** (22.22.184.0+; every one must read 0 or be absent on a healthy
+  boot): `VnEncOvf` (venus command-stream overflow, absent), `VnRingFt`/`VnRingWd`
+  (ring fatal latch / head-wait ms, absent), `VnRingSz` (undersized ring mapping,
+  absent), `VnMtDown` (memory-type downgrade, absent), `CpNoDrn` (prepared-copy
+  drain skipped because nothing was submitted), `PBTdErr` (partial Present-BLT
+  teardown), `CtNotOurs` (sync token named another entry), `WtTbl`
+  (`FENCE_WAIT_TABLE_FULL`, split out of `WtOut`), `AbnDrop` (fences discarded by
+  a TDR/preempt/reset epoch), `ChSzMm`/`ChSzDl`/`ChSzPv` (aperture size-provenance
+  cross-checks), `MapDup` (duplicate blob map refused at commit time),
+  `PciCapOob` (PCI capability tail outside config space), `WnRcf` (window-reserve
+  reconfiguration refused). CollectDbgInfo is **version 6 / `[u32; 38]`**, with
+  `FENCE_WAIT_TABLE_FULL` at index 37; word 25 is still `FENCE_WAIT_TIMEOUTS`.
 - **Guest probes** (schtasks, session 1; SSH lands in session 0):
   `helios_paintcap` (screenshot → `Z:\tmp\screen_copy.png`), `helios_repaint`,
   `helios_flasher`, `helios_dstate`, `helios_enum_windows`, `helios_regedit`.
