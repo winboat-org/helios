@@ -233,6 +233,19 @@ const RING_WAIT_TIMEOUT_MS: u64 = 30_000;
 // comment that used to sit here said "~120 bytes" and was wrong by 212.
 use helios_kmd_logic::Writer;
 
+/// Why the venus ring was declared unusable. Each arm names a registry counter
+/// so a wedge is distinguishable from every other `DeviceError` in a post-mortem
+/// `reg query`, at the default `DiagLevel=0`.
+enum FatalReason {
+    /// The host set `RING_STATUS_FATAL` — it rejected something we encoded.
+    /// Records `VnRingFt=1`.
+    HostStatusFatal,
+    /// The ring head never advanced past our seqno within
+    /// [`RING_WAIT_TIMEOUT_MS`]. Records `VnRingWd` = milliseconds waited, so
+    /// the dump distinguishes "gave up at the budget" from a short stall.
+    HeadWaitTimeout { elapsed_ms: u64 },
+}
+
 /// Diagnostic breadcrumb base for venus bring-up (0x0D00_00xx).
 fn diag(code: u32) {
     crate::diag::record(0x0D00_0000 | (code & 0xFFFF));
@@ -880,12 +893,19 @@ pub struct VenusClient {
     /// Raw VkMemoryPropertyFlags for physical-device memory types.
     memory_type_flags: [u32; VK_MAX_MEMORY_TYPES as usize],
     memory_type_count: u32,
-    /// Poison latch: set when a ring wait hits its spin bound or the host
-    /// reports RING_STATUS_FATAL. A wedged/fatal ring never recovers, and the
-    /// allocation path reaches these waits at DISPATCH_LEVEL under the device
-    /// spinlock — without the latch every subsequent call re-burned the full
-    /// RING_POLL_SPINS budget (~1 s each), which is the 2026-07-03 guest
-    /// wedge. Once set, every ring command fails fast with `DeviceError`.
+    /// Poison latch: set when a ring wait exhausts [`RING_WAIT_TIMEOUT_MS`] or
+    /// the host reports RING_STATUS_FATAL. A wedged/fatal ring never recovers,
+    /// and without the latch every subsequent call re-burned the full wait
+    /// budget, which is the 2026-07-03 guest wedge. Once set, every ring command
+    /// fails fast with `DeviceError`.
+    ///
+    /// Write it ONLY through [`VenusClient::latch_fatal`], which names the
+    /// reason in the registry. (The previous version of this comment claimed the
+    /// allocation path reaches these waits "at DISPATCH_LEVEL under the device
+    /// spinlock" and cited a `RING_POLL_SPINS` constant that no longer exists.
+    /// It is wrong on both counts and it is load-bearing here: `ring_wait_until`
+    /// sleeps via `ctrl::sleep_ms`, so these waits are PASSIVE-only, which is
+    /// what makes `latch_fatal`'s registry write legal.)
     fatal: bool,
     /// One-time PREINITIALIZED -> GENERAL -> EXTERNAL setup for the persistent
     /// LINEAR scanout target. The pool/buffer remain live because setup is
@@ -924,6 +944,29 @@ impl VenusClient {
         h
     }
 
+    /// Latch the ring poison, naming the reason in the registry.
+    ///
+    /// This is the ONLY writer of `self.fatal`; `grep -n 'self.fatal = true'`
+    /// returning just this body is the invariant. Before it, a wedged ring left
+    /// zero evidence on a production boot: the three latch sites recorded
+    /// nothing, `diag::record` is `DiagLevel`-gated off by default, and the DDI
+    /// returned a bare `DeviceError` indistinguishable from every other one —
+    /// destroying the post-mortem for exactly the failure the 30 s budget exists
+    /// to survive.
+    ///
+    /// `record_named_bytes` writes the registry and so must run at PASSIVE. All
+    /// three callers are on the PASSIVE ring path: `ring_wait_until` sleeps via
+    /// `ctrl::sleep_ms` (`KeDelayExecutionThread`), which is only legal there.
+    fn latch_fatal(&mut self, reason: FatalReason) {
+        self.fatal = true;
+        match reason {
+            FatalReason::HostStatusFatal => crate::diag::record_named_bytes(b"VnRingFt", 1),
+            FatalReason::HeadWaitTimeout { elapsed_ms } => {
+                crate::diag::record_named_bytes(b"VnRingWd", elapsed_ms as u32)
+            }
+        }
+    }
+
     /// Send a direct (non-ring) venus command via `VIRTIO_GPU_CMD_SUBMIT_3D`. Used
     /// for the ring-bootstrap commands (`vkCreateRingMESA`, `vkNotifyRingMESA`,
     /// `vkSubmit/WaitVirtqueueSeqnoMESA`) which must reach the host before / around
@@ -945,7 +988,7 @@ impl VenusClient {
 
         let status = self.ring_map.load_u32_acquire(RING_STATUS_OFFSET);
         if status & RING_STATUS_FATAL != 0 {
-            self.fatal = true;
+            self.latch_fatal(FatalReason::HostStatusFatal);
             return Err(VirtioError::DeviceError);
         }
         // vkNotifyRingMESA(ring, seqno, flags=0): wake the host ring dispatch.
@@ -985,11 +1028,13 @@ impl VenusClient {
             let status = self.ring_map.load_u32_acquire(RING_STATUS_OFFSET);
             if status & RING_STATUS_FATAL != 0 {
                 // Host declared the ring fatal — it never recovers.
-                self.fatal = true;
+                self.latch_fatal(FatalReason::HostStatusFatal);
                 return Err(VirtioError::DeviceError);
             }
             if slept_ms >= RING_WAIT_TIMEOUT_MS {
-                self.fatal = true;
+                self.latch_fatal(FatalReason::HeadWaitTimeout {
+                    elapsed_ms: slept_ms,
+                });
                 return Err(VirtioError::DeviceError);
             }
             ctrl::sleep_ms(1);
