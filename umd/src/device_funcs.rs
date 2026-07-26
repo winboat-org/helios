@@ -342,6 +342,10 @@ unsafe extern "C" fn ddi_relocate_device_funcs_wddm1_3(
     }
 }
 
+// Unreachable: nothing at or above 0x000b_0022 is advertised, so
+// NegotiatedInterface has no WDDM2_1 variant to dispatch here. The code stays
+// in place; its deletion is T6's u-core-V02.
+#[allow(dead_code)]
 unsafe extern "C" fn ddi_relocate_device_funcs_wddm2_1(
     _h_device: ddi::D3D10DDI_HDEVICE,
     funcs: *mut ddi::D3DWDDM2_1DDI_DEVICEFUNCS,
@@ -751,6 +755,10 @@ pub unsafe fn fill_wddm1_3_device_funcs(funcs: *mut ddi::D3DWDDM1_3DDI_DEVICEFUN
     audit_wddm1_3_device_funcs("FillDeviceFuncs", funcs);
 }
 
+// Unreachable: nothing at or above 0x000b_0022 is advertised, so
+// NegotiatedInterface has no WDDM2_1 variant to dispatch here. The code stays
+// in place; its deletion is T6's u-core-V02.
+#[allow(dead_code)]
 pub unsafe fn fill_wddm2_1_device_funcs(funcs: *mut ddi::D3DWDDM2_1DDI_DEVICEFUNCS) {
     let n = core::mem::size_of::<ddi::D3DWDDM2_1DDI_DEVICEFUNCS>() / core::mem::size_of::<usize>();
     let slots = funcs as *mut Option<UniformFn>;

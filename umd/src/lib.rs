@@ -50,6 +50,58 @@ const SUPPORTED_DDI_VERSIONS: &[u64] = &[
     ddi_supported(11, 10, 2), // D3D11_0_DDI_SUPPORTED
 ];
 
+/// The DDI interface versions `GetSupportedVersions` advertises, as a closed
+/// set. `CreateDevice` dispatches on this and nothing else: the previous
+/// `if/else-if/else` chain treated "unknown or older interface" as D3D11.0 and
+/// bulk-filled `size_of::<D3D11DDI_DEVICEFUNCS>()` = 150 pointer slots into
+/// whatever table the runtime had allocated — 101 slots for
+/// `D3D10DDI_DEVICEFUNCS`, 103 for `D3D10_1DDI_DEVICEFUNCS`, i.e. a 376..392
+/// byte out-of-bounds write into the runtime's heap. `OpenAdapter10` installs
+/// `create_device` while installing no `pfnGetSupportedVersions`, so on that
+/// path the negotiated interface is entirely the runtime's choice and every
+/// D3D10 interface (`0x000a_0001..0x000a_000a`) landed in that `else`.
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum NegotiatedInterface {
+    D3D11_0,
+    D3D11_1,
+    Wddm1_3,
+}
+
+impl NegotiatedInterface {
+    const D3D11_0_INTERFACE: u32 = 0x000b_000a;
+    const D3D11_1_INTERFACE: u32 = 0x000b_000f;
+    const WDDM1_3_INTERFACE: u32 = 0x000b_0010;
+
+    /// Panic-free: a linear scan of a three-element array literal, no indexing.
+    fn from_interface(interface: u32) -> Option<Self> {
+        match interface {
+            Self::WDDM1_3_INTERFACE => Some(Self::Wddm1_3),
+            Self::D3D11_1_INTERFACE => Some(Self::D3D11_1),
+            Self::D3D11_0_INTERFACE => Some(Self::D3D11_0),
+            _ => None,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Wddm1_3 => "WDDM1_3",
+            Self::D3D11_1 => "D3D11_1",
+            Self::D3D11_0 => "D3D11_0",
+        }
+    }
+}
+
+// Keep the enum and the advertised table in lockstep at COMPILE time: adding a
+// version to SUPPORTED_DDI_VERSIONS without adding an enum variant fails here,
+// and adding a variant without a fill arm fails the exhaustive match in
+// `create_device`. That is the property the `else`-as-default did not have.
+const _: () = {
+    assert!(SUPPORTED_DDI_VERSIONS.len() == 3);
+    assert!((SUPPORTED_DDI_VERSIONS[0] >> 32) as u32 == NegotiatedInterface::WDDM1_3_INTERFACE);
+    assert!((SUPPORTED_DDI_VERSIONS[1] >> 32) as u32 == NegotiatedInterface::D3D11_1_INTERFACE);
+    assert!((SUPPORTED_DDI_VERSIONS[2] >> 32) as u32 == NegotiatedInterface::D3D11_0_INTERFACE);
+};
+
 const D3D12_SUPPORTED_DDI_VERSIONS: &[u64] = &[
     // D3D12DDI_SUPPORTED_0003 from WDK 10.0.26100 d3d12umddi.h:
     // interface ((12 << 16) | 2), build 8.
@@ -720,6 +772,19 @@ unsafe extern "system" fn create_device(
         log_line("  CreateDevice: null pDeviceFuncs -> E_FAIL");
         return E_FAIL;
     }
+    //    The negotiated interface is runtime-supplied too, and it selects the
+    //    SHAPE of the table we write. Refuse anything outside the advertised
+    //    set rather than defaulting to D3D11.0's 150-slot fill.
+    let Some(negotiated) = NegotiatedInterface::from_interface(create.interface) else {
+        log_line(&format!(
+            "  CreateDevice: unsupported interface 0x{:08x} (advertised 0x{:08x}/0x{:08x}/0x{:08x}) -> E_NOTIMPL",
+            create.interface,
+            NegotiatedInterface::WDDM1_3_INTERFACE,
+            NegotiatedInterface::D3D11_1_INTERFACE,
+            NegotiatedInterface::D3D11_0_INTERFACE,
+        ));
+        return E_NOTIMPL;
+    };
 
     // 1) Bring up the DXVK device on the Helios venus adapter.
     let dxvk = bridge::ffi::helios_dxvk_create_device(0, 0);
@@ -797,38 +862,39 @@ unsafe extern "system" fn create_device(
 
     // 3) Fill the device-funcs table (Interface == D3D11_0 -> p11DeviceFuncs) and
     //    the DXGI base DDI table the runtime handed us.
+    log_line(&format!(
+        "  CreateDevice: filling {} device-funcs table",
+        negotiated.name()
+    ));
     unsafe {
-        if create.interface >= 0x000b_0022 {
-            device_funcs::fill_wddm2_1_device_funcs(
-                create.p_device_funcs as *mut ddi::D3DWDDM2_1DDI_DEVICEFUNCS,
-            );
-            device_funcs::fill_dxgi_1_3_base_funcs(
-                create.dxgi_base_ddi.p_dxgi_ddi_base_functions
-                    as *mut ddi::DXGI1_3_DDI_BASE_FUNCTIONS,
-            );
-        } else if create.interface >= 0x000b_0010 {
-            device_funcs::fill_wddm1_3_device_funcs(
-                create.p_device_funcs as *mut ddi::D3DWDDM1_3DDI_DEVICEFUNCS,
-            );
-            device_funcs::fill_dxgi_1_3_base_funcs(
-                create.dxgi_base_ddi.p_dxgi_ddi_base_functions
-                    as *mut ddi::DXGI1_3_DDI_BASE_FUNCTIONS,
-            );
-        } else if create.interface >= 0x000b_000f {
-            device_funcs::fill_d3d11_1_device_funcs(
-                create.p_device_funcs as *mut ddi::D3D11_1DDI_DEVICEFUNCS,
-            );
-            device_funcs::fill_dxgi_1_1_base_funcs(
-                create.dxgi_base_ddi.p_dxgi_ddi_base_functions
-                    as *mut ddi::DXGI1_1_DDI_BASE_FUNCTIONS,
-            );
-        } else {
-            device_funcs::fill_d3d11_device_funcs(
-                create.p_device_funcs as *mut ddi::D3D11DDI_DEVICEFUNCS,
-            );
-            device_funcs::fill_dxgi_base_funcs(
-                create.dxgi_base_ddi.p_dxgi_ddi_base_functions as *mut ddi::DXGI_DDI_BASE_FUNCTIONS,
-            );
+        match negotiated {
+            NegotiatedInterface::Wddm1_3 => {
+                device_funcs::fill_wddm1_3_device_funcs(
+                    create.p_device_funcs as *mut ddi::D3DWDDM1_3DDI_DEVICEFUNCS,
+                );
+                device_funcs::fill_dxgi_1_3_base_funcs(
+                    create.dxgi_base_ddi.p_dxgi_ddi_base_functions
+                        as *mut ddi::DXGI1_3_DDI_BASE_FUNCTIONS,
+                );
+            }
+            NegotiatedInterface::D3D11_1 => {
+                device_funcs::fill_d3d11_1_device_funcs(
+                    create.p_device_funcs as *mut ddi::D3D11_1DDI_DEVICEFUNCS,
+                );
+                device_funcs::fill_dxgi_1_1_base_funcs(
+                    create.dxgi_base_ddi.p_dxgi_ddi_base_functions
+                        as *mut ddi::DXGI1_1_DDI_BASE_FUNCTIONS,
+                );
+            }
+            NegotiatedInterface::D3D11_0 => {
+                device_funcs::fill_d3d11_device_funcs(
+                    create.p_device_funcs as *mut ddi::D3D11DDI_DEVICEFUNCS,
+                );
+                device_funcs::fill_dxgi_base_funcs(
+                    create.dxgi_base_ddi.p_dxgi_ddi_base_functions
+                        as *mut ddi::DXGI_DDI_BASE_FUNCTIONS,
+                );
+            }
         }
     }
 

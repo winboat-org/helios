@@ -3375,6 +3375,10 @@ unsafe extern "C" fn resource_read_after_write_hazard(
 ) {
 }
 
+// Unreachable: nothing at or above 0x000b_0022 is advertised, so
+// NegotiatedInterface has no WDDM2_1 variant to dispatch here. The code stays
+// in place; its deletion is T6's u-core-V02.
+#[allow(dead_code)]
 unsafe fn sync_token_cb(h: Hdevice, arg: *const ddi::D3DDDIARG_SYNCTOKEN, release: bool) {
     let Some(dev) = helios_device(h) else {
         log_line("DDI sync_token: missing device");
@@ -3422,6 +3426,10 @@ unsafe extern "C" fn release_resource_sync(h: Hdevice, arg: *const ddi::D3DDDIAR
     sync_token_cb(h, arg, true);
 }
 
+// Unreachable: nothing at or above 0x000b_0022 is advertised, so
+// NegotiatedInterface has no WDDM2_1 variant to dispatch here. The code stays
+// in place; its deletion is T6's u-core-V02.
+#[allow(dead_code)]
 unsafe fn sync_token_cb_2_1(
     h: Hdevice,
     resource: ddi::D3D10DDI_HRESOURCE,
@@ -3435,6 +3443,10 @@ unsafe fn sync_token_cb_2_1(
     sync_token_cb(h, &arg, release);
 }
 
+// Unreachable: nothing at or above 0x000b_0022 is advertised, so
+// NegotiatedInterface has no WDDM2_1 variant to dispatch here. The code stays
+// in place; its deletion is T6's u-core-V02.
+#[allow(dead_code)]
 unsafe extern "C" fn acquire_resource_2_1(
     h: Hdevice,
     resource: ddi::D3D10DDI_HRESOURCE,
@@ -3443,6 +3455,10 @@ unsafe extern "C" fn acquire_resource_2_1(
     sync_token_cb_2_1(h, resource, token, false);
 }
 
+// Unreachable: nothing at or above 0x000b_0022 is advertised, so
+// NegotiatedInterface has no WDDM2_1 variant to dispatch here. The code stays
+// in place; its deletion is T6's u-core-V02.
+#[allow(dead_code)]
 unsafe extern "C" fn release_resource_2_1(
     h: Hdevice,
     resource: ddi::D3D10DDI_HRESOURCE,
@@ -10528,6 +10544,10 @@ pub unsafe fn install_wddm1_3(funcs: *mut ddi::D3DWDDM1_3DDI_DEVICEFUNCS) {
     f.pfnSetMarkerMode = Some(set_marker_mode);
 }
 
+// Unreachable: nothing at or above 0x000b_0022 is advertised, so
+// NegotiatedInterface has no WDDM2_1 variant to dispatch here. The code stays
+// in place; its deletion is T6's u-core-V02.
+#[allow(dead_code)]
 pub unsafe fn install_wddm2_1(funcs: *mut ddi::D3DWDDM2_1DDI_DEVICEFUNCS) {
     let f = &mut *funcs;
     f.pfnCheckMultisampleQualityLevels = Some(check_multisample_quality_levels_wddm1_3);
