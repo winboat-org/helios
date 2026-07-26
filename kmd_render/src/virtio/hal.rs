@@ -233,6 +233,12 @@ impl WdkHal {
 // returns page-aligned, zeroed, physically-contiguous non-paged memory whose
 // physical address is reported for the device; `share`/`unshare` are identity
 // (no IOMMU/bounce in this guest); `mmio_phys_to_virt` maps a real BAR region.
+//
+// The identity `share` is sound only because every buffer that reaches it is a
+// sub-span of a `DmaBuffer`. That is a whole-program property, not something
+// this impl can check — see the precondition paragraph on `share` for where it
+// is discharged. Restating it as fact here without naming the producer is what
+// made it easy to miss.
 unsafe impl Hal for WdkHal {
     fn dma_alloc(pages: usize, _direction: BufferDirection) -> (PhysAddr, NonNull<u8>) {
         let bytes = pages * PAGE_SIZE;
@@ -272,10 +278,25 @@ unsafe impl Hal for WdkHal {
         unsafe { try_mmio_map(paddr, size) }.unwrap_or(NonNull::dangling())
     }
     unsafe fn share(buffer: NonNull<[u8]>, _direction: BufferDirection) -> PhysAddr {
-        // No IOMMU/bounce buffer: the device DMAs guest-physical memory directly.
-        // Buffers handed to the queue are always `dma_alloc`'d (contiguous), so a
-        // single physical base is valid for the whole buffer.
-        // SAFETY: `buffer` points to valid kernel memory for the duration.
+        // No IOMMU/bounce buffer: the device DMAs guest-physical memory directly,
+        // so ONE physical base must describe the WHOLE buffer.
+        //
+        // PRECONDITION, stated properly: every buffer that reaches `add` or
+        // `pop_used` is a sub-span of a `DmaBuffer` — `MmAllocateContiguousMemory`-
+        // backed, hence physically contiguous across its entire length. The old
+        // comment here established only "valid kernel memory", which is a
+        // strictly weaker claim: a non-contiguous kernel buffer would take this
+        // path happily and the device would DMA the wrong pages for everything
+        // past the first discontinuity.
+        //
+        // Discharged at the producer, not asserted here: `DmaSpan` (this module)
+        // is constructible only by `DmaBuffer::span`, and `Chain::spans`
+        // (virtio::gpu) is the only thing that builds the slice lists for the
+        // four `control.add` sites. `VirtQueue` is private to `VirtioGpu`, so
+        // nothing outside that module can reach `add` at all.
+        //
+        // SAFETY: `buffer` points to valid kernel memory for the duration, and
+        // by the above it is contiguous across `buffer.len()`.
         let phys = unsafe { MmGetPhysicalAddress(buffer.as_ptr() as *mut _).QuadPart };
         phys as PhysAddr
     }

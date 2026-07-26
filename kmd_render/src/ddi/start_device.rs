@@ -512,6 +512,20 @@ pub unsafe extern "C" fn dxgkddi_stop_device(miniport_device_context: *mut c_voi
         // SAFETY: our adapter context, handed back from AddDevice.
         let adapter = unsafe { &*(miniport_device_context as *const AdapterContext) };
         // Stop the ISR from touching the (about-to-be-reset) device first.
+        //
+        // ⚠ ASYMMETRY, recorded rather than changed (k-ctrlsubmit-12): this
+        // clears the ISR's gate but NOT `started_published`, so the boxed
+        // StartedState — including the DXGKRNL_INTERFACE both DPCs read
+        // lock-free — stays published across the stop. That is deliberate on
+        // one count (a stop/start cycle carries the contiguous RAM blocks
+        // forward through it) and unexamined on another: a DPC already queued
+        // when this runs can still resolve `started()` for a stopped device.
+        // The DPC's actual work all goes through `with_virtio`, which is
+        // `Err(DeviceNotFound)` once `set_virtio(None)` runs below, so the
+        // window is currently harmless. Clearing the publication properly needs
+        // the take-and-republish dance `take_paging_ram` already performs, and
+        // that is a lifecycle change with its own reboot-level gate — not a
+        // T4a minor item.
         adapter
             .isr_status
             .store(0, core::sync::atomic::Ordering::Release);

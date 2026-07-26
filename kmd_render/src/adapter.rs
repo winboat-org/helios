@@ -672,6 +672,17 @@ unsafe impl Sync for AdapterContext {}
 /// code can obtain a usable reference only inside [`AdapterContext::with_wddm_notify_lock`].
 /// Fence-queue mutation and VidSch fence notifications accept this token rather
 /// than relying on a caller-side comment or naming convention.
+///
+/// ⚠ LOCK ORDER, and the prohibition that goes with it: `wddm_notify_lock` is
+/// taken BEFORE the interrupt object, because the closure may raise further to
+/// the device DIRQL via `DxgkCbSynchronizeExecution` (`notify_at_dirql`) and
+/// the interrupt DPC holds this lock across its whole retire loop. The converse
+/// is therefore forbidden and is NOT enforced by anything: **the ISR must never
+/// acquire `wddm_notify_lock`**. Adding
+/// `adapter.with_wddm_notify_lock(..)` to `dxgkddi_interrupt_routine` while the
+/// DPC holds it inside `DxgkCbSynchronizeExecution` is a hard DIRQL deadlock
+/// with no attributable bugcheck. The `IsrPublish` projection that would make it
+/// unreachable is a separate, larger change; this comment is not gated on it.
 pub(crate) struct WddmNotifyGuard<'a> {
     adapter: &'a AdapterContext,
 }
