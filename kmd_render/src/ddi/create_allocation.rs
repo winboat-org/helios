@@ -72,6 +72,11 @@ struct AllocationContext {
     scanout_copy_pool_id: core::sync::atomic::AtomicU64,
     scanout_copy_command_buffer_id: core::sync::atomic::AtomicU64,
     scanout_copy_target_image_id: core::sync::atomic::AtomicU64,
+    /// DIAGNOSTIC MIRROR ONLY since R609. The authoritative drain fence lives on
+    /// the VenusClient that submitted it, where writer and reader are both
+    /// inside the venus mutex by construction. This copy is kept because it is
+    /// the per-allocation value a dump wants; nothing reads it to decide
+    /// anything.
     scanout_copy_last_fence: core::sync::atomic::AtomicU64,
     scanout_copy_owns_source_alias: AtomicU32,
     /// Exact segment-relative address supplied by Windows in
@@ -852,8 +857,7 @@ pub(crate) unsafe fn submit_primary_scanout_copy(
                 if Some(old.target_image_id)
                     != crate::virtio::venus::VkImageId::from_raw(target_image_id) =>
             {
-                let last = ctx.scanout_copy_last_fence.load(Ordering::Acquire);
-                client.destroy_prepared_image_copy(adapter, old, last)?;
+                client.destroy_prepared_image_copy(adapter, old)?;
                 clear_prepared_copy(ctx);
                 None
             }
@@ -1146,11 +1150,13 @@ unsafe fn destroy_allocation_ctx(adapter: &AdapterContext, ctx: Box<AllocationCo
     // image, or memory. On an ambiguous drain failure, leak the allocation's
     // host objects to Venus-context teardown rather than use-after-free them.
     if let Some(copy) = cached_prepared_copy(&ctx) {
-        let last_fence = ctx.scanout_copy_last_fence.load(Ordering::Acquire);
+        // The drain fence lives on the VenusClient now (R609). This read used to
+        // load ctx.scanout_copy_last_fence with Acquire BEFORE acquiring the
+        // venus mutex, while the only writer performed its Release store INSIDE
+        // it — so a concurrent SetVidPnSourceAddress submit could leave this
+        // thread with a stale-or-zero fence and skip the mandatory drain.
         let drained = adapter
-            .with_venus_client(|client| {
-                client.destroy_prepared_image_copy(adapter, copy, last_fence)
-            })
+            .with_venus_client(|client| client.destroy_prepared_image_copy(adapter, copy))
             .map(|r| r.is_ok())
             .unwrap_or(false);
         if !drained {

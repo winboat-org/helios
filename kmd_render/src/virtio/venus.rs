@@ -1376,6 +1376,26 @@ pub struct VenusClient {
     /// Raw VkMemoryPropertyFlags for physical-device memory types.
     memory_type_flags: [u32; VK_MAX_MEMORY_TYPES as usize],
     memory_type_count: u32,
+    /// Wire fence of the most recent [`Self::submit_prepared_image_copy`].
+    ///
+    /// The client submits that fence itself, so it is the only thing that
+    /// legitimately knows it. It used to round-trip through an `AtomicU64` in
+    /// the caller's `AllocationContext` and come back as a parameter — and the
+    /// only writer stored it INSIDE the venus mutex while
+    /// `destroy_allocation_ctx` read it OUTSIDE, so a SetVidPnSourceAddress
+    /// that had enqueued its outer SUBMIT_3D but whose store this thread had
+    /// not yet observed yielded a stale-or-zero fence. With 0 the mandatory
+    /// drain was skipped silently and uncounted, the ring marker could be
+    /// decoded ahead of the still-pending SUBMIT_3D, and vkDestroyCommandPool
+    /// ran against a pool with in-flight work.
+    ///
+    /// One client-wide field is correct and conservative: `copy_target_image_id`
+    /// is a single-slot invariant, wire fence ids are monotonic, and ring-1
+    /// submissions retire in order, so draining the highest prepared-copy fence
+    /// drains every earlier one. NEVER cleared — waiting on an already-retired
+    /// fence returns `Complete` immediately through `fence_wait_prepare`'s
+    /// `!in_flight` arm.
+    scanout_copy_last_fence: u64,
     /// One-time PREINITIALIZED -> GENERAL -> EXTERNAL setup for the persistent
     /// LINEAR scanout target. The pool/buffer remain live because setup is
     /// intentionally submitted without a fence wait; queue order makes every
@@ -4122,13 +4142,18 @@ impl VenusClient {
         submit.u32(0); // signalSemaphoreCount
         submit.count(false); // pSignalSemaphores
         submit.u64(0); // fence
-        ctrl::submit_venus_async_scanout(
+        let fence = ctrl::submit_venus_async_scanout(
             adapter,
             self.ctx_id(),
             submit.as_slice()?,
             primary_address,
             ticket,
-        )
+        )?;
+        // Remember it here, under the venus mutex the caller already holds, so
+        // the drain in destroy_prepared_image_copy cannot read a stale value
+        // published from a different critical section.
+        self.scanout_copy_last_fence = fence;
+        Ok(fence)
     }
 
     fn encode_command_buffer_submit(&self, command_buffer_id: VkCommandBufferId) -> Writer {
@@ -4545,20 +4570,28 @@ impl VenusClient {
         &mut self,
         adapter: &AdapterContext,
         copy: PreparedImageCopy,
-        last_wire_fence_id: u64,
     ) -> Result<(), VirtioError> {
         // The reusable command buffer is submitted through an outer async
         // SUBMIT_3D. Drain its latest GPU-completion fence before enqueuing the
         // inner Vulkan marker; otherwise the marker could be decoded first on a
         // different Venus dispatch path and let us destroy a still-referenced
         // command pool.
-        if last_wire_fence_id != 0 {
-            match ctrl::wait_fence(adapter, last_wire_fence_id, 5_000_000_000) {
+        //
+        // The fence comes from `self`, not from a caller-supplied parameter, so
+        // both the write and this read happen under the venus mutex by
+        // construction — which is the invariant the paragraph above asserts.
+        if self.scanout_copy_last_fence != 0 {
+            match ctrl::wait_fence(adapter, self.scanout_copy_last_fence, 5_000_000_000) {
                 ctrl::WaitFenceOutcome::Complete => {}
                 ctrl::WaitFenceOutcome::TimedOut | ctrl::WaitFenceOutcome::Invalid => {
                     return Err(VirtioError::DeviceError);
                 }
             }
+        } else {
+            // Nothing was ever submitted through this client, so there is
+            // nothing to drain. Distinguishable from "drain skipped by
+            // accident", which is what a 0 parameter used to look like.
+            crate::diag::record_named_bytes(b"CpNoDrn", copy.source_resource_id);
         }
         let fence_id = self.create_fence(adapter)?;
         if let Err(e) = self.queue_submit_fence_marker(adapter, fence_id) {
@@ -5384,6 +5417,7 @@ impl VenusInstance {
         Ok(VenusClient {
             ring: self.ring,
             probe_pending: None,
+            scanout_copy_last_fence: 0,
             instance_id: self.instance_id,
             phys_dev_id: self.phys_dev_id,
             device_id,
