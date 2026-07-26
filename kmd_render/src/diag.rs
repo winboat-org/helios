@@ -396,9 +396,27 @@ const RTL_QUERY_REGISTRY_DIRECT: u32 = 0x20;
 /// The value MUST be REG_DWORD (RTL_QUERY_REGISTRY_DIRECT without TYPECHECK
 /// interprets string data as a UNICODE_STRING buffer — only this driver's own
 /// documented knobs are read here).
-pub fn read_config_dword(name: &[u8], default: u32) -> u32 {
+/// Longest service-key value name [`read_config_dword`] can look up.
+///
+/// The lookup builds a UTF-16 name in a fixed 16-word buffer and NUL-terminates
+/// it, so anything longer is silently TRUNCATED and the lookup then misses —
+/// returning `default` forever with no diagnostic. `ScanoutForceReject` (18)
+/// was created that way and read as 0 on every boot, which cost a deploy cycle.
+pub const MAX_CONFIG_NAME: usize = 14;
+
+/// Read a service-key REG_DWORD knob, or `default` if absent.
+///
+/// The name length is checked AT COMPILE TIME — a knob named longer than
+/// [`MAX_CONFIG_NAME`] is a build failure, not a silent always-default.
+pub fn read_config_dword<const N: usize>(name: &[u8; N], default: u32) -> u32 {
+    const {
+        assert!(
+            N <= MAX_CONFIG_NAME,
+            "knob name exceeds the RtlQueryRegistryValues lookup buffer and would silently read as its default"
+        )
+    };
     let mut name_buf = [0u16; 16];
-    let n = name.len().min(14);
+    let n = name.len().min(MAX_CONFIG_NAME);
     let mut i = 0;
     while i < n {
         name_buf[i] = name[i] as u16;

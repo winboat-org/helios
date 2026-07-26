@@ -208,7 +208,7 @@ pub unsafe extern "C" fn dxgkddi_start_device(
     let present_probe = crate::diag::read_config_dword(b"PresentProbe", 0) != 0;
     // GATE INSTRUMENT (T3): forces one deferred-programming refusal exit. 0 = off
     // and absent from a production registry. See `StartedState::forced_reject`.
-    let forced_reject = crate::diag::read_config_dword(b"ScanoutForceReject", 0);
+    let forced_reject = crate::diag::read_config_dword(b"ScForceReject", 0);
     let mut display_half = crate::diag::read_config_dword(b"DisplayHalf", 0) != 0;
     crate::diag::record_named_bytes(b"AlcC", alloc_cached as u32);
     crate::diag::record_named_bytes(b"PBPrEn", present_probe as u32);

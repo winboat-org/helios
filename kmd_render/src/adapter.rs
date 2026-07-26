@@ -219,7 +219,7 @@ pub(crate) struct StartedState {
     /// waits or maps a frame, and the per-pair `probe_done` state statically
     /// prevents repeated readbacks.
     pub present_probe: bool,
-    /// `ScanoutForceReject` service-key knob (read once in StartDevice;
+    /// `ScForceReject` service-key knob (read once in StartDevice;
     /// default 0 = OFF, and absent from the registry in the shipped baseline).
     ///
     /// GATE INSTRUMENT. The T3 gate requires each deferred-programming refusal
@@ -2183,7 +2183,7 @@ impl AdapterContext {
         self.started().is_some_and(|s| s.present_probe)
     }
 
-    /// `ScanoutForceReject` — the T3 gate instrument. 0 = off (the shipped
+    /// `ScForceReject` — the T3 gate instrument. 0 = off (the shipped
     /// default and the only value present in a production registry).
     pub(crate) fn forced_reject(&self) -> u32 {
         self.started().map_or(0, |s| s.forced_reject)
