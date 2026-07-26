@@ -280,6 +280,95 @@ pub fn sample_named(name: &[u8], value: u32, ticks: &AtomicU32) {
     }
 }
 
+/// One counter in a [`CounterBlock`].
+pub struct CounterEntry {
+    /// Registry value name (≤14 chars, as [`record_named_bytes`] requires).
+    pub name: &'static [u8],
+    pub value: CounterRef,
+    /// A FAILURE counter: when one of these changes, the block flushes
+    /// immediately regardless of the throttle, so a failure always surfaces on
+    /// the operation that produced it.
+    pub failure: bool,
+}
+
+/// The two atomic widths this driver's counter blocks hold. `U64Low` reports the
+/// low 32 bits, exactly as the hand-rolled dumps did.
+pub enum CounterRef {
+    U32(&'static AtomicU32),
+    U64Low(&'static core::sync::atomic::AtomicU64),
+}
+
+impl CounterRef {
+    fn load(&self) -> u32 {
+        match self {
+            CounterRef::U32(a) => a.load(Ordering::Relaxed),
+            CounterRef::U64Low(a) => a.load(Ordering::Relaxed) as u32,
+        }
+    }
+}
+
+/// How often a [`CounterBlock`] mirrors itself into the registry.
+pub enum FlushPolicy {
+    /// Every call (for blocks that only run at a rate that is already low).
+    EveryOp,
+    /// The 1st call and every Nth after it, at the default `DiagLevel`.
+    EveryNth(u32),
+}
+
+/// A named counter block that can only be emitted through a throttled emitter.
+///
+/// Three modules each implemented the same "flush my counters to fixed registry
+/// names" routine, and they had already drifted on throttling: the GDI executor
+/// deferred to every 64th batch, while the paging block ran at the tail of EVERY
+/// content op (24 synchronous registry writes) and the aperture block on every
+/// map, unmap and refusal (16). Under VidMm eviction pressure the paging path is
+/// per-allocation, so a storm of N allocations performed 24N registry writes
+/// INSIDE BuildPagingBuffer — inflating paging latency and therefore the storm
+/// (x-dup-dead-27).
+///
+/// Values stay cumulative atomics, so flushing less often does not change what a
+/// `reg query` reads at rest; only failure latency changes, and the
+/// flush-on-failure-change rule bounds that. Every atomic stays a named `static`,
+/// so the TDR report and ntoseye symbol reads are unaffected.
+pub struct CounterBlock {
+    pub entries: &'static [CounterEntry],
+    /// Call counter driving [`FlushPolicy::EveryNth`].
+    pub ticks: &'static AtomicU32,
+    /// Last observed sum of the `failure` entries, for the flush-on-change rule.
+    pub failures: &'static AtomicU32,
+    pub policy: FlushPolicy,
+}
+
+impl CounterBlock {
+    /// Mirror the block into the registry if the policy (or a changed failure
+    /// counter, or `DiagLevel >= 1`) says so. PASSIVE_LEVEL only.
+    pub fn flush(&self) {
+        let mut fail_sum: u32 = 0;
+        let mut i = 0;
+        while i < self.entries.len() {
+            if self.entries[i].failure {
+                fail_sum = fail_sum.wrapping_add(self.entries[i].value.load());
+            }
+            i += 1;
+        }
+        let previous = self.failures.swap(fail_sum, Ordering::Relaxed);
+        let n = self.ticks.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+        let due = match self.policy {
+            FlushPolicy::EveryOp => true,
+            FlushPolicy::EveryNth(period) => n == 1 || n % period == 0,
+        };
+        // A changed failure counter always wins over the throttle.
+        if !(due || fail_sum != previous || level() >= 1) {
+            return;
+        }
+        let mut i = 0;
+        while i < self.entries.len() {
+            record_named_bytes(self.entries[i].name, self.entries[i].value.load());
+            i += 1;
+        }
+    }
+}
+
 /// `record_named` convenience: build the UTF-16 value name from an ASCII byte
 /// slice (≤14 chars). PASSIVE_LEVEL only.
 pub fn record_named_bytes(name: &[u8], value: u32) {

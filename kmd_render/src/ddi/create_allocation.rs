@@ -154,6 +154,9 @@ static RESOURCE_FOREIGN_HANDLES: AtomicU32 = AtomicU32::new(0);
 /// in this tree sets NumAllocations = 1.
 static MULTI_ENTRY_OPENS: AtomicU32 = AtomicU32::new(0);
 
+/// Ticks the per-CreateAllocation breadcrumb throttle (R317 / k-alloc-05).
+static CREATE_BREADCRUMB_TICKS: AtomicU32 = AtomicU32::new(0);
+
 /// Per-device open state for an allocation. Dxgkrnl's `hAllocation` in
 /// `DXGK_OPENALLOCATIONINFO` is its non-device-specific allocation handle; the
 /// miniport must return its own device-specific handle here and later receives it
@@ -739,7 +742,16 @@ static ALLOC_EVENT_SEQ: AtomicU32 = AtomicU32::new(0);
 /// throttle the display path.
 static PRIMARY_COPY_SUBMIT_COUNT: AtomicU32 = AtomicU32::new(0);
 
+/// Ticks the create/open breadcrumb throttle (R317 / k-alloc-05). The ring
+/// itself stays 8 slots; what changes is how often it reaches the registry.
+static ALLOC_EVENT_TICKS: AtomicU32 = AtomicU32::new(0);
+
 fn record_alloc_event(resid: u32, width: u32, height: u32, ctx_id: u32, is_open: bool) {
+    // 3 synchronous registry writes per allocation CREATE and per OPEN. Keeping
+    // the first occurrence means a one-shot boot repro still shows it.
+    if !crate::diag::sample_tick(&ALLOC_EVENT_TICKS) {
+        return;
+    }
     let i = (ALLOC_EVENT_SEQ.fetch_add(1, Ordering::Relaxed) % 8) as u8;
     let d = b'0' + i;
     crate::diag::record_named_bytes(&[b'A', b'E', d, b'r'], resid);
@@ -1495,11 +1507,17 @@ pub unsafe extern "C" fn dxgkddi_create_allocation(
     let args = unsafe { &mut *create_allocation };
     let create_flags = unsafe { args.Flags.__bindgen_anon_1.Value };
     let input_resource = args.hResource as usize as u64;
-    crate::diag::record_named_bytes(b"CARFlg", create_flags);
-    crate::diag::record_named_bytes(b"CARNum", args.NumAllocations);
-    crate::diag::record_named_bytes(b"CARRSz", args.PrivateDriverDataSize);
-    crate::diag::record_named_bytes(b"CARInLo", input_resource as u32);
-    crate::diag::record_named_bytes(b"CARInHi", (input_resource >> 32) as u32);
+    // Per-create identity breadcrumbs, SAMPLED (R317): 5 here plus CAROutLo/Hi
+    // and one CARAPSz per allocation — 8 synchronous registry writes per
+    // CreateAllocation, for values that only change when the surface set does.
+    let sample_create = crate::diag::sample_tick(&CREATE_BREADCRUMB_TICKS);
+    if sample_create {
+        crate::diag::record_named_bytes(b"CARFlg", create_flags);
+        crate::diag::record_named_bytes(b"CARNum", args.NumAllocations);
+        crate::diag::record_named_bytes(b"CARRSz", args.PrivateDriverDataSize);
+        crate::diag::record_named_bytes(b"CARInLo", input_resource as u32);
+        crate::diag::record_named_bytes(b"CARInHi", (input_resource >> 32) as u32);
+    }
     crate::diag::record(0x0C10_0000 | ((args.NumAllocations as u32).min(0xFFFF)));
     crate::diag::record(0x0C33_0000 | ((args.PrivateDriverDataSize as u32).min(0xFFFF)));
     crate::diag::record(0x0C34_0000 | (unsafe { args.Flags.__bindgen_anon_1.Value } & 0xFFFF));
@@ -1543,13 +1561,17 @@ pub unsafe extern "C" fn dxgkddi_create_allocation(
         crate::diag::record(0x0C3D_0000 | ((args.hResource as usize as u32) & 0xFFFF));
     }
     let output_resource = args.hResource as usize as u64;
-    crate::diag::record_named_bytes(b"CAROutLo", output_resource as u32);
-    crate::diag::record_named_bytes(b"CAROutHi", (output_resource >> 32) as u32);
+    if sample_create {
+        crate::diag::record_named_bytes(b"CAROutLo", output_resource as u32);
+        crate::diag::record_named_bytes(b"CAROutHi", (output_resource >> 32) as u32);
+    }
 
     for i in 0..args.NumAllocations as usize {
         // SAFETY: pAllocationInfo points to NumAllocations elements.
         let info = unsafe { &mut *args.pAllocationInfo.add(i) };
-        crate::diag::record_named_bytes(b"CARAPSz", info.PrivateDriverDataSize);
+        if sample_create {
+            crate::diag::record_named_bytes(b"CARAPSz", info.PrivateDriverDataSize);
+        }
         if let Err(status) = unsafe {
             create_one(
                 adapter,

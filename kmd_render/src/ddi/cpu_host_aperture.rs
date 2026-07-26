@@ -68,27 +68,55 @@ static BAR_AP_LAST_IRQL: AtomicU32 = AtomicU32::new(0);
 static BAR_AP_IRQL_ACK: AtomicU32 = AtomicU32::new(0);
 static BAR_AP_IRQL_DEFER: AtomicU32 = AtomicU32::new(0);
 
-/// Mirror the segment-3 aperture counters into the registry. PASSIVE only.
+/// The segment-3 aperture counter block, mirrored through the shared throttled
+/// emitter (R317). Same names and encodings; the cadence changes — this ran on
+/// every map, unmap and refusal (17 synchronous registry writes each). Failure
+/// counters still surface on the operation that produced them.
+static AP_FLUSH_TICKS: AtomicU32 = AtomicU32::new(0);
+static AP_FLUSH_FAILURES: AtomicU32 = AtomicU32::new(0);
+
+const fn e(name: &'static [u8], value: &'static AtomicU32) -> crate::diag::CounterEntry {
+    crate::diag::CounterEntry {
+        name,
+        value: crate::diag::CounterRef::U32(value),
+        failure: false,
+    }
+}
+const fn f(name: &'static [u8], value: &'static AtomicU32) -> crate::diag::CounterEntry {
+    crate::diag::CounterEntry {
+        name,
+        value: crate::diag::CounterRef::U32(value),
+        failure: true,
+    }
+}
+
+static AP_COUNTERS: crate::diag::CounterBlock = crate::diag::CounterBlock {
+    entries: &[
+        e(b"ChMn", &BAR_AP_MAPS),
+        e(b"ChMh", &BAR_AP_HITS),
+        e(b"ChUn", &BAR_AP_UNMAPS),
+        e(b"ChMr", &BAR_AP_LAST_RESID),
+        e(b"ChMo", &BAR_AP_LAST_PAGE),
+        f(b"ChEi", &BAR_AP_ERR_IRQL),
+        f(b"ChEa", &BAR_AP_ERR_ALLOC),
+        f(b"ChEp", &BAR_AP_ERR_PARTIAL),
+        f(b"ChEs", &BAR_AP_ERR_SPARSE),
+        f(b"ChEb", &BAR_AP_ERR_BOUNDS),
+        f(b"ChEm", &BAR_AP_ERR_MAP),
+        f(b"ChEu", &BAR_AP_ERR_UNRESOLVED_UNMAP),
+        e(b"ChMc", &CPU_HOST_MAP_COUNT),
+        e(b"ChUc", &CPU_HOST_UNMAP_COUNT),
+        e(b"ChIq", &BAR_AP_LAST_IRQL),
+        e(b"ChIa", &BAR_AP_IRQL_ACK),
+        e(b"ChId", &BAR_AP_IRQL_DEFER),
+    ],
+    ticks: &AP_FLUSH_TICKS,
+    failures: &AP_FLUSH_FAILURES,
+    policy: crate::diag::FlushPolicy::EveryNth(64),
+};
+
 fn dump_bar_ap_counters() {
-    crate::diag::record_named_bytes(b"ChMn", BAR_AP_MAPS.load(Ordering::Relaxed));
-    crate::diag::record_named_bytes(b"ChMh", BAR_AP_HITS.load(Ordering::Relaxed));
-    crate::diag::record_named_bytes(b"ChUn", BAR_AP_UNMAPS.load(Ordering::Relaxed));
-    crate::diag::record_named_bytes(b"ChMr", BAR_AP_LAST_RESID.load(Ordering::Relaxed));
-    crate::diag::record_named_bytes(b"ChMo", BAR_AP_LAST_PAGE.load(Ordering::Relaxed));
-    crate::diag::record_named_bytes(b"ChEi", BAR_AP_ERR_IRQL.load(Ordering::Relaxed));
-    crate::diag::record_named_bytes(b"ChEa", BAR_AP_ERR_ALLOC.load(Ordering::Relaxed));
-    crate::diag::record_named_bytes(b"ChEp", BAR_AP_ERR_PARTIAL.load(Ordering::Relaxed));
-    crate::diag::record_named_bytes(b"ChEs", BAR_AP_ERR_SPARSE.load(Ordering::Relaxed));
-    crate::diag::record_named_bytes(b"ChEb", BAR_AP_ERR_BOUNDS.load(Ordering::Relaxed));
-    crate::diag::record_named_bytes(b"ChEm", BAR_AP_ERR_MAP.load(Ordering::Relaxed));
-    crate::diag::record_named_bytes(b"ChEu", BAR_AP_ERR_UNRESOLVED_UNMAP.load(Ordering::Relaxed));
-    crate::diag::record_named_bytes(b"ChMc", CPU_HOST_MAP_COUNT.load(Ordering::Relaxed));
-    // DDI-level unmap count. ChUn is the INTERNAL unmap count, so without this
-    // the DDI map/unmap pairing could not be checked against ChMc at all.
-    crate::diag::record_named_bytes(b"ChUc", CPU_HOST_UNMAP_COUNT.load(Ordering::Relaxed));
-    crate::diag::record_named_bytes(b"ChIq", BAR_AP_LAST_IRQL.load(Ordering::Relaxed));
-    crate::diag::record_named_bytes(b"ChIa", BAR_AP_IRQL_ACK.load(Ordering::Relaxed));
-    crate::diag::record_named_bytes(b"ChId", BAR_AP_IRQL_DEFER.load(Ordering::Relaxed));
+    AP_COUNTERS.flush();
 }
 
 /// PASSIVE-only flush of the CPU-host-aperture counters into the registry ring.
@@ -306,7 +334,10 @@ pub unsafe extern "C" fn dxgkddi_map_cpu_host_aperture(
             BAR_AP_MAPS.fetch_add(1, Ordering::Relaxed);
             BAR_AP_LAST_RESID.store(alloc.resource_id, Ordering::Relaxed);
             BAR_AP_LAST_PAGE.store((range.offset >> 12) as u32, Ordering::Relaxed);
-            dump_bar_ap_counters();
+            // No flush on the SUCCESS path: the atomics carry the values, the
+            // refusal paths and the PASSIVE mode-set hook flush them, and this
+            // is the site that made a successful aperture map cost 17 registry
+            // writes (R317 / k-alloc-05).
             STATUS_SUCCESS
         }
         Err(_e) => {
@@ -369,8 +400,9 @@ pub unsafe extern "C" fn dxgkddi_unmap_cpu_host_aperture(
             // Nothing mapped there (already torn down at DestroyAllocation, or
             // a map this driver refused). Counted for visibility.
             BAR_AP_ERR_UNRESOLVED_UNMAP.fetch_add(1, Ordering::Relaxed);
+            // A refusal: flush so it surfaces on the operation that produced it.
+            dump_bar_ap_counters();
         }
     }
-    dump_bar_ap_counters();
     STATUS_SUCCESS
 }

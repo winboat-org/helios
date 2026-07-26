@@ -187,36 +187,77 @@ static BAR_SYSTEM_BACKING_CAPTURES: AtomicU32 = AtomicU32::new(0);
 static BAR_SYSTEM_BACKING_MIRRORS: AtomicU32 = AtomicU32::new(0);
 static BAR_SYSTEM_BACKING_ERRORS: AtomicU32 = AtomicU32::new(0);
 
-/// Mirror the BAR paging counters into the registry (PASSIVE only — callers
-/// gate on IRQL). Named-value writes, same style as the GDI executor counters.
+/// The BAR paging counter block, mirrored into the registry through the shared
+/// throttled emitter (R317). Named values and encodings are unchanged; only the
+/// cadence is — this ran at the tail of EVERY content op, i.e. 26 synchronous
+/// registry writes per paging operation, per allocation, under eviction
+/// pressure. Failure counters still surface on the op that produced them, via
+/// `CounterBlock`'s flush-on-failure-change rule.
+static PAGING_FLUSH_TICKS: AtomicU32 = AtomicU32::new(0);
+static PAGING_FLUSH_FAILURES: AtomicU32 = AtomicU32::new(0);
+
+static PAGING_COUNTERS: crate::diag::CounterBlock = crate::diag::CounterBlock {
+    entries: &[
+        e(b"PgTi", &BAR_XFER_IN),
+        e(b"PgTo", &BAR_XFER_OUT),
+        e(b"PgTm", &BAR_XFER_MOVE),
+        e(b"PgFn", &BAR_FILLS),
+        e(b"PgDn", &BAR_DISCARDS),
+        e(b"PgUn", &BAR_PT_HARVESTS),
+        e(b"PgMr", &BAR_LAST_RESID),
+        e(b"PgSf", &BAR_LAST_XFER_FLAGS),
+        e(b"PgTs", &BAR_LAST_XFER_OFF),
+        e(b"PgTd", &BAR_LAST_MDL_OFF),
+        f(b"PgEi", &BAR_ERR_IRQL),
+        f(b"PgEm", &BAR_ERR_MAP),
+        f(b"PgEb", &BAR_ERR_BOUNDS),
+        f(b"PgEc", &BAR_ERR_DISCONTIG),
+        f(b"PgEv", &BAR_ERR_VIRTUAL),
+        f(b"PgEx", &BAR_ERR_MDL),
+        f(b"PgEf", &BAR_ERR_SHADOW_FULL),
+        e(b"PgVp", &BAR_VIRTUAL_PTES),
+        e64(b"PgVs", &BAR_LAST_VIRTUAL_SRC),
+        e64(b"PgVd", &BAR_LAST_VIRTUAL_DST),
+        e(b"PgDi", &BAR_DEVICE_OP_SKIPS),
+        e(b"PgSc", &BAR_SYSTEM_BACKING_CAPTURES),
+        e(b"PgSm", &BAR_SYSTEM_BACKING_MIRRORS),
+        f(b"PgSe", &BAR_SYSTEM_BACKING_ERRORS),
+        f(b"PgEh", &BAR_ERR_XFER_HANDLE),
+        f(b"PgFh", &BAR_ERR_FILL_HANDLE),
+        e(b"PgFv", &BAR_VIRTUAL_FILL_SYSTEM),
+    ],
+    ticks: &PAGING_FLUSH_TICKS,
+    failures: &PAGING_FLUSH_FAILURES,
+    policy: crate::diag::FlushPolicy::EveryNth(64),
+};
+
+/// Value entry.
+const fn e(name: &'static [u8], value: &'static AtomicU32) -> crate::diag::CounterEntry {
+    crate::diag::CounterEntry {
+        name,
+        value: crate::diag::CounterRef::U32(value),
+        failure: false,
+    }
+}
+/// Failure entry — its change forces an immediate flush.
+const fn f(name: &'static [u8], value: &'static AtomicU32) -> crate::diag::CounterEntry {
+    crate::diag::CounterEntry {
+        name,
+        value: crate::diag::CounterRef::U32(value),
+        failure: true,
+    }
+}
+/// Value entry reported as the low 32 bits of a u64, as before.
+const fn e64(name: &'static [u8], value: &'static AtomicU64) -> crate::diag::CounterEntry {
+    crate::diag::CounterEntry {
+        name,
+        value: crate::diag::CounterRef::U64Low(value),
+        failure: false,
+    }
+}
+
 fn dump_bar_counters() {
-    crate::diag::record_named_bytes(b"PgTi", BAR_XFER_IN.load(Ordering::Relaxed));
-    crate::diag::record_named_bytes(b"PgTo", BAR_XFER_OUT.load(Ordering::Relaxed));
-    crate::diag::record_named_bytes(b"PgTm", BAR_XFER_MOVE.load(Ordering::Relaxed));
-    crate::diag::record_named_bytes(b"PgFn", BAR_FILLS.load(Ordering::Relaxed));
-    crate::diag::record_named_bytes(b"PgDn", BAR_DISCARDS.load(Ordering::Relaxed));
-    crate::diag::record_named_bytes(b"PgUn", BAR_PT_HARVESTS.load(Ordering::Relaxed));
-    crate::diag::record_named_bytes(b"PgMr", BAR_LAST_RESID.load(Ordering::Relaxed));
-    crate::diag::record_named_bytes(b"PgSf", BAR_LAST_XFER_FLAGS.load(Ordering::Relaxed));
-    crate::diag::record_named_bytes(b"PgTs", BAR_LAST_XFER_OFF.load(Ordering::Relaxed));
-    crate::diag::record_named_bytes(b"PgTd", BAR_LAST_MDL_OFF.load(Ordering::Relaxed));
-    crate::diag::record_named_bytes(b"PgEi", BAR_ERR_IRQL.load(Ordering::Relaxed));
-    crate::diag::record_named_bytes(b"PgEm", BAR_ERR_MAP.load(Ordering::Relaxed));
-    crate::diag::record_named_bytes(b"PgEb", BAR_ERR_BOUNDS.load(Ordering::Relaxed));
-    crate::diag::record_named_bytes(b"PgEc", BAR_ERR_DISCONTIG.load(Ordering::Relaxed));
-    crate::diag::record_named_bytes(b"PgEv", BAR_ERR_VIRTUAL.load(Ordering::Relaxed));
-    crate::diag::record_named_bytes(b"PgEx", BAR_ERR_MDL.load(Ordering::Relaxed));
-    crate::diag::record_named_bytes(b"PgEf", BAR_ERR_SHADOW_FULL.load(Ordering::Relaxed));
-    crate::diag::record_named_bytes(b"PgEh", BAR_ERR_XFER_HANDLE.load(Ordering::Relaxed));
-    crate::diag::record_named_bytes(b"PgFh", BAR_ERR_FILL_HANDLE.load(Ordering::Relaxed));
-    crate::diag::record_named_bytes(b"PgFv", BAR_VIRTUAL_FILL_SYSTEM.load(Ordering::Relaxed));
-    crate::diag::record_named_bytes(b"PgVp", BAR_VIRTUAL_PTES.load(Ordering::Relaxed));
-    crate::diag::record_named_bytes(b"PgVs", BAR_LAST_VIRTUAL_SRC.load(Ordering::Relaxed) as u32);
-    crate::diag::record_named_bytes(b"PgVd", BAR_LAST_VIRTUAL_DST.load(Ordering::Relaxed) as u32);
-    crate::diag::record_named_bytes(b"PgDi", BAR_DEVICE_OP_SKIPS.load(Ordering::Relaxed));
-    crate::diag::record_named_bytes(b"PgSc", BAR_SYSTEM_BACKING_CAPTURES.load(Ordering::Relaxed));
-    crate::diag::record_named_bytes(b"PgSm", BAR_SYSTEM_BACKING_MIRRORS.load(Ordering::Relaxed));
-    crate::diag::record_named_bytes(b"PgSe", BAR_SYSTEM_BACKING_ERRORS.load(Ordering::Relaxed));
+    PAGING_COUNTERS.flush();
 }
 
 // ── Paging-process leaf-PTE shadow ──────────────────────────────────────────
