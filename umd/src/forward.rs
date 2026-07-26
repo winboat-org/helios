@@ -2108,7 +2108,9 @@ unsafe extern "C" fn create_resource(
                     None
                 }
             };
+            let mut stored = false;
             finish_create(h, created, res, |res| {
+                stored = true;
                 stamp_dxvk_resource_kmt_handles(h, &res, allocation_handle, km_resource);
                 let n = RESOURCE_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
                 if n < 128 {
@@ -2127,6 +2129,26 @@ unsafe extern "C" fn create_resource(
                     empty_present_private(),
                 );
             });
+            if !stored && allocation_handle != 0 {
+                // The buffer arm allocates first and creates second, so a failed
+                // CreateBuffer (or a missing object, or a failed cast) leaves a
+                // kernel allocation nobody can reach: the closure's
+                // `Option<ResidentAllocation>` has been dropped by now — evicting
+                // the residency reference — but pfnDeallocateCb was never called,
+                // and `release_resource` cannot recover it later because
+                // `clear_handle` already nulled pDrvPrivate at DDI entry, so
+                // DestroyResource reads a null state pointer and returns. The
+                // handle would stay associated with the runtime resource until
+                // device teardown.
+                //
+                // Evict-then-deallocate is the order `release_resource`
+                // documents, and dropping the closure above already did the
+                // evict half. Same call `allocate_wddm_resource` makes for its
+                // own rollback.
+                if let Some(dev) = helios_device(h) {
+                    deallocate_standalone(dev, allocation_handle);
+                }
+            }
         }
         RES_TEX2D | RES_TEXCUBE => {
             let bind = api_bind_flags(a.BindFlags);
