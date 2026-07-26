@@ -452,9 +452,32 @@ pub unsafe extern "C" fn dxgkddi_remove_device(miniport_device_context: *mut c_v
 pub unsafe extern "C" fn dxgkddi_dispatch_io_request(
     _miniport_device_context: *mut c_void,
     vidpn_source_id: u32,
-    _video_request_packet: PVIDEO_REQUEST_PACKET,
+    video_request_packet: PVIDEO_REQUEST_PACKET,
 ) -> NTSTATUS {
     crate::diag::record(0x0A10_0000 | (vidpn_source_id & 0xFFFF));
+    // Returning STATUS_SUCCESS without touching the VRP's StatusBlock tells the
+    // caller the request was serviced and leaves it to read whatever was in the
+    // block. We service no VRP, so say so in the block the contract puts it in.
+    // A WDDM display miniport is effectively never called here, so this is
+    // honesty rather than a live bug - and StVrp is how we would find out
+    // otherwise.
+    if !video_request_packet.is_null() {
+        // SAFETY: dxgkrnl owns the packet for the duration of the call; the
+        // StatusBlock pointer is part of the same contract and is only written
+        // after a null check.
+        unsafe {
+            let vrp = &*video_request_packet;
+            crate::diag::fault(crate::diag::FaultCounter::StVrp, vrp.IoControlCode);
+            if !vrp.StatusBlock.is_null() {
+                // VP_STATUS is a Win32 error code, NOT an NTSTATUS:
+                // ERROR_INVALID_FUNCTION is the video-port convention for "this
+                // miniport does not implement this IOCTL".
+                const ERROR_INVALID_FUNCTION: i32 = 1;
+                (*vrp.StatusBlock).__bindgen_anon_1.Status = ERROR_INVALID_FUNCTION;
+                (*vrp.StatusBlock).Information = 0;
+            }
+        }
+    }
     STATUS_SUCCESS
 }
 
@@ -567,7 +590,17 @@ pub unsafe extern "C" fn dxgkddi_query_child_status(
     // SAFETY: our AdapterContext.
     let adapter = unsafe { &*(miniport_device_context as *const AdapterContext) };
     if !adapter.display_half {
-        return STATUS_SUCCESS;
+        // We reported NumberOfChildren = 0, so there is no child whose status we
+        // could answer. Returning SUCCESS with the caller's DXGK_CHILD_STATUS
+        // untouched is a fake success; NOT_SUPPORTED is in the DDI's legal
+        // return set and is behaviour-neutral in the field, because dxgkrnl does
+        // not query children it was never told about. StQcs moving means the
+        // child count and this path have gone out of step.
+        // SAFETY: non-null per the check above.
+        crate::diag::fault(crate::diag::FaultCounter::StQcs, unsafe {
+            (*child_status).Type as u32
+        });
+        return STATUS_NOT_SUPPORTED;
     }
 
     // SAFETY: non-null per the check; dxgkrnl provides a writable DXGK_CHILD_STATUS.

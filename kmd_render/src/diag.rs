@@ -137,6 +137,15 @@ pub enum FaultCounter {
     /// transport is absent — value is the NTSTATUS that killed it, or 1 if the
     /// transport was already gone for another reason. The adapter still binds.
     StNoTx,
+    /// `DxgkDdiDispatchIoRequest` was called — value is the IoControlCode. A
+    /// WDDM display miniport is effectively never called on this legacy
+    /// video-port path, so any movement here is itself the news.
+    StVrp,
+    /// `DxgkDdiQueryChildStatus` was called with the display half off — value is
+    /// the child status Type. Behaviour-neutral in the field
+    /// (`NumberOfChildren` is 0 in that configuration), so movement means the
+    /// two are out of step.
+    StQcs,
 }
 
 impl FaultCounter {
@@ -152,6 +161,8 @@ impl FaultCounter {
             FaultCounter::StTxG => b"StTxG",
             FaultCounter::StMdB => b"StMdB",
             FaultCounter::StNoTx => b"StNoTx",
+            FaultCounter::StVrp => b"StVrp",
+            FaultCounter::StQcs => b"StQcs",
         }
     }
 
@@ -165,6 +176,8 @@ impl FaultCounter {
         FaultCounter::StTxG,
         FaultCounter::StMdB,
         FaultCounter::StNoTx,
+        FaultCounter::StVrp,
+        FaultCounter::StQcs,
     ];
 }
 
