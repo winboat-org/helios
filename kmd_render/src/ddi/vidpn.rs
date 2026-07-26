@@ -411,6 +411,282 @@ pub unsafe fn recommend_monitor_modes(
     STATUS_SUCCESS
 }
 
+/// Where `enum_cofunc_modality`'s error ladder stopped.
+///
+/// The `fp` local these replace was an undocumented magic number set at eight
+/// `break` sites and used only as the `VpECf` registry breadcrumb. The numbers
+/// are owner debugging ABI, so they are mapped in exactly ONE place here and
+/// stay byte-identical.
+#[derive(Clone, Copy)]
+enum CofuncStage {
+    VidPnInterface,
+    Topology,
+    FirstPath,
+    AcquireSourceSet,
+    AcquireSourcePinned,
+    ReleaseSourceSet,
+    CreateSourceSet,
+    AddSourceModes,
+    AssignSourceSet,
+    AcquireTargetSet,
+    AcquireTargetPinned,
+    ReleaseTargetSet,
+    CreateTargetSet,
+    AddTargetMode,
+    AssignTargetSet,
+    UpdatePathSupport,
+    NextPath,
+    /// A required callback slot was NULL. Never had an `fp` value — it broke
+    /// with `fp` still 0, and this preserves that exactly.
+    MissingCallback,
+}
+
+impl CofuncStage {
+    /// The `VpECf` value. Do NOT renumber.
+    const fn code(self) -> u32 {
+        match self {
+            Self::MissingCallback => 0,
+            Self::VidPnInterface => 1,
+            Self::Topology => 2,
+            Self::FirstPath => 3,
+            Self::AcquireSourceSet => 10,
+            Self::AcquireSourcePinned => 12,
+            Self::ReleaseSourceSet => 13,
+            Self::CreateSourceSet => 14,
+            Self::AddSourceModes => 15,
+            Self::AssignSourceSet => 16,
+            Self::AcquireTargetSet => 20,
+            Self::AcquireTargetPinned => 22,
+            Self::ReleaseTargetSet => 23,
+            Self::CreateTargetSet => 24,
+            Self::AddTargetMode => 25,
+            Self::AssignTargetSet => 26,
+            Self::UpdatePathSupport => 30,
+            Self::NextPath => 31,
+        }
+    }
+}
+
+/// An acquired-or-created SOURCE mode set, released on drop.
+///
+/// The function acquires and releases four kinds of OS-owned object across a
+/// long error ladder, with a manual release call at every numbered break site.
+/// Two arms leaked a created-but-unassigned set — fixed by hand in T1a
+/// (k-display-13); this makes the omission unrepresentable. A set that is
+/// created and never assigned stays acquired inside dxgkrnl for the constraining
+/// VidPn's lifetime and poisons every later acquire for the same source, turning
+/// a transient rejection into a persistent 0-path VidPn.
+///
+/// ⚠ Ownership transfers to the VidPn on a SUCCESSFUL assign and only then, so
+/// [`Self::assign`] consumes the guard and forgets it only on success. A `Drop`
+/// that ran after a successful assign would be a DOUBLE-RELEASE into dxgkrnl.
+struct SourceModeSet<'a> {
+    vidpn: &'a DXGK_VIDPN_INTERFACE,
+    h_vidpn: D3DKMDT_HVIDPN,
+    source_id: u32,
+    h_set: D3DKMDT_HVIDPNSOURCEMODESET,
+    iface: *const DXGK_VIDPNSOURCEMODESET_INTERFACE,
+}
+
+impl SourceModeSet<'_> {
+    /// Hand the set to the VidPn. Consumes the guard; forgets it ONLY on
+    /// success, so a failed assign still releases.
+    fn assign(self) -> NTSTATUS {
+        let Some(assign) = self.vidpn.pfnAssignSourceModeSet else {
+            return STATUS_GRAPHICS_INVALID_VIDPN;
+        };
+        // SAFETY: live VidPn interface and handles for the duration of the DDI.
+        let st = unsafe { assign(self.h_vidpn, self.source_id, self.h_set) };
+        if ok(st) {
+            // Ownership moved to the VidPn — releasing now would double-release.
+            core::mem::forget(self);
+        }
+        st
+    }
+
+    /// Release explicitly and report the status, for the one arm that must check
+    /// it (the pinned-null path releases the acquired set before creating a
+    /// replacement).
+    fn release_now(self) -> NTSTATUS {
+        let Some(release) = self.vidpn.pfnReleaseSourceModeSet else {
+            return STATUS_GRAPHICS_INVALID_VIDPN;
+        };
+        // SAFETY: live VidPn interface and handles for the duration of the DDI.
+        let st = unsafe { release(self.h_vidpn, self.h_set) };
+        core::mem::forget(self);
+        st
+    }
+}
+
+impl Drop for SourceModeSet<'_> {
+    fn drop(&mut self) {
+        let Some(release) = self.vidpn.pfnReleaseSourceModeSet else {
+            return;
+        };
+        // SAFETY: the handle came from a successful acquire/create on this same
+        // VidPn and has not been assigned (assign forgets the guard).
+        let _ = unsafe { release(self.h_vidpn, self.h_set) };
+    }
+}
+
+/// An acquired-or-created TARGET mode set. Same contract as [`SourceModeSet`].
+struct TargetModeSet<'a> {
+    vidpn: &'a DXGK_VIDPN_INTERFACE,
+    h_vidpn: D3DKMDT_HVIDPN,
+    target_id: u32,
+    h_set: D3DKMDT_HVIDPNTARGETMODESET,
+    iface: *const DXGK_VIDPNTARGETMODESET_INTERFACE,
+}
+
+impl TargetModeSet<'_> {
+    fn assign(self) -> NTSTATUS {
+        let Some(assign) = self.vidpn.pfnAssignTargetModeSet else {
+            return STATUS_GRAPHICS_INVALID_VIDPN;
+        };
+        // SAFETY: live VidPn interface and handles for the duration of the DDI.
+        let st = unsafe { assign(self.h_vidpn, self.target_id, self.h_set) };
+        if ok(st) {
+            core::mem::forget(self);
+        }
+        st
+    }
+
+    fn release_now(self) -> NTSTATUS {
+        let Some(release) = self.vidpn.pfnReleaseTargetModeSet else {
+            return STATUS_GRAPHICS_INVALID_VIDPN;
+        };
+        // SAFETY: live VidPn interface and handles for the duration of the DDI.
+        let st = unsafe { release(self.h_vidpn, self.h_set) };
+        core::mem::forget(self);
+        st
+    }
+}
+
+impl Drop for TargetModeSet<'_> {
+    fn drop(&mut self) {
+        let Some(release) = self.vidpn.pfnReleaseTargetModeSet else {
+            return;
+        };
+        // SAFETY: as SourceModeSet::drop.
+        let _ = unsafe { release(self.h_vidpn, self.h_set) };
+    }
+}
+
+/// A pinned mode-info reference held on a source mode set.
+///
+/// Borrows the set, so it can never outlive it, and Rust drops locals in reverse
+/// declaration order — which is exactly the required order: release the mode
+/// info, then the set.
+struct PinnedSourceMode<'a> {
+    set: &'a SourceModeSet<'a>,
+    mode: *const D3DKMDT_VIDPN_SOURCE_MODE,
+}
+
+impl Drop for PinnedSourceMode<'_> {
+    fn drop(&mut self) {
+        // SAFETY: `iface` came from the same acquire that produced `h_set`.
+        if let Some(release_mode) = unsafe { (*self.set.iface).pfnReleaseModeInfo } {
+            // SAFETY: `mode` is the pinned info this set handed us.
+            let _ = unsafe { release_mode(self.set.h_set, self.mode) };
+        }
+    }
+}
+
+/// As [`PinnedSourceMode`], for a target mode set.
+struct PinnedTargetMode<'a> {
+    set: &'a TargetModeSet<'a>,
+    mode: *const D3DKMDT_VIDPN_TARGET_MODE,
+}
+
+impl Drop for PinnedTargetMode<'_> {
+    fn drop(&mut self) {
+        // SAFETY: `iface` came from the same acquire that produced `h_set`.
+        if let Some(release_mode) = unsafe { (*self.set.iface).pfnReleaseModeInfo } {
+            // SAFETY: `mode` is the pinned info this set handed us.
+            let _ = unsafe { release_mode(self.set.h_set, self.mode) };
+        }
+    }
+}
+
+/// One present-path reference from a topology, released on drop.
+struct PathInfo<'a> {
+    topo: &'a DXGK_VIDPNTOPOLOGY_INTERFACE,
+    h_topo: D3DKMDT_HVIDPNTOPOLOGY,
+    path: *const D3DKMDT_VIDPN_PRESENT_PATH,
+}
+
+impl<'a> PathInfo<'a> {
+    /// The first path, or `None` if the topology is empty.
+    ///
+    /// # Safety
+    /// `h_topo` and `topo` are live for the duration of the DDI call.
+    unsafe fn first(
+        topo: &'a DXGK_VIDPNTOPOLOGY_INTERFACE,
+        h_topo: D3DKMDT_HVIDPNTOPOLOGY,
+    ) -> Result<Option<Self>, NTSTATUS> {
+        let Some(acquire_first) = topo.pfnAcquireFirstPathInfo else {
+            return Err(STATUS_GRAPHICS_INVALID_VIDPN);
+        };
+        let mut path = null();
+        // SAFETY: valid out-pointer; per the fn contract.
+        let st = unsafe { acquire_first(h_topo, &mut path) };
+        if st == STATUS_GRAPHICS_NO_MORE_ELEMENTS_IN_DATASET {
+            return Ok(None);
+        }
+        if !ok(st) {
+            return Err(st);
+        }
+        Ok(Some(Self { topo, h_topo, path }))
+    }
+
+    fn get(&self) -> &D3DKMDT_VIDPN_PRESENT_PATH {
+        // SAFETY: a live path-info reference from this topology.
+        unsafe { &*self.path }
+    }
+
+    /// Advance. CONSUMES this path — which releases it, on every outcome.
+    ///
+    /// That matches the hand-written dance exactly:
+    ///   * success            -> the old code called `release_path(prev)` and
+    ///                           continued; the guard's drop does the same.
+    ///   * NO_MORE_ELEMENTS   -> that status is warning-severity, so `ok()` was
+    ///                           true and `release_path(prev)` ALSO ran before
+    ///                           the loop exited. Same.
+    ///   * a real failure     -> the old code set `path = prev` and let the final
+    ///                           cleanup release it. Same.
+    /// The new path is never released here, and on NO_MORE_ELEMENTS it is never
+    /// wrapped at all — the old code was explicit that it is invalid.
+    fn next(self) -> Result<Option<Self>, NTSTATUS> {
+        let Some(acquire_next) = self.topo.pfnAcquireNextPathInfo else {
+            return Err(STATUS_GRAPHICS_INVALID_VIDPN);
+        };
+        let mut next = null();
+        // SAFETY: live handles for the duration of the DDI call.
+        let st = unsafe { acquire_next(self.h_topo, self.path, &mut next) };
+        if st == STATUS_GRAPHICS_NO_MORE_ELEMENTS_IN_DATASET {
+            return Ok(None);
+        }
+        if !ok(st) {
+            return Err(st);
+        }
+        Ok(Some(Self {
+            topo: self.topo,
+            h_topo: self.h_topo,
+            path: next,
+        }))
+    }
+}
+
+impl Drop for PathInfo<'_> {
+    fn drop(&mut self) {
+        let Some(release) = self.topo.pfnReleasePathInfo else {
+            return;
+        };
+        // SAFETY: a live path-info reference from this topology, released once.
+        let _ = unsafe { release(self.h_topo, self.path) };
+    }
+}
+
 /// `DxgkDdiEnumVidPnCofuncModality` body — populate cofunctional source/target
 /// mode sets for every unpinned end of every path in the constraining VidPn,
 /// and advertise Identity scaling/rotation. Mirrors viogpudo's implementation
@@ -438,7 +714,9 @@ pub unsafe fn enum_cofunc_modality(
             .vsync_count
             .load(core::sync::atomic::Ordering::Relaxed),
     );
-    let mut fp: u32 = 0;
+    // Which numbered stage failed, if any. Replaces the bare `fp: u32`; the
+    // registry value is unchanged (see `CofuncStage::code`).
+    let mut stage = CofuncStage::MissingCallback;
     if arg.is_null() {
         return STATUS_GRAPHICS_INVALID_VIDPN;
     }
@@ -452,7 +730,7 @@ pub unsafe fn enum_cofunc_modality(
         Ok(p) => p,
         Err(e) => {
             rec(b"VpECe", e as u32);
-            rec(b"VpECf", 1);
+            rec(b"VpECf", CofuncStage::VidPnInterface.code());
             return legalize_vidpn(e);
         }
     };
@@ -468,7 +746,7 @@ pub unsafe fn enum_cofunc_modality(
     if !ok(st) || topo_iface.is_null() {
         if !ok(st) {
             rec(b"VpECe", st as u32);
-            rec(b"VpECf", 2);
+            rec(b"VpECf", CofuncStage::Topology.code());
         }
         return if ok(st) {
             STATUS_GRAPHICS_INVALID_VIDPN
@@ -488,7 +766,10 @@ pub unsafe fn enum_cofunc_modality(
         let _ = unsafe { get_num(h_topo, &mut n) };
         rec(b"VpECp", n as u32);
     }
-    let (Some(acquire_first), Some(acquire_next), Some(release_path), Some(update_support)) = (
+    // Kept as an up-front check, exactly as before, so this early return stays
+    // byte-identical (no VpECe/VpECf record, raw STATUS_GRAPHICS_INVALID_VIDPN).
+    // It also makes the `else` arms inside `PathInfo`'s methods unreachable.
+    let (Some(_), Some(_), Some(_), Some(update_support)) = (
         topo.pfnAcquireFirstPathInfo,
         topo.pfnAcquireNextPathInfo,
         topo.pfnReleasePathInfo,
@@ -497,19 +778,21 @@ pub unsafe fn enum_cofunc_modality(
         return STATUS_GRAPHICS_INVALID_VIDPN;
     };
 
-    let mut path: *const D3DKMDT_VIDPN_PRESENT_PATH = null();
-    // SAFETY: valid out-pointer.
-    let mut status = unsafe { acquire_first(h_topo, &mut path) };
-    if !ok(status) {
-        rec(b"VpECe", status as u32);
-        rec(b"VpECf", 3);
-        return legalize_vidpn(status);
-    }
+    let mut status = STATUS_SUCCESS;
+    let mut current = match unsafe { PathInfo::first(topo, h_topo) } {
+        Ok(first) => first,
+        Err(e) => {
+            rec(b"VpECe", e as u32);
+            rec(b"VpECf", CofuncStage::FirstPath.code());
+            return legalize_vidpn(e);
+        }
+    };
 
-    // Iterate paths. On any error `status` is set and we `break` to cleanup.
-    while status != STATUS_GRAPHICS_NO_MORE_ELEMENTS_IN_DATASET {
-        // SAFETY: `path` is a live path-info from the topology.
-        let p = unsafe { &*path };
+    // Iterate paths. Every OS-owned object acquired below is held by a guard, so
+    // a `break` out of this loop releases exactly what is still owned — the
+    // hand-matched release ladder is gone.
+    while let Some(path) = current {
+        let p = path.get();
         let source_id = p.VidPnSourceId;
         let target_id = p.VidPnTargetId;
 
@@ -517,11 +800,9 @@ pub unsafe fn enum_cofunc_modality(
         if !(a.EnumPivotType == _D3DKMDT_ENUMCOFUNCMODALITY_PIVOT_TYPE::D3DKMDT_EPT_VIDPNSOURCE
             && a.EnumPivot.VidPnSourceId == source_id)
         {
-            let (Some(acquire_src), Some(release_src), Some(create_src), Some(assign_src)) = (
+            let (Some(acquire_src), Some(create_src)) = (
                 vidpn.pfnAcquireSourceModeSet,
-                vidpn.pfnReleaseSourceModeSet,
                 vidpn.pfnCreateNewSourceModeSet,
-                vidpn.pfnAssignSourceModeSet,
             ) else {
                 status = STATUS_GRAPHICS_INVALID_VIDPN;
                 break;
@@ -531,63 +812,68 @@ pub unsafe fn enum_cofunc_modality(
             // SAFETY: valid out-pointers.
             status = unsafe { acquire_src(h_vidpn, source_id, &mut h_set, &mut set_iface) };
             if !ok(status) {
-                fp = 10;
+                stage = CofuncStage::AcquireSourceSet;
                 break;
             }
-            let Some(acquire_pinned) = (unsafe { (*set_iface).pfnAcquirePinnedModeInfo }) else {
+            let set = SourceModeSet {
+                vidpn,
+                h_vidpn,
+                source_id,
+                h_set,
+                iface: set_iface,
+            };
+            let Some(acquire_pinned) = (unsafe { (*set.iface).pfnAcquirePinnedModeInfo }) else {
                 status = STATUS_GRAPHICS_INVALID_VIDPN;
-                let _ = unsafe { release_src(h_vidpn, h_set) };
-                break;
+                break; // `set` drops → released
             };
             let mut pinned: *const D3DKMDT_VIDPN_SOURCE_MODE = null();
             // SAFETY: valid out-pointer.
-            status = unsafe { acquire_pinned(h_set, &mut pinned) };
+            status = unsafe { acquire_pinned(set.h_set, &mut pinned) };
             if !ok(status) {
-                fp = 12;
-                let _ = unsafe { release_src(h_vidpn, h_set) };
-                break;
+                stage = CofuncStage::AcquireSourcePinned;
+                break; // `set` drops → released
             }
             if pinned.is_null() {
                 // No pinned source mode → replace the set with every format the
-                // primary/scanout path carries end-to-end.
-                // SAFETY: releasing/creating with valid handles.
-                status = unsafe { release_src(h_vidpn, h_set) };
+                // primary/scanout path carries end-to-end. This release's status
+                // is checked, so it is explicit rather than a drop.
+                status = set.release_now();
                 if !ok(status) {
-                    fp = 13;
+                    stage = CofuncStage::ReleaseSourceSet;
                     break;
                 }
-                h_set = null_mut();
-                status = unsafe { create_src(h_vidpn, source_id, &mut h_set, &mut set_iface) };
+                let mut h_new: D3DKMDT_HVIDPNSOURCEMODESET = null_mut();
+                let mut new_iface: *const DXGK_VIDPNSOURCEMODESET_INTERFACE = null();
+                // SAFETY: valid out-pointers.
+                status = unsafe { create_src(h_vidpn, source_id, &mut h_new, &mut new_iface) };
                 if !ok(status) {
-                    fp = 14;
+                    stage = CofuncStage::CreateSourceSet;
                     break;
                 }
-                status = unsafe { add_source_modes(set_iface, h_set, mode_w, mode_h) };
+                let created = SourceModeSet {
+                    vidpn,
+                    h_vidpn,
+                    source_id,
+                    h_set: h_new,
+                    iface: new_iface,
+                };
+                // SAFETY: live set interface + handle.
+                status = unsafe { add_source_modes(created.iface, created.h_set, mode_w, mode_h) };
                 if !ok(status) {
-                    fp = 15;
-                    let _ = unsafe { release_src(h_vidpn, h_set) };
-                    break;
+                    stage = CofuncStage::AddSourceModes;
+                    break; // `created` drops → released
                 }
-                status = unsafe { assign_src(h_vidpn, source_id, h_set) };
+                // Consumes the guard; forgets it ONLY on success, so a failed
+                // assign still releases and cannot orphan the set inside dxgkrnl.
+                status = created.assign();
                 if !ok(status) {
-                    fp = 16;
-                    // The assign failed, so ownership did NOT transfer to the
-                    // VidPn and the final cleanup (which releases only `path`)
-                    // will not touch this set. Left unreleased it stays acquired
-                    // inside dxgkrnl for the constraining VidPn's lifetime, and
-                    // a later pfnAcquireSourceModeSet for the same source then
-                    // fails - turning a transient rejection into a persistent
-                    // 0-path VidPn, the exact failure mode this file exists to
-                    // avoid. The add-mode arm above already does this.
-                    let _ = unsafe { release_src(h_vidpn, h_set) };
+                    stage = CofuncStage::AssignSourceSet;
                     break;
                 }
             } else {
-                // A pinned mode exists — release the pinned info and the set.
-                if let Some(release_mode) = unsafe { (*set_iface).pfnReleaseModeInfo } {
-                    let _ = unsafe { release_mode(h_set, pinned) };
-                }
-                let _ = unsafe { release_src(h_vidpn, h_set) };
+                // A pinned mode exists — the guard releases the mode info, and
+                // `set` (declared first) releases after it.
+                let _pinned = PinnedSourceMode { set: &set, mode: pinned };
             }
         }
 
@@ -595,11 +881,9 @@ pub unsafe fn enum_cofunc_modality(
         if !(a.EnumPivotType == _D3DKMDT_ENUMCOFUNCMODALITY_PIVOT_TYPE::D3DKMDT_EPT_VIDPNTARGET
             && a.EnumPivot.VidPnTargetId == target_id)
         {
-            let (Some(acquire_tgt), Some(release_tgt), Some(create_tgt), Some(assign_tgt)) = (
+            let (Some(acquire_tgt), Some(create_tgt)) = (
                 vidpn.pfnAcquireTargetModeSet,
-                vidpn.pfnReleaseTargetModeSet,
                 vidpn.pfnCreateNewTargetModeSet,
-                vidpn.pfnAssignTargetModeSet,
             ) else {
                 status = STATUS_GRAPHICS_INVALID_VIDPN;
                 break;
@@ -609,55 +893,62 @@ pub unsafe fn enum_cofunc_modality(
             // SAFETY: valid out-pointers.
             status = unsafe { acquire_tgt(h_vidpn, target_id, &mut h_set, &mut set_iface) };
             if !ok(status) {
-                fp = 20;
+                stage = CofuncStage::AcquireTargetSet;
                 break;
             }
-            let Some(acquire_pinned) = (unsafe { (*set_iface).pfnAcquirePinnedModeInfo }) else {
+            let set = TargetModeSet {
+                vidpn,
+                h_vidpn,
+                target_id,
+                h_set,
+                iface: set_iface,
+            };
+            let Some(acquire_pinned) = (unsafe { (*set.iface).pfnAcquirePinnedModeInfo }) else {
                 status = STATUS_GRAPHICS_INVALID_VIDPN;
-                let _ = unsafe { release_tgt(h_vidpn, h_set) };
-                break;
+                break; // `set` drops → released
             };
             let mut pinned: *const D3DKMDT_VIDPN_TARGET_MODE = null();
             // SAFETY: valid out-pointer.
-            status = unsafe { acquire_pinned(h_set, &mut pinned) };
+            status = unsafe { acquire_pinned(set.h_set, &mut pinned) };
             if !ok(status) {
-                fp = 22;
-                let _ = unsafe { release_tgt(h_vidpn, h_set) };
-                break;
+                stage = CofuncStage::AcquireTargetPinned;
+                break; // `set` drops → released
             }
             if pinned.is_null() {
-                // SAFETY: releasing/creating with valid handles.
-                status = unsafe { release_tgt(h_vidpn, h_set) };
+                status = set.release_now();
                 if !ok(status) {
-                    fp = 23;
+                    stage = CofuncStage::ReleaseTargetSet;
                     break;
                 }
-                h_set = null_mut();
-                status = unsafe { create_tgt(h_vidpn, target_id, &mut h_set, &mut set_iface) };
+                let mut h_new: D3DKMDT_HVIDPNTARGETMODESET = null_mut();
+                let mut new_iface: *const DXGK_VIDPNTARGETMODESET_INTERFACE = null();
+                // SAFETY: valid out-pointers.
+                status = unsafe { create_tgt(h_vidpn, target_id, &mut h_new, &mut new_iface) };
                 if !ok(status) {
-                    fp = 24;
+                    stage = CofuncStage::CreateTargetSet;
                     break;
                 }
-                status = unsafe { add_single_target_mode(set_iface, h_set, mode_w, mode_h) };
+                let created = TargetModeSet {
+                    vidpn,
+                    h_vidpn,
+                    target_id,
+                    h_set: h_new,
+                    iface: new_iface,
+                };
+                // SAFETY: live set interface + handle.
+                status =
+                    unsafe { add_single_target_mode(created.iface, created.h_set, mode_w, mode_h) };
                 if !ok(status) {
-                    fp = 25;
-                    let _ = unsafe { release_tgt(h_vidpn, h_set) };
-                    break;
+                    stage = CofuncStage::AddTargetMode;
+                    break; // `created` drops → released
                 }
-                status = unsafe { assign_tgt(h_vidpn, target_id, h_set) };
+                status = created.assign();
                 if !ok(status) {
-                    fp = 26;
-                    // As in the source arm above: assign failed, so ownership
-                    // did not transfer and this set would otherwise be orphaned
-                    // inside dxgkrnl for the VidPn's lifetime.
-                    let _ = unsafe { release_tgt(h_vidpn, h_set) };
+                    stage = CofuncStage::AssignTargetSet;
                     break;
                 }
             } else {
-                if let Some(release_mode) = unsafe { (*set_iface).pfnReleaseModeInfo } {
-                    let _ = unsafe { release_mode(h_set, pinned) };
-                }
-                let _ = unsafe { release_tgt(h_vidpn, h_set) };
+                let _pinned = PinnedTargetMode { set: &set, mode: pinned };
             }
         }
 
@@ -709,44 +1000,32 @@ pub unsafe fn enum_cofunc_modality(
             // SAFETY: `local` is a filled path-info copy.
             status = unsafe { update_support(h_topo, &local) };
             if !ok(status) {
-                fp = 30;
-                break;
+                stage = CofuncStage::UpdatePathSupport;
+                break; // `path` drops → released
             }
         }
 
-        // ── advance to the next path, releasing the previous ────────────────
-        let prev = path;
-        // SAFETY: valid handles/out-pointer.
-        status = unsafe { acquire_next(h_topo, prev, &mut path) };
-        if !ok(status) {
-            // On failure `path` is unchanged; cleanup releases `prev` below.
-            fp = 31;
-            path = prev;
-            break;
+        // ── advance, releasing the previous ─────────────────────────────────
+        // `next` CONSUMES `path`, so the previous reference is released on every
+        // outcome — success, end-of-set, and failure alike.
+        match path.next() {
+            Ok(next) => current = next,
+            Err(e) => {
+                // `next` already consumed (and released) the path it was called
+                // on, so there is nothing left to clean up here.
+                status = e;
+                stage = CofuncStage::NextPath;
+                break;
+            }
         }
-        // SAFETY: prev is no longer referenced.
-        let _ = unsafe { release_path(h_topo, prev) };
     }
-
-    if status == STATUS_GRAPHICS_NO_MORE_ELEMENTS_IN_DATASET {
-        status = STATUS_SUCCESS;
-        // NO_MORE_ELEMENTS leaves `path` invalid; nothing to release.
-        path = null();
-    }
-
-    // Final cleanup: release any path-info still held (error break path).
-    if !path.is_null() {
-        // SAFETY: `path` is a live path-info from this topology.
-        let _ = unsafe { release_path(h_topo, path) };
-    }
-
     // A raw callback failure here MUST NOT escape as an out-of-contract NTSTATUS
     // (dxgkrnl would flag the driver buggy and discard every VidPn — the 36th
-    // session's 0-paths root cause). Record the raw status + which break fired
-    // (`fp`), then clamp to a legal graphics status.
+    // session's 0-paths root cause). Record the raw status + which stage broke,
+    // then clamp to a legal graphics status.
     if status != STATUS_SUCCESS {
         rec(b"VpECe", status as u32); // raw failing NTSTATUS (full 32-bit)
-        rec(b"VpECf", fp); // fail-point id (see `fp = N` sites)
+        rec(b"VpECf", stage.code()); // fail-point id (see `CofuncStage::code`)
         COFUNC_ERR_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         rec(
             b"VpECn",
@@ -849,7 +1128,10 @@ pub unsafe fn commit_vidpn(adapter: &AdapterContext, arg: *const DXGKARG_COMMITV
     }
 
     // The decisive probe: is a source mode pinned on our source?
-    let (Some(acquire_src), Some(release_src)) =
+    //
+    // Read-only — this arm never assigns, so its `SourceModeSet` is always
+    // released by drop and `assign`/`release_now` are never reached from here.
+    let (Some(acquire_src), Some(_)) =
         (vidpn.pfnAcquireSourceModeSet, vidpn.pfnReleaseSourceModeSet)
     else {
         rec(b"VpCP", 0xF);
@@ -864,25 +1146,32 @@ pub unsafe fn commit_vidpn(adapter: &AdapterContext, arg: *const DXGKARG_COMMITV
         rec(b"VpCP", 0);
         return STATUS_SUCCESS;
     }
+    let set = SourceModeSet {
+        vidpn,
+        h_vidpn,
+        source_id,
+        h_set,
+        iface: set_iface,
+    };
     let mut pinned = 0u32;
     let mut wh = 0u32;
-    if let Some(acquire_pinned) = unsafe { (*set_iface).pfnAcquirePinnedModeInfo } {
+    // SAFETY: `iface` came from the acquire above.
+    if let Some(acquire_pinned) = unsafe { (*set.iface).pfnAcquirePinnedModeInfo } {
         let mut mode: *const D3DKMDT_VIDPN_SOURCE_MODE = null();
         // SAFETY: valid out-pointer.
-        if ok(unsafe { acquire_pinned(h_set, &mut mode) }) && !mode.is_null() {
+        if ok(unsafe { acquire_pinned(set.h_set, &mut mode) }) && !mode.is_null() {
+            // Guarded so the mode info is released before the set, on every exit
+            // from this block.
+            let held = PinnedSourceMode { set: &set, mode };
             pinned = 1;
             // SAFETY: `mode` is a live pinned source mode; Graphics is the arm
             // source modes use (Format is a Copy union — read is unsafe).
-            let g = unsafe { &(*mode).Format.Graphics };
+            let g = unsafe { &(*held.mode).Format.Graphics };
             wh = ((g.PrimSurfSize.cx as u32) << 16) | (g.PrimSurfSize.cy as u32 & 0xFFFF);
-            if let Some(release_mode) = unsafe { (*set_iface).pfnReleaseModeInfo } {
-                // SAFETY: releasing the mode we acquired.
-                let _ = unsafe { release_mode(h_set, mode) };
-            }
         }
     }
-    // SAFETY: releasing the source mode set we acquired.
-    let _ = unsafe { release_src(h_vidpn, h_set) };
+    // `set` drops here, releasing the source mode set we acquired.
+    drop(set);
 
     rec(b"VpCP", pinned);
     rec(b"VpCW", wh);
