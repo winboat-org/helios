@@ -91,6 +91,14 @@ pub static ASYNC_RESP_ERRORS: AtomicU32 = AtomicU32::new(0);
 pub static FENCE_WAIT_REGISTERED: AtomicU32 = AtomicU32::new(0);
 /// WAIT_FENCE waits that timed out.
 pub static FENCE_WAIT_TIMEOUTS: AtomicU32 = AtomicU32::new(0);
+/// A `ctrl_roundtrip` whose waiter was abandoned because the transport went away
+/// mid-wait (StopDevice), rather than because the host timed out. Previously
+/// folded into "already completed successfully" by `unwrap_or(true)`.
+pub static CTRL_TEARDOWN_ABANDONS: AtomicU32 = AtomicU32::new(0);
+/// A `wait_fence` that found the transport gone. Previously reported as
+/// `Complete`, which made `escape_wait_fence` tell the ICD that a wire fence had
+/// retired when it never did.
+pub static TRANSPORT_GONE_AT_WAIT: AtomicU32 = AtomicU32::new(0);
 /// Used-ring completions whose token matched no in-flight entry (ring state
 /// corrupt → transport latches failed).
 pub static DRAIN_BAD_TOKEN: AtomicU32 = AtomicU32::new(0);

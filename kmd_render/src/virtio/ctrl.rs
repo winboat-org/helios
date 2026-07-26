@@ -28,7 +28,8 @@ use wdk_sys::{KEVENT, LARGE_INTEGER, PVOID, STATUS_SUCCESS};
 
 use super::gpu::{
     AsyncScanoutNotify, BlobMapBegin, BlobMapFinish, BlobMapPrep, BlobRemapBegin, FenceWaitPrep,
-    SyncWaitBlock, CTRL_TIMEOUT_COUNT, FENCE_WAIT_TIMEOUTS, SUBMIT_META_BYTES,
+    SyncWaitBlock, CTRL_TEARDOWN_ABANDONS, CTRL_TIMEOUT_COUNT, FENCE_WAIT_TIMEOUTS,
+    SUBMIT_META_BYTES, TRANSPORT_GONE_AT_WAIT,
 };
 use super::hal::DmaBuffer;
 use super::VirtioError;
@@ -278,15 +279,25 @@ fn ctrl_roundtrip(
 
     if !wait_block(adapter, block_ptr, timeout_ms) {
         // Final race check + abandonment under the lock.
-        let already_done = adapter
-            .with_virtio(|v| {
-                v.drain_used();
-                v.abandon_sync(token, block_ptr)
-            })
-            .unwrap_or(true);
-        if !already_done {
-            CTRL_TIMEOUT_COUNT.fetch_add(1, Ordering::Relaxed);
-            return Err(VirtioError::Timeout);
+        // Three outcomes, not two. `unwrap_or(true)` folded Err(DeviceNotFound)
+        // - the transport was torn down under us - into "already completed
+        // successfully", which skipped the timeout counter and picked the wrong
+        // error class. The fake-success half is masked here because all three
+        // callers re-validate resp_is_ok on the returned bytes and a zeroed
+        // response fails that, but the missing evidence was real.
+        match adapter.with_virtio(|v| {
+            v.drain_used();
+            v.abandon_sync(token, block_ptr)
+        }) {
+            Ok(true) => {}
+            Ok(false) => {
+                CTRL_TIMEOUT_COUNT.fetch_add(1, Ordering::Relaxed);
+                return Err(VirtioError::Timeout);
+            }
+            Err(_) => {
+                CTRL_TEARDOWN_ABANDONS.fetch_add(1, Ordering::Relaxed);
+                return Err(VirtioError::DeviceError);
+            }
         }
     }
     block.copy_resp(resp_out);
@@ -1557,13 +1568,19 @@ pub fn wait_fence(adapter: &AdapterContext, fence_id: u64, timeout_ns: u64) -> W
 
     if timeout_ns == 0 {
         // Poll: deregister immediately; completion may still have raced in.
-        let completed = adapter
-            .with_virtio(|v| v.fence_wait_cancel(block_ptr))
-            .unwrap_or(true);
-        return if completed {
-            WaitFenceOutcome::Complete
-        } else {
-            WaitFenceOutcome::TimedOut
+        return match adapter.with_virtio(|v| v.fence_wait_cancel(block_ptr)) {
+            Ok(true) => WaitFenceOutcome::Complete,
+            Ok(false) => WaitFenceOutcome::TimedOut,
+            // Transport gone: the fence did NOT retire. Reporting Complete here
+            // made escape_wait_fence write out_completed = 1 and return
+            // STATUS_SUCCESS for an unretired wire fence - a direct violation of
+            // "never signal a wire fence before host completion". Invalid is
+            // already mapped to STATUS_INVALID_PARAMETER and already handled by
+            // the ICD.
+            Err(_) => {
+                TRANSPORT_GONE_AT_WAIT.fetch_add(1, Ordering::Relaxed);
+                WaitFenceOutcome::Invalid
+            }
         };
     }
 
@@ -1571,16 +1588,19 @@ pub fn wait_fence(adapter: &AdapterContext, fence_id: u64, timeout_ns: u64) -> W
     if wait_block(adapter, block_ptr, total_ms) {
         return WaitFenceOutcome::Complete;
     }
-    let completed = adapter
-        .with_virtio(|v| {
-            v.drain_used();
-            v.fence_wait_cancel(block_ptr)
-        })
-        .unwrap_or(true);
-    if completed {
-        WaitFenceOutcome::Complete
-    } else {
-        FENCE_WAIT_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
-        WaitFenceOutcome::TimedOut
+    match adapter.with_virtio(|v| {
+        v.drain_used();
+        v.fence_wait_cancel(block_ptr)
+    }) {
+        Ok(true) => WaitFenceOutcome::Complete,
+        Ok(false) => {
+            FENCE_WAIT_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
+            WaitFenceOutcome::TimedOut
+        }
+        // As in the poll exit above.
+        Err(_) => {
+            TRANSPORT_GONE_AT_WAIT.fetch_add(1, Ordering::Relaxed);
+            WaitFenceOutcome::Invalid
+        }
     }
 }
