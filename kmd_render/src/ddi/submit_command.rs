@@ -51,12 +51,57 @@ pub static SUBMIT_LEGACY_COUNT: AtomicU32 = AtomicU32::new(0);
 pub static PRESENT_MARKER_HITS: AtomicU32 = AtomicU32::new(0);
 pub static PRESENT_MARKER_SCAN_HITS: AtomicU32 = AtomicU32::new(0);
 pub static PRESENT_MARKER_LAST_OFFSET: AtomicU32 = AtomicU32::new(u32::MAX);
-pub static PRESENT_PRIVATE_LAST_TOTAL: AtomicU32 = AtomicU32::new(0);
-pub static PRESENT_PRIVATE_LAST_UMD: AtomicU32 = AtomicU32::new(0);
-pub static PRESENT_PRIVATE_LAST_START: AtomicU32 = AtomicU32::new(0);
-pub static PRESENT_PRIVATE_LAST_END: AtomicU32 = AtomicU32::new(0);
-pub static PRESENT_PRIVATE_LAST_BASE_WORD: AtomicU32 = AtomicU32::new(0);
-pub static PRESENT_PRIVATE_LAST_EXPECTED_WORD: AtomicU32 = AtomicU32::new(0);
+/// Private-data shape of the LAST submission ON EACH PATH.
+///
+/// These used to be ONE shared set written by both SubmitCommand entry points,
+/// so `PmTot`/`PmUmd`/`PmSta`/`PmEnd`/`PmB0`/`PmX0` described whichever DDI ran
+/// last and a mixed workload (the GpuMmu path uses the virtual DDI, paging
+/// buffers arrive on the legacy one) produced a self-contradictory registry
+/// snapshot — e.g. a legacy start/end offset paired with the virtual path's
+/// UMD size. The existing names stay bound to the LEGACY path, which is the one
+/// that reports real start/end offsets; the virtual path gets `PmV*`
+/// (k-ctrlsubmit-17).
+pub struct PresentPrivateShape {
+    pub total: AtomicU32,
+    pub umd: AtomicU32,
+    pub start: AtomicU32,
+    pub end: AtomicU32,
+    pub base_word: AtomicU32,
+    pub expected_word: AtomicU32,
+}
+
+impl PresentPrivateShape {
+    const fn new() -> Self {
+        Self {
+            total: AtomicU32::new(0),
+            umd: AtomicU32::new(0),
+            start: AtomicU32::new(0),
+            end: AtomicU32::new(0),
+            base_word: AtomicU32::new(0),
+            expected_word: AtomicU32::new(0),
+        }
+    }
+}
+
+pub static PRESENT_PRIVATE_LEGACY: PresentPrivateShape = PresentPrivateShape::new();
+pub static PRESENT_PRIVATE_VIRTUAL: PresentPrivateShape = PresentPrivateShape::new();
+
+/// Which SubmitCommand entry point a decode came from. Makes it impossible for
+/// the two decoders to share destination globals again.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SubmitPath {
+    Virtual,
+    Legacy,
+}
+
+impl SubmitPath {
+    fn shape(self) -> &'static PresentPrivateShape {
+        match self {
+            SubmitPath::Virtual => &PRESENT_PRIVATE_VIRTUAL,
+            SubmitPath::Legacy => &PRESENT_PRIVATE_LEGACY,
+        }
+    }
+}
 static PRESENT_MARKER_SCAN_ATTEMPTS: AtomicU32 = AtomicU32::new(0);
 
 /// Mirror the scheduler private-data handoff evidence at PASSIVE_LEVEL.
@@ -73,18 +118,22 @@ pub(crate) fn record_present_handoff_telemetry() {
     crate::diag::record_named_bytes(b"PmOff", PRESENT_MARKER_LAST_OFFSET.load(Ordering::Relaxed));
     crate::diag::record_named_bytes(b"PmVir", SUBMIT_VIRTUAL_COUNT.load(Ordering::Relaxed));
     crate::diag::record_named_bytes(b"PmLeg", SUBMIT_LEGACY_COUNT.load(Ordering::Relaxed));
-    crate::diag::record_named_bytes(b"PmTot", PRESENT_PRIVATE_LAST_TOTAL.load(Ordering::Relaxed));
-    crate::diag::record_named_bytes(b"PmUmd", PRESENT_PRIVATE_LAST_UMD.load(Ordering::Relaxed));
-    crate::diag::record_named_bytes(b"PmSta", PRESENT_PRIVATE_LAST_START.load(Ordering::Relaxed));
-    crate::diag::record_named_bytes(b"PmEnd", PRESENT_PRIVATE_LAST_END.load(Ordering::Relaxed));
-    crate::diag::record_named_bytes(
-        b"PmB0",
-        PRESENT_PRIVATE_LAST_BASE_WORD.load(Ordering::Relaxed),
-    );
-    crate::diag::record_named_bytes(
-        b"PmX0",
-        PRESENT_PRIVATE_LAST_EXPECTED_WORD.load(Ordering::Relaxed),
-    );
+    // Legacy path keeps the original names (it is the one with real start/end
+    // offsets); the virtual path reports the same six values under PmV*.
+    let legacy = &PRESENT_PRIVATE_LEGACY;
+    crate::diag::record_named_bytes(b"PmTot", legacy.total.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"PmUmd", legacy.umd.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"PmSta", legacy.start.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"PmEnd", legacy.end.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"PmB0", legacy.base_word.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"PmX0", legacy.expected_word.load(Ordering::Relaxed));
+    let virt = &PRESENT_PRIVATE_VIRTUAL;
+    crate::diag::record_named_bytes(b"PmVTot", virt.total.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"PmVUmd", virt.umd.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"PmVSta", virt.start.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"PmVEnd", virt.end.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"PmVB0", virt.base_word.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"PmVX0", virt.expected_word.load(Ordering::Relaxed));
 }
 
 /// Mirror the DISPATCH-safe engine tracers into the PASSIVE diag ring. Call ONLY
@@ -375,45 +424,88 @@ fn note_and_maybe_signal(
     SubmitAck::Accepted
 }
 
-unsafe fn decode_virtual_present_fence(submit: &DXGKARG_SUBMITCOMMANDVIRTUAL) -> Option<u64> {
-    let base = submit.pDmaBufferPrivateData as *const u8;
-    let total = submit.DmaBufferPrivateDataSize as usize;
-    let umd = submit.DmaBufferUmdPrivateDataSize as usize;
-    SUBMIT_VIRTUAL_COUNT.fetch_add(1, Ordering::Relaxed);
-    PRESENT_PRIVATE_LAST_TOTAL.store(total.min(u32::MAX as usize) as u32, Ordering::Relaxed);
-    PRESENT_PRIVATE_LAST_UMD.store(umd.min(u32::MAX as usize) as u32, Ordering::Relaxed);
-    PRESENT_PRIVATE_LAST_START.store(0, Ordering::Relaxed);
-    PRESENT_PRIVATE_LAST_END.store(0, Ordering::Relaxed);
-    PRESENT_PRIVATE_LAST_BASE_WORD.store(
-        unsafe { diagnostic_private_word(base, total, 0) },
-        Ordering::Relaxed,
-    );
-    PRESENT_PRIVATE_LAST_EXPECTED_WORD.store(
-        unsafe { diagnostic_private_word(base, total, umd) },
-        Ordering::Relaxed,
-    );
-    if !base.is_null() && umd <= total {
-        let kmd_size = total - umd;
+/// The ONE present-marker decoder, shared by both SubmitCommand entry points.
+///
+/// `kmd_range` is the half of the private data the KMD owns: `umd..total` on the
+/// virtual path (dxgkrnl reports a UMD prefix size) and `start..end` on the
+/// legacy one (it reports an explicit submission window). Both then fall back to
+/// decoding the whole buffer, and finally to the bounded evidence-only scan.
+///
+/// # Safety
+/// `base` must be readable for `total` bytes for the duration of the call.
+unsafe fn decode_present_fence(
+    base: *const u8,
+    total: usize,
+    kmd_range: core::ops::Range<usize>,
+    path: SubmitPath,
+) -> Option<u64> {
+    if !base.is_null() && kmd_range.start <= kmd_range.end && kmd_range.end <= total {
+        let size = kmd_range.end - kmd_range.start;
         if let Some(fence) =
-            unsafe { PresentSubmissionPrivate::decode(base.add(umd).cast(), kmd_size as u32) }
+            unsafe { PresentSubmissionPrivate::decode(base.add(kmd_range.start).cast(), size as u32) }
         {
             PRESENT_MARKER_HITS.fetch_add(1, Ordering::Relaxed);
-            PRESENT_MARKER_LAST_OFFSET.store(umd as u32, Ordering::Relaxed);
+            PRESENT_MARKER_LAST_OFFSET.store(kmd_range.start as u32, Ordering::Relaxed);
             return Some(fence);
         }
     }
     if let Some(fence) = unsafe {
-        PresentSubmissionPrivate::decode(
-            submit.pDmaBufferPrivateData,
-            submit.DmaBufferPrivateDataSize,
-        )
+        PresentSubmissionPrivate::decode(base as *const c_void, total.min(u32::MAX as usize) as u32)
     } {
         PRESENT_MARKER_HITS.fetch_add(1, Ordering::Relaxed);
         PRESENT_MARKER_LAST_OFFSET.store(0, Ordering::Relaxed);
         return Some(fence);
     }
+    let _ = path;
     unsafe { diagnostic_scan_present_private(base, total) };
     None
+}
+
+/// Record the private-data shape for `path`. Six relaxed stores plus two
+/// length-checked unaligned reads, per submission, at DISPATCH — their only
+/// purpose is the registry mirror, and they are now per-path so the mirror is
+/// self-consistent.
+unsafe fn note_present_private_shape(
+    path: SubmitPath,
+    base: *const u8,
+    total: usize,
+    umd: usize,
+    start: usize,
+    end: usize,
+    expected_at: usize,
+) {
+    let shape = path.shape();
+    shape
+        .total
+        .store(total.min(u32::MAX as usize) as u32, Ordering::Relaxed);
+    shape
+        .umd
+        .store(umd.min(u32::MAX as usize) as u32, Ordering::Relaxed);
+    shape
+        .start
+        .store(start.min(u32::MAX as usize) as u32, Ordering::Relaxed);
+    shape
+        .end
+        .store(end.min(u32::MAX as usize) as u32, Ordering::Relaxed);
+    shape.base_word.store(
+        unsafe { diagnostic_private_word(base, total, 0) },
+        Ordering::Relaxed,
+    );
+    shape.expected_word.store(
+        unsafe { diagnostic_private_word(base, total, expected_at) },
+        Ordering::Relaxed,
+    );
+}
+
+unsafe fn decode_virtual_present_fence(submit: &DXGKARG_SUBMITCOMMANDVIRTUAL) -> Option<u64> {
+    let base = submit.pDmaBufferPrivateData as *const u8;
+    let total = submit.DmaBufferPrivateDataSize as usize;
+    let umd = submit.DmaBufferUmdPrivateDataSize as usize;
+    SUBMIT_VIRTUAL_COUNT.fetch_add(1, Ordering::Relaxed);
+    // The virtual DDI has no submission start/end window: 0/0 is the truthful
+    // report, and it no longer overwrites the legacy path's real offsets.
+    unsafe { note_present_private_shape(SubmitPath::Virtual, base, total, umd, 0, 0, umd) };
+    unsafe { decode_present_fence(base, total, umd..total, SubmitPath::Virtual) }
 }
 
 unsafe fn decode_legacy_present_fence(submit: &DXGKARG_SUBMITCOMMAND) -> Option<u64> {
@@ -422,39 +514,8 @@ unsafe fn decode_legacy_present_fence(submit: &DXGKARG_SUBMITCOMMAND) -> Option<
     let start = submit.DmaBufferPrivateDataSubmissionStartOffset as usize;
     let end = submit.DmaBufferPrivateDataSubmissionEndOffset as usize;
     SUBMIT_LEGACY_COUNT.fetch_add(1, Ordering::Relaxed);
-    PRESENT_PRIVATE_LAST_TOTAL.store(total.min(u32::MAX as usize) as u32, Ordering::Relaxed);
-    PRESENT_PRIVATE_LAST_UMD.store(0, Ordering::Relaxed);
-    PRESENT_PRIVATE_LAST_START.store(start.min(u32::MAX as usize) as u32, Ordering::Relaxed);
-    PRESENT_PRIVATE_LAST_END.store(end.min(u32::MAX as usize) as u32, Ordering::Relaxed);
-    PRESENT_PRIVATE_LAST_BASE_WORD.store(
-        unsafe { diagnostic_private_word(base, total, 0) },
-        Ordering::Relaxed,
-    );
-    PRESENT_PRIVATE_LAST_EXPECTED_WORD.store(
-        unsafe { diagnostic_private_word(base, total, start) },
-        Ordering::Relaxed,
-    );
-    if !base.is_null() && start <= end && end <= total {
-        if let Some(fence) = unsafe {
-            PresentSubmissionPrivate::decode(base.add(start).cast(), (end - start) as u32)
-        } {
-            PRESENT_MARKER_HITS.fetch_add(1, Ordering::Relaxed);
-            PRESENT_MARKER_LAST_OFFSET.store(start as u32, Ordering::Relaxed);
-            return Some(fence);
-        }
-    }
-    if let Some(fence) = unsafe {
-        PresentSubmissionPrivate::decode(
-            submit.pDmaBufferPrivateData,
-            submit.DmaBufferPrivateDataSize,
-        )
-    } {
-        PRESENT_MARKER_HITS.fetch_add(1, Ordering::Relaxed);
-        PRESENT_MARKER_LAST_OFFSET.store(0, Ordering::Relaxed);
-        return Some(fence);
-    }
-    unsafe { diagnostic_scan_present_private(base, total) };
-    None
+    unsafe { note_present_private_shape(SubmitPath::Legacy, base, total, 0, start, end, start) };
+    unsafe { decode_present_fence(base, total, start..end, SubmitPath::Legacy) }
 }
 
 /// Read one diagnostic word without extending the trusted private-data range.
