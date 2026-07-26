@@ -734,10 +734,27 @@ unsafe extern "system" fn create_device(
     // 11.1 handlers into slots an 11.0-negotiated device never calls (dwm's
     // singlethreaded devices were observed hitting the UNTYPED shader creates
     // → float32-typed SPIR-V inputs vs SINT vertex data, VUID-Input-08733).
-    {
+    if trace_enabled() {
+        // Bound the dump by the struct being interpreted, not by a literal. The
+        // hand copy is 88 bytes (ppfnRetrieveSubObject@80) and that member only
+        // exists from minor >= 3, so the runtime's object can be 80 bytes; the
+        // old `0..12` read bytes 0..96, which is 8 past the largest possible
+        // layout and 16 past the smallest — an access violation inside the
+        // caller's D3D11CreateDevice if the arg sits at the end of a page, or a
+        // garbage dump that reads as real ABI evidence.
+        //
+        // Words 0..9 cover every field this code actually interprets: hRTDevice,
+        // interface/version, pKTCallbacks, pDeviceFuncs, hDrvDevice, the 16-byte
+        // DXGIBaseDDI, hRTCoreLayer, pUMCallbacks, flags. Word 10 is read only
+        // when the negotiated interface says it is there, keyed on the same
+        // closed set R405 introduced; an unknown interface reads the short shape.
+        let words = match NegotiatedInterface::from_interface(create.interface) {
+            Some(NegotiatedInterface::D3D11_1) | Some(NegotiatedInterface::Wddm1_3) => 11,
+            Some(NegotiatedInterface::D3D11_0) | None => 10,
+        };
         let q = args as *const u64;
         let mut raw = String::from("CreateDevice raw args:");
-        for i in 0..12 {
+        for i in 0..words {
             raw.push_str(&format!(" [{}]=0x{:016x}", i, unsafe {
                 q.add(i).read_unaligned()
             }));
