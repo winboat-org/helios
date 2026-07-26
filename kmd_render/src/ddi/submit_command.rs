@@ -312,16 +312,35 @@ unsafe fn signal_dma_preempted_locked(
 /// during bring-up) or the transport is down; otherwise the interrupt DPC
 /// completes it once every async venus submission queued before it has retired
 /// (the real venus-driven WDDM fence — WDDM_FAKE_VIDMM_RESEARCH §C).
+/// The only thing `note_and_maybe_signal` can tell a SubmitCommand DDI.
+///
+/// This type exists so a transport or notification status physically cannot
+/// become the DDI's return value. Both DDIs used to `return
+/// note_and_maybe_signal(..)` verbatim, so a failed
+/// `DxgkCbSynchronizeExecution` in a stop/rebalance window - the exact failure
+/// R209 turns into a retry on the DPC path - was returned to VidSch as
+/// STATUS_DEVICE_NOT_READY, and this file's own record says a non-SUCCESS return
+/// here bugchecks dxgmms2!VidSchiSendToExecutionQueue with 0x119
+/// VIDEO_SCHEDULER_INTERNAL_ERROR Arg1=2. CLAUDE.md's DDI rule says the same
+/// thing in general: an illegal NTSTATUS is itself logged by dxgkrnl as a driver
+/// bug. A failed notify has to be handled where it can be retried, not escalated.
+enum SubmitAck {
+    Accepted,
+}
+
 fn note_and_maybe_signal(
     adapter: &AdapterContext,
     fence: u32,
     is_paging: bool,
     gpu_completion_fence: Option<u64>,
     refresh_scanout: bool,
-) -> NTSTATUS {
-    let dxgkrnl = match adapter.dxgkrnl() {
-        Ok(interface) => interface,
-        Err(_) => return STATUS_DEVICE_NOT_READY,
+) -> SubmitAck {
+    let Ok(dxgkrnl) = adapter.dxgkrnl() else {
+        // Effectively unreachable: dxgkrnl is set at StartDevice and never
+        // cleared, and SubmitCommand cannot precede it. The submission stays in
+        // the FIFO for the DPC either way.
+        DMA_NOTIFY_FAILS.fetch_add(1, Ordering::Relaxed);
+        return SubmitAck::Accepted;
     };
     adapter.with_wddm_notify_lock(|guard| {
         let signal_now = adapter
@@ -341,11 +360,20 @@ fn note_and_maybe_signal(
                 adapter.request_scanout_refresh();
             }
             // SAFETY: the notification lock is held and dxgkrnl is live.
-            unsafe { signal_dma_completed_locked(guard, dxgkrnl, fence) }
-        } else {
-            STATUS_SUCCESS
+            let status = unsafe { signal_dma_completed_locked(guard, dxgkrnl, fence) };
+            if status != STATUS_SUCCESS {
+                // Same handling as the DPC path in R209: count it and leave the
+                // retirement to a later DPC rather than failing the submission.
+                DMA_NOTIFY_FAILS.fetch_add(1, Ordering::Relaxed);
+                if let Some(queue_dpc) = dxgkrnl.DxgkCbQueueDpc {
+                    // SAFETY: callable at <= DIRQL with a valid DeviceHandle;
+                    // it does not take the notify lock we hold.
+                    unsafe { queue_dpc(dxgkrnl.DeviceHandle) };
+                }
+            }
         }
-    })
+    });
+    SubmitAck::Accepted
 }
 
 unsafe fn decode_virtual_present_fence(submit: &DXGKARG_SUBMITCOMMANDVIRTUAL) -> Option<u64> {
@@ -503,7 +531,11 @@ pub unsafe extern "C" fn dxgkddi_submit_command_virtual(
     }
 
     let present_fence = unsafe { decode_virtual_present_fence(submit) };
-    note_and_maybe_signal(adapter, fence, is_paging, present_fence, false)
+    // The submission is accepted regardless of how the notification went; a
+    // non-SUCCESS return here bugchecks dxgmms2 with 0x119 Arg1=2.
+    let SubmitAck::Accepted =
+        note_and_maybe_signal(adapter, fence, is_paging, present_fence, false);
+    STATUS_SUCCESS
 }
 
 /// `DxgkDdiSubmitCommand` — submit a DMA buffer to the GPU. Critically, this is
@@ -533,7 +565,10 @@ pub unsafe extern "C" fn dxgkddi_submit_command(
     }
 
     let present_fence = unsafe { decode_legacy_present_fence(submit) };
-    note_and_maybe_signal(adapter, fence, is_paging, present_fence, false)
+    // As above: accepted regardless of the notification outcome.
+    let SubmitAck::Accepted =
+        note_and_maybe_signal(adapter, fence, is_paging, present_fence, false);
+    STATUS_SUCCESS
 }
 
 /// `DxgkDdiPreemptCommand` — VidSch wants the node's pending submissions back
