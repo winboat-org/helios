@@ -261,19 +261,24 @@ fn ctrl_roundtrip(
     let block_ptr = NonNull::from(&mut block);
 
     // Enqueue, with PASSIVE backpressure while the queue is full.
-    let mut meta_slot = Some(meta);
+    //
+    // `meta` is carried as a loop value, not round-tripped through an
+    // `Option`. The enqueue moves it into the closure and the QueueFull arm
+    // reinitialises it before the back edge, which Rust's flow-sensitive move
+    // checking accepts. A future retry arm that forgets to hand the buffer back
+    // is then a *compile* error, where the take-then-expect this replaces was a
+    // `KeBugCheck` inside a DDI on the next iteration.
     let mut attempts = 0u32;
     let token = loop {
-        let m = meta_slot.take().expect("meta returned on every retry path");
         let res = adapter.with_virtio(move |v| {
             v.drain_used();
-            v.enqueue_sync(m, in0_len, in1_len, resp_len, block_ptr)
+            v.enqueue_sync(meta, in0_len, in1_len, resp_len, block_ptr)
         });
         match res {
             Err(_) => return Err(VirtioError::DeviceError), // transport gone
             Ok(Ok(token)) => break token,
             Ok(Err((m_back, VirtioError::QueueFull))) => {
-                meta_slot = Some(m_back);
+                meta = m_back;
                 attempts += 1;
                 if attempts > ENQUEUE_RETRY_MAX {
                     return Err(VirtioError::QueueFull);
@@ -1469,7 +1474,7 @@ pub fn submit_venus_async(
     };
     let ctx_id = owned.id();
     reap_parked(adapter);
-    let meta = adapter
+    let mut meta = adapter
         .with_virtio(|v| v.take_dma_buffer(SUBMIT_META_BYTES))
         .ok()
         .flatten()
@@ -1484,24 +1489,22 @@ pub fn submit_venus_async(
     venus.as_mut_slice()[..stream.len()].copy_from_slice(stream);
     let venus_len = stream.len();
 
-    let mut meta_slot = Some(meta);
-    let mut venus_slot = Some(venus);
+    // Both buffers are carried as loop values for the reason given in
+    // `ctrl_roundtrip`: this loop has two of them, so an arm that returns only
+    // one is exactly the maintenance mistake the take-then-expect pair used to
+    // turn into a bugcheck. As loop values it does not compile.
     let mut attempts = 0u32;
     loop {
-        let m = meta_slot.take().expect("meta returned on every retry path");
-        let vn = venus_slot
-            .take()
-            .expect("venus returned on every retry path");
         let res = adapter.with_virtio(move |v| {
             v.drain_used();
-            v.enqueue_async_submit(ctx_id, ring_idx, m, vn, venus_len)
+            v.enqueue_async_submit(ctx_id, ring_idx, meta, venus, venus_len)
         });
         match res {
             Err(_) => return Err(VirtioError::DeviceError), // transport gone
             Ok(Ok(fence_id)) => return Ok(fence_id),
             Ok(Err((m_back, v_back, VirtioError::QueueFull))) => {
-                meta_slot = Some(m_back);
-                venus_slot = Some(v_back);
+                meta = m_back;
+                venus = v_back;
                 attempts += 1;
                 if attempts > ENQUEUE_RETRY_MAX {
                     return Err(VirtioError::QueueFull);
