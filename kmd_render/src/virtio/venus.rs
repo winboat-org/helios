@@ -371,7 +371,7 @@ pub struct HostVisibleBlob {
 
 pub struct ScanoutImageBlob {
     pub blob: HostVisibleBlob,
-    pub image_id: u64,
+    pub image_id: VkImageId,
     pub memory_type_index: u32,
     pub row_pitch: u32,
     pub plane_offset: u32,
@@ -384,7 +384,7 @@ pub struct ScanoutImageBlob {
 /// storage contract; callers must never reinterpret the backing as a buffer.
 pub struct OptimalImageBlob {
     pub blob: HostVisibleBlob,
-    pub image_id: u64,
+    pub image_id: VkImageId,
     pub memory_type_index: u32,
 }
 
@@ -406,23 +406,26 @@ pub struct PreparedImageCopy {
     /// `memory_id`. Zero for a borrowed KMD-created source.
     pub source_resource_id: u32,
     /// KMD-device OPTIMAL alias of the source allocation.
-    pub source_image_id: u64,
-    /// `VkDeviceMemory` imported through `VkImportMemoryResourceInfoMESA`, or
-    /// zero for a borrowed source.
-    pub source_memory_id: u64,
+    pub source_image_id: VkImageId,
+    /// `VkDeviceMemory` imported through `VkImportMemoryResourceInfoMESA`.
+    /// `None` for a borrowed source, which used to be spelled 0.
+    pub source_memory_id: Option<VkDeviceMemoryId>,
     /// KMD-owned OPTIMAL BGRA scratch used only when the Windows-selected
-    /// primary format differs from the physical BGRA scanout format.
-    pub conversion_image_id: u64,
-    pub conversion_memory_id: u64,
+    /// primary format differs from the physical BGRA scanout format. `None`
+    /// when no conversion is needed — the common case.
+    pub conversion_image_id: Option<VkImageId>,
+    pub conversion_memory_id: Option<VkDeviceMemoryId>,
     /// Pool retaining the one-time UNDEFINED-to-GENERAL transition for the
     /// conversion image.
-    pub conversion_init_pool_id: u64,
+    pub conversion_init_pool_id: Option<VkCommandPoolId>,
     /// Pool owning `command_buffer_id`; retained while submissions may be live.
-    pub command_pool_id: u64,
-    /// Reusable source-acquire/copy/release command buffer.
-    pub command_buffer_id: u64,
+    pub command_pool_id: VkCommandPoolId,
+    /// Reusable source-acquire/copy/release command buffer. Also the publish
+    /// word of the `AllocationContext` mirror: a nonzero value there means the
+    /// whole snapshot is coherent.
+    pub command_buffer_id: VkCommandBufferId,
     /// Persistent adapter-owned destination image baked into the command buffer.
-    pub target_image_id: u64,
+    pub target_image_id: VkImageId,
     pub width: u32,
     pub height: u32,
 }
@@ -3908,19 +3911,17 @@ impl VenusClient {
         };
 
         crate::diag::record_named_bytes(b"CpImpSt", 0x10);
-        // PreparedImageCopy is still a bag of raw u64s; R607 commit (2)
-        // converts it and its AtomicU64 mirrors in create_allocation.rs.
         Ok(PreparedImageCopy {
             owns_source_alias: true,
             source_resource_id,
-            source_image_id: source_image_id.get(),
-            source_memory_id: source_memory_id.get(),
-            conversion_image_id: conversion_image_id.map_or(0, VkImageId::get),
-            conversion_memory_id: conversion_memory_id.map_or(0, VkDeviceMemoryId::get),
-            conversion_init_pool_id: conversion_init_pool_id.map_or(0, VkCommandPoolId::get),
-            command_pool_id: command_pool_id.get(),
-            command_buffer_id: command_buffer_id.get(),
-            target_image_id: target_image_id.get(),
+            source_image_id,
+            source_memory_id: Some(source_memory_id),
+            conversion_image_id,
+            conversion_memory_id,
+            conversion_init_pool_id,
+            command_pool_id,
+            command_buffer_id,
+            target_image_id,
             width,
             height,
         })
@@ -4005,14 +4006,14 @@ impl VenusClient {
         Ok(PreparedImageCopy {
             owns_source_alias: false,
             source_resource_id: 0,
-            source_image_id: source_image_id.get(),
-            source_memory_id: 0,
-            conversion_image_id: conversion_image_id.map_or(0, VkImageId::get),
-            conversion_memory_id: conversion_memory_id.map_or(0, VkDeviceMemoryId::get),
-            conversion_init_pool_id: conversion_init_pool_id.map_or(0, VkCommandPoolId::get),
-            command_pool_id: command_pool_id.get(),
-            command_buffer_id: command_buffer_id.get(),
-            target_image_id: target_image_id.get(),
+            source_image_id,
+            source_memory_id: None,
+            conversion_image_id,
+            conversion_memory_id,
+            conversion_init_pool_id,
+            command_pool_id,
+            command_buffer_id,
+            target_image_id,
             width,
             height,
         })
@@ -4028,10 +4029,8 @@ impl VenusClient {
         primary_address: u64,
         ticket: crate::adapter::ProgrammingTicket,
     ) -> Result<u64, VirtioError> {
-        if copy.command_buffer_id == 0
-            || copy.source_image_id == 0
-            || Some(copy.target_image_id) != self.copy_target_image_id.map(VkImageId::get)
-        {
+        // The two null checks are gone: both handles are NonZeroU64 now.
+        if Some(copy.target_image_id) != self.copy_target_image_id {
             return Err(VirtioError::DeviceError);
         }
         // Encode vkQueueSubmit directly into the outer SUBMIT_3D stream. The
@@ -4052,7 +4051,7 @@ impl VenusClient {
         submit.count(false); // pWaitDstStageMask
         submit.u32(1); // commandBufferCount
         submit.u64(1); // pCommandBuffers array_size
-        submit.u64(copy.command_buffer_id);
+        submit.handle(copy.command_buffer_id);
         submit.u32(0); // signalSemaphoreCount
         submit.count(false); // pSignalSemaphores
         submit.u64(0); // fence
@@ -4504,31 +4503,22 @@ impl VenusClient {
             return Err(e);
         }
         self.destroy_fence(adapter, fence_id)?;
-        // PreparedImageCopy is still raw u64 (R607 commit 2). Every `!= 0`
-        // guard below becomes a `from_raw`, which is the same test; the
-        // unconditional pool destroy becomes conditional, which is also the
-        // same behaviour, because vkDestroyCommandPool(VK_NULL_HANDLE) is a
-        // documented no-op.
-        if let Some(pool_id) = VkCommandPoolId::from_raw(copy.command_pool_id) {
+        self.destroy_command_pool(adapter, copy.command_pool_id)?;
+        if let Some(pool_id) = copy.conversion_init_pool_id {
             self.destroy_command_pool(adapter, pool_id)?;
         }
-        if let Some(pool_id) = VkCommandPoolId::from_raw(copy.conversion_init_pool_id) {
-            self.destroy_command_pool(adapter, pool_id)?;
-        }
-        if let Some(image_id) = VkImageId::from_raw(copy.conversion_image_id) {
+        if let Some(image_id) = copy.conversion_image_id {
             self.destroy_image_on_ring(adapter, image_id)?;
         }
-        if let Some(memory_id) = VkDeviceMemoryId::from_raw(copy.conversion_memory_id) {
+        if let Some(memory_id) = copy.conversion_memory_id {
             self.free_memory_object(adapter, memory_id)?;
         }
         if copy.owns_source_alias {
-            let source_image_id =
-                VkImageId::from_raw(copy.source_image_id).ok_or(VirtioError::DeviceError)?;
             self.cleanup_imported_source_alias(
                 adapter,
                 copy.source_resource_id,
-                source_image_id,
-                VkDeviceMemoryId::from_raw(copy.source_memory_id),
+                copy.source_image_id,
+                copy.source_memory_id,
             )
         } else {
             Ok(())
@@ -4685,7 +4675,7 @@ impl VenusClient {
                 gpa: 0,
                 size: alloc_size,
             },
-            image_id: image_id.get(),
+            image_id,
             memory_type_index,
             row_pitch: row_pitch as u32,
             plane_offset: offset as u32,
@@ -4778,7 +4768,7 @@ impl VenusClient {
                 gpa: 0,
                 size: allocation_size,
             },
-            image_id: image_id.get(),
+            image_id,
             memory_type_index,
         })
     }
@@ -4861,7 +4851,7 @@ impl VenusClient {
                 gpa: 0,
                 size: alloc_size,
             },
-            image_id: image_id.get(),
+            image_id,
             memory_type_index,
             row_pitch: row_pitch as u32,
             plane_offset: offset as u32,

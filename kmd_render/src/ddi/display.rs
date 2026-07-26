@@ -115,7 +115,7 @@ fn production_linear_scanout(
         .store(scanout.blob.blob_id, Ordering::Relaxed);
     adapter
         .dedicated_scanout_image
-        .store(scanout.image_id, Ordering::Relaxed);
+        .store(scanout.image_id.get(), Ordering::Relaxed);
     adapter
         .dedicated_scanout_resource
         .store(scanout.blob.res_id, Ordering::Release);

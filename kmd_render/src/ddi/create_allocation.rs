@@ -697,13 +697,29 @@ pub(crate) unsafe fn scanout_alloc_info(h: HANDLE) -> Option<WindowsPrimary> {
     })
 }
 
+/// Rebuild the published [`PreparedImageCopy`] snapshot from its atomic mirror.
+///
+/// The atomics stay raw `u64` — that is what an `AtomicU64` can hold — so this
+/// is the ONE place raw words become typed handles, and it is a *validating*
+/// restore: a snapshot missing any of the three handles it cannot function
+/// without is no snapshot at all and reads as `None`. Before the handle
+/// newtypes those three were `!= 0` tests scattered across the two consumers
+/// (`submit_prepared_image_copy` had two of them; the third had none).
+///
+/// `scanout_copy_command_buffer_id` is the publish word: acquiring a nonzero
+/// value there means the eight Relaxed payload stores that preceded its Release
+/// store are visible, so the rest of the snapshot is coherent.
 fn cached_prepared_copy(
     ctx: &AllocationContext,
 ) -> Option<crate::virtio::venus::PreparedImageCopy> {
-    let command_buffer_id = ctx.scanout_copy_command_buffer_id.load(Ordering::Acquire);
-    if command_buffer_id == 0 {
-        return None;
-    }
+    use crate::virtio::venus::{VkCommandBufferId, VkCommandPoolId, VkDeviceMemoryId, VkImageId};
+
+    let command_buffer_id =
+        VkCommandBufferId::from_raw(ctx.scanout_copy_command_buffer_id.load(Ordering::Acquire))?;
+    let command_pool_id = VkCommandPoolId::from_raw(ctx.scanout_copy_pool_id.load(Ordering::Relaxed))?;
+    let source_image_id = VkImageId::from_raw(ctx.scanout_copy_image_id.load(Ordering::Relaxed))?;
+    let target_image_id =
+        VkImageId::from_raw(ctx.scanout_copy_target_image_id.load(Ordering::Relaxed))?;
     let owns_source_alias = ctx.scanout_copy_owns_source_alias.load(Ordering::Relaxed) != 0;
     Some(crate::virtio::venus::PreparedImageCopy {
         owns_source_alias,
@@ -712,21 +728,31 @@ fn cached_prepared_copy(
         } else {
             0
         },
-        source_image_id: ctx.scanout_copy_image_id.load(Ordering::Relaxed),
-        source_memory_id: ctx.scanout_copy_memory_id.load(Ordering::Relaxed),
-        conversion_image_id: ctx.scanout_copy_conversion_image_id.load(Ordering::Relaxed),
-        conversion_memory_id: ctx
-            .scanout_copy_conversion_memory_id
-            .load(Ordering::Relaxed),
-        conversion_init_pool_id: ctx
-            .scanout_copy_conversion_init_pool_id
-            .load(Ordering::Relaxed),
-        command_pool_id: ctx.scanout_copy_pool_id.load(Ordering::Relaxed),
+        source_image_id,
+        source_memory_id: VkDeviceMemoryId::from_raw(
+            ctx.scanout_copy_memory_id.load(Ordering::Relaxed),
+        ),
+        conversion_image_id: VkImageId::from_raw(
+            ctx.scanout_copy_conversion_image_id.load(Ordering::Relaxed),
+        ),
+        conversion_memory_id: VkDeviceMemoryId::from_raw(
+            ctx.scanout_copy_conversion_memory_id.load(Ordering::Relaxed),
+        ),
+        conversion_init_pool_id: VkCommandPoolId::from_raw(
+            ctx.scanout_copy_conversion_init_pool_id
+                .load(Ordering::Relaxed),
+        ),
+        command_pool_id,
         command_buffer_id,
-        target_image_id: ctx.scanout_copy_target_image_id.load(Ordering::Relaxed),
+        target_image_id,
         width: ctx.width,
         height: ctx.height,
     })
+}
+
+/// `None` stores as 0, the value the mirror has always used for "absent".
+fn raw<T: Into<u64>>(id: Option<T>) -> u64 {
+    id.map_or(0, Into::into)
 }
 
 fn publish_prepared_copy(ctx: &AllocationContext, copy: &crate::virtio::venus::PreparedImageCopy) {
@@ -735,21 +761,21 @@ fn publish_prepared_copy(ctx: &AllocationContext, copy: &crate::virtio::venus::P
     ctx.scanout_copy_owns_source_alias
         .store(copy.owns_source_alias as u32, Ordering::Relaxed);
     ctx.scanout_copy_image_id
-        .store(copy.source_image_id, Ordering::Relaxed);
+        .store(copy.source_image_id.get(), Ordering::Relaxed);
     ctx.scanout_copy_memory_id
-        .store(copy.source_memory_id, Ordering::Relaxed);
+        .store(raw(copy.source_memory_id), Ordering::Relaxed);
     ctx.scanout_copy_conversion_image_id
-        .store(copy.conversion_image_id, Ordering::Relaxed);
+        .store(raw(copy.conversion_image_id), Ordering::Relaxed);
     ctx.scanout_copy_conversion_memory_id
-        .store(copy.conversion_memory_id, Ordering::Relaxed);
+        .store(raw(copy.conversion_memory_id), Ordering::Relaxed);
     ctx.scanout_copy_conversion_init_pool_id
-        .store(copy.conversion_init_pool_id, Ordering::Relaxed);
+        .store(raw(copy.conversion_init_pool_id), Ordering::Relaxed);
     ctx.scanout_copy_pool_id
-        .store(copy.command_pool_id, Ordering::Relaxed);
+        .store(copy.command_pool_id.get(), Ordering::Relaxed);
     ctx.scanout_copy_target_image_id
-        .store(copy.target_image_id, Ordering::Relaxed);
+        .store(copy.target_image_id.get(), Ordering::Relaxed);
     ctx.scanout_copy_command_buffer_id
-        .store(copy.command_buffer_id, Ordering::Release);
+        .store(copy.command_buffer_id.get(), Ordering::Release);
 }
 
 fn clear_prepared_copy(ctx: &AllocationContext) {
@@ -822,7 +848,10 @@ pub(crate) unsafe fn submit_primary_scanout_copy(
         // cache-HIT path must fall through with the value still in place; a bare
         // `if let Some(old) = prepared.take()` would destroy it every frame.
         let prepared = match cached_prepared_copy(ctx) {
-            Some(old) if old.target_image_id != target_image_id => {
+            Some(old)
+                if Some(old.target_image_id)
+                    != crate::virtio::venus::VkImageId::from_raw(target_image_id) =>
+            {
                 let last = ctx.scanout_copy_last_fence.load(Ordering::Acquire);
                 client.destroy_prepared_image_copy(adapter, old, last)?;
                 clear_prepared_copy(ctx);
@@ -1323,7 +1352,7 @@ unsafe fn create_one(
         }) {
             Ok(Ok(scanout)) => {
                 venus_memory_id = scanout.blob.blob_id;
-                venus_image_id = scanout.image_id;
+                venus_image_id = scanout.image_id.get();
                 meta.pitch = scanout.row_pitch;
                 meta.plane_offset = scanout.plane_offset as u64;
                 meta.venus_alloc_size = scanout.blob.size;
@@ -1365,7 +1394,7 @@ unsafe fn create_one(
         }) {
             Ok(Ok(image)) => {
                 venus_memory_id = image.blob.blob_id;
-                venus_image_id = image.image_id;
+                venus_image_id = image.image_id.get();
                 meta.pitch = 0;
                 meta.plane_offset = 0;
                 meta.dxgi_format = dxgi_format;

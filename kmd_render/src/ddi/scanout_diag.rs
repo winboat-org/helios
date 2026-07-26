@@ -372,7 +372,7 @@ pub(crate) fn maybe_run(adapter: &AdapterContext) {
                 .map(|scanout| {
                     (
                         scanout.blob,
-                        scanout.image_id,
+                        scanout.image_id.get(),
                         scanout.row_pitch,
                         scanout.plane_offset,
                     )
@@ -383,7 +383,7 @@ pub(crate) fn maybe_run(adapter: &AdapterContext) {
                 .map(|scanout| {
                     (
                         scanout.blob,
-                        scanout.image_id,
+                        scanout.image_id.get(),
                         scanout.row_pitch,
                         scanout.plane_offset,
                     )
