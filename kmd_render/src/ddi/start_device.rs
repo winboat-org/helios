@@ -96,7 +96,11 @@ fn setup_bar_segment(
     }
     // The KMD blob-window allocator must never hand out offsets inside the
     // aperture region (dxgkrnl's CPU-host-aperture allocator owns them).
-    let _ = adapter.with_virtio(|v| v.reserve_window_prefix(size));
+    // Refused (and counted) if any window offset has already been issued —
+    // moving the VidMm partition out from under live mappings would strand
+    // every offset below the new mark with no way to recycle it. Nothing has
+    // been mapped at this point in StartDevice; a false here is a real defect.
+    let _ = adapter.with_virtio(|v| v.configure_window_reserve(size));
     crate::diag::record(0x0B00_0008);
     crate::diag::record(((size >> 20) & 0xFFFF_FFFF) as u32);
     (

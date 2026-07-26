@@ -208,6 +208,10 @@ pub static RESOURCE_FULL_REJECTS: AtomicU32 = AtomicU32::new(0);
 pub static CONTEXT_FULL_DROPS: AtomicU32 = AtomicU32::new(0);
 /// Freed window ranges dropped because the free list was full (leaked offsets).
 pub static WINDOW_RANGE_DROPS: AtomicU32 = AtomicU32::new(0);
+/// `configure_window_reserve` refusals — offsets had already been issued. Must
+/// stay 0: a nonzero value means someone tried to move the VidMm partition out
+/// from under live mappings.
+pub static WINDOW_RECONFIG_REFUSED: AtomicU32 = AtomicU32::new(0);
 /// `take_live_resource` misses (duplicate-teardown suppressions). Replaces the
 /// in-lock `diag::record(0x0D20_00E0)` breadcrumb.
 pub static TAKE_LIVE_MISSES: AtomicU32 = AtomicU32::new(0);
@@ -261,10 +265,10 @@ pub fn max_resources() -> usize {
 // reports this window as a CPU-visible memory segment so dxgkrnl/VidMm can map
 // blobs to user space (there is no DxgkDdiLock; see GATE5_STAGE2_ALLOC_DESIGN.md).
 
-const PCI_CFG_STATUS: u16 = 0x04; // command (low 16) | status (high 16)
+const PCI_CFG_STATUS: u8 = 0x04; // command (low 16) | status (high 16)
 const PCI_STATUS_CAP_LIST: u32 = 1 << 4; // status bit 4: capability list present
-const PCI_CFG_CAP_PTR: u16 = 0x34; // first capability offset (low byte)
-const PCI_CFG_BAR0: u16 = 0x10; // BAR0; BARn at 0x10 + n*4
+const PCI_CFG_CAP_PTR: u8 = 0x34; // first capability offset (low byte)
+const PCI_CFG_BAR0: u8 = 0x10; // BAR0; BARn at 0x10 + n*4
 const PCI_CAP_ID_VNDR: u32 = 0x09; // generic PCI vendor-specific capability id
 
 /// The host-visible memory window discovered from the SHARED_MEMORY_CFG /
@@ -281,15 +285,42 @@ pub struct HostVisibleWindow {
 /// config-space callback. `off` is held in a `u16` (like the System-class scan)
 /// so the `cap + 20` cap-structure reads never overflow the `u8` arithmetic;
 /// PCI config space is 256 bytes, so the `as u8` truncation is lossless.
-fn cfg_read32(access: &DxgkConfigAccess, off: u16) -> u32 {
+/// One dword of PCI config space at `off`.
+///
+/// The parameter is a `u8` on purpose. It used to be a `u16` truncated with
+/// `as u8` and a comment claiming the truncation was lossless — it is not, and
+/// the capability walks below could produce an out-of-range offset: `cap` is
+/// masked to `& 0xFC` and bounded only by `cap != 0` and a 48-iteration count,
+/// never by an upper bound, so `cap + 20` with `cap >= 0xEC` WRAPPED to
+/// `PCI_CFG_BAR0` (0x10) and `cap + 8` to `PCI_CFG_STATUS` (0x04). The device's
+/// length would then be read out of a BAR register. Making the parameter `u8`
+/// moves that arithmetic to the walks, where it can be checked.
+fn cfg_read32(access: &DxgkConfigAccess, off: u8) -> u32 {
     access.read_word(
         DeviceFunction {
             bus: 0,
             device: 0,
             function: 0,
         },
-        off as u8,
+        off,
     )
+}
+
+/// Bytes of a `virtio_pci_cap64` — the largest structure either capability walk
+/// reads, at `cap + 20`.
+const VIRTIO_PCI_CAP64_BYTES: u8 = 24;
+
+/// Whether every field of a `virtio_pci_cap64` at `cap` fits in config space.
+///
+/// A capability whose header sits inside 256 bytes can still have its tail
+/// outside it. Refusing such a capability (and counting it) is the whole point:
+/// the alternative is a silent wrap onto an unrelated register.
+fn cap_fits(cap: u8) -> bool {
+    if cap > u8::MAX - VIRTIO_PCI_CAP64_BYTES {
+        crate::diag::record_named_bytes(b"PciCapOob", u32::from(cap));
+        return false;
+    }
+    true
 }
 
 /// Read the guest-physical base a memory BAR was assigned, handling the 64-bit
@@ -298,7 +329,8 @@ fn bar_base(access: &DxgkConfigAccess, bar: u16) -> Option<u64> {
     if bar > 5 {
         return None;
     }
-    let reg = PCI_CFG_BAR0 + bar * 4;
+    // bar <= 5, so reg <= 0x24 and reg + 4 <= 0x28 — both inside config space.
+    let reg = PCI_CFG_BAR0 + (bar as u8) * 4;
     let lo = cfg_read32(access, reg);
     if lo & 0x1 != 0 {
         return None; // I/O-space BAR — not the memory window
@@ -322,7 +354,7 @@ fn scan_host_visible_window(access: &DxgkConfigAccess) -> Option<HostVisibleWind
         return None;
     }
     // Capability pointers are dword-aligned; mask the reserved low 2 bits.
-    let mut cap = (cfg_read32(access, PCI_CFG_CAP_PTR) & 0xFF) as u16 & 0xFC;
+    let mut cap = (cfg_read32(access, PCI_CFG_CAP_PTR) & 0xFF) as u8 & 0xFC;
     // Bounded walk — a corrupt cap_next cannot escape the 256-byte config space.
     for _ in 0..48 {
         if cap == 0 {
@@ -330,9 +362,12 @@ fn scan_host_visible_window(access: &DxgkConfigAccess) -> Option<HostVisibleWind
         }
         let d0 = cfg_read32(access, cap);
         let cap_id = d0 & 0xFF;
-        let cap_next = ((d0 >> 8) & 0xFF) as u16 & 0xFC;
+        let cap_next = ((d0 >> 8) & 0xFF) as u8 & 0xFC;
         let cfg_type = (d0 >> 24) & 0xFF;
         if cap_id == PCI_CAP_ID_VNDR && cfg_type == VIRTIO_PCI_CAP_SHARED_MEMORY_CFG as u32 {
+            if !cap_fits(cap) {
+                break;
+            }
             // `virtio_pci_cap`: bar at +4 byte0, id (shmid) at +4 byte1.
             let d1 = cfg_read32(access, cap + 4);
             let bar = (d1 & 0xFF) as u16;
@@ -371,16 +406,19 @@ fn map_isr_status_register(access: &DxgkConfigAccess) -> usize {
     if (cfg_read32(access, PCI_CFG_STATUS) >> 16) & PCI_STATUS_CAP_LIST == 0 {
         return 0;
     }
-    let mut cap = (cfg_read32(access, PCI_CFG_CAP_PTR) & 0xFF) as u16 & 0xFC;
+    let mut cap = (cfg_read32(access, PCI_CFG_CAP_PTR) & 0xFF) as u8 & 0xFC;
     for _ in 0..48 {
         if cap == 0 {
             break;
         }
         let d0 = cfg_read32(access, cap);
         let cap_id = d0 & 0xFF;
-        let cap_next = ((d0 >> 8) & 0xFF) as u16 & 0xFC;
+        let cap_next = ((d0 >> 8) & 0xFF) as u8 & 0xFC;
         let cfg_type = (d0 >> 24) & 0xFF;
         if cap_id == PCI_CAP_ID_VNDR && cfg_type == VIRTIO_PCI_CAP_ISR_CFG as u32 {
+            if !cap_fits(cap) {
+                break;
+            }
             // `virtio_pci_cap`: bar at +4 byte0; offset (u32) at +8.
             let bar = (cfg_read32(access, cap + 4) & 0xFF) as u16;
             let offset = cfg_read32(access, cap + 8) as u64;
@@ -1022,6 +1060,132 @@ static NEXT_WIRE_FENCE_BASE: AtomicU64 = AtomicU64::new(1);
 /// cannot wrap in the machine's lifetime.
 const WIRE_FENCE_INSTANCE_STRIDE: u64 = 1 << 32;
 
+/// The KMD's allocator for offsets inside the host-visible BAR window.
+///
+/// Its three pieces — the high-water bump, the coalescing free list and the
+/// VidMm reserve — were three loose fields of `VirtioGpu`, and the reserve was
+/// installed by a plain setter two statements after `set_virtio` in StartDevice.
+/// A SECOND `reserve_window_prefix` with a larger len would silently strand
+/// every offset already issued below the new mark: `free_window_range` returns
+/// early for `offset < reserve`, so those ranges could never be recycled and
+/// nothing would say so.
+///
+/// The reserve is now immutable once any offset has been issued —
+/// [`VirtioGpu::configure_window_reserve`] refuses and counts otherwise. It is a
+/// guarded setter rather than a literal construct-with-reserve because the
+/// reserve is computed from the window length AFTER `VirtioGpu::init` and
+/// installed under the device spinlock, where allocating the free list's `Vec`
+/// is forbidden.
+struct WindowAllocator {
+    /// Total bytes of the host-visible window (0 if the device exposes none).
+    window_len: u64,
+    /// First `reserve` bytes are OWNED BY VIDMM (the CPU-visible BAR memory
+    /// segment, `query_adapter_info`): VidMm's segment allocator assigns offsets
+    /// there and `BuildPagingBuffer` maps each allocation's blob at the assigned
+    /// offset. This allocator never hands out or reclaims offsets below the mark.
+    reserve: u64,
+    /// Bump high-water.
+    next_offset: u64,
+    /// Coalescing free list (bounded by MAX_WINDOW_RANGES).
+    free_ranges: Vec<WindowRange>,
+}
+
+impl WindowAllocator {
+    /// PASSIVE only: reserves the free list up front so `alloc`/`free` under the
+    /// device spinlock never allocate.
+    fn new(window_len: u64) -> Self {
+        Self {
+            window_len,
+            reserve: 0,
+            next_offset: 0,
+            free_ranges: Vec::with_capacity(MAX_WINDOW_RANGES),
+        }
+    }
+
+    /// True while no offset has been issued and nothing has been freed — the
+    /// only state in which the reserve may still be set.
+    fn is_pristine(&self) -> bool {
+        self.next_offset == self.reserve && self.free_ranges.is_empty()
+    }
+
+    /// Bytes currently handed out.
+    fn used(&self) -> u64 {
+        let free: u64 = self.free_ranges.iter().map(|r| r.len).sum();
+        self.next_offset.saturating_sub(free)
+    }
+
+    /// Allocate a page-rounded `len`-byte range: reuse a free range if one fits,
+    /// else bump the high-water mark (bounded by `window_len`).
+    fn alloc(&mut self, len: u64) -> Result<u64, VirtioError> {
+        if let Some(idx) = self.free_ranges.iter().position(|r| r.len >= len) {
+            let offset = self.free_ranges[idx].offset;
+            if self.free_ranges[idx].len == len {
+                self.free_ranges.swap_remove(idx);
+            } else {
+                self.free_ranges[idx].offset += len;
+                self.free_ranges[idx].len -= len;
+            }
+            return Ok(offset);
+        }
+        let offset = self.next_offset;
+        let end = match offset.checked_add(len) {
+            Some(e) if e <= self.window_len => e,
+            _ => {
+                WINDOW_ALLOC_REJECTS.fetch_add(1, Ordering::Relaxed);
+                return Err(VirtioError::OutOfMemory);
+            }
+        };
+        self.next_offset = end;
+        Ok(offset)
+    }
+
+    /// Return a range: drop the high-water mark if it abuts, else coalesce into
+    /// an adjacent free range, else record a new free range (or silently leak if
+    /// the bounded free list is full — bring-up acceptable).
+    fn free(&mut self, offset: u64, len: u64) {
+        if len == 0 {
+            return;
+        }
+        // VidMm-partition offsets are owned by VidMm's segment allocator — they
+        // must never enter the KMD free list (a later KMD-side map would collide
+        // with a VidMm placement). Every release path funnels here, so this one
+        // guard covers DestroyAllocation/ReleaseBlob/teardown of VidMm-placed
+        // blobs uniformly. PRESERVED VERBATIM: it is what keeps VidMm-partition
+        // offsets out of the KMD free list.
+        if offset < self.reserve {
+            return;
+        }
+        if offset.checked_add(len) == Some(self.next_offset) {
+            self.next_offset = offset;
+            while let Some(idx) = self
+                .free_ranges
+                .iter()
+                .position(|r| r.offset.checked_add(r.len) == Some(self.next_offset))
+            {
+                let r = self.free_ranges.swap_remove(idx);
+                self.next_offset = r.offset;
+            }
+            return;
+        }
+        for range in &mut self.free_ranges {
+            if range.offset.checked_add(range.len) == Some(offset) {
+                range.len += len;
+                return;
+            }
+            if offset.checked_add(len) == Some(range.offset) {
+                range.offset = offset;
+                range.len += len;
+                return;
+            }
+        }
+        if self.free_ranges.len() < MAX_WINDOW_RANGES {
+            self.free_ranges.push(WindowRange { offset, len });
+        } else {
+            WINDOW_RANGE_DROPS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
 /// Which retirement domain a wait is against.
 ///
 /// The nine-line doc this replaces explained at length that the wait is ring-0
@@ -1188,17 +1352,8 @@ pub struct VirtioGpu {
     /// accumulate host-side state and eventually wedge the render server. Reserved
     /// to MAX_CONTEXTS at init (no realloc under the spinlock).
     contexts: Vec<ContextSlot>,
-    /// Bump high-water for the host-visible window offset allocator.
-    next_window_offset: u64,
-    /// First `vidmm_reserved` bytes of the host-visible window are OWNED BY
-    /// VIDMM (the CPU-visible BAR memory segment, `query_adapter_info`): VidMm's
-    /// segment allocator assigns offsets there and `BuildPagingBuffer` maps each
-    /// allocation's blob at the assigned offset. The KMD bump/free allocator
-    /// never hands out or reclaims offsets below this mark (see
-    /// [`Self::reserve_window_prefix`] / [`Self::free_window_range`]).
-    vidmm_reserved: u64,
-    /// Coalescing free list for released window ranges (bounded by MAX_WINDOW_RANGES).
-    free_window_ranges: Vec<WindowRange>,
+    /// Offsets inside the host-visible BAR window. See [`WindowAllocator`].
+    window: WindowAllocator,
     /// In-flight control-queue entries (token-matched; capacity MAX_INFLIGHT,
     /// reserved at init — pushes never reallocate under the spinlock).
     inflight: Vec<InFlight>,
@@ -1417,9 +1572,7 @@ impl VirtioGpu {
             resources_reserved: 0,
             contexts_reserved: 0,
             contexts: Vec::with_capacity(MAX_CONTEXTS),
-            next_window_offset: 0,
-            vidmm_reserved: 0,
-            free_window_ranges: Vec::with_capacity(MAX_WINDOW_RANGES),
+            window: WindowAllocator::new(host_visible.map_or(0, |w| w.len)),
             inflight: Vec::with_capacity(MAX_INFLIGHT),
             parked: Vec::with_capacity(MAX_PARKED),
             parked_spare: Vec::with_capacity(MAX_PARKED),
@@ -2804,7 +2957,7 @@ impl VirtioGpu {
         if map_len == 0 || map_len > MAX_BLOB_MAP_BYTES {
             return BlobMapBegin::Failed(VirtioError::DeviceError);
         }
-        let offset = match self.alloc_window_range(map_len, window.len) {
+        let offset = match self.window.alloc(map_len) {
             Ok(o) => o,
             Err(e) => return BlobMapBegin::Failed(e),
         };
@@ -2837,7 +2990,7 @@ impl VirtioGpu {
             // must undo the host mapping (UNMAP round-trip) and then return the
             // range via `free_window_range_pub`.
             if cache.is_none() {
-                self.free_window_range(offset, len);
+                self.window.free(offset, len);
                 return BlobMapFinish::HostRejected;
             }
             return BlobMapFinish::SlotGone;
@@ -2858,7 +3011,7 @@ impl VirtioGpu {
             None => {
                 s.map_offset = 0;
                 s.map_len = 0;
-                self.free_window_range(offset, len);
+                self.window.free(offset, len);
                 BlobMapFinish::HostRejected
             }
         }
@@ -2867,18 +3020,29 @@ impl VirtioGpu {
     /// Return a window range to the allocator (PASSIVE flows that unmapped a
     /// blob outside the lock).
     pub fn free_window_range_pub(&mut self, offset: u64, len: u64) {
-        self.free_window_range(offset, len);
+        self.window.free(offset, len);
     }
 
-    /// Reserve the first `len` bytes of the host-visible window for VidMm (the
-    /// CPU-visible BAR memory segment). Called once from StartDevice, before
-    /// any blob is mapped: the KMD offset allocator starts past the partition,
-    /// and freed ranges inside it are never recycled by the KMD side.
-    pub fn reserve_window_prefix(&mut self, len: u64) {
-        self.vidmm_reserved = len;
-        if self.next_window_offset < len {
-            self.next_window_offset = len;
+    /// Install the VidMm reserve: the first `len` bytes of the host-visible
+    /// window belong to the CPU-visible BAR memory segment, so the KMD offset
+    /// allocator starts past them and freed ranges inside them are never
+    /// recycled by the KMD side.
+    ///
+    /// Legal ONLY while nothing has been issued. A second call, or one after any
+    /// blob has been mapped, is refused and counted rather than silently
+    /// stranding every offset already handed out below the new mark — those
+    /// ranges could never be recycled, because `WindowAllocator::free` returns
+    /// early for `offset < reserve`.
+    ///
+    /// Returns whether the reserve was installed.
+    pub fn configure_window_reserve(&mut self, len: u64) -> bool {
+        if !self.window.is_pristine() {
+            WINDOW_RECONFIG_REFUSED.fetch_add(1, Ordering::Relaxed);
+            return false;
         }
+        self.window.reserve = len;
+        self.window.next_offset = len;
+        true
     }
 
     /// Begin a fixed-offset (re)map of a blob at the VidMm-assigned window
@@ -2915,7 +3079,7 @@ impl VirtioGpu {
         if offset % BLOB_PAGE != 0
             || offset
                 .checked_add(map_len)
-                .map_or(true, |e| e > self.vidmm_reserved)
+                .map_or(true, |e| e > self.window.reserve)
         {
             return BlobRemapBegin::Failed(VirtioError::DeviceError);
         }
@@ -2960,7 +3124,7 @@ impl VirtioGpu {
         for s in self.blobs.iter() {
             if s.mapped
                 && s.resource_id != keep_resource_id
-                && s.map_offset < self.vidmm_reserved
+                && s.map_offset < self.window.reserve
                 && s.map_offset < end
                 && s.map_offset.saturating_add(s.map_len) > offset
             {
@@ -3049,86 +3213,12 @@ impl VirtioGpu {
     /// Point-in-time table occupancy + host-visible-window usage for
     /// `HELIOS_ESCAPE_QUERY_STATS`. Called under the device spinlock; pure reads.
     pub fn table_stats(&self) -> TableStats {
-        let free: u64 = self.free_window_ranges.iter().map(|r| r.len).sum();
         TableStats {
             blobs_live: self.blobs.len() as u32,
             resources_live: self.resources.len() as u32,
             contexts_live: self.contexts.len() as u32,
-            window_used: self.next_window_offset.saturating_sub(free),
-            window_len: self.host_visible.map_or(0, |w| w.len),
-        }
-    }
-
-    /// Allocate a page-rounded `len`-byte range in the host-visible window: reuse a
-    /// free range if one fits, else bump the high-water mark (bounded by `window_len`).
-    fn alloc_window_range(&mut self, len: u64, window_len: u64) -> Result<u64, VirtioError> {
-        if let Some(idx) = self.free_window_ranges.iter().position(|r| r.len >= len) {
-            let offset = self.free_window_ranges[idx].offset;
-            if self.free_window_ranges[idx].len == len {
-                self.free_window_ranges.swap_remove(idx);
-            } else {
-                self.free_window_ranges[idx].offset += len;
-                self.free_window_ranges[idx].len -= len;
-            }
-            return Ok(offset);
-        }
-        let offset = self.next_window_offset;
-        let end = match offset.checked_add(len) {
-            Some(e) if e <= window_len => e,
-            _ => {
-                WINDOW_ALLOC_REJECTS.fetch_add(1, Ordering::Relaxed);
-                return Err(VirtioError::OutOfMemory);
-            }
-        };
-        self.next_window_offset = end;
-        Ok(offset)
-    }
-
-    /// Return a window range to the allocator: drop the high-water mark if it abuts,
-    /// else coalesce into an adjacent free range, else record a new free range (or
-    /// silently leak if the bounded free list is full — bring-up acceptable).
-    fn free_window_range(&mut self, offset: u64, len: u64) {
-        if len == 0 {
-            return;
-        }
-        // VidMm-partition offsets are owned by VidMm's segment allocator — they
-        // must never enter the KMD free list (a later KMD-side map would collide
-        // with a VidMm placement). Every release path funnels here, so this one
-        // guard covers DestroyAllocation/ReleaseBlob/teardown of VidMm-placed
-        // blobs uniformly.
-        if offset < self.vidmm_reserved {
-            return;
-        }
-        if offset.checked_add(len) == Some(self.next_window_offset) {
-            self.next_window_offset = offset;
-            while let Some(idx) = self
-                .free_window_ranges
-                .iter()
-                .position(|r| r.offset.checked_add(r.len) == Some(self.next_window_offset))
-            {
-                let r = self.free_window_ranges.swap_remove(idx);
-                self.next_window_offset = r.offset;
-            }
-            return;
-        }
-        for range in &mut self.free_window_ranges {
-            if range.offset.checked_add(range.len) == Some(offset) {
-                range.len += len;
-                return;
-            }
-            if offset.checked_add(len) == Some(range.offset) {
-                range.offset = offset;
-                range.len += len;
-                return;
-            }
-        }
-        if self.free_window_ranges.len() < MAX_WINDOW_RANGES {
-            self.free_window_ranges.push(WindowRange { offset, len });
-        } else {
-            // Free list full: the range is dropped and its window offset space
-            // is leaked until driver restart. Counted so QUERY_STATS makes the
-            // leak visible instead of silent.
-            WINDOW_RANGE_DROPS.fetch_add(1, Ordering::Relaxed);
+            window_used: self.window.used(),
+            window_len: self.window.window_len,
         }
     }
 

@@ -1633,6 +1633,12 @@ impl AdapterContext {
             b"AbnDrop",
             crate::ddi::ABANDONED_FENCES.load(Ordering::Relaxed),
         );
+        // R619/k-gputransport-14: a nonzero value means someone tried to move the
+        // VidMm window partition after offsets had been issued.
+        crate::diag::record_named_bytes(
+            b"WnRcf",
+            crate::virtio::gpu::WINDOW_RECONFIG_REFUSED.load(Ordering::Relaxed),
+        );
         crate::diag::record_named_bytes(
             b"WtTbl",
             crate::virtio::gpu::FENCE_WAIT_TABLE_FULL.load(Ordering::Relaxed),
