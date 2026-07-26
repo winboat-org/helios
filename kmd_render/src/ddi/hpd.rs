@@ -167,6 +167,36 @@ pub unsafe extern "C" fn hpd_thread_routine(context: *mut c_void) {
         // so every SdgR* counter keeps its exact name and value.
         let _ = crate::ddi::scanout_diag::rebind_if_forced(adapter, 11);
 
+        // Drain an armed one-shot Present probe (R320). Taking the record is a
+        // quick operation under the venus mutex; the probe itself — a 5 s fence
+        // wait, a host map round-trip with 1 ms sleeps, MmMapIoSpace, ~196
+        // volatile reads and 7 registry writes — runs HERE, at PASSIVE, with no
+        // lock held and off the Present path entirely.
+        if adapter.probe_pending.swap(0, Ordering::AcqRel) != 0 {
+            let pending = adapter
+                .with_venus_client(|client| client.take_pending_probe())
+                .ok()
+                .flatten();
+            if let Some((destination, fence_id)) = pending {
+                // The probe now samples LATER than the fence retirement it waits
+                // for, so the destination may have been destroyed in between.
+                // Re-validate liveness by resource id before touching it; the
+                // record deliberately carries the id, never a raw pointer.
+                let live = adapter
+                    .with_virtio(|v| v.resource_is_live(destination.resource_id()))
+                    .unwrap_or(false);
+                if live {
+                    crate::virtio::venus::VenusClient::probe_present_destination(
+                        adapter,
+                        destination,
+                        fence_id,
+                    );
+                } else {
+                    crate::diag::record_named_bytes(b"PBPrF", 0xE6);
+                }
+            }
+        }
+
         if adapter.scanout_refresh_pending.swap(0, Ordering::AcqRel) != 0 {
             match adapter.queue_active_scanout_refresh() {
                 ScanoutRefreshQueue::Queued => {}

@@ -265,6 +265,10 @@ pub struct AdapterContext {
     /// The persistent venus 3D context id (`VIRTIO_GPU_CAPSET_VENUS`) the venus
     /// client rides, created in StartDevice and destroyed in StopDevice. `0` = none.
     pub venus_ctx_id: u32,
+    /// A one-shot Present destination probe is armed inside the venus client and
+    /// waiting for the PASSIVE display worker to drain it (R320). Only ever set
+    /// when the `PresentProbe` knob is on.
+    pub probe_pending: AtomicU32,
     /// `AllocCached` service-key knob (read once in StartDevice; default 1).
     /// When set, CpuVisible allocations are additionally flagged `Cached` so
     /// dxgkrnl maps CPU views write-back instead of write-combined. The BAR
@@ -491,6 +495,7 @@ impl AdapterContext {
             // `init_kernel_events` once the context is at its final address.
             venus_mutex: UnsafeCell::new(unsafe { core::mem::zeroed() }),
             venus_ctx_id: 0,
+            probe_pending: AtomicU32::new(0),
             alloc_cached: true,
             present_probe: false,
             display_half: false,

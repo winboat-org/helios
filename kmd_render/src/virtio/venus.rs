@@ -425,6 +425,12 @@ pub struct PresentBufferDesc {
 }
 
 impl PresentBufferDesc {
+    /// The venus resource this destination names. Used by the deferred probe to
+    /// re-validate liveness before sampling (R320).
+    pub fn resource_id(&self) -> u32 {
+        self.resource_id
+    }
+
     pub fn new(
         resource_id: u32,
         allocation_size: u64,
@@ -555,6 +561,15 @@ struct PreparedPresentBlt {
 const MAX_PRESENT_IMAGES: usize = 32;
 const MAX_PRESENT_BUFFERS: usize = 16;
 const MAX_PRESENT_BLITS: usize = 32;
+/// Submissions a source/destination pair must complete before the one-shot
+/// destination probe is armed for it (`PresentProbe` knob only).
+///
+/// 8 rather than 1 because the first submissions of a pair are the ones most
+/// likely to race DWM's own surface churn: an early sample can catch the
+/// destination between the allocation being opened and the first copy actually
+/// retiring, which reads as "the copy did not populate the destination" when
+/// nothing is wrong. By the 8th submission the pair is steady state.
+const PRESENT_PROBE_AFTER_SUBMITS: u32 = 8;
 /// Every owned memory blob is also tracked by VirtioGpu's bounded blob table,
 /// so the transport's capacity is an exact upper bound rather than a second,
 /// divergent resource limit.
@@ -867,6 +882,16 @@ pub struct VenusClient {
     next_handle: u64,
     /// The persistent venus 3D context id all commands ride.
     ctx_id: u32,
+    /// One-shot destination probe ARMED but not yet run (R320). The probe is a
+    /// blocking PASSIVE diagnostic — a 5 s fence wait, a host map round-trip
+    /// with 1 ms Busy sleeps, MmMapIoSpace, ~196 volatile reads and 7 registry
+    /// writes — and it used to run inside `submit_present_blt`, i.e. on the
+    /// Present path with the adapter venus mutex HELD. Since the one-shot is per
+    /// source/destination PAIR, a session with the knob enabled could pay that
+    /// up to MAX_PRESENT_BLITS times, each a potential multi-second stall of the
+    /// compositor. It is now recorded here and drained by the PASSIVE display
+    /// worker outside the mutex.
+    probe_pending: Option<(PresentBufferDesc, u64)>,
     /// venus instance handle.
     instance_id: u64,
     /// venus device handle.
@@ -3989,7 +4014,10 @@ impl VenusClient {
             let blt = &mut self.present_blits[blt_index];
             blt.last_wire_fence_id = fence_id;
             blt.submit_count = blt.submit_count.saturating_add(1);
-            if adapter.present_probe && blt.submit_count >= 8 && !blt.probe_done {
+            if adapter.present_probe
+                && blt.submit_count >= PRESENT_PROBE_AFTER_SUBMITS
+                && !blt.probe_done
+            {
                 // Claim the one-shot before doing any fallible work. Even a
                 // failed diagnostic can therefore never turn into a recurring
                 // Present-path stall.
@@ -4001,17 +4029,30 @@ impl VenusClient {
         };
         if run_probe {
             if let PresentDestinationDesc::StandardBuffer(destination) = destination {
-                Self::probe_present_destination(adapter, destination, fence_id);
+                // ARM ONLY. The probe itself runs on the PASSIVE display worker,
+                // outside this mutex and off the Present path (R320).
+                self.probe_pending = Some((destination, fence_id));
+                adapter
+                    .probe_pending
+                    .store(1, core::sync::atomic::Ordering::Release);
             }
         }
         Ok(fence_id)
+    }
+
+    /// Take the armed one-shot probe, if any. Called under the venus mutex by
+    /// the PASSIVE worker, which then runs the probe outside it.
+    pub fn take_pending_probe(&mut self) -> Option<(PresentBufferDesc, u64)> {
+        self.probe_pending.take()
     }
 
     /// One-shot diagnostic proving whether the completed Vulkan copy populated
     /// dxgkrnl's host-visible Present destination. This is deliberately not a
     /// correctness mechanism: all failures are loud breadcrumbs, and the
     /// caller's per-pair `probe_done` bit prevents retry loops.
-    fn probe_present_destination(
+    ///
+    /// PASSIVE_LEVEL, and MUST NOT be called with the venus mutex held.
+    pub(crate) fn probe_present_destination(
         adapter: &AdapterContext,
         destination: PresentBufferDesc,
         fence_id: u64,
@@ -4693,6 +4734,7 @@ pub fn allocate_host_visible_blob(
         present_images: Vec::with_capacity(MAX_PRESENT_IMAGES),
         present_buffers: Vec::with_capacity(MAX_PRESENT_BUFFERS),
         present_blits: Vec::with_capacity(MAX_PRESENT_BLITS),
+        probe_pending: None,
         owned_memory_blobs: Vec::with_capacity(MAX_OWNED_MEMORY_BLOBS),
     };
 
