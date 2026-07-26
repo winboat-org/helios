@@ -243,6 +243,12 @@ static int query_scanout(struct helios_escape_query_scanout* qs) {
 
 int main(int argc, char** argv) {
     int destructive = (argc > 1 && strcmp(argv[1], "--attack") == 0);
+    /* Optional explicit victim resource id for test 4. QUERY_SCANOUT only
+       reports the KMD-owned LINEAR direct primary, which may not be published;
+       the service key's ScRid (the ACTIVE scanout resource) is the other live,
+       KMD-adopted (owner-0) blob behind the desktop, and is the same class of
+       target. */
+    UINT victim = (argc > 2) ? (UINT)strtoul(argv[2], NULL, 0) : 0;
     UINT ctx_a = 0;
     if (open_helios(&ctx_a) != 0) {
         return 1;
@@ -274,26 +280,31 @@ int main(int argc, char** argv) {
     } else {
         /* --- 4. owner==0 RELEASE_BLOB against the live DWM primary --- */
         struct helios_escape_query_scanout sc;
-        if (query_scanout(&sc) == 0 && sc.out_resource_id != 0) {
+        int have_scanout = (query_scanout(&sc) == 0 && sc.out_resource_id != 0);
+        if (have_scanout) {
+            victim = sc.out_resource_id;
+        }
+        if (victim != 0) {
             struct helios_escape_release_blob rb;
             memset(&rb, 0, sizeof(rb));
             hdr_init(&rb.hdr, HELIOS_ESCAPE_RELEASE_BLOB, sizeof(rb));
             rb.ctx_id = ctx_a; /* nonzero: the KMD rejects ctx_id 0 outright */
-            rb.resource_id = sc.out_resource_id;
+            rb.resource_id = victim;
             st = escape_on(0 /* hDevice = NULL: the forged owner */, &rb, sizeof(rb));
-            printf("owner=0 RELEASE_BLOB(primary resid=%u) st=0x%08x %s\n", sc.out_resource_id,
+            printf("owner=0 RELEASE_BLOB(live resid=%u) st=0x%08x %s\n", victim,
                    (unsigned)st,
                    st == STATUS_INVALID_PARAMETER ? "(PASS: refused)"
                                                   : "(FAIL: the KMD accepted a forged owner)");
             struct helios_escape_query_scanout after_sc;
-            if (query_scanout(&after_sc) == 0) {
+            if (have_scanout && query_scanout(&after_sc) == 0) {
                 printf("primary after attack   resid=%u %s\n", after_sc.out_resource_id,
                        after_sc.out_resource_id == sc.out_resource_id
                            ? "(PASS: unchanged)"
                            : "(FAIL: the primary was destroyed)");
             }
         } else {
-            printf("no live primary published; skipping the owner=0 attack\n");
+            printf("no victim resource id (pass one as argv[2], e.g. the service key's "
+                   "ScRid); skipping the owner=0 attack\n");
         }
 
         /* --- 5. cross-device CTX_DESTROY --- */

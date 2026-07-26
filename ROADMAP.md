@@ -108,26 +108,45 @@ virtio-gpu scanout; IddCx/Looking Glass is no longer the active display path.*
    the scanout mutex and at ONE rate, `n==1 || n%600==0` (was `n%16`), so the provocation
    must be long enough to cross the period** — a 25 s `helios_dcomp_probe` run (~1250
    refreshes at ~50 fps) crosses it twice.
-4. **NEXT — T1b** (`REFACTOR_REVIEW.md` §T1b): 30 items, R301–R320 + ten minor items, one KMD
-   image and one reboot. Two halves, and the ordering between them is load-bearing: **every bug
-   commit precedes every telemetry commit**, so the before/after cadence numbers are taken against
-   a functionally known-good driver rather than one being fixed at the same time.
-   (a) Trust-boundary and status-contract fixes, 13 of them `BUG` — RenderGdi runs the raster
-   executor *before* its DMA-capacity check so a `STATUS_BUFFER_TOO_SMALL` retry re-applies
-   non-idempotent ROPs (R301); BuildPagingBuffer reports SUCCESS after a failed page-in or eviction
-   copy (R302); a registry flush sits on a DISPATCH-reachable path (R307); escape `owner == 0`
-   still means "KMD-owned" and CTX_DESTROY/SUBMIT_VENUS are not owner-scoped (R311 = 2 ordered
-   sub-commits, R312 = 3 — the first of each sizes the population before the strict check lands);
-   the primary scanout descriptor is published and read without a seqlock (R313).
-   (b) Telemetry cost — **R316 removes 77 unconditional `rec_named` registry writes from
-   `dxgkddi_present_inner`** (30–60 synchronous `RtlWriteRegistryValue` calls per Present), with the
-   same ungated dump pattern per aperture map and per paging content op (R317). A plausible
-   contributor to the DComp defect above, which is why the gate measures present-to-scanout and VNC
-   delivery separately, before and after.
-   Constraints: **no counter, breadcrumb or registry-value renames** — R316/R317 change write
-   *cadence* only; and R316's third throttled channel must not reclassify anything T1a made a
-   `FaultCounter` (those stay ungated and unthrottled). Several items are pure functions that
-   belong in T0's `kmd_logic/` crate, which is where their unit tests go.
+4. **T1b LANDED — gate PASSED (2026-07-26, KMD `22.22.180.0`, 24 commits).** Both halves in one
+   image, bug commits before telemetry commits so the cadence numbers were taken against a
+   functionally known-good driver.
+   **⚠ SCOPE CHANGE, owner directive: the GDI path is RETIRED, not hardened.** Helios does not and
+   should not advertise GDI acceleration, so T6's `R903`/`x-dup-dead-20` was pulled forward:
+   `SupportKernelModeCommandBuffer` is hard-coded 0, the `GdiAccelMode` knob is gone, and
+   `gdi_blit.rs` (819 lines: batch parser, `MmMapIoSpace` view cache, six CPU rasterizers) is
+   deleted. **T1b's R301/R304/R305/R306 died with it** — all four only hardened that executor.
+   Reachability was re-proven the same boot BEFORE deleting: every `Gd*` service value deleted,
+   then explorer restart + maximized notepad + GDI canary + repaint + EnumWindows + two paintcaps,
+   and **not one reappeared** (the executor flushed its block on its first batch, so absence is
+   proof, not throttling).
+   Landed: R302 (`PagingOpOutcome` + one `paging_failure()`; the crate's last `STATUS_UNSUCCESSFUL`
+   is gone), R303 (`MdlWindow` bounds the eviction WRITE side), R307, R308 (`MetaLayout` per-arm
+   trailer), R309 (one aperture validator, refusal handling split by IRQL), R310, R311 + R312
+   (`DeviceOwner(NonZeroUsize)`; context tracking now reserve-then-commit so the owner check is
+   authoritative), R313 (seqlock, bounded retry), R314/R315/M10 (QUERY_STATS **V3**, appended),
+   R316–R320, and M1–M8/M10. Five new host-tested `kmd_logic` helpers (`window_range`, `Pfn`,
+   `MetaLayout`, `seq_read`, + tests): **17 tests green**.
+   **Gate evidence, all same boot:** cold boot → `CM_PROB_NONE` on `22.22.180.0`, visible desktop;
+   3 × `pnputil /restart-device` all rebind `CM_PROB_NONE` (the R903 cap change is the one that
+   could have reproduced FAILED_ADD). Every fault counter 0; every new refusal counter 0/absent
+   **except the two deliberately provoked**. Attacks (`tools/escape_owner_probe.c --attack`):
+   owner==0 `RELEASE_BLOB` against the live scanout resource → `0xc000000d` refused, `EscNoDev` +1,
+   `blobs_live` unchanged, **DWM alive**; cross-device `CTX_DESTROY` → `0xc0000010` refused,
+   `EscCtxOwn` +1, while the owner's own `CTX_DESTROY` still succeeds; bad magic and verb `0x0007`
+   each +1. `DiagLevel=0` still shows `StVio`/`StBar`/`PgTs`/`PgTd`/`BAR_ERR_*`; every `PB*` name
+   still present at its sampled cadence (`PBcall` steps in exact 600s), and `DiagLevel=1` restores
+   per-call (`PBcall` 610→904 in 6 s). R320 proven live — `PresentProbe` is ON on this box and the
+   DEFERRED probe still reaches `PBPrF=16` with `PBPrNz=64 PBPrSum=12616`.
+   **Measured, same procedure before and after:** DComp **46.6 / 46.5 → 51.6 / 49.2 fps**; dwm
+   present-gate **avg 2241 → 1407 µs**, timeouts **844/14464 (5.8 %) → 87/6784 (1.3 %)**.
+   **⚠ NOT PROVEN — the paging/eviction half never ran.** `PgTi`/`PgTo` are 0 for the whole boot:
+   VidMm evicted nothing (Fire Strike was killed mid-run by the owner and its relaunch lost its
+   controller), so R302/R303/M8's new failure paths are **unexercised on hardware** — the zeros
+   prove no regression, not that the new refusals behave. Same for R309's DISPATCH arm (`ChMc`=0:
+   no aperture maps this boot). Next session should force real eviction pressure (a completed Fire
+   Strike run plus a working-set larger than the 1 GiB BAR partition) before trusting them.
+   Cursor-trail check not performed (needs interactive mouse input).
 5. Implement the remaining reviewed refactors atomically, in tranche order, one recommendation
    per commit; never fold a `BUG` fix into a structure move. Preserve the current direct
    primary, completion ordering, loud-failure contracts, registry ABI, and
