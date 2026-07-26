@@ -301,9 +301,16 @@ unsafe fn log_backtrace(tag: &str) {
 }
 
 /// No-op DDI stub: returns 0 (S_OK for HRESULT funcs; ignored for void funcs).
+///
+/// The counter is the WS3 "drive noop-DDI hit counts to zero" metric and stays
+/// unconditional. Only the I/O is gated: this used to do a heap-allocating
+/// `format!` plus an unbuffered write under the process-global log mutex from
+/// inside the runtime's call — and the very first hit additionally captured and
+/// formatted 32 stack frames through `RtlCaptureStackBackTrace` — none of it
+/// behind `trace_enabled()`, unlike the rest of the repeat traffic.
 unsafe extern "C" fn ddi_noop_device(_a: usize) -> usize {
     let n = DEVICE_NOOP_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-    if n < 512 {
+    if n < 512 && crate::trace_enabled() {
         if n == 0 {
             log_backtrace("DDI noop(device)");
         } else {
@@ -315,9 +322,15 @@ unsafe extern "C" fn ddi_noop_device(_a: usize) -> usize {
 
 /// DXGI base no-op DDI stub. Kept separate so Present-adjacent missing funcs are
 /// distinguishable from D3D11 device-func misses.
+///
+/// PROVEN DEAD (T2 R419, name-diffed against the generated structs):
+/// `install_dxgi`, `install_dxgi_1_1` and `install_dxgi_1_3` overwrite all
+/// 7 / 8 / 18 slots of every DXGI table, so no slot is left pointing here. The
+/// deletion belongs to T6, which owns deletions; this comment records the proof
+/// so the next reader does not re-derive it.
 unsafe extern "C" fn ddi_noop_dxgi(_a: usize) -> usize {
     let n = DXGI_NOOP_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-    if n < 256 {
+    if n < 256 && crate::trace_enabled() {
         if n == 0 {
             log_backtrace("DDI noop(dxgi)");
         } else {
@@ -380,7 +393,7 @@ unsafe extern "C" fn ddi_relocate_device_funcs_wddm2_1(
 
 unsafe fn audit_wddm1_3_device_funcs(tag: &str, funcs: *mut ddi::D3DWDDM1_3DDI_DEVICEFUNCS) {
     let hit = WDDM13_TABLE_AUDIT_COUNT.fetch_add(1, Ordering::Relaxed);
-    if hit >= 32 {
+    if hit >= 32 || !crate::trace_enabled() {
         return;
     }
 
@@ -431,7 +444,7 @@ unsafe fn audit_wddm1_3_device_funcs(tag: &str, funcs: *mut ddi::D3DWDDM1_3DDI_D
 
 unsafe fn audit_dxgi_1_3_base_funcs(tag: &str, funcs: *mut ddi::DXGI1_3_DDI_BASE_FUNCTIONS) {
     let hit = DXGI13_TABLE_AUDIT_COUNT.fetch_add(1, Ordering::Relaxed);
-    if hit >= 32 {
+    if hit >= 32 || !crate::trace_enabled() {
         return;
     }
 
