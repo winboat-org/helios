@@ -3318,6 +3318,36 @@ unsafe extern "C" fn resource_map(
     }
 }
 
+/// `pfnDynamicConstantBufferMapNoOverwrite`, which exists only in
+/// `D3D11_1DDI_DEVICEFUNCS` and later. Its PFN type is `PFND3D10DDI_RESOURCEMAP`
+/// — the same shape as `pfnDynamicIABufferMapNoOverwrite`, which `install()`
+/// already points at `resource_map` — and `D3D10_DDI_MAP_WRITE_NOOVERWRITE`
+/// equals `D3D11_MAP_WRITE_NO_OVERWRITE` (4), so no-overwrite semantics reach
+/// DXVK unchanged.
+///
+/// The wrapper exists only to make the slot's first use measurable: it spent
+/// its life on `ddi_noop_device`, a stub that returns without touching the
+/// caller's `D3D10DDI_MAPPED_SUBRESOURCE` even though filling it is this
+/// slot's entire job.
+unsafe extern "C" fn dynamic_cb_map_no_overwrite(
+    h: Hdevice,
+    h_resource: ddi::D3D10DDI_HRESOURCE,
+    subresource: u32,
+    map_type: ddi::D3D10_DDI_MAP,
+    map_flags: u32,
+    mapped: *mut ddi::D3D10DDI_MAPPED_SUBRESOURCE,
+) {
+    static FIRST_HIT: AtomicUsize = AtomicUsize::new(0);
+    if FIRST_HIT.fetch_add(1, Ordering::Relaxed) == 0 {
+        trace_line!(
+            "DDI DynamicConstantBufferMapNoOverwrite: first hit sub={} map={}",
+            subresource,
+            map_type
+        );
+    }
+    resource_map(h, h_resource, subresource, map_type, map_flags, mapped);
+}
+
 unsafe extern "C" fn resource_unmap(
     h: Hdevice,
     h_resource: ddi::D3D10DDI_HRESOURCE,
@@ -10455,6 +10485,13 @@ pub unsafe fn install_11_1(funcs: *mut ddi::D3D11_1DDI_DEVICEFUNCS) {
     f.pfnResourceUpdateSubresourceUP = Some(resource_update_subresource_11_1);
     f.pfnDefaultConstantBufferUpdateSubresourceUP = Some(resource_update_subresource_11_1);
     f.pfnDiscard = Some(discard_11_1);
+    // Only >=11.1 tables have this slot, so `install()` (written against the
+    // 11.0 shape) cannot set it and it was left on the uniform no-op stub.
+    // Nothing gated it either: D3D11_1DDI_D3D11_OPTIONS_DATA carries only
+    // OutputMergerLogicOp and AssignDebugBinarySupport, so every >=11.1 device
+    // — dwm negotiates WDDM1.3 — exposed the feature with a handler that never
+    // wrote the caller's MAPPED_SUBRESOURCE.
+    f.pfnDynamicConstantBufferMapNoOverwrite = Some(dynamic_cb_map_no_overwrite);
     f.pfnCheckDirectFlipSupport = Some(check_direct_flip_support_11_1);
     f.pfnClearView = Some(clear_view_11_1);
     // The >=11.1 tables pass D3D11_1_DDI_BLEND_DESC (LogicOpEnable/LogicOp
