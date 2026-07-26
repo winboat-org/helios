@@ -2940,10 +2940,10 @@ unsafe extern "C" fn create_rtv(
         let allocation = resource_allocation(a.hDrvResource.pDrvPrivate);
         let (width, height) = resource_dimensions(a.hDrvResource.pDrvPrivate);
         if n < 128 {
-            log_line(&format!(
+            trace_line!(
                 "DDI create_rtv ok: dim={} fmt={} alloc=0x{:x} {}x{}",
                 a.ResourceDimension, a.Format, allocation, width, height
-            ));
+            );
         }
         store_rtv(
             h_rtv.pDrvPrivate,
@@ -3132,10 +3132,10 @@ unsafe extern "C" fn create_dsv(
     finish_create(h, created, dsv, |v| {
         let n = VIEW_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
         if n < 128 {
-            log_line(&format!(
+            trace_line!(
                 "DDI create_dsv ok: dim={} fmt={} flags=0x{:x}",
                 a.ResourceDimension, a.Format, a.Flags
-            ));
+            );
         }
         store_com(h_dsv.pDrvPrivate, v);
     });
@@ -4603,7 +4603,7 @@ unsafe extern "C" fn vs_set_shader(h: Hdevice, h_shader: ddi::D3D10DDI_HSHADER) 
     }
     let n = SHADER_SET_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
     if n < 512 {
-        log_line(&format!("DDI VSSetShader raw=0x{com:x}"));
+        trace_line!("DDI VSSetShader raw=0x{com:x}");
     }
     let Some(context) = d3d11_context(h) else {
         return;
@@ -4621,7 +4621,7 @@ unsafe extern "C" fn ps_set_shader(h: Hdevice, h_shader: ddi::D3D10DDI_HSHADER) 
     }
     let n = SHADER_SET_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
     if n < 512 {
-        log_line(&format!("DDI PSSetShader raw=0x{com:x}"));
+        trace_line!("DDI PSSetShader raw=0x{com:x}");
     }
     let Some(context) = d3d11_context(h) else {
         return;
@@ -4639,7 +4639,7 @@ unsafe extern "C" fn gs_set_shader(h: Hdevice, h_shader: ddi::D3D10DDI_HSHADER) 
     }
     let n = SHADER_SET_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
     if n < 512 {
-        log_line(&format!("DDI GSSetShader raw=0x{com:x}"));
+        trace_line!("DDI GSSetShader raw=0x{com:x}");
     }
     let Some(context) = d3d11_context(h) else {
         return;
@@ -4657,7 +4657,7 @@ unsafe extern "C" fn hs_set_shader(h: Hdevice, h_shader: ddi::D3D10DDI_HSHADER) 
     }
     let n = SHADER_SET_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
     if n < 512 {
-        log_line(&format!("DDI HSSetShader raw=0x{com:x}"));
+        trace_line!("DDI HSSetShader raw=0x{com:x}");
     }
     let Some(context) = d3d11_context(h) else {
         return;
@@ -4675,7 +4675,7 @@ unsafe extern "C" fn ds_set_shader(h: Hdevice, h_shader: ddi::D3D10DDI_HSHADER) 
     }
     let n = SHADER_SET_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
     if n < 512 {
-        log_line(&format!("DDI DSSetShader raw=0x{com:x}"));
+        trace_line!("DDI DSSetShader raw=0x{com:x}");
     }
     let Some(context) = d3d11_context(h) else {
         return;
@@ -4693,7 +4693,7 @@ unsafe extern "C" fn cs_set_shader(h: Hdevice, h_shader: ddi::D3D10DDI_HSHADER) 
     }
     let n = SHADER_SET_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
     if n < 512 {
-        log_line(&format!("DDI CSSetShader raw=0x{com:x}"));
+        trace_line!("DDI CSSetShader raw=0x{com:x}");
     }
     let Some(context) = d3d11_context(h) else {
         return;
@@ -4906,15 +4906,15 @@ unsafe extern "C" fn set_viewports(
     let n = VIEWPORT_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
     if n < 64 || num == 0 {
         if let Some(v) = out.first() {
-            log_line(&format!(
+            trace_line!(
                 "DDI RSSetViewports num={} clear={} first=({},{} {}x{} depth={:.3}..{:.3})",
                 num, _clear, v.TopLeftX, v.TopLeftY, v.Width, v.Height, v.MinDepth, v.MaxDepth
-            ));
+            );
         } else {
-            log_line(&format!(
+            trace_line!(
                 "DDI RSSetViewports num={} clear={} empty",
                 num, _clear
-            ));
+            );
         }
     }
     context.RSSetViewports(Some(&out));
@@ -4944,17 +4944,17 @@ unsafe extern "C" fn set_scissor_rects(
     let n = SCISSOR_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
     if n < 64 || num == 0 {
         if let Some(r) = out.first() {
-            log_line(&format!(
+            trace_line!(
                 "DDI RSSetScissorRects num={} clear={} first=({},{}-{}, {})",
                 num, _clear, r.left, r.top, r.right, r.bottom
-            ));
+            );
         } else {
-            log_line(&format!(
+            trace_line!(
                 "DDI RSSetScissorRects num={} clear={} empty rects_null={}",
                 num,
                 _clear,
                 rects.is_null()
-            ));
+            );
         }
     }
     context.RSSetScissorRects(Some(&out));
@@ -4968,7 +4968,7 @@ unsafe extern "C" fn ia_set_topology(h: Hdevice, topo: ddi::D3D10_DDI_PRIMITIVE_
     }
     let n = IA_BIND_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
     if n < 64 {
-        log_line(&format!("DDI IASetTopology topo={}", topo as u32));
+        trace_line!("DDI IASetTopology topo={}", topo as u32);
     }
     if let Some(context) = d3d11_context(h) {
         context.IASetPrimitiveTopology(windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY(
@@ -5285,10 +5285,10 @@ unsafe extern "C" fn set_rasterizer_state(h: Hdevice, h_rs: ddi::D3D10DDI_HRASTE
     };
     let n = RASTER_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
     if n < 128 {
-        log_line(&format!(
+        trace_line!(
             "DDI RSSetState raw=0x{:x}",
             handle_com_raw(h_rs.pDrvPrivate)
-        ));
+        );
     }
     match load_com::<ID3D11RasterizerState>(h_rs.pDrvPrivate) {
         Some(s) => context.RSSetState(&*s),
@@ -5399,10 +5399,10 @@ unsafe extern "C" fn create_srv(
         let n = SRV_CREATE_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
         if n < 1024 || allocation != 0 {
             let (width, height) = resource_dimensions(a.hDrvResource.pDrvPrivate);
-            log_line(&format!(
+            trace_line!(
                 "DDI create_srv ok: hpriv={:p} alloc=0x{:x} dim={} fmt={} {}x{}",
                 h_srv.pDrvPrivate, allocation, a.ResourceDimension, a.Format, width, height
-            ));
+            );
         }
         store_com(h_srv.pDrvPrivate, v);
     });
@@ -5655,12 +5655,12 @@ unsafe extern "C" fn create_uav(
     finish_create(h, created, uav, |v| {
         let n = VIEW_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
         if n < 256 {
-            log_line(&format!(
+            trace_line!(
                 "DDI create_uav ok: dim={} fmt={} alloc=0x{:x}",
                 a.ResourceDimension,
                 a.Format,
                 resource_allocation(a.hDrvResource.pDrvPrivate)
-            ));
+            );
         }
         store_com(h_uav.pDrvPrivate, v);
     });
@@ -6123,10 +6123,10 @@ unsafe fn set_constant_buffers1_common(
         } else {
             *num_constants
         };
-        log_line(&format!(
+        trace_line!(
             "DDI {stage}SetConstantBuffers1 start={} num={} first_ptr={} count_ptr={} first0={} count0={}",
             start, num, !first_constants.is_null(), !num_constants.is_null(), first0, count0
-        ));
+        );
     }
     match stage {
         "VS" => c.VSSetConstantBuffers1(start, num, buffers_ptr, first_ptr, count_ptr),
@@ -6228,10 +6228,10 @@ unsafe fn set_shader_resources_common(
     let (nonnull, missing, first_raw, first_priv) = srv_bind_summary(num, srvs);
     let n = SRV_BIND_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
     if n < 2048 || missing != 0 {
-        log_line(&format!(
+        trace_line!(
             "DDI {stage}SetShaderResources start={} num={} nonnull={} missing={} first_raw=0x{:x} first_priv={:p}",
             start, num, nonnull, missing, first_raw, first_priv
-        ));
+        );
     }
     match stage {
         "VS" => c.VSSetShaderResources(start, Some(&views)),
@@ -8362,10 +8362,10 @@ unsafe extern "C" fn ia_set_vertex_buffers(
             .and_then(|b| b.as_ref())
             .map(|b| b.as_raw() as usize)
             .unwrap_or(0);
-        log_line(&format!(
+        trace_line!(
             "DDI IASetVertexBuffers start={} num={} first=0x{:x} stride={} offset={}",
             start, num, first_raw, first_stride, first_offset
-        ));
+        );
     }
     context.IASetVertexBuffers(
         start,
@@ -8394,12 +8394,12 @@ unsafe extern "C" fn ia_set_index_buffer(
     }
     let n = IA_BIND_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
     if n < 128 {
-        log_line(&format!(
+        trace_line!(
             "DDI IASetIndexBuffer raw=0x{:x} fmt={} offset={}",
             buf.as_ref().map(|b| b.as_raw() as usize).unwrap_or(0),
             format as u32,
             offset
-        ));
+        );
     }
     context.IASetIndexBuffer(buf.as_ref(), DXGI_FORMAT(format as i32), offset);
 }
