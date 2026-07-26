@@ -223,7 +223,24 @@ const PAGE_TABLE_ALLOC_SIZE: u64 = 16 * 1024 * 1024;
 const RING_SPIN_BURST: u32 = 50_000;
 /// PASSIVE wait budget for the ring head advancing past a published seqno
 /// (1 ms sleep-polls). A host that has not consumed the ring in this long is
-/// genuinely wedged → the client latches `fatal`.
+/// genuinely wedged → the client latches `fatal` ([`FatalReason`]).
+///
+/// ⚠ OPEN OWNER QUESTION (T4a/R603) — the value is NOT derived from a dxgkrnl
+/// deadline, and it is deliberately separate from the 5 s budget every host
+/// *fence* wait in this file uses. This wait is reachable from `DxgkDdiPresent`
+/// (`ddi/display.rs` → `submit_present_blt` → `ensure_present_image` →
+/// `ring_command_reply` → `write_to_ring` → here) while the adapter venus mutex
+/// is held, so a caller can in principle block a Present for half a minute —
+/// which is several times the Windows default `TdrDdiDelay`, the interval after
+/// which dxgkrnl declares a driver hung. If that is right, a real wedge is
+/// TDR'd long before this budget expires and the constant bounds post-TDR
+/// thread residency rather than preventing a hang.
+///
+/// It is left at 30 s and NOT shortened here: a bounded wait on a real ring-head
+/// watermark is a safety contract, and shortening it without measuring how long
+/// a legitimately slow host actually takes would trade a rare stall for a
+/// frequent false fatal latch. `VnRingWd` now records the milliseconds actually
+/// waited at every expiry, which is the measurement that has to come first.
 const RING_WAIT_TIMEOUT_MS: u64 = 30_000;
 
 // The command-stream writer and its capacity live in `helios_kmd_logic`: they
