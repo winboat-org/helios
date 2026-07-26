@@ -40,6 +40,29 @@ use crate::adapter::AdapterContext;
 use crate::dxgk::*;
 use crate::virtio::ctrl;
 
+/// Ownership-bearing escape verbs refused because `hDevice` was NULL
+/// (registry-visible as `EscNoDev`).
+///
+/// NULL collides with the kernel's owner-0 "KMD-owned" sentinel, so accepting it
+/// let a caller name blob slots the KMD adopted for live WDDM allocations — the
+/// DWM primary and every shared UMD surface. No in-tree caller does this: the
+/// Mesa ICD always sets `esc.hDevice`, and dxgkrnl resolves a non-zero handle in
+/// the caller's own process handle table, so it cannot be forged across
+/// processes. This must read 0 in normal operation.
+static ESCAPE_NO_DEVICE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Refuse an ownership-bearing verb that arrived with no device handle.
+fn refuse_no_device() -> NTSTATUS {
+    use core::sync::atomic::Ordering;
+    let n = ESCAPE_NO_DEVICE.fetch_add(1, Ordering::Relaxed) + 1;
+    // PASSIVE (DxgkDdiEscape); first occurrence plus every 64th, so a caller
+    // cannot turn a refusal into a registry-write storm.
+    if n == 1 || n % 64 == 0 {
+        crate::diag::record_named_bytes(b"EscNoDev", n);
+    }
+    STATUS_INVALID_PARAMETER
+}
+
 pub unsafe extern "C" fn dxgkddi_escape(
     h_adapter: *mut c_void,
     escape: *const DXGKARG_ESCAPE,
@@ -72,6 +95,13 @@ pub unsafe extern "C" fn dxgkddi_escape(
     // one we returned from DxgkDdiCreateDevice) as `hDevice`, and hands the SAME
     // handle to DxgkDdiDestroyDevice — so a mapping tagged with it is unmapped at
     // the right time, in the creating process. Blob verbs require a device handle.
+    //
+    // ZERO IS NOT A NEUTRAL VALUE. It is the kernel's "KMD/allocation-owned,
+    // removed from every escape reclaim path" sentinel: `adopt_blob_for_allocation`
+    // re-tags a blob with owner 0 when the KMD takes it over for a WDDM
+    // allocation. `hDevice` is optional at the D3DKMTEscape API, so NULL is the
+    // one owner value a caller can forge — and it collides with that sentinel,
+    // which is why each ownership-bearing verb rejects it below (k-capsescape-01).
     let owner = args.hDevice as usize;
 
     match hdr.cmd_type {
@@ -384,6 +414,9 @@ fn escape_ctx_create(adapter: &AdapterContext, buf: &mut [u8], owner: usize) -> 
     if buf.len() < sz {
         return STATUS_BUFFER_TOO_SMALL;
     }
+    if owner == 0 {
+        return refuse_no_device();
+    }
     let req: HeliosEscapeCtxCreate = pod_read_unaligned(&buf[..sz]);
     match ctrl::ctx_create(adapter, req.capset_id, owner) {
         Ok(ctx_id) => {
@@ -492,6 +525,12 @@ fn escape_alloc_blob(adapter: &AdapterContext, buf: &mut [u8], owner: usize) -> 
     if buf.len() < sz {
         return STATUS_BUFFER_TOO_SMALL;
     }
+    if owner == 0 {
+        // An owner-0 blob would be tagged KMD-owned: invisible to the per-device
+        // reclaim sweep, holding a MAX_BLOBS slot until StopDevice's
+        // release_blobs_for_owner(0) tears the transport down.
+        return refuse_no_device();
+    }
     let req: HeliosEscapeAllocBlob = pod_read_unaligned(&buf[..sz]);
     // DIAG: 0x0E04_HHHH = ALLOC_BLOB's owning handle (low 16 bits), to confirm it
     // matches the handle DxgkDdiDestroyDevice reclaims under (0x0E01_HHHH).
@@ -584,6 +623,14 @@ fn escape_release_blob(adapter: &AdapterContext, buf: &[u8], owner: usize) -> NT
     let sz = size_of::<HeliosEscapeReleaseBlob>();
     if buf.len() < sz {
         return STATUS_BUFFER_TOO_SMALL;
+    }
+    if owner == 0 {
+        // THE ONE THAT DESTROYS STATE: an owner-0 RELEASE_BLOB matches a slot the
+        // KMD adopted for a live WDDM allocation, pops it, and runs
+        // RESOURCE_UNMAP_BLOB + take_live_resource + resource_unref behind the
+        // allocation's back — DestroyAllocation then finds nothing and the host
+        // logs "invalid res_id" (the boot-#3 DWM kill class).
+        return refuse_no_device();
     }
     let req: HeliosEscapeReleaseBlob = pod_read_unaligned(&buf[..sz]);
     if req.ctx_id == 0 || req.resource_id == 0 {
