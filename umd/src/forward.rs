@@ -8629,6 +8629,63 @@ unsafe fn present_prerequisites(
     })
 }
 
+/// Outcome of the bounded frame gate. `#[must_use]` because `dxgi_present1`'s
+/// multi arm silently discarded the boolean this replaces.
+///
+/// "Did not confirm completion", not "timed out": `present_frame_gate` also
+/// returns false when the bridge impl/context is missing or an exception was
+/// caught, so a nonzero count folds those in.
+#[must_use]
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum GateOutcome {
+    Completed,
+    NotConfirmed,
+}
+
+/// Frame-gate non-confirmations on EVERY path. `EXT_FLIP_GATE_TIMEOUTS` is
+/// conditioned on `is_vehicle_present`, so an expiry on the direct-primary
+/// path — the one that ships — incremented nothing and logged nothing, and the
+/// only trace was the aggregated C++ `present-gate: ... timeouts=` line every
+/// 128 presents. A gate expiry means the present is published while DXVK still
+/// has queued work: exactly the producer race the gate exists to close, so a
+/// steady-state expiry was indistinguishable from a healthy run in the guest
+/// counters and the stale-frame symptom got blamed on the KMD marker or the
+/// host.
+static PRESENT_GATE_TIMEOUTS: AtomicUsize = AtomicUsize::new(0);
+static PRESENT_GATE_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// Run the bounded gate and count every non-confirmation. The present proceeds
+/// either way — a stale frame beats a wedged worker — so the outcome is
+/// telemetry, not control flow, but it must not be droppable by accident.
+unsafe fn run_present_frame_gate(
+    dev: &crate::device_funcs::HeliosDevice,
+    gate_us: u32,
+    is_vehicle_present: bool,
+) -> GateOutcome {
+    if dev.dxvk.present_frame_gate(gate_us) {
+        return GateOutcome::Completed;
+    }
+    let total = PRESENT_GATE_TIMEOUTS.fetch_add(1, Ordering::Relaxed) + 1;
+    if is_vehicle_present {
+        // Unchanged text and cadence: this is the pre-existing vehicle line.
+        let n = EXT_FLIP_GATE_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
+        if n < 16 || n % 512 == 0 {
+            log_line(&format!(
+                "vehicle flip gate TIMEOUT (x{}) — flipping anyway",
+                n + 1
+            ));
+        }
+    } else {
+        let n = PRESENT_GATE_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+        if n < 16 || n % 512 == 0 {
+            log_line(&format!(
+                "present frame gate did not confirm completion (x{total}) — presenting anyway"
+            ));
+        }
+    }
+    GateOutcome::NotConfirmed
+}
+
 /// Kernel flip-waits queued ahead of the present packet (the ordering is
 /// dxgkrnl-enforced for these presents; the CPU gate is skipped).
 static EXT_KWAIT_ARMED: AtomicUsize = AtomicUsize::new(0);
@@ -9669,15 +9726,7 @@ unsafe extern "C" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT) -> i32 {
     };
     if !kernel_wait_armed && gate_us != 0 {
         if let Some(dev) = helios_device(h) {
-            if !dev.dxvk.present_frame_gate(gate_us) && is_vehicle_present {
-                let n = EXT_FLIP_GATE_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
-                if n < 16 || n % 512 == 0 {
-                    log_line(&format!(
-                        "vehicle flip gate TIMEOUT (x{}) — flipping anyway",
-                        n + 1
-                    ));
-                }
-            }
+            let _outcome = run_present_frame_gate(dev, gate_us, is_vehicle_present);
         }
     }
 
@@ -9797,7 +9846,7 @@ unsafe extern "C" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT) -> i32 {
         log_line(&format!(
             "DXGI Present: #{} src=0x{:x} dst=0x{:x} copied={} flags=0x{:x} opt_comp={} presentCb=0x{:08x} \
              hSurf={:p} srcSub={} hDstRes={:p} dstSub={} flipInterval={} dxgiCtx={:p} hContext={:p} \
-             syncVal={} skips={}/{}/{}",
+             syncVal={} skips={}/{}/{} gate_nc={}",
             ordinal,
             src_alloc,
             dst_alloc,
@@ -9816,6 +9865,7 @@ unsafe extern "C" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT) -> i32 {
             PRESENT_SKIP_NO_CALLBACKS.load(Ordering::Relaxed),
             PRESENT_SKIP_NO_CONTEXT.load(Ordering::Relaxed),
             PRESENT_SKIP_NO_SRC_ALLOC.load(Ordering::Relaxed),
+            PRESENT_GATE_TIMEOUTS.load(Ordering::Relaxed),
         ));
     }
     present_hr
@@ -10500,7 +10550,9 @@ unsafe extern "C" fn dxgi_present1(arg: *mut ddi::DXGI_DDI_ARG_PRESENT1) -> i32 
     let gate_us = present_gate_us();
     if gate_us != 0 {
         if let Some(dev) = helios_device(h) {
-            dev.dxvk.present_frame_gate(gate_us);
+            // Present1-multi discarded this boolean entirely; #[must_use] on
+            // GateOutcome makes that a compiler warning rather than a silence.
+            let _outcome = run_present_frame_gate(dev, gate_us, false);
         }
     }
 
