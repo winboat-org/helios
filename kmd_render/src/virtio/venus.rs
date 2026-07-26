@@ -182,13 +182,17 @@ const ACCESS_TRANSFER_WRITE: u32 = 0x0000_1000;
 const ACCESS_TRANSFER_READ: u32 = 0x0000_0800;
 
 // ── VkMemoryPropertyFlags bits we require ────────────────────────────────────
-const MEMORY_PROPERTY_DEVICE_LOCAL: u32 = 0x1;
-const MEMORY_PROPERTY_HOST_VISIBLE: u32 = 0x2;
-const MEMORY_PROPERTY_HOST_COHERENT: u32 = 0x4;
-
-/// VK_MAX_MEMORY_TYPES — the fixed array length the host encodes in the
-/// memory-properties reply (`vn_encode_VkPhysicalDeviceMemoryProperties_partial`).
-const VK_MAX_MEMORY_TYPES: u32 = 32;
+//
+// Defined once in `helios_kmd_logic` alongside the two selectors that read them
+// (`choose_host_visible_memory_type` / `choose_device_local_memory_type`), which
+// live there because they are pure functions of the host's reported flag array
+// and so can carry a host test. VK_MAX_MEMORY_TYPES is the fixed array length
+// the host encodes in the memory-properties reply
+// (`vn_encode_VkPhysicalDeviceMemoryProperties_partial`), and both the reply
+// decoder here and the selectors there must agree on it.
+use helios_kmd_logic::{
+    MEMORY_PROPERTY_HOST_COHERENT, MEMORY_PROPERTY_HOST_VISIBLE, VK_MAX_MEMORY_TYPES,
+};
 /// VK_MAX_MEMORY_HEAPS — likewise for the heap array.
 const VK_MAX_MEMORY_HEAPS: u32 = 16;
 
@@ -248,7 +252,7 @@ const RING_WAIT_TIMEOUT_MS: u64 = 30_000;
 // claim that justifies the buffer is worth a host test. See
 // `writer_ext_full_create_device_is_332_bytes` there for the real number — the
 // comment that used to sit here said "~120 bytes" and was wrong by 212.
-use helios_kmd_logic::Writer;
+use helios_kmd_logic::{MemoryTypeChoice, Writer};
 
 /// Why the venus ring was declared unusable. Each arm names a registry counter
 /// so a wedge is distinguishable from every other `DeviceError` in a post-mortem
@@ -1242,54 +1246,36 @@ impl VenusClient {
         })
     }
 
-    fn choose_host_visible_memory_type(&self, memory_type_bits: u32) -> Option<u32> {
-        let mut fallback = None;
-        let mut i = 0;
-        while i < self.memory_type_count && i < VK_MAX_MEMORY_TYPES {
-            if (memory_type_bits & (1u32 << i)) != 0 {
-                let flags = self.memory_type_flags[i as usize];
-                if (flags & MEMORY_PROPERTY_HOST_VISIBLE) != 0 {
-                    if fallback.is_none() {
-                        fallback = Some(i);
-                    }
-                    if (flags & MEMORY_PROPERTY_HOST_COHERENT) != 0 {
-                        return Some(i);
-                    }
-                }
-            }
-            i += 1;
-        }
-        fallback
+    /// See [`helios_kmd_logic::choose_host_visible_memory_type`] — the rule is a
+    /// pure function of `memory_type_flags`/`memory_type_count`, so it lives
+    /// where it can be host-tested.
+    fn choose_host_visible_memory_type(&self, memory_type_bits: u32) -> Option<MemoryTypeChoice> {
+        helios_kmd_logic::choose_host_visible_memory_type(
+            &self.memory_type_flags,
+            self.memory_type_count,
+            memory_type_bits,
+        )
     }
 
-    fn choose_device_local_memory_type(&self, memory_type_bits: u32) -> Option<u32> {
-        let mut fallback = None;
-        let mut i = 0;
-        while i < self.memory_type_count && i < VK_MAX_MEMORY_TYPES {
-            if (memory_type_bits & (1u32 << i)) != 0 {
-                let flags = self.memory_type_flags[i as usize];
-                if fallback.is_none() {
-                    fallback = Some(i);
-                }
-                if (flags & MEMORY_PROPERTY_DEVICE_LOCAL) != 0
-                    && (flags & MEMORY_PROPERTY_HOST_VISIBLE) == 0
-                {
-                    return Some(i);
-                }
-            }
-            i += 1;
+    /// See [`helios_kmd_logic::choose_device_local_memory_type`].
+    fn choose_device_local_memory_type(&self, memory_type_bits: u32) -> Option<MemoryTypeChoice> {
+        helios_kmd_logic::choose_device_local_memory_type(
+            &self.memory_type_flags,
+            self.memory_type_count,
+            memory_type_bits,
+        )
+    }
+
+    /// Accept a memory-type choice, naming a downgrade in the registry.
+    ///
+    /// Every selector call site goes through here, so "we asked for
+    /// DEVICE_LOCAL and settled for whatever was allowed" can no longer happen
+    /// without a breadcrumb. `VnMtDown` records the index that was taken.
+    fn accept_memory_type(choice: MemoryTypeChoice) -> u32 {
+        if let MemoryTypeChoice::Downgraded(index) = choice {
+            crate::diag::record_named_bytes(b"VnMtDown", index);
         }
-        i = 0;
-        while i < self.memory_type_count && i < VK_MAX_MEMORY_TYPES {
-            if (memory_type_bits & (1u32 << i)) != 0 {
-                let flags = self.memory_type_flags[i as usize];
-                if (flags & MEMORY_PROPERTY_DEVICE_LOCAL) != 0 {
-                    return Some(i);
-                }
-            }
-            i += 1;
-        }
-        fallback
+        choice.index()
     }
 
     fn create_scanout_image(
@@ -1649,7 +1635,7 @@ impl VenusClient {
                 }
             };
         let memory_type_index = match self.choose_device_local_memory_type(memory_type_bits) {
-            Some(index) => index,
+            Some(choice) => Self::accept_memory_type(choice),
             None => {
                 let _ = self.destroy_image_on_ring(adapter, image_id);
                 return Err(VirtioError::DeviceError);
@@ -4399,12 +4385,14 @@ impl VenusClient {
         let diag_mode = crate::diag::read_config_dword(b"ScanoutDiag", 0);
         let cpu_filled_cross_device_blob = diag_mode == 9 || diag_mode == 11;
         let prefer_device_local = diag_mode >= 5 && !cpu_filled_cross_device_blob;
-        let memory_type_index = if prefer_device_local {
-            self.choose_device_local_memory_type(memory_type_bits)
-        } else {
-            self.choose_host_visible_memory_type(memory_type_bits)
-        }
-        .ok_or(VirtioError::DeviceError)?;
+        let memory_type_index = Self::accept_memory_type(
+            if prefer_device_local {
+                self.choose_device_local_memory_type(memory_type_bits)
+            } else {
+                self.choose_host_visible_memory_type(memory_type_bits)
+            }
+            .ok_or(VirtioError::DeviceError)?,
+        );
         crate::diag::record_named_bytes(b"SdgMt", memory_type_index);
         crate::diag::record_named_bytes(
             b"SdgMf",
@@ -4496,7 +4484,7 @@ impl VenusClient {
                 }
             };
         let memory_type_index = match self.choose_device_local_memory_type(memory_type_bits) {
-            Some(index) => index,
+            Some(choice) => Self::accept_memory_type(choice),
             None => {
                 let _ = self.destroy_image(adapter, image_id);
                 return Err(VirtioError::DeviceError);
@@ -4579,9 +4567,10 @@ impl VenusClient {
         crate::diag::record_named_bytes(b"SdgLTyc", self.memory_type_count);
 
         crate::diag::record_named_bytes(b"SdgLStg", 3);
-        let memory_type_index = self
-            .choose_host_visible_memory_type(memory_type_bits)
-            .ok_or(VirtioError::DeviceError)?;
+        let memory_type_index = Self::accept_memory_type(
+            self.choose_host_visible_memory_type(memory_type_bits)
+                .ok_or(VirtioError::DeviceError)?,
+        );
         crate::diag::record_named_bytes(b"SdgMt", memory_type_index);
         crate::diag::record_named_bytes(
             b"SdgMf",

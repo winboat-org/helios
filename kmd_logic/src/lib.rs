@@ -528,6 +528,131 @@ impl Writer {
     }
 }
 
+// ── Vulkan memory-type selection ──────────────────────────────────────────────
+
+/// `VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT`.
+pub const MEMORY_PROPERTY_DEVICE_LOCAL: u32 = 0x1;
+/// `VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT`.
+pub const MEMORY_PROPERTY_HOST_VISIBLE: u32 = 0x2;
+/// `VK_MEMORY_PROPERTY_HOST_COHERENT_BIT`.
+pub const MEMORY_PROPERTY_HOST_COHERENT: u32 = 0x4;
+/// `VK_MAX_MEMORY_TYPES` — the fixed array length the host encodes in
+/// `vkGetPhysicalDeviceMemoryProperties`.
+pub const VK_MAX_MEMORY_TYPES: u32 = 32;
+
+/// Which memory type a selector settled on, and whether it is the one that was
+/// actually asked for.
+///
+/// Both selectors fall back rather than fail, which is the right policy — a
+/// downgraded allocation usually still works. What was wrong is that they
+/// returned a bare `Option<u32>`, so every caller read `Some(i)` as "the
+/// requested property was satisfied" and a downgrade left no trace anywhere.
+/// That is the ScanoutDiag=16 / SdgErr=2 defect class: a memory-type choice that
+/// looked fine and was not.
+///
+/// `#[must_use]` plus two arms means a caller has to say what it does about the
+/// downgrade. It does not prevent choosing a downgraded type — it prevents doing
+/// so silently.
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryTypeChoice {
+    /// Every requested property is present on this type.
+    Exact(u32),
+    /// The type is allowed by `memory_type_bits` but is missing at least one
+    /// requested property.
+    Downgraded(u32),
+}
+
+impl MemoryTypeChoice {
+    /// The chosen `memoryTypeIndex`, whichever arm it came from.
+    pub fn index(self) -> u32 {
+        match self {
+            Self::Exact(i) | Self::Downgraded(i) => i,
+        }
+    }
+}
+
+/// Pick a HOST_VISIBLE memory type, preferring one that is also HOST_COHERENT.
+///
+/// `Downgraded` means HOST_VISIBLE but NOT HOST_COHERENT, which for a MAPPABLE
+/// scanout blob means the guest's writes need explicit flushes that nothing
+/// issues.
+pub fn choose_host_visible_memory_type(
+    memory_type_flags: &[u32],
+    memory_type_count: u32,
+    memory_type_bits: u32,
+) -> Option<MemoryTypeChoice> {
+    let mut fallback = None;
+    let mut i = 0;
+    while i < memory_type_count && i < VK_MAX_MEMORY_TYPES && (i as usize) < memory_type_flags.len()
+    {
+        if (memory_type_bits & (1u32 << i)) != 0 {
+            let flags = memory_type_flags[i as usize];
+            if (flags & MEMORY_PROPERTY_HOST_VISIBLE) != 0 {
+                if fallback.is_none() {
+                    fallback = Some(i);
+                }
+                if (flags & MEMORY_PROPERTY_HOST_COHERENT) != 0 {
+                    return Some(MemoryTypeChoice::Exact(i));
+                }
+            }
+        }
+        i += 1;
+    }
+    fallback.map(MemoryTypeChoice::Downgraded)
+}
+
+/// Pick a DEVICE_LOCAL memory type, in three tiers.
+///
+/// The tier order is load-bearing and must not be reordered:
+/// 1. device-local and NOT host-visible — the real VRAM type;
+/// 2. device-local (host-visible too, i.e. a BAR/ReBAR type);
+/// 3. the first allowed type at all, device-local or not.
+///
+/// Tiers 1 and 2 are both `Exact`: the requested property is DEVICE_LOCAL and
+/// both have it, so tier 1 is a preference inside the same answer, not a
+/// downgrade. Tier 3 is the downgrade, and it is just the lowest set bit of
+/// `memory_type_bits`: on a host whose `memoryTypeBits` for an OPTIMAL GDI image
+/// contains only a host-visible type, the old signature reported success and the
+/// "device-local dedicated memory" contract in the caller's own doc comment was
+/// silently false.
+pub fn choose_device_local_memory_type(
+    memory_type_flags: &[u32],
+    memory_type_count: u32,
+    memory_type_bits: u32,
+) -> Option<MemoryTypeChoice> {
+    let limit = |i: u32| {
+        i < memory_type_count && i < VK_MAX_MEMORY_TYPES && (i as usize) < memory_type_flags.len()
+    };
+    let mut fallback = None;
+    let mut i = 0;
+    while limit(i) {
+        if (memory_type_bits & (1u32 << i)) != 0 {
+            let flags = memory_type_flags[i as usize];
+            if fallback.is_none() {
+                fallback = Some(i);
+            }
+            if (flags & MEMORY_PROPERTY_DEVICE_LOCAL) != 0
+                && (flags & MEMORY_PROPERTY_HOST_VISIBLE) == 0
+            {
+                return Some(MemoryTypeChoice::Exact(i));
+            }
+        }
+        i += 1;
+    }
+    i = 0;
+    while limit(i) {
+        if (memory_type_bits & (1u32 << i)) != 0 {
+            let flags = memory_type_flags[i as usize];
+            if (flags & MEMORY_PROPERTY_DEVICE_LOCAL) != 0 {
+                return Some(MemoryTypeChoice::Exact(i));
+            }
+        }
+        i += 1;
+    }
+    fallback.map(MemoryTypeChoice::Downgraded)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1033,6 +1158,90 @@ mod tests {
         let mut w = Writer::new();
         w.bytes_padded(b"VK_EXT_image_drm_format_modifier\0");
         assert_eq!(w.len(), 36);
+    }
+
+    // ── Memory-type selection ────────────────────────────────────────────────
+
+    /// The shape this box actually reports: a pure DEVICE_LOCAL type, a
+    /// HOST_VISIBLE|HOST_COHERENT type, and a device-local BAR type.
+    const NVIDIA_SHAPED: [u32; 3] = [
+        MEMORY_PROPERTY_DEVICE_LOCAL,
+        MEMORY_PROPERTY_HOST_VISIBLE | MEMORY_PROPERTY_HOST_COHERENT,
+        MEMORY_PROPERTY_DEVICE_LOCAL
+            | MEMORY_PROPERTY_HOST_VISIBLE
+            | MEMORY_PROPERTY_HOST_COHERENT,
+    ];
+
+    /// Today's host takes the exact arm on both selectors — which is why the
+    /// guest gate for R605 is "VnMtDown is ABSENT", not "VnMtDown is 0".
+    #[test]
+    fn memory_type_exact_on_the_shape_this_box_reports() {
+        assert_eq!(
+            choose_device_local_memory_type(&NVIDIA_SHAPED, 3, 0b111),
+            Some(MemoryTypeChoice::Exact(0))
+        );
+        assert_eq!(
+            choose_host_visible_memory_type(&NVIDIA_SHAPED, 3, 0b111),
+            Some(MemoryTypeChoice::Exact(1))
+        );
+    }
+
+    /// The defect case: `memoryTypeBits` allows only a host-visible,
+    /// non-device-local type. The old signature returned `Some(i)` and the
+    /// caller's "device-local dedicated memory" contract was silently false.
+    #[test]
+    fn memory_type_downgrades_when_only_host_visible_is_allowed() {
+        assert_eq!(
+            choose_device_local_memory_type(&NVIDIA_SHAPED, 3, 0b010),
+            Some(MemoryTypeChoice::Downgraded(1))
+        );
+    }
+
+    /// A device-local BAR type still satisfies DEVICE_LOCAL, so tier 2 is Exact.
+    /// Tier 1 is a preference inside the same answer, not a downgrade.
+    #[test]
+    fn memory_type_device_local_bar_type_is_exact() {
+        assert_eq!(
+            choose_device_local_memory_type(&NVIDIA_SHAPED, 3, 0b100),
+            Some(MemoryTypeChoice::Exact(2))
+        );
+        // ...and tier 1 still wins when both are allowed.
+        assert_eq!(
+            choose_device_local_memory_type(&NVIDIA_SHAPED, 3, 0b101),
+            Some(MemoryTypeChoice::Exact(0))
+        );
+    }
+
+    /// HOST_VISIBLE without HOST_COHERENT is the silent half of the host-visible
+    /// selector: a MAPPABLE scanout blob whose writes need flushes nobody issues.
+    #[test]
+    fn memory_type_host_visible_without_coherent_is_a_downgrade() {
+        let flags = [MEMORY_PROPERTY_HOST_VISIBLE, MEMORY_PROPERTY_DEVICE_LOCAL];
+        assert_eq!(
+            choose_host_visible_memory_type(&flags, 2, 0b11),
+            Some(MemoryTypeChoice::Downgraded(0))
+        );
+    }
+
+    /// No allowed type has the property at all.
+    #[test]
+    fn memory_type_none_when_nothing_qualifies() {
+        let flags = [MEMORY_PROPERTY_DEVICE_LOCAL, MEMORY_PROPERTY_DEVICE_LOCAL];
+        assert_eq!(choose_host_visible_memory_type(&flags, 2, 0b11), None);
+        assert_eq!(choose_device_local_memory_type(&flags, 2, 0), None);
+    }
+
+    /// `memory_type_count` and the array length both bound the scan; a host that
+    /// reports a count larger than the array must not index past it.
+    #[test]
+    fn memory_type_scan_is_bounded_by_both_count_and_array() {
+        let flags = [MEMORY_PROPERTY_DEVICE_LOCAL];
+        assert_eq!(
+            choose_device_local_memory_type(&flags, 32, u32::MAX),
+            Some(MemoryTypeChoice::Exact(0))
+        );
+        // A count of 0 means the host reported nothing usable.
+        assert_eq!(choose_device_local_memory_type(&flags, 0, u32::MAX), None);
     }
 
     /// Little-endian, and the header is two 4-byte words in encode order.
