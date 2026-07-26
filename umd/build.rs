@@ -21,6 +21,10 @@ fn def(var: &str, default: &str) -> String {
 
 /// Pick the highest-versioned MSVC include directory (for vcruntime/STL headers
 /// that the WDK headers transitively pull in).
+///
+/// NOTE: the sort is lexicographic over directory names, not semantic, so a
+/// hypothetical `14.9.x` would outrank `14.44.x`. Only one toolset is installed
+/// today; set `HELIOS_MSVC_INCLUDE` if that ever stops being true.
 fn find_msvc_include() -> String {
     if let Ok(v) = env::var("HELIOS_MSVC_INCLUDE") {
         return v;
@@ -37,7 +41,32 @@ fn find_msvc_include() -> String {
     versions
         .last()
         .map(|p| p.join("include").to_string_lossy().into_owned())
-        .unwrap_or_else(|| format!(r"{}\14.44.35207\include", root.display()))
+        // Previously this invented a literal version number, which turns a
+        // missing or moved toolset into a bindgen failure against a path that
+        // was never scanned for. Name the override instead.
+        .unwrap_or_else(|| {
+            panic!(
+                "no MSVC toolset with an include/ directory under {}; set HELIOS_MSVC_INCLUDE \
+                 to the vcruntime/STL include directory",
+                root.display()
+            )
+        })
+}
+
+/// Fail the build at the point the path is chosen, naming the env var that
+/// overrides it.
+///
+/// Every one of these four defaults is an absolute path baked into this script.
+/// Without the check a wrong path surfaces far from its cause — as a clang
+/// include error, a missing-archive link error, or a "program not found" from
+/// `cc` — and none of those name the variable that would fix it.
+fn require_path(env_var: &str, value: &str, dir: bool) {
+    let path = Path::new(value);
+    let ok = if dir { path.is_dir() } else { path.is_file() };
+    if !ok {
+        let kind = if dir { "directory" } else { "file" };
+        panic!("helios_umd: {env_var} {kind} not found: {value} (override with {env_var})");
+    }
 }
 
 /// Generate Rust types for the d3d10umddi DDI (device-funcs tables, the
@@ -85,6 +114,9 @@ fn generate_d3d10umddi_bindings() {
 
     println!("cargo:rerun-if-changed=bindgen/d3d10umddi_wrapper.h");
     println!("cargo:rerun-if-env-changed=HELIOS_WDK_INCLUDE");
+    // Same reason as HELIOS_WDK_INCLUDE: these bindings are generated against
+    // this include path, so changing the selection must regenerate them.
+    println!("cargo:rerun-if-env-changed=HELIOS_MSVC_INCLUDE");
 }
 
 fn main() {
@@ -105,6 +137,28 @@ fn main() {
     let dxvk_build = def("HELIOS_DXVK_BUILD", r"C:\Users\Rupansh\dxvk-build");
     let clang_cl = def("HELIOS_CLANG_CL", r"C:\Program Files\LLVM\bin\clang-cl.exe");
     let archiver = def("HELIOS_MSVC_LIB", r"C:\Program Files\LLVM\bin\llvm-lib.exe");
+
+    // The module doc above calls the C++ ABI / CRT agreement critical, and then
+    // the build declared no dependency on the compiler that decides it. `cc` and
+    // `cxx-build` do not add a rerun edge for a compiler supplied via
+    // `.compiler()`, so swapping HELIOS_CLANG_CL or HELIOS_MSVC_LIB left the
+    // previously built helios_dxvk_bridge.lib — compiled against the previous
+    // MSVC STL — to be relinked against freshly built DXVK archives (which DO
+    // have rerun-if-changed), giving mismatched std::string / std::mutex layouts
+    // across the cxx boundary inside one DLL. That is heap corruption at
+    // runtime, guarded by prose. Declaring the identity as a build input turns a
+    // changed *selection* into a rebuild.
+    //
+    // It does NOT catch an in-place LLVM upgrade; a generated toolchain
+    // fingerprint (resolved `clang-cl --version` + MSVC include dir, with
+    // rerun-if-changed on it) is the stronger fix and is a separate follow-up.
+    println!("cargo:rerun-if-env-changed=HELIOS_CLANG_CL");
+    println!("cargo:rerun-if-env-changed=HELIOS_MSVC_LIB");
+
+    require_path("HELIOS_DXVK_SRC", &dxvk_src, true);
+    require_path("HELIOS_DXVK_BUILD", &dxvk_build, true);
+    require_path("HELIOS_CLANG_CL", &clang_cl, false);
+    require_path("HELIOS_MSVC_LIB", &archiver, false);
 
     generate_d3d10umddi_bindings();
 
@@ -127,6 +181,11 @@ fn main() {
         .include(format!(r"{dxvk_src}\include\spirv\include"))
         // Generated headers (version.h / buildenv.h) live at the meson build root.
         .include(&dxvk_build)
+        // Suppresses the MSVC STL's own #error when the clang-cl version falls
+        // outside the STL's supported-compiler window. Deliberately accepted:
+        // removing it hard-fails the only working build. It is a runtime-risk
+        // acknowledgement, not a fix — the ABI still rests on the two objects
+        // agreeing, which nothing here can prove.
         .define("_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH", None)
         .define("NOMINMAX", None)
         .define("WIN32_LEAN_AND_MEAN", None)

@@ -531,6 +531,15 @@ sites textually unchanged.
 
 ### R105. Make the UMD toolchain identity an actual cargo build input
 
+- **Status**: **LANDED** (2026-07-26). All four default paths verified present on the VM before
+  committing (the specific hazard the recommendation names), and no `HELIOS_*` override is set at
+  machine or user scope. Validated: `cargo build --release` clean with an unchanged environment;
+  `HELIOS_CLANG_CL=C:\nope\clang-cl.exe` fails the build at exit 101 with
+  `helios_umd: HELIOS_CLANG_CL file not found: C:\nope\clang-cl.exe (override with HELIOS_CLANG_CL)`;
+  pointing `HELIOS_CLANG_CL` at a *copy* of the same clang-cl now triggers `Compiling helios_umd`,
+  which it previously would not. Only one MSVC toolset (`14.44.35207`) is installed, so the removed
+  literal fallback had never been exercised. The toolchain-fingerprint file, for an in-place LLVM
+  upgrade, remains the separate follow-up the recommendation asks for and is **not** landed.
 - **Finding**: u-core-15.
 - **Where**: `umd/build.rs:10-13` (the "Toolchain coherence (critical)" doc paragraph), `:24-41`
   (`find_msvc_include`: `versions.sort()` over `PathBuf`s, literal `14.44.35207` fallback,
