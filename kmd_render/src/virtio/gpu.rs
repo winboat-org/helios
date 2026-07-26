@@ -154,6 +154,11 @@ pub static FENCE_EVENT_CANCELS: AtomicU32 = AtomicU32::new(0);
 /// deadline will expire and its unregister will report NOT_FOUND with an
 /// unsignaled event — the ICD must treat that as failure, not completion).
 pub static FENCE_EVENT_TEARDOWN_DROPS: AtomicU32 = AtomicU32::new(0);
+/// WDDM fences signalled immediately because the transport had already latched
+/// its ring-corruption failure. Each one also cleared the pending FIFO, so a
+/// nonzero value means the driver chose a TDR-visible completion over an
+/// undrainable queue.
+pub static WDDM_SIGNAL_AFTER_FAILURE: AtomicU32 = AtomicU32::new(0);
 /// High-water of `fence_events.len()` since driver start.
 pub static FENCE_EVENT_HIGH_WATER: AtomicU32 = AtomicU32::new(0);
 
@@ -1335,6 +1340,112 @@ impl VirtioGpu {
         Ok(fence_id)
     }
 
+    /// Set the ring-corruption latch and fail every in-flight entry exactly
+    /// once. Call at the moment the latch is set, never later, and always under
+    /// the device spinlock.
+    ///
+    /// Before this, latching `failed` made `drain_used` return immediately and
+    /// left every entry in `inflight` forever. `async_retired_up_to` then
+    /// reported false for every watermark above those stuck ids,
+    /// `note_wddm_submission` never returned "signal now" and `take_ready_wddm`
+    /// never popped, so DMA_COMPLETED was never delivered again. ResetFromTimeout
+    /// cleared the FIFO but neither the latch nor the stuck entries, so dxgkrnl
+    /// resubmitted with fresh ids into the same wedge: a TDR loop. And the
+    /// `AsyncControl` entries that own `scanout_bind_inflight` /
+    /// `scanout_flush_inflight` were abandoned with their completion gates still
+    /// set, so `queue_active_scanout_refresh` returned Busy forever and the HPD
+    /// worker spun its 4 ms lost-interrupt poll for the rest of the boot.
+    ///
+    /// Everything here mirrors the success path's ordering exactly, because a
+    /// mistake in the Sync-waiter sequence is a use-after-free of a stack block.
+    fn latch_failed_and_fail_inflight(&mut self) {
+        self.failed = true;
+        while let Some(entry) = self.inflight.pop() {
+            match entry.kind {
+                InFlightKind::Sync { waiter } => {
+                    if let Some(block) = waiter {
+                        // No response is copied on purpose: `SyncWaitBlock::new_zeroed`
+                        // zeroes `resp`, and `resp_is_ok(0)` is false, so every
+                        // waiter observes failure rather than a stale success.
+                        // SAFETY: a registered block stays valid until its owner
+                        // deregisters under this same lock, which has not happened
+                        // (waiter is still Some). `done` (Release) BEFORE
+                        // KeSetEvent, both inside the critical section: after a
+                        // release the block's stack frame may be reused at once.
+                        unsafe {
+                            let b = block.as_ptr();
+                            (*b).done.store(true, Ordering::Release);
+                            KeSetEvent(&mut (*b).event, IO_NO_INCREMENT, 0);
+                        }
+                    }
+                }
+                InFlightKind::AsyncControl {
+                    completion,
+                    completion_errors,
+                    wake_event,
+                    ..
+                } => {
+                    // Clear the gate and wake the worker, so the display's
+                    // coalescing gates unstick instead of reading Busy forever.
+                    // No `success_store`, no `resubmit`: nothing succeeded.
+                    // SAFETY: all three name stable AdapterContext fields whose
+                    // lifetime encloses this transport entry.
+                    unsafe {
+                        completion_errors.as_ref().fetch_add(1, Ordering::Relaxed);
+                        completion.as_ref().store(0, Ordering::Release);
+                        KeSetEvent(wake_event.as_ptr(), IO_NO_INCREMENT, 0);
+                    }
+                }
+                InFlightKind::AsyncVenus { scanout_notify, .. } => {
+                    if let Some(notify) = scanout_notify {
+                        // Publish nothing as displayed - the copy did not happen -
+                        // but DO clear the programming gate, or the VSync
+                        // heartbeat stops exactly as in R202.
+                        // SAFETY: stable AdapterContext fields; the adapter owns
+                        // this transport and outlives every in-flight entry.
+                        unsafe {
+                            notify.programming.as_ref().store(0, Ordering::Release);
+                            KeSetEvent(notify.event.as_ptr(), IO_NO_INCREMENT, 0);
+                        }
+                    }
+                }
+            }
+            // Park, never free: the host may still be DMAing into these buffers,
+            // and DmaBuffer frees are PASSIVE-only. Same policy as the success
+            // path.
+            if self.parked.len() < MAX_PARKED {
+                self.parked.push(entry);
+                bump_high_water(&PARKED_HIGH_WATER, self.parked.len());
+            } else {
+                PARKED_LEAKS.fetch_add(1, Ordering::Relaxed);
+                core::mem::forget(entry);
+            }
+        }
+
+        // No wire fence can ever retire now, so release every parked waiter and
+        // usermode event rather than leaving them blocked on a dead transport.
+        while let Some(w) = self.fence_waiters.pop() {
+            // SAFETY: registered blocks stay valid until deregistration, which
+            // happens under this same lock.
+            unsafe {
+                let b = w.block.as_ptr();
+                (*b).done.store(true, Ordering::Release);
+                KeSetEvent(&mut (*b).event, IO_NO_INCREMENT, 0);
+            }
+        }
+        while let Some(e) = self.fence_events.pop() {
+            // SAFETY: the entry holds an object reference taken by the escape
+            // handler. The deref MUST be deferred: dropping the last reference
+            // with a plain deref at DISPATCH would run the object's PASSIVE-only
+            // deletion.
+            unsafe {
+                KeSetEvent(e.event.as_ptr(), IO_NO_INCREMENT, 0);
+                ObDereferenceObjectDeferDelete(e.event.as_ptr() as PVOID);
+            }
+            FENCE_EVENT_SIGNALS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     /// Drain every completed entry off the used ring: pop the descriptor chain
     /// (token-matched), signal sync/fence waiters, and park the entry for a
     /// PASSIVE reap. The ONLY used-ring consumer (interrupt DPC + opportunistic
@@ -1350,7 +1461,7 @@ impl VirtioGpu {
             let Some(idx) = self.inflight.iter().position(|e| e.token == token) else {
                 // A completion we do not track: the ring state is corrupt.
                 DRAIN_BAD_TOKEN.fetch_add(1, Ordering::Relaxed);
-                self.failed = true;
+                self.latch_failed_and_fail_inflight();
                 return;
             };
             // Copy raw pointers/lengths so no borrow of `self.inflight` is held
@@ -1387,7 +1498,7 @@ impl VirtioGpu {
                 }
             };
             if popped.is_err() {
-                self.failed = true;
+                self.latch_failed_and_fail_inflight();
                 return;
             }
             let entry = self.inflight.swap_remove(idx);
@@ -1657,7 +1768,9 @@ impl VirtioGpu {
         fence_id: u64,
         block: NonNull<SyncWaitBlock>,
     ) -> FenceWaitPrep {
-        if fence_id == 0 || fence_id >= self.next_wire_fence {
+        // A failed transport can never retire a fence, so parking a PASSIVE
+        // waiter against one is a guaranteed timeout at best.
+        if self.failed || fence_id == 0 || fence_id >= self.next_wire_fence {
             return FenceWaitPrep::Invalid;
         }
         let in_flight = self.inflight.iter().any(|e| match e.kind {
@@ -1698,7 +1811,9 @@ impl VirtioGpu {
     /// reference (released by the drain / unregister / teardown). On every
     /// other outcome the caller still owns it and must deref.
     pub fn fence_event_register(&mut self, fence_id: u64, event: NonNull<KEVENT>) -> FenceEventReg {
-        if fence_id == 0 || fence_id >= self.next_wire_fence {
+        // As in fence_wait_prepare. `Invalid` leaves the object reference with
+        // the caller, per the ownership contract documented on this function.
+        if self.failed || fence_id == 0 || fence_id >= self.next_wire_fence {
             return FenceEventReg::Invalid;
         }
         let in_flight = self.inflight.iter().any(|e| match e.kind {
@@ -1823,6 +1938,16 @@ impl VirtioGpu {
         gpu_completion_fence: Option<u64>,
         refresh_scanout: bool,
     ) -> bool {
+        if self.failed {
+            // Nothing will ever retire, so queueing this fence guarantees a TDR.
+            // Signal it now - and clear the FIFO in the SAME critical section:
+            // dxgkrnl requires monotonic SubmissionFenceId completion, so
+            // signalling the newest fence while older ones stay queued would
+            // break the invariant.
+            WDDM_SIGNAL_AFTER_FAILURE.fetch_add(1, Ordering::Relaxed);
+            self.wddm_pending.clear();
+            return true;
+        }
         let wait_gpu = gpu_completion_fence.is_some();
         let watermark = if paging {
             0

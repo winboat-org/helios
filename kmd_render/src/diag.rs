@@ -155,6 +155,10 @@ pub enum FaultCounter {
     /// is 0. Previously reported only through the DiagLevel-gated `diag(0x0136)`,
     /// so a default boot saw nothing but `ScCpy=0xE` / `CpCpy=0xE3`.
     CpTgtE,
+    /// The virtio control ring latched its corruption failure — value is
+    /// `DRAIN_BAD_TOKEN`. Reported from `ResetFromTimeout`, on change only, so a
+    /// TDR storm cannot become a registry write storm.
+    StRing,
 }
 
 impl FaultCounter {
@@ -174,6 +178,7 @@ impl FaultCounter {
             FaultCounter::StQcs => b"StQcs",
             FaultCounter::StIsr => b"StIsr",
             FaultCounter::CpTgtE => b"CpTgtE",
+            FaultCounter::StRing => b"StRing",
         }
     }
 
@@ -191,6 +196,7 @@ impl FaultCounter {
         FaultCounter::StQcs,
         FaultCounter::StIsr,
         FaultCounter::CpTgtE,
+        FaultCounter::StRing,
     ];
 }
 

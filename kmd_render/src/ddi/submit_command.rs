@@ -624,8 +624,26 @@ pub unsafe extern "C" fn dxgkddi_reset_from_timeout(h_adapter: *mut c_void) -> N
     adapter.with_wddm_notify_lock(|guard| {
         let _ = adapter.with_virtio(|v| v.preempt_flush(guard));
     });
+    // Consume transport_failed(), which had zero callers repo-wide: a TDR
+    // against a latched ring is the loop this tranche exists to break, and
+    // without this the only evidence was a DiagLevel-gated breadcrumb. Reported
+    // here and mirrored on change only, so a TDR storm cannot become a registry
+    // write storm.
+    let failed = adapter
+        .with_virtio(|v| v.transport_failed())
+        .unwrap_or(false);
+    if failed {
+        let bad = crate::virtio::gpu::DRAIN_BAD_TOKEN.load(Ordering::Relaxed);
+        if RING_FAIL_REPORTED.swap(bad, Ordering::Relaxed) != bad {
+            crate::diag::fault(crate::diag::FaultCounter::StRing, bad);
+        }
+    }
     STATUS_SUCCESS
 }
+
+/// Last `DRAIN_BAD_TOKEN` value reported through `StRing`, so the ring-failure
+/// report is written on change rather than on every TDR.
+static RING_FAIL_REPORTED: AtomicU32 = AtomicU32::new(u32::MAX);
 
 /// `DxgkDdiRestartFromTimeout` — resume after TDR.
 pub unsafe extern "C" fn dxgkddi_restart_from_timeout(h_adapter: *mut c_void) -> NTSTATUS {
