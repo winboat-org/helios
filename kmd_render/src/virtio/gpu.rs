@@ -89,8 +89,22 @@ pub static ASYNC_COMPLETE_COUNT: AtomicU32 = AtomicU32::new(0);
 pub static ASYNC_RESP_ERRORS: AtomicU32 = AtomicU32::new(0);
 /// WAIT_FENCE waiters registered (fence was still in flight at wait time).
 pub static FENCE_WAIT_REGISTERED: AtomicU32 = AtomicU32::new(0);
-/// WAIT_FENCE waits that timed out.
+/// WAIT_FENCE waits that timed out — the host did not complete this fence.
+///
+/// This is the counter the project reads as fence evidence and dumps into the
+/// TDR report, so it must mean exactly one thing. It used to also count
+/// [`FENCE_WAIT_TABLE_FULL`]'s condition, where the host is perfectly healthy.
 pub static FENCE_WAIT_TIMEOUTS: AtomicU32 = AtomicU32::new(0);
+/// WAIT_FENCE waits that gave up because all [`MAX_FENCE_WAITERS`] slots were
+/// occupied for the whole retry budget — a *guest* table-size condition, not a
+/// host one, and the fix is a bigger table rather than a host investigation.
+///
+/// `gpu.rs`'s own comment on `MAX_FENCE_WAITERS` says dwm plus several apps plus
+/// WUDFHost are expected concurrently, so the 65th waiter is a reachable state.
+/// Before the split it incremented [`FENCE_WAIT_TIMEOUTS`], so post-mortem
+/// evidence could not distinguish a wedged host from a table that needs
+/// resizing — and the TDR report blamed the host.
+pub static FENCE_WAIT_TABLE_FULL: AtomicU32 = AtomicU32::new(0);
 /// A `ctrl_roundtrip` whose waiter was abandoned because the transport went away
 /// mid-wait (StopDevice), rather than because the host timed out. Previously
 /// folded into "already completed successfully" by `unwrap_or(true)`.

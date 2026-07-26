@@ -1610,6 +1610,14 @@ impl AdapterContext {
             b"WtOut",
             crate::virtio::gpu::FENCE_WAIT_TIMEOUTS.load(Ordering::Relaxed),
         );
+        // R604: the condition split out of WtOut. Mirrored here rather than only
+        // into the CollectDbgInfo report, because otherwise the only way to read
+        // it would be to provoke a TDR — and the point of the split is that this
+        // condition is NOT a host fault and should be visible without one.
+        crate::diag::record_named_bytes(
+            b"WtTbl",
+            crate::virtio::gpu::FENCE_WAIT_TABLE_FULL.load(Ordering::Relaxed),
+        );
         crate::diag::record_named_bytes(
             b"CtOut",
             crate::virtio::gpu::CTRL_TIMEOUT_COUNT.load(Ordering::Relaxed),

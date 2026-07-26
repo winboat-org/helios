@@ -1041,9 +1041,9 @@ pub unsafe extern "C" fn dxgkddi_collect_dbg_info(
         let adapter = unsafe { &*(h_adapter as *const AdapterContext) };
         adapter.completed_fence()
     };
-    let report: [u32; 37] = [
+    let report: [u32; 38] = [
         0x4844_4247, // 'HDBG'
-        5,           // report version (5: + ctrl-path response errors, DDI unmaps)
+        6,           // report version (6: + FENCE_WAIT_TABLE_FULL at index 37)
         args.Reason,
         SUBMIT_COUNT.load(Ordering::Relaxed),
         SUBMIT_LAST_FENCE.load(Ordering::Relaxed),
@@ -1090,8 +1090,15 @@ pub unsafe extern "C" fn dxgkddi_collect_dbg_info(
         crate::virtio::gpu::ASYNC_CTRL_RESP_ERRORS.load(Ordering::Relaxed),
         // DDI-level CpuHostAperture unmaps, for map/unmap pairing.
         crate::ddi::cpu_host_aperture::CPU_HOST_UNMAP_COUNT.load(Ordering::Relaxed),
+        // v6 (R604): split out of FENCE_WAIT_TIMEOUTS (word 25), which now means
+        // only "the host did not complete this fence". This word means "all 64
+        // waiter slots were taken", a guest table-size condition. The report is
+        // decoded offline BY INDEX, so word 25 keeps its meaning and the new
+        // word is appended — never renumbered — and the version word above moves
+        // with the array in the same commit.
+        crate::virtio::gpu::FENCE_WAIT_TABLE_FULL.load(Ordering::Relaxed),
     ];
-    let report_bytes = size_of::<[u32; 37]>();
+    let report_bytes = size_of::<[u32; 38]>();
     let copy_len = core::cmp::min(report_bytes, buf_len);
     // SAFETY: copy_len <= BufferSize (writable, checked above) and
     // copy_len <= size_of report (readable local array).

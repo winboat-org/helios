@@ -29,7 +29,7 @@ use wdk_sys::{KEVENT, LARGE_INTEGER, PVOID, STATUS_SUCCESS};
 use super::gpu::{
     BlobMapBegin, BlobMapFinish, BlobMapPrep, BlobRemapBegin, DeviceOwner,
     FenceWaitPrep, OwnerFilter, SyncWaitBlock, CTRL_TEARDOWN_ABANDONS, CTRL_TIMEOUT_COUNT,
-    FENCE_WAIT_TIMEOUTS, SUBMIT_META_BYTES, TRANSPORT_GONE_AT_WAIT,
+    FENCE_WAIT_TABLE_FULL, FENCE_WAIT_TIMEOUTS, SUBMIT_META_BYTES, TRANSPORT_GONE_AT_WAIT,
 };
 use super::hal::DmaBuffer;
 use super::VirtioError;
@@ -1588,6 +1588,18 @@ pub fn submit_venus_async_present(
 }
 
 /// Outcome of a [`wait_fence`] call.
+///
+/// ⚠ The escape boundary (`ddi/escape.rs`'s `escape_wait_fence`) must keep
+/// matching every variant explicitly, with **no wildcard arm**: today it maps
+/// three variants to three statuses, so adding a variant is a compile error
+/// there instead of a silent collapse into `TimedOut`. That is the whole
+/// encoding — `#[non_exhaustive]` is deliberately NOT used, because it only
+/// affects downstream crates and would claim a guarantee it cannot provide
+/// inside this one.
+///
+/// A fourth variant also needs a paired ICD change: `escape_wait_fence` reports
+/// only `out_completed` 1/0 plus `STATUS_INVALID_PARAMETER`, so a third state
+/// has nowhere to go on the wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WaitFenceOutcome {
     /// The wire fence has completed (host-visible-complete).
@@ -1619,7 +1631,14 @@ pub fn wait_fence(adapter: &AdapterContext, fence_id: u64, timeout_ns: u64) -> W
             Ok(FenceWaitPrep::TableFull) => {
                 full_retries += 1;
                 if full_retries > 1_000 {
-                    FENCE_WAIT_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
+                    // NOT FENCE_WAIT_TIMEOUTS: the host may be perfectly
+                    // healthy and all MAX_FENCE_WAITERS slots simply occupied.
+                    // The outcome stays TimedOut so the ICD is untouched; only
+                    // the evidence is split. Note the budget is nominally 1 s
+                    // but KeDelayExecutionThread rounds a 1 ms relative timeout
+                    // up to the system timer granularity (~15.6 ms), so this is
+                    // up to ~16 s of thread residency.
+                    FENCE_WAIT_TABLE_FULL.fetch_add(1, Ordering::Relaxed);
                     return WaitFenceOutcome::TimedOut;
                 }
                 sleep_ms(1);
