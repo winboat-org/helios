@@ -28,7 +28,7 @@ use helios_protocol::{
     VIRTIO_GPU_MAP_CACHE_WC,
 };
 
-use crate::adapter::AdapterContext;
+use crate::adapter::{AdapterContext, ScanoutGuard};
 use crate::dxgk::_D3DDDIFORMAT::{D3DDDIFMT_A8B8G8R8, D3DDDIFMT_A8R8G8B8, D3DDDIFMT_X8R8G8B8};
 use crate::dxgk::_D3DKMDT_STANDARDALLOCATION_TYPE::{
     D3DKMDT_STANDARDALLOCATION_GDISURFACE, D3DKMDT_STANDARDALLOCATION_SHADOWSURFACE,
@@ -595,6 +595,7 @@ fn clear_prepared_copy(ctx: &AllocationContext) {
 /// SetVidPnSourceAddress. PASSIVE_LEVEL only (the Venus client mutex may wait).
 pub(crate) unsafe fn submit_primary_scanout_copy(
     adapter: &AdapterContext,
+    lock: &ScanoutGuard<'_>,
     h: HANDLE,
     target_image_id: u64,
     width: u32,
@@ -625,7 +626,9 @@ pub(crate) unsafe fn submit_primary_scanout_copy(
         return Err(STATUS_NOT_SUPPORTED);
     }
 
-    let result = adapter.with_venus_client(|client| {
+    // Through the scanout token: the second of the two Venus acquisitions that
+    // run under `scanout_mutex` (see `ScanoutGuard`).
+    let result = lock.with_venus_client(|client| {
         let mut prepared = cached_prepared_copy(ctx);
         if prepared
             .as_ref()

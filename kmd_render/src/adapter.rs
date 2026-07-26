@@ -8,6 +8,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use core::cell::UnsafeCell;
+use core::marker::PhantomData;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
@@ -463,6 +464,50 @@ impl WddmNotifyGuard<'_> {
     }
 }
 
+/// Proof that this adapter's PASSIVE scanout-lifecycle mutex is currently held.
+///
+/// The fields are private and the type is neither `Copy` nor `Clone`, so safe
+/// code can obtain a reference only inside
+/// [`AdapterContext::with_scanout_lifecycle`]. Every helper whose contract is
+/// "call only under `scanout_mutex`" takes `&ScanoutGuard<'_>` instead of
+/// carrying a `_locked` suffix and a doc comment.
+///
+/// The lock order this token sits at the head of is
+/// `scanout_mutex -> venus_mutex -> virtio_lock`; [`Self::with_venus_client`]
+/// is the enforced path for the middle step.
+///
+/// ⚠ This does NOT make recursion unrepresentable: the guard is handed to the
+/// very closure that could call a re-acquiring wrapper. Callers must still not
+/// invoke [`AdapterContext::with_scanout_lifecycle`],
+/// [`AdapterContext::queue_active_scanout_refresh`] or
+/// [`AdapterContext::retire_scanout_allocation`] from inside a guarded closure —
+/// `scanout_mutex` is a non-recursive `SynchronizationEvent` and a re-entry is a
+/// permanent PASSIVE self-deadlock of the HPD worker with no bugcheck and no
+/// counter. `request_scanout_refresh` is deliberately token-free: it only sets a
+/// bit and signals an event, so it is legal from inside the lock and from
+/// DISPATCH.
+pub(crate) struct ScanoutGuard<'a> {
+    adapter: &'a AdapterContext,
+    /// Makes the guard `!Send`: the guarded work never crosses threads.
+    _not_send: PhantomData<*const ()>,
+}
+
+impl ScanoutGuard<'_> {
+    /// The scanout-lifecycle-ordered path to the Venus client.
+    ///
+    /// Forwards to [`AdapterContext::with_venus_client`]. Calling it through the
+    /// guard is what makes `scanout_mutex`-before-`venus_mutex` a signature
+    /// rather than a comment at the two sites that run under the scanout lock.
+    /// `AdapterContext::with_venus_client` stays public because eleven of its
+    /// thirteen callers legitimately hold no scanout lock.
+    pub(crate) fn with_venus_client<R>(
+        &self,
+        f: impl FnOnce(&mut crate::virtio::venus::VenusClient) -> R,
+    ) -> Result<R, DriverError> {
+        self.adapter.with_venus_client(f)
+    }
+}
+
 /// Outcome of trying to queue one coalesced scanout refresh.
 pub(crate) enum ScanoutRefreshQueue {
     Queued,
@@ -886,7 +931,8 @@ impl AdapterContext {
     /// wakes the worker only after the Venus GPU copy has completed. One
     /// in-flight command is the backpressure boundary.
     pub(crate) fn queue_active_scanout_refresh(&self) -> ScanoutRefreshQueue {
-        let outcome = self.with_scanout_lifecycle(|| self.queue_active_scanout_refresh_locked());
+        let outcome =
+            self.with_scanout_lifecycle(|lock| self.queue_active_scanout_refresh_locked(lock));
         // R318: the pacing snapshot runs OUTSIDE `scanout_mutex`. It used to run
         // inside it — 32 synchronous registry transactions every 16 queued
         // refreshes, roughly 3.75 bursts per second at 60 Hz, on the PASSIVE
@@ -1015,7 +1061,10 @@ impl AdapterContext {
     /// Scanout refresh implementation. The caller holds `scanout_mutex`, which
     /// prevents a matching WDDM allocation from being unbound/unref'd between
     /// the liveness check and control-queue submission.
-    fn queue_active_scanout_refresh_locked(&self) -> ScanoutRefreshQueue {
+    fn queue_active_scanout_refresh_locked(
+        &self,
+        _lock: &ScanoutGuard<'_>,
+    ) -> ScanoutRefreshQueue {
         use core::sync::atomic::Ordering;
 
         // This is the production path only. Diagnostic fills issue their own
@@ -1254,8 +1303,12 @@ impl AdapterContext {
     /// Serialize a PASSIVE scanout operation against exact-resource retirement.
     ///
     /// The closure may block on virtio/Venus work, so this cannot use the
-    /// DISPATCH-safe transport spinlock. Callers must not invoke it recursively.
-    pub(crate) fn with_scanout_lifecycle<R>(&self, f: impl FnOnce() -> R) -> R {
+    /// DISPATCH-safe transport spinlock. Callers must not invoke it recursively —
+    /// see [`ScanoutGuard`] for what the token does and does not prove.
+    pub(crate) fn with_scanout_lifecycle<R>(
+        &self,
+        f: impl FnOnce(&ScanoutGuard<'_>) -> R,
+    ) -> R {
         // SAFETY: initialized in place by `init_kernel_events`; all callers are
         // PASSIVE-level display worker or allocation-lifecycle paths.
         let _ = unsafe {
@@ -1267,7 +1320,11 @@ impl AdapterContext {
                 core::ptr::null_mut(),
             )
         };
-        let result = f();
+        let guard = ScanoutGuard {
+            adapter: self,
+            _not_send: PhantomData,
+        };
+        let result = f(&guard);
         // SAFETY: release the synchronization-event mutex acquired above.
         unsafe { KeSetEvent(self.scanout_mutex.get(), 0, 0) };
         result
@@ -1283,93 +1340,105 @@ impl AdapterContext {
         allocation_handle: usize,
         resource_id: u32,
     ) -> bool {
+        self.with_scanout_lifecycle(|lock| {
+            self.retire_scanout_allocation_locked(lock, allocation_handle, resource_id)
+        })
+    }
+
+    /// Body of [`Self::retire_scanout_allocation`]. Separate so the critical
+    /// section's contents are a named function taking the lock token rather than
+    /// an inline closure; the generated critical section is identical.
+    fn retire_scanout_allocation_locked(
+        &self,
+        _lock: &ScanoutGuard<'_>,
+        allocation_handle: usize,
+        resource_id: u32,
+    ) -> bool {
         use core::sync::atomic::Ordering;
 
-        self.with_scanout_lifecycle(|| {
-            // SetVidPnSourceAddress can publish its exact KMD allocation handle
-            // at DIRQL for later PASSIVE processing. DestroyAllocation owns the
-            // same exact pointer; cancel it while serialized with the worker's
-            // swap-and-dereference before the Box can be freed.
-            if allocation_handle != 0
+        // SetVidPnSourceAddress can publish its exact KMD allocation handle
+        // at DIRQL for later PASSIVE processing. DestroyAllocation owns the
+        // same exact pointer; cancel it while serialized with the worker's
+        // swap-and-dereference before the Box can be freed.
+        if allocation_handle != 0
+            && self
+                .pending_vidpn_allocation
+                .compare_exchange(allocation_handle, 0, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            // We just cancelled a deferred SetVidPnSourceAddress, so the HPD
+            // worker's swap() will now yield 0 and
+            // process_deferred_vidpn_source_address will return None -
+            // meaning nobody reaches any of the ten sites that clear
+            // `vidpn_programming`. A gate left at 1 makes vsync_dpc_routine
+            // early-return on every 16 ms tick before it increments
+            // vsync_count, so CRTC_VSYNC stops, dxgkrnl never retires the
+            // queued flip, and it therefore never issues the next
+            // SetVidPnSourceAddress that would re-arm the gate. The display
+            // is wedged for the rest of the boot.
+            //
+            // Both conditions below are load-bearing. SetVidPnSourceAddress
+            // runs at DIRQL and does NOT take the scanout lifecycle lock, so
+            // a NEWER program can raise the gate immediately after our CAS -
+            // re-read `pending` and only act while it is still 0. And
+            // compare_exchange(1, 0) rather than store(0) keeps us from
+            // clearing a gate we never observed set, which is the stale-clear
+            // window that would let the VSync DPC report a primary address
+            // the host has not sampled yet.
+            if self.pending_vidpn_allocation.load(Ordering::Acquire) == 0
                 && self
-                    .pending_vidpn_allocation
-                    .compare_exchange(allocation_handle, 0, Ordering::AcqRel, Ordering::Acquire)
+                    .vidpn_programming
+                    .compare_exchange(1, 0, Ordering::AcqRel, Ordering::Acquire)
                     .is_ok()
             {
-                // We just cancelled a deferred SetVidPnSourceAddress, so the HPD
-                // worker's swap() will now yield 0 and
-                // process_deferred_vidpn_source_address will return None -
-                // meaning nobody reaches any of the ten sites that clear
-                // `vidpn_programming`. A gate left at 1 makes vsync_dpc_routine
-                // early-return on every 16 ms tick before it increments
-                // vsync_count, so CRTC_VSYNC stops, dxgkrnl never retires the
-                // queued flip, and it therefore never issues the next
-                // SetVidPnSourceAddress that would re-arm the gate. The display
-                // is wedged for the rest of the boot.
-                //
-                // Both conditions below are load-bearing. SetVidPnSourceAddress
-                // runs at DIRQL and does NOT take the scanout lifecycle lock, so
-                // a NEWER program can raise the gate immediately after our CAS -
-                // re-read `pending` and only act while it is still 0. And
-                // compare_exchange(1, 0) rather than store(0) keeps us from
-                // clearing a gate we never observed set, which is the stale-clear
-                // window that would let the VSync DPC report a primary address
-                // the host has not sampled yet.
-                if self.pending_vidpn_allocation.load(Ordering::Acquire) == 0
-                    && self
-                        .vidpn_programming
-                        .compare_exchange(1, 0, Ordering::AcqRel, Ordering::Acquire)
-                        .is_ok()
-                {
-                    crate::diag::record_named_bytes(b"VpCncl", allocation_handle as u32);
-                }
+                crate::diag::record_named_bytes(b"VpCncl", allocation_handle as u32);
             }
-            if resource_id == 0 {
-                return true;
-            }
+        }
+        if resource_id == 0 {
+            return true;
+        }
 
-            let was_active = self
-                .active_scanout_resource
-                .compare_exchange(resource_id, 0, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok();
-            let was_host_bound =
-                self.host_bound_scanout_resource.load(Ordering::Acquire) == resource_id;
-            if !was_active && !was_host_bound {
-                return true;
-            }
-            if !was_host_bound {
-                // The retiring allocation was only a newer desired candidate;
-                // a different resource is still bound on the host. Clearing
-                // the candidate above is sufficient. Sending scanout-disable
-                // here would blank the unrelated Windows-selected primary.
-                crate::diag::record_named_bytes(b"ScRet", resource_id);
-                return true;
-            }
-
-            // QEMU's virtio-gpu SET_SCANOUT_BLOB contract treats resource_id=0
-            // as scanout disable before any resource lookup. Because this
-            // synchronous command is queued after all earlier async scanout
-            // commands, its response is the lifetime barrier before UNREF.
-            let unbound = crate::virtio::ctrl::set_scanout_blob(self, 0, 0, 0, 0, 0, 0).is_ok();
-            if !unbound {
-                crate::diag::record_named_bytes(b"ScRet", 0xE);
-                crate::diag::record_named_bytes(b"ScDead", resource_id);
-                return false;
-            }
-
-            self.host_bound_scanout_resource.store(0, Ordering::Release);
-            self.scanout_refresh_pending.store(0, Ordering::Release);
+        let was_active = self
+            .active_scanout_resource
+            .compare_exchange(resource_id, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok();
+        let was_host_bound =
+            self.host_bound_scanout_resource.load(Ordering::Acquire) == resource_id;
+        if !was_active && !was_host_bound {
+            return true;
+        }
+        if !was_host_bound {
+            // The retiring allocation was only a newer desired candidate;
+            // a different resource is still bound on the host. Clearing
+            // the candidate above is sufficient. Sending scanout-disable
+            // here would blank the unrelated Windows-selected primary.
             crate::diag::record_named_bytes(b"ScRet", resource_id);
+            return true;
+        }
 
-            // The DISPATCH Present path can publish a newer exact Windows
-            // primary without taking this PASSIVE lock. If that happened while
-            // the old resource was retiring, make the new identity drive a
-            // fresh bind instead of treating the just-issued unbind as final.
-            if self.active_scanout_resource.load(Ordering::Acquire) != 0 {
-                self.request_scanout_refresh();
-            }
-            true
-        })
+        // QEMU's virtio-gpu SET_SCANOUT_BLOB contract treats resource_id=0
+        // as scanout disable before any resource lookup. Because this
+        // synchronous command is queued after all earlier async scanout
+        // commands, its response is the lifetime barrier before UNREF.
+        let unbound = crate::virtio::ctrl::set_scanout_blob(self, 0, 0, 0, 0, 0, 0).is_ok();
+        if !unbound {
+            crate::diag::record_named_bytes(b"ScRet", 0xE);
+            crate::diag::record_named_bytes(b"ScDead", resource_id);
+            return false;
+        }
+
+        self.host_bound_scanout_resource.store(0, Ordering::Release);
+        self.scanout_refresh_pending.store(0, Ordering::Release);
+        crate::diag::record_named_bytes(b"ScRet", resource_id);
+
+        // The DISPATCH Present path can publish a newer exact Windows
+        // primary without taking this PASSIVE lock. If that happened while
+        // the old resource was retiring, make the new identity drive a
+        // fresh bind instead of treating the just-issued unbind as final.
+        if self.active_scanout_resource.load(Ordering::Acquire) != 0 {
+            self.request_scanout_refresh();
+        }
+        true
     }
 
     /// Run `f` against the persistent venus client under the PASSIVE venus

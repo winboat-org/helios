@@ -13,7 +13,7 @@ use helios_protocol::{
     HeliosPresentPrivateData, HELIOS_WDDM_ALLOC_KIND_DEVICE_MEMORY, HELIOS_WDDM_ALLOC_KIND_STANDARD,
 };
 
-use crate::adapter::AdapterContext;
+use crate::adapter::{AdapterContext, ScanoutGuard};
 use crate::ddi::create_allocation::{present_alloc_info, PresentAllocationStorage};
 use crate::ddi::present_packet::{
     PresentAllocations, PresentSubmissionPrivate, STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER,
@@ -50,6 +50,7 @@ fn virtio_scanout_format(dxgi_format: u32) -> Option<u32> {
 
 fn production_linear_scanout(
     adapter: &AdapterContext,
+    lock: &ScanoutGuard<'_>,
     width: u32,
     height: u32,
 ) -> Result<crate::ddi::create_allocation::ScanoutInfo, NTSTATUS> {
@@ -82,7 +83,10 @@ fn production_linear_scanout(
         });
     }
 
-    let scanout = match adapter.with_venus_client(|client| {
+    // Through the scanout token: this is one of the two Venus acquisitions that
+    // run under `scanout_mutex`, and going through the guard is what makes the
+    // scanout-before-venus lock order structural here.
+    let scanout = match lock.with_venus_client(|client| {
         client.allocate_linear_scanout_image_blob(adapter, width, height)
     }) {
         Ok(Ok(scanout)) => scanout,
@@ -906,12 +910,12 @@ pub unsafe extern "C" fn dxgkddi_set_vidpn_source_address(
 /// The allocation handle is the exact identity supplied by Windows. No
 /// process, geometry, creation-order, or timing classification is involved.
 pub(crate) fn process_deferred_vidpn_source_address(adapter: &AdapterContext) {
-    let status = adapter.with_scanout_lifecycle(|| {
+    let status = adapter.with_scanout_lifecycle(|lock| {
         let raw = adapter.pending_vidpn_allocation.swap(0, Ordering::AcqRel);
         if raw == 0 {
             return None;
         }
-        Some(unsafe { apply_vidpn_source_address_locked(adapter, raw as HANDLE) })
+        Some(unsafe { apply_vidpn_source_address_locked(adapter, lock, raw as HANDLE) })
     });
     if let Some(status) = status {
         crate::diag::record_named_bytes(b"VpDSt", status as u32);
@@ -920,13 +924,18 @@ pub(crate) fn process_deferred_vidpn_source_address(adapter: &AdapterContext) {
 
 /// Program the Windows-selected primary. PASSIVE_LEVEL only.
 unsafe fn apply_vidpn_source_address(adapter: &AdapterContext, h_alloc: HANDLE) -> NTSTATUS {
-    adapter
-        .with_scanout_lifecycle(|| unsafe { apply_vidpn_source_address_locked(adapter, h_alloc) })
+    adapter.with_scanout_lifecycle(|lock| unsafe {
+        apply_vidpn_source_address_locked(adapter, lock, h_alloc)
+    })
 }
 
 /// Apply one exact Windows source allocation while serialized against
 /// DestroyAllocation retirement of the same KMD allocation/resource identity.
-unsafe fn apply_vidpn_source_address_locked(adapter: &AdapterContext, h_alloc: HANDLE) -> NTSTATUS {
+unsafe fn apply_vidpn_source_address_locked(
+    adapter: &AdapterContext,
+    lock: &ScanoutGuard<'_>,
+    h_alloc: HANDLE,
+) -> NTSTATUS {
     crate::diag::record(0x1300_000A);
     let source_address_n = VIDPN_SOURCE_ADDRESS_COUNT
         .fetch_add(1, Ordering::Relaxed)
@@ -988,7 +997,7 @@ unsafe fn apply_vidpn_source_address_locked(adapter: &AdapterContext, h_alloc: H
         }
         source
     } else {
-        match production_linear_scanout(adapter, width, height) {
+        match production_linear_scanout(adapter, lock, width, height) {
             Ok(target) => target,
             Err(status) => {
                 crate::diag::record_named_bytes(b"ScSet", 0xE1);
@@ -1098,6 +1107,7 @@ unsafe fn apply_vidpn_source_address_locked(adapter: &AdapterContext, h_alloc: H
     match unsafe {
         crate::ddi::create_allocation::submit_primary_scanout_copy(
             adapter,
+            lock,
             h_alloc,
             target_image_id,
             width,
