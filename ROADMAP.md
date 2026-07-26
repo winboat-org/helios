@@ -189,9 +189,27 @@ virtio-gpu scanout; IddCx/Looking Glass is no longer the active display path.*
    `IDENTITY PARSE FAILED` because `parse_identity` uses `fopen_s`, which opens deny-sharing against
    a log the UMD holds open — the documented 18th-session trap. The needle it greps
    (`open_resource identity: res_id=`) is still an unconditional `log_line` and is present in the
-   file. ⚠ `win_install_umd` cannot refresh the DriverStore copy while it is in use (`Copy-Item …
-   being used by another process`); the ProgramData path the software key points at IS updated, so
-   this only risks a stale copy at cold boot.
+   file. ⚠ **FIXED 2026-07-27** — `win_install_umd` could not refresh the DriverStore copy while it
+   was in use (`Copy-Item … being used by another process`), so every deploy of a session silently
+   left the COLD-BOOT copy stale (measured: store SHA 56473A67 vs current F0C7A2E6, eight hours and
+   six deploys behind) while still reporting success. It is a SHARING violation — the package copy
+   is mapped by long-lived shell processes (ShellHost, SystemSettings, CrossDeviceResume) — so
+   takeown/icacls never applied. `Copy-HeliosFileVerified -DisplaceInUse` now renames the loaded
+   image aside (handles follow the rename; new loads get the fresh file), inherits the SHA256
+   verification, and THROWS on failure. A reboot-scheduled replace was rejected because
+   `Clear-HeliosPendingRenames` strips pending helios_umd renames at every deploy.
+   ⚠ **Post-gate follow-ups landed the same session:** R416 was still leaking — caching successes
+   only means an absent export retries every call, and the manifest walk `LoadLibraryA`s each
+   candidate without freeing on the MISS; the cache bounds the HIT path, and the leak only ever
+   existed on the miss path (fixed; the gate could not catch it because every export resolves here).
+   R420 was missing its static guarantee — `log_line` is now `#[deprecated]` as an internal marker
+   with `log_error!`/`trace_line!` the only callers and `#![deny(deprecated)]` making a direct call a
+   COMPILE ERROR (fault-injection verified), and the caps-query sites moved behind `trace_line!`.
+   ⚠ **Measurement trap found while doing that:** `umd-<pid>.log` is PID-keyed and opened
+   `append(true)`, so a recycled PID appends to a file an EARLIER process wrote — whole-file line
+   counts mix processes. Window every histogram (`Select-Object -Skip $before`) and compare the
+   file's `CreationTime` against the process `StartTime`. Byte-DELTA measurements over a fixed
+   window are immune, which is why the A/B growth numbers above stand.
    ⚠ R417 commit (3) remains **owner-gated and NOT done**: `track_dwm_composition_target` is the
    ONLY writer of `dev.composition_source`, so deleting that call would silently disable both the
    legacy LINEAR copy and the `flush()` refresh-marker submission.
