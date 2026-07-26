@@ -40,6 +40,7 @@ use helios_protocol::{
 
 use crate::ddi;
 use crate::device_funcs::HeliosDevice;
+use crate::device_funcs::KmdScanoutTarget;
 use crate::log_line;
 use crate::present_gate_us;
 use crate::present_sync_publish_enabled;
@@ -736,9 +737,14 @@ unsafe fn remember_direct_scanout_allocation(
     let Some(dev) = (unsafe { helios_device(h) }) else {
         return;
     };
-    let mut entries = dev.direct_scanout_allocations.borrow_mut();
-    entries.retain(|(candidate, _)| *candidate != allocation);
-    entries.push((allocation, private));
+    {
+        let mut entries = dev.direct_scanout_allocations.borrow_mut();
+        entries.retain(|(candidate, _)| *candidate != allocation);
+        entries.push((allocation, private));
+    }
+    // A new direct-scanout primary is exactly the event a mode change produces,
+    // so re-arm a previously-Unavailable LINEAR probe.
+    dev.scanout_epoch.set(dev.scanout_epoch.get().wrapping_add(1));
 }
 
 /// Drop a destroyed allocation's direct-scanout entry. Returns
@@ -756,7 +762,12 @@ unsafe fn forget_direct_scanout_allocation(
     let before = entries.len();
     entries.retain(|(candidate, _)| *candidate != allocation);
     let removed = before - entries.len();
-    (removed != 0).then(|| (removed, entries.len()))
+    let remaining = entries.len();
+    drop(entries);
+    if removed != 0 {
+        dev.scanout_epoch.set(dev.scanout_epoch.get().wrapping_add(1));
+    }
+    (removed != 0).then_some((removed, remaining))
 }
 
 unsafe fn remember_scanout_target(
@@ -840,8 +851,16 @@ unsafe fn ensure_kmd_scanout_target(h: Hdevice) -> bool {
     let Some(dev) = helios_device(h) else {
         return false;
     };
-    if dev.scanout_import.borrow().is_some() {
-        return true;
+    let epoch = dev.scanout_epoch.get();
+    match &*dev.scanout_import.borrow() {
+        KmdScanoutTarget::Ready(_) => return true,
+        // The negative half of the cache: without it, any of (a)
+        // primary_scanout_resource == 0, (b) resource_is_live false, (c) the
+        // import returning 0 left this None and re-armed the full walk +
+        // D3DKMTEscape + KMD virtio round-trip for the next bind and the next
+        // flush.
+        KmdScanoutTarget::Unavailable { at_epoch } if *at_epoch == epoch => return false,
+        _ => {}
     }
 
     let mut resource_id = 0u32;
@@ -859,6 +878,15 @@ unsafe fn ensure_kmd_scanout_target(h: Hdevice) -> bool {
         )
     };
     if raw == 0 {
+        dev.scanout_import
+            .replace(KmdScanoutTarget::Unavailable { at_epoch: epoch });
+        let n = SCANOUT_UNAVAILABLE_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+        if n < 16 || n % 512 == 0 {
+            log_line(&format!(
+                "DWM KMD scanout import unavailable at epoch {epoch} (x{}) — not re-probing until it moves",
+                n + 1
+            ));
+        }
         return false;
     }
 
@@ -872,13 +900,21 @@ unsafe fn ensure_kmd_scanout_target(h: Hdevice) -> bool {
     // The target VkImage is BGRA; virtio scanout ignores alpha as XR24.
     dev.scanout_format.set(87);
     dev.scanout_generation.set(generation);
-    dev.scanout_import.replace(Some(target));
+    dev.scanout_import.replace(KmdScanoutTarget::Ready(target));
     log_line(&format!(
         "DWM KMD scanout import ready: res_id={} {}x{} pitch={} gen={}",
         resource_id, width, height, pitch, generation
     ));
     true
 }
+
+/// Re-arming an `Unavailable` probe is driven by `scanout_epoch`, which the two
+/// `direct_scanout_allocations` writers bump. The KMD's own scanout generation
+/// is only readable THROUGH the probe this cache exists to avoid, so the
+/// trigger has to be the UMD's own observation: a direct-scanout primary
+/// appearing or going away is exactly what a mode change produces.
+static SCANOUT_UNAVAILABLE_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
+
 
 /// Remember a full-mode BGRA render target as DWM's current private optimal
 /// composition surface. Holding our own COM reference makes the pointer safe
@@ -945,7 +981,7 @@ unsafe fn publish_dwm_composition(context: &ID3D11DeviceContext, h: Hdevice) -> 
     };
     let source = dev.composition_source.borrow();
     let target = dev.scanout_import.borrow();
-    let (Some(source), Some(target)) = (source.as_ref(), target.as_ref()) else {
+    let (Some(source), KmdScanoutTarget::Ready(target)) = (source.as_ref(), &*target) else {
         return false;
     };
     if source.as_raw() == target.as_raw() {

@@ -836,8 +836,11 @@ unsafe extern "system" fn create_device(
                 scanout_width: core::cell::Cell::new(0),
                 scanout_height: core::cell::Cell::new(0),
                 scanout_format: core::cell::Cell::new(0),
-                scanout_import: core::cell::RefCell::new(None),
+                scanout_import: core::cell::RefCell::new(
+                    device_funcs::KmdScanoutTarget::Unprobed,
+                ),
                 scanout_generation: core::cell::Cell::new(0),
+                scanout_epoch: core::cell::Cell::new(0),
                 direct_scanout_allocations: core::cell::RefCell::new(Vec::new()),
                 composition_source: core::cell::RefCell::new(None),
                 scanout_copy_count: core::cell::Cell::new(0),

@@ -51,6 +51,23 @@ impl Drop for PresentSrcEntry {
     }
 }
 
+/// State of the legacy LINEAR scan-out import.
+///
+/// An `Option` could not express "already decided this is unavailable" —
+/// absent is indistinguishable from unprobed — so the only positive
+/// short-circuit was `is_some()`, and a failed probe re-armed the whole
+/// toolhelp-module-walk-plus-kernel-escape on the next `OMSetRenderTargets`
+/// and the next `Flush`. The KMD-side handler adds a virtio `resource_is_live`
+/// round-trip, taken under two ICD locks.
+pub enum KmdScanoutTarget {
+    /// Never probed on this device.
+    Unprobed,
+    /// Probed and not available. Do not probe again until `scanout_epoch` moves.
+    Unavailable { at_epoch: u32 },
+    /// Imported; owns one COM reference.
+    Ready(ID3D11Resource),
+}
+
 /// WDDM 2.x paging queue used to order explicit residency operations.
 ///
 /// The non-zero handles and non-null monitored-fence mapping are validated at
@@ -102,8 +119,13 @@ pub struct HeliosDevice {
     pub scanout_format: core::cell::Cell<u32>,
     /// Owned direct-LINEAR import of the KMD VidPn primary. Only DWM creates
     /// this; ordinary application devices never query or touch scanout 0.
-    pub scanout_import: core::cell::RefCell<Option<ID3D11Resource>>,
+    pub scanout_import: core::cell::RefCell<KmdScanoutTarget>,
     pub scanout_generation: core::cell::Cell<u32>,
+    /// Bumped whenever this UMD observes something that could change the KMD's
+    /// scanout: a direct-scanout primary created or destroyed. An `Unavailable`
+    /// probe result re-arms when this moves, so a LINEAR target that appears
+    /// later is still picked up.
+    pub scanout_epoch: core::cell::Cell<u32>,
     /// Exact pPrimaryDesc allocation identity -> Venus scanout metadata.
     /// DXGI can present a stable resource object while rotating its allocation
     /// handle, so the allocation is the authoritative lookup key.
