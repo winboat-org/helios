@@ -22,8 +22,8 @@ pub mod venus;
 pub use gpu::VirtioGpu;
 
 use wdk_sys::{
-    NTSTATUS, STATUS_DEVICE_BUSY, STATUS_INSUFFICIENT_RESOURCES, STATUS_IO_DEVICE_ERROR,
-    STATUS_IO_TIMEOUT, STATUS_NOT_IMPLEMENTED,
+    NTSTATUS, STATUS_DEVICE_BUSY, STATUS_INSUFFICIENT_RESOURCES, STATUS_INVALID_DEVICE_REQUEST,
+    STATUS_IO_DEVICE_ERROR, STATUS_IO_TIMEOUT, STATUS_NOT_IMPLEMENTED,
 };
 
 /// Errors from virtio-gpu bring-up. Mapped to NTSTATUS so `StartDevice` can fail
@@ -48,6 +48,10 @@ pub enum VirtioError {
     Timeout,
     /// Not yet implemented (scaffolding).
     NotImplemented,
+    /// The calling device does not own the context this operation names. An
+    /// authorization refusal, not a device failure — the escape layer maps it to
+    /// STATUS_INVALID_DEVICE_REQUEST and counts it (EscCtxOwn).
+    NotOwned,
 }
 
 impl From<VirtioError> for NTSTATUS {
@@ -60,6 +64,7 @@ impl From<VirtioError> for NTSTATUS {
             VirtioError::QueueFull => STATUS_DEVICE_BUSY,
             VirtioError::Timeout => STATUS_IO_TIMEOUT,
             VirtioError::NotImplemented => STATUS_NOT_IMPLEMENTED,
+            VirtioError::NotOwned => STATUS_INVALID_DEVICE_REQUEST,
         }
     }
 }

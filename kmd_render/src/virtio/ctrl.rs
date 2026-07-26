@@ -368,13 +368,37 @@ pub fn ctx_create(
     Ok(ctx_id)
 }
 
-/// Destroy a context and drop its tracking slot.
-pub fn ctx_destroy(adapter: &AdapterContext, ctx_id: u32) -> Result<(), VirtioError> {
-    let _ = adapter.with_virtio(|v| v.untrack_context(ctx_id));
+/// Destroy a context and drop its tracking slot, scoped to its owner.
+///
+/// The untrack and the ownership test are ONE step under the device lock, so a
+/// racing CTX_DESTROY for the same id cannot have both callers pass the check.
+/// A guest-supplied id that this owner does not own never reaches the wire:
+/// before this, CTX_DESTROY took the raw id straight to the host, so process B
+/// (or A after a restart that recycled the id) could destroy process A's Venus
+/// context and A's next submit referenced a destroyed host context — CS error,
+/// fatal decoder state (k-capsescape-02).
+pub fn ctx_destroy(
+    adapter: &AdapterContext,
+    owner: Option<DeviceOwner>,
+    ctx_id: u32,
+) -> Result<(), VirtioError> {
+    let owned = adapter
+        .with_virtio(|v| v.untrack_owned_context(owner, ctx_id))
+        .map_err(|_| VirtioError::DeviceError)?;
+    let Some(ctx_id) = owned else {
+        return Err(VirtioError::NotOwned);
+    };
     let mut cmd = VirtioGpuCtxDestroy::zeroed();
     cmd.hdr.type_ = VIRTIO_GPU_CMD_CTX_DESTROY;
     cmd.hdr.ctx_id = ctx_id;
     ctrl_roundtrip_ok(adapter, bytes_of(&cmd), None)
+}
+
+/// Untracked teardown of a context this driver created for itself (the
+/// persistent venus context, the virgl diagnostic contexts). Owner-scoped to
+/// the KMD.
+pub fn ctx_destroy_kmd(adapter: &AdapterContext, ctx_id: u32) -> Result<(), VirtioError> {
+    ctx_destroy(adapter, None, ctx_id)
 }
 
 /// `CTX_DESTROY` every context still owned by `owner` (device teardown).
@@ -872,7 +896,7 @@ pub fn diagnostic_virgl_host3d_blob(
         )
     };
     if let Err(e) = submit_3d_sync(adapter, ctx_id, bytes) {
-        let _ = ctx_destroy(adapter, ctx_id);
+        let _ = ctx_destroy_kmd(adapter, ctx_id);
         return Err(e);
     }
 
@@ -888,7 +912,7 @@ pub fn diagnostic_virgl_host3d_blob(
     ) {
         Ok(resource_id) => Ok((resource_id, blob_id, pitch)),
         Err(e) => {
-            let _ = ctx_destroy(adapter, ctx_id);
+            let _ = ctx_destroy_kmd(adapter, ctx_id);
             Err(e)
         }
     }
@@ -978,7 +1002,7 @@ pub fn diagnostic_virgl_host3d_guest_scanout(
         )
     };
     if let Err(e) = submit_3d_sync(adapter, ctx_id, bytes) {
-        let _ = ctx_destroy(adapter, ctx_id);
+        let _ = ctx_destroy_kmd(adapter, ctx_id);
         return Err(e);
     }
 
@@ -986,14 +1010,14 @@ pub fn diagnostic_virgl_host3d_guest_scanout(
         .with_virtio(|v| v.reserve_resource_slot())
         .map_err(|_| VirtioError::DeviceError)?;
     if !reserved {
-        let _ = ctx_destroy(adapter, ctx_id);
+        let _ = ctx_destroy_kmd(adapter, ctx_id);
         return Err(VirtioError::OutOfMemory);
     }
     let resource_id = match adapter.with_virtio(|v| v.alloc_resource_id()) {
         Ok(id) => id,
         Err(_) => {
             let _ = adapter.with_virtio(|v| v.cancel_resource_reservation());
-            let _ = ctx_destroy(adapter, ctx_id);
+            let _ = ctx_destroy_kmd(adapter, ctx_id);
             return Err(VirtioError::DeviceError);
         }
     };
@@ -1014,7 +1038,7 @@ pub fn diagnostic_virgl_host3d_guest_scanout(
     };
     if let Err(e) = ctrl_roundtrip_ok(adapter, bytes_of(&create), Some(bytes_of(&entry))) {
         let _ = adapter.with_virtio(|v| v.cancel_resource_reservation());
-        let _ = ctx_destroy(adapter, ctx_id);
+        let _ = ctx_destroy_kmd(adapter, ctx_id);
         return Err(e);
     }
     let _ = adapter.with_virtio(|v| v.commit_resource(resource_id));
@@ -1426,6 +1450,7 @@ pub fn submit_venus_sync(
 /// at QUEUE time. Completion is observed via [`wait_fence`].
 pub fn submit_venus_async(
     adapter: &AdapterContext,
+    owner: Option<DeviceOwner>,
     ctx_id: u32,
     ring_idx: u32,
     stream: &[u8],
@@ -1433,6 +1458,16 @@ pub fn submit_venus_async(
     if stream.is_empty() {
         return Err(VirtioError::DeviceError);
     }
+    // Ownership is resolved under the device lock, the same lock the enqueue
+    // below takes, so a foreign command stream cannot reach another process's
+    // Venus ring. This costs no extra acquisition on the ~89 us submit path.
+    let owned = adapter
+        .with_virtio(|v| v.resolve_owned_ctx(owner, ctx_id))
+        .map_err(|_| VirtioError::DeviceError)?;
+    let Some(owned) = owned else {
+        return Err(VirtioError::NotOwned);
+    };
+    let ctx_id = owned.id();
     reap_parked(adapter);
     let meta = adapter
         .with_virtio(|v| v.take_dma_buffer(SUBMIT_META_BYTES))

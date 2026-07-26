@@ -52,6 +52,21 @@ use crate::virtio::gpu::{DeviceOwner, OwnerFilter};
 /// processes. This must read 0 in normal operation.
 static ESCAPE_NO_DEVICE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
+/// Context verbs refused because the caller's device does not own the ctx_id
+/// (registry-visible as `EscCtxOwn`). Must read 0: every in-tree caller uses the
+/// context it created.
+static ESCAPE_FOREIGN_CTX: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Refuse a context verb naming a context this device does not own.
+fn refuse_foreign_context() -> NTSTATUS {
+    use core::sync::atomic::Ordering;
+    let n = ESCAPE_FOREIGN_CTX.fetch_add(1, Ordering::Relaxed) + 1;
+    if n == 1 || n % 64 == 0 {
+        crate::diag::record_named_bytes(b"EscCtxOwn", n);
+    }
+    STATUS_INVALID_DEVICE_REQUEST
+}
+
 /// Refuse an ownership-bearing verb that arrived with no device handle.
 fn refuse_no_device() -> NTSTATUS {
     use core::sync::atomic::Ordering;
@@ -114,8 +129,14 @@ pub unsafe extern "C" fn dxgkddi_escape(
             Some(owner) => escape_ctx_create(adapter, buf, owner),
             None => refuse_no_device(),
         },
-        HELIOS_ESCAPE_CTX_DESTROY => escape_ctx_destroy(adapter, buf),
-        HELIOS_ESCAPE_SUBMIT_VENUS => escape_submit_venus(adapter, buf),
+        HELIOS_ESCAPE_CTX_DESTROY => match owner {
+            Some(owner) => escape_ctx_destroy(adapter, buf, owner),
+            None => refuse_no_device(),
+        },
+        HELIOS_ESCAPE_SUBMIT_VENUS => match owner {
+            Some(owner) => escape_submit_venus(adapter, buf, owner),
+            None => refuse_no_device(),
+        },
         HELIOS_ESCAPE_WAIT_FENCE => escape_wait_fence(adapter, buf),
         HELIOS_ESCAPE_ALLOC_BLOB => match owner {
             Some(owner) => escape_alloc_blob(adapter, buf, owner),
@@ -447,15 +468,20 @@ fn escape_ctx_create(
     }
 }
 
-/// `HELIOS_ESCAPE_CTX_DESTROY` → tear down a context.
-fn escape_ctx_destroy(adapter: &AdapterContext, buf: &mut [u8]) -> NTSTATUS {
+/// `HELIOS_ESCAPE_CTX_DESTROY` → tear down a context this device owns.
+fn escape_ctx_destroy(
+    adapter: &AdapterContext,
+    buf: &mut [u8],
+    owner: DeviceOwner,
+) -> NTSTATUS {
     let sz = size_of::<HeliosEscapeCtxDestroy>();
     if buf.len() < sz {
         return STATUS_BUFFER_TOO_SMALL;
     }
     let req: HeliosEscapeCtxDestroy = pod_read_unaligned(&buf[..sz]);
-    match ctrl::ctx_destroy(adapter, req.ctx_id) {
+    match ctrl::ctx_destroy(adapter, Some(owner), req.ctx_id) {
         Ok(()) => STATUS_SUCCESS,
+        Err(crate::virtio::VirtioError::NotOwned) => refuse_foreign_context(),
         Err(ve) => ve.into(),
     }
 }
@@ -468,7 +494,11 @@ fn escape_ctx_destroy(adapter: &AdapterContext, buf: &mut [u8]) -> NTSTATUS {
 /// caller's ~seconds-long host round-trip no longer serializes every other
 /// escape under the dxgkrnl adapter lock (the 2026-07-04 WUDFHost/IddCx
 /// deadline-collision root cause).
-fn escape_submit_venus(adapter: &AdapterContext, buf: &mut [u8]) -> NTSTATUS {
+fn escape_submit_venus(
+    adapter: &AdapterContext,
+    buf: &mut [u8],
+    owner: DeviceOwner,
+) -> NTSTATUS {
     let hsz = size_of::<HeliosEscapeSubmitVenus>();
     if buf.len() < hsz {
         return STATUS_BUFFER_TOO_SMALL;
@@ -486,7 +516,13 @@ fn escape_submit_venus(adapter: &AdapterContext, buf: &mut [u8]) -> NTSTATUS {
         _ => return STATUS_INVALID_PARAMETER,
     };
 
-    match ctrl::submit_venus_async(adapter, req.ctx_id, req.ring_idx, &buf[hsz..end]) {
+    match ctrl::submit_venus_async(
+        adapter,
+        Some(owner),
+        req.ctx_id,
+        req.ring_idx,
+        &buf[hsz..end],
+    ) {
         Ok(wire_fence) => {
             // Report the assigned wire fence id back (in/out escape buffer).
             let mut out = req;
@@ -494,6 +530,7 @@ fn escape_submit_venus(adapter: &AdapterContext, buf: &mut [u8]) -> NTSTATUS {
             buf[..hsz].copy_from_slice(bytes_of(&out));
             STATUS_SUCCESS
         }
+        Err(crate::virtio::VirtioError::NotOwned) => refuse_foreign_context(),
         Err(ve) => ve.into(),
     }
 }

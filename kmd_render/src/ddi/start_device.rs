@@ -420,7 +420,7 @@ pub unsafe extern "C" fn dxgkddi_stop_device(miniport_device_context: *mut c_voi
             // The KMD-owned sweep — `None` here means exactly the KMD's own blobs, not
             // "every owner".
             let _ = crate::virtio::ctrl::release_blobs_for_owner(adapter, None);
-            let _ = crate::virtio::ctrl::ctx_destroy(adapter, venus_ctx);
+            let _ = crate::virtio::ctrl::ctx_destroy_kmd(adapter, venus_ctx);
         }
         // Free any parked completed entries at PASSIVE before the transport
         // (and the buffers still in flight inside it) is dropped.

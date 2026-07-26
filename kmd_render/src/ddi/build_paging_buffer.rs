@@ -819,13 +819,7 @@ unsafe fn bar_transfer(
                     }
                     // SAFETY: dst covers `len` blob bytes and src covers `bytes`
                     // mapped MDL bytes, both checked above.
-                    unsafe {
-                        core::ptr::copy_nonoverlapping(
-                            src,
-                            dst.add(blob_off as usize),
-                            bytes as usize,
-                        );
-                    }
+                    core::ptr::copy_nonoverlapping(src, dst.add(blob_off as usize), bytes as usize);
                     copied = true;
                 })
             };
@@ -862,13 +856,7 @@ unsafe fn bar_transfer(
                     }
                     // SAFETY: src covers `len` blob bytes and dst_start covers
                     // `bytes` mapped MDL bytes, both checked above.
-                    unsafe {
-                        core::ptr::copy_nonoverlapping(
-                            src.add(blob_off as usize),
-                            dst_start,
-                            bytes as usize,
-                        );
-                    }
+                    core::ptr::copy_nonoverlapping(src.add(blob_off as usize), dst_start, bytes as usize);
                     copied = true;
                 })
             };
@@ -1154,11 +1142,7 @@ pub unsafe extern "C" fn dxgkddi_build_paging_buffer(
                                 return;
                             }
                             // SAFETY: bounds-checked against the blob mapping.
-                            fill_pattern(
-                                unsafe { dst.add(off as usize) },
-                                fill_len as usize,
-                                pattern,
-                            );
+                            fill_pattern(dst.add(off as usize), fill_len as usize, pattern);
                             filled = true;
                         })
                     };

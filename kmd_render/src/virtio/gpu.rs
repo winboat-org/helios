@@ -483,6 +483,26 @@ impl DeviceOwner {
     }
 }
 
+/// A context id resolved through the tracking table against its owner.
+///
+/// The wire-facing context calls take this rather than a raw `u32`, so a
+/// guest-supplied id cannot reach the host without the table lookup. This is a
+/// real guarantee only because context tracking is mandatory
+/// (`VirtioGpu::reserve_context_slot`): with best-effort tracking the resolver
+/// would have to fall back to trusting unknown ids, and the type would merely
+/// relocate the check.
+#[derive(Clone, Copy)]
+pub struct OwnedCtx {
+    id: u32,
+}
+
+impl OwnedCtx {
+    /// The wire context id. Only reachable from a successful table lookup.
+    pub fn id(self) -> u32 {
+        self.id
+    }
+}
+
 /// Which slots a blob lookup may match.
 ///
 /// The two "no owner" concepts are deliberately NOT the same value: `Any` is a
@@ -2191,11 +2211,23 @@ impl VirtioGpu {
         self.contexts_reserved = self.contexts_reserved.saturating_sub(1);
     }
 
-    /// Drop a context's tracking slot (explicit CTX_DESTROY path).
-    pub fn untrack_context(&mut self, ctx_id: u32) {
-        if let Some(idx) = self.contexts.iter().position(|c| c.ctx_id == ctx_id) {
-            self.contexts.swap_remove(idx);
-        }
+    /// Resolve `ctx_id` for `owner`, or `None` if it is untracked or tracked by
+    /// a DIFFERENT owner.
+    pub fn resolve_owned_ctx(&self, owner: Option<DeviceOwner>, ctx_id: u32) -> Option<OwnedCtx> {
+        self.contexts
+            .iter()
+            .find(|c| c.ctx_id == ctx_id && c.owner == owner)
+            .map(|c| OwnedCtx { id: c.ctx_id })
+    }
+
+    /// Drop a context's tracking slot, but only for its owner. Returns the
+    /// resolved id, or `None` if the caller does not own it.
+    pub fn untrack_owned_context(&mut self, owner: Option<DeviceOwner>, ctx_id: u32) -> Option<u32> {
+        let idx = self
+            .contexts
+            .iter()
+            .position(|c| c.ctx_id == ctx_id && c.owner == owner)?;
+        Some(self.contexts.swap_remove(idx).ctx_id)
     }
 
     /// Pop one context still owned by `owner` (device-teardown reclamation
