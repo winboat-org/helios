@@ -992,9 +992,6 @@ unsafe fn apply_vidpn_source_address_locked(adapter: &AdapterContext, h_alloc: H
         adapter.vidpn_programming.store(0, Ordering::Release);
         return STATUS_NOT_SUPPORTED;
     };
-    if crate::ddi::scanout_diag::rebind_if_forced(adapter, 11) {
-        return STATUS_SUCCESS;
-    }
     let bound_wh = adapter.active_scanout_wh.load(Ordering::Acquire);
     let already_bound = adapter.active_scanout_resource.load(Ordering::Acquire)
         == target.resource_id

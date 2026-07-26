@@ -142,6 +142,21 @@ pub unsafe extern "C" fn hpd_thread_routine(context: *mut c_void) {
         // PASSIVE continuation for that exact callback.
         crate::ddi::display::process_deferred_vidpn_source_address(adapter);
 
+        // The ScanoutDiag forced-rebind experiment. It lives HERE, and not in
+        // apply_vidpn_source_address_locked where it used to sit, because there
+        // it short-circuited the production publication path: both of its
+        // `return true` arms skipped every remaining exit - including the
+        // vidpn_programming.store(0) that all sibling exits perform - while the
+        // DDI returned STATUS_SUCCESS to dxgkrnl as if the Windows primary had
+        // been programmed. The gate stayed at 1, the VSync heartbeat stopped,
+        // and the Windows primary was never bound again for the rest of the boot.
+        //
+        // This worker is PASSIVE and owns no dxgkrnl return value, so the
+        // experiment can no longer lie to the OS. `rebind_if_forced` is
+        // unchanged and keeps its own `ScanoutDiag >= 2 && display_half` gate,
+        // so every SdgR* counter keeps its exact name and value.
+        let _ = crate::ddi::scanout_diag::rebind_if_forced(adapter, 11);
+
         if adapter.scanout_refresh_pending.swap(0, Ordering::AcqRel) != 0 {
             match adapter.queue_active_scanout_refresh() {
                 ScanoutRefreshQueue::Queued => {}
