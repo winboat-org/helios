@@ -2398,8 +2398,21 @@ unsafe extern "C" fn open_resource(
         }
         let allocation_identity =
             unsafe { read_open_identity(info.pPrivateDriverData, info.PrivateDriverDataSize) };
-        if identity.is_none() {
-            identity = allocation_identity;
+        // Prefer the first candidate that carries the meta TRAILER, not merely
+        // the first that parses an identity. The KMD stamps the identity into
+        // both the per-allocation and the resource-level private buffer
+        // (create_allocation.rs `write_open_identity`), but the resource-level
+        // copy for KMD standard allocations is the pristine
+        // GetStandardAllocationDriverData output whose size the KMD does not
+        // choose: it can hold a valid 48-byte identity with no 16-byte trailer
+        // and shadow a per-allocation buffer that carries both. Selecting it
+        // then loses the real geometry. No change for buffers that do carry a
+        // trailer.
+        if !matches!(identity, Some((_, Some(_)))) {
+            let candidate_has_meta = matches!(allocation_identity, Some((_, Some(_))));
+            if candidate_has_meta || identity.is_none() {
+                identity = allocation_identity;
+            }
         }
         if let Some((ident, meta)) = allocation_identity {
             let meta = meta.unwrap_or_default();
