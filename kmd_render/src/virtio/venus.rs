@@ -226,9 +226,12 @@ const RING_SPIN_BURST: u32 = 50_000;
 /// genuinely wedged → the client latches `fatal`.
 const RING_WAIT_TIMEOUT_MS: u64 = 30_000;
 
-/// Maximum venus stream we build for any single direct/ring command. The largest
-/// is `vkCreateDevice` (~120 bytes); 512 is comfortable headroom.
-const MAX_CMD_BYTES: usize = 512;
+// The command-stream writer and its capacity live in `helios_kmd_logic`: they
+// are pure byte arithmetic with no adapter, handle or wdk-sys edge, and the size
+// claim that justifies the buffer is worth a host test. See
+// `writer_ext_full_create_device_is_332_bytes` there for the real number — the
+// comment that used to sit here said "~120 bytes" and was wrong by 212.
+use helios_kmd_logic::Writer;
 
 /// Diagnostic breadcrumb base for venus bring-up (0x0D00_00xx).
 fn diag(code: u32) {
@@ -736,68 +739,35 @@ impl Drop for KernelMap {
     }
 }
 
-// ── A tiny little-endian byte writer for building venus command streams ───────
+// ── Handing the encoded bytes out ───────────────────────────────────
 
-/// Fixed-capacity LE writer. All venus scalars are 4-byte aligned in the stream;
-/// `size_t`/`VkDeviceSize`/handle/array_size are 8 bytes, `u32`/`VkResult`/
-/// `VkStructureType`/`VkFlags`/`VkCommandTypeEXT` are 4 bytes.
-struct Writer {
-    buf: [u8; MAX_CMD_BYTES],
-    len: usize,
+/// The kernel-side half of [`Writer`]: turn a finished stream into bytes, or
+/// refuse loudly.
+///
+/// `helios_kmd_logic` has no `VirtioError` and no `diag` (that is the point of
+/// its absent dependency edge), so it reports overflow as `None`. Naming the
+/// refusal and picking the error code is this crate's job.
+trait EncodedStream {
+    /// The encoded bytes, or `DeviceError` if any write overflowed.
+    ///
+    /// Records `VnEncOvf` = the `VkCommandTypeEXT` that overflowed.
+    /// `record_named_bytes` is NOT `DiagLevel`-gated (unlike [`diag`]), so the
+    /// refusal is visible in a `reg query` on a production boot. It writes the
+    /// registry, so it must run at PASSIVE — which every venus encoder does:
+    /// `ring_wait_until` sleeps via `ctrl::sleep_ms`, so the whole ring API is
+    /// PASSIVE-only.
+    fn as_slice(&self) -> Result<&[u8], VirtioError>;
 }
 
-impl Writer {
-    fn new() -> Self {
-        Self {
-            buf: [0u8; MAX_CMD_BYTES],
-            len: 0,
+impl EncodedStream for Writer {
+    fn as_slice(&self) -> Result<&[u8], VirtioError> {
+        match self.finished() {
+            Some(bytes) => Ok(bytes),
+            None => {
+                crate::diag::record_named_bytes(b"VnEncOvf", self.cmd_type());
+                Err(VirtioError::DeviceError)
+            }
         }
-    }
-
-    fn u32(&mut self, v: u32) {
-        let b = v.to_le_bytes();
-        self.buf[self.len..self.len + 4].copy_from_slice(&b);
-        self.len += 4;
-    }
-
-    fn i32(&mut self, v: i32) {
-        self.u32(v as u32);
-    }
-
-    fn u64(&mut self, v: u64) {
-        let b = v.to_le_bytes();
-        self.buf[self.len..self.len + 8].copy_from_slice(&b);
-        self.len += 8;
-    }
-
-    /// A f32 priority value (encoded as its IEEE-754 bits).
-    fn f32(&mut self, v: f32) {
-        self.u32(v.to_bits());
-    }
-
-    /// `vn_encode_simple_pointer` / `vn_encode_array_size`: a u64 count (1 present,
-    /// 0 absent / empty array).
-    fn count(&mut self, present: bool) {
-        self.u64(if present { 1 } else { 0 });
-    }
-
-    fn bytes_padded(&mut self, bytes: &[u8]) {
-        let padded = (bytes.len() + 3) & !3;
-        self.buf[self.len..self.len + bytes.len()].copy_from_slice(bytes);
-        for i in bytes.len()..padded {
-            self.buf[self.len + i] = 0;
-        }
-        self.len += padded;
-    }
-
-    /// The command header: `VkCommandTypeEXT | VkCommandFlagsEXT`.
-    fn header(&mut self, cmd_type: u32, flags: u32) {
-        self.u32(cmd_type);
-        self.u32(flags);
-    }
-
-    fn as_slice(&self) -> &[u8] {
-        &self.buf[..self.len]
     }
 }
 
@@ -990,7 +960,7 @@ impl VenusClient {
         w.u64(self.ring_id);
         w.u32(self.notify_seqno);
         w.u32(0); // VkRingNotifyFlagsMESA
-        self.submit_direct(adapter, w.as_slice())?;
+        self.submit_direct(adapter, w.as_slice()?)?;
         Ok(seqno)
     }
 
@@ -1087,7 +1057,7 @@ impl VenusClient {
         set.u32(self.reply_res_id); // VkCommandStreamDescriptionMESA.resourceId
         set.u64(0); // .offset
         set.u64(REPLY_SHMEM_SIZE); // .size
-        self.write_to_ring(set.as_slice())?;
+        self.write_to_ring(set.as_slice()?)?;
 
         // The real command, with GENERATE_REPLY.
         self.write_to_ring(cmd_stream)?;
@@ -1108,12 +1078,12 @@ impl VenusClient {
         sub.header(CMD_SUBMIT_VIRTQUEUE_SEQNO_MESA, 0);
         sub.u64(self.ring_id);
         sub.u64(seqno);
-        self.submit_direct(adapter, sub.as_slice())?;
+        self.submit_direct(adapter, sub.as_slice()?)?;
 
         let mut wait = Writer::new();
         wait.header(CMD_WAIT_VIRTQUEUE_SEQNO_MESA, 0);
         wait.u64(seqno);
-        self.submit_direct(adapter, wait.as_slice())
+        self.submit_direct(adapter, wait.as_slice()?)
     }
 
     /// Allocate HOST_VISIBLE|HOST_COHERENT Venus device memory and bind it to a
@@ -1152,7 +1122,7 @@ impl VenusClient {
             w.count(false);
             w.count(true);
             w.u64(memory_id);
-            self.ring_command_reply(adapter, w.as_slice())?;
+            self.ring_command_reply(adapter, w.as_slice()?)?;
 
             let mut r = ReplyReader::new(&self.reply_map);
             let cmd = r.read_i32()?;
@@ -1300,7 +1270,7 @@ impl VenusClient {
         w.count(false); // pAllocator
         w.count(true);
         w.u64(image_id);
-        self.ring_command_reply(adapter, w.as_slice())?;
+        self.ring_command_reply(adapter, w.as_slice()?)?;
 
         let mut r = ReplyReader::new(&self.reply_map);
         let cmd = r.read_i32()?;
@@ -1356,7 +1326,7 @@ impl VenusClient {
         w.count(false); // pAllocator
         w.count(true);
         w.u64(image_id);
-        self.ring_command_reply(adapter, w.as_slice())?;
+        self.ring_command_reply(adapter, w.as_slice()?)?;
 
         let mut r = ReplyReader::new(&self.reply_map);
         let cmd = r.read_i32()?;
@@ -1449,7 +1419,7 @@ impl VenusClient {
         w.count(false); // pAllocator
         w.count(true);
         w.u64(image_id);
-        self.ring_command_reply(adapter, w.as_slice())?;
+        self.ring_command_reply(adapter, w.as_slice()?)?;
 
         let mut r = ReplyReader::new(&self.reply_map);
         let cmd = r.read_i32()?;
@@ -1511,7 +1481,7 @@ impl VenusClient {
         w.count(false); // pAllocator
         w.count(true);
         w.u64(image_id);
-        self.ring_command_reply(adapter, w.as_slice())?;
+        self.ring_command_reply(adapter, w.as_slice()?)?;
 
         let mut r = ReplyReader::new(&self.reply_map);
         if r.read_i32()? as u32 != CMD_CREATE_IMAGE || r.read_i32()? != 0 {
@@ -1547,7 +1517,7 @@ impl VenusClient {
         w.count(false); // pAllocator
         w.count(true);
         w.u64(memory_id);
-        self.ring_command_reply(adapter, w.as_slice())?;
+        self.ring_command_reply(adapter, w.as_slice()?)?;
 
         let mut r = ReplyReader::new(&self.reply_map);
         if r.read_i32()? as u32 != CMD_ALLOCATE_MEMORY || r.read_i32()? != 0 {
@@ -1653,7 +1623,7 @@ impl VenusClient {
         w.u64(self.device_id);
         w.u64(image_id);
         w.count(true);
-        self.ring_command_reply(adapter, w.as_slice())?;
+        self.ring_command_reply(adapter, w.as_slice()?)?;
 
         let mut r = ReplyReader::new(&self.reply_map);
         let cmd = r.read_i32()?;
@@ -1697,7 +1667,7 @@ impl VenusClient {
         w.count(false); // pAllocator
         w.count(true);
         w.u64(buffer_id);
-        self.ring_command_reply(adapter, w.as_slice())?;
+        self.ring_command_reply(adapter, w.as_slice()?)?;
 
         let mut r = ReplyReader::new(&self.reply_map);
         let cmd = r.read_i32()?;
@@ -1725,7 +1695,7 @@ impl VenusClient {
         w.u64(self.device_id);
         w.u64(buffer_id);
         w.count(true);
-        self.ring_command_reply(adapter, w.as_slice())?;
+        self.ring_command_reply(adapter, w.as_slice()?)?;
 
         let mut r = ReplyReader::new(&self.reply_map);
         let cmd = r.read_i32()?;
@@ -1765,7 +1735,7 @@ impl VenusClient {
         w.count(false);
         w.count(true);
         w.u64(memory_id);
-        self.ring_command_reply(adapter, w.as_slice())?;
+        self.ring_command_reply(adapter, w.as_slice()?)?;
 
         let mut r = ReplyReader::new(&self.reply_map);
         let cmd = r.read_i32()?;
@@ -1801,7 +1771,7 @@ impl VenusClient {
         w.count(false);
         w.count(true);
         w.u64(memory_id);
-        self.ring_command_reply(adapter, w.as_slice())?;
+        self.ring_command_reply(adapter, w.as_slice()?)?;
 
         let mut r = ReplyReader::new(&self.reply_map);
         let cmd = r.read_i32()?;
@@ -1846,7 +1816,7 @@ impl VenusClient {
         w.count(false); // pAllocator
         w.count(true);
         w.u64(memory_id);
-        self.ring_command_reply(adapter, w.as_slice())?;
+        self.ring_command_reply(adapter, w.as_slice()?)?;
 
         let mut r = ReplyReader::new(&self.reply_map);
         let cmd = r.read_i32()?;
@@ -1875,7 +1845,7 @@ impl VenusClient {
         w.u64(image_id);
         w.u64(memory_id);
         w.u64(0);
-        self.ring_command_reply(adapter, w.as_slice())?;
+        self.ring_command_reply(adapter, w.as_slice()?)?;
 
         let mut r = ReplyReader::new(&self.reply_map);
         let cmd = r.read_i32()?;
@@ -1902,7 +1872,7 @@ impl VenusClient {
         w.u64(buffer_id);
         w.u64(memory_id);
         w.u64(0);
-        self.ring_command_reply(adapter, w.as_slice())?;
+        self.ring_command_reply(adapter, w.as_slice()?)?;
 
         let mut r = ReplyReader::new(&self.reply_map);
         let cmd = r.read_i32()?;
@@ -1927,7 +1897,7 @@ impl VenusClient {
         w.u32(0);
         w.u32(0);
         w.count(true);
-        self.ring_command_reply(adapter, w.as_slice())?;
+        self.ring_command_reply(adapter, w.as_slice()?)?;
 
         let mut r = ReplyReader::new(&self.reply_map);
         let cmd = r.read_i32()?;
@@ -1963,7 +1933,7 @@ impl VenusClient {
         w.u32(0); // queueIndex
         w.count(true);
         w.u64(queue_id);
-        self.ring_command_reply(adapter, w.as_slice())?;
+        self.ring_command_reply(adapter, w.as_slice()?)?;
 
         let mut r = ReplyReader::new(&self.reply_map);
         let cmd = r.read_i32()?;
@@ -1993,7 +1963,7 @@ impl VenusClient {
         w.count(false); // pAllocator
         w.count(true);
         w.u64(pool_id);
-        self.ring_command_reply(adapter, w.as_slice())?;
+        self.ring_command_reply(adapter, w.as_slice()?)?;
 
         let mut r = ReplyReader::new(&self.reply_map);
         let cmd = r.read_i32()?;
@@ -2023,7 +1993,7 @@ impl VenusClient {
         w.u64(self.device_id);
         w.u64(pool_id);
         w.count(false);
-        self.ring_command_noreply(adapter, w.as_slice())
+        self.ring_command_noreply(adapter, w.as_slice()?)
     }
 
     fn allocate_command_buffer(
@@ -2043,7 +2013,7 @@ impl VenusClient {
         w.u32(1);
         w.u64(1); // pCommandBuffers array_size
         w.u64(command_buffer_id);
-        self.ring_command_reply(adapter, w.as_slice())?;
+        self.ring_command_reply(adapter, w.as_slice()?)?;
 
         let mut r = ReplyReader::new(&self.reply_map);
         let cmd = r.read_i32()?;
@@ -2093,7 +2063,7 @@ impl VenusClient {
         w.count(false);
         w.u32(usage_flags);
         w.count(false);
-        self.ring_command_reply(adapter, w.as_slice())?;
+        self.ring_command_reply(adapter, w.as_slice()?)?;
 
         let mut r = ReplyReader::new(&self.reply_map);
         let cmd = r.read_i32()?;
@@ -2148,7 +2118,7 @@ impl VenusClient {
         w.u32(1);
         w.u32(0);
         w.u32(1);
-        self.ring_command_noreply(adapter, w.as_slice())
+        self.ring_command_noreply(adapter, w.as_slice()?)
     }
 
     fn cmd_buffer_barrier(
@@ -2185,7 +2155,7 @@ impl VenusClient {
         w.u64(buffer_size);
         w.u32(0); // imageMemoryBarrierCount
         w.count(false);
-        self.ring_command_noreply(adapter, w.as_slice())
+        self.ring_command_noreply(adapter, w.as_slice()?)
     }
 
     fn cmd_copy_image(
@@ -2228,7 +2198,7 @@ impl VenusClient {
         w.u32(width);
         w.u32(height);
         w.u32(1);
-        self.ring_command_noreply(adapter, w.as_slice())
+        self.ring_command_noreply(adapter, w.as_slice()?)
     }
 
     fn cmd_blit_image(
@@ -2276,7 +2246,7 @@ impl VenusClient {
         w.i32(height);
         w.i32(1);
         w.u32(0); // VK_FILTER_NEAREST
-        self.ring_command_noreply(adapter, w.as_slice())
+        self.ring_command_noreply(adapter, w.as_slice()?)
     }
 
     fn cmd_copy_image_to_buffer(
@@ -2318,7 +2288,7 @@ impl VenusClient {
         w.u32(width);
         w.u32(height);
         w.u32(1);
-        self.ring_command_noreply(adapter, w.as_slice())
+        self.ring_command_noreply(adapter, w.as_slice()?)
     }
 
     fn cmd_clear_color_image(
@@ -2348,7 +2318,7 @@ impl VenusClient {
         w.u32(1);
         w.u32(0);
         w.u32(1);
-        self.ring_command_noreply(adapter, w.as_slice())
+        self.ring_command_noreply(adapter, w.as_slice()?)
     }
 
     fn end_command_buffer(
@@ -2359,7 +2329,7 @@ impl VenusClient {
         let mut w = Writer::new();
         w.header(CMD_END_COMMAND_BUFFER, CMD_FLAG_GENERATE_REPLY);
         w.u64(command_buffer_id);
-        self.ring_command_reply(adapter, w.as_slice())?;
+        self.ring_command_reply(adapter, w.as_slice()?)?;
 
         let mut r = ReplyReader::new(&self.reply_map);
         let cmd = r.read_i32()?;
@@ -2386,7 +2356,7 @@ impl VenusClient {
         w.count(false); // pAllocator
         w.count(true);
         w.u64(fence_id);
-        self.ring_command_reply(adapter, w.as_slice())?;
+        self.ring_command_reply(adapter, w.as_slice()?)?;
 
         let mut r = ReplyReader::new(&self.reply_map);
         let cmd = r.read_i32()?;
@@ -2423,7 +2393,7 @@ impl VenusClient {
         w.u64(fence_id);
         w.u32(1); // waitAll
         w.u64(5_000_000_000); // 5 s
-        self.ring_command_reply(adapter, w.as_slice())?;
+        self.ring_command_reply(adapter, w.as_slice()?)?;
 
         let mut r = ReplyReader::new(&self.reply_map);
         let cmd = r.read_i32()?;
@@ -2449,7 +2419,7 @@ impl VenusClient {
         w.u64(self.device_id);
         w.u64(fence_id);
         w.count(false); // pAllocator
-        self.ring_command_noreply(adapter, w.as_slice())
+        self.ring_command_noreply(adapter, w.as_slice()?)
     }
 
     /// Enqueue an empty fence marker. A later wait on this fence completes only
@@ -2465,7 +2435,7 @@ impl VenusClient {
         submit.u32(0); // submitCount
         submit.count(false); // pSubmits
         submit.u64(fence_id);
-        self.ring_command_reply(adapter, submit.as_slice())?;
+        self.ring_command_reply(adapter, submit.as_slice()?)?;
 
         let mut r = ReplyReader::new(&self.reply_map);
         if r.read_i32()? as u32 != CMD_QUEUE_SUBMIT || r.read_i32()? != 0 {
@@ -2497,7 +2467,7 @@ impl VenusClient {
         submit.u32(0); // signalSemaphoreCount
         submit.count(false);
         submit.u64(fence_id); // fence
-        self.ring_command_reply(adapter, submit.as_slice())?;
+        self.ring_command_reply(adapter, submit.as_slice()?)?;
 
         let mut r = ReplyReader::new(&self.reply_map);
         let cmd = r.read_i32()?;
@@ -2523,7 +2493,7 @@ impl VenusClient {
         w.u64(self.device_id);
         w.u64(image_id);
         w.count(false);
-        self.ring_command_noreply(adapter, w.as_slice())
+        self.ring_command_noreply(adapter, w.as_slice()?)
     }
 
     fn destroy_buffer_on_ring(
@@ -2536,7 +2506,7 @@ impl VenusClient {
         w.u64(self.device_id);
         w.u64(buffer_id);
         w.count(false);
-        self.ring_command_noreply(adapter, w.as_slice())
+        self.ring_command_noreply(adapter, w.as_slice()?)
     }
 
     fn cleanup_imported_source_alias(
@@ -3821,7 +3791,7 @@ impl VenusClient {
         ctrl::submit_venus_async_scanout(
             adapter,
             self.ctx_id,
-            submit.as_slice(),
+            submit.as_slice()?,
             primary_address,
             ticket,
         )
@@ -4023,7 +3993,7 @@ impl VenusClient {
 
         let command_buffer_id = self.present_blits[blt_index].command_buffer_id;
         let submit = self.encode_command_buffer_submit(command_buffer_id);
-        let fence_id = ctrl::submit_venus_async_present(adapter, self.ctx_id, submit.as_slice())?;
+        let fence_id = ctrl::submit_venus_async_present(adapter, self.ctx_id, submit.as_slice()?)?;
         let run_probe = {
             let blt = &mut self.present_blits[blt_index];
             blt.last_wire_fence_id = fence_id;
@@ -4616,7 +4586,7 @@ impl VenusClient {
         w.u64(self.device_id);
         w.u64(image_id);
         w.count(false);
-        self.submit_direct(adapter, w.as_slice())
+        self.submit_direct(adapter, w.as_slice()?)
     }
 
     /// Enqueue a raw Venus `vkFreeMemory` command.
@@ -4630,7 +4600,7 @@ impl VenusClient {
         w.u64(self.device_id);
         w.u64(memory_id);
         w.count(false); // pAllocator = NULL
-        self.ring_command_noreply(adapter, w.as_slice())
+        self.ring_command_noreply(adapter, w.as_slice()?)
     }
 
     /// Free a Venus `VkDeviceMemory`, removing its local blob identity only
@@ -4773,7 +4743,7 @@ pub fn allocate_host_visible_blob(
         w.u64(RING_BUFFER_SIZE as u64); // bufferSize
         w.u64(RING_EXTRA_OFFSET); // extraOffset
         w.u64(RING_EXTRA_SIZE); // extraSize
-        client.submit_direct(adapter, w.as_slice())?;
+        client.submit_direct(adapter, w.as_slice()?)?;
     }
     diag(0x0004);
 
@@ -4803,7 +4773,7 @@ pub fn allocate_host_visible_blob(
         w.count(false); // simple_pointer(pAllocator) NULL
         w.count(true); // simple_pointer(pInstance)
         w.u64(instance_id); // VkInstance handle
-        client.ring_command_reply(adapter, w.as_slice())?;
+        client.ring_command_reply(adapter, w.as_slice()?)?;
     }
     // Reply: [i32 cmd][i32 VkResult][simple_pointer u64][u64 instance]
     {
@@ -4830,7 +4800,7 @@ pub fn allocate_host_visible_blob(
         w.count(true); // simple_pointer(pPhysicalDeviceCount)
         w.u32(0); // *pPhysicalDeviceCount = 0
         w.count(false); // pPhysicalDevices NULL → array_size 0
-        client.ring_command_reply(adapter, w.as_slice())?;
+        client.ring_command_reply(adapter, w.as_slice()?)?;
         // We don't strictly need the count value; just validate the reply header.
         let mut r = ReplyReader::new(&client.reply_map);
         let cmd = r.read_i32()?;
@@ -4851,7 +4821,7 @@ pub fn allocate_host_visible_blob(
         w.u32(1); // *pPhysicalDeviceCount = 1
         w.count(true); // pPhysicalDevices present → array_size 1 follows
         w.u64(phys_dev_id); // guest-assigned VkPhysicalDevice id for slot 0
-        client.ring_command_reply(adapter, w.as_slice())?;
+        client.ring_command_reply(adapter, w.as_slice()?)?;
 
         // Reply: [i32 cmd][i32 VkResult][sp u64][u32 count][array_size u64][u64 id×N]
         let mut r = ReplyReader::new(&client.reply_map);
@@ -4904,7 +4874,7 @@ pub fn allocate_host_visible_blob(
                        // partial-encoded struct: array_size(32) then array_size(16).
         w.u64(VK_MAX_MEMORY_TYPES as u64);
         w.u64(VK_MAX_MEMORY_HEAPS as u64);
-        client.ring_command_reply(adapter, w.as_slice())?;
+        client.ring_command_reply(adapter, w.as_slice()?)?;
 
         // Reply (NO VkResult): [i32 cmd][sp u64][u32 typeCount][array u64]
         //   [ (u32 propertyFlags, u32 heapIndex) × 32 ]
@@ -5040,7 +5010,7 @@ pub fn allocate_host_visible_blob(
         w.count(false); // simple_pointer(pAllocator) NULL
         w.count(true); // simple_pointer(pDevice)
         w.u64(device_id); // VkDevice handle
-        client.ring_command_reply(adapter, w.as_slice())?;
+        client.ring_command_reply(adapter, w.as_slice()?)?;
 
         // Reply: [i32 cmd][i32 VkResult][sp u64][u64 device]
         let mut r = ReplyReader::new(&client.reply_map);

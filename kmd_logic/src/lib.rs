@@ -387,6 +387,147 @@ impl ScanoutFormat {
     }
 }
 
+/// Maximum venus command stream built for any single direct/ring command.
+///
+/// The largest encoder in the KMD is `vkCreateDevice` at its `EXT_FULL` tier,
+/// which is **332 bytes**: 144 bytes of struct plus a 188-byte extension block
+/// (five 8-byte string lengths plus 24+28+28+32+36 bytes of NUL-terminated,
+/// 4-byte-padded names). That leaves 180 bytes of slack — enough for one more
+/// extension string, not for four, and not for any encoder that grows by a
+/// `pNext` chain, a multi-region `vkCmdCopyImage` or a queue-family index array.
+///
+/// The number is asserted by `writer_ext_full_create_device_is_332_bytes` below
+/// rather than by a comment: the previous comment claimed "the largest is
+/// `vkCreateDevice` (~120 bytes)" and was wrong by 212 bytes, which mattered
+/// because until [`Writer`] gained a checked API, overrunning this buffer was a
+/// slice-index panic — i.e. a `KeBugCheck` inside a DDI.
+pub const MAX_CMD_BYTES: usize = 512;
+
+/// Fixed-capacity little-endian writer for venus command streams.
+///
+/// All venus scalars are 4-byte aligned in the stream; `size_t` / `VkDeviceSize`
+/// / handle / array_size are 8 bytes, and `u32` / `VkResult` / `VkStructureType`
+/// / `VkFlags` / `VkCommandTypeEXT` are 4 bytes.
+///
+/// Overflow is **sticky and non-panicking**: a write that would exceed
+/// [`MAX_CMD_BYTES`] is dropped, the writer is poisoned, and [`Writer::finished`]
+/// returns `None` forever after. The caller turns that into a refusal with a
+/// named counter. Every write method is infallible so the ~40 encoder bodies
+/// stay linear; the single fallible point is where the bytes are handed out.
+pub struct Writer {
+    buf: [u8; MAX_CMD_BYTES],
+    len: usize,
+    overflow: bool,
+}
+
+impl Default for Writer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Writer {
+    pub const fn new() -> Self {
+        Self {
+            buf: [0u8; MAX_CMD_BYTES],
+            len: 0,
+            overflow: false,
+        }
+    }
+
+    /// Reserve `n` bytes, or poison the writer and report that there is no room.
+    fn reserve(&mut self, n: usize) -> bool {
+        if self.overflow || self.len + n > MAX_CMD_BYTES {
+            self.overflow = true;
+            return false;
+        }
+        true
+    }
+
+    pub fn u32(&mut self, v: u32) {
+        if !self.reserve(4) {
+            return;
+        }
+        self.buf[self.len..self.len + 4].copy_from_slice(&v.to_le_bytes());
+        self.len += 4;
+    }
+
+    pub fn i32(&mut self, v: i32) {
+        self.u32(v as u32);
+    }
+
+    pub fn u64(&mut self, v: u64) {
+        if !self.reserve(8) {
+            return;
+        }
+        self.buf[self.len..self.len + 8].copy_from_slice(&v.to_le_bytes());
+        self.len += 8;
+    }
+
+    /// A f32 priority value (encoded as its IEEE-754 bits).
+    pub fn f32(&mut self, v: f32) {
+        self.u32(v.to_bits());
+    }
+
+    /// `vn_encode_simple_pointer` / `vn_encode_array_size`: a u64 count (1
+    /// present, 0 absent / empty array).
+    pub fn count(&mut self, present: bool) {
+        self.u64(if present { 1 } else { 0 });
+    }
+
+    /// Copy `bytes` and zero-fill to the next 4-byte boundary.
+    pub fn bytes_padded(&mut self, bytes: &[u8]) {
+        let padded = (bytes.len() + 3) & !3;
+        if !self.reserve(padded) {
+            return;
+        }
+        self.buf[self.len..self.len + bytes.len()].copy_from_slice(bytes);
+        for i in bytes.len()..padded {
+            self.buf[self.len + i] = 0;
+        }
+        self.len += padded;
+    }
+
+    /// The command header: `VkCommandTypeEXT | VkCommandFlagsEXT`.
+    pub fn header(&mut self, cmd_type: u32, flags: u32) {
+        self.u32(cmd_type);
+        self.u32(flags);
+    }
+
+    /// Bytes written so far. Meaningless once [`Writer::overflowed`] is set.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// True once any write has been refused for want of room.
+    pub fn overflowed(&self) -> bool {
+        self.overflow
+    }
+
+    /// The `VkCommandTypeEXT` this stream opened with — stream word 0, read back
+    /// so an overflow refusal can name the command that caused it. Reads 0 if the
+    /// header was never written.
+    pub fn cmd_type(&self) -> u32 {
+        if self.len < 4 {
+            return 0;
+        }
+        u32::from_le_bytes([self.buf[0], self.buf[1], self.buf[2], self.buf[3]])
+    }
+
+    /// The encoded stream, or `None` if any write overflowed.
+    ///
+    /// This is the only way to get the bytes out, so a stream that did not fit
+    /// cannot be submitted: the `Option` replaces what used to be a slice-index
+    /// panic on the first over-long write.
+    pub fn finished(&self) -> Option<&[u8]> {
+        (!self.overflow).then(|| &self.buf[..self.len])
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -734,5 +875,181 @@ mod tests {
         let wrapped = gate_pack(u32::MAX, true);
         assert_eq!(gate_seq(wrapped).wrapping_add(1), 0);
         assert_ne!(gate_pack(0, true), wrapped);
+    }
+
+    // ── Writer ────────────────────────────────────────────────────────────────
+
+    /// The KMD's `EXT_FULL` extension tier, verbatim from
+    /// `kmd_render/src/virtio/venus.rs`. These strings decide the size of the
+    /// largest stream the driver ever encodes, so the test carries its own copy:
+    /// if the driver's list grows, this test still asserts the OLD number and the
+    /// [`MAX_CMD_BYTES`] headroom must be recomputed deliberately.
+    const EXT_FULL: [&[u8]; 5] = [
+        b"VK_KHR_external_memory\0",
+        b"VK_KHR_external_memory_fd\0",
+        b"VK_KHR_image_format_list\0",
+        b"VK_EXT_external_memory_dma_buf\0",
+        b"VK_EXT_image_drm_format_modifier\0",
+    ];
+
+    /// Re-encode `vkCreateDevice` exactly as `create_venus_device` does, for the
+    /// given extension list.
+    fn encode_create_device(exts: &[&[u8]]) -> Writer {
+        const CMD_CREATE_DEVICE: u32 = 11;
+        const CMD_FLAG_GENERATE_REPLY: u32 = 1;
+        const ST_DEVICE_CREATE_INFO: i32 = 3;
+        const ST_DEVICE_QUEUE_CREATE_INFO: i32 = 2;
+
+        let mut w = Writer::new();
+        w.header(CMD_CREATE_DEVICE, CMD_FLAG_GENERATE_REPLY);
+        w.u64(0xDEAD_BEEF); // VkPhysicalDevice
+        w.count(true); // simple_pointer(pCreateInfo)
+        w.i32(ST_DEVICE_CREATE_INFO);
+        w.u64(0); // pNext
+        w.u32(0); // flags
+        w.u32(1); // queueCreateInfoCount
+        w.count(true); // array_size(1)
+        w.i32(ST_DEVICE_QUEUE_CREATE_INFO);
+        w.u64(0); // pNext
+        w.u32(0); // flags
+        w.u32(0); // queueFamilyIndex
+        w.u32(1); // queueCount
+        w.count(true); // array_size(1)
+        w.f32(1.0); // priority
+        w.u32(0); // enabledLayerCount
+        w.count(false);
+        if exts.is_empty() {
+            w.u32(0);
+            w.count(false);
+        } else {
+            w.u32(exts.len() as u32);
+            w.u64(exts.len() as u64);
+            for ext in exts {
+                w.u64(ext.len() as u64);
+                w.bytes_padded(ext);
+            }
+        }
+        w.count(false); // pEnabledFeatures
+        w.count(false); // pAllocator
+        w.count(true); // simple_pointer(pDevice)
+        w.u64(0x1234); // VkDevice handle
+        w
+    }
+
+    /// The number that sizes [`MAX_CMD_BYTES`]. The comment this replaces said
+    /// "the largest is vkCreateDevice (~120 bytes)" and was wrong by 212 bytes,
+    /// so the buffer's whole safety margin was arithmetic performed in prose.
+    #[test]
+    fn writer_ext_full_create_device_is_332_bytes() {
+        let w = encode_create_device(&EXT_FULL);
+        assert!(!w.overflowed());
+        assert_eq!(w.len(), 332);
+        // 144 bytes of struct plus a 188-byte extension block. The zero-extension
+        // arm encodes the same two words for count and array size, so the
+        // difference is exactly the five lengths plus the five padded names.
+        let bare = encode_create_device(&[]);
+        assert_eq!(bare.len(), 144);
+        assert_eq!(w.len() - bare.len(), 188);
+    }
+
+    /// 512 - 332 = 180 bytes of slack. A 32-character extension name costs 44
+    /// bytes (an 8-byte length plus 33 bytes padded to 36), so FOUR more still
+    /// fit at 508 bytes and a fifth does not.
+    ///
+    /// Both the original finding ("a sixth extension bugchecks the guest") and
+    /// the review that corrected it ("four more EXT_FULL strings" overflow) are
+    /// wrong in the same direction. This is the measured boundary.
+    #[test]
+    fn writer_headroom_is_four_more_extension_names() {
+        const BIG: &[u8] = b"VK_EXT_image_drm_format_modifier\0";
+        let plus_four: [&[u8]; 9] = [
+            EXT_FULL[0], EXT_FULL[1], EXT_FULL[2], EXT_FULL[3], EXT_FULL[4], BIG, BIG, BIG, BIG,
+        ];
+        let w = encode_create_device(&plus_four);
+        assert!(!w.overflowed(), "four more names must still fit");
+        assert_eq!(w.len(), 508);
+
+        let plus_five: [&[u8]; 10] = [
+            EXT_FULL[0],
+            EXT_FULL[1],
+            EXT_FULL[2],
+            EXT_FULL[3],
+            EXT_FULL[4],
+            BIG,
+            BIG,
+            BIG,
+            BIG,
+            BIG,
+        ];
+        let w = encode_create_device(&plus_five);
+        assert!(w.overflowed(), "a fifth extra name must be refused");
+        assert!(w.finished().is_none());
+    }
+
+    /// Overflow must be sticky: a refused write must not leave a shorter, valid
+    /// looking stream that a later small write could complete.
+    #[test]
+    fn writer_overflow_is_sticky_and_withholds_the_bytes() {
+        let mut w = Writer::new();
+        w.header(7, 0);
+        assert_eq!(w.cmd_type(), 7);
+        for _ in 0..MAX_CMD_BYTES {
+            w.u64(0);
+        }
+        assert!(w.overflowed());
+        assert!(w.finished().is_none());
+        // A write that WOULD fit must not un-poison it.
+        w.u32(1);
+        assert!(w.finished().is_none());
+        // The command type stays readable so the refusal can name the command.
+        assert_eq!(w.cmd_type(), 7);
+    }
+
+    /// The exact boundary: a stream that fills the buffer to the last byte is
+    /// valid; one byte more is not.
+    #[test]
+    fn writer_accepts_exactly_max_cmd_bytes() {
+        let mut w = Writer::new();
+        for _ in 0..MAX_CMD_BYTES / 8 {
+            w.u64(0);
+        }
+        assert!(!w.overflowed());
+        assert_eq!(w.len(), MAX_CMD_BYTES);
+        assert_eq!(w.finished().map(|s| s.len()), Some(MAX_CMD_BYTES));
+
+        w.u32(0);
+        assert!(w.overflowed());
+    }
+
+    /// `bytes_padded` zero-fills to the next 4-byte boundary, and the padding is
+    /// counted against the budget — a 33-byte name costs 36.
+    #[test]
+    fn writer_bytes_padded_pads_with_zeroes() {
+        let mut w = Writer::new();
+        w.bytes_padded(b"abcde");
+        assert_eq!(w.len(), 8);
+        assert_eq!(w.finished(), Some(&b"abcde\0\0\0"[..]));
+
+        let mut w = Writer::new();
+        w.bytes_padded(b"VK_EXT_image_drm_format_modifier\0");
+        assert_eq!(w.len(), 36);
+    }
+
+    /// Little-endian, and the header is two 4-byte words in encode order.
+    #[test]
+    fn writer_encodes_little_endian() {
+        let mut w = Writer::new();
+        w.header(0x1122_3344, 0x5566_7788);
+        w.u64(0x0102_0304_0506_0708);
+        w.f32(1.0);
+        assert_eq!(
+            w.finished(),
+            Some(
+                &[
+                    0x44, 0x33, 0x22, 0x11, 0x88, 0x77, 0x66, 0x55, 0x08, 0x07, 0x06, 0x05, 0x04,
+                    0x03, 0x02, 0x01, 0x00, 0x00, 0x80, 0x3F,
+                ][..]
+            )
+        );
     }
 }
