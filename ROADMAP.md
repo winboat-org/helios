@@ -161,8 +161,9 @@ virtio-gpu scanout; IddCx/Looking Glass is no longer the active display path.*
    no `FreeLibrary` (R416, the largest measured per-frame win); the LINEAR scanout probe has no
    negative cache (R417); 267 `log_line` vs 27 `trace_line!` sites with a 21-argument `format!` on
    all seven draw entry points (R420).
-   ⚠ **Blocking prerequisite for R420: confirm with the owner which currently-unconditional log
-   lines the triage recipes grep for BEFORE moving them behind `trace_line!`.** ⚠ R417 commit (3)
+   ⚠ R420: grep `tools/`, `*.ps1`, `*.md`, `*.py`, `*.sh` for each line's text before converting
+   it. Checked 2026-07-26: **nothing automated reads a UMD log line**; the only line a documented
+   procedure depends on is the C++ `present-gate:` line, which R420 does not touch. ⚠ R417 commit (3)
    is owner-gated: `track_dwm_composition_target` is the ONLY writer of `dev.composition_source`.
    ⚠ The UMD has **no registry/escape counter surface** — a "named counter" is a process-global
    `AtomicUsize` next to the `EXT_*` block plus a field in an existing periodic dump line.
