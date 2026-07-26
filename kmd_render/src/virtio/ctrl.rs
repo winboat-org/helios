@@ -209,7 +209,15 @@ pub fn reap_parked(adapter: &AdapterContext) {
     }
     // Moving buffers into the pre-reserved pool is allocation-free under the
     // spinlock. Excess buffers are returned and dropped here at PASSIVE.
-    let Ok(mut excess) = adapter.with_virtio(move |v| v.recycle_dma_buffers(buffers)) else {
+    //
+    // The `else` arm is the two-phase strand: returning here without
+    // finish_parked_reap left reap_in_progress true and both pre-reserved
+    // spares taken, permanently disabling reaping and then refusing every
+    // enqueue at the PARKED_ENQUEUE_GATE. `dead` is already drained, so the
+    // abort restores both vectors intact.
+    let excess = adapter.with_virtio(move |v| v.recycle_dma_buffers(buffers));
+    let Ok(mut excess) = excess else {
+        let _ = adapter.with_virtio(move |v| v.abort_parked_reap(dead, alloc::vec::Vec::new()));
         return;
     };
     // Drop only the retained elements at PASSIVE while preserving the vector's

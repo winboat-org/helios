@@ -167,6 +167,10 @@ pub static FENCE_EVENT_TEARDOWN_DROPS: AtomicU32 = AtomicU32::new(0);
 /// nonzero value means the driver chose a TDR-visible completion over an
 /// undrainable queue.
 pub static WDDM_SIGNAL_AFTER_FAILURE: AtomicU32 = AtomicU32::new(0);
+/// Parked reaps abandoned between `begin_parked_reap` and `finish_parked_reap`.
+/// Exists so a future strand shows up as itself rather than as a generic
+/// `QUEUE_FULL_RETRIES` climb.
+pub static REAP_ABANDONED: AtomicU32 = AtomicU32::new(0);
 /// High-water of `fence_events.len()` since driver start.
 pub static FENCE_EVENT_HIGH_WATER: AtomicU32 = AtomicU32::new(0);
 
@@ -1696,13 +1700,39 @@ impl VirtioGpu {
 
     /// Return the emptied pre-reserved reap vectors after excess DMA buffers
     /// were dropped at PASSIVE_LEVEL.
-    pub fn finish_parked_reap(&mut self, entries: Vec<InFlight>, buffers: Vec<DmaBuffer>) {
-        debug_assert!(entries.is_empty());
-        debug_assert!(buffers.is_empty());
-        debug_assert!(self.reap_in_progress);
+    pub fn finish_parked_reap(&mut self, mut entries: Vec<InFlight>, mut buffers: Vec<DmaBuffer>) {
+        // These were debug_assert-only, i.e. absent from the release driver
+        // (kmd_render sets no debug-assertions). They guard the capacity the
+        // `parked.push` path relies on to never reallocate under the spinlock,
+        // so enforce them for real: clear, and replace any vector whose capacity
+        // fell below its reserve with a freshly reserved one. Both allocations
+        // happen HERE, at PASSIVE, never under the lock.
+        entries.clear();
+        buffers.clear();
+        if entries.capacity() < MAX_PARKED {
+            entries = Vec::with_capacity(MAX_PARKED);
+        }
+        if buffers.capacity() < 2 * MAX_PARKED {
+            buffers = Vec::with_capacity(2 * MAX_PARKED);
+        }
         self.parked_spare = entries;
         self.reap_buffers_spare = buffers;
         self.reap_in_progress = false;
+    }
+
+    /// Undo [`Self::begin_parked_reap`] on a failure path, restoring both spares
+    /// and clearing the in-progress flag.
+    ///
+    /// Without this, an early return between begin and finish stranded
+    /// `reap_in_progress` at true AND left both pre-reserved spares taken, so
+    /// reaping was permanently disabled and every later enqueue hit the
+    /// `PARKED_ENQUEUE_GATE` refusal. Latent today only because the sole
+    /// reachable early return is a concurrent StopDevice, after which the whole
+    /// `VirtioGpu` is replaced - but that is a property of today's callers, not
+    /// of the protocol.
+    pub fn abort_parked_reap(&mut self, entries: Vec<InFlight>, buffers: Vec<DmaBuffer>) {
+        REAP_ABANDONED.fetch_add(1, Ordering::Relaxed);
+        self.finish_parked_reap(entries, buffers);
     }
 
     /// Take one already-allocated DMA buffer whose page capacity covers `len`.
