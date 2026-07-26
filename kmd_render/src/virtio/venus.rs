@@ -698,6 +698,46 @@ struct PreparedPresentBlt {
     probe_done: bool,
 }
 
+impl PreparedPresentBlt {
+    /// Destroy the host objects this record owns, handing the record BACK on
+    /// failure.
+    ///
+    /// The loop this replaces called `pop()` first and then `?`-returned after
+    /// it, so a mid-loop failure forgot the cache record while its host objects
+    /// were still alive. `release_present_blits_for_resource` goes to real
+    /// trouble to be all-or-nothing — it drains every wire fence, then submits
+    /// and waits a queue marker before touching anything, and its own comment
+    /// says "retain the complete cache ... rather than partially freeing live
+    /// objects" — so the loops violated exactly the contract the prologue
+    /// establishes. Consuming `self` and returning it in the error makes the
+    /// forgotten-record state unrepresentable rather than merely avoided.
+    fn release(
+        self,
+        client: &mut VenusClient,
+        adapter: &AdapterContext,
+    ) -> Result<(), (Self, VirtioError)> {
+        if let Err(e) = client.destroy_command_pool(adapter, self.command_pool_id) {
+            return Err((self, e));
+        }
+        if let Some(pool_id) = self.conversion_init_pool_id {
+            if let Err(e) = client.destroy_command_pool(adapter, pool_id) {
+                return Err((self, e));
+            }
+        }
+        if let Some(image_id) = self.conversion_image_id {
+            if let Err(e) = client.destroy_image_on_ring(adapter, image_id) {
+                return Err((self, e));
+            }
+        }
+        if let Some(memory_id) = self.conversion_memory_id {
+            if let Err(e) = client.free_memory_object(adapter, memory_id) {
+                return Err((self, e));
+            }
+        }
+        Ok(())
+    }
+}
+
 const MAX_PRESENT_IMAGES: usize = 32;
 const MAX_PRESENT_BUFFERS: usize = 16;
 const MAX_PRESENT_BLITS: usize = 32;
@@ -4537,15 +4577,15 @@ impl VenusClient {
         self.destroy_fence(adapter, marker)?;
 
         while let Some(blt) = self.present_blits.pop() {
-            self.destroy_command_pool(adapter, blt.command_pool_id)?;
-            if let Some(pool_id) = blt.conversion_init_pool_id {
-                self.destroy_command_pool(adapter, pool_id)?;
-            }
-            if let Some(image_id) = blt.conversion_image_id {
-                self.destroy_image_on_ring(adapter, image_id)?;
-            }
-            if let Some(memory_id) = blt.conversion_memory_id {
-                self.free_memory_object(adapter, memory_id)?;
+            if let Err((blt, error)) = blt.release(self, adapter) {
+                // Reinsert: MAX_PRESENT_BLITS capacity is preallocated, so this
+                // push cannot allocate under any lock. The record must go back
+                // because its host objects may still exist — the whole point of
+                // the consuming signature is that "forgot the record while the
+                // object survives" has nowhere to be written.
+                self.present_blits.push(blt);
+                crate::diag::record_named_bytes(b"PBTdErr", resource_id);
+                return Err(error);
             }
         }
         while let Some(image) = self.present_images.pop() {
