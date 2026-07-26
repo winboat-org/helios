@@ -241,7 +241,32 @@ impl DisplayMode {
     pub const fn packed(self) -> u32 {
         (self.width.get() << 16) | (self.height.get() & 0xFFFF)
     }
+
+    /// The extent used when the host reports nothing usable.
+    ///
+    /// Written as a total `match` rather than an `unwrap` or a const `panic!`:
+    /// a panicking expression has no place in a crate the kernel driver links,
+    /// even one that could only fire at compile time. The `None` arms are
+    /// unreachable for the nonzero constants below, and
+    /// `display_mode_fallback_is_the_documented_extent` asserts that — so an
+    /// edit that broke it fails a host test instead of silently degrading the
+    /// fallback to the minimum extent.
+    pub const FALLBACK: Self = Self {
+        width: match core::num::NonZeroU32::new(FALLBACK_DISPLAY_WIDTH) {
+            Some(w) => w,
+            None => core::num::NonZeroU32::MIN,
+        },
+        height: match core::num::NonZeroU32::new(FALLBACK_DISPLAY_HEIGHT) {
+            Some(h) => h,
+            None => core::num::NonZeroU32::MIN,
+        },
+    };
 }
+
+/// The mode Helios advertises when the host's `GET_DISPLAY_INFO` reported no
+/// usable scanout-0 size. Mirrored by `ddi::vidpn::DEFAULT_MODE_*`.
+pub const FALLBACK_DISPLAY_WIDTH: u32 = 1920;
+pub const FALLBACK_DISPLAY_HEIGHT: u32 = 1080;
 
 impl From<DisplayMode> for (u32, u32) {
     fn from(mode: DisplayMode) -> Self {
@@ -641,6 +666,23 @@ mod tests {
         // width, since DspMd masks only the height.
         let wide = DisplayMode::from_host(4096, 2160).expect("4K");
         assert_eq!(wide.packed() >> 16, 4096);
+    }
+
+    /// `DisplayMode::FALLBACK`'s `None` arms are unreachable — this is what says
+    /// so, instead of a const `panic!` inside a crate the kernel driver links.
+    #[test]
+    fn display_mode_fallback_is_the_documented_extent() {
+        assert_eq!(
+            <(u32, u32)>::from(DisplayMode::FALLBACK),
+            (FALLBACK_DISPLAY_WIDTH, FALLBACK_DISPLAY_HEIGHT)
+        );
+        assert_eq!(<(u32, u32)>::from(DisplayMode::FALLBACK), (1920, 1080));
+        // If either constant were edited below the floor the const `match` would
+        // silently degrade to the minimum extent; this catches that.
+        assert_eq!(
+            DisplayMode::from_host(FALLBACK_DISPLAY_WIDTH, FALLBACK_DISPLAY_HEIGHT),
+            Some(DisplayMode::FALLBACK)
+        );
     }
 
     #[test]

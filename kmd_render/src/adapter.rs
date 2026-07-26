@@ -322,18 +322,18 @@ impl ScanoutMode {
     }
 }
 
-/// The 1920×1080 fallback, validated at COMPILE time.
+/// The 1920×1080 fallback as an already-validated value, so nothing on the
+/// display path needs an `unwrap` on a constant that cannot fail.
 ///
-/// A `const` match, not a runtime `unwrap`: if the default mode were ever edited
-/// below the minimum extent this is a build failure, and no runtime panic path
-/// is generated — which matters because a panic in any DDI is a silent graphics
-/// deadlock.
-const DEFAULT_SCANOUT_EXTENT: DisplayMode = match DisplayMode::from_host(
-    crate::ddi::vidpn::DEFAULT_MODE_WIDTH,
-    crate::ddi::vidpn::DEFAULT_MODE_HEIGHT,
-) {
-    Some(mode) => mode,
-    None => panic!("the default VidPn mode must be at or above the minimum extent"),
+/// `DisplayMode::FALLBACK` is a total const expression with no panic path — see
+/// its doc — and `kmd_logic`'s host tests pin it to the documented extent and to
+/// `vidpn::DEFAULT_MODE_*`.
+const DEFAULT_SCANOUT_EXTENT: DisplayMode = DisplayMode::FALLBACK;
+
+/// The two fallback constants must not drift apart.
+const _: () = {
+    assert!(crate::ddi::vidpn::DEFAULT_MODE_WIDTH == helios_kmd_logic::FALLBACK_DISPLAY_WIDTH);
+    assert!(crate::ddi::vidpn::DEFAULT_MODE_HEIGHT == helios_kmd_logic::FALLBACK_DISPLAY_HEIGHT);
 };
 
 /// State whose meaning dies with the transport generation that produced it.
@@ -575,6 +575,16 @@ pub struct AdapterContext {
     /// the DPC signals `hpd_event`, then the PASSIVE worker consumes this bit and
     /// re-indicates connection.
     pub config_change_pending: AtomicU32,
+    /// 1 once `DxgkDdiStartDevice` has returned.
+    ///
+    /// `DxgkCbIndicateChildStatus` is forbidden DURING StartDevice, and the HPD
+    /// worker is a thread StartDevice itself spawned — so "StartDevice has
+    /// returned" cannot be a compile-time fact. It used to be approximated by a
+    /// 500 ms relative wait, i.e. a delay standing in for an event, with nothing
+    /// actually observing the return. This is the real edge: StartDevice sets it
+    /// and signals `hpd_event`, which demotes the timeout to a documented
+    /// fallback rather than the mechanism.
+    pub start_complete: AtomicU32,
 }
 
 // SAFETY (rewritten by R510 to name what is actually here now):
@@ -1001,7 +1011,20 @@ impl AdapterContext {
             hpd_stop: AtomicU32::new(0),
             hpd_worker_leaked: AtomicU32::new(0),
             config_change_pending: AtomicU32::new(0),
+            start_complete: AtomicU32::new(0),
         }
+    }
+
+    /// Publish "StartDevice has returned" and wake the HPD worker.
+    ///
+    /// The last thing `DxgkDdiStartDevice` does. Before this, the worker's
+    /// prologue simply waited 500 ms and hoped; now the wait has a real wake
+    /// source and the timeout is only a fallback.
+    pub(crate) fn signal_start_complete(&self) {
+        self.start_complete.store(1, Ordering::Release);
+        // SAFETY: hpd_event was initialized in place by init_kernel_events;
+        // KeSetEvent(Wait=FALSE) is legal through DISPATCH_LEVEL.
+        unsafe { KeSetEvent(self.hpd_event.get(), 0, 0) };
     }
 
     /// Start the HPD worker thread (StartDevice, display half). PASSIVE_LEVEL.

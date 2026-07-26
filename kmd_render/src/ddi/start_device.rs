@@ -143,6 +143,15 @@ pub unsafe extern "C" fn dxgkddi_start_device(
     // SAFETY: Dxgkrnl passes our adapter context and valid out-pointers.
     let adapter = unsafe { &*(miniport_device_context as *const AdapterContext) };
 
+    // Clear the start edge FIRST. On a stop/start cycle the flag survives from
+    // the previous start (the context does), and `init_hpd` below spawns a fresh
+    // worker — which would see a stale 1, skip the wait entirely and indicate
+    // child status while THIS StartDevice is still running. That is precisely
+    // what the wait exists to prevent.
+    adapter
+        .start_complete
+        .store(0, core::sync::atomic::Ordering::Release);
+
     // The callback interface, copied for the driver's lifetime (Copy struct).
     let dxgkrnl = unsafe { *dxgkrnl_interface };
     crate::diag::record(0x0B00_0002);
@@ -410,6 +419,11 @@ pub unsafe extern "C" fn dxgkddi_start_device(
     }
 
     crate::diag::record(0x0B00_0004);
+    // LAST action: the real edge the HPD worker waits on. Its prologue used to
+    // approximate "StartDevice has returned" with a 500 ms delay; that delay is
+    // now only a bounded fallback (`HpdStTo` counts it firing). Safe to signal
+    // even when the worker was never started — nothing else waits on this.
+    adapter.signal_start_complete();
     STATUS_SUCCESS
 }
 

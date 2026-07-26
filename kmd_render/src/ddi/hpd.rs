@@ -19,6 +19,26 @@ use wdk_sys::ntddk::{KeWaitForSingleObject, PsTerminateSystemThread};
 
 const STATUS_TIMEOUT: NTSTATUS = 0x0000_0102;
 
+/// Bounded fallback for the prologue's wait on "StartDevice has returned".
+///
+/// This is a SAFETY BOUND, not the mechanism. The mechanism is
+/// `AdapterContext::signal_start_complete`, which StartDevice calls as its last
+/// action; this only caps how long the worker sits idle if that edge is somehow
+/// missed, so the first `Connected=1` still reaches the OS. Keeping the bound is
+/// deliberate — the defect was a delay standing in for an event, not the
+/// existence of a timeout.
+const START_COMPLETE_FALLBACK_100NS: i64 = -5_000_000; // 500 ms, relative
+
+/// Bounded lost-interrupt fallback while one async ctrl command owns descriptors.
+///
+/// NOT the R515 defect: the KEVENT (ISR -> DPC -> drain -> signal) is the real
+/// wake source and this only covers a delayed device interrupt.
+const CTRL_INFLIGHT_POLL_100NS: i64 = -40_000; // 4 ms, relative
+
+/// Retry delay after a loud scanout-refresh enqueue failure. Also a real bound,
+/// not a stand-in: the failure has no wake source of its own.
+const REFRESH_RETRY_100NS: i64 = -160_000; // 16 ms, relative
+
 /// Indicate the single child video-output's connection state to the OS. PASSIVE.
 fn indicate_child_status(adapter: &AdapterContext, connected: bool) {
     let Some(dxgkrnl) = adapter.dxgkrnl_opt() else {
@@ -39,10 +59,21 @@ fn indicate_child_status(adapter: &AdapterContext, connected: bool) {
     crate::diag::record_named_bytes(b"HpdI", ((connected as u32) << 16) | (st as u32 & 0xFFFF));
     HPD_INDICATE_COUNT.fetch_add(1, Ordering::Relaxed);
     crate::diag::record_named_bytes(b"HpdN", HPD_INDICATE_COUNT.load(Ordering::Relaxed));
+    // Emitted alongside HpdN so the two are always read together: a nonzero
+    // HpdStTo means the first indication was driven by the fallback, not the
+    // start edge.
+    crate::diag::record_named_bytes(b"HpdStTo", HPD_START_EDGE_TIMEOUTS.load(Ordering::Relaxed));
 }
 
 /// Count of child-status indications this boot (diag `HpdN`).
 static HPD_INDICATE_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Times the prologue's bounded fallback fired instead of the real start edge
+/// (diag `HpdStTo`). Must read 0 on a healthy boot: a nonzero value means
+/// StartDevice's `signal_start_complete` did not reach the worker, and the first
+/// `Connected=1` was as late as it used to be.
+static HPD_START_EDGE_TIMEOUTS: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
 
 /// The HPD worker thread body (`PsCreateSystemThread`). Runs at PASSIVE_LEVEL for
 /// the device's lifetime; `AdapterContext::stop_hpd` signals `hpd_stop` + the wake
@@ -58,21 +89,43 @@ pub unsafe extern "C" fn hpd_thread_routine(context: *mut c_void) {
     // SAFETY: the adapter context is alive until StopDevice joins this thread.
     let adapter = unsafe { &*(context as *const AdapterContext) };
 
-    // First indication: wait briefly so StartDevice has certainly returned
-    // (DxgkCbIndicateChildStatus is forbidden during it), then indicate connected.
-    // A boot config-change wakes us early; otherwise the timeout drives it.
-    let mut initial_timeout: LARGE_INTEGER = unsafe { core::mem::zeroed() };
-    initial_timeout.QuadPart = -5_000_000; // 500 ms relative (100 ns units)
-                                           // SAFETY: waiting on the initialized hpd_event with a relative timeout.
-    let _ = unsafe {
-        KeWaitForSingleObject(
-            adapter.hpd_event.get() as PVOID,
-            0, // Executive
-            0, // KernelMode
-            0, // non-alertable
-            &mut initial_timeout,
-        )
-    };
+    // ── Phase 1: wait for StartDevice to return ─────────────────────────────
+    //
+    // `DxgkCbIndicateChildStatus` is forbidden DURING StartDevice, so the first
+    // indication must wait for it to return. That used to be a bare 500 ms
+    // relative wait — a delay standing in for an event, with nothing observing
+    // the return at all. StartDevice now sets `start_complete` and signals
+    // `hpd_event` as its last action, so this wait has a REAL wake source and
+    // `START_COMPLETE_FALLBACK_100NS` is only the bound that keeps a missed edge
+    // from parking the worker forever.
+    //
+    // Looped because `hpd_event` is a SynchronizationEvent shared with the
+    // scanout/config-change paths: a wake that is not the start edge must not be
+    // mistaken for one. The loop is bounded by the same fallback per iteration
+    // and by `hpd_stop`.
+    while adapter.start_complete.load(Ordering::Acquire) == 0 {
+        if adapter.hpd_stop.load(Ordering::Acquire) != 0 {
+            break;
+        }
+        let mut timeout: LARGE_INTEGER = unsafe { core::mem::zeroed() };
+        timeout.QuadPart = START_COMPLETE_FALLBACK_100NS;
+        // SAFETY: waiting on the initialized hpd_event with a relative timeout.
+        let st = unsafe {
+            KeWaitForSingleObject(
+                adapter.hpd_event.get() as PVOID,
+                0, // Executive
+                0, // KernelMode
+                0, // non-alertable
+                &mut timeout,
+            )
+        };
+        if st == STATUS_TIMEOUT {
+            // The bound fired. Proceed anyway — a late indication is far better
+            // than none — and count it, because it means the edge was missed.
+            HPD_START_EDGE_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
+            break;
+        }
+    }
     if adapter.hpd_stop.load(Ordering::Acquire) != 0 {
         // Publish "worker exited" BEFORE terminating, so stop_hpd's join does
         // not depend on ObReferenceObjectByHandle succeeding.
@@ -113,10 +166,10 @@ pub unsafe extern "C" fn hpd_thread_routine(context: *mut c_void) {
             adapter.scanout_refresh_pending.load(Ordering::Acquire) != 0 && !ctrl_inflight;
         let mut timeout: LARGE_INTEGER = unsafe { core::mem::zeroed() };
         let timeout_ptr = if ctrl_inflight {
-            timeout.QuadPart = -40_000; // 4 ms: bounded lost-interrupt fallback.
+            timeout.QuadPart = CTRL_INFLIGHT_POLL_100NS;
             &mut timeout
         } else if retry_pending {
-            timeout.QuadPart = -160_000; // 16 ms retry after a loud enqueue failure.
+            timeout.QuadPart = REFRESH_RETRY_100NS;
             &mut timeout
         } else {
             core::ptr::null_mut()
