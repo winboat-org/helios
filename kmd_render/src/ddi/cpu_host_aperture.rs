@@ -95,6 +95,101 @@ pub fn diag_dump_cpu_host_atomics() {
 
 const PASSIVE_LEVEL_IRQL: u8 = 0;
 
+/// An aperture request proven whole-allocation, consecutive and in-bounds.
+///
+/// Constructible only by [`validate_aperture_request`], and both things that can
+/// act on a request — establishing the mapping and acknowledging an existing one
+/// — take it. A future path therefore cannot answer an unvalidated request,
+/// because it cannot produce the token (k-alloc-13).
+#[derive(Clone, Copy)]
+struct ValidatedApertureRange {
+    offset: u64,
+    #[allow(dead_code)]
+    pages: u64,
+}
+
+/// Why an aperture request was refused. Carries no status: the two callers run
+/// at different IRQLs and answer differently.
+#[derive(Clone, Copy)]
+enum ApertureRefusal {
+    /// Zero pages, or a null page array.
+    Partial,
+    /// Not a whole-allocation map.
+    NotWholeAllocation,
+    /// The aperture pages are not one consecutive run.
+    Sparse,
+    /// The range leaves the declared window region.
+    Bounds,
+}
+
+impl ApertureRefusal {
+    /// Bump the matching counter. Atomics only — DISPATCH-safe by construction,
+    /// which is what lets the raised-IRQL caller report a refusal at all.
+    fn count(self, resource_id: Option<u32>) {
+        match self {
+            ApertureRefusal::Partial | ApertureRefusal::NotWholeAllocation => {
+                BAR_AP_ERR_PARTIAL.fetch_add(1, Ordering::Relaxed);
+            }
+            ApertureRefusal::Sparse => {
+                BAR_AP_ERR_SPARSE.fetch_add(1, Ordering::Relaxed);
+            }
+            ApertureRefusal::Bounds => {
+                BAR_AP_ERR_BOUNDS.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        if let Some(res) = resource_id {
+            BAR_AP_LAST_RESID.store(res, Ordering::Relaxed);
+        }
+    }
+}
+
+/// The ONE aperture-request validation rule, for both IRQL paths.
+///
+/// This used to exist twice, and the raised-IRQL copy was incomplete: it checked
+/// the page count and then compared `blob_resid_at_offset(page0 << 12)` against
+/// the allocation, but never asked whether the remaining pages were consecutive.
+/// A request of `[P, P+7, P+8, ...]` whose first page matched the offset the blob
+/// was already mapped at was ACKNOWLEDGED with STATUS_SUCCESS, telling dxgkrnl
+/// the whole range was backed while the CPU view for pages 1..n-1 addressed
+/// foreign window offsets. The identical request on the PASSIVE path was refused.
+///
+/// # Safety
+/// `pCpuHostAperturePages` must hold `NumberOfPages` entries for the call.
+/// Reading all of them at DISPATCH is sound for the same reason reading element
+/// 0 there already was: the array is dxgkrnl-owned and must be non-paged either
+/// way, since this DDI is documented to be callable above PASSIVE.
+unsafe fn validate_aperture_request(
+    args: &DXGKARG_MAPCPUHOSTAPERTURE,
+    alloc: &crate::ddi::create_allocation::PagingAllocInfo,
+    bar: &crate::adapter::BarSegment,
+) -> Result<ValidatedApertureRange, ApertureRefusal> {
+    let n = args.NumberOfPages;
+    if n == 0 || args.pCpuHostAperturePages.is_null() {
+        return Err(ApertureRefusal::Partial);
+    }
+    // Whole-allocation only: a blob maps at one offset, whole-blob — a partial
+    // map would spill blob pages over neighboring aperture assignments.
+    let blob_pages = (alloc.size.saturating_add(4095) >> 12).max(1);
+    if n != blob_pages {
+        return Err(ApertureRefusal::NotWholeAllocation);
+    }
+    // SAFETY: n entries exist per the fn contract.
+    let page0 = unsafe { core::ptr::read_unaligned(args.pCpuHostAperturePages) } as u64;
+    for i in 1..n {
+        // SAFETY: as above, i < n.
+        let p =
+            unsafe { core::ptr::read_unaligned(args.pCpuHostAperturePages.add(i as usize)) } as u64;
+        if p != page0 + i {
+            return Err(ApertureRefusal::Sparse);
+        }
+    }
+    let offset = page0 << 12;
+    if offset.saturating_add(n << 12) > bar.size {
+        return Err(ApertureRefusal::Bounds);
+    }
+    Ok(ValidatedApertureRange { offset, pages: n })
+}
+
 pub unsafe extern "C" fn dxgkddi_map_cpu_host_aperture(
     h_adapter: *mut c_void,
     map: IN_CONST_PDXGKARG_MAPCPUHOSTAPERTURE,
@@ -146,20 +241,28 @@ pub unsafe extern "C" fn dxgkddi_map_cpu_host_aperture(
         //     dxgkrnl re-issues the map at PASSIVE, where the round-trip can run.
         BAR_AP_ERR_IRQL.fetch_add(1, Ordering::Relaxed);
         BAR_AP_LAST_IRQL.store(irql as u32, Ordering::Relaxed);
+        // Same validator as the PASSIVE arm — all four checks, not two — and
+        // only then the "already mapped at this offset?" question on top of a
+        // fully validated range. REFUSAL HANDLING IS SPLIT BY IRQL: this arm may
+        // only bump atomics and defer; it must NEVER call dump_bar_ap_counters,
+        // because RtlWriteRegistryValue above PASSIVE is the same invariant
+        // violation R307 removed from the paging path.
         let already_mapped = unsafe { paging_alloc_info(args.hAllocation) }
-            .filter(|a| {
-                a.bar_eligible
-                    && args.NumberOfPages != 0
-                    && !args.pCpuHostAperturePages.is_null()
-                    // whole-allocation, same shape as the PASSIVE map contract below
-                    && args.NumberOfPages as u64 == (a.size.saturating_add(4095) >> 12).max(1)
+            .filter(|a| a.bar_eligible)
+            .and_then(|a| {
+                // SAFETY: dxgkrnl owns the page array for the call; see the
+                // validator's safety note on reading it at DISPATCH.
+                match unsafe { validate_aperture_request(args, &a, bar) } {
+                    Ok(range) => Some((a, range)),
+                    Err(refusal) => {
+                        refusal.count(Some(a.resource_id));
+                        None
+                    }
+                }
             })
-            .map(|a| {
-                // SAFETY: pCpuHostAperturePages holds >=1 entry (checked above).
-                let page0 = unsafe { core::ptr::read_unaligned(args.pCpuHostAperturePages) } as u64;
-                let offset = page0 << 12;
+            .map(|(a, range)| {
                 adapter
-                    .with_virtio(|v| v.blob_resid_at_offset(offset))
+                    .with_virtio(|v| v.blob_resid_at_offset(range.offset))
                     .ok()
                     .flatten()
                     == Some(a.resource_id)
@@ -186,44 +289,22 @@ pub unsafe extern "C" fn dxgkddi_map_cpu_host_aperture(
         dump_bar_ap_counters();
         return STATUS_NO_MEMORY;
     }
-    let n = args.NumberOfPages;
-    let blob_pages = (alloc.size.saturating_add(4095) >> 12).max(1);
-    if n == 0 || args.pCpuHostAperturePages.is_null() {
-        BAR_AP_ERR_PARTIAL.fetch_add(1, Ordering::Relaxed);
-        dump_bar_ap_counters();
-        return STATUS_NO_MEMORY;
-    }
-    // Whole-allocation only: a blob maps at one offset, whole-blob — a partial
-    // map would spill blob pages over neighboring aperture assignments.
-    if n != blob_pages {
-        BAR_AP_ERR_PARTIAL.fetch_add(1, Ordering::Relaxed);
-        BAR_AP_LAST_RESID.store(alloc.resource_id, Ordering::Relaxed);
-        dump_bar_ap_counters();
-        return STATUS_NO_MEMORY;
-    }
-    // SAFETY: pCpuHostAperturePages holds NumberOfPages entries for the call.
-    let page0 = unsafe { core::ptr::read_unaligned(args.pCpuHostAperturePages) } as u64;
-    for i in 1..n {
-        let p =
-            unsafe { core::ptr::read_unaligned(args.pCpuHostAperturePages.add(i as usize)) } as u64;
-        if p != page0 + i {
-            BAR_AP_ERR_SPARSE.fetch_add(1, Ordering::Relaxed);
+    // SAFETY: dxgkrnl owns `pCpuHostAperturePages` for the duration of the call.
+    let range = match unsafe { validate_aperture_request(args, &alloc, bar) } {
+        Ok(range) => range,
+        Err(refusal) => {
+            refusal.count(Some(alloc.resource_id));
+            // Only the PASSIVE caller flushes.
             dump_bar_ap_counters();
             return STATUS_NO_MEMORY;
         }
-    }
-    let offset = page0 << 12;
-    if offset.saturating_add(n << 12) > bar.size {
-        BAR_AP_ERR_BOUNDS.fetch_add(1, Ordering::Relaxed);
-        dump_bar_ap_counters();
-        return STATUS_NO_MEMORY;
-    }
+    };
 
-    match crate::virtio::ctrl::map_blob_at(adapter, alloc.resource_id, offset) {
+    match crate::virtio::ctrl::map_blob_at(adapter, alloc.resource_id, range.offset) {
         Ok(_prep) => {
             BAR_AP_MAPS.fetch_add(1, Ordering::Relaxed);
             BAR_AP_LAST_RESID.store(alloc.resource_id, Ordering::Relaxed);
-            BAR_AP_LAST_PAGE.store(page0 as u32, Ordering::Relaxed);
+            BAR_AP_LAST_PAGE.store((range.offset >> 12) as u32, Ordering::Relaxed);
             dump_bar_ap_counters();
             STATUS_SUCCESS
         }
