@@ -77,25 +77,39 @@ virtio-gpu scanout; IddCx/Looking Glass is no longer the active display path.*
    are invisible at the default `DiagLevel`. The review also carries the
    implicit-ordering register and the static-guarantee catalogue (organised by
    mechanism, with an explicit *rejected as cosmetic* list).
-2. Implement the reviewed refactors atomically, in tranche order, one recommendation
+2. **T0 DONE + gate PASSED (2026-07-26), KMD `22.22.178.0`.** All five T0 recommendations
+   landed: `kmd_logic/` is a dependency-free host-testable `no_std` crate holding the
+   page/pitch arithmetic (5 tests; `kmd_render` cannot host a libtest harness at all —
+   bindgen + `rc.exe` in build.rs, `panic="abort"` cdylib); the deploy default is the
+   **release** UMD and dwm is now proven to load `umd/target/release/helios_umd.dll` out
+   of the DriverStore; the KMD version is one line in `kmd_render/driver-version.env`,
+   with the coherence gate in `build.rs` (`verify_version_wiring`) so a hand-run
+   `cargo make` is covered and **building no longer depends on win-mcp**; `umd` names its
+   Windows-only constraint; and the C++ toolchain identity is a declared cargo build
+   input with four existence-checked paths. Release-UMD baseline recorded in
+   `REFACTOR_REVIEW.md` Appendix A. **Deploy trap learned:** a rebuild at an
+   already-published version can never produce a verifiable DriverStore image — the
+   install script re-signs the package after the build signed it, so devcon's no-op
+   publish leaves a hash mismatch and the bind check (correctly) refuses. Bump first.
+3. Implement the remaining reviewed refactors atomically, in tranche order, one recommendation
    per commit; never fold a `BUG` fix into a structure move. Preserve the current direct
    primary, completion ordering, loud-failure contracts, registry ABI, and
    diagnostic names unless a reviewed change explicitly migrates them. Replace
    arbitrary `Sleep`/poll loops with event, interrupt, fence, or
    condition-variable contracts; do not remove bounded safety timeouts merely
    because they wait.
-3. Regression-test each tranche and the final driver against visible desktop
+4. Regression-test each tranche and the final driver against visible desktop
    output, idle wake, rapid cursor motion, DComp cadence, DWM stability,
    same-boot KMD breadcrumbs, and host scanout evidence. Keep
    `ScanoutDiag` absent during primary tests.
-4. Continue soaking the current direct-primary path across DWM buffer rotation,
+5. Continue soaking the current direct-primary path across DWM buffer rotation,
    resize, suspend/resume, device restart, and cold boot.
-5. Pursue true host zero-copy only with a layout contract the display importer
+6. Pursue true host zero-copy only with a layout contract the display importer
    can consume. An explicit DRM modifier is one possible route, but enabling the
    modifier/DMA_BUF extensions on every DXVK device is prohibited: it inflated
    ordinary shared OPTIMAL import requirements and caused valid undersized-import
    refusal, DWM failures, and NVIDIA Xid 31 when bypassed.
-6. Continue D3D11 stability and conformance work after the quality pass.
+7. Continue D3D11 stability and conformance work after the quality pass.
 
 ## Historical PSC workstreams
 
@@ -445,6 +459,18 @@ Open defects, roughly ordered:
 
 ## Workstream 2 — Performance
 
+- **OPEN (2026-07-26, found while taking the T0 baseline): DComp cadence ~50 fps, not the
+  documented ~63; present-gate avg ~2.0 ms, not the documented ~0.48 ms.** Measured on an
+  idle box (CPU ~1 %) with `helios_dcomp_probe` (25 s runs): 1236 / 1152 / 1253 frames
+  **before** the T0 deploy and 1227 / 1307 **after**, i.e. 46–52 fps throughout — so this
+  is NOT a T0 effect and not a debug-vs-release-UMD effect. An earlier stored run of the
+  same probe on this box recorded 1576 frames (63.0 fps), which is where the documented
+  figure comes from. dwm `present-gate:` reads avg 2018 µs / max 14595 µs / 30 timeouts in
+  3072 presents on the release UMD. Not yet triaged: unknown whether the regression is in
+  the guest (present path), the QEMU frontend, or host-side scanout delivery — the PSC
+  charter says to measure present-to-scanout and VNC delivery separately before assigning
+  blame. Repeatable baseline procedure: two `helios_dcomp_probe` runs, then read the last
+  `present-gate:` line from the live dwm UMD log.
 - **IDD delivered-frame cycle — MEASURED (21st session, `D3D11 path stats:` line,
   1/300 frames in the LGIdd log):** the swapchain thread is fully serialized, so
   stage sums ARE the delivered fps. Under a 50Hz bouncing-window probe:

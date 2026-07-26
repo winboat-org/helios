@@ -619,6 +619,12 @@ allocation path.
   before/after evidence.
 - **Validation**: after R101, `grep -c 'fn round_up_page' kmd_render/src` is exactly 1 (in
   `venus.rs`), and the `venus.rs` allocation-size breadcrumbs are unchanged from the pre-change boot.
+- **Status correction (2026-07-26)**: the count is **2**, not 1, and that is correct — this
+  validation line contradicts R101's own *Change* text, which prescribes keeping a thin
+  `fn round_up_page(n: SIZE_T) -> SIZE_T` wrapper in `create_allocation.rs` so its call site stays
+  textually unchanged. Two definitions remain: that wrapper, and the divergent `venus.rs` copy. The
+  check that means what this line intended is `grep -c 'saturating_add(PAGE\|saturating_add(BLOB_PAGE'
+  kmd_render/src` == 0, i.e. no *body* is duplicated.
 
 ---
 
@@ -7020,6 +7026,45 @@ Two standing rules apply to all of them:
   `pnputil /restart-device`. Ask before requesting a reboot.
 
 ### T0 gate
+
+**RESULT: PASSED (2026-07-26), one item outstanding for the owner.** KMD `22.22.178.0`, oem105.inf,
+DriverStore `..._5e2a51b29feed870`, boot 18:54:05.
+
+| Item | Result |
+|---|---|
+| `cargo test` protocol / kmd_logic / win-mcp (host) | 3 / 5 / 1 green |
+| INF `DriverVer` + `.sys` FILEVERSION/FileVersion/ProductVersion vs pre-change 22.22.176.0 reference | **byte-identical** INF; version resources identical. Reference archived at `C:\Users\Rupansh\helios-ref-pkg-22.22.176.0` |
+| Corrupt the single version file → build fails loudly | 3 modes, all exit 101 with a named cause: `has 3 components, expected 4`; missing top-level `env_files`; stampinf literal. Restored tree builds clean |
+| Default install stamps `umd/target/release/helios_umd.dll` | install log `Refreshed package UMD: ... hash 56473A67…`; DriverStore copy = same hash; **dwm loads that exact DLL** |
+| Missing release DLL aborts the install | `UMD DLL not found: ...\target\release\helios_umd.dll`, exit 1 |
+| Device state | `CM_PROB_NONE`, DriverVersion 22.22.178.0 |
+| Visible desktop | `helios_paintcap` → full composited desktop (wallpaper, taskbar, icons, clock matching this boot) |
+| `ScanoutDiag` absent, `VpSA`, `ScSet` | **absent**; `VpSA` 1→3000 this boot, `ScSet=1`, `ScRid` 48→50, `ScPch=7680`, `ScFmt=28` |
+| Vsync heartbeat | `VsCnt` 8844→16023 over 60 s idle (≈120/s). *Note: sampled over 5 s it reads delta 0 — the registry write is throttled, so short windows are not evidence.* |
+| Failure counters | `RfFail=0 PgEv=0 ChMc=0`; `RfLost=1` unchanged from the pre-change boot |
+| Unprompted DWM crash | none |
+| Rapid cursor motion / idle-to-active feel | **OWNER TO CONFIRM** — not assessable from the agent side |
+
+**Release-UMD baseline numbers** (this is what T1a–T8 compare against; the pre-change figures are from
+the previous boot on the previously-deployed UMD and are *not* a like-for-like workload):
+
+| Measure | Pre-change boot | Release-UMD baseline |
+|---|---|---|
+| DComp probe, 25 s ×2–3 | 1236 / 1152 / 1253 frames = 49.4 / 46.1 / 50.1 fps | 1227 / 1307 frames = **49.1 / 52.3 fps** |
+| dwm `present-gate:` | n=1536 avg 1079 µs max 15302 µs timeouts 43 (2.8 %) | n=3072 avg **2018 µs** max 14595 µs timeouts 30 (**1.0 %**) |
+
+Two honesty notes on that table, both of which matter for later tranches:
+
+1. **The workloads differ.** The post-change `present-gate` sample includes two dcomp probe runs
+   (dwm composites the probe animation); the pre-change sample is desktop-only. The higher average
+   is therefore *not* established as a regression, and the lower timeout rate is not established as
+   an improvement. The previously deployed UMD is gone, so a like-for-like re-measure would need a
+   reinstall. Later tranches must compare against the release-UMD row using the **same** workload:
+   two `helios_dcomp_probe` runs, then read the last `present-gate:` line.
+2. **Neither boot reproduces the documented figures.** `ROADMAP.md` and `REFACTOR_HANDOFF.md` record
+   ~63 fps DComp and ~0.48 ms present-gate steady state. This box measures ~50 fps and ~2 ms on an
+   idle CPU (~1 %) *before* T0 as well as after, so the gap predates this tranche. It is entered as
+   a PSC defect rather than treated as a T0 outcome.
 
 cargo test green in protocol/ and in the new build.rs-free no_std logic crate on the Linux host. win_build_kmd (after rebuilding and restarting the win-mcp server) produces a package whose stamped INF DriverVer and .sys FILEVERSION/FileVersion/ProductVersion are byte-identical to a pre-change 22.22.176.0 package; deliberately corrupting the single version file fails the build loudly; cargo test green in tools/win-mcp. A default win_install_kmd stamps umd/target/release/helios_umd.dll (SHA256 in the install log matches the release artefact) and a missing release DLL aborts the install. Then, because the deployed UMD profile changed: guest reboot, device reaches CM_PROB_NONE, visible desktop, ScanoutDiag absent with VpSA=1 and ScSet=1, DComp probe cadence near 63 fps, idle-to-active wake at or better than the pre-change number, no unprompted DWM crash. Record these as the new baseline numbers - every later tranche compares against the release-UMD baseline, not the debug one.
 
