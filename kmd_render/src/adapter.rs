@@ -551,6 +551,64 @@ impl ScanoutGuard<'_> {
     }
 }
 
+/// Ownership of one raised `vidpn_programming` interval.
+///
+/// The gate is raised at exactly one place — the DIRQL half of
+/// `SetVidPnSourceAddress` — and used to be lowered at nine hand-written
+/// `store(0)` sites inside one 196-line function, plus one asynchronous site in
+/// the used-ring DPC. Every future early return in that function was a potential
+/// permanent display stop: `vsync_dpc_routine` returns early on every 16 ms tick
+/// while the gate is set, so no CRTC_VSYNC is delivered and dxgkrnl never
+/// retires the queued flip. Two exits already got this wrong (T1a's k-display-01
+/// and k-display-03).
+///
+/// The token is *adopted*, not constructed at the raise site: the raise happens
+/// in the DIRQL DDI and the lower happens in the PASSIVE worker's call stack, so
+/// a token that spanned the deferral would just be a flag again. Inside the
+/// PASSIVE continuation the nine exits collapse to one compiler-inserted drop.
+///
+/// What it canNOT express: the DIRQL-set/PASSIVE-clear split itself, and the
+/// DestroyAllocation cancel path — that stays an explicit, counter-backed
+/// hand-off in `retire_scanout_allocation_locked` (`VpCncl`).
+#[must_use]
+pub(crate) struct ProgrammingInterval<'a> {
+    gate: &'a AtomicU32,
+    /// Makes the interval `!Send`: it is lowered on the thread that adopted it.
+    _not_send: PhantomData<*const ()>,
+}
+
+impl<'a> ProgrammingInterval<'a> {
+    /// Take ownership of the already-raised gate for the duration of this scope.
+    pub(crate) fn adopt(gate: &'a AtomicU32) -> Self {
+        Self {
+            gate,
+            _not_send: PhantomData,
+        }
+    }
+
+    /// Hand the interval to the ring-1 GPU-completion DPC, which clears the gate
+    /// when the scan-out copy retires (`gpu.rs`, through the notify's raw
+    /// `NonNull<AtomicU32>`).
+    ///
+    /// This is the ONE legitimate way for the gate to outlive this scope, and
+    /// making it a named call means the hand-off is greppable instead of being
+    /// an absence. The compiler cannot prove the DPC ever runs, so a lost
+    /// completion still leaves the gate raised; that residual is what R509's
+    /// generation tag turns into a detectable mismatch.
+    pub(crate) fn transfer_to_completion(self) {
+        core::mem::forget(self);
+    }
+}
+
+impl Drop for ProgrammingInterval<'_> {
+    fn drop(&mut self) {
+        // Release, and last: every arm records its diag breadcrumb before this
+        // runs, and the same-resource success arm stores `last_primary_address`
+        // first. Drop-at-end-of-scope preserves both orders.
+        self.gate.store(0, Ordering::Release);
+    }
+}
+
 /// Outcome of trying to queue one coalesced scanout refresh.
 pub(crate) enum ScanoutRefreshQueue {
     Queued,

@@ -875,6 +875,58 @@ pub unsafe extern "C" fn dxgkddi_set_vidpn_source_address(
     let primary_segment = unsafe { (*address).PrimarySegment };
     let primary_address = unsafe { (*address).PrimaryAddress.QuadPart as u64 };
     let primary_flags = unsafe { (*address).Flags.__bindgen_anon_1.Value };
+
+    // Dxgkrnl's MMIO-flip path invokes this DDI under DxgkCbSynchronizeExecution
+    // at DIRQL. At that IRQL it is illegal to write registry diagnostics, wait on
+    // the Venus mutex, or submit synchronous virtio control commands, so the
+    // atomics-only half is split out below and the PASSIVE continuation is
+    // separate: the two halves cannot be interleaved by accident.
+    if !unsafe {
+        set_vidpn_source_address_dirql(
+            adapter,
+            h_alloc,
+            primary_segment,
+            primary_address,
+            primary_flags,
+        )
+    } {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    if unsafe { KeGetCurrentIrql() } != crate::ddi::PASSIVE_LEVEL_IRQL {
+        // Deferred: the timer DPC wakes the PASSIVE display worker, which
+        // consumes `pending_vidpn_allocation` and adopts the raised gate.
+        adapter
+            .pending_vidpn_allocation
+            .store(h_alloc as usize, Ordering::Release);
+        return STATUS_SUCCESS;
+    }
+
+    unsafe { apply_vidpn_source_address(adapter, h_alloc) }
+}
+
+/// The atomics-only half of `SetVidPnSourceAddress`, legal at DIRQL.
+///
+/// Pairs the exact address with the exact allocation and RAISES the programming
+/// gate; nothing here writes the registry, waits, or touches the transport.
+/// Returns false if the handle could not be paired, in which case the gate is
+/// NOT raised.
+///
+/// The matching lower is `ProgrammingInterval`'s drop inside
+/// [`apply_vidpn_source_address_locked`], or the ring-1 completion DPC after a
+/// `transfer_to_completion()`. The raise cannot itself hold a
+/// `ProgrammingInterval`: the two halves run in different call stacks at
+/// different IRQLs, so a token spanning them would be a flag again.
+///
+/// # Safety
+/// `h_alloc` is the live KMD allocation handle dxgkrnl passed to the DDI.
+unsafe fn set_vidpn_source_address_dirql(
+    adapter: &AdapterContext,
+    h_alloc: HANDLE,
+    primary_segment: u32,
+    primary_address: u64,
+    primary_flags: u32,
+) -> bool {
     // Pair the exact address with the exact allocation before deferring. The
     // VSync DPC must continue reporting the previously displayed address until
     // the PASSIVE worker has actually programmed this primary.
@@ -886,26 +938,13 @@ pub unsafe extern "C" fn dxgkddi_set_vidpn_source_address(
             primary_flags,
         )
     } {
-        return STATUS_INVALID_PARAMETER;
+        return false;
     }
     // This exact Windows handoff is now pending display-engine programming.
     // Keep the periodic VSync path from reporting the preceding physical
     // address while the DIRQL callback is deferred to PASSIVE_LEVEL.
     adapter.vidpn_programming.store(1, Ordering::Release);
-    // Dxgkrnl's MMIO-flip path invokes this DDI under
-    // DxgkCbSynchronizeExecution at DIRQL. At that IRQL it is illegal to write
-    // registry diagnostics, wait on the Venus mutex, or submit synchronous
-    // virtio control commands. Preserve the exact Windows-supplied allocation
-    // identity and let the timer DPC wake the PASSIVE display worker.
-    let irql = unsafe { KeGetCurrentIrql() };
-    if irql != 0 {
-        adapter
-            .pending_vidpn_allocation
-            .store(h_alloc as usize, Ordering::Release);
-        return STATUS_SUCCESS;
-    }
-
-    unsafe { apply_vidpn_source_address(adapter, h_alloc) }
+    true
 }
 
 /// PASSIVE continuation of SetVidPnSourceAddress.
@@ -940,6 +979,10 @@ unsafe fn apply_vidpn_source_address_locked(
     h_alloc: HANDLE,
 ) -> NTSTATUS {
     crate::diag::record(0x1300_000A);
+    // Adopt the gate the DIRQL half raised. Every exit below now lowers it via
+    // this token's drop; the ONE exit that must not is the copy-submitted arm,
+    // which calls `transfer_to_completion()` to hand it to the ring-1 DPC.
+    let interval = crate::adapter::ProgrammingInterval::adopt(&adapter.vidpn_programming);
     let source_address_n = VIDPN_SOURCE_ADDRESS_COUNT
         .fetch_add(1, Ordering::Relaxed)
         .wrapping_add(1);
@@ -951,7 +994,6 @@ unsafe fn apply_vidpn_source_address_locked(
     let Some(source) = (unsafe { crate::ddi::create_allocation::scanout_alloc_info(h_alloc) })
     else {
         crate::diag::record_named_bytes(b"ScRid", 0);
-        adapter.vidpn_programming.store(0, Ordering::Release);
         return STATUS_SUCCESS;
     };
     let (mode_w, mode_h) = adapter.display_mode();
@@ -976,7 +1018,6 @@ unsafe fn apply_vidpn_source_address_locked(
     }
     if width != mode_w || height != mode_h {
         crate::diag::record_named_bytes(b"ScSet", 0xD);
-        adapter.vidpn_programming.store(0, Ordering::Release);
         return STATUS_INVALID_PARAMETER;
     }
     // A UMD-created exact pPrimaryDesc may already have the proven scan-out
@@ -995,7 +1036,6 @@ unsafe fn apply_vidpn_source_address_locked(
             && ScanoutFormat::from_dxgi(source.dxgi_format).is_some();
         if !valid {
             crate::diag::record_named_bytes(b"ScSet", 0xE3);
-            adapter.vidpn_programming.store(0, Ordering::Release);
             return STATUS_INVALID_PARAMETER;
         }
         source
@@ -1004,7 +1044,6 @@ unsafe fn apply_vidpn_source_address_locked(
             Ok(target) => target,
             Err(status) => {
                 crate::diag::record_named_bytes(b"ScSet", 0xE1);
-                adapter.vidpn_programming.store(0, Ordering::Release);
                 return status;
             }
         }
@@ -1027,7 +1066,6 @@ unsafe fn apply_vidpn_source_address_locked(
         ScanoutFormat::from_dxgi_or_legacy_zero(target.dxgi_format).map(ScanoutFormat::virtio)
     else {
         crate::diag::record_named_bytes(b"ScFmt", target.dxgi_format);
-        adapter.vidpn_programming.store(0, Ordering::Release);
         return STATUS_NOT_SUPPORTED;
     };
     let bound_wh = adapter.active_scanout_wh.load(Ordering::Acquire);
@@ -1051,7 +1089,6 @@ unsafe fn apply_vidpn_source_address_locked(
         );
         if set.is_err() {
             crate::diag::record_named_bytes(b"ScSet", 0xE);
-            adapter.vidpn_programming.store(0, Ordering::Release);
             return STATUS_DEVICE_NOT_READY;
         }
         // Keep the adapter-owned fallback cache separate from a rotating DWM
@@ -1093,16 +1130,15 @@ unsafe fn apply_vidpn_source_address_locked(
         adapter
             .last_primary_address
             .store(source.primary_address, Ordering::Release);
-        // Release after publishing the matching physical address. The next
-        // VSync DPC acquires this flag before sampling last_primary_address.
-        adapter.vidpn_programming.store(0, Ordering::Release);
+        // `interval` drops here, clearing the gate AFTER the matching physical
+        // address was published — the order the next VSync DPC depends on (it
+        // acquires the gate before sampling `last_primary_address`).
         return STATUS_SUCCESS;
     }
 
     let target_image_id = adapter.dedicated_scanout_image.load(Ordering::Acquire);
     if target_image_id == 0 {
         crate::diag::record_named_bytes(b"ScSet", 0xE2);
-        adapter.vidpn_programming.store(0, Ordering::Release);
         return STATUS_DEVICE_NOT_READY;
     }
 
@@ -1126,10 +1162,17 @@ unsafe fn apply_vidpn_source_address_locked(
                 crate::diag::record_named_bytes(b"ScFnc", fence as u32);
                 crate::diag::record_named_bytes(b"ScFlu", 2); // async completion path
             }
+            // THE one hand-off. The copy is queued on ring 1 and its used-ring
+            // completion DPC owns the gate from here: it publishes the displayed
+            // address on success and clears the gate either way. Dropping the
+            // interval here instead would clear the gate mid-programming and let
+            // a CRTC_VSYNC report the OLD address as authoritative.
+            interval.transfer_to_completion();
         }
         Err(status) => {
+            // Nothing was queued, so no DPC will ever run for this interval;
+            // `interval` drops and the gate clears, keeping VSync alive.
             crate::diag::record_named_bytes(b"ScCpy", 0xE);
-            adapter.vidpn_programming.store(0, Ordering::Release);
             return status;
         }
     }

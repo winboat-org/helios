@@ -128,7 +128,7 @@ pub fn diag_dump_cpu_host_atomics() {
     dump_bar_ap_counters();
 }
 
-const PASSIVE_LEVEL_IRQL: u8 = 0;
+use crate::ddi::PASSIVE_LEVEL_IRQL;
 
 /// An aperture request proven whole-allocation, consecutive and in-bounds.
 ///

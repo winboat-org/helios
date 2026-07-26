@@ -106,7 +106,7 @@ pub fn diag_dump_gpummu_atomics() {
 
 /// `PASSIVE_LEVEL` (KIRQL 0) — the only IRQL at which the BAR content ops
 /// (host round-trips, Mm mapping calls) may run.
-const PASSIVE_LEVEL_IRQL: u8 = 0;
+use crate::ddi::PASSIVE_LEVEL_IRQL;
 
 /// What one content-op executor did, as a value the dispatch must consume.
 ///

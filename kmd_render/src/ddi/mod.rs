@@ -1,6 +1,14 @@
 //! WDDM DDI entry points, grouped by subsystem. `lib.rs` wires these into the
 //! `DRIVER_INITIALIZATION_DATA` table.
 
+/// `PASSIVE_LEVEL` as returned by `KeGetCurrentIrql`.
+///
+/// One site for what used to be two module-local copies plus a bare `irql != 0`
+/// literal on the SetVidPnSourceAddress split. Deliberately NOT taken from
+/// `wdk_sys`: `PASSIVE_LEVEL` is a C preprocessor macro, so bindgen does not
+/// emit it and assuming otherwise is a build break, not a fallback.
+pub(crate) const PASSIVE_LEVEL_IRQL: u8 = 0;
+
 mod add_device;
 mod blob_map;
 mod build_paging_buffer;
