@@ -1383,6 +1383,30 @@ const RES_TEX3D: ddi::D3D10DDIRESOURCE_TYPE = ddi::D3D10DDIRESOURCE_TYPE_D3D10DD
 const RES_TEXCUBE: ddi::D3D10DDIRESOURCE_TYPE =
     ddi::D3D10DDIRESOURCE_TYPE_D3D10DDIRESOURCE_TEXTURECUBE;
 
+/// The resource dimensions `create_resource` implements, as a closed set.
+///
+/// `D3D10DDIRESOURCE_TYPE` is a bindgen integer, so the conversion stays
+/// fallible and exactly one counted catch-all survives at the conversion. The
+/// guarantee is that no KNOWN dimension can be silently dropped by a match that
+/// quietly grew a hole, not that the integer domain becomes closed.
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum ResourceDimension {
+    Buffer,
+    Texture2D,
+    Texture3D,
+}
+
+impl ResourceDimension {
+    fn from_ddi(dimension: ddi::D3D10DDIRESOURCE_TYPE) -> Option<Self> {
+        match dimension {
+            RES_BUFFER | RES_BUFFEREX => Some(Self::Buffer),
+            RES_TEX2D | RES_TEXCUBE => Some(Self::Texture2D),
+            RES_TEX3D => Some(Self::Texture3D),
+            _ => None,
+        }
+    }
+}
+
 /// Add one allocation to the WDDM 2.x device residency list.
 ///
 /// E_PENDING is completed with a blocking monitored-fence wait through the
@@ -2048,8 +2072,21 @@ unsafe extern "C" fn create_resource(
 
     let cpu = cpu_access(a.Usage);
 
-    match a.ResourceDimension {
-        RES_BUFFER | RES_BUFFEREX => {
+    let Some(dimension) = ResourceDimension::from_ddi(a.ResourceDimension) else {
+        // The DDI returns void and `clear_handle` already nulled the slot, so
+        // logging and returning told the runtime S_OK with a null driver
+        // resource. Every later `load_resource` then returns None and the view
+        // create / Map / Copy silently does nothing — "nothing draws", not an
+        // error. E_INVALIDARG is in CreateTexture*'s documented return set.
+        log_line(&format!(
+            "DDI create_resource: unhandled dimension {}",
+            a.ResourceDimension
+        ));
+        set_runtime_error(h, E_INVALIDARG);
+        return;
+    };
+    match dimension {
+        ResourceDimension::Buffer => {
             let bind = api_bind_flags(a.BindFlags);
             let misc = api_misc_flags(a.MiscFlags, a.BindFlags, true);
             if bind != a.BindFlags || misc != a.MiscFlags || !a.pPrimaryDesc.is_null() {
@@ -2150,7 +2187,7 @@ unsafe extern "C" fn create_resource(
                 }
             }
         }
-        RES_TEX2D | RES_TEXCUBE => {
+        ResourceDimension::Texture2D => {
             let bind = api_bind_flags(a.BindFlags);
             let mut misc = api_misc_flags(a.MiscFlags, a.BindFlags, false);
             if a.ResourceDimension == RES_TEXCUBE {
@@ -2312,7 +2349,7 @@ unsafe extern "C" fn create_resource(
                 });
             }
         }
-        RES_TEX3D => {
+        ResourceDimension::Texture3D => {
             let bind = api_bind_flags(a.BindFlags);
             let misc = api_misc_flags(a.MiscFlags, a.BindFlags, false);
             log_line(&format!(
@@ -2399,7 +2436,6 @@ unsafe extern "C" fn create_resource(
                 );
             });
         }
-        other => log_line(&format!("DDI create_resource: unhandled dimension {other}")),
     }
 }
 
