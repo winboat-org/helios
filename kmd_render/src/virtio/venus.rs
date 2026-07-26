@@ -693,9 +693,16 @@ impl KernelMap {
         };
         let mut pa: PHYSICAL_ADDRESS = unsafe { core::mem::zeroed() };
         pa.QuadPart = gpa as i64;
-        // SAFETY: PASSIVE_LEVEL; maps a real, host-backed BAR sub-region (the venus
-        // blob was RESOURCE_MAP_BLOB'd into exactly this window range, so the pages
-        // are backed). Unmapped exactly once in `Drop`.
+        // SAFETY: PASSIVE_LEVEL. `MmMapIoSpace` gives a kernel VA for exactly
+        // `size` bytes starting at `gpa`, valid until `MmUnmapIoSpace`, which
+        // `Drop` calls exactly once.
+        //
+        // That is ALL it gives. Whether `[gpa, gpa+size)` is host-backed depends
+        // on the host having honoured RESOURCE_MAP_BLOB for this window range,
+        // which no Rust type can witness — and it is a separate claim from
+        // "`size` is big enough for what the caller intends to put here", which
+        // this constructor deliberately does not make. See [`RingMap`] for the
+        // wrapper that does make it.
         let va = unsafe { MmMapIoSpace(pa, size, caching) } as *mut u8;
         if va.is_null() {
             return None;
@@ -712,9 +719,14 @@ impl KernelMap {
     }
 
     /// Volatile u32 load at byte `offset` (Acquire-ordered for ring head/status).
+    ///
+    /// Private to the module: the only caller is [`RingMap`], which proves
+    /// `offset + 4 <= size` at construction for the closed set of [`RingWord`]
+    /// offsets. Do not add a second caller without the same proof.
     fn load_u32_acquire(&self, offset: u64) -> u32 {
-        // SAFETY: `offset+4 <= size` is the caller's invariant (all ring header
-        // offsets are < RING_SHMEM_SIZE); aligned 4-byte MMIO read.
+        // SAFETY: `offset+4 <= size`, discharged by RingMap::new checking
+        // `size >= RING_SHMEM_SIZE` and by RingWord having no inhabitant above
+        // RING_STATUS_OFFSET. Aligned 4-byte MMIO read.
         let p = unsafe { self.va.add(offset as usize) } as *const u32;
         let v = unsafe { core::ptr::read_volatile(p) };
         // The producer side of vn_ring loads head/status with acquire; a fence
@@ -729,7 +741,7 @@ impl KernelMap {
     fn store_u32_seqcst(&self, offset: u64, val: u32) {
         // Full barrier: all prior buffer writes are visible before the tail store.
         fence(Ordering::SeqCst);
-        // SAFETY: `offset+4 <= size`; aligned 4-byte MMIO write.
+        // SAFETY: `offset+4 <= size`, discharged as for `load_u32_acquire`.
         let p = unsafe { self.va.add(offset as usize) } as *mut u32;
         unsafe { core::ptr::write_volatile(p, val) };
         fence(Ordering::SeqCst);
@@ -737,12 +749,17 @@ impl KernelMap {
 
     /// Copy `src` into the ring buffer at free-running counter `cur`, splitting at
     /// the power-of-two wrap. `cur` and the buffer mask follow vn_ring exactly.
+    ///
+    /// Reached only through [`RingMap::write_buffer`]; the caller's own bound
+    /// (`write_to_ring` refuses `src.len() > RING_BUFFER_SIZE`) plus the mask
+    /// keep both halves inside the buffer window.
     fn write_ring_buffer(&self, cur: u32, src: &[u8]) {
         let mask = RING_BUFFER_SIZE - 1;
         let offset = (cur & mask) as u64;
         let first = core::cmp::min(src.len() as u64, RING_BUFFER_SIZE as u64 - offset);
         // SAFETY: buffer base + in-range offsets; first + second == src.len() and
-        // both halves are within [RING_BUFFER_OFFSET, RING_EXTRA_OFFSET).
+        // both halves are within [RING_BUFFER_OFFSET, RING_EXTRA_OFFSET), which
+        // RingMap::new proved is inside the mapping (size >= RING_SHMEM_SIZE).
         unsafe {
             let base = self.va.add(RING_BUFFER_OFFSET as usize);
             for i in 0..first {
@@ -757,10 +774,90 @@ impl KernelMap {
         compiler_fence(Ordering::Release);
     }
 
-    /// Volatile byte load at `offset` (for reply decoding out of the reply shmem).
-    fn read_byte(&self, offset: u64) -> u8 {
-        // SAFETY: caller bounds-checks `offset < size`.
-        unsafe { core::ptr::read_volatile(self.va.add(offset as usize)) }
+    /// Volatile byte load at `offset` (for reply decoding out of the reply
+    /// shmem), or `None` if `offset` is outside the mapping.
+    ///
+    /// The check used to be a comment saying "caller bounds-checks
+    /// `offset < size`". `ReplyReader` does; `probe_present_destination`'s four
+    /// sample reads only argued about it. Making it an `Option` costs one
+    /// compare per byte on paths that are already byte-at-a-time volatile MMIO.
+    fn read_byte(&self, offset: u64) -> Option<u8> {
+        if offset >= self.size {
+            return None;
+        }
+        // SAFETY: `offset < size`, just checked; `va` owns `size` mapped bytes.
+        Some(unsafe { core::ptr::read_volatile(self.va.add(offset as usize)) })
+    }
+}
+
+/// One of the three ring header words. A closed set with no other inhabitants,
+/// so an out-of-range ring header offset is not expressible.
+#[derive(Clone, Copy)]
+enum RingWord {
+    /// Host-owned consumer position.
+    Head,
+    /// Guest-owned producer position.
+    Tail,
+    /// Host-owned status bits (`RING_STATUS_FATAL`, idle).
+    Status,
+}
+
+impl RingWord {
+    const fn offset(self) -> u64 {
+        match self {
+            Self::Head => RING_HEAD_OFFSET,
+            Self::Tail => RING_TAIL_OFFSET,
+            Self::Status => RING_STATUS_OFFSET,
+        }
+    }
+}
+
+/// A [`KernelMap`] proven at construction to be at least [`RING_SHMEM_SIZE`]
+/// bytes, so every ring accessor's bounds obligation is a constructor
+/// postcondition rather than a per-call caller obligation.
+///
+/// `KernelMap::new` maps whatever length it is handed, and the ring accessors
+/// never consulted `self.size` at all — four **safe** fns dereferencing
+/// `va + offset` under SAFETY comments that asserted a different invariant than
+/// the one they needed. Nothing in the type system distinguished a ring-sized
+/// mapping from an arbitrary one, so a second ring mapping site, a re-map
+/// through `blob_map_begin`'s `Mapped` arm (which returns the previously
+/// recorded `map_len` verbatim), or a host reporting a short `map_len` yielded
+/// an undersized map whose writers then ran up to `RING_BUFFER_OFFSET + 131072`
+/// bytes past the end.
+///
+/// This does NOT remove `unsafe` — it constrains which offsets can reach it. The
+/// one surviving unsafe precondition is `MmMapIoSpace`'s, which is the point.
+struct RingMap(KernelMap);
+
+impl RingMap {
+    /// Map the ring shmem, refusing a mapping too small to hold it.
+    ///
+    /// Records `VnRingSz` = the offered size in KiB on refusal, so a short host
+    /// `map_len` is named rather than inferred from a later ring desync.
+    fn new(gpa: u64, size: u64, map_cache: u32) -> Option<Self> {
+        if size < RING_SHMEM_SIZE {
+            crate::diag::record_named_bytes(b"VnRingSz", (size / 1024) as u32);
+            return None;
+        }
+        KernelMap::new(gpa, size, map_cache).map(Self)
+    }
+
+    fn zero(&self) {
+        self.0.zero();
+    }
+
+    fn load_acquire(&self, word: RingWord) -> u32 {
+        self.0.load_u32_acquire(word.offset())
+    }
+
+    fn store_seqcst(&self, word: RingWord, val: u32) {
+        self.0.store_u32_seqcst(word.offset(), val);
+    }
+
+    /// Copy `src` into the ring buffer window at free-running counter `cur`.
+    fn write_buffer(&self, cur: u32, src: &[u8]) {
+        self.0.write_ring_buffer(cur, src);
     }
 }
 
@@ -834,7 +931,10 @@ impl<'a> ReplyReader<'a> {
         }
         let mut b = [0u8; 4];
         for (i, slot) in b.iter_mut().enumerate() {
-            *slot = self.map.read_byte(self.pos + i as u64);
+            *slot = self
+                .map
+                .read_byte(self.pos + i as u64)
+                .ok_or(VirtioError::DeviceError)?;
         }
         self.pos += 4;
         Ok(u32::from_le_bytes(b))
@@ -850,7 +950,10 @@ impl<'a> ReplyReader<'a> {
         }
         let mut b = [0u8; 8];
         for (i, slot) in b.iter_mut().enumerate() {
-            *slot = self.map.read_byte(self.pos + i as u64);
+            *slot = self
+                .map
+                .read_byte(self.pos + i as u64)
+                .ok_or(VirtioError::DeviceError)?;
         }
         self.pos += 8;
         Ok(u64::from_le_bytes(b))
@@ -880,7 +983,7 @@ pub struct VenusClient {
     /// Reply shmem blob resource id (for unref on teardown).
     reply_res_id: u32,
     /// Kernel mapping of the ring shmem.
-    ring_map: KernelMap,
+    ring_map: RingMap,
     /// Kernel mapping of the reply shmem.
     reply_map: KernelMap,
     /// Free-running ring producer counter (vn_ring `ring->cur`).
@@ -1005,9 +1108,9 @@ impl VenusClient {
             return Err(VirtioError::DeviceError);
         }
         let seqno = self.cur;
-        self.ring_map.store_u32_seqcst(RING_TAIL_OFFSET, seqno);
+        self.ring_map.store_seqcst(RingWord::Tail, seqno);
 
-        let status = self.ring_map.load_u32_acquire(RING_STATUS_OFFSET);
+        let status = self.ring_map.load_acquire(RingWord::Status);
         if status & RING_STATUS_FATAL != 0 {
             self.latch_fatal(FatalReason::HostStatusFatal);
             return Err(VirtioError::DeviceError);
@@ -1046,7 +1149,7 @@ impl VenusClient {
             if ready(self) {
                 return Ok(());
             }
-            let status = self.ring_map.load_u32_acquire(RING_STATUS_OFFSET);
+            let status = self.ring_map.load_acquire(RingWord::Status);
             if status & RING_STATUS_FATAL != 0 {
                 // Host declared the ring fatal — it never recovers.
                 self.latch_fatal(FatalReason::HostStatusFatal);
@@ -1078,10 +1181,10 @@ impl VenusClient {
         // occupancy after this write = cur + size - head; must be <= buffer_size.
         let cur = self.cur;
         self.ring_wait_until(move |c| {
-            let head = c.ring_map.load_u32_acquire(RING_HEAD_OFFSET);
+            let head = c.ring_map.load_acquire(RingWord::Head);
             cur.wrapping_add(size).wrapping_sub(head) <= RING_BUFFER_SIZE
         })?;
-        self.ring_map.write_ring_buffer(self.cur, stream);
+        self.ring_map.write_buffer(self.cur, stream);
         self.cur = self.cur.wrapping_add(size);
         Ok(())
     }
@@ -1090,7 +1193,7 @@ impl VenusClient {
     /// and completed the command). Wrap-safe `(i32)(head - seqno) >= 0` compare.
     fn wait_seqno(&mut self, seqno: u32) -> Result<(), VirtioError> {
         self.ring_wait_until(move |c| {
-            let head = c.ring_map.load_u32_acquire(RING_HEAD_OFFSET);
+            let head = c.ring_map.load_acquire(RingWord::Head);
             (head.wrapping_sub(seqno)) as i32 >= 0
         })
     }
@@ -4138,21 +4241,37 @@ impl VenusClient {
                 let x = u64::from(destination.width - 1) * gx / (GRID - 1);
                 let offset = y * u64::from(destination.pitch) + x * bytes_per_pixel;
                 // PresentBufferDesc::new proves the complete pitched image is
-                // within allocation_size, and prep.size covers that allocation.
-                let b = u32::from(map.read_byte(offset));
-                let g = u32::from(map.read_byte(offset + 1));
-                let r = u32::from(map.read_byte(offset + 2));
-                let pixel_sum = r + g + b;
+                // within allocation_size, and prep.size covers that allocation —
+                // but that is an argument spread over two files, so take the
+                // checked read and breadcrumb the refusal instead.
+                let (Some(b), Some(g), Some(r)) = (
+                    map.read_byte(offset),
+                    map.read_byte(offset + 1),
+                    map.read_byte(offset + 2),
+                ) else {
+                    crate::diag::record_named_bytes(b"PBPrF", 0xE6);
+                    return;
+                };
+                let pixel_sum = u32::from(r) + u32::from(g) + u32::from(b);
                 rgb_sum = rgb_sum.saturating_add(pixel_sum);
                 nonblack += u32::from(pixel_sum != 0);
             }
         }
         let center_offset = u64::from(destination.height / 2) * u64::from(destination.pitch)
             + u64::from(destination.width / 2) * bytes_per_pixel;
-        let center = u32::from(map.read_byte(center_offset))
-            | (u32::from(map.read_byte(center_offset + 1)) << 8)
-            | (u32::from(map.read_byte(center_offset + 2)) << 16)
-            | (u32::from(map.read_byte(center_offset + 3)) << 24);
+        let (Some(c0), Some(c1), Some(c2), Some(c3)) = (
+            map.read_byte(center_offset),
+            map.read_byte(center_offset + 1),
+            map.read_byte(center_offset + 2),
+            map.read_byte(center_offset + 3),
+        ) else {
+            crate::diag::record_named_bytes(b"PBPrF", 0xE6);
+            return;
+        };
+        let center = u32::from(c0)
+            | (u32::from(c1) << 8)
+            | (u32::from(c2) << 16)
+            | (u32::from(c3) << 24);
         crate::diag::record_named_bytes(b"PBPrNz", nonblack);
         crate::diag::record_named_bytes(b"PBPrSum", rgb_sum);
         crate::diag::record_named_bytes(b"PBPrCtr", center);
@@ -4723,7 +4842,7 @@ pub fn allocate_host_visible_blob(
     // Track the ring blob (owner 0) so the map below can size the mapping.
     let _ = adapter.with_virtio(|v| v.note_blob_size(ring_res_id, RING_SHMEM_SIZE));
     let ring_prep = ctrl::map_blob_prepare(adapter, super::gpu::OwnerFilter::Exactly(None), ring_res_id)?;
-    let ring_map = KernelMap::new(ring_prep.gpa, ring_prep.size, ring_prep.map_cache)
+    let ring_map = RingMap::new(ring_prep.gpa, ring_prep.size, ring_prep.map_cache)
         .ok_or(VirtioError::MmioMapFailed)?;
     ring_map.zero();
     diag(0x0002);
