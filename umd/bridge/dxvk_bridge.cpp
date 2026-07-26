@@ -269,8 +269,21 @@ namespace {
       if (!mod)
         continue;
       auto fn = reinterpret_cast<Fn>(GetProcAddress(mod, export_name));
-      if (!fn)
+      if (!fn) {
+        // Release the reference this call took. Without it the refcount grows
+        // on EVERY probe of an export this module does not have — and the
+        // success cache does not bound that, because a miss is retried on
+        // every call by design (an export can legitimately appear later). The
+        // miss path is the only one where the growth was ever unbounded.
+        // LoadLibraryA on an already-loaded module only increments, so this
+        // returns the module to exactly its previous state and can never
+        // unload one another component is using.
+        FreeLibrary(mod);
         continue;
+      }
+      // Deliberately NOT freed on the hit path: `fn` points into this module,
+      // so the reference is what keeps it valid. The success cache bounds that
+      // to one extra reference per export (seven total).
 
       char msg[512];
       std::snprintf(msg, sizeof(msg), "resolved %s via ICD manifest %s -> %s",
@@ -300,8 +313,11 @@ namespace {
   // makes retry-on-failure race-free without a mutex. No code path stores
   // nullptr into a slot.
   //
-  // FreeLibrary is deliberately still absent: the cached pointer is INTO that
-  // module. Caching is what bounds the loads, not a matching free.
+  // FreeLibrary: released on the MISS path (see
+  // find_export_via_vulkan_icd_manifests), deliberately held on the HIT path
+  // because the cached pointer is INTO that module. Caching bounds the hit-path
+  // references to one per export; it does NOT bound the miss path, which is
+  // retried on every call by design — that is why the miss needs the free.
   enum class HeliosIcdExport : std::size_t {
     CurrentCtxId = 0,
     InstanceCtxId,
