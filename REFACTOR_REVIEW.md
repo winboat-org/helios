@@ -484,6 +484,12 @@ sites textually unchanged.
 
 ### R104. Turn the non-Windows `umd` build failure into the message `build.rs` already claims
 
+- **Status**: **LANDED** (2026-07-26). One correction to the validation text: `cargo check` on the
+  host now leads with the `compile_error!` text, but the `couldn't read .../d3d10umddi.rs` error
+  still follows it — rustc does not stop at `compile_error!`. The recommendation says the new
+  diagnostic appears "instead of" the old one; in fact it appears *first*, and the constraint is
+  now named. Suppressing the second would require `cfg`-gating `ddi.rs` and its dependents, which
+  the recommendation itself rules out.
 - **Finding**: u-core-14. **BUG** (a build-system assumption asserted in a comment and contradicted
   by the module graph).
 - **Where**: `umd/build.rs:90-97` (the `TARGET`-based early return whose comment says "allow

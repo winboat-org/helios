@@ -90,8 +90,13 @@ fn generate_d3d10umddi_bindings() {
 fn main() {
     let target = env::var("TARGET").unwrap_or_default();
     if !target.contains("windows") {
-        // The UMD is Windows-only; allow `cargo check` on Linux to no-op so the
-        // crate doesn't pull clang-cl / DXVK on the host.
+        // The crate is Windows-only. This guard exists so the build script does
+        // not go looking for clang-cl or the DXVK archives on a non-Windows
+        // host; it is NOT a path to a working host build. `src/lib.rs`'s
+        // `#[cfg(not(windows))] compile_error!` is what reports that, and it
+        // keys off the same target this branch tests. The WDK headers are not
+        // present on the host, so `src/ddi.rs`'s bindgen output cannot be
+        // generated there and a cfg-gated build would type-check nothing useful.
         println!("cargo:warning=helios_umd: skipping DXVK bridge on non-Windows target");
         return;
     }

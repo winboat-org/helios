@@ -6,6 +6,19 @@
 //! fails explicitly. The adapter-open handshake itself must succeed because
 //! dxgkrnl calls it during render-adapter start validation.
 
+// This crate builds for Windows targets only. `src/ddi.rs` unconditionally
+// `include!`s `$OUT_DIR/d3d10umddi.rs`, which `build.rs` can only generate on
+// Windows (bindgen over the WDK's d3d10umddi.h). Without this, a host
+// `cargo check` produced two contradictory diagnostics — build.rs reporting a
+// deliberate skip, then rustc reporting a missing generated file — neither of
+// which names the actual constraint. The predicate matches `build.rs`'s own
+// `TARGET`-based guard: `cfg(windows)` is evaluated against the target.
+#[cfg(not(windows))]
+compile_error!(
+    "helios_umd builds for windows targets only: src/ddi.rs includes WDK-derived \
+     bindgen output that build.rs can only generate on Windows"
+);
+
 use core::ffi::c_void;
 use std::io::Write;
 
