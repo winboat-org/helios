@@ -295,13 +295,16 @@ sites textually unchanged.
 
 ### R102. Make a default deploy ship and measure the release UMD
 
-- **Status**: commit 1/2 **LANDED** (2026-07-26) — PowerShell defaults, `UmdProfile` plan lines,
-  `main.rs:692` and `ROADMAP.md` doc text. `-PlanOnly` now reports
-  `UmdProfile: release` / `UmdSource: ...\target\release\helios_umd.dll`. Commit 2 (Cargo.make.toml
-  profile derivation + loud-failure copy) pending. Operational note for the gate: the release DLL
-  on the VM is dated 2026-07-24 and the debug one is current, so the UMD **must** be rebuilt
-  `--release` before the first install under the new default — otherwise the new default deploys a
-  stale binary rather than a debug one.
+- **Status**: **LANDED** (2026-07-26), both commits. Commit 1 = PowerShell defaults, `UmdProfile`
+  plan lines, `main.rs:692` and `ROADMAP.md` doc text; `-PlanOnly` now reports
+  `UmdProfile: release` / `UmdSource: ...\target\release\helios_umd.dll`. Commit 2 =
+  `Cargo.make.toml` profile derivation + loud-failure copy; a default `cargo make` still stages the
+  debug DLL byte-for-byte (package hash == `umd/target/debug/helios_umd.dll` hash), so the
+  packaging half is behaviour-preserving as claimed. Operational note carried into the gate: the
+  release DLL on the VM is dated 2026-07-24 while the debug one is current, so the UMD **must** be
+  rebuilt `--release` before the first install under the new default — otherwise the new default
+  deploys a *stale* binary rather than a debug one. Remaining gate items (SHA256 in the install log,
+  deliberate-delete abort, and the reboot baseline numbers) are the T0 gate, not this entry.
 - **Finding**: z-lead-02. **BUG** (a default deploy silently ships a different binary from the one
   the regression gate names; deliberately behaviour-changing).
 - **Where**: `tools/install-helios-kmd.ps1:3` (`[string]$UmdDll = "C:\Users\Rupansh\helios-vgpu\umd\

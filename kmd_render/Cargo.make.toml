@@ -18,6 +18,18 @@ load_script = '''
 wdk_build::cargo_make::load_rust_driver_makefile()?
 '''
 
+# Builds helios_umd and stages it into the driver package.
+#
+# PREREQUISITE: this task cannot succeed without a prior `win_dxvk` build.
+# umd/build.rs links libhelios_d3d11_static.a / libdxvk.a / ... out of
+# C:\Users\Rupansh\dxvk-build, so a missing or stale DXVK build fails here, in
+# the inner cargo build, not in kmd_render.
+#
+# NOTE: whatever this task stages is overwritten by install-helios-kmd.ps1's
+# Sync-HeliosPackageUmd ($UmdDll, release by default) before the catalog is
+# created and signed. This task decides what a bare `cargo make` packages; the
+# install script decides what actually reaches the DriverStore. Keep the two
+# profiles in agreement or the package hash moves between build and install.
 [tasks.copy-umd-to-package]
 private = true
 dependencies = ["copy-driver-binary-to-package", "copy-inf-to-package"]
@@ -30,20 +42,51 @@ let kmd_dir = PathBuf::from(std::env::var("CARGO_MAKE_WORKING_DIRECTORY").unwrap
 let repo = kmd_dir.parent().unwrap().to_path_buf();
 let umd_dir = repo.join("umd");
 
-let status = Command::new("cargo")
-    .arg("build")
-    .current_dir(&umd_dir)
+// One source of truth for the profile, used for the inner build's flag, the UMD
+// source directory and the package destination — previously all three were the
+// hardcoded string "debug", so a `cargo make --profile production` built release
+// and then copied a stale debug DLL.
+let cargo_profile =
+    std::env::var("CARGO_MAKE_CARGO_PROFILE").unwrap_or_else(|_| "dev".to_string());
+// cargo's `dev` profile writes to target/debug; every other profile uses its own
+// name as the directory.
+let profile_dir = if cargo_profile == "dev" { "debug" } else { cargo_profile.as_str() };
+
+let mut build = Command::new("cargo");
+build.arg("build").current_dir(&umd_dir);
+match cargo_profile.as_str() {
+    "dev" => {}
+    "release" => { build.arg("--release"); }
+    other => { build.arg("--profile").arg(other); }
+}
+let status = build
     .status()
     .expect("launch cargo build for helios_umd");
-assert!(status.success(), "helios_umd build failed");
+assert!(
+    status.success(),
+    "helios_umd build failed (profile {cargo_profile}); a missing or stale DXVK build in \
+     C:\\Users\\Rupansh\\dxvk-build is the usual cause — run win_dxvk first"
+);
 
-let source = umd_dir.join("target").join("debug").join("helios_umd.dll");
+let source = umd_dir.join("target").join(profile_dir).join("helios_umd.dll");
+// Loud failure over a stale copy: CARGO_TARGET_DIR set in the environment sends
+// the inner build's output elsewhere, in which case `source` is either absent or
+// a leftover from an older build and the package would ship it silently.
+assert!(
+    source.exists(),
+    "helios_umd.dll not found at {} after a successful build (profile {cargo_profile}) — \
+     CARGO_TARGET_DIR set in the environment redirects the inner cargo build's output",
+    source.display()
+);
 let package = kmd_dir
     .join("target")
-    .join("debug")
+    .join(profile_dir)
     .join("helios_kmd_render_package");
 std::fs::create_dir_all(&package).unwrap();
-std::fs::copy(&source, package.join("helios_umd.dll")).unwrap();
+let destination = package.join("helios_umd.dll");
+std::fs::copy(&source, &destination).unwrap_or_else(|e| {
+    panic!("copy {} -> {}: {e}", source.display(), destination.display())
+});
 '''
 
 [tasks.stampinf]
