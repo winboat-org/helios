@@ -8236,7 +8236,7 @@ fn device_is_live(device: usize) -> bool {
     }
 }
 
-/// The ten DDI paths that refuse or silently downgrade runtime-requested work.
+/// The eleven DDI paths that refuse or silently downgrade runtime-requested work.
 ///
 /// Each field is a legitimate runtime decision about runtime-supplied data, so
 /// a *type* encoding would be cosmetic — what they lacked was any record at
@@ -8290,6 +8290,15 @@ struct DdiRefusals {
     /// bpp/layout reads), so this counts rather than refuses -- but it was the
     /// one silent path the format table's readers still had.
     alloc_meta_format_unknown: AtomicUsize,
+    /// `maybe_log_present_readback` refusing to sample a mapped surface whose
+    /// `dxgi_bytes_per_pixel` stride would leave the mapped row.
+    ///
+    /// The eleventh, added with R1010. Env-gated
+    /// (`HELIOS_PRESENT_READBACK`) and capped at 8 invocations, so it is a
+    /// debugging path rather than a live one -- but it was reading out of
+    /// bounds for a genuinely 16-bpp or block-compressed surface, and a
+    /// refusal has to be countable like every other.
+    readback_stride_unsafe: AtomicUsize,
 }
 
 static DDI_REFUSALS: DdiRefusals = DdiRefusals {
@@ -8303,9 +8312,10 @@ static DDI_REFUSALS: DdiRefusals = DdiRefusals {
     tess_sig_fallback: AtomicUsize::new(0),
     unhandled_resource_dimension: AtomicUsize::new(0),
     alloc_meta_format_unknown: AtomicUsize::new(0),
+    readback_stride_unsafe: AtomicUsize::new(0),
 };
 
-/// One bounded log line carrying all ten counters.
+/// One bounded log line carrying all eleven counters.
 ///
 /// The UMD's evidence channel is the log — it has no registry counter surface —
 /// and T5 proved the failure mode this avoids: three of the four R806/R809
@@ -8327,7 +8337,8 @@ pub(crate) fn ddi_refusal_summary() -> String {
          text_filter_size_ignored={} staging_busy_assumed_free={} \
          discard_partial={} clear_view_unsupported={} \
          gs_so_declaration_dropped={} tess_sig_fallback={} \
-         unhandled_resource_dimension={} alloc_meta_format_unknown={}",
+         unhandled_resource_dimension={} alloc_meta_format_unknown={} \
+         readback_stride_unsafe={}",
         r.srv_raw_hazard.load(Ordering::Relaxed),
         r.resource_raw_hazard.load(Ordering::Relaxed),
         r.text_filter_size_ignored.load(Ordering::Relaxed),
@@ -8338,6 +8349,7 @@ pub(crate) fn ddi_refusal_summary() -> String {
         r.tess_sig_fallback.load(Ordering::Relaxed),
         r.unhandled_resource_dimension.load(Ordering::Relaxed),
         r.alloc_meta_format_unknown.load(Ordering::Relaxed),
+        r.readback_stride_unsafe.load(Ordering::Relaxed),
     )
 }
 
@@ -8776,6 +8788,33 @@ unsafe fn maybe_log_present_readback(h: Hdevice, src_h: ddi::D3D10DDI_HRESOURCE)
     }
     let bpp = dxgi_bytes_per_pixel(desc.Format.0 as u32).max(1) as usize;
     let row_pitch = mapped.RowPitch as usize;
+    // `dxgi_bytes_per_pixel` is a PITCH-PADDING estimate, not a true bpp: its
+    // 4-byte default covers the genuinely 16-bpp B5G6R5 / B5G5R5A1 / B4G4R4A4
+    // formats and every block-compressed format. Over-reporting is harmless
+    // where it is used to pad `linear_size`, but here it is a byte-addressing
+    // stride, and `(Width - 1) * bpp` then runs past the row -- on the LAST
+    // row, past the end of the mapping. `maybe_force_present_alpha_opaque`
+    // already guards its own indexing with a hard `bpp != 4`; this is the
+    // same refusal, expressed against the pitch the runtime actually mapped
+    // so every currently-correct width/format still reads.
+    let last_sample_end = (desc.Width.saturating_sub(1) as usize)
+        .saturating_mul(bpp)
+        .saturating_add(bpp.min(4));
+    if row_pitch == 0 || last_sample_end > row_pitch {
+        note_ddi_refusal(&DDI_REFUSALS.readback_stride_unsafe);
+        log_error!(
+            "DXGI Present readback: stride would leave the mapping, refusing \
+             {}x{} fmt={} bpp={} row_pitch={} last_sample_end={}",
+            desc.Width,
+            desc.Height,
+            desc.Format.0,
+            bpp,
+            row_pitch,
+            last_sample_end
+        );
+        context.Unmap(&staging_res, 0);
+        return;
+    }
     let data = mapped.pData as *const u8;
     let mut sum: u64 = 0;
     let mut nonzero = 0u32;
