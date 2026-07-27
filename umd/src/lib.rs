@@ -38,8 +38,8 @@ mod forward;
 mod hr;
 
 use crate::hr::{
-    Hresult, DXGI_ERROR_DRIVER_INTERNAL_ERROR, DXGI_STATUS_NO_REDIRECTION, E_FAIL, E_NOTIMPL,
-    E_OUTOFMEMORY, S_OK,
+    Hresult, DXGI_ERROR_UNSUPPORTED, DXGI_STATUS_NO_REDIRECTION, E_FAIL, E_NOTIMPL, E_OUTOFMEMORY,
+    S_OK,
 };
 
 const fn ddi_supported(major: u64, minor: u64, build: u64) -> u64 {
@@ -458,11 +458,13 @@ pub unsafe extern "system" fn OpenAdapter12(open_data: *mut D3d12DdiArgOpenAdapt
     log_error!("OpenAdapter12");
     log_error!("OpenAdapter12 -> DXGI_ERROR_UNSUPPORTED (D3D12 DDI not implemented yet)");
     let _ = open_data;
-    // R801 sub-commit 1 is value-preserving: this site has always returned
-    // 0x887A_0020, which is DXGI_ERROR_DRIVER_INTERNAL_ERROR and not
-    // DXGI_ERROR_UNSUPPORTED as the old constant name claimed. Named honestly
-    // here; corrected to DXGI_ERROR_UNSUPPORTED in sub-commit 2.
-    return DXGI_ERROR_DRIVER_INTERNAL_ERROR;
+    // Declining an unimplemented DDI is DXGI_ERROR_UNSUPPORTED (0x887A_0004),
+    // not DXGI_ERROR_DRIVER_INTERNAL_ERROR (0x887A_0020). This site returned
+    // the latter until R801 because the two shared a constant name: a D3D12
+    // client's ordinary "this driver has no D3D12 DDI" negotiation was recorded
+    // by the runtime and by ETW as a *driver fault*. Nothing distinguished the
+    // two in our log, since both printed as "DXGI_ERROR_UNSUPPORTED".
+    return DXGI_ERROR_UNSUPPORTED;
 
     #[allow(unreachable_code)]
     {
