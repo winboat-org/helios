@@ -280,6 +280,67 @@ impl PresentAllocInfo {
     }
 }
 
+/// A resolved byte row stride for a surface that HAS a linear row layout.
+///
+/// R1007. "What is this surface's row stride" had several independent answers:
+/// `OpenAllocation` implemented the full three-arm rule, `ScanoutTarget::new`
+/// the two-arm form without the OPTIMAL case, and
+/// `GetStandardAllocationDriverData` re-implemented the authoring half four
+/// times. They agree today only because KMD standard allocations are authored
+/// with exactly `cross_adapter_pitch(width)` -- while the primary arm overwrites
+/// `meta.pitch` with Vulkan's `scanout.row_pitch`, which is NOT derived from
+/// width.
+///
+/// Constructible only through [`RowPitch::resolve`], so a byte-addressing
+/// consumer cannot obtain a stride for a tiled surface: `resolve` answers `None`
+/// there, and `None` is not 0.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RowPitch(u32);
+
+impl RowPitch {
+    /// The single rule.
+    ///
+    ///   OPTIMAL GDI texture -> `None`  (no linear row layout exists)
+    ///   authored pitch      -> that pitch
+    ///   otherwise           -> `cross_adapter_pitch(width)`
+    ///
+    /// ⚠ `cross_adapter_pitch` HARDCODES 32 bpp (`width * 4`, 256-aligned),
+    /// while the UMD's equivalent uses `dxgi_bytes_per_pixel`. The fallback
+    /// therefore assumes every KMD standard allocation is 4 bpp. That is true
+    /// today -- `GetStandardAllocationDriverData` authors them all that way --
+    /// and it is the assumption to revisit first if a non-32-bpp standard
+    /// allocation ever appears.
+    pub(crate) fn resolve(misc_flags: u32, pitch: u32, width: u32) -> Option<Self> {
+        if misc_flags & HELIOS_WDDM_ALLOC_MISC_OPTIMAL_GDI_TEXTURE != 0 {
+            return None;
+        }
+        Some(Self(if pitch != 0 {
+            pitch
+        } else {
+            cross_adapter_pitch(width)
+        }))
+    }
+
+    /// The same rule for a surface KNOWN to have a linear row layout.
+    ///
+    /// A scan-out target is linear by construction -- an OPTIMAL GDI texture can
+    /// never be a primary -- so the tiled arm cannot apply and this is total.
+    pub(crate) fn linear(pitch: u32, width: u32) -> Self {
+        match Self::resolve(0, pitch, width) {
+            Some(p) => p,
+            // Unreachable: `resolve` answers None only for the
+            // OPTIMAL_GDI_TEXTURE flag, which is not set above. Falls back to
+            // the value the pre-R1007 two-arm expression produced rather than
+            // refusing; this tranche adds no refusals.
+            None => Self(cross_adapter_pitch(width)),
+        }
+    }
+
+    pub(crate) fn get(self) -> u32 {
+        self.0
+    }
+}
+
 /// Row-count alignment for an external LINEAR image, in rows.
 ///
 /// EMPIRICAL, and named so it reads as one. NVIDIA's external-linear image
@@ -743,12 +804,8 @@ impl ScanoutTarget {
         // 256-aligned), NOT `width*4`: for 1896 wide that is 7680 vs 7584, and a
         // wrong stride shears the scan-out so the host reads each row 96 bytes
         // short. Fall back to the same alignment the UMD uses if the allocation
-        // carried no pitch.
-        let pitch = if pitch != 0 {
-            pitch
-        } else {
-            cross_adapter_pitch(width)
-        };
+        // carried no pitch. R1007: one resolver, shared with OpenAllocation.
+        let pitch = RowPitch::linear(pitch, width).get();
         // Resolve the scan-out format from the creator's EXACT DXGI format (the
         // KMD D3DDDIFORMAT is lossy — B8G8R8A8 and R8G8B8A8 both collapse to
         // A8R8G8B8). The legacy-zero arm is what the converter has always
@@ -2563,13 +2620,12 @@ pub unsafe extern "C" fn dxgkddi_open_allocation(
 
     if let Some(meta) = subresource_meta {
         args.SubresourceOffset = 0;
-        args.Pitch = if meta.misc_flags & HELIOS_WDDM_ALLOC_MISC_OPTIMAL_GDI_TEXTURE != 0 {
-            0
-        } else if meta.pitch != 0 {
-            meta.pitch
-        } else {
-            cross_adapter_pitch(meta.width)
-        };
+        // R1007: one resolver. `None` -- a tiled surface with no linear row
+        // layout -- reports 0 to the runtime, which is what OpenAllocation has
+        // always done and is the documented "no pitch" answer for a GDI
+        // texture.
+        args.Pitch = RowPitch::resolve(meta.misc_flags, meta.pitch, meta.width)
+            .map_or(0, RowPitch::get);
         crate::diag::record(0x0C38_0000 | (args.Pitch.min(0xFFFF) as u32));
     }
     STATUS_SUCCESS
@@ -2713,12 +2769,12 @@ pub unsafe extern "C" fn dxgkddi_get_standard_allocation_driver_data(
         }
         D3DKMDT_STANDARDALLOCATION_SHADOWSURFACE => {
             let sd = unsafe { &mut *args.__bindgen_anon_1.pCreateShadowSurfaceData };
-            sd.Pitch = cross_adapter_pitch(sd.Width);
+            sd.Pitch = RowPitch::linear(0, sd.Width).get();
             (sd.Width, sd.Height, sd.Format as u32)
         }
         D3DKMDT_STANDARDALLOCATION_STAGINGSURFACE => {
             let sd = unsafe { &mut *args.__bindgen_anon_1.pCreateStagingSurfaceData };
-            sd.Pitch = cross_adapter_pitch(sd.Width);
+            sd.Pitch = RowPitch::linear(0, sd.Width).get();
             (sd.Width, sd.Height, D3DDDIFMT_A8R8G8B8 as u32)
         }
         D3DKMDT_STANDARDALLOCATION_GDISURFACE => {
@@ -2730,11 +2786,16 @@ pub unsafe extern "C" fn dxgkddi_get_standard_allocation_driver_data(
             // staging variants are the only GDI types for which Windows
             // requires the miniport to return a pitch.
             is_optimal_gdi_texture = gdi_surface_type == GDI_SURFACE_TYPE_TEXTURE;
-            sd.Pitch = if is_optimal_gdi_texture {
-                0
-            } else {
-                cross_adapter_pitch(sd.Width)
-            };
+            sd.Pitch = RowPitch::resolve(
+                if is_optimal_gdi_texture {
+                    HELIOS_WDDM_ALLOC_MISC_OPTIMAL_GDI_TEXTURE
+                } else {
+                    0
+                },
+                0,
+                sd.Width,
+            )
+            .map_or(0, RowPitch::get);
             (sd.Width, sd.Height, sd.Format as u32)
         }
         _ => {
@@ -2743,11 +2804,28 @@ pub unsafe extern "C" fn dxgkddi_get_standard_allocation_driver_data(
         }
     };
 
-    let pitch = if is_optimal_gdi_texture {
-        0
-    } else {
-        cross_adapter_pitch(width)
-    };
+    // THE PRODUCER of `meta.pitch`, and the reason the consumers' fallback arm
+    // is `cross_adapter_pitch(width)` at all: KMD standard allocations are
+    // AUTHORED with exactly that value, so the consumers agree with the
+    // producer by construction rather than by coincidence. `RowPitch::resolve`
+    // is the consumer side of the same rule -- with `pitch: 0` here, it answers
+    // `cross_adapter_pitch(width)` for exactly the surfaces this arm authors
+    // and `None` for the OPTIMAL GDI texture this one reports as 0.
+    //
+    // ⚠ The one arm that breaks the correspondence is not here: the `is_primary`
+    // path in `create_one` overwrites `meta.pitch` with Vulkan's
+    // `scanout.row_pitch`, which is NOT derived from width. That is why the
+    // consumers prefer a non-zero authored pitch over recomputing one.
+    let pitch = RowPitch::resolve(
+        if is_optimal_gdi_texture {
+            HELIOS_WDDM_ALLOC_MISC_OPTIMAL_GDI_TEXTURE
+        } else {
+            0
+        },
+        0,
+        width,
+    )
+    .map_or(0, RowPitch::get);
     let size = if is_optimal_gdi_texture {
         // CreateAllocation replaces this estimate with Vulkan's exact memory
         // requirement before reporting Size to VidMm.
