@@ -557,6 +557,10 @@ pub unsafe extern "C" fn dxgkddi_stop_device(miniport_device_context: *mut c_voi
         // resource id gets bound as the cached scan-out target.
         adapter.reset_display_publication_state();
 
+        // SAFETY: PLACEHOLDER (R614) — `dxgkddi_stop_device` mints the real token
+        // in the start/stop commit of this tranche.
+        let passive_stop = unsafe { crate::irql::PassiveLevel::assume() };
+
         // Tear down the venus client + page-table blob + context BEFORE dropping
         // the transport (the unref/detach/destroy commands need the live device).
         // Drop the client first to unmap its ring/reply BAR kernel mappings.
@@ -567,16 +571,12 @@ pub unsafe extern "C" fn dxgkddi_stop_device(miniport_device_context: *mut c_voi
             // venus context (PASSIVE flows through virtio::ctrl).
             // The KMD-owned sweep — `None` here means exactly the KMD's own blobs, not
             // "every owner".
-            let _ = crate::virtio::ctrl::release_blobs_for_owner(adapter, None);
+            let _ = crate::virtio::ctrl::release_blobs_for_owner(passive_stop, adapter, None);
             let _ = crate::virtio::ctrl::ctx_destroy_kmd(adapter, venus_ctx);
         }
         // Free any parked completed entries at PASSIVE before the transport
         // (and the buffers still in flight inside it) is dropped.
-        // SAFETY: PLACEHOLDER (R614 commit 1) — see above.
-        crate::virtio::ctrl::reap_parked(
-            unsafe { crate::irql::PassiveLevel::assume() },
-            adapter,
-        );
+        crate::virtio::ctrl::reap_parked(passive_stop, adapter);
 
         // Tear down the virtio transport: VirtioGpu::drop resets the device and
         // frees its rings (plus any in-flight/parked entry buffers). A later

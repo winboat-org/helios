@@ -768,7 +768,12 @@ impl ImportedOptimalImage {
             return Err((self, e));
         }
         // Each resource occurs exactly once in present_images.
-        if let Err(e) = ctrl::ctx_detach_resource(adapter, client.ctx_id(), self.desc.resource_id) {
+        if let Err(e) = ctrl::ctx_detach_resource(
+            client.passive(),
+            adapter,
+            client.ctx_id(),
+            self.desc.resource_id,
+        ) {
             return Err((self, e));
         }
         Ok(())
@@ -3019,7 +3024,7 @@ impl VenusClient {
         if let Some(memory_id) = memory_id {
             self.free_memory_blob(adapter, memory_id.get())?;
         }
-        ctrl::ctx_detach_resource(adapter, self.ctx_id(), resource_id)
+        ctrl::ctx_detach_resource(self.passive(), adapter, self.ctx_id(), resource_id)
     }
 
     fn cleanup_borrowed_present_buffer(
@@ -3053,7 +3058,12 @@ impl VenusClient {
         ) {
             Ok(image_id) => image_id,
             Err(e) => {
-                let _ = ctrl::ctx_detach_resource(adapter, self.ctx_id(), desc.resource_id);
+                let _ = ctrl::ctx_detach_resource(
+                    self.passive(),
+                    adapter,
+                    self.ctx_id(),
+                    desc.resource_id,
+                );
                 return Err(e);
             }
         };
@@ -3972,7 +3982,12 @@ impl VenusClient {
         ) {
             Ok(id) => id,
             Err(e) => {
-                let _ = ctrl::ctx_detach_resource(adapter, self.ctx_id(), source_resource_id);
+                let _ = ctrl::ctx_detach_resource(
+                    self.passive(),
+                    adapter,
+                    self.ctx_id(),
+                    source_resource_id,
+                );
                 return Err(e);
             }
         };

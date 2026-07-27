@@ -521,6 +521,7 @@ unsafe fn dxgkddi_present_inner(
             if has_system_backing {
                 match unsafe {
                     crate::ddi::build_paging_buffer::mirror_present_system_backing(
+                        passive,
                         adapter,
                         destination.resource_id,
                     )

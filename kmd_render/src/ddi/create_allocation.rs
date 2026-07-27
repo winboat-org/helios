@@ -1221,9 +1221,10 @@ unsafe fn destroy_allocation_ctx(adapter: &AdapterContext, ctx: Box<AllocationCo
         // Drop the owner-0 tracking slot (registered at CreateAllocation, or
         // re-owned to the allocation at adopt), unmapping the GDI executor's
         // host-visible mapping if one is live.
-        let unmapped_here = crate::virtio::ctrl::forget_allocation_blob(adapter, ctx.resource_id);
+        let unmapped_here =
+            crate::virtio::ctrl::forget_allocation_blob(passive, adapter, ctx.resource_id);
         if ctx.mapped && !unmapped_here {
-            let _ = crate::virtio::ctrl::resource_unmap_blob(adapter, ctx.resource_id);
+            let _ = crate::virtio::ctrl::resource_unmap_blob(passive, adapter, ctx.resource_id);
         }
         // One guarded teardown path for created AND adopted resources. The old
         // adopted arm unref'd unconditionally, which double-freed resources
@@ -1233,8 +1234,13 @@ unsafe fn destroy_allocation_ctx(adapter: &AdapterContext, ctx: Box<AllocationCo
             .with_virtio(|v| v.take_live_resource(ctx.resource_id))
             .unwrap_or(false);
         if first_teardown {
-            let _ = crate::virtio::ctrl::ctx_detach_resource(adapter, ctx.ctx_id, ctx.resource_id);
-            let _ = crate::virtio::ctrl::resource_unref(adapter, ctx.resource_id);
+            let _ = crate::virtio::ctrl::ctx_detach_resource(
+                passive,
+                adapter,
+                ctx.ctx_id,
+                ctx.resource_id,
+            );
+            let _ = crate::virtio::ctrl::resource_unref(passive, adapter, ctx.resource_id);
         }
         if ctx.venus_image_id != 0 {
             let _ = adapter

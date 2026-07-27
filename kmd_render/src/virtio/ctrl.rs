@@ -543,11 +543,11 @@ pub fn ctx_attach_resource(
 
 /// Detach a resource from a 3D context.
 pub fn ctx_detach_resource(
+    passive: PassiveLevel,
     adapter: &AdapterContext,
     ctx_id: u32,
     resource_id: u32,
 ) -> Result<(), VirtioError> {
-    let passive = assume_passive_unaudited();
     let mut cmd = VirtioGpuCtxResource::zeroed();
     cmd.hdr.type_ = VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE;
     cmd.hdr.ctx_id = ctx_id;
@@ -750,8 +750,11 @@ pub fn set_scanout_2d(
     ctrl_roundtrip_ok(passive, adapter, bytes_of(&set), None)
 }
 
-pub fn resource_unref(adapter: &AdapterContext, resource_id: u32) -> Result<(), VirtioError> {
-    let passive = assume_passive_unaudited();
+pub fn resource_unref(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    resource_id: u32,
+) -> Result<(), VirtioError> {
     let mut cmd = VirtioGpuResourceUnref::zeroed();
     cmd.hdr.type_ = VIRTIO_GPU_CMD_RESOURCE_UNREF;
     cmd.resource_id = resource_id;
@@ -954,7 +957,7 @@ pub fn diagnostic_guest_blob_scanout(
 
     let _ = adapter.with_virtio(|v| v.commit_resource(resource_id));
     if let Err(e) = set_scanout_blob(adapter, resource_id, width, height, format, pitch, 0) {
-        let _ = resource_unref(adapter, resource_id);
+        let _ = resource_unref(passive, adapter, resource_id);
         return Err(e);
     }
     core::mem::forget(backing);
@@ -1187,7 +1190,7 @@ pub fn diagnostic_virgl_host3d_guest_scanout(
     xfer.stride = pitch;
     xfer.layer_stride = pitch.saturating_mul(height);
     if let Err(e) = ctrl_roundtrip_ok(passive, adapter, bytes_of(&xfer), None) {
-        let _ = resource_unref(adapter, resource_id);
+        let _ = resource_unref(passive, adapter, resource_id);
         return Err(e);
     }
 
@@ -1260,7 +1263,7 @@ pub fn resource_create_blob(
     if let Err(e) = ctx_attach_resource(passive, adapter, ctx_id, resource_id) {
         // The resource exists host-side but could not attach: drop it so it
         // does not leak untracked.
-        let _ = resource_unref(adapter, resource_id);
+        let _ = resource_unref(passive, adapter, resource_id);
         let _ = adapter.with_virtio(|v| v.cancel_resource_reservation());
         return Err(e);
     }
@@ -1334,8 +1337,11 @@ fn resource_map_blob_roundtrip(
 }
 
 /// Tear down a blob's host-visible mapping.
-pub fn resource_unmap_blob(adapter: &AdapterContext, resource_id: u32) -> Result<(), VirtioError> {
-    let passive = assume_passive_unaudited();
+pub fn resource_unmap_blob(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    resource_id: u32,
+) -> Result<(), VirtioError> {
     let mut cmd = VirtioGpuResourceUnmapBlob::zeroed();
     cmd.hdr.type_ = VIRTIO_GPU_CMD_RESOURCE_UNMAP_BLOB;
     cmd.resource_id = resource_id;
@@ -1379,7 +1385,7 @@ pub fn map_blob_prepare(
                     BlobMapFinish::SlotGone => {
                         // Owner teardown raced the map: undo the host mapping
                         // and return the reserved range.
-                        let _ = resource_unmap_blob(adapter, resource_id);
+                        let _ = resource_unmap_blob(passive, adapter, resource_id);
                         let _ = adapter.with_virtio(|v| v.free_window_range_pub(offset, len));
                         Err(VirtioError::DeviceError)
                     }
@@ -1401,11 +1407,11 @@ pub fn map_blob_prepare(
 /// driver missed) is unmapped so host window subregions never overlap.
 /// PASSIVE_LEVEL only (host round-trips).
 pub fn map_blob_at(
+    passive: PassiveLevel,
     adapter: &AdapterContext,
     resource_id: u32,
     window_offset: u64,
 ) -> Result<BlobMapPrep, VirtioError> {
-    let passive = assume_passive_unaudited();
     // Evict stale overlapping placements before reserving our own slot.
     let (_, blob_size, _) = adapter
         .with_virtio(|v| v.blob_lookup(resource_id))
@@ -1426,7 +1432,7 @@ pub fn map_blob_at(
         .map_err(|_| VirtioError::DeviceError)?
         .map_err(|_truncated| VirtioError::DeviceError)?;
     for &res in stale[..n].iter() {
-        let _ = resource_unmap_blob(adapter, res);
+        let _ = resource_unmap_blob(passive, adapter, res);
         let _ = adapter.with_virtio(|v| v.blob_note_unmapped(res));
     }
 
@@ -1449,7 +1455,7 @@ pub fn map_blob_at(
                     // Content-preserving move: unmap the previous placement and
                     // (for KMD-partition offsets only — the free guard ignores
                     // VidMm-partition ones) return its range.
-                    let _ = resource_unmap_blob(adapter, resource_id);
+                    let _ = resource_unmap_blob(passive, adapter, resource_id);
                     let _ = adapter.with_virtio(|v| v.free_window_range_pub(old_offset, old_len));
                 }
                 let cache =
@@ -1464,7 +1470,7 @@ pub fn map_blob_at(
                         Err(cache.err().unwrap_or(VirtioError::DeviceError))
                     }
                     BlobMapFinish::SlotGone => {
-                        let _ = resource_unmap_blob(adapter, resource_id);
+                        let _ = resource_unmap_blob(passive, adapter, resource_id);
                         Err(VirtioError::DeviceError)
                     }
                 };
@@ -1476,9 +1482,7 @@ pub fn map_blob_at(
 /// `HELIOS_ESCAPE_RELEASE_BLOB` — unmap (if mapped) + detach + unref a blob and
 /// drop its tracking slot, returning its window range to the free list.
 pub fn release_blob_for_owner(
-    // Becomes load-bearing in the allocation commit, when the unmap/detach/unref
-    // entry points it calls stop minting their own token.
-    _passive: PassiveLevel,
+    passive: PassiveLevel,
     adapter: &AdapterContext,
     owner: DeviceOwner,
     ctx_id: u32,
@@ -1491,15 +1495,15 @@ pub fn release_blob_for_owner(
         return Ok(());
     };
     if mapped {
-        let _ = resource_unmap_blob(adapter, res);
+        let _ = resource_unmap_blob(passive, adapter, res);
         let _ = adapter.with_virtio(|v| v.free_window_range_pub(map_offset, map_len));
     }
     let first_teardown = adapter
         .with_virtio(|v| v.take_live_resource(res))
         .unwrap_or(false);
     if first_teardown {
-        let _ = ctx_detach_resource(adapter, ctx_id, res);
-        resource_unref(adapter, res)
+        let _ = ctx_detach_resource(passive, adapter, ctx_id, res);
+        resource_unref(passive, adapter, res)
     } else {
         Ok(())
     }
@@ -1508,7 +1512,11 @@ pub fn release_blob_for_owner(
 /// Reclaim every blob still owned by `owner` (a destroyed D3D device handle):
 /// unmap (if mapped), detach, unref, and return the window range. KMD-side
 /// safety net for an ICD that crashes or skips RELEASE_BLOB. Returns the count.
-pub fn release_blobs_for_owner(adapter: &AdapterContext, owner: Option<DeviceOwner>) -> u32 {
+pub fn release_blobs_for_owner(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    owner: Option<DeviceOwner>,
+) -> u32 {
     let mut reclaimed = 0u32;
     loop {
         let taken = adapter
@@ -1518,15 +1526,15 @@ pub fn release_blobs_for_owner(adapter: &AdapterContext, owner: Option<DeviceOwn
             return reclaimed;
         };
         if mapped {
-            let _ = resource_unmap_blob(adapter, res);
+            let _ = resource_unmap_blob(passive, adapter, res);
             let _ = adapter.with_virtio(|v| v.free_window_range_pub(map_offset, map_len));
         }
         let first_teardown = adapter
             .with_virtio(|v| v.take_live_resource(res))
             .unwrap_or(false);
         if first_teardown {
-            let _ = ctx_detach_resource(adapter, ctx_id, res);
-            let _ = resource_unref(adapter, res);
+            let _ = ctx_detach_resource(passive, adapter, ctx_id, res);
+            let _ = resource_unref(passive, adapter, res);
         }
         reclaimed += 1;
     }
@@ -1536,7 +1544,11 @@ pub fn release_blobs_for_owner(adapter: &AdapterContext, owner: Option<DeviceOwn
 /// DestroyAllocation time, unmapping the window mapping the GDI executor may
 /// have opened. Returns `true` if a live mapping was unmapped here (the caller
 /// must not send a second host unmap for the same resource).
-pub fn forget_allocation_blob(adapter: &AdapterContext, resource_id: u32) -> bool {
+pub fn forget_allocation_blob(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    resource_id: u32,
+) -> bool {
     let taken = adapter
         .with_virtio(|v| v.forget_allocation_blob(resource_id))
         .unwrap_or(None);
@@ -1544,7 +1556,7 @@ pub fn forget_allocation_blob(adapter: &AdapterContext, resource_id: u32) -> boo
         return false;
     };
     if mapped {
-        let _ = resource_unmap_blob(adapter, resource_id);
+        let _ = resource_unmap_blob(passive, adapter, resource_id);
         let _ = adapter.with_virtio(|v| v.free_window_range_pub(map_offset, map_len));
         return true;
     }

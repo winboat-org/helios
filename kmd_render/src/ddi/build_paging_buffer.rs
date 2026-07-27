@@ -107,6 +107,7 @@ pub fn diag_dump_gpummu_atomics() {
 /// `PASSIVE_LEVEL` (KIRQL 0) — the only IRQL at which the BAR content ops
 /// (host round-trips, Mm mapping calls) may run.
 use crate::ddi::PASSIVE_LEVEL_IRQL;
+use crate::irql::PassiveLevel;
 
 /// What one content-op executor did, as a value the dispatch must consume.
 ///
@@ -484,15 +485,12 @@ unsafe fn mdl_system_va(mdl: PMDL) -> Option<MdlWindow> {
 /// identical at any window offset). PASSIVE_LEVEL. Returns `false` (counted)
 /// if the blob could not be resolved/mapped.
 unsafe fn with_blob_bytes(
+    passive: PassiveLevel,
     adapter: &AdapterContext,
     resource_id: u32,
     f: impl FnOnce(*mut u8, u64),
 ) -> bool {
     BAR_LAST_RESID.store(resource_id, Ordering::Relaxed);
-    // SAFETY: PLACEHOLDER (R614) — the audited mint for this path arrives with
-    // the paging/aperture commit, which threads a parameter from
-    // `dxgkddi_build_paging_buffer`'s runtime IRQL gate and from DxgkDdiPresent.
-    let passive = unsafe { crate::irql::PassiveLevel::assume() };
     let prep = match crate::virtio::ctrl::map_blob_prepare(
         passive,
         adapter,
@@ -670,13 +668,14 @@ unsafe fn remember_system_backing(
 /// paged it back into the BAR before this Present). `Some(false)` is a real
 /// mapping/copy failure and must not be silently treated as a successful frame.
 pub(crate) unsafe fn mirror_present_system_backing(
+    passive: PassiveLevel,
     adapter: &AdapterContext,
     resource_id: u32,
 ) -> Option<bool> {
     let backing = adapter.system_backings.snapshot(resource_id)?;
     let mut copied = false;
     let mapped = unsafe {
-        with_blob_bytes(adapter, resource_id, |blob, len| {
+        with_blob_bytes(passive, adapter, resource_id, |blob, len| {
             if backing.blob_offset.saturating_add(backing.size) > len {
                 return;
             }
@@ -706,6 +705,7 @@ pub(crate) unsafe fn mirror_present_system_backing(
 /// only to the blob and is deliberately not added to either virtual address, as
 /// required by `DXGK_BUILDPAGINGBUFFER_TRANSFERVIRTUAL`.
 unsafe fn bar_virtual_transfer(
+    passive: PassiveLevel,
     adapter: &AdapterContext,
     transfer: &DXGK_BUILDPAGINGBUFFER_TRANSFERVIRTUAL,
 ) -> bool {
@@ -760,7 +760,7 @@ unsafe fn bar_virtual_transfer(
 
     let mut copied = false;
     let mapped = unsafe {
-        with_blob_bytes(adapter, alloc.resource_id, |blob, blob_size| {
+        with_blob_bytes(passive, adapter, alloc.resource_id, |blob, blob_size| {
             if offset.checked_add(size).is_none_or(|end| end > blob_size) {
                 BAR_ERR_BOUNDS.fetch_add(1, Ordering::Relaxed);
                 return;
@@ -806,6 +806,7 @@ unsafe fn bar_virtual_transfer(
 /// the paging fence retires, so VidMm's content model stays truthful across
 /// eviction/re-commit). PASSIVE_LEVEL.
 unsafe fn bar_transfer(
+    passive: PassiveLevel,
     adapter: &AdapterContext,
     bar_id: u32,
     t: &_DXGKARG_BUILDPAGINGBUFFER__bindgen_ty_1__bindgen_ty_1,
@@ -858,7 +859,7 @@ unsafe fn bar_transfer(
             };
             let mut copied = false;
             let ok = unsafe {
-                with_blob_bytes(adapter, alloc.resource_id, |dst, len| {
+                with_blob_bytes(passive, adapter, alloc.resource_id, |dst, len| {
                     if blob_off.saturating_add(bytes) > len {
                         BAR_ERR_BOUNDS.fetch_add(1, Ordering::Relaxed);
                         return;
@@ -895,7 +896,7 @@ unsafe fn bar_transfer(
             };
             let mut copied = false;
             let ok = unsafe {
-                with_blob_bytes(adapter, alloc.resource_id, |src, len| {
+                with_blob_bytes(passive, adapter, alloc.resource_id, |src, len| {
                     if blob_off.saturating_add(bytes) > len {
                         BAR_ERR_BOUNDS.fetch_add(1, Ordering::Relaxed);
                         return;
@@ -933,6 +934,7 @@ unsafe fn bar_transfer(
 
 /// Classic FILL of a BAR-segment allocation: CPU-fill the blob. PASSIVE_LEVEL.
 unsafe fn bar_fill(
+    passive: PassiveLevel,
     adapter: &AdapterContext,
     bar_id: u32,
     f: &_DXGKARG_BUILDPAGINGBUFFER__bindgen_ty_1__bindgen_ty_2,
@@ -954,7 +956,7 @@ unsafe fn bar_fill(
     let pattern = f.FillPattern;
     let mut filled = false;
     let ok = unsafe {
-        with_blob_bytes(adapter, alloc.resource_id, |dst, len| {
+        with_blob_bytes(passive, adapter, alloc.resource_id, |dst, len| {
             // REFUSE, do not clamp (M8/k-paging-19). The VIRTUAL_FILL arm twelve
             // lines below has always refused an over-long fill; clamping here
             // meant one condition had two policies, and the clamped tail was a
@@ -1132,6 +1134,12 @@ pub unsafe extern "C" fn dxgkddi_build_paging_buffer(
         BAR_ERR_IRQL.fetch_add(1, Ordering::Relaxed);
         return STATUS_SUCCESS;
     }
+    // SAFETY: the strongest mint in the driver — `DxgkDdiBuildPagingBuffer` is
+    // documented "IRQL: PASSIVE_LEVEL", and the gate immediately above CHECKED
+    // it rather than trusting the annotation (PgEi has never moved). Every
+    // content arm below is downstream of that check, so `IrqlBad` and PgEi can
+    // never disagree for this DDI.
+    let passive = unsafe { crate::irql::PassiveLevel::assume() };
 
     // Every content arm yields a `PagingOpOutcome`, so the match itself is the
     // driver's answer: `Failed` is the only variant that reaches VidMm as a
@@ -1139,11 +1147,18 @@ pub unsafe extern "C" fn dxgkddi_build_paging_buffer(
     let outcome = match args.Operation {
         PagingOp::DXGK_OPERATION_TRANSFER => {
             // SAFETY: union arm selected by Operation.
-            unsafe { bar_transfer(adapter, bar.seg_id, args.__bindgen_anon_1.Transfer.as_ref()) }
+            unsafe {
+                bar_transfer(
+                    passive,
+                    adapter,
+                    bar.seg_id,
+                    args.__bindgen_anon_1.Transfer.as_ref(),
+                )
+            }
         }
         PagingOp::DXGK_OPERATION_FILL => {
             // SAFETY: union arm selected by Operation.
-            unsafe { bar_fill(adapter, bar.seg_id, args.__bindgen_anon_1.Fill.as_ref()) }
+            unsafe { bar_fill(passive, adapter, bar.seg_id, args.__bindgen_anon_1.Fill.as_ref()) }
         }
         PagingOp::DXGK_OPERATION_DISCARD_CONTENT => {
             // SAFETY: union arm selected by Operation.
@@ -1182,7 +1197,7 @@ pub unsafe extern "C" fn dxgkddi_build_paging_buffer(
                     }
                     let mut filled = false;
                     let ok = unsafe {
-                        with_blob_bytes(adapter, alloc.resource_id, |dst, len| {
+                        with_blob_bytes(passive, adapter, alloc.resource_id, |dst, len| {
                             if off.saturating_add(fill_len) > len {
                                 BAR_ERR_BOUNDS.fetch_add(1, Ordering::Relaxed);
                                 return;
@@ -1205,7 +1220,7 @@ pub unsafe extern "C" fn dxgkddi_build_paging_buffer(
         PagingOp::DXGK_OPERATION_VIRTUAL_TRANSFER => {
             // SAFETY: union arm selected by Operation.
             let tv = unsafe { args.__bindgen_anon_1.TransferVirtual.as_ref() };
-            if unsafe { bar_virtual_transfer(adapter, tv) } {
+            if unsafe { bar_virtual_transfer(passive, adapter, tv) } {
                 PagingOpOutcome::Executed
             } else {
                 // Was STATUS_UNSUCCESSFUL — the crate's last use of a status two

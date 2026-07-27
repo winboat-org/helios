@@ -351,6 +351,14 @@ pub unsafe extern "C" fn dxgkddi_map_cpu_host_aperture(
         BAR_AP_IRQL_DEFER.fetch_add(1, Ordering::Relaxed);
         return STATUS_NO_MEMORY;
     }
+    // SAFETY: this DDI is documented PASSIVE but ARRIVES AT DISPATCH in practice
+    // (ETW-proven, v71), which is exactly why the gate above exists. The mint
+    // belongs HERE, on the PASSIVE side of it, and must never move above the
+    // gate: the DISPATCH arm may only bump atomics and defer with
+    // STATUS_NO_MEMORY, and it holds no token so it cannot call `map_blob_at`
+    // even by accident. That refusal is the reason `assume()` counts rather than
+    // returning a Result — STATUS_UNSUCCESSFUL here costs the whole VidPn.
+    let passive = unsafe { crate::irql::PassiveLevel::assume() };
     let Some(alloc) = (unsafe { paging_alloc_info(args.hAllocation) }) else {
         BAR_AP_ERR_ALLOC.fetch_add(1, Ordering::Relaxed);
         dump_bar_ap_counters();
@@ -377,7 +385,7 @@ pub unsafe extern "C" fn dxgkddi_map_cpu_host_aperture(
         }
     };
 
-    match crate::virtio::ctrl::map_blob_at(adapter, alloc.resource_id, range.offset) {
+    match crate::virtio::ctrl::map_blob_at(passive, adapter, alloc.resource_id, range.offset) {
         Ok(_prep) => {
             BAR_AP_MAPS.fetch_add(1, Ordering::Relaxed);
             BAR_AP_LAST_RESID.store(alloc.resource_id, Ordering::Relaxed);
@@ -435,12 +443,16 @@ pub unsafe extern "C" fn dxgkddi_unmap_cpu_host_aperture(
         BAR_AP_ERR_IRQL.fetch_add(1, Ordering::Relaxed);
         return STATUS_SUCCESS;
     }
+    // SAFETY: as in the map DDI above — downstream of a runtime check, not of
+    // the documented annotation. The non-PASSIVE arm leaves the mapping in place
+    // (self-healed by the next `map_blob_at`) and holds no token.
+    let passive = unsafe { crate::irql::PassiveLevel::assume() };
     let resid = adapter
         .with_virtio(|v| v.blob_resid_at_offset(offset))
         .unwrap_or(None);
     match resid {
         Some(res) => {
-            let _ = crate::virtio::ctrl::resource_unmap_blob(adapter, res);
+            let _ = crate::virtio::ctrl::resource_unmap_blob(passive, adapter, res);
             let _ = adapter.with_virtio(|v| v.blob_note_unmapped(res));
             BAR_AP_UNMAPS.fetch_add(1, Ordering::Relaxed);
         }

@@ -140,15 +140,13 @@ pub unsafe extern "C" fn dxgkddi_destroy_device(h_device: *mut c_void) -> NTSTAT
         // Sweep exactly this device's slots. A null hDevice would sweep the
         // KMD-owned ones, so the token is minted rather than cast.
         let device_owner = crate::virtio::gpu::DeviceOwner::new(owner);
-        let blobs = crate::virtio::ctrl::release_blobs_for_owner(adapter, device_owner);
+        // SAFETY: PLACEHOLDER (R614) — `dxgkddi_destroy_device` mints the real
+        // token in the start/stop commit of this tranche.
+        let passive = unsafe { crate::irql::PassiveLevel::assume() };
+        let blobs = crate::virtio::ctrl::release_blobs_for_owner(passive, adapter, device_owner);
         let contexts = crate::virtio::ctrl::destroy_contexts_for_owner(adapter, device_owner);
         // Opportunistic PASSIVE reap of completed transport entries.
-        // SAFETY: PLACEHOLDER (R614 commit 1) — `dxgkddi_destroy_device` mints
-        // the real token in the start/stop commit of this tranche.
-        crate::virtio::ctrl::reap_parked(
-            unsafe { crate::irql::PassiveLevel::assume() },
-            adapter,
-        );
+        crate::virtio::ctrl::reap_parked(passive, adapter);
         // 0x0E02_BBBB = blob-table size BEFORE reclaim (saturated to 16 bits).
         crate::diag::record(0x0E02_0000 | before.min(0xFFFF));
         // 0x0E03_RRCC = reclaimed blobs (RR) + contexts (CC).
