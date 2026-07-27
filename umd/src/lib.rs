@@ -103,6 +103,14 @@ impl NegotiatedInterface {
 // version to SUPPORTED_DDI_VERSIONS without adding an enum variant fails here,
 // and adding a variant without a fill arm fails the exhaustive match in
 // `create_device`. That is the property the `else`-as-default did not have.
+//
+// This is also what retired the WDDM2.1 chain in T6/R918: `0x000b_0022`
+// (D3DWDDM2_1_DDI_INTERFACE_VERSION) is strictly greater than the maximum
+// advertised here, so the runtime could never negotiate it and the fifth
+// device-funcs fill behind it was unreachable by construction. Making that path
+// live means ADDING a version above -- a behaviour change (DWM would negotiate
+// a 170-slot table and the AcquireResource/ReleaseResource DDIs would start
+// being called) that needs its own validation, not a silently dead fifth copy.
 const _: () = {
     assert!(SUPPORTED_DDI_VERSIONS.len() == 3);
     assert!((SUPPORTED_DDI_VERSIONS[0] >> 32) as u32 == NegotiatedInterface::WDDM1_3_INTERFACE);

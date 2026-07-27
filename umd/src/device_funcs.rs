@@ -587,20 +587,6 @@ unsafe extern "C" fn ddi_relocate_device_funcs_wddm1_3(
     }
 }
 
-// Unreachable: nothing at or above 0x000b_0022 is advertised, so
-// NegotiatedInterface has no WDDM2_1 variant to dispatch here. The code stays
-// in place; its deletion is T6's u-core-V02.
-#[allow(dead_code)]
-unsafe extern "C" fn ddi_relocate_device_funcs_wddm2_1(
-    _h_device: ddi::D3D10DDI_HDEVICE,
-    funcs: *mut ddi::D3DWDDM2_1DDI_DEVICEFUNCS,
-) {
-    log_error!("DDI RelocateDeviceFuncs(WDDM2.1)");
-    if !funcs.is_null() {
-        fill_wddm2_1_device_funcs(funcs);
-    }
-}
-
 unsafe fn audit_wddm1_3_device_funcs(tag: &str, funcs: *mut ddi::D3DWDDM1_3DDI_DEVICEFUNCS) {
     let hit = WDDM13_TABLE_AUDIT_COUNT.fetch_add(1, Ordering::Relaxed);
     if hit >= 32 || !crate::trace_enabled() {
@@ -1078,66 +1064,6 @@ pub unsafe fn fill_wddm1_3_device_funcs(funcs: *mut ddi::D3DWDDM1_3DDI_DEVICEFUN
     crate::forward::install_11_1(funcs as *mut ddi::D3D11_1DDI_DEVICEFUNCS);
     crate::forward::install_wddm1_3(funcs);
     audit_wddm1_3_device_funcs("FillDeviceFuncs", funcs);
-}
-
-// Unreachable: nothing at or above 0x000b_0022 is advertised, so
-// NegotiatedInterface has no WDDM2_1 variant to dispatch here. The code stays
-// in place; its deletion is T6's u-core-V02.
-#[allow(dead_code)]
-pub unsafe fn fill_wddm2_1_device_funcs(funcs: *mut ddi::D3DWDDM2_1DDI_DEVICEFUNCS) {
-    let n = core::mem::size_of::<ddi::D3DWDDM2_1DDI_DEVICEFUNCS>() / core::mem::size_of::<usize>();
-    let slots = funcs as *mut Option<UniformFn>;
-    for i in 0..n {
-        *slots.add(i) = Some(ddi_noop_device);
-    }
-
-    let f = &mut *(funcs as *mut ddi::D3D11DDI_DEVICEFUNCS);
-
-    macro_rules! calc {
-        ($($field:ident),* $(,)?) => {$(
-            f.$field = core::mem::transmute::<UniformFn, _>(ddi_calc_size as UniformFn);
-        )*};
-    }
-    calc!(
-        pfnCalcPrivateResourceSize,
-        pfnCalcPrivateOpenedResourceSize,
-        pfnCalcPrivateShaderResourceViewSize,
-        pfnCalcPrivateRenderTargetViewSize,
-        pfnCalcPrivateDepthStencilViewSize,
-        pfnCalcPrivateElementLayoutSize,
-        pfnCalcPrivateBlendStateSize,
-        pfnCalcPrivateDepthStencilStateSize,
-        pfnCalcPrivateRasterizerStateSize,
-        pfnCalcPrivateShaderSize,
-        pfnCalcPrivateGeometryShaderWithStreamOutput,
-        pfnCalcPrivateSamplerSize,
-        pfnCalcPrivateQuerySize,
-        pfnCalcDeferredContextHandleSize,
-        pfnCalcPrivateDeferredContextSize,
-        pfnCalcPrivateCommandListSize,
-        pfnCalcPrivateTessellationShaderSize,
-        pfnCalcPrivateUnorderedAccessViewSize,
-    );
-    // The three entries above for deferred contexts and command lists
-    // (pfnCalcDeferredContextHandleSize, pfnCalcPrivateDeferredContextSize,
-    // pfnCalcPrivateCommandListSize) keep the 256-byte stub. That is sound ONLY
-    // because the runtime never calls the paired Create, and the reason it
-    // never does is THREADING caps = 0 -- a fact that was stated in neither
-    // place before R812. Implementing pfnCreateDeferredContext and flipping the
-    // cap (a natural pair of steps for D3D11 conformance) would write a
-    // >256-byte driver object into hDrvContext with the stub still reporting
-    // 256: heap corruption inside the runtime's allocator, no diagnostic.
-    const _: () = assert!(THREADING_CAPS == 0);
-    // Not a size getter -- a void writer. Installed with its real signature, no
-    // transmute, identically in all four tables. R812.
-    f.pfnCheckDeferredContextHandleSizes = Some(ddi_check_deferred_context_handle_sizes);
-
-    f.pfnDestroyDevice = Some(ddi_destroy_device);
-    (*funcs).pfnRelocateDeviceFuncs = Some(ddi_relocate_device_funcs_wddm2_1);
-    crate::forward::install(f);
-    crate::forward::install_11_1(funcs as *mut ddi::D3D11_1DDI_DEVICEFUNCS);
-    crate::forward::install_wddm1_3(funcs as *mut ddi::D3DWDDM1_3DDI_DEVICEFUNCS);
-    crate::forward::install_wddm2_1(funcs);
 }
 
 /// Fill the DXGI base DDI table (presentation/resource base funcs) the runtime
