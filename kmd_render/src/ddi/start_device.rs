@@ -125,7 +125,10 @@ fn setup_bar_segment(
 /// `VirtioGpu::init` — is what keeps the nested peak inside the budget. See
 /// `StartedState::boxed` for the boot failure this class of growth caused.
 #[inline(never)]
-fn bring_up_venus(adapter: &AdapterContext) -> (u32, Option<(u64, u64)>) {
+fn bring_up_venus(
+    passive: crate::irql::PassiveLevel,
+    adapter: &AdapterContext,
+) -> (u32, Option<(u64, u64)>) {
     if !VENUS_ALLOC_ENABLED {
         // venus page-table allocation disabled — boot-safe build.
         adapter.set_venus_client(None);
@@ -137,7 +140,7 @@ fn bring_up_venus(adapter: &AdapterContext) -> (u32, Option<(u64, u64)>) {
         crate::virtio::ctrl::ctx_create(adapter, helios_protocol::VIRTIO_GPU_CAPSET_VENUS, None)
             .and_then(|ctx_id| {
                 let (client, blob) =
-                    crate::virtio::venus::allocate_host_visible_blob(adapter, ctx_id)?;
+                    crate::virtio::venus::allocate_host_visible_blob(passive, adapter, ctx_id)?;
                 Ok((ctx_id, client, blob))
             });
     match venus_result {
@@ -262,10 +265,10 @@ pub unsafe extern "C" fn dxgkddi_start_device(
     let mut page_table_window = None;
     // SAFETY: dxgkrnl_interface is valid per the DDI contract (also copied into
     // the `dxgkrnl` local above); init only borrows it for the call.
-    // SAFETY: PLACEHOLDER (R614 commit 1) — `dxgkddi_start_device` mints the real
-    // token in the start/stop commit of this tranche.
-    let passive_init = unsafe { crate::irql::PassiveLevel::assume() };
-    match crate::virtio::VirtioGpu::init(passive_init, unsafe { &*dxgkrnl_interface }) {
+    // SAFETY: PLACEHOLDER (R614) — `dxgkddi_start_device` mints the real token in
+    // the start/stop commit of this tranche.
+    let passive = unsafe { crate::irql::PassiveLevel::assume() };
+    match crate::virtio::VirtioGpu::init(passive, unsafe { &*dxgkrnl_interface }) {
         Ok(gpu) => {
             crate::kmsg(c"Helios: virtio-gpu transport up\n");
             crate::diag::record(0x0B00_0003);
@@ -292,7 +295,7 @@ pub unsafe extern "C" fn dxgkddi_start_device(
             // already be live. On any failure we record diag and leave
             // page_table_window = None — never fail StartDevice (Gate 1 stays
             // start-safe). See virtio::venus.
-            (venus_ctx_id, page_table_window) = bring_up_venus(adapter);
+            (venus_ctx_id, page_table_window) = bring_up_venus(passive, adapter);
         }
         Err(e) => {
             crate::kmsg(c"Helios: virtio-gpu init FAILED\n");

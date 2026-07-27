@@ -22,6 +22,7 @@ use wdk_sys::{KDPC, KEVENT, KSPIN_LOCK, KTIMER, PHYSICAL_ADDRESS, PVOID};
 
 use crate::dxgk::*;
 use crate::error::DriverError;
+use crate::irql::PassiveLevel;
 use crate::virtio::VirtioGpu;
 use helios_kmd_logic::DisplayMode;
 
@@ -766,6 +767,13 @@ impl WddmNotifyGuard<'_> {
 /// DISPATCH.
 pub(crate) struct ScanoutGuard<'a> {
     adapter: &'a AdapterContext,
+    /// The caller's PASSIVE proof (R614), carried so the helpers that already
+    /// take this guard — `production_linear_scanout`,
+    /// `submit_primary_scanout_copy`, `program_vidpn_source` — reach the venus
+    /// gateway and `virtio::ctrl` without a second parameter beside the one they
+    /// already have. It is genuinely implied: `with_scanout_lifecycle` waits on a
+    /// `SynchronizationEvent`, so a DISPATCH caller could never have got here.
+    passive: PassiveLevel,
     /// Makes the guard `!Send`: the guarded work never crosses threads.
     _not_send: PhantomData<*const ()>,
 }
@@ -782,7 +790,7 @@ impl ScanoutGuard<'_> {
         &self,
         f: impl FnOnce(&mut crate::virtio::venus::VenusClient) -> R,
     ) -> Result<R, DriverError> {
-        self.adapter.with_venus_client(f)
+        self.adapter.with_venus_client(self.passive, f)
     }
 }
 
@@ -1532,9 +1540,12 @@ impl AdapterContext {
     /// the exact-primary copy's ring-1 completion DPC sets the dirty bit and
     /// wakes the worker only after the Venus GPU copy has completed. One
     /// in-flight command is the backpressure boundary.
-    pub(crate) fn queue_active_scanout_refresh(&self) -> ScanoutRefreshQueue {
-        let outcome =
-            self.with_scanout_lifecycle(|lock| self.queue_active_scanout_refresh_locked(lock));
+    pub(crate) fn queue_active_scanout_refresh(
+        &self,
+        passive: PassiveLevel,
+    ) -> ScanoutRefreshQueue {
+        let outcome = self
+            .with_scanout_lifecycle(passive, |lock| self.queue_active_scanout_refresh_locked(lock));
         // R318: the pacing snapshot runs OUTSIDE `scanout_mutex`. It used to run
         // inside it — 32 synchronous registry transactions every 16 queued
         // refreshes, roughly 3.75 bursts per second at 60 Hz, on the PASSIVE
@@ -1944,6 +1955,7 @@ impl AdapterContext {
     /// see [`ScanoutGuard`] for what the token does and does not prove.
     pub(crate) fn with_scanout_lifecycle<R>(
         &self,
+        passive: PassiveLevel,
         f: impl FnOnce(&ScanoutGuard<'_>) -> R,
     ) -> R {
         // SAFETY: initialized in place by `init_kernel_events`; all callers are
@@ -1959,6 +1971,7 @@ impl AdapterContext {
         };
         let guard = ScanoutGuard {
             adapter: self,
+            passive,
             _not_send: PhantomData,
         };
         let result = f(&guard);
@@ -1974,10 +1987,11 @@ impl AdapterContext {
     /// teardown rather than RESOURCE_UNREF a blob QEMU may still sample.
     pub(crate) fn retire_scanout_allocation(
         &self,
+        passive: PassiveLevel,
         allocation_handle: usize,
         resource_id: u32,
     ) -> bool {
-        self.with_scanout_lifecycle(|lock| {
+        self.with_scanout_lifecycle(passive, |lock| {
             self.retire_scanout_allocation_locked(lock, allocation_handle, resource_id)
         })
     }
@@ -2079,8 +2093,21 @@ impl AdapterContext {
     /// mutex. Returns `DeviceNotFound` if no client is installed. PASSIVE_LEVEL
     /// only — `f` may block on host round-trips (`virtio::ctrl`) and venus ring
     /// progress.
+    ///
+    /// ⚠ THE VENUS GATEWAY (R614). This is the only path to a `&mut VenusClient`
+    /// after StartDevice: `venus_client` is a private `UnsafeCell` and the only
+    /// other accessor, `set_venus_client`, moves the client by value. That is
+    /// what makes the single `PassiveLevel` stored in `VenusRing` at bring-up
+    /// sound for the ~89 `VenusClient` methods that take no token of their own:
+    /// each of them ran because some caller proved PASSIVE *here*. The
+    /// pre-installation client is reachable only from
+    /// `venus::allocate_host_visible_blob`, which threads a real parameter.
+    ///
+    /// `_passive` is a PRECONDITION, not data — nothing in this body reads it.
+    /// Its job is to make the gateway unreachable from code that has no proof.
     pub fn with_venus_client<R>(
         &self,
+        _passive: PassiveLevel,
         f: impl FnOnce(&mut crate::virtio::venus::VenusClient) -> R,
     ) -> Result<R, DriverError> {
         self.acquire_venus_mutex();

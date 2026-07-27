@@ -88,6 +88,9 @@ pub unsafe extern "C" fn hpd_thread_routine(context: *mut c_void) {
     }
     // SAFETY: the adapter context is alive until StopDevice joins this thread.
     let adapter = unsafe { &*(context as *const AdapterContext) };
+    // SAFETY: PLACEHOLDER (R614) — the audited mint for this path arrives with
+    // its caller-group commit (display worker).
+    let passive = unsafe { crate::irql::PassiveLevel::assume() };
 
     // ── Phase 1: wait for StartDevice to return ─────────────────────────────
     //
@@ -237,7 +240,7 @@ pub unsafe extern "C" fn hpd_thread_routine(context: *mut c_void) {
         // lock held and off the Present path entirely.
         if adapter.probe_pending.swap(0, Ordering::AcqRel) != 0 {
             let pending = adapter
-                .with_venus_client(|client| client.take_pending_probe())
+                .with_venus_client(passive, |client| client.take_pending_probe())
                 .ok()
                 .flatten();
             if let Some((destination, fence_id)) = pending {
@@ -261,7 +264,7 @@ pub unsafe extern "C" fn hpd_thread_routine(context: *mut c_void) {
         }
 
         if adapter.scanout_refresh_pending.swap(0, Ordering::AcqRel) != 0 {
-            match adapter.queue_active_scanout_refresh() {
+            match adapter.queue_active_scanout_refresh(passive) {
                 ScanoutRefreshQueue::Queued => {}
                 ScanoutRefreshQueue::Busy | ScanoutRefreshQueue::Failed => {
                     // Preserve the first dirty frame. Busy completion wakes us;

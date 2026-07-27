@@ -761,8 +761,11 @@ pub fn resource_unref(adapter: &AdapterContext, resource_id: u32) -> Result<(), 
 /// Linux virtio-gpu assigns a resource UUID when a blob is created with
 /// `USE_CROSS_DEVICE`. Keep the full 40-byte response buffer because the OK
 /// reply carries the UUID after the control header.
-pub fn resource_assign_uuid(adapter: &AdapterContext, resource_id: u32) -> Result<(), VirtioError> {
-    let passive = assume_passive_unaudited();
+pub fn resource_assign_uuid(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    resource_id: u32,
+) -> Result<(), VirtioError> {
     let mut cmd = VirtioGpuResourceAssignUuid::zeroed();
     cmd.hdr.type_ = VIRTIO_GPU_CMD_RESOURCE_ASSIGN_UUID;
     cmd.resource_id = resource_id;
@@ -965,6 +968,7 @@ pub fn diagnostic_virgl_host3d_blob(
     height: u32,
     format: u32,
 ) -> Result<(u32, u64, u32), VirtioError> {
+    let passive = assume_passive_unaudited();
     let pitch = width.checked_mul(4).ok_or(VirtioError::OutOfMemory)?;
     let size = (pitch as u64)
         .checked_mul(height as u64)
@@ -1015,7 +1019,7 @@ pub fn diagnostic_virgl_host3d_blob(
             stream.len() * size_of::<u32>(),
         )
     };
-    if let Err(e) = submit_3d_sync(adapter, ctx_id, bytes) {
+    if let Err(e) = submit_3d_sync(passive, adapter, ctx_id, bytes) {
         let _ = ctx_destroy_kmd(adapter, ctx_id);
         return Err(e);
     }
@@ -1123,7 +1127,7 @@ pub fn diagnostic_virgl_host3d_guest_scanout(
             stream.len() * size_of::<u32>(),
         )
     };
-    if let Err(e) = submit_3d_sync(adapter, ctx_id, bytes) {
+    if let Err(e) = submit_3d_sync(passive, adapter, ctx_id, bytes) {
         let _ = ctx_destroy_kmd(adapter, ctx_id);
         return Err(e);
     }
@@ -1547,11 +1551,11 @@ pub fn forget_allocation_blob(adapter: &AdapterContext, resource_id: u32) -> boo
 /// are its ring-head polls). `fence_id` stays 0 (parity with the proven
 /// System-class `submit_direct` shape).
 pub fn submit_3d_sync(
+    passive: PassiveLevel,
     adapter: &AdapterContext,
     ctx_id: u32,
     stream: &[u8],
 ) -> Result<(), VirtioError> {
-    let passive = assume_passive_unaudited();
     if stream.is_empty() {
         return Err(VirtioError::DeviceError);
     }
@@ -1566,11 +1570,12 @@ pub fn submit_3d_sync(
 }
 
 pub fn submit_venus_sync(
+    passive: PassiveLevel,
     adapter: &AdapterContext,
     ctx_id: u32,
     stream: &[u8],
 ) -> Result<(), VirtioError> {
-    submit_3d_sync(adapter, ctx_id, stream)
+    submit_3d_sync(passive, adapter, ctx_id, stream)
 }
 
 /// ASYNC venus SUBMIT_3D (the ICD escape path): stage the stream into DMA
@@ -1650,13 +1655,13 @@ pub fn submit_venus_async(
 /// QueueFull to the caller. That keeps SetVidPnSourceAddress out of a hidden
 /// multi-second retry loop.
 pub fn submit_venus_async_scanout(
+    passive: PassiveLevel,
     adapter: &AdapterContext,
     ctx_id: u32,
     stream: &[u8],
     primary_address: u64,
     ticket: crate::adapter::ProgrammingTicket,
 ) -> Result<u64, VirtioError> {
-    let passive = assume_passive_unaudited();
     if stream.is_empty() {
         return Err(VirtioError::DeviceError);
     }
@@ -1687,11 +1692,11 @@ pub fn submit_venus_async_scanout(
 /// GPU completion. Unlike scanout, an ordinary app/DWM BLT must not mark the
 /// physical scanout dirty or wake the display refresh worker.
 pub fn submit_venus_async_present(
+    passive: PassiveLevel,
     adapter: &AdapterContext,
     ctx_id: u32,
     stream: &[u8],
 ) -> Result<u64, VirtioError> {
-    let passive = assume_passive_unaudited();
     if stream.is_empty() {
         return Err(VirtioError::DeviceError);
     }

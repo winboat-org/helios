@@ -108,6 +108,9 @@ unsafe fn sample_bgra(va: *mut u8, len: usize, pitch: u32, offset: u32, width: u
 }
 
 pub(crate) fn maybe_run(adapter: &AdapterContext) {
+    // SAFETY: PLACEHOLDER (R614) — the audited mint for this path arrives with
+    // its caller-group commit (StartDevice).
+    let passive = unsafe { crate::irql::PassiveLevel::assume() };
     let mode = diag_mode();
     crate::diag::record_named_bytes(b"SdgM", mode);
     crate::diag::record_named_bytes(b"SdgErr", 0);
@@ -365,7 +368,7 @@ pub(crate) fn maybe_run(adapter: &AdapterContext) {
         return;
     }
 
-    let (blob, image_id, pitch, offset) = match adapter.with_venus_client(|client| {
+    let (blob, image_id, pitch, offset) = match adapter.with_venus_client(passive, |client| {
         if mode == 16 {
             client
                 .allocate_linear_scanout_image_blob(adapter, width, height)
@@ -454,7 +457,9 @@ pub(crate) fn maybe_run(adapter: &AdapterContext) {
 
     if mode >= 4 && mode != 16 && !uses_cpu_filled_cross_device_blob(mode) {
         let gpu_clear =
-            adapter.with_venus_client(|client| client.gpu_clear_scanout_image(adapter, image_id));
+            adapter.with_venus_client(passive, |client| {
+                client.gpu_clear_scanout_image(adapter, image_id)
+            });
         let ok = matches!(gpu_clear, Ok(Ok(())));
         crate::diag::record_named_bytes(b"SdgGpu", if ok { 1 } else { 0xE });
         if !ok {

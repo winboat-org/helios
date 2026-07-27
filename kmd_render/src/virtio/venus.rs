@@ -45,6 +45,7 @@ use wdk_sys::{_MEMORY_CACHING_TYPE, PHYSICAL_ADDRESS};
 use super::ctrl;
 use super::VirtioError;
 use crate::adapter::AdapterContext;
+use crate::irql::PassiveLevel;
 
 // ── venus command type ids (VkCommandTypeEXT) ────────────────────────────────
 // Verified against vn_protocol_driver_defines.h.
@@ -1203,6 +1204,17 @@ struct VenusRing {
     next_handle: NonZeroU64,
     /// The persistent venus 3D context id all commands ride.
     ctx_id: u32,
+    /// The PASSIVE proof (R614) every ring/client `ctrl::` call rides.
+    ///
+    /// Minted once, by StartDevice, and handed to [`VenusRing::bring_up`] as a
+    /// parameter. It stands in for the caller's token on the ~89 `VenusClient`
+    /// methods that take none, and that substitution is sound ONLY because
+    /// `AdapterContext::with_venus_client` — the single gateway to a
+    /// `&mut VenusClient` — requires its caller's own token. Read that gateway's
+    /// doc before adding any other way to reach a client.
+    ///
+    /// A ZST, so this field costs the struct nothing.
+    passive: PassiveLevel,
     /// Poison latch: set when a ring wait exhausts [`RING_WAIT_TIMEOUT_MS`] or
     /// the host reports RING_STATUS_FATAL. A wedged/fatal ring never recovers,
     /// and without the latch every subsequent call re-burned the full wait
@@ -1258,7 +1270,7 @@ impl VenusRing {
     /// the ring being usable. Blocks at PASSIVE (virtio::ctrl KEVENT wait) until
     /// the device acks the command.
     fn submit_direct(&self, adapter: &AdapterContext, stream: &[u8]) -> Result<(), VirtioError> {
-        ctrl::submit_venus_sync(adapter, self.ctx_id, stream)
+        ctrl::submit_venus_sync(self.passive, adapter, self.ctx_id, stream)
     }
 
     /// Publish the ring buffer up to `self.cur` (SeqCst tail store), then nudge the
@@ -1322,9 +1334,7 @@ impl VenusRing {
                 });
                 return Err(VirtioError::DeviceError);
             }
-            // SAFETY: PLACEHOLDER (R614 commit 1) — replaced by `self.passive`
-            // when VenusRing gains the field in the next commit.
-            ctrl::sleep_ms(unsafe { crate::irql::PassiveLevel::assume() }, 1);
+            ctrl::sleep_ms(self.passive, 1);
             slept_ms += 1;
         }
     }
@@ -1558,6 +1568,12 @@ impl VenusClient {
     /// The reply shmem mapping, for a fresh [`ReplyReader`].
     fn reply_map(&self) -> &KernelMap {
         &self.ring.reply_map
+    }
+
+    /// The stage-1 PASSIVE proof (R614). See [`VenusRing::passive`] for why a
+    /// bring-up-time token is the right provenance for a client method.
+    fn passive(&self) -> PassiveLevel {
+        self.ring.passive
     }
 
     fn submit_direct(&self, adapter: &AdapterContext, stream: &[u8]) -> Result<(), VirtioError> {
@@ -4260,6 +4276,7 @@ impl VenusClient {
         submit.count(false); // pSignalSemaphores
         submit.u64(0); // fence
         let fence = ctrl::submit_venus_async_scanout(
+            self.passive(),
             adapter,
             self.ctx_id(),
             submit.as_slice()?,
@@ -4467,7 +4484,12 @@ impl VenusClient {
 
         let command_buffer_id = self.present_blits[blt_index].command_buffer_id;
         let submit = self.encode_command_buffer_submit(command_buffer_id);
-        let fence_id = ctrl::submit_venus_async_present(adapter, self.ctx_id(), submit.as_slice()?)?;
+        let fence_id = ctrl::submit_venus_async_present(
+            self.passive(),
+            adapter,
+            self.ctx_id(),
+            submit.as_slice()?,
+        )?;
         let run_probe = {
             let blt = &mut self.present_blits[blt_index];
             blt.last_wire_fence_id = fence_id;
@@ -4913,7 +4935,7 @@ impl VenusClient {
             alloc_size,
         )?;
         if (blob_flags & VIRTIO_GPU_BLOB_FLAG_USE_CROSS_DEVICE) != 0 && diag_mode == 10 {
-            ctrl::resource_assign_uuid(adapter, res_id)?;
+            ctrl::resource_assign_uuid(self.passive(), adapter, res_id)?;
             crate::diag::record_named_bytes(b"SdgUuid", 1);
         } else if (blob_flags & VIRTIO_GPU_BLOB_FLAG_USE_CROSS_DEVICE) != 0 {
             crate::diag::record_named_bytes(b"SdgUuid", 2);
@@ -5195,6 +5217,7 @@ fn round_up_page(size: u64) -> u64 {
 /// Runs at PASSIVE_LEVEL during StartDevice, after `set_virtio` installs the
 /// transport (all round-trips ride `virtio::ctrl`'s PASSIVE waits).
 pub fn allocate_host_visible_blob(
+    passive: PassiveLevel,
     adapter: &AdapterContext,
     ctx_id: u32,
 ) -> Result<(VenusClient, HostVisibleBlob), VirtioError> {
@@ -5207,7 +5230,7 @@ pub fn allocate_host_visible_blob(
     // dump and no bugcheck event, and NO reproduction on a live restart-device).
     // Keeping each stage's locals in a transient frame is load-bearing, not
     // style. See tools/kmd-frame-sizes.ps1.
-    let ring = VenusRing::bring_up(adapter, ctx_id)?;
+    let ring = VenusRing::bring_up(passive, adapter, ctx_id)?;
     let instance = ring.into_instance(adapter)?;
     let mut client = instance.into_device(adapter)?;
 
@@ -5237,7 +5260,11 @@ impl VenusRing {
     /// Breadcrumbs 0x0002 (ring mapped), 0x0003 (reply mapped), 0x0004 (ring
     /// registered), 0x0005 (no warm-up) — unchanged values, unchanged order.
     #[inline(never)]
-    fn bring_up(adapter: &AdapterContext, ctx_id: u32) -> Result<Self, VirtioError> {
+    fn bring_up(
+        passive: PassiveLevel,
+        adapter: &AdapterContext,
+        ctx_id: u32,
+    ) -> Result<Self, VirtioError> {
         // ── 1. Ring shmem: create blob + map into window + kernel-map + zero ──
         let ring_res_id = ctrl::resource_create_blob(
             adapter,
@@ -5285,6 +5312,7 @@ impl VenusRing {
             roundtrip_seqno: 0,
             next_handle: NonZeroU64::MIN,
             ctx_id,
+            passive,
             fatal: false,
         };
 

@@ -1153,12 +1153,15 @@ unsafe fn write_open_identity(
 /// PASSIVE_LEVEL (DxgkDdiDestroyAllocation) — the round-trips ride
 /// `virtio::ctrl`'s PASSIVE waits.
 unsafe fn destroy_allocation_ctx(adapter: &AdapterContext, ctx: Box<AllocationContext>) {
+    // SAFETY: PLACEHOLDER (R614) — the audited mint for this path arrives with
+    // its caller-group commit (allocation commit).
+    let passive = unsafe { crate::irql::PassiveLevel::assume() };
     let allocation_handle = (&*ctx as *const AllocationContext) as usize;
     // Retire the exact Windows/KMD allocation identity before any backing
     // resource, Venus image, or cached copy can be torn down. If QEMU cannot
     // confirm resource_id=0 scanout disable, retain every host object until
     // device teardown rather than leave scanout 0 pointing at an unref'd blob.
-    if !adapter.retire_scanout_allocation(allocation_handle, ctx.resource_id) {
+    if !adapter.retire_scanout_allocation(passive, allocation_handle, ctx.resource_id) {
         drop(ctx);
         return;
     }
@@ -1175,7 +1178,7 @@ unsafe fn destroy_allocation_ctx(adapter: &AdapterContext, ctx: Box<AllocationCo
         // it — so a concurrent SetVidPnSourceAddress submit could leave this
         // thread with a stale-or-zero fence and skip the mandatory drain.
         let drained = adapter
-            .with_venus_client(|client| client.destroy_prepared_image_copy(adapter, copy))
+            .with_venus_client(passive, |client| client.destroy_prepared_image_copy(adapter, copy))
             .map(|r| r.is_ok())
             .unwrap_or(false);
         if !drained {
@@ -1192,7 +1195,7 @@ unsafe fn destroy_allocation_ctx(adapter: &AdapterContext, ctx: Box<AllocationCo
     // detached/unref'd. The cache is intentionally one ownership unit because
     // several swapchain sources may share the same DWM destination.
     let present_drained = adapter
-        .with_venus_client(|client| {
+        .with_venus_client(passive, |client| {
             client.release_present_blits_for_resource(adapter, ctx.resource_id)
         })
         .map(|result| result.is_ok())
@@ -1234,7 +1237,8 @@ unsafe fn destroy_allocation_ctx(adapter: &AdapterContext, ctx: Box<AllocationCo
             let _ = crate::virtio::ctrl::resource_unref(adapter, ctx.resource_id);
         }
         if ctx.venus_image_id != 0 {
-            let _ = adapter.with_venus_client(|c| c.destroy_image(adapter, ctx.venus_image_id));
+            let _ = adapter
+                .with_venus_client(passive, |c| c.destroy_image(adapter, ctx.venus_image_id));
         }
         if ctx.venus_memory_id != 0 {
             // KMD-backed standard allocation: after the RESOURCE teardown above
@@ -1242,7 +1246,8 @@ unsafe fn destroy_allocation_ctx(adapter: &AdapterContext, ctx: Box<AllocationCo
             // vkFreeMemory the venus memory. Best-effort: if the venus client
             // is already gone (device teardown), the host context destruction
             // reclaims everything anyway.
-            let _ = adapter.with_venus_client(|c| c.free_memory_blob(adapter, ctx.venus_memory_id));
+            let _ = adapter
+                .with_venus_client(passive, |c| c.free_memory_blob(adapter, ctx.venus_memory_id));
         }
     } else if adapter_owned_scanout {
         crate::diag::record_named_bytes(b"CpKeep", ctx.resource_id);
@@ -1328,6 +1333,10 @@ fn build_backing(
 ) -> Result<CreatedBacking, NTSTATUS> {
     use helios_protocol::AllocationBacking as Backing;
 
+    // SAFETY: PLACEHOLDER (R614) — the audited mint for this path arrives with
+    // its caller-group commit (allocation commit).
+    let passive = unsafe { crate::irql::PassiveLevel::assume() };
+
     // The venus identity a cross-process opener needs. For adopted and raw
     // resources the UMD recorded it in the trailer at create time; a 0 there
     // means unknown, and the (page-rounded) blob size is the documented
@@ -1384,7 +1393,9 @@ fn build_backing(
         }
         Backing::KmdLinearPrimary { width, height } => {
             match adapter
-                .with_venus_client(|c| c.allocate_linear_scanout_image_blob(adapter, width, height))
+                .with_venus_client(passive, |c| {
+                    c.allocate_linear_scanout_image_blob(adapter, width, height)
+                })
             {
                 Ok(Ok(scanout)) => Ok(CreatedBacking {
                     resource_id: scanout.blob.res_id,
@@ -1421,7 +1432,7 @@ fn build_backing(
             // Reinterpreting this allocation as pitched host bytes makes DWM
             // sample tiled memory as a different resource shape and produces a
             // black redirected window.
-            match adapter.with_venus_client(|client| {
+            match adapter.with_venus_client(passive, |client| {
                 client.allocate_optimal_gdi_image_blob(
                     adapter,
                     width,
@@ -1464,7 +1475,7 @@ fn build_backing(
             // also registers the blob in the tracking table (owner 0), which the
             // GDI executor's `blob_kernel_range` resolves. PASSIVE flow under the
             // venus mutex (never the DISPATCH spinlock).
-            match adapter.with_venus_client(|c| {
+            match adapter.with_venus_client(passive, |c| {
                 c.allocate_memory_blob(adapter, size, true, primary)
                     .map(|b| (b, c.memory_type_index()))
             }) {

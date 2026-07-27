@@ -469,7 +469,10 @@ unsafe fn dxgkddi_present_inner(
                 return STATUS_INVALID_PARAMETER;
             }
 
-            let copy = adapter.with_venus_client(|client| {
+            // SAFETY: PLACEHOLDER (R614) — the audited mint for DxgkDdiPresent
+            // arrives with the display commit.
+            let passive = unsafe { crate::irql::PassiveLevel::assume() };
+            let copy = adapter.with_venus_client(passive, |client| {
                 client.submit_present_blt(adapter, source_desc, destination_desc)
             });
             let gpu_fence = match copy {
@@ -947,7 +950,10 @@ unsafe fn set_vidpn_source_address_dirql(
 /// The allocation handle is the exact identity supplied by Windows. No
 /// process, geometry, creation-order, or timing classification is involved.
 pub(crate) fn process_deferred_vidpn_source_address(adapter: &AdapterContext) {
-    let status = adapter.with_scanout_lifecycle(|lock| {
+    // SAFETY: PLACEHOLDER (R614) — the audited mint for this path arrives with
+    // its caller-group commit (display worker).
+    let passive = unsafe { crate::irql::PassiveLevel::assume() };
+    let status = adapter.with_scanout_lifecycle(passive, |lock| {
         let raw = adapter.pending_vidpn_allocation.swap(0, Ordering::AcqRel);
         if raw == 0 {
             return None;
@@ -1031,7 +1037,10 @@ unsafe fn apply_deferred_vidpn_source_address_locked(
 
 /// Program the Windows-selected primary. PASSIVE_LEVEL only.
 unsafe fn apply_vidpn_source_address(adapter: &AdapterContext, h_alloc: HANDLE) -> NTSTATUS {
-    adapter.with_scanout_lifecycle(|lock| unsafe {
+    // SAFETY: PLACEHOLDER (R614) — the audited mint for this path arrives with
+    // its caller-group commit (display commit).
+    let passive = unsafe { crate::irql::PassiveLevel::assume() };
+    adapter.with_scanout_lifecycle(passive, |lock| unsafe {
         apply_vidpn_source_address_locked(adapter, lock, h_alloc)
     })
 }
