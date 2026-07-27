@@ -1449,7 +1449,7 @@ unsafe fn resource_summary(
 }
 
 unsafe fn store_rtv(
-    handle_priv: *mut c_void,
+    h_rtv: ddi::D3D10DDI_HRENDERTARGETVIEW,
     obj: ID3D11RenderTargetView,
     resource_raw: usize,
     allocation: ddi::D3DKMT_HANDLE,
@@ -1457,7 +1457,7 @@ unsafe fn store_rtv(
     height: u32,
     format: u32,
 ) {
-    let Some(slot) = Slot::<Boxed<RtvState>>::from_priv(handle_priv) else {
+    let Some(slot) = boxed_slot(h_rtv) else {
         drop(obj);
         return;
     };
@@ -1513,8 +1513,8 @@ unsafe fn rtv_info(
     })
 }
 
-unsafe fn release_rtv(handle_priv: *mut c_void) {
-    let Some(slot) = Slot::<Boxed<RtvState>>::from_priv(handle_priv) else {
+unsafe fn release_rtv(h_rtv: ddi::D3D10DDI_HRENDERTARGETVIEW) {
+    let Some(slot) = boxed_slot(h_rtv) else {
         return;
     };
     // `take` empties the slot as it hands the box over, so a second release on
@@ -3309,7 +3309,7 @@ unsafe extern "C" fn create_rtv(
             );
         }
         store_rtv(
-            h_rtv.pDrvPrivate,
+            h_rtv,
             v,
             resource_com_raw(a.hDrvResource),
             allocation,
@@ -3450,7 +3450,7 @@ unsafe fn rtv_desc(
 }
 
 unsafe extern "C" fn destroy_rtv(_h: Hdevice, h_rtv: ddi::D3D10DDI_HRENDERTARGETVIEW) {
-    release_rtv(h_rtv.pDrvPrivate);
+    release_rtv(h_rtv);
 }
 
 // --- Depth-stencil views ----------------------------------------------------
@@ -10984,7 +10984,7 @@ unsafe extern "C" fn dxgi_rotate_resource_identities(
             );
             return 0;
         }
-        let state = match Slot::<Boxed<ResourceState>>::from_priv(hr.pDrvPrivate) {
+        let state = match boxed_slot(hr) {
             Some(slot) => slot.ptr(),
             None => core::ptr::null_mut(),
         };
