@@ -520,6 +520,43 @@ unsafe extern "C" fn ddi_calc_size(_a: usize) -> usize {
     256
 }
 
+/// Times the runtime called `pfnCheckDeferredContextHandleSizes`. Expected 0:
+/// [`THREADING_CAPS`] is 0, so the runtime never builds deferred contexts.
+static CHECK_DEFERRED_HANDLE_SIZES_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+/// `pfnCheckDeferredContextHandleSizes` -- and it is NOT a size getter.
+///
+/// `PFND3D11DDI_CHECKDEFERREDCONTEXTHANDLESIZES` is
+/// `void(HDEVICE, UINT* pHSizes, D3D11DDI_HANDLESIZE*)`: a VOID writer with a
+/// count out-param. It sat in the `calc!` lists, so three of the four
+/// device-funcs tables installed the 256-returning uniform stub in it and the
+/// fourth (D3D11.0, whose list omits it) installed `ddi_noop_device` -- two
+/// different stubs for one slot across four copies of the same table, and both
+/// of them a shape mismatch that is harmless only because neither writes
+/// anything.
+///
+/// Writing nothing is its own defect: the runtime then reads whatever it had
+/// pre-set into `pHSizes`, the same class of bug `check_counter_info` was fixed
+/// for. We create no deferred contexts, so 0 is the honest answer. R812.
+unsafe extern "C" fn ddi_check_deferred_context_handle_sizes(
+    _h_device: ddi::D3D10DDI_HDEVICE,
+    p_h_sizes: *mut ddi::UINT,
+    _sizes: *mut ddi::D3D11DDI_HANDLESIZE,
+) {
+    let n = CHECK_DEFERRED_HANDLE_SIZES_CALLS.fetch_add(1, Ordering::Relaxed);
+    if n < 8 {
+        log_error!(
+            "DDI CheckDeferredContextHandleSizes called (x{}) — unexpected at \
+             THREADING caps = {}",
+            n + 1,
+            THREADING_CAPS
+        );
+    }
+    if !p_h_sizes.is_null() {
+        *p_h_sizes = 0;
+    }
+}
+
 unsafe extern "C" fn ddi_relocate_device_funcs(
     _h_device: ddi::D3D10DDI_HDEVICE,
     funcs: *mut ddi::D3D11DDI_DEVICEFUNCS,
@@ -908,6 +945,19 @@ pub unsafe fn fill_d3d11_device_funcs(funcs: *mut ddi::D3D11DDI_DEVICEFUNCS) {
         pfnCalcPrivateTessellationShaderSize,
         pfnCalcPrivateUnorderedAccessViewSize,
     );
+    // The three entries above for deferred contexts and command lists
+    // (pfnCalcDeferredContextHandleSize, pfnCalcPrivateDeferredContextSize,
+    // pfnCalcPrivateCommandListSize) keep the 256-byte stub. That is sound ONLY
+    // because the runtime never calls the paired Create, and the reason it
+    // never does is THREADING caps = 0 -- a fact that was stated in neither
+    // place before R812. Implementing pfnCreateDeferredContext and flipping the
+    // cap (a natural pair of steps for D3D11 conformance) would write a
+    // >256-byte driver object into hDrvContext with the stub still reporting
+    // 256: heap corruption inside the runtime's allocator, no diagnostic.
+    const _: () = assert!(THREADING_CAPS == 0);
+    // Not a size getter -- a void writer. Installed with its real signature, no
+    // transmute, identically in all four tables. R812.
+    f.pfnCheckDeferredContextHandleSizes = Some(ddi_check_deferred_context_handle_sizes);
 
     // Real cleanup on device teardown (matching signature, no transmute).
     f.pfnDestroyDevice = Some(ddi_destroy_device);
@@ -948,13 +998,25 @@ pub unsafe fn fill_d3d11_1_device_funcs(funcs: *mut ddi::D3D11_1DDI_DEVICEFUNCS)
         pfnCalcPrivateGeometryShaderWithStreamOutput,
         pfnCalcPrivateSamplerSize,
         pfnCalcPrivateQuerySize,
-        pfnCheckDeferredContextHandleSizes,
         pfnCalcDeferredContextHandleSize,
         pfnCalcPrivateDeferredContextSize,
         pfnCalcPrivateCommandListSize,
         pfnCalcPrivateTessellationShaderSize,
         pfnCalcPrivateUnorderedAccessViewSize,
     );
+    // The three entries above for deferred contexts and command lists
+    // (pfnCalcDeferredContextHandleSize, pfnCalcPrivateDeferredContextSize,
+    // pfnCalcPrivateCommandListSize) keep the 256-byte stub. That is sound ONLY
+    // because the runtime never calls the paired Create, and the reason it
+    // never does is THREADING caps = 0 -- a fact that was stated in neither
+    // place before R812. Implementing pfnCreateDeferredContext and flipping the
+    // cap (a natural pair of steps for D3D11 conformance) would write a
+    // >256-byte driver object into hDrvContext with the stub still reporting
+    // 256: heap corruption inside the runtime's allocator, no diagnostic.
+    const _: () = assert!(THREADING_CAPS == 0);
+    // Not a size getter -- a void writer. Installed with its real signature, no
+    // transmute, identically in all four tables. R812.
+    f.pfnCheckDeferredContextHandleSizes = Some(ddi_check_deferred_context_handle_sizes);
 
     f.pfnDestroyDevice = Some(ddi_destroy_device);
     (*funcs).pfnRelocateDeviceFuncs = Some(ddi_relocate_device_funcs_11_1);
@@ -990,13 +1052,25 @@ pub unsafe fn fill_wddm1_3_device_funcs(funcs: *mut ddi::D3DWDDM1_3DDI_DEVICEFUN
         pfnCalcPrivateGeometryShaderWithStreamOutput,
         pfnCalcPrivateSamplerSize,
         pfnCalcPrivateQuerySize,
-        pfnCheckDeferredContextHandleSizes,
         pfnCalcDeferredContextHandleSize,
         pfnCalcPrivateDeferredContextSize,
         pfnCalcPrivateCommandListSize,
         pfnCalcPrivateTessellationShaderSize,
         pfnCalcPrivateUnorderedAccessViewSize,
     );
+    // The three entries above for deferred contexts and command lists
+    // (pfnCalcDeferredContextHandleSize, pfnCalcPrivateDeferredContextSize,
+    // pfnCalcPrivateCommandListSize) keep the 256-byte stub. That is sound ONLY
+    // because the runtime never calls the paired Create, and the reason it
+    // never does is THREADING caps = 0 -- a fact that was stated in neither
+    // place before R812. Implementing pfnCreateDeferredContext and flipping the
+    // cap (a natural pair of steps for D3D11 conformance) would write a
+    // >256-byte driver object into hDrvContext with the stub still reporting
+    // 256: heap corruption inside the runtime's allocator, no diagnostic.
+    const _: () = assert!(THREADING_CAPS == 0);
+    // Not a size getter -- a void writer. Installed with its real signature, no
+    // transmute, identically in all four tables. R812.
+    f.pfnCheckDeferredContextHandleSizes = Some(ddi_check_deferred_context_handle_sizes);
 
     f.pfnDestroyDevice = Some(ddi_destroy_device);
     (*funcs).pfnRelocateDeviceFuncs = Some(ddi_relocate_device_funcs_wddm1_3);
@@ -1038,13 +1112,25 @@ pub unsafe fn fill_wddm2_1_device_funcs(funcs: *mut ddi::D3DWDDM2_1DDI_DEVICEFUN
         pfnCalcPrivateGeometryShaderWithStreamOutput,
         pfnCalcPrivateSamplerSize,
         pfnCalcPrivateQuerySize,
-        pfnCheckDeferredContextHandleSizes,
         pfnCalcDeferredContextHandleSize,
         pfnCalcPrivateDeferredContextSize,
         pfnCalcPrivateCommandListSize,
         pfnCalcPrivateTessellationShaderSize,
         pfnCalcPrivateUnorderedAccessViewSize,
     );
+    // The three entries above for deferred contexts and command lists
+    // (pfnCalcDeferredContextHandleSize, pfnCalcPrivateDeferredContextSize,
+    // pfnCalcPrivateCommandListSize) keep the 256-byte stub. That is sound ONLY
+    // because the runtime never calls the paired Create, and the reason it
+    // never does is THREADING caps = 0 -- a fact that was stated in neither
+    // place before R812. Implementing pfnCreateDeferredContext and flipping the
+    // cap (a natural pair of steps for D3D11 conformance) would write a
+    // >256-byte driver object into hDrvContext with the stub still reporting
+    // 256: heap corruption inside the runtime's allocator, no diagnostic.
+    const _: () = assert!(THREADING_CAPS == 0);
+    // Not a size getter -- a void writer. Installed with its real signature, no
+    // transmute, identically in all four tables. R812.
+    f.pfnCheckDeferredContextHandleSizes = Some(ddi_check_deferred_context_handle_sizes);
 
     f.pfnDestroyDevice = Some(ddi_destroy_device);
     (*funcs).pfnRelocateDeviceFuncs = Some(ddi_relocate_device_funcs_wddm2_1);
