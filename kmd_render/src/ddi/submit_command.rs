@@ -267,24 +267,22 @@ unsafe fn notify_at_dirql(
     STATUS_SUCCESS
 }
 
-/// Signal `DXGK_INTERRUPT_DMA_COMPLETED` for `fence` (see [`notify_at_dirql`]).
-/// Called from the interrupt DPC for venus-gated submissions (C3/M3.4) and
-/// directly for submissions with no venus work outstanding.
+/// Signal `DXGK_INTERRUPT_DMA_COMPLETED` for `fence` (see [`notify_at_dirql`]),
+/// with the adapter's WDDM notification lock ALREADY HELD -- the only door.
+///
+/// Queue arbitration and the callback must be one critical section; otherwise a
+/// DPC can pop fence N, a concurrent submit can observe an empty FIFO and report
+/// N+1 first, and VidSch bugchecks 0x119/1.
+///
+/// T6/R914 deleted the sibling wrapper that took `&AdapterContext` and acquired
+/// the lock itself. It had zero callers and was not re-exported, and the invalid
+/// sequence it invited is real: `with_wddm_notify_lock` uses
+/// `KeAcquireSpinLockRaiseToDpc` and a `KSPIN_LOCK` is not recursive, so the
+/// first caller to reach for it from INSIDE the guard hard-hangs a CPU at
+/// DISPATCH. Requiring a `&WddmNotifyGuard` removes the footgun; it does not
+/// remove the class, since a hand-written nested `with_wddm_notify_lock` is
+/// still writable.
 pub(crate) unsafe fn signal_dma_completed(
-    adapter: &AdapterContext,
-    dxgkrnl: &DXGKRNL_INTERFACE,
-    fence: u32,
-) -> NTSTATUS {
-    adapter.with_wddm_notify_lock(|guard| unsafe {
-        signal_dma_completed_locked(guard, dxgkrnl, fence)
-    })
-}
-
-/// Same notification with the adapter's WDDM notification lock already held.
-/// Queue arbitration and the callback must be one critical section; otherwise
-/// a DPC can pop fence N, a concurrent submit can observe an empty FIFO and
-/// report N+1 first, and VidSch bugchecks 0x119/1.
-pub(crate) unsafe fn signal_dma_completed_locked(
     guard: &WddmNotifyGuard<'_>,
     dxgkrnl: &DXGKRNL_INTERFACE,
     fence: u32,
@@ -381,7 +379,6 @@ fn note_and_maybe_signal(
     fence: u32,
     is_paging: bool,
     gpu_completion_fence: Option<u64>,
-    refresh_scanout: bool,
 ) -> SubmitAck {
     let Ok(dxgkrnl) = adapter.dxgkrnl() else {
         // Effectively unreachable: dxgkrnl is set at StartDevice and never
@@ -393,16 +390,13 @@ fn note_and_maybe_signal(
     adapter.with_wddm_notify_lock(|guard| {
         let signal_now = guard
             .with_virtio(|o, v| {
-                v.note_wddm_submission(o, fence, is_paging, gpu_completion_fence, refresh_scanout)
+                v.note_wddm_submission(o, fence, is_paging, gpu_completion_fence)
             })
             // Transport down (bring-up / teardown): no venus work can gate it.
             .unwrap_or(true);
         if signal_now {
-            if refresh_scanout {
-                adapter.request_scanout_refresh();
-            }
             // SAFETY: the notification lock is held and dxgkrnl is live.
-            let status = unsafe { signal_dma_completed_locked(guard, dxgkrnl, fence) };
+            let status = unsafe { signal_dma_completed(guard, dxgkrnl, fence) };
             if status != STATUS_SUCCESS {
                 // Same handling as the DPC path in R209: count it and leave the
                 // retirement to a later DPC rather than failing the submission.
@@ -588,7 +582,7 @@ pub unsafe extern "C" fn dxgkddi_submit_command_virtual(
     // The submission is accepted regardless of how the notification went; a
     // non-SUCCESS return here bugchecks dxgmms2 with 0x119 Arg1=2.
     let SubmitAck::Accepted =
-        note_and_maybe_signal(adapter, fence, is_paging, present_fence, false);
+        note_and_maybe_signal(adapter, fence, is_paging, present_fence);
     STATUS_SUCCESS
 }
 
@@ -621,7 +615,7 @@ pub unsafe extern "C" fn dxgkddi_submit_command(
     let present_fence = unsafe { decode_legacy_present_fence(submit) };
     // As above: accepted regardless of the notification outcome.
     let SubmitAck::Accepted =
-        note_and_maybe_signal(adapter, fence, is_paging, present_fence, false);
+        note_and_maybe_signal(adapter, fence, is_paging, present_fence);
     STATUS_SUCCESS
 }
 

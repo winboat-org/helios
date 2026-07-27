@@ -843,7 +843,7 @@ impl WddmNotifyGuard<'_> {
     /// ⚠ Do NOT grow this into a `with_notify_then_virtio` that holds both locks
     /// for one closure: `drain_used_and_complete` deliberately makes several
     /// separate `with_virtio` calls inside one notify scope and runs
-    /// `request_scanout_refresh()` and `signal_dma_completed_locked()` (which
+    /// `request_scanout_refresh()` and `signal_dma_completed()` (which
     /// raises to the device DIRQL via `DxgkCbSynchronizeExecution`) between
     /// them. Folding those into one transport critical section would change
     /// frame-path timing.

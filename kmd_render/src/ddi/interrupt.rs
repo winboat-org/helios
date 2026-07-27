@@ -62,9 +62,6 @@ pub(crate) fn drain_used_and_complete(adapter: &AdapterContext) {
             else {
                 break;
             };
-            if ready.refresh_scanout() {
-                adapter.request_scanout_refresh();
-            }
             let Some(dxgkrnl) = adapter.dxgkrnl_opt() else {
                 // No callback table: we cannot deliver and must not drop it.
                 let _ = guard.with_virtio(|o, v| v.requeue_wddm_front(o, ready));
@@ -73,7 +70,7 @@ pub(crate) fn drain_used_and_complete(adapter: &AdapterContext) {
             // SAFETY: the WDDM notification lock is held; the helper
             // raises to DIRQL for the callback without re-locking.
             let status = unsafe {
-                super::submit_command::signal_dma_completed_locked(guard, dxgkrnl, ready.fence())
+                super::submit_command::signal_dma_completed(guard, dxgkrnl, ready.fence())
             };
             if status == STATUS_SUCCESS {
                 ready.delivered();

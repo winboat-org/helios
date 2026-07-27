@@ -1219,7 +1219,6 @@ struct WddmPending {
     fence: u32,
     watermark: u64,
     domain: RetireDomain,
-    refresh_scanout: bool,
 }
 
 /// A WDDM submission popped from the pending FIFO whose `DMA_COMPLETED` has not
@@ -1241,10 +1240,6 @@ pub struct WddmReady {
 impl WddmReady {
     pub fn fence(&self) -> u32 {
         self.pending.fence
-    }
-
-    pub fn refresh_scanout(&self) -> bool {
-        self.pending.refresh_scanout
     }
 
     /// Consume the token after `DMA_COMPLETED` was delivered successfully.
@@ -2571,7 +2566,6 @@ impl VirtioGpu {
         fence: u32,
         paging: bool,
         gpu_completion_fence: Option<u64>,
-        refresh_scanout: bool,
     ) -> bool {
         if self.failed {
             // Nothing will ever retire, so queueing this fence guarantees a TDR.
@@ -2620,7 +2614,6 @@ impl VirtioGpu {
             fence,
             watermark,
             domain,
-            refresh_scanout,
         });
         false
     }
