@@ -3085,8 +3085,8 @@ unsafe fn dsv_desc(
     match a.ResourceDimension {
         RES_TEX1D => {
             let t = a.__bindgen_anon_1.Tex1D;
-            if t.ArraySize > 1 {
-                Some(D3D11_DEPTH_STENCIL_VIEW_DESC {
+            Some(match tex1d_shape(t.ArraySize) {
+                Tex1DShape::Array => D3D11_DEPTH_STENCIL_VIEW_DESC {
                     Format: format,
                     ViewDimension: D3D11_DSV_DIMENSION_TEXTURE1DARRAY,
                     Flags: a.Flags,
@@ -3097,9 +3097,8 @@ unsafe fn dsv_desc(
                             ArraySize: t.ArraySize,
                         },
                     },
-                })
-            } else {
-                Some(D3D11_DEPTH_STENCIL_VIEW_DESC {
+                },
+                Tex1DShape::Plain => D3D11_DEPTH_STENCIL_VIEW_DESC {
                     Format: format,
                     ViewDimension: D3D11_DSV_DIMENSION_TEXTURE1D,
                     Flags: a.Flags,
@@ -3108,61 +3107,60 @@ unsafe fn dsv_desc(
                             MipSlice: t.MipSlice,
                         },
                     },
-                })
-            }
+                },
+            })
         }
         RES_TEX2D => {
             let t = a.__bindgen_anon_1.Tex2D;
-            let is_msaa = resource_sample_count(h_res) > 1;
-            if is_msaa && t.ArraySize > 1 {
-                Some(D3D11_DEPTH_STENCIL_VIEW_DESC {
-                    Format: format,
-                    ViewDimension: D3D11_DSV_DIMENSION_TEXTURE2DMSARRAY,
-                    Flags: a.Flags,
-                    Anonymous: D3D11_DEPTH_STENCIL_VIEW_DESC_0 {
-                        Texture2DMSArray: D3D11_TEX2DMS_ARRAY_DSV {
-                            FirstArraySlice: t.FirstArraySlice,
-                            ArraySize: t.ArraySize,
+            Some(
+                match tex2d_shape(t.ArraySize, resource_sample_count(h_res)) {
+                    Tex2DShape::MsArray => D3D11_DEPTH_STENCIL_VIEW_DESC {
+                        Format: format,
+                        ViewDimension: D3D11_DSV_DIMENSION_TEXTURE2DMSARRAY,
+                        Flags: a.Flags,
+                        Anonymous: D3D11_DEPTH_STENCIL_VIEW_DESC_0 {
+                            Texture2DMSArray: D3D11_TEX2DMS_ARRAY_DSV {
+                                FirstArraySlice: t.FirstArraySlice,
+                                ArraySize: t.ArraySize,
+                            },
                         },
                     },
-                })
-            } else if is_msaa {
-                Some(D3D11_DEPTH_STENCIL_VIEW_DESC {
-                    Format: format,
-                    ViewDimension: D3D11_DSV_DIMENSION_TEXTURE2DMS,
-                    Flags: a.Flags,
-                    Anonymous: D3D11_DEPTH_STENCIL_VIEW_DESC_0 {
-                        Texture2DMS: D3D11_TEX2DMS_DSV {
-                            UnusedField_NothingToDefine: 0,
+                    Tex2DShape::Ms => D3D11_DEPTH_STENCIL_VIEW_DESC {
+                        Format: format,
+                        ViewDimension: D3D11_DSV_DIMENSION_TEXTURE2DMS,
+                        Flags: a.Flags,
+                        Anonymous: D3D11_DEPTH_STENCIL_VIEW_DESC_0 {
+                            Texture2DMS: D3D11_TEX2DMS_DSV {
+                                UnusedField_NothingToDefine: 0,
+                            },
                         },
                     },
-                })
-            } else if t.ArraySize > 1 {
-                Some(D3D11_DEPTH_STENCIL_VIEW_DESC {
-                    Format: format,
-                    ViewDimension: D3D11_DSV_DIMENSION_TEXTURE2DARRAY,
-                    Flags: a.Flags,
-                    Anonymous: D3D11_DEPTH_STENCIL_VIEW_DESC_0 {
-                        Texture2DArray: D3D11_TEX2D_ARRAY_DSV {
-                            MipSlice: t.MipSlice,
-                            FirstArraySlice: t.FirstArraySlice,
-                            ArraySize: t.ArraySize,
+                    Tex2DShape::Array => D3D11_DEPTH_STENCIL_VIEW_DESC {
+                        Format: format,
+                        ViewDimension: D3D11_DSV_DIMENSION_TEXTURE2DARRAY,
+                        Flags: a.Flags,
+                        Anonymous: D3D11_DEPTH_STENCIL_VIEW_DESC_0 {
+                            Texture2DArray: D3D11_TEX2D_ARRAY_DSV {
+                                MipSlice: t.MipSlice,
+                                FirstArraySlice: t.FirstArraySlice,
+                                ArraySize: t.ArraySize,
+                            },
                         },
                     },
-                })
-            } else {
-                Some(D3D11_DEPTH_STENCIL_VIEW_DESC {
-                    Format: format,
-                    ViewDimension: D3D11_DSV_DIMENSION_TEXTURE2D,
-                    Flags: a.Flags,
-                    Anonymous: D3D11_DEPTH_STENCIL_VIEW_DESC_0 {
-                        Texture2D: D3D11_TEX2D_DSV {
-                            MipSlice: t.MipSlice,
+                    Tex2DShape::Plain => D3D11_DEPTH_STENCIL_VIEW_DESC {
+                        Format: format,
+                        ViewDimension: D3D11_DSV_DIMENSION_TEXTURE2D,
+                        Flags: a.Flags,
+                        Anonymous: D3D11_DEPTH_STENCIL_VIEW_DESC_0 {
+                            Texture2D: D3D11_TEX2D_DSV {
+                                MipSlice: t.MipSlice,
+                            },
                         },
                     },
-                })
-            }
+                },
+            )
         }
+        // As in `rtv_desc`: a cube depth-stencil view is a 2D array view.
         RES_TEXCUBE => {
             let t = a.__bindgen_anon_1.TexCube;
             Some(D3D11_DEPTH_STENCIL_VIEW_DESC {
@@ -3178,6 +3176,10 @@ unsafe fn dsv_desc(
                 },
             })
         }
+        // No BUFFER and no TEX3D arm, and that is CORRECT, not missing: D3D11
+        // defines neither `D3D11_DSV_DIMENSION_BUFFER` nor
+        // `..._TEXTURE3D` — a buffer and a volume texture cannot be
+        // depth-stencil targets. The caller logs the refused dimension.
         _ => None,
     }
 }
