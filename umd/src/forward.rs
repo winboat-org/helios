@@ -9,6 +9,9 @@
 //! now (TODO: report via the device error callback) — a failed create leaves a
 //! null handle.
 
+mod handles;
+use handles::{Boxed, Com, Slot};
+
 use core::ffi::c_void;
 use core::mem::ManuallyDrop;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -603,8 +606,18 @@ unsafe fn d3d11_device2(h: Hdevice) -> Option<ID3D11Device2> {
 }
 
 /// Store a COM interface's raw pointer (ownership transferred) in a DDI handle.
+///
+/// The null check is new: this was the one writer of the three that lacked it,
+/// so a null slot wrote through a null pointer where `store_raw_com` and
+/// `clear_handle` returned quietly. R803.
 unsafe fn store_com<T: Interface>(handle_priv: *mut c_void, obj: T) {
-    *(handle_priv as *mut *mut c_void) = obj.into_raw();
+    match Slot::<Com<T>>::from_priv(handle_priv) {
+        Some(slot) => slot.store(obj),
+        // Dropping `obj` here releases the reference we were asked to hand to
+        // the runtime. That is correct: with no slot to put it in, the
+        // alternative is leaking it.
+        None => drop(obj),
+    }
 }
 
 /// Map a DXVK create failure onto an HRESULT the invoking API is documented to
@@ -647,22 +660,29 @@ unsafe fn finish_create<T: Interface>(
 }
 
 unsafe fn store_raw_com(handle_priv: *mut c_void, raw: usize) {
-    if !handle_priv.is_null() {
-        *(handle_priv as *mut *mut c_void) = raw as *mut c_void;
+    if let Some(slot) = Slot::<Com<IUnknown>>::from_priv(handle_priv) {
+        slot.store_raw(raw);
     }
 }
 
 unsafe fn clear_handle(handle_priv: *mut c_void) {
-    if !handle_priv.is_null() {
-        *(handle_priv as *mut *mut c_void) = core::ptr::null_mut();
+    if let Some(slot) = Slot::<Com<IUnknown>>::from_priv(handle_priv) {
+        slot.clear();
     }
 }
 
+/// The raw word behind a bare-COM DDI handle (0 when absent).
+///
+/// Correct for the shader/DSV/state slots it is used on, and silently the
+/// `Box` pointer if ever applied to a resource or RTV slot -- which is exactly
+/// the confusion `Slot<P>` exists to remove. Retained with its old signature so
+/// this commit churns no call sites; the per-family conversions replace each
+/// use with `Slot::<Com<T>>::word()` on a typed handle.
 unsafe fn handle_com_raw(handle_priv: *mut c_void) -> usize {
-    if handle_priv.is_null() {
-        return 0;
+    match Slot::<Com<IUnknown>>::from_priv(handle_priv) {
+        Some(slot) => slot.word(),
+        None => 0,
     }
-    *(handle_priv as *const usize)
 }
 
 unsafe fn store_resource(
@@ -674,10 +694,11 @@ unsafe fn store_resource(
     owns_allocation: bool,
     present_private: HeliosPresentPrivateData,
 ) {
-    if handle_priv.is_null() {
+    let Some(slot) = Slot::<Boxed<ResourceState>>::from_priv(handle_priv) else {
+        drop(obj);
         return;
-    }
-    let state = Box::new(ResourceState {
+    };
+    slot.store(ResourceState {
         com_raw: obj.into_raw() as usize,
         allocation,
         km_resource,
@@ -685,7 +706,6 @@ unsafe fn store_resource(
         owns_allocation,
         present_private,
     });
-    *(handle_priv as *mut *mut c_void) = Box::into_raw(state) as *mut c_void;
 }
 
 unsafe fn stamp_dxvk_resource_kmt_handles(
@@ -725,71 +745,47 @@ unsafe fn stamp_dxvk_resource_kmt_handles(
 }
 
 unsafe fn load_resource(handle_priv: *mut c_void) -> Option<ManuallyDrop<ID3D11Resource>> {
-    if handle_priv.is_null() {
-        return None;
-    }
-    let state = *(handle_priv as *const *mut ResourceState);
-    if state.is_null() || (*state).com_raw == 0 {
+    let state = resource_state(handle_priv)?;
+    if state.com_raw == 0 {
         return None;
     }
     Some(ManuallyDrop::new(ID3D11Resource::from_raw(
-        (*state).com_raw as *mut c_void,
+        state.com_raw as *mut c_void,
     )))
+}
+
+/// The `ResourceState` behind a DDI resource handle, or `None` for an empty
+/// slot. The single place the resource slot is decoded; every reader below
+/// goes through it instead of repeating the two-step null dance.
+unsafe fn resource_state(handle_priv: *mut c_void) -> Option<&'static ResourceState> {
+    Slot::<Boxed<ResourceState>>::from_priv(handle_priv)?.get()
 }
 
 /// Raw ID3D11Resource COM pointer behind a DDI resource private handle
 /// (0 when absent) — for bridge calls that inspect the DXVK image without
 /// taking a COM reference.
 unsafe fn resource_com_raw(handle_priv: *mut c_void) -> usize {
-    if handle_priv.is_null() {
-        return 0;
-    }
-    let state = *(handle_priv as *const *mut ResourceState);
-    if state.is_null() {
-        return 0;
-    }
-    (*state).com_raw
+    resource_state(handle_priv).map_or(0, |s| s.com_raw)
 }
 
 unsafe fn resource_allocation(handle_priv: *mut c_void) -> ddi::D3DKMT_HANDLE {
-    if handle_priv.is_null() {
-        return 0;
-    }
-    let state = *(handle_priv as *const *mut ResourceState);
-    if state.is_null() {
-        0
-    } else {
-        (*state)
-            .allocation
+    resource_state(handle_priv).map_or(0, |s| {
+        s.allocation
             .as_ref()
             .map(ResidentAllocation::handle)
             .unwrap_or(0)
-    }
+    })
 }
 
 unsafe fn resource_parent_handles(
     handle_priv: *mut c_void,
 ) -> (ddi::HANDLE, ddi::D3DKMT_HANDLE) {
-    if handle_priv.is_null() {
-        return (core::ptr::null_mut(), 0);
-    }
-    let state = *(handle_priv as *const *mut ResourceState);
-    if state.is_null() {
-        (core::ptr::null_mut(), 0)
-    } else {
-        ((*state).rt_resource, (*state).km_resource)
-    }
+    resource_state(handle_priv)
+        .map_or((core::ptr::null_mut(), 0), |s| (s.rt_resource, s.km_resource))
 }
 
 unsafe fn resource_present_private(handle_priv: *mut c_void) -> Option<HeliosPresentPrivateData> {
-    if handle_priv.is_null() {
-        return None;
-    }
-    let state = *(handle_priv as *const *mut ResourceState);
-    if state.is_null() {
-        return None;
-    }
-    let p = (*state).present_private;
+    let p = resource_state(handle_priv)?.present_private;
     p.is_valid().then_some(p)
 }
 
@@ -1263,10 +1259,11 @@ unsafe fn store_rtv(
     height: u32,
     format: u32,
 ) {
-    if handle_priv.is_null() {
+    let Some(slot) = Slot::<Boxed<RtvState>>::from_priv(handle_priv) else {
+        drop(obj);
         return;
-    }
-    let state = Box::new(RtvState {
+    };
+    slot.store(RtvState {
         com_raw: obj.into_raw() as usize,
         resource_raw,
         allocation,
@@ -1274,60 +1271,59 @@ unsafe fn store_rtv(
         height,
         format,
     });
-    *(handle_priv as *mut *mut c_void) = Box::into_raw(state) as *mut c_void;
+}
+
+/// The `RtvState` behind a DDI render-target-view handle, or `None` for an
+/// empty slot. The single place the RTV slot is decoded.
+unsafe fn rtv_state(handle_priv: *mut c_void) -> Option<&'static RtvState> {
+    Slot::<Boxed<RtvState>>::from_priv(handle_priv)?.get()
 }
 
 unsafe fn load_rtv(handle_priv: *mut c_void) -> Option<ManuallyDrop<ID3D11RenderTargetView>> {
-    if handle_priv.is_null() {
-        return None;
-    }
-    let state = *(handle_priv as *const *mut RtvState);
-    if state.is_null() || (*state).com_raw == 0 {
+    let state = rtv_state(handle_priv)?;
+    if state.com_raw == 0 {
         return None;
     }
     Some(ManuallyDrop::new(ID3D11RenderTargetView::from_raw(
-        (*state).com_raw as *mut c_void,
+        state.com_raw as *mut c_void,
     )))
 }
 
+/// Geometry + identity of the RTV behind a handle, all zeros when absent.
+///
+/// `clear_rtv` used to re-derive these by casting the slot inline, duplicating
+/// this function's body four lines from a `load_rtv` call on the same handle.
+/// That copy is gone; the log line it feeds is unchanged. R803.
 unsafe fn rtv_info(handle_priv: *mut c_void) -> (ddi::D3DKMT_HANDLE, u32, u32, u32, usize) {
-    if handle_priv.is_null() {
-        return (0, 0, 0, 0, 0);
-    }
-    let state = *(handle_priv as *const *mut RtvState);
-    if state.is_null() {
-        (0, 0, 0, 0, 0)
-    } else {
-        (
-            (*state).allocation,
-            (*state).width,
-            (*state).height,
-            (*state).format,
-            (*state).resource_raw,
-        )
-    }
+    rtv_state(handle_priv).map_or((0, 0, 0, 0, 0), |s| {
+        (s.allocation, s.width, s.height, s.format, s.resource_raw)
+    })
 }
 
 unsafe fn release_rtv(handle_priv: *mut c_void) {
-    if handle_priv.is_null() {
+    let Some(slot) = Slot::<Boxed<RtvState>>::from_priv(handle_priv) else {
         return;
-    }
-    let state = *(handle_priv as *mut *mut RtvState);
-    if !state.is_null() {
-        if (*state).com_raw != 0 {
-            drop(IUnknown::from_raw((*state).com_raw as *mut c_void));
+    };
+    // `take` empties the slot as it hands the box over, so a second release on
+    // the same handle finds `None` instead of freeing twice.
+    if let Some(state) = slot.take() {
+        if state.com_raw != 0 {
+            drop(IUnknown::from_raw(state.com_raw as *mut c_void));
         }
-        drop(Box::from_raw(state));
-        *(handle_priv as *mut *mut c_void) = core::ptr::null_mut();
     }
 }
 
 unsafe fn release_resource(h: Hdevice, handle_priv: *mut c_void) {
-    if handle_priv.is_null() {
+    let Some(slot) = Slot::<Boxed<ResourceState>>::from_priv(handle_priv) else {
         return;
-    }
-    let state = *(handle_priv as *mut *mut ResourceState);
-    if !state.is_null() {
+    };
+    // Take the box (and empty the slot) BEFORE the teardown below, which
+    // re-enters this driver through helios_device/pfnDeallocateCb. A second
+    // release of the same handle now finds an empty slot instead of freeing
+    // twice. `state` is an owned Box, so the drop at the end of this scope is
+    // what frees it -- the explicit `Box::from_raw` is gone.
+    if let Some(mut state) = slot.take() {
+        let state = &mut *state;
         clear_scanout_target_if_matches(h, (*state).com_raw);
         let allocation = (*state)
             .allocation
@@ -1408,33 +1404,18 @@ unsafe fn release_resource(h: Hdevice, handle_priv: *mut c_void) {
         if (*state).com_raw != 0 {
             drop(IUnknown::from_raw((*state).com_raw as *mut c_void));
         }
-        drop(Box::from_raw(state));
-        *(handle_priv as *mut *mut c_void) = core::ptr::null_mut();
     }
 }
 
 /// Borrow the COM interface stored in a DDI handle (does not take ownership).
 unsafe fn load_com<T: Interface>(handle_priv: *mut c_void) -> Option<ManuallyDrop<T>> {
-    if handle_priv.is_null() {
-        return None;
-    }
-    let raw = *(handle_priv as *const *mut c_void);
-    if raw.is_null() {
-        return None;
-    }
-    Some(ManuallyDrop::new(T::from_raw(raw)))
+    Slot::<Com<T>>::from_priv(handle_priv)?.load()
 }
 
 /// Release the COM interface stored in a DDI handle.
 unsafe fn release_com(handle_priv: *mut c_void) {
-    if handle_priv.is_null() {
-        return;
-    }
-    let raw = *(handle_priv as *const *mut c_void);
-    if !raw.is_null() {
-        // Reconstitute owning ref and drop it.
-        drop(IUnknown::from_raw(raw));
-        *(handle_priv as *mut *mut c_void) = core::ptr::null_mut();
+    if let Some(slot) = Slot::<Com<IUnknown>>::from_priv(handle_priv) {
+        slot.release();
     }
 }
 
@@ -3360,17 +3341,17 @@ unsafe extern "C" fn clear_rtv(
     } else {
         [*color, *color.add(1), *color.add(2), *color.add(3)]
     };
-    if !h_rtv.pDrvPrivate.is_null() {
-        let state = *(h_rtv.pDrvPrivate as *const *mut RtvState);
-        if !state.is_null() {
+    {
+        let (allocation, width, height, format, _resource_raw) = rtv_info(h_rtv.pDrvPrivate);
+        if allocation != 0 || width != 0 || height != 0 || format != 0 {
             if let Some(n) = CLEAR_RTV_LOG_COUNT.first_n_then_every_from_one(64, 512) {
                 log_error!(
                     "DDI ClearRenderTargetView #{} alloc=0x{:x} {}x{} fmt={} rgba=({:.3},{:.3},{:.3},{:.3})",
                     n + 1,
-                    (*state).allocation,
-                    (*state).width,
-                    (*state).height,
-                    (*state).format,
+                    allocation,
+                    width,
+                    height,
+                    format,
                     rgba[0],
                     rgba[1],
                     rgba[2],
@@ -8090,15 +8071,23 @@ unsafe extern "C" fn create_element_layout(
             input_register: e.InputRegister,
         });
     }
-    let boxed = Box::new(LayoutData { elements: elems });
-    *(h_el.pDrvPrivate as *mut usize) = Box::into_raw(boxed) as usize;
+    // The element-layout slot is a fourth payload kind: a Box this driver
+    // allocated, but stored as a bare `usize` and then used as the identity key
+    // of `IaState::layout_cache`. R803's finding does not list it; it is the
+    // same latent confusion as the resource and RTV slots.
+    let Some(slot) = Slot::<Boxed<LayoutData>>::from_priv(h_el.pDrvPrivate) else {
+        return;
+    };
+    slot.store(LayoutData { elements: elems });
 }
 
 unsafe extern "C" fn destroy_element_layout(h: Hdevice, h_el: ddi::D3D10DDI_HELEMENTLAYOUT) {
-    if h_el.pDrvPrivate.is_null() {
+    let Some(slot) = Slot::<Boxed<LayoutData>>::from_priv(h_el.pDrvPrivate) else {
         return;
-    }
-    let p = *(h_el.pDrvPrivate as *const usize);
+    };
+    // The slot word doubles as this layout's identity in `layout_cache`, so it
+    // is read before the box is taken.
+    let p = slot.word();
     if p != 0 {
         let mut owned = std::collections::HashSet::new();
         if let Some(dev) = helios_device(h) {
@@ -8127,17 +8116,15 @@ unsafe extern "C" fn destroy_element_layout(h: Hdevice, h_el: ddi::D3D10DDI_HELE
             p,
             owned.len()
         );
-        drop(Box::from_raw(p as *mut LayoutData));
-        *(h_el.pDrvPrivate as *mut usize) = 0;
+        drop(slot.take());
     }
 }
 
 unsafe extern "C" fn ia_set_input_layout(h: Hdevice, h_el: ddi::D3D10DDI_HELEMENTLAYOUT) {
     if let Some(dev) = helios_device(h) {
-        let p = if h_el.pDrvPrivate.is_null() {
-            0
-        } else {
-            *(h_el.pDrvPrivate as *const usize)
+        let p = match Slot::<Boxed<LayoutData>>::from_priv(h_el.pDrvPrivate) {
+            Some(slot) => slot.word(),
+            None => 0,
         };
         dev.ia.borrow_mut().current_layout = p;
     }
@@ -10409,7 +10396,10 @@ unsafe extern "C" fn dxgi_rotate_resource_identities(
             );
             return 0;
         }
-        let state = *(hr.pDrvPrivate as *const *mut ResourceState);
+        let state = match Slot::<Boxed<ResourceState>>::from_priv(hr.pDrvPrivate) {
+            Some(slot) => slot.ptr(),
+            None => core::ptr::null_mut(),
+        };
         if state.is_null() {
             ROTATE_UNTRACKED.fetch_add(1, Ordering::Relaxed);
             log_error!(
