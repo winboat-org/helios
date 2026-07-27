@@ -1692,6 +1692,7 @@ impl VenusClient {
             flags |= VIRTIO_GPU_BLOB_FLAG_USE_SHAREABLE;
         }
         let res_id = match ctrl::resource_create_blob(
+            self.passive(),
             adapter,
             self.ctx_id(),
             VIRTIO_GPU_BLOB_MEM_HOST3D,
@@ -4954,6 +4955,7 @@ impl VenusClient {
         }
         crate::diag::record_named_bytes(b"SdgBFl", blob_flags);
         let res_id = ctrl::resource_create_blob(
+            self.passive(),
             adapter,
             self.ctx_id(),
             VIRTIO_GPU_BLOB_MEM_HOST3D,
@@ -5047,6 +5049,7 @@ impl VenusClient {
 
         let blob_flags = VIRTIO_GPU_BLOB_FLAG_USE_SHAREABLE | VIRTIO_GPU_BLOB_FLAG_USE_CROSS_DEVICE;
         let resource_id = match ctrl::resource_create_blob(
+            self.passive(),
             adapter,
             self.ctx_id(),
             VIRTIO_GPU_BLOB_MEM_HOST3D,
@@ -5137,6 +5140,7 @@ impl VenusClient {
         crate::diag::record_named_bytes(b"SdgBFl", blob_flags);
         crate::diag::record_named_bytes(b"SdgLStg", 8);
         let res_id = ctrl::resource_create_blob(
+            self.passive(),
             adapter,
             self.ctx_id(),
             VIRTIO_GPU_BLOB_MEM_HOST3D,
@@ -5299,6 +5303,7 @@ impl VenusRing {
     ) -> Result<Self, VirtioError> {
         // ── 1. Ring shmem: create blob + map into window + kernel-map + zero ──
         let ring_res_id = ctrl::resource_create_blob(
+            passive,
             adapter,
             ctx_id,
             VIRTIO_GPU_BLOB_MEM_HOST3D,
@@ -5321,6 +5326,7 @@ impl VenusRing {
 
         // ── 2. Reply shmem: create blob + map + kernel-map + zero ─────────────
         let reply_res_id = ctrl::resource_create_blob(
+            passive,
             adapter,
             ctx_id,
             VIRTIO_GPU_BLOB_MEM_HOST3D,

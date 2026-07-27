@@ -29,6 +29,7 @@ use helios_protocol::{
 };
 
 use crate::adapter::{AdapterContext, ScanoutGuard};
+use crate::irql::PassiveLevel;
 use crate::dxgk::_D3DDDIFORMAT::{D3DDDIFMT_A8B8G8R8, D3DDDIFMT_A8R8G8B8, D3DDDIFMT_X8R8G8B8};
 use crate::dxgk::_D3DKMDT_STANDARDALLOCATION_TYPE::{
     D3DKMDT_STANDARDALLOCATION_GDISURFACE, D3DKMDT_STANDARDALLOCATION_SHADOWSURFACE,
@@ -1152,10 +1153,11 @@ unsafe fn write_open_identity(
 /// KMD context. Best-effort on the virtio ops (teardown must not get stuck).
 /// PASSIVE_LEVEL (DxgkDdiDestroyAllocation) — the round-trips ride
 /// `virtio::ctrl`'s PASSIVE waits.
-unsafe fn destroy_allocation_ctx(adapter: &AdapterContext, ctx: Box<AllocationContext>) {
-    // SAFETY: PLACEHOLDER (R614) — the audited mint for this path arrives with
-    // its caller-group commit (allocation commit).
-    let passive = unsafe { crate::irql::PassiveLevel::assume() };
+unsafe fn destroy_allocation_ctx(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    ctx: Box<AllocationContext>,
+) {
     let allocation_handle = (&*ctx as *const AllocationContext) as usize;
     // Retire the exact Windows/KMD allocation identity before any backing
     // resource, Venus image, or cached copy can be torn down. If QEMU cannot
@@ -1332,16 +1334,13 @@ struct CreatedBacking {
 /// legal return set and dxgkrnl logged it as "Driver returned an invalid
 /// NTSTATUS" (197x) and responded with adapter resets during boot.
 fn build_backing(
+    passive: PassiveLevel,
     adapter: &AdapterContext,
     backing: helios_protocol::AllocationBacking,
     ap: &HeliosWddmAllocPrivate,
     meta: &HeliosWddmAllocMeta,
 ) -> Result<CreatedBacking, NTSTATUS> {
     use helios_protocol::AllocationBacking as Backing;
-
-    // SAFETY: PLACEHOLDER (R614) — the audited mint for this path arrives with
-    // its caller-group commit (allocation commit).
-    let passive = unsafe { crate::irql::PassiveLevel::assume() };
 
     // The venus identity a cross-process opener needs. For adopted and raw
     // resources the UMD recorded it in the trailer at create time; a 0 there
@@ -1521,6 +1520,7 @@ fn build_backing(
             blob_id,
             size,
         } => match crate::virtio::ctrl::resource_create_blob(
+            passive,
             adapter, ctx_id, blob_mem, blob_flags, blob_id, size,
         ) {
             Ok(rid) => {
@@ -1554,6 +1554,7 @@ fn build_backing(
 /// Create the virtio blob for one allocation and fill its VidMm metadata. On
 /// failure nothing is stored (the caller unwinds prior allocations).
 unsafe fn create_one(
+    passive: PassiveLevel,
     adapter: &AdapterContext,
     resource_private: *const c_void,
     resource_private_size: UINT,
@@ -1656,7 +1657,7 @@ unsafe fn create_one(
     // PRIMARY | OPTIMAL_GDI_TEXTURE combination, which classifies as the primary.
     let is_optimal_gdi_texture = ap.kind == HELIOS_WDDM_ALLOC_KIND_STANDARD
         && (meta.misc_flags & HELIOS_WDDM_ALLOC_MISC_OPTIMAL_GDI_TEXTURE) != 0;
-    let created = build_backing(adapter, backing, &ap, &meta)?;
+    let created = build_backing(passive, adapter, backing, &ap, &meta)?;
 
     // THE one update site. `meta`/`ap` used to be mutated in place by each arm
     // and read again 100-470 lines later, with nothing stating which fields an
@@ -1927,6 +1928,10 @@ pub unsafe extern "C" fn dxgkddi_create_allocation(
     crate::diag::record(0x0C01_0001);
     // SAFETY: Dxgkrnl passes our adapter context and a valid args struct.
     let adapter = unsafe { &*(h_adapter as *const AdapterContext) };
+    // SAFETY: `DxgkDdiCreateAllocation` is documented "IRQL: PASSIVE_LEVEL" (WDK
+    // DXGKDDI_CREATEALLOCATION). It creates the host resources every arm below
+    // round-trips the control queue for, so it cannot be anything else.
+    let passive = unsafe { crate::irql::PassiveLevel::assume() };
     let args = unsafe { &mut *create_allocation };
     let create_flags = unsafe { args.Flags.__bindgen_anon_1.Value };
     let input_resource = args.hResource as usize as u64;
@@ -1997,6 +2002,7 @@ pub unsafe extern "C" fn dxgkddi_create_allocation(
         }
         if let Err(status) = unsafe {
             create_one(
+                passive,
                 adapter,
                 args.pPrivateDriverData,
                 args.PrivateDriverDataSize,
@@ -2012,7 +2018,7 @@ pub unsafe extern "C" fn dxgkddi_create_allocation(
             for j in 0..i {
                 let prev = unsafe { &mut *args.pAllocationInfo.add(j) };
                 if let Some(ctx) = unsafe { take_alloc_ctx(prev.hAllocation) } {
-                    unsafe { destroy_allocation_ctx(adapter, ctx) };
+                    unsafe { destroy_allocation_ctx(passive, adapter, ctx) };
                 }
                 prev.hAllocation = core::ptr::null_mut();
             }
@@ -2035,6 +2041,10 @@ pub unsafe extern "C" fn dxgkddi_destroy_allocation(
         return STATUS_INVALID_PARAMETER;
     }
     let adapter = unsafe { &*(h_adapter as *const AdapterContext) };
+    // SAFETY: `DxgkDdiDestroyAllocation` is documented "IRQL: PASSIVE_LEVEL" (WDK
+    // DXGKDDI_DESTROYALLOCATION). Teardown unmaps/detaches/unrefs host
+    // resources, all control round-trips.
+    let passive = unsafe { crate::irql::PassiveLevel::assume() };
     let args = unsafe { &*destroy_allocation };
     if args.NumAllocations != 0 && args.pAllocationList.is_null() {
         return STATUS_INVALID_PARAMETER;
@@ -2043,7 +2053,7 @@ pub unsafe extern "C" fn dxgkddi_destroy_allocation(
     for i in 0..args.NumAllocations as usize {
         let handle = unsafe { *args.pAllocationList.add(i) };
         if let Some(ctx) = unsafe { take_alloc_ctx(handle) } {
-            unsafe { destroy_allocation_ctx(adapter, ctx) };
+            unsafe { destroy_allocation_ctx(passive, adapter, ctx) };
         }
     }
 

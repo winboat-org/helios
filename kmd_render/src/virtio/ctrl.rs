@@ -1226,6 +1226,7 @@ pub fn attach_resource_checked(
 /// live-resource table slot is reserved up front so an untracked-but-live
 /// resource can never exist.
 pub fn resource_create_blob(
+    passive: PassiveLevel,
     adapter: &AdapterContext,
     ctx_id: u32,
     blob_mem: u32,
@@ -1233,7 +1234,6 @@ pub fn resource_create_blob(
     blob_id: u64,
     size: u64,
 ) -> Result<u32, VirtioError> {
-    let passive = assume_passive_unaudited();
     let reserved = adapter
         .with_virtio(|v| v.reserve_resource_slot())
         .map_err(|_| VirtioError::DeviceError)?;
@@ -1274,9 +1274,7 @@ pub fn resource_create_blob(
 /// `HELIOS_ESCAPE_ALLOC_BLOB` — create a HOST3D blob (create + attach) and
 /// record it in the blob table. Returns the resource id.
 pub fn alloc_blob(
-    // Becomes load-bearing in the allocation commit, when `resource_create_blob`
-    // stops minting its own token.
-    _passive: PassiveLevel,
+    passive: PassiveLevel,
     adapter: &AdapterContext,
     ctx_id: u32,
     blob_mem: u32,
@@ -1294,7 +1292,7 @@ pub fn alloc_blob(
     if !reserved {
         return Err(VirtioError::OutOfMemory);
     }
-    match resource_create_blob(adapter, ctx_id, blob_mem, blob_flags, blob_id, size) {
+    match resource_create_blob(passive, adapter, ctx_id, blob_mem, blob_flags, blob_id, size) {
         Ok(resource_id) => {
             let _ = adapter.with_virtio(|v| v.commit_blob(owner, ctx_id, resource_id, size));
             Ok(resource_id)
