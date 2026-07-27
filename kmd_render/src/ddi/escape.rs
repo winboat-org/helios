@@ -26,6 +26,7 @@ use helios_protocol::{
     HeliosEscapeQueryScanout, HeliosEscapeQueryStats, HeliosEscapeQueryStatsV2,
     HeliosEscapeQueryStatsV3,
     HeliosEscapeReleaseBlob, HeliosEscapeSubmitVenus, HeliosEscapeWaitFence,
+    HeliosEscapeWaitFenceLegacy,
     HELIOS_ESCAPE_ALLOC_BLOB, HELIOS_ESCAPE_ATTACH_RESOURCE, HELIOS_ESCAPE_CTX_CREATE,
     HELIOS_ESCAPE_CTX_DESTROY, HELIOS_ESCAPE_MAP_BLOB, HELIOS_ESCAPE_QUERY_SCANOUT,
     HELIOS_ESCAPE_QUERY_STATS, HELIOS_ESCAPE_REGISTER_FENCE_EVENT, HELIOS_ESCAPE_RELEASE_BLOB,
@@ -75,6 +76,81 @@ pub(crate) static ESCAPE_DEVICE_GONE: core::sync::atomic::AtomicU32 =
 fn refuse_short_buffer() -> NTSTATUS {
     ESCAPE_SHORT_BUFFER.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     STATUS_BUFFER_TOO_SMALL
+}
+
+/// A guest escape buffer, bound to the wire struct `T` that describes it.
+///
+/// # Why this exists
+///
+/// The peer is a separately-built binary — `vn_renderer_helios.c` carries
+/// hand-written C copies of every struct in `helios_protocol::escape`, and their
+/// only cross-language guard is a size `_Static_assert`. Field-order drift is
+/// caught by neither compiler. Four magic-value mechanisms stood in for a
+/// version field that already exists:
+///
+///   * `buf[16..24]` / `buf[24..32]` re-encoded `HeliosEscapeWaitFence`'s layout
+///     as literal offsets. Insert a field before `timeout_ns`, or reorder the C
+///     copy, and the size asserts still pass while the KMD waits on a garbage
+///     timeout with no diagnostic.
+///   * `legacy = buf.len() < sz` and `v2 = buf.len() >= sz2` made the runtime's
+///     BUFFER LENGTH the protocol version rather than the caller's declared
+///     struct size, so any caller whose scratch buffer happened to be large
+///     enough was served a newer layout than it declared.
+///   * `hdr.size`, validated once in the dispatcher, was then never consulted by
+///     any arm — the only per-message declared length was dead.
+///
+/// `EscapeBuf` makes the struct definition the only layout authority: an arm
+/// touches the guest buffer through `read`/`write_back` or not at all, and both
+/// bounds — what the caller DECLARED (`hdr.size`) and what the runtime actually
+/// supplied (`buf.len()`) — are checked once, at construction.
+///
+/// # The SUBMIT_VENUS exception
+///
+/// `SUBMIT_VENUS` sets `hdr.size = sizeof(struct helios_escape_submit_venus)` =
+/// 40 while `PrivateDriverDataSize` covers 40 PLUS the Venus command stream. So
+/// [`Self::trailing`] is bounded by `buf.len()`, NEVER by `hdr.size` — bounding
+/// the stream on the declared header size breaks every submit.
+struct EscapeBuf<'a, T: bytemuck::Pod> {
+    buf: &'a mut [u8],
+    _wire: core::marker::PhantomData<T>,
+}
+
+impl<'a, T: bytemuck::Pod> EscapeBuf<'a, T> {
+    /// Bind `buf` to `T`, requiring room for `T` in BOTH the declared and the
+    /// actual length.
+    ///
+    /// The `hdr.size` half is a new refusal condition, and a no-op for every
+    /// known sender: the ICD's `helios_hdr_init` sets `hdr.size = sizeof(req)`
+    /// for every verb (`vn_renderer_helios.c:1534`). A caller that declares less
+    /// than it asks the KMD to read is refused rather than served.
+    fn new(buf: &'a mut [u8], hdr: &HeliosEscapeHeader) -> Result<Self, NTSTATUS> {
+        if buf.len() < size_of::<T>() || (hdr.size as usize) < size_of::<T>() {
+            return Err(refuse_short_buffer());
+        }
+        Ok(Self {
+            buf,
+            _wire: core::marker::PhantomData,
+        })
+    }
+
+    /// The request, read unaligned — the guest buffer carries no alignment
+    /// guarantee.
+    fn read(&self) -> T {
+        pod_read_unaligned(&self.buf[..size_of::<T>()])
+    }
+
+    /// Write the reply back over the request.
+    fn write_back(&mut self, value: &T) {
+        self.buf[..size_of::<T>()].copy_from_slice(bytes_of(value));
+    }
+
+    /// Everything after `T`, bounded by the length the RUNTIME supplied.
+    ///
+    /// This is SUBMIT_VENUS's command stream. See the type docs for why the
+    /// bound is `buf.len()` and not `hdr.size`.
+    fn trailing(&self) -> &[u8] {
+        &self.buf[size_of::<T>()..]
+    }
 }
 
 /// The transport is gone (StopDevice tore it down). A real device-lost answer:
@@ -226,35 +302,35 @@ pub unsafe extern "C" fn dxgkddi_escape(
 
     match hdr.cmd_type {
         HELIOS_ESCAPE_CTX_CREATE => match owner {
-            Some(owner) => escape_ctx_create(passive, adapter, buf, owner),
+            Some(owner) => escape_ctx_create(passive, adapter, buf, &hdr, owner),
             None => refuse_no_device(),
         },
         HELIOS_ESCAPE_CTX_DESTROY => match owner {
-            Some(owner) => escape_ctx_destroy(passive, adapter, buf, owner),
+            Some(owner) => escape_ctx_destroy(passive, adapter, buf, &hdr, owner),
             None => refuse_no_device(),
         },
         HELIOS_ESCAPE_SUBMIT_VENUS => match owner {
-            Some(owner) => escape_submit_venus(passive, adapter, buf, owner),
+            Some(owner) => escape_submit_venus(passive, adapter, buf, &hdr, owner),
             None => refuse_no_device(),
         },
-        HELIOS_ESCAPE_WAIT_FENCE => escape_wait_fence(passive, adapter, buf),
+        HELIOS_ESCAPE_WAIT_FENCE => escape_wait_fence(passive, adapter, buf, &hdr),
         HELIOS_ESCAPE_ALLOC_BLOB => match owner {
-            Some(owner) => escape_alloc_blob(passive, adapter, buf, owner),
+            Some(owner) => escape_alloc_blob(passive, adapter, buf, &hdr, owner),
             None => refuse_no_device(),
         },
         HELIOS_ESCAPE_MAP_BLOB => match owner {
-            Some(owner) => escape_map_blob(passive, adapter, buf, owner),
+            Some(owner) => escape_map_blob(passive, adapter, buf, &hdr, owner),
             None => refuse_no_device(),
         },
         HELIOS_ESCAPE_RELEASE_BLOB => match owner {
-            Some(owner) => escape_release_blob(passive, adapter, buf, owner),
+            Some(owner) => escape_release_blob(passive, adapter, buf, &hdr, owner),
             None => refuse_no_device(),
         },
-        HELIOS_ESCAPE_ATTACH_RESOURCE => escape_attach_resource(passive, adapter, buf),
-        HELIOS_ESCAPE_QUERY_STATS => escape_query_stats(adapter, buf),
-        HELIOS_ESCAPE_QUERY_SCANOUT => escape_query_scanout(adapter, buf),
-        HELIOS_ESCAPE_REGISTER_FENCE_EVENT => escape_register_fence_event(adapter, buf),
-        HELIOS_ESCAPE_UNREGISTER_FENCE_EVENT => escape_unregister_fence_event(adapter, buf),
+        HELIOS_ESCAPE_ATTACH_RESOURCE => escape_attach_resource(passive, adapter, buf, &hdr),
+        HELIOS_ESCAPE_QUERY_STATS => escape_query_stats(adapter, buf, &hdr),
+        HELIOS_ESCAPE_QUERY_SCANOUT => escape_query_scanout(adapter, buf, &hdr),
+        HELIOS_ESCAPE_REGISTER_FENCE_EVENT => escape_register_fence_event(adapter, buf, &hdr),
+        HELIOS_ESCAPE_UNREGISTER_FENCE_EVENT => escape_unregister_fence_event(adapter, buf, &hdr),
         // Unknown verbs are rejected — and counted, because an unhandled verb is
         // how an ICD/KMD protocol skew presents (HELIOS_ESCAPE_PRESENT_BLOB
         // = 0x0007 exists in the protocol and lands here).
@@ -268,14 +344,18 @@ pub unsafe extern "C" fn dxgkddi_escape(
 /// Read-only snapshot of the production LINEAR primary currently published by
 /// `SetVidPnSourceAddress`. The diagnostic resource is deliberately excluded:
 /// consumers must never mistake color bars for the DWM copy destination.
-fn escape_query_scanout(adapter: &AdapterContext, buf: &mut [u8]) -> NTSTATUS {
+fn escape_query_scanout(
+    adapter: &AdapterContext,
+    buf: &mut [u8],
+    hdr: &HeliosEscapeHeader,
+) -> NTSTATUS {
     use core::sync::atomic::Ordering;
 
-    let sz = size_of::<HeliosEscapeQueryScanout>();
-    if buf.len() < sz {
-        return refuse_short_buffer();
-    }
-    let mut out: HeliosEscapeQueryScanout = pod_read_unaligned(&buf[..sz]);
+    let mut wire = match EscapeBuf::<HeliosEscapeQueryScanout>::new(buf, hdr) {
+        Ok(w) => w,
+        Err(st) => return st,
+    };
+    let mut out = wire.read();
 
     // SEQLOCK READ. Loading the resource id first and everything else Relaxed
     // was safe only against a FIRST publish; a republish landing between the
@@ -341,7 +421,7 @@ fn escape_query_scanout(adapter: &AdapterContext, buf: &mut [u8]) -> NTSTATUS {
         out.out_memory_type_index = 0;
         out.out_generation = generation;
         out.reserved = [0; 2];
-        buf[..sz].copy_from_slice(bytes_of(&out));
+        wire.write_back(&out);
         return STATUS_SUCCESS;
     }
 
@@ -355,7 +435,7 @@ fn escape_query_scanout(adapter: &AdapterContext, buf: &mut [u8]) -> NTSTATUS {
     out.out_memory_type_index = memory_type;
     out.out_generation = generation;
     out.reserved = [0; 2];
-    buf[..sz].copy_from_slice(bytes_of(&out));
+    wire.write_back(&out);
     STATUS_SUCCESS
 }
 
@@ -416,23 +496,27 @@ fn dereference_user_event(event: core::ptr::NonNull<wdk_sys::KEVENT>) {
 /// signaling at wire-fence retirement. Non-blocking. `fence_id == 0 &&
 /// event_handle == 0` is the capability probe (PROBE_ACK; old KMDs fail the
 /// escape with STATUS_NOT_IMPLEMENTED at the dispatcher).
-fn escape_register_fence_event(adapter: &AdapterContext, buf: &mut [u8]) -> NTSTATUS {
+fn escape_register_fence_event(
+    adapter: &AdapterContext,
+    buf: &mut [u8],
+    hdr: &HeliosEscapeHeader,
+) -> NTSTATUS {
     use crate::virtio::gpu::FenceEventReg;
     use core::sync::atomic::Ordering;
 
-    let sz = size_of::<HeliosEscapeFenceEvent>();
-    if buf.len() < sz {
-        return refuse_short_buffer();
-    }
-    let req: HeliosEscapeFenceEvent = pod_read_unaligned(&buf[..sz]);
-    let write_state = |buf: &mut [u8], state: u32| {
+    let mut wire = match EscapeBuf::<HeliosEscapeFenceEvent>::new(buf, hdr) {
+        Ok(w) => w,
+        Err(st) => return st,
+    };
+    let req = wire.read();
+    let mut write_state = |state: u32| {
         let mut out = req;
         out.out_state = state;
-        buf[..sz].copy_from_slice(bytes_of(&out));
+        wire.write_back(&out);
     };
 
     if req.fence_id == 0 && req.event_handle == 0 {
-        write_state(buf, HELIOS_FENCE_EVENT_PROBE_ACK);
+        write_state(HELIOS_FENCE_EVENT_PROBE_ACK);
         return STATUS_SUCCESS;
     }
     if req.fence_id == 0 || req.event_handle == 0 {
@@ -449,7 +533,7 @@ fn escape_register_fence_event(adapter: &AdapterContext, buf: &mut [u8]) -> NTST
     match reg {
         Ok(FenceEventReg::Registered) => {
             // The table now owns the reference; the drain signals + derefs.
-            write_state(buf, HELIOS_FENCE_EVENT_REGISTERED);
+            write_state(HELIOS_FENCE_EVENT_REGISTERED);
             STATUS_SUCCESS
         }
         Ok(FenceEventReg::AlreadyComplete) => {
@@ -458,7 +542,7 @@ fn escape_register_fence_event(adapter: &AdapterContext, buf: &mut [u8]) -> NTST
             // SAFETY: we still own the reference; the KEVENT is live.
             unsafe { wdk_sys::ntddk::KeSetEvent(event.as_ptr(), 0, 0) };
             dereference_user_event(event);
-            write_state(buf, HELIOS_FENCE_EVENT_ALREADY_COMPLETE);
+            write_state(HELIOS_FENCE_EVENT_ALREADY_COMPLETE);
             STATUS_SUCCESS
         }
         Ok(FenceEventReg::Invalid) => {
@@ -488,14 +572,18 @@ fn escape_register_fence_event(adapter: &AdapterContext, buf: &mut [u8]) -> NTST
 /// NOT_FOUND = the drain consumed it (event signaled) or nothing was parked —
 /// the caller disambiguates by the event's own state, so a teardown-purged
 /// registration (unsignaled event) reads as failure, never fake completion.
-fn escape_unregister_fence_event(adapter: &AdapterContext, buf: &mut [u8]) -> NTSTATUS {
+fn escape_unregister_fence_event(
+    adapter: &AdapterContext,
+    buf: &mut [u8],
+    hdr: &HeliosEscapeHeader,
+) -> NTSTATUS {
     use core::sync::atomic::Ordering;
 
-    let sz = size_of::<HeliosEscapeFenceEvent>();
-    if buf.len() < sz {
-        return refuse_short_buffer();
-    }
-    let req: HeliosEscapeFenceEvent = pod_read_unaligned(&buf[..sz]);
+    let mut wire = match EscapeBuf::<HeliosEscapeFenceEvent>::new(buf, hdr) {
+        Ok(w) => w,
+        Err(st) => return st,
+    };
+    let req = wire.read();
     if req.fence_id == 0 || req.event_handle == 0 {
         crate::virtio::gpu::FENCE_EVENT_INVALID.fetch_add(1, Ordering::Relaxed);
         return STATUS_INVALID_PARAMETER;
@@ -526,7 +614,7 @@ fn escape_unregister_fence_event(adapter: &AdapterContext, buf: &mut [u8]) -> NT
     } else {
         HELIOS_FENCE_EVENT_NOT_FOUND
     };
-    buf[..sz].copy_from_slice(bytes_of(&out));
+    wire.write_back(&out);
     STATUS_SUCCESS
 }
 
@@ -536,7 +624,11 @@ fn escape_unregister_fence_event(adapter: &AdapterContext, buf: &mut [u8]) -> NT
 /// exhaustion class; no device state is modified. Accepts BOTH struct sizes:
 /// a v1 (88-byte) caller gets the v1 fields, a v2 (22.22.54+) caller also gets
 /// the fence-event table counters.
-fn escape_query_stats(adapter: &AdapterContext, buf: &mut [u8]) -> NTSTATUS {
+fn escape_query_stats(
+    adapter: &AdapterContext,
+    buf: &mut [u8],
+    hdr: &HeliosEscapeHeader,
+) -> NTSTATUS {
     use core::sync::atomic::Ordering;
 
     use crate::virtio::gpu::{
@@ -554,8 +646,16 @@ fn escape_query_stats(adapter: &AdapterContext, buf: &mut [u8]) -> NTSTATUS {
     if buf.len() < sz {
         return refuse_short_buffer();
     }
-    let v2 = buf.len() >= sz2;
-    let v3 = buf.len() >= sz3;
+    // VERSION SELECTION OFF `hdr.size` — the length the caller DECLARED — with
+    // `buf.len()` still bounding every write, because the buffer we may touch is
+    // the one the runtime actually supplied. Declared behaviour change, and a
+    // no-op for every known sender (`helios_hdr_init` sets hdr.size =
+    // sizeof(req)). Previously a caller that declared V1 but happened to pass a
+    // buffer >= sizeof(V3) was served the V3 layout, writing fields into bytes it
+    // never agreed were part of the message.
+    let declared = hdr.size as usize;
+    let v2 = declared >= sz2 && buf.len() >= sz2;
+    let v3 = declared >= sz3 && buf.len() >= sz3;
     let (stats, fence_events_live) =
         match adapter.with_virtio(|v| (v.table_stats(), v.fence_events_live())) {
             Ok(s) => s,
@@ -579,6 +679,11 @@ fn escape_query_stats(adapter: &AdapterContext, buf: &mut [u8]) -> NTSTATUS {
     out.out_take_live_misses = TAKE_LIVE_MISSES.load(Ordering::Relaxed);
     out.out_adopt_dead_rejects = ADOPT_DEAD_REJECTS.load(Ordering::Relaxed);
     if !v2 {
+        // NOT an EscapeBuf arm: this verb writes one of THREE layouts over the
+        // same buffer, so there is no single wire type to bind it to. The bounds
+        // are the explicit `sz`/`sz2`/`sz3` checks above, and the version is now
+        // selected by the caller's declared `hdr.size` rather than by how big a
+        // scratch buffer it happened to pass.
         buf[..sz].copy_from_slice(bytes_of(&out));
         return STATUS_SUCCESS;
     }
@@ -635,18 +740,19 @@ fn escape_ctx_create(
     passive: PassiveLevel,
     adapter: &AdapterContext,
     buf: &mut [u8],
+    hdr: &HeliosEscapeHeader,
     owner: DeviceOwner,
 ) -> NTSTATUS {
-    let sz = size_of::<HeliosEscapeCtxCreate>();
-    if buf.len() < sz {
-        return refuse_short_buffer();
-    }
-    let req: HeliosEscapeCtxCreate = pod_read_unaligned(&buf[..sz]);
+    let mut wire = match EscapeBuf::<HeliosEscapeCtxCreate>::new(buf, hdr) {
+        Ok(w) => w,
+        Err(st) => return st,
+    };
+    let req = wire.read();
     match ctrl::ctx_create(passive, adapter, req.capset_id, Some(owner)) {
         Ok(ctx_id) => {
             let mut out = req;
             out.out_ctx_id = ctx_id;
-            buf[..sz].copy_from_slice(bytes_of(&out));
+            wire.write_back(&out);
             STATUS_SUCCESS
         }
         Err(ve) => ve.into(),
@@ -658,13 +764,14 @@ fn escape_ctx_destroy(
     passive: PassiveLevel,
     adapter: &AdapterContext,
     buf: &mut [u8],
+    hdr: &HeliosEscapeHeader,
     owner: DeviceOwner,
 ) -> NTSTATUS {
-    let sz = size_of::<HeliosEscapeCtxDestroy>();
-    if buf.len() < sz {
-        return refuse_short_buffer();
-    }
-    let req: HeliosEscapeCtxDestroy = pod_read_unaligned(&buf[..sz]);
+    let wire = match EscapeBuf::<HeliosEscapeCtxDestroy>::new(buf, hdr) {
+        Ok(w) => w,
+        Err(st) => return st,
+    };
+    let req = wire.read();
     match ctrl::ctx_destroy(passive, adapter, Some(owner), req.ctx_id) {
         Ok(()) => STATUS_SUCCESS,
         Err(crate::virtio::VirtioError::NotOwned) => refuse_foreign_context(),
@@ -684,24 +791,26 @@ fn escape_submit_venus(
     passive: PassiveLevel,
     adapter: &AdapterContext,
     buf: &mut [u8],
+    hdr: &HeliosEscapeHeader,
     owner: DeviceOwner,
 ) -> NTSTATUS {
-    let hsz = size_of::<HeliosEscapeSubmitVenus>();
-    if buf.len() < hsz {
-        return refuse_short_buffer();
-    }
-    let req: HeliosEscapeSubmitVenus = pod_read_unaligned(&buf[..hsz]);
+    let mut wire = match EscapeBuf::<HeliosEscapeSubmitVenus>::new(buf, hdr) {
+        Ok(w) => w,
+        Err(st) => return st,
+    };
+    let req = wire.read();
 
-    // TRUST BOUNDARY: the Venus stream occupies [hsz .. hsz + buffer_size]. Reject
-    // empty payloads and any length that overflows or exceeds the buffer.
+    // TRUST BOUNDARY, and THE ONE PLACE `hdr.size` MUST NOT BE THE BOUND.
+    // SUBMIT_VENUS sets hdr.size = sizeof(HeliosEscapeSubmitVenus) = 40 while
+    // PrivateDriverDataSize covers 40 PLUS the Venus command stream, so the
+    // stream is bounded by what the RUNTIME supplied — `wire.trailing()`, i.e.
+    // `buf.len()`. Bounding it on the declared header size breaks every submit.
+    // Reject empty payloads and any length that exceeds that trailing region.
+    let stream = wire.trailing();
     let payload = req.buffer_size as usize;
-    if payload == 0 {
+    if payload == 0 || payload > stream.len() {
         return STATUS_INVALID_PARAMETER;
     }
-    let end = match hsz.checked_add(payload) {
-        Some(e) if e <= buf.len() => e,
-        _ => return STATUS_INVALID_PARAMETER,
-    };
 
     match ctrl::submit_venus_async(
         passive,
@@ -709,13 +818,13 @@ fn escape_submit_venus(
         Some(owner),
         req.ctx_id,
         req.ring_idx,
-        &buf[hsz..end],
+        &stream[..payload],
     ) {
         Ok(wire_fence) => {
             // Report the assigned wire fence id back (in/out escape buffer).
             let mut out = req;
             out.fence_id = wire_fence;
-            buf[..hsz].copy_from_slice(bytes_of(&out));
+            wire.write_back(&out);
             STATUS_SUCCESS
         }
         Err(crate::virtio::VirtioError::NotOwned) => refuse_foreign_context(),
@@ -734,34 +843,60 @@ fn escape_wait_fence(
     passive: PassiveLevel,
     adapter: &AdapterContext,
     buf: &mut [u8],
+    hdr: &HeliosEscapeHeader,
 ) -> NTSTATUS {
-    const LEGACY_SIZE: usize = 32;
-    let sz = size_of::<HeliosEscapeWaitFence>();
-    if buf.len() < LEGACY_SIZE {
-        return refuse_short_buffer();
-    }
-    let legacy = buf.len() < sz;
-    // The legacy struct is a strict prefix of the v2 struct; read the common
-    // fields (hdr + fence_id + timeout_ns) from the prefix. buf.len() >= 32 is
-    // guaranteed above, so these fixed reads cannot go out of bounds.
-    let fence_id: u64 = pod_read_unaligned(&buf[16..24]);
-    let timeout_ns: u64 = pod_read_unaligned(&buf[24..32]);
+    // VERSION SELECTION OFF `hdr.size`, not off `buf.len()`. Declared behaviour
+    // change, and a no-op for every known sender: the ICD's `helios_hdr_init`
+    // sets `hdr.size = sizeof(req)` (`vn_renderer_helios.c:1534`), so a caller
+    // that declares the 40-byte shape gets it and one that declares 32 gets the
+    // legacy shape. Previously the runtime's BUFFER LENGTH was the protocol
+    // version, so any caller whose scratch buffer happened to be >= 40 was served
+    // the newer layout even when it declared the older one — and would then have
+    // its `out_completed` written in bytes it never agreed were part of the
+    // message.
+    //
+    // The literal offsets this replaces (`buf[16..24]`, `buf[24..32]`) were a
+    // third copy of the struct layout, correct only by coincidence: the peer's
+    // hand-written C copy has nothing but a size assert guarding its field order.
+    let current = match EscapeBuf::<HeliosEscapeWaitFence>::new(buf, hdr) {
+        Ok(w) => Some(w),
+        Err(_) => None,
+    };
+    let (fence_id, timeout_ns) = match &current {
+        Some(w) => {
+            let req = w.read();
+            (req.fence_id, req.timeout_ns)
+        }
+        None => {
+            // Legacy 32-byte shape (old ICD): waits, but can only report a
+            // timeout through a failure NTSTATUS. Read through the declared
+            // prefix struct rather than byte offsets.
+            let legacy = match EscapeBuf::<HeliosEscapeWaitFenceLegacy>::new(buf, hdr) {
+                Ok(w) => w,
+                Err(st) => return st,
+            };
+            let req = legacy.read();
+            let outcome = ctrl::wait_fence(passive, adapter, req.fence_id, req.timeout_ns);
+            return match outcome {
+                ctrl::WaitFenceOutcome::Complete => STATUS_SUCCESS,
+                ctrl::WaitFenceOutcome::TimedOut => wdk_sys::STATUS_IO_TIMEOUT,
+                ctrl::WaitFenceOutcome::Invalid => STATUS_INVALID_PARAMETER,
+            };
+        }
+    };
 
     let outcome = ctrl::wait_fence(passive, adapter, fence_id, timeout_ns);
-    if legacy {
-        return match outcome {
-            ctrl::WaitFenceOutcome::Complete => STATUS_SUCCESS,
-            ctrl::WaitFenceOutcome::TimedOut => wdk_sys::STATUS_IO_TIMEOUT,
-            ctrl::WaitFenceOutcome::Invalid => STATUS_INVALID_PARAMETER,
-        };
-    }
-    let mut out: HeliosEscapeWaitFence = pod_read_unaligned(&buf[..sz]);
+    // `current` is Some on this path — the None arm returned above.
+    let Some(mut wire) = current else {
+        return STATUS_INVALID_PARAMETER;
+    };
+    let mut out = wire.read();
     match outcome {
         ctrl::WaitFenceOutcome::Complete => out.out_completed = 1,
         ctrl::WaitFenceOutcome::TimedOut => out.out_completed = 0,
         ctrl::WaitFenceOutcome::Invalid => return STATUS_INVALID_PARAMETER,
     }
-    buf[..sz].copy_from_slice(bytes_of(&out));
+    wire.write_back(&out);
     STATUS_SUCCESS
 }
 
@@ -771,13 +906,14 @@ fn escape_alloc_blob(
     passive: PassiveLevel,
     adapter: &AdapterContext,
     buf: &mut [u8],
+    hdr: &HeliosEscapeHeader,
     owner: DeviceOwner,
 ) -> NTSTATUS {
-    let sz = size_of::<HeliosEscapeAllocBlob>();
-    if buf.len() < sz {
-        return refuse_short_buffer();
-    }
-    let req: HeliosEscapeAllocBlob = pod_read_unaligned(&buf[..sz]);
+    let mut wire = match EscapeBuf::<HeliosEscapeAllocBlob>::new(buf, hdr) {
+        Ok(w) => w,
+        Err(st) => return st,
+    };
+    let req = wire.read();
     // DIAG: 0x0E04_HHHH = ALLOC_BLOB's owning handle (low 16 bits), to confirm it
     // matches the handle DxgkDdiDestroyDevice reclaims under (0x0E01_HHHH).
     crate::diag::record(0x0E04_0000 | ((owner.raw() as u32) & 0xFFFF));
@@ -794,7 +930,7 @@ fn escape_alloc_blob(
         Ok(resource_id) => {
             let mut out = req;
             out.out_resource_id = resource_id;
-            buf[..sz].copy_from_slice(bytes_of(&out));
+            wire.write_back(&out);
             STATUS_SUCCESS
         }
         Err(ve) => ve.into(),
@@ -811,13 +947,14 @@ fn escape_map_blob(
     passive: PassiveLevel,
     adapter: &AdapterContext,
     buf: &mut [u8],
+    hdr: &HeliosEscapeHeader,
     owner: DeviceOwner,
 ) -> NTSTATUS {
-    let sz = size_of::<HeliosEscapeMapBlob>();
-    if buf.len() < sz {
-        return refuse_short_buffer();
-    }
-    let req: HeliosEscapeMapBlob = pod_read_unaligned(&buf[..sz]);
+    let mut wire = match EscapeBuf::<HeliosEscapeMapBlob>::new(buf, hdr) {
+        Ok(w) => w,
+        Err(st) => return st,
+    };
+    let req = wire.read();
     if req.resource_id == 0 {
         return STATUS_INVALID_PARAMETER;
     }
@@ -893,7 +1030,7 @@ fn escape_map_blob(
     let mut out = req;
     out.out_user_va = user_va;
     out.map_cache = eff_cache;
-    buf[..sz].copy_from_slice(bytes_of(&out));
+    wire.write_back(&out);
     STATUS_SUCCESS
 }
 
@@ -902,19 +1039,20 @@ fn escape_map_blob(
 fn escape_release_blob(
     passive: PassiveLevel,
     adapter: &AdapterContext,
-    buf: &[u8],
+    buf: &mut [u8],
+    hdr: &HeliosEscapeHeader,
     owner: DeviceOwner,
 ) -> NTSTATUS {
-    let sz = size_of::<HeliosEscapeReleaseBlob>();
-    if buf.len() < sz {
-        return refuse_short_buffer();
-    }
+    let wire = match EscapeBuf::<HeliosEscapeReleaseBlob>::new(buf, hdr) {
+        Ok(w) => w,
+        Err(st) => return st,
+    };
     // THE VERB THAT DESTROYS STATE: with a `usize` owner, a null hDevice matched
     // the slots the KMD adopts for live WDDM allocations — pop, unmap,
     // take_live_resource, unref, all behind the allocation's back, after which
     // DestroyAllocation finds nothing and the host logs "invalid res_id" (the
     // boot-#3 DWM kill class). `DeviceOwner` makes that unrepresentable.
-    let req: HeliosEscapeReleaseBlob = pod_read_unaligned(&buf[..sz]);
+    let req = wire.read();
     if req.ctx_id == 0 || req.resource_id == 0 {
         return STATUS_INVALID_PARAMETER;
     }
@@ -939,13 +1077,14 @@ fn escape_release_blob(
 fn escape_attach_resource(
     passive: PassiveLevel,
     adapter: &AdapterContext,
-    buf: &[u8],
+    buf: &mut [u8],
+    hdr: &HeliosEscapeHeader,
 ) -> NTSTATUS {
-    let sz = size_of::<HeliosEscapeAttachResource>();
-    if buf.len() < sz {
-        return refuse_short_buffer();
-    }
-    let req: HeliosEscapeAttachResource = pod_read_unaligned(&buf[..sz]);
+    let wire = match EscapeBuf::<HeliosEscapeAttachResource>::new(buf, hdr) {
+        Ok(w) => w,
+        Err(st) => return st,
+    };
+    let req = wire.read();
     if req.ctx_id == 0 || req.resource_id == 0 {
         return STATUS_INVALID_PARAMETER;
     }

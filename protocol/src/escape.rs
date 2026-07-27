@@ -216,6 +216,23 @@ pub struct HeliosEscapeWaitFence {
     pub _pad: u32,
 }
 
+/// The pre-async 32-byte `HELIOS_ESCAPE_WAIT_FENCE` shape: a strict PREFIX of
+/// [`HeliosEscapeWaitFence`], without the `out_completed`/`_pad` tail.
+///
+/// Declared as a struct so the KMD stops re-encoding it as literal byte offsets
+/// (`buf[16..24]` / `buf[24..32]`). Those literals were correct only by
+/// coincidence: inserting a field before `timeout_ns` here — or reordering the
+/// hand-written C copy in `vn_renderer_helios.c`, whose only cross-language guard
+/// is a size assert — left both size asserts passing while the KMD waited on a
+/// garbage timeout with no diagnostic.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct HeliosEscapeWaitFenceLegacy {
+    pub hdr: HeliosEscapeHeader,
+    pub fence_id: u64,
+    pub timeout_ns: u64,
+}
+
 /// `HELIOS_ESCAPE_PRESENT_BLOB` — throwaway Phase-7 gate op (DISPLAY.md §8). Bind
 /// a venus blob `resource_id` to scanout 0 (`SET_SCANOUT_BLOB` + `RESOURCE_FLUSH`)
 /// so the host displays it zero-copy under `-spice gl=on`. Input-only. 40 bytes.
@@ -450,6 +467,17 @@ const _: () = {
     assert!(core::mem::size_of::<HeliosEscapeReleaseBlob>() == 32);
     assert!(core::mem::size_of::<HeliosEscapeAttachResource>() == 24);
     assert!(core::mem::size_of::<HeliosEscapeWaitFence>() == 40);
+    assert!(core::mem::size_of::<HeliosEscapeWaitFenceLegacy>() == 32);
+    // The legacy shape must stay a strict PREFIX of the current one — that is
+    // what makes reading the common fields out of a 32-byte buffer correct.
+    assert!(
+        core::mem::offset_of!(HeliosEscapeWaitFence, fence_id)
+            == core::mem::offset_of!(HeliosEscapeWaitFenceLegacy, fence_id)
+    );
+    assert!(
+        core::mem::offset_of!(HeliosEscapeWaitFence, timeout_ns)
+            == core::mem::offset_of!(HeliosEscapeWaitFenceLegacy, timeout_ns)
+    );
     assert!(core::mem::size_of::<HeliosEscapePresentBlob>() == 40);
     assert!(core::mem::size_of::<HeliosEscapeFenceEvent>() == 40);
     assert!(core::mem::size_of::<HeliosEscapeQueryScanout>() == 64);
