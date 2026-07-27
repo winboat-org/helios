@@ -292,9 +292,38 @@ virtio-gpu scanout; IddCx/Looking Glass is no longer the active display path.*
    ⚠ One consequence for T5 sequencing: T5's **R805** renames `protocol/`'s `_pad` and four
    `kmd_render` read sites, so it is not UMD-only. Doing T3 first means R805 folds naturally into a
    KMD-deploy window instead of being an awkward exception to T5's "release UMD only" shape.
-7. **T4a BUILT — gate NOT YET RUN (2026-07-27, KMD `22.22.184.0`, 34 commits).** 18 of the 19
+7. **T4a LANDED — gate PASSED (2026-07-27, KMD `22.22.184.0`, 34 commits).** 18 of the 19
    items (R601–R613, R615–R619) plus **all 11 minor items** landed; **R614 is DECLINED**
-   (see below), so T4a is complete as scoped. New host tests: `kmd_logic` 28→34, `protocol` 3→8.
+   (see below), so T4a is complete as scoped.
+   **Gate evidence, all same boot (08:40:31):** cold boot to `CM_PROB_NONE` on 22.22.184.0 with a
+   visible composited desktop (`helios_paintcap`), and a second composited capture after **nine
+   consecutive `pnputil /restart-device` cycles**. Per-flip diag IDENTICAL to the pre-image
+   baseline — `VpSA=1 ScSet=1 ScFlu=3 VpDSt=0 DspMd=124257286 ScCpy=2 ScPch=7680`, `ScanoutDiag`
+   absent. Every failure counter clear, every T4a counter absent, `ChSzMm`/`ChSzPv` 0.
+   `ASYNC_SUBMIT_COUNT == ASYNC_COMPLETE_COUNT` exactly at both 332102 and 24110 (R611).
+   `WtOut`/`CtOut`/`ctrl_timeouts`/`rangedrops`/`dma_fails`/`mmio_fails` 0 throughout.
+   `QfRet` **63/run before vs ~61/run after** (182 across three Fire Strike runs) — R601/R616's
+   backpressure is unchanged. dwm survived the whole soak; zero 4101/dxgkrnl/LiveKernelEvent
+   entries in the System log. Host log: 54 × `OPTIMAL DMA-BUF ready 1896x1030`, same-boot ones on
+   this image, and **no venus decode, "failed to look up object", or validation lines anywhere**.
+   **Measured:** DComp 57.8/50.0 → **58.0/48.5 fps** (unchanged); dwm present-gate
+   **avg 2099 → 1854 µs, timeouts 0.91 % → 0.56 %** (better). Fire Strike Graphics 21024 (n=1,
+   pre) vs 19460/20312/20150 (n=3, post) — **~5 % lower and NOT ATTRIBUTED**: one baseline sample
+   against three, on a host GPU shared with the compositor, and the per-frame present-gate metric
+   moved the other way. Re-baseline it before reading anything into it.
+   **T3's outstanding forced-refusal leg is DISCHARGED**, and the reason it could not be
+   discharged in T3 is now known: `record_scanout_reject_counters` is reachable only from
+   `pacing_snapshot`, which is driven by the count of SUCCESSFUL refreshes — force every
+   `SetVidPnSourceAddress` to refuse and the counters never reach the registry at all. Checking
+   the UNGATED per-refusal breadcrumb instead, **five of six reachable exits FIRE**: 1 BadAlloc
+   (`ScRid` 36→0), 2 Extent (`ScSet` 1→0xD), 3 Layout (→0xE3), 5 LinearAllocFailed (→0xE1),
+   6 SetFailed (→0xE), with `ScFrc` echoing each value. **4 Format is NOT DISCRIMINABLE** — its
+   breadcrumb is `ScFmt = the live dxgi_format` (88, the same value the healthy path leaves) and
+   its arm writes no `ScSet`; the site sits between the two proven ones, so the path is reached.
+   7/8 remain unreachable with a direct primary.
+   ⚠ **NOT performed:** DOOM, suspend/resume, rapid cursor motion (needs an interactive mouse —
+   now FOUR tranches overdue), and the `HELIOS_VKR_DEBUG=validate` host command-mix capture
+   (needs a launcher relaunch, which is owner-owned). New host tests: `kmd_logic` 28→34, `protocol` 3→8.
    **Structure added:** the no-panic rule is now enforced twice (a `verify-no-panics` cargo-make
    task that fails the PACKAGE build, plus `#![deny(clippy::unwrap_used, expect_used, panic)]`) —
    `grep -rn '\.expect(\|\.unwrap()' kmd_render/src` is EMPTY. `Writer` moved to `kmd_logic`
