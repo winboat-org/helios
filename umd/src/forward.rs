@@ -4631,169 +4631,77 @@ unsafe extern "C" fn destroy_shader(h: Hdevice, h_shader: ddi::D3D10DDI_HSHADER)
     release_com(h_shader);
 }
 
-unsafe extern "C" fn vs_set_shader(h: Hdevice, h_shader: ddi::D3D10DDI_HSHADER) {
-    let com = handle_com_raw(h_shader);
-    if let Some(dev) = helios_device(h) {
-        let mut ia = dev.owned.ia.borrow_mut();
-        ia.current_vs = com;
-        ia.bound_vs_com = com;
-    }
-    if SHADER_SET_LOG_COUNT.first_n(512).is_some() {
-        trace_line!("DDI VSSetShader raw=0x{com:x}");
-    }
-    let Some(context) = d3d11_context(h) else {
-        return;
+/// Generate one stage's `pfn*SetShader` entry point.
+///
+/// The DDI table demands six distinct `extern "C"` symbols, so this is a macro
+/// expansion and not a shared function — there is no type-level guarantee to
+/// win here. What it wins is that the fourteen shared lines and the ONE
+/// stage-specific line stop being indistinguishable to a reviewer: `vs` alone
+/// also writes `ia.bound_vs_com` (read by the input-variant recompiler), and
+/// in six copy-pasted bodies that asymmetry looked exactly like the five
+/// others. `also_set:` is now the only visible difference.
+macro_rules! stage_set_shader {
+    ($name:ident, $tag:literal, $current:ident, $com:ty, $method:ident
+     $(, also_set: $extra:ident)?) => {
+        unsafe extern "C" fn $name(h: Hdevice, h_shader: ddi::D3D10DDI_HSHADER) {
+            let com = handle_com_raw(h_shader);
+            if let Some(dev) = helios_device(h) {
+                let mut ia = dev.owned.ia.borrow_mut();
+                ia.$current = com;
+                $(ia.$extra = com;)?
+            }
+            if SHADER_SET_LOG_COUNT.first_n(512).is_some() {
+                trace_line!(concat!("DDI ", $tag, "SetShader raw=0x{:x}"), com);
+            }
+            let Some(context) = d3d11_context(h) else {
+                return;
+            };
+            match load_com::<$com>(h_shader) {
+                Some(s) => context.$method(&*s, None),
+                None => context.$method(None, None),
+            }
+        }
     };
-    match load_com::<ID3D11VertexShader>(h_shader) {
-        Some(s) => context.VSSetShader(&*s, None),
-        None => context.VSSetShader(None, None),
-    }
 }
 
-unsafe extern "C" fn ps_set_shader(h: Hdevice, h_shader: ddi::D3D10DDI_HSHADER) {
-    let com = handle_com_raw(h_shader);
-    if let Some(dev) = helios_device(h) {
-        dev.owned.ia.borrow_mut().current_ps = com;
-    }
-    if SHADER_SET_LOG_COUNT.first_n(512).is_some() {
-        trace_line!("DDI PSSetShader raw=0x{com:x}");
-    }
-    let Some(context) = d3d11_context(h) else {
-        return;
+stage_set_shader!(
+    vs_set_shader, "VS", current_vs, ID3D11VertexShader, VSSetShader,
+    // The one real asymmetry in the family: the input-variant recompiler
+    // (`resolve_vs_input_variant`) reads this to find the bound VS.
+    also_set: bound_vs_com
+);
+stage_set_shader!(ps_set_shader, "PS", current_ps, ID3D11PixelShader, PSSetShader);
+stage_set_shader!(gs_set_shader, "GS", current_gs, ID3D11GeometryShader, GSSetShader);
+stage_set_shader!(hs_set_shader, "HS", current_hs, ID3D11HullShader, HSSetShader);
+stage_set_shader!(ds_set_shader, "DS", current_ds, ID3D11DomainShader, DSSetShader);
+stage_set_shader!(cs_set_shader, "CS", current_cs, ID3D11ComputeShader, CSSetShader);
+
+/// Generate one stage's `pfn*SetShaderWithIfaces` entry point.
+///
+/// Class instances (dynamic shader linkage) are not implemented, so every one
+/// of these forwards to the plain setter and ignores the three interface
+/// arguments. Keeping that as six identical hand-written bodies made it look
+/// like six independent decisions.
+macro_rules! stage_set_shader_with_ifaces {
+    ($name:ident, $plain:ident) => {
+        unsafe extern "C" fn $name(
+            h: Hdevice,
+            h_shader: ddi::D3D10DDI_HSHADER,
+            _num_class_instances: u32,
+            _class_instance_ids: *const u32,
+            _pointer_data: *const ddi::D3D11DDIARG_POINTERDATA,
+        ) {
+            $plain(h, h_shader);
+        }
     };
-    match load_com::<ID3D11PixelShader>(h_shader) {
-        Some(s) => context.PSSetShader(&*s, None),
-        None => context.PSSetShader(None, None),
-    }
 }
 
-unsafe extern "C" fn gs_set_shader(h: Hdevice, h_shader: ddi::D3D10DDI_HSHADER) {
-    let com = handle_com_raw(h_shader);
-    if let Some(dev) = helios_device(h) {
-        dev.owned.ia.borrow_mut().current_gs = com;
-    }
-    if SHADER_SET_LOG_COUNT.first_n(512).is_some() {
-        trace_line!("DDI GSSetShader raw=0x{com:x}");
-    }
-    let Some(context) = d3d11_context(h) else {
-        return;
-    };
-    match load_com::<ID3D11GeometryShader>(h_shader) {
-        Some(s) => context.GSSetShader(&*s, None),
-        None => context.GSSetShader(None, None),
-    }
-}
-
-unsafe extern "C" fn hs_set_shader(h: Hdevice, h_shader: ddi::D3D10DDI_HSHADER) {
-    let com = handle_com_raw(h_shader);
-    if let Some(dev) = helios_device(h) {
-        dev.owned.ia.borrow_mut().current_hs = com;
-    }
-    if SHADER_SET_LOG_COUNT.first_n(512).is_some() {
-        trace_line!("DDI HSSetShader raw=0x{com:x}");
-    }
-    let Some(context) = d3d11_context(h) else {
-        return;
-    };
-    match load_com::<ID3D11HullShader>(h_shader) {
-        Some(s) => context.HSSetShader(&*s, None),
-        None => context.HSSetShader(None, None),
-    }
-}
-
-unsafe extern "C" fn ds_set_shader(h: Hdevice, h_shader: ddi::D3D10DDI_HSHADER) {
-    let com = handle_com_raw(h_shader);
-    if let Some(dev) = helios_device(h) {
-        dev.owned.ia.borrow_mut().current_ds = com;
-    }
-    if SHADER_SET_LOG_COUNT.first_n(512).is_some() {
-        trace_line!("DDI DSSetShader raw=0x{com:x}");
-    }
-    let Some(context) = d3d11_context(h) else {
-        return;
-    };
-    match load_com::<ID3D11DomainShader>(h_shader) {
-        Some(s) => context.DSSetShader(&*s, None),
-        None => context.DSSetShader(None, None),
-    }
-}
-
-unsafe extern "C" fn cs_set_shader(h: Hdevice, h_shader: ddi::D3D10DDI_HSHADER) {
-    let com = handle_com_raw(h_shader);
-    if let Some(dev) = helios_device(h) {
-        dev.owned.ia.borrow_mut().current_cs = com;
-    }
-    if SHADER_SET_LOG_COUNT.first_n(512).is_some() {
-        trace_line!("DDI CSSetShader raw=0x{com:x}");
-    }
-    let Some(context) = d3d11_context(h) else {
-        return;
-    };
-    match load_com::<ID3D11ComputeShader>(h_shader) {
-        Some(s) => context.CSSetShader(&*s, None),
-        None => context.CSSetShader(None, None),
-    }
-}
-
-unsafe extern "C" fn ps_set_shader_with_ifaces(
-    h: Hdevice,
-    h_shader: ddi::D3D10DDI_HSHADER,
-    _num_class_instances: u32,
-    _class_instance_ids: *const u32,
-    _pointer_data: *const ddi::D3D11DDIARG_POINTERDATA,
-) {
-    ps_set_shader(h, h_shader);
-}
-
-unsafe extern "C" fn vs_set_shader_with_ifaces(
-    h: Hdevice,
-    h_shader: ddi::D3D10DDI_HSHADER,
-    _num_class_instances: u32,
-    _class_instance_ids: *const u32,
-    _pointer_data: *const ddi::D3D11DDIARG_POINTERDATA,
-) {
-    vs_set_shader(h, h_shader);
-}
-
-unsafe extern "C" fn gs_set_shader_with_ifaces(
-    h: Hdevice,
-    h_shader: ddi::D3D10DDI_HSHADER,
-    _num_class_instances: u32,
-    _class_instance_ids: *const u32,
-    _pointer_data: *const ddi::D3D11DDIARG_POINTERDATA,
-) {
-    gs_set_shader(h, h_shader);
-}
-
-unsafe extern "C" fn hs_set_shader_with_ifaces(
-    h: Hdevice,
-    h_shader: ddi::D3D10DDI_HSHADER,
-    _num_class_instances: u32,
-    _class_instance_ids: *const u32,
-    _pointer_data: *const ddi::D3D11DDIARG_POINTERDATA,
-) {
-    hs_set_shader(h, h_shader);
-}
-
-unsafe extern "C" fn ds_set_shader_with_ifaces(
-    h: Hdevice,
-    h_shader: ddi::D3D10DDI_HSHADER,
-    _num_class_instances: u32,
-    _class_instance_ids: *const u32,
-    _pointer_data: *const ddi::D3D11DDIARG_POINTERDATA,
-) {
-    ds_set_shader(h, h_shader);
-}
-
-unsafe extern "C" fn cs_set_shader_with_ifaces(
-    h: Hdevice,
-    h_shader: ddi::D3D10DDI_HSHADER,
-    _num_class_instances: u32,
-    _class_instance_ids: *const u32,
-    _pointer_data: *const ddi::D3D11DDIARG_POINTERDATA,
-) {
-    cs_set_shader(h, h_shader);
-}
+stage_set_shader_with_ifaces!(ps_set_shader_with_ifaces, ps_set_shader);
+stage_set_shader_with_ifaces!(vs_set_shader_with_ifaces, vs_set_shader);
+stage_set_shader_with_ifaces!(gs_set_shader_with_ifaces, gs_set_shader);
+stage_set_shader_with_ifaces!(hs_set_shader_with_ifaces, hs_set_shader);
+stage_set_shader_with_ifaces!(ds_set_shader_with_ifaces, ds_set_shader);
+stage_set_shader_with_ifaces!(cs_set_shader_with_ifaces, cs_set_shader);
 
 // --- Output-merger / rasterizer state setters -------------------------------
 
@@ -6061,66 +5969,32 @@ unsafe fn collect_samplers(
     })
 }
 
-unsafe extern "C" fn ps_set_constant_buffers(
-    h: Hdevice,
-    start: u32,
-    num: u32,
-    bufs: *const ddi::D3D10DDI_HRESOURCE,
-) {
-    if let Some(c) = d3d11_context(h) {
-        c.PSSetConstantBuffers(start, Some(&collect_buffers(start, num, bufs)));
-    }
+/// Generate one stage's `pfn*SetConstantBuffers` entry point.
+///
+/// Six identical bodies differing only in the context method. `collect_buffers`
+/// already single-sources the slot decode and its null policy; this removes the
+/// remaining wrapper.
+macro_rules! stage_set_constant_buffers {
+    ($name:ident, $method:ident) => {
+        unsafe extern "C" fn $name(
+            h: Hdevice,
+            start: u32,
+            num: u32,
+            bufs: *const ddi::D3D10DDI_HRESOURCE,
+        ) {
+            if let Some(c) = d3d11_context(h) {
+                c.$method(start, Some(&collect_buffers(start, num, bufs)));
+            }
+        }
+    };
 }
-unsafe extern "C" fn vs_set_constant_buffers(
-    h: Hdevice,
-    start: u32,
-    num: u32,
-    bufs: *const ddi::D3D10DDI_HRESOURCE,
-) {
-    if let Some(c) = d3d11_context(h) {
-        c.VSSetConstantBuffers(start, Some(&collect_buffers(start, num, bufs)));
-    }
-}
-unsafe extern "C" fn gs_set_constant_buffers(
-    h: Hdevice,
-    start: u32,
-    num: u32,
-    bufs: *const ddi::D3D10DDI_HRESOURCE,
-) {
-    if let Some(c) = d3d11_context(h) {
-        c.GSSetConstantBuffers(start, Some(&collect_buffers(start, num, bufs)));
-    }
-}
-unsafe extern "C" fn hs_set_constant_buffers(
-    h: Hdevice,
-    start: u32,
-    num: u32,
-    bufs: *const ddi::D3D10DDI_HRESOURCE,
-) {
-    if let Some(c) = d3d11_context(h) {
-        c.HSSetConstantBuffers(start, Some(&collect_buffers(start, num, bufs)));
-    }
-}
-unsafe extern "C" fn ds_set_constant_buffers(
-    h: Hdevice,
-    start: u32,
-    num: u32,
-    bufs: *const ddi::D3D10DDI_HRESOURCE,
-) {
-    if let Some(c) = d3d11_context(h) {
-        c.DSSetConstantBuffers(start, Some(&collect_buffers(start, num, bufs)));
-    }
-}
-unsafe extern "C" fn cs_set_constant_buffers(
-    h: Hdevice,
-    start: u32,
-    num: u32,
-    bufs: *const ddi::D3D10DDI_HRESOURCE,
-) {
-    if let Some(c) = d3d11_context(h) {
-        c.CSSetConstantBuffers(start, Some(&collect_buffers(start, num, bufs)));
-    }
-}
+
+stage_set_constant_buffers!(ps_set_constant_buffers, PSSetConstantBuffers);
+stage_set_constant_buffers!(vs_set_constant_buffers, VSSetConstantBuffers);
+stage_set_constant_buffers!(gs_set_constant_buffers, GSSetConstantBuffers);
+stage_set_constant_buffers!(hs_set_constant_buffers, HSSetConstantBuffers);
+stage_set_constant_buffers!(ds_set_constant_buffers, DSSetConstantBuffers);
+stage_set_constant_buffers!(cs_set_constant_buffers, CSSetConstantBuffers);
 
 /// The six programmable shader stages the D3D11 DDI binds to.
 ///
@@ -6212,80 +6086,63 @@ unsafe fn set_constant_buffers1_common(
     }
 }
 
-unsafe extern "C" fn vs_set_constant_buffers1(
-    h: Hdevice,
-    start: u32,
-    num: u32,
-    bufs: *const ddi::D3D10DDI_HRESOURCE,
-    first_constants: *const u32,
-    num_constants: *const u32,
-) {
-    set_constant_buffers1_common(h, ShaderStage::Vs, start, num, bufs, first_constants, num_constants);
+/// Generate one stage's `pfn*SetConstantBuffers1` entry point.
+///
+/// The BODY here was already single-sourced -- T5/R827 replaced the
+/// `stage: &str` dispatch and its fail-open `_ => {}` arm with the exhaustive
+/// `ShaderStage` enum, so the review's one claimed static gain for this family
+/// is already banked. `ShaderStage` deliberately SURVIVES: this removes only
+/// the eight-line signature boilerplate, six times over, and leaves the typed
+/// dispatch that makes "adding a stage silently binds nothing" a compile
+/// error.
+macro_rules! stage_set_constant_buffers1 {
+    ($name:ident, $stage:ident) => {
+        unsafe extern "C" fn $name(
+            h: Hdevice,
+            start: u32,
+            num: u32,
+            bufs: *const ddi::D3D10DDI_HRESOURCE,
+            first_constants: *const u32,
+            num_constants: *const u32,
+        ) {
+            set_constant_buffers1_common(
+                h,
+                ShaderStage::$stage,
+                start,
+                num,
+                bufs,
+                first_constants,
+                num_constants,
+            );
+        }
+    };
 }
 
-unsafe extern "C" fn ps_set_constant_buffers1(
-    h: Hdevice,
-    start: u32,
-    num: u32,
-    bufs: *const ddi::D3D10DDI_HRESOURCE,
-    first_constants: *const u32,
-    num_constants: *const u32,
-) {
-    set_constant_buffers1_common(h, ShaderStage::Ps, start, num, bufs, first_constants, num_constants);
+stage_set_constant_buffers1!(vs_set_constant_buffers1, Vs);
+stage_set_constant_buffers1!(ps_set_constant_buffers1, Ps);
+stage_set_constant_buffers1!(gs_set_constant_buffers1, Gs);
+stage_set_constant_buffers1!(hs_set_constant_buffers1, Hs);
+stage_set_constant_buffers1!(ds_set_constant_buffers1, Ds);
+stage_set_constant_buffers1!(cs_set_constant_buffers1, Cs);
+
+/// Generate one stage's `pfn*SetShaderResources` entry point.
+///
+/// As with `SetConstantBuffers1`, the body was already single-sourced by
+/// T5/R827's `ShaderStage`; this removes the repeated signature only.
+macro_rules! stage_set_shader_resources {
+    ($name:ident, $stage:ident) => {
+        unsafe extern "C" fn $name(
+            h: Hdevice,
+            start: u32,
+            num: u32,
+            srvs: *const ddi::D3D10DDI_HSHADERRESOURCEVIEW,
+        ) {
+            set_shader_resources_common(h, ShaderStage::$stage, start, num, srvs);
+        }
+    };
 }
 
-unsafe extern "C" fn gs_set_constant_buffers1(
-    h: Hdevice,
-    start: u32,
-    num: u32,
-    bufs: *const ddi::D3D10DDI_HRESOURCE,
-    first_constants: *const u32,
-    num_constants: *const u32,
-) {
-    set_constant_buffers1_common(h, ShaderStage::Gs, start, num, bufs, first_constants, num_constants);
-}
-
-unsafe extern "C" fn hs_set_constant_buffers1(
-    h: Hdevice,
-    start: u32,
-    num: u32,
-    bufs: *const ddi::D3D10DDI_HRESOURCE,
-    first_constants: *const u32,
-    num_constants: *const u32,
-) {
-    set_constant_buffers1_common(h, ShaderStage::Hs, start, num, bufs, first_constants, num_constants);
-}
-
-unsafe extern "C" fn ds_set_constant_buffers1(
-    h: Hdevice,
-    start: u32,
-    num: u32,
-    bufs: *const ddi::D3D10DDI_HRESOURCE,
-    first_constants: *const u32,
-    num_constants: *const u32,
-) {
-    set_constant_buffers1_common(h, ShaderStage::Ds, start, num, bufs, first_constants, num_constants);
-}
-
-unsafe extern "C" fn cs_set_constant_buffers1(
-    h: Hdevice,
-    start: u32,
-    num: u32,
-    bufs: *const ddi::D3D10DDI_HRESOURCE,
-    first_constants: *const u32,
-    num_constants: *const u32,
-) {
-    set_constant_buffers1_common(h, ShaderStage::Cs, start, num, bufs, first_constants, num_constants);
-}
-
-unsafe extern "C" fn ps_set_shader_resources(
-    h: Hdevice,
-    start: u32,
-    num: u32,
-    srvs: *const ddi::D3D10DDI_HSHADERRESOURCEVIEW,
-) {
-    set_shader_resources_common(h, ShaderStage::Ps, start, num, srvs);
-}
+stage_set_shader_resources!(ps_set_shader_resources, Ps);
 
 unsafe fn set_shader_resources_common(
     h: Hdevice,
@@ -6315,106 +6172,33 @@ unsafe fn set_shader_resources_common(
         ShaderStage::Cs => c.CSSetShaderResources(start, Some(&views)),
     }
 }
-unsafe extern "C" fn vs_set_shader_resources(
-    h: Hdevice,
-    start: u32,
-    num: u32,
-    srvs: *const ddi::D3D10DDI_HSHADERRESOURCEVIEW,
-) {
-    set_shader_resources_common(h, ShaderStage::Vs, start, num, srvs);
+stage_set_shader_resources!(vs_set_shader_resources, Vs);
+stage_set_shader_resources!(gs_set_shader_resources, Gs);
+stage_set_shader_resources!(hs_set_shader_resources, Hs);
+stage_set_shader_resources!(ds_set_shader_resources, Ds);
+stage_set_shader_resources!(cs_set_shader_resources, Cs);
+/// Generate one stage's `pfn*SetSamplers` entry point.
+macro_rules! stage_set_samplers {
+    ($name:ident, $method:ident) => {
+        unsafe extern "C" fn $name(
+            h: Hdevice,
+            start: u32,
+            num: u32,
+            samplers: *const ddi::D3D10DDI_HSAMPLER,
+        ) {
+            if let Some(c) = d3d11_context(h) {
+                c.$method(start, Some(&collect_samplers(num, samplers)));
+            }
+        }
+    };
 }
-unsafe extern "C" fn gs_set_shader_resources(
-    h: Hdevice,
-    start: u32,
-    num: u32,
-    srvs: *const ddi::D3D10DDI_HSHADERRESOURCEVIEW,
-) {
-    set_shader_resources_common(h, ShaderStage::Gs, start, num, srvs);
-}
-unsafe extern "C" fn hs_set_shader_resources(
-    h: Hdevice,
-    start: u32,
-    num: u32,
-    srvs: *const ddi::D3D10DDI_HSHADERRESOURCEVIEW,
-) {
-    set_shader_resources_common(h, ShaderStage::Hs, start, num, srvs);
-}
-unsafe extern "C" fn ds_set_shader_resources(
-    h: Hdevice,
-    start: u32,
-    num: u32,
-    srvs: *const ddi::D3D10DDI_HSHADERRESOURCEVIEW,
-) {
-    set_shader_resources_common(h, ShaderStage::Ds, start, num, srvs);
-}
-unsafe extern "C" fn cs_set_shader_resources(
-    h: Hdevice,
-    start: u32,
-    num: u32,
-    srvs: *const ddi::D3D10DDI_HSHADERRESOURCEVIEW,
-) {
-    set_shader_resources_common(h, ShaderStage::Cs, start, num, srvs);
-}
-unsafe extern "C" fn ps_set_samplers(
-    h: Hdevice,
-    start: u32,
-    num: u32,
-    samplers: *const ddi::D3D10DDI_HSAMPLER,
-) {
-    if let Some(c) = d3d11_context(h) {
-        c.PSSetSamplers(start, Some(&collect_samplers(num, samplers)));
-    }
-}
-unsafe extern "C" fn vs_set_samplers(
-    h: Hdevice,
-    start: u32,
-    num: u32,
-    samplers: *const ddi::D3D10DDI_HSAMPLER,
-) {
-    if let Some(c) = d3d11_context(h) {
-        c.VSSetSamplers(start, Some(&collect_samplers(num, samplers)));
-    }
-}
-unsafe extern "C" fn gs_set_samplers(
-    h: Hdevice,
-    start: u32,
-    num: u32,
-    samplers: *const ddi::D3D10DDI_HSAMPLER,
-) {
-    if let Some(c) = d3d11_context(h) {
-        c.GSSetSamplers(start, Some(&collect_samplers(num, samplers)));
-    }
-}
-unsafe extern "C" fn hs_set_samplers(
-    h: Hdevice,
-    start: u32,
-    num: u32,
-    samplers: *const ddi::D3D10DDI_HSAMPLER,
-) {
-    if let Some(c) = d3d11_context(h) {
-        c.HSSetSamplers(start, Some(&collect_samplers(num, samplers)));
-    }
-}
-unsafe extern "C" fn ds_set_samplers(
-    h: Hdevice,
-    start: u32,
-    num: u32,
-    samplers: *const ddi::D3D10DDI_HSAMPLER,
-) {
-    if let Some(c) = d3d11_context(h) {
-        c.DSSetSamplers(start, Some(&collect_samplers(num, samplers)));
-    }
-}
-unsafe extern "C" fn cs_set_samplers(
-    h: Hdevice,
-    start: u32,
-    num: u32,
-    samplers: *const ddi::D3D10DDI_HSAMPLER,
-) {
-    if let Some(c) = d3d11_context(h) {
-        c.CSSetSamplers(start, Some(&collect_samplers(num, samplers)));
-    }
-}
+
+stage_set_samplers!(ps_set_samplers, PSSetSamplers);
+stage_set_samplers!(vs_set_samplers, VSSetSamplers);
+stage_set_samplers!(gs_set_samplers, GSSetSamplers);
+stage_set_samplers!(hs_set_samplers, HSSetSamplers);
+stage_set_samplers!(ds_set_samplers, DSSetSamplers);
+stage_set_samplers!(cs_set_samplers, CSSetSamplers);
 
 unsafe extern "C" fn resource_update_subresource(
     h: Hdevice,
