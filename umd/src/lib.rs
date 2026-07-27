@@ -34,6 +34,7 @@ use std::io::Write;
 mod bridge;
 mod ddi;
 mod device_funcs;
+mod format;
 mod forward;
 mod hr;
 mod knobs;

@@ -351,150 +351,67 @@ struct StandardAllocMetaV1 {
     pitch: u32,
 }
 
+// The eight range tables that used to sit here are one row per format in
+// `crate::format`, which also carries the `0..=200` equivalence test that pins
+// every answer to the pre-change predicate. These are the thin adapters that
+// keep the call sites reading as they did.
+
+use crate::format;
+
 fn dxgi_to_d3dddi_format(format: u32) -> u32 {
     // KMD DescribeAllocation consumes legacy D3DDDIFORMAT values, not DXGI_FORMAT.
-    const DXGI_FORMAT_R8G8B8A8_UNORM: u32 = 28;
-    const DXGI_FORMAT_B8G8R8A8_UNORM: u32 = 87;
-    const D3DDDIFMT_A8R8G8B8: u32 = 21;
-    const D3DDDIFMT_A8B8G8R8: u32 = 32;
-
-    match format {
-        DXGI_FORMAT_R8G8B8A8_UNORM => D3DDDIFMT_A8B8G8R8,
-        DXGI_FORMAT_B8G8R8A8_UNORM => D3DDDIFMT_A8R8G8B8,
-        _ => 0,
-    }
+    format::to_d3dddi(format)
 }
 
-fn d3dddi_to_dxgi_format(format: u32) -> DXGI_FORMAT {
-    const D3DDDIFMT_A8R8G8B8: u32 = 21;
-    const D3DDDIFMT_A8B8G8R8: u32 = 32;
-
-    match format {
-        D3DDDIFMT_A8R8G8B8 => windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
-        D3DDDIFMT_A8B8G8R8 => windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM,
-        _ => windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
-    }
+fn d3dddi_to_dxgi_format(fmt: u32) -> DXGI_FORMAT {
+    DXGI_FORMAT(format::from_d3dddi(fmt) as i32)
 }
 
 /// Bytes per pixel of an (uncompressed) `DXGI_FORMAT`, for computing the WDDM
-/// surface pitch. Only the single-byte channel block (R8_*/A8/R1, 60..=66) and
-/// the wider HDR/deep formats matter for DWM composition; everything else
-/// defaults to 4 (32-bpp BGRA/RGBA — the historical assumption). Over-reporting
-/// is safe (the pitch only pads `linear_size`); under-reporting an A8 mask as
-/// 4bpp is what made openers size these surfaces 4x too large.
-fn dxgi_bytes_per_pixel(format: u32) -> u32 {
-    match format {
-        1..=4 => 16,  // R32G32B32A32_*
-        5..=8 => 12,  // R32G32B32_*
-        9..=14 => 8,  // R16G16B16A16_*
-        15..=19 => 8, // R32G32_*, R32G8X24 depth
-        60..=66 => 1, // R8_TYPELESS/UNORM/UINT/SNORM/SINT, A8_UNORM, R1_UNORM
-        _ => 4,
-    }
+/// surface pitch.
+fn dxgi_bytes_per_pixel(fmt: u32) -> u32 {
+    format::bytes_per_pixel(fmt)
 }
 
 /// Bits per sample for the uncompressed DXGI formats that can participate in
-/// D3D11 output/MSAA validation. Compressed/video-only formats are intentionally
-/// absent because the runtime must not require MSAA for them.
-fn dxgi_bits_per_sample(format: u32) -> Option<u32> {
-    match format {
-        1..=4 => Some(128),        // R32G32B32A32_*
-        5..=8 => Some(96),         // R32G32B32_*
-        9..=18 => Some(64),        // R16G16B16A16_*, R32G32_*
-        19..=22 => Some(64),       // R32G8X24 / D32_FLOAT_S8X24 family
-        23..=32 => Some(32),       // R10G10B10A2, R11G11B10, R8G8B8A8
-        33..=47 => Some(32),       // R16G16, R32, R24G8
-        48..=59 => Some(16),       // R8G8, R16 / D16
-        60..=65 => Some(8),        // R8, A8
-        85 | 86 | 115 => Some(16), // B5G6R5, B5G5R5A1, B4G4R4A4
-        87..=93 => Some(32),       // BGRA/RGBX and XR_BIAS
-        _ => None,
-    }
+/// D3D11 output/MSAA validation.
+fn dxgi_bits_per_sample(fmt: u32) -> Option<u32> {
+    format::bits_per_sample(fmt)
 }
 
-fn dxgi_output_family_bits(format: u32) -> Option<u32> {
-    match format {
-        1..=4 => Some(128),            // R32G32B32A32 family
-        5..=8 => Some(96),             // R32G32B32 family
-        9..=18 => Some(64),            // R16G16B16A16 / R32G32 families
-        19..=22 => Some(64),           // R32G8X24 / D32_FLOAT_S8X24 family
-        23..=32 => Some(32),           // R10G10B10A2, R8G8B8A8 families
-        33..=47 => Some(32),           // R16G16, R32, R24G8 families
-        48..=59 => Some(16),           // R8G8, R16 / D16 families
-        60..=64 => Some(8),            // R8 family
-        87 | 88 | 90..=93 => Some(32), // BGRA/RGBX families
-        _ => None,
-    }
+fn dxgi_output_family_bits(fmt: u32) -> Option<u32> {
+    format::output_family_bits(fmt)
 }
 
-fn dxgi_output_bits_per_sample(format: u32, caps: u32) -> Option<u32> {
+fn dxgi_output_bits_per_sample(fmt: u32, caps: u32) -> Option<u32> {
     const D3D11_FORMAT_SUPPORT_RENDER_TARGET: u32 = 0x0000_4000;
     const D3D11_FORMAT_SUPPORT_DEPTH_STENCIL: u32 = 0x0001_0000;
 
     if caps & (D3D11_FORMAT_SUPPORT_RENDER_TARGET | D3D11_FORMAT_SUPPORT_DEPTH_STENCIL) != 0 {
-        dxgi_bits_per_sample(format)
+        dxgi_bits_per_sample(fmt)
     } else {
-        dxgi_output_family_bits(format)
+        dxgi_output_family_bits(fmt)
     }
 }
 
-fn dxgi_msaa_bits_per_sample(format: u32, caps: u32) -> Option<u32> {
-    match format {
-        // Depth-resource read/view formats are format-support siblings of the
-        // MSAA-capable typeless/depth formats, but WARP reports zero quality
-        // levels above 1x and the runtime rejects advertising them as MSAA RTs.
-        21 | 22 | 46 | 47 => None,
-        _ => dxgi_output_bits_per_sample(format, caps),
+fn dxgi_msaa_bits_per_sample(fmt: u32, caps: u32) -> Option<u32> {
+    if format::msaa_ineligible(fmt) {
+        None
+    } else {
+        dxgi_output_bits_per_sample(fmt, caps)
     }
 }
 
-fn dxgi_resolve_required(format: u32) -> bool {
-    match format {
-        // FLOAT families.
-        2 | 6 | 10 | 16 | 26 | 34 | 41 | 54 => true,
-        // UNORM / UNORM_SRGB families.
-        11 | 24 | 28 | 29 | 35 | 45 | 46 | 49 | 55 | 56 | 61 | 85 | 86 | 87 | 88 | 89 | 91 | 93
-        | 115 => true,
-        // SNORM families.
-        13 | 31 | 37 | 51 | 58 | 63 => true,
-        // Typeless parents whose output views include at least one resolvable
-        // UNORM/SNORM/FLOAT interpretation.
-        1 | 5 | 9 | 15 | 19 | 23 | 27 | 33 | 39 | 44 | 48 | 53 | 60 | 90 | 92 => true,
-        _ => false,
-    }
+fn dxgi_resolve_required(fmt: u32) -> bool {
+    format::resolve_required(fmt)
 }
 
-fn dxgi_color_typeless_parent(format: u32) -> bool {
-    matches!(
-        format,
-        1 | 5 | 9 | 15 | 23 | 27 | 33 | 48 | 53 | 60 | 90 | 92
-    )
+fn dxgi_color_typeless_parent(fmt: u32) -> bool {
+    format::color_typeless_parent(fmt)
 }
 
-fn dxgi_integer_typed_format(format: u32) -> bool {
-    matches!(
-        format,
-        3 | 4
-            | 7
-            | 8
-            | 12
-            | 14
-            | 17
-            | 18
-            | 25
-            | 30
-            | 32
-            | 36
-            | 38
-            | 42
-            | 43
-            | 50
-            | 52
-            | 57
-            | 59
-            | 62
-            | 64
-    )
+fn dxgi_integer_typed_format(fmt: u32) -> bool {
+    format::integer_typed(fmt)
 }
 
 /// Parse the meta trailer at `base_off` bytes into the buffer, tolerating the
