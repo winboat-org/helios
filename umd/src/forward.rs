@@ -597,11 +597,10 @@ unsafe fn d3d11_device(h: Hdevice) -> Option<ManuallyDrop<ID3D11Device>> {
     if hd.is_null() {
         return None;
     }
-    let p = (*hd).dxvk.d3d11_device_ptr();
-    if p == 0 {
-        return None;
-    }
-    Some(ManuallyDrop::new(ID3D11Device::from_raw(p as *mut c_void)))
+    // Borrowed, not adopted: the bridge keeps the owning reference. The
+    // ManuallyDrop lives inside the wrapper now, so this cannot be written as
+    // an adopting `from_raw` by a future edit. R813.
+    (*hd).dxvk.d3d11_device()
 }
 
 /// Borrow the `HeliosDevice` behind a device handle (for the deferred
@@ -648,13 +647,7 @@ unsafe fn d3d11_context(h: Hdevice) -> Option<ManuallyDrop<ID3D11DeviceContext>>
     if hd.is_null() {
         return None;
     }
-    let p = (*hd).dxvk.d3d11_context_ptr();
-    if p == 0 {
-        return None;
-    }
-    Some(ManuallyDrop::new(ID3D11DeviceContext::from_raw(
-        p as *mut c_void,
-    )))
+    (*hd).dxvk.d3d11_context()
 }
 
 unsafe fn d3d11_context1(h: Hdevice) -> Option<ID3D11DeviceContext1> {
@@ -1083,21 +1076,16 @@ unsafe fn ensure_kmd_scanout_target(h: Hdevice) -> bool {
         }
     }
 
-    let mut resource_id = 0u32;
-    let mut width = 0u32;
-    let mut height = 0u32;
-    let mut pitch = 0u32;
-    let mut generation = 0u32;
-    let raw = unsafe {
-        dev.dxvk.open_kmd_scanout_target(
-            &mut resource_id,
-            &mut width,
-            &mut height,
-            &mut pitch,
-            &mut generation,
-        )
-    };
-    if raw == 0 {
+    // The wrapper adopts the reference and returns the geometry together with
+    // it, so the five out-params cannot be read after a failed open (when they
+    // are whatever the bridge zeroed them to). R813.
+    let opened = dev.dxvk.open_scanout_target();
+    let (resource_id, width, height, pitch, generation) = opened
+        .as_ref()
+        .map_or((0, 0, 0, 0, 0), |(_, i)| {
+            (i.resource_id, i.width, i.height, i.pitch, i.generation)
+        });
+    if opened.is_none() {
         dev.scanout_probe
             .set(crate::device_funcs::ScanoutProbe::Unavailable { at_epoch: epoch });
         if let Some(n) = SCANOUT_UNAVAILABLE_LOG_COUNT.first_n_then_every(16, 512) {
@@ -1109,8 +1097,10 @@ unsafe fn ensure_kmd_scanout_target(h: Hdevice) -> bool {
         return false;
     }
 
-    // SAFETY: the bridge returns one owned ID3D11Resource reference.
-    let import = unsafe { ID3D11Resource::from_raw(raw as *mut c_void) };
+    let Some((import, _)) = opened else {
+        return false;
+    };
+    let raw = import.as_raw() as usize;
     let (Some(width_nz), Some(height_nz)) = (
         core::num::NonZeroU32::new(width),
         core::num::NonZeroU32::new(height),
@@ -2602,20 +2592,19 @@ unsafe extern "C" fn create_resource(
                 // DMA_BUF with the original blob allocation size. This avoids a
                 // guest copy and any virtio protocol field or global modifier
                 // extension. The host display backend currently reads it back.
-                let mut rp: u64 = 0;
-                let mut off: u64 = 0;
-                let raw = match helios_device(h) {
-                    Some(dev) => dev.dxvk.create_ddi_scanout_texture2d(
+                // The wrapper adopts the reference and returns the metadata
+                // with it, so `rp`/`off` cannot be read on the failure path.
+                // R813.
+                let created = helios_device(h).and_then(|dev| {
+                    dev.dxvk.create_scanout_texture2d(
                         mip0.TexelWidth,
                         mip0.TexelHeight,
                         a.Format as u32,
                         bind,
                         misc,
-                        &mut rp,
-                        &mut off,
-                    ),
-                    None => 0,
-                };
+                    )
+                });
+                let (rp, off) = created.as_ref().map_or((0, 0), |(_, p, o)| (*p, *o));
                 // BEHAVIOUR CHANGE (R806 sub-commit 2): a zero row pitch is a
                 // failed scan-out-primary create, not a primary with no
                 // geometry. Previously only `raw != 0` was checked, so a
@@ -2633,22 +2622,31 @@ unsafe extern "C" fn create_resource(
                 // closes the cross-FFI contract dependency rather than a live
                 // bug, which is why the counter is expected to stay 0.
                 let geometry = ScanoutGeometry::new(rp as u32, off);
-                if raw != 0 && geometry.is_some() {
+                // One match over the pair, so the created resource is moved
+                // into exactly one arm and the refusal arm still owns it (and
+                // therefore still releases it).
+                match (created, geometry) {
+                    (Some((res, _, _)), Some(geometry)) => {
                     log_error!(
                         "DDI create_resource(tex2d): direct scan-out primary {}x{} fmt={} logicalPitch={} offset={} (OPTIMAL DMA_BUF)",
                         mip0.TexelWidth, mip0.TexelHeight, a.Format, rp, off
                     );
-                    let res = ID3D11Resource::from_raw(raw as *mut c_void);
-                    finish_wddm_tex2d(h, a, &mip0, h_rt, h_resource, res, true, geometry);
-                } else {
+                        finish_wddm_tex2d(
+                            h, a, &mip0, h_rt, h_resource, res, true, Some(geometry),
+                        );
+                    }
+                    (created, _) => {
                     // Loud failure over fake success: do NOT fall back to a plain
                     // primary — that reintroduces the black scan-out as a "working"
                     // desktop. A failure here is a real direct-scanout regression.
-                    if raw != 0 {
+                    if let Some((res, _, _)) = created {
                         // The new arm: the bridge handed back a resource but no
-                        // usable stride. Release it -- nothing else will.
+                        // usable stride. Dropping the adopted wrapper releases
+                        // it -- nothing else will. R813 removed the manual
+                        // IUnknown::from_raw this used to need.
                         SCANOUT_PRIMARY_ZERO_PITCH.fetch_add(1, Ordering::Relaxed);
-                        drop(IUnknown::from_raw(raw as *mut c_void));
+                        let raw = res.as_raw() as usize;
+                        drop(res);
                         log_error!(
                             "DDI create_resource(tex2d): SCAN-OUT PRIMARY ZERO PITCH {}x{} fmt={} raw=0x{:x} offset={} -> refused (zero_pitch={})",
                             mip0.TexelWidth,
@@ -2670,6 +2668,7 @@ unsafe extern "C" fn create_resource(
                     // CreateTexture2D's documented return set; the bridge
                     // returns 0 with no HRESULT to map through.
                     set_runtime_error(h, E_OUTOFMEMORY);
+                    }
                 }
                 handled = true;
             }
@@ -3111,7 +3110,7 @@ unsafe extern "C" fn open_resource(
     // Ordinary shared images always retain their creator's OPTIMAL contract.
     // Production scanout uses a separate KMD-owned plain-LINEAR target; never
     // rebuild DWM imports as DRM-modifier images (the .38 regression).
-    let raw = dev.dxvk.open_ddi_texture2d(
+    let opened = dev.dxvk.open_texture2d(
         meta.width.max(1),
         meta.height.max(1),
         open_dxgi_format,
@@ -3125,7 +3124,7 @@ unsafe extern "C" fn open_resource(
         false,
         cross_context_optimal,
     );
-    if raw == 0 {
+    if opened.is_none() {
         // Import of a KMD-validated-live resource failed: a real bug, not a
         // condition to paper over with substitute content (audit C1.3).
         log_error!(
@@ -3136,7 +3135,10 @@ unsafe extern "C" fn open_resource(
         return;
     }
 
-    let res = ID3D11Resource::from_raw(raw as *mut c_void);
+    let Some(res) = opened else {
+        return;
+    };
+    let raw = res.as_raw() as usize;
     stamp_dxvk_resource_kmt_handles(h, &res, allocation, a.hKMResource.handle);
     let resident = match unsafe { make_resident(dev, allocation) } {
         Ok(resident) => resident,
@@ -9453,7 +9455,7 @@ unsafe fn vehicle_present_prepare(
         }
     };
     if imported_raw == 0 {
-        let raw = dev.dxvk.open_ddi_texture2d(
+        let opened = dev.dxvk.open_texture2d(
             info.width,
             info.height,
             info.dxgi_format,
@@ -9470,7 +9472,7 @@ unsafe fn vehicle_present_prepare(
             false,
             false,
         );
-        if raw == 0 {
+        let Some(imported) = opened else {
             let n = EXT_IMPORT_FAILS.fetch_add(1, Ordering::Relaxed);
             if n < 16 || n % 512 == 0 {
                 log_error!(
@@ -9485,7 +9487,10 @@ unsafe fn vehicle_present_prepare(
                 );
             }
             return Err(E_FAIL);
-        }
+        };
+        // PresentSrcEntry owns the reference from here; into_raw hands it over
+        // so the adopted wrapper does not release it on drop.
+        let raw = imported.into_raw() as usize;
         let mut cache = dev.owned.present_src_cache.borrow_mut();
         if cache.len() >= 16 {
             cache.remove(0);

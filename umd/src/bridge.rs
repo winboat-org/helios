@@ -218,3 +218,174 @@ pub mod ffi {
         fn helios_dxvk_create_device(luid_low: u32, luid_high: i32) -> UniquePtr<HeliosDxvkDevice>;
     }
 }
+
+// ---------------------------------------------------------------------------
+// Safe wrappers: one owned/borrowed decision per bridge entry point.
+// ---------------------------------------------------------------------------
+//
+// Thirteen bridge methods return a COM pointer as a bare `usize`. Two are
+// BORROWED -- the bridge keeps the owning reference -- and eleven are OWNED and
+// the Rust side must `Release`. Before R813 that discipline was a doc comment on
+// one side and a `// SAFETY:` comment on the other, repeated at every call site.
+// Every existing site was correct; the exposure was entirely future sites, and
+// both failure modes are silent:
+//
+//   * adopting a borrowed pointer  -> a double release. `ID3D11Resource::
+//     from_raw(dev.dxvk.d3d11_device_ptr() as *mut c_void)` is type-correct,
+//     compiles, and drops the device's only reference at end of scope --
+//     destroying the D3D11 device under a running DDI.
+//   * wrapping an owned pointer in `ManuallyDrop` -> a leak.
+//
+// Each surfaces as a much later crash in dwm. The wrappers below make the
+// correct adoption exist in exactly ONE place per entry point; R815 is what
+// makes the wrong one unreachable.
+
+use core::ffi::c_void;
+use core::mem::ManuallyDrop;
+
+use windows::core::Interface;
+use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11DeviceContext, ID3D11Resource};
+
+/// Adopt an owned COM pointer the bridge returned, or `None` for its 0-failure
+/// sentinel. The single `from_raw` for every owning bridge entry point.
+///
+/// # Safety
+/// `raw`, when non-zero, must be an `ID3D11Resource*` whose reference the
+/// bridge transferred to this caller.
+unsafe fn adopt_resource(raw: usize) -> Option<ID3D11Resource> {
+    (raw != 0).then(|| unsafe { ID3D11Resource::from_raw(raw as *mut c_void) })
+}
+
+impl ffi::HeliosDxvkDevice {
+    // -- borrowed ----------------------------------------------------------
+    //
+    // `ManuallyDrop` is the whole point: the bridge owns the reference, so the
+    // returned wrapper must never release it.
+
+    pub(crate) fn d3d11_device(&self) -> Option<ManuallyDrop<ID3D11Device>> {
+        let p = self.d3d11_device_ptr();
+        // SAFETY: a non-zero `d3d11_device_ptr` is the bridge's live
+        // ID3D11Device, kept alive by the bridge for as long as this device
+        // exists. ManuallyDrop borrows it without taking a reference.
+        (p != 0).then(|| ManuallyDrop::new(unsafe { ID3D11Device::from_raw(p as *mut c_void) }))
+    }
+
+    pub(crate) fn d3d11_context(&self) -> Option<ManuallyDrop<ID3D11DeviceContext>> {
+        let p = self.d3d11_context_ptr();
+        // SAFETY: as above, for the immediate context.
+        (p != 0)
+            .then(|| ManuallyDrop::new(unsafe { ID3D11DeviceContext::from_raw(p as *mut c_void) }))
+    }
+
+    // -- owned -------------------------------------------------------------
+
+    /// # Safety
+    /// Caller upholds `open_ddi_texture2d`'s preconditions (a live KMT handle
+    /// and a renderer resource id the host still has).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn open_texture2d(
+        &self,
+        width: u32,
+        height: u32,
+        format: u32,
+        bind_flags: u32,
+        misc_flags: u32,
+        global: u32,
+        renderer_resource_id: u32,
+        venus_alloc_size: u64,
+        memory_type_index: u32,
+        scanout_linear: bool,
+        linear_scanout_target: bool,
+        cross_context_optimal: bool,
+    ) -> Option<ID3D11Resource> {
+        // SAFETY: the bridge transfers one reference on success.
+        unsafe {
+            adopt_resource(self.open_ddi_texture2d(
+                width,
+                height,
+                format,
+                bind_flags,
+                misc_flags,
+                global,
+                renderer_resource_id,
+                venus_alloc_size,
+                memory_type_index,
+                scanout_linear,
+                linear_scanout_target,
+                cross_context_optimal,
+            ))
+        }
+    }
+
+    /// Geometry of the KMD VidPn primary, plus one owned import of it.
+    ///
+    /// The five out-params become a returned tuple so a caller cannot read them
+    /// after a failed open, when they are whatever the bridge zeroed them to.
+    pub(crate) fn open_scanout_target(&self) -> Option<(ID3D11Resource, ScanoutImportInfo)> {
+        let mut info = ScanoutImportInfo::default();
+        // SAFETY: every out-param points at a live local for the call's
+        // duration; the bridge writes each before returning non-zero.
+        let raw = unsafe {
+            self.open_kmd_scanout_target(
+                &mut info.resource_id,
+                &mut info.width,
+                &mut info.height,
+                &mut info.pitch,
+                &mut info.generation,
+            )
+        };
+        // SAFETY: the bridge transfers one reference on success.
+        unsafe { adopt_resource(raw) }.map(|r| (r, info))
+    }
+
+    /// The DWM scan-out primary as a dedicated OPTIMAL, DMA_BUF-exportable
+    /// image, plus the logical scan-out metadata the host reconstructs from.
+    pub(crate) fn create_scanout_texture2d(
+        &self,
+        width: u32,
+        height: u32,
+        format: u32,
+        bind_flags: u32,
+        misc_flags: u32,
+    ) -> Option<(ID3D11Resource, u64, u64)> {
+        let mut row_pitch: u64 = 0;
+        let mut offset: u64 = 0;
+        // SAFETY: both out-params point at live locals; the bridge zeroes them
+        // on entry and writes them before returning non-zero.
+        let raw = unsafe {
+            self.create_ddi_scanout_texture2d(
+                width,
+                height,
+                format,
+                bind_flags,
+                misc_flags,
+                &mut row_pitch,
+                &mut offset,
+            )
+        };
+        // SAFETY: the bridge transfers one reference on success.
+        unsafe { adopt_resource(raw) }.map(|r| (r, row_pitch, offset))
+    }
+}
+
+/// Geometry the KMD reports for its VidPn primary, filled by
+/// [`ffi::HeliosDxvkDevice::open_scanout_target`].
+#[derive(Clone, Copy, Default)]
+pub(crate) struct ScanoutImportInfo {
+    pub(crate) resource_id: u32,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) pitch: u32,
+    pub(crate) generation: u32,
+}
+
+// NOT wrapped, deliberately: the eight shader creates.
+//
+// R813 suggests an `Option<usize>` (or NonZero) wrapper for them too. Audited
+// instead: all TEN shader-create call sites already guard the bridge's
+// 0-failure sentinel with `if raw != 0` before `store_raw_com`, and storing a
+// zero would be harmless anyway -- `load_com` null-checks the slot. There is no
+// wrong-adoption hazard here either, because the result goes into a slot as a
+// raw word rather than being wrapped as owned or borrowed. A newtype would be
+// ceremony across ten correct sites, so it is left out by the review's own
+// "rejected as cosmetic" standard.
