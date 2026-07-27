@@ -47,15 +47,14 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use core::cell::UnsafeCell;
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use wdk_sys::ntddk::{
-    KeAcquireSpinLockRaiseToDpc, KeGetCurrentIrql, KeReleaseSpinLock, MmGetPhysicalAddress,
-    MmMapIoSpace, MmMapLockedPagesSpecifyCache, MmUnmapIoSpace,
+    KeGetCurrentIrql, MmGetPhysicalAddress, MmMapIoSpace, MmMapLockedPagesSpecifyCache,
+    MmUnmapIoSpace,
 };
-use wdk_sys::{_MEMORY_CACHING_TYPE, KSPIN_LOCK, PHYSICAL_ADDRESS, PMDL};
+use wdk_sys::{_MEMORY_CACHING_TYPE, PHYSICAL_ADDRESS, PMDL};
 
 use crate::adapter::{AdapterContext, SystemBackingSnapshot};
 use crate::ddi::create_allocation::{paging_alloc_info, set_bar_placement};
@@ -279,6 +278,38 @@ struct PagingSystemPte {
     physical_page: u64,
 }
 
+/// Insert one entry into a `gpu_page`-sorted table, preserving the order.
+///
+/// Returns `false` when the table is full — the caller must then FAIL the paging
+/// operation rather than retire an incomplete mapping.
+///
+/// Allocation-free: `FixedVec::push` cannot grow, and the tail shift is a
+/// `copy_within` inside the already-reserved buffer. Never `Vec::insert` per
+/// element into a growing vector — that is O(k*n) and can allocate under the
+/// spinlock.
+fn insert_sorted(
+    entries: &mut crate::sync::FixedVec<PagingSystemPte>,
+    entry: PagingSystemPte,
+) -> bool {
+    if entries.is_full() {
+        return false;
+    }
+    let at = {
+        let slice = entries.as_slice();
+        // Same arithmetic as `helios_kmd_logic::sorted_splice_range`'s lower
+        // bound, which is host-tested against a retain-then-sort oracle.
+        slice.partition_point(|e| e.gpu_page < entry.gpu_page)
+    };
+    // Grow by one at the end (cannot allocate — capacity was reserved once at
+    // construction), then rotate the new slot into place.
+    if !entries.push(entry) {
+        return false;
+    }
+    let slice = entries.as_mut_slice();
+    slice[at..].rotate_right(1);
+    true
+}
+
 /// Exact system-memory leaf mappings supplied by VidMm in
 /// `DXGK_OPERATION_UPDATE_PAGE_TABLE`.
 ///
@@ -287,21 +318,23 @@ struct PagingSystemPte {
 /// when the update names a live Helios blob allocation and its exact PTE is
 /// valid, non-zero, and in segment 0 (system memory).
 pub(crate) struct PagingPteShadow {
-    lock: UnsafeCell<KSPIN_LOCK>,
-    entries: UnsafeCell<Vec<PagingSystemPte>>,
+    /// SORTED BY `gpu_page`, by construction. `resolve`'s `binary_search_by_key`
+    /// depends on that, and it used to be kept true by one `sort_unstable_by_key`
+    /// call at the end of `update_leaf` — so a future edit that dropped or moved
+    /// the sort broke eviction content silently. The only mutator is
+    /// [`Self::update_leaf`], which splices an ascending block into the exact
+    /// range it just cleared.
+    entries: crate::sync::SpinLock<crate::sync::FixedVec<PagingSystemPte>>,
 }
-
-// SAFETY: every access to `entries` is serialized by `lock`; entries are POD.
-unsafe impl Send for PagingPteShadow {}
-unsafe impl Sync for PagingPteShadow {}
 
 impl PagingPteShadow {
     /// Reserve once at adapter construction (PASSIVE_LEVEL); no update allocates
     /// while the spinlock is held.
     pub(crate) fn new() -> Self {
         Self {
-            lock: UnsafeCell::new(0),
-            entries: UnsafeCell::new(Vec::with_capacity(MAX_PAGING_SYSTEM_PTES)),
+            entries: crate::sync::SpinLock::new(crate::sync::FixedVec::with_max(
+                MAX_PAGING_SYSTEM_PTES,
+            )),
         }
     }
 
@@ -325,44 +358,51 @@ impl PagingPteShadow {
         let first_page = update.FirstPteVirtualAddress >> 12;
         let page_count = update.NumPageTableEntries as u64;
         let end_page = first_page.saturating_add(page_count);
-        let irql = unsafe { KeAcquireSpinLockRaiseToDpc(self.lock.get()) };
-        // SAFETY: exclusive spinlock ownership.
-        let entries = unsafe { &mut *self.entries.get() };
-
-        // The new update replaces this exact Windows-supplied VA range even if
-        // it maps a non-Helios allocation, a device segment, or invalid PTEs.
-        entries.retain(|entry| entry.gpu_page < first_page || entry.gpu_page >= end_page);
-
         let mut ok = true;
-        if track_system_pages {
-            let repeat = update.Flags.Repeat() != 0;
-            for i in 0..update.NumPageTableEntries as usize {
-                // Repeat means pPageTableEntries names one value replicated
-                // across the whole update; otherwise it names Num entries.
-                let pte_index = if repeat { 0 } else { i };
-                // SAFETY: index follows the DXGK_UPDATEPAGETABLEFLAGS contract.
-                let pte =
-                    unsafe { core::ptr::read_unaligned(update.pPageTableEntries.add(pte_index)) };
-                let bits = unsafe { pte.__bindgen_anon_1.__bindgen_anon_1 };
-                let valid = bits.Valid() != 0;
-                let zero = bits.Zero() != 0;
-                let segment = bits.Segment() as u32;
-                if !valid || zero || segment != 0 {
-                    continue;
+        {
+            let mut entries = self.entries.lock();
+
+            // The new update replaces this exact Windows-supplied VA range even
+            // if it maps a non-Helios allocation, a device segment, or invalid
+            // PTEs.
+            entries.retain(|entry| entry.gpu_page < first_page || entry.gpu_page >= end_page);
+
+            if track_system_pages {
+                let repeat = update.Flags.Repeat() != 0;
+                for i in 0..update.NumPageTableEntries as usize {
+                    // Repeat means pPageTableEntries names one value replicated
+                    // across the whole update; otherwise it names Num entries.
+                    let pte_index = if repeat { 0 } else { i };
+                    // SAFETY: index follows the DXGK_UPDATEPAGETABLEFLAGS contract.
+                    let pte = unsafe {
+                        core::ptr::read_unaligned(update.pPageTableEntries.add(pte_index))
+                    };
+                    let bits = unsafe { pte.__bindgen_anon_1.__bindgen_anon_1 };
+                    let valid = bits.Valid() != 0;
+                    let zero = bits.Zero() != 0;
+                    let segment = bits.Segment() as u32;
+                    if !valid || zero || segment != 0 {
+                        continue;
+                    }
+                    // SPLICE, not append-then-sort. `retain` above removed
+                    // exactly `[first_page, end_page)`, every entry below lands
+                    // in that range in ascending order, and the table was sorted
+                    // before the update — so inserting at the partition point
+                    // reproduces the sorted result WITHOUT the O(n log n)
+                    // `sort_unstable_by_key` this used to run over up to 65,536
+                    // entries with the spinlock held, at DISPATCH_LEVEL.
+                    let entry = PagingSystemPte {
+                        gpu_page: first_page + i as u64,
+                        physical_page: unsafe { pte.__bindgen_anon_2.PageAddress },
+                    };
+                    if !insert_sorted(&mut entries, entry) {
+                        ok = false;
+                        break;
+                    }
                 }
-                if entries.len() == MAX_PAGING_SYSTEM_PTES {
-                    ok = false;
-                    break;
-                }
-                entries.push(PagingSystemPte {
-                    gpu_page: first_page + i as u64,
-                    physical_page: unsafe { pte.__bindgen_anon_2.PageAddress },
-                });
             }
-            entries.sort_unstable_by_key(|entry| entry.gpu_page);
+            BAR_VIRTUAL_PTES.store(entries.len() as u32, Ordering::Relaxed);
         }
-        BAR_VIRTUAL_PTES.store(entries.len() as u32, Ordering::Relaxed);
-        unsafe { KeReleaseSpinLock(self.lock.get(), irql) };
 
         if !ok {
             BAR_ERR_SHADOW_FULL.fetch_add(1, Ordering::Relaxed);
@@ -386,21 +426,21 @@ impl PagingPteShadow {
             return None;
         }
 
-        let irql = unsafe { KeAcquireSpinLockRaiseToDpc(self.lock.get()) };
-        // SAFETY: shared read while holding the table spinlock.
-        let entries = unsafe { &*self.entries.get() };
         let mut resolved = true;
-        for i in 0..page_count {
-            let gpu_page = first_page + i;
-            match entries.binary_search_by_key(&gpu_page, |entry| entry.gpu_page) {
-                Ok(index) => pages.push(entries[index].physical_page),
-                Err(_) => {
-                    resolved = false;
-                    break;
+        {
+            let entries = self.entries.lock();
+            let slice = entries.as_slice();
+            for i in 0..page_count {
+                let gpu_page = first_page + i;
+                match slice.binary_search_by_key(&gpu_page, |entry| entry.gpu_page) {
+                    Ok(index) => pages.push(slice[index].physical_page),
+                    Err(_) => {
+                        resolved = false;
+                        break;
+                    }
                 }
             }
         }
-        unsafe { KeReleaseSpinLock(self.lock.get(), irql) };
         resolved.then_some(pages)
     }
 }

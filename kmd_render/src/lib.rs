@@ -42,6 +42,10 @@ mod error;
 // The PASSIVE_LEVEL proof token (R614) and the one definition of PASSIVE_LEVEL.
 mod irql;
 mod mapping;
+// The guard-based spinlock and the fixed-capacity vector the three bounded
+// tables share. `irql` is the execution-LEVEL contract; this is the mutual
+// exclusion one.
+mod sync;
 // Scaffolding: the transport's types/parsers are wired into the StartDevice path
 // over Phase-2 milestones M1–M4; allow dead_code until M4 consumes them all.
 #[allow(dead_code)]

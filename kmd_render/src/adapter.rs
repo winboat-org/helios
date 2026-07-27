@@ -6,7 +6,6 @@
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
-use alloc::vec::Vec;
 
 use core::cell::UnsafeCell;
 use core::marker::PhantomData;
@@ -105,12 +104,8 @@ pub(crate) struct SystemBackingSnapshot {
 /// while the spinlock is held. New page arrays are built before the lock is
 /// acquired; the entry vector is pre-reserved and never grows while locked.
 pub(crate) struct SystemBackingTable {
-    lock: UnsafeCell<KSPIN_LOCK>,
-    entries: UnsafeCell<Vec<SystemBackingSnapshot>>,
+    entries: crate::sync::SpinLock<crate::sync::FixedVec<SystemBackingSnapshot>>,
 }
-
-unsafe impl Send for SystemBackingTable {}
-unsafe impl Sync for SystemBackingTable {}
 
 /// Ticks the scanout pacing snapshot (R318). One rate for the whole block.
 static SCANOUT_PACING_TICKS: AtomicU32 = AtomicU32::new(0);
@@ -120,61 +115,65 @@ impl SystemBackingTable {
 
     pub fn new() -> Self {
         Self {
-            lock: UnsafeCell::new(0),
-            entries: UnsafeCell::new(Vec::with_capacity(Self::MAX_ENTRIES)),
+            entries: crate::sync::SpinLock::new(crate::sync::FixedVec::with_max(Self::MAX_ENTRIES)),
         }
     }
 
     pub fn replace(&self, backing: SystemBackingSnapshot) -> bool {
-        let irql = unsafe { KeAcquireSpinLockRaiseToDpc(self.lock.get()) };
-        let entries = unsafe { &mut *self.entries.get() };
         let mut old = None;
-        let success = if let Some(index) = entries
-            .iter()
-            .position(|entry| entry.resource_id == backing.resource_id)
-        {
-            old = Some(core::mem::replace(&mut entries[index], backing));
-            true
-        } else if entries.len() < entries.capacity() {
-            entries.push(backing);
-            true
-        } else {
-            false
+        let success = {
+            let mut entries = self.entries.lock();
+            let existing = entries
+                .as_slice()
+                .iter()
+                .position(|entry| entry.resource_id == backing.resource_id);
+            match existing {
+                Some(index) => {
+                    old = Some(entries.replace_at(index, backing));
+                    true
+                }
+                // BEHAVIOUR NOTE: the bound is now MAX_ENTRIES, not
+                // `Vec::capacity()`. The old check admitted whatever
+                // over-allocation the allocator chose above the declared 128,
+                // so this can only ever admit FEWER entries — `PgSc`/`PgSe`
+                // must be unchanged, and would move if the allocator had been
+                // over-allocating.
+                None => entries.push(backing),
+            }
         };
-        unsafe { KeReleaseSpinLock(self.lock.get(), irql) };
-        // Releasing the old Arc can free pool memory; do that after dropping
-        // back to the caller's original IRQL.
+        // Releasing the old Arc can free pool memory; do that after the guard
+        // has dropped us back to the caller's original IRQL.
         drop(old);
         success
     }
 
     pub fn snapshot(&self, resource_id: u32) -> Option<SystemBackingSnapshot> {
-        let irql = unsafe { KeAcquireSpinLockRaiseToDpc(self.lock.get()) };
-        let result = unsafe { &*self.entries.get() }
+        self.entries
+            .lock()
+            .as_slice()
             .iter()
             .find(|entry| entry.resource_id == resource_id)
-            .cloned();
-        unsafe { KeReleaseSpinLock(self.lock.get(), irql) };
-        result
+            .cloned()
     }
 
     pub fn contains(&self, resource_id: u32) -> bool {
-        let irql = unsafe { KeAcquireSpinLockRaiseToDpc(self.lock.get()) };
-        let result = unsafe { &*self.entries.get() }
+        self.entries
+            .lock()
+            .as_slice()
             .iter()
-            .any(|entry| entry.resource_id == resource_id);
-        unsafe { KeReleaseSpinLock(self.lock.get(), irql) };
-        result
+            .any(|entry| entry.resource_id == resource_id)
     }
 
     pub fn remove(&self, resource_id: u32) {
-        let irql = unsafe { KeAcquireSpinLockRaiseToDpc(self.lock.get()) };
-        let entries = unsafe { &mut *self.entries.get() };
-        let removed = entries
-            .iter()
-            .position(|entry| entry.resource_id == resource_id)
-            .map(|index| entries.swap_remove(index));
-        unsafe { KeReleaseSpinLock(self.lock.get(), irql) };
+        let removed = {
+            let mut entries = self.entries.lock();
+            entries
+                .as_slice()
+                .iter()
+                .position(|entry| entry.resource_id == resource_id)
+                .map(|index| entries.swap_remove(index))
+        };
+        // Same reason as `replace`: drop the Arc outside the critical section.
         drop(removed);
     }
 }

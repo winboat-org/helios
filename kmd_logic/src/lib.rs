@@ -1270,3 +1270,137 @@ mod tests {
         );
     }
 }
+
+// ── Sorted-by-key splice (R712) ─────────────────────────────────────────────
+
+/// Where an ascending block of keys belongs in an already-sorted slice, and how
+/// many existing entries it displaces.
+///
+/// # Why this is here rather than in `kmd_render`
+///
+/// `PagingPteShadow::update_leaf` used to `retain` and then
+/// `sort_unstable_by_key` a table bounded at 65,536 entries with a spinlock held
+/// — and `KeAcquireSpinLockRaiseToDpc` raises to DISPATCH_LEVEL regardless of the
+/// caller's IRQL. That is O(n log n) of unbounded work in a DISPATCH path, which
+/// the project rule forbids, and its cost was invisible because only the
+/// resulting LENGTH was recorded (`PgVp`).
+///
+/// The sort was unnecessary: the table is already sorted before the update, the
+/// appended block is itself ascending, and it is confined to the exact VA range
+/// `retain` just cleared. So one splice at the right index reproduces the sorted
+/// result. That argument is easy to get subtly wrong for a partially-overlapping
+/// range — and getting it wrong makes `resolve`'s `binary_search_by_key` return
+/// `None`, which breaks eviction CONTENT. Hence: pure logic, moved out, with a
+/// randomized oracle test against a reference `sort`.
+///
+/// Returns `(start, removed)`: the entries in `[start, start + removed)` are the
+/// ones whose keys fall inside `[first_key, end_key)`, and the new block belongs
+/// at `start`.
+///
+/// `keys` must be sorted ascending.
+pub fn sorted_splice_range(keys: &[u64], first_key: u64, end_key: u64) -> (usize, usize) {
+    let start = partition_point(keys, |k| k < first_key);
+    let end = partition_point(keys, |k| k < end_key);
+    (start, end - start)
+}
+
+/// `slice::partition_point` over a key slice, spelled out so this crate stays
+/// free of any dependency on slice-method stabilisation in `no_std`.
+fn partition_point<F: Fn(u64) -> bool>(keys: &[u64], pred: F) -> usize {
+    let mut lo = 0usize;
+    let mut hi = keys.len();
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if pred(keys[mid]) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
+}
+
+#[cfg(test)]
+mod sorted_splice_tests {
+    extern crate alloc;
+    use super::sorted_splice_range;
+    use alloc::vec::Vec;
+
+    /// Reference implementation: retain-then-sort, exactly what the KMD did
+    /// before the splice replaced it.
+    fn reference(existing: &[(u64, u64)], first: u64, end: u64, block: &[(u64, u64)]) -> Vec<(u64, u64)> {
+        let mut out: Vec<(u64, u64)> = existing
+            .iter()
+            .copied()
+            .filter(|(k, _)| *k < first || *k >= end)
+            .collect();
+        out.extend_from_slice(block);
+        out.sort_by_key(|(k, _)| *k);
+        out
+    }
+
+    /// Splice implementation, driven by `sorted_splice_range`.
+    fn spliced(existing: &[(u64, u64)], first: u64, end: u64, block: &[(u64, u64)]) -> Vec<(u64, u64)> {
+        let keys: Vec<u64> = existing.iter().map(|(k, _)| *k).collect();
+        let (start, removed) = sorted_splice_range(&keys, first, end);
+        let mut out: Vec<(u64, u64)> = Vec::new();
+        out.extend_from_slice(&existing[..start]);
+        out.extend_from_slice(block);
+        out.extend_from_slice(&existing[start + removed..]);
+        out
+    }
+
+    /// Deterministic xorshift — `Math::random` is not available and a fixed seed
+    /// makes a failure reproducible.
+    fn next(state: &mut u64) -> u64 {
+        let mut x = *state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        *state = x;
+        x
+    }
+
+    #[test]
+    fn splice_matches_retain_then_sort_over_random_ranges() {
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        for case in 0..2000u64 {
+            // A sorted existing table with gaps, so ranges can partially overlap.
+            let n = (next(&mut seed) % 40) as usize;
+            let mut existing: Vec<(u64, u64)> = Vec::new();
+            let mut key = next(&mut seed) % 8;
+            for i in 0..n {
+                existing.push((key, key * 1000 + i as u64));
+                key += 1 + next(&mut seed) % 4;
+            }
+
+            let first = next(&mut seed) % 80;
+            let len = next(&mut seed) % 12;
+            let end = first + len;
+            // The appended block is ascending and confined to [first, end).
+            let block: Vec<(u64, u64)> = (first..end).map(|k| (k, k * 7 + case)).collect();
+
+            let want = reference(&existing, first, end, &block);
+            let got = spliced(&existing, first, end, &block);
+            assert_eq!(want, got, "case {case}: first={first} end={end}");
+            // The result must be sorted — that is what `resolve`'s binary search
+            // depends on.
+            assert!(got.windows(2).all(|w| w[0].0 <= w[1].0), "case {case} unsorted");
+        }
+    }
+
+    #[test]
+    fn empty_block_is_pure_removal() {
+        let existing = [(1u64, 10u64), (2, 20), (5, 50), (9, 90)];
+        let keys: Vec<u64> = existing.iter().map(|(k, _)| *k).collect();
+        let (start, removed) = sorted_splice_range(&keys, 2, 6);
+        assert_eq!((start, removed), (1, 2));
+    }
+
+    #[test]
+    fn range_beyond_the_end_removes_nothing() {
+        let existing = [(1u64, 10u64), (2, 20)];
+        let keys: Vec<u64> = existing.iter().map(|(k, _)| *k).collect();
+        assert_eq!(sorted_splice_range(&keys, 100, 200), (2, 0));
+    }
+}

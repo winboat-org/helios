@@ -28,13 +28,7 @@
 //! kernel-stack-overflow lesson; here the array would be heap-resident anyway,
 //! but the no-realloc-under-lock invariant still matters.)
 
-use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU32, Ordering};
-
-use alloc::vec::Vec;
-
-use wdk_sys::ntddk::{KeAcquireSpinLockRaiseToDpc, KeReleaseSpinLock};
-use wdk_sys::KSPIN_LOCK;
 
 /// Maximum concurrently-mapped host-visible blobs per ADAPTER (the table is
 /// adapter-global: dwm + WUDFHost + every game share it). Matches MAX_BLOBS —
@@ -87,40 +81,29 @@ struct Mapping {
 
 /// Registry of live host-visible blob mappings, guarded by its own spinlock.
 pub struct MappingTable {
-    /// `0` is the initialized + unlocked state of a `KSPIN_LOCK`, so no explicit
-    /// `KeInitializeSpinLock` is needed (same rationale as `virtio::hal`).
-    lock: UnsafeCell<KSPIN_LOCK>,
     /// Live mappings. Capacity reserved to `MAX_MAPPINGS` at construction;
-    /// `push`/`pop` within that capacity never (de)allocate.
-    entries: UnsafeCell<Vec<Mapping>>,
+    /// `FixedVec` has no growth path, so nothing here can allocate under the
+    /// spinlock.
+    entries: crate::sync::SpinLock<crate::sync::FixedVec<Mapping>>,
 }
-
-// SAFETY: every access to `entries` is serialized by `lock` (a kernel spinlock).
-// `Mapping` is Copy/POD (the `usize` MDL is an opaque token, dereferenced only by
-// the ioctl unmap path at PASSIVE_LEVEL in the owning process).
-unsafe impl Send for MappingTable {}
-unsafe impl Sync for MappingTable {}
 
 impl MappingTable {
     /// Reserve the backing buffer up front (PASSIVE_LEVEL). After this, `insert`
     /// up to `MAX_MAPPINGS` entries performs no allocation.
     pub fn new() -> Self {
         Self {
-            lock: UnsafeCell::new(0),
-            entries: UnsafeCell::new(Vec::with_capacity(MAX_MAPPINGS)),
+            entries: crate::sync::SpinLock::new(crate::sync::FixedVec::with_max(MAX_MAPPINGS)),
         }
     }
 
     /// True if `resource_id` already has a live mapping for `owner`. Used by
     /// `MAP_BLOB` to reject a duplicate map from the same D3DKMT device handle.
     pub fn contains(&self, owner: usize, resource_id: u32) -> bool {
-        let irql = unsafe { KeAcquireSpinLockRaiseToDpc(self.lock.get()) };
-        // SAFETY: spinlock-guarded read of the entries.
-        let found = unsafe { &*self.entries.get() }
+        self.entries
+            .lock()
+            .as_slice()
             .iter()
-            .any(|m| m.owner == owner && m.resource_id == resource_id);
-        unsafe { KeReleaseSpinLock(self.lock.get(), irql) };
-        found
+            .any(|m| m.owner == owner && m.resource_id == resource_id)
     }
 
     /// Record a freshly-created mapping owned by `owner`, refusing a duplicate
@@ -150,41 +133,37 @@ impl MappingTable {
         user_va: u64,
         mdl: usize,
     ) -> InsertResult {
-        let irql = unsafe { KeAcquireSpinLockRaiseToDpc(self.lock.get()) };
-        // SAFETY: spinlock-guarded exclusive access to the entries.
-        let entries = unsafe { &mut *self.entries.get() };
-        let result = if entries
+        let mut entries = self.entries.lock();
+        if entries
+            .as_slice()
             .iter()
             .any(|m| m.owner == owner && m.resource_id == resource_id)
         {
-            InsertResult::Duplicate
-        } else if entries.len() < MAX_MAPPINGS {
-            entries.push(Mapping {
-                owner,
-                resource_id,
-                user_va,
-                mdl,
-            });
-            let n = entries.len() as u32;
-            if MAPPINGS_HIGH_WATER.load(Ordering::Relaxed) < n {
-                MAPPINGS_HIGH_WATER.store(n, Ordering::Relaxed);
-            }
-            InsertResult::Inserted
-        } else {
+            return InsertResult::Duplicate;
+        }
+        if !entries.push(Mapping {
+            owner,
+            resource_id,
+            user_va,
+            mdl,
+        }) {
             MAPPING_FULL_REJECTS.fetch_add(1, Ordering::Relaxed);
-            InsertResult::Full
-        };
-        unsafe { KeReleaseSpinLock(self.lock.get(), irql) };
-        result
+            return InsertResult::Full;
+        }
+        let n = entries.len() as u32;
+        if MAPPINGS_HIGH_WATER.load(Ordering::Relaxed) < n {
+            MAPPINGS_HIGH_WATER.store(n, Ordering::Relaxed);
+        }
+        InsertResult::Inserted
+        // The two early returns above are the point of the guard: each one used
+        // to be an assignment into `result` followed by a shared
+        // KeReleaseSpinLock, because an early `return` there would have leaked
+        // the lock. Release is now a Drop obligation.
     }
 
     /// Current live-mapping count (QUERY_STATS v2).
     pub fn live(&self) -> u32 {
-        let irql = unsafe { KeAcquireSpinLockRaiseToDpc(self.lock.get()) };
-        // SAFETY: spinlock-guarded read of the entries.
-        let n = unsafe { &*self.entries.get() }.len() as u32;
-        unsafe { KeReleaseSpinLock(self.lock.get(), irql) };
-        n
+        self.entries.lock().len() as u32
     }
 
     /// Pop up to `out.len()` of `owner`'s mappings per acquisition, returning how
@@ -206,13 +185,11 @@ impl MappingTable {
         if out.is_empty() {
             return 0;
         }
-        let irql = unsafe { KeAcquireSpinLockRaiseToDpc(self.lock.get()) };
-        // SAFETY: spinlock-guarded exclusive access to the entries.
-        let entries = unsafe { &mut *self.entries.get() };
+        let mut entries = self.entries.lock();
         let mut n = 0;
         let mut i = 0;
         while i < entries.len() && n < out.len() {
-            if entries[i].owner == owner {
+            if entries.as_slice()[i].owner == owner {
                 // swap_remove moves the last element into slot i, so do NOT
                 // advance — it has not been tested yet.
                 let m = entries.swap_remove(i);
@@ -222,24 +199,18 @@ impl MappingTable {
                 i += 1;
             }
         }
-        unsafe { KeReleaseSpinLock(self.lock.get(), irql) };
         n
     }
 
     /// Pop the mapping for `resource_id` owned by `owner`, if one exists. Used by
     /// explicit BO release while the process is still alive.
     pub fn take_for_resource(&self, owner: usize, resource_id: u32) -> Option<(u64, usize)> {
-        let irql = unsafe { KeAcquireSpinLockRaiseToDpc(self.lock.get()) };
-        // SAFETY: spinlock-guarded exclusive access to the entries.
-        let entries = unsafe { &mut *self.entries.get() };
-        let popped = entries
+        let mut entries = self.entries.lock();
+        let index = entries
+            .as_slice()
             .iter()
-            .position(|m| m.owner == owner && m.resource_id == resource_id)
-            .map(|i| {
-                let m = entries.swap_remove(i);
-                (m.user_va, m.mdl)
-            });
-        unsafe { KeReleaseSpinLock(self.lock.get(), irql) };
-        popped
+            .position(|m| m.owner == owner && m.resource_id == resource_id)?;
+        let m = entries.swap_remove(index);
+        Some((m.user_va, m.mdl))
     }
 }
