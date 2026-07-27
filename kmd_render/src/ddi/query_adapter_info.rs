@@ -20,7 +20,7 @@ use crate::dxgk::_DXGK_QUERYADAPTERINFOTYPE::{
 };
 use crate::dxgk::*;
 
-use crate::adapter::AdapterContext;
+use crate::adapter::{AdapterContext, AdapterKnobs};
 use crate::ddi::gpummu;
 use crate::ddi::wddm_surface::SURFACE;
 
@@ -50,8 +50,8 @@ pub unsafe extern "C" fn dxgkddi_query_adapter_info(
 
     match args.Type {
         DXGKQAITYPE_DRIVERCAPS => unsafe { query_driver_caps(adapter, args) },
-        DXGKQAITYPE_QUERYSEGMENT => unsafe { query_segments_legacy(args) },
-        DXGKQAITYPE_QUERYSEGMENT3 => unsafe { query_segments3(args) },
+        DXGKQAITYPE_QUERYSEGMENT => unsafe { query_segments_legacy(adapter, args) },
+        DXGKQAITYPE_QUERYSEGMENT3 => unsafe { query_segments3(adapter, args) },
         DXGKQAITYPE_QUERYSEGMENT4 => unsafe { query_segments(adapter, args) },
         DXGKQAITYPE_GPUMMUCAPS => unsafe { gpummu::fill_gpummu_caps(args) },
         DXGKQAITYPE_PAGETABLELEVELDESC => unsafe {
@@ -182,13 +182,11 @@ macro_rules! caps_offset {
     };
 }
 
-/// The caps surface is a pure function of the build's compile-time levers and
-/// the two service knobs read below, so it no longer reads adapter state; the
-/// parameter stays so the dispatcher's arms remain uniform.
-unsafe fn query_driver_caps(
-    _adapter: &AdapterContext,
-    args: &DXGKARG_QUERYADAPTERINFO,
-) -> NTSTATUS {
+/// The caps surface is a pure function of the build's compile-time levers and the
+/// service-knob snapshot. It reads the snapshot rather than the registry, so the
+/// caps it reports and the segment flags reported alongside them cannot disagree.
+unsafe fn query_driver_caps(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTERINFO) -> NTSTATUS {
+    let knobs = adapter.knobs();
     // The MINIMUM this DDI insists on, unchanged at 540 so the
     // STATUS_BUFFER_TOO_SMALL threshold and the 0x02CF record keep their values.
     // It is no longer load-bearing for memory safety — every write below is
@@ -330,7 +328,7 @@ unsafe fn query_driver_caps(
     const MEMORYMANAGEMENTCAPS_GPU_MMU_SUPPORTED: u32 = 1 << 6;
 
     let mut mem_caps = MEMORYMANAGEMENTCAPS_SECTION_BACKED_PRIMARY;
-    if DECLARE_CROSS_ADAPTER_RESOURCE || cross_adapter_advertised() {
+    if DECLARE_CROSS_ADAPTER_RESOURCE || knobs.cross_adapter {
         mem_caps |= MEMORYMANAGEMENTCAPS_CROSS_ADAPTER_RESOURCE;
     }
     if SURFACE.gpu_mmu() {
@@ -368,7 +366,7 @@ unsafe fn query_driver_caps(
     // (mcdm-implementation-guidelines.md) requires 0 here. `DirectFlipCaps`
     // service knob (default 0) restores the legacy advertisement for A/B via
     // reg add + devcon restart; value lands in the 0x01D7 diag record bit 2.
-    let support_direct_flip: BOOLEAN = if direct_flip_advertised() { 1 } else { 0 };
+    let support_direct_flip: BOOLEAN = if knobs.direct_flip { 1 } else { 0 };
     out.set(caps_offset!(SupportDirectFlip), support_direct_flip);
     let nb_asymetric_processing_nodes: UINT = 1;
     out.set(
@@ -554,39 +552,26 @@ pub(crate) const DECLARE_CROSS_ADAPTER_RESOURCE: bool = false;
 /// GetRootPageTableSize, BuildPagingBuffer, SubmitCommand/SubmitCommandVirtual,
 /// CreateProcess) is implemented (decorative/null engine), so the level only flips
 /// the capability *declaration*.
-/// `DirectFlipCaps` service knob (REG_DWORD, default 0): 0 = deny direct flip
-/// everywhere (adapter cap + aperture segment flags — the truthful surface for
-/// a zero-scanout render adapter; see the SupportDirectFlip comment in
-/// `query_driver_caps`), nonzero = restore the legacy bring-up advertisement.
-/// Read at AddAdapter/QUERYSEGMENT time (PASSIVE), same pattern as BarSegFlags.
-/// The BAR knob descriptor is independently governed by BarSegFlags bit 5
-/// (default off) and is not gated here.
-fn direct_flip_advertised() -> bool {
-    crate::diag::read_config_dword(b"DirectFlipCaps", 0) != 0
-}
-
-/// `CrossAdaptCaps` service knob (REG_DWORD, default 0): nonzero advertises the
-/// `DXGK_VIDMMCAPS.CrossAdapterResource` bit (tier-1 cross-adapter copy support).
-/// Without that bit the OS never attempts the cross-adapter *redirected-bitblt*
-/// windowed present, so every legacy BLT-model swapchain (DXUT/FaceWorks, older
-/// 3DMark) is declared `DXGI_STATUS_OCCLUDED` and renders transparent (priority #1,
-/// root-caused 2026-07-08 with `tools/d3d11_triangle.cpp`: FLIP composites, BLT
-/// occludes). The redirection-surface machinery already exists — GDISURFACE is
-/// handled in `GetStandardAllocationDriverData` and backed by a real venus blob in
-/// `create_one`; this cap is the only gate. Kept OFF by default (the compiled
-/// `DECLARE_CROSS_ADAPTER_RESOURCE` const stays false, boot-proven surface); the
-/// knob is read at AddAdapter (PASSIVE), same pattern as `DirectFlipCaps`, so it
-/// A/Bs via `reg add ... /v CrossAdaptCaps /t REG_DWORD /d 1` + `pnputil
-/// /restart-device` with NO reboot once this KMD is deployed. Its value is visible
-/// in the `0x01D4` MemoryManagementCaps diag record (CrossAdapterResource = bit 4).
-/// NB: `read_config_dword` truncates names to 14 chars — this name is exactly 14.
-fn cross_adapter_advertised() -> bool {
-    crate::diag::read_config_dword(b"CrossAdaptCaps", 0) != 0
-}
+// `DirectFlipCaps` and `CrossAdaptCaps` used to be read here, by a helper each,
+// on every call. `DirectFlipCaps` alone cost FOUR registry reads per AddAdapter
+// (the caps path plus once inside each of the three aperture descriptor writers)
+// and could therefore change value mid-AddAdapter. Both now arrive through
+// `AdapterKnobs`, snapshotted once at StartDevice — see that type for the
+// inconsistency this closes.
+//
+// `CrossAdaptCaps` is the gate for the cross-adapter *redirected-bitblt*
+// windowed present: without `DXGK_VIDMMCAPS.CrossAdapterResource` the OS never
+// attempts it, so every legacy BLT-model swapchain (DXUT/FaceWorks, older
+// 3DMark) is declared `DXGI_STATUS_OCCLUDED` and renders transparent
+// (root-caused 2026-07-08 with `tools/d3d11_triangle.cpp`: FLIP composites, BLT
+// occludes). The redirection-surface machinery already exists — GDISURFACE is
+// handled in `GetStandardAllocationDriverData` and backed by a real venus blob
+// in `create_one`; this cap is the only gate. Its value is visible in the
+// `0x01D4` MemoryManagementCaps diag record (CrossAdapterResource = bit 4).
 
 /// Write the viogpu3d-style linear aperture descriptor (paging-buffer host).
 /// SAFETY: `seg` points to a writable `DXGK_SEGMENTDESCRIPTOR4`.
-unsafe fn write_aperture_descriptor(seg: *mut DXGK_SEGMENTDESCRIPTOR4) {
+unsafe fn write_aperture_descriptor(seg: *mut DXGK_SEGMENTDESCRIPTOR4, knobs: &AdapterKnobs) {
     unsafe {
         core::ptr::write_bytes(seg as *mut u8, 0, size_of::<DXGK_SEGMENTDESCRIPTOR4>());
         let s = &mut *seg;
@@ -595,7 +580,7 @@ unsafe fn write_aperture_descriptor(seg: *mut DXGK_SEGMENTDESCRIPTOR4) {
             .__bindgen_anon_1
             .__bindgen_anon_1
             .set_CacheCoherent(1);
-        if direct_flip_advertised() {
+        if knobs.direct_flip {
             s.Flags.__bindgen_anon_1.__bindgen_anon_1.set_DirectFlip(1);
         }
         // CpuVisible deliberately 0 — an aperture holds no bits (viogpu3d :558).
@@ -608,7 +593,7 @@ unsafe fn write_aperture_descriptor(seg: *mut DXGK_SEGMENTDESCRIPTOR4) {
 /// Write the viogpu3d-style linear aperture descriptor for WDDM 1.2/1.3
 /// `DXGK_QUERYSEGMENTOUT3`.
 /// SAFETY: `seg` points to a writable `DXGK_SEGMENTDESCRIPTOR3`.
-unsafe fn write_aperture_descriptor3(seg: *mut DXGK_SEGMENTDESCRIPTOR3) {
+unsafe fn write_aperture_descriptor3(seg: *mut DXGK_SEGMENTDESCRIPTOR3, knobs: &AdapterKnobs) {
     unsafe {
         core::ptr::write_bytes(seg as *mut u8, 0, size_of::<DXGK_SEGMENTDESCRIPTOR3>());
         let s = &mut *seg;
@@ -617,7 +602,7 @@ unsafe fn write_aperture_descriptor3(seg: *mut DXGK_SEGMENTDESCRIPTOR3) {
             .__bindgen_anon_1
             .__bindgen_anon_1
             .set_CacheCoherent(1);
-        if direct_flip_advertised() {
+        if knobs.direct_flip {
             s.Flags.__bindgen_anon_1.__bindgen_anon_1.set_DirectFlip(1);
         }
         // CpuVisible deliberately 0 — a linear aperture redirects system-memory
@@ -631,7 +616,7 @@ unsafe fn write_aperture_descriptor3(seg: *mut DXGK_SEGMENTDESCRIPTOR3) {
 /// Write the legacy `DXGK_QUERYSEGMENTOUT` descriptor used if dxgkrnl falls back
 /// from QUERYSEGMENT3.
 /// SAFETY: `seg` points to a writable `DXGK_SEGMENTDESCRIPTOR`.
-unsafe fn write_aperture_descriptor_legacy(seg: *mut DXGK_SEGMENTDESCRIPTOR) {
+unsafe fn write_aperture_descriptor_legacy(seg: *mut DXGK_SEGMENTDESCRIPTOR, knobs: &AdapterKnobs) {
     unsafe {
         core::ptr::write_bytes(seg as *mut u8, 0, size_of::<DXGK_SEGMENTDESCRIPTOR>());
         let s = &mut *seg;
@@ -640,7 +625,7 @@ unsafe fn write_aperture_descriptor_legacy(seg: *mut DXGK_SEGMENTDESCRIPTOR) {
             .__bindgen_anon_1
             .__bindgen_anon_1
             .set_CacheCoherent(1);
-        if direct_flip_advertised() {
+        if knobs.direct_flip {
             s.Flags.__bindgen_anon_1.__bindgen_anon_1.set_DirectFlip(1);
         }
         s.BaseAddress.QuadPart = APERTURE_BASE_ADDRESS;
@@ -706,11 +691,18 @@ unsafe fn write_cpu_host_memory_descriptor(seg: *mut DXGK_SEGMENTDESCRIPTOR4, ba
 ///     the BaseAddress-overlap hypothesis.
 ///
 /// SAFETY: `seg` points to a writable `DXGK_SEGMENTDESCRIPTOR4`.
-unsafe fn write_bar_knob_descriptor(seg: *mut DXGK_SEGMENTDESCRIPTOR4, gpa: u64, len: u64) {
-    let flags = crate::diag::read_config_dword(b"BarSegFlags", 0x1C);
-    let base_mb = crate::diag::read_config_dword(b"BarSegBaseMB", 0);
-    crate::diag::record_named_bytes(b"BarF", flags);
-    crate::diag::record_named_bytes(b"BarB", base_mb);
+unsafe fn write_bar_knob_descriptor(
+    seg: *mut DXGK_SEGMENTDESCRIPTOR4,
+    gpa: u64,
+    len: u64,
+    knobs: &AdapterKnobs,
+) {
+    // Pure: the flag word and base come from the snapshot, and the `BarF`/`BarB`
+    // breadcrumbs are written once in `AdapterKnobs::read_at_start`. This
+    // function used to do two blocking registry READS and two ungated registry
+    // WRITES on every descriptor write.
+    let flags = knobs.bar_seg_flags;
+    let base_mb = knobs.bar_seg_base_mb;
     unsafe {
         core::ptr::write_bytes(seg as *mut u8, 0, size_of::<DXGK_SEGMENTDESCRIPTOR4>());
         let s = &mut *seg;
@@ -757,6 +749,7 @@ unsafe fn query_segments(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTERIN
         return STATUS_BUFFER_TOO_SMALL;
     }
 
+    let knobs = adapter.knobs();
     // The host-visible BAR window backs the CPU-visible memory segment.
     let window = adapter.with_virtio(|v| v.host_visible()).ok().flatten();
     crate::diag::record(if window.is_some() {
@@ -858,7 +851,7 @@ unsafe fn query_segments(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTERIN
                     (descriptors as *mut u8).add(idx * stride) as *mut DXGK_SEGMENTDESCRIPTOR4
                 };
                 match seg {
-                    Seg::Aperture => unsafe { write_aperture_descriptor(d) },
+                    Seg::Aperture => unsafe { write_aperture_descriptor(d, &knobs) },
                     Seg::RamCpuHost(gpa, size) => {
                         crate::diag::record(0x0903_0000 | (((gpa >> 12) as u32) & 0xFFFF));
                         crate::diag::record(0x0904_0000 | (((size >> 12) as u32) & 0xFFFF));
@@ -872,7 +865,7 @@ unsafe fn query_segments(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTERIN
                         // CpuHostAperture-like: DxgkDdiMapCpuHostAperture maps
                         // each allocation's venus blob at the dxgkrnl-chosen
                         // aperture offset within this window.
-                        unsafe { write_bar_knob_descriptor(d, *gpa, *size) };
+                        unsafe { write_bar_knob_descriptor(d, *gpa, *size, &knobs) };
                     }
                 }
             }
@@ -883,7 +876,7 @@ unsafe fn query_segments(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTERIN
     STATUS_SUCCESS
 }
 
-unsafe fn query_segments3(args: &DXGKARG_QUERYADAPTERINFO) -> NTSTATUS {
+unsafe fn query_segments3(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTERINFO) -> NTSTATUS {
     if (args.OutputDataSize as usize) < size_of::<DXGK_QUERYSEGMENTOUT3>() {
         return STATUS_BUFFER_TOO_SMALL;
     }
@@ -917,12 +910,15 @@ unsafe fn query_segments3(args: &DXGKARG_QUERYADAPTERINFO) -> NTSTATUS {
     out.PagingBufferSize = 10 * 4096;
     out.PagingBufferPrivateDataSize = 0;
 
-    unsafe { write_aperture_descriptor3(descriptors) };
+    unsafe { write_aperture_descriptor3(descriptors, &adapter.knobs()) };
 
     STATUS_SUCCESS
 }
 
-unsafe fn query_segments_legacy(args: &DXGKARG_QUERYADAPTERINFO) -> NTSTATUS {
+unsafe fn query_segments_legacy(
+    adapter: &AdapterContext,
+    args: &DXGKARG_QUERYADAPTERINFO,
+) -> NTSTATUS {
     if (args.OutputDataSize as usize) < size_of::<DXGK_QUERYSEGMENTOUT>() {
         return STATUS_BUFFER_TOO_SMALL;
     }
@@ -955,7 +951,7 @@ unsafe fn query_segments_legacy(args: &DXGKARG_QUERYADAPTERINFO) -> NTSTATUS {
     out.PagingBufferSize = 10 * 4096;
     out.PagingBufferPrivateDataSize = 0;
 
-    unsafe { write_aperture_descriptor_legacy(descriptors) };
+    unsafe { write_aperture_descriptor_legacy(descriptors, &adapter.knobs()) };
 
     STATUS_SUCCESS
 }

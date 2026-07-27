@@ -17,7 +17,7 @@ use crate::adapter::AdapterContext;
 use crate::irql::PassiveLevel;
 
 fn diag_mode() -> u32 {
-    crate::diag::read_config_dword(b"ScanoutDiag", 0)
+    crate::diag::read_config_dword(crate::diag::knobs::SCANOUT_DIAG, 0)
 }
 
 fn uses_cpu_filled_cross_device_blob(mode: u32) -> bool {

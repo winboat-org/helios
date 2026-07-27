@@ -206,50 +206,9 @@ pub(crate) struct StartedState {
     /// StartDevice. Read lock-free by the ISR and both DPCs; publishing it as
     /// part of this struct is what makes that visibility structural.
     pub dxgkrnl: DXGKRNL_INTERFACE,
-    /// `AllocCached` service-key knob (read once in StartDevice; default 1).
-    /// When set, CpuVisible allocations are additionally flagged `Cached` so
-    /// dxgkrnl maps CPU views write-back instead of write-combined. The BAR
-    /// window is RAM-backed host shmem (x86 cache-coherent for all agents on
-    /// the same physical pages); WC reads measured ~200 MB/s in the IDD
-    /// readback (36 ms per 7.8 MiB frame, 2026-07-06). 0 = kill switch.
-    pub alloc_cached: bool,
-    /// `PresentProbe` service-key knob (read once in StartDevice; default 0).
-    /// When enabled, each exact Present source/destination pair performs one
-    /// bounded, fence-ordered CPU sample of the destination after its eighth
-    /// submission. This is a diagnostic only: the steady-state path never
-    /// waits or maps a frame, and the per-pair `probe_done` state statically
-    /// prevents repeated readbacks.
-    pub present_probe: bool,
-    /// `ScForceReject` service-key knob (read once in StartDevice;
-    /// default 0 = OFF, and absent from the registry in the shipped baseline).
-    ///
-    /// GATE INSTRUMENT. The T3 gate requires each deferred-programming refusal
-    /// exit to be forced with its counter proven to move and `VsCnt` still
-    /// advancing — and seven of the eight cannot be provoked naturally on a
-    /// healthy box. This makes `program_vidpn_source` take one specific exit so
-    /// that can be shown per boot-cycle, with `pnputil /restart-device` between
-    /// values instead of eight reboots.
-    ///
-    ///   1 = BadAlloc   2 = Extent   3 = Layout           4 = Format
-    ///   5 = LinearAllocFailed       6 = SetFailed
-    ///   7 = NoTarget                8 = CopyFailed
-    ///
-    /// Costs one atomic-free field read per SetVidPnSourceAddress. Recorded as
-    /// `ScFrc` at StartDevice. Candidate for deletion in T6 alongside the other
-    /// experiment surfaces once the gate evidence is banked.
-    pub forced_reject: u32,
-    /// `DisplayHalf` service-key knob (REG_DWORD, read once in StartDevice;
-    /// default 0 = OFF, the boot-proven render-only surface). When nonzero,
-    /// StartDevice advertises ONE video-present source + ONE child video-output
-    /// and the VidPn/child DDIs in `ddi::display`/`ddi::vidpn`/`ddi::start_device`
-    /// stand up a real virtual VidPn output + default monitor and drive
-    /// virtio-gpu scanout, instead of returning NOT_SUPPORTED. Default 0 keeps
-    /// the render-only recovery shape available; production sets it to 1 via
-    /// `reg add ... /v DisplayHalf /t REG_DWORD /d 1` + a guest reboot
-    /// (re-runs StartDevice → child enumeration) with NO reboot once deployed.
-    /// Demoted to 0 before publication if the transport never came up.
-    /// Value mirrored to the `DspH` fixed diag record at StartDevice.
-    pub display_half: bool,
+    /// Every service-key knob, snapshotted once at StartDevice. See
+    /// [`AdapterKnobs`].
+    pub knobs: AdapterKnobs,
     /// Scanout-0 mode the display half presents, together with the EDID
     /// generated from it. See [`ScanoutMode`].
     pub scanout_mode: ScanoutMode,
@@ -262,14 +221,150 @@ pub(crate) struct StartedState {
     transport: UnsafeCell<Option<TransportGeneration>>,
 }
 
-/// The service-key knobs, as one small POD so they cross the
-/// [`StartedState::boxed`] boundary without a wide argument list.
+/// Every service-key knob this driver reads, snapshotted ONCE per StartDevice.
+///
+/// One concept, one mechanism. Before this existed there were three:
+/// `AllocCached`/`PresentProbe`/`ScForceReject`/`DisplayHalf` were snapshotted
+/// here at StartDevice; `DirectFlipCaps` was re-read from the registry FOUR
+/// times per AddAdapter (the caps path plus once inside each of the three
+/// aperture descriptor writers); and `BarSegFlags`/`BarSegBaseMB` were read
+/// *inside* `write_bar_knob_descriptor`, which also performed two synchronous
+/// registry WRITES on every descriptor write — ungated by `DiagLevel`, because
+/// `record_named` has no such gate. A function named "write this descriptor"
+/// did blocking registry I/O in both directions.
+///
+/// Passing `&AdapterKnobs` to the descriptor writers removes their ability to do
+/// I/O at all: they become pure functions of their arguments. It also closes a
+/// real (if test-VM-only) inconsistency — `reg add ... /v DirectFlipCaps /d 1`
+/// executed BETWEEN the DRIVERCAPS query and the segment query of a
+/// `pnputil /restart-device` produced `SupportDirectFlip = 0` in the caps surface
+/// while the aperture descriptor set the DirectFlip segment flag, an internally
+/// inconsistent surface no diag record could explain because `0x01D7` bit 2 read 0.
+///
+/// Every field name here corresponds to a [`crate::diag::knobs`] entry, which is
+/// where the ≤14-byte lookup-buffer rule is enforced at compile time.
 #[derive(Clone, Copy)]
-pub(crate) struct StartedKnobs {
+pub(crate) struct AdapterKnobs {
+    /// `AllocCached` (default 1). When set, CpuVisible allocations are
+    /// additionally flagged `Cached` so dxgkrnl maps CPU views write-back
+    /// instead of write-combined. The BAR window is RAM-backed host shmem (x86
+    /// cache-coherent for all agents on the same physical pages); WC reads
+    /// measured ~200 MB/s in the IDD readback (36 ms per 7.8 MiB frame,
+    /// 2026-07-06). 0 = kill switch.
     pub alloc_cached: bool,
+    /// `PresentProbe` (default 0). When enabled, each exact Present
+    /// source/destination pair performs one bounded, fence-ordered CPU sample of
+    /// the destination after its eighth submission. Diagnostic only: the
+    /// steady-state path never waits or maps a frame, and the per-pair
+    /// `probe_done` state statically prevents repeated readbacks.
     pub present_probe: bool,
+    /// `ScForceReject` (default 0 = OFF, absent from the shipped registry).
+    ///
+    /// GATE INSTRUMENT. The T3 gate requires each deferred-programming refusal
+    /// exit to be forced with its counter proven to move and `VsCnt` still
+    /// advancing — and seven of the eight cannot be provoked naturally on a
+    /// healthy box. This makes `program_vidpn_source` take one specific exit so
+    /// that can be shown per boot-cycle, with `pnputil /restart-device` between
+    /// values instead of eight reboots.
+    ///
+    ///   1 = BadAlloc   2 = Extent   3 = Layout           4 = Format
+    ///   5 = LinearAllocFailed       6 = SetFailed
+    ///   7 = NoTarget                8 = CopyFailed
+    ///
+    /// Costs one field read per SetVidPnSourceAddress. Recorded as `ScFrc`.
+    /// Candidate for deletion in T6 once the gate evidence is banked.
     pub forced_reject: u32,
+    /// `DisplayHalf` (default 0 = OFF, the boot-proven render-only surface).
+    /// When nonzero, StartDevice advertises ONE video-present source + ONE child
+    /// video-output and the VidPn/child DDIs in
+    /// `ddi::display`/`ddi::vidpn`/`ddi::start_device` stand up a real virtual
+    /// VidPn output + default monitor and drive virtio-gpu scanout, instead of
+    /// returning NOT_SUPPORTED. Production sets it to 1 via `reg add` + a guest
+    /// reboot (re-runs StartDevice -> child enumeration). Demoted to 0 before
+    /// publication if the transport never came up. Mirrored to `DspH`.
     pub display_half: bool,
+    /// `DirectFlipCaps` (default 0 = deny direct flip everywhere — the truthful
+    /// surface; see the `SupportDirectFlip` comment in `query_driver_caps`).
+    /// Nonzero restores the legacy bring-up advertisement, in BOTH the adapter
+    /// cap and the aperture segment flags, which is the point of reading it once.
+    pub direct_flip: bool,
+    /// `CrossAdaptCaps` (default 0). Nonzero advertises
+    /// `DXGK_VIDMMCAPS.CrossAdapterResource` (tier-1 cross-adapter copy support),
+    /// OR'd with the compile-time `DECLARE_CROSS_ADAPTER_RESOURCE`.
+    pub cross_adapter: bool,
+    /// `BarSegFlags` (default 0x1C = CacheCoherent | SupportsCpuHostAperture |
+    /// SupportsCachedCpuHostAperture). The BAR descriptor's flag word.
+    pub bar_seg_flags: u32,
+    /// `BarSegBaseMB` (default 0). The BAR descriptor's GPU-physical
+    /// `BaseAddress` in MiB; a nonzero value tests the BaseAddress-overlap
+    /// hypothesis.
+    pub bar_seg_base_mb: u32,
+    /// `BarSegMode` (default 10). Parsed into
+    /// `crate::ddi::start_device::BarSegTopology`; kept raw here so the coerced
+    /// value can be reported.
+    pub bar_seg_mode: u32,
+}
+
+impl AdapterKnobs {
+    /// The value each knob takes when absent from the service key.
+    ///
+    /// Load-bearing, and it must not drift: with every knob absent this has to
+    /// equal what [`Self::read`] produces, which is what makes the emitted
+    /// descriptors byte-identical to the old per-writer `read_config_dword`
+    /// calls. Kept as a named const because it is also the documented answer to
+    /// "what does this driver do with no registry configuration at all".
+    #[allow(dead_code)]
+    pub const DEFAULTS: Self = Self {
+        alloc_cached: true,
+        present_probe: false,
+        forced_reject: 0,
+        display_half: false,
+        direct_flip: false,
+        cross_adapter: false,
+        bar_seg_flags: 0x1C,
+        bar_seg_base_mb: 0,
+        bar_seg_mode: 10,
+    };
+
+    /// Read every knob once. PASSIVE_LEVEL.
+    ///
+    /// Called twice per device lifetime: at AddAdapter (so the AddAdapter-time
+    /// caps and segment queries answer from real registry values — a
+    /// `DirectFlipCaps=1` A/B must still take effect before StartDevice runs,
+    /// exactly as it did when each writer read the registry itself) and again in
+    /// StartDevice through [`Self::read_at_start`], so `reg add` +
+    /// `pnputil /restart-device` still picks up a change with no reboot.
+    pub fn read() -> Self {
+        use crate::diag::{knobs, read_config_dword};
+        Self {
+            alloc_cached: read_config_dword(knobs::ALLOC_CACHED, 1) != 0,
+            present_probe: read_config_dword(knobs::PRESENT_PROBE, 0) != 0,
+            forced_reject: read_config_dword(knobs::SC_FORCE_REJECT, 0),
+            display_half: read_config_dword(knobs::DISPLAY_HALF, 0) != 0,
+            direct_flip: read_config_dword(knobs::DIRECT_FLIP_CAPS, 0) != 0,
+            cross_adapter: read_config_dword(knobs::CROSS_ADAPT_CAPS, 0) != 0,
+            bar_seg_flags: read_config_dword(knobs::BAR_SEG_FLAGS, 0x1C),
+            bar_seg_base_mb: read_config_dword(knobs::BAR_SEG_BASE_MB, 0),
+            bar_seg_mode: read_config_dword(knobs::BAR_SEG_MODE, 10),
+        }
+    }
+
+    /// [`Self::read`] plus the fixed-name breadcrumbs that mirror the knobs.
+    /// StartDevice only, so they cost one registry write per start — the
+    /// `BarF`/`BarB` pair used to be written on every descriptor write, from
+    /// inside `write_bar_knob_descriptor`, ungated by `DiagLevel`. Names and
+    /// values unchanged.
+    pub fn read_at_start() -> Self {
+        let knobs = Self::read();
+        crate::diag::record_named_bytes(b"AlcC", knobs.alloc_cached as u32);
+        crate::diag::record_named_bytes(b"PBPrEn", knobs.present_probe as u32);
+        crate::diag::record_named_bytes(b"ScFrc", knobs.forced_reject);
+        crate::diag::record_named_bytes(b"DspH", knobs.display_half as u32);
+        crate::diag::record_named_bytes(b"BarF", knobs.bar_seg_flags);
+        crate::diag::record_named_bytes(b"BarB", knobs.bar_seg_base_mb);
+        crate::diag::record_named_bytes(b"BarM", knobs.bar_seg_mode);
+        knobs
+    }
 }
 
 impl StartedState {
@@ -303,17 +398,14 @@ impl StartedState {
     #[inline(never)]
     pub(crate) unsafe fn boxed(
         dxgkrnl: *const DXGKRNL_INTERFACE,
-        knobs: StartedKnobs,
+        knobs: AdapterKnobs,
         scanout_mode: ScanoutMode,
         paging_ram: Option<PagingRam>,
     ) -> Box<Self> {
         Box::new(Self {
             // SAFETY: per the fn contract; a plain POD copy of dxgkrnl's buffer.
             dxgkrnl: unsafe { *dxgkrnl },
-            alloc_cached: knobs.alloc_cached,
-            present_probe: knobs.present_probe,
-            forced_reject: knobs.forced_reject,
-            display_half: knobs.display_half,
+            knobs,
             scanout_mode,
             paging_ram,
             transport: UnsafeCell::new(None),
@@ -417,6 +509,15 @@ pub(crate) struct TransportGeneration {
 pub struct AdapterContext {
     /// Physical device object for the virtio-gpu device.
     pub pdo: PDEVICE_OBJECT,
+    /// Service-key knobs as read at **AddAdapter**, for the window before
+    /// StartDevice has published its own snapshot.
+    ///
+    /// That window is not hypothetical: dxgkrnl issues the DRIVERCAPS and
+    /// QUERYSEGMENT queries during AddAdapter, so this is what those answer
+    /// from. Written once in [`Self::new`], before the context is published, and
+    /// never mutated — which is why it needs no `UnsafeCell` and no ordering,
+    /// unlike everything below it. Reads go through [`Self::knobs`].
+    initial_knobs: AdapterKnobs,
     /// Everything StartDevice establishes, published ONCE. See [`StartedState`].
     ///
     /// Reached only through [`Self::started`]; there is no `&mut` path to it, so
@@ -1027,6 +1128,12 @@ impl AdapterContext {
     fn new(pdo: PDEVICE_OBJECT) -> Self {
         Self {
             pdo,
+            // PASSIVE_LEVEL: `create` is called from AddAdapter. Read here so the
+            // AddAdapter-time caps/segment queries — which run BEFORE
+            // StartDevice — answer from the registry rather than from
+            // `DEFAULTS`. Written once, before this context is published, so it
+            // needs no interior mutability and no synchronisation.
+            initial_knobs: AdapterKnobs::read(),
             started: UnsafeCell::new(None),
             started_published: AtomicU32::new(0),
             last_completed_fence: AtomicU32::new(0),
@@ -2222,27 +2329,41 @@ impl AdapterContext {
         self.started().map(|s| &s.dxgkrnl)
     }
 
+    /// The service-key knob snapshot, or [`AdapterKnobs::DEFAULTS`] before
+    /// StartDevice has published one.
+    ///
+    /// Every knob reader in the driver goes through here, so "a query landing
+    /// before StartDevice sees the documented defaults" is one branch in one
+    /// place rather than a per-accessor `map_or` whose fallback could drift from
+    /// the `read_config_dword` default it is supposed to mirror.
+    ///
+    /// Returned by value: `AdapterKnobs` is a small `Copy` POD, and handing out a
+    /// reference would tie every caller's borrow to the published slot.
+    pub(crate) fn knobs(&self) -> AdapterKnobs {
+        self.started().map_or(self.initial_knobs, |s| s.knobs)
+    }
+
     /// `DisplayHalf`: whether the display DDIs answer for real. False before
     /// StartDevice and on the render-only recovery shape.
     pub fn display_half(&self) -> bool {
-        self.started().is_some_and(|s| s.display_half)
+        self.knobs().display_half
     }
 
     /// `AllocCached`. Defaults to TRUE before StartDevice, matching the value the
     /// field was constructed with.
     pub fn alloc_cached(&self) -> bool {
-        self.started().map_or(true, |s| s.alloc_cached)
+        self.knobs().alloc_cached
     }
 
     /// `PresentProbe`. Defaults to false before StartDevice.
     pub fn present_probe(&self) -> bool {
-        self.started().is_some_and(|s| s.present_probe)
+        self.knobs().present_probe
     }
 
     /// `ScForceReject` — the T3 gate instrument. 0 = off (the shipped
     /// default and the only value present in a production registry).
     pub(crate) fn forced_reject(&self) -> u32 {
-        self.started().map_or(0, |s| s.forced_reject)
+        self.knobs().forced_reject
     }
 
     /// The EDID served by `DxgkDdiQueryDeviceDescriptor`.

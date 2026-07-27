@@ -4885,7 +4885,7 @@ impl VenusClient {
             crate::diag::record_named_bytes(b"SdgGpBb", 1);
             self.end_command_buffer(adapter, command_buffer_id)?;
             crate::diag::record_named_bytes(b"SdgGpEnd", 1);
-            let fence_id = if crate::diag::read_config_dword(b"ScanoutDiag", 0) >= 6 {
+            let fence_id = if crate::diag::read_config_dword(crate::diag::knobs::SCANOUT_DIAG, 0) >= 6 {
                 let fence_id = self.create_fence(adapter)?;
                 crate::diag::record_named_bytes(b"SdgGpF", 1);
                 Some(fence_id)
@@ -4919,7 +4919,7 @@ impl VenusClient {
     ) -> Result<ScanoutImageBlob, VirtioError> {
         let image_id = self.create_scanout_image(adapter, width, height)?;
         let (req_size, memory_type_bits) = self.image_memory_requirements(adapter, image_id)?;
-        let diag_mode = crate::diag::read_config_dword(b"ScanoutDiag", 0);
+        let diag_mode = crate::diag::read_config_dword(crate::diag::knobs::SCANOUT_DIAG, 0);
         let cpu_filled_cross_device_blob = diag_mode == 9 || diag_mode == 11;
         let prefer_device_local = diag_mode >= 5 && !cpu_filled_cross_device_blob;
         let memory_type_index = Self::accept_memory_type(
@@ -5695,7 +5695,7 @@ impl VenusInstance {
             b"VK_KHR_external_memory_fd\0",
             b"VK_EXT_external_memory_dma_buf\0",
         ];
-        let scanout_diag = crate::diag::read_config_dword(b"ScanoutDiag", 0);
+        let scanout_diag = crate::diag::read_config_dword(crate::diag::knobs::SCANOUT_DIAG, 0);
         // Production DisplayHalf needs only the export trio for its dedicated
         // plain LINEAR DMA_BUF image. The modifier/image-format-list tier
         // remains strictly diagnostic; never enable it merely because real

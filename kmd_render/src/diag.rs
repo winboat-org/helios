@@ -41,7 +41,7 @@ pub fn level() -> u32 {
     if cached != u32::MAX {
         return cached;
     }
-    let level = read_config_dword(b"DiagLevel", 0);
+    let level = read_config_dword(knobs::DIAG_LEVEL, 0);
     DIAG_LEVEL.store(level, Ordering::Relaxed);
     level
 }
@@ -237,6 +237,28 @@ impl FaultCounter {
     ];
 }
 
+/// Compile-time proof that no fault-counter name is truncated.
+///
+/// [`record_named_bytes`] silently clamps to [`MAX_CONFIG_NAME`], so two counters
+/// whose names share a 14-byte prefix would MERGE into one registry value — a
+/// failure counter reading someone else's number. The rule was a doc comment on
+/// [`FaultCounter::name`]; this makes it a build failure.
+///
+/// Scope, stated honestly: this covers the counter set, and [`KnobName`] covers
+/// every knob READ. The ~478 remaining raw `record_named_bytes(b"…")` call sites
+/// still rely on the review rule — converting them is a mechanical sweep too
+/// large to land inside a tranche that has to stay reviewable.
+const _: () = {
+    let mut i = 0;
+    while i < FaultCounter::ALL.len() {
+        assert!(
+            FaultCounter::ALL[i].name().len() <= MAX_CONFIG_NAME,
+            "FaultCounter name exceeds MAX_CONFIG_NAME and would merge with another counter"
+        );
+        i += 1;
+    }
+};
+
 /// Report a lifecycle failure through the **ungated** named-counter path.
 /// PASSIVE_LEVEL only, like every other writer here.
 pub fn fault(counter: FaultCounter, value: u32) {
@@ -421,17 +443,63 @@ const RTL_QUERY_REGISTRY_DIRECT: u32 = 0x20;
 /// was created that way and read as 0 on every boot, which cost a deploy cycle.
 pub const MAX_CONFIG_NAME: usize = 14;
 
-/// Read a service-key REG_DWORD knob, or `default` if absent.
+/// A service-key value name PROVEN to survive the lookup buffer.
 ///
-/// The name length is checked AT COMPILE TIME — a knob named longer than
-/// [`MAX_CONFIG_NAME`] is a build failure, not a silent always-default.
-pub fn read_config_dword<const N: usize>(name: &[u8; N], default: u32) -> u32 {
-    const {
+/// The constructor is `const fn` and every [`knobs`] entry is a `const` item, so
+/// the length assert is evaluated during `cargo check` — not only at
+/// monomorphisation, which is where the previous inline-const-in-a-generic-fn
+/// form fired (a build failure but not a check failure, so `cargo check` passed
+/// on a knob that could never be read).
+#[derive(Clone, Copy)]
+pub struct KnobName(&'static [u8]);
+
+impl KnobName {
+    /// Fails the BUILD if the name cannot survive the lookup buffer.
+    pub const fn new(name: &'static [u8]) -> Self {
         assert!(
-            N <= MAX_CONFIG_NAME,
+            name.len() <= MAX_CONFIG_NAME,
             "knob name exceeds the RtlQueryRegistryValues lookup buffer and would silently read as its default"
-        )
-    };
+        );
+        Self(name)
+    }
+}
+
+/// Every service-key knob the driver reads, in one place.
+///
+/// A knob that is not here cannot be read, which makes this the inventory rather
+/// than a list someone maintains in ROADMAP.md by grepping. Each is a `const`
+/// item, so [`KnobName::new`]'s length assert runs on every build of this module.
+pub mod knobs {
+    use super::KnobName;
+
+    /// Breadcrumb ring level. 0 (default) = the `S<idx>` ring is off.
+    pub const DIAG_LEVEL: KnobName = KnobName::new(b"DiagLevel");
+    /// Segment topology. Legal values 0 and 10 only — see `BarSegTopology`.
+    pub const BAR_SEG_MODE: KnobName = KnobName::new(b"BarSegMode");
+    /// CpuVisible cached-allocation kill switch (default 1 = cached).
+    pub const ALLOC_CACHED: KnobName = KnobName::new(b"AllocCached");
+    /// Per-present probe instrumentation (default 0).
+    pub const PRESENT_PROBE: KnobName = KnobName::new(b"PresentProbe");
+    /// T3 gate instrument: force one deferred-programming refusal (default 0).
+    pub const SC_FORCE_REJECT: KnobName = KnobName::new(b"ScForceReject");
+    /// Render+display adapter shape (default 0 = render-only recovery).
+    pub const DISPLAY_HALF: KnobName = KnobName::new(b"DisplayHalf");
+    /// Restore the legacy `SupportDirectFlip` advertisement (default 0 = deny).
+    pub const DIRECT_FLIP_CAPS: KnobName = KnobName::new(b"DirectFlipCaps");
+    /// Advertise `DXGK_VIDMMCAPS.CrossAdapterResource` (default 0).
+    /// Exactly [`super::MAX_CONFIG_NAME`] bytes — the assert's live subject.
+    pub const CROSS_ADAPT_CAPS: KnobName = KnobName::new(b"CrossAdaptCaps");
+    /// BAR descriptor flag word (default 0x1C).
+    pub const BAR_SEG_FLAGS: KnobName = KnobName::new(b"BarSegFlags");
+    /// BAR descriptor `BaseAddress` in MiB (default 0).
+    pub const BAR_SEG_BASE_MB: KnobName = KnobName::new(b"BarSegBaseMB");
+    /// Diagnostic scan-out mode. Production must leave this absent/0.
+    pub const SCANOUT_DIAG: KnobName = KnobName::new(b"ScanoutDiag");
+}
+
+/// Read a service-key REG_DWORD knob, or `default` if absent.
+pub fn read_config_dword(name: KnobName, default: u32) -> u32 {
+    let name = name.0;
     let mut name_buf = [0u16; 16];
     let n = name.len().min(MAX_CONFIG_NAME);
     let mut i = 0;

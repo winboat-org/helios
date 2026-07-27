@@ -77,12 +77,14 @@ impl TryFrom<u32> for BarSegTopology {
 }
 
 /// Configure the BAR memory segment per [`BarSegTopology`].
+///
+/// Takes the knob snapshot rather than reading the registry: StartDevice has
+/// already read `BarSegMode` once and mirrored it to `BarM`.
 fn setup_bar_segment(
     adapter: &crate::adapter::AdapterContext,
+    knobs: &crate::adapter::AdapterKnobs,
 ) -> Option<crate::adapter::BarSegment> {
-    let mode = crate::diag::read_config_dword(b"BarSegMode", 10);
-    crate::diag::record_named_bytes(b"BarM", mode);
-    let topo = match BarSegTopology::try_from(mode) {
+    let topo = match BarSegTopology::try_from(knobs.bar_seg_mode) {
         Ok(topo) => topo,
         Err(stale) => {
             // A deleted bisect arm, or a typo. Bind the production shape and say
@@ -220,19 +222,11 @@ pub unsafe extern "C" fn dxgkddi_start_device(
     // publication site and dereferenced straight into the heap allocation.
     crate::diag::record(0x0B00_0002);
 
-    // Service-key knobs, read once per StartDevice (same iteration model as
-    // `BarSegMode`: `reg add` + `devcon restart` re-runs this without a
-    // reboot). See the field docs in `adapter.rs`.
-    let alloc_cached = crate::diag::read_config_dword(b"AllocCached", 1) != 0;
-    let present_probe = crate::diag::read_config_dword(b"PresentProbe", 0) != 0;
-    // GATE INSTRUMENT (T3): forces one deferred-programming refusal exit. 0 = off
-    // and absent from a production registry. See `StartedState::forced_reject`.
-    let forced_reject = crate::diag::read_config_dword(b"ScForceReject", 0);
-    let mut display_half = crate::diag::read_config_dword(b"DisplayHalf", 0) != 0;
-    crate::diag::record_named_bytes(b"AlcC", alloc_cached as u32);
-    crate::diag::record_named_bytes(b"PBPrEn", present_probe as u32);
-    crate::diag::record_named_bytes(b"ScFrc", forced_reject);
-    crate::diag::record_named_bytes(b"DspH", display_half as u32);
+    // EVERY service-key knob, read once per StartDevice (`reg add` + `devcon
+    // restart` re-runs this without a reboot), together with the breadcrumbs that
+    // mirror them. The descriptor writers and the caps path take this value, so
+    // none of them can reach the registry themselves. See `AdapterKnobs`.
+    let mut knobs = crate::adapter::AdapterKnobs::read_at_start();
 
     // Registry values persist across boots, so a stale nonzero fault counter is
     // indistinguishable from a fault on THIS boot. Zero the whole set once here,
@@ -295,7 +289,7 @@ pub unsafe extern "C" fn dxgkddi_start_device(
             // Reserve the window head BEFORE any blob map can allocate a
             // window offset, and before dxgkrnl queries segments.
             // Two-memory-split fix (Option A).
-            bar_segment = setup_bar_segment(adapter);
+            bar_segment = setup_bar_segment(adapter, &knobs);
 
             // ── Venus-backed page-table memory (best-effort) ─────────────────
             // Self-allocate a 16-MiB HOST_VISIBLE|HOST_COHERENT VkDeviceMemory over
@@ -335,8 +329,8 @@ pub unsafe extern "C" fn dxgkddi_start_device(
     // Turning the flag OFF - rather than merely reporting zero sources - is
     // required because ~20 display DDIs branch on the flag itself. StartDevice
     // still returns STATUS_SUCCESS: the render-only recovery shape is preserved.
-    if display_half && adapter.with_virtio(|_| ()).is_err() {
-        display_half = false;
+    if knobs.display_half && adapter.with_virtio(|_| ()).is_err() {
+        knobs.display_half = false;
         crate::diag::fault(
             crate::diag::FaultCounter::StNoTx,
             if transport_fail_status != 0 {
@@ -353,7 +347,7 @@ pub unsafe extern "C" fn dxgkddi_start_device(
     // video-output, with the VidPn/child DDIs driving virtio-gpu scanout.
     // SAFETY: out-pointers validated non-null above.
     unsafe {
-        if display_half {
+        if knobs.display_half {
             *number_of_video_present_sources = crate::ddi::vidpn::NUM_VIDPN_SOURCES;
             *number_of_children = crate::ddi::vidpn::NUM_CHILDREN;
         } else {
@@ -375,7 +369,7 @@ pub unsafe extern "C" fn dxgkddi_start_device(
     // The scan-out mode and its EDID, resolved BEFORE publication because
     // `StartedState` is published exactly once.
     let mut host_mode = None;
-    if display_half {
+    if knobs.display_half {
         // Adopt the host's scanout-0 size (GET_DISPLAY_INFO, captured at transport
         // init) as the VidPn mode + generated-EDID native resolution, so Helios
         // presents the size QEMU actually wants on scanout 0. Falls back to the
@@ -403,7 +397,7 @@ pub unsafe extern "C" fn dxgkddi_start_device(
     // EDID, so the two cannot disagree. The render-only surface advertises no
     // monitor, so its EDID is zeroed and QueryDeviceDescriptor answers
     // NOT_SUPPORTED before ever reading it.
-    let scanout_mode = if display_half {
+    let scanout_mode = if knobs.display_half {
         crate::adapter::ScanoutMode::adopt(host_mode)
     } else {
         crate::adapter::ScanoutMode::render_only()
@@ -417,12 +411,7 @@ pub unsafe extern "C" fn dxgkddi_start_device(
     unsafe {
         adapter.publish_started(crate::adapter::StartedState::boxed(
             dxgkrnl_interface,
-            crate::adapter::StartedKnobs {
-                alloc_cached,
-                present_probe,
-                forced_reject,
-                display_half,
-            },
+            knobs,
             scanout_mode,
             paging_ram,
         ));
@@ -433,7 +422,7 @@ pub unsafe extern "C" fn dxgkddi_start_device(
         }));
     }
 
-    if display_half {
+    if knobs.display_half {
         crate::diag::record_named_bytes(b"DspMd", adapter.display_mode_packed());
         crate::ddi::scanout_diag::maybe_run(passive, adapter);
 
