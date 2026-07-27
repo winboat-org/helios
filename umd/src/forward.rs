@@ -9201,6 +9201,224 @@ unsafe fn submit_runtime_present_then_call(
     present_cb(dev.h_rt_device, callback_args)
 }
 
+/// Which entry point a [`finish_present`] call is serving.
+///
+/// R1013. `dxgi_present` and `dxgi_present1`'s multi-surface arm duplicated
+/// ~70 lines -- the `DXGIDDICB_PRESENT` construction, the private-data attach,
+/// `RuntimePresentDependencies::new`, the PresentCb identity trace and
+/// `submit_runtime_present_then_call` -- and the copies had DRIFTED. Every
+/// fix landed in `dxgi_present` only, silently not applying to any swapchain
+/// presenting through Present1's multi-surface form.
+///
+/// This impl is the divergence table: each surviving difference is one method
+/// with both arms visible, instead of code that is present on one path and
+/// absent on the other. **Every arm below reproduces today's behaviour
+/// exactly**; narrowing any of them is a separate change with its own
+/// evidence.
+///
+/// Four of the six differences the review lists are already gone, deleted by
+/// T6 rather than reconciled here: the vehicle TLS slot and `PRESENT_RESULT`
+/// (R912), the discarded frame-gate result -- `EXT_FLIP_GATE_TIMEOUTS` is now
+/// bumped in one shared place, `run_present_frame_gate` -- the
+/// `copy_to_scanout_target` asymmetry (R910), and `syncVal` (R912).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PresentKind {
+    Present,
+    Present1Multi,
+}
+
+impl PresentKind {
+    /// Prefix on the PresentCb identity trace. The two spellings are load
+    /// bearing: they are how a log reader tells which entry point ran.
+    fn identity_prefix(self) -> &'static str {
+        match self {
+            PresentKind::Present => "DXGI ",
+            PresentKind::Present1Multi => "DXGI Present1 ",
+        }
+    }
+
+    /// Prefix on this tail's error lines.
+    fn error_tag(self) -> &'static str {
+        match self {
+            PresentKind::Present => "DXGI Present",
+            PresentKind::Present1Multi => "DXGI Present1 multi",
+        }
+    }
+
+    /// What the tail returns when it never reaches the present callback --
+    /// no device, or a refused prerequisite on the fall-through path.
+    ///
+    /// DIVERGENT AND PRESERVED: Present1-multi initialises to `E_INVALIDARG`,
+    /// so a device-less path there returns a FAILURE where Present returns
+    /// success.
+    fn initial_hr(self) -> i32 {
+        match self {
+            PresentKind::Present => 0,
+            PresentKind::Present1Multi => E_INVALIDARG,
+        }
+    }
+
+    /// What a failed `present_prerequisites` check does.
+    ///
+    /// DIVERGENT AND PRESERVED: Present logs (rate-capped) and FALLS THROUGH
+    /// to the rest of its body with `initial_hr`; Present1-multi RETURNS
+    /// `DXGI_ERROR_UNSUPPORTED` immediately, skipping its trailing log. The
+    /// two also log different field sets, which is why the message is emitted
+    /// per kind rather than unified.
+    fn missing_prereq_hr(self) -> Option<i32> {
+        match self {
+            PresentKind::Present => None,
+            PresentKind::Present1Multi => Some(DXGI_ERROR_UNSUPPORTED),
+        }
+    }
+}
+
+/// The per-call values the shared present tail needs that are not derivable
+/// from [`PresentKind`]. Both entry points read them from their own (different)
+/// DDI argument struct.
+struct PresentRequest {
+    kind: PresentKind,
+    /// `DXGI_DDI_ARG_PRESENT{,1}::pDXGIContext`, passed straight through.
+    dxgi_context: *mut c_void,
+    /// The raw `Flags` word. TRACE ONLY -- nothing branches on it here.
+    flags: u32,
+}
+
+/// The shared present tail: build `DXGIDDICB_PRESENT`, attach the direct-primary
+/// private data, resolve the runtime dependencies, trace the callback identity,
+/// and submit.
+///
+/// Everything from the prerequisite check through
+/// `submit_runtime_present_then_call`, written once. The scanout-publish
+/// decision, the src->dst copy and the frame gate stay at the call sites: those
+/// genuinely differ, and Present1-multi performs none of them.
+///
+/// `Ok(hr)` means "carry on with the rest of your body"; `Err(hr)` means
+/// "return this from the DDI entry point NOW, running nothing else". That
+/// distinction is load-bearing rather than stylistic: both entry points used
+/// a bare `return` for the lost-invariant and (for Present1) missing-callback
+/// cases, which skipped the vehicle mint, `EXT_PRESENTS` and the trailing
+/// per-present log. Collapsing those into a plain HRESULT would have started
+/// minting vehicle slots on a path that never did.
+unsafe fn finish_present(
+    h: Hdevice,
+    src_h: ddi::D3D10DDI_HRESOURCE,
+    dst_h: ddi::D3D10DDI_HRESOURCE,
+    src_alloc: u32,
+    dst_alloc: u32,
+    req: PresentRequest,
+) -> Result<i32, i32> {
+    let no_callback_hr = req.kind.initial_hr();
+    let Some(dev) = helios_device(h) else {
+        return Ok(no_callback_hr);
+    };
+
+    let ready = match present_prerequisites(dev, src_alloc) {
+        Ok(ready) => ready,
+        Err(_skip) => {
+            // Which of the three preconditions failed lives in
+            // PRESENT_SKIP_NO_CALLBACKS / _NO_CONTEXT / _NO_SRC_ALLOC.
+            match req.kind {
+                PresentKind::Present => {
+                    // Rate cap: same message text and field set, fewer lines.
+                    if PRESENT_SKIP_LOG_COUNT
+                        .first_n_then_every_from_one(64, 512)
+                        .is_some()
+                    {
+                        log_error!(
+                            "DXGI Present: skip PresentCb callbacks={} src=0x{:x} hContext={:p}",
+                            dev.dxgi_callbacks.is_null(),
+                            src_alloc,
+                            dev.context
+                                .as_ref()
+                                .map_or(core::ptr::null_mut(), |c| c.handle.as_ptr())
+                        );
+                    }
+                }
+                PresentKind::Present1Multi => {
+                    log_error!(
+                        "DXGI Present1 multi: missing callback table/context callbacks={} hContext={:p}",
+                        dev.dxgi_callbacks.is_null(),
+                        dev.context
+                            .as_ref()
+                            .map_or(core::ptr::null_mut(), |c| c.handle.as_ptr())
+                    );
+                }
+            }
+            return match req.kind.missing_prereq_hr() {
+                Some(hr) => Err(hr),
+                None => Ok(no_callback_hr),
+            };
+        }
+    };
+
+    let mut cb = ddi::DXGIDDICB_PRESENT::default();
+    let present_private = presented_primary_private(h, src_h);
+    // `ready` carries the same two values both entry points used to spell out
+    // by hand -- `src_alloc` proved non-zero, and the context handle proved
+    // present -- so this is the checked form of what Present1-multi was
+    // re-deriving from `dev.context` after the check had already run.
+    cb.hSrcAllocation = ready.src_alloc.get();
+    cb.hDstAllocation = dst_alloc;
+    cb.pDXGIContext = req.dxgi_context;
+    cb.hContext = ready.h_context.as_ptr();
+    cb.BroadcastContextCount = 0;
+    if let Some(ref private) = present_private {
+        cb.PrivateDriverDataSize = core::mem::size_of::<HeliosPresentPrivateData>() as u32;
+        cb.pPrivateDriverData = (private as *const HeliosPresentPrivateData)
+            .cast_mut()
+            .cast();
+    } else {
+        cb.PrivateDriverDataSize = 0;
+        cb.pPrivateDriverData = core::ptr::null_mut();
+    }
+    cb.bOptimizeForComposition = if present_optimize_composition_enabled() {
+        1
+    } else {
+        0
+    };
+    let Some(dependencies) = RuntimePresentDependencies::new(src_alloc, dst_alloc) else {
+        log_error!(
+            "{}: nonzero source allocation invariant lost",
+            req.kind.error_tag()
+        );
+        return Err(E_FAIL);
+    };
+    if let Some(cb_n) = PRESENT_CB_LOG_COUNT.first_n_then_every_from_one(128, 512) {
+        let (src_rt, src_km) = resource_parent_handles(src_h);
+        let (dst_rt, dst_km) = resource_parent_handles(dst_h);
+        trace_line!(
+            "{}PresentCb identity: #{} src_alloc=0x{:x} dst_alloc=0x{:x} \
+             src_hDrv={:p} src_hRT={:p} src_hKM=0x{:x} dst_hDrv={:p} \
+             dst_hRT={:p} dst_hKM=0x{:x} hContext={:p} dxgi_context={:p} \
+             flags=0x{:x} broadcast={} private={:p}/{} optimize={}",
+            req.kind.identity_prefix(),
+            cb_n,
+            cb.hSrcAllocation,
+            cb.hDstAllocation,
+            src_h.pDrvPrivate,
+            src_rt,
+            src_km,
+            dst_h.pDrvPrivate,
+            dst_rt,
+            dst_km,
+            cb.hContext,
+            cb.pDXGIContext,
+            req.flags,
+            cb.BroadcastContextCount,
+            cb.pPrivateDriverData,
+            cb.PrivateDriverDataSize,
+            cb.bOptimizeForComposition,
+        );
+    }
+    Ok(submit_runtime_present_then_call(
+        dev,
+        dependencies,
+        present_private,
+        &mut cb,
+    ))
+}
+
 /// DXGI `pfnPresent`: copy the source resource to the destination resource when
 /// DXGI provides both handles, then flush submitted GPU work.
 unsafe extern "C" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT) -> i32 {
@@ -9217,7 +9435,6 @@ unsafe extern "C" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT) -> i32 {
     let src_alloc = resource_allocation(src_h);
     let dst_alloc = resource_allocation(dst_h);
     let mut copied = false;
-    let mut present_hr = 0;
 
     // Dcomp present vehicle (road 4): a pending TLS source means THIS
     // present is the vehicle carrying an ICD frame — replace the normal
@@ -9312,76 +9529,23 @@ unsafe extern "C" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT) -> i32 {
         }
     }
 
-    if let Some(dev) = helios_device(h) {
-        if let Ok(ready) = present_prerequisites(dev, src_alloc) {
-            let mut cb = ddi::DXGIDDICB_PRESENT::default();
-            let present_private = presented_primary_private(h, src_h);
-            cb.hSrcAllocation = ready.src_alloc.get();
-            cb.hDstAllocation = dst_alloc;
-            cb.pDXGIContext = a.pDXGIContext;
-            cb.hContext = ready.h_context.as_ptr();
-            cb.BroadcastContextCount = 0;
-            if let Some(ref private) = present_private {
-                cb.PrivateDriverDataSize = core::mem::size_of::<HeliosPresentPrivateData>() as u32;
-                cb.pPrivateDriverData = (private as *const HeliosPresentPrivateData)
-                    .cast_mut()
-                    .cast();
-            } else {
-                cb.PrivateDriverDataSize = 0;
-                cb.pPrivateDriverData = core::ptr::null_mut();
-            }
-            cb.bOptimizeForComposition = if present_optimize_composition_enabled() {
-                1
-            } else {
-                0
-            };
-            let Some(dependencies) = RuntimePresentDependencies::new(src_alloc, dst_alloc) else {
-                log_error!("DXGI Present: nonzero source allocation invariant lost");
-                return E_FAIL;
-            };
-            if let Some(cb_n) = PRESENT_CB_LOG_COUNT.first_n_then_every_from_one(128, 512) {
-                let (src_rt, src_km) = resource_parent_handles(src_h);
-                let (dst_rt, dst_km) = resource_parent_handles(dst_h);
-                trace_line!(
-                    "DXGI PresentCb identity: #{} src_alloc=0x{:x} dst_alloc=0x{:x} \
-                     src_hDrv={:p} src_hRT={:p} src_hKM=0x{:x} dst_hDrv={:p} \
-                     dst_hRT={:p} dst_hKM=0x{:x} hContext={:p} dxgi_context={:p} \
-                     flags=0x{:x} broadcast={} private={:p}/{} optimize={}",
-                    cb_n,
-                    cb.hSrcAllocation,
-                    cb.hDstAllocation,
-                    src_h.pDrvPrivate,
-                    src_rt,
-                    src_km,
-                    dst_h.pDrvPrivate,
-                    dst_rt,
-                    dst_km,
-                    cb.hContext,
-                    cb.pDXGIContext,
-                    *(&a.Flags as *const ddi::DXGI_DDI_PRESENT_FLAGS as *const u32),
-                    cb.BroadcastContextCount,
-                    cb.pPrivateDriverData,
-                    cb.PrivateDriverDataSize,
-                    cb.bOptimizeForComposition,
-                );
-            }
-            present_hr =
-                submit_runtime_present_then_call(dev, dependencies, present_private, &mut cb);
-        } else {
-            // Rate cap: same message text and field set, fewer lines. Which of
-            // the three preconditions failed now lives in the counters below.
-            if PRESENT_SKIP_LOG_COUNT.first_n_then_every_from_one(64, 512).is_some() {
-                log_error!(
-                    "DXGI Present: skip PresentCb callbacks={} src=0x{:x} hContext={:p}",
-                    dev.dxgi_callbacks.is_null(),
-                    src_alloc,
-                    dev.context
-                        .as_ref()
-                        .map_or(core::ptr::null_mut(), |c| c.handle.as_ptr())
-                );
-            }
-        }
-    }
+    let present_hr = match finish_present(
+        h,
+        src_h,
+        dst_h,
+        src_alloc,
+        dst_alloc,
+        PresentRequest {
+            kind: PresentKind::Present,
+            dxgi_context: a.pDXGIContext,
+            flags: *(&a.Flags as *const ddi::DXGI_DDI_PRESENT_FLAGS as *const u32),
+        },
+    ) {
+        Ok(hr) => hr,
+        // Abandons the vehicle mint, EXT_PRESENTS and the ordinal log below,
+        // exactly as the bare `return E_FAIL` did.
+        Err(hr) => return hr,
+    };
 
     if is_vehicle_present {
         // `wait_last_present` targets the device recorded here. The
@@ -10241,80 +10405,23 @@ unsafe extern "C" fn dxgi_present1(arg: *mut ddi::DXGI_DDI_ARG_PRESENT1) -> i32 
         }
     }
 
-    let mut present_hr = E_INVALIDARG;
-    if let Some(dev) = helios_device(h) {
-        // Same three preconditions, counted the same way. The HRESULTs this
-        // path returns are NOT changed here: Present1-multi rejects a missing
-        // callback table/context with DXGI_ERROR_UNSUPPORTED where
-        // dxgi_present logs and returns present_hr, and it already rejected
-        // src_alloc == 0 with E_INVALIDARG above. Unifying the two tails is
-        // T7's u-forward-b-04.
-        if let Err(_skip) = present_prerequisites(dev, src_alloc) {
-            log_error!(
-                "DXGI Present1 multi: missing callback table/context callbacks={} hContext={:p}",
-                dev.dxgi_callbacks.is_null(),
-                dev.context
-                    .as_ref()
-                    .map_or(core::ptr::null_mut(), |c| c.handle.as_ptr())
-            );
-            return DXGI_ERROR_UNSUPPORTED;
-        }
-        let mut cb = ddi::DXGIDDICB_PRESENT::default();
-        let present_private = presented_primary_private(h, src_h);
-        cb.hSrcAllocation = src_alloc;
-        cb.hDstAllocation = dst_alloc;
-        cb.pDXGIContext = a.pDXGIContext;
-        cb.hContext = dev
-            .context
-            .as_ref()
-            .map_or(core::ptr::null_mut(), |c| c.handle.as_ptr());
-        cb.BroadcastContextCount = 0;
-        if let Some(ref private) = present_private {
-            cb.PrivateDriverDataSize = core::mem::size_of::<HeliosPresentPrivateData>() as u32;
-            cb.pPrivateDriverData = (private as *const HeliosPresentPrivateData)
-                .cast_mut()
-                .cast();
-        } else {
-            cb.PrivateDriverDataSize = 0;
-            cb.pPrivateDriverData = core::ptr::null_mut();
-        }
-        cb.bOptimizeForComposition = if present_optimize_composition_enabled() {
-            1
-        } else {
-            0
-        };
-        let Some(dependencies) = RuntimePresentDependencies::new(src_alloc, dst_alloc) else {
-            log_error!("DXGI Present1 multi: nonzero source allocation invariant lost");
-            return E_FAIL;
-        };
-        if let Some(cb_n) = PRESENT_CB_LOG_COUNT.first_n_then_every_from_one(128, 512) {
-            let (src_rt, src_km) = resource_parent_handles(src_h);
-            let (dst_rt, dst_km) = resource_parent_handles(dst_h);
-            trace_line!(
-                "DXGI Present1 PresentCb identity: #{} src_alloc=0x{:x} dst_alloc=0x{:x} \
-                 src_hDrv={:p} src_hRT={:p} src_hKM=0x{:x} dst_hDrv={:p} \
-                 dst_hRT={:p} dst_hKM=0x{:x} hContext={:p} dxgi_context={:p} \
-                 flags=0x{:x} broadcast={} private={:p}/{} optimize={}",
-                cb_n,
-                cb.hSrcAllocation,
-                cb.hDstAllocation,
-                src_h.pDrvPrivate,
-                src_rt,
-                src_km,
-                dst_h.pDrvPrivate,
-                dst_rt,
-                dst_km,
-                cb.hContext,
-                cb.pDXGIContext,
-                *(&a.Flags as *const ddi::DXGI_DDI_PRESENT_FLAGS as *const u32),
-                cb.BroadcastContextCount,
-                cb.pPrivateDriverData,
-                cb.PrivateDriverDataSize,
-                cb.bOptimizeForComposition,
-            );
-        }
-        present_hr = submit_runtime_present_then_call(dev, dependencies, present_private, &mut cb);
-    }
+    let present_hr = match finish_present(
+        h,
+        src_h,
+        dst_h,
+        src_alloc,
+        dst_alloc,
+        PresentRequest {
+            kind: PresentKind::Present1Multi,
+            dxgi_context: a.pDXGIContext,
+            flags: *(&a.Flags as *const ddi::DXGI_DDI_PRESENT_FLAGS as *const u32),
+        },
+    ) {
+        Ok(hr) => hr,
+        // Skips the trailing PRESENT1_LOG_COUNT line, exactly as the bare
+        // `return DXGI_ERROR_UNSUPPORTED` / `return E_FAIL` did.
+        Err(hr) => return hr,
+    };
 
     if PRESENT1_LOG_COUNT.first_n(64).is_some() {
         trace_line!(
