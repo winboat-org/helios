@@ -86,6 +86,12 @@ impl DmaBuffer {
     }
 
     /// Guest-physical base address suitable for virtio descriptor payloads.
+    ///
+    /// Unused today -- the virtio-drivers HAL hands physical addresses back
+    /// through its own trait methods. Kept as the typed accessor rather than
+    /// letting a future caller reach for the raw `pa`. Pre-dates T6; surfaced
+    /// when R906 removed the crate-wide `dead_code` allow over `mod virtio`.
+    #[allow(dead_code)]
     pub fn physical_address(&self) -> u64 {
         self.pa as u64
     }

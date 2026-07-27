@@ -76,14 +76,11 @@ const CMD_END_COMMAND_BUFFER: u32 = 91;
 const CMD_COPY_IMAGE: u32 = 113;
 const CMD_BLIT_IMAGE: u32 = 114;
 const CMD_COPY_IMAGE_TO_BUFFER: u32 = 116;
-const CMD_CLEAR_COLOR_IMAGE: u32 = 119;
 const CMD_PIPELINE_BARRIER: u32 = 126;
 const CMD_GET_DEVICE_QUEUE_2: u32 = 155;
 const CMD_SET_REPLY_COMMAND_STREAM_MESA: u32 = 178;
 const CMD_CREATE_RING_MESA: u32 = 188;
 const CMD_NOTIFY_RING_MESA: u32 = 190;
-const CMD_SUBMIT_VIRTQUEUE_SEQNO_MESA: u32 = 251;
-const CMD_WAIT_VIRTQUEUE_SEQNO_MESA: u32 = 252;
 
 /// `VK_COMMAND_GENERATE_REPLY_BIT_EXT` — set in a command's flags word to request
 /// a reply written into the previously-set reply command stream.
@@ -107,7 +104,6 @@ const ST_DEVICE_QUEUE_INFO_2: i32 = 1000145003;
 const ST_EXTERNAL_MEMORY_IMAGE_CREATE_INFO: i32 = 1000072001;
 const ST_EXPORT_MEMORY_ALLOCATE_INFO: i32 = 1000072002;
 const ST_MEMORY_DEDICATED_ALLOCATE_INFO: i32 = 1000127001;
-const ST_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO: i32 = 1000158003;
 const ST_RING_CREATE_INFO_MESA: i32 = 1000384000;
 const ST_DEVICE_QUEUE_TIMELINE_INFO_MESA: i32 = 1000384005;
 const ST_IMPORT_MEMORY_RESOURCE_INFO_MESA: i32 = 1000384002;
@@ -140,7 +136,6 @@ impl OptimalImageTransport {
         }
     }
 }
-const DRM_FORMAT_MOD_LINEAR: u64 = 0;
 const IMAGE_TYPE_2D: u32 = 1;
 const FORMAT_R8G8B8A8_UNORM: u32 = 37;
 const FORMAT_R8G8B8A8_SRGB: u32 = 43;
@@ -154,7 +149,6 @@ const FORMAT_R16G16B16A16_SFLOAT: u32 = 97;
 // (ScanoutDiag=16 SdgErr=2 / SdgLStg=3). Confirmed against Mesa venus on the same
 // NVIDIA host: LINEAR→typebits=0xf (scans out), OPTIMAL→typebits=0x3 (no host-visible).
 const IMAGE_TILING_LINEAR: u32 = 1;
-const IMAGE_TILING_DRM_FORMAT_MODIFIER: u32 = 1000158000;
 const IMAGE_USAGE_TRANSFER_SRC: u32 = 0x0000_0001;
 const IMAGE_USAGE_TRANSFER_DST: u32 = 0x0000_0002;
 const IMAGE_USAGE_SAMPLED: u32 = 0x0000_0004;
@@ -168,7 +162,6 @@ const IMAGE_LAYOUT_GENERAL: u32 = 1;
 const IMAGE_LAYOUT_PREINITIALIZED: u32 = 8;
 const SAMPLE_COUNT_1: u32 = 0x0000_0001;
 const IMAGE_ASPECT_COLOR: u32 = 0x0000_0001;
-const IMAGE_ASPECT_MEMORY_PLANE_0: u32 = 0x0000_0080;
 const QUEUE_FAMILY_IGNORED: u32 = u32::MAX;
 const QUEUE_FAMILY_EXTERNAL: u32 = u32::MAX - 1;
 // Kept for the older diagnostic call sites. Its numeric value has always been
@@ -438,7 +431,14 @@ pub struct PreparedImageCopy {
     pub command_buffer_id: VkCommandBufferId,
     /// Persistent adapter-owned destination image baked into the command buffer.
     pub target_image_id: VkImageId,
+    /// Geometry of the baked copy, carried for diagnosis of a mismatched
+    /// retarget. NOT read by any decision path -- the command buffer already
+    /// encodes the extent. Pre-dates T6; surfaced when R906 removed the
+    /// crate-wide `dead_code` allow over `mod virtio`, kept because a snapshot
+    /// that cannot report its own geometry is harder to debug than one field.
+    #[allow(dead_code)]
     pub width: u32,
+    #[allow(dead_code)]
     pub height: u32,
 }
 
@@ -644,6 +644,10 @@ impl PresentDestinationDesc {
         }
     }
 
+    /// The DXGI format of either backing kind. Unused today: every caller has
+    /// the concrete variant in hand. Pre-dates T6; kept as the one place the
+    /// two variants' format fields are unified. R906.
+    #[allow(dead_code)]
     fn dxgi_format(self) -> u32 {
         match self {
             Self::StandardBuffer(desc) => desc.dxgi_format,
@@ -1159,6 +1163,13 @@ impl<'a> ReplyReader<'a> {
     }
 
     /// Skip `n` bytes, bounds-checked.
+    ///
+    /// Unused today -- every current reply is parsed field by field. Kept
+    /// because it is the ONLY bounds-checked way to advance this reader, and a
+    /// future reply with a variable-length prefix that has to hand-roll
+    /// `self.pos += n` is exactly the unchecked-advance bug this type exists to
+    /// prevent. Pre-dates T6. R906.
+    #[allow(dead_code)]
     fn skip(&mut self, n: u64) -> Result<(), VirtioError> {
         if self.pos + n > self.end {
             return Err(VirtioError::DeviceError);
@@ -1444,7 +1455,6 @@ impl VenusRing {
 /// call `allocate_memory_blob` from.
 struct VenusInstance {
     ring: VenusRing,
-    instance_id: NonZeroU64,
     phys_dev_id: NonZeroU64,
 }
 
@@ -1479,10 +1489,6 @@ pub struct VenusClient {
     /// compositor. It is now recorded here and drained by the PASSIVE display
     /// worker outside the mutex.
     probe_pending: Option<(PresentBufferDesc, u64)>,
-    /// venus instance handle.
-    instance_id: NonZeroU64,
-    /// venus physical-device handle.
-    phys_dev_id: NonZeroU64,
     /// venus device handle. Not `Option`: a `VenusClient` without a device is
     /// unrepresentable, which is the whole point of the typestate.
     device_id: VkDeviceId,
@@ -2710,36 +2716,6 @@ impl VenusClient {
         w.i32(0); // imageOffset.z
         w.u32(width);
         w.u32(height);
-        w.u32(1);
-        self.ring_command_noreply(adapter, w.as_slice()?)
-    }
-
-    fn cmd_clear_color_image(
-        &mut self,
-        adapter: &AdapterContext,
-        command_buffer_id: VkCommandBufferId,
-        image_id: VkImageId,
-    ) -> Result<(), VirtioError> {
-        let one = 1.0f32.to_bits();
-        let zero = 0.0f32.to_bits();
-        let mut w = Writer::new();
-        w.header(CMD_CLEAR_COLOR_IMAGE, 0);
-        w.handle(command_buffer_id);
-        w.handle(image_id);
-        w.u32(IMAGE_LAYOUT_GENERAL);
-        w.count(true);
-        w.u32(2); // VkClearColorValue union tag: uint32[4]
-        w.u64(4); // array_size
-        w.u32(one); // R
-        w.u32(zero); // G
-        w.u32(one); // B
-        w.u32(one); // A
-        w.u32(1); // rangeCount
-        w.u64(1); // pRanges array_size
-        w.u32(IMAGE_ASPECT_COLOR);
-        w.u32(0);
-        w.u32(1);
-        w.u32(0);
         w.u32(1);
         self.ring_command_noreply(adapter, w.as_slice()?)
     }
@@ -5273,7 +5249,6 @@ impl VenusRing {
         diag(0x0007);
         Ok(VenusInstance {
             ring: self,
-            instance_id,
             phys_dev_id,
         })
     }
@@ -5408,8 +5383,6 @@ impl VenusInstance {
             ring: self.ring,
             probe_pending: None,
             scanout_copy_last_fence: 0,
-            instance_id: self.instance_id,
-            phys_dev_id: self.phys_dev_id,
             device_id,
             queue_id,
             memory_type_index,

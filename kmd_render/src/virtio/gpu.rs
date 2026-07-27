@@ -2237,6 +2237,12 @@ impl VirtioGpu {
     }
 
     /// Number of completed entries awaiting a PASSIVE reap.
+    ///
+    /// Unused today: `PARKED_LEAKS` is surfaced through the escape's
+    /// QUERY_STATS instead, since it has no registry mirror. Kept as the typed
+    /// accessor for that population. Pre-dates T6; surfaced when R906 removed
+    /// the crate-wide `dead_code` allow over `mod virtio`.
+    #[allow(dead_code)]
     pub fn parked_len(&self) -> usize {
         self.parked.len()
     }
