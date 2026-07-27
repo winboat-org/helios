@@ -110,12 +110,6 @@ const _: () = {
     assert!((SUPPORTED_DDI_VERSIONS[2] >> 32) as u32 == NegotiatedInterface::D3D11_0_INTERFACE);
 };
 
-const D3D12_SUPPORTED_DDI_VERSIONS: &[u64] = &[
-    // D3D12DDI_SUPPORTED_0003 from WDK 10.0.26100 d3d12umddi.h:
-    // interface ((12 << 16) | 2), build 8.
-    ddi_supported(12, 2, 8),
-];
-
 // The seven d3d10umddi ABI structs that used to be hand-transcribed here
 // (ddi::D3D10DDI_HADAPTER, D3d10DdiArgOpenAdapter, D3d10DdiAdapterFuncs,
 // D3d10_2DdiAdapterFuncs, D3d10_2DdiArgGetCaps, DxgiDdiBaseArgs,
@@ -123,80 +117,12 @@ const D3D12_SUPPORTED_DDI_VERSIONS: &[u64] = &[
 // `ddi::*` from the WDK header, with bindgen's size/alignment/offset
 // assertions, and the code below uses the generated types directly. R802.
 //
-// The `D3d12Ddi*` structs BELOW stay hand-written, and that is deliberate
-// rather than an oversight: build.rs bindgens d3d10umddi.h only, so there is
-// no generated d3d12umddi counterpart to switch to. They are reachable only
-// from OpenAdapter12, which declines with DXGI_ERROR_UNSUPPORTED before
-// touching them; T6's u-core-04 deletes the whole D3D12 adapter path.
-
-#[repr(C)]
-pub struct D3d12DdiArgOpenAdapter {
-    pub h_rt_adapter: *mut c_void,
-    pub h_adapter: ddi::D3D10DDI_HADAPTER,
-    pub p_adapter_callbacks: *const c_void,
-    pub p_adapter_funcs: *mut D3d12DdiAdapterFuncs,
-}
-
-#[repr(C)]
-pub struct D3d12DdiAdapterFuncs {
-    pub pfn_calc_private_device_size: Option<
-        unsafe extern "system" fn(
-            ddi::D3D10DDI_HADAPTER,
-            *const D3d12DdiArgCalcPrivateDeviceSize,
-        ) -> usize,
-    >,
-    pub pfn_create_device: Option<
-        unsafe extern "system" fn(ddi::D3D10DDI_HADAPTER, *const D3d12DdiArgCreateDevice) -> Hresult,
-    >,
-    pub pfn_close_adapter: Option<unsafe extern "system" fn(ddi::D3D10DDI_HADAPTER) -> Hresult>,
-    pub pfn_get_supported_versions:
-        Option<unsafe extern "system" fn(ddi::D3D10DDI_HADAPTER, *mut u32, *mut u64) -> Hresult>,
-    pub pfn_get_caps: Option<
-        unsafe extern "system" fn(ddi::D3D10DDI_HADAPTER, *const ddi::D3D10_2DDIARG_GETCAPS) -> Hresult,
-    >,
-    pub pfn_get_optional_ddi_tables: Option<
-        unsafe extern "system" fn(
-            ddi::D3D10DDI_HADAPTER,
-            *mut u32,
-            *mut D3d12DdiTableRequest,
-        ) -> Hresult,
-    >,
-    pub pfn_fill_ddi_table: Option<
-        unsafe extern "system" fn(
-            ddi::D3D10DDI_HADAPTER,
-            u32,
-            *mut c_void,
-            usize,
-            u32,
-            *mut c_void,
-        ) -> Hresult,
-    >,
-    pub pfn_destroy_device: Option<unsafe extern "system" fn(*mut c_void)>,
-}
-
-#[repr(C)]
-pub struct D3d12DdiArgCalcPrivateDeviceSize {
-    pub interface: u32,
-    pub version: u32,
-    pub flags: u32,
-}
-
-#[repr(C)]
-pub struct D3d12DdiArgCreateDevice {
-    pub h_rt_device: *mut c_void,
-    pub interface: u32,
-    pub version: u32,
-    pub p_kt_callbacks: *const c_void,
-    pub h_drv_device: *mut c_void,
-    pub p_um_callbacks: *const c_void,
-    pub flags: u32,
-}
-
-#[repr(C)]
-pub struct D3d12DdiTableRequest {
-    pub table_type: u32,
-    pub num_tables: u32,
-}
+// The five hand-written `D3d12Ddi*` structs that used to sit here, the eight
+// `d3d12_*` handlers and `D3D12_SUPPORTED_DDI_VERSIONS` went with T6's R908:
+// the compiler already proved them unreachable behind `OpenAdapter12`'s
+// unconditional early return, and `#[allow(unreachable_code)]` was silencing
+// that proof. `D3d10_2DdiArgGetCaps` is NOT among them -- the live `get_caps`
+// uses it.
 
 /// The value handed back as every adapter's `pDrvPrivate`.
 ///
@@ -455,8 +381,19 @@ pub unsafe extern "system" fn OpenAdapter10_2(open_data: *mut ddi::D3D10DDIARG_O
     unsafe { open_adapter_common(open_data, true) }
 }
 
+/// The D3D12 adapter entry point. Kept EXPORTED and refusing: the loader
+/// resolves it by name, and a missing export is a different (worse) failure
+/// than a clean refusal.
+///
+/// The parameter is `*mut c_void` because nothing here reads it. Before R908
+/// this took a hand-written `D3d12DdiArgOpenAdapter` and was followed by ~200
+/// lines of adapter-funcs installation and a D3D12 caps policy (UMA,
+/// 3DPIPELINESUPPORT, 3DPIPELINELEVEL_1_0_CORE) behind
+/// `#[allow(unreachable_code)]` -- a second, divergent copy of the caps-dispatch
+/// pattern that read as a live contract while the compiler had already proved
+/// it could never run.
 #[no_mangle]
-pub unsafe extern "system" fn OpenAdapter12(open_data: *mut D3d12DdiArgOpenAdapter) -> Hresult {
+pub unsafe extern "system" fn OpenAdapter12(open_data: *mut c_void) -> Hresult {
     log_error!("OpenAdapter12");
     log_error!("OpenAdapter12 -> DXGI_ERROR_UNSUPPORTED (D3D12 DDI not implemented yet)");
     let _ = open_data;
@@ -466,225 +403,7 @@ pub unsafe extern "system" fn OpenAdapter12(open_data: *mut D3d12DdiArgOpenAdapt
     // client's ordinary "this driver has no D3D12 DDI" negotiation was recorded
     // by the runtime and by ETW as a *driver fault*. Nothing distinguished the
     // two in our log, since both printed as "DXGI_ERROR_UNSUPPORTED".
-    return DXGI_ERROR_UNSUPPORTED;
-
-    #[allow(unreachable_code)]
-    {
-        if open_data.is_null() {
-            log_error!("OpenAdapter12 null open_data -> E_NOTIMPL");
-            return E_NOTIMPL;
-        }
-
-        let open = unsafe { &mut *open_data };
-        if open.p_adapter_funcs.is_null() {
-            log_error!("OpenAdapter12 null pAdapterFuncs -> E_NOTIMPL");
-            return E_NOTIMPL;
-        }
-
-        open.h_adapter = ddi::D3D10DDI_HADAPTER {
-            pDrvPrivate: core::ptr::addr_of!(ADAPTER_TOKEN) as *mut c_void,
-        };
-
-        let funcs = unsafe { &mut *open.p_adapter_funcs };
-        funcs.pfn_calc_private_device_size = Some(d3d12_calc_private_device_size);
-        funcs.pfn_create_device = Some(d3d12_create_device);
-        funcs.pfn_close_adapter = Some(d3d12_close_adapter);
-        funcs.pfn_get_supported_versions = Some(d3d12_get_supported_versions);
-        funcs.pfn_get_caps = Some(d3d12_get_caps);
-        funcs.pfn_get_optional_ddi_tables = Some(d3d12_get_optional_ddi_tables);
-        funcs.pfn_fill_ddi_table = Some(d3d12_fill_ddi_table);
-        funcs.pfn_destroy_device = Some(d3d12_destroy_device);
-
-        log_error!("OpenAdapter12 -> S_OK (adapter funcs installed)");
-        S_OK
-    }
-}
-
-unsafe extern "system" fn d3d12_calc_private_device_size(
-    _h_adapter: ddi::D3D10DDI_HADAPTER,
-    args: *const D3d12DdiArgCalcPrivateDeviceSize,
-) -> usize {
-    if args.is_null() {
-        log_error!("D3D12 CalcPrivateDeviceSize null args -> 8");
-    } else {
-        let args = unsafe { &*args };
-        log_error!(
-            "D3D12 CalcPrivateDeviceSize interface=0x{:08x} version=0x{:08x} flags=0x{:08x} -> 8",
-            args.interface, args.version, args.flags
-        );
-    }
-    core::mem::size_of::<usize>()
-}
-
-unsafe extern "system" fn d3d12_create_device(
-    _h_adapter: ddi::D3D10DDI_HADAPTER,
-    args: *const D3d12DdiArgCreateDevice,
-) -> Hresult {
-    if args.is_null() {
-        log_error!("D3D12 CreateDevice null args -> E_NOTIMPL");
-    } else {
-        let args = unsafe { &*args };
-        log_error!(
-            "D3D12 CreateDevice interface=0x{:08x} version=0x{:08x} flags=0x{:08x} \
-             hRTDevice={:p} hDrvDevice={:p} pKTCallbacks={:p} pUMCallbacks={:p} -> E_NOTIMPL",
-            args.interface,
-            args.version,
-            args.flags,
-            args.h_rt_device,
-            args.h_drv_device,
-            args.p_kt_callbacks,
-            args.p_um_callbacks,
-        );
-    }
-    E_NOTIMPL
-}
-
-unsafe extern "system" fn d3d12_close_adapter(_h_adapter: ddi::D3D10DDI_HADAPTER) -> Hresult {
-    log_error!("D3D12 CloseAdapter");
-    S_OK
-}
-
-unsafe extern "system" fn d3d12_get_supported_versions(
-    _h_adapter: ddi::D3D10DDI_HADAPTER,
-    entries: *mut u32,
-    supported_versions: *mut u64,
-) -> Hresult {
-    if entries.is_null() {
-        log_error!("D3D12 GetSupportedVersions null entries -> E_NOTIMPL");
-        return E_NOTIMPL;
-    }
-
-    let requested_entries = unsafe { *entries };
-    log_error!(
-        "D3D12 GetSupportedVersions requested={requested_entries} bufNull={} (advertising {:#018x?})",
-        supported_versions.is_null(),
-        D3D12_SUPPORTED_DDI_VERSIONS,
-    );
-    unsafe { *entries = D3D12_SUPPORTED_DDI_VERSIONS.len() as u32 };
-
-    if supported_versions.is_null() {
-        return S_OK;
-    }
-
-    if requested_entries < D3D12_SUPPORTED_DDI_VERSIONS.len() as u32 {
-        return E_OUTOFMEMORY;
-    }
-
-    for (index, version) in D3D12_SUPPORTED_DDI_VERSIONS.iter().enumerate() {
-        unsafe { *supported_versions.add(index) = *version };
-    }
-    S_OK
-}
-
-unsafe extern "system" fn d3d12_get_caps(
-    _h_adapter: ddi::D3D10DDI_HADAPTER,
-    args: *const ddi::D3D10_2DDIARG_GETCAPS,
-) -> Hresult {
-    // Typed as D3D10_2DDICAPS_TYPE to match `args.Type`. These stay hand-written
-    // (unlike the D3D11 set above, which now aliases the generated enumerators)
-    // because build.rs bindgens d3d10umddi.h only -- there is no generated
-    // d3d12umddi, so no D3D12DDICAPS_TYPE_* to alias. Values unchanged.
-    const D3D12DDICAPS_TYPE_MEMORY_ARCHITECTURE: ddi::D3D10_2DDICAPS_TYPE = 1002;
-    const D3D12DDICAPS_TYPE_SHADER: ddi::D3D10_2DDICAPS_TYPE = 1004;
-    const D3D12DDICAPS_TYPE_ARCHITECTURE_INFO: ddi::D3D10_2DDICAPS_TYPE = 1005;
-    const D3D12DDICAPS_TYPE_D3D12_OPTIONS: ddi::D3D10_2DDICAPS_TYPE = 1006;
-    const D3D12DDICAPS_TYPE_3DPIPELINESUPPORT: ddi::D3D10_2DDICAPS_TYPE = 1007;
-    const D3D12DDICAPS_TYPE_0081_3DPIPELINESUPPORT1: ddi::D3D10_2DDICAPS_TYPE = 1074;
-    const D3D12DDI_3DPIPELINELEVEL_1_0_CORE: u32 = 2;
-
-    if args.is_null() {
-        log_error!("D3D12 GetCaps null args -> S_OK");
-        return S_OK;
-    }
-
-    let args = unsafe { &*args };
-    log_error!(
-        "D3D12 GetCaps type=0x{:08x} dataSize={} pInfo={:p}",
-        args.Type, args.DataSize, args.pInfo,
-    );
-
-    if !args.pData.is_null() && args.DataSize != 0 {
-        if args.Type == D3D12DDICAPS_TYPE_0081_3DPIPELINESUPPORT1 && args.DataSize >= 8 {
-            let data = args.pData as *mut u32;
-            let runtime_max = unsafe { *data.add(0) };
-            let driver_max = runtime_max.min(D3D12DDI_3DPIPELINELEVEL_1_0_CORE);
-            unsafe {
-                *data.add(1) = driver_max;
-            }
-            log_error!(
-                "  D3D12 GetCaps: 3DPIPELINESUPPORT1 runtimeMax={} driverMax={}",
-                runtime_max, driver_max
-            );
-            return S_OK;
-        }
-
-        unsafe { core::ptr::write_bytes(args.pData as *mut u8, 0, args.DataSize as usize) };
-        match args.Type {
-            D3D12DDICAPS_TYPE_3DPIPELINESUPPORT if args.DataSize >= 4 => {
-                unsafe { *(args.pData as *mut u32) = D3D12DDI_3DPIPELINELEVEL_1_0_CORE };
-                log_error!("  D3D12 GetCaps: 3DPIPELINESUPPORT = 1_0_CORE");
-            }
-            D3D12DDICAPS_TYPE_MEMORY_ARCHITECTURE if args.DataSize >= 12 => {
-                let data = args.pData as *mut u32;
-                unsafe {
-                    *data.add(0) = 1; // UMA
-                    *data.add(1) = 1; // IO coherent
-                    *data.add(2) = 1; // Cache coherent
-                }
-                log_error!("  D3D12 GetCaps: MEMORY_ARCHITECTURE = UMA/IO/cache coherent");
-            }
-            D3D12DDICAPS_TYPE_SHADER => {
-                log_error!("  D3D12 GetCaps: SHADER = zero");
-            }
-            D3D12DDICAPS_TYPE_D3D12_OPTIONS => {
-                log_error!("  D3D12 GetCaps: D3D12_OPTIONS = zero");
-            }
-            D3D12DDICAPS_TYPE_ARCHITECTURE_INFO => {
-                log_error!("  D3D12 GetCaps: ARCHITECTURE_INFO = zero");
-            }
-            _ => {}
-        }
-    }
-
-    S_OK
-}
-
-unsafe extern "system" fn d3d12_get_optional_ddi_tables(
-    _h_adapter: ddi::D3D10DDI_HADAPTER,
-    entries: *mut u32,
-    requests: *mut D3d12DdiTableRequest,
-) -> Hresult {
-    if entries.is_null() {
-        log_error!("D3D12 GetOptionalDDITables null entries -> E_NOTIMPL");
-        return E_NOTIMPL;
-    }
-
-    let requested_entries = unsafe { *entries };
-    log_error!(
-        "D3D12 GetOptionalDDITables requested={requested_entries} requestsNull={} -> 0 tables",
-        requests.is_null()
-    );
-    unsafe { *entries = 0 };
-    S_OK
-}
-
-unsafe extern "system" fn d3d12_fill_ddi_table(
-    _h_adapter: ddi::D3D10DDI_HADAPTER,
-    table_type: u32,
-    table: *mut c_void,
-    table_size: usize,
-    interface: u32,
-    rt_table: *mut c_void,
-) -> Hresult {
-    log_error!(
-        "D3D12 FillDDITable type={} table={:p} size={} interface=0x{:08x} rtTable={:p} -> E_NOTIMPL",
-        table_type, table, table_size, interface, rt_table,
-    );
-    E_NOTIMPL
-}
-
-unsafe extern "system" fn d3d12_destroy_device(h_device: *mut c_void) {
-    log_error!("D3D12 DestroyDevice hDevice={h_device:p}");
+    DXGI_ERROR_UNSUPPORTED
 }
 
 unsafe fn open_adapter_common(open_data: *mut ddi::D3D10DDIARG_OPENADAPTER, with_10_2: bool) -> Hresult {
