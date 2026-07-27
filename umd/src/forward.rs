@@ -10049,14 +10049,67 @@ impl RuntimePresentDependencies {
 
 #[derive(Clone, Copy)]
 enum RuntimeSubmission {
-    /// A pending DXGI present. The typed dependency value makes a
+    /// A DXGI present carrying the scan-out identity, written as a
+    /// `HeliosPresentRenderCmd`. The typed dependency value makes a
     /// source-allocation-free present submission unrepresentable.
-    Present {
+    TypedPresent {
         dependencies: RuntimePresentDependencies,
-        private: Option<HeliosPresentPrivateData>,
+        private: HeliosPresentPrivateData,
+    },
+    /// A DXGI present with no identity to carry, written as a
+    /// `HeliosPresentRefreshCmd`. Distinct from [`Self::Refresh`] because it
+    /// still submits the present's allocation dependencies.
+    MarkerPresent {
+        dependencies: RuntimePresentDependencies,
     },
     /// An allocation-free dirty marker for an already-published scanout.
     Refresh,
+}
+
+impl RuntimeSubmission {
+    /// The wire command's length and the label its log line carries.
+    ///
+    /// Pre-R828 the enum had two variants for three commands: `Present` with
+    /// `private: Option<_>` selected the command type by an inner match, so the
+    /// length and the bytes written were decided in two separate places, and
+    /// BOTH present arms produced the label "Present". The labels are kept
+    /// EXACTLY as they were -- TypedPresent and MarkerPresent both log
+    /// "Present" -- so validation stays byte-identical.
+    fn command_length_and_label(&self) -> (u32, &'static str) {
+        match self {
+            Self::TypedPresent { .. } => (
+                core::mem::size_of::<HeliosPresentRenderCmd>() as u32,
+                "Present",
+            ),
+            Self::MarkerPresent { .. } => (
+                core::mem::size_of::<HeliosPresentRefreshCmd>() as u32,
+                "Present",
+            ),
+            Self::Refresh => (
+                core::mem::size_of::<HeliosPresentRefreshCmd>() as u32,
+                "refresh",
+            ),
+        }
+    }
+}
+
+/// The allocation-free dirty marker, built in ONE place.
+///
+/// Pre-R828 this literal appeared twice, byte for byte, in two arms of the same
+/// match -- the `Present { private: None }` arm and the `Refresh` arm.
+///
+/// `source_index`/`destination_index` are RESERVED-ZERO on this path.
+/// `submit_command.rs` validates only the magic and version and reads neither;
+/// the KMD writes its own copy with real `DXGK_PRESENT_*_INDEX` values in
+/// `display.rs`. Populating them here would be a wire-semantics change with no
+/// reader.
+fn present_refresh_cmd() -> HeliosPresentRefreshCmd {
+    HeliosPresentRefreshCmd {
+        magic: HELIOS_PRESENT_REFRESH_MAGIC,
+        version: HELIOS_PRESENT_REFRESH_VERSION,
+        source_index: 0,
+        destination_index: 0,
+    }
 }
 
 /// Submit a runtime-owned WDDM command buffer.
@@ -10081,29 +10134,17 @@ unsafe fn submit_runtime_submission(
     };
     let command_window = ctx.command.get();
     let command = command_window.map_or(core::ptr::null_mut(), |w| w.ptr.as_ptr());
-    let (command_length, label) = match submission {
-        RuntimeSubmission::Present {
-            private: Some(_), ..
-        } => (
-            core::mem::size_of::<HeliosPresentRenderCmd>() as u32,
-            "Present",
-        ),
-        RuntimeSubmission::Present { private: None, .. } => (
-            core::mem::size_of::<HeliosPresentRefreshCmd>() as u32,
-            "Present",
-        ),
-        RuntimeSubmission::Refresh => (
-            core::mem::size_of::<HeliosPresentRefreshCmd>() as u32,
-            "refresh",
-        ),
-    };
+    let (command_length, label) = submission.command_length_and_label();
     if command.is_null() || command_window.map_or(0, |w| w.capacity) < command_length {
         log_error!("DXGI {label}: no runtime command buffer");
         return E_FAIL;
     }
 
+    // Exactly one write per command type. A variant that writes the wrong
+    // command is no longer representable: the length above and the bytes below
+    // are both derived from the same variant.
     let allocation_count = match submission {
-        RuntimeSubmission::Present {
+        RuntimeSubmission::TypedPresent {
             dependencies,
             private,
         } => {
@@ -10111,31 +10152,23 @@ unsafe fn submit_runtime_submission(
                 Ok(count) => count,
                 Err(hr) => return hr,
             };
-            if let Some(private) = private {
-                (command as *mut HeliosPresentRenderCmd).write_unaligned(HeliosPresentRenderCmd {
-                    magic: HELIOS_PRESENT_RENDER_MAGIC,
-                    version: HELIOS_PRESENT_RENDER_VERSION,
-                    present: private,
-                });
-            } else {
-                (command as *mut HeliosPresentRefreshCmd).write_unaligned(
-                    HeliosPresentRefreshCmd {
-                        magic: HELIOS_PRESENT_REFRESH_MAGIC,
-                        version: HELIOS_PRESENT_REFRESH_VERSION,
-                        source_index: 0,
-                        destination_index: 0,
-                    },
-                );
-            }
+            (command as *mut HeliosPresentRenderCmd).write_unaligned(HeliosPresentRenderCmd {
+                magic: HELIOS_PRESENT_RENDER_MAGIC,
+                version: HELIOS_PRESENT_RENDER_VERSION,
+                present: private,
+            });
+            count
+        }
+        RuntimeSubmission::MarkerPresent { dependencies } => {
+            let count = match dependencies.write_to(ctx) {
+                Ok(count) => count,
+                Err(hr) => return hr,
+            };
+            (command as *mut HeliosPresentRefreshCmd).write_unaligned(present_refresh_cmd());
             count
         }
         RuntimeSubmission::Refresh => {
-            (command as *mut HeliosPresentRefreshCmd).write_unaligned(HeliosPresentRefreshCmd {
-                magic: HELIOS_PRESENT_REFRESH_MAGIC,
-                version: HELIOS_PRESENT_REFRESH_VERSION,
-                source_index: 0,
-                destination_index: 0,
-            });
+            (command as *mut HeliosPresentRefreshCmd).write_unaligned(present_refresh_cmd());
             0
         }
     };
@@ -10200,9 +10233,12 @@ unsafe fn submit_runtime_present(
 ) -> i32 {
     submit_runtime_submission(
         dev,
-        RuntimeSubmission::Present {
-            dependencies,
-            private,
+        match private {
+            Some(private) => RuntimeSubmission::TypedPresent {
+                dependencies,
+                private,
+            },
+            None => RuntimeSubmission::MarkerPresent { dependencies },
         },
     )
 }

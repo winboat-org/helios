@@ -339,7 +339,14 @@ impl HeliosPresentRenderCmd {
 pub struct HeliosPresentRefreshCmd {
     pub magic: u32,
     pub version: u32,
+    /// RESERVED-ZERO on the UMD path, and documented as such by R828 because
+    /// the name suggests otherwise. The UMD writes 0 here;
+    /// `kmd_render/src/ddi/submit_command.rs` validates only the magic and
+    /// version and reads NEITHER index. The KMD builds its own copy with real
+    /// `DXGK_PRESENT_*_INDEX` values in `ddi/display.rs`. Populating these from
+    /// the UMD would be a wire-semantics change with no reader.
     pub source_index: u32,
+    /// RESERVED-ZERO on the UMD path. See [`Self::source_index`].
     pub destination_index: u32,
 }
 
