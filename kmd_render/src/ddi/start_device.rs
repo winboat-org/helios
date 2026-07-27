@@ -191,6 +191,34 @@ fn build_segment_table(
 /// these in their own transient frame — which does not overlap
 /// `VirtioGpu::init` — is what keeps the nested peak inside the budget. See
 /// `StartedState::boxed` for the boot failure this class of growth caused.
+/// Same-boot zeroing for the PRODUCTION LINEAR-scanout ladder (T6/R901).
+///
+/// These eight names are written by `venus::create_linear_scanout_image` /
+/// `allocate_linear_scanout_image_blob` -- the KMD's real display fallback,
+/// which stays -- but their only zeroing used to live inside the deleted
+/// `scanout_diag::maybe_run`. Registry value names PERSIST ACROSS BOOTS, so
+/// without this a stale prior-boot `SdgLStg = 0x10` survives into a boot where
+/// the fallback is never taken and reads as though it had been: exactly the
+/// cross-boot counter trap the evidence rules forbid.
+///
+/// ⚠ `#[inline(never)]` is a STACK BUDGET decision, not style -- the same rule
+/// `bring_up_venus` below is annotated for. The eight-element name array is ~64
+/// bytes of locals, and inlined into `dxgkddi_start_device` it measurably grew
+/// that frame (8424 -> 8456 bytes measured with `tools/kmd-frame-sizes.ps1`),
+/// eating 32 of the 352 bytes of headroom on the 24 KB kernel boot stack. In its
+/// own transient frame -- which does not overlap `VirtioGpu::init` -- it costs
+/// the budget nothing. Overflow here is `0xc0000001`/Startup Repair with no dump
+/// and no bugcheck event, and it does NOT reproduce on a live devcon restart.
+#[inline(never)]
+fn zero_linear_scanout_breadcrumbs() {
+    for name in [
+        b"SdgLStg", b"SdgLReq", b"SdgLBit", b"SdgLTyc", b"SdgLImg", b"SdgLMem", b"SdgLPch",
+        b"SdgLOff",
+    ] {
+        crate::diag::record_named_bytes(name, 0);
+    }
+}
+
 #[inline(never)]
 fn bring_up_venus(
     passive: crate::irql::PassiveLevel,
@@ -491,21 +519,7 @@ pub unsafe extern "C" fn dxgkddi_start_device(
     if knobs.display_half {
         crate::diag::record_named_bytes(b"DspMd", adapter.display_mode_packed());
 
-        // Same-boot zeroing for the PRODUCTION LINEAR-scanout ladder, re-homed
-        // here by T6/R901. These eight names are written by
-        // `venus::create_linear_scanout_image` / `allocate_linear_scanout_image_blob`
-        // -- the KMD's real display fallback, which stays -- but their only
-        // zeroing lived inside the deleted `scanout_diag::maybe_run`. Registry
-        // value names PERSIST ACROSS BOOTS, so without this a stale prior-boot
-        // `SdgLStg` survives into a boot where the LINEAR fallback is never
-        // taken, and reads as though it had been. That is precisely the
-        // cross-boot counter trap the evidence rules forbid.
-        for name in [
-            b"SdgLStg", b"SdgLReq", b"SdgLBit", b"SdgLTyc", b"SdgLImg", b"SdgLMem",
-            b"SdgLPch", b"SdgLOff",
-        ] {
-            crate::diag::record_named_bytes(name, 0);
-        }
+        zero_linear_scanout_breadcrumbs();
 
         // Arm the CRTC_VSYNC heartbeat: without a free-running VSync, dxgkrnl never
         // retires a flip and so never issues SetVidPnSourceAddress (viogpu3d
