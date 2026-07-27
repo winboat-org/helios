@@ -759,7 +759,7 @@ unsafe fn handle_com_raw_at(handle_priv: *mut c_void) -> usize {
 }
 
 unsafe fn store_resource(
-    handle_priv: *mut c_void,
+    h_res: ddi::D3D10DDI_HRESOURCE,
     obj: ID3D11Resource,
     allocation: Option<ResidentAllocation>,
     km_resource: ddi::D3DKMT_HANDLE,
@@ -767,7 +767,7 @@ unsafe fn store_resource(
     ownership: AllocationOwnership,
     present_private: HeliosPresentPrivateData,
 ) {
-    let Some(slot) = Slot::<Boxed<ResourceState>>::from_priv(handle_priv) else {
+    let Some(slot) = boxed_slot(h_res) else {
         drop(obj);
         return;
     };
@@ -1511,8 +1511,8 @@ unsafe fn release_rtv(handle_priv: *mut c_void) {
     }
 }
 
-unsafe fn release_resource(h: Hdevice, handle_priv: *mut c_void) {
-    let Some(slot) = Slot::<Boxed<ResourceState>>::from_priv(handle_priv) else {
+unsafe fn release_resource(h: Hdevice, h_res: ddi::D3D10DDI_HRESOURCE) {
+    let Some(slot) = boxed_slot(h_res) else {
         return;
     };
     // Take the box (and empty the slot) BEFORE the teardown below, which
@@ -2308,7 +2308,7 @@ unsafe fn finish_wddm_tex2d(
         );
     }
     store_resource(
-        h_resource.pDrvPrivate,
+        h_resource,
         res,
         allocation,
         km_resource,
@@ -2530,7 +2530,7 @@ unsafe extern "C" fn create_resource(
                     );
                 }
                 store_resource(
-                    h_resource.pDrvPrivate,
+                    h_resource,
                     res,
                     allocation,
                     km_resource,
@@ -2840,7 +2840,7 @@ unsafe extern "C" fn create_resource(
                     mip0.TexelWidth, a.Format, bind, misc
                 );
                 store_resource(
-                    h_resource.pDrvPrivate,
+                    h_resource,
                     res,
                     allocation,
                     km_resource,
@@ -2927,7 +2927,7 @@ unsafe extern "C" fn create_resource(
                     mip0.TexelWidth, mip0.TexelHeight, mip0.TexelDepth, a.Format, bind, misc
                 );
                 store_resource(
-                    h_resource.pDrvPrivate,
+                    h_resource,
                     res,
                     allocation,
                     km_resource,
@@ -2941,7 +2941,7 @@ unsafe extern "C" fn create_resource(
 }
 
 unsafe extern "C" fn destroy_resource(h: Hdevice, h_resource: ddi::D3D10DDI_HRESOURCE) {
-    release_resource(h, h_resource.pDrvPrivate);
+    release_resource(h, h_resource);
 }
 
 unsafe extern "C" fn open_resource(
@@ -3181,7 +3181,7 @@ unsafe extern "C" fn open_resource(
         meta.width, meta.height, meta.format, allocation, a.hKMResource, raw
     );
     store_resource(
-        h_resource.pDrvPrivate,
+        h_resource,
         res,
         Some(resident),
         a.hKMResource.handle,
