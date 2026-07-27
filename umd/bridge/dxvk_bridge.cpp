@@ -1167,6 +1167,56 @@ struct HeliosDxvkDeviceImpl {
   }
 };
 
+namespace {
+
+  // The body every plain `create_*_shader` forwarder shares.
+  //
+  // Six bodies were identical apart from one COM interface type, one
+  // `ID3D11Device` method and a two-letter dump tag. That is the shape where a
+  // fix (a new dump, a changed refusal) lands in five of six and the sixth
+  // behaves differently only under the workload that binds that stage.
+  //
+  // `Create` is a lambda rather than a pointer-to-member-function because the
+  // six `ID3D11Device::Create*Shader` overloads have six different out-param
+  // types; the lambda pins the pairing at each call site, where it is visible.
+  template <typename Iface, typename Create>
+  std::size_t create_shader_impl(const HeliosDxvkDeviceImpl* impl,
+                                 const char* dump_tag,
+                                 const char* name,
+                                 const std::uint8_t* code,
+                                 std::size_t len,
+                                 Create create) {
+    if (!impl || !impl->d3d11 || !code || !len)
+      return 0;
+    Iface* shader = nullptr;
+    try {
+      auto bytecode = prepare_shader_bytecode(code, len);
+      if (!bytecode)
+        return 0;
+      dump_shader_bytecode(dump_tag, "raw", code, len);
+      dump_shader_bytecode(dump_tag, "wrapped", bytecode.data(), bytecode.len());
+      HRESULT hr = create(impl->d3d11, bytecode.data(), bytecode.len(), &shader);
+      if (FAILED(hr)) {
+        char msg[96];
+        std::snprintf(msg, sizeof(msg), "%s returned failure", name);
+        umd_log(msg);
+        return 0;
+      }
+      return reinterpret_cast<std::size_t>(shader);
+    } catch (const dxvk::DxvkError& e) {
+      umd_log((std::string(name) + " DxvkError: " + e.message()).c_str());
+    } catch (const std::exception& e) {
+      umd_log(e.what());
+    } catch (...) {
+      char msg[96];
+      std::snprintf(msg, sizeof(msg), "unknown exception in %s", name);
+      umd_log(msg);
+    }
+    return 0;
+  }
+
+}
+
 // Out-of-line ctor/dtor, defined where HeliosDxvkDeviceImpl is complete so the
 // header (and the cxx glue) need no DXVK headers.
 HeliosDxvkDevice::HeliosDxvkDevice() noexcept = default;
@@ -1542,81 +1592,27 @@ std::size_t HeliosDxvkDevice::create_ddi_scanout_texture2d(
 }
 
 std::size_t HeliosDxvkDevice::create_vertex_shader(const std::uint8_t* code, std::size_t len) const {
-  if (!impl || !impl->d3d11 || !code || !len)
-    return 0;
-  ID3D11VertexShader* shader = nullptr;
-  try {
-    auto bytecode = prepare_shader_bytecode(code, len);
-    if (!bytecode)
-      return 0;
-    dump_shader_bytecode("vs", "raw", code, len);
-    dump_shader_bytecode("vs", "wrapped", bytecode.data(), bytecode.len());
-    HRESULT hr = impl->d3d11->CreateVertexShader(bytecode.data(), bytecode.len(), nullptr, &shader);
-    if (FAILED(hr)) {
-      umd_log("CreateVertexShader returned failure");
-      return 0;
-    }
-    return reinterpret_cast<std::size_t>(shader);
-  } catch (const dxvk::DxvkError& e) {
-    umd_log(("CreateVertexShader DxvkError: " + e.message()).c_str());
-  } catch (const std::exception& e) {
-    umd_log(e.what());
-  } catch (...) {
-    umd_log("unknown exception in CreateVertexShader");
-  }
-  return 0;
+  return create_shader_impl<ID3D11VertexShader>(
+      impl.get(), "vs", "CreateVertexShader", code, len,
+      [](ID3D11Device* d, const void* bc, std::size_t n, ID3D11VertexShader** out) {
+        return d->CreateVertexShader(bc, n, nullptr, out);
+      });
 }
 
 std::size_t HeliosDxvkDevice::create_pixel_shader(const std::uint8_t* code, std::size_t len) const {
-  if (!impl || !impl->d3d11 || !code || !len)
-    return 0;
-  ID3D11PixelShader* shader = nullptr;
-  try {
-    auto bytecode = prepare_shader_bytecode(code, len);
-    if (!bytecode)
-      return 0;
-    dump_shader_bytecode("ps", "raw", code, len);
-    dump_shader_bytecode("ps", "wrapped", bytecode.data(), bytecode.len());
-    HRESULT hr = impl->d3d11->CreatePixelShader(bytecode.data(), bytecode.len(), nullptr, &shader);
-    if (FAILED(hr)) {
-      umd_log("CreatePixelShader returned failure");
-      return 0;
-    }
-    return reinterpret_cast<std::size_t>(shader);
-  } catch (const dxvk::DxvkError& e) {
-    umd_log(("CreatePixelShader DxvkError: " + e.message()).c_str());
-  } catch (const std::exception& e) {
-    umd_log(e.what());
-  } catch (...) {
-    umd_log("unknown exception in CreatePixelShader");
-  }
-  return 0;
+  return create_shader_impl<ID3D11PixelShader>(
+      impl.get(), "ps", "CreatePixelShader", code, len,
+      [](ID3D11Device* d, const void* bc, std::size_t n, ID3D11PixelShader** out) {
+        return d->CreatePixelShader(bc, n, nullptr, out);
+      });
 }
 
 std::size_t HeliosDxvkDevice::create_geometry_shader(const std::uint8_t* code, std::size_t len) const {
-  if (!impl || !impl->d3d11 || !code || !len)
-    return 0;
-  ID3D11GeometryShader* shader = nullptr;
-  try {
-    auto bytecode = prepare_shader_bytecode(code, len);
-    if (!bytecode)
-      return 0;
-    dump_shader_bytecode("gs", "raw", code, len);
-    dump_shader_bytecode("gs", "wrapped", bytecode.data(), bytecode.len());
-    HRESULT hr = impl->d3d11->CreateGeometryShader(bytecode.data(), bytecode.len(), nullptr, &shader);
-    if (FAILED(hr)) {
-      umd_log("CreateGeometryShader returned failure");
-      return 0;
-    }
-    return reinterpret_cast<std::size_t>(shader);
-  } catch (const dxvk::DxvkError& e) {
-    umd_log(("CreateGeometryShader DxvkError: " + e.message()).c_str());
-  } catch (const std::exception& e) {
-    umd_log(e.what());
-  } catch (...) {
-    umd_log("unknown exception in CreateGeometryShader");
-  }
-  return 0;
+  return create_shader_impl<ID3D11GeometryShader>(
+      impl.get(), "gs", "CreateGeometryShader", code, len,
+      [](ID3D11Device* d, const void* bc, std::size_t n, ID3D11GeometryShader** out) {
+        return d->CreateGeometryShader(bc, n, nullptr, out);
+      });
 }
 
 std::size_t HeliosDxvkDevice::create_shader_sig(
@@ -2088,81 +2084,27 @@ std::int32_t HeliosDxvkDevice::present_vehicle_copy(
 }
 
 std::size_t HeliosDxvkDevice::create_hull_shader(const std::uint8_t* code, std::size_t len) const {
-  if (!impl || !impl->d3d11 || !code || !len)
-    return 0;
-  ID3D11HullShader* shader = nullptr;
-  try {
-    auto bytecode = prepare_shader_bytecode(code, len);
-    if (!bytecode)
-      return 0;
-    dump_shader_bytecode("hs", "raw", code, len);
-    dump_shader_bytecode("hs", "wrapped", bytecode.data(), bytecode.len());
-    HRESULT hr = impl->d3d11->CreateHullShader(bytecode.data(), bytecode.len(), nullptr, &shader);
-    if (FAILED(hr)) {
-      umd_log("CreateHullShader returned failure");
-      return 0;
-    }
-    return reinterpret_cast<std::size_t>(shader);
-  } catch (const dxvk::DxvkError& e) {
-    umd_log(("CreateHullShader DxvkError: " + e.message()).c_str());
-  } catch (const std::exception& e) {
-    umd_log(e.what());
-  } catch (...) {
-    umd_log("unknown exception in CreateHullShader");
-  }
-  return 0;
+  return create_shader_impl<ID3D11HullShader>(
+      impl.get(), "hs", "CreateHullShader", code, len,
+      [](ID3D11Device* d, const void* bc, std::size_t n, ID3D11HullShader** out) {
+        return d->CreateHullShader(bc, n, nullptr, out);
+      });
 }
 
 std::size_t HeliosDxvkDevice::create_domain_shader(const std::uint8_t* code, std::size_t len) const {
-  if (!impl || !impl->d3d11 || !code || !len)
-    return 0;
-  ID3D11DomainShader* shader = nullptr;
-  try {
-    auto bytecode = prepare_shader_bytecode(code, len);
-    if (!bytecode)
-      return 0;
-    dump_shader_bytecode("ds", "raw", code, len);
-    dump_shader_bytecode("ds", "wrapped", bytecode.data(), bytecode.len());
-    HRESULT hr = impl->d3d11->CreateDomainShader(bytecode.data(), bytecode.len(), nullptr, &shader);
-    if (FAILED(hr)) {
-      umd_log("CreateDomainShader returned failure");
-      return 0;
-    }
-    return reinterpret_cast<std::size_t>(shader);
-  } catch (const dxvk::DxvkError& e) {
-    umd_log(("CreateDomainShader DxvkError: " + e.message()).c_str());
-  } catch (const std::exception& e) {
-    umd_log(e.what());
-  } catch (...) {
-    umd_log("unknown exception in CreateDomainShader");
-  }
-  return 0;
+  return create_shader_impl<ID3D11DomainShader>(
+      impl.get(), "ds", "CreateDomainShader", code, len,
+      [](ID3D11Device* d, const void* bc, std::size_t n, ID3D11DomainShader** out) {
+        return d->CreateDomainShader(bc, n, nullptr, out);
+      });
 }
 
 std::size_t HeliosDxvkDevice::create_compute_shader(const std::uint8_t* code, std::size_t len) const {
-  if (!impl || !impl->d3d11 || !code || !len)
-    return 0;
-  ID3D11ComputeShader* shader = nullptr;
-  try {
-    auto bytecode = prepare_shader_bytecode(code, len);
-    if (!bytecode)
-      return 0;
-    dump_shader_bytecode("cs", "raw", code, len);
-    dump_shader_bytecode("cs", "wrapped", bytecode.data(), bytecode.len());
-    HRESULT hr = impl->d3d11->CreateComputeShader(bytecode.data(), bytecode.len(), nullptr, &shader);
-    if (FAILED(hr)) {
-      umd_log("CreateComputeShader returned failure");
-      return 0;
-    }
-    return reinterpret_cast<std::size_t>(shader);
-  } catch (const dxvk::DxvkError& e) {
-    umd_log(("CreateComputeShader DxvkError: " + e.message()).c_str());
-  } catch (const std::exception& e) {
-    umd_log(e.what());
-  } catch (...) {
-    umd_log("unknown exception in CreateComputeShader");
-  }
-  return 0;
+  return create_shader_impl<ID3D11ComputeShader>(
+      impl.get(), "cs", "CreateComputeShader", code, len,
+      [](ID3D11Device* d, const void* bc, std::size_t n, ID3D11ComputeShader** out) {
+        return d->CreateComputeShader(bc, n, nullptr, out);
+      });
 }
 
 std::unique_ptr<HeliosDxvkDevice> helios_dxvk_create_device(
