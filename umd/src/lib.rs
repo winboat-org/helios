@@ -259,6 +259,187 @@ pub struct D3d12DdiTableRequest {
     pub num_tables: u32,
 }
 
+/// TEMPORARY (R802 verification, deleted in the conversion commit).
+///
+/// The review asks for "one throwaway build [that] logs `size_of`/`offset_of`
+/// for both the hand-written and the bindgen struct — they must be numerically
+/// identical (the field lists were verified to match; the compiler's numbers
+/// were not)". A build that *logs* numbers still needs a human to compare them,
+/// so this asserts the equality instead: if this module compiles, the two
+/// definitions are provably the same shape and the hand-written ones can be
+/// deleted without reading a single offset.
+#[allow(dead_code)]
+mod abi_equivalence_proof {
+    use super::*;
+    use core::mem::{align_of, offset_of, size_of};
+
+    // ---- D3D10DDI_HADAPTER -------------------------------------------------
+    const _: () = assert!(size_of::<D3d10DdiAdapterHandle>() == size_of::<ddi::D3D10DDI_HADAPTER>());
+    const _: () =
+        assert!(align_of::<D3d10DdiAdapterHandle>() == align_of::<ddi::D3D10DDI_HADAPTER>());
+    const _: () = assert!(
+        offset_of!(D3d10DdiAdapterHandle, p_drv_private)
+            == offset_of!(ddi::D3D10DDI_HADAPTER, pDrvPrivate)
+    );
+
+    // ---- D3D10DDIARG_OPENADAPTER ------------------------------------------
+    const _: () =
+        assert!(size_of::<D3d10DdiArgOpenAdapter>() == size_of::<ddi::D3D10DDIARG_OPENADAPTER>());
+    const _: () = assert!(
+        offset_of!(D3d10DdiArgOpenAdapter, h_rt_adapter)
+            == offset_of!(ddi::D3D10DDIARG_OPENADAPTER, hRTAdapter)
+    );
+    const _: () = assert!(
+        offset_of!(D3d10DdiArgOpenAdapter, h_adapter)
+            == offset_of!(ddi::D3D10DDIARG_OPENADAPTER, hAdapter)
+    );
+    const _: () = assert!(
+        offset_of!(D3d10DdiArgOpenAdapter, interface)
+            == offset_of!(ddi::D3D10DDIARG_OPENADAPTER, Interface)
+    );
+    const _: () = assert!(
+        offset_of!(D3d10DdiArgOpenAdapter, version)
+            == offset_of!(ddi::D3D10DDIARG_OPENADAPTER, Version)
+    );
+    const _: () = assert!(
+        offset_of!(D3d10DdiArgOpenAdapter, p_adapter_callbacks)
+            == offset_of!(ddi::D3D10DDIARG_OPENADAPTER, pAdapterCallbacks)
+    );
+    // The hand copy flattens the funcs union to one pointer; bindgen keeps the
+    // union. Same offset, same size, which is the whole question.
+    const _: () = assert!(
+        offset_of!(D3d10DdiArgOpenAdapter, p_adapter_funcs)
+            == offset_of!(ddi::D3D10DDIARG_OPENADAPTER, __bindgen_anon_1)
+    );
+
+    // ---- D3D10DDI_ADAPTERFUNCS / D3D10_2DDI_ADAPTERFUNCS -------------------
+    const _: () =
+        assert!(size_of::<D3d10DdiAdapterFuncs>() == size_of::<ddi::D3D10DDI_ADAPTERFUNCS>());
+    const _: () = assert!(
+        offset_of!(D3d10DdiAdapterFuncs, pfn_calc_private_device_size)
+            == offset_of!(ddi::D3D10DDI_ADAPTERFUNCS, pfnCalcPrivateDeviceSize)
+    );
+    const _: () = assert!(
+        offset_of!(D3d10DdiAdapterFuncs, pfn_create_device)
+            == offset_of!(ddi::D3D10DDI_ADAPTERFUNCS, pfnCreateDevice)
+    );
+    const _: () = assert!(
+        offset_of!(D3d10DdiAdapterFuncs, pfn_close_adapter)
+            == offset_of!(ddi::D3D10DDI_ADAPTERFUNCS, pfnCloseAdapter)
+    );
+    // The hand copy nests the 10.0 table as `base`; bindgen flattens all five
+    // fields. Equivalent only if `base` sits at 0 and the two extra fields land
+    // where the flat table puts them.
+    const _: () =
+        assert!(size_of::<D3d10_2DdiAdapterFuncs>() == size_of::<ddi::D3D10_2DDI_ADAPTERFUNCS>());
+    const _: () = assert!(offset_of!(D3d10_2DdiAdapterFuncs, base) == 0);
+    const _: () = assert!(
+        offset_of!(D3d10_2DdiAdapterFuncs, pfn_get_supported_versions)
+            == offset_of!(ddi::D3D10_2DDI_ADAPTERFUNCS, pfnGetSupportedVersions)
+    );
+    const _: () = assert!(
+        offset_of!(D3d10_2DdiAdapterFuncs, pfn_get_caps)
+            == offset_of!(ddi::D3D10_2DDI_ADAPTERFUNCS, pfnGetCaps)
+    );
+
+    // ---- D3D10_2DDIARG_GETCAPS --------------------------------------------
+    const _: () =
+        assert!(size_of::<D3d10_2DdiArgGetCaps>() == size_of::<ddi::D3D10_2DDIARG_GETCAPS>());
+    const _: () = assert!(
+        offset_of!(D3d10_2DdiArgGetCaps, caps_type) == offset_of!(ddi::D3D10_2DDIARG_GETCAPS, Type)
+    );
+    const _: () = assert!(
+        offset_of!(D3d10_2DdiArgGetCaps, p_info) == offset_of!(ddi::D3D10_2DDIARG_GETCAPS, pInfo)
+    );
+    const _: () = assert!(
+        offset_of!(D3d10_2DdiArgGetCaps, p_data) == offset_of!(ddi::D3D10_2DDIARG_GETCAPS, pData)
+    );
+    const _: () = assert!(
+        offset_of!(D3d10_2DdiArgGetCaps, data_size)
+            == offset_of!(ddi::D3D10_2DDIARG_GETCAPS, DataSize)
+    );
+
+    // ---- DXGI_DDI_BASE_ARGS ------------------------------------------------
+    const _: () = assert!(size_of::<DxgiDdiBaseArgs>() == size_of::<ddi::DXGI_DDI_BASE_ARGS>());
+    const _: () = assert!(
+        offset_of!(DxgiDdiBaseArgs, p_dxgi_base_callbacks)
+            == offset_of!(ddi::DXGI_DDI_BASE_ARGS, pDXGIBaseCallbacks)
+    );
+    const _: () = assert!(
+        offset_of!(DxgiDdiBaseArgs, p_dxgi_ddi_base_functions)
+            == offset_of!(ddi::DXGI_DDI_BASE_ARGS, __bindgen_anon_1)
+    );
+
+    // ---- D3D10DDIARG_CREATEDEVICE -----------------------------------------
+    // The one that matters most: `CreateDevice` writes 152 function pointers
+    // through the funcs union and constructs `HeliosDevice` over `hDrvDevice`.
+    const _: () =
+        assert!(size_of::<D3d10DdiArgCreateDevice>() == size_of::<ddi::D3D10DDIARG_CREATEDEVICE>());
+    const _: () = assert!(
+        align_of::<D3d10DdiArgCreateDevice>() == align_of::<ddi::D3D10DDIARG_CREATEDEVICE>()
+    );
+    const _: () = assert!(
+        offset_of!(D3d10DdiArgCreateDevice, h_rt_device)
+            == offset_of!(ddi::D3D10DDIARG_CREATEDEVICE, hRTDevice)
+    );
+    const _: () = assert!(
+        offset_of!(D3d10DdiArgCreateDevice, interface)
+            == offset_of!(ddi::D3D10DDIARG_CREATEDEVICE, Interface)
+    );
+    const _: () = assert!(
+        offset_of!(D3d10DdiArgCreateDevice, version)
+            == offset_of!(ddi::D3D10DDIARG_CREATEDEVICE, Version)
+    );
+    const _: () = assert!(
+        offset_of!(D3d10DdiArgCreateDevice, p_kt_callbacks)
+            == offset_of!(ddi::D3D10DDIARG_CREATEDEVICE, pKTCallbacks)
+    );
+    const _: () = assert!(
+        offset_of!(D3d10DdiArgCreateDevice, p_device_funcs)
+            == offset_of!(ddi::D3D10DDIARG_CREATEDEVICE, __bindgen_anon_1)
+    );
+    const _: () = assert!(
+        offset_of!(D3d10DdiArgCreateDevice, h_drv_device)
+            == offset_of!(ddi::D3D10DDIARG_CREATEDEVICE, hDrvDevice)
+    );
+    const _: () = assert!(
+        offset_of!(D3d10DdiArgCreateDevice, dxgi_base_ddi)
+            == offset_of!(ddi::D3D10DDIARG_CREATEDEVICE, DXGIBaseDDI)
+    );
+    const _: () = assert!(
+        offset_of!(D3d10DdiArgCreateDevice, h_rt_core_layer)
+            == offset_of!(ddi::D3D10DDIARG_CREATEDEVICE, hRTCoreLayer)
+    );
+    const _: () = assert!(
+        offset_of!(D3d10DdiArgCreateDevice, p_um_callbacks)
+            == offset_of!(ddi::D3D10DDIARG_CREATEDEVICE, __bindgen_anon_2)
+    );
+    const _: () = assert!(
+        offset_of!(D3d10DdiArgCreateDevice, flags)
+            == offset_of!(ddi::D3D10DDIARG_CREATEDEVICE, Flags)
+    );
+    const _: () = assert!(
+        offset_of!(D3d10DdiArgCreateDevice, ppfn_retrieve_sub_object)
+            == offset_of!(ddi::D3D10DDIARG_CREATEDEVICE, ppfnRetrieveSubObject)
+    );
+
+    // The doc comment on `D3d10DdiArgCreateDevice` asserts these absolute
+    // offsets in prose. Pin them so the prose is checked too.
+    const _: () = assert!(offset_of!(ddi::D3D10DDIARG_CREATEDEVICE, hRTDevice) == 0);
+    const _: () = assert!(offset_of!(ddi::D3D10DDIARG_CREATEDEVICE, Interface) == 8);
+    const _: () = assert!(offset_of!(ddi::D3D10DDIARG_CREATEDEVICE, Version) == 12);
+    const _: () = assert!(offset_of!(ddi::D3D10DDIARG_CREATEDEVICE, pKTCallbacks) == 16);
+    const _: () = assert!(offset_of!(ddi::D3D10DDIARG_CREATEDEVICE, __bindgen_anon_1) == 24);
+    const _: () = assert!(offset_of!(ddi::D3D10DDIARG_CREATEDEVICE, hDrvDevice) == 32);
+    const _: () = assert!(offset_of!(ddi::D3D10DDIARG_CREATEDEVICE, DXGIBaseDDI) == 40);
+    const _: () = assert!(size_of::<ddi::DXGI_DDI_BASE_ARGS>() == 16);
+    const _: () = assert!(offset_of!(ddi::D3D10DDIARG_CREATEDEVICE, hRTCoreLayer) == 56);
+    const _: () = assert!(offset_of!(ddi::D3D10DDIARG_CREATEDEVICE, __bindgen_anon_2) == 64);
+    const _: () = assert!(offset_of!(ddi::D3D10DDIARG_CREATEDEVICE, Flags) == 72);
+    const _: () = assert!(offset_of!(ddi::D3D10DDIARG_CREATEDEVICE, ppfnRetrieveSubObject) == 80);
+    const _: () = assert!(size_of::<ddi::D3D10DDIARG_CREATEDEVICE>() == 88);
+}
+
 static mut ADAPTER_COOKIE: usize = 0x4845_4c49_4f53_554d; // "HELIOSUM"
 
 /// Dcomp present vehicle (road 4 unit 2), in-process export for the ICD's
@@ -375,21 +556,42 @@ pub extern "system" fn helios_umd_selftest() -> i32 {
     let mut funcs = vec![0u64; core::mem::size_of::<ddi::D3D11DDI_DEVICEFUNCS>() / 8 + 1];
     let mut dxgi_funcs = vec![0u64; core::mem::size_of::<ddi::DXGI_DDI_BASE_FUNCTIONS>() / 8 + 1];
 
-    let arg = D3d10DdiArgCreateDevice {
-        h_rt_device: core::ptr::null_mut(),
-        interface: 0x000b_000a, // D3D11_0_DDI_INTERFACE_VERSION
-        version: 0,
-        p_kt_callbacks: core::ptr::null(),
-        p_device_funcs: funcs.as_mut_ptr().cast(),
-        h_drv_device: device_priv.as_mut_ptr().cast(),
-        dxgi_base_ddi: DxgiDdiBaseArgs {
-            p_dxgi_base_callbacks: core::ptr::null(),
-            p_dxgi_ddi_base_functions: dxgi_funcs.as_mut_ptr().cast(),
+    // Both unions are initialised explicitly, and each names the member that
+    // matches the `Interface` above: an 11.0-negotiated device reads
+    // `p11DeviceFuncs` and `pUMCallbacks`. Every member of each union is a
+    // pointer at offset 0 (bindgen asserts that in the generated module), so
+    // this is representationally identical to the old single-pointer field --
+    // what it buys is that the member name and `Interface` now have to agree.
+    let arg = ddi::D3D10DDIARG_CREATEDEVICE {
+        // The WDK spells runtime-owned handles `handle` and driver-private ones
+        // `pDrvPrivate`. The hand-written struct erased that by declaring every
+        // one as a bare `*mut c_void`.
+        hRTDevice: ddi::D3D10DDI_HRTDEVICE {
+            handle: core::ptr::null_mut(),
         },
-        h_rt_core_layer: core::ptr::null_mut(),
-        p_um_callbacks: core::ptr::null(),
-        flags: 0,
-        ppfn_retrieve_sub_object: core::ptr::null_mut(),
+        Interface: 0x000b_000a, // D3D11_0_DDI_INTERFACE_VERSION
+        Version: 0,
+        pKTCallbacks: core::ptr::null(),
+        __bindgen_anon_1: ddi::D3D10DDIARG_CREATEDEVICE__bindgen_ty_1 {
+            p11DeviceFuncs: funcs.as_mut_ptr().cast(),
+        },
+        hDrvDevice: ddi::D3D10DDI_HDEVICE {
+            pDrvPrivate: device_priv.as_mut_ptr().cast(),
+        },
+        DXGIBaseDDI: ddi::DXGI_DDI_BASE_ARGS {
+            pDXGIBaseCallbacks: core::ptr::null_mut(),
+            __bindgen_anon_1: ddi::DXGI_DDI_BASE_ARGS__bindgen_ty_1 {
+                pDXGIDDIBaseFunctions: dxgi_funcs.as_mut_ptr().cast(),
+            },
+        },
+        hRTCoreLayer: ddi::D3D10DDI_HRTCORELAYER {
+            handle: core::ptr::null_mut(),
+        },
+        __bindgen_anon_2: ddi::D3D10DDIARG_CREATEDEVICE__bindgen_ty_2 {
+            pUMCallbacks: core::ptr::null(),
+        },
+        Flags: 0,
+        ppfnRetrieveSubObject: core::ptr::null_mut(),
     };
 
     let hr = unsafe { create_device(hadapter, &arg as *const _ as *mut c_void) };
@@ -740,7 +942,20 @@ unsafe extern "system" fn create_device(
         log_error!("CreateDevice null args -> E_NOTIMPL");
         return E_NOTIMPL;
     }
-    let create = unsafe { &*(args as *const D3d10DdiArgCreateDevice) };
+    let create = unsafe { &*(args as *const ddi::D3D10DDIARG_CREATEDEVICE) };
+    // The three union members this function reads generically: for logging, for
+    // null-checking, and for handing to the runtime. Every member of each union
+    // is a pointer at offset 0 -- machine-checked by the bindgen layout
+    // assertions in the generated module -- so which member is named here does
+    // not change the value. Where the CHOICE is load-bearing is the fill match
+    // at step 3, which names the member matching the negotiated interface.
+    // SAFETY: reading any member of a union of same-offset pointers is
+    // well-defined for every initialisation the runtime can have performed;
+    // `create` itself is validated by the caller contract above.
+    let p_device_funcs = unsafe { create.__bindgen_anon_1.pDeviceFuncs };
+    let p_um_callbacks = unsafe { create.__bindgen_anon_2.pUMCallbacks };
+    let p_dxgi_base_functions =
+        unsafe { create.DXGIBaseDDI.__bindgen_anon_1.pDXGIDDIBaseFunctions };
     // Ground-truth dump: the negotiated Interface decides which funcs-table
     // LAYOUT the runtime reads back, and a misread here silently wires typed
     // 11.1 handlers into slots an 11.0-negotiated device never calls (dwm's
@@ -760,7 +975,7 @@ unsafe extern "system" fn create_device(
         // DXGIBaseDDI, hRTCoreLayer, pUMCallbacks, flags. Word 10 is read only
         // when the negotiated interface says it is there, keyed on the same
         // closed set R405 introduced; an unknown interface reads the short shape.
-        let words = match NegotiatedInterface::from_interface(create.interface) {
+        let words = match NegotiatedInterface::from_interface(create.Interface) {
             Some(NegotiatedInterface::D3D11_1) | Some(NegotiatedInterface::Wddm1_3) => 11,
             Some(NegotiatedInterface::D3D11_0) | None => 10,
         };
@@ -776,14 +991,14 @@ unsafe extern "system" fn create_device(
     log_error!(
         "CreateDevice interface=0x{:08x} version=0x{:08x} flags=0x{:08x} \
          pDeviceFuncs={:p} hDrvDevice={:p} pKTCallbacks={:p} pUMCallbacks={:p} pDXGIBaseFuncs={:p}",
-        create.interface,
-        create.version,
-        create.flags,
-        create.p_device_funcs,
-        create.h_drv_device,
-        create.p_kt_callbacks,
-        create.p_um_callbacks,
-        create.dxgi_base_ddi.p_dxgi_ddi_base_functions,
+        create.Interface,
+        create.Version,
+        create.Flags,
+        p_device_funcs,
+        create.hDrvDevice.pDrvPrivate,
+        create.pKTCallbacks,
+        p_um_callbacks,
+        p_dxgi_base_functions,
     );
 
     // 0) Validate every runtime-supplied pointer BEFORE constructing anything.
@@ -793,21 +1008,21 @@ unsafe extern "system" fn create_device(
     //    and the paging queue all existed) leaked a kernel context and a paging
     //    queue per attempt, skipping both destroy_runtime_objects and
     //    drop_in_place. A crash-looping client exhausted them.
-    if create.h_drv_device.is_null() {
+    if create.hDrvDevice.pDrvPrivate.is_null() {
         log_error!("  CreateDevice: null hDrvDevice -> E_FAIL");
         return E_FAIL;
     }
-    if create.p_device_funcs.is_null() {
+    if p_device_funcs.is_null() {
         log_error!("  CreateDevice: null pDeviceFuncs -> E_FAIL");
         return E_FAIL;
     }
     //    The negotiated interface is runtime-supplied too, and it selects the
     //    SHAPE of the table we write. Refuse anything outside the advertised
     //    set rather than defaulting to D3D11.0's 150-slot fill.
-    let Some(negotiated) = NegotiatedInterface::from_interface(create.interface) else {
+    let Some(negotiated) = NegotiatedInterface::from_interface(create.Interface) else {
         log_error!(
             "  CreateDevice: unsupported interface 0x{:08x} (advertised 0x{:08x}/0x{:08x}/0x{:08x}) -> E_NOTIMPL",
-            create.interface,
+            create.Interface,
             NegotiatedInterface::WDDM1_3_INTERFACE,
             NegotiatedInterface::D3D11_1_INTERFACE,
             NegotiatedInterface::D3D11_0_INTERFACE,
@@ -826,11 +1041,11 @@ unsafe extern "system" fn create_device(
     //    (size came from CalcPrivateDeviceSize). hDrvDevice IS that pointer.
     unsafe {
         core::ptr::write(
-            create.h_drv_device as *mut device_funcs::HeliosDevice,
+            create.hDrvDevice.pDrvPrivate as *mut device_funcs::HeliosDevice,
             device_funcs::HeliosDevice {
                 present_src_cache: core::cell::RefCell::new(Vec::new()),
                 dxvk,
-                h_rt_device: create.h_rt_device,
+                h_rt_device: create.hRTDevice.handle,
                 h_context: core::ptr::null_mut(),
                 command_buffer: core::cell::Cell::new(core::ptr::null_mut()),
                 command_buffer_size: core::cell::Cell::new(0),
@@ -838,10 +1053,12 @@ unsafe extern "system" fn create_device(
                 allocation_list_size: core::cell::Cell::new(0),
                 patch_list: core::cell::Cell::new(core::ptr::null_mut()),
                 patch_list_size: core::cell::Cell::new(0),
-                kt_callbacks: create.p_kt_callbacks as *const ddi::D3DDDI_DEVICECALLBACKS,
+                // Both of these arrive already typed from the bindgen struct;
+                // the hand copy declared them as bare `c_void` pointers and had
+                // to cast at this site.
+                kt_callbacks: create.pKTCallbacks,
                 paging_queue: None,
-                dxgi_callbacks: create.dxgi_base_ddi.p_dxgi_base_callbacks
-                    as *mut ddi::DXGI_DDI_BASE_CALLBACKS,
+                dxgi_callbacks: create.DXGIBaseDDI.pDXGIBaseCallbacks,
                 scanout_resource_raw: core::cell::Cell::new(0),
                 scanout_resource_id: core::cell::Cell::new(0),
                 scanout_allocation: core::cell::Cell::new(0),
@@ -856,8 +1073,8 @@ unsafe extern "system" fn create_device(
                 direct_scanout_allocations: core::cell::RefCell::new(Vec::new()),
                 composition_source: core::cell::RefCell::new(None),
                 scanout_copy_count: core::cell::Cell::new(0),
-                h_rt_core_layer: create.h_rt_core_layer,
-                um_callbacks: create.p_um_callbacks,
+                h_rt_core_layer: create.hRTCoreLayer.handle,
+                um_callbacks: p_um_callbacks.cast(),
                 ia: core::cell::RefCell::new(device_funcs::IaState::default()),
                 flip_wait_state: core::cell::Cell::new(0),
                 flip_wait_fence: core::cell::Cell::new(0),
@@ -869,11 +1086,11 @@ unsafe extern "system" fn create_device(
     // From here on every early return must tear down. The guard does it, so it
     // is not something each new failure arm has to remember.
     let guard = DeviceUnderConstruction {
-        dev: create.h_drv_device as *mut device_funcs::HeliosDevice,
+        dev: create.hDrvDevice.pDrvPrivate as *mut device_funcs::HeliosDevice,
     };
 
     unsafe {
-        let dev = &mut *(create.h_drv_device as *mut device_funcs::HeliosDevice);
+        let dev = &mut *(create.hDrvDevice.pDrvPrivate as *mut device_funcs::HeliosDevice);
         let context_hr = device_funcs::create_runtime_context(dev);
         if context_hr != S_OK {
             log_error!(
@@ -898,33 +1115,33 @@ unsafe extern "system" fn create_device(
         "  CreateDevice: filling {} device-funcs table",
         negotiated.name()
     );
+    // Each arm now names the union member the negotiated interface selects,
+    // instead of casting one `*mut c_void` to a different table type per arm.
+    // The pointer value is the same either way (all members alias at offset 0);
+    // what changes is that the member name, the fill function and the interface
+    // are readable as one triple, which is the R802 defect -- an editor could
+    // previously pair `D3D11_1` with `fill_d3d11_device_funcs` and the cast
+    // would still compile.
     unsafe {
         match negotiated {
             NegotiatedInterface::Wddm1_3 => {
                 device_funcs::fill_wddm1_3_device_funcs(
-                    create.p_device_funcs as *mut ddi::D3DWDDM1_3DDI_DEVICEFUNCS,
+                    create.__bindgen_anon_1.pWDDM1_3DeviceFuncs,
                 );
                 device_funcs::fill_dxgi_1_3_base_funcs(
-                    create.dxgi_base_ddi.p_dxgi_ddi_base_functions
-                        as *mut ddi::DXGI1_3_DDI_BASE_FUNCTIONS,
+                    create.DXGIBaseDDI.__bindgen_anon_1.pDXGIDDIBaseFunctions4,
                 );
             }
             NegotiatedInterface::D3D11_1 => {
-                device_funcs::fill_d3d11_1_device_funcs(
-                    create.p_device_funcs as *mut ddi::D3D11_1DDI_DEVICEFUNCS,
-                );
+                device_funcs::fill_d3d11_1_device_funcs(create.__bindgen_anon_1.p11_1DeviceFuncs);
                 device_funcs::fill_dxgi_1_1_base_funcs(
-                    create.dxgi_base_ddi.p_dxgi_ddi_base_functions
-                        as *mut ddi::DXGI1_1_DDI_BASE_FUNCTIONS,
+                    create.DXGIBaseDDI.__bindgen_anon_1.pDXGIDDIBaseFunctions2,
                 );
             }
             NegotiatedInterface::D3D11_0 => {
-                device_funcs::fill_d3d11_device_funcs(
-                    create.p_device_funcs as *mut ddi::D3D11DDI_DEVICEFUNCS,
-                );
+                device_funcs::fill_d3d11_device_funcs(create.__bindgen_anon_1.p11DeviceFuncs);
                 device_funcs::fill_dxgi_base_funcs(
-                    create.dxgi_base_ddi.p_dxgi_ddi_base_functions
-                        as *mut ddi::DXGI_DDI_BASE_FUNCTIONS,
+                    create.DXGIBaseDDI.__bindgen_anon_1.pDXGIDDIBaseFunctions,
                 );
             }
         }
@@ -935,7 +1152,7 @@ unsafe extern "system" fn create_device(
     guard.defuse();
     // Record it live for `helios_umd_wait_last_present`, which dereferences a
     // device pointer the ICD recorded on an earlier call (R415).
-    forward::register_live_device(create.h_drv_device as usize);
+    forward::register_live_device(create.hDrvDevice.pDrvPrivate as usize);
 
     if std::env::var_os("HELIOS_DXGI_NO_REDIRECTION").is_some() {
         log_error!("  CreateDevice -> DXGI_STATUS_NO_REDIRECTION (env-gated; DXGI desktop fallback)");
