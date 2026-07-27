@@ -343,8 +343,8 @@ virtio-gpu scanout; IddCx/Looking Glass is no longer the active display path.*
    448**. The script now reads sub-page frames, sums declared call CHAINS rather than every symbol,
    and exits 1 over the ceiling; run it on every image. The venus bring-up is the shallower chain
    at 12816 because R608 split it into `#[inline(never)]` per-stage frames.
-   ⚠ **R614 (the `PassiveLevel` proof token) is DECLINED — owner decision 2026-07-27, dropped
-   from T4a and NOT carried forward.** The review sized it at "33 signatures plus caller groups";
+   ⚠ **R614 (the `PassiveLevel` proof token) is DEFERRED to its own tranche and its own KMD
+   image — owner decision 2026-07-27 (initially declined, reversed the same day).** The review sized it at "33 signatures plus caller groups";
    measured against the tree it is ~190 sites, because `venus.rs` sits between the DDIs and
    `virtio::ctrl` and every one of its 95 `VenusClient`/`VenusRing` methods transitively reaches
    `ctrl::sleep_ms` through `ring_wait_until`. Full cost: 34 ctrl entry points + 95 venus methods
@@ -352,8 +352,12 @@ virtio-gpu scanout; IddCx/Looking Glass is no longer the active display path.*
    that buys no behaviour. **Consequence to remember: the PASSIVE-only contract of `virtio::ctrl`
    stays what it always was — one prose comment at `ctrl.rs:19` over 34 public functions that
    sleep, wait on KEVENTs or allocate contiguous memory, with no runtime assertion.** Anything
-   that later wants the guarantee should re-scope it from the venus layer outward. Marked DECLINED
-   in REFACTOR_REVIEW.md §T4a.
+   that later wants the guarantee should re-scope it from the venus layer outward — which is
+   exactly what makes it tractable: `with_venus_client` is the only gateway to
+   `&mut VenusClient`, so requiring the token there and storing one in `VenusRing` replaces ~95
+   threaded parameters with one structural claim (~130 sites, not ~190). See REFACTOR_REVIEW.md
+   §T4a R614, which carries that plus the finding that all 34 entry points really are
+   PASSIVE-only (even the `_async` ones allocate contiguous memory).
    ⚠ Formatting: `cargo fmt` was NOT run — the crate was already unclean before T4a (`lib.rs` 49
    hunks, `ddi/mod.rs` 26, `virtio/mod.rs` 20, all untouched here) and `cargo fmt` clean is T8's
    gate criterion. T4a added ~5 hunks in files it edited.
