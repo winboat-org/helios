@@ -275,22 +275,6 @@ pub(crate) struct AdapterKnobs {
     /// steady-state path never waits or maps a frame, and the per-pair
     /// `probe_done` state statically prevents repeated readbacks.
     pub present_probe: bool,
-    /// `ScForceReject` (default 0 = OFF, absent from the shipped registry).
-    ///
-    /// GATE INSTRUMENT. The T3 gate requires each deferred-programming refusal
-    /// exit to be forced with its counter proven to move and `VsCnt` still
-    /// advancing — and seven of the eight cannot be provoked naturally on a
-    /// healthy box. This makes `program_vidpn_source` take one specific exit so
-    /// that can be shown per boot-cycle, with `pnputil /restart-device` between
-    /// values instead of eight reboots.
-    ///
-    ///   1 = BadAlloc   2 = Extent   3 = Layout           4 = Format
-    ///   5 = LinearAllocFailed       6 = SetFailed
-    ///   7 = NoTarget                8 = CopyFailed
-    ///
-    /// Costs one field read per SetVidPnSourceAddress. Recorded as `ScFrc`.
-    /// Candidate for deletion in T6 once the gate evidence is banked.
-    pub forced_reject: u32,
     /// `DisplayHalf` (default 0 = OFF, the boot-proven render-only surface).
     /// When nonzero, StartDevice advertises ONE video-present source + ONE child
     /// video-output and the VidPn/child DDIs in
@@ -336,7 +320,6 @@ impl AdapterKnobs {
     pub const DEFAULTS: Self = Self {
         alloc_cached: true,
         present_probe: false,
-        forced_reject: 0,
         display_half: false,
         direct_flip: false,
         cross_adapter: false,
@@ -358,7 +341,6 @@ impl AdapterKnobs {
         Self {
             alloc_cached: read_config_dword(knobs::ALLOC_CACHED, 1) != 0,
             present_probe: read_config_dword(knobs::PRESENT_PROBE, 0) != 0,
-            forced_reject: read_config_dword(knobs::SC_FORCE_REJECT, 0),
             display_half: read_config_dword(knobs::DISPLAY_HALF, 0) != 0,
             direct_flip: read_config_dword(knobs::DIRECT_FLIP_CAPS, 0) != 0,
             cross_adapter: read_config_dword(knobs::CROSS_ADAPT_CAPS, 0) != 0,
@@ -377,7 +359,6 @@ impl AdapterKnobs {
         let knobs = Self::read();
         crate::diag::record_named_bytes(b"AlcC", knobs.alloc_cached as u32);
         crate::diag::record_named_bytes(b"PBPrEn", knobs.present_probe as u32);
-        crate::diag::record_named_bytes(b"ScFrc", knobs.forced_reject);
         crate::diag::record_named_bytes(b"DspH", knobs.display_half as u32);
         crate::diag::record_named_bytes(b"BarF", knobs.bar_seg_flags);
         crate::diag::record_named_bytes(b"BarB", knobs.bar_seg_base_mb);
@@ -2344,12 +2325,6 @@ impl AdapterContext {
     /// `PresentProbe`. Defaults to false before StartDevice.
     pub fn present_probe(&self) -> bool {
         self.knobs().present_probe
-    }
-
-    /// `ScForceReject` — the T3 gate instrument. 0 = off (the shipped
-    /// default and the only value present in a production registry).
-    pub(crate) fn forced_reject(&self) -> u32 {
-        self.knobs().forced_reject
     }
 
     /// The EDID served by `DxgkDdiQueryDeviceDescriptor`.

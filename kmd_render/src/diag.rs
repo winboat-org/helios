@@ -537,7 +537,6 @@ pub mod knobs {
     /// Per-present probe instrumentation (default 0).
     pub const PRESENT_PROBE: KnobName = KnobName::new(b"PresentProbe");
     /// T3 gate instrument: force one deferred-programming refusal (default 0).
-    pub const SC_FORCE_REJECT: KnobName = KnobName::new(b"ScForceReject");
     /// Render+display adapter shape (default 0 = render-only recovery).
     pub const DISPLAY_HALF: KnobName = KnobName::new(b"DisplayHalf");
     /// Restore the legacy `SupportDirectFlip` advertisement (default 0 = deny).
