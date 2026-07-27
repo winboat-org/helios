@@ -972,6 +972,15 @@ const fn tex2d_shape(array_size: u32, sample_count: u32) -> Tex2DShape {
     }
 }
 
+/// The sample count a translator passes to [`tex2d_shape`] when the view kind
+/// has no multisampled form at all.
+///
+/// D3D11 has no multisampled UAV — there is no
+/// `D3D11_UAV_DIMENSION_TEXTURE2DMS` — so `uav_desc` never consulted the
+/// resource's sample count and must keep not consulting it. Naming the 1 says
+/// that is deliberate rather than a missing `resource_sample_count` call.
+const NO_MULTISAMPLED_FORM: u32 = 1;
+
 unsafe fn resource_dxgi_format(h_res: ddi::D3D10DDI_HRESOURCE) -> DXGI_FORMAT {
     let Some(res) = load_resource(h_res) else {
         return DXGI_FORMAT(0);
@@ -5468,8 +5477,8 @@ unsafe fn srv_desc(
         }
         RES_TEX1D => {
             let t = a.__bindgen_anon_1.Tex1D;
-            if t.ArraySize > 1 {
-                Some(D3D11_SHADER_RESOURCE_VIEW_DESC {
+            Some(match tex1d_shape(t.ArraySize) {
+                Tex1DShape::Array => D3D11_SHADER_RESOURCE_VIEW_DESC {
                     Format: format,
                     ViewDimension: D3D11_SRV_DIMENSION_TEXTURE1DARRAY,
                     Anonymous: D3D11_SHADER_RESOURCE_VIEW_DESC_0 {
@@ -5480,9 +5489,8 @@ unsafe fn srv_desc(
                             ArraySize: t.ArraySize,
                         },
                     },
-                })
-            } else {
-                Some(D3D11_SHADER_RESOURCE_VIEW_DESC {
+                },
+                Tex1DShape::Plain => D3D11_SHADER_RESOURCE_VIEW_DESC {
                     Format: format,
                     ViewDimension: D3D11_SRV_DIMENSION_TEXTURE1D,
                     Anonymous: D3D11_SHADER_RESOURCE_VIEW_DESC_0 {
@@ -5491,58 +5499,56 @@ unsafe fn srv_desc(
                             MipLevels: t.MipLevels,
                         },
                     },
-                })
-            }
+                },
+            })
         }
         RES_TEX2D => {
             let t = a.__bindgen_anon_1.Tex2D;
-            let is_msaa = resource_sample_count(h_res) > 1;
-            if is_msaa && t.ArraySize > 1 {
-                Some(D3D11_SHADER_RESOURCE_VIEW_DESC {
-                    Format: format,
-                    ViewDimension: D3D11_SRV_DIMENSION_TEXTURE2DMSARRAY,
-                    Anonymous: D3D11_SHADER_RESOURCE_VIEW_DESC_0 {
-                        Texture2DMSArray: D3D11_TEX2DMS_ARRAY_SRV {
-                            FirstArraySlice: t.FirstArraySlice,
-                            ArraySize: t.ArraySize,
+            Some(
+                match tex2d_shape(t.ArraySize, resource_sample_count(h_res)) {
+                    Tex2DShape::MsArray => D3D11_SHADER_RESOURCE_VIEW_DESC {
+                        Format: format,
+                        ViewDimension: D3D11_SRV_DIMENSION_TEXTURE2DMSARRAY,
+                        Anonymous: D3D11_SHADER_RESOURCE_VIEW_DESC_0 {
+                            Texture2DMSArray: D3D11_TEX2DMS_ARRAY_SRV {
+                                FirstArraySlice: t.FirstArraySlice,
+                                ArraySize: t.ArraySize,
+                            },
                         },
                     },
-                })
-            } else if is_msaa {
-                Some(D3D11_SHADER_RESOURCE_VIEW_DESC {
-                    Format: format,
-                    ViewDimension: D3D11_SRV_DIMENSION_TEXTURE2DMS,
-                    Anonymous: D3D11_SHADER_RESOURCE_VIEW_DESC_0 {
-                        Texture2DMS: D3D11_TEX2DMS_SRV {
-                            UnusedField_NothingToDefine: 0,
+                    Tex2DShape::Ms => D3D11_SHADER_RESOURCE_VIEW_DESC {
+                        Format: format,
+                        ViewDimension: D3D11_SRV_DIMENSION_TEXTURE2DMS,
+                        Anonymous: D3D11_SHADER_RESOURCE_VIEW_DESC_0 {
+                            Texture2DMS: D3D11_TEX2DMS_SRV {
+                                UnusedField_NothingToDefine: 0,
+                            },
                         },
                     },
-                })
-            } else if t.ArraySize > 1 {
-                Some(D3D11_SHADER_RESOURCE_VIEW_DESC {
-                    Format: format,
-                    ViewDimension: D3D11_SRV_DIMENSION_TEXTURE2DARRAY,
-                    Anonymous: D3D11_SHADER_RESOURCE_VIEW_DESC_0 {
-                        Texture2DArray: D3D11_TEX2D_ARRAY_SRV {
-                            MostDetailedMip: t.MostDetailedMip,
-                            MipLevels: t.MipLevels,
-                            FirstArraySlice: t.FirstArraySlice,
-                            ArraySize: t.ArraySize,
+                    Tex2DShape::Array => D3D11_SHADER_RESOURCE_VIEW_DESC {
+                        Format: format,
+                        ViewDimension: D3D11_SRV_DIMENSION_TEXTURE2DARRAY,
+                        Anonymous: D3D11_SHADER_RESOURCE_VIEW_DESC_0 {
+                            Texture2DArray: D3D11_TEX2D_ARRAY_SRV {
+                                MostDetailedMip: t.MostDetailedMip,
+                                MipLevels: t.MipLevels,
+                                FirstArraySlice: t.FirstArraySlice,
+                                ArraySize: t.ArraySize,
+                            },
                         },
                     },
-                })
-            } else {
-                Some(D3D11_SHADER_RESOURCE_VIEW_DESC {
-                    Format: format,
-                    ViewDimension: D3D11_SRV_DIMENSION_TEXTURE2D,
-                    Anonymous: D3D11_SHADER_RESOURCE_VIEW_DESC_0 {
-                        Texture2D: D3D11_TEX2D_SRV {
-                            MostDetailedMip: t.MostDetailedMip,
-                            MipLevels: t.MipLevels,
+                    Tex2DShape::Plain => D3D11_SHADER_RESOURCE_VIEW_DESC {
+                        Format: format,
+                        ViewDimension: D3D11_SRV_DIMENSION_TEXTURE2D,
+                        Anonymous: D3D11_SHADER_RESOURCE_VIEW_DESC_0 {
+                            Texture2D: D3D11_TEX2D_SRV {
+                                MostDetailedMip: t.MostDetailedMip,
+                                MipLevels: t.MipLevels,
+                            },
                         },
                     },
-                })
-            }
+                },
+            )
         }
         RES_TEX3D => {
             let t = a.__bindgen_anon_1.Tex3D;
@@ -5557,6 +5563,12 @@ unsafe fn srv_desc(
                 },
             })
         }
+        // The one dimension where SRV genuinely differs from RTV/DSV: D3D11
+        // has real cube SRV dimensions, so this branches on `NumCubes` rather
+        // than collapsing to a 2D array view. Deliberately NOT routed through
+        // `tex1d_shape`/`tex2d_shape` — the discriminant is a cube count, not
+        // an array size, and conflating them is the confusion those two
+        // functions exist to prevent.
         RES_TEXCUBE => {
             let t = a.__bindgen_anon_1.TexCube;
             if t.NumCubes > 1 {
@@ -5707,8 +5719,8 @@ unsafe fn uav_desc(
         }
         RES_TEX1D => {
             let t = a.__bindgen_anon_1.Tex1D;
-            if t.ArraySize > 1 {
-                Some(D3D11_UNORDERED_ACCESS_VIEW_DESC {
+            Some(match tex1d_shape(t.ArraySize) {
+                Tex1DShape::Array => D3D11_UNORDERED_ACCESS_VIEW_DESC {
                     Format: format,
                     ViewDimension: D3D11_UAV_DIMENSION_TEXTURE1DARRAY,
                     Anonymous: D3D11_UNORDERED_ACCESS_VIEW_DESC_0 {
@@ -5718,9 +5730,8 @@ unsafe fn uav_desc(
                             ArraySize: t.ArraySize,
                         },
                     },
-                })
-            } else {
-                Some(D3D11_UNORDERED_ACCESS_VIEW_DESC {
+                },
+                Tex1DShape::Plain => D3D11_UNORDERED_ACCESS_VIEW_DESC {
                     Format: format,
                     ViewDimension: D3D11_UAV_DIMENSION_TEXTURE1D,
                     Anonymous: D3D11_UNORDERED_ACCESS_VIEW_DESC_0 {
@@ -5728,13 +5739,13 @@ unsafe fn uav_desc(
                             MipSlice: t.MipSlice,
                         },
                     },
-                })
-            }
+                },
+            })
         }
         RES_TEX2D => {
             let t = a.__bindgen_anon_1.Tex2D;
-            if t.ArraySize > 1 {
-                Some(D3D11_UNORDERED_ACCESS_VIEW_DESC {
+            match tex2d_shape(t.ArraySize, NO_MULTISAMPLED_FORM) {
+                Tex2DShape::Array => Some(D3D11_UNORDERED_ACCESS_VIEW_DESC {
                     Format: format,
                     ViewDimension: D3D11_UAV_DIMENSION_TEXTURE2DARRAY,
                     Anonymous: D3D11_UNORDERED_ACCESS_VIEW_DESC_0 {
@@ -5744,9 +5755,8 @@ unsafe fn uav_desc(
                             ArraySize: t.ArraySize,
                         },
                     },
-                })
-            } else {
-                Some(D3D11_UNORDERED_ACCESS_VIEW_DESC {
+                }),
+                Tex2DShape::Plain => Some(D3D11_UNORDERED_ACCESS_VIEW_DESC {
                     Format: format,
                     ViewDimension: D3D11_UAV_DIMENSION_TEXTURE2D,
                     Anonymous: D3D11_UNORDERED_ACCESS_VIEW_DESC_0 {
@@ -5754,7 +5764,13 @@ unsafe fn uav_desc(
                             MipSlice: t.MipSlice,
                         },
                     },
-                })
+                }),
+                // Unreachable by construction, and stated rather than
+                // dropped into a catch-all: `NO_MULTISAMPLED_FORM` is 1, so
+                // `tex2d_shape` cannot return either MS shape here. If a
+                // multisampled UAV ever becomes representable, this is the
+                // arm the compiler will point at.
+                Tex2DShape::Ms | Tex2DShape::MsArray => None,
             }
         }
         RES_TEX3D => {
@@ -5771,6 +5787,9 @@ unsafe fn uav_desc(
                 },
             })
         }
+        // No TEXCUBE arm, and that is correct: D3D11 has no cube UAV
+        // dimension. A cube resource reaches a compute shader as a 2D array
+        // UAV, which the runtime asks for as RES_TEX2D.
         _ => None,
     }
 }
