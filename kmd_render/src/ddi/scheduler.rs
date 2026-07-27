@@ -10,7 +10,9 @@ use core::mem::size_of;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::adapter::AdapterContext;
-use crate::ddi::present_packet::{PresentAllocations, STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER};
+use crate::ddi::present_packet::{
+    PresentAllocations, PresentPayload, STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER,
+};
 use crate::device::DeviceHandleRef;
 use crate::dxgk::*;
 
@@ -250,11 +252,20 @@ pub unsafe extern "C" fn dxgkddi_present_to_hw_queue(
         (args.NumSrcAllocations << 16) | (args.NumDstAllocations & 0xFFFF),
     );
 
-    let allocation_list = unsafe { args.__bindgen_anon_1.pAllocationList };
+    // Same one-place union decode as DxgkDdiPresent.
+    // SAFETY: `args` is dxgkrnl's present struct.
+    let payload = unsafe { PresentPayload::decode(args) };
+    let Some(allocation_list) = payload.allocation_list() else {
+        // FlipWithMultiPlaneOverlay — unreachable without the MPO3 KMD interface.
+        crate::diag::record_named_bytes(b"PHQmpo", 1);
+        return STATUS_NOT_SUPPORTED;
+    };
+    let has_list = allocation_list.is_present();
+    // SAFETY: `allocation_list` came from `PresentPayload::decode`.
     let present_allocations = unsafe { PresentAllocations::from_allocation_list(allocation_list) };
-    crate::diag::record_named_bytes(b"PHQalst", if allocation_list.is_null() { 0 } else { 1 });
+    crate::diag::record_named_bytes(b"PHQalst", u32::from(has_list));
 
-    if (present_flags & (1 << 2)) == 0 && !allocation_list.is_null() {
+    if (present_flags & (1 << 2)) == 0 && has_list {
         let src_handle = present_allocations
             .source()
             .map(|allocation| allocation.handle())
@@ -273,7 +284,17 @@ pub unsafe extern "C" fn dxgkddi_present_to_hw_queue(
         crate::diag::record_named_bytes(b"PHQsrc", 0);
     }
 
-    if let Err(status) = unsafe { present_allocations.write_patch_references(args) } {
+    // PresentToHwQueue queues NOTHING, so the token is acquired immediately
+    // before the write. That adjacency is the documentation: there is no host
+    // work here for the validate-before-submit ordering to protect.
+    let capacity = match present_allocations.validate_patch_capacity(args) {
+        Ok(capacity) => capacity,
+        Err(status) => {
+            crate::diag::record_named_bytes(b"PHQst", status as u32);
+            return status;
+        }
+    };
+    if let Err(status) = unsafe { present_allocations.write_patch_references(capacity, args) } {
         crate::diag::record_named_bytes(b"PHQst", status as u32);
         return status;
     }

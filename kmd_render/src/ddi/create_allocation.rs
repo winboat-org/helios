@@ -302,14 +302,65 @@ impl PresentAllocInfo {
 /// `DxgkDdiOpenAllocation` (dxgkrnl round-trips it unmodified in command/present
 /// allocation lists) and still open (not yet `CloseAllocation`-freed).
 pub unsafe fn present_alloc_info(h: HANDLE) -> Option<PresentAllocInfo> {
+    // SAFETY: validated by `open_allocation_context`, which reads the magic
+    // through an unaligned raw read before forming any reference.
+    let open = unsafe { open_allocation_context(h)? };
+    open.present
+}
+
+/// Validate an `hDeviceSpecificAllocation` BEFORE forming a reference to it.
+///
+/// The handle is an integer from dxgkrnl and the check cannot be encoded — but
+/// the ORDER can. Both callers used to do `&*(h as *const OpenAllocationContext)`
+/// and only then test the magic, so any non-null garbage handle was a kernel
+/// dereference that bugchecked before the magic check could refuse it: a stale
+/// handle after CloseAllocation, or a future DDI routing a different list
+/// through here. Now alignment and the magic are checked through
+/// `read_unaligned(addr_of!(..))`, which forms no reference to the whole struct,
+/// and refusals are counted in `OaBadH`.
+///
+/// # Safety
+/// `h`, when it passes the magic check, is one of our live
+/// `OpenAllocationContext` pointers. That a magic-matching pointer really is
+/// live is dxgkrnl's contract and is not encodable.
+unsafe fn open_allocation_context<'a>(h: HANDLE) -> Option<&'a OpenAllocationContext> {
     if h.is_null() {
         return None;
     }
-    let open = unsafe { &*(h as *const OpenAllocationContext) };
-    if open.magic != OPEN_ALLOCATION_CTX_MAGIC {
+    let p = h as *const OpenAllocationContext;
+    if !p.is_aligned() {
+        refuse_open_allocation_handle();
         return None;
     }
-    open.present
+    // SAFETY: `p` is non-null and correctly aligned. Reading ONLY the magic
+    // field through `addr_of!` + `read_unaligned` does not assert that the whole
+    // referent is initialized or dereferenceable, which is exactly the property
+    // the old `&*` cast asserted before it had any evidence for it.
+    let magic = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*p).magic)) };
+    if magic != OPEN_ALLOCATION_CTX_MAGIC {
+        refuse_open_allocation_handle();
+        return None;
+    }
+    // SAFETY: the magic matched, so this is one of our contexts.
+    Some(unsafe { &*p })
+}
+
+/// Non-null open-allocation handles that failed alignment or the magic check.
+///
+/// Must read 0: every handle reaching here came from our own
+/// `DxgkDdiOpenAllocation`. Movement means dxgkrnl routed something else through
+/// the present allocation list, or a handle outlived its CloseAllocation.
+static OPEN_ALLOC_BAD_HANDLE: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
+/// Count a refused handle, mirroring on a bounded cadence — this is the Present
+/// path, so an unthrottled `record_named_bytes` would be a per-frame registry
+/// write.
+fn refuse_open_allocation_handle() {
+    let n = OPEN_ALLOC_BAD_HANDLE.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+    if n == 1 || n % 64 == 0 {
+        crate::diag::record_named_bytes(b"OaBadH", n);
+    }
 }
 
 /// Trace-only identity for a Present allocation-list entry. Call ONLY from
@@ -318,13 +369,8 @@ pub unsafe fn present_alloc_info(h: HANDLE) -> Option<PresentAllocInfo> {
 /// # Safety
 /// As [`present_alloc_info`].
 pub unsafe fn present_alloc_diag(h: HANDLE) -> Option<PresentAllocDiag> {
-    if h.is_null() {
-        return None;
-    }
-    let open = unsafe { &*(h as *const OpenAllocationContext) };
-    if open.magic != OPEN_ALLOCATION_CTX_MAGIC {
-        return None;
-    }
+    // SAFETY: as `present_alloc_info` — validated before any reference is formed.
+    let open = unsafe { open_allocation_context(h)? };
     open.present_diag
 }
 

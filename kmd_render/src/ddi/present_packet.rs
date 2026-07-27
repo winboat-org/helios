@@ -161,6 +161,95 @@ impl PresentAllocation {
     }
 }
 
+/// `DXGK_ALLOCATIONLIST` patch slot ids, and the driver ids we echo back.
+///
+/// They were bare `1` and `2` written into a bitfield union's raw `Value` with
+/// nothing saying what the numbers meant. The values are the WDK's fixed present
+/// slots — `DXGK_PRESENT_DESTINATION_INDEX` = 1 and `DXGK_PRESENT_SOURCE_INDEX`
+/// = 2 — and the driver id echoes the slot so a patch entry identifies itself.
+const PATCH_SLOT_DESTINATION: u32 = DXGK_PRESENT_DESTINATION_INDEX;
+const PATCH_SLOT_SOURCE: u32 = DXGK_PRESENT_SOURCE_INDEX;
+
+/// Which arm of `DXGKARG_PRESENT.__bindgen_anon_1` this present carries.
+///
+/// The union has three arms — `pAllocationList`, `pAllocationInfo` and
+/// `pPresentMultiPlaneOverlayInfo` (`tmp/dxgk_bindings.rs:37178-37182`) — and
+/// both call sites used to pick `pAllocationList` implicitly, while
+/// `from_allocation_list`'s SAFETY paragraph asserted the array shape without
+/// ever having seen the present flags. Decoding the arm ONCE, from
+/// `args.Flags`, means the choice happens in one audited place instead of
+/// implicitly at two call sites.
+pub(crate) enum PresentPayload<'a> {
+    /// The fixed source/destination allocation array. Every present this driver
+    /// services today.
+    AllocationList(PresentAllocationList<'a>),
+    /// `FlipWithMultiPlaneOverlay` — the `pPresentMultiPlaneOverlayInfo` arm.
+    ///
+    /// Unreachable: the driver does not register the MPO3 KMD interface
+    /// (`query_adapter_info.rs`'s cap surface), so dxgkrnl never sets this. It
+    /// is a named variant rather than an assumption so that if it ever arrives,
+    /// the code refuses instead of reinterpreting an MPO struct as an
+    /// allocation array.
+    MultiPlaneOverlay,
+}
+
+impl<'a> PresentPayload<'a> {
+    /// `DXGK_PRESENTFLAGS.FlipWithMultiPlaneOverlay`, verified against the
+    /// generated bitfield order.
+    const FLAG_FLIP_WITH_MPO: u32 = 1 << 12;
+
+    /// Decode the union arm from the present flags.
+    ///
+    /// # Safety
+    /// `args` is dxgkrnl's present argument struct, and the arm named by its
+    /// flags is the one it initialised.
+    pub(crate) unsafe fn decode(args: &'a DXGKARG_PRESENT) -> Self {
+        // SAFETY: `Flags` is a POD union of a bitfield struct and a `UINT`
+        // `Value`; reading the `Value` view is a read of initialized memory.
+        let flags = unsafe { args.Flags.__bindgen_anon_1.Value };
+        if flags & Self::FLAG_FLIP_WITH_MPO != 0 {
+            return Self::MultiPlaneOverlay;
+        }
+        // SAFETY: not an MPO present, so the allocation-list arm is live.
+        let list = unsafe { args.__bindgen_anon_1.pAllocationList };
+        Self::AllocationList(PresentAllocationList {
+            list,
+            _present: core::marker::PhantomData,
+        })
+    }
+
+    /// The allocation list, or `None` for an arm that has none.
+    pub(crate) fn allocation_list(&self) -> Option<&PresentAllocationList<'a>> {
+        match self {
+            Self::AllocationList(list) => Some(list),
+            Self::MultiPlaneOverlay => None,
+        }
+    }
+}
+
+/// The fixed present allocation array, as a value only [`PresentPayload::decode`]
+/// can produce.
+///
+/// A wrapper rather than a raw pointer so the OTHER two union arms cannot be
+/// reinterpreted as an allocation list. It adds provenance, not a new runtime
+/// check: the count it uses is the WDK's fixed `DXGK_PRESENT_MAX_INDEX + 1`, NOT
+/// `NumSrcAllocations`/`NumDstAllocations`, and it must stay that way — dxgkrnl
+/// supplies the full fixed array and encodes an absent source or destination as
+/// a NULL `hDeviceSpecificAllocation`. Passing the Num* counts as the bound
+/// "while we're here" changes which slots are read for the absent case and
+/// silently drops presents.
+pub(crate) struct PresentAllocationList<'a> {
+    list: *mut DXGK_ALLOCATIONLIST,
+    _present: core::marker::PhantomData<&'a DXGKARG_PRESENT>,
+}
+
+impl PresentAllocationList<'_> {
+    /// Whether dxgkrnl supplied an array at all (`PBalst`/`PHQalst`).
+    pub(crate) fn is_present(&self) -> bool {
+        !self.list.is_null()
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct PresentAllocations {
     source: Option<PresentAllocation>,
@@ -176,10 +265,11 @@ impl PresentAllocations {
     /// emission to reference an absent allocation.
     ///
     /// # Safety
-    /// When non-null, `allocation_list` is the fixed present allocation array
-    /// supplied by dxgkrnl and therefore contains the source and destination
-    /// indices defined by the WDK.
-    pub(crate) unsafe fn from_allocation_list(allocation_list: *mut DXGK_ALLOCATIONLIST) -> Self {
+    /// `list` came from [`PresentPayload::decode`], so it is the fixed present
+    /// allocation array supplied by dxgkrnl and contains the source and
+    /// destination indices defined by the WDK.
+    pub(crate) unsafe fn from_allocation_list(list: &PresentAllocationList<'_>) -> Self {
+        let allocation_list = list.list;
         if allocation_list.is_null() {
             return Self {
                 source: None,
@@ -199,14 +289,14 @@ impl PresentAllocations {
             source: NonNull::new(source_handle).map(|handle| PresentAllocation {
                 handle,
                 allocation_index: DXGK_PRESENT_SOURCE_INDEX,
-                slot_id: 2,
-                driver_id: 2,
+                slot_id: PATCH_SLOT_SOURCE,
+                driver_id: PATCH_SLOT_SOURCE,
             }),
             destination: NonNull::new(destination_handle).map(|handle| PresentAllocation {
                 handle,
                 allocation_index: DXGK_PRESENT_DESTINATION_INDEX,
-                slot_id: 1,
-                driver_id: 1,
+                slot_id: PATCH_SLOT_DESTINATION,
+                driver_id: PATCH_SLOT_DESTINATION,
             }),
         }
     }
@@ -229,41 +319,59 @@ impl PresentAllocations {
     /// Validate patch-list capacity without mutating the runtime's output
     /// cursor. Present must call this before it submits any host GPU work, so an
     /// insufficient-buffer retry cannot duplicate a BLT.
-    pub(crate) fn validate_patch_capacity(self, args: &DXGKARG_PRESENT) -> Result<(), NTSTATUS> {
-        let required = self.reference_count();
-        if required != 0
-            && (args.pPatchLocationListOut.is_null()
-                || (args.PatchLocationListOutSize as usize) < required)
-        {
-            Err(STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER)
-        } else {
-            Ok(())
-        }
-    }
-
-    /// Emit exactly the allocation references represented by this value.
     ///
-    /// The capacity check happens before any write, so callers either get a
-    /// complete valid list or an unchanged output pointer.
-    ///
-    /// # Safety
-    /// `args` and its output patch list are supplied by dxgkrnl.  The function
-    /// validates the pointer and capacity before writing.
-    pub(crate) unsafe fn write_patch_references(
+    /// Returns the proof, not `()`. [`PatchCapacity`] is non-`Copy` and
+    /// non-`Clone` and carries the checked pointer and count, so
+    /// [`Self::write_patch_references`] cannot run without it, cannot re-derive
+    /// the capacity expression, and cannot be called twice against a stale
+    /// cursor. Same shape as `WddmNotifyGuard` and T1b's `RenderGdiPlan`.
+    pub(crate) fn validate_patch_capacity(
         self,
-        args: &mut DXGKARG_PRESENT,
-    ) -> Result<(), NTSTATUS> {
+        args: &DXGKARG_PRESENT,
+    ) -> Result<PatchCapacity, NTSTATUS> {
         let required = self.reference_count();
         if required == 0 {
-            return Ok(());
+            return Ok(PatchCapacity {
+                first: core::ptr::null_mut(),
+                required: 0,
+            });
         }
         if args.pPatchLocationListOut.is_null()
             || (args.PatchLocationListOutSize as usize) < required
         {
             return Err(STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER);
         }
+        Ok(PatchCapacity {
+            first: args.pPatchLocationListOut,
+            required,
+        })
+    }
 
-        let first = args.pPatchLocationListOut;
+    /// Emit exactly the allocation references represented by this value.
+    ///
+    /// Consumes the [`PatchCapacity`] token, so the "validate before any host
+    /// GPU work" ordering is discharged by the type system rather than by the
+    /// programmer remembering: `display.rs` validates at the top and submits the
+    /// BLT before writing, and moving the submission above the validation — or
+    /// adding a second one after it — no longer compiles into a path that can
+    /// duplicate GPU copies on an insufficient-buffer retry (the same defect
+    /// class as T1b's `k-paging-01`). `scheduler.rs` acquires the token
+    /// immediately before writing, which is what documents that it queues
+    /// nothing.
+    ///
+    /// # Safety
+    /// The output patch list is supplied by dxgkrnl; `capacity` records that we
+    /// checked the count dxgkrnl declared, not that the memory is mapped.
+    pub(crate) unsafe fn write_patch_references(
+        self,
+        capacity: PatchCapacity,
+        args: &mut DXGKARG_PRESENT,
+    ) -> Result<(), NTSTATUS> {
+        let PatchCapacity { first, required } = capacity;
+        if required == 0 {
+            return Ok(());
+        }
+
         let mut written = 0usize;
         for reference in [self.destination, self.source].into_iter().flatten() {
             let patch = unsafe { first.add(written) };
@@ -276,9 +384,38 @@ impl PresentAllocations {
             written += 1;
         }
 
-        // `written` and `required` are derived from the same two Options.
-        debug_assert_eq!(written, required);
+        // `written == required` by construction: both are derived from the same
+        // two Options, and `PatchCapacity` carries the count computed from them.
+        // The `debug_assert_eq!` that used to stand here was a LIVE KeBugCheck
+        // site in the shipped image — [profile.dev] does not disable
+        // debug-assertions and cargo-make ships that profile — so it traded a
+        // structurally-impossible mismatch for a real bugcheck.
         args.pPatchLocationListOut = unsafe { first.add(written) };
+        // Decrement the declared capacity with the cursor. A second call would
+        // otherwise validate against a stale count. `display.rs` records
+        // PatchLocationListOutSize into PBPatch BEFORE the write, so the
+        // breadcrumb is unaffected — keep it that way.
+        args.PatchLocationListOutSize = args
+            .PatchLocationListOutSize
+            .saturating_sub(written as u32);
         Ok(())
     }
+}
+
+/// Proof that the patch-list capacity was checked, carrying what was checked.
+///
+/// Non-`Copy` and non-`Clone` on purpose: it is consumed by
+/// [`PresentAllocations::write_patch_references`], so it cannot be reused for a
+/// second write against an advanced cursor.
+///
+/// The token must CARRY the pointer and count and the writer must stop
+/// re-deriving them — otherwise this is a relocation of the same runtime check.
+/// That is why the capacity expression now exists exactly once, in
+/// [`PresentAllocations::validate_patch_capacity`], instead of being duplicated
+/// there and in the writer where the two copies could silently diverge.
+pub(crate) struct PatchCapacity {
+    /// The checked `pPatchLocationListOut`. Null iff `required == 0`.
+    first: *mut D3DDDI_PATCHLOCATIONLIST,
+    /// How many entries were proven to fit.
+    required: usize,
 }

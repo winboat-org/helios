@@ -16,7 +16,8 @@ use helios_protocol::{
 use crate::adapter::{AdapterContext, ScanoutGuard};
 use crate::ddi::create_allocation::{present_alloc_info, PresentAllocationStorage, ScanoutTarget};
 use crate::ddi::present_packet::{
-    PresentAllocations, PresentSubmissionPrivate, STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER,
+    PatchCapacity, PresentAllocations, PresentPayload, PresentSubmissionPrivate,
+    STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER,
 };
 use crate::device::ContextHandleRef;
 use crate::dxgk::*;
@@ -207,6 +208,29 @@ unsafe fn dxgkddi_present_inner(
     let present_flags = unsafe { args.Flags.__bindgen_anon_1.Value };
     PRESENT_LAST_FLAGS.store(present_flags, Ordering::Relaxed);
 
+    // Decode the payload union arm ONCE, from the flags, before anything reads
+    // it. Both this DDI and PresentToHwQueue used to pick `pAllocationList`
+    // implicitly out of a three-arm union.
+    // SAFETY: `args` is dxgkrnl's present struct; the arm its flags name is the
+    // one it initialised.
+    let payload = unsafe { PresentPayload::decode(args) };
+    let Some(allocation_list) = payload.allocation_list() else {
+        // FlipWithMultiPlaneOverlay: unreachable, because the driver does not
+        // register the MPO3 KMD interface. Refuse rather than reinterpret an MPO
+        // struct as an allocation array.
+        crate::diag::record_named_bytes(b"PBmpo", 1);
+        PRESENT_LAST_STATUS.store(STATUS_NOT_SUPPORTED as u32, Ordering::Relaxed);
+        return STATUS_NOT_SUPPORTED;
+    };
+    let payload_has_list = allocation_list.is_present();
+    // SAFETY: `allocation_list` came from `PresentPayload::decode`, so it is the
+    // fixed present allocation array.
+    let present_allocations = unsafe { PresentAllocations::from_allocation_list(allocation_list) };
+
+    // The patch-capacity proof, acquired before any host GPU work on the BLT
+    // path and consumed by the single write below.
+    let mut patch_capacity: Option<PatchCapacity> = None;
+
     // Present-path IDENTITY trace, SAMPLED (R316). These are per-call dumps of
     // flags / counts / sizes that mattered during bring-up; at 60 Hz they were
     // ~8 synchronous kernel registry writes per frame before the surface block
@@ -221,20 +245,11 @@ unsafe fn dxgkddi_present_inner(
             b"PBcnt",
             (args.NumSrcAllocations << 16) | (args.NumDstAllocations & 0xFFFF),
         );
-        crate::diag::record_named_bytes(
-            b"PBalst",
-            if unsafe { args.__bindgen_anon_1.pAllocationList }.is_null() {
-                0
-            } else {
-                1
-            },
-        );
+        crate::diag::record_named_bytes(b"PBalst", u32::from(payload_has_list));
         crate::diag::record_named_bytes(b"PBDma", args.DmaSize);
         crate::diag::record_named_bytes(b"PBPatch", args.PatchLocationListOutSize);
     }
 
-    let allocation_list = unsafe { args.__bindgen_anon_1.pAllocationList };
-    let present_allocations = unsafe { PresentAllocations::from_allocation_list(allocation_list) };
     let present_private = unsafe { present_private_data(args) };
     if sample {
         crate::diag::record_named_bytes(b"PBpdsz", args.PrivateDriverDataSize);
@@ -252,7 +267,7 @@ unsafe fn dxgkddi_present_inner(
         .unwrap_or(core::ptr::null_mut());
     let src_info = unsafe { present_alloc_info(src_handle) };
     let dst_info = unsafe { present_alloc_info(dst_handle) };
-    if !allocation_list.is_null() {
+    if payload_has_list {
         PRESENT_LAST_SRC_OPEN_LOW.store(src_handle as usize as u32, Ordering::Relaxed);
         PRESENT_LAST_DST_OPEN_LOW.store(dst_handle as usize as u32, Ordering::Relaxed);
 
@@ -367,9 +382,16 @@ unsafe fn dxgkddi_present_inner(
                 );
                 return STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER;
             }
-            if let Err(status) = present_allocations.validate_patch_capacity(args) {
-                PRESENT_LAST_STATUS.store(status as u32, Ordering::Relaxed);
-                return status;
+            // BEFORE any host GPU work: an insufficient-buffer retry must not
+            // be able to duplicate the BLT below. The token is carried to the
+            // single write site rather than dropped, so the ordering is a
+            // type-level fact on this path and not a convention.
+            match present_allocations.validate_patch_capacity(args) {
+                Ok(capacity) => patch_capacity = Some(capacity),
+                Err(status) => {
+                    PRESENT_LAST_STATUS.store(status as u32, Ordering::Relaxed);
+                    return status;
+                }
             }
 
             let (Some(adapter), Some(source), Some(destination)) = (adapter, src_info, dst_info)
@@ -640,7 +662,19 @@ unsafe fn dxgkddi_present_inner(
         }
     }
 
-    if let Err(status) = unsafe { present_allocations.write_patch_references(args) } {
+    // The BLT path carried its token here; every other path queues nothing, so
+    // acquiring immediately before the write is correct and says so.
+    let capacity = match patch_capacity {
+        Some(capacity) => capacity,
+        None => match present_allocations.validate_patch_capacity(args) {
+            Ok(capacity) => capacity,
+            Err(status) => {
+                PRESENT_LAST_STATUS.store(status as u32, Ordering::Relaxed);
+                return status;
+            }
+        },
+    };
+    if let Err(status) = unsafe { present_allocations.write_patch_references(capacity, args) } {
         PRESENT_LAST_STATUS.store(status as u32, Ordering::Relaxed);
         return status;
     }
