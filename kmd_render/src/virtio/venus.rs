@@ -1763,66 +1763,6 @@ impl VenusClient {
         choice.index()
     }
 
-    fn create_scanout_image(
-        &mut self,
-        adapter: &AdapterContext,
-        width: u32,
-        height: u32,
-    ) -> Result<VkImageId, VirtioError> {
-        let image_id = self.new_image_id();
-        let mut w = Writer::new();
-        w.header(CMD_CREATE_IMAGE, CMD_FLAG_GENERATE_REPLY);
-        w.handle(self.device_id);
-        w.count(true);
-        w.i32(ST_IMAGE_CREATE_INFO);
-        // VkExternalMemoryImageCreateInfo -> VkImageDrmFormatModifierListCreateInfoEXT.
-        w.count(true);
-        w.i32(ST_EXTERNAL_MEMORY_IMAGE_CREATE_INFO);
-        w.count(true);
-        w.i32(ST_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO);
-        w.count(false);
-        w.u32(1);
-        w.u64(1);
-        w.u64(DRM_FORMAT_MOD_LINEAR);
-        w.u32(EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF);
-        w.u32(0); // flags
-        w.u32(IMAGE_TYPE_2D);
-        w.u32(FORMAT_B8G8R8A8_UNORM);
-        w.u32(width);
-        w.u32(height);
-        w.u32(1); // depth
-        w.u32(1); // mipLevels
-        w.u32(1); // arrayLayers
-        w.u32(SAMPLE_COUNT_1);
-        w.u32(IMAGE_TILING_DRM_FORMAT_MODIFIER);
-        w.u32(IMAGE_USAGE_TRANSFER_DST);
-        w.u32(SHARING_MODE_EXCLUSIVE);
-        w.u32(0); // queueFamilyIndexCount
-        w.count(false);
-        w.u32(IMAGE_LAYOUT_UNDEFINED);
-        w.count(false); // pAllocator
-        w.count(true);
-        w.handle(image_id);
-        self.ring_command_reply(adapter, w.as_slice()?)?;
-
-        let mut r = ReplyReader::new(self.reply_map());
-        let cmd = r.read_i32()?;
-        if cmd as u32 != CMD_CREATE_IMAGE {
-            diag(0x0101);
-            return Err(VirtioError::DeviceError);
-        }
-        let result = r.read_i32()?;
-        if result != 0 {
-            diag(0x0102);
-            return Err(VirtioError::DeviceError);
-        }
-        if r.read_u64()? == 0 || r.read_u64()? == 0 {
-            diag(0x0103);
-            return Err(VirtioError::DeviceError);
-        }
-        Ok(image_id)
-    }
-
     fn create_linear_scanout_image(
         &mut self,
         adapter: &AdapterContext,
@@ -4828,164 +4768,6 @@ impl VenusClient {
         }
     }
 
-    /// Diagnostic-only GPU fill for scanout images. The image is KMD-owned and
-    /// never enters the production present path; this proves whether QEMU's GL
-    /// console consumes pixels written by the host GPU rather than by the guest CPU.
-    pub fn gpu_clear_scanout_image(
-        &mut self,
-        adapter: &AdapterContext,
-        image_id: u64,
-    ) -> Result<(), VirtioError> {
-        let image_id = VkImageId::from_raw(image_id).ok_or(VirtioError::DeviceError)?;
-        crate::diag::record_named_bytes(b"SdgGpS", 1);
-        let pool_id = self.create_command_pool(adapter)?;
-        crate::diag::record_named_bytes(b"SdgGpP", 1);
-        let command_buffer_id = match self.allocate_command_buffer(adapter, pool_id) {
-            Ok(command_buffer_id) => {
-                crate::diag::record_named_bytes(b"SdgGpB", 1);
-                command_buffer_id
-            }
-            Err(e) => {
-                let _ = self.destroy_command_pool(adapter, pool_id);
-                return Err(e);
-            }
-        };
-        let result = (|| {
-            self.begin_command_buffer(adapter, command_buffer_id)?;
-            crate::diag::record_named_bytes(b"SdgGpBeg", 1);
-            self.cmd_image_barrier(
-                adapter,
-                command_buffer_id,
-                image_id,
-                PIPELINE_STAGE_TOP_OF_PIPE,
-                PIPELINE_STAGE_TRANSFER,
-                0,
-                ACCESS_TRANSFER_WRITE,
-                IMAGE_LAYOUT_UNDEFINED,
-                IMAGE_LAYOUT_GENERAL,
-                QUEUE_FAMILY_IGNORED,
-                QUEUE_FAMILY_IGNORED,
-            )?;
-            crate::diag::record_named_bytes(b"SdgGpBa", 1);
-            self.cmd_clear_color_image(adapter, command_buffer_id, image_id)?;
-            crate::diag::record_named_bytes(b"SdgGpClr", 1);
-            self.cmd_image_barrier(
-                adapter,
-                command_buffer_id,
-                image_id,
-                PIPELINE_STAGE_TRANSFER,
-                PIPELINE_STAGE_BOTTOM_OF_PIPE,
-                ACCESS_TRANSFER_WRITE,
-                0,
-                IMAGE_LAYOUT_GENERAL,
-                IMAGE_LAYOUT_GENERAL,
-                0,
-                QUEUE_FAMILY_FOREIGN_EXT,
-            )?;
-            crate::diag::record_named_bytes(b"SdgGpBb", 1);
-            self.end_command_buffer(adapter, command_buffer_id)?;
-            crate::diag::record_named_bytes(b"SdgGpEnd", 1);
-            let fence_id = if crate::diag::read_config_dword(crate::diag::knobs::SCANOUT_DIAG, 0) >= 6 {
-                let fence_id = self.create_fence(adapter)?;
-                crate::diag::record_named_bytes(b"SdgGpF", 1);
-                Some(fence_id)
-            } else {
-                None
-            };
-            self.queue_submit_command_buffer(adapter, command_buffer_id, fence_id)?;
-            crate::diag::record_named_bytes(b"SdgGpSub", 1);
-            if let Some(fence_id) = fence_id {
-                self.wait_for_fence(adapter, fence_id)?;
-                crate::diag::record_named_bytes(b"SdgGpW", 1);
-            }
-            Ok(())
-        })();
-        result?;
-        // Keep the command pool/buffer alive. This diagnostic submits a GPU
-        // ownership release to the host scanout path but has no nonblocking
-        // completion primitive in KMD yet; destroying immediately can race the
-        // queue work and vkQueueWaitIdle poisons the venus decoder on NVIDIA.
-        crate::diag::record_named_bytes(b"SdgGpDst", 2);
-        Ok(())
-    }
-
-    /// Diagnostic-only scanout allocation: DRM_FORMAT_MODIFIER(LINEAR) BGRA image
-    /// backed by dedicated, DMA-BUF-exportable memory, exposed as a HOST3D blob.
-    pub fn allocate_scanout_image_blob(
-        &mut self,
-        adapter: &AdapterContext,
-        width: u32,
-        height: u32,
-    ) -> Result<ScanoutImageBlob, VirtioError> {
-        let image_id = self.create_scanout_image(adapter, width, height)?;
-        let (req_size, memory_type_bits) = self.image_memory_requirements(adapter, image_id)?;
-        let diag_mode = crate::diag::read_config_dword(crate::diag::knobs::SCANOUT_DIAG, 0);
-        let cpu_filled_cross_device_blob = diag_mode == 9 || diag_mode == 11;
-        let prefer_device_local = diag_mode >= 5 && !cpu_filled_cross_device_blob;
-        let memory_type_index = Self::accept_memory_type(
-            if prefer_device_local {
-                self.choose_device_local_memory_type(memory_type_bits)
-            } else {
-                self.choose_host_visible_memory_type(memory_type_bits)
-            }
-            .ok_or(VirtioError::DeviceError)?,
-        );
-        crate::diag::record_named_bytes(b"SdgMt", memory_type_index);
-        crate::diag::record_named_bytes(
-            b"SdgMf",
-            self.memory_type_flags[memory_type_index as usize],
-        );
-        let alloc_size = round_up_page(req_size.max(4096));
-        let memory_id =
-            self.allocate_dedicated_image_memory(adapter, image_id, alloc_size, memory_type_index)?;
-        self.bind_image_memory(adapter, image_id, memory_id)?;
-        let (offset, row_pitch) =
-            self.image_subresource_layout(adapter, image_id, IMAGE_ASPECT_MEMORY_PLANE_0)?;
-        if row_pitch == 0 || row_pitch > u32::MAX as u64 || offset > u32::MAX as u64 {
-            diag(0x010C);
-            return Err(VirtioError::DeviceError);
-        }
-
-        let mut blob_flags = VIRTIO_GPU_BLOB_FLAG_USE_SHAREABLE;
-        if !prefer_device_local {
-            blob_flags |= VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE;
-        }
-        if diag_mode >= 8 {
-            blob_flags |= VIRTIO_GPU_BLOB_FLAG_USE_CROSS_DEVICE;
-        }
-        crate::diag::record_named_bytes(b"SdgBFl", blob_flags);
-        let res_id = ctrl::resource_create_blob(
-            self.passive(),
-            adapter,
-            self.ctx_id(),
-            VIRTIO_GPU_BLOB_MEM_HOST3D,
-            blob_flags,
-            memory_id.get(),
-            alloc_size,
-        )?;
-        if (blob_flags & VIRTIO_GPU_BLOB_FLAG_USE_CROSS_DEVICE) != 0 && diag_mode == 10 {
-            ctrl::resource_assign_uuid(self.passive(), adapter, res_id)?;
-            crate::diag::record_named_bytes(b"SdgUuid", 1);
-        } else if (blob_flags & VIRTIO_GPU_BLOB_FLAG_USE_CROSS_DEVICE) != 0 {
-            crate::diag::record_named_bytes(b"SdgUuid", 2);
-        } else {
-            crate::diag::record_named_bytes(b"SdgUuid", 0);
-        }
-        let _ = adapter.with_virtio(|v| v.note_blob_size(res_id, alloc_size));
-        Ok(ScanoutImageBlob {
-            blob: HostVisibleBlob {
-                blob_id: memory_id.get(),
-                res_id,
-                gpa: 0,
-                size: alloc_size,
-            },
-            image_id,
-            memory_type_index,
-            row_pitch: row_pitch as u32,
-            plane_offset: offset as u32,
-        })
-    }
-
     /// Allocate a KMD-owned GDI texture with the storage contract Windows
     /// requested for `D3DKMDT_GDISURFACE_TEXTURE`: an OPTIMAL BGRA image,
     /// device-local dedicated memory, and DMA_BUF/CROSS_DEVICE export.
@@ -5662,17 +5444,21 @@ impl VenusInstance {
         })
     }
 
-    /// The CreateDevice extension ladder: full → export-trio → none.
+    /// The CreateDevice extension ladder: export-trio → none.
     ///
     /// The proven scanout/export shape (`/tmp/vk-dmabuf-scanout.c`, the CachyOS
     /// NVIDIA egl-headless success) needs only the external-memory + DMA_BUF
-    /// trio; the DRM-modifier image path (scanout_diag modes 4-11) additionally
-    /// wants image_drm_format_modifier + image_format_list. This used to be
-    /// all-or-nothing: if the host rejected the full 5-ext set we dropped
-    /// straight to a ZERO-ext device, which then silently rejects every DMA_BUF
-    /// export op — the whole scanout path dies with no visible reason, since the
-    /// S-ring is off at DiagLevel 0. Stepping down keeps linear scanout (mode
-    /// 16) working when only the modifier exts are unavailable.
+    /// trio, which is what production asks for. The ladder exists because a
+    /// zero-ext device silently rejects every DMA_BUF export op — the whole
+    /// scanout path dies with no visible reason, since the S-ring is off at
+    /// DiagLevel 0 — so stepping down has to be visible in `SdgDevX`/`SdgDevR`
+    /// rather than inferred.
+    ///
+    /// T6/R901 removed the third tier above it (the 5-ext set adding
+    /// `VK_EXT_image_drm_format_modifier` + `VK_KHR_image_format_list`), which
+    /// only a `ScanoutDiag >= 4` registry value ever selected. Tier NUMBERING is
+    /// deliberately unchanged — 1 = export-trio, 2 = none — so `SdgDevX` means
+    /// the same thing before and after.
     ///
     /// The tier that stuck (`SdgDevX`) and every knock-down VkResult
     /// (`SdgDevR`) go to fixed registry names so a `reg query` reveals them
@@ -5683,41 +5469,36 @@ impl VenusInstance {
         &mut self,
         adapter: &AdapterContext,
     ) -> Result<VkDeviceId, VirtioError> {
-        const EXT_FULL: [&[u8]; 5] = [
-            b"VK_KHR_external_memory\0",
-            b"VK_KHR_external_memory_fd\0",
-            b"VK_KHR_image_format_list\0",
-            b"VK_EXT_external_memory_dma_buf\0",
-            b"VK_EXT_image_drm_format_modifier\0",
-        ];
         const EXT_EXPORT: [&[u8]; 3] = [
             b"VK_KHR_external_memory\0",
             b"VK_KHR_external_memory_fd\0",
             b"VK_EXT_external_memory_dma_buf\0",
         ];
-        let scanout_diag = crate::diag::read_config_dword(crate::diag::knobs::SCANOUT_DIAG, 0);
+        // ⚠ THE MODIFIER TIER IS GONE, AND THAT IS THE POINT (T6/R901).
+        // `EXT_FULL` additionally requested `VK_KHR_image_format_list` and
+        // `VK_EXT_image_drm_format_modifier` on the ONE production `VkDevice`
+        // every render / scanout / GDI path then uses -- and a leftover
+        // `ScanoutDiag >= 4` in the registry selected it. That is the
+        // 38th-session global-modifier-enable regression class: enabling those
+        // extensions inflated the memory requirements of ordinary shared
+        // OPTIMAL imports, producing valid undersized-import refusals, DWM
+        // failures, and NVIDIA Xid 31 when the undersize guard was bypassed.
+        // With the tier deleted there is NO configuration -- registry or
+        // otherwise -- in which the production device is created with them.
+        //
         // Production DisplayHalf needs only the export trio for its dedicated
-        // plain LINEAR DMA_BUF image. The modifier/image-format-list tier
-        // remains strictly diagnostic; never enable it merely because real
-        // scanout is active.
-        let want_scanout_exts =
-            self.ring.ctx_id != 0 && (adapter.display_half() || scanout_diag >= 4);
-        // Clear the knock-down VkResult so a clean full-tier success leaves it 0
-        // and a prior boot's value can't be mistaken for this boot's (names
+        // plain LINEAR DMA_BUF image.
+        let want_scanout_exts = self.ring.ctx_id != 0 && adapter.display_half();
+        // Clear the knock-down VkResult so a clean first-tier success leaves it
+        // 0 and a prior boot's value can't be mistaken for this boot's (names
         // persist across boots).
         crate::diag::record_named_bytes(b"SdgDevR", 0);
-        // Tier 0 = full, 1 = export-only, 2 = none. Production (scanout off)
-        // starts at 2, exactly the old render-only, no-ext behaviour.
-        let mut ext_tier: u32 = if scanout_diag >= 4 {
-            0
-        } else if want_scanout_exts {
-            1
-        } else {
-            2
-        };
+        // Tier 1 = export-only, 2 = none. Render-only starts at 2, exactly the
+        // old no-ext behaviour. Tier numbering is UNCHANGED so `SdgDevX` keeps
+        // its meaning across the deletion: a DisplayHalf boot still reads 1.
+        let mut ext_tier: u32 = if want_scanout_exts { 1 } else { 2 };
         loop {
             let exts: &[&[u8]] = match ext_tier {
-                0 => &EXT_FULL,
                 1 => &EXT_EXPORT,
                 _ => &[],
             };

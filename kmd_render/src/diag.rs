@@ -549,8 +549,6 @@ pub mod knobs {
     pub const BAR_SEG_FLAGS: KnobName = KnobName::new(b"BarSegFlags");
     /// BAR descriptor `BaseAddress` in MiB (default 0).
     pub const BAR_SEG_BASE_MB: KnobName = KnobName::new(b"BarSegBaseMB");
-    /// Diagnostic scan-out mode. Production must leave this absent/0.
-    pub const SCANOUT_DIAG: KnobName = KnobName::new(b"ScanoutDiag");
 }
 
 /// Read a service-key REG_DWORD knob, or `default` if absent.
