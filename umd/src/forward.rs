@@ -12,6 +12,7 @@
 mod alloc;
 mod handles;
 use alloc::{ScanoutGeometry, VenusBacking};
+use crate::bridge::{DstRes, SrcRes};
 use handles::{Boxed, Com, ComHandle, DdiHandle, Slot};
 
 use core::ffi::c_void;
@@ -9488,7 +9489,10 @@ unsafe fn vehicle_present_prepare(
         imported_raw = raw;
     }
 
-    match dev.dxvk.present_vehicle_copy(backbuffer_raw, imported_raw) {
+    match dev
+        .dxvk
+        .present_vehicle_copy(DstRes(backbuffer_raw), SrcRes(imported_raw))
+    {
         0 => {}
         1 => {
             EXT_GEOM_MISMATCH.fetch_add(1, Ordering::Relaxed);
@@ -9519,7 +9523,7 @@ unsafe fn vehicle_present_prepare(
     if present_sync_publish_enabled() {
         sync_value = dev
             .dxvk
-            .present_sync_publish(backbuffer_raw, 0, kwait_ordered);
+            .present_sync_publish(SrcRes(backbuffer_raw), DstRes(0), kwait_ordered);
         if sync_value != 0 {
             fence_id = dev.dxvk.present_sync_fence_id();
         }
@@ -10198,8 +10202,8 @@ unsafe extern "C" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT) -> i32 {
                     // advertise kwait here (a skipping consumer on an idle
                     // desktop would freeze the host display one frame back).
                     sync_value = dev.dxvk.present_sync_publish(
-                        resource_com_raw(src_h.pDrvPrivate),
-                        resource_com_raw(dst_h.pDrvPrivate),
+                        SrcRes(resource_com_raw(src_h.pDrvPrivate)),
+                        DstRes(resource_com_raw(dst_h.pDrvPrivate)),
                         false,
                     );
                 }
@@ -11218,8 +11222,8 @@ unsafe extern "C" fn dxgi_present1(arg: *mut ddi::DXGI_DDI_ARG_PRESENT1) -> i32 
     if present_sync_publish_enabled() {
         if let Some(dev) = helios_device(h) {
             sync_value = dev.dxvk.present_sync_publish(
-                resource_com_raw(src_h.pDrvPrivate),
-                resource_com_raw(dst_h.pDrvPrivate),
+                SrcRes(resource_com_raw(src_h.pDrvPrivate)),
+                DstRes(resource_com_raw(dst_h.pDrvPrivate)),
                 false,
             );
         }

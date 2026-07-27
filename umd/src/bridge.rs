@@ -435,6 +435,31 @@ pub(crate) struct ScanoutImportInfo {
 // The C++ side still returns `usize`, so the ABI is unchanged and this
 // migration cannot break the wire.
 
+
+/// A **source** resource pointer for the present path.
+///
+/// `present_sync_publish(src, dst)` and `present_vehicle_copy(dst, src)` take
+/// the same two COM pointers in OPPOSITE order, are called ~30 lines apart in
+/// the same function, and a transposition compiles cleanly on both sides of the
+/// FFI. Blast radius is asymmetric: transposing publish where dst is 0 is
+/// benign, but at the two two-non-zero-pointer sites it advertises the wrong
+/// resid to the shared present-sync table, and transposing
+/// `present_vehicle_copy` is ALWAYS harmful -- the bridge copies the vehicle
+/// backbuffer INTO the imported ICD frame, the geometry check passes because
+/// both are the same size, `EXT_GEOM_MISMATCH` never fires, and the flipped
+/// backbuffer shows whatever it held last frame. That is exactly the
+/// stale-frame symptom class this project has already spent multiple sessions
+/// chasing.
+///
+/// With `SrcRes`/`DstRes` the transposition is a type error regardless of
+/// parameter order. R816.
+#[derive(Clone, Copy)]
+pub(crate) struct SrcRes(pub(crate) usize);
+
+/// A **destination** resource pointer for the present path. See [`SrcRes`].
+#[derive(Clone, Copy)]
+pub(crate) struct DstRes(pub(crate) usize);
+
 /// The DXVK bridge device, with the raw cxx surface sealed off.
 pub struct BridgeDevice {
     inner: cxx::UniquePtr<ffi::HeliosDxvkDevice>,
@@ -606,25 +631,25 @@ impl BridgeDevice {
     /// Both pointers must be live `ID3D11Resource*` or 0.
     pub(crate) unsafe fn present_sync_publish(
         &self,
-        src_resource_ptr: usize,
-        dst_resource_ptr: usize,
+        src: SrcRes,
+        dst: DstRes,
         kwait_ordered: bool,
     ) -> u64 {
-        self.get().map_or(0, |d| unsafe {
-            d.present_sync_publish(src_resource_ptr, dst_resource_ptr, kwait_ordered)
-        })
+        // The C++ order is (src, dst) and is NOT reordered here -- R816 says to
+        // pick one change, and the types are the one that makes ordering
+        // unrepresentable rather than merely documented.
+        self.get()
+            .map_or(0, |d| unsafe { d.present_sync_publish(src.0, dst.0, kwait_ordered) })
     }
 
     /// # Safety
     /// Both pointers must be live `ID3D11Resource*`.
-    pub(crate) unsafe fn present_vehicle_copy(
-        &self,
-        dst_resource_ptr: usize,
-        src_resource_ptr: usize,
-    ) -> i32 {
-        self.get().map_or(-1, |d| unsafe {
-            d.present_vehicle_copy(dst_resource_ptr, src_resource_ptr)
-        })
+    pub(crate) unsafe fn present_vehicle_copy(&self, dst: DstRes, src: SrcRes) -> i32 {
+        // C++ order here is (dst, src) -- the opposite of publish above, which
+        // is the whole hazard. The named types mean the two orders no longer
+        // have to agree for the call to be correct.
+        self.get()
+            .map_or(-1, |d| unsafe { d.present_vehicle_copy(dst.0, src.0) })
     }
 
     /// # Safety
