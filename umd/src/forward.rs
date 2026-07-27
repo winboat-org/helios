@@ -10,7 +10,7 @@
 //! null handle.
 
 mod handles;
-use handles::{Boxed, Com, Slot};
+use handles::{Boxed, Com, ComHandle, DdiHandle, Slot};
 
 use core::ffi::c_void;
 use core::mem::ManuallyDrop;
@@ -610,8 +610,8 @@ unsafe fn d3d11_device2(h: Hdevice) -> Option<ID3D11Device2> {
 /// The null check is new: this was the one writer of the three that lacked it,
 /// so a null slot wrote through a null pointer where `store_raw_com` and
 /// `clear_handle` returned quietly. R803.
-unsafe fn store_com<T: Interface>(handle_priv: *mut c_void, obj: T) {
-    match Slot::<Com<T>>::from_priv(handle_priv) {
+unsafe fn store_com<T: Interface>(h: impl ComHandle, obj: T) {
+    match Slot::<Com<T>>::from_priv(h.drv_private()) {
         Some(slot) => slot.store(obj),
         // Dropping `obj` here releases the reference we were asked to hand to
         // the runtime. That is correct: with no slot to put it in, the
@@ -659,14 +659,18 @@ unsafe fn finish_create<T: Interface>(
     }
 }
 
-unsafe fn store_raw_com(handle_priv: *mut c_void, raw: usize) {
-    if let Some(slot) = Slot::<Com<IUnknown>>::from_priv(handle_priv) {
+unsafe fn store_raw_com(h: impl ComHandle, raw: usize) {
+    if let Some(slot) = Slot::<Com<IUnknown>>::from_priv(h.drv_private()) {
         slot.store_raw(raw);
     }
 }
 
-unsafe fn clear_handle(handle_priv: *mut c_void) {
-    if let Some(slot) = Slot::<Com<IUnknown>>::from_priv(handle_priv) {
+/// Null a handle's slot. Payload-agnostic on purpose -- this writes the word
+/// and never touches what it pointed at -- so it takes any `DdiHandle`,
+/// including the boxed-payload ones. Every `Create*`/`Open*` DDI calls it on
+/// entry so a failure leaves a null handle rather than stale garbage.
+unsafe fn clear_handle(h: impl DdiHandle) {
+    if let Some(slot) = Slot::<Com<IUnknown>>::from_priv(h.drv_private()) {
         slot.clear();
     }
 }
@@ -678,7 +682,15 @@ unsafe fn clear_handle(handle_priv: *mut c_void) {
 /// the confusion `Slot<P>` exists to remove. Retained with its old signature so
 /// this commit churns no call sites; the per-family conversions replace each
 /// use with `Slot::<Com<T>>::word()` on a typed handle.
-unsafe fn handle_com_raw(handle_priv: *mut c_void) -> usize {
+unsafe fn handle_com_raw(h: impl ComHandle) -> usize {
+    handle_com_raw_at(h.drv_private())
+}
+
+/// `handle_com_raw` for the runtime-tag dispatches, which receive a bare
+/// `pDrvPrivate` whose payload is selected by a `D3D11DDI_HANDLETYPE` value at
+/// run time and so cannot be keyed on a static handle type. Callers must be an
+/// arm of such a dispatch that has already matched a bare-COM tag.
+unsafe fn handle_com_raw_at(handle_priv: *mut c_void) -> usize {
     match Slot::<Com<IUnknown>>::from_priv(handle_priv) {
         Some(slot) => slot.word(),
         None => 0,
@@ -1408,13 +1420,26 @@ unsafe fn release_resource(h: Hdevice, handle_priv: *mut c_void) {
 }
 
 /// Borrow the COM interface stored in a DDI handle (does not take ownership).
-unsafe fn load_com<T: Interface>(handle_priv: *mut c_void) -> Option<ManuallyDrop<T>> {
+unsafe fn load_com<T: Interface>(h: impl ComHandle) -> Option<ManuallyDrop<T>> {
+    load_com_at::<T>(h.drv_private())
+}
+
+/// `load_com` for the three runtime-tag dispatches (`discard_11_1`,
+/// `clear_view_11_1`, `tiled_barrier_child`).
+///
+/// Those receive one `pDrvPrivate` plus a `D3D11DDI_HANDLETYPE` that selects
+/// the payload at run time, so the static `ComHandle` bound cannot apply. Each
+/// already matches the tag and calls the decoder its arm proved correct --
+/// `load_resource` for HT_RESOURCE, `load_rtv` for HT_RENDERTARGETVIEW, this
+/// for the bare-COM view tags. Do not call it from anywhere else: it is the
+/// unchecked form `load_com` exists to replace.
+unsafe fn load_com_at<T: Interface>(handle_priv: *mut c_void) -> Option<ManuallyDrop<T>> {
     Slot::<Com<T>>::from_priv(handle_priv)?.load()
 }
 
 /// Release the COM interface stored in a DDI handle.
-unsafe fn release_com(handle_priv: *mut c_void) {
-    if let Some(slot) = Slot::<Com<IUnknown>>::from_priv(handle_priv) {
+unsafe fn release_com(h: impl ComHandle) {
+    if let Some(slot) = Slot::<Com<IUnknown>>::from_priv(h.drv_private()) {
         slot.release();
     }
 }
@@ -2100,7 +2125,7 @@ unsafe extern "C" fn create_resource(
     h_resource: ddi::D3D10DDI_HRESOURCE,
     h_rt: ddi::D3D10DDI_HRTRESOURCE,
 ) {
-    clear_handle(h_resource.pDrvPrivate);
+    clear_handle(h_resource);
     if arg.is_null() {
         log_error!("DDI CreateResource identity: null args");
         set_runtime_error(h, E_INVALIDARG);
@@ -2681,7 +2706,7 @@ unsafe extern "C" fn open_resource(
     h_resource: ddi::D3D10DDI_HRESOURCE,
     h_rt: ddi::D3D10DDI_HRTRESOURCE,
 ) {
-    clear_handle(h_resource.pDrvPrivate);
+    clear_handle(h_resource);
 
     if arg.is_null() {
         log_error!("DDI open_resource: null args");
@@ -2987,7 +3012,7 @@ unsafe extern "C" fn create_rtv(
     h_rtv: ddi::D3D10DDI_HRENDERTARGETVIEW,
     _h_rt: ddi::D3D10DDI_HRTRENDERTARGETVIEW,
 ) {
-    clear_handle(h_rtv.pDrvPrivate);
+    clear_handle(h_rtv);
     let Some(device) = d3d11_device(h) else {
         return;
     };
@@ -3181,7 +3206,7 @@ unsafe extern "C" fn create_dsv(
     h_dsv: ddi::D3D10DDI_HDEPTHSTENCILVIEW,
     _h_rt: ddi::D3D10DDI_HRTDEPTHSTENCILVIEW,
 ) {
-    clear_handle(h_dsv.pDrvPrivate);
+    clear_handle(h_dsv);
     let Some(device) = d3d11_device(h) else {
         return;
     };
@@ -3212,7 +3237,7 @@ unsafe extern "C" fn create_dsv(
                 a.ResourceDimension, a.Format, a.Flags
             );
         }
-        store_com(h_dsv.pDrvPrivate, v);
+        store_com(h_dsv, v);
     });
 }
 
@@ -3322,7 +3347,7 @@ unsafe fn dsv_desc(
 }
 
 unsafe extern "C" fn destroy_dsv(_h: Hdevice, h_dsv: ddi::D3D10DDI_HDEPTHSTENCILVIEW) {
-    release_com(h_dsv.pDrvPrivate);
+    release_com(h_dsv);
 }
 
 unsafe extern "C" fn clear_rtv(
@@ -3373,7 +3398,7 @@ unsafe extern "C" fn clear_dsv(
     let Some(context) = d3d11_context(h) else {
         return;
     };
-    let Some(dsv) = load_com::<ID3D11DepthStencilView>(h_dsv.pDrvPrivate) else {
+    let Some(dsv) = load_com::<ID3D11DepthStencilView>(h_dsv) else {
         return;
     };
     context.ClearDepthStencilView(&*dsv, flags, depth, stencil);
@@ -3809,7 +3834,7 @@ unsafe extern "C" fn discard_11_1(
             }
         }
         ddi::D3D11DDI_HANDLETYPE_D3D10DDI_HT_SHADERRESOURCEVIEW => {
-            if let Some(view) = load_com::<ID3D11ShaderResourceView>(handle)
+            if let Some(view) = load_com_at::<ID3D11ShaderResourceView>(handle)
                 .and_then(|v| (*v).cast::<ID3D11View>().ok())
             {
                 context.DiscardView(&view);
@@ -3821,14 +3846,14 @@ unsafe extern "C" fn discard_11_1(
             }
         }
         ddi::D3D11DDI_HANDLETYPE_D3D10DDI_HT_DEPTHSTENCILVIEW => {
-            if let Some(view) = load_com::<ID3D11DepthStencilView>(handle)
+            if let Some(view) = load_com_at::<ID3D11DepthStencilView>(handle)
                 .and_then(|v| (*v).cast::<ID3D11View>().ok())
             {
                 context.DiscardView(&view);
             }
         }
         ddi::D3D11DDI_HANDLETYPE_D3D11DDI_HT_UNORDEREDACCESSVIEW => {
-            if let Some(view) = load_com::<ID3D11UnorderedAccessView>(handle)
+            if let Some(view) = load_com_at::<ID3D11UnorderedAccessView>(handle)
                 .and_then(|v| (*v).cast::<ID3D11View>().ok())
             {
                 context.DiscardView(&view);
@@ -3970,7 +3995,7 @@ unsafe extern "C" fn create_vertex_shader(
     _hrt: ddi::D3D10DDI_HRTSHADER,
     _sig: *const ddi::D3D10DDIARG_STAGE_IO_SIGNATURES,
 ) {
-    clear_handle(h_shader.pDrvPrivate);
+    clear_handle(h_shader);
     let Some(dev) = helios_device(h) else {
         return;
     };
@@ -3991,7 +4016,7 @@ unsafe extern "C" fn create_vertex_shader(
                 "DDI create_vertex_shader ok: raw=0x{raw:x} len={len}"
             );
         }
-        store_raw_com(h_shader.pDrvPrivate, raw);
+        store_raw_com(h_shader, raw);
         // Keep the bytecode so input layouts can be created lazily (the ISGN
         // supplies the semantic names CreateInputLayout requires).
         dev.ia.borrow_mut().vs_bytecode.insert(raw, bytes.to_vec());
@@ -4007,7 +4032,7 @@ unsafe extern "C" fn create_pixel_shader(
     _hrt: ddi::D3D10DDI_HRTSHADER,
     _sig: *const ddi::D3D10DDIARG_STAGE_IO_SIGNATURES,
 ) {
-    clear_handle(h_shader.pDrvPrivate);
+    clear_handle(h_shader);
     let Some(dev) = helios_device(h) else {
         return;
     };
@@ -4028,7 +4053,7 @@ unsafe extern "C" fn create_pixel_shader(
                 "DDI create_pixel_shader ok: raw=0x{raw:x} len={len}"
             );
         }
-        store_raw_com(h_shader.pDrvPrivate, raw);
+        store_raw_com(h_shader, raw);
     } else {
         log_error!("DDI create_pixel_shader failed");
     }
@@ -4240,7 +4265,7 @@ unsafe fn create_shader_11_1_common(
     sig: *const ddi::D3D11_1DDIARG_STAGE_IO_SIGNATURES,
     name: &str,
 ) {
-    clear_handle(h_shader.pDrvPrivate);
+    clear_handle(h_shader);
     let Some(dev) = helios_device(h) else {
         return;
     };
@@ -4287,7 +4312,7 @@ unsafe fn create_shader_11_1_common(
                 sig_words[0], sig_words[1]
             );
         }
-        store_raw_com(h_shader.pDrvPrivate, raw);
+        store_raw_com(h_shader, raw);
         if kind == 0 {
             // Keep the bytecode so input layouts can be created lazily, and
             // the signature words so input-class variants can be recompiled
@@ -4338,7 +4363,7 @@ unsafe extern "C" fn create_geometry_shader(
     _hrt: ddi::D3D10DDI_HRTSHADER,
     _sig: *const ddi::D3D10DDIARG_STAGE_IO_SIGNATURES,
 ) {
-    clear_handle(h_shader.pDrvPrivate);
+    clear_handle(h_shader);
     let Some(dev) = helios_device(h) else {
         return;
     };
@@ -4354,7 +4379,7 @@ unsafe extern "C" fn create_geometry_shader(
     };
     let raw = dxvk.create_geometry_shader(bytes.as_ptr(), bytes.len());
     if raw != 0 {
-        store_raw_com(h_shader.pDrvPrivate, raw);
+        store_raw_com(h_shader, raw);
     } else {
         log_error!("DDI create_geometry_shader failed");
     }
@@ -4375,7 +4400,7 @@ unsafe extern "C" fn create_geometry_shader_so(
     _hrt: ddi::D3D10DDI_HRTSHADER,
     _sig: *const ddi::D3D10DDIARG_STAGE_IO_SIGNATURES,
 ) {
-    clear_handle(h_shader.pDrvPrivate);
+    clear_handle(h_shader);
     if arg.is_null() {
         return;
     }
@@ -4398,7 +4423,7 @@ unsafe extern "C" fn create_geometry_shader_so(
     };
     let raw = dxvk.create_geometry_shader(bytes.as_ptr(), bytes.len());
     if raw != 0 {
-        store_raw_com(h_shader.pDrvPrivate, raw);
+        store_raw_com(h_shader, raw);
     } else {
         log_error!("DDI create_geometry_shader_so failed");
     }
@@ -4427,7 +4452,7 @@ unsafe extern "C" fn create_hull_shader(
     _hrt: ddi::D3D10DDI_HRTSHADER,
     sig: *const ddi::D3D11DDIARG_TESSELLATION_IO_SIGNATURES,
 ) {
-    clear_handle(h_shader.pDrvPrivate);
+    clear_handle(h_shader);
     let Some(dev) = helios_device(h) else {
         return;
     };
@@ -4455,7 +4480,7 @@ unsafe extern "C" fn create_hull_shader(
         raw = dxvk.create_hull_shader(bytes.as_ptr(), bytes.len());
     }
     if raw != 0 {
-        store_raw_com(h_shader.pDrvPrivate, raw);
+        store_raw_com(h_shader, raw);
     } else {
         log_error!("DDI create_hull_shader failed");
     }
@@ -4468,7 +4493,7 @@ unsafe extern "C" fn create_hull_shader_11_1(
     _hrt: ddi::D3D10DDI_HRTSHADER,
     sig: *const ddi::D3D11_1DDIARG_TESSELLATION_IO_SIGNATURES,
 ) {
-    clear_handle(h_shader.pDrvPrivate);
+    clear_handle(h_shader);
     let Some(dev) = helios_device(h) else {
         return;
     };
@@ -4496,7 +4521,7 @@ unsafe extern "C" fn create_hull_shader_11_1(
         raw = dxvk.create_hull_shader(bytes.as_ptr(), bytes.len());
     }
     if raw != 0 {
-        store_raw_com(h_shader.pDrvPrivate, raw);
+        store_raw_com(h_shader, raw);
     } else {
         log_error!("DDI create_hull_shader_11_1 failed");
     }
@@ -4509,7 +4534,7 @@ unsafe extern "C" fn create_domain_shader(
     _hrt: ddi::D3D10DDI_HRTSHADER,
     sig: *const ddi::D3D11DDIARG_TESSELLATION_IO_SIGNATURES,
 ) {
-    clear_handle(h_shader.pDrvPrivate);
+    clear_handle(h_shader);
     let Some(dev) = helios_device(h) else {
         return;
     };
@@ -4537,7 +4562,7 @@ unsafe extern "C" fn create_domain_shader(
         raw = dxvk.create_domain_shader(bytes.as_ptr(), bytes.len());
     }
     if raw != 0 {
-        store_raw_com(h_shader.pDrvPrivate, raw);
+        store_raw_com(h_shader, raw);
     } else {
         log_error!("DDI create_domain_shader failed");
     }
@@ -4550,7 +4575,7 @@ unsafe extern "C" fn create_domain_shader_11_1(
     _hrt: ddi::D3D10DDI_HRTSHADER,
     sig: *const ddi::D3D11_1DDIARG_TESSELLATION_IO_SIGNATURES,
 ) {
-    clear_handle(h_shader.pDrvPrivate);
+    clear_handle(h_shader);
     let Some(dev) = helios_device(h) else {
         return;
     };
@@ -4580,7 +4605,7 @@ unsafe extern "C" fn create_domain_shader_11_1(
         raw = dxvk.create_domain_shader(bytes.as_ptr(), bytes.len());
     }
     if raw != 0 {
-        store_raw_com(h_shader.pDrvPrivate, raw);
+        store_raw_com(h_shader, raw);
     } else {
         log_error!("DDI create_domain_shader_11_1 failed");
     }
@@ -4592,7 +4617,7 @@ unsafe extern "C" fn create_compute_shader(
     h_shader: ddi::D3D10DDI_HSHADER,
     _hrt: ddi::D3D10DDI_HRTSHADER,
 ) {
-    clear_handle(h_shader.pDrvPrivate);
+    clear_handle(h_shader);
     let Some(dev) = helios_device(h) else {
         return;
     };
@@ -4608,14 +4633,14 @@ unsafe extern "C" fn create_compute_shader(
     };
     let raw = dxvk.create_compute_shader(bytes.as_ptr(), bytes.len());
     if raw != 0 {
-        store_raw_com(h_shader.pDrvPrivate, raw);
+        store_raw_com(h_shader, raw);
     } else {
         log_error!("DDI create_compute_shader failed");
     }
 }
 
 unsafe extern "C" fn destroy_shader(h: Hdevice, h_shader: ddi::D3D10DDI_HSHADER) {
-    let raw = handle_com_raw(h_shader.pDrvPrivate);
+    let raw = handle_com_raw(h_shader);
     if raw != 0 {
         if let Some(dev) = helios_device(h) {
             let mut owned = std::collections::HashSet::new();
@@ -4669,11 +4694,11 @@ unsafe extern "C" fn destroy_shader(h: Hdevice, h_shader: ddi::D3D10DDI_HSHADER)
             }
         }
     }
-    release_com(h_shader.pDrvPrivate);
+    release_com(h_shader);
 }
 
 unsafe extern "C" fn vs_set_shader(h: Hdevice, h_shader: ddi::D3D10DDI_HSHADER) {
-    let com = handle_com_raw(h_shader.pDrvPrivate);
+    let com = handle_com_raw(h_shader);
     if let Some(dev) = helios_device(h) {
         let mut ia = dev.ia.borrow_mut();
         ia.current_vs = com;
@@ -4685,14 +4710,14 @@ unsafe extern "C" fn vs_set_shader(h: Hdevice, h_shader: ddi::D3D10DDI_HSHADER) 
     let Some(context) = d3d11_context(h) else {
         return;
     };
-    match load_com::<ID3D11VertexShader>(h_shader.pDrvPrivate) {
+    match load_com::<ID3D11VertexShader>(h_shader) {
         Some(s) => context.VSSetShader(&*s, None),
         None => context.VSSetShader(None, None),
     }
 }
 
 unsafe extern "C" fn ps_set_shader(h: Hdevice, h_shader: ddi::D3D10DDI_HSHADER) {
-    let com = handle_com_raw(h_shader.pDrvPrivate);
+    let com = handle_com_raw(h_shader);
     if let Some(dev) = helios_device(h) {
         dev.ia.borrow_mut().current_ps = com;
     }
@@ -4702,14 +4727,14 @@ unsafe extern "C" fn ps_set_shader(h: Hdevice, h_shader: ddi::D3D10DDI_HSHADER) 
     let Some(context) = d3d11_context(h) else {
         return;
     };
-    match load_com::<ID3D11PixelShader>(h_shader.pDrvPrivate) {
+    match load_com::<ID3D11PixelShader>(h_shader) {
         Some(s) => context.PSSetShader(&*s, None),
         None => context.PSSetShader(None, None),
     }
 }
 
 unsafe extern "C" fn gs_set_shader(h: Hdevice, h_shader: ddi::D3D10DDI_HSHADER) {
-    let com = handle_com_raw(h_shader.pDrvPrivate);
+    let com = handle_com_raw(h_shader);
     if let Some(dev) = helios_device(h) {
         dev.ia.borrow_mut().current_gs = com;
     }
@@ -4719,14 +4744,14 @@ unsafe extern "C" fn gs_set_shader(h: Hdevice, h_shader: ddi::D3D10DDI_HSHADER) 
     let Some(context) = d3d11_context(h) else {
         return;
     };
-    match load_com::<ID3D11GeometryShader>(h_shader.pDrvPrivate) {
+    match load_com::<ID3D11GeometryShader>(h_shader) {
         Some(s) => context.GSSetShader(&*s, None),
         None => context.GSSetShader(None, None),
     }
 }
 
 unsafe extern "C" fn hs_set_shader(h: Hdevice, h_shader: ddi::D3D10DDI_HSHADER) {
-    let com = handle_com_raw(h_shader.pDrvPrivate);
+    let com = handle_com_raw(h_shader);
     if let Some(dev) = helios_device(h) {
         dev.ia.borrow_mut().current_hs = com;
     }
@@ -4736,14 +4761,14 @@ unsafe extern "C" fn hs_set_shader(h: Hdevice, h_shader: ddi::D3D10DDI_HSHADER) 
     let Some(context) = d3d11_context(h) else {
         return;
     };
-    match load_com::<ID3D11HullShader>(h_shader.pDrvPrivate) {
+    match load_com::<ID3D11HullShader>(h_shader) {
         Some(s) => context.HSSetShader(&*s, None),
         None => context.HSSetShader(None, None),
     }
 }
 
 unsafe extern "C" fn ds_set_shader(h: Hdevice, h_shader: ddi::D3D10DDI_HSHADER) {
-    let com = handle_com_raw(h_shader.pDrvPrivate);
+    let com = handle_com_raw(h_shader);
     if let Some(dev) = helios_device(h) {
         dev.ia.borrow_mut().current_ds = com;
     }
@@ -4753,14 +4778,14 @@ unsafe extern "C" fn ds_set_shader(h: Hdevice, h_shader: ddi::D3D10DDI_HSHADER) 
     let Some(context) = d3d11_context(h) else {
         return;
     };
-    match load_com::<ID3D11DomainShader>(h_shader.pDrvPrivate) {
+    match load_com::<ID3D11DomainShader>(h_shader) {
         Some(s) => context.DSSetShader(&*s, None),
         None => context.DSSetShader(None, None),
     }
 }
 
 unsafe extern "C" fn cs_set_shader(h: Hdevice, h_shader: ddi::D3D10DDI_HSHADER) {
-    let com = handle_com_raw(h_shader.pDrvPrivate);
+    let com = handle_com_raw(h_shader);
     if let Some(dev) = helios_device(h) {
         dev.ia.borrow_mut().current_cs = com;
     }
@@ -4770,7 +4795,7 @@ unsafe extern "C" fn cs_set_shader(h: Hdevice, h_shader: ddi::D3D10DDI_HSHADER) 
     let Some(context) = d3d11_context(h) else {
         return;
     };
-    match load_com::<ID3D11ComputeShader>(h_shader.pDrvPrivate) {
+    match load_com::<ID3D11ComputeShader>(h_shader) {
         Some(s) => context.CSSetShader(&*s, None),
         None => context.CSSetShader(None, None),
     }
@@ -4897,14 +4922,14 @@ unsafe extern "C" fn set_render_targets(
             rt0.1,
             rt0.2,
             rt0.3,
-            handle_com_raw(dsv.pDrvPrivate),
+            handle_com_raw(dsv),
             uav_start,
             num_uavs,
             uav_range_start,
             uav_range_size
         );
     }
-    let depth = load_com::<ID3D11DepthStencilView>(dsv.pDrvPrivate).map(|m| (*m).clone());
+    let depth = load_com::<ID3D11DepthStencilView>(dsv).map(|m| (*m).clone());
     if num_uavs != 0 {
         let uav_slice = DdiSlice::new(uavs, num_uavs);
         let mut uav_views: Vec<Option<ID3D11UnorderedAccessView>> =
@@ -4915,7 +4940,7 @@ unsafe extern "C" fn set_render_targets(
             uav_views.push(match uav_slice.as_ref().and_then(|s| s.get(i)) {
                 Some(handle) => {
                     let p = handle.pDrvPrivate;
-                    let view = load_com::<ID3D11UnorderedAccessView>(p).map(|m| (*m).clone());
+                    let view = load_com::<ID3D11UnorderedAccessView>(*handle).map(|m| (*m).clone());
                     if view.is_some() {
                         uav_nonnull += 1;
                     } else if !p.is_null() {
@@ -5308,7 +5333,7 @@ unsafe extern "C" fn create_rasterizer_state(
     h_rs: ddi::D3D10DDI_HRASTERIZERSTATE,
     _hrt: ddi::D3D10DDI_HRTRASTERIZERSTATE,
 ) {
-    clear_handle(h_rs.pDrvPrivate);
+    clear_handle(h_rs);
     let Some(device) = d3d11_device(h) else {
         return;
     };
@@ -5344,7 +5369,7 @@ unsafe extern "C" fn create_rasterizer_state(
     if let Err(ref e) = created {
         log_error!("DDI CreateRasterizerState failed: {e:?}");
     }
-    finish_create(h, created, rs, |s| store_com(h_rs.pDrvPrivate, s));
+    finish_create(h, created, rs, |s| store_com(h_rs, s));
 }
 
 unsafe extern "C" fn set_rasterizer_state(h: Hdevice, h_rs: ddi::D3D10DDI_HRASTERIZERSTATE) {
@@ -5354,10 +5379,10 @@ unsafe extern "C" fn set_rasterizer_state(h: Hdevice, h_rs: ddi::D3D10DDI_HRASTE
     if RASTER_LOG_COUNT.first_n(128).is_some() {
         trace_line!(
             "DDI RSSetState raw=0x{:x}",
-            handle_com_raw(h_rs.pDrvPrivate)
+            handle_com_raw(h_rs)
         );
     }
-    match load_com::<ID3D11RasterizerState>(h_rs.pDrvPrivate) {
+    match load_com::<ID3D11RasterizerState>(h_rs) {
         Some(s) => context.RSSetState(&*s),
         None => context.RSSetState(None),
     }
@@ -5378,7 +5403,7 @@ unsafe extern "C" fn create_depth_stencil_state(
     h_ds: ddi::D3D10DDI_HDEPTHSTENCILSTATE,
     _hrt: ddi::D3D10DDI_HRTDEPTHSTENCILSTATE,
 ) {
-    clear_handle(h_ds.pDrvPrivate);
+    clear_handle(h_ds);
     let Some(device) = d3d11_device(h) else {
         return;
     };
@@ -5398,7 +5423,7 @@ unsafe extern "C" fn create_depth_stencil_state(
     if let Err(ref e) = created {
         log_error!("DDI CreateDepthStencilState failed: {e:?}");
     }
-    finish_create(h, created, ds, |s| store_com(h_ds.pDrvPrivate, s));
+    finish_create(h, created, ds, |s| store_com(h_ds, s));
 }
 
 unsafe extern "C" fn set_depth_stencil_state(
@@ -5409,14 +5434,14 @@ unsafe extern "C" fn set_depth_stencil_state(
     let Some(context) = d3d11_context(h) else {
         return;
     };
-    match load_com::<ID3D11DepthStencilState>(h_ds.pDrvPrivate) {
+    match load_com::<ID3D11DepthStencilState>(h_ds) {
         Some(s) => context.OMSetDepthStencilState(&*s, stencil_ref),
         None => context.OMSetDepthStencilState(None, stencil_ref),
     }
 }
 
 unsafe extern "C" fn destroy_raster_state(_h: Hdevice, h_state: ddi::D3D10DDI_HRASTERIZERSTATE) {
-    release_com(h_state.pDrvPrivate);
+    release_com(h_state);
 }
 
 // --- Shader resource views, samplers, constant buffers ----------------------
@@ -5434,7 +5459,7 @@ unsafe extern "C" fn create_srv(
     h_srv: ddi::D3D10DDI_HSHADERRESOURCEVIEW,
     _hrt: ddi::D3D10DDI_HRTSHADERRESOURCEVIEW,
 ) {
-    clear_handle(h_srv.pDrvPrivate);
+    clear_handle(h_srv);
     let Some(device) = d3d11_device(h) else {
         return;
     };
@@ -5471,7 +5496,7 @@ unsafe extern "C" fn create_srv(
                 h_srv.pDrvPrivate, allocation, a.ResourceDimension, a.Format, width, height
             );
         }
-        store_com(h_srv.pDrvPrivate, v);
+        store_com(h_srv, v);
     });
 }
 
@@ -5636,14 +5661,14 @@ unsafe fn srv_desc(
 }
 
 unsafe extern "C" fn destroy_srv(_h: Hdevice, h_srv: ddi::D3D10DDI_HSHADERRESOURCEVIEW) {
-    release_com(h_srv.pDrvPrivate);
+    release_com(h_srv);
 }
 
 unsafe extern "C" fn gen_mips(h: Hdevice, h_srv: ddi::D3D10DDI_HSHADERRESOURCEVIEW) {
     let Some(context) = d3d11_context(h) else {
         return;
     };
-    let Some(srv) = load_com::<ID3D11ShaderResourceView>(h_srv.pDrvPrivate) else {
+    let Some(srv) = load_com::<ID3D11ShaderResourceView>(h_srv) else {
         return;
     };
     context.GenerateMips(&*srv);
@@ -5662,7 +5687,7 @@ unsafe extern "C" fn create_uav(
     h_uav: ddi::D3D11DDI_HUNORDEREDACCESSVIEW,
     _hrt: ddi::D3D11DDI_HRTUNORDEREDACCESSVIEW,
 ) {
-    clear_handle(h_uav.pDrvPrivate);
+    clear_handle(h_uav);
     let Some(device) = d3d11_device(h) else {
         return;
     };
@@ -5728,7 +5753,7 @@ unsafe extern "C" fn create_uav(
                 resource_allocation(a.hDrvResource.pDrvPrivate)
             );
         }
-        store_com(h_uav.pDrvPrivate, v);
+        store_com(h_uav, v);
     });
 }
 
@@ -5822,7 +5847,7 @@ unsafe fn uav_desc(
 }
 
 unsafe extern "C" fn destroy_uav(_h: Hdevice, h_uav: ddi::D3D11DDI_HUNORDEREDACCESSVIEW) {
-    release_com(h_uav.pDrvPrivate);
+    release_com(h_uav);
 }
 
 unsafe extern "C" fn clear_uav_uint(
@@ -5833,7 +5858,7 @@ unsafe extern "C" fn clear_uav_uint(
     let Some(context) = d3d11_context(h) else {
         return;
     };
-    let Some(uav) = load_com::<ID3D11UnorderedAccessView>(h_uav.pDrvPrivate) else {
+    let Some(uav) = load_com::<ID3D11UnorderedAccessView>(h_uav) else {
         return;
     };
     let v = if values.is_null() {
@@ -5852,7 +5877,7 @@ unsafe extern "C" fn clear_uav_float(
     let Some(context) = d3d11_context(h) else {
         return;
     };
-    let Some(uav) = load_com::<ID3D11UnorderedAccessView>(h_uav.pDrvPrivate) else {
+    let Some(uav) = load_com::<ID3D11UnorderedAccessView>(h_uav) else {
         return;
     };
     let v = if values.is_null() {
@@ -5881,7 +5906,7 @@ unsafe extern "C" fn cs_set_uavs(
         out.push(match slice.as_ref().and_then(|s| s.get(i)) {
             Some(handle) => {
                 let p = handle.pDrvPrivate;
-                let view = load_com::<ID3D11UnorderedAccessView>(p).map(|m| (*m).clone());
+                let view = load_com::<ID3D11UnorderedAccessView>(*handle).map(|m| (*m).clone());
                 if view.is_some() {
                     nonnull += 1;
                 } else if !p.is_null() {
@@ -5925,7 +5950,7 @@ unsafe extern "C" fn copy_structure_count(
     else {
         return;
     };
-    let Some(src) = load_com::<ID3D11UnorderedAccessView>(h_src.pDrvPrivate) else {
+    let Some(src) = load_com::<ID3D11UnorderedAccessView>(h_src) else {
         return;
     };
     context.CopyStructureCount(&dst, dst_offset, &*src);
@@ -5941,7 +5966,7 @@ unsafe extern "C" fn create_sampler(
     h_sampler: ddi::D3D10DDI_HSAMPLER,
     _hrt: ddi::D3D10DDI_HRTSAMPLER,
 ) {
-    clear_handle(h_sampler.pDrvPrivate);
+    clear_handle(h_sampler);
     let Some(device) = d3d11_device(h) else {
         return;
     };
@@ -5963,11 +5988,11 @@ unsafe extern "C" fn create_sampler(
     if let Err(ref e) = created {
         log_error!("DDI CreateSamplerState failed: {e:?}");
     }
-    finish_create(h, created, s, |o| store_com(h_sampler.pDrvPrivate, o));
+    finish_create(h, created, s, |o| store_com(h_sampler, o));
 }
 
 unsafe extern "C" fn destroy_sampler(_h: Hdevice, h_sampler: ddi::D3D10DDI_HSAMPLER) {
-    release_com(h_sampler.pDrvPrivate);
+    release_com(h_sampler);
 }
 
 /// A runtime-supplied DDI handle array, with the null check moved into the type.
@@ -6046,7 +6071,7 @@ unsafe fn collect_srvs(
     h: *const ddi::D3D10DDI_HSHADERRESOURCEVIEW,
 ) -> Vec<Option<ID3D11ShaderResourceView>> {
     collect_slots(DdiSlice::new(h, num), num, |handle| {
-        load_com::<ID3D11ShaderResourceView>(handle.pDrvPrivate).map(|m| (*m).clone())
+        load_com::<ID3D11ShaderResourceView>(*handle).map(|m| (*m).clone())
     })
 }
 
@@ -6066,7 +6091,7 @@ unsafe fn srv_bind_summary(
         if p.is_null() {
             continue;
         }
-        let raw = handle_com_raw(p);
+        let raw = handle_com_raw_at(p);
         if raw == 0 {
             missing += 1;
             continue;
@@ -6084,7 +6109,7 @@ unsafe fn collect_samplers(
     h: *const ddi::D3D10DDI_HSAMPLER,
 ) -> Vec<Option<ID3D11SamplerState>> {
     collect_slots(DdiSlice::new(h, num), num, |handle| {
-        load_com::<ID3D11SamplerState>(handle.pDrvPrivate).map(|m| (*m).clone())
+        load_com::<ID3D11SamplerState>(*handle).map(|m| (*m).clone())
     })
 }
 
@@ -6737,7 +6762,7 @@ unsafe fn tiled_barrier_child(
             (*res).cast::<ID3D11DeviceChild>().ok()
         }
         ddi::D3D11DDI_HANDLETYPE_D3D10DDI_HT_SHADERRESOURCEVIEW => {
-            let view = load_com::<ID3D11ShaderResourceView>(handle)?;
+            let view = load_com_at::<ID3D11ShaderResourceView>(handle)?;
             (*view).cast::<ID3D11DeviceChild>().ok()
         }
         ddi::D3D11DDI_HANDLETYPE_D3D10DDI_HT_RENDERTARGETVIEW => {
@@ -6745,11 +6770,11 @@ unsafe fn tiled_barrier_child(
             (*view).cast::<ID3D11DeviceChild>().ok()
         }
         ddi::D3D11DDI_HANDLETYPE_D3D10DDI_HT_DEPTHSTENCILVIEW => {
-            let view = load_com::<ID3D11DepthStencilView>(handle)?;
+            let view = load_com_at::<ID3D11DepthStencilView>(handle)?;
             (*view).cast::<ID3D11DeviceChild>().ok()
         }
         ddi::D3D11DDI_HANDLETYPE_D3D11DDI_HT_UNORDEREDACCESSVIEW => {
-            let view = load_com::<ID3D11UnorderedAccessView>(handle)?;
+            let view = load_com_at::<ID3D11UnorderedAccessView>(handle)?;
             (*view).cast::<ID3D11DeviceChild>().ok()
         }
         _ => None,
@@ -6864,7 +6889,7 @@ unsafe extern "C" fn create_query(
     h_query: ddi::D3D10DDI_HQUERY,
     _hrt: ddi::D3D10DDI_HRTQUERY,
 ) {
-    clear_handle(h_query.pDrvPrivate);
+    clear_handle(h_query);
     let Some(device) = d3d11_device(h) else {
         return;
     };
@@ -6877,7 +6902,7 @@ unsafe extern "C" fn create_query(
     match device.CreateQuery(&desc, Some(&mut q)) {
         Ok(()) => {
             if let Some(query) = q {
-                store_com(h_query.pDrvPrivate, query);
+                store_com(h_query, query);
             }
         }
         Err(e) => log_error!("DDI create_query failed: {e:?}"),
@@ -6885,14 +6910,14 @@ unsafe extern "C" fn create_query(
 }
 
 unsafe extern "C" fn destroy_query(_h: Hdevice, h_query: ddi::D3D10DDI_HQUERY) {
-    release_com(h_query.pDrvPrivate);
+    release_com(h_query);
 }
 
 unsafe extern "C" fn query_begin(h: Hdevice, h_query: ddi::D3D10DDI_HQUERY) {
     let Some(context) = d3d11_context(h) else {
         return;
     };
-    let Some(q) = load_com::<ID3D11Query>(h_query.pDrvPrivate) else {
+    let Some(q) = load_com::<ID3D11Query>(h_query) else {
         return;
     };
     if let Ok(async_) = (*q).cast::<ID3D11Asynchronous>() {
@@ -6904,7 +6929,7 @@ unsafe extern "C" fn query_end(h: Hdevice, h_query: ddi::D3D10DDI_HQUERY) {
     let Some(context) = d3d11_context(h) else {
         return;
     };
-    let Some(q) = load_com::<ID3D11Query>(h_query.pDrvPrivate) else {
+    let Some(q) = load_com::<ID3D11Query>(h_query) else {
         return;
     };
     if let Ok(async_) = (*q).cast::<ID3D11Asynchronous>() {
@@ -6922,7 +6947,7 @@ unsafe extern "C" fn query_get_data(
     let Some(context) = d3d11_context(h) else {
         return;
     };
-    let Some(q) = load_com::<ID3D11Query>(h_query.pDrvPrivate) else {
+    let Some(q) = load_com::<ID3D11Query>(h_query) else {
         return;
     };
     if let Ok(async_) = (*q).cast::<ID3D11Asynchronous>() {
@@ -6938,7 +6963,7 @@ unsafe extern "C" fn set_predication(
     let Some(context) = d3d11_context(h) else {
         return;
     };
-    let predicate = load_com::<ID3D11Query>(h_query.pDrvPrivate)
+    let predicate = load_com::<ID3D11Query>(h_query)
         .and_then(|q| (*q).cast::<ID3D11Predicate>().ok());
     context.SetPredication(predicate.as_ref(), predicate_value != 0);
 }
@@ -7300,7 +7325,7 @@ unsafe extern "C" fn check_format_support(h: Hdevice, fmt: ddi::DXGI_FORMAT, out
     }
 }
 unsafe extern "C" fn destroy_depth_state(_h: Hdevice, h_state: ddi::D3D10DDI_HDEPTHSTENCILSTATE) {
-    release_com(h_state.pDrvPrivate);
+    release_com(h_state);
 }
 
 /// In-process offscreen clear+readback through the real forwarders (no install,
@@ -8057,7 +8082,7 @@ unsafe extern "C" fn create_element_layout(
     h_el: ddi::D3D10DDI_HELEMENTLAYOUT,
     _hrt: ddi::D3D10DDI_HRTELEMENTLAYOUT,
 ) {
-    clear_handle(h_el.pDrvPrivate);
+    clear_handle(h_el);
     let a = &*arg;
     let mut elems = Vec::with_capacity(a.NumElements as usize);
     for i in 0..a.NumElements as usize {
@@ -8521,7 +8546,7 @@ unsafe extern "C" fn create_blend_state(
     h_bs: ddi::D3D10DDI_HBLENDSTATE,
     _hrt: ddi::D3D10DDI_HRTBLENDSTATE,
 ) {
-    clear_handle(h_bs.pDrvPrivate);
+    clear_handle(h_bs);
     let Some(device) = d3d11_device(h) else {
         return;
     };
@@ -8550,7 +8575,7 @@ unsafe extern "C" fn create_blend_state(
     if let Err(ref e) = created {
         log_error!("DDI CreateBlendState failed: {e:?}");
     }
-    finish_create(h, created, bs, |s| store_com(h_bs.pDrvPrivate, s));
+    finish_create(h, created, bs, |s| store_com(h_bs, s));
 }
 
 /// D3D11.1-interface `pfnCalcPrivateBlendStateSize` (same 8-byte COM-pointer
@@ -8578,7 +8603,7 @@ unsafe extern "C" fn create_blend_state_11_1(
     h_bs: ddi::D3D10DDI_HBLENDSTATE,
     _hrt: ddi::D3D10DDI_HRTBLENDSTATE,
 ) {
-    clear_handle(h_bs.pDrvPrivate);
+    clear_handle(h_bs);
     let Some(device) = d3d11_device(h) else {
         return;
     };
@@ -8629,7 +8654,7 @@ unsafe extern "C" fn create_blend_state_11_1(
         },
         None => None,
     };
-    finish_create(h, created, base, |b| store_com(h_bs.pDrvPrivate, b));
+    finish_create(h, created, base, |b| store_com(h_bs, b));
 }
 
 unsafe extern "C" fn set_blend_state(
@@ -8646,14 +8671,14 @@ unsafe extern "C" fn set_blend_state(
     } else {
         [*factor, *factor.add(1), *factor.add(2), *factor.add(3)]
     };
-    match load_com::<ID3D11BlendState>(h_bs.pDrvPrivate) {
+    match load_com::<ID3D11BlendState>(h_bs) {
         Some(s) => context.OMSetBlendState(&*s, Some(&f), sample_mask),
         None => context.OMSetBlendState(None, Some(&f), sample_mask),
     }
 }
 
 unsafe extern "C" fn destroy_blend_state(_h: Hdevice, h_bs: ddi::D3D10DDI_HBLENDSTATE) {
-    release_com(h_bs.pDrvPrivate);
+    release_com(h_bs);
 }
 
 // --- Dcomp present vehicle (road 4 unit 2) ----------------------------------

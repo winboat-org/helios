@@ -54,6 +54,69 @@ use core::ptr::NonNull;
 
 use windows::core::{IUnknown, Interface};
 
+/// Any DDI handle struct: a wrapper around one `pDrvPrivate` slot pointer.
+///
+/// Implemented for every handle type this driver stores into, regardless of
+/// payload, because *clearing* a slot is payload-agnostic — it nulls the word
+/// and touches nothing it pointed at. Every `Create*`/`Open*` DDI does exactly
+/// that on entry so a failed create leaves a null handle rather than stale
+/// garbage.
+pub(crate) trait DdiHandle: Copy {
+    fn drv_private(self) -> *mut c_void;
+}
+
+/// A DDI handle whose slot holds a **bare owning COM pointer**, not a `Box`.
+///
+/// This is the marker that makes R803's named invalid sequence a compile
+/// error. `D3D10DDI_HRESOURCE`, `D3D10DDI_HRENDERTARGETVIEW` and
+/// `D3D10DDI_HELEMENTLAYOUT` deliberately do NOT implement it, so
+/// `load_com::<ID3D11RenderTargetView>(h_rtv)` — which used to compile and
+/// yield a `ManuallyDrop` whose vtable pointer was `RtvState::com_raw` — no
+/// longer names a callable function.
+pub(crate) trait ComHandle: DdiHandle {}
+
+/// Implement both traits for handle types whose slot holds a bare COM pointer.
+macro_rules! com_handles {
+    ($($ty:ident),* $(,)?) => {$(
+        impl DdiHandle for crate::ddi::$ty {
+            fn drv_private(self) -> *mut c_void {
+                self.pDrvPrivate
+            }
+        }
+        impl ComHandle for crate::ddi::$ty {}
+    )*};
+}
+
+/// Implement only `DdiHandle` for handle types whose slot holds a `Box`.
+/// Clearing is still legal; decoding as COM is not.
+macro_rules! boxed_handles {
+    ($($ty:ident),* $(,)?) => {$(
+        impl DdiHandle for crate::ddi::$ty {
+            fn drv_private(self) -> *mut c_void {
+                self.pDrvPrivate
+            }
+        }
+    )*};
+}
+
+com_handles!(
+    D3D10DDI_HSHADER,
+    D3D10DDI_HBLENDSTATE,
+    D3D10DDI_HDEPTHSTENCILSTATE,
+    D3D10DDI_HRASTERIZERSTATE,
+    D3D10DDI_HSAMPLER,
+    D3D10DDI_HQUERY,
+    D3D10DDI_HSHADERRESOURCEVIEW,
+    D3D10DDI_HDEPTHSTENCILVIEW,
+    D3D11DDI_HUNORDEREDACCESSVIEW,
+);
+
+boxed_handles!(
+    D3D10DDI_HRESOURCE,
+    D3D10DDI_HRENDERTARGETVIEW,
+    D3D10DDI_HELEMENTLAYOUT,
+);
+
 /// Payload marker: the slot word is an owning COM pointer to `T`.
 pub(crate) struct Com<T: Interface>(PhantomData<fn() -> T>);
 
