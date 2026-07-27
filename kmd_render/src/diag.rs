@@ -20,6 +20,16 @@
 //!   0x05_00_0000            GetRootPageTableSize entry
 //!   0x06_00_0000            CreateProcess entry
 //!   raw value               an interface GUID Data1 logged after a 0x04 marker
+//!
+//! COLLISIONS FIXED 2026-07-27 (T4b/R722) — these are owner debugging ABI, so
+//! the old values are recorded here rather than only in git:
+//!   0x0B00_00E7  was BOTH venus-bring-up-failed (start_device.rs) and
+//!                HPD-worker-create-failed (adapter.rs), both inside the
+//!                StartDevice window. HPD moved to 0x0B00_00EA.
+//!   0x0E00_0001  was BOTH DestroyDevice entry (device.rs) and
+//!                ExchangePreStartInfo entry (display.rs). The 0x0E00_* block is
+//!                the device-teardown family, so ExchangePreStartInfo moved to
+//!                0x0E10_0001 (and its success marker 0x0E00_0002 -> 0x0E10_0002).
 
 use core::sync::atomic::{AtomicU32, Ordering};
 

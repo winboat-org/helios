@@ -1679,10 +1679,15 @@ pub unsafe extern "C" fn dxgkddi_exchange_pre_start_info(
     _adapter: IN_CONST_HANDLE,
     pre_start_info: IN_OUT_PDXGK_PRE_START_INFO,
 ) -> NTSTATUS {
-    crate::diag::record(0x0E00_0001);
+    // 0x0E10_* = ExchangePreStartInfo. Entry was 0x0E00_0001, which device.rs
+    // also records for DestroyDevice entry; the 0x0E00_* block is the
+    // device-teardown family (0x0E01 owning handle, 0x0E02 blob-table size,
+    // 0x0E03 reclaim counts, 0x0E04 ALLOC_BLOB owner), so this one moves out of
+    // it rather than the other way round.
+    crate::diag::record(0x0E10_0001);
     if pre_start_info.is_null() {
         return STATUS_INVALID_PARAMETER;
     }
-    crate::diag::record(0x0E00_0002);
+    crate::diag::record(0x0E10_0002);
     STATUS_SUCCESS
 }

@@ -1344,7 +1344,12 @@ impl AdapterContext {
         if st == STATUS_SUCCESS && !handle.is_null() {
             self.hpd_thread.store(handle as usize, Ordering::Release);
         } else {
-            crate::diag::record(0x0B00_00E7);
+            // 0x0B00_00EA = HPD-worker-create-failed. It was 0x0B00_00E7, which
+            // start_device.rs also records for venus-bring-up-failed — and BOTH
+            // happen inside the StartDevice window, so the ring could not
+            // disambiguate them. `StHpd` vs `StVnu` already distinguish the two
+            // as named counters; this makes the ring agree.
+            crate::diag::record(0x0B00_00EA);
             crate::diag::fault(crate::diag::FaultCounter::StHpd, st as u32);
         }
     }
