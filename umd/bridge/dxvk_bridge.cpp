@@ -1180,6 +1180,32 @@ namespace {
 
 }
 
+// Scan-out row-pitch alignment. The host reconstructs the DWM primary from a
+// linear stride, and 256 is the cross-adapter alignment the QEMU fork's
+// reconstruction and the KMD's SET_SCANOUT_BLOB both assume. It is NOT a
+// hardware requirement of this device and must not be "optimised" to the
+// natural row length. R822.
+static constexpr std::uint32_t kScanoutPitchAlign = 256u;
+
+// The 32bpp scan-out formats, and the bytes-per-pixel the pitch arithmetic
+// needs. Mirrors forward.rs's `matches!(a.Format as u32, 28 | 87 | 88)`:
+// R8G8B8A8_UNORM (28), B8G8R8A8_UNORM (87), B8G8R8X8_UNORM (88).
+struct ScanoutFormat {
+  std::uint32_t dxgiValue;
+  std::uint32_t bytesPerPixel;
+
+  static std::optional<ScanoutFormat> from_dxgi(std::uint32_t format) {
+    switch (format) {
+      case 28u:
+      case 87u:
+      case 88u:
+        return ScanoutFormat{ format, 4u };
+      default:
+        return std::nullopt;
+    }
+  }
+};
+
 // ── Kernel flip-wait (25th session) ─────────────────────────────────────────
 // Hand-declared WDDM runtime-callback ABI: this TU compiles without the WDK's
 // d3dumddi.h, and the shape below is the stable WDDM2
@@ -1629,7 +1655,11 @@ std::size_t HeliosDxvkDevice::open_ddi_texture2d(
     importInfo.LinearScanoutTarget = linear_scanout_target;
     importInfo.CrossContextOptimal = cross_context_optimal;
 
-    auto* device = reinterpret_cast<dxvk::D3D11Device*>(impl->d3d11);
+    // static_cast, matching the sibling context downcast in this file. Zero
+    // runtime change today (the base sits at offset 0), but if an upstream DXVK
+    // rebase inserts a base class into D3D11Device this becomes a compile error
+    // instead of a silently mis-offset `this`. R823.
+    auto* device = static_cast<dxvk::D3D11Device*>(impl->d3d11);
     auto* texture = new dxvk::D3D11Texture2D(
         device, &desc, nullptr,
         reinterpret_cast<HANDLE>(static_cast<std::uintptr_t>(renderer_resource_id)),
@@ -1768,6 +1798,26 @@ std::size_t HeliosDxvkDevice::create_ddi_scanout_texture2d(
   if (!impl || !impl->d3d11 || !width || !height)
     return 0;
 
+  // R822: the pitch below assumes 4 bytes per pixel, and that was true only
+  // because of a check in ANOTHER LANGUAGE -- forward.rs gates the caller on
+  // `matches!(a.Format as u32, 28 | 87 | 88)`, while this function accepted any
+  // DXGI_FORMAT and static_cast it straight into the texture desc. Validated
+  // here as well, so the arithmetic and its precondition live together. The
+  // Rust-side check stays as defence in depth.
+  const auto scanoutFormat = ScanoutFormat::from_dxgi(format);
+  if (!scanoutFormat) {
+    static std::atomic<std::uint32_t> s_badFormat{0};
+    const std::uint32_t n = s_badFormat.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n <= 8 || (n % 512) == 0) {
+      char msg[160];
+      std::snprintf(msg, sizeof(msg),
+        "CreateDdiScanoutTexture2D REFUSED: fmt=%u is not a 32bpp scan-out "
+        "format (x%u)", format, n);
+      umd_log(msg);
+    }
+    return 0;
+  }
+
   try {
     {
       static std::atomic<std::uint32_t> s_scanBeginLogs{0};
@@ -1802,7 +1852,11 @@ std::size_t HeliosDxvkDevice::create_ddi_scanout_texture2d(
     dxvk::D3D11_HELIOS_CREATE_INFO createInfo = { };
     createInfo.DirectOptimalScanout = true;
 
-    auto* device = reinterpret_cast<dxvk::D3D11Device*>(impl->d3d11);
+    // static_cast, matching the sibling context downcast in this file. Zero
+    // runtime change today (the base sits at offset 0), but if an upstream DXVK
+    // rebase inserts a base class into D3D11Device this becomes a compile error
+    // instead of a silently mis-offset `this`. R823.
+    auto* device = static_cast<dxvk::D3D11Device*>(impl->d3d11);
     // Fresh Export create: no imported vkImage, no shared handle, no import
     // identity. The last argument marks it as the DWM scan-out primary.
     auto* texture = new dxvk::D3D11Texture2D(
@@ -1828,7 +1882,13 @@ std::size_t HeliosDxvkDevice::create_ddi_scanout_texture2d(
       return 0;
     }
 
-    const std::uint64_t pitch = (std::uint64_t(width) * 4u + 255u) & ~255ull;
+    // Arithmetic DELIBERATELY unchanged: (width * bpp + 255) & ~255 gives 7680
+    // for a 1896-wide primary, which is what the frozen host reconstruction
+    // expects. What changes is that `bpp` now comes from the validated
+    // descriptor instead of a bare 4, and the 256 has a name and a reason.
+    const std::uint64_t pitch =
+        (std::uint64_t(width) * scanoutFormat->bytesPerPixel + (kScanoutPitchAlign - 1))
+        & ~(std::uint64_t(kScanoutPitchAlign) - 1);
     if (out_row_pitch) *out_row_pitch = pitch;
     if (out_offset)    *out_offset = 0;
     static std::atomic<std::uint32_t> s_scanDoneLogs{0};
@@ -2257,9 +2317,22 @@ bool HeliosDxvkDevice::rotate_resource_backings(
   return false;
 }
 
+// R826 counters. The gate is the stage's own measurement instrument and it
+// could not see one of its own failure modes: the three catch arms below
+// returned false without touching s_gateTimeouts, so a thrown exception was
+// indistinguishable from a timeout to every consumer -- forward.rs maps false
+// to return code 1 = timeout and increments EXT_FLIP_GATE_TIMEOUTS.
+static std::atomic<std::uint32_t> s_gateExceptions{0};
+// The no-context arm. Counted at zero cost, but NOT a live failure mode:
+// GetImmediateContext runs before the device is handed to Rust, so this is
+// unreachable rather than rare. Recorded so the distinction is in the code.
+static std::atomic<std::uint32_t> s_gateNoContext{0};
+
 bool HeliosDxvkDevice::present_frame_gate(std::uint32_t timeout_us) const {
-  if (!impl || !impl->context)
+  if (!impl || !impl->context) {
+    s_gateNoContext.fetch_add(1, std::memory_order_relaxed);
     return false;
+  }
   try {
     LARGE_INTEGER qpcFreq, qpcT0, qpcT1;
     QueryPerformanceFrequency(&qpcFreq);
@@ -2284,15 +2357,20 @@ bool HeliosDxvkDevice::present_frame_gate(std::uint32_t timeout_us) const {
            !s_gateMaxUs.compare_exchange_weak(prevMax, us, std::memory_order_relaxed)) {}
     const std::uint32_t n = s_gateCount.fetch_add(1, std::memory_order_relaxed) + 1;
     if ((n & 127u) == 0) {
-      char msg[160];
+      // The existing keys keep their names, order and format so before/after
+      // runs compare directly; `failed` and `noctx` are APPENDED. R826.
+      char msg[200];
       std::snprintf(msg, sizeof(msg),
-                    "present-gate: n=%u avg_us=%llu max_us=%llu timeouts=%u",
+                    "present-gate: n=%u avg_us=%llu max_us=%llu timeouts=%u "
+                    "failed=%u noctx=%u",
                     n,
                     static_cast<unsigned long long>(
                         s_gateTotalUs.load(std::memory_order_relaxed) / n),
                     static_cast<unsigned long long>(
                         s_gateMaxUs.load(std::memory_order_relaxed)),
-                    s_gateTimeouts.load(std::memory_order_relaxed));
+                    s_gateTimeouts.load(std::memory_order_relaxed),
+                    s_gateExceptions.load(std::memory_order_relaxed),
+                    s_gateNoContext.load(std::memory_order_relaxed));
       umd_log(msg);
       s_gateMaxUs.store(0, std::memory_order_relaxed);
     }
@@ -2304,6 +2382,13 @@ bool HeliosDxvkDevice::present_frame_gate(std::uint32_t timeout_us) const {
   } catch (...) {
     umd_log("unknown exception in present_frame_gate");
   }
+  // R826: the exception arms are a DIFFERENT outcome from a timeout and are now
+  // counted as one. The `bool` return and the bounded timeout are KEPT -- this
+  // is a real event wait with a safety bound, which the frozen baseline keeps.
+  // A later, separate commit may return an
+  // `enum class GateOutcome { Completed, TimedOut, Failed }` so the Rust caller
+  // must handle Failed explicitly instead of reporting it as a timeout.
+  s_gateExceptions.fetch_add(1, std::memory_order_relaxed);
   return false;
 }
 
@@ -2530,6 +2615,27 @@ std::uint64_t HeliosDxvkDevice::present_sync_publish(
       published |= dxvk::HeliosPresentSync::publish(residDst, pid, fenceId, value,
         kwait_ordered);
 
+    if (!published) {
+      // R825: four distinguishable states returned 0 and this -- the
+      // worst-behaved -- had no bridge-side counter and no log. DXVK warns
+      // "table full" into a DIFFERENT log, so a degradation from
+      // kernel-ordered flips to gate-timeout frames required correlating three
+      // files. Note the value and the latency slot are already spent by the
+      // time we get here; that is deliberate and not unwound -- the fence
+      // value is monotonic and the slot is overwritten 64 values later.
+      static std::atomic<std::uint32_t> s_publishTableFull{0};
+      const std::uint32_t n =
+        s_publishTableFull.fetch_add(1, std::memory_order_relaxed) + 1;
+      if (n <= 8 || (n % 512) == 0) {
+        char msg[160];
+        std::snprintf(msg, sizeof(msg),
+          "present_sync_publish: NO SLOT published (table full?) "
+          "residSrc=%u residDst=%u value=%llu (x%u)",
+          residSrc, residDst,
+          static_cast<unsigned long long>(value), n);
+        umd_log(msg);
+      }
+    }
     return published ? value : 0;
   } catch (const dxvk::DxvkError& e) {
     umd_log(("present_sync_publish DxvkError: " + e.message()).c_str());
@@ -2805,22 +2911,43 @@ std::size_t HeliosDxvkDevice::create_compute_shader(const std::uint8_t* code, st
 std::unique_ptr<HeliosDxvkDevice> helios_dxvk_create_device(
     std::uint32_t luid_low,
     std::int32_t  luid_high) {
-  // Force selection of the Helios venus device if other ICDs are present.
-  _putenv_s("DXVK_FILTER_DEVICE_NAME", "Virtio-GPU Venus");
-  _putenv_s("HELIOS_DXVK_KMT_SHARED", "1");
+  // R824: configuration delivered as a process-global side effect, whose
+  // correctness used to be statement position -- these writes happened on EVERY
+  // CreateDevice DDI, and one process (dwm) creates several D3D11 devices, so
+  // the block was rewritten while earlier DxvkInstances were live and
+  // _putenv_s is not safe against a concurrent getenv. The values are identical
+  // on every call, so doing it once is behaviour-preserving; what goes away is
+  // the repeat writes and the concurrent-write window.
+  //
+  // Static guarantee: none. std::call_once is a runtime construct and an
+  // `EnvConfigured` token would be ceremony around one call site. _putenv_s
+  // stays the mechanism because DXVK reads env; changing that is out of scope.
+  static std::once_flag s_envOnce;
+  std::call_once(s_envOnce, [] {
+    // Force selection of the Helios venus device if other ICDs are present.
+    _putenv_s("DXVK_FILTER_DEVICE_NAME", "Virtio-GPU Venus");
+    _putenv_s("HELIOS_DXVK_KMT_SHARED", "1");
 
-  // Debug instrument (registry-gated, off by default): route DXVK's shader
-  // dumping into every UMD-hosting process — session-0 services (dwm) cannot
-  // be given process env vars any other way. HKLM\SOFTWARE\Helios!
-  // ShaderDumpPath (REG_SZ) = target directory.
-  {
+    // Debug instrument (registry-gated, off by default): route DXVK's shader
+    // dumping into every UMD-hosting process — session-0 services (dwm) cannot
+    // be given process env vars any other way. HKLM\SOFTWARE\Helios!
+    // ShaderDumpPath (REG_SZ) = target directory.
     char dumpPath[MAX_PATH] = {};
     DWORD size = sizeof(dumpPath);
-    if (RegGetValueA(HKEY_LOCAL_MACHINE, "SOFTWARE\\Helios", "ShaderDumpPath",
+    const bool haveDump =
+        RegGetValueA(HKEY_LOCAL_MACHINE, "SOFTWARE\\Helios", "ShaderDumpPath",
                      RRF_RT_REG_SZ, nullptr, dumpPath, &size) == ERROR_SUCCESS &&
-        dumpPath[0])
+        dumpPath[0];
+    if (haveDump)
       _putenv_s("DXVK_SHADER_DUMP_PATH", dumpPath);
-  }
+
+    char msg[MAX_PATH + 128];
+    std::snprintf(msg, sizeof(msg),
+      "dxvk env configured once: DXVK_FILTER_DEVICE_NAME=Virtio-GPU Venus "
+      "HELIOS_DXVK_KMT_SHARED=1 DXVK_SHADER_DUMP_PATH=%s",
+      haveDump ? dumpPath : "(unset)");
+    umd_log(msg);
+  });
 
   try {
     auto out = std::make_unique<HeliosDxvkDevice>();
