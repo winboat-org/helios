@@ -111,6 +111,14 @@ const _: () = assert!(PAGE_TABLE_LEVEL_COUNT == 4);
 const _: () = assert!(LEAF_PAGE_TABLE_SIZE_BYTES == 4096);
 const _: () = assert!(ROOT_PAGE_TABLE_INDEX_BIT_COUNT <= 9);
 const _: () = assert!(PAGE_TABLE_SIZE_BYTES == 4096);
+/// The coupling `root_page_table_size_bytes` relies on: a root table addressing
+/// every index the declared bit count allows must fit in ONE page. This is the
+/// invariant that used to be implied by the `<= 9` assert above and by nothing
+/// else; stating it directly means a future bit-count change fails the build
+/// here rather than silently making the returned size wrong.
+const _: () = assert!(
+    (1u32 << ROOT_PAGE_TABLE_INDEX_BIT_COUNT) * PTE_SIZE_BYTES <= PAGE_TABLE_SIZE_BYTES
+);
 
 /// Fill a `DXGK_GPUMMUCAPS` (`DXGKQAITYPE_GPUMMUCAPS = 13`) with the decorative
 /// geometry above. All optional behaviour bits stay off (we back none of them):
@@ -143,10 +151,14 @@ pub unsafe fn fill_gpummu_caps(args: &DXGKARG_QUERYADAPTERINFO) -> NTSTATUS {
 /// Fill one `DXGK_PAGE_TABLE_LEVEL_DESC` (`DXGKQAITYPE_PAGETABLELEVELDESC = 14`).
 /// VidMm queries this once per level (`DXGK_QUERYPAGETABLELEVELDESCIN::LevelIndex`,
 /// 0 = leaf, 1 = root for the two-level scheme.
-pub unsafe fn fill_page_table_level_desc(
-    args: &DXGKARG_QUERYADAPTERINFO,
-    page_table_segment_id: u32,
-) -> NTSTATUS {
+///
+/// The `page_table_segment_id` parameter is gone: it had exactly ONE possible
+/// value at its single call site, and taking it as an argument hid the invariant
+/// that page tables live in SYSTEM MEMORY (segment 0). WDDM reserves id 0 for
+/// that, which is what avoids the
+/// `VIDMM_PAGE_TABLE_BASE::GetCpuVisibleAddress` segment-attribute path that
+/// bugchecks when a fake page-table device segment is dropped or lacks bit 13.
+pub unsafe fn fill_page_table_level_desc(args: &DXGKARG_QUERYADAPTERINFO) -> NTSTATUS {
     if (args.OutputDataSize as usize) < size_of::<DXGK_PAGE_TABLE_LEVEL_DESC>() {
         return STATUS_BUFFER_TOO_SMALL;
     }
@@ -176,20 +188,43 @@ pub unsafe fn fill_page_table_level_desc(
         1 | 2 => INTERMEDIATE_PAGE_TABLE_INDEX_BIT_COUNT,
         _ => ROOT_PAGE_TABLE_INDEX_BIT_COUNT,
     };
-    desc.PageTableSegmentId = page_table_segment_id;
-    desc.PagingProcessPageTableSegmentId = page_table_segment_id;
+    desc.PageTableSegmentId = SYSTEM_MEMORY_SEGMENT_ID;
+    desc.PagingProcessPageTableSegmentId = SYSTEM_MEMORY_SEGMENT_ID;
     desc.PageTableSizeInBytes = PAGE_TABLE_SIZE_BYTES;
     desc.PageTableAlignmentInBytes = PAGE_TABLE_ALIGNMENT_BYTES;
     STATUS_SUCCESS
 }
 
-/// Byte size of a root page table that must address `num_pte` entries, consistent
-/// with the declared `PTE_SIZE_BYTES`. Used by `DxgkDdiGetRootPageTableSize`.
-/// Rounded up to a page; never zero for a non-zero request.
+/// Root page tables larger than one page were requested — value is the count.
+///
+/// The declared geometry makes this unreachable: `ROOT_PAGE_TABLE_INDEX_BIT_COUNT`
+/// is 1, so a root table addresses at most 2 entries, and the `<= 9` assert
+/// bounds it at 512 (= one page / `PTE_SIZE_BYTES`) even if the bit count
+/// changes. Counted anyway, because a geometry contradiction should be LOUD
+/// rather than absorbed by a function that ignored its own argument.
+pub static ROOT_PT_OVERSIZE: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
+/// Byte size of a root page table that must address `num_pte` entries.
+///
+/// The doc has always promised a `num_pte`-derived, page-rounded size; the body
+/// ignored `num_pte` entirely and returned the constant. It was CORRECT only
+/// because of the `ROOT_PAGE_TABLE_INDEX_BIT_COUNT <= 9` assert above — i.e. the
+/// promise was kept by an invariant declared 80 lines away rather than by the
+/// arithmetic.
+///
+/// Now it is derived. For every legal request today the result is still exactly
+/// 4096, so `GET_ROOT_PT_SIZE_LAST` records the same `(NumberOfPte, bytes)`
+/// pairs.
 pub fn root_page_table_size_bytes(num_pte: u32) -> SIZE_T {
     if num_pte == 0 {
-        0
-    } else {
-        PAGE_TABLE_SIZE_BYTES as SIZE_T
+        return 0;
     }
+    let bytes = u64::from(num_pte).saturating_mul(u64::from(PTE_SIZE_BYTES));
+    let page = u64::from(PAGE_TABLE_SIZE_BYTES);
+    if bytes > page {
+        ROOT_PT_OVERSIZE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+    // Round up to a whole page; never zero for a non-zero request.
+    (bytes.div_ceil(page).max(1).saturating_mul(page)) as SIZE_T
 }

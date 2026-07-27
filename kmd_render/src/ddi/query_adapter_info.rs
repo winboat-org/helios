@@ -54,9 +54,7 @@ pub unsafe extern "C" fn dxgkddi_query_adapter_info(
         DXGKQAITYPE_QUERYSEGMENT3 => unsafe { query_segments3(adapter, args) },
         DXGKQAITYPE_QUERYSEGMENT4 => unsafe { query_segments(adapter, args) },
         DXGKQAITYPE_GPUMMUCAPS => unsafe { gpummu::fill_gpummu_caps(args) },
-        DXGKQAITYPE_PAGETABLELEVELDESC => unsafe {
-            gpummu::fill_page_table_level_desc(args, gpummu::SYSTEM_MEMORY_SEGMENT_ID)
-        },
+        DXGKQAITYPE_PAGETABLELEVELDESC => unsafe { gpummu::fill_page_table_level_desc(args) },
         DXGKQAITYPE_WDDMDEVICECAPS => unsafe { query_wddm_device_caps(args) },
         DXGKQAITYPE_PHYSICAL_MEMORY_CAPS => unsafe { query_physical_memory_caps(args) },
         DXGKQAITYPE_IOMMU_CAPS => unsafe { query_zeroed::<DXGK_IOMMU_CAPS>(args) },
@@ -221,7 +219,7 @@ unsafe fn query_driver_caps(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTE
         caps_offset!(MaxAllocationListSlotId),
         max_allocation_list_slot_id,
     );
-    let aperture_segment_commit_limit: SIZE_T = 64 * 1024 * 1024;
+    let aperture_segment_commit_limit: SIZE_T = APERTURE_COMMIT_LIMIT as SIZE_T;
     out.set(
         caps_offset!(ApertureSegmentCommitLimit),
         aperture_segment_commit_limit,
@@ -388,7 +386,11 @@ unsafe fn query_driver_caps(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTE
     crate::diag::record(0x01D3_0000 | (scheduling_caps & 0xFFFF));
     crate::diag::record(0x01D4_0000 | (mem_caps & 0xFFFF));
     crate::diag::record(0x01D5_0000 | (max_allocation_list_slot_id & 0xFFFF));
-    crate::diag::record(0x01D6_0000 | ((aperture_segment_commit_limit as u32) & 0xFFFF));
+    // ENCODING CHANGE, declared: this record now carries the limit in MiB.
+    // `ApertureSegmentCommitLimit` was truncated to its low 16 bits, and 64 MiB
+    // has none — so 0x01D6 read 0x01D6_0000 on every boot regardless of the
+    // value, which made it useless for exactly the thing it exists to report.
+    crate::diag::record(0x01D6_0000 | ((APERTURE_COMMIT_LIMIT >> 20) as u32 & 0xFFFF));
     crate::diag::record(
         0x01D7_0000
             | (((support_non_vga as u32) & 1) << 0)
@@ -492,8 +494,27 @@ unsafe fn write_wchar_z_unaligned(dst: *mut WCHAR, dst_len: usize, ascii: &[u8])
 /// `0xC0000000`). An aperture is address-space only; the value just needs to be a
 /// plausible, non-overlapping window base.
 const APERTURE_BASE_ADDRESS: i64 = 0xC000_0000;
+/// Global cap on aperture-segment commitment, reported as
+/// `DXGK_DRIVERCAPS.ApertureSegmentCommitLimit`.
+///
+/// One constant for one resource. It was a bare literal in `query_driver_caps`
+/// with no explanatory comment — unlike every other cap in that function — while
+/// [`APERTURE_SEGMENT_SIZE`] independently described the same aperture, so two
+/// numbers described one thing in one file.
+///
+/// ⚠ Per `calculating-graphics-memory.md`, this field is a GLOBAL cap that
+/// REDUCES the OS-computed `SharedSystemMemory`, and the documentation advises
+/// against reducing it; viogpu3d never sets it at all. Changing the VALUE is
+/// therefore a separate, evidence-gated commit — it is an advertised capability,
+/// and the stage rule requires the measurement first. This commit only stops it
+/// being a magic number.
+const APERTURE_COMMIT_LIMIT: u64 = 64 * 1024 * 1024;
+
 /// Aperture window length. viogpu3d uses 1 GiB (`256 * 1024 * 4096`).
 const APERTURE_SEGMENT_SIZE: SIZE_T = 256 * 1024 * 4096;
+
+/// A commit limit above the segment it caps would be nonsense.
+const _: () = assert!(APERTURE_COMMIT_LIMIT <= APERTURE_SEGMENT_SIZE as u64);
 
 // WHY THE APERTURE IS ALWAYS SEGMENT 0 — from the live-KD decode of dxgmms2's
 // paging DMA-pool init (INITDMAPOOLS_HANDOVER.md, 2026-06-21).
