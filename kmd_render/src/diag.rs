@@ -207,6 +207,23 @@ pub enum FaultCounter {
     /// this is the counter behind that clamp's SAFETY comment. Not constructible
     /// with an immutable post-StartDevice table; it exists so that stays true.
     SegCntMis,
+    /// An escape arrived with `DXGKARG_ESCAPE.Flags.HardwareAccess` set — value
+    /// is the running count.
+    ///
+    /// This must read 0. A HardwareAccess escape makes dxgkrnl take the adapter
+    /// core resource EXCLUSIVE, which first runs `FlushAllDevice` against a
+    /// kwait-parked queue and wedges the whole graphics stack — the wedge class
+    /// the 26th session killed. Until now that contract was enforced entirely in
+    /// another codebase (the Mesa ICD's `HELIOS_ESCAPE_HW` kill switch), so an
+    /// ICD rebuild or a stale test-VM environment regressed it with no counter
+    /// and no breadcrumb: the only symptom was a frozen desktop, indistinguishable
+    /// from a venus hang.
+    EscHwA,
+    /// An escape arrived with `DXGKARG_ESCAPE.Flags.NoAdapterSynchronization`
+    /// set — value is the running count. Same class as [`Self::EscHwA`]: a
+    /// second env-driven ICD flag riding the same struct, whose own ICD comment
+    /// records a cold boot producing black output.
+    EscNoSy,
 }
 
 impl FaultCounter {
@@ -234,6 +251,8 @@ impl FaultCounter {
             FaultCounter::SegRule => b"SegRule",
             FaultCounter::SegDiv => b"SegDiv",
             FaultCounter::SegCntMis => b"SegCntMis",
+            FaultCounter::EscHwA => b"EscHwA",
+            FaultCounter::EscNoSy => b"EscNoSy",
         }
     }
 
@@ -259,6 +278,8 @@ impl FaultCounter {
         FaultCounter::SegRule,
         FaultCounter::SegDiv,
         FaultCounter::SegCntMis,
+        FaultCounter::EscHwA,
+        FaultCounter::EscNoSy,
     ];
 }
 

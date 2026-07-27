@@ -86,6 +86,44 @@ fn escape_device_gone(de: crate::error::DriverError) -> NTSTATUS {
     de.into()
 }
 
+/// `D3DDDI_ESCAPEFLAGS` bit positions, verified against the generated bitfield
+/// order in `tmp/dxgk_bindings.rs:14066-14103`. `__bindgen_anon_1.Value` is the
+/// union's `UINT` view, so a named mask against `.Value` is the stable,
+/// layout-independent way to test a documented bit — the same convention
+/// `query_driver_caps` uses for the cap unions.
+///
+///   bit 0 = HardwareAccess          bit 1 = DeviceStatusQuery
+///   bit 2 = ChangeFrameLatency      bit 3 = NoAdapterSynchronization
+const ESCAPE_FLAG_HARDWARE_ACCESS: u32 = 1 << 0;
+const ESCAPE_FLAG_NO_ADAPTER_SYNC: u32 = 1 << 3;
+
+/// Escapes seen with `HardwareAccess` / `NoAdapterSynchronization` set.
+///
+/// The KMD never inspected `DXGKARG_ESCAPE.Flags` at all — the "callers must use
+/// HardwareAccess = 0" contract lived entirely in the Mesa ICD, behind the
+/// `HELIOS_ESCAPE_HW` environment kill switch. Counting is deliberately all this
+/// does for now: refusing is a behaviour change that must be evidence-gated on
+/// these reading 0 across a desktop session plus a game run, and that evidence
+/// can only come from the image that first counts them.
+static ESCAPE_HW_ACCESS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static ESCAPE_NO_ADAPTER_SYNC: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
+/// Count one flagged escape and mirror it to the registry on a bounded cadence.
+///
+/// `record_named*` is an UNGATED synchronous registry write and this is the
+/// hottest DDI in the driver — the whole ICD command path rides it — so a
+/// per-escape breadcrumb would be a per-submit registry write. First observation
+/// plus every 64th, the same throttle `refuse_foreign_context` uses. Both names
+/// are zeroed by `reset_fault_counters` at StartDevice, so "absent" and "0" are
+/// not the same reading and the gate's verify-movement rule applies.
+fn count_escape_flag(counter: &core::sync::atomic::AtomicU32, which: crate::diag::FaultCounter) {
+    let n = counter.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+    if n == 1 || n % 64 == 0 {
+        crate::diag::fault(which, n);
+    }
+}
+
 /// QUERY_SCANOUT reads that gave up after SEQ_READ_ATTEMPTS because a publisher
 /// held the descriptor throughout (registry-visible as `QsRetry`). Expected 0 in
 /// steady state; it can only move under a mode-change loop.
@@ -130,6 +168,20 @@ pub unsafe extern "C" fn dxgkddi_escape(
     // We only read fields of `args`; we write only through the buffer it points to.
     let adapter = unsafe { &*(h_adapter as *const AdapterContext) };
     let args = unsafe { &*escape };
+
+    // Read the flags word ONCE, at PASSIVE, outside any lock, before any
+    // dispatch. Until now `pPrivateDriverData`/`PrivateDriverDataSize`/`hDevice`
+    // were the only fields of `args` this DDI ever read.
+    // SAFETY: `D3DDDI_ESCAPEFLAGS` is a union of a bitfield struct and a `UINT`
+    // `Value`; reading the `Value` view of a plain POD union field the runtime
+    // filled in is a valid read of initialized memory.
+    let flags = unsafe { args.Flags.__bindgen_anon_1.Value };
+    if flags & ESCAPE_FLAG_HARDWARE_ACCESS != 0 {
+        count_escape_flag(&ESCAPE_HW_ACCESS, crate::diag::FaultCounter::EscHwA);
+    }
+    if flags & ESCAPE_FLAG_NO_ADAPTER_SYNC != 0 {
+        count_escape_flag(&ESCAPE_NO_ADAPTER_SYNC, crate::diag::FaultCounter::EscNoSy);
+    }
 
     let buf_ptr = args.pPrivateDriverData as *mut u8;
     let buf_len = args.PrivateDriverDataSize as usize;
