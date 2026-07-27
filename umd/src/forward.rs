@@ -922,6 +922,56 @@ unsafe fn resource_sample_count(h_res: ddi::D3D10DDI_HRESOURCE) -> u32 {
     desc.SampleDesc.Count.max(1)
 }
 
+/// Which 1D view shape an array size selects.
+///
+/// One of the two decisions that the four view-descriptor translators each
+/// wrote out by hand. Purpose-scoped rather than one big `ViewShape` enum so
+/// each translator's `match` is exhaustive with no catch-all: adding a shape
+/// here is a compile error in every translator, which is the whole point.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tex1DShape {
+    Plain,
+    Array,
+}
+
+/// Which 2D view shape an (array size, sample count) pair selects.
+///
+/// This is the fork that was written out THREE times — RTV, DSV and SRV each
+/// had `if is_msaa && ArraySize > 1 / else if is_msaa / else if ArraySize > 1
+/// / else` — and the one where the wrong answer silently mis-binds a Fire
+/// Strike MSAA render target rather than failing. RTV, DSV and SRV can no
+/// longer disagree about which shape a resource is.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tex2DShape {
+    Plain,
+    Array,
+    Ms,
+    MsArray,
+}
+
+const fn tex1d_shape(array_size: u32) -> Tex1DShape {
+    if array_size > 1 {
+        Tex1DShape::Array
+    } else {
+        Tex1DShape::Plain
+    }
+}
+
+/// `sample_count` is the resource's, from [`resource_sample_count`], which
+/// clamps to 1 for a non-texture or unloadable handle.
+///
+/// The evaluation order is load-bearing and matches all three originals: MSAA
+/// wins over array-ness, so a multisampled array is `MsArray` and NOT
+/// `Array`.
+const fn tex2d_shape(array_size: u32, sample_count: u32) -> Tex2DShape {
+    match (sample_count > 1, array_size > 1) {
+        (true, true) => Tex2DShape::MsArray,
+        (true, false) => Tex2DShape::Ms,
+        (false, true) => Tex2DShape::Array,
+        (false, false) => Tex2DShape::Plain,
+    }
+}
+
 unsafe fn resource_dxgi_format(h_res: ddi::D3D10DDI_HRESOURCE) -> DXGI_FORMAT {
     let Some(res) = load_resource(h_res) else {
         return DXGI_FORMAT(0);
@@ -2866,8 +2916,8 @@ unsafe fn rtv_desc(
         }
         RES_TEX1D => {
             let t = a.__bindgen_anon_1.Tex1D;
-            if t.ArraySize > 1 {
-                Some(D3D11_RENDER_TARGET_VIEW_DESC {
+            Some(match tex1d_shape(t.ArraySize) {
+                Tex1DShape::Array => D3D11_RENDER_TARGET_VIEW_DESC {
                     Format: format,
                     ViewDimension: D3D11_RTV_DIMENSION_TEXTURE1DARRAY,
                     Anonymous: D3D11_RENDER_TARGET_VIEW_DESC_0 {
@@ -2877,9 +2927,8 @@ unsafe fn rtv_desc(
                             ArraySize: t.ArraySize,
                         },
                     },
-                })
-            } else {
-                Some(D3D11_RENDER_TARGET_VIEW_DESC {
+                },
+                Tex1DShape::Plain => D3D11_RENDER_TARGET_VIEW_DESC {
                     Format: format,
                     ViewDimension: D3D11_RTV_DIMENSION_TEXTURE1D,
                     Anonymous: D3D11_RENDER_TARGET_VIEW_DESC_0 {
@@ -2887,56 +2936,54 @@ unsafe fn rtv_desc(
                             MipSlice: t.MipSlice,
                         },
                     },
-                })
-            }
+                },
+            })
         }
         RES_TEX2D => {
             let t = a.__bindgen_anon_1.Tex2D;
-            let is_msaa = resource_sample_count(h_res) > 1;
-            if is_msaa && t.ArraySize > 1 {
-                Some(D3D11_RENDER_TARGET_VIEW_DESC {
-                    Format: format,
-                    ViewDimension: D3D11_RTV_DIMENSION_TEXTURE2DMSARRAY,
-                    Anonymous: D3D11_RENDER_TARGET_VIEW_DESC_0 {
-                        Texture2DMSArray: D3D11_TEX2DMS_ARRAY_RTV {
-                            FirstArraySlice: t.FirstArraySlice,
-                            ArraySize: t.ArraySize,
+            Some(
+                match tex2d_shape(t.ArraySize, resource_sample_count(h_res)) {
+                    Tex2DShape::MsArray => D3D11_RENDER_TARGET_VIEW_DESC {
+                        Format: format,
+                        ViewDimension: D3D11_RTV_DIMENSION_TEXTURE2DMSARRAY,
+                        Anonymous: D3D11_RENDER_TARGET_VIEW_DESC_0 {
+                            Texture2DMSArray: D3D11_TEX2DMS_ARRAY_RTV {
+                                FirstArraySlice: t.FirstArraySlice,
+                                ArraySize: t.ArraySize,
+                            },
                         },
                     },
-                })
-            } else if is_msaa {
-                Some(D3D11_RENDER_TARGET_VIEW_DESC {
-                    Format: format,
-                    ViewDimension: D3D11_RTV_DIMENSION_TEXTURE2DMS,
-                    Anonymous: D3D11_RENDER_TARGET_VIEW_DESC_0 {
-                        Texture2DMS: D3D11_TEX2DMS_RTV {
-                            UnusedField_NothingToDefine: 0,
+                    Tex2DShape::Ms => D3D11_RENDER_TARGET_VIEW_DESC {
+                        Format: format,
+                        ViewDimension: D3D11_RTV_DIMENSION_TEXTURE2DMS,
+                        Anonymous: D3D11_RENDER_TARGET_VIEW_DESC_0 {
+                            Texture2DMS: D3D11_TEX2DMS_RTV {
+                                UnusedField_NothingToDefine: 0,
+                            },
                         },
                     },
-                })
-            } else if t.ArraySize > 1 {
-                Some(D3D11_RENDER_TARGET_VIEW_DESC {
-                    Format: format,
-                    ViewDimension: D3D11_RTV_DIMENSION_TEXTURE2DARRAY,
-                    Anonymous: D3D11_RENDER_TARGET_VIEW_DESC_0 {
-                        Texture2DArray: D3D11_TEX2D_ARRAY_RTV {
-                            MipSlice: t.MipSlice,
-                            FirstArraySlice: t.FirstArraySlice,
-                            ArraySize: t.ArraySize,
+                    Tex2DShape::Array => D3D11_RENDER_TARGET_VIEW_DESC {
+                        Format: format,
+                        ViewDimension: D3D11_RTV_DIMENSION_TEXTURE2DARRAY,
+                        Anonymous: D3D11_RENDER_TARGET_VIEW_DESC_0 {
+                            Texture2DArray: D3D11_TEX2D_ARRAY_RTV {
+                                MipSlice: t.MipSlice,
+                                FirstArraySlice: t.FirstArraySlice,
+                                ArraySize: t.ArraySize,
+                            },
                         },
                     },
-                })
-            } else {
-                Some(D3D11_RENDER_TARGET_VIEW_DESC {
-                    Format: format,
-                    ViewDimension: D3D11_RTV_DIMENSION_TEXTURE2D,
-                    Anonymous: D3D11_RENDER_TARGET_VIEW_DESC_0 {
-                        Texture2D: D3D11_TEX2D_RTV {
-                            MipSlice: t.MipSlice,
+                    Tex2DShape::Plain => D3D11_RENDER_TARGET_VIEW_DESC {
+                        Format: format,
+                        ViewDimension: D3D11_RTV_DIMENSION_TEXTURE2D,
+                        Anonymous: D3D11_RENDER_TARGET_VIEW_DESC_0 {
+                            Texture2D: D3D11_TEX2D_RTV {
+                                MipSlice: t.MipSlice,
+                            },
                         },
                     },
-                })
-            }
+                },
+            )
         }
         RES_TEX3D => {
             let t = a.__bindgen_anon_1.Tex3D;
@@ -2952,6 +2999,9 @@ unsafe fn rtv_desc(
                 },
             })
         }
+        // A cube render target IS a 2D array view; D3D11 has no cube RTV
+        // dimension. Deliberately unlike `srv_desc`, which does have
+        // TEXTURECUBE / TEXTURECUBEARRAY and branches on `NumCubes`.
         RES_TEXCUBE => {
             let t = a.__bindgen_anon_1.TexCube;
             Some(D3D11_RENDER_TARGET_VIEW_DESC {
@@ -2966,6 +3016,9 @@ unsafe fn rtv_desc(
                 },
             })
         }
+        // Every dimension D3D11 defines is handled above. The caller logs the
+        // refusal with the dimension and format; never `unreachable!` —
+        // `panic = "abort"` would take DWM down with it.
         _ => None,
     }
 }
