@@ -174,6 +174,17 @@ bool resource_cycle(ID3D11Device* device) {
 }  // namespace
 
 int main(int argc, char** argv) {
+    // Unbuffered stdout, before anything can print.
+    //
+    // When this runs under the harness its stdout is a pipe, so the CRT block-
+    // buffers it. A crash then discards every line still in the buffer: the
+    // first full-scale run (1000/10000) fail-fasted in ucrtbase and produced
+    // ZERO output -- not even the banner printed on the line below -- which
+    // said nothing about where it died. A soak whose evidence evaporates on the
+    // failure it is meant to catch is worse than no soak, because the empty log
+    // reads like "never started".
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
+
     unsigned deviceCycles = 1000;
     unsigned resourceCycles = 10000;
     // Working-set tolerance. Allocator behaviour and DXVK's own caches make an
