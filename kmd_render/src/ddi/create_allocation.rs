@@ -1205,6 +1205,16 @@ unsafe fn destroy_allocation_ctx(
     ctx: Box<AllocationContext>,
 ) {
     let allocation_handle = (&*ctx as *const AllocationContext) as usize;
+    // The system-backing entry is removed on EVERY teardown exit, including the
+    // scanout-retire failure below.
+    //
+    // It used to sit after that early return, so an allocation destroyed while
+    // QEMU could not confirm the scanout disable left a stale entry in a table
+    // of 128 (k-paging-04). Bounded damage — resource ids are monotonic and
+    // never recycled (`virtio/gpu.rs`), so the entry consumes a slot rather than
+    // aliasing a new allocation — but the slot is never reclaimed, and the
+    // Present-time mirror keys off `contains(resource_id)`.
+    adapter.system_backings.remove(ctx.resource_id);
     // Retire the exact Windows/KMD allocation identity before any backing
     // resource, Venus image, or cached copy can be torn down. If QEMU cannot
     // confirm resource_id=0 scanout disable, retain every host object until
@@ -1213,7 +1223,6 @@ unsafe fn destroy_allocation_ctx(
         drop(ctx);
         return;
     }
-    adapter.system_backings.remove(ctx.resource_id);
     // A prepared scanout copy owns a command buffer which may still be queued
     // through the outer async SUBMIT_3D. Drain that GPU-completion fence and
     // tear the prepared objects down BEFORE touching the allocation's resource,

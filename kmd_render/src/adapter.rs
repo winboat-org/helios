@@ -86,9 +86,19 @@ pub struct BarSegment {
 /// Exact system-memory backing Windows supplied for one allocation in a paging
 /// TRANSFER from the BAR segment to segment 0.
 ///
-/// The physical pages come directly from the locked MDL in the transfer
-/// request. They remain the allocation's authoritative system backing until
-/// Windows issues the inverse transfer or destroys the allocation.
+/// The physical pages come directly from the locked MDL in the transfer request
+/// — locked for THAT OPERATION.
+///
+/// ⚠ This type does NOT own the frames it names, and nothing in the driver does.
+/// `pages` is a snapshot of PFNs; the entry's presence in the table records that
+/// WE remember them, not that VidMm still considers them the allocation's
+/// backing. `mirror_present_system_backing` re-maps them from `DxgkDdiPresent`,
+/// a completely different call from the paging op that supplied them. See the
+/// SAFETY note at `copy_blob_system_pages` in `ddi/build_paging_buffer.rs` for
+/// the full statement and the owner decision it gates (R715 / k-paging-04).
+///
+/// The entry is removed on every allocation-teardown exit, so it cannot outlive
+/// the allocation — which bounds the damage but does not make the mapping sound.
 #[derive(Clone)]
 pub(crate) struct SystemBackingSnapshot {
     pub resource_id: u32,

@@ -624,9 +624,40 @@ unsafe fn copy_blob_system_pages(
         let map_size = (run_pages as u64) << 12;
         let mut pa: PHYSICAL_ADDRESS = unsafe { core::mem::zeroed() };
         pa.QuadPart = physical_address as i64;
-        // SAFETY: the pages are either locked for the current paging operation
-        // or remain owned by the allocation's system backing until the inverse
-        // transfer/destroy removes their recorded association.
+        // ⚠ SAFETY, STATED HONESTLY — this is the R715 owner gate.
+        //
+        // The previous comment said the pages "remain owned by the allocation's
+        // system backing until the inverse transfer/destroy removes their
+        // recorded association". That is a statement about OUR TABLE, not about
+        // VidMm's page ownership, and it does not establish what a SAFETY
+        // comment must: that these frames are still the allocation's backing at
+        // the moment of the map.
+        //
+        // What is actually true:
+        //   - On the paging-op path the pages ARE locked, for the duration of
+        //     that operation. Sound.
+        //   - On the Present-time mirror path they are PFNs captured during an
+        //     earlier paging op, re-mapped from a completely different call. A
+        //     paging MDL is locked for the OPERATION, not for the residency
+        //     epoch, and this module's own doc twelve lines from
+        //     MAX_PAGING_SYSTEM_PTES records that VidMm "maps a bounded
+        //     paging-process scratch range around each virtual content operation
+        //     and unmaps it immediately afterward". Nobody has told us we may
+        //     keep those frames.
+        //   - `MmMapIoSpace` is the DEVICE-memory mapping API. Mapping ordinary
+        //     locked RAM through it creates a second cache-attribute alias; the
+        //     correct primitive for RAM is an MDL plus
+        //     `MmMapLockedPagesSpecifyCache`, which `mdl_system_va` in this very
+        //     file already uses for the MDL path.
+        //
+        // The keeper of the pages between the paging op and the Present is
+        // therefore UNNAMED, and naming it requires a VidMm-supplied lifetime
+        // this driver does not have. That is the owner decision R715 gates on
+        // (drop the mirror, re-derive from a live MDL, or obtain a real lease);
+        // this commit closes the destroy-path leak and replaces the claim with
+        // the truth rather than shipping a newtype whose no-op Drop would only
+        // look like a fix. Measure PgSm first: if the mirror never fires on real
+        // workloads, deleting it is cheaper than making it sound.
         let system =
             unsafe { MmMapIoSpace(pa, map_size, _MEMORY_CACHING_TYPE::MmCached) } as *mut u8;
         if system.is_null() {
