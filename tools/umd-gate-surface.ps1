@@ -118,7 +118,7 @@ foreach ($f in $logs) {
 }
 
 Write-Host ""
-Write-Host "--- DDI refusals (R911; all nine must read 0 on a healthy session) ---"
+Write-Host "--- DDI refusals (R911 + R1010; all ten must read 0 on a healthy session) ---"
 Write-Host "    (emitted at DestroyDevice AND on each counter's first hit, so a"
 Write-Host "     process that never tore a device down still reports.)"
 Write-Host "    EXPECTED TO MOVE under 3DMark: gs_so_declaration_dropped and"
@@ -131,12 +131,13 @@ foreach ($name in $sessions.Keys) {
         Write-Host ("  {0,-20} {1}" -f $name, ($hit -replace '^.*DDI refusals: ', ''))
         # Any non-zero field is a finding, not a failure -- these are legitimate
         # runtime decisions. Name them so nobody has to parse the line by eye.
-        # Anchored to the nine counter names: an unanchored `(\w+)=(\d+)` also
+        # Anchored to the ten counter names: an unanchored `(\w+)=(\d+)` also
         # matches the `[pid=NNNN]` prefix every UMD line carries, which reported
         # a clean session as NON-ZERO.
         $names = 'srv_raw_hazard|resource_raw_hazard|text_filter_size_ignored|' +
                  'staging_busy_assumed_free|discard_partial|clear_view_unsupported|' +
-                 'gs_so_declaration_dropped|tess_sig_fallback|unhandled_resource_dimension'
+                 'gs_so_declaration_dropped|tess_sig_fallback|unhandled_resource_dimension|' +
+                 'alloc_meta_format_unknown'
         $nz = [regex]::Matches($hit, "($names)=([1-9]\d*)") | ForEach-Object { $_.Value }
         if ($nz) { Write-Host ("  {0,-20} NON-ZERO: {1}" -f '', ($nz -join ' ')) }
     }

@@ -358,9 +358,18 @@ struct StandardAllocMetaV1 {
 
 use crate::format;
 
-fn dxgi_to_d3dddi_format(format: u32) -> u32 {
-    // KMD DescribeAllocation consumes legacy D3DDDIFORMAT values, not DXGI_FORMAT.
-    format::to_d3dddi(format)
+/// The lossy DXGI -> legacy D3DDDIFORMAT downgrade the KMD's
+/// `DxgkDdiDescribeAllocation` consumes. Counted, not refused: only two DXGI
+/// formats have a spelling here, the EXACT format travels beside it in
+/// `HeliosWddmAllocMeta::dxgi_format`, and every consumer that needs
+/// bpp/layout reads that one. It was the last silent answer in the format
+/// readers.
+fn dxgi_to_d3dddi_format(fmt: u32) -> u32 {
+    let d3dddi = format::to_d3dddi(fmt);
+    if d3dddi == format::D3DDDIFMT_UNKNOWN {
+        note_ddi_refusal(&DDI_REFUSALS.alloc_meta_format_unknown);
+    }
+    d3dddi
 }
 
 fn d3dddi_to_dxgi_format(fmt: u32) -> DXGI_FORMAT {
@@ -8227,7 +8236,7 @@ fn device_is_live(device: usize) -> bool {
     }
 }
 
-/// The nine DDI paths that refuse or silently downgrade runtime-requested work.
+/// The ten DDI paths that refuse or silently downgrade runtime-requested work.
 ///
 /// Each field is a legitimate runtime decision about runtime-supplied data, so
 /// a *type* encoding would be cosmetic — what they lacked was any record at
@@ -8269,6 +8278,18 @@ struct DdiRefusals {
     tess_sig_fallback: AtomicUsize,
     /// `create_resource` with a resource dimension outside the four we handle.
     unhandled_resource_dimension: AtomicUsize,
+    /// A DXGI format with no legacy D3DDDIFORMAT spelling, stamped into the
+    /// KMD allocation meta as `D3DDDIFMT_UNKNOWN` (0).
+    ///
+    /// The tenth, added with R1010. `format::to_d3dddi` knows exactly two
+    /// formats -- R8G8B8A8_UNORM and B8G8R8A8_UNORM -- and answered 0 for
+    /// everything else with no log and no counter; that 0 goes straight into
+    /// `HeliosWddmAllocMeta::format`, which `DxgkDdiDescribeAllocation`
+    /// consumes. It is a legitimate downgrade (the EXACT format travels
+    /// separately in `dxgi_format`, which is what every consumer that needs
+    /// bpp/layout reads), so this counts rather than refuses -- but it was the
+    /// one silent path the format table's readers still had.
+    alloc_meta_format_unknown: AtomicUsize,
 }
 
 static DDI_REFUSALS: DdiRefusals = DdiRefusals {
@@ -8281,9 +8302,10 @@ static DDI_REFUSALS: DdiRefusals = DdiRefusals {
     gs_so_declaration_dropped: AtomicUsize::new(0),
     tess_sig_fallback: AtomicUsize::new(0),
     unhandled_resource_dimension: AtomicUsize::new(0),
+    alloc_meta_format_unknown: AtomicUsize::new(0),
 };
 
-/// One bounded log line carrying all nine counters.
+/// One bounded log line carrying all ten counters.
 ///
 /// The UMD's evidence channel is the log — it has no registry counter surface —
 /// and T5 proved the failure mode this avoids: three of the four R806/R809
@@ -8305,7 +8327,7 @@ pub(crate) fn ddi_refusal_summary() -> String {
          text_filter_size_ignored={} staging_busy_assumed_free={} \
          discard_partial={} clear_view_unsupported={} \
          gs_so_declaration_dropped={} tess_sig_fallback={} \
-         unhandled_resource_dimension={}",
+         unhandled_resource_dimension={} alloc_meta_format_unknown={}",
         r.srv_raw_hazard.load(Ordering::Relaxed),
         r.resource_raw_hazard.load(Ordering::Relaxed),
         r.text_filter_size_ignored.load(Ordering::Relaxed),
@@ -8315,6 +8337,7 @@ pub(crate) fn ddi_refusal_summary() -> String {
         r.gs_so_declaration_dropped.load(Ordering::Relaxed),
         r.tess_sig_fallback.load(Ordering::Relaxed),
         r.unhandled_resource_dimension.load(Ordering::Relaxed),
+        r.alloc_meta_format_unknown.load(Ordering::Relaxed),
     )
 }
 
