@@ -20,7 +20,6 @@ use crate::log_error;
 use core::ffi::c_void;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use windows::core::{IUnknown, Interface};
-use windows::Win32::Graphics::Direct3D11::ID3D11Resource;
 
 /// One cached dcomp-vehicle present source (road 4): an alias-imported D3D11
 /// texture over the producing ICD's frame blob, keyed by venus resid. Owns
@@ -49,66 +48,6 @@ impl Drop for PresentSrcEntry {
             }
         }
     }
-}
-
-/// Probe state of the legacy LINEAR scan-out import.
-///
-/// An `Option` could not express "already decided this is unavailable" —
-/// absent is indistinguishable from unprobed — so the only positive
-/// short-circuit was `is_some()`, and a failed probe re-armed the whole
-/// toolhelp-module-walk-plus-kernel-escape on the next `OMSetRenderTargets`
-/// and the next `Flush`. The KMD-side handler adds a virtio `resource_is_live`
-/// round-trip, taken under two ICD locks.
-///
-/// R809 split the old third state (`Ready(ID3D11Resource)`) out of here: a
-/// successful import is now a [`ScanoutTarget`] with
-/// [`ScanoutKind::KmdLinearImport`], so the imported resource lives with the
-/// geometry it describes instead of beside it. What remains is purely the
-/// negative cache.
-#[derive(Clone, Copy)]
-pub enum ScanoutProbe {
-    /// Never probed on this device.
-    Unprobed,
-    /// Probed and not available. Do not probe again until `scanout_epoch` moves.
-    Unavailable { at_epoch: u32 },
-}
-
-/// Which of the two scan-out paths the recorded target belongs to.
-///
-/// This is the sealed discriminator the six loose `Cell`s had no room for. It
-/// exists so a reader can tell whether the recorded geometry describes the
-/// exact runtime-designated primary or the fallback LINEAR copy target —
-/// previously indistinguishable, because `ensure_kmd_scanout_target` wrote the
-/// same six fields with `allocation = 0` and a hard-coded `format = 87`.
-pub enum ScanoutKind {
-    /// The exact runtime-designated direct-scanout primary.
-    DirectPrimary,
-    /// Fallback LINEAR import of the KMD VidPn primary. Owns one COM
-    /// reference, which is why `ScanoutTarget` lives inside [`BridgeOwned`].
-    KmdLinearImport {
-        import: ID3D11Resource,
-        generation: u32,
-    },
-}
-
-/// The device's scan-out identity, as one value.
-///
-/// Six independent `Cell`s used to have to move as a unit and did not: three
-/// writers disagreed, and `clear_scanout_target_if_matches` reset six fields
-/// while leaving the import and its generation behind. Folding them into one
-/// `Option` makes a partial update unrepresentable — the third writer can no
-/// longer leave anything stale, because there is nothing left to leave.
-pub struct ScanoutTarget {
-    /// Non-owning raw COM pointer. For `KmdLinearImport` the owning reference
-    /// is `ScanoutKind::import`; for `DirectPrimary` the resource is owned by
-    /// its DDI handle. That asymmetry is deliberate and pre-dates R809.
-    pub resource_raw: usize,
-    pub resource_id: u32,
-    pub allocation: u32,
-    pub width: core::num::NonZeroU32,
-    pub height: core::num::NonZeroU32,
-    pub format: u32,
-    pub kind: ScanoutKind,
 }
 
 /// WDDM 2.x paging queue used to order explicit residency operations.
@@ -204,13 +143,6 @@ pub struct BridgeOwned {
     /// Dcomp present-vehicle source cache. Same single-threaded-DDI RefCell
     /// contract as `ia`.
     pub present_src_cache: core::cell::RefCell<Vec<PresentSrcEntry>>,
-    /// The device's scan-out identity. Lives here rather than beside the other
-    /// scanout state because `ScanoutKind::KmdLinearImport` owns a
-    /// bridge-derived COM reference, and R807's rule is that every such owner
-    /// is released before the bridge device drops.
-    pub scanout_target: core::cell::RefCell<Option<ScanoutTarget>>,
-    /// Owned reference to DWM's currently-bound full-mode optimal render target.
-    pub composition_source: core::cell::RefCell<Option<ID3D11Resource>>,
     /// Input-assembler state for lazy `ID3D11InputLayout` creation. The
     /// d3d10umddi `CreateElementLayout` DDI does NOT pass the vertex-shader
     /// input-signature bytecode that `ID3D11Device::CreateInputLayout`
@@ -223,8 +155,6 @@ impl BridgeOwned {
     pub fn new() -> Self {
         Self {
             present_src_cache: core::cell::RefCell::new(Vec::new()),
-            scanout_target: core::cell::RefCell::new(None),
-            composition_source: core::cell::RefCell::new(None),
             ia: core::cell::RefCell::new(IaState::default()),
         }
     }
@@ -241,11 +171,9 @@ impl BridgeOwned {
     /// but they move from "released here" to "released whenever the field
     /// drops", which is the ordering this type exists to stop depending on.
     pub fn release(&mut self) -> (usize, usize) {
-        // Order: caches and imports first, IA last, matching the pre-R807
-        // sequence where `ia` was the field released explicitly.
+        // Order: caches first, IA last, matching the pre-R807 sequence where
+        // `ia` was the field released explicitly.
         self.present_src_cache.get_mut().clear();
-        *self.scanout_target.get_mut() = None;
-        *self.composition_source.get_mut() = None;
         self.ia.get_mut().release_owned_com()
     }
 }
@@ -293,20 +221,11 @@ pub struct HeliosDevice {
     /// resident.
     pub paging_queue: Option<RuntimePagingQueue>,
     pub dxgi_callbacks: *mut ddi::DXGI_DDI_BASE_CALLBACKS,
-    /// Negative cache for the LINEAR-import probe. The positive result is the
-    /// `owned.scanout_target` value itself.
-    pub scanout_probe: core::cell::Cell<ScanoutProbe>,
-    /// Bumped whenever this UMD observes something that could change the KMD's
-    /// scanout: a direct-scanout primary created or destroyed. An `Unavailable`
-    /// probe result re-arms when this moves, so a LINEAR target that appears
-    /// later is still picked up.
-    pub scanout_epoch: core::cell::Cell<u32>,
     /// Exact pPrimaryDesc allocation identity -> Venus scanout metadata.
     /// DXGI can present a stable resource object while rotating its allocation
     /// handle, so the allocation is the authoritative lookup key.
     pub direct_scanout_allocations:
         core::cell::RefCell<Vec<(u32, helios_protocol::HeliosPresentPrivateData)>>,
-    pub scanout_copy_count: core::cell::Cell<u64>,
     /// Runtime corelayer handle + callbacks (pfnSetErrorCb) so VOID-returning
     /// DDIs can report failures to the runtime instead of leaving null handles.
     pub h_rt_core_layer: *mut core::ffi::c_void,

@@ -920,9 +920,6 @@ unsafe fn remember_direct_scanout_allocation(
         entries.retain(|(candidate, _)| *candidate != allocation);
         entries.push((allocation, private));
     }
-    // A new direct-scanout primary is exactly the event a mode change produces,
-    // so re-arm a previously-Unavailable LINEAR probe.
-    dev.scanout_epoch.set(dev.scanout_epoch.get().wrapping_add(1));
 }
 
 /// Drop a destroyed allocation's direct-scanout entry. Returns
@@ -942,130 +939,7 @@ unsafe fn forget_direct_scanout_allocation(
     let removed = before - entries.len();
     let remaining = entries.len();
     drop(entries);
-    if removed != 0 {
-        dev.scanout_epoch.set(dev.scanout_epoch.get().wrapping_add(1));
-    }
     (removed != 0).then_some((removed, remaining))
-}
-
-unsafe fn remember_scanout_target(
-    h: Hdevice,
-    raw: usize,
-    allocation: ddi::D3DKMT_HANDLE,
-    private: HeliosPresentPrivateData,
-) {
-    if raw == 0 || allocation == 0 || !private.is_valid() {
-        return;
-    }
-    let Some(dev) = helios_device(h) else {
-        return;
-    };
-    // The "largest area wins" policy. It is UNCHANGED by R809 and is now stated
-    // where it happens instead of only in a field comment calling the pointer
-    // "the largest scanout primary". A resolution change DOWNWARDS therefore
-    // still keeps the older, larger geometry -- see SCANOUT_DOWNRES_KEPT, which
-    // exists to measure how often that actually happens before the policy is
-    // changed. Deferred, not adopted: making it an explicit counted policy is
-    // R809's behaviour half.
-    let area = (private.width as u64).saturating_mul(private.height as u64);
-    let existing = dev.owned.scanout_target.borrow();
-    let current_area = existing.as_ref().map_or(0u64, |t| {
-        (t.width.get() as u64).saturating_mul(t.height.get() as u64)
-    });
-    // Observation only: how often a DirectPrimary record would be displaced by
-    // the LINEAR import, which R809's deferred DirectPrimary-wins rule would
-    // forbid. Counted here where the competing record is visible.
-    if matches!(
-        existing.as_ref().map(|t| &t.kind),
-        Some(crate::device_funcs::ScanoutKind::KmdLinearImport { .. })
-    ) {
-        SCANOUT_DIRECT_OVER_LINEAR.fetch_add(1, Ordering::Relaxed);
-    }
-    if current_area != 0 && area < current_area {
-        SCANOUT_DOWNRES_KEPT.fetch_add(1, Ordering::Relaxed);
-        log_error!(
-            "DDI scanout target KEPT older larger geometry: offered {}x{} vs stored area {} — {}",
-            private.width,
-            private.height,
-            current_area,
-            scanout_counter_summary()
-        );
-        return;
-    }
-    drop(existing);
-    let (Some(width), Some(height)) = (
-        core::num::NonZeroU32::new(private.width),
-        core::num::NonZeroU32::new(private.height),
-    ) else {
-        SCANOUT_ZERO_EXTENT.fetch_add(1, Ordering::Relaxed);
-        log_error!(
-            "DDI scanout target refused: zero extent {}x{} raw=0x{raw:x} — {}",
-            private.width,
-            private.height,
-            scanout_counter_summary()
-        );
-        return;
-    };
-    *dev.owned.scanout_target.borrow_mut() = Some(crate::device_funcs::ScanoutTarget {
-        resource_raw: raw,
-        resource_id: private.resource_id,
-        allocation,
-        width,
-        height,
-        format: private.dxgi_format,
-        kind: crate::device_funcs::ScanoutKind::DirectPrimary,
-    });
-    // Read back through the stored record rather than the parameters, so the
-    // line reports what was actually committed. This is also what keeps
-    // `allocation` a live field: pre-R809 `scanout_allocation` was written by
-    // two writers and read by nobody, which the grouping made visible as a
-    // dead-field warning. It is part of the scan-out identity the KMD matches
-    // on, so it is kept and reported rather than deleted (that is T6's call).
-    let stored = dev.owned.scanout_target.borrow();
-    if let Some(t) = stored.as_ref() {
-        log_error!(
-            "DDI scanout target: raw=0x{:x} alloc=0x{:x} res_id={} {}x{} fmt={} pitch={} — {}",
-            t.resource_raw, t.allocation, t.resource_id, t.width, t.height, t.format,
-            private.pitch,
-            scanout_counter_summary()
-        );
-    }
-}
-
-unsafe fn clear_scanout_target_if_matches(h: Hdevice, raw: usize) {
-    if raw == 0 {
-        return;
-    }
-    let Some(dev) = helios_device(h) else {
-        return;
-    };
-    // Pre-R809 this reset six Cells and left `scanout_import` and
-    // `scanout_generation` behind, so a cleared target still had a live import
-    // describing it. There is now one value to clear, and clearing it releases
-    // the imported COM reference with it -- nothing can be left stale because
-    // nothing is left.
-    let matches = dev
-        .owned
-        .scanout_target
-        .borrow()
-        .as_ref()
-        .is_some_and(|t| t.resource_raw == raw);
-    if matches {
-        *dev.owned.scanout_target.borrow_mut() = None;
-        log_error!("DDI scanout target cleared");
-    }
-}
-
-fn is_dwm_process() -> bool {
-    use std::sync::OnceLock;
-    static IS_DWM: OnceLock<bool> = OnceLock::new();
-    *IS_DWM.get_or_init(|| {
-        std::env::current_exe()
-            .ok()
-            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
-            .map(|n| n.eq_ignore_ascii_case("dwm.exe"))
-            .unwrap_or(false)
-    })
 }
 
 fn needs_wddm_texture_allocation(a: &ddi::D3D11DDIARG_CREATERESOURCE) -> bool {
@@ -1076,292 +950,6 @@ fn needs_wddm_texture_allocation(a: &ddi::D3D11DDIARG_CREATERESOURCE) -> bool {
     !a.pPrimaryDesc.is_null()
         || (a.BindFlags & DDI_BIND_PRESENT) != 0
         || (a.MiscFlags & (DDI_MISC_SHARED | DDI_MISC_SHARED_KEYEDMUTEX)) != 0
-}
-
-/// Lazily query and import the KMD-owned LINEAR primary into DWM's existing
-/// Venus device. The bridge uses this VkInstance's D3DKMT handles, so the import
-/// and its resource attachment cannot accidentally land in another live Venus
-/// instance hosted by the process.
-unsafe fn ensure_kmd_scanout_target(h: Hdevice) -> bool {
-    if !is_dwm_process() {
-        return false;
-    }
-    let Some(dev) = helios_device(h) else {
-        return false;
-    };
-    let epoch = dev.scanout_epoch.get();
-    // The positive half of the cache is now the recorded target itself: a
-    // KmdLinearImport target IS the successful probe result.
-    if matches!(
-        dev.owned.scanout_target.borrow().as_ref().map(|t| &t.kind),
-        Some(crate::device_funcs::ScanoutKind::KmdLinearImport { .. })
-    ) {
-        return true;
-    }
-    // The negative half: without it, any of (a) primary_scanout_resource == 0,
-    // (b) resource_is_live false, (c) the import returning 0 re-armed the full
-    // walk + D3DKMTEscape + KMD virtio round-trip for the next bind and the
-    // next flush.
-    if let crate::device_funcs::ScanoutProbe::Unavailable { at_epoch } = dev.scanout_probe.get() {
-        if at_epoch == epoch {
-            return false;
-        }
-    }
-
-    // The wrapper adopts the reference and returns the geometry together with
-    // it, so the five out-params cannot be read after a failed open (when they
-    // are whatever the bridge zeroed them to). R813.
-    let opened = dev.dxvk.open_scanout_target();
-    let (resource_id, width, height, pitch, generation) = opened
-        .as_ref()
-        .map_or((0, 0, 0, 0, 0), |(_, i)| {
-            (i.resource_id, i.width, i.height, i.pitch, i.generation)
-        });
-    if opened.is_none() {
-        dev.scanout_probe
-            .set(crate::device_funcs::ScanoutProbe::Unavailable { at_epoch: epoch });
-        if let Some(n) = SCANOUT_UNAVAILABLE_LOG_COUNT.first_n_then_every(16, 512) {
-            log_error!(
-                "DWM KMD scanout import unavailable at epoch {epoch} (x{}) — not re-probing until it moves",
-                n + 1
-            );
-        }
-        return false;
-    }
-
-    let Some((import, _)) = opened else {
-        return false;
-    };
-    let raw = import.as_raw() as usize;
-    let (Some(width_nz), Some(height_nz)) = (
-        core::num::NonZeroU32::new(width),
-        core::num::NonZeroU32::new(height),
-    ) else {
-        SCANOUT_ZERO_EXTENT.fetch_add(1, Ordering::Relaxed);
-        log_error!(
-            "DWM KMD scanout import refused: zero extent {width}x{height} — {}",
-            scanout_counter_summary()
-        );
-        dev.scanout_probe
-            .set(crate::device_funcs::ScanoutProbe::Unavailable { at_epoch: epoch });
-        return false;
-    };
-    // The geometry, the identity and the owning import are now written as ONE
-    // value. Pre-R809 these were six Cells plus scanout_generation plus
-    // scanout_import, and this writer set them with allocation = 0 and a
-    // hard-coded format = 87 -- indistinguishable, to any reader, from a
-    // DirectPrimary record.
-    *dev.owned.scanout_target.borrow_mut() = Some(crate::device_funcs::ScanoutTarget {
-        resource_raw: raw,
-        resource_id,
-        allocation: 0,
-        width: width_nz,
-        height: height_nz,
-        // The target VkImage is BGRA; virtio scanout ignores alpha as XR24.
-        format: 87,
-        kind: crate::device_funcs::ScanoutKind::KmdLinearImport { import, generation },
-    });
-    // `generation` likewise: pre-R809 `scanout_generation` had one writer and
-    // no reader. Reported from the stored variant so it is live state, not a
-    // value written into a Cell nothing consults.
-    let stored = dev.owned.scanout_target.borrow();
-    let stored_gen = match stored.as_ref().map(|t| &t.kind) {
-        Some(crate::device_funcs::ScanoutKind::KmdLinearImport { generation, .. }) => *generation,
-        _ => 0,
-    };
-    log_error!(
-        "DWM KMD scanout import ready: res_id={} {}x{} pitch={} gen={} — {}",
-        resource_id, width, height, pitch, stored_gen,
-        scanout_counter_summary()
-    );
-    drop(stored);
-    true
-}
-
-/// Re-arming an `Unavailable` probe is driven by `scanout_epoch`, which the two
-/// `direct_scanout_allocations` writers bump. The KMD's own scanout generation
-/// is only readable THROUGH the probe this cache exists to avoid, so the
-/// trigger has to be the UMD's own observation: a direct-scanout primary
-/// appearing or going away is exactly what a mode change produces.
-static SCANOUT_UNAVAILABLE_LOG_COUNT: LogThrottle = LogThrottle::new();
-
-
-/// Remember a full-mode BGRA render target as DWM's current private optimal
-/// composition surface. Holding our own COM reference makes the pointer safe
-/// across the later Flush callback even if DWM releases the RTV first.
-unsafe fn track_dwm_composition_target(
-    h: Hdevice,
-    resource_raw: usize,
-    allocation: ddi::D3DKMT_HANDLE,
-    width: u32,
-    height: u32,
-    format: u32,
-) {
-    // An exact Windows-designated primary already is the scanout backing.
-    // Never create/select the legacy LINEAR copy target for it.
-    let direct_primary = unsafe { helios_device(h) }.is_some_and(|dev| {
-        dev.direct_scanout_allocations
-            .borrow()
-            .iter()
-            .any(|(candidate, _)| *candidate == allocation)
-    });
-    if resource_raw == 0 || direct_primary || !unsafe { ensure_kmd_scanout_target(h) } {
-        return;
-    }
-    let Some(dev) = helios_device(h) else {
-        return;
-    };
-    let geometry_mismatch = dev.owned.scanout_target.borrow().as_ref().map_or(true, |t| {
-        width != t.width.get()
-            || height != t.height.get()
-            || format != t.format
-            || resource_raw == t.resource_raw
-    });
-    if geometry_mismatch {
-        return;
-    }
-
-    if dev
-        .owned
-        .composition_source
-        .borrow()
-        .as_ref()
-        .map(|r| r.as_raw() as usize == resource_raw)
-        .unwrap_or(false)
-    {
-        return;
-    }
-    // SAFETY: `resource_raw` is kept alive by the bound RTV. ManuallyDrop makes
-    // this a borrowed COM wrapper; clone takes the owned reference we retain.
-    let borrowed =
-        ManuallyDrop::new(unsafe { ID3D11Resource::from_raw(resource_raw as *mut c_void) });
-    dev.owned.composition_source.replace(Some((*borrowed).clone()));
-    log_error!(
-        "DWM composition target selected: raw=0x{:x} {}x{} fmt={}",
-        resource_raw, width, height, format
-    );
-}
-
-/// Record the one required per-frame GPU copy on DWM's own command stream.
-/// The following `ID3D11DeviceContext::Flush` submits both DWM's rendering and
-/// this copy in order; DXVK then releases the shared LINEAR target externally.
-unsafe fn publish_dwm_composition(context: &ID3D11DeviceContext, h: Hdevice) -> bool {
-    if !unsafe { ensure_kmd_scanout_target(h) } {
-        return false;
-    }
-    let Some(dev) = helios_device(h) else {
-        return false;
-    };
-    let source = dev.owned.composition_source.borrow();
-    let recorded = dev.owned.scanout_target.borrow();
-    // The copy target must be a LINEAR import specifically -- a DirectPrimary
-    // record describes a surface this path must never copy into. Pre-R809 the
-    // `kind` did not exist, and the guard was that `scanout_import` happened to
-    // hold a `Ready`.
-    let (
-        Some(source),
-        Some(crate::device_funcs::ScanoutTarget {
-            resource_id: target_id,
-            width: target_w,
-            height: target_h,
-            kind: crate::device_funcs::ScanoutKind::KmdLinearImport { import: target, .. },
-            ..
-        }),
-    ) = (source.as_ref(), recorded.as_ref())
-    else {
-        return false;
-    };
-    let (target_id, target_w, target_h) = (*target_id, target_w.get(), target_h.get());
-    if source.as_raw() == target.as_raw() {
-        return false;
-    }
-    context.CopySubresourceRegion(target, 0, 0, 0, 0, source, 0, None);
-    let n = dev.scanout_copy_count.get().wrapping_add(1);
-    dev.scanout_copy_count.set(n);
-    if n == 1 {
-        // THIS is entry into the COPY path, and it is a silent regression away
-        // from the direct primary if it is not loud: the desktop still appears
-        // either way, so nothing else distinguishes them. Merely opening the
-        // LINEAR target does not qualify — that happens on every DWM boot while
-        // this count stays 0.
-        log_error!(
-            "WARNING: DWM is compositing through the LEGACY LINEAR copy target — \
-             the direct primary is NOT the presented surface for this device"
-        );
-    }
-    if n <= 8 || n % 600 == 0 {
-        log_error!(
-            "DWM desktop->LINEAR scanout copy #{} res_id={} {}x{}",
-            n,
-            target_id,
-            target_w,
-            target_h
-        );
-    }
-    true
-}
-
-unsafe fn copy_to_scanout_target(
-    context: &ID3D11DeviceContext,
-    h: Hdevice,
-    src_h: ddi::D3D10DDI_HRESOURCE,
-) -> bool {
-    let Some(dev) = helios_device(h) else {
-        return false;
-    };
-    let dst_raw = dev
-        .owned
-        .scanout_target
-        .borrow()
-        .as_ref()
-        .map_or(0, |t| t.resource_raw);
-    if dst_raw == 0 || dst_raw == resource_com_raw(src_h) {
-        return false;
-    }
-    let Some(src) = load_resource(src_h) else {
-        return false;
-    };
-    let dst = ManuallyDrop::new(ID3D11Resource::from_raw(dst_raw as *mut c_void));
-    let (Ok(src_tex), Ok(dst_tex)) = (
-        (*src).cast::<ID3D11Texture2D>(),
-        (*dst).cast::<ID3D11Texture2D>(),
-    ) else {
-        return false;
-    };
-    let mut src_desc = D3D11_TEXTURE2D_DESC::default();
-    let mut dst_desc = D3D11_TEXTURE2D_DESC::default();
-    src_tex.GetDesc(&mut src_desc);
-    dst_tex.GetDesc(&mut dst_desc);
-    if src_desc.Format != dst_desc.Format
-        || src_desc.SampleDesc.Count != 1
-        || dst_desc.SampleDesc.Count != 1
-    {
-        log_error!(
-            "DXGI Present scanout-copy skipped: src {}x{} fmt={} dst {}x{} fmt={}",
-            src_desc.Width,
-            src_desc.Height,
-            src_desc.Format.0,
-            dst_desc.Width,
-            dst_desc.Height,
-            dst_desc.Format.0
-        );
-        return false;
-    }
-    let w = src_desc.Width.min(dst_desc.Width);
-    let hgt = src_desc.Height.min(dst_desc.Height);
-    if w == 0 || hgt == 0 {
-        return false;
-    }
-    let bx = D3D11_BOX {
-        left: 0,
-        top: 0,
-        front: 0,
-        right: w,
-        bottom: hgt,
-        back: 1,
-    };
-    context.CopySubresourceRegion(&*dst, 0, 0, 0, 0, &*src, 0, Some(&bx as *const D3D11_BOX));
-    true
 }
 
 unsafe fn dxvk_resource_memory_info(h: Hdevice, obj: &ID3D11Resource) -> (u64, u64, u64, u32) {
@@ -1549,7 +1137,6 @@ unsafe fn release_resource(h: Hdevice, h_res: ddi::D3D10DDI_HRESOURCE) {
     // what frees it -- the explicit `Box::from_raw` is gone.
     if let Some(mut state) = slot.take() {
         let state = &mut *state;
-        clear_scanout_target_if_matches(h, (*state).com_raw);
         let allocation = (*state)
             .allocation
             .as_ref()
@@ -1561,8 +1148,6 @@ unsafe fn release_resource(h: Hdevice, h_res: ddi::D3D10DDI_HRESOURCE) {
         // over dead entries, and if dxgkrnl reissues a freed D3DKMT_HANDLE the
         // lookup returns the previous primary's resource_id/width/height/pitch
         // for the new allocation — a stale scanout identity handed to the KMD.
-        // `clear_scanout_target_if_matches` above only clears the `scanout_*`
-        // Cells; it never touched this Vec.
         if let Some((removed, remaining)) = forget_direct_scanout_allocation(h, allocation) {
             log_error!(
                 "DDI scanout registry: dropped {removed} entry alloc=0x{allocation:x} remaining={remaining}"
@@ -2326,7 +1911,6 @@ unsafe fn finish_wddm_tex2d(
         },
         _ => empty_present_private(),
     };
-    let scanout_raw = res.as_raw() as usize;
     if RESOURCE_LOG_COUNT.first_n(128).is_some() {
         trace_line!(
             "DDI create_resource(tex2d) ok after-stamp-call: {}x{} fmt={} usage={} bind=0x{:x} misc=0x{:x} sample={}x{}",
@@ -2345,7 +1929,6 @@ unsafe fn finish_wddm_tex2d(
     );
     if present_private.is_valid() {
         unsafe { remember_direct_scanout_allocation(h, allocation_handle, present_private) };
-        remember_scanout_target(h, scanout_raw, allocation_handle, present_private);
     }
 }
 
@@ -3963,17 +3546,7 @@ unsafe extern "C" fn resource_read_after_write_hazard(
 
 unsafe extern "C" fn flush(h: Hdevice) {
     if let Some(context) = d3d11_context(h) {
-        let published = unsafe { publish_dwm_composition(&context, h) };
         context.Flush();
-        if published {
-            if let Some(dev) = helios_device(h) {
-                // This marker is the exact dirty edge for the fallback scanout
-                // copy recorded immediately above. The KMD captures its Venus
-                // watermark in Render and emits RESOURCE_FLUSH from the
-                // used-ring DPC only after all preceding work retires.
-                let _ = unsafe { submit_runtime_refresh(dev) };
-            }
-        }
     }
 }
 
@@ -5075,7 +4648,6 @@ unsafe extern "C" fn set_render_targets(
         ia.current_rt0_height = rt0.2;
         ia.current_rt0_format = rt0.3;
     }
-    unsafe { track_dwm_composition_target(h, rt0.4, rt0.0, rt0.1, rt0.2, rt0.3) };
     let n = OM_LOG_COUNT.next();
     if n < 1024 || rt_missing != 0 || rt0.0 != 0 {
         trace_line!(
@@ -8522,23 +8094,6 @@ fn device_is_live(device: usize) -> bool {
     }
 }
 
-/// R809 observation counters. All three measure policies the tranche
-/// deliberately did NOT change, so the gate run produces the evidence to decide
-/// them rather than the decision being taken blind.
-///
-/// Times a DirectPrimary record was written over a KmdLinearImport one. R809's
-/// deferred "DirectPrimary wins, and a LINEAR import may not displace it" rule
-/// would make the reverse direction impossible; this counts how often the two
-/// actually compete at all.
-static SCANOUT_DIRECT_OVER_LINEAR: AtomicUsize = AtomicUsize::new(0);
-/// Times the "largest area wins" heuristic kept older, larger geometry after a
-/// resolution change DOWNWARDS -- the undocumented policy R809 names.
-static SCANOUT_DOWNRES_KEPT: AtomicUsize = AtomicUsize::new(0);
-/// Scan-out targets refused for a zero width or height. Expected 0; a
-/// zero-extent scan-out target is meaningless, and `NonZeroU32` is what makes
-/// it unrepresentable rather than merely unlikely.
-static SCANOUT_ZERO_EXTENT: AtomicUsize = AtomicUsize::new(0);
-
 /// Scan-out primary creates refused because the bridge returned a resource
 /// with a zero row pitch (R806 sub-commit 2).
 ///
@@ -8549,28 +8104,6 @@ static SCANOUT_ZERO_EXTENT: AtomicUsize = AtomicUsize::new(0);
 /// direct-scanout primary being stamped into the KMD meta that the UMD could
 /// never identify through PresentCb private data.
 static SCANOUT_PRIMARY_ZERO_PITCH: AtomicUsize = AtomicUsize::new(0);
-
-/// The four scan-out observation counters above, as one field group.
-///
-/// They are process-global atomics and the UMD has no registry counter surface,
-/// so unless a log line reads them they increment into a void — which is
-/// exactly what they did between the commit that introduced them and this one.
-/// An instrument nothing can read is not an instrument, and R809's deferred
-/// rules were supposed to be decided from these three.
-///
-/// Appended at every decision point on both scan-out paths, including the early
-/// returns: the `downres_kept` case in particular *is* an early return, so a
-/// summary only on the success path would be blind to the one policy it most
-/// needs to measure.
-fn scanout_counter_summary() -> String {
-    format!(
-        "direct_over_linear={} downres_kept={} zero_extent={} zero_pitch={}",
-        SCANOUT_DIRECT_OVER_LINEAR.load(Ordering::Relaxed),
-        SCANOUT_DOWNRES_KEPT.load(Ordering::Relaxed),
-        SCANOUT_ZERO_EXTENT.load(Ordering::Relaxed),
-        SCANOUT_PRIMARY_ZERO_PITCH.load(Ordering::Relaxed),
-    )
-}
 
 /// `set_present_source` refusals (invalid geometry/resid from the ICD).
 static EXT_SOURCE_REFUSED: AtomicUsize = AtomicUsize::new(0);
@@ -9529,13 +9062,15 @@ enum RuntimeSubmission {
         private: HeliosPresentPrivateData,
     },
     /// A DXGI present with no identity to carry, written as a
-    /// `HeliosPresentRefreshCmd`. Distinct from [`Self::Refresh`] because it
-    /// still submits the present's allocation dependencies.
+    /// `HeliosPresentRefreshCmd`. It still submits the present's allocation
+    /// dependencies -- which is what distinguished it from the allocation-free
+    /// `Refresh` variant, retired with the LINEAR copy path in R910: that
+    /// marker's only trigger was `publish_dwm_composition` succeeding, and the
+    /// KMD issues its own `HeliosPresentRefreshCmd` for the direct primary
+    /// (`display.rs`), so the frozen refresh-marker ordering is unaffected.
     MarkerPresent {
         dependencies: RuntimePresentDependencies,
     },
-    /// An allocation-free dirty marker for an already-published scanout.
-    Refresh,
 }
 
 impl RuntimeSubmission {
@@ -9556,10 +9091,6 @@ impl RuntimeSubmission {
             Self::MarkerPresent { .. } => (
                 core::mem::size_of::<HeliosPresentRefreshCmd>() as u32,
                 "Present",
-            ),
-            Self::Refresh => (
-                core::mem::size_of::<HeliosPresentRefreshCmd>() as u32,
-                "refresh",
             ),
         }
     }
@@ -9638,10 +9169,6 @@ unsafe fn submit_runtime_submission(
             };
             (command as *mut HeliosPresentRefreshCmd).write_unaligned(present_refresh_cmd());
             count
-        }
-        RuntimeSubmission::Refresh => {
-            (command as *mut HeliosPresentRefreshCmd).write_unaligned(present_refresh_cmd());
-            0
         }
     };
 
@@ -9746,10 +9273,6 @@ unsafe fn submit_runtime_present_then_call(
     present_cb(dev.h_rt_device, callback_args)
 }
 
-unsafe fn submit_runtime_refresh(dev: &crate::device_funcs::HeliosDevice) -> i32 {
-    submit_runtime_submission(dev, RuntimeSubmission::Refresh)
-}
-
 /// DXGI `pfnPresent`: copy the source resource to the destination resource when
 /// DXGI provides both handles, then flush submitted GPU work.
 unsafe extern "C" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT) -> i32 {
@@ -9800,13 +9323,12 @@ unsafe extern "C" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT) -> i32 {
                     return hr;
                 }
             }
-            let _ = unsafe { publish_dwm_composition(context, h) };
             context.Flush();
         } else {
             // A direct primary already is the scanout backing. Do not copy it
             // through the adapter-owned LINEAR target; Present will publish its
             // rotated resource id after flushing DWM's rendering.
-            let mut published_to_scanout =
+            let published_to_scanout =
                 presented_primary_private(h, src_h).is_some();
             let copy_pair = if published_to_scanout {
                 None
@@ -9822,12 +9344,6 @@ unsafe extern "C" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT) -> i32 {
             if let Some((dst, src)) = copy_pair {
                 context.CopySubresourceRegion(&*dst, 0, 0, 0, 0, &*src, 0, None);
                 copied = true;
-            } else if !published_to_scanout
-                && dst_alloc == 0
-                && copy_to_scanout_target(context, h, src_h)
-            {
-                copied = true;
-                published_to_scanout = true;
             }
             // WS1 #4 producer: record the named-present-fence signal BEFORE the
             // flush so it submits WITH the frame's last work, and publish
@@ -9845,12 +9361,6 @@ unsafe extern "C" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT) -> i32 {
                         false,
                     );
                 }
-            }
-            // The DXGI Present source is the authoritative completed desktop.
-            // Use the RTV-tracking fallback only when no present source could
-            // be copied, otherwise this records the same full-frame copy twice.
-            if !published_to_scanout {
-                let _ = unsafe { publish_dwm_composition(context, h) };
             }
             context.Flush();
         }
@@ -10158,7 +9668,6 @@ unsafe extern "C" fn dxgi_set_display_mode(arg: *mut ddi::DXGI_DDI_ARG_SETDISPLA
     }
 
     if let Some(context) = d3d11_context(h) {
-        let _ = unsafe { publish_dwm_composition(&context, h) };
         context.Flush();
     }
     let mut callback = ddi::D3DDDICB_SETDISPLAYMODE {
@@ -10797,7 +10306,6 @@ unsafe extern "C" fn dxgi_present_mpo(arg: *mut ddi::DXGI_DDI_ARG_PRESENTMULTIPL
     }
 
     if let Some(context) = d3d11_context(h) {
-        let _ = unsafe { publish_dwm_composition(&context, h) };
         context.Flush();
     }
 
@@ -10885,11 +10393,6 @@ unsafe extern "C" fn dxgi_present1(arg: *mut ddi::DXGI_DDI_ARG_PRESENT1) -> i32 
     }
 
     if let Some(context) = d3d11_context(h) {
-        let published_to_scanout = presented_primary_private(h, src_h).is_some()
-            || (dst_alloc == 0 && copy_to_scanout_target(&context, h, src_h));
-        if !published_to_scanout {
-            let _ = unsafe { publish_dwm_composition(&context, h) };
-        }
         context.Flush();
     }
 
