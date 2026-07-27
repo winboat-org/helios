@@ -894,6 +894,73 @@ virtio-gpu scanout; IddCx/Looking Glass is no longer the active display path.*
    - **Suspend/resume** — still NOT TESTABLE (`disable_s3=1`/`disable_s4=1`, see 7b).
    - **The soak at its specified 1000-device scale** — unreachable on any build, see 7d(b).
 
+7g. **T6 IN PROGRESS — "delete the proven-dead paths". Pre-deletion reachability evidence
+   taken 2026-07-28 on KMD `22.22.187.0` / UMD `0daa30ca3ac146ec`, boot 2026-07-27 17:32.**
+   Real scope is **16 items, not the review's 18**: R903 (gdi_blit) landed in T1b at
+   22.22.180.0 and R904 (BarSegMode) landed in T4b at 22.22.187.0, both exactly as the
+   review's own plan-ordering correction instructed.
+
+   **Three owner sign-offs obtained before a line was touched**, plus one adjacent call:
+   R901 *delete the lab*; R910 *delete all of it, the review's literal list*; R912
+   *(a) retire the kwait subsystem*; `ScForceReject` *delete*.
+
+   **(a) R901 — the ScanoutDiag lab is inert this boot.** `ScanoutDiag` ABSENT, so
+   `diag_mode()` returns 0 and `maybe_run` returns at its `mode == 0` guard while
+   `rebind_if_forced` returns at `diag_mode() < 2` — both *before* writing anything. Confirmed
+   dynamically: all **40** `Sdg*`/`S2d*` values are byte-identical before and after a mixed
+   session (two `helios_dcomp_probe` runs, `helios_vkcube`, `helios_notepad_max`,
+   `helios_paintcap`). ⚠ **`SdgReb=235`, `SdgRv=11`, `SdgRRid=4`, `SdgRPc=5120`, `SdgRSet=1`,
+   `SdgRFlu=1`, `SdgMc=3` are STALE from an old `ScanoutDiag>=2` boot** — `maybe_run` zeroes
+   seventeen `Sdg*` names plus the eight `SdgL*` each StartDevice, but **not** the `SdgR*`
+   rebind family, so those never got cleared. Presence is not evidence; the diff is.
+   ⚠ The stronger form of this test — *delete the values, then confirm they do not reappear* —
+   **could not be run**: the registry-write was refused by a permission gate. The
+   before/after diff over a real workload plus the static argument is what stands in.
+   **Production `Sdg*` names that must survive R901**, confirmed by grepping the writers
+   rather than by the review's list: `SdgLStg SdgLReq SdgLBit SdgLTyc SdgLImg SdgLMem SdgLPch
+   SdgLOff` (the production LINEAR ladder, `venus.rs` `create_linear_scanout_image` /
+   `allocate_linear_scanout_image_blob`), `SdgMt SdgMf SdgBFl` (written by BOTH the diag and
+   the production allocator) and `SdgDevR SdgDevX` (device create). Live values this boot:
+   `SdgLStg=16 SdgLReq=7910400 SdgLBit=15 SdgLTyc=5 SdgLPch=7680 SdgDevX=1 SdgDevR=0`.
+
+   **(b) R907 — `PHQcall` is ABSENT from the service key entirely**, i.e.
+   `dxgkddi_present_to_hw_queue` has never been called in the key's lifetime, across every
+   desktop session and Fire Strike run since it was created. No `HwSched`/`HwQueueSupported`
+   capability is advertised anywhere in the driver. Evidence gate met.
+
+   **(c) R910 — `scanout_copy_count == 0`, but the import IS taken.** The
+   `DWM desktop->LINEAR scanout copy #N` line is **absent** from dwm's whole session, which is
+   the x-dup-dead-14 precondition. `open_kmd_scanout_target … res=6 1896x1030 pitch=7680
+   fmt=87 gen=3 opens=4` **is** present — so `ensure_kmd_scanout_target` runs and imports the
+   KMD target on every DWM boot while the copy never fires. That is exactly what
+   `forward.rs`'s own comment predicts ("merely opening the LINEAR target does not qualify —
+   that happens on every DWM boot while this count stays 0"). ⚠ Honest limit: no non-direct
+   primary could be forced (no mode change possible on this box, see 7f), so this is
+   "the copy never fires on an ordinary desktop", not "the copy is unreachable".
+   ⚠ **The review's item list is wrong here and following it literally would have deleted the
+   direct-primary recorder without noticing:** `remember_scanout_target` writes
+   `ScanoutKind::DirectPrimary`, it is not a LINEAR function. Deleting the full list also
+   deletes `SCANOUT_DIRECT_OVER_LINEAR` / `SCANOUT_DOWNRES_KEPT` / `SCANOUT_ZERO_EXTENT` —
+   the instrument T5 built for R809. The owner chose the full deletion knowing that, on the
+   ground that with no LINEAR import left there is no competition for the rule to govern:
+   **R809's deferred DirectPrimary-wins rule closes as vacuous, not as adopted.**
+
+   **(d) R912 — the measurement gate is SATISFIED.** `helios_vkcube`, the Vulkan vehicle
+   workload the review names: `vehicle present #1536: imports_failed=0 copies_failed=0
+   geom_mismatch=0 overwrites=0 **kwait_armed=0** kwait_arm_fails=0 kwait_queue_fails=0`, and
+   `get_present_result: none pending (**x1537**)`. Armed is **0** over 1536 vehicle presents;
+   misses track presents one-for-one (the two counters log on different cadences — presents at
+   `(n+1) % 512`, misses at `n % 512` — so 1537 vs 1536 is the same sample point, not a
+   discrepancy). Every ICD call falls back to the serial `wait_last_present`.
+   ⚠ **`helios_umd_get_present_result` must keep existing under outcome (a)**:
+   `icd/mesa/src/vulkan/wsi/wsi_common_win32.cpp:880-886` resolves all three UMD exports by
+   name and fails the whole vehicle path with `E_NOINTERFACE` (incrementing
+   `helios_vehicle_export_miss`) if any is missing. It stays, returning -1.
+
+   **Rendering evidence for the pre-deletion state:** `helios_paintcap` at 01:13:30 — full
+   composited desktop, wallpaper, taskbar, a maximised Notepad, a PowerShell console and the
+   clock reading 01:13 28-07-2026. DComp probe `PROBE PASS`, 1357 frames / 25 s.
+
 8. Implement the remaining reviewed refactors atomically, in tranche order, one recommendation
    per commit; never fold a `BUG` fix into a structure move. Preserve the current direct
    primary, completion ordering, loud-failure contracts, registry ABI, and
