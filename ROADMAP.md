@@ -404,6 +404,30 @@ virtio-gpu scanout; IddCx/Looking Glass is no longer the active display path.*
    (a `PsCreateSystemThread` body, the one structural justification).
    `DxgkDdiOpenAllocation` deliberately gets NO mint: it reaches no `ctrl::` entry point, and a
    mint with no consumer is laundering.
+   **Gate evidence, all same boot (15:37:09) on 22.22.186.0:** cold boot to `CM_PROB_NONE`; a
+   visible composited desktop (`helios_paintcap`) before AND after a `pnputil /restart-device`
+   cycle; `IrqlBad` PRESENT and 0 at boot, mid-Fire-Strike, after two complete Fire Strike runs
+   and across the restart-device — present rather than absent matters, because absence would be no
+   evidence at all. `ASYNC_SUBMIT_COUNT == ASYNC_COMPLETE_COUNT` exactly at both 230902 (pre-restart
+   generation) and 223100 (post-restart). Every failure counter clear, every T4a counter absent.
+   Per-flip diag identical: `ScSet=1 ScFlu=3 VpDSt=0 DspMd=124257286 ScCpy=2 ScPch=7680`,
+   `ScanoutDiag` absent. (`VpSA` is NOT a constant — it is a SAMPLED count written at n==1 and
+   every 600th, so 1 at a fresh generation and 3000 under load are the same code. Do not gate on
+   it.) `QfRet` 101-129/run, `AbnDrop` 0 on the clean generation. Host log same-boot, 
+   `OPTIMAL DMA-BUF ready 1896x1030`, no venus decode/validation lines; the periodic
+   `required=8773632 fd_size=7913472` shape mismatch is the pre-existing 38th-session class.
+   **Measured:** Fire Strike Graphics **20144** (n=1) vs T4a's 19460/20312/20150 (n=3) — inside
+   that cluster, so R614 moved nothing, and it makes a fourth sample for the re-baseline T4a asked
+   for (four now at 19460/20144/20150/20312 against ONE pre-T4a sample at 21024, which is the
+   weak side of that comparison). Physics 35443, Combined 5305. DComp 25 s runs
+   1317/1350 pre-image → 1223/1319 post: inside the documented boot-to-boot spread, and this
+   tranche changed no mechanism, so read nothing into it.
+   ⚠ **NOT performed:** DOOM, rapid cursor motion (needs an interactive mouse — now FIVE tranches
+   overdue), and the `HELIOS_VKR_DEBUG=validate` host capture (owner-owned launcher relaunch).
+   **Suspend/resume is NOT TESTABLE as configured** and that is now a known fact rather than an
+   omission: `powercfg /a` reports S1/S2/S3/Hibernate/S0-idle/Hybrid/Fast-Startup ALL unsupported,
+   because `tools/launch-helios-gtk.sh` passes `-global ICH9-LPC.disable_s3=1` and
+   `disable_s4=1`. Testing it needs that launcher change plus a full VM restart — owner-owned.
    **The honest limit, stated in `ctrl.rs`'s module doc and `irql.rs`:** the token does not prove
    the live IRQL — only `KeGetCurrentIrql` can, and a per-call check was out of scope. It proves
    PROVENANCE. One PASSIVE-only operation stays outside the type system: `DmaBuffer`'s `Drop`
