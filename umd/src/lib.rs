@@ -37,6 +37,8 @@ mod device_funcs;
 mod forward;
 mod hr;
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use crate::hr::{
     Hresult, DXGI_ERROR_UNSUPPORTED, DXGI_STATUS_NO_REDIRECTION, E_FAIL, E_NOTIMPL, E_OUTOFMEMORY,
     S_OK,
@@ -196,7 +198,43 @@ pub struct D3d12DdiTableRequest {
     pub num_tables: u32,
 }
 
-static mut ADAPTER_COOKIE: usize = 0x4845_4c49_4f53_554d; // "HELIOSUM"
+/// The value handed back as every adapter's `pDrvPrivate`.
+///
+/// A zero-sized type, address-taken. It replaces a `static mut ADAPTER_COOKIE:
+/// usize = 0x4845_4c49_4f53_554d` ("HELIOSUM") whose stated purpose -- letting
+/// the driver recognise its own adapter -- was never realised: all three
+/// consumers bound it as `_h_adapter` and it was never read or written. A ZST
+/// says "this pointer is not dereferenceable state" in a way a `usize`
+/// carrying a magic number does not, and it drops a `static mut` carried for a
+/// value nothing consulted. R821.
+struct AdapterToken;
+static ADAPTER_TOKEN: AdapterToken = AdapterToken;
+
+/// Adapter handles that did not carry [`ADAPTER_TOKEN`].
+///
+/// COUNT AND LOG ONLY -- deliberately not a refusal. The counter has to be
+/// observed at zero on a real boot before any DDI starts rejecting on it, and
+/// `helios_umd_selftest` deliberately passes a null `pDrvPrivate`, so it trips
+/// this by design.
+static ADAPTER_UNRECOGNISED: AtomicUsize = AtomicUsize::new(0);
+
+/// Validate an adapter handle against the token we handed out. Reports only.
+fn adapter_ok(h: ddi::D3D10DDI_HADAPTER) -> bool {
+    let expected = core::ptr::addr_of!(ADAPTER_TOKEN) as *const c_void;
+    if core::ptr::eq(h.pDrvPrivate as *const c_void, expected) {
+        return true;
+    }
+    let n = ADAPTER_UNRECOGNISED.fetch_add(1, Ordering::Relaxed);
+    if n < 8 {
+        log_error!(
+            "adapter handle not ours: pDrvPrivate={:p} expected={:p} (x{}) — counted only",
+            h.pDrvPrivate,
+            expected,
+            n + 1
+        );
+    }
+    false
+}
 
 /// Dcomp present vehicle (road 4 unit 2), in-process export for the ICD's
 /// WSI: hand over the frame to present — venus resid + WS1 #4 fence value +
@@ -444,7 +482,7 @@ pub unsafe extern "system" fn OpenAdapter12(open_data: *mut D3d12DdiArgOpenAdapt
         }
 
         open.h_adapter = ddi::D3D10DDI_HADAPTER {
-            pDrvPrivate: core::ptr::addr_of_mut!(ADAPTER_COOKIE).cast::<c_void>(),
+            pDrvPrivate: core::ptr::addr_of!(ADAPTER_TOKEN) as *mut c_void,
         };
 
         let funcs = unsafe { &mut *open.p_adapter_funcs };
@@ -674,7 +712,7 @@ unsafe fn open_adapter_common(open_data: *mut ddi::D3D10DDIARG_OPENADAPTER, with
     log_self_module_path();
 
     open.hAdapter = ddi::D3D10DDI_HADAPTER {
-        pDrvPrivate: core::ptr::addr_of_mut!(ADAPTER_COOKIE).cast::<c_void>(),
+        pDrvPrivate: core::ptr::addr_of!(ADAPTER_TOKEN) as *mut c_void,
     };
 
     // The generated D3D10_2DDI_ADAPTERFUNCS is FLAT -- the WDK repeats the
@@ -720,9 +758,11 @@ unsafe extern "C" fn calc_private_device_size(
 }
 
 unsafe extern "C" fn create_device(
-    _h_adapter: ddi::D3D10DDI_HADAPTER,
+    h_adapter: ddi::D3D10DDI_HADAPTER,
     args: *mut ddi::D3D10DDIARG_CREATEDEVICE,
 ) -> Hresult {
+    // Report-only until the counter is observed at zero on a real boot (R821).
+    let _ = adapter_ok(h_adapter);
     // SAFETY: the runtime passes a valid `D3D10DDIARG_CREATEDEVICE*` per the
     // `PFND3D10DDI_CREATEDEVICE` contract; we only read scalar/pointer fields and
     // never write through it, so an E_NOTIMPL return leaves the runtime's state
@@ -999,7 +1039,8 @@ impl Drop for DeviceUnderConstruction {
     }
 }
 
-unsafe extern "C" fn close_adapter(_h_adapter: ddi::D3D10DDI_HADAPTER) -> Hresult {
+unsafe extern "C" fn close_adapter(h_adapter: ddi::D3D10DDI_HADAPTER) -> Hresult {
+    let _ = adapter_ok(h_adapter);
     log_error!("CloseAdapter");
     S_OK
 }
