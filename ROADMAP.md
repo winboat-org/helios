@@ -511,32 +511,106 @@ virtio-gpu scanout; IddCx/Looking Glass is no longer the active display path.*
    StartMenuExperienceHost — every one already in the historical set of 9 processes, and the only
    exception code ever seen. 1167 such faults now in the log (889 three weeks ago). NO non-ICD
    application error this boot. `tools/icd-fault-history.ps1` is the A/B that establishes that.
-7d. **T5 IN PROGRESS (release UMD only; no KMD image, no reboot).** 30 items (R801–R820 major,
-   R821–R830 minor) — note `REFACTOR_REVIEW.md`'s summary table at line 178 says 29 and is wrong.
-   **Two owner decisions taken up front so they do not block the other 28:** R829 → *correct the
-   doc*, i.e. `helios_multisample_quality_levels` keeps advertising 8x for every output-capable
-   format and the doc stops claiming the D3D11.3 §19.2.5 128-bit exception (that rule is a FLOOR,
-   not a ceiling; no behaviour change, and the caps/quality pair stays internally coherent).
-   R830 → *name the literals only*: `MaxStretchFactor`/`MaxShrinkFactor` 16.0, `BILINEAR` and
-   `NumCapabilityGroups: 1` move behind one named const block with **values unchanged**, and the
-   decision to reduce the advertised MPO caps is DEFERRED pending same-boot evidence on whether
-   DWM queries them at all (zero `GetMultiplaneOverlayCaps` / MPO-plane lines in any UMD log on
-   the box, but those logs predate this tranche by three weeks, so re-sample at the gate).
-   **DECLARED BEHAVIOUR CHANGE (R806 sub-commit 2), the only one in the tranche so far:**
-   `create_resource` now refuses a scan-out-primary create when the bridge returns a resource with
-   a **zero row pitch**, releasing it and reporting `E_OUTOFMEMORY` through `pfnSetErrorCb`
-   instead of continuing. Previously only `raw != 0` was checked, so a zero pitch would stamp
-   `HELIOS_WDDM_ALLOC_MISC_PRIMARY | MISC_DIRECT_SCANOUT` into the KMD meta while
-   `finish_wddm_tex2d`'s `present_private` gate failed — a direct-scanout primary in the kernel
-   the UMD never registered in `direct_scanout_allocations` and could never identify through
-   PresentCb private data, with nothing detecting the split. **New UMD counter
-   `SCANOUT_PRIMARY_ZERO_PITCH`** (process-global `AtomicUsize`, logged with its running total at
-   the one site that increments it — there is no periodic line on the scan-out create path, and
-   the UMD still has no registry counter surface). **Expected to stay 0**, and the review's claim
-   that the split state is "constructible today" is corrected: `create_ddi_scanout_texture2d`
-   returns 0 for a zero width/height, sets `out_offset` to 0 on every path, and otherwise computes
-   a non-zero pitch, so `raw != 0` implies `rp != 0`. This closes a cross-FFI contract dependency
-   (same class as R822), not a live bug. A non-zero counter means that contract broke.
+7d. **T5 IMPLEMENTED — GATE NOT YET RUN (release UMD only; no KMD image, no reboot).**
+   All **30** items closed (R801–R820 major, R821–R830 minor) across 30 commits on `wddm`.
+   Note `REFACTOR_REVIEW.md`'s summary table at line 178 says 29 and is **wrong**.
+   Every commit builds clean and the crate warning count is unchanged from the pre-tranche
+   baseline (16) at every step.
+   **The one real BUG with a live wrong value was R801:** two constants shared the name
+   `DXGI_ERROR_UNSUPPORTED` with different values, and `OpenAdapter12` returned `0x887A_0020`
+   = `DXGI_ERROR_DRIVER_INTERNAL_ERROR`, so a D3D12 client's ordinary unsupported-DDI
+   negotiation was recorded by the runtime and by ETW as a **driver fault**. Both printed as
+   "DXGI_ERROR_UNSUPPORTED" in our own log, so the divergence was invisible to a triage grep.
+   **Two owner decisions, taken up front so they could not block the other 28:** R829 →
+   *correct the doc* (`helios_multisample_quality_levels` keeps advertising 8x for every
+   output-capable format; D3D11.3 §19.2.5 is a FLOOR, not a ceiling, and the caps/quality pair
+   stays coherent because `check_format_support` shares the predicate). R830 → *name the
+   literals only*, values UNCHANGED, with the cap reduction DEFERRED pending same-boot evidence
+   on whether DWM queries MPO at all.
+   **Machine-checked ABI is the tranche's biggest single gain.** `layout_tests(true)` in
+   `umd/build.rs` gives **6,336 assertions across 818 types** (817 size, 815 alignment, 4704
+   field offsets), and — contrary to R802, which predicts unrunnable `#[test]` functions —
+   bindgen 0.70 emits them as `const _: () = { ["msg"][offset_of!(X,y) - N]; }`, i.e.
+   **compile-time**. Verified by corrupting `D3D10DDIARG_CREATEDEVICE`'s `hDrvDevice` offset
+   32→24 (exactly R802's named invalid sequence) and confirming `error[E0080]`. The seven
+   hand-transcribed d3d10umddi structs are deleted; the five `D3d12Ddi*` ones stay because
+   `build.rs` bindgens `d3d10umddi.h` only.
+   **Three static guarantees were verified with throwaway negative controls, not asserted:**
+   `load_com::<ID3D11RenderTargetView>(h_rtv)` → `the trait bound
+   D3D10DDI_HRENDERTARGETVIEW: ComHandle is not satisfied` (R803);
+   `dev.dxvk.d3d11_device_ptr()` → `no method named d3d11_device_ptr found for struct
+   BridgeDevice` (R815); and transposing `present_vehicle_copy`'s two pointers by type →
+   `error[E0308]` (R816). R814 was validated by hashing the generated `bridge.rs.cc` before and
+   after — **byte-identical**, so the `unsafe` re-marking provably changed no codegen.
+   `forward.rs` now contains **zero raw handle-slot casts** (was 14 across five spellings); all
+   live in the new `forward/handles.rs`, which is T8's stated precondition.
+   **DECLARED BEHAVIOUR CHANGES, four, all counted:**
+   (a) **R801** — `OpenAdapter12` now returns `DXGI_ERROR_UNSUPPORTED` (`0x887A_0004`).
+   (b) **R806 sub-commit 2** — `create_resource` refuses a scan-out-primary create whose bridge
+   resource has a **zero row pitch**, releasing it and reporting `E_OUTOFMEMORY`, instead of
+   stamping `MISC_PRIMARY | MISC_DIRECT_SCANOUT` into the KMD meta for an allocation the UMD
+   never registers in `direct_scanout_allocations`. New counter `SCANOUT_PRIMARY_ZERO_PITCH`.
+   **Expected 0** — the review calls this state "constructible today" and it is NOT:
+   `create_ddi_scanout_texture2d` returns 0 for a zero width/height, hard-wires `out_offset` to
+   0 on every path, and otherwise computes a non-zero pitch, so `raw != 0` implies `rp != 0`.
+   This closes a cross-FFI contract dependency, not a live bug.
+   (c) **R812** — `pfnCheckDeferredContextHandleSizes` is a VOID writer, not a size getter; it
+   had TWO different stubs across the four device-funcs tables (the 256-returning `calc!` stub
+   in three, `ddi_noop_device` in the 11.0 table, whose list omits it). All four now install one
+   typed stub that writes 0 to the count out-param. Writing nothing, which both old stubs did,
+   left the runtime reading whatever it had pre-set.
+   (d) **R817** — `present_flip_wait_setup` returns **false** with a counter when called with
+   parameters differing from the armed ctx, where it previously returned **true** while
+   discarding them. Unreachable today; it becomes reachable after a device reset with a new
+   monitored fence, where the old behaviour left the watchdog dereferencing a retired
+   monitored-fence mapping.
+   **New UMD counters, all process-global `AtomicUsize` (the UMD still has no registry counter
+   surface):** `SCANOUT_PRIMARY_ZERO_PITCH`, `SCANOUT_DIRECT_OVER_LINEAR`,
+   `SCANOUT_DOWNRES_KEPT`, `SCANOUT_ZERO_EXTENT`, `ADAPTER_UNRECOGNISED`,
+   `CHECK_DEFERRED_HANDLE_SIZES_CALLS`; C++ side `flipWaitSetupMismatch`,
+   `flipWaitSetupConcurrent`, `s_publishTableFull`, `s_gateExceptions`, `s_gateNoContext`, the
+   scan-out format refusal. The `present-gate:` line KEEPS its existing keys and APPENDS
+   `failed=` and `noctx=`.
+   **Four items landed structure-only, with the behaviour half deferred and INSTRUMENTED so the
+   gate produces the evidence to decide it:** R809 (the DirectPrimary-wins rule and the
+   down-resolution policy — this is the frozen direct-primary display path and the failure mode
+   is a blank desktop; `SCANOUT_DIRECT_OVER_LINEAR` / `SCANOUT_DOWNRES_KEPT` / `SCANOUT_ZERO_EXTENT`
+   measure whether they ever fire), R818 sub-commit 2 (the Rust trampoline — its stated benefit
+   is already delivered by asserting the CPU-signal ABI's 24/0/8/16 on BOTH sides, and it would
+   run on DXVK's fence-waiter and watchdog threads), R820 sub-commit 2 (the move to
+   `format_caps.rs` — the const-asserts that make it safe now exist, and T8 is the move tranche),
+   and R803's resource/RTV signature conversion (~110 further call sites in a file T8 splits,
+   closing no hazard those decoders have).
+   **Corrections to `REFACTOR_REVIEW.md` found while implementing, worth carrying into T6–T8:**
+   R802's "seven structs" counts what is REPLACEABLE, not what exists (twelve were
+   hand-written); `E_FAIL` was defined FOUR times, not three; `_pad` had SIX kernel read sites,
+   not four, and the cited line numbers were stale; there are FIVE `store_resource` call sites,
+   not four; R809's prescribed `Cell<Option<ScanoutTarget>>` cannot compile because the variant
+   owns an `ID3D11Resource`; and R816's cxx **shared structs** are not constructible here at all
+   — `dxvk_bridge.h` is included BY the cxx-generated glue, so a shared struct is declared after
+   it and cannot appear in `HeliosDxvkDevice`'s signatures. R816 uses Rust-side newtypes
+   instead, which R815 makes airtight for every reachable caller.
+   **Two dead fields surfaced by the R809 grouping:** `allocation` and `generation` each had
+   writers and no reader — invisible while they were loose `Cell`s. Both kept (scan-out identity
+   the KMD matches on) and now logged from stored state; deletion is T6's call.
+   **New tooling:** `tools/umd-check.ps1` (filters the UMD build on the VM — a full build emits
+   ~115 clang warnings from the vendored dxvk-helios headers, enough to blow the MCP output cap
+   and drop the rustc errors, which happened twice) and `tools/helios_ownership_soak.cpp` +
+   `tools/helios-ownership-soak.ps1` (the gate's headline ownership run, which did not exist).
+   ⚠ **GATE NOT YET RUN.** Nothing here has been deployed or measured on the guest. The release
+   UMD must be built and installed (`win_install_umd` with an explicit `umd_dll` — Defender
+   blocks the debug copy and a stale debug DLL silently invalidates every timing number), then:
+   the ownership soak; a `UmdTrace=1` ABI diff against a pre-change run; visible desktop, Fire
+   Strike, the in-tree D3D11 probe suites as the dxvk-tests surrogate (dxvk-tests is NOT
+   installed on this box), DComp cadence, idle-to-active wake, cursor with no trails; the
+   standing KMD surface (`kmd-gate-surface.ps1`, per-flip diag `ScSet=1 ScFlu=3 VpDSt=0
+   DspMd=124257286 ScCpy=2 ScPch=7680` with `ScanoutDiag` absent, `AsSub == AsDone`, `WtOut`/
+   `CtOut` 0); and `helios_paintcap` → `Z:\tmp\screen_copy.png` as the only rendering evidence.
+   ⚠ **Pre-tranche ownership baseline, measured against the DEPLOYED T4b UMD** (so it is a
+   BEFORE number, not a T5 result): a short 5-device/20-resource run reported
+   **handles +36, modules +0, working set +548 KiB**. Whether that plateaus or grows without
+   bound is being characterised; the T5 comparison is only meaningful against the same
+   measurement on the same box.
 8. Implement the remaining reviewed refactors atomically, in tranche order, one recommendation
    per commit; never fold a `BUG` fix into a structure move. Preserve the current direct
    primary, completion ordering, loud-failure contracts, registry ABI, and
