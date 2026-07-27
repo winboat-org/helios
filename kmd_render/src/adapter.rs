@@ -792,6 +792,12 @@ impl ScanoutGuard<'_> {
     ) -> Result<R, DriverError> {
         self.adapter.with_venus_client(self.passive, f)
     }
+
+    /// The caller's PASSIVE proof, for the guarded helpers that reach
+    /// `virtio::ctrl` directly instead of through the venus client.
+    pub(crate) fn passive(&self) -> PassiveLevel {
+        self.passive
+    }
 }
 
 /// Identity of ONE programming interval.
@@ -1711,7 +1717,7 @@ impl AdapterContext {
     /// the liveness check and control-queue submission.
     fn queue_active_scanout_refresh_locked(
         &self,
-        _lock: &ScanoutGuard<'_>,
+        lock: &ScanoutGuard<'_>,
     ) -> ScanoutRefreshQueue {
         use core::sync::atomic::Ordering;
 
@@ -1772,6 +1778,7 @@ impl AdapterContext {
                 return ScanoutRefreshQueue::Busy;
             }
             let result = crate::virtio::ctrl::set_scanout_blob_async(
+                lock.passive(),
                 self,
                 resource_id,
                 width,
@@ -1810,6 +1817,7 @@ impl AdapterContext {
         }
 
         let result = crate::virtio::ctrl::resource_flush_async(
+            lock.passive(),
             self,
             resource_id,
             width,
@@ -2001,7 +2009,7 @@ impl AdapterContext {
     /// an inline closure; the generated critical section is identical.
     fn retire_scanout_allocation_locked(
         &self,
-        _lock: &ScanoutGuard<'_>,
+        lock: &ScanoutGuard<'_>,
         allocation_handle: usize,
         resource_id: u32,
     ) -> bool {
@@ -2068,7 +2076,8 @@ impl AdapterContext {
         // as scanout disable before any resource lookup. Because this
         // synchronous command is queued after all earlier async scanout
         // commands, its response is the lifetime barrier before UNREF.
-        let unbound = crate::virtio::ctrl::set_scanout_blob(self, 0, 0, 0, 0, 0, 0).is_ok();
+        let unbound =
+            crate::virtio::ctrl::set_scanout_blob(lock.passive(), self, 0, 0, 0, 0, 0, 0).is_ok();
         if !unbound {
             crate::diag::record_named_bytes(b"ScRet", 0xE);
             crate::diag::record_named_bytes(b"ScDead", resource_id);

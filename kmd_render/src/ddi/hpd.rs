@@ -88,8 +88,13 @@ pub unsafe extern "C" fn hpd_thread_routine(context: *mut c_void) {
     }
     // SAFETY: the adapter context is alive until StopDevice joins this thread.
     let adapter = unsafe { &*(context as *const AdapterContext) };
-    // SAFETY: PLACEHOLDER (R614) — the audited mint for this path arrives with
-    // its caller-group commit (display worker).
+    // SAFETY: this is a `PsCreateSystemThread` body. A system worker thread runs
+    // at PASSIVE_LEVEL for its whole life — it is not entered from a DDI, an ISR
+    // or a DPC — and every wait below is a `KeWaitForSingleObject` that would
+    // already be illegal otherwise. This is the one mint in the driver whose
+    // justification is structural rather than a documented DDI annotation, which
+    // is why it is minted ONCE here and passed down rather than re-asserted per
+    // callee.
     let passive = unsafe { crate::irql::PassiveLevel::assume() };
 
     // ── Phase 1: wait for StartDevice to return ─────────────────────────────
@@ -216,7 +221,7 @@ pub unsafe extern "C" fn hpd_thread_routine(context: *mut c_void) {
         // SetVidPnSourceAddress. The DDI can be called at DIRQL, where neither
         // Venus waits nor registry diagnostics are legal; this worker is the
         // PASSIVE continuation for that exact callback.
-        crate::ddi::display::process_deferred_vidpn_source_address(adapter);
+        crate::ddi::display::process_deferred_vidpn_source_address(passive, adapter);
 
         // The ScanoutDiag forced-rebind experiment. It lives HERE, and not in
         // apply_vidpn_source_address_locked where it used to sit, because there
@@ -231,7 +236,7 @@ pub unsafe extern "C" fn hpd_thread_routine(context: *mut c_void) {
         // experiment can no longer lie to the OS. `rebind_if_forced` is
         // unchanged and keeps its own `ScanoutDiag >= 2 && display_half` gate,
         // so every SdgR* counter keeps its exact name and value.
-        let _ = crate::ddi::scanout_diag::rebind_if_forced(adapter, 11);
+        let _ = crate::ddi::scanout_diag::rebind_if_forced(passive, adapter, 11);
 
         // Drain an armed one-shot Present probe (R320). Taking the record is a
         // quick operation under the venus mutex; the probe itself — a 5 s fence

@@ -436,7 +436,7 @@ pub unsafe extern "C" fn dxgkddi_start_device(
 
     if display_half {
         crate::diag::record_named_bytes(b"DspMd", adapter.display_mode_packed());
-        crate::ddi::scanout_diag::maybe_run(adapter);
+        crate::ddi::scanout_diag::maybe_run(passive, adapter);
 
         // Arm the CRTC_VSYNC heartbeat: without a free-running VSync, dxgkrnl never
         // retires a flip and so never issues SetVidPnSourceAddress (viogpu3d

@@ -20,6 +20,7 @@ use crate::ddi::present_packet::{
 };
 use crate::device::ContextHandleRef;
 use crate::dxgk::*;
+use crate::irql::PassiveLevel;
 use crate::virtio::venus::{OptimalPresentImageDesc, PresentBufferDesc, PresentDestinationDesc};
 use crate::virtio::VirtioError;
 use helios_kmd_logic::ScanoutFormat;
@@ -469,8 +470,12 @@ unsafe fn dxgkddi_present_inner(
                 return STATUS_INVALID_PARAMETER;
             }
 
-            // SAFETY: PLACEHOLDER (R614) — the audited mint for DxgkDdiPresent
-            // arrives with the display commit.
+            // SAFETY: `DxgkDdiPresent` is documented "IRQL: PASSIVE_LEVEL" (WDK
+            // DXGKDDI_PRESENT) — it is a pageable DDI, and the BLT arm below
+            // waits on a wire fence and maps blob bytes, neither of which is
+            // legal above PASSIVE. Note this is the BLT arm only; the MMIO-flip
+            // arm generates no DMA buffer and is completed through
+            // SetVidPnSourceAddress, whose DIRQL half holds no token at all.
             let passive = unsafe { crate::irql::PassiveLevel::assume() };
             let copy = adapter.with_venus_client(passive, |client| {
                 client.submit_present_blt(adapter, source_desc, destination_desc)
@@ -892,13 +897,25 @@ pub unsafe extern "C" fn dxgkddi_set_vidpn_source_address(
     if unsafe { KeGetCurrentIrql() } != crate::ddi::PASSIVE_LEVEL_IRQL {
         // Deferred: the timer DPC wakes the PASSIVE display worker, which
         // consumes `pending_vidpn_allocation` and adopts the raised gate.
+        //
+        // ⚠ R614: this arm holds NO `PassiveLevel`, and that is now structural
+        // rather than a convention. `program_vidpn_source` -> `ctrl::set_scanout_blob`
+        // is unreachable from here because the token does not exist on this side
+        // of the branch — which is the exact invalid sequence the item was
+        // written for ("compiles, links, ships, and either deadlocks at DISPATCH
+        // on a KEVENT wait or calls MmAllocateContiguousMemory above APC_LEVEL").
         adapter
             .pending_vidpn_allocation
             .store(h_alloc as usize, Ordering::Release);
         return STATUS_SUCCESS;
     }
 
-    unsafe { apply_vidpn_source_address(adapter, h_alloc) }
+    // SAFETY: `DxgkDdiSetVidPnSourceAddress` is documented callable up to DIRQL
+    // (dxgkrnl's MMIO-flip path invokes it under DxgkCbSynchronizeExecution), so
+    // the annotation proves nothing here — the runtime check immediately above
+    // does. This mint is downstream of it and must stay there.
+    let passive = unsafe { crate::irql::PassiveLevel::assume() };
+    unsafe { apply_vidpn_source_address(passive, adapter, h_alloc) }
 }
 
 /// The atomics-only half of `SetVidPnSourceAddress`, legal at DIRQL.
@@ -950,10 +967,10 @@ unsafe fn set_vidpn_source_address_dirql(
 ///
 /// The allocation handle is the exact identity supplied by Windows. No
 /// process, geometry, creation-order, or timing classification is involved.
-pub(crate) fn process_deferred_vidpn_source_address(adapter: &AdapterContext) {
-    // SAFETY: PLACEHOLDER (R614) — the audited mint for this path arrives with
-    // its caller-group commit (display worker).
-    let passive = unsafe { crate::irql::PassiveLevel::assume() };
+pub(crate) fn process_deferred_vidpn_source_address(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+) {
     let status = adapter.with_scanout_lifecycle(passive, |lock| {
         let raw = adapter.pending_vidpn_allocation.swap(0, Ordering::AcqRel);
         if raw == 0 {
@@ -1037,10 +1054,11 @@ unsafe fn apply_deferred_vidpn_source_address_locked(
 }
 
 /// Program the Windows-selected primary. PASSIVE_LEVEL only.
-unsafe fn apply_vidpn_source_address(adapter: &AdapterContext, h_alloc: HANDLE) -> NTSTATUS {
-    // SAFETY: PLACEHOLDER (R614) — the audited mint for this path arrives with
-    // its caller-group commit (display commit).
-    let passive = unsafe { crate::irql::PassiveLevel::assume() };
+unsafe fn apply_vidpn_source_address(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    h_alloc: HANDLE,
+) -> NTSTATUS {
     adapter.with_scanout_lifecycle(passive, |lock| unsafe {
         apply_vidpn_source_address_locked(adapter, lock, h_alloc)
     })
@@ -1407,6 +1425,7 @@ unsafe fn program_vidpn_source(
     }
     if !already_bound {
         let set = crate::virtio::ctrl::set_scanout_blob(
+            lock.passive(),
             adapter,
             target.resource_id(),
             target.width(),

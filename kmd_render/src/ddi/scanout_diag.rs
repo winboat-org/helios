@@ -14,6 +14,7 @@ use wdk_sys::ntddk::{MmMapIoSpace, MmUnmapIoSpace};
 use wdk_sys::{_MEMORY_CACHING_TYPE, PHYSICAL_ADDRESS};
 
 use crate::adapter::AdapterContext;
+use crate::irql::PassiveLevel;
 
 fn diag_mode() -> u32 {
     crate::diag::read_config_dword(b"ScanoutDiag", 0)
@@ -107,10 +108,7 @@ unsafe fn sample_bgra(va: *mut u8, len: usize, pitch: u32, offset: u32, width: u
     }
 }
 
-pub(crate) fn maybe_run(adapter: &AdapterContext) {
-    // SAFETY: PLACEHOLDER (R614) — the audited mint for this path arrives with
-    // its caller-group commit (StartDevice).
-    let passive = unsafe { crate::irql::PassiveLevel::assume() };
+pub(crate) fn maybe_run(passive: PassiveLevel, adapter: &AdapterContext) {
     let mode = diag_mode();
     crate::diag::record_named_bytes(b"SdgM", mode);
     crate::diag::record_named_bytes(b"SdgErr", 0);
@@ -146,7 +144,7 @@ pub(crate) fn maybe_run(adapter: &AdapterContext) {
 
     let (width, height) = adapter.display_mode();
     if mode == 7 {
-        match crate::virtio::ctrl::diagnostic_2d_scanout(adapter, width, height) {
+        match crate::virtio::ctrl::diagnostic_2d_scanout(passive, adapter, width, height) {
             Ok(resource_id) => {
                 crate::diag::record_named_bytes(b"S2dRid", resource_id);
                 crate::diag::record_named_bytes(b"S2dSet", 1);
@@ -179,6 +177,7 @@ pub(crate) fn maybe_run(adapter: &AdapterContext) {
             helios_protocol::VIRTIO_GPU_BLOB_FLAG_USE_SHAREABLE,
         );
         match crate::virtio::ctrl::diagnostic_guest_blob_scanout(
+            passive,
             adapter, width, height, format, blob_mem,
         ) {
             Ok((resource_id, pitch)) => {
@@ -216,7 +215,9 @@ pub(crate) fn maybe_run(adapter: &AdapterContext) {
         crate::diag::record_named_bytes(b"SdgBFl", blob_flags);
         crate::diag::record_named_bytes(b"SdgStg", 1);
         let (resource_id, blob_id, pitch) =
-            match crate::virtio::ctrl::diagnostic_virgl_host3d_blob(adapter, width, height, format)
+            match crate::virtio::ctrl::diagnostic_virgl_host3d_blob(
+                passive, adapter, width, height, format,
+            )
             {
                 Ok(result) => result,
                 Err(_) => {
@@ -273,6 +274,7 @@ pub(crate) fn maybe_run(adapter: &AdapterContext) {
         crate::diag::record_named_bytes(b"SdgStg", 5);
 
         let set = crate::virtio::ctrl::set_scanout_blob(
+            passive,
             adapter,
             resource_id,
             width,
@@ -287,7 +289,8 @@ pub(crate) fn maybe_run(adapter: &AdapterContext) {
             return;
         }
         crate::diag::record_named_bytes(b"SdgStg", 6);
-        let flush = crate::virtio::ctrl::resource_flush(adapter, resource_id, width, height);
+        let flush =
+            crate::virtio::ctrl::resource_flush(passive, adapter, resource_id, width, height);
         crate::diag::record_named_bytes(b"SdgFlu", if flush.is_ok() { 1 } else { 0xE });
         crate::diag::record_named_bytes(b"SdgStg", 7);
         adapter
@@ -314,6 +317,7 @@ pub(crate) fn maybe_run(adapter: &AdapterContext) {
         crate::diag::record_named_bytes(b"SdgStg", 1);
         let (resource_id, blob_id, pitch) =
             match crate::virtio::ctrl::diagnostic_virgl_host3d_guest_scanout(
+                passive,
                 adapter, width, height, format,
             ) {
                 Ok(result) => result,
@@ -331,6 +335,7 @@ pub(crate) fn maybe_run(adapter: &AdapterContext) {
         crate::diag::record_named_bytes(b"SdgFill", 1);
 
         let set = crate::virtio::ctrl::set_scanout_blob(
+            passive,
             adapter,
             resource_id,
             width,
@@ -346,7 +351,8 @@ pub(crate) fn maybe_run(adapter: &AdapterContext) {
             return;
         }
         crate::diag::record_named_bytes(b"SdgStg", 4);
-        let flush = crate::virtio::ctrl::resource_flush(adapter, resource_id, width, height);
+        let flush =
+            crate::virtio::ctrl::resource_flush(passive, adapter, resource_id, width, height);
         crate::diag::record_named_bytes(b"SdgFlu", if flush.is_ok() { 1 } else { 0xE });
         crate::diag::record_named_bytes(b"SdgStg", if flush.is_ok() { 5 } else { 0xE });
         adapter
@@ -472,6 +478,7 @@ pub(crate) fn maybe_run(adapter: &AdapterContext) {
     let format = scanout_format(mode);
     crate::diag::record_named_bytes(b"SdgFmt", format);
     let set = crate::virtio::ctrl::set_scanout_blob(
+        passive,
         adapter,
         blob.res_id,
         width,
@@ -486,11 +493,15 @@ pub(crate) fn maybe_run(adapter: &AdapterContext) {
     }
     adapter.remember_diag_scanout_blob(blob.res_id, width, height, pitch, offset);
     adapter.remember_scanout_blob(blob.res_id, width, height);
-    let flush = crate::virtio::ctrl::resource_flush(adapter, blob.res_id, width, height);
+    let flush = crate::virtio::ctrl::resource_flush(passive, adapter, blob.res_id, width, height);
     crate::diag::record_named_bytes(b"SdgFlu", if flush.is_ok() { 1 } else { 0xE });
 }
 
-pub(crate) fn rebind_if_forced(adapter: &AdapterContext, via: u32) -> bool {
+pub(crate) fn rebind_if_forced(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    via: u32,
+) -> bool {
     if diag_mode() < 2 || !adapter.display_half() {
         return false;
     }
@@ -516,19 +527,21 @@ pub(crate) fn rebind_if_forced(adapter: &AdapterContext, via: u32) -> bool {
     crate::diag::record_named_bytes(b"SdgRPc", pitch);
     crate::diag::record_named_bytes(b"SdgROf", offset);
     if diag_mode() == 7 {
-        let set = crate::virtio::ctrl::set_scanout_2d(adapter, resource_id, width, height);
+        let set = crate::virtio::ctrl::set_scanout_2d(passive, adapter, resource_id, width, height);
         crate::diag::record_named_bytes(b"SdgRSet", if set.is_ok() { 1 } else { 0xE });
         if set.is_err() {
             return true;
         }
         adapter.remember_scanout_blob(resource_id, width, height);
-        let flush = crate::virtio::ctrl::resource_flush(adapter, resource_id, width, height);
+        let flush =
+            crate::virtio::ctrl::resource_flush(passive, adapter, resource_id, width, height);
         crate::diag::record_named_bytes(b"SdgRFlu", if flush.is_ok() { 1 } else { 0xE });
         return true;
     }
     let format = scanout_format(diag_mode());
     crate::diag::record_named_bytes(b"SdgFmt", format);
     let set = crate::virtio::ctrl::set_scanout_blob(
+        passive,
         adapter,
         resource_id,
         width,
@@ -542,7 +555,7 @@ pub(crate) fn rebind_if_forced(adapter: &AdapterContext, via: u32) -> bool {
         return true;
     }
     adapter.remember_scanout_blob(resource_id, width, height);
-    let flush = crate::virtio::ctrl::resource_flush(adapter, resource_id, width, height);
+    let flush = crate::virtio::ctrl::resource_flush(passive, adapter, resource_id, width, height);
     crate::diag::record_named_bytes(b"SdgRFlu", if flush.is_ok() { 1 } else { 0xE });
     true
 }

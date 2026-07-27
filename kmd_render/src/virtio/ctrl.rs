@@ -565,6 +565,7 @@ pub fn ctx_detach_resource(
 /// `stride`/`offset` are plane-0 geometry of the LINEAR image. Device-global
 /// (`hdr.ctx_id = 0`). PASSIVE_LEVEL only (control round-trip).
 pub fn set_scanout_blob(
+    passive: PassiveLevel,
     adapter: &AdapterContext,
     resource_id: u32,
     width: u32,
@@ -573,7 +574,6 @@ pub fn set_scanout_blob(
     stride: u32,
     offset: u32,
 ) -> Result<(), VirtioError> {
-    let passive = assume_passive_unaudited();
     let mut cmd = VirtioGpuSetScanoutBlob::zeroed();
     cmd.hdr.type_ = VIRTIO_GPU_CMD_SET_SCANOUT_BLOB;
     cmd.r = VirtioGpuRect {
@@ -596,12 +596,12 @@ pub fn set_scanout_blob(
 /// a GL/blob scanout this is what drives the actual host present. Device-global.
 /// PASSIVE_LEVEL only (control round-trip).
 pub fn resource_flush(
+    passive: PassiveLevel,
     adapter: &AdapterContext,
     resource_id: u32,
     width: u32,
     height: u32,
 ) -> Result<(), VirtioError> {
-    let passive = assume_passive_unaudited();
     let mut cmd = VirtioGpuResourceFlush::zeroed();
     cmd.hdr.type_ = VIRTIO_GPU_CMD_RESOURCE_FLUSH;
     cmd.r = VirtioGpuRect {
@@ -621,6 +621,7 @@ pub fn resource_flush(
 /// continue, and blocking here previously imposed the observed ~0.41 s/frame
 /// cadence when ctrl interrupts were delayed.
 pub fn resource_flush_async(
+    passive: PassiveLevel,
     adapter: &AdapterContext,
     resource_id: u32,
     width: u32,
@@ -629,7 +630,6 @@ pub fn resource_flush_async(
     completion_errors: NonNull<AtomicU32>,
     wake_event: NonNull<KEVENT>,
 ) -> Result<(), VirtioError> {
-    let passive = assume_passive_unaudited();
     let mut cmd = VirtioGpuResourceFlush::zeroed();
     cmd.hdr.type_ = VIRTIO_GPU_CMD_RESOURCE_FLUSH;
     cmd.r = VirtioGpuRect {
@@ -673,6 +673,7 @@ pub fn resource_flush_async(
 /// bind does not self-resubmit: only a new Windows-selected candidate or a new
 /// completion-ordered dirty edge may request another attempt.
 pub fn set_scanout_blob_async(
+    passive: PassiveLevel,
     adapter: &AdapterContext,
     resource_id: u32,
     width: u32,
@@ -686,7 +687,6 @@ pub fn set_scanout_blob_async(
     refresh_pending: NonNull<AtomicU32>,
     wake_event: NonNull<KEVENT>,
 ) -> Result<(), VirtioError> {
-    let passive = assume_passive_unaudited();
     let mut cmd = VirtioGpuSetScanoutBlob::zeroed();
     cmd.hdr.type_ = VIRTIO_GPU_CMD_SET_SCANOUT_BLOB;
     cmd.r = VirtioGpuRect {
@@ -731,12 +731,12 @@ pub fn set_scanout_blob_async(
 }
 
 pub fn set_scanout_2d(
+    passive: PassiveLevel,
     adapter: &AdapterContext,
     resource_id: u32,
     width: u32,
     height: u32,
 ) -> Result<(), VirtioError> {
-    let passive = assume_passive_unaudited();
     let mut set = VirtioGpuSetScanout::zeroed();
     set.hdr.type_ = VIRTIO_GPU_CMD_SET_SCANOUT;
     set.r = VirtioGpuRect {
@@ -795,11 +795,11 @@ pub fn resource_assign_uuid(
 /// the current host. The backing allocation is intentionally leaked so the host
 /// can continue scanning it out after this PASSIVE one-shot returns.
 pub fn diagnostic_2d_scanout(
+    passive: PassiveLevel,
     adapter: &AdapterContext,
     width: u32,
     height: u32,
 ) -> Result<u32, VirtioError> {
-    let passive = assume_passive_unaudited();
     let pitch = (width as usize)
         .checked_mul(4)
         .ok_or(VirtioError::OutOfMemory)?;
@@ -855,7 +855,7 @@ pub fn diagnostic_2d_scanout(
     };
     ctrl_roundtrip_ok(passive, adapter, bytes_of(&attach), Some(bytes_of(&entry)))?;
 
-    set_scanout_2d(adapter, resource_id, width, height)?;
+    set_scanout_2d(passive, adapter, resource_id, width, height)?;
 
     let mut xfer = VirtioGpuTransferToHost2d::zeroed();
     xfer.hdr.type_ = VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D;
@@ -868,7 +868,7 @@ pub fn diagnostic_2d_scanout(
     xfer.offset = 0;
     xfer.resource_id = resource_id;
     ctrl_roundtrip_ok(passive, adapter, bytes_of(&xfer), None)?;
-    resource_flush(adapter, resource_id, width, height)?;
+    resource_flush(passive, adapter, resource_id, width, height)?;
 
     core::mem::forget(backing);
     Ok(resource_id)
@@ -878,13 +878,13 @@ pub fn diagnostic_2d_scanout(
 /// avoids HOST3D/Venus dma-buf export by backing the blob directly with guest
 /// RAM. The backing allocation is intentionally leaked while scanned out.
 pub fn diagnostic_guest_blob_scanout(
+    passive: PassiveLevel,
     adapter: &AdapterContext,
     width: u32,
     height: u32,
     format: u32,
     blob_mem: u32,
 ) -> Result<(u32, u32), VirtioError> {
-    let passive = assume_passive_unaudited();
     let pitch = width.checked_mul(4).ok_or(VirtioError::OutOfMemory)?;
     let size = (pitch as usize)
         .checked_mul(height as usize)
@@ -956,22 +956,23 @@ pub fn diagnostic_guest_blob_scanout(
     }
 
     let _ = adapter.with_virtio(|v| v.commit_resource(resource_id));
-    if let Err(e) = set_scanout_blob(adapter, resource_id, width, height, format, pitch, 0) {
+    if let Err(e) = set_scanout_blob(passive, adapter, resource_id, width, height, format, pitch, 0)
+    {
         let _ = resource_unref(passive, adapter, resource_id);
         return Err(e);
     }
     core::mem::forget(backing);
-    resource_flush(adapter, resource_id, width, height)?;
+    resource_flush(passive, adapter, resource_id, width, height)?;
     Ok((resource_id, pitch))
 }
 
 pub fn diagnostic_virgl_host3d_blob(
+    passive: PassiveLevel,
     adapter: &AdapterContext,
     width: u32,
     height: u32,
     format: u32,
 ) -> Result<(u32, u64, u32), VirtioError> {
-    let passive = assume_passive_unaudited();
     let pitch = width.checked_mul(4).ok_or(VirtioError::OutOfMemory)?;
     let size = (pitch as u64)
         .checked_mul(height as u64)
@@ -1047,12 +1048,12 @@ pub fn diagnostic_virgl_host3d_blob(
 }
 
 pub fn diagnostic_virgl_host3d_guest_scanout(
+    passive: PassiveLevel,
     adapter: &AdapterContext,
     width: u32,
     height: u32,
     format: u32,
 ) -> Result<(u32, u64, u32), VirtioError> {
-    let passive = assume_passive_unaudited();
     let pitch = width.checked_mul(4).ok_or(VirtioError::OutOfMemory)?;
     let size = (pitch as u64)
         .checked_mul(height as u64)
