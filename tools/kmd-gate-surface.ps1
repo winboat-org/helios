@@ -30,7 +30,7 @@ param(
         'ScGateCx', 'HpdStTo',
         # T4a
         'VnEncOvf', 'VnRingFt', 'VnRingWd', 'VnRingSz', 'VnMtDown', 'CpNoDrn',
-        'PBTdErr', 'CtNotOurs', 'AbnDrop', 'ChSzMm', 'ChSzPv', 'MapDup',
+        'PBTdErr', 'CtNotOurs', 'ChSzMm', 'ChSzPv', 'MapDup',
         'PciCapOob', 'WnRcf',
         # aperture / paging failure family
         'ChEi', 'ChEa', 'ChEp', 'ChEs', 'ChEb', 'ChEm', 'ChEu'
@@ -39,10 +39,17 @@ param(
     [string[]] $Report = @(
         'VpSA', 'ScSet', 'ScFlu', 'ScRid', 'VpDSt', 'DspMd', 'ScCpy', 'ScPch',
         'ScFrc', 'VsCnt', 'SaCnt', 'PkHi', 'IfHi', 'AsSub', 'AsDone', 'ChSzDl',
-        # QfRet is BACKPRESSURE, not a failure: it moves under real load (63 on
-        # the pre-T4a Fire Strike baseline). Judged by order of magnitude, not
-        # by zero, so it is reported rather than gated.
-        'QfRet'
+        # QfRet is BACKPRESSURE, not a failure: it moves under real load (63 per
+        # Fire Strike run, measured on both sides of T4a). Judged by order of
+        # magnitude, not by zero, so it is reported rather than gated.
+        'QfRet',
+        # AbnDrop is likewise NOT a failure counter. DxgkDdiPreemptCommand is
+        # "TDR probe OR PRIORITY SCHEDULING", and VidSch legitimately preempts
+        # under load: 45 fences across three Fire Strike runs on 22.22.184.0,
+        # with dwm's pid unchanged and zero 4101/dxgkrnl events in the System
+        # log. It reads 0 on a clean idle session; if it moves, check for a TDR
+        # rather than assuming one.
+        'AbnDrop'
     )
 )
 
