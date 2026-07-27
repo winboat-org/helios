@@ -1473,12 +1473,25 @@ unsafe fn store_rtv(
 
 /// The `RtvState` behind a DDI render-target-view handle, or `None` for an
 /// empty slot. The single place the RTV slot is decoded.
-unsafe fn rtv_state(handle_priv: *mut c_void) -> Option<&'static RtvState> {
+unsafe fn rtv_state(h_rtv: ddi::D3D10DDI_HRENDERTARGETVIEW) -> Option<&'static RtvState> {
+    boxed_slot(h_rtv)?.get()
+}
+
+/// `rtv_state` for the runtime-tag dispatches. See `load_resource_at`.
+unsafe fn rtv_state_at(handle_priv: *mut c_void) -> Option<&'static RtvState> {
     Slot::<Boxed<RtvState>>::from_priv(handle_priv)?.get()
 }
 
-unsafe fn load_rtv(handle_priv: *mut c_void) -> Option<ManuallyDrop<ID3D11RenderTargetView>> {
-    let state = rtv_state(handle_priv)?;
+unsafe fn load_rtv(
+    h_rtv: ddi::D3D10DDI_HRENDERTARGETVIEW,
+) -> Option<ManuallyDrop<ID3D11RenderTargetView>> {
+    load_rtv_at(h_rtv.pDrvPrivate)
+}
+
+/// `load_rtv` for the runtime-tag dispatches (`Discard`, `ClearView`, the
+/// tiled-resource barrier). See `load_resource_at`.
+unsafe fn load_rtv_at(handle_priv: *mut c_void) -> Option<ManuallyDrop<ID3D11RenderTargetView>> {
+    let state = rtv_state_at(handle_priv)?;
     if state.com_raw == 0 {
         return None;
     }
@@ -1492,8 +1505,10 @@ unsafe fn load_rtv(handle_priv: *mut c_void) -> Option<ManuallyDrop<ID3D11Render
 /// `clear_rtv` used to re-derive these by casting the slot inline, duplicating
 /// this function's body four lines from a `load_rtv` call on the same handle.
 /// That copy is gone; the log line it feeds is unchanged. R803.
-unsafe fn rtv_info(handle_priv: *mut c_void) -> (ddi::D3DKMT_HANDLE, u32, u32, u32, usize) {
-    rtv_state(handle_priv).map_or((0, 0, 0, 0, 0), |s| {
+unsafe fn rtv_info(
+    h_rtv: ddi::D3D10DDI_HRENDERTARGETVIEW,
+) -> (ddi::D3DKMT_HANDLE, u32, u32, u32, usize) {
+    rtv_state(h_rtv).map_or((0, 0, 0, 0, 0), |s| {
         (s.allocation, s.width, s.height, s.format, s.resource_raw)
     })
 }
@@ -3605,7 +3620,7 @@ unsafe extern "C" fn clear_rtv(
     let Some(context) = d3d11_context(h) else {
         return;
     };
-    let Some(rtv) = load_rtv(h_rtv.pDrvPrivate) else {
+    let Some(rtv) = load_rtv(h_rtv) else {
         return;
     };
     let rgba: [f32; 4] = if color.is_null() {
@@ -3614,7 +3629,7 @@ unsafe extern "C" fn clear_rtv(
         [*color, *color.add(1), *color.add(2), *color.add(3)]
     };
     {
-        let (allocation, width, height, format, _resource_raw) = rtv_info(h_rtv.pDrvPrivate);
+        let (allocation, width, height, format, _resource_raw) = rtv_info(h_rtv);
         if allocation != 0 || width != 0 || height != 0 || format != 0 {
             if let Some(n) = CLEAR_RTV_LOG_COUNT.first_n_then_every_from_one(64, 512) {
                 log_error!(
@@ -4088,7 +4103,7 @@ unsafe extern "C" fn discard_11_1(
             }
         }
         ddi::D3D11DDI_HANDLETYPE_D3D10DDI_HT_RENDERTARGETVIEW => {
-            if let Some(view) = load_rtv(handle).and_then(|v| (*v).cast::<ID3D11View>().ok()) {
+            if let Some(view) = load_rtv_at(handle).and_then(|v| (*v).cast::<ID3D11View>().ok()) {
                 context.DiscardView(&view);
             }
         }
@@ -4149,7 +4164,7 @@ unsafe extern "C" fn clear_view_11_1(
     let Some(context) = d3d11_context1(h) else {
         return;
     };
-    let Some(rtv) = load_rtv(view) else {
+    let Some(rtv) = load_rtv_at(view) else {
         return;
     };
     let Ok(view) = (*rtv).cast::<ID3D11View>() else {
@@ -5115,17 +5130,20 @@ unsafe extern "C" fn set_render_targets(
     let mut rt_nonnull = 0u32;
     let mut rt_missing = 0u32;
     for i in 0..num_views as usize {
-        let p = match rtv_slice.as_ref().and_then(|s| s.get(i)) {
-            Some(handle) => handle.pDrvPrivate,
-            None => core::ptr::null_mut(),
-        };
+        // An absent slot is spelled as a null handle rather than a null
+        // pointer, so the readers below stay on the typed accessors.
+        let h_rtv = rtv_slice.as_ref().and_then(|s| s.get(i)).copied().unwrap_or(
+            ddi::D3D10DDI_HRENDERTARGETVIEW {
+                pDrvPrivate: core::ptr::null_mut(),
+            },
+        );
         if i == 0 {
-            rt0 = rtv_info(p);
+            rt0 = rtv_info(h_rtv);
         }
-        let view = load_rtv(p).map(|m| (*m).clone());
+        let view = load_rtv(h_rtv).map(|m| (*m).clone());
         if view.is_some() {
             rt_nonnull += 1;
-        } else if !p.is_null() {
+        } else if !h_rtv.pDrvPrivate.is_null() {
             rt_missing += 1;
         }
         views.push(view);
@@ -7027,7 +7045,7 @@ unsafe fn tiled_barrier_child(
             (*view).cast::<ID3D11DeviceChild>().ok()
         }
         ddi::D3D11DDI_HANDLETYPE_D3D10DDI_HT_RENDERTARGETVIEW => {
-            let view = load_rtv(handle)?;
+            let view = load_rtv_at(handle)?;
             (*view).cast::<ID3D11DeviceChild>().ok()
         }
         ddi::D3D11DDI_HANDLETYPE_D3D10DDI_HT_DEPTHSTENCILVIEW => {
