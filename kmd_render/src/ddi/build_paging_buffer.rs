@@ -85,7 +85,12 @@ pub static GET_ROOT_PT_SIZE_LAST: AtomicU64 = AtomicU64::new(0);
 ///   0x0F03_NNNN = SetRootPageTable call count
 ///   0x0F04_NNNN = GetRootPageTableSize call count
 ///   0x0F05_OOOO = last paging Operation
-pub fn diag_dump_gpummu_atomics() {
+/// Mirror the GpuMmu page-table-DDI tracers into the PASSIVE breadcrumb ring.
+///
+/// Takes the PASSIVE proof token: every `diag::record` here is a synchronous
+/// `RtlWriteRegistryValue`, and the obligation used to be a doc comment reading
+/// "Call ONLY from a PASSIVE DDI".
+pub fn diag_dump_gpummu_atomics(_passive: PassiveLevel) {
     let mask = PAGING_OP_SEEN_MASK.load(Ordering::Relaxed) & 0xFFFF;
     crate::diag::record(0x0F01_0000 | mask);
     crate::diag::record(0x0F02_0000 | (PAGING_CALL_COUNT.load(Ordering::Relaxed) & 0xFFFF));
@@ -256,7 +261,15 @@ const fn e64(name: &'static [u8], value: &'static AtomicU64) -> crate::diag::Cou
     }
 }
 
-fn dump_bar_counters() {
+/// Mirror the paging counter block into the registry.
+///
+/// Takes the PASSIVE proof token by value (a ZST, so it costs nothing): this is
+/// ~26 synchronous `RtlWriteRegistryValue` calls, and `k-paging-05` got in
+/// precisely because a call to this sat on the DISPATCH-safe UPDATE_PAGE_TABLE
+/// branch, twelve lines above a content path that installs a runtime IRQL gate
+/// because the documented PASSIVE contract is not trusted. The token makes that
+/// call site a COMPILE error rather than a review miss.
+fn dump_bar_counters(_passive: PassiveLevel) {
     PAGING_COUNTERS.flush();
 }
 
@@ -491,7 +504,7 @@ impl MdlWindow {
 ///
 /// # Safety
 /// `mdl` must be a valid, locked MDL for the duration of the paging op.
-unsafe fn mdl_system_va(mdl: PMDL) -> Option<MdlWindow> {
+unsafe fn mdl_system_va(_passive: PassiveLevel, mdl: PMDL) -> Option<MdlWindow> {
     if mdl.is_null() {
         return None;
     }
@@ -649,7 +662,12 @@ unsafe fn copy_blob_system_pages(
 /// `system_start` is the mapped byte at which this allocation range begins.
 /// Every page number comes from `MmGetPhysicalAddress` while the MDL is locked;
 /// no allocation dimensions, process identity, or placement ordering is used.
+/// Snapshot the physical pages behind a paging transfer's system end.
+///
+/// Takes the PASSIVE proof token: `MmGetPhysicalAddress` over a mapped range and
+/// the `Arc<[u64]>` allocation below are both PASSIVE obligations.
 unsafe fn remember_system_backing(
+    _passive: PassiveLevel,
     adapter: &AdapterContext,
     resource_id: u32,
     blob_offset: u64,
@@ -884,10 +902,13 @@ unsafe fn bar_transfer(
     match (src_seg, dst_seg) {
         // Page-in: system backing → blob (evicted or initial content).
         (0, s) if s == bar_id => {
-            // SAFETY: Source.pMdl arm is valid for SegmentId 0. The cast maps
-            // the dxgk-bindings MDL to the layout-identical wdk_sys MDL.
-            let mdl = unsafe { *t.Source.__bindgen_anon_1.pMdl.as_ref() };
-            let Some(window) = (unsafe { mdl_system_va(mdl.cast()) }) else {
+            // SAFETY: `t.Source` is the transfer's source descriptor; its
+            // SegmentId selects the union arm, and it is 0 on this arm.
+            let TransferEnd::SystemMdl(mdl) = (unsafe { TransferEnd::source(&t.Source) }) else {
+                BAR_ERR_BOUNDS.fetch_add(1, Ordering::Relaxed);
+                return PagingOpOutcome::Failed(paging_failure());
+            };
+            let Some(window) = (unsafe { mdl_system_va(passive, mdl) }) else {
                 // PgEx counted inside mdl_system_va. The page-in did not happen,
                 // so the blob still holds stale bytes — never report success.
                 return PagingOpOutcome::Failed(paging_failure());
@@ -921,9 +942,13 @@ unsafe fn bar_transfer(
         }
         // Eviction: blob → system backing.
         (s, 0) if s == bar_id => {
-            // SAFETY: Destination.pMdl arm is valid for SegmentId 0. Cast as above.
-            let mdl = unsafe { *t.Destination.__bindgen_anon_1.pMdl.as_ref() };
-            let Some(window) = (unsafe { mdl_system_va(mdl.cast()) }) else {
+            // SAFETY: as the page-in arm — SegmentId 0 selects pMdl.
+            let TransferEnd::SystemMdl(mdl) = (unsafe { TransferEnd::destination(&t.Destination) })
+            else {
+                BAR_ERR_BOUNDS.fetch_add(1, Ordering::Relaxed);
+                return PagingOpOutcome::Failed(paging_failure());
+            };
+            let Some(window) = (unsafe { mdl_system_va(passive, mdl.cast()) }) else {
                 // PgEx counted inside mdl_system_va. The eviction did not happen;
                 // reporting success here would lose the allocation's only copy.
                 return PagingOpOutcome::Failed(paging_failure());
@@ -952,7 +977,14 @@ unsafe fn bar_transfer(
                 return PagingOpOutcome::Failed(paging_failure());
             }
             let _ = unsafe {
-                remember_system_backing(adapter, alloc.resource_id, blob_off, bytes, dst_start)
+                remember_system_backing(
+                    passive,
+                    adapter,
+                    alloc.resource_id,
+                    blob_off,
+                    bytes,
+                    dst_start,
+                )
             };
             BAR_XFER_OUT.fetch_add(1, Ordering::Relaxed);
             PagingOpOutcome::Executed
@@ -1087,6 +1119,144 @@ unsafe fn bar_harvest_page_table(
     }
 }
 
+/// One `DXGKARG_BUILDPAGINGBUFFER` operation, with its union arm already resolved.
+///
+/// # What this replaces
+///
+/// SIX sites repeated the same `// SAFETY: union arm selected by Operation.`
+/// sentence and reached into `args.__bindgen_anon_1` directly, and the operation
+/// set was maintained TWICE — once in an `is_content_op` `matches!` list and once
+/// in the dispatch arms — with nothing making the two agree. Added to the
+/// dispatch only, an operation never ran; added to `is_content_op` only, it fell
+/// through the wildcard and reported success having done nothing.
+///
+/// Now every union read happens inside [`PagingOperation::parse`], the IRQL gate
+/// keys off the parsed value, and the dispatch is an exhaustive match over a safe
+/// enum — so adding an operation forces a decision in exactly one place.
+///
+/// The residual trust is stated once instead of six times: `parse` believes
+/// `Operation` describes the live arm. That is the DDI contract, and there is no
+/// discriminant to check it against.
+enum PagingOperation<'a> {
+    UpdatePageTable(&'a DXGK_BUILDPAGINGBUFFER_UPDATEPAGETABLE),
+    Transfer(&'a _DXGKARG_BUILDPAGINGBUFFER__bindgen_ty_1__bindgen_ty_1),
+    Fill(&'a _DXGKARG_BUILDPAGINGBUFFER__bindgen_ty_1__bindgen_ty_2),
+    DiscardContent(&'a _DXGKARG_BUILDPAGINGBUFFER__bindgen_ty_1__bindgen_ty_3),
+    VirtualFill(&'a DXGK_BUILDPAGINGBUFFER_FILLVIRTUAL),
+    VirtualTransfer(&'a DXGK_BUILDPAGINGBUFFER_TRANSFERVIRTUAL),
+    /// Any operation this driver does not service — the null engine.
+    Other,
+}
+
+impl<'a> PagingOperation<'a> {
+    /// Resolve the union arm named by `Operation`.
+    ///
+    /// # Safety
+    /// `args.Operation` must describe the union arm dxgkrnl initialised. That is
+    /// the `DxgkDdiBuildPagingBuffer` contract; this is the ONE place in the
+    /// driver that relies on it.
+    unsafe fn parse(args: &'a DXGKARG_BUILDPAGINGBUFFER) -> Self {
+        use crate::dxgk::_DXGK_BUILDPAGINGBUFFER_OPERATION as PagingOp;
+        // SAFETY: per the fn contract — each arm is read only when `Operation`
+        // names it.
+        unsafe {
+            match args.Operation {
+                PagingOp::DXGK_OPERATION_UPDATE_PAGE_TABLE => {
+                    Self::UpdatePageTable(args.__bindgen_anon_1.UpdatePageTable.as_ref())
+                }
+                PagingOp::DXGK_OPERATION_TRANSFER => {
+                    Self::Transfer(args.__bindgen_anon_1.Transfer.as_ref())
+                }
+                PagingOp::DXGK_OPERATION_FILL => Self::Fill(args.__bindgen_anon_1.Fill.as_ref()),
+                PagingOp::DXGK_OPERATION_DISCARD_CONTENT => {
+                    Self::DiscardContent(args.__bindgen_anon_1.DiscardContent.as_ref())
+                }
+                PagingOp::DXGK_OPERATION_VIRTUAL_FILL => {
+                    Self::VirtualFill(args.__bindgen_anon_1.FillVirtual.as_ref())
+                }
+                PagingOp::DXGK_OPERATION_VIRTUAL_TRANSFER => {
+                    Self::VirtualTransfer(args.__bindgen_anon_1.TransferVirtual.as_ref())
+                }
+                _ => Self::Other,
+            }
+        }
+    }
+
+    /// Whether this operation needs PASSIVE_LEVEL: host round-trips and `Mm`
+    /// mapping calls.
+    ///
+    /// THE single source for that set. It used to be a `matches!` list beside the
+    /// dispatch, which is the drift hazard this enum removes.
+    const fn is_content_op(&self) -> bool {
+        matches!(
+            self,
+            Self::Transfer(_)
+                | Self::Fill(_)
+                | Self::DiscardContent(_)
+                | Self::VirtualFill(_)
+                | Self::VirtualTransfer(_)
+        )
+    }
+}
+
+/// Which end of a classic TRANSFER a `DXGK_TRANSFERVIRTUAL`-style descriptor
+/// names.
+///
+/// The SECOND, undocumented discriminant in this DDI: `SegmentId == 0` selects
+/// `pMdl` out of a `__BindgenUnionField`, and that rule lived only in an inline
+/// comment at two sites. Resolving it in one place means a future arm cannot copy
+/// the neighbouring line and read the wrong union field — which would compile,
+/// run, and swap a segment id for an MDL pointer, making `bar_transfer` copy in
+/// the wrong direction.
+enum TransferEnd {
+    /// A real memory segment. The id itself is read directly from the
+    /// descriptor by `bar_transfer`'s `(src_seg, dst_seg)` match — this variant
+    /// exists to say "NOT the MDL arm", which is the discriminant that was
+    /// undocumented.
+    Segment,
+    /// Segment 0: system memory, described by an MDL.
+    SystemMdl(PMDL),
+}
+
+impl TransferEnd {
+    /// The transfer's SOURCE end.
+    ///
+    /// Source and Destination are structurally identical but are SEPARATE
+    /// bindgen types, so there are two constructors rather than one generic —
+    /// which also means neither can be applied to the wrong end by accident.
+    ///
+    /// # Safety
+    /// `end` is the live `Source` descriptor of a `DXGK_OPERATION_TRANSFER`,
+    /// whose `SegmentId` selects its union arm.
+    unsafe fn source(
+        end: &_DXGKARG_BUILDPAGINGBUFFER__bindgen_ty_1__bindgen_ty_1__bindgen_ty_1,
+    ) -> Self {
+        if end.SegmentId == 0 {
+            // SAFETY: the pMdl arm is the live one exactly when SegmentId is 0.
+            // The cast maps the dxgk-bindings MDL to the layout-identical
+            // wdk_sys MDL.
+            Self::SystemMdl(unsafe { *end.__bindgen_anon_1.pMdl.as_ref() }.cast())
+        } else {
+            Self::Segment
+        }
+    }
+
+    /// The transfer's DESTINATION end. See [`Self::source`].
+    ///
+    /// # Safety
+    /// As [`Self::source`], for the `Destination` descriptor.
+    unsafe fn destination(
+        end: &_DXGKARG_BUILDPAGINGBUFFER__bindgen_ty_1__bindgen_ty_1__bindgen_ty_2,
+    ) -> Self {
+        if end.SegmentId == 0 {
+            // SAFETY: as `source`.
+            Self::SystemMdl(unsafe { *end.__bindgen_anon_1.pMdl.as_ref() }.cast())
+        } else {
+            Self::Segment
+        }
+    }
+}
+
 /// `DxgkDdiBuildPagingBuffer` — translate a memory-management operation into GPU
 /// DMA. Null engine for the aperture / page-table segments; REAL content engine
 /// for BAR-segment allocations. See the module doc.
@@ -1115,12 +1285,13 @@ pub unsafe extern "C" fn dxgkddi_build_paging_buffer(
         return STATUS_SUCCESS; // BAR segment inactive → pure null engine
     };
 
-    use crate::dxgk::_DXGK_BUILDPAGINGBUFFER_OPERATION as PagingOp;
+    // ONE union read for the whole DDI.
+    // SAFETY: `Operation` describes the arm dxgkrnl initialised — the DDI
+    // contract, now relied on in exactly one place instead of six.
+    let operation = unsafe { PagingOperation::parse(args) };
 
     // Placement harvest is DISPATCH-safe (atomic store only) — no IRQL gate.
-    if args.Operation == PagingOp::DXGK_OPERATION_UPDATE_PAGE_TABLE {
-        // SAFETY: union arm selected by Operation.
-        let update = unsafe { args.__bindgen_anon_1.UpdatePageTable.as_ref() };
+    if let PagingOperation::UpdatePageTable(update) = operation {
         let track_system_pages = unsafe { paging_alloc_info(update.hAllocation) }
             .is_some_and(|alloc| alloc.bar_eligible);
         // Preserve the exact leaf mapping before retiring the page-table update.
@@ -1146,15 +1317,9 @@ pub unsafe extern "C" fn dxgkddi_build_paging_buffer(
         return STATUS_SUCCESS;
     }
 
-    let is_content_op = matches!(
-        args.Operation,
-        PagingOp::DXGK_OPERATION_TRANSFER
-            | PagingOp::DXGK_OPERATION_FILL
-            | PagingOp::DXGK_OPERATION_DISCARD_CONTENT
-            | PagingOp::DXGK_OPERATION_VIRTUAL_FILL
-            | PagingOp::DXGK_OPERATION_VIRTUAL_TRANSFER
-    );
-    if !is_content_op {
+    // The content-op set is a method on the parsed value, so it cannot drift
+    // from the dispatch below.
+    if !operation.is_content_op() {
         return STATUS_SUCCESS;
     }
     // Content ops need PASSIVE (host round-trips, Mm mapping calls). The DDI
@@ -1184,25 +1349,12 @@ pub unsafe extern "C" fn dxgkddi_build_paging_buffer(
     // Every content arm yields a `PagingOpOutcome`, so the match itself is the
     // driver's answer: `Failed` is the only variant that reaches VidMm as a
     // status, and every arm that produces one routes through `paging_failure()`.
-    let outcome = match args.Operation {
-        PagingOp::DXGK_OPERATION_TRANSFER => {
-            // SAFETY: union arm selected by Operation.
-            unsafe {
-                bar_transfer(
-                    passive,
-                    adapter,
-                    bar.seg_id,
-                    args.__bindgen_anon_1.Transfer.as_ref(),
-                )
-            }
-        }
-        PagingOp::DXGK_OPERATION_FILL => {
-            // SAFETY: union arm selected by Operation.
-            unsafe { bar_fill(passive, adapter, bar.seg_id, args.__bindgen_anon_1.Fill.as_ref()) }
-        }
-        PagingOp::DXGK_OPERATION_DISCARD_CONTENT => {
-            // SAFETY: union arm selected by Operation.
-            let d = unsafe { args.__bindgen_anon_1.DiscardContent.as_ref() };
+    let outcome = match operation {
+        PagingOperation::Transfer(t) => unsafe {
+            bar_transfer(passive, adapter, bar.seg_id, t)
+        },
+        PagingOperation::Fill(f) => unsafe { bar_fill(passive, adapter, bar.seg_id, f) },
+        PagingOperation::DiscardContent(d) => {
             if let Some(alloc) = unsafe { paging_alloc_info(d.hAllocation) } {
                 adapter.system_backings.remove(alloc.resource_id);
             }
@@ -1214,9 +1366,7 @@ pub unsafe extern "C" fn dxgkddi_build_paging_buffer(
             // Discard cannot fail: there is nothing to move.
             PagingOpOutcome::Executed
         }
-        PagingOp::DXGK_OPERATION_VIRTUAL_FILL => {
-            // SAFETY: union arm selected by Operation.
-            let fv = unsafe { args.__bindgen_anon_1.FillVirtual.as_ref() };
+        PagingOperation::VirtualFill(fv) => {
             match unsafe { paging_alloc_info(fv.hAllocation) } {
                 None => {
                     BAR_ERR_FILL_HANDLE.fetch_add(1, Ordering::Relaxed);
@@ -1257,9 +1407,7 @@ pub unsafe extern "C" fn dxgkddi_build_paging_buffer(
                 }
             }
         }
-        PagingOp::DXGK_OPERATION_VIRTUAL_TRANSFER => {
-            // SAFETY: union arm selected by Operation.
-            let tv = unsafe { args.__bindgen_anon_1.TransferVirtual.as_ref() };
+        PagingOperation::VirtualTransfer(tv) => {
             if unsafe { bar_virtual_transfer(passive, adapter, tv) } {
                 PagingOpOutcome::Executed
             } else {
@@ -1269,9 +1417,14 @@ pub unsafe extern "C" fn dxgkddi_build_paging_buffer(
                 PagingOpOutcome::Failed(paging_failure())
             }
         }
-        _ => PagingOpOutcome::NotOurs,
+        // Exhaustive: `is_content_op` already returned for these, so reaching
+        // them here is impossible. Named rather than wildcarded so a new variant
+        // is a compile error in BOTH places at once.
+        PagingOperation::UpdatePageTable(_) | PagingOperation::Other => {
+            PagingOpOutcome::NotOurs
+        }
     };
-    dump_bar_counters();
+    dump_bar_counters(passive);
     match outcome {
         PagingOpOutcome::Failed(reason) => reason,
         PagingOpOutcome::Executed | PagingOpOutcome::NotOurs => STATUS_SUCCESS,

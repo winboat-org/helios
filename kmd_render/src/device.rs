@@ -161,6 +161,13 @@ pub unsafe extern "C" fn dxgkddi_destroy_device(h_device: *mut c_void) -> NTSTAT
             return STATUS_SUCCESS;
         };
         let owner = h_device as usize;
+        // SAFETY: `DxgkDdiDestroyDevice` is documented "IRQL: PASSIVE_LEVEL" (WDK
+        // DXGKDDI_DESTROYDEVICE), and the unmap loop below already depends on it
+        // — `MmUnmapLockedPages` is PASSIVE-only, which is exactly why the table
+        // lock is dropped between batches. Minted HERE rather than further down
+        // because the diag dumps between also require it; still ONE mint for
+        // this DDI.
+        let passive = unsafe { crate::irql::PassiveLevel::assume() };
         // Drain THIS device's mappings in batches, unmapping outside the table
         // lock (MmUnmapLockedPages needs PASSIVE; the table lock raises to
         // DISPATCH). One acquisition per entry was O(n) acquisitions and O(n^2)
@@ -191,7 +198,7 @@ pub unsafe extern "C" fn dxgkddi_destroy_device(h_device: *mut c_void) -> NTSTAT
         // Mirror the GpuMmu page-table-DDI tracers into the PASSIVE ring so the
         // post-CreateContext Code-43 failure stage is visible over SSH without
         // ntoseye (Step-2 decorative-GpuMmu bring-up).
-        crate::ddi::diag_dump_gpummu_atomics();
+        crate::ddi::diag_dump_gpummu_atomics(passive);
         // Engine-path tracers (SubmitCommand/Render/Patch/ISR/DPC counts): show
         // whether VidSch exercised the submission engine at all before the
         // post-CreateContext VidSchTerminateAdapter Code-43 (Step-2 coherent fence).
@@ -204,11 +211,6 @@ pub unsafe extern "C" fn dxgkddi_destroy_device(h_device: *mut c_void) -> NTSTAT
         // Sweep exactly this device's slots. A null hDevice would sweep the
         // KMD-owned ones, so the token is minted rather than cast.
         let device_owner = crate::virtio::gpu::DeviceOwner::new(owner);
-        // SAFETY: `DxgkDdiDestroyDevice` is documented "IRQL: PASSIVE_LEVEL" (WDK
-        // DXGKDDI_DESTROYDEVICE), and the unmap loop above already depends on it
-        // — `MmUnmapLockedPages` is PASSIVE-only, which is exactly why the table
-        // lock is dropped between batches.
-        let passive = unsafe { crate::irql::PassiveLevel::assume() };
         let blobs = crate::virtio::ctrl::release_blobs_for_owner(passive, adapter, device_owner);
         let contexts =
             crate::virtio::ctrl::destroy_contexts_for_owner(passive, adapter, device_owner);
