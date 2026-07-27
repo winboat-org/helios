@@ -9,7 +9,9 @@
 //! now (TODO: report via the device error callback) — a failed create leaves a
 //! null handle.
 
+mod alloc;
 mod handles;
+use alloc::{ScanoutGeometry, VenusBacking};
 use handles::{Boxed, Com, ComHandle, DdiHandle, Slot};
 
 use core::ffi::c_void;
@@ -1779,17 +1781,16 @@ unsafe fn allocate_wddm_resource(
     a: &ddi::D3D11DDIARG_CREATERESOURCE,
     mip0: &ddi::D3D10DDI_MIPINFO,
     h_rt: ddi::D3D10DDI_HRTRESOURCE,
-    backing_blob_id: u64,
-    backing_blob_size: u64,
-    backing_resource_id: u32,
-    venus_alloc_size: u64,
-    memory_type_index: u32,
+    // `Some` = venus-backed (the KMD adopts our allocation), `None` = plain
+    // KMD-backed standard allocation. This one `Option` replaces the three
+    // independent `backing_blob_id != 0` conjunctions.
+    backing: Option<VenusBacking>,
+    // Kept separate from `scanout` on purpose -- see alloc.rs.
     direct_scanout_primary: bool,
     // Scan-out primary metadata. LINEAR paths use the queried COLOR row pitch;
     // direct OPTIMAL uses a logical scanout stride while QEMU validates the
     // opaque allocation with its exact Vulkan allocation size.
-    scanout_pitch: u32,
-    scanout_offset: u64,
+    scanout: Option<ScanoutGeometry>,
 ) -> Result<(Option<ResidentAllocation>, ddi::D3DKMT_HANDLE), i32> {
     const DDI_BIND_PRESENT: u32 = 0x0000_0080;
 
@@ -1824,18 +1825,18 @@ unsafe fn allocate_wddm_resource(
     // A LINEAR scan-out primary reports its exact COLOR row pitch; use it verbatim so
     // `SET_SCANOUT_BLOB` reads rows at the true host stride instead of the
     // cross-adapter guess (a wrong stride shears the scanned-out image).
-    let pitch = if scanout_pitch != 0 {
-        scanout_pitch
-    } else {
-        pitch
+    let pitch = match scanout {
+        Some(g) => g.pitch.get(),
+        None => pitch,
     };
     let linear_size = (pitch as u64)
         .saturating_mul(mip0.TexelHeight.max(1) as u64)
         .max(4096);
-    let size = if backing_blob_id != 0 && backing_blob_size != 0 {
-        backing_blob_size
-    } else {
-        linear_size
+    // A live backing with a zero blob_size still falls back to the linear size:
+    // blob_id is the only field that gates a mode.
+    let size = match backing {
+        Some(b) if b.blob_size != 0 => b.blob_size,
+        _ => linear_size,
     };
 
     // pPrimaryDesc is the runtime's authoritative primary classification.
@@ -1853,16 +1854,16 @@ unsafe fn allocate_wddm_resource(
 
     let mut private = RuntimeAllocPrivate {
         alloc: HeliosWddmAllocPrivate::new(
-            if backing_blob_id != 0 {
+            if backing.is_some() {
                 HELIOS_WDDM_ALLOC_KIND_DEVICE_MEMORY
             } else {
                 HELIOS_WDDM_ALLOC_KIND_STANDARD
             },
             venus_ctx_id,
-            backing_blob_id,
+            backing.map_or(0, |b| b.blob_id.get()),
             size,
             VIRTIO_GPU_BLOB_MEM_HOST3D,
-            if backing_blob_id != 0 {
+            if backing.is_some() {
                 // DXVK render targets are normally backed by device-local Venus
                 // memory. virglrenderer rejects USE_MAPPABLE for non-host-visible
                 // memory ("mem cannot support mappable blob"). They still must
@@ -1876,11 +1877,7 @@ unsafe fn allocate_wddm_resource(
             // struct after construction because the constructor could not
             // express the field; it is a parameter now, so the record reaches
             // the kernel fully initialised by one expression. R805.
-            if backing_blob_id != 0 {
-                backing_resource_id
-            } else {
-                0
-            },
+            backing.map_or(0, |b| b.adopt_resource_id()),
         ),
         meta: HeliosWddmAllocMeta {
             width: mip0.TexelWidth,
@@ -1893,8 +1890,8 @@ unsafe fn allocate_wddm_resource(
             // adopted venus-backed resources (a cross-process opener must import
             // with them). Zero for KMD-backed standard allocations — the KMD
             // fills them at CreateAllocation from its kernel venus client.
-            venus_alloc_size,
-            memory_type_index,
+            venus_alloc_size: backing.map_or(0, |b| b.alloc_size),
+            memory_type_index: backing.map_or(0, |b| b.memory_type_index),
             // Carry the creator's EXACT DXGI format so a cross-process opener
             // rebuilds the image with the same bpp/layout instead of a squashed
             // BGRA (the `format` field below is a lossy D3DDDIFORMAT for the
@@ -1902,7 +1899,7 @@ unsafe fn allocate_wddm_resource(
             dxgi_format: a.Format as u32,
             // Scan-out primary's real memory-plane-0 offset (0 for everything
             // else); the KMD adds it to the blob base in SET_SCANOUT_BLOB.
-            plane_offset: scanout_offset,
+            plane_offset: scanout.map_or(0, |g| g.plane_offset),
         },
     };
     let pre_private_alloc = private.alloc;
@@ -1917,8 +1914,8 @@ unsafe fn allocate_wddm_resource(
             private.alloc.ctx_id,
             private.alloc.kind,
             private.alloc.size,
-            venus_alloc_size,
-            memory_type_index,
+            backing.map_or(0, |b| b.alloc_size),
+            backing.map_or(0, |b| b.memory_type_index),
             mip0.TexelWidth,
             mip0.TexelHeight,
             a.Format,
@@ -1973,7 +1970,7 @@ unsafe fn allocate_wddm_resource(
             alloc.PrivateDriverDataSize,
             size,
             pitch,
-            backing_blob_id,
+            backing.map_or(0, |b| b.blob_id.get()),
             private.alloc.adopt_resource_id,
             private.alloc.ctx_id,
             private.alloc.kind,
@@ -2066,8 +2063,7 @@ unsafe fn finish_wddm_tex2d(
     h_resource: ddi::D3D10DDI_HRESOURCE,
     res: ID3D11Resource,
     direct_scanout_primary: bool,
-    scanout_pitch: u32,
-    scanout_offset: u64,
+    scanout: Option<ScanoutGeometry>,
 ) {
     let (memory, memory_size, memory_offset, resource_id) = dxvk_resource_memory_info(h, &res);
     let (backing_blob_id, backing_blob_size, backing_resource_id) = if memory != 0
@@ -2114,19 +2110,21 @@ unsafe fn finish_wddm_tex2d(
             }
         }
     }
-    let (allocation, km_resource) = match allocate_wddm_resource(
-        h,
-        a,
-        mip0,
-        h_rt,
+    let backing = VenusBacking::new(
         backing_blob_id,
         backing_blob_size,
         backing_resource_id,
         venus_alloc_size,
         memory_type_index,
+    );
+    let (allocation, km_resource) = match allocate_wddm_resource(
+        h,
+        a,
+        mip0,
+        h_rt,
+        backing,
         direct_scanout_primary,
-        scanout_pitch,
-        scanout_offset,
+        scanout,
     ) {
         Ok(allocation) => allocation,
         Err(hr) => {
@@ -2164,22 +2162,24 @@ unsafe fn finish_wddm_tex2d(
     // Only the exact runtime-designated primary may identify itself through
     // PresentCb private data. Ordinary shared/pitched DWM sources are copied to
     // the KMD-owned LINEAR target and must use the identity-free refresh path.
-    let present_private =
-        if direct_scanout_primary && backing_resource_id != 0 && scanout_pitch != 0 {
-            HeliosPresentPrivateData {
-                plane_offset: scanout_offset,
-                magic: HELIOS_PRESENT_PRIVATE_MAGIC,
-                version: HELIOS_PRESENT_PRIVATE_VERSION,
-                resource_id: backing_resource_id,
-                width: mip0.TexelWidth,
-                height: mip0.TexelHeight,
-                pitch: scanout_pitch,
-                dxgi_format: a.Format as u32,
-                reserved: HELIOS_PRESENT_PRIVATE_FLAG_DIRECT_SCANOUT,
-            }
-        } else {
-            empty_present_private()
-        };
+    let present_private = match (
+        direct_scanout_primary,
+        core::num::NonZeroU32::new(backing_resource_id),
+        scanout,
+    ) {
+        (true, Some(resource_id), Some(geometry)) => HeliosPresentPrivateData {
+            plane_offset: geometry.plane_offset,
+            magic: HELIOS_PRESENT_PRIVATE_MAGIC,
+            version: HELIOS_PRESENT_PRIVATE_VERSION,
+            resource_id: resource_id.get(),
+            width: mip0.TexelWidth,
+            height: mip0.TexelHeight,
+            pitch: geometry.pitch.get(),
+            dxgi_format: a.Format as u32,
+            reserved: HELIOS_PRESENT_PRIVATE_FLAG_DIRECT_SCANOUT,
+        },
+        _ => empty_present_private(),
+    };
     let scanout_raw = res.as_raw() as usize;
     if RESOURCE_LOG_COUNT.first_n(128).is_some() {
         trace_line!(
@@ -2363,7 +2363,7 @@ unsafe extern "C" fn create_resource(
                 StructureByteStride: a.ByteStride,
             };
             let (allocation, km_resource) =
-                match allocate_wddm_resource(h, a, &mip0, h_rt, 0, 0, 0, 0, 0, false, 0, 0) {
+                match allocate_wddm_resource(h, a, &mip0, h_rt, None, false, None) {
                     Ok(allocation) => allocation,
                     Err(hr) => {
                         log_error!(
@@ -2518,7 +2518,16 @@ unsafe extern "C" fn create_resource(
                         mip0.TexelWidth, mip0.TexelHeight, a.Format, rp, off
                     );
                     let res = ID3D11Resource::from_raw(raw as *mut c_void);
-                    finish_wddm_tex2d(h, a, &mip0, h_rt, h_resource, res, true, rp as u32, off);
+                    finish_wddm_tex2d(
+                        h,
+                        a,
+                        &mip0,
+                        h_rt,
+                        h_resource,
+                        res,
+                        true,
+                        ScanoutGeometry::new(rp as u32, off),
+                    );
                 } else {
                     // Loud failure over fake success: do NOT fall back to a plain
                     // primary — that reintroduces the black scan-out as a "working"
@@ -2599,7 +2608,7 @@ unsafe extern "C" fn create_resource(
                     }
                 };
                 finish_create(h, created, res, |res| {
-                    finish_wddm_tex2d(h, a, &mip0, h_rt, h_resource, res, false, 0, 0);
+                    finish_wddm_tex2d(h, a, &mip0, h_rt, h_resource, res, false, None);
                 });
             }
         }
@@ -2659,7 +2668,7 @@ unsafe extern "C" fn create_resource(
             };
             finish_create(h, created, res, |res| {
                 let (allocation, km_resource) =
-                    match allocate_wddm_resource(h, a, &mip0, h_rt, 0, 0, 0, 0, 0, false, 0, 0) {
+                    match allocate_wddm_resource(h, a, &mip0, h_rt, None, false, None) {
                         Ok(allocation) => allocation,
                         Err(hr) => {
                             log_error!(
@@ -2746,7 +2755,7 @@ unsafe extern "C" fn create_resource(
                 // the last statement of create_resource, so that is the same
                 // exit it was before.
                 let (allocation, km_resource) =
-                    match allocate_wddm_resource(h, a, &mip0, h_rt, 0, 0, 0, 0, 0, false, 0, 0) {
+                    match allocate_wddm_resource(h, a, &mip0, h_rt, None, false, None) {
                         Ok(allocation) => allocation,
                         Err(hr) => {
                             log_error!(
