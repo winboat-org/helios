@@ -154,10 +154,10 @@ impl<'a, T: bytemuck::Pod> EscapeBuf<'a, T> {
 }
 
 /// The transport is gone (StopDevice tore it down). A real device-lost answer:
-/// `with_virtio` returns `DriverError::DeviceNotFound`, which maps to
+/// `with_virtio` returns `NotStarted`, which maps to
 /// STATUS_DEVICE_DOES_NOT_EXIST — not a content answer that reads as "nothing
 /// published yet".
-fn escape_device_gone(de: crate::error::DriverError) -> NTSTATUS {
+fn escape_device_gone(de: crate::error::NotStarted) -> NTSTATUS {
     ESCAPE_DEVICE_GONE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     de.into()
 }

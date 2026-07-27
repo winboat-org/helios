@@ -8,7 +8,11 @@ use crate::adapter::AdapterContext;
 use crate::dxgk::*;
 
 pub unsafe extern "C" fn dxgkddi_add_device(
-    physical_device_object: PDEVICE_OBJECT,
+    // The DDI hands us the PDO; nothing in this driver retains or uses it.
+    // Every path to the OS goes through the DXGKRNL_INTERFACE callback table
+    // saved at StartDevice. T6/R917 deleted the `AdapterContext::pdo` field
+    // that stored it and was never read.
+    _physical_device_object: PDEVICE_OBJECT,
     miniport_device_context: *mut *mut c_void,
 ) -> NTSTATUS {
     crate::kmsg(c"Helios: AddDevice\n");
@@ -28,7 +32,7 @@ pub unsafe extern "C" fn dxgkddi_add_device(
     // cannot move the context afterwards. The context is leaked to a raw
     // pointer; Dxgkrnl returns it to us on every DDI and we reclaim it in
     // DxgkDdiRemoveDevice.
-    let raw = AdapterContext::create(physical_device_object);
+    let raw = AdapterContext::create();
     // SAFETY: miniport_device_context is a valid out-pointer per the DDI contract.
     unsafe { *miniport_device_context = raw.as_ptr() as *mut c_void };
 

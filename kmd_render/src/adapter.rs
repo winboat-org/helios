@@ -20,7 +20,7 @@ use wdk_sys::ntddk::{
 use wdk_sys::{KDPC, KEVENT, KSPIN_LOCK, KTIMER, PHYSICAL_ADDRESS, PVOID};
 
 use crate::dxgk::*;
-use crate::error::DriverError;
+use crate::error::NotStarted;
 use crate::irql::PassiveLevel;
 use crate::virtio::VirtioGpu;
 use helios_kmd_logic::DisplayMode;
@@ -528,8 +528,6 @@ pub(crate) struct TransportGeneration {
 }
 
 pub struct AdapterContext {
-    /// Physical device object for the virtio-gpu device.
-    pub pdo: PDEVICE_OBJECT,
     /// Service-key knobs as read at **AddAdapter**, for the window before
     /// StartDevice has published its own snapshot.
     ///
@@ -850,7 +848,7 @@ impl WddmNotifyGuard<'_> {
     pub(crate) fn with_virtio<R>(
         &self,
         f: impl FnOnce(&NotifyOrdered<'_>, &mut VirtioGpu) -> R,
-    ) -> Result<R, DriverError> {
+    ) -> Result<R, NotStarted> {
         self.adapter.with_virtio(|v| {
             let order = NotifyOrdered { _lock: PhantomData };
             f(&order, v)
@@ -904,7 +902,7 @@ impl ScanoutGuard<'_> {
     pub(crate) fn with_venus_client<R>(
         &self,
         f: impl FnOnce(&mut crate::virtio::venus::VenusClient) -> R,
-    ) -> Result<R, DriverError> {
+    ) -> Result<R, NotStarted> {
         self.adapter.with_venus_client(self.passive, f)
     }
 
@@ -1109,7 +1107,7 @@ impl AdapterContext {
     /// headers can only be written once the context is at its final heap
     /// address. As two public steps, this compiled:
     ///
-    ///   let ctx = AdapterContext::new(pdo)?;
+    ///   let ctx = AdapterContext::new()?;
     ///   let boxed = Box::new(ctx);
     ///   /* no init_kernel_events */
     ///   *out = Box::into_raw(boxed);
@@ -1132,8 +1130,13 @@ impl AdapterContext {
     /// `Option` here would imply an allocation-failure path that does not exist.
     /// If one is wanted later that is a `Box::try_new` change, not a signature
     /// change now.
-    pub(crate) fn create(pdo: PDEVICE_OBJECT) -> NonNull<AdapterContext> {
-        let raw = Box::into_raw(Box::new(Self::new(pdo)));
+    ///
+    /// Takes no PDO. AddAdapter is handed one, and this context used to store
+    /// it in a `pub pdo` field that NOTHING ever read -- every path to the OS
+    /// goes through the `DXGKRNL_INTERFACE` callback table saved at
+    /// StartDevice, not through the device object. T6/R917.
+    pub(crate) fn create() -> NonNull<AdapterContext> {
+        let raw = Box::into_raw(Box::new(Self::new()));
         // Kernel dispatcher objects must be initialized at the context's FINAL
         // address — a KEVENT's header is self-referential.
         // SAFETY: `raw` is the final heap address, freshly allocated, and no
@@ -1145,9 +1148,8 @@ impl AdapterContext {
 
     /// Private: an `AdapterContext` by value is only ever a transient inside
     /// [`Self::create`], before the in-place dispatcher init runs.
-    fn new(pdo: PDEVICE_OBJECT) -> Self {
+    fn new() -> Self {
         Self {
-            pdo,
             // PASSIVE_LEVEL: `create` is called from AddAdapter. Read here so the
             // AddAdapter-time caps/segment queries — which run BEFORE
             // StartDevice — answer from the registry rather than from
@@ -2174,12 +2176,12 @@ impl AdapterContext {
         &self,
         _passive: PassiveLevel,
         f: impl FnOnce(&mut crate::virtio::venus::VenusClient) -> R,
-    ) -> Result<R, DriverError> {
+    ) -> Result<R, NotStarted> {
         self.acquire_venus_mutex();
         // SAFETY: the venus mutex gives exclusive access to the cell.
         let result = match unsafe { &mut *self.venus_client.get() } {
             Some(client) => Ok(f(client)),
-            None => Err(DriverError::DeviceNotFound),
+            None => Err(NotStarted),
         };
         self.release_venus_mutex();
         result
@@ -2270,8 +2272,8 @@ impl AdapterContext {
     }
 
     /// Borrow the Dxgkrnl interface, or fail if StartDevice has not run yet.
-    pub fn dxgkrnl(&self) -> Result<&DXGKRNL_INTERFACE, DriverError> {
-        self.dxgkrnl_opt().ok_or(DriverError::DeviceNotFound)
+    pub fn dxgkrnl(&self) -> Result<&DXGKRNL_INTERFACE, NotStarted> {
+        self.dxgkrnl_opt().ok_or(NotStarted)
     }
 
     /// The Dxgkrnl callback table, or `None` before StartDevice.
@@ -2450,13 +2452,13 @@ impl AdapterContext {
     /// DISPATCH_LEVEL (spinlock held): it must not allocate or call pageable code.
     /// Stage any payload (e.g. a Venus stream) into a `DmaBuffer` *before* calling
     /// this, then pass a slice of it into `f`.
-    pub fn with_virtio<R>(&self, f: impl FnOnce(&mut VirtioGpu) -> R) -> Result<R, DriverError> {
+    pub fn with_virtio<R>(&self, f: impl FnOnce(&mut VirtioGpu) -> R) -> Result<R, NotStarted> {
         // SAFETY: spinlock-guarded exclusive access to the cell's contents for the
         // duration of the critical section.
         let irql = unsafe { KeAcquireSpinLockRaiseToDpc(self.virtio_lock.get()) };
         let result = match unsafe { &mut *self.virtio.get() } {
             Some(v) => Ok(f(v)),
-            None => Err(DriverError::DeviceNotFound),
+            None => Err(NotStarted),
         };
         unsafe { KeReleaseSpinLock(self.virtio_lock.get(), irql) };
         result
