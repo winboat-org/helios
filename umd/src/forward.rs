@@ -3826,15 +3826,220 @@ unsafe extern "C" fn create_pixel_shader(
     }
 }
 
+/// Words per signature entry in the bridge wire layout.
+///
+/// The C++ decoder names the same stride once, as `kSigEntryWords`
+/// (`dxvk_bridge.cpp`), and length-validates every incoming block against it.
+/// This is the Rust-side half of that constant: it was previously a bare `5`
+/// spelled out in eight producer loops, three log dumps and one patch loop.
+const SIG_ENTRY_WORDS: usize = 5;
+
+/// One entry of a flattened shader signature, in the bridge's wire order.
+///
+/// The tessellation D3D11 (non-11.1) producer has no component type or stream
+/// — the older D3D10 entry shape does not carry them — and passes zeros so the
+/// bridge's DXBC writer takes its UNKNOWN-component fallback. That is the only
+/// legitimate zero pair; going through this constructor is what stops it being
+/// confused with a five-element literal that dropped a field.
+#[derive(Clone, Copy)]
+struct SigEntry {
+    sysval: u32,
+    register_: u32,
+    mask: u32,
+    comptype: u32,
+    stream: u32,
+}
+
+impl SigEntry {
+    fn as_words(self) -> [u32; SIG_ENTRY_WORDS] {
+        [
+            self.sysval,
+            self.register_,
+            self.mask,
+            self.comptype,
+            self.stream,
+        ]
+    }
+}
+
+/// Which header a flattened signature block carries.
+///
+/// The two shapes are NOT interchangeable and the arity is the whole hazard:
+/// the stage block is `[n_in, n_out, entries…]` (validated in the bridge at
+/// `sig_words_len == 2 + (n_in + n_out) * kSigEntryWords`), the tessellation
+/// block is `[n_in, n_out, n_patch, entries…]` (`3 + …`). Reading a tess block
+/// with the 2-word accessors silently returns `n_patch` as the first entry's
+/// system value. Making the header a constructor choice is what removes that.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SigHeader {
+    Stage,
+    Tess,
+}
+
+impl SigHeader {
+    const fn words(self) -> usize {
+        match self {
+            SigHeader::Stage => 2,
+            SigHeader::Tess => 3,
+        }
+    }
+}
+
+/// A borrowed flattened signature block: a header of counts followed by
+/// fixed-width entries. The read side of the layout, shared by the log dumps
+/// and the input-variant patcher.
+#[derive(Clone, Copy)]
+struct SigBlock<'a> {
+    words: &'a [u32],
+    header: SigHeader,
+}
+
+impl<'a> SigBlock<'a> {
+    /// A `[n_in, n_out, …]` block. `None` if the header itself is missing.
+    fn stage(words: &'a [u32]) -> Option<Self> {
+        Self::new(words, SigHeader::Stage)
+    }
+
+    /// A `[n_in, n_out, n_patch, …]` block. `None` if the header is missing.
+    fn tess(words: &'a [u32]) -> Option<Self> {
+        Self::new(words, SigHeader::Tess)
+    }
+
+    fn new(words: &'a [u32], header: SigHeader) -> Option<Self> {
+        (words.len() >= header.words()).then_some(Self { words, header })
+    }
+
+    fn n_in(self) -> usize {
+        self.words[0] as usize
+    }
+
+    fn n_out(self) -> usize {
+        self.words[1] as usize
+    }
+
+    /// `None` on a stage block, which has no patch-constant group.
+    fn n_patch(self) -> Option<usize> {
+        match self.header {
+            SigHeader::Stage => None,
+            SigHeader::Tess => Some(self.words[2] as usize),
+        }
+    }
+
+    /// Entry `i` of the group that starts after `preceding` entries, or `None`
+    /// if the block is shorter than its header claims. Never a partial entry.
+    fn entry(self, preceding: usize, i: usize) -> Option<SigEntry> {
+        let base = entry_base(self.header, preceding, i);
+        let w = self.words.get(base..base + SIG_ENTRY_WORDS)?;
+        Some(SigEntry {
+            sysval: w[0],
+            register_: w[1],
+            mask: w[2],
+            comptype: w[3],
+            stream: w[4],
+        })
+    }
+
+    fn input(self, i: usize) -> Option<SigEntry> {
+        self.entry(0, i)
+    }
+}
+
+/// Word index of entry `i` of the group that starts after `preceding` entries.
+///
+/// The `2 + i * 5` / `3 + (n_in + i) * 5` arithmetic, once.
+fn entry_base(header: SigHeader, preceding: usize, i: usize) -> usize {
+    header.words() + (preceding + i) * SIG_ENTRY_WORDS
+}
+
+/// An owned flattened signature block. Holds the exact `Vec<u32>` handed across
+/// the cxx bridge.
+struct SigWords {
+    words: Vec<u32>,
+    header: SigHeader,
+}
+
+impl SigWords {
+    /// `[n_in, n_out]`, the >=11.1 stage-shader header.
+    fn stage(n_in: u32, n_out: u32) -> Self {
+        Self {
+            words: vec![n_in, n_out],
+            header: SigHeader::Stage,
+        }
+    }
+
+    /// `[n_in, n_out, n_patch]`, the tessellation header.
+    fn tess(n_in: u32, n_out: u32, n_patch: u32) -> Self {
+        Self {
+            words: vec![n_in, n_out, n_patch],
+            header: SigHeader::Tess,
+        }
+    }
+
+    /// Re-adopt a stage block previously produced by [`SigWords::stage`] and
+    /// stored as raw words (`ia.vs_sig_words`).
+    fn adopt_stage(words: Vec<u32>) -> Option<Self> {
+        (words.len() >= SigHeader::Stage.words()).then_some(Self {
+            words,
+            header: SigHeader::Stage,
+        })
+    }
+
+    fn push(&mut self, entry: SigEntry) {
+        self.words.extend_from_slice(&entry.as_words());
+    }
+
+    fn block(&self) -> SigBlock<'_> {
+        SigBlock {
+            words: &self.words,
+            header: self.header,
+        }
+    }
+
+    fn n_in(&self) -> usize {
+        self.block().n_in()
+    }
+
+    /// Overwrite input entry `i`'s component type. Returns false if the block
+    /// is too short, which the caller treats as "leave it alone".
+    fn set_input_comptype(&mut self, i: usize, comptype: u32) -> bool {
+        let base = entry_base(self.header, 0, i);
+        match self.words.get_mut(base + 3) {
+            Some(slot) => {
+                *slot = comptype;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Replace the whole input group, keeping the groups that follow it. Used
+    /// when a shader arrived through the legacy untyped create and its inputs
+    /// must be synthesized wholesale from the bound layout.
+    fn replace_inputs(&mut self, entries: &[SigEntry]) {
+        let header = self.header.words();
+        let old_end = (header + self.n_in() * SIG_ENTRY_WORDS).min(self.words.len());
+        let tail = self.words.split_off(old_end);
+        self.words.truncate(header);
+        self.words[0] = entries.len() as u32;
+        for e in entries {
+            self.words.extend_from_slice(&e.as_words());
+        }
+        self.words.extend_from_slice(&tail);
+    }
+
+    fn into_words(self) -> Vec<u32> {
+        self.words
+    }
+}
+
 /// Flatten a >=11.1 typed signature block into the bridge wire layout:
 /// [n_in, n_out, (sysval, register, mask, comptype, stream) x n_in, same x
 /// n_out]. The ENTRY2 arm is the one the >=11.1 runtime fills.
 unsafe fn flatten_stage_io_signatures(
     sig: *const ddi::D3D11_1DDIARG_STAGE_IO_SIGNATURES,
 ) -> Vec<u32> {
-    let mut words = vec![0u32, 0u32];
     if sig.is_null() {
-        return words;
+        return SigWords::stage(0, 0).into_words();
     }
     let s = &*sig;
     let p_in = s.__bindgen_anon_1.pInputSignature;
@@ -3849,29 +4054,28 @@ unsafe fn flatten_stage_io_signatures(
     } else {
         s.NumOutputSignatureEntries
     };
-    words[0] = n_in;
-    words[1] = n_out;
+    let mut words = SigWords::stage(n_in, n_out);
     for i in 0..n_in as usize {
         let e = &*p_in.add(i);
-        words.extend_from_slice(&[
-            e.SystemValue as u32,
-            e.Register,
-            e.Mask as u32,
-            e.RegisterComponentType as u32,
-            e.Stream as u32,
-        ]);
+        words.push(SigEntry {
+            sysval: e.SystemValue as u32,
+            register_: e.Register,
+            mask: e.Mask as u32,
+            comptype: e.RegisterComponentType as u32,
+            stream: e.Stream as u32,
+        });
     }
     for i in 0..n_out as usize {
         let e = &*p_out.add(i);
-        words.extend_from_slice(&[
-            e.SystemValue as u32,
-            e.Register,
-            e.Mask as u32,
-            e.RegisterComponentType as u32,
-            e.Stream as u32,
-        ]);
+        words.push(SigEntry {
+            sysval: e.SystemValue as u32,
+            register_: e.Register,
+            mask: e.Mask as u32,
+            comptype: e.RegisterComponentType as u32,
+            stream: e.Stream as u32,
+        });
     }
-    words
+    words.into_words()
 }
 
 /// Flatten a D3D11 tessellation signature block into the bridge wire layout:
@@ -3882,9 +4086,8 @@ unsafe fn flatten_stage_io_signatures(
 unsafe fn flatten_tess_io_signatures(
     sig: *const ddi::D3D11DDIARG_TESSELLATION_IO_SIGNATURES,
 ) -> Vec<u32> {
-    let mut words = vec![0u32, 0u32, 0u32];
     if sig.is_null() {
-        return words;
+        return SigWords::tess(0, 0, 0).into_words();
     }
     let s = &*sig;
     let p_in = s.pInputSignature;
@@ -3905,22 +4108,26 @@ unsafe fn flatten_tess_io_signatures(
     } else {
         s.NumPatchConstantSignatureEntries
     };
-    words[0] = n_in;
-    words[1] = n_out;
-    words[2] = n_patch;
+    // The D3D10 entry shape carries no component type and no stream: zeros here
+    // are the documented UNKNOWN-component fallback, not dropped fields.
+    let d3d10_entry = |e: &ddi::D3D10DDIARG_SIGNATURE_ENTRY| SigEntry {
+        sysval: e.SystemValue as u32,
+        register_: e.Register,
+        mask: e.Mask as u32,
+        comptype: 0,
+        stream: 0,
+    };
+    let mut words = SigWords::tess(n_in, n_out, n_patch);
     for i in 0..n_in as usize {
-        let e = &*p_in.add(i);
-        words.extend_from_slice(&[e.SystemValue as u32, e.Register, e.Mask as u32, 0, 0]);
+        words.push(d3d10_entry(&*p_in.add(i)));
     }
     for i in 0..n_out as usize {
-        let e = &*p_out.add(i);
-        words.extend_from_slice(&[e.SystemValue as u32, e.Register, e.Mask as u32, 0, 0]);
+        words.push(d3d10_entry(&*p_out.add(i)));
     }
     for i in 0..n_patch as usize {
-        let e = &*p_patch.add(i);
-        words.extend_from_slice(&[e.SystemValue as u32, e.Register, e.Mask as u32, 0, 0]);
+        words.push(d3d10_entry(&*p_patch.add(i)));
     }
-    words
+    words.into_words()
 }
 
 /// Flatten a >=11.1 tessellation signature block into the bridge wire layout:
@@ -3930,9 +4137,8 @@ unsafe fn flatten_tess_io_signatures(
 unsafe fn flatten_tess_io_signatures_11_1(
     sig: *const ddi::D3D11_1DDIARG_TESSELLATION_IO_SIGNATURES,
 ) -> Vec<u32> {
-    let mut words = vec![0u32, 0u32, 0u32];
     if sig.is_null() {
-        return words;
+        return SigWords::tess(0, 0, 0).into_words();
     }
     let s = &*sig;
     let p_in = s.__bindgen_anon_1.pInputSignature;
@@ -3953,66 +4159,46 @@ unsafe fn flatten_tess_io_signatures_11_1(
     } else {
         s.NumPatchConstantSignatureEntries
     };
-    words[0] = n_in;
-    words[1] = n_out;
-    words[2] = n_patch;
+    let entry_11_1 = |e: &ddi::D3D11_1DDIARG_SIGNATURE_ENTRY2| SigEntry {
+        sysval: e.SystemValue as u32,
+        register_: e.Register,
+        mask: e.Mask as u32,
+        comptype: e.RegisterComponentType as u32,
+        stream: e.Stream as u32,
+    };
+    let mut words = SigWords::tess(n_in, n_out, n_patch);
     for i in 0..n_in as usize {
-        let e = &*p_in.add(i);
-        words.extend_from_slice(&[
-            e.SystemValue as u32,
-            e.Register,
-            e.Mask as u32,
-            e.RegisterComponentType as u32,
-            e.Stream as u32,
-        ]);
+        words.push(entry_11_1(&*p_in.add(i)));
     }
     for i in 0..n_out as usize {
-        let e = &*p_out.add(i);
-        words.extend_from_slice(&[
-            e.SystemValue as u32,
-            e.Register,
-            e.Mask as u32,
-            e.RegisterComponentType as u32,
-            e.Stream as u32,
-        ]);
+        words.push(entry_11_1(&*p_out.add(i)));
     }
     for i in 0..n_patch as usize {
-        let e = &*p_patch.add(i);
-        words.extend_from_slice(&[
-            e.SystemValue as u32,
-            e.Register,
-            e.Mask as u32,
-            e.RegisterComponentType as u32,
-            e.Stream as u32,
-        ]);
+        words.push(entry_11_1(&*p_patch.add(i)));
     }
-    words
+    words.into_words()
 }
 
 unsafe fn log_tess_sig_summary(name: &str, sig_words: &[u32]) {
-    if sig_words.len() < 3 {
+    let Some(block) = SigBlock::tess(sig_words) else {
         return;
-    }
-    let n_in = sig_words[0] as usize;
-    let n_out = sig_words[1] as usize;
-    let n_patch = sig_words[2] as usize;
+    };
+    let n_in = block.n_in();
+    let n_out = block.n_out();
+    let n_patch = block.n_patch().unwrap_or(0);
     let mut dump = format!("DDI {name} tess sig counts: in={n_in} out={n_out} patch={n_patch}");
-    let groups = [
-        ("i", 3usize, n_in),
-        ("o", 3usize + n_in * 5, n_out),
-        ("p", 3usize + (n_in + n_out) * 5, n_patch),
-    ];
-    for (tag, start, count) in groups {
+    for (tag, count, preceding) in [
+        ("i", n_in, 0usize),
+        ("o", n_out, n_in),
+        ("p", n_patch, n_in + n_out),
+    ] {
         for i in 0..count.min(4) {
-            let base = start + i * 5;
-            if base + 2 >= sig_words.len() {
+            let Some(e) = block.entry(preceding, i) else {
                 break;
-            }
+            };
             dump.push_str(&format!(
                 " {tag}[r{} m0x{:x} sv{}]",
-                sig_words[base + 1],
-                sig_words[base + 2],
-                sig_words[base]
+                e.register_, e.mask, e.sysval
             ));
         }
     }
@@ -4050,16 +4236,14 @@ unsafe fn create_shader_11_1_common(
         // entry's (register, mask, component type) — comptype 0 (UNKNOWN)
         // falls back to float32 in the bridge, which is UB against SINT
         // vertex formats.
-        let n_in = sig_words[0] as usize;
+        let block = SigBlock::stage(&sig_words);
+        let n_in = block.map_or(0, |b| b.n_in());
         let mut dump = format!("DDI {name} sig entries:");
         for i in 0..n_in.min(8) {
-            let base = 2 + i * 5;
-            dump.push_str(&format!(
-                " [r{} m0x{:x} t{}]",
-                sig_words[base + 1],
-                sig_words[base + 2],
-                sig_words[base + 3]
-            ));
+            let Some(e) = block.and_then(|b| b.input(i)) else {
+                break;
+            };
+            dump.push_str(&format!(" [r{} m0x{:x} t{}]", e.register_, e.mask, e.comptype));
         }
         log_error!("{dump}");
     }
@@ -7722,36 +7906,44 @@ unsafe fn create_vs_input_variant(
             .vs_sig_words
             .get(&vp)
             .cloned()
-            .unwrap_or_else(|| vec![0u32, 0u32]);
+            .and_then(SigWords::adopt_stage)
+            .unwrap_or_else(|| SigWords::stage(0, 0));
         (b.clone(), w)
     };
 
-    let n_in = words[0] as usize;
+    let n_in = words.n_in();
     if n_in > 0 {
         // Patch the DDI-provided entries' component types from the layout.
         for i in 0..n_in {
-            let base = 2 + i * 5;
-            let reg = words[base + 1];
-            if let Some(&(_, class, _)) = classes.iter().find(|c| c.0 == reg) {
-                words[base + 3] = class;
-            } else if words[base + 3] == 0 {
-                words[base + 3] = 3;
-            }
+            let Some(e) = words.block().input(i) else {
+                break;
+            };
+            let class = match classes.iter().find(|c| c.0 == e.register_) {
+                Some(&(_, class, _)) => class,
+                None if e.comptype == 0 => 3,
+                None => continue,
+            };
+            words.set_input_comptype(i, class);
         }
     } else {
         // Shader arrived through the legacy untyped create: synthesize the
         // input entries wholesale from the layout (extra entries for unused
         // registers are declared-then-eliminated by the compiler).
-        let n_out = words[1];
-        let out_words = words.split_off(2);
-        words = vec![classes.len() as u32, n_out];
-        for &(reg, class, mask) in classes {
-            words.extend_from_slice(&[0, reg, mask, class, 0]);
-        }
-        words.extend_from_slice(&out_words);
+        let synthesized: Vec<SigEntry> = classes
+            .iter()
+            .map(|&(reg, class, mask)| SigEntry {
+                sysval: 0,
+                register_: reg,
+                mask,
+                comptype: class,
+                stream: 0,
+            })
+            .collect();
+        words.replace_inputs(&synthesized);
     }
 
     let dxvk = &dev.dxvk;
+    let words = words.into_words();
     let raw = dxvk.create_shader_sig(
         0,
         bytecode.as_ptr(),
