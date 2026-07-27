@@ -173,7 +173,6 @@ const QUEUE_FAMILY_IGNORED: u32 = u32::MAX;
 const QUEUE_FAMILY_EXTERNAL: u32 = u32::MAX - 1;
 // Kept for the older diagnostic call sites. Its numeric value has always been
 // VK_QUEUE_FAMILY_EXTERNAL (`~1U`), despite the historical name.
-const QUEUE_FAMILY_FOREIGN_EXT: u32 = u32::MAX - 1;
 const COMMAND_BUFFER_LEVEL_PRIMARY: u32 = 0;
 const COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT: u32 = 0x0000_0001;
 const COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE: u32 = 0x0000_0004;
@@ -1187,10 +1186,19 @@ impl<'a> ReplyReader<'a> {
 struct VenusRing {
     /// Guest-assigned ring handle token (reused everywhere the ring is named).
     ring_id: u64,
-    /// Ring shmem blob resource id (for unref on teardown).
+    /// Ring shmem blob resource id.
+    ///
+    /// ⚠ NOT consumed by any teardown. The doc used to say "for unref on
+    /// teardown" and no unref exists -- T6/R916 chose to correct the claim
+    /// rather than delete the field, because the id is the only in-driver
+    /// record of which host resource backs the ring and a future teardown
+    /// needs it. It is kept as documentation-only state, and saying so is the
+    /// point: a field that promises a lifecycle it does not implement is worse
+    /// than one that admits it.
     #[allow(dead_code)]
     ring_res_id: u32,
-    /// Reply shmem blob resource id (for unref on teardown).
+    /// Reply shmem blob resource id. Unlike `ring_res_id` this one IS read --
+    /// `VkCommandStreamDescriptionMESA.resourceId` names it on every submit.
     reply_res_id: u32,
     /// Kernel mapping of the ring shmem.
     ring_map: RingMap,
@@ -1201,7 +1209,6 @@ struct VenusRing {
     /// Monotonic notify seqno.
     notify_seqno: u32,
     /// Monotonic virtqueue roundtrip seqno (for the reply-shmem warm-up).
-    roundtrip_seqno: u64,
     /// Next guest-assigned Vulkan handle id. `NonZeroU64` because 0 is
     /// `VK_NULL_HANDLE`: it is the value the handle newtypes exist to keep out
     /// of the wire stream, so the counter must not be able to produce it.
@@ -1376,7 +1383,6 @@ impl VenusRing {
     }
 
     /// Issue a command WITHOUT a reply through the ring: write → publish → wait.
-    #[allow(dead_code)]
     fn ring_command_noreply(
         &mut self,
         adapter: &AdapterContext,
@@ -1429,24 +1435,6 @@ impl VenusRing {
         Ok(())
     }
 
-    /// Warm up the reply shmem so the host maps it before the first reply: a
-    /// virtqueue-seqno submit + wait roundtrip (`vkSubmit/WaitVirtqueueSeqnoMESA`,
-    /// both direct). seqno is monotonic from 1.
-    #[allow(dead_code)]
-    fn reply_shmem_roundtrip(&mut self, adapter: &AdapterContext) -> Result<(), VirtioError> {
-        self.roundtrip_seqno += 1;
-        let seqno = self.roundtrip_seqno;
-        let mut sub = Writer::new();
-        sub.header(CMD_SUBMIT_VIRTQUEUE_SEQNO_MESA, 0);
-        sub.u64(self.ring_id);
-        sub.u64(seqno);
-        self.submit_direct(adapter, sub.as_slice()?)?;
-
-        let mut wait = Writer::new();
-        wait.header(CMD_WAIT_VIRTQUEUE_SEQNO_MESA, 0);
-        wait.u64(seqno);
-        self.submit_direct(adapter, wait.as_slice()?)
-    }
 }
 
 /// Bring-up stage 2: an instance and a physical device exist on the ring.
@@ -1492,10 +1480,8 @@ pub struct VenusClient {
     /// worker outside the mutex.
     probe_pending: Option<(PresentBufferDesc, u64)>,
     /// venus instance handle.
-    #[allow(dead_code)]
     instance_id: NonZeroU64,
     /// venus physical-device handle.
-    #[allow(dead_code)]
     phys_dev_id: NonZeroU64,
     /// venus device handle. Not `Option`: a `VenusClient` without a device is
     /// unrepresentable, which is the whole point of the typestate.
@@ -1533,7 +1519,6 @@ pub struct VenusClient {
     /// later copy execute after it.
     copy_target_image_id: Option<VkImageId>,
     copy_target_init_pool_id: Option<VkCommandPoolId>,
-    copy_target_init_command_buffer_id: Option<VkCommandBufferId>,
     /// App/DWM BLT imports and recorded copies. Both vectors are preallocated
     /// and capacity-bounded. Every access is serialized by
     /// AdapterContext::with_venus_client, so setup/submission/teardown cannot
@@ -3218,7 +3203,6 @@ impl VenusClient {
             // WRITE-ONLY, see T6/k-venus-17: destroying the pool already freed
             // its command buffer, so this field has no reader. Cleared here for
             // consistency rather than given an invented read.
-            self.copy_target_init_command_buffer_id = None;
             crate::diag::record_named_bytes(b"CpTgtSw", target_image_id.get() as u32);
             // Fall through to the normal first-time setup below.
         }
@@ -3271,7 +3255,6 @@ impl VenusClient {
         // destroying a possibly-pending command buffer is not.
         self.copy_target_image_id = Some(target_image_id);
         self.copy_target_init_pool_id = Some(pool_id);
-        self.copy_target_init_command_buffer_id = Some(command_buffer_id);
         self.queue_submit_command_buffer(adapter, command_buffer_id, None)
     }
 
@@ -5136,7 +5119,6 @@ impl VenusRing {
             reply_map,
             cur: 0,
             notify_seqno: 0,
-            roundtrip_seqno: 0,
             next_handle: NonZeroU64::MIN,
             ctx_id,
             passive,
@@ -5435,7 +5417,6 @@ impl VenusInstance {
             memory_type_count,
             copy_target_image_id: None,
             copy_target_init_pool_id: None,
-            copy_target_init_command_buffer_id: None,
             present_images: Vec::with_capacity(MAX_PRESENT_IMAGES),
             present_buffers: Vec::with_capacity(MAX_PRESENT_BUFFERS),
             present_blits: Vec::with_capacity(MAX_PRESENT_BLITS),
