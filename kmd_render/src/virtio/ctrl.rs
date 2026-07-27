@@ -1058,6 +1058,50 @@ pub fn submit_venus_async(
     }
 }
 
+/// The prologue both per-frame display submitters share: refuse an empty
+/// stream, reap parked buffers, and stage the meta + venus DMA buffers.
+///
+/// R1004. `submit_venus_async_scanout` and `submit_venus_async_present` were
+/// identical apart from which enqueue entry point they called.
+///
+/// ⚠ NOTE THE DIVERGENCE THIS MAKES VISIBLE, and does NOT change: unlike
+/// `submit_venus_async` (the escape path), neither display submitter uses the
+/// DMA POOL -- `DmaBuffer::new` allocates contiguous memory PER FRAME on both.
+/// Switching them onto `take_dma_buffer` is a perf change with its own gate and
+/// is explicitly out of scope here; what this commit buys is that the policy is
+/// now stated in one place instead of inferred from two.
+fn stage_display_submit(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    stream: &[u8],
+) -> Result<(DmaBuffer, DmaBuffer, usize), VirtioError> {
+    if stream.is_empty() {
+        return Err(VirtioError::DeviceError);
+    }
+    reap_parked(passive, adapter);
+    let meta = DmaBuffer::new(passive, SUBMIT_META_BYTES).ok_or(VirtioError::OutOfMemory)?;
+    let mut venus = DmaBuffer::new(passive, stream.len()).ok_or(VirtioError::OutOfMemory)?;
+    venus.as_mut_slice()[..stream.len()].copy_from_slice(stream);
+    Ok((meta, venus, stream.len()))
+}
+
+/// The outcome mapping both display submitters share: a transport-gone outer
+/// error and a per-enqueue inner error are distinct, and the handed-back
+/// buffers are dropped at PASSIVE.
+///
+/// Neither path retries. That is deliberate and unchanged: one enqueue attempt
+/// either succeeds or reports QueueFull to the caller, which keeps
+/// SetVidPnSourceAddress out of a hidden multi-second retry loop.
+fn display_submit_outcome(
+    queued: Result<Result<u64, (DmaBuffer, DmaBuffer, VirtioError)>, crate::error::NotStarted>,
+) -> Result<u64, VirtioError> {
+    match queued {
+        Ok(Ok(fence_id)) => Ok(fence_id),
+        Ok(Err((_meta, _venus, e))) => Err(e),
+        Err(_) => Err(VirtioError::DeviceError),
+    }
+}
+
 /// Nonblocking KMD scanout-copy submission. `stream` is the already encoded
 /// Venus vkQueueSubmit command; the outer virtio SUBMIT_3D is fenced on
 /// ring_idx=1, whose used-ring completion represents GPU completion. Only a
@@ -1075,28 +1119,16 @@ pub fn submit_venus_async_scanout(
     primary_address: u64,
     ticket: crate::adapter::ProgrammingTicket,
 ) -> Result<u64, VirtioError> {
-    if stream.is_empty() {
-        return Err(VirtioError::DeviceError);
-    }
-    reap_parked(passive, adapter);
-    let meta = DmaBuffer::new(passive, SUBMIT_META_BYTES).ok_or(VirtioError::OutOfMemory)?;
-    let mut venus = DmaBuffer::new(passive, stream.len()).ok_or(VirtioError::OutOfMemory)?;
-    venus.as_mut_slice()[..stream.len()].copy_from_slice(stream);
-    let venus_len = stream.len();
+    let (meta, venus, venus_len) = stage_display_submit(passive, adapter, stream)?;
     // One construction site, on the adapter, so all four pointers necessarily
     // come from the same adapter; and `enqueue_scanout_submit` is the only way
     // to attach it, so it necessarily lands on the ring the drain honours.
     let notify = adapter.scanout_notify(primary_address, ticket);
 
-    let queued = adapter.with_virtio(move |v| {
+    display_submit_outcome(adapter.with_virtio(move |v| {
         v.drain_used();
         v.enqueue_scanout_submit(ctx_id, meta, venus, venus_len, notify)
-    });
-    match queued {
-        Ok(Ok(fence_id)) => Ok(fence_id),
-        Ok(Err((_meta, _venus, e))) => Err(e),
-        Err(_) => Err(VirtioError::DeviceError),
-    }
+    }))
 }
 
 /// Nonblocking KMD Present-BLT submission.
@@ -1110,24 +1142,16 @@ pub fn submit_venus_async_present(
     ctx_id: u32,
     stream: &[u8],
 ) -> Result<u64, VirtioError> {
-    if stream.is_empty() {
-        return Err(VirtioError::DeviceError);
-    }
-    reap_parked(passive, adapter);
-    let meta = DmaBuffer::new(passive, SUBMIT_META_BYTES).ok_or(VirtioError::OutOfMemory)?;
-    let mut venus = DmaBuffer::new(passive, stream.len()).ok_or(VirtioError::OutOfMemory)?;
-    venus.as_mut_slice()[..stream.len()].copy_from_slice(stream);
-    let venus_len = stream.len();
+    let (meta, venus, venus_len) = stage_display_submit(passive, adapter, stream)?;
 
-    let queued = adapter.with_virtio(move |v| {
+    // Ring 1 WITHOUT a notify, which is the whole difference from the scanout
+    // path above: used-ring retirement still represents GPU completion, but an
+    // ordinary app/DWM BLT must not mark the physical scanout dirty or wake the
+    // display refresh worker.
+    display_submit_outcome(adapter.with_virtio(move |v| {
         v.drain_used();
         v.enqueue_async_submit(ctx_id, crate::virtio::gpu::SCANOUT_RING_IDX, meta, venus, venus_len)
-    });
-    match queued {
-        Ok(Ok(fence_id)) => Ok(fence_id),
-        Ok(Err((_meta, _venus, e))) => Err(e),
-        Err(_) => Err(VirtioError::DeviceError),
-    }
+    }))
 }
 
 /// Outcome of a [`wait_fence`] call.

@@ -1642,6 +1642,89 @@ impl VirtioGpu {
     /// (one contiguous DMA buffer); the entry owns it until completion. The
     /// waiter's block is signaled (resp copied in) by [`Self::drain_used`].
     /// On `QueueFull` the buffer is handed back for a PASSIVE retry.
+    /// The device-facing half of every enqueue: the corruption latch, the
+    /// capacity gate, the descriptor spans, and `control.add` with its two
+    /// distinct failure arms.
+    ///
+    /// R1005. All three entry points repeated this verbatim -- the `failed`
+    /// check, `inflight.len() >= MAX_INFLIGHT || parked.len() >=
+    /// PARKED_ENQUEUE_GATE` with its QUEUE_FULL_RETRIES bump, the
+    /// `chain.spans(..)` refusal, and the `QueueFull` vs corruption-latch split
+    /// on `add`.
+    ///
+    /// The DmaBuffers are BORROWED, not consumed: the three entry points hand
+    /// them back to their callers in two different tuple shapes
+    /// (`(DmaBuffer, VirtioError)` and `(DmaBuffer, DmaBuffer, VirtioError)`),
+    /// and threading that through a shared signature would need either a panic
+    /// or a third shape nobody wants. Each caller keeps ownership and maps this
+    /// bare `VirtioError` into its own tuple.
+    ///
+    /// # Safety of the spans
+    /// The device-visible slices handed to `control.add` alias `meta`/`venus`,
+    /// which the caller moves into the `InFlight` entry on the success path;
+    /// the entry owns them until the matching `pop_used`. Moving a `DmaBuffer`
+    /// moves the owning struct, not the DMA bytes. The borrows end at `add`.
+    fn enqueue_core(
+        &mut self,
+        chain: Chain,
+        meta: &DmaBuffer,
+        venus: Option<&DmaBuffer>,
+        resp_len: usize,
+    ) -> Result<u16, VirtioError> {
+        if self.failed {
+            return Err(VirtioError::DeviceError);
+        }
+        if self.inflight.len() >= MAX_INFLIGHT || self.parked.len() >= PARKED_ENQUEUE_GATE {
+            QUEUE_FULL_RETRIES.fetch_add(1, Ordering::Relaxed);
+            return Err(VirtioError::QueueFull);
+        }
+        let Some((reads, count, resp)) = chain.spans(meta, venus, resp_len) else {
+            return Err(VirtioError::DeviceError);
+        };
+        // SAFETY: see the function's Safety note.
+        let added = unsafe {
+            let reads = [reads[0].as_slice(), reads[1].as_slice()];
+            self.control.add(&reads[..count], &mut [resp.as_mut_slice()])
+        };
+        match added {
+            Ok(token) => Ok(token),
+            Err(virtio_drivers::Error::QueueFull) => {
+                QUEUE_FULL_RETRIES.fetch_add(1, Ordering::Relaxed);
+                Err(VirtioError::QueueFull)
+            }
+            Err(_) => {
+                self.failed = true;
+                Err(VirtioError::DeviceError)
+            }
+        }
+    }
+
+    /// Publish the in-flight entry, THEN ring the device doorbell.
+    ///
+    /// R1005, and k-gputransport-17. The order is the point, and it was not
+    /// uniform: `enqueue_async_control` and `enqueue_submit_inner` pushed first
+    /// and notified last, each carrying a comment about a fast host completing
+    /// into the ISR/DPC on another CPU -- while `enqueue_sync` notified FIRST
+    /// and pushed afterwards. A rule stated in prose, in two copies, and
+    /// violated in the third.
+    ///
+    /// The comment was also misstated. The hazard it describes is not live:
+    /// `drain_used` is the only used-ring consumer and every one of its call
+    /// sites runs inside `adapter.with_virtio`, so it takes the same spinlock
+    /// this call is already holding and cannot interleave between the doorbell
+    /// and the push. THE REAL INVARIANT is that the token must be in `inflight`
+    /// before this spinlock is released. Having one implementation makes that
+    /// structural instead of repeated, so a future change that moves
+    /// `drain_used` off `virtio_lock` cannot reintroduce the race in exactly
+    /// one of three places.
+    fn publish_then_notify(&mut self, entry: InFlight) {
+        self.inflight.push(entry);
+        bump_high_water(&INFLIGHT_HIGH_WATER, self.inflight.len());
+        if self.control.should_notify() {
+            self.transport.notify(CTRL_QUEUE);
+        }
+    }
+
     pub fn enqueue_sync(
         &mut self,
         meta: DmaBuffer,
@@ -1650,9 +1733,6 @@ impl VirtioGpu {
         resp_len: usize,
         waiter: NonNull<SyncWaitBlock>,
     ) -> Result<SyncTicket, (DmaBuffer, VirtioError)> {
-        if self.failed {
-            return Err((meta, VirtioError::DeviceError));
-        }
         // The shape is decided ONCE, here, and carried on the entry; the drain
         // no longer re-derives it from `in1_len > 0`.
         let chain = if in1_len > 0 {
@@ -1664,39 +1744,18 @@ impl VirtioGpu {
         // check did: a malformed request must report DeviceError even when the
         // queue also happens to be full. The `t <= meta.as_slice().len()` test
         // this replaces now lives in DmaBuffer::span, per span rather than on
-        // the sum.
+        // the sum. `enqueue_core` re-checks `failed` first, as this path did.
         if in0_len == 0 || resp_len == 0 || resp_len > SYNC_RESP_MAX {
             return Err((meta, VirtioError::DeviceError));
         }
-        let Some((reads, count, resp)) = chain.spans(&meta, None, resp_len) else {
-            return Err((meta, VirtioError::DeviceError));
+        let token = match self.enqueue_core(chain, &meta, None, resp_len) {
+            Ok(token) => token,
+            Err(e) => return Err((meta, e)),
         };
-        if self.inflight.len() >= MAX_INFLIGHT || self.parked.len() >= PARKED_ENQUEUE_GATE {
-            QUEUE_FULL_RETRIES.fetch_add(1, Ordering::Relaxed);
-            return Err((meta, VirtioError::QueueFull));
-        }
-        // SAFETY: the spans are disjoint sub-ranges of `meta`, which the
-        // InFlight entry owns until the matching pop_used (moving the DmaBuffer
-        // moves the owning struct, not the DMA bytes). The borrows end at `add`.
-        let added = unsafe {
-            let reads = [reads[0].as_slice(), reads[1].as_slice()];
-            self.control.add(&reads[..count], &mut [resp.as_mut_slice()])
-        };
-        let token = match added {
-            Ok(t) => t,
-            Err(virtio_drivers::Error::QueueFull) => {
-                QUEUE_FULL_RETRIES.fetch_add(1, Ordering::Relaxed);
-                return Err((meta, VirtioError::QueueFull));
-            }
-            Err(_) => {
-                self.failed = true;
-                return Err((meta, VirtioError::DeviceError));
-            }
-        };
-        if self.control.should_notify() {
-            self.transport.notify(CTRL_QUEUE);
-        }
-        self.inflight.push(InFlight {
+        // ⚠ This path used to notify BEFORE pushing; it now publishes first,
+        // like the other two. Unobservable -- both happen inside one hold of
+        // `virtio_lock`, which `drain_used` also takes -- and deliberate.
+        self.publish_then_notify(InFlight {
             token,
             kind: InFlightKind::Sync {
                 waiter: Some(waiter),
@@ -1706,7 +1765,6 @@ impl VirtioGpu {
             resp_len,
             venus: None,
         });
-        bump_high_water(&INFLIGHT_HIGH_WATER, self.inflight.len());
         Ok(SyncTicket { token })
     }
 
@@ -1727,39 +1785,17 @@ impl VirtioGpu {
         success_store: Option<(NonNull<AtomicU32>, u32)>,
         resubmit: Option<NonNull<AtomicU32>>,
     ) -> Result<(), (DmaBuffer, VirtioError)> {
-        if self.failed {
-            return Err((meta, VirtioError::DeviceError));
-        }
         let chain = Chain::Meta1 { in0_len };
         // Validated before the capacity gate, as in enqueue_sync.
         if in0_len == 0 || resp_len == 0 || resp_len > SYNC_RESP_MAX {
             return Err((meta, VirtioError::DeviceError));
         }
-        let Some((reads, count, resp)) = chain.spans(&meta, None, resp_len) else {
-            return Err((meta, VirtioError::DeviceError));
+        let token = match self.enqueue_core(chain, &meta, None, resp_len) {
+            Ok(token) => token,
+            Err(e) => return Err((meta, e)),
         };
-        if self.inflight.len() >= MAX_INFLIGHT || self.parked.len() >= PARKED_ENQUEUE_GATE {
-            QUEUE_FULL_RETRIES.fetch_add(1, Ordering::Relaxed);
-            return Err((meta, VirtioError::QueueFull));
-        }
-        // SAFETY: the request/response spans are disjoint inside `meta`, which
-        // moves into the InFlight entry and remains device-owned until pop_used.
-        let added = unsafe {
-            let reads = [reads[0].as_slice(), reads[1].as_slice()];
-            self.control.add(&reads[..count], &mut [resp.as_mut_slice()])
-        };
-        let token = match added {
-            Ok(t) => t,
-            Err(virtio_drivers::Error::QueueFull) => {
-                QUEUE_FULL_RETRIES.fetch_add(1, Ordering::Relaxed);
-                return Err((meta, VirtioError::QueueFull));
-            }
-            Err(_) => {
-                self.failed = true;
-                return Err((meta, VirtioError::DeviceError));
-            }
-        };
-        self.inflight.push(InFlight {
+        ASYNC_CTRL_COUNT.fetch_add(1, Ordering::Relaxed);
+        self.publish_then_notify(InFlight {
             token,
             kind: InFlightKind::AsyncControl {
                 completion,
@@ -1773,13 +1809,6 @@ impl VirtioGpu {
             resp_len,
             venus: None,
         });
-        ASYNC_CTRL_COUNT.fetch_add(1, Ordering::Relaxed);
-        bump_high_water(&INFLIGHT_HIGH_WATER, self.inflight.len());
-        // Publish token ownership before ringing the device doorbell: a fast
-        // host may complete immediately and enter the ISR/DPC on another CPU.
-        if self.control.should_notify() {
-            self.transport.notify(CTRL_QUEUE);
-        }
         Ok(())
     }
 
@@ -1846,10 +1875,6 @@ impl VirtioGpu {
         {
             return Err((meta, venus, VirtioError::DeviceError));
         }
-        if self.inflight.len() >= MAX_INFLIGHT || self.parked.len() >= PARKED_ENQUEUE_GATE {
-            QUEUE_FULL_RETRIES.fetch_add(1, Ordering::Relaxed);
-            return Err((meta, venus, VirtioError::QueueFull));
-        }
         let fence_id = self.next_wire_fence;
         let mut cmd = VirtioGpuCmdSubmit::zeroed();
         cmd.hdr.type_ = VIRTIO_GPU_CMD_SUBMIT_3D;
@@ -1864,29 +1889,19 @@ impl VirtioGpu {
         meta.as_mut_slice()[..hdr_len].copy_from_slice(bytemuck::bytes_of(&cmd));
 
         let chain = Chain::MetaPlusVenus { hdr_len, venus_len };
-        let Some((reads, count, resp)) = chain.spans(&meta, Some(&venus), resp_len) else {
-            return Err((meta, venus, VirtioError::DeviceError));
+        let token = match self.enqueue_core(chain, &meta, Some(&venus), resp_len) {
+            Ok(token) => token,
+            Err(e) => return Err((meta, venus, e)),
         };
-        // SAFETY: spans live inside `meta`/`venus`, owned by the InFlight entry
-        // until pop_used; the borrows end at `add`.
-        let added = unsafe {
-            let reads = [reads[0].as_slice(), reads[1].as_slice()];
-            self.control.add(&reads[..count], &mut [resp.as_mut_slice()])
-        };
-        let token = match added {
-            Ok(t) => t,
-            Err(virtio_drivers::Error::QueueFull) => {
-                QUEUE_FULL_RETRIES.fetch_add(1, Ordering::Relaxed);
-                return Err((meta, venus, VirtioError::QueueFull));
-            }
-            Err(_) => {
-                self.failed = true;
-                return Err((meta, venus, VirtioError::DeviceError));
-            }
-        };
+        // Stays BETWEEN a successful `add` and the publish: the wire fence id
+        // is only spent once the device has actually taken the descriptor.
         self.next_wire_fence += 1;
         let ring = cmd.hdr.ring_idx;
-        self.inflight.push(InFlight {
+        ASYNC_SUBMIT_COUNT.fetch_add(1, Ordering::Relaxed);
+        if ring != 0 {
+            RING_SUBMIT_COUNT.fetch_add(1, Ordering::Relaxed);
+        }
+        self.publish_then_notify(InFlight {
             token,
             kind: InFlightKind::AsyncVenus {
                 fence_id,
@@ -1898,16 +1913,6 @@ impl VirtioGpu {
             resp_len,
             venus: Some(venus),
         });
-        ASYNC_SUBMIT_COUNT.fetch_add(1, Ordering::Relaxed);
-        if ring != 0 {
-            RING_SUBMIT_COUNT.fetch_add(1, Ordering::Relaxed);
-        }
-        bump_high_water(&INFLIGHT_HIGH_WATER, self.inflight.len());
-        // Publish token/fence/callback ownership before the device can race a
-        // completion into the ISR/DPC on another CPU.
-        if self.control.should_notify() {
-            self.transport.notify(CTRL_QUEUE);
-        }
         Ok(fence_id)
     }
 
