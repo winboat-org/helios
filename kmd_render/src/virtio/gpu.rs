@@ -1401,7 +1401,14 @@ pub struct VirtioGpu {
 
 impl VirtioGpu {
     /// Bring the virtio-gpu device online and prove it with `GET_DISPLAY_INFO`.
-    pub fn init(dxgkrnl: &DXGKRNL_INTERFACE) -> Result<Self, VirtioError> {
+    /// `passive` is threaded only to reach `DmaBuffer::new` for the
+    /// GET_DISPLAY_INFO scratch page; the rest of bring-up is MMIO and PCI
+    /// config access. It is a by-value ZST, so it costs neither a register nor a
+    /// stack slot in this ~9.1 KB frame — see `crate::irql`.
+    pub fn init(
+        passive: crate::irql::PassiveLevel,
+        dxgkrnl: &DXGKRNL_INTERFACE,
+    ) -> Result<Self, VirtioError> {
         // ── M1: discover the device + map BARs through Dxgkrnl ──────────────
         // A miniport doesn't own the bus, so config space is reached via the
         // Dxgkrnl callbacks; the DeviceFunction is a formality (DxgkConfigAccess
@@ -1474,7 +1481,8 @@ impl VirtioGpu {
         // the device, response is written by it. The page is a local RAII
         // `DmaBuffer` — the runtime paths own per-command buffers instead
         // (C3/M3.4), so no shared scratch survives init.
-        let mut scratch = DmaBuffer::new(SCRATCH_BYTES).ok_or(VirtioError::OutOfMemory)?;
+        let mut scratch =
+            DmaBuffer::new(passive, SCRATCH_BYTES).ok_or(VirtioError::OutOfMemory)?;
         let buf = scratch.as_mut_slice();
         let (req_buf, resp_buf) = buf.split_at_mut(SCRATCH_BYTES / 2);
 

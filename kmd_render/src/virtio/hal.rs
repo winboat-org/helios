@@ -26,6 +26,8 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 use virtio_drivers::{BufferDirection, Hal, PhysAddr};
 
+use crate::irql::PassiveLevel;
+
 /// An owned, physically-contiguous, page-aligned DMA buffer.
 ///
 /// Wraps `WdkHal::dma_alloc`/`dma_dealloc` with RAII so command paths can stage
@@ -37,6 +39,13 @@ use virtio_drivers::{BufferDirection, Hal, PhysAddr};
 /// IRQL: both `new` (MmAllocateContiguousMemory) and `drop`
 /// (MmFreeContiguousMemory) require PASSIVE_LEVEL — allocate/free a `DmaBuffer`
 /// outside any spinlock, never from the DPC/ISR path.
+///
+/// `new` now takes a [`PassiveLevel`] (R614), so that half of the contract is a
+/// signature. The `drop` half cannot be: `Drop::drop` has a fixed signature and
+/// no token can be threaded into it, so "never let a `DmaBuffer` fall out of
+/// scope above PASSIVE" stays a doc comment. It is a real remaining hazard — the
+/// transport parks completed buffers precisely so the DISPATCH drain never drops
+/// one (`ctrl::reap_parked` frees them at PASSIVE instead).
 pub struct DmaBuffer {
     pa: PhysAddr,
     ptr: NonNull<u8>,
@@ -47,7 +56,7 @@ pub struct DmaBuffer {
 impl DmaBuffer {
     /// Allocate a zeroed contiguous buffer of at least `len` bytes. Returns
     /// `None` on allocation failure or `len == 0`.
-    pub fn new(len: usize) -> Option<Self> {
+    pub fn new(_passive: PassiveLevel, len: usize) -> Option<Self> {
         if len == 0 {
             return None;
         }

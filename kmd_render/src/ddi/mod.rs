@@ -1,13 +1,11 @@
 //! WDDM DDI entry points, grouped by subsystem. `lib.rs` wires these into the
 //! `DRIVER_INITIALIZATION_DATA` table.
 
-/// `PASSIVE_LEVEL` as returned by `KeGetCurrentIrql`.
-///
-/// One site for what used to be two module-local copies plus a bare `irql != 0`
-/// literal on the SetVidPnSourceAddress split. Deliberately NOT taken from
-/// `wdk_sys`: `PASSIVE_LEVEL` is a C preprocessor macro, so bindgen does not
-/// emit it and assuming otherwise is a build break, not a fallback.
-pub(crate) const PASSIVE_LEVEL_IRQL: u8 = 0;
+// `PASSIVE_LEVEL_IRQL` now lives with the proof token that shares its subject
+// (`crate::irql`), so the constant and the type that means "we are at that
+// level" cannot drift apart. Re-exported here because the four existing
+// `crate::ddi::PASSIVE_LEVEL_IRQL` users are all in this subtree.
+pub(crate) use crate::irql::PASSIVE_LEVEL_IRQL;
 
 mod add_device;
 mod blob_map;

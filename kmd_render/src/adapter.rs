@@ -1643,6 +1643,15 @@ impl AdapterContext {
             b"WtTbl",
             crate::virtio::gpu::FENCE_WAIT_TABLE_FULL.load(Ordering::Relaxed),
         );
+        // R614: mint sites whose `// SAFETY:` IRQL claim was false, packed as
+        // (count << 8) | last_irql. Mirrored from HERE for the same reason
+        // AbnDrop is: `PassiveLevel::assume` runs at whatever IRQL its caller
+        // was at — that is the point of it — and a registry write above PASSIVE
+        // is a never-violate rule. Must read 0; see `crate::irql`.
+        crate::diag::record_named_bytes(
+            b"IrqlBad",
+            crate::irql::IRQL_ASSUME_BAD.load(Ordering::Relaxed),
+        );
         crate::diag::record_named_bytes(
             b"CtOut",
             crate::virtio::gpu::CTRL_TIMEOUT_COUNT.load(Ordering::Relaxed),

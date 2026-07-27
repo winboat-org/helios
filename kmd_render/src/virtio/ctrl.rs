@@ -35,6 +35,7 @@ use super::gpu::{
 use super::hal::DmaBuffer;
 use super::VirtioError;
 use crate::adapter::AdapterContext;
+use crate::irql::PassiveLevel;
 use core::sync::atomic::Ordering;
 use helios_protocol::{
     resp_is_ok, VirtioGpuCtrlHdr, VirtioGpuCtxCreate, VirtioGpuCtxDestroy, VirtioGpuCtxResource,
@@ -192,8 +193,26 @@ struct VirtioGpuTransferHost3d {
     layer_stride: u32,
 }
 
+/// ⚠ TEMPORARY, R614 commit 1 — an UNAUDITED [`PassiveLevel`] mint.
+///
+/// The token is threaded from the inside out: this module's primitives take one
+/// first, then each caller group is converted in its own commit and its
+/// `ctrl::` entry points switch to taking the token as a parameter. Until a
+/// given entry point's last caller group lands, it mints here instead, which
+/// asserts nothing beyond the module contract it already had.
+///
+/// This is deliberately laundering, and it is the one thing the item exists to
+/// remove — so it is named for what it is, and
+/// `grep -c assume_passive_unaudited` is the count of work remaining. The
+/// tranche's final commit deletes this function; if it is still here, the
+/// tranche is not finished.
+fn assume_passive_unaudited() -> PassiveLevel {
+    // SAFETY: NOT a real audit. Placeholder for the caller-group commits.
+    unsafe { PassiveLevel::assume() }
+}
+
 /// PASSIVE sleep for ~`ms` milliseconds.
-pub(crate) fn sleep_ms(ms: u64) {
+pub(crate) fn sleep_ms(_passive: PassiveLevel, ms: u64) {
     let mut interval: LARGE_INTEGER = unsafe { core::mem::zeroed() };
     interval.QuadPart = -((ms.max(1) as i64) * 10_000);
     // SAFETY: PASSIVE_LEVEL relative-timeout sleep.
@@ -208,7 +227,12 @@ pub(crate) fn sleep_ms(ms: u64) {
 /// Wait on `block` for up to `total_ms`, in adaptive slices (1 ms → 1 s),
 /// opportunistically draining the used ring after each slice so a lost
 /// interrupt costs only slice latency. Returns whether the block completed.
-fn wait_block(adapter: &AdapterContext, block: &WaitBlockRef<'_>, total_ms: u64) -> bool {
+fn wait_block(
+    _passive: PassiveLevel,
+    adapter: &AdapterContext,
+    block: &WaitBlockRef<'_>,
+    total_ms: u64,
+) -> bool {
     let mut waited: u64 = 0;
     let mut slice: u64 = 1;
     loop {
@@ -247,7 +271,7 @@ fn wait_block(adapter: &AdapterContext, block: &WaitBlockRef<'_>, total_ms: u64)
 /// Reap completed entries at PASSIVE and retain their DMA buffers for reuse.
 /// `MmAllocateContiguousMemory` per tiny Venus submission dominated DWM's
 /// command rate; recycling page-backed buffers removes that steady-state cost.
-pub fn reap_parked(adapter: &AdapterContext) {
+pub fn reap_parked(_passive: PassiveLevel, adapter: &AdapterContext) {
     let work = adapter.with_virtio(|v| v.begin_parked_reap());
     let Ok(Some((mut dead, mut buffers))) = work else {
         return;
@@ -284,6 +308,7 @@ pub fn reap_parked(adapter: &AdapterContext) {
 /// `timeout_ms`. On timeout the in-flight slot is abandoned (reaped when the
 /// completion eventually arrives) — the transport is NOT poisoned.
 fn ctrl_roundtrip(
+    passive: PassiveLevel,
     adapter: &AdapterContext,
     req: &[u8],
     extra: Option<&[u8]>,
@@ -296,10 +321,10 @@ fn ctrl_roundtrip(
     if in0_len == 0 || resp_len == 0 {
         return Err(VirtioError::DeviceError);
     }
-    reap_parked(adapter);
+    reap_parked(passive, adapter);
 
     let total = in0_len + in1_len + resp_len;
-    let mut meta = DmaBuffer::new(total).ok_or(VirtioError::OutOfMemory)?;
+    let mut meta = DmaBuffer::new(passive, total).ok_or(VirtioError::OutOfMemory)?;
     {
         let m = meta.as_mut_slice();
         m[..in0_len].copy_from_slice(req);
@@ -335,8 +360,8 @@ fn ctrl_roundtrip(
                     if budget.charge_slice() {
                         return Err(VirtioError::QueueFull);
                     }
-                    reap_parked(adapter);
-                    sleep_ms(RETRY_SLICE_MS);
+                    reap_parked(passive, adapter);
+                    sleep_ms(passive, RETRY_SLICE_MS);
                 }
                 Ok(Err((_m, e))) => return Err(e), // dropped here at PASSIVE
             }
@@ -345,7 +370,7 @@ fn ctrl_roundtrip(
         // Kept for the refusal breadcrumb: SyncTicket is move-only, so it is
         // consumed by abandon_sync and cannot be read afterwards.
         let token_value = token.raw();
-        if !wait_block(adapter, block, timeout_ms) {
+        if !wait_block(passive, adapter, block, timeout_ms) {
             // Final race check + abandonment under the lock.
             // Three outcomes, not two. `unwrap_or(true)` folded Err(DeviceNotFound)
             // - the transport was torn down under us - into "already completed
@@ -384,12 +409,20 @@ fn ctrl_roundtrip(
 
 /// Round-trip expecting a bare `VirtioGpuCtrlHdr` response; checks RESP_OK.
 fn ctrl_roundtrip_ok(
+    passive: PassiveLevel,
     adapter: &AdapterContext,
     req: &[u8],
     extra: Option<&[u8]>,
 ) -> Result<(), VirtioError> {
     let mut resp = [0u8; size_of::<VirtioGpuCtrlHdr>()];
-    ctrl_roundtrip(adapter, req, extra, &mut resp, SYNC_ROUNDTRIP_TIMEOUT_MS)?;
+    ctrl_roundtrip(
+        passive,
+        adapter,
+        req,
+        extra,
+        &mut resp,
+        SYNC_ROUNDTRIP_TIMEOUT_MS,
+    )?;
     let resp_type = u32::from_le_bytes([resp[0], resp[1], resp[2], resp[3]]);
     if resp_is_ok(resp_type) {
         Ok(())
@@ -408,6 +441,7 @@ pub fn ctx_create(
     capset_id: u32,
     owner: Option<DeviceOwner>,
 ) -> Result<u32, VirtioError> {
+    let passive = assume_passive_unaudited();
     let ctx_id = adapter
         .with_virtio(|v| v.alloc_ctx_id())
         .map_err(|_| VirtioError::DeviceError)?;
@@ -429,7 +463,7 @@ pub fn ctx_create(
     cmd.nlen = NAME.len() as u32;
     cmd.debug_name[..NAME.len()].copy_from_slice(NAME);
     crate::diag::record(0x0D20_0000 | (ctx_id & 0xFFFF));
-    if let Err(e) = ctrl_roundtrip_ok(adapter, bytes_of(&cmd), None) {
+    if let Err(e) = ctrl_roundtrip_ok(passive, adapter, bytes_of(&cmd), None) {
         let _ = adapter.with_virtio(|v| v.cancel_context_reservation());
         return Err(e);
     }
@@ -452,6 +486,7 @@ pub fn ctx_destroy(
     owner: Option<DeviceOwner>,
     ctx_id: u32,
 ) -> Result<(), VirtioError> {
+    let passive = assume_passive_unaudited();
     let owned = adapter
         .with_virtio(|v| v.untrack_owned_context(owner, ctx_id))
         .map_err(|_| VirtioError::DeviceError)?;
@@ -461,7 +496,7 @@ pub fn ctx_destroy(
     let mut cmd = VirtioGpuCtxDestroy::zeroed();
     cmd.hdr.type_ = VIRTIO_GPU_CMD_CTX_DESTROY;
     cmd.hdr.ctx_id = ctx_id;
-    ctrl_roundtrip_ok(adapter, bytes_of(&cmd), None)
+    ctrl_roundtrip_ok(passive, adapter, bytes_of(&cmd), None)
 }
 
 /// Untracked teardown of a context this driver created for itself (the
@@ -473,6 +508,7 @@ pub fn ctx_destroy_kmd(adapter: &AdapterContext, ctx_id: u32) -> Result<(), Virt
 
 /// `CTX_DESTROY` every context still owned by `owner` (device teardown).
 pub fn destroy_contexts_for_owner(adapter: &AdapterContext, owner: Option<DeviceOwner>) -> u32 {
+    let passive = assume_passive_unaudited();
     let mut destroyed = 0u32;
     loop {
         let taken = adapter
@@ -484,7 +520,7 @@ pub fn destroy_contexts_for_owner(adapter: &AdapterContext, owner: Option<Device
         let mut cmd = VirtioGpuCtxDestroy::zeroed();
         cmd.hdr.type_ = VIRTIO_GPU_CMD_CTX_DESTROY;
         cmd.hdr.ctx_id = ctx_id;
-        let _ = ctrl_roundtrip_ok(adapter, bytes_of(&cmd), None);
+        let _ = ctrl_roundtrip_ok(passive, adapter, bytes_of(&cmd), None);
         destroyed += 1;
     }
 }
@@ -497,11 +533,12 @@ pub fn ctx_attach_resource(
     ctx_id: u32,
     resource_id: u32,
 ) -> Result<(), VirtioError> {
+    let passive = assume_passive_unaudited();
     let mut cmd = VirtioGpuCtxResource::zeroed();
     cmd.hdr.type_ = VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE;
     cmd.hdr.ctx_id = ctx_id;
     cmd.resource_id = resource_id;
-    ctrl_roundtrip_ok(adapter, bytes_of(&cmd), None)
+    ctrl_roundtrip_ok(passive, adapter, bytes_of(&cmd), None)
 }
 
 /// Detach a resource from a 3D context.
@@ -510,11 +547,12 @@ pub fn ctx_detach_resource(
     ctx_id: u32,
     resource_id: u32,
 ) -> Result<(), VirtioError> {
+    let passive = assume_passive_unaudited();
     let mut cmd = VirtioGpuCtxResource::zeroed();
     cmd.hdr.type_ = VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE;
     cmd.hdr.ctx_id = ctx_id;
     cmd.resource_id = resource_id;
-    ctrl_roundtrip_ok(adapter, bytes_of(&cmd), None)
+    ctrl_roundtrip_ok(passive, adapter, bytes_of(&cmd), None)
 }
 
 /// Drop the host's reference to a resource.
@@ -535,6 +573,7 @@ pub fn set_scanout_blob(
     stride: u32,
     offset: u32,
 ) -> Result<(), VirtioError> {
+    let passive = assume_passive_unaudited();
     let mut cmd = VirtioGpuSetScanoutBlob::zeroed();
     cmd.hdr.type_ = VIRTIO_GPU_CMD_SET_SCANOUT_BLOB;
     cmd.r = VirtioGpuRect {
@@ -550,7 +589,7 @@ pub fn set_scanout_blob(
     cmd.format = format;
     cmd.strides[0] = stride;
     cmd.offsets[0] = offset;
-    ctrl_roundtrip_ok(adapter, bytes_of(&cmd), None)
+    ctrl_roundtrip_ok(passive, adapter, bytes_of(&cmd), None)
 }
 
 /// Flush scanout 0's bound resource to the host display (`RESOURCE_FLUSH`) — for
@@ -562,6 +601,7 @@ pub fn resource_flush(
     width: u32,
     height: u32,
 ) -> Result<(), VirtioError> {
+    let passive = assume_passive_unaudited();
     let mut cmd = VirtioGpuResourceFlush::zeroed();
     cmd.hdr.type_ = VIRTIO_GPU_CMD_RESOURCE_FLUSH;
     cmd.r = VirtioGpuRect {
@@ -571,7 +611,7 @@ pub fn resource_flush(
         height,
     };
     cmd.resource_id = resource_id;
-    ctrl_roundtrip_ok(adapter, bytes_of(&cmd), None)
+    ctrl_roundtrip_ok(passive, adapter, bytes_of(&cmd), None)
 }
 
 /// Queue a RESOURCE_FLUSH without synchronously waiting for its ctrl response.
@@ -589,6 +629,7 @@ pub fn resource_flush_async(
     completion_errors: NonNull<AtomicU32>,
     wake_event: NonNull<KEVENT>,
 ) -> Result<(), VirtioError> {
+    let passive = assume_passive_unaudited();
     let mut cmd = VirtioGpuResourceFlush::zeroed();
     cmd.hdr.type_ = VIRTIO_GPU_CMD_RESOURCE_FLUSH;
     cmd.r = VirtioGpuRect {
@@ -599,10 +640,11 @@ pub fn resource_flush_async(
     };
     cmd.resource_id = resource_id;
 
-    reap_parked(adapter);
+    reap_parked(passive, adapter);
     let request = bytes_of(&cmd);
     let response_len = size_of::<VirtioGpuCtrlHdr>();
-    let mut meta = DmaBuffer::new(request.len() + response_len).ok_or(VirtioError::OutOfMemory)?;
+    let mut meta =
+        DmaBuffer::new(passive, request.len() + response_len).ok_or(VirtioError::OutOfMemory)?;
     meta.as_mut_slice()[..request.len()].copy_from_slice(request);
 
     let queued = adapter.with_virtio(move |v| {
@@ -644,6 +686,7 @@ pub fn set_scanout_blob_async(
     refresh_pending: NonNull<AtomicU32>,
     wake_event: NonNull<KEVENT>,
 ) -> Result<(), VirtioError> {
+    let passive = assume_passive_unaudited();
     let mut cmd = VirtioGpuSetScanoutBlob::zeroed();
     cmd.hdr.type_ = VIRTIO_GPU_CMD_SET_SCANOUT_BLOB;
     cmd.r = VirtioGpuRect {
@@ -660,10 +703,11 @@ pub fn set_scanout_blob_async(
     cmd.strides[0] = stride;
     cmd.offsets[0] = offset;
 
-    reap_parked(adapter);
+    reap_parked(passive, adapter);
     let request = bytes_of(&cmd);
     let response_len = size_of::<VirtioGpuCtrlHdr>();
-    let mut meta = DmaBuffer::new(request.len() + response_len).ok_or(VirtioError::OutOfMemory)?;
+    let mut meta =
+        DmaBuffer::new(passive, request.len() + response_len).ok_or(VirtioError::OutOfMemory)?;
     meta.as_mut_slice()[..request.len()].copy_from_slice(request);
 
     let queued = adapter.with_virtio(move |v| {
@@ -692,6 +736,7 @@ pub fn set_scanout_2d(
     width: u32,
     height: u32,
 ) -> Result<(), VirtioError> {
+    let passive = assume_passive_unaudited();
     let mut set = VirtioGpuSetScanout::zeroed();
     set.hdr.type_ = VIRTIO_GPU_CMD_SET_SCANOUT;
     set.r = VirtioGpuRect {
@@ -702,26 +747,29 @@ pub fn set_scanout_2d(
     };
     set.scanout_id = 0;
     set.resource_id = resource_id;
-    ctrl_roundtrip_ok(adapter, bytes_of(&set), None)
+    ctrl_roundtrip_ok(passive, adapter, bytes_of(&set), None)
 }
 
 pub fn resource_unref(adapter: &AdapterContext, resource_id: u32) -> Result<(), VirtioError> {
+    let passive = assume_passive_unaudited();
     let mut cmd = VirtioGpuResourceUnref::zeroed();
     cmd.hdr.type_ = VIRTIO_GPU_CMD_RESOURCE_UNREF;
     cmd.resource_id = resource_id;
-    ctrl_roundtrip_ok(adapter, bytes_of(&cmd), None)
+    ctrl_roundtrip_ok(passive, adapter, bytes_of(&cmd), None)
 }
 
 /// Linux virtio-gpu assigns a resource UUID when a blob is created with
 /// `USE_CROSS_DEVICE`. Keep the full 40-byte response buffer because the OK
 /// reply carries the UUID after the control header.
 pub fn resource_assign_uuid(adapter: &AdapterContext, resource_id: u32) -> Result<(), VirtioError> {
+    let passive = assume_passive_unaudited();
     let mut cmd = VirtioGpuResourceAssignUuid::zeroed();
     cmd.hdr.type_ = VIRTIO_GPU_CMD_RESOURCE_ASSIGN_UUID;
     cmd.resource_id = resource_id;
 
     let mut resp = [0u8; size_of::<VirtioGpuCtrlHdr>() + 16];
     ctrl_roundtrip(
+        passive,
         adapter,
         bytes_of(&cmd),
         None,
@@ -745,6 +793,7 @@ pub fn diagnostic_2d_scanout(
     width: u32,
     height: u32,
 ) -> Result<u32, VirtioError> {
+    let passive = assume_passive_unaudited();
     let pitch = (width as usize)
         .checked_mul(4)
         .ok_or(VirtioError::OutOfMemory)?;
@@ -755,7 +804,7 @@ pub fn diagnostic_2d_scanout(
         return Err(VirtioError::OutOfMemory);
     }
 
-    let mut backing = DmaBuffer::new(size).ok_or(VirtioError::OutOfMemory)?;
+    let mut backing = DmaBuffer::new(passive, size).ok_or(VirtioError::OutOfMemory)?;
     {
         let buf = backing.as_mut_slice();
         let mut y = 0usize;
@@ -787,7 +836,7 @@ pub fn diagnostic_2d_scanout(
     create.format = helios_protocol::VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM;
     create.width = width;
     create.height = height;
-    ctrl_roundtrip_ok(adapter, bytes_of(&create), None)?;
+    ctrl_roundtrip_ok(passive, adapter, bytes_of(&create), None)?;
 
     let mut attach = VirtioGpuResourceAttachBacking::zeroed();
     attach.hdr.type_ = VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING;
@@ -798,7 +847,7 @@ pub fn diagnostic_2d_scanout(
         length: size as u32,
         padding: 0,
     };
-    ctrl_roundtrip_ok(adapter, bytes_of(&attach), Some(bytes_of(&entry)))?;
+    ctrl_roundtrip_ok(passive, adapter, bytes_of(&attach), Some(bytes_of(&entry)))?;
 
     set_scanout_2d(adapter, resource_id, width, height)?;
 
@@ -812,7 +861,7 @@ pub fn diagnostic_2d_scanout(
     };
     xfer.offset = 0;
     xfer.resource_id = resource_id;
-    ctrl_roundtrip_ok(adapter, bytes_of(&xfer), None)?;
+    ctrl_roundtrip_ok(passive, adapter, bytes_of(&xfer), None)?;
     resource_flush(adapter, resource_id, width, height)?;
 
     core::mem::forget(backing);
@@ -829,6 +878,7 @@ pub fn diagnostic_guest_blob_scanout(
     format: u32,
     blob_mem: u32,
 ) -> Result<(u32, u32), VirtioError> {
+    let passive = assume_passive_unaudited();
     let pitch = width.checked_mul(4).ok_or(VirtioError::OutOfMemory)?;
     let size = (pitch as usize)
         .checked_mul(height as usize)
@@ -837,7 +887,7 @@ pub fn diagnostic_guest_blob_scanout(
         return Err(VirtioError::OutOfMemory);
     }
 
-    let mut backing = DmaBuffer::new(size).ok_or(VirtioError::OutOfMemory)?;
+    let mut backing = DmaBuffer::new(passive, size).ok_or(VirtioError::OutOfMemory)?;
     {
         let buf = backing.as_mut_slice();
         let mut y = 0usize;
@@ -894,7 +944,7 @@ pub fn diagnostic_guest_blob_scanout(
         length: size as u32,
         padding: 0,
     };
-    if let Err(e) = ctrl_roundtrip_ok(adapter, bytes_of(&create), Some(bytes_of(&entry))) {
+    if let Err(e) = ctrl_roundtrip_ok(passive, adapter, bytes_of(&create), Some(bytes_of(&entry))) {
         let _ = adapter.with_virtio(|v| v.cancel_resource_reservation());
         return Err(e);
     }
@@ -994,6 +1044,7 @@ pub fn diagnostic_virgl_host3d_guest_scanout(
     height: u32,
     format: u32,
 ) -> Result<(u32, u64, u32), VirtioError> {
+    let passive = assume_passive_unaudited();
     let pitch = width.checked_mul(4).ok_or(VirtioError::OutOfMemory)?;
     let size = (pitch as u64)
         .checked_mul(height as u64)
@@ -1003,7 +1054,8 @@ pub fn diagnostic_virgl_host3d_guest_scanout(
     }
     let aligned_size = (size + 0xFFF) & !0xFFF;
 
-    let mut backing = DmaBuffer::new(aligned_size as usize).ok_or(VirtioError::OutOfMemory)?;
+    let mut backing =
+        DmaBuffer::new(passive, aligned_size as usize).ok_or(VirtioError::OutOfMemory)?;
     {
         let buf = backing.as_mut_slice();
         let mut y = 0usize;
@@ -1106,7 +1158,7 @@ pub fn diagnostic_virgl_host3d_guest_scanout(
         length: aligned_size as u32,
         padding: 0,
     };
-    if let Err(e) = ctrl_roundtrip_ok(adapter, bytes_of(&create), Some(bytes_of(&entry))) {
+    if let Err(e) = ctrl_roundtrip_ok(passive, adapter, bytes_of(&create), Some(bytes_of(&entry))) {
         let _ = adapter.with_virtio(|v| v.cancel_resource_reservation());
         let _ = ctx_destroy_kmd(adapter, ctx_id);
         return Err(e);
@@ -1129,7 +1181,7 @@ pub fn diagnostic_virgl_host3d_guest_scanout(
     xfer.level = 0;
     xfer.stride = pitch;
     xfer.layer_stride = pitch.saturating_mul(height);
-    if let Err(e) = ctrl_roundtrip_ok(adapter, bytes_of(&xfer), None) {
+    if let Err(e) = ctrl_roundtrip_ok(passive, adapter, bytes_of(&xfer), None) {
         let _ = resource_unref(adapter, resource_id);
         return Err(e);
     }
@@ -1172,6 +1224,7 @@ pub fn resource_create_blob(
     blob_id: u64,
     size: u64,
 ) -> Result<u32, VirtioError> {
+    let passive = assume_passive_unaudited();
     let reserved = adapter
         .with_virtio(|v| v.reserve_resource_slot())
         .map_err(|_| VirtioError::DeviceError)?;
@@ -1194,7 +1247,7 @@ pub fn resource_create_blob(
     cmd.nr_entries = 0;
     cmd.blob_id = blob_id;
     cmd.size = size;
-    if let Err(e) = ctrl_roundtrip_ok(adapter, bytes_of(&cmd), None) {
+    if let Err(e) = ctrl_roundtrip_ok(passive, adapter, bytes_of(&cmd), None) {
         let _ = adapter.with_virtio(|v| v.cancel_resource_reservation());
         return Err(e);
     }
@@ -1243,6 +1296,7 @@ pub fn alloc_blob(
 
 /// `RESOURCE_MAP_BLOB` round-trip; returns the host caching nibble.
 fn resource_map_blob_roundtrip(
+    passive: PassiveLevel,
     adapter: &AdapterContext,
     resource_id: u32,
     offset: u64,
@@ -1253,6 +1307,7 @@ fn resource_map_blob_roundtrip(
     cmd.offset = offset;
     let mut resp = [0u8; size_of::<VirtioGpuRespMapInfo>()];
     ctrl_roundtrip(
+        passive,
         adapter,
         bytes_of(&cmd),
         None,
@@ -1271,10 +1326,11 @@ fn resource_map_blob_roundtrip(
 
 /// Tear down a blob's host-visible mapping.
 pub fn resource_unmap_blob(adapter: &AdapterContext, resource_id: u32) -> Result<(), VirtioError> {
+    let passive = assume_passive_unaudited();
     let mut cmd = VirtioGpuResourceUnmapBlob::zeroed();
     cmd.hdr.type_ = VIRTIO_GPU_CMD_RESOURCE_UNMAP_BLOB;
     cmd.resource_id = resource_id;
-    ctrl_roundtrip_ok(adapter, bytes_of(&cmd), None)
+    ctrl_roundtrip_ok(passive, adapter, bytes_of(&cmd), None)
 }
 
 /// Map a blob into the host-visible window (idempotent — returns the existing
@@ -1285,6 +1341,7 @@ pub fn map_blob_prepare(
     owner: OwnerFilter,
     resource_id: u32,
 ) -> Result<BlobMapPrep, VirtioError> {
+    let passive = assume_passive_unaudited();
     let mut busy = Budget::new(MAP_BUSY_MAX_MS);
     loop {
         let begin = adapter
@@ -1297,10 +1354,10 @@ pub fn map_blob_prepare(
                 if busy.charge_slice() {
                     return Err(VirtioError::Timeout);
                 }
-                sleep_ms(RETRY_SLICE_MS);
+                sleep_ms(passive, RETRY_SLICE_MS);
             }
             BlobMapBegin::Start { offset, len } => {
-                let cache = resource_map_blob_roundtrip(adapter, resource_id, offset);
+                let cache = resource_map_blob_roundtrip(passive, adapter, resource_id, offset);
                 let cache_ok = cache.as_ref().ok().copied();
                 let fin = adapter
                     .with_virtio(|v| v.blob_map_finish(resource_id, offset, len, cache_ok))
@@ -1339,6 +1396,7 @@ pub fn map_blob_at(
     resource_id: u32,
     window_offset: u64,
 ) -> Result<BlobMapPrep, VirtioError> {
+    let passive = assume_passive_unaudited();
     // Evict stale overlapping placements before reserving our own slot.
     let (_, blob_size, _) = adapter
         .with_virtio(|v| v.blob_lookup(resource_id))
@@ -1375,7 +1433,7 @@ pub fn map_blob_at(
                 if busy.charge_slice() {
                     return Err(VirtioError::Timeout);
                 }
-                sleep_ms(RETRY_SLICE_MS);
+                sleep_ms(passive, RETRY_SLICE_MS);
             }
             BlobRemapBegin::Start { old, len } => {
                 if let Some((old_offset, old_len)) = old {
@@ -1385,7 +1443,8 @@ pub fn map_blob_at(
                     let _ = resource_unmap_blob(adapter, resource_id);
                     let _ = adapter.with_virtio(|v| v.free_window_range_pub(old_offset, old_len));
                 }
-                let cache = resource_map_blob_roundtrip(adapter, resource_id, window_offset);
+                let cache =
+                    resource_map_blob_roundtrip(passive, adapter, resource_id, window_offset);
                 let cache_ok = cache.as_ref().ok().copied();
                 let fin = adapter
                     .with_virtio(|v| v.blob_map_finish(resource_id, window_offset, len, cache_ok))
@@ -1492,6 +1551,7 @@ pub fn submit_3d_sync(
     ctx_id: u32,
     stream: &[u8],
 ) -> Result<(), VirtioError> {
+    let passive = assume_passive_unaudited();
     if stream.is_empty() {
         return Err(VirtioError::DeviceError);
     }
@@ -1502,7 +1562,7 @@ pub fn submit_3d_sync(
     cmd.size = stream.len() as u32;
     // The stream rides a second device-read descriptor (kept split so the host
     // never mis-parses the submit header as another control command).
-    ctrl_roundtrip_ok(adapter, bytes_of(&cmd), Some(stream))
+    ctrl_roundtrip_ok(passive, adapter, bytes_of(&cmd), Some(stream))
 }
 
 pub fn submit_venus_sync(
@@ -1523,6 +1583,7 @@ pub fn submit_venus_async(
     ring_idx: u32,
     stream: &[u8],
 ) -> Result<u64, VirtioError> {
+    let passive = assume_passive_unaudited();
     if stream.is_empty() {
         return Err(VirtioError::DeviceError);
     }
@@ -1536,18 +1597,18 @@ pub fn submit_venus_async(
         return Err(VirtioError::NotOwned);
     };
     let ctx_id = owned.id();
-    reap_parked(adapter);
+    reap_parked(passive, adapter);
     let mut meta = adapter
         .with_virtio(|v| v.take_dma_buffer(SUBMIT_META_BYTES))
         .ok()
         .flatten()
-        .or_else(|| DmaBuffer::new(SUBMIT_META_BYTES))
+        .or_else(|| DmaBuffer::new(passive, SUBMIT_META_BYTES))
         .ok_or(VirtioError::OutOfMemory)?;
     let mut venus = adapter
         .with_virtio(|v| v.take_dma_buffer(stream.len()))
         .ok()
         .flatten()
-        .or_else(|| DmaBuffer::new(stream.len()))
+        .or_else(|| DmaBuffer::new(passive, stream.len()))
         .ok_or(VirtioError::OutOfMemory)?;
     venus.as_mut_slice()[..stream.len()].copy_from_slice(stream);
     let venus_len = stream.len();
@@ -1571,8 +1632,8 @@ pub fn submit_venus_async(
                 if budget.charge_slice() {
                     return Err(VirtioError::QueueFull);
                 }
-                reap_parked(adapter);
-                sleep_ms(RETRY_SLICE_MS);
+                reap_parked(passive, adapter);
+                sleep_ms(passive, RETRY_SLICE_MS);
             }
             Ok(Err((_m, _v, e))) => return Err(e), // buffers dropped at PASSIVE
         }
@@ -1595,12 +1656,13 @@ pub fn submit_venus_async_scanout(
     primary_address: u64,
     ticket: crate::adapter::ProgrammingTicket,
 ) -> Result<u64, VirtioError> {
+    let passive = assume_passive_unaudited();
     if stream.is_empty() {
         return Err(VirtioError::DeviceError);
     }
-    reap_parked(adapter);
-    let meta = DmaBuffer::new(SUBMIT_META_BYTES).ok_or(VirtioError::OutOfMemory)?;
-    let mut venus = DmaBuffer::new(stream.len()).ok_or(VirtioError::OutOfMemory)?;
+    reap_parked(passive, adapter);
+    let meta = DmaBuffer::new(passive, SUBMIT_META_BYTES).ok_or(VirtioError::OutOfMemory)?;
+    let mut venus = DmaBuffer::new(passive, stream.len()).ok_or(VirtioError::OutOfMemory)?;
     venus.as_mut_slice()[..stream.len()].copy_from_slice(stream);
     let venus_len = stream.len();
     // One construction site, on the adapter, so all four pointers necessarily
@@ -1629,12 +1691,13 @@ pub fn submit_venus_async_present(
     ctx_id: u32,
     stream: &[u8],
 ) -> Result<u64, VirtioError> {
+    let passive = assume_passive_unaudited();
     if stream.is_empty() {
         return Err(VirtioError::DeviceError);
     }
-    reap_parked(adapter);
-    let meta = DmaBuffer::new(SUBMIT_META_BYTES).ok_or(VirtioError::OutOfMemory)?;
-    let mut venus = DmaBuffer::new(stream.len()).ok_or(VirtioError::OutOfMemory)?;
+    reap_parked(passive, adapter);
+    let meta = DmaBuffer::new(passive, SUBMIT_META_BYTES).ok_or(VirtioError::OutOfMemory)?;
+    let mut venus = DmaBuffer::new(passive, stream.len()).ok_or(VirtioError::OutOfMemory)?;
     venus.as_mut_slice()[..stream.len()].copy_from_slice(stream);
     let venus_len = stream.len();
 
@@ -1675,6 +1738,7 @@ pub enum WaitFenceOutcome {
 /// Wait (PASSIVE, KEVENT) until wire fence `fence_id` completes or
 /// `timeout_ns` elapses. `timeout_ns == 0` is a poll.
 pub fn wait_fence(adapter: &AdapterContext, fence_id: u64, timeout_ns: u64) -> WaitFenceOutcome {
+    let passive = assume_passive_unaudited();
     // Scoped exactly as in `ctrl_roundtrip`. Every `return` below is a return
     // from the closure, and the deregistration pairing is unchanged: the four
     // early exits in the registration loop all happen BEFORE `Registered`, so
@@ -1704,7 +1768,7 @@ pub fn wait_fence(adapter: &AdapterContext, fence_id: u64, timeout_ns: u64) -> W
                         FENCE_WAIT_TABLE_FULL.fetch_add(1, Ordering::Relaxed);
                         return WaitFenceOutcome::TimedOut;
                     }
-                    sleep_ms(1);
+                    sleep_ms(passive, 1);
                 }
                 Ok(FenceWaitPrep::Registered) => break,
             }
@@ -1729,7 +1793,7 @@ pub fn wait_fence(adapter: &AdapterContext, fence_id: u64, timeout_ns: u64) -> W
         }
 
         let total_ms = (timeout_ns / 1_000_000).max(1).min(WAIT_FENCE_MAX_MS);
-        if wait_block(adapter, block, total_ms) {
+        if wait_block(passive, adapter, block, total_ms) {
             return WaitFenceOutcome::Complete;
         }
         match adapter.with_virtio(|v| {

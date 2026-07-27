@@ -143,7 +143,12 @@ pub unsafe extern "C" fn dxgkddi_destroy_device(h_device: *mut c_void) -> NTSTAT
         let blobs = crate::virtio::ctrl::release_blobs_for_owner(adapter, device_owner);
         let contexts = crate::virtio::ctrl::destroy_contexts_for_owner(adapter, device_owner);
         // Opportunistic PASSIVE reap of completed transport entries.
-        crate::virtio::ctrl::reap_parked(adapter);
+        // SAFETY: PLACEHOLDER (R614 commit 1) — `dxgkddi_destroy_device` mints
+        // the real token in the start/stop commit of this tranche.
+        crate::virtio::ctrl::reap_parked(
+            unsafe { crate::irql::PassiveLevel::assume() },
+            adapter,
+        );
         // 0x0E02_BBBB = blob-table size BEFORE reclaim (saturated to 16 bits).
         crate::diag::record(0x0E02_0000 | before.min(0xFFFF));
         // 0x0E03_RRCC = reclaimed blobs (RR) + contexts (CC).

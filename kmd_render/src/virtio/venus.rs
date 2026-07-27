@@ -1322,7 +1322,9 @@ impl VenusRing {
                 });
                 return Err(VirtioError::DeviceError);
             }
-            ctrl::sleep_ms(1);
+            // SAFETY: PLACEHOLDER (R614 commit 1) — replaced by `self.passive`
+            // when VenusRing gains the field in the next commit.
+            ctrl::sleep_ms(unsafe { crate::irql::PassiveLevel::assume() }, 1);
             slept_ms += 1;
         }
     }

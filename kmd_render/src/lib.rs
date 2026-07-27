@@ -39,6 +39,8 @@ mod device;
 mod diag;
 mod dxgk;
 mod error;
+// The PASSIVE_LEVEL proof token (R614) and the one definition of PASSIVE_LEVEL.
+mod irql;
 mod mapping;
 // Scaffolding: the transport's types/parsers are wired into the StartDevice path
 // over Phase-2 milestones M1–M4; allow dead_code until M4 consumes them all.

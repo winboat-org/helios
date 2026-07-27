@@ -262,7 +262,10 @@ pub unsafe extern "C" fn dxgkddi_start_device(
     let mut page_table_window = None;
     // SAFETY: dxgkrnl_interface is valid per the DDI contract (also copied into
     // the `dxgkrnl` local above); init only borrows it for the call.
-    match crate::virtio::VirtioGpu::init(unsafe { &*dxgkrnl_interface }) {
+    // SAFETY: PLACEHOLDER (R614 commit 1) — `dxgkddi_start_device` mints the real
+    // token in the start/stop commit of this tranche.
+    let passive_init = unsafe { crate::irql::PassiveLevel::assume() };
+    match crate::virtio::VirtioGpu::init(passive_init, unsafe { &*dxgkrnl_interface }) {
         Ok(gpu) => {
             crate::kmsg(c"Helios: virtio-gpu transport up\n");
             crate::diag::record(0x0B00_0003);
@@ -561,7 +564,11 @@ pub unsafe extern "C" fn dxgkddi_stop_device(miniport_device_context: *mut c_voi
         }
         // Free any parked completed entries at PASSIVE before the transport
         // (and the buffers still in flight inside it) is dropped.
-        crate::virtio::ctrl::reap_parked(adapter);
+        // SAFETY: PLACEHOLDER (R614 commit 1) — see above.
+        crate::virtio::ctrl::reap_parked(
+            unsafe { crate::irql::PassiveLevel::assume() },
+            adapter,
+        );
 
         // Tear down the virtio transport: VirtioGpu::drop resets the device and
         // frees its rings (plus any in-flight/parked entry buffers). A later
