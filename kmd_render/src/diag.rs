@@ -175,6 +175,14 @@ pub enum FaultCounter {
     /// (QEMU services the status write synchronously inside `virtio_reset()`),
     /// but every later assumption in `init` rests on that reset.
     StVioR,
+    /// A `DXGK_DRIVERCAPS` field did not fit the versioned buffer dxgkrnl
+    /// supplied and was SKIPPED — value is the count of skipped fields on the
+    /// last `DXGKQAITYPE_DRIVERCAPS` query. The adapter still reports the
+    /// maximal valid prefix, so this is a truncated capability surface rather
+    /// than a failure, but any movement means the OS is being told less than
+    /// this driver believes it said. Expected 0 on 24H2, which passes the full
+    /// 592-byte struct.
+    CapTrunc,
 }
 
 impl FaultCounter {
@@ -197,6 +205,7 @@ impl FaultCounter {
             FaultCounter::StRing => b"StRing",
             FaultCounter::StHpdX => b"StHpdX",
             FaultCounter::StVioR => b"StVioR",
+            FaultCounter::CapTrunc => b"CapTrunc",
         }
     }
 
@@ -217,6 +226,7 @@ impl FaultCounter {
         FaultCounter::StRing,
         FaultCounter::StHpdX,
         FaultCounter::StVioR,
+        FaultCounter::CapTrunc,
     ];
 }
 

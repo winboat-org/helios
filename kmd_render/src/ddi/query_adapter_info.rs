@@ -95,6 +95,93 @@ pub unsafe extern "C" fn dxgkddi_query_adapter_info(
     }
 }
 
+/// A dxgkrnl-supplied **versioned** output buffer: a leading prefix of `T` whose
+/// length the running OS chose, which may legitimately be SHORTER than `T`.
+///
+/// That is the whole reason this type exists. `query_driver_caps`'s size gate
+/// deliberately admits `OutputDataSize` values below `size_of::<DXGK_DRIVERCAPS>()`
+/// (592 on the bindgen'd 26100 headers) — a caps buffer is versioned, and 540 is
+/// all this driver's surface needs. Forming `&mut *(pOutputData as *mut
+/// DXGK_DRIVERCAPS)` over such a buffer is undefined behaviour *independent of
+/// which fields are touched*: a reference must be dereferenceable for its whole
+/// referent type. The old code did exactly that, and then wrote through
+/// `args.pOutputData` — a second, separately-derived raw pointer — while that
+/// reference was still live and used afterwards, which is additionally a
+/// Stacked-Borrows aliasing violation.
+///
+/// So: **`VersionedOut` never exposes the referent type by reference.** A wrapper
+/// that still handed out `&mut T` internally would relocate the defect, not remove
+/// it. The only way out of this type is [`VersionedOut::set`], one field at a time,
+/// each bounds-checked against the length the OS actually declared.
+///
+/// The bound also becomes self-maintaining. `REQUIRED_DRIVER_CAPS_SIZE` is a
+/// hand-maintained claim — "the last field we write is `SupportDirectFlip`" —
+/// that nothing checked against the writes below it. It is true today only by
+/// luck: `SupportMultiPlaneOverlay` sits at offset 540, exactly one byte past the
+/// checked bound, so `caps.SupportMultiPlaneOverlay = 1` in a future commit would
+/// have written past dxgkrnl's allocation in the DDI that gates adapter start.
+/// With a per-field check that write is refused and counted instead.
+struct VersionedOut {
+    base: *mut u8,
+    len: usize,
+    /// Fields skipped because they did not fit. Reported through `CapTrunc`.
+    skipped: u32,
+}
+
+impl VersionedOut {
+    /// # Safety
+    ///
+    /// `base` must be valid for writes of `len` bytes and must stay so for the
+    /// lifetime of this value. `len` is the size the runtime declared, NOT
+    /// `size_of::<T>()`.
+    unsafe fn new(base: *mut u8, len: usize) -> Self {
+        Self {
+            base,
+            len,
+            skipped: 0,
+        }
+    }
+
+    /// Write `value` at `offset` if the whole field lies inside the declared
+    /// buffer; otherwise count it and skip.
+    ///
+    /// Skipping rather than returning early is deliberate: a short buffer still
+    /// gets the maximal valid prefix of the capability surface, which is what a
+    /// versioned buffer means. A caller that needs a field to be mandatory must
+    /// enforce that through the minimum-size gate, not through this.
+    fn set<F>(&mut self, offset: usize, value: F) {
+        let fits = offset
+            .checked_add(size_of::<F>())
+            .is_some_and(|end| end <= self.len);
+        if !fits {
+            self.skipped = self.skipped.saturating_add(1);
+            return;
+        }
+        // SAFETY: `base` is valid for writes of `len` bytes (constructor
+        // precondition) and the check above proves `offset .. offset +
+        // size_of::<F>()` lies inside that range. `write_unaligned` because the
+        // buffer's alignment is dxgkrnl's to promise, not ours.
+        unsafe { self.base.add(offset).cast::<F>().write_unaligned(value) };
+    }
+}
+
+/// Byte offset of a `DXGK_DRIVERCAPS` field, including one level of nesting.
+///
+/// Written as an addition of two `offset_of!`s rather than a nested field path so
+/// it composes through the bindgen anonymous-union wrappers as well: for
+/// `PresentationCaps`/`FlipCaps`/`SchedulingCaps`/`MemoryManagementCaps` the flags
+/// union is the FIRST member of its struct and `Value` is the first member of that
+/// union, so the struct's own offset already names the `UINT` view — the same
+/// `.Value`-plus-mask convention the bit definitions below use.
+macro_rules! caps_offset {
+    ($field:ident) => {
+        offset_of!(DXGK_DRIVERCAPS, $field)
+    };
+    ($field:ident, $inner:ty, $sub:ident) => {
+        offset_of!(DXGK_DRIVERCAPS, $field) + offset_of!($inner, $sub)
+    };
+}
+
 /// The caps surface is a pure function of the build's compile-time levers and
 /// the two service knobs read below, so it no longer reads adapter state; the
 /// parameter stays so the dispatcher's arms remain uniform.
@@ -102,6 +189,11 @@ unsafe fn query_driver_caps(
     _adapter: &AdapterContext,
     args: &DXGKARG_QUERYADAPTERINFO,
 ) -> NTSTATUS {
+    // The MINIMUM this DDI insists on, unchanged at 540 so the
+    // STATUS_BUFFER_TOO_SMALL threshold and the 0x02CF record keep their values.
+    // It is no longer load-bearing for memory safety — every write below is
+    // individually bounded — but it still states the smallest surface worth
+    // reporting.
     const REQUIRED_DRIVER_CAPS_SIZE: usize =
         offset_of!(DXGK_DRIVERCAPS, SupportDirectFlip) + size_of::<BOOLEAN>();
 
@@ -110,27 +202,59 @@ unsafe fn query_driver_caps(
         crate::diag::record(0x02CF_0000 | ((REQUIRED_DRIVER_CAPS_SIZE as u32) & 0xFFFF));
         return STATUS_BUFFER_TOO_SMALL;
     }
-    // SAFETY: pOutputData points to a versioned DXGK_DRIVERCAPS buffer large
-    // enough for every field this WDDM 1.3 caps surface writes.
-    let caps = unsafe { &mut *(args.pOutputData as *mut DXGK_DRIVERCAPS) };
+
+    // Zero-fill FIRST, through the raw pointer, before any other pointer into the
+    // buffer exists. Doing it after deriving a writer is what made the old code
+    // an aliasing violation on top of the referent-size one.
+    // SAFETY: dxgkrnl gives us `OutputDataSize` writable bytes at `pOutputData`.
     unsafe { core::ptr::write_bytes(args.pOutputData as *mut u8, 0, args.OutputDataSize as usize) };
 
+    // SAFETY: as above — valid for writes of `OutputDataSize` bytes for the
+    // duration of this call, and no other pointer into it is live from here on.
+    let mut out =
+        unsafe { VersionedOut::new(args.pOutputData as *mut u8, args.OutputDataSize as usize) };
+
     // 64-bit addressable; no render/memory features are advertised here yet.
-    caps.HighestAcceptableAddress.QuadPart = -1;
-    caps.MaxAllocationListSlotId = 0xFFFF;
-    caps.ApertureSegmentCommitLimit = 64 * 1024 * 1024;
+    // `HighestAcceptableAddress` is a LARGE_INTEGER union whose `QuadPart` is the
+    // full 8-byte view at offset 0.
+    out.set::<i64>(caps_offset!(HighestAcceptableAddress), -1);
+    let max_allocation_list_slot_id: UINT = 0xFFFF;
+    out.set(
+        caps_offset!(MaxAllocationListSlotId),
+        max_allocation_list_slot_id,
+    );
+    let aperture_segment_commit_limit: SIZE_T = 64 * 1024 * 1024;
+    out.set(
+        caps_offset!(ApertureSegmentCommitLimit),
+        aperture_segment_commit_limit,
+    );
     // Not a legacy VGA device.
-    caps.SupportNonVGA = 1;
+    let support_non_vga: BOOLEAN = 1;
+    out.set(caps_offset!(SupportNonVGA), support_non_vga);
 
     // One value drives this, DXGKQAITYPE_WDDMDEVICECAPS and DriverEntry's
     // DRIVER_INITIALIZATION_DATA.Version. Dxgkrnl rejects internally
     // inconsistent version/capability surfaces during AddAdapter.
-    caps.WDDMVersion = SURFACE.driver_caps_version();
-    caps.PreemptionCaps.GraphicsPreemptionGranularity =
-        D3DKMDT_GRAPHICS_PREEMPTION_DMA_BUFFER_BOUNDARY;
-    caps.PreemptionCaps.ComputePreemptionGranularity =
-        D3DKMDT_COMPUTE_PREEMPTION_DMA_BUFFER_BOUNDARY;
-    caps.SupportPerEngineTDR = 1;
+    let wddm_version = SURFACE.driver_caps_version();
+    out.set(caps_offset!(WDDMVersion), wddm_version);
+    out.set(
+        caps_offset!(
+            PreemptionCaps,
+            D3DKMDT_PREEMPTION_CAPS,
+            GraphicsPreemptionGranularity
+        ),
+        D3DKMDT_GRAPHICS_PREEMPTION_DMA_BUFFER_BOUNDARY,
+    );
+    out.set(
+        caps_offset!(
+            PreemptionCaps,
+            D3DKMDT_PREEMPTION_CAPS,
+            ComputePreemptionGranularity
+        ),
+        D3DKMDT_COMPUTE_PREEMPTION_DMA_BUFFER_BOUNDARY,
+    );
+    let support_per_engine_tdr: BOOLEAN = 1;
+    out.set(caps_offset!(SupportPerEngineTDR), support_per_engine_tdr);
 
     // Required WDDM 1.2+ render-only caps. Bit positions verified field-by-field
     // against WDK 10.0.26100 `shared/d3dkmddi.h` (2026-06-18). `__bindgen_anon_1`
@@ -216,15 +340,19 @@ unsafe fn query_driver_caps(
 
     // No GDI hardware acceleration (see the note above): every documented
     // DXGK_PRESENTATIONCAPS bit stays clear.
-    caps.PresentationCaps.__bindgen_anon_1.Value = 0;
-    caps.FlipCaps.__bindgen_anon_1.Value = FLIPCAPS_FLIP_ON_VSYNC_MMIO;
-    caps.SchedulingCaps.__bindgen_anon_1.Value =
+    let presentation_caps: UINT = 0;
+    let flip_caps: UINT = FLIPCAPS_FLIP_ON_VSYNC_MMIO;
+    let scheduling_caps: UINT =
         SCHEDULINGCAPS_MULTI_ENGINE_AWARE | SCHEDULINGCAPS_PREEMPTION_AWARE;
-    caps.MemoryManagementCaps.__bindgen_anon_1.Value = mem_caps;
+    out.set(caps_offset!(PresentationCaps), presentation_caps);
+    out.set(caps_offset!(FlipCaps), flip_caps);
+    out.set(caps_offset!(SchedulingCaps), scheduling_caps);
+    out.set(caps_offset!(MemoryManagementCaps), mem_caps);
     // PagingNode = 0 (single engine node). MemoryManagementCaps.PagingNode is the
     // second field of DXGK_VIDMMCAPS, after the flags union; the zero-fill at the
     // top of this fn already leaves it 0, which is what we want.
-    caps.MaxQueuedFlipOnVSync = 1;
+    let max_queued_flip_on_vsync: UINT = 1;
+    out.set(caps_offset!(MaxQueuedFlipOnVSync), max_queued_flip_on_vsync);
     // DIRECT-FLIP DENIAL (27th session, 2026-07-07): SupportDirectFlip=1 was an
     // unbacked bring-up advertisement (no bisect ever showed it load-mandatory —
     // the STEP-0 bisect above proved only FlipOnVSyncMmIo). On this adapter it is
@@ -240,23 +368,41 @@ unsafe fn query_driver_caps(
     // (mcdm-implementation-guidelines.md) requires 0 here. `DirectFlipCaps`
     // service knob (default 0) restores the legacy advertisement for A/B via
     // reg add + devcon restart; value lands in the 0x01D7 diag record bit 2.
-    caps.SupportDirectFlip = if direct_flip_advertised() { 1 } else { 0 };
-    caps.GpuEngineTopology.NbAsymetricProcessingNodes = 1;
+    let support_direct_flip: BOOLEAN = if direct_flip_advertised() { 1 } else { 0 };
+    out.set(caps_offset!(SupportDirectFlip), support_direct_flip);
+    let nb_asymetric_processing_nodes: UINT = 1;
+    out.set(
+        caps_offset!(
+            GpuEngineTopology,
+            DXGK_GPUENGINETOPOLOGY,
+            NbAsymetricProcessingNodes
+        ),
+        nb_asymetric_processing_nodes,
+    );
 
-    crate::diag::record(0x01D0_0000 | ((caps.WDDMVersion as u32) & 0xFFFF));
-    crate::diag::record(0x01D1_0000 | (caps.PresentationCaps.__bindgen_anon_1.Value & 0xFFFF));
-    crate::diag::record(0x01D2_0000 | (caps.FlipCaps.__bindgen_anon_1.Value & 0xFFFF));
-    crate::diag::record(0x01D3_0000 | (caps.SchedulingCaps.__bindgen_anon_1.Value & 0xFFFF));
-    crate::diag::record(0x01D4_0000 | (caps.MemoryManagementCaps.__bindgen_anon_1.Value & 0xFFFF));
-    crate::diag::record(0x01D5_0000 | ((caps.MaxAllocationListSlotId as u32) & 0xFFFF));
-    crate::diag::record(0x01D6_0000 | ((caps.ApertureSegmentCommitLimit as u32) & 0xFFFF));
+    // Recorded from the LOCALS, not read back out of dxgkrnl's buffer. Reading
+    // back would need a second pointer into it for no benefit, and a field that
+    // `set` skipped would report as 0 rather than as the value this driver
+    // believes it advertised — `CapTrunc` is what says a field was dropped.
+    crate::diag::record(0x01D0_0000 | ((wddm_version as u32) & 0xFFFF));
+    crate::diag::record(0x01D1_0000 | (presentation_caps & 0xFFFF));
+    crate::diag::record(0x01D2_0000 | (flip_caps & 0xFFFF));
+    crate::diag::record(0x01D3_0000 | (scheduling_caps & 0xFFFF));
+    crate::diag::record(0x01D4_0000 | (mem_caps & 0xFFFF));
+    crate::diag::record(0x01D5_0000 | (max_allocation_list_slot_id & 0xFFFF));
+    crate::diag::record(0x01D6_0000 | ((aperture_segment_commit_limit as u32) & 0xFFFF));
     crate::diag::record(
         0x01D7_0000
-            | (((caps.SupportNonVGA as u32) & 1) << 0)
-            | (((caps.SupportPerEngineTDR as u32) & 1) << 1)
-            | (((caps.SupportDirectFlip as u32) & 1) << 2),
+            | (((support_non_vga as u32) & 1) << 0)
+            | (((support_per_engine_tdr as u32) & 1) << 1)
+            | (((support_direct_flip as u32) & 1) << 2),
     );
-    crate::diag::record(0x01D8_0000 | (caps.GpuEngineTopology.NbAsymetricProcessingNodes & 0xFFFF));
+    crate::diag::record(0x01D8_0000 | (nb_asymetric_processing_nodes & 0xFFFF));
+
+    // Ungated: a truncated capability surface must be visible on a default boot.
+    // Written unconditionally (not only when nonzero) so the value describes THIS
+    // query rather than the last one that happened to truncate.
+    crate::diag::fault(crate::diag::FaultCounter::CapTrunc, out.skipped);
 
     STATUS_SUCCESS
 }
@@ -400,12 +546,18 @@ const REPORT_APERTURE_PAGING_SEGMENT: bool = true;
 /// contract that specifically requires it.
 pub(crate) const DECLARE_CROSS_ADAPTER_RESOURCE: bool = false;
 
-// The WDDM level itself — WDDM-sync-redesign M1's `RAISE_WDDM_3_2_GPUMMU` and the
-// display-surface lever that sat beside it — is now the single
-// `crate::ddi::wddm_surface::SURFACE` value. Two independently-readable bools could
-// express a PARTIAL raise, which is internally inconsistent and which dxgkrnl
-// rejects at AddAdapter. See `ddi/wddm_surface.rs` for the level history.
-
+/// WDDM-sync-redesign M1 (2026-06-25) raised the adapter off the bring-up WDDM 1.3
+/// surface so the OS enables the monitored-fence path that `D3DDDI_MONITORED_FENCE`
+/// requires. That lever, and the display-surface lever that used to sit beside it,
+/// are now the single [`crate::ddi::wddm_surface::SURFACE`] value — a partial raise
+/// is internally inconsistent, dxgkrnl rejects it at AddAdapter, and two
+/// independently-readable bools could express exactly that. See
+/// `ddi/wddm_surface.rs` for the level history and `WDDM_SYNC_REDESIGN.md` M1.
+///
+/// The GpuMmu DDI surface (GPUMMUCAPS, page-table-level desc, SetRootPageTable,
+/// GetRootPageTableSize, BuildPagingBuffer, SubmitCommand/SubmitCommandVirtual,
+/// CreateProcess) is implemented (decorative/null engine), so the level only flips
+/// the capability *declaration*.
 /// `DirectFlipCaps` service knob (REG_DWORD, default 0): 0 = deny direct flip
 /// everywhere (adapter cap + aperture segment flags — the truthful surface for
 /// a zero-scanout render adapter; see the SupportDirectFlip comment in
