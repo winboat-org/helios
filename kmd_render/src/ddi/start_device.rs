@@ -10,12 +10,6 @@ use core::ffi::c_void;
 use crate::adapter::AdapterContext;
 use crate::dxgk::*;
 
-/// Run the in-StartDevice venus self-allocation of the page-table window. Gated so
-/// the safe/recovery build boots cleanly: the venus client busy-polls a ring in
-/// StartDevice and a protocol bug there can hang/crash boot. Turn ON only when
-/// debugging the venus path with ntoseye attached (so a wedge is catchable).
-const VENUS_ALLOC_ENABLED: bool = true;
-
 /// Size cap for the VidMm-owned head partition of the host-visible window (the
 /// CPU-visible BAR memory segment). The window is 8 GiB on the current
 /// QEMU config (`hostmem=8G`); 1 GiB comfortably holds the CPU-rasterized
@@ -202,11 +196,6 @@ fn bring_up_venus(
     passive: crate::irql::PassiveLevel,
     adapter: &AdapterContext,
 ) -> (u32, Option<(u64, u64)>) {
-    if !VENUS_ALLOC_ENABLED {
-        // venus page-table allocation disabled — boot-safe build.
-        adapter.set_venus_client(None);
-        return (0, None);
-    }
     // Persistent venus context for the device lifetime (owner 0: KMD-internal,
     // destroyed explicitly in StopDevice).
     let venus_result =
@@ -910,9 +899,12 @@ pub unsafe extern "C" fn dxgkddi_query_child_status(
 
 /// `DxgkDdiQueryDeviceDescriptor` — return the child monitor's descriptor (EDID).
 ///
-/// DisplayHalf on: we ship no EDID, so report CHILD_DESCRIPTOR_NOT_SUPPORTED and
-/// let the OS synthesize a default monitor (its modes come from
-/// `DxgkDdiRecommendMonitorModes`). Off: no child descriptors at all.
+/// DisplayHalf on: serve the REAL EDID generated at StartDevice for the host's
+/// scanout-0 mode, in the OS-requested chunk. That is what makes the OS build a
+/// presentable target; the EDID-less `CHILD_DESCRIPTOR_NOT_SUPPORTED`
+/// default-monitor path this doc used to describe was replaced in the 36th
+/// session and is a suspect for the mode-set retry loop. Off: no child
+/// descriptors at all (`STATUS_NOT_SUPPORTED`).
 pub unsafe extern "C" fn dxgkddi_query_device_descriptor(
     miniport_device_context: *mut c_void,
     child_uid: u32,

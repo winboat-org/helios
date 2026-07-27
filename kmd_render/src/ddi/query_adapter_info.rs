@@ -326,7 +326,7 @@ unsafe fn query_driver_caps(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTE
     const MEMORYMANAGEMENTCAPS_GPU_MMU_SUPPORTED: u32 = 1 << 6;
 
     let mut mem_caps = MEMORYMANAGEMENTCAPS_SECTION_BACKED_PRIMARY;
-    if DECLARE_CROSS_ADAPTER_RESOURCE || knobs.cross_adapter {
+    if knobs.cross_adapter {
         mem_caps |= MEMORYMANAGEMENTCAPS_CROSS_ADAPTER_RESOURCE;
     }
     if SURFACE.gpu_mmu() {
@@ -535,31 +535,6 @@ const _: () = assert!(APERTURE_COMMIT_LIMIT <= APERTURE_SEGMENT_SIZE as u64);
 // state space every reader of `query_segments` had to consider. Deleted with the
 // rest of the known-rejected shapes; the aperture-first rule is now unconditional
 // and stated once, here.
-
-/// PATH-A lever (2026-06-22): declare `DXGK_VIDMMCAPS::CrossAdapterResource` so the
-/// OS can use Helios as the cross-adapter render side for the Looking Glass IDD's
-/// composition swapchain. See the comment in `query_driver_caps`. Gated for clean
-/// reversibility — flip to `false` and redeploy if it destabilizes boot.
-/// `pub(crate)` is now vestigial: a grep finds exactly ONE reader, the `mem_caps`
-/// OR below. The claim this comment used to make — that `create_allocation.rs`
-/// gates a matching cross-adapter surface layout (aperture-eligible + 256-aligned
-/// linear) on the same lever — is stale; that file does not read this const.
-///
-/// 2026-06-22 EXPERIMENT RESULT (1st try, `true`): declaring the cap made dxgkrnl
-/// drive the GDI hardware-acceleration render path (`DxgkDdiRenderKm`) against the
-/// cross-adapter resource — gated by our (mandatory-for-load)
-/// `SupportKernelModeCommandBuffer` cap — and our `RenderKm` returned
-/// `STATUS_NOT_IMPLEMENTED`, so dxgkrnl `call`ed a null DMA/submission pointer
-/// (`dxgkrnl!ADAPTER_RENDER::DdiRenderGdi+0x140`, `call rax` rax=0 → kernel
-/// 0xC0000005). FIX: `dxgkddi_render_km`/`dxgkddi_render_gdi` now record the command
-/// into the DMA buffer + advance the output pointer + return SUCCESS
-/// (`submit_command.rs`), satisfying the GDI-HW-accel DDI contract
-/// (`gdi-hardware-acceleration.md`: CreateAllocation + GetStandardAllocationDriverData
-/// + RenderKm). Re-tested with the cap enabled in build 22.22.57.0: DXGI still
-/// presented with hDstRes=0 and no Blt/Blt1 destination, while restart churn hit
-/// venus/DWM/explorer crashes. Keep disabled until we have a resource-allocation
-/// contract that specifically requires it.
-pub(crate) const DECLARE_CROSS_ADAPTER_RESOURCE: bool = false;
 
 /// WDDM-sync-redesign M1 (2026-06-25) raised the adapter off the bring-up WDDM 1.3
 /// surface so the OS enables the monitored-fence path that `D3DDDI_MONITORED_FENCE`

@@ -213,7 +213,6 @@ const RING_SHMEM_SIZE: u64 = RING_BUFFER_OFFSET + RING_BUFFER_SIZE as u64 + RING
 const RING_IDLE_TIMEOUT_NS: u64 = 1_000_000;
 
 /// Ring status bits (`VkRingStatusFlagsMESA`).
-const RING_STATUS_IDLE: u32 = 0x1;
 const RING_STATUS_FATAL: u32 = 0x2;
 
 /// Reply shmem size — generous for the small replies we read (largest is the

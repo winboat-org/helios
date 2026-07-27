@@ -306,8 +306,10 @@ pub(crate) struct AdapterKnobs {
     /// cap and the aperture segment flags, which is the point of reading it once.
     pub direct_flip: bool,
     /// `CrossAdaptCaps` (default 0). Nonzero advertises
-    /// `DXGK_VIDMMCAPS.CrossAdapterResource` (tier-1 cross-adapter copy support),
-    /// OR'd with the compile-time `DECLARE_CROSS_ADAPTER_RESOURCE`.
+    /// `DXGK_VIDMMCAPS.CrossAdapterResource` (tier-1 cross-adapter copy support).
+    /// The compile-time `DECLARE_CROSS_ADAPTER_RESOURCE` this used to be OR'd
+    /// with was a `const false` and went with T6/R905; this knob is now the only
+    /// way to set the bit.
     pub cross_adapter: bool,
     /// `BarSegFlags` (default 0x1C = CacheCoherent | SupportsCpuHostAperture |
     /// SupportsCachedCpuHostAperture). The BAR descriptor's flag word.
