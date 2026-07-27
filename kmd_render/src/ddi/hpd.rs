@@ -223,20 +223,20 @@ pub unsafe extern "C" fn hpd_thread_routine(context: *mut c_void) {
         // PASSIVE continuation for that exact callback.
         crate::ddi::display::process_deferred_vidpn_source_address(passive, adapter);
 
-        // The ScanoutDiag forced-rebind experiment. It lives HERE, and not in
-        // apply_vidpn_source_address_locked where it used to sit, because there
-        // it short-circuited the production publication path: both of its
-        // `return true` arms skipped every remaining exit - including the
-        // vidpn_programming.store(0) that all sibling exits perform - while the
+        // T6/R901 deleted the `ScanoutDiag` forced-rebind experiment that used
+        // to run here. T1a had already moved it off
+        // `apply_vidpn_source_address_locked`, where both of its `return true`
+        // arms short-circuited the production publication path -- skipping the
+        // `vidpn_programming.store(0)` every sibling exit performs -- while the
         // DDI returned STATUS_SUCCESS to dxgkrnl as if the Windows primary had
         // been programmed. The gate stayed at 1, the VSync heartbeat stopped,
         // and the Windows primary was never bound again for the rest of the boot.
+        // Deleting the experiment removes that failure mode by construction
+        // rather than by keeping it on a worker that cannot lie to the OS.
         //
-        // This worker is PASSIVE and owns no dxgkrnl return value, so the
-        // experiment can no longer lie to the OS. `rebind_if_forced` is
-        // unchanged and keeps its own `ScanoutDiag >= 2 && display_half` gate,
-        // so every SdgR* counter keeps its exact name and value.
-        let _ = crate::ddi::scanout_diag::rebind_if_forced(passive, adapter, 11);
+        // It also removed a synchronous `RtlQueryRegistryValues` per programmed
+        // primary, which contradicted `adapter.rs`'s own "never query the
+        // registry on every frame".
 
         // Drain an armed one-shot Present probe (R320). Taking the record is a
         // quick operation under the venus mutex; the probe itself — a 5 s fence
