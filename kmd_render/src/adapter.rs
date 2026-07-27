@@ -209,6 +209,14 @@ pub(crate) struct StartedState {
     /// Every service-key knob, snapshotted once at StartDevice. See
     /// [`AdapterKnobs`].
     pub knobs: AdapterKnobs,
+    /// The segment table this adapter REPORTS, built once in StartDevice from
+    /// the same `BarSegment` value every other consumer reads.
+    ///
+    /// `query_segments` renders this; it does not re-derive one. That is what
+    /// makes the count reported on the descriptor-NULL call and the descriptors
+    /// written on the second call the same immutable value — the premise the old
+    /// SAFETY comment stated as its conclusion.
+    pub segment_table: crate::ddi::segment_table::SegmentTable,
     /// Scanout-0 mode the display half presents, together with the EDID
     /// generated from it. See [`ScanoutMode`].
     pub scanout_mode: ScanoutMode,
@@ -401,6 +409,7 @@ impl StartedState {
         knobs: AdapterKnobs,
         scanout_mode: ScanoutMode,
         paging_ram: Option<PagingRam>,
+        segment_table: crate::ddi::segment_table::SegmentTable,
     ) -> Box<Self> {
         Box::new(Self {
             // SAFETY: per the fn contract; a plain POD copy of dxgkrnl's buffer.
@@ -408,6 +417,7 @@ impl StartedState {
             knobs,
             scanout_mode,
             paging_ram,
+            segment_table,
             transport: UnsafeCell::new(None),
         })
     }
@@ -518,6 +528,11 @@ pub struct AdapterContext {
     /// never mutated — which is why it needs no `UnsafeCell` and no ordering,
     /// unlike everything below it. Reads go through [`Self::knobs`].
     initial_knobs: AdapterKnobs,
+    /// `NbSegment` as reported on the descriptor-NULL call of the two-call
+    /// QUERYSEGMENT protocol — the number of descriptor slots dxgkrnl then
+    /// allocates. The descriptor pass clamps to this, because only dxgkrnl knows
+    /// how many slots it allocated and this is the number we told it.
+    reported_segment_count: AtomicU32,
     /// Everything StartDevice establishes, published ONCE. See [`StartedState`].
     ///
     /// Reached only through [`Self::started`]; there is no `&mut` path to it, so
@@ -1134,6 +1149,9 @@ impl AdapterContext {
             // `DEFAULTS`. Written once, before this context is published, so it
             // needs no interior mutability and no synchronisation.
             initial_knobs: AdapterKnobs::read(),
+            reported_segment_count: AtomicU32::new(
+                crate::ddi::segment_table::SegmentTable::MAX as u32,
+            ),
             started: UnsafeCell::new(None),
             started_published: AtomicU32::new(0),
             last_completed_fence: AtomicU32::new(0),
@@ -2341,6 +2359,35 @@ impl AdapterContext {
     /// reference would tie every caller's borrow to the published slot.
     pub(crate) fn knobs(&self) -> AdapterKnobs {
         self.started().map_or(self.initial_knobs, |s| s.knobs)
+    }
+
+    /// Latch the `NbSegment` reported on the descriptor-NULL call.
+    ///
+    /// `Relaxed` is sufficient and correct: both calls of the two-call protocol
+    /// arrive on the same dxgkrnl-serialized PASSIVE path, so this is a plain
+    /// carry between them, not a synchronisation edge.
+    pub(crate) fn latch_reported_segment_count(&self, count: u32) {
+        self.reported_segment_count
+            .store(count, core::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The count latched by [`Self::latch_reported_segment_count`], i.e. the
+    /// number of descriptor slots dxgkrnl allocated. `SegmentTable::MAX` before
+    /// any NULL call, so a descriptor pass that somehow arrived first is bounded
+    /// by the table's own capacity rather than by zero.
+    pub(crate) fn reported_segment_count(&self) -> u32 {
+        self.reported_segment_count
+            .load(core::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The reported segment table, or `None` before StartDevice has published one.
+    ///
+    /// `None` is not reachable in practice — a DiagLevel=1 ring shows StartDevice
+    /// completing before the first QueryAdapterInfo — but the query path handles
+    /// it explicitly rather than assuming, and falls back to the aperture-only
+    /// shape it would otherwise have emitted.
+    pub(crate) fn segment_table(&self) -> Option<crate::ddi::segment_table::SegmentTable> {
+        self.started().map(|s| s.segment_table)
     }
 
     /// `DisplayHalf`: whether the display DDIs answer for real. False before

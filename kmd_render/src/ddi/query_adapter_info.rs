@@ -776,97 +776,85 @@ unsafe fn query_segments(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTERIN
     out.PagingBufferSize = 64 * 1024;
     out.PagingBufferPrivateDataSize = 0;
 
-    {
-        // Aperture (id 1, idx 0) = paging-buffer host, which is what passes
-        // InitDmaPools (see the note above the aperture constants). The second
-        // slot is the BAR under `BarSegTopology::ApertureAndBar`, or the
-        // AddDevice-time RAM-backed cpu-host MEMORY segment under `Disabled`.
-        //
-        // The RAM slot must use `paging_ram`, not `page_table_window`:
-        // QuerySegment4 runs before StartDevice's venus allocation, so
-        // `page_table_window` is not available when VidMm builds its segment
-        // table. If the contiguous RAM allocation was unavailable too, this
-        // falls back to NbSegment = 1 (aperture only).
-        let page_table = adapter.paging_ram();
-        let bar = adapter.bar_segment().map(|b| (b.gpa, b.size));
-        crate::diag::record(if descriptors.is_null() {
-            0x0901_0000
-        } else {
-            0x0901_0001
-        });
-        crate::diag::record(if page_table.is_some() {
-            0x0902_0001
-        } else {
-            0x0902_0000
-        });
-        crate::diag::record(if bar.is_some() {
-            0x0905_0001
-        } else {
-            0x0905_0000
-        });
+    // The table is BUILT IN StartDevice (`build_segment_table`) and only
+    // RENDERED here. It used to be synthesized from live adapter state on every
+    // call, independently of the `adapter.bar_segment` three other subsystems
+    // read, and the two could disagree (k-capsescape-04).
+    //
+    // `None` means StartDevice has not published one. Not reachable in practice
+    // — a DiagLevel=1 ring shows StartDevice completing before the first
+    // QueryAdapterInfo — but handled explicitly, falling back to the same
+    // aperture-only shape the no-BAR baseline emits. NbSegment = 0 is a shape
+    // this driver has never booted and must never be emitted.
+    let table = adapter
+        .segment_table()
+        .unwrap_or(crate::ddi::segment_table::SegmentTable::APERTURE_ONLY);
 
-        // Segment TABLE per topology (`BarSegTopology` — see `setup_bar_segment`).
-        // The list is (writer, args) per positional slot; ids are positional
-        // (index 0 = id 1). The aperture is ALWAYS first (InitDmaPools
-        // validates segdesc[0] for paging-buffer-host capability).
-        enum Seg {
-            Aperture,
-            RamCpuHost(u64, u64),
-            Bar(u64, u64),
+    crate::diag::record(if descriptors.is_null() {
+        0x0901_0000
+    } else {
+        0x0901_0001
+    });
+    crate::diag::record(if adapter.paging_ram().is_some() {
+        0x0902_0001
+    } else {
+        0x0902_0000
+    });
+    crate::diag::record(if table.bar_seg_id().is_some() {
+        0x0905_0001
+    } else {
+        0x0905_0000
+    });
+
+    out.NbSegment = table.len();
+    out.PagingBufferSegmentId = gpummu::APERTURE_SEGMENT_ID;
+
+    if descriptors.is_null() {
+        // Call 1 of the two-call protocol: report the count only. Latch it, so
+        // the descriptor pass has a bound that came from what we actually told
+        // dxgkrnl rather than from a recount.
+        adapter.latch_reported_segment_count(table.len());
+    } else {
+        // Only dxgkrnl knows how many descriptor slots it allocated, and it
+        // allocated the count we reported on the NULL call. Clamp to that rather
+        // than to a fresh `table.len()`: with an immutable post-StartDevice table
+        // the two agree, and this counter is what keeps that true.
+        let reported = adapter.reported_segment_count();
+        let writable = table.len().min(reported);
+        if writable != table.len() {
+            crate::diag::fault(crate::diag::FaultCounter::SegCntMis, table.len());
         }
-        let mut table: [Option<Seg>; 2] = [Some(Seg::Aperture), None];
-        // Exhaustive over the two shapes, with no wildcard arm: a segment
-        // topology can no longer be selected by falling off the end of a match
-        // over an integer knob.
-        match (bar, page_table) {
-            // ApertureAndBar (production): aperture + the BAR as id 2. The
-            // paging-RAM segment is dropped — it was vestigial, since page
-            // tables live in system segment 0 and paging buffers in the
-            // aperture.
-            //
-            // Note this arm no longer depends on `page_table`. Under the deleted
-            // topologies a `None` paging-RAM allocation made the whole match fall
-            // through to the wildcard, which silently dropped the BAR from the
-            // REPORTED table while `adapter.bar_segment` stayed `Some` — every
-            // BAR consumer then placed allocations against a segment id dxgkrnl
-            // was never told about (k-capsescape-04).
-            (Some((gpa, size)), _) => {
-                table[1] = Some(Seg::Bar(gpa, size));
+        for (seg_id, spec) in table.iter() {
+            let idx = seg_id - 1;
+            if idx >= writable {
+                break;
             }
-            // Disabled: aperture + the paging-RAM cpu-host segment as id 2. The
-            // recovery baseline that always binds.
-            (None, Some((rgpa, rsize))) => {
-                table[1] = Some(Seg::RamCpuHost(rgpa, rsize));
-            }
-            // Disabled with no contiguous RAM either: aperture only.
-            (None, None) => {}
-        }
-        out.NbSegment = table.iter().flatten().count() as u32;
-        out.PagingBufferSegmentId = gpummu::APERTURE_SEGMENT_ID;
-        if !descriptors.is_null() {
-            for (idx, seg) in table.iter().flatten().enumerate() {
-                // SAFETY: the second QUERYSEGMENT4 call provides NbSegment
-                // descriptors; idx < NbSegment by construction.
-                let d = unsafe {
-                    (descriptors as *mut u8).add(idx * stride) as *mut DXGK_SEGMENTDESCRIPTOR4
-                };
-                match seg {
-                    Seg::Aperture => unsafe { write_aperture_descriptor(d, &knobs) },
-                    Seg::RamCpuHost(gpa, size) => {
-                        crate::diag::record(0x0903_0000 | (((gpa >> 12) as u32) & 0xFFFF));
-                        crate::diag::record(0x0904_0000 | (((size >> 12) as u32) & 0xFFFF));
-                        // SAFETY: d is a writable descriptor slot (above).
-                        unsafe { write_cpu_host_memory_descriptor(d, *gpa, *size) };
-                    }
-                    Seg::Bar(gpa, size) => {
-                        crate::diag::record(0x0906_0000 | (((size >> 20) as u32) & 0xFFFF));
-                        // Knob-driven descriptor (BarSegFlags/BarSegBaseMB) —
-                        // the AddAdapter shape bisect. The production shape is
-                        // CpuHostAperture-like: DxgkDdiMapCpuHostAperture maps
-                        // each allocation's venus blob at the dxgkrnl-chosen
-                        // aperture offset within this window.
-                        unsafe { write_bar_knob_descriptor(d, *gpa, *size, &knobs) };
-                    }
+            // SAFETY: `descriptors` is dxgkrnl's array of `SegmentDescriptorStride`
+            // -sized slots, and `idx < writable <= reported` — the count reported
+            // on the descriptor-NULL call, which is the number of slots dxgkrnl
+            // allocated. NOT "by construction": that was the premise the previous
+            // comment asserted without establishing.
+            let d = unsafe {
+                (descriptors as *mut u8).add(idx as usize * stride) as *mut DXGK_SEGMENTDESCRIPTOR4
+            };
+            match spec {
+                crate::ddi::segment_table::SegmentSpec::Aperture => unsafe {
+                    write_aperture_descriptor(d, &knobs)
+                },
+                crate::ddi::segment_table::SegmentSpec::RamCpuHost { base, size } => {
+                    crate::diag::record(0x0903_0000 | (((base >> 12) as u32) & 0xFFFF));
+                    crate::diag::record(0x0904_0000 | (((size >> 12) as u32) & 0xFFFF));
+                    // SAFETY: d is a writable descriptor slot (above).
+                    unsafe { write_cpu_host_memory_descriptor(d, base, size) };
+                }
+                crate::ddi::segment_table::SegmentSpec::Bar { gpa, size, .. } => {
+                    crate::diag::record(0x0906_0000 | (((size >> 20) as u32) & 0xFFFF));
+                    // Knob-driven descriptor (BarSegFlags/BarSegBaseMB). The
+                    // production shape is CpuHostAperture-like:
+                    // DxgkDdiMapCpuHostAperture maps each allocation's venus blob
+                    // at the dxgkrnl-chosen aperture offset within this window.
+                    // SAFETY: d is a writable descriptor slot (above).
+                    unsafe { write_bar_knob_descriptor(d, gpa, size, &knobs) };
                 }
             }
         }

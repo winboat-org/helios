@@ -188,6 +188,25 @@ pub enum FaultCounter {
     /// likely a VM left set from one of the deleted Code-43 bisect arms
     /// (1/2/5/11); the only legal values are 0 and 10.
     BarMCo,
+    /// The proposed segment table broke the AddAdapter ordering rule and was
+    /// REFUSED — value is the `SegmentRuleViolation` code (1 = a cpu-host
+    /// segment was not last, 2 = too many segments). The adapter binds with the
+    /// aperture-only shape instead of landing in Code 43, which is the whole
+    /// point: the rule was previously enforced by nothing and its violation
+    /// surfaced only as a dead device.
+    SegRule,
+    /// The BAR segment was dropped from the REPORTED table while the driver's
+    /// own `bar_segment` said otherwise — value is 1. StartDevice clears
+    /// `bar_segment` in the same step, so this counts a state divergence that
+    /// was PREVENTED. Any movement means the reported topology and the
+    /// allocation path disagreed about which segment ids exist.
+    SegDiv,
+    /// The descriptor pass of the two-call segment protocol disagreed with the
+    /// count reported on the descriptor-NULL call — value is the count the
+    /// render pass wanted. The write loop is clamped to the reported count, so
+    /// this is the counter behind that clamp's SAFETY comment. Not constructible
+    /// with an immutable post-StartDevice table; it exists so that stays true.
+    SegCntMis,
 }
 
 impl FaultCounter {
@@ -212,6 +231,9 @@ impl FaultCounter {
             FaultCounter::StVioR => b"StVioR",
             FaultCounter::CapTrunc => b"CapTrunc",
             FaultCounter::BarMCo => b"BarMCo",
+            FaultCounter::SegRule => b"SegRule",
+            FaultCounter::SegDiv => b"SegDiv",
+            FaultCounter::SegCntMis => b"SegCntMis",
         }
     }
 
@@ -234,6 +256,9 @@ impl FaultCounter {
         FaultCounter::StVioR,
         FaultCounter::CapTrunc,
         FaultCounter::BarMCo,
+        FaultCounter::SegRule,
+        FaultCounter::SegDiv,
+        FaultCounter::SegCntMis,
     ];
 }
 

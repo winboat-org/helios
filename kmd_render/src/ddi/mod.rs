@@ -21,6 +21,7 @@ mod present_packet;
 pub(crate) mod query_adapter_info;
 mod scanout_diag;
 mod scheduler;
+pub(crate) mod segment_table;
 mod start_device;
 mod submit_command;
 pub(crate) mod vidpn;

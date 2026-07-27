@@ -124,6 +124,70 @@ fn setup_bar_segment(
     })
 }
 
+/// Build the reported segment table, and make the driver's own view agree with it.
+///
+/// The single construction site. `query_segments` used to synthesize a table of
+/// its own from live adapter state on every call while `adapter.bar_segment`
+/// carried an independent view of the same BAR, and the two could disagree —
+/// three subsystems then placed allocations against a segment id dxgkrnl was
+/// never told about (k-capsescape-04).
+///
+/// `bar_segment` is taken by `&mut` precisely so that cannot happen: if the BAR
+/// does not make it into the table, it is cleared here, in the same step, before
+/// the transport generation that publishes it is installed. `SegDiv` counts that
+/// — a divergence PREVENTED, not observed.
+///
+/// A rule violation is refused rather than reported: binding with the
+/// aperture-only shape and a `SegRule` breadcrumb beats AddAdapter failing with
+/// Code 43 and nothing in the ring naming the rule. The aperture-only shape is
+/// the same one the no-BAR baseline emits, so it is a known-good fallback.
+fn build_segment_table(
+    bar_segment: &mut Option<crate::adapter::BarSegment>,
+    paging_ram: Option<(u64, u64)>,
+    knobs: &crate::adapter::AdapterKnobs,
+) -> crate::ddi::segment_table::SegmentTable {
+    use crate::ddi::segment_table::{SegmentSpec, SegmentTable};
+
+    // The aperture is ALWAYS first: InitDmaPools validates segdesc[0] for
+    // paging-buffer-host capability, which a CPU-visible memory segment never has.
+    let mut specs = [SegmentSpec::Aperture; SegmentTable::MAX];
+    let mut len = 1;
+    match (bar_segment.as_ref(), paging_ram) {
+        // ApertureAndBar (production). The paging-RAM segment is dropped; it was
+        // vestigial (page tables live in system segment 0, paging buffers in the
+        // aperture).
+        (Some(bar), _) => {
+            specs[1] = SegmentSpec::bar(bar.gpa, bar.size, knobs);
+            len = 2;
+        }
+        // Disabled: the recovery baseline.
+        (None, Some((base, size))) => {
+            specs[1] = SegmentSpec::RamCpuHost { base, size };
+            len = 2;
+        }
+        (None, None) => {}
+    }
+
+    match SegmentTable::new(&specs[..len]) {
+        Ok(table) => {
+            if bar_segment.is_some() && table.bar_seg_id().is_none() {
+                // Unreachable with the arms above, which only omit the BAR when
+                // it is already absent. Counted anyway: this is the exact
+                // divergence the item is about, and a future arm could
+                // reintroduce it.
+                crate::diag::fault(crate::diag::FaultCounter::SegDiv, 1);
+                *bar_segment = None;
+            }
+            table
+        }
+        Err(violation) => {
+            crate::diag::fault(crate::diag::FaultCounter::SegRule, violation.code());
+            *bar_segment = None;
+            SegmentTable::APERTURE_ONLY
+        }
+    }
+}
+
 /// Stand up the persistent venus context + page-table blob. Returns
 /// `(venus_ctx_id, page_table_window)`; `(0, None)` on any failure.
 ///
@@ -403,6 +467,18 @@ pub unsafe extern "C" fn dxgkddi_start_device(
         crate::adapter::ScanoutMode::render_only()
     };
 
+    // ── The reported segment table, built ONCE from the same locals every other
+    // consumer will read. `query_segments` renders this; it no longer re-derives
+    // a table of its own from live adapter state, which is what let the reported
+    // topology and `bar_segment` disagree (k-capsescape-04).
+    //
+    // Ordering is proven, not assumed: on a DiagLevel=1 boot the ring shows
+    // StartDevice entry/exit (0x0B00_0001 .. 0x0B00_0004) completing before the
+    // first QueryAdapterInfo (0x0100_0001), so the table always exists by the
+    // time QUERYSEGMENT4 runs.
+    let segment_table =
+        build_segment_table(&mut bar_segment, paging_ram.as_ref().map(|r| (r.phys, r.size)), &knobs);
+
     // ── Publish. Everything above was a local; from here the adapter answers. ──
     // SAFETY: StartDevice, PASSIVE_LEVEL, serialized by dxgkrnl; published once
     // per start, and every reader reaches it through the Acquire in `started()`.
@@ -414,6 +490,7 @@ pub unsafe extern "C" fn dxgkddi_start_device(
             knobs,
             scanout_mode,
             paging_ram,
+            segment_table,
         ));
         adapter.set_transport_generation(Some(crate::adapter::TransportGeneration {
             page_table_window,
