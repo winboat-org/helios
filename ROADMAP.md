@@ -381,6 +381,16 @@ virtio-gpu scanout; IddCx/Looking Glass is no longer the active display path.*
    `.unwrap()`/`.expect(` so it would not have caught it. `assume()` counts into a packed
    `(count << 8) | last_irql` atomic mirrored as **`IrqlBad`** from `pacing_snapshot`, the same
    PASSIVE flush site `AbnDrop`/`WtTbl`/`WnRcf` use. It must read 0.
+   ⚠ **This is PROVEN on the image, not inferred from the profile config**:
+   `tools/kmd-debug-assert-check.ps1` finds the stringified expressions of all three existing
+   `debug_assert!`s plus `assertion failed` inside the shipped 22.22.186.0 `.sys`, which a
+   compiled-out assert could not leave behind. **FOUR `debug_assert!`s therefore ship today and
+   are live bugcheck sites in DDI paths** — `virtio/ctrl.rs` (`reap_parked`), `virtio/gpu.rs` x2
+   (`begin_parked_reap`), `ddi/present_packet.rs` (`debug_assert_eq!`). Deliberately NOT fixed
+   here (R614's claim is "identical counters, identical desktop"); it wants its own item, either
+   `debug-assertions = false` in `[profile.dev]` or four counted refusals. Note the comment at
+   `gpu.rs:2259` claims they are "absent from the release driver" — true of the release PROFILE,
+   misleading about the image that actually ships.
    (c) **Re-scoped from the venus layer outward**, as T4a's note said to: `with_venus_client` was
    VERIFIED (not assumed) to be the only path to a `&mut VenusClient`, so it takes the token and
    `VenusRing` stores one from bring-up. That replaced ~95 threaded parameters with one field —
