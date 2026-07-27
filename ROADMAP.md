@@ -513,6 +513,29 @@ Remaining: cold-boot + multi-hour soak, and the forced-loss test for the loss pa
 
 Open defects, roughly ordered:
 
+0z. **NEW, 2026-07-27 (R614 gate): the Mesa venus ICD does not survive adapter teardown —
+   `pnputil /restart-device` ACCESS-VIOLATES every process holding a venus device.** Each
+   restart-device cycle logs Application-log id 1000 faults with
+   `Faulting module name: vulkan_virtio-<hash>.dll, Exception code: 0xc0000005` for dwm.exe plus
+   3-4 shell processes (Explorer, SearchHost, StartMenuExperienceHost, ApplicationFrameHost,
+   ShellExperienceHost). The desktop self-recovers — dwm restarts and composites, which is why
+   this was never noticed — but "a new dwm pid is expected, not a crash" was too generous: it IS
+   a crash, just a survivable one. The same cluster appears at every clean shutdown/reboot.
+   **PRE-EXISTING, NOT caused by R614, and the evidence is unambiguous:** 889 such faults in the
+   Application log spanning 2026-07-07 → 2026-07-27, and **T4a's own nine-consecutive-restart-device
+   soak on 22.22.184.0 produced them on every cycle** (08:56:45, 08:56:58, 08:57:12, 08:57:25,
+   08:57:39 … a ~13 s cadence matching the nine cycles).
+   **Why every gate so far called that soak clean:** the gates check the SYSTEM log for
+   4101/dxgkrnl/LiveKernelEvent, and those stay legitimately empty — a user-mode ICD access
+   violation is not a TDR. Nothing checked the APPLICATION log. `tmp/r614-tdr-check.ps1` and
+   `tmp/r614-icd-fault-history.ps1` now do; fold them into the standing gate.
+   Next step is a stack: the deployed UMD/ICD PDBs are present, so
+   `tools/take-minidump.ps1 -ProcessId <dwm>` under a restart-device, then
+   `minidump-stackwalk` on Linux, should name the ICD site directly. Most likely shape is the ICD
+   touching a venus object (or its ring/reply BAR mapping) after StopDevice destroyed the host
+   context — i.e. the ICD has no adapter-loss path, which is the same class as the 17th-session
+   DEVICE_LOST chain but on teardown rather than on a slow present.
+
 0a. **Ghosting — ROOT-CAUSED AND FIXED IN LAYERS (21st session, 2026-07-06).** Owner
    insight proved out: the dirty-rect *attribution* was fine; STUTTER caused the
    ghosting. Evidence chain (all same-day): dwm's composed primary is paintcap-CLEAN
