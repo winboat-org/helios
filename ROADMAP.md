@@ -293,8 +293,8 @@ virtio-gpu scanout; IddCx/Looking Glass is no longer the active display path.*
    `kmd_render` read sites, so it is not UMD-only. Doing T3 first means R805 folds naturally into a
    KMD-deploy window instead of being an awkward exception to T5's "release UMD only" shape.
 7. **T4a LANDED — gate PASSED (2026-07-27, KMD `22.22.184.0`, 34 commits).** 18 of the 19
-   items (R601–R613, R615–R619) plus **all 11 minor items** landed; **R614 is DECLINED**
-   (see below), so T4a is complete as scoped.
+   items (R601–R613, R615–R619) plus **all 11 minor items** landed; **R614 was re-scoped to
+   its own tranche and has since LANDED — see item 7b** — so T4a is complete as scoped.
    **Gate evidence, all same boot (08:40:31):** cold boot to `CM_PROB_NONE` on 22.22.184.0 with a
    visible composited desktop (`helios_paintcap`), and a second composited capture after **nine
    consecutive `pnputil /restart-device` cycles**. Per-flip diag IDENTICAL to the pre-image
@@ -361,6 +361,45 @@ virtio-gpu scanout; IddCx/Looking Glass is no longer the active display path.*
    ⚠ Formatting: `cargo fmt` was NOT run — the crate was already unclean before T4a (`lib.rs` 49
    hunks, `ddi/mod.rs` 26, `virtio/mod.rs` 20, all untouched here) and `cargo fmt` clean is T8's
    gate criterion. T4a added ~5 hunks in files it edited.
+7b. **R614 LANDED — its own tranche, its own KMD image (2026-07-27, KMD `22.22.186.0`,
+   8 commits).** `virtio::ctrl`'s PASSIVE-only contract is now a signature: `crate::irql`'s
+   zero-sized `PassiveLevel` (`Copy`, `!Send`, no safe constructor) is threaded through all 34
+   entry points, the internal primitives (`ctrl_roundtrip`, `ctrl_roundtrip_ok`,
+   `resource_map_blob_roundtrip`, `sleep_ms`, `wait_block`, `reap_parked`) and `DmaBuffer::new`.
+   **What it buys, concretely:** the DIRQL half of `DxgkDdiSetVidPnSourceAddress` holds no token,
+   so `program_vidpn_source → ctrl::set_scanout_blob` is now UNREACHABLE from it — a compile
+   error instead of the shipped DISPATCH deadlock the item was written for.
+   **Three implementation decisions that differ from the review text, all deliberate:**
+   (a) **BY VALUE, not `&PassiveLevel`.** A reference to a ZST is a real 8-byte pointer per frame,
+   and the token threads through the boot chain that had 368 bytes of headroom. Measured on the
+   built image before and after: every frame BYTE-FOR-BYTE UNCHANGED — `DxgkDdiStartDevice` 8408,
+   `VirtioGpu::init` 9160, chain **17568** of 17936, headroom still 368.
+   (b) **A COUNTED refusal, not the review's `debug_assert!`.** `kmd_render`'s `[profile.dev]`
+   does NOT disable debug-assertions and cargo-make defaults to that profile, so THE SHIPPED
+   IMAGE HAS THEM ON: a failing `debug_assert!` inside `assume()` would be a live `KeBugCheck` in
+   a DDI — exactly what R601 spent four commits removing, and `verify-no-panics` greps only
+   `.unwrap()`/`.expect(` so it would not have caught it. `assume()` counts into a packed
+   `(count << 8) | last_irql` atomic mirrored as **`IrqlBad`** from `pacing_snapshot`, the same
+   PASSIVE flush site `AbnDrop`/`WtTbl`/`WnRcf` use. It must read 0.
+   (c) **Re-scoped from the venus layer outward**, as T4a's note said to: `with_venus_client` was
+   VERIFIED (not assumed) to be the only path to a `&mut VenusClient`, so it takes the token and
+   `VenusRing` stores one from bring-up. That replaced ~95 threaded parameters with one field —
+   ~130 sites instead of ~190. `ScanoutGuard` carries a token too, which let the two locked
+   scanout bodies drop their `_lock` underscores.
+   **Twelve audited mints, and that number is the deliverable** (`grep -rn 'PassiveLevel::assume()'
+   kmd_render/src/`): Escape, CreateAllocation, DestroyAllocation, Present, StartDevice,
+   StopDevice, DestroyDevice (documented PASSIVE_LEVEL); BuildPagingBuffer, MapCpuHostAperture,
+   UnmapCpuHostAperture, SetVidPnSourceAddress (**below a runtime `KeGetCurrentIrql` gate that
+   already existed** — these four are checked, not asserted); and `hpd_thread_routine`
+   (a `PsCreateSystemThread` body, the one structural justification).
+   `DxgkDdiOpenAllocation` deliberately gets NO mint: it reaches no `ctrl::` entry point, and a
+   mint with no consumer is laundering.
+   **The honest limit, stated in `ctrl.rs`'s module doc and `irql.rs`:** the token does not prove
+   the live IRQL — only `KeGetCurrentIrql` can, and a per-call check was out of scope. It proves
+   PROVENANCE. One PASSIVE-only operation stays outside the type system: `DmaBuffer`'s `Drop`
+   (`MmFreeContiguousMemory`), because `Drop::drop` has a fixed signature — which is why the
+   transport parks completed buffers for `reap_parked` instead of letting the DISPATCH drain
+   free one.
 8. Implement the remaining reviewed refactors atomically, in tranche order, one recommendation
    per commit; never fold a `BUG` fix into a structure move. Preserve the current direct
    primary, completion ordering, loud-failure contracts, registry ABI, and
