@@ -16,7 +16,34 @@
 //! under the device spinlock and then poisoned the transport; this model waits
 //! properly and, on timeout, abandons only its own in-flight slot.
 //!
-//! IRQL: every function in this module MUST be called at PASSIVE_LEVEL.
+//! # IRQL
+//!
+//! Every function in this module runs at PASSIVE_LEVEL, and since R614 that is a
+//! signature rather than this comment: every entry point takes a
+//! [`crate::irql::PassiveLevel`], which safe code cannot construct. What the
+//! token proves, exactly:
+//!
+//! * **What it does prove.** A caller that holds no token cannot reach any of
+//!   these functions at all. The concrete case: the DIRQL half of
+//!   `DxgkDdiSetVidPnSourceAddress` (`ddi::display`) holds no token, so
+//!   `set_scanout_blob` and `resource_flush` are unreachable from it, and adding
+//!   such a call is a compile error instead of a shipped DISPATCH deadlock.
+//! * **What it does NOT prove.** The live IRQL. Only `KeGetCurrentIrql` can, and
+//!   this module deliberately does not call it per entry point — one check inside
+//!   `PassiveLevel::assume` at the DDI boundary is the whole budget. So the
+//!   guarantee is about *provenance*: every token in the driver traces to one of
+//!   twelve audited mints (`grep -rn 'PassiveLevel::assume()' src/`), four of
+//!   which sit below a runtime IRQL gate that already existed, plus one
+//!   structural claim about the venus gateway
+//!   (`AdapterContext::with_venus_client`).
+//!
+//! `crate::irql::IRQL_ASSUME_BAD` — the `IrqlBad` breadcrumb — is what turns a
+//! wrong audit into evidence. It must read 0.
+//!
+//! One PASSIVE-only operation is still outside the type system:
+//! `DmaBuffer`'s `Drop` (`MmFreeContiguousMemory`). `Drop::drop` has a fixed
+//! signature, so the transport parks completed buffers and frees them from
+//! [`reap_parked`] instead of letting the DISPATCH drain drop one.
 
 use core::mem::size_of;
 use core::ptr::NonNull;
