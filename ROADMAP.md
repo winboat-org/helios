@@ -622,9 +622,29 @@ virtio-gpu scanout; IddCx/Looking Glass is no longer the active display path.*
    device cycle 300        handles=1946   modules=24   ws=50908 KiB
    ```
    +598/+600/+600 per 100 cycles = **6.00 handles per device**, dead linear.
-   **The WARP control isolates it to our UMD**: identical cycling against
-   "Microsoft Basic Render Driver" gives **handles 137 → 137 → 137 → 137, +0 over 300 cycles**.
-   So this is not a D3D11/DXGI property of this box.
+   ⚠⚠ **CORRECTION (2026-07-27, later the same day): that run did not COMPLETE — it CRASHED,
+   and "300 cycles" was not a chosen scale but the last sample before the crash.** The harness
+   defaults to 1000 device cycles and had never actually been run at its own default. At that
+   scale it dies **between device cycle 301 and 400, deterministically** (three runs, identical
+   to the sample), with **exit `0xC0000409` (STATUS_STACK_BUFFER_OVERRUN / fail-fast), faulting
+   module `ucrtbase.dll`, fault offset `0xa527e`, WER bucket type BEX64**. The first attempt
+   produced *no output at all* because the harness's stdout was block-buffered into a pipe and
+   the fail-fast discarded it — fixed in `ff16107` (`setvbuf(_IONBF)`), which is what made the
+   crash window visible.
+   **The WARP control isolates BOTH the leak and the crash to our UMD**: identical cycling
+   against "Microsoft Basic Render Driver" gives **handles 137 → 137 → 137 → 137**, `+0 over
+   1000 cycles`, `OWNERSHIP SOAK PASS`, **no crash**. So neither is a D3D11/DXGI property of
+   this box.
+   ★ **This escalates the leak from "unbounded growth" to "the process dies after ~350
+   devices"** — a hard failure mode, not just resource pressure. Handle count at the crash is
+   only ~2500, nowhere near any system limit, so handle exhaustion is NOT the mechanism and
+   the cause is something else that grows per device.
+   **A full WER dump is captured for whoever root-causes it:**
+   `C:\Users\Rupansh\helios-probe\dumps\helios_ownership_soak.exe.3352.dmp` (150 MB, DumpType 2;
+   LocalDumps registered under
+   `HKLM\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\helios_ownership_soak.exe`).
+   Note the probe is built without `/Zi`, so it has no PDB — symbolising it needs a rebuild
+   with debug info first. Deliberately NOT guessed at beyond this.
    **The resource phase is FLAT on Helios** — handles 1977 at cycle 1000, 2000 and 3000 — so
    the paths T5 restructured (`Slot<Boxed<ResourceState>>`, `RtvState`, `DeallocateForm`, the
    R806 descriptors) do not leak. The leak is entirely in device teardown.
@@ -632,12 +652,18 @@ virtio-gpu scanout; IddCx/Looking Glass is no longer the active display path.*
    threads, the WS1 #4 named present fence, and the `pfnCreateSynchronizationObject2Cb`
    monitored fence R810 touched (which has no destroy path — though that one is inert at
    `PresentSyncPublish=0` and so cannot be this).
-   ⚠ **Consequence for the T5 gate:** its ownership criterion as written ("handle count FLAT")
-   **cannot pass on this codebase**, because the baseline already fails it. The honest gate is
-   *no worse than 6.00 handles/device and a flat resource phase*; the absolute leak is a
-   separate WS1 defect. The harness now prints the handles-per-device-cycle figure directly so
-   before/after compare on one number, and its working-set tolerance is calibrated to the WARP
-   control's own ~8 MiB of runtime noise rather than to zero.
+   ⚠ **Consequence for the T5 gate, in two parts:**
+   (a) its ownership criterion as written ("handle count FLAT") **cannot pass on this
+   codebase**, because the baseline already fails it. The honest gate is *no worse than 6.00
+   handles/device and a flat resource phase*; the absolute leak is a separate WS1 defect. The
+   harness prints the handles-per-device-cycle figure directly so before/after compare on one
+   number, and its working-set tolerance is calibrated to the WARP control's own ~8 MiB of
+   runtime noise rather than to zero.
+   (b) **its SCALE cannot be met either.** "1000 CreateDevice/DestroyDevice cycles" is
+   unreachable on any build, before or after, because of the crash above. The matched pair is
+   therefore run at **300 devices / 10000 resources** — the largest device count that survives —
+   and the gate reads the per-device figure plus a flat resource phase. A future tranche that
+   fixes the crash should re-run at the specified 1000/10000 and record it here.
 7e. **T5 REMAINING WORK — CLOSED. Two items implemented, six dispositioned.**
    Supersedes the "seven unfinished halves" list this entry used to carry. Of the eight open
    points, **two were the real work and are now landed** (R803's boxed half, R802 sub-commit 3);
@@ -760,6 +786,104 @@ virtio-gpu scanout; IddCx/Looking Glass is no longer the active display path.*
    parameters on the C++ side is still unguarded.** Closing it properly means restructuring the
    pimpl/header arrangement so the bridge can consume cxx-generated types — out of scope for a
    tranche that is not allowed to move files.
+
+7f. **T5 GATE RUN AND PASSED (2026-07-28), UMD `0daa30ca3ac146ec`, KMD unchanged at
+   22.22.187.0.** UMD-only tranche, no KMD image, no reboot; three `pnputil /restart-device`
+   cycles. T4b backup intact at `C:\Users\Rupansh\helios-umd-backup-t4b.dll`
+   (`F0C7A2E6…25CDFD`) and is what every BEFORE number below was measured against.
+   ⚠ **Deploy trap, hit once:** `umd-check.ps1` builds into the MIRROR
+   (`C:\Users\Rupansh\helios-vgpu\umd\target\release`), and `Z:\umd\target\release\` does not
+   exist at all. The first deploy shipped a release DLL built BEFORE the last commit; caught
+   because `direct_over_linear=` was absent from the binary's string table. **Always pass
+   `umd_dll` explicitly and check a string you just added is in the shipped image.**
+
+   **Ownership soak — the headline. PASS on the honest criterion, and the numbers are
+   IDENTICAL before and after.** 300 devices / 10000 resources (see 7d(b) for why not 1000):
+   ```
+                         T4b BEFORE                T5 AFTER
+   baseline              148                       148
+   device 100/200/300    746 / 1346 / 1946         746 / 1346 / 1946
+   per-device            5.99 handles              5.99 handles
+   resource 1000..10000  1977, all ten samples     1977, all ten samples
+   final / modules       1952 / +0                 1952 / +0
+   failures              0 device, 0 resource      0 device, 0 resource
+   working set delta     +38548 KiB                +38644 KiB   (0.25% apart)
+   ```
+   Every handle count matches exactly. **The resource phase — the paths T5 actually
+   restructured (`Slot<Boxed<ResourceState>>`, `RtvState`, the R803 accessor conversion,
+   `DeallocateForm`, the R806 descriptors) — is perfectly flat across 10,000 cycles.** The
+   `OWNERSHIP SOAK FAIL` verdict the harness prints is the pre-existing 6-handles-per-device
+   device-teardown leak failing the literal "flat" test, identically on both sides.
+
+   **ABI — IDENTICAL.** `UmdTrace=1` capture on T4b vs T5, compared structurally by the new
+   `tools/abi-diff.ps1` (a text diff is pure noise — the dump prints heap pointers). Word count
+   11, `word[1]`/`word[9]`/interface/version/flags byte-identical, and **every named field
+   resolves to the same word index**: pKTCallbacks→2, pDeviceFuncs→3, hDrvDevice→4,
+   pDXGIBaseFuncs→6, pUMCallbacks→8, Flags→9. That is bytes 16/24/32/48/64/72 — independent
+   live confirmation of R802 sub-commit 3's const-asserts.
+
+   **Rendering evidence (the only kind that counts):** `helios_paintcap` →
+   `Z:\tmp\screen_copy.png` twice, once right after deploy and once after a device restart plus
+   60 s idle. Full composited desktop both times — wallpaper, taskbar, icons, window frames,
+   clock matching the capture minute. The second capture also caught a window mid-fade, which
+   is live compositing rather than a stale surface.
+
+   **Performance, all within or above the T4b reference:**
+   - DComp cadence **1316 / 1311** frames per 25 s (52.6 / 52.4 fps), both `PROBE PASS`, vs
+     T4b's 1308 / 1292. ⚠ An earlier pair read 1196 / 1161 and that was **entirely a
+     `UmdTrace=1` confound** left set from the ABI capture — the knob is read once per process
+     at device init, so dwm had tracing on. **Clear `HKLM\SOFTWARE\Helios` and restart the
+     device before any cadence measurement.** Idle log growth with the knob absent: 0 bytes/min.
+   - Fire Strike **Graphics 20212** (GT1 141.1 fps, GT2 63.8, Physics 33553, Combined 5507),
+     inside T4b's own five-sample spread of 19460–20473.
+   - Idle-to-active wake: desktop composited correctly after 60 s idle; 1.1 s from schtasks
+     trigger to PNG on disk, which is task launch + process start + capture + write, so the
+     wake component is well under that.
+
+   **Conformance:** both in-tree D3D11 probe suites (`helios_d3d11_knob_suite`,
+   `helios_d3d11_extra_suite`) pass end to end — every `rc=0`, `TOTAL failures=0` on the
+   upload-integrity sweep across five sizes × three upload paths × two bind flags, and
+   feature-level, cross-adapter, shared-resource, keyed-mutex, KMT-open and cross-process draw
+   all `hr=0x00000000`. dxvk-tests is NOT installed on this box; these are the surrogate.
+
+   **KMD surface CLEAN** (`kmd-gate-surface.ps1`): every must-be-zero counter clear including
+   `WtOut`/`CtOut`/`IrqlBad`; per-flip `ScSet=1 ScFlu=3 VpDSt=0 DspMd=124257286 ScCpy=2
+   ScPch=7680`, `ScanoutDiag` absent, **`AsSub == AsDone` (261177)**. `QfRet=117` and
+   `AbnDrop=34` are backpressure/preemption, not failures, and are the right order for a Fire
+   Strike plus two probe suites.
+
+   **UMD surface CLEAN** (new `tools/umd-gate-surface.ps1`). The eleven new counters:
+   `zero_pitch=0` (R806/2), `zero_extent=0`, `downres_kept=0`, `flip-kwait setup REFUSED`
+   absent (R817), `CheckDeferredContextHandleSizes called` absent (R812), `adapter handle not
+   ours` absent (R801), `NO SLOT published` absent (R826), and `present-gate: … failed=0
+   noctx=0` on every T5 process. **`PresentSyncPublish=1` + two dcomp-vehicle runs were done
+   specifically because R810/R817/R818 are inert at defaults** — still `failed=0 noctx=0`,
+   cadence 1184 / 1330. Knob removed and the device restarted afterwards; the box is back at
+   defaults.
+   ★ **`SCANOUT_DIRECT_OVER_LINEAR` is NOT zero — 17 in one dwm session, 2 and 1 in others.**
+   See 7e(3): this settles half of R809's pending decision. The DirectPrimary-vs-LinearImport
+   competition the deferred rule governs **fires routinely on an ordinary desktop**, so that
+   rule must NOT be dropped as dead code. `downres_kept` remains 0 but is **unexercised, not
+   proven unreachable** — see the resolution-change limitation below.
+
+   **WS1 defect 0z reproduced unchanged and is NOT this tranche's.** 1161 → 1165 ICD faults
+   all-time across three device restarts; 17 this boot, all `0xc0000005`, all in
+   dwm/Explorer/SearchHost/StartMenuExperienceHost — the historical process set and the only
+   exception code ever seen. **Zero non-ICD application faults this boot.** A T5 regression
+   would be a new process or a new exception code; there is neither.
+
+   ⚠ **NOT performed, and why:**
+   - **Rapid cursor motion / no trails** — needs an interactive mouse. Now EIGHT tranches
+     overdue and still the only gate line no automated instrument covers.
+   - **Resolution change up and down**, so `SCANOUT_DOWNRES_KEPT` stays unexercised.
+     `tools/res_change_probe.ps1` was written for it and is committed working, but
+     **`ChangeDisplaySettingsEx` is not an available mechanism on this box**: running as the
+     console user in session 1 (verified, not assumed), `EnumDisplayDevicesW` returns FALSE at
+     index 0 and `EnumDisplaySettingsW` fails, so there is nothing to act on — the same family
+     as the historical "no DXGI output" symptom. **This also blocks WS1's resize soak**, which
+     needs a working mode-change mechanism, and is worth its own item.
+   - **Suspend/resume** — still NOT TESTABLE (`disable_s3=1`/`disable_s4=1`, see 7b).
+   - **The soak at its specified 1000-device scale** — unreachable on any build, see 7d(b).
 
 8. Implement the remaining reviewed refactors atomically, in tranche order, one recommendation
    per commit; never fold a `BUG` fix into a structure move. Preserve the current direct
