@@ -36,6 +36,7 @@ mod ddi;
 mod device_funcs;
 mod forward;
 mod hr;
+mod knobs;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -301,6 +302,7 @@ unsafe fn open_adapter_common(open_data: *mut ddi::D3D10DDIARG_OPENADAPTER, with
         open.Interface, open.Version, with_10_2
     );
     log_self_module_path();
+    log_knob_inventory();
 
     open.hAdapter = ddi::D3D10DDI_HADAPTER {
         pDrvPrivate: core::ptr::addr_of!(ADAPTER_TOKEN) as *mut c_void,
@@ -866,39 +868,7 @@ pub(crate) fn log_line(message: &str) {
 /// only known-hot repeat traffic (Present, OMSetRenderTargets,
 /// ResolveSharedResource, per-op stamps) sits behind this gate.
 pub(crate) fn trace_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        #[link(name = "advapi32")]
-        unsafe extern "system" {
-            fn RegGetValueA(
-                hkey: usize,
-                sub_key: *const u8,
-                value: *const u8,
-                flags: u32,
-                type_out: *mut u32,
-                data: *mut c_void,
-                data_len: *mut u32,
-            ) -> i32;
-        }
-        const HKEY_LOCAL_MACHINE: usize = 0x8000_0002;
-        const RRF_RT_REG_DWORD: u32 = 0x10;
-        let mut value: u32 = 0;
-        let mut len: u32 = 4;
-        // SAFETY: NUL-terminated key/value names; `value`/`len` outlive the call.
-        let rc = unsafe {
-            RegGetValueA(
-                HKEY_LOCAL_MACHINE,
-                c"SOFTWARE\\Helios".as_ptr().cast(),
-                c"UmdTrace".as_ptr().cast(),
-                RRF_RT_REG_DWORD,
-                core::ptr::null_mut(),
-                (&mut value as *mut u32).cast(),
-                &mut len,
-            )
-        };
-        rc == 0 && value != 0
-    })
+    knobs::UMD_TRACE.get()
 }
 
 /// Selects whether the adapter advertises the full D3D11 feature-level profile
@@ -928,43 +898,7 @@ pub(crate) fn trace_enabled() -> bool {
 ///   2 = DIAGNOSTIC: pipeline claims 11_0 but keeps the FL10 MSAA/format caps —
 ///       isolates pipeline-level validation from the later FL11 caps gates.
 pub(crate) fn feature_level_mode() -> u32 {
-    use std::sync::OnceLock;
-    static MODE: OnceLock<u32> = OnceLock::new();
-    *MODE.get_or_init(|| {
-        #[link(name = "advapi32")]
-        unsafe extern "system" {
-            fn RegGetValueA(
-                hkey: usize,
-                sub_key: *const u8,
-                value: *const u8,
-                flags: u32,
-                type_out: *mut u32,
-                data: *mut c_void,
-                data_len: *mut u32,
-            ) -> i32;
-        }
-        const HKEY_LOCAL_MACHINE: usize = 0x8000_0002;
-        const RRF_RT_REG_DWORD: u32 = 0x10;
-        let mut value: u32 = 0;
-        let mut len: u32 = 4;
-        // SAFETY: NUL-terminated key/value names; `value`/`len` outlive the call.
-        let rc = unsafe {
-            RegGetValueA(
-                HKEY_LOCAL_MACHINE,
-                c"SOFTWARE\\Helios".as_ptr().cast(),
-                c"FeatureLevel11".as_ptr().cast(),
-                RRF_RT_REG_DWORD,
-                core::ptr::null_mut(),
-                (&mut value as *mut u32).cast(),
-                &mut len,
-            )
-        };
-        if rc == 0 {
-            value
-        } else {
-            1
-        }
-    })
+    knobs::FEATURE_LEVEL_11.get()
 }
 
 /// Present-path frame-completion gate cap in microseconds:
@@ -975,44 +909,7 @@ pub(crate) fn feature_level_mode() -> u32 {
 /// This bounded, condition-variable-backed gate closes that producer race
 /// without restoring the old 32 ms polling throttle. 0 remains the A/B disable.
 pub(crate) fn present_gate_us() -> u32 {
-    use std::sync::OnceLock;
-    static VALUE: OnceLock<u32> = OnceLock::new();
-    *VALUE.get_or_init(|| {
-        #[link(name = "advapi32")]
-        unsafe extern "system" {
-            fn RegGetValueA(
-                hkey: usize,
-                sub_key: *const u8,
-                value: *const u8,
-                flags: u32,
-                type_out: *mut u32,
-                data: *mut c_void,
-                data_len: *mut u32,
-            ) -> i32;
-        }
-        const HKEY_LOCAL_MACHINE: usize = 0x8000_0002;
-        const RRF_RT_REG_DWORD: u32 = 0x10;
-        const DEFAULT_US: u32 = 10000;
-        let mut value: u32 = 0;
-        let mut len: u32 = 4;
-        // SAFETY: NUL-terminated key/value names; `value`/`len` outlive the call.
-        let rc = unsafe {
-            RegGetValueA(
-                HKEY_LOCAL_MACHINE,
-                c"SOFTWARE\\Helios".as_ptr().cast(),
-                c"PresentGateUs".as_ptr().cast(),
-                RRF_RT_REG_DWORD,
-                core::ptr::null_mut(),
-                (&mut value as *mut u32).cast(),
-                &mut len,
-            )
-        };
-        if rc == 0 {
-            value
-        } else {
-            DEFAULT_US
-        }
-    })
+    knobs::PRESENT_GATE_US.get()
 }
 
 /// Dcomp-vehicle flip-ordering gate cap in microseconds:
@@ -1025,44 +922,7 @@ pub(crate) fn present_gate_us() -> u32 {
 /// buffer pops out (the 24th-session gameplay stutter). Composed presents
 /// are protected by dwm's consumer wait either way; direct flip is not.
 pub(crate) fn vehicle_flip_gate_us() -> u32 {
-    use std::sync::OnceLock;
-    static VALUE: OnceLock<u32> = OnceLock::new();
-    *VALUE.get_or_init(|| {
-        #[link(name = "advapi32")]
-        unsafe extern "system" {
-            fn RegGetValueA(
-                hkey: usize,
-                sub_key: *const u8,
-                value: *const u8,
-                flags: u32,
-                type_out: *mut u32,
-                data: *mut c_void,
-                data_len: *mut u32,
-            ) -> i32;
-        }
-        const HKEY_LOCAL_MACHINE: usize = 0x8000_0002;
-        const RRF_RT_REG_DWORD: u32 = 0x10;
-        const DEFAULT_US: u32 = 32_000;
-        let mut value: u32 = 0;
-        let mut len: u32 = 4;
-        // SAFETY: NUL-terminated key/value names; `value`/`len` outlive the call.
-        let rc = unsafe {
-            RegGetValueA(
-                HKEY_LOCAL_MACHINE,
-                c"SOFTWARE\\Helios".as_ptr().cast(),
-                c"VehicleFlipGateUs".as_ptr().cast(),
-                RRF_RT_REG_DWORD,
-                core::ptr::null_mut(),
-                (&mut value as *mut u32).cast(),
-                &mut len,
-            )
-        };
-        if rc == 0 {
-            value
-        } else {
-            DEFAULT_US
-        }
-    })
+    knobs::VEHICLE_FLIP_GATE_US.get()
 }
 
 /// Per-frame/per-op trace logging, gated by [`trace_enabled`]. The format
@@ -1130,5 +990,30 @@ fn log_self_module_path() {
             }
         }
         log_error!("UMD module: <unresolvable>");
+    }
+}
+
+/// Log every registry knob and its resolved value, once per process.
+///
+/// The reader that makes [`crate::knobs`]'s inventory more than a comment: it
+/// turns "which knobs were in force in this process" from a re-derivation into
+/// a fact in the log, next to the module path that says which DLL produced it.
+/// It is also R1008's own validation instrument — the defaults moved from four
+/// hand-written tail expressions into constructor arguments, and this line is
+/// what proves the resolved values did not move with them.
+///
+/// Resolving forces all four `OnceLock`s here rather than at each knob's first
+/// use. Every one is read once per process either way, and the documented A/B
+/// procedure is "write the value, then start a new process (or
+/// `pnputil /restart-device`)" — which loads the DLL after the write in both
+/// orderings, so the resolved values are the same.
+fn log_knob_inventory() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static LOGGED: AtomicBool = AtomicBool::new(false);
+    if LOGGED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    for (name, value) in knobs::resolved_inventory() {
+        log_error!("UMD knob: {name}={value}");
     }
 }
