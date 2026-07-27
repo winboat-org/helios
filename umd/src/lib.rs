@@ -865,8 +865,8 @@ unsafe extern "C" fn create_device(
                 scanout_copy_count: core::cell::Cell::new(0),
                 h_rt_core_layer: create.hRTCoreLayer.handle,
                 um_callbacks: p_um_callbacks.cast(),
-                flip_wait_state: core::cell::Cell::new(0),
-                flip_wait_fence: core::cell::Cell::new(0),
+                flip_wait: core::cell::Cell::new(None),
+                flip_wait_disabled: core::cell::Cell::new(false),
                 flip_wait_next_value: core::cell::Cell::new(0),
             },
         );

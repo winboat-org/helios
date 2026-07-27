@@ -9191,18 +9191,50 @@ static EXT_KWAIT_QUEUE_FAILS: AtomicUsize = AtomicUsize::new(0);
 /// to the bridge, which fires it from the present-fence waiter and runs the
 /// wedge watchdog. Any missing piece disables the path loudly ONCE for the
 /// device; the bounded CPU gate serves instead.
-unsafe fn flip_wait_setup(dev: &crate::device_funcs::HeliosDevice) -> bool {
-    match dev.flip_wait_state.get() {
-        1 => return true,
-        2 => return false,
-        _ => {}
+/// The runtime callback the queued GPU wait targets. Spelled out rather than
+/// reusing bindgen's `PFND3DDDI_WAITFORSYNCHRONIZATIONOBJECTFROMGPUCB`, which
+/// **is** the `Option` -- the whole point of the token is that the `Some` has
+/// already been taken.
+pub type WaitFromGpuCb = unsafe extern "C" fn(
+    ddi::HANDLE,
+    *const ddi::D3DDDICB_WAITFORSYNCHRONIZATIONOBJECTFROMGPU,
+) -> ddi::HRESULT;
+
+/// Proof that this device's kernel flip-wait path is fully armed.
+///
+/// Possession is compile-time evidence that `pfnCreateSynchronizationObject2Cb`,
+/// `pfnSignalSynchronizationObjectFromCpuCb` and
+/// `pfnWaitForSynchronizationObjectFromGpuCb` all resolved AND that the
+/// monitored fence exists -- three facts a `flip_wait_state == 1` sentinel
+/// merely implied. The present path used to re-read that integer and, on `1`,
+/// call `.unwrap()` on an `Option<fn>` it never re-checked, with the guarantee
+/// carried by a one-line comment. That unwrap is gone rather than moved: by
+/// project invariant a panic in a DDI is a silent graphics deadlock, not a
+/// diagnosable failure.
+///
+/// Same style as `kmd_render`'s `WddmNotifyGuard`. R810.
+#[derive(Clone, Copy)]
+pub struct FlipWaitReady {
+    pub fence: core::num::NonZeroU32,
+    pub wait_cb: WaitFromGpuCb,
+    pub h_rt_device: ddi::HANDLE,
+}
+
+unsafe fn flip_wait_setup(
+    dev: &crate::device_funcs::HeliosDevice,
+) -> Option<FlipWaitReady> {
+    if let Some(ready) = dev.flip_wait.get() {
+        return Some(ready);
+    }
+    if dev.flip_wait_disabled.get() {
+        return None;
     }
     let disable = |reason: &str| {
-        dev.flip_wait_state.set(2);
+        dev.flip_wait_disabled.set(true);
         log_error!(
             "flip-kwait DISABLED for this device: {reason} — bounded CPU gate serves"
         );
-        false
+        None
     };
     if !crate::vehicle_kernel_flip_wait() {
         return disable("VehicleKernelFlipWait=0");
@@ -9217,9 +9249,11 @@ unsafe fn flip_wait_setup(dev: &crate::device_funcs::HeliosDevice) -> bool {
     let Some(signal_cb) = cbs.pfnSignalSynchronizationObjectFromCpuCb else {
         return disable("pfnSignalSynchronizationObjectFromCpuCb missing");
     };
-    if cbs.pfnWaitForSynchronizationObjectFromGpuCb.is_none() {
+    // Captured, not merely checked: the token carries the resolved callback, so
+    // the present path never re-derives it and can never unwrap a None.
+    let Some(wait_cb) = cbs.pfnWaitForSynchronizationObjectFromGpuCb else {
         return disable("pfnWaitForSynchronizationObjectFromGpuCb missing");
-    }
+    };
 
     let mut arg: ddi::D3DDDICB_CREATESYNCHRONIZATIONOBJECT2 = core::mem::zeroed();
     arg.Info.Type = ddi::_D3DDDI_SYNCHRONIZATIONOBJECT_TYPE_D3DDDI_MONITORED_FENCE;
@@ -9237,9 +9271,9 @@ unsafe fn flip_wait_setup(dev: &crate::device_funcs::HeliosDevice) -> bool {
         .__bindgen_anon_1
         .MonitoredFence
         .FenceValueCPUVirtualAddress as usize;
-    if h_fence == 0 || cpu_va == 0 {
+    let (Some(fence), true) = (core::num::NonZeroU32::new(h_fence), cpu_va != 0) else {
         return disable("monitored fence returned no handle/CPU VA");
-    }
+    };
 
     if !dev.dxvk.present_flip_wait_setup(
         signal_cb as usize,
@@ -9249,13 +9283,17 @@ unsafe fn flip_wait_setup(dev: &crate::device_funcs::HeliosDevice) -> bool {
     ) {
         return disable("bridge setup refused (present fence path disabled?)");
     }
-    dev.flip_wait_fence.set(h_fence);
-    dev.flip_wait_state.set(1);
+    let ready = FlipWaitReady {
+        fence,
+        wait_cb,
+        h_rt_device: dev.h_rt_device,
+    };
+    dev.flip_wait.set(Some(ready));
     log_error!(
         "flip-kwait READY: runtime-device fence 0x{h_fence:x} — vehicle flips are \
          kernel-ordered on the copy's completion (CPU gate retired for this device)"
     );
-    true
+    Some(ready)
 }
 
 /// Backing for the `helios_umd_set_present_source` C export.
@@ -9517,7 +9555,7 @@ unsafe fn vehicle_present_prepare(
     // caller WILL queue the dxgkrnl wait for this present; a per-present
     // queue failure (kwait_queue_fails, 0 observed live) degrades one frame
     // to consumer-side bounded semantics — counted, self-healing.
-    let kwait_ordered = flip_wait_setup(dev);
+    let kwait_ordered = flip_wait_setup(dev).is_some();
     let mut sync_value = 0u64;
     let mut fence_id = 0u32;
     if present_sync_publish_enabled() {
@@ -10249,11 +10287,11 @@ unsafe extern "C" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT) -> i32 {
     let mut kernel_wait_armed = false;
     if is_vehicle_present && sync_value != 0 {
         if let Some(dev) = helios_device(h) {
-            if flip_wait_setup(dev) {
+            if let Some(ready) = flip_wait_setup(dev) {
                 let v = dev.flip_wait_next_value.get() + 1;
                 dev.flip_wait_next_value.set(v);
                 if dev.dxvk.present_flip_wait_arm(sync_value, v) {
-                    let handles = [dev.flip_wait_fence.get()];
+                    let handles = [ready.fence.get()];
                     let values = [v];
                     let mut warg: ddi::D3DDDICB_WAITFORSYNCHRONIZATIONOBJECTFROMGPU =
                         core::mem::zeroed();
@@ -10264,11 +10302,10 @@ unsafe extern "C" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT) -> i32 {
                     warg.ObjectCount = 1;
                     warg.ObjectHandleArray = handles.as_ptr();
                     warg.__bindgen_anon_1.MonitoredFenceValueArray = values.as_ptr();
-                    // Checked present in flip_wait_setup.
-                    let wait_cb = (*dev.kt_callbacks)
-                        .pfnWaitForSynchronizationObjectFromGpuCb
-                        .unwrap();
-                    let hr = wait_cb(dev.h_rt_device, &warg);
+                    // The callback comes from the token, which is why there is
+                    // no `.unwrap()` here any more and no comment vouching for
+                    // one. R810.
+                    let hr = (ready.wait_cb)(ready.h_rt_device, &warg);
                     if hr >= 0 {
                         EXT_KWAIT_ARMED.fetch_add(1, Ordering::Relaxed);
                         kernel_wait_armed = true;
