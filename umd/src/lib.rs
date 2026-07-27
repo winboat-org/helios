@@ -147,9 +147,10 @@ static ADAPTER_TOKEN: AdapterToken = AdapterToken;
 /// Adapter handles that did not carry [`ADAPTER_TOKEN`].
 ///
 /// COUNT AND LOG ONLY -- deliberately not a refusal. The counter has to be
-/// observed at zero on a real boot before any DDI starts rejecting on it, and
-/// `helios_umd_selftest` deliberately passes a null `pDrvPrivate`, so it trips
-/// this by design.
+/// observed at zero on a real boot before any DDI starts rejecting on it.
+/// The one known caller that tripped it by design -- `helios_umd_selftest`,
+/// which passed a null `pDrvPrivate` -- was deleted in T6/R909, so a nonzero
+/// reading is now unexplained and worth chasing.
 static ADAPTER_UNRECOGNISED: AtomicUsize = AtomicUsize::new(0);
 
 /// Validate an adapter handle against the token we handed out. Reports only.
@@ -227,154 +228,6 @@ pub extern "system" fn helios_umd_get_present_result(fence_id: *mut u32, value: 
     // SAFETY: null-checked above; the ICD caller owns both out-params for
     // the duration of the call (same-thread, synchronous contract).
     unsafe { forward::take_present_result(&mut *fence_id, &mut *value) }
-}
-
-/// TEMPORARY (Gate 5b bring-up): out-of-band smoke test of the DXVK bridge from a
-/// normal process — no WDDM/INF/devcon/DWM involvement. Returns 0 if DXVK brought
-/// up a logical device on the venus adapter, 1 otherwise. Remove once the DDI path
-/// is validated end-to-end.
-#[no_mangle]
-pub extern "system" fn helios_umd_selftest() -> i32 {
-    log_error!("helios_umd_selftest: creating DXVK device on venus...");
-    let dev = bridge::BridgeDevice::create(0, 0);
-    let bridge_ok = dev.is_some();
-    log_error!("helios_umd_selftest: bridge ok={bridge_ok}");
-    let Some(dev) = dev else {
-        return 1;
-    };
-
-    // Prove the windows-crate COM bindings call straight into DXVK's ID3D11Device
-    // (the foundation for the pure-Rust DDI forwarders): create a real buffer.
-    {
-        use windows::Win32::Graphics::Direct3D11::*;
-        // Borrowed through the sealed accessor: the raw `d3d11_device_ptr` is
-        // no longer reachable from outside `bridge`, so this cannot be written
-        // as an adopting from_raw. R815.
-        let device = dev.d3d11_device();
-        log_error!(
-            "helios_umd_selftest: ID3D11Device* = 0x{:x}",
-            device
-                .as_ref()
-                .map_or(0, |d| windows::core::Interface::as_raw(&**d) as usize)
-        );
-        if let Some(device) = device {
-            let desc = D3D11_BUFFER_DESC {
-                ByteWidth: 256,
-                Usage: D3D11_USAGE_DEFAULT,
-                BindFlags: D3D11_BIND_VERTEX_BUFFER.0 as u32,
-                ..Default::default()
-            };
-            let mut buffer: Option<ID3D11Buffer> = None;
-            let hr = unsafe { device.CreateBuffer(&desc, None, Some(&mut buffer)) };
-            log_error!(
-                "helios_umd_selftest: windows-crate CreateBuffer -> {hr:?}, buffer_some={}",
-                buffer.is_some()
-            );
-        }
-    }
-    drop(dev);
-
-    // Exercise the full CreateDevice path in-process with synthesized runtime
-    // buffers (no D3D runtime / DWM): proves CalcPrivateDeviceSize + CreateDevice
-    // + the 152-entry table fill + DestroyDevice don't crash before risking a
-    // live install. Buffers are u64-backed for 8-byte alignment.
-    let hadapter = ddi::D3D10DDI_HADAPTER {
-        pDrvPrivate: core::ptr::null_mut(),
-    };
-    let dev_size = unsafe { calc_private_device_size(hadapter, core::ptr::null()) } as usize;
-
-    let mut device_priv = vec![0u64; dev_size / 8 + 1];
-    let mut funcs = vec![0u64; core::mem::size_of::<ddi::D3D11DDI_DEVICEFUNCS>() / 8 + 1];
-    let mut dxgi_funcs = vec![0u64; core::mem::size_of::<ddi::DXGI_DDI_BASE_FUNCTIONS>() / 8 + 1];
-
-    // Both unions are initialised explicitly, and each names the member that
-    // matches the `Interface` above: an 11.0-negotiated device reads
-    // `p11DeviceFuncs` and `pUMCallbacks`. Every member of each union is a
-    // pointer at offset 0 (bindgen asserts that in the generated module), so
-    // this is representationally identical to the old single-pointer field --
-    // what it buys is that the member name and `Interface` now have to agree.
-    let arg = ddi::D3D10DDIARG_CREATEDEVICE {
-        // The WDK spells runtime-owned handles `handle` and driver-private ones
-        // `pDrvPrivate`. The hand-written struct erased that by declaring every
-        // one as a bare `*mut c_void`.
-        hRTDevice: ddi::D3D10DDI_HRTDEVICE {
-            handle: core::ptr::null_mut(),
-        },
-        Interface: 0x000b_000a, // D3D11_0_DDI_INTERFACE_VERSION
-        Version: 0,
-        pKTCallbacks: core::ptr::null(),
-        __bindgen_anon_1: ddi::D3D10DDIARG_CREATEDEVICE__bindgen_ty_1 {
-            p11DeviceFuncs: funcs.as_mut_ptr().cast(),
-        },
-        hDrvDevice: ddi::D3D10DDI_HDEVICE {
-            pDrvPrivate: device_priv.as_mut_ptr().cast(),
-        },
-        DXGIBaseDDI: ddi::DXGI_DDI_BASE_ARGS {
-            pDXGIBaseCallbacks: core::ptr::null_mut(),
-            __bindgen_anon_1: ddi::DXGI_DDI_BASE_ARGS__bindgen_ty_1 {
-                pDXGIDDIBaseFunctions: dxgi_funcs.as_mut_ptr().cast(),
-            },
-        },
-        hRTCoreLayer: ddi::D3D10DDI_HRTCORELAYER {
-            handle: core::ptr::null_mut(),
-        },
-        __bindgen_anon_2: ddi::D3D10DDIARG_CREATEDEVICE__bindgen_ty_2 {
-            pUMCallbacks: core::ptr::null(),
-        },
-        Flags: 0,
-        ppfnRetrieveSubObject: core::ptr::null_mut(),
-    };
-
-    // No `as *mut c_void` any more: `create_device` takes the arg struct by its
-    // own type, so passing the wrong thing here is a compile error.
-    let mut arg = arg;
-    let hr = unsafe { create_device(hadapter, &mut arg) };
-    log_error!(
-        "helios_umd_selftest: synthesized CreateDevice -> 0x{hr:08x}"
-    );
-    if hr != S_OK {
-        return 2;
-    }
-
-    // Sanity: the table must be fully non-null (a null entry the runtime calls = crash).
-    let table = funcs.as_ptr() as *const Option<unsafe extern "C" fn(usize) -> usize>;
-    let n = core::mem::size_of::<ddi::D3D11DDI_DEVICEFUNCS>() / 8;
-    let null_slots = (0..n)
-        .filter(|&i| unsafe { (*table.add(i)).is_none() })
-        .count();
-    log_error!(
-        "helios_umd_selftest: device-funcs null slots = {null_slots} / {n}"
-    );
-
-    // Offscreen clear+readback through the real forwarders.
-    let hdev = ddi::D3D10DDI_HDEVICE {
-        pDrvPrivate: device_priv.as_mut_ptr().cast(),
-    };
-    let render_rc = unsafe { forward::selftest_offscreen_clear(hdev) };
-    log_error!(
-        "helios_umd_selftest: offscreen clear rc={render_rc}"
-    );
-    let tri_rc = unsafe { forward::selftest_triangle(hdev) };
-    log_error!("helios_umd_selftest: triangle rc={tri_rc}");
-    let cb_rc = unsafe { forward::selftest_cb_readback(hdev) };
-    log_error!("helios_umd_selftest: cb_readback rc={cb_rc}");
-    let cbtri_rc = unsafe { forward::selftest_triangle_cb(hdev) };
-    log_error!("helios_umd_selftest: triangle_cb rc={cbtri_rc}");
-
-    // Tear the device back down via the real DestroyDevice entry.
-    let device_funcs_table = funcs.as_ptr() as *const ddi::D3D11DDI_DEVICEFUNCS;
-    if let Some(destroy) = unsafe { (*device_funcs_table).pfnDestroyDevice } {
-        let hdev = ddi::D3D10DDI_HDEVICE {
-            pDrvPrivate: device_priv.as_mut_ptr().cast(),
-        };
-        unsafe { destroy(hdev) };
-    }
-
-    if null_slots == 0 {
-        0
-    } else {
-        3
-    }
 }
 
 #[no_mangle]
