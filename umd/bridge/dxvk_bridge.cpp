@@ -736,14 +736,61 @@ namespace {
     file.write(reinterpret_cast<const char*>(data), len);
   }
 
-  struct ShaderBytecode {
-    std::vector<std::uint8_t> owned;
-    const std::uint8_t* data = nullptr;
-    std::size_t len = 0;
+  // A shader blob that is either BORROWED from the caller's buffer or OWNED in
+  // a vector this object built.
+  //
+  // Pre-R819 `data` meant two different things depending on which factory
+  // produced the value -- a pointer into the caller's buffer with `owned`
+  // empty, or a pointer aliasing `owned.data()`. The struct was COPYABLE, and
+  // copying it in the second case left the copy's `data` pointing at the
+  // ORIGINAL vector's heap buffer: a dangling pointer as soon as the original
+  // died, handed to CreateVertexShader as the shader blob. It survived only
+  // because every use is a single local initialised by `auto x = factory(...)`
+  // and never copied or reassigned.
+  //
+  // Two changes make the invalid state unrepresentable rather than merely
+  // unreached: the type is move-only, and the range is DERIVED from the owner
+  // instead of stored beside it, so there is no `data` member that can alias a
+  // vector which is not this object's. Moving is safe and stays allowed --
+  // moving a std::vector transfers the heap buffer, so a derived pointer stays
+  // valid; it is copying that reallocates.
+  //
+  // No std::span: this TU is C++17 (see umd/build.rs).
+  class ShaderBytecode {
+   public:
+    ShaderBytecode() = default;
+    ShaderBytecode(const ShaderBytecode&) = delete;
+    ShaderBytecode& operator=(const ShaderBytecode&) = delete;
+    // A user-declared copy constructor -- even a deleted one -- suppresses the
+    // implicit move operations, so they are defaulted explicitly.
+    ShaderBytecode(ShaderBytecode&&) = default;
+    ShaderBytecode& operator=(ShaderBytecode&&) = default;
+
+    /// Borrow the caller's buffer. Its lifetime must exceed this object's --
+    /// the one precondition that stays a documented rule.
+    void borrow(const std::uint8_t* p, std::size_t n) {
+      borrowed_ = p;
+      borrowed_len_ = n;
+    }
+
+    /// The owned buffer, built in place by the wrapping factories.
+    std::vector<std::uint8_t>& owned() { return owned_; }
+
+    const std::uint8_t* data() const {
+      return owned_.empty() ? borrowed_ : owned_.data();
+    }
+    std::size_t len() const {
+      return owned_.empty() ? borrowed_len_ : owned_.size();
+    }
 
     explicit operator bool() const {
-      return data && len;
+      return data() && len();
     }
+
+   private:
+    std::vector<std::uint8_t> owned_;
+    const std::uint8_t* borrowed_ = nullptr;
+    std::size_t borrowed_len_ = 0;
   };
 
   template<typename T>
@@ -1005,20 +1052,19 @@ namespace {
     const std::uint32_t chunk_base = file_header_size + offset_table_size;
     const std::uint32_t file_size = chunk_base + std::uint32_t(chunks.size());
 
-    result.owned.resize(file_size);
-    std::memcpy(&result.owned[0], "DXBC", 4);
-    write_le(result.owned, 20u, std::uint32_t(1u));
-    write_le(result.owned, 24u, file_size);
-    write_le(result.owned, 28u, chunk_count);
+    result.owned().resize(file_size);
+    std::memcpy(&result.owned()[0], "DXBC", 4);
+    write_le(result.owned(), 20u, std::uint32_t(1u));
+    write_le(result.owned(), 24u, file_size);
+    write_le(result.owned(), 28u, chunk_count);
     for (std::uint32_t i = 0; i < chunk_count; ++i)
-      write_le(result.owned, 32u + 4u * i, chunk_base + chunk_offsets.at(i));
-    std::memcpy(&result.owned[chunk_base], chunks.data(), chunks.size());
+      write_le(result.owned(), 32u + 4u * i, chunk_base + chunk_offsets.at(i));
+    std::memcpy(&result.owned()[chunk_base], chunks.data(), chunks.size());
 
-    auto digest = dxbc_spv::dxbc::hashDxbcBinary(result.owned.data(), result.owned.size());
-    std::memcpy(&result.owned[4], digest.data.data(), digest.data.size());
+    auto digest = dxbc_spv::dxbc::hashDxbcBinary(result.owned().data(), result.owned().size());
+    std::memcpy(&result.owned()[4], digest.data.data(), digest.data.size());
 
-    result.data = result.owned.data();
-    result.len = result.owned.size();
+    // No `result.data = result.owned().data()` any more: the range is derived.
     return result;
   }
 
@@ -1065,20 +1111,19 @@ namespace {
     const std::uint32_t chunk_base = file_header_size + offset_table_size;
     const std::uint32_t file_size = chunk_base + std::uint32_t(chunks.size());
 
-    result.owned.resize(file_size);
-    std::memcpy(&result.owned[0], "DXBC", 4);
-    write_le(result.owned, 20u, std::uint32_t(1u));
-    write_le(result.owned, 24u, file_size);
-    write_le(result.owned, 28u, chunk_count);
+    result.owned().resize(file_size);
+    std::memcpy(&result.owned()[0], "DXBC", 4);
+    write_le(result.owned(), 20u, std::uint32_t(1u));
+    write_le(result.owned(), 24u, file_size);
+    write_le(result.owned(), 28u, chunk_count);
     for (std::uint32_t i = 0; i < chunk_count; ++i)
-      write_le(result.owned, 32u + 4u * i, chunk_base + chunk_offsets.at(i));
-    std::memcpy(&result.owned[chunk_base], chunks.data(), chunks.size());
+      write_le(result.owned(), 32u + 4u * i, chunk_base + chunk_offsets.at(i));
+    std::memcpy(&result.owned()[chunk_base], chunks.data(), chunks.size());
 
-    auto digest = dxbc_spv::dxbc::hashDxbcBinary(result.owned.data(), result.owned.size());
-    std::memcpy(&result.owned[4], digest.data.data(), digest.data.size());
+    auto digest = dxbc_spv::dxbc::hashDxbcBinary(result.owned().data(), result.owned().size());
+    std::memcpy(&result.owned()[4], digest.data.data(), digest.data.size());
 
-    result.data = result.owned.data();
-    result.len = result.owned.size();
+    // No `result.data = result.owned().data()` any more: the range is derived.
     return result;
   }
 
@@ -1089,8 +1134,7 @@ namespace {
       return result;
 
     if (len >= 4 && std::memcmp(code, "DXBC", 4) == 0) {
-      result.data = code;
-      result.len = len;
+      result.borrow(code, len);
       return result;
     }
 
@@ -1117,21 +1161,20 @@ namespace {
     constexpr std::uint32_t chunk_header_size = 8u;
     const std::uint32_t file_size = chunk_offset + chunk_header_size + std::uint32_t(len);
 
-    result.owned.resize(file_size);
-    std::memcpy(&result.owned[0], "DXBC", 4);
-    write_le(result.owned, 20u, std::uint32_t(1u));
-    write_le(result.owned, 24u, file_size);
-    write_le(result.owned, 28u, chunk_count);
-    write_le(result.owned, 32u, chunk_offset);
-    std::memcpy(&result.owned[chunk_offset], chunk_tag, 4);
-    write_le(result.owned, chunk_offset + 4u, std::uint32_t(len));
-    std::memcpy(&result.owned[chunk_offset + chunk_header_size], code, len);
+    result.owned().resize(file_size);
+    std::memcpy(&result.owned()[0], "DXBC", 4);
+    write_le(result.owned(), 20u, std::uint32_t(1u));
+    write_le(result.owned(), 24u, file_size);
+    write_le(result.owned(), 28u, chunk_count);
+    write_le(result.owned(), 32u, chunk_offset);
+    std::memcpy(&result.owned()[chunk_offset], chunk_tag, 4);
+    write_le(result.owned(), chunk_offset + 4u, std::uint32_t(len));
+    std::memcpy(&result.owned()[chunk_offset + chunk_header_size], code, len);
 
-    auto digest = dxbc_spv::dxbc::hashDxbcBinary(result.owned.data(), result.owned.size());
-    std::memcpy(&result.owned[4], digest.data.data(), digest.data.size());
+    auto digest = dxbc_spv::dxbc::hashDxbcBinary(result.owned().data(), result.owned().size());
+    std::memcpy(&result.owned()[4], digest.data.data(), digest.data.size());
 
-    result.data = result.owned.data();
-    result.len = result.owned.size();
+    // No `result.data = result.owned().data()` any more: the range is derived.
     return result;
   }
 
@@ -1817,8 +1860,8 @@ std::size_t HeliosDxvkDevice::create_vertex_shader(const std::uint8_t* code, std
     if (!bytecode)
       return 0;
     dump_shader_bytecode("vs", "raw", code, len);
-    dump_shader_bytecode("vs", "wrapped", bytecode.data, bytecode.len);
-    HRESULT hr = impl->d3d11->CreateVertexShader(bytecode.data, bytecode.len, nullptr, &shader);
+    dump_shader_bytecode("vs", "wrapped", bytecode.data(), bytecode.len());
+    HRESULT hr = impl->d3d11->CreateVertexShader(bytecode.data(), bytecode.len(), nullptr, &shader);
     if (FAILED(hr)) {
       umd_log("CreateVertexShader returned failure");
       return 0;
@@ -1843,8 +1886,8 @@ std::size_t HeliosDxvkDevice::create_pixel_shader(const std::uint8_t* code, std:
     if (!bytecode)
       return 0;
     dump_shader_bytecode("ps", "raw", code, len);
-    dump_shader_bytecode("ps", "wrapped", bytecode.data, bytecode.len);
-    HRESULT hr = impl->d3d11->CreatePixelShader(bytecode.data, bytecode.len, nullptr, &shader);
+    dump_shader_bytecode("ps", "wrapped", bytecode.data(), bytecode.len());
+    HRESULT hr = impl->d3d11->CreatePixelShader(bytecode.data(), bytecode.len(), nullptr, &shader);
     if (FAILED(hr)) {
       umd_log("CreatePixelShader returned failure");
       return 0;
@@ -1869,8 +1912,8 @@ std::size_t HeliosDxvkDevice::create_geometry_shader(const std::uint8_t* code, s
     if (!bytecode)
       return 0;
     dump_shader_bytecode("gs", "raw", code, len);
-    dump_shader_bytecode("gs", "wrapped", bytecode.data, bytecode.len);
-    HRESULT hr = impl->d3d11->CreateGeometryShader(bytecode.data, bytecode.len, nullptr, &shader);
+    dump_shader_bytecode("gs", "wrapped", bytecode.data(), bytecode.len());
+    HRESULT hr = impl->d3d11->CreateGeometryShader(bytecode.data(), bytecode.len(), nullptr, &shader);
     if (FAILED(hr)) {
       umd_log("CreateGeometryShader returned failure");
       return 0;
@@ -1915,20 +1958,20 @@ std::size_t HeliosDxvkDevice::create_shader_sig(
       return 0;
     const char* stage = kind == 0 ? "vs-sig" : kind == 1 ? "ps-sig" : "gs-sig";
     dump_shader_bytecode(stage, "raw", code, len);
-    dump_shader_bytecode(stage, "wrapped", bytecode.data, bytecode.len);
+    dump_shader_bytecode(stage, "wrapped", bytecode.data(), bytecode.len());
     HRESULT hr = E_FAIL;
     void* shader = nullptr;
     switch (kind) {
       case 0:
-        hr = impl->d3d11->CreateVertexShader(bytecode.data, bytecode.len, nullptr,
+        hr = impl->d3d11->CreateVertexShader(bytecode.data(), bytecode.len(), nullptr,
                                              reinterpret_cast<ID3D11VertexShader**>(&shader));
         break;
       case 1:
-        hr = impl->d3d11->CreatePixelShader(bytecode.data, bytecode.len, nullptr,
+        hr = impl->d3d11->CreatePixelShader(bytecode.data(), bytecode.len(), nullptr,
                                             reinterpret_cast<ID3D11PixelShader**>(&shader));
         break;
       case 2:
-        hr = impl->d3d11->CreateGeometryShader(bytecode.data, bytecode.len, nullptr,
+        hr = impl->d3d11->CreateGeometryShader(bytecode.data(), bytecode.len(), nullptr,
                                                reinterpret_cast<ID3D11GeometryShader**>(&shader));
         break;
       default:
@@ -1980,16 +2023,16 @@ std::size_t HeliosDxvkDevice::create_tess_shader_sig(
       return 0;
     const char* stage = kind == 0 ? "hs-sig" : "ds-sig";
     dump_shader_bytecode(stage, "raw", code, len);
-    dump_shader_bytecode(stage, "wrapped", bytecode.data, bytecode.len);
+    dump_shader_bytecode(stage, "wrapped", bytecode.data(), bytecode.len());
     HRESULT hr = E_FAIL;
     void* shader = nullptr;
     switch (kind) {
       case 0:
-        hr = impl->d3d11->CreateHullShader(bytecode.data, bytecode.len, nullptr,
+        hr = impl->d3d11->CreateHullShader(bytecode.data(), bytecode.len(), nullptr,
                                            reinterpret_cast<ID3D11HullShader**>(&shader));
         break;
       case 1:
-        hr = impl->d3d11->CreateDomainShader(bytecode.data, bytecode.len, nullptr,
+        hr = impl->d3d11->CreateDomainShader(bytecode.data(), bytecode.len(), nullptr,
                                              reinterpret_cast<ID3D11DomainShader**>(&shader));
         break;
       default:
@@ -2690,8 +2733,8 @@ std::size_t HeliosDxvkDevice::create_hull_shader(const std::uint8_t* code, std::
     if (!bytecode)
       return 0;
     dump_shader_bytecode("hs", "raw", code, len);
-    dump_shader_bytecode("hs", "wrapped", bytecode.data, bytecode.len);
-    HRESULT hr = impl->d3d11->CreateHullShader(bytecode.data, bytecode.len, nullptr, &shader);
+    dump_shader_bytecode("hs", "wrapped", bytecode.data(), bytecode.len());
+    HRESULT hr = impl->d3d11->CreateHullShader(bytecode.data(), bytecode.len(), nullptr, &shader);
     if (FAILED(hr)) {
       umd_log("CreateHullShader returned failure");
       return 0;
@@ -2716,8 +2759,8 @@ std::size_t HeliosDxvkDevice::create_domain_shader(const std::uint8_t* code, std
     if (!bytecode)
       return 0;
     dump_shader_bytecode("ds", "raw", code, len);
-    dump_shader_bytecode("ds", "wrapped", bytecode.data, bytecode.len);
-    HRESULT hr = impl->d3d11->CreateDomainShader(bytecode.data, bytecode.len, nullptr, &shader);
+    dump_shader_bytecode("ds", "wrapped", bytecode.data(), bytecode.len());
+    HRESULT hr = impl->d3d11->CreateDomainShader(bytecode.data(), bytecode.len(), nullptr, &shader);
     if (FAILED(hr)) {
       umd_log("CreateDomainShader returned failure");
       return 0;
@@ -2742,8 +2785,8 @@ std::size_t HeliosDxvkDevice::create_compute_shader(const std::uint8_t* code, st
     if (!bytecode)
       return 0;
     dump_shader_bytecode("cs", "raw", code, len);
-    dump_shader_bytecode("cs", "wrapped", bytecode.data, bytecode.len);
-    HRESULT hr = impl->d3d11->CreateComputeShader(bytecode.data, bytecode.len, nullptr, &shader);
+    dump_shader_bytecode("cs", "wrapped", bytecode.data(), bytecode.len());
+    HRESULT hr = impl->d3d11->CreateComputeShader(bytecode.data(), bytecode.len(), nullptr, &shader);
     if (FAILED(hr)) {
       umd_log("CreateComputeShader returned failure");
       return 0;
