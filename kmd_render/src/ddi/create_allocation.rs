@@ -2113,7 +2113,15 @@ pub unsafe extern "C" fn dxgkddi_open_allocation(
     }
     // SAFETY: hDevice is the DeviceContext we returned from DxgkDdiCreateDevice;
     // its adapter back-pointer is valid for the device's lifetime.
-    let adapter = unsafe { &*(*(h_device as *const crate::device::DeviceContext)).adapter };
+    //
+    // This site used to dereference the back-pointer in ONE expression with no
+    // null check at all, unlike its two siblings in scheduler.rs and
+    // submit_command.rs. The checked traversal is now the only route.
+    let Some(adapter) = (unsafe { crate::device::DeviceHandleRef::from_raw(h_device) })
+        .and_then(|d| d.adapter())
+    else {
+        return STATUS_INVALID_PARAMETER;
+    };
     // SAFETY: valid per the DDI contract; `pOpenAllocation` is a `*mut` array of
     // `NumAllocations` entries whose `hDeviceSpecificAllocation` we fill.
     // The struct has output fields (`Pitch`, `SubresourceOffset`) despite the WDK

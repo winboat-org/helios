@@ -16,20 +16,25 @@ use crate::dxgk::*;
 /// State for one D3D device opened on the adapter.
 pub struct DeviceContext {
     /// Back-pointer to the owning adapter (valid for the device's lifetime).
-    pub adapter: *mut AdapterContext,
+    ///
+    /// PRIVATE. The only route from a device handle to an `&AdapterContext` is
+    /// [`DeviceHandleRef`]'s checked traversal — see its docs for the cast this
+    /// prevents.
+    adapter: *mut AdapterContext,
 }
 
 /// State for one scheduler context opened on a D3D device.
 pub struct ContextContext {
     /// Back-pointer to the owning device (valid for the context's lifetime).
-    pub device: *mut DeviceContext,
+    /// PRIVATE, for the same reason as [`DeviceContext::adapter`].
+    device: *mut DeviceContext,
 }
 
 /// Typed borrowed view of a scheduler context handle.
 ///
 /// DDI handle types are all C `HANDLE`s, so a direct cast can compile even when
 /// the callback actually received an hContext rather than an hAdapter. Keeping
-/// the only Present-path traversal here makes the ownership chain explicit:
+/// the traversal here makes the ownership chain explicit:
 /// ContextContext -> DeviceContext -> AdapterContext.
 pub struct ContextHandleRef<'a> {
     context: &'a ContextContext,
@@ -49,13 +54,65 @@ impl<'a> ContextHandleRef<'a> {
     }
 }
 
+/// Typed borrowed view of a D3D **device** handle.
+///
+/// [`ContextHandleRef`] existed precisely because "DDI handle types are all C
+/// `HANDLE`s, so a direct cast can compile even when the callback actually
+/// received an hContext rather than an hAdapter" — and it was used at exactly ONE
+/// site. Five other sites did the cast it was written to prevent, and both
+/// back-pointer fields were `pub`, so nothing forced the checked traversal. The
+/// sharpest was `create_allocation.rs`'s
+/// `&*(*(h_device as *const DeviceContext)).adapter`, which dereferenced the
+/// back-pointer in one expression with NO null check, unlike its two siblings.
+///
+/// With the fields private, the only route from a device handle to an
+/// `&AdapterContext` outside this module is through here, so an adapter-scoped
+/// DDI slot handed a device handle no longer compiles.
+///
+/// What this does NOT buy: newtyped handles (`struct HDevice(HANDLE)`) would go
+/// further, but the DDI signatures are bindgen-fixed at `*mut c_void`, so an
+/// `unsafe fn from_raw` is still needed at each entry. The win is that the cast
+/// happens once per DDI in one module instead of inline in four subsystems.
+pub struct DeviceHandleRef<'a> {
+    device: &'a DeviceContext,
+}
+
+impl<'a> DeviceHandleRef<'a> {
+    /// # Safety
+    /// `handle` must be a live hDevice returned by [`dxgkddi_create_device`].
+    /// That it really is one is dxgkrnl's contract and is not encodable; the null
+    /// check below is the only part we can enforce.
+    pub unsafe fn from_raw(handle: HANDLE) -> Option<Self> {
+        let device = unsafe { (handle as *const DeviceContext).as_ref() }?;
+        Some(Self { device })
+    }
+
+    pub fn adapter(&self) -> Option<&'a AdapterContext> {
+        unsafe { self.device.adapter.as_ref() }
+    }
+
+    /// The raw back-pointer, for the one caller that stores it rather than
+    /// borrowing through it (`scheduler.rs`'s `HwContext`).
+    pub fn adapter_ptr(&self) -> *mut AdapterContext {
+        self.device.adapter
+    }
+}
+
 /// State for one GPU process object (WDDM 2.0 GPU-VA requirement). We keep no
 /// per-process GPU virtual address space (host-owned VA), but dxgkrnl requires a
 /// non-NULL driver handle it can round-trip through every per-process DDI and
 /// hand back at DestroyProcess, so we allocate a real object to back the handle.
+///
+/// DELIBERATELY EMPTY. It used to carry an `adapter` back-pointer that was
+/// written at CreateProcess and never read, which implied an ownership edge that
+/// does not exist. The allocation stays — dxgkrnl needs the non-NULL handle — but
+/// the object is an opaque token and nothing more.
 pub struct ProcessContext {
-    /// Back-pointer to the owning adapter (valid for the process's lifetime).
-    pub adapter: *mut AdapterContext,
+    /// Zero-sized structs still get a unique non-null address from `Box`, but a
+    /// field makes the allocation's purpose (a handle dxgkrnl can round-trip)
+    /// legible and keeps `Box::into_raw` returning a real pointer under any
+    /// future allocator.
+    _opaque: u32,
 }
 
 /// `DxgkDdiCreateDevice` — allocate per-device state.
@@ -94,8 +151,15 @@ pub unsafe extern "C" fn dxgkddi_destroy_device(h_device: *mut c_void) -> NTSTAT
     if !h_device.is_null() {
         // SAFETY: h_device came from Box::into_raw in create_device; its `adapter`
         // back-pointer is valid for the device's lifetime.
-        let dev = unsafe { &*(h_device as *mut DeviceContext) };
-        let adapter = unsafe { &*dev.adapter };
+        let Some(adapter) = (unsafe { DeviceHandleRef::from_raw(h_device) })
+            .and_then(|d| d.adapter())
+        else {
+            // The Box still has to be reclaimed even if the back-pointer is
+            // somehow null — leaking it would be the worse failure.
+            // SAFETY: produced by Box::into_raw in create_device.
+            drop(unsafe { Box::from_raw(h_device as *mut DeviceContext) });
+            return STATUS_SUCCESS;
+        };
         let owner = h_device as usize;
         // Drain THIS device's mappings in batches, unmapping outside the table
         // lock (MmUnmapLockedPages needs PASSIVE; the table lock raises to
@@ -226,9 +290,9 @@ pub unsafe extern "C" fn dxgkddi_create_process(
     }
     // SAFETY: Dxgkrnl passes our adapter context and a valid args struct.
     let args = unsafe { &mut *args };
-    let ctx = Box::new(ProcessContext {
-        adapter: miniport_device_context as *mut AdapterContext,
-    });
+    // The handle is an opaque token: dxgkrnl only round-trips it. The old
+    // `adapter` back-pointer here was written and never read.
+    let ctx = Box::new(ProcessContext { _opaque: 0 });
     // Hand the process handle back to Dxgkrnl; reclaimed in destroy_process.
     args.hKmdProcess = Box::into_raw(ctx) as HANDLE;
     STATUS_SUCCESS

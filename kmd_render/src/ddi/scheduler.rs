@@ -11,7 +11,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::adapter::AdapterContext;
 use crate::ddi::present_packet::{PresentAllocations, STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER};
-use crate::device::DeviceContext;
+use crate::device::DeviceHandleRef;
 use crate::dxgk::*;
 
 const HW_CONTEXT_MAGIC: u32 = 0x4843_5458; // "HCTX"
@@ -137,15 +137,19 @@ pub unsafe extern "C" fn dxgkddi_create_hw_context(
     }
 
     // SAFETY: h_device is the DeviceContext pointer returned from
-    // DxgkDdiCreateDevice for this adapter.
-    let device = unsafe { &*(h_device as *const DeviceContext) };
-    if device.adapter.is_null() {
+    // DxgkDdiCreateDevice for this adapter. The checked traversal is the only
+    // route to the adapter now that the back-pointer is private.
+    let Some(device) = (unsafe { DeviceHandleRef::from_raw(h_device) }) else {
+        return STATUS_INVALID_PARAMETER;
+    };
+    if device.adapter().is_none() {
         return STATUS_INVALID_PARAMETER;
     }
 
     let ctx = Box::new(HwContext {
         magic: HW_CONTEXT_MAGIC,
-        adapter: device.adapter,
+        // Stored, not borrowed: `HwContext` outlives this call.
+        adapter: device.adapter_ptr(),
     });
     args.hHwContext = Box::into_raw(ctx) as HANDLE;
     STATUS_SUCCESS

@@ -823,15 +823,16 @@ pub unsafe extern "C" fn dxgkddi_render(
             )
         };
         if command.is_valid() {
-            if !h_context.is_null() {
-                let context = unsafe { &*(h_context as *const crate::device::ContextContext) };
-                // The allocation identity was fixed once by
-                // SetVidPnSourceAddress. Ordinary presents only dirty that
-                // durable target; they must never select a resource from stale
-                // bytes beyond the 16-byte command.
-                if !context.device.is_null() && !unsafe { (*context.device).adapter.is_null() } {
-                    arm_scanout_refresh_after_current_venus(unsafe { &*(*context.device).adapter });
-                }
+            // The allocation identity was fixed once by SetVidPnSourceAddress.
+            // Ordinary presents only dirty that durable target; they must never
+            // select a resource from stale bytes beyond the 16-byte command.
+            //
+            // The two-back-pointer chain used to be walked inline here with a
+            // hand-written `!is_null()` pair; `ContextHandleRef` is the same
+            // traversal, checked once, in the module that owns the fields.
+            let context = unsafe { crate::device::ContextHandleRef::from_raw(h_context) };
+            if let Some(adapter) = context.as_ref().and_then(|c| c.adapter()) {
+                arm_scanout_refresh_after_current_venus(adapter);
             }
         }
     }
@@ -851,8 +852,9 @@ pub unsafe extern "C" fn dxgkddi_render(
                     crate::diag::record_named_bytes(b"PRset", 0xE1);
                 }
             } else {
-                let context = unsafe { &*(h_context as *const crate::device::ContextContext) };
-                if context.device.is_null() || unsafe { (*context.device).adapter.is_null() } {
+                let context = unsafe { crate::device::ContextHandleRef::from_raw(h_context) };
+                let adapter = context.as_ref().and_then(|c| c.adapter());
+                if adapter.is_none() {
                     if diag {
                         crate::diag::record_named_bytes(b"PRset", 0xE2);
                     }
@@ -867,7 +869,9 @@ pub unsafe extern "C" fn dxgkddi_render(
                     // completion/dirty edge for the Venus work submitted
                     // before pfnPresentCb; its private bytes are not a second
                     // scanout selector.
-                    arm_scanout_refresh_after_current_venus(unsafe { &*(*context.device).adapter });
+                    if let Some(adapter) = adapter {
+                        arm_scanout_refresh_after_current_venus(adapter);
+                    }
                 }
             }
         }
