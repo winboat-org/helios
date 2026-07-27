@@ -193,24 +193,6 @@ struct VirtioGpuTransferHost3d {
     layer_stride: u32,
 }
 
-/// ⚠ TEMPORARY, R614 commit 1 — an UNAUDITED [`PassiveLevel`] mint.
-///
-/// The token is threaded from the inside out: this module's primitives take one
-/// first, then each caller group is converted in its own commit and its
-/// `ctrl::` entry points switch to taking the token as a parameter. Until a
-/// given entry point's last caller group lands, it mints here instead, which
-/// asserts nothing beyond the module contract it already had.
-///
-/// This is deliberately laundering, and it is the one thing the item exists to
-/// remove — so it is named for what it is, and
-/// `grep -c assume_passive_unaudited` is the count of work remaining. The
-/// tranche's final commit deletes this function; if it is still here, the
-/// tranche is not finished.
-fn assume_passive_unaudited() -> PassiveLevel {
-    // SAFETY: NOT a real audit. Placeholder for the caller-group commits.
-    unsafe { PassiveLevel::assume() }
-}
-
 /// PASSIVE sleep for ~`ms` milliseconds.
 pub(crate) fn sleep_ms(_passive: PassiveLevel, ms: u64) {
     let mut interval: LARGE_INTEGER = unsafe { core::mem::zeroed() };
@@ -502,13 +484,20 @@ pub fn ctx_destroy(
 /// Untracked teardown of a context this driver created for itself (the
 /// persistent venus context, the virgl diagnostic contexts). Owner-scoped to
 /// the KMD.
-pub fn ctx_destroy_kmd(adapter: &AdapterContext, ctx_id: u32) -> Result<(), VirtioError> {
-    ctx_destroy(assume_passive_unaudited(), adapter, None, ctx_id)
+pub fn ctx_destroy_kmd(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    ctx_id: u32,
+) -> Result<(), VirtioError> {
+    ctx_destroy(passive, adapter, None, ctx_id)
 }
 
 /// `CTX_DESTROY` every context still owned by `owner` (device teardown).
-pub fn destroy_contexts_for_owner(adapter: &AdapterContext, owner: Option<DeviceOwner>) -> u32 {
-    let passive = assume_passive_unaudited();
+pub fn destroy_contexts_for_owner(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    owner: Option<DeviceOwner>,
+) -> u32 {
     let mut destroyed = 0u32;
     loop {
         let taken = adapter
@@ -1024,7 +1013,7 @@ pub fn diagnostic_virgl_host3d_blob(
         )
     };
     if let Err(e) = submit_3d_sync(passive, adapter, ctx_id, bytes) {
-        let _ = ctx_destroy_kmd(adapter, ctx_id);
+        let _ = ctx_destroy_kmd(passive, adapter, ctx_id);
         return Err(e);
     }
 
@@ -1041,7 +1030,7 @@ pub fn diagnostic_virgl_host3d_blob(
     ) {
         Ok(resource_id) => Ok((resource_id, blob_id, pitch)),
         Err(e) => {
-            let _ = ctx_destroy_kmd(adapter, ctx_id);
+            let _ = ctx_destroy_kmd(passive, adapter, ctx_id);
             Err(e)
         }
     }
@@ -1133,7 +1122,7 @@ pub fn diagnostic_virgl_host3d_guest_scanout(
         )
     };
     if let Err(e) = submit_3d_sync(passive, adapter, ctx_id, bytes) {
-        let _ = ctx_destroy_kmd(adapter, ctx_id);
+        let _ = ctx_destroy_kmd(passive, adapter, ctx_id);
         return Err(e);
     }
 
@@ -1141,14 +1130,14 @@ pub fn diagnostic_virgl_host3d_guest_scanout(
         .with_virtio(|v| v.reserve_resource_slot())
         .map_err(|_| VirtioError::DeviceError)?;
     if !reserved {
-        let _ = ctx_destroy_kmd(adapter, ctx_id);
+        let _ = ctx_destroy_kmd(passive, adapter, ctx_id);
         return Err(VirtioError::OutOfMemory);
     }
     let resource_id = match adapter.with_virtio(|v| v.alloc_resource_id()) {
         Ok(id) => id,
         Err(_) => {
             let _ = adapter.with_virtio(|v| v.cancel_resource_reservation());
-            let _ = ctx_destroy_kmd(adapter, ctx_id);
+            let _ = ctx_destroy_kmd(passive, adapter, ctx_id);
             return Err(VirtioError::DeviceError);
         }
     };
@@ -1169,7 +1158,7 @@ pub fn diagnostic_virgl_host3d_guest_scanout(
     };
     if let Err(e) = ctrl_roundtrip_ok(passive, adapter, bytes_of(&create), Some(bytes_of(&entry))) {
         let _ = adapter.with_virtio(|v| v.cancel_resource_reservation());
-        let _ = ctx_destroy_kmd(adapter, ctx_id);
+        let _ = ctx_destroy_kmd(passive, adapter, ctx_id);
         return Err(e);
     }
     let _ = adapter.with_virtio(|v| v.commit_resource(resource_id));

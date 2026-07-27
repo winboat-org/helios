@@ -270,8 +270,11 @@ pub unsafe extern "C" fn dxgkddi_start_device(
     let mut page_table_window = None;
     // SAFETY: dxgkrnl_interface is valid per the DDI contract (also copied into
     // the `dxgkrnl` local above); init only borrows it for the call.
-    // SAFETY: PLACEHOLDER (R614) — `dxgkddi_start_device` mints the real token in
-    // the start/stop commit of this tranche.
+    // SAFETY: `DxgkDdiStartDevice` is documented "IRQL: PASSIVE_LEVEL" (WDK
+    // DXGKDDI_START_DEVICE). It is also the deepest stack in the driver — this
+    // token threads down through `bring_up_venus` -> `allocate_host_visible_blob`
+    // -> `VenusRing::bring_up`, which is why it is a by-value ZST and not a
+    // reference: see `crate::irql` and tools/kmd-frame-sizes.ps1.
     let passive = unsafe { crate::irql::PassiveLevel::assume() };
     match crate::virtio::VirtioGpu::init(passive, unsafe { &*dxgkrnl_interface }) {
         Ok(gpu) => {
@@ -557,8 +560,9 @@ pub unsafe extern "C" fn dxgkddi_stop_device(miniport_device_context: *mut c_voi
         // resource id gets bound as the cached scan-out target.
         adapter.reset_display_publication_state();
 
-        // SAFETY: PLACEHOLDER (R614) — `dxgkddi_stop_device` mints the real token
-        // in the start/stop commit of this tranche.
+        // SAFETY: `DxgkDdiStopDevice` is documented "IRQL: PASSIVE_LEVEL" (WDK
+        // DXGKDDI_STOP_DEVICE); the teardown below unrefs blobs and destroys the
+        // venus context, both control round-trips against the still-live device.
         let passive_stop = unsafe { crate::irql::PassiveLevel::assume() };
 
         // Tear down the venus client + page-table blob + context BEFORE dropping
@@ -572,7 +576,7 @@ pub unsafe extern "C" fn dxgkddi_stop_device(miniport_device_context: *mut c_voi
             // The KMD-owned sweep — `None` here means exactly the KMD's own blobs, not
             // "every owner".
             let _ = crate::virtio::ctrl::release_blobs_for_owner(passive_stop, adapter, None);
-            let _ = crate::virtio::ctrl::ctx_destroy_kmd(adapter, venus_ctx);
+            let _ = crate::virtio::ctrl::ctx_destroy_kmd(passive_stop, adapter, venus_ctx);
         }
         // Free any parked completed entries at PASSIVE before the transport
         // (and the buffers still in flight inside it) is dropped.

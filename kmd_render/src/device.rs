@@ -140,11 +140,14 @@ pub unsafe extern "C" fn dxgkddi_destroy_device(h_device: *mut c_void) -> NTSTAT
         // Sweep exactly this device's slots. A null hDevice would sweep the
         // KMD-owned ones, so the token is minted rather than cast.
         let device_owner = crate::virtio::gpu::DeviceOwner::new(owner);
-        // SAFETY: PLACEHOLDER (R614) — `dxgkddi_destroy_device` mints the real
-        // token in the start/stop commit of this tranche.
+        // SAFETY: `DxgkDdiDestroyDevice` is documented "IRQL: PASSIVE_LEVEL" (WDK
+        // DXGKDDI_DESTROYDEVICE), and the unmap loop above already depends on it
+        // — `MmUnmapLockedPages` is PASSIVE-only, which is exactly why the table
+        // lock is dropped between batches.
         let passive = unsafe { crate::irql::PassiveLevel::assume() };
         let blobs = crate::virtio::ctrl::release_blobs_for_owner(passive, adapter, device_owner);
-        let contexts = crate::virtio::ctrl::destroy_contexts_for_owner(adapter, device_owner);
+        let contexts =
+            crate::virtio::ctrl::destroy_contexts_for_owner(passive, adapter, device_owner);
         // Opportunistic PASSIVE reap of completed transport entries.
         crate::virtio::ctrl::reap_parked(passive, adapter);
         // 0x0E02_BBBB = blob-table size BEFORE reclaim (saturated to 16 bits).
