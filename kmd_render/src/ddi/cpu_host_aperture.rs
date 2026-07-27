@@ -131,6 +131,18 @@ static AP_COUNTERS: crate::diag::CounterBlock = crate::diag::CounterBlock {
         f(b"ChSzMm", &BAR_AP_SIZE_MISMATCH),
         e(b"ChSzDl", &BAR_AP_SIZE_DELTA),
         f(b"ChSzPv", &BAR_AP_SIZE_PROVENANCE),
+        // R718's measurement. It lives in this block rather than one of its own
+        // because it is an APERTURE fact — "how many CpuVisible BAR allocations
+        // shipped with no aperture segment to fall back to" — and because this
+        // block already has a PASSIVE flush site on the mode-set path. Marked a
+        // FAILURE entry so a change forces an immediate flush: on the production
+        // DisplayHalf=1 configuration it must read 0, and any movement means the
+        // v71/v72 VidPn-commit rejection shape is being emitted again.
+        f(b"ApMiss", &crate::ddi::create_allocation::APERTURE_MISSING_CPU_VISIBLE),
+        // R719's measurement: how often the empirical linear-blob size guess
+        // disagreed with the exact Vulkan requirement. A VALUE entry, not a
+        // failure — the guess being off is information, not a fault.
+        e(b"BlbSzD", &crate::ddi::create_allocation::LINEAR_BLOB_SIZE_DIVERGENCE),
     ],
     ticks: &AP_FLUSH_TICKS,
     failures: &AP_FLUSH_FAILURES,

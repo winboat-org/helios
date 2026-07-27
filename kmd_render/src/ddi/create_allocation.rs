@@ -286,12 +286,122 @@ impl PresentAllocInfo {
     pub fn resolved_dxgi_format(self) -> Option<u32> {
         match self.dxgi_format {
             exact if exact != 0 => Some(exact),
-            0 if self.format == D3DDDIFMT_A8B8G8R8 as u32 => Some(28),
-            0 if self.format == D3DDDIFMT_A8R8G8B8 as u32 => Some(87),
-            0 if self.format == D3DDDIFMT_X8R8G8B8 as u32 => Some(88),
+            // Same fixed mapping as UMD `d3d_format_to_dxgi`, now single-sourced.
+            0 => d3dddi_to_dxgi(self.format).map(DxgiFormat::as_u32),
             _ => None,
         }
     }
+}
+
+/// Row-count alignment for an external LINEAR image, in rows.
+///
+/// EMPIRICAL, and named so it reads as one. NVIDIA's external-linear image
+/// requirements round the row count up to GOB granularity; 128 is what the
+/// measurements below produced. It is not derived from a documented rule.
+const NV_LINEAR_ROW_ALIGN: u64 = 128;
+
+/// Opaque tail slack an external LINEAR image requires beyond the padded rows.
+///
+/// Equally empirical. The measurements that produced both constants:
+///   1896x48   -> 487424  vs 368640  tight
+///   1896x1030 -> 8773632 vs 7913472 tight
+///   1024x1872 -> 7864320 =  pitch * align(1872, 128)
+const NV_LINEAR_TAIL_SLACK: u64 = 64 * 1024;
+
+/// `D3DKMDT_GDISURFACETYPE` value for a GDI texture (OPTIMAL tiling, no linear
+/// CPU byte view). It was a bare `1` compared against `gdi_surface_type`.
+const GDI_SURFACE_TYPE_TEXTURE: u32 = 1;
+
+/// Size a blob that will be imported as an external LINEAR VkImage on the host.
+///
+/// Deliberately LARGER than pitch x height. A blob smaller than the image
+/// requirement binds "successfully" and then MMU-faults when the sampler reads
+/// the slack region (host Xid 31, FAULT_PTE VIRT_READ — killed the IDD feed live
+/// 2026-07-04).
+///
+/// The failure mode of a WRONG guess is at least loud: the importer refuses
+/// undersized imports, so an insufficient bound surfaces as a failed open rather
+/// than a GPU fault. But it surfaces at a DISTANT stage — as an import error, not
+/// a sizing error — which is why `BlbSzD` counts the divergence between this
+/// guess and the exact Vulkan requirement the create path later learns.
+fn linear_blob_size(pitch: u64, height: u64) -> u64 {
+    let padded_rows = (height + (NV_LINEAR_ROW_ALIGN - 1)) & !(NV_LINEAR_ROW_ALIGN - 1);
+    pitch
+        .saturating_mul(padded_rows)
+        .saturating_add(NV_LINEAR_TAIL_SLACK)
+        .max(PAGE as u64)
+}
+
+/// Blobs whose guessed linear size differed from the Vulkan memory requirement
+/// the create path later learned — value is the count.
+///
+/// The guess is currently AUTHORITATIVE for shadow/staging/GDI-staging surfaces
+/// (`create_one` passes `ap.size` straight to `allocate_memory_blob` and only
+/// back-fills `meta.venus_alloc_size`), so this measures how good it is without
+/// changing it.
+pub(crate) static LINEAR_BLOB_SIZE_DIVERGENCE: AtomicU32 = AtomicU32::new(0);
+
+/// The three DXGI formats this driver ever names.
+///
+/// The bare numbers 28 / 87 / 88 used to appear in four places, each with its own
+/// mapping rule — `resolved_dxgi_format`, the GDI-texture arm, the
+/// standard-allocation author, and a local const block — including one that
+/// forces 88 for the primary for scan-out reasons. A silent divergence between
+/// any two of those tables is a black or refused surface, and nothing made them
+/// agree.
+///
+/// `TryFrom<u32>`, not `From`: the KMD receives arbitrary `u32` values from the
+/// UMD trailer, so an unknown format must be `None` rather than a fabricated
+/// variant.
+#[repr(u32)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DxgiFormat {
+    R8G8B8A8Unorm = 28,
+    B8G8R8A8Unorm = 87,
+    B8G8R8X8Unorm = 88,
+}
+
+impl DxgiFormat {
+    pub(crate) const fn as_u32(self) -> u32 {
+        self as u32
+    }
+}
+
+impl TryFrom<u32> for DxgiFormat {
+    type Error = ();
+
+    fn try_from(value: u32) -> Result<Self, ()> {
+        match value {
+            28 => Ok(Self::R8G8B8A8Unorm),
+            87 => Ok(Self::B8G8R8A8Unorm),
+            88 => Ok(Self::B8G8R8X8Unorm),
+            _ => Err(()),
+        }
+    }
+}
+
+/// The one D3DDDIFORMAT -> DXGI mapping. `None` for a format with no DXGI peer.
+pub(crate) fn d3dddi_to_dxgi(format: u32) -> Option<DxgiFormat> {
+    if format == D3DDDIFMT_A8B8G8R8 as u32 {
+        Some(DxgiFormat::R8G8B8A8Unorm)
+    } else if format == D3DDDIFMT_A8R8G8B8 as u32 {
+        Some(DxgiFormat::B8G8R8A8Unorm)
+    } else if format == D3DDDIFMT_X8R8G8B8 as u32 {
+        Some(DxgiFormat::B8G8R8X8Unorm)
+    } else {
+        None
+    }
+}
+
+/// The scan-out primary's format, which is NOT a function of D3DDDIFORMAT.
+///
+/// Kept a distinct function rather than folded into [`d3dddi_to_dxgi`] because
+/// the frozen baseline depends on it: the display primary must scan out as
+/// XR24/XRGB on the virtio-gpu contract — the Linux virtio primary plane
+/// advertises XRGB only, and the matching CachyOS dma-buf probe reached
+/// egl-headless only with XR24.
+pub(crate) const fn scanout_dxgi_for_primary() -> DxgiFormat {
+    DxgiFormat::B8G8R8X8Unorm
 }
 
 /// Resolve a Present allocation-list entry's `hDeviceSpecificAllocation` (an
@@ -1195,6 +1305,130 @@ unsafe fn write_open_identity(
     bytes.copy_from_slice(bytes_of(&record));
 }
 
+/// What VidMm is told about one allocation: where it goes and how it may be
+/// touched.
+///
+/// # Why this is one function
+///
+/// The segments and the flags are ONE decision and were made in two places
+/// twenty lines apart, which is how the illegal combination below stayed
+/// invisible. dxgkrnl rejects a CpuVisible allocation in a non-CPU-accessible
+/// segment unless its supported set contains an APERTURE segment — the v71/v72
+/// "10 x 0x0202 violators" VidPn-commit failure — and `set_CpuVisible(!
+/// is_optimal_gdi_texture)` marks every BAR-placed allocation CpuVisible while
+/// the aperture bit is gated on `DisplayHalf`, a registry knob defaulting to 0.
+///
+/// So with `DisplayHalf=0` the driver KNOWINGLY emits the shape that produced
+/// that failure. The tolerance is real — the render-only surface never demanded
+/// the aperture fallback, because its CpuHostAperture always had space — but
+/// nothing recorded how large the violating population is, so it could not be
+/// re-verified after any change. `ApMiss` is that measurement, incremented
+/// exactly where the illegal combination is constructed.
+///
+/// BEHAVIOUR IS UNCHANGED. The `DisplayHalf` gate is preserved exactly; only the
+/// violation becomes visible.
+///
+/// # The limit of the encoding, which is the point
+///
+/// A `SupportedSegments` newtype whose `cpu_visible_in(bar)` constructor could
+/// only produce `bar_bit | aperture_bit` would make the illegal shape
+/// unconstructible — but preserving today's `DisplayHalf=0` behaviour requires a
+/// `legacy_render_only()` constructor that still yields it. So the honest
+/// guarantee is "the illegal shape has exactly one, explicitly named
+/// constructor", not "the illegal shape is unconstructible". This function IS
+/// that one constructor.
+struct VidMmPlacement {
+    preferred_segment: u32,
+    supported_segments: u32,
+    cpu_visible: bool,
+    cached: bool,
+    accessed_physically: bool,
+}
+
+/// Allocations marked CpuVisible in the BAR segment WITHOUT an aperture segment
+/// in their supported set — the shape dxgkrnl rejects for a VidPn commit.
+///
+/// Expected NONZERO on the render-only configuration (`DisplayHalf=0`) and ZERO
+/// on the production `DisplayHalf=1` one. It documents the current population
+/// rather than changing it.
+///
+/// A per-allocation ATOMIC, flushed from an existing PASSIVE dump site — never a
+/// per-allocation registry write (T1b's k-alloc-05).
+pub(crate) static APERTURE_MISSING_CPU_VISIBLE: AtomicU32 = AtomicU32::new(0);
+
+fn vidmm_placement(
+    bar_eligible: bool,
+    bar_seg_id: Option<u32>,
+    is_primary: bool,
+    is_optimal_gdi_texture: bool,
+    display_half: bool,
+) -> VidMmPlacement {
+    let aperture_bit = 1u32 << (crate::ddi::gpummu::APERTURE_SEGMENT_ID - 1);
+    let (preferred_segment, supported_segments) =
+        if let (true, Some(seg_id)) = (bar_eligible, bar_seg_id) {
+            // Prefer the BAR (the two-memory-split fix keeps CPU raster in the venus
+            // blob's bytes). These allocations are CpuVisible (set below) in a
+            // NON-CPU-accessible memory segment — the BAR exposes CPU access only via
+            // the CpuHostAperture (segment CpuVisible=0) — and WDDM REQUIRES every such
+            // allocation to list an aperture segment in its supported set so VidMm can
+            // always obtain a CPU virtual address, falling back to system memory if the
+            // CpuHostAperture is full (allocation-usage-tracking.md: "all CPU-accessible
+            // allocations in non-CPU-accessible memory segments must contain an aperture
+            // segment in their supported segment set"). v71 added it to the PRIMARY only;
+            // the other CpuVisible surfaces (SHADOW/STAGING/GDI) shipped BAR-only and
+            // dxgkrnl rejected them ("CPUVisible allocations must include an aperture
+            // segment", ETW-confirmed v71/v72 — 10 `0x0202` violators in the S-ring) →
+            // the whole VidPn commit failed. Gated on the display half so the proven
+            // render-only surface (DisplayHalf off) stays byte-identical: it never hit
+            // the rejection because its CpuHostAperture always had space, so the fallback
+            // was never demanded. PreferredSegment stays the BAR — with a 1 GiB BAR vs a
+            // ~200 MB CpuVisible working set, content lives in the venus blob in steady
+            // state and the aperture (which VidMm upgrades to the implicit system-memory
+            // segment without AccessedPhysically, iommu-dma-remapping.md) is an
+            // eviction-only fallback not exercised at this scale — negligible runtime cost.
+            let needs_aperture = is_primary || display_half;
+            let supp = 1u32 << (seg_id - 1);
+            (
+                seg_id,
+                if needs_aperture {
+                    supp | aperture_bit
+                } else {
+                    supp
+                },
+            )
+        } else {
+            (crate::ddi::gpummu::APERTURE_SEGMENT_ID, aperture_bit)
+        };
+    // CpuVisible for everything but an OPTIMAL GDI texture, which has no linear
+    // CPU byte view.
+    let cpu_visible = !is_optimal_gdi_texture;
+    // THE MEASUREMENT. Counted here, at the one site that constructs the shape:
+    // CpuVisible, preferred to the BAR, with no aperture segment to fall back to.
+    if cpu_visible
+        && Some(preferred_segment) == bar_seg_id
+        && supported_segments & aperture_bit == 0
+    {
+        APERTURE_MISSING_CPU_VISIBLE.fetch_add(1, Ordering::Relaxed);
+    }
+    VidMmPlacement {
+        preferred_segment,
+        supported_segments,
+        cpu_visible,
+        // Omit `Cached` on the scan-out primary: dxgkrnl rejects
+        // Cached-with-Primary (AzureTriage; 36th-session primary-creation
+        // failure -> no VidPn path). The primary is host-scanned-out, not
+        // CPU-read-hot, so write-combined is fine. The `AllocCached` kill switch
+        // is applied by the caller, which owns the knob snapshot.
+        cached: !is_primary && !is_optimal_gdi_texture,
+        // A D3DDDI primary is selected by the display engine using the physical
+        // address delivered in SetVidPnSourceAddress. Tell VidMm that exact
+        // access model so it allocates the primary contiguously in a
+        // GPU-addressable segment rather than at a non-identifiable implicit
+        // system-memory address.
+        accessed_physically: is_primary,
+    }
+}
+
 /// Tear down one blob allocation: unmap (if mapped) → detach → unref → free the
 /// KMD context. Best-effort on the virtio ops (teardown must not get stuck).
 /// PASSIVE_LEVEL (DxgkDdiDestroyAllocation) — the round-trips ride
@@ -1723,6 +1957,16 @@ unsafe fn create_one(
     meta.pitch = created.pitch;
     meta.plane_offset = created.plane_offset;
     meta.dxgi_format = created.dxgi_format;
+    // MEASURE THE GUESS (R719). `ap.size` is what `linear_blob_size` (or the
+    // GDI-texture estimate) produced and what was handed to
+    // `allocate_memory_blob`; `created.venus_alloc_size` is the exact Vulkan
+    // requirement the host reported. For the shadow/staging/GDI-staging arms the
+    // guess is AUTHORITATIVE — this arm does not overwrite `ap.size` — so a
+    // divergence is not a failure, it is how far off the empirical constants are.
+    // Counted, not acted on.
+    if created.venus_alloc_size != 0 && created.venus_alloc_size != ap.size {
+        LINEAR_BLOB_SIZE_DIVERGENCE.fetch_add(1, Ordering::Relaxed);
+    }
     meta.venus_alloc_size = created.venus_alloc_size;
     meta.memory_type_index = created.memory_type_index;
     ap.size = created.blob_size.bytes();
@@ -1854,42 +2098,15 @@ unsafe fn create_one(
     // APERTURE segment ("CPUVisible allocations must include an aperture segment in
     // the supported segment set" — ETW-confirmed 36th session), which without it
     // fails the whole VidPn commit → 0-path VidPn → display never activates.
-    let aperture_bit = 1u32 << (crate::ddi::gpummu::APERTURE_SEGMENT_ID - 1);
+    let placement = vidmm_placement(
+        bar_eligible,
+        bar_seg_id,
+        is_primary,
+        is_optimal_gdi_texture,
+        adapter.display_half(),
+    );
     let (preferred_segment, supported_segments) =
-        if let (true, Some(seg_id)) = (bar_eligible, bar_seg_id) {
-            // Prefer the BAR (the two-memory-split fix keeps CPU raster in the venus
-            // blob's bytes). These allocations are CpuVisible (set below) in a
-            // NON-CPU-accessible memory segment — the BAR exposes CPU access only via
-            // the CpuHostAperture (segment CpuVisible=0) — and WDDM REQUIRES every such
-            // allocation to list an aperture segment in its supported set so VidMm can
-            // always obtain a CPU virtual address, falling back to system memory if the
-            // CpuHostAperture is full (allocation-usage-tracking.md: "all CPU-accessible
-            // allocations in non-CPU-accessible memory segments must contain an aperture
-            // segment in their supported segment set"). v71 added it to the PRIMARY only;
-            // the other CpuVisible surfaces (SHADOW/STAGING/GDI) shipped BAR-only and
-            // dxgkrnl rejected them ("CPUVisible allocations must include an aperture
-            // segment", ETW-confirmed v71/v72 — 10 `0x0202` violators in the S-ring) →
-            // the whole VidPn commit failed. Gated on the display half so the proven
-            // render-only surface (DisplayHalf off) stays byte-identical: it never hit
-            // the rejection because its CpuHostAperture always had space, so the fallback
-            // was never demanded. PreferredSegment stays the BAR — with a 1 GiB BAR vs a
-            // ~200 MB CpuVisible working set, content lives in the venus blob in steady
-            // state and the aperture (which VidMm upgrades to the implicit system-memory
-            // segment without AccessedPhysically, iommu-dma-remapping.md) is an
-            // eviction-only fallback not exercised at this scale — negligible runtime cost.
-            let needs_aperture = is_primary || adapter.display_half();
-            let supp = 1u32 << (seg_id - 1);
-            (
-                seg_id,
-                if needs_aperture {
-                    supp | aperture_bit
-                } else {
-                    supp
-                },
-            )
-        } else {
-            (crate::ddi::gpummu::APERTURE_SEGMENT_ID, aperture_bit)
-        };
+        (placement.preferred_segment, placement.supported_segments);
     info.SupportedWriteSegmentSet = supported_segments;
     info.EvictionSegmentSet = 0;
     info.HintedBank.__bindgen_anon_1.Value = 0;
@@ -1908,14 +2125,14 @@ unsafe fn create_one(
             .FlagsWddm2
             .__bindgen_anon_1
             .__bindgen_anon_1
-            .set_CpuVisible(u32::from(!is_optimal_gdi_texture));
+            .set_CpuVisible(u32::from(placement.cpu_visible));
         // A D3DDDI primary is selected by the display engine using the physical
         // address delivered in SetVidPnSourceAddress. Tell VidMm that exact
         // access model so it allocates the primary contiguously in a
         // GPU-addressable segment rather than at a non-identifiable implicit
         // system-memory address. `is_primary` comes only from Windows'
         // pPrimaryDesc/standard-allocation contract preserved in private data.
-        if is_primary {
+        if placement.accessed_physically {
             info.__bindgen_anon_4
                 .FlagsWddm2
                 .__bindgen_anon_1
@@ -1935,7 +2152,7 @@ unsafe fn create_one(
         if is_primary {
             crate::diag::record(0x0C3E_0000 | (resource_id & 0xFFFF));
         }
-        if adapter.alloc_cached() && !is_primary && !is_optimal_gdi_texture {
+        if adapter.alloc_cached() && placement.cached {
             info.__bindgen_anon_4
                 .FlagsWddm2
                 .__bindgen_anon_1
@@ -2530,7 +2747,7 @@ pub unsafe extern "C" fn dxgkddi_get_standard_allocation_driver_data(
             // CPU-visible and has no linear-pitch contract. The CPU-visible
             // staging variants are the only GDI types for which Windows
             // requires the miniport to return a pitch.
-            is_optimal_gdi_texture = gdi_surface_type == 1;
+            is_optimal_gdi_texture = gdi_surface_type == GDI_SURFACE_TYPE_TEXTURE;
             sd.Pitch = if is_optimal_gdi_texture {
                 0
             } else {
@@ -2549,17 +2766,6 @@ pub unsafe extern "C" fn dxgkddi_get_standard_allocation_driver_data(
     } else {
         cross_adapter_pitch(width)
     };
-    // Size the blob past pitch×height: these blobs get imported as LINEAR
-    // VkImages on the host, and NVIDIA's external-linear image requirements
-    // round the row count up to GOB granularity plus opaque tail slack
-    // (observed: 1896x48 → 487424 vs 368640 tight; 1896x1030 → 8773632 vs
-    // 7913472; 1024x1872 → 7864320 = pitch × align(1872, 128)). A blob
-    // smaller than the image requirement binds "successfully" and then MMU-
-    // faults when the sampler reads the slack region (host Xid 31,
-    // FAULT_PTE VIRT_READ — killed the IDD feed live 2026-07-04). The
-    // importer refuses undersized imports loudly, so an insufficient bound
-    // here surfaces as a failed open, never a GPU fault.
-    let padded_rows = ((height as u64) + 127) & !127;
     let size = if is_optimal_gdi_texture {
         // CreateAllocation replaces this estimate with Vulkan's exact memory
         // requirement before reporting Size to VidMm.
@@ -2568,10 +2774,7 @@ pub unsafe extern "C" fn dxgkddi_get_standard_allocation_driver_data(
             .saturating_mul(4)
             .max(PAGE as u64)
     } else {
-        (pitch as u64)
-            .saturating_mul(padded_rows)
-            .saturating_add(64 * 1024)
-            .max(PAGE as u64)
+        linear_blob_size(pitch as u64, height as u64)
     };
 
     let map_cache = if is_primary {
@@ -2614,19 +2817,19 @@ pub unsafe extern "C" fn dxgkddi_get_standard_allocation_driver_data(
         // client has actually allocated the backing memory.
         venus_alloc_size: 0,
         memory_type_index: 0,
-        // The display primary must scan out as XR24/XRGB on the virtio-gpu
-        // contract. The Linux virtio primary plane advertises XRGB only, and the
-        // matching CachyOS dma-buf probe reached egl-headless only with XR24.
-        // Non-primary standard allocations keep the legacy zero hint so UMD
-        // openers use the existing BGRA fallback.
+        // The display primary must scan out as XR24/XRGB (see
+        // `scanout_dxgi_for_primary`). Non-primary standard allocations keep the
+        // legacy zero hint so UMD openers use the existing BGRA fallback, which
+        // is why an unmapped format is 0 rather than a refusal here.
         dxgi_format: if is_primary {
-            88
-        } else if format == D3DDDIFMT_A8R8G8B8 as u32 {
-            87
-        } else if format == D3DDDIFMT_X8R8G8B8 as u32 {
-            88
+            scanout_dxgi_for_primary().as_u32()
         } else {
-            0
+            match d3dddi_to_dxgi(format) {
+                // A8B8G8R8 has no scan-out meaning for a standard allocation and
+                // kept the zero hint before this change; preserve that exactly.
+                Some(DxgiFormat::R8G8B8A8Unorm) | None => 0,
+                Some(fmt) => fmt.as_u32(),
+            }
         },
         // KMD standard allocations carry no scan-out plane offset.
         plane_offset: 0,

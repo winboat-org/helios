@@ -11,7 +11,7 @@ mod add_device;
 mod blob_map;
 mod build_paging_buffer;
 pub(crate) mod cpu_host_aperture;
-mod create_allocation;
+pub(crate) mod create_allocation;
 pub(crate) mod display;
 mod escape;
 mod gpummu;
