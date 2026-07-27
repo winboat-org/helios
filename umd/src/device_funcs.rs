@@ -796,22 +796,37 @@ pub unsafe fn create_runtime_paging_queue(dev: &mut HeliosDevice) -> i32 {
     0
 }
 
-/// Fill all 152 entries of a `D3D11DDI_DEVICEFUNCS` table with safe stubs, then
-/// specialise the entries whose behaviour matters for device creation.
+/// Bulk-fill every pointer slot of a device-funcs table with `ddi_noop_device`
+/// and return the D3D11.0-typed view of it.
+///
+/// The slot count comes from `size_of::<T>()`, so it CANNOT disagree with the
+/// table actually being filled. That matters: the failure mode this replaces is
+/// a wrong length under-stubbing a table and leaving uninitialised slots past
+/// the prefix, which is precisely what `fill_dxgi_1_3_base_funcs`'s comment
+/// exists to warn about. The three fills each spelled the length out by hand.
 ///
 /// # Safety
-/// `funcs` must point to a writable `D3D11DDI_DEVICEFUNCS` (the runtime's table,
-/// selected when Interface == D3D11_0_DDI_INTERFACE_VERSION).
-pub unsafe fn fill_d3d11_device_funcs(funcs: *mut ddi::D3D11DDI_DEVICEFUNCS) {
-    // Every field is a pointer-sized Option<fn>; bulk-fill with the no-op.
-    let n = core::mem::size_of::<ddi::D3D11DDI_DEVICEFUNCS>() / core::mem::size_of::<usize>();
+/// `funcs` must point to a writable `T` whose every field is a pointer-sized
+/// `Option<fn>`, and `T` must be a layout-compatible extension of
+/// `D3D11DDI_DEVICEFUNCS` (a WDK header property no Rust type can assert).
+unsafe fn stub_fill_device_table<T>(funcs: *mut T) -> *mut ddi::D3D11DDI_DEVICEFUNCS {
+    let n = core::mem::size_of::<T>() / core::mem::size_of::<usize>();
     let slots = funcs as *mut Option<UniformFn>;
     for i in 0..n {
         *slots.add(i) = Some(ddi_noop_device);
     }
+    funcs as *mut ddi::D3D11DDI_DEVICEFUNCS
+}
 
-    let f = &mut *funcs;
-
+/// The `CalcPrivate*Size` entries and the two real lifecycle entries every
+/// device-funcs table gets, applied identically at every interface level.
+///
+/// Was three verbatim copies of one 18-name `calc!` list plus the same two
+/// assignments and the same 10-line rationale comment.
+///
+/// # Safety
+/// `f` must be the D3D11.0-typed view of a stub-filled table.
+unsafe fn install_calc_and_lifecycle(f: &mut ddi::D3D11DDI_DEVICEFUNCS) {
     // CalcPrivate*Size funcs must return a valid nonzero size.
     macro_rules! calc {
         ($($field:ident),* $(,)?) => {$(
@@ -849,127 +864,51 @@ pub unsafe fn fill_d3d11_device_funcs(funcs: *mut ddi::D3D11DDI_DEVICEFUNCS) {
     // 256: heap corruption inside the runtime's allocator, no diagnostic.
     const _: () = assert!(THREADING_CAPS == 0);
     // Not a size getter -- a void writer. Installed with its real signature, no
-    // transmute, identically in all four tables. R812.
+    // transmute, identically in every table. R812.
     f.pfnCheckDeferredContextHandleSizes = Some(ddi_check_deferred_context_handle_sizes);
 
     // Real cleanup on device teardown (matching signature, no transmute).
     f.pfnDestroyDevice = Some(ddi_destroy_device);
+}
+
+/// Fill every entry of a `D3D11DDI_DEVICEFUNCS` table with safe stubs, then
+/// specialise the entries whose behaviour matters for device creation.
+///
+/// # Safety
+/// `funcs` must point to a writable `D3D11DDI_DEVICEFUNCS` (the runtime's table,
+/// selected when Interface == D3D11_0_DDI_INTERFACE_VERSION).
+pub unsafe fn fill_d3d11_device_funcs(funcs: *mut ddi::D3D11DDI_DEVICEFUNCS) {
+    let f = &mut *stub_fill_device_table(funcs);
+    install_calc_and_lifecycle(f);
     f.pfnRelocateDeviceFuncs = Some(ddi_relocate_device_funcs);
 
-    // Override stubs with the real D3D11 COM forwarders.
-    crate::forward::install(funcs);
+    // Override stubs with the real D3D11 COM forwarders. The 11.0 table stops
+    // here: the returned proof is what the higher levels below consume.
+    let _base = crate::forward::install(funcs);
 }
 
 /// Fill a D3D11.1 device-funcs table. The D3D11.1 layout is an extension of the
 /// D3D11.0 prefix, so the implemented forwarders can be installed through the
 /// D3D11.0 view after the whole larger table has been stub-filled.
 pub unsafe fn fill_d3d11_1_device_funcs(funcs: *mut ddi::D3D11_1DDI_DEVICEFUNCS) {
-    let n = core::mem::size_of::<ddi::D3D11_1DDI_DEVICEFUNCS>() / core::mem::size_of::<usize>();
-    let slots = funcs as *mut Option<UniformFn>;
-    for i in 0..n {
-        *slots.add(i) = Some(ddi_noop_device);
-    }
-
-    let f = &mut *(funcs as *mut ddi::D3D11DDI_DEVICEFUNCS);
-
-    macro_rules! calc {
-        ($($field:ident),* $(,)?) => {$(
-            f.$field = core::mem::transmute::<UniformFn, _>(ddi_calc_size as UniformFn);
-        )*};
-    }
-    calc!(
-        pfnCalcPrivateResourceSize,
-        pfnCalcPrivateOpenedResourceSize,
-        pfnCalcPrivateShaderResourceViewSize,
-        pfnCalcPrivateRenderTargetViewSize,
-        pfnCalcPrivateDepthStencilViewSize,
-        pfnCalcPrivateElementLayoutSize,
-        pfnCalcPrivateBlendStateSize,
-        pfnCalcPrivateDepthStencilStateSize,
-        pfnCalcPrivateRasterizerStateSize,
-        pfnCalcPrivateShaderSize,
-        pfnCalcPrivateGeometryShaderWithStreamOutput,
-        pfnCalcPrivateSamplerSize,
-        pfnCalcPrivateQuerySize,
-        pfnCalcDeferredContextHandleSize,
-        pfnCalcPrivateDeferredContextSize,
-        pfnCalcPrivateCommandListSize,
-        pfnCalcPrivateTessellationShaderSize,
-        pfnCalcPrivateUnorderedAccessViewSize,
-    );
-    // The three entries above for deferred contexts and command lists
-    // (pfnCalcDeferredContextHandleSize, pfnCalcPrivateDeferredContextSize,
-    // pfnCalcPrivateCommandListSize) keep the 256-byte stub. That is sound ONLY
-    // because the runtime never calls the paired Create, and the reason it
-    // never does is THREADING caps = 0 -- a fact that was stated in neither
-    // place before R812. Implementing pfnCreateDeferredContext and flipping the
-    // cap (a natural pair of steps for D3D11 conformance) would write a
-    // >256-byte driver object into hDrvContext with the stub still reporting
-    // 256: heap corruption inside the runtime's allocator, no diagnostic.
-    const _: () = assert!(THREADING_CAPS == 0);
-    // Not a size getter -- a void writer. Installed with its real signature, no
-    // transmute, identically in all four tables. R812.
-    f.pfnCheckDeferredContextHandleSizes = Some(ddi_check_deferred_context_handle_sizes);
-
-    f.pfnDestroyDevice = Some(ddi_destroy_device);
+    let f = &mut *stub_fill_device_table(funcs);
+    install_calc_and_lifecycle(f);
     (*funcs).pfnRelocateDeviceFuncs = Some(ddi_relocate_device_funcs_11_1);
-    crate::forward::install(f);
-    crate::forward::install_11_1(funcs);
+
+    // The ordering is now structural, not textual: `install_11_1` cannot be
+    // called without the `Filled11_0` token `install` returns.
+    let base = crate::forward::install(f);
+    let _l1 = crate::forward::install_11_1(base, funcs);
 }
 
 pub unsafe fn fill_wddm1_3_device_funcs(funcs: *mut ddi::D3DWDDM1_3DDI_DEVICEFUNCS) {
-    let n = core::mem::size_of::<ddi::D3DWDDM1_3DDI_DEVICEFUNCS>() / core::mem::size_of::<usize>();
-    let slots = funcs as *mut Option<UniformFn>;
-    for i in 0..n {
-        *slots.add(i) = Some(ddi_noop_device);
-    }
-
-    let f = &mut *(funcs as *mut ddi::D3D11DDI_DEVICEFUNCS);
-
-    macro_rules! calc {
-        ($($field:ident),* $(,)?) => {$(
-            f.$field = core::mem::transmute::<UniformFn, _>(ddi_calc_size as UniformFn);
-        )*};
-    }
-    calc!(
-        pfnCalcPrivateResourceSize,
-        pfnCalcPrivateOpenedResourceSize,
-        pfnCalcPrivateShaderResourceViewSize,
-        pfnCalcPrivateRenderTargetViewSize,
-        pfnCalcPrivateDepthStencilViewSize,
-        pfnCalcPrivateElementLayoutSize,
-        pfnCalcPrivateBlendStateSize,
-        pfnCalcPrivateDepthStencilStateSize,
-        pfnCalcPrivateRasterizerStateSize,
-        pfnCalcPrivateShaderSize,
-        pfnCalcPrivateGeometryShaderWithStreamOutput,
-        pfnCalcPrivateSamplerSize,
-        pfnCalcPrivateQuerySize,
-        pfnCalcDeferredContextHandleSize,
-        pfnCalcPrivateDeferredContextSize,
-        pfnCalcPrivateCommandListSize,
-        pfnCalcPrivateTessellationShaderSize,
-        pfnCalcPrivateUnorderedAccessViewSize,
-    );
-    // The three entries above for deferred contexts and command lists
-    // (pfnCalcDeferredContextHandleSize, pfnCalcPrivateDeferredContextSize,
-    // pfnCalcPrivateCommandListSize) keep the 256-byte stub. That is sound ONLY
-    // because the runtime never calls the paired Create, and the reason it
-    // never does is THREADING caps = 0 -- a fact that was stated in neither
-    // place before R812. Implementing pfnCreateDeferredContext and flipping the
-    // cap (a natural pair of steps for D3D11 conformance) would write a
-    // >256-byte driver object into hDrvContext with the stub still reporting
-    // 256: heap corruption inside the runtime's allocator, no diagnostic.
-    const _: () = assert!(THREADING_CAPS == 0);
-    // Not a size getter -- a void writer. Installed with its real signature, no
-    // transmute, identically in all four tables. R812.
-    f.pfnCheckDeferredContextHandleSizes = Some(ddi_check_deferred_context_handle_sizes);
-
-    f.pfnDestroyDevice = Some(ddi_destroy_device);
+    let f = &mut *stub_fill_device_table(funcs);
+    install_calc_and_lifecycle(f);
     (*funcs).pfnRelocateDeviceFuncs = Some(ddi_relocate_device_funcs_wddm1_3);
-    crate::forward::install(f);
-    crate::forward::install_11_1(funcs as *mut ddi::D3D11_1DDI_DEVICEFUNCS);
-    crate::forward::install_wddm1_3(funcs);
+
+    let base = crate::forward::install(f);
+    let l1 = crate::forward::install_11_1(base, funcs as *mut ddi::D3D11_1DDI_DEVICEFUNCS);
+    let _l13 = crate::forward::install_wddm1_3(l1, funcs);
     audit_wddm1_3_device_funcs("FillDeviceFuncs", funcs);
 }
 

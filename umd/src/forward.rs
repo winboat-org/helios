@@ -10489,7 +10489,35 @@ pub unsafe fn install_dxgi_1_3(funcs: *mut ddi::DXGI1_3_DDI_BASE_FUNCTIONS) {
 
 /// Install the implemented forwarders into the device-funcs table (over the
 /// stub fill). Uses the real bindgen PFN field types — no transmute.
-pub unsafe fn install(funcs: *mut ddi::D3D11DDI_DEVICEFUNCS) {
+/// Proof that [`install`] has run over a table: its 10.x-typed forwarders are
+/// in place, including the eighteen slots [`install_11_1`] must overwrite.
+///
+/// R1009. Correctness of every >=11.1 device rested on TEXTUAL CALL ORDER
+/// inside `device_funcs.rs`: `install()` writes 10.x-typed handlers into slots
+/// that `install_11_1()` must run AFTERWARDS to replace. The 11.1 blend
+/// descriptor inserts `LogicOpEnable` mid-struct, so a 10.x reader returns the
+/// wrong write mask -- wrong blending for DWM, no counter, no log, only pixels
+/// -- and the untyped-shader-create form of the same class has already shipped
+/// once (VUID-Input-08733).
+///
+/// These tokens make the ordering structural. `install_11_1` cannot be called
+/// without the value `install` returns, so
+/// `install_11_1(f); install(f);` no longer compiles.
+#[must_use]
+pub struct Filled11_0(());
+
+/// Proof that [`install_11_1`] has replaced the eighteen 10.x-typed slots.
+#[must_use]
+pub struct Filled11_1(());
+
+/// Proof that [`install_wddm1_3`] has run. Terminal: nothing consumes it, and
+/// it exists so the chain reads as one pipeline rather than two links and a
+/// loose call. T6/R918 deleted the WDDM2.1 level above it -- the runtime could
+/// never negotiate that interface, so there is no `upgrade_wddm2_1`.
+#[must_use]
+pub struct FilledWddm1_3(());
+
+pub unsafe fn install(funcs: *mut ddi::D3D11DDI_DEVICEFUNCS) -> Filled11_0 {
     let f = &mut *funcs;
     f.pfnCalcPrivateResourceSize = Some(calc_size_resource);
     f.pfnCalcPrivateOpenedResourceSize = Some(calc_size_opened_resource);
@@ -10638,11 +10666,18 @@ pub unsafe fn install(funcs: *mut ddi::D3D11DDI_DEVICEFUNCS) {
     f.pfnCreateBlendState = Some(create_blend_state);
     f.pfnSetBlendState = Some(set_blend_state);
     f.pfnDestroyBlendState = Some(destroy_blend_state);
+    Filled11_0(())
 }
 
 /// Install D3D11.1-specific handlers whose signatures differ from the D3D11.0
 /// prefix or only exist in the D3D11.1 table.
-pub unsafe fn install_11_1(funcs: *mut ddi::D3D11_1DDI_DEVICEFUNCS) {
+pub unsafe fn install_11_1(
+    base: Filled11_0,
+    funcs: *mut ddi::D3D11_1DDI_DEVICEFUNCS,
+) -> Filled11_1 {
+    // Consumed by value: this is the whole point. The 10.x handlers must
+    // already be in the table for these overrides to be overrides.
+    let Filled11_0(()) = base;
     let f = &mut *funcs;
     f.pfnVsSetConstantBuffers = Some(vs_set_constant_buffers1);
     f.pfnPsSetConstantBuffers = Some(ps_set_constant_buffers1);
@@ -10683,9 +10718,14 @@ pub unsafe fn install_11_1(funcs: *mut ddi::D3D11_1DDI_DEVICEFUNCS) {
     f.pfnCalcPrivateTessellationShaderSize = Some(calc_size_tess_shader_11_1);
     f.pfnCreateHullShader = Some(create_hull_shader_11_1);
     f.pfnCreateDomainShader = Some(create_domain_shader_11_1);
+    Filled11_1(())
 }
 
-pub unsafe fn install_wddm1_3(funcs: *mut ddi::D3DWDDM1_3DDI_DEVICEFUNCS) {
+pub unsafe fn install_wddm1_3(
+    level_11_1: Filled11_1,
+    funcs: *mut ddi::D3DWDDM1_3DDI_DEVICEFUNCS,
+) -> FilledWddm1_3 {
+    let Filled11_1(()) = level_11_1;
     let f = &mut *funcs;
     f.pfnCheckMultisampleQualityLevels = Some(check_multisample_quality_levels_wddm1_3);
     f.pfnUpdateTileMappings = Some(update_tile_mappings);
@@ -10697,5 +10737,6 @@ pub unsafe fn install_wddm1_3(funcs: *mut ddi::D3DWDDM1_3DDI_DEVICEFUNCS) {
     f.pfnResizeTilePool = Some(resize_tile_pool);
     f.pfnSetMarker = Some(set_marker);
     f.pfnSetMarkerMode = Some(set_marker_mode);
+    FilledWddm1_3(())
 }
 
