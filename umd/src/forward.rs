@@ -802,6 +802,10 @@ unsafe fn stamp_dxvk_resource_kmt_handles(
     };
     if dev
         .dxvk
+        // SAFETY: `obj` is a live ID3D11Resource borrowed for this call, so the
+        // pointer the bridge reinterpret_casts is valid for its duration.
+        // R814 moved `unsafe` onto this declaration because it launders a
+        // pointer; the marking now matches where the precondition is.
         .set_resource_kmt_handles(obj.as_raw() as usize, local, global)
     {
         log_error!(
@@ -2236,7 +2240,8 @@ unsafe fn finish_wddm_tex2d(
         .unwrap_or(0);
     if allocation_handle != 0 && backing_resource_id != 0 {
         if let Some(dev) = helios_device(h) {
-            if !dev.dxvk.transfer_resource_ownership(res.as_raw() as usize) {
+            // SAFETY: `res` is the live resource this DDI just created.
+            if !unsafe { dev.dxvk.transfer_resource_ownership(res.as_raw() as usize) } {
                 log_error!(
                     "DDI create_resource(tex2d): ownership transfer failed res_id={}",
                     backing_resource_id
@@ -9369,7 +9374,7 @@ pub fn wait_last_present(timeout_us: u32) -> i32 {
     // device reference) — now backed by the liveness check above rather than
     // by that contract alone.
     let dev = unsafe { &*(dev_ptr as *const HeliosDevice) };
-    if unsafe { dev.dxvk.present_frame_gate(timeout_us) } {
+    if dev.dxvk.present_frame_gate(timeout_us) {
         0
     } else {
         1

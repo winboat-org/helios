@@ -1,3 +1,20 @@
+//! # Where `unsafe` sits on these declarations (R814)
+//!
+//! Rust's one memory-safety signal used to be attached to the wrong six
+//! declarations here, so a reviewer scanning for `unsafe` call sites looked in
+//! the wrong places. Three pointer-laundering entry points were SAFE
+//! (`set_resource_kmt_handles`, `transfer_resource_ownership`,
+//! `open_ddi_texture2d`) while three that take only scalars and cannot violate
+//! memory safety were `unsafe fn` (`present_frame_gate`,
+//! `present_sync_fence_id`, `present_flip_wait_arm`).
+//!
+//! Scope limit worth stating, because it changes the finding's shape: cxx
+//! REQUIRES `unsafe fn` for any signature containing a raw pointer, and every
+//! raw-pointer declaration in this block already is. Those are correct and are
+//! not touched. `present_sync_publish` and `present_vehicle_copy` take `usize`
+//! COM pointers AND are already unsafe, which is the correct end state; they
+//! are left alone too.
+
 //! cxx bridge to DXVK's C++ engine.
 //!
 //! The UMD's `d3d10umddi` frontend (Rust) calls into DXVK's `DxvkInstance`/
@@ -23,7 +40,10 @@ pub mod ffi {
         fn d3d11_device_ptr(self: &HeliosDxvkDevice) -> usize;
         fn d3d11_context_ptr(self: &HeliosDxvkDevice) -> usize;
         fn venus_context_id(self: &HeliosDxvkDevice) -> u32;
-        fn set_resource_kmt_handles(
+        /// # Safety
+        /// `d3d11_resource_ptr` must be a live `ID3D11Resource*`; the bridge
+        /// `reinterpret_cast`s it and calls `GetCommonTexture` on it.
+        unsafe fn set_resource_kmt_handles(
             self: &HeliosDxvkDevice,
             d3d11_resource_ptr: usize,
             local: u32,
@@ -46,8 +66,16 @@ pub mod ffi {
             venus_alloc_size: *mut u64,
             memory_type_index: *mut u32,
         ) -> bool;
-        fn transfer_resource_ownership(self: &HeliosDxvkDevice, d3d11_resource_ptr: usize) -> bool;
-        fn open_ddi_texture2d(
+        /// # Safety
+        /// `d3d11_resource_ptr` must be a live `ID3D11Resource*`.
+        unsafe fn transfer_resource_ownership(
+            self: &HeliosDxvkDevice,
+            d3d11_resource_ptr: usize,
+        ) -> bool;
+        /// # Safety
+        /// Returns an OWNED COM pointer the caller must release; the safe
+        /// wrapper `open_texture2d` is the only thing that should call it.
+        unsafe fn open_ddi_texture2d(
             self: &HeliosDxvkDevice,
             width: u32,
             height: u32,
@@ -133,7 +161,7 @@ pub mod ffi {
         /// until the current flush's submission completes on the GPU, so the
         /// IddCx consumer never copies a buffer whose writes are in flight.
         /// Returns false on timeout (caller proceeds — bounded by design).
-        unsafe fn present_frame_gate(self: &HeliosDxvkDevice, timeout_us: u32) -> bool;
+        fn present_frame_gate(self: &HeliosDxvkDevice, timeout_us: u32) -> bool;
         /// WS1 #4 producer: record a named-present-fence signal on the
         /// frame's open command list (submits with the caller's following
         /// Flush; retires at host GPU completion) and publish
@@ -152,7 +180,7 @@ pub mod ffi {
         /// Name discriminator of this device's named present fence; 0 until
         /// the first successful publish created it (or path disabled). Pairs
         /// with publish's value for the vehicle acquire-side recycle gate.
-        unsafe fn present_sync_fence_id(self: &HeliosDxvkDevice) -> u32;
+        fn present_sync_fence_id(self: &HeliosDxvkDevice) -> u32;
         /// Kernel flip-wait plumbing (25th session): hand the bridge the
         /// runtime's pfnSignalSynchronizationObjectFromCpuCb (as a raw fn
         /// address), the runtime device handle, the runtime-device monitored
@@ -175,7 +203,7 @@ pub mod ffi {
         /// `flip_value`. Enqueue-only — never waits. Returns false when the
         /// present fence is unavailable (caller falls back to the CPU gate
         /// for this present and must NOT queue the GPU wait).
-        unsafe fn present_flip_wait_arm(
+        fn present_flip_wait_arm(
             self: &HeliosDxvkDevice,
             target_value: u64,
             flip_value: u64,
@@ -298,7 +326,8 @@ impl ffi::HeliosDxvkDevice {
         linear_scanout_target: bool,
         cross_context_optimal: bool,
     ) -> Option<ID3D11Resource> {
-        // SAFETY: the bridge transfers one reference on success.
+        // SAFETY: the caller upholds the resource-id/handle preconditions
+        // above, and the bridge transfers one reference on success.
         unsafe {
             adopt_resource(self.open_ddi_texture2d(
                 width,
