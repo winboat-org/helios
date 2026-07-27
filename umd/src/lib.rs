@@ -1079,8 +1079,12 @@ unsafe extern "C" fn get_caps(
                 // mode and no command-list build support; the runtime must
                 // serialize/emulate.
                 D3D11DDICAPS_THREADING if args.DataSize >= 4 => {
-                    unsafe { *(args.pData as *mut u32) = 0 };
-                    log_error!("  GetCaps: THREADING caps = 0");
+                    // The value and the state model it licenses now live on one
+                    // symbol, next to the Cell/RefCell fields that are sound
+                    // only because it is 0. R811.
+                    let caps = device_funcs::THREADING_CAPS;
+                    unsafe { *(args.pData as *mut u32) = caps };
+                    log_error!("  GetCaps: THREADING caps = {caps}");
                 }
                 // D3D11DDI_SHADER_CAPS::Caps. FL11 mandates compute shaders;
                 // the runtime rejects the adapter with "Driver doesn't support

@@ -250,6 +250,29 @@ impl BridgeOwned {
     }
 }
 
+/// `D3D11DDI_THREADING_CAPS::Caps`, the value `get_caps` reports.
+///
+/// **MUST stay 0 while [`HeliosDevice`] uses `Cell`/`RefCell` and the
+/// deferred-context / command-list slots are stubs (see R812).**
+///
+/// Every mutable field of `HeliosDevice` is a `Cell` or `RefCell` and its docs
+/// call that "the single-threaded-DDI contract". That is not a DDI guarantee in
+/// general -- it holds only because this driver reports THREADING caps = 0, a
+/// value that was written in another file with no reference to the state
+/// depending on it. Advertise free-threaded creates or command lists and the
+/// runtime may call `pfnCreateResource` on two threads; two `borrow_mut()`s on
+/// `ia` is a `RefCell` panic, and with `panic = "abort"` in both profiles that
+/// is an immediate dwm process kill.
+///
+/// The same cap value is also the only reason the deferred-context and
+/// command-list Create slots R812 covers are never called.
+///
+/// Guarantee is one definition site carrying the rationale, referenced by the
+/// caps writer -- not a token. A `SingleThreadedDeviceModel` token would be
+/// ceremony: it cannot stop anyone editing both sites, and `HeliosDevice` is
+/// already `!Sync` by construction. R811.
+pub const THREADING_CAPS: u32 = 0;
+
 /// Per-device UMD state, constructed in-place in the runtime-allocated private
 /// device memory (size = [`device_private_size`]). Owns the DXVK device the cxx
 /// bridge created on the Helios venus adapter.
