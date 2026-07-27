@@ -1035,17 +1035,75 @@ virtio-gpu scanout; IddCx/Looking Glass is no longer the active display path.*
    `venus::allocate_scanout_image_blob` is the only caller of
    `ctrl::resource_assign_uuid`.
 
-   ⚠ **STILL REQUIRED FOR THE T6 GATE, and blocked on the reboot:** cold boot to
-   `CM_PROB_NONE` on `22.22.188.0`, a DxgKrnl all-keywords ETW trace with no
-   `AzureTriage` record, `SdgDevX` reading 1 on a DisplayHalf boot with `SdgDevR`
-   0, the `SdgL*` ladder reaching `0x10` if the LINEAR fallback is forced,
-   `RfUnb` ticking at most once across a `restart-device` while `RfFail` stays 0,
-   `PHQcall` still absent, and same-boot QEMU evidence for the exact OPTIMAL DWM
-   primary. Not performed and still owed from earlier tranches: **rapid cursor
-   motion / no trails** (needs an interactive mouse; now NINE tranches overdue),
-   **suspend/resume** (not testable, `disable_s3=1`/`disable_s4=1`), and a
-   **resolution change** (`ChangeDisplaySettingsEx` is not an available mechanism
-   on this box, see 7f).
+7i. **T6 GATE RUN AND PASSED (2026-07-28), KMD `22.22.188.0` + UMD
+   `355b4366b1666104`, cold boot 02:58:36.** Installed with `win_install_kmd`
+   (package UMD hash verified `355B4366…06245F`), one graceful reboot, then two
+   `pnputil /restart-device` cycles. Backup at
+   `C:\ProgramData\HeliosDeployBackups\20260728-025815`; the T5 and T4b UMDs are
+   still at `helios-umd-backup-t5.dll` / `-t4b.dll`.
+
+   **★ NO BOOT LOOP.** The tranche touched `DxgkDdiStartDevice` and the frame
+   budget, so this was the real risk: `CM_PROB_NONE`, `DriverVersion 22.22.188.0`,
+   23 s after boot. Deepest boot chain **17584 B / 352 B headroom**, unchanged.
+
+   | Gate line | Result |
+   |---|---|
+   | Cold boot to `CM_PROB_NONE` | **yes**, 22.22.188.0 |
+   | DxgKrnl all-keywords ETW, `AzureTriage` | **NONE** (armed across a restart-device + a dcomp run) |
+   | Visible desktop, cold boot | `helios_paintcap` 02:59:58 — full desktop, wallpaper, all icons, taskbar, clock matching |
+   | Visible desktop, after `restart-device` | `helios_paintcap` 03:01:43 — same |
+   | `ScanoutDiag` absent, `VpSA`, `ScSet` | absent; `VpSA=1`, `ScSet=1`, `ScFlu=3`, `ScPch=7680`, `DspMd=124257286` |
+   | KMD must-be-zero surface | **all clear** (`kmd-gate-surface.ps1` exit 0) |
+   | R901 ext ladder | `SdgDevX=1` (export trio), `SdgDevR=0` — **tier numbering preserved exactly**, a DisplayHalf boot still reads 1 |
+   | R901 production `SdgL*` ladder | `SdgLStg=0x10`, `SdgLReq=7910400`, `SdgLBit=15`, `SdgLTyc=5`, `SdgLPch=7680` — every value identical to the pre-tranche reading |
+   | R901 lab names | `SdgM=0`; `SdgReb`/`SdgRv`/`SdgRRid`/`SdgRSet`/`SdgRFlu` **byte-identical to the pre-tranche reading** — nothing writes them now. `S2d*` absent |
+   | R907 | `PHQcall` **absent**, and the new `HwQRef` **absent** — `CreateHwQueue` was never called either |
+   | R902 | `RfUnb` **absent** across a cold boot AND a `restart-device` |
+   | UMD gate surface | `umd-gate-surface.ps1` **CLEAN**, exit 0 |
+   | D3D11 suites | `TOTAL failures=0`, `xproc_read_rc=0` |
+   | Fire Strike, full T6 stack | Graphics **20003** (GT1 140.72, GT2 62.93, Physics 35587, Combined 5529) |
+   | Ownership soak 300/10000 | device 300 = **1947**, **5.99 handles/device**, resource phase **flat at 1975** all ten samples, final 1953, modules **+0**, failures **0/0**, dwm handles **+0** |
+   | DComp cadence | 1247, `PROBE PASS` |
+   | Same-boot host evidence | `vulkan-readback: DMA-BUF import tiling=OPTIMAL … OPTIMAL DMA-BUF ready 1896x1030` — the exact OPTIMAL DWM primary |
+   | dxgkrnl / TDR / bugcheck (System log) | **none** |
+
+   Ownership is identical across all three stacks measured today — T5 (1946 /
+   5.99 / flat 1977), T6 UMD-only (1947 / 5.99 / flat 1975), T6 full (1947 /
+   5.99 / flat 1975). The printed `OWNERSHIP SOAK FAIL` is the pre-existing
+   6-handles-per-device teardown leak (7d(b)) failing the literal "flat" test,
+   identically on all three.
+
+   ⚠ **A Fire Strike run that reported a score of 0 was nearly accepted.** The
+   first attempt on this image finished in 61 s (a real run is ~6.3 min) because
+   two D3D11 probe suites were launched concurrently; its `Result.xml` carried
+   `firestrikegraphicsscorep = 0`. **Check the run DURATION, and open the XML —
+   3DMark writes a result file either way.** The clean re-run gave 20003.
+
+   ⚠ **`RfUnb` staying absent across `restart-device` is NOT proof the refusal
+   works** — it is the same distinction T1a found for `StRst`: `restart-device`
+   re-runs AddDevice with a FRESH zeroed context, so `active_scanout_resource`
+   is 0 too and the `host_bound != active` mismatch never arises. Reaching it
+   needs a PnP stop/start on the SAME context. The R902 refusal is therefore
+   correct-by-construction and **unexercised**, not verified.
+
+   ⚠ **WS1 defect 0z reproduced, PROMPTED, and slightly wider than recorded.**
+   Eight `0xc0000005` faults this boot, at 03:01:11 and 03:02:28 — both instants
+   coinciding exactly with the two `restart-device` cycles, i.e. provoked, not
+   unprompted, and the historical process set (dwm, Explorer,
+   StartMenuExperienceHost, SearchHost, ApplicationFrameHost) with
+   `vulkan_virtio-*.dll` as the faulting module. **One entry differs from the
+   recorded signature:** `ApplicationFrameHost.exe` at 03:02:28 faulted in
+   `ucrtbase.dll`, not the ICD — same exception code, same burst, but 0z has
+   only ever been recorded as ICD-module faults. Worth a line in the WS1 item.
+   dwm has been stable since 03:02:28. Zero dxgkrnl/TDR/bugcheck events.
+
+   ⚠ **NOT performed, and owed from earlier tranches:** **rapid cursor motion /
+   no trails** (needs an interactive mouse; NINE tranches overdue and still the
+   only gate line no instrument covers), **suspend/resume** (not testable,
+   `disable_s3=1`/`disable_s4=1`), a **resolution change**
+   (`ChangeDisplaySettingsEx` is not an available mechanism on this box, 7f), and
+   the **one-hour unattended session** — the box was under continuous test
+   instead.
 
 8. Implement the remaining reviewed refactors atomically, in tranche order, one recommendation
    per commit; never fold a `BUG` fix into a structure move. Preserve the current direct
