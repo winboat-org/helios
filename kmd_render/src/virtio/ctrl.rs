@@ -581,69 +581,6 @@ pub fn resource_flush_async(
     }
 }
 
-/// Queue SET_SCANOUT_BLOB without waiting for its ctrl response. A successful
-/// response publishes `resource_id` through `host_bound` and re-arms
-/// `refresh_pending` so the worker flushes the newly-bound image. A rejected
-/// bind does not self-resubmit: only a new Windows-selected candidate or a new
-/// completion-ordered dirty edge may request another attempt.
-pub fn set_scanout_blob_async(
-    passive: PassiveLevel,
-    adapter: &AdapterContext,
-    resource_id: u32,
-    width: u32,
-    height: u32,
-    format: u32,
-    stride: u32,
-    offset: u32,
-    completion: NonNull<AtomicU32>,
-    completion_errors: NonNull<AtomicU32>,
-    host_bound: NonNull<AtomicU32>,
-    refresh_pending: NonNull<AtomicU32>,
-    wake_event: NonNull<KEVENT>,
-) -> Result<(), VirtioError> {
-    let mut cmd = VirtioGpuSetScanoutBlob::zeroed();
-    cmd.hdr.type_ = VIRTIO_GPU_CMD_SET_SCANOUT_BLOB;
-    cmd.r = VirtioGpuRect {
-        x: 0,
-        y: 0,
-        width,
-        height,
-    };
-    cmd.scanout_id = 0;
-    cmd.resource_id = resource_id;
-    cmd.width = width;
-    cmd.height = height;
-    cmd.format = format;
-    cmd.strides[0] = stride;
-    cmd.offsets[0] = offset;
-
-    reap_parked(passive, adapter);
-    let request = bytes_of(&cmd);
-    let response_len = size_of::<VirtioGpuCtrlHdr>();
-    let mut meta =
-        DmaBuffer::new(passive, request.len() + response_len).ok_or(VirtioError::OutOfMemory)?;
-    meta.as_mut_slice()[..request.len()].copy_from_slice(request);
-
-    let queued = adapter.with_virtio(move |v| {
-        v.drain_used();
-        v.enqueue_async_control(
-            meta,
-            request.len(),
-            response_len,
-            completion,
-            completion_errors,
-            wake_event,
-            Some((host_bound, resource_id)),
-            Some(refresh_pending),
-        )
-    });
-    match queued {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err((_meta, e))) => Err(e),
-        Err(_) => Err(VirtioError::DeviceError),
-    }
-}
-
 /// Drop the host's reference to a resource.
 pub fn resource_unref(
     passive: PassiveLevel,

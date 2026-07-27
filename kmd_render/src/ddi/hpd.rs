@@ -167,9 +167,11 @@ pub unsafe extern "C" fn hpd_thread_routine(context: *mut c_void) {
     // spam and a delayed synchronous response cannot cap presentation at 2.4 Hz.
     let mut reported_fail = 0u32;
     loop {
-        let flush_inflight = adapter.scanout_flush_inflight.load(Ordering::Acquire) != 0;
-        let bind_inflight = adapter.scanout_bind_inflight.load(Ordering::Acquire) != 0;
-        let ctrl_inflight = flush_inflight || bind_inflight;
+        // One in-flight class since T6/R902 deleted the async bind: the
+        // composition `flush_inflight || bind_inflight` reduces to the flush
+        // term, because `scanout_bind_inflight`'s only non-zero writer was the
+        // CAS inside the deleted arm.
+        let ctrl_inflight = adapter.scanout_flush_inflight.load(Ordering::Acquire) != 0;
         let retry_pending =
             adapter.scanout_refresh_pending.load(Ordering::Acquire) != 0 && !ctrl_inflight;
         let mut timeout: LARGE_INTEGER = unsafe { core::mem::zeroed() };
@@ -204,8 +206,7 @@ pub unsafe extern "C" fn hpd_thread_routine(context: *mut c_void) {
         // arrives behind it. This frees the coalescing gate without waiting for
         // the old exponential synchronous-roundtrip slices.
         if (wait_status == STATUS_TIMEOUT && ctrl_inflight)
-            || ((adapter.scanout_flush_inflight.load(Ordering::Acquire) != 0
-                || adapter.scanout_bind_inflight.load(Ordering::Acquire) != 0)
+            || (adapter.scanout_flush_inflight.load(Ordering::Acquire) != 0
                 && adapter.scanout_refresh_pending.load(Ordering::Acquire) != 0)
         {
             crate::ddi::interrupt::drain_used_and_complete(adapter);

@@ -667,16 +667,17 @@ pub struct AdapterContext {
     /// copy marks scanout dirty.
     pub active_scanout_resource: AtomicU32,
     pub active_scanout_wh: AtomicU64,
-    /// Row pitch (high 32), plane offset (low 32), and virtio format for the
-    /// desired scanout. `active_scanout_resource` is the publish word.
-    pub active_scanout_layout: AtomicU64,
-    pub active_scanout_format: AtomicU32,
-    /// Host-accepted binding and one-command async SET_SCANOUT_BLOB gate. A
-    /// rotating DWM primary only publishes the newest desired resource; the
-    /// worker coalesces intermediate flips without blocking in a ctrl roundtrip.
+    /// The resource the host has actually bound to scanout 0.
+    ///
+    /// The ONLY rebind that runs is the SYNCHRONOUS `ctrl::set_scanout_blob`
+    /// from `display.rs`, under `with_scanout_lifecycle`. The async coalescing
+    /// design this field's doc used to describe -- `set_scanout_blob_async`
+    /// driven from `queue_active_scanout_refresh_locked`, with an in-flight
+    /// gate and companion `active_scanout_layout`/`_format` -- was 45 lines of
+    /// code that could never execute, because nothing in the crate ever stored
+    /// a non-zero stride or format. T6/R902 deleted it; this word and
+    /// `active_scanout_resource`/`_wh` are what remain.
     pub host_bound_scanout_resource: AtomicU32,
-    pub scanout_bind_inflight: AtomicU32,
-    pub scanout_bind_fail: AtomicU32,
     /// Import identity of the optional KMD-owned LINEAR fallback. DWM may query
     /// this through `HELIOS_ESCAPE_QUERY_SCANOUT` when the primary cannot be
     /// bound directly. The resource id is the publish word: writers store every
@@ -1180,11 +1181,7 @@ impl AdapterContext {
             last_primary_address: AtomicU64::new(0),
             active_scanout_resource: AtomicU32::new(0),
             active_scanout_wh: AtomicU64::new(0),
-            active_scanout_layout: AtomicU64::new(0),
-            active_scanout_format: AtomicU32::new(0),
             host_bound_scanout_resource: AtomicU32::new(0),
-            scanout_bind_inflight: AtomicU32::new(0),
-            scanout_bind_fail: AtomicU32::new(0),
             primary_scanout_resource: AtomicU32::new(0),
             primary_scanout_wh: AtomicU64::new(0),
             primary_scanout_layout: AtomicU64::new(0),
@@ -1270,8 +1267,6 @@ impl AdapterContext {
         self.pending_vidpn_allocation.store(0, Ordering::Release);
         self.active_scanout_resource.store(0, Ordering::Release);
         self.active_scanout_wh.store(0, Ordering::Release);
-        self.active_scanout_layout.store(0, Ordering::Release);
-        self.active_scanout_format.store(0, Ordering::Release);
         self.host_bound_scanout_resource.store(0, Ordering::Release);
         self.last_primary_address.store(0, Ordering::Release);
         self.dedicated_scanout_resource.store(0, Ordering::Release);
@@ -1288,7 +1283,6 @@ impl AdapterContext {
         self.primary_scanout_seq.fetch_add(1, Ordering::Release);
         self.scanout_refresh_pending.store(0, Ordering::Release);
         self.scanout_flush_inflight.store(0, Ordering::Release);
-        self.scanout_bind_inflight.store(0, Ordering::Release);
         // Consumers that cache a primary identity compare generations, so bump
         // it rather than zeroing it: a wrapped-to-equal generation would let a
         // stale cache look current.
@@ -1311,7 +1305,13 @@ impl AdapterContext {
         self.hpd_stop.store(0, Ordering::Release);
         self.scanout_refresh_pending.store(0, Ordering::Release);
         self.scanout_flush_inflight.store(0, Ordering::Release);
-        self.scanout_bind_inflight.store(0, Ordering::Release);
+        // ⚠ `host_bound_scanout_resource` is zeroed here WITHOUT clearing
+        // `active_scanout_resource`, so after a StopDevice/StartDevice cycle
+        // the two disagree and `queue_active_scanout_refresh_locked` reaches
+        // the `host_bound != resource_id` test below. That is the ONE path
+        // that made the deleted async-bind arm reachable, and it is why the
+        // refusal survives the deletion as `RfUnb` rather than falling through
+        // to a RESOURCE_FLUSH against a resource the host never bound.
         self.host_bound_scanout_resource.store(0, Ordering::Release);
         let mut handle: wdk_sys::HANDLE = core::ptr::null_mut();
         const THREAD_ALL_ACCESS: u32 = 0x001F_FFFF;
@@ -1668,8 +1668,9 @@ impl AdapterContext {
     /// otherwise become visible only at device teardown.
     ///
     /// ONE rate now (~600 refreshes, about 10 s at 60 Hz): the 16-period set is
-    /// folded in. `RfFail`, `RbFail`/`RfUnb` and `ScDead` are deliberately NOT
-    /// here — those stay loud and in place at their own sites.
+    /// folded in. `RfFail`, `RfUnb` and `ScDead` are deliberately NOT here —
+    /// those stay loud and in place at their own sites. (`RbFail` was here
+    /// until T6/R902 deleted the async bind arm that produced it.)
     fn pacing_snapshot(&self) {
         use core::sync::atomic::Ordering;
 
@@ -1689,14 +1690,6 @@ impl AdapterContext {
             b"RfFail",
             self.scanout_refresh_fail.load(Ordering::Relaxed),
         );
-        // R315: the BIND-side failure counter, emitted from the SAME periodic
-        // block as the flush-side one. Its only other writer is the enqueue
-        // failure path above, which T6's k-lifecycle-02 shows is statically
-        // unreachable — so a host-REJECTED SET_SCANOUT_BLOB (counted through
-        // the DPC's completion_errors into scanout_bind_fail) used to leave
-        // the display silently frozen with no counter movement visible over
-        // SSH.
-        crate::diag::record_named_bytes(b"RbFail", self.scanout_bind_fail.load(Ordering::Relaxed));
         // Live proof that ctrl completions are reaching the real IRQ/DPC
         // path; these atomics otherwise become visible only at teardown.
         crate::diag::record_named_bytes(
@@ -1824,17 +1817,13 @@ impl AdapterContext {
         // explicit one-shot flushes; never query the registry on every frame.
         let resource_id = self.active_scanout_resource.load(Ordering::Acquire);
         let wh = self.active_scanout_wh.load(Ordering::Relaxed);
-        let layout = self.active_scanout_layout.load(Ordering::Relaxed);
-        let format = self.active_scanout_format.load(Ordering::Relaxed);
-        // A newer present may publish while we sample the companion fields.
+        // A newer present may publish while we sample the companion field.
         // Retry from the worker rather than combine two primary identities.
         if self.active_scanout_resource.load(Ordering::Acquire) != resource_id {
             return ScanoutRefreshQueue::Busy;
         }
         let width = (wh >> 32) as u32;
         let height = wh as u32;
-        let stride = (layout >> 32) as u32;
-        let offset = layout as u32;
         if !self.display_half() || resource_id == 0 || width == 0 || height == 0 {
             return ScanoutRefreshQueue::Unavailable;
         }
@@ -1859,52 +1848,18 @@ impl AdapterContext {
             }
             return ScanoutRefreshQueue::Unavailable;
         }
-        if self.scanout_bind_inflight.load(Ordering::Acquire) != 0
-            || self.scanout_flush_inflight.load(Ordering::Acquire) != 0
-        {
+        if self.scanout_flush_inflight.load(Ordering::Acquire) != 0 {
             return ScanoutRefreshQueue::Busy;
         }
 
+        // KEEP THE REFUSAL, and make it loud. Deleting the whole arm -- as the
+        // original finding proposed -- would let control fall through to
+        // `resource_flush_async` and issue RESOURCE_FLUSH against a resource
+        // the host has never bound to scanout 0, reachable on exactly the
+        // StopDevice/StartDevice path that `init_hpd` creates.
         if self.host_bound_scanout_resource.load(Ordering::Acquire) != resource_id {
-            if stride == 0 || format == 0 {
-                return ScanoutRefreshQueue::Unavailable;
-            }
-            if self
-                .scanout_bind_inflight
-                .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
-                .is_err()
-            {
-                return ScanoutRefreshQueue::Busy;
-            }
-            let result = crate::virtio::ctrl::set_scanout_blob_async(
-                lock.passive(),
-                self,
-                resource_id,
-                width,
-                height,
-                format,
-                stride,
-                offset,
-                NonNull::from(&self.scanout_bind_inflight),
-                NonNull::from(&self.scanout_bind_fail),
-                NonNull::from(&self.host_bound_scanout_resource),
-                NonNull::from(&self.scanout_refresh_pending),
-                // SAFETY: embedded initialized event; adapter outlives entry.
-                unsafe { NonNull::new_unchecked(self.hpd_event.get()) },
-            );
-            if result.is_err() {
-                self.scanout_bind_inflight.store(0, Ordering::Release);
-                let failed = self
-                    .scanout_bind_fail
-                    .fetch_add(1, Ordering::Relaxed)
-                    .wrapping_add(1);
-                if failed == 1 || (failed % 60) == 0 {
-                    crate::diag::record_named_bytes(b"RbRid", resource_id);
-                    crate::diag::record_named_bytes(b"RbFail", failed);
-                }
-                return ScanoutRefreshQueue::Failed;
-            }
-            return ScanoutRefreshQueue::Queued;
+            crate::diag::record_named_bytes(b"RfUnb", resource_id);
+            return ScanoutRefreshQueue::Unavailable;
         }
 
         if self

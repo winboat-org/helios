@@ -1927,10 +1927,11 @@ impl VirtioGpu {
     /// never popped, so DMA_COMPLETED was never delivered again. ResetFromTimeout
     /// cleared the FIFO but neither the latch nor the stuck entries, so dxgkrnl
     /// resubmitted with fresh ids into the same wedge: a TDR loop. And the
-    /// `AsyncControl` entries that own `scanout_bind_inflight` /
-    /// `scanout_flush_inflight` were abandoned with their completion gates still
-    /// set, so `queue_active_scanout_refresh` returned Busy forever and the HPD
-    /// worker spun its 4 ms lost-interrupt poll for the rest of the boot.
+    /// `AsyncControl` entries that own `scanout_flush_inflight` were abandoned
+    /// with their completion gates still set, so `queue_active_scanout_refresh`
+    /// returned Busy forever and the HPD worker spun its 4 ms lost-interrupt
+    /// poll for the rest of the boot. (`scanout_bind_inflight` was the other
+    /// such gate until T6/R902 deleted the async bind.)
     ///
     /// Everything here mirrors the success path's ordering exactly, because a
     /// mistake in the Sync-waiter sequence is a use-after-free of a stack block.
