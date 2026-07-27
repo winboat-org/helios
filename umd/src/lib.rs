@@ -840,13 +840,10 @@ unsafe extern "C" fn create_device(
                 owned: device_funcs::BridgeOwned::new(),
                 dxvk,
                 h_rt_device: create.hRTDevice.handle,
-                h_context: core::ptr::null_mut(),
-                command_buffer: core::cell::Cell::new(core::ptr::null_mut()),
-                command_buffer_size: core::cell::Cell::new(0),
-                allocation_list: core::cell::Cell::new(core::ptr::null_mut()),
-                allocation_list_size: core::cell::Cell::new(0),
-                patch_list: core::cell::Cell::new(core::ptr::null_mut()),
-                patch_list_size: core::cell::Cell::new(0),
+                // Populated by create_runtime_context below; CreateDevice
+                // fails if that does not succeed, so a device the runtime ever
+                // sees always has one. R808.
+                context: None,
                 // Both of these arrive already typed from the bindgen struct;
                 // the hand copy declared them as bare `c_void` pointers and had
                 // to cast at this site.

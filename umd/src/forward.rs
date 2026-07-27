@@ -8996,7 +8996,7 @@ unsafe fn present_prerequisites(
         PRESENT_SKIP_NO_CALLBACKS.fetch_add(1, Ordering::Relaxed);
         return Err(PresentSkip::NoDxgiCallbacks);
     }
-    let Some(h_context) = core::ptr::NonNull::new(dev.h_context) else {
+    let Some(h_context) = dev.context.as_ref().map(|c| c.handle) else {
         PRESENT_SKIP_NO_CONTEXT.fetch_add(1, Ordering::Relaxed);
         return Err(PresentSkip::NoContext);
     };
@@ -9101,7 +9101,7 @@ unsafe fn flip_wait_setup(dev: &crate::device_funcs::HeliosDevice) -> bool {
     if !crate::vehicle_kernel_flip_wait() {
         return disable("VehicleKernelFlipWait=0");
     }
-    if dev.kt_callbacks.is_null() || dev.h_context.is_null() {
+    if dev.kt_callbacks.is_null() || dev.context.is_none() {
         return disable("no runtime callbacks/context");
     }
     let cbs = &*dev.kt_callbacks;
@@ -9769,14 +9769,19 @@ impl RuntimePresentDependencies {
     /// The list pointer and capacity came from pfnCreateContextCb or the
     /// preceding successful pfnRenderCb. This method validates both before
     /// writing exactly `count()` initialized entries.
-    unsafe fn write_to(self, dev: &crate::device_funcs::HeliosDevice) -> Result<u32, i32> {
+    unsafe fn write_to(self, ctx: &crate::device_funcs::RuntimeContext) -> Result<u32, i32> {
         let required = self.count();
-        let list = dev.allocation_list.get();
-        if list.is_null() || dev.allocation_list_size.get() < required {
+        // Pointer and capacity arrive together, so the `<` comparison cannot be
+        // made against a capacity that describes a different pointer. The
+        // comparison itself, and `required`, are unchanged from pre-R808.
+        let window = ctx.allocations.get();
+        let list = window.map_or(core::ptr::null_mut(), |w| w.ptr.as_ptr());
+        let capacity = window.map_or(0, |w| w.capacity);
+        if list.is_null() || capacity < required {
             log_error!(
                 "DXGI Present: runtime allocation list unavailable ptr={:p} capacity={} required={}",
                 list,
-                dev.allocation_list_size.get(),
+                capacity,
                 required
             );
             return Err(E_FAIL);
@@ -9825,14 +9830,15 @@ unsafe fn submit_runtime_submission(
 ) -> i32 {
     static LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 
-    if dev.kt_callbacks.is_null() || dev.h_context.is_null() {
+    let (Some(ctx), false) = (dev.context.as_ref(), dev.kt_callbacks.is_null()) else {
         return E_FAIL;
-    }
+    };
     let Some(render_cb) = (*dev.kt_callbacks).pfnRenderCb else {
         log_error!("DXGI submission: pfnRenderCb missing");
         return E_FAIL;
     };
-    let command = dev.command_buffer.get();
+    let command_window = ctx.command.get();
+    let command = command_window.map_or(core::ptr::null_mut(), |w| w.ptr.as_ptr());
     let (command_length, label) = match submission {
         RuntimeSubmission::Present {
             private: Some(_), ..
@@ -9849,7 +9855,7 @@ unsafe fn submit_runtime_submission(
             "refresh",
         ),
     };
-    if command.is_null() || dev.command_buffer_size.get() < command_length {
+    if command.is_null() || command_window.map_or(0, |w| w.capacity) < command_length {
         log_error!("DXGI {label}: no runtime command buffer");
         return E_FAIL;
     }
@@ -9859,7 +9865,7 @@ unsafe fn submit_runtime_submission(
             dependencies,
             private,
         } => {
-            let count = match dependencies.write_to(dev) {
+            let count = match dependencies.write_to(ctx) {
                 Ok(count) => count,
                 Err(hr) => return hr,
             };
@@ -9897,21 +9903,37 @@ unsafe fn submit_runtime_submission(
     render.CommandOffset = 0;
     render.NumAllocations = allocation_count;
     render.NumPatchLocations = 0;
-    render.hContext = dev.h_context;
+    render.hContext = ctx.handle.as_ptr();
     let hr = render_cb(dev.h_rt_device, &mut render);
 
     if hr >= 0 {
-        if !render.pNewCommandBuffer.is_null() && render.NewCommandBufferSize != 0 {
-            dev.command_buffer.set(render.pNewCommandBuffer);
-            dev.command_buffer_size.set(render.NewCommandBufferSize);
+        // Each window is replaced as a unit, so a new pointer can never be
+        // stored against the old capacity. The `!= 0` size guards are retained:
+        // the runtime returning a pointer with a zero size means "keep what you
+        // have", not "here is an empty buffer".
+        if render.NewCommandBufferSize != 0 {
+            if let Some(w) = crate::device_funcs::Window::new(
+                render.pNewCommandBuffer,
+                render.NewCommandBufferSize,
+            ) {
+                ctx.command.set(Some(w));
+            }
         }
-        if !render.pNewAllocationList.is_null() && render.NewAllocationListSize != 0 {
-            dev.allocation_list.set(render.pNewAllocationList);
-            dev.allocation_list_size.set(render.NewAllocationListSize);
+        if render.NewAllocationListSize != 0 {
+            if let Some(w) = crate::device_funcs::Window::new(
+                render.pNewAllocationList,
+                render.NewAllocationListSize,
+            ) {
+                ctx.allocations.set(Some(w));
+            }
         }
-        if !render.pNewPatchLocationList.is_null() && render.NewPatchLocationListSize != 0 {
-            dev.patch_list.set(render.pNewPatchLocationList);
-            dev.patch_list_size.set(render.NewPatchLocationListSize);
+        if render.NewPatchLocationListSize != 0 {
+            if let Some(w) = crate::device_funcs::Window::new(
+                render.pNewPatchLocationList,
+                render.NewPatchLocationListSize,
+            ) {
+                ctx.patches.set(Some(w));
+            }
         }
     }
 
@@ -10123,7 +10145,10 @@ unsafe extern "C" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT) -> i32 {
                     let values = [v];
                     let mut warg: ddi::D3DDDICB_WAITFORSYNCHRONIZATIONOBJECTFROMGPU =
                         core::mem::zeroed();
-                    warg.hContext = dev.h_context;
+                    warg.hContext = dev
+                        .context
+                        .as_ref()
+                        .map_or(core::ptr::null_mut(), |c| c.handle.as_ptr());
                     warg.ObjectCount = 1;
                     warg.ObjectHandleArray = handles.as_ptr();
                     warg.__bindgen_anon_1.MonitoredFenceValueArray = values.as_ptr();
@@ -10232,7 +10257,9 @@ unsafe extern "C" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT) -> i32 {
                     "DXGI Present: skip PresentCb callbacks={} src=0x{:x} hContext={:p}",
                     dev.dxgi_callbacks.is_null(),
                     src_alloc,
-                    dev.h_context
+                    dev.context
+                        .as_ref()
+                        .map_or(core::ptr::null_mut(), |c| c.handle.as_ptr())
                 );
             }
         }
@@ -10320,7 +10347,13 @@ unsafe extern "C" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT) -> i32 {
 
 // Best-effort context handle for present logging (null when unavailable).
 fn dev_context_for_log(h: ddi::D3D10DDI_HDEVICE) -> *mut core::ffi::c_void {
-    unsafe { helios_device(h).map_or(core::ptr::null_mut(), |d| d.h_context) }
+    unsafe {
+        helios_device(h).map_or(core::ptr::null_mut(), |d| {
+            d.context
+                .as_ref()
+                .map_or(core::ptr::null_mut(), |c| c.handle.as_ptr())
+        })
+    }
 }
 
 unsafe extern "C" fn dxgi_get_gamma_caps(
@@ -10896,10 +10929,10 @@ unsafe extern "C" fn dxgi_present_mpo(arg: *mut ddi::DXGI_DDI_ARG_PRESENTMULTIPL
     let Some(dev) = helios_device(h) else {
         return E_INVALIDARG;
     };
-    if dev.dxgi_callbacks.is_null() || dev.h_context.is_null() {
+    let (false, Some(ctx)) = (dev.dxgi_callbacks.is_null(), dev.context.as_ref()) else {
         log_error!("DXGI PresentMultiplaneOverlay: no DXGI callbacks/context");
         return DXGI_ERROR_UNSUPPORTED;
-    }
+    };
     let Some(present_cb) = (*dev.dxgi_callbacks).pfnPresentMultiplaneOverlayCb else {
         log_error!("DXGI PresentMultiplaneOverlay: pfnPresentMultiplaneOverlayCb missing");
         return DXGI_ERROR_UNSUPPORTED;
@@ -10907,7 +10940,7 @@ unsafe extern "C" fn dxgi_present_mpo(arg: *mut ddi::DXGI_DDI_ARG_PRESENTMULTIPL
 
     let mut cb = ddi::DXGIDDICB_PRESENT_MULTIPLANE_OVERLAY::default();
     cb.pDXGIContext = a.pDXGIContext;
-    cb.hContext = dev.h_context;
+    cb.hContext = ctx.handle.as_ptr();
     cb.BroadcastContextCount = 0;
 
     for i in 0..a.PresentPlaneCount as usize {
@@ -10988,7 +11021,7 @@ unsafe extern "C" fn dxgi_present_mpo(arg: *mut ddi::DXGI_DDI_ARG_PRESENTMULTIPL
             a.PresentPlaneCount,
             cb.AllocationInfoCount,
             hr as u32,
-            dev.h_context
+            ctx.handle.as_ptr()
         );
     }
     hr
@@ -11105,7 +11138,9 @@ unsafe extern "C" fn dxgi_present1(arg: *mut ddi::DXGI_DDI_ARG_PRESENT1) -> i32 
             log_error!(
                 "DXGI Present1 multi: missing callback table/context callbacks={} hContext={:p}",
                 dev.dxgi_callbacks.is_null(),
-                dev.h_context
+                dev.context
+                    .as_ref()
+                    .map_or(core::ptr::null_mut(), |c| c.handle.as_ptr())
             );
             return DXGI_ERROR_UNSUPPORTED;
         }
@@ -11114,7 +11149,10 @@ unsafe extern "C" fn dxgi_present1(arg: *mut ddi::DXGI_DDI_ARG_PRESENT1) -> i32 
         cb.hSrcAllocation = src_alloc;
         cb.hDstAllocation = dst_alloc;
         cb.pDXGIContext = a.pDXGIContext;
-        cb.hContext = dev.h_context;
+        cb.hContext = dev
+            .context
+            .as_ref()
+            .map_or(core::ptr::null_mut(), |c| c.handle.as_ptr());
         cb.BroadcastContextCount = 0;
         if let Some(ref private) = present_private {
             cb.PrivateDriverDataSize = core::mem::size_of::<HeliosPresentPrivateData>() as u32;

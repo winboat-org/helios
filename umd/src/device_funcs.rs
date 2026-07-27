@@ -80,6 +80,62 @@ pub struct RuntimePagingQueue {
     pub fence_value_cpu: core::ptr::NonNull<u64>,
 }
 
+/// One runtime-owned buffer window: a pointer and the capacity that describes
+/// it, which are only ever meaningful together.
+///
+/// Pre-R808 these were six independent `Cell`s (`command_buffer` +
+/// `command_buffer_size`, `allocation_list` + `allocation_list_size`,
+/// `patch_list` + `patch_list_size`), so a pointer could be updated without its
+/// size. Pairing them makes that unrepresentable.
+pub struct Window<T> {
+    pub ptr: core::ptr::NonNull<T>,
+    pub capacity: u32,
+}
+
+// Hand-written rather than derived: `derive` would add a `T: Copy` bound, and
+// the pointee types here (c_void, the DDI list structs) are not Copy. A window
+// is a pointer and an integer; copying it never copies a `T`.
+impl<T> Clone for Window<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<T> Copy for Window<T> {}
+
+impl<T> Window<T> {
+    /// `None` for a null pointer, which is how the runtime spells "no window".
+    /// A zero capacity is retained rather than rejected: `pfnRenderCb` returns
+    /// pointer/size pairs and only the pointer decides presence, exactly as the
+    /// pre-R808 `is_null()` checks did.
+    pub fn new(ptr: *mut T, capacity: u32) -> Option<Self> {
+        Some(Self {
+            ptr: core::ptr::NonNull::new(ptr)?,
+            capacity,
+        })
+    }
+}
+
+/// The kernel context every present path submits through, plus the three
+/// runtime-owned buffer windows that arrive with it.
+///
+/// Seven fields used to become meaningful together or not at all, depending on
+/// one `hr` the caller never saw — `create_runtime_context` returned unit — and
+/// every consumer re-derived the invariant by hand with its own
+/// `h_context.is_null()` test. `RuntimePagingQueue`, twenty lines above, already
+/// demonstrated the fix and even documented it; the context group was never
+/// converted. R808.
+///
+/// Stored as `Option<RuntimeContext>` exactly like `paging_queue`, so "context
+/// exists" is one check that yields a value in which a pointer and its capacity
+/// can never disagree.
+pub struct RuntimeContext {
+    pub handle: core::ptr::NonNull<c_void>,
+    /// Legacy command buffer recycled by `pfnRenderCb`.
+    pub command: core::cell::Cell<Option<Window<c_void>>>,
+    pub allocations: core::cell::Cell<Option<Window<ddi::D3DDDI_ALLOCATIONLIST>>>,
+    pub patches: core::cell::Cell<Option<Window<ddi::D3DDDI_PATCHLOCATIONLIST>>>,
+}
+
 /// Every COM object this device holds that came OUT of the bridge.
 ///
 /// `HeliosDevice` used to state an ownership rule — "declared before `dxvk` so
@@ -159,17 +215,10 @@ pub struct HeliosDevice {
     pub owned: BridgeOwned,
     pub dxvk: cxx::UniquePtr<bridge::ffi::HeliosDxvkDevice>,
     pub h_rt_device: ddi::HANDLE,
-    pub h_context: ddi::HANDLE,
-    /// Runtime-owned legacy command buffers returned by pfnCreateContextCb and
-    /// recycled by pfnRenderCb. DXVK submits the real Venus work separately,
-    /// but DXGI Present still needs a WDDM submission so dxgkrnl drives the
-    /// display flip queue.
-    pub command_buffer: core::cell::Cell<*mut core::ffi::c_void>,
-    pub command_buffer_size: core::cell::Cell<u32>,
-    pub allocation_list: core::cell::Cell<*mut ddi::D3DDDI_ALLOCATIONLIST>,
-    pub allocation_list_size: core::cell::Cell<u32>,
-    pub patch_list: core::cell::Cell<*mut ddi::D3DDDI_PATCHLOCATIONLIST>,
-    pub patch_list_size: core::cell::Cell<u32>,
+    /// The kernel context and its buffer windows, validated at construction.
+    /// `None` until `create_runtime_context` succeeds -- and CreateDevice now
+    /// refuses a device that never gets one, so a live device always has it.
+    pub context: Option<RuntimeContext>,
     pub kt_callbacks: *const ddi::D3DDDI_DEVICECALLBACKS,
     /// Created once with pfnCreatePagingQueueCb. WDDM 2.x residency is an
     /// explicit per-device list; allocation/patch lists do not make resources
@@ -627,18 +676,17 @@ pub unsafe fn destroy_runtime_objects(dev: &mut HeliosDevice) {
             }
         }
 
-        if !dev.h_context.is_null() {
+        if let Some(ctx) = dev.context.take() {
             if let Some(destroy_context_cb) = (*dev.kt_callbacks).pfnDestroyContextCb {
                 let arg = ddi::D3DDDICB_DESTROYCONTEXT {
-                    hContext: dev.h_context,
+                    hContext: ctx.handle.as_ptr(),
                 };
                 let hr = destroy_context_cb(dev.h_rt_device, &arg);
                 log_error!(
                     "DDI DestroyDevice: DestroyContext hContext={:p} hr=0x{:08x}",
-                    dev.h_context, hr as u32
+                    ctx.handle.as_ptr(), hr as u32
                 );
             }
-            dev.h_context = core::ptr::null_mut();
         }
     }
 }
@@ -677,13 +725,25 @@ pub unsafe fn create_runtime_context(dev: &mut HeliosDevice) -> i32 {
     if hr != 0 {
         return hr;
     }
-    dev.h_context = arg.hContext;
-    dev.command_buffer.set(arg.pCommandBuffer);
-    dev.command_buffer_size.set(arg.CommandBufferSize);
-    dev.allocation_list.set(arg.pAllocationList);
-    dev.allocation_list_size.set(arg.AllocationListSize);
-    dev.patch_list.set(arg.pPatchLocationList);
-    dev.patch_list_size.set(arg.PatchLocationListSize);
+    // The whole group becomes meaningful at once, or the call fails. A null
+    // hContext with hr == 0 would previously have left six companion fields set
+    // and every consumer to discover it five checks deep.
+    let Some(handle) = core::ptr::NonNull::new(arg.hContext) else {
+        log_error!("CreateDevice: CreateContext returned S_OK with a null hContext");
+        return E_FAIL;
+    };
+    dev.context = Some(RuntimeContext {
+        handle,
+        command: core::cell::Cell::new(Window::new(arg.pCommandBuffer, arg.CommandBufferSize)),
+        allocations: core::cell::Cell::new(Window::new(
+            arg.pAllocationList,
+            arg.AllocationListSize,
+        )),
+        patches: core::cell::Cell::new(Window::new(
+            arg.pPatchLocationList,
+            arg.PatchLocationListSize,
+        )),
+    });
     0
 }
 
