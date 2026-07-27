@@ -434,6 +434,83 @@ virtio-gpu scanout; IddCx/Looking Glass is no longer the active display path.*
    (`MmFreeContiguousMemory`), because `Drop::drop` has a fixed signature — which is why the
    transport parks completed buffers for `reap_parked` instead of letting the DISPATCH drain
    free one.
+7c. **T4b LANDED — gate PASSED (2026-07-27, KMD `22.22.187.0`, 16 commits).** 18 of the 22 listed
+   items implemented; **R716 and R717 were DEAD on arrival** — both live entirely inside
+   `ddi/gdi_blit.rs`, which T1b deleted under the owner's GDI directive (R903 pulled forward), so
+   the tranche is 20 items and all 20 are closed. **R904 (T6) landed FIRST**, as its cross-tranche
+   note requires: R704's segment typestate cannot express the topo-11 shape, so encoding the
+   must-be-last rule before that deletion would have changed behaviour rather than preserved it.
+   **The one real bug fixed here is R702, and it was LIVE, not latent.** `query_driver_caps` formed
+   `&mut *(pOutputData as *mut DXGK_DRIVERCAPS)` over a buffer the size gate deliberately permits
+   to be shorter than the 592-byte struct — UB independent of which fields are touched, plus a
+   Stacked-Borrows violation from writing through a second raw pointer while that reference was
+   live. The review left open whether 24H2 actually passes a short buffer; **it does**: the
+   `0x01CF` breadcrumb reads `0x240` = **576 bytes**, so the driver has been constructing that
+   reference on every AddAdapter. Now every field is written through a bounds-checked
+   `VersionedOut::set`; `CapTrunc` counts any field that will not fit.
+   **Gate evidence, all same boot (17:32:13) on 22.22.187.0:** cold boot to `CM_PROB_NONE` AND
+   `CM_PROB_NONE` after `pnputil /restart-device`, with a `Microsoft-Windows-DxgKrnl`
+   all-keywords ETW trace over the restart — **74,706 events, 0 lost, NO `AzureTriage` record**
+   (a real negative, not an empty capture). `kmd-gate-surface.ps1` → `GATE SURFACE CLEAN`.
+   Per-flip diag identical to the T4a/R614 baseline: `ScSet=1 ScFlu=3 VpDSt=0 DspMd=124257286
+   ScCpy=2 ScPch=7680`, `ScanoutDiag` absent, `AsSub == AsDone` exactly (1/1 idle, 58973/58973 and
+   87455/87455 under Fire Strike), `WtOut`/`CtOut` 0. Knobs byte-identical: `BarM=10 BarF=0x1C
+   BarB=0`. **Every new counter present and 0** — `CapTrunc SegRule SegDiv SegCntMis BarMCo EscHwA
+   EscNoSy ApMiss` — plus `IrqlBad` present and 0, and `OaBadH` absent (never fired). Visible
+   composited desktop via `helios_paintcap` after cold boot and after restart-device: full Win11
+   shell — maximized Notepad with menus/status bar, layered console, live taskbar with clock.
+   Host log same boot: `OPTIMAL DMA-BUF ready 1896x1030` twice, no venus decode/validation lines,
+   no Xid; the periodic `required=8773632 fd_size=7913472` shape mismatch and the paired
+   `glEGLImageTargetTexture2DOES failed: 0x502` are the pre-existing 38th-session class.
+   **Declared value changes, all three verified:** `0x01D6` now carries the aperture commit limit
+   in **MiB** (it was always `0x01D6_0000` because 64 MiB has no low 16 bits — useless for the one
+   thing it reports); `root_page_table_size_bytes` returns a derived size for `num_pte > 512`
+   (unreachable by the declared geometry); and R722's two colliding breadcrumbs moved —
+   HPD-worker-create-failed `0x0B00_00E7` → **`0x0B00_00EA`** and ExchangePreStartInfo
+   `0x0E00_0001/2` → **`0x0E10_0001/2`**. Both old and new values are recorded in `diag.rs`'s
+   encoding header. `BRINGUP_QUIRKS.md:172` cites `0x0E00_0001` as DestroyDevice entry and stays
+   correct; no ROADMAP recipe cited either.
+   **Measured:** Fire Strike **Graphics 20473** (Physics 34663, Combined 5439, Overall 16850) —
+   the highest of five samples against T4a's 19460/20312/20150 and R614's 20144, i.e. inside a
+   ~5 % spread that is wider than any tranche's effect; read no improvement into it either.
+   A full run completed with `AsSub == AsDone` at **227685/227685** and again at 250985/250985
+   after two DComp probes — zero leaked submissions across ~250k submits. DComp 25 s runs
+   **1308 / 1292** frames (52.3 / 51.7 fps), both `PROBE PASS`, inside 22.22.186.0's 1223/1319.
+   `AbnDrop` 0 idle → 70 after the soak, which is VidSch preempting under load, not a failure.
+   **Measurements this tranche added, and what they say:** `ApMiss` = 0 on the production
+   `DisplayHalf=1` shape, exactly as R718 predicted. `BlbSzD` = **1** — the empirical linear-blob
+   size guess (`NV_LINEAR_ROW_ALIGN` 128 + `NV_LINEAR_TAIL_SLACK` 64 KiB) disagreed with the exact
+   Vulkan requirement once this boot; that is the first quantification of how good that guess is.
+   **`PgSm` = 0 through a full Fire Strike run — the Present-time system-backing mirror NEVER
+   FIRES.** That is the deciding evidence R715 commit 2 was gated on: deleting the mirror is
+   cheaper than building a VidMm page lease for it. `EscHwA` = 0 likewise unblocks R706 sub-commit
+   (2) for a future image.
+   **Four scope deviations, all deliberate and all in the commit messages:** (a) `KnobName`
+   covers every knob READ (14 sites, now compile-checked at `cargo check` rather than only at
+   monomorphisation) plus a `const _: () = assert!` sweep over `FaultCounter::ALL`, but NOT the 478
+   `record_named_bytes` call sites; (b) R706 sub-commit (2) is count-only by owner decision, since
+   its evidence can only come from this image; (c) R715 commit 2 is owner-gated and only commit 1
+   landed — no newtype with a no-op `Drop`, which the review calls cosmetic; (d) R722's
+   `diag::codes` migration across ~20 files is skipped — its guarantee is weak by the review's own
+   admission and the defect it prevents is fixed directly here.
+   **One removed KeBugCheck site:** `write_patch_references`'s `debug_assert_eq!` was one of the
+   four `debug_assert!`s that SHIP in this image; `PatchCapacity` now carries the count that made
+   it structurally impossible. Three remain, all in the virtio layer.
+   **Stack:** deepest chain 17584 B (ceiling 17936, headroom 352), +16 B against T4a's 17568 —
+   `AdapterKnobs` and `SegmentTable` are new StartDevice locals and the optimizer folded all but
+   16 bytes.
+   ⚠ **NOT performed:** DOOM, rapid cursor motion (needs an interactive mouse — now SIX tranches
+   overdue), the `HELIOS_VKR_DEBUG=validate` host capture (owner-owned launcher relaunch), and the
+   `DiagLevel=1` S-ring diff of the `0x01D0`–`0x01D8` / `0x09*` records, which needs a SECOND
+   reboot because `DIAG_LEVEL` is cached at driver load and `restart-device` does not reload the
+   image. The caps and segment values were instead verified against the values the counters and
+   the AddAdapter success path expose. **Suspend/resume remains NOT TESTABLE** for the reason
+   recorded under 7b (`disable_s3=1`/`disable_s4=1` in `tools/launch-helios-gtk.sh`).
+   ⚠ **WS1 defect 0z reproduced unchanged and is NOT this tranche's:** 5 application faults this
+   boot, all `vulkan_virtio-*.dll` `0xc0000005`, all in dwm/Explorer/SearchHost/
+   StartMenuExperienceHost — every one already in the historical set of 9 processes, and the only
+   exception code ever seen. 1167 such faults now in the log (889 three weeks ago). NO non-ICD
+   application error this boot. `tools/icd-fault-history.ps1` is the A/B that establishes that.
 8. Implement the remaining reviewed refactors atomically, in tranche order, one recommendation
    per commit; never fold a `BUG` fix into a structure move. Preserve the current direct
    primary, completion ordering, loud-failure contracts, registry ABI, and

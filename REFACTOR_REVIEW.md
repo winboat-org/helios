@@ -4134,6 +4134,29 @@ others unless noted.
 
 ## T4b - Encode the caps, segment-topology, paging and handle invariants
 
+- **Status**: **LANDED — gate PASSED** (2026-07-27, KMD `22.22.187.0`, 16 commits). 20 items, not
+  22: **R716 and R717 were dead on arrival** because `ddi/gdi_blit.rs` no longer exists (T1b
+  deleted the whole GDI path under the owner directive, R903 pulled forward), exactly as this
+  section's own "Read before starting" note anticipated. **R904 landed FIRST**, per its
+  cross-tranche note. Full gate evidence in `ROADMAP.md` item 7c.
+  Three corrections this tranche establishes against hardware, all worth carrying forward:
+  1. **R702's UB was LIVE, not latent.** This section left open whether 24H2 ever passes a
+     short DRIVERCAPS buffer; the `0x01CF` breadcrumb reads **`0x240` = 576 bytes** against a
+     592-byte struct, so the `&mut *(pOutputData as *mut DXGK_DRIVERCAPS)` was being constructed
+     over a short referent on every AddAdapter. `CapTrunc` = 0 confirms all 540 written bytes fit.
+  2. **R705's ordering premise is measured, not assumed.** Moving table construction into
+     StartDevice is only sound if StartDevice precedes the first QUERYSEGMENT4. A `DiagLevel=1`
+     ring read off the live box shows StartDevice entry/exit (`0x0B00_0001` .. `0x0B00_0004`)
+     completing before the first QueryAdapterInfo (`0x0100_0001`), with the segment queries after.
+  3. **R715's deciding measurement came back 0.** `PgSm` stayed 0 through a full Fire Strike run —
+     the Present-time system-backing mirror never fires — so commit 2 should DELETE the mirror
+     rather than build a VidMm page lease for it. That was the evidence this item gated on.
+  Four deviations, each argued in its commit message: `KnobName` covers knob reads and the fault
+  counter set but not the 478 `record_named_bytes` sites; R706 sub-commit (2) is deferred
+  (count-only, by owner decision, since its evidence can only come from this image); R715 commit 2
+  is owner-gated; R722's `diag::codes` sweep is skipped in favour of fixing the two collisions
+  directly.
+
 This tranche turns the AddAdapter-surface and paging-engine obligations that today live in comments into types: one `WddmSurface` value instead of a nested lever expression copy-pasted at five coupled sites, a per-field bounded writer instead of a `&mut DXGK_DRIVERCAPS` over a short versioned buffer, a validating `SegmentTable` that owns the "a SupportsCpuHostAperture segment must be LAST" rule instead of hand-ordered positional match arms over a `BarSegMode` DWORD, an `EscapeBuf` plus a first-ever read of `DXGKARG_ESCAPE.Flags`, a typed traversal for every dxgkrnl handle, and - on the paging side - a total parse of both command streams (`DXGKARG_BUILDPAGINGBUFFER`'s union and the RenderGdi batch), a guard-based spinlock, a `Passive` proof token, and a `PatchCapacity` token for the validate-before-host-work rule. It sits after T3 because T3 already reshaped `display.rs`'s Present path and installed the `WddmNotifyGuard` branding these items build next to, and after T1a/T1b because two of the defects those tranches fix live in the exact lines edited here (`k-paging-05`'s ungated registry dump at `build_paging_buffer.rs:918`, `k-paging-01`/`06`/`07`/`08` in `gdi_blit.rs`). It does **not** touch the direct-primary publication path, the refresh-marker watermark, `SetVidPnSourceAddress`, the UMD/DXVK side, the venus wire protocol (T4a), or any knob/counter *name*; the only recorded values that change are the two colliding breadcrumbs in R722 and the `0x01D6` encoding in R720, both declared. One item (R715) is an owner-decision gate and must not block the rest.
 
 **Read before starting**: T6's `x-dup-dead-20` may delete `gdi_blit.rs` outright. R716 and R717 are both inside that file - confirm the deletion decision first; if it is approved, skip them.
