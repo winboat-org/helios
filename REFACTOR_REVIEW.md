@@ -3664,6 +3664,23 @@ were dropped from the plan entirely (noted per item).
 
 ### R614. Express the PASSIVE-only contract of `virtio::ctrl` as a proof token
 
+- **LANDED 2026-07-27 — its own tranche, its own KMD image (`22.22.186.0`, 8 commits), gate
+  PASSED.** See `ROADMAP.md` item 7b for the result. Three parts of the "Change" and
+  "Validation" text below were WRONG and were deliberately not followed; they are left in place
+  so the reasoning is auditable, but do not copy them:
+  1. `&PassiveLevel` → implemented **BY VALUE**. A reference to a ZST is a real 8-byte pointer
+     per frame, and the token threads through the boot chain that had 368 bytes of headroom.
+     Measured before/after on the built image: every frame byte-for-byte unchanged.
+  2. `debug_assert!(KeGetCurrentIrql() == PASSIVE_LEVEL)` → implemented as a **counted refusal**
+     (`IrqlBad`). `kmd_render`'s `[profile.dev]` does not disable debug-assertions and cargo-make
+     ships that profile, so the assert would have been a live `KeBugCheck` inside a DDI — the
+     class R601 spent four commits removing — and `verify-no-panics` greps only
+     `.unwrap()`/`.expect(`, so it would not have caught it. The "a debug build with the
+     assertion must survive…" validation line is therefore also wrong: the assertion is live in
+     the SHIPPED build, and what the gate actually checks is that `IrqlBad` reads 0.
+  3. "33 signatures plus caller groups; the compiler finds every site" → ~130 sites, and only
+     after re-scoping from the venus layer outward per the note below. Straight from `ctrl`
+     inward it is ~190.
 - **RE-SCOPED, NOT DECLINED — owner decision 2026-07-27 (reversing the same day's decline):
   worth implementing, as its own tranche and its own KMD image.** The effort estimate below ("33 signatures plus caller groups; the compiler finds every site")
   is wrong by roughly 6x. Measured against the tree at KMD 22.22.184.0 the change is **~190
