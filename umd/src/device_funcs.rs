@@ -80,14 +80,83 @@ pub struct RuntimePagingQueue {
     pub fence_value_cpu: core::ptr::NonNull<u64>,
 }
 
+/// Every COM object this device holds that came OUT of the bridge.
+///
+/// `HeliosDevice` used to state an ownership rule — "declared before `dxvk` so
+/// entries release their D3D11 textures before the bridge device drops" — and
+/// enforce it with field declaration order for exactly ONE of its four
+/// COM-owning fields. `scanout_import`, `composition_source` and `ia` all sat
+/// *after* `dxvk`, so all three dropped after the bridge `UniquePtr` had run
+/// `~HeliosDxvkDeviceImpl`. `ia` was patched around explicitly in
+/// `ddi_destroy_device`; the other two were not.
+///
+/// Nothing has crashed because DXVK's `D3D11DeviceChild` holds a strong parent
+/// reference, so a surviving child keeps the device alive. The concrete defect
+/// is that the stated invariant was false, and the next COM-owning field added
+/// below `dxvk` would inherit an unreviewed assumption — a bridge-derived
+/// object that does NOT take a parent reference (a raw Vulkan-side handle, or a
+/// DXGI object owned by the impl) would touch freed state in its `Drop`.
+///
+/// Grouping them into one field placed before `dxvk` encodes the rule for all
+/// present and future members at once. [`BridgeOwned::release`] then makes
+/// correctness not depend on drop order at all; `Drop` remains as the
+/// rollback/panic path. R807.
+pub struct BridgeOwned {
+    /// Dcomp present-vehicle source cache. Same single-threaded-DDI RefCell
+    /// contract as `ia`.
+    pub present_src_cache: core::cell::RefCell<Vec<PresentSrcEntry>>,
+    /// Owned direct-LINEAR import of the KMD VidPn primary. Only DWM creates
+    /// this; ordinary application devices never query or touch scanout 0.
+    pub scanout_import: core::cell::RefCell<KmdScanoutTarget>,
+    /// Owned reference to DWM's currently-bound full-mode optimal render target.
+    pub composition_source: core::cell::RefCell<Option<ID3D11Resource>>,
+    /// Input-assembler state for lazy `ID3D11InputLayout` creation. The
+    /// d3d10umddi `CreateElementLayout` DDI does NOT pass the vertex-shader
+    /// input-signature bytecode that `ID3D11Device::CreateInputLayout`
+    /// requires, so we stash the element descs + the bound VS bytecode and
+    /// create the layout lazily at draw.
+    pub ia: core::cell::RefCell<IaState>,
+}
+
+impl BridgeOwned {
+    pub fn new() -> Self {
+        Self {
+            present_src_cache: core::cell::RefCell::new(Vec::new()),
+            scanout_import: core::cell::RefCell::new(KmdScanoutTarget::Unprobed),
+            composition_source: core::cell::RefCell::new(None),
+            ia: core::cell::RefCell::new(IaState::default()),
+        }
+    }
+
+    /// Release every bridge-derived COM object, explicitly and in order, while
+    /// the bridge device is still alive.
+    ///
+    /// Returns the IA cache's `(variants, layouts)` so the existing
+    /// `DDI DestroyDevice: released IA cache variants=N layouts=M` line keeps
+    /// its counts verbatim.
+    ///
+    /// Must be called on EVERY teardown path — `ddi_destroy_device` and the
+    /// `CreateDevice` rollback. If it is missed, the refs do not leak forever,
+    /// but they move from "released here" to "released whenever the field
+    /// drops", which is the ordering this type exists to stop depending on.
+    pub fn release(&mut self) -> (usize, usize) {
+        // Order: caches and imports first, IA last, matching the pre-R807
+        // sequence where `ia` was the field released explicitly.
+        self.present_src_cache.get_mut().clear();
+        *self.scanout_import.get_mut() = KmdScanoutTarget::Unprobed;
+        *self.composition_source.get_mut() = None;
+        self.ia.get_mut().release_owned_com()
+    }
+}
+
 /// Per-device UMD state, constructed in-place in the runtime-allocated private
 /// device memory (size = [`device_private_size`]). Owns the DXVK device the cxx
 /// bridge created on the Helios venus adapter.
 pub struct HeliosDevice {
-    /// Dcomp present-vehicle source cache (declared before `dxvk` so entries
-    /// release their D3D11 textures before the bridge device drops). Same
-    /// single-threaded-DDI RefCell contract as `ia`.
-    pub present_src_cache: core::cell::RefCell<Vec<PresentSrcEntry>>,
+    /// Everything this device owns that came OUT of the bridge, in one field
+    /// declared before `dxvk`. See [`BridgeOwned`] for why the position and
+    /// the explicit `release()` both exist.
+    pub owned: BridgeOwned,
     pub dxvk: cxx::UniquePtr<bridge::ffi::HeliosDxvkDevice>,
     pub h_rt_device: ddi::HANDLE,
     pub h_context: ddi::HANDLE,
@@ -117,9 +186,6 @@ pub struct HeliosDevice {
     pub scanout_width: core::cell::Cell<u32>,
     pub scanout_height: core::cell::Cell<u32>,
     pub scanout_format: core::cell::Cell<u32>,
-    /// Owned direct-LINEAR import of the KMD VidPn primary. Only DWM creates
-    /// this; ordinary application devices never query or touch scanout 0.
-    pub scanout_import: core::cell::RefCell<KmdScanoutTarget>,
     pub scanout_generation: core::cell::Cell<u32>,
     /// Bumped whenever this UMD observes something that could change the KMD's
     /// scanout: a direct-scanout primary created or destroyed. An `Unavailable`
@@ -131,18 +197,11 @@ pub struct HeliosDevice {
     /// handle, so the allocation is the authoritative lookup key.
     pub direct_scanout_allocations:
         core::cell::RefCell<Vec<(u32, helios_protocol::HeliosPresentPrivateData)>>,
-    /// Owned reference to DWM's currently-bound full-mode optimal render target.
-    pub composition_source: core::cell::RefCell<Option<ID3D11Resource>>,
     pub scanout_copy_count: core::cell::Cell<u64>,
     /// Runtime corelayer handle + callbacks (pfnSetErrorCb) so VOID-returning
     /// DDIs can report failures to the runtime instead of leaving null handles.
     pub h_rt_core_layer: *mut core::ffi::c_void,
     pub um_callbacks: *const core::ffi::c_void,
-    /// Input-assembler state for lazy `ID3D11InputLayout` creation. The d3d10umddi
-    /// `CreateElementLayout` DDI does NOT pass the vertex-shader input-signature
-    /// bytecode that `ID3D11Device::CreateInputLayout` requires, so we stash the
-    /// element descs + the bound VS bytecode and create the layout lazily at draw.
-    pub ia: core::cell::RefCell<IaState>,
     /// Kernel-enforced vehicle flip ordering (forward.rs::flip_wait_setup):
     /// 0 = unprobed, 1 = ready, 2 = disabled (knob off / setup failed —
     /// counted + logged once; the bounded CPU gate serves instead). Same
@@ -536,7 +595,10 @@ unsafe extern "C" fn ddi_destroy_device(h_device: ddi::D3D10DDI_HDEVICE) {
     crate::forward::unregister_live_device(h_device.pDrvPrivate as usize);
     if !h_device.pDrvPrivate.is_null() {
         let dev = &mut *(h_device.pDrvPrivate as *mut HeliosDevice);
-        let (variants, layouts) = dev.ia.get_mut().release_owned_com();
+        // One explicit release of everything bridge-derived, while the bridge
+        // device is still alive. Pre-R807 this released `ia` only; the other
+        // three COM owners relied on a drop order that did not hold.
+        let (variants, layouts) = dev.owned.release();
         log_error!(
             "DDI DestroyDevice: released IA cache variants={} layouts={}",
             variants, layouts

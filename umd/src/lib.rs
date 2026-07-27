@@ -833,7 +833,11 @@ unsafe extern "C" fn create_device(
         core::ptr::write(
             create.hDrvDevice.pDrvPrivate as *mut device_funcs::HeliosDevice,
             device_funcs::HeliosDevice {
-                present_src_cache: core::cell::RefCell::new(Vec::new()),
+                // One grouped field, constructed (and declared) before `dxvk`
+                // so every bridge-derived COM object it holds outlives the
+                // bridge device rather than three of the four dropping after
+                // it. R807.
+                owned: device_funcs::BridgeOwned::new(),
                 dxvk,
                 h_rt_device: create.hRTDevice.handle,
                 h_context: core::ptr::null_mut(),
@@ -855,17 +859,12 @@ unsafe extern "C" fn create_device(
                 scanout_width: core::cell::Cell::new(0),
                 scanout_height: core::cell::Cell::new(0),
                 scanout_format: core::cell::Cell::new(0),
-                scanout_import: core::cell::RefCell::new(
-                    device_funcs::KmdScanoutTarget::Unprobed,
-                ),
                 scanout_generation: core::cell::Cell::new(0),
                 scanout_epoch: core::cell::Cell::new(0),
                 direct_scanout_allocations: core::cell::RefCell::new(Vec::new()),
-                composition_source: core::cell::RefCell::new(None),
                 scanout_copy_count: core::cell::Cell::new(0),
                 h_rt_core_layer: create.hRTCoreLayer.handle,
                 um_callbacks: p_um_callbacks.cast(),
-                ia: core::cell::RefCell::new(device_funcs::IaState::default()),
                 flip_wait_state: core::cell::Cell::new(0),
                 flip_wait_fence: core::cell::Cell::new(0),
                 flip_wait_next_value: core::cell::Cell::new(0),
@@ -984,6 +983,16 @@ impl Drop for DeviceUnderConstruction {
         // runtime does not see the handle until `defuse()` runs — so no other
         // reference exists during teardown.
         unsafe {
+            // The CreateDevice rollback path is the second place BridgeOwned
+            // must be released explicitly (R807): reaching it means the bridge
+            // device exists but the runtime never saw the handle, and letting
+            // the refs go out with `drop_in_place` would put them back on the
+            // drop order this type exists to stop depending on.
+            let (variants, layouts) = (*self.dev).owned.release();
+            log_error!(
+                "CreateDevice rollback: released IA cache variants={} layouts={}",
+                variants, layouts
+            );
             device_funcs::destroy_runtime_objects(&mut *self.dev);
             core::ptr::drop_in_place(self.dev);
         }

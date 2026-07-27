@@ -1016,7 +1016,7 @@ unsafe fn ensure_kmd_scanout_target(h: Hdevice) -> bool {
         return false;
     };
     let epoch = dev.scanout_epoch.get();
-    match &*dev.scanout_import.borrow() {
+    match &*dev.owned.scanout_import.borrow() {
         KmdScanoutTarget::Ready(_) => return true,
         // The negative half of the cache: without it, any of (a)
         // primary_scanout_resource == 0, (b) resource_is_live false, (c) the
@@ -1042,7 +1042,7 @@ unsafe fn ensure_kmd_scanout_target(h: Hdevice) -> bool {
         )
     };
     if raw == 0 {
-        dev.scanout_import
+        dev.owned.scanout_import
             .replace(KmdScanoutTarget::Unavailable { at_epoch: epoch });
         if let Some(n) = SCANOUT_UNAVAILABLE_LOG_COUNT.first_n_then_every(16, 512) {
             log_error!(
@@ -1063,7 +1063,7 @@ unsafe fn ensure_kmd_scanout_target(h: Hdevice) -> bool {
     // The target VkImage is BGRA; virtio scanout ignores alpha as XR24.
     dev.scanout_format.set(87);
     dev.scanout_generation.set(generation);
-    dev.scanout_import.replace(KmdScanoutTarget::Ready(target));
+    dev.owned.scanout_import.replace(KmdScanoutTarget::Ready(target));
     log_error!(
         "DWM KMD scanout import ready: res_id={} {}x{} pitch={} gen={}",
         resource_id, width, height, pitch, generation
@@ -1113,6 +1113,7 @@ unsafe fn track_dwm_composition_target(
     }
 
     if dev
+        .owned
         .composition_source
         .borrow()
         .as_ref()
@@ -1125,7 +1126,7 @@ unsafe fn track_dwm_composition_target(
     // this a borrowed COM wrapper; clone takes the owned reference we retain.
     let borrowed =
         ManuallyDrop::new(unsafe { ID3D11Resource::from_raw(resource_raw as *mut c_void) });
-    dev.composition_source.replace(Some((*borrowed).clone()));
+    dev.owned.composition_source.replace(Some((*borrowed).clone()));
     log_error!(
         "DWM composition target selected: raw=0x{:x} {}x{} fmt={}",
         resource_raw, width, height, format
@@ -1142,8 +1143,8 @@ unsafe fn publish_dwm_composition(context: &ID3D11DeviceContext, h: Hdevice) -> 
     let Some(dev) = helios_device(h) else {
         return false;
     };
-    let source = dev.composition_source.borrow();
-    let target = dev.scanout_import.borrow();
+    let source = dev.owned.composition_source.borrow();
+    let target = dev.owned.scanout_import.borrow();
     let (Some(source), KmdScanoutTarget::Ready(target)) = (source.as_ref(), &*target) else {
         return false;
     };
@@ -4135,7 +4136,7 @@ unsafe extern "C" fn create_vertex_shader(
         store_raw_com(h_shader, raw);
         // Keep the bytecode so input layouts can be created lazily (the ISGN
         // supplies the semantic names CreateInputLayout requires).
-        dev.ia.borrow_mut().vs_bytecode.insert(raw, bytes.to_vec());
+        dev.owned.ia.borrow_mut().vs_bytecode.insert(raw, bytes.to_vec());
     } else {
         log_error!("DDI create_vertex_shader failed");
     }
@@ -4433,7 +4434,7 @@ unsafe fn create_shader_11_1_common(
             // Keep the bytecode so input layouts can be created lazily, and
             // the signature words so input-class variants can be recompiled
             // against the bound layout (resolve_vs_input_variant).
-            let mut ia = dev.ia.borrow_mut();
+            let mut ia = dev.owned.ia.borrow_mut();
             ia.vs_bytecode.insert(raw, bytes.to_vec());
             ia.vs_sig_words.insert(raw, sig_words);
         }
@@ -4761,7 +4762,7 @@ unsafe extern "C" fn destroy_shader(h: Hdevice, h_shader: ddi::D3D10DDI_HSHADER)
         if let Some(dev) = helios_device(h) {
             let mut owned = std::collections::HashSet::new();
             let was_vertex_shader = {
-                let mut ia = dev.ia.borrow_mut();
+                let mut ia = dev.owned.ia.borrow_mut();
                 let had_bytecode = ia.vs_bytecode.remove(&raw).is_some();
                 let had_signature = ia.vs_sig_words.remove(&raw).is_some();
                 let was_vertex_shader = had_bytecode || had_signature;
@@ -4816,7 +4817,7 @@ unsafe extern "C" fn destroy_shader(h: Hdevice, h_shader: ddi::D3D10DDI_HSHADER)
 unsafe extern "C" fn vs_set_shader(h: Hdevice, h_shader: ddi::D3D10DDI_HSHADER) {
     let com = handle_com_raw(h_shader);
     if let Some(dev) = helios_device(h) {
-        let mut ia = dev.ia.borrow_mut();
+        let mut ia = dev.owned.ia.borrow_mut();
         ia.current_vs = com;
         ia.bound_vs_com = com;
     }
@@ -4835,7 +4836,7 @@ unsafe extern "C" fn vs_set_shader(h: Hdevice, h_shader: ddi::D3D10DDI_HSHADER) 
 unsafe extern "C" fn ps_set_shader(h: Hdevice, h_shader: ddi::D3D10DDI_HSHADER) {
     let com = handle_com_raw(h_shader);
     if let Some(dev) = helios_device(h) {
-        dev.ia.borrow_mut().current_ps = com;
+        dev.owned.ia.borrow_mut().current_ps = com;
     }
     if SHADER_SET_LOG_COUNT.first_n(512).is_some() {
         trace_line!("DDI PSSetShader raw=0x{com:x}");
@@ -4852,7 +4853,7 @@ unsafe extern "C" fn ps_set_shader(h: Hdevice, h_shader: ddi::D3D10DDI_HSHADER) 
 unsafe extern "C" fn gs_set_shader(h: Hdevice, h_shader: ddi::D3D10DDI_HSHADER) {
     let com = handle_com_raw(h_shader);
     if let Some(dev) = helios_device(h) {
-        dev.ia.borrow_mut().current_gs = com;
+        dev.owned.ia.borrow_mut().current_gs = com;
     }
     if SHADER_SET_LOG_COUNT.first_n(512).is_some() {
         trace_line!("DDI GSSetShader raw=0x{com:x}");
@@ -4869,7 +4870,7 @@ unsafe extern "C" fn gs_set_shader(h: Hdevice, h_shader: ddi::D3D10DDI_HSHADER) 
 unsafe extern "C" fn hs_set_shader(h: Hdevice, h_shader: ddi::D3D10DDI_HSHADER) {
     let com = handle_com_raw(h_shader);
     if let Some(dev) = helios_device(h) {
-        dev.ia.borrow_mut().current_hs = com;
+        dev.owned.ia.borrow_mut().current_hs = com;
     }
     if SHADER_SET_LOG_COUNT.first_n(512).is_some() {
         trace_line!("DDI HSSetShader raw=0x{com:x}");
@@ -4886,7 +4887,7 @@ unsafe extern "C" fn hs_set_shader(h: Hdevice, h_shader: ddi::D3D10DDI_HSHADER) 
 unsafe extern "C" fn ds_set_shader(h: Hdevice, h_shader: ddi::D3D10DDI_HSHADER) {
     let com = handle_com_raw(h_shader);
     if let Some(dev) = helios_device(h) {
-        dev.ia.borrow_mut().current_ds = com;
+        dev.owned.ia.borrow_mut().current_ds = com;
     }
     if SHADER_SET_LOG_COUNT.first_n(512).is_some() {
         trace_line!("DDI DSSetShader raw=0x{com:x}");
@@ -4903,7 +4904,7 @@ unsafe extern "C" fn ds_set_shader(h: Hdevice, h_shader: ddi::D3D10DDI_HSHADER) 
 unsafe extern "C" fn cs_set_shader(h: Hdevice, h_shader: ddi::D3D10DDI_HSHADER) {
     let com = handle_com_raw(h_shader);
     if let Some(dev) = helios_device(h) {
-        dev.ia.borrow_mut().current_cs = com;
+        dev.owned.ia.borrow_mut().current_cs = com;
     }
     if SHADER_SET_LOG_COUNT.first_n(512).is_some() {
         trace_line!("DDI CSSetShader raw=0x{com:x}");
@@ -5020,7 +5021,7 @@ unsafe extern "C" fn set_render_targets(
         views.push(view);
     }
     if let Some(dev) = helios_device(h) {
-        let mut ia = dev.ia.borrow_mut();
+        let mut ia = dev.owned.ia.borrow_mut();
         ia.current_rt0_alloc = rt0.0;
         ia.current_rt0_width = rt0.1;
         ia.current_rt0_height = rt0.2;
@@ -5177,7 +5178,7 @@ unsafe extern "C" fn set_text_filter_size(_h: Hdevice, _w: u32, _hgt: u32) {}
 
 unsafe extern "C" fn ia_set_topology(h: Hdevice, topo: ddi::D3D10_DDI_PRIMITIVE_TOPOLOGY) {
     if let Some(dev) = helios_device(h) {
-        dev.ia.borrow_mut().current_topology = topo as u32;
+        dev.owned.ia.borrow_mut().current_topology = topo as u32;
     }
     if IA_BIND_LOG_COUNT.first_n(64).is_some() {
         trace_line!("DDI IASetTopology topo={}", topo as u32);
@@ -5199,7 +5200,7 @@ unsafe fn log_draw_state(
 ) {
     // Gate the WHOLE function, not just the write: this runs from all seven
     // draw entry points, and with tracing off it used to pay an atomic
-    // fetch_add on every draw plus a `dev.ia.borrow()` and a heap-allocating
+    // fetch_add on every draw plus a `dev.owned.ia.borrow()` and a heap-allocating
     // 21-argument `format!` on the first 1024 draws and every 1024th after —
     // through the unconditional mutex-serialised writer. A game issuing 2000
     // draws per frame at 60 fps meant ~120 file writes per second from the draw
@@ -5215,7 +5216,7 @@ unsafe fn log_draw_state(
     let Some(dev) = helios_device(h) else {
         return;
     };
-    let ia = dev.ia.borrow();
+    let ia = dev.owned.ia.borrow();
     trace_line!(
         "DDI {kind}: a={} b={} c={} d={} topo={} vb0=0x{:x}/{}+{} ib=0x{:x}/fmt{}+{} vs=0x{:x} ps=0x{:x} gs=0x{:x} hs=0x{:x} ds=0x{:x} rt0_alloc=0x{:x} rt0={}x{} fmt={} layout=0x{:x}",
         count0,
@@ -7210,7 +7211,7 @@ unsafe extern "C" fn check_counter(
 unsafe extern "C" fn dispatch(h: Hdevice, x: u32, y: u32, z: u32) {
     if DISPATCH_LOG_COUNT.first_n_then_every(1024, 1024).is_some() {
         if let Some(dev) = helios_device(h) {
-            let ia = dev.ia.borrow();
+            let ia = dev.owned.ia.borrow();
             trace_line!(
                 "DDI Dispatch x={} y={} z={} cs=0x{:x} rt0_alloc=0x{:x} rt0={}x{} fmt={}",
                 x,
@@ -8232,7 +8233,7 @@ unsafe extern "C" fn destroy_element_layout(h: Hdevice, h_el: ddi::D3D10DDI_HELE
     if p != 0 {
         let mut owned = std::collections::HashSet::new();
         if let Some(dev) = helios_device(h) {
-            let mut ia = dev.ia.borrow_mut();
+            let mut ia = dev.owned.ia.borrow_mut();
             ia.layout_cache.retain(|&(layout, _), cached| {
                 if layout == p {
                     if *cached != 0 {
@@ -8267,7 +8268,7 @@ unsafe extern "C" fn ia_set_input_layout(h: Hdevice, h_el: ddi::D3D10DDI_HELEMEN
             Some(slot) => slot.word(),
             None => 0,
         };
-        dev.ia.borrow_mut().current_layout = p;
+        dev.owned.ia.borrow_mut().current_layout = p;
     }
 }
 
@@ -8278,7 +8279,7 @@ unsafe fn bind_input_layout(h: Hdevice) {
         return;
     };
     let (lp, vp) = {
-        let ia = dev.ia.borrow();
+        let ia = dev.owned.ia.borrow();
         (ia.current_layout, ia.current_vs)
     };
     if lp == 0 || vp == 0 {
@@ -8290,11 +8291,11 @@ unsafe fn bind_input_layout(h: Hdevice) {
         }
         return;
     }
-    let cached = dev.ia.borrow().layout_cache.get(&(lp, vp)).copied();
+    let cached = dev.owned.ia.borrow().layout_cache.get(&(lp, vp)).copied();
     let il_raw = match cached {
         Some(p) => p,
         None => {
-            let bytecode = match dev.ia.borrow().vs_bytecode.get(&vp) {
+            let bytecode = match dev.owned.ia.borrow().vs_bytecode.get(&vp) {
                 Some(b) => b.clone(),
                 None => {
                     log_error!(
@@ -8379,7 +8380,7 @@ unsafe fn bind_input_layout(h: Hdevice) {
                             descs.len(),
                             raw
                         );
-                        dev.ia.borrow_mut().layout_cache.insert((lp, vp), raw);
+                        dev.owned.ia.borrow_mut().layout_cache.insert((lp, vp), raw);
                         raw
                     }
                     None => return,
@@ -8466,12 +8467,12 @@ unsafe fn resolve_vs_input_variant(h: Hdevice, lp: usize, vp: usize) {
         for &(r, c, _) in &classes {
             key = (key ^ (((r as u64) << 8) | c as u64)).wrapping_mul(0x0000_0100_0000_01b3);
         }
-        let cached = dev.ia.borrow().vs_variants.get(&(vp, key)).copied();
+        let cached = dev.owned.ia.borrow().vs_variants.get(&(vp, key)).copied();
         let variant = match cached {
             Some(v) => v,
             None => {
                 let v = create_vs_input_variant(dev, vp, &classes);
-                dev.ia.borrow_mut().vs_variants.insert((vp, key), v);
+                dev.owned.ia.borrow_mut().vs_variants.insert((vp, key), v);
                 v
             }
         };
@@ -8482,7 +8483,7 @@ unsafe fn resolve_vs_input_variant(h: Hdevice, lp: usize, vp: usize) {
         }
     };
 
-    if dev.ia.borrow().bound_vs_com == desired {
+    if dev.owned.ia.borrow().bound_vs_com == desired {
         return;
     }
     let Some(context) = d3d11_context(h) else {
@@ -8490,7 +8491,7 @@ unsafe fn resolve_vs_input_variant(h: Hdevice, lp: usize, vp: usize) {
     };
     let s = ManuallyDrop::new(ID3D11VertexShader::from_raw(desired as *mut c_void));
     context.VSSetShader(&*s, None);
-    dev.ia.borrow_mut().bound_vs_com = desired;
+    dev.owned.ia.borrow_mut().bound_vs_com = desired;
     if SHADER_BIND_LOG_COUNT.first_n(256).is_some() {
         trace_line!("DDI VS input-class variant bound: vs=0x{vp:x} -> 0x{desired:x}");
     }
@@ -8505,7 +8506,7 @@ unsafe fn create_vs_input_variant(
     classes: &[(u32, u32, u32)],
 ) -> usize {
     let (bytecode, mut words) = {
-        let ia = dev.ia.borrow();
+        let ia = dev.owned.ia.borrow();
         let Some(b) = ia.vs_bytecode.get(&vp) else {
             log_error!("VS variant: no bytecode for vs=0x{vp:x}");
             return 0;
@@ -8581,7 +8582,7 @@ unsafe extern "C" fn ia_set_vertex_buffers(
         bufs.push(load_resource(p).and_then(|r| (*r).cast::<ID3D11Buffer>().ok()));
     }
     if let Some(dev) = helios_device(h) {
-        let mut ia = dev.ia.borrow_mut();
+        let mut ia = dev.owned.ia.borrow_mut();
         if start == 0 && num != 0 {
             ia.current_vb0 = bufs
                 .first()
@@ -8634,7 +8635,7 @@ unsafe extern "C" fn ia_set_index_buffer(
     };
     let buf = load_resource(h_buf.pDrvPrivate).and_then(|r| (*r).cast::<ID3D11Buffer>().ok());
     if let Some(dev) = helios_device(h) {
-        let mut ia = dev.ia.borrow_mut();
+        let mut ia = dev.owned.ia.borrow_mut();
         ia.current_ib = buf.as_ref().map(|b| b.as_raw() as usize).unwrap_or(0);
         ia.current_ib_format = format as u32;
         ia.current_ib_offset = offset;
@@ -9315,7 +9316,7 @@ unsafe fn vehicle_present_prepare(
     // Cached alias-import by resid; geometry/format change invalidates the
     // entry (swapchain recreates give new resids, so also cap the cache).
     let mut imported_raw = {
-        let mut cache = dev.present_src_cache.borrow_mut();
+        let mut cache = dev.owned.present_src_cache.borrow_mut();
         match cache.iter().position(|e| e.resid == info.resid) {
             Some(pos)
                 if cache[pos].width == info.width
@@ -9365,7 +9366,7 @@ unsafe fn vehicle_present_prepare(
             }
             return Err(E_FAIL);
         }
-        let mut cache = dev.present_src_cache.borrow_mut();
+        let mut cache = dev.owned.present_src_cache.borrow_mut();
         if cache.len() >= 16 {
             cache.remove(0);
         }
