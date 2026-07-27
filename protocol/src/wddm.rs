@@ -90,7 +90,14 @@ pub struct HeliosWddmAllocPrivate {
     pub ctx_id: u32,  // in:  owning venus context id
     pub map_cache: u32, // in/out: requested/effective VIRTIO_GPU_MAP_CACHE_*
     pub kind: u32,    // in:  HELIOS_WDDM_ALLOC_KIND_*
-    pub _pad: u32,    // in:  optional existing virtio resource id to adopt
+    /// Optional existing virtio resource id for the KMD to adopt instead of
+    /// creating a new one (0 = create). Named `_pad` until R805, which is why
+    /// several comments in this tree still call the scheme "smuggling": the
+    /// name advertised the field as unused while it was load-bearing, so an
+    /// edit that zeroed it, reordered it, or inserted a field before it would
+    /// have silently detached every device-memory allocation from its venus
+    /// resource with the `size_of == 48` assert still passing.
+    pub adopt_resource_id: u32,
 }
 
 impl HeliosWddmAllocPrivate {
@@ -102,6 +109,7 @@ impl HeliosWddmAllocPrivate {
         blob_mem: u32,
         blob_flags: u32,
         map_cache: u32,
+        adopt_resource_id: u32,
     ) -> Self {
         Self {
             blob_id,
@@ -113,7 +121,7 @@ impl HeliosWddmAllocPrivate {
             ctx_id,
             map_cache,
             kind,
-            _pad: 0,
+            adopt_resource_id,
         }
     }
 
@@ -214,7 +222,8 @@ pub const HELIOS_WDDM_IDENTITY_VERSION: u32 = 1;
 /// data in `DxgkDdiOpenAllocation`, overwriting the first 48 bytes (the
 /// [`HeliosWddmAllocPrivate`] region — the [`HeliosWddmAllocMeta`] trailer at
 /// bytes 48.. is left as the creator wrote it). This replaces the old scheme of
-/// smuggling the venus resource id through `HeliosWddmAllocPrivate::_pad`.
+/// smuggling the venus resource id through the field then named
+/// `HeliosWddmAllocPrivate::_pad` (now `adopt_resource_id`; R805).
 ///
 /// The KMD only writes this record after validating `resource_id` against its
 /// live-resource table (the KMD owns the resid namespace: every create and every
@@ -418,7 +427,7 @@ pub enum ClassifyRefusal {
 /// Decide one allocation's backing class. Pure: no adapter, no host round-trip,
 /// no side effect — which is what makes the five arms unit-testable.
 ///
-/// `supplied_resource_id` is the id the UMD passed in `_pad`, already filtered
+/// `supplied_resource_id` is the id the UMD passed in `adopt_resource_id`, already filtered
 /// by kind (STANDARD and DEVICE_MEMORY carry one; SHMEM does not).
 ///
 /// ORDER IS LOAD-BEARING and reproduces the old if/else chain exactly:
@@ -482,7 +491,10 @@ mod classify_tests {
     use super::*;
 
     fn private(kind: u32) -> HeliosWddmAllocPrivate {
-        HeliosWddmAllocPrivate::new(kind, 7, 0xBEEF, 4096, 3, 1, 0)
+        // Trailing 0 = adopt_resource_id, which the constructor gained in R805.
+        // The tests that exercise adoption set the field explicitly below, as
+        // they did when it was `_pad`.
+        HeliosWddmAllocPrivate::new(kind, 7, 0xBEEF, 4096, 3, 1, 0, 0)
     }
 
     fn meta(misc_flags: u32) -> HeliosWddmAllocMeta {

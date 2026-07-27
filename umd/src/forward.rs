@@ -560,7 +560,7 @@ struct OpenedAllocation {
 
 /// Parse the OPEN-time private data: the KMD's versioned [`HeliosWddmOpenIdentity`]
 /// record (written in `DxgkDdiOpenAllocation` after validating the venus resource
-/// is LIVE) plus the creator's meta trailer. This replaces the `_pad`-smuggling
+/// is LIVE) plus the creator's meta trailer. This replaces the adopt-id
 /// heuristics: an open-time buffer either carries a valid identity or the open is
 /// not backed by an identified venus resource.
 ///
@@ -1872,6 +1872,15 @@ unsafe fn allocate_wddm_resource(
                 VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE
             },
             VIRTIO_GPU_MAP_CACHE_CACHED,
+            // The venus resource id for the KMD to adopt. Was patched into the
+            // struct after construction because the constructor could not
+            // express the field; it is a parameter now, so the record reaches
+            // the kernel fully initialised by one expression. R805.
+            if backing_blob_id != 0 {
+                backing_resource_id
+            } else {
+                0
+            },
         ),
         meta: HeliosWddmAllocMeta {
             width: mip0.TexelWidth,
@@ -1896,9 +1905,6 @@ unsafe fn allocate_wddm_resource(
             plane_offset: scanout_offset,
         },
     };
-    if backing_blob_id != 0 && backing_resource_id != 0 {
-        private.alloc._pad = backing_resource_id;
-    }
     let pre_private_alloc = private.alloc;
     let pre_private_meta = private.meta;
 
@@ -1907,7 +1913,7 @@ unsafe fn allocate_wddm_resource(
         log_error!(
             "DDI allocate_wddm_resource pre: blob=0x{:x} res_id={} ctx={} kind={} size={} alloc_size={} mti={} {}x{} fmt={} bind=0x{:x} misc=0x{:x} primary_desc={}",
             private.alloc.blob_id,
-            private.alloc._pad,
+            private.alloc.adopt_resource_id,
             private.alloc.ctx_id,
             private.alloc.kind,
             private.alloc.size,
@@ -1968,7 +1974,7 @@ unsafe fn allocate_wddm_resource(
             size,
             pitch,
             backing_blob_id,
-            private.alloc._pad,
+            private.alloc.adopt_resource_id,
             private.alloc.ctx_id,
             private.alloc.kind,
             is_primary_allocation,
@@ -1980,7 +1986,7 @@ unsafe fn allocate_wddm_resource(
             a.BindFlags,
             a.MiscFlags
         );
-        if pre_private_alloc._pad != post_private_alloc._pad
+        if pre_private_alloc.adopt_resource_id != post_private_alloc.adopt_resource_id
             || pre_private_alloc.kind != post_private_alloc.kind
             || pre_private_alloc.ctx_id != post_private_alloc.ctx_id
             || pre_private_alloc.blob_id != post_private_alloc.blob_id
@@ -1990,13 +1996,13 @@ unsafe fn allocate_wddm_resource(
             log_error!(
                 "DDI allocate_wddm_resource private mutated: pre blob=0x{:x} res_id={} ctx={} kind={} vas={} mti={} -> post blob=0x{:x} res_id={} ctx={} kind={} vas={} mti={}",
                 pre_private_alloc.blob_id,
-                pre_private_alloc._pad,
+                pre_private_alloc.adopt_resource_id,
                 pre_private_alloc.ctx_id,
                 pre_private_alloc.kind,
                 pre_private_meta.venus_alloc_size,
                 pre_private_meta.memory_type_index,
                 post_private_alloc.blob_id,
-                post_private_alloc._pad,
+                post_private_alloc.adopt_resource_id,
                 post_private_alloc.ctx_id,
                 post_private_alloc.kind,
                 post_private_meta.venus_alloc_size,
@@ -2798,7 +2804,7 @@ unsafe extern "C" fn open_resource(
     // C1 identity ABI: the KMD wrote a versioned HeliosWddmOpenIdentity record
     // into the open-time private data in DxgkDdiOpenAllocation, after
     // validating the backing venus resource is LIVE. Prefer the per-allocation
-    // buffer; fall back to the resource-level one. No `_pad` heuristics.
+    // buffer; fall back to the resource-level one. No adopt-id heuristics.
     let mut identity =
         unsafe { read_opened_allocation(a.pPrivateDriverData, a.PrivateDriverDataSize) };
     // Distinguishes "no identity anywhere" from "identity present, trailer

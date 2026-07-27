@@ -1219,10 +1219,10 @@ unsafe fn read_standard_meta(
 
 /// Identity summary parsed from an allocation's private driver data at
 /// OpenAllocation time. Sourced from either layout the buffer may hold:
-/// the creator's [`HeliosWddmAllocPrivate`] (with the create-time `_pad`
+/// the creator's [`HeliosWddmAllocPrivate`] (with the create-time adopt id
 /// resid write-back), or a [`HeliosWddmOpenIdentity`] a previous open of the
 /// same allocation already wrote (dxgkrnl keeps ONE per-allocation buffer, so
-/// KMD mutations persist across opens — proven by the old `_pad` patching).
+/// KMD mutations persist across opens — proven by the old adopt-id patching).
 #[derive(Clone, Copy)]
 struct ParsedAllocIdentity {
     resource_id: u32,
@@ -1256,10 +1256,10 @@ unsafe fn read_alloc_identity(
         });
     }
     let ap: HeliosWddmAllocPrivate = pod_read_unaligned(bytes);
-    if ap.is_valid() && ap._pad != 0 {
+    if ap.is_valid() && ap.adopt_resource_id != 0 {
         let meta = unsafe { read_standard_meta(private, private_size) };
         return Some(ParsedAllocIdentity {
-            resource_id: ap._pad,
+            resource_id: ap.adopt_resource_id,
             blob_size: ap.size,
             venus_alloc_size: meta
                 .map(|m| m.venus_alloc_size)
@@ -1275,9 +1275,9 @@ unsafe fn read_alloc_identity(
 
 /// Write the C1 [`HeliosWddmOpenIdentity`] record over the first 48 bytes of an
 /// open-time private-data buffer (the meta trailer at bytes 48.. is preserved).
-/// Replaces the old `_pad` smuggling: the UMD's pfnOpenResource parses this
+/// Replaces the old adopt-id smuggling: the UMD's pfnOpenResource parses this
 /// versioned struct instead of heuristically preferring "whichever buffer has a
-/// nonzero `_pad`". Idempotent — rewriting the same record is harmless.
+/// nonzero adopt id". Idempotent — rewriting the same record is harmless.
 unsafe fn write_open_identity(
     private: *mut c_void,
     private_size: UINT,
@@ -1916,12 +1916,12 @@ unsafe fn create_one(
         // a nonzero blob id intact so dxgkrnl/IddCx and DXVK observe the same
         // backing store.
         ap.size = if ap.size == 0 { PAGE as u64 } else { ap.size };
-        if ap._pad != 0 {
-            supplied_resource_id = ap._pad;
+        if ap.adopt_resource_id != 0 {
+            supplied_resource_id = ap.adopt_resource_id;
             crate::diag::record(0x0C39_0000 | (supplied_resource_id & 0xFFFF));
         }
-    } else if ap.kind == HELIOS_WDDM_ALLOC_KIND_DEVICE_MEMORY && ap._pad != 0 {
-        supplied_resource_id = ap._pad;
+    } else if ap.kind == HELIOS_WDDM_ALLOC_KIND_DEVICE_MEMORY && ap.adopt_resource_id != 0 {
+        supplied_resource_id = ap.adopt_resource_id;
         crate::diag::record(0x0C39_0000 | (supplied_resource_id & 0xFFFF));
     }
 
@@ -1982,7 +1982,7 @@ unsafe fn create_one(
     };
     if adopt_supplied_resource {
         // UMD/Venus-backed allocations arrive with a Mesa BO resource id in
-        // `_pad`. The UMD transfers lifetime ownership from the ICD to this WDDM
+        // the adopt id. The UMD transfers lifetime ownership from the ICD to this WDDM
         // allocation after pfnAllocateCb succeeds (blob-slot re-owned above), so
         // DestroyAllocation releases DEVICE_MEMORY resources even though they
         // were not created through this CreateAllocation call. Cross-context
@@ -2532,7 +2532,7 @@ pub unsafe extern "C" fn dxgkddi_open_allocation(
         crate::diag::record(0x0C3C_0000 | (resource_id & 0xFFFF));
 
         // Write the versioned C1 identity record into the open-time private-data
-        // buffers (replaces the `_pad` smuggling). For KMD-created standard
+        // buffers (replaces the adopt-id smuggling). For KMD-created standard
         // allocations (indirect-swapchain backbuffers, GDI redirection textures)
         // the runtime's UMD-visible RESOURCE-level copy is the pristine
         // GetStandardAllocationDriverData output, so the UMD's pfnOpenResource
@@ -2790,6 +2790,10 @@ pub unsafe extern "C" fn dxgkddi_get_standard_allocation_driver_data(
         VIRTIO_GPU_BLOB_MEM_HOST3D,
         VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE,
         map_cache,
+        // Nothing to adopt: the KMD creates this resource itself. R805 made
+        // this an explicit parameter rather than a field the constructor
+        // zeroed and a later assignment could overwrite.
+        0,
     );
     let meta = HeliosWddmAllocMeta {
         width,
