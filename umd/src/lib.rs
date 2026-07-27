@@ -35,15 +35,12 @@ mod bridge;
 mod ddi;
 mod device_funcs;
 mod forward;
+mod hr;
 
-type Hresult = i32;
-
-const S_OK: Hresult = 0;
-const E_FAIL: Hresult = 0x8000_4005u32 as i32;
-const E_NOTIMPL: Hresult = 0x8000_4001u32 as i32;
-const E_OUTOFMEMORY: Hresult = 0x8007_000eu32 as i32;
-const DXGI_ERROR_UNSUPPORTED: Hresult = 0x887a_0020u32 as i32;
-const DXGI_STATUS_NO_REDIRECTION: Hresult = 0x087a_0004u32 as i32;
+use crate::hr::{
+    Hresult, DXGI_ERROR_DRIVER_INTERNAL_ERROR, DXGI_STATUS_NO_REDIRECTION, E_FAIL, E_NOTIMPL,
+    E_OUTOFMEMORY, S_OK,
+};
 
 const fn ddi_supported(major: u64, minor: u64, build: u64) -> u64 {
     let interface = (major << 16) | minor;
@@ -461,7 +458,11 @@ pub unsafe extern "system" fn OpenAdapter12(open_data: *mut D3d12DdiArgOpenAdapt
     log_error!("OpenAdapter12");
     log_error!("OpenAdapter12 -> DXGI_ERROR_UNSUPPORTED (D3D12 DDI not implemented yet)");
     let _ = open_data;
-    return DXGI_ERROR_UNSUPPORTED;
+    // R801 sub-commit 1 is value-preserving: this site has always returned
+    // 0x887A_0020, which is DXGI_ERROR_DRIVER_INTERNAL_ERROR and not
+    // DXGI_ERROR_UNSUPPORTED as the old constant name claimed. Named honestly
+    // here; corrected to DXGI_ERROR_UNSUPPORTED in sub-commit 2.
+    return DXGI_ERROR_DRIVER_INTERNAL_ERROR;
 
     #[allow(unreachable_code)]
     {

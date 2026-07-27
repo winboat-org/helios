@@ -586,7 +586,7 @@ pub unsafe fn destroy_runtime_objects(dev: &mut HeliosDevice) {
 /// GPU copy and the flush, report S_OK to DXGI and never call `pfnPresentCb`,
 /// so the swapchain token is never minted and DXGI never falls back.
 pub unsafe fn create_runtime_context(dev: &mut HeliosDevice) -> i32 {
-    const E_FAIL: i32 = 0x8000_4005u32 as i32;
+    use crate::hr::E_FAIL;
 
     if dev.kt_callbacks.is_null() {
         log_error!("CreateDevice: no KT callbacks for CreateContext");
@@ -629,7 +629,7 @@ pub unsafe fn create_runtime_context(dev: &mut HeliosDevice) -> i32 {
 /// pfnMakeResidentCb. Returns an HRESULT and leaves `paging_queue` empty on
 /// failure.
 pub unsafe fn create_runtime_paging_queue(dev: &mut HeliosDevice) -> i32 {
-    const E_FAIL: i32 = 0x8000_4005u32 as i32;
+    use crate::hr::E_FAIL;
 
     if dev.kt_callbacks.is_null() {
         log_error!("CreateDevice: no KT callbacks for CreatePagingQueue");

@@ -545,10 +545,7 @@ unsafe fn helios_device<'a>(h: Hdevice) -> Option<&'a HeliosDevice> {
     }
 }
 
-const E_FAIL: i32 = 0x8000_4005u32 as i32;
-const E_INVALIDARG: i32 = 0x8007_0057u32 as i32;
-const E_OUTOFMEMORY: i32 = 0x8007_000Eu32 as i32;
-const DXGI_ERROR_UNSUPPORTED: i32 = 0x887a_0004u32 as i32;
+use crate::hr::{DXGI_ERROR_UNSUPPORTED, E_FAIL, E_INVALIDARG, E_OUTOFMEMORY};
 
 /// Report an error to the D3D11 runtime for a VOID-returning DDI via the
 /// corelayer `pfnSetErrorCb`. The runtime fails the API call that invoked the
@@ -7298,8 +7295,11 @@ unsafe extern "C" fn check_format_support(h: Hdevice, fmt: ddi::DXGI_FORMAT, out
     // sentinel (0x80000000, "Set only this bit") rather than a bare 0. DXVK does
     // not implement this legacy XR format and returns 0, which the runtime treats
     // as a malformed response and fails `D3D11CreateDevice` with
-    // `DXGI_ERROR_UNSUPPORTED` (0x887a0020) — the only caps=0 format, observed
-    // live. That is the device-create failure DWM hits, after which
+    // `DXGI_ERROR_DRIVER_INTERNAL_ERROR` (0x887a0020) — the only caps=0 format,
+    // observed live. (The observed *value* is unchanged; before R801 this comment
+    // named it `DXGI_ERROR_UNSUPPORTED`, which is 0x887a0004. A malformed driver
+    // caps response being reported as a driver-internal fault is consistent.)
+    // That is the device-create failure DWM hits, after which
     // dwmcore!CreateD3D11Device raises the DWM error 0x889800b0 and crash-loops.
     // Map the 0 to the sentinel so the runtime accepts the (legitimately
     // unsupported) format. PATH-A (2026-06-22).
