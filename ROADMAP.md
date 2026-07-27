@@ -961,6 +961,92 @@ virtio-gpu scanout; IddCx/Looking Glass is no longer the active display path.*
    composited desktop, wallpaper, taskbar, a maximised Notepad, a PowerShell console and the
    clock reading 01:13 28-07-2026. DComp probe `PROBE PASS`, 1357 frames / 25 s.
 
+7h. **T6 IMPLEMENTED — all 16 items, 21 commits, KMD `22.22.188.0` + UMD
+   `355b4366b1666104`. UMD HALF DEPLOYED AND VERIFIED; KMD HALF AWAITS A REBOOT.**
+   A KMD image only loads at boot, so `22.22.188.0` is built, signed and packaged
+   but NOT yet the running driver — every KMD number below is from
+   `22.22.187.0`. The UMD half needed only `pnputil /restart-device` and is live.
+
+   **Deployed and measured (UMD `355b4366b1666104`, five `restart-device` cycles):**
+   ```
+                        T5 BEFORE            T6 AFTER
+   ownership soak       device 300 = 1946    1947      (5.99 handles/device both)
+     300 dev/10000 res  resource flat 1977   flat 1975 (all ten samples)
+                        final 1952 / +0 mod  1953 / +0
+                        failures 0 / 0       failures 0 / 0
+   Fire Strike Graphics 20212                20214     (GT1 141.1/140.89, GT2 63.8/63.86)
+   D3D11 suites         TOTAL failures=0     TOTAL failures=0, xproc_read_rc=0
+   present-gate (dwm)   n=3072 avg 2018 us   n=8704 avg 1852 us, 0.8% timeouts
+   ICD faults           4 procs, 0xc0000005  SAME 4 procs, only 0xc0000005
+   ```
+   Rendering evidence: `helios_paintcap` after the deploy + restart — full
+   composited desktop, taskbar, Notepad, PowerShell, clock reading the capture
+   minute.
+
+   ⚠ **DComp cadence looked like an 11% regression and IS NOT. A/B'd rather than
+   argued.** Five T6 samples on a settled idle box read 1149/1213/1152/1184/1161
+   against T5's recorded 1316/1311. Redeploying the backed-up T5 UMD
+   (`helios-umd-backup-t5.dll`), same box, same procedure, minutes apart, gave
+   **1318 / 1279 / 1144 / 1198**. T5's own spread (1144–1318, 15%) fully contains
+   the T6 range, and T5's low sample is below every T6 sample. **The probe's
+   sample-to-sample variance on this box is wider than any tranche's effect** —
+   which is what `kmd-gate-surface.ps1`'s own doc has said all along, and what
+   the T0 gate flagged as an open WS2 question. Do not read a single cadence pair
+   as a tranche result again; A/B or say nothing.
+
+   **★ R911's counters earned their keep on first read, and corrected the review.**
+   `srv_raw_hazard` is **3,892,049** in the 3DMark process (795k, 574k, 120k in
+   others): `pfnResourceReadAfterWriteHazard` for SRVs is a HOT-PATH DDI whose
+   body was empty and uncounted. `discard_partial` = 1 in several dwm/app
+   processes. But **`gs_so_declaration_dropped` and `tess_sig_fallback` both read
+   0 even under a full Fire Strike run** — the review predicted those two would
+   move and name a WS3 conformance gap. They do not on this workload; the gap is
+   real in the code but Fire Strike does not exercise it. All other counters 0.
+   Cost of the added `fetch_add` on a 3.9M-call path: not measurable — Fire
+   Strike Graphics moved 20212 → 20214.
+
+   **Built, not yet running (KMD `22.22.188.0`):**
+   - `tools/kmd-frame-sizes.ps1` PASSES: deepest boot chain **17584 B, headroom
+     352** — byte-for-byte the pre-tranche figure. ⚠ It did NOT pass first time:
+     R901's re-homed eight-name `SdgL*` zeroing array grew
+     `dxgkddi_start_device` 8424 → 8456 and took headroom to 320. The tool still
+     exited 0 (under the ceiling), so it would have shipped. Moved behind
+     `#[inline(never)]` (`zero_linear_scanout_breadcrumbs`), the same annotation
+     `bring_up_venus` carries for the same reason. **The prediction that R901
+     would IMPROVE this number by deleting a StartDevice callee was wrong.**
+   - KMD warnings 8 → **3**, and R906/2 removed the crate-wide
+     `#[allow(dead_code)] mod virtio` that had been hiding them. That surfaced 14
+     items; ten deleted (eight orphaned by this tranche's own deletions), four
+     kept with narrow per-item allows carrying their reason. ⚠ `IMAGE_TILING_LINEAR`
+     — the 39th session's root cause — sits among the DRM-modifier constants that
+     went and was checked BY HAND, not by the compiler; it is live and stays.
+   - UMD warnings 16 → 14 (both remaining are pre-existing).
+
+   **Corrections to REFACTOR_REVIEW's T6 section, all verified against the tree:**
+   R903/R904 already landed (T1b/T4b), so the real scope was 16 items, not 18.
+   R906 sub-commit 1 was already done by T4b's `WddmSurface`. R911 commit 3 was
+   already done by T5's R827 (`ShaderStage`). R905 says to delete
+   `gpummu::MEMORY_SEGMENT_ID` and `BAR_SEGMENT_ID` — the first is LIVE at
+   `start_device.rs:123` and the second no longer lives in `gpummu.rs`; deleting
+   either would have been a build break. R915 says `ResourceContext::_marker` is
+   never read — it is read twice, as the "is this a handle we minted" test. R910's
+   item list names `remember_scanout_target`, which is the DirectPrimary recorder,
+   not a LINEAR function. R901's commits (3) and (4) had to be SWAPPED, because
+   `venus::allocate_scanout_image_blob` is the only caller of
+   `ctrl::resource_assign_uuid`.
+
+   ⚠ **STILL REQUIRED FOR THE T6 GATE, and blocked on the reboot:** cold boot to
+   `CM_PROB_NONE` on `22.22.188.0`, a DxgKrnl all-keywords ETW trace with no
+   `AzureTriage` record, `SdgDevX` reading 1 on a DisplayHalf boot with `SdgDevR`
+   0, the `SdgL*` ladder reaching `0x10` if the LINEAR fallback is forced,
+   `RfUnb` ticking at most once across a `restart-device` while `RfFail` stays 0,
+   `PHQcall` still absent, and same-boot QEMU evidence for the exact OPTIMAL DWM
+   primary. Not performed and still owed from earlier tranches: **rapid cursor
+   motion / no trails** (needs an interactive mouse; now NINE tranches overdue),
+   **suspend/resume** (not testable, `disable_s3=1`/`disable_s4=1`), and a
+   **resolution change** (`ChangeDisplaySettingsEx` is not an available mechanism
+   on this box, see 7f).
+
 8. Implement the remaining reviewed refactors atomically, in tranche order, one recommendation
    per commit; never fold a `BUG` fix into a structure move. Preserve the current direct
    primary, completion ordering, loud-failure contracts, registry ABI, and
@@ -2447,15 +2533,19 @@ Plan:
   is coerced to `10` and recorded in the new `BarMCo` counter carrying the stale
   number — so a VM left set from an old bisect now binds and says so instead of
   reporting a segment no allocation may use. Nothing reports segment id 3 any more.
-- **ScanoutDiag modes** (service key, production default 0): `1` creates and
-  binds a CPU-filled KMD blob once; `2`+ rebinds the diagnostic blob after OS
-  scanout attempts; `3` tests shareable memory blob; `4`+ tests KMD-created
-  Vulkan scanout images; `7` tests classic 2D `SET_SCANOUT`; `9`/`11` are
-  CPU-filled cross-device image/blob variants; `11` and `16` use XR24; `12`
-  and `13` test guest/host3d-guest blob memory; `14`/`15` test virgl HOST3D
-  guest scanout helpers; `16` is the Linux/CachyOS-style LINEAR external DMA_BUF
-  image path. Mode 16 is verified working after the tiling-constant fix, but the
-  active value must remain absent/0 so it cannot overwrite the DWM primary.
+- **ScanoutDiag — RETIRED in T6/R901 (KMD 22.22.188.0).** The knob, its 16 modes
+  and `ddi/scanout_diag.rs` are GONE from the driver; any `ScanoutDiag` value or
+  `Sdg*`/`S2d*` name still in the service key is a stale leftover. What it bought
+  and why it went: the lab published its colour-bar blobs through the PRODUCTION
+  publish word, so at the type level a KMD-owned fill image was indistinguishable
+  from the Windows-designated primary, and a leftover `ScanoutDiag >= 4` selected
+  a 5-extension `VkDevice` (the 38th-session global-modifier-enable regression
+  class) on the one device every render/scanout/GDI path uses. Neither is
+  representable now. **`Sdg*` names that SURVIVE, written by the production
+  LINEAR fallback:** `SdgLStg SdgLReq SdgLBit SdgLTyc SdgLImg SdgLMem SdgLPch
+  SdgLOff` (zeroed each StartDevice by `zero_linear_scanout_breadcrumbs`), plus
+  `SdgMt SdgMf SdgBFl` and `SdgDevR SdgDevX` (ext tier; numbering unchanged, 1 =
+  export trio, 2 = none).
 - **Scanout counters** (service key fixed names): `Sc*` =
   `SetVidPnSourceAddress` scanout, `CSc*` = create-time scanout bind attempt,
   `PSc*` = Present/HWQ diagnostic-only scanout candidate, `Sdg*` = diagnostic
@@ -2532,16 +2622,12 @@ Plan:
   text. Found the segment rule in minutes.
 - **AddAdapter iteration**: `pnputil /restart-device` re-runs AddAdapter with
   the loaded image — registry-knob experiments need no reboot.
-- **T3 refusal instrument**: `ScForceReject` (service key, REG_DWORD, default 0
-  and absent in production) forces ONE deferred-programming refusal exit so its
-  counter can be proven to move: 1=BadAlloc 2=Extent 3=Layout 4=Format
-  5=LinearAllocFailed 6=SetFailed 7=NoTarget 8=CopyFailed. Read at StartDevice,
-  so `restart-device` between values — no reboot. Mirrored to `ScFrc`; a nonzero
-  `ScFrc` means the `Sc*Err` values in that dump were PROVOKED, not observed.
-  7 and 8 sit on the copy/fallback arm and are unreachable with a direct primary.
-  T6 deletion candidate. ⚠ Knob names are capped at **14 chars**
-  (`diag::MAX_CONFIG_NAME`) — now a build failure, previously a silent
-  always-default.
+- **T3 refusal instrument `ScForceReject` — RETIRED in T6 (owner-approved).**
+  ⚠ **This leaves the T3 gate line "force each of the seven deferred-programming
+  exits and confirm the matching counter moved" with NO mechanism behind it.**
+  The `Sc*Err` counters below are still written at their real sites; what is gone
+  is the only way to provoke them. Knob names are still capped at **14 chars**
+  (`diag::MAX_CONFIG_NAME`) — a build failure, previously a silent always-default.
 - **T3 counters** (all must read 0; reset at StartDevice so movement is
   this-boot): `ScBadAlc ScBadExt ScBadLay ScBadFmt ScLinErr ScSetErr ScNoTgt
   ScCpyErr` (one per refusal class), `ScUnav` (HPD dropped a dirty bit),
