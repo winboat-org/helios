@@ -511,6 +511,32 @@ virtio-gpu scanout; IddCx/Looking Glass is no longer the active display path.*
    StartMenuExperienceHost — every one already in the historical set of 9 processes, and the only
    exception code ever seen. 1167 such faults now in the log (889 three weeks ago). NO non-ICD
    application error this boot. `tools/icd-fault-history.ps1` is the A/B that establishes that.
+7d. **T5 IN PROGRESS (release UMD only; no KMD image, no reboot).** 30 items (R801–R820 major,
+   R821–R830 minor) — note `REFACTOR_REVIEW.md`'s summary table at line 178 says 29 and is wrong.
+   **Two owner decisions taken up front so they do not block the other 28:** R829 → *correct the
+   doc*, i.e. `helios_multisample_quality_levels` keeps advertising 8x for every output-capable
+   format and the doc stops claiming the D3D11.3 §19.2.5 128-bit exception (that rule is a FLOOR,
+   not a ceiling; no behaviour change, and the caps/quality pair stays internally coherent).
+   R830 → *name the literals only*: `MaxStretchFactor`/`MaxShrinkFactor` 16.0, `BILINEAR` and
+   `NumCapabilityGroups: 1` move behind one named const block with **values unchanged**, and the
+   decision to reduce the advertised MPO caps is DEFERRED pending same-boot evidence on whether
+   DWM queries them at all (zero `GetMultiplaneOverlayCaps` / MPO-plane lines in any UMD log on
+   the box, but those logs predate this tranche by three weeks, so re-sample at the gate).
+   **DECLARED BEHAVIOUR CHANGE (R806 sub-commit 2), the only one in the tranche so far:**
+   `create_resource` now refuses a scan-out-primary create when the bridge returns a resource with
+   a **zero row pitch**, releasing it and reporting `E_OUTOFMEMORY` through `pfnSetErrorCb`
+   instead of continuing. Previously only `raw != 0` was checked, so a zero pitch would stamp
+   `HELIOS_WDDM_ALLOC_MISC_PRIMARY | MISC_DIRECT_SCANOUT` into the KMD meta while
+   `finish_wddm_tex2d`'s `present_private` gate failed — a direct-scanout primary in the kernel
+   the UMD never registered in `direct_scanout_allocations` and could never identify through
+   PresentCb private data, with nothing detecting the split. **New UMD counter
+   `SCANOUT_PRIMARY_ZERO_PITCH`** (process-global `AtomicUsize`, logged with its running total at
+   the one site that increments it — there is no periodic line on the scan-out create path, and
+   the UMD still has no registry counter surface). **Expected to stay 0**, and the review's claim
+   that the split state is "constructible today" is corrected: `create_ddi_scanout_texture2d`
+   returns 0 for a zero width/height, sets `out_offset` to 0 on every path, and otherwise computes
+   a non-zero pitch, so `raw != 0` implies `rp != 0`. This closes a cross-FFI contract dependency
+   (same class as R822), not a live bug. A non-zero counter means that contract broke.
 8. Implement the remaining reviewed refactors atomically, in tranche order, one recommendation
    per commit; never fold a `BUG` fix into a structure move. Preserve the current direct
    primary, completion ordering, loud-failure contracts, registry ABI, and

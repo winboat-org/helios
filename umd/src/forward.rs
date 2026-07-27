@@ -2512,26 +2512,49 @@ unsafe extern "C" fn create_resource(
                     ),
                     None => 0,
                 };
-                if raw != 0 {
+                // BEHAVIOUR CHANGE (R806 sub-commit 2): a zero row pitch is a
+                // failed scan-out-primary create, not a primary with no
+                // geometry. Previously only `raw != 0` was checked, so a
+                // non-zero resource with `rp == 0` would stamp
+                // HELIOS_WDDM_ALLOC_MISC_PRIMARY | MISC_DIRECT_SCANOUT into the
+                // KMD meta while finish_wddm_tex2d's present_private gate
+                // failed -- a direct scan-out primary in the kernel that the
+                // UMD never registered in direct_scanout_allocations and could
+                // never identify through PresentCb private data. Nothing
+                // detected that split state.
+                //
+                // Not reachable through today's bridge: create_ddi_scanout_
+                // texture2d returns 0 for a zero width/height and otherwise
+                // computes a non-zero pitch, so raw != 0 implies rp != 0. This
+                // closes the cross-FFI contract dependency rather than a live
+                // bug, which is why the counter is expected to stay 0.
+                let geometry = ScanoutGeometry::new(rp as u32, off);
+                if raw != 0 && geometry.is_some() {
                     log_error!(
                         "DDI create_resource(tex2d): direct scan-out primary {}x{} fmt={} logicalPitch={} offset={} (OPTIMAL DMA_BUF)",
                         mip0.TexelWidth, mip0.TexelHeight, a.Format, rp, off
                     );
                     let res = ID3D11Resource::from_raw(raw as *mut c_void);
-                    finish_wddm_tex2d(
-                        h,
-                        a,
-                        &mip0,
-                        h_rt,
-                        h_resource,
-                        res,
-                        true,
-                        ScanoutGeometry::new(rp as u32, off),
-                    );
+                    finish_wddm_tex2d(h, a, &mip0, h_rt, h_resource, res, true, geometry);
                 } else {
                     // Loud failure over fake success: do NOT fall back to a plain
                     // primary — that reintroduces the black scan-out as a "working"
                     // desktop. A failure here is a real direct-scanout regression.
+                    if raw != 0 {
+                        // The new arm: the bridge handed back a resource but no
+                        // usable stride. Release it -- nothing else will.
+                        SCANOUT_PRIMARY_ZERO_PITCH.fetch_add(1, Ordering::Relaxed);
+                        drop(IUnknown::from_raw(raw as *mut c_void));
+                        log_error!(
+                            "DDI create_resource(tex2d): SCAN-OUT PRIMARY ZERO PITCH {}x{} fmt={} raw=0x{:x} offset={} -> refused (zero_pitch={})",
+                            mip0.TexelWidth,
+                            mip0.TexelHeight,
+                            a.Format,
+                            raw,
+                            off,
+                            SCANOUT_PRIMARY_ZERO_PITCH.load(Ordering::Relaxed)
+                        );
+                    }
                     log_error!(
                         "DDI create_resource(tex2d): SCAN-OUT PRIMARY CREATE FAILED {}x{} fmt={} bind=0x{:x} -> no primary (optimal/dmabuf rejected?)",
                         mip0.TexelWidth, mip0.TexelHeight, a.Format, bind
@@ -8895,6 +8918,17 @@ fn device_is_live(device: usize) -> bool {
         Err(_) => false,
     }
 }
+
+/// Scan-out primary creates refused because the bridge returned a resource
+/// with a zero row pitch (R806 sub-commit 2).
+///
+/// Expected to stay 0: `create_ddi_scanout_texture2d` returns 0 for a zero
+/// width/height and otherwise computes a non-zero pitch, so a non-zero
+/// resource implies a non-zero pitch. A non-zero value here means that
+/// cross-FFI contract has been broken, and the refusal is what stops a
+/// direct-scanout primary being stamped into the KMD meta that the UMD could
+/// never identify through PresentCb private data.
+static SCANOUT_PRIMARY_ZERO_PITCH: AtomicUsize = AtomicUsize::new(0);
 
 /// `set_present_source` refusals (invalid geometry/resid from the ICD).
 static EXT_SOURCE_REFUSED: AtomicUsize = AtomicUsize::new(0);
