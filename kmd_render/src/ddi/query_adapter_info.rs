@@ -565,126 +565,315 @@ const _: () = assert!(APERTURE_COMMIT_LIMIT <= APERTURE_SEGMENT_SIZE as u64);
 // in `create_one`; this cap is the only gate. Its value is visible in the
 // `0x01D4` MemoryManagementCaps diag record (CrossAdapterResource = bit 4).
 
+/// `PagingBufferSize` reported by the WDDM 2.x `QUERYSEGMENT4` surface.
+///
+/// R1015. This was a bare `64 * 1024`, and the two older surfaces reported a
+/// bare `10 * 4096` -- one contract with three call sites and two different
+/// answers, which read as an accident and is not one.
+const PAGING_BUFFER_BYTES_V4: u32 = 64 * 1024;
+
+/// `PagingBufferSize` reported by the WDDM 1.2/1.3 `QUERYSEGMENT3` surface and
+/// by the legacy `QUERYSEGMENT` fallback.
+///
+/// ⚠ DELIBERATELY DIFFERENT from [`PAGING_BUFFER_BYTES_V4`], and NOT reconciled
+/// here. Naming the two makes the divergence visible and a future reconciliation
+/// one edit; changing either value is a behaviour change on the WDDM 1.3
+/// recovery surface and needs its own evidence, which this tranche does not
+/// have. Which surface serves which build is documented on `query_segments3`.
+const PAGING_BUFFER_BYTES_LEGACY: u32 = 10 * 4096;
+
+/// Which union member of a `DXGK_SEGMENTDESCRIPTOR4` carries CPU access.
+///
+/// R1006. `CpuTranslatedAddress` and `CpuHostAperture` SHARE a union, so
+/// writing both is not "two flags set" -- it is one silently overwriting the
+/// other. That exclusivity used to be maintained by hand, with the condition
+/// `flags & 0x08 != 0 && flags & 0x02 == 0` at the single site that knew about
+/// it. As an enum, which member gets written is decided BY CONSTRUCTION and
+/// there is no expressible way to write both.
+///
+/// This does NOT make the bindgen union writes safe -- the layout is a WDK
+/// header property no Rust type can assert -- and it is separate from the
+/// FLAG bits, which stay independently settable so an arbitrary `BarSegFlags`
+/// value still produces byte-identical output.
+#[derive(Clone, Copy)]
+enum CpuAccess {
+    /// Nothing written; the union stays zeroed.
+    None,
+    /// `CpuTranslatedAddress.QuadPart = gpa`.
+    Translated(u64),
+    /// `CpuHostAperture = { PhysicalAddress: gpa, SizeInPages: pages }`.
+    HostAperture { gpa: u64, pages: u32 },
+}
+
+/// Aperture segments redirect system-memory MDLs; memory segments hold bits.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SegmentKind {
+    Aperture,
+    Memory,
+}
+
+/// One segment descriptor, independent of which bindgen generation carries it.
+///
+/// The three aperture writers differed ONLY in the descriptor type -- identical
+/// flags, identical base, size and commit limit -- and
+/// `write_bar_knob_descriptor` at its default `BarSegFlags = 0x1C` emits a
+/// descriptor byte-identical to `write_cpu_host_memory_descriptor`. One spec,
+/// three renderers.
+#[derive(Clone, Copy)]
+struct SegmentDescriptorSpec {
+    base: i64,
+    size: SIZE_T,
+    commit_limit: SIZE_T,
+    kind: SegmentKind,
+    cache_coherent: bool,
+    direct_flip: bool,
+    cpu_visible: bool,
+    supports_cpu_host_aperture: bool,
+    supports_cached_cpu_host_aperture: bool,
+    populated_from_system_memory: bool,
+    cpu_access: CpuAccess,
+}
+
+impl SegmentDescriptorSpec {
+    /// The viogpu3d-style linear aperture (paging-buffer host).
+    ///
+    /// CpuVisible is deliberately 0: an aperture holds no bits (viogpu3d :558),
+    /// and a linear aperture redirects system-memory MDLs through
+    /// MAP_APERTURE_SEGMENT instead of exposing device memory.
+    const fn aperture(direct_flip: bool) -> Self {
+        Self {
+            base: APERTURE_BASE_ADDRESS,
+            size: APERTURE_SEGMENT_SIZE,
+            commit_limit: APERTURE_SEGMENT_SIZE,
+            kind: SegmentKind::Aperture,
+            cache_coherent: true,
+            direct_flip,
+            cpu_visible: false,
+            supports_cpu_host_aperture: false,
+            supports_cached_cpu_host_aperture: false,
+            populated_from_system_memory: false,
+            cpu_access: CpuAccess::None,
+        }
+    }
+
+    /// A MEMORY segment whose backing lives at `base` (guest-physical) for
+    /// `len` bytes, exposed through WDDM's CPU host aperture rather than the
+    /// legacy CpuVisible direct-BAR path.
+    ///
+    /// CpuVisible deliberately stays 0. If it is set, dxgkrnl treats the union
+    /// as CpuTranslatedAddress and does not create the CPU-host-aperture segment
+    /// attributes VidMm needs for paging-process page tables: `GetCpuVisibleAddress`
+    /// accepts the internal segment attribute only for a CPU-host-aperture
+    /// segment (bit 13).
+    fn cpu_host_memory(base: u64, len: u64) -> Self {
+        Self {
+            base: 0,
+            size: len as SIZE_T,
+            commit_limit: len as SIZE_T,
+            kind: SegmentKind::Memory,
+            cache_coherent: true,
+            direct_flip: false,
+            cpu_visible: false,
+            supports_cpu_host_aperture: true,
+            supports_cached_cpu_host_aperture: true,
+            populated_from_system_memory: false,
+            cpu_access: CpuAccess::HostAperture {
+                gpa: base,
+                pages: (len / 4096).min(u32::MAX as u64) as u32,
+            },
+        }
+    }
+
+    /// The fully knob-driven segment-3 descriptor. The bit ladder and its union
+    /// special case exist HERE and nowhere else.
+    ///
+    ///   bit0 Aperture   bit1 CpuVisible(CpuTranslatedAddress=gpa)
+    ///   bit2 CacheCoherent    bit3 SupportsCpuHostAperture
+    ///   bit4 SupportsCachedCpuHostAperture   bit5 DirectFlip
+    ///   bit6 PopulatedFromSystemMemory
+    fn from_bar_flags(flags: u32, base_mb: u32, gpa: u64, len: u64) -> Self {
+        Self {
+            base: (base_mb as i64) << 20,
+            size: len as SIZE_T,
+            commit_limit: len as SIZE_T,
+            kind: if flags & 0x01 != 0 {
+                SegmentKind::Aperture
+            } else {
+                SegmentKind::Memory
+            },
+            cache_coherent: flags & 0x04 != 0,
+            direct_flip: flags & 0x20 != 0,
+            cpu_visible: flags & 0x02 != 0,
+            supports_cpu_host_aperture: flags & 0x08 != 0,
+            supports_cached_cpu_host_aperture: flags & 0x10 != 0,
+            populated_from_system_memory: flags & 0x40 != 0,
+            // CpuVisible claims the union first; the host aperture only gets it
+            // when CpuVisible did not. This is the one condition the old code
+            // spelled out inline, and the reason `CpuAccess` is an enum.
+            cpu_access: if flags & 0x02 != 0 {
+                CpuAccess::Translated(gpa)
+            } else if flags & 0x08 != 0 {
+                CpuAccess::HostAperture {
+                    gpa,
+                    pages: (len / 4096).min(u32::MAX as u64) as u32,
+                }
+            } else {
+                CpuAccess::None
+            },
+        }
+    }
+
+    /// Render into a `DXGK_QUERYSEGMENTOUT4` descriptor -- the only generation
+    /// that can express CPU access at all.
+    ///
+    /// SAFETY: `seg` points to a writable `DXGK_SEGMENTDESCRIPTOR4`.
+    unsafe fn write_into_v4(self, seg: *mut DXGK_SEGMENTDESCRIPTOR4) {
+        unsafe {
+            core::ptr::write_bytes(seg as *mut u8, 0, size_of::<DXGK_SEGMENTDESCRIPTOR4>());
+            let s = &mut *seg;
+            s.BaseAddress.QuadPart = self.base;
+            {
+                let f = &mut s.Flags.__bindgen_anon_1.__bindgen_anon_1;
+                if self.kind == SegmentKind::Aperture {
+                    f.set_Aperture(1);
+                }
+                if self.cpu_visible {
+                    f.set_CpuVisible(1);
+                }
+                if self.cache_coherent {
+                    f.set_CacheCoherent(1);
+                }
+                if self.supports_cpu_host_aperture {
+                    f.set_SupportsCpuHostAperture(1);
+                }
+                if self.supports_cached_cpu_host_aperture {
+                    f.set_SupportsCachedCpuHostAperture(1);
+                }
+                if self.direct_flip {
+                    f.set_DirectFlip(1);
+                }
+                if self.populated_from_system_memory {
+                    f.set_PopulatedFromSystemMemory(1);
+                }
+            }
+            match self.cpu_access {
+                CpuAccess::None => {}
+                CpuAccess::Translated(gpa) => {
+                    (*s.__bindgen_anon_1.CpuTranslatedAddress.as_mut()).QuadPart = gpa as i64;
+                }
+                CpuAccess::HostAperture { gpa, pages } => {
+                    *s.__bindgen_anon_1.CpuHostAperture.as_mut() = DXGK_CPUHOSTAPERTURE {
+                        PhysicalAddress: gpa,
+                        SizeInPages: pages,
+                    };
+                }
+            }
+            s.Size = self.size;
+            s.CommitLimit = self.commit_limit;
+        }
+    }
+
+    /// Render into a WDDM 1.2/1.3 `DXGK_QUERYSEGMENTOUT3` descriptor.
+    ///
+    /// ⚠ `DXGK_SEGMENTDESCRIPTOR3` cannot express a CPU-host-aperture segment at
+    /// all -- there is no such union member -- so `cpu_access`, `cpu_visible`
+    /// and `populated_from_system_memory` have NO representation here and are
+    /// dropped. That is sound only because the only spec this generation ever
+    /// receives is [`SegmentDescriptorSpec::aperture`], on which all three are
+    /// false/None. It is a documented mapping, NOT a claimed invariant: the type
+    /// system does not enforce it, which is why it is written down.
+    ///
+    /// SAFETY: `seg` points to a writable `DXGK_SEGMENTDESCRIPTOR3`.
+    unsafe fn write_into_v3(self, seg: *mut DXGK_SEGMENTDESCRIPTOR3) {
+        unsafe {
+            core::ptr::write_bytes(seg as *mut u8, 0, size_of::<DXGK_SEGMENTDESCRIPTOR3>());
+            let s = &mut *seg;
+            let f = &mut s.Flags.__bindgen_anon_1.__bindgen_anon_1;
+            if self.kind == SegmentKind::Aperture {
+                f.set_Aperture(1);
+            }
+            if self.cache_coherent {
+                f.set_CacheCoherent(1);
+            }
+            if self.direct_flip {
+                f.set_DirectFlip(1);
+            }
+            s.BaseAddress.QuadPart = self.base;
+            s.Size = self.size;
+            s.CommitLimit = self.commit_limit;
+        }
+    }
+
+    /// Render into the legacy `DXGK_QUERYSEGMENTOUT` descriptor used if dxgkrnl
+    /// falls back from QUERYSEGMENT3. Same limits as [`Self::write_into_v3`].
+    ///
+    /// SAFETY: `seg` points to a writable `DXGK_SEGMENTDESCRIPTOR`.
+    unsafe fn write_into_legacy(self, seg: *mut DXGK_SEGMENTDESCRIPTOR) {
+        unsafe {
+            core::ptr::write_bytes(seg as *mut u8, 0, size_of::<DXGK_SEGMENTDESCRIPTOR>());
+            let s = &mut *seg;
+            let f = &mut s.Flags.__bindgen_anon_1.__bindgen_anon_1;
+            if self.kind == SegmentKind::Aperture {
+                f.set_Aperture(1);
+            }
+            if self.cache_coherent {
+                f.set_CacheCoherent(1);
+            }
+            if self.direct_flip {
+                f.set_DirectFlip(1);
+            }
+            s.BaseAddress.QuadPart = self.base;
+            s.Size = self.size;
+            s.CommitLimit = self.commit_limit;
+        }
+    }
+}
+
 /// Write the viogpu3d-style linear aperture descriptor (paging-buffer host).
 /// SAFETY: `seg` points to a writable `DXGK_SEGMENTDESCRIPTOR4`.
 unsafe fn write_aperture_descriptor(seg: *mut DXGK_SEGMENTDESCRIPTOR4, knobs: &AdapterKnobs) {
-    unsafe {
-        core::ptr::write_bytes(seg as *mut u8, 0, size_of::<DXGK_SEGMENTDESCRIPTOR4>());
-        let s = &mut *seg;
-        s.Flags.__bindgen_anon_1.__bindgen_anon_1.set_Aperture(1);
-        s.Flags
-            .__bindgen_anon_1
-            .__bindgen_anon_1
-            .set_CacheCoherent(1);
-        if knobs.direct_flip {
-            s.Flags.__bindgen_anon_1.__bindgen_anon_1.set_DirectFlip(1);
-        }
-        // CpuVisible deliberately 0 — an aperture holds no bits (viogpu3d :558).
-        s.BaseAddress.QuadPart = APERTURE_BASE_ADDRESS;
-        s.Size = APERTURE_SEGMENT_SIZE;
-        s.CommitLimit = APERTURE_SEGMENT_SIZE;
-    }
+    unsafe { SegmentDescriptorSpec::aperture(knobs.direct_flip).write_into_v4(seg) };
 }
 
-/// Write the viogpu3d-style linear aperture descriptor for WDDM 1.2/1.3
-/// `DXGK_QUERYSEGMENTOUT3`.
+/// The same aperture, for WDDM 1.2/1.3 `DXGK_QUERYSEGMENTOUT3`.
 /// SAFETY: `seg` points to a writable `DXGK_SEGMENTDESCRIPTOR3`.
 unsafe fn write_aperture_descriptor3(seg: *mut DXGK_SEGMENTDESCRIPTOR3, knobs: &AdapterKnobs) {
-    unsafe {
-        core::ptr::write_bytes(seg as *mut u8, 0, size_of::<DXGK_SEGMENTDESCRIPTOR3>());
-        let s = &mut *seg;
-        s.Flags.__bindgen_anon_1.__bindgen_anon_1.set_Aperture(1);
-        s.Flags
-            .__bindgen_anon_1
-            .__bindgen_anon_1
-            .set_CacheCoherent(1);
-        if knobs.direct_flip {
-            s.Flags.__bindgen_anon_1.__bindgen_anon_1.set_DirectFlip(1);
-        }
-        // CpuVisible deliberately 0 — a linear aperture redirects system-memory
-        // MDLs through MAP_APERTURE_SEGMENT instead of exposing device memory.
-        s.BaseAddress.QuadPart = APERTURE_BASE_ADDRESS;
-        s.Size = APERTURE_SEGMENT_SIZE;
-        s.CommitLimit = APERTURE_SEGMENT_SIZE;
-    }
+    unsafe { SegmentDescriptorSpec::aperture(knobs.direct_flip).write_into_v3(seg) };
 }
 
-/// Write the legacy `DXGK_QUERYSEGMENTOUT` descriptor used if dxgkrnl falls back
-/// from QUERYSEGMENT3.
+/// The same aperture again, for the legacy `DXGK_QUERYSEGMENTOUT` dxgkrnl falls
+/// back to from QUERYSEGMENT3.
 /// SAFETY: `seg` points to a writable `DXGK_SEGMENTDESCRIPTOR`.
 unsafe fn write_aperture_descriptor_legacy(seg: *mut DXGK_SEGMENTDESCRIPTOR, knobs: &AdapterKnobs) {
-    unsafe {
-        core::ptr::write_bytes(seg as *mut u8, 0, size_of::<DXGK_SEGMENTDESCRIPTOR>());
-        let s = &mut *seg;
-        s.Flags.__bindgen_anon_1.__bindgen_anon_1.set_Aperture(1);
-        s.Flags
-            .__bindgen_anon_1
-            .__bindgen_anon_1
-            .set_CacheCoherent(1);
-        if knobs.direct_flip {
-            s.Flags.__bindgen_anon_1.__bindgen_anon_1.set_DirectFlip(1);
-        }
-        s.BaseAddress.QuadPart = APERTURE_BASE_ADDRESS;
-        s.Size = APERTURE_SEGMENT_SIZE;
-        s.CommitLimit = APERTURE_SEGMENT_SIZE;
-    }
+    unsafe { SegmentDescriptorSpec::aperture(knobs.direct_flip).write_into_legacy(seg) };
 }
 
 /// Write a MEMORY descriptor (`Aperture=0`, holds bits) whose backing lives at
-/// `base` (guest-physical) for `len` bytes. For the GpuMmu page-table segment we
-/// expose CPU access through WDDM's CPU host aperture, not the legacy CpuVisible
-/// direct-BAR path: VidMm's `GetCpuVisibleAddress` accepts the internal segment
-/// attribute only when it is a CPU-host-aperture segment (bit 13), and the public
-/// docs describe `DXGK_CPUHOSTAPERTURE` as the alternative mapping path for
-/// non-CPU-accessible memory segments.
+/// `base` (guest-physical) for `len` bytes.
 /// SAFETY: `seg` points to a writable `DXGK_SEGMENTDESCRIPTOR4`.
 unsafe fn write_cpu_host_memory_descriptor(seg: *mut DXGK_SEGMENTDESCRIPTOR4, base: u64, len: u64) {
-    unsafe {
-        core::ptr::write_bytes(seg as *mut u8, 0, size_of::<DXGK_SEGMENTDESCRIPTOR4>());
-        let s = &mut *seg;
-        s.BaseAddress.QuadPart = 0;
-        // CpuVisible deliberately stays 0. If this is set, dxgkrnl treats the
-        // union as CpuTranslatedAddress and does not create the CPU-host-aperture
-        // segment attributes VidMm needs for paging-process page tables.
-        s.Flags
-            .__bindgen_anon_1
-            .__bindgen_anon_1
-            .set_SupportsCpuHostAperture(1);
-        s.Flags
-            .__bindgen_anon_1
-            .__bindgen_anon_1
-            .set_SupportsCachedCpuHostAperture(1);
-        // Aperture stays 0 — this segment holds bits (the BAR/device memory).
-        s.Flags
-            .__bindgen_anon_1
-            .__bindgen_anon_1
-            .set_CacheCoherent(1);
-        let cpu_host = DXGK_CPUHOSTAPERTURE {
-            PhysicalAddress: base,
-            SizeInPages: (len / 4096).min(u32::MAX as u64) as u32,
-        };
-        *s.__bindgen_anon_1.CpuHostAperture.as_mut() = cpu_host;
-        s.Size = len as SIZE_T;
-        s.CommitLimit = len as SIZE_T;
-    }
+    unsafe { SegmentDescriptorSpec::cpu_host_memory(base, len).write_into_v4(seg) };
 }
 
 /// Segment-3 descriptor, FULLY KNOB-DRIVEN (AddAdapter shape bisect: both the
 /// classic-CpuVisible and CpuHostAperture shapes were rejected identically, as
-/// were 64 MiB and RAM-backed variants — the remaining hypotheses are flag
+/// were 64 MiB and RAM-backed variants -- the remaining hypotheses are flag
 /// combinations and GPU-physical BaseAddress overlap with segment 2, and each
 /// compiled-in variant costs an owner reboot; registry knobs + devcon restart
 /// cost nothing).
 ///
 ///   `BarSegFlags` (REG_DWORD, default 0x1C = CacheCoherent |
-///                  SupportsCpuHostAperture | SupportsCachedCpuHostAperture):
-///     bit0 Aperture   bit1 CpuVisible(CpuTranslatedAddress=gpa)
-///     bit2 CacheCoherent    bit3 SupportsCpuHostAperture
-///     bit4 SupportsCachedCpuHostAperture   bit5 DirectFlip
-///     bit6 PopulatedFromSystemMemory
-///   `BarSegBaseMB` (REG_DWORD, default 0): GPU-physical BaseAddress in MiB —
+///                  SupportsCpuHostAperture | SupportsCachedCpuHostAperture)
+///   `BarSegBaseMB` (REG_DWORD, default 0): GPU-physical BaseAddress in MiB --
 ///     segment 2 sits at 0; a nonzero value (e.g. 8192 = 0x2_0000_0000) tests
 ///     the BaseAddress-overlap hypothesis.
+///
+/// The bit ladder itself lives on [`SegmentDescriptorSpec::from_bar_flags`].
+///
+/// Pure: the flag word and base come from the [`AdapterKnobs`] snapshot, and the
+/// `BarF`/`BarB` breadcrumbs are written once in `AdapterKnobs::read_at_start`.
+/// This function used to do two blocking registry READS and two ungated registry
+/// WRITES on every descriptor write.
 ///
 /// SAFETY: `seg` points to a writable `DXGK_SEGMENTDESCRIPTOR4`.
 unsafe fn write_bar_knob_descriptor(
@@ -693,51 +882,9 @@ unsafe fn write_bar_knob_descriptor(
     len: u64,
     knobs: &AdapterKnobs,
 ) {
-    // Pure: the flag word and base come from the snapshot, and the `BarF`/`BarB`
-    // breadcrumbs are written once in `AdapterKnobs::read_at_start`. This
-    // function used to do two blocking registry READS and two ungated registry
-    // WRITES on every descriptor write.
-    let flags = knobs.bar_seg_flags;
-    let base_mb = knobs.bar_seg_base_mb;
-    unsafe {
-        core::ptr::write_bytes(seg as *mut u8, 0, size_of::<DXGK_SEGMENTDESCRIPTOR4>());
-        let s = &mut *seg;
-        s.BaseAddress.QuadPart = (base_mb as i64) << 20;
-        let f = &mut s.Flags.__bindgen_anon_1.__bindgen_anon_1;
-        if flags & 0x01 != 0 {
-            f.set_Aperture(1);
-        }
-        if flags & 0x02 != 0 {
-            f.set_CpuVisible(1);
-            (*s.__bindgen_anon_1.CpuTranslatedAddress.as_mut()).QuadPart = gpa as i64;
-        }
-        if flags & 0x04 != 0 {
-            f.set_CacheCoherent(1);
-        }
-        if flags & 0x08 != 0 {
-            f.set_SupportsCpuHostAperture(1);
-        }
-        if flags & 0x10 != 0 {
-            f.set_SupportsCachedCpuHostAperture(1);
-        }
-        if flags & 0x20 != 0 {
-            f.set_DirectFlip(1);
-        }
-        if flags & 0x40 != 0 {
-            f.set_PopulatedFromSystemMemory(1);
-        }
-        if flags & 0x08 != 0 && flags & 0x02 == 0 {
-            // CpuHostAperture and CpuTranslatedAddress share a union — only
-            // write the aperture region when CpuVisible didn't claim it.
-            let cpu_host = DXGK_CPUHOSTAPERTURE {
-                PhysicalAddress: gpa,
-                SizeInPages: (len / 4096).min(u32::MAX as u64) as u32,
-            };
-            *s.__bindgen_anon_1.CpuHostAperture.as_mut() = cpu_host;
-        }
-        s.Size = len as SIZE_T;
-        s.CommitLimit = len as SIZE_T;
-    }
+    let spec =
+        SegmentDescriptorSpec::from_bar_flags(knobs.bar_seg_flags, knobs.bar_seg_base_mb, gpa, len);
+    unsafe { spec.write_into_v4(seg) };
 }
 
 unsafe fn query_segments(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTERINFO) -> NTSTATUS {
@@ -769,7 +916,7 @@ unsafe fn query_segments(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTERIN
     out.pSegmentDescriptor = descriptors;
     let stride = size_of::<DXGK_SEGMENTDESCRIPTOR4>();
     out.SegmentDescriptorStride = stride as u64;
-    out.PagingBufferSize = 64 * 1024;
+    out.PagingBufferSize = PAGING_BUFFER_BYTES_V4;
     out.PagingBufferPrivateDataSize = 0;
 
     // The table is BUILT IN StartDevice (`build_segment_table`) and only
@@ -860,6 +1007,32 @@ unsafe fn query_segments(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTERIN
     STATUS_SUCCESS
 }
 
+/// `DXGKQAITYPE_QUERYSEGMENT3` -- the WDDM 1.2/1.3 segment surface.
+///
+/// R1015: WHICH GENERATION SERVES WHICH SURFACE. dxgkrnl asks for exactly one
+/// of the three, chosen from the WDDM interface version the adapter advertises
+/// in `DXGK_DRIVERCAPS` (`WddmSurface`, T4b/R701), and the dispatcher at the
+/// top of this file routes each to its own responder:
+///
+///   `QUERYSEGMENT4` -> `query_segments`        the production 3.2 surface
+///   `QUERYSEGMENT3` -> this, WDDM 1.2/1.3
+///   `QUERYSEGMENT`  -> `query_segments_legacy`, dxgkrnl's own fallback
+///
+/// ⚠ NEITHER OF THE TWO OLDER RESPONDERS MAY BE DELETED, and the review's
+/// stated reason for that no longer applies: it argues from flipping a
+/// `RAISE_WDDM_3_2_GPUMMU = false` recovery lever, and T4b/R701 replaced that
+/// lever with `WddmSurface`, so there is nothing to flip. The reason now is
+/// simply that the surface dxgkrnl asks for is ITS choice, not ours -- lowering
+/// `WddmSurface` (the documented way to get a WDDM 1.3 adapter back for
+/// bisection) makes it ask for QUERYSEGMENT3, and the legacy responder is the
+/// fallback dxgkrnl reaches for on its own. Returning an unhandled status from
+/// either is a bind failure with no diagnostic.
+///
+/// Whether the production 2.1/3.2 surface EVER takes these paths is not
+/// established: the `0x0912_*` / `0x0913_*` records that would show it are
+/// `diag::record`, i.e. DiagLevel-gated, and DiagLevel is cached at driver
+/// load, so answering it needs a DiagLevel=1 boot. Recorded as owed rather
+/// than assumed either way.
 unsafe fn query_segments3(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTERINFO) -> NTSTATUS {
     if (args.OutputDataSize as usize) < size_of::<DXGK_QUERYSEGMENTOUT3>() {
         return STATUS_BUFFER_TOO_SMALL;
@@ -891,7 +1064,7 @@ unsafe fn query_segments3(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTERI
     }
 
     out.PagingBufferSegmentId = gpummu::APERTURE_SEGMENT_ID;
-    out.PagingBufferSize = 10 * 4096;
+    out.PagingBufferSize = PAGING_BUFFER_BYTES_LEGACY;
     out.PagingBufferPrivateDataSize = 0;
 
     unsafe { write_aperture_descriptor3(descriptors, &adapter.knobs()) };
@@ -932,7 +1105,7 @@ unsafe fn query_segments_legacy(
     }
 
     out.PagingBufferSegmentId = gpummu::APERTURE_SEGMENT_ID;
-    out.PagingBufferSize = 10 * 4096;
+    out.PagingBufferSize = PAGING_BUFFER_BYTES_LEGACY;
     out.PagingBufferPrivateDataSize = 0;
 
     unsafe { write_aperture_descriptor_legacy(descriptors, &adapter.knobs()) };
