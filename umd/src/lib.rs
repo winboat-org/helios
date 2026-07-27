@@ -850,13 +850,12 @@ unsafe extern "C" fn create_device(
                 kt_callbacks: create.pKTCallbacks,
                 paging_queue: None,
                 dxgi_callbacks: create.DXGIBaseDDI.pDXGIBaseCallbacks,
-                scanout_resource_raw: core::cell::Cell::new(0),
-                scanout_resource_id: core::cell::Cell::new(0),
-                scanout_allocation: core::cell::Cell::new(0),
-                scanout_width: core::cell::Cell::new(0),
-                scanout_height: core::cell::Cell::new(0),
-                scanout_format: core::cell::Cell::new(0),
-                scanout_generation: core::cell::Cell::new(0),
+                // The six scanout Cells plus scanout_generation are now one
+                // Option<ScanoutTarget> inside `owned`; what is left here is
+                // the LINEAR-import probe's negative cache. R809.
+                scanout_probe: core::cell::Cell::new(
+                    device_funcs::ScanoutProbe::Unprobed,
+                ),
                 scanout_epoch: core::cell::Cell::new(0),
                 direct_scanout_allocations: core::cell::RefCell::new(Vec::new()),
                 scanout_copy_count: core::cell::Cell::new(0),
