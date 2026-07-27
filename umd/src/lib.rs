@@ -264,25 +264,28 @@ pub extern "system" fn helios_umd_get_present_result(fence_id: *mut u32, value: 
 #[no_mangle]
 pub extern "system" fn helios_umd_selftest() -> i32 {
     log_error!("helios_umd_selftest: creating DXVK device on venus...");
-    let dev = bridge::ffi::helios_dxvk_create_device(0, 0);
-    let bridge_ok = !dev.is_null();
+    let dev = bridge::BridgeDevice::create(0, 0);
+    let bridge_ok = dev.is_some();
     log_error!("helios_umd_selftest: bridge ok={bridge_ok}");
-    if !bridge_ok {
+    let Some(dev) = dev else {
         return 1;
-    }
+    };
 
     // Prove the windows-crate COM bindings call straight into DXVK's ID3D11Device
     // (the foundation for the pure-Rust DDI forwarders): create a real buffer.
     {
         use windows::Win32::Graphics::Direct3D11::*;
-        let dev_ptr = dev.d3d11_device_ptr();
+        // Borrowed through the sealed accessor: the raw `d3d11_device_ptr` is
+        // no longer reachable from outside `bridge`, so this cannot be written
+        // as an adopting from_raw. R815.
+        let device = dev.d3d11_device();
         log_error!(
-            "helios_umd_selftest: ID3D11Device* = 0x{dev_ptr:x}"
+            "helios_umd_selftest: ID3D11Device* = 0x{:x}",
+            device
+                .as_ref()
+                .map_or(0, |d| windows::core::Interface::as_raw(&**d) as usize)
         );
-        if dev_ptr != 0 {
-            let device = core::mem::ManuallyDrop::new(unsafe {
-                <ID3D11Device as windows::core::Interface>::from_raw(dev_ptr as *mut _)
-            });
+        if let Some(device) = device {
             let desc = D3D11_BUFFER_DESC {
                 ByteWidth: 256,
                 Usage: D3D11_USAGE_DEFAULT,
@@ -821,11 +824,12 @@ unsafe extern "C" fn create_device(
     };
 
     // 1) Bring up the DXVK device on the Helios venus adapter.
-    let dxvk = bridge::ffi::helios_dxvk_create_device(0, 0);
-    if dxvk.is_null() {
+    // BridgeDevice::create folds the old is_null() test into construction, so a
+    // stored BridgeDevice is always usable. R815.
+    let Some(dxvk) = bridge::BridgeDevice::create(0, 0) else {
         log_error!("  CreateDevice: DXVK device creation FAILED -> E_FAIL");
         return E_FAIL;
-    }
+    };
 
     // 2) Construct our device object in the runtime-allocated private memory
     //    (size came from CalcPrivateDeviceSize). hDrvDevice IS that pointer.

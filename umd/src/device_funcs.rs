@@ -258,7 +258,7 @@ pub struct HeliosDevice {
     /// declared before `dxvk`. See [`BridgeOwned`] for why the position and
     /// the explicit `release()` both exist.
     pub owned: BridgeOwned,
-    pub dxvk: cxx::UniquePtr<bridge::ffi::HeliosDxvkDevice>,
+    pub dxvk: bridge::BridgeDevice,
     pub h_rt_device: ddi::HANDLE,
     /// The kernel context and its buffer windows, validated at construction.
     /// `None` until `create_runtime_context` succeeds -- and CreateDevice now

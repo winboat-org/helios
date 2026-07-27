@@ -4233,9 +4233,7 @@ unsafe extern "C" fn create_vertex_shader(
         return;
     }
     let bytes = core::slice::from_raw_parts(code as *const u8, len);
-    let Some(dxvk) = dev.dxvk.as_ref() else {
-        return;
-    };
+    let dxvk = &dev.dxvk;
     let raw = dxvk.create_vertex_shader(bytes.as_ptr(), bytes.len());
     if raw != 0 {
         if SHADER_BIND_LOG_COUNT.first_n(128).is_some() {
@@ -4270,9 +4268,7 @@ unsafe extern "C" fn create_pixel_shader(
         return;
     }
     let bytes = core::slice::from_raw_parts(code as *const u8, len);
-    let Some(dxvk) = dev.dxvk.as_ref() else {
-        return;
-    };
+    let dxvk = &dev.dxvk;
     let raw = dxvk.create_pixel_shader(bytes.as_ptr(), bytes.len());
     if raw != 0 {
         if SHADER_BIND_LOG_COUNT.first_n(128).is_some() {
@@ -4503,9 +4499,7 @@ unsafe fn create_shader_11_1_common(
         return;
     }
     let bytes = core::slice::from_raw_parts(code as *const u8, len);
-    let Some(dxvk) = dev.dxvk.as_ref() else {
-        return;
-    };
+    let dxvk = &dev.dxvk;
     let sig_words = flatten_stage_io_signatures(sig);
     {
         // Evidence line for the Input-08733 investigation: dump each input
@@ -4601,9 +4595,7 @@ unsafe extern "C" fn create_geometry_shader(
         return;
     }
     let bytes = core::slice::from_raw_parts(code as *const u8, len);
-    let Some(dxvk) = dev.dxvk.as_ref() else {
-        return;
-    };
+    let dxvk = &dev.dxvk;
     let raw = dxvk.create_geometry_shader(bytes.as_ptr(), bytes.len());
     if raw != 0 {
         store_raw_com(h_shader, raw);
@@ -4645,9 +4637,7 @@ unsafe extern "C" fn create_geometry_shader_so(
     // Stream-output declarations need semantic names that are not present in the
     // compact DDI declaration. Create a plain GS for now; DWM's composition path
     // should not depend on SO capture.
-    let Some(dxvk) = dev.dxvk.as_ref() else {
-        return;
-    };
+    let dxvk = &dev.dxvk;
     let raw = dxvk.create_geometry_shader(bytes.as_ptr(), bytes.len());
     if raw != 0 {
         store_raw_com(h_shader, raw);
@@ -4690,9 +4680,7 @@ unsafe extern "C" fn create_hull_shader(
         return;
     }
     let bytes = core::slice::from_raw_parts(code as *const u8, len);
-    let Some(dxvk) = dev.dxvk.as_ref() else {
-        return;
-    };
+    let dxvk = &dev.dxvk;
     let sig_words = flatten_tess_io_signatures(sig);
     log_tess_sig_summary("create_hull_shader", &sig_words);
     let mut raw = dxvk.create_tess_shader_sig(
@@ -4731,9 +4719,7 @@ unsafe extern "C" fn create_hull_shader_11_1(
         return;
     }
     let bytes = core::slice::from_raw_parts(code as *const u8, len);
-    let Some(dxvk) = dev.dxvk.as_ref() else {
-        return;
-    };
+    let dxvk = &dev.dxvk;
     let sig_words = flatten_tess_io_signatures_11_1(sig);
     log_tess_sig_summary("create_hull_shader_11_1", &sig_words);
     let mut raw = dxvk.create_tess_shader_sig(
@@ -4772,9 +4758,7 @@ unsafe extern "C" fn create_domain_shader(
         return;
     }
     let bytes = core::slice::from_raw_parts(code as *const u8, len);
-    let Some(dxvk) = dev.dxvk.as_ref() else {
-        return;
-    };
+    let dxvk = &dev.dxvk;
     let sig_words = flatten_tess_io_signatures(sig);
     log_tess_sig_summary("create_domain_shader", &sig_words);
     let mut raw = dxvk.create_tess_shader_sig(
@@ -4813,9 +4797,7 @@ unsafe extern "C" fn create_domain_shader_11_1(
         return;
     }
     let bytes = core::slice::from_raw_parts(code as *const u8, len);
-    let Some(dxvk) = dev.dxvk.as_ref() else {
-        return;
-    };
+    let dxvk = &dev.dxvk;
     let sig_words = flatten_tess_io_signatures_11_1(sig);
     log_tess_sig_summary("create_domain_shader_11_1", &sig_words);
     let mut raw = dxvk.create_tess_shader_sig(
@@ -4855,9 +4837,7 @@ unsafe extern "C" fn create_compute_shader(
         return;
     }
     let bytes = core::slice::from_raw_parts(code as *const u8, len);
-    let Some(dxvk) = dev.dxvk.as_ref() else {
-        return;
-    };
+    let dxvk = &dev.dxvk;
     let raw = dxvk.create_compute_shader(bytes.as_ptr(), bytes.len());
     if raw != 0 {
         store_raw_com(h_shader, raw);
@@ -8658,9 +8638,7 @@ unsafe fn create_vs_input_variant(
         words.extend_from_slice(&out_words);
     }
 
-    let Some(dxvk) = dev.dxvk.as_ref() else {
-        return 0;
-    };
+    let dxvk = &dev.dxvk;
     let raw = dxvk.create_shader_sig(
         0,
         bytecode.as_ptr(),

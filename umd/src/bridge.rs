@@ -26,7 +26,7 @@
 //! `DXVK_FILTER_DEVICE_NAME="Virtio-GPU Venus"` before creating the instance.
 
 #[cxx::bridge]
-pub mod ffi {
+mod ffi {
     unsafe extern "C++" {
         include!("dxvk_bridge.h");
 
@@ -418,3 +418,305 @@ pub(crate) struct ScanoutImportInfo {
 // raw word rather than being wrapped as owned or borrowed. A newtype would be
 // ceremony across ten correct sites, so it is left out by the review's own
 // "rejected as cosmetic" standard.
+
+// ---------------------------------------------------------------------------
+// BridgeDevice: the sealed public API (R815)
+// ---------------------------------------------------------------------------
+//
+// After R813 the safe wrappers exist, but the raw `usize`-returning methods
+// remain callable at every site, so nothing prevents a future caller choosing
+// the wrong adoption. Module privacy alone is NOT sufficient: cxx generates the
+// raw methods as INHERENT methods on the public opaque type, and inherent
+// methods of a re-exported public type stay callable regardless of module
+// visibility. A newtype with no `Deref` is the only encoding that actually
+// seals them -- which is why `BridgeDevice` deliberately has none, and why
+// `inner` is private.
+//
+// The C++ side still returns `usize`, so the ABI is unchanged and this
+// migration cannot break the wire.
+
+/// The DXVK bridge device, with the raw cxx surface sealed off.
+pub struct BridgeDevice {
+    inner: cxx::UniquePtr<ffi::HeliosDxvkDevice>,
+}
+
+impl BridgeDevice {
+    /// Create a DXVK instance and logical device on the Helios venus adapter.
+    /// `None` when the bridge returned a null device (no adapter, creation
+    /// threw, ...) -- folding the old `is_null()` check into construction so a
+    /// `BridgeDevice` that exists is always usable.
+    pub fn create(luid_low: u32, luid_high: i32) -> Option<Self> {
+        let inner = ffi::helios_dxvk_create_device(luid_low, luid_high);
+        (!inner.is_null()).then_some(Self { inner })
+    }
+
+    /// The only path from the newtype to the sealed type, and it is private.
+    fn get(&self) -> Option<&ffi::HeliosDxvkDevice> {
+        self.inner.as_ref()
+    }
+
+    // -- borrowed COM ------------------------------------------------------
+
+    pub(crate) fn d3d11_device(&self) -> Option<ManuallyDrop<ID3D11Device>> {
+        self.get()?.d3d11_device()
+    }
+
+    pub(crate) fn d3d11_context(&self) -> Option<ManuallyDrop<ID3D11DeviceContext>> {
+        self.get()?.d3d11_context()
+    }
+
+    // -- owned COM ---------------------------------------------------------
+
+    /// # Safety
+    /// See [`ffi::HeliosDxvkDevice::open_texture2d`].
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn open_texture2d(
+        &self,
+        width: u32,
+        height: u32,
+        format: u32,
+        bind_flags: u32,
+        misc_flags: u32,
+        global: u32,
+        renderer_resource_id: u32,
+        venus_alloc_size: u64,
+        memory_type_index: u32,
+        scanout_linear: bool,
+        linear_scanout_target: bool,
+        cross_context_optimal: bool,
+    ) -> Option<ID3D11Resource> {
+        unsafe {
+            self.get()?.open_texture2d(
+                width,
+                height,
+                format,
+                bind_flags,
+                misc_flags,
+                global,
+                renderer_resource_id,
+                venus_alloc_size,
+                memory_type_index,
+                scanout_linear,
+                linear_scanout_target,
+                cross_context_optimal,
+            )
+        }
+    }
+
+    pub(crate) fn open_scanout_target(&self) -> Option<(ID3D11Resource, ScanoutImportInfo)> {
+        self.get()?.open_scanout_target()
+    }
+
+    pub(crate) fn create_scanout_texture2d(
+        &self,
+        width: u32,
+        height: u32,
+        format: u32,
+        bind_flags: u32,
+        misc_flags: u32,
+    ) -> Option<(ID3D11Resource, u64, u64)> {
+        self.get()?
+            .create_scanout_texture2d(width, height, format, bind_flags, misc_flags)
+    }
+
+    // -- scalar passthroughs ----------------------------------------------
+
+    pub(crate) fn venus_context_id(&self) -> u32 {
+        self.get().map_or(0, |d| d.venus_context_id())
+    }
+
+    pub(crate) fn present_frame_gate(&self, timeout_us: u32) -> bool {
+        self.get().is_some_and(|d| d.present_frame_gate(timeout_us))
+    }
+
+    pub(crate) fn present_sync_fence_id(&self) -> u32 {
+        self.get().map_or(0, |d| d.present_sync_fence_id())
+    }
+
+    pub(crate) fn present_flip_wait_arm(&self, target_value: u64, flip_value: u64) -> bool {
+        self.get()
+            .is_some_and(|d| d.present_flip_wait_arm(target_value, flip_value))
+    }
+
+    // -- pointer-laundering passthroughs -----------------------------------
+    //
+    // `unsafe` for the reason R814 established: each hands the bridge a raw
+    // address it reinterpret_casts.
+
+    /// # Safety
+    /// `d3d11_resource_ptr` must be a live `ID3D11Resource*`.
+    pub(crate) unsafe fn set_resource_kmt_handles(
+        &self,
+        d3d11_resource_ptr: usize,
+        local: u32,
+        global: u32,
+    ) -> bool {
+        self.get().is_some_and(|d| unsafe {
+            d.set_resource_kmt_handles(d3d11_resource_ptr, local, global)
+        })
+    }
+
+    /// # Safety
+    /// `d3d11_resource_ptr` must be live; the out-params must be writable.
+    pub(crate) unsafe fn get_resource_memory_info(
+        &self,
+        d3d11_resource_ptr: usize,
+        memory: *mut u64,
+        size: *mut u64,
+        offset: *mut u64,
+        resource_id: *mut u32,
+    ) -> bool {
+        self.get().is_some_and(|d| unsafe {
+            d.get_resource_memory_info(d3d11_resource_ptr, memory, size, offset, resource_id)
+        })
+    }
+
+    /// # Safety
+    /// `d3d11_resource_ptr` must be live; the out-params must be writable.
+    pub(crate) unsafe fn get_resource_alloc_identity(
+        &self,
+        d3d11_resource_ptr: usize,
+        venus_alloc_size: *mut u64,
+        memory_type_index: *mut u32,
+    ) -> bool {
+        self.get().is_some_and(|d| unsafe {
+            d.get_resource_alloc_identity(d3d11_resource_ptr, venus_alloc_size, memory_type_index)
+        })
+    }
+
+    /// # Safety
+    /// `d3d11_resource_ptr` must be a live `ID3D11Resource*`.
+    pub(crate) unsafe fn transfer_resource_ownership(&self, d3d11_resource_ptr: usize) -> bool {
+        self.get()
+            .is_some_and(|d| unsafe { d.transfer_resource_ownership(d3d11_resource_ptr) })
+    }
+
+    /// # Safety
+    /// `d3d11_resource_ptrs` must point at `count` live `ID3D11Resource*`.
+    pub(crate) unsafe fn rotate_resource_backings(
+        &self,
+        d3d11_resource_ptrs: *const usize,
+        count: usize,
+    ) -> bool {
+        self.get()
+            .is_some_and(|d| unsafe { d.rotate_resource_backings(d3d11_resource_ptrs, count) })
+    }
+
+    /// # Safety
+    /// Both pointers must be live `ID3D11Resource*` or 0.
+    pub(crate) unsafe fn present_sync_publish(
+        &self,
+        src_resource_ptr: usize,
+        dst_resource_ptr: usize,
+        kwait_ordered: bool,
+    ) -> u64 {
+        self.get().map_or(0, |d| unsafe {
+            d.present_sync_publish(src_resource_ptr, dst_resource_ptr, kwait_ordered)
+        })
+    }
+
+    /// # Safety
+    /// Both pointers must be live `ID3D11Resource*`.
+    pub(crate) unsafe fn present_vehicle_copy(
+        &self,
+        dst_resource_ptr: usize,
+        src_resource_ptr: usize,
+    ) -> i32 {
+        self.get().map_or(-1, |d| unsafe {
+            d.present_vehicle_copy(dst_resource_ptr, src_resource_ptr)
+        })
+    }
+
+    /// # Safety
+    /// `signal_cb` must be a valid `PFND3DDDI_SIGNALSYNCHRONIZATIONOBJECTFROMCPUCB`,
+    /// and `h_rt_device` / `fence_cpu_va` must outlive the device.
+    pub(crate) unsafe fn present_flip_wait_setup(
+        &self,
+        signal_cb: usize,
+        h_rt_device: usize,
+        h_fence: u32,
+        fence_cpu_va: usize,
+    ) -> bool {
+        self.get().is_some_and(|d| unsafe {
+            d.present_flip_wait_setup(signal_cb, h_rt_device, h_fence, fence_cpu_va)
+        })
+    }
+
+    // -- shader creates ----------------------------------------------------
+    //
+    // These return the bridge's owned COM pointer as a raw word because the IA
+    // caches key on the pointer VALUE; see the note above on why they are not
+    // additionally newtyped.
+
+    /// # Safety
+    /// `code` must point at `len` readable bytes.
+    pub(crate) unsafe fn create_vertex_shader(&self, code: *const u8, len: usize) -> usize {
+        self.get()
+            .map_or(0, |d| unsafe { d.create_vertex_shader(code, len) })
+    }
+
+    /// # Safety
+    /// `code` must point at `len` readable bytes.
+    pub(crate) unsafe fn create_pixel_shader(&self, code: *const u8, len: usize) -> usize {
+        self.get()
+            .map_or(0, |d| unsafe { d.create_pixel_shader(code, len) })
+    }
+
+    /// # Safety
+    /// `code` must point at `len` readable bytes.
+    pub(crate) unsafe fn create_geometry_shader(&self, code: *const u8, len: usize) -> usize {
+        self.get()
+            .map_or(0, |d| unsafe { d.create_geometry_shader(code, len) })
+    }
+
+    /// # Safety
+    /// `code` must point at `len` readable bytes.
+    pub(crate) unsafe fn create_hull_shader(&self, code: *const u8, len: usize) -> usize {
+        self.get()
+            .map_or(0, |d| unsafe { d.create_hull_shader(code, len) })
+    }
+
+    /// # Safety
+    /// `code` must point at `len` readable bytes.
+    pub(crate) unsafe fn create_domain_shader(&self, code: *const u8, len: usize) -> usize {
+        self.get()
+            .map_or(0, |d| unsafe { d.create_domain_shader(code, len) })
+    }
+
+    /// # Safety
+    /// `code` must point at `len` readable bytes.
+    pub(crate) unsafe fn create_compute_shader(&self, code: *const u8, len: usize) -> usize {
+        self.get()
+            .map_or(0, |d| unsafe { d.create_compute_shader(code, len) })
+    }
+
+    /// # Safety
+    /// `code`/`sig_words` must point at `len`/`sig_words_len` readable items.
+    pub(crate) unsafe fn create_shader_sig(
+        &self,
+        kind: u32,
+        code: *const u8,
+        len: usize,
+        sig_words: *const u32,
+        sig_words_len: usize,
+    ) -> usize {
+        self.get().map_or(0, |d| unsafe {
+            d.create_shader_sig(kind, code, len, sig_words, sig_words_len)
+        })
+    }
+
+    /// # Safety
+    /// `code`/`sig_words` must point at `len`/`sig_words_len` readable items.
+    pub(crate) unsafe fn create_tess_shader_sig(
+        &self,
+        kind: u32,
+        code: *const u8,
+        len: usize,
+        sig_words: *const u32,
+        sig_words_len: usize,
+    ) -> usize {
+        self.get().map_or(0, |d| unsafe {
+            d.create_tess_shader_sig(kind, code, len, sig_words, sig_words_len)
+        })
+    }
+}
