@@ -292,9 +292,9 @@ virtio-gpu scanout; IddCx/Looking Glass is no longer the active display path.*
    ⚠ One consequence for T5 sequencing: T5's **R805** renames `protocol/`'s `_pad` and four
    `kmd_render` read sites, so it is not UMD-only. Doing T3 first means R805 folds naturally into a
    KMD-deploy window instead of being an awkward exception to T5's "release UMD only" shape.
-7. **T4a BUILT — gate NOT YET RUN (2026-07-27, KMD `22.22.184.0`, 27 commits).** 18 of the 19
-   items (R601–R613, R615–R619) plus **all 11 minor items** landed; **R614 is the one item NOT
-   done** (see below). New host tests: `kmd_logic` 28→34, `protocol` 3→8.
+7. **T4a BUILT — gate NOT YET RUN (2026-07-27, KMD `22.22.184.0`, 34 commits).** 18 of the 19
+   items (R601–R613, R615–R619) plus **all 11 minor items** landed; **R614 is DECLINED**
+   (see below), so T4a is complete as scoped. New host tests: `kmd_logic` 28→34, `protocol` 3→8.
    **Structure added:** the no-panic rule is now enforced twice (a `verify-no-panics` cargo-make
    task that fails the PACKAGE build, plus `#![deny(clippy::unwrap_used, expect_used, panic)]`) —
    `grep -rn '\.expect(\|\.unwrap()' kmd_render/src` is EMPTY. `Writer` moved to `kmd_logic`
@@ -314,14 +314,17 @@ virtio-gpu scanout; IddCx/Looking Glass is no longer the active display path.*
    448**. The script now reads sub-page frames, sums declared call CHAINS rather than every symbol,
    and exits 1 over the ceiling; run it on every image. The venus bring-up is the shallower chain
    at 12816 because R608 split it into `#[inline(never)]` per-stage frames.
-   ⚠ **R614 (the `PassiveLevel` proof token) is NOT DONE, deliberately.** The review sized it at
-   "33 signatures plus caller groups"; measured against the tree it is ~190 sites, because
-   `venus.rs` sits between the DDIs and `virtio::ctrl` and every one of its 95 `VenusClient`/
-   `VenusRing` methods transitively reaches `ctrl::sleep_ms` through `ring_wait_until`. Full cost:
-   34 ctrl entry points + 95 venus methods + 64 external `ctrl::` call sites + 23
-   `with_venus_client` sites. It is pure type-level change (identical counters, identical desktop),
-   the review itself schedules it last "so a partial revert does not strand other items", and it
-   needs its own image.
+   ⚠ **R614 (the `PassiveLevel` proof token) is DECLINED — owner decision 2026-07-27, dropped
+   from T4a and NOT carried forward.** The review sized it at "33 signatures plus caller groups";
+   measured against the tree it is ~190 sites, because `venus.rs` sits between the DDIs and
+   `virtio::ctrl` and every one of its 95 `VenusClient`/`VenusRing` methods transitively reaches
+   `ctrl::sleep_ms` through `ring_wait_until`. Full cost: 34 ctrl entry points + 95 venus methods
+   + 64 external `ctrl::` call sites + 23 `with_venus_client` sites, for a pure type-level change
+   that buys no behaviour. **Consequence to remember: the PASSIVE-only contract of `virtio::ctrl`
+   stays what it always was — one prose comment at `ctrl.rs:19` over 34 public functions that
+   sleep, wait on KEVENTs or allocate contiguous memory, with no runtime assertion.** Anything
+   that later wants the guarantee should re-scope it from the venus layer outward. Marked DECLINED
+   in REFACTOR_REVIEW.md §T4a.
    ⚠ Formatting: `cargo fmt` was NOT run — the crate was already unclean before T4a (`lib.rs` 49
    hunks, `ddi/mod.rs` 26, `virtio/mod.rs` 20, all untouched here) and `cargo fmt` clean is T8's
    gate criterion. T4a added ~5 hunks in files it edited.

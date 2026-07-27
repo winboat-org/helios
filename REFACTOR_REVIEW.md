@@ -3664,6 +3664,21 @@ were dropped from the plan entirely (noted per item).
 
 ### R614. Express the PASSIVE-only contract of `virtio::ctrl` as a proof token
 
+- **DECLINED — owner decision, 2026-07-27, dropped from T4a and not carried forward.**
+  The effort estimate below ("33 signatures plus caller groups; the compiler finds every site")
+  is wrong by roughly 6x. Measured against the tree at KMD 22.22.184.0 the change is **~190
+  sites**: 34 `virtio::ctrl` entry points, **95 `VenusClient`/`VenusRing` methods**, 64 external
+  `ctrl::` call sites and 23 `with_venus_client` sites. The item's own "Where" section does not
+  mention `venus.rs`, and that is the omission: `venus.rs` sits BETWEEN the DDIs and
+  `virtio::ctrl`, and every one of its methods transitively reaches `ctrl::sleep_ms` through
+  `ring_wait_until`, so the token has to thread through all of them. There is no shortcut —
+  putting the token only on the `with_venus_client` gateway (the single gateway to
+  `&mut VenusClient`) still leaves the 35 `ctrl::` call sites inside `venus.rs` without one, and
+  minting a token at each of those is exactly the laundering the token exists to prevent.
+  The change is pure type-level (identical counters, identical desktop), so the cost buys no
+  behaviour. **The PASSIVE-only contract of `virtio::ctrl` therefore remains what it was: one
+  module-level prose comment at `ctrl.rs:19`, with no runtime assertion.** Anything that later
+  wants this guarantee should re-scope it from the venus layer outward, not from `ctrl` inward.
 - **Finding**: k-ctrlsubmit-13.
 - **Where**: `kmd_render/src/virtio/ctrl.rs:19` (the module comment "every function in this module MUST
   be called at PASSIVE_LEVEL"), `:147-153` (`sleep_ms` -> `KeDelayExecutionThread`), `:157-191`
