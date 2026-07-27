@@ -135,8 +135,8 @@ impl PassiveLevel {
     /// to a worker. All three already own that decision at the DDI, above their
     /// mint. `IrqlBad` moving is the signal that a fourth DDI needs one too —
     /// and returning a `Result` here would instead have put an unreachable
-    /// error arm at 11 audited sites and a new refusal population in a tranche
-    /// whose whole claim is "identical counters, identical desktop".
+    /// error arm at all twelve audited sites and a new refusal population in a
+    /// tranche whose whole claim is "identical counters, identical desktop".
     ///
     /// # Safety
     /// The caller must be running at `PASSIVE_LEVEL`, and must say why in a
@@ -152,11 +152,11 @@ impl PassiveLevel {
             // thread, not a synchronization edge. A lost increment under a
             // simultaneous violation on two CPUs is irrelevant — the first
             // nonzero read is the whole signal.
+            // Clamp the count explicitly rather than letting `<< 8` discard the
+            // high bits: 0xFF_FFFF violations is already far past "escalate".
             let prior = IRQL_ASSUME_BAD.load(Ordering::Relaxed) >> 8;
-            IRQL_ASSUME_BAD.store(
-                (prior.saturating_add(1) << 8) | u32::from(irql),
-                Ordering::Relaxed,
-            );
+            let count = prior.saturating_add(1).min(0x00FF_FFFF);
+            IRQL_ASSUME_BAD.store((count << 8) | u32::from(irql), Ordering::Relaxed);
         }
         Self {
             _not_send: PhantomData,
