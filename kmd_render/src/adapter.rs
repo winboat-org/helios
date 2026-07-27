@@ -55,34 +55,34 @@ pub struct PagingRam {
     pub size: u64,
 }
 
-/// The BAR memory segment (segment 3): the head of the host-visible venus
+/// The BAR memory segment: the head of the host-visible venus
 /// window, reserved as dxgkrnl's CPU-host-aperture region. Blobs are mapped
 /// into it at dxgkrnl-chosen aperture offsets by `DxgkDdiMapCpuHostAperture`
 /// (`cpu_host_aperture.rs`). See the two-memory-split root cause
 /// (HANDOFF_GDI_EXECUTOR_2026_07_05.md ★FINAL).
 pub struct BarSegment {
-    /// Guest-physical base = the host-visible window base (partition offset 0),
-    /// or the probe RAM block's base under `BarSegMode` 5.
+    /// Guest-physical base = the host-visible window base (partition offset 0).
     pub gpa: u64,
     /// Partition length in bytes (== reported segment Size/CommitLimit == the
     /// declared `DXGK_CPUHOSTAPERTURE` span == the `reserve_window_prefix`
     /// given to the blob-window allocator).
     pub size: u64,
-    /// The WDDM segment id this region is reported as (3 in the default
-    /// topology; 2 under `BarSegMode` 10/11 where it replaces/precedes the
-    /// paging-RAM segment). All BAR-segment consumers key off this field.
+    /// The WDDM segment id this region is reported as. All BAR-segment consumers
+    /// key off this field.
+    ///
+    /// Always [`crate::ddi::start_device::BAR_SEGMENT_ID`] now that the reported
+    /// topology is either "aperture only" or "aperture + BAR". The field stays
+    /// (rather than becoming a bare const at each consumer) because it is the
+    /// one place the positional id and the segment it describes are tied
+    /// together.
     pub seg_id: u32,
-    /// The `BarSegMode` topology this segment was configured under (10 = two
-    /// segments, BAR replaces RAM as id 2; 11 = three segments, BAR id 2 +
-    /// RAM id 3; anything else = default aperture/RAM/BAR = ids 1/2/3).
-    pub topo: u32,
-    /// AddAdapter-acceptance probe only (`BarSegMode` 5: RAM-backed region):
-    /// the segment is reported but NO allocation is ever placed in it
-    /// (`create_allocation` keeps everything on the aperture) and
-    /// MapCpuHostAperture refuses it — the aperture region is not the venus
-    /// window, so blob maps cannot back it.
-    pub probe_only: bool,
 }
+
+/// The existence of a [`BarSegment`] IS the topology: `Some` is
+/// [`crate::ddi::start_device::BarSegTopology::ApertureAndBar`], `None` is
+/// `Disabled`. The old `topo: u32` field carried a `BarSegMode` value that a
+/// second file then re-matched positionally against the literals 10 and 11;
+/// with the rejected shapes deleted there is nothing left for it to say.
 
 /// Exact system-memory backing Windows supplied for one allocation in a paging
 /// TRANSFER from the BAR segment to segment 0.
@@ -257,10 +257,6 @@ pub(crate) struct StartedState {
     /// `None` if the contiguous allocation failed (then we fall back to the old
     /// single-segment shape). Freed in `AdapterContext::drop`.
     pub paging_ram: Option<PagingRam>,
-    /// RAM block backing the `BarSegMode` 5 AddAdapter-acceptance probe (the
-    /// segment-3 aperture region is then real RAM instead of the BAR window).
-    /// Freed in `AdapterContext::drop`.
-    pub bar_probe_ram: Option<PagingRam>,
     /// The half StopDevice clears. `None` between StopDevice and the next
     /// StartDevice.
     transport: UnsafeCell<Option<TransportGeneration>>,
@@ -310,7 +306,6 @@ impl StartedState {
         knobs: StartedKnobs,
         scanout_mode: ScanoutMode,
         paging_ram: Option<PagingRam>,
-        bar_probe_ram: Option<PagingRam>,
     ) -> Box<Self> {
         Box::new(Self {
             // SAFETY: per the fn contract; a plain POD copy of dxgkrnl's buffer.
@@ -321,7 +316,6 @@ impl StartedState {
             display_half: knobs.display_half,
             scanout_mode,
             paging_ram,
-            bar_probe_ram,
             transport: UnsafeCell::new(None),
         })
     }
@@ -410,9 +404,9 @@ pub(crate) struct TransportGeneration {
     /// this refactor.
     #[allow(dead_code)]
     pub page_table_window: Option<(u64, u64)>,
-    /// BAR memory segment (segment 3) — the head partition of the host-visible
+    /// BAR memory segment — the head partition of the host-visible
     /// window, reserved as dxgkrnl's CPU-host-aperture region at StartDevice.
-    /// `None` if the window is absent/too small; segment 3 is then not
+    /// `None` if the window is absent/too small; the BAR segment is then not
     /// reported and standard allocations stay on the aperture (old behavior).
     pub bar_segment: Option<BarSegment>,
     /// The persistent venus 3D context id (`VIRTIO_GPU_CAPSET_VENUS`) the venus
@@ -2198,22 +2192,6 @@ impl AdapterContext {
         unsafe { (*self.started.get()).as_deref_mut() }.and_then(|s| s.paging_ram.take())
     }
 
-    /// As [`Self::take_paging_ram`], for the `BarSegMode` 5 probe block.
-    ///
-    /// # Safety
-    /// Same contract as [`Self::take_paging_ram`].
-    pub(crate) unsafe fn take_bar_probe_ram(&self) -> Option<PagingRam> {
-        // SAFETY: per the fn contract.
-        unsafe { (*self.started.get()).as_deref_mut() }.and_then(|s| s.bar_probe_ram.take())
-    }
-
-    /// Free a contiguous RAM block that is being replaced rather than carried
-    /// forward. PASSIVE_LEVEL.
-    pub(crate) fn free_contiguous_ram(ram: PagingRam) {
-        // SAFETY: `va` came from MmAllocateContiguousMemory and is freed once.
-        unsafe { MmFreeContiguousMemory(ram.va.as_ptr() as *mut _) };
-    }
-
     /// Publish the started state. StartDevice only, exactly once per start.
     ///
     /// # Safety
@@ -2412,11 +2390,6 @@ impl Drop for AdapterContext {
             if let Some(pr) = state.paging_ram.take() {
                 // SAFETY: `va` came from MmAllocateContiguousMemory in
                 // `alloc_paging_ram` and is freed exactly once here.
-                unsafe { MmFreeContiguousMemory(pr.va.as_ptr() as *mut _) };
-            }
-            if let Some(pr) = state.bar_probe_ram.take() {
-                // SAFETY: same contract as paging_ram (alloc_contiguous_ram),
-                // freed once.
                 unsafe { MmFreeContiguousMemory(pr.va.as_ptr() as *mut _) };
             }
         }

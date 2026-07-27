@@ -183,6 +183,11 @@ pub enum FaultCounter {
     /// this driver believes it said. Expected 0 on 24H2, which passes the full
     /// 592-byte struct.
     CapTrunc,
+    /// `BarSegMode` held a value that is no longer a segment topology — value is
+    /// that stale number. The adapter binds the production shape anyway. Most
+    /// likely a VM left set from one of the deleted Code-43 bisect arms
+    /// (1/2/5/11); the only legal values are 0 and 10.
+    BarMCo,
 }
 
 impl FaultCounter {
@@ -206,6 +211,7 @@ impl FaultCounter {
             FaultCounter::StHpdX => b"StHpdX",
             FaultCounter::StVioR => b"StVioR",
             FaultCounter::CapTrunc => b"CapTrunc",
+            FaultCounter::BarMCo => b"BarMCo",
         }
     }
 
@@ -227,6 +233,7 @@ impl FaultCounter {
         FaultCounter::StHpdX,
         FaultCounter::StVioR,
         FaultCounter::CapTrunc,
+        FaultCounter::BarMCo,
     ];
 }
 

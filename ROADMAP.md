@@ -1909,9 +1909,17 @@ Plan:
   `BarSegBaseMB`.
   `DisplayHalf=1` enables the render+display adapter shape. `AllocCached=0`
   is the CpuVisible cached-allocation kill switch. `DirectFlipCaps` and `CrossAdaptCaps` are
-  explicit cap-advertisement probes; leave off unless bisecting. `BarSegMode`
-  controls segment topology; `BarSegFlags`/`BarSegBaseMB` bisect BAR descriptor
-  flags/base. `DiagLevel` enables the generic S-ring registry breadcrumbs.
+  explicit cap-advertisement probes; leave off unless bisecting.
+  `BarSegFlags`/`BarSegBaseMB` bisect BAR descriptor flags/base. `DiagLevel`
+  enables the generic S-ring registry breadcrumbs.
+  **`BarSegMode` now has exactly TWO legal values** (T4b/R904, KMD 22.22.187.0):
+  `10` (default, absent = production: aperture id 1 + BAR id 2) and `0` (the
+  recovery baseline: aperture id 1 + paging-RAM cpu-host id 2, no BAR). The
+  historic Code-43 bisect arms `1`, `2`, `5` and `11` are DELETED, along with the
+  `probe_only` BAR segment and its 16 MiB contiguous RAM block. Any other value
+  is coerced to `10` and recorded in the new `BarMCo` counter carrying the stale
+  number — so a VM left set from an old bisect now binds and says so instead of
+  reporting a segment no allocation may use. Nothing reports segment id 3 any more.
 - **ScanoutDiag modes** (service key, production default 0): `1` creates and
   binds a CPU-filled KMD blob once; `2`+ rebinds the diagnostic blob after OS
   scanout attempts; `3` tests shareable memory blob; `4`+ tests KMD-created

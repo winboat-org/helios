@@ -17,82 +17,91 @@ use crate::dxgk::*;
 const VENUS_ALLOC_ENABLED: bool = true;
 
 /// Size cap for the VidMm-owned head partition of the host-visible window (the
-/// CPU-visible BAR memory segment, id 3). The window is 8 GiB on the current
+/// CPU-visible BAR memory segment). The window is 8 GiB on the current
 /// QEMU config (`hostmem=8G`); 1 GiB comfortably holds the CPU-rasterized
 /// GDI/shadow/staging/shared-primary standard allocations (a full-screen
 /// surface is ~8 MiB) while leaving the rest to the KMD/ICD blob allocator.
 const BAR_SEGMENT_MAX_BYTES: u64 = 1 << 30;
 
-/// Configure the segment-3 shape per the `BarSegMode` registry DWORD (service
-/// key; read once per StartDevice, so experiments iterate via `reg add` +
-/// `devcon restart` — AddAdapter re-runs without a rebuild/reboot). The knob
-/// exists because BOTH initial shapes (classic CpuVisible 22.22.45,
-/// CpuHostAperture 22.22.46) were rejected at AddAdapter right after the
-/// segment queries, and each blind retry costs an owner reboot.
+/// The segment topology this adapter may report. **Two shapes, not five.**
 ///
-///   0  = no BAR segment (baseline recovery shape — always binds)
+/// The `BarSegMode` registry DWORD (service key; read once per StartDevice, so
+/// experiments iterate via `reg add` + `devcon restart` — AddAdapter re-runs
+/// without a rebuild/reboot) once selected among five, because BOTH initial
+/// shapes (classic CpuVisible 22.22.45, CpuHostAperture 22.22.46) were rejected
+/// at AddAdapter right after the segment queries and each blind retry cost an
+/// owner reboot. Four of those arms were annotated REJECTED or historic in this
+/// file's own table and yet stayed reachable from a DWORD, and any unrecognised
+/// value fell through to a shape the same table documented as rejected:
+///
 ///   1  = 3 segments (aperture/RAM/BAR id 3) — REJECTED by dxgmms: a
 ///        SupportsCpuHostAperture segment must be the LAST segment, so ANY
 ///        segment after the RAM cpu-host segment fails AddAdapter with
 ///        "Invalid flags specified for segment #2" (ETW AzureTriage, 2026-07-05)
 ///   2  = 3 segments, BAR id 3, 64 MiB   (historic size-bisect arm; rejected)
 ///   5  = 3 segments, RAM probe id 3     (historic backing-bisect arm; rejected)
-///   10 = 2 segments: aperture + BAR as SEGMENT ID 2, paging-RAM segment
-///        dropped (it was vestigial: page tables live in system segment 0,
-///        paging buffers in the aperture). **THE PRODUCTION SHAPE** — binds,
-///        and with GDI surfaces in this device segment win32k routes their
-///        rasterization through DxgkDdiRenderGdi (the executor writes the
-///        blob bytes dwm samples) instead of CPU raster into aperture pages:
-///        the two-memory-split fix. First full desktop 2026-07-05 20:53.
 ///   11 = 3 segments swapped: aperture + BAR id 2 + RAM id 3 (rejected —
 ///        confirms the must-be-last rule; the BAR cpu-host seg isn't last)
 ///
-/// Returns the segment AND, for the `BarSegMode` 5 probe arm, the RAM block that
-/// backs it — instead of writing `bar_probe_ram` through a `&mut AdapterContext`.
-/// That write was one of the reasons StartDevice needed a unique borrow at all.
+/// A VM left with `BarSegMode=5` from an old bisect booted into an adapter that
+/// reported a segment no allocation could use, which is indistinguishable from a
+/// code regression; 1, 2, 11 and any unknown value reached Code 43. They are gone.
+/// An unrecognised value is now COERCED to the production shape and counted in
+/// `BarMCo`, so a stale knob is loud rather than fatal.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BarSegTopology {
+    /// `BarSegMode=0` — no BAR segment. The recovery baseline that always binds:
+    /// aperture (id 1) plus, if the contiguous allocation succeeded, the
+    /// paging-RAM cpu-host segment (id 2).
+    Disabled,
+    /// `BarSegMode=10` — **the production shape**. Two segments: aperture (id 1)
+    /// plus the BAR as id 2, the vestigial paging-RAM segment dropped (page
+    /// tables live in system segment 0, paging buffers in the aperture). With
+    /// GDI surfaces in this device segment win32k routes their rasterization
+    /// through DxgkDdiRenderGdi instead of CPU raster into aperture pages: the
+    /// two-memory-split fix. First full desktop 2026-07-05 20:53.
+    ApertureAndBar,
+}
+
+impl TryFrom<u32> for BarSegTopology {
+    /// The unrecognised value, for the caller to count.
+    type Error = u32;
+
+    fn try_from(mode: u32) -> Result<Self, u32> {
+        match mode {
+            0 => Ok(Self::Disabled),
+            10 => Ok(Self::ApertureAndBar),
+            other => Err(other),
+        }
+    }
+}
+
+/// Configure the BAR memory segment per [`BarSegTopology`].
 fn setup_bar_segment(
     adapter: &crate::adapter::AdapterContext,
-) -> (
-    Option<crate::adapter::BarSegment>,
-    Option<crate::adapter::PagingRam>,
-) {
+) -> Option<crate::adapter::BarSegment> {
     let mode = crate::diag::read_config_dword(b"BarSegMode", 10);
     crate::diag::record_named_bytes(b"BarM", mode);
-    if mode == 0 {
-        return (None, None);
-    }
-    let seg_id = if mode == 10 || mode == 11 { 2 } else { 3 };
-    if mode == 5 {
-        // RAM-backed acceptance probe: is the rejection about the BAR GPA?
-        let Some(ram) = crate::adapter::AdapterContext::alloc_contiguous_ram(16 << 20) else {
-            return (None, None);
-        };
-        let (gpa, size) = (ram.phys, ram.size);
-        crate::diag::record(0x0B00_0008);
-        crate::diag::record(((size >> 20) & 0xFFFF_FFFF) as u32);
-        return (
-            Some(crate::adapter::BarSegment {
-                gpa,
-                size,
-                seg_id,
-                topo: mode,
-                probe_only: true,
-            }),
-            Some(ram),
-        );
-    }
-    let Some(window) = adapter.with_virtio(|v| v.host_visible()).ok().flatten() else {
-        return (None, None);
+    let topo = match BarSegTopology::try_from(mode) {
+        Ok(topo) => topo,
+        Err(stale) => {
+            // A deleted bisect arm, or a typo. Bind the production shape and say
+            // which value was coerced — silently honouring it would reproduce
+            // exactly the "reports a segment nothing may use" failure this
+            // reduction exists to remove.
+            crate::diag::fault(crate::diag::FaultCounter::BarMCo, stale);
+            BarSegTopology::ApertureAndBar
+        }
     };
-    let size = match mode {
-        2 => 64 << 20,
-        // 1, 10, 11, or any unknown value → the default partition size.
-        _ => (window.len / 2).min(BAR_SEGMENT_MAX_BYTES) & !4095,
-    };
+    if topo == BarSegTopology::Disabled {
+        return None;
+    }
+    let window = adapter.with_virtio(|v| v.host_visible()).ok().flatten()?;
+    let size = (window.len / 2).min(BAR_SEGMENT_MAX_BYTES) & !4095;
     if size < (16 << 20) || size > window.len {
         crate::diag::record(0x0B00_00E8);
         crate::diag::fault(crate::diag::FaultCounter::StBar, (size >> 20) as u32);
-        return (None, None);
+        return None;
     }
     // The KMD blob-window allocator must never hand out offsets inside the
     // aperture region (dxgkrnl's CPU-host-aperture allocator owns them).
@@ -103,16 +112,14 @@ fn setup_bar_segment(
     let _ = adapter.with_virtio(|v| v.configure_window_reserve(size));
     crate::diag::record(0x0B00_0008);
     crate::diag::record(((size >> 20) & 0xFFFF_FFFF) as u32);
-    (
-        Some(crate::adapter::BarSegment {
-            gpa: window.base,
-            size,
-            seg_id,
-            topo: mode,
-            probe_only: false,
-        }),
-        None,
-    )
+    Some(crate::adapter::BarSegment {
+        gpa: window.base,
+        size,
+        // Positional: the aperture is always index 0 (id 1), so the BAR is index
+        // 1. This used to be computed (`if mode == 10 || mode == 11 { 2 } else
+        // { 3 }`) purely because the deleted topologies moved it to id 3.
+        seg_id: crate::ddi::gpummu::MEMORY_SEGMENT_ID,
+    })
 }
 
 /// Stand up the persistent venus context + page-table blob. Returns
@@ -240,8 +247,6 @@ pub unsafe extern "C" fn dxgkddi_start_device(
     // SAFETY: StartDevice, PASSIVE, serialized by dxgkrnl against every other
     // lifecycle DDI; the blocks are republished below in the new state.
     let mut paging_ram = unsafe { adapter.take_paging_ram() };
-    // SAFETY: same contract.
-    let carried_probe_ram = unsafe { adapter.take_bar_probe_ram() };
     if paging_ram.is_none() {
         paging_ram = AdapterContext::alloc_paging_ram();
     }
@@ -265,7 +270,6 @@ pub unsafe extern "C" fn dxgkddi_start_device(
     let mut transport_fail_status: u32 = 0;
     // The transport generation, built as locals and installed after publication.
     let mut bar_segment = None;
-    let mut bar_probe_ram = None;
     let mut venus_ctx_id = 0u32;
     let mut page_table_window = None;
     // SAFETY: dxgkrnl_interface is valid per the DDI contract (also copied into
@@ -287,11 +291,11 @@ pub unsafe extern "C" fn dxgkddi_start_device(
                 .store(gpu.isr_status_addr(), core::sync::atomic::Ordering::Release);
             adapter.set_virtio(Some(gpu));
 
-            // ── BAR memory segment / CPU host aperture (segment 3) ───────────
+            // ── BAR memory segment / CPU host aperture ──────────────────────
             // Reserve the window head BEFORE any blob map can allocate a
             // window offset, and before dxgkrnl queries segments.
             // Two-memory-split fix (Option A).
-            (bar_segment, bar_probe_ram) = setup_bar_segment(adapter);
+            bar_segment = setup_bar_segment(adapter);
 
             // ── Venus-backed page-table memory (best-effort) ─────────────────
             // Self-allocate a 16-MiB HOST_VISIBLE|HOST_COHERENT VkDeviceMemory over
@@ -406,13 +410,6 @@ pub unsafe extern "C" fn dxgkddi_start_device(
     };
 
     // ── Publish. Everything above was a local; from here the adapter answers. ──
-    // The RAM block the probe arm carried in is freed if this start did not take
-    // it (mode changed away from 5), rather than being dropped on the floor.
-    if bar_probe_ram.is_none() {
-        bar_probe_ram = carried_probe_ram;
-    } else if let Some(stale) = carried_probe_ram {
-        AdapterContext::free_contiguous_ram(stale);
-    }
     // SAFETY: StartDevice, PASSIVE_LEVEL, serialized by dxgkrnl; published once
     // per start, and every reader reaches it through the Acquire in `started()`.
     // `boxed` builds on the HEAP in its own (transient) frame — never bind its
@@ -428,7 +425,6 @@ pub unsafe extern "C" fn dxgkddi_start_device(
             },
             scanout_mode,
             paging_ram,
-            bar_probe_ram,
         ));
         adapter.set_transport_generation(Some(crate::adapter::TransportGeneration {
             page_table_window,

@@ -9,7 +9,7 @@
 //!
 //! 2. **Segment 3 (BAR / venus window head) — REAL.** This is the CPU side of
 //!    the two-memory-split fix (HANDOFF_GDI_EXECUTOR_2026_07_05.md ★FINAL):
-//!    when dxgkrnl needs CPU access to a segment-3 allocation (Lock, win32k
+//!    when dxgkrnl needs CPU access to a BAR-segment allocation (Lock, win32k
 //!    GDI raster), it calls `DxgkDdiMapCpuHostAperture` with the aperture
 //!    pages IT chose inside our declared window-head region. We host-map the
 //!    allocation's venus BLOB at exactly that window offset
@@ -87,7 +87,7 @@ static BAR_AP_SIZE_DELTA: AtomicU32 = AtomicU32::new(0);
 // CPU view's tail addressing unbacked window offsets. Must stay 0.
 static BAR_AP_SIZE_PROVENANCE: AtomicU32 = AtomicU32::new(0);
 
-/// The segment-3 aperture counter block, mirrored through the shared throttled
+/// The BAR-segment aperture counter block, mirrored through the shared throttled
 /// emitter (R317). Same names and encodings; the cadence changes — this ran on
 /// every map, unmap and refusal (17 synchronous registry writes each). Failure
 /// counters still surface on the operation that produced them.
@@ -288,7 +288,7 @@ pub unsafe extern "C" fn dxgkddi_map_cpu_host_aperture(
     let adapter = unsafe { &*(h_adapter as *const AdapterContext) };
     let bar_active = adapter
         .bar_segment()
-        .filter(|b| !b.probe_only && b.seg_id == args.SegmentId as u32);
+        .filter(|b| b.seg_id == args.SegmentId as u32);
     let Some(bar) = bar_active else {
         // Paging-RAM segment (or a probe arm): decorative identity aperture
         // over real RAM; acknowledging is correct (see module doc).
@@ -425,7 +425,7 @@ pub unsafe extern "C" fn dxgkddi_unmap_cpu_host_aperture(
     // SAFETY: our AdapterContext (DDI contract).
     let adapter = unsafe { &*(h_adapter as *const AdapterContext) };
     let is_bar = adapter.bar_segment().as_ref().map_or(false, |b| {
-        !b.probe_only && b.seg_id == args.SegmentId as u32
+        b.seg_id == args.SegmentId as u32
     });
     if !is_bar {
         return STATUS_SUCCESS;

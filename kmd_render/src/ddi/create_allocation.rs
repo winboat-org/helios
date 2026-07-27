@@ -130,7 +130,7 @@ struct AllocationContext {
     /// authoritative record travels in the private-data trailer / open identity.
     venus_alloc_size: u64,
     memory_type_index: u32,
-    /// VidMm-assigned SegmentAddress in the CPU-visible BAR segment (id 3), or
+    /// VidMm-assigned SegmentAddress in the CPU-visible BAR segment, or
     /// [`BAR_UNPLACED`]. Written by `BuildPagingBuffer` when it maps the blob at
     /// the assigned offset; atomic because paging DDIs run concurrently with
     /// allocation DDIs. Only meaningful for `bar_eligible` allocations.
@@ -1739,12 +1739,8 @@ unsafe fn create_one(
     // blob exposes (two-memory-split fix). UMD/venus-backed adopted allocations
     // stay off this path for now: making every adopted present/shared resource
     // BAR-eligible destabilized the LogonUI/DWM boot path, so the 3D-present
-    // equivalent needs a narrower resource-class gate. Bisect arms (probe_only
-    // RAM region / classic descriptor) never receive allocations.
-    let bar_seg_id = adapter
-        .bar_segment()
-        .filter(|b| !b.probe_only)
-        .map(|b| b.seg_id);
+    // equivalent needs a narrower resource-class gate.
+    let bar_seg_id = adapter.bar_segment().map(|b| b.seg_id);
     // Truth table verified identical to `venus_memory_id != 0 && ...`:
     // HostAuthoritative is exactly the three KMD-created arms, which are exactly
     // the arms that set venus_memory_id. What changes is that the aperture

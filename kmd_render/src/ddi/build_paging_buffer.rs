@@ -22,8 +22,8 @@
 //!     PTE size, so VidMm carves a correctly-sized root page table.
 //!   - `SetRootPageTable` records-and-ignores (the root address is decorative).
 //!
-//! **BAR SEGMENT (id 3) CONTENT OPS ARE REAL** (two-memory-split fix,
-//! HANDOFF_GDI_EXECUTOR_2026_07_05.md ★FINAL). A segment-3 allocation's
+//! **BAR SEGMENT CONTENT OPS ARE REAL** (two-memory-split fix,
+//! HANDOFF_GDI_EXECUTOR_2026_07_05.md ★FINAL). A BAR-segment allocation's
 //! content IS its venus blob (the CPU host aperture exposes the blob bytes —
 //! `cpu_host_aperture.rs`), so:
 //!
@@ -34,7 +34,7 @@
 //!     across eviction/re-commit. FILL / VIRTUAL_FILL pattern-fill the blob.
 //!   - A segment→segment move needs NO copy (content is intrinsic to the host
 //!     memory object; the decorative SegmentAddress values are ignored).
-//!   - A leaf UPDATE_PAGE_TABLE naming segment 3 is harvested (atomic store
+//!   - A leaf UPDATE_PAGE_TABLE naming the BAR segment is harvested (atomic store
 //!     only) as a placement diagnostic.
 //!
 //! IRQL: the docs state `DxgkDdiBuildPagingBuffer` runs at PASSIVE_LEVEL; the
@@ -95,9 +95,9 @@ pub fn diag_dump_gpummu_atomics() {
     crate::diag::record(0x0F05_0000 | (PAGING_LAST_OP.load(Ordering::Relaxed) & 0xFFFF));
 }
 
-// ── BAR-segment (id 3) paging engine ─────────────────────────────────────────
+// ── BAR-segment paging engine ───────────────────────────────────────────────
 //
-// Content ops for segment-3 allocations are PLACEMENT-INDEPENDENT: an
+// Content ops for BAR-segment allocations are PLACEMENT-INDEPENDENT: an
 // allocation's content is its venus BLOB (the CPU host aperture exposes blob
 // bytes wherever dxgkrnl asked them mapped — `cpu_host_aperture.rs`), so a
 // paging TRANSFER/FILL reads/writes the blob through a transient kernel map of
@@ -993,7 +993,7 @@ fn fill_pattern(dst: *mut u8, len: usize, pattern: u32) {
     }
 }
 
-/// Diagnostic harvest of a LEAF `UPDATE_PAGE_TABLE`: record the segment-3
+/// Diagnostic harvest of a LEAF `UPDATE_PAGE_TABLE`: record the BAR-segment
 /// physical placement VidMm assigned (pure atomic store — DISPATCH-safe, no
 /// side effects; content ops do not depend on it in the aperture model).
 unsafe fn bar_harvest_page_table(
@@ -1049,7 +1049,7 @@ unsafe fn bar_harvest_page_table(
 
 /// `DxgkDdiBuildPagingBuffer` — translate a memory-management operation into GPU
 /// DMA. Null engine for the aperture / page-table segments; REAL content engine
-/// for BAR-segment (id 3) allocations. See the module doc.
+/// for BAR-segment allocations. See the module doc.
 pub unsafe extern "C" fn dxgkddi_build_paging_buffer(
     h_adapter: *mut c_void,
     build_paging_buffer: *mut DXGKARG_BUILDPAGINGBUFFER,

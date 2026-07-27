@@ -76,20 +76,23 @@ pub const PAGE_TABLE_ALIGNMENT_BYTES: u32 = 4096;
 /// the aperture is reported FIRST (segment id 1) and is `PagingBufferSegmentId`.
 /// Matches the proven viogpu3d virtio-gpu WDDM segment (WDDM_FAKE_VIDMM §A2.2).
 pub const APERTURE_SEGMENT_ID: u32 = 1;
-/// Segment id of the CPU-visible **memory** segment (host-visible venus BAR) used
-/// by render allocations. Page-table allocations deliberately use system memory
-/// segment id 0 instead; see [`SYSTEM_MEMORY_SEGMENT_ID`].
+/// Segment id of the CPU-visible **memory** segment: the head partition of the
+/// host-visible venus BAR window, used by render allocations. Segment ids are
+/// positional and the aperture is always index 0, so this is index 1.
+///
+/// It is reported with the CPU-HOST-APERTURE shape — the only memory-segment
+/// CPU-access shape this dxgkrnl accepts; the classic
+/// CpuVisible/CpuTranslatedAddress form fails AddAdapter with Code 43 (proven
+/// 2026-07-05). CPU access (Lock / win32k GDI raster) is REAL:
+/// `DxgkDdiMapCpuHostAperture` maps each allocation's venus blob at the
+/// dxgkrnl-chosen aperture offset inside the window, so CPU raster, the RenderGdi
+/// executor and the host GPU all address ONE memory — the two-memory-split fix.
+///
+/// Page-table allocations deliberately use system memory segment id 0 instead;
+/// see [`SYSTEM_MEMORY_SEGMENT_ID`]. A sibling `BAR_SEGMENT_ID = 3` used to sit
+/// here for the three-segment topologies; those shapes were all documented as
+/// AddAdapter-rejected and have been deleted, so id 3 no longer exists.
 pub const MEMORY_SEGMENT_ID: u32 = 2;
-/// Segment id of the BAR MEMORY SEGMENT (segment index 2, id 3): the head
-/// partition of the host-visible venus window, reported with the CPU-HOST-
-/// APERTURE shape (the only memory-segment CPU-access shape this dxgkrnl
-/// accepts — the classic CpuVisible/CpuTranslatedAddress form fails AddAdapter
-/// with Code 43, proven 2026-07-05). CPU access (Lock / win32k GDI raster) is
-/// REAL: `DxgkDdiMapCpuHostAperture` maps each allocation's venus blob at the
-/// dxgkrnl-chosen aperture offset inside the window, so CPU raster, the
-/// RenderGdi executor, and the host GPU all address ONE memory — the
-/// two-memory-split fix.
-pub const BAR_SEGMENT_ID: u32 = 3;
 /// WDDM reserves page-table segment id 0 for system memory. This avoids the
 /// `VIDMM_PAGE_TABLE_BASE::GetCpuVisibleAddress` segment-attribute path that
 /// bugchecks when a fake page-table device segment is dropped or lacks bit 13.

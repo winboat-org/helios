@@ -497,38 +497,34 @@ const APERTURE_BASE_ADDRESS: i64 = 0xC000_0000;
 /// Aperture window length. viogpu3d uses 1 GiB (`256 * 1024 * 4096`).
 const APERTURE_SEGMENT_SIZE: SIZE_T = 256 * 1024 * 4096;
 
-/// Segment-shape selector — the lever from the live-KD decode of dxgmms2's paging
-/// DMA-pool init (INITDMAPOOLS_HANDOVER.md, 2026-06-21).
-///
-/// `VIDMM_GLOBAL::InitDmaPools` builds ONE paging DMA pool and validates the FIRST
-/// reported segment (`segdesc[0]`): it requires that segment's per-attribute
-/// object's "can host a paging buffer" flag (`[attr+0x68] & 1`). A CPU-visible
-/// *memory* segment (the BAR) NEVER has that flag; a linear **aperture** segment
-/// does (classic WDDM paging-buffer backing via MAP_APERTURE_SEGMENT — what the
-/// proven viogpu3d driver reports, WDDM_FAKE_VIDMM §A2.2). The decode also showed
-/// VidMm DROPS a system-RAM-backed memory segment (only the BAR registered), so the
-/// old "RAM paging segment id 2" never existed.
-///
-/// - `false` = **SAFE** shape: report only the BAR CpuVisible **memory** segment.
-///   InitDmaPools then cleanly *rejects* it (`STATUS_INVALID_PARAMETER`, Code 43) —
-///   a status return, not a crash, so the adapter just fails to start and the VM
-///   boots normally with gpu-gl attached. Use this for a deployable safe baseline.
-/// - `true` = **APERTURE** shape: report a viogpu3d-style aperture segment FIRST
-///   (= `PagingBufferSegmentId`) so InitDmaPools ACCEPTS it, plus the BAR memory
-///   segment (id 2) for page tables (`MEMORY_SEGMENT_ID`) + render. This is the
-///   deployable shape after the 2026-06-22 follow-on fix in `CreateContext`:
-///   `DmaBufferSegmentSet=1` keeps the CDD/system context DMA pool on the
-///   aperture allocation path instead of letting VidMm build a null-allocation
-///   contiguous-memory pool.
-const REPORT_APERTURE_PAGING_SEGMENT: bool = true;
+// WHY THE APERTURE IS ALWAYS SEGMENT 0 — from the live-KD decode of dxgmms2's
+// paging DMA-pool init (INITDMAPOOLS_HANDOVER.md, 2026-06-21).
+//
+// `VIDMM_GLOBAL::InitDmaPools` builds ONE paging DMA pool and validates the FIRST
+// reported segment (`segdesc[0]`): it requires that segment's per-attribute
+// object's "can host a paging buffer" flag (`[attr+0x68] & 1`). A CPU-visible
+// *memory* segment (the BAR) NEVER has that flag; a linear **aperture** segment
+// does (classic WDDM paging-buffer backing via MAP_APERTURE_SEGMENT — what the
+// proven viogpu3d driver reports, WDDM_FAKE_VIDMM §A2.2). The decode also showed
+// VidMm DROPS a system-RAM-backed memory segment (only the BAR registered), so
+// the old "RAM paging segment id 2" never existed.
+//
+// The `REPORT_APERTURE_PAGING_SEGMENT` lever that used to sit here selected
+// between this and a BAR-only shape whose own doc comment described it as
+// rejected by InitDmaPools with Code 43 *by design*. It was a `const bool = true`,
+// so the false branch was const-folded out of the binary while still widening the
+// state space every reader of `query_segments` had to consider. Deleted with the
+// rest of the known-rejected shapes; the aperture-first rule is now unconditional
+// and stated once, here.
 
 /// PATH-A lever (2026-06-22): declare `DXGK_VIDMMCAPS::CrossAdapterResource` so the
 /// OS can use Helios as the cross-adapter render side for the Looking Glass IDD's
 /// composition swapchain. See the comment in `query_driver_caps`. Gated for clean
 /// reversibility — flip to `false` and redeploy if it destabilizes boot.
-/// `pub(crate)` so the allocation path (`create_allocation.rs`) gates the matching
-/// cross-adapter surface layout (aperture-eligible + 256-aligned linear) on the
-/// same lever.
+/// `pub(crate)` is now vestigial: a grep finds exactly ONE reader, the `mem_caps`
+/// OR below. The claim this comment used to make — that `create_allocation.rs`
+/// gates a matching cross-adapter surface layout (aperture-eligible + 256-aligned
+/// linear) on the same lever — is stale; that file does not read this const.
 ///
 /// 2026-06-22 EXPERIMENT RESULT (1st try, `true`): declaring the cap made dxgkrnl
 /// drive the GDI hardware-acceleration render path (`DxgkDdiRenderKm`) against the
@@ -787,16 +783,19 @@ unsafe fn query_segments(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTERIN
     out.PagingBufferSize = 64 * 1024;
     out.PagingBufferPrivateDataSize = 0;
 
-    if REPORT_APERTURE_PAGING_SEGMENT {
-        // APERTURE shape (Option A): aperture (id 1, idx 0) = paging-buffer host
-        // (passes InitDmaPools); AddDevice-time RAM-backed MEMORY segment (id 2,
-        // idx 1) = page tables, exposed through WDDM CPU host aperture. This must
-        // use `paging_ram`, not `page_table_window`: QuerySegment4 runs before
-        // StartDevice's venus allocation, so `page_table_window` is not available
-        // when VidMm builds its segment table. If the contiguous RAM allocation was
-        // unavailable, fall back to NbSegment=1 (aperture only).
+    {
+        // Aperture (id 1, idx 0) = paging-buffer host, which is what passes
+        // InitDmaPools (see the note above the aperture constants). The second
+        // slot is the BAR under `BarSegTopology::ApertureAndBar`, or the
+        // AddDevice-time RAM-backed cpu-host MEMORY segment under `Disabled`.
+        //
+        // The RAM slot must use `paging_ram`, not `page_table_window`:
+        // QuerySegment4 runs before StartDevice's venus allocation, so
+        // `page_table_window` is not available when VidMm builds its segment
+        // table. If the contiguous RAM allocation was unavailable too, this
+        // falls back to NbSegment = 1 (aperture only).
         let page_table = adapter.paging_ram();
-        let bar = adapter.bar_segment().map(|b| (b.gpa, b.size, b.topo));
+        let bar = adapter.bar_segment().map(|b| (b.gpa, b.size));
         crate::diag::record(if descriptors.is_null() {
             0x0901_0000
         } else {
@@ -813,7 +812,7 @@ unsafe fn query_segments(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTERIN
             0x0905_0000
         });
 
-        // Segment TABLE per topology (`BarSegMode` — see `setup_bar_segment`).
+        // Segment TABLE per topology (`BarSegTopology` — see `setup_bar_segment`).
         // The list is (writer, args) per positional slot; ids are positional
         // (index 0 = id 1). The aperture is ALWAYS first (InitDmaPools
         // validates segdesc[0] for paging-buffer-host capability).
@@ -822,27 +821,32 @@ unsafe fn query_segments(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTERIN
             RamCpuHost(u64, u64),
             Bar(u64, u64),
         }
-        let mut table: [Option<Seg>; 3] = [Some(Seg::Aperture), None, None];
+        let mut table: [Option<Seg>; 2] = [Some(Seg::Aperture), None];
+        // Exhaustive over the two shapes, with no wildcard arm: a segment
+        // topology can no longer be selected by falling off the end of a match
+        // over an integer knob.
         match (bar, page_table) {
-            // Topo 10: aperture + BAR as id 2 (RAM segment dropped).
-            (Some((gpa, size, 10)), _) => {
+            // ApertureAndBar (production): aperture + the BAR as id 2. The
+            // paging-RAM segment is dropped — it was vestigial, since page
+            // tables live in system segment 0 and paging buffers in the
+            // aperture.
+            //
+            // Note this arm no longer depends on `page_table`. Under the deleted
+            // topologies a `None` paging-RAM allocation made the whole match fall
+            // through to the wildcard, which silently dropped the BAR from the
+            // REPORTED table while `adapter.bar_segment` stayed `Some` — every
+            // BAR consumer then placed allocations against a segment id dxgkrnl
+            // was never told about (k-capsescape-04).
+            (Some((gpa, size)), _) => {
                 table[1] = Some(Seg::Bar(gpa, size));
             }
-            // Topo 11: aperture + BAR id 2 + RAM id 3 (order swap).
-            (Some((gpa, size, 11)), Some((rgpa, rsize))) => {
-                table[1] = Some(Seg::Bar(gpa, size));
-                table[2] = Some(Seg::RamCpuHost(rgpa, rsize));
-            }
-            // Default topo: aperture + RAM id 2 + BAR id 3. The BAR segment
-            // must be id 3, so it is only reported when the RAM segment is.
-            (Some((gpa, size, _)), Some((rgpa, rsize))) => {
-                table[1] = Some(Seg::RamCpuHost(rgpa, rsize));
-                table[2] = Some(Seg::Bar(gpa, size));
-            }
-            (_, Some((rgpa, rsize))) => {
+            // Disabled: aperture + the paging-RAM cpu-host segment as id 2. The
+            // recovery baseline that always binds.
+            (None, Some((rgpa, rsize))) => {
                 table[1] = Some(Seg::RamCpuHost(rgpa, rsize));
             }
-            _ => {}
+            // Disabled with no contiguous RAM either: aperture only.
+            (None, None) => {}
         }
         out.NbSegment = table.iter().flatten().count() as u32;
         out.PagingBufferSegmentId = gpummu::APERTURE_SEGMENT_ID;
@@ -871,20 +875,6 @@ unsafe fn query_segments(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTERIN
                         unsafe { write_bar_knob_descriptor(d, *gpa, *size) };
                     }
                 }
-            }
-        }
-    } else {
-        // SAFE shape: a single BAR CpuVisible memory segment (id 1). InitDmaPools
-        // rejects it cleanly (Code 43, no crash). If there is no host-visible
-        // window, fall back to the aperture descriptor (never CpuVisible-backed).
-        out.NbSegment = 1;
-        out.PagingBufferSegmentId = gpummu::APERTURE_SEGMENT_ID; // numeric id 1 = sole segment
-        if !descriptors.is_null() {
-            let seg0 = descriptors as *mut DXGK_SEGMENTDESCRIPTOR4;
-            match window {
-                // SAFETY: descriptors points to a writable DXGK_SEGMENTDESCRIPTOR4.
-                Some(w) => unsafe { write_cpu_host_memory_descriptor(seg0, w.base, w.len) },
-                None => unsafe { write_aperture_descriptor(seg0) },
             }
         }
     }
