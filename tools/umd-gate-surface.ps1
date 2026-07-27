@@ -70,6 +70,29 @@ param(
 $ErrorActionPreference = 'Continue'
 $logDir = 'C:\ProgramData\Helios'
 
+# ⚠ UMD logs are keyed by PID ONLY and are APPENDED, never truncated. Windows
+# reuses pids across boots, so `umd-<pid>.log` routinely contains several
+# unrelated sessions from different builds stacked end to end -- the first time
+# this script ran against a fresh deploy it read `present-gate:` lines written
+# on 09-07 by a different dwm that happened to get the same pid, and reported
+# them as the current build's. "Last occurrence wins" is only correct WITHIN a
+# session.
+#
+# `UMD module: <path>` is emitted once per module load, so the last one marks
+# the start of the newest session. Everything before it belongs to some earlier
+# process and must not be read.
+function Get-CurrentSession {
+    param([string] $Path)
+    $lines = Get-Content -LiteralPath $Path -ErrorAction SilentlyContinue
+    if (-not $lines) { return @() }
+    $starts = @()
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        if ($lines[$i] -match 'UMD module:') { $starts += $i }
+    }
+    if ($starts.Count -eq 0) { return $lines }   # no marker: read it all
+    return $lines[$starts[-1]..($lines.Count - 1)]
+}
+
 if (-not (Test-Path $logDir)) {
     Write-Host "no $logDir -- the UMD has not run"
     exit 1
@@ -94,35 +117,44 @@ if ($AllProcesses) {
     Write-Host "scope     : dwm pid $($dwm.Id), started $($dwm.StartTime)"
 }
 
-Write-Host ""
-Write-Host "--- scan-out counters (last value wins; group is printed per decision) ---"
-$sawGroup = $false
+# Read each log ONCE, anchored to its newest session.
+$sessions = @{}
 foreach ($f in $logs) {
-    $hit = Select-String -Path $f.FullName -Pattern 'direct_over_linear=' |
-        Select-Object -Last 1
+    $body = Get-CurrentSession $f.FullName
+    $sessions[$f.Name] = $body
+    $mod = ($body | Where-Object { $_ -match 'UMD module:' } | Select-Object -First 1)
+    Write-Host ("  {0,-20} {1} line(s) in the newest session" -f $f.Name, $body.Count)
+    if ($mod) { Write-Host ("  {0,-20} {1}" -f '', $mod.Trim()) }
+}
+
+Write-Host ""
+Write-Host "--- scan-out counters (last value in the CURRENT session) ---"
+$sawGroup = $false
+foreach ($name in $sessions.Keys) {
+    $hit = $sessions[$name] | Where-Object { $_ -match 'direct_over_linear=' } | Select-Object -Last 1
     if ($hit) {
         $sawGroup = $true
-        if ($hit.Line -match '(direct_over_linear=\S+\s+downres_kept=\S+\s+zero_extent=\S+\s+zero_pitch=\S+)') {
-            Write-Host ("  {0,-20} {1}" -f $f.Name, $matches[1])
+        if ($hit -match '(direct_over_linear=\S+\s+downres_kept=\S+\s+zero_extent=\S+\s+zero_pitch=\S+)') {
+            Write-Host ("  {0,-20} {1}" -f $name, $matches[1])
         } else {
-            Write-Host ("  {0,-20} {1}" -f $f.Name, $hit.Line)
+            Write-Host ("  {0,-20} {1}" -f $name, $hit)
         }
     }
 }
 if (-not $sawGroup) {
     Write-Host "  <no scan-out decision recorded in scope>"
-    Write-Host "  NOTE: for dwm this means no scan-out target was ever established."
+    Write-Host "  NOTE: for dwm this means no scan-out target was established this session."
 }
 
 Write-Host ""
 Write-Host "--- must NOT appear (absence IS the zero reading) ---"
 $failed = @()
 foreach ($pat in $MustNotAppear) {
-    foreach ($f in $logs) {
-        $hits = Select-String -Path $f.FullName -Pattern $pat -SimpleMatch
-        if ($hits) {
-            Write-Host ("  FAIL {0}  [{1}]  x{2}" -f $pat, $f.Name, $hits.Count)
-            Write-Host ("       first: {0}" -f ($hits | Select-Object -First 1).Line)
+    foreach ($name in $sessions.Keys) {
+        $hits = @($sessions[$name] | Where-Object { $_.Contains($pat) })
+        if ($hits.Count -gt 0) {
+            Write-Host ("  FAIL {0}  [{1}]  x{2}" -f $pat, $name, $hits.Count)
+            Write-Host ("       first: {0}" -f $hits[0].Trim())
             $failed += $pat
         }
     }
@@ -131,9 +163,11 @@ if ($failed.Count -eq 0) { Write-Host "  all clear" }
 
 Write-Host ""
 Write-Host "--- present gate (C++ bridge; cost of the 10 ms producer gate) ---"
-foreach ($f in $logs) {
-    $g = Select-String -Path $f.FullName -Pattern 'present-gate:' | Select-Object -Last 1
-    if ($g) { Write-Host ("  {0,-20} {1}" -f $f.Name, $g.Line.Trim()) }
+Write-Host "    (a T5 UMD appends 'failed= noctx='; a T4b one stops at 'timeouts=' -- R826)"
+foreach ($name in $sessions.Keys) {
+    $g = $sessions[$name] | Where-Object { $_ -match 'present-gate:' } | Select-Object -Last 1
+    if ($g) { Write-Host ("  {0,-20} {1}" -f $name, $g.Trim()) }
+    else    { Write-Host ("  {0,-20} <none this session>" -f $name) }
 }
 
 Write-Host ""
