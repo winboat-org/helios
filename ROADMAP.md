@@ -716,7 +716,16 @@ virtio-gpu scanout; IddCx/Looking Glass is no longer the active display path.*
    `[4]`=hDrvDevice, `[6]`=pDXGIBaseFuncs, `[8]`=pUMCallbacks, `[9]`=Flags — i.e. the runtime
    really does place those fields at bytes 16/24/32/48/64/72, exactly as asserted.
 
-   **(3) R809 — the two behaviour changes. DEFERRED, INSTRUMENTED, DECISION PENDING.**
+   **(3) R809 — the two behaviour changes. HALF DECIDED BY THE 7f GATE, half still unexercised.**
+   ★ **DirectPrimary-wins: the gate read `SCANOUT_DIRECT_OVER_LINEAR` = 17 in one dwm session
+   (2 and 1 in others), so this rule is REACHABLE and must not be dropped as dead.** Adopting
+   it is a real behaviour change on the frozen direct-primary path and stays an owner-visible
+   decision, but "delete it as unreachable" is now ruled out by evidence.
+   **Down-resolution: `SCANOUT_DOWNRES_KEPT` = 0, but UNEXERCISED, not proven unreachable** —
+   no resolution change could be driven on this box (see 7f). Do not conclude anything from
+   that 0 until a mode change actually happens.
+   `SCANOUT_ZERO_EXTENT` = 0 and `SCANOUT_PRIMARY_ZERO_PITCH` = 0, both as predicted.
+   Original entry, for the reasoning:
    *Done:* one `RefCell<Option<ScanoutTarget>>` with a sealed `ScanoutKind`; the third writer
    can no longer leave the import stale; `publish_dwm_composition` matches `KmdLinearImport`
    explicitly. *Missing:* the **DirectPrimary-wins rule** (a LINEAR import may not displace an
