@@ -37,8 +37,25 @@
 //! reinterpret the box pointer as a vtable. The non-null check happens once, at
 //! construction, so the operations do not each repeat it.
 //!
+//! Which payload a given handle carries is then a property of the handle type,
+//! not of the call site: [`ComHandle`] marks the bare-COM handles and
+//! [`BoxedHandle`] names each boxed handle's one payload struct. Accessors take
+//! the handle itself and derive the payload from it — `boxed_slot(h_rtv)` can
+//! only produce a `Slot<Boxed<RtvState>>` — so passing a resource handle to an
+//! RTV reader, or the reverse, does not compile.
+//!
 //! The `*mut c_void` → payload cast exists in this module and nowhere else,
 //! which is the precondition T8's split of `forward.rs` depends on.
+//!
+//! # Runtime-tagged slots
+//!
+//! Three DDIs (`Discard`, `ClearView`, the tiled-resource barrier) receive a
+//! bare `pDrvPrivate` plus a `D3D11DDI_HANDLETYPE` that selects the payload at
+//! *run* time, so no static handle type is available to key on. Those call the
+//! `*_at` forms, which take the raw pointer and name the payload explicitly at
+//! the call site after the tag has been matched. `handle_com_raw_at` and
+//! `load_com_at` are the existing precedent; `load_resource_at` and
+//! `load_rtv_at` are the boxed equivalents.
 //!
 //! # What stays unencodable
 //!
@@ -87,14 +104,36 @@ macro_rules! com_handles {
     )*};
 }
 
-/// Implement only `DdiHandle` for handle types whose slot holds a `Box`.
-/// Clearing is still legal; decoding as COM is not.
+/// A DDI handle whose slot holds a **`Box<Self::State>`** this driver
+/// allocated.
+///
+/// The associated type is the boxed-side counterpart of [`ComHandle`]. Where
+/// `ComHandle` says only "this word is a COM pointer", `BoxedHandle` names the
+/// one payload struct that belongs in this handle's slot, so the payload is
+/// selected by the handle's *type* rather than by which free function the
+/// caller happened to reach for. `resource_state(h_rtv)` — passing an RTV
+/// handle to a reader that decodes a `ResourceState` — stops resolving, which
+/// is the boxed half of the guarantee sub-commit 2 established for bare COM.
+///
+/// `pub(super)`, not `pub(crate)` like the rest of this module: the payload
+/// structs it names (`ResourceState`, `RtvState`, `LayoutData`) are private to
+/// `forward`, and a `pub(crate)` trait may not leak them.
+pub(super) trait BoxedHandle: DdiHandle {
+    type State;
+}
+
+/// Implement `DdiHandle` + `BoxedHandle` for handle types whose slot holds a
+/// `Box`, pairing each with the payload struct it stores. Clearing is still
+/// legal for these (it is payload-agnostic); decoding as COM is not.
 macro_rules! boxed_handles {
-    ($($ty:ident),* $(,)?) => {$(
+    ($($ty:ident => $state:ty),* $(,)?) => {$(
         impl DdiHandle for crate::ddi::$ty {
             fn drv_private(self) -> *mut c_void {
                 self.pDrvPrivate
             }
+        }
+        impl BoxedHandle for crate::ddi::$ty {
+            type State = $state;
         }
     )*};
 }
@@ -112,10 +151,24 @@ com_handles!(
 );
 
 boxed_handles!(
-    D3D10DDI_HRESOURCE,
-    D3D10DDI_HRENDERTARGETVIEW,
-    D3D10DDI_HELEMENTLAYOUT,
+    D3D10DDI_HRESOURCE => super::ResourceState,
+    D3D10DDI_HRENDERTARGETVIEW => super::RtvState,
+    D3D10DDI_HELEMENTLAYOUT => super::LayoutData,
 );
+
+/// The slot behind a boxed-payload DDI handle, typed with the payload that
+/// handle names. `None` when the runtime handed us a null slot.
+///
+/// This is the boxed counterpart of taking `impl ComHandle`: the caller passes
+/// the handle itself rather than its `pDrvPrivate`, so the payload type is
+/// derived rather than chosen, and the `*mut c_void` stays inside this module.
+///
+/// # Safety
+/// Same precondition as [`Slot::from_priv`]: `h`'s slot, when non-null, must
+/// lie inside the private memory the paired `CalcPrivate*Size` sized.
+pub(super) unsafe fn boxed_slot<H: BoxedHandle>(h: H) -> Option<Slot<Boxed<H::State>>> {
+    unsafe { Slot::from_priv(h.drv_private()) }
+}
 
 /// Payload marker: the slot word is an owning COM pointer to `T`.
 pub(crate) struct Com<T: Interface>(PhantomData<fn() -> T>);

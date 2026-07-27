@@ -13,7 +13,7 @@ mod alloc;
 mod handles;
 use alloc::{ScanoutGeometry, VenusBacking};
 use crate::bridge::{DstRes, SrcRes};
-use handles::{Boxed, Com, ComHandle, DdiHandle, Slot};
+use handles::{boxed_slot, Boxed, Com, ComHandle, DdiHandle, Slot};
 
 use core::ffi::c_void;
 use core::mem::ManuallyDrop;
@@ -8454,14 +8454,14 @@ unsafe extern "C" fn create_element_layout(
     // allocated, but stored as a bare `usize` and then used as the identity key
     // of `IaState::layout_cache`. R803's finding does not list it; it is the
     // same latent confusion as the resource and RTV slots.
-    let Some(slot) = Slot::<Boxed<LayoutData>>::from_priv(h_el.pDrvPrivate) else {
+    let Some(slot) = boxed_slot(h_el) else {
         return;
     };
     slot.store(LayoutData { elements: elems });
 }
 
 unsafe extern "C" fn destroy_element_layout(h: Hdevice, h_el: ddi::D3D10DDI_HELEMENTLAYOUT) {
-    let Some(slot) = Slot::<Boxed<LayoutData>>::from_priv(h_el.pDrvPrivate) else {
+    let Some(slot) = boxed_slot(h_el) else {
         return;
     };
     // The slot word doubles as this layout's identity in `layout_cache`, so it
@@ -8501,7 +8501,7 @@ unsafe extern "C" fn destroy_element_layout(h: Hdevice, h_el: ddi::D3D10DDI_HELE
 
 unsafe extern "C" fn ia_set_input_layout(h: Hdevice, h_el: ddi::D3D10DDI_HELEMENTLAYOUT) {
     if let Some(dev) = helios_device(h) {
-        let p = match Slot::<Boxed<LayoutData>>::from_priv(h_el.pDrvPrivate) {
+        let p = match boxed_slot(h_el) {
             Some(slot) => slot.word(),
             None => 0,
         };
