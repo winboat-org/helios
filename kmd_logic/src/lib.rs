@@ -536,6 +536,211 @@ impl Writer {
     }
 }
 
+// ── Venus VkImageCreateInfo / VkMemoryAllocateInfo encoding ───────────────────
+//
+// R1002. Three image encoders and five memory encoders each re-emitted the whole
+// struct body inline — about 25 `Writer` calls for an image — differing only in
+// the pNext chain and a handful of scalars. Two of the three image bodies wrote
+// `w.u32(0); // VK_IMAGE_TILING_OPTIMAL` as a BARE LITERAL while the third used
+// the named `IMAGE_TILING_LINEAR`: the exact shape of the 39th-session defect (a
+// tiling scalar hand-written in one of several copies of one struct), only
+// inverted. That session's root cause was `IMAGE_TILING_LINEAR` being defined as
+// 0, i.e. OPTIMAL, and it painted black.
+//
+// The pNext encoding is order-sensitive in a way no reader can infer from a call
+// site: for the export-plus-dedicated allocation, the DEDICATED struct's fields
+// are written inline first and the EXPORT struct's own `handleTypes` field comes
+// AFTER them, because export's pNext points at dedicated. Getting that backwards
+// produces a stream the host decodes as a different allocation.
+//
+// These live in `kmd_logic`, not in `venus.rs`, for one reason: they can then be
+// pinned by golden-byte tests on the Linux host. The literals in those tests were
+// produced by compiling the PRE-CHANGE inline sequences and printing their
+// output, so they are an equivalence proof against the old code rather than a
+// restatement of the new.
+
+/// `VkCommandTypeEXT` for `vkAllocateMemory`.
+pub const CMD_ALLOCATE_MEMORY: u32 = 21;
+/// `VkCommandTypeEXT` for `vkCreateImage`.
+pub const CMD_CREATE_IMAGE: u32 = 54;
+/// `VK_COMMAND_GENERATE_REPLY_BIT_EXT`.
+pub const CMD_FLAG_GENERATE_REPLY: u32 = 0x1;
+
+pub const ST_MEMORY_ALLOCATE_INFO: i32 = 5;
+pub const ST_IMAGE_CREATE_INFO: i32 = 14;
+pub const ST_EXTERNAL_MEMORY_IMAGE_CREATE_INFO: i32 = 1000072001;
+pub const ST_EXPORT_MEMORY_ALLOCATE_INFO: i32 = 1000072002;
+pub const ST_MEMORY_DEDICATED_ALLOCATE_INFO: i32 = 1000127001;
+pub const ST_IMPORT_MEMORY_RESOURCE_INFO_MESA: i32 = 1000384002;
+
+pub const IMAGE_TYPE_2D: u32 = 1;
+pub const SAMPLE_COUNT_1: u32 = 0x0000_0001;
+pub const SHARING_MODE_EXCLUSIVE: u32 = 0;
+
+/// `VK_IMAGE_TILING_OPTIMAL`.
+///
+/// ⚠ Introducing this is half the point of R1002. It was a bare `w.u32(0)` with
+/// a trailing comment at two of the three image encoders, while its sibling
+/// `IMAGE_TILING_LINEAR` was a named constant — the 39th session's defect shape
+/// inverted. There are now no bare tiling literals anywhere.
+pub const IMAGE_TILING_OPTIMAL: u32 = 0;
+/// `VK_IMAGE_TILING_LINEAR`.
+///
+/// ⚠ THE 39TH SESSION'S ROOT CAUSE. This was defined as 0 — which is OPTIMAL —
+/// and the host built a tiled image the display importer read as linear: a black
+/// screen with no error anywhere. It is 1. Do not "simplify" it.
+pub const IMAGE_TILING_LINEAR: u32 = 1;
+
+/// Which pNext chain a `VkImageCreateInfo` carries.
+///
+/// An exhaustive enum rather than an ad-hoc `count(true)/i32(ST_…)` sequence, so
+/// the nesting order lives in exactly one place and an unrepresentable chain
+/// cannot be encoded.
+///
+/// The `ExternalMemoryWithModifierList` variant the review specifies is NOT
+/// here: `ST_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO`, `DRM_FORMAT_MOD_LINEAR`
+/// and `IMAGE_TILING_DRM_FORMAT_MODIFIER` all went with T6/R906 when the modifier
+/// path was deleted, so it would have zero users.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ImagePNext {
+    /// An internal image with no external-memory contract.
+    None,
+    /// `VkExternalMemoryImageCreateInfo` with the given `VkExternalMemoryHandleTypeFlags`.
+    ExternalMemory { handle_type: u32 },
+}
+
+/// Everything the three image creates differ by. The rest of
+/// `VkImageCreateInfo` — 2D, depth 1, one mip, one layer, 1 sample, exclusive
+/// sharing, no queue families — is fixed by [`encode_image_create`].
+#[derive(Clone, Copy)]
+pub struct ImageCreateSpec {
+    pub pnext: ImagePNext,
+    pub flags: u32,
+    pub format: u32,
+    pub width: u32,
+    pub height: u32,
+    pub tiling: u32,
+    pub usage: u32,
+    pub initial_layout: u32,
+}
+
+/// Encode one `vkCreateImage` command stream.
+pub fn encode_image_create(device_id: u64, image_id: u64, spec: &ImageCreateSpec) -> Writer {
+    let mut w = Writer::new();
+    w.header(CMD_CREATE_IMAGE, CMD_FLAG_GENERATE_REPLY);
+    w.u64(device_id);
+    w.count(true);
+    w.i32(ST_IMAGE_CREATE_INFO);
+    match spec.pnext {
+        ImagePNext::None => w.count(false),
+        ImagePNext::ExternalMemory { handle_type } => {
+            w.count(true);
+            w.i32(ST_EXTERNAL_MEMORY_IMAGE_CREATE_INFO);
+            w.count(false);
+            w.u32(handle_type);
+        }
+    }
+    w.u32(spec.flags);
+    w.u32(IMAGE_TYPE_2D);
+    w.u32(spec.format);
+    w.u32(spec.width);
+    w.u32(spec.height);
+    w.u32(1); // depth
+    w.u32(1); // mipLevels
+    w.u32(1); // arrayLayers
+    w.u32(SAMPLE_COUNT_1);
+    w.u32(spec.tiling);
+    w.u32(spec.usage);
+    w.u32(SHARING_MODE_EXCLUSIVE);
+    w.u32(0); // queueFamilyIndexCount
+    w.count(false); // pQueueFamilyIndices
+    w.u32(spec.initial_layout);
+    w.count(false); // pAllocator
+    w.count(true);
+    w.u64(image_id);
+    w
+}
+
+/// Which pNext chain a `VkMemoryAllocateInfo` carries.
+///
+/// ⚠ `ExportDedicated` is the order-sensitive one: the dedicated struct is
+/// nested INSIDE the export struct's pNext, so its `image`/`buffer` fields are
+/// written before the export struct's own `handleTypes`. That ordering is why
+/// this is an enum and not four hand-written sequences.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum MemoryPNext {
+    /// Plain host-visible allocation.
+    None,
+    /// `VkExportMemoryAllocateInfo`.
+    Export { handle_type: u32 },
+    /// `VkMemoryDedicatedAllocateInfo` for an image.
+    Dedicated { image: u64 },
+    /// `VkExportMemoryAllocateInfo` -> `VkMemoryDedicatedAllocateInfo`.
+    ExportDedicated { handle_type: u32, image: u64 },
+    /// `VkImportMemoryResourceInfoMESA` — adopt an existing virtio resource.
+    ImportResource { resource_id: u32 },
+}
+
+/// Everything the five memory allocations differ by.
+#[derive(Clone, Copy)]
+pub struct MemoryAllocateSpec {
+    pub pnext: MemoryPNext,
+    pub size: u64,
+    pub memory_type_index: u32,
+}
+
+/// Encode one `vkAllocateMemory` command stream.
+pub fn encode_memory_allocate(
+    device_id: u64,
+    memory_id: u64,
+    spec: &MemoryAllocateSpec,
+) -> Writer {
+    let mut w = Writer::new();
+    w.header(CMD_ALLOCATE_MEMORY, CMD_FLAG_GENERATE_REPLY);
+    w.u64(device_id);
+    w.count(true);
+    w.i32(ST_MEMORY_ALLOCATE_INFO);
+    match spec.pnext {
+        MemoryPNext::None => w.count(false),
+        MemoryPNext::Export { handle_type } => {
+            w.count(true);
+            w.i32(ST_EXPORT_MEMORY_ALLOCATE_INFO);
+            w.count(false);
+            w.u32(handle_type);
+        }
+        MemoryPNext::Dedicated { image } => {
+            w.count(true);
+            w.i32(ST_MEMORY_DEDICATED_ALLOCATE_INFO);
+            w.count(false);
+            w.u64(image);
+            w.u64(0); // buffer
+        }
+        MemoryPNext::ExportDedicated { handle_type, image } => {
+            w.count(true);
+            w.i32(ST_EXPORT_MEMORY_ALLOCATE_INFO);
+            w.count(true);
+            w.i32(ST_MEMORY_DEDICATED_ALLOCATE_INFO);
+            w.count(false);
+            w.u64(image);
+            w.u64(0); // buffer
+            // The EXPORT struct's own field, after the nested dedicated one.
+            w.u32(handle_type);
+        }
+        MemoryPNext::ImportResource { resource_id } => {
+            w.count(true);
+            w.i32(ST_IMPORT_MEMORY_RESOURCE_INFO_MESA);
+            w.count(false);
+            w.u32(resource_id);
+        }
+    }
+    w.u64(spec.size);
+    w.u32(spec.memory_type_index);
+    w.count(false); // pAllocator
+    w.count(true);
+    w.u64(memory_id);
+    w
+}
+
 // ── Vulkan memory-type selection ──────────────────────────────────────────────
 
 /// `VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT`.
@@ -663,6 +868,268 @@ pub fn choose_device_local_memory_type(
 
 #[cfg(test)]
 mod tests {
+
+    // ── R1002 golden bytes ────────────────────────────────────────────────
+    //
+    // Produced by compiling the PRE-CHANGE inline encoder sequences against
+    // this same `Writer` and printing their output, so these literals are an
+    // equivalence proof against the old code rather than a restatement of the
+    // new. Regenerating them from the current encoder would make the tests
+    // circular and worthless.
+    //
+    // Fixed handles and geometry so the arrays are stable: device
+    // 0x1111222233334444, image 0x5555666677778888, memory 0x9999AAAABBBBCCCC,
+    // 1896x1030 (the live DWM primary), size 0x800000, memoryTypeIndex 7.
+    const GOLD_DEVICE: u64 = 0x1111_2222_3333_4444;
+    const GOLD_IMAGE: u64 = 0x5555_6666_7777_8888;
+    const GOLD_MEMORY: u64 = 0x9999_AAAA_BBBB_CCCC;
+    const GOLD_SIZE: u64 = 0x0080_0000;
+    const GOLD_MTI: u32 = 7;
+
+    // GOLDEN_LINEAR_SCANOUT_IMAGE (140 bytes)
+    const GOLDEN_LINEAR_SCANOUT_IMAGE: &[u8] = &[
+        0x36, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x44, 0x44, 0x33, 0x33, 
+        0x22, 0x22, 0x11, 0x11, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+        0x0e, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+        0x41, 0xe3, 0x9b, 0x3b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+        0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 
+        0x2c, 0x00, 0x00, 0x00, 0x68, 0x07, 0x00, 0x00, 0x06, 0x04, 0x00, 0x00, 
+        0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 
+        0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+        0x00, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+        0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+        0x88, 0x88, 0x77, 0x77, 0x66, 0x66, 0x55, 0x55, 
+    ];
+    // GOLDEN_OPTIMAL_PRESENT_IMAGE_ALIAS (140 bytes)
+    const GOLDEN_OPTIMAL_PRESENT_IMAGE_ALIAS: &[u8] = &[
+        0x36, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x44, 0x44, 0x33, 0x33, 
+        0x22, 0x22, 0x11, 0x11, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+        0x0e, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+        0x41, 0xe3, 0x9b, 0x3b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+        0x01, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 
+        0x2c, 0x00, 0x00, 0x00, 0x68, 0x07, 0x00, 0x00, 0x06, 0x04, 0x00, 0x00, 
+        0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 
+        0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x17, 0x00, 0x00, 0x00, 
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+        0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+        0x88, 0x88, 0x77, 0x77, 0x66, 0x66, 0x55, 0x55, 
+    ];
+    // GOLDEN_PRESENT_CONVERSION_IMAGE (124 bytes)
+    const GOLDEN_PRESENT_CONVERSION_IMAGE: &[u8] = &[
+        0x36, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x44, 0x44, 0x33, 0x33, 
+        0x22, 0x22, 0x11, 0x11, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+        0x0e, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+        0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x2c, 0x00, 0x00, 0x00, 
+        0x68, 0x07, 0x00, 0x00, 0x06, 0x04, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 
+        0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 
+        0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+        0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x88, 0x88, 0x77, 0x77, 
+        0x66, 0x66, 0x55, 0x55, 
+    ];
+    // GOLDEN_MEMORY_PLAIN (72 bytes)
+    const GOLDEN_MEMORY_PLAIN: &[u8] = &[
+        0x15, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x44, 0x44, 0x33, 0x33, 
+        0x22, 0x22, 0x11, 0x11, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+        0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+        0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00, 
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 
+        0x00, 0x00, 0x00, 0x00, 0xcc, 0xcc, 0xbb, 0xbb, 0xaa, 0xaa, 0x99, 0x99, 
+    ];
+    // GOLDEN_MEMORY_EXPORT (88 bytes)
+    const GOLDEN_MEMORY_EXPORT: &[u8] = &[
+        0x15, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x44, 0x44, 0x33, 0x33, 
+        0x22, 0x22, 0x11, 0x11, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+        0x05, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+        0x42, 0xe3, 0x9b, 0x3b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+        0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 
+        0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+        0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xcc, 0xcc, 0xbb, 0xbb, 
+        0xaa, 0xaa, 0x99, 0x99, 
+    ];
+    // GOLDEN_MEMORY_DEDICATED (100 bytes)
+    const GOLDEN_MEMORY_DEDICATED: &[u8] = &[
+        0x15, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x44, 0x44, 0x33, 0x33, 
+        0x22, 0x22, 0x11, 0x11, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+        0x05, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+        0x19, 0xba, 0x9c, 0x3b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+        0x88, 0x88, 0x77, 0x77, 0x66, 0x66, 0x55, 0x55, 0x00, 0x00, 0x00, 0x00, 
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 
+        0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+        0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xcc, 0xcc, 0xbb, 0xbb, 
+        0xaa, 0xaa, 0x99, 0x99, 
+    ];
+    // GOLDEN_MEMORY_EXPORT_DEDICATED (116 bytes)
+    const GOLDEN_MEMORY_EXPORT_DEDICATED: &[u8] = &[
+        0x15, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x44, 0x44, 0x33, 0x33, 
+        0x22, 0x22, 0x11, 0x11, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+        0x05, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+        0x42, 0xe3, 0x9b, 0x3b, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+        0x19, 0xba, 0x9c, 0x3b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+        0x88, 0x88, 0x77, 0x77, 0x66, 0x66, 0x55, 0x55, 0x00, 0x00, 0x00, 0x00, 
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x80, 0x00, 
+        0x00, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+        0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+        0xcc, 0xcc, 0xbb, 0xbb, 0xaa, 0xaa, 0x99, 0x99, 
+    ];
+    // GOLDEN_MEMORY_IMPORT_RESOURCE (88 bytes)
+    const GOLDEN_MEMORY_IMPORT_RESOURCE: &[u8] = &[
+        0x15, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x44, 0x44, 0x33, 0x33, 
+        0x22, 0x22, 0x11, 0x11, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+        0x05, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+        0x02, 0xa6, 0xa0, 0x3b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+        0x34, 0x12, 0x00, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 
+        0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+        0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xcc, 0xcc, 0xbb, 0xbb, 
+        0xaa, 0xaa, 0x99, 0x99, 
+    ];
+
+    /// The production LINEAR scan-out image. The frozen direct-primary path:
+    /// wrong bytes here are a black desktop, which is how the 39th session
+    /// started.
+    #[test]
+    fn linear_scanout_image_bytes_are_unchanged() {
+        let w = encode_image_create(
+            GOLD_DEVICE,
+            GOLD_IMAGE,
+            &ImageCreateSpec {
+                pnext: ImagePNext::ExternalMemory { handle_type: 0x0000_0200 },
+                flags: 0,
+                format: 44, // VK_FORMAT_B8G8R8A8_UNORM
+                width: 1896,
+                height: 1030,
+                tiling: IMAGE_TILING_LINEAR,
+                usage: 0x1 | 0x2,
+                initial_layout: 8, // PREINITIALIZED
+            },
+        );
+        assert_eq!(w.finished(), Some(GOLDEN_LINEAR_SCANOUT_IMAGE));
+    }
+
+    #[test]
+    fn optimal_present_image_alias_bytes_are_unchanged() {
+        let w = encode_image_create(
+            GOLD_DEVICE,
+            GOLD_IMAGE,
+            &ImageCreateSpec {
+                pnext: ImagePNext::ExternalMemory { handle_type: 0x0000_0001 },
+                flags: 0x8, // MUTABLE_FORMAT
+                format: 44,
+                width: 1896,
+                height: 1030,
+                tiling: IMAGE_TILING_OPTIMAL,
+                usage: 0x1 | 0x2 | 0x4 | 0x10,
+                initial_layout: 0, // UNDEFINED
+            },
+        );
+        assert_eq!(w.finished(), Some(GOLDEN_OPTIMAL_PRESENT_IMAGE_ALIAS));
+    }
+
+    #[test]
+    fn present_conversion_image_bytes_are_unchanged() {
+        let w = encode_image_create(
+            GOLD_DEVICE,
+            GOLD_IMAGE,
+            &ImageCreateSpec {
+                pnext: ImagePNext::None,
+                flags: 0,
+                format: 44,
+                width: 1896,
+                height: 1030,
+                tiling: IMAGE_TILING_OPTIMAL,
+                usage: 0x1 | 0x2,
+                initial_layout: 0,
+            },
+        );
+        assert_eq!(w.finished(), Some(GOLDEN_PRESENT_CONVERSION_IMAGE));
+    }
+
+    #[test]
+    fn plain_memory_allocate_bytes_are_unchanged() {
+        let w = encode_memory_allocate(
+            GOLD_DEVICE,
+            GOLD_MEMORY,
+            &MemoryAllocateSpec {
+                pnext: MemoryPNext::None,
+                size: GOLD_SIZE,
+                memory_type_index: GOLD_MTI,
+            },
+        );
+        assert_eq!(w.finished(), Some(GOLDEN_MEMORY_PLAIN));
+    }
+
+    #[test]
+    fn export_memory_allocate_bytes_are_unchanged() {
+        let w = encode_memory_allocate(
+            GOLD_DEVICE,
+            GOLD_MEMORY,
+            &MemoryAllocateSpec {
+                pnext: MemoryPNext::Export { handle_type: 0x0000_0200 },
+                size: GOLD_SIZE,
+                memory_type_index: GOLD_MTI,
+            },
+        );
+        assert_eq!(w.finished(), Some(GOLDEN_MEMORY_EXPORT));
+    }
+
+    #[test]
+    fn dedicated_memory_allocate_bytes_are_unchanged() {
+        let w = encode_memory_allocate(
+            GOLD_DEVICE,
+            GOLD_MEMORY,
+            &MemoryAllocateSpec {
+                pnext: MemoryPNext::Dedicated { image: GOLD_IMAGE },
+                size: GOLD_SIZE,
+                memory_type_index: GOLD_MTI,
+            },
+        );
+        assert_eq!(w.finished(), Some(GOLDEN_MEMORY_DEDICATED));
+    }
+
+    /// The order-sensitive one: the dedicated struct's image/buffer fields come
+    /// BEFORE the export struct's own handleTypes, because export's pNext points
+    /// at dedicated. Swapping them still compiles and still type-checks.
+    #[test]
+    fn export_dedicated_memory_allocate_keeps_its_nesting_order() {
+        let w = encode_memory_allocate(
+            GOLD_DEVICE,
+            GOLD_MEMORY,
+            &MemoryAllocateSpec {
+                pnext: MemoryPNext::ExportDedicated {
+                    handle_type: 0x0000_0200,
+                    image: GOLD_IMAGE,
+                },
+                size: GOLD_SIZE,
+                memory_type_index: GOLD_MTI,
+            },
+        );
+        assert_eq!(w.finished(), Some(GOLDEN_MEMORY_EXPORT_DEDICATED));
+    }
+
+    #[test]
+    fn import_resource_memory_allocate_bytes_are_unchanged() {
+        let w = encode_memory_allocate(
+            GOLD_DEVICE,
+            GOLD_MEMORY,
+            &MemoryAllocateSpec {
+                pnext: MemoryPNext::ImportResource { resource_id: 0x1234 },
+                size: GOLD_SIZE,
+                memory_type_index: GOLD_MTI,
+            },
+        );
+        assert_eq!(w.finished(), Some(GOLDEN_MEMORY_IMPORT_RESOURCE));
+    }
+
+    /// The 39th session, as an assertion. `IMAGE_TILING_LINEAR` was 0 — which
+    /// is OPTIMAL — and the desktop painted black with no error anywhere.
+    #[test]
+    fn linear_and_optimal_tiling_are_not_the_same_value() {
+        assert_eq!(IMAGE_TILING_OPTIMAL, 0);
+        assert_eq!(IMAGE_TILING_LINEAR, 1);
+    }
     use super::*;
 
     /// Vectors taken from the production comments so they double as

@@ -54,7 +54,6 @@ const CMD_ENUMERATE_PHYSICAL_DEVICES: u32 = 2;
 const CMD_GET_PHYSICAL_DEVICE_MEMORY_PROPERTIES: u32 = 8;
 const CMD_CREATE_DEVICE: u32 = 11;
 const CMD_QUEUE_SUBMIT: u32 = 18;
-const CMD_ALLOCATE_MEMORY: u32 = 21;
 const CMD_FREE_MEMORY: u32 = 22;
 const CMD_BIND_IMAGE_MEMORY: u32 = 29;
 const CMD_BIND_BUFFER_MEMORY: u32 = 28;
@@ -65,7 +64,6 @@ const CMD_DESTROY_FENCE: u32 = 36;
 const CMD_WAIT_FOR_FENCES: u32 = 39;
 const CMD_CREATE_BUFFER: u32 = 50;
 const CMD_DESTROY_BUFFER: u32 = 51;
-const CMD_CREATE_IMAGE: u32 = 54;
 const CMD_DESTROY_IMAGE: u32 = 55;
 const CMD_GET_IMAGE_SUBRESOURCE_LAYOUT: u32 = 56;
 const CMD_CREATE_COMMAND_POOL: u32 = 85;
@@ -84,29 +82,22 @@ const CMD_NOTIFY_RING_MESA: u32 = 190;
 
 /// `VK_COMMAND_GENERATE_REPLY_BIT_EXT` — set in a command's flags word to request
 /// a reply written into the previously-set reply command stream.
-const CMD_FLAG_GENERATE_REPLY: u32 = 0x1;
 
 // ── Vulkan structure-type ids (VkStructureType) ──────────────────────────────
 const ST_INSTANCE_CREATE_INFO: i32 = 1;
 const ST_DEVICE_QUEUE_CREATE_INFO: i32 = 2;
 const ST_DEVICE_CREATE_INFO: i32 = 3;
 const ST_SUBMIT_INFO: i32 = 4;
-const ST_MEMORY_ALLOCATE_INFO: i32 = 5;
 const ST_BUFFER_CREATE_INFO: i32 = 12;
 const ST_FENCE_CREATE_INFO: i32 = 8;
-const ST_IMAGE_CREATE_INFO: i32 = 14;
 const ST_COMMAND_POOL_CREATE_INFO: i32 = 39;
 const ST_COMMAND_BUFFER_ALLOCATE_INFO: i32 = 40;
 const ST_COMMAND_BUFFER_BEGIN_INFO: i32 = 42;
 const ST_BUFFER_MEMORY_BARRIER: i32 = 44;
 const ST_IMAGE_MEMORY_BARRIER: i32 = 45;
 const ST_DEVICE_QUEUE_INFO_2: i32 = 1000145003;
-const ST_EXTERNAL_MEMORY_IMAGE_CREATE_INFO: i32 = 1000072001;
-const ST_EXPORT_MEMORY_ALLOCATE_INFO: i32 = 1000072002;
-const ST_MEMORY_DEDICATED_ALLOCATE_INFO: i32 = 1000127001;
 const ST_RING_CREATE_INFO_MESA: i32 = 1000384000;
 const ST_DEVICE_QUEUE_TIMELINE_INFO_MESA: i32 = 1000384005;
-const ST_IMPORT_MEMORY_RESOURCE_INFO_MESA: i32 = 1000384002;
 
 /// `VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT`.
 ///
@@ -136,19 +127,20 @@ impl OptimalImageTransport {
         }
     }
 }
-const IMAGE_TYPE_2D: u32 = 1;
 const FORMAT_R8G8B8A8_UNORM: u32 = 37;
 const FORMAT_R8G8B8A8_SRGB: u32 = 43;
 const FORMAT_B8G8R8A8_UNORM: u32 = 44;
 const FORMAT_B8G8R8A8_SRGB: u32 = 50;
 const FORMAT_A2B10G10R10_UNORM_PACK32: u32 = 64;
 const FORMAT_R16G16B16A16_SFLOAT: u32 = 97;
-// VK_IMAGE_TILING_OPTIMAL = 0, VK_IMAGE_TILING_LINEAR = 1. This was 0 (OPTIMAL),
-// so create_linear_scanout_image built a TILED image → device-local-only
+// IMAGE_TILING_LINEAR / IMAGE_TILING_OPTIMAL moved to `helios_kmd_logic` with
+// the encoders that write them (R1002), and the 39th session's evidence moved
+// with them. In short: LINEAR was defined as 0 (OPTIMAL), so
+// create_linear_scanout_image built a TILED image → device-local-only
 // memoryTypeBits (0x3, no host-visible) → choose_host_visible_memory_type failed
 // (ScanoutDiag=16 SdgErr=2 / SdgLStg=3). Confirmed against Mesa venus on the same
-// NVIDIA host: LINEAR→typebits=0xf (scans out), OPTIMAL→typebits=0x3 (no host-visible).
-const IMAGE_TILING_LINEAR: u32 = 1;
+// NVIDIA host: LINEAR→typebits=0xf (scans out), OPTIMAL→typebits=0x3 (no
+// host-visible). There is now a host test asserting the two are 1 and 0.
 const IMAGE_USAGE_TRANSFER_SRC: u32 = 0x0000_0001;
 const IMAGE_USAGE_TRANSFER_DST: u32 = 0x0000_0002;
 const IMAGE_USAGE_SAMPLED: u32 = 0x0000_0004;
@@ -156,11 +148,9 @@ const IMAGE_USAGE_STORAGE: u32 = 0x0000_0008;
 const IMAGE_USAGE_COLOR_ATTACHMENT: u32 = 0x0000_0010;
 const BUFFER_USAGE_TRANSFER_DST: u32 = 0x0000_0002;
 const IMAGE_CREATE_MUTABLE_FORMAT: u32 = 0x0000_0008;
-const SHARING_MODE_EXCLUSIVE: u32 = 0;
 const IMAGE_LAYOUT_UNDEFINED: u32 = 0;
 const IMAGE_LAYOUT_GENERAL: u32 = 1;
 const IMAGE_LAYOUT_PREINITIALIZED: u32 = 8;
-const SAMPLE_COUNT_1: u32 = 0x0000_0001;
 const IMAGE_ASPECT_COLOR: u32 = 0x0000_0001;
 const QUEUE_FAMILY_IGNORED: u32 = u32::MAX;
 const QUEUE_FAMILY_EXTERNAL: u32 = u32::MAX - 1;
@@ -245,7 +235,11 @@ const RING_WAIT_TIMEOUT_MS: u64 = 30_000;
 // claim that justifies the buffer is worth a host test. See
 // `writer_ext_full_create_device_is_332_bytes` there for the real number — the
 // comment that used to sit here said "~120 bytes" and was wrong by 212.
-use helios_kmd_logic::{MemoryTypeChoice, Writer};
+use helios_kmd_logic::{
+    encode_image_create, encode_memory_allocate, ImageCreateSpec, ImagePNext, MemoryAllocateSpec,
+    MemoryPNext, MemoryTypeChoice, Writer, CMD_ALLOCATE_MEMORY, CMD_CREATE_IMAGE,
+    CMD_FLAG_GENERATE_REPLY, IMAGE_TILING_LINEAR, IMAGE_TILING_OPTIMAL, SHARING_MODE_EXCLUSIVE,
+};
 
 /// Why the venus ring was declared unusable. Each arm names a registry counter
 /// so a wedge is distinguishable from every other `DeviceError` in a post-mortem
@@ -1836,24 +1830,21 @@ impl VenusClient {
         let size = round_up_page(size.max(4096));
         let memory_id = self.new_memory_id();
         {
-            let mut w = Writer::new();
-            w.header(CMD_ALLOCATE_MEMORY, CMD_FLAG_GENERATE_REPLY);
-            w.handle(self.device_id);
-            w.count(true);
-            w.i32(ST_MEMORY_ALLOCATE_INFO);
-            if shareable {
-                w.count(true);
-                w.i32(ST_EXPORT_MEMORY_ALLOCATE_INFO);
-                w.count(false);
-                w.u32(EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF);
-            } else {
-                w.count(false);
-            }
-            w.u64(size);
-            w.u32(self.memory_type_index.0);
-            w.count(false);
-            w.count(true);
-            w.handle(memory_id);
+            let w = encode_memory_allocate(
+                self.device_id.into(),
+                memory_id.into(),
+                &MemoryAllocateSpec {
+                    pnext: if shareable {
+                        MemoryPNext::Export {
+                            handle_type: EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF,
+                        }
+                    } else {
+                        MemoryPNext::None
+                    },
+                    size,
+                    memory_type_index: self.memory_type_index.0,
+                },
+            );
             self.ring_command_expect(
                 adapter,
                 w.as_slice()?,
@@ -1949,35 +1940,25 @@ impl VenusClient {
         height: u32,
     ) -> Result<VkImageId, VirtioError> {
         let image_id = self.new_image_id();
-        let mut w = Writer::new();
-        w.header(CMD_CREATE_IMAGE, CMD_FLAG_GENERATE_REPLY);
-        w.handle(self.device_id);
-        w.count(true);
-        w.i32(ST_IMAGE_CREATE_INFO);
-        // VkExternalMemoryImageCreateInfo only. This matches the Linux KMS probe
-        // that reached QEMU's egl-headless dmabuf import on NVIDIA.
-        w.count(true);
-        w.i32(ST_EXTERNAL_MEMORY_IMAGE_CREATE_INFO);
-        w.count(false);
-        w.u32(EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF);
-        w.u32(0); // flags
-        w.u32(IMAGE_TYPE_2D);
-        w.u32(FORMAT_B8G8R8A8_UNORM);
-        w.u32(width);
-        w.u32(height);
-        w.u32(1); // depth
-        w.u32(1); // mipLevels
-        w.u32(1); // arrayLayers
-        w.u32(SAMPLE_COUNT_1);
-        w.u32(IMAGE_TILING_LINEAR);
-        w.u32(IMAGE_USAGE_TRANSFER_SRC | IMAGE_USAGE_TRANSFER_DST);
-        w.u32(SHARING_MODE_EXCLUSIVE);
-        w.u32(0); // queueFamilyIndexCount
-        w.count(false);
-        w.u32(IMAGE_LAYOUT_PREINITIALIZED);
-        w.count(false); // pAllocator
-        w.count(true);
-        w.handle(image_id);
+        let w = encode_image_create(
+            self.device_id.into(),
+            image_id.into(),
+            &ImageCreateSpec {
+                // VkExternalMemoryImageCreateInfo only. This matches the Linux
+                // KMS probe that reached QEMU's egl-headless dmabuf import on
+                // NVIDIA.
+                pnext: ImagePNext::ExternalMemory {
+                    handle_type: EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF,
+                },
+                flags: 0,
+                format: FORMAT_B8G8R8A8_UNORM,
+                width,
+                height,
+                tiling: IMAGE_TILING_LINEAR,
+                usage: IMAGE_USAGE_TRANSFER_SRC | IMAGE_USAGE_TRANSFER_DST,
+                initial_layout: IMAGE_LAYOUT_PREINITIALIZED,
+            },
+        );
         // The raw VkResult of the LINEAR external-DMA_BUF image create is the
         // most likely NVIDIA-venus rejection point for the CachyOS shape, which
         // is why `SdgLImg` carries it verbatim.
@@ -2033,39 +2014,30 @@ impl VenusClient {
         }
 
         let image_id = self.new_image_id();
-        let mut w = Writer::new();
-        w.header(CMD_CREATE_IMAGE, CMD_FLAG_GENERATE_REPLY);
-        w.handle(self.device_id);
-        w.count(true);
-        w.i32(ST_IMAGE_CREATE_INFO);
-        // Imported ordinary UMD resources use OPAQUE_FD. KMD-created GDI
-        // textures use DMA_BUF because virglrenderer's render-server proxy can
-        // carry DMA_BUF, but cannot attach an OPAQUE_FD to another context.
-        w.count(true);
-        w.i32(ST_EXTERNAL_MEMORY_IMAGE_CREATE_INFO);
-        w.count(false);
-        w.u32(transport.handle_type());
-        // Shared color images retain MUTABLE_FORMAT but intentionally have no
-        // format-list pNext (DXVK suppresses that list to disable per-image
-        // compression metadata which cannot survive cross-device imports).
-        w.u32(IMAGE_CREATE_MUTABLE_FORMAT);
-        w.u32(IMAGE_TYPE_2D);
-        w.u32(vk_format);
-        w.u32(width);
-        w.u32(height);
-        w.u32(1); // depth
-        w.u32(1); // mipLevels
-        w.u32(1); // arrayLayers
-        w.u32(SAMPLE_COUNT_1);
-        w.u32(0); // VK_IMAGE_TILING_OPTIMAL
-        w.u32(usage);
-        w.u32(SHARING_MODE_EXCLUSIVE);
-        w.u32(0); // queueFamilyIndexCount
-        w.count(false);
-        w.u32(IMAGE_LAYOUT_UNDEFINED);
-        w.count(false); // pAllocator
-        w.count(true);
-        w.handle(image_id);
+        let w = encode_image_create(
+            self.device_id.into(),
+            image_id.into(),
+            &ImageCreateSpec {
+                // Imported ordinary UMD resources use OPAQUE_FD. KMD-created
+                // GDI textures use DMA_BUF because virglrenderer's
+                // render-server proxy can carry DMA_BUF, but cannot attach an
+                // OPAQUE_FD to another context.
+                pnext: ImagePNext::ExternalMemory {
+                    handle_type: transport.handle_type(),
+                },
+                // Shared color images retain MUTABLE_FORMAT but intentionally
+                // have no format-list pNext (DXVK suppresses that list to
+                // disable per-image compression metadata which cannot survive
+                // cross-device imports).
+                flags: IMAGE_CREATE_MUTABLE_FORMAT,
+                format: vk_format,
+                width,
+                height,
+                tiling: IMAGE_TILING_OPTIMAL,
+                usage,
+                initial_layout: IMAGE_LAYOUT_UNDEFINED,
+            },
+        );
         let mut r = self.ring_command_expect(
             adapter,
             w.as_slice()?,
@@ -2098,30 +2070,21 @@ impl VenusClient {
             return Err(VirtioError::DeviceError);
         }
         let image_id = self.new_image_id();
-        let mut w = Writer::new();
-        w.header(CMD_CREATE_IMAGE, CMD_FLAG_GENERATE_REPLY);
-        w.handle(self.device_id);
-        w.count(true);
-        w.i32(ST_IMAGE_CREATE_INFO);
-        w.count(false); // pNext: internal image, no external-memory contract
-        w.u32(0); // flags
-        w.u32(IMAGE_TYPE_2D);
-        w.u32(vk_format);
-        w.u32(width);
-        w.u32(height);
-        w.u32(1); // depth
-        w.u32(1); // mipLevels
-        w.u32(1); // arrayLayers
-        w.u32(SAMPLE_COUNT_1);
-        w.u32(0); // VK_IMAGE_TILING_OPTIMAL
-        w.u32(IMAGE_USAGE_TRANSFER_SRC | IMAGE_USAGE_TRANSFER_DST);
-        w.u32(SHARING_MODE_EXCLUSIVE);
-        w.u32(0); // queueFamilyIndexCount
-        w.count(false);
-        w.u32(IMAGE_LAYOUT_UNDEFINED);
-        w.count(false); // pAllocator
-        w.count(true);
-        w.handle(image_id);
+        let w = encode_image_create(
+            self.device_id.into(),
+            image_id.into(),
+            &ImageCreateSpec {
+                // Internal image, no external-memory contract.
+                pnext: ImagePNext::None,
+                flags: 0,
+                format: vk_format,
+                width,
+                height,
+                tiling: IMAGE_TILING_OPTIMAL,
+                usage: IMAGE_USAGE_TRANSFER_SRC | IMAGE_USAGE_TRANSFER_DST,
+                initial_layout: IMAGE_LAYOUT_UNDEFINED,
+            },
+        );
         let mut r = self.ring_command_expect(
             adapter,
             w.as_slice()?,
@@ -2142,21 +2105,17 @@ impl VenusClient {
         memory_type_index: u32,
     ) -> Result<VkDeviceMemoryId, VirtioError> {
         let memory_id = self.new_memory_id();
-        let mut w = Writer::new();
-        w.header(CMD_ALLOCATE_MEMORY, CMD_FLAG_GENERATE_REPLY);
-        w.handle(self.device_id);
-        w.count(true);
-        w.i32(ST_MEMORY_ALLOCATE_INFO);
-        w.count(true);
-        w.i32(ST_MEMORY_DEDICATED_ALLOCATE_INFO);
-        w.count(false);
-        w.handle(image_id);
-        w.u64(0); // buffer
-        w.u64(size);
-        w.u32(memory_type_index);
-        w.count(false); // pAllocator
-        w.count(true);
-        w.handle(memory_id);
+        let w = encode_memory_allocate(
+            self.device_id.into(),
+            memory_id.into(),
+            &MemoryAllocateSpec {
+                pnext: MemoryPNext::Dedicated {
+                    image: image_id.into(),
+                },
+                size,
+                memory_type_index,
+            },
+        );
         self.ring_command_expect(
             adapter,
             w.as_slice()?,
@@ -2352,25 +2311,19 @@ impl VenusClient {
         memory_type_index: u32,
     ) -> Result<VkDeviceMemoryId, VirtioError> {
         let memory_id = self.new_memory_id();
-        let mut w = Writer::new();
-        w.header(CMD_ALLOCATE_MEMORY, CMD_FLAG_GENERATE_REPLY);
-        w.handle(self.device_id);
-        w.count(true);
-        w.i32(ST_MEMORY_ALLOCATE_INFO);
-        // VkExportMemoryAllocateInfo -> VkMemoryDedicatedAllocateInfo.
-        w.count(true);
-        w.i32(ST_EXPORT_MEMORY_ALLOCATE_INFO);
-        w.count(true);
-        w.i32(ST_MEMORY_DEDICATED_ALLOCATE_INFO);
-        w.count(false);
-        w.handle(image_id);
-        w.u64(0); // buffer
-        w.u32(EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF);
-        w.u64(size);
-        w.u32(memory_type_index);
-        w.count(false);
-        w.count(true);
-        w.handle(memory_id);
+        let w = encode_memory_allocate(
+            self.device_id.into(),
+            memory_id.into(),
+            &MemoryAllocateSpec {
+                // VkExportMemoryAllocateInfo -> VkMemoryDedicatedAllocateInfo.
+                pnext: MemoryPNext::ExportDedicated {
+                    handle_type: EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF,
+                    image: image_id.into(),
+                },
+                size,
+                memory_type_index,
+            },
+        );
         self.ring_command_expect(
             adapter,
             w.as_slice()?,
@@ -2388,20 +2341,17 @@ impl VenusClient {
         memory_type_index: u32,
     ) -> Result<VkDeviceMemoryId, VirtioError> {
         let memory_id = self.new_memory_id();
-        let mut w = Writer::new();
-        w.header(CMD_ALLOCATE_MEMORY, CMD_FLAG_GENERATE_REPLY);
-        w.handle(self.device_id);
-        w.count(true);
-        w.i32(ST_MEMORY_ALLOCATE_INFO);
-        w.count(true);
-        w.i32(ST_EXPORT_MEMORY_ALLOCATE_INFO);
-        w.count(false);
-        w.u32(EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF);
-        w.u64(size);
-        w.u32(memory_type_index);
-        w.count(false);
-        w.count(true);
-        w.handle(memory_id);
+        let w = encode_memory_allocate(
+            self.device_id.into(),
+            memory_id.into(),
+            &MemoryAllocateSpec {
+                pnext: MemoryPNext::Export {
+                    handle_type: EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF,
+                },
+                size,
+                memory_type_index,
+            },
+        );
         // `SdgLMem` carries the raw VkResult of the exportable-DMA_BUF
         // allocation for the linear scanout image (dedicated-less export
         // alloc).
@@ -2427,21 +2377,15 @@ impl VenusClient {
         memory_type_index: u32,
     ) -> Result<VkDeviceMemoryId, VirtioError> {
         let memory_id = self.new_memory_id();
-        let mut w = Writer::new();
-        w.header(CMD_ALLOCATE_MEMORY, CMD_FLAG_GENERATE_REPLY);
-        w.handle(self.device_id);
-        w.count(true);
-        w.i32(ST_MEMORY_ALLOCATE_INFO);
-        // VkImportMemoryResourceInfoMESA
-        w.count(true);
-        w.i32(ST_IMPORT_MEMORY_RESOURCE_INFO_MESA);
-        w.count(false);
-        w.u32(resource_id);
-        w.u64(allocation_size);
-        w.u32(memory_type_index);
-        w.count(false); // pAllocator
-        w.count(true);
-        w.handle(memory_id);
+        let w = encode_memory_allocate(
+            self.device_id.into(),
+            memory_id.into(),
+            &MemoryAllocateSpec {
+                pnext: MemoryPNext::ImportResource { resource_id },
+                size: allocation_size,
+                memory_type_index,
+            },
+        );
         self.ring_command_expect(
             adapter,
             w.as_slice()?,
