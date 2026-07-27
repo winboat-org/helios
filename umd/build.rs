@@ -101,8 +101,25 @@ fn generate_d3d10umddi_bindings() {
         .allowlist_type("PFND3D1.*")
         .allowlist_var("D3D1[012].*_DDI_.*")
         .allowlist_var("D3DWDDM.*")
-        // Keep the generated module lean and stable across runs.
-        .layout_tests(false)
+        // Emit bindgen's per-type size/alignment/offset assertions. These are
+        // what make R802's deletion of the hand-transcribed ABI structs safe:
+        // the generated module becomes self-checking against the WDK headers it
+        // was produced from -- currently 817 size, 815 alignment and 4704 field
+        // offsets across 818 types.
+        //
+        // These are COMPILE-TIME. bindgen 0.70 emits them as
+        //   const _: () = { ["Offset of field: X::y"][offset_of!(X, y) - N]; };
+        // so a mismatch is an E0080 const-evaluation failure during an ordinary
+        // `cargo build`, not a `#[test]` that has to be run. (Verified by
+        // deliberately corrupting one D3D10DDIARG_CREATEDEVICE offset and
+        // confirming the build fails; REFACTOR_REVIEW.md R802 predicts the
+        // older `#[test] fn bindgen_test_layout_*` form, which this bindgen
+        // version no longer produces.)
+        //
+        // The cost is generated-file size (~1.1 MB, 43k lines) and a slower
+        // cold build, which is why they were originally off. That is worth
+        // paying for a driver whose ABI is defined by someone else's headers.
+        .layout_tests(true)
         .derive_default(true)
         .generate_comments(false)
         .generate()
