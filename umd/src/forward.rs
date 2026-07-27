@@ -985,6 +985,13 @@ unsafe fn remember_scanout_target(
     }
     if current_area != 0 && area < current_area {
         SCANOUT_DOWNRES_KEPT.fetch_add(1, Ordering::Relaxed);
+        log_error!(
+            "DDI scanout target KEPT older larger geometry: offered {}x{} vs stored area {} — {}",
+            private.width,
+            private.height,
+            current_area,
+            scanout_counter_summary()
+        );
         return;
     }
     drop(existing);
@@ -994,8 +1001,10 @@ unsafe fn remember_scanout_target(
     ) else {
         SCANOUT_ZERO_EXTENT.fetch_add(1, Ordering::Relaxed);
         log_error!(
-            "DDI scanout target refused: zero extent {}x{} raw=0x{raw:x}",
-            private.width, private.height
+            "DDI scanout target refused: zero extent {}x{} raw=0x{raw:x} — {}",
+            private.width,
+            private.height,
+            scanout_counter_summary()
         );
         return;
     };
@@ -1017,9 +1026,10 @@ unsafe fn remember_scanout_target(
     let stored = dev.owned.scanout_target.borrow();
     if let Some(t) = stored.as_ref() {
         log_error!(
-            "DDI scanout target: raw=0x{:x} alloc=0x{:x} res_id={} {}x{} fmt={} pitch={}",
+            "DDI scanout target: raw=0x{:x} alloc=0x{:x} res_id={} {}x{} fmt={} pitch={} — {}",
             t.resource_raw, t.allocation, t.resource_id, t.width, t.height, t.format,
-            private.pitch
+            private.pitch,
+            scanout_counter_summary()
         );
     }
 }
@@ -1130,7 +1140,10 @@ unsafe fn ensure_kmd_scanout_target(h: Hdevice) -> bool {
         core::num::NonZeroU32::new(height),
     ) else {
         SCANOUT_ZERO_EXTENT.fetch_add(1, Ordering::Relaxed);
-        log_error!("DWM KMD scanout import refused: zero extent {width}x{height}");
+        log_error!(
+            "DWM KMD scanout import refused: zero extent {width}x{height} — {}",
+            scanout_counter_summary()
+        );
         dev.scanout_probe
             .set(crate::device_funcs::ScanoutProbe::Unavailable { at_epoch: epoch });
         return false;
@@ -1159,8 +1172,9 @@ unsafe fn ensure_kmd_scanout_target(h: Hdevice) -> bool {
         _ => 0,
     };
     log_error!(
-        "DWM KMD scanout import ready: res_id={} {}x{} pitch={} gen={}",
-        resource_id, width, height, pitch, stored_gen
+        "DWM KMD scanout import ready: res_id={} {}x{} pitch={} gen={} — {}",
+        resource_id, width, height, pitch, stored_gen,
+        scanout_counter_summary()
     );
     drop(stored);
     true
@@ -9219,6 +9233,28 @@ static SCANOUT_ZERO_EXTENT: AtomicUsize = AtomicUsize::new(0);
 /// direct-scanout primary being stamped into the KMD meta that the UMD could
 /// never identify through PresentCb private data.
 static SCANOUT_PRIMARY_ZERO_PITCH: AtomicUsize = AtomicUsize::new(0);
+
+/// The four scan-out observation counters above, as one field group.
+///
+/// They are process-global atomics and the UMD has no registry counter surface,
+/// so unless a log line reads them they increment into a void — which is
+/// exactly what they did between the commit that introduced them and this one.
+/// An instrument nothing can read is not an instrument, and R809's deferred
+/// rules were supposed to be decided from these three.
+///
+/// Appended at every decision point on both scan-out paths, including the early
+/// returns: the `downres_kept` case in particular *is* an early return, so a
+/// summary only on the success path would be blind to the one policy it most
+/// needs to measure.
+fn scanout_counter_summary() -> String {
+    format!(
+        "direct_over_linear={} downres_kept={} zero_extent={} zero_pitch={}",
+        SCANOUT_DIRECT_OVER_LINEAR.load(Ordering::Relaxed),
+        SCANOUT_DOWNRES_KEPT.load(Ordering::Relaxed),
+        SCANOUT_ZERO_EXTENT.load(Ordering::Relaxed),
+        SCANOUT_PRIMARY_ZERO_PITCH.load(Ordering::Relaxed),
+    )
+}
 
 /// `set_present_source` refusals (invalid geometry/resid from the ICD).
 static EXT_SOURCE_REFUSED: AtomicUsize = AtomicUsize::new(0);
