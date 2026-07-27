@@ -233,6 +233,7 @@ pub(crate) fn maybe_run(adapter: &AdapterContext) {
 
         crate::diag::record_named_bytes(b"SdgStg", 3);
         let prep = match crate::virtio::ctrl::map_blob_prepare(
+            passive,
             adapter,
             crate::virtio::gpu::OwnerFilter::Any,
             resource_id,
@@ -417,6 +418,7 @@ pub(crate) fn maybe_run(adapter: &AdapterContext) {
         crate::diag::record_named_bytes(b"SdgFill", 2);
     } else {
         let prep = match crate::virtio::ctrl::map_blob_prepare(
+            passive,
             adapter,
             crate::virtio::gpu::OwnerFilter::Any,
             blob.res_id,

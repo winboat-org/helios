@@ -253,6 +253,7 @@ pub unsafe extern "C" fn hpd_thread_routine(context: *mut c_void) {
                     .unwrap_or(false);
                 if live {
                     crate::virtio::venus::VenusClient::probe_present_destination(
+                        passive,
                         adapter,
                         destination,
                         fence_id,

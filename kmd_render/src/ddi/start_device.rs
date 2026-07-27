@@ -137,7 +137,12 @@ fn bring_up_venus(
     // Persistent venus context for the device lifetime (owner 0: KMD-internal,
     // destroyed explicitly in StopDevice).
     let venus_result =
-        crate::virtio::ctrl::ctx_create(adapter, helios_protocol::VIRTIO_GPU_CAPSET_VENUS, None)
+        crate::virtio::ctrl::ctx_create(
+            passive,
+            adapter,
+            helios_protocol::VIRTIO_GPU_CAPSET_VENUS,
+            None,
+        )
             .and_then(|ctx_id| {
                 let (client, blob) =
                     crate::virtio::venus::allocate_host_visible_blob(passive, adapter, ctx_id)?;

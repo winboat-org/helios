@@ -489,7 +489,12 @@ unsafe fn with_blob_bytes(
     f: impl FnOnce(*mut u8, u64),
 ) -> bool {
     BAR_LAST_RESID.store(resource_id, Ordering::Relaxed);
+    // SAFETY: PLACEHOLDER (R614) — the audited mint for this path arrives with
+    // the paging/aperture commit, which threads a parameter from
+    // `dxgkddi_build_paging_buffer`'s runtime IRQL gate and from DxgkDdiPresent.
+    let passive = unsafe { crate::irql::PassiveLevel::assume() };
     let prep = match crate::virtio::ctrl::map_blob_prepare(
+        passive,
         adapter,
         crate::virtio::gpu::OwnerFilter::Any,
         resource_id,

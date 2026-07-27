@@ -437,11 +437,11 @@ fn ctrl_roundtrip_ok(
 /// the guest-assigned context id. `owner` is the D3D device handle recorded for
 /// `DxgkDdiDestroyDevice` reclamation (0 = KMD-internal).
 pub fn ctx_create(
+    passive: PassiveLevel,
     adapter: &AdapterContext,
     capset_id: u32,
     owner: Option<DeviceOwner>,
 ) -> Result<u32, VirtioError> {
-    let passive = assume_passive_unaudited();
     let ctx_id = adapter
         .with_virtio(|v| v.alloc_ctx_id())
         .map_err(|_| VirtioError::DeviceError)?;
@@ -482,11 +482,11 @@ pub fn ctx_create(
 /// context and A's next submit referenced a destroyed host context — CS error,
 /// fatal decoder state (k-capsescape-02).
 pub fn ctx_destroy(
+    passive: PassiveLevel,
     adapter: &AdapterContext,
     owner: Option<DeviceOwner>,
     ctx_id: u32,
 ) -> Result<(), VirtioError> {
-    let passive = assume_passive_unaudited();
     let owned = adapter
         .with_virtio(|v| v.untrack_owned_context(owner, ctx_id))
         .map_err(|_| VirtioError::DeviceError)?;
@@ -503,7 +503,7 @@ pub fn ctx_destroy(
 /// persistent venus context, the virgl diagnostic contexts). Owner-scoped to
 /// the KMD.
 pub fn ctx_destroy_kmd(adapter: &AdapterContext, ctx_id: u32) -> Result<(), VirtioError> {
-    ctx_destroy(adapter, None, ctx_id)
+    ctx_destroy(assume_passive_unaudited(), adapter, None, ctx_id)
 }
 
 /// `CTX_DESTROY` every context still owned by `owner` (device teardown).
@@ -529,11 +529,11 @@ pub fn destroy_contexts_for_owner(adapter: &AdapterContext, owner: Option<Device
 
 /// Attach a resource to a 3D context (`CTX_ATTACH_RESOURCE`).
 pub fn ctx_attach_resource(
+    passive: PassiveLevel,
     adapter: &AdapterContext,
     ctx_id: u32,
     resource_id: u32,
 ) -> Result<(), VirtioError> {
-    let passive = assume_passive_unaudited();
     let mut cmd = VirtioGpuCtxResource::zeroed();
     cmd.hdr.type_ = VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE;
     cmd.hdr.ctx_id = ctx_id;
@@ -978,7 +978,7 @@ pub fn diagnostic_virgl_host3d_blob(
     }
     let aligned_size = (size + 0xFFF) & !0xFFF;
     let blob_id = VIRGL_DIAG_BLOB_ID.fetch_add(1, Ordering::Relaxed);
-    let ctx_id = ctx_create(adapter, helios_protocol::VIRTIO_GPU_CAPSET_VIRGL, None)?;
+    let ctx_id = ctx_create(passive, adapter, helios_protocol::VIRTIO_GPU_CAPSET_VIRGL, None)?;
 
     const VIRGL_CCMD_PIPE_RESOURCE_CREATE: u32 = 48;
     const VIRGL_PIPE_RES_CREATE_SIZE: u32 = 11;
@@ -1026,6 +1026,7 @@ pub fn diagnostic_virgl_host3d_blob(
 
     let blob_flags = helios_protocol::VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE;
     match alloc_blob(
+        passive,
         adapter,
         ctx_id,
         helios_protocol::VIRTIO_GPU_BLOB_MEM_HOST3D,
@@ -1089,7 +1090,7 @@ pub fn diagnostic_virgl_host3d_guest_scanout(
     }
 
     let blob_id = VIRGL_DIAG_BLOB_ID.fetch_add(1, Ordering::Relaxed);
-    let ctx_id = ctx_create(adapter, helios_protocol::VIRTIO_GPU_CAPSET_VIRGL, None)?;
+    let ctx_id = ctx_create(passive, adapter, helios_protocol::VIRTIO_GPU_CAPSET_VIRGL, None)?;
 
     const VIRGL_CCMD_PIPE_RESOURCE_CREATE: u32 = 48;
     const VIRGL_PIPE_RES_CREATE_SIZE: u32 = 11;
@@ -1200,6 +1201,7 @@ pub fn diagnostic_virgl_host3d_guest_scanout(
 /// cannot be trusted to fail (`virgl_renderer_ctx_attach_resource` is void and
 /// silently no-ops on an unknown resource; QEMU still replies OK_NODATA).
 pub fn attach_resource_checked(
+    passive: PassiveLevel,
     adapter: &AdapterContext,
     ctx_id: u32,
     resource_id: u32,
@@ -1211,7 +1213,7 @@ pub fn attach_resource_checked(
         crate::diag::record(0x0E09_0000 | (resource_id & 0xFFFF));
         return Err(VirtioError::DeviceError);
     }
-    ctx_attach_resource(adapter, ctx_id, resource_id)
+    ctx_attach_resource(passive, adapter, ctx_id, resource_id)
 }
 
 /// Create a HOST3D virtio-gpu blob resource in venus context `ctx_id`,
@@ -1255,7 +1257,7 @@ pub fn resource_create_blob(
         let _ = adapter.with_virtio(|v| v.cancel_resource_reservation());
         return Err(e);
     }
-    if let Err(e) = ctx_attach_resource(adapter, ctx_id, resource_id) {
+    if let Err(e) = ctx_attach_resource(passive, adapter, ctx_id, resource_id) {
         // The resource exists host-side but could not attach: drop it so it
         // does not leak untracked.
         let _ = resource_unref(adapter, resource_id);
@@ -1269,6 +1271,9 @@ pub fn resource_create_blob(
 /// `HELIOS_ESCAPE_ALLOC_BLOB` — create a HOST3D blob (create + attach) and
 /// record it in the blob table. Returns the resource id.
 pub fn alloc_blob(
+    // Becomes load-bearing in the allocation commit, when `resource_create_blob`
+    // stops minting its own token.
+    _passive: PassiveLevel,
     adapter: &AdapterContext,
     ctx_id: u32,
     blob_mem: u32,
@@ -1341,11 +1346,11 @@ pub fn resource_unmap_blob(adapter: &AdapterContext, resource_id: u32) -> Result
 /// mapping if present). `owner = Some(o)` is the owner-scoped escape path;
 /// `None` resolves by resource id alone (the GDI executor / kernel path).
 pub fn map_blob_prepare(
+    passive: PassiveLevel,
     adapter: &AdapterContext,
     owner: OwnerFilter,
     resource_id: u32,
 ) -> Result<BlobMapPrep, VirtioError> {
-    let passive = assume_passive_unaudited();
     let mut busy = Budget::new(MAP_BUSY_MAX_MS);
     loop {
         let begin = adapter
@@ -1471,6 +1476,9 @@ pub fn map_blob_at(
 /// `HELIOS_ESCAPE_RELEASE_BLOB` — unmap (if mapped) + detach + unref a blob and
 /// drop its tracking slot, returning its window range to the free list.
 pub fn release_blob_for_owner(
+    // Becomes load-bearing in the allocation commit, when the unmap/detach/unref
+    // entry points it calls stop minting their own token.
+    _passive: PassiveLevel,
     adapter: &AdapterContext,
     owner: DeviceOwner,
     ctx_id: u32,
@@ -1582,13 +1590,13 @@ pub fn submit_venus_sync(
 /// buffers, enqueue fenced with a fresh KMD wire fence id, and return that id
 /// at QUEUE time. Completion is observed via [`wait_fence`].
 pub fn submit_venus_async(
+    passive: PassiveLevel,
     adapter: &AdapterContext,
     owner: Option<DeviceOwner>,
     ctx_id: u32,
     ring_idx: u32,
     stream: &[u8],
 ) -> Result<u64, VirtioError> {
-    let passive = assume_passive_unaudited();
     if stream.is_empty() {
         return Err(VirtioError::DeviceError);
     }
@@ -1742,8 +1750,12 @@ pub enum WaitFenceOutcome {
 
 /// Wait (PASSIVE, KEVENT) until wire fence `fence_id` completes or
 /// `timeout_ns` elapses. `timeout_ns == 0` is a poll.
-pub fn wait_fence(adapter: &AdapterContext, fence_id: u64, timeout_ns: u64) -> WaitFenceOutcome {
-    let passive = assume_passive_unaudited();
+pub fn wait_fence(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    fence_id: u64,
+    timeout_ns: u64,
+) -> WaitFenceOutcome {
     // Scoped exactly as in `ctrl_roundtrip`. Every `return` below is a return
     // from the closure, and the deregistration pairing is unchanged: the four
     // early exits in the registration loop all happen BEFORE `Registered`, so

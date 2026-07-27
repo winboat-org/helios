@@ -500,7 +500,7 @@ unsafe fn dxgkddi_present_inner(
             // frames update only the stale BAR blob.
             let has_system_backing = adapter.system_backings.contains(destination.resource_id);
             if has_system_backing {
-                match crate::virtio::ctrl::wait_fence(adapter, gpu_fence, 5_000_000_000) {
+                match crate::virtio::ctrl::wait_fence(passive, adapter, gpu_fence, 5_000_000_000) {
                     crate::virtio::ctrl::WaitFenceOutcome::Complete => {
                         crate::diag::record_named_bytes(b"PBSyWt", 1);
                     }

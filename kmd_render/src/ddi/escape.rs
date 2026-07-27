@@ -38,6 +38,7 @@ use super::blob_map::{
     effective_map_cache, map_cache_to_mm, map_io_pages_to_user, unmap_io_pages_from_user,
 };
 use crate::adapter::AdapterContext;
+use crate::irql::PassiveLevel;
 use crate::dxgk::*;
 use crate::virtio::ctrl;
 use crate::virtio::gpu::{DeviceOwner, OwnerFilter};
@@ -164,33 +165,40 @@ pub unsafe extern "C" fn dxgkddi_escape(
     // this one site and cannot reach a slot lookup at all.
     let owner = crate::virtio::gpu::DeviceOwner::new(args.hDevice as usize);
 
+    // SAFETY: `DxgkDdiEscape` is documented "IRQL: PASSIVE_LEVEL" (WDK
+    // d3dkmddi.h / DXGKDDI_ESCAPE), and it is the DDI the whole ICD command path
+    // rides — every verb below either round-trips the virtio control queue or
+    // waits on a wire fence, so a DISPATCH arrival here would already be a
+    // deadlock rather than a new one. Counted by `IrqlBad` if that ever changes.
+    let passive = unsafe { crate::irql::PassiveLevel::assume() };
+
     match hdr.cmd_type {
         HELIOS_ESCAPE_CTX_CREATE => match owner {
-            Some(owner) => escape_ctx_create(adapter, buf, owner),
+            Some(owner) => escape_ctx_create(passive, adapter, buf, owner),
             None => refuse_no_device(),
         },
         HELIOS_ESCAPE_CTX_DESTROY => match owner {
-            Some(owner) => escape_ctx_destroy(adapter, buf, owner),
+            Some(owner) => escape_ctx_destroy(passive, adapter, buf, owner),
             None => refuse_no_device(),
         },
         HELIOS_ESCAPE_SUBMIT_VENUS => match owner {
-            Some(owner) => escape_submit_venus(adapter, buf, owner),
+            Some(owner) => escape_submit_venus(passive, adapter, buf, owner),
             None => refuse_no_device(),
         },
-        HELIOS_ESCAPE_WAIT_FENCE => escape_wait_fence(adapter, buf),
+        HELIOS_ESCAPE_WAIT_FENCE => escape_wait_fence(passive, adapter, buf),
         HELIOS_ESCAPE_ALLOC_BLOB => match owner {
-            Some(owner) => escape_alloc_blob(adapter, buf, owner),
+            Some(owner) => escape_alloc_blob(passive, adapter, buf, owner),
             None => refuse_no_device(),
         },
         HELIOS_ESCAPE_MAP_BLOB => match owner {
-            Some(owner) => escape_map_blob(adapter, buf, owner),
+            Some(owner) => escape_map_blob(passive, adapter, buf, owner),
             None => refuse_no_device(),
         },
         HELIOS_ESCAPE_RELEASE_BLOB => match owner {
-            Some(owner) => escape_release_blob(adapter, buf, owner),
+            Some(owner) => escape_release_blob(passive, adapter, buf, owner),
             None => refuse_no_device(),
         },
-        HELIOS_ESCAPE_ATTACH_RESOURCE => escape_attach_resource(adapter, buf),
+        HELIOS_ESCAPE_ATTACH_RESOURCE => escape_attach_resource(passive, adapter, buf),
         HELIOS_ESCAPE_QUERY_STATS => escape_query_stats(adapter, buf),
         HELIOS_ESCAPE_QUERY_SCANOUT => escape_query_scanout(adapter, buf),
         HELIOS_ESCAPE_REGISTER_FENCE_EVENT => escape_register_fence_event(adapter, buf),
@@ -572,6 +580,7 @@ fn escape_query_stats(adapter: &AdapterContext, buf: &mut [u8]) -> NTSTATUS {
 /// `HELIOS_ESCAPE_CTX_CREATE` → create a Venus virtio-gpu context; write the
 /// guest-assigned id back into the in/out buffer's `out_ctx_id`.
 fn escape_ctx_create(
+    passive: PassiveLevel,
     adapter: &AdapterContext,
     buf: &mut [u8],
     owner: DeviceOwner,
@@ -581,7 +590,7 @@ fn escape_ctx_create(
         return refuse_short_buffer();
     }
     let req: HeliosEscapeCtxCreate = pod_read_unaligned(&buf[..sz]);
-    match ctrl::ctx_create(adapter, req.capset_id, Some(owner)) {
+    match ctrl::ctx_create(passive, adapter, req.capset_id, Some(owner)) {
         Ok(ctx_id) => {
             let mut out = req;
             out.out_ctx_id = ctx_id;
@@ -594,6 +603,7 @@ fn escape_ctx_create(
 
 /// `HELIOS_ESCAPE_CTX_DESTROY` → tear down a context this device owns.
 fn escape_ctx_destroy(
+    passive: PassiveLevel,
     adapter: &AdapterContext,
     buf: &mut [u8],
     owner: DeviceOwner,
@@ -603,7 +613,7 @@ fn escape_ctx_destroy(
         return refuse_short_buffer();
     }
     let req: HeliosEscapeCtxDestroy = pod_read_unaligned(&buf[..sz]);
-    match ctrl::ctx_destroy(adapter, Some(owner), req.ctx_id) {
+    match ctrl::ctx_destroy(passive, adapter, Some(owner), req.ctx_id) {
         Ok(()) => STATUS_SUCCESS,
         Err(crate::virtio::VirtioError::NotOwned) => refuse_foreign_context(),
         Err(ve) => ve.into(),
@@ -619,6 +629,7 @@ fn escape_ctx_destroy(
 /// escape under the dxgkrnl adapter lock (the 2026-07-04 WUDFHost/IddCx
 /// deadline-collision root cause).
 fn escape_submit_venus(
+    passive: PassiveLevel,
     adapter: &AdapterContext,
     buf: &mut [u8],
     owner: DeviceOwner,
@@ -641,6 +652,7 @@ fn escape_submit_venus(
     };
 
     match ctrl::submit_venus_async(
+        passive,
         adapter,
         Some(owner),
         req.ctx_id,
@@ -666,7 +678,11 @@ fn escape_submit_venus(
 /// not contractual, so the payload carries the verdict. The legacy 32-byte
 /// shape (old ICD) is still accepted: it waits, but can only report a timeout
 /// via a failure status.
-fn escape_wait_fence(adapter: &AdapterContext, buf: &mut [u8]) -> NTSTATUS {
+fn escape_wait_fence(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    buf: &mut [u8],
+) -> NTSTATUS {
     const LEGACY_SIZE: usize = 32;
     let sz = size_of::<HeliosEscapeWaitFence>();
     if buf.len() < LEGACY_SIZE {
@@ -679,7 +695,7 @@ fn escape_wait_fence(adapter: &AdapterContext, buf: &mut [u8]) -> NTSTATUS {
     let fence_id: u64 = pod_read_unaligned(&buf[16..24]);
     let timeout_ns: u64 = pod_read_unaligned(&buf[24..32]);
 
-    let outcome = ctrl::wait_fence(adapter, fence_id, timeout_ns);
+    let outcome = ctrl::wait_fence(passive, adapter, fence_id, timeout_ns);
     if legacy {
         return match outcome {
             ctrl::WaitFenceOutcome::Complete => STATUS_SUCCESS,
@@ -700,6 +716,7 @@ fn escape_wait_fence(adapter: &AdapterContext, buf: &mut [u8]) -> NTSTATUS {
 /// `HELIOS_ESCAPE_ALLOC_BLOB` → create a HOST3D virtio-gpu blob (create + attach)
 /// and record its size; write the guest-assigned `out_resource_id` back.
 fn escape_alloc_blob(
+    passive: PassiveLevel,
     adapter: &AdapterContext,
     buf: &mut [u8],
     owner: DeviceOwner,
@@ -713,6 +730,7 @@ fn escape_alloc_blob(
     // matches the handle DxgkDdiDestroyDevice reclaims under (0x0E01_HHHH).
     crate::diag::record(0x0E04_0000 | ((owner.raw() as u32) & 0xFFFF));
     match ctrl::alloc_blob(
+        passive,
         adapter,
         req.ctx_id,
         req.blob_mem,
@@ -738,6 +756,7 @@ fn escape_alloc_blob(
 /// space at PASSIVE_LEVEL, in this thread's (the ICD's) process. The mapping is
 /// tagged with the owning device handle and unmapped at DxgkDdiDestroyDevice.
 fn escape_map_blob(
+    passive: PassiveLevel,
     adapter: &AdapterContext,
     buf: &mut [u8],
     owner: DeviceOwner,
@@ -761,7 +780,12 @@ fn escape_map_blob(
     // Phase 1 — the RESOURCE_MAP_BLOB flow (PASSIVE waits in virtio::ctrl):
     // reserves a window offset, round-trips the map, returns the
     // guest-physical range + host caching.
-    let prep = match ctrl::map_blob_prepare(adapter, OwnerFilter::Exactly(Some(owner)), req.resource_id)
+    let prep = match ctrl::map_blob_prepare(
+        passive,
+        adapter,
+        OwnerFilter::Exactly(Some(owner)),
+        req.resource_id,
+    )
     {
         Ok(p) => p,
         Err(ve) => return ve.into(),
@@ -823,7 +847,12 @@ fn escape_map_blob(
 
 /// `HELIOS_ESCAPE_RELEASE_BLOB` → unmap this device's user view (if any), then
 /// detach + unref the blob. Symmetric to MAP_BLOB; runs in the owning process.
-fn escape_release_blob(adapter: &AdapterContext, buf: &[u8], owner: DeviceOwner) -> NTSTATUS {
+fn escape_release_blob(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    buf: &[u8],
+    owner: DeviceOwner,
+) -> NTSTATUS {
     let sz = size_of::<HeliosEscapeReleaseBlob>();
     if buf.len() < sz {
         return refuse_short_buffer();
@@ -845,7 +874,7 @@ fn escape_release_blob(adapter: &AdapterContext, buf: &[u8], owner: DeviceOwner)
         // SAFETY: PASSIVE, in the creating process; pair from a prior MAP_BLOB.
         unsafe { unmap_io_pages_from_user(user_va, mdl as wdk_sys::PMDL) };
     }
-    match ctrl::release_blob_for_owner(adapter, owner, req.ctx_id, req.resource_id) {
+    match ctrl::release_blob_for_owner(passive, adapter, owner, req.ctx_id, req.resource_id) {
         Ok(()) => STATUS_SUCCESS,
         Err(ve) => ve.into(),
     }
@@ -855,7 +884,11 @@ fn escape_release_blob(adapter: &AdapterContext, buf: &[u8], owner: DeviceOwner)
 /// without taking ownership. Used by the DXVK/Mesa shared-resource import path:
 /// the resource was created by another device/context and must be visible in the
 /// importing context before `VkImportMemoryResourceInfoMESA` reaches virglrenderer.
-fn escape_attach_resource(adapter: &AdapterContext, buf: &[u8]) -> NTSTATUS {
+fn escape_attach_resource(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    buf: &[u8],
+) -> NTSTATUS {
     let sz = size_of::<HeliosEscapeAttachResource>();
     if buf.len() < sz {
         return refuse_short_buffer();
@@ -871,7 +904,7 @@ fn escape_attach_resource(adapter: &AdapterContext, buf: &[u8]) -> NTSTATUS {
     // attach of a dead resid "succeeds" and the importer's next
     // `vkAllocateMemory` poisons its whole venus ring (host `invalid res_id`
     // → CS error → fatal decoder state — the boot-#3 dwm kill).
-    match ctrl::attach_resource_checked(adapter, req.ctx_id, req.resource_id) {
+    match ctrl::attach_resource_checked(passive, adapter, req.ctx_id, req.resource_id) {
         Ok(()) => STATUS_SUCCESS,
         Err(ve) => ve.into(),
     }

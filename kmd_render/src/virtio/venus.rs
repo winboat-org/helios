@@ -3042,7 +3042,7 @@ impl VenusClient {
             return Err(VirtioError::DeviceError);
         }
 
-        ctrl::attach_resource_checked(adapter, self.ctx_id(), desc.resource_id)?;
+        ctrl::attach_resource_checked(self.passive(), adapter, self.ctx_id(), desc.resource_id)?;
         let image_id = match self.create_optimal_present_image_alias(
             adapter,
             desc.width,
@@ -3959,7 +3959,7 @@ impl VenusClient {
         let target_pixel_format = PresentPixelFormat::Bgra8Unorm;
 
         crate::diag::record_named_bytes(b"CpImpSt", 1);
-        ctrl::attach_resource_checked(adapter, self.ctx_id(), source_resource_id)?;
+        ctrl::attach_resource_checked(self.passive(), adapter, self.ctx_id(), source_resource_id)?;
 
         crate::diag::record_named_bytes(b"CpImpSt", 2);
         let source_image_id = match self.create_optimal_present_image_alias(
@@ -4533,12 +4533,13 @@ impl VenusClient {
     ///
     /// PASSIVE_LEVEL, and MUST NOT be called with the venus mutex held.
     pub(crate) fn probe_present_destination(
+        passive: PassiveLevel,
         adapter: &AdapterContext,
         destination: PresentBufferDesc,
         fence_id: u64,
     ) {
         crate::diag::record_named_bytes(b"PBPrF", 1);
-        match ctrl::wait_fence(adapter, fence_id, 5_000_000_000) {
+        match ctrl::wait_fence(passive, adapter, fence_id, 5_000_000_000) {
             ctrl::WaitFenceOutcome::Complete => {
                 crate::diag::record_named_bytes(b"PBPrF", 2);
             }
@@ -4553,6 +4554,7 @@ impl VenusClient {
         }
 
         let prep = match ctrl::map_blob_prepare(
+            passive,
             adapter,
             super::gpu::OwnerFilter::Any,
             destination.resource_id,
@@ -4661,7 +4663,12 @@ impl VenusClient {
         // context teardown rather than partially freeing live objects.
         for blt in &self.present_blits {
             if blt.last_wire_fence_id != 0 {
-                match ctrl::wait_fence(adapter, blt.last_wire_fence_id, 5_000_000_000) {
+                match ctrl::wait_fence(
+                    self.passive(),
+                    adapter,
+                    blt.last_wire_fence_id,
+                    5_000_000_000,
+                ) {
                     ctrl::WaitFenceOutcome::Complete => {}
                     ctrl::WaitFenceOutcome::TimedOut | ctrl::WaitFenceOutcome::Invalid => {
                         return Err(VirtioError::DeviceError);
@@ -4756,7 +4763,12 @@ impl VenusClient {
         // both the write and this read happen under the venus mutex by
         // construction — which is the invariant the paragraph above asserts.
         if self.scanout_copy_last_fence != 0 {
-            match ctrl::wait_fence(adapter, self.scanout_copy_last_fence, 5_000_000_000) {
+            match ctrl::wait_fence(
+                self.passive(),
+                adapter,
+                self.scanout_copy_last_fence,
+                5_000_000_000,
+            ) {
                 ctrl::WaitFenceOutcome::Complete => {}
                 ctrl::WaitFenceOutcome::TimedOut | ctrl::WaitFenceOutcome::Invalid => {
                     return Err(VirtioError::DeviceError);
@@ -5240,7 +5252,12 @@ pub fn allocate_host_visible_blob(
     diag(0x000A);
 
     // ── 9. Create + map the page-table blob backed by the venus memory id ─────
-    let pt_prep = ctrl::map_blob_prepare(adapter, super::gpu::OwnerFilter::Exactly(None), blob.res_id)?;
+    let pt_prep = ctrl::map_blob_prepare(
+        passive,
+        adapter,
+        super::gpu::OwnerFilter::Exactly(None),
+        blob.res_id,
+    )?;
     diag(0x000B);
 
     let blob = HostVisibleBlob {
@@ -5276,8 +5293,12 @@ impl VenusRing {
         )?;
         // Track the ring blob (owner 0) so the map below can size the mapping.
         let _ = adapter.with_virtio(|v| v.note_blob_size(ring_res_id, RING_SHMEM_SIZE));
-        let ring_prep =
-            ctrl::map_blob_prepare(adapter, super::gpu::OwnerFilter::Exactly(None), ring_res_id)?;
+        let ring_prep = ctrl::map_blob_prepare(
+            passive,
+            adapter,
+            super::gpu::OwnerFilter::Exactly(None),
+            ring_res_id,
+        )?;
         let ring_map = RingMap::new(ring_prep.gpa, ring_prep.size, ring_prep.map_cache)
             .ok_or(VirtioError::MmioMapFailed)?;
         ring_map.zero();
@@ -5293,8 +5314,12 @@ impl VenusRing {
             REPLY_SHMEM_SIZE,
         )?;
         let _ = adapter.with_virtio(|v| v.note_blob_size(reply_res_id, REPLY_SHMEM_SIZE));
-        let reply_prep =
-            ctrl::map_blob_prepare(adapter, super::gpu::OwnerFilter::Exactly(None), reply_res_id)?;
+        let reply_prep = ctrl::map_blob_prepare(
+            passive,
+            adapter,
+            super::gpu::OwnerFilter::Exactly(None),
+            reply_res_id,
+        )?;
         let reply_map = KernelMap::new(reply_prep.gpa, reply_prep.size, reply_prep.map_cache)
             .ok_or(VirtioError::MmioMapFailed)?;
         reply_map.zero();
