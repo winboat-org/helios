@@ -91,15 +91,6 @@ mod ffi {
             cross_context_optimal: bool,
         ) -> usize;
 
-        unsafe fn open_kmd_scanout_target(
-            self: &HeliosDxvkDevice,
-            out_resource_id: *mut u32,
-            out_width: *mut u32,
-            out_height: *mut u32,
-            out_pitch: *mut u32,
-            out_generation: *mut u32,
-        ) -> usize;
-
         /// Create the DWM scan-out primary as a dedicated OPTIMAL,
         /// DMA_BUF-exportable image and report logical scanout metadata for
         /// exact host reconstruction.
@@ -346,27 +337,6 @@ impl ffi::HeliosDxvkDevice {
         }
     }
 
-    /// Geometry of the KMD VidPn primary, plus one owned import of it.
-    ///
-    /// The five out-params become a returned tuple so a caller cannot read them
-    /// after a failed open, when they are whatever the bridge zeroed them to.
-    pub(crate) fn open_scanout_target(&self) -> Option<(ID3D11Resource, ScanoutImportInfo)> {
-        let mut info = ScanoutImportInfo::default();
-        // SAFETY: every out-param points at a live local for the call's
-        // duration; the bridge writes each before returning non-zero.
-        let raw = unsafe {
-            self.open_kmd_scanout_target(
-                &mut info.resource_id,
-                &mut info.width,
-                &mut info.height,
-                &mut info.pitch,
-                &mut info.generation,
-            )
-        };
-        // SAFETY: the bridge transfers one reference on success.
-        unsafe { adopt_resource(raw) }.map(|r| (r, info))
-    }
-
     /// The DWM scan-out primary as a dedicated OPTIMAL, DMA_BUF-exportable
     /// image, plus the logical scan-out metadata the host reconstructs from.
     pub(crate) fn create_scanout_texture2d(
@@ -395,17 +365,6 @@ impl ffi::HeliosDxvkDevice {
         // SAFETY: the bridge transfers one reference on success.
         unsafe { adopt_resource(raw) }.map(|r| (r, row_pitch, offset))
     }
-}
-
-/// Geometry the KMD reports for its VidPn primary, filled by
-/// [`ffi::HeliosDxvkDevice::open_scanout_target`].
-#[derive(Clone, Copy, Default)]
-pub(crate) struct ScanoutImportInfo {
-    pub(crate) resource_id: u32,
-    pub(crate) width: u32,
-    pub(crate) height: u32,
-    pub(crate) pitch: u32,
-    pub(crate) generation: u32,
 }
 
 // NOT wrapped, deliberately: the eight shader creates.
@@ -526,10 +485,6 @@ impl BridgeDevice {
                 cross_context_optimal,
             )
         }
-    }
-
-    pub(crate) fn open_scanout_target(&self) -> Option<(ID3D11Resource, ScanoutImportInfo)> {
-        self.get()?.open_scanout_target()
     }
 
     pub(crate) fn create_scanout_texture2d(

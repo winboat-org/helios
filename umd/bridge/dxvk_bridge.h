@@ -59,16 +59,6 @@ struct HeliosDxvkDevice {
       bool linear_scanout_target,
       bool cross_context_optimal) const;
 
-  // Query the KMD's currently-bound LINEAR VidPn primary through this device's
-  // Venus instance, import it as a direct LINEAR transfer destination, and
-  // return one owned ID3D11Resource reference. Zero means not yet available.
-  std::size_t open_kmd_scanout_target(
-      std::uint32_t* out_resource_id,
-      std::uint32_t* out_width,
-      std::uint32_t* out_height,
-      std::uint32_t* out_pitch,
-      std::uint32_t* out_generation) const noexcept;
-
   // Create the DWM scan-out primary as a dedicated OPTIMAL,
   // DMA_BUF-exportable image (via the D3D11_HELIOS_CREATE_INFO marker) and
   // report logical scanout metadata for exact host reconstruction. Returns an

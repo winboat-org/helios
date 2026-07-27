@@ -326,7 +326,6 @@ namespace {
     MemoryResId,
     MemoryTransferOwnership,
     MemoryAllocInfo,
-    QueryScanout,
     Count,
   };
 
@@ -342,7 +341,6 @@ namespace {
     case HeliosIcdExport::MemoryTransferOwnership:
       return "helios_venus_memory_transfer_resource_ownership";
     case HeliosIcdExport::MemoryAllocInfo: return "helios_venus_memory_alloc_info";
-    case HeliosIcdExport::QueryScanout:    return "helios_venus_query_scanout";
     default: return "";
     }
   }
@@ -515,50 +513,9 @@ namespace {
     return read_current_venus_context_id();
   }
 
-  struct HeliosVenusScanoutInfo {
-    std::uint64_t allocSize;
-    std::uint32_t resourceId;
-    std::uint32_t width;
-    std::uint32_t height;
-    std::uint32_t dxgiFormat;
-    std::uint32_t pitch;
-    std::uint32_t planeOffset;
-    std::uint32_t memoryTypeIndex;
-    std::uint32_t generation;
-  };
-  static_assert(sizeof(HeliosVenusScanoutInfo) == 40);
-
-  // open_kmd_scanout_target is the entry point for the guest primary-to-scanout
-  // LINEAR COPY target. It returned 0 for three different reasons with a named
-  // counter for none of them, and two of the three were entirely silent, so
-  // "the query is failing every frame" was indistinguishable from "the query is
-  // not being made".
-  std::atomic<std::uint32_t> g_scanoutExportMissing{0};
-  std::atomic<std::uint32_t> g_scanoutQueryUnavailable{0};
-  std::atomic<std::uint32_t> g_scanoutImportFailed{0};
-  std::atomic<std::uint32_t> g_scanoutFormatRefused{0};
   /// The direct-scanout PRIMARY create's QI failure — the one whose silent zero
   /// R401 now reports to the runtime.
   std::atomic<std::uint32_t> g_scanoutPrimaryQiFailed{0};
-  std::atomic<std::uint32_t> g_scanoutPlaneOffsetRefused{0};
-
-  void log_scanout_refusal(const char* what, std::atomic<std::uint32_t>& counter) {
-    const std::uint32_t n = counter.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (n == 1 || (n % 512u) == 0) {
-      char msg[256];
-      std::snprintf(msg, sizeof(msg),
-        "open_kmd_scanout_target REFUSED: %s (x%u) "
-        "[export_missing=%u query_unavailable=%u import_failed=%u "
-        "format_refused=%u plane_offset_refused=%u]",
-        what, n,
-        g_scanoutExportMissing.load(std::memory_order_relaxed),
-        g_scanoutQueryUnavailable.load(std::memory_order_relaxed),
-        g_scanoutImportFailed.load(std::memory_order_relaxed),
-        g_scanoutFormatRefused.load(std::memory_order_relaxed),
-        g_scanoutPlaneOffsetRefused.load(std::memory_order_relaxed));
-      umd_log(msg);
-    }
-  }
 
   // Owns one COM reference until it is deliberately released. Non-copyable, so
   // the reference cannot be duplicated into a second owner by accident.
@@ -1217,11 +1174,11 @@ struct HeliosCbSignalSyncFromCpu {
   const std::uint64_t* FenceValueArray;
 };
 
-// R818: the prose above was the ONLY thing vouching for this layout, unlike
-// HeliosVenusScanoutInfo twenty lines up, which asserts its size on BOTH sides
-// of the guest/host boundary. A shifted field here is a stack-corrupting kernel
-// call, not a compile error -- it would be reported, if at all, only as
-// "flip-kwait: CPU signal FAILED hr=...".
+// R818: the prose above is the ONLY thing vouching for this layout. A shifted
+// field here is a stack-corrupting kernel call, not a compile error -- it would
+// be reported, if at all, only as "flip-kwait: CPU signal FAILED hr=...".
+// (The comparison this used to draw, against HeliosVenusScanoutInfo's
+// both-sides size assert, went with R910's scan-out import.)
 //
 // The same three numbers are asserted against the bindgen
 // D3DDDICB_SIGNALSYNCHRONIZATIONOBJECTFROMCPU on the Rust side (see
@@ -1693,96 +1650,6 @@ std::size_t HeliosDxvkDevice::open_ddi_texture2d(
   }
 
   return 0;
-}
-
-std::size_t HeliosDxvkDevice::open_kmd_scanout_target(
-    std::uint32_t* out_resource_id,
-    std::uint32_t* out_width,
-    std::uint32_t* out_height,
-    std::uint32_t* out_pitch,
-    std::uint32_t* out_generation) const noexcept {
-  return bridge_guard("open_kmd_scanout_target", std::size_t(0), [&]() -> std::size_t {
-    if (out_resource_id) *out_resource_id = 0;
-    if (out_width)       *out_width = 0;
-    if (out_height)      *out_height = 0;
-    if (out_pitch)       *out_pitch = 0;
-    if (out_generation)  *out_generation = 0;
-    if (!impl || !impl->instance || !impl->d3d11)
-      return 0;
-
-    using Fn = bool (__cdecl*)(VkInstance, HeliosVenusScanoutInfo*);
-    auto query = helios_icd_export<Fn>(HeliosIcdExport::QueryScanout);
-    if (!query) {
-      log_export_unavailable(HeliosIcdExport::QueryScanout);
-      g_scanoutExportMissing.fetch_add(1, std::memory_order_relaxed);
-      return 0;
-    }
-
-    HeliosVenusScanoutInfo info = { };
-    if (!query(impl->instance->handle(), &info) || !info.resourceId ||
-        !info.allocSize || !info.width || !info.height || !info.pitch) {
-      log_scanout_refusal("no scanout published yet", g_scanoutQueryUnavailable);
-      return 0;
-    }
-
-    // The ICD reports the format; the literal 87 that used to be substituted
-    // here silently disagreed with it if it ever reported anything else. The
-    // KMD image is VkFormat B8G8R8A8_UNORM while scanout advertises XR24, so
-    // BGRA remains the expected value: CopyResource from DWM's BGRA composition
-    // target stays format-compatible and alpha is ignored by XR24 scanout.
-    // Refuse anything outside the 32-bit Windows scan-out set rather than
-    // passing an unknown format through blind.
-    std::uint32_t aliasFormat = info.dxgiFormat;
-    if (aliasFormat == 0u)
-      aliasFormat = 87u;  // older ICDs left the field zero
-    if (aliasFormat != 28u && aliasFormat != 87u && aliasFormat != 88u) {
-      log_scanout_refusal("ICD reported a non-scanout dxgiFormat",
-                          g_scanoutFormatRefused);
-      return 0;
-    }
-    // planeOffset was fetched and thrown away. Nothing downstream applies it,
-    // so a non-zero value would alias the wrong bytes: refuse explicitly.
-    if (info.planeOffset != 0u) {
-      log_scanout_refusal("ICD reported a non-zero planeOffset",
-                          g_scanoutPlaneOffsetRefused);
-      return 0;
-    }
-    const auto resource = open_ddi_texture2d(
-      info.width, info.height, aliasFormat,
-      0u, 0u, info.resourceId, info.resourceId, info.allocSize,
-      info.memoryTypeIndex, false, true, false);
-    if (!resource) {
-      log_scanout_refusal("import of the published scanout failed",
-                          g_scanoutImportFailed);
-      return 0;
-    }
-
-    // Importing the target only ARMS the fallback; it does not mean anything
-    // is being copied through it. `publish_dwm_composition` performs the copy
-    // only once a composition source has been selected, and THAT is the
-    // regression away from the direct primary — so the warning lives at the
-    // copy site (forward.rs), not here. Verified on the live stack: this import
-    // succeeds on every DWM boot while the LINEAR copy count stays 0.
-    static std::atomic<std::uint32_t> s_copyTargetOpens{0};
-    const std::uint32_t opens =
-      s_copyTargetOpens.fetch_add(1, std::memory_order_relaxed) + 1;
-
-    if (out_resource_id) *out_resource_id = info.resourceId;
-    if (out_width)       *out_width = info.width;
-    if (out_height)      *out_height = info.height;
-    if (out_pitch)       *out_pitch = info.pitch;
-    if (out_generation)  *out_generation = info.generation;
-
-    char msg[224];
-    std::snprintf(msg, sizeof(msg),
-      "open_kmd_scanout_target res=%u %ux%u pitch=%u off=%u fmt=%u alloc=%llu mti=%u gen=%u resource=%p opens=%u",
-      info.resourceId, info.width, info.height, info.pitch, info.planeOffset,
-      aliasFormat,
-      static_cast<unsigned long long>(info.allocSize), info.memoryTypeIndex,
-      info.generation, reinterpret_cast<void*>(resource), opens);
-    umd_log(msg);
-    return resource;
-  });
 }
 
 std::size_t HeliosDxvkDevice::create_ddi_scanout_texture2d(
