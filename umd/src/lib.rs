@@ -114,86 +114,23 @@ const D3D12_SUPPORTED_DDI_VERSIONS: &[u64] = &[
     ddi_supported(12, 2, 8),
 ];
 
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct D3d10DdiAdapterHandle {
-    pub p_drv_private: *mut c_void,
-}
-
-#[repr(C)]
-pub struct D3d10DdiArgOpenAdapter {
-    pub h_rt_adapter: *mut c_void,
-    pub h_adapter: D3d10DdiAdapterHandle,
-    pub interface: u32,
-    pub version: u32,
-    pub p_adapter_callbacks: *const c_void,
-    pub p_adapter_funcs: *mut c_void,
-}
-
-#[repr(C)]
-pub struct D3d10DdiAdapterFuncs {
-    pub pfn_calc_private_device_size:
-        Option<unsafe extern "system" fn(D3d10DdiAdapterHandle, *const c_void) -> usize>,
-    pub pfn_create_device:
-        Option<unsafe extern "system" fn(D3d10DdiAdapterHandle, *mut c_void) -> Hresult>,
-    pub pfn_close_adapter: Option<unsafe extern "system" fn(D3d10DdiAdapterHandle) -> Hresult>,
-}
-
-#[repr(C)]
-pub struct D3d10_2DdiAdapterFuncs {
-    pub base: D3d10DdiAdapterFuncs,
-    pub pfn_get_supported_versions:
-        Option<unsafe extern "system" fn(D3d10DdiAdapterHandle, *mut u32, *mut u64) -> Hresult>,
-    pub pfn_get_caps: Option<
-        unsafe extern "system" fn(D3d10DdiAdapterHandle, *const D3d10_2DdiArgGetCaps) -> Hresult,
-    >,
-}
-
-#[repr(C)]
-pub struct D3d10_2DdiArgGetCaps {
-    pub caps_type: u32,
-    pub p_info: *mut c_void,
-    pub p_data: *mut c_void,
-    pub data_size: u32,
-}
-
-/// `DXGI_DDI_BASE_ARGS` (dxgiddi.h): the runtime hands `pDXGIBaseCallbacks` (in)
-/// and expects the driver to fill the `pDXGIDDIBaseFunctions*` union member
-/// (in/out) with the DXGI base entry points. A real `CreateDevice` MUST fill it.
-#[repr(C)]
-pub struct DxgiDdiBaseArgs {
-    pub p_dxgi_base_callbacks: *const c_void,
-    pub p_dxgi_ddi_base_functions: *mut c_void,
-}
-
-/// `D3D10DDIARG_CREATEDEVICE` (d3d10umddi.h, WDK 10.0.26100, x64), laid out
-/// field-for-field so we can read the negotiated `Interface`/`Version`/`Flags`
-/// the runtime asks Helios for. The function-pointer union (`pDeviceFuncs` and
-/// friends) is one pointer; which device-funcs table it points at is selected by
-/// `interface` (e.g. `D3D11_0_DDI_INTERFACE_VERSION` -> `p11DeviceFuncs`).
-///
-/// Offsets (x64): hRTDevice@0, interface@8, version@12, pKTCallbacks@16,
-/// pDeviceFuncs@24, hDrvDevice@32, DXGIBaseDDI@40 (16B), hRTCoreLayer@56,
-/// pUMCallbacks@64, flags@72, ppfnRetrieveSubObject@80 (minor>=3).
-#[repr(C)]
-pub struct D3d10DdiArgCreateDevice {
-    pub h_rt_device: *mut c_void,
-    pub interface: u32,
-    pub version: u32,
-    pub p_kt_callbacks: *const c_void,
-    pub p_device_funcs: *mut c_void,
-    pub h_drv_device: *mut c_void,
-    pub dxgi_base_ddi: DxgiDdiBaseArgs,
-    pub h_rt_core_layer: *mut c_void,
-    pub p_um_callbacks: *const c_void,
-    pub flags: u32,
-    pub ppfn_retrieve_sub_object: *mut c_void,
-}
+// The seven d3d10umddi ABI structs that used to be hand-transcribed here
+// (ddi::D3D10DDI_HADAPTER, D3d10DdiArgOpenAdapter, D3d10DdiAdapterFuncs,
+// D3d10_2DdiAdapterFuncs, D3d10_2DdiArgGetCaps, DxgiDdiBaseArgs,
+// D3d10DdiArgCreateDevice) are gone: every one of them is generated into
+// `ddi::*` from the WDK header, with bindgen's size/alignment/offset
+// assertions, and the code below uses the generated types directly. R802.
+//
+// The `D3d12Ddi*` structs BELOW stay hand-written, and that is deliberate
+// rather than an oversight: build.rs bindgens d3d10umddi.h only, so there is
+// no generated d3d12umddi counterpart to switch to. They are reachable only
+// from OpenAdapter12, which declines with DXGI_ERROR_UNSUPPORTED before
+// touching them; T6's u-core-04 deletes the whole D3D12 adapter path.
 
 #[repr(C)]
 pub struct D3d12DdiArgOpenAdapter {
     pub h_rt_adapter: *mut c_void,
-    pub h_adapter: D3d10DdiAdapterHandle,
+    pub h_adapter: ddi::D3D10DDI_HADAPTER,
     pub p_adapter_callbacks: *const c_void,
     pub p_adapter_funcs: *mut D3d12DdiAdapterFuncs,
 }
@@ -202,29 +139,29 @@ pub struct D3d12DdiArgOpenAdapter {
 pub struct D3d12DdiAdapterFuncs {
     pub pfn_calc_private_device_size: Option<
         unsafe extern "system" fn(
-            D3d10DdiAdapterHandle,
+            ddi::D3D10DDI_HADAPTER,
             *const D3d12DdiArgCalcPrivateDeviceSize,
         ) -> usize,
     >,
     pub pfn_create_device: Option<
-        unsafe extern "system" fn(D3d10DdiAdapterHandle, *const D3d12DdiArgCreateDevice) -> Hresult,
+        unsafe extern "system" fn(ddi::D3D10DDI_HADAPTER, *const D3d12DdiArgCreateDevice) -> Hresult,
     >,
-    pub pfn_close_adapter: Option<unsafe extern "system" fn(D3d10DdiAdapterHandle) -> Hresult>,
+    pub pfn_close_adapter: Option<unsafe extern "system" fn(ddi::D3D10DDI_HADAPTER) -> Hresult>,
     pub pfn_get_supported_versions:
-        Option<unsafe extern "system" fn(D3d10DdiAdapterHandle, *mut u32, *mut u64) -> Hresult>,
+        Option<unsafe extern "system" fn(ddi::D3D10DDI_HADAPTER, *mut u32, *mut u64) -> Hresult>,
     pub pfn_get_caps: Option<
-        unsafe extern "system" fn(D3d10DdiAdapterHandle, *const D3d10_2DdiArgGetCaps) -> Hresult,
+        unsafe extern "system" fn(ddi::D3D10DDI_HADAPTER, *const ddi::D3D10_2DDIARG_GETCAPS) -> Hresult,
     >,
     pub pfn_get_optional_ddi_tables: Option<
         unsafe extern "system" fn(
-            D3d10DdiAdapterHandle,
+            ddi::D3D10DDI_HADAPTER,
             *mut u32,
             *mut D3d12DdiTableRequest,
         ) -> Hresult,
     >,
     pub pfn_fill_ddi_table: Option<
         unsafe extern "system" fn(
-            D3d10DdiAdapterHandle,
+            ddi::D3D10DDI_HADAPTER,
             u32,
             *mut c_void,
             usize,
@@ -257,187 +194,6 @@ pub struct D3d12DdiArgCreateDevice {
 pub struct D3d12DdiTableRequest {
     pub table_type: u32,
     pub num_tables: u32,
-}
-
-/// TEMPORARY (R802 verification, deleted in the conversion commit).
-///
-/// The review asks for "one throwaway build [that] logs `size_of`/`offset_of`
-/// for both the hand-written and the bindgen struct — they must be numerically
-/// identical (the field lists were verified to match; the compiler's numbers
-/// were not)". A build that *logs* numbers still needs a human to compare them,
-/// so this asserts the equality instead: if this module compiles, the two
-/// definitions are provably the same shape and the hand-written ones can be
-/// deleted without reading a single offset.
-#[allow(dead_code)]
-mod abi_equivalence_proof {
-    use super::*;
-    use core::mem::{align_of, offset_of, size_of};
-
-    // ---- D3D10DDI_HADAPTER -------------------------------------------------
-    const _: () = assert!(size_of::<D3d10DdiAdapterHandle>() == size_of::<ddi::D3D10DDI_HADAPTER>());
-    const _: () =
-        assert!(align_of::<D3d10DdiAdapterHandle>() == align_of::<ddi::D3D10DDI_HADAPTER>());
-    const _: () = assert!(
-        offset_of!(D3d10DdiAdapterHandle, p_drv_private)
-            == offset_of!(ddi::D3D10DDI_HADAPTER, pDrvPrivate)
-    );
-
-    // ---- D3D10DDIARG_OPENADAPTER ------------------------------------------
-    const _: () =
-        assert!(size_of::<D3d10DdiArgOpenAdapter>() == size_of::<ddi::D3D10DDIARG_OPENADAPTER>());
-    const _: () = assert!(
-        offset_of!(D3d10DdiArgOpenAdapter, h_rt_adapter)
-            == offset_of!(ddi::D3D10DDIARG_OPENADAPTER, hRTAdapter)
-    );
-    const _: () = assert!(
-        offset_of!(D3d10DdiArgOpenAdapter, h_adapter)
-            == offset_of!(ddi::D3D10DDIARG_OPENADAPTER, hAdapter)
-    );
-    const _: () = assert!(
-        offset_of!(D3d10DdiArgOpenAdapter, interface)
-            == offset_of!(ddi::D3D10DDIARG_OPENADAPTER, Interface)
-    );
-    const _: () = assert!(
-        offset_of!(D3d10DdiArgOpenAdapter, version)
-            == offset_of!(ddi::D3D10DDIARG_OPENADAPTER, Version)
-    );
-    const _: () = assert!(
-        offset_of!(D3d10DdiArgOpenAdapter, p_adapter_callbacks)
-            == offset_of!(ddi::D3D10DDIARG_OPENADAPTER, pAdapterCallbacks)
-    );
-    // The hand copy flattens the funcs union to one pointer; bindgen keeps the
-    // union. Same offset, same size, which is the whole question.
-    const _: () = assert!(
-        offset_of!(D3d10DdiArgOpenAdapter, p_adapter_funcs)
-            == offset_of!(ddi::D3D10DDIARG_OPENADAPTER, __bindgen_anon_1)
-    );
-
-    // ---- D3D10DDI_ADAPTERFUNCS / D3D10_2DDI_ADAPTERFUNCS -------------------
-    const _: () =
-        assert!(size_of::<D3d10DdiAdapterFuncs>() == size_of::<ddi::D3D10DDI_ADAPTERFUNCS>());
-    const _: () = assert!(
-        offset_of!(D3d10DdiAdapterFuncs, pfn_calc_private_device_size)
-            == offset_of!(ddi::D3D10DDI_ADAPTERFUNCS, pfnCalcPrivateDeviceSize)
-    );
-    const _: () = assert!(
-        offset_of!(D3d10DdiAdapterFuncs, pfn_create_device)
-            == offset_of!(ddi::D3D10DDI_ADAPTERFUNCS, pfnCreateDevice)
-    );
-    const _: () = assert!(
-        offset_of!(D3d10DdiAdapterFuncs, pfn_close_adapter)
-            == offset_of!(ddi::D3D10DDI_ADAPTERFUNCS, pfnCloseAdapter)
-    );
-    // The hand copy nests the 10.0 table as `base`; bindgen flattens all five
-    // fields. Equivalent only if `base` sits at 0 and the two extra fields land
-    // where the flat table puts them.
-    const _: () =
-        assert!(size_of::<D3d10_2DdiAdapterFuncs>() == size_of::<ddi::D3D10_2DDI_ADAPTERFUNCS>());
-    const _: () = assert!(offset_of!(D3d10_2DdiAdapterFuncs, base) == 0);
-    const _: () = assert!(
-        offset_of!(D3d10_2DdiAdapterFuncs, pfn_get_supported_versions)
-            == offset_of!(ddi::D3D10_2DDI_ADAPTERFUNCS, pfnGetSupportedVersions)
-    );
-    const _: () = assert!(
-        offset_of!(D3d10_2DdiAdapterFuncs, pfn_get_caps)
-            == offset_of!(ddi::D3D10_2DDI_ADAPTERFUNCS, pfnGetCaps)
-    );
-
-    // ---- D3D10_2DDIARG_GETCAPS --------------------------------------------
-    const _: () =
-        assert!(size_of::<D3d10_2DdiArgGetCaps>() == size_of::<ddi::D3D10_2DDIARG_GETCAPS>());
-    const _: () = assert!(
-        offset_of!(D3d10_2DdiArgGetCaps, caps_type) == offset_of!(ddi::D3D10_2DDIARG_GETCAPS, Type)
-    );
-    const _: () = assert!(
-        offset_of!(D3d10_2DdiArgGetCaps, p_info) == offset_of!(ddi::D3D10_2DDIARG_GETCAPS, pInfo)
-    );
-    const _: () = assert!(
-        offset_of!(D3d10_2DdiArgGetCaps, p_data) == offset_of!(ddi::D3D10_2DDIARG_GETCAPS, pData)
-    );
-    const _: () = assert!(
-        offset_of!(D3d10_2DdiArgGetCaps, data_size)
-            == offset_of!(ddi::D3D10_2DDIARG_GETCAPS, DataSize)
-    );
-
-    // ---- DXGI_DDI_BASE_ARGS ------------------------------------------------
-    const _: () = assert!(size_of::<DxgiDdiBaseArgs>() == size_of::<ddi::DXGI_DDI_BASE_ARGS>());
-    const _: () = assert!(
-        offset_of!(DxgiDdiBaseArgs, p_dxgi_base_callbacks)
-            == offset_of!(ddi::DXGI_DDI_BASE_ARGS, pDXGIBaseCallbacks)
-    );
-    const _: () = assert!(
-        offset_of!(DxgiDdiBaseArgs, p_dxgi_ddi_base_functions)
-            == offset_of!(ddi::DXGI_DDI_BASE_ARGS, __bindgen_anon_1)
-    );
-
-    // ---- D3D10DDIARG_CREATEDEVICE -----------------------------------------
-    // The one that matters most: `CreateDevice` writes 152 function pointers
-    // through the funcs union and constructs `HeliosDevice` over `hDrvDevice`.
-    const _: () =
-        assert!(size_of::<D3d10DdiArgCreateDevice>() == size_of::<ddi::D3D10DDIARG_CREATEDEVICE>());
-    const _: () = assert!(
-        align_of::<D3d10DdiArgCreateDevice>() == align_of::<ddi::D3D10DDIARG_CREATEDEVICE>()
-    );
-    const _: () = assert!(
-        offset_of!(D3d10DdiArgCreateDevice, h_rt_device)
-            == offset_of!(ddi::D3D10DDIARG_CREATEDEVICE, hRTDevice)
-    );
-    const _: () = assert!(
-        offset_of!(D3d10DdiArgCreateDevice, interface)
-            == offset_of!(ddi::D3D10DDIARG_CREATEDEVICE, Interface)
-    );
-    const _: () = assert!(
-        offset_of!(D3d10DdiArgCreateDevice, version)
-            == offset_of!(ddi::D3D10DDIARG_CREATEDEVICE, Version)
-    );
-    const _: () = assert!(
-        offset_of!(D3d10DdiArgCreateDevice, p_kt_callbacks)
-            == offset_of!(ddi::D3D10DDIARG_CREATEDEVICE, pKTCallbacks)
-    );
-    const _: () = assert!(
-        offset_of!(D3d10DdiArgCreateDevice, p_device_funcs)
-            == offset_of!(ddi::D3D10DDIARG_CREATEDEVICE, __bindgen_anon_1)
-    );
-    const _: () = assert!(
-        offset_of!(D3d10DdiArgCreateDevice, h_drv_device)
-            == offset_of!(ddi::D3D10DDIARG_CREATEDEVICE, hDrvDevice)
-    );
-    const _: () = assert!(
-        offset_of!(D3d10DdiArgCreateDevice, dxgi_base_ddi)
-            == offset_of!(ddi::D3D10DDIARG_CREATEDEVICE, DXGIBaseDDI)
-    );
-    const _: () = assert!(
-        offset_of!(D3d10DdiArgCreateDevice, h_rt_core_layer)
-            == offset_of!(ddi::D3D10DDIARG_CREATEDEVICE, hRTCoreLayer)
-    );
-    const _: () = assert!(
-        offset_of!(D3d10DdiArgCreateDevice, p_um_callbacks)
-            == offset_of!(ddi::D3D10DDIARG_CREATEDEVICE, __bindgen_anon_2)
-    );
-    const _: () = assert!(
-        offset_of!(D3d10DdiArgCreateDevice, flags)
-            == offset_of!(ddi::D3D10DDIARG_CREATEDEVICE, Flags)
-    );
-    const _: () = assert!(
-        offset_of!(D3d10DdiArgCreateDevice, ppfn_retrieve_sub_object)
-            == offset_of!(ddi::D3D10DDIARG_CREATEDEVICE, ppfnRetrieveSubObject)
-    );
-
-    // The doc comment on `D3d10DdiArgCreateDevice` asserts these absolute
-    // offsets in prose. Pin them so the prose is checked too.
-    const _: () = assert!(offset_of!(ddi::D3D10DDIARG_CREATEDEVICE, hRTDevice) == 0);
-    const _: () = assert!(offset_of!(ddi::D3D10DDIARG_CREATEDEVICE, Interface) == 8);
-    const _: () = assert!(offset_of!(ddi::D3D10DDIARG_CREATEDEVICE, Version) == 12);
-    const _: () = assert!(offset_of!(ddi::D3D10DDIARG_CREATEDEVICE, pKTCallbacks) == 16);
-    const _: () = assert!(offset_of!(ddi::D3D10DDIARG_CREATEDEVICE, __bindgen_anon_1) == 24);
-    const _: () = assert!(offset_of!(ddi::D3D10DDIARG_CREATEDEVICE, hDrvDevice) == 32);
-    const _: () = assert!(offset_of!(ddi::D3D10DDIARG_CREATEDEVICE, DXGIBaseDDI) == 40);
-    const _: () = assert!(size_of::<ddi::DXGI_DDI_BASE_ARGS>() == 16);
-    const _: () = assert!(offset_of!(ddi::D3D10DDIARG_CREATEDEVICE, hRTCoreLayer) == 56);
-    const _: () = assert!(offset_of!(ddi::D3D10DDIARG_CREATEDEVICE, __bindgen_anon_2) == 64);
-    const _: () = assert!(offset_of!(ddi::D3D10DDIARG_CREATEDEVICE, Flags) == 72);
-    const _: () = assert!(offset_of!(ddi::D3D10DDIARG_CREATEDEVICE, ppfnRetrieveSubObject) == 80);
-    const _: () = assert!(size_of::<ddi::D3D10DDIARG_CREATEDEVICE>() == 88);
 }
 
 static mut ADAPTER_COOKIE: usize = 0x4845_4c49_4f53_554d; // "HELIOSUM"
@@ -547,10 +303,10 @@ pub extern "system" fn helios_umd_selftest() -> i32 {
     // buffers (no D3D runtime / DWM): proves CalcPrivateDeviceSize + CreateDevice
     // + the 152-entry table fill + DestroyDevice don't crash before risking a
     // live install. Buffers are u64-backed for 8-byte alignment.
-    let hadapter = D3d10DdiAdapterHandle {
-        p_drv_private: core::ptr::null_mut(),
+    let hadapter = ddi::D3D10DDI_HADAPTER {
+        pDrvPrivate: core::ptr::null_mut(),
     };
-    let dev_size = unsafe { calc_private_device_size(hadapter, core::ptr::null()) };
+    let dev_size = unsafe { calc_private_device_size(hadapter, core::ptr::null()) } as usize;
 
     let mut device_priv = vec![0u64; dev_size / 8 + 1];
     let mut funcs = vec![0u64; core::mem::size_of::<ddi::D3D11DDI_DEVICEFUNCS>() / 8 + 1];
@@ -594,7 +350,10 @@ pub extern "system" fn helios_umd_selftest() -> i32 {
         ppfnRetrieveSubObject: core::ptr::null_mut(),
     };
 
-    let hr = unsafe { create_device(hadapter, &arg as *const _ as *mut c_void) };
+    // No `as *mut c_void` any more: `create_device` takes the arg struct by its
+    // own type, so passing the wrong thing here is a compile error.
+    let mut arg = arg;
+    let hr = unsafe { create_device(hadapter, &mut arg) };
     log_error!(
         "helios_umd_selftest: synthesized CreateDevice -> 0x{hr:08x}"
     );
@@ -644,13 +403,13 @@ pub extern "system" fn helios_umd_selftest() -> i32 {
 }
 
 #[no_mangle]
-pub unsafe extern "system" fn OpenAdapter10(open_data: *mut D3d10DdiArgOpenAdapter) -> Hresult {
+pub unsafe extern "system" fn OpenAdapter10(open_data: *mut ddi::D3D10DDIARG_OPENADAPTER) -> Hresult {
     log_error!("OpenAdapter10");
     unsafe { open_adapter_common(open_data, false) }
 }
 
 #[no_mangle]
-pub unsafe extern "system" fn OpenAdapter10_2(open_data: *mut D3d10DdiArgOpenAdapter) -> Hresult {
+pub unsafe extern "system" fn OpenAdapter10_2(open_data: *mut ddi::D3D10DDIARG_OPENADAPTER) -> Hresult {
     log_error!("OpenAdapter10_2");
     unsafe { open_adapter_common(open_data, true) }
 }
@@ -681,8 +440,8 @@ pub unsafe extern "system" fn OpenAdapter12(open_data: *mut D3d12DdiArgOpenAdapt
             return E_NOTIMPL;
         }
 
-        open.h_adapter = D3d10DdiAdapterHandle {
-            p_drv_private: core::ptr::addr_of_mut!(ADAPTER_COOKIE).cast::<c_void>(),
+        open.h_adapter = ddi::D3D10DDI_HADAPTER {
+            pDrvPrivate: core::ptr::addr_of_mut!(ADAPTER_COOKIE).cast::<c_void>(),
         };
 
         let funcs = unsafe { &mut *open.p_adapter_funcs };
@@ -701,7 +460,7 @@ pub unsafe extern "system" fn OpenAdapter12(open_data: *mut D3d12DdiArgOpenAdapt
 }
 
 unsafe extern "system" fn d3d12_calc_private_device_size(
-    _h_adapter: D3d10DdiAdapterHandle,
+    _h_adapter: ddi::D3D10DDI_HADAPTER,
     args: *const D3d12DdiArgCalcPrivateDeviceSize,
 ) -> usize {
     if args.is_null() {
@@ -717,7 +476,7 @@ unsafe extern "system" fn d3d12_calc_private_device_size(
 }
 
 unsafe extern "system" fn d3d12_create_device(
-    _h_adapter: D3d10DdiAdapterHandle,
+    _h_adapter: ddi::D3D10DDI_HADAPTER,
     args: *const D3d12DdiArgCreateDevice,
 ) -> Hresult {
     if args.is_null() {
@@ -739,13 +498,13 @@ unsafe extern "system" fn d3d12_create_device(
     E_NOTIMPL
 }
 
-unsafe extern "system" fn d3d12_close_adapter(_h_adapter: D3d10DdiAdapterHandle) -> Hresult {
+unsafe extern "system" fn d3d12_close_adapter(_h_adapter: ddi::D3D10DDI_HADAPTER) -> Hresult {
     log_error!("D3D12 CloseAdapter");
     S_OK
 }
 
 unsafe extern "system" fn d3d12_get_supported_versions(
-    _h_adapter: D3d10DdiAdapterHandle,
+    _h_adapter: ddi::D3D10DDI_HADAPTER,
     entries: *mut u32,
     supported_versions: *mut u64,
 ) -> Hresult {
@@ -777,15 +536,19 @@ unsafe extern "system" fn d3d12_get_supported_versions(
 }
 
 unsafe extern "system" fn d3d12_get_caps(
-    _h_adapter: D3d10DdiAdapterHandle,
-    args: *const D3d10_2DdiArgGetCaps,
+    _h_adapter: ddi::D3D10DDI_HADAPTER,
+    args: *const ddi::D3D10_2DDIARG_GETCAPS,
 ) -> Hresult {
-    const D3D12DDICAPS_TYPE_MEMORY_ARCHITECTURE: u32 = 1002;
-    const D3D12DDICAPS_TYPE_SHADER: u32 = 1004;
-    const D3D12DDICAPS_TYPE_ARCHITECTURE_INFO: u32 = 1005;
-    const D3D12DDICAPS_TYPE_D3D12_OPTIONS: u32 = 1006;
-    const D3D12DDICAPS_TYPE_3DPIPELINESUPPORT: u32 = 1007;
-    const D3D12DDICAPS_TYPE_0081_3DPIPELINESUPPORT1: u32 = 1074;
+    // Typed as D3D10_2DDICAPS_TYPE to match `args.Type`. These stay hand-written
+    // (unlike the D3D11 set above, which now aliases the generated enumerators)
+    // because build.rs bindgens d3d10umddi.h only -- there is no generated
+    // d3d12umddi, so no D3D12DDICAPS_TYPE_* to alias. Values unchanged.
+    const D3D12DDICAPS_TYPE_MEMORY_ARCHITECTURE: ddi::D3D10_2DDICAPS_TYPE = 1002;
+    const D3D12DDICAPS_TYPE_SHADER: ddi::D3D10_2DDICAPS_TYPE = 1004;
+    const D3D12DDICAPS_TYPE_ARCHITECTURE_INFO: ddi::D3D10_2DDICAPS_TYPE = 1005;
+    const D3D12DDICAPS_TYPE_D3D12_OPTIONS: ddi::D3D10_2DDICAPS_TYPE = 1006;
+    const D3D12DDICAPS_TYPE_3DPIPELINESUPPORT: ddi::D3D10_2DDICAPS_TYPE = 1007;
+    const D3D12DDICAPS_TYPE_0081_3DPIPELINESUPPORT1: ddi::D3D10_2DDICAPS_TYPE = 1074;
     const D3D12DDI_3DPIPELINELEVEL_1_0_CORE: u32 = 2;
 
     if args.is_null() {
@@ -796,12 +559,12 @@ unsafe extern "system" fn d3d12_get_caps(
     let args = unsafe { &*args };
     log_error!(
         "D3D12 GetCaps type=0x{:08x} dataSize={} pInfo={:p}",
-        args.caps_type, args.data_size, args.p_info,
+        args.Type, args.DataSize, args.pInfo,
     );
 
-    if !args.p_data.is_null() && args.data_size != 0 {
-        if args.caps_type == D3D12DDICAPS_TYPE_0081_3DPIPELINESUPPORT1 && args.data_size >= 8 {
-            let data = args.p_data as *mut u32;
+    if !args.pData.is_null() && args.DataSize != 0 {
+        if args.Type == D3D12DDICAPS_TYPE_0081_3DPIPELINESUPPORT1 && args.DataSize >= 8 {
+            let data = args.pData as *mut u32;
             let runtime_max = unsafe { *data.add(0) };
             let driver_max = runtime_max.min(D3D12DDI_3DPIPELINELEVEL_1_0_CORE);
             unsafe {
@@ -814,14 +577,14 @@ unsafe extern "system" fn d3d12_get_caps(
             return S_OK;
         }
 
-        unsafe { core::ptr::write_bytes(args.p_data as *mut u8, 0, args.data_size as usize) };
-        match args.caps_type {
-            D3D12DDICAPS_TYPE_3DPIPELINESUPPORT if args.data_size >= 4 => {
-                unsafe { *(args.p_data as *mut u32) = D3D12DDI_3DPIPELINELEVEL_1_0_CORE };
+        unsafe { core::ptr::write_bytes(args.pData as *mut u8, 0, args.DataSize as usize) };
+        match args.Type {
+            D3D12DDICAPS_TYPE_3DPIPELINESUPPORT if args.DataSize >= 4 => {
+                unsafe { *(args.pData as *mut u32) = D3D12DDI_3DPIPELINELEVEL_1_0_CORE };
                 log_error!("  D3D12 GetCaps: 3DPIPELINESUPPORT = 1_0_CORE");
             }
-            D3D12DDICAPS_TYPE_MEMORY_ARCHITECTURE if args.data_size >= 12 => {
-                let data = args.p_data as *mut u32;
+            D3D12DDICAPS_TYPE_MEMORY_ARCHITECTURE if args.DataSize >= 12 => {
+                let data = args.pData as *mut u32;
                 unsafe {
                     *data.add(0) = 1; // UMA
                     *data.add(1) = 1; // IO coherent
@@ -846,7 +609,7 @@ unsafe extern "system" fn d3d12_get_caps(
 }
 
 unsafe extern "system" fn d3d12_get_optional_ddi_tables(
-    _h_adapter: D3d10DdiAdapterHandle,
+    _h_adapter: ddi::D3D10DDI_HADAPTER,
     entries: *mut u32,
     requests: *mut D3d12DdiTableRequest,
 ) -> Hresult {
@@ -865,7 +628,7 @@ unsafe extern "system" fn d3d12_get_optional_ddi_tables(
 }
 
 unsafe extern "system" fn d3d12_fill_ddi_table(
-    _h_adapter: D3d10DdiAdapterHandle,
+    _h_adapter: ddi::D3D10DDI_HADAPTER,
     table_type: u32,
     table: *mut c_void,
     table_size: usize,
@@ -883,56 +646,79 @@ unsafe extern "system" fn d3d12_destroy_device(h_device: *mut c_void) {
     log_error!("D3D12 DestroyDevice hDevice={h_device:p}");
 }
 
-unsafe fn open_adapter_common(open_data: *mut D3d10DdiArgOpenAdapter, with_10_2: bool) -> Hresult {
+unsafe fn open_adapter_common(open_data: *mut ddi::D3D10DDIARG_OPENADAPTER, with_10_2: bool) -> Hresult {
     if open_data.is_null() {
         log_error!("open_adapter_common null open_data");
         return E_NOTIMPL;
     }
 
     let open = unsafe { &mut *open_data };
-    if open.p_adapter_funcs.is_null() {
+    // `pAdapterFuncs` and `pAdapterFuncs_2` are the two members of one union;
+    // which one the runtime means is decided by which OpenAdapter export it
+    // called, i.e. by `with_10_2`. Read it generically for the null check --
+    // both members alias at offset 0 -- and name the right member per arm
+    // below, where the table shape actually matters.
+    // SAFETY: reading either member of a union of same-offset pointers is
+    // well-defined for any initialisation the runtime can have performed.
+    if unsafe { open.__bindgen_anon_1.pAdapterFuncs }.is_null() {
         log_error!("open_adapter_common null p_adapter_funcs");
         return E_NOTIMPL;
     }
     log_error!(
         "open_adapter_common interface=0x{:08x} version=0x{:08x} with_10_2={}",
-        open.interface, open.version, with_10_2
+        open.Interface, open.Version, with_10_2
     );
     log_self_module_path();
 
-    open.h_adapter = D3d10DdiAdapterHandle {
-        p_drv_private: core::ptr::addr_of_mut!(ADAPTER_COOKIE).cast::<c_void>(),
+    open.hAdapter = ddi::D3D10DDI_HADAPTER {
+        pDrvPrivate: core::ptr::addr_of_mut!(ADAPTER_COOKIE).cast::<c_void>(),
     };
 
-    if with_10_2 {
-        let funcs = unsafe { &mut *(open.p_adapter_funcs.cast::<D3d10_2DdiAdapterFuncs>()) };
-        funcs.base.pfn_calc_private_device_size = Some(calc_private_device_size);
-        funcs.base.pfn_create_device = Some(create_device);
-        funcs.base.pfn_close_adapter = Some(close_adapter);
-        funcs.pfn_get_supported_versions = Some(get_supported_versions);
-        funcs.pfn_get_caps = Some(get_caps);
-    } else {
-        let funcs = unsafe { &mut *(open.p_adapter_funcs.cast::<D3d10DdiAdapterFuncs>()) };
-        funcs.pfn_calc_private_device_size = Some(calc_private_device_size);
-        funcs.pfn_create_device = Some(create_device);
-        funcs.pfn_close_adapter = Some(close_adapter);
+    // The generated D3D10_2DDI_ADAPTERFUNCS is FLAT -- the WDK repeats the
+    // three 10.0 entries rather than nesting them, where the hand copy modelled
+    // them as a `base` sub-struct. Same layout (the hand copy's `base` sat at
+    // offset 0), different spelling.
+    unsafe {
+        if with_10_2 {
+            let funcs = &mut *open.__bindgen_anon_1.pAdapterFuncs_2;
+            funcs.pfnCalcPrivateDeviceSize = Some(calc_private_device_size);
+            funcs.pfnCreateDevice = Some(create_device);
+            funcs.pfnCloseAdapter = Some(close_adapter);
+            funcs.pfnGetSupportedVersions = Some(get_supported_versions);
+            funcs.pfnGetCaps = Some(get_caps);
+        } else {
+            let funcs = &mut *open.__bindgen_anon_1.pAdapterFuncs;
+            funcs.pfnCalcPrivateDeviceSize = Some(calc_private_device_size);
+            funcs.pfnCreateDevice = Some(create_device);
+            funcs.pfnCloseAdapter = Some(close_adapter);
+        }
     }
 
     S_OK
 }
 
-unsafe extern "system" fn calc_private_device_size(
-    _h_adapter: D3d10DdiAdapterHandle,
-    _args: *const c_void,
-) -> usize {
+// NOTE on the calling convention: the five functions below are `extern "C"`,
+// not `extern "system"`, because they are stored into the generated
+// `D3D10DDI_ADAPTERFUNCS` / `D3D10_2DDI_ADAPTERFUNCS` tables and bindgen types
+// every `PFND3D10DDI_*` as `extern "C"`. On x86_64-pc-windows-msvc the two are
+// the same calling convention, so this is a no-op in the emitted code -- but
+// rustc treats them as distinct TYPES, so the tables will not accept a
+// "system" fn. The `OpenAdapter*` exports above stay `extern "system"`: they
+// are resolved by the loader against an exported name, not through a PFN type.
+unsafe extern "C" fn calc_private_device_size(
+    _h_adapter: ddi::D3D10DDI_HADAPTER,
+    _args: *const ddi::D3D10DDIARG_CALCPRIVATEDEVICESIZE,
+) -> ddi::SIZE_T {
     let size = device_funcs::device_private_size();
     log_error!("CalcPrivateDeviceSize -> {size}");
-    size
+    // `SIZE_T` is the WDK's spelling and is a distinct type from `usize` even
+    // though both are 64-bit here, so the PFN type needs the conversion.
+    size as ddi::SIZE_T
 }
 
-unsafe extern "system" fn create_device(
-    _h_adapter: D3d10DdiAdapterHandle,
-    args: *mut c_void,
+unsafe extern "C" fn create_device(
+    _h_adapter: ddi::D3D10DDI_HADAPTER,
+    args: *mut ddi::D3D10DDIARG_CREATEDEVICE,
 ) -> Hresult {
     // SAFETY: the runtime passes a valid `D3D10DDIARG_CREATEDEVICE*` per the
     // `PFND3D10DDI_CREATEDEVICE` contract; we only read scalar/pointer fields and
@@ -942,7 +728,11 @@ unsafe extern "system" fn create_device(
         log_error!("CreateDevice null args -> E_NOTIMPL");
         return E_NOTIMPL;
     }
-    let create = unsafe { &*(args as *const ddi::D3D10DDIARG_CREATEDEVICE) };
+    // The parameter is now typed by `PFND3D10DDI_CREATEDEVICE` itself rather
+    // than being a `*mut c_void` this function reinterprets, so the cast that
+    // used to sit here -- the one place a wrong type would have gone unnoticed
+    // -- no longer exists.
+    let create = unsafe { &*args };
     // The three union members this function reads generically: for logging, for
     // null-checking, and for handing to the runtime. Every member of each union
     // is a pointer at offset 0 -- machine-checked by the bindgen layout
@@ -1200,13 +990,13 @@ impl Drop for DeviceUnderConstruction {
     }
 }
 
-unsafe extern "system" fn close_adapter(_h_adapter: D3d10DdiAdapterHandle) -> Hresult {
+unsafe extern "C" fn close_adapter(_h_adapter: ddi::D3D10DDI_HADAPTER) -> Hresult {
     log_error!("CloseAdapter");
     S_OK
 }
 
-unsafe extern "system" fn get_supported_versions(
-    _h_adapter: D3d10DdiAdapterHandle,
+unsafe extern "C" fn get_supported_versions(
+    _h_adapter: ddi::D3D10DDI_HADAPTER,
     entries: *mut u32,
     supported_versions: *mut u64,
 ) -> Hresult {
@@ -1237,34 +1027,50 @@ unsafe extern "system" fn get_supported_versions(
     S_OK
 }
 
-unsafe extern "system" fn get_caps(
-    _h_adapter: D3d10DdiAdapterHandle,
-    args: *const D3d10_2DdiArgGetCaps,
+unsafe extern "C" fn get_caps(
+    _h_adapter: ddi::D3D10DDI_HADAPTER,
+    args: *const ddi::D3D10_2DDIARG_GETCAPS,
 ) -> Hresult {
-    const D3D11DDICAPS_THREADING: u32 = 128;
-    const D3D11DDICAPS_SHADER: u32 = 129;
-    const D3D11DDICAPS_3DPIPELINESUPPORT: u32 = 130;
-    const D3D11_1DDICAPS_D3D11_OPTIONS: u32 = 131;
-    const D3D11_1DDICAPS_ARCHITECTURE_INFO: u32 = 132;
-    const D3D11_1DDICAPS_SHADER_MIN_PRECISION_SUPPORT: u32 = 134;
-    const D3DWDDM1_3DDICAPS_D3D11_OPTIONS1: u32 = 136;
-    const D3DWDDM1_3DDICAPS_MARKER: u32 = 137;
+    // Aliases onto the generated caps-type enumerators rather than eight hand-
+    // written literals. The numerics are identical (128, 129, 130, 131, 132,
+    // 134, 136, 137) -- what changes is that they now come from the WDK header
+    // and carry `D3D10_2DDICAPS_TYPE`, which is what `args.Type` actually is.
+    // The short local names are kept so the match arms below read unchanged.
+    use ddi::{
+        D3D10_2DDICAPS_TYPE_D3D11DDICAPS_3DPIPELINESUPPORT as D3D11DDICAPS_3DPIPELINESUPPORT,
+        D3D10_2DDICAPS_TYPE_D3D11DDICAPS_SHADER as D3D11DDICAPS_SHADER,
+        D3D10_2DDICAPS_TYPE_D3D11DDICAPS_THREADING as D3D11DDICAPS_THREADING,
+        D3D10_2DDICAPS_TYPE_D3D11_1DDICAPS_ARCHITECTURE_INFO as D3D11_1DDICAPS_ARCHITECTURE_INFO,
+        D3D10_2DDICAPS_TYPE_D3D11_1DDICAPS_D3D11_OPTIONS as D3D11_1DDICAPS_D3D11_OPTIONS,
+        D3D10_2DDICAPS_TYPE_D3D11_1DDICAPS_SHADER_MIN_PRECISION_SUPPORT as D3D11_1DDICAPS_SHADER_MIN_PRECISION_SUPPORT,
+        D3D10_2DDICAPS_TYPE_D3DWDDM1_3DDICAPS_D3D11_OPTIONS1 as D3DWDDM1_3DDICAPS_D3D11_OPTIONS1,
+        D3D10_2DDICAPS_TYPE_D3DWDDM1_3DDICAPS_MARKER as D3DWDDM1_3DDICAPS_MARKER,
+    };
+    // The old literals, pinned so the alias swap is provably value-preserving.
+    const _: () = assert!(D3D11DDICAPS_THREADING == 128);
+    const _: () = assert!(D3D11DDICAPS_SHADER == 129);
+    const _: () = assert!(D3D11DDICAPS_3DPIPELINESUPPORT == 130);
+    const _: () = assert!(D3D11_1DDICAPS_D3D11_OPTIONS == 131);
+    const _: () = assert!(D3D11_1DDICAPS_ARCHITECTURE_INFO == 132);
+    const _: () = assert!(D3D11_1DDICAPS_SHADER_MIN_PRECISION_SUPPORT == 134);
+    const _: () = assert!(D3DWDDM1_3DDICAPS_D3D11_OPTIONS1 == 136);
+    const _: () = assert!(D3DWDDM1_3DDICAPS_MARKER == 137);
 
     if !args.is_null() {
         let args = unsafe { &*args };
         log_error!(
             "GetCaps type=0x{:08x} dataSize={} pInfo={:p}",
-            args.caps_type, args.data_size, args.p_info,
+            args.Type, args.DataSize, args.pInfo,
         );
-        if !args.p_data.is_null() && args.data_size != 0 {
+        if !args.pData.is_null() && args.DataSize != 0 {
             // Default: zero the output.
-            unsafe { core::ptr::write_bytes(args.p_data as *mut u8, 0, args.data_size as usize) };
-            match args.caps_type {
+            unsafe { core::ptr::write_bytes(args.pData as *mut u8, 0, args.DataSize as usize) };
+            match args.Type {
                 // D3D11DDI_THREADING_CAPS::Caps. Zero means no free-threaded
                 // mode and no command-list build support; the runtime must
                 // serialize/emulate.
-                D3D11DDICAPS_THREADING if args.data_size >= 4 => {
-                    unsafe { *(args.p_data as *mut u32) = 0 };
+                D3D11DDICAPS_THREADING if args.DataSize >= 4 => {
+                    unsafe { *(args.pData as *mut u32) = 0 };
                     log_error!("  GetCaps: THREADING caps = 0");
                 }
                 // D3D11DDI_SHADER_CAPS::Caps. FL11 mandates compute shaders;
@@ -1276,7 +1082,7 @@ unsafe extern "system" fn get_caps(
                 // full CS 5.0. FL12_0 additionally requires the D3D11.3 typed
                 // UAV-load additional-formats bit. FL10 profile stays 0 (no
                 // optional shader caps).
-                D3D11DDICAPS_SHADER if args.data_size >= 4 => {
+                D3D11DDICAPS_SHADER if args.DataSize >= 4 => {
                     const SHADER_COMPUTE: u32 = 0x2;
                     const SHADER_TYPED_UAV_LOAD_ADDITIONAL_FORMATS: u32 = 0x20;
                     let caps = if feature_level_mode() >= 1 {
@@ -1284,7 +1090,7 @@ unsafe extern "system" fn get_caps(
                     } else {
                         0
                     };
-                    unsafe { *(args.p_data as *mut u32) = caps };
+                    unsafe { *(args.pData as *mut u32) = caps };
                     log_error!("  GetCaps: SHADER caps = 0x{caps:x}");
                 }
                 // D3D11DDI_3DPIPELINESUPPORT_CAPS::Caps is a BITMASK, NOT the
@@ -1303,7 +1109,7 @@ unsafe extern "system" fn get_caps(
                 // feature levels" (0x887a0004) for EVERY level. (The old FL10
                 // path wrote 1 == (1<<0) == the 10_0 bit, so it worked by
                 // coincidence and produced an FL10_0 device.)
-                D3D11DDICAPS_3DPIPELINESUPPORT if args.data_size >= 4 => {
+                D3D11DDICAPS_3DPIPELINESUPPORT if args.DataSize >= 4 => {
                     const LVL_10_0: u32 = 1 << 0;
                     const LVL_10_1: u32 = 1 << 1;
                     const LVL_11_0: u32 = 1 << 2;
@@ -1314,44 +1120,44 @@ unsafe extern "system" fn get_caps(
                     } else {
                         LVL_10_0 // 0x1: max FL10_0 (the proven baseline)
                     };
-                    unsafe { *(args.p_data as *mut u32) = caps };
+                    unsafe { *(args.pData as *mut u32) = caps };
                     log_error!("  GetCaps: 3DPIPELINESUPPORT bitmask=0x{caps:x}");
                 }
                 // D3D11.1 caps. FL11_1 requires output-merger logic ops; the
                 // 11.1 blend-state forwarder maps LogicOpEnable/LogicOp to
                 // ID3D11Device1::CreateBlendState1. Keep debug binary support
                 // and shader min-precision support disabled.
-                D3D11_1DDICAPS_D3D11_OPTIONS if args.data_size >= 8 => {
-                    unsafe { *(args.p_data as *mut u32) = 1 };
+                D3D11_1DDICAPS_D3D11_OPTIONS if args.DataSize >= 8 => {
+                    unsafe { *(args.pData as *mut u32) = 1 };
                     log_error!("  GetCaps: D3D11_OPTIONS OutputMergerLogicOp=TRUE");
                 }
-                D3D11_1DDICAPS_ARCHITECTURE_INFO if args.data_size >= 4 => {
+                D3D11_1DDICAPS_ARCHITECTURE_INFO if args.DataSize >= 4 => {
                     log_error!("  GetCaps: ARCHITECTURE_INFO = zero");
                 }
-                D3D11_1DDICAPS_SHADER_MIN_PRECISION_SUPPORT if args.data_size >= 8 => {
+                D3D11_1DDICAPS_SHADER_MIN_PRECISION_SUPPORT if args.DataSize >= 8 => {
                     log_error!("  GetCaps: SHADER_MIN_PRECISION_SUPPORT = zero");
                 }
-                D3DWDDM1_3DDICAPS_D3D11_OPTIONS1 if args.data_size >= 4 => {
+                D3DWDDM1_3DDICAPS_D3D11_OPTIONS1 if args.DataSize >= 4 => {
                     const TILED_RESOURCES_TIER_2_SUPPORTED: u32 = 0x2;
                     let caps = if feature_level_mode() >= 1 {
                         TILED_RESOURCES_TIER_2_SUPPORTED
                     } else {
                         0
                     };
-                    unsafe { *(args.p_data as *mut u32) = caps };
+                    unsafe { *(args.pData as *mut u32) = caps };
                     log_error!(
                         "  GetCaps: D3D11_OPTIONS1 TiledResourcesSupportFlags=0x{caps:x}"
                     );
                 }
-                D3DWDDM1_3DDICAPS_MARKER if args.data_size >= 4 => {
+                D3DWDDM1_3DDICAPS_MARKER if args.DataSize >= 4 => {
                     const D3DWDDM1_3DDI_MARKER_TYPE_NONE: u32 = 0;
-                    unsafe { *(args.p_data as *mut u32) = D3DWDDM1_3DDI_MARKER_TYPE_NONE };
+                    unsafe { *(args.pData as *mut u32) = D3DWDDM1_3DDI_MARKER_TYPE_NONE };
                     log_error!("  GetCaps: MARKER type = NONE");
                 }
                 other => {
                     log_error!(
                         "  GetCaps: unsupported cap type {} (zeroed {} bytes)",
-                        other, args.data_size
+                        other, args.DataSize
                     );
                 }
             }
