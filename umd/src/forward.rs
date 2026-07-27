@@ -7445,7 +7445,6 @@ unsafe extern "C" fn check_format_support(h: Hdevice, fmt: ddi::DXGI_FORMAT, out
     const DDI_MSAA_RENDERTARGET: u32 = 0x0000_0008;
     const DDI_MSAA_LOAD: u32 = 0x0000_0010;
     const VIDEO_BITS: u32 = 0x0800_0000 | 0x1000_0000 | 0x2000_0000 | 0x4000_0000;
-    const TYPELESS_PARENT_TEXTURE_CAPS: u32 = 0x0012_10f0;
     const TEXTURE1D: u32 = 0x0000_0010;
     const TEXTURE3D: u32 = 0x0000_0040;
     const SHADER_SAMPLE: u32 = 0x0000_0200;
@@ -7456,6 +7455,80 @@ unsafe extern "C" fn check_format_support(h: Hdevice, fmt: ddi::DXGI_FORMAT, out
     const DEPTH_STENCIL: u32 = 0x0001_0000;
     const SHADER_GATHER: u32 = 0x0080_0000;
     const SHADER_GATHER_COMPARISON: u32 = 0x0400_0000;
+    // R820: the six D3D11_FORMAT_SUPPORT bits this function used but did not
+    // name. They are what the five whole-value hex constants below decompose
+    // into; without them a reader could not tell which capability each hex
+    // asserts, or whether it contradicts the MSAA/video scrubs around it.
+    const TEXTURE2D: u32 = 0x0000_0020;
+    const TEXTURECUBE: u32 = 0x0000_0080;
+    const SHADER_LOAD: u32 = 0x0000_0100;
+    const MIP: u32 = 0x0000_1000;
+    const CPU_LOCKABLE: u32 = 0x0002_0000;
+    const CAST_WITHIN_BIT_LAYOUT: u32 = 0x0010_0000;
+
+    // The five values copied from WARP, expressed as compositions and PINNED to
+    // the hex they replace. The const-asserts are what make this rewrite
+    // provably value-preserving -- and what will make the eventual move to
+    // forward/format_caps.rs safe.
+    const TYPELESS_PARENT_TEXTURE_CAPS: u32 = TEXTURE1D
+        | TEXTURE2D
+        | TEXTURE3D
+        | TEXTURECUBE
+        | MIP
+        | CPU_LOCKABLE
+        | CAST_WITHIN_BIT_LAYOUT;
+    const _: () = assert!(TYPELESS_PARENT_TEXTURE_CAPS == 0x0012_10f0);
+
+    /// The TYPELESS depth-stencil PARENTS: R32G8X24_TYPELESS (19) and
+    /// R24G8_TYPELESS (44). Lockable texture families with no depth,
+    /// render-target or multisample capability of their own -- the typed
+    /// children below carry those.
+    const WARP_TYPELESS_PARENT_CAPS: u32 =
+        TEXTURE1D | TEXTURE2D | TEXTURECUBE | MIP | CPU_LOCKABLE | CAST_WITHIN_BIT_LAYOUT;
+    const _: () = assert!(WARP_TYPELESS_PARENT_CAPS == 0x0012_10b0);
+
+    /// The typed DEPTH formats: D32_FLOAT_S8X24_UINT (20), D32_FLOAT (40),
+    /// D24_UNORM_S8_UINT (45) and D16_UNORM (55). These add DEPTH_STENCIL and
+    /// the multisample render-target bit.
+    const WARP_DEPTH_CAPS: u32 = TEXTURE1D
+        | TEXTURE2D
+        | TEXTURECUBE
+        | MIP
+        | DEPTH_STENCIL
+        | CPU_LOCKABLE
+        | CAST_WITHIN_BIT_LAYOUT
+        | MSAA_RENDERTARGET;
+    const _: () = assert!(WARP_DEPTH_CAPS == 0x0033_10b0);
+
+    /// The DEPTH read views: R32_FLOAT_X8X24_TYPELESS (21) and
+    /// R24_UNORM_X8_TYPELESS (46). Fully sampleable -- sample,
+    /// comparison-sample, gather, comparison-gather and multisample load.
+    const WARP_DEPTH_READ_CAPS: u32 = TEXTURE1D
+        | TEXTURE2D
+        | TEXTURECUBE
+        | SHADER_LOAD
+        | SHADER_SAMPLE
+        | SHADER_SAMPLE_COMPARISON
+        | MIP
+        | CPU_LOCKABLE
+        | CAST_WITHIN_BIT_LAYOUT
+        | MSAA_LOAD
+        | SHADER_GATHER
+        | SHADER_GATHER_COMPARISON;
+    const _: () = assert!(WARP_DEPTH_READ_CAPS == 0x04d2_17b0);
+
+    /// The STENCIL read views: X32_TYPELESS_G8X24_UINT (22) and
+    /// X24_TYPELESS_G8_UINT (47). Integer, so loadable but not sampleable --
+    /// no SHADER_SAMPLE and no gather.
+    const WARP_STENCIL_READ_CAPS: u32 = TEXTURE1D
+        | TEXTURE2D
+        | TEXTURECUBE
+        | SHADER_LOAD
+        | MIP
+        | CPU_LOCKABLE
+        | CAST_WITHIN_BIT_LAYOUT
+        | MSAA_LOAD;
+    const _: () = assert!(WARP_STENCIL_READ_CAPS == 0x0052_11b0);
     if crate::feature_level_mode() != 1 {
         // FL10.0 profile (and diagnostic mode 2): strip the multisample bits.
         caps &= !MSAA_BITS;
@@ -7510,19 +7583,6 @@ unsafe extern "C" fn check_format_support(h: Hdevice, fmt: ddi::DXGI_FORMAT, out
     // mismatch is rejected with DXGI_ERROR_UNSUPPORTED. Normalize the family to
     // the stricter depth-compatible answer.
     const D3D11_FORMAT_SUPPORT_SO_BUFFER: u32 = 0x0000_0008;
-    const DXGI_FORMAT_R32_TYPELESS: ddi::DXGI_FORMAT = 39;
-    const DXGI_FORMAT_D32_FLOAT: ddi::DXGI_FORMAT = 40;
-    const DXGI_FORMAT_R32_FLOAT: ddi::DXGI_FORMAT = 41;
-    const DXGI_FORMAT_R32_UINT: ddi::DXGI_FORMAT = 42;
-    const DXGI_FORMAT_R32_SINT: ddi::DXGI_FORMAT = 43;
-    const DXGI_FORMAT_R24G8_TYPELESS: ddi::DXGI_FORMAT = 44;
-    const DXGI_FORMAT_D24_UNORM_S8_UINT: ddi::DXGI_FORMAT = 45;
-    const DXGI_FORMAT_R24_UNORM_X8_TYPELESS: ddi::DXGI_FORMAT = 46;
-    const DXGI_FORMAT_X24_TYPELESS_G8_UINT: ddi::DXGI_FORMAT = 47;
-    const DXGI_FORMAT_R32G8X24_TYPELESS: ddi::DXGI_FORMAT = 19;
-    const DXGI_FORMAT_D32_FLOAT_S8X24_UINT: ddi::DXGI_FORMAT = 20;
-    const DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS: ddi::DXGI_FORMAT = 21;
-    const DXGI_FORMAT_X32_TYPELESS_G8X24_UINT: ddi::DXGI_FORMAT = 22;
     if matches!(
         fmt,
         DXGI_FORMAT_R32_TYPELESS
@@ -7541,16 +7601,39 @@ unsafe extern "C" fn check_format_support(h: Hdevice, fmt: ddi::DXGI_FORMAT, out
     ) {
         caps &= !D3D11_FORMAT_SUPPORT_SO_BUFFER;
     }
+    const DXGI_FORMAT_R32_TYPELESS: ddi::DXGI_FORMAT = 39;
+    const DXGI_FORMAT_D32_FLOAT: ddi::DXGI_FORMAT = 40;
+    const DXGI_FORMAT_R32_FLOAT: ddi::DXGI_FORMAT = 41;
+    const DXGI_FORMAT_R32_UINT: ddi::DXGI_FORMAT = 42;
+    const DXGI_FORMAT_R32_SINT: ddi::DXGI_FORMAT = 43;
+    const DXGI_FORMAT_R24G8_TYPELESS: ddi::DXGI_FORMAT = 44;
+    const DXGI_FORMAT_D24_UNORM_S8_UINT: ddi::DXGI_FORMAT = 45;
+    const DXGI_FORMAT_R24_UNORM_X8_TYPELESS: ddi::DXGI_FORMAT = 46;
+    const DXGI_FORMAT_X24_TYPELESS_G8_UINT: ddi::DXGI_FORMAT = 47;
+    const DXGI_FORMAT_R32G8X24_TYPELESS: ddi::DXGI_FORMAT = 19;
+    const DXGI_FORMAT_D32_FLOAT_S8X24_UINT: ddi::DXGI_FORMAT = 20;
+    const DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS: ddi::DXGI_FORMAT = 21;
+    const DXGI_FORMAT_X32_TYPELESS_G8X24_UINT: ddi::DXGI_FORMAT = 22;
+    const DXGI_FORMAT_D16_UNORM: ddi::DXGI_FORMAT = 55;
     if crate::feature_level_mode() == 1 {
-        match fmt as u32 {
+        match fmt {
             // Match WARP's API-visible caps for depth-format families; the
             // DDI-only MSAA RT bit is re-applied immediately below where
             // required. DXVK over-reports the read/view siblings here, and the
             // FL11 constructor rejects that before issuing an MSAA query.
-            19 | 44 => caps = 0x0012_10b0,
-            20 | 40 | 45 | 55 => caps = 0x0033_10b0,
-            21 | 46 => caps = 0x04d2_17b0,
-            22 | 47 => caps = 0x0052_11b0,
+            DXGI_FORMAT_R32G8X24_TYPELESS | DXGI_FORMAT_R24G8_TYPELESS => {
+                caps = WARP_TYPELESS_PARENT_CAPS
+            }
+            DXGI_FORMAT_D32_FLOAT_S8X24_UINT
+            | DXGI_FORMAT_D32_FLOAT
+            | DXGI_FORMAT_D24_UNORM_S8_UINT
+            | DXGI_FORMAT_D16_UNORM => caps = WARP_DEPTH_CAPS,
+            DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS | DXGI_FORMAT_R24_UNORM_X8_TYPELESS => {
+                caps = WARP_DEPTH_READ_CAPS
+            }
+            DXGI_FORMAT_X32_TYPELESS_G8X24_UINT | DXGI_FORMAT_X24_TYPELESS_G8_UINT => {
+                caps = WARP_STENCIL_READ_CAPS
+            }
             _ => {}
         }
     }
