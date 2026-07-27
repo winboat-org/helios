@@ -964,34 +964,45 @@ namespace {
       blob.push_back(0);
   }
 
-  // Wrap a raw SM4/SM5 token stream in a DXBC container carrying REAL input/
-  // output signature chunks from the >=11.1 DDI. Layout mirrors
-  // prepare_shader_bytecode's code-only wrap, with two extra chunks.
-  ShaderBytecode prepare_shader_bytecode_with_sigs(
-      const std::uint8_t* code, std::size_t len,
-      const std::uint32_t* in_entries, std::uint32_t n_in,
-      const std::uint32_t* out_entries, std::uint32_t n_out) {
+  // One signature chunk to place ahead of the code chunk.
+  struct SignatureChunk {
+    const char* tag;                 // exactly four characters
+    const std::uint32_t* entries;
+    std::uint32_t count;
+  };
+
+  // Assemble a DXBC container: the 32-byte file header, the chunk offset table,
+  // `N` signature chunks in order, then the code chunk, then the MD5 stamp.
+  //
+  // The container header validation, the code-tag selection, the offset table,
+  // the file-size arithmetic and the MD5 stamping used to exist in three
+  // verbatim copies -- one per wrapper -- differing only by which chunks went in
+  // front. That divergence had already partially occurred, and it is the kind
+  // where a wrong offset produces a container the shader compiler silently
+  // misreads.
+  //
+  // `N` is a template parameter, not a runtime count: the offset table is then
+  // a fixed `std::array<std::uint32_t, N + 1>` with no runtime bound to get
+  // wrong, and each caller's chunk list is checked at compile time.
+  //
+  // NOT std::span: the TU is pinned to C++17 by umd/build.rs.
+  template <std::size_t N>
+  ShaderBytecode build_dxbc_container(const std::uint8_t* code, std::size_t len,
+                                      const char* code_tag,
+                                      const std::array<SignatureChunk, N>& sigs) {
     ShaderBytecode result = { };
-    if (!code || !len || len < 8 || (len & 3u))
-      return result;
 
-    const auto* dwords = reinterpret_cast<const std::uint32_t*>(code);
-    const std::uint32_t major = (dwords[0] >> 4u) & 0xfu;
-    if (std::size_t(dwords[1]) * sizeof(std::uint32_t) != len) {
-      umd_log("raw shader bytecode dword count mismatch (sig wrap)");
-      return result;
-    }
-    const char* code_tag = major >= 5u ? "SHEX" : "SHDR";
-
-    // Build the three chunks into a scratch buffer first.
+    // Build every chunk into a scratch buffer first, recording where each one
+    // starts relative to the chunk base.
     std::vector<std::uint8_t> chunks;
-    std::array<std::uint32_t, 3> chunk_offsets = { };
+    std::array<std::uint32_t, N + 1> chunk_offsets = { };
     std::uint32_t chunk_count = 0;
 
-    chunk_offsets.at(chunk_count++) = std::uint32_t(chunks.size());
-    append_signature_chunk(chunks, "ISGN", in_entries, n_in);
-    chunk_offsets.at(chunk_count++) = std::uint32_t(chunks.size());
-    append_signature_chunk(chunks, "OSGN", out_entries, n_out);
+    for (const auto& sig : sigs) {
+      chunk_offsets.at(chunk_count++) = std::uint32_t(chunks.size());
+      append_signature_chunk(chunks, sig.tag, sig.entries, sig.count);
+    }
+
     chunk_offsets.at(chunk_count++) = std::uint32_t(chunks.size());
     chunks.insert(chunks.end(), code_tag, code_tag + 4);
     {
@@ -1024,6 +1035,35 @@ namespace {
     return result;
   }
 
+  // "SHEX" for SM5+, "SHDR" for SM4. Was re-derived at all three wrappers.
+  const char* dxbc_code_tag(std::uint32_t version_token) {
+    return ((version_token >> 4u) & 0xfu) >= 5u ? "SHEX" : "SHDR";
+  }
+
+  // Wrap a raw SM4/SM5 token stream in a DXBC container carrying REAL input/
+  // output signature chunks from the >=11.1 DDI. Layout mirrors
+  // prepare_shader_bytecode's code-only wrap, with two extra chunks.
+  ShaderBytecode prepare_shader_bytecode_with_sigs(
+      const std::uint8_t* code, std::size_t len,
+      const std::uint32_t* in_entries, std::uint32_t n_in,
+      const std::uint32_t* out_entries, std::uint32_t n_out) {
+    ShaderBytecode result = { };
+    if (!code || !len || len < 8 || (len & 3u))
+      return result;
+
+    const auto* dwords = reinterpret_cast<const std::uint32_t*>(code);
+    if (std::size_t(dwords[1]) * sizeof(std::uint32_t) != len) {
+      umd_log("raw shader bytecode dword count mismatch (sig wrap)");
+      return result;
+    }
+
+    const std::array<SignatureChunk, 2> sigs = {{
+      { "ISGN", in_entries,  n_in  },
+      { "OSGN", out_entries, n_out },
+    }};
+    return build_dxbc_container(code, len, dxbc_code_tag(dwords[0]), sigs);
+  }
+
   ShaderBytecode prepare_shader_bytecode_with_tess_sigs(
       const std::uint8_t* code, std::size_t len,
       const std::uint32_t* in_entries, std::uint32_t n_in,
@@ -1034,53 +1074,18 @@ namespace {
       return result;
 
     const auto* dwords = reinterpret_cast<const std::uint32_t*>(code);
-    const std::uint32_t major = (dwords[0] >> 4u) & 0xfu;
     if (std::size_t(dwords[1]) * sizeof(std::uint32_t) != len) {
       umd_log("raw shader bytecode dword count mismatch (tess sig wrap)");
       return result;
     }
-    const char* code_tag = major >= 5u ? "SHEX" : "SHDR";
 
-    std::vector<std::uint8_t> chunks;
-    std::array<std::uint32_t, 4> chunk_offsets = { };
-    std::uint32_t chunk_count = 0;
-
-    chunk_offsets.at(chunk_count++) = std::uint32_t(chunks.size());
-    append_signature_chunk(chunks, "ISGN", in_entries, n_in);
-    chunk_offsets.at(chunk_count++) = std::uint32_t(chunks.size());
-    append_signature_chunk(chunks, "OSGN", out_entries, n_out);
-    chunk_offsets.at(chunk_count++) = std::uint32_t(chunks.size());
-    append_signature_chunk(chunks, "PCSG", patch_entries, n_patch);
-    chunk_offsets.at(chunk_count++) = std::uint32_t(chunks.size());
-    chunks.insert(chunks.end(), code_tag, code_tag + 4);
-    {
-      std::uint32_t v = std::uint32_t(len);
-      chunks.push_back(std::uint8_t(v));
-      chunks.push_back(std::uint8_t(v >> 8));
-      chunks.push_back(std::uint8_t(v >> 16));
-      chunks.push_back(std::uint8_t(v >> 24));
-    }
-    chunks.insert(chunks.end(), code, code + len);
-
-    const std::uint32_t file_header_size = 32u;
-    const std::uint32_t offset_table_size = chunk_count * sizeof(std::uint32_t);
-    const std::uint32_t chunk_base = file_header_size + offset_table_size;
-    const std::uint32_t file_size = chunk_base + std::uint32_t(chunks.size());
-
-    result.owned().resize(file_size);
-    std::memcpy(&result.owned()[0], "DXBC", 4);
-    write_le(result.owned(), 20u, std::uint32_t(1u));
-    write_le(result.owned(), 24u, file_size);
-    write_le(result.owned(), 28u, chunk_count);
-    for (std::uint32_t i = 0; i < chunk_count; ++i)
-      write_le(result.owned(), 32u + 4u * i, chunk_base + chunk_offsets.at(i));
-    std::memcpy(&result.owned()[chunk_base], chunks.data(), chunks.size());
-
-    auto digest = dxbc_spv::dxbc::hashDxbcBinary(result.owned().data(), result.owned().size());
-    std::memcpy(&result.owned()[4], digest.data.data(), digest.data.size());
-
-    // No `result.data = result.owned().data()` any more: the range is derived.
-    return result;
+    // The tess variant differs by exactly one list element.
+    const std::array<SignatureChunk, 3> sigs = {{
+      { "ISGN", in_entries,    n_in    },
+      { "OSGN", out_entries,   n_out   },
+      { "PCSG", patch_entries, n_patch },
+    }};
+    return build_dxbc_container(code, len, dxbc_code_tag(dwords[0]), sigs);
   }
 
   ShaderBytecode prepare_shader_bytecode(const std::uint8_t* code, std::size_t len) {
@@ -1102,36 +1107,22 @@ namespace {
     const auto* dwords = reinterpret_cast<const std::uint32_t*>(code);
     const std::uint32_t version_token = dwords[0];
     const std::uint32_t dword_count = dwords[1];
-    const std::uint32_t major = (version_token >> 4u) & 0xfu;
 
+    // `dword_count < 2u` is absent from both signature wrappers. It is
+    // REDUNDANT in all three -- `len >= 8` together with `dword_count * 4 ==
+    // len` already implies `dword_count >= 2` -- so it stays here rather than
+    // being propagated: adding it to the other two would be adding validation,
+    // and removing it here would be removing a (harmless) check. Neither is
+    // this tranche's business.
     if (dword_count < 2u || std::size_t(dword_count) * sizeof(std::uint32_t) != len) {
       umd_log("raw shader bytecode dword count mismatch");
       return result;
     }
 
-    const char* chunk_tag = major >= 5u ? "SHEX" : "SHDR";
-    constexpr std::uint32_t file_header_size = 32u;
-    constexpr std::uint32_t chunk_count = 1u;
-    constexpr std::uint32_t chunk_offset_table_size = chunk_count * sizeof(std::uint32_t);
-    constexpr std::uint32_t chunk_offset = file_header_size + chunk_offset_table_size;
-    constexpr std::uint32_t chunk_header_size = 8u;
-    const std::uint32_t file_size = chunk_offset + chunk_header_size + std::uint32_t(len);
-
-    result.owned().resize(file_size);
-    std::memcpy(&result.owned()[0], "DXBC", 4);
-    write_le(result.owned(), 20u, std::uint32_t(1u));
-    write_le(result.owned(), 24u, file_size);
-    write_le(result.owned(), 28u, chunk_count);
-    write_le(result.owned(), 32u, chunk_offset);
-    std::memcpy(&result.owned()[chunk_offset], chunk_tag, 4);
-    write_le(result.owned(), chunk_offset + 4u, std::uint32_t(len));
-    std::memcpy(&result.owned()[chunk_offset + chunk_header_size], code, len);
-
-    auto digest = dxbc_spv::dxbc::hashDxbcBinary(result.owned().data(), result.owned().size());
-    std::memcpy(&result.owned()[4], digest.data.data(), digest.data.size());
-
-    // No `result.data = result.owned().data()` any more: the range is derived.
-    return result;
+    // No signature chunks: the code-only wrap is the same container with an
+    // empty list, which is where the three copies converge.
+    const std::array<SignatureChunk, 0> sigs = { };
+    return build_dxbc_container(code, len, dxbc_code_tag(version_token), sigs);
   }
 
 }
