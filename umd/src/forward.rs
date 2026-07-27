@@ -821,8 +821,17 @@ unsafe fn stamp_dxvk_resource_kmt_handles(
     }
 }
 
-unsafe fn load_resource(handle_priv: *mut c_void) -> Option<ManuallyDrop<ID3D11Resource>> {
-    let state = resource_state(handle_priv)?;
+unsafe fn load_resource(h_res: ddi::D3D10DDI_HRESOURCE) -> Option<ManuallyDrop<ID3D11Resource>> {
+    load_resource_at(h_res.pDrvPrivate)
+}
+
+/// `load_resource` for the runtime-tag dispatches (`Discard`, the tiled-resource
+/// barrier), which receive a bare `pDrvPrivate` whose payload is selected by a
+/// `D3D11DDI_HANDLETYPE` value at run time and so cannot be keyed on a static
+/// handle type. Callers must be an arm of such a dispatch that has already
+/// matched `HT_RESOURCE`. Same contract as `handle_com_raw_at`/`load_com_at`.
+unsafe fn load_resource_at(handle_priv: *mut c_void) -> Option<ManuallyDrop<ID3D11Resource>> {
+    let state = resource_state_at(handle_priv)?;
     if state.com_raw == 0 {
         return None;
     }
@@ -834,19 +843,27 @@ unsafe fn load_resource(handle_priv: *mut c_void) -> Option<ManuallyDrop<ID3D11R
 /// The `ResourceState` behind a DDI resource handle, or `None` for an empty
 /// slot. The single place the resource slot is decoded; every reader below
 /// goes through it instead of repeating the two-step null dance.
-unsafe fn resource_state(handle_priv: *mut c_void) -> Option<&'static ResourceState> {
+///
+/// Taking the handle rather than its `pDrvPrivate` is what makes the payload
+/// follow from the handle's type: `resource_state(h_rtv)` does not resolve.
+unsafe fn resource_state(h_res: ddi::D3D10DDI_HRESOURCE) -> Option<&'static ResourceState> {
+    boxed_slot(h_res)?.get()
+}
+
+/// `resource_state` for the runtime-tag dispatches. See `load_resource_at`.
+unsafe fn resource_state_at(handle_priv: *mut c_void) -> Option<&'static ResourceState> {
     Slot::<Boxed<ResourceState>>::from_priv(handle_priv)?.get()
 }
 
-/// Raw ID3D11Resource COM pointer behind a DDI resource private handle
-/// (0 when absent) — for bridge calls that inspect the DXVK image without
-/// taking a COM reference.
-unsafe fn resource_com_raw(handle_priv: *mut c_void) -> usize {
-    resource_state(handle_priv).map_or(0, |s| s.com_raw)
+/// Raw ID3D11Resource COM pointer behind a DDI resource handle (0 when
+/// absent) — for bridge calls that inspect the DXVK image without taking a COM
+/// reference.
+unsafe fn resource_com_raw(h_res: ddi::D3D10DDI_HRESOURCE) -> usize {
+    resource_state(h_res).map_or(0, |s| s.com_raw)
 }
 
-unsafe fn resource_allocation(handle_priv: *mut c_void) -> ddi::D3DKMT_HANDLE {
-    resource_state(handle_priv).map_or(0, |s| {
+unsafe fn resource_allocation(h_res: ddi::D3D10DDI_HRESOURCE) -> ddi::D3DKMT_HANDLE {
+    resource_state(h_res).map_or(0, |s| {
         s.allocation
             .as_ref()
             .map(ResidentAllocation::handle)
@@ -855,14 +872,16 @@ unsafe fn resource_allocation(handle_priv: *mut c_void) -> ddi::D3DKMT_HANDLE {
 }
 
 unsafe fn resource_parent_handles(
-    handle_priv: *mut c_void,
+    h_res: ddi::D3D10DDI_HRESOURCE,
 ) -> (ddi::HANDLE, ddi::D3DKMT_HANDLE) {
-    resource_state(handle_priv)
+    resource_state(h_res)
         .map_or((core::ptr::null_mut(), 0), |s| (s.rt_resource, s.km_resource))
 }
 
-unsafe fn resource_present_private(handle_priv: *mut c_void) -> Option<HeliosPresentPrivateData> {
-    let p = resource_state(handle_priv)?.present_private;
+unsafe fn resource_present_private(
+    h_res: ddi::D3D10DDI_HRESOURCE,
+) -> Option<HeliosPresentPrivateData> {
+    let p = resource_state(h_res)?.present_private;
     p.is_valid().then_some(p)
 }
 
@@ -871,12 +890,12 @@ unsafe fn resource_present_private(handle_priv: *mut c_void) -> Option<HeliosPre
 /// among the pPrimaryDesc ring, so resource-local metadata alone is not enough.
 unsafe fn presented_primary_private(
     h: Hdevice,
-    handle_priv: *mut c_void,
+    h_res: ddi::D3D10DDI_HRESOURCE,
 ) -> Option<HeliosPresentPrivateData> {
-    if let Some(private) = unsafe { resource_present_private(handle_priv) } {
+    if let Some(private) = unsafe { resource_present_private(h_res) } {
         return Some(private);
     }
-    let allocation = unsafe { resource_allocation(handle_priv) };
+    let allocation = unsafe { resource_allocation(h_res) };
     if allocation == 0 {
         return None;
     }
@@ -1284,10 +1303,10 @@ unsafe fn copy_to_scanout_target(
         .borrow()
         .as_ref()
         .map_or(0, |t| t.resource_raw);
-    if dst_raw == 0 || dst_raw == resource_com_raw(src_h.pDrvPrivate) {
+    if dst_raw == 0 || dst_raw == resource_com_raw(src_h) {
         return false;
     }
-    let Some(src) = load_resource(src_h.pDrvPrivate) else {
+    let Some(src) = load_resource(src_h) else {
         return false;
     };
     let dst = ManuallyDrop::new(ID3D11Resource::from_raw(dst_raw as *mut c_void));
@@ -1354,8 +1373,8 @@ unsafe fn dxvk_resource_memory_info(h: Hdevice, obj: &ID3D11Resource) -> (u64, u
     }
 }
 
-unsafe fn resource_dimensions(handle_priv: *mut c_void) -> (u32, u32) {
-    let Some(res) = load_resource(handle_priv) else {
+unsafe fn resource_dimensions(h_res: ddi::D3D10DDI_HRESOURCE) -> (u32, u32) {
+    let Some(res) = load_resource(h_res) else {
         return (0, 0);
     };
     let Ok(tex) = (*res).cast::<ID3D11Texture2D>() else {
@@ -1366,8 +1385,8 @@ unsafe fn resource_dimensions(handle_priv: *mut c_void) -> (u32, u32) {
     (desc.Width, desc.Height)
 }
 
-unsafe fn resource_sample_count(handle_priv: *mut c_void) -> u32 {
-    let Some(res) = load_resource(handle_priv) else {
+unsafe fn resource_sample_count(h_res: ddi::D3D10DDI_HRESOURCE) -> u32 {
+    let Some(res) = load_resource(h_res) else {
         return 1;
     };
     let Ok(tex) = (*res).cast::<ID3D11Texture2D>() else {
@@ -1378,8 +1397,8 @@ unsafe fn resource_sample_count(handle_priv: *mut c_void) -> u32 {
     desc.SampleDesc.Count.max(1)
 }
 
-unsafe fn resource_dxgi_format(handle_priv: *mut c_void) -> DXGI_FORMAT {
-    let Some(res) = load_resource(handle_priv) else {
+unsafe fn resource_dxgi_format(h_res: ddi::D3D10DDI_HRESOURCE) -> DXGI_FORMAT {
+    let Some(res) = load_resource(h_res) else {
         return DXGI_FORMAT(0);
     };
     let Ok(tex) = (*res).cast::<ID3D11Texture2D>() else {
@@ -1391,10 +1410,10 @@ unsafe fn resource_dxgi_format(handle_priv: *mut c_void) -> DXGI_FORMAT {
 }
 
 unsafe fn resource_summary(
-    handle_priv: *mut c_void,
+    h_res: ddi::D3D10DDI_HRESOURCE,
 ) -> (ddi::D3DKMT_HANDLE, &'static str, u32, u32, u32, u32) {
-    let allocation = resource_allocation(handle_priv);
-    let Some(res) = load_resource(handle_priv) else {
+    let allocation = resource_allocation(h_res);
+    let Some(res) = load_resource(h_res) else {
         return (allocation, "missing", 0, 0, 0, 0);
     };
     if let Ok(buf) = (*res).cast::<ID3D11Buffer>() {
@@ -3191,8 +3210,8 @@ unsafe extern "C" fn resolve_shared_resource(
     let resource = ddi::D3D10DDI_HRESOURCE {
         pDrvPrivate: h_resource,
     };
-    let alloc = resource_allocation(resource.pDrvPrivate);
-    let (width, height) = resource_dimensions(resource.pDrvPrivate);
+    let alloc = resource_allocation(resource);
+    let (width, height) = resource_dimensions(resource);
     log_error!(
         "DDI ResolveSharedResource: hDevice={:p} hResource={:p} alloc=0x{:x} {}x{}",
         h, h_resource, alloc, width, height
@@ -3214,8 +3233,8 @@ unsafe extern "C" fn dxgi_resolve_shared_resource(
         ((*arg).hDevice as usize, (*arg).hResource as usize)
     };
     let resource = dxgi_resource_handle(h_resource as ddi::DXGI_DDI_HRESOURCE);
-    let alloc = resource_allocation(resource.pDrvPrivate);
-    let (width, height) = resource_dimensions(resource.pDrvPrivate);
+    let alloc = resource_allocation(resource);
+    let (width, height) = resource_dimensions(resource);
     trace_line!(
         "DXGI ResolveSharedResource: hDevice=0x{:x} hResource=0x{:x} alloc=0x{:x} {}x{}",
         h_device,
@@ -3245,11 +3264,11 @@ unsafe extern "C" fn create_rtv(
         return;
     };
     let a = &*arg;
-    let Some(res) = load_resource(a.hDrvResource.pDrvPrivate) else {
+    let Some(res) = load_resource(a.hDrvResource) else {
         log_error!("DDI create_rtv: resource handle empty");
         return;
     };
-    let Some(desc) = rtv_desc(a, a.hDrvResource.pDrvPrivate) else {
+    let Some(desc) = rtv_desc(a, a.hDrvResource) else {
         log_error!(
             "DDI create_rtv: unsupported resource dimension {} fmt={}",
             a.ResourceDimension, a.Format
@@ -3266,8 +3285,8 @@ unsafe extern "C" fn create_rtv(
     }
     finish_create(h, created, rtv, |v| {
         let n = VIEW_LOG_COUNT.next();
-        let allocation = resource_allocation(a.hDrvResource.pDrvPrivate);
-        let (width, height) = resource_dimensions(a.hDrvResource.pDrvPrivate);
+        let allocation = resource_allocation(a.hDrvResource);
+        let (width, height) = resource_dimensions(a.hDrvResource);
         if n < 128 {
             trace_line!(
                 "DDI create_rtv ok: dim={} fmt={} alloc=0x{:x} {}x{}",
@@ -3277,7 +3296,7 @@ unsafe extern "C" fn create_rtv(
         store_rtv(
             h_rtv.pDrvPrivate,
             v,
-            resource_com_raw(a.hDrvResource.pDrvPrivate),
+            resource_com_raw(a.hDrvResource),
             allocation,
             width,
             height,
@@ -3288,7 +3307,7 @@ unsafe extern "C" fn create_rtv(
 
 unsafe fn rtv_desc(
     a: &ddi::D3D10DDIARG_CREATERENDERTARGETVIEW,
-    resource_priv: *mut c_void,
+    h_res: ddi::D3D10DDI_HRESOURCE,
 ) -> Option<D3D11_RENDER_TARGET_VIEW_DESC> {
     let format = DXGI_FORMAT(a.Format as i32);
     match a.ResourceDimension {
@@ -3337,7 +3356,7 @@ unsafe fn rtv_desc(
         }
         RES_TEX2D => {
             let t = a.__bindgen_anon_1.Tex2D;
-            let is_msaa = resource_sample_count(resource_priv) > 1;
+            let is_msaa = resource_sample_count(h_res) > 1;
             if is_msaa && t.ArraySize > 1 {
                 Some(D3D11_RENDER_TARGET_VIEW_DESC {
                     Format: format,
@@ -3439,11 +3458,11 @@ unsafe extern "C" fn create_dsv(
         return;
     };
     let a = &*arg;
-    let Some(res) = load_resource(a.hDrvResource.pDrvPrivate) else {
+    let Some(res) = load_resource(a.hDrvResource) else {
         log_error!("DDI create_dsv: resource handle empty");
         return;
     };
-    let Some(desc) = dsv_desc(a, a.hDrvResource.pDrvPrivate) else {
+    let Some(desc) = dsv_desc(a, a.hDrvResource) else {
         log_error!(
             "DDI create_dsv: unsupported resource dimension {} fmt={}",
             a.ResourceDimension, a.Format
@@ -3471,7 +3490,7 @@ unsafe extern "C" fn create_dsv(
 
 unsafe fn dsv_desc(
     a: &ddi::D3D11DDIARG_CREATEDEPTHSTENCILVIEW,
-    resource_priv: *mut c_void,
+    h_res: ddi::D3D10DDI_HRESOURCE,
 ) -> Option<D3D11_DEPTH_STENCIL_VIEW_DESC> {
     let format = DXGI_FORMAT(a.Format as i32);
     match a.ResourceDimension {
@@ -3505,7 +3524,7 @@ unsafe fn dsv_desc(
         }
         RES_TEX2D => {
             let t = a.__bindgen_anon_1.Tex2D;
-            let is_msaa = resource_sample_count(resource_priv) > 1;
+            let is_msaa = resource_sample_count(h_res) > 1;
             if is_msaa && t.ArraySize > 1 {
                 Some(D3D11_DEPTH_STENCIL_VIEW_DESC {
                     Format: format,
@@ -3643,8 +3662,8 @@ unsafe extern "C" fn resource_copy(
         return;
     };
     let (Some(dst), Some(src)) = (
-        load_resource(h_dst.pDrvPrivate),
-        load_resource(h_src.pDrvPrivate),
+        load_resource(h_dst),
+        load_resource(h_src),
     ) else {
         if COPY_LOG_COUNT.first_n(256).is_some() {
             log_error!(
@@ -3654,8 +3673,8 @@ unsafe extern "C" fn resource_copy(
         }
         return;
     };
-    let dst_alloc = resource_allocation(h_dst.pDrvPrivate);
-    let src_alloc = resource_allocation(h_src.pDrvPrivate);
+    let dst_alloc = resource_allocation(h_dst);
+    let src_alloc = resource_allocation(h_src);
     let n = COPY_LOG_COUNT.next();
     if n < 256 || dst_alloc != 0 || src_alloc != 0 {
         trace_line!(
@@ -3680,12 +3699,12 @@ unsafe extern "C" fn resource_copy_region(
     let Some(context) = d3d11_context(h) else {
         return;
     };
-    let dst = load_resource(h_dst.pDrvPrivate);
-    let src = load_resource(h_src.pDrvPrivate);
-    let dst_summary = resource_summary(h_dst.pDrvPrivate);
-    let src_summary = resource_summary(h_src.pDrvPrivate);
-    let (dst_rt, dst_km) = resource_parent_handles(h_dst.pDrvPrivate);
-    let (src_rt, src_km) = resource_parent_handles(h_src.pDrvPrivate);
+    let dst = load_resource(h_dst);
+    let src = load_resource(h_src);
+    let dst_summary = resource_summary(h_dst);
+    let src_summary = resource_summary(h_src);
+    let (dst_rt, dst_km) = resource_parent_handles(h_dst);
+    let (src_rt, src_km) = resource_parent_handles(h_src);
     let n = COPY_REGION_LOG_COUNT.next();
     if n < 1024 || dst.is_none() || src.is_none() {
         trace_line!(
@@ -3785,8 +3804,8 @@ unsafe extern "C" fn resource_resolve_subresource(
         return;
     };
     let (Some(dst), Some(src)) = (
-        load_resource(h_dst.pDrvPrivate),
-        load_resource(h_src.pDrvPrivate),
+        load_resource(h_dst),
+        load_resource(h_src),
     ) else {
         return;
     };
@@ -3817,7 +3836,7 @@ unsafe extern "C" fn resource_map(
     let Some(context) = d3d11_context(h) else {
         return;
     };
-    let Some(res) = load_resource(h_resource.pDrvPrivate) else {
+    let Some(res) = load_resource(h_resource) else {
         return;
     };
     let mut out = D3D11_MAPPED_SUBRESOURCE::default();
@@ -3830,7 +3849,7 @@ unsafe extern "C" fn resource_map(
         Some(&mut out),
     ) {
         Ok(()) => {
-            let allocation = resource_allocation(h_resource.pDrvPrivate);
+            let allocation = resource_allocation(h_resource);
             let n = MAP_LOG_COUNT.next();
             if n < 256 || allocation != 0 {
                 trace_line!(
@@ -3896,7 +3915,7 @@ unsafe extern "C" fn resource_unmap(
     let Some(context) = d3d11_context(h) else {
         return;
     };
-    let Some(res) = load_resource(h_resource.pDrvPrivate) else {
+    let Some(res) = load_resource(h_resource) else {
         return;
     };
     context.Unmap(&*res, subresource);
@@ -4057,7 +4076,7 @@ unsafe extern "C" fn discard_11_1(
     };
     match handle_type {
         ddi::D3D11DDI_HANDLETYPE_D3D10DDI_HT_RESOURCE => {
-            if let Some(res) = load_resource(handle) {
+            if let Some(res) = load_resource_at(handle) {
                 context.DiscardResource(&*res);
             }
         }
@@ -5434,8 +5453,8 @@ unsafe extern "C" fn draw_instanced_indirect(
     let Some(context) = d3d11_context(h) else {
         return;
     };
-    let (alloc, kind, width, height, depth, fmt) = resource_summary(h_args.pDrvPrivate);
-    let Some(res) = load_resource(h_args.pDrvPrivate) else {
+    let (alloc, kind, width, height, depth, fmt) = resource_summary(h_args);
+    let Some(res) = load_resource(h_args) else {
         log_error!(
             "DDI DrawInstancedIndirect skipped: args missing alloc=0x{alloc:x} offset={aligned_byte_offset}"
         );
@@ -5473,8 +5492,8 @@ unsafe extern "C" fn draw_indexed_instanced_indirect(
     let Some(context) = d3d11_context(h) else {
         return;
     };
-    let (alloc, kind, width, height, depth, fmt) = resource_summary(h_args.pDrvPrivate);
-    let Some(res) = load_resource(h_args.pDrvPrivate) else {
+    let (alloc, kind, width, height, depth, fmt) = resource_summary(h_args);
+    let Some(res) = load_resource(h_args) else {
         log_error!(
             "DDI DrawIndexedInstancedIndirect skipped: args missing alloc=0x{alloc:x} offset={aligned_byte_offset}"
         );
@@ -5511,7 +5530,7 @@ unsafe extern "C" fn so_set_targets(
     // `offsets` was passed as `Some(..)` with no null check while every sibling
     // path checked theirs.
     let out = collect_slots(DdiSlice::new(buffers, num), num, |handle| {
-        load_resource(handle.pDrvPrivate).and_then(|r| (*r).cast::<ID3D11Buffer>().ok())
+        load_resource(*handle).and_then(|r| (*r).cast::<ID3D11Buffer>().ok())
     });
     context.SOSetTargets(
         num,
@@ -5672,14 +5691,14 @@ unsafe extern "C" fn create_srv(
         return;
     };
     let a = &*arg;
-    let Some(res) = load_resource(a.hDrvResource.pDrvPrivate) else {
+    let Some(res) = load_resource(a.hDrvResource) else {
         log_error!(
             "DDI create_srv: resource handle empty dim={} fmt={} hpriv={:p}",
             a.ResourceDimension, a.Format, a.hDrvResource.pDrvPrivate
         );
         return;
     };
-    let Some(desc) = srv_desc(a, a.hDrvResource.pDrvPrivate) else {
+    let Some(desc) = srv_desc(a, a.hDrvResource) else {
         log_error!(
             "DDI create_srv: unsupported resource dimension {} fmt={}",
             a.ResourceDimension, a.Format
@@ -5695,10 +5714,10 @@ unsafe extern "C" fn create_srv(
         );
     }
     finish_create(h, created, srv, |v| {
-        let allocation = resource_allocation(a.hDrvResource.pDrvPrivate);
+        let allocation = resource_allocation(a.hDrvResource);
         let n = SRV_CREATE_LOG_COUNT.next();
         if n < 1024 || allocation != 0 {
-            let (width, height) = resource_dimensions(a.hDrvResource.pDrvPrivate);
+            let (width, height) = resource_dimensions(a.hDrvResource);
             trace_line!(
                 "DDI create_srv ok: hpriv={:p} alloc=0x{:x} dim={} fmt={} {}x{}",
                 h_srv.pDrvPrivate, allocation, a.ResourceDimension, a.Format, width, height
@@ -5710,7 +5729,7 @@ unsafe extern "C" fn create_srv(
 
 unsafe fn srv_desc(
     a: &ddi::D3D11DDIARG_CREATESHADERRESOURCEVIEW,
-    resource_priv: *mut c_void,
+    h_res: ddi::D3D10DDI_HRESOURCE,
 ) -> Option<D3D11_SHADER_RESOURCE_VIEW_DESC> {
     let format = DXGI_FORMAT(a.Format as i32);
     match a.ResourceDimension {
@@ -5775,7 +5794,7 @@ unsafe fn srv_desc(
         }
         RES_TEX2D => {
             let t = a.__bindgen_anon_1.Tex2D;
-            let is_msaa = resource_sample_count(resource_priv) > 1;
+            let is_msaa = resource_sample_count(h_res) > 1;
             if is_msaa && t.ArraySize > 1 {
                 Some(D3D11_SHADER_RESOURCE_VIEW_DESC {
                     Format: format,
@@ -5900,7 +5919,7 @@ unsafe extern "C" fn create_uav(
         return;
     };
     let a = &*arg;
-    let Some(res) = load_resource(a.hDrvResource.pDrvPrivate) else {
+    let Some(res) = load_resource(a.hDrvResource) else {
         return;
     };
     let Some(desc) = uav_desc(a) else {
@@ -5958,7 +5977,7 @@ unsafe extern "C" fn create_uav(
                 "DDI create_uav ok: dim={} fmt={} alloc=0x{:x}",
                 a.ResourceDimension,
                 a.Format,
-                resource_allocation(a.hDrvResource.pDrvPrivate)
+                resource_allocation(a.hDrvResource)
             );
         }
         store_com(h_uav, v);
@@ -6154,7 +6173,7 @@ unsafe extern "C" fn copy_structure_count(
     let Some(context) = d3d11_context(h) else {
         return;
     };
-    let Some(dst) = load_resource(h_dst.pDrvPrivate).and_then(|r| (*r).cast::<ID3D11Buffer>().ok())
+    let Some(dst) = load_resource(h_dst).and_then(|r| (*r).cast::<ID3D11Buffer>().ok())
     else {
         return;
     };
@@ -6271,7 +6290,7 @@ unsafe fn collect_buffers(
 ) -> Vec<Option<ID3D11Buffer>> {
     let _ = start;
     collect_slots(DdiSlice::new(h, num), num, |handle| {
-        load_resource(handle.pDrvPrivate).and_then(|r| (*r).cast::<ID3D11Buffer>().ok())
+        load_resource(*handle).and_then(|r| (*r).cast::<ID3D11Buffer>().ok())
     })
 }
 unsafe fn collect_srvs(
@@ -6688,7 +6707,7 @@ unsafe extern "C" fn resource_update_subresource(
     let Some(context) = d3d11_context(h) else {
         return;
     };
-    let Some(res) = load_resource(h_res.pDrvPrivate) else {
+    let Some(res) = load_resource(h_res) else {
         if HANDLE_MISS_LOG_COUNT.first_n(256).is_some() {
             log_error!(
                 "DDI UpdateSubresource missing resource hpriv={:p} sub={} data={:p}",
@@ -6702,7 +6721,7 @@ unsafe extern "C" fn resource_update_subresource(
     // `read_unaligned` probes in particular are two dependent cache misses into
     // the CALLER's buffer, and they used to be paid on every BGRA/RGBA tex2d
     // update purely to produce a log field.
-    let (alloc, kind, width, height, depth, fmt) = resource_summary(h_res.pDrvPrivate);
+    let (alloc, kind, width, height, depth, fmt) = resource_summary(h_res);
     let n = UPDATE_LOG_COUNT.next();
     // DECLARED diagnostic change: the old gate's `|| alloc != 0` disjunct
     // removed the rate cap entirely for exactly the shared/primary/present
@@ -6715,7 +6734,7 @@ unsafe extern "C" fn resource_update_subresource(
         UPDATE_SUPPRESSED.fetch_add(1, Ordering::Relaxed);
     }
     if crate::trace_enabled() && rate_ok {
-        let (rt_resource, km_resource) = resource_parent_handles(h_res.pDrvPrivate);
+        let (rt_resource, km_resource) = resource_parent_handles(h_res);
         let (box_left, box_top, box_right, box_bottom) = if box_.is_null() {
             (
                 0i32,
@@ -6861,7 +6880,7 @@ unsafe fn tile_regions(
 unsafe fn resource_as_buffer(
     h_resource: ddi::D3D10DDI_HRESOURCE,
 ) -> Option<ManuallyDrop<ID3D11Buffer>> {
-    let res = load_resource(h_resource.pDrvPrivate)?;
+    let res = load_resource(h_resource)?;
     (*res).cast::<ID3D11Buffer>().ok().map(ManuallyDrop::new)
 }
 
@@ -6881,7 +6900,7 @@ unsafe extern "C" fn update_tile_mappings(
     let Some(context) = d3d11_context2(h) else {
         return;
     };
-    let Some(tiled_resource) = load_resource(h_tiled_resource.pDrvPrivate) else {
+    let Some(tiled_resource) = load_resource(h_tiled_resource) else {
         return;
     };
     let coords = tile_coords(region_start_coords, region_count);
@@ -6924,10 +6943,10 @@ unsafe extern "C" fn copy_tile_mappings(
     let Some(context) = d3d11_context2(h) else {
         return;
     };
-    let Some(dst) = load_resource(h_dst_resource.pDrvPrivate) else {
+    let Some(dst) = load_resource(h_dst_resource) else {
         return;
     };
-    let Some(src) = load_resource(h_src_resource.pDrvPrivate) else {
+    let Some(src) = load_resource(h_src_resource) else {
         return;
     };
     if dst_start_coord.is_null() || src_start_coord.is_null() || region_size.is_null() {
@@ -6951,7 +6970,7 @@ unsafe extern "C" fn copy_tiles(
     let Some(context) = d3d11_context2(h) else {
         return;
     };
-    let Some(tiled_resource) = load_resource(h_tiled_resource.pDrvPrivate) else {
+    let Some(tiled_resource) = load_resource(h_tiled_resource) else {
         return;
     };
     let Some(buffer) = resource_as_buffer(h_buffer) else {
@@ -6983,7 +7002,7 @@ unsafe extern "C" fn update_tiles(
     let Some(context) = d3d11_context2(h) else {
         return;
     };
-    let Some(dst) = load_resource(h_dst_resource.pDrvPrivate) else {
+    let Some(dst) = load_resource(h_dst_resource) else {
         return;
     };
     if dst_start_coord.is_null() || dst_region_size.is_null() || src_tile_data.is_null() {
@@ -7000,7 +7019,7 @@ unsafe fn tiled_barrier_child(
 ) -> Option<ID3D11DeviceChild> {
     match handle_type {
         ddi::D3D11DDI_HANDLETYPE_D3D10DDI_HT_RESOURCE => {
-            let res = load_resource(handle)?;
+            let res = load_resource_at(handle)?;
             (*res).cast::<ID3D11DeviceChild>().ok()
         }
         ddi::D3D11DDI_HANDLETYPE_D3D10DDI_HT_SHADERRESOURCEVIEW => {
@@ -7053,7 +7072,7 @@ unsafe extern "C" fn get_mip_packing(
     let Some(device) = d3d11_device2(h) else {
         return;
     };
-    let Some(resource) = load_resource(h_tiled_resource.pDrvPrivate) else {
+    let Some(resource) = load_resource(h_tiled_resource) else {
         return;
     };
     let mut total_tiles = 0u32;
@@ -7392,7 +7411,7 @@ unsafe extern "C" fn dispatch_indirect(
     if DISPATCH_LOG_COUNT.first_n_then_every(1024, 1024).is_some() {
         trace_line!(
             "DDI DispatchIndirect args_alloc=0x{:x} offset={}",
-            resource_allocation(h_args.pDrvPrivate),
+            resource_allocation(h_args),
             aligned_byte_offset
         );
     }
@@ -7400,7 +7419,7 @@ unsafe extern "C" fn dispatch_indirect(
         return;
     };
     let Some(buf) =
-        load_resource(h_args.pDrvPrivate).and_then(|r| (*r).cast::<ID3D11Buffer>().ok())
+        load_resource(h_args).and_then(|r| (*r).cast::<ID3D11Buffer>().ok())
     else {
         return;
     };
@@ -7415,7 +7434,7 @@ unsafe extern "C" fn set_resource_min_lod(
     let Some(context) = d3d11_context(h) else {
         return;
     };
-    let Some(res) = load_resource(h_resource.pDrvPrivate) else {
+    let Some(res) = load_resource(h_resource) else {
         return;
     };
     context.SetResourceMinLOD(&*res, min_lod);
@@ -8813,8 +8832,8 @@ unsafe extern "C" fn ia_set_vertex_buffers(
     };
     let mut bufs: Vec<Option<ID3D11Buffer>> = Vec::with_capacity(num as usize);
     for i in 0..num as usize {
-        let p = (*buffers.add(i)).pDrvPrivate;
-        bufs.push(load_resource(p).and_then(|r| (*r).cast::<ID3D11Buffer>().ok()));
+        let h_buf = *buffers.add(i);
+        bufs.push(load_resource(h_buf).and_then(|r| (*r).cast::<ID3D11Buffer>().ok()));
     }
     if let Some(dev) = helios_device(h) {
         let mut ia = dev.owned.ia.borrow_mut();
@@ -8868,7 +8887,7 @@ unsafe extern "C" fn ia_set_index_buffer(
     let Some(context) = d3d11_context(h) else {
         return;
     };
-    let buf = load_resource(h_buf.pDrvPrivate).and_then(|r| (*r).cast::<ID3D11Buffer>().ok());
+    let buf = load_resource(h_buf).and_then(|r| (*r).cast::<ID3D11Buffer>().ok());
     if let Some(dev) = helios_device(h) {
         let mut ia = dev.owned.ia.borrow_mut();
         ia.current_ib = buf.as_ref().map(|b| b.as_raw() as usize).unwrap_or(0);
@@ -9625,7 +9644,7 @@ unsafe fn vehicle_present_prepare(
         log_error!("vehicle present FAILED: no Helios device");
         return Err(E_FAIL);
     };
-    let backbuffer_raw = resource_com_raw(backbuffer_h.pDrvPrivate);
+    let backbuffer_raw = resource_com_raw(backbuffer_h);
     if backbuffer_raw == 0 {
         EXT_NO_DEVICE.fetch_add(1, Ordering::Relaxed);
         log_error!("vehicle present FAILED: backbuffer has no COM resource");
@@ -9774,7 +9793,7 @@ unsafe fn maybe_log_present_readback(h: Hdevice, src_h: ddi::D3D10DDI_HRESOURCE)
         log_error!("DXGI Present readback: no D3D11 context");
         return;
     };
-    let Some(res) = load_resource(src_h.pDrvPrivate) else {
+    let Some(res) = load_resource(src_h) else {
         log_error!("DXGI Present readback: source resource missing");
         return;
     };
@@ -9965,7 +9984,7 @@ unsafe fn maybe_force_present_alpha_opaque(h: Hdevice, src_h: ddi::D3D10DDI_HRES
         }
         return;
     };
-    let Some(res) = load_resource(src_h.pDrvPrivate) else {
+    let Some(res) = load_resource(src_h) else {
         if n < 8 {
             log_error!("DXGI Present force-opaque: source resource missing");
         }
@@ -10374,8 +10393,8 @@ unsafe extern "C" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT) -> i32 {
     let context = d3d11_context(h);
     let src_h = dxgi_resource_handle(a.hSurfaceToPresent);
     let dst_h = dxgi_resource_handle(a.hDstResource);
-    let src_alloc = resource_allocation(src_h.pDrvPrivate);
-    let dst_alloc = resource_allocation(dst_h.pDrvPrivate);
+    let src_alloc = resource_allocation(src_h);
+    let dst_alloc = resource_allocation(dst_h);
     let mut copied = false;
     let mut present_hr = 0;
     let mut sync_value: u64 = 0;
@@ -10418,13 +10437,13 @@ unsafe extern "C" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT) -> i32 {
             // through the adapter-owned LINEAR target; Present will publish its
             // rotated resource id after flushing DWM's rendering.
             let mut published_to_scanout =
-                presented_primary_private(h, src_h.pDrvPrivate).is_some();
+                presented_primary_private(h, src_h).is_some();
             let copy_pair = if published_to_scanout {
                 None
             } else {
                 match (
-                    load_resource(dst_h.pDrvPrivate),
-                    load_resource(src_h.pDrvPrivate),
+                    load_resource(dst_h),
+                    load_resource(src_h),
                 ) {
                     (Some(dst), Some(src)) => Some((dst, src)),
                     _ => None,
@@ -10451,8 +10470,8 @@ unsafe extern "C" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT) -> i32 {
                     // advertise kwait here (a skipping consumer on an idle
                     // desktop would freeze the host display one frame back).
                     sync_value = dev.dxvk.present_sync_publish(
-                        SrcRes(resource_com_raw(src_h.pDrvPrivate)),
-                        DstRes(resource_com_raw(dst_h.pDrvPrivate)),
+                        SrcRes(resource_com_raw(src_h)),
+                        DstRes(resource_com_raw(dst_h)),
                         false,
                     );
                 }
@@ -10557,7 +10576,7 @@ unsafe extern "C" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT) -> i32 {
     if let Some(dev) = helios_device(h) {
         if let Ok(ready) = present_prerequisites(dev, src_alloc) {
             let mut cb = ddi::DXGIDDICB_PRESENT::default();
-            let present_private = presented_primary_private(h, src_h.pDrvPrivate);
+            let present_private = presented_primary_private(h, src_h);
             cb.hSrcAllocation = ready.src_alloc.get();
             cb.hDstAllocation = dst_alloc;
             cb.pDXGIContext = a.pDXGIContext;
@@ -10582,8 +10601,8 @@ unsafe extern "C" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT) -> i32 {
                 return E_FAIL;
             };
             if let Some(cb_n) = PRESENT_CB_LOG_COUNT.first_n_then_every_from_one(128, 512) {
-                let (src_rt, src_km) = resource_parent_handles(src_h.pDrvPrivate);
-                let (dst_rt, dst_km) = resource_parent_handles(dst_h.pDrvPrivate);
+                let (src_rt, src_km) = resource_parent_handles(src_h);
+                let (dst_rt, dst_km) = resource_parent_handles(dst_h);
                 trace_line!(
                     "DXGI PresentCb identity: #{} src_alloc=0x{:x} dst_alloc=0x{:x} \
                      src_hDrv={:p} src_hRT={:p} src_hKM=0x{:x} dst_hDrv={:p} \
@@ -10759,7 +10778,7 @@ unsafe extern "C" fn dxgi_set_display_mode(arg: *mut ddi::DXGI_DDI_ARG_SETDISPLA
     // allocation created for it; pfnSetDisplayModeCb then asks dxgkrnl to make
     // that allocation the scan-out primary and initiates the VidPn commit.
     let resource = dxgi_resource_handle(a.hResource);
-    let allocation = resource_allocation(resource.pDrvPrivate);
+    let allocation = resource_allocation(resource);
     if allocation == 0 {
         log_error!(
             "DXGI SetDisplayMode: resource=0x{:x} sub={} has no WDDM allocation",
@@ -11022,8 +11041,8 @@ unsafe extern "C" fn dxgi_blt(arg: *mut ddi::DXGI_DDI_ARG_BLT) -> i32 {
     let dst_h = dxgi_resource_handle(a.hDstResource);
     let src_h = dxgi_resource_handle(a.hSrcResource);
     let (Some(dst), Some(src)) = (
-        load_resource(dst_h.pDrvPrivate),
-        load_resource(src_h.pDrvPrivate),
+        load_resource(dst_h),
+        load_resource(src_h),
     ) else {
         log_error!(
             "DXGI Blt: missing resource dst=0x{:x} src=0x{:x}",
@@ -11049,13 +11068,13 @@ unsafe extern "C" fn dxgi_blt(arg: *mut ddi::DXGI_DDI_ARG_BLT) -> i32 {
             n,
             src_h.pDrvPrivate,
             a.SrcSubresource,
-            resource_allocation(src_h.pDrvPrivate),
+            resource_allocation(src_h),
             src_desc.Width,
             src_desc.Height,
             src_desc.Format.0,
             dst_h.pDrvPrivate,
             a.DstSubresource,
-            resource_allocation(dst_h.pDrvPrivate),
+            resource_allocation(dst_h),
             dst_desc.Width,
             dst_desc.Height,
             dst_desc.Format.0,
@@ -11092,8 +11111,8 @@ unsafe extern "C" fn dxgi_blt1(arg: *mut ddi::DXGI_DDI_ARG_BLT1) -> i32 {
     let dst_h = dxgi_resource_handle(a.hDstResource);
     let src_h = dxgi_resource_handle(a.hSrcResource);
     let (Some(dst), Some(src)) = (
-        load_resource(dst_h.pDrvPrivate),
-        load_resource(src_h.pDrvPrivate),
+        load_resource(dst_h),
+        load_resource(src_h),
     ) else {
         log_error!(
             "DXGI Blt1: missing resource dst=0x{:x} src=0x{:x}",
@@ -11117,7 +11136,7 @@ unsafe extern "C" fn dxgi_blt1(arg: *mut ddi::DXGI_DDI_ARG_BLT1) -> i32 {
     let dst_h_px = a.DstBottom.saturating_sub(a.DstTop);
 
     if flags & BLT_RESOLVE != 0 {
-        let format = resource_dxgi_format(dst_h.pDrvPrivate);
+        let format = resource_dxgi_format(dst_h);
         if format.0 == 0 {
             log_error!("DXGI Blt1: resolve has unknown destination format");
             return E_INVALIDARG;
@@ -11380,7 +11399,7 @@ unsafe extern "C" fn dxgi_present_mpo(arg: *mut ddi::DXGI_DDI_ARG_PRESENTMULTIPL
             return E_INVALIDARG;
         }
         let resource = dxgi_resource_handle(plane.hResource);
-        let alloc = resource_allocation(resource.pDrvPrivate);
+        let alloc = resource_allocation(resource);
         if alloc == 0 {
             log_error!(
                 "DXGI PresentMultiplaneOverlay: plane {} has no allocation hResource=0x{:x}",
@@ -11467,8 +11486,8 @@ unsafe extern "C" fn dxgi_present1(arg: *mut ddi::DXGI_DDI_ARG_PRESENT1) -> i32 
     let h = dxgi_device_handle(a.hDevice);
     let src_h = dxgi_resource_handle(source.hSurface);
     let dst_h = dxgi_resource_handle(a.hDstResource);
-    let src_alloc = resource_allocation(src_h.pDrvPrivate);
-    let dst_alloc = resource_allocation(dst_h.pDrvPrivate);
+    let src_alloc = resource_allocation(src_h);
+    let dst_alloc = resource_allocation(dst_h);
     if PRESENT1_LOG_COUNT.first_n(64).is_some() {
         trace_line!(
             "DXGI Present1 multi: surfaces={} callback_src={} src={:p}/{} alloc=0x{:x} \
@@ -11496,7 +11515,7 @@ unsafe extern "C" fn dxgi_present1(arg: *mut ddi::DXGI_DDI_ARG_PRESENT1) -> i32 
     }
 
     if let Some(context) = d3d11_context(h) {
-        let published_to_scanout = presented_primary_private(h, src_h.pDrvPrivate).is_some()
+        let published_to_scanout = presented_primary_private(h, src_h).is_some()
             || (dst_alloc == 0 && copy_to_scanout_target(&context, h, src_h));
         if !published_to_scanout {
             let _ = unsafe { publish_dwm_composition(&context, h) };
@@ -11508,8 +11527,8 @@ unsafe extern "C" fn dxgi_present1(arg: *mut ddi::DXGI_DDI_ARG_PRESENT1) -> i32 
     if present_sync_publish_enabled() {
         if let Some(dev) = helios_device(h) {
             sync_value = dev.dxvk.present_sync_publish(
-                SrcRes(resource_com_raw(src_h.pDrvPrivate)),
-                DstRes(resource_com_raw(dst_h.pDrvPrivate)),
+                SrcRes(resource_com_raw(src_h)),
+                DstRes(resource_com_raw(dst_h)),
                 false,
             );
         }
@@ -11543,7 +11562,7 @@ unsafe extern "C" fn dxgi_present1(arg: *mut ddi::DXGI_DDI_ARG_PRESENT1) -> i32 
             return DXGI_ERROR_UNSUPPORTED;
         }
         let mut cb = ddi::DXGIDDICB_PRESENT::default();
-        let present_private = presented_primary_private(h, src_h.pDrvPrivate);
+        let present_private = presented_primary_private(h, src_h);
         cb.hSrcAllocation = src_alloc;
         cb.hDstAllocation = dst_alloc;
         cb.pDXGIContext = a.pDXGIContext;
@@ -11571,8 +11590,8 @@ unsafe extern "C" fn dxgi_present1(arg: *mut ddi::DXGI_DDI_ARG_PRESENT1) -> i32 
             return E_FAIL;
         };
         if let Some(cb_n) = PRESENT_CB_LOG_COUNT.first_n_then_every_from_one(128, 512) {
-            let (src_rt, src_km) = resource_parent_handles(src_h.pDrvPrivate);
-            let (dst_rt, dst_km) = resource_parent_handles(dst_h.pDrvPrivate);
+            let (src_rt, src_km) = resource_parent_handles(src_h);
+            let (dst_rt, dst_km) = resource_parent_handles(dst_h);
             trace_line!(
                 "DXGI Present1 PresentCb identity: #{} src_alloc=0x{:x} dst_alloc=0x{:x} \
                  src_hDrv={:p} src_hRT={:p} src_hKM=0x{:x} dst_hDrv={:p} \
