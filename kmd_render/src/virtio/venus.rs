@@ -1107,75 +1107,217 @@ impl EncodedStream for Writer {
 
 // ── A bounds-checked LE reader over the reply shmem ───────────────────────────
 
-/// Reads little-endian scalars out of the host-written reply buffer. The reply is
-/// **untrusted** input: every read is bounds-checked against the mapping size and
-/// returns `VirtioError::DeviceError` on overrun, so a malformed reply can never
-/// index out of bounds.
-struct ReplyReader<'a> {
-    map: &'a KernelMap,
-    /// Absolute byte offset within the mapping (reply lives at offset 0).
-    pos: u64,
-    /// Hard cap = reply mapping size.
-    end: u64,
+/// The reply reader, in its own module so its constructor can be PRIVATE.
+///
+/// R1001. The shmem is reused at offset 0 for every command, so a decode
+/// without a command-id check reads the PREVIOUS command's reply as its own and
+/// produces a plausible-looking success. Twenty-eight sites hand-wrote that
+/// check; nothing made them.
+///
+/// Inside this module `new` is private and [`ReplyReader::open`] is the only way
+/// out, so a reader positioned at offset 0 with an UNCHECKED command id is not
+/// constructible from anywhere in `venus.rs`. That is a real compile-time
+/// property, not a convention.
+///
+/// The other half of the finding -- "decode a reply without having issued the
+/// matching request" -- is NOT expressible this way, because `open` still takes
+/// a `&KernelMap` that any code in this file could reach. It is enforced
+/// instead by there being exactly one caller: `VenusRing::ring_command_expect`,
+/// which publishes and waits first and hands the reader back. Said plainly
+/// rather than claimed as a type-level guarantee.
+mod reply {
+    use super::{KernelMap, VirtioError};
+
+    /// Reads little-endian scalars out of the host-written reply buffer. The
+    /// reply is **untrusted** input: every read is bounds-checked against the
+    /// mapping size and returns `VirtioError::DeviceError` on overrun, so a
+    /// malformed reply can never index out of bounds.
+    pub(super) struct ReplyReader<'a> {
+        map: &'a KernelMap,
+        /// Absolute byte offset within the mapping (reply lives at offset 0).
+        pos: u64,
+        /// Hard cap = reply mapping size.
+        end: u64,
+    }
+
+    /// The reply's first word was not the command that was issued.
+    ///
+    /// Deliberately NOT a `VirtioError`: the caller has a per-site diag code
+    /// and breadcrumb to record before converting it, and a bare
+    /// `VirtioError::DeviceError` would let a site forget.
+    pub(super) struct CommandMismatch;
+
+    impl<'a> ReplyReader<'a> {
+        fn new(map: &'a KernelMap) -> Self {
+            Self {
+                map,
+                pos: 0,
+                end: map.size,
+            }
+        }
+
+        /// The ONLY constructor reachable outside this module: read word 0 and
+        /// require it to be `expected` before handing back a reader positioned
+        /// after it.
+        ///
+        /// A short reply (word 0 not even readable) is `Err(Err(DeviceError))`,
+        /// matching what the hand-written `r.read_i32()?` did.
+        #[allow(clippy::result_unit_err)]
+        pub(super) fn open(
+            map: &'a KernelMap,
+            expected: u32,
+        ) -> Result<Result<Self, CommandMismatch>, VirtioError> {
+            let mut r = Self::new(map);
+            let cmd = r.read_i32()?;
+            if cmd as u32 != expected {
+                return Ok(Err(CommandMismatch));
+            }
+            Ok(Ok(r))
+        }
+
+        pub(super) fn read_u32(&mut self) -> Result<u32, VirtioError> {
+            if self.pos + 4 > self.end {
+                return Err(VirtioError::DeviceError);
+            }
+            let mut b = [0u8; 4];
+            for (i, slot) in b.iter_mut().enumerate() {
+                *slot = self
+                    .map
+                    .read_byte(self.pos + i as u64)
+                    .ok_or(VirtioError::DeviceError)?;
+            }
+            self.pos += 4;
+            Ok(u32::from_le_bytes(b))
+        }
+
+        pub(super) fn read_i32(&mut self) -> Result<i32, VirtioError> {
+            Ok(self.read_u32()? as i32)
+        }
+
+        pub(super) fn read_u64(&mut self) -> Result<u64, VirtioError> {
+            if self.pos + 8 > self.end {
+                return Err(VirtioError::DeviceError);
+            }
+            let mut b = [0u8; 8];
+            for (i, slot) in b.iter_mut().enumerate() {
+                *slot = self
+                    .map
+                    .read_byte(self.pos + i as u64)
+                    .ok_or(VirtioError::DeviceError)?;
+            }
+            self.pos += 8;
+            Ok(u64::from_le_bytes(b))
+        }
+
+        /// Skip `n` bytes, bounds-checked.
+        ///
+        /// Unused today -- every current reply is parsed field by field. Kept
+        /// because it is the ONLY bounds-checked way to advance this reader,
+        /// and a future reply with a variable-length prefix that has to
+        /// hand-roll `self.pos += n` is exactly the unchecked-advance bug this
+        /// type exists to prevent. Pre-dates T6. R906.
+        #[allow(dead_code)]
+        pub(super) fn skip(&mut self, n: u64) -> Result<(), VirtioError> {
+            if self.pos + n > self.end {
+                return Err(VirtioError::DeviceError);
+            }
+            self.pos += n;
+            Ok(())
+        }
+    }
 }
 
-impl<'a> ReplyReader<'a> {
-    fn new(map: &'a KernelMap) -> Self {
+use reply::ReplyReader;
+
+/// What a reply-issuing site wants checked, and what to record when it fails.
+///
+/// R1001. Every one of the twenty-eight decode sites hand-wrote "read word 0,
+/// compare it to my command, record my diag code" and nineteen of them also
+/// hand-wrote the `VkResult` check. The per-site *values* are real -- each diag
+/// code and breadcrumb name identifies which command failed and is owner
+/// debugging ABI -- but the *shape* was copied. This carries the values and
+/// [`VenusRing::ring_command_expect`] performs the shape.
+#[derive(Clone, Copy)]
+struct ReplyCheck {
+    expected: u32,
+    /// `diag` code recorded when word 0 is not `expected`.
+    mismatch_diag: Option<u32>,
+    /// A named breadcrumb recorded as `0xE0` on a command mismatch.
+    mismatch_mark: Option<&'static [u8]>,
+    result: ResultPolicy,
+}
+
+/// What to do with the reply's `VkResult` word.
+#[derive(Clone, Copy)]
+enum ResultPolicy {
+    /// Do not read it. Either the reply carries none (the three
+    /// `Get*Requirements`/`GetDeviceQueue2`/memory-properties shapes, whose
+    /// second word is a simple-pointer, not a result) or the caller
+    /// interprets it itself (`VK_INCOMPLETE` is acceptable to
+    /// `vkEnumeratePhysicalDevices`; the ext-ladder reads it to choose a tier).
+    Deferred,
+    /// Read it and refuse a non-zero value.
+    Refuse {
+        diag: Option<u32>,
+        /// A named breadcrumb recorded as the RAW `VkResult` before refusing.
+        /// The six host-VkResult breadcrumbs (`SdgLImg`, `CpImgVr`, `PBBufVr`,
+        /// `SdgLMem`, `CpMemVr`, `SdgDevR`) are the owner's first look at a
+        /// host-side rejection.
+        mark: Option<&'static [u8]>,
+    },
+}
+
+impl ReplyCheck {
+    /// Check only that the reply is for `expected`; record nothing, and leave
+    /// the `VkResult` word to the caller.
+    const fn new(expected: u32) -> Self {
         Self {
-            map,
-            pos: 0,
-            end: map.size,
+            expected,
+            mismatch_diag: None,
+            mismatch_mark: None,
+            result: ResultPolicy::Deferred,
         }
     }
 
-    fn read_u32(&mut self) -> Result<u32, VirtioError> {
-        if self.pos + 4 > self.end {
-            return Err(VirtioError::DeviceError);
-        }
-        let mut b = [0u8; 4];
-        for (i, slot) in b.iter_mut().enumerate() {
-            *slot = self
-                .map
-                .read_byte(self.pos + i as u64)
-                .ok_or(VirtioError::DeviceError)?;
-        }
-        self.pos += 4;
-        Ok(u32::from_le_bytes(b))
+    const fn mismatch(mut self, code: u32) -> Self {
+        self.mismatch_diag = Some(code);
+        self
     }
 
-    fn read_i32(&mut self) -> Result<i32, VirtioError> {
-        Ok(self.read_u32()? as i32)
+    /// Record `name = 0xE0` when the command id does not match.
+    const fn mismatch_marks(mut self, name: &'static [u8]) -> Self {
+        self.mismatch_mark = Some(name);
+        self
     }
 
-    fn read_u64(&mut self) -> Result<u64, VirtioError> {
-        if self.pos + 8 > self.end {
-            return Err(VirtioError::DeviceError);
-        }
-        let mut b = [0u8; 8];
-        for (i, slot) in b.iter_mut().enumerate() {
-            *slot = self
-                .map
-                .read_byte(self.pos + i as u64)
-                .ok_or(VirtioError::DeviceError)?;
-        }
-        self.pos += 8;
-        Ok(u64::from_le_bytes(b))
+    /// Read the `VkResult` word and refuse a non-zero value, recording `code`.
+    const fn refuse_result(mut self, code: u32) -> Self {
+        self.result = ResultPolicy::Refuse {
+            diag: Some(code),
+            mark: None,
+        };
+        self
     }
 
-    /// Skip `n` bytes, bounds-checked.
-    ///
-    /// Unused today -- every current reply is parsed field by field. Kept
-    /// because it is the ONLY bounds-checked way to advance this reader, and a
-    /// future reply with a variable-length prefix that has to hand-roll
-    /// `self.pos += n` is exactly the unchecked-advance bug this type exists to
-    /// prevent. Pre-dates T6. R906.
-    #[allow(dead_code)]
-    fn skip(&mut self, n: u64) -> Result<(), VirtioError> {
-        if self.pos + n > self.end {
-            return Err(VirtioError::DeviceError);
+    /// As [`Self::refuse_result`], but the site records no diag code.
+    const fn refuse_result_undiagnosed(mut self) -> Self {
+        self.result = ResultPolicy::Refuse {
+            diag: None,
+            mark: None,
+        };
+        self
+    }
+
+    /// Record `name = <raw VkResult>` before refusing. Only meaningful after
+    /// one of the `refuse_result*` builders.
+    const fn result_marks(mut self, name: &'static [u8]) -> Self {
+        if let ResultPolicy::Refuse { diag, .. } = self.result {
+            self.result = ResultPolicy::Refuse {
+                diag,
+                mark: Some(name),
+            };
         }
-        self.pos += n;
-        Ok(())
+        self
     }
 }
 
@@ -1407,7 +1549,12 @@ impl VenusRing {
     /// Issue a command WITH a reply through the ring. First points the host at the
     /// reply shmem (`vkSetReplyCommandStreamMESA`), then writes the real command
     /// with the GENERATE_REPLY flag, publishes once, and waits. The reply lands at
-    /// reply-shmem offset 0; the caller decodes it via a fresh [`ReplyReader`].
+    /// reply-shmem offset 0.
+    ///
+    /// PRIVATE to [`Self::ring_command_expect`], which is its only caller. That
+    /// is R1001's second half: publishing a reply-generating command and
+    /// obtaining a reader for it are one operation, so a decode cannot be
+    /// written against a reply nobody asked for.
     fn ring_command_reply(
         &mut self,
         adapter: &AdapterContext,
@@ -1446,6 +1593,55 @@ impl VenusRing {
         Ok(())
     }
 
+    /// Issue a command WITH a reply and hand back a reader positioned past the
+    /// header words `check` consumed.
+    ///
+    /// R1001. This is the only way to obtain a [`ReplyReader`]: `open` is the
+    /// reader's sole public constructor and it performs the command-id check
+    /// itself, so a decode that skips that check does not compile. Publishing
+    /// and decoding being one call is what stops a reader being built over the
+    /// PREVIOUS command's reply.
+    ///
+    /// The returned reader borrows `self` for its lifetime, so a caller that
+    /// needs `&mut self` afterwards must read what it wants into locals and
+    /// drop the reader first -- which is the correct discipline anyway.
+    fn ring_command_expect(
+        &mut self,
+        adapter: &AdapterContext,
+        cmd_stream: &[u8],
+        check: ReplyCheck,
+    ) -> Result<ReplyReader<'_>, VirtioError> {
+        self.ring_command_reply(adapter, cmd_stream)?;
+
+        let opened = ReplyReader::open(&self.reply_map, check.expected)?;
+        let mut r = match opened {
+            Ok(r) => r,
+            Err(_mismatch) => {
+                if let Some(name) = check.mismatch_mark {
+                    crate::diag::record_named_bytes(name, 0xE0);
+                }
+                if let Some(code) = check.mismatch_diag {
+                    diag(code);
+                }
+                return Err(VirtioError::DeviceError);
+            }
+        };
+
+        if let ResultPolicy::Refuse { diag: code, mark } = check.result {
+            let result = r.read_i32()?;
+            if result != 0 {
+                if let Some(name) = mark {
+                    crate::diag::record_named_bytes(name, result as u32);
+                }
+                if let Some(code) = code {
+                    diag(code);
+                }
+                return Err(VirtioError::DeviceError);
+            }
+        }
+
+        Ok(r)
+    }
 }
 
 /// Bring-up stage 2: an instance and a physical device exist on the ring.
@@ -1560,11 +1756,6 @@ impl VenusClient {
         self.ring.ctx_id
     }
 
-    /// The reply shmem mapping, for a fresh [`ReplyReader`].
-    fn reply_map(&self) -> &KernelMap {
-        &self.ring.reply_map
-    }
-
     /// The stage-1 PASSIVE proof (R614). See [`VenusRing::passive`] for why a
     /// bring-up-time token is the right provenance for a client method.
     fn passive(&self) -> PassiveLevel {
@@ -1583,12 +1774,16 @@ impl VenusClient {
         self.ring.ring_command_noreply(adapter, stream)
     }
 
-    fn ring_command_reply(
+    /// See [`VenusRing::ring_command_expect`]. Delegating rather than
+    /// re-implementing keeps the reader's single construction site on the ring,
+    /// where the publish/wait it must follow also lives.
+    fn ring_command_expect(
         &mut self,
         adapter: &AdapterContext,
         stream: &[u8],
-    ) -> Result<(), VirtioError> {
-        self.ring.ring_command_reply(adapter, stream)
+        check: ReplyCheck,
+    ) -> Result<ReplyReader<'_>, VirtioError> {
+        self.ring.ring_command_expect(adapter, stream, check)
     }
 
     /// Mint the next raw handle. Private: every caller goes through one of the
@@ -1659,19 +1854,13 @@ impl VenusClient {
             w.count(false);
             w.count(true);
             w.handle(memory_id);
-            self.ring_command_reply(adapter, w.as_slice()?)?;
-
-            let mut r = ReplyReader::new(self.reply_map());
-            let cmd = r.read_i32()?;
-            if cmd as u32 != CMD_ALLOCATE_MEMORY {
-                diag(0x00F6);
-                return Err(VirtioError::DeviceError);
-            }
-            let result = r.read_i32()?;
-            if result != 0 {
-                diag(0x00F7);
-                return Err(VirtioError::DeviceError);
-            }
+            self.ring_command_expect(
+                adapter,
+                w.as_slice()?,
+                ReplyCheck::new(CMD_ALLOCATE_MEMORY)
+                    .mismatch(0x00F6)
+                    .refuse_result(0x00F7),
+            )?;
         }
 
         let mut flags = 0;
@@ -1789,23 +1978,18 @@ impl VenusClient {
         w.count(false); // pAllocator
         w.count(true);
         w.handle(image_id);
-        self.ring_command_reply(adapter, w.as_slice()?)?;
-
-        let mut r = ReplyReader::new(self.reply_map());
-        let cmd = r.read_i32()?;
-        if cmd as u32 != CMD_CREATE_IMAGE {
-            crate::diag::record_named_bytes(b"SdgLImg", 0xE0);
-            diag(0x0120);
-            return Err(VirtioError::DeviceError);
-        }
-        let result = r.read_i32()?;
-        if result != 0 {
-            // Raw VkResult of the LINEAR external-DMA_BUF image create — this is
-            // the most likely NVIDIA-venus rejection point for the CachyOS shape.
-            crate::diag::record_named_bytes(b"SdgLImg", result as u32);
-            diag(0x0121);
-            return Err(VirtioError::DeviceError);
-        }
+        // The raw VkResult of the LINEAR external-DMA_BUF image create is the
+        // most likely NVIDIA-venus rejection point for the CachyOS shape, which
+        // is why `SdgLImg` carries it verbatim.
+        let mut r = self.ring_command_expect(
+            adapter,
+            w.as_slice()?,
+            ReplyCheck::new(CMD_CREATE_IMAGE)
+                .mismatch(0x0120)
+                .mismatch_marks(b"SdgLImg")
+                .refuse_result(0x0121)
+                .result_marks(b"SdgLImg"),
+        )?;
         if r.read_u64()? == 0 || r.read_u64()? == 0 {
             crate::diag::record_named_bytes(b"SdgLImg", 0xE1);
             diag(0x0122);
@@ -1882,20 +2066,14 @@ impl VenusClient {
         w.count(false); // pAllocator
         w.count(true);
         w.handle(image_id);
-        self.ring_command_reply(adapter, w.as_slice()?)?;
-
-        let mut r = ReplyReader::new(self.reply_map());
-        let cmd = r.read_i32()?;
-        if cmd as u32 != CMD_CREATE_IMAGE {
-            diag(0x0130);
-            return Err(VirtioError::DeviceError);
-        }
-        let result = r.read_i32()?;
-        if result != 0 {
-            crate::diag::record_named_bytes(b"CpImgVr", result as u32);
-            diag(0x0131);
-            return Err(VirtioError::DeviceError);
-        }
+        let mut r = self.ring_command_expect(
+            adapter,
+            w.as_slice()?,
+            ReplyCheck::new(CMD_CREATE_IMAGE)
+                .mismatch(0x0130)
+                .refuse_result(0x0131)
+                .result_marks(b"CpImgVr"),
+        )?;
         if r.read_u64()? == 0 || r.read_u64()? == 0 {
             diag(0x0132);
             return Err(VirtioError::DeviceError);
@@ -1944,12 +2122,11 @@ impl VenusClient {
         w.count(false); // pAllocator
         w.count(true);
         w.handle(image_id);
-        self.ring_command_reply(adapter, w.as_slice()?)?;
-
-        let mut r = ReplyReader::new(self.reply_map());
-        if r.read_i32()? as u32 != CMD_CREATE_IMAGE || r.read_i32()? != 0 {
-            return Err(VirtioError::DeviceError);
-        }
+        let mut r = self.ring_command_expect(
+            adapter,
+            w.as_slice()?,
+            ReplyCheck::new(CMD_CREATE_IMAGE).refuse_result_undiagnosed(),
+        )?;
         if r.read_u64()? == 0 || r.read_u64()? == 0 {
             return Err(VirtioError::DeviceError);
         }
@@ -1980,12 +2157,11 @@ impl VenusClient {
         w.count(false); // pAllocator
         w.count(true);
         w.handle(memory_id);
-        self.ring_command_reply(adapter, w.as_slice()?)?;
-
-        let mut r = ReplyReader::new(self.reply_map());
-        if r.read_i32()? as u32 != CMD_ALLOCATE_MEMORY || r.read_i32()? != 0 {
-            return Err(VirtioError::DeviceError);
-        }
+        self.ring_command_expect(
+            adapter,
+            w.as_slice()?,
+            ReplyCheck::new(CMD_ALLOCATE_MEMORY).refuse_result_undiagnosed(),
+        )?;
         Ok(memory_id)
     }
 
@@ -2086,14 +2262,12 @@ impl VenusClient {
         w.handle(self.device_id);
         w.handle(image_id);
         w.count(true);
-        self.ring_command_reply(adapter, w.as_slice()?)?;
-
-        let mut r = ReplyReader::new(self.reply_map());
-        let cmd = r.read_i32()?;
-        if cmd as u32 != CMD_GET_IMAGE_MEMORY_REQUIREMENTS {
-            diag(0x0104);
-            return Err(VirtioError::DeviceError);
-        }
+        // No VkResult in this reply shape: word 1 is the simple-pointer.
+        let mut r = self.ring_command_expect(
+            adapter,
+            w.as_slice()?,
+            ReplyCheck::new(CMD_GET_IMAGE_MEMORY_REQUIREMENTS).mismatch(0x0104),
+        )?;
         if r.read_u64()? == 0 {
             diag(0x0105);
             return Err(VirtioError::DeviceError);
@@ -2130,18 +2304,13 @@ impl VenusClient {
         w.count(false); // pAllocator
         w.count(true);
         w.handle(buffer_id);
-        self.ring_command_reply(adapter, w.as_slice()?)?;
-
-        let mut r = ReplyReader::new(self.reply_map());
-        let cmd = r.read_i32()?;
-        if cmd as u32 != CMD_CREATE_BUFFER {
-            return Err(VirtioError::DeviceError);
-        }
-        let result = r.read_i32()?;
-        if result != 0 {
-            crate::diag::record_named_bytes(b"PBBufVr", result as u32);
-            return Err(VirtioError::DeviceError);
-        }
+        let mut r = self.ring_command_expect(
+            adapter,
+            w.as_slice()?,
+            ReplyCheck::new(CMD_CREATE_BUFFER)
+                .refuse_result_undiagnosed()
+                .result_marks(b"PBBufVr"),
+        )?;
         if r.read_u64()? == 0 || r.read_u64()? == 0 {
             return Err(VirtioError::DeviceError);
         }
@@ -2158,11 +2327,15 @@ impl VenusClient {
         w.handle(self.device_id);
         w.handle(buffer_id);
         w.count(true);
-        self.ring_command_reply(adapter, w.as_slice()?)?;
-
-        let mut r = ReplyReader::new(self.reply_map());
-        let cmd = r.read_i32()?;
-        if cmd as u32 != CMD_GET_BUFFER_MEMORY_REQUIREMENTS || r.read_u64()? == 0 {
+        // No VkResult: word 1 is the simple-pointer, checked below. The
+        // pre-R1001 form short-circuited on a command mismatch and so never
+        // read it either.
+        let mut r = self.ring_command_expect(
+            adapter,
+            w.as_slice()?,
+            ReplyCheck::new(CMD_GET_BUFFER_MEMORY_REQUIREMENTS),
+        )?;
+        if r.read_u64()? == 0 {
             return Err(VirtioError::DeviceError);
         }
         let size = r.read_u64()?;
@@ -2198,18 +2371,13 @@ impl VenusClient {
         w.count(false);
         w.count(true);
         w.handle(memory_id);
-        self.ring_command_reply(adapter, w.as_slice()?)?;
-
-        let mut r = ReplyReader::new(self.reply_map());
-        let cmd = r.read_i32()?;
-        if cmd as u32 != CMD_ALLOCATE_MEMORY {
-            diag(0x0106);
-            return Err(VirtioError::DeviceError);
-        }
-        if r.read_i32()? != 0 {
-            diag(0x0107);
-            return Err(VirtioError::DeviceError);
-        }
+        self.ring_command_expect(
+            adapter,
+            w.as_slice()?,
+            ReplyCheck::new(CMD_ALLOCATE_MEMORY)
+                .mismatch(0x0106)
+                .refuse_result(0x0107),
+        )?;
         Ok(memory_id)
     }
 
@@ -2234,23 +2402,18 @@ impl VenusClient {
         w.count(false);
         w.count(true);
         w.handle(memory_id);
-        self.ring_command_reply(adapter, w.as_slice()?)?;
-
-        let mut r = ReplyReader::new(self.reply_map());
-        let cmd = r.read_i32()?;
-        if cmd as u32 != CMD_ALLOCATE_MEMORY {
-            crate::diag::record_named_bytes(b"SdgLMem", 0xE0);
-            diag(0x0123);
-            return Err(VirtioError::DeviceError);
-        }
-        let result = r.read_i32()?;
-        if result != 0 {
-            // Raw VkResult of the exportable-DMA_BUF allocation for the linear
-            // scanout image (dedicated-less export alloc).
-            crate::diag::record_named_bytes(b"SdgLMem", result as u32);
-            diag(0x0124);
-            return Err(VirtioError::DeviceError);
-        }
+        // `SdgLMem` carries the raw VkResult of the exportable-DMA_BUF
+        // allocation for the linear scanout image (dedicated-less export
+        // alloc).
+        self.ring_command_expect(
+            adapter,
+            w.as_slice()?,
+            ReplyCheck::new(CMD_ALLOCATE_MEMORY)
+                .mismatch(0x0123)
+                .mismatch_marks(b"SdgLMem")
+                .refuse_result(0x0124)
+                .result_marks(b"SdgLMem"),
+        )?;
         Ok(memory_id)
     }
 
@@ -2279,20 +2442,14 @@ impl VenusClient {
         w.count(false); // pAllocator
         w.count(true);
         w.handle(memory_id);
-        self.ring_command_reply(adapter, w.as_slice()?)?;
-
-        let mut r = ReplyReader::new(self.reply_map());
-        let cmd = r.read_i32()?;
-        if cmd as u32 != CMD_ALLOCATE_MEMORY {
-            diag(0x0133);
-            return Err(VirtioError::DeviceError);
-        }
-        let result = r.read_i32()?;
-        if result != 0 {
-            crate::diag::record_named_bytes(b"CpMemVr", result as u32);
-            diag(0x0134);
-            return Err(VirtioError::DeviceError);
-        }
+        self.ring_command_expect(
+            adapter,
+            w.as_slice()?,
+            ReplyCheck::new(CMD_ALLOCATE_MEMORY)
+                .mismatch(0x0133)
+                .refuse_result(0x0134)
+                .result_marks(b"CpMemVr"),
+        )?;
         Ok(memory_id)
     }
 
@@ -2308,18 +2465,13 @@ impl VenusClient {
         w.handle(image_id);
         w.handle(memory_id);
         w.u64(0);
-        self.ring_command_reply(adapter, w.as_slice()?)?;
-
-        let mut r = ReplyReader::new(self.reply_map());
-        let cmd = r.read_i32()?;
-        if cmd as u32 != CMD_BIND_IMAGE_MEMORY {
-            diag(0x0108);
-            return Err(VirtioError::DeviceError);
-        }
-        if r.read_i32()? != 0 {
-            diag(0x0109);
-            return Err(VirtioError::DeviceError);
-        }
+        self.ring_command_expect(
+            adapter,
+            w.as_slice()?,
+            ReplyCheck::new(CMD_BIND_IMAGE_MEMORY)
+                .mismatch(0x0108)
+                .refuse_result(0x0109),
+        )?;
         Ok(())
     }
 
@@ -2335,13 +2487,11 @@ impl VenusClient {
         w.handle(buffer_id);
         w.handle(memory_id);
         w.u64(0);
-        self.ring_command_reply(adapter, w.as_slice()?)?;
-
-        let mut r = ReplyReader::new(self.reply_map());
-        let cmd = r.read_i32()?;
-        if cmd as u32 != CMD_BIND_BUFFER_MEMORY || r.read_i32()? != 0 {
-            return Err(VirtioError::DeviceError);
-        }
+        self.ring_command_expect(
+            adapter,
+            w.as_slice()?,
+            ReplyCheck::new(CMD_BIND_BUFFER_MEMORY).refuse_result_undiagnosed(),
+        )?;
         Ok(())
     }
 
@@ -2360,14 +2510,12 @@ impl VenusClient {
         w.u32(0);
         w.u32(0);
         w.count(true);
-        self.ring_command_reply(adapter, w.as_slice()?)?;
-
-        let mut r = ReplyReader::new(self.reply_map());
-        let cmd = r.read_i32()?;
-        if cmd as u32 != CMD_GET_IMAGE_SUBRESOURCE_LAYOUT {
-            diag(0x010A);
-            return Err(VirtioError::DeviceError);
-        }
+        // No VkResult in this reply shape: word 1 is the simple-pointer.
+        let mut r = self.ring_command_expect(
+            adapter,
+            w.as_slice()?,
+            ReplyCheck::new(CMD_GET_IMAGE_SUBRESOURCE_LAYOUT).mismatch(0x010A),
+        )?;
         if r.read_u64()? == 0 {
             diag(0x010B);
             return Err(VirtioError::DeviceError);
@@ -2393,18 +2541,13 @@ impl VenusClient {
         w.count(false); // pAllocator
         w.count(true);
         w.handle(pool_id);
-        self.ring_command_reply(adapter, w.as_slice()?)?;
-
-        let mut r = ReplyReader::new(self.reply_map());
-        let cmd = r.read_i32()?;
-        if cmd as u32 != CMD_CREATE_COMMAND_POOL {
-            diag(0x0112);
-            return Err(VirtioError::DeviceError);
-        }
-        if r.read_i32()? != 0 {
-            diag(0x0113);
-            return Err(VirtioError::DeviceError);
-        }
+        let mut r = self.ring_command_expect(
+            adapter,
+            w.as_slice()?,
+            ReplyCheck::new(CMD_CREATE_COMMAND_POOL)
+                .mismatch(0x0112)
+                .refuse_result(0x0113),
+        )?;
         if r.read_u64()? == 0 {
             diag(0x0114);
             return Err(VirtioError::DeviceError);
@@ -2446,18 +2589,13 @@ impl VenusClient {
         w.u32(1);
         w.u64(1); // pCommandBuffers array_size
         w.handle(command_buffer_id);
-        self.ring_command_reply(adapter, w.as_slice()?)?;
-
-        let mut r = ReplyReader::new(self.reply_map());
-        let cmd = r.read_i32()?;
-        if cmd as u32 != CMD_ALLOCATE_COMMAND_BUFFERS {
-            diag(0x0115);
-            return Err(VirtioError::DeviceError);
-        }
-        if r.read_i32()? != 0 {
-            diag(0x0116);
-            return Err(VirtioError::DeviceError);
-        }
+        let mut r = self.ring_command_expect(
+            adapter,
+            w.as_slice()?,
+            ReplyCheck::new(CMD_ALLOCATE_COMMAND_BUFFERS)
+                .mismatch(0x0115)
+                .refuse_result(0x0116),
+        )?;
         if r.read_u64()? == 0 {
             diag(0x0117);
             return Err(VirtioError::DeviceError);
@@ -2492,18 +2630,13 @@ impl VenusClient {
         w.count(false);
         w.u32(usage_flags);
         w.count(false);
-        self.ring_command_reply(adapter, w.as_slice()?)?;
-
-        let mut r = ReplyReader::new(self.reply_map());
-        let cmd = r.read_i32()?;
-        if cmd as u32 != CMD_BEGIN_COMMAND_BUFFER {
-            diag(0x0118);
-            return Err(VirtioError::DeviceError);
-        }
-        if r.read_i32()? != 0 {
-            diag(0x0119);
-            return Err(VirtioError::DeviceError);
-        }
+        self.ring_command_expect(
+            adapter,
+            w.as_slice()?,
+            ReplyCheck::new(CMD_BEGIN_COMMAND_BUFFER)
+                .mismatch(0x0118)
+                .refuse_result(0x0119),
+        )?;
         Ok(())
     }
 
@@ -2728,18 +2861,13 @@ impl VenusClient {
         let mut w = Writer::new();
         w.header(CMD_END_COMMAND_BUFFER, CMD_FLAG_GENERATE_REPLY);
         w.handle(command_buffer_id);
-        self.ring_command_reply(adapter, w.as_slice()?)?;
-
-        let mut r = ReplyReader::new(self.reply_map());
-        let cmd = r.read_i32()?;
-        if cmd as u32 != CMD_END_COMMAND_BUFFER {
-            diag(0x011A);
-            return Err(VirtioError::DeviceError);
-        }
-        if r.read_i32()? != 0 {
-            diag(0x011B);
-            return Err(VirtioError::DeviceError);
-        }
+        self.ring_command_expect(
+            adapter,
+            w.as_slice()?,
+            ReplyCheck::new(CMD_END_COMMAND_BUFFER)
+                .mismatch(0x011A)
+                .refuse_result(0x011B),
+        )?;
         Ok(())
     }
 
@@ -2755,18 +2883,13 @@ impl VenusClient {
         w.count(false); // pAllocator
         w.count(true);
         w.handle(fence_id);
-        self.ring_command_reply(adapter, w.as_slice()?)?;
-
-        let mut r = ReplyReader::new(self.reply_map());
-        let cmd = r.read_i32()?;
-        if cmd as u32 != CMD_CREATE_FENCE {
-            diag(0x011E);
-            return Err(VirtioError::DeviceError);
-        }
-        if r.read_i32()? != 0 {
-            diag(0x011F);
-            return Err(VirtioError::DeviceError);
-        }
+        let mut r = self.ring_command_expect(
+            adapter,
+            w.as_slice()?,
+            ReplyCheck::new(CMD_CREATE_FENCE)
+                .mismatch(0x011E)
+                .refuse_result(0x011F),
+        )?;
         if r.read_u64()? == 0 {
             diag(0x0120);
             return Err(VirtioError::DeviceError);
@@ -2792,19 +2915,13 @@ impl VenusClient {
         w.handle(fence_id);
         w.u32(1); // waitAll
         w.u64(5_000_000_000); // 5 s
-        self.ring_command_reply(adapter, w.as_slice()?)?;
-
-        let mut r = ReplyReader::new(self.reply_map());
-        let cmd = r.read_i32()?;
-        if cmd as u32 != CMD_WAIT_FOR_FENCES {
-            diag(0x0122);
-            return Err(VirtioError::DeviceError);
-        }
-        let result = r.read_i32()?;
-        if result != 0 {
-            diag(0x0123);
-            return Err(VirtioError::DeviceError);
-        }
+        self.ring_command_expect(
+            adapter,
+            w.as_slice()?,
+            ReplyCheck::new(CMD_WAIT_FOR_FENCES)
+                .mismatch(0x0122)
+                .refuse_result(0x0123),
+        )?;
         Ok(())
     }
 
@@ -2834,13 +2951,15 @@ impl VenusClient {
         submit.u32(0); // submitCount
         submit.count(false); // pSubmits
         submit.handle(fence_id);
-        self.ring_command_reply(adapter, submit.as_slice()?)?;
-
-        let mut r = ReplyReader::new(self.reply_map());
-        if r.read_i32()? as u32 != CMD_QUEUE_SUBMIT || r.read_i32()? != 0 {
-            diag(0x0135);
-            return Err(VirtioError::DeviceError);
-        }
+        // Both arms record the SAME code here, unlike every other site --
+        // preserved verbatim rather than tidied into two.
+        self.ring_command_expect(
+            adapter,
+            submit.as_slice()?,
+            ReplyCheck::new(CMD_QUEUE_SUBMIT)
+                .mismatch(0x0135)
+                .refuse_result(0x0135),
+        )?;
         Ok(())
     }
 
@@ -2868,18 +2987,13 @@ impl VenusClient {
         // VK_NULL_HANDLE when no fence is wanted: `None` is the only way to
         // write a zero here now, and it has to be spelled out.
         submit.u64(fence_id.map_or(0, VkFenceId::get)); // fence
-        self.ring_command_reply(adapter, submit.as_slice()?)?;
-
-        let mut r = ReplyReader::new(self.reply_map());
-        let cmd = r.read_i32()?;
-        if cmd as u32 != CMD_QUEUE_SUBMIT {
-            diag(0x011C);
-            return Err(VirtioError::DeviceError);
-        }
-        if r.read_i32()? != 0 {
-            diag(0x011D);
-            return Err(VirtioError::DeviceError);
-        }
+        self.ring_command_expect(
+            adapter,
+            submit.as_slice()?,
+            ReplyCheck::new(CMD_QUEUE_SUBMIT)
+                .mismatch(0x011C)
+                .refuse_result(0x011D),
+        )?;
 
         Ok(())
     }
@@ -5160,21 +5274,14 @@ impl VenusRing {
             w.count(false); // simple_pointer(pAllocator) NULL
             w.count(true); // simple_pointer(pInstance)
             w.u64(instance_id.get()); // VkInstance handle
-            self.ring_command_reply(adapter, w.as_slice()?)?;
-        }
-        // Reply: [i32 cmd][i32 VkResult][simple_pointer u64][u64 instance]
-        {
-            let mut r = ReplyReader::new(&self.reply_map);
-            let cmd = r.read_i32()?;
-            if cmd as u32 != CMD_CREATE_INSTANCE {
-                diag(0x00E5);
-                return Err(VirtioError::DeviceError);
-            }
-            let result = r.read_i32()?;
-            if result != 0 {
-                diag(0x00E6);
-                return Err(VirtioError::DeviceError);
-            }
+            // Reply: [i32 cmd][i32 VkResult][simple_pointer u64][u64 instance]
+            self.ring_command_expect(
+                adapter,
+                w.as_slice()?,
+                ReplyCheck::new(CMD_CREATE_INSTANCE)
+                    .mismatch(0x00E5)
+                    .refuse_result(0x00E6),
+            )?;
         }
         diag(0x0006);
 
@@ -5187,14 +5294,12 @@ impl VenusRing {
             w.count(true); // simple_pointer(pPhysicalDeviceCount)
             w.u32(0); // *pPhysicalDeviceCount = 0
             w.count(false); // pPhysicalDevices NULL → array_size 0
-            self.ring_command_reply(adapter, w.as_slice()?)?;
             // We don't strictly need the count value; just validate the header.
-            let mut r = ReplyReader::new(&self.reply_map);
-            let cmd = r.read_i32()?;
-            if cmd as u32 != CMD_ENUMERATE_PHYSICAL_DEVICES {
-                diag(0x00E7);
-                return Err(VirtioError::DeviceError);
-            }
+            self.ring_command_expect(
+                adapter,
+                w.as_slice()?,
+                ReplyCheck::new(CMD_ENUMERATE_PHYSICAL_DEVICES).mismatch(0x00E7),
+            )?;
         }
         // Array call: request up to 1 physical device. Physical-device handles
         // are GUEST-assigned like all venus handles (the host rejects a 0
@@ -5208,15 +5313,15 @@ impl VenusRing {
             w.u32(1); // *pPhysicalDeviceCount = 1
             w.count(true); // pPhysicalDevices present → array_size 1 follows
             w.u64(phys_dev_id.get()); // guest-assigned VkPhysicalDevice for slot 0
-            self.ring_command_reply(adapter, w.as_slice()?)?;
-
             // Reply: [i32 cmd][i32 VkResult][sp u64][u32 count][array u64][u64 id×N]
-            let mut r = ReplyReader::new(&self.reply_map);
-            let cmd = r.read_i32()?;
-            if cmd as u32 != CMD_ENUMERATE_PHYSICAL_DEVICES {
-                diag(0x00E8);
-                return Err(VirtioError::DeviceError);
-            }
+            //
+            // The VkResult is DEFERRED to this site, not refused by the helper:
+            // VK_INCOMPLETE is an acceptable answer here.
+            let mut r = self.ring_command_expect(
+                adapter,
+                w.as_slice()?,
+                ReplyCheck::new(CMD_ENUMERATE_PHYSICAL_DEVICES).mismatch(0x00E8),
+            )?;
             let result = r.read_i32()?;
             // VK_INCOMPLETE (5) is acceptable (more devices than we asked for).
             if result != 0 && result != 5 {
@@ -5280,14 +5385,12 @@ impl VenusInstance {
         w.u32(0); // queueIndex
         w.count(true);
         w.u64(queue_id.get());
-        self.ring.ring_command_reply(adapter, w.as_slice()?)?;
-
-        let mut r = ReplyReader::new(&self.ring.reply_map);
-        let cmd = r.read_i32()?;
-        if cmd as u32 != CMD_GET_DEVICE_QUEUE_2 {
-            diag(0x0110);
-            return Err(VirtioError::DeviceError);
-        }
+        // No VkResult in this reply shape: word 1 is the simple-pointer.
+        let mut r = self.ring.ring_command_expect(
+            adapter,
+            w.as_slice()?,
+            ReplyCheck::new(CMD_GET_DEVICE_QUEUE_2).mismatch(0x0110),
+        )?;
         if r.read_u64()? == 0 {
             diag(0x0111);
             return Err(VirtioError::DeviceError);
@@ -5321,17 +5424,14 @@ impl VenusInstance {
                            // partial-encoded struct: array_size(32) then array_size(16).
             w.u64(VK_MAX_MEMORY_TYPES as u64);
             w.u64(VK_MAX_MEMORY_HEAPS as u64);
-            self.ring.ring_command_reply(adapter, w.as_slice()?)?;
-
             // Reply (NO VkResult): [i32 cmd][sp u64][u32 typeCount][array u64]
             //   [ (u32 propertyFlags, u32 heapIndex) × 32 ]
             //   [u32 heapCount][array u64][ (u64 size, u32 flags) × 16 ]
-            let mut r = ReplyReader::new(&self.ring.reply_map);
-            let cmd = r.read_i32()?;
-            if cmd as u32 != CMD_GET_PHYSICAL_DEVICE_MEMORY_PROPERTIES {
-                diag(0x00EE);
-                return Err(VirtioError::DeviceError);
-            }
+            let mut r = self.ring.ring_command_expect(
+                adapter,
+                w.as_slice()?,
+                ReplyCheck::new(CMD_GET_PHYSICAL_DEVICE_MEMORY_PROPERTIES).mismatch(0x00EE),
+            )?;
             let sp = r.read_u64()?;
             if sp == 0 {
                 diag(0x00EF);
@@ -5494,15 +5594,16 @@ impl VenusInstance {
             w.count(false); // simple_pointer(pAllocator) NULL
             w.count(true); // simple_pointer(pDevice)
             w.handle(device_id); // VkDevice handle
-            self.ring.ring_command_reply(adapter, w.as_slice()?)?;
-
             // Reply: [i32 cmd][i32 VkResult][sp u64][u64 device]
-            let mut r = ReplyReader::new(&self.ring.reply_map);
-            let cmd = r.read_i32()?;
-            if cmd as u32 != CMD_CREATE_DEVICE {
-                diag(0x00F2);
-                return Err(VirtioError::DeviceError);
-            }
+            //
+            // The VkResult is DEFERRED to this site, not refused by the helper:
+            // a non-zero result steps the extension ladder down a tier rather
+            // than failing the bring-up.
+            let mut r = self.ring.ring_command_expect(
+                adapter,
+                w.as_slice()?,
+                ReplyCheck::new(CMD_CREATE_DEVICE).mismatch(0x00F2),
+            )?;
             let result = r.read_i32()?;
             if result == 0 {
                 // Which extension tier the device actually got. mode 16 needs
