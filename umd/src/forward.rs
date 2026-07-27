@@ -156,8 +156,74 @@ struct ResourceState {
     /// created to pfnDeallocateCb's HandleList form — deallocating opened
     /// handles that way is what returned 0x80070057 and leaked the runtime's
     /// side of the open.
-    owns_allocation: bool,
+    ownership: AllocationOwnership,
     present_private: HeliosPresentPrivateData,
+}
+
+/// Who owns the WDDM allocation behind a resource.
+///
+/// This used to be an unnamed positional `bool` sitting between `km_resource`
+/// and `rt_resource` in a seven-argument call, and the deallocate form was
+/// reconstructed from `(rt_resource.is_null(), owns_allocation)` at destroy
+/// time. R804.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AllocationOwnership {
+    /// This UMD called `pfnAllocateCb` for it, in `create_resource`.
+    CreatedByUmd,
+    /// The runtime handed us the handle at `open_resource`. Passing these to
+    /// `pfnDeallocateCb`'s HandleList form is what returned 0x80070057 and
+    /// leaked the runtime's side of the open.
+    OpenedByRuntime,
+}
+
+impl AllocationOwnership {
+    /// The value the `owned=` log key has always carried. Kept so the
+    /// `DDI deallocate_resource:` line stays byte-identical across R804.
+    fn owns(self) -> bool {
+        matches!(self, Self::CreatedByUmd)
+    }
+}
+
+/// The one legal shape of a `D3DDDICB_DEALLOCATE` call.
+///
+/// The wire contract is three-way: EITHER `hResource` alone, OR
+/// `NumAllocations`+`HandleList` with `hResource` NULL. Both together is
+/// E_INVALIDARG -- the old 0x80070057, which also leaked opened resources.
+/// Constructing this enum is the only way a `D3DDDICB_DEALLOCATE` is built, so
+/// the both-set combination is unrepresentable rather than merely avoided.
+///
+/// `Nothing` must still exist: it is the (currently unreachable) case of no
+/// runtime resource and an allocation we did not create. The guarantee is that
+/// it is named and logged, not that it is gone.
+enum DeallocateForm {
+    ByResource(ddi::HANDLE),
+    ByHandleList(core::num::NonZeroU32),
+    Nothing { reason: &'static str },
+}
+
+impl DeallocateForm {
+    /// The single exhaustive decision. Order matters and is the pre-R804
+    /// behaviour exactly: a runtime resource handle wins over ownership,
+    /// because the runtime then releases every allocation it tracks for the
+    /// resource -- created AND opened instances.
+    fn select(
+        rt_resource: ddi::HANDLE,
+        ownership: AllocationOwnership,
+        allocation: ddi::D3DKMT_HANDLE,
+    ) -> Self {
+        if !rt_resource.is_null() {
+            return Self::ByResource(rt_resource);
+        }
+        match (ownership, core::num::NonZeroU32::new(allocation)) {
+            (AllocationOwnership::CreatedByUmd, Some(a)) => Self::ByHandleList(a),
+            (AllocationOwnership::CreatedByUmd, None) => Self::Nothing {
+                reason: "owner but no allocation handle",
+            },
+            (AllocationOwnership::OpenedByRuntime, _) => Self::Nothing {
+                reason: "not owner",
+            },
+        }
+    }
 }
 
 type EvictCallback = unsafe extern "C" fn(ddi::HANDLE, *mut ddi::D3DDDICB_EVICT) -> ddi::HRESULT;
@@ -703,7 +769,7 @@ unsafe fn store_resource(
     allocation: Option<ResidentAllocation>,
     km_resource: ddi::D3DKMT_HANDLE,
     rt_resource: ddi::HANDLE,
-    owns_allocation: bool,
+    ownership: AllocationOwnership,
     present_private: HeliosPresentPrivateData,
 ) {
     let Some(slot) = Slot::<Boxed<ResourceState>>::from_priv(handle_priv) else {
@@ -715,7 +781,7 @@ unsafe fn store_resource(
         allocation,
         km_resource,
         rt_resource,
-        owns_allocation,
+        ownership,
         present_private,
     });
 }
@@ -1370,35 +1436,47 @@ unsafe fn release_resource(h: Hdevice, handle_priv: *mut c_void) {
                         // together is E_INVALIDARG (the old 0x80070057, which
                         // also leaked opened resources).
                         let mut allocation = allocation;
-                        let mut dealloc = if !(*state).rt_resource.is_null() {
-                            ddi::D3DDDICB_DEALLOCATE {
-                                hResource: (*state).rt_resource,
+                        // One exhaustive decision, then one construction. The
+                        // hResource-and-HandleList-together shape the runtime
+                        // rejects cannot be built from any DeallocateForm.
+                        let form = DeallocateForm::select(
+                            (*state).rt_resource,
+                            (*state).ownership,
+                            allocation,
+                        );
+                        let mut dealloc = match form {
+                            DeallocateForm::ByResource(h_resource) => ddi::D3DDDICB_DEALLOCATE {
+                                hResource: h_resource,
                                 NumAllocations: 0,
                                 HandleList: core::ptr::null_mut(),
+                            },
+                            DeallocateForm::ByHandleList(handle) => {
+                                // Take the handle from the form, not from the
+                                // surrounding local: the form is what validated
+                                // it as non-zero, and `HandleList` must point at
+                                // exactly that value.
+                                allocation = handle.get();
+                                ddi::D3DDDICB_DEALLOCATE {
+                                    hResource: core::ptr::null_mut(),
+                                    NumAllocations: 1,
+                                    HandleList: &mut allocation,
+                                }
                             }
-                        } else if (*state).owns_allocation {
-                            // Standalone allocation this UMD created itself.
-                            ddi::D3DDDICB_DEALLOCATE {
-                                hResource: core::ptr::null_mut(),
-                                NumAllocations: 1,
-                                HandleList: &mut allocation,
-                            }
-                        } else {
-                            // An allocation handle we did not create and no
-                            // runtime resource to hand back: nothing we may
-                            // legally deallocate.
-                            log_error!(
-                                "DDI deallocate_resource skip: not owner alloc=0x{:x} km=0x{:x}",
-                                allocation,
-                                (*state).km_resource
-                            );
-                            ddi::D3DDDICB_DEALLOCATE {
-                                hResource: core::ptr::null_mut(),
-                                NumAllocations: 0,
-                                HandleList: core::ptr::null_mut(),
+                            DeallocateForm::Nothing { reason } => {
+                                log_error!(
+                                    "DDI deallocate_resource skip: {} alloc=0x{:x} km=0x{:x}",
+                                    reason,
+                                    allocation,
+                                    (*state).km_resource
+                                );
+                                ddi::D3DDDICB_DEALLOCATE {
+                                    hResource: core::ptr::null_mut(),
+                                    NumAllocations: 0,
+                                    HandleList: core::ptr::null_mut(),
+                                }
                             }
                         };
-                        if !dealloc.hResource.is_null() || dealloc.NumAllocations != 0 {
+                        if !matches!(form, DeallocateForm::Nothing { .. }) {
                             let hr = deallocate_cb(dev.h_rt_device, &mut dealloc);
                             trace_line!(
                                 "DDI deallocate_resource: hr=0x{:08x} alloc=0x{:x} km=0x{:x} rt={:p} owned={}",
@@ -1406,7 +1484,7 @@ unsafe fn release_resource(h: Hdevice, handle_priv: *mut c_void) {
                                 allocation,
                                 (*state).km_resource,
                                 (*state).rt_resource,
-                                (*state).owns_allocation
+                                (*state).ownership.owns()
                             );
                         }
                     }
@@ -2110,7 +2188,7 @@ unsafe fn finish_wddm_tex2d(
         allocation,
         km_resource,
         h_rt.handle,
-        true, // allocated via pfnAllocateCb above
+        AllocationOwnership::CreatedByUmd, // via pfnAllocateCb above
         present_private,
     );
     if present_private.is_valid() {
@@ -2332,7 +2410,7 @@ unsafe extern "C" fn create_resource(
                     allocation,
                     km_resource,
                     h_rt.handle,
-                    true, // allocated via pfnAllocateCb above
+                    AllocationOwnership::CreatedByUmd, // via pfnAllocateCb above
                     empty_present_private(),
                 );
             });
@@ -2601,7 +2679,7 @@ unsafe extern "C" fn create_resource(
                     allocation,
                     km_resource,
                     h_rt.handle,
-                    true,
+                    AllocationOwnership::CreatedByUmd,
                     empty_present_private(),
                 );
             });
@@ -2688,7 +2766,7 @@ unsafe extern "C" fn create_resource(
                     allocation,
                     km_resource,
                     h_rt.handle,
-                    true,
+                    AllocationOwnership::CreatedByUmd,
                     empty_present_private(),
                 );
             });
@@ -2939,7 +3017,7 @@ unsafe extern "C" fn open_resource(
         Some(resident),
         a.hKMResource.handle,
         h_rt.handle,
-        false, // opened: runtime owns these allocation handles
+        AllocationOwnership::OpenedByRuntime,
         empty_present_private(),
     );
 }
@@ -10361,7 +10439,12 @@ unsafe fn rotate_ring(
     // Rotate the WDDM identity records in lockstep with the storages.
     let first_allocation = (*first).allocation.take();
     let first_km_resource = (*first).km_resource;
-    let first_owns_allocation = (*first).owns_allocation;
+    // `ownership` rotates with the allocation it describes; `rt_resource`
+    // deliberately does NOT rotate and is not touched here. That asymmetry is
+    // why R804 keeps the discriminant a separate field rather than bundling the
+    // runtime handle into the ownership enum -- a variant carrying the handle
+    // would change what RotateResourceIdentities moves.
+    let first_ownership = (*first).ownership;
     let first_present_private = (*first).present_private;
     for pair in states.windows(2) {
         let (Some(&cur), Some(&next)) = (pair.first(), pair.get(1)) else {
@@ -10369,7 +10452,7 @@ unsafe fn rotate_ring(
         };
         (*cur).allocation = (*next).allocation.take();
         (*cur).km_resource = (*next).km_resource;
-        (*cur).owns_allocation = (*next).owns_allocation;
+        (*cur).ownership = (*next).ownership;
         // Present private data identifies the backing allocation (Venus
         // resource id, layout and extent), not the stable D3D resource object.
         // DXGI rotates that backing identity together with the allocation and
@@ -10379,7 +10462,7 @@ unsafe fn rotate_ring(
     }
     (*last).allocation = first_allocation;
     (*last).km_resource = first_km_resource;
-    (*last).owns_allocation = first_owns_allocation;
+    (*last).ownership = first_ownership;
     (*last).present_private = first_present_private;
 
     RotationOutcome::Rotated
