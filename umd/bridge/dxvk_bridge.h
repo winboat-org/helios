@@ -117,53 +117,6 @@ struct HeliosDxvkDevice {
   // frame completed within the timeout, false on timeout/error.
   bool present_frame_gate(std::uint32_t timeout_us) const;
 
-  // WS1 #4 producer: lazily create the device-wide NAMED present fence
-  // (Global\HeliosPresentFence_<pid>, permissive DACL — the IddCx consumer
-  // runs as another principal), record a signal of value = ++present counter
-  // on the frame's OPEN command list (rides the caller's following Flush;
-  // the ICD retires it at host GPU completion), and publish
-  // (resid -> pid, value) for the presented src/dst resources in the shared
-  // present-sync table. NO wait happens on the present thread.
-  // Returns the published value, or 0 when unavailable (no venus resid on
-  // the resources, table unavailable, or named-fence creation failed —
-  // failure disables the path loudly and permanently for this device, and
-  // the caller keeps using the bounded present gate instead).
-  // kwait_ordered advertises (slot fenceId bit 30) that this present's flip
-  // is kernel-held until the published value retires — consumers may then
-  // skip a staged re-stage of an unretired value instead of blocking (the
-  // dwm 9 ms composition stalls). Only set it for presents whose flip WILL
-  // queue the dxgkrnl GPU-side wait.
-  std::uint64_t present_sync_publish(
-      std::size_t src_resource_ptr,
-      std::size_t dst_resource_ptr,
-      bool kwait_ordered) const;
-
-  // Name discriminator of this device's WS1 #4 named present fence
-  // (Global\HeliosPresentFence_<pid>_<id>), 0 until the first successful
-  // present_sync_publish created it (or when the path is disabled). The
-  // dcomp-vehicle recycle gate pairs it with publish's returned value so
-  // the ICD can import the fence by name and gate image reuse at acquire.
-  std::uint32_t present_sync_fence_id() const noexcept;
-
-  // Kernel flip-wait plumbing (25th session): the UMD created a monitored
-  // fence on the RUNTIME's kernel device (the only device scope the present
-  // context's queued GPU waits accept) and hands over the runtime's
-  // pfnSignalSynchronizationObjectFromCpuCb (raw fn address), the runtime
-  // device handle, the fence handle, and its CPU value VA. The bridge owns
-  // the signal side: present_flip_wait_arm enqueues "CPU-signal the flip
-  // fence to flip_value when the present fence reaches target_value" on the
-  // fence-waiter thread, and a watchdog thread unwedges a stalled chain by
-  // signaling the flip fence forward (bounded failure = today's stale-frame
-  // semantics, never a forever-parked present context).
-  bool present_flip_wait_setup(
-      std::size_t signal_cb,
-      std::size_t h_rt_device,
-      std::uint32_t h_fence,
-      std::size_t fence_cpu_va) const noexcept;
-  bool present_flip_wait_arm(
-      std::uint64_t target_value,
-      std::uint64_t flip_value) const;
-
   // Dcomp present vehicle (road 4 unit 2): record an image-level copy of the
   // imported ICD frame (src) into the vehicle backbuffer texture (dst) on
   // the open command list. Sources the import's LIVE storage (the

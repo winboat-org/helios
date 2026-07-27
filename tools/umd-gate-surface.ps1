@@ -9,18 +9,17 @@
   `C:\ProgramData\Helios\umd-<pid>.log`. This reads them the same way, so a
   tranche gate checks both halves without doing the UMD half by hand.
 
-  Two shapes of counter live here and they are read differently:
+  Every counter here is FIRST-HIT-ONLY: it logs once (or for the first N hits)
+  when it fires and is silent otherwise, so ABSENCE IS THE ZERO READING.
+  Present = failure. This is why the script reports "clean" for a missing line
+  rather than "unknown".
 
-    * SUMMARISED -- the four scan-out counters are printed as a
-      `direct_over_linear= downres_kept= zero_extent= zero_pitch=` group on
-      every scan-out decision, so the LAST occurrence is the current value.
-      Absence of the group means no scan-out target was ever established in
-      this process, which is itself a finding for dwm.
-
-    * FIRST-HIT-ONLY -- the rest log once (or for the first N hits) when they
-      fire and are silent otherwise, so ABSENCE IS THE ZERO READING. Present =
-      failure. This is why the script reports "clean" for a missing line rather
-      than "unknown".
+  T6 removed the summarised half. The
+  `direct_over_linear= downres_kept= zero_extent= zero_pitch=` group came from
+  `scanout_counter_summary()`, which went with R910's deletion of the UMD LINEAR
+  scan-out copy -- three of those four counters described a path that no longer
+  exists. `zero_pitch` survives and reports itself inline on the
+  `SCAN-OUT PRIMARY ZERO PITCH` line, which is already in the list below.
 
   Reads dwm's log by default, since that is the process whose UMD behaviour the
   desktop depends on. `-AllProcesses` widens it to every UMD log written since
@@ -47,19 +46,10 @@ param(
         # T5 counter, but it is the one failure that turns the desktop black,
         # so a gate that reads this log should not walk past it.
         'SCAN-OUT PRIMARY CREATE FAILED',
-        # R809 -- a scan-out target with a zero width or height.
-        'scanout target refused: zero extent',
-        'scanout import refused: zero extent',
         # R801 -- an adapter handle that is not the token we handed out.
         'adapter handle not ours',
         # R812 -- we create no deferred contexts, so this must never be called.
         'CheckDeferredContextHandleSizes called',
-        # R817 -- flip-wait setup called with parameters differing from the
-        # armed ctx (dxvk_bridge.cpp). Unreachable until a device reset with a
-        # new monitored fence; if it appears, that path is now live.
-        'flip-kwait setup REFUSED',
-        # R826 -- present-sync publish found no free slot.
-        'NO SLOT published',
         # Generic UMD fault vocabulary that should not appear on a healthy
         # session. `present_frame_gate DxvkError` is the C++ gate's own catch.
         'present_frame_gate DxvkError',
@@ -128,22 +118,23 @@ foreach ($f in $logs) {
 }
 
 Write-Host ""
-Write-Host "--- scan-out counters (last value in the CURRENT session) ---"
-$sawGroup = $false
+Write-Host "--- direct-scanout registry (bounded-growth check) ---"
+Write-Host "    (the exact-primary identity path; the LINEAR import went with T6/R910)"
 foreach ($name in $sessions.Keys) {
-    $hit = $sessions[$name] | Where-Object { $_ -match 'direct_over_linear=' } | Select-Object -Last 1
-    if ($hit) {
-        $sawGroup = $true
-        if ($hit -match '(direct_over_linear=\S+\s+downres_kept=\S+\s+zero_extent=\S+\s+zero_pitch=\S+)') {
-            Write-Host ("  {0,-20} {1}" -f $name, $matches[1])
-        } else {
-            Write-Host ("  {0,-20} {1}" -f $name, $hit)
-        }
-    }
+    $hit = $sessions[$name] | Where-Object { $_ -match 'DDI scanout registry:' } | Select-Object -Last 1
+    if ($hit) { Write-Host ("  {0,-20} {1}" -f $name, $hit.Trim()) }
+    else      { Write-Host ("  {0,-20} <no entry dropped this session>" -f $name) }
 }
-if (-not $sawGroup) {
-    Write-Host "  <no scan-out decision recorded in scope>"
-    Write-Host "  NOTE: for dwm this means no scan-out target was established this session."
+
+Write-Host ""
+Write-Host "--- vehicle present (R912a: the kwait producer is retired) ---"
+Write-Host "    (get_present_result is a stub returning -1; the ICD's serial"
+Write-Host "     wait_last_present is the recycle gate. One line per process.)"
+foreach ($name in $sessions.Keys) {
+    $v = $sessions[$name] | Where-Object { $_ -match 'vehicle present #' } | Select-Object -Last 1
+    if ($v) { Write-Host ("  {0,-20} {1}" -f $name, $v.Trim()) }
+    $r = $sessions[$name] | Where-Object { $_ -match 'get_present_result: retired stub' } | Select-Object -Last 1
+    if ($r) { Write-Host ("  {0,-20} {1}" -f '', $r.Trim()) }
 }
 
 Write-Host ""

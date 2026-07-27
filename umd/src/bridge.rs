@@ -5,15 +5,16 @@
 //! the wrong places. Three pointer-laundering entry points were SAFE
 //! (`set_resource_kmt_handles`, `transfer_resource_ownership`,
 //! `open_ddi_texture2d`) while three that take only scalars and cannot violate
-//! memory safety were `unsafe fn` (`present_frame_gate`,
-//! `present_sync_fence_id`, `present_flip_wait_arm`).
+//! memory safety were `unsafe fn` (`present_frame_gate`, and
+//! `present_sync_fence_id` / `present_flip_wait_arm`, both retired with the
+//! kwait subsystem in T6/R912a).
 //!
 //! Scope limit worth stating, because it changes the finding's shape: cxx
 //! REQUIRES `unsafe fn` for any signature containing a raw pointer, and every
 //! raw-pointer declaration in this block already is. Those are correct and are
-//! not touched. `present_sync_publish` and `present_vehicle_copy` take `usize`
-//! COM pointers AND are already unsafe, which is the correct end state; they
-//! are left alone too.
+//! not touched. `present_vehicle_copy` takes `usize` COM pointers AND is
+//! already unsafe, which is the correct end state; it is left alone too
+//! (`present_sync_publish` was its twin until R912a retired it).
 
 //! cxx bridge to DXVK's C++ engine.
 //!
@@ -153,52 +154,6 @@ mod ffi {
         /// IddCx consumer never copies a buffer whose writes are in flight.
         /// Returns false on timeout (caller proceeds — bounded by design).
         fn present_frame_gate(self: &HeliosDxvkDevice, timeout_us: u32) -> bool;
-        /// WS1 #4 producer: record a named-present-fence signal on the
-        /// frame's open command list (submits with the caller's following
-        /// Flush; retires at host GPU completion) and publish
-        /// (resid -> pid, value) for the presented resources. NO wait on the
-        /// present thread. Returns the published value, or 0 when the path
-        /// is unavailable (caller keeps relying on the present gate).
-        /// `kwait_ordered` advertises in the slot (fenceId bit 30) that this
-        /// present's flip is kernel-held until the value retires, so staged
-        /// consumers may skip an unretired re-stage instead of blocking.
-        unsafe fn present_sync_publish(
-            self: &HeliosDxvkDevice,
-            src_resource_ptr: usize,
-            dst_resource_ptr: usize,
-            kwait_ordered: bool,
-        ) -> u64;
-        /// Name discriminator of this device's named present fence; 0 until
-        /// the first successful publish created it (or path disabled). Pairs
-        /// with publish's value for the vehicle acquire-side recycle gate.
-        fn present_sync_fence_id(self: &HeliosDxvkDevice) -> u32;
-        /// Kernel flip-wait plumbing (25th session): hand the bridge the
-        /// runtime's pfnSignalSynchronizationObjectFromCpuCb (as a raw fn
-        /// address), the runtime device handle, the runtime-device monitored
-        /// fence to signal, and its CPU value VA. The bridge owns the signal
-        /// path (present-fence enqueueWait callbacks) and a wedge watchdog
-        /// (CPU-signals the fence forward when the copy chain stalls, so a
-        /// poisoned fence degrades to today's stale-frame semantics instead
-        /// of parking the present context forever). Returns false when the
-        /// producer fence path is disabled (caller keeps the CPU gate).
-        unsafe fn present_flip_wait_setup(
-            self: &HeliosDxvkDevice,
-            signal_cb: usize,
-            h_rt_device: usize,
-            h_fence: u32,
-            fence_cpu_va: usize,
-        ) -> bool;
-        /// Arm one present's kernel flip wait: when this device's present
-        /// fence reaches `target_value` (the copy's completion, signaled by
-        /// the ICD retire thread), CPU-signal the flip fence to
-        /// `flip_value`. Enqueue-only — never waits. Returns false when the
-        /// present fence is unavailable (caller falls back to the CPU gate
-        /// for this present and must NOT queue the GPU wait).
-        fn present_flip_wait_arm(
-            self: &HeliosDxvkDevice,
-            target_value: u64,
-            flip_value: u64,
-        ) -> bool;
         /// Dcomp present vehicle: image-level copy of the imported ICD frame
         /// (src) into the vehicle backbuffer texture (dst), sourcing the
         /// import's LIVE storage (staging alias when present). The copy-time
@@ -397,12 +352,10 @@ impl ffi::HeliosDxvkDevice {
 
 /// A **source** resource pointer for the present path.
 ///
-/// `present_sync_publish(src, dst)` and `present_vehicle_copy(dst, src)` take
-/// the same two COM pointers in OPPOSITE order, are called ~30 lines apart in
-/// the same function, and a transposition compiles cleanly on both sides of the
-/// FFI. Blast radius is asymmetric: transposing publish where dst is 0 is
-/// benign, but at the two two-non-zero-pointer sites it advertises the wrong
-/// resid to the shared present-sync table, and transposing
+/// `present_vehicle_copy(dst, src)` took the same two COM pointers in the
+/// OPPOSITE order to the neighbouring `present_sync_publish(src, dst)` (retired
+/// in R912a), they were called ~30 lines apart in the same function, and a
+/// transposition compiled cleanly on both sides of the FFI. Transposing
 /// `present_vehicle_copy` is ALWAYS harmful -- the bridge copies the vehicle
 /// backbuffer INTO the imported ICD frame, the geometry check passes because
 /// both are the same size, `EXT_GEOM_MISMATCH` never fires, and the flipped
@@ -509,15 +462,6 @@ impl BridgeDevice {
         self.get().is_some_and(|d| d.present_frame_gate(timeout_us))
     }
 
-    pub(crate) fn present_sync_fence_id(&self) -> u32 {
-        self.get().map_or(0, |d| d.present_sync_fence_id())
-    }
-
-    pub(crate) fn present_flip_wait_arm(&self, target_value: u64, flip_value: u64) -> bool {
-        self.get()
-            .is_some_and(|d| d.present_flip_wait_arm(target_value, flip_value))
-    }
-
     // -- pointer-laundering passthroughs -----------------------------------
     //
     // `unsafe` for the reason R814 established: each hands the bridge a raw
@@ -583,21 +527,6 @@ impl BridgeDevice {
     }
 
     /// # Safety
-    /// Both pointers must be live `ID3D11Resource*` or 0.
-    pub(crate) unsafe fn present_sync_publish(
-        &self,
-        src: SrcRes,
-        dst: DstRes,
-        kwait_ordered: bool,
-    ) -> u64 {
-        // The C++ order is (src, dst) and is NOT reordered here -- R816 says to
-        // pick one change, and the types are the one that makes ordering
-        // unrepresentable rather than merely documented.
-        self.get()
-            .map_or(0, |d| unsafe { d.present_sync_publish(src.0, dst.0, kwait_ordered) })
-    }
-
-    /// # Safety
     /// Both pointers must be live `ID3D11Resource*`.
     pub(crate) unsafe fn present_vehicle_copy(&self, dst: DstRes, src: SrcRes) -> i32 {
         // C++ order here is (dst, src) -- the opposite of publish above, which
@@ -605,21 +534,6 @@ impl BridgeDevice {
         // have to agree for the call to be correct.
         self.get()
             .map_or(-1, |d| unsafe { d.present_vehicle_copy(dst.0, src.0) })
-    }
-
-    /// # Safety
-    /// `signal_cb` must be a valid `PFND3DDDI_SIGNALSYNCHRONIZATIONOBJECTFROMCPUCB`,
-    /// and `h_rt_device` / `fence_cpu_va` must outlive the device.
-    pub(crate) unsafe fn present_flip_wait_setup(
-        &self,
-        signal_cb: usize,
-        h_rt_device: usize,
-        h_fence: u32,
-        fence_cpu_va: usize,
-    ) -> bool {
-        self.get().is_some_and(|d| unsafe {
-            d.present_flip_wait_setup(signal_cb, h_rt_device, h_fence, fence_cpu_va)
-        })
     }
 
     // -- shader creates ----------------------------------------------------

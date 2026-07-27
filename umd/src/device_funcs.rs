@@ -230,22 +230,6 @@ pub struct HeliosDevice {
     /// DDIs can report failures to the runtime instead of leaving null handles.
     pub h_rt_core_layer: *mut core::ffi::c_void,
     pub um_callbacks: *const core::ffi::c_void,
-    /// Kernel-enforced vehicle flip ordering (forward.rs::flip_wait_setup).
-    ///
-    /// `Some` is a proof token: holding one is compile-time evidence that all
-    /// three runtime callbacks resolved and the monitored fence exists. It
-    /// replaces a `u8` sentinel (0 = unprobed, 1 = ready, 2 = disabled) whose
-    /// meaning was documented in another file, plus a separate
-    /// `flip_wait_fence` Cell that `state == 1` implicitly asserted was
-    /// non-zero. R810.
-    pub flip_wait: core::cell::Cell<Option<crate::forward::FlipWaitReady>>,
-    /// Latched once the path is refused for this device, so a failed probe is
-    /// not retried on every present. Separate from `flip_wait` because
-    /// "disabled" is not a degenerate token, it is the absence of one plus a
-    /// decision never to look again.
-    pub flip_wait_disabled: core::cell::Cell<bool>,
-    /// Last flip value queued as a GPU wait (monotonic per device).
-    pub flip_wait_next_value: core::cell::Cell<u64>,
 }
 
 /// Deferred input-assembler binding state (see [`HeliosDevice::ia`]).

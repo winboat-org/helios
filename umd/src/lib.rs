@@ -211,23 +211,34 @@ pub extern "system" fn helios_umd_wait_last_present(timeout_us: u32) -> i32 {
     forward::wait_last_present(timeout_us)
 }
 
-/// Companion export: take the last MINTED vehicle present's recycle-gate
-/// identity — the vehicle device's named present fence
-/// (Global\HeliosPresentFence_<pid>_<fence_id>) and the value its frame-copy
-/// signal retires at (host GPU completion). Same-thread contract as the
-/// pair above; consuming. The ICD imports the fence by name once per chain
-/// and gates frame-image reuse on (fence, value) at ACQUIRE — replacing the
-/// worker-serial wait_last_present. Returns 0 = taken, -1 = none pending
-/// (failed present / publish unavailable / contract violation, counted) —
-/// the caller must fall back to helios_umd_wait_last_present.
+/// Companion export: RETIRED STUB, and it must keep existing.
+///
+/// R912(a) retired the kwait subsystem, so there is no present result to hand
+/// back and this always returns -1 -- the ICD then falls back to
+/// `helios_umd_wait_last_present`, which is what it already did on every frame
+/// (measured: `kwait_armed = 0`, misses == presents, ROADMAP 7g(d)).
+///
+/// ⚠ DO NOT DELETE THE EXPORT.
+/// `icd/mesa/src/vulkan/wsi/wsi_common_win32.cpp:876-886` resolves all three
+/// `helios_umd_*` exports BY NAME and fails the entire dcomp vehicle path with
+/// `E_NOINTERFACE` (incrementing `helios_vehicle_export_miss`) if any one is
+/// missing. A UMD-only deploy that drops it kills the vehicle.
+///
+/// Logged ONCE per process rather than counted per call: returning -1 is now
+/// the designed steady state, so a per-call counter would be measuring normal
+/// operation. What is still worth seeing is that the ICD is asking at all.
 #[no_mangle]
 pub extern "system" fn helios_umd_get_present_result(fence_id: *mut u32, value: *mut u64) -> i32 {
-    if fence_id.is_null() || value.is_null() {
-        return -1;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static ANNOUNCED: AtomicBool = AtomicBool::new(false);
+    if !ANNOUNCED.swap(true, Ordering::Relaxed) {
+        log_error!(
+            "get_present_result: retired stub (R912a) -- always -1; the ICD's \
+             serial wait_last_present is the recycle gate"
+        );
     }
-    // SAFETY: null-checked above; the ICD caller owns both out-params for
-    // the duration of the call (same-thread, synchronous contract).
-    unsafe { forward::take_present_result(&mut *fence_id, &mut *value) }
+    let _ = (fence_id, value);
+    -1
 }
 
 #[no_mangle]
@@ -482,9 +493,6 @@ unsafe extern "C" fn create_device(
                 direct_scanout_allocations: core::cell::RefCell::new(Vec::new()),
                 h_rt_core_layer: create.hRTCoreLayer.handle,
                 um_callbacks: p_um_callbacks.cast(),
-                flip_wait: core::cell::Cell::new(None),
-                flip_wait_disabled: core::cell::Cell::new(false),
-                flip_wait_next_value: core::cell::Cell::new(0),
             },
         );
     }
@@ -1054,100 +1062,6 @@ pub(crate) fn vehicle_flip_gate_us() -> u32 {
         } else {
             DEFAULT_US
         }
-    })
-}
-
-/// Kernel-enforced vehicle flip ordering:
-/// `HKLM\SOFTWARE\Helios!VehicleKernelFlipWait` (REG_DWORD). Read once per
-/// process. **Absent = 1 (ON — default flipped 28th session)**: vehicle
-/// presents queue a dxgkrnl GPU-side wait on the copy's completion (a
-/// runtime-device monitored fence CPU-signaled when the present fence
-/// reaches the copy's value) AHEAD of the present packet — the flip
-/// physically cannot execute before the venus copy lands, closing the
-/// bounded CPU gate's timeout leak AND retiring the worker-serial flip
-/// gate (5.6 ms/present measured under Doom). =0 = kill switch (bounded
-/// CPU gate serves instead). It also underwrites the consumers'
-/// skip-if-unretired refresh (the kwait bit in the present-sync slot).
-/// History: the first integration (2026-07-07) wedged the guest — root
-/// cause was HardwareAccess=1 escapes convoying dxgkrnl's core resource
-/// against the kwait-parked queue, killed in the 26th session (escapes
-/// HardwareAccess=0 + exported-sem fold + signalTo monotonicity guard);
-/// since then 24k probe + 6k Doom + 4.6k vkcube presents, zero
-/// wedges/arm fails.
-pub(crate) fn vehicle_kernel_flip_wait() -> bool {
-    use std::sync::OnceLock;
-    static VALUE: OnceLock<bool> = OnceLock::new();
-    *VALUE.get_or_init(|| {
-        #[link(name = "advapi32")]
-        unsafe extern "system" {
-            fn RegGetValueA(
-                hkey: usize,
-                sub_key: *const u8,
-                value: *const u8,
-                flags: u32,
-                type_out: *mut u32,
-                data: *mut c_void,
-                data_len: *mut u32,
-            ) -> i32;
-        }
-        const HKEY_LOCAL_MACHINE: usize = 0x8000_0002;
-        const RRF_RT_REG_DWORD: u32 = 0x10;
-        let mut value: u32 = 0;
-        let mut len: u32 = 4;
-        // SAFETY: NUL-terminated key/value names; `value`/`len` outlive the call.
-        let rc = unsafe {
-            RegGetValueA(
-                HKEY_LOCAL_MACHINE,
-                c"SOFTWARE\\Helios".as_ptr().cast(),
-                c"VehicleKernelFlipWait".as_ptr().cast(),
-                RRF_RT_REG_DWORD,
-                core::ptr::null_mut(),
-                (&mut value as *mut u32).cast(),
-                &mut len,
-            )
-        };
-        // Absent/unreadable = ON; an explicit 0 is the kill switch.
-        rc != 0 || value != 0
-    })
-}
-
-/// Legacy IddCx producer switch: `HKLM\SOFTWARE\Helios!PresentSyncPublish`
-/// (REG_DWORD). Read once per process. Absent = 0 because the real Helios
-/// display adapter has no cross-process IDD consumer. Enabling it creates a
-/// Win32 external semaphore and an extra D3DKMTEscape on every frame.
-pub(crate) fn present_sync_publish_enabled() -> bool {
-    use std::sync::OnceLock;
-    static VALUE: OnceLock<bool> = OnceLock::new();
-    *VALUE.get_or_init(|| {
-        #[link(name = "advapi32")]
-        unsafe extern "system" {
-            fn RegGetValueA(
-                hkey: usize,
-                sub_key: *const u8,
-                value: *const u8,
-                flags: u32,
-                type_out: *mut u32,
-                data: *mut c_void,
-                data_len: *mut u32,
-            ) -> i32;
-        }
-        const HKEY_LOCAL_MACHINE: usize = 0x8000_0002;
-        const RRF_RT_REG_DWORD: u32 = 0x10;
-        let mut value: u32 = 0;
-        let mut len: u32 = 4;
-        // SAFETY: NUL-terminated key/value names; `value`/`len` outlive the call.
-        let rc = unsafe {
-            RegGetValueA(
-                HKEY_LOCAL_MACHINE,
-                c"SOFTWARE\\Helios".as_ptr().cast(),
-                c"PresentSyncPublish".as_ptr().cast(),
-                RRF_RT_REG_DWORD,
-                core::ptr::null_mut(),
-                (&mut value as *mut u32).cast(),
-                &mut len,
-            )
-        };
-        rc == 0 && value != 0
     })
 }
 
