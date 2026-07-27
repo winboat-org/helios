@@ -1315,6 +1315,153 @@ impl ReplyCheck {
     }
 }
 
+
+/// Which side of a transfer an EXTERNAL ownership transition serves.
+///
+/// R1003. The acquire and release argument lists differed by transposing two
+/// pairs of adjacent `u32`s, so both spellings compiled and type-checked and
+/// the wrong one is a host-side queue-family ownership violation rather than an
+/// error. This is the only thing that actually varies between them.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TransferAccess {
+    Read,
+    Write,
+}
+
+impl TransferAccess {
+    const fn mask(self) -> u32 {
+        match self {
+            TransferAccess::Read => ACCESS_TRANSFER_READ,
+            TransferAccess::Write => ACCESS_TRANSFER_WRITE,
+        }
+    }
+}
+
+/// One `VkImageMemoryBarrier`, by field name rather than by position.
+struct ImageBarrier {
+    image: VkImageId,
+    src_stage: u32,
+    dst_stage: u32,
+    src_access: u32,
+    dst_access: u32,
+    old_layout: u32,
+    new_layout: u32,
+    src_queue_family: u32,
+    dst_queue_family: u32,
+}
+
+impl ImageBarrier {
+    /// Take ownership of an image FROM the external (host/DXVK) queue family,
+    /// at the top of the pipe, for a transfer read or write.
+    const fn acquire_from_external(image: VkImageId, access: TransferAccess) -> Self {
+        Self {
+            image,
+            src_stage: PIPELINE_STAGE_TOP_OF_PIPE,
+            dst_stage: PIPELINE_STAGE_TRANSFER,
+            src_access: 0,
+            dst_access: access.mask(),
+            old_layout: IMAGE_LAYOUT_GENERAL,
+            new_layout: IMAGE_LAYOUT_GENERAL,
+            src_queue_family: QUEUE_FAMILY_EXTERNAL,
+            dst_queue_family: 0,
+        }
+    }
+
+    /// Hand ownership back TO the external queue family at the bottom of the
+    /// pipe, after a transfer read or write. The exact mirror of
+    /// [`Self::acquire_from_external`]: stages, accesses and queue families all
+    /// swap, which is why writing it out by hand at ten sites was the hazard.
+    const fn release_to_external(image: VkImageId, access: TransferAccess) -> Self {
+        Self {
+            image,
+            src_stage: PIPELINE_STAGE_TRANSFER,
+            dst_stage: PIPELINE_STAGE_BOTTOM_OF_PIPE,
+            src_access: access.mask(),
+            dst_access: 0,
+            old_layout: IMAGE_LAYOUT_GENERAL,
+            new_layout: IMAGE_LAYOUT_GENERAL,
+            src_queue_family: 0,
+            dst_queue_family: QUEUE_FAMILY_EXTERNAL,
+        }
+    }
+
+    /// A transfer-to-transfer transition with NO ownership change, for the
+    /// scratch conversion image. `QUEUE_FAMILY_IGNORED` on both sides.
+    const fn internal(image: VkImageId, src_access: u32, dst_access: u32) -> Self {
+        Self {
+            image,
+            src_stage: PIPELINE_STAGE_TRANSFER,
+            dst_stage: PIPELINE_STAGE_TRANSFER,
+            src_access,
+            dst_access,
+            old_layout: IMAGE_LAYOUT_GENERAL,
+            new_layout: IMAGE_LAYOUT_GENERAL,
+            src_queue_family: QUEUE_FAMILY_IGNORED,
+            dst_queue_family: QUEUE_FAMILY_IGNORED,
+        }
+    }
+
+    /// The one-shot transition of a freshly created image into GENERAL.
+    /// `old_layout` is whichever layout it was created with -- UNDEFINED for an
+    /// internal conversion image, PREINITIALIZED for the LINEAR scan-out image.
+    const fn initial_to_general(image: VkImageId, old_layout: u32) -> Self {
+        Self {
+            image,
+            src_stage: PIPELINE_STAGE_TOP_OF_PIPE,
+            dst_stage: PIPELINE_STAGE_TRANSFER,
+            src_access: 0,
+            dst_access: ACCESS_TRANSFER_WRITE,
+            old_layout,
+            new_layout: IMAGE_LAYOUT_GENERAL,
+            src_queue_family: QUEUE_FAMILY_IGNORED,
+            dst_queue_family: QUEUE_FAMILY_IGNORED,
+        }
+    }
+}
+
+/// One `VkBufferMemoryBarrier`, by field name.
+///
+/// Only the WRITE direction exists: the present destination buffer is always
+/// written by the transfer and read by the host.
+struct BufferBarrier {
+    buffer: VkBufferId,
+    size: u64,
+    src_stage: u32,
+    dst_stage: u32,
+    src_access: u32,
+    dst_access: u32,
+    src_queue_family: u32,
+    dst_queue_family: u32,
+}
+
+impl BufferBarrier {
+    const fn acquire_from_external(buffer: VkBufferId, size: u64) -> Self {
+        Self {
+            buffer,
+            size,
+            src_stage: PIPELINE_STAGE_TOP_OF_PIPE,
+            dst_stage: PIPELINE_STAGE_TRANSFER,
+            src_access: 0,
+            dst_access: ACCESS_TRANSFER_WRITE,
+            src_queue_family: QUEUE_FAMILY_EXTERNAL,
+            dst_queue_family: 0,
+        }
+    }
+
+    const fn release_to_external(buffer: VkBufferId, size: u64) -> Self {
+        Self {
+            buffer,
+            size,
+            src_stage: PIPELINE_STAGE_TRANSFER,
+            dst_stage: PIPELINE_STAGE_BOTTOM_OF_PIPE,
+            src_access: ACCESS_TRANSFER_WRITE,
+            dst_access: 0,
+            src_queue_family: 0,
+            dst_queue_family: QUEUE_FAMILY_EXTERNAL,
+        }
+    }
+}
+
 /// Bring-up stage 1: the venus ring exists and is registered with the host, but
 /// no Vulkan object does.
 ///
@@ -2142,18 +2289,11 @@ impl VenusClient {
         };
         let record_result = (|| {
             self.begin_command_buffer(adapter, command_buffer_id)?;
-            self.cmd_image_barrier(
+            self.cmd_initial_image_transition(
                 adapter,
                 command_buffer_id,
                 image_id,
-                PIPELINE_STAGE_TOP_OF_PIPE,
-                PIPELINE_STAGE_TRANSFER,
-                0,
-                ACCESS_TRANSFER_WRITE,
                 IMAGE_LAYOUT_UNDEFINED,
-                IMAGE_LAYOUT_GENERAL,
-                QUEUE_FAMILY_IGNORED,
-                QUEUE_FAMILY_IGNORED,
             )?;
             self.end_command_buffer(adapter, command_buffer_id)
         })();
@@ -2584,20 +2724,125 @@ impl VenusClient {
         Ok(())
     }
 
+    /// Which side of a transfer an EXTERNAL queue-family ownership transition is
+    /// for. Not a bare `u32`: the access mask and the stage pair have to move
+    /// together, and this is the only thing that varies between them.
+    fn cmd_acquire_image_from_external(
+        &mut self,
+        adapter: &AdapterContext,
+        command_buffer_id: VkCommandBufferId,
+        image: VkImageId,
+        access: TransferAccess,
+    ) -> Result<(), VirtioError> {
+        self.cmd_image_barrier(
+            adapter,
+            command_buffer_id,
+            ImageBarrier::acquire_from_external(image, access),
+        )
+    }
+
+    fn cmd_release_image_to_external(
+        &mut self,
+        adapter: &AdapterContext,
+        command_buffer_id: VkCommandBufferId,
+        image: VkImageId,
+        access: TransferAccess,
+    ) -> Result<(), VirtioError> {
+        self.cmd_image_barrier(
+            adapter,
+            command_buffer_id,
+            ImageBarrier::release_to_external(image, access),
+        )
+    }
+
+    /// A `QUEUE_FAMILY_IGNORED` transition on a scratch conversion image: a
+    /// third barrier kind an acquire/release pair cannot express, because no
+    /// ownership changes hands.
+    fn cmd_internal_image_barrier(
+        &mut self,
+        adapter: &AdapterContext,
+        command_buffer_id: VkCommandBufferId,
+        image: VkImageId,
+        src_access: u32,
+        dst_access: u32,
+    ) -> Result<(), VirtioError> {
+        self.cmd_image_barrier(
+            adapter,
+            command_buffer_id,
+            ImageBarrier::internal(image, src_access, dst_access),
+        )
+    }
+
+    /// The one-shot transition of a freshly created image into GENERAL, from
+    /// whichever initial layout it was created with. Also IGNORED/IGNORED.
+    fn cmd_initial_image_transition(
+        &mut self,
+        adapter: &AdapterContext,
+        command_buffer_id: VkCommandBufferId,
+        image: VkImageId,
+        old_layout: u32,
+    ) -> Result<(), VirtioError> {
+        self.cmd_image_barrier(
+            adapter,
+            command_buffer_id,
+            ImageBarrier::initial_to_general(image, old_layout),
+        )
+    }
+
+    fn cmd_acquire_buffer_from_external(
+        &mut self,
+        adapter: &AdapterContext,
+        command_buffer_id: VkCommandBufferId,
+        buffer: VkBufferId,
+        size: u64,
+    ) -> Result<(), VirtioError> {
+        self.cmd_buffer_barrier(
+            adapter,
+            command_buffer_id,
+            BufferBarrier::acquire_from_external(buffer, size),
+        )
+    }
+
+    fn cmd_release_buffer_to_external(
+        &mut self,
+        adapter: &AdapterContext,
+        command_buffer_id: VkCommandBufferId,
+        buffer: VkBufferId,
+        size: u64,
+    ) -> Result<(), VirtioError> {
+        self.cmd_buffer_barrier(
+            adapter,
+            command_buffer_id,
+            BufferBarrier::release_to_external(buffer, size),
+        )
+    }
+
+    /// Encode one `vkCmdPipelineBarrier` carrying a single image barrier.
+    ///
+    /// PRIVATE, and taking a struct rather than eleven positionals. The
+    /// positional form was the hazard R1003 names: six adjacent same-typed
+    /// `u32`s where transposing `src_access`/`dst_access` or
+    /// `src_queue_family`/`dst_queue_family` turns an ACQUIRE into a RELEASE.
+    /// Both spellings compiled, both type-checked, and the wrong one is a
+    /// host-side queue-family ownership violation rather than an error.
+    /// Callers go through the named constructors above.
     fn cmd_image_barrier(
         &mut self,
         adapter: &AdapterContext,
         command_buffer_id: VkCommandBufferId,
-        image_id: VkImageId,
-        src_stage: u32,
-        dst_stage: u32,
-        src_access: u32,
-        dst_access: u32,
-        old_layout: u32,
-        new_layout: u32,
-        src_queue_family: u32,
-        dst_queue_family: u32,
+        b: ImageBarrier,
     ) -> Result<(), VirtioError> {
+        let ImageBarrier {
+            image: image_id,
+            src_stage,
+            dst_stage,
+            src_access,
+            dst_access,
+            old_layout,
+            new_layout,
+            src_queue_family,
+            dst_queue_family,
+        } = b;
         let mut w = Writer::new();
         w.header(CMD_PIPELINE_BARRIER, 0);
         w.handle(command_buffer_id);
@@ -2627,19 +2872,24 @@ impl VenusClient {
         self.ring_command_noreply(adapter, w.as_slice()?)
     }
 
+    /// Encode one `vkCmdPipelineBarrier` carrying a single buffer barrier.
+    /// PRIVATE, for the same reason as [`Self::cmd_image_barrier`].
     fn cmd_buffer_barrier(
         &mut self,
         adapter: &AdapterContext,
         command_buffer_id: VkCommandBufferId,
-        buffer_id: VkBufferId,
-        buffer_size: u64,
-        src_stage: u32,
-        dst_stage: u32,
-        src_access: u32,
-        dst_access: u32,
-        src_queue_family: u32,
-        dst_queue_family: u32,
+        b: BufferBarrier,
     ) -> Result<(), VirtioError> {
+        let BufferBarrier {
+            buffer: buffer_id,
+            size: buffer_size,
+            src_stage,
+            dst_stage,
+            src_access,
+            dst_access,
+            src_queue_family,
+            dst_queue_family,
+        } = b;
         let mut w = Writer::new();
         w.header(CMD_PIPELINE_BARRIER, 0);
         w.handle(command_buffer_id);
@@ -3251,31 +3501,17 @@ impl VenusClient {
         };
         let record_result = (|| {
             self.begin_command_buffer(adapter, command_buffer_id)?;
-            self.cmd_image_barrier(
+            self.cmd_initial_image_transition(
                 adapter,
                 command_buffer_id,
                 target_image_id,
-                PIPELINE_STAGE_TOP_OF_PIPE,
-                PIPELINE_STAGE_TRANSFER,
-                0,
-                ACCESS_TRANSFER_WRITE,
                 IMAGE_LAYOUT_PREINITIALIZED,
-                IMAGE_LAYOUT_GENERAL,
-                QUEUE_FAMILY_IGNORED,
-                QUEUE_FAMILY_IGNORED,
             )?;
-            self.cmd_image_barrier(
+            self.cmd_release_image_to_external(
                 adapter,
                 command_buffer_id,
                 target_image_id,
-                PIPELINE_STAGE_TRANSFER,
-                PIPELINE_STAGE_BOTTOM_OF_PIPE,
-                ACCESS_TRANSFER_WRITE,
-                0,
-                IMAGE_LAYOUT_GENERAL,
-                IMAGE_LAYOUT_GENERAL,
-                0,
-                QUEUE_FAMILY_EXTERNAL,
+                TransferAccess::Write,
             )?;
             self.end_command_buffer(adapter, command_buffer_id)
         })();
@@ -3295,6 +3531,52 @@ impl VenusClient {
     /// Record the common reusable EXTERNAL-acquire, GENERAL-layout image copy,
     /// and EXTERNAL-release sequence. Both source forms (imported OPTIMAL alias
     /// and borrowed KMD LINEAR image) use this exact ownership protocol.
+    /// The reusable-command-buffer lifecycle every `record_reusable_*` shares:
+    /// create a pool, allocate a buffer, begin it SIMULTANEOUS_USE, run `body`,
+    /// end it, and destroy the pool on any failure along the way.
+    ///
+    /// R1003(b). All five recorders repeated those twenty-five lines, including
+    /// the two distinct unwind paths (allocate-failed and record-failed).
+    ///
+    /// ⚠ DELIBERATE DEVIATION from the review's design. It specifies one
+    /// `record_reusable_transfer(plan: TransferPlan)` with a five-variant enum
+    /// carrying each recorder's body, and names its own risk as "where a barrier
+    /// could be dropped for one variant". Extracting only the LIFECYCLE removes
+    /// the same duplication without ever merging the bodies, so that risk does
+    /// not arise: each recorder's barrier sequence stays verbatim at its own
+    /// site, where it can still be diffed against the pre-change source. The
+    /// per-variant validation predicates stay at their sites too -- notably
+    /// `record_reusable_present_blt`'s `pitch >= width * bpp` guard, which is
+    /// meaningful only for the buffer destinations.
+    fn record_reusable(
+        &mut self,
+        adapter: &AdapterContext,
+        body: impl FnOnce(&mut Self, VkCommandBufferId) -> Result<(), VirtioError>,
+    ) -> Result<(VkCommandPoolId, VkCommandBufferId), VirtioError> {
+        let command_pool_id = self.create_command_pool(adapter)?;
+        let command_buffer_id = match self.allocate_command_buffer(adapter, command_pool_id) {
+            Ok(id) => id,
+            Err(e) => {
+                let _ = self.destroy_command_pool(adapter, command_pool_id);
+                return Err(e);
+            }
+        };
+        let record_result = (|| {
+            self.begin_command_buffer_with_flags(
+                adapter,
+                command_buffer_id,
+                COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE,
+            )?;
+            body(self, command_buffer_id)?;
+            self.end_command_buffer(adapter, command_buffer_id)
+        })();
+        if let Err(e) = record_result {
+            let _ = self.destroy_command_pool(adapter, command_pool_id);
+            return Err(e);
+        }
+        Ok((command_pool_id, command_buffer_id))
+    }
+
     fn record_reusable_image_copy(
         &mut self,
         adapter: &AdapterContext,
@@ -3309,48 +3591,20 @@ impl VenusClient {
             return Err(VirtioError::DeviceError);
         }
 
-        let command_pool_id = self.create_command_pool(adapter)?;
-        let command_buffer_id = match self.allocate_command_buffer(adapter, command_pool_id) {
-            Ok(id) => id,
-            Err(e) => {
-                let _ = self.destroy_command_pool(adapter, command_pool_id);
-                return Err(e);
-            }
-        };
-
-        let record_result = (|| {
-            self.begin_command_buffer_with_flags(
-                adapter,
-                command_buffer_id,
-                COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE,
-            )?;
-            self.cmd_image_barrier(
+        self.record_reusable(adapter, |s, command_buffer_id| {
+            s.cmd_acquire_image_from_external(
                 adapter,
                 command_buffer_id,
                 source_image_id,
-                PIPELINE_STAGE_TOP_OF_PIPE,
-                PIPELINE_STAGE_TRANSFER,
-                0,
-                ACCESS_TRANSFER_READ,
-                IMAGE_LAYOUT_GENERAL,
-                IMAGE_LAYOUT_GENERAL,
-                QUEUE_FAMILY_EXTERNAL,
-                0,
+                TransferAccess::Read,
             )?;
-            self.cmd_image_barrier(
+            s.cmd_acquire_image_from_external(
                 adapter,
                 command_buffer_id,
                 target_image_id,
-                PIPELINE_STAGE_TOP_OF_PIPE,
-                PIPELINE_STAGE_TRANSFER,
-                0,
-                ACCESS_TRANSFER_WRITE,
-                IMAGE_LAYOUT_GENERAL,
-                IMAGE_LAYOUT_GENERAL,
-                QUEUE_FAMILY_EXTERNAL,
-                0,
+                TransferAccess::Write,
             )?;
-            self.cmd_copy_image(
+            s.cmd_copy_image(
                 adapter,
                 command_buffer_id,
                 source_image_id,
@@ -3358,39 +3612,20 @@ impl VenusClient {
                 width,
                 height,
             )?;
-            self.cmd_image_barrier(
+            s.cmd_release_image_to_external(
                 adapter,
                 command_buffer_id,
                 source_image_id,
-                PIPELINE_STAGE_TRANSFER,
-                PIPELINE_STAGE_BOTTOM_OF_PIPE,
-                ACCESS_TRANSFER_READ,
-                0,
-                IMAGE_LAYOUT_GENERAL,
-                IMAGE_LAYOUT_GENERAL,
-                0,
-                QUEUE_FAMILY_EXTERNAL,
+                TransferAccess::Read,
             )?;
-            self.cmd_image_barrier(
+            s.cmd_release_image_to_external(
                 adapter,
                 command_buffer_id,
                 target_image_id,
-                PIPELINE_STAGE_TRANSFER,
-                PIPELINE_STAGE_BOTTOM_OF_PIPE,
-                ACCESS_TRANSFER_WRITE,
-                0,
-                IMAGE_LAYOUT_GENERAL,
-                IMAGE_LAYOUT_GENERAL,
-                0,
-                QUEUE_FAMILY_EXTERNAL,
+                TransferAccess::Write,
             )?;
-            self.end_command_buffer(adapter, command_buffer_id)
-        })();
-        if let Err(e) = record_result {
-            let _ = self.destroy_command_pool(adapter, command_pool_id);
-            return Err(e);
-        }
-        Ok((command_pool_id, command_buffer_id))
+            Ok(())
+        })
     }
 
     /// Reusable external-image BLT for authoritative source/destination formats
@@ -3409,47 +3644,20 @@ impl VenusClient {
             return Err(VirtioError::DeviceError);
         }
 
-        let command_pool_id = self.create_command_pool(adapter)?;
-        let command_buffer_id = match self.allocate_command_buffer(adapter, command_pool_id) {
-            Ok(id) => id,
-            Err(e) => {
-                let _ = self.destroy_command_pool(adapter, command_pool_id);
-                return Err(e);
-            }
-        };
-        let record_result = (|| {
-            self.begin_command_buffer_with_flags(
-                adapter,
-                command_buffer_id,
-                COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE,
-            )?;
-            self.cmd_image_barrier(
+        self.record_reusable(adapter, |s, command_buffer_id| {
+            s.cmd_acquire_image_from_external(
                 adapter,
                 command_buffer_id,
                 source_image_id,
-                PIPELINE_STAGE_TOP_OF_PIPE,
-                PIPELINE_STAGE_TRANSFER,
-                0,
-                ACCESS_TRANSFER_READ,
-                IMAGE_LAYOUT_GENERAL,
-                IMAGE_LAYOUT_GENERAL,
-                QUEUE_FAMILY_EXTERNAL,
-                0,
+                TransferAccess::Read,
             )?;
-            self.cmd_image_barrier(
+            s.cmd_acquire_image_from_external(
                 adapter,
                 command_buffer_id,
                 target_image_id,
-                PIPELINE_STAGE_TOP_OF_PIPE,
-                PIPELINE_STAGE_TRANSFER,
-                0,
-                ACCESS_TRANSFER_WRITE,
-                IMAGE_LAYOUT_GENERAL,
-                IMAGE_LAYOUT_GENERAL,
-                QUEUE_FAMILY_EXTERNAL,
-                0,
+                TransferAccess::Write,
             )?;
-            self.cmd_blit_image(
+            s.cmd_blit_image(
                 adapter,
                 command_buffer_id,
                 source_image_id,
@@ -3457,39 +3665,20 @@ impl VenusClient {
                 width,
                 height,
             )?;
-            self.cmd_image_barrier(
+            s.cmd_release_image_to_external(
                 adapter,
                 command_buffer_id,
                 source_image_id,
-                PIPELINE_STAGE_TRANSFER,
-                PIPELINE_STAGE_BOTTOM_OF_PIPE,
-                ACCESS_TRANSFER_READ,
-                0,
-                IMAGE_LAYOUT_GENERAL,
-                IMAGE_LAYOUT_GENERAL,
-                0,
-                QUEUE_FAMILY_EXTERNAL,
+                TransferAccess::Read,
             )?;
-            self.cmd_image_barrier(
+            s.cmd_release_image_to_external(
                 adapter,
                 command_buffer_id,
                 target_image_id,
-                PIPELINE_STAGE_TRANSFER,
-                PIPELINE_STAGE_BOTTOM_OF_PIPE,
-                ACCESS_TRANSFER_WRITE,
-                0,
-                IMAGE_LAYOUT_GENERAL,
-                IMAGE_LAYOUT_GENERAL,
-                0,
-                QUEUE_FAMILY_EXTERNAL,
+                TransferAccess::Write,
             )?;
-            self.end_command_buffer(adapter, command_buffer_id)
-        })();
-        if let Err(e) = record_result {
-            let _ = self.destroy_command_pool(adapter, command_pool_id);
-            return Err(e);
-        }
-        Ok((command_pool_id, command_buffer_id))
+            Ok(())
+        })
     }
 
     /// Convert one authoritative primary into an OPTIMAL BGRA scratch image,
@@ -3518,60 +3707,27 @@ impl VenusClient {
             return Err(VirtioError::DeviceError);
         }
 
-        let command_pool_id = self.create_command_pool(adapter)?;
-        let command_buffer_id = match self.allocate_command_buffer(adapter, command_pool_id) {
-            Ok(id) => id,
-            Err(e) => {
-                let _ = self.destroy_command_pool(adapter, command_pool_id);
-                return Err(e);
-            }
-        };
-        let record_result = (|| {
-            self.begin_command_buffer_with_flags(
-                adapter,
-                command_buffer_id,
-                COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE,
-            )?;
-            self.cmd_image_barrier(
+        self.record_reusable(adapter, |s, command_buffer_id| {
+            s.cmd_acquire_image_from_external(
                 adapter,
                 command_buffer_id,
                 source_image_id,
-                PIPELINE_STAGE_TOP_OF_PIPE,
-                PIPELINE_STAGE_TRANSFER,
-                0,
-                ACCESS_TRANSFER_READ,
-                IMAGE_LAYOUT_GENERAL,
-                IMAGE_LAYOUT_GENERAL,
-                QUEUE_FAMILY_EXTERNAL,
-                0,
+                TransferAccess::Read,
             )?;
-            self.cmd_image_barrier(
+            s.cmd_internal_image_barrier(
                 adapter,
                 command_buffer_id,
                 conversion_image_id,
-                PIPELINE_STAGE_TRANSFER,
-                PIPELINE_STAGE_TRANSFER,
                 ACCESS_TRANSFER_READ | ACCESS_TRANSFER_WRITE,
                 ACCESS_TRANSFER_WRITE,
-                IMAGE_LAYOUT_GENERAL,
-                IMAGE_LAYOUT_GENERAL,
-                QUEUE_FAMILY_IGNORED,
-                QUEUE_FAMILY_IGNORED,
             )?;
-            self.cmd_image_barrier(
+            s.cmd_acquire_image_from_external(
                 adapter,
                 command_buffer_id,
                 target_image_id,
-                PIPELINE_STAGE_TOP_OF_PIPE,
-                PIPELINE_STAGE_TRANSFER,
-                0,
-                ACCESS_TRANSFER_WRITE,
-                IMAGE_LAYOUT_GENERAL,
-                IMAGE_LAYOUT_GENERAL,
-                QUEUE_FAMILY_EXTERNAL,
-                0,
+                TransferAccess::Write,
             )?;
-            self.cmd_blit_image(
+            s.cmd_blit_image(
                 adapter,
                 command_buffer_id,
                 source_image_id,
@@ -3579,20 +3735,14 @@ impl VenusClient {
                 width,
                 height,
             )?;
-            self.cmd_image_barrier(
+            s.cmd_internal_image_barrier(
                 adapter,
                 command_buffer_id,
                 conversion_image_id,
-                PIPELINE_STAGE_TRANSFER,
-                PIPELINE_STAGE_TRANSFER,
                 ACCESS_TRANSFER_WRITE,
                 ACCESS_TRANSFER_READ,
-                IMAGE_LAYOUT_GENERAL,
-                IMAGE_LAYOUT_GENERAL,
-                QUEUE_FAMILY_IGNORED,
-                QUEUE_FAMILY_IGNORED,
             )?;
-            self.cmd_copy_image(
+            s.cmd_copy_image(
                 adapter,
                 command_buffer_id,
                 conversion_image_id,
@@ -3600,39 +3750,20 @@ impl VenusClient {
                 width,
                 height,
             )?;
-            self.cmd_image_barrier(
+            s.cmd_release_image_to_external(
                 adapter,
                 command_buffer_id,
                 source_image_id,
-                PIPELINE_STAGE_TRANSFER,
-                PIPELINE_STAGE_BOTTOM_OF_PIPE,
-                ACCESS_TRANSFER_READ,
-                0,
-                IMAGE_LAYOUT_GENERAL,
-                IMAGE_LAYOUT_GENERAL,
-                0,
-                QUEUE_FAMILY_EXTERNAL,
+                TransferAccess::Read,
             )?;
-            self.cmd_image_barrier(
+            s.cmd_release_image_to_external(
                 adapter,
                 command_buffer_id,
                 target_image_id,
-                PIPELINE_STAGE_TRANSFER,
-                PIPELINE_STAGE_BOTTOM_OF_PIPE,
-                ACCESS_TRANSFER_WRITE,
-                0,
-                IMAGE_LAYOUT_GENERAL,
-                IMAGE_LAYOUT_GENERAL,
-                0,
-                QUEUE_FAMILY_EXTERNAL,
+                TransferAccess::Write,
             )?;
-            self.end_command_buffer(adapter, command_buffer_id)
-        })();
-        if let Err(e) = record_result {
-            let _ = self.destroy_command_pool(adapter, command_pool_id);
-            return Err(e);
-        }
-        Ok((command_pool_id, command_buffer_id))
+            Ok(())
+        })
     }
 
     /// Record one reusable full-surface Present BLT from an imported OPTIMAL
@@ -3659,47 +3790,20 @@ impl VenusClient {
             return Err(VirtioError::DeviceError);
         }
 
-        let command_pool_id = self.create_command_pool(adapter)?;
-        let command_buffer_id = match self.allocate_command_buffer(adapter, command_pool_id) {
-            Ok(id) => id,
-            Err(e) => {
-                let _ = self.destroy_command_pool(adapter, command_pool_id);
-                return Err(e);
-            }
-        };
-
-        let record_result = (|| {
-            self.begin_command_buffer_with_flags(
-                adapter,
-                command_buffer_id,
-                COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE,
-            )?;
-            self.cmd_image_barrier(
+        self.record_reusable(adapter, |s, command_buffer_id| {
+            s.cmd_acquire_image_from_external(
                 adapter,
                 command_buffer_id,
                 source_image_id,
-                PIPELINE_STAGE_TOP_OF_PIPE,
-                PIPELINE_STAGE_TRANSFER,
-                0,
-                ACCESS_TRANSFER_READ,
-                IMAGE_LAYOUT_GENERAL,
-                IMAGE_LAYOUT_GENERAL,
-                QUEUE_FAMILY_EXTERNAL,
-                0,
+                TransferAccess::Read,
             )?;
-            self.cmd_buffer_barrier(
+            s.cmd_acquire_buffer_from_external(
                 adapter,
                 command_buffer_id,
                 destination_buffer_id,
                 destination_size,
-                PIPELINE_STAGE_TOP_OF_PIPE,
-                PIPELINE_STAGE_TRANSFER,
-                0,
-                ACCESS_TRANSFER_WRITE,
-                QUEUE_FAMILY_EXTERNAL,
-                0,
             )?;
-            self.cmd_copy_image_to_buffer(
+            s.cmd_copy_image_to_buffer(
                 adapter,
                 command_buffer_id,
                 source_image_id,
@@ -3709,38 +3813,20 @@ impl VenusClient {
                 pitch,
                 bytes_per_pixel,
             )?;
-            self.cmd_image_barrier(
+            s.cmd_release_image_to_external(
                 adapter,
                 command_buffer_id,
                 source_image_id,
-                PIPELINE_STAGE_TRANSFER,
-                PIPELINE_STAGE_BOTTOM_OF_PIPE,
-                ACCESS_TRANSFER_READ,
-                0,
-                IMAGE_LAYOUT_GENERAL,
-                IMAGE_LAYOUT_GENERAL,
-                0,
-                QUEUE_FAMILY_EXTERNAL,
+                TransferAccess::Read,
             )?;
-            self.cmd_buffer_barrier(
+            s.cmd_release_buffer_to_external(
                 adapter,
                 command_buffer_id,
                 destination_buffer_id,
                 destination_size,
-                PIPELINE_STAGE_TRANSFER,
-                PIPELINE_STAGE_BOTTOM_OF_PIPE,
-                ACCESS_TRANSFER_WRITE,
-                0,
-                0,
-                QUEUE_FAMILY_EXTERNAL,
             )?;
-            self.end_command_buffer(adapter, command_buffer_id)
-        })();
-        if let Err(e) = record_result {
-            let _ = self.destroy_command_pool(adapter, command_pool_id);
-            return Err(e);
-        }
-        Ok((command_pool_id, command_buffer_id))
+            Ok(())
+        })
     }
 
     /// Convert the authoritative source into a KMD-owned scratch image carrying
@@ -3769,59 +3855,27 @@ impl VenusClient {
             return Err(VirtioError::DeviceError);
         }
 
-        let command_pool_id = self.create_command_pool(adapter)?;
-        let command_buffer_id = match self.allocate_command_buffer(adapter, command_pool_id) {
-            Ok(id) => id,
-            Err(e) => {
-                let _ = self.destroy_command_pool(adapter, command_pool_id);
-                return Err(e);
-            }
-        };
-        let record_result = (|| {
-            self.begin_command_buffer_with_flags(
-                adapter,
-                command_buffer_id,
-                COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE,
-            )?;
-            self.cmd_image_barrier(
+        self.record_reusable(adapter, |s, command_buffer_id| {
+            s.cmd_acquire_image_from_external(
                 adapter,
                 command_buffer_id,
                 source_image_id,
-                PIPELINE_STAGE_TOP_OF_PIPE,
-                PIPELINE_STAGE_TRANSFER,
-                0,
-                ACCESS_TRANSFER_READ,
-                IMAGE_LAYOUT_GENERAL,
-                IMAGE_LAYOUT_GENERAL,
-                QUEUE_FAMILY_EXTERNAL,
-                0,
+                TransferAccess::Read,
             )?;
-            self.cmd_image_barrier(
+            s.cmd_internal_image_barrier(
                 adapter,
                 command_buffer_id,
                 conversion_image_id,
-                PIPELINE_STAGE_TRANSFER,
-                PIPELINE_STAGE_TRANSFER,
                 ACCESS_TRANSFER_READ | ACCESS_TRANSFER_WRITE,
                 ACCESS_TRANSFER_WRITE,
-                IMAGE_LAYOUT_GENERAL,
-                IMAGE_LAYOUT_GENERAL,
-                QUEUE_FAMILY_IGNORED,
-                QUEUE_FAMILY_IGNORED,
             )?;
-            self.cmd_buffer_barrier(
+            s.cmd_acquire_buffer_from_external(
                 adapter,
                 command_buffer_id,
                 destination_buffer_id,
                 destination_size,
-                PIPELINE_STAGE_TOP_OF_PIPE,
-                PIPELINE_STAGE_TRANSFER,
-                0,
-                ACCESS_TRANSFER_WRITE,
-                QUEUE_FAMILY_EXTERNAL,
-                0,
             )?;
-            self.cmd_blit_image(
+            s.cmd_blit_image(
                 adapter,
                 command_buffer_id,
                 source_image_id,
@@ -3829,20 +3883,14 @@ impl VenusClient {
                 width,
                 height,
             )?;
-            self.cmd_image_barrier(
+            s.cmd_internal_image_barrier(
                 adapter,
                 command_buffer_id,
                 conversion_image_id,
-                PIPELINE_STAGE_TRANSFER,
-                PIPELINE_STAGE_TRANSFER,
                 ACCESS_TRANSFER_WRITE,
                 ACCESS_TRANSFER_READ,
-                IMAGE_LAYOUT_GENERAL,
-                IMAGE_LAYOUT_GENERAL,
-                QUEUE_FAMILY_IGNORED,
-                QUEUE_FAMILY_IGNORED,
             )?;
-            self.cmd_copy_image_to_buffer(
+            s.cmd_copy_image_to_buffer(
                 adapter,
                 command_buffer_id,
                 conversion_image_id,
@@ -3852,38 +3900,20 @@ impl VenusClient {
                 pitch,
                 bytes_per_pixel,
             )?;
-            self.cmd_image_barrier(
+            s.cmd_release_image_to_external(
                 adapter,
                 command_buffer_id,
                 source_image_id,
-                PIPELINE_STAGE_TRANSFER,
-                PIPELINE_STAGE_BOTTOM_OF_PIPE,
-                ACCESS_TRANSFER_READ,
-                0,
-                IMAGE_LAYOUT_GENERAL,
-                IMAGE_LAYOUT_GENERAL,
-                0,
-                QUEUE_FAMILY_EXTERNAL,
+                TransferAccess::Read,
             )?;
-            self.cmd_buffer_barrier(
+            s.cmd_release_buffer_to_external(
                 adapter,
                 command_buffer_id,
                 destination_buffer_id,
                 destination_size,
-                PIPELINE_STAGE_TRANSFER,
-                PIPELINE_STAGE_BOTTOM_OF_PIPE,
-                ACCESS_TRANSFER_WRITE,
-                0,
-                0,
-                QUEUE_FAMILY_EXTERNAL,
             )?;
-            self.end_command_buffer(adapter, command_buffer_id)
-        })();
-        if let Err(e) = record_result {
-            let _ = self.destroy_command_pool(adapter, command_pool_id);
-            return Err(e);
-        }
-        Ok((command_pool_id, command_buffer_id))
+            Ok(())
+        })
     }
 
     /// Import an authoritative WDDM primary and record its reusable GPU copy to
