@@ -10,6 +10,7 @@
 #include <windows.h>
 #include <sddl.h>
 
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
@@ -1146,6 +1147,32 @@ struct HeliosCbSignalSyncFromCpu {
   const std::uint32_t* ObjectHandleArray; // D3DKMT_HANDLE = UINT
   const std::uint64_t* FenceValueArray;
 };
+
+// R818: the prose above was the ONLY thing vouching for this layout, unlike
+// HeliosVenusScanoutInfo twenty lines up, which asserts its size on BOTH sides
+// of the guest/host boundary. A shifted field here is a stack-corrupting kernel
+// call, not a compile error -- it would be reported, if at all, only as
+// "flip-kwait: CPU signal FAILED hr=...".
+//
+// The same three numbers are asserted against the bindgen
+// D3DDDICB_SIGNALSYNCHRONIZATIONOBJECTFROMCPU on the Rust side (see
+// forward.rs::flip_wait_setup), which is generated from the shipping WDK
+// header. A WDK revision that moves a field therefore fails the build on the
+// Rust side while these asserts pin the C++ copy to the same shape --
+// re-verify both together on a WDK bump.
+static_assert(sizeof(HeliosCbSignalSyncFromCpu) == 24,
+              "D3DDDICB_SIGNALSYNCHRONIZATIONOBJECTFROMCPU is 24 bytes on x64");
+static_assert(offsetof(HeliosCbSignalSyncFromCpu, ObjectCount) == 0, "ObjectCount@0");
+static_assert(offsetof(HeliosCbSignalSyncFromCpu, ObjectHandleArray) == 8,
+              "ObjectHandleArray@8 (4 bytes of natural x64 padding after ObjectCount)");
+static_assert(offsetof(HeliosCbSignalSyncFromCpu, FenceValueArray) == 16, "FenceValueArray@16");
+
+// Calling convention: bindgen types the callback `extern "C"` while this is
+// `__stdcall`. Identical on x64 -- where there is one native convention -- and
+// divergent anywhere else, which is why the assert below pins the assumption
+// rather than leaving it implicit.
+static_assert(sizeof(void*) == 8, "the __stdcall/extern-C equivalence assumed here is x64-only");
+
 typedef long (__stdcall *HeliosSignalSyncFromCpuCb)(
     void* hDevice, const HeliosCbSignalSyncFromCpu*);
 

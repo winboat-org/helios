@@ -9220,6 +9220,35 @@ pub struct FlipWaitReady {
     pub h_rt_device: ddi::HANDLE,
 }
 
+// R818: the bridge re-derives the WDDM CPU-signal callback ABI by hand,
+// because that TU compiles without the WDK headers
+// (`HeliosCbSignalSyncFromCpu` in dxvk_bridge.cpp). These asserts pin the
+// AUTHORITATIVE definition -- bindgen's, generated from the shipping
+// d3dumddi.h -- to the same three numbers the C++ copy static_asserts against.
+//
+// That is the load-bearing half of the fix: a WDK revision that moves a field
+// regenerates this type and fails the build HERE, instead of the bridge
+// silently passing a mis-laid-out argument to dxgkrnl and signalling the flip
+// fence with a garbage value. Re-verify both sides together on a WDK bump.
+const _: () = assert!(
+    core::mem::size_of::<ddi::D3DDDICB_SIGNALSYNCHRONIZATIONOBJECTFROMCPU>() == 24
+);
+const _: () = assert!(
+    core::mem::offset_of!(ddi::D3DDDICB_SIGNALSYNCHRONIZATIONOBJECTFROMCPU, ObjectCount) == 0
+);
+const _: () = assert!(
+    core::mem::offset_of!(
+        ddi::D3DDDICB_SIGNALSYNCHRONIZATIONOBJECTFROMCPU,
+        ObjectHandleArray
+    ) == 8
+);
+const _: () = assert!(
+    core::mem::offset_of!(
+        ddi::D3DDDICB_SIGNALSYNCHRONIZATIONOBJECTFROMCPU,
+        FenceValueArray
+    ) == 16
+);
+
 unsafe fn flip_wait_setup(
     dev: &crate::device_funcs::HeliosDevice,
 ) -> Option<FlipWaitReady> {
