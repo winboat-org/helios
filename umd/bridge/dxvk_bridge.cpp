@@ -432,6 +432,66 @@ namespace {
   }
 
 
+  // The "atomic total + CAS max + count + log every Nth + reset max" idiom,
+  // open-coded at two telemetry sites with two different periods.
+  //
+  // `bridge_log_budget` above is deliberately a SEPARATE, smaller helper for the
+  // simpler count-and-rate-limit counters -- forcing the two shapes together
+  // would give both a worse API than either has now. (The review names three
+  // accumulators; `copy-lat:` is gone, so there are two.)
+  //
+  // Per-site extras stay at the sites: `present-gate:` also accumulates
+  // `s_gateTimeouts`, which it deliberately never resets, plus two failure
+  // counters. Each site keeps its own log key and format string, so before/after
+  // numbers stay directly comparable -- which is the whole reason those lines
+  // exist.
+  class PeriodicStat {
+  public:
+    struct Sample {
+      std::uint32_t n;
+      std::uint64_t avg_us;
+      std::uint64_t max_us;
+    };
+
+    // `period` must be a power of two: the two sites tested `(n & 31u) == 0`
+    // and `(n & 127u) == 0`, and keeping the mask form keeps that cadence exact.
+    explicit constexpr PeriodicStat(std::uint32_t period) : mask_(period - 1u) {}
+
+    // Record one measurement. Returns the sample to log when this call lands on
+    // the period boundary, resetting the running max exactly as both sites did.
+    std::optional<Sample> record(std::uint64_t us) {
+      total_us_.fetch_add(us, std::memory_order_relaxed);
+      std::uint64_t prev_max = max_us_.load(std::memory_order_relaxed);
+      while (us > prev_max &&
+             !max_us_.compare_exchange_weak(prev_max, us, std::memory_order_relaxed)) {}
+      const std::uint32_t n = count_.fetch_add(1, std::memory_order_relaxed) + 1;
+      if ((n & mask_) != 0)
+        return std::nullopt;
+      const Sample sample{
+        n,
+        total_us_.load(std::memory_order_relaxed) / n,
+        max_us_.load(std::memory_order_relaxed),
+      };
+      max_us_.store(0, std::memory_order_relaxed);
+      return sample;
+    }
+
+  private:
+    const std::uint32_t mask_;
+    std::atomic<std::uint64_t> total_us_{0};
+    std::atomic<std::uint64_t> max_us_{0};
+    std::atomic<std::uint32_t> count_{0};
+  };
+
+  // Microseconds between two QueryPerformanceCounter reads. Both telemetry
+  // sites spelled this division out.
+  std::uint64_t qpc_elapsed_us(const LARGE_INTEGER& freq,
+                               const LARGE_INTEGER& t0,
+                               const LARGE_INTEGER& t1) {
+    return std::uint64_t(t1.QuadPart - t0.QuadPart) * 1000000ull
+         / std::uint64_t(freq.QuadPart);
+  }
+
   bool plausible_venus_context_id(std::uint32_t ctx) {
     // KMD-assigned context ids are small monotonically allocated integers. A
     // value such as 0xcccccc00 means the instance-scoped export decoded the
@@ -1805,27 +1865,15 @@ bool HeliosDxvkDevice::rotate_resource_backings(
     {
       LARGE_INTEGER qpcT1;
       QueryPerformanceCounter(&qpcT1);
-      const std::uint64_t us = std::uint64_t(qpcT1.QuadPart - qpcT0.QuadPart)
-        * 1000000ull / std::uint64_t(qpcFreq.QuadPart);
-      static std::atomic<std::uint64_t> s_drainTotalUs{0};
-      static std::atomic<std::uint64_t> s_drainMaxUs{0};
-      static std::atomic<std::uint32_t> s_drainCount{0};
-      s_drainTotalUs.fetch_add(us, std::memory_order_relaxed);
-      std::uint64_t prevMax = s_drainMaxUs.load(std::memory_order_relaxed);
-      while (us > prevMax &&
-             !s_drainMaxUs.compare_exchange_weak(prevMax, us, std::memory_order_relaxed)) {}
-      const std::uint32_t n = s_drainCount.fetch_add(1, std::memory_order_relaxed) + 1;
-      if ((n & 31u) == 0) {
+      static PeriodicStat s_drainStat(32u);
+      if (const auto sample = s_drainStat.record(qpc_elapsed_us(qpcFreq, qpcT0, qpcT1))) {
         char msg[128];
         std::snprintf(msg, sizeof(msg),
                       "rotate-perf: n=%u drain_avg_us=%llu drain_max_us=%llu",
-                      n,
-                      static_cast<unsigned long long>(
-                          s_drainTotalUs.load(std::memory_order_relaxed) / n),
-                      static_cast<unsigned long long>(
-                          s_drainMaxUs.load(std::memory_order_relaxed)));
+                      sample->n,
+                      static_cast<unsigned long long>(sample->avg_us),
+                      static_cast<unsigned long long>(sample->max_us));
         umd_log(msg);
-        s_drainMaxUs.store(0, std::memory_order_relaxed);
       }
     }
 
@@ -1969,36 +2017,26 @@ bool HeliosDxvkDevice::present_frame_gate(std::uint32_t timeout_us) const {
 
     // Gate-cost telemetry (PSC WS2 discipline): one line per 128 presents.
     QueryPerformanceCounter(&qpcT1);
-    const std::uint64_t us = std::uint64_t(qpcT1.QuadPart - qpcT0.QuadPart)
-      * 1000000ull / std::uint64_t(qpcFreq.QuadPart);
-    static std::atomic<std::uint64_t> s_gateTotalUs{0};
-    static std::atomic<std::uint64_t> s_gateMaxUs{0};
-    static std::atomic<std::uint32_t> s_gateCount{0};
+    // Site-local extra, deliberately NEVER reset (unlike the running max), so
+    // the printed count is cumulative for the process.
     static std::atomic<std::uint32_t> s_gateTimeouts{0};
-    s_gateTotalUs.fetch_add(us, std::memory_order_relaxed);
     if (!completed)
       s_gateTimeouts.fetch_add(1, std::memory_order_relaxed);
-    std::uint64_t prevMax = s_gateMaxUs.load(std::memory_order_relaxed);
-    while (us > prevMax &&
-           !s_gateMaxUs.compare_exchange_weak(prevMax, us, std::memory_order_relaxed)) {}
-    const std::uint32_t n = s_gateCount.fetch_add(1, std::memory_order_relaxed) + 1;
-    if ((n & 127u) == 0) {
+    static PeriodicStat s_gateStat(128u);
+    if (const auto sample = s_gateStat.record(qpc_elapsed_us(qpcFreq, qpcT0, qpcT1))) {
       // The existing keys keep their names, order and format so before/after
       // runs compare directly; `failed` and `noctx` are APPENDED. R826.
       char msg[200];
       std::snprintf(msg, sizeof(msg),
                     "present-gate: n=%u avg_us=%llu max_us=%llu timeouts=%u "
                     "failed=%u noctx=%u",
-                    n,
-                    static_cast<unsigned long long>(
-                        s_gateTotalUs.load(std::memory_order_relaxed) / n),
-                    static_cast<unsigned long long>(
-                        s_gateMaxUs.load(std::memory_order_relaxed)),
+                    sample->n,
+                    static_cast<unsigned long long>(sample->avg_us),
+                    static_cast<unsigned long long>(sample->max_us),
                     s_gateTimeouts.load(std::memory_order_relaxed),
                     s_gateExceptions.load(std::memory_order_relaxed),
                     s_gateNoContext.load(std::memory_order_relaxed));
       umd_log(msg);
-      s_gateMaxUs.store(0, std::memory_order_relaxed);
     }
     return completed;
   } catch (const dxvk::DxvkError& e) {
