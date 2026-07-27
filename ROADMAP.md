@@ -606,11 +606,35 @@ virtio-gpu scanout; IddCx/Looking Glass is no longer the active display path.*
    standing KMD surface (`kmd-gate-surface.ps1`, per-flip diag `ScSet=1 ScFlu=3 VpDSt=0
    DspMd=124257286 ScCpy=2 ScPch=7680` with `ScanoutDiag` absent, `AsSub == AsDone`, `WtOut`/
    `CtOut` 0); and `helios_paintcap` → `Z:\tmp\screen_copy.png` as the only rendering evidence.
-   ⚠ **Pre-tranche ownership baseline, measured against the DEPLOYED T4b UMD** (so it is a
-   BEFORE number, not a T5 result): a short 5-device/20-resource run reported
-   **handles +36, modules +0, working set +548 KiB**. Whether that plateaus or grows without
-   bound is being characterised; the T5 comparison is only meaningful against the same
-   measurement on the same box.
+   ⚠⚠ **NEW DEFECT FOUND BY THE SOAK HARNESS — PRE-EXISTING, NOT T5's. WS1 (stability).**
+   **`D3D11CreateDevice` / `Release` on the Helios adapter leaks exactly 6 kernel handles and
+   ~135 KiB per device, linearly, with no plateau.** Measured 2026-07-27 against the DEPLOYED
+   **T4b release UMD** (the DriverStore copy the runtime actually resolves —
+   5,917,696 B, 27-07 00:33; note `C:\ProgramData\HeliosUmd` still holds a stale 03-07 build
+   that nothing loads), so this is a BEFORE number and predates the tranche:
+   ```
+   baseline (post-warmup)  handles=148    modules=24   ws=10648 KiB
+   device cycle 100        handles=746    modules=24   ws=24092 KiB
+   device cycle 200        handles=1346   modules=24   ws=37676 KiB
+   device cycle 300        handles=1946   modules=24   ws=50908 KiB
+   ```
+   +598/+600/+600 per 100 cycles = **6.00 handles per device**, dead linear.
+   **The WARP control isolates it to our UMD**: identical cycling against
+   "Microsoft Basic Render Driver" gives **handles 137 → 137 → 137 → 137, +0 over 300 cycles**.
+   So this is not a D3D11/DXGI property of this box.
+   **The resource phase is FLAT on Helios** — handles 1977 at cycle 1000, 2000 and 3000 — so
+   the paths T5 restructured (`Slot<Boxed<ResourceState>>`, `RtvState`, `DeallocateForm`, the
+   R806 descriptors) do not leak. The leak is entirely in device teardown.
+   Not yet root-caused, and deliberately not guessed at: candidates are DXVK's per-device
+   threads, the WS1 #4 named present fence, and the `pfnCreateSynchronizationObject2Cb`
+   monitored fence R810 touched (which has no destroy path — though that one is inert at
+   `PresentSyncPublish=0` and so cannot be this).
+   ⚠ **Consequence for the T5 gate:** its ownership criterion as written ("handle count FLAT")
+   **cannot pass on this codebase**, because the baseline already fails it. The honest gate is
+   *no worse than 6.00 handles/device and a flat resource phase*; the absolute leak is a
+   separate WS1 defect. The harness now prints the handles-per-device-cycle figure directly so
+   before/after compare on one number, and its working-set tolerance is calibrated to the WARP
+   control's own ~8 MiB of runtime noise rather than to zero.
 8. Implement the remaining reviewed refactors atomically, in tranche order, one recommendation
    per commit; never fold a `BUG` fix into a structure move. Preserve the current direct
    primary, completion ordering, loud-failure contracts, registry ABI, and

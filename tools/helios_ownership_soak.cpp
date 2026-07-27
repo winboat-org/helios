@@ -102,13 +102,22 @@ DWORD find_process_id(const wchar_t* exeName) {
     return 0;
 }
 
-IDXGIAdapter1* find_helios_adapter(IDXGIFactory1* factory) {
+// `match` is a substring of DXGI_ADAPTER_DESC1::Description -- "Helios" for the
+// driver under test, "Basic Render" or "Microsoft" for the WARP control.
+//
+// The control is not optional. A handle delta measured only against Helios
+// cannot distinguish "our UMD leaks" from "D3D11CreateDevice leaks on this box
+// regardless of adapter", and the project rule is not to blame a component
+// without evidence that isolates it.
+IDXGIAdapter1* find_adapter(IDXGIFactory1* factory, const wchar_t* match) {
     IDXGIAdapter1* adapter = nullptr;
     for (UINT i = 0; factory->EnumAdapters1(i, &adapter) != DXGI_ERROR_NOT_FOUND; ++i) {
         DXGI_ADAPTER_DESC1 desc{};
         adapter->GetDesc1(&desc);
-        if (wcsstr(desc.Description, L"Helios") != nullptr)
+        if (wcsstr(desc.Description, match) != nullptr) {
+            std::wprintf(L"adapter: \"%s\"\n", desc.Description);
             return adapter;  // caller releases
+        }
         adapter->Release();
     }
     return nullptr;
@@ -170,10 +179,16 @@ int main(int argc, char** argv) {
     // Working-set tolerance. Allocator behaviour and DXVK's own caches make an
     // exactly-equal demand meaningless; anything genuinely leaking per cycle
     // blows well past this over 10k iterations.
-    unsigned wsToleranceKiB = 4096;
+    // 16 MiB. The WARP control grows ~8 MiB of working set over 1000 resource
+    // cycles with a ZERO handle delta, so committed pages are partly a D3D11
+    // runtime/allocator property rather than a driver signal. A tolerance
+    // tighter than the control's own noise reports the runtime as a leak.
+    unsigned wsToleranceKiB = 16384;
+    const wchar_t* adapterMatch = L"Helios";
     if (argc > 1) deviceCycles = strtoul(argv[1], nullptr, 10);
     if (argc > 2) resourceCycles = strtoul(argv[2], nullptr, 10);
     if (argc > 3) wsToleranceKiB = strtoul(argv[3], nullptr, 10);
+    if (argc > 4 && argv[4][0] == 'w') adapterMatch = L"Basic Render";  // WARP control
 
     std::printf("helios ownership soak: deviceCycles=%u resourceCycles=%u wsTolKiB=%u\n",
                 deviceCycles, resourceCycles, wsToleranceKiB);
@@ -183,9 +198,9 @@ int main(int argc, char** argv) {
         std::printf("FAIL: CreateDXGIFactory1\n");
         return 1;
     }
-    IDXGIAdapter1* adapter = find_helios_adapter(factory);
+    IDXGIAdapter1* adapter = find_adapter(factory, adapterMatch);
     if (!adapter) {
-        std::printf("FAIL: no Helios adapter enumerated\n");
+        std::wprintf(L"FAIL: no adapter matching \"%s\" enumerated\n", adapterMatch);
         factory->Release();
         return 1;
     }
@@ -206,7 +221,7 @@ int main(int argc, char** argv) {
     {
         ID3D11Device* warm = create_device(adapter);
         if (!warm) {
-            std::printf("FAIL: D3D11CreateDevice on the Helios adapter\n");
+            std::printf("FAIL: D3D11CreateDevice on the selected adapter\n");
             adapter->Release();
             factory->Release();
             return 1;
@@ -287,8 +302,18 @@ int main(int argc, char** argv) {
     const long long wsDeltaKiB =
         (static_cast<long long>(final.workingSet) - static_cast<long long>(base.workingSet)) / 1024;
 
+    // The per-device-cycle figure is the one that compares across runs and
+    // across adapters. Measured 2026-07-27 on the T4b release UMD
+    // (DriverStore, 5,917,696 B): Helios 6.00, WARP 0.00 over 300 cycles.
+    const long deviceHandleDelta =
+        static_cast<long>(afterDevices.handles) - static_cast<long>(base.handles);
+    const double perDeviceCycle =
+        deviceCycles ? static_cast<double>(deviceHandleDelta) / deviceCycles : 0.0;
+
     std::printf("\ndeltas vs post-warmup baseline: handles=%+ld modules=%+ld ws=%+lld KiB\n",
                 handleDelta, moduleDelta, wsDeltaKiB);
+    std::printf("device phase: handles=%+ld over %u cycles = %.2f handles/device\n",
+                deviceHandleDelta, deviceCycles, perDeviceCycle);
     std::printf("failures: device=%u resource=%u\n", deviceFailures, resourceFailures);
     if (dwmPid && dwmAfter.handles) {
         std::printf("dwm deltas: handles=%+ld ws=%+lld KiB\n",

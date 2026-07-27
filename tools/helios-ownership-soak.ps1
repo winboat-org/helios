@@ -17,7 +17,11 @@
 param(
     [int]$DeviceCycles = 1000,
     [int]$ResourceCycles = 10000,
-    [int]$WorkingSetToleranceKiB = 4096,
+    [int]$WorkingSetToleranceKiB = 16384,
+    # Run the same cycles against WARP instead of Helios. A handle delta
+    # measured only against Helios cannot separate "our UMD leaks" from
+    # "D3D11CreateDevice leaks on this box regardless of adapter".
+    [switch]$Warp,
     [switch]$SkipBuild
 )
 
@@ -48,7 +52,8 @@ if (-not $SkipBuild) {
 }
 
 Write-Output "=== running ownership soak ==="
-& $exe $DeviceCycles $ResourceCycles $WorkingSetToleranceKiB
+$adapterArg = if ($Warp) { "warp" } else { "helios" }
+& $exe $DeviceCycles $ResourceCycles $WorkingSetToleranceKiB $adapterArg
 $rc = $LASTEXITCODE
 Write-Output "=== probe exit code $rc ==="
 exit $rc
