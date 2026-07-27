@@ -92,24 +92,14 @@ fn build_ddi_table() -> DRIVER_INITIALIZATION_DATA {
     // DxgkInitialize and still fail the adapter bring-up path before StartDevice.
     //
     // Helios followed the viogpu3d-style WDDM 1.3 render/display miniport shape
-    // during bring-up. The WDDM-sync-redesign M1 raises it to a coherent WDDM 3.2 +
-    // GpuMmu surface (gated by `RAISE_WDDM_3_2_GPUMMU`) so the OS enables monitored
-    // fences. The interface version is the primary lever (the OS infers the WDDM
-    // level from it + the advertised caps); it is bumped together with the matching
-    // `DXGK_DRIVERCAPS.WDDMVersion`, the GpuMmu `MemoryManagementCaps` bits, and
-    // `GetNodeMetadata.GpuMmuSupported` in `query_adapter_info.rs`. WDDM 3.2 (not
-    // 2.0) is the target: a 2.0 adapter was previously rejected as too old for the
-    // 24H2 user-mode driver (STATUS_REVISION_MISMATCH), and the struct ABI we
-    // bindgen is already the 26100/WDDM-3.2 shape.
-    data.Version = if crate::ddi::query_adapter_info::RAISE_WDDM_3_2_GPUMMU {
-        if crate::ddi::query_adapter_info::USE_WDDM_2_1_DISPLAY_SURFACE {
-            DXGKDDI_INTERFACE_VERSION_WDDM2_1
-        } else {
-            DXGKDDI_INTERFACE_VERSION_WDDM3_2
-        }
-    } else {
-        DXGKDDI_INTERFACE_VERSION_WDDM1_3
-    };
+    // during bring-up; WDDM-sync-redesign M1 raised it onto the GpuMmu memory model
+    // so the OS enables monitored fences. The interface version is the PRIMARY lever
+    // (the OS infers the WDDM level from it + the advertised caps), and it must
+    // agree with `DXGK_DRIVERCAPS.WDDMVersion`, the GpuMmu `MemoryManagementCaps`
+    // bits and `GetNodeMetadata.GpuMmuSupported` in `query_adapter_info.rs` — which
+    // is why all four now read the one `SURFACE` value. The struct ABI we bindgen is
+    // the 26100/WDDM-3.2 shape regardless of the level reported here.
+    data.Version = crate::ddi::wddm_surface::SURFACE.ddi_interface_version();
 
     // ── PnP / power lifecycle (Phase 1, real) ──────────────────────────────
     data.DxgkDdiAddDevice = Some(ddi::dxgkddi_add_device);

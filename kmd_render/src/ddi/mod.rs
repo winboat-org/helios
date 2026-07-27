@@ -24,6 +24,7 @@ mod scheduler;
 mod start_device;
 mod submit_command;
 pub(crate) mod vidpn;
+pub(crate) mod wddm_surface;
 
 pub use add_device::dxgkddi_add_device;
 pub use blob_map::unmap_io_pages_from_user;

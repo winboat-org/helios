@@ -18,11 +18,11 @@ use crate::dxgk::_DXGK_QUERYADAPTERINFOTYPE::{
     DXGKQAITYPE_QUERYSEGMENT, DXGKQAITYPE_QUERYSEGMENT3, DXGKQAITYPE_QUERYSEGMENT4,
     DXGKQAITYPE_WDDMDEVICECAPS,
 };
-use crate::dxgk::_DXGK_WDDMVERSION::{DXGKDDI_WDDMv1_3, DXGKDDI_WDDMv2_1, DXGKDDI_WDDMv3_2};
 use crate::dxgk::*;
 
 use crate::adapter::AdapterContext;
 use crate::ddi::gpummu;
+use crate::ddi::wddm_surface::SURFACE;
 
 pub unsafe extern "C" fn dxgkddi_query_adapter_info(
     miniport_device_context: *mut c_void,
@@ -122,18 +122,10 @@ unsafe fn query_driver_caps(
     // Not a legacy VGA device.
     caps.SupportNonVGA = 1;
 
-    // Keep this in sync with DXGKQAITYPE_WDDMDEVICECAPS and DriverEntry's
+    // One value drives this, DXGKQAITYPE_WDDMDEVICECAPS and DriverEntry's
     // DRIVER_INITIALIZATION_DATA.Version. Dxgkrnl rejects internally
     // inconsistent version/capability surfaces during AddAdapter.
-    caps.WDDMVersion = if RAISE_WDDM_3_2_GPUMMU {
-        if USE_WDDM_2_1_DISPLAY_SURFACE {
-            DXGKDDI_WDDMv2_1
-        } else {
-            DXGKDDI_WDDMv3_2
-        }
-    } else {
-        DXGKDDI_WDDMv1_3
-    };
+    caps.WDDMVersion = SURFACE.driver_caps_version();
     caps.PreemptionCaps.GraphicsPreemptionGranularity =
         D3DKMDT_GRAPHICS_PREEMPTION_DMA_BUFFER_BOUNDARY;
     caps.PreemptionCaps.ComputePreemptionGranularity =
@@ -217,7 +209,7 @@ unsafe fn query_driver_caps(
     if DECLARE_CROSS_ADAPTER_RESOURCE || cross_adapter_advertised() {
         mem_caps |= MEMORYMANAGEMENTCAPS_CROSS_ADAPTER_RESOURCE;
     }
-    if RAISE_WDDM_3_2_GPUMMU {
+    if SURFACE.gpu_mmu() {
         mem_caps |= MEMORYMANAGEMENTCAPS_VIRTUAL_ADDRESSING_SUPPORTED
             | MEMORYMANAGEMENTCAPS_GPU_MMU_SUPPORTED;
     }
@@ -287,15 +279,7 @@ unsafe fn query_wddm_device_caps(args: &DXGKARG_QUERYADAPTERINFO) -> NTSTATUS {
     // SAFETY: pOutputData points to a DXGK_WDDMDEVICECAPS of sufficient size.
     let caps = unsafe { &mut *(args.pOutputData as *mut DXGK_WDDMDEVICECAPS) };
     unsafe { core::ptr::write_bytes(args.pOutputData as *mut u8, 0, args.OutputDataSize as usize) };
-    caps.WDDMVersion = if RAISE_WDDM_3_2_GPUMMU {
-        if USE_WDDM_2_1_DISPLAY_SURFACE {
-            DXGKDDI_WDDMv2_1
-        } else {
-            DXGKDDI_WDDMv3_2
-        }
-    } else {
-        DXGKDDI_WDDMv1_3
-    };
+    caps.WDDMVersion = SURFACE.driver_caps_version();
     STATUS_SUCCESS
 }
 
@@ -416,34 +400,11 @@ const REPORT_APERTURE_PAGING_SEGMENT: bool = true;
 /// contract that specifically requires it.
 pub(crate) const DECLARE_CROSS_ADAPTER_RESOURCE: bool = false;
 
-/// WDDM-sync-redesign M1 (2026-06-25): raise the adapter from the bring-up WDDM 1.3
-/// surface to a coherent WDDM 3.2 + GpuMmu (GPU virtual addressing) surface, so the
-/// OS enables the monitored-fence path that `D3DDDI_MONITORED_FENCE` (and the
-/// IddCx swapchain keyed-mutex/host-completion sync) requires. This is a SINGLE
-/// atomic on/off lever wired into every coupled site (DriverEntry `data.Version`,
-/// `DRIVERCAPS.WDDMVersion` + the `VirtualAddressingSupported|GpuMmuSupported`
-/// `MemoryManagementCaps` bits, `WDDMDEVICECAPS.WDDMVersion`, and
-/// `GetNodeMetadata.GpuMmuSupported`) because a PARTIAL raise is internally
-/// inconsistent and dxgkrnl rejects it at AddAdapter.
-///
-/// The GpuMmu DDI surface (GPUMMUCAPS, page-table-level desc, SetRootPageTable,
-/// GetRootPageTableSize, BuildPagingBuffer, SubmitCommand/SubmitCommandVirtual,
-/// CreateProcess) is already implemented (decorative/null engine), so this lever
-/// only flips the capability *declaration*. RISK: declaring GPU VA re-engages the
-/// VidMm paging path that historically bugchecked (InitDmaPools Code-43,
-/// 0x10E:0x49). If boot destabilizes, flip `false` + redeploy to revert to the
-/// known-good 1.3 surface. See `WDDM_SYNC_REDESIGN.md` M1.
-// Keep the coherent GPU-VA/GpuMmu contract enabled: the DisplayHalf activation
-// commit was proven on this modern memory model, while the 1.3 fallback commits
-// the enumerated monitor as a zero-path/powered-off VidPn on Windows 11 24H2.
-pub(crate) const RAISE_WDDM_3_2_GPUMMU: bool = true;
-
-// DWM treats a WDDM 2.2+ display adapter as a Display-Core/MPO3 presentation
-// device. Helios does not register the MPO3 KMD interface, so 3.2 makes DWM call
-// CDDisplaySwapChain's unimplemented legacy-present slot and fail-fast with
-// E_NOTIMPL. WDDM 2.1 is the truthful middle contract: modern GpuMmu/ManagedPrimary
-// activation, but below the MPO3 requirement boundary.
-pub(crate) const USE_WDDM_2_1_DISPLAY_SURFACE: bool = true;
+// The WDDM level itself — WDDM-sync-redesign M1's `RAISE_WDDM_3_2_GPUMMU` and the
+// display-surface lever that sat beside it — is now the single
+// `crate::ddi::wddm_surface::SURFACE` value. Two independently-readable bools could
+// express a PARTIAL raise, which is internally inconsistent and which dxgkrnl
+// rejects at AddAdapter. See `ddi/wddm_surface.rs` for the level history.
 
 /// `DirectFlipCaps` service knob (REG_DWORD, default 0): 0 = deny direct flip
 /// everywhere (adapter cap + aperture segment flags — the truthful surface for
@@ -882,11 +843,11 @@ pub unsafe extern "C" fn dxgkddi_get_node_metadata(
         core::ptr::write_bytes(node as *mut _ as *mut u8, 0, size_of::<DXGK_NODEMETADATA>());
     }
     node.EngineType = DXGK_ENGINE_TYPE::DXGK_ENGINE_TYPE_3D;
-    // The node memory model must match the DRIVERCAPS surface. When the WDDM 3.2 +
-    // GpuMmu raise is active, this 3D node advertises the GpuMmu (GPU virtual
-    // addressing) model; otherwise it stays at the viogpu3d-style WDDM 1.3 surface
-    // (no explicit memory model). GpuMmu and IoMmu are mutually exclusive.
-    node.GpuMmuSupported = if RAISE_WDDM_3_2_GPUMMU { 1 } else { 0 };
+    // The node memory model must match the DRIVERCAPS surface, so it reads the same
+    // value: a GpuMmu level advertises the GPU-virtual-addressing model, WDDM 1.3
+    // stays at the viogpu3d-style surface with no explicit memory model. GpuMmu and
+    // IoMmu are mutually exclusive.
+    node.GpuMmuSupported = BOOLEAN::from(SURFACE.gpu_mmu());
     node.IoMmuSupported = 0;
     // FriendlyName, Flags stay zeroed.
     STATUS_SUCCESS
