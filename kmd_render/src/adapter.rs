@@ -706,13 +706,6 @@ pub struct AdapterContext {
     /// allocation selected by `SetVidPnSourceAddress`.
     pub dedicated_scanout_image: AtomicU64,
     pub dedicated_scanout_memory: AtomicU64,
-    /// Diagnostic scanout blob selected by `ScanoutDiag >= 2`. This is a
-    /// KMD-owned, CPU-filled color-bars blob used only to prove whether QEMU can
-    /// display any blob from this miniport after boot.
-    pub diag_scanout_resource: AtomicU32,
-    pub diag_scanout_wh: AtomicU64,
-    /// Diagnostic scanout row pitch (high 32) and byte offset (low 32).
-    pub diag_scanout_layout: AtomicU64,
     pub scanout_refresh_count: AtomicU32,
     pub scanout_refresh_fail: AtomicU32,
     /// Dirty/coalescing state for real scanout refresh. A completion-ordered
@@ -1203,9 +1196,6 @@ impl AdapterContext {
             dedicated_scanout_resource: AtomicU32::new(0),
             dedicated_scanout_image: AtomicU64::new(0),
             dedicated_scanout_memory: AtomicU64::new(0),
-            diag_scanout_resource: AtomicU32::new(0),
-            diag_scanout_wh: AtomicU64::new(0),
-            diag_scanout_layout: AtomicU64::new(0),
             scanout_refresh_count: AtomicU32::new(0),
             scanout_refresh_fail: AtomicU32::new(0),
             scanout_refresh_pending: AtomicU32::new(0),
@@ -1296,9 +1286,6 @@ impl AdapterContext {
         self.primary_scanout_memory_type.store(0, Ordering::Release);
         self.primary_scanout_dxgi_format.store(0, Ordering::Release);
         self.primary_scanout_seq.fetch_add(1, Ordering::Release);
-        self.diag_scanout_resource.store(0, Ordering::Release);
-        self.diag_scanout_wh.store(0, Ordering::Release);
-        self.diag_scanout_layout.store(0, Ordering::Release);
         self.scanout_refresh_pending.store(0, Ordering::Release);
         self.scanout_flush_inflight.store(0, Ordering::Release);
         self.scanout_bind_inflight.store(0, Ordering::Release);
@@ -1652,27 +1639,6 @@ impl AdapterContext {
                 .fetch_add(1, Ordering::Relaxed);
         }
         self.primary_scanout_seq.fetch_add(1, Ordering::Release);
-    }
-
-    /// Remember the KMD-owned diagnostic blob. The production scanout can still
-    /// change in mode 1; mode 2 callers rebind this blob after each OS scanout
-    /// attempt so the host display should show color bars if blob scanout works.
-    pub fn remember_diag_scanout_blob(
-        &self,
-        resource_id: u32,
-        width: u32,
-        height: u32,
-        pitch: u32,
-        offset: u32,
-    ) {
-        let wh = ((width as u64) << 32) | height as u64;
-        let layout = ((pitch as u64) << 32) | offset as u64;
-        self.diag_scanout_wh
-            .store(wh, core::sync::atomic::Ordering::Release);
-        self.diag_scanout_layout
-            .store(layout, core::sync::atomic::Ordering::Release);
-        self.diag_scanout_resource
-            .store(resource_id, core::sync::atomic::Ordering::Release);
     }
 
     /// Queue one non-blocking RESOURCE_FLUSH for the selected scanout.  The

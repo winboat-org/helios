@@ -19,7 +19,6 @@ pub(crate) mod hpd;
 pub(crate) mod interrupt;
 mod present_packet;
 pub(crate) mod query_adapter_info;
-mod scanout_diag;
 mod scheduler;
 pub(crate) mod segment_table;
 mod start_device;

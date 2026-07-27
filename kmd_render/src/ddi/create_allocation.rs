@@ -1113,8 +1113,9 @@ const D3DDDI_ALLOCATIONPRIORITY_NORMAL: UINT = 0x7800_0000;
 
 /// 32-bpp linear row pitch aligned to the cross-adapter requirement
 /// (`D3D12_TEXTURE_DATA_PITCH_ALIGNMENT`, 256 bytes). Re-exported so the existing
-/// `crate::ddi::create_allocation::cross_adapter_pitch` call paths in
-/// `ddi/display.rs`, `ddi/gdi_blit.rs` and `ddi/scanout_diag.rs` are unchanged.
+/// `crate::ddi::create_allocation::cross_adapter_pitch` call path in
+/// `ddi/display.rs` is unchanged. (`ddi/gdi_blit.rs` and `ddi/scanout_diag.rs`
+/// were the other two callers; T1b and T6/R901 deleted both files.)
 ///
 /// The body now lives in `helios_kmd_logic`, which has no dependency edge to
 /// `wdk-sys` or the generated `dxgk` bindings and is covered by host unit tests —

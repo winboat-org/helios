@@ -501,7 +501,22 @@ pub unsafe extern "C" fn dxgkddi_start_device(
 
     if knobs.display_half {
         crate::diag::record_named_bytes(b"DspMd", adapter.display_mode_packed());
-        crate::ddi::scanout_diag::maybe_run(passive, adapter);
+
+        // Same-boot zeroing for the PRODUCTION LINEAR-scanout ladder, re-homed
+        // here by T6/R901. These eight names are written by
+        // `venus::create_linear_scanout_image` / `allocate_linear_scanout_image_blob`
+        // -- the KMD's real display fallback, which stays -- but their only
+        // zeroing lived inside the deleted `scanout_diag::maybe_run`. Registry
+        // value names PERSIST ACROSS BOOTS, so without this a stale prior-boot
+        // `SdgLStg` survives into a boot where the LINEAR fallback is never
+        // taken, and reads as though it had been. That is precisely the
+        // cross-boot counter trap the evidence rules forbid.
+        for name in [
+            b"SdgLStg", b"SdgLReq", b"SdgLBit", b"SdgLTyc", b"SdgLImg", b"SdgLMem",
+            b"SdgLPch", b"SdgLOff",
+        ] {
+            crate::diag::record_named_bytes(name, 0);
+        }
 
         // Arm the CRTC_VSYNC heartbeat: without a free-running VSync, dxgkrnl never
         // retires a flip and so never issues SetVidPnSourceAddress (viogpu3d
