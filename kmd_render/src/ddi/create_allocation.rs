@@ -54,7 +54,6 @@ struct AllocationContext {
     ctx_id: u32,
     resource_id: u32,
     owns_resource: bool,
-    blob_id: u64,
     /// Nonzero for KMD-backed standard allocations: the kernel venus client's
     /// `VkDeviceMemory` object id behind the blob, freed (`vkFreeMemory`) at
     /// DestroyAllocation after the resource unref.
@@ -92,12 +91,6 @@ struct AllocationContext {
     /// Exact `DXGK_SETVIDPNSOURCEADDRESS_FLAGS::Value` paired with the callback.
     vidpn_primary_flags: AtomicU32,
     size: SIZE_T,
-    /// Host-visible window byte offset this blob is mapped at (Stage 2b).
-    map_offset: u64,
-    /// Page-rounded mapped length (Stage 2b).
-    map_len: u64,
-    /// `true` once `RESOURCE_MAP_BLOB` has succeeded (so destroy unmaps first).
-    mapped: bool,
     /// Surface geometry for `DxgkDdiDescribeAllocation` (0 for UMD blob allocations
     /// that carry no dimensions). Populated from the standard-allocation trailer.
     width: u32,
@@ -134,6 +127,13 @@ struct AllocationContext {
     /// [`BAR_UNPLACED`]. Written by `BuildPagingBuffer` when it maps the blob at
     /// the assigned offset; atomic because paging DDIs run concurrently with
     /// allocation DDIs. Only meaningful for `bar_eligible` allocations.
+    ///
+    /// ⚠ PLACEMENT-CHANGE DETECTOR FOR `PgUn`, not a mapping decision. Nothing
+    /// consults it to decide whether to map or unmap: `build_paging_buffer.rs`
+    /// compares it against the incoming offset purely to count
+    /// `BAR_PT_HARVESTS`, surfaced as the `PgUn` registry value. Deleting it or
+    /// re-basing that comparison would silently change what `PgUn` means, which
+    /// is why T6/R915 kept it while deleting its write-only neighbours.
     bar_placed: core::sync::atomic::AtomicU64,
     /// This allocation was reported to VidMm as BAR-segment-only (KMD-backed
     /// standard allocation with a mappable venus blob, BAR segment active).
@@ -173,21 +173,8 @@ static CREATE_BREADCRUMB_TICKS: AtomicU32 = AtomicU32::new(0);
 /// in command allocation lists / CloseAllocation.
 const OPEN_ALLOCATION_CTX_MAGIC: u32 = 0x484F_504E; // "HOPN"
 
-/// Opaque allocation token owned by dxgkrnl.
-///
-/// This is deliberately not a pointer-shaped type. `DXGK_OPENALLOCATIONINFO`
-/// calls the field `hAllocation`, but its type is `D3DKMT_HANDLE` (a 32-bit
-/// runtime token), not the miniport's `AllocationContext*` returned from
-/// `DxgkDdiCreateAllocation`. Keeping the token behind a newtype prevents open
-/// allocation code from accidentally casting it back to a KMD context.
-#[repr(transparent)]
-#[derive(Clone, Copy)]
-struct RuntimeAllocationHandle(D3DKMT_HANDLE);
-
 struct OpenAllocationContext {
     magic: u32,
-    runtime_allocation: RuntimeAllocationHandle,
-    private_size: u32,
     /// Validated immutable view captured from open-time private data. Present
     /// receives only this device-specific open handle, so it must use this
     /// snapshot rather than trying to reinterpret dxgkrnl's runtime token as an
@@ -1513,11 +1500,12 @@ unsafe fn destroy_allocation_ctx(
         // Drop the owner-0 tracking slot (registered at CreateAllocation, or
         // re-owned to the allocation at adopt), unmapping the GDI executor's
         // host-visible mapping if one is live.
-        let unmapped_here =
-            crate::virtio::ctrl::forget_allocation_blob(passive, adapter, ctx.resource_id);
-        if ctx.mapped && !unmapped_here {
-            let _ = crate::virtio::ctrl::resource_unmap_blob(passive, adapter, ctx.resource_id);
-        }
+        // `forget_allocation_blob` already OWNS the unmap decision. The
+        // fallback that used to sit here was gated on `ctx.mapped`, whose doc
+        // claimed "true once RESOURCE_MAP_BLOB has succeeded" -- but its only
+        // writer set it `false`, so the branch never ran and the doc described
+        // a state the field could not reach. T6/R915.
+        let _ = crate::virtio::ctrl::forget_allocation_blob(passive, adapter, ctx.resource_id);
         // One guarded teardown path for created AND adopted resources. The old
         // adopted arm unref'd unconditionally, which double-freed resources
         // another path had already reclaimed — QEMU's "virgl_cmd_resource_unref:
@@ -2055,7 +2043,6 @@ unsafe fn create_one(
         ctx_id: ap.ctx_id,
         resource_id,
         owns_resource,
-        blob_id: ap.blob_id,
         venus_memory_id,
         venus_image_id,
         scanout_copy_image_id: core::sync::atomic::AtomicU64::new(0),
@@ -2072,9 +2059,6 @@ unsafe fn create_one(
         vidpn_primary_segment: AtomicU32::new(0),
         vidpn_primary_flags: AtomicU32::new(0),
         size,
-        map_offset: 0,
-        map_len: 0,
-        mapped: false,
         width: meta.width,
         height: meta.height,
         format: meta.format,
@@ -2514,8 +2498,6 @@ pub unsafe extern "C" fn dxgkddi_open_allocation(
         });
         let open = Box::new(OpenAllocationContext {
             magic: OPEN_ALLOCATION_CTX_MAGIC,
-            runtime_allocation: RuntimeAllocationHandle(info.hAllocation),
-            private_size: info.PrivateDriverDataSize,
             present,
             present_diag,
         });
@@ -2609,9 +2591,8 @@ pub unsafe extern "C" fn dxgkddi_close_allocation(
         let handle = unsafe { *args.pOpenHandleList.add(i) };
         if !handle.is_null() {
             crate::diag::record(0x0C37_0000 | ((handle as usize as u32) & 0xFFFF));
-            if let Some(open) = unsafe { take_open_ctx(handle) } {
-                let _ = (open.runtime_allocation, open.private_size);
-            }
+            // Taking the context frees it; nothing in it was ever read.
+            let _ = unsafe { take_open_ctx(handle) };
         }
     }
     STATUS_SUCCESS
