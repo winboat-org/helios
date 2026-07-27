@@ -32,6 +32,14 @@ param(
         'VnEncOvf', 'VnRingFt', 'VnRingWd', 'VnRingSz', 'VnMtDown', 'CpNoDrn',
         'PBTdErr', 'CtNotOurs', 'ChSzMm', 'ChSzPv', 'MapDup',
         'PciCapOob', 'WnRcf',
+        # R614. Packed (count << 8) | last_irql, so ANY nonzero value means a
+        # `PassiveLevel::assume()` site was reached above PASSIVE_LEVEL — i.e. a
+        # `// SAFETY:` claim at one of the twelve audited mints is FALSE on this
+        # machine. It is the one counter in this list that indicts the driver's
+        # own reasoning rather than the host or the transport, and a nonzero
+        # value is a design-gap escalation, not something to absorb: the DDI it
+        # names needs its own IRQL split, like MapCpuHostAperture already has.
+        'IrqlBad',
         # aperture / paging failure family
         'ChEi', 'ChEa', 'ChEp', 'ChEs', 'ChEb', 'ChEm', 'ChEu'
     ),
