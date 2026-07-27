@@ -638,40 +638,57 @@ virtio-gpu scanout; IddCx/Looking Glass is no longer the active display path.*
    separate WS1 defect. The harness now prints the handles-per-device-cycle figure directly so
    before/after compare on one number, and its working-set tolerance is calibrated to the WARP
    control's own ~8 MiB of runtime noise rather than to zero.
-7e. **T5 REMAINING WORK — the seven unfinished halves, in dependency order.**
-   Each entry says what exists, what is missing, and what it costs. Nothing here is blocked on
-   anything except R803/2b, which T8 needs.
+7e. **T5 REMAINING WORK — CLOSED. Two items implemented, six dispositioned.**
+   Supersedes the "seven unfinished halves" list this entry used to carry. Of the eight open
+   points, **two were the real work and are now landed** (R803's boxed half, R802 sub-commit 3);
+   **five are deferred with a named destination and a stated reason**; **one (R813) is closed as
+   rejected**. Nothing in T5 is now blocked, and `u-forward-a-01` (T8's `forward.rs` split) has
+   its stated precondition.
 
-   **(1) R803 sub-commits 2b..n — the boxed-payload half. THE BIG ONE, and T8 depends on it.**
-   *Done:* `Slot<P>` + `Com<T>`/`Boxed<S>` + `DdiHandle`/`ComHandle` in `forward/handles.rs`;
-   the five bare-COM accessors take typed handles (87 sites); zero raw slot casts remain.
-   *Missing:* the **eleven boxed accessors still take `*mut c_void`** — `store_resource`,
-   `load_resource`, `resource_state`, `resource_com_raw`, `resource_allocation`,
-   `resource_parent_handles`, `resource_present_private`, `resource_summary`, `store_rtv`,
-   `rtv_state`, `load_rtv`, `rtv_info`, `release_rtv`, `release_resource` — with **68 call
-   sites** still passing `.pDrvPrivate`. Convert one DDI family per commit, as the review says.
-   *Why it was deferred:* it closes no hazard those decoders have (they are already
-   payload-typed and correct), and the review rates the class medium-risk with a double-free
-   failure mode. *Why it must still happen:* `u-forward-a-01` (T8's `forward.rs` split) is
-   specified against it. **Risk: a converted site that adopts a payload twice is a double free
-   in `release_resource`/`release_rtv` — keep the old free functions until their last caller
-   is gone.**
+   **(1) R803 sub-commits 2b..f — the boxed-payload half. LANDED.** Five commits, readers before
+   owners so the only two functions per family that can double-free were reviewed alone:
+   - *2b* `BoxedHandle` + `boxed_slot()` in `forward/handles.rs`. An associated `State` type pairs
+     each boxed handle with the one struct its slot holds (`HRESOURCE`→`ResourceState`,
+     `HRENDERTARGETVIEW`→`RtvState`, `HELEMENTLAYOUT`→`LayoutData`), so the payload is derived
+     from the handle's type instead of chosen at the call site. Element-layout family converted
+     (3 sites) as the infrastructure's first user. Both are `pub(super)`, not `pub(crate)`: the
+     payload structs are private to `forward` and a `pub(crate)` trait may not leak them (E0446).
+   - *2c* the ten resource readers + `presented_primary_private`, 87 sites. Also re-typed
+     `rtv_desc`/`dsv_desc`/`srv_desc`, which took a `resource_priv: *mut c_void` purely to reach
+     `resource_sample_count`.
+   - *2d* `store_resource`/`release_resource` (6 sites) — the ownership-transfer pair, alone.
+   - *2e* the three RTV readers (6 sites); *2f* `store_rtv`/`release_rtv` plus the last raw boxed
+     decode, in `dxgi_rotate_resource_identities`.
+   **`Slot::<Boxed<_>>::from_priv` now survives at exactly two sites**, `resource_state_at` and
+   `rtv_state_at` — the runtime-tag forms for `Discard`, `ClearView` and the tiled-resource
+   barrier, where a `D3D11DDI_HANDLETYPE` picks the payload at *run* time and no static type
+   exists to key on. `ClearView`'s `hView` is a bare `*mut c_void` in the DDI itself, so there is
+   no handle to pass even in principle. These sit beside the pre-existing `handle_com_raw_at` /
+   `load_com_at` and carry the same contract.
+   `forward.rs` still names `pDrvPrivate` 66 times; **none of them decode a boxed slot** — they
+   are the `HDEVICE` private-memory cast (a different payload kind), `{:p}` log fields, null tests
+   on bare-COM handles, and the selftest's handle literals.
+   Verified with throwaway negative controls, not asserted: `resource_state(h_rtv)` →
+   `error[E0308]: mismatched types: expected D3D10DDI_HRESOURCE`, and
+   `let _: Option<Slot<Boxed<ResourceState>>> = boxed_slot(h_el)` → the same. Both removed.
 
-   **(2) R802 sub-commit 3 — the const-asserts in `ddi.rs`. NOT DONE, and my stated reason for
-   skipping it was WRONG.** `umd/src/ddi.rs` is still the bare 16-line bindgen `include!`.
-   The R802 commit message claims the bindgen layout tests already provide the machine-checking.
-   **They do not, for this purpose:** bindgen generates both the struct and its assertions from
-   the *same* header, so they are self-consistent by construction and a WDK revision that moves
-   a field regenerates both and passes. What the layout tests actually catch is
-   bindgen-vs-compiler disagreement, not ABI drift.
-   The accurate justification for the asserts is narrower but real: `create_device`'s
-   `CreateDevice raw args:` dump reads words 0..10 **by index** and bounds itself on
-   `size_of == 88`, so it is the one place with a genuine offset dependency. Add
-   `const _: () = assert!(size_of::<ddi::D3D10DDIARG_CREATEDEVICE>() == 88);` plus `offset_of`
-   for `hDrvDevice`@32, the funcs union@24, `DXGIBaseDDI`@40, `hRTCoreLayer`@56, `Flags`@72,
-   `ppfnRetrieveSubObject`@80, and `size_of` for `OPENADAPTER` / `GETCAPS` /
-   `DXGI_DDI_BASE_ARGS`. Cheap; the exact values are in commit `c090fdf`'s deleted proof module
-   (`git show c090fdf`). **Cost: one small commit.**
+   **(2) R802 sub-commit 3 — the const-asserts in `ddi.rs`. LANDED.** `size_of` == 88 plus the
+   eleven `D3D10DDIARG_CREATEDEVICE` offsets, `DXGI_DDI_BASE_ARGS` == 16, `OPENADAPTER` == 40,
+   `GETCAPS` == 32. **The reason given for skipping this in `c090fdf` was wrong, and that commit
+   message should not be trusted on the point:** bindgen derives both the struct and its 6,336
+   layout assertions from the same header, so they are self-consistent by construction and a WDK
+   revision that moved a field would regenerate both and pass. What they catch is bindgen
+   disagreeing with the C compiler, not the ABI moving under us.
+   The accurate justification is narrower but real: `create_device`'s `CreateDevice raw args:`
+   dump walks the argument as `*const u64` and prints words 0..=10 **by index**, bounded at 11
+   words on the premise that the struct is 88 bytes. Values lifted from `c090fdf`'s
+   `abi_equivalence_proof` module (deleted in `2d1fdb0`), so they are the same numbers that were
+   checked against the hand-transcribed struct before it was removed.
+   Confirmed live: flipping `hDrvDevice` 32→24 fails with `error[E0080]` at `ddi.rs:60`.
+   ★ **Independently confirmed by the gate's own ABI capture**, which is stronger evidence than
+   the compile-time check: the `UmdTrace=1` dump shows `[2]`=pKTCallbacks, `[3]`=pDeviceFuncs,
+   `[4]`=hDrvDevice, `[6]`=pDXGIBaseFuncs, `[8]`=pUMCallbacks, `[9]`=Flags — i.e. the runtime
+   really does place those fields at bytes 16/24/32/48/64/72, exactly as asserted.
 
    **(3) R809 — the two behaviour changes. DEFERRED, INSTRUMENTED, DECISION PENDING.**
    *Done:* one `RefCell<Option<ScanoutTarget>>` with a sealed `ScanoutKind`; the third writer
@@ -684,55 +701,65 @@ virtio-gpu scanout; IddCx/Looking Glass is no longer the active display path.*
    gate run with an up **and** down resolution change. **If all three read 0, the two rules are
    unreachable and can be adopted safely or dropped as dead.** That is the whole point of the
    counters — do not adopt the rules without that reading.
+   ⚠⚠ **The counters had NO READER until `9256a6e`, so that procedure was not executable
+   against the code as it was committed.** Three of the four were process-global atomics that
+   nothing ever loaded — they incremented into a void. `scanout_counter_summary()` now appends
+   `direct_over_linear= downres_kept= zero_extent= zero_pitch=` at every decision point on both
+   scan-out paths. Note the `downres_kept` branch is an **early return**: a summary only on the
+   success path would have been blind to the single policy it most needs to measure, which is
+   how the gap survived. **Read the values from the DWM UMD log** (`C:\ProgramData\Helios\
+   umd-<dwm pid>.log`, grep `DDI scanout target`), not from the registry — the UMD has no
+   registry counter surface.
 
-   **(4) R812 — the paired calc/create descriptor. NOT DONE.**
-   *Done:* `pfnCheckDeferredContextHandleSizes` reclassified out of the `calc!` lists into one
-   typed void stub in all four tables, plus `const _: () = assert!(THREADING_CAPS == 0)` tying
-   the three remaining 256-byte stubs to the cap. *Missing:* the `DdiObject` / `NoDriverPrivate`
-   descriptor that makes "a real Create with a stub size" unrepresentable for the marked
-   classes. It needs the paired **Create** slot names, which are currently filled by the blanket
-   noop pass and named nowhere — enumerating them is exactly the second table-fill abstraction
-   the review forbids building here. **Recommend folding this into T7's `u-core-07`**, which
-   rewrites all four fills anyway, rather than doing it in isolation.
+   **(4) R812 — the paired calc/create descriptor. DEFERRED to T7 `u-core-07`.**
+   *Landed in T5:* `pfnCheckDeferredContextHandleSizes` reclassified out of the `calc!` lists into
+   one typed void stub in all four tables, plus `const _: () = assert!(THREADING_CAPS == 0)` tying
+   the three remaining 256-byte stubs to the cap. *Not done:* the `DdiObject`/`NoDriverPrivate`
+   descriptor that would make "a real Create with a stub size" unrepresentable for the marked
+   classes. It needs the paired **Create** slot names, which the blanket noop pass fills and
+   nothing names; enumerating them here would be exactly the second table-fill abstraction the
+   review forbids building in T5. `u-core-07` rewrites all four fills anyway — the descriptor is
+   nearly free there and is a duplicated table here.
 
-   **(5) R813 — the eight shader-create wrappers. NOT DONE, deliberately.**
-   The review asks for `Option<usize>`/NonZero wrappers on the shader creates. Audited instead:
-   all **ten** call sites already guard the bridge's 0 sentinel with `if raw != 0` before
-   `store_raw_com`, storing a zero would be harmless anyway (`load_com` null-checks the slot),
-   and the result goes into a slot as a raw word rather than being wrapped owned-or-borrowed, so
-   there is no wrong-adoption hazard to close. **Recommend closing as "rejected as cosmetic"**
-   under the review's own standard, or doing it in T7 with the rest of the shader consolidation.
+   **(5) R813 — the eight shader-create wrappers. CLOSED AS REJECTED (cosmetic).**
+   Audited rather than implemented, and the audit stands under the review's own standard: all
+   **ten** call sites already guard the bridge's 0 sentinel with `if raw != 0` before
+   `store_raw_com`; storing a zero would be harmless anyway because `load_com` null-checks the
+   slot; and the result goes into the slot as a raw word rather than being wrapped
+   owned-or-borrowed, so there is no wrong-adoption hazard of the kind `Slot<P>` exists to close.
+   An `Option<usize>`/NonZero wrapper here would restate a check already present at every site and
+   close nothing. If the shader creates are consolidated in T7 the wrapper comes free with that;
+   it is not worth its own commit.
 
-   **(6) R818 sub-commit 2 — the Rust trampoline. NOT DONE.**
-   *Done:* the CPU-signal ABI's 24/0/8/16 is now static_asserted in C++ **and** const-asserted
-   against the bindgen type in Rust, so a WDK change fails the build. *Missing:* exporting
-   `helios_flip_signal` and repointing `present_flip_wait_setup`'s first parameter at it, so the
-   bridge never spells the WDDM ABI. **Its stated benefit is already delivered by the
-   cross-language asserts**; what remains is removing the duplicate declaration, at the cost of
-   a trampoline running on DXVK's fence-waiter and watchdog threads that must not allocate, log,
-   or touch any `Cell`/`RefCell` device state. **Recommend deferring to whichever tranche does
-   other trampoline work; it is not worth doing alone.**
+   **(6) R818 sub-commit 2 — the Rust trampoline. DEFERRED, no destination claimed.**
+   *Landed in T5:* the CPU-signal ABI's 24/0/8/16 is static_asserted in C++ **and** const-asserted
+   against the bindgen type in Rust, so a WDK change fails the build. **That is the whole of the
+   item's stated benefit.** *Not done:* exporting `helios_flip_signal` and repointing
+   `present_flip_wait_setup`'s first parameter at it. What that buys is removing a duplicate
+   *declaration*; what it costs is a Rust trampoline running on DXVK's fence-waiter and watchdog
+   threads, which must not allocate, log, or touch any `Cell`/`RefCell` device state. Bad trade on
+   its own — fold it into whichever tranche does other trampoline work.
 
-   **(7) R820 sub-commit 2 — move to `forward/format_caps.rs` + the pipeline. NOT DONE.**
-   *Done:* six previously-unnamed `D3D11_FORMAT_SUPPORT` bits, all five WARP values expressed as
-   compositions and pinned by `const _: () = assert!` to the hex they replace, bare integers
-   replaced by the named `DXGI_FORMAT_*` constants. *Missing:* the file move and the explicit
-   `base -> scrub_video -> warp_family_override -> reassert_msaa` pipeline, plus reading
-   `feature_level_mode()` once into a local (it is read four times). The const-asserts that make
-   the move safe now exist, so this is unblocked. **T8 is the move tranche and will relocate this
-   file's contents regardless — recommend doing it there.**
+   **(7) R820 sub-commit 2 — move to `forward/format_caps.rs` + the pipeline. DEFERRED to T8.**
+   *Landed in T5:* six previously-unnamed `D3D11_FORMAT_SUPPORT` bits, all five WARP values
+   expressed as compositions and pinned by `const _: () = assert!` to the hex they replace, bare
+   integers replaced by named `DXGI_FORMAT_*` constants. *Not done:* the file move, the explicit
+   `base -> scrub_video -> warp_family_override -> reassert_msaa` pipeline, and reading
+   `feature_level_mode()` once instead of four times. **The const-asserts that make the move safe
+   now exist**, so this is unblocked and purely a question of which tranche moves the file. T8 is
+   the move tranche and will relocate this file's contents regardless.
 
-   **(8) R816 — MECHANISM DEVIATION, not an unfinished half, but it leaves a gap.**
+   **(8) R816 — MECHANISM DEVIATION, gap acknowledged, closure is T7/T8-sized.**
    The review specifies cxx **shared structs** so the guarantee holds in BOTH languages. That is
    structurally impossible here: `dxvk_bridge.h` is included **by** the cxx-generated glue and
    `dxvk_bridge.cpp` includes no generated header, so a shared struct is declared after
-   `HeliosDxvkDevice` and can never appear in its signatures. Rust-side `SrcRes`/`DstRes`
-   newtypes were used instead, which R815's sealing makes airtight for **every reachable Rust
-   caller**. **The gap: a future edit to `dxvk_bridge.cpp` transposing the parameters on the C++
-   side is still unguarded.** Closing it properly needs the pimpl/header arrangement
-   restructured so the bridge can consume cxx-generated types — a T7/T8-sized change.
-
-   ⚠ **And the gate itself has NOT been run at all.** Nothing is deployed. See the end of 7d.
+   `HeliosDxvkDevice` and can never appear in its signatures. The review's own `PresentPair`
+   fallback has the identical problem. Rust-side `SrcRes`/`DstRes` newtypes were used instead,
+   which R815's sealing makes airtight for **every reachable Rust caller** (transposing them is
+   `error[E0308]`). **The residual gap: a future edit to `dxvk_bridge.cpp` that transposes the two
+   parameters on the C++ side is still unguarded.** Closing it properly means restructuring the
+   pimpl/header arrangement so the bridge can consume cxx-generated types — out of scope for a
+   tranche that is not allowed to move files.
 
 8. Implement the remaining reviewed refactors atomically, in tranche order, one recommendation
    per commit; never fold a `BUG` fix into a structure move. Preserve the current direct
