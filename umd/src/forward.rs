@@ -6382,9 +6382,43 @@ unsafe extern "C" fn cs_set_constant_buffers(
     }
 }
 
+/// The six programmable shader stages the D3D11 DDI binds to.
+///
+/// Replaces a `&str` discriminator matched with a silent `_ => {}` catch-all on
+/// two bind paths. All twelve callers passed correct literals, so this removes a
+/// latent silent-skip class rather than fixing a live bind: a typo, or a future
+/// `AS`/`MS` stage, would have bound NOTHING and left the previous stage's
+/// buffers or SRVs live for the following draw, with no counter and no log.
+/// R827.
+#[derive(Clone, Copy)]
+enum ShaderStage {
+    Vs,
+    Ps,
+    Gs,
+    Hs,
+    Ds,
+    Cs,
+}
+
+impl ShaderStage {
+    /// Exactly the two-letter strings the log lines carried before R827, so
+    /// `DDI {stage}SetShaderResources ...` and
+    /// `DDI {stage}SetConstantBuffers1 ...` stay textually identical.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Vs => "VS",
+            Self::Ps => "PS",
+            Self::Gs => "GS",
+            Self::Hs => "HS",
+            Self::Ds => "DS",
+            Self::Cs => "CS",
+        }
+    }
+}
+
 unsafe fn set_constant_buffers1_common(
     h: Hdevice,
-    stage: &str,
+    stage: ShaderStage,
     start: u32,
     num: u32,
     bufs: *const ddi::D3D10DDI_HRESOURCE,
@@ -6422,18 +6456,19 @@ unsafe fn set_constant_buffers1_common(
             *num_constants
         };
         trace_line!(
-            "DDI {stage}SetConstantBuffers1 start={} num={} first_ptr={} count_ptr={} first0={} count0={}",
-            start, num, !first_constants.is_null(), !num_constants.is_null(), first0, count0
+            "DDI {}SetConstantBuffers1 start={} num={} first_ptr={} count_ptr={} first0={} count0={}",
+            stage.name(), start, num, !first_constants.is_null(), !num_constants.is_null(), first0, count0
         );
     }
+    // Exhaustive: adding a stage to the enum is a compile error here, not a
+    // silent no-op bind.
     match stage {
-        "VS" => c.VSSetConstantBuffers1(start, num, buffers_ptr, first_ptr, count_ptr),
-        "PS" => c.PSSetConstantBuffers1(start, num, buffers_ptr, first_ptr, count_ptr),
-        "GS" => c.GSSetConstantBuffers1(start, num, buffers_ptr, first_ptr, count_ptr),
-        "HS" => c.HSSetConstantBuffers1(start, num, buffers_ptr, first_ptr, count_ptr),
-        "DS" => c.DSSetConstantBuffers1(start, num, buffers_ptr, first_ptr, count_ptr),
-        "CS" => c.CSSetConstantBuffers1(start, num, buffers_ptr, first_ptr, count_ptr),
-        _ => {}
+        ShaderStage::Vs => c.VSSetConstantBuffers1(start, num, buffers_ptr, first_ptr, count_ptr),
+        ShaderStage::Ps => c.PSSetConstantBuffers1(start, num, buffers_ptr, first_ptr, count_ptr),
+        ShaderStage::Gs => c.GSSetConstantBuffers1(start, num, buffers_ptr, first_ptr, count_ptr),
+        ShaderStage::Hs => c.HSSetConstantBuffers1(start, num, buffers_ptr, first_ptr, count_ptr),
+        ShaderStage::Ds => c.DSSetConstantBuffers1(start, num, buffers_ptr, first_ptr, count_ptr),
+        ShaderStage::Cs => c.CSSetConstantBuffers1(start, num, buffers_ptr, first_ptr, count_ptr),
     }
 }
 
@@ -6445,7 +6480,7 @@ unsafe extern "C" fn vs_set_constant_buffers1(
     first_constants: *const u32,
     num_constants: *const u32,
 ) {
-    set_constant_buffers1_common(h, "VS", start, num, bufs, first_constants, num_constants);
+    set_constant_buffers1_common(h, ShaderStage::Vs, start, num, bufs, first_constants, num_constants);
 }
 
 unsafe extern "C" fn ps_set_constant_buffers1(
@@ -6456,7 +6491,7 @@ unsafe extern "C" fn ps_set_constant_buffers1(
     first_constants: *const u32,
     num_constants: *const u32,
 ) {
-    set_constant_buffers1_common(h, "PS", start, num, bufs, first_constants, num_constants);
+    set_constant_buffers1_common(h, ShaderStage::Ps, start, num, bufs, first_constants, num_constants);
 }
 
 unsafe extern "C" fn gs_set_constant_buffers1(
@@ -6467,7 +6502,7 @@ unsafe extern "C" fn gs_set_constant_buffers1(
     first_constants: *const u32,
     num_constants: *const u32,
 ) {
-    set_constant_buffers1_common(h, "GS", start, num, bufs, first_constants, num_constants);
+    set_constant_buffers1_common(h, ShaderStage::Gs, start, num, bufs, first_constants, num_constants);
 }
 
 unsafe extern "C" fn hs_set_constant_buffers1(
@@ -6478,7 +6513,7 @@ unsafe extern "C" fn hs_set_constant_buffers1(
     first_constants: *const u32,
     num_constants: *const u32,
 ) {
-    set_constant_buffers1_common(h, "HS", start, num, bufs, first_constants, num_constants);
+    set_constant_buffers1_common(h, ShaderStage::Hs, start, num, bufs, first_constants, num_constants);
 }
 
 unsafe extern "C" fn ds_set_constant_buffers1(
@@ -6489,7 +6524,7 @@ unsafe extern "C" fn ds_set_constant_buffers1(
     first_constants: *const u32,
     num_constants: *const u32,
 ) {
-    set_constant_buffers1_common(h, "DS", start, num, bufs, first_constants, num_constants);
+    set_constant_buffers1_common(h, ShaderStage::Ds, start, num, bufs, first_constants, num_constants);
 }
 
 unsafe extern "C" fn cs_set_constant_buffers1(
@@ -6500,7 +6535,7 @@ unsafe extern "C" fn cs_set_constant_buffers1(
     first_constants: *const u32,
     num_constants: *const u32,
 ) {
-    set_constant_buffers1_common(h, "CS", start, num, bufs, first_constants, num_constants);
+    set_constant_buffers1_common(h, ShaderStage::Cs, start, num, bufs, first_constants, num_constants);
 }
 
 unsafe extern "C" fn ps_set_shader_resources(
@@ -6509,12 +6544,12 @@ unsafe extern "C" fn ps_set_shader_resources(
     num: u32,
     srvs: *const ddi::D3D10DDI_HSHADERRESOURCEVIEW,
 ) {
-    set_shader_resources_common(h, "PS", start, num, srvs);
+    set_shader_resources_common(h, ShaderStage::Ps, start, num, srvs);
 }
 
 unsafe fn set_shader_resources_common(
     h: Hdevice,
-    stage: &str,
+    stage: ShaderStage,
     start: u32,
     num: u32,
     srvs: *const ddi::D3D10DDI_HSHADERRESOURCEVIEW,
@@ -6527,18 +6562,17 @@ unsafe fn set_shader_resources_common(
     let n = SRV_BIND_LOG_COUNT.next();
     if n < 2048 || missing != 0 {
         trace_line!(
-            "DDI {stage}SetShaderResources start={} num={} nonnull={} missing={} first_raw=0x{:x} first_priv={:p}",
-            start, num, nonnull, missing, first_raw, first_priv
+            "DDI {}SetShaderResources start={} num={} nonnull={} missing={} first_raw=0x{:x} first_priv={:p}",
+            stage.name(), start, num, nonnull, missing, first_raw, first_priv
         );
     }
     match stage {
-        "VS" => c.VSSetShaderResources(start, Some(&views)),
-        "PS" => c.PSSetShaderResources(start, Some(&views)),
-        "GS" => c.GSSetShaderResources(start, Some(&views)),
-        "HS" => c.HSSetShaderResources(start, Some(&views)),
-        "DS" => c.DSSetShaderResources(start, Some(&views)),
-        "CS" => c.CSSetShaderResources(start, Some(&views)),
-        _ => {}
+        ShaderStage::Vs => c.VSSetShaderResources(start, Some(&views)),
+        ShaderStage::Ps => c.PSSetShaderResources(start, Some(&views)),
+        ShaderStage::Gs => c.GSSetShaderResources(start, Some(&views)),
+        ShaderStage::Hs => c.HSSetShaderResources(start, Some(&views)),
+        ShaderStage::Ds => c.DSSetShaderResources(start, Some(&views)),
+        ShaderStage::Cs => c.CSSetShaderResources(start, Some(&views)),
     }
 }
 unsafe extern "C" fn vs_set_shader_resources(
@@ -6547,7 +6581,7 @@ unsafe extern "C" fn vs_set_shader_resources(
     num: u32,
     srvs: *const ddi::D3D10DDI_HSHADERRESOURCEVIEW,
 ) {
-    set_shader_resources_common(h, "VS", start, num, srvs);
+    set_shader_resources_common(h, ShaderStage::Vs, start, num, srvs);
 }
 unsafe extern "C" fn gs_set_shader_resources(
     h: Hdevice,
@@ -6555,7 +6589,7 @@ unsafe extern "C" fn gs_set_shader_resources(
     num: u32,
     srvs: *const ddi::D3D10DDI_HSHADERRESOURCEVIEW,
 ) {
-    set_shader_resources_common(h, "GS", start, num, srvs);
+    set_shader_resources_common(h, ShaderStage::Gs, start, num, srvs);
 }
 unsafe extern "C" fn hs_set_shader_resources(
     h: Hdevice,
@@ -6563,7 +6597,7 @@ unsafe extern "C" fn hs_set_shader_resources(
     num: u32,
     srvs: *const ddi::D3D10DDI_HSHADERRESOURCEVIEW,
 ) {
-    set_shader_resources_common(h, "HS", start, num, srvs);
+    set_shader_resources_common(h, ShaderStage::Hs, start, num, srvs);
 }
 unsafe extern "C" fn ds_set_shader_resources(
     h: Hdevice,
@@ -6571,7 +6605,7 @@ unsafe extern "C" fn ds_set_shader_resources(
     num: u32,
     srvs: *const ddi::D3D10DDI_HSHADERRESOURCEVIEW,
 ) {
-    set_shader_resources_common(h, "DS", start, num, srvs);
+    set_shader_resources_common(h, ShaderStage::Ds, start, num, srvs);
 }
 unsafe extern "C" fn cs_set_shader_resources(
     h: Hdevice,
@@ -6579,7 +6613,7 @@ unsafe extern "C" fn cs_set_shader_resources(
     num: u32,
     srvs: *const ddi::D3D10DDI_HSHADERRESOURCEVIEW,
 ) {
-    set_shader_resources_common(h, "CS", start, num, srvs);
+    set_shader_resources_common(h, ShaderStage::Cs, start, num, srvs);
 }
 unsafe extern "C" fn ps_set_samplers(
     h: Hdevice,
@@ -7176,16 +7210,34 @@ unsafe extern "C" fn set_predication(
     context.SetPredication(predicate.as_ref(), predicate_value != 0);
 }
 
+/// Shared rate cap for the three MSAA log sites (R829).
+static MSAA_LOG_COUNT: LogThrottle = LogThrottle::new();
+
 /// D3D11 multisample-quality caps, keyed off the active feature-level profile.
 ///
 /// The Microsoft runtime validates `CheckFormatSupport` and
 /// `CheckMultisampleQualityLevels` as a coherent feature-level contract during
 /// `CDevice::LLOCompleteLayerConstruction`. The FL10.0 profile expresses a
 /// no-multisample device (1x only) coherently with `check_format_support`
-/// stripping the multisample bits. The FL11_0 profile implements the D3D11.3
-/// §19.2.5 floor: 1x, 4x for every output-capable format and 8x for output
-/// formats below 128 bits/sample. The runtime also accepts optional standard
-/// patterns (2x/16x) but rejects arbitrary non-power-of-two sample counts.
+/// stripping the multisample bits. The FL11_0 profile advertises 1x, 4x, 8x and
+/// the optional standard patterns (2x/16x) for EVERY output-capable format. The
+/// runtime rejects arbitrary non-power-of-two sample counts.
+///
+/// R829 (OWNER DECISION): this doc previously claimed the D3D11.3 §19.2.5
+/// exception -- 8x only for output formats *below* 128 bits/sample -- which the
+/// code has never implemented. The decision was to correct the DOC, not the
+/// code. §19.2.5 is a FLOOR, not a ceiling: a driver may advertise above it,
+/// and the caps/quality pair stays internally coherent either way because
+/// `check_format_support` uses the SAME
+/// `dxgi_msaa_bits_per_sample(fmt, caps).is_some()` predicate.
+///
+/// What made this a decision rather than a cleanup, and worth knowing before
+/// revisiting it: `dxgi_msaa_bits_per_sample` resolves to a static format table
+/// plus the DXVK caps word. It never asks whether that SAMPLE COUNT is
+/// supported, so today's "8x on a 128-bit format" is a table assertion, not a
+/// capability probe. Implementing the floor would narrow the claim; probing
+/// DXVK would make it true. Neither is done here -- both are behaviour changes
+/// on the default-live FL11 caps path, which this tranche freezes.
 unsafe fn helios_multisample_quality_levels(
     h: Hdevice,
     fmt: ddi::DXGI_FORMAT,
@@ -7205,13 +7257,20 @@ unsafe fn helios_multisample_quality_levels(
         .CheckFormatSupport(DXGI_FORMAT(fmt as i32))
         .unwrap_or(0);
     let output_bits = dxgi_msaa_bits_per_sample(fmt as u32, caps);
-    let required = match (sample_count, output_bits) {
-        (1 | 2 | 4 | 16, Some(_)) => true,
-        (8, Some(_)) => true,
-        _ => false,
-    };
+    // The two arms were identical -- (1|2|4|16, Some(_)) and (8, Some(_)) both
+    // yielding true -- which is what made the doc's 128-bit exception look
+    // implemented. Collapsed; `output_bits` is still bound for the log, which
+    // is the only thing that ever consumed it.
+    let required = matches!(
+        (sample_count, output_bits),
+        (1 | 2 | 4 | 8 | 16, Some(_))
+    );
     let val = if required { 1 } else { 0 };
-    if required || sample_count <= 8 {
+    // DECLARED diagnostic-volume change (R829): this site fired whenever
+    // `required || sample_count <= 8`, i.e. on essentially every query, and the
+    // two public wrappers below logged unconditionally with no cap at all. All
+    // three now share one throttle.
+    if (required || sample_count <= 8) && MSAA_LOG_COUNT.first_n_then_every(256, 4096).is_some() {
         trace_line!(
             "MSAA q fmt={fmt} c={sample_count} output_bits={output_bits:?} required={required} -> {val}"
         );
@@ -7228,9 +7287,11 @@ unsafe extern "C" fn check_multisample_quality_levels(
     if !out.is_null() {
         let val = helios_multisample_quality_levels(h, fmt, sample_count);
         *out = val;
-        trace_line!(
-            "MSAA out fmt={fmt} c={sample_count} flags=legacy out={out:p} val={val}"
-        );
+        if MSAA_LOG_COUNT.first_n_then_every(256, 4096).is_some() {
+            trace_line!(
+                "MSAA out fmt={fmt} c={sample_count} flags=legacy out={out:p} val={val}"
+            );
+        }
     }
 }
 
@@ -7244,9 +7305,11 @@ unsafe extern "C" fn check_multisample_quality_levels_wddm1_3(
     if !out.is_null() {
         let val = helios_multisample_quality_levels(h, fmt, sample_count);
         *out = val;
-        trace_line!(
-            "MSAA out fmt={fmt} c={sample_count} flags=0x{_flags:x} out={out:p} val={val}"
-        );
+        if MSAA_LOG_COUNT.first_n_then_every(256, 4096).is_some() {
+            trace_line!(
+                "MSAA out fmt={fmt} c={sample_count} flags=0x{_flags:x} out={out:p} val={val}"
+            );
+        }
     }
 }
 
@@ -11027,6 +11090,54 @@ unsafe extern "C" fn dxgi_reclaim_resources(arg: *mut ddi::DXGI_DDI_ARG_RECLAIMR
     0
 }
 
+// ---------------------------------------------------------------------------
+// R830 (OWNER DECISION): name the literals, DO NOT change the values.
+// ---------------------------------------------------------------------------
+//
+// Helios advertises MaxPlanes = 16, 16x stretch and shrink, and BILINEAR
+// filtering, while the KMD deliberately does not register the MPO3 interface
+// (query_adapter_info.rs pins the display surface to WDDM 2.1) and dxgi_blt1
+// rejects any stretch with DXGI_ERROR_UNSUPPORTED. So these are caps with no
+// kernel overlay path behind them.
+//
+// The review's own correction stands and is worth keeping visible: the plane
+// count IS already a named constant (DXGI_MPO_MAX_PLANES), and
+// `dxgi_present_mpo` forwarding only (allocation, subresource) is CORRECT --
+// DXGIDDICB_PRESENT_MULTIPLANE_OVERLAY has no geometry fields at all. Plane
+// attributes reach the kernel through dxgkrnl's MPO VidPn DDIs, which is
+// exactly where Helios has nothing. The unjustified literals were the two 16.0
+// factors, BILINEAR and NumCapabilityGroups: 1 -- named below.
+//
+// Reducing the advertised caps is behaviour-affecting: DWM picks its
+// composition strategy from them, and the direct-primary scanout path is this
+// tranche's frozen baseline. DEFERRED pending same-boot evidence on whether DWM
+// queries MPO at all (zero GetMultiplaneOverlayCaps / MPO-plane lines appear in
+// any UMD log on this box, but those logs predate the tranche by three weeks --
+// re-sample at the gate). See the ROADMAP T5 entry.
+/// The four MPO feature-cap bits Helios advertises. Hoisted to module scope by
+/// R830 so `HELIOS_MPO_OVERLAY_CAPS` below can be the single composition.
+const RGB: u32 =
+    ddi::DXGI_DDI_MULTIPLANE_OVERLAY_FEATURE_CAPS_DXGI_DDI_MULTIPLANE_OVERLAY_FEATURE_CAPS_RGB
+        as u32;
+const BILINEAR: u32 = ddi::DXGI_DDI_MULTIPLANE_OVERLAY_FEATURE_CAPS_DXGI_DDI_MULTIPLANE_OVERLAY_FEATURE_CAPS_BILINEAR_FILTER
+    as u32;
+const SHARED: u32 =
+    ddi::DXGI_DDI_MULTIPLANE_OVERLAY_FEATURE_CAPS_DXGI_DDI_MULTIPLANE_OVERLAY_FEATURE_CAPS_SHARED
+        as u32;
+const IMMEDIATE: u32 = ddi::DXGI_DDI_MULTIPLANE_OVERLAY_FEATURE_CAPS_DXGI_DDI_MULTIPLANE_OVERLAY_FEATURE_CAPS_IMMEDIATE
+    as u32;
+
+/// Maximum stretch the caps advertise. NOT implemented: `dxgi_blt1` refuses any
+/// stretch with DXGI_ERROR_UNSUPPORTED.
+const HELIOS_MPO_MAX_STRETCH: f32 = 16.0;
+/// Maximum shrink the caps advertise. Same caveat as the stretch factor.
+const HELIOS_MPO_MAX_SHRINK: f32 = 16.0;
+/// One capability group, covering all planes.
+const HELIOS_MPO_GROUPS: u32 = 1;
+/// The advertised overlay feature caps. BILINEAR is the questionable member --
+/// there is no filter path behind it.
+const HELIOS_MPO_OVERLAY_CAPS: u32 = RGB | BILINEAR | SHARED | IMMEDIATE;
+
 unsafe extern "C" fn dxgi_get_mpo_caps(
     arg: *mut ddi::DXGI_DDI_ARG_GETMULTIPLANEOVERLAYCAPS,
 ) -> i32 {
@@ -11036,7 +11147,7 @@ unsafe extern "C" fn dxgi_get_mpo_caps(
     let a = &mut *arg;
     a.MultiplaneOverlayCaps = ddi::DXGI_DDI_MULTIPLANE_OVERLAY_CAPS {
         MaxPlanes: DXGI_MPO_MAX_PLANES,
-        NumCapabilityGroups: 1,
+        NumCapabilityGroups: HELIOS_MPO_GROUPS,
     };
     if MPO_LOG_COUNT.first_n(16).is_some() {
         log_error!(
@@ -11054,22 +11165,12 @@ unsafe extern "C" fn dxgi_get_mpo_group_caps(
         return 0;
     }
     let a = &mut *arg;
-    const RGB: u32 =
-        ddi::DXGI_DDI_MULTIPLANE_OVERLAY_FEATURE_CAPS_DXGI_DDI_MULTIPLANE_OVERLAY_FEATURE_CAPS_RGB
-            as u32;
-    const BILINEAR: u32 = ddi::DXGI_DDI_MULTIPLANE_OVERLAY_FEATURE_CAPS_DXGI_DDI_MULTIPLANE_OVERLAY_FEATURE_CAPS_BILINEAR_FILTER
-        as u32;
-    const SHARED: u32 =
-        ddi::DXGI_DDI_MULTIPLANE_OVERLAY_FEATURE_CAPS_DXGI_DDI_MULTIPLANE_OVERLAY_FEATURE_CAPS_SHARED
-            as u32;
-    const IMMEDIATE: u32 = ddi::DXGI_DDI_MULTIPLANE_OVERLAY_FEATURE_CAPS_DXGI_DDI_MULTIPLANE_OVERLAY_FEATURE_CAPS_IMMEDIATE
-        as u32;
     a.MultiplaneOverlayGroupCaps = if a.GroupIndex == 0 {
         ddi::DXGI_DDI_MULTIPLANE_OVERLAY_GROUP_CAPS {
             NumPlanes: DXGI_MPO_MAX_PLANES,
-            MaxStretchFactor: 16.0,
-            MaxShrinkFactor: 16.0,
-            OverlayCaps: RGB | BILINEAR | SHARED | IMMEDIATE,
+            MaxStretchFactor: HELIOS_MPO_MAX_STRETCH,
+            MaxShrinkFactor: HELIOS_MPO_MAX_SHRINK,
+            OverlayCaps: HELIOS_MPO_OVERLAY_CAPS,
             StereoCaps: 0,
         }
     } else {
