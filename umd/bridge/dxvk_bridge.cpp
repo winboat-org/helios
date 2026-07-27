@@ -1317,8 +1317,21 @@ struct HeliosDxvkDeviceImpl {
   std::mutex presentSyncMutex;
 
   // Kernel flip-wait signal context + wedge watchdog (see the ctx above).
+  // Guarded by presentSyncMutex (R817). Pre-R817 both the readiness check and
+  // the publication were unsynchronised reads/writes of this member.
   std::shared_ptr<HeliosFlipWaitCtx> flipWait;
   std::thread flipWaitWatchdog;
+  // Set between "this call owns the setup" and publication, so a concurrent
+  // second setup cannot assign over a joinable flipWaitWatchdog -- which is
+  // std::terminate, not a recoverable error.
+  bool flipWaitSetupInProgress = false;
+  // Setup calls refused because they arrived with parameters differing from
+  // the recorded ones. Pre-R817 that path returned TRUE while silently
+  // discarding the signal_cb / h_rt_device / h_fence / fence_cpu_va it was
+  // handed, so the caller believed a NEW fence was armed while ctx still held
+  // the OLD hFence and cpuVa.
+  std::atomic<std::uint32_t> flipWaitSetupMismatch{0};
+  std::atomic<std::uint32_t> flipWaitSetupConcurrent{0};
 
   ~HeliosDxvkDeviceImpl() {
     // Silence the flip-wait machinery BEFORE the runtime device dies (the
@@ -2475,20 +2488,72 @@ bool HeliosDxvkDevice::present_flip_wait_setup(
   return bridge_guard("present_flip_wait_setup", false, [&]() -> bool {
     if (!impl || !signal_cb || !h_fence || !fence_cpu_va)
       return false;
+
+    const auto signal = reinterpret_cast<HeliosSignalSyncFromCpuCb>(signal_cb);
+    auto* const hDevice = reinterpret_cast<void*>(h_rt_device);
+    const auto* cpuVa =
+        reinterpret_cast<const volatile std::uint64_t*>(fence_cpu_va);
+
+    // R817 phase 1: decide, under ONE critical section, whether this call owns
+    // the setup. The disabled check and the already-set-up check were two
+    // separate reads before, the second of them unsynchronised.
     {
       std::lock_guard<std::mutex> lock(impl->presentSyncMutex);
       if (impl->presentSyncDisabled)
         return false; // no producer fence will ever signal — CPU gate serves
+      if (impl->flipWait) {
+        const auto& prev = *impl->flipWait;
+        const bool same = prev.signal == signal && prev.hDevice == hDevice &&
+                          prev.hFence == h_fence && prev.cpuVa == cpuVa;
+        if (same)
+          return true;
+        // INTENTIONAL BEHAVIOUR CHANGE on a path that cannot currently fire:
+        // this used to return TRUE while discarding every parameter it was
+        // handed. After a device reset with a new monitored fence that means
+        // the caller believes a new fence is armed while ctx still holds the
+        // OLD hFence and cpuVa -- the watchdog then dereferences a retired
+        // monitored-fence mapping and signalTo drives a dead handle.
+        const std::uint32_t n =
+          impl->flipWaitSetupMismatch.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n <= 8 || (n % 512) == 0) {
+          char msg[192];
+          std::snprintf(msg, sizeof(msg),
+            "flip-kwait setup REFUSED: parameters differ from the armed ctx "
+            "(fence 0x%08x -> 0x%08x) (x%u)",
+            prev.hFence, h_fence, n);
+          umd_log(msg);
+        }
+        return false;
+      }
+      if (impl->flipWaitSetupInProgress) {
+        // A second concurrent setup. Assigning flipWaitWatchdog over a
+        // joinable thread is std::terminate, so refuse rather than race.
+        impl->flipWaitSetupConcurrent.fetch_add(1, std::memory_order_relaxed);
+        return false;
+      }
+      impl->flipWaitSetupInProgress = true;
     }
-    if (impl->flipWait)
-      return true;
+
+    // The in-progress flag must be cleared on EVERY exit from here on, not just
+    // the success path: bridge_guard swallows exceptions, so a throw from
+    // make_shared or from std::thread construction would otherwise latch the
+    // flag and permanently refuse every later setup.
+    struct SetupFlagGuard {
+      HeliosDxvkDeviceImpl* impl;
+      bool armed = true;
+      ~SetupFlagGuard() {
+        if (!armed)
+          return;
+        std::lock_guard<std::mutex> lock(impl->presentSyncMutex);
+        impl->flipWaitSetupInProgress = false;
+      }
+    } setupFlag{impl.get()};
 
     auto ctx = std::make_shared<HeliosFlipWaitCtx>();
-    ctx->signal  = reinterpret_cast<HeliosSignalSyncFromCpuCb>(signal_cb);
-    ctx->hDevice = reinterpret_cast<void*>(h_rt_device);
+    ctx->signal  = signal;
+    ctx->hDevice = hDevice;
     ctx->hFence  = h_fence;
-    ctx->cpuVa   = reinterpret_cast<const volatile std::uint64_t*>(fence_cpu_va);
-    impl->flipWait = ctx;
+    ctx->cpuVa   = cpuVa;
 
     // Wedge watchdog: queued GPU waits park the present CONTEXT, not a thread,
     // so a poisoned copy chain (present fence never reaching its target) would
@@ -2527,6 +2592,17 @@ bool HeliosDxvkDevice::present_flip_wait_setup(
       }
     });
 
+    // R817 phase 3: publish only AFTER the watchdog thread is running, so a
+    // visible ctx always has its watchdog. Pre-R817 publication happened eight
+    // lines before the thread was created, leaving a window in which a
+    // wedged chain had nothing to unwedge it.
+    {
+      std::lock_guard<std::mutex> lock(impl->presentSyncMutex);
+      impl->flipWait = ctx;
+      impl->flipWaitSetupInProgress = false;
+    }
+    setupFlag.armed = false;  // published; the guard has nothing left to undo
+
     umd_log("flip-kwait: kernel flip-wait READY (runtime-device fence armed)");
     return true;
   });
@@ -2535,18 +2611,24 @@ bool HeliosDxvkDevice::present_flip_wait_setup(
 bool HeliosDxvkDevice::present_flip_wait_arm(
     std::uint64_t target_value,
     std::uint64_t flip_value) const {
-  if (!impl || !impl->flipWait)
+  if (!impl)
     return false;
 
+  // R817: the ctx and the present fence are read in ONE critical section, so
+  // arming can only ever use a ctx a COMPLETED setup published. Pre-R817 this
+  // read impl->flipWait twice without the lock, either side of a locked block.
   dxvk::Rc<dxvk::DxvkFence> fence;
+  std::shared_ptr<HeliosFlipWaitCtx> ctx;
   {
     std::lock_guard<std::mutex> lock(impl->presentSyncMutex);
     if (impl->presentSyncDisabled || impl->presentFence == nullptr)
       return false;
+    if (!impl->flipWait)
+      return false;
     fence = impl->presentFence;
+    ctx = impl->flipWait;
   }
 
-  auto ctx = impl->flipWait;
   // Publish the queued target BEFORE enqueueing so the watchdog never sees a
   // wait it does not know about. flip_value is monotonic per device.
   std::uint64_t prev = ctx->queuedValue.load(std::memory_order_relaxed);
