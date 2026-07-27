@@ -2061,6 +2061,7 @@ unsafe extern "C" fn create_resource(
         // resource. Every later `load_resource` then returns None and the view
         // create / Map / Copy silently does nothing — "nothing draws", not an
         // error. E_INVALIDARG is in CreateTexture*'s documented return set.
+        note_ddi_refusal(&DDI_REFUSALS.unhandled_resource_dimension);
         log_error!(
             "DDI create_resource: unhandled dimension {}",
             a.ResourceDimension
@@ -3427,10 +3428,14 @@ unsafe extern "C" fn resource_resolve_subresource(
     );
 }
 
+/// Returns 0 = "not busy", unconditionally. That is a semantic CLAIM the
+/// runtime acts on, not a no-op: an app polling this to avoid a stalling Map is
+/// told the staging resource is always free. Counted, behaviour unchanged. R911.
 unsafe extern "C" fn resource_is_staging_busy(
     _h: Hdevice,
     _h_resource: ddi::D3D10DDI_HRESOURCE,
 ) -> i32 {
+    note_ddi_refusal(&DDI_REFUSALS.staging_busy_assumed_free);
     0
 }
 
@@ -3530,17 +3535,22 @@ unsafe extern "C" fn resource_unmap(
     context.Unmap(&*res, subresource);
 }
 
+// DXVK tracks read-after-write hazards itself from the barrier state it already
+// maintains, so forwarding these adds nothing -- but "we deliberately do nothing
+// here" and "nobody ever wired this up" were the same empty body. R911.
 unsafe extern "C" fn srv_read_after_write_hazard(
     _h: Hdevice,
     _srv: ddi::D3D10DDI_HSHADERRESOURCEVIEW,
     _resource: ddi::D3D10DDI_HRESOURCE,
 ) {
+    note_ddi_refusal(&DDI_REFUSALS.srv_raw_hazard);
 }
 
 unsafe extern "C" fn resource_read_after_write_hazard(
     _h: Hdevice,
     _resource: ddi::D3D10DDI_HRESOURCE,
 ) {
+    note_ddi_refusal(&DDI_REFUSALS.resource_raw_hazard);
 }
 
 unsafe extern "C" fn flush(h: Hdevice) {
@@ -3575,6 +3585,7 @@ unsafe extern "C" fn discard_11_1(
     // rect-discards exactly that region on the incoming buffer). Match
     // upstream DXVK's DiscardView1 behaviour: drop partial discards.
     if num_rects != 0 {
+        note_ddi_refusal(&DDI_REFUSALS.discard_partial);
         return;
     }
 
@@ -3648,6 +3659,12 @@ unsafe extern "C" fn clear_view_11_1(
         );
     }
     if view_type != ddi::D3D11DDI_HANDLETYPE_D3D10DDI_HT_RENDERTARGETVIEW {
+        // Already loud -- this arm logs. Bump the field directly instead of
+        // going through `note_ddi_refusal`, which would add a SECOND line for
+        // the same event. R911 is explicit about not doing that here.
+        DDI_REFUSALS
+            .clear_view_unsupported
+            .fetch_add(1, Ordering::Relaxed);
         log_error!(
             "DDI D3D11.1 ClearView UNSUPPORTED view type {view_type} — clear dropped"
         );
@@ -4164,6 +4181,11 @@ unsafe extern "C" fn create_geometry_shader_so(
     // Stream-output declarations need semantic names that are not present in the
     // compact DDI declaration. Create a plain GS for now; DWM's composition path
     // should not depend on SO capture.
+    //
+    // The consequence when an app DOES depend on it: SOSetTargets binds buffers
+    // that are never written, DrawAuto reads zero vertices, and the app renders
+    // nothing. Counted so that failure has a name. R911.
+    note_ddi_refusal(&DDI_REFUSALS.gs_so_declaration_dropped);
     let dxvk = &dev.dxvk;
     let raw = dxvk.create_geometry_shader(bytes.as_ptr(), bytes.len());
     if raw != 0 {
@@ -4218,6 +4240,7 @@ unsafe extern "C" fn create_hull_shader(
         sig_words.len(),
     );
     if raw == 0 {
+        note_ddi_refusal(&DDI_REFUSALS.tess_sig_fallback);
         log_error!("DDI create_hull_shader signature path failed; falling back to raw bytecode");
         raw = dxvk.create_hull_shader(bytes.as_ptr(), bytes.len());
     }
@@ -4257,6 +4280,7 @@ unsafe extern "C" fn create_hull_shader_11_1(
         sig_words.len(),
     );
     if raw == 0 {
+        note_ddi_refusal(&DDI_REFUSALS.tess_sig_fallback);
         log_error!("DDI create_hull_shader_11_1 signature path failed; falling back to raw bytecode");
         raw = dxvk.create_hull_shader(bytes.as_ptr(), bytes.len());
     }
@@ -4296,6 +4320,7 @@ unsafe extern "C" fn create_domain_shader(
         sig_words.len(),
     );
     if raw == 0 {
+        note_ddi_refusal(&DDI_REFUSALS.tess_sig_fallback);
         log_error!("DDI create_domain_shader signature path failed; falling back to raw bytecode");
         raw = dxvk.create_domain_shader(bytes.as_ptr(), bytes.len());
     }
@@ -4335,6 +4360,7 @@ unsafe extern "C" fn create_domain_shader_11_1(
         sig_words.len(),
     );
     if raw == 0 {
+        note_ddi_refusal(&DDI_REFUSALS.tess_sig_fallback);
         log_error!(
             "DDI create_domain_shader_11_1 signature path failed; falling back to raw bytecode"
         );
@@ -4793,7 +4819,9 @@ unsafe extern "C" fn set_scissor_rects(
     context.RSSetScissorRects(Some(&out));
 }
 
-unsafe extern "C" fn set_text_filter_size(_h: Hdevice, _w: u32, _hgt: u32) {}
+unsafe extern "C" fn set_text_filter_size(_h: Hdevice, _w: u32, _hgt: u32) {
+    note_ddi_refusal(&DDI_REFUSALS.text_filter_size_ignored);
+}
 
 unsafe extern "C" fn ia_set_topology(h: Hdevice, topo: ddi::D3D10_DDI_PRIMITIVE_TOPOLOGY) {
     if let Some(dev) = helios_device(h) {
