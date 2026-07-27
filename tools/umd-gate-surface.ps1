@@ -118,6 +118,29 @@ foreach ($f in $logs) {
 }
 
 Write-Host ""
+Write-Host "--- DDI refusals (R911; all nine must read 0 on a healthy session) ---"
+Write-Host "    (emitted at DestroyDevice AND on each counter's first hit, so a"
+Write-Host "     process that never tore a device down still reports.)"
+Write-Host "    EXPECTED TO MOVE under 3DMark: gs_so_declaration_dropped and"
+Write-Host "    tess_sig_fallback -- those two name a real conformance gap."
+$sawRefusals = $false
+foreach ($name in $sessions.Keys) {
+    $hit = $sessions[$name] | Where-Object { $_ -match 'DDI refusals:' } | Select-Object -Last 1
+    if ($hit) {
+        $sawRefusals = $true
+        Write-Host ("  {0,-20} {1}" -f $name, ($hit -replace '^.*DDI refusals: ', ''))
+        # Any non-zero field is a finding, not a failure -- these are legitimate
+        # runtime decisions. Name them so nobody has to parse the line by eye.
+        $nz = [regex]::Matches($hit, '(\w+)=([1-9]\d*)') | ForEach-Object { $_.Value }
+        if ($nz) { Write-Host ("  {0,-20} NON-ZERO: {1}" -f '', ($nz -join ' ')) }
+    }
+}
+if (-not $sawRefusals) {
+    Write-Host "  <no summary line in scope>"
+    Write-Host "  NOTE: absence means no counter ever fired AND no device was destroyed."
+}
+
+Write-Host ""
 Write-Host "--- direct-scanout registry (bounded-growth check) ---"
 Write-Host "    (the exact-primary identity path; the LINEAR import went with T6/R910)"
 foreach ($name in $sessions.Keys) {

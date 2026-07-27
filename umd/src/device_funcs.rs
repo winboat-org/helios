@@ -629,6 +629,10 @@ unsafe fn audit_dxgi_1_3_base_funcs(tag: &str, funcs: *mut ddi::DXGI1_3_DDI_BASE
 /// The runtime owns the backing memory, so we only run the destructor.
 unsafe extern "C" fn ddi_destroy_device(h_device: ddi::D3D10DDI_HDEVICE) {
     log_error!("DDI: DestroyDevice");
+    // R911: the nine refusal counters, once per device teardown. Process-global
+    // rather than per-device, so this is a running total; the point is that
+    // they are READ at all, which the T5 scan-out counters were not.
+    log_error!("{}", crate::forward::ddi_refusal_summary());
     // Drop it from the liveness registry BEFORE anything is torn down, so a
     // concurrent `wait_last_present` on an ICD worker refuses rather than
     // dereferencing a block dxgkrnl is about to free and reuse (R415).

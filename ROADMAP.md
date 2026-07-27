@@ -2487,6 +2487,30 @@ Plan:
   key): `PresentGateUs` is absent by default and the UMD uses 10000 µs. `0` is
   the ordering A/B disable. The wait is condition-variable-backed; inspect
   `present-gate:` in the current DWM UMD log for cost and timeouts.
+- **UMD `DDI refusals:` counters, T6/R911** — nine names on ONE bounded log
+  line, read by `tools/umd-gate-surface.ps1`: `srv_raw_hazard`,
+  `resource_raw_hazard`, `text_filter_size_ignored`,
+  `staging_busy_assumed_free`, `discard_partial`, `clear_view_unsupported`,
+  `gs_so_declaration_dropped`, `tess_sig_fallback`,
+  `unhandled_resource_dimension`. Emitted at `DestroyDevice` and on each
+  counter's FIRST hit — never on a per-present path (that cost is what T2
+  measured and reduced). All nine should read 0 on a healthy DWM session;
+  **`gs_so_declaration_dropped` and `tess_sig_fallback` are expected to MOVE
+  under 3DMark** and each names a real WS3 conformance gap. The UMD still has
+  no registry counter surface, so the log line is the readout — check the line
+  exists, not just the `fetch_add`.
+- **RETIRED in T6** — do not look for these; they are gone from the driver:
+  the `ScanoutDiag` knob and the whole diagnostic `Sdg*`/`S2d*` lab (R901; the
+  production `SdgL*` LINEAR ladder plus `SdgMt SdgMf SdgBFl SdgDevR SdgDevX`
+  SURVIVE), `ScForceReject`/`ScFrc` (owner-approved), `RbRid`/`RbFail` (R902,
+  replaced by `RfUnb`), and on the UMD side the `PresentSyncPublish` and
+  `VehicleKernelFlipWait` knobs with the whole kwait subsystem (R912a).
+  `helios_umd_get_present_result` REMAINS EXPORTED, returning -1 — the mesa ICD
+  resolves it by name and fails the dcomp vehicle with `E_NOINTERFACE` if it is
+  absent. Two verbs now have no in-tree consumer and are kept as read-only ABI:
+  `HELIOS_ESCAPE_QUERY_SCANOUT` / `helios_venus_query_scanout` (R910), and the
+  UMD-side `HeliosPresentRefreshCmd` sender (R910 — the KMD still issues its own
+  'HERF' marker in `display.rs`, so the refresh-marker ordering is intact).
 - **Launcher/display path**: `tools/launch-helios-gtk.sh` supports
   `HELIOS_DISPLAY=egl-vnc` for `-display egl-headless` + VNC, intended as the
   reliable display-output inspection path, and `HELIOS_DISPLAY=sdl` is visually

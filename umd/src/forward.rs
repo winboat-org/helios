@@ -8090,6 +8090,108 @@ fn device_is_live(device: usize) -> bool {
     }
 }
 
+/// The nine DDI paths that refuse or silently downgrade runtime-requested work.
+///
+/// Each field is a legitimate runtime decision about runtime-supplied data, so
+/// a *type* encoding would be cosmetic — what they lacked was any record at
+/// all. Every one of them returned, dropped or downgraded without incrementing
+/// anything, which violates the loud-failure invariant. R911.
+///
+/// The refusals themselves are unchanged: this makes them countable, not
+/// different.
+struct DdiRefusals {
+    /// `pfnResourceReadAfterWriteHazard` for an SRV — empty body.
+    srv_raw_hazard: AtomicUsize,
+    /// `pfnResourceReadAfterWriteHazard` for a resource — empty body.
+    resource_raw_hazard: AtomicUsize,
+    /// `pfnSetTextFilterSize` — empty body.
+    text_filter_size_ignored: AtomicUsize,
+    /// `pfnResourceIsStagingBusy` returning 0. NOT a no-op: that is the
+    /// semantic claim "never busy", which the runtime acts on.
+    staging_busy_assumed_free: AtomicUsize,
+    /// `pfnDiscard` with `num_rects != 0` — the partial discard is dropped.
+    /// Well reasoned (upstream DXVK does the same, and forwarding partial
+    /// discards as full-view discards wiped the undamaged 99% of DWM's flip
+    /// backbuffer), but it was uncounted AND unlogged once the 64-line budget
+    /// was spent.
+    discard_partial: AtomicUsize,
+    /// `pfnClearView` for a non-RTV view type — the clear is dropped. This one
+    /// already logs its refusal, so it was uncounted but never silent; no
+    /// second log line is added.
+    clear_view_unsupported: AtomicUsize,
+    /// `pfnCreateGeometryShaderWithStreamOutput` — the SO declaration is
+    /// discarded and a plain GS is created. The most consequential of the nine:
+    /// `SOSetTargets` then binds buffers that are never written and `DrawAuto`
+    /// reads zero vertices, so the app renders nothing with nothing recording
+    /// that SO capture was dropped.
+    gs_so_declaration_dropped: AtomicUsize,
+    /// Hull/domain shader creates taking the signature-less fallback.
+    /// Expected to MOVE under 3DMark; the UB against SINT inputs noted at the
+    /// fallback is NOT fixed here — it is made countable, which is the
+    /// precondition for fixing it against a real workload.
+    tess_sig_fallback: AtomicUsize,
+    /// `create_resource` with a resource dimension outside the four we handle.
+    unhandled_resource_dimension: AtomicUsize,
+}
+
+static DDI_REFUSALS: DdiRefusals = DdiRefusals {
+    srv_raw_hazard: AtomicUsize::new(0),
+    resource_raw_hazard: AtomicUsize::new(0),
+    text_filter_size_ignored: AtomicUsize::new(0),
+    staging_busy_assumed_free: AtomicUsize::new(0),
+    discard_partial: AtomicUsize::new(0),
+    clear_view_unsupported: AtomicUsize::new(0),
+    gs_so_declaration_dropped: AtomicUsize::new(0),
+    tess_sig_fallback: AtomicUsize::new(0),
+    unhandled_resource_dimension: AtomicUsize::new(0),
+};
+
+/// One bounded log line carrying all nine counters.
+///
+/// The UMD's evidence channel is the log — it has no registry counter surface —
+/// and T5 proved the failure mode this avoids: three of the four R806/R809
+/// scan-out counters were process-global atomics that NOTHING ever loaded, so
+/// ROADMAP's own instruction to read them after a gate run was not executable.
+/// **An instrument nothing can read is not an instrument.** This extends the
+/// `scanout_counter_summary()` pattern that fixed it, rather than inventing a
+/// second mechanism, and it is a `log_line` summary rather than an escape,
+/// which the recommendation is explicit about.
+///
+/// ⚠ NOT on a per-present path: the UMD hot-path logger cost is exactly what T2
+/// measured and reduced. Emitted at `DestroyDevice`, and on the FIRST hit of
+/// each counter (so a refusal that fires once in a session that never tears a
+/// device down is still visible).
+pub(crate) fn ddi_refusal_summary() -> String {
+    let r = &DDI_REFUSALS;
+    format!(
+        "DDI refusals: srv_raw_hazard={} resource_raw_hazard={} \
+         text_filter_size_ignored={} staging_busy_assumed_free={} \
+         discard_partial={} clear_view_unsupported={} \
+         gs_so_declaration_dropped={} tess_sig_fallback={} \
+         unhandled_resource_dimension={}",
+        r.srv_raw_hazard.load(Ordering::Relaxed),
+        r.resource_raw_hazard.load(Ordering::Relaxed),
+        r.text_filter_size_ignored.load(Ordering::Relaxed),
+        r.staging_busy_assumed_free.load(Ordering::Relaxed),
+        r.discard_partial.load(Ordering::Relaxed),
+        r.clear_view_unsupported.load(Ordering::Relaxed),
+        r.gs_so_declaration_dropped.load(Ordering::Relaxed),
+        r.tess_sig_fallback.load(Ordering::Relaxed),
+        r.unhandled_resource_dimension.load(Ordering::Relaxed),
+    )
+}
+
+/// Bump one refusal counter and emit the summary on its FIRST hit.
+///
+/// Taking `&AtomicUsize` rather than a field name keeps the call sites one line
+/// and makes "increment without a readout" — the defect this whole item exists
+/// to close — impossible to write by accident.
+fn note_ddi_refusal(counter: &AtomicUsize) {
+    if counter.fetch_add(1, Ordering::Relaxed) == 0 {
+        log_error!("{}", ddi_refusal_summary());
+    }
+}
+
 /// Scan-out primary creates refused because the bridge returned a resource
 /// with a zero row pitch (R806 sub-commit 2).
 ///
