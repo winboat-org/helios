@@ -306,15 +306,26 @@ Open defects, roughly ordered:
 
     **Kept as permanent instrumentation:** a loud check in `waitForResource` —
     if a resource is still in use while `DxvkSubmissionQueue::isDrainedLocked()`
-    reports both stages empty, the wait can never return, so it logs the
-    resource, its access bits and trackId once and counts the occurrence.
-    Expected 0. It deliberately does not change behaviour; bounding the wait
-    would return with the reference still leaked. All investigation-only
-    logging (`QFOT-ACQ`, `WFR-ENTRY`) and the sleep knob were removed. To
-    re-provoke the race for a regression test, re-add a sleep between
-    `ExecuteFlush()` and `waitForResource` in `SyncSharedTexture` (noted in the
-    comment there) and run
+    reports both stages empty, nothing pending can release the reference, so it
+    logs the resource, its access bits and trackId once and counts the
+    occurrence (`waitForResource STALLED`). It deliberately does not change
+    behaviour; bounding the wait would return with the reference still held.
+    All investigation-only logging (`QFOT-ACQ`, `WFR-ENTRY`) and the sleep knob
+    were removed. To re-provoke the race for a regression test, re-add a sleep
+    between `ExecuteFlush()` and `waitForResource` in `SyncSharedTexture`
+    (noted in the comment there) and run
     `tools/d3d11_shared_wedge_repro.cpp --clear --watchdog-ms 25000`.
+
+    ⚠ **Read that counter as a RATE, not as pass/fail — the check is a warning,
+    not a proof of deadlock.** It fires whenever no completion is currently
+    possible, which is terminal only if no other thread will submit the holding
+    command list. That is what made 0w fatal (a single-threaded XAML UI
+    thread), but **dwm trips it exactly once per start and recovers**, because
+    another of its threads submits the list. Verified on the fixed build: dwm
+    pid 8184 logged `occurrences=1` at startup, then stayed responsive with a
+    live desktop and the count flat. A repeating or never-cleared occurrence is
+    the one that matters; one line in dwm's log at startup is expected and is
+    NOT a 0w regression.
 
     ⚠ **Deploy trap that cost two build cycles and invalidated two runs:** the
     default ProgramData UMD hotplug does **not** reach new processes. dxgkrnl
