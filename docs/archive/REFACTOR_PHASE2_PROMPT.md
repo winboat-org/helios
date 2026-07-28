@@ -1,3 +1,17 @@
+> **ARCHIVED 2026-07-28 — FULLY CONSUMED, NOT AN OPEN PLAN.**
+> Every tranche T0–T8 landed and passed its gate; the final image is KMD
+> 22.22.190.0 + UMD `DB343F02…`. The tranche-by-tranche record — gate results,
+> scope corrections, and the items dropped with their evidence — is
+> `docs/archive/REFACTOR_TRANCHES_T0_T8.md`. Read `ROADMAP.md` for current state.
+>
+> ⚠ This document was found WRONG in verified ways in every single tranche
+> (thirteen in T8 alone, including R1103's premise: it names three methods
+> spanning the queue/fence boundary where there are six). Treat every line
+> number, line count and reachability claim in it as stale until re-derived.
+
+> This is the phase-2 kickoff prompt. Superseded: the implementation it asks
+> for is finished.
+>
 # Phase-2 handoff prompt — implement the KMD/UMD quality refactor
 
 Paste the block below into a fresh session.

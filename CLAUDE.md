@@ -96,9 +96,12 @@ helios-vgpu/
 ├── BRINGUP_QUIRKS.md       ← build/deploy/VM-control gotchas (purge-fingerprint,
 │                             repackage+sign, DriverStore, QMP reset, diag ring)
 ├── HELIOS_DRIVER_DEPLOYMENT.md
-├── docs/archive/           ← Frozen bring-up-era design/research docs (GATE*,
-│                             WDDM_*, DISPLAY*, PHASE*, HANDOFF_*). Read-only
-│                             history; code comments may cite them by name.
+├── docs/archive/           ← Frozen design/research docs (GATE*, WDDM_*,
+│                             DISPLAY*, PHASE*, HANDOFF_*, and REFACTOR_* —
+│                             the completed T0–T8 quality refactor: the review,
+│                             its two kickoff prompts, and the
+│                             tranche-by-tranche record). Read-only history;
+│                             code comments may cite them by name.
 │
 ├── kmd_render/             ← ACTIVE: WDDM 3.2 render+display miniport (Rust, no_std)
 │   └── src/ddi/            ← DDI surface (query_adapter_info = caps/segments,
