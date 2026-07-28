@@ -1030,7 +1030,7 @@ pub(crate) fn process_deferred_vidpn_source_address(
 /// source addresses, and the desktop froze.
 ///
 /// ⚠ The freeze is derived from the driver's own documented model
-/// (`adapter.rs`'s `last_primary_address` contract and `start_device.rs`'s VSync
+/// (`adapter/mod.rs`'s `last_primary_address` contract and `adapter/kobj.rs`'s VSync
 /// DPC), NOT from a hardware observation.
 ///
 /// A retryable refusal now re-arms the exact handle and keeps the gate raised;

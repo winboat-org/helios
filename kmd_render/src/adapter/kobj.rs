@@ -67,7 +67,7 @@ impl AdapterContext {
             self.hpd_thread.store(handle as usize, Ordering::Release);
         } else {
             // 0x0B00_00EA = HPD-worker-create-failed. It was 0x0B00_00E7, which
-            // start_device.rs also records for venus-bring-up-failed — and BOTH
+            // ddi/lifecycle.rs also records for venus-bring-up-failed — and BOTH
             // happen inside the StartDevice window, so the ring could not
             // disambiguate them. `StHpd` vs `StVnu` already distinguish the two
             // as named counters; this makes the ring agree.

@@ -4,7 +4,7 @@
 //! reports either the production one-source/one-child display topology or the
 //! explicit knob-off render-only recovery topology.
 //!
-//! Moved verbatim out of `ddi/start_device.rs` by T8/R1102.
+//! Moved verbatim out of `ddi/lifecycle.rs` by T8/R1102.
 
 use alloc::boxed::Box;
 use core::ffi::c_void;
@@ -14,15 +14,6 @@ use crate::dxgk::*;
 
 use super::bar_segment::{build_segment_table, setup_bar_segment};
 
-/// Stand up the persistent venus context + page-table blob. Returns
-/// `(venus_ctx_id, page_table_window)`; `(0, None)` on any failure.
-///
-/// ⚠ `#[inline(never)]` is a STACK BUDGET decision, not style. `VenusClient` and
-/// the blob descriptors are large locals, and StartDevice's frame is already
-/// shared with `VirtioGpu::init`'s ~9.1 KB one on a 24 KB kernel stack. Keeping
-/// these in their own transient frame — which does not overlap
-/// `VirtioGpu::init` — is what keeps the nested peak inside the budget. See
-/// `StartedState::boxed` for the boot failure this class of growth caused.
 /// Same-boot zeroing for the PRODUCTION LINEAR-scanout ladder (T6/R901).
 ///
 /// These eight names are written by `venus::create_linear_scanout_image` /
@@ -51,6 +42,15 @@ fn zero_linear_scanout_breadcrumbs() {
     }
 }
 
+/// Stand up the persistent venus context + page-table blob. Returns
+/// `(venus_ctx_id, page_table_window)`; `(0, None)` on any failure.
+///
+/// ⚠ `#[inline(never)]` is a STACK BUDGET decision, not style. `VenusClient` and
+/// the blob descriptors are large locals, and StartDevice's frame is already
+/// shared with `VirtioGpu::init`'s ~9.1 KB one on a 24 KB kernel stack. Keeping
+/// these in their own transient frame — which does not overlap
+/// `VirtioGpu::init` — is what keeps the nested peak inside the budget. See
+/// `StartedState::boxed` for the boot failure this class of growth caused.
 #[inline(never)]
 fn bring_up_venus(
     passive: crate::irql::PassiveLevel,

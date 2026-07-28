@@ -23,7 +23,7 @@
 //!
 //! COLLISIONS FIXED 2026-07-27 (T4b/R722) — these are owner debugging ABI, so
 //! the old values are recorded here rather than only in git:
-//!   0x0B00_00E7  was BOTH venus-bring-up-failed (start_device.rs) and
+//!   0x0B00_00E7  was BOTH venus-bring-up-failed (ddi/lifecycle.rs) and
 //!                HPD-worker-create-failed (adapter.rs), both inside the
 //!                StartDevice window. HPD moved to 0x0B00_00EA.
 //!   0x0E00_0001  was BOTH DestroyDevice entry (device.rs) and

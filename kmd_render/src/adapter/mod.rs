@@ -122,7 +122,7 @@ pub(crate) struct AdapterKnobs {
     /// `DisplayHalf` (default 0 = OFF, the boot-proven render-only surface).
     /// When nonzero, StartDevice advertises ONE video-present source + ONE child
     /// video-output and the VidPn/child DDIs in
-    /// `ddi::display`/`ddi::vidpn`/`ddi::start_device` stand up a real virtual
+    /// `ddi::display`/`ddi::vidpn`/`ddi::child` stand up a real virtual
     /// VidPn output + default monitor and drive virtio-gpu scanout, instead of
     /// returning NOT_SUPPORTED. Production sets it to 1 via `reg add` + a guest
     /// reboot (re-runs StartDevice -> child enumeration). Demoted to 0 before
@@ -911,7 +911,6 @@ impl AdapterContext {
         unsafe { KeSetEvent(self.hpd_event.get(), 0, 0) };
     }
 
-    /// Start the HPD worker thread (StartDevice, display half). PASSIVE_LEVEL.
     /// Drop every piece of display publication state that is only meaningful
     /// for the transport generation that produced it. PASSIVE_LEVEL.
     ///

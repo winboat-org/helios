@@ -48,7 +48,7 @@ pub struct BarSegment {
     /// The WDDM segment id this region is reported as. All BAR-segment consumers
     /// key off this field.
     ///
-    /// Always [`crate::ddi::start_device::BAR_SEGMENT_ID`] now that the reported
+    /// Always [`crate::ddi::gpummu::MEMORY_SEGMENT_ID`] now that the reported
     /// topology is either "aperture only" or "aperture + BAR". The field stays
     /// (rather than becoming a bare const at each consumer) because it is the
     /// one place the positional id and the segment it describes are tied
