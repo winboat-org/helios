@@ -1562,6 +1562,81 @@ virtio-gpu scanout; IddCx/Looking Glass is no longer the active display path.*
    box is still on KMD 22.22.189.0 + UMD `ba6adde3`.
 
 
+7n. **T8 GATE — PASSED on one cold boot (2026-07-28 15:39:45), KMD
+   22.22.190.0 + UMD `DB343F02…`.** Owner scoped it to everything except the
+   one-hour DWM-crash soak; DOOM was dropped on owner instruction. Two gate
+   lines are NOT OBTAINABLE on this box and are recorded as such below, not
+   as skips.
+
+   | Item | Result |
+   |---|---|
+   | Cold boot | **`CM_PROB_NONE` first try, no boot loop** — the real risk, since T8 rewrote `DxgkDdiStartDevice`'s module |
+   | `helios_umd.dll` faults since boot | **0** — across Fire Strike, both D3D11 suites, the shader probes, 4 DComp runs, the soak, restart-device, a DWM restart and a 60 s idle |
+   | Desktop | `helios_paintcap` ×3 — full desktop, wallpaper, taskbar, clock matching the capture minute each time (15:41, 16:07, 16:10) |
+   | UMD actually loaded | DriverStore `..._521ab82e85c3fc2b`, SHA-256 `DB343F02…` — matched against the installed file, not assumed |
+   | `kmd-gate-surface.ps1` | **CLEAN, exit 0**, twice (first boot and after the whole chain). `VpSA=1 ScSet=1 ScPch=7680 DspMd=124257286`, identical to 7i/7k/7l; `ScanoutDiag` absent |
+   | `umd-gate-surface.ps1` | **CLEAN, exit 0**, twice; eleven refusal counters, must-not-appear all clear |
+   | T7-critical breadcrumbs | **all identical to 7l**: `SdgDevX=1 SdgDevR=0`, `SdgLStg=16 SdgLReq=7910400 SdgLBit=15 SdgLTyc=5 SdgLPch=7680`, `BarF=28 BarB=0`, `SdgM=0`, `IrqlBad=0`; `PHQcall`/`HwQRef`/`RfUnb`/`VnEncOvf`/`CpImgVr`/`CpMemVr`/`PBBufVr` absent |
+   | D3D11 suites | knob suite **`TOTAL failures=0`**; extra suite every **`rc=0`**, **`xproc_read_rc=0`** |
+   | DXBC A/B vs `dxbc-t7fix.txt` | **9/9 pairs, byte-identical** — and identical to `dxbc-t6.txt` too. The R1105 C++ TU split changed nothing in the container synthesis |
+   | Fire Strike | Graphics **20058** (Physics 33689, Combined 5391, Overall 16558), **duration 377 s** — a real run, inside the 19460–20473 spread, between T6 (20003) and T7 (20269) |
+   | DComp probe ×3 | **1247 / 1343 / 1257**, all `PROBE PASS` (T7 1308/1360/1305; T6 backup 1195/1308/1110) |
+   | Ownership soak 300/10000 | device 300 = 1946, **5.99 handles/device** (T6 5.99, T7 5.99), resource phase **flat at 1974** all ten samples, modules **+0**, failures **0/0**, dwm handles **+0** |
+   | Stack frames | **17488 B, headroom 448** — 96 B BETTER than 7l's 17584/352, and unchanged by `cargo fmt` |
+   | `pnputil /restart-device` | completes, `CM_PROB_NONE`, desktop recovers |
+   | Deliberate DWM restart | pid 5032 → 7136, desktop recovers |
+   | Idle-to-active wake | **0.65 s** after a 60 s idle (T0-era reference 1.1 s) |
+   | System log | no bugcheck, no dump, **no TDR 4101** |
+
+   The printed `OWNERSHIP SOAK FAIL` is the pre-existing 6-handles-per-device
+   teardown leak (7d(b)) failing the literal "flat" test, identically to
+   T5/T6/T7 — the per-device RATE is what matters and it is unchanged at 5.99.
+
+   The only 4 `Application` id-1000 faults on the whole boot are
+   `vulkan_virtio-41a8bda2401f.dll` in dwm, Explorer, SearchHost and
+   ApplicationFrameHost, all at 16:07:16 — provoked by the one
+   `restart-device`. **WS1 defect 0z, pre-existing.** `helios_umd.dll`: zero.
+
+   `srv_raw_hazard=1` and `discard_partial=1..10` read non-zero; the gate
+   script judges the surface clean and these are ordinary DDI-shape refusals,
+   not new. `alloc_meta_format_unknown` is **0** this boot (it read 2–3 in 7l).
+
+   **⚠ TWO GATE LINES ARE NOT OBTAINABLE ON THIS BOX — recorded, not skipped:**
+
+   1. **Suspend/resume: impossible.** `powercfg /a` reports S1, S2, S3,
+      Hibernate, S0-Low-Power-Idle and Hybrid Sleep ALL unavailable — "the
+      system firmware does not support this standby state" for every one. No
+      driver change can make this testable; it needs a VM firmware/machine-type
+      change, which is owner territory. This also means the same-context PnP
+      stop/start carry-over path (`StRst`, `RfUnb`) STILL has no way to be
+      provoked on this box — `restart-device` re-runs AddDevice with a fresh
+      zeroed context, exactly as T1a/7i and the 46th recorded. `StRst=0`
+      `StRstR=0` this boot are therefore "never exercised", not "exercised and
+      clean".
+   2. **Same-boot QEMU scanout evidence: unavailable on this launcher config.**
+      The VM is running `HELIOS_DISPLAY=sdl` (confirmed from
+      `/proc/<qemu>/cmdline`), so there is no VNC endpoint and the host-side
+      `vulkan-readback: OPTIMAL DMA-BUF ready` path is never driven — the last
+      such line in `/tmp/helios-qemu-stderr.log` is **10:23:37, before this
+      15:39:45 boot**. Producing it needs a relaunch with `HELIOS_DISPLAY=egl-vnc`,
+      which CLAUDE.md puts under owner control. The same-boot host-path evidence
+      that IS available is the KMD's `ScSet=1` (SET_SCANOUT_BLOB accepted),
+      `ScFlu=3`, `ScPch=7680` and `ScanoutDiag` absent, plus a visibly
+      composited desktop. Also re-confirmed while checking: the host log's
+      `OPTIMAL DMA-BUF shape mismatch` line is **PRE-EXISTING**, first
+      occurrence 2026-07-26T21:41:56, 106 of them against 326 successes.
+
+   **Not run, by owner decision:** the one-hour mixed session, and DOOM.
+
+   **The box is left on KMD 22.22.190.0 + UMD `DB343F02…`, rendering.**
+   Backups: `C:\Users\Rupansh\helios-umd-backup-t7.dll` (the `ba6adde3` T7
+   UMD), `...-t6.dll`, `...-t5.dll`, `...-t4b.dll`;
+   `C:\ProgramData\HeliosDeployBackups\20260728-153923` is the pre-T8
+   DriverStore.
+
+   **This closes the Phase-1 refactor review: T0–T8 are all landed and gated.**
+
+
 8. Implement the remaining reviewed refactors atomically, in tranche order, one recommendation
    per commit; never fold a `BUG` fix into a structure move. Preserve the current direct
    primary, completion ordering, loud-failure contracts, registry ABI, and
