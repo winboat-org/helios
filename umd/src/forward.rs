@@ -6767,7 +6767,7 @@ unsafe fn helios_multisample_quality_levels(
     fmt: ddi::DXGI_FORMAT,
     sample_count: u32,
 ) -> u32 {
-    if crate::feature_level_mode() != 1 {
+    if crate::caps::feature_profile().msaa == crate::caps::MsaaPolicy::SingleSampleOnly {
         return if sample_count == 1 { 1 } else { 0 };
     }
     if sample_count == 0 {
@@ -7053,7 +7053,7 @@ unsafe extern "C" fn check_format_support(h: Hdevice, fmt: ddi::DXGI_FORMAT, out
         | CAST_WITHIN_BIT_LAYOUT
         | MSAA_LOAD;
     const _: () = assert!(WARP_STENCIL_READ_CAPS == 0x0052_11b0);
-    if crate::feature_level_mode() != 1 {
+    if crate::caps::feature_profile().format == crate::caps::FormatPolicy::StripMultisampleBits {
         // FL10.0 profile (and diagnostic mode 2): strip the multisample bits.
         caps &= !MSAA_BITS;
     } else if dxgi_msaa_bits_per_sample(fmt as u32, caps).is_some() {
@@ -7139,7 +7139,7 @@ unsafe extern "C" fn check_format_support(h: Hdevice, fmt: ddi::DXGI_FORMAT, out
     const DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS: ddi::DXGI_FORMAT = 21;
     const DXGI_FORMAT_X32_TYPELESS_G8X24_UINT: ddi::DXGI_FORMAT = 22;
     const DXGI_FORMAT_D16_UNORM: ddi::DXGI_FORMAT = 55;
-    if crate::feature_level_mode() == 1 {
+    if crate::caps::feature_profile().format == crate::caps::FormatPolicy::Unmasked {
         match fmt {
             // Match WARP's API-visible caps for depth-format families; the
             // DDI-only MSAA RT bit is re-applied immediately below where
@@ -7161,7 +7161,9 @@ unsafe extern "C" fn check_format_support(h: Hdevice, fmt: ddi::DXGI_FORMAT, out
             _ => {}
         }
     }
-    if crate::feature_level_mode() == 1 && dxgi_msaa_bits_per_sample(fmt as u32, caps).is_some() {
+    if crate::caps::feature_profile().format == crate::caps::FormatPolicy::Unmasked
+        && dxgi_msaa_bits_per_sample(fmt as u32, caps).is_some()
+    {
         // In the D3D10/11 UMD callback, low bit 0x8 is
         // D3D10_DDI_FORMAT_SUPPORT_MULTISAMPLE_RENDERTARGET, not API
         // SO_BUFFER. Re-assert it after the API-style compatibility scrubs
@@ -7192,7 +7194,7 @@ unsafe extern "C" fn check_format_support(h: Hdevice, fmt: ddi::DXGI_FORMAT, out
     if fmt == DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM && caps == 0 {
         caps = DDI_FORMAT_SUPPORT_NOT_SUPPORTED;
     }
-    if crate::feature_level_mode() == 1 {
+    if crate::caps::feature_profile().format == crate::caps::FormatPolicy::Unmasked {
         trace_line!(
             "FormatSupport fmt={fmt} raw=0x{raw_caps:08x} final=0x{caps:08x} output_bits={:?}",
             dxgi_output_bits_per_sample(fmt as u32, caps)

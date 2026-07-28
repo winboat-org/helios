@@ -30,7 +30,7 @@ compile_error!(
 
 mod adapter;
 mod bridge;
-mod caps;
+pub(crate) mod caps;
 mod ddi;
 mod device_funcs;
 mod format;

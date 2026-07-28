@@ -7,6 +7,136 @@ use crate::hr::{Hresult, S_OK};
 use crate::log_error;
 use crate::{device_funcs, feature_level_mode};
 
+/// How the FL11 multisample caps are answered.
+///
+/// A named field rather than a bool because the two answers are policies, not
+/// a capability: `Full` reports real quality levels, `SingleSampleOnly` reports
+/// 1 for sample_count==1 and 0 for everything else.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum MsaaPolicy {
+    Full,
+    SingleSampleOnly,
+}
+
+/// How `check_format_support` treats the multisample bits.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum FormatPolicy {
+    Unmasked,
+    StripMultisampleBits,
+}
+
+/// The feature-level profile, as ONE value.
+///
+/// ⚠ THIS EXISTS BECAUSE THE CONTRACT IS DISTRIBUTED AND ASYMMETRIC ON PURPOSE.
+/// Before it, `feature_level_mode()` gated three caps here with `>= 1` and five
+/// sites in `forward.rs`'s `check_format_support` / `helios_multisample_quality_
+/// levels` with `== 1`, and the difference between the two operators WAS the
+/// knob=2 diagnostic ("pipeline claims 11_0 but keeps the FL10 MSAA/format
+/// caps"). Nothing said so: it was discoverable only by grepping two files and
+/// noticing that the same knob is compared two different ways deliberately.
+///
+/// The runtime validates the three pipeline/shader/options caps and the
+/// MSAA/format answers as ONE coherent feature-level contract in
+/// `CDevice::LLOCompleteLayerConstruction`; a partial edit is rejected with
+/// `DXGI_ERROR_UNSUPPORTED`. Selecting one of three named constants makes
+/// "these caps move together" a data fact, and adding a field forces every
+/// consumer to be updated.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FeatureProfile {
+    /// `D3D11DDICAPS_3DPIPELINESUPPORT`: a BITMASK of supported levels, not the
+    /// bare `D3D11DDI_3DPIPELINELEVEL` enum.
+    pub pipeline_mask: u32,
+    /// `D3D11DDICAPS_SHADER`.
+    pub shader_caps: u32,
+    /// `D3DWDDM1_3DDICAPS_D3D11_OPTIONS1` tiled-resource tier flags.
+    pub options1: u32,
+    pub msaa: MsaaPolicy,
+    pub format: FormatPolicy,
+}
+
+const LVL_10_0: u32 = 1 << 0;
+const LVL_10_1: u32 = 1 << 1;
+const LVL_11_0: u32 = 1 << 2;
+const LVL_11_1: u32 = 1 << 3;
+const LVL_12_0: u32 = 1 << 7;
+const SHADER_COMPUTE: u32 = 0x2;
+const SHADER_TYPED_UAV_LOAD_ADDITIONAL_FORMATS: u32 = 0x20;
+const TILED_RESOURCES_TIER_2_SUPPORTED: u32 = 0x2;
+const FL11_PIPELINE_MASK: u32 = LVL_10_0 | LVL_10_1 | LVL_11_0 | LVL_11_1 | LVL_12_0;
+const FL11_SHADER_CAPS: u32 = SHADER_COMPUTE | SHADER_TYPED_UAV_LOAD_ADDITIONAL_FORMATS;
+
+/// `FeatureLevel11 = 0`: the proven FL10_0 baseline opt-out.
+const FL10_0: FeatureProfile = FeatureProfile {
+    pipeline_mask: LVL_10_0,
+    shader_caps: 0,
+    options1: 0,
+    msaa: MsaaPolicy::SingleSampleOnly,
+    format: FormatPolicy::StripMultisampleBits,
+};
+
+/// `FeatureLevel11` absent or `= 1`: the production profile.
+const FL11_0: FeatureProfile = FeatureProfile {
+    pipeline_mask: FL11_PIPELINE_MASK,
+    shader_caps: FL11_SHADER_CAPS,
+    options1: TILED_RESOURCES_TIER_2_SUPPORTED,
+    msaa: MsaaPolicy::Full,
+    format: FormatPolicy::Unmasked,
+};
+
+/// `FeatureLevel11 = 2`: the DIAGNOSTIC profile. FL11 pipeline / shader /
+/// options1 with the FL10 MSAA and format policy, which isolates pipeline-level
+/// validation from the later FL11 caps gates.
+///
+/// ⚠ THIS THIRD PROFILE IS THE ONE A "TIDY-UP" DELETES. Two profiles would fold
+/// mode 2 into either FL10_0 or FL11_0 and silently retire the knob. The
+/// assertion below is what stops that: it fails to compile if this profile
+/// stops being distinct from both others in exactly the documented way.
+const FL11_PIPELINE_ONLY: FeatureProfile = FeatureProfile {
+    pipeline_mask: FL11_PIPELINE_MASK,
+    shader_caps: FL11_SHADER_CAPS,
+    options1: TILED_RESOURCES_TIER_2_SUPPORTED,
+    msaa: MsaaPolicy::SingleSampleOnly,
+    format: FormatPolicy::StripMultisampleBits,
+};
+
+// Mode 2 is FL11's three caps with FL10's two policies. If a future edit makes
+// it equal to either neighbour, the knob has been deleted -- say so at compile
+// time rather than in a bug report six months later.
+const _: () = {
+    assert!(FL11_PIPELINE_ONLY.pipeline_mask == FL11_0.pipeline_mask);
+    assert!(FL11_PIPELINE_ONLY.shader_caps == FL11_0.shader_caps);
+    assert!(FL11_PIPELINE_ONLY.options1 == FL11_0.options1);
+    assert!(FL11_PIPELINE_ONLY.pipeline_mask != FL10_0.pipeline_mask);
+    // ... and FL10's MSAA/format policy, which is what makes it a diagnostic.
+    assert!(matches!(FL11_PIPELINE_ONLY.msaa, MsaaPolicy::SingleSampleOnly));
+    assert!(matches!(
+        FL11_PIPELINE_ONLY.format,
+        FormatPolicy::StripMultisampleBits
+    ));
+    // The old bug this replaces: writing the bare enum value 2 as the pipeline
+    // mask meant bit1 only, i.e. "10_1 without 10_0" -- an invalid mask.
+    assert!(FL11_0.pipeline_mask & LVL_10_0 != 0);
+};
+
+/// The profile this process advertises, selected ONCE from the knob.
+///
+/// All four knob settings are enumerated. Deliberately NOT a range: `>= 2`
+/// would read as "mode 2 and up" and invite collapsing it into FL11_0, which
+/// deletes the diagnostic. Any other nonzero value lands in the same arm the
+/// old `>= 1` / `!= 1` PAIR gave it -- FL11's three caps with FL10's two
+/// policies -- so this is behaviour-preserving for every input.
+pub(crate) fn feature_profile() -> &'static FeatureProfile {
+    match feature_level_mode() {
+        // `feature_level_mode()` returns 1 when the value is ABSENT, so the
+        // absent case and an explicit 1 are the same arm by construction.
+        0 => &FL10_0,
+        1 => &FL11_0,
+        2 => &FL11_PIPELINE_ONLY,
+        _ => &FL11_PIPELINE_ONLY,
+    }
+}
+
+
 pub(crate) unsafe extern "C" fn get_caps(
     _h_adapter: ddi::D3D10DDI_HADAPTER,
     args: *const ddi::D3D10_2DDIARG_GETCAPS,
@@ -67,13 +197,7 @@ pub(crate) unsafe extern "C" fn get_caps(
                 // UAV-load additional-formats bit. FL10 profile stays 0 (no
                 // optional shader caps).
                 D3D11DDICAPS_SHADER if args.DataSize >= 4 => {
-                    const SHADER_COMPUTE: u32 = 0x2;
-                    const SHADER_TYPED_UAV_LOAD_ADDITIONAL_FORMATS: u32 = 0x20;
-                    let caps = if feature_level_mode() >= 1 {
-                        SHADER_COMPUTE | SHADER_TYPED_UAV_LOAD_ADDITIONAL_FORMATS
-                    } else {
-                        0
-                    };
+                    let caps = feature_profile().shader_caps;
                     unsafe { *(args.pData as *mut u32) = caps };
                     log_error!("  GetCaps: SHADER caps = 0x{caps:x}");
                 }
@@ -94,16 +218,7 @@ pub(crate) unsafe extern "C" fn get_caps(
                 // path wrote 1 == (1<<0) == the 10_0 bit, so it worked by
                 // coincidence and produced an FL10_0 device.)
                 D3D11DDICAPS_3DPIPELINESUPPORT if args.DataSize >= 4 => {
-                    const LVL_10_0: u32 = 1 << 0;
-                    const LVL_10_1: u32 = 1 << 1;
-                    const LVL_11_0: u32 = 1 << 2;
-                    const LVL_11_1: u32 = 1 << 3;
-                    const LVL_12_0: u32 = 1 << 7;
-                    let caps = if feature_level_mode() >= 1 {
-                        LVL_10_0 | LVL_10_1 | LVL_11_0 | LVL_11_1 | LVL_12_0
-                    } else {
-                        LVL_10_0 // 0x1: max FL10_0 (the proven baseline)
-                    };
+                    let caps = feature_profile().pipeline_mask;
                     unsafe { *(args.pData as *mut u32) = caps };
                     log_error!("  GetCaps: 3DPIPELINESUPPORT bitmask=0x{caps:x}");
                 }
@@ -122,12 +237,7 @@ pub(crate) unsafe extern "C" fn get_caps(
                     log_error!("  GetCaps: SHADER_MIN_PRECISION_SUPPORT = zero");
                 }
                 D3DWDDM1_3DDICAPS_D3D11_OPTIONS1 if args.DataSize >= 4 => {
-                    const TILED_RESOURCES_TIER_2_SUPPORTED: u32 = 0x2;
-                    let caps = if feature_level_mode() >= 1 {
-                        TILED_RESOURCES_TIER_2_SUPPORTED
-                    } else {
-                        0
-                    };
+                    let caps = feature_profile().options1;
                     unsafe { *(args.pData as *mut u32) = caps };
                     log_error!(
                         "  GetCaps: D3D11_OPTIONS1 TiledResourcesSupportFlags=0x{caps:x}"
