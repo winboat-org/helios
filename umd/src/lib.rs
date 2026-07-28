@@ -40,6 +40,7 @@ mod knobs;
 
 mod log;
 
+pub(crate) use knobs::{feature_level_mode, present_gate_us, trace_enabled, vehicle_flip_gate_us};
 pub(crate) use log::{log_error, log_knob_inventory, log_self_module_path, trace_line};
 // R420's `#![deny(deprecated)]` guard, preserved across the move: `log_line` is
 // `#[deprecated]` so that only `trace_line!` and `log_error!` may reach the
@@ -817,67 +818,4 @@ unsafe extern "C" fn get_caps(
         log_error!("GetCaps: null args");
     }
     S_OK
-}
-
-/// Whether per-frame/per-op DDI chatter (`trace_line!`) is enabled:
-/// `HKLM\SOFTWARE\Helios!UmdTrace` (REG_DWORD) != 0. Read once per process.
-/// Errors, one-shots and refusals keep using [`log_line`] unconditionally —
-/// only known-hot repeat traffic (Present, OMSetRenderTargets,
-/// ResolveSharedResource, per-op stamps) sits behind this gate.
-pub(crate) fn trace_enabled() -> bool {
-    knobs::UMD_TRACE.get()
-}
-
-/// Selects whether the adapter advertises the full D3D11 feature-level profile
-/// or the conservative FL10_0 fallback:
-/// `HKLM\SOFTWARE\Helios!FeatureLevel11` (REG_DWORD). Absent = full FL11
-/// profile; explicit 0 = FL10_0 opt-out. Read once
-/// per process, so an already-running dwm keeps the level it created its
-/// device at while freshly-launched apps pick up the new value.
-///
-/// This gate MUST cover the three caps together — the 3DPIPELINESUPPORT
-/// pipeline level, `check_format_support`'s multisample bits, and
-/// `CheckMultisampleQualityLevels` — because the Microsoft runtime validates
-/// them as one coherent feature-level contract during
-/// `CDevice::LLOCompleteLayerConstruction`; a partial change is rejected with
-/// DXGI_ERROR_UNSUPPORTED. FL11_0 additionally requires real multisample
-/// support, which the FL10_0 profile deliberately suppresses.
-///
-/// 30th/31st-session ETW evidence (Microsoft-Windows-DXGI) showed this is a UMD
-/// caps sequence, not a KMD/adapter ceiling: the runtime reaches
-/// CreateDevice/venus CTX_CREATE and rejects each bad caps contract with a
-/// concrete string. Gates fixed so far: 3DPIPELINESUPPORT is a bitmask,
-/// SHADER compute cap is 0x2, and MSAA/format support must match D3D11.3
-/// §19.2.5. knob=0 remains the exact FL10_0 baseline opt-out for A/B.
-///   absent = full FL11 profile
-///   0 = FL10_0 profile
-///   1 = full FL11_0 (pipeline 11_0 + real MSAA + unmasked format bits)
-///   2 = DIAGNOSTIC: pipeline claims 11_0 but keeps the FL10 MSAA/format caps —
-///       isolates pipeline-level validation from the later FL11 caps gates.
-pub(crate) fn feature_level_mode() -> u32 {
-    knobs::FEATURE_LEVEL_11.get()
-}
-
-/// Present-path frame-completion gate cap in microseconds:
-/// `HKLM\SOFTWARE\Helios!PresentGateUs` (REG_DWORD). Read once per process.
-/// Absent = 10000 for the direct-primary display path. `context.Flush()` can
-/// return before DXVK's submission thread has entered the matching Venus work,
-/// so the KMD cannot capture that future command in its completion watermark.
-/// This bounded, condition-variable-backed gate closes that producer race
-/// without restoring the old 32 ms polling throttle. 0 remains the A/B disable.
-pub(crate) fn present_gate_us() -> u32 {
-    knobs::PRESENT_GATE_US.get()
-}
-
-/// Dcomp-vehicle flip-ordering gate cap in microseconds:
-/// `HKLM\SOFTWARE\Helios!VehicleFlipGateUs` (REG_DWORD). Read once per
-/// process. Absent = 32000; 0 disables (A/B lever). Bounds the worker-side
-/// wait for the vehicle frame COPY's host-GPU completion before the flip is
-/// minted: a direct/independent-flip present is ordered only on the KMD's
-/// DMA fence, which completes at DECODE — without this gate the backbuffer
-/// scans out before the venus copy lands and the previous occupant of the
-/// buffer pops out (the 24th-session gameplay stutter). Composed presents
-/// are protected by dwm's consumer wait either way; direct flip is not.
-pub(crate) fn vehicle_flip_gate_us() -> u32 {
-    knobs::VEHICLE_FLIP_GATE_US.get()
 }
