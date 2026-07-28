@@ -1264,6 +1264,75 @@ virtio-gpu scanout; IddCx/Looking Glass is no longer the active display path.*
    is cached at driver load, so answering it needs a DiagLevel=1 boot.
 
 
+7k. **T7 GATE RUN — KMD HALF PASSED, UMD HALF FAILED. `helios_umd.dll`
+   crash-loops dwm and LogonUI at cold boot; the QEMU window is BLACK.**
+   Cold boot 2026-07-28 12:22:12 on KMD `22.22.189.0`. **BISECTED, and the
+   answer is unambiguous: the defect is in the T7 UMD half, not the KMD half.**
+
+   | Stack | Result |
+   |---|---|
+   | T7 KMD `22.22.189.0` + T7 UMD `3b704b27` | dwm + LogonUI crash-loop, **black screen** |
+   | T7 KMD `22.22.189.0` + T6 UMD `355b4366` | **renders fine** (owner-confirmed) |
+   | T6 KMD `22.22.188.0` + T7 UMD `3b704b27` | rendered fine for ~5 min, but WARM ONLY (restart-device, already-logged-in session — LogonUI was never re-exercised) |
+
+   The box is currently left on **T7 KMD + T6 UMD, working.**
+
+   **★ THE FAULT IS A SINGLE DETERMINISTIC SITE.** Every crash, in both
+   processes, reports the SAME `Fault offset: 0x8068c`, exception `0xc0000005`.
+   Resolved against `umd/target/release/helios_umd.pdb`
+   (ImageBase 0x180000000, so VA 0x18008068c):
+
+   ```
+   llvm-symbolizer --obj=helios_umd.dll --demangle --functions=linkage 0x18008068c
+     std::_Atomic_integral<unsigned int,4>::operator++       atomic:1469
+     dxvk::ComObject<ID3D11VertexShader>::AddRefPrivate      com_object.h:59
+     dxvk::ComRef_<D3D11Shader<ID3D11VertexShader,..>>::incRef  com_pointer.h:37
+     dxvk::Com<D3D11Shader<ID3D11VertexShader,..>>::operator=   com_pointer.h:76
+     dxvk::D3D11CommonContext<D3D11ImmediateContext>::VSSetShader
+                                                     d3d11_context.cpp:1397
+   ```
+
+   i.e. **`VSSetShader` AddRef'ing a bad `ID3D11VertexShader` pointer.** The
+   two T7 items that touch that exact path are **R1011** (the
+   `stage_set_shader!` macro — `vs_set_shader` is the one member with the
+   `ia.bound_vs_com` asymmetry) and **R1016** (`SigWords`, whose only consumer
+   is `create_vs_input_variant`, reached through `bound_vs_com`). **R1009** is
+   the third candidate: a wrong device-funcs slot would hand the runtime a
+   shader handle that never held a real COM pointer.
+
+   **KMD half of the gate, all PASSED and worth keeping:**
+   - Cold boot to `CM_PROB_NONE` **first try, no boot loop** — the real risk,
+     since this tranche touched `DxgkDdiStartDevice`.
+   - `kmd-gate-surface.ps1` **CLEAN, exit 0**; all must-be-zero clear;
+     `ScanoutDiag` absent; `VpSA=1 ScSet=1 ScPch=7680 DspMd=124257286`,
+     identical to 7i.
+   - Every T7-critical breadcrumb **identical to the T6 gate**: `SdgDevX=1`
+     `SdgDevR=0` (R1001 rewrote that decode), `SdgLStg=16 SdgLReq=7910400
+     SdgLBit=15 SdgLTyc=5 SdgLPch=7680` (R1002 rewrote that encoder),
+     `BarF=28 BarB=0` (R1006's knob default), `SdgM=0`, the `SdgR*` lab family
+     byte-identical, `PHQcall`/`HwQRef`/`RfUnb` absent, `VnEncOvf` absent, and
+     `CpImgVr`/`CpMemVr`/`PBBufVr` **absent** — the three raw-VkResult
+     breadcrumbs R1001 re-plumbed never fired.
+   - Frame sizes byte-for-byte identical to T6 (see 7j).
+
+   ⚠ **A near-miss worth recording: the host log's `vulkan-readback: OPTIMAL
+   DMA-BUF shape mismatch required=8773632 fd_size=7913472` is PRE-EXISTING and
+   is NOT this regression.** It first appears 2026-07-26T21:41:56 and occurs 94
+   times across the log, alongside 284 `OPTIMAL DMA-BUF ready 1896x1030`
+   successes. It looked exactly like a T7/R1002 encoder regression and is not
+   one. Check `grep -n` for the FIRST occurrence before blaming a tranche for
+   any host-side line.
+
+   ⚠ **The UMD half was "verified" WARM and that was not enough.** The T7 UMD
+   was deployed with `pnputil /restart-device` into an already-logged-in session
+   at 04:50 and composited correctly for minutes; the DXBC-container A/B against
+   the backed-up T6 UMD came back bit-identical. None of that exercised
+   LogonUI or a cold-boot device create. **A UMD-only tranche still needs a cold
+   boot before it can be called verified** — restart-device is not a substitute,
+   for the same reason `StRst`/`RfUnb` cannot be provoked by it (fresh zeroed
+   context, T1a and 7i).
+
+
 8. Implement the remaining reviewed refactors atomically, in tranche order, one recommendation
    per commit; never fold a `BUG` fix into a structure move. Preserve the current direct
    primary, completion ordering, loud-failure contracts, registry ABI, and
