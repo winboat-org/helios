@@ -186,6 +186,7 @@ fn main() {
         // T8/R1105: extra TUs inherit every include and define from this same
         // cc::Build, so there is no flag duplication to drift.
         .file("bridge/bridge_dxbc.cpp")
+        .file("bridge/bridge_icd_exports.cpp")
         .compiler(&clang_cl)
         .archiver(&archiver)
         .std("c++17")
