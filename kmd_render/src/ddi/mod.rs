@@ -18,6 +18,7 @@ pub(crate) mod create_allocation;
 pub(crate) mod display;
 mod escape;
 mod gpummu;
+mod lifecycle;
 pub(crate) mod hpd;
 pub(crate) mod interrupt;
 mod present_packet;
@@ -75,10 +76,11 @@ pub use child::{
     dxgkddi_get_child_container_id, dxgkddi_query_child_relations, dxgkddi_query_child_status,
     dxgkddi_query_device_descriptor,
 };
-pub use start_device::{
+pub use lifecycle::{
     dxgkddi_dispatch_io_request, dxgkddi_remove_device, dxgkddi_set_power_state,
-    dxgkddi_start_device, dxgkddi_stop_device, vsync_dpc_routine,
+    dxgkddi_start_device, dxgkddi_stop_device,
 };
+pub use start_device::vsync_dpc_routine;
 pub use submit_command::{
     diag_dump_engine_atomics, dxgkddi_collect_dbg_info, dxgkddi_patch, dxgkddi_preempt_command,
     dxgkddi_query_current_fence, dxgkddi_render, dxgkddi_render_gdi, dxgkddi_render_km,
