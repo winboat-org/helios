@@ -10,6 +10,8 @@
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU32, Ordering};
 
+use wdk_sys::ntddk::KeSetEvent;
+
 use crate::irql::PassiveLevel;
 
 use super::{AdapterContext, ScanoutGuard};

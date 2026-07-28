@@ -68,7 +68,7 @@ impl TryFrom<u32> for BarSegTopology {
 ///
 /// Takes the knob snapshot rather than reading the registry: StartDevice has
 /// already read `BarSegMode` once and mirrored it to `BarM`.
-fn setup_bar_segment(
+pub(super) fn setup_bar_segment(
     adapter: &crate::adapter::AdapterContext,
     knobs: &crate::adapter::AdapterKnobs,
 ) -> Option<crate::adapter::BarSegment> {
@@ -129,7 +129,7 @@ fn setup_bar_segment(
 /// aperture-only shape and a `SegRule` breadcrumb beats AddAdapter failing with
 /// Code 43 and nothing in the ring naming the rule. The aperture-only shape is
 /// the same one the no-BAR baseline emits, so it is a known-good fallback.
-fn build_segment_table(
+pub(super) fn build_segment_table(
     bar_segment: &mut Option<crate::adapter::BarSegment>,
     paging_ram: Option<(u64, u64)>,
     knobs: &crate::adapter::AdapterKnobs,

@@ -25,7 +25,7 @@ mod present_packet;
 pub(crate) mod query_adapter_info;
 mod scheduler;
 pub(crate) mod segment_table;
-mod submit_command;
+pub(crate) mod submit_command;
 pub(crate) mod vidpn;
 pub(crate) mod wddm_surface;
 

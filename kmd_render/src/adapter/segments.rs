@@ -26,7 +26,7 @@ const PAGING_RAM_SIZE: usize = 8 * 1024 * 1024;
 /// for page-table / paging-buffer storage (see [`PAGING_RAM_SIZE`]).
 pub struct PagingRam {
     /// Kernel VA (for free); the region is mapped non-paged by the allocator.
-    va: NonNull<u8>,
+    pub(super) va: NonNull<u8>,
     /// Guest-physical base — the segment's `CpuTranslatedAddress`.
     pub phys: u64,
     /// Region length in bytes (== reported segment Size/CommitLimit).
