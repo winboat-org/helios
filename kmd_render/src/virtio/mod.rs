@@ -14,6 +14,7 @@
 //! M5 MSI-X ISR/DPC → M6 teardown.
 
 pub mod config;
+pub mod counters;
 pub mod ctrl;
 pub mod gpu;
 pub mod hal;
