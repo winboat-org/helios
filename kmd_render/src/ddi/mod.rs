@@ -12,6 +12,7 @@ mod bar_segment;
 mod base;
 mod blob_map;
 mod build_paging_buffer;
+mod child;
 pub(crate) mod cpu_host_aperture;
 pub(crate) mod create_allocation;
 pub(crate) mod display;
@@ -70,10 +71,13 @@ pub use base::{
     dxgkddi_control_etw_logging, dxgkddi_notify_acpi_event, dxgkddi_query_interface,
     dxgkddi_reset_device, dxgkddi_unload,
 };
+pub use child::{
+    dxgkddi_get_child_container_id, dxgkddi_query_child_relations, dxgkddi_query_child_status,
+    dxgkddi_query_device_descriptor,
+};
 pub use start_device::{
-    dxgkddi_dispatch_io_request, dxgkddi_get_child_container_id, dxgkddi_query_child_relations,
-    dxgkddi_query_child_status, dxgkddi_query_device_descriptor, dxgkddi_remove_device,
-    dxgkddi_set_power_state, dxgkddi_start_device, dxgkddi_stop_device, vsync_dpc_routine,
+    dxgkddi_dispatch_io_request, dxgkddi_remove_device, dxgkddi_set_power_state,
+    dxgkddi_start_device, dxgkddi_stop_device, vsync_dpc_routine,
 };
 pub use submit_command::{
     diag_dump_engine_atomics, dxgkddi_collect_dbg_info, dxgkddi_patch, dxgkddi_preempt_command,
