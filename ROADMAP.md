@@ -1330,7 +1330,104 @@ virtio-gpu scanout; IddCx/Looking Glass is no longer the active display path.*
    LogonUI or a cold-boot device create. **A UMD-only tranche still needs a cold
    boot before it can be called verified** — restart-device is not a substitute,
    for the same reason `StRst`/`RfUnb` cannot be provoked by it (fresh zeroed
-   context, T1a and 7i).
+   context, T1a and 7i). **7l corrects this further: that warm window was not a
+   pass at all, it was a crash-loop behind a stale primary.**
+
+
+7l. **T7 UMD CRASH FIXED and the whole T7 gate PASSED.** One commit, `ead692e`,
+   `umd/bridge/dxvk_bridge.cpp` only. KMD unchanged at **22.22.189.0**; UMD
+   **`ba6adde35da4426e`**. Cold boot 2026-07-28 12:56:43.
+
+   **ROOT CAUSE — `bridge_guard` truncated every returned pointer to 32 bits.**
+   R1014 commit 4 (`919f28a`) folded nine hand-written catch triples into
+
+   ```cpp
+   template <typename R, typename Fn>
+   R bridge_guard(const char* what, R on_error, Fn&& fn) noexcept;
+   ```
+
+   `R` is deduced from `on_error` **alone** — the guarded body's return type is
+   not a deduction context. Four call sites passed the bare literal `0` against
+   a body returning `std::size_t`, so `R` deduced to `int` and `return fn();`
+   narrowed **the success value, not only the error value**. All four bodies
+   return a `reinterpret_cast<std::size_t>` of a live COM pointer:
+   `create_shader_sig` (the >=11.1 VS/PS/GS create dwm uses),
+   `create_tess_shader_sig`, `open_ddi_texture2d`,
+   `create_ddi_scanout_texture2d`. Before T7 each was a hand-written body
+   returning that cast straight out of its own `std::size_t` function — no
+   conversion, no defect. Nothing warns: `-Wconversion` / `-Wshorten-64-to-32`
+   are off, and the ~115 clang warnings a UMD build emits are exactly why
+   `tools/umd-check.ps1` exists.
+
+   ★ **The truncation was VISIBLE in the line 7k quoted as healthy.** Same dwm
+   role, same shaders, same lengths:
+
+   ```
+   T6 (renders):  create_vertex_shader_11_1 ok: raw=0x1cd520fc300 len=4600 …
+                                             …raw=0x1cd520fd200 len=180
+   T7 (crashes):  create_vertex_shader_11_1 ok: raw=0x7bdb1800   len=4600 …
+                                             …raw=0x7bdb2200   len=180
+   ```
+
+   `0x7bdb2200` is the low 32 bits of a Win64 heap pointer. `store_raw_com`
+   stored it and `VSSetShader` AddRef'd it — `Fault offset: 0x8068c`, exactly.
+   **A `raw=` that is 8 hex digits where its siblings are 11 is a truncated
+   pointer, not a small allocation.** (Caveat: genuinely small `raw=` values do
+   occur — 32-bit/WOW64 processes log them on T6 too. The comparison that means
+   something is *within one process role*, not across the log.)
+
+   **The fix is the static_assert, not the four `std::size_t(0)`s:**
+   `static_assert(std::is_same_v<R, decltype(fn())>)` makes a sentinel whose
+   type differs from the body's return type a compile error. Fault-injected on
+   the Linux host — restoring one bare `0` fails with `'int' is not the same as
+   'long unsigned int'`, exit 1 — via a two-file oracle that copies the template
+   verbatim and compiles all thirteen call-site shapes. No VM needed.
+
+   ⚠⚠ **THE PROCESS LESSON, and it is worse than 7k recorded: on the direct
+   primary, A PICTURE ON SCREEN DOES NOT PROVE THE COMPOSITOR IS ALIVE.** The
+   bisect row "T6 KMD + T7 UMD rendered fine for ~5 min (warm)" was never a
+   pass. `Application` id 1000 for 04:30–05:30 holds **102 faults**, of which
+   ~60 are `dwm.exe <- helios_umd_3b704b27b42a3ef1.dll` on a **~34-second
+   cadence** for the entire hour, plus every probe exe that ran. dwm was
+   crash-looping the whole time; the KMD kept scanning out the last composited
+   buffer, so the desktop looked static-but-fine instead of black. Cold boot is
+   black only because dwm never produces a first frame. **Check
+   `Get-WinEvent -Id 1000` before calling any display observation a pass.** The
+   same window's DXBC A/B returned **5 pairs where a healthy run returns 9** —
+   the four missing ones were the tess/11.1 probes dying — and that visible
+   shortfall was read as "bit-identical".
+
+   **T7 GATE — the full run nobody had done, all on the one cold boot:**
+
+   | Item | Result |
+   |---|---|
+   | Cold boot | `CM_PROB_NONE` first try, **no boot loop**; dwm and LogonUI survive |
+   | `helios_umd.dll` faults since boot | **0** |
+   | Desktop | `helios_paintcap` ×2 — full desktop, wallpaper, taskbar, clock matching the capture minute |
+   | `kmd-gate-surface.ps1` | **CLEAN, exit 0**; `VpSA=1 ScSet=1 ScPch=7680 DspMd=124257286` identical to 7i/7k; `ScanoutDiag` absent |
+   | `umd-gate-surface.ps1` | **CLEAN, exit 0**; eleven refusal counters; must-not-appear all clear |
+   | D3D11 suites | knob suite `TOTAL failures=0`; extra suite every `rc=0`, `xproc_read_rc=0` |
+   | DXBC A/B vs `dxbc-t6.txt` | **9/9 pairs byte-identical**, spanning all three container wrappers |
+   | Ownership soak 300/10000 | device 300 = 1944, **5.99 handles/device** (T6: 1947 / 5.99), resource phase **flat at 1972** all ten samples, modules **+0**, failures **0/0**, dwm handles **−2** |
+   | Fire Strike | Graphics **20269** (GT1 137.84, GT2 64.77, Physics 33697, Combined 5300, Overall 16577), **duration 383 s** — a real run, inside the T4a–T6 spread 19460–20473 |
+   | DComp probe, A/B same session | fixed **1308 / 1360 / 1305** vs T6 backup **1195 / 1308 / 1110**, all `PROBE PASS` — T6's own spread is wider than the gap (7h) |
+   | `present-gate:` cold-boot dwm | `n=5120 avg_us=1867 max_us=2820 timeouts=26 failed=0 noctx=0` |
+   | System log | no bugcheck (last 25-07, pre-T7), no dump written, **no TDR 4101** |
+
+   The printed `OWNERSHIP SOAK FAIL` is the pre-existing 6-handles-per-device
+   teardown leak (7d(b)) failing the literal "flat" test, identically to T5/T6.
+   The 8 `Application` id 1000 faults this boot are all `vulkan_virtio-*.dll`,
+   provoked by the two `restart-device` deploys — **WS1 defect 0z,
+   pre-existing.** `Kernel-Power` id 41 at boot is routine on this VM (it is
+   logged on every reboot, 26-07 and 27-07 included), not a Helios bugcheck.
+
+   `alloc_meta_format_unknown` reads 2–3 on some processes. It is a **T7-new**
+   counter naming a pre-existing silent `D3DDDIFMT_UNKNOWN` allocation-meta
+   downgrade (R1010 commit 2), so it has no T6 comparand by construction; the
+   gate script judges the surface clean. Left as an owed observation, not a
+   regression.
+
+   **The box is left on KMD 22.22.189.0 + UMD `ba6adde3`, rendering.**
 
 
 8. Implement the remaining reviewed refactors atomically, in tranche order, one recommendation

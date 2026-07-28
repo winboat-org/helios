@@ -1,3 +1,13 @@
+> **RESOLVED 2026-07-28 by `ead692e`. This brief is history — read `ROADMAP.md`
+> 7l instead.** The defect was in NONE of the three candidates below: it was
+> `bridge_guard` (R1014 commit 4, `919f28a`) deducing `R = int` from a bare `0`
+> sentinel and truncating every `std::size_t` return — including
+> `create_shader_sig`'s live COM pointer — to 32 bits. The whole T7 gate has
+> since passed on a cold boot. Two claims below are also now known to be FALSE:
+> the bisect's third row was never a pass (dwm was crash-looping behind a stale
+> primary), and the T7 DXBC A/B it calls "bit-identical" returned 5 pairs where
+> a healthy run returns 9.
+
 # HANDOFF: fix the T7 UMD crash (dwm + LogonUI, 0xc0000005, black screen)
 
 Branch `wddm`, HEAD `ccbd2c1`. **24 commits on top of `f1c6ace` (T6).** Working
