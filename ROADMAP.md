@@ -1430,6 +1430,138 @@ virtio-gpu scanout; IddCx/Looking Glass is no longer the active display path.*
    **The box is left on KMD 22.22.189.0 + UMD `ba6adde3`, rendering.**
 
 
+7m. **T8 IMPLEMENTED — the LAST tranche of the Phase-1 refactor review. 49
+   commits, KMD 22.22.190.0. GATE NOT YET RUN (needs a cold boot).**
+
+   Eight items, R1101–R1108, plus M1/M2. Every file the review names is split.
+   The headline numbers, all measured after `cargo fmt`:
+
+   | File | Before | After |
+   |---|---|---|
+   | `umd/src/forward.rs` | 10744 | **562** + 16 modules under `forward/` |
+   | `kmd_render/src/virtio/venus.rs` | 5603 | **470** (`venus/mod.rs`) + 7 |
+   | `kmd_render/src/virtio/gpu.rs` | 3289 | **2346** (`gpu/mod.rs`) + 3 |
+   | `kmd_render/src/adapter.rs` | 2479 | **1341** (`adapter/mod.rs`) + 5 |
+   | `umd/bridge/dxvk_bridge.cpp` | 2217 | **1338** + 2 TUs + 3 headers |
+   | `umd/src/lib.rs` | 1020 | **53** + 5 modules |
+   | `kmd_render/src/ddi/start_device.rs` | 1069 | **deleted**, 4 modules |
+
+   **Verified state (host + VM `cargo check`, no boot yet):** KMD 0 errors /
+   **3 warnings**; release UMD 0 errors / **14 warnings, 2 rustc** — both the
+   7l baseline exactly. `kmd_logic` **46 tests** green. `cargo fmt --check`
+   **zero diffs** in all four crates. Deepest boot chain **17488 B, headroom
+   448** — 96 bytes BETTER than 7l's 17584/352, because `setup_bar_segment`
+   and `build_segment_table` left `dxgkddi_start_device`'s module.
+
+   **How "move-only" was proved rather than asserted.** A multiset line diff,
+   with leading visibility keywords normalised away so a sanctioned widening
+   is not counted as a change, run per item against a pristine copy of the
+   pre-split file. Every item reports **LOST (0)** — including R1107's
+   **9959 lines across 14 modules**. The handful of lines that did report as
+   lost are each named in their commit message and are all `use` fixups, the
+   scheduled M2 doc rewrite, or the `super::gpu::` → `crate::virtio::gpu::`
+   path changes a module move forces.
+
+   **Cheap oracles that replaced VM runs, all fault-injected to prove they
+   bite:**
+   - `venus/ring.rs` — SHA-256 of `store_u32_seqcst`, `write_ring_buffer`,
+     `load_u32_acquire`, `publish_and_notify`, `ring_wait_until` matches
+     pre-split; whole-file `fence`/`compiler_fence` sequence unchanged
+     `[Acquire, SeqCst, SeqCst, compiler_fence(Release)]`.
+   - `venus/bringup.rs` — the `diag()` multiset is identical (35 = 35) and the
+     bring-up ladder appears in the pristine ORDER, so the `0x0D00_0001` …
+     `0x0D00_000D` sequence cannot have been reordered.
+   - `bridge_dxbc.cpp` / `bridge_icd_exports.cpp` — all nineteen sampled
+     bodies hash-match the pre-split file.
+   - **`tools/fl-profile-oracle.rs` (NEW)** — replays the eight pre-R1106
+     `feature_level_mode()` predicates against the new `FeatureProfile` for
+     knob values 0..6: all identical. Pointing the `2 =>` arm at `FL11_0`
+     makes it fail, exit 101.
+   - R420's `#![deny(deprecated)]` log guard re-proven by injecting a direct
+     `crate::log_line(..)` call: hard compile error, as designed.
+   - The six `#[no_mangle]` exports checked against the built DLL's export
+     table with `llvm-readobj --coff-exports`, not by inspection.
+
+   **THREE THINGS DROPPED, each with evidence, per the tranche's own rule
+   ("if an item cannot be made move-only, say so and drop it"):**
+
+   1. **R1103's three field-disjoint sub-structs.** `ResourceTables` IS
+      disjoint (its 10 fields are touched by exactly 32 methods, no
+      `self.<method>()` call crosses the boundary either way) — but making it
+      a struct costs ~130 lines of hand-written delegation in the blob/window
+      allocator, which is new code in a tranche that writes none, against a
+      defect class that has never fired. `CtrlQueue`+`FenceTables` cannot be
+      done as specified at all: the review names THREE methods needing a
+      hoist, measurement finds **SIX** — `drain_used`,
+      `note_wddm_submission`, `note_scanout_refresh` (predicted) plus
+      `latch_failed_and_fail_inflight`, `fence_wait_prepare`,
+      `fence_event_register` (NOT predicted) — while `async_retired_up_to`,
+      which the review lists, touches only `inflight` and needs no hoist. All
+      six sit on the completion path. **Owed: its own tranche and gate.**
+   2. **R1105's `bridge_flip_wait.cpp`.** Nothing to move — R912(a) retired
+      the kwait subsystem, so `HeliosCbSignalSyncFromCpu`, `HeliosFlipWaitCtx`,
+      the 64-slot latency ring, `present_flip_wait_setup`/`_arm` and
+      `HeliosVenusScanoutInfo` do not exist.
+   3. **R1108's TLS sealing.** `dxgi_present` touches the vehicle cell at FOUR
+      sites and none is a read (an arm-and-consume `match` with per-arm side
+      effects, two `set(Idle)` failure resets, one `set(Minted{..})` publish).
+      Wrapping them is API design in the per-frame path. `VEHICLE` is
+      `pub(crate)`. **Owed: `take_present_source()` + those four call sites.**
+
+   **Corrections to `REFACTOR_REVIEW.md`'s T8 section found while
+   implementing (thirteen):**
+   - `Writer` is NOT moved to `venus/protocol.rs` — T0 already put it in
+     `kmd_logic` with **seven** host tests, so the item's "add the T0-style
+     `Writer` test" is already satisfied.
+   - **M1 needs no commit**: the `fatal` field doc already states the PASSIVE
+     sleep-poll reality and keeps the wedge rationale.
+   - **M2's first paragraph needs no commit**: the `QueryDeviceDescriptor` doc
+     already describes serving `adapter.edid`. Only the `DxgkDdiResetDevice`
+     "no hardware to quiesce until Phase 2" paragraph was stale; rewritten.
+   - `VENUS_ALLOC_ENABLED` (R1102) no longer exists.
+   - `ADAPTER_COOKIE` (R1106) does not exist; it is `AdapterToken`/
+     `ADAPTER_TOKEN`, a ZST whose ADDRESS is the handle.
+   - R1106's knob module takes **four** readers, not six —
+     `vehicle_kernel_flip_wait` and `present_sync_publish_enabled` went with
+     T6/R912.
+   - `FeatureProfile` has **five** fields, not six: there is no second levels
+     cap, `D3D11DDICAPS_3DPIPELINESUPPORT` IS the levels bitmask.
+   - **`forward/format.rs` NOT created.** T7/R1010 moved the eight DXGI
+     classification tables to `umd/src/format.rs`; what is left in
+     `forward.rs` is eight three-line delegating wrappers, so the module would
+     delegate to the module that owns the subject.
+   - R1108: **one** TLS cell (`Cell<VehicleSlot>`), not three — the
+     `Idle`/`Armed`/`Minted` states replaced `PRESENT_SOURCE`,
+     `LAST_VEHICLE_DEVICE` and `PRESENT_RESULT`.
+   - `tools/kmd-frame-sizes.ps1` matched the boot symbol by the mangled
+     substring `12start_device20dxgkddi_start_device`; R1102's module rename
+     changed the length prefix, so the symbol stopped being found. Retargeted.
+   - Two **pre-existing merged doc blocks** found and fixed: `init_hpd`'s
+     summary sat above `reset_display_publication_state`, and
+     `bring_up_venus`'s entire nine-line `#[inline(never)]` STACK BUDGET
+     rationale sat above `zero_linear_scanout_breadcrumbs` — leaving
+     `bring_up_venus` with no doc at all.
+   - `adapter/segments.rs` carried a **broken doc link** to
+     `crate::ddi::start_device::BAR_SEGMENT_ID`, a constant deleted when the
+     id-3 topologies went. Retargeted to `crate::ddi::gpummu::MEMORY_SEGMENT_ID`.
+   - The tree was **not `cargo fmt` clean before T8**: 191 hunks at `f60febc`
+     (kmd_render 69, umd 102, kmd_logic 19, protocol 1). Most of the fmt
+     commit is that pre-existing drift.
+
+   **Two modules added beyond the review's list**, both recorded in their
+   commits: `forward/tiles.rs` (the self-contained WDDM1.3 sparse-resource
+   subsystem) and `forward/layout.rs` (input layouts + the VS input-variant
+   cache, of which `bind_input_layout` alone is 135 lines).
+
+   ⚠ **The 37 `LogThrottle` statics are byte-identical as a set** — 37 before,
+   37 after, `diff` of the sorted names empty. That is the item's explicit
+   constraint and it matters because eleven are SHARED by sites with different
+   log budgets, so renaming or renumbering one changes a cadence.
+
+   **NEXT: the T8 gate.** Needs a cold boot; nothing has been deployed. The
+   box is still on KMD 22.22.189.0 + UMD `ba6adde3`.
+
+
 8. Implement the remaining reviewed refactors atomically, in tranche order, one recommendation
    per commit; never fold a `BUG` fix into a structure move. Preserve the current direct
    primary, completion ordering, loud-failure contracts, registry ABI, and
