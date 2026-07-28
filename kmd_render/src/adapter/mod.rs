@@ -27,10 +27,10 @@ mod locks;
 mod scanout;
 mod segments;
 
-pub(crate) use segments::{BarSegment, PagingRam};
 pub(crate) use backing::{SystemBackingSnapshot, SystemBackingTable};
 pub(crate) use locks::{NotifyOrdered, ScanoutGuard, WddmNotifyGuard};
 pub(crate) use scanout::ScanoutRefreshQueue;
+pub(crate) use segments::{BarSegment, PagingRam};
 
 /// Everything `DxgkDdiStartDevice` establishes, as one value published once.
 ///
@@ -1265,7 +1265,8 @@ impl AdapterContext {
     /// See the field doc: no live consumer today.
     #[allow(dead_code)]
     pub fn page_table_window(&self) -> Option<(u64, u64)> {
-        self.transport_generation().and_then(|t| t.page_table_window)
+        self.transport_generation()
+            .and_then(|t| t.page_table_window)
     }
 
     /// Lock-free observation for query/diagnostic paths. Mutation is exposed

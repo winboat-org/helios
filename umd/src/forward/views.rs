@@ -25,7 +25,8 @@ pub(crate) unsafe extern "C" fn create_rtv(
     let Some(desc) = rtv_desc(a, a.hDrvResource) else {
         log_error!(
             "DDI create_rtv: unsupported resource dimension {} fmt={}",
-            a.ResourceDimension, a.Format
+            a.ResourceDimension,
+            a.Format
         );
         return;
     };
@@ -34,7 +35,8 @@ pub(crate) unsafe extern "C" fn create_rtv(
     if let Err(ref e) = created {
         log_error!(
             "DDI create_rtv failed: dim={} fmt={} {e:?}",
-            a.ResourceDimension, a.Format
+            a.ResourceDimension,
+            a.Format
         );
     }
     finish_create(h, created, rtv, |v| {
@@ -44,7 +46,11 @@ pub(crate) unsafe extern "C" fn create_rtv(
         if n < 128 {
             trace_line!(
                 "DDI create_rtv ok: dim={} fmt={} alloc=0x{:x} {}x{}",
-                a.ResourceDimension, a.Format, allocation, width, height
+                a.ResourceDimension,
+                a.Format,
+                allocation,
+                width,
+                height
             );
         }
         store_rtv(
@@ -222,7 +228,8 @@ pub(crate) unsafe extern "C" fn create_dsv(
     let Some(desc) = dsv_desc(a, a.hDrvResource) else {
         log_error!(
             "DDI create_dsv: unsupported resource dimension {} fmt={}",
-            a.ResourceDimension, a.Format
+            a.ResourceDimension,
+            a.Format
         );
         return;
     };
@@ -231,14 +238,18 @@ pub(crate) unsafe extern "C" fn create_dsv(
     if let Err(ref e) = created {
         log_error!(
             "DDI create_dsv failed: dim={} fmt={} flags=0x{:x} {e:?}",
-            a.ResourceDimension, a.Format, a.Flags
+            a.ResourceDimension,
+            a.Format,
+            a.Flags
         );
     }
     finish_create(h, created, dsv, |v| {
         if VIEW_LOG_COUNT.first_n(128).is_some() {
             trace_line!(
                 "DDI create_dsv ok: dim={} fmt={} flags=0x{:x}",
-                a.ResourceDimension, a.Format, a.Flags
+                a.ResourceDimension,
+                a.Format,
+                a.Flags
             );
         }
         store_com(h_dsv, v);
@@ -433,14 +444,17 @@ pub(crate) unsafe extern "C" fn create_srv(
     let Some(res) = load_resource(a.hDrvResource) else {
         log_error!(
             "DDI create_srv: resource handle empty dim={} fmt={} hpriv={:p}",
-            a.ResourceDimension, a.Format, a.hDrvResource.pDrvPrivate
+            a.ResourceDimension,
+            a.Format,
+            a.hDrvResource.pDrvPrivate
         );
         return;
     };
     let Some(desc) = srv_desc(a, a.hDrvResource) else {
         log_error!(
             "DDI create_srv: unsupported resource dimension {} fmt={}",
-            a.ResourceDimension, a.Format
+            a.ResourceDimension,
+            a.Format
         );
         return;
     };
@@ -449,7 +463,8 @@ pub(crate) unsafe extern "C" fn create_srv(
     if let Err(ref e) = created {
         log_error!(
             "DDI create_srv failed: dim={} fmt={} {e:?}",
-            a.ResourceDimension, a.Format
+            a.ResourceDimension,
+            a.Format
         );
     }
     finish_create(h, created, srv, |v| {
@@ -459,7 +474,12 @@ pub(crate) unsafe extern "C" fn create_srv(
             let (width, height) = resource_dimensions(a.hDrvResource);
             trace_line!(
                 "DDI create_srv ok: hpriv={:p} alloc=0x{:x} dim={} fmt={} {}x{}",
-                h_srv.pDrvPrivate, allocation, a.ResourceDimension, a.Format, width, height
+                h_srv.pDrvPrivate,
+                allocation,
+                a.ResourceDimension,
+                a.Format,
+                width,
+                height
             );
         }
         store_com(h_srv, v);
@@ -667,7 +687,8 @@ pub(crate) unsafe extern "C" fn create_uav(
     let Some(desc) = uav_desc(a) else {
         log_error!(
             "DDI create_uav: unsupported resource dimension {} fmt={}",
-            a.ResourceDimension, a.Format
+            a.ResourceDimension,
+            a.Format
         );
         return;
     };
@@ -709,7 +730,9 @@ pub(crate) unsafe extern "C" fn create_uav(
             };
             log_error!(
                 "DDI create_uav failed: dim={} fmt={} {} {e:?}",
-                a.ResourceDimension, a.Format, detail
+                a.ResourceDimension,
+                a.Format,
+                detail
             );
         }
     }
@@ -822,7 +845,10 @@ pub(crate) unsafe fn uav_desc(
     }
 }
 
-pub(crate) unsafe extern "C" fn destroy_uav(_h: Hdevice, h_uav: ddi::D3D11DDI_HUNORDEREDACCESSVIEW) {
+pub(crate) unsafe extern "C" fn destroy_uav(
+    _h: Hdevice,
+    h_uav: ddi::D3D11DDI_HUNORDEREDACCESSVIEW,
+) {
     release_com(h_uav);
 }
 
@@ -922,8 +948,7 @@ pub(crate) unsafe extern "C" fn copy_structure_count(
     let Some(context) = d3d11_context(h) else {
         return;
     };
-    let Some(dst) = load_resource(h_dst).and_then(|r| (*r).cast::<ID3D11Buffer>().ok())
-    else {
+    let Some(dst) = load_resource(h_dst).and_then(|r| (*r).cast::<ID3D11Buffer>().ok()) else {
         return;
     };
     let Some(src) = load_com::<ID3D11UnorderedAccessView>(h_src) else {
@@ -932,7 +957,10 @@ pub(crate) unsafe extern "C" fn copy_structure_count(
     context.CopyStructureCount(&dst, dst_offset, &*src);
 }
 
-pub(crate) unsafe extern "C" fn calc_size_sampler(_h: Hdevice, _d: *const ddi::D3D10_DDI_SAMPLER_DESC) -> u64 {
+pub(crate) unsafe extern "C" fn calc_size_sampler(
+    _h: Hdevice,
+    _d: *const ddi::D3D10_DDI_SAMPLER_DESC,
+) -> u64 {
     8
 }
 

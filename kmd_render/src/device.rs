@@ -151,8 +151,8 @@ pub unsafe extern "C" fn dxgkddi_destroy_device(h_device: *mut c_void) -> NTSTAT
     if !h_device.is_null() {
         // SAFETY: h_device came from Box::into_raw in create_device; its `adapter`
         // back-pointer is valid for the device's lifetime.
-        let Some(adapter) = (unsafe { DeviceHandleRef::from_raw(h_device) })
-            .and_then(|d| d.adapter())
+        let Some(adapter) =
+            (unsafe { DeviceHandleRef::from_raw(h_device) }).and_then(|d| d.adapter())
         else {
             // The Box still has to be reclaimed even if the back-pointer is
             // somehow null — leaking it would be the worse failure.

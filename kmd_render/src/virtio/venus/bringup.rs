@@ -182,7 +182,10 @@ impl VenusRing {
     /// Consumes the ring, so no caller can keep a handle to the stage that
     /// cannot encode a `VkInstance`.
     #[inline(never)]
-    pub(super) fn into_instance(mut self, adapter: &AdapterContext) -> Result<VenusInstance, VirtioError> {
+    pub(super) fn into_instance(
+        mut self,
+        adapter: &AdapterContext,
+    ) -> Result<VenusInstance, VirtioError> {
         // ── 4. vkCreateInstance (ring, reply) ─────────────────────────────────
         let instance_id = self.next_raw();
         {
@@ -201,7 +204,7 @@ impl VenusRing {
             w.count(false); // simple_pointer(pAllocator) NULL
             w.count(true); // simple_pointer(pInstance)
             w.u64(instance_id.get()); // VkInstance handle
-            // Reply: [i32 cmd][i32 VkResult][simple_pointer u64][u64 instance]
+                                      // Reply: [i32 cmd][i32 VkResult][simple_pointer u64][u64 instance]
             self.ring_command_expect(
                 adapter,
                 w.as_slice()?,
@@ -221,7 +224,7 @@ impl VenusRing {
             w.count(true); // simple_pointer(pPhysicalDeviceCount)
             w.u32(0); // *pPhysicalDeviceCount = 0
             w.count(false); // pPhysicalDevices NULL → array_size 0
-            // We don't strictly need the count value; just validate the header.
+                            // We don't strictly need the count value; just validate the header.
             self.ring_command_expect(
                 adapter,
                 w.as_slice()?,
@@ -240,10 +243,10 @@ impl VenusRing {
             w.u32(1); // *pPhysicalDeviceCount = 1
             w.count(true); // pPhysicalDevices present → array_size 1 follows
             w.u64(phys_dev_id.get()); // guest-assigned VkPhysicalDevice for slot 0
-            // Reply: [i32 cmd][i32 VkResult][sp u64][u32 count][array u64][u64 id×N]
-            //
-            // The VkResult is DEFERRED to this site, not refused by the helper:
-            // VK_INCOMPLETE is an acceptable answer here.
+                                      // Reply: [i32 cmd][i32 VkResult][sp u64][u32 count][array u64][u64 id×N]
+                                      //
+                                      // The VkResult is DEFERRED to this site, not refused by the helper:
+                                      // VK_INCOMPLETE is an acceptable answer here.
             let mut r = self.ring_command_expect(
                 adapter,
                 w.as_slice()?,
@@ -335,7 +338,10 @@ impl VenusInstance {
     /// still mints a FRESH handle — reusing one across tiers would make a retry
     /// collide with the host's record of the failed device.
     #[inline(never)]
-    pub(super) fn into_device(mut self, adapter: &AdapterContext) -> Result<VenusClient, VirtioError> {
+    pub(super) fn into_device(
+        mut self,
+        adapter: &AdapterContext,
+    ) -> Result<VenusClient, VirtioError> {
         // ── 6. vkGetPhysicalDeviceMemoryProperties — pick HOST_VISIBLE|COHERENT
         let mut memory_type_flags = [0u32; VK_MAX_MEMORY_TYPES as usize];
         let memory_type_count;
@@ -521,11 +527,11 @@ impl VenusInstance {
             w.count(false); // simple_pointer(pAllocator) NULL
             w.count(true); // simple_pointer(pDevice)
             w.handle(device_id); // VkDevice handle
-            // Reply: [i32 cmd][i32 VkResult][sp u64][u64 device]
-            //
-            // The VkResult is DEFERRED to this site, not refused by the helper:
-            // a non-zero result steps the extension ladder down a tier rather
-            // than failing the bring-up.
+                                 // Reply: [i32 cmd][i32 VkResult][sp u64][u64 device]
+                                 //
+                                 // The VkResult is DEFERRED to this site, not refused by the helper:
+                                 // a non-zero result steps the extension ladder down a tier rather
+                                 // than failing the bring-up.
             let mut r = self.ring.ring_command_expect(
                 adapter,
                 w.as_slice()?,

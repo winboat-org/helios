@@ -194,7 +194,10 @@ pub(crate) unsafe extern "C" fn create_element_layout(
     slot.store(LayoutData { elements: elems });
 }
 
-pub(crate) unsafe extern "C" fn destroy_element_layout(h: Hdevice, h_el: ddi::D3D10DDI_HELEMENTLAYOUT) {
+pub(crate) unsafe extern "C" fn destroy_element_layout(
+    h: Hdevice,
+    h_el: ddi::D3D10DDI_HELEMENTLAYOUT,
+) {
     let Some(slot) = boxed_slot(h_el) else {
         return;
     };
@@ -233,7 +236,10 @@ pub(crate) unsafe extern "C" fn destroy_element_layout(h: Hdevice, h_el: ddi::D3
     }
 }
 
-pub(crate) unsafe extern "C" fn ia_set_input_layout(h: Hdevice, h_el: ddi::D3D10DDI_HELEMENTLAYOUT) {
+pub(crate) unsafe extern "C" fn ia_set_input_layout(
+    h: Hdevice,
+    h_el: ddi::D3D10DDI_HELEMENTLAYOUT,
+) {
     if let Some(dev) = helios_device(h) {
         let p = match boxed_slot(h_el) {
             Some(slot) => slot.word(),
@@ -257,7 +263,8 @@ pub(crate) unsafe fn bind_input_layout(h: Hdevice) {
         if SHADER_BIND_LOG_COUNT.first_n(256).is_some() {
             log_error!(
                 "DDI bind_input_layout skipped: layout=0x{:x} vs=0x{:x}",
-                lp, vp
+                lp,
+                vp
             );
         }
         return;
@@ -589,7 +596,11 @@ pub(crate) unsafe extern "C" fn ia_set_vertex_buffers(
             .unwrap_or(0);
         trace_line!(
             "DDI IASetVertexBuffers start={} num={} first=0x{:x} stride={} offset={}",
-            start, num, first_raw, first_stride, first_offset
+            start,
+            num,
+            first_raw,
+            first_stride,
+            first_offset
         );
     }
     context.IASetVertexBuffers(

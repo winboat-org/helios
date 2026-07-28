@@ -120,10 +120,7 @@ pub(crate) fn log_self_module_path() {
             let mut buf = [0u16; 512];
             let n = GetModuleFileNameW(hmod, buf.as_mut_ptr(), buf.len() as u32) as usize;
             if n > 0 && n < buf.len() {
-                log_error!(
-                    "UMD module: {}",
-                    String::from_utf16_lossy(&buf[..n])
-                );
+                log_error!("UMD module: {}", String::from_utf16_lossy(&buf[..n]));
                 return;
             }
         }

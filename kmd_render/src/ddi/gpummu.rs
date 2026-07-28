@@ -116,9 +116,8 @@ const _: () = assert!(PAGE_TABLE_SIZE_BYTES == 4096);
 /// invariant that used to be implied by the `<= 9` assert above and by nothing
 /// else; stating it directly means a future bit-count change fails the build
 /// here rather than silently making the returned size wrong.
-const _: () = assert!(
-    (1u32 << ROOT_PAGE_TABLE_INDEX_BIT_COUNT) * PTE_SIZE_BYTES <= PAGE_TABLE_SIZE_BYTES
-);
+const _: () =
+    assert!((1u32 << ROOT_PAGE_TABLE_INDEX_BIT_COUNT) * PTE_SIZE_BYTES <= PAGE_TABLE_SIZE_BYTES);
 
 /// Fill a `DXGK_GPUMMUCAPS` (`DXGKQAITYPE_GPUMMUCAPS = 13`) with the decorative
 /// geometry above. All optional behaviour bits stay off (we back none of them):
@@ -202,8 +201,7 @@ pub unsafe fn fill_page_table_level_desc(args: &DXGKARG_QUERYADAPTERINFO) -> NTS
 /// bounds it at 512 (= one page / `PTE_SIZE_BYTES`) even if the bit count
 /// changes. Counted anyway, because a geometry contradiction should be LOUD
 /// rather than absorbed by a function that ignored its own argument.
-pub static ROOT_PT_OVERSIZE: core::sync::atomic::AtomicU32 =
-    core::sync::atomic::AtomicU32::new(0);
+pub static ROOT_PT_OVERSIZE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 /// Byte size of a root page table that must address `num_pte` entries.
 ///

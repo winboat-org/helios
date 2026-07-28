@@ -47,19 +47,19 @@ use super::VirtioError;
 use crate::adapter::AdapterContext;
 use crate::irql::PassiveLevel;
 
+mod bringup;
+mod commands;
+mod diagnostics;
+mod present;
 mod protocol;
 mod ring;
-mod commands;
-mod present;
 mod scanout;
-mod diagnostics;
-mod bringup;
 
-pub(crate) use protocol::*;
-use ring::*;
+pub(crate) use bringup::*;
 use commands::*;
 pub(crate) use present::*;
-pub(crate) use bringup::*;
+pub(crate) use protocol::*;
+use ring::*;
 
 /// Declare one handle newtype per Vulkan object class.
 ///
@@ -230,7 +230,6 @@ pub struct PreparedImageCopy {
     #[allow(dead_code)]
     pub height: u32,
 }
-
 
 /// Bring-up stage 2: an instance and a physical device exist on the ring.
 ///

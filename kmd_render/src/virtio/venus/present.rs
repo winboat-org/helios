@@ -474,7 +474,8 @@ impl VenusClient {
         {
             Ok(requirements) => requirements,
             Err(e) => {
-                let _ = self.cleanup_imported_source_alias(adapter, desc.resource_id, image_id, None);
+                let _ =
+                    self.cleanup_imported_source_alias(adapter, desc.resource_id, image_id, None);
                 return Err(e);
             }
         };
@@ -493,13 +494,18 @@ impl VenusClient {
         ) {
             Ok(memory_id) => memory_id,
             Err(e) => {
-                let _ = self.cleanup_imported_source_alias(adapter, desc.resource_id, image_id, None);
+                let _ =
+                    self.cleanup_imported_source_alias(adapter, desc.resource_id, image_id, None);
                 return Err(e);
             }
         };
         if let Err(e) = self.bind_image_memory(adapter, image_id, memory_id) {
-            let _ =
-                self.cleanup_imported_source_alias(adapter, desc.resource_id, image_id, Some(memory_id));
+            let _ = self.cleanup_imported_source_alias(
+                adapter,
+                desc.resource_id,
+                image_id,
+                Some(memory_id),
+            );
             return Err(e);
         }
 

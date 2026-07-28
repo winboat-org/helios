@@ -15,14 +15,12 @@ pub(crate) unsafe extern "C" fn resource_copy(
     let Some(context) = d3d11_context(h) else {
         return;
     };
-    let (Some(dst), Some(src)) = (
-        load_resource(h_dst),
-        load_resource(h_src),
-    ) else {
+    let (Some(dst), Some(src)) = (load_resource(h_dst), load_resource(h_src)) else {
         if COPY_LOG_COUNT.first_n(256).is_some() {
             log_error!(
                 "DDI resource_copy missing resource dst_priv={:p} src_priv={:p}",
-                h_dst.pDrvPrivate, h_src.pDrvPrivate
+                h_dst.pDrvPrivate,
+                h_src.pDrvPrivate
             );
         }
         return;
@@ -33,7 +31,8 @@ pub(crate) unsafe extern "C" fn resource_copy(
     if n < 256 || dst_alloc != 0 || src_alloc != 0 {
         trace_line!(
             "DDI resource_copy dst_alloc=0x{:x} src_alloc=0x{:x}",
-            dst_alloc, src_alloc
+            dst_alloc,
+            src_alloc
         );
     }
     context.CopyResource(&*dst, &*src);
@@ -157,10 +156,7 @@ pub(crate) unsafe extern "C" fn resource_resolve_subresource(
     let Some(context) = d3d11_context(h) else {
         return;
     };
-    let (Some(dst), Some(src)) = (
-        load_resource(h_dst),
-        load_resource(h_src),
-    ) else {
+    let (Some(dst), Some(src)) = (load_resource(h_dst), load_resource(h_src)) else {
         return;
     };
     context.ResolveSubresource(
@@ -316,9 +312,7 @@ pub(crate) unsafe extern "C" fn discard_11_1(
     num_rects: u32,
 ) {
     if D3D11_1_LOG_COUNT.first_n(64).is_some() {
-        trace_line!(
-            "DDI D3D11.1 Discard: type={handle_type} rects={num_rects}"
-        );
+        trace_line!("DDI D3D11.1 Discard: type={handle_type} rects={num_rects}");
     }
 
     // A rect-limited discard invalidates ONLY the given sub-rects. D3D11's
@@ -383,9 +377,7 @@ pub(crate) unsafe extern "C" fn check_direct_flip_support_11_1(
         *supported = 0;
     }
     if D3D11_1_LOG_COUNT.first_n(64).is_some() {
-        log_error!(
-            "DDI D3D11.1 CheckDirectFlipSupport: flags=0x{flags:x} -> no"
-        );
+        log_error!("DDI D3D11.1 CheckDirectFlipSupport: flags=0x{flags:x} -> no");
     }
 }
 
@@ -398,9 +390,7 @@ pub(crate) unsafe extern "C" fn clear_view_11_1(
     num_rects: u32,
 ) {
     if D3D11_1_LOG_COUNT.first_n(64).is_some() {
-        trace_line!(
-            "DDI D3D11.1 ClearView: type={view_type} rects={num_rects}"
-        );
+        trace_line!("DDI D3D11.1 ClearView: type={view_type} rects={num_rects}");
     }
     if view_type != ddi::D3D11DDI_HANDLETYPE_D3D10DDI_HT_RENDERTARGETVIEW {
         // Already loud -- this arm logs. Bump the field directly instead of
@@ -409,9 +399,7 @@ pub(crate) unsafe extern "C" fn clear_view_11_1(
         DDI_REFUSALS
             .clear_view_unsupported
             .fetch_add(1, Ordering::Relaxed);
-        log_error!(
-            "DDI D3D11.1 ClearView UNSUPPORTED view type {view_type} — clear dropped"
-        );
+        log_error!("DDI D3D11.1 ClearView UNSUPPORTED view type {view_type} — clear dropped");
         return;
     }
     let Some(context) = d3d11_context1(h) else {
@@ -462,7 +450,9 @@ pub(crate) unsafe extern "C" fn resource_update_subresource(
         if HANDLE_MISS_LOG_COUNT.first_n(256).is_some() {
             log_error!(
                 "DDI UpdateSubresource missing resource hpriv={:p} sub={} data={:p}",
-                h_res.pDrvPrivate, subresource, data
+                h_res.pDrvPrivate,
+                subresource,
+                data
             );
         }
         return;

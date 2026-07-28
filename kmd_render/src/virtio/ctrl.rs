@@ -54,10 +54,10 @@ use wdk_sys::ntddk::{KeDelayExecutionThread, KeWaitForSingleObject};
 use wdk_sys::{KEVENT, LARGE_INTEGER, PVOID, STATUS_SUCCESS};
 
 use super::gpu::{
-    BlobMapBegin, BlobMapFinish, BlobMapPrep, BlobRemapBegin, DeviceOwner,
-    FenceWaitPrep, OwnerFilter, SyncWaitBlock, WaitBlockRef, CTRL_TEARDOWN_ABANDONS,
-    CTRL_TIMEOUT_COUNT, SyncOutcome, SyncTicket,
-    FENCE_WAIT_TABLE_FULL, FENCE_WAIT_TIMEOUTS, SUBMIT_META_BYTES, TRANSPORT_GONE_AT_WAIT,
+    BlobMapBegin, BlobMapFinish, BlobMapPrep, BlobRemapBegin, DeviceOwner, FenceWaitPrep,
+    OwnerFilter, SyncOutcome, SyncTicket, SyncWaitBlock, WaitBlockRef, CTRL_TEARDOWN_ABANDONS,
+    CTRL_TIMEOUT_COUNT, FENCE_WAIT_TABLE_FULL, FENCE_WAIT_TIMEOUTS, SUBMIT_META_BYTES,
+    TRANSPORT_GONE_AT_WAIT,
 };
 use super::hal::DmaBuffer;
 use super::VirtioError;
@@ -687,7 +687,9 @@ pub fn alloc_blob(
     if !reserved {
         return Err(VirtioError::OutOfMemory);
     }
-    match resource_create_blob(passive, adapter, ctx_id, blob_mem, blob_flags, blob_id, size) {
+    match resource_create_blob(
+        passive, adapter, ctx_id, blob_mem, blob_flags, blob_id, size,
+    ) {
         Ok(resource_id) => {
             let _ = adapter.with_virtio(|v| v.commit_blob(owner, ctx_id, resource_id, size));
             Ok(resource_id)
@@ -1150,7 +1152,13 @@ pub fn submit_venus_async_present(
     // display refresh worker.
     display_submit_outcome(adapter.with_virtio(move |v| {
         v.drain_used();
-        v.enqueue_async_submit(ctx_id, crate::virtio::gpu::SCANOUT_RING_IDX, meta, venus, venus_len)
+        v.enqueue_async_submit(
+            ctx_id,
+            crate::virtio::gpu::SCANOUT_RING_IDX,
+            meta,
+            venus,
+            venus_len,
+        )
     }))
 }
 

@@ -23,9 +23,7 @@ pub(crate) unsafe fn shader_code_len(code: *const u32) -> usize {
     if *code == u32::from_le_bytes(*b"DXBC") {
         let total = *code.add(6) as usize;
         if total < 32 || total > (1 << 20) * core::mem::size_of::<u32>() {
-            log_error!(
-                "DDI shader_code_len: rejecting DXBC total size {total}"
-            );
+            log_error!("DDI shader_code_len: rejecting DXBC total size {total}");
             return 0;
         }
         return total;
@@ -53,7 +51,12 @@ pub(crate) unsafe fn log_shader_code(kind: &str, code: *const u32, len: usize) {
     let is_dxbc = d0 == u32::from_le_bytes(*b"DXBC");
     log_error!(
         "DDI {kind}: shader len={} dxbc={} tokens={:08x} {:08x} {:08x} {:08x}",
-        len, is_dxbc, d0, d1, d2, d3
+        len,
+        is_dxbc,
+        d0,
+        d1,
+        d2,
+        d3
     );
 }
 
@@ -87,14 +90,16 @@ pub(crate) unsafe extern "C" fn create_vertex_shader(
     let raw = dxvk.create_vertex_shader(bytes.as_ptr(), bytes.len());
     if raw != 0 {
         if SHADER_BIND_LOG_COUNT.first_n(128).is_some() {
-            log_error!(
-                "DDI create_vertex_shader ok: raw=0x{raw:x} len={len}"
-            );
+            log_error!("DDI create_vertex_shader ok: raw=0x{raw:x} len={len}");
         }
         store_raw_com(h_shader, raw);
         // Keep the bytecode so input layouts can be created lazily (the ISGN
         // supplies the semantic names CreateInputLayout requires).
-        dev.owned.ia.borrow_mut().vs_bytecode.insert(raw, bytes.to_vec());
+        dev.owned
+            .ia
+            .borrow_mut()
+            .vs_bytecode
+            .insert(raw, bytes.to_vec());
     } else {
         log_error!("DDI create_vertex_shader failed");
     }
@@ -122,9 +127,7 @@ pub(crate) unsafe extern "C" fn create_pixel_shader(
     let raw = dxvk.create_pixel_shader(bytes.as_ptr(), bytes.len());
     if raw != 0 {
         if SHADER_BIND_LOG_COUNT.first_n(128).is_some() {
-            log_error!(
-                "DDI create_pixel_shader ok: raw=0x{raw:x} len={len}"
-            );
+            log_error!("DDI create_pixel_shader ok: raw=0x{raw:x} len={len}");
         }
         store_raw_com(h_shader, raw);
     } else {
@@ -549,7 +552,10 @@ pub(crate) unsafe fn create_shader_11_1_common(
             let Some(e) = block.and_then(|b| b.input(i)) else {
                 break;
             };
-            dump.push_str(&format!(" [r{} m0x{:x} t{}]", e.register_, e.mask, e.comptype));
+            dump.push_str(&format!(
+                " [r{} m0x{:x} t{}]",
+                e.register_, e.mask, e.comptype
+            ));
         }
         log_error!("{dump}");
     }
@@ -564,7 +570,8 @@ pub(crate) unsafe fn create_shader_11_1_common(
         if SHADER_BIND_LOG_COUNT.first_n(128).is_some() {
             log_error!(
                 "DDI {name} ok: raw=0x{raw:x} len={len} sig_in={} sig_out={}",
-                sig_words[0], sig_words[1]
+                sig_words[0],
+                sig_words[1]
             );
         }
         store_raw_com(h_shader, raw);
@@ -771,7 +778,9 @@ pub(crate) unsafe extern "C" fn create_hull_shader_11_1(
     );
     if raw == 0 {
         note_ddi_refusal(&DDI_REFUSALS.tess_sig_fallback);
-        log_error!("DDI create_hull_shader_11_1 signature path failed; falling back to raw bytecode");
+        log_error!(
+            "DDI create_hull_shader_11_1 signature path failed; falling back to raw bytecode"
+        );
         raw = dxvk.create_hull_shader(bytes.as_ptr(), bytes.len());
     }
     if raw != 0 {
@@ -986,11 +995,41 @@ stage_set_shader!(
     // (`resolve_vs_input_variant`) reads this to find the bound VS.
     also_set: bound_vs_com
 );
-stage_set_shader!(ps_set_shader, "PS", current_ps, ID3D11PixelShader, PSSetShader);
-stage_set_shader!(gs_set_shader, "GS", current_gs, ID3D11GeometryShader, GSSetShader);
-stage_set_shader!(hs_set_shader, "HS", current_hs, ID3D11HullShader, HSSetShader);
-stage_set_shader!(ds_set_shader, "DS", current_ds, ID3D11DomainShader, DSSetShader);
-stage_set_shader!(cs_set_shader, "CS", current_cs, ID3D11ComputeShader, CSSetShader);
+stage_set_shader!(
+    ps_set_shader,
+    "PS",
+    current_ps,
+    ID3D11PixelShader,
+    PSSetShader
+);
+stage_set_shader!(
+    gs_set_shader,
+    "GS",
+    current_gs,
+    ID3D11GeometryShader,
+    GSSetShader
+);
+stage_set_shader!(
+    hs_set_shader,
+    "HS",
+    current_hs,
+    ID3D11HullShader,
+    HSSetShader
+);
+stage_set_shader!(
+    ds_set_shader,
+    "DS",
+    current_ds,
+    ID3D11DomainShader,
+    DSSetShader
+);
+stage_set_shader!(
+    cs_set_shader,
+    "CS",
+    current_cs,
+    ID3D11ComputeShader,
+    CSSetShader
+);
 
 /// Generate one stage's `pfn*SetShaderWithIfaces` entry point.
 ///

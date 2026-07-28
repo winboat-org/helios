@@ -7,7 +7,11 @@
 
 use super::*;
 
-pub(crate) unsafe extern "C" fn check_format_support(h: Hdevice, fmt: ddi::DXGI_FORMAT, out: *mut u32) {
+pub(crate) unsafe extern "C" fn check_format_support(
+    h: Hdevice,
+    fmt: ddi::DXGI_FORMAT,
+    out: *mut u32,
+) {
     // The D3D11 DDI `pfnCheckFormatSupport` returns API-style D3D11_FORMAT_SUPPORT
     // flags (D3D11 harmonized the DDI with the API enum; the small
     // D3D10_DDI_FORMAT_SUPPORT enum is only for the legacy D3D10 DDI). So pass

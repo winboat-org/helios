@@ -999,7 +999,11 @@ unsafe fn bar_transfer(
                     }
                     // SAFETY: src covers `len` blob bytes and dst_start covers
                     // `bytes` mapped MDL bytes, both checked above.
-                    core::ptr::copy_nonoverlapping(src.add(blob_off as usize), dst_start, bytes as usize);
+                    core::ptr::copy_nonoverlapping(
+                        src.add(blob_off as usize),
+                        dst_start,
+                        bytes as usize,
+                    );
                     copied = true;
                 })
             };
@@ -1381,9 +1385,7 @@ pub unsafe extern "C" fn dxgkddi_build_paging_buffer(
     // driver's answer: `Failed` is the only variant that reaches VidMm as a
     // status, and every arm that produces one routes through `paging_failure()`.
     let outcome = match operation {
-        PagingOperation::Transfer(t) => unsafe {
-            bar_transfer(passive, adapter, bar.seg_id, t)
-        },
+        PagingOperation::Transfer(t) => unsafe { bar_transfer(passive, adapter, bar.seg_id, t) },
         PagingOperation::Fill(f) => unsafe { bar_fill(passive, adapter, bar.seg_id, f) },
         PagingOperation::DiscardContent(d) => {
             if let Some(alloc) = unsafe { paging_alloc_info(d.hAllocation) } {
@@ -1451,9 +1453,7 @@ pub unsafe extern "C" fn dxgkddi_build_paging_buffer(
         // Exhaustive: `is_content_op` already returned for these, so reaching
         // them here is impossible. Named rather than wildcarded so a new variant
         // is a compile error in BOTH places at once.
-        PagingOperation::UpdatePageTable(_) | PagingOperation::Other => {
-            PagingOpOutcome::NotOurs
-        }
+        PagingOperation::UpdatePageTable(_) | PagingOperation::Other => PagingOpOutcome::NotOurs,
     };
     dump_bar_counters(passive);
     match outcome {

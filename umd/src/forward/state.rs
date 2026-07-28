@@ -96,7 +96,8 @@ impl DeallocateForm {
     }
 }
 
-pub(crate) type EvictCallback = unsafe extern "C" fn(ddi::HANDLE, *mut ddi::D3DDDICB_EVICT) -> ddi::HRESULT;
+pub(crate) type EvictCallback =
+    unsafe extern "C" fn(ddi::HANDLE, *mut ddi::D3DDDICB_EVICT) -> ddi::HRESULT;
 
 /// One persistent WDDM 2.x device-residency reference.
 ///
@@ -130,7 +131,8 @@ impl Drop for ResidentAllocation {
         if hr != 0 {
             log_error!(
                 "WDDM residency: Evict FAILED alloc=0x{:x} hr=0x{:08x}",
-                handle, hr as u32
+                handle,
+                hr as u32
             );
         }
     }
@@ -227,7 +229,6 @@ pub(crate) struct StandardAllocMetaV1 {
 // every answer to the pre-change predicate. These are the thin adapters that
 // keep the call sites reading as they did.
 
-
 /// Parse the meta trailer at `base_off` bytes into the buffer, tolerating the
 /// two legacy (shorter) layouts. Returns a zero-extended [`HeliosWddmAllocMeta`].
 pub(crate) unsafe fn read_alloc_meta(
@@ -314,7 +315,10 @@ pub(crate) unsafe fn read_open_identity(
 }
 
 /// The parse an OPEN may use: identity plus a present meta trailer, or nothing.
-pub(crate) unsafe fn read_opened_allocation(ptr: *const c_void, size: u32) -> Option<OpenedAllocation> {
+pub(crate) unsafe fn read_opened_allocation(
+    ptr: *const c_void,
+    size: u32,
+) -> Option<OpenedAllocation> {
     let (ident, meta) = read_open_identity(ptr, size)?;
     Some(OpenedAllocation { ident, meta: meta? })
 }
@@ -342,8 +346,6 @@ pub(crate) unsafe fn helios_device<'a>(h: Hdevice) -> Option<&'a HeliosDevice> {
         Some(&*hd)
     }
 }
-
-
 
 /// Report an error to the D3D11 runtime for a VOID-returning DDI via the
 /// corelayer `pfnSetErrorCb`. The runtime fails the API call that invoked the
@@ -539,17 +541,21 @@ pub(crate) unsafe fn stamp_dxvk_resource_kmt_handles(
     {
         log_error!(
             "DDI resource KMT handles stamped: local=0x{:x} global=0x{:x}",
-            local, global
+            local,
+            global
         );
     } else {
         log_error!(
             "DDI resource KMT handle stamp failed: local=0x{:x} global=0x{:x}",
-            local, global
+            local,
+            global
         );
     }
 }
 
-pub(crate) unsafe fn load_resource(h_res: ddi::D3D10DDI_HRESOURCE) -> Option<ManuallyDrop<ID3D11Resource>> {
+pub(crate) unsafe fn load_resource(
+    h_res: ddi::D3D10DDI_HRESOURCE,
+) -> Option<ManuallyDrop<ID3D11Resource>> {
     load_resource_at(h_res.pDrvPrivate)
 }
 
@@ -558,7 +564,9 @@ pub(crate) unsafe fn load_resource(h_res: ddi::D3D10DDI_HRESOURCE) -> Option<Man
 /// `D3D11DDI_HANDLETYPE` value at run time and so cannot be keyed on a static
 /// handle type. Callers must be an arm of such a dispatch that has already
 /// matched `HT_RESOURCE`. Same contract as `handle_com_raw_at`/`load_com_at`.
-pub(crate) unsafe fn load_resource_at(handle_priv: *mut c_void) -> Option<ManuallyDrop<ID3D11Resource>> {
+pub(crate) unsafe fn load_resource_at(
+    handle_priv: *mut c_void,
+) -> Option<ManuallyDrop<ID3D11Resource>> {
     let state = resource_state_at(handle_priv)?;
     if state.com_raw == 0 {
         return None;
@@ -574,7 +582,9 @@ pub(crate) unsafe fn load_resource_at(handle_priv: *mut c_void) -> Option<Manual
 ///
 /// Taking the handle rather than its `pDrvPrivate` is what makes the payload
 /// follow from the handle's type: `resource_state(h_rtv)` does not resolve.
-pub(crate) unsafe fn resource_state(h_res: ddi::D3D10DDI_HRESOURCE) -> Option<&'static ResourceState> {
+pub(crate) unsafe fn resource_state(
+    h_res: ddi::D3D10DDI_HRESOURCE,
+) -> Option<&'static ResourceState> {
     boxed_slot(h_res)?.get()
 }
 
@@ -602,8 +612,9 @@ pub(crate) unsafe fn resource_allocation(h_res: ddi::D3D10DDI_HRESOURCE) -> ddi:
 pub(crate) unsafe fn resource_parent_handles(
     h_res: ddi::D3D10DDI_HRESOURCE,
 ) -> (ddi::HANDLE, ddi::D3DKMT_HANDLE) {
-    resource_state(h_res)
-        .map_or((core::ptr::null_mut(), 0), |s| (s.rt_resource, s.km_resource))
+    resource_state(h_res).map_or((core::ptr::null_mut(), 0), |s| {
+        (s.rt_resource, s.km_resource)
+    })
 }
 
 pub(crate) unsafe fn resource_present_private(
@@ -682,7 +693,10 @@ pub(crate) fn needs_wddm_texture_allocation(a: &ddi::D3D11DDIARG_CREATERESOURCE)
         || (a.MiscFlags & (DDI_MISC_SHARED | DDI_MISC_SHARED_KEYEDMUTEX)) != 0
 }
 
-pub(crate) unsafe fn dxvk_resource_memory_info(h: Hdevice, obj: &ID3D11Resource) -> (u64, u64, u64, u32) {
+pub(crate) unsafe fn dxvk_resource_memory_info(
+    h: Hdevice,
+    obj: &ID3D11Resource,
+) -> (u64, u64, u64, u32) {
     let Some(dev) = helios_device(h) else {
         return (0, 0, 0, 0);
     };
@@ -862,7 +876,9 @@ pub(crate) unsafe fn store_rtv(
 
 /// The `RtvState` behind a DDI render-target-view handle, or `None` for an
 /// empty slot. The single place the RTV slot is decoded.
-pub(crate) unsafe fn rtv_state(h_rtv: ddi::D3D10DDI_HRENDERTARGETVIEW) -> Option<&'static RtvState> {
+pub(crate) unsafe fn rtv_state(
+    h_rtv: ddi::D3D10DDI_HRENDERTARGETVIEW,
+) -> Option<&'static RtvState> {
     boxed_slot(h_rtv)?.get()
 }
 
@@ -879,7 +895,9 @@ pub(crate) unsafe fn load_rtv(
 
 /// `load_rtv` for the runtime-tag dispatches (`Discard`, `ClearView`, the
 /// tiled-resource barrier). See `load_resource_at`.
-pub(crate) unsafe fn load_rtv_at(handle_priv: *mut c_void) -> Option<ManuallyDrop<ID3D11RenderTargetView>> {
+pub(crate) unsafe fn load_rtv_at(
+    handle_priv: *mut c_void,
+) -> Option<ManuallyDrop<ID3D11RenderTargetView>> {
     let state = rtv_state_at(handle_priv)?;
     if state.com_raw == 0 {
         return None;
@@ -1032,7 +1050,9 @@ pub(crate) unsafe fn load_com<T: Interface>(h: impl ComHandle) -> Option<Manuall
 /// `load_resource` for HT_RESOURCE, `load_rtv` for HT_RENDERTARGETVIEW, this
 /// for the bare-COM view tags. Do not call it from anywhere else: it is the
 /// unchecked form `load_com` exists to replace.
-pub(crate) unsafe fn load_com_at<T: Interface>(handle_priv: *mut c_void) -> Option<ManuallyDrop<T>> {
+pub(crate) unsafe fn load_com_at<T: Interface>(
+    handle_priv: *mut c_void,
+) -> Option<ManuallyDrop<T>> {
     Slot::<Com<T>>::from_priv(handle_priv)?.load()
 }
 

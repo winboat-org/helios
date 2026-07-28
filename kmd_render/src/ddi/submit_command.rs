@@ -389,9 +389,7 @@ fn note_and_maybe_signal(
     };
     adapter.with_wddm_notify_lock(|guard| {
         let signal_now = guard
-            .with_virtio(|o, v| {
-                v.note_wddm_submission(o, fence, is_paging, gpu_completion_fence)
-            })
+            .with_virtio(|o, v| v.note_wddm_submission(o, fence, is_paging, gpu_completion_fence))
             // Transport down (bring-up / teardown): no venus work can gate it.
             .unwrap_or(true);
         if signal_now {
@@ -429,9 +427,9 @@ unsafe fn decode_present_fence(
 ) -> Option<u64> {
     if !base.is_null() && kmd_range.start <= kmd_range.end && kmd_range.end <= total {
         let size = kmd_range.end - kmd_range.start;
-        if let Some(fence) =
-            unsafe { PresentSubmissionPrivate::decode(base.add(kmd_range.start).cast(), size as u32) }
-        {
+        if let Some(fence) = unsafe {
+            PresentSubmissionPrivate::decode(base.add(kmd_range.start).cast(), size as u32)
+        } {
             PRESENT_MARKER_HITS.fetch_add(1, Ordering::Relaxed);
             PRESENT_MARKER_LAST_OFFSET.store(kmd_range.start as u32, Ordering::Relaxed);
             return Some(fence);
@@ -581,8 +579,7 @@ pub unsafe extern "C" fn dxgkddi_submit_command_virtual(
     let present_fence = unsafe { decode_virtual_present_fence(submit) };
     // The submission is accepted regardless of how the notification went; a
     // non-SUCCESS return here bugchecks dxgmms2 with 0x119 Arg1=2.
-    let SubmitAck::Accepted =
-        note_and_maybe_signal(adapter, fence, is_paging, present_fence);
+    let SubmitAck::Accepted = note_and_maybe_signal(adapter, fence, is_paging, present_fence);
     STATUS_SUCCESS
 }
 
@@ -614,8 +611,7 @@ pub unsafe extern "C" fn dxgkddi_submit_command(
 
     let present_fence = unsafe { decode_legacy_present_fence(submit) };
     // As above: accepted regardless of the notification outcome.
-    let SubmitAck::Accepted =
-        note_and_maybe_signal(adapter, fence, is_paging, present_fence);
+    let SubmitAck::Accepted = note_and_maybe_signal(adapter, fence, is_paging, present_fence);
     STATUS_SUCCESS
 }
 

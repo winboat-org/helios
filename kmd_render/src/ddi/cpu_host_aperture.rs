@@ -138,11 +138,17 @@ static AP_COUNTERS: crate::diag::CounterBlock = crate::diag::CounterBlock {
         // FAILURE entry so a change forces an immediate flush: on the production
         // DisplayHalf=1 configuration it must read 0, and any movement means the
         // v71/v72 VidPn-commit rejection shape is being emitted again.
-        f(b"ApMiss", &crate::ddi::create_allocation::APERTURE_MISSING_CPU_VISIBLE),
+        f(
+            b"ApMiss",
+            &crate::ddi::create_allocation::APERTURE_MISSING_CPU_VISIBLE,
+        ),
         // R719's measurement: how often the empirical linear-blob size guess
         // disagreed with the exact Vulkan requirement. A VALUE entry, not a
         // failure — the guess being off is information, not a fault.
-        e(b"BlbSzD", &crate::ddi::create_allocation::LINEAR_BLOB_SIZE_DIVERGENCE),
+        e(
+            b"BlbSzD",
+            &crate::ddi::create_allocation::LINEAR_BLOB_SIZE_DIVERGENCE,
+        ),
     ],
     ticks: &AP_FLUSH_TICKS,
     failures: &AP_FLUSH_FAILURES,
@@ -226,7 +232,8 @@ fn note_size_provenance(adapter: &AdapterContext, alloc: &PagingAllocInfo) {
     if alloc.bar_eligible && !alloc.size_provenance.is_host_authoritative() {
         BAR_AP_SIZE_PROVENANCE.fetch_add(1, Ordering::Relaxed);
     }
-    let Ok(Some((_, tracked, _))) = adapter.with_virtio(|v| v.blob_lookup(alloc.resource_id)) else {
+    let Ok(Some((_, tracked, _))) = adapter.with_virtio(|v| v.blob_lookup(alloc.resource_id))
+    else {
         return;
     };
     let from_alloc = (alloc.size.saturating_add(4095) >> 12).max(1);
@@ -436,9 +443,10 @@ pub unsafe extern "C" fn dxgkddi_unmap_cpu_host_aperture(
     // hAllocation in this DDI — resolve by aperture offset.
     // SAFETY: our AdapterContext (DDI contract).
     let adapter = unsafe { &*(h_adapter as *const AdapterContext) };
-    let is_bar = adapter.bar_segment().as_ref().map_or(false, |b| {
-        b.seg_id == args.SegmentId as u32
-    });
+    let is_bar = adapter
+        .bar_segment()
+        .as_ref()
+        .map_or(false, |b| b.seg_id == args.SegmentId as u32);
     if !is_bar {
         return STATUS_SUCCESS;
     }

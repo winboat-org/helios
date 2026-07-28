@@ -58,8 +58,8 @@ use wdk_sys::{KEVENT, PVOID};
 mod resource_tables;
 
 use super::config::DxgkConfigAccess;
-use super::pci_caps::{map_isr_status_register, scan_host_visible_window, HostVisibleWindow};
 use super::hal::{DmaBuffer, DmaSpan, WdkHal};
+use super::pci_caps::{map_isr_status_register, scan_host_visible_window, HostVisibleWindow};
 
 // R1103: the telemetry atomics moved to `super::counters`. Re-exported here so
 // all 53+ external `gpu::<COUNTER>` paths keep compiling unchanged; narrowing
@@ -1103,8 +1103,7 @@ impl VirtioGpu {
         // the device, response is written by it. The page is a local RAII
         // `DmaBuffer` — the runtime paths own per-command buffers instead
         // (C3/M3.4), so no shared scratch survives init.
-        let mut scratch =
-            DmaBuffer::new(passive, SCRATCH_BYTES).ok_or(VirtioError::OutOfMemory)?;
+        let mut scratch = DmaBuffer::new(passive, SCRATCH_BYTES).ok_or(VirtioError::OutOfMemory)?;
         let buf = scratch.as_mut_slice();
         let (req_buf, resp_buf) = buf.split_at_mut(SCRATCH_BYTES / 2);
 
@@ -1311,7 +1310,8 @@ impl VirtioGpu {
         // SAFETY: see the function's Safety note.
         let added = unsafe {
             let reads = [reads[0].as_slice(), reads[1].as_slice()];
-            self.control.add(&reads[..count], &mut [resp.as_mut_slice()])
+            self.control
+                .add(&reads[..count], &mut [resp.as_mut_slice()])
         };
         match added {
             Ok(token) => Ok(token),
@@ -1477,7 +1477,14 @@ impl VirtioGpu {
         venus_len: usize,
         notify: ScanoutNotify,
     ) -> Result<u64, (DmaBuffer, DmaBuffer, VirtioError)> {
-        self.enqueue_submit_inner(ctx_id, SCANOUT_RING_IDX, meta, venus, venus_len, Some(notify))
+        self.enqueue_submit_inner(
+            ctx_id,
+            SCANOUT_RING_IDX,
+            meta,
+            venus,
+            venus_len,
+            Some(notify),
+        )
     }
 
     /// Shared body of the two entry points above. Private: the notify/ring
@@ -1678,7 +1685,10 @@ impl VirtioGpu {
             // `self.inflight` is held across the `self.control` call.
             let (spans, resp_len) = {
                 let e = &self.inflight[idx];
-                (e.chain.spans(&e.meta, e.venus.as_ref(), e.resp_len), e.resp_len)
+                (
+                    e.chain.spans(&e.meta, e.venus.as_ref(), e.resp_len),
+                    e.resp_len,
+                )
             };
             // The entry's own spans were proved at enqueue and nothing has
             // resized the buffers since, so this cannot fail; treat it as a
@@ -1997,7 +2007,11 @@ impl VirtioGpu {
     /// completion signals nobody (the entry itself is reaped when it completes).
     /// Returns `true` if the entry had ALREADY completed — the wait raced the
     /// drain and the caller should treat it as success.
-    pub fn abandon_sync(&mut self, ticket: SyncTicket, block: NonNull<SyncWaitBlock>) -> SyncOutcome {
+    pub fn abandon_sync(
+        &mut self,
+        ticket: SyncTicket,
+        block: NonNull<SyncWaitBlock>,
+    ) -> SyncOutcome {
         for e in self.inflight.iter_mut() {
             if e.token != ticket.token {
                 continue;
@@ -2142,10 +2156,7 @@ impl VirtioGpu {
     /// relationship to the `&mut VirtioGpu` being mutated.) Returns true when
     /// all preceding GPU work has already retired and the caller may refresh
     /// immediately.
-    pub fn note_scanout_refresh(
-        &mut self,
-        _order: &crate::adapter::NotifyOrdered<'_>,
-    ) -> bool {
+    pub fn note_scanout_refresh(&mut self, _order: &crate::adapter::NotifyOrdered<'_>) -> bool {
         let watermark = self.next_wire_fence;
         if self.async_retired_up_to(watermark, RetireDomain::IncludingGpu) {
             self.scanout_refresh_watermark = None;

@@ -58,18 +58,17 @@ fn bring_up_venus(
 ) -> (u32, Option<(u64, u64)>) {
     // Persistent venus context for the device lifetime (owner 0: KMD-internal,
     // destroyed explicitly in StopDevice).
-    let venus_result =
-        crate::virtio::ctrl::ctx_create(
-            passive,
-            adapter,
-            helios_protocol::VIRTIO_GPU_CAPSET_VENUS,
-            None,
-        )
-            .and_then(|ctx_id| {
-                let (client, blob) =
-                    crate::virtio::venus::allocate_host_visible_blob(passive, adapter, ctx_id)?;
-                Ok((ctx_id, client, blob))
-            });
+    let venus_result = crate::virtio::ctrl::ctx_create(
+        passive,
+        adapter,
+        helios_protocol::VIRTIO_GPU_CAPSET_VENUS,
+        None,
+    )
+    .and_then(|ctx_id| {
+        let (client, blob) =
+            crate::virtio::venus::allocate_host_visible_blob(passive, adapter, ctx_id)?;
+        Ok((ctx_id, client, blob))
+    });
     match venus_result {
         Ok((ctx_id, client, blob)) => {
             crate::diag::record(0x0B00_0007);
@@ -325,8 +324,11 @@ pub unsafe extern "C" fn dxgkddi_start_device(
     // StartDevice entry/exit (0x0B00_0001 .. 0x0B00_0004) completing before the
     // first QueryAdapterInfo (0x0100_0001), so the table always exists by the
     // time QUERYSEGMENT4 runs.
-    let segment_table =
-        build_segment_table(&mut bar_segment, paging_ram.as_ref().map(|r| (r.phys, r.size)), &knobs);
+    let segment_table = build_segment_table(
+        &mut bar_segment,
+        paging_ram.as_ref().map(|r| (r.phys, r.size)),
+        &knobs,
+    );
 
     // ── Publish. Everything above was a local; from here the adapter answers. ──
     // SAFETY: StartDevice, PASSIVE_LEVEL, serialized by dxgkrnl; published once

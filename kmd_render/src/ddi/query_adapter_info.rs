@@ -338,8 +338,7 @@ unsafe fn query_driver_caps(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTE
     // DXGK_PRESENTATIONCAPS bit stays clear.
     let presentation_caps: UINT = 0;
     let flip_caps: UINT = FLIPCAPS_FLIP_ON_VSYNC_MMIO;
-    let scheduling_caps: UINT =
-        SCHEDULINGCAPS_MULTI_ENGINE_AWARE | SCHEDULINGCAPS_PREEMPTION_AWARE;
+    let scheduling_caps: UINT = SCHEDULINGCAPS_MULTI_ENGINE_AWARE | SCHEDULINGCAPS_PREEMPTION_AWARE;
     out.set(caps_offset!(PresentationCaps), presentation_caps);
     out.set(caps_offset!(FlipCaps), flip_caps);
     out.set(caps_offset!(SchedulingCaps), scheduling_caps);

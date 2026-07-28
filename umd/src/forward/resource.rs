@@ -24,12 +24,16 @@ pub(crate) unsafe extern "C" fn calc_size_rtv(
 
 // --- Resources --------------------------------------------------------------
 
-pub(crate) const RES_BUFFER: ddi::D3D10DDIRESOURCE_TYPE = ddi::D3D10DDIRESOURCE_TYPE_D3D10DDIRESOURCE_BUFFER;
+pub(crate) const RES_BUFFER: ddi::D3D10DDIRESOURCE_TYPE =
+    ddi::D3D10DDIRESOURCE_TYPE_D3D10DDIRESOURCE_BUFFER;
 pub(crate) const RES_BUFFEREX: ddi::D3D10DDIRESOURCE_TYPE =
     ddi::D3D10DDIRESOURCE_TYPE_D3D11DDIRESOURCE_BUFFEREX;
-pub(crate) const RES_TEX2D: ddi::D3D10DDIRESOURCE_TYPE = ddi::D3D10DDIRESOURCE_TYPE_D3D10DDIRESOURCE_TEXTURE2D;
-pub(crate) const RES_TEX1D: ddi::D3D10DDIRESOURCE_TYPE = ddi::D3D10DDIRESOURCE_TYPE_D3D10DDIRESOURCE_TEXTURE1D;
-pub(crate) const RES_TEX3D: ddi::D3D10DDIRESOURCE_TYPE = ddi::D3D10DDIRESOURCE_TYPE_D3D10DDIRESOURCE_TEXTURE3D;
+pub(crate) const RES_TEX2D: ddi::D3D10DDIRESOURCE_TYPE =
+    ddi::D3D10DDIRESOURCE_TYPE_D3D10DDIRESOURCE_TEXTURE2D;
+pub(crate) const RES_TEX1D: ddi::D3D10DDIRESOURCE_TYPE =
+    ddi::D3D10DDIRESOURCE_TYPE_D3D10DDIRESOURCE_TEXTURE1D;
+pub(crate) const RES_TEX3D: ddi::D3D10DDIRESOURCE_TYPE =
+    ddi::D3D10DDIRESOURCE_TYPE_D3D10DDIRESOURCE_TEXTURE3D;
 pub(crate) const RES_TEXCUBE: ddi::D3D10DDIRESOURCE_TYPE =
     ddi::D3D10DDIRESOURCE_TYPE_D3D10DDIRESOURCE_TEXTURECUBE;
 
@@ -108,7 +112,9 @@ pub(crate) unsafe fn make_resident(
     if hr != 0 && hr != E_PENDING {
         log_error!(
             "WDDM residency: MakeResident FAILED alloc=0x{:x} hr=0x{:08x} trim={}",
-            allocation, hr as u32, arg.NumBytesToTrim
+            allocation,
+            hr as u32,
+            arg.NumBytesToTrim
         );
         return Err(hr);
     }
@@ -142,7 +148,9 @@ pub(crate) unsafe fn make_resident(
         if wait_hr != 0 {
             log_error!(
                 "WDDM residency: paging-fence wait FAILED alloc=0x{:x} fence={} hr=0x{:08x}",
-                allocation, fence_value, wait_hr as u32
+                allocation,
+                fence_value,
+                wait_hr as u32
             );
             drop(resident);
             return Err(wait_hr);
@@ -171,7 +179,8 @@ pub(crate) unsafe fn deallocate_standalone(
     let hr = deallocate_cb(dev.h_rt_device, &mut arg);
     log_error!(
         "DDI allocate rollback: alloc=0x{:x} hr=0x{:08x}",
-        allocation, hr as u32
+        allocation,
+        hr as u32
     );
 }
 
@@ -354,8 +363,7 @@ pub(crate) unsafe fn allocate_wddm_resource(
     let h_allocation = allocation_info.hAllocation;
     let post_private_alloc = private.alloc;
     let post_private_meta = private.meta;
-    let post_open_identity =
-        unsafe { read_open_identity(private_ptr, private_size) };
+    let post_open_identity = unsafe { read_open_identity(private_ptr, private_size) };
     let n = WDDM_ALLOC_LOG_COUNT.next();
     if n < 128 || hr != 0 {
         log_error!(
@@ -516,25 +524,18 @@ pub(crate) unsafe fn finish_wddm_tex2d(
         venus_alloc_size,
         memory_type_index,
     );
-    let (allocation, km_resource) = match allocate_wddm_resource(
-        h,
-        a,
-        mip0,
-        h_rt,
-        backing,
-        direct_scanout_primary,
-        scanout,
-    ) {
-        Ok(allocation) => allocation,
-        Err(hr) => {
-            log_error!(
-                "DDI create_resource(tex2d): WDDM allocation/residency failed hr=0x{:08x}",
-                hr as u32
-            );
-            set_runtime_error(h, hr);
-            return;
-        }
-    };
+    let (allocation, km_resource) =
+        match allocate_wddm_resource(h, a, mip0, h_rt, backing, direct_scanout_primary, scanout) {
+            Ok(allocation) => allocation,
+            Err(hr) => {
+                log_error!(
+                    "DDI create_resource(tex2d): WDDM allocation/residency failed hr=0x{:08x}",
+                    hr as u32
+                );
+                set_runtime_error(h, hr);
+                return;
+            }
+        };
     let allocation_handle = allocation
         .as_ref()
         .map(ResidentAllocation::handle)
@@ -632,7 +633,9 @@ pub(crate) unsafe extern "C" fn create_resource(
 
     // Build initial-data array if provided (one entry per subresource).
     let num_sub = (a.MipLevels.max(1) * a.ArraySize.max(1)) as usize;
-    if let Some(identity_n) = CREATE_RESOURCE_IDENTITY_LOG_COUNT.first_n_then_every_from_one(512, 2048) {
+    if let Some(identity_n) =
+        CREATE_RESOURCE_IDENTITY_LOG_COUNT.first_n_then_every_from_one(512, 2048)
+    {
         trace_line!(
             "DDI CreateResource identity: #{} hDrv={:p} hRT={:p} hDevice={:p} \
              dim={} fmt={} texel={}x{}x{} physical={}x{}x{} usage={} map=0x{:x} \
@@ -794,7 +797,9 @@ pub(crate) unsafe extern "C" fn create_resource(
                 },
                 None => {
                     if created.is_ok() {
-                        log_error!("DDI create_resource(buffer): DXVK CreateBuffer returned no buffer");
+                        log_error!(
+                            "DDI create_resource(buffer): DXVK CreateBuffer returned no buffer"
+                        );
                     }
                     None
                 }
@@ -849,7 +854,9 @@ pub(crate) unsafe extern "C" fn create_resource(
             if a.MiscFlags != 0 {
                 log_error!(
                     "DDI misc translation v2: ddi_misc=0x{:x} ddi_bind=0x{:x} api_misc=0x{:x}",
-                    a.MiscFlags, a.BindFlags, misc
+                    a.MiscFlags,
+                    a.BindFlags,
+                    misc
                 );
             }
             if bind != a.BindFlags
@@ -889,8 +896,7 @@ pub(crate) unsafe extern "C" fn create_resource(
             // Windows' pPrimaryDesc is the authoritative, non-heuristic marker
             // for a scan-out primary. The supported 32-bit Windows primary
             // formats become dedicated OPTIMAL DMA_BUF exports.
-            let is_scanout =
-                !a.pPrimaryDesc.is_null() && matches!(a.Format as u32, 28 | 87 | 88);
+            let is_scanout = !a.pPrimaryDesc.is_null() && matches!(a.Format as u32, 28 | 87 | 88);
             let mut handled = false;
             if is_scanout {
                 // The QEMU fork reconstructs this exact same-driver OPTIMAL
@@ -932,27 +938,25 @@ pub(crate) unsafe extern "C" fn create_resource(
                 // therefore still releases it).
                 match (created, geometry) {
                     (Some((res, _, _)), Some(geometry)) => {
-                    log_error!(
+                        log_error!(
                         "DDI create_resource(tex2d): direct scan-out primary {}x{} fmt={} logicalPitch={} offset={} (OPTIMAL DMA_BUF)",
                         mip0.TexelWidth, mip0.TexelHeight, a.Format, rp, off
                     );
-                        finish_wddm_tex2d(
-                            h, a, &mip0, h_rt, h_resource, res, true, Some(geometry),
-                        );
+                        finish_wddm_tex2d(h, a, &mip0, h_rt, h_resource, res, true, Some(geometry));
                     }
                     (created, _) => {
-                    // Loud failure over fake success: do NOT fall back to a plain
-                    // primary — that reintroduces the black scan-out as a "working"
-                    // desktop. A failure here is a real direct-scanout regression.
-                    if let Some((res, _, _)) = created {
-                        // The new arm: the bridge handed back a resource but no
-                        // usable stride. Dropping the adopted wrapper releases
-                        // it -- nothing else will. R813 removed the manual
-                        // IUnknown::from_raw this used to need.
-                        SCANOUT_PRIMARY_ZERO_PITCH.fetch_add(1, Ordering::Relaxed);
-                        let raw = res.as_raw() as usize;
-                        drop(res);
-                        log_error!(
+                        // Loud failure over fake success: do NOT fall back to a plain
+                        // primary — that reintroduces the black scan-out as a "working"
+                        // desktop. A failure here is a real direct-scanout regression.
+                        if let Some((res, _, _)) = created {
+                            // The new arm: the bridge handed back a resource but no
+                            // usable stride. Dropping the adopted wrapper releases
+                            // it -- nothing else will. R813 removed the manual
+                            // IUnknown::from_raw this used to need.
+                            SCANOUT_PRIMARY_ZERO_PITCH.fetch_add(1, Ordering::Relaxed);
+                            let raw = res.as_raw() as usize;
+                            drop(res);
+                            log_error!(
                             "DDI create_resource(tex2d): SCAN-OUT PRIMARY ZERO PITCH {}x{} fmt={} raw=0x{:x} offset={} -> refused (zero_pitch={})",
                             mip0.TexelWidth,
                             mip0.TexelHeight,
@@ -961,18 +965,18 @@ pub(crate) unsafe extern "C" fn create_resource(
                             off,
                             SCANOUT_PRIMARY_ZERO_PITCH.load(Ordering::Relaxed)
                         );
-                    }
-                    log_error!(
+                        }
+                        log_error!(
                         "DDI create_resource(tex2d): SCAN-OUT PRIMARY CREATE FAILED {}x{} fmt={} bind=0x{:x} -> no primary (optimal/dmabuf rejected?)",
                         mip0.TexelWidth, mip0.TexelHeight, a.Format, bind
                     );
-                    // The loudness has to reach the runtime, not stop at the log
-                    // file: this DDI returns void, so pfnSetErrorCb is the only
-                    // way CreateTexture2D fails instead of handing the caller
-                    // S_OK with a null driver resource. E_OUTOFMEMORY is in
-                    // CreateTexture2D's documented return set; the bridge
-                    // returns 0 with no HRESULT to map through.
-                    set_runtime_error(h, E_OUTOFMEMORY);
+                        // The loudness has to reach the runtime, not stop at the log
+                        // file: this DDI returns void, so pfnSetErrorCb is the only
+                        // way CreateTexture2D fails instead of handing the caller
+                        // S_OK with a null driver resource. E_OUTOFMEMORY is in
+                        // CreateTexture2D's documented return set; the bridge
+                        // returns 0 with no HRESULT to map through.
+                        set_runtime_error(h, E_OUTOFMEMORY);
                     }
                 }
                 handled = true;
@@ -1098,18 +1102,19 @@ pub(crate) unsafe extern "C" fn create_resource(
                 }
             };
             finish_create(h, created, res, |res| {
-                let (allocation, km_resource) =
-                    match allocate_wddm_resource(h, a, &mip0, h_rt, None, false, None) {
-                        Ok(allocation) => allocation,
-                        Err(hr) => {
-                            log_error!(
+                let (allocation, km_resource) = match allocate_wddm_resource(
+                    h, a, &mip0, h_rt, None, false, None,
+                ) {
+                    Ok(allocation) => allocation,
+                    Err(hr) => {
+                        log_error!(
                                 "DDI create_resource(tex1d): WDDM allocation/residency failed hr=0x{:08x}",
                                 hr as u32
                             );
-                            set_runtime_error(h, hr);
-                            return;
-                        }
-                    };
+                        set_runtime_error(h, hr);
+                        return;
+                    }
+                };
                 let allocation_handle = allocation
                     .as_ref()
                     .map(ResidentAllocation::handle)
@@ -1117,7 +1122,10 @@ pub(crate) unsafe extern "C" fn create_resource(
                 stamp_dxvk_resource_kmt_handles(h, &res, allocation_handle, km_resource);
                 log_error!(
                     "DDI create_resource(tex1d) ok: {} fmt={} bind=0x{:x} misc=0x{:x}",
-                    mip0.TexelWidth, a.Format, bind, misc
+                    mip0.TexelWidth,
+                    a.Format,
+                    bind,
+                    misc
                 );
                 store_resource(
                     h_resource,
@@ -1185,18 +1193,19 @@ pub(crate) unsafe extern "C" fn create_resource(
                 // set_runtime_error; `return` leaves the closure, and this is
                 // the last statement of create_resource, so that is the same
                 // exit it was before.
-                let (allocation, km_resource) =
-                    match allocate_wddm_resource(h, a, &mip0, h_rt, None, false, None) {
-                        Ok(allocation) => allocation,
-                        Err(hr) => {
-                            log_error!(
+                let (allocation, km_resource) = match allocate_wddm_resource(
+                    h, a, &mip0, h_rt, None, false, None,
+                ) {
+                    Ok(allocation) => allocation,
+                    Err(hr) => {
+                        log_error!(
                                 "DDI create_resource(tex3d): WDDM allocation/residency failed hr=0x{:08x}",
                                 hr as u32
                             );
-                            set_runtime_error(h, hr);
-                            return;
-                        }
-                    };
+                        set_runtime_error(h, hr);
+                        return;
+                    }
+                };
                 let allocation_handle = allocation
                     .as_ref()
                     .map(ResidentAllocation::handle)
@@ -1204,7 +1213,12 @@ pub(crate) unsafe extern "C" fn create_resource(
                 stamp_dxvk_resource_kmt_handles(h, &res, allocation_handle, km_resource);
                 log_error!(
                     "DDI create_resource(tex3d) ok: {}x{}x{} fmt={} bind=0x{:x} misc=0x{:x}",
-                    mip0.TexelWidth, mip0.TexelHeight, mip0.TexelDepth, a.Format, bind, misc
+                    mip0.TexelWidth,
+                    mip0.TexelHeight,
+                    mip0.TexelDepth,
+                    a.Format,
+                    bind,
+                    misc
                 );
                 store_resource(
                     h_resource,
@@ -1450,7 +1464,8 @@ pub(crate) unsafe extern "C" fn open_resource(
         Err(hr) => {
             log_error!(
                 "DDI open_resource FAILED: MakeResident alloc=0x{:x} hr=0x{:08x}",
-                allocation, hr as u32
+                allocation,
+                hr as u32
             );
             set_runtime_error(h, hr);
             return;
@@ -1458,7 +1473,12 @@ pub(crate) unsafe extern "C" fn open_resource(
     };
     log_error!(
         "DDI open_resource ddi-shared ok: {}x{} d3dfmt={} alloc=0x{:x} hKM={:?} raw=0x{:x}",
-        meta.width, meta.height, meta.format, allocation, a.hKMResource, raw
+        meta.width,
+        meta.height,
+        meta.format,
+        allocation,
+        a.hKMResource,
+        raw
     );
     store_resource(
         h_resource,
@@ -1494,7 +1514,11 @@ pub(crate) unsafe extern "C" fn resolve_shared_resource(
     let (width, height) = resource_dimensions(resource);
     log_error!(
         "DDI ResolveSharedResource: hDevice={:p} hResource={:p} alloc=0x{:x} {}x{}",
-        h, h_resource, alloc, width, height
+        h,
+        h_resource,
+        alloc,
+        width,
+        height
     );
     if let Some(context) = d3d11_context(Hdevice {
         pDrvPrivate: h as *mut c_void,

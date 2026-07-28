@@ -85,7 +85,11 @@ impl VirtioGpu {
 
     /// Drop a context's tracking slot, but only for its owner. Returns the
     /// resolved id, or `None` if the caller does not own it.
-    pub fn untrack_owned_context(&mut self, owner: Option<DeviceOwner>, ctx_id: u32) -> Option<u32> {
+    pub fn untrack_owned_context(
+        &mut self,
+        owner: Option<DeviceOwner>,
+        ctx_id: u32,
+    ) -> Option<u32> {
         let idx = self
             .contexts
             .iter()
@@ -284,17 +288,13 @@ impl VirtioGpu {
         let Some(window) = self.host_visible else {
             return BlobMapBegin::Failed(VirtioError::DeviceError);
         };
-        let Some(idx) = self
-            .blobs
-            .iter()
-            .position(|s| {
-                s.resource_id == resource_id
-                    && match owner {
-                        OwnerFilter::Any => true,
-                        OwnerFilter::Exactly(o) => s.owner == o,
-                    }
-            })
-        else {
+        let Some(idx) = self.blobs.iter().position(|s| {
+            s.resource_id == resource_id
+                && match owner {
+                    OwnerFilter::Any => true,
+                    OwnerFilter::Exactly(o) => s.owner == o,
+                }
+        }) else {
             return BlobMapBegin::Failed(VirtioError::DeviceError);
         };
         if self.blobs[idx].mapped {

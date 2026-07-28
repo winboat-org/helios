@@ -32,11 +32,13 @@ pub(crate) unsafe extern "C" fn set_render_targets(
     for i in 0..num_views as usize {
         // An absent slot is spelled as a null handle rather than a null
         // pointer, so the readers below stay on the typed accessors.
-        let h_rtv = rtv_slice.as_ref().and_then(|s| s.get(i)).copied().unwrap_or(
-            ddi::D3D10DDI_HRENDERTARGETVIEW {
+        let h_rtv = rtv_slice
+            .as_ref()
+            .and_then(|s| s.get(i))
+            .copied()
+            .unwrap_or(ddi::D3D10DDI_HRENDERTARGETVIEW {
                 pDrvPrivate: core::ptr::null_mut(),
-            },
-        );
+            });
         if i == 0 {
             rt0 = rtv_info(h_rtv);
         }
@@ -149,13 +151,17 @@ pub(crate) unsafe extern "C" fn set_viewports(
         if let Some(v) = out.first() {
             trace_line!(
                 "DDI RSSetViewports num={} clear={} first=({},{} {}x{} depth={:.3}..{:.3})",
-                num, _clear, v.TopLeftX, v.TopLeftY, v.Width, v.Height, v.MinDepth, v.MaxDepth
+                num,
+                _clear,
+                v.TopLeftX,
+                v.TopLeftY,
+                v.Width,
+                v.Height,
+                v.MinDepth,
+                v.MaxDepth
             );
         } else {
-            trace_line!(
-                "DDI RSSetViewports num={} clear={} empty",
-                num, _clear
-            );
+            trace_line!("DDI RSSetViewports num={} clear={} empty", num, _clear);
         }
     }
     context.RSSetViewports(Some(&out));
@@ -187,7 +193,12 @@ pub(crate) unsafe extern "C" fn set_scissor_rects(
         if let Some(r) = out.first() {
             trace_line!(
                 "DDI RSSetScissorRects num={} clear={} first=({},{}-{}, {})",
-                num, _clear, r.left, r.top, r.right, r.bottom
+                num,
+                _clear,
+                r.left,
+                r.top,
+                r.right,
+                r.bottom
             );
         } else {
             trace_line!(
@@ -205,7 +216,10 @@ pub(crate) unsafe extern "C" fn set_text_filter_size(_h: Hdevice, _w: u32, _hgt:
     note_ddi_refusal(&DDI_REFUSALS.text_filter_size_ignored);
 }
 
-pub(crate) unsafe extern "C" fn ia_set_topology(h: Hdevice, topo: ddi::D3D10_DDI_PRIMITIVE_TOPOLOGY) {
+pub(crate) unsafe extern "C" fn ia_set_topology(
+    h: Hdevice,
+    topo: ddi::D3D10_DDI_PRIMITIVE_TOPOLOGY,
+) {
     if let Some(dev) = helios_device(h) {
         dev.owned.ia.borrow_mut().current_topology = topo as u32;
     }
@@ -454,7 +468,11 @@ pub(crate) unsafe extern "C" fn so_set_targets(
     context.SOSetTargets(
         num,
         Some(out.as_ptr()),
-        if offsets.is_null() { None } else { Some(offsets) },
+        if offsets.is_null() {
+            None
+        } else {
+            Some(offsets)
+        },
     );
 }
 
@@ -497,9 +515,7 @@ pub(crate) unsafe extern "C" fn dispatch_indirect(
     let Some(context) = d3d11_context(h) else {
         return;
     };
-    let Some(buf) =
-        load_resource(h_args).and_then(|r| (*r).cast::<ID3D11Buffer>().ok())
-    else {
+    let Some(buf) = load_resource(h_args).and_then(|r| (*r).cast::<ID3D11Buffer>().ok()) else {
         return;
     };
     context.DispatchIndirect(&buf, aligned_byte_offset);

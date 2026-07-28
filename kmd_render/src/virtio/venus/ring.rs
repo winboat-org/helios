@@ -573,14 +573,21 @@ impl VenusRing {
     /// `vkSubmit/WaitVirtqueueSeqnoMESA`) which must reach the host before / around
     /// the ring being usable. Blocks at PASSIVE (virtio::ctrl KEVENT wait) until
     /// the device acks the command.
-    pub(super) fn submit_direct(&self, adapter: &AdapterContext, stream: &[u8]) -> Result<(), VirtioError> {
+    pub(super) fn submit_direct(
+        &self,
+        adapter: &AdapterContext,
+        stream: &[u8],
+    ) -> Result<(), VirtioError> {
         ctrl::submit_venus_sync(self.passive, adapter, self.ctx_id, stream)
     }
 
     /// Publish the ring buffer up to `self.cur` (SeqCst tail store), then nudge the
     /// host if the ring reports idle. Returns the seqno of the just-written command
     /// (== the post-write `cur`). Aborts on a fatal ring status.
-    pub(super) fn publish_and_notify(&mut self, adapter: &AdapterContext) -> Result<u32, VirtioError> {
+    pub(super) fn publish_and_notify(
+        &mut self,
+        adapter: &AdapterContext,
+    ) -> Result<u32, VirtioError> {
         if self.fatal {
             return Err(VirtioError::DeviceError);
         }

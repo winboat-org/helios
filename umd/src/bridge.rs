@@ -349,7 +349,6 @@ impl ffi::HeliosDxvkDevice {
 // The C++ side still returns `usize`, so the ABI is unchanged and this
 // migration cannot break the wire.
 
-
 /// A **source** resource pointer for the present path.
 ///
 /// `present_vehicle_copy(dst, src)` took the same two COM pointers in the

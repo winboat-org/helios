@@ -246,7 +246,10 @@ impl VenusClient {
     /// See [`helios_kmd_logic::choose_host_visible_memory_type`] — the rule is a
     /// pure function of `memory_type_flags`/`memory_type_count`, so it lives
     /// where it can be host-tested.
-    pub(super) fn choose_host_visible_memory_type(&self, memory_type_bits: u32) -> Option<MemoryTypeChoice> {
+    pub(super) fn choose_host_visible_memory_type(
+        &self,
+        memory_type_bits: u32,
+    ) -> Option<MemoryTypeChoice> {
         helios_kmd_logic::choose_host_visible_memory_type(
             &self.memory_type_flags,
             self.memory_type_count,
@@ -255,7 +258,10 @@ impl VenusClient {
     }
 
     /// See [`helios_kmd_logic::choose_device_local_memory_type`].
-    pub(super) fn choose_device_local_memory_type(&self, memory_type_bits: u32) -> Option<MemoryTypeChoice> {
+    pub(super) fn choose_device_local_memory_type(
+        &self,
+        memory_type_bits: u32,
+    ) -> Option<MemoryTypeChoice> {
         helios_kmd_logic::choose_device_local_memory_type(
             &self.memory_type_flags,
             self.memory_type_count,
@@ -807,7 +813,10 @@ impl VenusClient {
         Ok((offset, row_pitch))
     }
 
-    pub(super) fn create_command_pool(&mut self, adapter: &AdapterContext) -> Result<VkCommandPoolId, VirtioError> {
+    pub(super) fn create_command_pool(
+        &mut self,
+        adapter: &AdapterContext,
+    ) -> Result<VkCommandPoolId, VirtioError> {
         let pool_id = self.new_command_pool_id();
         let mut w = Writer::new();
         w.header(CMD_CREATE_COMMAND_POOL, CMD_FLAG_GENERATE_REPLY);
@@ -1260,7 +1269,10 @@ impl VenusClient {
         Ok(())
     }
 
-    pub(super) fn create_fence(&mut self, adapter: &AdapterContext) -> Result<VkFenceId, VirtioError> {
+    pub(super) fn create_fence(
+        &mut self,
+        adapter: &AdapterContext,
+    ) -> Result<VkFenceId, VirtioError> {
         let fence_id = self.new_fence_id();
         let mut w = Writer::new();
         w.header(CMD_CREATE_FENCE, CMD_FLAG_GENERATE_REPLY);
@@ -1439,7 +1451,10 @@ impl VenusClient {
         self.destroy_buffer_on_ring(adapter, buffer_id)
     }
 
-    pub(super) fn encode_command_buffer_submit(&self, command_buffer_id: VkCommandBufferId) -> Writer {
+    pub(super) fn encode_command_buffer_submit(
+        &self,
+        command_buffer_id: VkCommandBufferId,
+    ) -> Writer {
         let mut submit = Writer::new();
         submit.header(CMD_QUEUE_SUBMIT, 0);
         submit.handle(self.queue_id);

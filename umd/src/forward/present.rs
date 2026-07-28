@@ -51,7 +51,11 @@ pub(crate) unsafe fn maybe_log_present_readback(h: Hdevice, src_h: ddi::D3D10DDI
     if desc.Width == 0 || desc.Height == 0 || desc.SampleDesc.Count != 1 {
         log_error!(
             "DXGI Present readback: unsupported {}x{} fmt={} sample={}x{}",
-            desc.Width, desc.Height, desc.Format.0, desc.SampleDesc.Count, desc.SampleDesc.Quality
+            desc.Width,
+            desc.Height,
+            desc.Format.0,
+            desc.SampleDesc.Count,
+            desc.SampleDesc.Quality
         );
         return;
     }
@@ -65,9 +69,7 @@ pub(crate) unsafe fn maybe_log_present_readback(h: Hdevice, src_h: ddi::D3D10DDI
     staging_desc.MiscFlags = 0;
     let mut staging: Option<ID3D11Texture2D> = None;
     if let Err(e) = device.CreateTexture2D(&staging_desc, None, Some(&mut staging)) {
-        log_error!(
-            "DXGI Present readback: staging create failed {e:?}"
-        );
+        log_error!("DXGI Present readback: staging create failed {e:?}");
         return;
     }
     let Some(staging) = staging else {
@@ -298,9 +300,7 @@ pub(crate) unsafe fn maybe_force_present_alpha_opaque(h: Hdevice, src_h: ddi::D3
     let mut staging: Option<ID3D11Texture2D> = None;
     if let Err(e) = device.CreateTexture2D(&staging_desc, None, Some(&mut staging)) {
         if n < 8 {
-            log_error!(
-                "DXGI Present force-opaque: staging create failed {e:?}"
-            );
+            log_error!("DXGI Present force-opaque: staging create failed {e:?}");
         }
         return;
     }
@@ -385,7 +385,10 @@ impl RuntimePresentDependencies {
     /// The list pointer and capacity came from pfnCreateContextCb or the
     /// preceding successful pfnRenderCb. This method validates both before
     /// writing exactly `count()` initialized entries.
-    pub(crate) unsafe fn write_to(self, ctx: &crate::device_funcs::RuntimeContext) -> Result<u32, i32> {
+    pub(crate) unsafe fn write_to(
+        self,
+        ctx: &crate::device_funcs::RuntimeContext,
+    ) -> Result<u32, i32> {
         let required = self.count();
         // Pointer and capacity arrive together, so the `<` comparison cannot be
         // made against a capacity that describes a different pointer. The
@@ -910,15 +913,11 @@ pub(crate) unsafe extern "C" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT
             // A direct primary already is the scanout backing. Do not copy it
             // through the adapter-owned LINEAR target; Present will publish its
             // rotated resource id after flushing DWM's rendering.
-            let published_to_scanout =
-                presented_primary_private(h, src_h).is_some();
+            let published_to_scanout = presented_primary_private(h, src_h).is_some();
             let copy_pair = if published_to_scanout {
                 None
             } else {
-                match (
-                    load_resource(dst_h),
-                    load_resource(src_h),
-                ) {
+                match (load_resource(dst_h), load_resource(src_h)) {
                     (Some(dst), Some(src)) => Some((dst, src)),
                     _ => None,
                 }
@@ -1075,7 +1074,9 @@ pub(crate) unsafe extern "C" fn dxgi_get_gamma_caps(
     0
 }
 
-pub(crate) unsafe extern "C" fn dxgi_set_display_mode(arg: *mut ddi::DXGI_DDI_ARG_SETDISPLAYMODE) -> i32 {
+pub(crate) unsafe extern "C" fn dxgi_set_display_mode(
+    arg: *mut ddi::DXGI_DDI_ARG_SETDISPLAYMODE,
+) -> i32 {
     if arg.is_null() {
         return E_INVALIDARG;
     }
@@ -1103,7 +1104,8 @@ pub(crate) unsafe extern "C" fn dxgi_set_display_mode(arg: *mut ddi::DXGI_DDI_AR
     if allocation == 0 {
         log_error!(
             "DXGI SetDisplayMode: resource=0x{:x} sub={} has no WDDM allocation",
-            a.hResource, a.SubResourceIndex
+            a.hResource,
+            a.SubResourceIndex
         );
         return E_INVALIDARG;
     }
@@ -1360,13 +1362,11 @@ pub(crate) unsafe extern "C" fn dxgi_blt(arg: *mut ddi::DXGI_DDI_ARG_BLT) -> i32
     };
     let dst_h = dxgi_resource_handle(a.hDstResource);
     let src_h = dxgi_resource_handle(a.hSrcResource);
-    let (Some(dst), Some(src)) = (
-        load_resource(dst_h),
-        load_resource(src_h),
-    ) else {
+    let (Some(dst), Some(src)) = (load_resource(dst_h), load_resource(src_h)) else {
         log_error!(
             "DXGI Blt: missing resource dst=0x{:x} src=0x{:x}",
-            a.hDstResource, a.hSrcResource
+            a.hDstResource,
+            a.hSrcResource
         );
         return 0;
     };
@@ -1430,13 +1430,11 @@ pub(crate) unsafe extern "C" fn dxgi_blt1(arg: *mut ddi::DXGI_DDI_ARG_BLT1) -> i
     };
     let dst_h = dxgi_resource_handle(a.hDstResource);
     let src_h = dxgi_resource_handle(a.hSrcResource);
-    let (Some(dst), Some(src)) = (
-        load_resource(dst_h),
-        load_resource(src_h),
-    ) else {
+    let (Some(dst), Some(src)) = (load_resource(dst_h), load_resource(src_h)) else {
         log_error!(
             "DXGI Blt1: missing resource dst=0x{:x} src=0x{:x}",
-            a.hDstResource, a.hSrcResource
+            a.hDstResource,
+            a.hSrcResource
         );
         return E_INVALIDARG;
     };
@@ -1471,7 +1469,10 @@ pub(crate) unsafe extern "C" fn dxgi_blt1(arg: *mut ddi::DXGI_DDI_ARG_BLT1) -> i
     {
         log_error!(
             "DXGI Blt1: stretch unsupported src={}x{} dst={}x{} flags=0x{flags:x}",
-            src_w, src_h_px, dst_w, dst_h_px
+            src_w,
+            src_h_px,
+            dst_w,
+            dst_h_px
         );
         return DXGI_ERROR_UNSUPPORTED;
     }
@@ -1515,7 +1516,9 @@ pub(crate) unsafe extern "C" fn dxgi_blt1(arg: *mut ddi::DXGI_DDI_ARG_BLT1) -> i
     0
 }
 
-pub(crate) unsafe extern "C" fn dxgi_offer_resources(arg: *mut ddi::DXGI_DDI_ARG_OFFERRESOURCES) -> i32 {
+pub(crate) unsafe extern "C" fn dxgi_offer_resources(
+    arg: *mut ddi::DXGI_DDI_ARG_OFFERRESOURCES,
+) -> i32 {
     if arg.is_null() {
         return 0;
     }
@@ -1523,13 +1526,16 @@ pub(crate) unsafe extern "C" fn dxgi_offer_resources(arg: *mut ddi::DXGI_DDI_ARG
     if RESIDENCY_LOG_COUNT.first_n(32).is_some() {
         log_error!(
             "DXGI OfferResources: resources={} priority={} (kept resident)",
-            a.Resources, a.Priority
+            a.Resources,
+            a.Priority
         );
     }
     0
 }
 
-pub(crate) unsafe extern "C" fn dxgi_reclaim_resources(arg: *mut ddi::DXGI_DDI_ARG_RECLAIMRESOURCES) -> i32 {
+pub(crate) unsafe extern "C" fn dxgi_reclaim_resources(
+    arg: *mut ddi::DXGI_DDI_ARG_RECLAIMRESOURCES,
+) -> i32 {
     if arg.is_null() {
         return 0;
     }
@@ -1582,8 +1588,9 @@ pub(crate) const BILINEAR: u32 = ddi::DXGI_DDI_MULTIPLANE_OVERLAY_FEATURE_CAPS_D
 pub(crate) const SHARED: u32 =
     ddi::DXGI_DDI_MULTIPLANE_OVERLAY_FEATURE_CAPS_DXGI_DDI_MULTIPLANE_OVERLAY_FEATURE_CAPS_SHARED
         as u32;
-pub(crate) const IMMEDIATE: u32 = ddi::DXGI_DDI_MULTIPLANE_OVERLAY_FEATURE_CAPS_DXGI_DDI_MULTIPLANE_OVERLAY_FEATURE_CAPS_IMMEDIATE
-    as u32;
+pub(crate) const IMMEDIATE: u32 =
+    ddi::DXGI_DDI_MULTIPLANE_OVERLAY_FEATURE_CAPS_DXGI_DDI_MULTIPLANE_OVERLAY_FEATURE_CAPS_IMMEDIATE
+        as u32;
 
 /// Maximum stretch the caps advertise. NOT implemented: `dxgi_blt1` refuses any
 /// stretch with DXGI_ERROR_UNSUPPORTED.
@@ -1645,7 +1652,9 @@ pub(crate) unsafe extern "C" fn dxgi_get_mpo_group_caps(
     0
 }
 
-pub(crate) unsafe extern "C" fn dxgi_present_mpo(arg: *mut ddi::DXGI_DDI_ARG_PRESENTMULTIPLANEOVERLAY) -> i32 {
+pub(crate) unsafe extern "C" fn dxgi_present_mpo(
+    arg: *mut ddi::DXGI_DDI_ARG_PRESENTMULTIPLANEOVERLAY,
+) -> i32 {
     if arg.is_null() {
         return E_INVALIDARG;
     }
@@ -1723,7 +1732,8 @@ pub(crate) unsafe extern "C" fn dxgi_present_mpo(arg: *mut ddi::DXGI_DDI_ARG_PRE
         if alloc == 0 {
             log_error!(
                 "DXGI PresentMultiplaneOverlay: plane {} has no allocation hResource=0x{:x}",
-                i, plane.hResource
+                i,
+                plane.hResource
             );
             return E_INVALIDARG;
         }

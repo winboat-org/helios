@@ -149,7 +149,8 @@ pub(crate) const RING_BUFFER_SIZE: u32 = 131072;
 pub(crate) const RING_EXTRA_OFFSET: u64 = RING_BUFFER_OFFSET + RING_BUFFER_SIZE as u64; // 131264
 pub(crate) const RING_EXTRA_SIZE: u64 = 4;
 /// Total ring shmem = 192 + 131072 + 4 = 131268.
-pub(crate) const RING_SHMEM_SIZE: u64 = RING_BUFFER_OFFSET + RING_BUFFER_SIZE as u64 + RING_EXTRA_SIZE;
+pub(crate) const RING_SHMEM_SIZE: u64 =
+    RING_BUFFER_OFFSET + RING_BUFFER_SIZE as u64 + RING_EXTRA_SIZE;
 /// Idle timeout reported in the ring-create info (ns); cosmetic for our use.
 pub(crate) const RING_IDLE_TIMEOUT_NS: u64 = 1_000_000;
 

@@ -287,11 +287,7 @@ pub(crate) static WDDM13_MARKER_LOG_COUNT: LogThrottle = LogThrottle::new();
 
 pub(crate) unsafe extern "C" fn set_marker(h: Hdevice) {
     if let Some(n) = WDDM13_MARKER_LOG_COUNT.first_n_then_every(16, 1024) {
-        log_error!(
-            "WDDM1.3 SetMarker h={:p} hit={}",
-            h.pDrvPrivate,
-            n + 1
-        );
+        log_error!("WDDM1.3 SetMarker h={:p} hit={}", h.pDrvPrivate, n + 1);
     }
 }
 

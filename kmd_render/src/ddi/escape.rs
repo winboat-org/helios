@@ -24,13 +24,12 @@ use helios_protocol::{
     HeliosEscapeAllocBlob, HeliosEscapeAttachResource, HeliosEscapeCtxCreate,
     HeliosEscapeCtxDestroy, HeliosEscapeFenceEvent, HeliosEscapeHeader, HeliosEscapeMapBlob,
     HeliosEscapeQueryScanout, HeliosEscapeQueryStats, HeliosEscapeQueryStatsV2,
-    HeliosEscapeQueryStatsV3,
-    HeliosEscapeReleaseBlob, HeliosEscapeSubmitVenus, HeliosEscapeWaitFence,
-    HeliosEscapeWaitFenceLegacy,
-    HELIOS_ESCAPE_ALLOC_BLOB, HELIOS_ESCAPE_ATTACH_RESOURCE, HELIOS_ESCAPE_CTX_CREATE,
-    HELIOS_ESCAPE_CTX_DESTROY, HELIOS_ESCAPE_MAP_BLOB, HELIOS_ESCAPE_QUERY_SCANOUT,
-    HELIOS_ESCAPE_QUERY_STATS, HELIOS_ESCAPE_REGISTER_FENCE_EVENT, HELIOS_ESCAPE_RELEASE_BLOB,
-    HELIOS_ESCAPE_SUBMIT_VENUS, HELIOS_ESCAPE_UNREGISTER_FENCE_EVENT, HELIOS_ESCAPE_WAIT_FENCE,
+    HeliosEscapeQueryStatsV3, HeliosEscapeReleaseBlob, HeliosEscapeSubmitVenus,
+    HeliosEscapeWaitFence, HeliosEscapeWaitFenceLegacy, HELIOS_ESCAPE_ALLOC_BLOB,
+    HELIOS_ESCAPE_ATTACH_RESOURCE, HELIOS_ESCAPE_CTX_CREATE, HELIOS_ESCAPE_CTX_DESTROY,
+    HELIOS_ESCAPE_MAP_BLOB, HELIOS_ESCAPE_QUERY_SCANOUT, HELIOS_ESCAPE_QUERY_STATS,
+    HELIOS_ESCAPE_REGISTER_FENCE_EVENT, HELIOS_ESCAPE_RELEASE_BLOB, HELIOS_ESCAPE_SUBMIT_VENUS,
+    HELIOS_ESCAPE_UNREGISTER_FENCE_EVENT, HELIOS_ESCAPE_WAIT_FENCE,
     HELIOS_FENCE_EVENT_ALREADY_COMPLETE, HELIOS_FENCE_EVENT_CANCELLED,
     HELIOS_FENCE_EVENT_NOT_FOUND, HELIOS_FENCE_EVENT_PROBE_ACK, HELIOS_FENCE_EVENT_REGISTERED,
 };
@@ -39,8 +38,8 @@ use super::blob_map::{
     effective_map_cache, map_cache_to_mm, map_io_pages_to_user, unmap_io_pages_from_user,
 };
 use crate::adapter::AdapterContext;
-use crate::irql::PassiveLevel;
 use crate::dxgk::*;
+use crate::irql::PassiveLevel;
 use crate::virtio::ctrl;
 use crate::virtio::gpu::{DeviceOwner, OwnerFilter};
 
@@ -388,7 +387,8 @@ fn escape_query_scanout(
             break;
         }
     }
-    let Some((resource_id, wh, layout, alloc_size, dxgi_format, memory_type, generation)) = snapshot
+    let Some((resource_id, wh, layout, alloc_size, dxgi_format, memory_type, generation)) =
+        snapshot
     else {
         // A publisher held the descriptor for every attempt. Report "no primary"
         // rather than a torn one; the consumer polls.
@@ -974,8 +974,7 @@ fn escape_map_blob(
         adapter,
         OwnerFilter::Exactly(Some(owner)),
         req.resource_id,
-    )
-    {
+    ) {
         Ok(p) => p,
         Err(ve) => return ve.into(),
     };

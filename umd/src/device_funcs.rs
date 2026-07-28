@@ -289,16 +289,8 @@ impl IaState {
     /// identities. Only the cache values own references transferred by
     /// `CreateInputLayout` and `create_shader_sig`.
     pub fn release_owned_com(&mut self) -> (usize, usize) {
-        let variant_count = self
-            .vs_variants
-            .values()
-            .filter(|&&raw| raw != 0)
-            .count();
-        let layout_count = self
-            .layout_cache
-            .values()
-            .filter(|&&raw| raw != 0)
-            .count();
+        let variant_count = self.vs_variants.values().filter(|&&raw| raw != 0).count();
+        let layout_count = self.layout_cache.values().filter(|&&raw| raw != 0).count();
         let mut owned = std::collections::HashSet::new();
         owned.extend(self.vs_variants.drain().filter_map(
             |(_, raw)| {
@@ -645,7 +637,8 @@ unsafe extern "C" fn ddi_destroy_device(h_device: ddi::D3D10DDI_HDEVICE) {
         let (variants, layouts) = dev.owned.release();
         log_error!(
             "DDI DestroyDevice: released IA cache variants={} layouts={}",
-            variants, layouts
+            variants,
+            layouts
         );
         destroy_runtime_objects(dev);
         core::ptr::drop_in_place(h_device.pDrvPrivate as *mut HeliosDevice);
@@ -679,7 +672,8 @@ pub unsafe fn destroy_runtime_objects(dev: &mut HeliosDevice) {
                 let hr = destroy_context_cb(dev.h_rt_device, &arg);
                 log_error!(
                     "DDI DestroyDevice: DestroyContext hContext={:p} hr=0x{:08x}",
-                    ctx.handle.as_ptr(), hr as u32
+                    ctx.handle.as_ptr(),
+                    hr as u32
                 );
             }
         }
@@ -764,7 +758,10 @@ pub unsafe fn create_runtime_paging_queue(dev: &mut HeliosDevice) -> i32 {
     let hr = create_queue_cb(dev.h_rt_device, &mut arg);
     log_error!(
         "CreateDevice: CreatePagingQueue hr=0x{:08x} hQueue=0x{:x} hSync=0x{:x} fence={:p}",
-        hr as u32, arg.hPagingQueue, arg.hSyncObject, arg.FenceValueCPUVirtualAddress
+        hr as u32,
+        arg.hPagingQueue,
+        arg.hSyncObject,
+        arg.FenceValueCPUVirtualAddress
     );
     if hr != 0 {
         return hr;

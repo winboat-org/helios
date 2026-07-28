@@ -395,9 +395,8 @@ impl PresentAllocations {
         // otherwise validate against a stale count. `display.rs` records
         // PatchLocationListOutSize into PBPatch BEFORE the write, so the
         // breadcrumb is unaffected — keep it that way.
-        args.PatchLocationListOutSize = args
-            .PatchLocationListOutSize
-            .saturating_sub(written as u32);
+        args.PatchLocationListOutSize =
+            args.PatchLocationListOutSize.saturating_sub(written as u32);
         Ok(())
     }
 }

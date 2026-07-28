@@ -400,7 +400,10 @@ pub enum AllocationBacking {
     /// A live virtio resource created by the UMD/ICD, adopted by this
     /// allocation. `take_ownership` re-owns the blob slot from the ICD's escape
     /// owner; otherwise the resource is only liveness-validated.
-    AdoptedUmdResource { resource_id: u32, take_ownership: bool },
+    AdoptedUmdResource {
+        resource_id: u32,
+        take_ownership: bool,
+    },
     /// The VidPn primary: a KMD-created LINEAR scanout image blob.
     KmdLinearPrimary { width: u32, height: u32 },
     /// `D3DKMDT_GDISURFACE_TEXTURE`: a KMD-created cross-context OPTIMAL image.

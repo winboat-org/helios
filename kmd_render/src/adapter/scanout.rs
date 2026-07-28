@@ -124,8 +124,9 @@ impl AdapterContext {
         &self,
         passive: PassiveLevel,
     ) -> ScanoutRefreshQueue {
-        let outcome = self
-            .with_scanout_lifecycle(passive, |lock| self.queue_active_scanout_refresh_locked(lock));
+        let outcome = self.with_scanout_lifecycle(passive, |lock| {
+            self.queue_active_scanout_refresh_locked(lock)
+        });
         // R318: the pacing snapshot runs OUTSIDE `scanout_mutex`. It used to run
         // inside it — 32 synchronous registry transactions every 16 queued
         // refreshes, roughly 3.75 bursts per second at 60 Hz, on the PASSIVE
@@ -282,10 +283,7 @@ impl AdapterContext {
     /// Scanout refresh implementation. The caller holds `scanout_mutex`, which
     /// prevents a matching WDDM allocation from being unbound/unref'd between
     /// the liveness check and control-queue submission.
-    fn queue_active_scanout_refresh_locked(
-        &self,
-        lock: &ScanoutGuard<'_>,
-    ) -> ScanoutRefreshQueue {
+    fn queue_active_scanout_refresh_locked(&self, lock: &ScanoutGuard<'_>) -> ScanoutRefreshQueue {
         use core::sync::atomic::Ordering;
 
         // This is the production path only. Diagnostic fills issue their own

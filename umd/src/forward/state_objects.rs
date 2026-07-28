@@ -64,15 +64,15 @@ pub(crate) unsafe extern "C" fn create_rasterizer_state(
     finish_create(h, created, rs, |s| store_com(h_rs, s));
 }
 
-pub(crate) unsafe extern "C" fn set_rasterizer_state(h: Hdevice, h_rs: ddi::D3D10DDI_HRASTERIZERSTATE) {
+pub(crate) unsafe extern "C" fn set_rasterizer_state(
+    h: Hdevice,
+    h_rs: ddi::D3D10DDI_HRASTERIZERSTATE,
+) {
     let Some(context) = d3d11_context(h) else {
         return;
     };
     if RASTER_LOG_COUNT.first_n(128).is_some() {
-        trace_line!(
-            "DDI RSSetState raw=0x{:x}",
-            handle_com_raw(h_rs)
-        );
+        trace_line!("DDI RSSetState raw=0x{:x}", handle_com_raw(h_rs));
     }
     match load_com::<ID3D11RasterizerState>(h_rs) {
         Some(s) => context.RSSetState(&*s),
@@ -80,7 +80,9 @@ pub(crate) unsafe extern "C" fn set_rasterizer_state(h: Hdevice, h_rs: ddi::D3D1
     }
 }
 
-pub(crate) unsafe fn cvt_stencilop(d: &ddi::D3D10_DDI_DEPTH_STENCILOP_DESC) -> D3D11_DEPTH_STENCILOP_DESC {
+pub(crate) unsafe fn cvt_stencilop(
+    d: &ddi::D3D10_DDI_DEPTH_STENCILOP_DESC,
+) -> D3D11_DEPTH_STENCILOP_DESC {
     D3D11_DEPTH_STENCILOP_DESC {
         StencilFailOp: D3D11_STENCIL_OP(d.StencilFailOp),
         StencilDepthFailOp: D3D11_STENCIL_OP(d.StencilDepthFailOp),
@@ -132,11 +134,17 @@ pub(crate) unsafe extern "C" fn set_depth_stencil_state(
     }
 }
 
-pub(crate) unsafe extern "C" fn destroy_raster_state(_h: Hdevice, h_state: ddi::D3D10DDI_HRASTERIZERSTATE) {
+pub(crate) unsafe extern "C" fn destroy_raster_state(
+    _h: Hdevice,
+    h_state: ddi::D3D10DDI_HRASTERIZERSTATE,
+) {
     release_com(h_state);
 }
 
-pub(crate) unsafe extern "C" fn destroy_depth_state(_h: Hdevice, h_state: ddi::D3D10DDI_HDEPTHSTENCILSTATE) {
+pub(crate) unsafe extern "C" fn destroy_depth_state(
+    _h: Hdevice,
+    h_state: ddi::D3D10DDI_HDEPTHSTENCILSTATE,
+) {
     release_com(h_state);
 }
 
@@ -144,7 +152,10 @@ pub(crate) unsafe extern "C" fn destroy_depth_state(_h: Hdevice, h_state: ddi::D
 
 // --- Blend state ------------------------------------------------------------
 
-pub(crate) unsafe extern "C" fn calc_size_blend(_h: Hdevice, _d: *const ddi::D3D10_1_DDI_BLEND_DESC) -> u64 {
+pub(crate) unsafe extern "C" fn calc_size_blend(
+    _h: Hdevice,
+    _d: *const ddi::D3D10_1_DDI_BLEND_DESC,
+) -> u64 {
     8
 }
 
@@ -254,9 +265,7 @@ pub(crate) unsafe extern "C" fn create_blend_state_11_1(
         Some(s) => match s.cast::<ID3D11BlendState>() {
             Ok(b) => Some(b),
             Err(e) => {
-                log_error!(
-                    "DDI create_blend_state_11_1: ID3D11BlendState cast failed: {e:?}"
-                );
+                log_error!("DDI create_blend_state_11_1: ID3D11BlendState cast failed: {e:?}");
                 None
             }
         },

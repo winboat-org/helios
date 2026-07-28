@@ -105,10 +105,8 @@ impl VenusClient {
             crate::diag::record_named_bytes(b"PBPrF", 0xE6);
             return;
         };
-        let center = u32::from(c0)
-            | (u32::from(c1) << 8)
-            | (u32::from(c2) << 16)
-            | (u32::from(c3) << 24);
+        let center =
+            u32::from(c0) | (u32::from(c1) << 8) | (u32::from(c2) << 16) | (u32::from(c3) << 24);
         crate::diag::record_named_bytes(b"PBPrNz", nonblack);
         crate::diag::record_named_bytes(b"PBPrSum", rgb_sum);
         crate::diag::record_named_bytes(b"PBPrCtr", center);

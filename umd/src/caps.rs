@@ -108,7 +108,10 @@ const _: () = {
     assert!(FL11_PIPELINE_ONLY.options1 == FL11_0.options1);
     assert!(FL11_PIPELINE_ONLY.pipeline_mask != FL10_0.pipeline_mask);
     // ... and FL10's MSAA/format policy, which is what makes it a diagnostic.
-    assert!(matches!(FL11_PIPELINE_ONLY.msaa, MsaaPolicy::SingleSampleOnly));
+    assert!(matches!(
+        FL11_PIPELINE_ONLY.msaa,
+        MsaaPolicy::SingleSampleOnly
+    ));
     assert!(matches!(
         FL11_PIPELINE_ONLY.format,
         FormatPolicy::StripMultisampleBits
@@ -135,7 +138,6 @@ pub(crate) fn feature_profile() -> &'static FeatureProfile {
         _ => &FL11_PIPELINE_ONLY,
     }
 }
-
 
 pub(crate) unsafe extern "C" fn get_caps(
     _h_adapter: ddi::D3D10DDI_HADAPTER,
@@ -170,7 +172,9 @@ pub(crate) unsafe extern "C" fn get_caps(
         let args = unsafe { &*args };
         log_error!(
             "GetCaps type=0x{:08x} dataSize={} pInfo={:p}",
-            args.Type, args.DataSize, args.pInfo,
+            args.Type,
+            args.DataSize,
+            args.pInfo,
         );
         if !args.pData.is_null() && args.DataSize != 0 {
             // Default: zero the output.
@@ -239,9 +243,7 @@ pub(crate) unsafe extern "C" fn get_caps(
                 D3DWDDM1_3DDICAPS_D3D11_OPTIONS1 if args.DataSize >= 4 => {
                     let caps = feature_profile().options1;
                     unsafe { *(args.pData as *mut u32) = caps };
-                    log_error!(
-                        "  GetCaps: D3D11_OPTIONS1 TiledResourcesSupportFlags=0x{caps:x}"
-                    );
+                    log_error!("  GetCaps: D3D11_OPTIONS1 TiledResourcesSupportFlags=0x{caps:x}");
                 }
                 D3DWDDM1_3DDICAPS_MARKER if args.DataSize >= 4 => {
                     const D3DWDDM1_3DDI_MARKER_TYPE_NONE: u32 = 0;
@@ -251,7 +253,8 @@ pub(crate) unsafe extern "C" fn get_caps(
                 other => {
                     log_error!(
                         "  GetCaps: unsupported cap type {} (zeroed {} bytes)",
-                        other, args.DataSize
+                        other,
+                        args.DataSize
                     );
                 }
             }

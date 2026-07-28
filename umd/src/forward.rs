@@ -17,40 +17,40 @@
 mod alloc;
 mod handles;
 
-mod state;
-mod resource;
-mod views;
-mod transfer;
-mod shaders;
-mod pipeline;
-mod state_objects;
 mod bindings;
-mod tiles;
-mod queries;
 mod format_caps;
 mod layout;
+mod pipeline;
 mod present;
+mod queries;
+mod resource;
+mod shaders;
+mod state;
+mod state_objects;
 mod tables;
+mod tiles;
+mod transfer;
 mod vehicle;
+mod views;
 
-pub(crate) use state::*;
-pub(crate) use resource::*;
-pub(crate) use views::*;
-pub(crate) use transfer::*;
-pub(crate) use shaders::*;
-pub(crate) use pipeline::*;
-pub(crate) use state_objects::*;
-pub(crate) use bindings::*;
-pub(crate) use tiles::*;
-pub(crate) use queries::*;
-pub(crate) use format_caps::*;
-pub(crate) use layout::*;
-pub(crate) use present::*;
-pub(crate) use tables::*;
-pub(crate) use vehicle::*;
-pub(super) use alloc::{ScanoutGeometry, VenusBacking};
 pub(super) use crate::bridge::{DstRes, SrcRes};
+pub(super) use alloc::{ScanoutGeometry, VenusBacking};
+pub(crate) use bindings::*;
+pub(crate) use format_caps::*;
 pub(super) use handles::{Boxed, Com, ComHandle, DdiHandle, Slot};
+pub(crate) use layout::*;
+pub(crate) use pipeline::*;
+pub(crate) use present::*;
+pub(crate) use queries::*;
+pub(crate) use resource::*;
+pub(crate) use shaders::*;
+pub(crate) use state::*;
+pub(crate) use state_objects::*;
+pub(crate) use tables::*;
+pub(crate) use tiles::*;
+pub(crate) use transfer::*;
+pub(crate) use vehicle::*;
+pub(crate) use views::*;
 // NOT re-exported: `boxed_slot` is `pub(super)` in `handles` and its
 // `BoxedHandle` bound names types (`ResourceState`, `RtvState`, `LayoutData`)
 // that are private to this subtree, so a `pub(super)` re-export would leak
@@ -546,10 +546,7 @@ unsafe fn run_present_frame_gate(
         // Unchanged text and cadence: this is the pre-existing vehicle line.
         let n = EXT_FLIP_GATE_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
         if n < 16 || n % 512 == 0 {
-            log_error!(
-                "vehicle flip gate TIMEOUT (x{}) — flipping anyway",
-                n + 1
-            );
+            log_error!("vehicle flip gate TIMEOUT (x{}) — flipping anyway", n + 1);
         }
     } else {
         if PRESENT_GATE_LOG_COUNT.first_n_then_every(16, 512).is_some() {

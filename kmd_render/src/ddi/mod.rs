@@ -18,9 +18,9 @@ pub(crate) mod create_allocation;
 pub(crate) mod display;
 mod escape;
 mod gpummu;
-mod lifecycle;
 pub(crate) mod hpd;
 pub(crate) mod interrupt;
+mod lifecycle;
 mod present_packet;
 pub(crate) mod query_adapter_info;
 mod scheduler;
@@ -30,11 +30,19 @@ pub(crate) mod vidpn;
 pub(crate) mod wddm_surface;
 
 pub use add_device::dxgkddi_add_device;
+pub use base::{
+    dxgkddi_control_etw_logging, dxgkddi_notify_acpi_event, dxgkddi_query_interface,
+    dxgkddi_reset_device, dxgkddi_unload,
+};
 pub use blob_map::unmap_io_pages_from_user;
 pub(crate) use build_paging_buffer::PagingPteShadow;
 pub use build_paging_buffer::{
     diag_dump_gpummu_atomics, dxgkddi_build_paging_buffer, dxgkddi_get_root_page_table_size,
     dxgkddi_set_root_page_table,
+};
+pub use child::{
+    dxgkddi_get_child_container_id, dxgkddi_query_child_relations, dxgkddi_query_child_status,
+    dxgkddi_query_device_descriptor,
 };
 pub use cpu_host_aperture::{
     diag_dump_cpu_host_atomics, dxgkddi_map_cpu_host_aperture, dxgkddi_unmap_cpu_host_aperture,
@@ -57,6 +65,10 @@ pub use display::{
 };
 pub use escape::dxgkddi_escape;
 pub use interrupt::{dxgkddi_control_interrupt, dxgkddi_dpc_routine, dxgkddi_interrupt_routine};
+pub use lifecycle::{
+    dxgkddi_dispatch_io_request, dxgkddi_remove_device, dxgkddi_set_power_state,
+    dxgkddi_start_device, dxgkddi_stop_device,
+};
 pub use query_adapter_info::{dxgkddi_get_node_metadata, dxgkddi_query_adapter_info};
 pub use scheduler::{
     dxgkddi_calibrate_gpu_clock, dxgkddi_cancel_command, dxgkddi_create_hw_context,
@@ -67,25 +79,13 @@ pub use scheduler::{
     dxgkddi_set_stable_power_state, dxgkddi_set_virtual_machine_data,
     dxgkddi_submit_command_to_hw_queue, dxgkddi_switch_to_hw_context_list,
 };
-pub use base::{
-    dxgkddi_control_etw_logging, dxgkddi_notify_acpi_event, dxgkddi_query_interface,
-    dxgkddi_reset_device, dxgkddi_unload,
-};
-pub use child::{
-    dxgkddi_get_child_container_id, dxgkddi_query_child_relations, dxgkddi_query_child_status,
-    dxgkddi_query_device_descriptor,
-};
-pub use lifecycle::{
-    dxgkddi_dispatch_io_request, dxgkddi_remove_device, dxgkddi_set_power_state,
-    dxgkddi_start_device, dxgkddi_stop_device,
+pub(crate) use submit_command::{
+    abandon_pending_submissions, record_present_handoff_telemetry, AbandonOutcome,
+    ABANDONED_FENCES, DMA_STALE_SKIP_COUNT,
 };
 pub use submit_command::{
     diag_dump_engine_atomics, dxgkddi_collect_dbg_info, dxgkddi_patch, dxgkddi_preempt_command,
     dxgkddi_query_current_fence, dxgkddi_render, dxgkddi_render_gdi, dxgkddi_render_km,
     dxgkddi_reset_from_timeout, dxgkddi_restart_from_timeout, dxgkddi_submit_command,
     dxgkddi_submit_command_virtual,
-};
-pub(crate) use submit_command::{
-    abandon_pending_submissions, record_present_handoff_telemetry, AbandonOutcome,
-    ABANDONED_FENCES, DMA_STALE_SKIP_COUNT,
 };

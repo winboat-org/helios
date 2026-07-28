@@ -199,9 +199,7 @@ impl<'a> VidPn<'a> {
         witness: &'a W,
     ) -> Result<Self, NTSTATUS> {
         let _ = witness;
-        let dxgkrnl = adapter
-            .dxgkrnl_opt()
-            .ok_or(STATUS_GRAPHICS_INVALID_VIDPN)?;
+        let dxgkrnl = adapter.dxgkrnl_opt().ok_or(STATUS_GRAPHICS_INVALID_VIDPN)?;
         let query = dxgkrnl
             .DxgkCbQueryVidPnInterface
             .ok_or(STATUS_GRAPHICS_INVALID_VIDPN)?;
@@ -921,7 +919,10 @@ pub unsafe fn enum_cofunc_modality(
             } else {
                 // A pinned mode exists — the guard releases the mode info, and
                 // `set` (declared first) releases after it.
-                let _pinned = PinnedSourceMode { set: &set, mode: pinned };
+                let _pinned = PinnedSourceMode {
+                    set: &set,
+                    mode: pinned,
+                };
             }
         }
 
@@ -996,7 +997,10 @@ pub unsafe fn enum_cofunc_modality(
                     break;
                 }
             } else {
-                let _pinned = PinnedTargetMode { set: &set, mode: pinned };
+                let _pinned = PinnedTargetMode {
+                    set: &set,
+                    mode: pinned,
+                };
             }
         }
 

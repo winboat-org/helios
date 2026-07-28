@@ -6,7 +6,10 @@ use super::*;
 
 // --- Queries / counters -----------------------------------------------------
 
-pub(crate) unsafe extern "C" fn calc_size_query(_h: Hdevice, _a: *const ddi::D3D10DDIARG_CREATEQUERY) -> u64 {
+pub(crate) unsafe extern "C" fn calc_size_query(
+    _h: Hdevice,
+    _a: *const ddi::D3D10DDIARG_CREATEQUERY,
+) -> u64 {
     8
 }
 
@@ -90,8 +93,8 @@ pub(crate) unsafe extern "C" fn set_predication(
     let Some(context) = d3d11_context(h) else {
         return;
     };
-    let predicate = load_com::<ID3D11Query>(h_query)
-        .and_then(|q| (*q).cast::<ID3D11Predicate>().ok());
+    let predicate =
+        load_com::<ID3D11Query>(h_query).and_then(|q| (*q).cast::<ID3D11Predicate>().ok());
     context.SetPredication(predicate.as_ref(), predicate_value != 0);
 }
 
@@ -146,10 +149,7 @@ pub(crate) unsafe fn helios_multisample_quality_levels(
     // yielding true -- which is what made the doc's 128-bit exception look
     // implemented. Collapsed; `output_bits` is still bound for the log, which
     // is the only thing that ever consumed it.
-    let required = matches!(
-        (sample_count, output_bits),
-        (1 | 2 | 4 | 8 | 16, Some(_))
-    );
+    let required = matches!((sample_count, output_bits), (1 | 2 | 4 | 8 | 16, Some(_)));
     let val = if required { 1 } else { 0 };
     // DECLARED diagnostic-volume change (R829): this site fired whenever
     // `required || sample_count <= 8`, i.e. on essentially every query, and the
@@ -173,9 +173,7 @@ pub(crate) unsafe extern "C" fn check_multisample_quality_levels(
         let val = helios_multisample_quality_levels(h, fmt, sample_count);
         *out = val;
         if MSAA_LOG_COUNT.first_n_then_every(256, 4096).is_some() {
-            trace_line!(
-                "MSAA out fmt={fmt} c={sample_count} flags=legacy out={out:p} val={val}"
-            );
+            trace_line!("MSAA out fmt={fmt} c={sample_count} flags=legacy out={out:p} val={val}");
         }
     }
 }
@@ -205,7 +203,10 @@ pub(crate) unsafe extern "C" fn check_multisample_quality_levels_wddm1_3(
 /// failure during `LLOCompleteLayerConstruction`). We expose no device-dependent
 /// counters: zero the struct (LastDeviceDependentCounter = 0, 0 simultaneous
 /// counters) and report a single detectable parallel unit. PATH-A (2026-06-22).
-pub(crate) unsafe extern "C" fn check_counter_info(_h: Hdevice, info: *mut ddi::D3D10DDI_COUNTER_INFO) {
+pub(crate) unsafe extern "C" fn check_counter_info(
+    _h: Hdevice,
+    info: *mut ddi::D3D10DDI_COUNTER_INFO,
+) {
     if !info.is_null() {
         core::ptr::write_bytes(
             info as *mut u8,

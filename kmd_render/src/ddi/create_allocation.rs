@@ -29,14 +29,14 @@ use helios_protocol::{
 };
 
 use crate::adapter::{AdapterContext, ScanoutGuard};
-use crate::irql::PassiveLevel;
+use crate::ddi::display::ScanoutReject;
 use crate::dxgk::_D3DDDIFORMAT::{D3DDDIFMT_A8B8G8R8, D3DDDIFMT_A8R8G8B8, D3DDDIFMT_X8R8G8B8};
 use crate::dxgk::_D3DKMDT_STANDARDALLOCATION_TYPE::{
     D3DKMDT_STANDARDALLOCATION_GDISURFACE, D3DKMDT_STANDARDALLOCATION_SHADOWSURFACE,
     D3DKMDT_STANDARDALLOCATION_SHAREDPRIMARYSURFACE, D3DKMDT_STANDARDALLOCATION_STAGINGSURFACE,
 };
-use crate::ddi::display::ScanoutReject;
 use crate::dxgk::*;
+use crate::irql::PassiveLevel;
 use helios_kmd_logic::ScanoutFormat;
 
 /// `AllocationContext::magic` — validates `hAllocation` casts in paging DDIs
@@ -508,8 +508,7 @@ unsafe fn open_allocation_context<'a>(h: HANDLE) -> Option<&'a OpenAllocationCon
 /// Must read 0: every handle reaching here came from our own
 /// `DxgkDdiOpenAllocation`. Movement means dxgkrnl routed something else through
 /// the present allocation list, or a handle outlived its CloseAllocation.
-static OPEN_ALLOC_BAD_HANDLE: core::sync::atomic::AtomicU32 =
-    core::sync::atomic::AtomicU32::new(0);
+static OPEN_ALLOC_BAD_HANDLE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 /// Count a refused handle, mirroring on a bounded cadence — this is the Present
 /// path, so an unthrottled `record_named_bytes` would be a per-frame registry
@@ -613,8 +612,8 @@ unsafe fn take_open_ctx(h: HANDLE) -> Option<Box<OpenAllocationContext>> {
         return None;
     }
     // SAFETY: non-null; magic is read before any other field is trusted.
-    let magic_ok = unsafe { (*(h as *const OpenAllocationContext)).magic }
-        == OPEN_ALLOCATION_CTX_MAGIC;
+    let magic_ok =
+        unsafe { (*(h as *const OpenAllocationContext)).magic } == OPEN_ALLOCATION_CTX_MAGIC;
     if !magic_ok {
         RECLAIM_BAD_HANDLE.fetch_add(1, Ordering::Relaxed);
         return None;
@@ -929,7 +928,8 @@ fn cached_prepared_copy(
 
     let command_buffer_id =
         VkCommandBufferId::from_raw(ctx.scanout_copy_command_buffer_id.load(Ordering::Acquire))?;
-    let command_pool_id = VkCommandPoolId::from_raw(ctx.scanout_copy_pool_id.load(Ordering::Relaxed))?;
+    let command_pool_id =
+        VkCommandPoolId::from_raw(ctx.scanout_copy_pool_id.load(Ordering::Relaxed))?;
     let source_image_id = VkImageId::from_raw(ctx.scanout_copy_image_id.load(Ordering::Relaxed))?;
     let target_image_id =
         VkImageId::from_raw(ctx.scanout_copy_target_image_id.load(Ordering::Relaxed))?;
@@ -949,7 +949,8 @@ fn cached_prepared_copy(
             ctx.scanout_copy_conversion_image_id.load(Ordering::Relaxed),
         ),
         conversion_memory_id: VkDeviceMemoryId::from_raw(
-            ctx.scanout_copy_conversion_memory_id.load(Ordering::Relaxed),
+            ctx.scanout_copy_conversion_memory_id
+                .load(Ordering::Relaxed),
         ),
         conversion_init_pool_id: VkCommandPoolId::from_raw(
             ctx.scanout_copy_conversion_init_pool_id
@@ -1514,7 +1515,9 @@ unsafe fn destroy_allocation_ctx(
         // it — so a concurrent SetVidPnSourceAddress submit could leave this
         // thread with a stale-or-zero fence and skip the mandatory drain.
         let drained = adapter
-            .with_venus_client(passive, |client| client.destroy_prepared_image_copy(adapter, copy))
+            .with_venus_client(passive, |client| {
+                client.destroy_prepared_image_copy(adapter, copy)
+            })
             .map(|r| r.is_ok())
             .unwrap_or(false);
         if !drained {
@@ -1589,8 +1592,9 @@ unsafe fn destroy_allocation_ctx(
             // vkFreeMemory the venus memory. Best-effort: if the venus client
             // is already gone (device teardown), the host context destruction
             // reclaims everything anyway.
-            let _ = adapter
-                .with_venus_client(passive, |c| c.free_memory_blob(adapter, ctx.venus_memory_id));
+            let _ = adapter.with_venus_client(passive, |c| {
+                c.free_memory_blob(adapter, ctx.venus_memory_id)
+            });
         }
     } else if adapter_owned_scanout {
         crate::diag::record_named_bytes(b"CpKeep", ctx.resource_id);
@@ -1732,11 +1736,9 @@ fn build_backing(
             })
         }
         Backing::KmdLinearPrimary { width, height } => {
-            match adapter
-                .with_venus_client(passive, |c| {
-                    c.allocate_linear_scanout_image_blob(adapter, width, height)
-                })
-            {
+            match adapter.with_venus_client(passive, |c| {
+                c.allocate_linear_scanout_image_blob(adapter, width, height)
+            }) {
                 Ok(Ok(scanout)) => Ok(CreatedBacking {
                     resource_id: scanout.blob.res_id,
                     venus_memory_id: scanout.blob.blob_id,
@@ -1855,8 +1857,7 @@ fn build_backing(
             blob_id,
             size,
         } => match crate::virtio::ctrl::resource_create_blob(
-            passive,
-            adapter, ctx_id, blob_mem, blob_flags, blob_id, size,
+            passive, adapter, ctx_id, blob_mem, blob_flags, blob_id, size,
         ) {
             Ok(rid) => {
                 // Register the blob in the tracking table (owner 0 =
@@ -2057,7 +2058,8 @@ unsafe fn create_one(
                 &ident,
             );
         }
-        if write_target_len >= size_of::<HeliosWddmAllocPrivate>() + size_of::<HeliosWddmAllocMeta>()
+        if write_target_len
+            >= size_of::<HeliosWddmAllocPrivate>() + size_of::<HeliosWddmAllocMeta>()
         {
             // SAFETY: bounds-checked; trailer follows the 48-byte prefix in the
             // per-allocation runtime-owned buffer.
@@ -2377,8 +2379,8 @@ pub unsafe extern "C" fn dxgkddi_destroy_allocation(
         crate::diag::record(0x0C01_0031);
         // Magic-checked like the allocation handles: a foreign value is counted
         // and leaked rather than freed as if it were our pool.
-        let ours = unsafe { (*(args.hResource as *const ResourceContext))._marker }
-            == RESOURCE_CTX_MARKER;
+        let ours =
+            unsafe { (*(args.hResource as *const ResourceContext))._marker } == RESOURCE_CTX_MARKER;
         if ours {
             let _resource = unsafe { Box::from_raw(args.hResource as *mut ResourceContext) };
         } else {
@@ -2431,8 +2433,8 @@ pub unsafe extern "C" fn dxgkddi_open_allocation(
     // This site used to dereference the back-pointer in ONE expression with no
     // null check at all, unlike its two siblings in scheduler.rs and
     // submit_command.rs. The checked traversal is now the only route.
-    let Some(adapter) = (unsafe { crate::device::DeviceHandleRef::from_raw(h_device) })
-        .and_then(|d| d.adapter())
+    let Some(adapter) =
+        (unsafe { crate::device::DeviceHandleRef::from_raw(h_device) }).and_then(|d| d.adapter())
     else {
         return STATUS_INVALID_PARAMETER;
     };
@@ -2448,9 +2450,8 @@ pub unsafe extern "C" fn dxgkddi_open_allocation(
     // the binding and was never read; entry 0 is the fallback, which reproduces
     // today's value exactly for the single-entry opens this tree produces
     // (the UMD always sets NumAllocations = 1).
-    let subresource_entry = (args.SubresourceIndex as usize).min(
-        (args.NumAllocations as usize).saturating_sub(1),
-    );
+    let subresource_entry =
+        (args.SubresourceIndex as usize).min((args.NumAllocations as usize).saturating_sub(1));
     if args.NumAllocations > 1 {
         let n = MULTI_ENTRY_OPENS.fetch_add(1, Ordering::Relaxed) + 1;
         if n == 1 || n % 64 == 0 {
@@ -2624,8 +2625,8 @@ pub unsafe extern "C" fn dxgkddi_open_allocation(
         // layout -- reports 0 to the runtime, which is what OpenAllocation has
         // always done and is the documented "no pitch" answer for a GDI
         // texture.
-        args.Pitch = RowPitch::resolve(meta.misc_flags, meta.pitch, meta.width)
-            .map_or(0, RowPitch::get);
+        args.Pitch =
+            RowPitch::resolve(meta.misc_flags, meta.pitch, meta.width).map_or(0, RowPitch::get);
         crate::diag::record(0x0C38_0000 | (args.Pitch.min(0xFFFF) as u32));
     }
     STATUS_SUCCESS

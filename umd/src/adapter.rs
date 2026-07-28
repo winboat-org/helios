@@ -9,6 +9,7 @@
 use core::ffi::c_void;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use crate::get_caps;
 use crate::hr::{
     Hresult, DXGI_ERROR_UNSUPPORTED, DXGI_STATUS_NO_REDIRECTION, E_FAIL, E_NOTIMPL, E_OUTOFMEMORY,
     S_OK,
@@ -16,7 +17,6 @@ use crate::hr::{
 use crate::{bridge, ddi, device_funcs, forward};
 use crate::{log_error, trace_line};
 use crate::{log_knob_inventory, log_self_module_path, trace_enabled};
-use crate::get_caps;
 
 const fn ddi_supported(major: u64, minor: u64, build: u64) -> u64 {
     let interface = (major << 16) | minor;
@@ -146,13 +146,17 @@ fn adapter_ok(h: ddi::D3D10DDI_HADAPTER) -> bool {
 }
 
 #[no_mangle]
-pub unsafe extern "system" fn OpenAdapter10(open_data: *mut ddi::D3D10DDIARG_OPENADAPTER) -> Hresult {
+pub unsafe extern "system" fn OpenAdapter10(
+    open_data: *mut ddi::D3D10DDIARG_OPENADAPTER,
+) -> Hresult {
     log_error!("OpenAdapter10");
     unsafe { open_adapter_common(open_data, false) }
 }
 
 #[no_mangle]
-pub unsafe extern "system" fn OpenAdapter10_2(open_data: *mut ddi::D3D10DDIARG_OPENADAPTER) -> Hresult {
+pub unsafe extern "system" fn OpenAdapter10_2(
+    open_data: *mut ddi::D3D10DDIARG_OPENADAPTER,
+) -> Hresult {
     log_error!("OpenAdapter10_2");
     unsafe { open_adapter_common(open_data, true) }
 }
@@ -182,7 +186,10 @@ pub unsafe extern "system" fn OpenAdapter12(open_data: *mut c_void) -> Hresult {
     DXGI_ERROR_UNSUPPORTED
 }
 
-unsafe fn open_adapter_common(open_data: *mut ddi::D3D10DDIARG_OPENADAPTER, with_10_2: bool) -> Hresult {
+unsafe fn open_adapter_common(
+    open_data: *mut ddi::D3D10DDIARG_OPENADAPTER,
+    with_10_2: bool,
+) -> Hresult {
     if open_data.is_null() {
         log_error!("open_adapter_common null open_data");
         return E_NOTIMPL;
@@ -202,7 +209,9 @@ unsafe fn open_adapter_common(open_data: *mut ddi::D3D10DDIARG_OPENADAPTER, with
     }
     log_error!(
         "open_adapter_common interface=0x{:08x} version=0x{:08x} with_10_2={}",
-        open.Interface, open.Version, with_10_2
+        open.Interface,
+        open.Version,
+        with_10_2
     );
     log_self_module_path();
     log_knob_inventory();
@@ -474,7 +483,9 @@ unsafe extern "C" fn create_device(
     forward::register_live_device(create.hDrvDevice.pDrvPrivate as usize);
 
     if std::env::var_os("HELIOS_DXGI_NO_REDIRECTION").is_some() {
-        log_error!("  CreateDevice -> DXGI_STATUS_NO_REDIRECTION (env-gated; DXGI desktop fallback)");
+        log_error!(
+            "  CreateDevice -> DXGI_STATUS_NO_REDIRECTION (env-gated; DXGI desktop fallback)"
+        );
         DXGI_STATUS_NO_REDIRECTION
     } else {
         log_error!("  CreateDevice -> S_OK (DXVK device + D3D11 funcs table installed)");
@@ -521,7 +532,8 @@ impl Drop for DeviceUnderConstruction {
             let (variants, layouts) = (*self.dev).owned.release();
             log_error!(
                 "CreateDevice rollback: released IA cache variants={} layouts={}",
-                variants, layouts
+                variants,
+                layouts
             );
             device_funcs::destroy_runtime_objects(&mut *self.dev);
             core::ptr::drop_in_place(self.dev);

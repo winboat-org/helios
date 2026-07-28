@@ -59,7 +59,9 @@ pub(crate) enum VehicleSlot {
     /// `result: Option<(u32, u64)>` half: it could only ever be `None`, since
     /// its only producer was `present_sync_publish` behind a knob that
     /// defaulted off.
-    Minted { device: usize },
+    Minted {
+        device: usize,
+    },
 }
 
 thread_local! {
@@ -93,7 +95,10 @@ pub fn set_present_source(
         EXT_SOURCE_REFUSED.fetch_add(1, Ordering::Relaxed);
         log_error!(
             "set_present_source REFUSED: resid={} {}x{} fmt={}",
-            resid, width, height, dxgi_format
+            resid,
+            width,
+            height,
+            dxgi_format
         );
         return -1;
     }

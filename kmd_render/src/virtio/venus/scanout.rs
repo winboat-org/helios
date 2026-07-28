@@ -177,8 +177,12 @@ impl VenusClient {
             || (memory_type_bits & (1u32 << source_memory_type_index)) == 0
         {
             crate::diag::record_named_bytes(b"CpImpSt", 0xE3);
-            let _ =
-                self.cleanup_imported_source_alias(adapter, source_resource_id, source_image_id, None);
+            let _ = self.cleanup_imported_source_alias(
+                adapter,
+                source_resource_id,
+                source_image_id,
+                None,
+            );
             return Err(VirtioError::DeviceError);
         }
 
