@@ -29,7 +29,6 @@ compile_error!(
 );
 
 use core::ffi::c_void;
-use std::io::Write;
 
 mod bridge;
 mod ddi;
@@ -38,6 +37,16 @@ mod format;
 mod forward;
 mod hr;
 mod knobs;
+
+mod log;
+
+pub(crate) use log::{log_error, log_knob_inventory, log_self_module_path, trace_line};
+// R420's `#![deny(deprecated)]` guard, preserved across the move: `log_line` is
+// `#[deprecated]` so that only `trace_line!` and `log_error!` may reach the
+// unconditional writer. The re-export has to name it once; every CALL site that
+// names `crate::log_line` still trips the deny, which is the whole guarantee.
+#[allow(deprecated)]
+pub(crate) use log::log_line;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -810,59 +819,6 @@ unsafe extern "C" fn get_caps(
     S_OK
 }
 
-/// Resolve the per-process UMD log path, computed once.
-///
-/// The restricted IddCx host process (which opens the IDD swapchain surface)
-/// cannot write `C:\Windows\Temp\helios_umd.log` — that directory's ACL only
-/// grants SYSTEM/Administrators, so the IDD process's log lines vanished. We log
-/// to a per-pid file under `C:\ProgramData\Helios\` instead: standard users may
-/// create files there (inherited ProgramData ACL), and a per-pid name means each
-/// process owns its own file with full control regardless of who created the dir.
-pub(crate) fn umd_log_path() -> &'static std::path::Path {
-    use std::sync::OnceLock;
-    static PATH: OnceLock<std::path::PathBuf> = OnceLock::new();
-    PATH.get_or_init(|| {
-        let dir = std::path::Path::new(r"C:\ProgramData\Helios");
-        // Best effort: ignore AlreadyExists / permission errors.
-        let _ = std::fs::create_dir_all(dir);
-        dir.join(format!("umd-{}.log", std::process::id()))
-    })
-}
-
-/// The unconditional log writer.
-///
-/// DO NOT CALL DIRECTLY — it is `#[deprecated]` purely as an internal marker so
-/// the compiler enforces that. Use one of the two macros, which is the whole
-/// point of R420's static guarantee: the choice between "this is an error, a
-/// one-shot or a refusal" and "this is per-op repeat traffic" has to be made
-/// explicitly at every site, and a new per-op site cannot reach the
-/// unconditional writer by accident.
-///
-/// - [`log_error!`] — errors, one-shots, refusals. Always written.
-/// - [`trace_line!`] — per-op repeat traffic. `UmdTrace`-gated, and it does not
-///   even evaluate its arguments when the knob is off.
-#[deprecated(note = "use log_error! (errors/one-shots/refusals) or trace_line! (per-op traffic)")]
-pub(crate) fn log_line(message: &str) {
-    use std::sync::{Mutex, OnceLock};
-    // One handle per process: the old open/append/close-per-line pattern cost
-    // a full CreateFile round trip on every logged DDI call — measurable on
-    // per-frame paths (PSC WS2). Unbuffered File writes keep crash durability.
-    static FILE: OnceLock<Option<Mutex<std::fs::File>>> = OnceLock::new();
-    let file = FILE.get_or_init(|| {
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(umd_log_path())
-            .ok()
-            .map(Mutex::new)
-    });
-    if let Some(lock) = file {
-        if let Ok(mut f) = lock.lock() {
-            let _ = writeln!(f, "[pid={}] {}", std::process::id(), message);
-        }
-    }
-}
-
 /// Whether per-frame/per-op DDI chatter (`trace_line!`) is enabled:
 /// `HKLM\SOFTWARE\Helios!UmdTrace` (REG_DWORD) != 0. Read once per process.
 /// Errors, one-shots and refusals keep using [`log_line`] unconditionally —
@@ -924,97 +880,4 @@ pub(crate) fn present_gate_us() -> u32 {
 /// are protected by dwm's consumer wait either way; direct flip is not.
 pub(crate) fn vehicle_flip_gate_us() -> u32 {
     knobs::VEHICLE_FLIP_GATE_US.get()
-}
-
-/// Per-frame/per-op trace logging, gated by [`trace_enabled`]. The format
-/// arguments are not evaluated when tracing is off.
-macro_rules! trace_line {
-    ($($arg:tt)*) => {
-        if crate::trace_enabled() {
-            #[allow(deprecated)]
-            crate::log_line(&format!($($arg)*));
-        }
-    };
-}
-pub(crate) use trace_line;
-
-/// Unconditional log line: errors, one-shots and refusals ONLY.
-///
-/// The counterpart to [`trace_line!`]. Per-op repeat traffic must not use this
-/// — that is what put a 21-argument `format!` plus a mutex-guarded unbuffered
-/// write on all seven draw entry points and on the caps-query path (R420).
-macro_rules! log_error {
-    ($($arg:tt)*) => {{
-        #[allow(deprecated)]
-        crate::log_line(&format!($($arg)*));
-    }};
-}
-pub(crate) use log_error;
-
-/// Log which DLL file THIS code is running from, once per process. Multiple
-/// UMD copies exist on disk (DriverStore package, ProgramData versioned
-/// copies) and boot-time resolution has served stale builds before (a stray
-/// pre-typed-signature FileRepository\helios_umd.dll caused cold-boot dwm
-/// devices to run old shader handlers, 2026-07-04) — the per-pid log alone
-/// cannot distinguish which copy handled which device.
-fn log_self_module_path() {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    static LOGGED: AtomicBool = AtomicBool::new(false);
-    if LOGGED.swap(true, Ordering::Relaxed) {
-        return;
-    }
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn GetModuleHandleExW(flags: u32, module_name: *const u16, module: *mut *mut c_void)
-            -> i32;
-        fn GetModuleFileNameW(module: *mut c_void, filename: *mut u16, size: u32) -> u32;
-    }
-    const FROM_ADDRESS: u32 = 0x4; // GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
-    const UNCHANGED_REFCOUNT: u32 = 0x2; // ..._UNCHANGED_REFCOUNT
-    unsafe {
-        let mut hmod: *mut c_void = core::ptr::null_mut();
-        let anchor = log_self_module_path as *const ();
-        if GetModuleHandleExW(
-            FROM_ADDRESS | UNCHANGED_REFCOUNT,
-            anchor as *const u16,
-            &mut hmod,
-        ) != 0
-        {
-            let mut buf = [0u16; 512];
-            let n = GetModuleFileNameW(hmod, buf.as_mut_ptr(), buf.len() as u32) as usize;
-            if n > 0 && n < buf.len() {
-                log_error!(
-                    "UMD module: {}",
-                    String::from_utf16_lossy(&buf[..n])
-                );
-                return;
-            }
-        }
-        log_error!("UMD module: <unresolvable>");
-    }
-}
-
-/// Log every registry knob and its resolved value, once per process.
-///
-/// The reader that makes [`crate::knobs`]'s inventory more than a comment: it
-/// turns "which knobs were in force in this process" from a re-derivation into
-/// a fact in the log, next to the module path that says which DLL produced it.
-/// It is also R1008's own validation instrument — the defaults moved from four
-/// hand-written tail expressions into constructor arguments, and this line is
-/// what proves the resolved values did not move with them.
-///
-/// Resolving forces all four `OnceLock`s here rather than at each knob's first
-/// use. Every one is read once per process either way, and the documented A/B
-/// procedure is "write the value, then start a new process (or
-/// `pnputil /restart-device`)" — which loads the DLL after the write in both
-/// orderings, so the resolved values are the same.
-fn log_knob_inventory() {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    static LOGGED: AtomicBool = AtomicBool::new(false);
-    if LOGGED.swap(true, Ordering::Relaxed) {
-        return;
-    }
-    for (name, value) in knobs::resolved_inventory() {
-        log_error!("UMD knob: {name}={value}");
-    }
 }
