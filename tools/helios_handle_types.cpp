@@ -409,6 +409,34 @@ int main(int argc, char** argv) {
                          -static_cast<int>(kv.second));
     }
 
+    // A NEGATIVE delta is not a leak, but it does need explaining before the
+    // soak's exactly-flat criterion can be called wrong rather than failed —
+    // so name what closed, not just what opened.
+    std::printf("\n--- handles live before and not after (closed during the run) ---\n");
+    {
+        unsigned closed = 0;
+        for (const HandleRecord& b : before) {
+            bool stillLive = false;
+            for (const HandleRecord& a : after) {
+                if (a.value == b.value) {
+                    stillLive = true;
+                    break;
+                }
+            }
+            if (stillLive)
+                continue;
+            if (++closed > 40) {
+                std::printf("  ... (further entries suppressed)\n");
+                break;
+            }
+            std::wprintf(L"  h=0x%04llX  %-16s access=0x%08lX obj=%p\n",
+                         static_cast<unsigned long long>(b.value),
+                         type_name(b.typeIndex, reinterpret_cast<HANDLE>(b.value)),
+                         static_cast<unsigned long>(b.grantedAccess), b.object);
+        }
+        std::printf("  (%u closed)\n", closed);
+    }
+
     // Handle values are reused, so "new" means a value not live before. The
     // object address distinguishes N leaked objects from N refs to one.
     std::printf("\n--- handles live after and not before ---\n");

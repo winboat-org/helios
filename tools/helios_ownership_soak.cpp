@@ -13,8 +13,10 @@
 // the existing probe set exercises them at volume, so this exists.
 //
 // What it measures, in THIS process:
-//   * GetProcessHandleCount   — kernel handles. Must be exactly flat: a leaked
-//                               D3D device or allocation shows up here.
+//   * GetProcessHandleCount   — kernel handles. Must not GROW: a leaked D3D
+//                               device or allocation shows up here. (Not
+//                               "exactly flat" — see the verdict block for the
+//                               ALPC Port evidence that killed that premise.)
 //   * EnumProcessModules      — loaded module count. Must be exactly flat: a
 //                               device teardown that fails to unload the UMD,
 //                               or one that reloads it per cycle, shows here.
@@ -194,6 +196,14 @@ int main(int argc, char** argv) {
     // cycles with a ZERO handle delta, so committed pages are partly a D3D11
     // runtime/allocator property rather than a driver signal. A tolerance
     // tighter than the control's own noise reports the runtime as a leak.
+    //
+    // ⚠ That calibration is per-1000-resource-cycles and the DEFAULT is
+    // 10000, so the control BLOWS this tolerance at its own default scale:
+    // measured 2026-07-28, `-Warp 1000 10000` grows +80,484 KiB (linear in
+    // the ~8 MiB figure) and prints OWNERSHIP SOAK FAIL on the working set
+    // alone. Read the control on its HANDLE number, which is the thing it
+    // exists to isolate: it was +0 over 1000 device cycles in the same run,
+    // against Helios's own +3,584 KiB and -0.00 handles/device.
     unsigned wsToleranceKiB = 16384;
     const wchar_t* adapterMatch = L"Helios";
     if (argc > 1) deviceCycles = strtoul(argv[1], nullptr, 10);
@@ -316,6 +326,10 @@ int main(int argc, char** argv) {
     // The per-device-cycle figure is the one that compares across runs and
     // across adapters. Measured 2026-07-27 on the T4b release UMD
     // (DriverStore, 5,917,696 B): Helios 6.00, WARP 0.00 over 300 cycles.
+    // Measured 2026-07-28 after the DLL-unload fixes (umd log handle +
+    // ICD module pin): Helios -0.00 over 1000 cycles, and 1000 devices no
+    // longer fail-fasts — the scale this harness has always defaulted to, and
+    // never once reached, now completes.
     const long deviceHandleDelta =
         static_cast<long>(afterDevices.handles) - static_cast<long>(base.handles);
     const double perDeviceCycle =
@@ -334,11 +348,38 @@ int main(int argc, char** argv) {
     }
 
     bool flat = true;
-    // Handles and modules are demanded EXACTLY flat: both are the signals a
-    // leaked device or a per-cycle module load would move, and neither has a
-    // legitimate reason to drift across a create/destroy pair.
-    if (handleDelta != 0) {
-        std::printf("NOT FLAT: handle count moved by %+ld\n", handleDelta);
+    // GROWTH fails; a fall is reported and passes.
+    //
+    // This used to demand handles EXACTLY equal, on the premise that "neither
+    // has a legitimate reason to drift across a create/destroy pair". That
+    // premise is FALSE and the evidence names it: with the per-device leak
+    // fixed, this harness settled at exactly -2 — the SAME -2 at 300 cycles
+    // and at 1000, i.e. an offset and not a rate — and
+    // tools/helios_handle_types.cpp identified the two as **ALPC Port**
+    // handles, which the Windows RPC runtime closes on its own idle schedule
+    // inside the measurement window. Nothing in this process opened or closed
+    // them. Failing on that reports the RPC runtime's housekeeping as a
+    // Helios defect.
+    //
+    // A leak is handles going UP, so that is what fails. The residual
+    // weakness is stated rather than hidden: a run where RPC happens to close
+    // N ports while we leak N handles nets zero and passes. The exact-equality
+    // form had the same blind spot in the other direction — it would have
+    // called a +2 leak offset by -2 closures a pass — and additionally could
+    // not pass at all on a healthy build.
+    if (handleDelta > 0) {
+        std::printf("NOT FLAT: handle count GREW by %+ld\n", handleDelta);
+        flat = false;
+    } else if (handleDelta < 0) {
+        std::printf("note: handle count fell by %ld (not a leak; see the ALPC "
+                    "Port note in the source)\n",
+                    -handleDelta);
+    }
+    // The device phase is the headline and is judged separately, so a leak
+    // there cannot be masked by the resource phase closing something.
+    if (deviceHandleDelta > 0) {
+        std::printf("NOT FLAT: device phase GREW by %+ld handles (%.2f per device)\n",
+                    deviceHandleDelta, perDeviceCycle);
         flat = false;
     }
     if (moduleDelta != 0) {
