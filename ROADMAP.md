@@ -218,6 +218,123 @@ Remaining: cold-boot + multi-hour soak, and the forced-loss test for the loss pa
 
 Open defects, roughly ordered:
 
+0w. **CLOSED 2026-07-28 — the Start menu never opened: our own QFOT re-acquire
+    claimed `DxvkAccess::Write` on a still-open command list, making
+    `SyncSharedTexture`'s wait unsatisfiable.** Owner report: "clicking the
+    Windows button or the search bar does not open them — it's literally not
+    there, I can't interact with it either", plus "if I keep clicking the
+    search bar, it sometimes appears".
+
+    **Symptom, measured.** `tools/start_menu_repro.ps1` and
+    `tools/start_invoke_probe.ps1` (session-1 tasks) press the hotkey / click
+    the real Start button and report each participant's CPU delta, window tree,
+    UMD-log growth and screen pixels:
+    - `StartMenuExperienceHost` burned **0.000 s of CPU** across 6/6 Win-key
+      presses AND a real Start-button click, owned **zero** top-level windows,
+      and its UMD log grew **+0 bytes**. It never woke.
+    - Controls passed: Win+R opened a Run dialog from the same probe (so the
+      synthetic input was real) and `SearchHost` painted its flyout in ~150 ms.
+      The desktop, dwm, composition and the taskbar were all healthy.
+    - Its UMD log ended mid-call — **8 `calling DXVK CreateTexture2D` vs 7
+      `returned`** — on a 704x576 `fmt=65` (A8_UNORM) `misc=0x802`
+      (SHARED|SHARED_NTHANDLE) texture, i.e. a XAML glyph atlas.
+
+    **Root cause.** `DxvkContext::acquireSharedImagesFromExternal` — the
+    Helios-only queue-family-ownership-transfer re-acquire, which upstream DXVK
+    does not have at all (0 occurrences upstream vs 9 in the fork) — ran at the
+    START of every command list and did
+    `m_cmd->track(image, DxvkAccess::Write)` for every shared image the
+    previous list touched. `track(obj, access)` records access "for the purpose
+    of CPU access synchronisation" (`dxvk_cmdlist.h`), which is exactly what
+    `DxvkDevice::waitForResource` tests. So a brand-new command list — still
+    OPEN, never submitted — held a write reference on the texture, and
+    `D3D11Initializer::SyncSharedTexture`'s `waitForResource(image, Write)`
+    could only be released by that list being submitted, by the very thread now
+    blocked in the wait. On an idle XAML startup that is a permanent deadlock:
+    the UI thread parked forever and the Start menu's CoreWindow was never
+    created. A queue-ownership transfer does not write image contents, so the
+    Write claim was simply wrong.
+
+    Chain, symbolised from a live minidump (`take-minidump.ps1` + `cdb` with
+    the release PDB):
+
+    ```
+    Windows_UI_Xaml → dcomp → d3d11
+      → helios_umd::forward::resource::create_resource
+        → dxvk::D3D11Device::CreateTexture2D → CreateTexture2DBase
+          → dxvk::D3D11Initializer::SyncSharedTexture
+            → dxvk::DxvkDevice::waitForResource
+              → DxvkSubmissionQueue::synchronizeUntil → SleepConditionVariableSRW
+    ```
+
+    **A TIMEOUT WOULD HAVE BEEN THE WRONG FIX (owner directive), and the dump
+    proved it**: all three DXVK workers were parked on their own idle condition
+    variables — `dxvk-submit` in `submitCmdLists`, `dxvk-queue` in
+    `finishCmdLists`, `dxvk-cs` in `threadFunc` — so every queue was drained
+    while `isInUse(Write)` was still true. Nothing was in flight to wait for;
+    the reference was leaked. The wedged instruction
+    `mov rax,qword ptr [r14+10h]` gave `m_useCount = 0x0000010000000002`, which
+    with `getIncrement = 1 << (access*20)` and `Write = 2` decodes as
+    **Write 1, Read 0, refcount 2** — exactly one unreleased `acquire(Write)`.
+    Both documented deliberate-leak paths were excluded: `m_lastError` is
+    sticky and never reset, and the wait did not take its `DEVICE_LOST`
+    bail-out, so no device loss occurred.
+
+    **Fix (ordering/accounting, not a bound):** both QFOT sites now take a
+    lifetime-only reference, `m_cmd->track(image)`. `DxvkObjectRef` holds a
+    strong `Rc` released when the list retires, so the barrier still keeps the
+    image alive; genuine content accesses recorded into the list continue to
+    track Read/Write normally, so `waitForResource` keeps its real meaning. The
+    release side was changed to match — it is not a deadlock source on its own
+    (its list is submitted immediately) but an asymmetric pair invites the bug
+    back.
+
+    **Verified by A/B under a forced race.** The bug is ~1-in-6 at XAML startup
+    and did **not** reproduce in 35 scripted attempts (25 quiet restarts + 10
+    `restart-device` churn cycles), because `ExecuteFlush` only *injects* the
+    flush chunk and the caller usually beats the CS thread to the wait. Adding
+    a temporary 150 ms sleep between the flush and the wait made the caller
+    lose that race deterministically:
+    - **before:** wedged on iteration 0; instrumented log read
+      `QFOT-ACQ res=X inUseWrite=1` → `WFR-ENTRY res=X inUse=1` →
+      `UNSATISFIABLE waitForResource … submission queue fully drained`.
+    - **after:** 8/8 creates returned, `wedged=0`, every `WFR-ENTRY` read
+      `inUse=0`, zero unsatisfiable waits.
+    Shipping build re-verified end to end: desktop composites and the Start
+    menu renders in full (`Z:\tmp\start_menu_open.png`), plus a
+    `restart-device` churn soak.
+
+    **Kept as permanent instrumentation:** a loud check in `waitForResource` —
+    if a resource is still in use while `DxvkSubmissionQueue::isDrainedLocked()`
+    reports both stages empty, the wait can never return, so it logs the
+    resource, its access bits and trackId once and counts the occurrence.
+    Expected 0. It deliberately does not change behaviour; bounding the wait
+    would return with the reference still leaked. All investigation-only
+    logging (`QFOT-ACQ`, `WFR-ENTRY`) and the sleep knob were removed. To
+    re-provoke the race for a regression test, re-add a sleep between
+    `ExecuteFlush()` and `waitForResource` in `SyncSharedTexture` (noted in the
+    comment there) and run
+    `tools/d3d11_shared_wedge_repro.cpp --clear --watchdog-ms 25000`.
+
+    ⚠ **Deploy trap that cost two build cycles and invalidated two runs:** the
+    default ProgramData UMD hotplug does **not** reach new processes. dxgkrnl
+    caches the UMD path at **device** start, so freshly launched processes kept
+    loading the previously deployed DLL; two builds' worth of instrumentation
+    appeared absent because the old image was still being loaded. Confirm with
+    `(Get-Process -Id N).Modules` and deploy with `-KillUmdUsers
+    -RestartDevice -NoProbe` whenever the new code must actually run.
+
+    ⚠ **Probe trap:** neither `EnumWindows` nor a `GetWindow(GW_HWNDNEXT)`
+    Z-order walk enumerates the Start/Search flyout CoreWindows — nor even
+    `Shell_TrayWnd`, which `FindWindowW` finds instantly. "0 top-level windows"
+    is NOT proof a flyout is absent; the host process's CPU delta and the
+    screen pixels are the discriminators.
+
+    Tooling added: `tools/d3d11_shared_wedge_repro.cpp` (forced-race repro with
+    watchdog), `tools/start_menu_repro.ps1`, `tools/start_invoke_probe.ps1`,
+    `tools/start_menu_churn_hunt.ps1`, `tools/start_menu_poke.ps1`,
+    `tools/start_menu_shot.ps1` (schtasks `helios_startrepro`,
+    `helios_startinvoke`, `helios_pokestart`, `helios_startshot`).
 0y. **CLOSED 2026-07-28 — the 6-handles-per-device leak, and the ~350-device
     fail-fast with it. ONE root cause for both.** Reported by the ownership
     soak since T5, constant at 5.99/device across T5/T6/T7/T8.
