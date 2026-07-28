@@ -28,6 +28,7 @@
 #include <mutex>
 #include <optional>
 #include <thread>
+#include <type_traits>
 #include <d3d11.h>
 #include <dxgi.h>
 #include <fstream>
@@ -688,8 +689,19 @@ namespace {
   // std::bad_alloc handler can throw again. Fixed char[] + snprintf only —
   // which is also why DxvkError::message() (returns std::string) is not called
   // here.
+  //
+  // `R` is deduced from `on_error` ALONE — the body's return type is not a
+  // deduction context — so the sentinel silently decides the type every
+  // SUCCESS value is converted to on the way out. A bare `0` against a
+  // `std::size_t` body deduced `R = int` and truncated every returned pointer
+  // to 32 bits: that shipped in T7 and access-violated dwm and LogonUI at the
+  // first `VSSetShader`. The static_assert makes the mismatch a compile error
+  // instead of a pointer that looks plausible in a log line.
   template <typename R, typename Fn>
   R bridge_guard(const char* what, R on_error, Fn&& fn) noexcept {
+    static_assert(std::is_same_v<R, decltype(fn())>,
+                  "bridge_guard's error value must have the guarded body's exact "
+                  "return type; otherwise the success path is converted too");
     try {
       return fn();
     } catch (const dxvk::DxvkError&) {
@@ -1436,7 +1448,7 @@ std::size_t HeliosDxvkDevice::open_ddi_texture2d(
   if (!impl || !impl->d3d11 || !global || !renderer_resource_id || !width || !height)
     return 0;
 
-  return bridge_guard("open_ddi_texture2d", 0, [&]() -> std::size_t {
+  return bridge_guard("open_ddi_texture2d", std::size_t(0), [&]() -> std::size_t {
       {
         static std::atomic<std::uint32_t> s_openBeginLogs{0};
         if (bridge_log_budget(s_openBeginLogs, 64, 512)) {
@@ -1545,7 +1557,7 @@ std::size_t HeliosDxvkDevice::create_ddi_scanout_texture2d(
     return 0;
   }
 
-  return bridge_guard("create_ddi_scanout_texture2d", 0, [&]() -> std::size_t {
+  return bridge_guard("create_ddi_scanout_texture2d", std::size_t(0), [&]() -> std::size_t {
       {
         static std::atomic<std::uint32_t> s_scanBeginLogs{0};
         if (bridge_log_budget(s_scanBeginLogs, 64, 512)) {
@@ -1676,7 +1688,7 @@ std::size_t HeliosDxvkDevice::create_shader_sig(
   }
   const std::uint32_t* in_entries = sig_words + 2;
   const std::uint32_t* out_entries = in_entries + std::size_t(n_in) * kSigEntryWords;
-  return bridge_guard("create_shader_sig", 0, [&]() -> std::size_t {
+  return bridge_guard("create_shader_sig", std::size_t(0), [&]() -> std::size_t {
       auto bytecode = prepare_shader_bytecode_with_sigs(
           code, len, in_entries, n_in, out_entries, n_out);
       if (!bytecode)
@@ -1734,7 +1746,7 @@ std::size_t HeliosDxvkDevice::create_tess_shader_sig(
   const std::uint32_t* in_entries = sig_words + 3;
   const std::uint32_t* out_entries = in_entries + std::size_t(n_in) * kSigEntryWords;
   const std::uint32_t* patch_entries = out_entries + std::size_t(n_out) * kSigEntryWords;
-  return bridge_guard("create_tess_shader_sig", 0, [&]() -> std::size_t {
+  return bridge_guard("create_tess_shader_sig", std::size_t(0), [&]() -> std::size_t {
       auto bytecode = prepare_shader_bytecode_with_tess_sigs(
           code, len, in_entries, n_in, out_entries, n_out, patch_entries, n_patch);
       if (!bytecode)
