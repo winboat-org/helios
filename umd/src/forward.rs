@@ -9,29 +9,40 @@
 //! now (TODO: report via the device error callback) — a failed create leaves a
 //! null handle.
 
+// T8/R1107 commit 0: the child modules below need this file's import surface,
+// and a `use` statement is not an item -- `use super::*;` in a child cannot see
+// one. Re-exporting them is what lets every child declare exactly
+// `use super::*;` instead of carrying its own copy of a 50-line import block
+// that would then drift.
 mod alloc;
 mod handles;
-use alloc::{ScanoutGeometry, VenusBacking};
-use crate::bridge::{DstRes, SrcRes};
-use handles::{boxed_slot, Boxed, Com, ComHandle, DdiHandle, Slot};
+pub(super) use alloc::{ScanoutGeometry, VenusBacking};
+pub(super) use crate::bridge::{DstRes, SrcRes};
+pub(super) use handles::{Boxed, Com, ComHandle, DdiHandle, Slot};
+// NOT re-exported: `boxed_slot` is `pub(super)` in `handles` and its
+// `BoxedHandle` bound names types (`ResourceState`, `RtvState`, `LayoutData`)
+// that are private to this subtree, so a `pub(super)` re-export would leak
+// them (E0446). The child modules that need it say
+// `use super::handles::boxed_slot;` -- one line, and the bound stays sealed.
+use handles::boxed_slot;
 
-use core::ffi::c_void;
-use core::mem::ManuallyDrop;
-use std::sync::atomic::{AtomicUsize, Ordering};
+pub(super) use core::ffi::c_void;
+pub(super) use core::mem::ManuallyDrop;
+pub(super) use std::sync::atomic::{AtomicUsize, Ordering};
 
-use windows::core::{IUnknown, Interface, PCSTR};
-use windows::Win32::Foundation::{BOOL, RECT};
-use windows::Win32::Graphics::Direct3D::{
+pub(super) use windows::core::{IUnknown, Interface, PCSTR};
+pub(super) use windows::Win32::Foundation::{BOOL, RECT};
+pub(super) use windows::Win32::Graphics::Direct3D::{
     D3D11_SRV_DIMENSION_BUFFER, D3D11_SRV_DIMENSION_BUFFEREX, D3D11_SRV_DIMENSION_TEXTURE1D,
     D3D11_SRV_DIMENSION_TEXTURE1DARRAY, D3D11_SRV_DIMENSION_TEXTURE2D,
     D3D11_SRV_DIMENSION_TEXTURE2DARRAY, D3D11_SRV_DIMENSION_TEXTURE2DMS,
     D3D11_SRV_DIMENSION_TEXTURE2DMSARRAY, D3D11_SRV_DIMENSION_TEXTURE3D,
     D3D11_SRV_DIMENSION_TEXTURECUBE, D3D11_SRV_DIMENSION_TEXTURECUBEARRAY,
 };
-use windows::Win32::Graphics::Direct3D11::*;
-use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_SAMPLE_DESC};
+pub(super) use windows::Win32::Graphics::Direct3D11::*;
+pub(super) use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_SAMPLE_DESC};
 
-use helios_protocol::{
+pub(super) use helios_protocol::{
     HeliosPresentPrivateData, HeliosPresentRefreshCmd, HeliosPresentRenderCmd, HeliosWddmAllocMeta,
     HeliosWddmAllocPrivate, HeliosWddmOpenIdentity, HELIOS_PRESENT_PRIVATE_FLAG_DIRECT_SCANOUT,
     HELIOS_PRESENT_PRIVATE_MAGIC, HELIOS_PRESENT_PRIVATE_VERSION, HELIOS_PRESENT_REFRESH_MAGIC,
@@ -42,13 +53,13 @@ use helios_protocol::{
     VIRTIO_GPU_BLOB_FLAG_USE_SHAREABLE, VIRTIO_GPU_BLOB_MEM_HOST3D, VIRTIO_GPU_MAP_CACHE_CACHED,
 };
 
-use crate::ddi;
-use crate::device_funcs::HeliosDevice;
-use crate::log_error;
-use crate::present_gate_us;
-use crate::trace_line;
+pub(super) use crate::ddi;
+pub(super) use crate::device_funcs::HeliosDevice;
+pub(super) use crate::log_error;
+pub(super) use crate::present_gate_us;
+pub(super) use crate::trace_line;
 
-type Hdevice = ddi::D3D10DDI_HDEVICE;
+pub(super) type Hdevice = ddi::D3D10DDI_HDEVICE;
 
 /// One rate-limited log site's occurrence counter.
 ///
@@ -66,12 +77,12 @@ type Hdevice = ddi::D3D10DDI_HDEVICE;
 /// `< 2048` and a `% 1024` shape). Giving each site its own counter would change
 /// the cadence of every one of them, which is precisely what must not happen.
 /// So the counter is shared exactly as today and the budget is a call argument.
-struct LogThrottle {
+pub(super) struct LogThrottle {
     count: AtomicUsize,
 }
 
 impl LogThrottle {
-    const fn new() -> Self {
+    pub(super) const fn new() -> Self {
         Self {
             count: AtomicUsize::new(0),
         }
@@ -80,24 +91,24 @@ impl LogThrottle {
     /// Bump and return the occurrence ordinal with no rate decision, for sites
     /// whose gate carries an extra escape clause (`|| alloc != 0`) or a shape
     /// of its own.
-    fn next(&self) -> usize {
+    pub(super) fn next(&self) -> usize {
         self.count.fetch_add(1, Ordering::Relaxed)
     }
 
     /// Read the ordinal WITHOUT bumping it — one site logs a "pre" line under
     /// the same budget as the "post" line that follows it.
-    fn peek(&self) -> usize {
+    pub(super) fn peek(&self) -> usize {
         self.count.load(Ordering::Relaxed)
     }
 
     /// The first `first` occurrences.
-    fn first_n(&self, first: usize) -> Option<usize> {
+    pub(super) fn first_n(&self, first: usize) -> Option<usize> {
         let n = self.next();
         (n < first).then_some(n)
     }
 
     /// The first `first`, then every `every`-th counting from zero.
-    fn first_n_then_every(&self, first: usize, every: usize) -> Option<usize> {
+    pub(super) fn first_n_then_every(&self, first: usize, every: usize) -> Option<usize> {
         let n = self.next();
         (n < first || n % every == 0).then_some(n)
     }
@@ -105,41 +116,41 @@ impl LogThrottle {
     /// The first `first`, then every `every`-th counting from one. Distinct
     /// from [`Self::first_n_then_every`]: it fires at n = every-1, 2*every-1,
     /// not at n = 0, every, 2*every.
-    fn first_n_then_every_from_one(&self, first: usize, every: usize) -> Option<usize> {
+    pub(super) fn first_n_then_every_from_one(&self, first: usize, every: usize) -> Option<usize> {
         let n = self.next();
         (n < first || (n + 1) % every == 0).then_some(n)
     }
 }
 
-static RESOURCE_LOG_COUNT: LogThrottle = LogThrottle::new();
-static CREATE_RESOURCE_IDENTITY_LOG_COUNT: LogThrottle = LogThrottle::new();
-static VIEW_LOG_COUNT: LogThrottle = LogThrottle::new();
-static WDDM_ALLOC_LOG_COUNT: LogThrottle = LogThrottle::new();
-static D3D11_1_LOG_COUNT: LogThrottle = LogThrottle::new();
-static COPY_LOG_COUNT: LogThrottle = LogThrottle::new();
-static COPY_REGION_LOG_COUNT: LogThrottle = LogThrottle::new();
-static MAP_LOG_COUNT: LogThrottle = LogThrottle::new();
-static SHADER_BIND_LOG_COUNT: LogThrottle = LogThrottle::new();
-static SHADER_SET_LOG_COUNT: LogThrottle = LogThrottle::new();
-static SRV_CREATE_LOG_COUNT: LogThrottle = LogThrottle::new();
-static SRV_BIND_LOG_COUNT: LogThrottle = LogThrottle::new();
-static DRAW_LOG_COUNT: LogThrottle = LogThrottle::new();
-static OM_LOG_COUNT: LogThrottle = LogThrottle::new();
-static UPDATE_LOG_COUNT: LogThrottle = LogThrottle::new();
+pub(super) static RESOURCE_LOG_COUNT: LogThrottle = LogThrottle::new();
+pub(super) static CREATE_RESOURCE_IDENTITY_LOG_COUNT: LogThrottle = LogThrottle::new();
+pub(super) static VIEW_LOG_COUNT: LogThrottle = LogThrottle::new();
+pub(super) static WDDM_ALLOC_LOG_COUNT: LogThrottle = LogThrottle::new();
+pub(super) static D3D11_1_LOG_COUNT: LogThrottle = LogThrottle::new();
+pub(super) static COPY_LOG_COUNT: LogThrottle = LogThrottle::new();
+pub(super) static COPY_REGION_LOG_COUNT: LogThrottle = LogThrottle::new();
+pub(super) static MAP_LOG_COUNT: LogThrottle = LogThrottle::new();
+pub(super) static SHADER_BIND_LOG_COUNT: LogThrottle = LogThrottle::new();
+pub(super) static SHADER_SET_LOG_COUNT: LogThrottle = LogThrottle::new();
+pub(super) static SRV_CREATE_LOG_COUNT: LogThrottle = LogThrottle::new();
+pub(super) static SRV_BIND_LOG_COUNT: LogThrottle = LogThrottle::new();
+pub(super) static DRAW_LOG_COUNT: LogThrottle = LogThrottle::new();
+pub(super) static OM_LOG_COUNT: LogThrottle = LogThrottle::new();
+pub(super) static UPDATE_LOG_COUNT: LogThrottle = LogThrottle::new();
 /// UpdateSubresource lines the rate cap dropped. Without this the cap would
 /// turn "no lines" into "nothing happened".
-static UPDATE_SUPPRESSED: AtomicUsize = AtomicUsize::new(0);
-static DISPATCH_LOG_COUNT: LogThrottle = LogThrottle::new();
-static HANDLE_MISS_LOG_COUNT: LogThrottle = LogThrottle::new();
-static UAV_BIND_LOG_COUNT: LogThrottle = LogThrottle::new();
-static CLEAR_RTV_LOG_COUNT: LogThrottle = LogThrottle::new();
-static VIEWPORT_LOG_COUNT: LogThrottle = LogThrottle::new();
-static SCISSOR_LOG_COUNT: LogThrottle = LogThrottle::new();
-static RASTER_LOG_COUNT: LogThrottle = LogThrottle::new();
-static IA_BIND_LOG_COUNT: LogThrottle = LogThrottle::new();
-static PRESENT_READBACK_LOG_COUNT: LogThrottle = LogThrottle::new();
-static PRESENT_FORCE_OPAQUE_LOG_COUNT: LogThrottle = LogThrottle::new();
-static PRESENT_CB_LOG_COUNT: LogThrottle = LogThrottle::new();
+pub(super) static UPDATE_SUPPRESSED: AtomicUsize = AtomicUsize::new(0);
+pub(super) static DISPATCH_LOG_COUNT: LogThrottle = LogThrottle::new();
+pub(super) static HANDLE_MISS_LOG_COUNT: LogThrottle = LogThrottle::new();
+pub(super) static UAV_BIND_LOG_COUNT: LogThrottle = LogThrottle::new();
+pub(super) static CLEAR_RTV_LOG_COUNT: LogThrottle = LogThrottle::new();
+pub(super) static VIEWPORT_LOG_COUNT: LogThrottle = LogThrottle::new();
+pub(super) static SCISSOR_LOG_COUNT: LogThrottle = LogThrottle::new();
+pub(super) static RASTER_LOG_COUNT: LogThrottle = LogThrottle::new();
+pub(super) static IA_BIND_LOG_COUNT: LogThrottle = LogThrottle::new();
+pub(super) static PRESENT_READBACK_LOG_COUNT: LogThrottle = LogThrottle::new();
+pub(super) static PRESENT_FORCE_OPAQUE_LOG_COUNT: LogThrottle = LogThrottle::new();
+pub(super) static PRESENT_CB_LOG_COUNT: LogThrottle = LogThrottle::new();
 
 struct ResourceState {
     com_raw: usize,
