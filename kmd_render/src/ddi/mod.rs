@@ -9,6 +9,7 @@ pub(crate) use crate::irql::PASSIVE_LEVEL_IRQL;
 
 mod add_device;
 mod bar_segment;
+mod base;
 mod blob_map;
 mod build_paging_buffer;
 pub(crate) mod cpu_host_aperture;
@@ -65,12 +66,14 @@ pub use scheduler::{
     dxgkddi_set_stable_power_state, dxgkddi_set_virtual_machine_data,
     dxgkddi_submit_command_to_hw_queue, dxgkddi_switch_to_hw_context_list,
 };
+pub use base::{
+    dxgkddi_control_etw_logging, dxgkddi_notify_acpi_event, dxgkddi_query_interface,
+    dxgkddi_reset_device, dxgkddi_unload,
+};
 pub use start_device::{
-    dxgkddi_control_etw_logging, dxgkddi_dispatch_io_request, dxgkddi_get_child_container_id,
-    dxgkddi_notify_acpi_event, dxgkddi_query_child_relations, dxgkddi_query_child_status,
-    dxgkddi_query_device_descriptor, dxgkddi_query_interface, dxgkddi_remove_device,
-    dxgkddi_reset_device, dxgkddi_set_power_state, dxgkddi_start_device, dxgkddi_stop_device,
-    dxgkddi_unload, vsync_dpc_routine,
+    dxgkddi_dispatch_io_request, dxgkddi_get_child_container_id, dxgkddi_query_child_relations,
+    dxgkddi_query_child_status, dxgkddi_query_device_descriptor, dxgkddi_remove_device,
+    dxgkddi_set_power_state, dxgkddi_start_device, dxgkddi_stop_device, vsync_dpc_routine,
 };
 pub use submit_command::{
     diag_dump_engine_atomics, dxgkddi_collect_dbg_info, dxgkddi_patch, dxgkddi_preempt_command,
