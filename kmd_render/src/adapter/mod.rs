@@ -147,7 +147,7 @@ pub(crate) struct AdapterKnobs {
     /// hypothesis.
     pub bar_seg_base_mb: u32,
     /// `BarSegMode` (default 10). Parsed into
-    /// `crate::ddi::start_device::BarSegTopology`; kept raw here so the coerced
+    /// `crate::ddi::bar_segment::BarSegTopology`; kept raw here so the coerced
     /// value can be reported.
     pub bar_seg_mode: u32,
 }

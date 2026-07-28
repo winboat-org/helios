@@ -57,7 +57,7 @@ pub struct BarSegment {
 }
 
 /// The existence of a [`BarSegment`] IS the topology: `Some` is
-/// [`crate::ddi::start_device::BarSegTopology::ApertureAndBar`], `None` is
+/// [`crate::ddi::bar_segment::BarSegTopology::ApertureAndBar`], `None` is
 /// `Disabled`. The old `topo: u32` field carried a `BarSegMode` value that a
 /// second file then re-matched positionally against the literals 10 and 11;
 /// with the rejected shapes deleted there is nothing left for it to say.

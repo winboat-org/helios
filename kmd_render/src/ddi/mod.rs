@@ -8,6 +8,7 @@
 pub(crate) use crate::irql::PASSIVE_LEVEL_IRQL;
 
 mod add_device;
+mod bar_segment;
 mod blob_map;
 mod build_paging_buffer;
 pub(crate) mod cpu_host_aperture;
