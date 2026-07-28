@@ -97,10 +97,8 @@ virtio-gpu scanout; IddCx/Looking Glass is no longer the active display path.*
      `dxgi_present` call sites that touch the cell.
    - **R1015** — whether the production surface ever takes the
      QUERYSEGMENT3/legacy paths. Needs a `DiagLevel=1` boot.
-   - The pre-existing **6-handles-per-device teardown leak** (7d(b)), constant
-     at 5.99/device from T5 through T8 and isolated to our UMD by a WARP
-     control. The resource path is flat over 10 000 cycles; only device
-     create/destroy leaks.
+   - ~~The pre-existing **6-handles-per-device teardown leak** (7d(b))~~ —
+     **CLOSED 2026-07-28**, root-caused and fixed. See the WS1 entry below.
    - **WS1 defect 0z** — `pnputil /restart-device` access-violates dwm,
      Explorer, SearchHost and ApplicationFrameHost inside
      `vulkan_virtio-*.dll`. Pre-existing, reproduced on every restart.
@@ -219,6 +217,68 @@ drain (fixed, WS2); (2) the latch no longer fires on idle desktops; (3)+(4) fixe
 Remaining: cold-boot + multi-hour soak, and the forced-loss test for the loss path (defect 2).
 
 Open defects, roughly ordered:
+
+0y. **CLOSED 2026-07-28 — the 6-handles-per-device leak, and the ~350-device
+    fail-fast with it. ONE root cause for both.** Reported by the ownership
+    soak since T5, constant at 5.99/device across T5/T6/T7/T8.
+
+    **Root cause: `helios_umd.dll` and the venus ICD are loaded and UNLOADED
+    once per D3D11 device, and nothing releases a module's process- or
+    thread-lifetime state on unload.** A Rust `static`/`OnceLock` is never
+    dropped, the loader closes no handles a module opened, and tss destructors
+    run at THREAD exit — so on a thread that outlives the module they never
+    run at all. Measured, not inferred: `GetModuleHandleW("helios_umd.dll")`
+    reads NO / yes / NO across one `D3D11CreateDevice` + `Release`, and the
+    UMD's once-per-DLL-instance `UMD module:` line appears once per device.
+
+    The six, each named by type, module and creating stack (the module
+    attribution is a `LoadLibrary`-pin bisect; the stacks are
+    `tools/helios_handle_origins.cpp` + `addr2line` on the mingw DWARF):
+
+    | # | type | site |
+    |---|------|------|
+    | 1 | `File` | `helios_umd` `log.rs`, the `OnceLock` log handle (`umd-<pid>.log`, access 0x00120194) |
+    | 2 | `Event` | ICD `vn_renderer_helios.c:1584` `helios_fence_event_get`, the per-thread tss fence event |
+    | 3,4 | `Event`+`Thread` | winpthreads registering the caller's NATIVE thread (event + duplicated thread handle) |
+    | 5,6 | `Semaphore` ×2 | libgcc `emutls.c:104` `emutls_init` → `__gthread_mutex_lock` |
+
+    Fixes: the UMD closes its log handle in `DllMain(DLL_PROCESS_DETACH)`
+    (`FreeLibrary` case only, `try_lock` so it cannot deadlock under the loader
+    lock, refusals counted in `LOG_CLOSE_CONTENDED`); the ICD **pins its own
+    module** (`GetModuleHandleExW(..._PIN)`, refusals counted in
+    `helios_module_pin_failures`), because four of its five handles are inside
+    the statically linked mingw runtime and unreachable from any detach hook we
+    could write, and the fifth belongs to threads the module does not own.
+
+    **Measured, 1000 devices / 10 000 resources:** 6.00 → 5.00 (UMD fix alone)
+    → **-0.00 handles/device**; working set +3,584 KiB where 300 devices alone
+    used to cost +39,048 KiB; modules +0, dwm +0, failures 0/0;
+    `OWNERSHIP SOAK PASS`, exit 0. **The WARP control still reads +0.00**, so
+    the fix is in the driver and not in the measurement. ★ **The soak also
+    completes at 1000 devices for the first time** — 7d(b) recorded that scale
+    as unreachable on any build (deterministic `0xC0000409` fail-fast in
+    `ucrtbase` between cycle 301 and 400), so the DLL churn was that too.
+
+    Residue, all recorded rather than hidden:
+    - The soak now fails on handle **growth**, not on any drift. With the leak
+      gone it settled at a fixed −2 (identical at 300 and 1000 cycles), and the
+      two are **ALPC Port** handles the Windows RPC runtime closes on its own
+      idle schedule inside the window — its old exactly-equal criterion called
+      that a Helios defect.
+    - The soak's working-set tolerance (16 MiB) is calibrated per **1000**
+      resource cycles but the default is 10 000, so the WARP control fails its
+      own default scale on working set (+80,484 KiB, linear in the documented
+      ~8 MiB). Read the control on its HANDLE number.
+    - ⚠ **New hazard from the pin:** a process that survives an ICD redeploy
+      now keeps the OLD ICD image loaded alongside the new one. The codebase
+      already anticipates two live ICD images (see the
+      `helios_venus_query_scanout` comment on decoding a DXVK `VkInstance`),
+      but a deploy still wants a `restart-device` or a dwm restart, not just a
+      manifest swap.
+    - The deeper fix is upstream of both: a DXVK that shares one `VkInstance`
+      across D3D11 devices would end the load/unload churn at its source and
+      stop paying loader enumeration + ICD load per device. Not attempted here
+      — different blast radius.
 
 0z. **NEW, 2026-07-27 (R614 gate): the Mesa venus ICD does not survive adapter teardown —
    `pnputil /restart-device` ACCESS-VIOLATES every process holding a venus device.** Each
@@ -1724,6 +1784,26 @@ Plan:
   `helios_paintcap` (screenshot → `Z:\tmp\screen_copy.png`), `helios_repaint`,
   `helios_flasher`, `helios_dstate`, `helios_enum_windows`, `helios_regedit`.
   `FindWindow('Progman')` is broken on this box — EnumWindows only.
+- **Handle-leak instruments** (`handle.exe` is NOT installed on this box and
+  these replace it; both run from SSH, no scheduled task needed):
+  `tools/helios-handle-types.ps1` answers *what* — per-type counts either side
+  of a run of device cycles, each new handle's type / granted access / kernel
+  object address / name, the handles that CLOSED during the run, the
+  transient-module set around ONE device cycle, and TlsAlloc/FlsAlloc
+  high-water. `-Pin <module-prefix|all>` holds modules loaded, which attributes
+  a leak to a module with no hooking at all: the per-device rate drops by
+  exactly that module's own never-released statics.
+  `tools/helios-handle-origins.ps1` answers *where* — IAT-hooks the
+  handle-minting kernel32 entry points (matching slots by resolved address, so
+  the kernel32/KernelBase/api-ms-win-core aliasing needs no spelling list) and
+  prints a stack per handle that one device leaves behind. **Two traps, each
+  cost a run:** the provider modules must be excluded or `kernel32!CreateFileW`
+  recurses through its own IAT into the hook (`0xC00000FD`, no output), and the
+  **ANSI** spellings are not redundant — the ICD is mingw-built, so its
+  `CreateSemaphore` IS `CreateSemaphoreA`. ICD frames are DWARF, which dbghelp
+  cannot read: resolve `module+0xRVA` with
+  `x86_64-w64-mingw32-addr2line -f -C -e <dll> $((ImageBase + RVA))` on the
+  Linux side (get ImageBase from `objdump -p`).
 - **User-mode stack dumps**: `tools/take-minidump.ps1 -ProcessId <pid> -Path <dmp>`
   (P/Invoke MiniDumpWriteDump; the `rundll32 comsvcs.dll,MiniDump` trick writes
   TRUNCATED dumps on this box — do not use). Analyze on Linux:
