@@ -17,6 +17,7 @@ pub mod config;
 pub mod ctrl;
 pub mod gpu;
 pub mod hal;
+pub mod pci_caps;
 pub mod venus;
 
 pub use gpu::{ScanoutNotify, VirtioGpu};
