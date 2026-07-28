@@ -70,6 +70,17 @@ class ShaderBytecode {
   std::size_t borrowed_len_ = 0;
 };
 
+// One DDI signature entry flattened by the Rust side:
+// (SystemValue, Register, Mask, RegisterComponentType, Stream).
+//
+// In the header because the shader creates in `dxvk_bridge.cpp` stride their
+// flattened entry arrays by it before handing them over.
+inline constexpr std::size_t kSigEntryWords = 5;
+
+/// Refuse an implausible signature entry count, count the refusal, and log it
+/// on a budget. Defined in `bridge_dxbc.cpp`.
+bool signature_count_ok(const char* what, std::uint32_t count);
+
 /// Wrap a raw SM4/SM5 token stream in a bare DXBC container (code chunk only).
 ShaderBytecode prepare_shader_bytecode(const std::uint8_t* code, std::size_t len);
 

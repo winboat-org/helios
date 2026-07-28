@@ -183,6 +183,9 @@ fn main() {
     let mut build = cxx_build::bridge("src/bridge.rs");
     build
         .file("bridge/dxvk_bridge.cpp")
+        // T8/R1105: extra TUs inherit every include and define from this same
+        // cc::Build, so there is no flag duplication to drift.
+        .file("bridge/bridge_dxbc.cpp")
         .compiler(&clang_cl)
         .archiver(&archiver)
         .std("c++17")
