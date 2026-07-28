@@ -41,6 +41,39 @@ mod knobs;
 mod log;
 mod vehicle_exports;
 
+/// The DLL entry point, present for exactly one reason: to release this
+/// module's process-lifetime handles when it is unloaded.
+///
+/// `helios_umd.dll` is loaded and unloaded ONCE PER D3D11 DEVICE — that is the
+/// runtime's behaviour, not ours, and it is measured, not assumed
+/// (`tools/helios_handle_types.cpp` reads `GetModuleHandleW` as NO / yes / NO
+/// across one `D3D11CreateDevice` + `Release`). Rust `static`s are never
+/// dropped and the loader closes nothing a module opened, so every such
+/// unload stranded the log-file handle: one leaked kernel handle per device,
+/// linear, no plateau. See [`log::close_at_detach`].
+///
+/// Rules this body obeys, all of them loader-lock rules:
+/// * no allocation, no I/O, no `LoadLibrary`, no thread waits;
+/// * no panic — a panic through `extern "system"` in DllMain aborts the
+///   process, and this runs inside dwm;
+/// * nothing at all on the `lpv_reserved != NULL` (process-exit) path, where
+///   the kernel reclaims every handle and other threads are already dead.
+///
+/// The MSVC CRT's `_DllMainCRTStartup` calls this by name; returning non-zero
+/// is "succeeded" and is the only legal answer for a DETACH notification.
+#[unsafe(no_mangle)]
+pub extern "system" fn DllMain(
+    _instance: *mut core::ffi::c_void,
+    reason: u32,
+    lpv_reserved: *mut core::ffi::c_void,
+) -> i32 {
+    const DLL_PROCESS_DETACH: u32 = 0;
+    if reason == DLL_PROCESS_DETACH && lpv_reserved.is_null() {
+        log::close_at_detach();
+    }
+    1
+}
+
 pub(crate) use knobs::{feature_level_mode, present_gate_us, trace_enabled, vehicle_flip_gate_us};
 pub(crate) use log::{log_error, log_knob_inventory, log_self_module_path, trace_line};
 // R420's `#![deny(deprecated)]` guard, preserved across the move: `log_line` is

@@ -43,25 +43,95 @@ pub(crate) fn umd_log_path() -> &'static std::path::Path {
 ///   even evaluate its arguments when the knob is off.
 #[deprecated(note = "use log_error! (errors/one-shots/refusals) or trace_line! (per-op traffic)")]
 pub(crate) fn log_line(message: &str) {
-    use std::sync::{Mutex, OnceLock};
-    // One handle per process: the old open/append/close-per-line pattern cost
-    // a full CreateFile round trip on every logged DDI call — measurable on
-    // per-frame paths (PSC WS2). Unbuffered File writes keep crash durability.
-    static FILE: OnceLock<Option<Mutex<std::fs::File>>> = OnceLock::new();
-    let file = FILE.get_or_init(|| {
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(umd_log_path())
-            .ok()
-            .map(Mutex::new)
-    });
-    if let Some(lock) = file {
-        if let Ok(mut f) = lock.lock() {
+    if let Ok(mut slot) = log_file().lock() {
+        if let Some(f) = slot.as_mut() {
             let _ = writeln!(f, "[pid={}] {}", std::process::id(), message);
         }
     }
 }
+
+/// The process-lifetime log handle.
+///
+/// One handle per DLL instance: the old open/append/close-per-line pattern cost
+/// a full CreateFile round trip on every logged DDI call — measurable on
+/// per-frame paths (PSC WS2). Unbuffered File writes keep crash durability.
+///
+/// The payload is an `Option` so [`close_at_detach`] can take the `File` and
+/// let its `Drop` close the handle. It is NOT merely `Option` for open
+/// failure: a `OnceLock` is never dropped, so with a plain `Mutex<File>` there
+/// is no way to release the handle at all.
+fn log_file() -> &'static std::sync::Mutex<Option<std::fs::File>> {
+    LOG_FILE.get_or_init(|| {
+        std::sync::Mutex::new(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(umd_log_path())
+                .ok(),
+        )
+    })
+}
+
+/// Close the log handle because this DLL is being unloaded.
+///
+/// `helios_umd.dll` is loaded and unloaded ONCE PER D3D11 DEVICE — measured
+/// directly (`GetModuleHandleW` reads NO / yes / NO across one
+/// `D3D11CreateDevice` + `Release` pair, and this file's own once-per-process
+/// `UMD module:` line appears once per device in the log). Neither a Rust
+/// `static` nor a `OnceLock` payload is ever dropped, and the loader does not
+/// close handles a module opened, so the log handle above was stranded on
+/// every unload: exactly one leaked kernel `File` per device, forever, with no
+/// plateau. That was one of the six handles per device
+/// `tools/helios_ownership_soak.cpp` has reported since T5; the other five
+/// belong to the venus ICD.
+///
+/// Called only from `DllMain(DLL_PROCESS_DETACH)` with `lpReserved == NULL`,
+/// i.e. the `FreeLibrary` case. On process teardown the kernel reclaims
+/// everything and touching a lock there buys nothing.
+///
+/// `try_lock`, not `lock`: DllMain runs under the loader lock, and blocking on
+/// a mutex another thread holds is the textbook loader deadlock. A thread
+/// inside `log_line` while its own module is being unloaded is already a
+/// use-after-free hazard the loader created, so the contended case is not
+/// reachable in any healthy teardown — it is counted rather than waited on.
+pub(crate) fn close_at_detach() {
+    use std::sync::atomic::Ordering;
+    let Some(lock) = log_file_if_open() else {
+        return;
+    };
+    match lock.try_lock() {
+        // Dropping the `File` is what closes the handle. Subsequent
+        // `log_line` calls find `None` and become no-ops, which is correct:
+        // the module they would log from is going away.
+        Ok(mut slot) => {
+            *slot = None;
+        }
+        // Refused, not silently skipped. The handle stays open and leaks, so
+        // the live signal is the soak's own per-device handle rate going back
+        // above zero; this counter is what names the reason in a dump.
+        Err(_) => {
+            LOG_CLOSE_CONTENDED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Log-handle closes refused because another thread held the writer lock at
+/// `DLL_PROCESS_DETACH`. Expected 0: see [`close_at_detach`].
+pub(crate) static LOG_CLOSE_CONTENDED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// The log mutex if it has already been created, WITHOUT creating it.
+///
+/// `close_at_detach` must not be the call that first opens the log file: a
+/// process that never logged has no handle to release, and `OnceLock::get`
+/// answers "already initialised?" without initialising, where `get_or_init`
+/// would strand the very handle this exists to close.
+fn log_file_if_open() -> Option<&'static std::sync::Mutex<Option<std::fs::File>>> {
+    LOG_FILE.get()
+}
+
+static LOG_FILE: std::sync::OnceLock<std::sync::Mutex<Option<std::fs::File>>> =
+    std::sync::OnceLock::new();
 
 /// Per-frame/per-op trace logging, gated by [`trace_enabled`]. The format
 /// arguments are not evaluated when tracing is off.
