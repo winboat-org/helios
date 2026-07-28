@@ -40,7 +40,7 @@ param(
     # functions whose sum is the budget, then the venus bring-up chain they
     # call, which R608 split into per-stage frames.
     [string[]] $Symbols = @(
-        '12start_device20dxgkddi_start_device',
+        '9lifecycle20dxgkddi_start_device',
         '9VirtioGpu4init',
         '14bring_up_venus',
         '26allocate_host_visible_blob',
@@ -54,8 +54,8 @@ param(
     # declared rather than inferred. Each entry is a comma-separated list of
     # $Symbols entries, outermost first.
     [string[]] $Chains = @(
-        '12start_device20dxgkddi_start_device,9VirtioGpu4init',
-        '12start_device20dxgkddi_start_device,14bring_up_venus,26allocate_host_visible_blob,13VenusInstance11into_device,13VenusInstance29create_device_with_ext_ladder'
+        '9lifecycle20dxgkddi_start_device,9VirtioGpu4init',
+        '9lifecycle20dxgkddi_start_device,14bring_up_venus,26allocate_host_visible_blob,13VenusInstance11into_device,13VenusInstance29create_device_with_ext_ladder'
     ),
     [int]      $Window  = 24
 )
