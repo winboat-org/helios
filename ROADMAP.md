@@ -1242,12 +1242,21 @@ registered in advance (`PREDICTIONS.md`) and scored.
   **`tmp/handoff-perf-structural/HANDOFF.md`** (owner: one structural
   point, not micro-levers; Steel Nomad Vulkan is only ~10 % off native ⇒
   the shared ICD/venus/KMD substrate is exonerated, the gap is
-  D3D11-side; prime suspect THREADING caps = 0 / R812 command-list stubs
-  ⇒ runtime replays emulated command lists on the render thread — verify
-  via a worker-thread sample BEFORE building). Supersedes
-  `tmp/handoff-perf-saturation/HANDOFF.md` (its attribution + lever
-  outcomes stand in `tmp/handoff-perf-saturation/reports/
-  p1-attribution.md`).
+  D3D11-side). Supersedes `tmp/handoff-perf-saturation/HANDOFF.md` (its
+  attribution + lever outcomes stand in
+  `tmp/handoff-perf-saturation/reports/p1-attribution.md`).
+  **66th session (2026-08-03): the prime suspect is CONFIRMED** — at
+  THREADING caps = 0 the runtime EMULATES command lists: Fire Strike's
+  ~15 workers record into software deferred contexts (SWDC_* frames,
+  worker sample) and the render thread replays every call through the
+  immediate DDI (`SWCL_CommandList::Execute` = #1 d3d11 function by
+  direct RIP; replay markers in 42.5 % of UMD samples, lower bound).
+  Evidence: `tmp/handoff-perf-structural/reports/
+  p0-commandlist-verification.md`. Build plan (phases A thread-safety →
+  B FREETHREADED → C COMMANDLISTS_BUILD_2 → DXVK's stock
+  D3D11DeferredContext, each knob-gated):
+  `tmp/handoff-perf-structural/PLAN-commandlists.md`. DXVK fork and cxx
+  bridge need ZERO changes — the work is entirely in `umd/src`.
 
 ## Workstream 1 — Stability
 
