@@ -1827,6 +1827,27 @@ Open defects, roughly ordered:
   `tmp/handoff-perf-saturation/reports/p1-attribution.md`; raw artifacts in
   `tmp/handoff-perf-saturation/logs/`; the samplers (reusable) in
   `tmp/handoff-perf-saturation/tools/`.
+  **Lever outcomes (2026-08-03, same session; canonical config =
+  owner-picked STANDARD FS preset, task `helios_fs_std`, baseline
+  GT1 170.6 / GT2 202.2 / Combined 21.38 ⇒ Graphics 42.6k):**
+  LEVER 1 LANDED (`e610d1c` — COM churn out of the binding DDIs; refcount
+  samples 8 %→1.5 %; Combined 21.4→≥22.9 on every subsequent run, best
+  25.26; GT1 likely +3–6 % but GT1 single runs swing ±5 % on identical
+  code — use 3-run medians; all stability gates + GT2 oracle green).
+  LEVER 2 NEGATIVE, reverted: the "chunk-pool contention" was a
+  stack-scan artifact — those parks are the FRAME GATE's
+  `SynchronizeCsThread` CS-drain; corrected gate cost ≈9.6 % of the
+  render thread (~0.55 ms/frame; DXVK's `CsSyncCount`/`CsSyncTicks`
+  already instrument it). LEVER 3 reverted: two real discoveries — the
+  per-context `DxvkLocalAllocationCache` mask is ZERO on venus (no
+  DEVICE_LOCAL+HOST_VISIBLE+HOST_COHERENT global-buffer type), and GT1
+  runs ~11 M small (48–128 B) buffer allocations through the locked
+  allocator per run (~950/frame, likely with a failed-properties attempt
+  + fallback each); enabling the cache (mask sans DEVICE_LOCAL → 99.7 %
+  hit rate) coincided with GT2 202→193–195, confounded by late-session
+  drift — unproven either way, do not re-land without answering why a
+  live cache would cost GT2 through venus. Run table + honest noise
+  discussion: report §3c.
 
 - **OPEN (2026-07-26, found while taking the T0 baseline): DComp cadence ~50 fps, not the
   documented ~63; present-gate avg ~2.0 ms, not the documented ~0.48 ms.** Measured on an
