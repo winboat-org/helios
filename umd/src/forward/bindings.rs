@@ -69,23 +69,97 @@ pub(crate) unsafe fn collect_slots<H, T>(
     out
 }
 
+/// Architectural cap for the per-stage binding arrays this file forwards
+/// (SRVs: 128; samplers and constant buffers: at most 16). One size for all
+/// three keeps the collector monomorphic; 128 stack words cost nothing.
+pub(crate) const MAX_BIND_SLOTS: usize = 128;
+
+/// Binding-array arms that arrived with `num` beyond [`MAX_BIND_SLOTS`] and
+/// were clamped. The runtime validates the API-level slot limits, so a
+/// nonzero value means a runtime/DDI contract bug, not app input. Expected 0.
+pub(crate) static BIND_SLOTS_CLAMPED: AtomicUsize = AtomicUsize::new(0);
+
+/// A binding array collected as raw COM words on the stack.
+///
+/// Replaces the per-call `Vec<Option<T>>` whose per-slot `.clone()` was an
+/// AddRef (plus a Release each when the `Vec` dropped) and, for constant
+/// buffers, a `QueryInterface` per slot per call — together ~8 % of the app's
+/// render thread in the GT1 profile
+/// (tmp/handoff-perf-saturation/reports/p1-attribution.md §2). No ownership
+/// is taken anywhere: the runtime holds each handle's reference across the
+/// DDI call by contract, and the handle slot's stored reference lives until
+/// the matching Destroy* DDI.
+pub(crate) struct RawBinds {
+    slots: [*mut c_void; MAX_BIND_SLOTS],
+    len: usize,
+}
+
+impl RawBinds {
+    /// View the collected words as the slice type the windows-crate context
+    /// methods take, WITHOUT constructing owned wrappers.
+    ///
+    /// SAFETY: windows-core interface types are `#[repr(transparent)]` over a
+    /// non-null pointer, so `Option<T>` is ABI-identical to a nullable
+    /// `*mut c_void` — this is the same layout the generated bindings pass to
+    /// COM. The borrow never drops an element, so no reference is released.
+    /// The caller must name the `T` the collected slots actually hold.
+    pub(crate) unsafe fn as_com_slice<T: Interface>(&self) -> &[Option<T>] {
+        core::slice::from_raw_parts(self.slots.as_ptr().cast::<Option<T>>(), self.len)
+    }
+
+    /// The raw-pointer form for the `SetConstantBuffers1` family, which takes
+    /// `Option<*const Option<T>>` + `num` instead of a slice.
+    ///
+    /// SAFETY: as [`RawBinds::as_com_slice`]; additionally the caller must
+    /// keep `self` alive across the context call the pointer is passed to.
+    pub(crate) unsafe fn as_com_ptr<T: Interface>(&self) -> *const Option<T> {
+        self.slots.as_ptr().cast::<Option<T>>()
+    }
+}
+
+/// Decode `num` slots of a runtime handle array into raw COM words. A null
+/// array yields `num` null slots — the same one policy as [`collect_slots`]:
+/// "no bindings", never "read `num` uninitialised pointers". `num` beyond the
+/// architectural cap is clamped loudly ([`BIND_SLOTS_CLAMPED`] + one
+/// `log_error!`), never indexed out of bounds.
+unsafe fn collect_raw<H>(h: *const H, num: u32, word_of: impl Fn(&H) -> usize) -> RawBinds {
+    let mut out = RawBinds {
+        slots: [core::ptr::null_mut(); MAX_BIND_SLOTS],
+        len: 0,
+    };
+    let len = (num as usize).min(MAX_BIND_SLOTS);
+    if num as usize > MAX_BIND_SLOTS && BIND_SLOTS_CLAMPED.fetch_add(1, Ordering::Relaxed) == 0 {
+        log_error!("DDI bind array clamped: num={num} max={MAX_BIND_SLOTS}");
+    }
+    if let Some(slice) = DdiSlice::new(h, len as u32) {
+        for index in 0..len {
+            if let Some(handle) = slice.get(index) {
+                out.slots[index] = word_of(handle) as *mut c_void;
+            }
+        }
+    }
+    out.len = len;
+    out
+}
+
 pub(crate) unsafe fn collect_buffers(
     start: u32,
     num: u32,
     h: *const ddi::D3D10DDI_HRESOURCE,
-) -> Vec<Option<ID3D11Buffer>> {
+) -> RawBinds {
     let _ = start;
-    collect_slots(DdiSlice::new(h, num), num, |handle| {
-        load_resource(*handle).and_then(|r| (*r).cast::<ID3D11Buffer>().ok())
+    // `buffer_raw` is the ID3D11Buffer interface pointer pre-cast at
+    // `store_resource`; 0 (= a null bind) for a non-buffer resource, which is
+    // exactly what the per-call `.cast()` used to produce for one.
+    collect_raw(h, num, |handle| {
+        resource_state_at(handle.pDrvPrivate).map_or(0, |s| s.buffer_raw)
     })
 }
 pub(crate) unsafe fn collect_srvs(
     num: u32,
     h: *const ddi::D3D10DDI_HSHADERRESOURCEVIEW,
-) -> Vec<Option<ID3D11ShaderResourceView>> {
-    collect_slots(DdiSlice::new(h, num), num, |handle| {
-        load_com::<ID3D11ShaderResourceView>(*handle).map(|m| (*m).clone())
-    })
+) -> RawBinds {
+    collect_raw(h, num, |handle| handle_com_raw_at(handle.pDrvPrivate))
 }
 
 pub(crate) unsafe fn srv_bind_summary(
@@ -117,13 +191,8 @@ pub(crate) unsafe fn srv_bind_summary(
     }
     (nonnull, missing, first_raw, first_priv)
 }
-pub(crate) unsafe fn collect_samplers(
-    num: u32,
-    h: *const ddi::D3D10DDI_HSAMPLER,
-) -> Vec<Option<ID3D11SamplerState>> {
-    collect_slots(DdiSlice::new(h, num), num, |handle| {
-        load_com::<ID3D11SamplerState>(*handle).map(|m| (*m).clone())
-    })
+pub(crate) unsafe fn collect_samplers(num: u32, h: *const ddi::D3D10DDI_HSAMPLER) -> RawBinds {
+    collect_raw(h, num, |handle| handle_com_raw_at(handle.pDrvPrivate))
 }
 
 /// Generate one stage's `pfn*SetConstantBuffers` entry point.
@@ -140,7 +209,8 @@ macro_rules! stage_set_constant_buffers {
             bufs: *const ddi::D3D10DDI_HRESOURCE,
         ) {
             if let Some(c) = d3d11_context(h) {
-                c.$method(start, Some(&collect_buffers(start, num, bufs)));
+                let buffers = collect_buffers(start, num, bufs);
+                c.$method(start, Some(buffers.as_com_slice::<ID3D11Buffer>()));
             }
         }
     };
@@ -203,7 +273,7 @@ pub(crate) unsafe fn set_constant_buffers1_common(
     let buffers_ptr = if num == 0 {
         None
     } else {
-        Some(buffers.as_ptr())
+        Some(buffers.as_com_ptr::<ID3D11Buffer>())
     };
     let first_ptr = if first_constants.is_null() {
         None
@@ -312,21 +382,28 @@ pub(crate) unsafe fn set_shader_resources_common(
         return;
     };
     let views = collect_srvs(num, srvs);
-    let (nonnull, missing, first_raw, first_priv) = srv_bind_summary(num, srvs);
-    let n = SRV_BIND_LOG_COUNT.next();
-    if n < 2048 || missing != 0 {
-        trace_line!(
-            "DDI {}SetShaderResources start={} num={} nonnull={} missing={} first_raw=0x{:x} first_priv={:p}",
-            stage.name(), start, num, nonnull, missing, first_raw, first_priv
-        );
+    // The summary is a second full pass over the array; it used to run on
+    // every call and be thrown away whenever tracing was off (the line below
+    // is `trace_line!`-gated anyway). Compute it only when it can print.
+    // SRV_BIND_LOG_COUNT now advances only while tracing is on — its sole
+    // consumer is this line budget.
+    if crate::trace_enabled() {
+        let (nonnull, missing, first_raw, first_priv) = srv_bind_summary(num, srvs);
+        if SRV_BIND_LOG_COUNT.next() < 2048 || missing != 0 {
+            trace_line!(
+                "DDI {}SetShaderResources start={} num={} nonnull={} missing={} first_raw=0x{:x} first_priv={:p}",
+                stage.name(), start, num, nonnull, missing, first_raw, first_priv
+            );
+        }
     }
+    let view_slice = views.as_com_slice::<ID3D11ShaderResourceView>();
     match stage {
-        ShaderStage::Vs => c.VSSetShaderResources(start, Some(&views)),
-        ShaderStage::Ps => c.PSSetShaderResources(start, Some(&views)),
-        ShaderStage::Gs => c.GSSetShaderResources(start, Some(&views)),
-        ShaderStage::Hs => c.HSSetShaderResources(start, Some(&views)),
-        ShaderStage::Ds => c.DSSetShaderResources(start, Some(&views)),
-        ShaderStage::Cs => c.CSSetShaderResources(start, Some(&views)),
+        ShaderStage::Vs => c.VSSetShaderResources(start, Some(view_slice)),
+        ShaderStage::Ps => c.PSSetShaderResources(start, Some(view_slice)),
+        ShaderStage::Gs => c.GSSetShaderResources(start, Some(view_slice)),
+        ShaderStage::Hs => c.HSSetShaderResources(start, Some(view_slice)),
+        ShaderStage::Ds => c.DSSetShaderResources(start, Some(view_slice)),
+        ShaderStage::Cs => c.CSSetShaderResources(start, Some(view_slice)),
     }
 }
 stage_set_shader_resources!(vs_set_shader_resources, Vs);
@@ -344,7 +421,8 @@ macro_rules! stage_set_samplers {
             samplers: *const ddi::D3D10DDI_HSAMPLER,
         ) {
             if let Some(c) = d3d11_context(h) {
-                c.$method(start, Some(&collect_samplers(num, samplers)));
+                let collected = collect_samplers(num, samplers);
+                c.$method(start, Some(collected.as_com_slice::<ID3D11SamplerState>()));
             }
         }
     };

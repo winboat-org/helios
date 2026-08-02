@@ -14,6 +14,14 @@ use super::*;
 
 pub(crate) struct ResourceState {
     pub(crate) com_raw: usize,
+    /// The same object's `ID3D11Buffer` interface pointer, pre-cast ONCE at
+    /// store time; 0 for non-buffer resources. Constant-buffer bind DDIs read
+    /// this word instead of a per-call `QueryInterface` + transient
+    /// AddRef/Release pair, which profiled as part of an ~8 % render-thread
+    /// cost (tmp/handoff-perf-saturation/reports/p1-attribution.md §2).
+    /// No reference is held through this field: `com_raw` owns the object,
+    /// and a COM interface pointer stays valid while its object lives.
+    pub(crate) buffer_raw: usize,
     /// A WDDM allocation is stored only after pfnMakeResidentCb has added one
     /// device-residency reference. Dropping the guard removes exactly that
     /// reference before the allocation is deallocated.
@@ -382,14 +390,30 @@ pub(crate) unsafe fn d3d11_context(h: Hdevice) -> Option<ManuallyDrop<ID3D11Devi
     (*hd).dxvk.d3d11_context()
 }
 
-pub(crate) unsafe fn d3d11_context1(h: Hdevice) -> Option<ID3D11DeviceContext1> {
+/// The immediate context as `ID3D11DeviceContext1`, borrowed.
+///
+/// The bridge's immediate context is DXVK's `D3D11ImmediateContext`, whose
+/// `QueryInterface` returns `this` for every `ID3D11DeviceContext{,1..4}`
+/// IID (dxvk-helios `d3d11_context.cpp:87-96`) — one vtable serves the whole
+/// chain, so the same pointer IS the derived interface. The previous per-call
+/// `.cast()` was a QI + transient AddRef/Release on the hot
+/// `SetConstantBuffers1` family (p1-attribution §2).
+pub(crate) unsafe fn d3d11_context1(h: Hdevice) -> Option<ManuallyDrop<ID3D11DeviceContext1>> {
     let context = d3d11_context(h)?;
-    (*context).cast::<ID3D11DeviceContext1>().ok()
+    // SAFETY: same object, same vtable (see above); ManuallyDrop keeps this a
+    // borrow — the bridge holds the owning reference.
+    Some(ManuallyDrop::new(ID3D11DeviceContext1::from_raw(
+        context.as_raw(),
+    )))
 }
 
-pub(crate) unsafe fn d3d11_context2(h: Hdevice) -> Option<ID3D11DeviceContext2> {
+/// As [`d3d11_context1`], for the tiled-resource DDIs.
+pub(crate) unsafe fn d3d11_context2(h: Hdevice) -> Option<ManuallyDrop<ID3D11DeviceContext2>> {
     let context = d3d11_context(h)?;
-    (*context).cast::<ID3D11DeviceContext2>().ok()
+    // SAFETY: as d3d11_context1 — the DXVK QI covers ID3D11DeviceContext2.
+    Some(ManuallyDrop::new(ID3D11DeviceContext2::from_raw(
+        context.as_raw(),
+    )))
 }
 
 pub(crate) unsafe fn d3d11_device2(h: Hdevice) -> Option<ID3D11Device2> {
@@ -502,8 +526,15 @@ pub(crate) unsafe fn store_resource(
         drop(obj);
         return;
     };
+    // One QI here instead of one per bind call. The temporary's release is
+    // fine: `com_raw` keeps the object alive, which keeps the pointer valid.
+    let buffer_raw = obj
+        .cast::<ID3D11Buffer>()
+        .map(|b| b.as_raw() as usize)
+        .unwrap_or(0);
     slot.store(ResourceState {
         com_raw: obj.into_raw() as usize,
+        buffer_raw,
         allocation,
         km_resource,
         rt_resource,
