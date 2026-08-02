@@ -267,6 +267,18 @@ pub const HELIOS_PRESENT_PRIVATE_VERSION: u32 = 1;
 /// exportable `pPrimaryDesc` allocation and may be scanned out directly. The
 /// bit does not promise a LINEAR layout; the host validates native metadata.
 pub const HELIOS_PRESENT_PRIVATE_FLAG_DIRECT_SCANOUT: u32 = 1 << 0;
+/// `HeliosPresentPrivateData::reserved` bit (D4b snapshot,
+/// FIX-DESIGN-d4b-snapshot.md): the descriptor fields (`resource_id`, the
+/// geometry, and `venus_alloc_size`) describe a SNAPSHOT image the UMD's
+/// venus-queue-ordered blit filled from the presented primary — the KMD
+/// should bind/flush THAT resource on the DMA-flip path instead of the
+/// flipped allocation's own. The flip bookkeeping (epoch stamp, VidMm
+/// physical address, CRTC_VSYNC retirement) stays entirely on the flipped
+/// allocation. A reader may only trust `venus_alloc_size` when this bit is
+/// set AND the buffer covers the 48-byte extended struct; readers that
+/// predate the bit ignore it and behave exactly as before (and the UMD only
+/// sets it after the KMD advertised `HELIOS_SCANOUT_CAP_SNAPSHOT_BIND`).
+pub const HELIOS_PRESENT_PRIVATE_FLAG_SNAPSHOT: u32 = 1 << 1;
 /// `'HEPR'` — magic of [`HeliosPresentRenderCmd`].
 pub const HELIOS_PRESENT_RENDER_MAGIC: u32 = 0x5250_4548;
 /// Current inline present-render command ABI version.
@@ -298,6 +310,14 @@ pub struct HeliosPresentPrivateData {
     pub pitch: u32,
     pub dxgi_format: u32,
     pub reserved: u32,
+    /// Total venus blob size backing `resource_id`, for the bind-time
+    /// undersize guard (`venus_alloc_size >= plane_offset + pitch*height`).
+    /// APPENDED for [`HELIOS_PRESENT_PRIVATE_FLAG_SNAPSHOT`] (40 -> 48 bytes,
+    /// offset 40 is 8-aligned, nothing before it moves — prefix-compatible
+    /// with pre-snapshot readers). Meaningful ONLY when that flag is set;
+    /// pre-snapshot writers leave it absent and readers must not consult it
+    /// without the flag + a 48-byte length check.
+    pub venus_alloc_size: u64,
 }
 
 impl HeliosPresentPrivateData {
@@ -361,8 +381,11 @@ const _: () = {
     assert!(core::mem::size_of::<HeliosWddmAllocPrivate>() == 48);
     assert!(core::mem::size_of::<HeliosWddmCmdBuf>() == 32);
     assert!(core::mem::size_of::<HeliosWddmAllocMeta>() == 48);
-    assert!(core::mem::size_of::<HeliosPresentPrivateData>() == 40);
-    assert!(core::mem::size_of::<HeliosPresentRenderCmd>() == 48);
+    // 40 -> 48 with the appended `venus_alloc_size` (D4b snapshot); the
+    // 40-byte prefix layout is unchanged — pre-snapshot readers keep working.
+    assert!(core::mem::size_of::<HeliosPresentPrivateData>() == 48);
+    assert!(core::mem::offset_of!(HeliosPresentPrivateData, venus_alloc_size) == 40);
+    assert!(core::mem::size_of::<HeliosPresentRenderCmd>() == 56);
     assert!(core::mem::size_of::<HeliosPresentRefreshCmd>() == 16);
     // The identity record must fit exactly over the HeliosWddmAllocPrivate
     // region so the meta trailer's offset is unchanged for openers.

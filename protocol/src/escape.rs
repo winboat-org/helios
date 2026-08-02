@@ -55,6 +55,16 @@ pub const HELIOS_ESCAPE_UNREGISTER_FENCE_EVENT: u32 = 0x000C;
 /// primary. The DWM UMD may import it as a transfer-only destination when a
 /// directly exportable primary is unavailable.
 pub const HELIOS_ESCAPE_QUERY_SCANOUT: u32 = 0x000D;
+/// Map the read-only scanout READ LEDGER page into the calling process
+/// (D4a scanout acquire — FIX-DESIGN-d4a.md §3.1/§3.3). See
+/// [`HeliosEscapeMapReadLedger`] and [`HeliosReadLedgerPage`].
+pub const HELIOS_ESCAPE_MAP_READ_LEDGER: u32 = 0x000E;
+/// Register/unregister a PERSISTENT per-device usermode event the KMD signals
+/// on every scanout-read retirement (D4a scanout acquire). Unlike the one-shot
+/// fence events (0x000B/C) this registration survives signals; the consumer is
+/// level-triggered (re-reads the ledger on every wake). See
+/// [`HeliosEscapeScanoutEvent`].
+pub const HELIOS_ESCAPE_SCANOUT_EVENT: u32 = 0x000F;
 
 /// Header for all escape commands. 16 bytes.
 #[repr(C)]
@@ -329,6 +339,142 @@ pub struct HeliosEscapeQueryScanout {
     /// Changes whenever the active primary identity is published or removed.
     pub out_generation: u32,
     pub reserved: [u32; 2],
+}
+
+// ---------------------------------------------------------------------------
+// D4a scanout acquire (FIX-DESIGN-d4a.md) — the read ledger + retirement event
+// ---------------------------------------------------------------------------
+
+/// `"HLRL"` — first word of the mapped ledger page.
+pub const HELIOS_READ_LEDGER_MAGIC: u32 = 0x4C52_4C48;
+/// Current ledger page layout version.
+pub const HELIOS_READ_LEDGER_VERSION: u32 = 1;
+/// Slot count in [`HeliosReadLedgerPage`]. Sized like the KMD's flush
+/// histogram: DWM rotates a 3-buffer chain, an app swapchain is 2-4 deep,
+/// and a fullscreen transition can briefly hold both sets.
+pub const HELIOS_READ_LEDGER_SLOTS: usize = 8;
+
+/// One ledger slot: the per-scanout-buffer host-readback ledger, keyed by the
+/// venus resource id (monotonic, never recycled — a stale key can never alias
+/// a new buffer). `issued` counts RESOURCE_FLUSH commands enqueued for this
+/// resource; `retired` counts their terminal outcomes (host completion, host
+/// error, cancel, teardown — every issue retires exactly once, enforced
+/// KMD-side by the flush token's Drop). Invariant: `issued >= retired`;
+/// `issued - retired` is the number of host reads in flight (0 or 1 today —
+/// the KMD holds at most one flush outstanding).
+///
+/// All fields are written KMD-side with Release stores and must be read with
+/// Acquire loads. Reader protocol for "is a read of X in flight?": find the
+/// slot with `resid == X`; read `issued`, `retired`; RE-READ `resid` — if it
+/// changed, treat as no-read-in-flight (slots are reclaimed only when
+/// `issued == retired`, so a mid-read reclaim implies every read of X
+/// retired).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct HeliosReadLedgerSlot {
+    /// Venus resource id owning this slot; 0 = free.
+    pub resid: u32,
+    /// Host readbacks enqueued for this resource (monotonic within a boot).
+    pub issued: u32,
+    /// Host readbacks retired (any outcome). The gate-semaphore value space.
+    pub retired: u32,
+    pub reserved: u32,
+}
+
+/// Layout of the one nonpaged 4 KiB page `HELIOS_ESCAPE_MAP_READ_LEDGER` maps
+/// read-only into user mode. KMD-owned, adapter-lifetime, zeroed at
+/// StartDevice (values are within-boot deltas like every Helios counter).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct HeliosReadLedgerPage {
+    /// == [`HELIOS_READ_LEDGER_MAGIC`]. A reader finding anything else must
+    /// treat the feature as off (page torn down / driver mismatch).
+    pub magic: u32,
+    /// == [`HELIOS_READ_LEDGER_VERSION`].
+    pub version: u32,
+    /// == [`HELIOS_READ_LEDGER_SLOTS`].
+    pub slot_count: u32,
+    pub reserved0: u32,
+    pub slots: [HeliosReadLedgerSlot; HELIOS_READ_LEDGER_SLOTS],
+    /// Slot claims refused because all slots were live (loud-failure counter;
+    /// a nonzero value means some buffer runs ungated — visible, not silent).
+    pub slot_overflow: u32,
+    pub reserved1: [u32; 3],
+}
+
+/// op values for [`HeliosEscapeMapReadLedger`] and
+/// [`HeliosEscapeScanoutEvent`]. PROBE follows the fence-event idiom: a
+/// supporting KMD answers `HELIOS_SCANOUT_ACQ_PROBE_ACK`; an old KMD fails
+/// the escape with STATUS_NOT_IMPLEMENTED from the unknown-verb arm — that is
+/// the capability signal, and the caller must latch the feature OFF.
+pub const HELIOS_SCANOUT_ACQ_OP_PROBE: u32 = 0;
+pub const HELIOS_SCANOUT_ACQ_OP_MAP: u32 = 1;
+pub const HELIOS_SCANOUT_ACQ_OP_UNMAP: u32 = 2;
+pub const HELIOS_SCANOUT_ACQ_OP_REGISTER: u32 = 1;
+pub const HELIOS_SCANOUT_ACQ_OP_UNREGISTER: u32 = 2;
+
+/// Capability bits returned in [`HeliosEscapeMapReadLedger::out_size`] by a
+/// PROBE reply (op 0). A pre-capability KMD (22.22.222.0) answers PROBE with
+/// `out_size == 0`, which reads as "read ledger only" via the ACK itself and
+/// no further capabilities — the absence of a bit is the negative signal.
+pub const HELIOS_SCANOUT_CAP_READ_LEDGER: u32 = 1 << 0;
+/// The KMD honors [`crate::wddm::HELIOS_PRESENT_PRIVATE_FLAG_SNAPSHOT`]
+/// (D4b: bind/flush the UMD's snapshot resource on the DMA-flip path). The
+/// UMD must never set that flag without seeing this bit.
+pub const HELIOS_SCANOUT_CAP_SNAPSHOT_BIND: u32 = 1 << 1;
+
+/// out_state values for the two D4a escapes.
+pub const HELIOS_SCANOUT_ACQ_OK: u32 = 0;
+pub const HELIOS_SCANOUT_ACQ_PROBE_ACK: u32 = 1;
+/// UNREGISTER/UNMAP: nothing matched the caller's device.
+pub const HELIOS_SCANOUT_ACQ_NOT_FOUND: u32 = 2;
+/// REGISTER: the event table is full. Counted KMD-side (`AqRgF`); the caller
+/// runs ungated (no waits armed) — loud, never wedged.
+pub const HELIOS_SCANOUT_ACQ_TABLE_FULL: u32 = 3;
+
+/// `HELIOS_ESCAPE_MAP_READ_LEDGER`. 40 bytes. PASSIVE, non-blocking.
+/// op MAP: maps the ledger page read-only into the calling process and
+/// returns the user VA (lifetime tracked owner-keyed KMD-side; reclaimed on
+/// device destroy / process death). op UNMAP: drops the caller's mapping.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct HeliosEscapeMapReadLedger {
+    pub hdr: HeliosEscapeHeader,
+    /// out (MAP): user VA of the read-only [`HeliosReadLedgerPage`] mapping.
+    pub out_user_va: u64,
+    /// in: one of `HELIOS_SCANOUT_ACQ_OP_{PROBE,MAP,UNMAP}`.
+    pub op: u32,
+    /// out (MAP): mapping size in bytes.
+    pub out_size: u32,
+    /// out: one of `HELIOS_SCANOUT_ACQ_*`.
+    pub out_state: u32,
+    pub _pad: u32,
+}
+
+/// `HELIOS_ESCAPE_SCANOUT_EVENT`. 32 bytes. PASSIVE, non-blocking.
+///
+/// REGISTER: `event_handle` is a usermode AUTO-RESET event (CreateEvent) in
+/// the calling process; the KMD references it (ObReferenceObjectByHandle,
+/// EVENT_MODIFY_STATE, UserMode) and signals it on EVERY scanout-read
+/// retirement until unregistered. PERSISTENT: the signal does not consume the
+/// registration. The consumer must be level-triggered — wake (event OR a
+/// bounded timeout), re-read the ledger, act on counter deltas — so lost or
+/// coalesced wakeups are a bounded hiccup, never a hang. Entries are
+/// owner-tagged and reclaimed at device destroy and StopDevice (the two fixes
+/// the one-shot fence-event table lacks).
+///
+/// UNREGISTER: same `event_handle`; the KMD drops the registration and its
+/// reference and will not signal again.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct HeliosEscapeScanoutEvent {
+    pub hdr: HeliosEscapeHeader,
+    /// in: usermode event handle, zero-extended to 64 bits.
+    pub event_handle: u64,
+    /// in: one of `HELIOS_SCANOUT_ACQ_OP_{PROBE,REGISTER,UNREGISTER}`.
+    pub op: u32,
+    /// out: one of `HELIOS_SCANOUT_ACQ_*`.
+    pub out_state: u32,
 }
 
 /// `HELIOS_ESCAPE_QUERY_STATS` — read-only snapshot of the KMD's bounded
