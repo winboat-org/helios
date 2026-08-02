@@ -52,6 +52,7 @@
 #include "d3d11_device.h"
 #include "d3d11_texture.h"
 #include "d3d11_context_imm.h"
+#include "dxvk_helios_present_sync.h"
 
 // After the DXVK headers: see the include-order note in this header.
 #include "bridge_icd_exports.h"
@@ -357,6 +358,17 @@ struct HeliosDxvkDeviceImpl {
   ID3D11Device*        d3d11   = nullptr; // QI'd from D3D11DXGIDevice; holds it alive
   ID3D11DeviceContext* context = nullptr; // immediate context
   std::uint32_t venus_ctx_id = 0;
+
+  // Cross-process present ordering, PRODUCER side. The named timeline this
+  // device signals at each frame's GPU completion, published per presented
+  // resource id so a consumer (dwm, compositing this app's window) can turn it
+  // into a GPU-side wait instead of us CPU-blocking on our own GPU work.
+  // Created lazily on the first present: an app that never presents never mints
+  // a kernel object.
+  dxvk::Rc<dxvk::DxvkFence> present_fence;
+  std::uint32_t present_fence_id = 0;
+  std::uint64_t present_value    = 0;
+  bool          present_fence_failed = false;
 
   ~HeliosDxvkDeviceImpl() {
     if (context) context->Release();
@@ -1094,7 +1106,159 @@ static std::atomic<std::uint32_t> s_gateExceptions{0};
 // unreachable rather than rare. Recorded so the distinction is in the code.
 static std::atomic<std::uint32_t> s_gateNoContext{0};
 
-bool HeliosDxvkDevice::present_frame_gate(std::uint32_t timeout_us) const {
+// Producers whose present could not be published, by stage. Every one of these
+// means a consumer will read that surface UNORDERED -- the black-frame defect --
+// so none of them may be silent.
+static std::atomic<std::uint32_t> s_publishNoResource{0};
+static std::atomic<std::uint32_t> s_publishFenceFailed{0};
+static std::atomic<std::uint32_t> s_publishSlotFailed{0};
+static std::atomic<std::uint64_t> s_publishOk{0};
+
+bool HeliosDxvkDevice::publish_present_order(std::size_t d3d11_resource_ptr) const {
+  if (!impl || !impl->context)
+    return false;
+
+  return bridge_guard("publish_present_order", false, [&]() -> bool {
+    if (!d3d11_resource_ptr)
+      return false;
+
+    // The id the CONSUMER will look up. dwm imports our presented surface by
+    // venus resource id (DxvkSharedHandleInfo::heliosResourceId), so the
+    // publish key has to be that same id, taken from the backing memory.
+    auto* resource = reinterpret_cast<ID3D11Resource*>(d3d11_resource_ptr);
+    auto* texture = dxvk::GetCommonTexture(resource);
+    if (!texture || !texture->GetImage() || !texture->GetImage()->storage())
+      return false;
+
+    const auto info = texture->GetImage()->storage()->getMemoryInfo();
+    const std::uint32_t resid = venus_memory_resource_id_from_handle(info.memory);
+
+    if (!resid) {
+      const auto n = s_publishNoResource.fetch_add(1, std::memory_order_relaxed) + 1;
+      if (n == 1 || (n % 512) == 0) {
+        char msg[160];
+        std::snprintf(msg, sizeof(msg),
+          "present-order: presented surface has no venus resource id (x%u) "
+          "- consumers will read it unordered", n);
+        umd_log(msg);
+      }
+      return false;
+    }
+
+    if (impl->present_fence == nullptr) {
+      if (impl->present_fence_failed)
+        return false;
+
+      // One named timeline per D3D11 device. A NULL DACL is deliberate and is
+      // the reason this needs a security descriptor at all: the consumer is
+      // dwm, which runs as its own principal (Window Manager\DWM-N), so the
+      // default descriptor -- owner-only -- would make the name unopenable and
+      // every consumer wait silently degrade to no wait. The object is a
+      // timeline semaphore carrying a frame counter; it grants no access to
+      // memory or content.
+      SECURITY_DESCRIPTOR sd = { };
+      SECURITY_ATTRIBUTES sa = { };
+      bool haveSa = false;
+
+      if (InitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION)
+       && SetSecurityDescriptorDacl(&sd, TRUE, nullptr, FALSE)) {
+        sa.nLength = sizeof(sa);
+        sa.lpSecurityDescriptor = &sd;
+        sa.bInheritHandle = FALSE;
+        haveSa = true;
+      }
+
+      static std::atomic<std::uint32_t> s_nextFenceId{1};
+      const std::uint32_t fenceId = s_nextFenceId.fetch_add(1, std::memory_order_relaxed);
+      const std::wstring name = L"Global\\HeliosPresentFence_"
+        + std::to_wstring(static_cast<unsigned long>(GetCurrentProcessId()))
+        + L"_" + std::to_wstring(fenceId);
+
+      try {
+        dxvk::DxvkFenceCreateInfo fenceInfo = { };
+        fenceInfo.initialValue = 0u;
+        fenceInfo.sharedType   = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT;
+        fenceInfo.ntExportName = name.c_str();
+        fenceInfo.ntSecurityAttributes = haveSa ? &sa : nullptr;
+        impl->present_fence = impl->device->createFence(fenceInfo);
+        impl->present_fence_id = fenceId;
+
+        char msg[200];
+        std::snprintf(msg, sizeof(msg),
+          "present-order: publishing as pid=%lu fence=%u",
+          static_cast<unsigned long>(GetCurrentProcessId()), fenceId);
+        umd_log(msg);
+      } catch (const dxvk::DxvkError& e) {
+        // Latch: retrying per present would spam and never succeed.
+        impl->present_fence_failed = true;
+        s_publishFenceFailed.fetch_add(1, std::memory_order_relaxed);
+        char msg[256];
+        std::snprintf(msg, sizeof(msg),
+          "present-order: named present fence creation FAILED (%s) "
+          "- consumers will read this process's surfaces unordered",
+          e.message().c_str());
+        umd_log(msg);
+        return false;
+      }
+    }
+
+    // Record the signal on the CS stream BEFORE publishing, so the value a
+    // consumer reads is one this device has already committed to reaching. The
+    // signal executes at GPU completion of everything recorded so far, i.e. the
+    // frame being presented.
+    const std::uint64_t value = ++impl->present_value;
+    auto* immediateContext = static_cast<dxvk::D3D11ImmediateContext*>(impl->context);
+    immediateContext->HeliosSignalPresentFence(impl->present_fence, value);
+
+    if (!dxvk::HeliosPresentSync::publish(resid,
+          static_cast<std::uint32_t>(GetCurrentProcessId()),
+          impl->present_fence_id, value)) {
+      const auto n = s_publishSlotFailed.fetch_add(1, std::memory_order_relaxed) + 1;
+      if (n == 1 || (n % 512) == 0) {
+        char msg[160];
+        std::snprintf(msg, sizeof(msg),
+          "present-order: slot publish FAILED for resid %u (x%u)", resid, n);
+        umd_log(msg);
+      }
+      return false;
+    }
+
+    const auto ok = s_publishOk.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (ok == 1 || (ok % 2048) == 0) {
+      char msg[200];
+      std::snprintf(msg, sizeof(msg),
+        "present-order: published n=%llu resid=%u value=%llu "
+        "(no_resid=%u fence_fail=%u slot_fail=%u)",
+        static_cast<unsigned long long>(ok), resid,
+        static_cast<unsigned long long>(value),
+        s_publishNoResource.load(std::memory_order_relaxed),
+        s_publishFenceFailed.load(std::memory_order_relaxed),
+        s_publishSlotFailed.load(std::memory_order_relaxed));
+      umd_log(msg);
+    }
+    return true;
+  });
+}
+
+bool HeliosDxvkDevice::set_scanout_acquire_event(std::size_t event_handle) const noexcept {
+  return bridge_guard("set_scanout_acquire_event", false, [&]() -> bool {
+    if (!impl || impl->device == nullptr || !event_handle)
+      return false;
+
+    impl->device->heliosScanoutAcquire().setEventHandle(
+      reinterpret_cast<HANDLE>(event_handle));
+
+    char msg[96];
+    std::snprintf(msg, sizeof(msg),
+      "scanout-acquire: retirement event 0x%zx delivered to DXVK signaler",
+      event_handle);
+    umd_log(msg);
+    return true;
+  });
+}
+
+bool HeliosDxvkDevice::present_frame_gate(std::uint32_t timeout_us,
+                                          std::uint32_t order_mode) const {
   if (!impl || !impl->context) {
     s_gateNoContext.fetch_add(1, std::memory_order_relaxed);
     return false;
@@ -1109,7 +1273,18 @@ bool HeliosDxvkDevice::present_frame_gate(std::uint32_t timeout_us) const {
     QueryPerformanceCounter(&qpcT0);
 
     auto* immediateContext = static_cast<dxvk::D3D11ImmediateContext*>(impl->context);
-    const bool completed = immediateContext->HeliosWaitFrameComplete(timeout_us);
+    // Both arms satisfy the same ordering contract -- the frame's Venus work is
+    // on the wire before pfnRenderCb samples the KMD watermark. The SUBMITTED
+    // arm stops there; the COMPLETE arm additionally waits out the GPU, which
+    // is a whole frame of CPU/GPU overlap the contract never asked for. Kept as
+    // one entry point with one telemetry line so the two compare directly.
+    bool completed;
+    if (order_mode == kPresentOrderSubmitted) {
+      immediateContext->HeliosWaitFrameSubmitted();
+      completed = true;
+    } else {
+      completed = immediateContext->HeliosWaitFrameComplete(timeout_us);
+    }
 
     // Gate-cost telemetry (PSC WS2 discipline): one line per 128 presents.
     QueryPerformanceCounter(&qpcT1);
@@ -1122,16 +1297,17 @@ bool HeliosDxvkDevice::present_frame_gate(std::uint32_t timeout_us) const {
     if (const auto sample = s_gateStat.record(qpc_elapsed_us(qpcFreq, qpcT0, qpcT1))) {
       // The existing keys keep their names, order and format so before/after
       // runs compare directly; `failed` and `noctx` are APPENDED. R826.
-      char msg[200];
+      char msg[220];
       std::snprintf(msg, sizeof(msg),
                     "present-gate: n=%u avg_us=%llu max_us=%llu timeouts=%u "
-                    "failed=%u noctx=%u",
+                    "failed=%u noctx=%u mode=%u",
                     sample->n,
                     static_cast<unsigned long long>(sample->avg_us),
                     static_cast<unsigned long long>(sample->max_us),
                     s_gateTimeouts.load(std::memory_order_relaxed),
                     s_gateExceptions.load(std::memory_order_relaxed),
-                    s_gateNoContext.load(std::memory_order_relaxed));
+                    s_gateNoContext.load(std::memory_order_relaxed),
+                    order_mode);
       umd_log(msg);
     }
     return completed;
@@ -1198,6 +1374,63 @@ std::int32_t HeliosDxvkDevice::present_vehicle_copy(
           char msg[160];
           std::snprintf(msg, sizeof(msg),
             "present_vehicle_copy: geometry mismatch dst=%ux%u src=%ux%u (x%u)",
+            dstExtent.width, dstExtent.height, srcExtent.width, srcExtent.height, n);
+          umd_log(msg);
+        }
+        return 1;
+      }
+      return 0;
+  });
+}
+
+std::int32_t HeliosDxvkDevice::present_snapshot_copy(
+    std::size_t dst_resource_ptr,
+    std::size_t src_resource_ptr) const {
+  if (!impl || !impl->context || !dst_resource_ptr || !src_resource_ptr)
+    return -1;
+
+  return bridge_guard("present_snapshot_copy", -1, [&]() -> std::int32_t {
+      auto* dstTex = dxvk::GetCommonTexture(
+        reinterpret_cast<ID3D11Resource*>(dst_resource_ptr));
+      auto* srcTex = dxvk::GetCommonTexture(
+        reinterpret_cast<ID3D11Resource*>(src_resource_ptr));
+      if (!dstTex || !dstTex->GetImage() || !srcTex || !srcTex->GetImage()) {
+        umd_log("present_snapshot_copy: non-texture resource");
+        return -1;
+      }
+
+      dxvk::Rc<dxvk::DxvkImage> dstImage = dstTex->GetImage();
+      dxvk::Rc<dxvk::DxvkImage> srcImage = srcTex->GetImage();
+
+      // No staging-alias substitution here, deliberately: the presented
+      // primary is this device's own DXVK image, never an import, so its own
+      // image IS the live storage. present_vehicle_copy's heliosStagingImage
+      // arm exists only for cross-context imports.
+
+      const VkExtent3D dstExtent = dstImage->info().extent;
+      const VkExtent3D srcExtent = srcImage->info().extent;
+      const VkExtent3D extent = {
+        std::min(dstExtent.width,  srcExtent.width),
+        std::min(dstExtent.height, srcExtent.height),
+        1u,
+      };
+
+      static_cast<dxvk::D3D11ImmediateContext*>(impl->context)
+        ->HeliosCopyPresentSnapshot(dstImage, srcImage, extent);
+
+      // A mismatch means the ring was built against stale geometry. The min
+      // region has been copied, but the caller must NOT substitute this
+      // present — the slot's remaining pixels are whatever a previous frame
+      // left there — so this is loud on every early occurrence.
+      const bool mismatch = dstExtent.width != srcExtent.width
+                         || dstExtent.height != srcExtent.height;
+      if (mismatch) {
+        static std::atomic<std::uint32_t> s_mismatch{0};
+        const std::uint32_t n = s_mismatch.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n <= 8 || (n % 128u) == 0) {
+          char msg[160];
+          std::snprintf(msg, sizeof(msg),
+            "present_snapshot_copy: geometry mismatch dst=%ux%u src=%ux%u (x%u)",
             dstExtent.width, dstExtent.height, srcExtent.width, srcExtent.height, n);
           umd_log(msg);
         }

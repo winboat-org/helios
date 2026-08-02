@@ -153,7 +153,21 @@ mod ffi {
         /// until the current flush's submission completes on the GPU, so the
         /// IddCx consumer never copies a buffer whose writes are in flight.
         /// Returns false on timeout (caller proceeds — bounded by design).
-        fn present_frame_gate(self: &HeliosDxvkDevice, timeout_us: u32) -> bool;
+        fn present_frame_gate(
+            self: &HeliosDxvkDevice,
+            timeout_us: u32,
+            order_mode: u32,
+        ) -> bool;
+
+        fn publish_present_order(self: &HeliosDxvkDevice, d3d11_resource_ptr: usize) -> bool;
+
+        /// D4a scanout acquire: hand the per-device KMD retirement event to
+        /// the DXVK device's signaler thread (auto-reset HANDLE as usize,
+        /// never 0). The UMD keeps ownership — DXVK only waits on it, and
+        /// DestroyDevice closes it after the bridge device has dropped (the
+        /// signaler joins inside ~DxvkDevice, so no waiter can outlive the
+        /// handle).
+        fn set_scanout_acquire_event(self: &HeliosDxvkDevice, event_handle: usize) -> bool;
         /// Dcomp present vehicle: image-level copy of the imported ICD frame
         /// (src) into the vehicle backbuffer texture (dst), sourcing the
         /// import's LIVE storage (staging alias when present). The copy-time
@@ -161,6 +175,20 @@ mod ffi {
         /// writes. 0 = ok, 1 = copied with a (counted) geometry mismatch,
         /// negative = failure — fail the present loudly, do not flip.
         unsafe fn present_vehicle_copy(
+            self: &HeliosDxvkDevice,
+            dst_resource_ptr: usize,
+            src_resource_ptr: usize,
+        ) -> i32;
+        /// D4b snapshot ring: image-level copy of the presented primary (src)
+        /// into a snapshot-ring image (dst), recorded on the open command
+        /// list BEFORE the present-time Flush so it rides frame N's own
+        /// command stream (queue-ordered after the frame's draws — no waits,
+        /// no CPU stalls). Clone of `present_vehicle_copy` minus the
+        /// staging-alias substitution: both operands are this device's own
+        /// images, never imports. 0 = ok, 1 = copied with a (counted)
+        /// geometry mismatch — the caller must NOT substitute the descriptor
+        /// for this present — negative = failure (present exactly as today).
+        unsafe fn present_snapshot_copy(
             self: &HeliosDxvkDevice,
             dst_resource_ptr: usize,
             src_resource_ptr: usize,
@@ -457,8 +485,25 @@ impl BridgeDevice {
         self.get().map_or(0, |d| d.venus_context_id())
     }
 
-    pub(crate) fn present_frame_gate(&self, timeout_us: u32) -> bool {
-        self.get().is_some_and(|d| d.present_frame_gate(timeout_us))
+    pub(crate) fn present_frame_gate(&self, timeout_us: u32, order_mode: u32) -> bool {
+        self.get()
+            .is_some_and(|d| d.present_frame_gate(timeout_us, order_mode))
+    }
+
+    /// Publish this present on the device's named timeline so a consumer can
+    /// order its read GPU-side. `d3d11_resource_ptr` is the presented source
+    /// resource's COM pointer; the bridge derives the venus resource id the
+    /// consumer imports by.
+    pub(crate) fn publish_present_order(&self, d3d11_resource_ptr: usize) -> bool {
+        self.get()
+            .is_some_and(|d| d.publish_present_order(d3d11_resource_ptr))
+    }
+
+    /// D4a scanout acquire: deliver this device's KMD retirement event handle
+    /// to the DXVK signaler. See the ffi declaration for the ownership rule.
+    pub(crate) fn set_scanout_acquire_event(&self, event_handle: usize) -> bool {
+        self.get()
+            .is_some_and(|d| d.set_scanout_acquire_event(event_handle))
     }
 
     // -- pointer-laundering passthroughs -----------------------------------
@@ -533,6 +578,18 @@ impl BridgeDevice {
         // have to agree for the call to be correct.
         self.get()
             .map_or(-1, |d| unsafe { d.present_vehicle_copy(dst.0, src.0) })
+    }
+
+    /// D4b snapshot blit: S_i <- presented primary, recorded before the
+    /// present-time Flush. See the ffi declaration for the return contract.
+    ///
+    /// # Safety
+    /// Both pointers must be live `ID3D11Resource*`.
+    pub(crate) unsafe fn present_snapshot_copy(&self, dst: DstRes, src: SrcRes) -> i32 {
+        // Same (dst, src) C++ order and the same transposition hazard as
+        // `present_vehicle_copy`; the newtypes are what make it a type error.
+        self.get()
+            .map_or(-1, |d| unsafe { d.present_snapshot_copy(dst.0, src.0) })
     }
 
     // -- shader creates ----------------------------------------------------

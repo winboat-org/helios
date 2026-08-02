@@ -25,6 +25,7 @@ mod present;
 mod queries;
 mod resource;
 mod shaders;
+mod snapshot;
 mod state;
 mod state_objects;
 mod tables;
@@ -44,6 +45,7 @@ pub(crate) use present::*;
 pub(crate) use queries::*;
 pub(crate) use resource::*;
 pub(crate) use shaders::*;
+pub(crate) use snapshot::*;
 pub(crate) use state::*;
 pub(crate) use state_objects::*;
 pub(crate) use tables::*;
@@ -77,7 +79,8 @@ pub(super) use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_SAMPLE
 pub(super) use helios_protocol::{
     HeliosPresentPrivateData, HeliosPresentRefreshCmd, HeliosPresentRenderCmd, HeliosWddmAllocMeta,
     HeliosWddmAllocPrivate, HeliosWddmOpenIdentity, HELIOS_PRESENT_PRIVATE_FLAG_DIRECT_SCANOUT,
-    HELIOS_PRESENT_PRIVATE_MAGIC, HELIOS_PRESENT_PRIVATE_VERSION, HELIOS_PRESENT_REFRESH_MAGIC,
+    HELIOS_PRESENT_PRIVATE_FLAG_SNAPSHOT, HELIOS_PRESENT_PRIVATE_MAGIC,
+    HELIOS_PRESENT_PRIVATE_VERSION, HELIOS_PRESENT_REFRESH_MAGIC,
     HELIOS_PRESENT_REFRESH_VERSION, HELIOS_PRESENT_RENDER_MAGIC, HELIOS_PRESENT_RENDER_VERSION,
     HELIOS_WDDM_ALLOC_KIND_DEVICE_MEMORY, HELIOS_WDDM_ALLOC_KIND_STANDARD,
     HELIOS_WDDM_ALLOC_MISC_DIRECT_SCANOUT, HELIOS_WDDM_ALLOC_MISC_OPTIMAL_GDI_TEXTURE,
@@ -88,7 +91,6 @@ pub(super) use helios_protocol::{
 pub(super) use crate::ddi;
 pub(super) use crate::device_funcs::HeliosDevice;
 pub(super) use crate::log_error;
-pub(super) use crate::present_gate_us;
 pub(super) use crate::trace_line;
 
 pub(super) type Hdevice = ddi::D3D10DDI_HDEVICE;
@@ -505,6 +507,11 @@ unsafe fn present_prerequisites(
     })
 }
 
+/// `order_mode` values of `HeliosDxvkDevice::present_frame_gate`, mirroring
+/// `kPresentOrderComplete` / `kPresentOrderSubmitted` in `bridge/dxvk_bridge.h`.
+pub(super) const PRESENT_ORDER_COMPLETE: u32 = 0;
+pub(super) const PRESENT_ORDER_SUBMITTED: u32 = 1;
+
 /// Outcome of the bounded frame gate. `#[must_use]` because `dxgi_present1`'s
 /// multi arm silently discarded the boolean this replaces.
 ///
@@ -538,7 +545,27 @@ unsafe fn run_present_frame_gate(
     gate_us: u32,
     is_vehicle_present: bool,
 ) -> GateOutcome {
-    if dev.dxvk.present_frame_gate(gate_us) {
+    // The vehicle keeps the COMPLETE wait, and it is the ONLY path that may.
+    // Its ordering requirement is genuinely different and genuinely stronger:
+    // the vehicle backbuffer is scanned out on a direct/independent flip
+    // ordered only on the KMD's DMA fence, which completes at DECODE, so the
+    // copy's host-GPU completion is what has to be waited for (24th session).
+    // It has its own bound, `VehicleFlipGateUs`.
+    //
+    // The DIRECT-PRIMARY / ordinary-app path is SUBMITTED, unconditionally and
+    // with no knob. It is ordered by the `DxgkDdiRender` watermark, which needs
+    // only that the frame's Venus work has reached `vkQueueSubmit`; waiting for
+    // GPU completion here is a producer-side CPU stall that removes all
+    // CPU/GPU overlap and does not fix the ordering anyway (owner-verified
+    // 2026-07-29: an unexpirable 200 ms completion gate still flashed black).
+    // The `PresentOrder`/`PresentGateUs` knobs that used to select and bound it
+    // were deleted with it — see the ⛔ note in `crate::knobs`.
+    let order_mode = if is_vehicle_present {
+        PRESENT_ORDER_COMPLETE
+    } else {
+        PRESENT_ORDER_SUBMITTED
+    };
+    if dev.dxvk.present_frame_gate(gate_us, order_mode) {
         return GateOutcome::Completed;
     }
     let total = PRESENT_GATE_TIMEOUTS.fetch_add(1, Ordering::Relaxed) + 1;

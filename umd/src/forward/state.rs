@@ -198,6 +198,7 @@ pub(crate) fn empty_present_private() -> HeliosPresentPrivateData {
         pitch: 0,
         dxgi_format: 0,
         reserved: 0,
+        venus_alloc_size: 0,
     }
 }
 

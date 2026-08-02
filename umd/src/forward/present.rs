@@ -744,6 +744,13 @@ pub(crate) struct PresentRequest {
 /// cases, which skipped the vehicle mint, `EXT_PRESENTS` and the trailing
 /// per-present log. Collapsing those into a plain HRESULT would have started
 /// minting vehicle slots on a path that never did.
+///
+/// `snapshot` is the D4b substitution plan and is value-threaded on purpose:
+/// only `dxgi_present`'s direct-flip arm, which just RECORDED the snapshot
+/// blit this present, can produce a `Some` — there is no device-latched copy
+/// that could go stale if the blit arm was skipped, so a descriptor pointing
+/// at an unwritten snapshot (a stale-frame display) is unrepresentable.
+/// Present1-multi performs no publish and always passes `None`.
 pub(crate) unsafe fn finish_present(
     h: Hdevice,
     src_h: ddi::D3D10DDI_HRESOURCE,
@@ -751,6 +758,7 @@ pub(crate) unsafe fn finish_present(
     src_alloc: u32,
     dst_alloc: u32,
     req: PresentRequest,
+    snapshot: Option<SnapshotPlan>,
 ) -> Result<i32, i32> {
     let no_callback_hr = req.kind.initial_hr();
     let Some(dev) = helios_device(h) else {
@@ -797,7 +805,16 @@ pub(crate) unsafe fn finish_present(
     };
 
     let mut cb = ddi::DXGIDDICB_PRESENT::default();
-    let present_private = presented_primary_private(h, src_h);
+    let mut present_private = presented_primary_private(h, src_h);
+    // D4b: substitute the snapshot descriptor into the OWNED LOCAL above —
+    // before BOTH consumers (`pPrivateDriverData` below and the
+    // `HeliosPresentRenderCmd` inside `submit_runtime_present_then_call`).
+    // The override re-validates the private's geometry against the plan and
+    // refuses loudly on any divergence; `ResourceState::present_private` and
+    // `direct_scanout_allocations` (rotation-coupled) are never touched.
+    if let Some(ref plan) = snapshot {
+        apply_snapshot_override(&mut present_private, plan);
+    }
     // `ready` carries the same two values both entry points used to spell out
     // by hand -- `src_alloc` proved non-zero, and the context handle proved
     // present -- so this is the checked form of what Present1-multi was
@@ -807,15 +824,15 @@ pub(crate) unsafe fn finish_present(
     cb.pDXGIContext = req.dxgi_context;
     cb.hContext = ready.h_context.as_ptr();
     cb.BroadcastContextCount = 0;
-    if let Some(ref private) = present_private {
-        cb.PrivateDriverDataSize = core::mem::size_of::<HeliosPresentPrivateData>() as u32;
-        cb.pPrivateDriverData = (private as *const HeliosPresentPrivateData)
-            .cast_mut()
-            .cast();
-    } else {
-        cb.PrivateDriverDataSize = 0;
-        cb.pPrivateDriverData = core::ptr::null_mut();
-    }
+    // RETIRED (0ab-C close-out): this used to also ship `present_private` via
+    // `cb.pPrivateDriverData`, but dxgkrnl never forwarded it to
+    // `DxgkDdiPresent` on the DMA-flip path (the KMD's `PBIdOk` read
+    // "no payload" across three driver generations). The ONE per-present
+    // channel to the KMD's flip arm is the inline `HeliosPresentRenderCmd`
+    // inside `submit_runtime_present_then_call` below — which is where the
+    // (possibly snapshot-substituted) `present_private` still goes.
+    cb.PrivateDriverDataSize = 0;
+    cb.pPrivateDriverData = core::ptr::null_mut();
     cb.bOptimizeForComposition = if present_optimize_composition_enabled() {
         1
     } else {
@@ -879,6 +896,10 @@ pub(crate) unsafe extern "C" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT
     let src_alloc = resource_allocation(src_h);
     let dst_alloc = resource_allocation(dst_h);
     let mut copied = false;
+    // D4b snapshot plan: `Some` iff the direct-flip arm below RECORDED the
+    // ordered blit this present. Value-threaded into `finish_present`, never
+    // latched on the device — see `snapshot_for_present`.
+    let mut snapshot: Option<SnapshotPlan> = None;
 
     // Dcomp present vehicle (road 4): a pending TLS source means THIS
     // present is the vehicle carrying an ICD frame — replace the normal
@@ -913,7 +934,13 @@ pub(crate) unsafe extern "C" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT
             // A direct primary already is the scanout backing. Do not copy it
             // through the adapter-owned LINEAR target; Present will publish its
             // rotated resource id after flushing DWM's rendering.
-            let published_to_scanout = presented_primary_private(h, src_h).is_some();
+            //
+            // The private data is read PER PRESENT: it rotates with the
+            // allocation (`presented_primary_private` resolves by the
+            // allocation Windows is actually presenting), so caching it per
+            // resource would hand the snapshot arm a stale geometry/identity.
+            let direct_private = presented_primary_private(h, src_h);
+            let published_to_scanout = direct_private.is_some();
             let copy_pair = if published_to_scanout {
                 None
             } else {
@@ -925,6 +952,15 @@ pub(crate) unsafe extern "C" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT
             if let Some((dst, src)) = copy_pair {
                 context.CopySubresourceRegion(&*dst, 0, 0, 0, 0, &*src, 0, None);
                 copied = true;
+            }
+            // D4b, direct-flip arm ONLY: record the ordered snapshot blit
+            // S_i <- presented primary BEFORE the Flush below, so the blit is
+            // inside frame N's command list — the same list the frame gate's
+            // `HeliosWaitFrameSubmitted` later covers, which is what keeps
+            // the KMD's completion watermark valid for the substituted resid.
+            // Every refusal inside returns None (present exactly as today).
+            if let Some(ref private) = direct_private {
+                snapshot = snapshot_for_present(h, src_h, private);
             }
             context.Flush();
         }
@@ -938,19 +974,61 @@ pub(crate) unsafe extern "C" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT
     maybe_force_present_alpha_opaque(h, src_h);
     maybe_log_present_readback(h, src_h);
 
-    // Frame-completion gate BEFORE the kernel present becomes visible. The
+    // Cross-process present ordering, PRODUCER half. Record a signal on this
+    // device's named present timeline for the frame just flushed and publish
+    // (resid -> pid, fenceId, value). A consumer compositing this surface --
+    // dwm, sampling it as an SRV -- turns that into a GPU-side wait on its own
+    // submission, so the ordering costs neither side a blocked CPU thread.
+    //
+    // This is what makes the submission-ordered present CORRECT rather than
+    // merely fast — it is the GPU-timeline half of the ordering that the
+    // deleted `PresentOrder`/`PresentGateUs` CPU gate was standing in for. It
+    // must run before the gate: the gate's flush is what pushes the signal to
+    // the wire, and the publish has to name a value this device has already
+    // committed to reaching.
+    //
+    // Deliberately NOT applied to a vehicle present: that path's source is the
+    // ICD's frame, which publishes its own slot from the ICD side.
+    //
+    // WHICH resource: the one the CONSUMER imports, which is not always the
+    // source. On the flip path (`dst_h` empty) dwm reads the presented
+    // backbuffer itself. On the windowed/BLT path we have just copied
+    // src -> dst, and `dst` is win32k's redirection surface -- the one dwm
+    // composes -- so publishing `src` there would key the slot on a resource no
+    // consumer ever looks up, and the wait would silently not happen.
+    if !is_vehicle_present {
+        if let Some(dev) = helios_device(h) {
+            let consumed = if copied {
+                resource_com_raw(dst_h)
+            } else {
+                resource_com_raw(src_h)
+            };
+            if consumed != 0 {
+                dev.dxvk.publish_present_order(consumed);
+            }
+        }
+    }
+
+    // Ordering gate BEFORE the kernel present becomes visible. The
     // direct-primary KMD marker can order Venus commands which have reached the
     // transport, but `context.Flush()` may return while matching work is still
-    // queued on DXVK's submission thread. Waiting for DXVK's submission fence
-    // closes that future-work gap before dxgkrnl publishes the primary.
-    // Bounded: on timeout the present proceeds loudly and the next full-frame
-    // refresh self-heals. `HKLM\SOFTWARE\Helios!PresentGateUs` (DWORD)
-    // overrides the 10 ms default; 0 disables. Cost telemetry:
-    // `present-gate:` lines.
+    // queued on DXVK's CS and submission threads. Closing that future-work gap
+    // before dxgkrnl publishes the primary is the whole job.
     //
-    // Bounded CPU gate (`VehicleFlipGateUs` / `PresentGateUs`): the producer
-    // ordering for vehicle and direct-primary/non-vehicle presents alike.
-    // Timeout = proceed loudly (a stale frame beats a wedged worker).
+    // The ordinary path waits for the frame's `vkQueueSubmit` — exactly what
+    // the KMD watermark needs, and it costs no GPU time. It is UNCONDITIONAL:
+    // there is no knob to select a completion wait and none to bound or disable
+    // it, because a producer-side CPU stall is a hack that hides ordering
+    // defects rather than fixing them, and owner testing on 2026-07-29 showed
+    // it does not even hide this one (an unexpirable 200 ms completion gate
+    // still flashed black). See the ⛔ note in `crate::knobs`.
+    //
+    // The VEHICLE path is the exception and keeps its bounded COMPLETE wait
+    // under its own `VehicleFlipGateUs`, whose 0 still disables it: that
+    // backbuffer scans out on a direct/independent flip ordered only on a
+    // DECODE-domain DMA fence, so host-GPU completion genuinely is the
+    // requirement there. Timeout = proceed loudly (a stale frame beats a
+    // wedged worker). Cost telemetry: `present-gate:` lines.
     //
     // Until R912(a) a kernel-enforced alternative sat above this: a dxgkrnl
     // GPU-side WAIT queued on a flip fence ahead of the present packet, which
@@ -958,12 +1036,16 @@ pub(crate) unsafe extern "C" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT
     // `sync_value`, whose only producer was `present_sync_publish` behind a
     // knob that defaulted OFF -- so it never armed. Measured before deleting:
     // `kwait_armed = 0` over 1536 vkcube vehicle presents (ROADMAP 7g(d)).
+    // `gate_us` is meaningful only for the vehicle's COMPLETE wait; the
+    // SUBMITTED arm ignores it (see `HeliosDxvkDevice::present_frame_gate`).
+    // The `!= 0` disable therefore applies to the vehicle alone — applying it
+    // to the ordinary path would be a knob that skips the ordering entirely.
     let gate_us = if is_vehicle_present {
         crate::vehicle_flip_gate_us()
     } else {
-        present_gate_us()
+        0
     };
-    if gate_us != 0 {
+    if !is_vehicle_present || gate_us != 0 {
         if let Some(dev) = helios_device(h) {
             let _outcome = run_present_frame_gate(dev, gate_us, is_vehicle_present);
         }
@@ -980,6 +1062,7 @@ pub(crate) unsafe extern "C" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT
             dxgi_context: a.pDXGIContext,
             flags: *(&a.Flags as *const ddi::DXGI_DDI_PRESENT_FLAGS as *const u32),
         },
+        snapshot,
     ) {
         Ok(hr) => hr,
         // Abandons the vehicle mint, EXT_PRESENTS and the ordinal log below,
@@ -1847,13 +1930,13 @@ pub(crate) unsafe extern "C" fn dxgi_present1(arg: *mut ddi::DXGI_DDI_ARG_PRESEN
         context.Flush();
     }
 
-    let gate_us = present_gate_us();
-    if gate_us != 0 {
-        if let Some(dev) = helios_device(h) {
-            // Present1-multi discarded this boolean entirely; #[must_use] on
-            // GateOutcome makes that a compiler warning rather than a silence.
-            let _outcome = run_present_frame_gate(dev, gate_us, false);
-        }
+    if let Some(dev) = helios_device(h) {
+        // Present1-multi discarded this boolean entirely; #[must_use] on
+        // GateOutcome makes that a compiler warning rather than a silence.
+        // Unconditional and unbounded-by-nothing: the SUBMITTED wait is on two
+        // guest CPU threads and has no slow-GPU case to bound, so it takes the
+        // `0` the vehicle-only timeout would have carried.
+        let _outcome = run_present_frame_gate(dev, 0, false);
     }
 
     let present_hr = match finish_present(
@@ -1867,6 +1950,9 @@ pub(crate) unsafe extern "C" fn dxgi_present1(arg: *mut ddi::DXGI_DDI_ARG_PRESEN
             dxgi_context: a.pDXGIContext,
             flags: *(&a.Flags as *const ddi::DXGI_DDI_PRESENT_FLAGS as *const u32),
         },
+        // Present1-multi performs no scanout publish and records no blit —
+        // no substitution here, ever.
+        None,
     ) {
         Ok(hr) => hr,
         // Skips the trailing PRESENT1_LOG_COUNT line, exactly as the bare

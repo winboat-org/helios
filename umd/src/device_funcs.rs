@@ -50,6 +50,61 @@ impl Drop for PresentSrcEntry {
     }
 }
 
+/// One slot of the D4b snapshot ring (FIX-DESIGN-d4b-snapshot.md §3): an
+/// ICD-owned DirectOptimalScanout OPTIMAL image the present-time blit fills
+/// from the presented primary, plus the identity the KMD binds it by. NO
+/// runtime object and NO WDDM allocation exist for it — the KMD needs only
+/// the resid + descriptor, and ownership is never transferred (the snapshot
+/// stays an ICD-owned blob). Owns one COM ref on the created resource,
+/// released on drop (ring recreate or `BridgeOwned::release`).
+pub struct SnapshotSlot {
+    /// Owned `ID3D11Resource` COM pointer from `create_ddi_scanout_texture2d`.
+    pub resource_raw: usize,
+    /// Venus resource id the KMD binds (`dxvk_resource_memory_info`).
+    pub resid: u32,
+    /// Logical scanout row pitch, from the same create outparam the primary
+    /// path records into its `ScanoutGeometry`.
+    pub pitch: u32,
+    /// Memory-plane-0 offset, same source as `pitch`.
+    pub plane_offset: u64,
+    /// Venus blob size backing `resid`, for the KMD's bind-time undersize
+    /// guard (`alloc_size >= plane_offset + pitch*height`).
+    pub alloc_size: u64,
+}
+
+impl Drop for SnapshotSlot {
+    fn drop(&mut self) {
+        if self.resource_raw != 0 {
+            // SAFETY: `resource_raw` is the owned COM ref adopted from
+            // create_scanout_texture2d and handed over with into_raw;
+            // from_raw re-adopts it so drop releases it.
+            unsafe {
+                drop(
+                    windows::Win32::Graphics::Direct3D11::ID3D11Resource::from_raw(
+                        self.resource_raw as *mut c_void,
+                    ),
+                );
+            }
+        }
+    }
+}
+
+/// The D4b snapshot ring: 4 slots rotated per direct-flip present, keyed by
+/// the presented primary's geometry. Created lazily on the first substitutable
+/// present, torn down and lazily recreated when the presented geometry moves
+/// (resize / fullscreen transition). Never handed to
+/// `dxgi_rotate_resource_identities` — its list is `a.pResources` only, so the
+/// ring is naturally excluded.
+pub struct SnapshotRing {
+    pub width: u32,
+    pub height: u32,
+    pub dxgi_format: u32,
+    /// Exactly [`crate::forward::SNAPSHOT_RING_SLOTS`] entries once built.
+    pub slots: Vec<SnapshotSlot>,
+    /// Next slot index to rotate into.
+    pub next: usize,
+}
+
 /// WDDM 2.x paging queue used to order explicit residency operations.
 ///
 /// The non-zero handles and non-null monitored-fence mapping are validated at
@@ -143,6 +198,9 @@ pub struct BridgeOwned {
     /// Dcomp present-vehicle source cache. Same single-threaded-DDI RefCell
     /// contract as `ia`.
     pub present_src_cache: core::cell::RefCell<Vec<PresentSrcEntry>>,
+    /// D4b snapshot ring (`None` until the first substitutable direct-flip
+    /// present builds it). Same single-threaded-DDI RefCell contract as `ia`.
+    pub snapshot_ring: core::cell::RefCell<Option<SnapshotRing>>,
     /// Input-assembler state for lazy `ID3D11InputLayout` creation. The
     /// d3d10umddi `CreateElementLayout` DDI does NOT pass the vertex-shader
     /// input-signature bytecode that `ID3D11Device::CreateInputLayout`
@@ -155,6 +213,7 @@ impl BridgeOwned {
     pub fn new() -> Self {
         Self {
             present_src_cache: core::cell::RefCell::new(Vec::new()),
+            snapshot_ring: core::cell::RefCell::new(None),
             ia: core::cell::RefCell::new(IaState::default()),
         }
     }
@@ -172,8 +231,13 @@ impl BridgeOwned {
     /// drops", which is the ordering this type exists to stop depending on.
     pub fn release(&mut self) -> (usize, usize) {
         // Order: caches first, IA last, matching the pre-R807 sequence where
-        // `ia` was the field released explicitly.
+        // `ia` was the field released explicitly. The snapshot ring is a
+        // cache too: dropping the slots releases their COM refs, and that is
+        // ALL its teardown — no WDDM handles, no KMD registrations to unwind
+        // (the KMD carries the descriptor by value and its executor's
+        // `resource_is_live` arm refuses a dead resid loudly).
         self.present_src_cache.get_mut().clear();
+        self.snapshot_ring.get_mut().take();
         self.ia.get_mut().release_owned_com()
     }
 }
@@ -642,6 +706,13 @@ unsafe extern "C" fn ddi_destroy_device(h_device: ddi::D3D10DDI_HDEVICE) {
         );
         destroy_runtime_objects(dev);
         core::ptr::drop_in_place(h_device.pDrvPrivate as *mut HeliosDevice);
+        // D4a scanout acquire, the tail of the §5.3 teardown order. The
+        // drop_in_place above released the bridge device, and ~DxvkDevice ran
+        // the DXVK half (stop arming → signal every gate to max → join the
+        // signaler) — so by here no thread waits the event and no reader can
+        // pick this device's ledger VA (the registry entry is removed under
+        // the same mutex every reader holds). Unregister + close + unmap.
+        crate::scanout_acquire::teardown_for_device(h_device.pDrvPrivate as usize);
     }
 }
 

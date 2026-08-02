@@ -163,7 +163,13 @@ pub fn wait_last_present(timeout_us: u32) -> i32 {
     // device reference) — now backed by the liveness check above rather than
     // by that contract alone.
     let dev = unsafe { &*(dev_ptr as *const HeliosDevice) };
-    if dev.dxvk.present_frame_gate(timeout_us) {
+    // COMPLETE, always: this is the ICD's image-RECYCLE guard, so
+    // the question it asks is "has the vehicle's copy finished reading the
+    // frame", which only GPU completion answers. The present-ordering handshake
+    // that the ordinary present path answers is a different question with a
+    // different answer -- which is why deleting the `PresentOrder` knob (owner
+    // directive, 2026-07-29) does not touch this call.
+    if dev.dxvk.present_frame_gate(timeout_us, PRESENT_ORDER_COMPLETE) {
         0
     } else {
         1

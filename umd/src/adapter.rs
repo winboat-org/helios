@@ -216,6 +216,12 @@ unsafe fn open_adapter_common(
     log_self_module_path();
     log_knob_inventory();
 
+    // D4a scanout acquire: `pfnEscapeCb`'s first argument is the RUNTIME
+    // adapter handle (PFND3DDDI_ESCAPECB(hAdapter, ..) — the WDK's own
+    // signature), which only ever appears here. Capture it; every open in a
+    // process targets the same Helios adapter.
+    crate::scanout_acquire::note_runtime_adapter(open.hRTAdapter.handle);
+
     open.hAdapter = ddi::D3D10DDI_HADAPTER {
         pDrvPrivate: core::ptr::addr_of!(ADAPTER_TOKEN) as *mut c_void,
     };
@@ -481,6 +487,22 @@ unsafe extern "C" fn create_device(
     // Record it live for `helios_umd_wait_last_present`, which dereferences a
     // device pointer the ICD recorded on an earlier call (R415).
     forward::register_live_device(create.hDrvDevice.pDrvPrivate as usize);
+
+    // D4a scanout acquire (FIX-DESIGN-d4a.md §4): probe the KMD read-ledger
+    // capability, map the ledger, register this device's retirement event, and
+    // hand the event to the DXVK device's signaler thread. Deliberately after
+    // defuse(): every failure inside degrades to "feature off for this
+    // device" (logged + counted) and never unwinds device creation, so the
+    // rollback guard needs no acquire knowledge. Knob off = no calls at all.
+    unsafe {
+        let dev = &mut *(create.hDrvDevice.pDrvPrivate as *mut device_funcs::HeliosDevice);
+        let event = crate::scanout_acquire::init_for_device(dev);
+        if event != 0 {
+            // The UMD keeps ownership of the handle; DestroyDevice closes it
+            // only after the bridge (and with it the DXVK signaler) is gone.
+            dev.dxvk.set_scanout_acquire_event(event);
+        }
+    }
 
     if std::env::var_os("HELIOS_DXGI_NO_REDIRECTION").is_some() {
         log_error!(

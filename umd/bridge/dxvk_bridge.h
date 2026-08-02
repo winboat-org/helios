@@ -15,6 +15,12 @@
 // Owns the DXVK Rc<DxvkInstance/Adapter/Device>; defined in dxvk_bridge.cpp.
 struct HeliosDxvkDeviceImpl;
 
+// `order_mode` of HeliosDxvkDevice::present_frame_gate. The values are the
+// `HKLM\SOFTWARE\Helios!PresentOrder` registry values, spelled here so the
+// wire meaning of the knob lives beside the code that branches on it.
+inline constexpr std::uint32_t kPresentOrderComplete = 0;
+inline constexpr std::uint32_t kPresentOrderSubmitted = 1;
+
 struct HeliosDxvkDevice {
   HeliosDxvkDevice() noexcept;
   ~HeliosDxvkDevice();
@@ -111,11 +117,38 @@ struct HeliosDxvkDevice {
       const std::size_t* d3d11_resource_ptrs,
       std::size_t count) const;
 
-  // Present-path frame-completion gate: bounded wait until the current
-  // flush's submission completes on the GPU (see
-  // D3D11ImmediateContext::HeliosWaitFrameComplete). Returns true when the
-  // frame completed within the timeout, false on timeout/error.
-  bool present_frame_gate(std::uint32_t timeout_us) const;
+  // Cross-process present ordering, PRODUCER side. Records a signal on this
+  // device's named present timeline at the presented frame's GPU completion and
+  // publishes (resid -> pid, fenceId, value), so a consumer compositing this
+  // surface waits on the GPU instead of us blocking the CPU here. Call once per
+  // present, BEFORE the gate, with the presented source resource.
+  //
+  // Returns false when the present could not be published, which means any
+  // consumer read of that surface is unordered; every such path is counted and
+  // logged rather than silently degrading.
+  bool publish_present_order(std::size_t d3d11_resource_ptr) const;
+
+  // D4a scanout acquire: hand the per-device KMD read-retirement event to the
+  // DXVK device's signaler thread (DxvkHeliosScanoutAcquire). `event_handle`
+  // is a usermode auto-reset event HANDLE as a machine word, never 0. The UMD
+  // keeps ownership of the handle and closes it in DestroyDevice only after
+  // this bridge device has dropped — the signaler joins inside ~DxvkDevice, so
+  // the handle always outlives its last waiter. Returns false if no live DXVK
+  // device.
+  bool set_scanout_acquire_event(std::size_t event_handle) const noexcept;
+
+  // Present-path ordering gate. `order_mode` selects WHAT is waited for:
+  //
+  //   kPresentOrderSubmitted — wait until the frame's Venus work has reached
+  //     vkQueueSubmit (D3D11ImmediateContext::HeliosWaitFrameSubmitted). This
+  //     is the KMD's actual requirement: pfnRenderCb then samples a watermark
+  //     that covers the frame. `timeout_us` is unused; the wait is on guest CPU
+  //     threads only and always reports true.
+  //   kPresentOrderComplete — additionally wait, bounded by `timeout_us`, for
+  //     the GPU to finish it (HeliosWaitFrameComplete). Returns false on
+  //     timeout/error, and a timeout means the present is published with work
+  //     still outstanding — the stale-frame window this gate exists to close.
+  bool present_frame_gate(std::uint32_t timeout_us, std::uint32_t order_mode) const;
 
   // Dcomp present vehicle (road 4 unit 2): record an image-level copy of the
   // imported ICD frame (src) into the vehicle backbuffer texture (dst) on
@@ -128,6 +161,22 @@ struct HeliosDxvkDevice {
   // mismatch, negative on failure — the caller must fail the present loudly
   // rather than flip a stale backbuffer.
   std::int32_t present_vehicle_copy(
+      std::size_t dst_resource_ptr,
+      std::size_t src_resource_ptr) const;
+
+  // D4b snapshot ring: record an image-level copy of the presented primary
+  // (src) into a snapshot-ring image (dst) on the open command list, BEFORE
+  // the present-time Flush, so the copy rides frame N's own command stream —
+  // ordered after the frame's draws and before anything of frame N+1 by queue
+  // order alone (no waits, no stalls). Unlike present_vehicle_copy there is no
+  // staging-alias substitution: both operands are this device's own DXVK
+  // images (the source is never an import), so the copy-time consumer
+  // present-wait no-ops and the full-extent OPTIMAL->OPTIMAL same-format copy
+  // takes DxvkContext::copyImageHw. Returns 0 on success, 1 on a (copied,
+  // loud) geometry mismatch — the caller must then SKIP the descriptor
+  // substitution (a partially-filled snapshot must never be bound) — and
+  // negative on failure, where the caller presents exactly as today.
+  std::int32_t present_snapshot_copy(
       std::size_t dst_resource_ptr,
       std::size_t src_resource_ptr) const;
 

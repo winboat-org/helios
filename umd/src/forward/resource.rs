@@ -578,6 +578,10 @@ pub(crate) unsafe fn finish_wddm_tex2d(
             pitch: geometry.pitch.get(),
             dxgi_format: a.Format as u32,
             reserved: HELIOS_PRESENT_PRIVATE_FLAG_DIRECT_SCANOUT,
+            // Meaningful only under FLAG_SNAPSHOT (D4b), which the per-present
+            // substitution sets on its OWNED LOCAL copy; a non-snapshot mint
+            // carries 0 by the wire contract (protocol/src/wddm.rs).
+            venus_alloc_size: 0,
         },
         _ => empty_present_private(),
     };
