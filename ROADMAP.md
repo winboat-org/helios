@@ -1237,12 +1237,17 @@ registered in advance (`PREDICTIONS.md`) and scored.
 - **SHIPPING STATE: 22.22.225.0**, all knobs at code defaults; kill
   switches `ScanoutSnapshot=0` / `ScanoutAcquire=0` / `DispatchBind=0` /
   `DisplayHalf=0`.
-- **NEXT FOCUS: PERFORMANCE (WS2)** — Fire Strike Graphics 43k → 70k+ at
-  400 W (600 W changed nothing ⇒ the GPU is underutilized, hunt the
-  bubbles), Combined → 10k+. Handoff:
-  **`tmp/handoff-perf-saturation/HANDOFF.md`** (attribution-first charter,
-  the R6/R7 lever space, the canonical-run problem, gates that keep the
-  0ab close from regressing).
+- **NEXT FOCUS: PERFORMANCE (WS2) — the STRUCTURAL bottleneck** — Fire
+  Strike Graphics 43k → 70k+, Combined → 10k+. Handoff:
+  **`tmp/handoff-perf-structural/HANDOFF.md`** (owner: one structural
+  point, not micro-levers; Steel Nomad Vulkan is only ~10 % off native ⇒
+  the shared ICD/venus/KMD substrate is exonerated, the gap is
+  D3D11-side; prime suspect THREADING caps = 0 / R812 command-list stubs
+  ⇒ runtime replays emulated command lists on the render thread — verify
+  via a worker-thread sample BEFORE building). Supersedes
+  `tmp/handoff-perf-saturation/HANDOFF.md` (its attribution + lever
+  outcomes stand in `tmp/handoff-perf-saturation/reports/
+  p1-attribution.md`).
 
 ## Workstream 1 — Stability
 
