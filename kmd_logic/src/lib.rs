@@ -1879,3 +1879,1616 @@ mod sorted_splice_tests {
         assert_eq!(sorted_splice_range(&keys, 100, 200), (2, 0));
     }
 }
+
+/// Scan-out presentation-epoch ownership — the display-consumer half of
+/// "when may Windows have this allocation back?" (ROADMAP defect 0ab-B).
+///
+/// # The invariant
+///
+/// A Helios scan-out is **not** a continuous scan-out. The host reads the bound
+/// DMA-BUF exactly once per `RESOURCE_FLUSH` and at no other time, so a
+/// presented buffer must be immutable from the moment it is published to the
+/// host until that read has finished. Windows knows nothing about that read: it
+/// retires a flip on the driver's own completion notifications and then hands
+/// the buffer back to DXGI, which hands it to the app, which clears it to
+/// opaque black for its next frame — while the host has still not read it. That
+/// is the entirely-black published frame.
+///
+/// So a presentation may be released only when BOTH halves hold:
+///
+/// ```text
+/// reuse_safe(epoch) = producer_venus_work_retired(epoch)
+///                     AND host_reader_lease_ended(epoch)
+/// ```
+///
+/// The producer half already exists (`VirtioGpu::note_wddm_submission`'s wire-
+/// fence watermark). This module is the second half.
+///
+/// # The state machine
+///
+/// * Every presentation of a buffer to the host mints a **monotonically
+///   increasing epoch**. Re-presenting a still-bound buffer mints a NEW epoch:
+///   the app wrote it again, so it needs to be read again. A bind generation
+///   would collapse those and is therefore not enough.
+/// * `bound_epoch` is the epoch whose buffer the host is bound to right now. It
+///   advances only when the display worker has actually published the binding
+///   (a completed `SET_SCANOUT_BLOB`, or an already-bound re-present).
+/// * A `RESOURCE_FLUSH` issued while `bound_epoch == E` proves, when its
+///   response returns, that the host has read the buffer of epoch `E` — and, by
+///   monotonicity, of every epoch below it. That is [`LeaseTracker::issue_flush`]
+///   / [`LeaseTracker::complete_flush`], and the snapshot `E` is the typed token
+///   the transport carries on the in-flight entry.
+/// * `read_epoch` is the watermark: every epoch `<= read_epoch` has ended its
+///   lease. It only ever moves forward ([`merge_read_epoch`]), so a completion
+///   that arrives out of order is inert rather than corrupting.
+/// * A successful bind of a DIFFERENT resource ends every older epoch's lease
+///   without a read. The virtio control queue is strictly FIFO host-side, so a
+///   returned `SET_SCANOUT_BLOB` proves every earlier-enqueued flush already
+///   completed, and a flush enqueued later cannot read a resource that is no
+///   longer the scan-out. **A completed bind is not a completed read** — it is a
+///   proof that no read remains, which is a different (and weaker) statement,
+///   and it is why this is the escape hatch and not the primary terminator.
+/// * Failure, cancellation and teardown end leases explicitly and loudly. There
+///   is deliberately NO timeout: a lease is never released on the theory that
+///   the read has probably finished by now.
+///
+/// # Why the shipped driver mirrors this with atomics
+///
+/// The three edges run under three different locks: the mint is on the
+/// `DxgkDdiSubmitCommand` DISPATCH path, the bind and the flush issue are on the
+/// PASSIVE display worker under `scanout_mutex`, and the flush completion is in
+/// the used-ring drain under `virtio_lock` — which may not take
+/// `wddm_notify_lock`, because the established order is the reverse and
+/// inverting it is a DIRQL deadlock. Every transition here is monotone, so the
+/// KMD implements them as `fetch_add` / `fetch_max` on `AdapterContext` atomics
+/// and calls the SAME predicates below.
+///
+/// # ⚠ WHAT 22.22.217.0 RETIRED, and what it kept
+///
+/// The **withholding** half above — holding `DXGK_INTERRUPT_DMA_COMPLETED` and
+/// the CRTC_VSYNC primary address until the presentation's read finished — was
+/// built, shipped and MEASURED INERT against the defect: a 2×2 lease ×
+/// `BindFlushMode` factorial over 46 681 frames moved whole-flush black by
+/// nothing in any cell (14.5–16.6 % everywhere). The reason is structural and is
+/// now proven: the app's clear of a reclaimed buffer never travels in a WDDM DMA
+/// buffer, so no completion-notification policy can order it. The driver
+/// therefore gates a WDDM submission on its Venus watermark alone again.
+///
+/// The **epochs** are kept and are load-bearing for the replacement fix: the
+/// ownership gate on the flush executor ([`surplus_republish`]), which refuses to
+/// re-read a binding generation that has already been published while a newer
+/// presentation is outstanding. So [`next_epoch`], [`merge_read_epoch`] and
+/// [`lease_satisfied`] are shipped predicates; [`LeaseTracker`]'s FIFO/pending-
+/// primary machinery below is the specification of the RETIRED withholding, kept
+/// as the record of what was measured — it is no longer a model of shipped code.
+/// Every item that models only the retired half says so on its own doc line.
+pub mod scanout_lease {
+    /// "This submission is not gated on any host read." Used for paging
+    /// buffers, render submissions, and every flip that carries no scan-out
+    /// presentation (the MMIO/`FlipOnVSyncMmIo` desktop path).
+    pub const NO_LEASE: u64 = 0;
+
+    /// The first epoch a tracker mints. Epoch 0 is reserved for [`NO_LEASE`].
+    pub const FIRST_EPOCH: u64 = 1;
+
+    /// Mint the epoch after `previous`.
+    ///
+    /// Saturating: at `u64::MAX` the counter stops instead of wrapping to 0,
+    /// because a wrap to 0 would read as [`NO_LEASE`] and silently ungate every
+    /// flip. At 200 presentations per second that bound is ~2.9 billion years
+    /// away, so the saturation arm exists to make the failure shape *stuck*
+    /// rather than *unsafe*.
+    pub const fn next_epoch(previous: u64) -> u64 {
+        if previous == u64::MAX {
+            u64::MAX
+        } else {
+            previous + 1
+        }
+    }
+
+    /// Whether a submission whose display-consumer requirement is `lease` may be
+    /// released to Windows.
+    pub const fn lease_satisfied(read_epoch: u64, lease: u64) -> bool {
+        lease == NO_LEASE || read_epoch >= lease
+    }
+
+    /// Monotone merge of a new lease-end watermark into the current one.
+    pub const fn merge_read_epoch(current: u64, candidate: u64) -> u64 {
+        if candidate > current {
+            candidate
+        } else {
+            current
+        }
+    }
+
+    /// THE OWNERSHIP GATE (ROADMAP defect 0ab-B, D2). Whether a `RESOURCE_FLUSH`
+    /// issued right now would be a SURPLUS re-read of the current binding.
+    ///
+    /// True means: the generation the host is bound to has already been
+    /// published (a flush token covering `bound_epoch` completed) AND a newer
+    /// presentation has been minted. The successor's own bind edge owns the next
+    /// publish, so re-reading now cannot show the newer frame — it can only
+    /// re-read a buffer the app may already have reclaimed and cleared, which is
+    /// a manufactured black frame (measured: surplus refresh flushes were ~30 %
+    /// of publishes at 43.4 % black, against 2.6 % for first reads).
+    ///
+    /// `tracked` is the third operand and it is not optional. It says the
+    /// CURRENT binding was published with an epoch at all. The MMIO /
+    /// `FlipOnVSyncMmIo` desktop contract mints no presentations, so on it
+    /// `present_epoch` is frozen at whatever the last DMA-flip app left behind:
+    /// a stale `present_epoch > bound_epoch` would then hold forever and drop
+    /// every desktop refresh — a frozen desktop, defect 0aa. With `tracked`
+    /// false the gate is off and the flush path behaves exactly as it did.
+    ///
+    /// The three passing cases, stated so a future edit cannot lose them:
+    /// * a first publish passes (`read_epoch < bound_epoch`);
+    /// * an idle desktop re-publish passes (`present == bound <= read`);
+    /// * a same-buffer re-present passes, because it mints AND publishes a fresh
+    ///   epoch, so `read_epoch < bound_epoch` again at the marker's fire time.
+    pub const fn surplus_republish(
+        tracked: bool,
+        read_epoch: u64,
+        bound_epoch: u64,
+        present_epoch: u64,
+    ) -> bool {
+        tracked
+            && bound_epoch != NO_LEASE
+            && lease_satisfied(read_epoch, bound_epoch)
+            && present_epoch > bound_epoch
+    }
+
+    /// Whether `fence` is FORWARD of `last` in the WDDM `SubmissionFenceId`
+    /// sequence, which wraps at `u32::MAX`.
+    ///
+    /// dxgkrnl treats a `SubmissionFenceId` as a watermark and requires
+    /// monotonic completion, so a fence that is equal to or behind the last
+    /// completed one must be dropped rather than re-signalled. Extracted from
+    /// `submit_command::signal_dma_completed` so the wrap arithmetic has a host
+    /// test; that function calls this.
+    pub const fn fence_is_forward(last: u32, fence: u32) -> bool {
+        fence != last && fence.wrapping_sub(last) < 0x8000_0000
+    }
+
+    /// Why a presentation epoch's host-reader lease ended.
+    ///
+    /// Every variant is counted separately by the driver: a fix that "works"
+    /// because every lease ends as `Cancelled` is not working, and the only way
+    /// to see that is to never merge the reasons.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub enum LeaseEnd {
+        /// The exact `RESOURCE_FLUSH` covering this epoch returned. The healthy
+        /// steady-state reason, and the only one that means "the host has the
+        /// pixels".
+        HostRead,
+        /// A later successful `SET_SCANOUT_BLOB` bound a different resource, so
+        /// no read of this epoch remains or can be queued.
+        Superseded,
+        /// The flush could not be enqueued, the host answered with an error, or
+        /// the allocation was retired. The command has terminated; no future
+        /// read from it exists.
+        Cancelled,
+        /// Transport failure, preemption/TDR epoch, reset or StopDevice.
+        Teardown,
+    }
+
+    /// Unsampled per-reason tallies. Mirrored into the service key as the `Ls*`
+    /// values.
+    #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+    pub struct LeaseCounters {
+        /// Presentation epochs minted.
+        pub minted: u32,
+        /// `RESOURCE_FLUSH` reads queued with a lease token.
+        pub read_queued: u32,
+        /// Read tokens completed (success or host error).
+        pub read_completed: u32,
+        /// Epochs ended by [`LeaseEnd::HostRead`].
+        pub ended_read: u32,
+        /// Epochs ended by [`LeaseEnd::Superseded`] — a binding that never got
+        /// its own read.
+        pub ended_superseded: u32,
+        /// Epochs ended by [`LeaseEnd::Cancelled`].
+        pub ended_cancelled: u32,
+        /// Epochs ended by [`LeaseEnd::Teardown`].
+        pub ended_teardown: u32,
+        /// Completions whose token was at or behind the watermark: coalesced,
+        /// duplicated or reordered. Inert, but counted — a large value means the
+        /// flush path is issuing reads nobody is waiting for.
+        pub stale_completions: u32,
+        /// Retirement attempts refused because the lease was still open.
+        pub retire_blocked: u32,
+        /// Retirement attempts allowed by a satisfied lease.
+        pub retire_released: u32,
+        /// Deferred primary addresses actually published to the VSync path.
+        pub primary_published: u32,
+        /// Bounded-state exhaustion: pending flips dropped because the FIFO was
+        /// full. Practically unreachable; loud if it ever is not.
+        pub overflow: u32,
+    }
+
+    /// Capacity of [`LeaseTracker`]'s model FIFO.
+    ///
+    /// The shipped driver's queue is `VecDeque<WddmPending>` with
+    /// `MAX_WDDM_PENDING = 256`; the model uses a small fixed array so the
+    /// exhaustion path is reachable in a test. What is under test is the RULE
+    /// (head-of-line blocking, monotonic delivery, overflow clears the queue and
+    /// releases every lease), not the number.
+    pub const MODEL_FIFO_LEN: usize = 8;
+
+    /// One pending WDDM submission in the model FIFO.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub struct PendingFlip {
+        /// `DXGKARG_SUBMITCOMMAND::SubmissionFenceId`.
+        pub fence: u32,
+        /// Producer half: this submission's Venus completion watermark, already
+        /// satisfied when `true`.
+        pub producer_ready: bool,
+        /// Display-consumer half: the presentation epoch whose host read must
+        /// finish first, or [`NO_LEASE`].
+        ///
+        /// ⚠ RETIRED IN THE DRIVER (22.22.217.0): the shipped FIFO carries no
+        /// lease any more. See the module's "what 22.22.217.0 retired" note.
+        pub lease: u64,
+    }
+
+    /// What one attempt to retire the head of the FIFO produced.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub enum RetireStep {
+        /// Nothing queued.
+        Empty,
+        /// The head's producer work has not retired yet.
+        BlockedOnProducer,
+        /// The head's producer work is done but the host has not finished
+        /// reading the presentation named by `lease`.
+        ///
+        /// ⚠ RETIRED IN THE DRIVER (22.22.217.0) — `WddmTake` has no such arm.
+        BlockedOnLease(u64),
+        /// Deliver `DXGK_INTERRUPT_DMA_COMPLETED` for this fence.
+        Ready(u32),
+    }
+
+    /// The executable specification of the ownership state machine.
+    ///
+    /// Single-threaded and lock-free by construction: the shipped driver splits
+    /// these fields across three locks and reproduces each transition with a
+    /// monotone atomic, calling the same free functions above.
+    #[derive(Clone, Copy, Debug)]
+    pub struct LeaseTracker {
+        next_epoch: u64,
+        bound_epoch: u64,
+        bound_resource: u32,
+        read_epoch: u64,
+        /// The primary address armed at the bind, waiting for its epoch's lease
+        /// to end before a CRTC_VSYNC may report it.
+        pending_primary: Option<(u64, u64)>,
+        /// The address the VSync heartbeat currently reports.
+        displayed_primary: u64,
+        fifo: [Option<PendingFlip>; MODEL_FIFO_LEN],
+        fifo_len: usize,
+        /// Last fence handed to Windows; the monotonicity check's left operand.
+        last_completed_fence: u32,
+        counters: LeaseCounters,
+    }
+
+    impl Default for LeaseTracker {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl LeaseTracker {
+        pub const fn new() -> Self {
+            Self {
+                next_epoch: FIRST_EPOCH,
+                bound_epoch: NO_LEASE,
+                bound_resource: 0,
+                read_epoch: NO_LEASE,
+                pending_primary: None,
+                displayed_primary: 0,
+                fifo: [None; MODEL_FIFO_LEN],
+                fifo_len: 0,
+                last_completed_fence: 0,
+                counters: LeaseCounters {
+                    minted: 0,
+                    read_queued: 0,
+                    read_completed: 0,
+                    ended_read: 0,
+                    ended_superseded: 0,
+                    ended_cancelled: 0,
+                    ended_teardown: 0,
+                    stale_completions: 0,
+                    retire_blocked: 0,
+                    retire_released: 0,
+                    primary_published: 0,
+                    overflow: 0,
+                },
+            }
+        }
+
+        pub const fn counters(&self) -> LeaseCounters {
+            self.counters
+        }
+
+        pub const fn read_epoch(&self) -> u64 {
+            self.read_epoch
+        }
+
+        pub const fn bound_epoch(&self) -> u64 {
+            self.bound_epoch
+        }
+
+        pub const fn displayed_primary(&self) -> u64 {
+            self.displayed_primary
+        }
+
+        pub const fn pending_len(&self) -> usize {
+            self.fifo_len
+        }
+
+        /// Mint the epoch for one presentation. `DxgkDdiSubmitCommand`'s
+        /// DMA-flip arm, before the flip's handle is published to the worker.
+        pub fn mint_presentation(&mut self) -> u64 {
+            let epoch = self.next_epoch;
+            self.next_epoch = next_epoch(self.next_epoch);
+            self.counters.minted = self.counters.minted.saturating_add(1);
+            epoch
+        }
+
+        /// The display worker published `epoch`'s buffer to the host.
+        ///
+        /// `rebound` is true when this call issued a `SET_SCANOUT_BLOB` (the
+        /// resource changed); false for a re-present of the already-bound
+        /// buffer, which publishes nothing to the host but is still a new
+        /// presentation that has to be read.
+        pub fn publish_bind(&mut self, epoch: u64, resource: u32, rebound: bool) {
+            if epoch == NO_LEASE {
+                return;
+            }
+            if rebound && resource != self.bound_resource && self.bound_epoch != NO_LEASE {
+                // Everything published before this bind can no longer be read.
+                self.end_leases_through(self.bound_epoch, LeaseEnd::Superseded);
+            }
+            self.bound_epoch = merge_read_epoch(self.bound_epoch, epoch);
+            self.bound_resource = resource;
+        }
+
+        /// Arm the primary address a later CRTC_VSYNC may report, gated on
+        /// `epoch`'s lease. Publishes immediately when the lease has already
+        /// ended.
+        ///
+        /// ⚠ RETIRED IN THE DRIVER (22.22.217.0): the bind publishes the
+        /// address unconditionally now. Kept as the record of the withholding
+        /// that was measured inert.
+        pub fn arm_primary(&mut self, address: u64, epoch: u64) {
+            if epoch == NO_LEASE || lease_satisfied(self.read_epoch, epoch) {
+                self.displayed_primary = address;
+                self.counters.primary_published = self.counters.primary_published.saturating_add(1);
+                return;
+            }
+            self.pending_primary = Some((address, epoch));
+        }
+
+        /// Snapshot the epoch a `RESOURCE_FLUSH` issued now will prove was read.
+        pub fn issue_flush(&mut self) -> u64 {
+            self.counters.read_queued = self.counters.read_queued.saturating_add(1);
+            self.bound_epoch
+        }
+
+        /// A flush token came back. `ok` is false for a host error response,
+        /// which still terminates the command — it just does not mean the pixels
+        /// were published.
+        pub fn complete_flush(&mut self, covers: u64, ok: bool) {
+            self.counters.read_completed = self.counters.read_completed.saturating_add(1);
+            let reason = if ok {
+                LeaseEnd::HostRead
+            } else {
+                LeaseEnd::Cancelled
+            };
+            if covers == NO_LEASE || covers <= self.read_epoch {
+                self.counters.stale_completions = self.counters.stale_completions.saturating_add(1);
+                return;
+            }
+            self.end_leases_through(covers, reason);
+        }
+
+        /// End every lease at or below `epoch`, for `reason`.
+        pub fn end_leases_through(&mut self, epoch: u64, reason: LeaseEnd) {
+            let merged = merge_read_epoch(self.read_epoch, epoch);
+            if merged == self.read_epoch {
+                return;
+            }
+            self.read_epoch = merged;
+            let slot = match reason {
+                LeaseEnd::HostRead => &mut self.counters.ended_read,
+                LeaseEnd::Superseded => &mut self.counters.ended_superseded,
+                LeaseEnd::Cancelled => &mut self.counters.ended_cancelled,
+                LeaseEnd::Teardown => &mut self.counters.ended_teardown,
+            };
+            *slot = slot.saturating_add(1);
+            self.publish_pending_primary();
+        }
+
+        /// End every lease that has ever been minted. Reset, StopDevice,
+        /// transport failure, allocation retirement.
+        pub fn release_all(&mut self, reason: LeaseEnd) {
+            let highest = self.next_epoch.saturating_sub(1);
+            self.end_leases_through(highest, reason);
+        }
+
+        fn publish_pending_primary(&mut self) {
+            let Some((address, epoch)) = self.pending_primary else {
+                return;
+            };
+            if !lease_satisfied(self.read_epoch, epoch) {
+                return;
+            }
+            self.pending_primary = None;
+            self.displayed_primary = address;
+            self.counters.primary_published = self.counters.primary_published.saturating_add(1);
+        }
+
+        /// Queue one WDDM submission. Returns true when the caller must signal
+        /// `DMA_COMPLETED` immediately (nothing gates it, or the FIFO overflowed
+        /// and degraded to the immediate model).
+        pub fn submit(&mut self, flip: PendingFlip) -> bool {
+            if self.fifo_len == 0
+                && flip.producer_ready
+                && lease_satisfied(self.read_epoch, flip.lease)
+            {
+                self.counters.retire_released = self.counters.retire_released.saturating_add(1);
+                self.last_completed_fence = flip.fence;
+                return true;
+            }
+            if self.fifo_len == MODEL_FIFO_LEN {
+                // Signalling the newest (monotonically largest) fence implicitly
+                // completes the queued older ones, so drop them — and release
+                // every lease with them, or the next presentation would be gated
+                // on a read whose waiter no longer exists.
+                self.counters.overflow = self.counters.overflow.saturating_add(1);
+                self.fifo = [None; MODEL_FIFO_LEN];
+                self.fifo_len = 0;
+                self.release_all(LeaseEnd::Teardown);
+                self.last_completed_fence = flip.fence;
+                return true;
+            }
+            self.fifo[self.fifo_len] = Some(flip);
+            self.fifo_len += 1;
+            false
+        }
+
+        /// Try to retire the head of the FIFO. Strictly head-of-line: a blocked
+        /// head is never bypassed, because `SubmissionFenceId`s are watermarks
+        /// to dxgkrnl and must complete monotonically.
+        pub fn try_retire(&mut self) -> RetireStep {
+            let Some(head) = self.fifo[0] else {
+                return RetireStep::Empty;
+            };
+            if !head.producer_ready {
+                return RetireStep::BlockedOnProducer;
+            }
+            if !lease_satisfied(self.read_epoch, head.lease) {
+                self.counters.retire_blocked = self.counters.retire_blocked.saturating_add(1);
+                return RetireStep::BlockedOnLease(head.lease);
+            }
+            let mut i = 1;
+            while i < self.fifo_len {
+                self.fifo[i - 1] = self.fifo[i];
+                i += 1;
+            }
+            self.fifo[self.fifo_len - 1] = None;
+            self.fifo_len -= 1;
+            self.counters.retire_released = self.counters.retire_released.saturating_add(1);
+            if fence_is_forward(self.last_completed_fence, head.fence) {
+                self.last_completed_fence = head.fence;
+            }
+            RetireStep::Ready(head.fence)
+        }
+
+        /// Mark the producer half of the submission carrying `fence` retired.
+        pub fn producer_retired(&mut self, fence: u32) {
+            let mut i = 0;
+            while i < self.fifo_len {
+                if let Some(entry) = self.fifo[i].as_mut() {
+                    if entry.fence == fence {
+                        entry.producer_ready = true;
+                    }
+                }
+                i += 1;
+            }
+        }
+
+        /// Drop every pending submission (preempt / ResetFromTimeout / reset)
+        /// and end every lease with it.
+        pub fn abandon(&mut self) -> usize {
+            let dropped = self.fifo_len;
+            self.fifo = [None; MODEL_FIFO_LEN];
+            self.fifo_len = 0;
+            self.release_all(LeaseEnd::Teardown);
+            dropped
+        }
+
+        pub const fn last_completed_fence(&self) -> u32 {
+            self.last_completed_fence
+        }
+    }
+}
+
+#[cfg(test)]
+mod scanout_lease_tests {
+    use super::scanout_lease::*;
+
+    /// Drive one steady-state presentation: mint, bind, flush, response.
+    fn present(tracker: &mut LeaseTracker, resource: u32, rebound: bool, fence: u32) -> u64 {
+        let epoch = tracker.mint_presentation();
+        tracker.submit(PendingFlip {
+            fence,
+            producer_ready: false,
+            lease: epoch,
+        });
+        tracker.publish_bind(epoch, resource, rebound);
+        epoch
+    }
+
+    // 1. normal bind -> flush queued -> response -> reuse
+    #[test]
+    fn normal_bind_flush_response_releases_the_flip() {
+        let mut t = LeaseTracker::new();
+        let epoch = present(&mut t, 191, true, 10);
+        t.producer_retired(10);
+        assert_eq!(t.try_retire(), RetireStep::BlockedOnLease(epoch));
+
+        let token = t.issue_flush();
+        assert_eq!(token, epoch);
+        t.complete_flush(token, true);
+        assert_eq!(t.try_retire(), RetireStep::Ready(10));
+        assert_eq!(t.counters().ended_read, 1);
+        assert_eq!(t.counters().ended_superseded, 0);
+    }
+
+    // 2. producer completion before reader completion
+    #[test]
+    fn producer_first_still_waits_for_the_reader() {
+        let mut t = LeaseTracker::new();
+        let epoch = present(&mut t, 191, true, 10);
+        t.producer_retired(10);
+        for _ in 0..4 {
+            assert_eq!(t.try_retire(), RetireStep::BlockedOnLease(epoch));
+        }
+        let token = t.issue_flush();
+        t.complete_flush(token, true);
+        assert_eq!(t.try_retire(), RetireStep::Ready(10));
+        assert_eq!(t.counters().retire_blocked, 4);
+    }
+
+    // 3. reader completion before producer completion
+    #[test]
+    fn reader_first_still_waits_for_the_producer() {
+        let mut t = LeaseTracker::new();
+        present(&mut t, 191, true, 10);
+        let token = t.issue_flush();
+        t.complete_flush(token, true);
+        assert_eq!(t.try_retire(), RetireStep::BlockedOnProducer);
+        t.producer_retired(10);
+        assert_eq!(t.try_retire(), RetireStep::Ready(10));
+    }
+
+    // 4. later bind supersedes an epoch that never got a read
+    #[test]
+    fn a_later_bind_supersedes_an_unread_epoch() {
+        let mut t = LeaseTracker::new();
+        let first = present(&mut t, 191, true, 10);
+        t.producer_retired(10);
+        assert_eq!(t.try_retire(), RetireStep::BlockedOnLease(first));
+
+        // No flush ever named `first`; the next flip binds the other buffer.
+        let second = present(&mut t, 195, true, 11);
+        t.producer_retired(11);
+        assert_eq!(t.try_retire(), RetireStep::Ready(10));
+        assert_eq!(t.try_retire(), RetireStep::BlockedOnLease(second));
+        assert_eq!(t.counters().ended_superseded, 1);
+        assert_eq!(t.counters().ended_read, 0);
+    }
+
+    // 5. later bind after a read was already queued for the previous epoch
+    #[test]
+    fn a_queued_read_and_a_later_bind_agree() {
+        let mut t = LeaseTracker::new();
+        let first = present(&mut t, 191, true, 10);
+        let token = t.issue_flush();
+        assert_eq!(token, first);
+
+        let second = present(&mut t, 195, true, 11);
+        // The bind superseded `first` before its response came back...
+        assert!(lease_satisfied(t.read_epoch(), first));
+        // ...and the late response is then inert, not a backwards step.
+        t.complete_flush(token, true);
+        assert_eq!(t.counters().stale_completions, 1);
+        assert!(!lease_satisfied(t.read_epoch(), second));
+    }
+
+    // 6. repeated presentations of the same still-bound resource
+    #[test]
+    fn repeated_presents_of_one_buffer_get_distinct_epochs() {
+        let mut t = LeaseTracker::new();
+        let a = present(&mut t, 191, true, 10);
+        let b = present(&mut t, 191, false, 11);
+        let c = present(&mut t, 191, false, 12);
+        assert!(a < b && b < c);
+        t.producer_retired(10);
+        t.producer_retired(11);
+        t.producer_retired(12);
+
+        // A read taken while `c` is bound covers all three; a read taken when
+        // only `a` had been published covers only `a`.
+        let mut t2 = LeaseTracker::new();
+        let a2 = present(&mut t2, 191, true, 10);
+        let token = t2.issue_flush();
+        let b2 = present(&mut t2, 191, false, 11);
+        t2.producer_retired(10);
+        t2.producer_retired(11);
+        t2.complete_flush(token, true);
+        assert_eq!(t2.try_retire(), RetireStep::Ready(10));
+        assert_eq!(t2.try_retire(), RetireStep::BlockedOnLease(b2));
+        assert!(a2 < b2);
+
+        // No supersede happened: the resource never changed.
+        assert_eq!(t2.counters().ended_superseded, 0);
+    }
+
+    // 7. two resources alternating faster than the host reads
+    #[test]
+    fn two_resources_alternating_never_release_an_unread_epoch() {
+        let mut t = LeaseTracker::new();
+        let mut fence = 100u32;
+        let mut leases = [0u64; 6];
+        for (i, lease) in leases.iter_mut().enumerate() {
+            let resource = if i % 2 == 0 { 191 } else { 195 };
+            *lease = present(&mut t, resource, true, fence);
+            t.producer_retired(fence);
+            fence += 1;
+        }
+        // Every retire is either delivered because a later bind proved no read
+        // remains, or blocked. Nothing is delivered while its own epoch is both
+        // unread and still the bound one.
+        let mut delivered = 0;
+        loop {
+            match t.try_retire() {
+                RetireStep::Ready(_) => delivered += 1,
+                _ => break,
+            }
+        }
+        // The last presentation is still bound and unread, so it must be held.
+        assert_eq!(delivered, leases.len() - 1);
+        assert_eq!(t.try_retire(), RetireStep::BlockedOnLease(leases[5]));
+        assert!(!lease_satisfied(t.read_epoch(), leases[5]));
+    }
+
+    // 8. coalesced refreshes
+    #[test]
+    fn one_read_covers_every_epoch_published_before_it() {
+        let mut t = LeaseTracker::new();
+        let e1 = present(&mut t, 191, true, 10);
+        let e2 = present(&mut t, 191, false, 11);
+        let e3 = present(&mut t, 191, false, 12);
+        t.producer_retired(10);
+        t.producer_retired(11);
+        t.producer_retired(12);
+        let token = t.issue_flush();
+        assert_eq!(token, e3);
+        t.complete_flush(token, true);
+        assert!(lease_satisfied(t.read_epoch(), e1));
+        assert!(lease_satisfied(t.read_epoch(), e2));
+        assert!(lease_satisfied(t.read_epoch(), e3));
+        assert_eq!(t.try_retire(), RetireStep::Ready(10));
+        assert_eq!(t.try_retire(), RetireStep::Ready(11));
+        assert_eq!(t.try_retire(), RetireStep::Ready(12));
+        assert_eq!(t.counters().read_queued, 1);
+    }
+
+    // 9. stale completion token
+    #[test]
+    fn a_stale_token_never_moves_the_watermark_backwards() {
+        let mut t = LeaseTracker::new();
+        let e1 = present(&mut t, 191, true, 10);
+        let stale = t.issue_flush();
+        let e2 = present(&mut t, 195, true, 11);
+        t.publish_bind(e2, 195, true);
+        let fresh = t.issue_flush();
+        t.complete_flush(fresh, true);
+        let after = t.read_epoch();
+        t.complete_flush(stale, true);
+        assert_eq!(t.read_epoch(), after);
+        assert!(lease_satisfied(t.read_epoch(), e1));
+        assert_eq!(t.counters().stale_completions, 1);
+        // Zero is never a valid token either.
+        t.complete_flush(NO_LEASE, true);
+        assert_eq!(t.read_epoch(), after);
+        assert_eq!(t.counters().stale_completions, 2);
+    }
+
+    // 10. response error and enqueue failure
+    #[test]
+    fn an_error_response_terminates_the_lease_without_claiming_a_publish() {
+        let mut t = LeaseTracker::new();
+        let epoch = present(&mut t, 191, true, 10);
+        t.producer_retired(10);
+        let token = t.issue_flush();
+        t.complete_flush(token, false);
+        assert_eq!(t.try_retire(), RetireStep::Ready(10));
+        assert_eq!(t.counters().ended_cancelled, 1);
+        assert_eq!(t.counters().ended_read, 0);
+        assert!(lease_satisfied(t.read_epoch(), epoch));
+    }
+
+    #[test]
+    fn an_enqueue_failure_cancels_exactly_the_epoch_it_named() {
+        let mut t = LeaseTracker::new();
+        let first = present(&mut t, 191, true, 10);
+        t.producer_retired(10);
+        // The flush could not be enqueued: no host read exists for `first`.
+        let token = t.issue_flush();
+        t.end_leases_through(token, LeaseEnd::Cancelled);
+        assert_eq!(t.try_retire(), RetireStep::Ready(10));
+
+        let second = present(&mut t, 195, true, 11);
+        t.producer_retired(11);
+        // The cancellation released `first` and NOTHING beyond it.
+        assert_eq!(t.try_retire(), RetireStep::BlockedOnLease(second));
+        assert!(first < second);
+        assert_eq!(t.counters().ended_cancelled, 1);
+    }
+
+    // 11. reset / teardown with outstanding leases
+    #[test]
+    fn teardown_releases_every_outstanding_lease() {
+        let mut t = LeaseTracker::new();
+        present(&mut t, 191, true, 10);
+        present(&mut t, 195, true, 11);
+        t.producer_retired(10);
+        t.producer_retired(11);
+        let dropped = t.abandon();
+        assert_eq!(dropped, 2);
+        assert_eq!(t.try_retire(), RetireStep::Empty);
+
+        // A fresh presentation after teardown is gated again, not pre-released.
+        let epoch = present(&mut t, 191, true, 12);
+        t.producer_retired(12);
+        assert_eq!(t.try_retire(), RetireStep::BlockedOnLease(epoch));
+        assert_eq!(t.counters().ended_teardown, 1);
+    }
+
+    // 12. WDDM FIFO monotonicity and fence wrap
+    #[test]
+    fn a_blocked_head_is_never_bypassed() {
+        let mut t = LeaseTracker::new();
+        let first = present(&mut t, 191, true, 10);
+        let second = present(&mut t, 191, false, 11);
+        t.producer_retired(11);
+        // The younger fence is fully ready, but the head is not: no bypass.
+        assert_eq!(t.try_retire(), RetireStep::BlockedOnProducer);
+        t.producer_retired(10);
+        // Still the HEAD's lease that is reported, not the ready younger one.
+        assert_eq!(t.try_retire(), RetireStep::BlockedOnLease(first));
+        assert!(first < second);
+        assert_eq!(t.last_completed_fence(), 0);
+
+        // Releasing the head's lease releases both, in submission order.
+        let token = t.issue_flush();
+        t.complete_flush(token, true);
+        assert_eq!(t.try_retire(), RetireStep::Ready(10));
+        assert_eq!(t.try_retire(), RetireStep::Ready(11));
+        assert_eq!(t.last_completed_fence(), 11);
+    }
+
+    #[test]
+    fn fence_forwardness_survives_the_u32_wrap() {
+        assert!(fence_is_forward(0, 1));
+        assert!(!fence_is_forward(1, 1));
+        assert!(!fence_is_forward(2, 1));
+        // Wrap: 0xFFFF_FFFF -> 0 is forward by one.
+        assert!(fence_is_forward(u32::MAX, 0));
+        assert!(fence_is_forward(u32::MAX - 1, 3));
+        // Half the space away is NOT forward.
+        assert!(!fence_is_forward(0, 0x8000_0000));
+        assert!(fence_is_forward(0, 0x7FFF_FFFF));
+    }
+
+    #[test]
+    fn epoch_minting_saturates_instead_of_wrapping_to_no_lease() {
+        assert_eq!(next_epoch(0), FIRST_EPOCH);
+        assert_eq!(next_epoch(u64::MAX - 1), u64::MAX);
+        assert_eq!(next_epoch(u64::MAX), u64::MAX);
+        assert!(!lease_satisfied(u64::MAX - 1, u64::MAX));
+        assert!(lease_satisfied(u64::MAX, u64::MAX));
+    }
+
+    // 13. bounded-state exhaustion
+    #[test]
+    fn fifo_exhaustion_degrades_loudly_and_releases_every_lease() {
+        let mut t = LeaseTracker::new();
+        let mut fence = 200u32;
+        for _ in 0..MODEL_FIFO_LEN {
+            present(&mut t, 191, false, fence);
+            fence += 1;
+        }
+        assert_eq!(t.pending_len(), MODEL_FIFO_LEN);
+        // One more overflows.
+        let epoch = t.mint_presentation();
+        let signal_now = t.submit(PendingFlip {
+            fence,
+            producer_ready: false,
+            lease: epoch,
+        });
+        assert!(signal_now);
+        assert_eq!(t.pending_len(), 0);
+        assert_eq!(t.counters().overflow, 1);
+        assert!(lease_satisfied(t.read_epoch(), epoch));
+        assert_eq!(t.try_retire(), RetireStep::Empty);
+    }
+
+    // The CRTC_VSYNC edge: the address a VSync may report is gated by the same
+    // lease that gates DMA_COMPLETED.
+    #[test]
+    fn the_displayed_primary_address_waits_for_the_same_lease() {
+        let mut t = LeaseTracker::new();
+        let epoch = present(&mut t, 191, true, 10);
+        t.arm_primary(0xDEAD_0000, epoch);
+        assert_eq!(t.displayed_primary(), 0);
+
+        let token = t.issue_flush();
+        t.complete_flush(token, true);
+        assert_eq!(t.displayed_primary(), 0xDEAD_0000);
+        assert_eq!(t.counters().primary_published, 1);
+    }
+
+    // ── The ownership gate (D2). These are the SHIPPED decisions: the driver's
+    // flush executor calls `surplus_republish` with its three atomics, so a
+    // regression here is a black frame or a frozen desktop, not a model bug.
+
+    #[test]
+    fn the_first_read_of_a_binding_is_never_surplus() {
+        // Bound generation 7 published, nothing read yet.
+        assert!(!surplus_republish(true, 6, 7, 7));
+        assert!(!surplus_republish(true, 6, 7, 9));
+        assert!(!surplus_republish(true, NO_LEASE, 1, 1));
+    }
+
+    #[test]
+    fn a_reread_with_a_newer_presentation_outstanding_is_surplus() {
+        // Generation 7 was read (read >= bound) and flip 8 has been minted:
+        // publishing 7 again cannot show 8, and 7 may already be reclaimed.
+        assert!(surplus_republish(true, 7, 7, 8));
+        assert!(surplus_republish(true, 9, 7, 8));
+    }
+
+    #[test]
+    fn an_idle_desktop_republish_is_never_surplus() {
+        // Nothing newer was presented: this flush IS the freshness edge.
+        assert!(!surplus_republish(true, 7, 7, 7));
+        assert!(!surplus_republish(true, 9, 7, 7));
+    }
+
+    #[test]
+    fn a_same_buffer_represent_passes_because_it_publishes_a_fresh_epoch() {
+        let mut t = LeaseTracker::new();
+        let first = present(&mut t, 191, true, 10);
+        let token = t.issue_flush();
+        t.complete_flush(token, true);
+        // Read caught up with the binding, nothing newer minted: passes.
+        assert!(!surplus_republish(
+            true,
+            t.read_epoch(),
+            t.bound_epoch(),
+            first
+        ));
+        // DWM re-presents the SAME buffer: the epoch is minted AND published,
+        // so the next marker's flush is a first read again.
+        let second = present(&mut t, 191, false, 11);
+        assert_eq!(t.bound_epoch(), second);
+        assert!(!surplus_republish(
+            true,
+            t.read_epoch(),
+            t.bound_epoch(),
+            second
+        ));
+    }
+
+    /// The MMIO/desktop contract mints no presentations, so `present_epoch` is
+    /// frozen at whatever the last DMA-flip app left behind. Without `tracked`
+    /// the gate would then drop every desktop refresh forever — a frozen
+    /// desktop, which is defect 0aa.
+    #[test]
+    fn an_untracked_binding_disables_the_gate_entirely() {
+        assert!(!surplus_republish(false, 7, 7, 8));
+        assert!(!surplus_republish(false, u64::MAX, 1, u64::MAX));
+        // A binding that never published an epoch cannot be gated either.
+        assert!(!surplus_republish(true, 7, NO_LEASE, 8));
+    }
+
+    #[test]
+    fn an_ungated_primary_publishes_immediately() {
+        let mut t = LeaseTracker::new();
+        t.arm_primary(0xBEEF_0000, NO_LEASE);
+        assert_eq!(t.displayed_primary(), 0xBEEF_0000);
+    }
+
+    #[test]
+    fn a_superseded_epoch_still_publishes_its_address() {
+        let mut t = LeaseTracker::new();
+        let first = present(&mut t, 191, true, 10);
+        t.arm_primary(0x1000, first);
+        assert_eq!(t.displayed_primary(), 0);
+        present(&mut t, 195, true, 11);
+        // The supersede ended `first`'s lease, so its address is authoritative
+        // now — the alternative is a heartbeat frozen on the previous address.
+        assert_eq!(t.displayed_primary(), 0x1000);
+    }
+}
+
+pub mod scanout_read_ledger {
+    //! D4a scanout-read acquire: the READ LEDGER slot state machine
+    //! (FIX-DESIGN-d4a.md §3.1/§3.2).
+    //!
+    //! One 4 KiB nonpaged page carries 8 slots of `{resid, issued, retired}`
+    //! that the KMD writes and a user-mode reader consumes: `issued > retired`
+    //! for resid X means a host readback of X is in flight, and the reader arms
+    //! a GPU-side wait on X's reuse. The driver implements every transition
+    //! below with monotone atomics; [`LedgerModel`] is the single-threaded
+    //! executable specification those atomics must agree with, and the free
+    //! functions are the shared decision predicates the driver actually calls.
+    //!
+    //! The load-bearing rules, stated once:
+    //!
+    //! * A slot is keyed by the venus resource id (monotonic within a transport
+    //!   generation, never recycled), claimed by CAS `resid` 0→X, and reclaimed
+    //!   ONLY when `issued == retired` — so a live read pins its slot and a
+    //!   token can never retire into a recycled slot.
+    //! * Reclaim zeroes the counters BEFORE releasing `resid`, so a claimant
+    //!   (which only takes `resid == 0` slots) always inherits `0/0`.
+    //! * Reclaim is arbitrated by the `wanted` token: allocation retire marks
+    //!   it, and whoever wins `take(wanted)` while `issued == retired` — the
+    //!   marker itself or the equalizing read retirement — performs the one
+    //!   reclaim. Two concurrent reclaims of one slot would let a fresh claim's
+    //!   counters be zeroed under it.
+    //! * Every issue is followed by exactly ONE retirement (any outcome —
+    //!   enforced driver-side by the flush token's `Drop`), so
+    //!   `issued == retired` at quiescence is an identity, not a hope.
+
+    /// Slots in the ledger page. Duplicated from
+    /// `helios_protocol::HELIOS_READ_LEDGER_SLOTS` because this crate
+    /// deliberately has no dependency edge; `kmd_render` pins the two together
+    /// with a `const` assertion at the use site.
+    pub const SLOT_COUNT: usize = 8;
+
+    /// "This read claimed no ledger slot" (all 8 were live — counted as
+    /// overflow). A token carrying it bumps nothing at retirement, which is
+    /// what keeps `issued == retired` an identity under overflow.
+    pub const NO_SLOT: u8 = 0xFF;
+
+    /// `resid` value of an unclaimed slot. A real venus resource id is never 0.
+    pub const FREE_RESID: u32 = 0;
+
+    /// THE RECLAIM ARBITRATION. True exactly when the caller both holds the
+    /// `wanted` token (it won the `swap(wanted, false)`) and observes the slot
+    /// quiescent. The two callers are allocation retire (marks `wanted`, then
+    /// tries to take it back) and read retirement (takes it when its bump
+    /// equalizes the counters); at most one of them can have `took_wanted`.
+    pub const fn reclaim_now(issued: u32, retired: u32, took_wanted: bool) -> bool {
+        took_wanted && issued == retired
+    }
+
+    /// The user-mode reader protocol (§3.1): is a read of X in flight?
+    ///
+    /// The reader found a slot whose `resid` was `resid_probe`, read `issued`
+    /// and `retired`, then RE-READ `resid` as `resid_reread`. A changed resid
+    /// means the slot was reclaimed mid-read — and a reclaim implies every read
+    /// of X retired, so the verdict is no-wait. Not called by the KMD; it is
+    /// the executable statement of the contract the UMD half implements.
+    pub const fn reader_in_flight(
+        resid_probe: u32,
+        issued: u32,
+        retired: u32,
+        resid_reread: u32,
+    ) -> bool {
+        resid_probe != FREE_RESID && resid_probe == resid_reread && issued > retired
+    }
+
+    /// One model slot. The driver's counterpart is four atomics: three in the
+    /// mapped page (`resid`, `issued`, `retired`) and one KMD-private
+    /// (`wanted`) — the reader must never see retire-wanted state.
+    #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+    pub struct SlotModel {
+        pub resid: u32,
+        pub issued: u32,
+        pub retired: u32,
+        pub wanted: bool,
+    }
+
+    /// Unsampled tallies, mirrored into the service key as the `Rd*` values.
+    /// NOT zeroed by [`LedgerModel::reset`]: the page is per-transport-
+    /// generation state, the counters are per-boot (StartDevice) state, and an
+    /// orphaned retirement (a token outliving a reset) balances `retired`
+    /// against an `issued` from before the reset ONLY because the two are
+    /// decoupled.
+    #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+    pub struct LedgerCounters {
+        /// Ledger issues (`RdIss`).
+        pub issued: u32,
+        /// Ledger retirements, any outcome (`RdRet`).
+        pub retired: u32,
+        /// Claims refused because all slots were live (`RdOvf`).
+        pub overflow: u32,
+        /// Retirements performed by the token's `Drop` rather than an explicit
+        /// completion (`RdDrp`) — enqueue failure or transport teardown.
+        pub drop_retired: u32,
+        /// Retirements whose slot no longer named the token's resid (`RdOrp`).
+        /// Reachable ONLY when a reset zeroed the ledger with the read in
+        /// flight; any other movement is a bug.
+        pub orphaned: u32,
+    }
+
+    /// The executable specification of the ledger state machine.
+    ///
+    /// Single-threaded by construction. The shipped driver serializes issue and
+    /// allocation-retire under `scanout_mutex`, runs retirement from the token
+    /// at any IRQL, and reproduces each transition here with monotone atomics
+    /// calling [`reclaim_now`].
+    #[derive(Clone, Copy, Debug)]
+    pub struct LedgerModel {
+        pub slots: [SlotModel; SLOT_COUNT],
+        /// The page's own `slot_overflow` word (reader-visible loud-failure
+        /// signal). Zeroed by reset with the slots, unlike the counters.
+        pub page_overflow: u32,
+        pub counters: LedgerCounters,
+    }
+
+    impl Default for LedgerModel {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl LedgerModel {
+        pub const fn new() -> Self {
+            Self {
+                slots: [SlotModel {
+                    resid: FREE_RESID,
+                    issued: 0,
+                    retired: 0,
+                    wanted: false,
+                }; SLOT_COUNT],
+                page_overflow: 0,
+                counters: LedgerCounters {
+                    issued: 0,
+                    retired: 0,
+                    overflow: 0,
+                    drop_retired: 0,
+                    orphaned: 0,
+                },
+            }
+        }
+
+        /// Find the slot currently claimed for `resid`, if any.
+        pub fn slot_of(&self, resid: u32) -> Option<usize> {
+            if resid == FREE_RESID {
+                return None;
+            }
+            self.slots.iter().position(|s| s.resid == resid)
+        }
+
+        /// One `RESOURCE_FLUSH` issue for `resid`: find-or-claim a slot and
+        /// bump `issued`. Returns the claimed slot, or [`NO_SLOT`] on overflow
+        /// (the read still happens host-side; it just runs unledgered — loud
+        /// via the overflow counters, never wedged).
+        ///
+        /// Two passes, mirroring the driver's Histogram CAS discipline: match
+        /// an existing claim first, then take a free slot.
+        pub fn issue(&mut self, resid: u32) -> u8 {
+            // `resid == FREE_RESID` cannot claim: the flush path refuses
+            // resid 0 upstream, and a 0 key would alias the free sentinel.
+            if resid == FREE_RESID {
+                return NO_SLOT;
+            }
+            if let Some(i) = self.slot_of(resid) {
+                self.slots[i].issued += 1;
+                self.counters.issued += 1;
+                return i as u8;
+            }
+            if let Some(i) = self.slots.iter().position(|s| s.resid == FREE_RESID) {
+                // A reclaimed slot was zeroed before its resid was released, so
+                // a fresh claim always starts from 0/0 — asserted by the tests'
+                // invariant checker, not here: nothing in this crate may panic
+                // (it links into the kernel image, dev profile asserts ON).
+                self.slots[i].resid = resid;
+                self.slots[i].issued = 1;
+                self.counters.issued += 1;
+                return i as u8;
+            }
+            self.page_overflow += 1;
+            self.counters.overflow += 1;
+            NO_SLOT
+        }
+
+        /// One token retirement: the read terminated (host OK, host error,
+        /// enqueue failure via `Drop`, teardown via `Drop`).
+        pub fn token_retire(&mut self, slot: u8, resid: u32, via_drop: bool) {
+            if slot == NO_SLOT {
+                // Overflow token: nothing was issued, nothing retires.
+                return;
+            }
+            let i = slot as usize;
+            self.counters.retired += 1;
+            if via_drop {
+                self.counters.drop_retired += 1;
+            }
+            if self.slots[i].resid != resid {
+                // The slot no longer names this read's resource: a reset zeroed
+                // the ledger with the read in flight. The global counters still
+                // balance; the slot (possibly re-claimed by a NEW resid) must
+                // not be touched.
+                self.counters.orphaned += 1;
+                return;
+            }
+            self.slots[i].retired += 1;
+            // The equalizing retirement completes a reclaim the allocation
+            // retire could not (a live read pinned the slot).
+            let took = core::mem::take(&mut self.slots[i].wanted);
+            if reclaim_now(self.slots[i].issued, self.slots[i].retired, took) {
+                self.reclaim(i);
+            } else if took {
+                // Defensive restore: unreachable while at most one read is in
+                // flight, but the token must not be lost if that ever changes.
+                self.slots[i].wanted = true;
+            }
+        }
+
+        /// The backing allocation for `resid` is retiring: reclaim its slot
+        /// now if no read is in flight, else mark retire-wanted and let the
+        /// equalizing [`Self::token_retire`] complete the reclaim (§3.1).
+        pub fn alloc_retire(&mut self, resid: u32) {
+            let Some(i) = self.slot_of(resid) else {
+                return;
+            };
+            // Mark FIRST, then decide: whichever of this marker and the
+            // equalizing retirement runs second sees both conditions and wins
+            // the `wanted` token; the other sees a losing arbitration.
+            self.slots[i].wanted = true;
+            if self.slots[i].issued == self.slots[i].retired {
+                let took = core::mem::take(&mut self.slots[i].wanted);
+                if reclaim_now(self.slots[i].issued, self.slots[i].retired, took) {
+                    self.reclaim(i);
+                }
+            }
+        }
+
+        /// StopDevice/StartDevice: the page's contents belong to the transport
+        /// generation being torn down. Counters survive (per-boot, reset only
+        /// at StartDevice by `scanout_trace::reset`), so tokens that die during
+        /// the teardown still balance `retired` against their `issued`.
+        pub fn reset(&mut self) {
+            for slot in &mut self.slots {
+                *slot = SlotModel::default();
+            }
+            self.page_overflow = 0;
+        }
+
+        /// Counters zeroed BEFORE the resid is released (§3.1): a claimant
+        /// takes only `resid == 0` slots, so it can never observe the stale
+        /// counters; a mapped reader that still sees the old resid sees
+        /// `0/0` = no-wait, which is correct (reclaim requires quiescence).
+        fn reclaim(&mut self, i: usize) {
+            self.slots[i].issued = 0;
+            self.slots[i].retired = 0;
+            self.slots[i].resid = FREE_RESID;
+        }
+
+        /// Reads in flight for `resid` — what the mapped reader computes.
+        pub fn in_flight(&self, resid: u32) -> u32 {
+            self.slot_of(resid)
+                .map(|i| self.slots[i].issued - self.slots[i].retired)
+                .unwrap_or(0)
+        }
+    }
+}
+
+#[cfg(test)]
+mod scanout_read_ledger_tests {
+    use super::scanout_read_ledger::*;
+
+    /// The rules the model must uphold after EVERY operation — checked from
+    /// the outside because nothing in the crate itself may panic.
+    fn check_invariants(m: &LedgerModel) {
+        for (i, s) in m.slots.iter().enumerate() {
+            assert!(s.issued >= s.retired, "slot {i}: retired ran ahead");
+            if s.resid == FREE_RESID {
+                // Reclaim zeroes counters before releasing the resid, so a
+                // free slot is always 0/0 and never retire-wanted.
+                assert_eq!((s.issued, s.retired), (0, 0), "slot {i}: dirty free slot");
+                assert!(!s.wanted, "slot {i}: free slot still wanted");
+            }
+        }
+    }
+
+    /// Liveness matrix rows 1/2 (FIX-DESIGN-d4a.md §6): a completed read
+    /// retires, and the identity `issued == retired` holds at quiescence.
+    #[test]
+    fn issue_then_retire_balances_and_reuses_the_slot() {
+        let mut m = LedgerModel::new();
+        let slot = m.issue(191);
+        assert_ne!(slot, NO_SLOT);
+        assert_eq!(m.in_flight(191), 1);
+        m.token_retire(slot, 191, false);
+        assert_eq!(m.in_flight(191), 0);
+        // The next read of the same resid reuses the same slot and accumulates.
+        assert_eq!(m.issue(191), slot);
+        m.token_retire(slot, 191, false);
+        assert_eq!(m.counters.issued, 2);
+        assert_eq!(m.counters.retired, 2);
+        assert_eq!(m.slots[slot as usize].issued, 2);
+        assert_eq!(m.slots[slot as usize].retired, 2);
+        check_invariants(&m);
+    }
+
+    /// A resid of 0 would alias the free-slot sentinel; the model refuses it
+    /// exactly as the driver's issue path does.
+    #[test]
+    fn free_resid_cannot_claim() {
+        let mut m = LedgerModel::new();
+        assert_eq!(m.issue(FREE_RESID), NO_SLOT);
+        assert_eq!(m.counters.issued, 0);
+        check_invariants(&m);
+    }
+
+    /// Rows 4/5: a token whose read never completed retires via `Drop` — the
+    /// ledger cannot tell the difference, only the census can.
+    #[test]
+    fn drop_retirement_balances_and_is_counted() {
+        let mut m = LedgerModel::new();
+        let slot = m.issue(191);
+        m.token_retire(slot, 191, true);
+        assert_eq!(m.counters.issued, m.counters.retired);
+        assert_eq!(m.counters.drop_retired, 1);
+        assert_eq!(m.in_flight(191), 0);
+    }
+
+    /// §3.1 overflow: the 9th distinct live resid gets no slot, is counted on
+    /// both the page and the census, and its token retires into nothing.
+    #[test]
+    fn ninth_distinct_resid_overflows_loudly() {
+        let mut m = LedgerModel::new();
+        for resid in 1..=8 {
+            assert_ne!(m.issue(resid), NO_SLOT);
+        }
+        let slot = m.issue(9);
+        assert_eq!(slot, NO_SLOT);
+        assert_eq!(m.page_overflow, 1);
+        assert_eq!(m.counters.overflow, 1);
+        // The unledgered token bumps nothing — issued == retired stays exact.
+        m.token_retire(slot, 9, false);
+        assert_eq!(m.counters.issued, 8);
+        assert_eq!(m.counters.retired, 0);
+    }
+
+    /// Row 6, quiescent half: an allocation retiring with no read in flight
+    /// reclaims immediately, and the freed slot is claimable with 0/0.
+    #[test]
+    fn alloc_retire_without_inflight_read_reclaims_immediately() {
+        let mut m = LedgerModel::new();
+        let slot = m.issue(191);
+        m.token_retire(slot, 191, false);
+        m.alloc_retire(191);
+        assert_eq!(m.slot_of(191), None);
+        let reused = m.issue(400);
+        assert_eq!(reused, slot);
+        assert_eq!(m.slots[slot as usize].issued, 1);
+        assert_eq!(m.slots[slot as usize].retired, 0);
+    }
+
+    /// Row 6, pinned half: a live token pins its slot across the allocation
+    /// retire, and the equalizing retirement completes the reclaim — so a
+    /// token can NEVER retire into a recycled slot.
+    #[test]
+    fn live_token_pins_the_slot_until_its_retirement_reclaims() {
+        let mut m = LedgerModel::new();
+        let slot = m.issue(191);
+        m.alloc_retire(191);
+        // Pinned: still claimed, retire-wanted, and the reader still sees the
+        // in-flight read (correct — the host read has not terminated).
+        assert_eq!(m.slot_of(191), Some(slot as usize));
+        assert!(m.slots[slot as usize].wanted);
+        assert_eq!(m.in_flight(191), 1);
+        m.token_retire(slot, 191, false);
+        // The retirement won the wanted token and reclaimed.
+        assert_eq!(m.slot_of(191), None);
+        assert!(!m.slots[slot as usize].wanted);
+        assert_eq!(m.counters.issued, m.counters.retired);
+        check_invariants(&m);
+    }
+
+    /// The arbitration cannot double-reclaim: after the retirement's reclaim,
+    /// a second alloc-retire of the same resid finds nothing.
+    #[test]
+    fn double_alloc_retire_is_inert() {
+        let mut m = LedgerModel::new();
+        let slot = m.issue(191);
+        m.alloc_retire(191);
+        m.token_retire(slot, 191, false);
+        m.alloc_retire(191);
+        assert_eq!(m.slot_of(191), None);
+        // And the slot is claimable by a new resid with clean state.
+        let reused = m.issue(500);
+        assert_eq!(reused, slot);
+        assert!(!m.slots[slot as usize].wanted);
+    }
+
+    /// Row 7: a reset with a read in flight orphans the token. The orphaned
+    /// retirement must not touch the slot — which a NEW generation's resid may
+    /// have re-claimed — and the global counters still balance.
+    #[test]
+    fn orphaned_retirement_after_reset_corrupts_nothing() {
+        let mut m = LedgerModel::new();
+        let old_slot = m.issue(191);
+        m.reset();
+        assert_eq!(m.page_overflow, 0);
+        // New generation: resource ids restart; resid 3 lands in slot 0 — the
+        // same slot the orphan token still names.
+        let new_slot = m.issue(3);
+        assert_eq!(new_slot, old_slot);
+        m.token_retire(old_slot, 191, true);
+        assert_eq!(m.counters.orphaned, 1);
+        // The new claim's counters were not corrupted by the orphan.
+        assert_eq!(m.slots[new_slot as usize].issued, 1);
+        assert_eq!(m.slots[new_slot as usize].retired, 0);
+        assert_eq!(m.in_flight(3), 1);
+        m.token_retire(new_slot, 3, false);
+        // Every issue retired exactly once, across the reset.
+        assert_eq!(m.counters.issued, m.counters.retired);
+        check_invariants(&m);
+    }
+
+    /// [`reclaim_now`] is the whole arbitration: quiescence alone is not
+    /// enough, the wanted token alone is not enough.
+    #[test]
+    fn reclaim_requires_both_quiescence_and_the_wanted_token() {
+        assert!(reclaim_now(3, 3, true));
+        assert!(!reclaim_now(3, 2, true));
+        assert!(!reclaim_now(3, 3, false));
+        assert!(!reclaim_now(0, 0, false));
+    }
+
+    /// The reader protocol (§3.1): in-flight requires a stable resid and
+    /// `issued > retired`; a mid-read reclaim (resid changed) is a no-wait.
+    #[test]
+    fn reader_protocol_verdicts() {
+        assert!(reader_in_flight(191, 5, 4, 191));
+        assert!(!reader_in_flight(191, 5, 5, 191));
+        // Reclaimed mid-read: every read of 191 retired, so no-wait.
+        assert!(!reader_in_flight(191, 5, 4, 0));
+        assert!(!reader_in_flight(191, 5, 4, 400));
+        // A free slot can never demand a wait.
+        assert!(!reader_in_flight(FREE_RESID, 1, 0, FREE_RESID));
+    }
+}
+
+pub mod snapshot_bind {
+    //! D4b snapshot bind: the Present-time descriptor gate
+    //! (FIX-DESIGN-d4b-snapshot.md §4).
+    //!
+    //! When `HELIOS_PRESENT_PRIVATE_FLAG_SNAPSHOT` is set, the present private
+    //! data describes a UMD-owned SNAPSHOT image (filled by a venus-queue-
+    //! ordered copy of the presented primary) that the KMD binds and flushes on
+    //! the DMA-flip path INSTEAD of the flipped allocation. The descriptor is
+    //! guest-supplied, so every field is validated before it may substitute the
+    //! bind target; a descriptor that fails ANY check falls back to the flipped
+    //! allocation (today's behaviour), counted as `SnFbk`.
+    //!
+    //! [`validate_layout`] is the undersize guard — the Xid-31 protection —
+    //! reproduced byte-for-byte (saturating arithmetic included) from
+    //! `ScanoutTarget::from_direct_primary` in
+    //! `kmd_render/src/ddi/create_allocation.rs`. It must NEVER be relaxed: an
+    //! `alloc_size` smaller than `plane_offset + pitch*height` lets QEMU read
+    //! past the blob.
+
+    use crate::ScanoutFormat;
+
+    /// The validated snapshot bind target, carried BY VALUE from the Present
+    /// DDI through the flip record to both bind paths. No pointer and no
+    /// allocation-table lookup ever resolves the snapshot, so its
+    /// `AllocationContext` lifetime cannot be involved; liveness is enforced
+    /// where it already lives (the flush executor's `resource_is_live` arm).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct SnapshotDescriptor {
+        /// Venus resource id of the snapshot image. Never 0 in a valid
+        /// descriptor; 0 is the "no substitution" sentinel on the carriers.
+        pub resource_id: u32,
+        pub width: u32,
+        pub height: u32,
+        /// Row pitch in bytes (the stride `SET_SCANOUT_BLOB` uses).
+        pub pitch: u32,
+        /// Exact DXGI format; must resolve via [`ScanoutFormat::from_dxgi`].
+        pub dxgi_format: u32,
+        /// Memory-plane-0 byte offset within the backing allocation.
+        pub plane_offset: u64,
+        /// Total venus blob size backing `resource_id` — the undersize guard's
+        /// right-hand side.
+        pub venus_alloc_size: u64,
+    }
+
+    /// Why a snapshot descriptor was refused. Every arm is one `SnFbk` and a
+    /// fall-back to binding the flipped allocation; none is an error return.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum SnapshotReject {
+        /// `resource_id == 0` — the no-substitution sentinel arrived flagged.
+        ZeroResource,
+        /// Descriptor extent differs from the allocation-list source's extent
+        /// (a fullscreen transition / geometry change mid-flight).
+        ExtentMismatch,
+        /// Pitch/offset/size failed the direct-scan-out layout rules — the
+        /// undersize guard.
+        Layout,
+        /// No virtio scan-out encoding for `dxgi_format`.
+        Format,
+    }
+
+    /// The full Present-time gate: identity, extent, then layout. The caller
+    /// has already established `FLAG_SNAPSHOT` + 48-byte coverage; this
+    /// validates everything the wire bytes claim. `source_width`/
+    /// `source_height` are the allocation-list source's extent — the identity
+    /// Windows placed in the Present call, which the descriptor must agree
+    /// with before it may substitute for it.
+    pub const fn validate(
+        d: &SnapshotDescriptor,
+        source_width: u32,
+        source_height: u32,
+    ) -> Result<(), SnapshotReject> {
+        if d.resource_id == 0 {
+            return Err(SnapshotReject::ZeroResource);
+        }
+        if d.width != source_width || d.height != source_height {
+            return Err(SnapshotReject::ExtentMismatch);
+        }
+        validate_layout(d)
+    }
+
+    /// The layout half, shared with `ScanoutTarget::from_snapshot_descriptor`
+    /// so the constructor cannot restate the arithmetic in a weakened form.
+    ///
+    /// ⚠ Byte-for-byte from `ScanoutTarget::from_direct_primary`, saturating
+    /// arithmetic included. Do not "simplify"; do not relax.
+    pub const fn validate_layout(d: &SnapshotDescriptor) -> Result<(), SnapshotReject> {
+        let min_size = d
+            .plane_offset
+            .saturating_add((d.pitch as u64).saturating_mul(d.height as u64));
+        let layout_ok = d.pitch >= d.width.saturating_mul(4)
+            && d.pitch & 3 == 0
+            && d.plane_offset <= u32::MAX as u64
+            && d.venus_alloc_size >= min_size;
+        if !layout_ok {
+            return Err(SnapshotReject::Layout);
+        }
+        if ScanoutFormat::from_dxgi(d.dxgi_format).is_none() {
+            return Err(SnapshotReject::Format);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod snapshot_bind_tests {
+    use super::snapshot_bind::*;
+
+    /// A descriptor shaped like the real S-ring slot: 1920×1080 BGRA, the
+    /// UMD's 256-aligned pitch, plane data at 0, exact-size blob.
+    fn good() -> SnapshotDescriptor {
+        SnapshotDescriptor {
+            resource_id: 0x131,
+            width: 1920,
+            height: 1080,
+            pitch: 7680,
+            dxgi_format: 87,
+            plane_offset: 0,
+            venus_alloc_size: 7680 * 1080,
+        }
+    }
+
+    #[test]
+    fn a_healthy_descriptor_validates() {
+        assert_eq!(validate(&good(), 1920, 1080), Ok(()));
+    }
+
+    #[test]
+    fn zero_resource_is_the_sentinel_and_never_substitutes() {
+        let mut d = good();
+        d.resource_id = 0;
+        assert_eq!(validate(&d, 1920, 1080), Err(SnapshotReject::ZeroResource));
+    }
+
+    /// Extent must equal the ALLOCATION-LIST source's, not merely be
+    /// self-consistent — the fullscreen-transition fallback row of the §6
+    /// matrix.
+    #[test]
+    fn extent_mismatch_falls_back() {
+        assert_eq!(
+            validate(&good(), 1896, 1030),
+            Err(SnapshotReject::ExtentMismatch)
+        );
+        let mut d = good();
+        d.height = 1030;
+        assert_eq!(
+            validate(&d, 1920, 1080),
+            Err(SnapshotReject::ExtentMismatch)
+        );
+    }
+
+    /// The undersize guard: `alloc_size >= plane_offset + pitch*height`,
+    /// exact at the boundary.
+    #[test]
+    fn undersize_guard_is_exact_and_never_relaxed() {
+        let mut d = good();
+        d.venus_alloc_size = 7680 * 1080 - 1;
+        assert_eq!(validate(&d, 1920, 1080), Err(SnapshotReject::Layout));
+        d.venus_alloc_size = 7680 * 1080;
+        assert_eq!(validate(&d, 1920, 1080), Ok(()));
+        // The plane offset shifts the requirement by exactly itself.
+        d.plane_offset = 4096;
+        assert_eq!(validate(&d, 1920, 1080), Err(SnapshotReject::Layout));
+        d.venus_alloc_size = 4096 + 7680 * 1080;
+        assert_eq!(validate(&d, 1920, 1080), Ok(()));
+    }
+
+    /// The widened-u64 arithmetic: the worst representable pitch*height
+    /// product (~2^64 - 2^33) must still be demanded IN FULL from
+    /// `venus_alloc_size` — a narrower or wrapping formulation would compute a
+    /// small `min_size` a tiny blob satisfies. (True u64 saturation is
+    /// unreachable from two u32 inputs; `saturating_*` is defense-in-depth,
+    /// kept byte-for-byte with `from_direct_primary`.)
+    #[test]
+    fn near_max_products_demand_the_full_size() {
+        let mut d = good();
+        d.plane_offset = 0;
+        d.pitch = u32::MAX & !3; // 4-aligned, enormous
+        d.height = u32::MAX;
+        let min_size = (d.pitch as u64) * (d.height as u64);
+        d.venus_alloc_size = min_size - 1;
+        assert_eq!(validate_layout(&d), Err(SnapshotReject::Layout));
+        d.venus_alloc_size = min_size;
+        assert_eq!(validate_layout(&d), Ok(()));
+    }
+
+    #[test]
+    fn pitch_rules_match_the_direct_primary_validator() {
+        // pitch < width*4
+        let mut d = good();
+        d.pitch = 1920 * 4 - 4;
+        assert_eq!(validate(&d, 1920, 1080), Err(SnapshotReject::Layout));
+        // pitch % 4 != 0
+        let mut d = good();
+        d.pitch = 7682;
+        d.venus_alloc_size = 7682 * 1080;
+        assert_eq!(validate(&d, 1920, 1080), Err(SnapshotReject::Layout));
+        // width*4 exactly (no 256-alignment REQUIREMENT here, same as the
+        // direct-primary validator).
+        let mut d = good();
+        d.pitch = 1920 * 4;
+        d.venus_alloc_size = 1920 * 4 * 1080;
+        assert_eq!(validate(&d, 1920, 1080), Ok(()));
+    }
+
+    #[test]
+    fn plane_offset_must_fit_u32() {
+        let mut d = good();
+        d.plane_offset = u32::MAX as u64 + 1;
+        d.venus_alloc_size = u64::MAX;
+        assert_eq!(validate(&d, 1920, 1080), Err(SnapshotReject::Layout));
+    }
+
+    /// The strict DXGI set (28/87/88) and NOT the legacy-zero arm: a snapshot
+    /// is a freshly created UMD image that always carries its exact format.
+    #[test]
+    fn format_uses_the_strict_dxgi_set() {
+        for (fmt, ok) in [(28u32, true), (87, true), (88, true), (0, false), (24, false)] {
+            let mut d = good();
+            d.dxgi_format = fmt;
+            assert_eq!(validate(&d, 1920, 1080).is_ok(), ok, "dxgi {fmt}");
+        }
+    }
+}
