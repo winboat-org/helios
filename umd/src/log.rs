@@ -45,9 +45,29 @@ pub(crate) fn umd_log_path() -> &'static std::path::Path {
 pub(crate) fn log_line(message: &str) {
     if let Ok(mut slot) = log_file().lock() {
         if let Some(f) = slot.as_mut() {
-            let _ = writeln!(f, "[pid={}] {}", std::process::id(), message);
+            // tid in the prefix: once creates/destroys go free-threaded and
+            // deferred contexts record on worker threads, a pid-only prefix
+            // makes concurrent DDI traffic unattributable.
+            let _ = writeln!(
+                f,
+                "[pid={} tid={}] {}",
+                std::process::id(),
+                current_thread_id(),
+                message
+            );
         }
     }
+}
+
+/// Win32 thread id of the calling thread (`GetCurrentThreadId`). Cheap: reads
+/// the TEB, no syscall.
+fn current_thread_id() -> u32 {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCurrentThreadId() -> u32;
+    }
+    // SAFETY: no arguments, no pointers; always valid to call.
+    unsafe { GetCurrentThreadId() }
 }
 
 /// The process-lifetime log handle.

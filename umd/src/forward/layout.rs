@@ -186,7 +186,7 @@ pub(crate) unsafe extern "C" fn create_element_layout(
     }
     // The element-layout slot is a fourth payload kind: a Box this driver
     // allocated, but stored as a bare `usize` and then used as the identity key
-    // of `IaState::layout_cache`. R803's finding does not list it; it is the
+    // of `ShaderCaches::layout_cache`. R803's finding does not list it; it is the
     // same latent confusion as the resource and RTV slots.
     let Some(slot) = boxed_slot(h_el) else {
         return;
@@ -207,20 +207,25 @@ pub(crate) unsafe extern "C" fn destroy_element_layout(
     if p != 0 {
         let mut owned = std::collections::HashSet::new();
         if let Some(dev) = helios_device(h) {
-            let mut ia = dev.owned.ia.borrow_mut();
-            ia.layout_cache.retain(|&(layout, _), cached| {
-                if layout == p {
-                    if *cached != 0 {
-                        owned.insert(*cached);
+            dev.owned
+                .caches_lock()
+                .layout_cache
+                .retain(|&(layout, _), cached| {
+                    if layout == p {
+                        if *cached != 0 {
+                            owned.insert(*cached);
+                        }
+                        false
+                    } else {
+                        true
                     }
-                    false
-                } else {
-                    true
-                }
-            });
-            if ia.current_layout == p {
-                ia.current_layout = 0;
-            }
+                });
+            let _ = dev.owned.bindings.current_layout.compare_exchange(
+                p,
+                0,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
         }
         for cached in &owned {
             // SAFETY: each removed cache value owns one CreateInputLayout
@@ -245,7 +250,7 @@ pub(crate) unsafe extern "C" fn ia_set_input_layout(
             Some(slot) => slot.word(),
             None => 0,
         };
-        dev.owned.ia.borrow_mut().current_layout = p;
+        dev.owned.bindings.current_layout.store(p, Ordering::Relaxed);
     }
 }
 
@@ -256,8 +261,11 @@ pub(crate) unsafe fn bind_input_layout(h: Hdevice) {
         return;
     };
     let (lp, vp) = {
-        let ia = dev.owned.ia.borrow();
-        (ia.current_layout, ia.current_vs)
+        let bindings = &dev.owned.bindings;
+        (
+            bindings.current_layout.load(Ordering::Relaxed),
+            bindings.current_vs.load(Ordering::Relaxed),
+        )
     };
     if lp == 0 || vp == 0 {
         if SHADER_BIND_LOG_COUNT.first_n(256).is_some() {
@@ -269,11 +277,11 @@ pub(crate) unsafe fn bind_input_layout(h: Hdevice) {
         }
         return;
     }
-    let cached = dev.owned.ia.borrow().layout_cache.get(&(lp, vp)).copied();
+    let cached = dev.owned.caches_lock().layout_cache.get(&(lp, vp)).copied();
     let il_raw = match cached {
         Some(p) => p,
         None => {
-            let bytecode = match dev.owned.ia.borrow().vs_bytecode.get(&vp) {
+            let bytecode = match dev.owned.caches_lock().vs_bytecode.get(&vp) {
                 Some(b) => b.clone(),
                 None => {
                     log_error!(
@@ -358,8 +366,27 @@ pub(crate) unsafe fn bind_input_layout(h: Hdevice) {
                             descs.len(),
                             raw
                         );
-                        dev.owned.ia.borrow_mut().layout_cache.insert((lp, vp), raw);
-                        raw
+                        // Insert-race arm: under FREETHREADED caps two threads
+                        // can miss and create concurrently. The loser releases
+                        // its layout and binds the winner's — never leak, never
+                        // orphan a cached entry. The COM release happens after
+                        // the caches guard drops.
+                        let (chosen, loser) = {
+                            let mut caches = dev.owned.caches_lock();
+                            match caches.layout_cache.entry((lp, vp)) {
+                                std::collections::hash_map::Entry::Occupied(e) => {
+                                    (*e.get(), Some(raw))
+                                }
+                                std::collections::hash_map::Entry::Vacant(e) => {
+                                    e.insert(raw);
+                                    (raw, None)
+                                }
+                            }
+                        };
+                        if let Some(loser) = loser {
+                            drop(IUnknown::from_raw(loser as *mut c_void));
+                        }
+                        chosen
                     }
                     None => return,
                 },
@@ -445,13 +472,27 @@ pub(crate) unsafe fn resolve_vs_input_variant(h: Hdevice, lp: usize, vp: usize) 
         for &(r, c, _) in &classes {
             key = (key ^ (((r as u64) << 8) | c as u64)).wrapping_mul(0x0000_0100_0000_01b3);
         }
-        let cached = dev.owned.ia.borrow().vs_variants.get(&(vp, key)).copied();
+        let cached = dev.owned.caches_lock().vs_variants.get(&(vp, key)).copied();
         let variant = match cached {
             Some(v) => v,
             None => {
                 let v = create_vs_input_variant(dev, vp, &classes);
-                dev.owned.ia.borrow_mut().vs_variants.insert((vp, key), v);
-                v
+                // Insert-race arm (FREETHREADED): keep the winner, release the
+                // loser's shader after the guard drops.
+                let (chosen, loser) = {
+                    let mut caches = dev.owned.caches_lock();
+                    match caches.vs_variants.entry((vp, key)) {
+                        std::collections::hash_map::Entry::Occupied(e) => (*e.get(), v),
+                        std::collections::hash_map::Entry::Vacant(e) => {
+                            e.insert(v);
+                            (v, 0)
+                        }
+                    }
+                };
+                if loser != 0 {
+                    drop(IUnknown::from_raw(loser as *mut c_void));
+                }
+                chosen
             }
         };
         if variant != 0 {
@@ -461,7 +502,7 @@ pub(crate) unsafe fn resolve_vs_input_variant(h: Hdevice, lp: usize, vp: usize) 
         }
     };
 
-    if dev.owned.ia.borrow().bound_vs_com == desired {
+    if dev.owned.bindings.bound_vs_com.load(Ordering::Relaxed) == desired {
         return;
     }
     let Some(context) = d3d11_context(h) else {
@@ -469,7 +510,7 @@ pub(crate) unsafe fn resolve_vs_input_variant(h: Hdevice, lp: usize, vp: usize) 
     };
     let s = ManuallyDrop::new(ID3D11VertexShader::from_raw(desired as *mut c_void));
     context.VSSetShader(&*s, None);
-    dev.owned.ia.borrow_mut().bound_vs_com = desired;
+    dev.owned.bindings.bound_vs_com.store(desired, Ordering::Relaxed);
     if SHADER_BIND_LOG_COUNT.first_n(256).is_some() {
         trace_line!("DDI VS input-class variant bound: vs=0x{vp:x} -> 0x{desired:x}");
     }
@@ -484,8 +525,8 @@ pub(crate) unsafe fn create_vs_input_variant(
     classes: &[(u32, u32, u32)],
 ) -> usize {
     let (bytecode, mut words) = {
-        let ia = dev.owned.ia.borrow();
-        let Some(b) = ia.vs_bytecode.get(&vp) else {
+        let caches = dev.owned.caches_lock();
+        let Some(b) = caches.vs_bytecode.get(&vp) else {
             log_error!("VS variant: no bytecode for vs=0x{vp:x}");
             return 0;
         };
@@ -493,7 +534,7 @@ pub(crate) unsafe fn create_vs_input_variant(
             // Real container: its own ISGN already carries real types.
             return 0;
         }
-        let w = ia
+        let w = caches
             .vs_sig_words
             .get(&vp)
             .cloned()
@@ -566,15 +607,23 @@ pub(crate) unsafe extern "C" fn ia_set_vertex_buffers(
         bufs.push(load_resource(h_buf).and_then(|r| (*r).cast::<ID3D11Buffer>().ok()));
     }
     if let Some(dev) = helios_device(h) {
-        let mut ia = dev.owned.ia.borrow_mut();
         if start == 0 && num != 0 {
-            ia.current_vb0 = bufs
-                .first()
-                .and_then(|b| b.as_ref())
-                .map(|b| b.as_raw() as usize)
-                .unwrap_or(0);
-            ia.current_vb0_stride = if strides.is_null() { 0 } else { *strides };
-            ia.current_vb0_offset = if offsets.is_null() { 0 } else { *offsets };
+            let bindings = &dev.owned.bindings;
+            bindings.current_vb0.store(
+                bufs.first()
+                    .and_then(|b| b.as_ref())
+                    .map(|b| b.as_raw() as usize)
+                    .unwrap_or(0),
+                Ordering::Relaxed,
+            );
+            bindings.current_vb0_stride.store(
+                if strides.is_null() { 0 } else { *strides },
+                Ordering::Relaxed,
+            );
+            bindings.current_vb0_offset.store(
+                if offsets.is_null() { 0 } else { *offsets },
+                Ordering::Relaxed,
+            );
         }
     }
     let n = IA_BIND_LOG_COUNT.next();
@@ -623,10 +672,13 @@ pub(crate) unsafe extern "C" fn ia_set_index_buffer(
     };
     let buf = load_resource(h_buf).and_then(|r| (*r).cast::<ID3D11Buffer>().ok());
     if let Some(dev) = helios_device(h) {
-        let mut ia = dev.owned.ia.borrow_mut();
-        ia.current_ib = buf.as_ref().map(|b| b.as_raw() as usize).unwrap_or(0);
-        ia.current_ib_format = format as u32;
-        ia.current_ib_offset = offset;
+        let bindings = &dev.owned.bindings;
+        bindings.current_ib.store(
+            buf.as_ref().map(|b| b.as_raw() as usize).unwrap_or(0),
+            Ordering::Relaxed,
+        );
+        bindings.current_ib_format.store(format as u32, Ordering::Relaxed);
+        bindings.current_ib_offset.store(offset, Ordering::Relaxed);
     }
     if IA_BIND_LOG_COUNT.first_n(128).is_some() {
         trace_line!(

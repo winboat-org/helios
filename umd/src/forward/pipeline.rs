@@ -51,11 +51,11 @@ pub(crate) unsafe extern "C" fn set_render_targets(
         views.push(view);
     }
     if let Some(dev) = helios_device(h) {
-        let mut ia = dev.owned.ia.borrow_mut();
-        ia.current_rt0_alloc = rt0.0;
-        ia.current_rt0_width = rt0.1;
-        ia.current_rt0_height = rt0.2;
-        ia.current_rt0_format = rt0.3;
+        let bindings = &dev.owned.bindings;
+        bindings.current_rt0_alloc.store(rt0.0, Ordering::Relaxed);
+        bindings.current_rt0_width.store(rt0.1, Ordering::Relaxed);
+        bindings.current_rt0_height.store(rt0.2, Ordering::Relaxed);
+        bindings.current_rt0_format.store(rt0.3, Ordering::Relaxed);
     }
     let n = OM_LOG_COUNT.next();
     if n < 1024 || rt_missing != 0 || rt0.0 != 0 {
@@ -221,7 +221,10 @@ pub(crate) unsafe extern "C" fn ia_set_topology(
     topo: ddi::D3D10_DDI_PRIMITIVE_TOPOLOGY,
 ) {
     if let Some(dev) = helios_device(h) {
-        dev.owned.ia.borrow_mut().current_topology = topo as u32;
+        dev.owned
+            .bindings
+            .current_topology
+            .store(topo as u32, Ordering::Relaxed);
     }
     if IA_BIND_LOG_COUNT.first_n(64).is_some() {
         trace_line!("DDI IASetTopology topo={}", topo as u32);
@@ -243,7 +246,7 @@ pub(crate) unsafe fn log_draw_state(
 ) {
     // Gate the WHOLE function, not just the write: this runs from all seven
     // draw entry points, and with tracing off it used to pay an atomic
-    // fetch_add on every draw plus a `dev.owned.ia.borrow()` and a heap-allocating
+    // fetch_add on every draw plus a bindings read and a heap-allocating
     // 21-argument `format!` on the first 1024 draws and every 1024th after —
     // through the unconditional mutex-serialised writer. A game issuing 2000
     // draws per frame at 60 fps meant ~120 file writes per second from the draw
@@ -259,30 +262,30 @@ pub(crate) unsafe fn log_draw_state(
     let Some(dev) = helios_device(h) else {
         return;
     };
-    let ia = dev.owned.ia.borrow();
+    let b = &dev.owned.bindings;
     trace_line!(
         "DDI {kind}: a={} b={} c={} d={} topo={} vb0=0x{:x}/{}+{} ib=0x{:x}/fmt{}+{} vs=0x{:x} ps=0x{:x} gs=0x{:x} hs=0x{:x} ds=0x{:x} rt0_alloc=0x{:x} rt0={}x{} fmt={} layout=0x{:x}",
         count0,
         start0,
         count1,
         start1,
-        ia.current_topology,
-        ia.current_vb0,
-        ia.current_vb0_stride,
-        ia.current_vb0_offset,
-        ia.current_ib,
-        ia.current_ib_format,
-        ia.current_ib_offset,
-        ia.current_vs,
-        ia.current_ps,
-        ia.current_gs,
-        ia.current_hs,
-        ia.current_ds,
-        ia.current_rt0_alloc,
-        ia.current_rt0_width,
-        ia.current_rt0_height,
-        ia.current_rt0_format,
-        ia.current_layout
+        b.current_topology.load(Ordering::Relaxed),
+        b.current_vb0.load(Ordering::Relaxed),
+        b.current_vb0_stride.load(Ordering::Relaxed),
+        b.current_vb0_offset.load(Ordering::Relaxed),
+        b.current_ib.load(Ordering::Relaxed),
+        b.current_ib_format.load(Ordering::Relaxed),
+        b.current_ib_offset.load(Ordering::Relaxed),
+        b.current_vs.load(Ordering::Relaxed),
+        b.current_ps.load(Ordering::Relaxed),
+        b.current_gs.load(Ordering::Relaxed),
+        b.current_hs.load(Ordering::Relaxed),
+        b.current_ds.load(Ordering::Relaxed),
+        b.current_rt0_alloc.load(Ordering::Relaxed),
+        b.current_rt0_width.load(Ordering::Relaxed),
+        b.current_rt0_height.load(Ordering::Relaxed),
+        b.current_rt0_format.load(Ordering::Relaxed),
+        b.current_layout.load(Ordering::Relaxed)
     );
 }
 
@@ -481,17 +484,17 @@ pub(crate) unsafe extern "C" fn so_set_targets(
 pub(crate) unsafe extern "C" fn dispatch(h: Hdevice, x: u32, y: u32, z: u32) {
     if DISPATCH_LOG_COUNT.first_n_then_every(1024, 1024).is_some() {
         if let Some(dev) = helios_device(h) {
-            let ia = dev.owned.ia.borrow();
+            let b = &dev.owned.bindings;
             trace_line!(
                 "DDI Dispatch x={} y={} z={} cs=0x{:x} rt0_alloc=0x{:x} rt0={}x{} fmt={}",
                 x,
                 y,
                 z,
-                ia.current_cs,
-                ia.current_rt0_alloc,
-                ia.current_rt0_width,
-                ia.current_rt0_height,
-                ia.current_rt0_format
+                b.current_cs.load(Ordering::Relaxed),
+                b.current_rt0_alloc.load(Ordering::Relaxed),
+                b.current_rt0_width.load(Ordering::Relaxed),
+                b.current_rt0_height.load(Ordering::Relaxed),
+                b.current_rt0_format.load(Ordering::Relaxed)
             );
         }
     }

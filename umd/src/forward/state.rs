@@ -671,8 +671,7 @@ pub(crate) unsafe fn presented_primary_private(
         return None;
     }
     let dev = unsafe { helios_device(h) }?;
-    dev.direct_scanout_allocations
-        .borrow()
+    lock_ignore_poison(&dev.direct_scanout_allocations)
         .iter()
         .find_map(|(candidate, private)| (*candidate == allocation).then_some(*private))
 }
@@ -689,7 +688,7 @@ pub(crate) unsafe fn remember_direct_scanout_allocation(
         return;
     };
     {
-        let mut entries = dev.direct_scanout_allocations.borrow_mut();
+        let mut entries = lock_ignore_poison(&dev.direct_scanout_allocations);
         entries.retain(|(candidate, _)| *candidate != allocation);
         entries.push((allocation, private));
     }
@@ -706,7 +705,7 @@ pub(crate) unsafe fn forget_direct_scanout_allocation(
         return None;
     }
     let dev = unsafe { helios_device(h) }?;
-    let mut entries = dev.direct_scanout_allocations.borrow_mut();
+    let mut entries = lock_ignore_poison(&dev.direct_scanout_allocations);
     let before = entries.len();
     entries.retain(|(candidate, _)| *candidate != allocation);
     let removed = before - entries.len();

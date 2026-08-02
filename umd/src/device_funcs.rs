@@ -18,7 +18,7 @@ use crate::bridge;
 use crate::ddi;
 use crate::log_error;
 use core::ffi::c_void;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use windows::core::{IUnknown, Interface};
 
 /// One cached dcomp-vehicle present source (road 4): an alias-imported D3D11
@@ -195,18 +195,29 @@ pub struct RuntimeContext {
 /// correctness not depend on drop order at all; `Drop` remains as the
 /// rollback/panic path. R807.
 pub struct BridgeOwned {
-    /// Dcomp present-vehicle source cache. Same single-threaded-DDI RefCell
-    /// contract as `ia`.
+    /// Dcomp present-vehicle source cache. Immediate-path-only RefCell: only
+    /// present-path DDIs touch it, and those stay runtime-serialized with the
+    /// rest of the immediate context even under FREETHREADED caps.
     pub present_src_cache: core::cell::RefCell<Vec<PresentSrcEntry>>,
     /// D4b snapshot ring (`None` until the first substitutable direct-flip
-    /// present builds it). Same single-threaded-DDI RefCell contract as `ia`.
+    /// present builds it). Same immediate-path-only RefCell contract as
+    /// `present_src_cache`.
     pub snapshot_ring: core::cell::RefCell<Option<SnapshotRing>>,
-    /// Input-assembler state for lazy `ID3D11InputLayout` creation. The
-    /// d3d10umddi `CreateElementLayout` DDI does NOT pass the vertex-shader
-    /// input-signature bytecode that `ID3D11Device::CreateInputLayout`
-    /// requires, so we stash the element descs + the bound VS bytecode and
-    /// create the layout lazily at draw.
-    pub ia: core::cell::RefCell<IaState>,
+    /// Device-global shader/layout caches for lazy `ID3D11InputLayout`
+    /// creation. The d3d10umddi `CreateElementLayout` DDI does NOT pass the
+    /// vertex-shader input-signature bytecode that
+    /// `ID3D11Device::CreateInputLayout` requires, so we stash the element
+    /// descs + the bound VS bytecode and create the layout lazily at draw.
+    ///
+    /// Mutex, not RefCell: create/destroy DDIs mutate these from any thread
+    /// once FREETHREADED caps are reported, concurrently with draw-path
+    /// lookups. Lock via [`BridgeOwned::caches_lock`]; never hold the guard
+    /// across a bridge/COM call (COM releases and creates run arbitrary DXVK
+    /// code).
+    pub caches: std::sync::Mutex<ShaderCaches>,
+    /// Immediate-context pipeline binding shadow. Per-context state — each
+    /// deferred context gets its own copy when command lists land.
+    pub bindings: CtxBindings,
 }
 
 impl BridgeOwned {
@@ -214,14 +225,24 @@ impl BridgeOwned {
         Self {
             present_src_cache: core::cell::RefCell::new(Vec::new()),
             snapshot_ring: core::cell::RefCell::new(None),
-            ia: core::cell::RefCell::new(IaState::default()),
+            caches: std::sync::Mutex::new(ShaderCaches::default()),
+            bindings: CtxBindings::default(),
         }
+    }
+
+    /// Lock the shader/layout caches, ignoring poison: with `panic = "abort"`
+    /// in both profiles no unwind can ever poison the mutex, and a DDI must
+    /// never panic on lock regardless.
+    pub fn caches_lock(&self) -> std::sync::MutexGuard<'_, ShaderCaches> {
+        self.caches
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Release every bridge-derived COM object, explicitly and in order, while
     /// the bridge device is still alive.
     ///
-    /// Returns the IA cache's `(variants, layouts)` so the existing
+    /// Returns the shader caches' `(variants, layouts)` so the existing
     /// `DDI DestroyDevice: released IA cache variants=N layouts=M` line keeps
     /// its counts verbatim.
     ///
@@ -230,39 +251,43 @@ impl BridgeOwned {
     /// but they move from "released here" to "released whenever the field
     /// drops", which is the ordering this type exists to stop depending on.
     pub fn release(&mut self) -> (usize, usize) {
-        // Order: caches first, IA last, matching the pre-R807 sequence where
-        // `ia` was the field released explicitly. The snapshot ring is a
-        // cache too: dropping the slots releases their COM refs, and that is
-        // ALL its teardown — no WDDM handles, no KMD registrations to unwind
-        // (the KMD carries the descriptor by value and its executor's
-        // `resource_is_live` arm refuses a dead resid loudly).
+        // Order: present caches first, shader caches last, matching the
+        // pre-R807 sequence where `ia` was the field released explicitly. The
+        // snapshot ring is a cache too: dropping the slots releases their COM
+        // refs, and that is ALL its teardown — no WDDM handles, no KMD
+        // registrations to unwind (the KMD carries the descriptor by value and
+        // its executor's `resource_is_live` arm refuses a dead resid loudly).
         self.present_src_cache.get_mut().clear();
         self.snapshot_ring.get_mut().take();
-        self.ia.get_mut().release_owned_com()
+        self.bindings.bound_vs_com.store(0, Ordering::Relaxed);
+        match self.caches.get_mut() {
+            Ok(caches) => caches.release_owned_com(),
+            Err(poisoned) => poisoned.into_inner().release_owned_com(),
+        }
     }
 }
 
 /// `D3D11DDI_THREADING_CAPS::Caps`, the value `get_caps` reports.
 ///
-/// **MUST stay 0 while [`HeliosDevice`] uses `Cell`/`RefCell` and the
-/// deferred-context / command-list slots are stubs (see R812).**
+/// **MUST stay 0 while the deferred-context / command-list slots are stubs
+/// (see R812).** The remaining single-threaded dependents are:
 ///
-/// Every mutable field of `HeliosDevice` is a `Cell` or `RefCell` and its docs
-/// call that "the single-threaded-DDI contract". That is not a DDI guarantee in
-/// general -- it holds only because this driver reports THREADING caps = 0, a
-/// value that was written in another file with no reference to the state
-/// depending on it. Advertise free-threaded creates or command lists and the
-/// runtime may call `pfnCreateResource` on two threads; two `borrow_mut()`s on
-/// `ia` is a `RefCell` panic, and with `panic = "abort"` in both profiles that
-/// is an immediate dwm process kill.
-///
-/// The same cap value is also the only reason the deferred-context and
-/// command-list Create slots R812 covers are never called.
+/// * the present-path `RefCell`s ([`BridgeOwned::present_src_cache`],
+///   [`BridgeOwned::snapshot_ring`]) and the [`RuntimeContext`] window
+///   `Cell`s — safe under FREETHREADED too, because present and the other
+///   immediate-context DDIs stay runtime-serialized; only creates/destroys/
+///   calcs go concurrent. What FREETHREADED actually unlocks needed the
+///   shader caches behind a `Mutex` ([`BridgeOwned::caches`]) and the binding
+///   shadow as relaxed atomics ([`CtxBindings`]) — done (Phase A of the
+///   command-list plan, `tmp/handoff-perf-structural/PLAN-commandlists.md`).
+/// * the deferred-context and command-list Create slots R812 covers, which
+///   this cap value keeps uncalled. Flipping FREETHREADED alone is legal
+///   (creates go concurrent, command lists stay emulated); reporting any
+///   COMMANDLISTS cap without real slot implementations is silent heap
+///   corruption inside the runtime allocator.
 ///
 /// Guarantee is one definition site carrying the rationale, referenced by the
-/// caps writer -- not a token. A `SingleThreadedDeviceModel` token would be
-/// ceremony: it cannot stop anyone editing both sites, and `HeliosDevice` is
-/// already `!Sync` by construction. R811.
+/// caps writer -- not a token. R811.
 pub const THREADING_CAPS: u32 = 0;
 
 /// Per-device UMD state, constructed in-place in the runtime-allocated private
@@ -288,17 +313,26 @@ pub struct HeliosDevice {
     /// Exact pPrimaryDesc allocation identity -> Venus scanout metadata.
     /// DXGI can present a stable resource object while rotating its allocation
     /// handle, so the allocation is the authoritative lookup key.
+    ///
+    /// Mutex, not RefCell: written by CreateResource/DestroyResource (any
+    /// thread under FREETHREADED caps), read by the present path. Lock with
+    /// `crate::forward::lock_ignore_poison`.
     pub direct_scanout_allocations:
-        core::cell::RefCell<Vec<(u32, helios_protocol::HeliosPresentPrivateData)>>,
+        std::sync::Mutex<Vec<(u32, helios_protocol::HeliosPresentPrivateData)>>,
     /// Runtime corelayer handle + callbacks (pfnSetErrorCb) so VOID-returning
     /// DDIs can report failures to the runtime instead of leaving null handles.
     pub h_rt_core_layer: *mut core::ffi::c_void,
     pub um_callbacks: *const core::ffi::c_void,
 }
 
-/// Deferred input-assembler binding state (see [`HeliosDevice::ia`]).
+/// Device-global shader/layout caches (see [`BridgeOwned::caches`]).
+///
+/// Keys are context-invariant identities — VS COM pointers and `LayoutData`
+/// box pointers — never DDI handle-region addresses, so the same entries will
+/// serve deferred contexts once context-local handles exist (a DC-local handle
+/// region carries a copy of the same identity word).
 #[derive(Default)]
-pub struct IaState {
+pub struct ShaderCaches {
     /// VS COM pointer (as `usize`) → its DXBC input-signature bytecode.
     pub vs_bytecode: std::collections::HashMap<usize, Vec<u8>>,
     /// VS COM pointer → the flattened DDI signature words it was created with
@@ -309,49 +343,17 @@ pub struct IaState {
     /// recompiled with the layout's per-register numeric classes. Variants
     /// live until device teardown (bounded: shaders × distinct class sets).
     pub vs_variants: std::collections::HashMap<(usize, u64), usize>,
-    /// The VS COM pointer most recently handed to DXVK's VSSetShader (may be
-    /// a variant; `current_vs` stays the runtime's own binding).
-    pub bound_vs_com: usize,
-    /// Currently-bound vertex shader's COM pointer.
-    pub current_vs: usize,
-    /// Currently-bound pixel shader's COM pointer.
-    pub current_ps: usize,
-    /// Currently-bound geometry shader's COM pointer.
-    pub current_gs: usize,
-    /// Currently-bound hull shader's COM pointer.
-    pub current_hs: usize,
-    /// Currently-bound domain shader's COM pointer.
-    pub current_ds: usize,
-    /// Currently-bound compute shader's COM pointer.
-    pub current_cs: usize,
-    /// Currently-bound primitive topology and first IA buffer state, for draw
-    /// diagnostics on complex D3D11 content.
-    pub current_topology: u32,
-    pub current_vb0: usize,
-    pub current_vb0_stride: u32,
-    pub current_vb0_offset: u32,
-    pub current_ib: usize,
-    pub current_ib_format: u32,
-    pub current_ib_offset: u32,
-    /// Allocation behind RTV slot 0, for live composition diagnostics.
-    pub current_rt0_alloc: u32,
-    /// Dimensions/format behind RTV slot 0, for live composition diagnostics.
-    pub current_rt0_width: u32,
-    pub current_rt0_height: u32,
-    pub current_rt0_format: u32,
-    /// Currently-bound element layout's `LayoutData` raw pointer (0 = none).
-    pub current_layout: usize,
-    /// Cache of created input layouts keyed by (layout_ptr, vs_ptr) → owned
-    /// `ID3D11InputLayout` raw pointer.
+    /// Cache of created input layouts keyed by (LayoutData box ptr, VS COM
+    /// ptr) → owned `ID3D11InputLayout` raw pointer.
     pub layout_cache: std::collections::HashMap<(usize, usize), usize>,
 }
 
-impl IaState {
+impl ShaderCaches {
     /// Release the owned COM references held by the lazy IA caches.
     ///
-    /// Cache keys and the remaining IA fields are non-owning runtime/DXVK
-    /// identities. Only the cache values own references transferred by
-    /// `CreateInputLayout` and `create_shader_sig`.
+    /// Cache keys are non-owning runtime/DXVK identities. Only the cache
+    /// values own references transferred by `CreateInputLayout` and
+    /// `create_shader_sig`.
     pub fn release_owned_com(&mut self) -> (usize, usize) {
         let variant_count = self.vs_variants.values().filter(|&&raw| raw != 0).count();
         let layout_count = self.layout_cache.values().filter(|&&raw| raw != 0).count();
@@ -382,17 +384,59 @@ impl IaState {
                 drop(IUnknown::from_raw(raw as *mut c_void));
             }
         }
-        self.bound_vs_com = 0;
         (variant_count, layout_count)
     }
 }
 
-impl Drop for IaState {
+impl Drop for ShaderCaches {
     fn drop(&mut self) {
         // Normal DestroyDevice calls this explicitly before the DXVK bridge
         // drops. Keep Drop as rollback/panic-path ownership protection.
         self.release_owned_com();
     }
+}
+
+/// Per-context pipeline binding shadow (draw diagnostics + the lazy
+/// input-layout keys). The immediate context's copy is
+/// [`BridgeOwned::bindings`]; each deferred context will own one.
+///
+/// Every field is an independent relaxed atomic scalar rather than a
+/// `RefCell`: a free-threaded `DestroyShader`/`DestroyElementLayout` clears a
+/// matching binding concurrently with draw-path reads, and a `RefCell`
+/// double-borrow there is a panic — with `panic = "abort"` an immediate dwm
+/// kill. No compound invariant spans two fields: the (layout, VS) pair read in
+/// `bind_input_layout` tolerates tearing because the runtime's use-counting
+/// never destroys an object that is still bound, so a torn read only ever
+/// sees values that were both current a moment ago.
+#[derive(Default)]
+pub struct CtxBindings {
+    /// The VS COM pointer most recently handed to DXVK's VSSetShader (may be
+    /// a variant; `current_vs` stays the runtime's own binding).
+    pub bound_vs_com: AtomicUsize,
+    /// Currently-bound per-stage shader COM pointers.
+    pub current_vs: AtomicUsize,
+    pub current_ps: AtomicUsize,
+    pub current_gs: AtomicUsize,
+    pub current_hs: AtomicUsize,
+    pub current_ds: AtomicUsize,
+    pub current_cs: AtomicUsize,
+    /// Currently-bound primitive topology and first IA buffer state, for draw
+    /// diagnostics on complex D3D11 content.
+    pub current_topology: AtomicU32,
+    pub current_vb0: AtomicUsize,
+    pub current_vb0_stride: AtomicU32,
+    pub current_vb0_offset: AtomicU32,
+    pub current_ib: AtomicUsize,
+    pub current_ib_format: AtomicU32,
+    pub current_ib_offset: AtomicU32,
+    /// Allocation behind RTV slot 0, for live composition diagnostics.
+    pub current_rt0_alloc: AtomicU32,
+    /// Dimensions/format behind RTV slot 0, for live composition diagnostics.
+    pub current_rt0_width: AtomicU32,
+    pub current_rt0_height: AtomicU32,
+    pub current_rt0_format: AtomicU32,
+    /// Currently-bound element layout's `LayoutData` raw pointer (0 = none).
+    pub current_layout: AtomicUsize,
 }
 
 pub fn device_private_size() -> usize {

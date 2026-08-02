@@ -280,6 +280,13 @@ fn live_devices() -> &'static std::sync::Mutex<std::collections::HashSet<usize>>
     LIVE.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
 }
 
+/// Lock a mutex, ignoring poison. With `panic = "abort"` in both profiles no
+/// unwind can ever poison a mutex, and a DDI must never panic on lock — so the
+/// poisoned arm hands back the inner guard instead of propagating.
+pub(crate) fn lock_ignore_poison<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 pub(crate) fn register_live_device(device: usize) {
     if device == 0 {
         return;

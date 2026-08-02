@@ -96,8 +96,7 @@ pub(crate) unsafe extern "C" fn create_vertex_shader(
         // Keep the bytecode so input layouts can be created lazily (the ISGN
         // supplies the semantic names CreateInputLayout requires).
         dev.owned
-            .ia
-            .borrow_mut()
+            .caches_lock()
             .vs_bytecode
             .insert(raw, bytes.to_vec());
     } else {
@@ -579,9 +578,9 @@ pub(crate) unsafe fn create_shader_11_1_common(
             // Keep the bytecode so input layouts can be created lazily, and
             // the signature words so input-class variants can be recompiled
             // against the bound layout (resolve_vs_input_variant).
-            let mut ia = dev.owned.ia.borrow_mut();
-            ia.vs_bytecode.insert(raw, bytes.to_vec());
-            ia.vs_sig_words.insert(raw, sig_words);
+            let mut caches = dev.owned.caches_lock();
+            caches.vs_bytecode.insert(raw, bytes.to_vec());
+            caches.vs_sig_words.insert(raw, sig_words);
         }
     } else {
         log_error!("DDI {name} failed");
@@ -904,12 +903,12 @@ pub(crate) unsafe extern "C" fn destroy_shader(h: Hdevice, h_shader: ddi::D3D10D
         if let Some(dev) = helios_device(h) {
             let mut owned = std::collections::HashSet::new();
             let was_vertex_shader = {
-                let mut ia = dev.owned.ia.borrow_mut();
-                let had_bytecode = ia.vs_bytecode.remove(&raw).is_some();
-                let had_signature = ia.vs_sig_words.remove(&raw).is_some();
+                let mut caches = dev.owned.caches_lock();
+                let had_bytecode = caches.vs_bytecode.remove(&raw).is_some();
+                let had_signature = caches.vs_sig_words.remove(&raw).is_some();
                 let was_vertex_shader = had_bytecode || had_signature;
                 if was_vertex_shader {
-                    ia.vs_variants.retain(|&(vs, _), variant| {
+                    caches.vs_variants.retain(|&(vs, _), variant| {
                         if vs == raw {
                             if *variant != 0 {
                                 owned.insert(*variant);
@@ -919,7 +918,7 @@ pub(crate) unsafe extern "C" fn destroy_shader(h: Hdevice, h_shader: ddi::D3D10D
                             true
                         }
                     });
-                    ia.layout_cache.retain(|&(_, vs), layout| {
+                    caches.layout_cache.retain(|&(_, vs), layout| {
                         if vs == raw {
                             if *layout != 0 {
                                 owned.insert(*layout);
@@ -929,15 +928,26 @@ pub(crate) unsafe extern "C" fn destroy_shader(h: Hdevice, h_shader: ddi::D3D10D
                             true
                         }
                     });
-                    if ia.current_vs == raw {
-                        ia.current_vs = 0;
-                    }
-                    if ia.bound_vs_com == raw || owned.contains(&ia.bound_vs_com) {
-                        ia.bound_vs_com = 0;
-                    }
                 }
                 was_vertex_shader
             };
+            if was_vertex_shader {
+                // Defensive: the runtime's use-counting means a destroyed VS
+                // cannot still be bound, but clear the shadow if it is. The
+                // stores happen after the caches lock drops — no compound
+                // invariant ties them to the map edits above.
+                let bindings = &dev.owned.bindings;
+                let _ = bindings.current_vs.compare_exchange(
+                    raw,
+                    0,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                );
+                let bound = bindings.bound_vs_com.load(Ordering::Relaxed);
+                if bound == raw || owned.contains(&bound) {
+                    bindings.bound_vs_com.store(0, Ordering::Relaxed);
+                }
+            }
             for cached in &owned {
                 // SAFETY: the cache owns the COM reference returned by its
                 // Create* operation. Removing the entry transfers that one
@@ -971,9 +981,9 @@ macro_rules! stage_set_shader {
         pub(crate) unsafe extern "C" fn $name(h: Hdevice, h_shader: ddi::D3D10DDI_HSHADER) {
             let com = handle_com_raw(h_shader);
             if let Some(dev) = helios_device(h) {
-                let mut ia = dev.owned.ia.borrow_mut();
-                ia.$current = com;
-                $(ia.$extra = com;)?
+                let bindings = &dev.owned.bindings;
+                bindings.$current.store(com, Ordering::Relaxed);
+                $(bindings.$extra.store(com, Ordering::Relaxed);)?
             }
             if SHADER_SET_LOG_COUNT.first_n(512).is_some() {
                 trace_line!(concat!("DDI ", $tag, "SetShader raw=0x{:x}"), com);
