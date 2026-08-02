@@ -242,6 +242,38 @@ function Publish-HeliosPackageOnly([string]$InfPath) {
   }
 }
 
+# Archive the SYMBOLS of the image this deploy is about to install.
+#
+# Defect 0ac: a 0xD1 bugcheck on 22.22.212.0 had to be triaged from a raw stack,
+# because the .pdb that matched the shipped .sys no longer existed anywhere -- the
+# INF does not name it, so the DriverStore never receives it, and the next build
+# overwrites it in the target directory. One stamped copy per deploy is the whole
+# fix: a dump from KMD version N resolves against <stamp>\staged\.
+#
+# They go in a `staged` SUBDIRECTORY on purpose. The stamp directory's own
+# .sys/.cat/.inf are the files this deploy REPLACED (the rollback set); these are
+# the ones it INSTALLED. Mixing an outgoing binary with an incoming pdb in one
+# flat directory reads like a matched pair and is not one.
+function Save-HeliosKmdSymbols([string]$BackupDir, [string]$PackageDir) {
+  $dir = Join-Path $BackupDir "staged"
+  New-Item -ItemType Directory -Force -Path $dir | Out-Null
+  $saved = @()
+  foreach ($name in @("helios_kmd_render.sys", "helios_kmd_render.pdb", "helios_kmd_render.map")) {
+    $src = Join-Path $PackageDir $name
+    if (Test-Path -LiteralPath $src -PathType Leaf) {
+      Copy-Item -LiteralPath $src -Destination (Join-Path $dir $name) -Force
+      $saved += $name
+    }
+  }
+  if ($saved -notcontains "helios_kmd_render.pdb") {
+    # Loud, not fatal: refusing the deploy over a missing symbol file would be a
+    # worse failure than deploying without it. But a bugcheck on this image will
+    # not be resolvable, so say so at deploy time rather than at triage time.
+    Write-Warning "No helios_kmd_render.pdb in $PackageDir -- this image will ship WITHOUT archived symbols (defect 0ac)."
+  }
+  Write-Host "Archived staged KMD symbols to $dir ($($saved -join ', '))"
+}
+
 function Backup-HeliosActiveFiles([string]$Store, [string[]]$Names) {
   $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
   $dir = Join-Path "C:\ProgramData\HeliosDeployBackups" $stamp
@@ -253,6 +285,7 @@ function Backup-HeliosActiveFiles([string]$Store, [string[]]$Names) {
     }
   }
   Write-Host "Backed up active DriverStore files to $dir"
+  Save-HeliosKmdSymbols $dir $PackageDir
   return $dir
 }
 
