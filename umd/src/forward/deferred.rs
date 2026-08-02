@@ -651,46 +651,38 @@ unsafe fn apply_dc_overrides(f: &mut ddi::D3D11DDI_DEVICEFUNCS) {
     f.pfnDestroyDevice = Some(ddi_destroy_device);
 }
 
-/// Same throttle discipline as the device relocates: the device-side line
-/// measured 2 relocates per CommandListExecute, and a DC-side storm would be
-/// just as hostile to the recording threads.
+/// Notification-only, exactly like the device relocates (see
+/// `device_funcs::relocate_log` for the refill-race post-mortem): the runtime
+/// copies the table itself; refilling a LIVE table stub-sweeps slots that a
+/// concurrent thread may be calling through.
 static DC_RELOCATE_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 fn dc_relocate_log(tag: &str) {
     let n = DC_RELOCATE_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
     if n < 8 || n % 65536 == 0 {
-        log_error!("DDI RelocateDeviceFuncs(DC {tag}) (x{})", n + 1);
+        log_error!("DDI RelocateDeviceFuncs(DC {tag}) (x{}) — noted, table untouched", n + 1);
     }
 }
 
 unsafe extern "C" fn dc_relocate_11_0(
     _h_device: Hdevice,
-    funcs: *mut ddi::D3D11DDI_DEVICEFUNCS,
+    _funcs: *mut ddi::D3D11DDI_DEVICEFUNCS,
 ) {
     dc_relocate_log("11.0");
-    if !funcs.is_null() {
-        fill_dc_11_0(funcs);
-    }
 }
 
 unsafe extern "C" fn dc_relocate_11_1(
     _h_device: Hdevice,
-    funcs: *mut ddi::D3D11_1DDI_DEVICEFUNCS,
+    _funcs: *mut ddi::D3D11_1DDI_DEVICEFUNCS,
 ) {
     dc_relocate_log("11.1");
-    if !funcs.is_null() {
-        fill_dc_11_1(funcs);
-    }
 }
 
 unsafe extern "C" fn dc_relocate_wddm1_3(
     _h_device: Hdevice,
-    funcs: *mut ddi::D3DWDDM1_3DDI_DEVICEFUNCS,
+    _funcs: *mut ddi::D3DWDDM1_3DDI_DEVICEFUNCS,
 ) {
     dc_relocate_log("WDDM1.3");
-    if !funcs.is_null() {
-        fill_dc_wddm1_3(funcs);
-    }
 }
 
 pub(crate) unsafe fn fill_dc_11_0(funcs: *mut ddi::D3D11DDI_DEVICEFUNCS) {

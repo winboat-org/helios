@@ -646,49 +646,50 @@ unsafe extern "C" fn ddi_calc_size(_a: usize) -> usize {
     256
 }
 
-/// Relocate traffic is HOT under command lists: the runtime relocates the
-/// device table TWICE PER pfnCommandListExecute (measured 1,585,160 calls ≈
-/// 2 × 792k executes in one Fire Strike run), so the per-call log line was
-/// ~9k mutex-serialized file writes per second on the render thread — the
-/// exact cost class T2 measured and removed. The refill itself is a few
-/// hundred slot writes and stays; only the I/O is throttled.
+/// `pfnRelocateDeviceFuncs` is a NOTIFICATION: the runtime has already
+/// copied the (driver-filled) table to the new location and tells the driver
+/// so it can update any cached table pointer. This driver caches none, so
+/// the correct implementation is a counted no-op.
+///
+/// ⚠ It must NOT refill the table. Under command lists the runtime relocates
+/// TWICE PER pfnCommandListExecute (measured 1,585,160 calls = 2 × 792k
+/// executes in one Fire Strike run) on the render thread, while FREETHREADED
+/// create/calc DDIs read the same table from worker threads. The old
+/// refill-on-relocate (stub-sweep every slot to `ddi_noop_device`, then
+/// reinstall) made a concurrent `CalcPrivate*Size` transiently return 0 —
+/// the runtime then allocates a zero-byte private region, the paired Create
+/// writes through it, and the heap corruption surfaces as a wild
+/// call (3DMarkICFWorkload c0000005 at a data address, faulting module
+/// "unknown", 2026-08-03). The per-call log line was its own T2-class cost
+/// (~9k mutex-serialized writes/s); first 8 + every 65536th now.
 static RELOCATE_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 fn relocate_log(tag: &str) {
     let n = RELOCATE_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
     if n < 8 || n % 65536 == 0 {
-        log_error!("DDI RelocateDeviceFuncs({tag}) (x{})", n + 1);
+        log_error!("DDI RelocateDeviceFuncs({tag}) (x{}) — noted, table untouched", n + 1);
     }
 }
 
 unsafe extern "C" fn ddi_relocate_device_funcs(
     _h_device: ddi::D3D10DDI_HDEVICE,
-    funcs: *mut ddi::D3D11DDI_DEVICEFUNCS,
+    _funcs: *mut ddi::D3D11DDI_DEVICEFUNCS,
 ) {
     relocate_log("D3D11");
-    if !funcs.is_null() {
-        fill_d3d11_device_funcs(funcs);
-    }
 }
 
 unsafe extern "C" fn ddi_relocate_device_funcs_11_1(
     _h_device: ddi::D3D10DDI_HDEVICE,
-    funcs: *mut ddi::D3D11_1DDI_DEVICEFUNCS,
+    _funcs: *mut ddi::D3D11_1DDI_DEVICEFUNCS,
 ) {
     relocate_log("D3D11.1");
-    if !funcs.is_null() {
-        fill_d3d11_1_device_funcs(funcs);
-    }
 }
 
 unsafe extern "C" fn ddi_relocate_device_funcs_wddm1_3(
     _h_device: ddi::D3D10DDI_HDEVICE,
-    funcs: *mut ddi::D3DWDDM1_3DDI_DEVICEFUNCS,
+    _funcs: *mut ddi::D3DWDDM1_3DDI_DEVICEFUNCS,
 ) {
     relocate_log("WDDM1.3");
-    if !funcs.is_null() {
-        fill_wddm1_3_device_funcs(funcs);
-    }
 }
 
 unsafe fn audit_wddm1_3_device_funcs(tag: &str, funcs: *mut ddi::D3DWDDM1_3DDI_DEVICEFUNCS) {
