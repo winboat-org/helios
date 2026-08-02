@@ -46,3 +46,4 @@ $RECYCLE.BIN/
 
 # Local clean-tree comparison mirror
 /umd_clean/
+__pycache__/
