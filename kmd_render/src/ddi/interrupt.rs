@@ -28,21 +28,94 @@ pub static INT_ROUTINE_COUNT: AtomicU32 = AtomicU32::new(0);
 pub static DPC_ROUTINE_COUNT: AtomicU32 = AtomicU32::new(0);
 pub static CONTROL_INT_COUNT: AtomicU32 = AtomicU32::new(0);
 
-/// Drain used control-queue entries and retire any WDDM fences whose Venus
-/// watermark is now complete. Normally called from the device DPC; the
-/// scanout worker may also call it at PASSIVE_LEVEL as a bounded fallback
-/// while one fire-and-forget RESOURCE_FLUSH is outstanding. Keeping fence
-/// retirement here prevents an opportunistic drain from consuming a Venus
-/// completion without notifying VidSch.
+/// Drain used control-queue entries, apply any completed DISPATCH-level scan-out
+/// bind, and retire any WDDM fences whose Venus watermark is now complete.
+/// Normally called from the device DPC; the scanout worker may also call it at
+/// PASSIVE_LEVEL as a bounded fallback while one fire-and-forget RESOURCE_FLUSH
+/// is outstanding. Keeping fence retirement here prevents an opportunistic drain
+/// from consuming a Venus completion without notifying VidSch.
+///
+/// The bind application lives HERE rather than in `drain_used` because of the
+/// lock order — see the comment on it below.
 pub(crate) fn drain_used_and_complete(adapter: &AdapterContext) {
     let _ = adapter.with_virtio(|v| v.drain_used());
 
+    // ── The DISPATCH fast bind's application (ROADMAP defect 0ab-C, D1(ii)) ──
+    //
+    // A SECOND, short `with_virtio`, and the separation is the point: the drain
+    // above holds `virtio_lock`, while applying a bind ends in a flush arm that
+    // needs `wddm_notify_lock` — the driver's order is notify → virtio (see
+    // `adapter/locks.rs` and `end_scanout_leases_through`), and inverting it is
+    // a DIRQL deadlock with no attributable bugcheck. So the drain stashes
+    // VALUES and this frame, holding no transport lock, applies them.
+    let fast_bind = adapter
+        .with_virtio(|v| v.take_completed_bind())
+        .ok()
+        .flatten()
+        .filter(|bind| {
+            // The wire-order guard. A bind whose sequence no longer advances the
+            // applied watermark was overtaken on the wire by one whose
+            // bookkeeping is already live; applying it now would name a resource
+            // the host has moved off.
+            let adopted = adapter.adopt_scanout_bind_seq(bind.seq);
+            if !adopted {
+                crate::ddi::scanout_trace::note_fast_bind_late();
+            }
+            adopted
+        });
+    if let Some(bind) = fast_bind {
+        // Atomics only, so this is DISPATCH-legal as it stands: no registry
+        // write (the counters are mirrored from the PASSIVE `pacing_snapshot`),
+        // no allocation, no wait.
+        //
+        // Sampled here rather than in the drain: every application is
+        // seq-ordered by the guard above, so the value this reads is the one the
+        // preceding application left, which is what makes the supersede decision
+        // coherent. A rebind to a DIFFERENT resource ends every older epoch's
+        // lease — the control queue is FIFO, so a returned SET_SCANOUT_BLOB
+        // proves every earlier flush completed.
+        let previous = adapter.host_bound_scanout_resource.load(Ordering::Acquire);
+        let superseded = previous != 0 && previous != bind.resource_id;
+        adapter.remember_scanout_blob(bind.resource_id, (bind.wh >> 32) as u32, bind.wh as u32);
+        adapter.publish_bound_epoch(bind.present_epoch, superseded);
+        adapter.publish_bound_primary(bind.primary_address);
+        crate::ddi::scanout_trace::note_fast_bind_applied();
+    }
+
     adapter.with_wddm_notify_lock(|guard| {
+        // The bind edge's flush arm, run with the boundary the FLIP carried
+        // (D1(i)) rather than a sample taken now — the whole point of the
+        // 22.22.217.0 ordering, preserved by carrying the mark through the
+        // in-flight entry. Same shape as the `refresh_ready` tail below: the
+        // locked body decides, and the caller requests the refresh.
+        //
+        // No liveness re-check here on purpose: the flush executor re-validates
+        // (`resource_is_live` + the `RfUnb` arm) before it issues any read, so a
+        // resource that died between the bind and now self-heals exactly as
+        // today's stale states do — and host-side FIFO means our bind always
+        // precedes any unref of the same resource.
+        if let Some(bind) = fast_bind {
+            let (ready, carried) =
+                adapter.arm_bind_refresh_locked(guard, bind.resource_id, bind.carried_watermark);
+            if carried {
+                crate::ddi::scanout_trace::note_bind_watermark_carried();
+            } else {
+                crate::ddi::scanout_trace::note_bind_watermark_sampled();
+            }
+            crate::ddi::scanout_trace::note_bind_refresh(ready);
+            if ready {
+                adapter.request_scanout_refresh_for(bind.resource_id);
+            }
+        }
+
+        // Carries the armed resource through: the refresh must flush the frame
+        // its marker belonged to, not whatever is bound when the worker runs.
         let refresh_ready = guard
             .with_virtio(|o, v| v.take_ready_scanout_refresh(o))
-            .unwrap_or(false);
-        if refresh_ready {
-            adapter.request_scanout_refresh();
+            .ok()
+            .flatten();
+        if let Some(resource_id) = refresh_ready {
+            adapter.request_scanout_refresh_for(resource_id);
         }
 
         // One at a time, so a failed notification can put its fence back. The
@@ -55,12 +128,25 @@ pub(crate) fn drain_used_and_complete(adapter: &AdapterContext) {
         // On an idle desktop VidSch then never sees that fence retire and
         // escalates to TDR.
         loop {
-            let Some(ready) = guard
+            // No lease watermark is read here any more. Until 22.22.217.0 a
+            // submission also waited for the host to READ the buffer it
+            // published, and a blocked head ran a liveness pump that asked the
+            // display worker for that read. Both are gone: the withholding was
+            // measured inert against the black frames (the 2×2 factorial), and
+            // the pump was itself a black-frame producer — a flush issued to
+            // satisfy a lease republishes whatever is bound NOW, which is an
+            // older buffer the app may already have reclaimed (measured: the
+            // 1–3 ms bucket 0.6 % → 5.0 %, duplicate-content reads 3.5 % → 9.1 %
+            // on 22.22.215.0). The ordering the frames actually need is the
+            // ownership gate on the flush executor, not a completion policy.
+            let taken = guard
                 .with_virtio(|o, v| v.take_one_ready_wddm(o))
-                .ok()
-                .flatten()
-            else {
-                break;
+                .unwrap_or(crate::virtio::WddmTake::Empty);
+            let ready = match taken {
+                crate::virtio::WddmTake::Ready(ready) => ready,
+                crate::virtio::WddmTake::Empty | crate::virtio::WddmTake::BlockedOnProducer => {
+                    break;
+                }
             };
             let Some(dxgkrnl) = adapter.dxgkrnl_opt() else {
                 // No callback table: we cannot deliver and must not drop it.

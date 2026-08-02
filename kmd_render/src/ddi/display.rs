@@ -8,10 +8,7 @@
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use bytemuck::pod_read_unaligned;
-use helios_protocol::{
-    HeliosPresentPrivateData, HELIOS_WDDM_ALLOC_KIND_DEVICE_MEMORY, HELIOS_WDDM_ALLOC_KIND_STANDARD,
-};
+use helios_protocol::{HELIOS_WDDM_ALLOC_KIND_DEVICE_MEMORY, HELIOS_WDDM_ALLOC_KIND_STANDARD};
 
 use crate::adapter::{AdapterContext, ScanoutGuard};
 use crate::ddi::create_allocation::{present_alloc_info, PresentAllocationStorage, ScanoutTarget};
@@ -24,6 +21,7 @@ use crate::dxgk::*;
 use crate::irql::PassiveLevel;
 use crate::virtio::venus::{OptimalPresentImageDesc, PresentBufferDesc, PresentDestinationDesc};
 use crate::virtio::VirtioError;
+use helios_kmd_logic::snapshot_bind::SnapshotDescriptor;
 use helios_kmd_logic::ScanoutFormat;
 use wdk_sys::ntddk::KeGetCurrentIrql;
 
@@ -136,21 +134,14 @@ fn production_linear_scanout(
     )
 }
 
-unsafe fn present_private_data(args: &DXGKARG_PRESENT) -> Option<HeliosPresentPrivateData> {
-    if args.pPrivateDriverData.is_null()
-        || (args.PrivateDriverDataSize as usize) < core::mem::size_of::<HeliosPresentPrivateData>()
-    {
-        return None;
-    }
-    let bytes = unsafe {
-        core::slice::from_raw_parts(
-            args.pPrivateDriverData as *const u8,
-            core::mem::size_of::<HeliosPresentPrivateData>(),
-        )
-    };
-    let data: HeliosPresentPrivateData = pod_read_unaligned(bytes);
-    data.is_valid().then_some(data)
-}
+// RETIRED (0ab-C close-out): the `DXGKARG_PRESENT.pPrivateDriverData` decode
+// and its `PBIdOk` cross-check. Measured fact that retired it: dxgkrnl never
+// forwarded the UMD's PresentCb private data to DxgkDdiPresent on the DMA-flip
+// path — `PBIdOk` read 2 ("no payload") across three driver generations
+// (c5/c6/c7, ROADMAP 0ab-C). The ONE per-present channel to the flip arm is
+// the inline `HeliosPresentRenderCmd` via `DxgkDdiRender`, stashed per-context
+// and taken below (D4b). The UMD stopped writing the dead field in the same
+// change.
 
 /// Mirror present-path tracers into the PASSIVE registry ring.
 ///
@@ -207,6 +198,16 @@ unsafe fn dxgkddi_present_inner(
     PRESENT_LAST_PATCH_SIZE.store(args.PatchLocationListOutSize, Ordering::Relaxed);
     let present_flags = unsafe { args.Flags.__bindgen_anon_1.Value };
     PRESENT_LAST_FLAGS.store(present_flags, Ordering::Relaxed);
+    // Unsampled arm census. `PBflag` records the same bits but is behind
+    // `sample_tick`, so it cannot answer "did dxgkrnl keep issuing flips while
+    // it stopped naming source addresses?" — which is the open question.
+    crate::ddi::scanout_trace::note_present(
+        present_flags,
+        args.FlipInterval as u32,
+        !args.pDmaBuffer.is_null(),
+        present_flags & 1 != 0,
+        present_flags & (1 << 2) != 0,
+    );
 
     // Decode the payload union arm ONCE, from the flags, before anything reads
     // it. Both this DDI and PresentToHwQueue used to pick `pAllocationList`
@@ -250,13 +251,20 @@ unsafe fn dxgkddi_present_inner(
         crate::diag::record_named_bytes(b"PBPatch", args.PatchLocationListOutSize);
     }
 
-    let present_private = unsafe { present_private_data(args) };
     if sample {
-        crate::diag::record_named_bytes(b"PBpdsz", args.PrivateDriverDataSize);
         crate::diag::record_named_bytes(b"PBkpsz", args.DmaBufferPrivateDataSize);
     }
     let present_context = unsafe { ContextHandleRef::from_raw(h_context) };
     let adapter = present_context.as_ref().and_then(ContextHandleRef::adapter);
+    // D4b: take (read + CLEAR) this context's stashed snapshot descriptor —
+    // the one `DxgkDdiRender` decoded from the UMD's `HeliosPresentRenderCmd`
+    // immediately before this present. Taken UNCONDITIONALLY, on every arm
+    // (flip, MMIO, BLT): the clear is the orphan bound, so a stash whose
+    // present failed cannot leak past the next present on this context. Only
+    // the DMA-flip arm below consumes it, after per-arm validation.
+    let stashed_snapshot = present_context
+        .as_ref()
+        .and_then(ContextHandleRef::take_snapshot_stash);
     let src_handle = present_allocations
         .source()
         .map(|allocation| allocation.handle())
@@ -611,6 +619,11 @@ unsafe fn dxgkddi_present_inner(
             PRESENT_LAST_STATUS.store(STATUS_INVALID_PARAMETER as u32, Ordering::Relaxed);
             return STATUS_INVALID_PARAMETER;
         };
+        // Unsampled: which buffer dxgkrnl asked to flip TO, for the whole run.
+        // Compared against `Vs*` (which of those it then named through
+        // SetVidPnSourceAddress), a difference localises the break to the
+        // flip-retirement contract rather than to the bind path.
+        crate::ddi::scanout_trace::PRESENT_FLIP_HISTOGRAM.note(source.resource_id);
         // Flip identity, SAMPLED (the 0xE1/0xE2 failure arms above stay
         // unconditional — those are the values a failed Present is read from).
         if sample {
@@ -620,22 +633,12 @@ unsafe fn dxgkddi_present_inner(
             crate::diag::record_named_bytes(b"PBsDir", u32::from(source.direct_scanout));
         }
 
-        // The driver-private Present payload is retained only as a diagnostic
-        // cross-check. It must never override the identity that Windows placed
-        // in the Present allocation list.
-        let private_match = present_private
-            .map(|private| {
-                private.resource_id == source.resource_id
-                    && private.width == source.width
-                    && private.height == source.height
-                    && private.dxgi_format == dxgi_format
-                    && private.plane_offset == source.plane_offset
-            })
-            .map(u32::from)
-            .unwrap_or(2);
-        if sample {
-            crate::diag::record_named_bytes(b"PBIdOk", private_match);
-        }
+        // The FLIP itself (epoch stamp, VidMm physical address, CRTC_VSYNC
+        // retirement) always belongs to the allocation-list source; the ONLY
+        // per-present override is the D4b snapshot BIND-TARGET descriptor
+        // taken from the Render-command stash above, after per-arm validation.
+        // (The old `PBIdOk` cross-check against the PresentCb private payload
+        // is retired with the channel — see the note at the top of this file.)
 
         // It must not program scanout here: dxgkrnl subsequently names the
         // allocation that actually reached the VidPn source through
@@ -656,10 +659,88 @@ unsafe fn dxgkddi_present_inner(
         // otherwise valid pfnPresentCb fail before the VidPn handoff can occur.
         if args.pDmaBuffer.is_null() {
             crate::diag::record_named_bytes(b"PBMmio", 1);
+            crate::ddi::scanout_trace::note_present_mmio_flip();
             args.MultipassOffset = 0;
             PRESENT_LAST_STATUS.store(STATUS_SUCCESS as u32, Ordering::Relaxed);
             return STATUS_SUCCESS;
         }
+
+        // DMA-BUFFER FLIP. dxgkrnl gave us a DMA buffer, which means it will
+        // NOT call SetVidPnSourceAddress for this flip — the driver programs
+        // the display when the buffer executes, and the submission fence is
+        // what tells dxgkrnl the flip happened. Record the exact allocation and
+        // the address dxgkrnl assigned it; `submit_command` picks both up and
+        // arms the same deferred programming the MMIO path arms, and the flip's
+        // DMA fence then retires behind it instead of ahead of it.
+        //
+        // The allocation list is the ONLY source for that address here (see
+        // `PresentAllocation::physical_address`), which is why it is captured
+        // now rather than resolved later.
+        let flip_source = match present_allocations.source() {
+            Some(allocation) => allocation,
+            None => {
+                crate::diag::record_named_bytes(b"PBFlip", 0xE4);
+                PRESENT_LAST_STATUS.store(STATUS_INVALID_PARAMETER as u32, Ordering::Relaxed);
+                return STATUS_INVALID_PARAMETER;
+            }
+        };
+        // The allocation list carries the DEVICE-SPECIFIC open handle; the
+        // scan-out path keys on the GLOBAL one. Bridge them through the venus
+        // resource id, which is the only identity both sides hold honestly —
+        // see `create_allocation::SCANOUT_ALLOCS`. Measured before this
+        // existed: `VpDmaF=165, VpDmaA=0, VpPrF=165`, i.e. every DMA flip
+        // failed to pair because the open handle is not an `AllocationContext*`.
+        let Some(flip_allocation) =
+            crate::ddi::create_allocation::scanout_allocation_for_resource(source.resource_id)
+        else {
+            crate::diag::record_named_bytes(b"PBFlip", 0xE6);
+            PRESENT_LAST_STATUS.store(STATUS_INVALID_PARAMETER as u32, Ordering::Relaxed);
+            return STATUS_INVALID_PARAMETER;
+        };
+        // D4b SNAPSHOT SUBSTITUTION, decided HERE and carried by value. The
+        // candidate arrived through the RENDER command's per-context stash
+        // (taken above) — NOT through `pPrivateDriverData`, which dxgkrnl does
+        // not forward to this DDI on flip presents (`PBIdOk` = "no payload"
+        // across three driver generations). Every field the stash claims is
+        // validated per-arm against the ALLOCATION-LIST source (extent) and
+        // the direct-scan-out layout rules including the undersize guard
+        // (`helios_kmd_logic::snapshot_bind`). Any failure falls back to
+        // binding the flipped allocation exactly as today, counted `SnFbk`; a
+        // validated descriptor counts `SnSub` ONCE per flip, at this single
+        // decision site.
+        let snapshot = stashed_snapshot.and_then(|candidate| {
+            match helios_kmd_logic::snapshot_bind::validate(
+                &candidate,
+                source.width,
+                source.height,
+            ) {
+                Ok(()) => {
+                    crate::ddi::scanout_trace::note_snapshot_substituted();
+                    Some(candidate)
+                }
+                Err(_) => {
+                    crate::ddi::scanout_trace::note_snapshot_fallback();
+                    None
+                }
+            }
+        });
+        if let Err(status) = unsafe {
+            crate::ddi::present_packet::PresentFlipPrivate::write(
+                args.pDmaBufferPrivateData,
+                args.DmaBufferPrivateDataSize,
+                flip_allocation,
+                flip_source.physical_address(),
+                snapshot,
+            )
+        } {
+            crate::diag::record_named_bytes(b"PBFlip", 0xE5);
+            PRESENT_LAST_STATUS.store(status as u32, Ordering::Relaxed);
+            return status;
+        }
+        crate::ddi::scanout_trace::note_present_dma_flip(
+            source.resource_id,
+            flip_source.segment_id(),
+        );
     }
 
     // The BLT path carried its token here; every other path queues nothing, so
@@ -900,10 +981,17 @@ pub unsafe extern "C" fn dxgkddi_set_vidpn_source_address(
         return STATUS_NOT_SUPPORTED;
     }
     let adapter = unsafe { &*p };
+    // Unsampled, atomics-only, and FIRST — before any refusal below can hide the
+    // fact that dxgkrnl called at all. `VpEnt` not moving during a workload is
+    // itself the answer to "why is the bind pinned"; every sampled `Sc*` value
+    // is silent about it. Legal here: this is a plain atomic increment with no
+    // registry transaction, and the DDI can arrive at DIRQL.
+    crate::ddi::scanout_trace::note_ddi_entry();
     // Windows names the authoritative desktop primary here. This—not resource
     // dimensions, OM bindings, process name, or an arbitrary Present call—is the
     // only allocation the KMD may bind directly or copy into the fallback image.
     if address.is_null() {
+        crate::ddi::scanout_trace::note_ddi_null_arg();
         return STATUS_SUCCESS;
     }
     let h_alloc = unsafe { (*address).hAllocation };
@@ -925,6 +1013,7 @@ pub unsafe extern "C" fn dxgkddi_set_vidpn_source_address(
             primary_flags,
         )
     } {
+        crate::ddi::scanout_trace::note_ddi_pair_failed();
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -938,9 +1027,20 @@ pub unsafe extern "C" fn dxgkddi_set_vidpn_source_address(
         // of the branch — which is the exact invalid sequence the item was
         // written for ("compiles, links, ships, and either deadlocks at DISPATCH
         // on a KEVENT wait or calls MmAllocateContiguousMemory above APC_LEVEL").
-        adapter
+        crate::ddi::scanout_trace::note_ddi_split(true);
+        // `swap`, not `store`, purely so the overwritten value is observable:
+        // this slot holds ONE pending handle, so dxgkrnl flipping faster than
+        // the PASSIVE worker drains silently discards every intermediate
+        // primary. That coalescing is by design, but its RATE is exactly the
+        // measurement missing from "the bind stays pinned" — and it was
+        // previously unobservable, because a discarded handle leaves no trace
+        // anywhere. The stored value and its ordering are unchanged.
+        let previous = adapter
             .pending_vidpn_allocation
-            .store(h_alloc as usize, Ordering::Release);
+            .swap(h_alloc as usize, Ordering::AcqRel);
+        if previous != 0 && previous != h_alloc as usize {
+            crate::ddi::scanout_trace::note_ddi_coalesced(previous);
+        }
         return STATUS_SUCCESS;
     }
 
@@ -948,8 +1048,259 @@ pub unsafe extern "C" fn dxgkddi_set_vidpn_source_address(
     // (dxgkrnl's MMIO-flip path invokes it under DxgkCbSynchronizeExecution), so
     // the annotation proves nothing here — the runtime check immediately above
     // does. This mint is downstream of it and must stay there.
+    crate::ddi::scanout_trace::note_ddi_split(false);
     let passive = unsafe { crate::irql::PassiveLevel::assume() };
     unsafe { apply_vidpn_source_address(passive, adapter, h_alloc) }
+}
+
+/// Arm the deferred scan-out programming for the DMA-BUFFER FLIP contract.
+///
+/// The MMIO path reaches the same state through
+/// [`set_vidpn_source_address_dirql`]; this is the entry point for flips
+/// dxgkrnl never calls `SetVidPnSourceAddress` for, and it is called from the
+/// submit path when the flip's DMA buffer is handed to the scheduler.
+///
+/// The DIFFERENCE THAT MATTERS is not in here, it is in the caller: on the MMIO
+/// path the DDI returns STATUS_SUCCESS immediately and dxgkrnl treats that as
+/// the flip having happened, so the programming this arms lands after dxgkrnl
+/// has already moved on. Here the flip's DMA fence is still outstanding, so
+/// dxgkrnl is still waiting when the programming runs.
+///
+/// Returns false if the handle could not be paired, in which case the gate is
+/// NOT raised.
+///
+/// # Safety
+/// `h_alloc` is the allocation handle dxgkrnl placed in the present allocation
+/// list and this driver copied into the kernel-only DMA private data.
+pub(crate) unsafe fn arm_dma_flip_programming(
+    adapter: &AdapterContext,
+    h_alloc: HANDLE,
+    primary_address: u64,
+    present_epoch: u64,
+    snapshot: Option<SnapshotDescriptor>,
+) -> bool {
+    // Segment and flags are the MMIO path's `DXGKARG_SETVIDPNSOURCEADDRESS`
+    // fields, which this contract has no equivalent of. The segment is only
+    // ever echoed back in diagnostics, and the flags word carries no bit this
+    // driver reads, so pairing 0 for both is honest rather than invented.
+    //
+    // `present_epoch` rides on the allocation for a load-bearing reason:
+    // `pending_vidpn_allocation` is a single slot that coalesces (`VpCoal`), so
+    // a parallel "newest epoch" atomic would let the worker pair one flip's
+    // handle with a different flip's epoch.
+    //
+    // The frame boundary rides along for that same reason AND for its own: the
+    // mark table holds one entry per resource, so by the time the PASSIVE worker
+    // binds, the same buffer's next present may already have replaced it. Taken
+    // HERE — the last point at which the mark still belongs to the frame being
+    // flipped — and consumed at the bind (ROADMAP defect 0ab-B, D1(i)).
+    //
+    // KEYED BY THE BOUND IDENTITY (the one-line key alignment that preserves
+    // 0ab-A across D4b): the marker records the watermark under the UMD's
+    // private-data resid, which on a substituted flip is the SNAPSHOT resid —
+    // so a substituted flip takes by the descriptor's resid, and everything
+    // downstream (`arm_bind_refresh`, the D2 identity arm, `RfUnb`, epochs,
+    // leases, the D4a ledger) self-aligns because armed = bound = snapshot.
+    let frame_watermark = adapter.take_flip_frame_watermark(match snapshot {
+        Some(snap) => snap.resource_id,
+        None => unsafe { crate::ddi::create_allocation::allocation_resource_id(h_alloc) },
+    });
+    if !unsafe {
+        crate::ddi::create_allocation::set_vidpn_primary_address(
+            h_alloc,
+            0,
+            primary_address,
+            0,
+            present_epoch,
+            frame_watermark,
+            snapshot,
+        )
+    } {
+        crate::ddi::scanout_trace::note_ddi_pair_failed();
+        return false;
+    }
+    let _ticket = adapter.raise_programming_gate();
+    let previous = adapter
+        .pending_vidpn_allocation
+        .swap(h_alloc as usize, Ordering::AcqRel);
+    if previous != 0 && previous != h_alloc as usize {
+        crate::ddi::scanout_trace::note_ddi_coalesced(previous);
+    }
+    adapter.signal_hpd();
+    // Everything above is UNCHANGED, and that is the design: the fast bind is a
+    // pure accelerator. The slot is armed, the gate is raised and the worker
+    // will run exactly as it does today — the only difference is that the host
+    // may already be bound by the time it gets there, in which case its
+    // `already_bound` arm short-circuits the wire bind (`VpSkip` rises, which is
+    // expected and benign).
+    unsafe {
+        fast_bind_from_flip(
+            adapter,
+            h_alloc,
+            primary_address,
+            present_epoch,
+            frame_watermark,
+            snapshot,
+        )
+    };
+    true
+}
+
+/// Enqueue this flip's `SET_SCANOUT_BLOB` NOW, from the flip arm, instead of
+/// waiting for the PASSIVE display worker to get to it (ROADMAP defect 0ab-C,
+/// D1(ii)).
+///
+/// WHY. The worker's bind cadence was measured bimodal — 44–48 % of binds 1–3 ms
+/// apart, 19–24 % 10–14 ms apart, 10–11 % beyond 20 ms — against a 4.8 ms flip
+/// cadence at GT2's 210 fps. Every stall pushes some bind two or more frame
+/// periods past its present, and by the time it lands the app has had the buffer
+/// back and re-cleared it: 370/391 of a run's black flushes sat in the 1–3 ms
+/// bind-age bucket of FIRST reads, i.e. the read was prompt and the BIND was
+/// late. Enqueueing here makes the host-side bind moment ≈ flip + ctrl transit,
+/// independent of the worker's stalls, and the control queue is FIFO so the
+/// earlier enqueue wins even when the worker later races through its own path.
+///
+/// WHAT IT IS NOT. It does not claim `pending_vidpn_allocation` (that would hide
+/// the handle from `retire_scanout_allocation_locked`'s cancel CAS — a
+/// use-after-free), it does not touch the `vidpn_programming` gate, it does not
+/// wait, and it never becomes the only binder: every bail-out below simply
+/// leaves today's behaviour in place, counted.
+///
+/// IRQL: DISPATCH_LEVEL. Reached from `DxgkDdiSubmitCommand`'s flip arm, which
+/// already takes `wddm_notify_lock` here (`take_flip_frame_watermark`), so
+/// taking the virtio spinlock is equally legal. The MMIO/DIRQL arm
+/// (`set_vidpn_source_address_dirql`) deliberately gets NO fast path: device
+/// DIRQL cannot take a DISPATCH spinlock, and the desktop contract has no
+/// measured black-frame defect to fix.
+///
+/// # Safety
+/// `h_alloc` is the live KMD allocation handle from the flip's private data —
+/// the same one the caller has just paired an address with.
+unsafe fn fast_bind_from_flip(
+    adapter: &AdapterContext,
+    h_alloc: HANDLE,
+    primary_address: u64,
+    present_epoch: u64,
+    frame_watermark: u64,
+    snapshot: Option<SnapshotDescriptor>,
+) {
+    use crate::ddi::scanout_trace::skip;
+
+    let knobs = adapter.knobs();
+    if !knobs.dispatch_bind {
+        crate::ddi::scanout_trace::note_fast_bind_skip(skip::KNOB_OFF);
+        return;
+    }
+    if knobs.bind_flush_immediate {
+        // Mode 1 is the diagnostic that measures the OLD bind→flush ordering.
+        // Accelerating the bind underneath it would silently change what that
+        // A/B answers.
+        crate::ddi::scanout_trace::note_fast_bind_skip(skip::DIAG_MODE);
+        return;
+    }
+    // SAFETY: per this function's contract — the handle dxgkrnl placed in the
+    // present allocation list, which the caller has already resolved once.
+    let source = match unsafe { crate::ddi::create_allocation::scanout_alloc_info(h_alloc) } {
+        Some(source) if source.direct_scanout => source,
+        _ => {
+            crate::ddi::scanout_trace::note_fast_bind_skip(skip::NOT_DIRECT);
+            return;
+        }
+    };
+    // D4b: a carried snapshot descriptor substitutes the BIND TARGET, by value
+    // (`from_snapshot_descriptor` re-runs the same layout validation the
+    // Present arm already passed). Structurally-unreachable failure falls back
+    // to the flipped allocation, counted — the §6 "descriptor fails" row.
+    let substituted = snapshot.and_then(|snap| {
+        match ScanoutTarget::from_snapshot_descriptor(&snap) {
+            Ok(target) => Some(target),
+            Err(_) => {
+                crate::ddi::scanout_trace::note_snapshot_fallback();
+                None
+            }
+        }
+    });
+    // The SAME validation the worker runs, through the SAME constructor: the
+    // pitch/offset/size/format checks are the undersize guard that keeps QEMU
+    // from reading past the blob (the 38th-session Xid-31 lesson), and they are
+    // not restated here in any weakened form.
+    let target = match substituted {
+        Some(target) => target,
+        None => match ScanoutTarget::from_direct_primary(&source, source.width, source.height) {
+            Ok(target) => target,
+            Err(_) => {
+                crate::ddi::scanout_trace::note_fast_bind_skip(skip::LAYOUT);
+                return;
+            }
+        },
+    };
+    // The STEADY-STATE test, and it is also the mode check. `active_scanout_wh`
+    // is only ever written by a bind that already proved its extent equals the
+    // advertised mode, so an extent equal to it is equal to the mode — while a
+    // first bind (0) and a mode change (a different extent) both fall through to
+    // the worker, which owns mode-set ordering and the LINEAR fallback.
+    let wh = ((target.width() as u64) << 32) | target.height() as u64;
+    if wh == 0 || adapter.active_scanout_wh.load(Ordering::Acquire) != wh {
+        crate::ddi::scanout_trace::note_fast_bind_skip(skip::EXTENT);
+        return;
+    }
+    // "Already bound" means the newest ENQUEUED bind already names this
+    // resource — the identity the host will hold when this flip's bind would
+    // land — NOT the identity already applied.
+    //
+    // Comparing against the applied `active_scanout_resource` (22.22.219.0) was
+    // measured to skip ~1-in-3 eligible flips, flat across the scene: at 2-deep
+    // pipelining the applied identity runs 1–2 flips behind, so the very flip
+    // this path exists to accelerate looks already bound (`FsC0` 2140/2192 per
+    // run, every skip reason 6; ROADMAP defect 0ab-C). Those uncovered flips
+    // rode only the worker's bind, whose lateness climbs late-scene — the
+    // residual black.
+    //
+    // Relaxed is sufficient and correct here: every writer publishes this word
+    // under `virtio_lock` beside the sequence it belongs to, a stale read costs
+    // at worst one redundant (host-idempotent) bind or one missed acceleration,
+    // and the enqueue below re-takes that lock and mints its own sequence, which
+    // is what actually orders the bookkeeping. See the field's own doc.
+    if adapter.scanout_bind_wire_resource.load(Ordering::Relaxed) == target.resource_id() {
+        crate::ddi::scanout_trace::note_fast_bind_skip(skip::ALREADY_BOUND);
+        return;
+    }
+    let request = crate::virtio::ScanoutBindRequest {
+        resource_id: target.resource_id(),
+        width: target.width(),
+        height: target.height(),
+        format: target.format().virtio(),
+        stride: target.pitch(),
+        offset: target.plane_offset(),
+        present_epoch,
+        primary_address,
+        // The SAME boundary the caller stamped on the allocation for the
+        // worker's own bind (D1(i)); whichever bind lands first orders its flush
+        // against this frame, not against a later sample.
+        carried_watermark: frame_watermark,
+    };
+    let outcome = adapter.with_virtio(|v| match v.take_bind_cmd_buffer() {
+        None => Err(crate::virtio::FastBindRefusal::Busy),
+        Some(buf) => {
+            // Minted INSIDE this lock hold, next to the enqueue it names: that
+            // is what makes the sequence agree with the control queue's FIFO
+            // order, which is the order the host applies the binds in. The same
+            // call publishes this resource as the newest ENQUEUED bind, which is
+            // what the skip test above reads.
+            let seq = adapter.mint_scanout_bind_seq(target.resource_id());
+            v.enqueue_scanout_bind_async(buf, seq, &request)
+        }
+    });
+    match outcome {
+        Ok(Ok(())) => crate::ddi::scanout_trace::note_fast_bind_enqueued(),
+        Ok(Err(crate::virtio::FastBindRefusal::Busy)) => {
+            crate::ddi::scanout_trace::note_fast_bind_busy()
+        }
+        Ok(Err(crate::virtio::FastBindRefusal::Failed)) => {
+            crate::ddi::scanout_trace::note_fast_bind_error()
+        }
+        Err(_) => crate::ddi::scanout_trace::note_fast_bind_skip(skip::NO_TRANSPORT),
+    }
 }
 
 /// The atomics-only half of `SetVidPnSourceAddress`, legal at DIRQL.
@@ -983,6 +1334,21 @@ unsafe fn set_vidpn_source_address_dirql(
             primary_segment,
             primary_address,
             primary_flags,
+            // NO_LEASE: on the MMIO/`FlipOnVSyncMmIo` contract dxgkrnl retires
+            // the flip BEFORE calling this DDI, so there is no fence of ours
+            // left to gate and nothing for a presentation lease to protect. It
+            // is also the contract DWM's 3-deep desktop chain uses, where the
+            // 0ab-B window has never been observed and where withholding the
+            // address from CRTC_VSYNC could cost a whole refresh interval.
+            helios_kmd_logic::scanout_lease::NO_LEASE,
+            // No carried frame boundary either: dxgkrnl retired this flip before
+            // calling us, so "now" at the bind IS this frame's boundary and
+            // there is nothing earlier to carry.
+            0,
+            // No snapshot on the MMIO/desktop contract — and passing `None`
+            // ZEROES any stamp a previous DMA flip of this allocation left, so
+            // a stale descriptor can never leak into a desktop bind.
+            None,
         )
     } {
         return false;
@@ -1049,13 +1415,14 @@ unsafe fn apply_deferred_vidpn_source_address_locked(
     h_alloc: HANDLE,
 ) -> NTSTATUS {
     let interval = crate::adapter::ProgrammingInterval::adopt(&adapter.vidpn_programming);
-    match unsafe { program_vidpn_source(adapter, lock, h_alloc, interval.ticket()) } {
+    match unsafe { program_vidpn_source(adapter, lock, h_alloc, interval.ticket(), true) } {
         Ok(ScanoutOutcome::Programmed) => {
             clear_retry_state();
             STATUS_SUCCESS
         }
         Ok(ScanoutOutcome::CopyQueued) => {
             clear_retry_state();
+            release_leases_for_copy_fallback(adapter);
             interval.transfer_to_completion();
             STATUS_SUCCESS
         }
@@ -1075,12 +1442,13 @@ unsafe fn apply_deferred_vidpn_source_address_locked(
                     // Budget exhausted. Drop the interval: the gate clears and
                     // the heartbeat resumes with the truthful OLD address, which
                     // is a visibly stale desktop rather than a frozen one.
-                    RetryDecision::GaveUp => {}
+                    RetryDecision::GaveUp => release_leases_for_reject(adapter),
                 }
             } else {
                 // Permanent for this allocation. Retrying would hold the gate
                 // and suppress CRTC_VSYNC for nothing.
                 clear_retry_state();
+                release_leases_for_reject(adapter);
             }
             reject.status()
         }
@@ -1193,6 +1561,24 @@ impl ScanoutReject {
         }
     }
 
+    /// Small dense code for the unsampled ring record (`Vp<n>A` bits 8..15).
+    ///
+    /// Nonzero for every variant, because 0 is the ring's "reached an outcome"
+    /// value. Owner debugging ABI like [`Self::record`]: append, do not
+    /// renumber.
+    fn trace_code(self) -> u32 {
+        match self {
+            Self::BadAlloc => 1,
+            Self::Extent => 2,
+            Self::Layout => 3,
+            Self::Format(_) => 4,
+            Self::LinearAllocFailed(_) => 5,
+            Self::SetFailed => 6,
+            Self::NoTarget => 7,
+            Self::CopyFailed(_) => 8,
+        }
+    }
+
     /// Emit the breadcrumb and bump the counter. One call so the two can never
     /// drift apart at a call site.
     fn report(self) {
@@ -1295,6 +1681,10 @@ pub(crate) fn record_scanout_reject_counters() {
     crate::diag::record_named_bytes(b"ScNoTgt", SC_NO_TARGET.load(Relaxed));
     crate::diag::record_named_bytes(b"ScCpyErr", SC_COPY_ERR.load(Relaxed));
     crate::diag::record_named_bytes(b"ScUnav", SC_UNAVAILABLE.load(Relaxed));
+    crate::diag::record_named_bytes(
+        b"ScAlcFul",
+        crate::ddi::create_allocation::SCANOUT_ALLOC_FULL.load(Relaxed),
+    );
     crate::diag::record_named_bytes(b"ScRetry", SC_RETRY.load(Relaxed));
     crate::diag::record_named_bytes(b"ScGaveUp", SC_GAVE_UP.load(Relaxed));
     // R509: gate-generation health. Both must read 0 on a normal boot.
@@ -1349,9 +1739,10 @@ unsafe fn apply_vidpn_source_address_locked(
     // function, i.e. after the reject breadcrumb below — preserving the
     // record-then-lower order every arm had before R504.
     let interval = crate::adapter::ProgrammingInterval::adopt(&adapter.vidpn_programming);
-    match unsafe { program_vidpn_source(adapter, lock, h_alloc, interval.ticket()) } {
+    match unsafe { program_vidpn_source(adapter, lock, h_alloc, interval.ticket(), false) } {
         Ok(ScanoutOutcome::Programmed) => STATUS_SUCCESS,
         Ok(ScanoutOutcome::CopyQueued) => {
+            release_leases_for_copy_fallback(adapter);
             // THE one hand-off. The copy is queued on ring 1 and its completion
             // DPC owns the gate from here: it publishes the displayed address on
             // success and clears the gate either way. Dropping the interval
@@ -1365,18 +1756,105 @@ unsafe fn apply_vidpn_source_address_locked(
             // NTSTATUS reaches dxgkrnl directly and is the truthful answer.
             // Nothing was deferred, so there is nothing to re-arm.
             reject.report();
+            release_leases_for_reject(adapter);
             reject.status()
         }
     }
 }
 
+/// Terminal programming refusal: nothing was bound, so nothing can be read
+/// (ROADMAP defect 0ab-B).
+///
+/// Every presentation minted up to now is unreadable — the display is already in
+/// its degraded state and each refusal carries its own `ScanoutReject` counter —
+/// so holding the flip fences on reads that cannot happen would trade a stale
+/// frame for a TDR and a frozen desktop. This is an exact terminal event, NOT a
+/// timeout: it runs only on a refusal that will not be retried, and it moves
+/// `LsCanc`, so a boot where it is the dominant lease-end reason is visible
+/// rather than looking healthy.
+fn release_leases_for_reject(adapter: &AdapterContext) {
+    adapter.release_all_scanout_leases(crate::ddi::scanout_trace::LeaseEnd::Cancelled);
+}
+
+/// The adapter-owned LINEAR fallback queued a GPU copy instead of binding the
+/// app's own buffer.
+///
+/// SCOPE LIMIT, stated rather than hidden: on this path the consumer of the
+/// app's buffer is the KMD's ring-1 `vkCmdCopyImage`, whose completion this
+/// driver does not key to a presentation epoch — so the lease gate does not
+/// cover it and the path behaves exactly as it did in 22.22.212.0. That is
+/// deliberate: 0ab-B was measured entirely on the DIRECT primary (a fullscreen
+/// app's own DMA-BUF), the fallback has no measured black-frame defect, and
+/// leaving the lease open here would hang the flip fence instead. Counted as
+/// `LsCanc` so the rate is visible.
+fn release_leases_for_copy_fallback(adapter: &AdapterContext) {
+    adapter.release_all_scanout_leases(crate::ddi::scanout_trace::LeaseEnd::Cancelled);
+}
+
+/// Scratch for the unsampled ring record, filled in as [`program_vidpn_source_inner`]
+/// learns each field.
+///
+/// It exists so the record is emitted from ONE place. The body has eight early
+/// `return Err(...)` exits, and an instrument that each of them has to remember
+/// to call is an instrument that silently omits exactly the refusal being
+/// hunted.
+struct ProgramTrace {
+    source_resource: u32,
+    target_resource: u32,
+    flags: u32,
+}
+
 /// The programming body. One happy shape, one unhappy shape.
+///
+/// `deferred` says which wrapper called: the PASSIVE worker draining a DIRQL
+/// handoff, or the DDI running inline at PASSIVE. It is recorded, never acted
+/// on.
 unsafe fn program_vidpn_source(
     adapter: &AdapterContext,
     lock: &ScanoutGuard<'_>,
     h_alloc: HANDLE,
     ticket: crate::adapter::ProgrammingTicket,
+    deferred: bool,
 ) -> Result<ScanoutOutcome, ScanoutReject> {
+    use crate::ddi::scanout_trace::flags;
+
+    let mut trace = ProgramTrace {
+        source_resource: 0,
+        target_resource: 0,
+        flags: if deferred { flags::DEFERRED } else { 0 },
+    };
+    let result =
+        unsafe { program_vidpn_source_inner(adapter, lock, h_alloc, ticket, &mut trace) };
+    let reject = match result {
+        Ok(ScanoutOutcome::Programmed) => {
+            trace.flags |= flags::PROGRAMMED;
+            0
+        }
+        Ok(ScanoutOutcome::CopyQueued) => {
+            trace.flags |= flags::COPY_QUEUED;
+            0
+        }
+        Err(reject) => reject.trace_code(),
+    };
+    crate::ddi::scanout_trace::note_program(
+        h_alloc as usize,
+        trace.source_resource,
+        trace.target_resource,
+        trace.flags,
+        reject,
+    );
+    result
+}
+
+unsafe fn program_vidpn_source_inner(
+    adapter: &AdapterContext,
+    lock: &ScanoutGuard<'_>,
+    h_alloc: HANDLE,
+    ticket: crate::adapter::ProgrammingTicket,
+    trace: &mut ProgramTrace,
+) -> Result<ScanoutOutcome, ScanoutReject> {
+    use crate::ddi::scanout_trace::flags;
+
     crate::diag::record(0x1300_000A);
     let source_address_n = VIDPN_SOURCE_ADDRESS_COUNT
         .fetch_add(1, Ordering::Relaxed)
@@ -1390,6 +1868,10 @@ unsafe fn program_vidpn_source(
         Some(source) => source,
         None => return Err(ScanoutReject::BadAlloc),
     };
+    trace.source_resource = source.resource_id;
+    if source.direct_scanout {
+        trace.flags |= flags::DIRECT;
+    }
     let (mode_w, mode_h) = adapter.display_mode();
     let width = if source.width != 0 {
         source.width
@@ -1423,8 +1905,27 @@ unsafe fn program_vidpn_source(
     // the wire format identically; a `ScanoutTarget` that exists is a target the
     // host can be told about, and it carries no primary address, so the fallback
     // arm cannot supply one to `publish_displayed_primary`.
+    //
+    // D4b: a flip that carried a validated snapshot descriptor (stamped on the
+    // allocation beside the epoch/watermark by `set_vidpn_primary_address`)
+    // binds the SNAPSHOT here too, so the worker and the DISPATCH fast bind
+    // substitute consistently for the same flip. Constructor failure — only
+    // reachable from a torn stamp, since the descriptor validated at Present —
+    // falls back to the primary itself, counted (`SnFbk`).
     let target = if source.direct_scanout {
-        ScanoutTarget::from_direct_primary(&source, width, height)?
+        let substituted = source.snapshot.and_then(|snap| {
+            match ScanoutTarget::from_snapshot_descriptor(&snap) {
+                Ok(target) => Some(target),
+                Err(_) => {
+                    crate::ddi::scanout_trace::note_snapshot_fallback();
+                    None
+                }
+            }
+        });
+        match substituted {
+            Some(target) => target,
+            None => ScanoutTarget::from_direct_primary(&source, width, height)?,
+        }
     } else {
         production_linear_scanout(adapter, lock, width, height)?
     };
@@ -1435,11 +1936,26 @@ unsafe fn program_vidpn_source(
     let already_bound = adapter.active_scanout_resource.load(Ordering::Acquire)
         == target.resource_id()
         && bound_wh == (((target.width() as u64) << 32) | target.height() as u64);
+    trace.target_resource = target.resource_id();
+    if already_bound {
+        trace.flags |= flags::ALREADY_BOUND;
+    }
     if !already_bound || trace_tick {
         crate::diag::record_named_bytes(b"ScRid", target.resource_id());
         crate::diag::record_named_bytes(b"ScPch", target.pitch());
         crate::diag::record_named_bytes(b"ScOff", target.plane_offset());
     }
+    // Sampled BEFORE the bind, because `remember_scanout_blob` below overwrites
+    // it. Only a change of RESOURCE supersedes an older presentation's lease: a
+    // re-bind of the same resource (an extent change) leaves that buffer as the
+    // scan-out, so a later flush still reads it and releasing its lease would
+    // hand the app a buffer the host is about to read (ROADMAP defect 0ab-B).
+    let previously_bound_resource = adapter.host_bound_scanout_resource.load(Ordering::Acquire);
+    // Whether THIS call's bookkeeping is the newest bind's (ROADMAP defect
+    // 0ab-C). True for an already-bound re-present, which issues no command and
+    // therefore has no wire order to be behind — that arm keeps its pre-0ab-C
+    // behaviour exactly.
+    let mut adopted = true;
     if !already_bound {
         let set = crate::virtio::ctrl::set_scanout_blob(
             lock.passive(),
@@ -1451,36 +1967,55 @@ unsafe fn program_vidpn_source(
             target.pitch(),
             target.plane_offset(),
         );
-        if set.is_err() {
+        let Ok(bind_seq) = set else {
             return Err(ScanoutReject::SetFailed);
+        };
+        trace.flags |= flags::BOUND;
+        // THE WIRE-ORDER GUARD. This bookkeeping runs at PASSIVE after the
+        // round-trip returned, so it can chronologically FOLLOW the application
+        // of a bind that was enqueued after it — the ordinary case at a
+        // fullscreen frame rate, where a flip arms the DISPATCH fast bind while
+        // this round-trip is still outstanding. Stomping the newer identity with
+        // this older one would leave `host_bound_scanout_resource` naming a
+        // buffer the host is no longer reading, which the flush executor's
+        // `RfUnb` arm then refuses for the rest of the binding's life.
+        adopted = adapter.adopt_scanout_bind_seq(bind_seq);
+        if adopted {
+            // Keep the adapter-owned fallback cache separate from a rotating DWM
+            // direct primary. The latter is tracked by active_scanout_resource and
+            // dies with its WDDM allocation; publishing it here would overwrite the
+            // durable target's cached Venus identity.
+            //
+            // Branches on the SOURCE's flag, which is equivalent: the direct arm is
+            // taken only when it is set, and the LINEAR arm only when it is clear.
+            if !source.direct_scanout {
+                adapter.remember_primary_scanout(
+                    target.resource_id(),
+                    target.width(),
+                    target.height(),
+                    target.pitch(),
+                    target.plane_offset(),
+                    target.venus_alloc_size(),
+                    target.memory_type_index(),
+                    target.dxgi_format(),
+                );
+            }
+            adapter.remember_scanout_blob(target.resource_id(), target.width(), target.height());
+            crate::diag::record_named_bytes(b"ScPub", target.resource_id());
+        } else {
+            crate::ddi::scanout_trace::note_fast_bind_late();
         }
-        // Keep the adapter-owned fallback cache separate from a rotating DWM
-        // direct primary. The latter is tracked by active_scanout_resource and
-        // dies with its WDDM allocation; publishing it here would overwrite the
-        // durable target's cached Venus identity.
-        //
-        // Branches on the SOURCE's flag, which is equivalent: the direct arm is
-        // taken only when it is set, and the LINEAR arm only when it is clear.
-        if !source.direct_scanout {
-            adapter.remember_primary_scanout(
-                target.resource_id(),
-                target.width(),
-                target.height(),
-                target.pitch(),
-                target.plane_offset(),
-                target.venus_alloc_size(),
-                target.memory_type_index(),
-                target.dxgi_format(),
-            );
-        }
-        adapter.remember_scanout_blob(target.resource_id(), target.width(), target.height());
-        crate::diag::record_named_bytes(b"ScPub", target.resource_id());
     }
     if !already_bound || trace_tick {
         crate::diag::record_named_bytes(b"ScSet", 1);
     }
 
-    if source.resource_id == target.resource_id() {
+    // The direct arm is the zero-copy arm. This used to test
+    // `source.resource_id == target.resource_id()`, which was equivalent while
+    // the direct constructor could only name the source's own resource; a D4b
+    // snapshot target is ALSO zero-copy (the venus-queue blit already produced
+    // its content), so the predicate is now the arm itself.
+    if source.direct_scanout {
         // True zero-copy primary. Never submit vkCmdCopyImage with the same
         // image as source and destination. SetVidPn only binds/publishes the
         // candidate; the matching Render marker and used-ring retirement are
@@ -1495,9 +2030,166 @@ unsafe fn program_vidpn_source(
         // next CRTC_VSYNC retire the preceding flip — and only here can a
         // `ProgrammedPrimary` be minted, which is the only thing
         // `publish_displayed_primary` accepts.
-        adapter.publish_displayed_primary(crate::adapter::ProgrammedPrimary::after_scanout_bind(
-            source.primary_address,
-        ));
+        // A BIND IS ITSELF A DIRTY EDGE. SET_SCANOUT_BLOB changes which resource
+        // the host pixel pipeline reads; it does not make the host read it. A
+        // buffer that has just become the scan-out has never been fetched, so
+        // until something flushes it the display shows whatever the host last
+        // read — stale content, or nothing.
+        //
+        // The comment above ("the matching Render marker and used-ring
+        // retirement are the sole producers of the dirty edge") was true only
+        // while the bind never moved: one desktop primary was bound once and
+        // DWM's per-frame markers dirtied it forever after. Once
+        // `FlipImmediateMmIo` made the bind rotate per flip, that stopped
+        // holding, and the QEMU trace showed the consequence exactly
+        // (2026-07-29, `virtio_gpu_cmd_*` via QMP):
+        //
+        //     .539 res_flush 0x121     <- flushes the OLD binding
+        //     .542 set_scanout_blob 0x128   <- new binding, nobody reads it
+        //     .666 res_flush 0x128     <- 124 ms later
+        //     .669 set_scanout_blob 0x121   <- and again
+        //     .761 res_flush 0x121     <- 92 ms later
+        //
+        // i.e. roughly every other flip left a freshly bound buffer on screen
+        // unread for ~100 ms. That is the residual black/stale frame.
+        //
+        // COMPLETION-ORDERED, and that is defect 0ab (2026-07-29). The edge
+        // itself is right; firing it HERE was not.
+        //
+        // The claim this arm shipped with — "the buffer's own Venus work is
+        // already retired when the bind runs, 425 of 425 binds" — was measured
+        // on the MMIO contract, where dxgkrnl retired the flip before calling
+        // `SetVidPnSourceAddress`. The DMA-buffer contract deliberately moved
+        // the arming EARLIER: `arm_dma_flip` runs in `DxgkDdiSubmitCommand`
+        // *with the flip's DMA fence still outstanding*, and the app's real work
+        // never travels in that DMA buffer at all — it goes to the host over the
+        // Venus escape channel. So at bind time the frame is SUBMITTED, not
+        // COMPLETE, and an immediate `request_scanout_refresh_for` tells QEMU to
+        // read a buffer whose GPU work has only got as far as its clear.
+        //
+        // Measured on the host, Fire Strike Combined, KMD 22.22.205.0 (QEMU
+        // `virtio_gpu_cmd_*` over QMP + an RFB sampler on the VNC surface, using
+        // 3DMark's fps bar as a "did this frame finish?" oracle):
+        //
+        //   bind -> this flush            0.2 ms   (submission)
+        //   bind -> the marker-edge flush 10.2 ms  (completion; the frame's GPU time)
+        //   VNC frame sampled BETWEEN the two, gap >= 10 ms:  48/60  = 80 % BLACK
+        //   VNC frame sampled AFTER the marker-edge flush:    32/287 = 11 %
+        //
+        // i.e. the display is black for the ~10 ms this flush opens up, and the
+        // marker edge repaints it. That is the flash, and it is why a
+        // producer-side CPU stall only REDUCED it: stalling the app shrinks the
+        // window instead of ordering the read.
+        //
+        // Arming through the Venus watermark keeps everything the bind edge
+        // exists for — a bind that changed the binding is still guaranteed its
+        // own flush, naming its own resource (defect 0aa) — and costs no CPU
+        // wait: the flush is issued from the completion DPC via
+        // `take_ready_scanout_refresh`.
+        if !already_bound && adopted {
+            // Arm against the boundary this buffer's own PRESENT MARKER
+            // captured, not against "everything in the ring now". Sampling
+            // here is defect 0ab-B: this code runs in the PASSIVE worker a
+            // frame or more after the app presented, so a fresh sample already
+            // covers the app's NEXT frame and the flush waits for that one —
+            // long enough, at a fullscreen frame rate, for the app to get this
+            // buffer back and clear it. Measured per flush on the host: frames
+            // flushed 1-3 ms after their bind were 0.2 % black, those flushed
+            // 6-12 ms after were 63 %.
+            //
+            // Capturing at flip SUBMISSION instead (22.22.210.0) was measured
+            // NOT to be early enough — see `submit_command::arm_dma_flip`.
+            // What the flip arm DOES do (22.22.217.0) is CONSUME the marker's
+            // boundary and stamp it on the allocation, because the mark table
+            // holds one entry per buffer and this bind can run after the same
+            // buffer's next present has already replaced it.
+            //
+            // No recorded boundary means no present marker named this buffer
+            // (the MMIO/desktop path), and sampling now is then correct
+            // *because* dxgkrnl retired that flip before calling us.
+            //
+            // `BindFlushMode=1` short-circuits the ordering entirely and
+            // flushes here. That is the A/B, not a shipping mode: it answers
+            // "is the buffer's content already correct at bind time?" directly.
+            // If it is, the deferral is spurious and every boundary variant is
+            // chasing the wrong thing; if it is not, the fix belongs on the
+            // buffer's LIFETIME instead of on the flush's ordering.
+            //
+            // `adopted` gates this arm for the same reason it gates the
+            // identity stores above (ROADMAP defect 0ab-C): a stale application
+            // would arm a flush against a binding the host has already
+            // replaced, and the newer bind's own arm has already run.
+            let (ready, carried) = if adapter.knobs().bind_flush_immediate {
+                adapter.request_scanout_refresh_for(target.resource_id());
+                (true, false)
+            } else {
+                adapter.arm_bind_refresh(target.resource_id(), source.frame_watermark)
+            };
+            if carried {
+                crate::ddi::scanout_trace::note_bind_watermark_carried();
+            } else {
+                crate::ddi::scanout_trace::note_bind_watermark_sampled();
+            }
+            crate::ddi::scanout_trace::note_bind_refresh(ready);
+        }
+        // ── THE OWNERSHIP EDGE (ROADMAP defect 0ab-B) ───────────────────────
+        //
+        // The host is now bound to this presentation, so a `RESOURCE_FLUSH`
+        // issued from here on reads THIS buffer. Publishing the epoch is what
+        // makes the next flush token mean something; doing it after the
+        // `set_scanout_blob` round-trip (and not before) is what makes the token
+        // provably cover a binding the host has actually accepted.
+        //
+        // A rebind to a different resource also ends every older epoch's lease:
+        // QEMU's control queue is strictly FIFO, so a returned SET_SCANOUT_BLOB
+        // proves every earlier flush completed and no later one can read the old
+        // resource. That is the escape for a binding that never got a read of
+        // its own (measured: ~350 of 4127 bind intervals) — not a substitute for
+        // the read, which is the distinction 22.22.207.0 collapsed.
+        //
+        // `adopted` is the third operand for the 0ab-C reason: a stale
+        // application's `previously_bound_resource` was sampled before a bind
+        // that has since landed, so its supersede decision describes a
+        // transition that is no longer the current one. The epoch publication
+        // below is left ungated deliberately — `fetch_max` is monotone and the
+        // already-bound re-present arm MUST keep publishing, or a stale
+        // `present > bound` would hold the ownership gate closed forever and
+        // freeze the desktop (defect 0aa).
+        let superseded_previous = adopted
+            && !already_bound
+            && previously_bound_resource != 0
+            && previously_bound_resource != target.resource_id();
+        adapter.publish_bound_epoch(source.present_epoch, superseded_previous);
+        // The physical address a later CRTC_VSYNC reports. It used to be
+        // WITHHELD here until this presentation's read finished — the second
+        // half of the reuse gate — and 22.22.217.0 retired that as measured
+        // inert; see `AdapterContext::publish_bound_primary`.
+        //
+        // Gated on `adopted` too, unlike the epoch above, and the asymmetry is
+        // deliberate: `fetch_max` cannot regress, an address store can. A stale
+        // application publishing here would report an address that disagrees
+        // with what the host is actually scanning out, for up to a worker pass.
+        //
+        // FREEZE-SAFE, which is the contract that matters here (the 36th-session
+        // heartbeat rule: a primary that is never published is a flip that never
+        // retires and a desktop that never moves). Three reasons, all structural:
+        //   * `adopted == false` means a NEWER bind's application advanced
+        //     `scanout_bind_applied_seq` — and that application publishes the
+        //     address itself, adopting BEFORE it publishes
+        //     (`ddi::interrupt::drain_used_and_complete`). So the address is
+        //     already correct or becomes correct within the same DPC; in between
+        //     it holds the previously displayed address, which is exactly what
+        //     the raised programming gate exists to keep authoritative.
+        //   * The `already_bound` arm keeps `adopted = true` by construction (no
+        //     command, no sequence), so same-resource re-presents — the MMIO
+        //     desktop steady state included — publish exactly as they do today.
+        //     Nothing without a concurrent fast bind changes behaviour at all.
+        //   * No retirement depends on a stale address being reported on either
+        //     contract: DMA-buffer flips retire on their fence, and MMIO flips
+        //     were retired by dxgkrnl before it ever called this DDI.
+        if adopted {
+            adapter.publish_bound_primary(source.primary_address);
+        }
         // The caller's `interval` drops AFTER this, clearing the gate once the
         // matching physical address is published — the order the next VSync DPC
         // depends on (it acquires the gate before sampling

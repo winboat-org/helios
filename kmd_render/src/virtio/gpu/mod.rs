@@ -45,8 +45,9 @@ use alloc::vec::Vec;
 use bytemuck::Zeroable;
 use helios_protocol::{
     resp_is_ok, VirtioGpuCmdSubmit, VirtioGpuCtrlHdr, VirtioGpuRespDisplayInfo,
-    HELIOS_OPTIONAL_FEATURES, HELIOS_REQUIRED_FEATURES, VIRTIO_GPU_CMD_GET_DISPLAY_INFO,
-    VIRTIO_GPU_CMD_SUBMIT_3D, VIRTIO_GPU_FLAG_FENCE, VIRTIO_GPU_FLAG_INFO_RING_IDX,
+    VirtioGpuSetScanoutBlob, HELIOS_OPTIONAL_FEATURES, HELIOS_REQUIRED_FEATURES,
+    VIRTIO_GPU_CMD_GET_DISPLAY_INFO, VIRTIO_GPU_CMD_SUBMIT_3D, VIRTIO_GPU_FLAG_FENCE,
+    VIRTIO_GPU_FLAG_INFO_RING_IDX,
 };
 use virtio_drivers::queue::VirtQueue;
 use virtio_drivers::transport::pci::bus::{DeviceFunction, PciRoot};
@@ -289,6 +290,26 @@ pub const SYNC_RESP_MAX: usize = 64;
 /// header followed by the device-written ctrl response.
 pub const SUBMIT_META_BYTES: usize =
     core::mem::size_of::<VirtioGpuCmdSubmit>() + core::mem::size_of::<VirtioGpuCtrlHdr>();
+/// Bytes for one DISPATCH-level fast-bind command buffer: the device-read
+/// `SET_SCANOUT_BLOB` followed by the device-written ctrl response (ROADMAP
+/// defect 0ab-C, D1(ii)).
+pub const BIND_CMD_BYTES: usize =
+    core::mem::size_of::<VirtioGpuSetScanoutBlob>() + core::mem::size_of::<VirtioGpuCtrlHdr>();
+/// Fast-bind command buffers held in the pool.
+///
+/// A SINGLE buffer was the coverage bottleneck (22.22.220.0, measured): the
+/// buffer only returns to the driver at the guest DPC drain, which lags the
+/// host's consume by several flip periods under load, so ~18 % of flips found it
+/// in flight and fell back to the worker's late bind (`FpBusy` 1776/run against
+/// `FpBind` +98 once the skip predicate stopped hiding them). Four covers that
+/// lag with the same "one buffer per outstanding command" ownership rule — no
+/// sharing, no reuse-before-completion.
+///
+/// It is BOTH the reserved capacity and the refill bound: `init` fills to it and
+/// every return site checks `len` against it, so the pool can never grow past
+/// the capacity reserved at PASSIVE and therefore never reallocates under the
+/// device spinlock.
+const BIND_CMD_POOL: usize = 4;
 
 /// `NotificationEvent` (`EVENT_TYPE` value 0): stays signaled until cleared —
 /// the right semantics for one-shot completion events.
@@ -355,6 +376,151 @@ pub struct ScanoutNotify {
     ticket: crate::adapter::ProgrammingTicket,
     primary_address: u64,
     event: NonNull<KEVENT>,
+}
+
+/// Typed completion token for one scan-out `RESOURCE_FLUSH` (ROADMAP defect
+/// 0ab-B).
+///
+/// The generic `AsyncControl` completion plumbing —
+/// `completion`/`completion_errors`/`wake_event`/`success_store` — can say THAT
+/// a control command finished; it cannot say WHICH presentation the host read
+/// while finishing it. That identity is the whole content of the ownership
+/// invariant, so it travels as its own value: `covers_epoch` is the presentation
+/// epoch the host was bound to when this exact command was enqueued, and a
+/// returned response therefore proves the host has read that buffer.
+///
+/// Carrying the adapter pointer (rather than a `NonNull<AtomicU64>` to the
+/// watermark alone) is deliberate: ending a lease also publishes any withheld
+/// primary address and wakes the worker that can pop the WDDM pending FIFO, and
+/// splitting those across three raw pointers is exactly the class of mistake
+/// `ScanoutNotify`'s four-pointer doc paragraph was written about.
+///
+/// Validity rests on the same fact `ScanoutNotify` documents: the adapter
+/// outlives the transport, enforced by ordering in StopDevice (`set_virtio(None)`
+/// after cancel/join), and every field this touches is an atomic on the shared
+/// `&AdapterContext` that every DDI, ISR and DPC already holds — no `&mut` to it
+/// exists anywhere in the driver.
+pub struct ScanoutFlushToken {
+    adapter: NonNull<crate::adapter::AdapterContext>,
+    covers_epoch: u64,
+    /// The venus resource this exact read names — the D4a ledger identity
+    /// (FIX-DESIGN-d4a.md §3.2). `covers_epoch` cannot stand in for it: the
+    /// MMIO/desktop path reads with `NO_LEASE` epochs, and those reads must
+    /// still retire in the ledger.
+    resource_id: u32,
+    /// The ledger slot `issue` claimed for `resource_id`, or
+    /// `scanout_read_ledger::NO_SLOT` (overflow / page absent — the read runs
+    /// unledgered and retirement bumps nothing).
+    ledger_slot: u8,
+    /// `complete` ran; `Drop` must not retire a second time. A plain field,
+    /// not an atomic: the token is single-owner and never `Copy`.
+    done: bool,
+}
+
+impl ScanoutFlushToken {
+    /// The ONE construction site, called from
+    /// `queue_active_scanout_refresh_locked` with the epoch it snapshotted and
+    /// the ledger slot its issue bump claimed.
+    pub(crate) fn new(
+        adapter: &crate::adapter::AdapterContext,
+        covers_epoch: u64,
+        resource_id: u32,
+        ledger_slot: u8,
+    ) -> Self {
+        Self {
+            adapter: NonNull::from(adapter),
+            covers_epoch,
+            resource_id,
+            ledger_slot,
+            done: false,
+        }
+    }
+
+    /// The ONE ledger-retirement site (`ledger_retire`, §3.2): every
+    /// constructed token reaches it exactly once — from [`Self::complete`]
+    /// (host OK and host-error arms) or, if `complete` never ran, from `Drop`
+    /// (enqueue failure, in-flight table teardown).
+    ///
+    /// Legal at PASSIVE and at DISPATCH under `virtio_lock`: atomics, the leaf
+    /// event lock, `KeSetEvent(Wait = FALSE)` — no allocation, no registry
+    /// write, never `wddm_notify_lock`.
+    fn retire_ledger(&mut self, via_drop: bool) {
+        if self.done {
+            return;
+        }
+        self.done = true;
+        // SAFETY: per the type's doc — the adapter outlives every in-flight
+        // transport entry, and the call touches only atomics + the leaf lock.
+        unsafe { self.adapter.as_ref() }.read_ledger.retire(
+            self.ledger_slot,
+            self.resource_id,
+            via_drop,
+        );
+    }
+
+    /// Consume the token when the control response has been drained.
+    ///
+    /// `ok` is the `VIRTIO_GPU_RESP_*` verdict. A host ERROR still ends the
+    /// lease, and that is not a loophole: the command has terminated, so no
+    /// future read can originate from it. It is counted as `Cancelled` rather
+    /// than `HostRead` precisely so an error storm cannot masquerade as healthy
+    /// publication.
+    ///
+    /// Runs at DISPATCH_LEVEL inside the used-ring drain, holding `virtio_lock`.
+    /// It must therefore NOT take `wddm_notify_lock` — the driver's order is the
+    /// reverse — which is why every operation it reaches is a monotone atomic.
+    pub(crate) fn complete(mut self, ok: bool) {
+        // Ledger first, BEFORE the `NO_LEASE` early return below: the desktop
+        // path's reads carry no epoch but are still host readbacks the ledger
+        // issued, and the D4a invariant is one retirement per issue, no
+        // exceptions. (`self.done` then makes the implicit `Drop` at this
+        // function's exit a no-op.)
+        self.retire_ledger(false);
+        crate::ddi::scanout_trace::note_lease_read_done();
+        if self.covers_epoch == helios_kmd_logic::scanout_lease::NO_LEASE {
+            // Nothing was bound with an epoch when this flush was issued — the
+            // MMIO/`FlipOnVSyncMmIo` desktop path, which mints no presentations
+            // at all. That is not a stale token, it is a read with nothing to
+            // cover, and counting it as one made `LsStal` read 389 of 389 on an
+            // idle desktop, i.e. useless for the thing it exists to detect.
+            return;
+        }
+        let reason = if ok {
+            crate::ddi::scanout_trace::LeaseEnd::HostRead
+        } else {
+            crate::ddi::scanout_trace::LeaseEnd::Cancelled
+        };
+        // SAFETY: per the type's doc — the adapter outlives every in-flight
+        // transport entry, and the call touches only its atomics.
+        let advanced =
+            unsafe { self.adapter.as_ref() }.end_scanout_leases_through(self.covers_epoch, reason);
+        if !advanced {
+            // The token was at or behind the watermark: a coalesced, duplicated
+            // or reordered read. Inert by construction — counted so that
+            // "inert" is a measurement rather than an assumption, because a
+            // large `LsStal` means the flush path is spending host readbacks on
+            // presentations nobody is waiting for.
+            crate::ddi::scanout_trace::note_lease_stale();
+        }
+    }
+}
+
+impl Drop for ScanoutFlushToken {
+    /// The backstop that makes the D4a liveness matrix rows 4 and 5 true BY
+    /// TYPE: a token dropped without `complete` — the enqueue-failure arm
+    /// (`resource_flush_async` / `enqueue_async_control` error paths, some at
+    /// DISPATCH under `virtio_lock`) and the in-flight table dying with its
+    /// `VirtioGpu` (PASSIVE, `set_virtio(None)`) — still retires its ledger
+    /// issue, counted `RdDrp`.
+    ///
+    /// Deliberately NOT the lease-end site: the enqueue-failure caller ends
+    /// exactly the epochs it named (`end_scanout_leases_through`, counted
+    /// `LsCanc`) and `latch_failed_and_fail_inflight` completes in-flight
+    /// tokens explicitly — duplicating that here would double-count the `Ls*`
+    /// census. The ledger is the one obligation only the token can discharge.
+    fn drop(&mut self) {
+        self.retire_ledger(true);
+    }
 }
 
 impl ScanoutNotify {
@@ -432,24 +598,36 @@ impl SyncWaitBlock {
         self.done.store(false, Ordering::Relaxed);
     }
 
-    /// Whether the entry completed (Acquire — pairs with the drain's Release).
-    fn is_done(&self) -> bool {
-        self.done.load(Ordering::Acquire)
-    }
-
-    /// Copy the response bytes out (only valid once [`Self::is_done`]).
+    /// Copy the response bytes out.
+    ///
+    /// ⚠ There is deliberately no `is_done` accessor to call first. Reading
+    /// `done` never authorized a copy safely — it authorized RESUMING, one
+    /// instruction before the drain's `KeSetEvent`, which is the 22.22.218.0
+    /// `0xA` (ROADMAP defect 0ab-C, and `ctrl::wait_block`'s doc has the whole
+    /// argument). The caller reaches this only after its wait was SATISFIED, so
+    /// the drain has finished with the block entirely.
+    ///
+    /// `done` still carries the release/acquire edge that makes `resp` visible:
+    /// it is stored (Release) after the copy and before the signal, and the
+    /// wait's own satisfaction is the acquire.
     fn copy_resp(&self, out: &mut [u8]) {
         let n = out.len().min(SYNC_RESP_MAX);
         // SAFETY: `resp` is only written by the drain BEFORE `done` is set
-        // (Release); the caller reads AFTER observing `done` (Acquire).
+        // (Release) and the event is signaled; this runs after that signal
+        // satisfied our wait.
         let src = unsafe { &*self.resp.get() };
         out[..n].copy_from_slice(&src[..n]);
     }
 }
 
 /// The only handle a [`SyncWaitBlock::with`] closure gets: a pointer to hand
-/// the transport, plus the two reads the waiter needs. Borrows the block, so it
+/// the transport, plus the one read the waiter needs. Borrows the block, so it
 /// cannot outlive the frame the block lives on.
+///
+/// The `is_done` wrapper that used to sit here went with the completion-side
+/// poll it existed for (22.22.219.0): exposing "has the drain started writing
+/// this block?" to the waiter is what let the waiter leave while the drain was
+/// still writing it.
 pub struct WaitBlockRef<'a> {
     ptr: NonNull<SyncWaitBlock>,
     _frame: PhantomData<&'a SyncWaitBlock>,
@@ -459,12 +637,6 @@ impl WaitBlockRef<'_> {
     /// The registration pointer for `enqueue_sync` / `fence_wait_prepare`.
     pub fn as_ptr(&self) -> NonNull<SyncWaitBlock> {
         self.ptr
-    }
-
-    pub fn is_done(&self) -> bool {
-        // SAFETY: the block is alive for this borrow's whole lifetime; `done`
-        // is an atomic, so the concurrent DISPATCH-level writer is fine.
-        unsafe { self.ptr.as_ref() }.is_done()
     }
 
     pub fn copy_resp(&self, out: &mut [u8]) {
@@ -489,6 +661,31 @@ enum InFlightKind {
         ring_idx: u8,
         scanout_notify: Option<ScanoutNotify>,
     },
+    /// A fire-and-forget `SET_SCANOUT_BLOB` enqueued by the DISPATCH-level flip
+    /// arm (ROADMAP defect 0ab-C, D1(ii)).
+    ///
+    /// VALUES ONLY, and that is the design rather than an accident: the entry
+    /// carries no allocation handle and no pointer into any WDDM object, so its
+    /// completion has nothing to dereference and the DestroyAllocation cancel
+    /// path (`retire_scanout_allocation_locked`, which CASes the single pending
+    /// slot) is untouched by it. The fast path deliberately does NOT claim the
+    /// pending slot: hiding the handle from that CAS is the use-after-free this
+    /// feature was analysed out of.
+    ///
+    /// `seq` orders this bind's bookkeeping against the PASSIVE worker's
+    /// (`AdapterContext::scanout_bind_wire_seq`); the rest is exactly what
+    /// applying that bookkeeping needs — the identity to remember, the epoch to
+    /// publish, the physical address the next CRTC_VSYNC reports, and the frame
+    /// boundary the flush arm must order against.
+    AsyncScanoutBind {
+        seq: u64,
+        resource_id: u32,
+        /// `(width << 32) | height`, as `remember_scanout_blob` wants it.
+        wh: u64,
+        present_epoch: u64,
+        primary_address: u64,
+        carried_watermark: u64,
+    },
     /// A control command whose caller must not wait for the host response.
     /// `completion` is a stable adapter-owned 0/1 gate; the used-ring drain
     /// clears it and wakes the stable worker event.  This lets scanout refresh
@@ -500,7 +697,78 @@ enum InFlightKind {
         wake_event: NonNull<KEVENT>,
         success_store: Option<(NonNull<AtomicU32>, u32)>,
         resubmit: Option<NonNull<AtomicU32>>,
+        /// Which presentation this command's host read covers, when it is a
+        /// scan-out `RESOURCE_FLUSH`. `None` for every other async control
+        /// command. See [`ScanoutFlushToken`].
+        scanout_flush: Option<ScanoutFlushToken>,
     },
+}
+
+/// Take the scan-out ownership token out of an in-flight entry, leaving the rest
+/// of the entry intact.
+///
+/// Both drain paths do `match entry.kind { .. }` by value and then PARK the
+/// entry (a `DmaBuffer` may not be freed above PASSIVE), so the token — the one
+/// non-`Copy` field in `InFlightKind` — has to come out first or `entry` is
+/// partially moved. Not making [`ScanoutFlushToken`] `Copy` is deliberate:
+/// completing one twice would count a host read that never happened.
+fn take_scanout_flush_token(kind: &mut InFlightKind) -> Option<ScanoutFlushToken> {
+    match kind {
+        InFlightKind::AsyncControl { scanout_flush, .. } => scanout_flush.take(),
+        _ => None,
+    }
+}
+
+/// What one DISPATCH-level fast bind asks for: the wire command's geometry plus
+/// the bookkeeping its completion must apply (ROADMAP defect 0ab-C, D1(ii)).
+///
+/// One `Copy` value rather than eleven arguments, so the enqueue and the
+/// in-flight entry cannot disagree about which flip they describe.
+#[derive(Clone, Copy)]
+pub struct ScanoutBindRequest {
+    pub resource_id: u32,
+    pub width: u32,
+    pub height: u32,
+    /// `ScanoutFormat::virtio()` — the wire format word.
+    pub format: u32,
+    pub stride: u32,
+    pub offset: u32,
+    /// The presentation epoch this flip minted.
+    pub present_epoch: u64,
+    /// The physical address a later CRTC_VSYNC reports for this primary.
+    pub primary_address: u64,
+    /// The frame-completion boundary the flip took out of the mark table (0 =
+    /// none), which the flush arm orders against.
+    pub carried_watermark: u64,
+}
+
+/// A fast bind the host has ACCEPTED, waiting for its bookkeeping to be applied
+/// outside `virtio_lock` (ROADMAP defect 0ab-C, D1(ii)).
+///
+/// The drain cannot apply it itself: applying ends in a flush arm that needs
+/// `wddm_notify_lock`, and the driver's order is notify → virtio (see
+/// `adapter/locks.rs`). So the drain stashes these values and
+/// `drain_used_and_complete` — one frame up the same DPC, holding no transport
+/// lock — applies them.
+#[derive(Clone, Copy)]
+pub struct CompletedBind {
+    pub seq: u64,
+    pub resource_id: u32,
+    pub wh: u64,
+    pub present_epoch: u64,
+    pub primary_address: u64,
+    pub carried_watermark: u64,
+}
+
+/// Why a fast bind did not reach the wire. Both arms leave the transport
+/// exactly as they found it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum FastBindRefusal {
+    /// Every preallocated command buffer is still in flight (`FpBusy`).
+    Busy,
+    /// The command could not be encoded, or the ring refused it (`FpErr`). The
+    /// buffer is back in its slot.
+    Failed,
 }
 
 /// One outstanding control-queue submission. Owns its device-visible buffers
@@ -842,6 +1110,17 @@ enum RetireDomain {
 /// completion: it may signal once every async wire fence `< watermark` has
 /// retired (and strictly in FIFO order — SubmissionFenceIds are watermarks to
 /// dxgkrnl, so they must complete monotonically).
+/// One WDDM submission waiting for its Venus watermark.
+///
+/// ⚠ IT CARRIED A SECOND HALF UNTIL 22.22.217.0 — the presentation epoch whose
+/// host `RESOURCE_FLUSH` had to complete before dxgkrnl could hand the
+/// allocation back to DXGI (ROADMAP defect 0ab-B). The theory was sound and the
+/// measurement was not: a 2×2 factorial over 46 681 frames moved whole-flush
+/// black by nothing in any cell, because the app's clear of a reclaimed buffer
+/// never travels in a WDDM DMA buffer and so waits on no completion this driver
+/// controls. `watermark` — "has the app finished WRITING this frame?" — is the
+/// only question a WDDM completion can answer, and it is the one asked here
+/// again. The epochs live on, deciding the flush executor's ownership gate.
 struct WddmPending {
     fence: u32,
     watermark: u64,
@@ -862,6 +1141,23 @@ struct WddmPending {
 #[must_use = "a popped WDDM fence must be delivered or requeued, never dropped"]
 pub struct WddmReady {
     pending: WddmPending,
+}
+
+/// The outcome of one attempt to retire the head of the WDDM pending FIFO.
+///
+/// It used to be `Option<WddmReady>`, which collapsed "nothing queued", "the
+/// app's own work is still running" and "the host has not read the frame we
+/// published" into one `None`. The last of those is the only one the caller can
+/// do something about — it can ask for the read it is waiting on — and it is
+/// also the only one whose rate proves the 0ab-B gate is live rather than inert.
+#[must_use = "a Ready outcome carries a fence that must be delivered or requeued"]
+pub enum WddmTake {
+    /// The FIFO is empty.
+    Empty,
+    /// The head's producer (Venus) watermark has not been reached.
+    BlockedOnProducer,
+    /// Deliver `DXGK_INTERRUPT_DMA_COMPLETED` for this submission.
+    Ready(WddmReady),
 }
 
 impl WddmReady {
@@ -991,6 +1287,40 @@ pub struct VirtioGpu {
     /// existing virtio spinlock, but allocation/free never occurs there.
     dma_pool: Vec<DmaBuffer>,
     dma_pool_bytes: usize,
+    /// The command buffers the DISPATCH-level fast bind may use (ROADMAP defect
+    /// 0ab-C, D1(ii)), allocated at transport init and recycled by the drain
+    /// forever after.
+    ///
+    /// TAKING A BUFFER IS THE GATE — no companion counter, because a counter and
+    /// a buffer can disagree and these cannot. An empty pool means
+    /// [`BIND_CMD_POOL`] binds are already outstanding (the flip arm counts
+    /// `FpBusy` and falls through to the worker's bind, i.e. today's behaviour),
+    /// or that the allocations failed at init, in which case the accelerator is
+    /// simply off for this transport generation.
+    ///
+    /// Depth 4 rather than 1 since 22.22.221.0: a buffer is only returned by the
+    /// guest's DPC drain, which lags the host's consume by several flip periods
+    /// under load, so one buffer left ~18 % of flips uncovered. See
+    /// [`BIND_CMD_POOL`].
+    ///
+    /// ⚠ A `Vec` RATHER THAN A `[Option<DmaBuffer>; 4]`, and that is a measured
+    /// requirement, not a preference. `VirtioGpu` is built in
+    /// `DxgkDdiStartDevice`'s frame, which the T3 kernel-stack overflow left
+    /// with ~160 bytes of headroom; the inline array's 128 bytes took the boot
+    /// chain to 18128 against the 17936-byte known-good ceiling
+    /// (`tools/kmd-frame-sizes.ps1`, and it fails the build gate). Three words
+    /// of `Vec` header put the buffers on the heap instead.
+    ///
+    /// Capacity is reserved ONCE at init and `len` never exceeds
+    /// [`BIND_CMD_POOL`], so the pushes below never reallocate under the device
+    /// spinlock — the same discipline `inflight`/`parked`/`dma_pool` follow, and
+    /// for the same reason (the 0x7F lesson).
+    bind_cmd_pool: Vec<DmaBuffer>,
+    /// The newest fast bind the host has accepted, awaiting application outside
+    /// this lock. Last-writer-wins, matching the pending-flip slot's own
+    /// coalescing: if two binds complete in one drain pass the NEWEST is the one
+    /// whose identity the host is left with.
+    completed_bind: Option<CompletedBind>,
     /// Registered WAIT_FENCE waiters (capacity MAX_FENCE_WAITERS).
     fence_waiters: Vec<FenceWaiter>,
     /// Usermode events awaiting wire-fence retirement (capacity
@@ -1006,7 +1336,17 @@ pub struct VirtioGpu {
     /// Latest DWM/primary dirty marker waiting for every Venus wire fence that
     /// preceded it to retire. Markers coalesce to the newest watermark so idle
     /// wakeups do not depend on which WDDM SubmitCommand DDI VidSch selects.
+    /// `DmaGpuFence`: retire ordinary (non-paging) WDDM DMA fences on host GPU
+    /// completion rather than host decode. See `AdapterKnobs::dma_gpu_fence`
+    /// for the contract this restores.
+    dma_gpu_fence: bool,
     scanout_refresh_watermark: Option<u64>,
+    /// The venus resource the pending marker's frame was rendered into, or 0
+    /// when the marker carries no identity. Coalesces with the watermark: the
+    /// newest marker wins, and it is the newest frame's buffer that must be
+    /// flushed. See [`VirtioGpu::note_scanout_refresh`] for why the watermark
+    /// alone was not enough.
+    scanout_refresh_resource: u32,
     /// Ring-corruption latch: set when the used ring returns a token we do not
     /// track or `pop_used` fails structurally. The ring state is then
     /// untrustworthy and every subsequent command fails fast. NOTE: unlike the
@@ -1103,6 +1443,24 @@ impl VirtioGpu {
         // the device, response is written by it. The page is a local RAII
         // `DmaBuffer` — the runtime paths own per-command buffers instead
         // (C3/M3.4), so no shared scratch survives init.
+        // The fast bind's command buffers, minted HERE because `DmaBuffer::new`
+        // is `MmAllocateContiguousMemory` (PASSIVE-only) and the path that uses
+        // them runs at DISPATCH under the device spinlock. A `None` is not a
+        // failure: that slot is simply never available, and a fully empty pool
+        // degrades to every flip arm counting `FpBusy`, which is exactly the
+        // pre-0ab-C behaviour.
+        //
+        // The capacity is reserved here, at PASSIVE, so every later `push` under
+        // the device spinlock is reallocation-free. A short pool (an allocation
+        // that failed) is a degraded accelerator, never an error.
+        let mut bind_cmd_pool = Vec::with_capacity(BIND_CMD_POOL);
+        for _ in 0..BIND_CMD_POOL {
+            let Some(buf) = DmaBuffer::new(passive, BIND_CMD_BYTES) else {
+                break;
+            };
+            bind_cmd_pool.push(buf);
+        }
+
         let mut scratch = DmaBuffer::new(passive, SCRATCH_BYTES).ok_or(VirtioError::OutOfMemory)?;
         let buf = scratch.as_mut_slice();
         let (req_buf, resp_buf) = buf.split_at_mut(SCRATCH_BYTES / 2);
@@ -1209,6 +1567,8 @@ impl VirtioGpu {
             reap_in_progress: false,
             dma_pool: Vec::with_capacity(MAX_DMA_POOL),
             dma_pool_bytes: 0,
+            bind_cmd_pool,
+            completed_bind: None,
             fence_waiters: Vec::with_capacity(MAX_FENCE_WAITERS),
             fence_events: Vec::with_capacity(MAX_FENCE_EVENTS),
             // NOT 1. Wire fence ids arrive from an untrusted usermode buffer
@@ -1226,7 +1586,14 @@ impl VirtioGpu {
             next_wire_fence: NEXT_WIRE_FENCE_BASE
                 .fetch_add(WIRE_FENCE_INSTANCE_STRIDE, Ordering::Relaxed),
             wddm_pending: VecDeque::with_capacity(MAX_WDDM_PENDING),
+            // Snapshotted at transport init like every other knob, so
+            // `reg add` + `pnputil /restart-device` flips it with no reboot.
+            dma_gpu_fence: crate::diag::read_config_dword(
+                crate::diag::knobs::DMA_GPU_FENCE,
+                1,
+            ) != 0,
             scanout_refresh_watermark: None,
+            scanout_refresh_resource: 0,
             failed: false,
             display_mode,
         };
@@ -1411,6 +1778,7 @@ impl VirtioGpu {
         wake_event: NonNull<KEVENT>,
         success_store: Option<(NonNull<AtomicU32>, u32)>,
         resubmit: Option<NonNull<AtomicU32>>,
+        scanout_flush: Option<ScanoutFlushToken>,
     ) -> Result<(), (DmaBuffer, VirtioError)> {
         let chain = Chain::Meta1 { in0_len };
         // Validated before the capacity gate, as in enqueue_sync.
@@ -1430,6 +1798,7 @@ impl VirtioGpu {
                 wake_event,
                 success_store,
                 resubmit,
+                scanout_flush,
             },
             meta,
             chain,
@@ -1437,6 +1806,116 @@ impl VirtioGpu {
             venus: None,
         });
         Ok(())
+    }
+
+    /// Enqueue the DISPATCH-level fast bind: one fire-and-forget
+    /// `SET_SCANOUT_BLOB` for the flip being armed (ROADMAP defect 0ab-C,
+    /// D1(ii)).
+    ///
+    /// DISPATCH_LEVEL by construction — a `&mut VirtioGpu` exists only inside
+    /// `with_virtio`, i.e. under the device spinlock. Nothing here allocates,
+    /// waits, or writes the registry: the command buffer is the preallocated
+    /// singleton, and the wire command is written straight into it.
+    ///
+    /// `seq` must have been minted under THIS lock hold (see
+    /// `AdapterContext::mint_scanout_bind_seq`), which is what makes sequence
+    /// order equal control-queue order.
+    ///
+    /// On any refusal the buffer goes back in its slot, so a failure costs
+    /// nothing but the counter: the PASSIVE worker's own bind is still armed and
+    /// is still the recovery path, exactly as it is with the accelerator off.
+    pub fn enqueue_scanout_bind_async(
+        &mut self,
+        mut buf: DmaBuffer,
+        seq: u64,
+        req: &ScanoutBindRequest,
+    ) -> Result<(), FastBindRefusal> {
+        let in0_len = core::mem::size_of::<VirtioGpuSetScanoutBlob>();
+        let resp_len = core::mem::size_of::<VirtioGpuCtrlHdr>();
+        // The buffer is recycled across binds, so its logical length is reset
+        // per use exactly like the DMA pool's; capacity was proved at init.
+        if !buf.reset(in0_len + resp_len) {
+            self.return_bind_cmd_buffer(buf);
+            return Err(FastBindRefusal::Failed);
+        }
+        {
+            // Written IN the device-visible buffer, not staged on this DISPATCH
+            // stack: `try_from_bytes_mut` is the checked cast (it returns Err
+            // rather than panicking on a bad size/alignment, and a panic in this
+            // path would be a bugcheck inside SubmitCommand). The DMA buffer is
+            // page-aligned, so the alignment arm cannot fire in practice.
+            let Ok(cmd) = bytemuck::try_from_bytes_mut::<VirtioGpuSetScanoutBlob>(
+                &mut buf.as_mut_slice()[..in0_len],
+            ) else {
+                self.return_bind_cmd_buffer(buf);
+                return Err(FastBindRefusal::Failed);
+            };
+            super::ctrl::fill_set_scanout_blob(
+                cmd,
+                req.resource_id,
+                req.width,
+                req.height,
+                req.format,
+                req.stride,
+                req.offset,
+            );
+        }
+        let chain = Chain::Meta1 { in0_len };
+        let token = match self.enqueue_core(chain, &buf, None, resp_len) {
+            Ok(token) => token,
+            Err(_) => {
+                self.return_bind_cmd_buffer(buf);
+                return Err(FastBindRefusal::Failed);
+            }
+        };
+        self.publish_then_notify(InFlight {
+            token,
+            kind: InFlightKind::AsyncScanoutBind {
+                seq,
+                resource_id: req.resource_id,
+                wh: ((req.width as u64) << 32) | req.height as u64,
+                present_epoch: req.present_epoch,
+                primary_address: req.primary_address,
+                carried_watermark: req.carried_watermark,
+            },
+            meta: buf,
+            chain,
+            resp_len,
+            venus: None,
+        });
+        Ok(())
+    }
+
+    /// Take a fast-bind command buffer, or `None` when all [`BIND_CMD_POOL`] of
+    /// them are already in flight. The take IS the gate — see
+    /// [`Self::bind_cmd_pool`].
+    pub fn take_bind_cmd_buffer(&mut self) -> Option<DmaBuffer> {
+        self.bind_cmd_pool.pop()
+    }
+
+    /// Put a fast-bind command buffer back, for the enqueue's failure arms.
+    ///
+    /// Cannot fail in practice: the buffer came out of this pool under the lock
+    /// the caller still holds, so the pool is one short of full. The `len` test
+    /// is what keeps the push inside the reserved capacity — a reallocation
+    /// under the device spinlock is the 0x7F class of bug — and the impossible
+    /// arm LEAKS rather than frees, because `DmaBuffer::drop` is
+    /// `MmFreeContiguousMemory` and that is PASSIVE-only; the same policy
+    /// `PARKED_LEAKS` follows. `FpErr` rising with no host errors is then the
+    /// visible signature of the accounting having broken.
+    fn return_bind_cmd_buffer(&mut self, buf: DmaBuffer) {
+        if self.bind_cmd_pool.len() < BIND_CMD_POOL {
+            self.bind_cmd_pool.push(buf);
+            return;
+        }
+        crate::ddi::scanout_trace::note_fast_bind_error();
+        core::mem::forget(buf);
+    }
+
+    /// Take the newest host-accepted fast bind, for application outside this
+    /// lock. See [`CompletedBind`] for why the drain cannot apply it itself.
+    pub fn take_completed_bind(&mut self) -> Option<CompletedBind> {
+        self.completed_bind.take()
     }
 
     /// Enqueue an ASYNC fenced SUBMIT_3D and return the KMD-assigned wire
@@ -1571,18 +2050,34 @@ impl VirtioGpu {
     /// mistake in the Sync-waiter sequence is a use-after-free of a stack block.
     fn latch_failed_and_fail_inflight(&mut self) {
         self.failed = true;
-        while let Some(entry) = self.inflight.pop() {
+        while let Some(mut entry) = self.inflight.pop() {
+            // Taken out BEFORE the match, so `entry` itself is never partially
+            // moved and can still be parked below. `ScanoutFlushToken` is
+            // deliberately not `Copy`: completing one twice would count a second
+            // host read that never happened.
+            let scanout_flush = take_scanout_flush_token(&mut entry.kind);
             match entry.kind {
                 InFlightKind::Sync { waiter } => {
                     if let Some(block) = waiter {
                         // No response is copied on purpose: `SyncWaitBlock::new_zeroed`
                         // zeroes `resp`, and `resp_is_ok(0)` is false, so every
                         // waiter observes failure rather than a stale success.
-                        // SAFETY: a registered block stays valid until its owner
-                        // deregisters under this same lock, which has not happened
-                        // (waiter is still Some). `done` (Release) BEFORE
-                        // KeSetEvent, both inside the critical section: after a
-                        // release the block's stack frame may be reused at once.
+                        //
+                        // SAFETY: identical to the success path's Sync arm in
+                        // `drain_used`, and audited with it for the 22.22.218.0
+                        // `0xA` (ROADMAP defect 0ab-C). The waiter has exactly
+                        // two exits and both keep the block alive across these
+                        // accesses: the SIGNAL, where the kernel's stack-event
+                        // contract forbids resuming before `KeSetEvent` is done
+                        // with the dispatcher object; and the TIMEOUT, whose
+                        // `abandon_sync` runs under THIS lock and therefore
+                        // either cleared `waiter` before us (it is still `Some`,
+                        // so it did not) or runs after this arm completes. No
+                        // lock-free `done` poll can authorize an exit any more —
+                        // that fast path is what made this pattern unsound.
+                        // `done` (Release) BEFORE KeSetEvent, both inside the
+                        // critical section, for the second exit's half of that
+                        // argument.
                         unsafe {
                             let b = block.as_ptr();
                             (*b).done.store(true, Ordering::Release);
@@ -1596,6 +2091,14 @@ impl VirtioGpu {
                     wake_event,
                     ..
                 } => {
+                    // The transport is dead: this command has terminated and no
+                    // host read can originate from it any more. End its lease
+                    // (counted `LsCanc`), or the flip that presented that buffer
+                    // never retires and VidSch escalates to a TDR — the same
+                    // wedge class this function's own doc paragraph describes.
+                    if let Some(token) = scanout_flush {
+                        token.complete(false);
+                    }
                     // Clear the gate and wake the worker, so the display's
                     // coalescing gates unstick instead of reading Busy forever.
                     // No `success_store`, no `resubmit`: nothing succeeded.
@@ -1606,6 +2109,20 @@ impl VirtioGpu {
                         completion.as_ref().store(0, Ordering::Release);
                         KeSetEvent(wake_event.as_ptr(), IO_NO_INCREMENT, 0);
                     }
+                }
+                InFlightKind::AsyncScanoutBind { .. } => {
+                    // The transport is dead, so this bind never reached the
+                    // host: apply NO bookkeeping (that would publish an identity
+                    // the host does not have) and stash nothing. Counted as an
+                    // error like every other way a fast bind can fail to land.
+                    //
+                    // The preallocated command buffer parks with the entry
+                    // below, and the slot stays empty for the rest of this
+                    // transport generation — the next StartDevice builds a fresh
+                    // `VirtioGpu` with a fresh buffer. That costs one page after
+                    // a transport death, which is not a state anything else
+                    // survives either.
+                    crate::ddi::scanout_trace::note_fast_bind_error();
                 }
                 InFlightKind::AsyncVenus { scanout_notify, .. } => {
                     if let Some(notify) = scanout_notify {
@@ -1709,7 +2226,11 @@ impl VirtioGpu {
                 self.latch_failed_and_fail_inflight();
                 return;
             }
-            let entry = self.inflight.swap_remove(idx);
+            let mut entry = self.inflight.swap_remove(idx);
+            // As in `latch_failed_and_fail_inflight`: take the ownership token
+            // out before the `match entry.kind` moves the other fields, so the
+            // entry stays whole for the park below.
+            let scanout_flush = take_scanout_flush_token(&mut entry.kind);
             let resp_base = {
                 // SAFETY: the resp span is within the entry-owned meta buffer.
                 unsafe { resp.as_slice() }.as_ptr()
@@ -1720,13 +2241,31 @@ impl VirtioGpu {
             match entry.kind {
                 InFlightKind::Sync { waiter } => {
                     if let Some(block) = waiter {
-                        // SAFETY: a registered SyncWaitBlock stays valid until
-                        // its owner deregisters under this same lock
-                        // (`abandon_sync`) — which has not happened (waiter is
-                        // still Some). Response copied BEFORE the Release store
-                        // on `done`; KeSetEvent is DISPATCH-safe (Wait=FALSE).
-                        // Signaling under the lock is required: after a release,
-                        // the block's stack frame may be reused immediately.
+                        // THE WRITE SITE THE 22.22.218.0 `0xA` RACED, and the
+                        // ordering below is now correct only because
+                        // `ctrl::wait_block` no longer has a lock-free `done`
+                        // fast path. Keep it that way: `done` is stored one
+                        // instruction before the signal, so any exit authorized
+                        // by `done` lets the waiter pop the frame these three
+                        // accesses are still writing (ROADMAP defect 0ab-C).
+                        //
+                        // SAFETY: the block outlives every access here, and the
+                        // argument is now about the waiter's TWO exits rather
+                        // than about deregistration:
+                        //   * the SIGNAL — the waiter is inside
+                        //     `KeWaitForSingleObject` on `event`, and the
+                        //     kernel's stack-event contract says it cannot
+                        //     resume before `KeSetEvent` has finished with the
+                        //     dispatcher object;
+                        //   * the TIMEOUT — `abandon_sync` runs under THIS lock,
+                        //     so it either clears `waiter` before this arm runs
+                        //     (`waiter` is still `Some`, so it did not) or runs
+                        //     after the whole arm and reports AlreadyCompleted;
+                        //     its own frame is alive across that call.
+                        // Response copied BEFORE the Release store on `done`;
+                        // KeSetEvent is DISPATCH-safe (Wait=FALSE). All three
+                        // stay inside the critical section for the second exit's
+                        // half of the argument.
                         unsafe {
                             let b = block.as_ptr();
                             let n = resp_len.min(SYNC_RESP_MAX);
@@ -1740,15 +2279,67 @@ impl VirtioGpu {
                         }
                     }
                 }
+                InFlightKind::AsyncScanoutBind {
+                    seq,
+                    resource_id,
+                    wh,
+                    present_epoch,
+                    primary_address,
+                    carried_watermark,
+                } => {
+                    // NO adapter bookkeeping here, on purpose. This runs under
+                    // `virtio_lock`, and applying ends in a flush arm that needs
+                    // `wddm_notify_lock` — the reverse of the driver's order,
+                    // which `end_scanout_leases_through` documents and which is
+                    // a DIRQL deadlock, not a lock-contention slowdown. Stash
+                    // the values; `drain_used_and_complete` applies them one
+                    // frame up, with no transport lock held.
+                    if resp_is_ok(resp_type) {
+                        if self.completed_bind.is_some() {
+                            // Two binds completed in one drain pass. The newest
+                            // is the identity the host is left with, so it wins
+                            // — the same coalescing the pending-flip slot does,
+                            // and counted for the same reason (`VpCoal` is that
+                            // slot's; this is `FpCoal`).
+                            crate::ddi::scanout_trace::note_fast_bind_coalesced();
+                        }
+                        self.completed_bind = Some(CompletedBind {
+                            seq,
+                            resource_id,
+                            wh,
+                            present_epoch,
+                            primary_address,
+                            carried_watermark,
+                        });
+                    } else {
+                        // The host refused the bind. Nothing is bound to this
+                        // resource, so nothing may be remembered or published;
+                        // the PASSIVE worker's own validate/retry ladder is the
+                        // recovery path, unchanged.
+                        crate::ddi::scanout_trace::note_fast_bind_error();
+                    }
+                }
                 InFlightKind::AsyncControl {
                     completion,
                     completion_errors,
                     wake_event,
                     success_store,
                     resubmit,
+                    ..
                 } => {
                     ASYNC_CTRL_COMPLETE_COUNT.fetch_add(1, Ordering::Relaxed);
                     let response_ok = resp_is_ok(resp_type);
+                    // THE CONSUMER EDGE (ROADMAP defect 0ab-B). QEMU's
+                    // `RESOURCE_FLUSH` handler is synchronous — the Vulkan
+                    // readback submits, waits on its fence, copies the staging
+                    // bytes and only then does this response go on the used ring
+                    // — so this exact point is "the host has finished reading
+                    // the buffer we published". Ending the lease HERE, before
+                    // the completion gate is cleared below, means the WDDM pop
+                    // that follows in the same DPC already sees it.
+                    if let Some(token) = scanout_flush {
+                        token.complete(response_ok);
+                    }
                     if !response_ok {
                         ASYNC_CTRL_RESP_ERRORS.fetch_add(1, Ordering::Relaxed);
                         // SAFETY: adapter-owned atomic; see enqueue contract.
@@ -1863,6 +2454,34 @@ impl VirtioGpu {
                         }
                     }
                 }
+            }
+            // The fast bind's buffer is RETAINED, not parked: it is one of the
+            // preallocated pool buffers, the device is done with it (`pop_used`
+            // returned), and nothing is freed here — which is the only reason
+            // parking exists (`DmaBuffer::drop` is PASSIVE-only). Returning it
+            // to the pool is also what re-arms the accelerator, and doing it
+            // HERE rather than at a PASSIVE reap is the point of the pool: the
+            // return is what a flip arm finds, so it must happen as early as the
+            // completion does. `venus.is_none()` is belt-and-braces — this kind
+            // is created with `venus: None`.
+            if matches!(entry.kind, InFlightKind::AsyncScanoutBind { .. }) && entry.venus.is_none()
+            {
+                if self.bind_cmd_pool.len() < BIND_CMD_POOL {
+                    let (meta, _none) = entry.into_dma_buffers();
+                    // Inside the reserved capacity by the test above, so no
+                    // reallocation under the spinlock.
+                    self.bind_cmd_pool.push(meta);
+                    continue;
+                }
+                // IMPOSSIBLE: at most BIND_CMD_POOL binds can be outstanding,
+                // and each one holds the buffer it popped, so a completing bind
+                // always has room to return to. Reaching this means the pool
+                // accounting has broken (a buffer returned twice, or one that
+                // never came from here). Park the entry like any other — never
+                // free at DISPATCH — and count it: `FpErr` rising while
+                // `FpBind`/`FpApply` look healthy and the host reports no errors
+                // is the signature.
+                crate::ddi::scanout_trace::note_fast_bind_error();
             }
             // Park the entry for a PASSIVE reap (DmaBuffer frees are
             // PASSIVE-only).
@@ -2151,18 +2770,70 @@ impl VirtioGpu {
     /// The `NotifyOrdered` token is mintable only inside
     /// `WddmNotifyGuard::with_virtio`, so reaching this method proves that THIS
     /// adapter's `wddm_notify` lock was taken before its `virtio` lock and is
-    /// still held. (The previous `&WddmNotifyGuard` parameter proved only that
-    /// SOME adapter's notify lock was held somewhere — it carried no
-    /// relationship to the `&mut VirtioGpu` being mutated.) Returns true when
-    /// all preceding GPU work has already retired and the caller may refresh
-    /// immediately.
-    pub fn note_scanout_refresh(&mut self, _order: &crate::adapter::NotifyOrdered<'_>) -> bool {
-        let watermark = self.next_wire_fence;
+    /// still held.
+    ///
+    /// `resource_id` is the allocation this dirty edge BELONGS TO — the exact
+    /// venus resource the present named — or 0 when the marker carries no
+    /// identity (the generic HERF refresh, whose meaning is "whatever is
+    /// currently bound").
+    ///
+    /// Carrying it is the fix for a real ordering defect. The watermark alone
+    /// says WHEN it is safe to flush; it never said WHAT to flush, so
+    /// `queue_active_scanout_refresh_locked` read `active_scanout_resource` at
+    /// flush time instead. Those are different frames: the bind is deferred
+    /// (`SetVidPnSourceAddress` stashes `pending_vidpn_allocation` at DIRQL for
+    /// a PASSIVE worker, which coalesces), so a refresh armed for frame N could
+    /// fire against the previous buffer — a stale frame — or against a buffer
+    /// the flip had already advanced to but the app had not yet rendered, which
+    /// is a BLACK frame. Host tracing showed both shapes directly: binds whose
+    /// content was never flushed, and repeated flushes of one bind.
+    ///
+    /// The old producer-side CPU gate hid this by removing all overlap: with
+    /// the app blocked until its own GPU work completed, bind and flush landed
+    /// in the same quiescent window and the bound buffer was always fully
+    /// rendered. That is why restoring CPU/GPU overlap exposed it.
+    /// The wire-fence boundary as it stands right now: every Venus command
+    /// submitted so far carries a fence BELOW this value.
+    ///
+    /// Read by a caller that knows WHICH FRAME it is arming for, so the
+    /// boundary can be captured when that frame is PRESENTED and carried to the
+    /// bind edge — see [`Self::note_scanout_refresh_at`].
+    pub fn wire_fence_watermark(&self) -> u64 {
+        self.next_wire_fence
+    }
+
+    /// Arm the marker against an EXPLICIT completion boundary instead of "now".
+    ///
+    /// WHY THIS EXISTS (ROADMAP defect 0ab-B, measured 2026-07-29). Sampling
+    /// `next_wire_fence` inside the bind edge names the wrong frame. The bind
+    /// runs in the PASSIVE display worker, ~10 ms after the flip was submitted,
+    /// and at 183 fps the app has pushed frame N+1 into the ring by then — so
+    /// the flush for frame N waited for N+1 to complete, one whole frame too
+    /// long. With two rotating buffers the app has had buffer N handed back and
+    /// CLEARED it for N+2 by the time QEMU reads it: an entirely black frame,
+    /// re-cleared rather than half-drawn.
+    ///
+    /// The QEMU-side per-flush oracle measured exactly that split over one GT1
+    /// run (`tools/scanout_oracle_report.py`): flushes landing 1–3 ms after
+    /// their bind were 1.0 % black, those landing 9–12 ms after were 41.1 %,
+    /// and 611 of 619 black frames landed within 0.5 ms of the NEXT bind.
+    ///
+    /// A watermark captured when the frame was submitted is that frame's own
+    /// completion boundary, and nothing later. Still an ordering, never a
+    /// stall.
+    pub fn note_scanout_refresh_at(
+        &mut self,
+        _order: &crate::adapter::NotifyOrdered<'_>,
+        resource_id: u32,
+        watermark: u64,
+    ) -> bool {
         if self.async_retired_up_to(watermark, RetireDomain::IncludingGpu) {
             self.scanout_refresh_watermark = None;
+            self.scanout_refresh_resource = resource_id;
             true
         } else {
             self.scanout_refresh_watermark = Some(watermark);
+            self.scanout_refresh_resource = resource_id;
             false
         }
     }
@@ -2170,18 +2841,47 @@ impl VirtioGpu {
     /// Consume a completion-ordered scanout marker after the used-ring drain.
     /// Must be called under the same statically witnessed notification lock as
     /// [`Self::note_scanout_refresh`].
+    ///
+    /// Returns the armed resource id (0 = "whatever is bound") on success, so
+    /// the flush names the frame the marker belonged to.
     pub fn take_ready_scanout_refresh(
         &mut self,
         _order: &crate::adapter::NotifyOrdered<'_>,
-    ) -> bool {
-        let Some(watermark) = self.scanout_refresh_watermark else {
-            return false;
-        };
+    ) -> Option<u32> {
+        let watermark = self.scanout_refresh_watermark?;
         if !self.async_retired_up_to(watermark, RetireDomain::IncludingGpu) {
-            return false;
+            return None;
         }
         self.scanout_refresh_watermark = None;
-        true
+        Some(core::mem::take(&mut self.scanout_refresh_resource))
+    }
+
+    /// How many async Venus fences below `watermark` are still outstanding, and
+    /// the ring of the lowest one (0 = host DECODE, >= 1 = host GPU).
+    ///
+    /// Diagnostic for defect 0ab-B: it says WHAT a deferred bind-edge arm is
+    /// waiting for. One or two GPU-ring fences means the app's own next frames;
+    /// a large count, or a decode-ring fence, means the boundary is blocked by
+    /// something that has nothing to do with this frame.
+    pub fn outstanding_below(&self, watermark: u64) -> (u32, u8) {
+        let mut count = 0u32;
+        let mut lowest = u64::MAX;
+        let mut lowest_ring = 0u8;
+        for e in self.inflight.iter() {
+            if let InFlightKind::AsyncVenus {
+                fence_id, ring_idx, ..
+            } = e.kind
+            {
+                if fence_id < watermark {
+                    count += 1;
+                    if fence_id < lowest {
+                        lowest = fence_id;
+                        lowest_ring = ring_idx;
+                    }
+                }
+            }
+        }
+        (count, lowest_ring)
     }
 
     /// Whether every async wire fence `< watermark` in `domain` has retired.
@@ -2226,10 +2926,19 @@ impl VirtioGpu {
             self.wddm_pending.clear();
             return true;
         }
+        // A non-paging DMA fence must mean "the GPU is finished", because that
+        // is what dxgkrnl schedules on. Retiring it at DECODE reports completion
+        // with host GPU work still executing, which lets dxgkrnl advance a flip
+        // or release an app's surface to the compositor mid-write. Paging keeps
+        // the decode domain: it moves memory rather than producing pixels, and
+        // coupling it to unrelated GPU work is the pacing cost the DecodeOnly
+        // doc warns about with none of the ordering benefit.
         let domain = if gpu_completion_fence.is_some() {
             RetireDomain::IncludingGpu
-        } else {
+        } else if paging || !self.dma_gpu_fence {
             RetireDomain::DecodeOnly
+        } else {
+            RetireDomain::IncludingGpu
         };
         let watermark = if paging {
             0
@@ -2255,6 +2964,15 @@ impl VirtioGpu {
             // newest (monotonically largest) fence implicitly completes the
             // queued older ones, so drop them too. Loud, counted, and
             // practically unreachable (VidSch queues far fewer than 256).
+            //
+            // ⚠ The caller still releases every outstanding scan-out lease when
+            // this returns true after an overflow. The leases no longer gate a
+            // retirement, but they DO decide the flush executor's ownership
+            // gate, and an epoch whose presentation was just dropped on the
+            // floor must not read as one that is still coming.
+            // `note_wddm_submission` cannot do it itself — the lease state lives
+            // on the adapter and this runs under `virtio_lock`, inside
+            // `wddm_notify_lock`.
             WDDM_PENDING_OVERFLOWS.fetch_add(1, Ordering::Relaxed);
             self.wddm_pending.clear();
             return true;
@@ -2267,23 +2985,42 @@ impl VirtioGpu {
         false
     }
 
-    /// Pop every head-of-FIFO WDDM submission whose venus watermark has been
-    /// reached, up to `out.len()` of them. The DPC signals DMA_COMPLETED for
-    /// each, in order, OUTSIDE the device spinlock.
-    pub fn take_one_ready_wddm(
-        &mut self,
-        _order: &crate::adapter::NotifyOrdered<'_>,
-    ) -> Option<WddmReady> {
+    /// Whether the last [`Self::note_wddm_submission`] overflowed the pending
+    /// FIFO, and the caller therefore owes a lease release.
+    ///
+    /// A counter read rather than a second return value, because the overflow is
+    /// practically unreachable and threading a tuple through the one call site
+    /// would put the rare path in everyone's way. The caller compares before and
+    /// after; `WDDM_PENDING_OVERFLOWS` is cumulative and monotonic.
+    pub fn wddm_pending_overflows() -> u32 {
+        WDDM_PENDING_OVERFLOWS.load(Ordering::Relaxed)
+    }
+
+    /// Pop the head-of-FIFO WDDM submission once its venus watermark has been
+    /// reached — the app has finished writing the frame. The DPC signals
+    /// DMA_COMPLETED for it OUTSIDE the device spinlock.
+    ///
+    /// The presentation-lease half that also gated this until 22.22.217.0 is
+    /// gone; see [`WddmPending`] for the measurement that retired it.
+    ///
+    /// Strictly head-of-line. A blocked head is never bypassed: dxgkrnl treats
+    /// `SubmissionFenceId` as a watermark and requires monotonic completion, so
+    /// skipping ahead is bugcheck 0x119/1.
+    pub fn take_one_ready_wddm(&mut self, _order: &crate::adapter::NotifyOrdered<'_>) -> WddmTake {
         let (watermark, domain) = {
-            let head = self.wddm_pending.front()?;
+            let Some(head) = self.wddm_pending.front() else {
+                return WddmTake::Empty;
+            };
             (head.watermark, head.domain)
         };
         if !self.async_retired_up_to(watermark, domain) {
-            return None;
+            return WddmTake::BlockedOnProducer;
         }
-        let pending = self.wddm_pending.pop_front()?;
+        let Some(pending) = self.wddm_pending.pop_front() else {
+            return WddmTake::Empty;
+        };
         WDDM_FENCE_FROM_DPC.fetch_add(1, Ordering::Relaxed);
-        Some(WddmReady { pending })
+        WddmTake::Ready(WddmReady { pending })
     }
 
     /// Put a popped-but-undelivered submission back at the head of the FIFO.

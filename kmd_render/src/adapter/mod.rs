@@ -24,11 +24,16 @@ use helios_kmd_logic::DisplayMode;
 mod backing;
 mod kobj;
 mod locks;
+mod read_ledger;
 mod scanout;
 mod segments;
 
 pub(crate) use backing::{SystemBackingSnapshot, SystemBackingTable};
-pub(crate) use locks::{NotifyOrdered, ScanoutGuard, WddmNotifyGuard};
+pub(crate) use locks::{NotifyOrdered, ScanoutGuard, WddmNotifyGuard, WITH_VIRTIO_TORN};
+pub(crate) use read_ledger::{
+    dump_counters as read_ledger_dump_counters, reset_counters as read_ledger_reset_counters,
+    ReadLedger, ScanoutEventReg, AQ_REGISTER_REFUSED, RD_MAP_REFUSED,
+};
 pub(crate) use scanout::ScanoutRefreshQueue;
 pub(crate) use segments::{BarSegment, PagingRam};
 
@@ -113,20 +118,64 @@ pub(crate) struct AdapterKnobs {
     /// measured ~200 MB/s in the IDD readback (36 ms per 7.8 MiB frame,
     /// 2026-07-06). 0 = kill switch.
     pub alloc_cached: bool,
+    /// `DmaGpuFence` (default 1). Retire ordinary (non-paging) WDDM DMA fences
+    /// on host GPU COMPLETION instead of host DECODE.
+    ///
+    /// THE CONTRACT: dxgkrnl reads a DMA fence as "the GPU is finished with this
+    /// work", and schedules everything downstream on that — including when a
+    /// compositor may read a surface an app has just rendered. Retiring at
+    /// decode reports completion while the host GPU is still executing, so
+    /// dxgkrnl can advance a flip, or let dwm compose an app's window, over a
+    /// buffer that is still being written. That is the black/torn frame, and it
+    /// is confined to the region being drawn, which is why it presented as
+    /// "only inside the app's window" and as Explorer's late top band.
+    ///
+    /// It was invisible while the UMD's present path blocked on GPU completion
+    /// before publishing a present (`PresentOrder=0`): that made the fence's lie
+    /// harmless by ensuring the work really was done before dxgkrnl saw it, at
+    /// the cost of removing all CPU/GPU overlap (Fire Strike GT1 158 -> 136 fps,
+    /// Combined 25.9 -> 18.8).
+    ///
+    /// The cost this trades against is the one `RetireDomain::DecodeOnly`'s doc
+    /// names: ring >= 1 fences stay in flight for the whole GPU-work duration,
+    /// so DMA fences now retire later. That is what the fences are supposed to
+    /// mean. 0 restores the old behaviour as the A/B lever.
+    pub dma_gpu_fence: bool,
+    /// `BindFlushMode` (default 0 = completion-ordered). 1 flushes immediately
+    /// at the bind with no ordering — the A/B that separates "the buffer is not
+    /// ready when we bind it" from "it is ready and our boundary is wrong".
+    /// See `crate::diag::knobs::BIND_FLUSH_MODE`.
+    pub bind_flush_immediate: bool,
+    /// `DispatchBind` (default 1 = ON). The DISPATCH-level fast bind
+    /// (ROADMAP defect 0ab-C, D1(ii)): the flip arm enqueues this flip's
+    /// `SET_SCANOUT_BLOB` itself instead of waiting for the PASSIVE display
+    /// worker to get to it, which measured a bimodal 1–3 ms / 10–14 ms bind
+    /// cadence against a 4.8 ms flip cadence at 210 fps — every stall pushing
+    /// some bind two frame periods past its present, onto a buffer the app had
+    /// already re-cleared.
+    ///
+    /// A PURE ACCELERATOR: the worker still consumes `pending_vidpn_allocation`
+    /// and still binds; the wire is FIFO, so whichever enqueue happens first
+    /// decides the host-side bind moment and the later one is an idempotent
+    /// re-bind of the same resource. 0 restores the worker-only cadence as the
+    /// same-boot A/B lever. See `crate::diag::knobs::DISPATCH_BIND`.
+    pub dispatch_bind: bool,
     /// `PresentProbe` (default 0). When enabled, each exact Present
     /// source/destination pair performs one bounded, fence-ordered CPU sample of
     /// the destination after its eighth submission. Diagnostic only: the
     /// steady-state path never waits or maps a frame, and the per-pair
     /// `probe_done` state statically prevents repeated readbacks.
     pub present_probe: bool,
-    /// `DisplayHalf` (default 0 = OFF, the boot-proven render-only surface).
-    /// When nonzero, StartDevice advertises ONE video-present source + ONE child
+    /// `DisplayHalf` (default 1 = ON — the render+display miniport IS the
+    /// product; the hardware-accelerated desktop shipped on it). When nonzero,
+    /// StartDevice advertises ONE video-present source + ONE child
     /// video-output and the VidPn/child DDIs in
     /// `ddi::display`/`ddi::vidpn`/`ddi::child` stand up a real virtual
     /// VidPn output + default monitor and drive virtio-gpu scanout, instead of
-    /// returning NOT_SUPPORTED. Production sets it to 1 via `reg add` + a guest
-    /// reboot (re-runs StartDevice -> child enumeration). Demoted to 0 before
-    /// publication if the transport never came up. Mirrored to `DspH`.
+    /// returning NOT_SUPPORTED. 0 restores the boot-era render-only surface as
+    /// the escape hatch (it was the default until 0ab-C closed and the display
+    /// half became unconditional production). Demoted to 0 before publication
+    /// if the transport never came up. Mirrored to `DspH`.
     pub display_half: bool,
     /// `DirectFlipCaps` (default 0 = deny direct flip everywhere — the truthful
     /// surface; see the `SupportDirectFlip` comment in `query_driver_caps`).
@@ -163,8 +212,11 @@ impl AdapterKnobs {
     #[allow(dead_code)]
     pub const DEFAULTS: Self = Self {
         alloc_cached: true,
+        dma_gpu_fence: true,
+        bind_flush_immediate: false,
+        dispatch_bind: true,
         present_probe: false,
-        display_half: false,
+        display_half: true,
         direct_flip: false,
         cross_adapter: false,
         bar_seg_flags: 0x1C,
@@ -184,8 +236,11 @@ impl AdapterKnobs {
         use crate::diag::{knobs, read_config_dword};
         Self {
             alloc_cached: read_config_dword(knobs::ALLOC_CACHED, 1) != 0,
+            dma_gpu_fence: read_config_dword(knobs::DMA_GPU_FENCE, 1) != 0,
+            bind_flush_immediate: read_config_dword(knobs::BIND_FLUSH_MODE, 0) == 1,
+            dispatch_bind: read_config_dword(knobs::DISPATCH_BIND, 1) != 0,
             present_probe: read_config_dword(knobs::PRESENT_PROBE, 0) != 0,
-            display_half: read_config_dword(knobs::DISPLAY_HALF, 0) != 0,
+            display_half: read_config_dword(knobs::DISPLAY_HALF, 1) != 0,
             direct_flip: read_config_dword(knobs::DIRECT_FLIP_CAPS, 0) != 0,
             cross_adapter: read_config_dword(knobs::CROSS_ADAPT_CAPS, 0) != 0,
             bar_seg_flags: read_config_dword(knobs::BAR_SEG_FLAGS, 0x1C),
@@ -202,6 +257,8 @@ impl AdapterKnobs {
     pub fn read_at_start() -> Self {
         let knobs = Self::read();
         crate::diag::record_named_bytes(b"AlcC", knobs.alloc_cached as u32);
+        crate::diag::record_named_bytes(b"BndFM", knobs.bind_flush_immediate as u32);
+        crate::diag::record_named_bytes(b"DspBnd", knobs.dispatch_bind as u32);
         crate::diag::record_named_bytes(b"PBPrEn", knobs.present_probe as u32);
         crate::diag::record_named_bytes(b"DspH", knobs.display_half as u32);
         crate::diag::record_named_bytes(b"BarF", knobs.bar_seg_flags);
@@ -424,6 +481,14 @@ pub struct AdapterContext {
     /// drains and unmaps them. Has its own spinlock, independent of `virtio_lock`,
     /// so teardown works even after the transport is gone.
     pub mappings: crate::mapping::MappingTable,
+    /// D4a scanout-read acquire (FIX-DESIGN-d4a.md §3): the per-resid READ
+    /// LEDGER page + retirement-event table. Adapter-owned, NOT transport-owned
+    /// — the page must survive transport swaps because user mappings of it
+    /// (tracked in `mappings`) can outlive StopDevice. The page itself is a
+    /// separate heap allocation (first StartDevice), never inline here: the
+    /// context is built by value inside `create` and the boot chain's stack
+    /// budget has no room for a 4 KiB array (the T3 lesson).
+    pub(crate) read_ledger: ReadLedger,
     /// Exact paging-process system-memory leaf PTEs supplied by VidMm for
     /// virtual content transfers. This is the software VA-walk state used by
     /// `DxgkDdiBuildPagingBuffer`, independent of the decorative hardware page
@@ -478,6 +543,105 @@ pub struct AdapterContext {
     /// DPC wakes the PASSIVE display worker, which consumes the newest handle
     /// and performs the Venus import/copy plus host scanout programming.
     pub pending_vidpn_allocation: AtomicUsize,
+    /// Per-buffer completion boundary, captured when the app PRESENTED that
+    /// buffer, for the bind edge to arm its refresh against. `(resource, wire
+    /// fence)`; a zero resource is a free slot.
+    ///
+    /// Eight slots (4 -> 8 for D4b): the four D4b snapshot-ring resids and the
+    /// desktop's rotation coexist across fullscreen transitions, where four
+    /// held only a whole single rotation (fullscreen rotates two scan-out
+    /// buffers, the desktop three). Touched ONLY from inside
+    /// `with_wddm_notify_lock`, which is the same lock that guards the marker
+    /// itself, so the pair is never observed torn.
+    ///
+    /// It lives here rather than in `VirtioGpu` because that struct is built on
+    /// the `DxgkDdiStartDevice` stack: adding 64 bytes to it cost 2448 bytes of
+    /// boot-chain frame (17488 -> 19936, over the 17936 ceiling) — see the T3
+    /// kernel-stack-overflow lesson. (`AdapterContext` itself is heap — growing
+    /// these arrays adds no boot-chain frame.)
+    pub frame_watermark_resource: [AtomicU32; 8],
+    pub frame_watermark_fence: [AtomicU64; 8],
+    /// ── Scan-out presentation-epoch ownership (ROADMAP defect 0ab-B) ────────
+    ///
+    /// The display-consumer half of "when may Windows have this allocation
+    /// back?". A Helios scan-out is not continuous: the host reads the bound
+    /// DMA-BUF exactly once per `RESOURCE_FLUSH`, so a presented buffer must be
+    /// immutable from the moment it is published to the host until that read has
+    /// finished. `helios_kmd_logic::scanout_lease` is the executable
+    /// specification and holds the whole argument; these three atomics are its
+    /// implementation.
+    ///
+    /// They are atomics rather than one lock-guarded struct because the three
+    /// edges sit under three different locks: the mint is on the
+    /// `DxgkDdiSubmitCommand` DISPATCH path, the bind and the flush issue are on
+    /// the PASSIVE display worker under `scanout_mutex`, and the flush
+    /// completion is in the used-ring drain under `virtio_lock` — which must
+    /// NOT take `wddm_notify_lock`, because the established order is the reverse
+    /// and inverting it is a DIRQL deadlock (`adapter/locks.rs`). Every
+    /// transition is monotone, so `fetch_add`/`fetch_max` is exact.
+    ///
+    /// Minter. Each DMA-buffer flip takes the next value; 0 is reserved for
+    /// "this submission is gated on no host read".
+    pub scanout_present_epoch: AtomicU64,
+    /// The epoch whose buffer the host is bound to right now. Advanced by the
+    /// display worker only after the binding has actually been published
+    /// (a returned `SET_SCANOUT_BLOB`, or an already-bound re-present).
+    pub scanout_bound_epoch: AtomicU64,
+    /// Lease-end watermark: every epoch `<= this` has ended its host-reader
+    /// lease, whether by a completed read, a supersede, a cancellation or
+    /// teardown. Only ever moves forward.
+    pub scanout_read_epoch: AtomicU64,
+    /// 1 while the CURRENT binding was published with a presentation epoch (the
+    /// DMA-buffer flip contract), 0 when it was not (the MMIO/`FlipOnVSyncMmIo`
+    /// desktop contract, and every path that released its leases wholesale).
+    ///
+    /// The ownership gate's third operand, and it is not optional: the MMIO path
+    /// mints no presentations, so `scanout_present_epoch` freezes at whatever
+    /// the last DMA-flip app left behind. A stale `present > bound` would then
+    /// hold forever and drop every desktop refresh — a frozen desktop (defect
+    /// 0aa). Every failure direction of this flag is "gate off", i.e. the
+    /// pre-22.22.217.0 behaviour. See `helios_kmd_logic::scanout_lease::
+    /// surplus_republish`.
+    pub scanout_epoch_tracked: AtomicU32,
+    /// Set when a lease ends from a context that cannot itself pop the WDDM
+    /// pending FIFO (the used-ring drain holds `virtio_lock`). The HPD worker
+    /// consumes it and runs one `drain_used_and_complete`.
+    pub scanout_retire_wanted: AtomicU32,
+    /// ── Wire-order guard for scan-out bind bookkeeping (defect 0ab-C, D1(ii)) ─
+    ///
+    /// Minted at every `SET_SCANOUT_BLOB` enqueue, INSIDE the same `with_virtio`
+    /// as the enqueue itself — so the sequence is totally ordered consistently
+    /// with the control queue's FIFO order, which is the order the host applies
+    /// the binds in.
+    ///
+    /// It exists because the two enqueue sites apply their guest-side
+    /// bookkeeping at completely different times: the DISPATCH fast bind applies
+    /// from the used-ring drain, while the PASSIVE worker applies after its
+    /// synchronous round-trip returns. A worker bind that started BEFORE a fast
+    /// bind can therefore finish its bookkeeping AFTER it (the common case at
+    /// 210 fps, where a flip arms mid-round-trip) and stomp the newer identity
+    /// with an older one.
+    pub scanout_bind_wire_seq: AtomicU64,
+    /// The highest bind sequence whose bookkeeping has been applied. Advanced by
+    /// whichever application runs; one whose sequence does not advance it is
+    /// STALE and applies nothing (`FpLate`).
+    pub scanout_bind_applied_seq: AtomicU64,
+    /// The resource the NEWEST ENQUEUED bind names — the identity the host will
+    /// hold once the control queue drains, as opposed to
+    /// `active_scanout_resource`, which is the identity already APPLIED.
+    ///
+    /// Written in the same store-pair as the sequence above, at every mint site,
+    /// and every mint site holds `virtio_lock`. That lock — not the ordering
+    /// annotation — is what makes the value coherent with the wire, so `Relaxed`
+    /// is sufficient on both the store and the fast path's read: the read is an
+    /// advisory skip decision whose worst outcomes are a redundant (host-
+    /// idempotent) bind or one missed acceleration, and the enqueue that follows
+    /// re-takes the lock and mints its own sequence.
+    ///
+    /// 0 = no bind enqueued this transport generation, or the last one was the
+    /// scan-out DISABLE (`SET_SCANOUT_BLOB` with resource 0), which is exactly
+    /// the state in which nothing may be treated as already bound.
+    pub scanout_bind_wire_resource: AtomicU32,
     /// Nonzero while the exact primary supplied by `SetVidPnSourceAddress` is
     /// being programmed for scanout. A CRTC_VSYNC must not report the preceding
     /// primary again during this interval: dxgkrnl treats that notification as
@@ -540,6 +704,21 @@ pub struct AdapterContext {
     /// At most one fire-and-forget RESOURCE_FLUSH is outstanding; its used-ring
     /// completion clears `scanout_flush_inflight` and wakes the same worker.
     pub scanout_refresh_pending: AtomicU32,
+    /// The venus resource the pending dirty edge belongs to, or 0 for the
+    /// identity-free HERF edge ("flush whatever is bound").
+    ///
+    /// The watermark says WHEN a refresh may fire; this says WHAT it must
+    /// flush. Without it the flush read `active_scanout_resource` at fire time,
+    /// which is a different frame whenever the deferred+coalesced
+    /// `SetVidPnSourceAddress` bind has not caught up — publishing the previous
+    /// buffer (stale) or one the flip advanced to but the app had not yet
+    /// rendered (black).
+    pub pending_refresh_resource: AtomicU32,
+    /// Refreshes deferred because the bind had not reached the armed resource.
+    /// Expected to be small and non-growing in steady state; a rising rate means
+    /// the bind path is lagging the present path, not that frames are lost (the
+    /// dirty bit is re-armed and the bind completion wakes the worker).
+    pub scanout_refresh_unbound: AtomicU32,
     pub scanout_flush_inflight: AtomicU32,
     /// 1 once [`Self::init_vsync`] has armed the timer (StopDevice cancels once).
     pub vsync_armed: AtomicU32,
@@ -853,6 +1032,7 @@ impl AdapterContext {
             // Zeroed placeholder — initialized in place by init_kernel_events.
             scanout_mutex: UnsafeCell::new(unsafe { core::mem::zeroed() }),
             mappings: crate::mapping::MappingTable::new(),
+            read_ledger: ReadLedger::new(),
             paging_pte_shadow: crate::ddi::PagingPteShadow::new(),
             system_backings: SystemBackingTable::new(),
             venus_client: UnsafeCell::new(None),
@@ -884,9 +1064,39 @@ impl AdapterContext {
             scanout_refresh_count: AtomicU32::new(0),
             scanout_refresh_fail: AtomicU32::new(0),
             scanout_refresh_pending: AtomicU32::new(0),
+            pending_refresh_resource: AtomicU32::new(0),
+            scanout_refresh_unbound: AtomicU32::new(0),
             scanout_flush_inflight: AtomicU32::new(0),
             vsync_armed: AtomicU32::new(0),
             pending_vidpn_allocation: AtomicUsize::new(0),
+            frame_watermark_resource: [
+                AtomicU32::new(0),
+                AtomicU32::new(0),
+                AtomicU32::new(0),
+                AtomicU32::new(0),
+                AtomicU32::new(0),
+                AtomicU32::new(0),
+                AtomicU32::new(0),
+                AtomicU32::new(0),
+            ],
+            frame_watermark_fence: [
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+            ],
+            scanout_present_epoch: AtomicU64::new(helios_kmd_logic::scanout_lease::NO_LEASE),
+            scanout_bound_epoch: AtomicU64::new(helios_kmd_logic::scanout_lease::NO_LEASE),
+            scanout_read_epoch: AtomicU64::new(helios_kmd_logic::scanout_lease::NO_LEASE),
+            scanout_epoch_tracked: AtomicU32::new(0),
+            scanout_retire_wanted: AtomicU32::new(0),
+            scanout_bind_wire_seq: AtomicU64::new(0),
+            scanout_bind_applied_seq: AtomicU64::new(0),
+            scanout_bind_wire_resource: AtomicU32::new(0),
             vidpn_programming: AtomicU64::new(0),
             // Zeroed placeholder — the real KEVENT is written by init_kernel_events.
             hpd_event: UnsafeCell::new(unsafe { core::mem::zeroed() }),
@@ -952,6 +1162,9 @@ impl AdapterContext {
 
         self.vidpn_programming.store(0, Ordering::Release);
         self.pending_vidpn_allocation.store(0, Ordering::Release);
+        for slot in &self.frame_watermark_resource {
+            slot.store(0, Ordering::Release);
+        }
         self.active_scanout_resource.store(0, Ordering::Release);
         self.active_scanout_wh.store(0, Ordering::Release);
         self.host_bound_scanout_resource.store(0, Ordering::Release);
@@ -970,11 +1183,49 @@ impl AdapterContext {
         self.primary_scanout_seq.fetch_add(1, Ordering::Release);
         self.scanout_refresh_pending.store(0, Ordering::Release);
         self.scanout_flush_inflight.store(0, Ordering::Release);
+        // Every presentation this generation published dies with the binding:
+        // release the leases so nothing carried over gates a fresh epoch, and
+        // reset the minter with them (the counters are what record how many
+        // there were — see `Ls*`). Order matters: end the leases while the
+        // minter still names them, THEN zero the sequence.
+        self.end_scanout_leases_through(
+            self.scanout_present_epoch.load(Ordering::Acquire),
+            crate::ddi::scanout_trace::LeaseEnd::Teardown,
+        );
+        self.scanout_present_epoch
+            .store(helios_kmd_logic::scanout_lease::NO_LEASE, Ordering::Release);
+        self.scanout_bound_epoch
+            .store(helios_kmd_logic::scanout_lease::NO_LEASE, Ordering::Release);
+        self.scanout_read_epoch
+            .store(helios_kmd_logic::scanout_lease::NO_LEASE, Ordering::Release);
+        // Nothing is bound, so no binding is epoch-tracked: the ownership gate
+        // stays off until a DMA-flip presentation publishes one again.
+        self.scanout_epoch_tracked.store(0, Ordering::Release);
+        self.scanout_retire_wanted.store(0, Ordering::Release);
+        // The bind sequence is meaningful only within one transport generation:
+        // it orders enqueues on a control queue that is about to be destroyed.
+        // Both halves are zeroed together, so the next generation's first bind
+        // (sequence 1) adopts rather than reading as stale behind an inherited
+        // watermark.
+        self.scanout_bind_wire_seq.store(0, Ordering::Release);
+        self.scanout_bind_applied_seq.store(0, Ordering::Release);
+        // With it, the resource the last generation's newest enqueue named: a
+        // resource id from a dead transport means nothing, and leaving it set
+        // would make the next generation's first flip of that recycled id look
+        // already bound.
+        self.scanout_bind_wire_resource.store(0, Ordering::Release);
         // Consumers that cache a primary identity compare generations, so bump
         // it rather than zeroing it: a wrapped-to-equal generation would let a
         // stale cache look current.
         self.primary_scanout_generation
             .fetch_add(1, Ordering::AcqRel);
+        // D4a: the read ledger's slots name this generation's resource ids and
+        // its event registrations signal this generation's retire stream —
+        // both die with the binding (signal+deref all, zero the slots; the
+        // page itself and the RD counters survive, see `ReadLedger::reset`).
+        // A flush token still in flight retires as an orphan (`RdOrp`), which
+        // the reclaim rules make inert by construction.
+        self.read_ledger.reset();
 
         crate::diag::record_named_bytes(b"StRst", was_programming);
         crate::diag::record_named_bytes(b"StRstR", was_resource);
@@ -1336,6 +1587,19 @@ impl Drop for AdapterContext {
                 // `alloc_paging_ram` and is freed exactly once here.
                 unsafe { MmFreeContiguousMemory(pr.va.as_ptr() as *mut _) };
             }
+        }
+        // D4a read-ledger page: allocated once at the first StartDevice, kept
+        // across stop/start cycles (user mappings of it may outlive a stop),
+        // freed exactly here. Every device was destroyed before RemoveDevice,
+        // so no user mapping and no flush token can still reference it. Any
+        // event registration left in the table holds an object reference and
+        // must be dropped with the adapter (deref only — nothing to signal).
+        self.read_ledger.drop_all_event_references();
+        let ledger_va = self.read_ledger.take_page_va();
+        if ledger_va != 0 {
+            // SAFETY: came from MmAllocateContiguousMemory in
+            // `ReadLedger::init_page`; freed exactly once, at PASSIVE_LEVEL.
+            unsafe { MmFreeContiguousMemory(ledger_va as *mut _) };
         }
     }
 }

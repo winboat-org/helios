@@ -534,6 +534,27 @@ pub mod knobs {
     pub const BAR_SEG_MODE: KnobName = KnobName::new(b"BarSegMode");
     /// CpuVisible cached-allocation kill switch (default 1 = cached).
     pub const ALLOC_CACHED: KnobName = KnobName::new(b"AllocCached");
+    /// Retire ordinary (non-paging) WDDM DMA fences on host GPU COMPLETION
+    /// rather than host DECODE (default 1 = GPU completion). 0 restores the
+    /// historical decode-only behaviour. See `AdapterKnobs::dma_gpu_fence`.
+    pub const DMA_GPU_FENCE: KnobName = KnobName::new(b"DmaGpuFence");
+    /// `BindFlushMode` (default 0). Selects when the bind edge tells the host
+    /// to READ the freshly bound primary (ROADMAP defect 0ab-B):
+    ///   0 = completion-ordered against the boundary this buffer's own present
+    ///       marker captured (`AdapterContext::arm_bind_refresh`),
+    ///   1 = IMMEDIATE — flush at the bind with no ordering at all.
+    ///
+    /// 1 is the discriminating A/B, not a shipping mode: it answers "is the
+    /// buffer's content already correct when we bind it?" directly, which two
+    /// falsified boundary variants could only answer by inference.
+    pub const BIND_FLUSH_MODE: KnobName = KnobName::new(b"BindFlushMode");
+    /// `DispatchBind` (default 1 = ON). Enqueue the flip's `SET_SCANOUT_BLOB`
+    /// from the DISPATCH-level flip arm as well as from the PASSIVE display
+    /// worker (ROADMAP defect 0ab-C, D1(ii)) — a pure accelerator: the worker
+    /// path is unchanged and still consumes the pending slot, and the earlier
+    /// enqueue wins on a FIFO control queue. 0 is the same-boot A/B disable,
+    /// which restores the worker-only bind cadence exactly.
+    pub const DISPATCH_BIND: KnobName = KnobName::new(b"DispatchBind");
     /// Per-present probe instrumentation (default 0).
     pub const PRESENT_PROBE: KnobName = KnobName::new(b"PresentProbe");
     /// T3 gate instrument: force one deferred-programming refusal (default 0).
@@ -548,6 +569,13 @@ pub mod knobs {
     pub const BAR_SEG_FLAGS: KnobName = KnobName::new(b"BarSegFlags");
     /// BAR descriptor `BaseAddress` in MiB (default 0).
     pub const BAR_SEG_BASE_MB: KnobName = KnobName::new(b"BarSegBaseMB");
+    /// `DXGK_FLIPCAPS` OVERRIDE. 0 (default) = the driver's own word
+    /// (`FlipOnVSyncMmIo | FlipImmediateMmIo`); nonzero replaces it verbatim,
+    /// so `FlipCapsX=2` restores the pre-2026-07-29 advertisement for an A/B.
+    /// Bit order (bindgen, WDK 10.0.26100): 0 `FlipOnVSyncWithNoWait`,
+    /// 1 `FlipOnVSyncMmIo`, 2 `FlipInterval`, 3 `FlipImmediateMmIo`. Read at
+    /// AddAdapter, so `pnputil /restart-device` applies it without a rebuild.
+    pub const FLIP_CAPS_EXTRA: KnobName = KnobName::new(b"FlipCapsX");
 }
 
 /// Read a service-key REG_DWORD knob, or `default` if absent.

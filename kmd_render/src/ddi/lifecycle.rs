@@ -156,6 +156,12 @@ pub unsafe extern "C" fn dxgkddi_start_device(
     if paging_ram.is_none() {
         paging_ram = AdapterContext::alloc_paging_ram();
     }
+    // D4a read-ledger page: same once-per-adapter lifetime as the RAM blocks
+    // above (user mappings of it survive a PnP stop), allocated on the HEAP —
+    // never a StartDevice-chain stack frame (the 17936 B boot-chain ceiling).
+    // Idempotent; failure is counted (`RdPgF`) and only latches the acquire
+    // feature off, never the adapter.
+    adapter.read_ledger.init_page();
 
     // ── Phase 2: bring up the virtio-gpu transport ──────────────────────────
     // VirtioGpu::init reads PCI config + maps BARs through the Dxgkrnl callbacks
@@ -277,6 +283,9 @@ pub unsafe extern "C" fn dxgkddi_start_device(
     // reader cannot tell a counter that is merely PRESENT from one that moved
     // this boot.
     crate::ddi::display::reset_scanout_reject_counters();
+    // Same rule for the unsampled scanout-bind trace: its whole purpose is that
+    // a value read after a workload describes THAT workload.
+    crate::ddi::scanout_trace::reset(adapter);
 
     // The scan-out mode and its EDID, resolved BEFORE publication because
     // `StartedState` is published exactly once.

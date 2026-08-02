@@ -3,9 +3,17 @@
 //! Lock order: `scanout_mutex -> venus_mutex -> virtio_lock`, with
 //! `wddm_notify_lock` taken before the interrupt object. Moved verbatim out of
 //! `adapter.rs` by T8/R1101.
+//!
+//! One LEAF spinlock sits below all of the above: `ReadLedger`'s
+//! `scanout_event_lock` (D4a, `adapter/read_ledger.rs`). It is acquired LAST —
+//! the retirement broadcast runs at DISPATCH under `virtio_lock` — and nothing
+//! may be acquired while holding it; it guards only the 16-entry event table
+//! and the ≤16 `KeSetEvent(Wait = FALSE)` calls of a broadcast. It has no
+//! accessor here because it mints no token: `crate::sync::SpinLock`'s guard is
+//! its whole discipline.
 
 use core::marker::PhantomData;
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use wdk_sys::ntddk::{
     KeAcquireSpinLockRaiseToDpc, KeReleaseSpinLock, KeSetEvent, KeWaitForSingleObject,
@@ -17,6 +25,16 @@ use crate::irql::PassiveLevel;
 use crate::virtio::VirtioGpu;
 
 use super::AdapterContext;
+
+/// `AdapterContext::with_virtio` entries whose `self` did not survive the
+/// spinlock acquire (`WvTorn`). MUST READ 0.
+///
+/// The tripwire for ROADMAP defect 0ac — a 0xD1 bugcheck inside this accessor on
+/// 22.22.212.0. A nonzero value here is a hard, attributable answer to a
+/// question a stack-only post-mortem could not settle: the adapter pointer this
+/// call was made with was not the one it woke up with. Mirrored from
+/// `pacing_snapshot`, a PASSIVE site, because this one runs at DISPATCH.
+pub(crate) static WITH_VIRTIO_TORN: AtomicU32 = AtomicU32::new(0);
 
 /// Proof that this adapter's WDDM notification spinlock is currently held.
 ///
@@ -103,8 +121,9 @@ impl WddmNotifyGuard<'_> {
 /// carrying a `_locked` suffix and a doc comment.
 ///
 /// The lock order this token sits at the head of is
-/// `scanout_mutex -> venus_mutex -> virtio_lock`; [`Self::with_venus_client`]
-/// is the enforced path for the middle step.
+/// `scanout_mutex -> venus_mutex -> virtio_lock` (below which only the D4a
+/// `scanout_event_lock` LEAF may nest — see the module doc);
+/// [`Self::with_venus_client`] is the enforced path for the middle step.
 ///
 /// ⚠ This does NOT make recursion unrepresentable: the guard is handed to the
 /// very closure that could call a re-acquiring wrapper. Callers must still not
@@ -257,14 +276,54 @@ impl AdapterContext {
     /// Stage any payload (e.g. a Venus stream) into a `DmaBuffer` *before* calling
     /// this, then pass a slice of it into `f`.
     pub fn with_virtio<R>(&self, f: impl FnOnce(&mut VirtioGpu) -> R) -> Result<R, NotStarted> {
+        // ── The `WvTorn` tripwire (ROADMAP defect 0ac) ───────────────────────
+        //
+        // The 0xD1 bugcheck on 22.22.212.0 faulted in this function's prologue
+        // region with an adapter pointer that did not survive the acquire. This
+        // costs one stack slot and one compare on a path that already takes a
+        // spinlock, and it turns "dereference whatever `self` now is" into the
+        // ordinary transport-down error arm. Zero behaviour change when healthy;
+        // `WvTorn` must read 0.
+        //
+        // `read_volatile` on both sides is what makes it a real check: without
+        // it the compiler is free to rematerialize the comparison from one value
+        // and fold it away, which would leave an inert tripwire that looks live.
+        //
+        // ⚠ THE LOCK ADDRESS IS HOISTED ONCE, HERE, from the `self` that has not
+        // been questioned yet, and BOTH releases use that saved value. Deriving
+        // it again after a detected mismatch would spell
+        // `KeReleaseSpinLock(<corrupt self>.virtio_lock, ..)` — a wild WRITE at
+        // DISPATCH_LEVEL, performed by the very arm whose job is to stop this
+        // frame from touching that pointer. It is also simply the correct
+        // release: the address that must be released is the one that was
+        // acquired.
+        let lock = self.virtio_lock.get();
+        let slot = self as *const Self as usize;
+        // SAFETY: `&slot` is a live, aligned, initialized stack slot owned by
+        // this frame. The volatile read exists only to force the value to
+        // memory, so the compare below cannot be folded away.
+        let before = unsafe { core::ptr::read_volatile(&slot) };
+        // SAFETY: `virtio_lock` is an embedded, in-place initialized KSPIN_LOCK
+        // stable for the adapter's lifetime; the raise-to-DPC form is callable at
+        // <= DISPATCH_LEVEL, which every caller of this accessor is.
+        let irql = unsafe { KeAcquireSpinLockRaiseToDpc(lock) };
+        if core::hint::black_box(self) as *const Self as usize != before {
+            // SAFETY: `lock` is the exact address this frame acquired above, read
+            // from `self` BEFORE the acquire, and `irql` is what that acquire
+            // returned. Nothing here dereferences the failed `self` — this
+            // release would otherwise be the first wild use of it.
+            unsafe { KeReleaseSpinLock(lock, irql) };
+            WITH_VIRTIO_TORN.fetch_add(1, Ordering::Relaxed);
+            return Err(NotStarted);
+        }
         // SAFETY: spinlock-guarded exclusive access to the cell's contents for the
         // duration of the critical section.
-        let irql = unsafe { KeAcquireSpinLockRaiseToDpc(self.virtio_lock.get()) };
         let result = match unsafe { &mut *self.virtio.get() } {
             Some(v) => Ok(f(v)),
             None => Err(NotStarted),
         };
-        unsafe { KeReleaseSpinLock(self.virtio_lock.get(), irql) };
+        // SAFETY: same address/IRQL pair the acquire above produced.
+        unsafe { KeReleaseSpinLock(lock, irql) };
         result
     }
 }

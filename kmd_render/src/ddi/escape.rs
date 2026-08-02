@@ -23,19 +23,26 @@ use bytemuck::{bytes_of, pod_read_unaligned};
 use helios_protocol::{
     HeliosEscapeAllocBlob, HeliosEscapeAttachResource, HeliosEscapeCtxCreate,
     HeliosEscapeCtxDestroy, HeliosEscapeFenceEvent, HeliosEscapeHeader, HeliosEscapeMapBlob,
-    HeliosEscapeQueryScanout, HeliosEscapeQueryStats, HeliosEscapeQueryStatsV2,
-    HeliosEscapeQueryStatsV3, HeliosEscapeReleaseBlob, HeliosEscapeSubmitVenus,
-    HeliosEscapeWaitFence, HeliosEscapeWaitFenceLegacy, HELIOS_ESCAPE_ALLOC_BLOB,
-    HELIOS_ESCAPE_ATTACH_RESOURCE, HELIOS_ESCAPE_CTX_CREATE, HELIOS_ESCAPE_CTX_DESTROY,
-    HELIOS_ESCAPE_MAP_BLOB, HELIOS_ESCAPE_QUERY_SCANOUT, HELIOS_ESCAPE_QUERY_STATS,
-    HELIOS_ESCAPE_REGISTER_FENCE_EVENT, HELIOS_ESCAPE_RELEASE_BLOB, HELIOS_ESCAPE_SUBMIT_VENUS,
-    HELIOS_ESCAPE_UNREGISTER_FENCE_EVENT, HELIOS_ESCAPE_WAIT_FENCE,
+    HeliosEscapeMapReadLedger, HeliosEscapeQueryScanout, HeliosEscapeQueryStats,
+    HeliosEscapeQueryStatsV2, HeliosEscapeQueryStatsV3, HeliosEscapeReleaseBlob,
+    HeliosEscapeScanoutEvent, HeliosEscapeSubmitVenus, HeliosEscapeWaitFence,
+    HeliosEscapeWaitFenceLegacy, HELIOS_ESCAPE_ALLOC_BLOB, HELIOS_ESCAPE_ATTACH_RESOURCE,
+    HELIOS_ESCAPE_CTX_CREATE, HELIOS_ESCAPE_CTX_DESTROY, HELIOS_ESCAPE_MAP_BLOB,
+    HELIOS_ESCAPE_MAP_READ_LEDGER, HELIOS_ESCAPE_QUERY_SCANOUT, HELIOS_ESCAPE_QUERY_STATS,
+    HELIOS_ESCAPE_REGISTER_FENCE_EVENT, HELIOS_ESCAPE_RELEASE_BLOB, HELIOS_ESCAPE_SCANOUT_EVENT,
+    HELIOS_ESCAPE_SUBMIT_VENUS, HELIOS_ESCAPE_UNREGISTER_FENCE_EVENT, HELIOS_ESCAPE_WAIT_FENCE,
     HELIOS_FENCE_EVENT_ALREADY_COMPLETE, HELIOS_FENCE_EVENT_CANCELLED,
     HELIOS_FENCE_EVENT_NOT_FOUND, HELIOS_FENCE_EVENT_PROBE_ACK, HELIOS_FENCE_EVENT_REGISTERED,
+    HELIOS_SCANOUT_ACQ_NOT_FOUND, HELIOS_SCANOUT_ACQ_OK, HELIOS_SCANOUT_ACQ_OP_MAP,
+    HELIOS_SCANOUT_ACQ_OP_PROBE, HELIOS_SCANOUT_ACQ_OP_REGISTER, HELIOS_SCANOUT_ACQ_OP_UNMAP,
+    HELIOS_SCANOUT_ACQ_OP_UNREGISTER, HELIOS_SCANOUT_ACQ_PROBE_ACK,
+    HELIOS_SCANOUT_ACQ_TABLE_FULL, HELIOS_SCANOUT_CAP_READ_LEDGER,
+    HELIOS_SCANOUT_CAP_SNAPSHOT_BIND,
 };
 
 use super::blob_map::{
-    effective_map_cache, map_cache_to_mm, map_io_pages_to_user, unmap_io_pages_from_user,
+    effective_map_cache, map_cache_to_mm, map_io_pages_to_user,
+    map_nonpaged_page_to_user_readonly, unmap_io_pages_from_user,
 };
 use crate::adapter::AdapterContext;
 use crate::dxgk::*;
@@ -330,6 +337,19 @@ pub unsafe extern "C" fn dxgkddi_escape(
         HELIOS_ESCAPE_QUERY_SCANOUT => escape_query_scanout(adapter, buf, &hdr),
         HELIOS_ESCAPE_REGISTER_FENCE_EVENT => escape_register_fence_event(adapter, buf, &hdr),
         HELIOS_ESCAPE_UNREGISTER_FENCE_EVENT => escape_unregister_fence_event(adapter, buf, &hdr),
+        // D4a scanout acquire (FIX-DESIGN-d4a.md §3.3). Ownership-bearing: the
+        // ledger mapping and the event registrations are reclaimed by the
+        // caller's DestroyDevice, so an owner-less request has no reclaim path
+        // and is refused — the probe therefore also needs a device handle,
+        // which every UMD caller (pfnEscapeCb, device-scoped) has.
+        HELIOS_ESCAPE_MAP_READ_LEDGER => match owner {
+            Some(owner) => escape_map_read_ledger(passive, adapter, buf, &hdr, owner),
+            None => refuse_no_device(),
+        },
+        HELIOS_ESCAPE_SCANOUT_EVENT => match owner {
+            Some(owner) => escape_scanout_event(adapter, buf, &hdr, owner),
+            None => refuse_no_device(),
+        },
         // Unknown verbs are rejected — and counted, because an unhandled verb is
         // how an ICD/KMD protocol skew presents (HELIOS_ESCAPE_PRESENT_BLOB
         // = 0x0007 exists in the protocol and lands here).
@@ -616,6 +636,224 @@ fn escape_unregister_fence_event(
     };
     wire.write_back(&out);
     STATUS_SUCCESS
+}
+
+// ── D4a scanout acquire (FIX-DESIGN-d4a.md §3.3) ────────────────────────────
+// Two PASSIVE, non-blocking verbs: map the read-only ledger page, and park a
+// PERSISTENT retirement event. Probe-ack idiom on both — an old KMD fails the
+// escape STATUS_NOT_IMPLEMENTED from the unknown-verb arm, and that is the
+// capability signal the UMD latches the feature OFF on.
+
+/// Count one MAP_READ_LEDGER refusal (`RdMapF`) and return the given status.
+fn refuse_read_ledger_map(status: NTSTATUS) -> NTSTATUS {
+    crate::adapter::RD_MAP_REFUSED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    status
+}
+
+/// Count one scanout-event refusal (`AqRgF`) and return the given status.
+fn refuse_scanout_event(status: NTSTATUS) -> NTSTATUS {
+    crate::adapter::AQ_REGISTER_REFUSED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    status
+}
+
+/// `HELIOS_ESCAPE_MAP_READ_LEDGER` — map the D4a read-ledger page READ-ONLY
+/// into the calling process (op MAP), drop that mapping (op UNMAP), or answer
+/// the capability probe (op PROBE).
+///
+/// The mapping rides the owner-keyed [`crate::mapping::MappingTable`] under
+/// [`crate::mapping::READ_LEDGER_MAPPING_ID`], so process-death reclaim is the
+/// existing `DxgkDdiDestroyDevice` drain — nothing new can leak. One mapping
+/// per device: a repeat MAP returns the recorded VA rather than a second view.
+fn escape_map_read_ledger(
+    _passive: PassiveLevel,
+    adapter: &AdapterContext,
+    buf: &mut [u8],
+    hdr: &HeliosEscapeHeader,
+    owner: DeviceOwner,
+) -> NTSTATUS {
+    // `_passive` is the precondition `map_nonpaged_page_to_user_readonly` and
+    // `unmap_io_pages_from_user` state (PASSIVE, caller's process); nothing in
+    // this body forwards it.
+    let mut wire = match EscapeBuf::<HeliosEscapeMapReadLedger>::new(buf, hdr) {
+        Ok(w) => w,
+        Err(st) => return st,
+    };
+    let req = wire.read();
+    let mut reply = |user_va: u64, size: u32, state: u32| {
+        let mut out = req;
+        out.out_user_va = user_va;
+        out.out_size = size;
+        out.out_state = state;
+        wire.write_back(&out);
+        STATUS_SUCCESS
+    };
+
+    match req.op {
+        // PROBE's `out_size` is the capability bitmask (D4b): READ_LEDGER for
+        // the page this escape maps, SNAPSHOT_BIND for honoring
+        // `HELIOS_PRESENT_PRIVATE_FLAG_SNAPSHOT`. A .222 KMD replied 0 here —
+        // the ACK alone reads as "read ledger only", so skew is safe in both
+        // directions and the UMD never substitutes against a KMD without the
+        // bit.
+        HELIOS_SCANOUT_ACQ_OP_PROBE => reply(
+            0,
+            HELIOS_SCANOUT_CAP_READ_LEDGER | HELIOS_SCANOUT_CAP_SNAPSHOT_BIND,
+            HELIOS_SCANOUT_ACQ_PROBE_ACK,
+        ),
+        HELIOS_SCANOUT_ACQ_OP_MAP => {
+            let Some((kernel_va, size)) = adapter.read_ledger.page_for_mapping() else {
+                // StartDevice could not allocate the page (counted `RdPgF`
+                // there); the feature is off for this boot and the caller must
+                // latch it off too — a failing status, never a fake mapping.
+                return refuse_read_ledger_map(STATUS_INSUFFICIENT_RESOURCES);
+            };
+            if let Some(existing) = adapter
+                .mappings
+                .find_user_va(owner.raw(), crate::mapping::READ_LEDGER_MAPPING_ID)
+            {
+                return reply(existing, size as u32, HELIOS_SCANOUT_ACQ_OK);
+            }
+            // SAFETY: PASSIVE escape in the caller's process; the page is a
+            // page-aligned nonpaged allocation that outlives every mapping
+            // (freed only in AdapterContext::drop, after DestroyDevice drained
+            // this table).
+            let mapped =
+                unsafe { map_nonpaged_page_to_user_readonly(kernel_va as *mut u8, size as u64) };
+            let Some((user_va, mdl)) = mapped else {
+                return refuse_read_ledger_map(STATUS_INSUFFICIENT_RESOURCES);
+            };
+            match adapter.mappings.insert_unique(
+                owner.raw(),
+                crate::mapping::READ_LEDGER_MAPPING_ID,
+                user_va,
+                mdl as usize,
+            ) {
+                crate::mapping::InsertResult::Inserted => {
+                    reply(user_va, size as u32, HELIOS_SCANOUT_ACQ_OK)
+                }
+                crate::mapping::InsertResult::Duplicate => {
+                    // Raced a concurrent MAP on this device: keep the recorded
+                    // view, undo ours.
+                    // SAFETY: same process, PASSIVE; the pair we just created.
+                    unsafe { unmap_io_pages_from_user(user_va, mdl) };
+                    match adapter
+                        .mappings
+                        .find_user_va(owner.raw(), crate::mapping::READ_LEDGER_MAPPING_ID)
+                    {
+                        Some(existing) => reply(existing, size as u32, HELIOS_SCANOUT_ACQ_OK),
+                        // The racing mapping was unmapped again meanwhile; the
+                        // caller retries rather than being served a stale VA.
+                        None => refuse_read_ledger_map(STATUS_DEVICE_BUSY),
+                    }
+                }
+                crate::mapping::InsertResult::Full => {
+                    // SAFETY: as above — the view must not outlive its record.
+                    unsafe { unmap_io_pages_from_user(user_va, mdl) };
+                    refuse_read_ledger_map(STATUS_INSUFFICIENT_RESOURCES)
+                }
+            }
+        }
+        HELIOS_SCANOUT_ACQ_OP_UNMAP => {
+            match adapter
+                .mappings
+                .take_for_resource(owner.raw(), crate::mapping::READ_LEDGER_MAPPING_ID)
+            {
+                Some((user_va, mdl)) => {
+                    // SAFETY: PASSIVE, in the process that created the mapping
+                    // (the escape runs in the caller's context, and the owner
+                    // key is that process's device handle).
+                    unsafe { unmap_io_pages_from_user(user_va, mdl as wdk_sys::PMDL) };
+                    reply(0, 0, HELIOS_SCANOUT_ACQ_OK)
+                }
+                None => reply(0, 0, HELIOS_SCANOUT_ACQ_NOT_FOUND),
+            }
+        }
+        _ => refuse_read_ledger_map(STATUS_INVALID_PARAMETER),
+    }
+}
+
+/// `HELIOS_ESCAPE_SCANOUT_EVENT` — register/unregister a PERSISTENT per-device
+/// usermode auto-reset event the KMD signals on EVERY scanout-read retirement
+/// (`ReadLedger::retire` broadcast), or answer the capability probe.
+///
+/// Clones REGISTER_FENCE_EVENT's reference discipline
+/// (`ObReferenceObjectByHandle`, EVENT_MODIFY_STATE, UserMode) with the two
+/// fixes that table lacks: entries are owner-tagged and reclaimed at
+/// DestroyDevice (`ReadLedger::reclaim_events_for_owner`), and Stop/Start
+/// signals + releases them (`ReadLedger::reset`). Unlike 0x000B this
+/// registration SURVIVES its signals; the consumer is level-triggered.
+fn escape_scanout_event(
+    adapter: &AdapterContext,
+    buf: &mut [u8],
+    hdr: &HeliosEscapeHeader,
+    owner: DeviceOwner,
+) -> NTSTATUS {
+    use crate::adapter::ScanoutEventReg;
+
+    let mut wire = match EscapeBuf::<HeliosEscapeScanoutEvent>::new(buf, hdr) {
+        Ok(w) => w,
+        Err(st) => return st,
+    };
+    let req = wire.read();
+    let mut reply = |state: u32| {
+        let mut out = req;
+        out.out_state = state;
+        wire.write_back(&out);
+        STATUS_SUCCESS
+    };
+
+    match req.op {
+        HELIOS_SCANOUT_ACQ_OP_PROBE => reply(HELIOS_SCANOUT_ACQ_PROBE_ACK),
+        HELIOS_SCANOUT_ACQ_OP_REGISTER => {
+            if req.event_handle == 0 {
+                return refuse_scanout_event(STATUS_INVALID_PARAMETER);
+            }
+            // NB: a failed resolve also ticks the fence-event family's
+            // `FENCE_EVENT_INVALID` inside `reference_user_event`; `AqRgF` is
+            // this verb's own census.
+            let Some(event) = reference_user_event(req.event_handle) else {
+                return refuse_scanout_event(STATUS_INVALID_PARAMETER);
+            };
+            match adapter.read_ledger.register_event(owner.raw(), event) {
+                ScanoutEventReg::Registered => {
+                    // The table now owns the reference; retirement broadcasts
+                    // signal it, and removal paths dereference it.
+                    reply(HELIOS_SCANOUT_ACQ_OK)
+                }
+                ScanoutEventReg::AlreadyRegistered => {
+                    // Idempotent: the parked reference stays, this call's goes.
+                    dereference_user_event(event);
+                    reply(HELIOS_SCANOUT_ACQ_OK)
+                }
+                ScanoutEventReg::TableFull => {
+                    // Counted `AqRgF` in register_event. SUCCESS with the
+                    // TABLE_FULL state: the caller reads it and runs ungated —
+                    // loud (the counter), never wedged.
+                    dereference_user_event(event);
+                    reply(HELIOS_SCANOUT_ACQ_TABLE_FULL)
+                }
+            }
+        }
+        HELIOS_SCANOUT_ACQ_OP_UNREGISTER => {
+            if req.event_handle == 0 {
+                return refuse_scanout_event(STATUS_INVALID_PARAMETER);
+            }
+            // Resolve the handle only to IDENTIFY the object; the lookup
+            // reference is dropped below either way (the fence-event
+            // unregister's exact discipline).
+            let Some(event) = reference_user_event(req.event_handle) else {
+                return refuse_scanout_event(STATUS_INVALID_PARAMETER);
+            };
+            let removed = adapter.read_ledger.unregister_event(owner.raw(), event);
+            dereference_user_event(event);
+            reply(if removed {
+                HELIOS_SCANOUT_ACQ_OK
+            } else {
+                HELIOS_SCANOUT_ACQ_NOT_FOUND
+            })
+        }
+        _ => refuse_scanout_event(STATUS_INVALID_PARAMETER),
+    }
 }
 
 /// `HELIOS_ESCAPE_QUERY_STATS` → read-only snapshot of the bounded resource

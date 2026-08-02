@@ -295,6 +295,12 @@ unsafe fn query_driver_caps(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTE
     // deleted, a full GDI-heavy session — explorer restart, maximized notepad, GDI
     // canary, repaint, paintcap — reproduced none of them).
     const FLIPCAPS_FLIP_ON_VSYNC_MMIO: u32 = 1 << 1;
+    /// `DXGK_FLIPCAPS.FlipImmediateMmIo` — bit 3 in the bindgen field order
+    /// (0 `FlipOnVSyncWithNoWait`, 1 `FlipOnVSyncMmIo`, 2 `FlipInterval`,
+    /// 3 `FlipImmediateMmIo`). See the `flip_caps` note below for why it is
+    /// required and why it is honest.
+    #[allow(dead_code, reason = "reachable only through the FlipCapsX override")]
+    const FLIPCAPS_FLIP_IMMEDIATE_MMIO: u32 = 1 << 3;
     const SCHEDULINGCAPS_MULTI_ENGINE_AWARE: u32 = 1 << 0;
     const SCHEDULINGCAPS_PREEMPTION_AWARE: u32 = 1 << 2;
     const MEMORYMANAGEMENTCAPS_SECTION_BACKED_PRIMARY: u32 = 1 << 3;
@@ -337,10 +343,62 @@ unsafe fn query_driver_caps(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTE
     // No GDI hardware acceleration (see the note above): every documented
     // DXGK_PRESENTATIONCAPS bit stays clear.
     let presentation_caps: UINT = 0;
-    let flip_caps: UINT = FLIPCAPS_FLIP_ON_VSYNC_MMIO;
+    // BOTH MMIO flip capabilities, and the second one is a FIX, measured
+    // 2026-07-29 (KMD 22.22.197.0).
+    //
+    // `FlipOnVSyncMmIo` alone covers only flips with a nonzero flip interval.
+    // dxgkrnl's fallback for an interval-0 (IMMEDIATE) flip is the DMA-BUFFER
+    // flip contract: it calls `DxgkDdiPresent` with a non-NULL `pDmaBuffer` and
+    // then never calls `DxgkDdiSetVidPnSourceAddress` at all, because in that
+    // contract the driver is supposed to program the display itself when the
+    // flip DMA buffer executes. Helios does not implement that arm — its flip
+    // arm deliberately declines to program scanout, which is correct ONLY for
+    // the MMIO contract — so every immediate flip was accepted, counted, and
+    // dropped on the floor.
+    //
+    // The measurement, from the unsampled `ddi/scanout_trace` census over one
+    // Fire Strike Combined run (`tmp/perf/trace-comb-fi0.txt` vs `-fi8.txt`):
+    // DWM presents at `(FlipInterval=1, pDmaBuffer=NULL)` and a fullscreen app
+    // at `(FlipInterval=0, pDmaBuffer!=NULL)`, with IDENTICAL
+    // `DXGKARG_PRESENT.Flags` (`Flip|FlipWithNoWait`) in both cases — so the
+    // flags are not the discriminator and the flip interval is. With
+    // `FlipOnVSyncMmIo` only: 839 flips during the run, 0 of them MMIO, 0
+    // `SET_SCANOUT_BLOB`, and `SetVidPnSourceAddress` named ONE resource twice
+    // and then went silent for 36 s while the app rotated two backbuffers.
+    // Adding `FlipImmediateMmIo`: 1151 flips, ALL MMIO, 948 `SET_SCANOUT_BLOB`,
+    // and both backbuffers bound and flushed. That is the pinned-scanout defect.
+    //
+    // It is an honest advertisement, not a second unbacked cap: a Helios "flip"
+    // IS a `SET_SCANOUT_BLOB`, which has no vertical-blank to wait for.
+    //
+    // `FlipCapsX` (service key, default 0) OVERRIDES the whole word when
+    // nonzero, so `FlipCapsX=2` restores the pre-fix advertisement exactly for
+    // an A/B via `reg add` + `pnputil /restart-device` — no rebuild per arm.
+    // ⚠ `FlipImmediateMmIo` is DELIBERATELY NOT SET, and re-adding it is a
+    // regression. It was set on 2026-07-29 to stop dxgkrnl routing immediate
+    // flips down a DMA-buffer contract this driver ignored (defect 0aa), and it
+    // did fix that — but the MMIO contract it opts into requires the flip to be
+    // COMPLETE when `DxgkDdiSetVidPnSourceAddress` returns, and that DDI
+    // arrives at DIRQL where a virtio `SET_SCANOUT_BLOB` round-trip is illegal.
+    // Returning SUCCESS from a DIRQL stash is a lie dxgkrnl acts on: it frees
+    // the previous buffer to the app and issues the next flip while nothing has
+    // been programmed. Measured the same day: 80 dropped binds and 145 of 1245
+    // present markers writing the buffer that was on screen (defect 0ab).
+    // `ddi/present_packet.rs`'s `PresentFlipPrivate` implements the DMA-buffer
+    // contract instead, which is the one designed for exactly this hardware.
+    const FLIPCAPS_DEFAULT: UINT = FLIPCAPS_FLIP_ON_VSYNC_MMIO;
+    let flip_caps: UINT = match crate::diag::read_config_dword(crate::diag::knobs::FLIP_CAPS_EXTRA, 0)
+    {
+        0 => FLIPCAPS_DEFAULT,
+        override_word => override_word,
+    };
     let scheduling_caps: UINT = SCHEDULINGCAPS_MULTI_ENGINE_AWARE | SCHEDULINGCAPS_PREEMPTION_AWARE;
     out.set(caps_offset!(PresentationCaps), presentation_caps);
     out.set(caps_offset!(FlipCaps), flip_caps);
+    // What was actually advertised, so a knob that silently read as its default
+    // cannot be mistaken for a knob that had no effect (`ScanoutForceReject`
+    // read as 0 on every boot for exactly that reason and cost a deploy cycle).
+    crate::diag::record_named_bytes(b"FlipCapV", flip_caps);
     out.set(caps_offset!(SchedulingCaps), scheduling_caps);
     out.set(caps_offset!(MemoryManagementCaps), mem_caps);
     // PagingNode = 0 (single engine node). MemoryManagementCaps.PagingNode is the

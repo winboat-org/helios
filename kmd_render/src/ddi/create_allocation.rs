@@ -37,6 +37,7 @@ use crate::dxgk::_D3DKMDT_STANDARDALLOCATION_TYPE::{
 };
 use crate::dxgk::*;
 use crate::irql::PassiveLevel;
+use helios_kmd_logic::snapshot_bind::SnapshotDescriptor;
 use helios_kmd_logic::ScanoutFormat;
 
 /// `AllocationContext::magic` — validates `hAllocation` casts in paging DDIs
@@ -90,6 +91,45 @@ struct AllocationContext {
     vidpn_primary_segment: AtomicU32,
     /// Exact `DXGK_SETVIDPNSOURCEADDRESS_FLAGS::Value` paired with the callback.
     vidpn_primary_flags: AtomicU32,
+    /// Presentation epoch this allocation's pending flip published, or
+    /// `NO_LEASE` (ROADMAP defect 0ab-B).
+    ///
+    /// It rides on the ALLOCATION, exactly like `vidpn_primary_address` above
+    /// and for exactly the same reason: `pending_vidpn_allocation` is a single
+    /// slot that coalesces, so a parallel "latest epoch" atomic would let the
+    /// display worker pair one flip's handle with another flip's epoch. Here the
+    /// pairing is by construction. Nonzero only on the DMA-buffer flip contract;
+    /// the MMIO/`FlipOnVSyncMmIo` desktop path stores 0 and is unchanged.
+    vidpn_present_epoch: AtomicU64,
+    /// This flip's own frame-completion boundary, taken out of the per-buffer
+    /// mark table at flip-arm time, or 0 (ROADMAP defect 0ab-B, D1(i)).
+    ///
+    /// It rides on the allocation for the same reason the epoch above does, and
+    /// it is taken at the FLIP rather than read at the BIND because the table
+    /// holds one mark per resource: a bind more than two frame periods after its
+    /// present finds the mark already replaced by the same buffer's next
+    /// present, and then waits a frame too long. Written by the flip arm only,
+    /// on every arm, so a bind can never read a mark from an older flip.
+    vidpn_frame_watermark: AtomicU64,
+    /// D4b snapshot BIND-TARGET substitution stamped by this allocation's most
+    /// recent flip, BY VALUE — never a pointer, never the snapshot's own
+    /// `AllocationContext` (the snapshot has no WDDM allocation to resolve).
+    /// `vidpn_snap_resid == 0` means no substitution. Rides on the allocation
+    /// for the same coalescing reason the epoch/watermark above do, and is
+    /// stored on EVERY `set_vidpn_primary_address` (zeroed on the MMIO path)
+    /// so a bind can never read a descriptor left by an older flip. Like the
+    /// epoch pair, the fields publish under the address's Release store and
+    /// are read after its Acquire; a torn read across two concurrent flips of
+    /// the same allocation can at worst mix two VALIDATED descriptors, which
+    /// the executor's `resource_is_live` arm and the extent gates absorb.
+    vidpn_snap_resid: AtomicU32,
+    vidpn_snap_width: AtomicU32,
+    vidpn_snap_height: AtomicU32,
+    vidpn_snap_pitch: AtomicU32,
+    vidpn_snap_dxgi_format: AtomicU32,
+    /// Validated `<= u32::MAX` at Present; stored narrow like the flip record.
+    vidpn_snap_plane_offset: AtomicU32,
+    vidpn_snap_alloc_size: AtomicU64,
     size: SIZE_T,
     /// Surface geometry for `DxgkDdiDescribeAllocation` (0 for UMD blob allocations
     /// that carry no dimensions). Populated from the standard-allocation trailer.
@@ -691,6 +731,21 @@ pub(crate) struct WindowsPrimary {
     pub primary_address: u64,
     /// Exact `DXGK_SETVIDPNSOURCEADDRESS_FLAGS::Value` supplied by Windows.
     pub primary_flags: u32,
+    /// The presentation epoch the flip that named this allocation minted, or
+    /// `NO_LEASE` on the MMIO path. Paired with the allocation rather than read
+    /// from a global, because the pending-flip slot coalesces (ROADMAP 0ab-B).
+    pub present_epoch: u64,
+    /// The frame-completion boundary that flip took out of the mark table, or 0.
+    /// Same pairing argument as `present_epoch`, and the same reason: the single
+    /// pending-flip slot coalesces.
+    pub frame_watermark: u64,
+    /// D4b: the validated snapshot descriptor that flip carried, or `None`.
+    /// Same pairing argument again — the descriptor must travel with the exact
+    /// handle it was flipped with, not through a coalescing global. When
+    /// present, the bind paths build the `ScanoutTarget` from IT instead of
+    /// from this primary's own layout; everything else here (address, epoch,
+    /// retirement) still describes the flipped allocation.
+    pub snapshot: Option<SnapshotDescriptor>,
 }
 
 /// A scan-out surface that has been validated as legal for `SET_SCANOUT_BLOB`.
@@ -751,6 +806,40 @@ impl ScanoutTarget {
             primary.venus_alloc_size,
             primary.memory_type_index,
             primary.dxgi_format,
+        )
+    }
+
+    /// Validate a D4b snapshot descriptor as the bind target (beside
+    /// [`Self::from_direct_primary`], same validation, same
+    /// `fill_set_scanout_blob` inputs: resid/width/height/format/stride/
+    /// offset).
+    ///
+    /// The layout predicate is the SHARED one in
+    /// `helios_kmd_logic::snapshot_bind` — the identical arithmetic the direct
+    /// arm spells inline, so the undersize guard cannot be restated here in a
+    /// weakened form. The descriptor was already validated at the Present DDI;
+    /// re-running it costs a few compares and keeps this constructor
+    /// impossible to reach with an unchecked layout.
+    ///
+    /// `memory_type_index` is 0: the target's memory type is only ever
+    /// consumed by the LINEAR-fallback cache (`remember_primary_scanout`),
+    /// which a snapshot target never feeds — the snapshot has no cross-process
+    /// import identity to remember.
+    pub(crate) fn from_snapshot_descriptor(
+        snap: &SnapshotDescriptor,
+    ) -> Result<Self, ScanoutReject> {
+        if helios_kmd_logic::snapshot_bind::validate_layout(snap).is_err() {
+            return Err(ScanoutReject::Layout);
+        }
+        Self::new(
+            snap.resource_id,
+            snap.width,
+            snap.height,
+            snap.pitch,
+            snap.plane_offset,
+            snap.venus_alloc_size,
+            0,
+            snap.dxgi_format,
         )
     }
 
@@ -854,16 +943,32 @@ impl ScanoutTarget {
     }
 }
 
-/// Preserve the exact segment, address, and flags Windows paired with a
-/// SetVidPn allocation.
+/// Preserve the exact segment, address, flags, presentation epoch, frame
+/// boundary and D4b snapshot descriptor Windows (or the DMA-flip record)
+/// paired with a SetVidPn allocation.
+///
+/// `present_epoch` is `NO_LEASE` on the MMIO path, where dxgkrnl retires the
+/// flip before calling us and there is nothing to gate, and the minted epoch on
+/// the DMA-buffer flip contract. `frame_watermark` is 0 on the MMIO path for the
+/// matching reason: that path has no earlier capture point to carry from, so its
+/// bind samples the boundary exactly as it always has. `snapshot` is `None`
+/// there too (the desktop always binds the allocation itself).
+///
+/// All are stored on EVERY call, including with 0/`None`: this is the only
+/// writer, so an unconditional store is what guarantees a bind cannot read a
+/// value left behind by an older flip of the same allocation.
 ///
 /// SAFETY: `h` is the live KMD allocation handle supplied by dxgkrnl to
-/// `DxgkDdiSetVidPnSourceAddress`.
+/// `DxgkDdiSetVidPnSourceAddress`, or the one this driver copied into the
+/// kernel-only DMA private data for a flip.
 pub(crate) unsafe fn set_vidpn_primary_address(
     h: HANDLE,
     primary_segment: u32,
     primary_address: u64,
     primary_flags: u32,
+    present_epoch: u64,
+    frame_watermark: u64,
+    snapshot: Option<SnapshotDescriptor>,
 ) -> bool {
     if h.is_null() {
         return false;
@@ -876,9 +981,56 @@ pub(crate) unsafe fn set_vidpn_primary_address(
         .store(primary_segment, Ordering::Relaxed);
     ctx.vidpn_primary_flags
         .store(primary_flags, Ordering::Relaxed);
+    ctx.vidpn_present_epoch
+        .store(present_epoch, Ordering::Relaxed);
+    ctx.vidpn_frame_watermark
+        .store(frame_watermark, Ordering::Relaxed);
+    // The snapshot stamp, resid LAST among its fields so a reader that races
+    // this store observes either the old descriptor, the new one, or a mix of
+    // two VALIDATED descriptors — never a nonzero resid paired with wholly
+    // unwritten geometry from a zeroed stamp.
+    let snap = snapshot.unwrap_or(SnapshotDescriptor {
+        resource_id: 0,
+        width: 0,
+        height: 0,
+        pitch: 0,
+        dxgi_format: 0,
+        plane_offset: 0,
+        venus_alloc_size: 0,
+    });
+    ctx.vidpn_snap_width.store(snap.width, Ordering::Relaxed);
+    ctx.vidpn_snap_height.store(snap.height, Ordering::Relaxed);
+    ctx.vidpn_snap_pitch.store(snap.pitch, Ordering::Relaxed);
+    ctx.vidpn_snap_dxgi_format
+        .store(snap.dxgi_format, Ordering::Relaxed);
+    ctx.vidpn_snap_plane_offset
+        .store(snap.plane_offset as u32, Ordering::Relaxed);
+    ctx.vidpn_snap_alloc_size
+        .store(snap.venus_alloc_size, Ordering::Relaxed);
+    ctx.vidpn_snap_resid
+        .store(snap.resource_id, Ordering::Relaxed);
     ctx.vidpn_primary_address
         .store(primary_address, Ordering::Release);
     true
+}
+
+/// The venus resource behind an `hAllocation`, or 0 for a null/foreign handle or
+/// an unbacked allocation.
+///
+/// Exists so the DISPATCH-level flip arm can name the buffer whose frame mark it
+/// must take without building a whole [`WindowsPrimary`] for one field.
+///
+/// # Safety
+/// Same contract as [`scanout_alloc_info`].
+pub(crate) unsafe fn allocation_resource_id(h: HANDLE) -> u32 {
+    if h.is_null() {
+        return 0;
+    }
+    let ctx = unsafe { &*(h as *const AllocationContext) };
+    if ctx.magic != ALLOCATION_CTX_MAGIC {
+        return 0;
+    }
+    ctx.resource_id
 }
 
 /// Resolve a primary allocation's `hAllocation` (the CreateAllocation handle
@@ -893,6 +1045,25 @@ pub(crate) unsafe fn scanout_alloc_info(h: HANDLE) -> Option<WindowsPrimary> {
     if ctx.magic != ALLOCATION_CTX_MAGIC || ctx.resource_id == 0 {
         return None;
     }
+    // Acquire on the address pairs with the Release in
+    // `set_vidpn_primary_address`, so every companion field stored before it —
+    // the presentation epoch, the watermark, and the D4b snapshot stamp — is
+    // visible here. Loaded FIRST for that reason.
+    let primary_address = ctx.vidpn_primary_address.load(Ordering::Acquire);
+    let snap_resid = ctx.vidpn_snap_resid.load(Ordering::Relaxed);
+    let snapshot = if snap_resid != 0 {
+        Some(SnapshotDescriptor {
+            resource_id: snap_resid,
+            width: ctx.vidpn_snap_width.load(Ordering::Relaxed),
+            height: ctx.vidpn_snap_height.load(Ordering::Relaxed),
+            pitch: ctx.vidpn_snap_pitch.load(Ordering::Relaxed),
+            dxgi_format: ctx.vidpn_snap_dxgi_format.load(Ordering::Relaxed),
+            plane_offset: ctx.vidpn_snap_plane_offset.load(Ordering::Relaxed) as u64,
+            venus_alloc_size: ctx.vidpn_snap_alloc_size.load(Ordering::Relaxed),
+        })
+    } else {
+        None
+    };
     Some(WindowsPrimary {
         resource_id: ctx.resource_id,
         width: ctx.width,
@@ -904,8 +1075,11 @@ pub(crate) unsafe fn scanout_alloc_info(h: HANDLE) -> Option<WindowsPrimary> {
         memory_type_index: ctx.memory_type_index,
         direct_scanout: ctx.direct_scanout,
         primary_segment: ctx.vidpn_primary_segment.load(Ordering::Relaxed),
-        primary_address: ctx.vidpn_primary_address.load(Ordering::Acquire),
+        primary_address,
         primary_flags: ctx.vidpn_primary_flags.load(Ordering::Relaxed),
+        present_epoch: ctx.vidpn_present_epoch.load(Ordering::Relaxed),
+        frame_watermark: ctx.vidpn_frame_watermark.load(Ordering::Relaxed),
+        snapshot,
     })
 }
 
@@ -1151,6 +1325,106 @@ pub(crate) unsafe fn set_bar_placement(h: HANDLE, offset: u64) {
     if ctx.magic == ALLOCATION_CTX_MAGIC {
         ctx.bar_placed.store(offset, Ordering::Release);
     }
+}
+
+
+/// Direct-scan-out allocations, keyed by venus resource id.
+///
+/// WHY IT EXISTS. `DxgkDdiPresent` receives only `hDeviceSpecificAllocation`
+/// (an `OpenAllocationContext*`), while the scan-out path keys on the GLOBAL
+/// allocation handle (`AllocationContext*`) that `DxgkDdiSetVidPnSourceAddress`
+/// supplies. On the MMIO flip path that DDI hands the global handle over; on
+/// the DMA-BUFFER FLIP path it is never called, so Present has to bridge the
+/// two itself. There is no back-pointer to bridge with — `DXGK_OPENALLOCATIONINFO`
+/// carries a `D3DKMT_HANDLE`, dxgkrnl's runtime token, NOT this driver's
+/// pointer — and the create-time private data is UMD-visible, so smuggling a
+/// kernel pointer through it would be both a leak and forgeable. The venus
+/// resource id is the one identity both sides already hold honestly.
+///
+/// Only DIRECT-SCAN-OUT allocations are registered, which is what keeps a fixed
+/// table adequate: DWM rotates 3 and an app's flip chain 2-4, so the live set is
+/// under ten even across a fullscreen transition.
+const SCANOUT_ALLOC_SLOTS: usize = 32;
+
+struct ScanoutAllocSlot {
+    resource_id: AtomicU32,
+    /// `AllocationContext*` as a `usize`. Written under the same
+    /// create/destroy discipline as the Box itself: published here after the
+    /// Box is leaked into `info.hAllocation`, and cleared in
+    /// `destroy_allocation_ctx` BEFORE the Box is dropped.
+    allocation: core::sync::atomic::AtomicUsize,
+}
+
+impl ScanoutAllocSlot {
+    const NEW: Self = Self {
+        resource_id: AtomicU32::new(0),
+        allocation: core::sync::atomic::AtomicUsize::new(0),
+    };
+}
+
+static SCANOUT_ALLOCS: [ScanoutAllocSlot; SCANOUT_ALLOC_SLOTS] =
+    [ScanoutAllocSlot::NEW; SCANOUT_ALLOC_SLOTS];
+
+/// Registrations refused because every slot was taken (diag `ScAlcFul`). Each
+/// one is a direct primary the DMA-flip path cannot resolve, so it must read 0.
+pub(crate) static SCANOUT_ALLOC_FULL: AtomicU32 = AtomicU32::new(0);
+
+/// Publish `allocation` as the global handle for `resource_id`.
+fn register_scanout_allocation(resource_id: u32, allocation: usize) {
+    if resource_id == 0 || allocation == 0 {
+        return;
+    }
+    for slot in SCANOUT_ALLOCS.iter() {
+        // Claim by resource id. Venus resource ids are monotonic and never
+        // recycled (`virtio/gpu.rs`), so a successful CAS from 0 can never be
+        // confused with a stale entry for a different surface.
+        if slot
+            .resource_id
+            .compare_exchange(0, resource_id, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            slot.allocation.store(allocation, Ordering::Release);
+            return;
+        }
+    }
+    SCANOUT_ALLOC_FULL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Withdraw `resource_id`'s registration. Called before the allocation's Box is
+/// dropped, so no lookup can return a dangling pointer afterwards.
+fn unregister_scanout_allocation(resource_id: u32) {
+    if resource_id == 0 {
+        return;
+    }
+    for slot in SCANOUT_ALLOCS.iter() {
+        if slot.resource_id.load(Ordering::Acquire) == resource_id {
+            // Pointer first: a reader that still sees the id must not then read
+            // a stale pointer.
+            slot.allocation.store(0, Ordering::Release);
+            slot.resource_id.store(0, Ordering::Release);
+            return;
+        }
+    }
+}
+
+/// The global allocation handle for `resource_id`, or `None`.
+///
+/// PASSIVE-level callers only, and only while the allocation cannot be
+/// destroyed concurrently — `DxgkDdiPresent` qualifies: dxgkrnl holds the
+/// present's allocations resident for the duration of the call.
+pub(crate) fn scanout_allocation_for_resource(resource_id: u32) -> Option<HANDLE> {
+    if resource_id == 0 {
+        return None;
+    }
+    for slot in SCANOUT_ALLOCS.iter() {
+        if slot.resource_id.load(Ordering::Acquire) == resource_id {
+            let allocation = slot.allocation.load(Ordering::Acquire);
+            if allocation != 0 {
+                return Some(allocation as HANDLE);
+            }
+        }
+    }
+    None
 }
 
 const PAGE: SIZE_T = 4096;
@@ -1485,6 +1759,9 @@ unsafe fn destroy_allocation_ctx(
     ctx: Box<AllocationContext>,
 ) {
     let allocation_handle = (&*ctx as *const AllocationContext) as usize;
+    // Withdraw the DMA-flip lookup FIRST: after this no Present can resolve
+    // this resource id to a handle whose Box is about to be dropped.
+    unregister_scanout_allocation(ctx.resource_id);
     // The system-backing entry is removed on EVERY teardown exit, including the
     // scanout-retire failure below.
     //
@@ -2117,6 +2394,15 @@ unsafe fn create_one(
         vidpn_primary_address: AtomicU64::new(0),
         vidpn_primary_segment: AtomicU32::new(0),
         vidpn_primary_flags: AtomicU32::new(0),
+        vidpn_present_epoch: AtomicU64::new(helios_kmd_logic::scanout_lease::NO_LEASE),
+        vidpn_frame_watermark: AtomicU64::new(0),
+        vidpn_snap_resid: AtomicU32::new(0),
+        vidpn_snap_width: AtomicU32::new(0),
+        vidpn_snap_height: AtomicU32::new(0),
+        vidpn_snap_pitch: AtomicU32::new(0),
+        vidpn_snap_dxgi_format: AtomicU32::new(0),
+        vidpn_snap_plane_offset: AtomicU32::new(0),
+        vidpn_snap_alloc_size: AtomicU64::new(0),
         size,
         width: meta.width,
         height: meta.height,
@@ -2134,7 +2420,14 @@ unsafe fn create_one(
     });
 
     // ── VidMm metadata: segment placement + CPU visibility ──────────────────
+    let is_direct_scanout = ctx.direct_scanout;
+    let ctx_resource_id = ctx.resource_id;
     info.hAllocation = Box::into_raw(ctx) as HANDLE;
+    // Register AFTER the Box is leaked, so the pointer published here is the
+    // one dxgkrnl will hand back.
+    if is_direct_scanout {
+        register_scanout_allocation(ctx_resource_id, info.hAllocation as usize);
+    }
     info.Size = size;
     info.PitchAlignedSize = size;
     // The scan-out display primary (CpuVisible SHAREDPRIMARYSURFACE) needs special

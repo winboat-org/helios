@@ -9,6 +9,9 @@
 
 use alloc::boxed::Box;
 use core::ffi::c_void;
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
+use helios_kmd_logic::snapshot_bind::SnapshotDescriptor;
 
 use crate::adapter::AdapterContext;
 use crate::dxgk::*;
@@ -28,6 +31,45 @@ pub struct ContextContext {
     /// Back-pointer to the owning device (valid for the context's lifetime).
     /// PRIVATE, for the same reason as [`DeviceContext::adapter`].
     device: *mut DeviceContext,
+    /// D4b snapshot descriptor STASH: the render→present handoff
+    /// (FIX-DESIGN-d4b-snapshot.md §4, corrected delivery route).
+    ///
+    /// WHY IT EXISTS. dxgkrnl does NOT forward the UMD's PresentCb
+    /// `pPrivateDriverData` to `DxgkDdiPresent` on flip presents (measured:
+    /// `PBIdOk` reads "no payload" across three driver generations), so the
+    /// descriptor's only working route into the KMD is the inline
+    /// `HeliosPresentRenderCmd` that `DxgkDdiRender` already decodes — the
+    /// same route the present-marker resid has always used. The UMD issues
+    /// pfnRenderCb then pfnPresentCb back-to-back on one thread for the same
+    /// hContext, so Render stashes HERE and the immediately following Present
+    /// takes it.
+    ///
+    /// DISCIPLINE. `snap_resid == 0` = empty. The writer stores the payload
+    /// fields Relaxed and the resid LAST with Release; the taker swaps the
+    /// resid to 0 with Acquire and only then reads the payload — read+clear on
+    /// EVERY present that resolves its context (flip, MMIO, BLT alike), so an
+    /// orphaned stash (a Render whose Present failed) cannot outlive the next
+    /// present on this context: staleness is bounded to one present, and the
+    /// Present-time validation (extent vs the allocation list, layout,
+    /// liveness at the executor) re-checks everything the stash claims.
+    /// Atomics rather than plain fields because context state is reached
+    /// through a shared reference; the same-thread Render→Present pairing is
+    /// the expected regime, and under any cross-thread interleaving a torn
+    /// stash degrades to a mix of two VALIDATED descriptors, which that same
+    /// validation absorbs. The stash is plain data inside this Box — it dies
+    /// with the context in `dxgkddi_destroy_context`, and dxgkrnl serializes
+    /// context destruction against in-flight Render/Present on the handle, so
+    /// nothing can dangle.
+    snap_resid: AtomicU32,
+    snap_width: AtomicU32,
+    snap_height: AtomicU32,
+    snap_pitch: AtomicU32,
+    snap_dxgi_format: AtomicU32,
+    /// Kept full-width: narrowing to u32 happens only AFTER Present-time
+    /// validation proved `plane_offset <= u32::MAX` (a pre-narrow truncation
+    /// could alias an invalid offset onto a valid-looking one).
+    snap_plane_offset: AtomicU64,
+    snap_alloc_size: AtomicU64,
 }
 
 /// Typed borrowed view of a scheduler context handle.
@@ -51,6 +93,48 @@ impl<'a> ContextHandleRef<'a> {
     pub fn adapter(&self) -> Option<&'a AdapterContext> {
         let device = unsafe { self.context.device.as_ref() }?;
         unsafe { device.adapter.as_ref() }
+    }
+
+    /// Stash a VALIDATED-shape D4b snapshot descriptor from `DxgkDdiRender`'s
+    /// `HeliosPresentRenderCmd` for the present that follows on this context.
+    /// See [`ContextContext::snap_resid`] for the whole contract; the payload
+    /// stores precede the resid's Release publication so the taker's Acquire
+    /// swap observes a complete descriptor.
+    pub fn stash_snapshot(&self, snap: &SnapshotDescriptor) {
+        let ctx = self.context;
+        ctx.snap_width.store(snap.width, Ordering::Relaxed);
+        ctx.snap_height.store(snap.height, Ordering::Relaxed);
+        ctx.snap_pitch.store(snap.pitch, Ordering::Relaxed);
+        ctx.snap_dxgi_format
+            .store(snap.dxgi_format, Ordering::Relaxed);
+        ctx.snap_plane_offset
+            .store(snap.plane_offset, Ordering::Relaxed);
+        ctx.snap_alloc_size
+            .store(snap.venus_alloc_size, Ordering::Relaxed);
+        ctx.snap_resid.store(snap.resource_id, Ordering::Release);
+    }
+
+    /// Take (read + CLEAR) the stashed snapshot descriptor, or `None`.
+    ///
+    /// Called on EVERY present that resolves this context — including the
+    /// MMIO/desktop and BLT arms, which never substitute — because the clear
+    /// is the orphan bound: a stash whose present failed must not leak past
+    /// the next present. The swap claims the descriptor exactly once.
+    pub fn take_snapshot_stash(&self) -> Option<SnapshotDescriptor> {
+        let ctx = self.context;
+        let resid = ctx.snap_resid.swap(0, Ordering::Acquire);
+        if resid == 0 {
+            return None;
+        }
+        Some(SnapshotDescriptor {
+            resource_id: resid,
+            width: ctx.snap_width.load(Ordering::Relaxed),
+            height: ctx.snap_height.load(Ordering::Relaxed),
+            pitch: ctx.snap_pitch.load(Ordering::Relaxed),
+            dxgi_format: ctx.snap_dxgi_format.load(Ordering::Relaxed),
+            plane_offset: ctx.snap_plane_offset.load(Ordering::Relaxed),
+            venus_alloc_size: ctx.snap_alloc_size.load(Ordering::Relaxed),
+        })
     }
 }
 
@@ -207,6 +291,11 @@ pub unsafe extern "C" fn dxgkddi_destroy_device(h_device: *mut c_void) -> NTSTAT
         // per-call breadcrumbs, so mirror the latest cross-adapter present args
         // here at PASSIVE_LEVEL.
         crate::ddi::diag_dump_present_atomics();
+        // D4a: drop this device's scanout retirement-event registrations —
+        // dereference ONLY, no signal (the process is exiting; a wake would
+        // land nowhere). Its read-ledger page mapping needs nothing here: it
+        // rides the MappingTable and was unmapped by the drain above.
+        adapter.read_ledger.reclaim_events_for_owner(owner);
         let before = adapter.with_virtio(|v| v.blob_count() as u32).unwrap_or(0);
         // Sweep exactly this device's slots. A null hDevice would sweep the
         // KMD-owned ones, so the token is minted rather than cast.
@@ -245,6 +334,13 @@ pub unsafe extern "C" fn dxgkddi_create_context(
     let args = unsafe { &mut *create_context };
     let ctx = Box::new(ContextContext {
         device: h_device as *mut DeviceContext,
+        snap_resid: AtomicU32::new(0),
+        snap_width: AtomicU32::new(0),
+        snap_height: AtomicU32::new(0),
+        snap_pitch: AtomicU32::new(0),
+        snap_dxgi_format: AtomicU32::new(0),
+        snap_plane_offset: AtomicU64::new(0),
+        snap_alloc_size: AtomicU64::new(0),
     });
     args.hContext = Box::into_raw(ctx) as HANDLE;
 
@@ -256,7 +352,11 @@ pub unsafe extern "C" fn dxgkddi_create_context(
     // through the normal aperture allocation path.
     args.ContextInfo.DmaBufferSegmentSet = 1; // segment id 1 (aperture)
     args.ContextInfo.DmaBufferSize = 256 * 1024;
-    args.ContextInfo.DmaBufferPrivateDataSize = 40;
+    // ONE definition site: present_packet.rs, beside the two records that live
+    // in the buffer and the compile-time proof they fit it (40 -> 72 with the
+    // D4b snapshot descriptor in `PresentFlipPrivate`).
+    args.ContextInfo.DmaBufferPrivateDataSize =
+        crate::ddi::present_packet::PRESENT_DMA_PRIVATE_DATA_BYTES;
     args.ContextInfo.AllocationListSize = DXGK_ALLOCATION_LIST_SIZE_GDICONTEXT;
     args.ContextInfo.PatchLocationListSize = DXGK_ALLOCATION_LIST_SIZE_GDICONTEXT;
 

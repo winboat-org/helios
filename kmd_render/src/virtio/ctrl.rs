@@ -44,7 +44,14 @@
 //! `DmaBuffer`'s `Drop` (`MmFreeContiguousMemory`). `Drop::drop` has a fixed
 //! signature, so the transport parks completed buffers and frees them from
 //! [`reap_parked`] instead of letting the DISPATCH drain drop one.
+//!
+//! ONE function here is deliberately IRQL-free and takes no token:
+//! [`fill_set_scanout_blob`], which only writes the fields of a wire command
+//! someone else owns. It lives here so the DISPATCH-level fast bind
+//! (`VirtioGpu::enqueue_scanout_bind_async`, ROADMAP defect 0ab-C) and the
+//! PASSIVE round-trip below cannot encode the same command differently.
 
+use core::cell::Cell;
 use core::mem::size_of;
 use core::ptr::NonNull;
 use core::sync::atomic::AtomicU32;
@@ -157,6 +164,37 @@ pub(crate) fn sleep_ms(_passive: PassiveLevel, ms: u64) {
 /// Wait on `block` for up to `total_ms`, in adaptive slices (1 ms → 1 s),
 /// opportunistically draining the used ring after each slice so a lost
 /// interrupt costs only slice latency. Returns whether the block completed.
+///
+/// ⚠ THE SIGNAL IS THE ONLY COMPLETION-SIDE EXIT. THE INVARIANT: a waiter may
+/// resume — and therefore pop the stack frame this block lives in — only once
+/// the signaler has finished touching the block. This loop has exactly two
+/// exits, and each one carries that guarantee:
+///
+///   * `KeWaitForSingleObject` returning STATUS_SUCCESS. The kernel's own
+///     stack-event contract: the wait cannot be satisfied before `KeSetEvent`
+///     has finished with the dispatcher object.
+///   * The timeout, which goes to `abandon_sync` under `virtio_lock` — the same
+///     lock the whole `InFlightKind::Sync` arm runs under, so abandon either
+///     clears `waiter` before the drain runs (and the drain then signals
+///     nothing) or observes `AlreadyCompleted` after the arm finished. The
+///     timed-out waiter's frame is alive across its own abandon call, so the
+///     block outlives every access on that side too.
+///
+/// A LOCK-FREE `done` POLL PROVIDES NEITHER, and this loop used to open with
+/// one. `done` is stored one instruction BEFORE `KeSetEvent` in the drain's
+/// Sync arm (`gpu/mod.rs`, the `InFlightKind::Sync` write site), so a waiter
+/// polling it could return, pop its frame, and leave the drain to memcpy and
+/// signal a dead stack frame — one ISR or KVM vm-exit inside that one-
+/// instruction window is all it takes. That is the 22.22.218.0 `0xA` bugcheck,
+/// root-caused from two dumps (ROADMAP defect 0ab-C): `KeSetEvent` walking the
+/// waiter list of a "KEVENT" that was the HPD worker's own popped frame. It
+/// only became reachable when the sync waits started outliving a wait slice.
+///
+/// Nothing is lost by removing it: a completion that lands before the first
+/// wait leaves the KEVENT SIGNALED, and a KEVENT holds state, so the next
+/// `KeWaitForSingleObject` returns immediately. The only cost is one
+/// 15.6 ms-granularity slice on the rare poll-hit, and correctness owns that
+/// trade.
 fn wait_block(
     _passive: PassiveLevel,
     adapter: &AdapterContext,
@@ -166,11 +204,6 @@ fn wait_block(
     let mut waited: u64 = 0;
     let mut slice: u64 = 1;
     loop {
-        // The borrow proves the block is alive for this whole call; only the
-        // drain (under the device lock) writes it, through atomics.
-        if block.is_done() {
-            return true;
-        }
         if waited >= total_ms {
             return false;
         }
@@ -233,10 +266,30 @@ pub fn reap_parked(_passive: PassiveLevel, adapter: &AdapterContext) {
     let _ = adapter.with_virtio(move |v| v.finish_parked_reap(dead, excess));
 }
 
+/// A scan-out bind's mint, as passed down to the enqueue: where the minted wire
+/// sequence goes, and which resource the command names.
+///
+/// The two travel together because they are published together, under the one
+/// `virtio_lock` hold that enqueues the command — the sequence orders the
+/// bookkeeping, the resource is the WIRE view of what is bound
+/// (`AdapterContext::scanout_bind_wire_resource`), and neither is meaningful
+/// against a different command's lock hold.
+#[derive(Clone, Copy)]
+struct BindMint<'a> {
+    seq_out: &'a Cell<u64>,
+    /// The `SET_SCANOUT_BLOB`'s own `resource_id`; 0 is the scan-out disable.
+    resource_id: u32,
+}
+
 /// One synchronous control round-trip: `req` (+ optional second device-read
 /// span `extra`) → device → `resp_out`. Blocks at PASSIVE until completion or
 /// `timeout_ms`. On timeout the in-flight slot is abandoned (reaped when the
 /// completion eventually arrives) — the transport is NOT poisoned.
+/// `bind`, when supplied, is minted INSIDE the same `with_virtio` as the
+/// successful enqueue (ROADMAP defect 0ab-C). Minting there and nowhere else is
+/// what makes the sequence agree with the control queue's FIFO order, and
+/// therefore with the order the host applies binds in. `None` for every command
+/// that is not a `SET_SCANOUT_BLOB`.
 fn ctrl_roundtrip(
     passive: PassiveLevel,
     adapter: &AdapterContext,
@@ -244,6 +297,7 @@ fn ctrl_roundtrip(
     extra: Option<&[u8]>,
     resp_out: &mut [u8],
     timeout_ms: u64,
+    bind: Option<BindMint<'_>>,
 ) -> Result<(), VirtioError> {
     let in0_len = req.len();
     let in1_len = extra.map_or(0, |e| e.len());
@@ -280,7 +334,19 @@ fn ctrl_roundtrip(
         let token: SyncTicket = loop {
             let res = adapter.with_virtio(move |v| {
                 v.drain_used();
-                v.enqueue_sync(meta, in0_len, in1_len, resp_len, block.as_ptr())
+                let queued = v.enqueue_sync(meta, in0_len, in1_len, resp_len, block.as_ptr());
+                // Under the SAME lock hold as the descriptor publication, and
+                // only when the device has actually taken it: a sequence minted
+                // for a command that never reached the ring would let a bind
+                // that did not happen out-rank one that did — and would publish
+                // a wire resource the host will never be told about.
+                if queued.is_ok() {
+                    if let Some(bind) = bind {
+                        bind.seq_out
+                            .set(adapter.mint_scanout_bind_seq(bind.resource_id));
+                    }
+                }
+                queued
             });
             match res {
                 Err(_) => return Err(VirtioError::DeviceError), // transport gone
@@ -344,6 +410,19 @@ fn ctrl_roundtrip_ok(
     req: &[u8],
     extra: Option<&[u8]>,
 ) -> Result<(), VirtioError> {
+    ctrl_roundtrip_ok_seq(passive, adapter, req, extra, None)
+}
+
+/// [`ctrl_roundtrip_ok`] plus the scan-out bind mint. Only the
+/// `SET_SCANOUT_BLOB` caller passes one; every other command's semantics are
+/// unchanged, because `None` skips the mint entirely.
+fn ctrl_roundtrip_ok_seq(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    req: &[u8],
+    extra: Option<&[u8]>,
+    bind: Option<BindMint<'_>>,
+) -> Result<(), VirtioError> {
     let mut resp = [0u8; size_of::<VirtioGpuCtrlHdr>()];
     ctrl_roundtrip(
         passive,
@@ -352,6 +431,7 @@ fn ctrl_roundtrip_ok(
         extra,
         &mut resp,
         SYNC_ROUNDTRIP_TIMEOUT_MS,
+        bind,
     )?;
     let resp_type = u32::from_le_bytes([resp[0], resp[1], resp[2], resp[3]]);
     if resp_is_ok(resp_type) {
@@ -500,6 +580,11 @@ pub fn ctx_detach_resource(
 /// surfaces here as `VirtioError::DeviceError` — that IS the export-gate signal.
 /// `stride`/`offset` are plane-0 geometry of the LINEAR image. Device-global
 /// (`hdr.ctx_id = 0`). PASSIVE_LEVEL only (control round-trip).
+///
+/// Returns the WIRE-ORDER SEQUENCE this bind was minted with (ROADMAP defect
+/// 0ab-C): the caller's post-response bookkeeping is only allowed to run if no
+/// LATER bind has already applied its own — see
+/// `AdapterContext::adopt_scanout_bind_seq`.
 pub fn set_scanout_blob(
     passive: PassiveLevel,
     adapter: &AdapterContext,
@@ -509,8 +594,46 @@ pub fn set_scanout_blob(
     format: u32,
     stride: u32,
     offset: u32,
-) -> Result<(), VirtioError> {
+) -> Result<u64, VirtioError> {
     let mut cmd = VirtioGpuSetScanoutBlob::zeroed();
+    fill_set_scanout_blob(&mut cmd, resource_id, width, height, format, stride, offset);
+    let seq = Cell::new(0u64);
+    // `resource_id` rides down to the mint: it is 0 for the scan-out DISABLE the
+    // retire path sends, which is exactly what must land in the wire-resource
+    // word — after a disable nothing is bound, so nothing may be skipped as
+    // already bound.
+    let bind = BindMint {
+        seq_out: &seq,
+        resource_id,
+    };
+    ctrl_roundtrip_ok_seq(passive, adapter, bytes_of(&cmd), None, Some(bind))?;
+    Ok(seq.get())
+}
+
+/// Encode one `SET_SCANOUT_BLOB` into `cmd`, whoever owns the storage.
+///
+/// THE ONE ENCODER. Its two callers are the synchronous round-trip above, which
+/// stages the command on its PASSIVE stack, and the DISPATCH-level fast bind,
+/// which writes it straight into the transport's preallocated DMA buffer — so
+/// the two commands are byte-identical by construction rather than by two
+/// copies of the same twelve field assignments.
+///
+/// Every field is written, including the zeros: `cmd` may be a recycled buffer
+/// whose previous contents are a different bind, and a stale `strides[1]` would
+/// be read by QEMU as a real plane.
+///
+/// IRQL-free (plain field stores, no allocation, no round-trip), which is why it
+/// takes no [`PassiveLevel`] unlike everything else in this module.
+pub(crate) fn fill_set_scanout_blob(
+    cmd: &mut VirtioGpuSetScanoutBlob,
+    resource_id: u32,
+    width: u32,
+    height: u32,
+    format: u32,
+    stride: u32,
+    offset: u32,
+) {
+    cmd.hdr = VirtioGpuCtrlHdr::zeroed();
     cmd.hdr.type_ = VIRTIO_GPU_CMD_SET_SCANOUT_BLOB;
     cmd.r = VirtioGpuRect {
         x: 0,
@@ -523,9 +646,9 @@ pub fn set_scanout_blob(
     cmd.width = width;
     cmd.height = height;
     cmd.format = format;
-    cmd.strides[0] = stride;
-    cmd.offsets[0] = offset;
-    ctrl_roundtrip_ok(passive, adapter, bytes_of(&cmd), None)
+    cmd.padding = 0;
+    cmd.strides = [stride, 0, 0, 0];
+    cmd.offsets = [offset, 0, 0, 0];
 }
 
 /// Queue a RESOURCE_FLUSH without synchronously waiting for its ctrl response.
@@ -534,6 +657,13 @@ pub fn set_scanout_blob(
 /// lifecycle commands, the caller does not need response data before it can
 /// continue, and blocking here previously imposed the observed ~0.41 s/frame
 /// cadence when ctrl interrupts were delayed.
+///
+/// `scanout_flush` is the presentation-ownership token (ROADMAP defect 0ab-B):
+/// the epoch this command's host read covers. It is CONSUMED by the used-ring
+/// drain. On every error return below the command never reaches the ring, so no
+/// host read exists for that epoch — the caller
+/// (`queue_active_scanout_refresh_locked`) ends the lease explicitly, which is
+/// why the token being dropped here is correct rather than a leak.
 pub fn resource_flush_async(
     passive: PassiveLevel,
     adapter: &AdapterContext,
@@ -543,6 +673,7 @@ pub fn resource_flush_async(
     completion: NonNull<AtomicU32>,
     completion_errors: NonNull<AtomicU32>,
     wake_event: NonNull<KEVENT>,
+    scanout_flush: crate::virtio::ScanoutFlushToken,
 ) -> Result<(), VirtioError> {
     let mut cmd = VirtioGpuResourceFlush::zeroed();
     cmd.hdr.type_ = VIRTIO_GPU_CMD_RESOURCE_FLUSH;
@@ -572,6 +703,7 @@ pub fn resource_flush_async(
             wake_event,
             None,
             None,
+            Some(scanout_flush),
         )
     });
     match queued {
@@ -720,6 +852,7 @@ fn resource_map_blob_roundtrip(
         None,
         &mut resp,
         SYNC_ROUNDTRIP_TIMEOUT_MS,
+        None,
     )?;
     let resp_type = u32::from_le_bytes([resp[0], resp[1], resp[2], resp[3]]);
     if !resp_is_ok(resp_type) {
@@ -896,12 +1029,24 @@ pub fn release_blob_for_owner(
     let first_teardown = adapter
         .with_virtio(|v| v.take_live_resource(res))
         .unwrap_or(false);
-    if first_teardown {
+    let result = if first_teardown {
         let _ = ctx_detach_resource(passive, adapter, ctx_id, res);
         resource_unref(passive, adapter, res)
     } else {
         Ok(())
-    }
+    };
+    // D4b: reclaim this resid's D4a read-ledger slot. Snapshot resids never
+    // pass through `retire_scanout_allocation` (they have no WDDM allocation),
+    // so without this the 8-slot ledger leaks one slot per snapshot-ring
+    // recreate and `RdOvf` climbs across app restarts. Under the scanout
+    // lifecycle mutex because `ReadLedger::issue`'s claim discipline is
+    // serialized by it (see `note_alloc_retired`'s contract); PASSIVE here, no
+    // other lock held, so the acquisition is legal and unordered against
+    // nothing. A resid with no ledger slot no-ops.
+    adapter.with_scanout_lifecycle(passive, |_lock| {
+        adapter.read_ledger.note_alloc_retired(res);
+    });
+    result
 }
 
 /// Reclaim every blob still owned by `owner` (a destroyed D3D device handle):
@@ -931,6 +1076,13 @@ pub fn release_blobs_for_owner(
             let _ = ctx_detach_resource(passive, adapter, ctx_id, res);
             let _ = resource_unref(passive, adapter, res);
         }
+        // Same D4b ledger reclaim as `release_blob_for_owner`: this sweep is
+        // how a crashed/exited process's snapshot resids reach the ledger at
+        // all (`RdOvf` must stay 0 across app restarts). Per-resid acquisition
+        // keeps the display worker's lock hold times unchanged during a sweep.
+        adapter.with_scanout_lifecycle(passive, |_lock| {
+            adapter.read_ledger.note_alloc_retired(res);
+        });
         reclaimed += 1;
     }
 }

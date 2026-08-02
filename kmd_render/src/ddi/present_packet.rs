@@ -10,6 +10,8 @@ use core::ffi::c_void;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU32, Ordering};
 
+use helios_kmd_logic::snapshot_bind::SnapshotDescriptor;
+
 use crate::dxgk::*;
 
 // Legal retry status for DxgkDdiPresent when either the DMA or patch buffer
@@ -19,6 +21,216 @@ pub(crate) const STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER: NTSTATUS = 0xC01E_0001
 const PRESENT_SUBMISSION_MAGIC: u32 = 0x4850_424C; // "HPBL"
 const PRESENT_SUBMISSION_VERSION: u32 = 1;
 
+/// Byte offset of [`PresentFlipPrivate`] inside the per-context DMA
+/// private-data buffer. [`PresentSubmissionPrivate`] owns bytes 0..16, so the
+/// flip record occupies 16.. and the two never collide even when dxgkrnl
+/// batches a BLT and a flip into one DMA buffer.
+pub(crate) const PRESENT_FLIP_PRIVATE_OFFSET: usize = 16;
+
+/// `DmaBufferPrivateDataSize` this driver requests per context (`device.rs`'s
+/// CreateContext reads it from here). 40 bytes until D4b; the snapshot
+/// descriptor grew [`PresentFlipPrivate`] by 32 bytes, and this is the OTHER
+/// half of the "deliberate change to BOTH sites" the compile-time proof below
+/// demands.
+pub(crate) const PRESENT_DMA_PRIVATE_DATA_BYTES: u32 = 72;
+
+const PRESENT_FLIP_MAGIC: u32 = 0x4850_464C; // "HPFL"
+const PRESENT_FLIP_VERSION: u32 = 1;
+
+/// KMD-private flip record for the DMA-BUFFER FLIP contract.
+///
+/// WHY THIS EXISTS. `DXGK_FLIPCAPS.FlipOnVSyncMmIo` covers only nonzero flip
+/// intervals. An IMMEDIATE flip (interval 0 — every unthrottled fullscreen app)
+/// goes down the DMA-buffer flip contract instead, in which dxgkrnl calls
+/// `DxgkDdiPresent` with a real `pDmaBuffer` and NEVER calls
+/// `DxgkDdiSetVidPnSourceAddress`: the driver is expected to program the
+/// display itself when that DMA buffer executes.
+///
+/// Advertising `FlipImmediateMmIo` to force those flips onto the MMIO path
+/// instead is NOT a valid substitute for implementing this, and was measured
+/// not to be (2026-07-29): the MMIO contract requires the flip to be complete
+/// when the DDI RETURNS, and Helios cannot do that, because a Helios flip is a
+/// virtio `SET_SCANOUT_BLOB` round-trip that is illegal at the DIRQL the DDI
+/// arrives at. Returning STATUS_SUCCESS from a DIRQL stash made dxgkrnl free
+/// the previous buffer to the app and issue the next flip while nothing had
+/// been programmed — measured as 80 dropped binds and 145 of 1245 present
+/// markers writing the buffer that was on screen. The DMA-buffer contract is
+/// the one designed for hardware that cannot flip synchronously, because the
+/// submission fence puts the completion signal back under driver control.
+///
+/// It lives in the kernel-only `pDmaBufferPrivateData`, never in the DMA buffer
+/// the UMD can see, so the allocation handle it carries is not user-influenced.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct PresentFlipPrivate {
+    magic: u32,
+    version: u32,
+    /// `hDeviceSpecificAllocation` of the flip source — the exact identity
+    /// `create_allocation::scanout_alloc_info` resolves, same as the handle
+    /// `SetVidPnSourceAddress` supplies on the MMIO path.
+    allocation: u64,
+    /// `DXGK_ALLOCATIONLIST::PhysicalAddress` of that allocation. This is what
+    /// a later CRTC_VSYNC must carry for dxgkrnl to retire the flip.
+    physical_address: u64,
+    /// D4b snapshot BIND-TARGET substitution, carried BY VALUE (never a
+    /// pointer, never an allocation handle): the venus resource the KMD binds
+    /// and flushes INSTEAD of `allocation`'s own, already validated at the
+    /// Present DDI (`helios_kmd_logic::snapshot_bind::validate`). 0 = no
+    /// substitution — every pre-snapshot flip. The FLIP bookkeeping (epoch
+    /// stamp, `physical_address`, CRTC_VSYNC retirement) stays entirely on
+    /// `allocation` regardless.
+    snap_resid: u32,
+    snap_width: u32,
+    snap_height: u32,
+    snap_pitch: u32,
+    snap_dxgi_format: u32,
+    /// Validated `<= u32::MAX` at Present, so the wire's u64 narrows honestly.
+    snap_plane_offset: u32,
+    /// The undersize guard's right-hand side, meaningful only with
+    /// `snap_resid != 0`.
+    snap_alloc_size: u64,
+}
+
+impl PresentFlipPrivate {
+    /// Write the flip record. `private_size` must cover the whole layout; a
+    /// smaller buffer is a refusal, never a partial write.
+    ///
+    /// # Safety
+    /// `private_data` points to `private_size` writable bytes supplied by
+    /// dxgkrnl for this Present call.
+    pub(crate) unsafe fn write(
+        private_data: *mut c_void,
+        private_size: u32,
+        allocation: HANDLE,
+        physical_address: u64,
+        snapshot: Option<SnapshotDescriptor>,
+    ) -> Result<(), NTSTATUS> {
+        if private_data.is_null()
+            || (private_size as usize)
+                < PRESENT_FLIP_PRIVATE_OFFSET + core::mem::size_of::<PresentFlipPrivate>()
+        {
+            return Err(STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER);
+        }
+        // A `None` writes an all-zero descriptor: `snap_resid == 0` is the one
+        // no-substitution sentinel, so a recycled buffer's stale descriptor
+        // bytes can never be mistaken for a carried one.
+        let snap = snapshot.unwrap_or(SnapshotDescriptor {
+            resource_id: 0,
+            width: 0,
+            height: 0,
+            pitch: 0,
+            dxgi_format: 0,
+            plane_offset: 0,
+            venus_alloc_size: 0,
+        });
+        let record = PresentFlipPrivate {
+            magic: PRESENT_FLIP_MAGIC,
+            version: PRESENT_FLIP_VERSION,
+            allocation: allocation as usize as u64,
+            physical_address,
+            snap_resid: snap.resource_id,
+            snap_width: snap.width,
+            snap_height: snap.height,
+            snap_pitch: snap.pitch,
+            snap_dxgi_format: snap.dxgi_format,
+            snap_plane_offset: snap.plane_offset as u32,
+            snap_alloc_size: snap.venus_alloc_size,
+        };
+        // SAFETY: the size check above proves the record fits at its offset;
+        // unaligned because dxgkrnl makes no alignment promise about the
+        // private-data buffer beyond its size.
+        unsafe {
+            core::ptr::write_unaligned(
+                private_data.cast::<u8>().add(PRESENT_FLIP_PRIVATE_OFFSET).cast::<PresentFlipPrivate>(),
+                record,
+            );
+        }
+        Ok(())
+    }
+
+    /// Take a flip record at submit time, or `None` when this DMA buffer
+    /// carries none. Validating BOTH magic and version means an uninitialised
+    /// or BLT-only private buffer cannot be mistaken for a flip, and the read
+    /// CONSUMES the record so a recycled buffer cannot replay it.
+    ///
+    /// The third tuple element is the D4b snapshot descriptor the Present DDI
+    /// validated and carried, or `None` (`snap_resid == 0`) for an ordinary
+    /// flip.
+    ///
+    /// # Safety
+    /// `private_data` points to `private_size` writable bytes from the DMA
+    /// submission dxgkrnl is handing back.
+    pub(crate) unsafe fn take(
+        private_data: *mut c_void,
+        private_size: u32,
+    ) -> Option<(HANDLE, u64, Option<SnapshotDescriptor>)> {
+        if private_data.is_null()
+            || (private_size as usize)
+                < PRESENT_FLIP_PRIVATE_OFFSET + core::mem::size_of::<PresentFlipPrivate>()
+        {
+            return None;
+        }
+        let slot = unsafe {
+            private_data
+                .cast::<u8>()
+                .add(PRESENT_FLIP_PRIVATE_OFFSET)
+                .cast::<PresentFlipPrivate>()
+        };
+        // SAFETY: size-checked above; unaligned because dxgkrnl makes no
+        // alignment promise about the private-data buffer beyond its size.
+        let record = unsafe { core::ptr::read_unaligned(slot) };
+        if record.magic != PRESENT_FLIP_MAGIC || record.version != PRESENT_FLIP_VERSION {
+            return None;
+        }
+        if record.allocation == 0 {
+            return None;
+        }
+        // CONSUME IT. dxgkrnl recycles DMA private-data buffers between
+        // submissions, so a record left behind would be read again by the next
+        // submission that happens to reuse this buffer and would re-arm a bind
+        // for a stale — possibly destroyed — allocation. Zeroing the magic
+        // makes the record strictly one-shot, which is what "this submission
+        // carries a flip" has to mean.
+        //
+        // SAFETY: same slot, same size check; only the magic word is written.
+        unsafe { core::ptr::write_unaligned(slot.cast::<u32>(), 0) };
+        let snapshot = if record.snap_resid != 0 {
+            Some(SnapshotDescriptor {
+                resource_id: record.snap_resid,
+                width: record.snap_width,
+                height: record.snap_height,
+                pitch: record.snap_pitch,
+                dxgi_format: record.snap_dxgi_format,
+                plane_offset: record.snap_plane_offset as u64,
+                venus_alloc_size: record.snap_alloc_size,
+            })
+        } else {
+            None
+        };
+        Some((
+            record.allocation as usize as HANDLE,
+            record.physical_address,
+            snapshot,
+        ))
+    }
+}
+
+/// Compile-time proof the two private records fit the per-context private-data
+/// buffer (`PRESENT_DMA_PRIVATE_DATA_BYTES`, which `device.rs`'s CreateContext
+/// reports). Growing either record past it has to be a deliberate change to
+/// BOTH sites, not a silent truncation here.
+const _: () = {
+    assert!(
+        PRESENT_FLIP_PRIVATE_OFFSET + core::mem::size_of::<PresentFlipPrivate>()
+            <= PRESENT_DMA_PRIVATE_DATA_BYTES as usize,
+        "PresentFlipPrivate does not fit the DMA private-data buffer"
+    );
+    assert!(
+        core::mem::size_of::<PresentSubmissionPrivate>() <= PRESENT_FLIP_PRIVATE_OFFSET,
+        "PresentSubmissionPrivate overlaps PresentFlipPrivate"
+    );
+};
+
 /// DISPATCH-safe proof that Present wrote a scheduler handoff marker.
 pub(crate) static PRESENT_MARKER_WRITES: AtomicU32 = AtomicU32::new(0);
 pub(crate) static PRESENT_MARKER_LAST_FENCE: AtomicU32 = AtomicU32::new(0);
@@ -26,8 +238,9 @@ pub(crate) static PRESENT_MARKER_LAST_SIZE: AtomicU32 = AtomicU32::new(0);
 
 /// KMD-private scheduler handoff for a BLT submitted while building Present.
 ///
-/// This lives only in the 40-byte DMA private-data buffer allocated by dxgkrnl
-/// for each Helios context. It is not part of the Helios or virtio-gpu wire ABI.
+/// This lives only in the per-context DMA private-data buffer allocated by
+/// dxgkrnl ([`PRESENT_DMA_PRIVATE_DATA_BYTES`]). It is not part of the Helios
+/// or virtio-gpu wire ABI.
 /// The outer ring-1 fence denotes GPU completion of the recorded Vulkan copy;
 /// SubmitCommand uses it to retire the corresponding WDDM DMA fence exactly.
 #[repr(C)]
@@ -152,12 +365,34 @@ pub(crate) struct PresentAllocation {
     allocation_index: u32,
     slot_id: u32,
     driver_id: u32,
+    /// `DXGK_ALLOCATIONLIST::PhysicalAddress` — where VidMm has this
+    /// allocation right now.
+    ///
+    /// Carried because the DMA-BUFFER FLIP path has no other source for it.
+    /// On the MMIO-flip path `DxgkDdiSetVidPnSourceAddress` hands the driver
+    /// the primary address explicitly; in the DMA-flip contract that DDI is
+    /// never called, so the allocation list is the only place dxgkrnl states
+    /// the address that a later CRTC_VSYNC must match to retire the flip.
+    physical_address: u64,
+    /// `DXGK_ALLOCATIONLIST::SegmentId`, alongside the address for the same
+    /// reason.
+    segment_id: u32,
 }
 
 impl PresentAllocation {
     #[inline]
     pub(crate) fn handle(self) -> HANDLE {
         self.handle.as_ptr()
+    }
+
+    #[inline]
+    pub(crate) fn physical_address(self) -> u64 {
+        self.physical_address
+    }
+
+    #[inline]
+    pub(crate) fn segment_id(self) -> u32 {
+        self.segment_id
     }
 }
 
@@ -277,12 +512,20 @@ impl PresentAllocations {
             };
         }
 
-        let source_handle = unsafe {
-            (*allocation_list.add(DXGK_PRESENT_SOURCE_INDEX as usize)).hDeviceSpecificAllocation
-        };
-        let destination_handle = unsafe {
-            (*allocation_list.add(DXGK_PRESENT_DESTINATION_INDEX as usize))
-                .hDeviceSpecificAllocation
+        // SAFETY: both reads index the fixed WDK present slots of the array
+        // `PresentPayload::decode` validated, and the address/segment fields
+        // are plain data in the same entry as the handle.
+        let source_entry = unsafe { &*allocation_list.add(DXGK_PRESENT_SOURCE_INDEX as usize) };
+        let destination_entry =
+            unsafe { &*allocation_list.add(DXGK_PRESENT_DESTINATION_INDEX as usize) };
+        let source_handle = source_entry.hDeviceSpecificAllocation;
+        let destination_handle = destination_entry.hDeviceSpecificAllocation;
+        // `PhysicalAddress` and `VirtualAddress` are a union; this driver's
+        // present allocations are physically addressed (the GpuMmu model is
+        // decorative — see `gpummu.rs`), so the physical arm is the correct one.
+        let address_of = |entry: &DXGK_ALLOCATIONLIST| -> u64 {
+            // SAFETY: reading the PhysicalAddress arm of the address union.
+            unsafe { entry.__bindgen_anon_2.PhysicalAddress.as_ref().QuadPart as u64 }
         };
 
         Self {
@@ -291,12 +534,16 @@ impl PresentAllocations {
                 allocation_index: DXGK_PRESENT_SOURCE_INDEX,
                 slot_id: PATCH_SLOT_SOURCE,
                 driver_id: PATCH_SLOT_SOURCE,
+                physical_address: address_of(source_entry),
+                segment_id: source_entry.__bindgen_anon_1.SegmentId(),
             }),
             destination: NonNull::new(destination_handle).map(|handle| PresentAllocation {
                 handle,
                 allocation_index: DXGK_PRESENT_DESTINATION_INDEX,
                 slot_id: PATCH_SLOT_DESTINATION,
                 driver_id: PATCH_SLOT_DESTINATION,
+                physical_address: address_of(destination_entry),
+                segment_id: destination_entry.__bindgen_anon_1.SegmentId(),
             }),
         }
     }

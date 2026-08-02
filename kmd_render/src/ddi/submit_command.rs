@@ -289,8 +289,10 @@ pub(crate) unsafe fn signal_dma_completed(
 ) -> NTSTATUS {
     let last = guard.completed_fence();
     // Sequence comparison remains correct across u32 wrap: a forward id is
-    // within the next half of the sequence space; equal/backward is stale.
-    let forward = fence != last && fence.wrapping_sub(last) < 0x8000_0000;
+    // within the next half of the sequence space; equal/backward is stale. The
+    // predicate lives in `helios_kmd_logic` so the wrap arithmetic has a host
+    // test instead of only this comment.
+    let forward = helios_kmd_logic::scanout_lease::fence_is_forward(last, fence);
     if !forward {
         DMA_STALE_SKIP_COUNT.fetch_add(1, Ordering::Relaxed);
         return STATUS_SUCCESS;
@@ -387,6 +389,7 @@ fn note_and_maybe_signal(
         DMA_NOTIFY_FAILS.fetch_add(1, Ordering::Relaxed);
         return SubmitAck::Accepted;
     };
+    let overflows_before = crate::virtio::VirtioGpu::wddm_pending_overflows();
     adapter.with_wddm_notify_lock(|guard| {
         let signal_now = guard
             .with_virtio(|o, v| v.note_wddm_submission(o, fence, is_paging, gpu_completion_fence))
@@ -407,6 +410,14 @@ fn note_and_maybe_signal(
             }
         }
     });
+    // The pending FIFO overflowed and degraded to the immediate model, dropping
+    // every queued entry. Those entries were the only waiters on their scan-out
+    // leases, so release them now — outside the notify lock, because the lease
+    // state lives on the adapter and its release wakes the display worker.
+    // Loud (`LsTear` moves) and exact; not a timeout.
+    if crate::virtio::VirtioGpu::wddm_pending_overflows() != overflows_before {
+        adapter.release_all_scanout_leases(crate::ddi::scanout_trace::LeaseEnd::Teardown);
+    }
     SubmitAck::Accepted
 }
 
@@ -483,6 +494,67 @@ unsafe fn note_present_private_shape(
     );
 }
 
+/// Pick up a DMA-BUFFER FLIP record from a submission's private data and arm
+/// the scan-out programming for it.
+///
+/// This is the DMA-flip contract's equivalent of `SetVidPnSourceAddress`: for
+/// an IMMEDIATE flip dxgkrnl never calls that DDI, so unless the driver
+/// programs the display from HERE the scan-out never follows the flip at all
+/// (ROADMAP defect 0aa). Runs at DISPATCH; the programming itself is deferred
+/// to the PASSIVE display worker exactly as the MMIO path defers it, but with
+/// this flip's DMA fence still outstanding while it happens.
+///
+/// Mints this flip's PRESENTATION EPOCH before the handle is published to the
+/// display worker, so the worker can never bind a presentation whose epoch does
+/// not exist yet. The epoch no longer gates the submission's completion —
+/// 22.22.217.0 retired that withholding as measured inert — it is the
+/// bookkeeping the ownership gate on the flush executor decides with
+/// (ROADMAP defect 0ab-B).
+///
+/// # Safety
+/// `base`/`total` describe the kernel-only DMA private-data buffer dxgkrnl
+/// supplied for this submission.
+unsafe fn arm_dma_flip(adapter: &AdapterContext, base: *mut c_void, total: u32) {
+    let Some((h_alloc, primary_address, snapshot)) =
+        (unsafe { crate::ddi::present_packet::PresentFlipPrivate::take(base, total) })
+    else {
+        return;
+    };
+    // NOTE (0ab-B, 22.22.210.0): capturing the completion boundary HERE was
+    // tried and MEASURED NOT TO WORK. dxgkrnl submits a flip about a frame
+    // after the app presented, so `next_wire_fence` at this point already
+    // covers frame N+1 and the flush still waited a frame too long — the host
+    // trace showed it released 60 us before the NEXT flip's bind, every cycle.
+    // The boundary is captured at the present marker instead; see
+    // `arm_scanout_refresh_after_current_venus`.
+    //
+    // The epoch this flip presents under. It used to gate the flip's own DMA
+    // fence and the CRTC_VSYNC address; both halves were measured inert against
+    // the black frames (the 2×2 factorial, 46 681 frames) because the app's
+    // clear never travels in a WDDM DMA buffer and therefore waits on no
+    // completion this driver controls. It is minted here regardless, because the
+    // flush executor's ownership gate decides with it.
+    let epoch = adapter.mint_present_epoch();
+    if unsafe {
+        crate::ddi::display::arm_dma_flip_programming(
+            adapter,
+            h_alloc,
+            primary_address,
+            epoch,
+            snapshot,
+        )
+    } {
+        crate::ddi::scanout_trace::note_dma_flip_armed();
+        return;
+    }
+    // The handle could not be paired, so nothing will ever bind or flush this
+    // epoch. End its lease immediately, or `present_epoch` stays permanently
+    // ahead of `bound_epoch` and the ownership gate reads a presentation that
+    // can never arrive as one that is still coming (`VpPrF` counts the pairing
+    // failure itself).
+    adapter.end_scanout_leases_through(epoch, crate::ddi::scanout_trace::LeaseEnd::Cancelled);
+}
+
 unsafe fn decode_virtual_present_fence(submit: &DXGKARG_SUBMITCOMMANDVIRTUAL) -> Option<u64> {
     let base = submit.pDmaBufferPrivateData as *const u8;
     let total = submit.DmaBufferPrivateDataSize as usize;
@@ -532,15 +604,27 @@ unsafe fn diagnostic_scan_present_private(base: *const u8, total: usize) {
 /// Order one coalesced host refresh after every Venus command submitted before
 /// the UMD's marker. The guard required by `note_scanout_refresh` statically
 /// enforces the scheduler/transport lock order instead of relying on callers.
-fn arm_scanout_refresh_after_current_venus(adapter: &AdapterContext) {
-    let ready = adapter.with_wddm_notify_lock(|guard| {
-        guard
-            .with_virtio(|o, v| v.note_scanout_refresh(o))
-            .unwrap_or(false)
-    });
-    if ready {
-        adapter.request_scanout_refresh();
+/// `resource_id` is the allocation the present named, or 0 when the marker
+/// carries no identity. It travels with the watermark so the eventual flush
+/// names the frame this marker belongs to rather than whatever happens to be
+/// bound when it fires — see [`crate::virtio::gpu::VirtioGpu::note_scanout_refresh`].
+fn arm_scanout_refresh_after_current_venus(adapter: &AdapterContext, resource_id: u32) {
+    // Unsampled: what the app PRESENTED, against `Vs*` (what Windows asked us
+    // to bind) and `Ff*` (what we told the host to re-read). Atomics only, so
+    // it is legal on this DISPATCH-level path.
+    crate::ddi::scanout_trace::MARKER_HISTOGRAM.note(resource_id);
+    // …and whether the app was writing the buffer the host is DISPLAYING. See
+    // `scanout_trace::MARKER_WHILE_BOUND` for why that is the candidate
+    // mechanism for the remaining black-frame flashes (ROADMAP defect 0ab).
+    if resource_id != 0
+        && adapter
+            .active_scanout_resource
+            .load(core::sync::atomic::Ordering::Acquire)
+            == resource_id
+    {
+        crate::ddi::scanout_trace::note_marker_while_bound();
     }
+    let _ready = adapter.arm_present_marker_refresh(resource_id);
 }
 
 /// `DxgkDdiSubmitCommandVirtual` — submit a DMA buffer addressed by GPU virtual
@@ -577,6 +661,17 @@ pub unsafe extern "C" fn dxgkddi_submit_command_virtual(
     }
 
     let present_fence = unsafe { decode_virtual_present_fence(submit) };
+    // Before the completion bookkeeping: a flip carried in this buffer must be
+    // armed while its fence is still outstanding, which is the whole point of
+    // the DMA-flip contract. It also mints the presentation epoch and takes the
+    // frame boundary this flip carries to its bind.
+    unsafe {
+        arm_dma_flip(
+            adapter,
+            submit.pDmaBufferPrivateData,
+            submit.DmaBufferPrivateDataSize,
+        )
+    };
     // The submission is accepted regardless of how the notification went; a
     // non-SUCCESS return here bugchecks dxgmms2 with 0x119 Arg1=2.
     let SubmitAck::Accepted = note_and_maybe_signal(adapter, fence, is_paging, present_fence);
@@ -610,6 +705,13 @@ pub unsafe extern "C" fn dxgkddi_submit_command(
     }
 
     let present_fence = unsafe { decode_legacy_present_fence(submit) };
+    unsafe {
+        arm_dma_flip(
+            adapter,
+            submit.pDmaBufferPrivateData,
+            submit.DmaBufferPrivateDataSize,
+        )
+    };
     // As above: accepted regardless of the notification outcome.
     let SubmitAck::Accepted = note_and_maybe_signal(adapter, fence, is_paging, present_fence);
     STATUS_SUCCESS
@@ -666,6 +768,13 @@ pub(crate) fn abandon_pending_submissions(
     adapter: &AdapterContext,
     outcome: AbandonOutcome<'_>,
 ) -> (u32, NTSTATUS) {
+    // Every dropped fence was the only waiter on its scan-out presentation
+    // lease. Release them all: a lease whose waiter has been discarded would
+    // gate the NEXT presentation on a read nobody is accounting for. Done
+    // BEFORE the critical section, because ending a lease publishes any withheld
+    // primary address and signals the display worker, and neither belongs
+    // inside a DISPATCH notification lock.
+    adapter.release_all_scanout_leases(crate::ddi::scanout_trace::LeaseEnd::Teardown);
     adapter.with_wddm_notify_lock(|guard| {
         let dropped = guard.with_virtio(|o, v| v.preempt_flush(o)).unwrap_or(0);
         if dropped != 0 {
@@ -822,17 +931,37 @@ pub unsafe extern "C" fn dxgkddi_render(
             // traversal, checked once, in the module that owns the fields.
             let context = unsafe { crate::device::ContextHandleRef::from_raw(h_context) };
             if let Some(adapter) = context.as_ref().and_then(|c| c.adapter()) {
-                arm_scanout_refresh_after_current_venus(adapter);
+                // HERF carries no resource identity: it is the generic
+                // "the bound target is dirty" edge, so it arms with 0 and the
+                // flush resolves the bound resource as before.
+                arm_scanout_refresh_after_current_venus(adapter, 0);
             }
         }
     }
 
-    if cmd_len >= size_of::<helios_protocol::HeliosPresentRenderCmd>() {
+    // `HeliosPresentRenderCmd` grew 48 -> 56 B when the D4b snapshot appended
+    // `venus_alloc_size` to its embedded `HeliosPresentPrivateData` (prefix-
+    // compatible: nothing before it moved). Decode from the 48-byte PREFIX,
+    // which covers everything the MARKER arm consumes — `is_valid()`
+    // (magics/versions/resid) and `present.resource_id` — so a pre-snapshot
+    // UMD's 48-byte command still arms the marker; the appended tail reads as
+    // zero then, and only the snapshot STASH arm below consults it, gated on
+    // full 56-byte coverage. On a substituted present `resource_id` already
+    // IS the snapshot resid (by design — that is what keys the frame
+    // watermark to the bound identity).
+    const PRESENT_RENDER_CMD_PREFIX: usize =
+        core::mem::offset_of!(helios_protocol::HeliosPresentRenderCmd, present)
+            + core::mem::offset_of!(helios_protocol::HeliosPresentPrivateData, venus_alloc_size);
+    if cmd_len >= PRESENT_RENDER_CMD_PREFIX {
+        let take = cmd_len.min(size_of::<helios_protocol::HeliosPresentRenderCmd>());
+        let mut raw = [0u8; size_of::<helios_protocol::HeliosPresentRenderCmd>()];
+        // SAFETY: the runtime guarantees `CommandLength` readable bytes at
+        // `pCommand`; `take` never exceeds it or the local buffer.
+        unsafe {
+            core::ptr::copy_nonoverlapping(args.pCommand as *const u8, raw.as_mut_ptr(), take);
+        }
         let command = unsafe {
-            core::ptr::read_unaligned(
-                args.pCommand
-                    .cast::<helios_protocol::HeliosPresentRenderCmd>(),
-            )
+            core::ptr::read_unaligned(raw.as_ptr().cast::<helios_protocol::HeliosPresentRenderCmd>())
         };
         if command.is_valid() {
             static PRESENT_RENDER_DIAG_COUNT: AtomicU32 = AtomicU32::new(0);
@@ -844,6 +973,42 @@ pub unsafe extern "C" fn dxgkddi_render(
             } else {
                 let context = unsafe { crate::device::ContextHandleRef::from_raw(h_context) };
                 let adapter = context.as_ref().and_then(|c| c.adapter());
+                // D4b: the RENDER command is the descriptor's DELIVERY ROUTE.
+                // dxgkrnl never forwards the UMD's PresentCb private data to
+                // DxgkDdiPresent on flip presents (PBIdOk = "no payload"
+                // across three driver generations), so a flagged descriptor
+                // is STASHED on the context here and taken by the Present
+                // that follows it on this same context/thread
+                // (`ContextHandleRef::take_snapshot_stash` holds the pairing
+                // and orphan contract). Trusted only when the command covers
+                // the full 56-byte form — the 48-byte prefix decode above can
+                // legitimately carry the flag bit while the appended
+                // `venus_alloc_size` was never written.
+                if command.present.reserved
+                    & helios_protocol::HELIOS_PRESENT_PRIVATE_FLAG_SNAPSHOT
+                    != 0
+                {
+                    if take >= size_of::<helios_protocol::HeliosPresentRenderCmd>() {
+                        if let Some(context) = context.as_ref() {
+                            context.stash_snapshot(
+                                &helios_kmd_logic::snapshot_bind::SnapshotDescriptor {
+                                    resource_id: command.present.resource_id,
+                                    width: command.present.width,
+                                    height: command.present.height,
+                                    pitch: command.present.pitch,
+                                    dxgi_format: command.present.dxgi_format,
+                                    plane_offset: command.present.plane_offset,
+                                    venus_alloc_size: command.present.venus_alloc_size,
+                                },
+                            );
+                        }
+                    } else {
+                        // Flagged without coverage of the appended field: the
+                        // descriptor cannot be trusted, so the present binds
+                        // the flipped allocation — counted, never silent.
+                        crate::ddi::scanout_trace::note_snapshot_fallback();
+                    }
+                }
                 if adapter.is_none() {
                     if diag {
                         crate::diag::record_named_bytes(b"PRset", 0xE2);
@@ -854,13 +1019,18 @@ pub unsafe extern "C" fn dxgkddi_render(
                         crate::diag::record_named_bytes(b"PRsrc", private.resource_id);
                         crate::diag::record_named_bytes(b"PRset", 2);
                     }
-                    // DxgkDdiPresent selects the exact source from
-                    // dxgkrnl's allocation list. This command is only the
-                    // completion/dirty edge for the Venus work submitted
-                    // before pfnPresentCb; its private bytes are not a second
-                    // scanout selector.
+                    // DxgkDdiPresent still selects the exact source from
+                    // dxgkrnl's allocation list -- these private bytes are NOT
+                    // a second scanout selector, and nothing here binds.
+                    //
+                    // They ARE the frame's identity, and that is a different
+                    // question the driver previously had no answer to. Passing
+                    // it makes the dirty edge name the buffer it belongs to, so
+                    // the flush cannot land on the previous buffer (stale) or
+                    // on one the flip has advanced to but the app has not yet
+                    // rendered (black).
                     if let Some(adapter) = adapter {
-                        arm_scanout_refresh_after_current_venus(adapter);
+                        arm_scanout_refresh_after_current_venus(adapter, private.resource_id);
                     }
                 }
             }

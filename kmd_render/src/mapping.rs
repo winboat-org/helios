@@ -40,6 +40,15 @@ use core::sync::atomic::{AtomicU32, Ordering};
 /// map-and-hold refused at exactly held=33 with 0xC000009A).
 const MAX_MAPPINGS: usize = 8192;
 
+/// Pseudo resource id tagging the D4a read-ledger page mapping
+/// (`HELIOS_ESCAPE_MAP_READ_LEDGER`) in this table. The ledger page is not a
+/// virtio blob, but its user view has exactly a blob mapping's lifetime
+/// obligations (unmap in the creating process before it dies, or bugcheck
+/// 0x76), so it rides the same owner-keyed reclaim. Cannot collide with a real
+/// id: venus resource ids are assigned monotonically from 1 and a boot cannot
+/// mint 2^32 of them.
+pub const READ_LEDGER_MAPPING_ID: u32 = u32::MAX;
+
 /// `insert` refusals because the table was at capacity (each one is a failed
 /// user MAP_BLOB — loud-failure rule; reported via QUERY_STATS v2).
 pub static MAPPING_FULL_REJECTS: AtomicU32 = AtomicU32::new(0);
@@ -164,6 +173,18 @@ impl MappingTable {
     /// Current live-mapping count (QUERY_STATS v2).
     pub fn live(&self) -> u32 {
         self.entries.lock().len() as u32
+    }
+
+    /// The recorded user VA for `(owner, resource_id)`, if one is live. The
+    /// repeat-MAP answer for the read-ledger escape: same VA back, no second
+    /// view, no table growth on repeats.
+    pub fn find_user_va(&self, owner: usize, resource_id: u32) -> Option<u64> {
+        self.entries
+            .lock()
+            .as_slice()
+            .iter()
+            .find(|m| m.owner == owner && m.resource_id == resource_id)
+            .map(|m| m.user_va)
     }
 
     /// Pop up to `out.len()` of `owner`'s mappings per acquisition, returning how

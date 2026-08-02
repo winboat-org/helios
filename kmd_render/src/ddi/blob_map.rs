@@ -15,7 +15,7 @@ use core::mem::size_of;
 use helios_protocol::{
     VIRTIO_GPU_MAP_CACHE_CACHED, VIRTIO_GPU_MAP_CACHE_UNCACHED, VIRTIO_GPU_MAP_CACHE_WC,
 };
-use wdk_sys::ntddk::{IoAllocateMdl, IoFreeMdl, MmUnmapLockedPages};
+use wdk_sys::ntddk::{IoAllocateMdl, IoFreeMdl, MmBuildMdlForNonPagedPool, MmUnmapLockedPages};
 use wdk_sys::{_MEMORY_CACHING_TYPE, MDL, PMDL, PVOID, ULONG};
 
 extern "C" {
@@ -47,6 +47,10 @@ const MDL_IO_SPACE: i16 = 0x0800;
 const NORMAL_PAGE_PRIORITY: u32 = 16;
 /// `MdlMappingNoExecute` — map the user view non-executable (data-only blob).
 const MDL_MAPPING_NO_EXECUTE: u32 = 0x4000_0000;
+/// `MdlMappingNoWrite` — map the user view READ-ONLY. The D4a read-ledger page
+/// is KMD-written truth a process only observes; a writable view would let any
+/// mapper forge `retired` bumps and unwedge/rewedge other processes' waits.
+const MDL_MAPPING_NO_WRITE: u32 = 0x8000_0000;
 /// `UserMode` (`KPROCESSOR_MODE`) — map into the calling user process.
 const USER_MODE: i8 = 1;
 
@@ -124,11 +128,65 @@ pub unsafe fn map_io_pages_to_user(
     Some((va as u64, mdl))
 }
 
-/// Unmap a user-space blob mapping made by [`map_io_pages_to_user`] and free its MDL.
+/// Map a KMD-owned NONPAGED page (the D4a read ledger,
+/// `MmAllocateContiguousMemory`-backed) into the CURRENT process, READ-ONLY.
+/// Returns `(user_va, mdl)`.
+///
+/// The sibling of [`map_io_pages_to_user`] for real RAM: these pages HAVE PFN
+/// database entries, so the MDL comes from `MmBuildMdlForNonPagedPool` (which
+/// fills the PFN array and marks the MDL nonpaged-source) rather than from the
+/// hand-populated `MDL_IO_SPACE` path — `MDL_IO_SPACE` exists precisely to
+/// bypass the PFN database, which for RAM would skip the mapping bookkeeping
+/// that IS present. Cached, because the KMD writes the page with ordinary
+/// cached stores; `MDL_MAPPING_NO_WRITE` because the page is KMD-written truth
+/// (see the constant's doc).
+///
+/// # Safety
+/// PASSIVE_LEVEL, in the target process's context, holding no spinlock. `va`
+/// must be a page-aligned nonpaged kernel allocation of at least `size` bytes
+/// (`size` page-aligned, <= `u32::MAX`) that outlives the mapping — the D4a
+/// page is freed only in `AdapterContext::drop`, after every device (and with
+/// it every mapping) is gone. Teardown pairs with [`unmap_io_pages_from_user`].
+pub unsafe fn map_nonpaged_page_to_user_readonly(va: *mut u8, size: u64) -> Option<(u64, PMDL)> {
+    // SAFETY: a real VirtualAddress + Length; the MDL header describes `va`.
+    let mdl = IoAllocateMdl(
+        va as PVOID,
+        size as ULONG,
+        0, // SecondaryBuffer = FALSE
+        0, // ChargeQuota = FALSE
+        core::ptr::null_mut(),
+    );
+    if mdl.is_null() {
+        return None;
+    }
+    // SAFETY: `va` is nonpaged system memory per this function's contract, so
+    // the routine can resolve every PFN without faulting.
+    MmBuildMdlForNonPagedPool(mdl);
+    let priority = NORMAL_PAGE_PRIORITY | MDL_MAPPING_NO_EXECUTE | MDL_MAPPING_NO_WRITE;
+    // SAFETY: valid populated MDL; UserMode map into the current process. The
+    // SEH shim converts the UserMode failure raise into NULL (same trap as the
+    // blob path: an unshimmed raise here is a bugcheck reachable from any
+    // process via D3DKMTEscape).
+    let user_va = helios_mm_map_locked_pages_user_seh(
+        mdl,
+        USER_MODE,
+        _MEMORY_CACHING_TYPE::MmCached as i32,
+        priority,
+    );
+    if user_va.is_null() {
+        IoFreeMdl(mdl);
+        return None;
+    }
+    Some((user_va as u64, mdl))
+}
+
+/// Unmap a user-space mapping made by [`map_io_pages_to_user`] or
+/// [`map_nonpaged_page_to_user_readonly`] and free its MDL.
 ///
 /// # Safety
 /// Must run at PASSIVE_LEVEL in the SAME process the mapping was created in;
-/// `user_va`/`mdl` must be a pair returned by `map_io_pages_to_user`, not yet unmapped.
+/// `user_va`/`mdl` must be a pair returned by one of the two mappers, not yet
+/// unmapped.
 pub unsafe fn unmap_io_pages_from_user(user_va: u64, mdl: PMDL) {
     MmUnmapLockedPages(user_va as PVOID, mdl);
     IoFreeMdl(mdl);

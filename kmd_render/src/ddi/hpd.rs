@@ -208,6 +208,13 @@ pub unsafe extern "C" fn hpd_thread_routine(context: *mut c_void) {
         if (wait_status == STATUS_TIMEOUT && ctrl_inflight)
             || (adapter.scanout_flush_inflight.load(Ordering::Acquire) != 0
                 && adapter.scanout_refresh_pending.load(Ordering::Acquire) != 0)
+            // A presentation lease ended somewhere that could not pop the WDDM
+            // pending FIFO itself — the used-ring drain holds `virtio_lock`, and
+            // taking `wddm_notify_lock` under it inverts the driver's lock order
+            // (ROADMAP defect 0ab-B). This is that work's PASSIVE home, and it
+            // is a real edge rather than a poll: the same store that sets the
+            // flag signals the event we just woke on.
+            || adapter.scanout_retire_wanted.swap(0, Ordering::AcqRel) != 0
         {
             crate::ddi::interrupt::drain_used_and_complete(adapter);
         }
@@ -223,6 +230,13 @@ pub unsafe extern "C" fn hpd_thread_routine(context: *mut c_void) {
         // Venus waits nor registry diagnostics are legal; this worker is the
         // PASSIVE continuation for that exact callback.
         crate::ddi::display::process_deferred_vidpn_source_address(passive, adapter);
+
+        // Publish the unsampled scanout-bind trace. This is the ONE PASSIVE
+        // site that mirrors it; accumulation happens at DIRQL/DISPATCH with
+        // atomics only. Throttled inside `dump_periodic` — a dump is ~120
+        // registry writes, so it must never run per frame. Placed after the
+        // deferred programming so a dump reflects the bind that just ran.
+        crate::ddi::scanout_trace::dump_periodic(adapter);
 
         // T6/R901 deleted the `ScanoutDiag` forced-rebind experiment that used
         // to run here. T1a had already moved it off
@@ -286,6 +300,12 @@ pub unsafe extern "C" fn hpd_thread_routine(context: *mut c_void) {
                 ScanoutRefreshQueue::Unavailable => {
                     crate::ddi::display::SC_UNAVAILABLE.fetch_add(1, Ordering::Relaxed);
                 }
+                // The ownership gate refused this edge (ROADMAP defect 0ab-B).
+                // Deliberately NOT re-armed: re-arming would reissue the same
+                // refused flush every wakeup, and the whole argument for the
+                // drop is that a better-timed publisher exists — the incoming
+                // buffer's own bind edge. Censused as `OgIdn`/`OgEpo`.
+                ScanoutRefreshQueue::Dropped => {}
             }
         }
 

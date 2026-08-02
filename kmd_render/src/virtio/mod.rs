@@ -21,7 +21,12 @@ pub mod hal;
 pub mod pci_caps;
 pub mod venus;
 
-pub use gpu::{ScanoutNotify, VirtioGpu};
+// `gpu::CompletedBind` is deliberately NOT re-exported: its only consumer names
+// it through inference (`take_completed_bind`), and an unused re-export is a
+// warning in a crate that keeps its build clean.
+pub use gpu::{
+    FastBindRefusal, ScanoutBindRequest, ScanoutFlushToken, ScanoutNotify, VirtioGpu, WddmTake,
+};
 
 use wdk_sys::{
     NTSTATUS, STATUS_DEVICE_BUSY, STATUS_INSUFFICIENT_RESOURCES, STATUS_INVALID_DEVICE_REQUEST,
