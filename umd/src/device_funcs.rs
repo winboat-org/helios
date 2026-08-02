@@ -646,11 +646,26 @@ unsafe extern "C" fn ddi_calc_size(_a: usize) -> usize {
     256
 }
 
+/// Relocate traffic is HOT under command lists: the runtime relocates the
+/// device table TWICE PER pfnCommandListExecute (measured 1,585,160 calls ≈
+/// 2 × 792k executes in one Fire Strike run), so the per-call log line was
+/// ~9k mutex-serialized file writes per second on the render thread — the
+/// exact cost class T2 measured and removed. The refill itself is a few
+/// hundred slot writes and stays; only the I/O is throttled.
+static RELOCATE_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+fn relocate_log(tag: &str) {
+    let n = RELOCATE_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+    if n < 8 || n % 65536 == 0 {
+        log_error!("DDI RelocateDeviceFuncs({tag}) (x{})", n + 1);
+    }
+}
+
 unsafe extern "C" fn ddi_relocate_device_funcs(
     _h_device: ddi::D3D10DDI_HDEVICE,
     funcs: *mut ddi::D3D11DDI_DEVICEFUNCS,
 ) {
-    log_error!("DDI RelocateDeviceFuncs(D3D11)");
+    relocate_log("D3D11");
     if !funcs.is_null() {
         fill_d3d11_device_funcs(funcs);
     }
@@ -660,7 +675,7 @@ unsafe extern "C" fn ddi_relocate_device_funcs_11_1(
     _h_device: ddi::D3D10DDI_HDEVICE,
     funcs: *mut ddi::D3D11_1DDI_DEVICEFUNCS,
 ) {
-    log_error!("DDI RelocateDeviceFuncs(D3D11.1)");
+    relocate_log("D3D11.1");
     if !funcs.is_null() {
         fill_d3d11_1_device_funcs(funcs);
     }
@@ -670,7 +685,7 @@ unsafe extern "C" fn ddi_relocate_device_funcs_wddm1_3(
     _h_device: ddi::D3D10DDI_HDEVICE,
     funcs: *mut ddi::D3DWDDM1_3DDI_DEVICEFUNCS,
 ) {
-    log_error!("DDI RelocateDeviceFuncs(WDDM1.3)");
+    relocate_log("WDDM1.3");
     if !funcs.is_null() {
         fill_wddm1_3_device_funcs(funcs);
     }
