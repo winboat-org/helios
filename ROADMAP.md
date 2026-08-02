@@ -1257,6 +1257,57 @@ registered in advance (`PREDICTIONS.md`) and scored.
   D3D11DeferredContext, each knob-gated):
   `tmp/handoff-perf-structural/PLAN-commandlists.md`. DXVK fork and cxx
   bridge need ZERO changes — the work is entirely in `umd/src`.
+  **Phase A LANDED (`ed7efe1`, thread-safe forward layer) and Phase B
+  LANDED (`b47bdd4`, FREETHREADED behind `UmdFreeThreaded`, absent=ON).**
+  First Phase B canonical run: GT1 190.92 / GT2 208.92 / Combined 25.25 /
+  Physics 112.11 — GT2 +3.4 % on the tight metric, GT1+Combined at/above
+  the historical best, all gates green. (Standard-preset scores are
+  display-mode-independent — owner-confirmed; comparable to baseline
+  directly. Owed: 3-run median + optional UmdFreeThreaded=0 knob A/B for
+  attribution, cold-boot gate.)
+  **Phase C LANDED AND MEASURED (67th session, 2026-08-03): NEGATIVE on
+  GT1/GT2, POSITIVE on Combined — knob stays default OFF.** Full DC/CL
+  DDI surface (tag-discriminated HDEVICE namespace, context-local handle
+  copies, BUILD_2 recycle flow → DXVK's stock D3D11DeferredContext)
+  landed in `2fccb5c`+`9fbeeb6`+`fa1d75b` behind `UmdCommandLists`
+  (bring-up default OFF; requires UmdFreeThreaded). Same-boot A/B:
+  ON = GT1 49 / GT2 144 / Combined 28.6–31.2; OFF = GT1 184.7 / GT2 210.6 /
+  Combined 25.3–26.7 (= the Phase B 3-run baseline GT1 184.23 / GT2
+  209.65 / Comb 25.01, so environment+ICD exonerated). The replay share
+  DID move off the render thread (d3d11.dll 42.5 %→3.4 % of samples) and
+  submits are EQUAL (AsSub 110.7k vs 115.1k — no flush storm); the loss
+  is DXVK's constant per-CL costs on the single dxvk-cs consumer at the
+  runtime's granularity (GT1 942k, GT2 2.66M FinishCommandList cycles
+  per run; recorded trailing state reset in EVERY CL; double reset +
+  chunk flush per execute; render thread 47 % parked on CS
+  backpressure). Numbers, scored predictions and the identified next
+  lever (make DXVK per-CL costs content-proportional — fork changes now
+  in scope): `tmp/handoff-perf-structural/reports/p2-phase-c-outcome.md`.
+  ⚠ Two host-stack robustness defects found en route (WS1):
+  `tmp/xid109-evidence/INCIDENT.md` — a venus worker can wedge inside the
+  NVIDIA driver and QEMU's virtio-gpu serializes behind it forever (all
+  contexts starve; one instance drew an Xid-109), and worker death is not
+  handled as context-loss. Hit 2× on 2026-08-03 during 3DMark
+  probe/loading phases, then 2 clean runs — timing-sensitive.
+  **67th session: wedge #3 captured LIVE with debuginfod symbols and the
+  wedge class FIXED guest-side** — the ring thread was executing the
+  guest's async `vkWaitSemaphores(UINT64_MAX)` (Mesa venus upstream's
+  feedback race-closer) inside the NVIDIA driver for a channel NVRM had
+  already Xid-killed; stock virglrenderer passes the guest timeout
+  verbatim, so bounding it guest-side frees the ring. icd/mesa
+  `f0c7bcd3465` (`VN_HELIOS_RING_WAIT_BOUND_MS`, default 8000);
+  4 subsequent FS runs, zero wedges/Xids; A/B-proven perf-neutral.
+  Evidence: `tmp/xid109-evidence/wedge3/WEDGE3.md`. Still open (WS1):
+  QEMU treating worker death as context-loss, and the Xid trigger if it
+  recurs with the bound in place.
+  **NEW WS1 watch item (67th): `ScStale` ≈ 4,000/run under FS (23 % of
+  18k flips; ScUnav ~10/run) — PRE-EXISTING load signature, masked until
+  now because every historical gate check followed a counter-zeroing
+  device restart.** The KMD's ticketed gate-clear refusal handles it
+  (display correct, scores normal), but `adapter/mod.rs`'s "interleave
+  does not occur today" invariant is falsified under FS flip load. The
+  kmd-gate-surface must-be-zero list needs a policy answer (expected-
+  under-load vs defect) before the next KMD tranche.
 
 ## Workstream 1 — Stability
 
