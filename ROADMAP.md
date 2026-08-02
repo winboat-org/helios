@@ -1811,6 +1811,23 @@ Open defects, roughly ordered:
 
 ## Workstream 2 — Performance
 
+- **THE FRAME IS ATTRIBUTED (2026-08-02, 65th session, measurement-only):
+  GT1 is guest render-thread bound; the host GPU idles at ~35 % busy
+  (~200 W of 400 W) and NOTHING else in the pipeline is saturated** —
+  venus decode thread 36 % of a core (decode-saturation KILLED), QEMU main
+  loop 13 %, dxvk-queue/cs/submit 38/24/6 %, no vCPU over ~70 %. The app's
+  render thread runs 88–93 % and RIP+stack sampling (no build; PDB-symbolized)
+  decomposes it: ~8 % COM refcount churn (samplers alone 5.6 % — R8 is real),
+  ~6.5 % DXVK CS chunk-pool mutex contention (`AllocCsChunk` parks),
+  ~5.4 % DxvkMemoryAllocator on the Map-DISCARD path, ~5.1 % heap, 5.6 %
+  d3d11-runtime device-critsec contention under `CUseCountedObject::Release`
+  (named via MS public PDBs — msdl is curl-reachable, recipe in the report),
+  3.6 % frame gate (contract), 1.2 % log.rs with tracing off. Wire path is µs-class (submit 40 µs,
+  escape ~100 µs, retire 0.75 ms). Full report + ranked levers:
+  `tmp/handoff-perf-saturation/reports/p1-attribution.md`; raw artifacts in
+  `tmp/handoff-perf-saturation/logs/`; the samplers (reusable) in
+  `tmp/handoff-perf-saturation/tools/`.
+
 - **OPEN (2026-07-26, found while taking the T0 baseline): DComp cadence ~50 fps, not the
   documented ~63; present-gate avg ~2.0 ms, not the documented ~0.48 ms.** Measured on an
   idle box (CPU ~1 %) with `helios_dcomp_probe` (25 s runs): 1236 / 1152 / 1253 frames
