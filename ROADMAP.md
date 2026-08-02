@@ -102,14 +102,73 @@ virtio-gpu scanout; IddCx/Looking Glass is no longer the active display path.*
    - **WS1 defect 0z** — `pnputil /restart-device` access-violates dwm,
      Explorer, SearchHost and ApplicationFrameHost inside
      `vulkan_virtio-*.dll`. Pre-existing, reproduced on every restart.
+   - ~~**WS1 defect 0aa** — fullscreen scan-out pinned to ONE resource~~ —
+     **ROOT-CAUSED AND FIXED 2026-07-29** (KMD 22.22.201.0), host-verified.
+   - **WS1 defect 0ab — black-frame flashes. SPLIT IN TWO 2026-07-29, one half
+     FIXED, one half OPEN.** First measured directly on the displayed surface
+     (VNC RFB sampler + QEMU trace, both on the host clock) instead of inferred.
+     - **0ab-A — the bind-edge RESOURCE_FLUSH was submission-ordered**, firing
+       ~10 ms before the frame it named finished on the host, so the host read
+       the frame's clear. **FIXED, KMD 22.22.206.0**: Fire Strike Combined
+       (23 fps) unfinished displayed frames **22.0 % → 0.7 %**.
+     - **0ab-B — at ~165 fps (GT1 fullscreen) the flashes REMAIN**: ~15 % of
+       published frames are entirely black in EVERY configuration we own. Five
+       mechanisms built, deployed, falsified; then a same-boot **2×2 factorial**
+       (lease × BindFlushMode, 9 runs, 46 681 frames, 2026-07-29 evening) closed
+       the whole ordering family WITH data: whole-flush black is 14.5–16.6 % in
+       all four cells, and the knobs only move black between populations
+       (bind-triggered first reads vs surplus refresh re-reads). **The mechanism
+       is now PROVEN, not inferred**: the first read of a binding — the very
+       event that ends its lease — finds the buffer already cleared 13–17 % of
+       the time under a live lease gate, which no WDDM release chain can permit.
+       The app's clear rides venus and never enters a DMA buffer, so the
+       scheduler-side allocation sync that real flip-model relies on to defer it
+       DOES NOT EXIST in this stack. The one variable that predicts black is
+       bind→read age (<3 ms ⇒ 0.4–5.6 %; 6–12 ms ⇒ 34–60 %).
+       **FIX SHIPPED — KMD 22.22.217.0 (owner-approved D1+D2+D3, 2026-07-29
+       late evening): GT1 whole-flush black 14.5–16.6 % → 2.1 / 0.7 / 2.0 %**
+       (age-standardised 2.2/0.9/2.0 — not an age-mix artifact), fps 169–186
+       (UP: 25–33 % fewer synchronous host readbacks), Combined 0ab-A gate
+       PASS (1.3 %, completion ordering intact), desktop 1:1 binds:flushes,
+       Start menu opens, windowed-app coexistence verified, `WvTorn` 0.
+       The win is the OWNERSHIP GATE (D2): the 34–49 %-black 2nd-read
+       population (1090–1669/run) collapsed to 9–26; the 6–12 ms bucket kept
+       its flush share but went 56 % → 0.5 % black — the wrong reads stopped
+       being issued, not the timing. See the build-1 subsection below +
+       `tmp/handoff-0ab-b-lease/analysis/build1-results.md`.
+       **OWNER-CONFIRMED BY EYE 2026-07-29 late night: GT1 visually clean,
+       overall Fire Strike >25k (was ~20k). 0ab-B's main population is
+       CLOSED.**
+     - **0ab-C — residual black-frame stuttering in GRAPHICS TEST 2 at
+       ~210 fps. CLASSIFIED 2026-07-29/30: the first-publish bind-edge margin
+       race (population (a)), the exact population build 1 left open.** Two
+       oracle GT2 runs on .217: whole-flush black 7.3 %/6.0 % (GT1 post-fix
+       0.7–2.1 %), all first reads at 1–3 ms bind age; the ownership gate
+       holds unchanged (6–12 ms bucket 0.2–0.4 %, rereads ~1 %). Guest half:
+       worker bind cadence bimodal (1–3 ms vs 10–14 ms stall modes),
+       `BeOvw` ×~30 GT1's rate. Minorities: 0ad's transition window
+       (~12–23 %), coalesce-holds (dup 3–5 %). **Fix arc = the D1(ii)
+       DISPATCH-bind family, four builds in one night**: .218 bugchecked (a
+       PRE-EXISTING `wait_block` TOCTOU the new load armed — root-caused
+       from dumps, fixed in .219, three clean batteries since); .219 halved
+       GT2 black (4.0/3.4 %); .220/.221 closed the fast-path coverage gap to
+       99 % and thereby PROVED the GT2 residual is not bind timing (x = y;
+       0/439 black at 0–1 ms bind age — the venus-executed clear lands in
+       the READ window). **GT1's residual was eliminated outright
+       (1.9 → 0.3 %, best recorded). SHIPPING: 22.22.221.0. GT2 residual
+       ~3.5–4 % needs D4 (venus acquire, owner-gated). 0ab-C = reduced, not
+       closed; owner's eye pending.** Corpus:
+       `tmp/handoff-0ab-c-gt2/analysis/{CLASSIFICATION,FIX-DESIGN-d1ii,BUGCHECK-0xA-218,build219-results,build220-results,build221-results}.md`.
 
-   ⚠ **Two standing gate lines are NOT OBTAINABLE on this box** and should not
-   be retried as written: **suspend/resume** (`powercfg /a` reports every sleep
-   state unsupported by the VM firmware — which also means the same-context PnP
-   stop/start carry-over path, `StRst`/`RfUnb`, can never be provoked here),
-   and **same-boot QEMU scanout evidence** (the VM runs `HELIOS_DISPLAY=sdl`,
-   so the host readback path is never driven; it needs an owner-run relaunch
-   with `HELIOS_DISPLAY=egl-vnc`).
+   ⚠ **One standing gate line remains NOT OBTAINABLE on this box** and should
+   not be retried as written: **suspend/resume** (`powercfg /a` reports every
+   sleep state unsupported by the VM firmware — which also means the
+   same-context PnP stop/start carry-over path, `StRst`/`RfUnb`, can never be
+   provoked here). The other one — **same-boot QEMU scanout evidence** — is
+   RESOLVED: since 2026-07-29 the VM runs `HELIOS_DISPLAY=egl-vnc` and the
+   per-flush oracle (`tools/qmp_trace.py` + `tools/scanout_oracle_report.py`)
+   provides it routinely; verify with `/proc/<qemu>/cmdline` before relying
+   on it.
 
 
 2. Continue soaking the current direct-primary path across DWM buffer rotation,
@@ -198,6 +257,992 @@ conflict.
    correctly). Measure first (venus submit/fence latency, copy/acquire gates,
    present-to-scanout) then remove known costs. See WS2 for the levers already
    mapped (feedback-shadow retire, dcomp vehicle, copy-latency).
+
+## Fullscreen scan-out — 0aa FIXED, 0ab STILL OPEN (2026-07-29, KMD 22.22.201.0)
+
+⚠ **0aa is fixed and host-verified; the owner still sees black-frame FLASHES
+(defect 0ab).** Do not read the two fixes below as closing the visible
+artifact. What they closed is measurable and closed; what remains has a
+different shape (brief, frequent flashes vs a lasting stale frame) and is
+recorded at the end of this section.
+
+
+**Symptom.** With a fullscreen D3D11 app, the guest published ONE scan-out
+resource to the host for the whole run, at the app's frame rate, with ZERO
+`SET_SCANOUT_BLOB`; the desktop before and after rotated a three-buffer chain
+with a blob per flip. Owner saw black frames, "some for longer". Five sessions
+of inference produced four wrong mechanisms; one run of an UNSAMPLED instrument
+named the cause.
+
+**The instrument comes first.** `kmd_render/src/ddi/scanout_trace.rs` separates
+accumulation (unsampled, atomics-only, legal at any IRQL, every call recorded)
+from publication (one throttled PASSIVE dump). Read it with
+`tmp/perf/scanout-trace.ps1`; run a workload with it via
+`tmp/perf/run-gt1-trace.ps1`. Host side: `virtio_gpu_cmd_*` over QMP
+(`/tmp/helios-tpm/mon.sock`) — see the recipe in the 57th-session memory.
+Every `Sc*`/`Rf*`/`PB*` value is SAMPLED (1st + every 600th) and registry values
+persist across boots; that is what produced the four wrong mechanisms.
+
+**Root cause 1 — the bind was never asked to move.** `DXGK_FLIPCAPS` advertised
+`FlipOnVSyncMmIo` only, which covers nonzero-interval flips. Measured: DWM
+presents at `FlipInterval=1` with `pDmaBuffer == NULL` (the MMIO contract,
+which dxgkrnl completes through `SetVidPnSourceAddress`); a fullscreen app
+presents at `FlipInterval=0` (IMMEDIATE) with a DMA buffer — the DMA-buffer
+flip contract, where the driver must program the display itself, and which
+`SetVidPnSourceAddress` never follows. `DXGKARG_PRESENT.Flags` is IDENTICAL
+(`Flip|FlipWithNoWait`) in both cases, so the flags are not the discriminator —
+the flip interval is. 839 flips in one run, 0 MMIO, 0 blobs,
+`SetVidPnSourceAddress` silent for 36 s. **Fix: also advertise
+`FlipImmediateMmIo`** — honest, because a Helios flip IS a `SET_SCANOUT_BLOB`
+and has no vblank to wait for. `FlipCapsX` (service key, default 0) overrides
+the whole word; `FlipCapsX=2` restores the old advertisement for an A/B.
+
+**Root cause 2 — a bind is itself a dirty edge.** `SET_SCANOUT_BLOB` changes
+which resource the host reads; it does not make the host read it. The zero-copy
+arm deliberately produced no dirty edge ("the matching Render marker and
+used-ring retirement are the sole producers"), which was true only while the
+bind never moved. Once it rotated per flip, a freshly bound buffer sat on screen
+unread. QMP-measured bind→same-resource-flush latency over a full run:
+
+| KMD | binds | p50 | p90 | max | ≥20 ms |
+|---|---|---|---|---|---|
+| 22.22.200.0 | 793 | 0.5 ms | 100.2 ms | 2634 ms | 265 (**33.4 %**) |
+| 22.22.201.0 | 829 | 0.3 ms | 0.6 ms | 81.8 ms | 2 (0.2 %) |
+
+**Fix: request a refresh for the exact resource after a bind that changed the
+binding.** Fire Strike Combined 23.1 → 25.5.
+
+**FALSIFIED here, with full-coverage measurements — do not re-propose.**
+- *The bind races the app's rendering.* The per-buffer watermark census
+  (`Bw`) is `CONTENT_TRACKED` on 425/425 binds and `CONTENT_PENDING` on ZERO.
+  dxgkrnl issues the flip on the app's DMA fence, which `DmaGpuFence=1` already
+  retires on host GPU completion, so the buffer is always complete at bind time.
+  The `BindWait` gate that came out of this hypothesis is LANDED but inert
+  (`ScNotRdy` ~1/boot, `ScBForce`=0); keep or delete deliberately.
+- *A stuck programming gate / dead VSync heartbeat.* `VpGate`=0 and `VpVsN`
+  advancing at ~60/s throughout the stall.
+- *`SetVidPnSourceAddress` binds are coalesced to ~1.5/s* (an in-tree code
+  comment). Measured at ~64/s with `VpCoal`=0 on the desktop.
+
+### NOT a defect — the one-shot `scanout_dmabuf` import failure
+
+`/tmp/helios-qemu-stderr.log` shows `sdl2_gl_scanout_dmabuf: failed` with
+`OPTIMAL DMA-BUF shape mismatch required=8773632 fd_size=7913472`, and 229 of
+229 attempts fail. It looks alarming and IS NOT A DEFECT: owner-verified
+2026-07-29, it fires ONCE PER RUN at startup and every subsequent
+`SET_SCANOUT_BLOB` is fine. It is a one-shot capability probe that falls back
+to the working blob path. Recorded here so the 100 %-failure ratio is not
+"discovered" again — the ratio is over ATTEMPTS, and there are only one or two
+attempts per boot.
+
+### Defect 0ab — 0ab-A FIXED 2026-07-29, 0ab-B STILL OPEN
+
+**Shipping state: KMD 22.22.209.0** = 0ab-A only. 22.22.207.0 and .208.0 were
+the two falsified 0ab-B attempts below and are fully reverted; .209.0 is .206.0
+plus nothing.
+
+**OWNER-CONFIRMED on .209.0, full Fire Strike suite (2026-07-29)** — and the
+result is the sharpest constraint we have on what is left:
+
+| test | presents | owner verdict |
+|---|---|---|
+| Graphics Test 1 (~165 fps) | high | **black-frame stutter** |
+| Graphics Test 2 (high fps) | high | **black-frame stutter** |
+| Physics | none (CPU) | clean |
+| Combined (~23 fps) | low | **clean** |
+
+Score 20k overall / 40k graphics / 4k combined — **unchanged**, so 0ab-A cost
+nothing. This confirms both halves of the instrument's reading: 0ab-A is fixed
+(Combined went 22.0 % → 0.7 % unfinished frames and the owner now sees it
+clean), and **0ab-B scales with FRAME RATE, not with workload**. Physics is the
+control: no presents, no artifact.
+
+**The instrument came first, and it is the reusable part.** Five sessions
+argued about 0ab from guest counters. What settled it was watching the thing
+itself: `tools/vnc_frame_probe.py` samples QEMU's VNC surface at ~30/s and
+stamps each frame with `time.time()`, which is the SAME CLOCK as the
+`virtio_gpu_cmd_*` trace lines the QEMU `log` backend writes; and it scores each
+frame with a **completeness oracle** — the mean brightness of 3DMark's fps bar,
+which is present in every finished frame and absent in every unfinished one.
+Whole-frame brightness cannot tell "dark scene" from "unfinished frame"; the
+oracle can. `tools/vnc_scanout_correlate.py` joins the two.
+
+⚠ Two traps in the probe, each of which cost a cycle: sending RFB
+`SetPixelFormat` makes QEMU stop answering FramebufferUpdateRequests entirely
+(its native format is already the one you want), and writing PNGs inside the
+sample loop throttles it to 3/s — which is coarser than the artifact and
+silently biases the sample.
+
+⚠ `screendump` is NOT an alternative, under `sdl,gl=on` OR under `egl-vnc`: the
+console's `scanout.kind` is DMABUF, so `qemu_console_surface()` returns NULL and
+QMP answers `"no surface"` even though the VNC path is happily reading a live
+surface. That is why the RFB client exists.
+
+**0ab-A root cause: the bind-edge RESOURCE_FLUSH was submission-ordered, so the
+host read the frame's CLEAR.**
+
+`program_vidpn_source_inner` fired `request_scanout_refresh_for(target)`
+immediately after every SET_SCANOUT_BLOB that changed the binding — the 0aa
+"a bind is itself a dirty edge" fix. Under the DMA-buffer flip contract that is
+~10 ms too early: `arm_dma_flip` runs in `DxgkDdiSubmitCommand` **with the
+flip's DMA fence still outstanding** (deliberately — that is the contract), and
+the app's real work never travels in that DMA buffer at all; it goes to the host
+over the Venus escape channel. So at bind time the frame is SUBMITTED, not
+COMPLETE. A RESOURCE_FLUSH is the host's instruction to READ, and what it read
+was the frame's own clear — hence a fully black frame, never a partial one.
+
+The `425 of 425 binds found the buffer's watermark already retired` claim the
+arm shipped with was measured on the MMIO contract, where dxgkrnl retired the
+flip BEFORE calling `SetVidPnSourceAddress`. It did not survive the move to the
+DMA contract, and nothing re-measured it.
+
+**Measured on what is actually DISPLAYED**, Fire Strike Combined, one QEMU
+`virtio_gpu_cmd_*` trace over QMP correlated with an RFB sampler on the VNC
+surface (`tools/vnc_frame_probe.py` + `tools/vnc_scanout_correlate.py`), using
+3DMark's fps bar as a "did this frame finish?" oracle:
+
+| | 22.22.205.0 | 22.22.206.0 |
+|---|---|---|
+| displayed frames that are UNFINISHED | **98/445 = 22.0 %** | **3/431 = 0.7 %** |
+| …and entirely black | 98 of 98 | 3 of 3 |
+| binds whose flush was within 2 ms of the bind | 465/475 = 98 % | 60/521 = 12 % |
+| bind → first flush of that resource, p50 | **0.2 ms** | **10.4 ms** |
+| Combined score | 23.06 | 23.14 |
+
+10.4 ms is the app's own GPU frame time — the flush now lands when the frame
+lands. Guest-side, the same thing reads as `BeDef` 3096 vs `BeRdy` 1478 over
+4576 binds: **two thirds of binds under a fullscreen DMA-flip workload had
+outstanding Venus work at bind time**, i.e. two thirds of them used to publish a
+half-drawn buffer. GT1 180.19 vs 183.06 — inside the run-to-run band.
+
+**The fix is an ordering, not a stall.** The bind edge now arms through the
+Venus watermark (`AdapterContext::arm_completion_ordered_refresh` →
+`VirtioGpu::note_scanout_refresh`), so the flush is issued from the completion
+DPC by `take_ready_scanout_refresh`. No CPU thread waits anywhere, which is
+exactly why the deleted producer-side gate was the wrong shape for this. It also
+keeps everything the bind edge exists for: a bind that changed the binding is
+still guaranteed a flush naming its own resource (defect 0aa stays fixed).
+
+**Residual inside 0ab-A, named rather than hand-waved.** ~12 % of binds still
+find the watermark already retired and flush immediately (`BeRdy`), and one of
+those produced the single remaining black frame in a 21 s Combined window.
+`note_scanout_refresh` samples `next_wire_fence` at the call, so "everything
+below it has retired" is trivially true if the frame's Venus commands have not
+reached the virtio ring yet. Closing that needs the watermark captured at flip
+SUBMISSION and carried in `PresentFlipPrivate`, not sampled at bind time.
+
+### 0ab-B — at ~180 fps the flashes REMAIN (OPEN)
+
+**Do not read 0ab-A's numbers as closing the visible artifact.** The same probe
+on Fire Strike **GT1 fullscreen (~180 fps)**, KMD 22.22.206.0:
+
+| | GT1 after 0ab-A |
+|---|---|
+| displayed frames entirely black | **157/856 = 18.3 %** (sampler 29.5/s) |
+| binds whose flush was within 2 ms | 1595/4409 = 36 % |
+| bind → first flush, p50 / p90 | 0.9 ms / 10.3 ms |
+| frame sampled AFTER the completion-ordered flush | 41/249 = **16 %** unfinished |
+
+The bind-edge fix DID take effect here (98 % → 36 % immediate flushes), and the
+black frames did not go away — so the early read is not what produces them at
+this frame rate. The 16 % figure is the load-bearing one: the buffer is
+unfinished *after* a flush that is correctly ordered on its content.
+
+Per-run counter deltas over that GT1 run (deltas, not absolutes — registry
+values persist across boots):
+
+    VpBind +5015   VpSkip +1046 (21 % already-bound)   VpCoal +310
+    MkTot  +5645   MkBound +824 = 14.6 % of presents
+    BeRdy  +1875   BeDef  +3139
+
+`MkBound` at **14.6 %** is write-while-displayed: the app finished writing the
+buffer that was, at that instant, the bound scan-out. That is the previous
+session's mechanism, which the DMA-flip contract drove to 0.45 % on Combined and
+which is plainly back at 180 fps, alongside `VpCoal`/`VpSkip` at ~20 % of binds.
+The app rotates only TWO scan-out resources in fullscreen (host trace: strict
+A,B,A,B alternation, zero consecutive same-resource binds), so a bind that lags
+one flip leaves the display pointed at the buffer the app has just been handed
+back and cleared.
+
+#### 0ab-B: two mechanisms BUILT, DEPLOYED, MEASURED, and FALSIFIED
+
+Both were implemented in full, installed, and measured against the same probe.
+Neither moved the artifact. **Both are reverted; do not re-propose either
+without new evidence.** The code is gone, this record is the point.
+
+| attempt | what it did | result |
+|---|---|---|
+| **Flip-fence ordering** (was 22.22.207.0) | Held a DMA-buffer flip's `DXGK_INTERRUPT_DMA_COMPLETED` until that flip's own SET_SCANOUT_BLOB had completed, via a monotonic ticket minted in `arm_dma_flip_programming` and released by the display worker. Premise: completing the flip fence on Venus retirement alone lets dxgkrnl recycle a still-displayed buffer. | Gate demonstrably live — **4844 of 5028 flips held** — and it did what it claimed: `VpSkip` 1046 → 274, no fps cost (GT1 162.0 vs 164.7). **Black frames unchanged: 21.2 % → 21.6 %.** |
+| **Dirty-edge identity gate** (was 22.22.208.0) | Dropped a refresh whose armed resource was not the bound one, *provided the bound one had already been flushed once* (a binding epoch, so defect 0aa stays fixed). Premise: a marker armed for frame B was re-reading buffer A. | Desktop stayed healthy (61 binds / 61 flushes over 3 s of mouse movement, so the epoch qualifier did fix the 2026-07-28 delivery collapse). But the gate fired only ~128 times per run. **Black frames unchanged: 18.0 %.** |
+
+**What the falsification actually taught us**, and it is the useful part:
+
+* A fence census over one GT1 run (`virtio_gpu_fence_ctrl` type 0x207 →
+  `fence_resp`, joined to the flushes) found the app had **NO GPU work in
+  flight for 94 % of flushes**, and the dark rate was **identical (19 %)**
+  whether 0, 1 or ≥2 submissions were outstanding. So the host is not reading a
+  buffer mid-render: the buffer is quiescent and genuinely contains a clear.
+* The dark rate is **FLAT against every timing variable** — age of the current
+  binding (21/16/18/14/16/29 % across <3…≥20 ms), time to the next bind
+  (18/20/16/16/17 %), time since the last flush (22/21/18/19/11/11 %). A race
+  against our bind/flush cadence would show a gradient. There is none.
+* The flashes are **163 isolated single-frame events in 31 s** (~5/s) plus the
+  two workload-transition fades; run-length is 1 for all of them.
+* Fullscreen rotates exactly **two** scan-out resources in strict A,B,A,B order
+  (**zero** consecutive same-resource binds in 4418), so this is not the
+  desktop primary being interleaved and not a lost rotation at our level.
+
+**Where that leaves 0ab-B.** The remaining shape is "the guest's own presented
+buffer contains a clear", which points UPSTREAM of the scan-out path — at the
+UMD/DXVK swapchain (`dxgi_rotate_resource_identities`/`rotate_ring`, and DXVK's
+reuse of a presented image) rather than at the KMD. Note the standing constraint
+that the app's CONTENT is correct was established with 3DMark's offline frame
+output, which does **not** exercise the swapchain rotation — so it does not
+cover this. ⚠ Also note the sampler tops out at ~30/s while GT1 presents at
+~165/s, so it cannot resolve an individual presented frame there; the next
+instrument needs either a slower workload or a guest-side timestamped trace.
+
+**Also still true and still not the cause** (kept because each cost a session):
+- The host runs `-display sdl,gl=on` or `egl-vnc`; the artifact reproduced on
+  BOTH, which is what ruled the backend out. Under `egl-vnc` QMP `screendump`
+  still answers `"no surface"` (the console is in DMABUF scanout kind), so the
+  RFB path is the only way to see the surface — hence the probe.
+- `VpCoal` and the burst bind pacing are real and unexplained, and are NOT this.
+
+**RESULT — producer-side ordering is NOT the cause, and the old ESTABLISHED #1
+is now wrong.** Owner ran `PresentOrder=0` + `PresentGateUs=200000` (a
+completion gate that cannot expire) on top of the 0aa fixes: **black frames
+still flash, only less frequently.** The handoff recorded that config as
+"visually clean"; it is not. A producer-side stall REDUCES the artifact — which
+is why it read as clean at lower frequency — but does not remove it, so
+whatever is producing 0ab survives the app's own GPU work being finished before
+the present is published.
+
+⛔ **The `PresentGateUs` and `PresentOrder` knobs were DELETED by owner
+directive (2026-07-29) and must not be reintroduced.** They were the
+producer-side CPU present gate. It is a hack in both directions: on expiry it
+publishes the present with work still outstanding (the exact thing it exists to
+prevent), and when it does hold it removes all CPU/GPU overlap (Fire Strike GT1
+158 → 136). The measurement above is the last word on it — it does not even fix
+what it was being kept for. The ordinary present path is now unconditionally
+SUBMITTED-ordered with no knob; the vehicle path keeps its own
+`VehicleFlipGateUs` COMPLETE wait, which answers a different question (ICD
+image RECYCLE, not present ordering). See the ⛔ note in `umd/src/knobs.rs`.
+
+**MECHANISM MEASURED 2026-07-29 (KMD 22.22.203.0).** `MkBound` counts present
+markers whose resource was, at that instant, the BOUND scan-out — i.e. the app
+finished writing the buffer the host was displaying. Over one Combined run:
+**145 of 1245 markers (11.6 %)**, and the per-window deltas correlate EXACTLY
+with dropped binds:
+
+| window | ΔMkBound | ΔVpCoal |
+|---|---|---|
+| desktop 0–10.9 s | 0 | 0 |
+| 11.8–16.6 s (app start) | 19, 22, 36, 18 | 2, 6, 27, 9 |
+| 18.7–22.6 s | 0 | 0 |
+| 26.7–29.1 s | 11, 17, 15, 5 | 10, 11, 12, 3 |
+| 31.8–46.7 s | 0 | 0 |
+
+Run totals `coalesced=80`, `alreadyBound=82` — tracking 1:1. Reading: a dropped
+pending bind makes the NEXT bind find the same buffer already bound, so nothing
+is issued and the display stays on a buffer the app then overwrites.
+
+**Why binds are dropped at all is the load-bearing question.** With
+`MaxQueuedFlipOnVSync = 1`, dxgkrnl should not issue a second
+`SetVidPnSourceAddress` until the first flip has retired — which requires our
+CRTC_VSYNC to carry its address, which requires us to have bound it. Two
+pendings therefore should never coexist, yet `VpCoal` is 80. The implication is
+that **dxgkrnl retires an IMMEDIATE flip on the DDI's RETURN, not on
+CRTC_VSYNC** — and our DIRQL half returns STATUS_SUCCESS having only stashed the
+handle for a PASSIVE worker. That makes the success return a lie for exactly the
+flip class `FlipImmediateMmIo` opted us into: dxgkrnl frees the previous buffer
+to the app immediately, then issues the next flip, while we have programmed
+nothing.
+
+**CONFIRMED, AND THE DMA-BUFFER FLIP CONTRACT IS IMPLEMENTED (KMD
+22.22.205.0).** `FlipImmediateMmIo` is withdrawn; `ddi/present_packet.rs`'s
+`PresentFlipPrivate` carries the flip's allocation + `DXGK_ALLOCATIONLIST`
+physical address in the kernel-only DMA private data, and `submit_command` arms
+the scan-out programming from there while the flip's DMA fence is still
+outstanding. Two supporting pieces were needed:
+
+* `create_allocation::SCANOUT_ALLOCS` — Present holds only
+  `hDeviceSpecificAllocation`, the scan-out path keys on the GLOBAL
+  `AllocationContext*`, and NOTHING bridges them (`DXGK_OPENALLOCATIONINFO`
+  carries a `D3DKMT_HANDLE`, and the create-time private data is UMD-visible so
+  a kernel pointer must not travel through it). A 32-slot registry keyed by
+  venus resource id, populated for direct-scan-out allocations only, is the
+  bridge. Measured before it existed: `VpDmaF=165, VpDmaA=0, VpPrF=165`.
+* `PresentFlipPrivate::take` CONSUMES the record, because dxgkrnl recycles DMA
+  private-data buffers and a left-behind record would re-arm a bind for a stale
+  allocation.
+
+Result on the same Combined workload:
+
+| | binds | coalesced | alreadyBound | write-while-displayed |
+|---|---|---|---|---|
+| MMIO immediate (22.22.203.0) | 1034 | 80 | 82 | **145 / 1245 = 11.6 %** |
+| DMA flip (22.22.205.0) | 1272 | **2** | **6** | **6 / 1327 = 0.45 %** |
+
+`VpDmaF=946, VpDmaA=946` — every immediate flip programs the scan-out.
+`ScAlcFul=0` (registry never overflowed), `VpPrF=0`, `ScSetErr=0`, `RfFail=0`.
+Combined 23.06, inside the run-to-run band. **Owner visual confirmation is still
+outstanding — the guest census is not the artifact.**
+
+**The reasoning that got here, kept because it is the reusable part** (an ordered pending QUEUE fixes lost flips but not a lag whose
+bound is "whenever the worker runs"; implementing the DMA-buffer flip contract
+puts completion back under driver control via the DMA fence, which is what that
+contract exists for). The confirming measurement is a DIRQL-side record of
+whether `last_primary_address` had already advanced to the previous pending
+handle's address when the next `SetVidPnSourceAddress` arrives.
+
+**FALSIFIED WITH EVIDENCE 2026-07-29 — do not re-propose:**
+- *The app's rendered CONTENT is black.* Owner ran 3DMark's frame-output (image
+  quality) dump: no black frames in the output, and none visible while it ran.
+  Note that frame output renders scenes offline and does NOT exercise the
+  display/scan-out path, so it is a content oracle only — which is exactly what
+  makes it decisive here. **The defect is strictly in what we DISPLAY.**
+- *`dxgi_present1`'s multi arm fails to copy src->dst.* CORRECT as written:
+  `DXGI_DDI_ARG_PRESENT1` documents that when many resources are presented
+  `hDstResource` is NULL and the driver must translate only the LAST source
+  handle for `pfnPresentCb`. There is no destination to populate.
+- *`BltDXGI` leaves the DWM shared surface / full-screen PROXY surface empty.*
+  The `dxgi-presentation-path` doc makes this the obvious suspect — both the
+  windowed shared surface and the full-screen proxy are filled by `BltDXGI`,
+  and our `dxgi_blt1` refuses CONVERT/STRETCH outright while the caps advertise
+  16x stretch. It is nevertheless NOT the cause: **`DXGI Blt` appears 0 times in
+  every UMD log.** Modern flip-model swapchains bypass the Blt path entirely.
+  (The unbacked stretch/convert caps remain a separate honesty problem.)
+- *A mid-run scan-out DISABLE blanks the screen.* `set_scanout_blob res 0x0`
+  appears ONCE in the entire host log.
+- *DWM keeps binding the scan-out during a fullscreen run, alternating with the
+  app.* DWM's ids freeze the moment the workload starts (`Vs` 36/39/40 stop at
+  86/85/85) and its flushes stop with them.
+
+**Older suspects, now subordinate to the above:**
+1. **Bind lag / burst pacing.** `VpCoal` ~85 per run, and binds arriving two
+   3 ms apart then a 40 ms gap against a 25 fps app. A late bind can point the
+   display at a buffer dxgkrnl has already recycled to the app — and with
+   `gl=on` the app's clear-to-black is then on screen live.
+2. **The programming gate's VSync suppression** as the cause of that burst
+   pacing: `vsync_dpc_routine` early-returns while `vidpn_programming` is
+   raised, so dxgkrnl cannot retire, flips queue, and the queue drains in a
+   burst when the gate drops.
+3. The consumer half of `publish_present_order`
+   (`Global\HeliosPresentFence_<pid>_<id>`) still has no consumer — a GPU-side
+   wait is the non-hack form of the ordering the deleted gate was faking.
+
+#### The QEMU-side scan-out oracle (built 2026-07-29, needs a VM relaunch)
+
+Every 0ab-B conclusion so far is statistical, because `tools/vnc_frame_probe.py`
+samples at ~30/s while GT1 flushes at ~142/s. The owner authorised working in
+the QEMU scan-out path, so the oracle now lives where the pixels are — inside
+the flush itself, one line per displayed frame, no sampling:
+
+| trace event | site | what it settles |
+|---|---|---|
+| `helios_scanout_blob_layout` | `virgl_cmd_set_scanout_blob` | the guest's own view: fd, blob size, `offsets[0]`, computed `fb.offset`, stride. ⚠ `virtio_gpu_create_dmabuf` builds every `QemuDmaBuf` at **offset 0** and drops `fb.offset`; a nonzero guest offset would mean the host reads the wrong bytes, so it is now visible rather than assumed away. |
+| `helios_scanout_bind` | `egl_scanout_dmabuf` | per bind: resource id → DMA-BUF inode/size/backing/stride, which readback path took it (`vk-optimal` / `vk-linear` / `cpu-mmap` / `egl-texture`), and whether the readback cache reused an entry. Two resource ids sharing one inode = aliased buffers. |
+| `helios_scanout_read` | `egl_scanout_flush` | per FLUSH: `bound_ino` (what the guest has bound, fstat'd now) vs `read_ino` (what the active readback actually imported), the flush rect, and a content verdict over the surface the VNC encoder is about to read — sampled every 4th pixel: `sampled`/`nonzero`/`max` plus an FNV-1a `csum` that separates new content from a re-read. |
+
+`nonzero == 0` **is** the black-frame flash, decided on the exact pixels that go
+out. Enable with `tools/qmp_trace.py on helios_scanout_read helios_scanout_bind
+helios_scanout_blob_layout`; the lines land in `/tmp/helios-qemu-stderr.log`
+with the same ISO8601 UTC prefix as the `virtio_gpu_cmd_*` traces. Report:
+`tools/scanout_oracle_report.py /tmp/helios-qemu-stderr.log <label>`.
+
+Zero cost when the events are off (both emitters return on
+`trace_event_get_state_backends`), and the only behavioural change in QEMU is
+that a `QemuDmaBuf` now carries its producer's id (`qemu_dmabuf_set_source_id`).
+
+#### 0ab-B ANSWERED (2026-07-29, KMD 22.22.209.0, GT1 183.6 fps, 54 s, 2965 flushes)
+
+One GT1 run through the oracle. **The host reads the right buffer; the guest's
+buffer contains a clear.** Hypothesis (B) is dead, and it died on identity, not
+on argument:
+
+| oracle question | answer |
+|---|---|
+| are the two rotating resources distinct memory? | **yes** — res 191 ino 27926 fd 423, res 195 ino 27930 fd 303, both 4587520 B, `guest_offset` 0, `fb_offset` 0. No aliasing. |
+| did any flush read a buffer other than the bound one? | **0 of 2965.** `read_ino == bound_ino` every time. |
+| what fraction of PUBLISHED frames are entirely black? | **619 / 2965 = 20.9 %** (res 191 20.4 %, res 195 22.0 %) — and that independently reproduces the 30/s VNC sampler's 18–21 %, on a per-flush instrument. |
+
+**And the artifact has a sharp timing structure the sampler could not see.** The
+previous session's "no timing gradient — the dark rate is flat against binding
+age" was an artifact of sampling at 30/s a thing that happens at 90 flushes/s.
+Per flush, the bind→flush latency is **bimodal**, and the black frames live
+entirely in the late mode:
+
+| bind → flush | flushes | black | |
+|---|---|---|---|
+| 1.0–3.0 ms | 1261 | 13 | **1.0 %** |
+| 3.0–6.0 ms | 26 | 6 | 23.1 % |
+| 9.0–12.0 ms | 1317 | 541 | **41.1 %** |
+| ≥12 ms | 301 | 58 | 19.3 % |
+
+p50 bind→flush: **LIT 1.8 ms, BLACK 11.1 ms**. And 611 of the 619 black flushes
+land **within 0.5 ms of the NEXT bind** (every other time-to-next-bind bucket is
+0–5 % black). So a black frame is a flush that arrives ~2 app frames after its
+own bind, at the instant the next flip is being programmed.
+
+**Root cause, confirmed in the source.** `VirtioGpu::note_scanout_refresh` arms
+the marker on `let watermark = self.next_wire_fence` — *everything submitted so
+far*, sampled at the call. The bind-edge arm
+(`program_vidpn_source_inner` → `arm_completion_ordered_refresh`) runs in the
+PASSIVE display worker, long after the flip was submitted, and at 183 fps the
+app has already pushed frame N+1 (and more) into the ring by then. So the flush
+for frame N waits for frame **N+1** to complete — one whole frame too long — and
+with only two rotating buffers the app has had buffer A handed back and cleared
+it for N+2 by the time QEMU reads it. That is the entirely-black frame: not a
+half-drawn one, a *re-cleared* one. It also explains why the artifact scales
+with frame rate (at Combined's 23 fps the extra frame still fits inside the
+buffer's time on screen) and why both falsified attempts missed — neither
+changed *when the flush is issued*.
+
+This is precisely the residual 0ab-A shipped with and named: *"`note_scanout_refresh`
+samples `next_wire_fence` at the call… closing that needs the watermark captured
+at flip SUBMISSION and carried in `PresentFlipPrivate`, not sampled at bind
+time."* The oracle turned that from a footnote into the measured cause.
+
+⚠ Also note `scanout_refresh_watermark` is a SINGLE slot: a second arm before
+the first fires overwrites it. Binds 3867 vs flushes 2965 in this run — ~900
+arms were dropped that way.
+
+#### FALSIFIED — capturing the boundary at flip SUBMISSION (22.22.210.0)
+
+Built, deployed, measured, reverted. `arm_dma_flip` captured
+`next_wire_fence` in `DxgkDdiSubmitCommand` and carried it to the bind edge in
+`AdapterContext::pending_flip_watermark`. **The gate was live** — `BeCar` 6504
+vs `BeSmp` 1694, so 79 % of binds used the carried boundary — and **black
+frames got WORSE: 20.9 % → 27.1 %** (GT1 162.3 fps, 52 s, 3689 flushes). The
+bimodal split survived unchanged: 0.2 % black at 1–3 ms, **63.1 %** at 6–12 ms.
+
+The raw event stream says why, and it is worth reading as the actual shape of
+the defect — a 13 ms cycle, identical on .209.0 and .210.0:
+
+    +1.76 ms  res 332  BIND
+    +12.66 ms res 332  read BLACK     <- flushed 10.9 ms after its bind
+    +12.72 ms res 335  BIND           <- the NEXT flip, 60 us later
+    +13.94 ms res 335  read lit       <- flushed 1.3 ms after ITS bind
+    +14.26 ms res 332  BIND
+
+Two flips arrive as a burst ~1.5 ms apart, then nothing for 11 ms. The buffer
+bound FIRST in a burst is flushed inside the same burst (1.3 ms → lit); the one
+bound LAST waits for the next burst (11 ms → black), by which time the app has
+cycled both buffers and re-cleared it. **The flush for frame N is released
+within 60 µs of frame N+1's bind, every cycle** — i.e. the carried boundary
+still covered frame N+1. dxgkrnl submits a flip's DMA buffer about a frame
+after the app presented, so `next_wire_fence` at SUBMISSION is already too
+late. `BeRdy` 3925 / `BeDef` 4273 matches the 58/42 early/late flush split
+exactly: the black frames ARE the deferred arms.
+
+#### RESULT — 0ab-B is NOT a flush-ordering defect. The ordering is irrelevant.
+
+**The artifact bundle for the follow-up static-analysis session is
+`tmp/handoff-perf/` — `INDEX.md` lists it, `HANDOFF.md` is the paste-able
+prompt, `reports/measurements.md` is every number in one place.**
+
+Three builds settled it, and the last one settled it by removing the ordering
+entirely rather than by arguing about it.
+
+| KMD | bind-edge ordering | GT1 fps | black flushes |
+|---|---|---|---|
+| 22.22.209.0 | boundary sampled at the bind | 183.6 | 20.9 % |
+| 22.22.210.0 | boundary carried from flip SUBMISSION | 162.3 | **27.1 %** |
+| 22.22.211.0 | boundary carried from the PRESENT MARKER, per buffer | 171.7 | 21.0 % |
+| 22.22.212.0 `BindFlushMode=0` | as .211 | 184.0 | 15.1 % |
+| 22.22.212.0 `BindFlushMode=1` | **none — flush AT the bind** | 173.7 | 15.8 % |
+
+`BindFlushMode=1` was demonstrably live (`BeDef` 0, `BeRdy` 4747, every bind
+flushed immediately) and it changed **nothing**. Note also the run-to-run spread
+on identical logic (.211 21.0 % vs .212 mode-0 15.1 %): treat anything under
+~6 points as noise.
+
+**The measurement that ends the ordering theory.** Even with every bind flushed
+immediately, the flushes that still land 6–12 ms after a bind — the
+marker-driven ones — are **50.2 % black**, against 4.2 % for those landing
+1–3 ms after. The black rate is a function of HOW LONG AFTER THE BIND the read
+happens, not of what triggered it:
+
+| flush lands after its bind | `BindFlushMode=0` | `BindFlushMode=1` |
+|---|---|---|
+| 1–3 ms | 1.3 % black | 4.2 % black |
+| 6–12 ms | 35.5 % black | **50.2 %** black |
+
+**So the bound buffer's content is destroyed ~6 ms after we bind it, and no
+flush-timing change can fix that — it can only race it.** The guest-side counter
+agrees to within a point: `MkBound/MkTot = 1268/5955 = 21.3 %` of present
+markers named the buffer that was, at that instant, the bound scan-out.
+
+`BeWMax=3 / BeWLst=1 / BeWRng=1` also disposes of the "something unrelated is
+blocking the boundary" reading: a deferred arm waits on one to three fences,
+all on the host GPU ring — the app's own recent frames.
+
+**What it actually is: a buffer-LIFETIME defect.** A Helios scan-out is not a
+continuous scan-out; the host reads the buffer only when a `RESOURCE_FLUSH`
+tells it to. So the buffer must be immutable from its bind until that flush
+completes. It is not: dxgkrnl retires the flip, frees the previous buffer to the
+app, and the app clears it for the next frame while it is still the bound
+scan-out and still unread.
+
+Two directions, both real, neither yet built:
+1. **Enforce the lifetime.** Do not retire a flip's DMA fence until the
+   PREVIOUS buffer's final `RESOURCE_FLUSH` has completed on the host. ⚠ Not
+   the same as the 2026-07-29 falsified attempt, which held the fence until the
+   flip's own `SET_SCANOUT_BLOB` completed — that waited for the BIND, never for
+   the READ. Cost: it serialises the app against our readback.
+   → **BUILT AND FALSIFIED, 22.22.216.0. See the next section.**
+2. **Shrink the window.** The safe zone is measured: <3 ms after the bind is
+   ~1 % black. Today the bind lands ~10 ms after the flip is submitted (PASSIVE
+   display worker) and binds arrive in bursts of two with an 11 ms gap. Getting
+   bind+flush inside a couple of milliseconds would shrink the race to nothing
+   and would help latency generally.
+
+#### FALSIFIED — the presentation-LEASE ownership gate (22.22.213.0-216.0)
+
+Direction 1 above was built in full, deployed, and measured against the QEMU
+per-flush oracle on one boot with a same-boot control. **The gate works
+mechanically and does not close the defect.** Do not rebuild it.
+
+**What was built** (`helios_kmd_logic::scanout_lease` + `AdapterContext`'s
+`scanout_{present,bound,read}_epoch`). Every DMA-buffer flip mints a
+monotonically increasing PRESENTATION EPOCH in `arm_dma_flip`, stamped on the
+allocation itself (`AllocationContext::vidpn_present_epoch`) so the coalescing
+single-slot `pending_vidpn_allocation` cannot pair one flip's handle with
+another flip's epoch. The display worker publishes `bound_epoch` after the
+`SET_SCANOUT_BLOB` returns; a `RESOURCE_FLUSH` carries a typed
+`ScanoutFlushToken` snapshotting `bound_epoch` at ISSUE, and its used-ring
+response advances `read_epoch`. A flip's `DXGK_INTERRUPT_DMA_COMPLETED` **and**
+its `last_primary_address` publication (the CRTC_VSYNC edge — both are reuse
+edges, and gating only the first is what 22.22.207.0 did) are withheld until
+`read_epoch >= lease`. Escapes, all loud and counted, never a timeout: a
+later bind of a DIFFERENT resource supersedes (virtio FIFO proves no read
+remains), and enqueue failure / host error / retire / reject / preempt / reset /
+transport failure cancel.
+
+**The gate is provably live, not inert** — the 22.22.208.0 trap was checked for
+explicitly. Per GT1 run: `LsMint 5590` == `VpDmaF 5590` (one epoch per flip),
+`LsRel 5590` (one release per mint), `LsBlk 20668` retirements actually blocked,
+and **`LsEndR 4996` of them ended on a REAL HOST READ** vs `LsSupe 573`
+superseded, `LsCanc 0`, `LsTear 0`. It also fixed the bind pipeline outright:
+`VpCoal` ~500 → **21** and `VpSkip` ~500 → **23**, i.e. essentially every flip
+now binds and gets its own read (the "349 of 4127 bind intervals with no read"
+gap is closed).
+
+**And it does not move the artifact.** The decisive metric is the black rate of
+the FIRST read after each bind — the exact population the invariant makes
+impossible, because at that instant the flip is still held:
+
+| build | 1st-read-after-bind black | GT1 fps |
+|---|---|---|
+| 22.22.212.0 control, same boot | **18.3 %** (771/4203) | 170.8 |
+| 22.22.216.0 lease, run a | **14.7 %** (752/5128) | 168.4 |
+| 22.22.216.0 lease, run b | **12.5 %** (676/5397) | 179.4 |
+| 22.22.216.0 lease, run c | **16.6 %** (874/5257) | 171.7 |
+
+Mean 14.6 % against a 4.1-point spread on the lease side alone, i.e. inside the
+documented ~6-point run-to-run band — and nowhere near the ~0 % the invariant
+predicts. fps is unaffected (mean 173.2 vs 170.8; instrumentation-off control
+168.4).
+
+**What that proves, and it is the reusable part.** dxgkrnl's flip retirement is
+NOT what returns the buffer to the app on this stack. The gate demonstrably
+back-pressures dxgkrnl — the flip stream serialised, `VpCoal` collapsed — and
+the app still clears the bound buffer before our read of it. That is consistent
+with the one structural fact this driver has always had: **the app's render work
+never travels through a WDDM DMA buffer at all**; it goes to the host over the
+Venus escape channel, so no WDDM completion notification can order the app's
+writes against our host read. Holding a flip only throttles `Present`; it cannot
+stop a clear that is already queued on the host GPU.
+
+⇒ **No KMD-side notification gating can fix 0ab-B.** The whole
+"which completion notification releases the allocation" family — 207.0's
+bind-hold, this lease gate, and any successor — is closed. The producing write
+has to be ordered where it is issued: the UMD/DXVK swapchain, or the host.
+
+⚠ TRAP THAT COST THREE RUNS: `3DMarkCmd` launched from `win_exec` lands in
+**session 0**, which has no desktop. The workload reaches `SINGLE_INIT_BEGIN`
+and then null-derefs (`0xc0000005`, `rcx=0`) inside its own module with
+`helios_umd.dll` NOT EVEN LOADED — it looks exactly like a driver regression and
+is not one. Launch it through a session-1 scheduled task
+(`helios_lease_gt1` / `helios_trace_fs`, principal `Rupansh` Interactive
+Highest). ⚠ Also: re-signing a package without bumping `DriverVer` makes the
+installer refuse to bind (correctly) — bump the version for every deploy.
+
+#### Superseded: capture at the PRESENT MARKER, keyed by buffer (22.22.211.0)
+
+The marker is the last point at which "everything submitted so far" still means
+"this frame and nothing after it" — the app records it inside its own Present.
+`arm_present_marker_refresh` records `(resource → next_wire_fence)` in a
+4-slot table on `AdapterContext`; `arm_bind_refresh` takes the entry for the
+buffer being bound and arms against it, falling back to sampling (`BeSmp`) when
+no marker named it (the MMIO/desktop path, where dxgkrnl retires the flip
+before calling us, so "now" IS that frame's boundary).
+
+Falsifiable prediction: **`BeDef` collapses toward zero** (the boundary has
+already retired by bind time), the 6–12 ms flush population disappears, and the
+black rate approaches the 0.2 % the early population already measures. If
+`BeDef` stays near half, the whole watermark family is dead and the answer is a
+lifetime contract instead — do not let dxgkrnl recycle the buffer until the
+host's RESOURCE_FLUSH for it has completed.
+
+⚠ The table lives on `AdapterContext`, NOT on `VirtioGpu`: adding 64 bytes to
+`VirtioGpu` cost **2448 bytes of boot-chain frame** (17488 → 19936, over the
+17936 ceiling), because that struct is built on the `DxgkDdiStartDevice` stack.
+Re-measured at 17488 after the move.
+
+#### CLOSED AS AN ORDERING QUESTION — the 2×2 factorial + metric validation (2026-07-29 evening)
+
+Full reports: `tmp/handoff-0ab-b-lease/analysis/{factorial-runs.md,
+metric-validation.md, SYNTHESIS.md}` (+ 89 raw artifacts under `analysis/logs/`).
+Same boot per build, runs interleaved (A,B,A,B,A then C,D,C,D), same UMD binary
+across both builds (hash-verified), oracle on for every run, per-run counter
+deltas, mode latched via `pnputil /restart-device` (`BndFM` echo checked).
+
+| | **A** .216 lease + mode 1 | **B** .216 lease + mode 0 | **C** .212 + mode 1 | **D** .212 + mode 0 |
+|---|---|---|---|---|
+| 1st-read-after-bind black | **2.6 %** | 13.8 % | **5.1 %** | 14.8 % |
+| 2nd-read-in-binding black | 43.4 % | 5.3 % | 32.3 % | 10.5 % |
+| whole-flush black | 15.4 % | 14.8 % | 14.5 % | 16.6 % |
+| age-standardised | 17.5 % | 13.3 % | 15.2 % | 13.7 % |
+| GT1 fps | 164.5 | 173.6 | 177.9 | 174.4 |
+| `VpCoal` per run | 206–642 | **27–34** | 796–873 | 621–886 |
+
+**No cell moves the whole-flush number** (pooled mode effect 0.66 pp, lease
+effect 0.39 pp, both under the within-cell spread). `BindFlushMode=1` does not
+remove black publications, it RE-LABELS them: the bind-triggered flush reads
+~1 ms after the bind and is nearly clean, while the surplus refresh flushes
+(187 flushes/s against 131 binds/s) re-read the same buffer several ms later at
+32–43 % black. Age-standardised, mode 1 is WORSE, not better.
+
+**Three corrections to the lease section above, from this data:**
+1. *"The gate demonstrably back-pressures dxgkrnl (`VpCoal` 500 → 21)"* — the
+   coalescing collapse appears in **lease × mode 0 only** (cell B). Under the
+   lease at mode 1, `VpCoal` is 206–642, same order as pre-lease. It was a
+   lease×latency artifact (slow mode-0 reads → longer withholding → spaced
+   flips), not a lease property.
+2. *"the '349 of 4127 bind intervals with no read' gap is closed"* — it is not:
+   9.5–10.7 % of binding generations still get zero reads under lease+mode0
+   (metric validation, `reuse`-delta-confirmed).
+3. The lease-vs-control black comparison: with real n and interleaving,
+   **B 14.8 % vs D 16.6 %** (raw; 13.3 vs 13.7 age-standardised) — if the lease
+   helps it helps by ≲2 points. The original 18.3-vs-14.6 rested on an n=1,
+   run-first control and omitted the lowest lease run (215-mode0, 10.3 %).
+
+**The mechanism is PROVEN (upgrade from the inference above).** The first read
+of binding N is the event that ends lease N — and it finds the buffer already
+cleared **12.9–17.2 %** of the time across every lease run. At that instant no
+WDDM edge can have returned buffer N to the app (reuse of N requires flip N+1's
+completion → read N+1 → FIFO-after read N). Supersede/cancel escapes are
+excluded (`LsSupe` = 0 in cell A entirely; post-supersede generations are
+15–20× LESS black; `LsCanc` 0). In real flip-model the app's next clear is
+deferred by the SCHEDULER via the allocation list of its render DMA buffer;
+Helios's clears never enter a DMA buffer, so that primitive does not exist
+here. Corollary of the metric validation: the black is always a complete
+opaque clear (`nonzero==0 && max==0 && csum==0`, zero exceptions), 96–98 %
+isolated single frames — one ~7–8 ms flash at a time.
+
+**Where the fix lives (decision list for the owner; measured populations):**
+
+black ≈ (share of publishes issued late) × (P(clear executed by then)) — two
+independent terms, two owners:
+
+- **D1 — publish once, promptly, content-ordered (KMD).** Bind-triggered
+  first reads are already 2.6–5.1 % black; <3 ms-old reads are 0.4–5.6 %.
+  Two sub-items: (i) the mode-0 deferred half (`BeDef` ≈ 41 % of binds even at
+  1:1 bind rate) fits the **mark-overwrite window** — a bind landing >2 frame
+  periods after its present takes the buffer's NEXT present's watermark
+  (`record_frame_watermark` replaces same-resource entries), waiting a frame
+  too long; fix = consume the recorded mark at `arm_dma_flip` time (dxgkrnl
+  submits flips ~1 frame after present, always before the overwrite) and carry
+  it in `PresentFlipPrivate`. Confirm with the R5 delta counter before
+  building. (ii) flip→read latency: a DISPATCH-level async bind
+  (fire-and-forget `SET_SCANOUT_BLOB` from the flip arm; the completion-
+  ordered flush arm already fires from the drain DPC) — T6/R902 deleted
+  `set_scanout_blob_async` as *unreachable dead code*, not as a falsified
+  design, so this is unexplored.
+- **D2 — never publish a binding the app may own (KMD, ⛔-adjacent, needs
+  explicit owner sign-off).** The surplus re-publishes are 32–43 % black and
+  ~30 % of all publishes at mode-1 cadence; suppressing/deferring a refresh
+  whose armed identity ≠ the active binding when the active binding already
+  had its first publish would take whole-flush to ≈ the first-read rate.
+  This is 22.22.208.0's identity gate — inert then only because mode-0
+  cadence starved its precondition — and it is ADJACENT TO THE REJECTED
+  `BindFlushMode=2`. The old objections now have answers (the lease's epochs
+  repair ownership; DWM's same-buffer re-presents mint fresh epochs and are
+  never suppressed; a suppressed stale re-read trades a 40 %-black flash for
+  a one-frame hold), but the ⛔ stands until the owner says otherwise.
+- **D3 — lease disposition.** The DMA_COMPLETED/address withholding is proven
+  inert against the defect (this table) and its hang-suspicion is retired
+  (defect 0ac reproduced on .212); the EPOCH bookkeeping is what D2 needs.
+  Keep epochs, consider retiring the withholding (or bounding it loudly).
+- **D4 — the true ~0 % ceiling** is a venus-level acquire: a GPU-side wait so
+  the clear executes only after the host read (the "non-hack form" already
+  anticipated at the `publish_present_order` consumer note above), or the
+  host-side equivalent (read-at-bind atomically in QEMU, owner-gated). Whether
+  the ~1–4 % residual after D1+D2 justifies it is an owner call.
+
+Also out of this campaign: defect **0ac** (guest bugcheck 0xD1 on 22.22.212.0,
+dump preserved) and defect **0ad** (fullscreen→desktop transition drops the
+host readback ~250 ms), filed in the WS1 list below.
+
+#### BUILD 1 SHIPPED — D1(i)+D2+D3, KMD 22.22.217.0 (2026-07-29 ~22:15)
+
+Owner approved D1+D2+D3 and deferred D4. Design:
+`tmp/handoff-0ab-b-lease/analysis/FIX-DESIGN-build1.md`; implementation +
+review record: `analysis/build1-implementation.md`; acceptance numbers:
+`analysis/build1-results.md` (raw artifacts `analysis/logs/b1-*`).
+
+**What landed** (all uncommitted, like the rest of the tree):
+- **D2 — the ownership gate** on the flush executor
+  (`scanout.rs::queue_active_scanout_refresh_locked`): identity arm (armed ≠
+  active → drop, `OgIdn`) + epoch arm (`helios_kmd_logic::scanout_lease::
+  surplus_republish`, 5 host tests, `OgEpo`) with a third `tracked` operand
+  (`AdapterContext::scanout_epoch_tracked`, mirrored as `LsTrk`) that disarms
+  the gate on the desktop's first MMIO bind — the MMIO contract mints no
+  epochs, so without it a stale `present>bound` after any app run would have
+  frozen the desktop (0aa). LsTrk's disarm was verified on hardware.
+- **D1(i) — allocation-carried frame marks** (`AllocationContext::
+  vidpn_frame_watermark`, taken at flip-arm time): LIVE (96.9 % of
+  frame-boundary binds use the carried mark) but **INERT — the mark-overwrite
+  mechanism (R5) is DEAD**: `BeOvw` 11/1/6 per run (0.02–0.25 %), not the ~41 %
+  the hypothesis predicted, and `BeDef` stays 45–48 %. The deferred half
+  defers because the frame's content genuinely has not retired at bind time —
+  which is CORRECT completion ordering, and harmless now that D2 stops the
+  surplus reads. Kept: it is 0ab-A-protective and the census cost nothing.
+  (Sixth falsified sub-mechanism of 0ab, this time for the price of a counter
+  riding a winning build.)
+- **D3 — the lease's completion withholding retired, epochs kept** (they are
+  D2's predicate). `LsBlk/LsRel/LsPump/LsWait/LsPubG` removed with their
+  mechanisms and one-shot-zeroed at StartDevice; the liveness pump deleted;
+  `WddmPending` no longer carries a lease.
+- **0ac riders**: the `WvTorn` tripwire (with_virtio; the review caught its
+  failure arm releasing the lock through the corrupted pointer — fixed to a
+  pre-acquire hoisted address, codegen verified) and PDB archiving in the
+  deploy script (fired on its first real run: sys+pdb+map in
+  `HeliosDeployBackups\20260729-221346\staged`).
+
+**Acceptance (all this-boot deltas, oracle per run):** GT1 ×3 whole-flush
+black **2.1 / 0.7 / 2.0 %** (was 14.5–16.6 % in every factorial cell),
+first-read 1.9/0.6/1.8 %, fps 185.7/169.2/182.0, duplicate-content
+0.2–1.5 % (was 2.9–10.3 %), `OgIdn` 1057–1483 + `OgEpo` 6–13 per run
+(24.5–33.4 % of would-be flushes dropped), 2nd-read population 1090–1669 →
+**9–26**, 6–12 ms bucket 56 % → **0.5 %** black at unchanged flush share.
+Combined ×1: **PASS** (1.3 % black, 61.5 % of binds still content-deferred =
+0ab-A ordering intact, `OgEpo` 0). Desktop: binds:flushes 412:415, Start menu
+opens (0w closed stays closed), windowed D3D11 + desktop coexist with
+`OgIdn` 7.5 % and no starvation — the self-healing argument held, no escape
+hatch needed. `WvTorn` 0, `IrqlBad` 0, no bugcheck in 4 runs (not evidence on
+0ac's ~1-in-10 base rate).
+
+**Attribution caveat, recorded honestly:** D2 and D3 shipped together, so the
+build cannot A/B them — but the dropped-population accounting is
+mechanism-level attribution to D2 (the reads that vanished are exactly the
+population that was black), and the factorial had already measured D3's
+withholding as inert on black.
+
+**Residual ~0.7–2.1 %**: the 1–3 ms margin race at the bind edge (most of
+what remains), workload transitions (12+ ms bucket, adjacent to defect 0ad),
+and a 3–6 ms bucket that reads 50 % on n≈6 (noise; do not quote it). Paths
+below ~1 % if ever wanted: D1(ii) (DISPATCH-level async bind — shrinks the
+margin race) and D4 (the venus acquire — the true ~0 % ceiling). Neither is
+scheduled; owner's call after the visual check.
+
+**Owner visual verdict (same night): GT1 clean, overall score >25k (was
+~20k) — 0ab-B's main population CLOSED. Residual black-frame stutter
+observed in GT2 around ~200 fps → filed as 0ab-C**, classification plan and
+levers in `tmp/handoff-0ab-c-gt2/HANDOFF.md` (next session).
+
+### 0ab-C — CLASSIFIED 2026-07-29/30 night: the first-publish margin race at GT2's operating point
+
+Two instrumented GT2 runs on 22.22.217.0 (a GT2-only schtask `helios_gt2`
+now exists; real GT2 runtime **68–69 s**, fps **209.5/210.1** — the owner's
+"~200 fps" is GT2's actual average; the T6-era ~63 fps figure is obsolete).
+Full verdict: `tmp/handoff-0ab-c-gt2/analysis/CLASSIFICATION.md`; raw
+artifacts `tmp/handoff-0ab-b-lease/analysis/logs/c1-gt2-*`; predictions were
+registered in advance (`PREDICTIONS.md`) and scored.
+
+- **Population (a) — the bind-edge margin race on the FIRST publish —
+  dominates (~75–85 % of black), the exact population build 1 left open.**
+  Whole-flush black 7.3 %/6.0 % (GT1 post-fix: 0.7–2.1 %), carried by first
+  reads (7.3 %/6.2 %) in the 1–3 ms bind-age bucket (10.1 %/8.6 %); 96–98 %
+  isolated single-frame flashes at ~116–120 flushes/s ⇒ ~7–8 flashes/s = the
+  visible stutter. The 6–12 ms bucket stays 0.2–0.4 % and 2nd reads ~1 %
+  black — **the 217.0 ownership gate holds unchanged at 210 fps**; identity
+  clean (0 mismatches), 2-buffer rotation, `WvTorn` 0 both runs.
+- **Guest-side half measured**: inter-bind gaps are bimodal — ~45–48 % at
+  1–3 ms but 19–24 % at 10–14 ms and 10–11 % ≥20 ms (mean worker cycle ~7 ms
+  vs the 4.8 ms flip cadence). `BeOvw` (bind landing after the same buffer's
+  next present) 180/194 per run vs GT1's 1–11, climbing within-run with the
+  black. Within-run black tracks scene PHASE (flip rate is flat 197–223/s);
+  between operating points it tracks the margin 1/F − latency, which crossed
+  zero between GT1's 5.9 ms and GT2's 4.8 ms period.
+- Minorities: **(c)/0ad** — the undersized `res 6` transition bind fires at
+  t≈63.7 s in BOTH runs (scene-end window w12, each run's worst 5-s window,
+  ~12–23 % of total black; separate defect, unchanged). **(b)** duplicates
+  3–5 % (GT1 0.2–1.5 %), `VpCoal` 15.5–16 % — real, minor. **(d)** absent.
+- **Fix: D1(ii) — DISPATCH-level fire-and-forget SET_SCANOUT_BLOB from the
+  flip arm**, design + review checklist + registered predictions in
+  `tmp/handoff-0ab-c-gt2/analysis/FIX-DESIGN-d1ii.md`. Pure accelerator: the
+  worker path and the DestroyAllocation cancel semantics are untouched;
+  values-only in-flight entry; wire-order seq guards bookkeeping; failure =
+  count + existing worker ladder.
+- **22.22.218.0 (D1(ii) build 1) BUGCHECKED 0xA deterministically under GT2
+  (2/2, ~50 s) — ROOT-CAUSED from two kernel dumps, and it is NOT the D1(ii)
+  logic:** a pre-existing TOCTOU in the sync-wait protocol.
+  `wait_block`'s lock-free `is_done()` early exit let the waiter pop its
+  stack frame between the drain Sync arm's `done.store(Release)` and its
+  `KeSetEvent` (an ISR or KVM vm-exit stalls the draining CPU mid-window);
+  the drain then memcpy'd + signaled a popped `SyncWaitBlock` on the HPD
+  worker's stack. .218 armed it by doubling ctrl traffic and lengthening
+  drain holds (sync waits started outliving the 15.6 ms wait slice, so the
+  poll finally ran inside the window). Dumps show the worker one call past
+  its sync bind, spinning on the drain's own lock — the race photographed.
+  All abandon/timeout counters zero; fast-bind machinery clean (`FpErr` 0,
+  `FpSeq == FpAppSq`, desktop `Fp*` Δ0). Full record:
+  `tmp/handoff-0ab-c-gt2/analysis/BUGCHECK-0xA-218.md`; forensics transcript
+  `tmp/dump0xA/`; dumps preserved in `C:\HeliosDumps`.
+  **Fix = 22.22.219.0: delete the `is_done()` fast path — the signal (or the
+  lock-serialized timeout-abandon) becomes the only exit.** (The same
+  deletion also fixed the identical latent TOCTOU on the `wait_fence` path,
+  which shares `wait_block`.)
+- **22.22.219.0 battery (c3-*): the TOCTOU fix HOLDS — 5/5 cells, zero
+  bugchecks where .218 died 2/2.** All gates pass: GT1 black 0.7 %
+  (0ab-B closed), Combined first-read 0.5 % with `BeDef`-dominant ordering
+  (0ab-A closed), desktop inert (`FpBind` Δ0) and clean, `WvTorn`/`IrqlBad`/
+  `FpErr` 0 throughout. **GT2: black HALVED, 7.3/6.0 % → 4.0/3.4 %
+  (fps 211.4/213.0, up), but the registered ≤2.5 % target was missed.**
+  Early/mid-scene windows collapsed to 0.5–1.6 % black; the residual lives
+  late-scene. Per-poll attribution: the fast path's ALREADY_BOUND skip is a
+  FLAT ~28–34 % coverage gap (`FsC0` 2140/2192 per run — the predicate
+  compares against the *applied* active resource, 1–2 flips behind at
+  2-deep pipelining), and the late-scene black climbs with `BeOvw` (worker
+  bind lateness) — i.e. black ≈ flat-uncovered-fraction × climbing-worker-
+  lateness. Secondary (not black): presents outrun reads 2.3:1, `OgEpo`
+  416–538/run (correct surplus drops), duplicates 11 %, in-scene flush rate
+  −22 % under the doubled ctrl load — display-freshness economics, a
+  separate lever. Full numbers + registered next-step predictions:
+  `tmp/handoff-0ab-c-gt2/analysis/build219-results.md`.
+- **22.22.220.0 = D1(ii)-b** (wire-resource skip predicate): predicate
+  confirmed live (`FsC0` 2140→296) but the freed flips became `FpBusy`
+  (61→1776) — the SINGLETON bind command buffer was the real coverage
+  bottleneck (it only returns at the guest DPC drain, which lags the host
+  consume by several flip periods). Exact identity all cells:
+  `FpBind + FpSkip + FpBusy = VpDmaF`. GT2 black flat; GT1 1.9 % at
+  190 fps (confounded). `tmp/handoff-0ab-c-gt2/analysis/build220-results.md`
+  (includes the x/y identifiability argument that motivated the last build).
+- **22.22.221.0 = the bind command POOL (depth 4; `Vec`, not array — the
+  inline array measured 18128 B on the StartDevice chain vs the 17936
+  ceiling) — THE DISCRIMINATING RUN, and it discriminated:**
+  `FpBusy` → 0, coverage → **99.1/99.3/99.9 %**, `FpBind = VpDmaF − FpSkip`
+  exact — and **GT2 black did not move by one decimal (3.5 %/4.1 %)** ⟹
+  x = y in the mixture model: flip-time binds go black at the worker-timed
+  rate. **The bind-timing family is EXHAUSTED WITH PROOF for GT2** — 0/439
+  pooled black in the 0–1 ms bind-age bucket; the loss is in the READ
+  window, to the venus-executed clear no publish timing can outrun. The
+  remaining GT2 lever is **D4 (venus-level acquire / host read-at-bind,
+  owner-gated)**, plus the flush-freshness economics as a separate quality
+  item. **The same pool FIXED GT1: 1.9 % → 0.3 % — the best GT1 black
+  recorded, below the whole .217-era band** (at 178–190 fps the margin is
+  wide enough for flip-time binds to win; at 210+ fps it is not).
+  Three consecutive clean batteries on the TOCTOU fix (c3/c4/c5, 15
+  workload cells, zero bugchecks). GT2 fps 214.1/212.5 (up), dup% improved
+  (12.6→7.6 %), `OgEpo` calmed (338→83). Watch: GT1/Combined scores c5
+  181.0/20.11 vs c4's 190.3/21.51 (c4 looks like the high outlier vs c3/b1;
+  re-measure before calling it a cost). Full record:
+  `tmp/handoff-0ab-c-gt2/analysis/build221-results.md`.
+- Shipping state after the four-build night: 22.22.221.0 (`DspBnd=1`,
+  `BndFM=0`; superseded by 22.22.222.0 below).
+  **OWNER EYE VERDICT (2026-07-30): GT1 visually CLEAN — the GT1 half of
+  0ab-C is CLOSED by the ground-truth rule. GT2 still visibly flashes,
+  ~24 black frames over a full run** (≈0.5/s visible vs the oracle's
+  ~3.3–3.9 black flushes/s — VNC delivery samples roughly 1-in-7 into
+  displayed frames). The GT2 residual is proven out of
+  KMD-publish-timing scope → **next session = the D4 family**, handoff at
+  **`tmp/handoff-gt2-d4/HANDOFF.md`**. Deferred hygiene items: the fast
+  path's mint-before-enqueue staleness (benign, one-line remedy documented
+  in the 220 implementor report); the `FpCoal`-heavy same-res coalescing
+  semantics if the pool ever deepens further.
+- **D4a v1 BUILT, LIVE, and MEASURED INERT on GT2 black — the in-flight
+  conditional's blind spot found (2026-07-30, KMD 22.22.222.0 + UMD/DXVK,
+  battery c6)**. The full acquire chain shipped and is proven end-to-end:
+  per-resid READ LEDGER page (escape 0x000E, `RdIss == RdRet` exact in
+  every cell, zero overflow/orphans), persistent retirement events
+  (0x000F), `ScanoutFlushToken` carries resource identity with
+  Drop-guaranteed retirement, DXVK arms conditional GPU-side timeline
+  waits at the reuse submission (GT2: armed ≈5 % of frames, signals
+  sub-8 ms, `residMiss=0`; GT1 0.4 %; desktop ~0), knob `ScanoutAcquire`
+  (default ON, free: **GT1 192.6 and Combined 22.44 — both records — with
+  it on**; GT2 213.5/209.8 fps in band; 0ab-A gate 0.5 % exact; zero
+  bugchecks). **GT2 black: 3.9 %/4.0 % — unchanged from .221's
+  3.5/4.1 %.** The design's §8 falsifier fired with a sharper
+  localization: at ~2 frames of CPU run-ahead the reuse-list's ledger
+  check races the bind-edge flush ISSUE of the buffer's own last present —
+  the killer read is not yet in flight when the only sound check can run,
+  and the watermark orders that read only against its OWN frame's content
+  (0ab-A's guarantee, which held), not against the NEXT reuse's clear.
+  **The in-flight-only conditional (the −40 %-trap cost guard itself) is
+  therefore structurally insufficient at GT2's operating point.** Both
+  closures are owner-gated: **D4a v2** (settle-semantics wait — UMD-side
+  per-resid present counter closes the race by program order; KMD signals
+  settlement from the existing lease edges; cost = throttles run-ahead
+  toward flip cadence, unmeasured, same family as the §3(a) trap → build
+  knob-gated with a registered fps envelope) or **D4b** (host-side
+  read-at-completion in qemu-helios; structural kill, slow owner-gated
+  loop). Record: `tmp/handoff-gt2-d4/analysis/build222-results.md`
+  (+ `FIX-DESIGN-d4a.md` with scored predictions).
+- Interim shipping state 22.22.222.0 (D4a live-but-inert; superseded below).
+- **D4b — THE ORDERED SNAPSHOT CHAIN: BUILT, SHIPPED, and ORACLE-CLOSES the
+  GT2 residual (2026-08-02, KMD 22.22.224.0, battery c8). GT2 oracle black
+  3.9–4.1 % → 0.02–0.1 %.** Owner selected D4b; the design conversation
+  established that a QEMU-only fix cannot order against the venus-ring
+  clear (packaged render server, content destroyed before flush arrival),
+  so the snapshot/copy rides the ONLY viable insertion point — the app's
+  own submission stream: at present time DXVK records a GPU blit of the
+  presented primary into a 4-slot ring of DXVK-internal DirectOptimalScanout
+  images (queue-ordered after frame N, before clear N+2, NO waits); the
+  UMD substitutes the snapshot's full descriptor into the present private
+  data (`HELIOS_PRESENT_PRIVATE_FLAG_SNAPSHOT`, wire struct 40→48 B,
+  capability-gated by the 0x000E PROBE caps); the KMD carries it BY VALUE
+  into the flip and binds/flushes the snapshot while ALL flip bookkeeping
+  stays on the real allocation. Nothing ever clears a snapshot — the race
+  died structurally. QEMU/virglrenderer: zero changes. Census EXACT:
+  `SnSub = VpDmaF = FpBind`, `SnFbk = 0`, `FpSkip = 0`, `BeCar` dominant
+  (0ab-A preserved), `RdIss == RdRet` everywhere, zero bugchecks; GT1
+  black 0.2 % with the fps↔margin correlation broken (the mechanism's
+  differential signature), Combined 22.68 = record, desktop/MMIO path
+  untouched. **The .223 detour's permanent lesson: dxgkrnl does NOT
+  forward Present private data to DxgkDdiPresent on DMA flips (PBIdOk=2
+  across three generations) — per-present data for the flip arm must ride
+  the Render command; .224 stashes it per-context at DxgkDdiRender and
+  takes+clears at every Present.** Records:
+  `tmp/handoff-gt2-d4/analysis/{FIX-DESIGN-d4b-snapshot,build224-results}.md`
+  (+ build222-results.md for the D4a-v1 falsification that motivated it).
+  Residual black counts are 0ad-class transition edges. **0ab-C is
+  oracle-closed; the owner's eye (baseline ~24 visible flashes/run) is the
+  ground-truth close.** Note: the c8 battery ran at 1896×1030 (EDID/viewer
+  geometry after a host reboot) — fps not comparable to 1280×800
+  baselines; a `ScanoutSnapshot=0` A/B isolates the blit cost if wanted.
+- **0ab-C: CLOSED 2026-08-02, OWNER-CONFIRMED FIXED.** Close-out build
+  **22.22.225.0**: sane defaults made code defaults (`DisplayHalf` now
+  defaults ON — the render+display miniport is the product; the production
+  `reg add` is gone), leftover diagnostics retired (`PresentProbe` registry
+  value cleared; the dead PresentCb-private channel — decode, `PBIdOk`,
+  and the UMD's write — deleted outright, since dxgkrnl never forwarded it
+  on flip presents), census log cadences quieted to steady-state
+  (per-16384). Smoke on .225: GT2 black 1/4766 = 0.02 %, `SnSub == VpDmaF`,
+  ledger exact, zero faults. The entire 0ab arc (D1(ii) family + D4a + D4b)
+  is committed and pushed (main `wddm`, dxvk-helios `master`, qemu-helios
+  `helios-11.0.1`).
+- **SHIPPING STATE: 22.22.225.0**, all knobs at code defaults; kill
+  switches `ScanoutSnapshot=0` / `ScanoutAcquire=0` / `DispatchBind=0` /
+  `DisplayHalf=0`.
+- **NEXT FOCUS: PERFORMANCE (WS2)** — Fire Strike Graphics 43k → 70k+ at
+  400 W (600 W changed nothing ⇒ the GPU is underutilized, hunt the
+  bubbles), Combined → 10k+. Handoff:
+  **`tmp/handoff-perf-saturation/HANDOFF.md`** (attribution-first charter,
+  the R6/R7 lever space, the canonical-run problem, gates that keep the
+  0ab close from regressing).
 
 ## Workstream 1 — Stability
 
@@ -408,6 +1453,71 @@ Open defects, roughly ordered:
       stop paying loader enumeration + ICD load per device. Not attempted here
       — different blast radius.
 
+0ac. **NEW 2026-07-29 (factorial campaign, run D-2x): guest BUGCHECK `0xD1`
+   DRIVER_IRQL_NOT_LESS_OR_EQUAL in `helios_kmd_render.sys` — on
+   22.22.212.0, the PRE-LEASE build**, 41 s into a Fire Strike GT1 run at
+   BindFlushMode=0. Read of `0x00000001'59b430d0` at DISPATCH_LEVEL from
+   `helios_kmd_render+0x21076`; two frames up the stack sits the VALID kernel
+   pointer `0xffffd38f'59b43050` (same region, high dword ffffd38f→00000001,
+   low +0x80) — shape of a torn/truncated 64-bit pointer dereference.
+   WinDbg bucket (public symbols, nearest-symbol hint only) names the
+   virtio transport / `WdkHal` / `DxgkConfigAccess` region. **Evidence
+   preserved**: kernel dump `C:\HeliosDumps\MEMORY-D2-212-mode0-20260729-2002.DMP`
+   (1 GB), minidump `C:\Windows\Minidump\072926-6359-01.dmp`, counter polls to
+   t+41 s and the oracle slice under
+   `tmp/handoff-0ab-b-lease/analysis/logs/D-2-VOID-bugcheck.*`. Intermittent
+   (~1 in 10 GT1 runs); the same config re-ran clean before and after.
+   3DMark logged `workload did not respond` for 11 s before the crash while
+   the oracle still saw 390–490 flushes/s — the graphics pipeline was live,
+   the workload's IPC was not. **This retires "treat the lease gate as the
+   prime suspect" for the 2026-07-29 19:08 hard hang** — the class reproduces
+   on the rollback build.
+   **TRIAGED 2026-07-29 (no matching PDB — resolved via `.pdata` bounds + a
+   487/506-byte match against the current build's `.map`)** →
+   `tmp/handoff-0ab-b-lease/analysis/bugcheck-d1.md`. The faulting function is
+   `AdapterContext::with_virtio` reached from `hpd_thread_routine →
+   process_deferred_vidpn_source_address → … → arm_bind_refresh`; the
+   dereference is the `Option<VirtioGpu>` discriminant test at `+0x80`
+   (`locks.rs:263`), first touch after `virtio_lock`. The CONTEXT record shows
+   `rsi/rdi/r13/rbx/r12` correct and **`r14` alone** holding
+   `0x00000001'59b43050` where `&AdapterContext` belongs — corrupted ACROSS
+   `KeAcquireSpinLockRaiseToDpc` (the consecutive `mov r14,rcx` /
+   `lea rsi,[rcx+0xb28]` had a good `rcx`; the real `virtio_lock` reads held).
+   Ruled out with dump evidence: torn reads, in-flight reuse, DMA recycling,
+   stack overflow, pool corruption, enlightened-spinlock path
+   (`HvlEnlightenments=0`), lease code. Since no x86-64 instruction writes
+   only a GPR's high dword, `r14` was RESTORED from a damaged image:
+   **H1** a VM-exit register round-trip (PLE exits during the contended spin,
+   `ple_gap=128`; contention was climbing — ISR 521→943/s in the final 10 s) /
+   **H2** a 4-byte `1` over a saved-`r14` stack slot in the DIRQL interrupt
+   chain (our ISR is verifiably clean; the INTx line is shared with the
+   balloon, 29th-session memory) / **H3** marginal host CPU / **H4** the
+   `hv-*` enlightenment set changing exit paths. Per the host-proven-good
+   rule none is promotable without host-side evidence.
+   **Mitigations landing in 22.22.217.0 (build 1):** the `WvTorn` tripwire in
+   `with_virtio` (converts a recurrence into a counter + graceful Err instead
+   of a bugcheck) and PDB archiving next to every deployed `.sys`.
+   **OWNER-GATED discriminating A/B (the actual fix path — host config only):**
+   ≥20-run GT1 loops under (a) baseline, (b) `kvm_intel ple_gap=0`,
+   (c) `hv-spinlocks`/`hv-avic`/`hv-evmcs` dropped, (d) balloon device removed
+   (shares IRQ 22); watch `dmesg -w` + `/sys/kernel/debug/kvm/*/pause_exits`
+   during the loops. (b)/(c) stopping it ⇒ H1/H4; surviving all ⇒ H2/H3.
+
+0ad. **NEW 2026-07-29 (metric validation): the fullscreen→desktop transition
+   sends one undersized `SET_SCANOUT_BLOB` and the host readback goes dark for
+   ~250 ms.** In every trace, at the transition, res 6 arrives with
+   `blob_size 4096000` (= 1280×800×4, the LINEAR size) against the OPTIMAL
+   import's `required=4587520`; the vk-optimal path refuses the shape, the
+   vk-linear import is rejected for all usages, and the egl-texture path
+   refuses the modifier-less reinterpretation (`glEGLImageTargetTexture2DOES`
+   0x502). `egl_scanout_dmabuf` had already deactivated the previous readback
+   on entry, so NO readback exists until the next successful bind ~250 ms
+   later. ⚠ The refusals themselves are correct — the undersize guard is
+   Xid-31 protection and must NOT be relaxed (38th-session memory); the defect
+   is guest-side: whatever binds res 6 at the transition presents a
+   LINEAR-sized blob to a path that needs the padded OPTIMAL size, and the
+   gap in coverage is user-visible as a transition blackout.
+
 0z. **NEW, 2026-07-27 (R614 gate): the Mesa venus ICD does not survive adapter teardown —
    `pnputil /restart-device` ACCESS-VIOLATES every process holding a venus device.** Each
    restart-device cycle logs Application-log id 1000 faults with
@@ -430,6 +1540,10 @@ Open defects, roughly ordered:
    touching a venus object (or its ring/reply BAR mapping) after StopDevice destroyed the host
    context — i.e. the ICD has no adapter-loss path, which is the same class as the 17th-session
    DEVICE_LOST chain but on teardown rather than on a slow present.
+   **2026-07-29 factorial campaign: reproduced 6/6** — every `pnputil /restart-device`
+   crashed dwm/Explorer/SearchHost/StartMenuExperienceHost/ApplicationFrameHost in
+   `vulkan_virtio-*.dll` (0xc0000005); desktop recovered within ~10 s each time
+   (screenshot-verified before every run). restart-device is NOT a free operation.
 
 0a. **Ghosting — ROOT-CAUSED AND FIXED IN LAYERS (21st session, 2026-07-06).** Owner
    insight proved out: the dirty-rect *attribution* was fine; STUTTER caused the
@@ -1764,6 +2878,25 @@ Plan:
 
 ## Tooling (keep alive; this stage depends on it)
 
+- **What is on the SCREEN, sampled at ~30/s** — `tools/vnc_frame_probe.py` +
+  `tools/vnc_scanout_correlate.py` (added 2026-07-29 for defect 0ab; needs
+  numpy + pillow, host-side only, a venv is fine).
+  The probe is an RFB client against QEMU's VNC server. It stamps every
+  framebuffer update with `time.time()` — the SAME CLOCK as the
+  `virtio_gpu_cmd_*` lines QEMU's `log` trace backend writes to
+  `/tmp/helios-qemu-stderr.log` — so a displayed frame can be attributed to a
+  specific `res_flush`. Enable the events over QMP first:
+  `python3 qmp trace-event-set-state virtio_gpu_cmd_set_scanout_blob /
+  _res_flush / _res_unref` on `/tmp/helios-tpm/mon.sock`.
+  Its **completeness oracle** is what makes it decisive: `--hud x0,y0,x1,y1`
+  names a rectangle that is bright in every FINISHED application frame
+  (3DMark's fps bar by default), which separates "the app rendered a dark
+  scene" from "we displayed a frame the app had not finished". Whole-frame
+  brightness cannot do that and led two sessions astray.
+  ⚠ `screendump` is not an alternative under `sdl,gl=on` OR `egl-vnc`: the
+  console's scanout kind is DMABUF, so QMP answers `"no surface"`.
+  ⚠ Use `--exclusive`; QEMU refuses a SHARED client while an exclusive viewer
+  (most viewers) is connected, and drops it silently after ClientInit.
 - **Registry knobs** (service key, active KMD reads): `DiagLevel`,
   `AllocCached`, `DisplayHalf`, `ScanoutDiag`,
   `DirectFlipCaps`, `CrossAdaptCaps`, `BarSegMode`, `BarSegFlags`,
