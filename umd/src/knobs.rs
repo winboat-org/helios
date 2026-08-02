@@ -197,18 +197,36 @@ pub(crate) static SCANOUT_ACQUIRE: BoolKnob = BoolKnob::new(c"ScanoutAcquire", t
 /// mechanism, behind one cheap check.
 pub(crate) static SCANOUT_SNAPSHOT: BoolKnob = BoolKnob::new(c"ScanoutSnapshot", true);
 
+/// FREETHREADED THREADING-caps kill switch (Phase B of the command-list
+/// build, `tmp/handoff-perf-structural/PLAN-commandlists.md`). Absent = ON;
+/// explicit 0 reverts the adapter to THREADING caps = 0 without a redeploy
+/// (a fresh process re-reads it; the caps answer is per-process).
+///
+/// ON reports `D3D11DDICAPS_FREETHREADED`: the runtime stops taking its
+/// device critical section around create/destroy/calc DDIs, so they arrive
+/// concurrently with immediate-context DDIs — the contention this removes
+/// was measured at 5.6 % of the render thread (65th session,
+/// `RtlpEnterCriticalSectionContended` under `CUseCountedObject::Release`).
+/// The state this exposes went thread-safe in Phase A (`ShaderCaches` mutex,
+/// `CtxBindings` atomics, `direct_scanout_allocations` mutex); present-path
+/// RefCells stay immediate-only and the runtime still serializes those.
+/// This knob NEVER enables command-list caps — see
+/// `device_funcs::threading_caps`.
+pub(crate) static UMD_FREE_THREADED: BoolKnob = BoolKnob::new(c"UmdFreeThreaded", true);
+
 /// The knob inventory, so the set is enumerable instead of grep-discoverable.
 ///
 /// Each entry is `(value name, resolved value as text)`. Resolving forces every
 /// `OnceLock`, which is why this is not called on any hot path — it exists for
 /// a one-shot dump at load, and for anyone asking "what knobs are there".
-pub(crate) fn resolved_inventory() -> [(&'static str, u32); 5] {
+pub(crate) fn resolved_inventory() -> [(&'static str, u32); 6] {
     [
         ("UmdTrace", UMD_TRACE.get() as u32),
         ("FeatureLevel11", FEATURE_LEVEL_11.get()),
         ("VehicleFlipGateUs", VEHICLE_FLIP_GATE_US.get()),
         ("ScanoutAcquire", SCANOUT_ACQUIRE.get() as u32),
         ("ScanoutSnapshot", SCANOUT_SNAPSHOT.get() as u32),
+        ("UmdFreeThreaded", UMD_FREE_THREADED.get() as u32),
     ]
 }
 
@@ -288,5 +306,12 @@ pub(crate) fn scanout_acquire_knob() -> bool {
 /// [`SCANOUT_SNAPSHOT`].
 pub(crate) fn scanout_snapshot_knob() -> bool {
     SCANOUT_SNAPSHOT.get()
+}
+
+/// FREETHREADED THREADING-caps kill switch:
+/// `HKLM\SOFTWARE\Helios!UmdFreeThreaded` (REG_DWORD). Read once per process.
+/// Absent = ON; explicit 0 reverts to caps = 0. See [`UMD_FREE_THREADED`].
+pub(crate) fn umd_free_threaded() -> bool {
+    UMD_FREE_THREADED.get()
 }
 

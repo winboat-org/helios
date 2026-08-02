@@ -267,28 +267,49 @@ impl BridgeOwned {
     }
 }
 
+/// `D3D11DDICAPS_FREETHREADED` (d3d10umddi.h; NOT in the bindgen output —
+/// the cap *bit* macros are preprocessor defines bindgen's allowlist misses).
+pub const D3D11DDICAPS_FREETHREADED: u32 = 0x1;
+/// `D3D11DDICAPS_COMMANDLISTS` (deprecated at BUILD_VERSION >= 2) and
+/// `D3D11DDICAPS_COMMANDLISTS_BUILD_2`. Declared ONLY for the compile-time
+/// guarantee below; nothing may report them until the R812 slots are real.
+pub const D3D11DDICAPS_COMMANDLISTS: u32 = 0x2;
+pub const D3D11DDICAPS_COMMANDLISTS_BUILD_2: u32 = 0x4;
+
+/// Every THREADING cap this driver can EVER report with the current slot
+/// implementations. The compile-time assert in `install_calc_and_lifecycle`
+/// checks this set, not the runtime value: [`threading_caps`] is structurally
+/// incapable of returning bits outside it, so "the knob can never enable
+/// command lists against stub slots" stays a build-time fact even though the
+/// reported value is now knob-dependent. Phase C widens this const together
+/// with the real deferred-context/command-list slots — that edit is the
+/// intended tripwire.
+pub const THREADING_CAPS_POSSIBLE: u32 = D3D11DDICAPS_FREETHREADED;
+
 /// `D3D11DDI_THREADING_CAPS::Caps`, the value `get_caps` reports.
 ///
-/// **MUST stay 0 while the deferred-context / command-list slots are stubs
-/// (see R812).** The remaining single-threaded dependents are:
+/// Phase B of the command-list plan
+/// (`tmp/handoff-perf-structural/PLAN-commandlists.md`): FREETHREADED when
+/// the `UmdFreeThreaded` knob is on (absent = ON; explicit 0 is the kill
+/// switch), else 0. The runtime then calls create/destroy/calc DDIs from any
+/// thread, concurrent with the immediate context — the state that exposes
+/// went thread-safe in Phase A ([`ShaderCaches`] mutex, [`CtxBindings`]
+/// atomics, `direct_scanout_allocations` mutex). The present-path `RefCell`s
+/// ([`BridgeOwned::present_src_cache`], [`BridgeOwned::snapshot_ring`]) and
+/// the [`RuntimeContext`] window `Cell`s remain sound: present and the other
+/// immediate-context DDIs stay runtime-serialized under FREETHREADED.
 ///
-/// * the present-path `RefCell`s ([`BridgeOwned::present_src_cache`],
-///   [`BridgeOwned::snapshot_ring`]) and the [`RuntimeContext`] window
-///   `Cell`s — safe under FREETHREADED too, because present and the other
-///   immediate-context DDIs stay runtime-serialized; only creates/destroys/
-///   calcs go concurrent. What FREETHREADED actually unlocks needed the
-///   shader caches behind a `Mutex` ([`BridgeOwned::caches`]) and the binding
-///   shadow as relaxed atomics ([`CtxBindings`]) — done (Phase A of the
-///   command-list plan, `tmp/handoff-perf-structural/PLAN-commandlists.md`).
-/// * the deferred-context and command-list Create slots R812 covers, which
-///   this cap value keeps uncalled. Flipping FREETHREADED alone is legal
-///   (creates go concurrent, command lists stay emulated); reporting any
-///   COMMANDLISTS cap without real slot implementations is silent heap
-///   corruption inside the runtime allocator.
-///
-/// Guarantee is one definition site carrying the rationale, referenced by the
-/// caps writer -- not a token. R811.
-pub const THREADING_CAPS: u32 = 0;
+/// COMMANDLISTS bits stay impossible (see [`THREADING_CAPS_POSSIBLE`]):
+/// reporting them while the deferred-context/command-list Create slots are
+/// the R812 stubs would be silent heap corruption inside the runtime
+/// allocator (256-byte stub sizes for >256-byte driver objects). R811/R812.
+pub fn threading_caps() -> u32 {
+    if crate::umd_free_threaded() {
+        THREADING_CAPS_POSSIBLE
+    } else {
+        0
+    }
+}
 
 /// Per-device UMD state, constructed in-place in the runtime-allocated private
 /// device memory (size = [`device_private_size`]). Owns the DXVK device the cxx
@@ -524,7 +545,8 @@ unsafe extern "C" fn ddi_calc_size(_a: usize) -> usize {
 }
 
 /// Times the runtime called `pfnCheckDeferredContextHandleSizes`. Expected 0:
-/// [`THREADING_CAPS`] is 0, so the runtime never builds deferred contexts.
+/// [`threading_caps`] never reports a COMMANDLISTS bit, so the runtime never
+/// builds deferred contexts (FREETHREADED alone does not trigger this probe).
 static CHECK_DEFERRED_HANDLE_SIZES_CALLS: AtomicUsize = AtomicUsize::new(0);
 
 /// `pfnCheckDeferredContextHandleSizes` -- and it is NOT a size getter.
@@ -552,7 +574,7 @@ unsafe extern "C" fn ddi_check_deferred_context_handle_sizes(
             "DDI CheckDeferredContextHandleSizes called (x{}) — unexpected at \
              THREADING caps = {}",
             n + 1,
-            THREADING_CAPS
+            threading_caps()
         );
     }
     if !p_h_sizes.is_null() {
@@ -969,12 +991,18 @@ unsafe fn install_calc_and_lifecycle(f: &mut ddi::D3D11DDI_DEVICEFUNCS) {
     // (pfnCalcDeferredContextHandleSize, pfnCalcPrivateDeferredContextSize,
     // pfnCalcPrivateCommandListSize) keep the 256-byte stub. That is sound ONLY
     // because the runtime never calls the paired Create, and the reason it
-    // never does is THREADING caps = 0 -- a fact that was stated in neither
-    // place before R812. Implementing pfnCreateDeferredContext and flipping the
-    // cap (a natural pair of steps for D3D11 conformance) would write a
-    // >256-byte driver object into hDrvContext with the stub still reporting
-    // 256: heap corruption inside the runtime's allocator, no diagnostic.
-    const _: () = assert!(THREADING_CAPS == 0);
+    // never does is that no COMMANDLISTS cap is ever reported -- a fact that
+    // was stated in neither place before R812. Implementing
+    // pfnCreateDeferredContext and flipping the cap (a natural pair of steps
+    // for D3D11 conformance) would write a >256-byte driver object into
+    // hDrvContext with the stub still reporting 256: heap corruption inside
+    // the runtime's allocator, no diagnostic. The reported value is
+    // knob-dependent since Phase B (FREETHREADED does NOT trigger these
+    // slots), so the guarantee is pinned on the POSSIBLE set instead.
+    const _: () = assert!(
+        THREADING_CAPS_POSSIBLE & (D3D11DDICAPS_COMMANDLISTS | D3D11DDICAPS_COMMANDLISTS_BUILD_2)
+            == 0
+    );
     // Not a size getter -- a void writer. Installed with its real signature, no
     // transmute, identically in every table. R812.
     f.pfnCheckDeferredContextHandleSizes = Some(ddi_check_deferred_context_handle_sizes);

@@ -272,8 +272,14 @@ impl<S> Slot<Boxed<S>> {
     /// Borrow the boxed state. `None` for an empty slot.
     ///
     /// # Safety
-    /// The single-threaded-DDI contract (THREADING caps = 0, see R811) is what
-    /// makes handing out a `&S` here sound; there is no interior locking.
+    /// There is no interior locking. Two invariants make the `&S` sound:
+    /// under THREADING caps = 0 the runtime serializes every DDI call (the
+    /// original R811 contract); under FREETHREADED (Phase B) the runtime's
+    /// use-counting guarantees an object's Destroy DDI — the only `take()`
+    /// path — never runs concurrently with a DDI still using the handle
+    /// (`CUseCountedObject`, first-created/last-destroyed ordering). Either
+    /// way no borrow can overlap the box's teardown. What FREETHREADED does
+    /// allow is concurrent *reads*, which `&S` permits by construction.
     pub(crate) unsafe fn get(self) -> Option<&'static S> {
         let p = unsafe { self.cell.as_ptr().read() }.cast::<S>();
         if p.is_null() {

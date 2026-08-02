@@ -182,12 +182,12 @@ pub(crate) unsafe extern "C" fn get_caps(
             match args.Type {
                 // D3D11DDI_THREADING_CAPS::Caps. Zero means no free-threaded
                 // mode and no command-list build support; the runtime must
-                // serialize/emulate.
+                // serialize/emulate. Knob-dependent since Phase B: the value
+                // and the state model it licenses live on one function whose
+                // POSSIBLE set is compile-time pinned to exclude the
+                // COMMANDLISTS bits while the R812 slots are stubs. R811.
                 D3D11DDICAPS_THREADING if args.DataSize >= 4 => {
-                    // The value and the state model it licenses now live on one
-                    // symbol, next to the Cell/RefCell fields that are sound
-                    // only because it is 0. R811.
-                    let caps = device_funcs::THREADING_CAPS;
+                    let caps = device_funcs::threading_caps();
                     unsafe { *(args.pData as *mut u32) = caps };
                     log_error!("  GetCaps: THREADING caps = {caps}");
                 }
