@@ -980,8 +980,7 @@ macro_rules! stage_set_shader {
      $(, also_set: $extra:ident)?) => {
         pub(crate) unsafe extern "C" fn $name(h: Hdevice, h_shader: ddi::D3D10DDI_HSHADER) {
             let com = handle_com_raw(h_shader);
-            if let Some(dev) = helios_device(h) {
-                let bindings = &dev.owned.bindings;
+            if let Some(bindings) = ctx_bindings(h) {
                 bindings.$current.store(com, Ordering::Relaxed);
                 $(bindings.$extra.store(com, Ordering::Relaxed);)?
             }

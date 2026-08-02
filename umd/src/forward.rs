@@ -18,6 +18,7 @@ mod alloc;
 mod handles;
 
 mod bindings;
+mod deferred;
 mod format_caps;
 mod layout;
 mod pipeline;
@@ -37,6 +38,7 @@ mod views;
 pub(super) use crate::bridge::{DstRes, SrcRes};
 pub(super) use alloc::{ScanoutGeometry, VenusBacking};
 pub(crate) use bindings::*;
+pub(crate) use deferred::*;
 pub(crate) use format_caps::*;
 pub(super) use handles::{Boxed, Com, ComHandle, DdiHandle, Slot};
 pub(crate) use layout::*;

@@ -214,12 +214,28 @@ pub(crate) static SCANOUT_SNAPSHOT: BoolKnob = BoolKnob::new(c"ScanoutSnapshot",
 /// `device_funcs::threading_caps`.
 pub(crate) static UMD_FREE_THREADED: BoolKnob = BoolKnob::new(c"UmdFreeThreaded", true);
 
+/// Native deferred-context/command-list DDIs (Phase C of the command-list
+/// build, `tmp/handoff-perf-structural/PLAN-commandlists.md`). Bring-up
+/// default **OFF** — explicit 1 enables; the declared default flips to ON
+/// only after the full Phase C gate set passes. Per-process read.
+///
+/// ON (and only with [`UMD_FREE_THREADED`] also on — COMMANDLISTS requires
+/// FREETHREADED) reports `D3D11DDICAPS_COMMANDLISTS_BUILD_2`: the runtime
+/// stops emulating command lists (worker-thread SWDC recording + render-
+/// thread SWCL replay, the verified #1 render-thread cost) and instead
+/// records through our deferred-context DDI onto DXVK's stock
+/// `D3D11DeferredContext`, handing finished `ID3D11CommandList`s to
+/// `pfnCommandListExecute`. The DDI slots themselves are real and installed
+/// unconditionally; this knob only controls whether the caps bit invites the
+/// runtime to use them. See `device_funcs::threading_caps`.
+pub(crate) static UMD_COMMAND_LISTS: BoolKnob = BoolKnob::new(c"UmdCommandLists", false);
+
 /// The knob inventory, so the set is enumerable instead of grep-discoverable.
 ///
 /// Each entry is `(value name, resolved value as text)`. Resolving forces every
 /// `OnceLock`, which is why this is not called on any hot path — it exists for
 /// a one-shot dump at load, and for anyone asking "what knobs are there".
-pub(crate) fn resolved_inventory() -> [(&'static str, u32); 6] {
+pub(crate) fn resolved_inventory() -> [(&'static str, u32); 7] {
     [
         ("UmdTrace", UMD_TRACE.get() as u32),
         ("FeatureLevel11", FEATURE_LEVEL_11.get()),
@@ -227,6 +243,7 @@ pub(crate) fn resolved_inventory() -> [(&'static str, u32); 6] {
         ("ScanoutAcquire", SCANOUT_ACQUIRE.get() as u32),
         ("ScanoutSnapshot", SCANOUT_SNAPSHOT.get() as u32),
         ("UmdFreeThreaded", UMD_FREE_THREADED.get() as u32),
+        ("UmdCommandLists", UMD_COMMAND_LISTS.get() as u32),
     ]
 }
 
@@ -313,5 +330,15 @@ pub(crate) fn scanout_snapshot_knob() -> bool {
 /// Absent = ON; explicit 0 reverts to caps = 0. See [`UMD_FREE_THREADED`].
 pub(crate) fn umd_free_threaded() -> bool {
     UMD_FREE_THREADED.get()
+}
+
+/// Native command-list enable: `HKLM\SOFTWARE\Helios!UmdCommandLists`
+/// (REG_DWORD). Read once per process. Absent = OFF during bring-up
+/// (explicit 1 enables). Forced off when [`umd_free_threaded`] is off —
+/// COMMANDLISTS caps require FREETHREADED, so `UmdFreeThreaded=0` remains the
+/// one kill switch that reverts the whole threading surface at once. See
+/// [`UMD_COMMAND_LISTS`].
+pub(crate) fn umd_command_lists() -> bool {
+    UMD_COMMAND_LISTS.get() && UMD_FREE_THREADED.get()
 }
 

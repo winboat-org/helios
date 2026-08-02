@@ -42,8 +42,10 @@ const SUPPORTED_DDI_VERSIONS: &[u64] = &[
 /// `create_device` while installing no `pfnGetSupportedVersions`, so on that
 /// path the negotiated interface is entirely the runtime's choice and every
 /// D3D10 interface (`0x000a_0001..0x000a_000a`) landed in that `else`.
+/// `pub(crate)`: stored on `HeliosDevice` since Phase C — a deferred context
+/// fills its context-funcs table in the parent device's negotiated shape.
 #[derive(Copy, Clone, PartialEq, Eq)]
-enum NegotiatedInterface {
+pub(crate) enum NegotiatedInterface {
     D3D11_0,
     D3D11_1,
     Wddm1_3,
@@ -64,7 +66,7 @@ impl NegotiatedInterface {
         }
     }
 
-    fn name(self) -> &'static str {
+    pub(crate) fn name(self) -> &'static str {
         match self {
             Self::Wddm1_3 => "WDDM1_3",
             Self::D3D11_1 => "D3D11_1",
@@ -388,6 +390,9 @@ unsafe extern "C" fn create_device(
         core::ptr::write(
             create.hDrvDevice.pDrvPrivate as *mut device_funcs::HeliosDevice,
             device_funcs::HeliosDevice {
+                // The discrimination word every HDEVICE resolver reads before
+                // casting (a deferred context shares the handle namespace).
+                tag: device_funcs::HELIOS_TAG_DEVICE,
                 // One grouped field, constructed (and declared) before `dxvk`
                 // so every bridge-derived COM object it holds outlives the
                 // bridge device rather than three of the four dropping after
@@ -413,6 +418,7 @@ unsafe extern "C" fn create_device(
                 direct_scanout_allocations: std::sync::Mutex::new(Vec::new()),
                 h_rt_core_layer: create.hRTCoreLayer.handle,
                 um_callbacks: p_um_callbacks.cast(),
+                negotiated,
             },
         );
     }

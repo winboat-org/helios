@@ -277,20 +277,17 @@ pub const D3D11DDICAPS_COMMANDLISTS: u32 = 0x2;
 pub const D3D11DDICAPS_COMMANDLISTS_BUILD_2: u32 = 0x4;
 
 /// Every THREADING cap this driver can EVER report with the current slot
-/// implementations. The compile-time assert in `install_calc_and_lifecycle`
-/// checks this set, not the runtime value: [`threading_caps`] is structurally
-/// incapable of returning bits outside it, so "the knob can never enable
-/// command lists against stub slots" stays a build-time fact even though the
-/// reported value is now knob-dependent. Phase C widens this const together
-/// with the real deferred-context/command-list slots — that edit is the
-/// intended tripwire.
-pub const THREADING_CAPS_POSSIBLE: u32 = D3D11DDICAPS_FREETHREADED;
+/// implementations. Phase C widened this together with the real deferred-
+/// context/command-list slots — the pairing the R811/R812 assert existed to
+/// force. The deprecated COMMANDLISTS (0x2) bit stays impossible; BUILD_2
+/// devices report only 0x1|0x4.
+pub const THREADING_CAPS_POSSIBLE: u32 =
+    D3D11DDICAPS_FREETHREADED | D3D11DDICAPS_COMMANDLISTS_BUILD_2;
 
 /// `D3D11DDI_THREADING_CAPS::Caps`, the value `get_caps` reports.
 ///
-/// Phase B of the command-list plan
-/// (`tmp/handoff-perf-structural/PLAN-commandlists.md`): FREETHREADED when
-/// the `UmdFreeThreaded` knob is on (absent = ON; explicit 0 is the kill
+/// Phase B (`tmp/handoff-perf-structural/PLAN-commandlists.md`): FREETHREADED
+/// when the `UmdFreeThreaded` knob is on (absent = ON; explicit 0 is the kill
 /// switch), else 0. The runtime then calls create/destroy/calc DDIs from any
 /// thread, concurrent with the immediate context — the state that exposes
 /// went thread-safe in Phase A ([`ShaderCaches`] mutex, [`CtxBindings`]
@@ -299,22 +296,62 @@ pub const THREADING_CAPS_POSSIBLE: u32 = D3D11DDICAPS_FREETHREADED;
 /// the [`RuntimeContext`] window `Cell`s remain sound: present and the other
 /// immediate-context DDIs stay runtime-serialized under FREETHREADED.
 ///
-/// COMMANDLISTS bits stay impossible (see [`THREADING_CAPS_POSSIBLE`]):
-/// reporting them while the deferred-context/command-list Create slots are
-/// the R812 stubs would be silent heap corruption inside the runtime
-/// allocator (256-byte stub sizes for >256-byte driver objects). R811/R812.
+/// Phase C: |= COMMANDLISTS_BUILD_2 when `UmdCommandLists` is also on (the
+/// knob accessor itself forces it off without FREETHREADED — COMMANDLISTS
+/// requires FREETHREADED per the WDK). The deferred-context/command-list
+/// slots this invites the runtime to call are REAL and installed
+/// unconditionally by `install_calc_and_lifecycle`/`forward::install`, so the
+/// R812 hazard (a 256-byte calc stub paired with a live Create) is gone
+/// structurally: caps only decide whether the runtime USES the slots, never
+/// whether they are safe to call.
 pub fn threading_caps() -> u32 {
-    if crate::umd_free_threaded() {
-        THREADING_CAPS_POSSIBLE
-    } else {
-        0
+    if !crate::umd_free_threaded() {
+        return 0;
+    }
+    let mut caps = D3D11DDICAPS_FREETHREADED;
+    if crate::umd_command_lists() {
+        caps |= D3D11DDICAPS_COMMANDLISTS_BUILD_2;
+    }
+    caps
+}
+
+/// First word of every object this driver constructs behind a
+/// `D3D10DDI_HDEVICE`'s `pDrvPrivate`. A deferred context IS an HDEVICE at
+/// the DDI level (there is no pfnDestroyContext — DCs are destroyed through
+/// pfnDestroyDevice), so once command lists exist two different types share
+/// one handle namespace and every resolver must discriminate BEFORE casting.
+/// Full-word magic values, not small enums: a stray private block cannot
+/// alias a valid tag by accident.
+pub const HELIOS_TAG_DEVICE: usize = 0x4845_4C49_4F44_4556; // "HELIODEV"
+pub const HELIOS_TAG_DEFERRED: usize = 0x4845_4C49_4F44_4643; // "HELIODFC"
+
+/// `D3D10DDI_HDEVICE` handles whose private block carried neither tag.
+/// Count + refuse, never cast: a wild cast here is the worst-risk failure of
+/// the whole deferred-context feature (`ddi_destroy_device` tearing a device
+/// down through a DC pointer, or vice versa).
+pub static DEVICE_TAG_MISMATCH: AtomicUsize = AtomicUsize::new(0);
+
+/// Bump the mismatch counter and log its first hits.
+pub(crate) fn note_device_tag_mismatch(site: &str, tag: usize) {
+    let n = DEVICE_TAG_MISMATCH.fetch_add(1, Ordering::Relaxed);
+    if n < 16 {
+        log_error!("{site}: HDEVICE tag mismatch tag=0x{tag:016x} (x{}) — refused", n + 1);
     }
 }
 
 /// Per-device UMD state, constructed in-place in the runtime-allocated private
 /// device memory (size = [`device_private_size`]). Owns the DXVK device the cxx
 /// bridge created on the Helios venus adapter.
+///
+/// `#[repr(C)]` so `tag` is guaranteed to sit at offset 0 — the resolvers and
+/// `ddi_destroy_device` read that word through the raw handle before deciding
+/// which type the block is. Field DROP order is still declaration order
+/// (`owned` before `dxvk`, see [`BridgeOwned`]); repr(C) fixes offsets, not
+/// drop semantics.
+#[repr(C)]
 pub struct HeliosDevice {
+    /// Always [`HELIOS_TAG_DEVICE`]; must stay the first field.
+    pub tag: usize,
     /// Everything this device owns that came OUT of the bridge, in one field
     /// declared before `dxvk`. See [`BridgeOwned`] for why the position and
     /// the explicit `release()` both exist.
@@ -344,6 +381,43 @@ pub struct HeliosDevice {
     /// DDIs can report failures to the runtime instead of leaving null handles.
     pub h_rt_core_layer: *mut core::ffi::c_void,
     pub um_callbacks: *const core::ffi::c_void,
+    /// The interface level this device negotiated at CreateDevice. A deferred
+    /// context created on this device fills its context-funcs table in the
+    /// SAME shape (`D3D11DDIARG_CREATEDEFERREDCONTEXT`'s funcs union member is
+    /// selected by the device's negotiated level).
+    pub negotiated: crate::adapter::NegotiatedInterface,
+}
+
+/// Per-deferred-context UMD state, constructed in-place in the runtime-
+/// allocated `hDrvContext` private memory (size =
+/// [`deferred_context_private_size`]). At the DDI level a deferred context IS
+/// an HDEVICE — same handle type, destroyed through `pfnDestroyDevice` — so
+/// this starts with the same tag header as [`HeliosDevice`] and every
+/// resolver discriminates before casting.
+#[repr(C)]
+pub struct HeliosDeferredContext {
+    /// Always [`HELIOS_TAG_DEFERRED`]; must stay the first field.
+    pub tag: usize,
+    /// The device this DC records against. Valid for the DC's whole life:
+    /// the runtime guarantees the device (an IC handle is first-created/
+    /// last-destroyed) outlives every DC created on it.
+    pub parent: *const HeliosDevice,
+    /// Owned DXVK deferred COM context from `ID3D11Device::CreateDeferredContext`.
+    /// Never crosses the cxx bridge — the five immediate-context static_casts
+    /// in dxvk_bridge.cpp must never see a deferred pointer.
+    pub dc: Option<windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext>,
+    /// This DC's own pipeline binding shadow (the immediate context's copy is
+    /// [`BridgeOwned::bindings`]).
+    pub bindings: CtxBindings,
+    /// The DC's OWN corelayer handle + callbacks: per the WDK, a DC create/
+    /// record error is reported through the DC's pfnSetErrorCb, not the
+    /// device's.
+    pub dc_core_layer: *mut core::ffi::c_void,
+    pub dc_um_callbacks: *const core::ffi::c_void,
+}
+
+pub fn deferred_context_private_size() -> usize {
+    core::mem::size_of::<HeliosDeferredContext>()
 }
 
 /// Device-global shader/layout caches (see [`BridgeOwned::caches`]).
@@ -460,6 +534,34 @@ pub struct CtxBindings {
     pub current_layout: AtomicUsize,
 }
 
+impl CtxBindings {
+    /// Zero every shadow slot. Used for the clear-state semantics of
+    /// `pfnCommandListExecute` (post-execute the runtime treats everything as
+    /// unbound and rebinds lazily) and for `pfnRecycleCreateDeferredContext`
+    /// (the DC is reborn for its next recording).
+    pub fn reset(&self) {
+        self.bound_vs_com.store(0, Ordering::Relaxed);
+        self.current_vs.store(0, Ordering::Relaxed);
+        self.current_ps.store(0, Ordering::Relaxed);
+        self.current_gs.store(0, Ordering::Relaxed);
+        self.current_hs.store(0, Ordering::Relaxed);
+        self.current_ds.store(0, Ordering::Relaxed);
+        self.current_cs.store(0, Ordering::Relaxed);
+        self.current_topology.store(0, Ordering::Relaxed);
+        self.current_vb0.store(0, Ordering::Relaxed);
+        self.current_vb0_stride.store(0, Ordering::Relaxed);
+        self.current_vb0_offset.store(0, Ordering::Relaxed);
+        self.current_ib.store(0, Ordering::Relaxed);
+        self.current_ib_format.store(0, Ordering::Relaxed);
+        self.current_ib_offset.store(0, Ordering::Relaxed);
+        self.current_rt0_alloc.store(0, Ordering::Relaxed);
+        self.current_rt0_width.store(0, Ordering::Relaxed);
+        self.current_rt0_height.store(0, Ordering::Relaxed);
+        self.current_rt0_format.store(0, Ordering::Relaxed);
+        self.current_layout.store(0, Ordering::Relaxed);
+    }
+}
+
 pub fn device_private_size() -> usize {
     core::mem::size_of::<HeliosDevice>()
 }
@@ -482,7 +584,7 @@ extern "system" {
     ) -> u16;
 }
 
-unsafe fn log_backtrace(tag: &str) {
+pub(crate) unsafe fn log_backtrace(tag: &str) {
     let mut frames = [core::ptr::null_mut::<c_void>(); 32];
     let captured = RtlCaptureStackBackTrace(
         0,
@@ -542,44 +644,6 @@ unsafe extern "C" fn ddi_noop_dxgi(_a: usize) -> usize {
 /// write into it and no other stub reads it, so the exact size is immaterial.
 unsafe extern "C" fn ddi_calc_size(_a: usize) -> usize {
     256
-}
-
-/// Times the runtime called `pfnCheckDeferredContextHandleSizes`. Expected 0:
-/// [`threading_caps`] never reports a COMMANDLISTS bit, so the runtime never
-/// builds deferred contexts (FREETHREADED alone does not trigger this probe).
-static CHECK_DEFERRED_HANDLE_SIZES_CALLS: AtomicUsize = AtomicUsize::new(0);
-
-/// `pfnCheckDeferredContextHandleSizes` -- and it is NOT a size getter.
-///
-/// `PFND3D11DDI_CHECKDEFERREDCONTEXTHANDLESIZES` is
-/// `void(HDEVICE, UINT* pHSizes, D3D11DDI_HANDLESIZE*)`: a VOID writer with a
-/// count out-param. It sat in the `calc!` lists, so three of the four
-/// device-funcs tables installed the 256-returning uniform stub in it and the
-/// fourth (D3D11.0, whose list omits it) installed `ddi_noop_device` -- two
-/// different stubs for one slot across four copies of the same table, and both
-/// of them a shape mismatch that is harmless only because neither writes
-/// anything.
-///
-/// Writing nothing is its own defect: the runtime then reads whatever it had
-/// pre-set into `pHSizes`, the same class of bug `check_counter_info` was fixed
-/// for. We create no deferred contexts, so 0 is the honest answer. R812.
-unsafe extern "C" fn ddi_check_deferred_context_handle_sizes(
-    _h_device: ddi::D3D10DDI_HDEVICE,
-    p_h_sizes: *mut ddi::UINT,
-    _sizes: *mut ddi::D3D11DDI_HANDLESIZE,
-) {
-    let n = CHECK_DEFERRED_HANDLE_SIZES_CALLS.fetch_add(1, Ordering::Relaxed);
-    if n < 8 {
-        log_error!(
-            "DDI CheckDeferredContextHandleSizes called (x{}) — unexpected at \
-             THREADING caps = {}",
-            n + 1,
-            threading_caps()
-        );
-    }
-    if !p_h_sizes.is_null() {
-        *p_h_sizes = 0;
-    }
 }
 
 unsafe extern "C" fn ddi_relocate_device_funcs(
@@ -747,19 +811,48 @@ unsafe fn audit_dxgi_1_3_base_funcs(tag: &str, funcs: *mut ddi::DXGI1_3_DDI_BASE
     );
 }
 
-/// Real DestroyDevice: drop the in-place HeliosDevice (releasing the DXVK device).
+/// Real DestroyDevice: drop the in-place object behind the handle.
 /// The runtime owns the backing memory, so we only run the destructor.
-unsafe extern "C" fn ddi_destroy_device(h_device: ddi::D3D10DDI_HDEVICE) {
+///
+/// ⚠ TAG DISCRIMINATION IS LOAD-BEARING: a deferred context is destroyed
+/// through THIS entry point too (no pfnDestroyContext exists). Running the
+/// device teardown below on a DC handle would unregister/release/drop state
+/// the parent device still owns — the single highest-risk confusion of the
+/// command-list feature, which is why the tag is checked before any cast.
+pub(crate) unsafe extern "C" fn ddi_destroy_device(h_device: ddi::D3D10DDI_HDEVICE) {
+    if h_device.pDrvPrivate.is_null() {
+        log_error!("DDI: DestroyDevice on null handle — refused");
+        return;
+    }
+    match *(h_device.pDrvPrivate as *const usize) {
+        HELIOS_TAG_DEVICE => {}
+        HELIOS_TAG_DEFERRED => {
+            // A deferred context dying through the shared DestroyDevice entry
+            // point. Its teardown is ONLY its own state: drop the owned DXVK
+            // deferred COM context and run the in-place destructor. None of
+            // the device teardown below may run — the parent device still
+            // owns all of it.
+            crate::forward::note_deferred_context_destroyed();
+            core::ptr::drop_in_place(h_device.pDrvPrivate as *mut HeliosDeferredContext);
+            return;
+        }
+        tag => {
+            note_device_tag_mismatch("DDI DestroyDevice", tag);
+            return;
+        }
+    }
     log_error!("DDI: DestroyDevice");
     // R911: the nine refusal counters, once per device teardown. Process-global
     // rather than per-device, so this is a running total; the point is that
     // they are READ at all, which the T5 scan-out counters were not.
     log_error!("{}", crate::forward::ddi_refusal_summary());
+    // The deferred-context surface, same readout discipline (Phase C).
+    log_error!("{}", crate::forward::deferred_summary());
     // Drop it from the liveness registry BEFORE anything is torn down, so a
     // concurrent `wait_last_present` on an ICD worker refuses rather than
     // dereferencing a block dxgkrnl is about to free and reuse (R415).
     crate::forward::unregister_live_device(h_device.pDrvPrivate as usize);
-    if !h_device.pDrvPrivate.is_null() {
+    {
         let dev = &mut *(h_device.pDrvPrivate as *mut HeliosDevice);
         // One explicit release of everything bridge-derived, while the bridge
         // device is still alive. Pre-R807 this released `ia` only; the other
@@ -981,31 +1074,23 @@ unsafe fn install_calc_and_lifecycle(f: &mut ddi::D3D11DDI_DEVICEFUNCS) {
         pfnCalcPrivateGeometryShaderWithStreamOutput,
         pfnCalcPrivateSamplerSize,
         pfnCalcPrivateQuerySize,
-        pfnCalcDeferredContextHandleSize,
-        pfnCalcPrivateDeferredContextSize,
-        pfnCalcPrivateCommandListSize,
         pfnCalcPrivateTessellationShaderSize,
         pfnCalcPrivateUnorderedAccessViewSize,
     );
-    // The three entries above for deferred contexts and command lists
-    // (pfnCalcDeferredContextHandleSize, pfnCalcPrivateDeferredContextSize,
-    // pfnCalcPrivateCommandListSize) keep the 256-byte stub. That is sound ONLY
-    // because the runtime never calls the paired Create, and the reason it
-    // never does is that no COMMANDLISTS cap is ever reported -- a fact that
-    // was stated in neither place before R812. Implementing
-    // pfnCreateDeferredContext and flipping the cap (a natural pair of steps
-    // for D3D11 conformance) would write a >256-byte driver object into
-    // hDrvContext with the stub still reporting 256: heap corruption inside
-    // the runtime's allocator, no diagnostic. The reported value is
-    // knob-dependent since Phase B (FREETHREADED does NOT trigger these
-    // slots), so the guarantee is pinned on the POSSIBLE set instead.
-    const _: () = assert!(
-        THREADING_CAPS_POSSIBLE & (D3D11DDICAPS_COMMANDLISTS | D3D11DDICAPS_COMMANDLISTS_BUILD_2)
-            == 0
-    );
+    // The deferred-context/command-list size family is REAL (Phase C), no
+    // longer the 256-byte stub: the paired Create slots are live in
+    // `forward::install`, so a stub size here would be exactly the R812 heap
+    // corruption the old compile-time assert guarded against. The deprecated
+    // COMMANDLISTS (0x2) bit remains impossible — BUILD_2 devices report
+    // 0x1|0x4 only.
+    const _: () = assert!(THREADING_CAPS_POSSIBLE & D3D11DDICAPS_COMMANDLISTS == 0);
+    f.pfnCalcDeferredContextHandleSize = Some(crate::forward::calc_deferred_context_handle_size);
+    f.pfnCalcPrivateDeferredContextSize = Some(crate::forward::calc_private_deferred_context_size);
+    f.pfnCalcPrivateCommandListSize = Some(crate::forward::calc_private_command_list_size);
     // Not a size getter -- a void writer. Installed with its real signature, no
-    // transmute, identically in every table. R812.
-    f.pfnCheckDeferredContextHandleSizes = Some(ddi_check_deferred_context_handle_sizes);
+    // transmute, identically in every table. R812; real array since Phase C.
+    f.pfnCheckDeferredContextHandleSizes =
+        Some(crate::forward::check_deferred_context_handle_sizes);
 
     // Real cleanup on device teardown (matching signature, no transmute).
     f.pfnDestroyDevice = Some(ddi_destroy_device);

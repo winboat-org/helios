@@ -148,6 +148,10 @@ com_handles!(
     D3D10DDI_HSHADERRESOURCEVIEW,
     D3D10DDI_HDEPTHSTENCILVIEW,
     D3D11DDI_HUNORDEREDACCESSVIEW,
+    // IC-side region owns the `ID3D11CommandList` COM word (Phase C). A
+    // DC-local command-list region is a borrowed COPY of the same word,
+    // closed by clearing — the DC table's close shim, never `release`.
+    D3D11DDI_HCOMMANDLIST,
 );
 
 boxed_handles!(

@@ -245,28 +245,31 @@ pub(crate) unsafe extern "C" fn ia_set_input_layout(
     h: Hdevice,
     h_el: ddi::D3D10DDI_HELEMENTLAYOUT,
 ) {
-    if let Some(dev) = helios_device(h) {
+    if let Some(bindings) = ctx_bindings(h) {
         let p = match boxed_slot(h_el) {
             Some(slot) => slot.word(),
             None => 0,
         };
-        dev.owned.bindings.current_layout.store(p, Ordering::Relaxed);
+        bindings.current_layout.store(p, Ordering::Relaxed);
     }
 }
 
 /// Lazily create + bind the `ID3D11InputLayout` for the current (element layout,
 /// VS) pair, resolving element semantic names from the VS input signature.
 pub(crate) unsafe fn bind_input_layout(h: Hdevice) {
+    // `dev` = device-global caches; `bindings` = the RECORDING context's
+    // shadow (the DC's own on a deferred context). Both resolve through the
+    // tag dispatch, so this path serves immediate and deferred draws alike.
     let Some(dev) = helios_device(h) else {
         return;
     };
-    let (lp, vp) = {
-        let bindings = &dev.owned.bindings;
-        (
-            bindings.current_layout.load(Ordering::Relaxed),
-            bindings.current_vs.load(Ordering::Relaxed),
-        )
+    let Some(bindings) = ctx_bindings(h) else {
+        return;
     };
+    let (lp, vp) = (
+        bindings.current_layout.load(Ordering::Relaxed),
+        bindings.current_vs.load(Ordering::Relaxed),
+    );
     if lp == 0 || vp == 0 {
         if SHADER_BIND_LOG_COUNT.first_n(256).is_some() {
             log_error!(
@@ -442,7 +445,12 @@ pub(crate) fn dxgi_vertex_mask(format: i32) -> u32 {
 /// component types match the bound layout's format classes, then bind it.
 /// All-float layouts (the overwhelmingly common case) bind the original.
 pub(crate) unsafe fn resolve_vs_input_variant(h: Hdevice, lp: usize, vp: usize) {
+    // Caches are device-global; the bound-VS shadow belongs to the RECORDING
+    // context (a DC's own under command lists).
     let Some(dev) = helios_device(h) else {
+        return;
+    };
+    let Some(bindings) = ctx_bindings(h) else {
         return;
     };
     let layout = &*(lp as *const LayoutData);
@@ -502,7 +510,7 @@ pub(crate) unsafe fn resolve_vs_input_variant(h: Hdevice, lp: usize, vp: usize) 
         }
     };
 
-    if dev.owned.bindings.bound_vs_com.load(Ordering::Relaxed) == desired {
+    if bindings.bound_vs_com.load(Ordering::Relaxed) == desired {
         return;
     }
     let Some(context) = d3d11_context(h) else {
@@ -510,7 +518,7 @@ pub(crate) unsafe fn resolve_vs_input_variant(h: Hdevice, lp: usize, vp: usize) 
     };
     let s = ManuallyDrop::new(ID3D11VertexShader::from_raw(desired as *mut c_void));
     context.VSSetShader(&*s, None);
-    dev.owned.bindings.bound_vs_com.store(desired, Ordering::Relaxed);
+    bindings.bound_vs_com.store(desired, Ordering::Relaxed);
     if SHADER_BIND_LOG_COUNT.first_n(256).is_some() {
         trace_line!("DDI VS input-class variant bound: vs=0x{vp:x} -> 0x{desired:x}");
     }
@@ -606,9 +614,8 @@ pub(crate) unsafe extern "C" fn ia_set_vertex_buffers(
         let h_buf = *buffers.add(i);
         bufs.push(load_resource(h_buf).and_then(|r| (*r).cast::<ID3D11Buffer>().ok()));
     }
-    if let Some(dev) = helios_device(h) {
+    if let Some(bindings) = ctx_bindings(h) {
         if start == 0 && num != 0 {
-            let bindings = &dev.owned.bindings;
             bindings.current_vb0.store(
                 bufs.first()
                     .and_then(|b| b.as_ref())
@@ -671,8 +678,7 @@ pub(crate) unsafe extern "C" fn ia_set_index_buffer(
         return;
     };
     let buf = load_resource(h_buf).and_then(|r| (*r).cast::<ID3D11Buffer>().ok());
-    if let Some(dev) = helios_device(h) {
-        let bindings = &dev.owned.bindings;
+    if let Some(bindings) = ctx_bindings(h) {
         bindings.current_ib.store(
             buf.as_ref().map(|b| b.as_raw() as usize).unwrap_or(0),
             Ordering::Relaxed,

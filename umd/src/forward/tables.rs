@@ -207,6 +207,20 @@ pub unsafe fn install(funcs: *mut ddi::D3D11DDI_DEVICEFUNCS) -> Filled11_0 {
     f.pfnDispatchIndirect = Some(dispatch_indirect);
     f.pfnSetResourceMinLOD = Some(set_resource_min_lod);
 
+    // Deferred contexts + command lists (Phase C). Real slots, installed
+    // unconditionally — the UmdCommandLists knob gates only the THREADING
+    // caps bit that invites the runtime to call them (the size family is
+    // installed by `install_calc_and_lifecycle` beside the other Calc*).
+    f.pfnCreateDeferredContext = Some(create_deferred_context);
+    f.pfnCreateCommandList = Some(create_command_list);
+    f.pfnDestroyCommandList = Some(destroy_command_list);
+    f.pfnCommandListExecute = Some(command_list_execute);
+    f.pfnAbandonCommandList = Some(abandon_command_list);
+    f.pfnRecycleCommandList = Some(recycle_command_list);
+    f.pfnRecycleCreateCommandList = Some(recycle_create_command_list);
+    f.pfnRecycleCreateDeferredContext = Some(recycle_create_deferred_context);
+    f.pfnRecycleDestroyCommandList = Some(destroy_command_list);
+
     // Input layouts (lazy), vertex/index buffers, blend state.
     f.pfnCalcPrivateElementLayoutSize = Some(calc_size_element_layout);
     f.pfnCreateElementLayout = Some(create_element_layout);

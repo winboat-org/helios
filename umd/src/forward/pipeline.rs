@@ -50,8 +50,7 @@ pub(crate) unsafe extern "C" fn set_render_targets(
         }
         views.push(view);
     }
-    if let Some(dev) = helios_device(h) {
-        let bindings = &dev.owned.bindings;
+    if let Some(bindings) = ctx_bindings(h) {
         bindings.current_rt0_alloc.store(rt0.0, Ordering::Relaxed);
         bindings.current_rt0_width.store(rt0.1, Ordering::Relaxed);
         bindings.current_rt0_height.store(rt0.2, Ordering::Relaxed);
@@ -220,11 +219,8 @@ pub(crate) unsafe extern "C" fn ia_set_topology(
     h: Hdevice,
     topo: ddi::D3D10_DDI_PRIMITIVE_TOPOLOGY,
 ) {
-    if let Some(dev) = helios_device(h) {
-        dev.owned
-            .bindings
-            .current_topology
-            .store(topo as u32, Ordering::Relaxed);
+    if let Some(bindings) = ctx_bindings(h) {
+        bindings.current_topology.store(topo as u32, Ordering::Relaxed);
     }
     if IA_BIND_LOG_COUNT.first_n(64).is_some() {
         trace_line!("DDI IASetTopology topo={}", topo as u32);
@@ -259,10 +255,9 @@ pub(crate) unsafe fn log_draw_state(
     if n >= 1024 && (n % 1024) != 0 {
         return;
     }
-    let Some(dev) = helios_device(h) else {
+    let Some(b) = ctx_bindings(h) else {
         return;
     };
-    let b = &dev.owned.bindings;
     trace_line!(
         "DDI {kind}: a={} b={} c={} d={} topo={} vb0=0x{:x}/{}+{} ib=0x{:x}/fmt{}+{} vs=0x{:x} ps=0x{:x} gs=0x{:x} hs=0x{:x} ds=0x{:x} rt0_alloc=0x{:x} rt0={}x{} fmt={} layout=0x{:x}",
         count0,
@@ -483,8 +478,7 @@ pub(crate) unsafe extern "C" fn so_set_targets(
 
 pub(crate) unsafe extern "C" fn dispatch(h: Hdevice, x: u32, y: u32, z: u32) {
     if DISPATCH_LOG_COUNT.first_n_then_every(1024, 1024).is_some() {
-        if let Some(dev) = helios_device(h) {
-            let b = &dev.owned.bindings;
+        if let Some(b) = ctx_bindings(h) {
             trace_line!(
                 "DDI Dispatch x={} y={} z={} cs=0x{:x} rt0_alloc=0x{:x} rt0={}x{} fmt={}",
                 x,

@@ -334,25 +334,63 @@ pub(crate) unsafe fn read_opened_allocation(
 
 // --- handle <-> COM helpers -------------------------------------------------
 
-pub(crate) unsafe fn d3d11_device(h: Hdevice) -> Option<ManuallyDrop<ID3D11Device>> {
-    let hd = h.pDrvPrivate as *const HeliosDevice;
-    if hd.is_null() {
+/// The two object kinds that can live behind an HDEVICE, discriminated by
+/// the tag word every resolver reads before casting.
+pub(crate) enum DrvHandle<'a> {
+    Device(&'a HeliosDevice),
+    Deferred(&'a crate::device_funcs::HeliosDeferredContext),
+}
+
+/// Discriminate an HDEVICE. A block carrying neither tag is refused loudly,
+/// never cast — that wild cast is the worst failure of the DC feature.
+pub(crate) unsafe fn drv_handle<'a>(h: Hdevice) -> Option<DrvHandle<'a>> {
+    let p = h.pDrvPrivate;
+    if p.is_null() {
         return None;
     }
+    match *(p as *const usize) {
+        crate::device_funcs::HELIOS_TAG_DEVICE => {
+            Some(DrvHandle::Device(&*(p as *const HeliosDevice)))
+        }
+        crate::device_funcs::HELIOS_TAG_DEFERRED => Some(DrvHandle::Deferred(
+            &*(p as *const crate::device_funcs::HeliosDeferredContext),
+        )),
+        tag => {
+            crate::device_funcs::note_device_tag_mismatch("drv_handle", tag);
+            None
+        }
+    }
+}
+
+pub(crate) unsafe fn d3d11_device(h: Hdevice) -> Option<ManuallyDrop<ID3D11Device>> {
     // Borrowed, not adopted: the bridge keeps the owning reference. The
     // ManuallyDrop lives inside the wrapper now, so this cannot be written as
     // an adopting `from_raw` by a future edit. R813.
-    (*hd).dxvk.d3d11_device()
+    helios_device(h)?.dxvk.d3d11_device()
 }
 
-/// Borrow the `HeliosDevice` behind a device handle (for the deferred
-/// input-assembler state). Does not take ownership.
+/// Borrow the `HeliosDevice` behind an HDEVICE handle. Does not take
+/// ownership. Tag-discriminated: an HDEVICE can be a deferred context — this
+/// resolver then returns the DC's PARENT device, so the ~66 forwarder sites
+/// that need device-scoped machinery (COM device, caches, kernel callbacks)
+/// keep working on both handle kinds.
 pub(crate) unsafe fn helios_device<'a>(h: Hdevice) -> Option<&'a HeliosDevice> {
-    let hd = h.pDrvPrivate as *const HeliosDevice;
-    if hd.is_null() {
-        None
-    } else {
-        Some(&*hd)
+    match drv_handle(h)? {
+        DrvHandle::Device(dev) => Some(dev),
+        // SAFETY: `parent` is written once at DC construction from a live
+        // device handle, and the runtime destroys every DC before its device.
+        DrvHandle::Deferred(dc) => Some(&*dc.parent),
+    }
+}
+
+/// The binding shadow of the context this handle records on: the device's
+/// immediate-context copy, or the DC's own.
+pub(crate) unsafe fn ctx_bindings<'a>(
+    h: Hdevice,
+) -> Option<&'a crate::device_funcs::CtxBindings> {
+    match drv_handle(h)? {
+        DrvHandle::Device(dev) => Some(&dev.owned.bindings),
+        DrvHandle::Deferred(dc) => Some(&dc.bindings),
     }
 }
 
@@ -361,33 +399,42 @@ pub(crate) unsafe fn helios_device<'a>(h: Hdevice) -> Option<&'a HeliosDevice> {
 /// DDI (e.g. `OpenSharedResource`), which is the contractual way for
 /// `open_resource`/`create_*` to fail loudly instead of leaving a null handle
 /// the runtime will dereference.
+///
+/// Tag-aware: an error on a deferred context goes to the DC's OWN corelayer
+/// (`hRTCoreLayer` + callbacks from `D3D11DDIARG_CREATEDEFERREDCONTEXT`), per
+/// the WDK contract — never to the parent device's.
 pub(crate) unsafe fn set_runtime_error(h: Hdevice, hr: i32) {
-    let Some(dev) = helios_device(h) else {
-        return;
+    let (core_layer, um_callbacks) = match drv_handle(h) {
+        Some(DrvHandle::Device(dev)) => (dev.h_rt_core_layer, dev.um_callbacks),
+        Some(DrvHandle::Deferred(dc)) => (dc.dc_core_layer, dc.dc_um_callbacks),
+        None => return,
     };
-    if dev.um_callbacks.is_null() {
+    if um_callbacks.is_null() {
         log_error!("set_runtime_error: no corelayer callbacks");
         return;
     }
     // pfnSetErrorCb is the first member of every D3D11DDI_CORELAYER_DEVICECALLBACKS
     // revision, so reading it through the 11.0 layout is version-independent.
-    let cb = &*(dev.um_callbacks as *const ddi::D3D11DDI_CORELAYER_DEVICECALLBACKS);
+    let cb = &*(um_callbacks as *const ddi::D3D11DDI_CORELAYER_DEVICECALLBACKS);
     if let Some(f) = cb.pfnSetErrorCb {
-        f(
-            ddi::D3D10DDI_HRTCORELAYER {
-                handle: dev.h_rt_core_layer,
-            },
-            hr,
-        );
+        f(ddi::D3D10DDI_HRTCORELAYER { handle: core_layer }, hr);
     }
 }
 
+/// The D3D11 context this handle records on, borrowed: the bridge's immediate
+/// context for a device handle, the DC's own DXVK deferred COM context for a
+/// deferred-context handle. Every context forwarder resolves through this, so
+/// one dispatch serves both tables.
 pub(crate) unsafe fn d3d11_context(h: Hdevice) -> Option<ManuallyDrop<ID3D11DeviceContext>> {
-    let hd = h.pDrvPrivate as *const HeliosDevice;
-    if hd.is_null() {
-        return None;
+    match drv_handle(h)? {
+        DrvHandle::Device(dev) => dev.dxvk.d3d11_context(),
+        DrvHandle::Deferred(dc) => {
+            let raw = dc.dc.as_ref()?.as_raw();
+            // SAFETY: `dc.dc` owns the reference for the DC's whole life;
+            // ManuallyDrop borrows it without taking one.
+            Some(ManuallyDrop::new(ID3D11DeviceContext::from_raw(raw)))
+        }
     }
-    (*hd).dxvk.d3d11_context()
 }
 
 /// The immediate context as `ID3D11DeviceContext1`, borrowed.

@@ -77,7 +77,7 @@ pub extern "system" fn DllMain(
 
 pub(crate) use knobs::{
     feature_level_mode, scanout_acquire_knob, scanout_snapshot_knob, trace_enabled,
-    umd_free_threaded, vehicle_flip_gate_us,
+    umd_command_lists, umd_free_threaded, vehicle_flip_gate_us,
 };
 pub(crate) use log::{log_error, log_knob_inventory, log_self_module_path, trace_line};
 // R420's `#![deny(deprecated)]` guard, preserved across the move: `log_line` is
