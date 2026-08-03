@@ -1,0 +1,81 @@
+# Windows CI package
+
+The `Windows graphics and compute bundle` GitHub Actions workflow builds one
+x64 archive that turns a clean Helios Windows 11 guest into a system-wide
+graphics/compute installation.
+
+## What the workflow builds
+
+The jobs are independent so an error points at the actual component:
+
+1. `driver` builds the DXVK static D3D11 core, embeds it in `helios_umd.dll`,
+   and builds/packages the Rust WDDM kernel driver.
+2. `mesa` builds the pinned Mesa submodule once with both the Venus Vulkan ICD
+   and the Zink WGL OpenGL ICD enabled.
+3. `opencl` builds pinned CLVK with the clspv online compiler embedded. End-user
+   machines therefore do not need `clspv.exe` or `CLVK_CLSPV_PATH`.
+4. `loaders` builds the official Khronos Vulkan and OpenCL loaders plus four
+   native smoke probes.
+5. `package` test-signs the final driver package, hashes every payload file,
+   and creates `helios-windows-x64-<version>-<commit>.zip`.
+
+The workflow runs for pull requests and pushes to `wddm`, and can be started
+manually. A tag beginning with `v` also publishes the zip and its SHA-256 file
+as a GitHub Release.
+
+## Reproducibility and source pins
+
+The Helios, Mesa, and DXVK revisions come from the checked-out commit and its
+gitlinks. CLVK, Vulkan-Loader, Vulkan-Headers, and OpenCL-ICD-Loader commits are
+pinned in `.github/workflows/windows-stack.yml`. Toolchain versions are pinned
+there as well. Every resulting source revision is written to `manifest.json`.
+
+When updating an external pin, first build and run all four packaged probes in
+the VM. In particular, CLVK and Zink are consumers of the Venus ICD and can
+expose synchronization/protocol mismatches that a successful compile cannot.
+
+## Signing model
+
+CI creates a unique, non-exportable test-signing key for each bundle. It signs
+the SYS and UMD before creating the catalog, signs the final catalog, exports
+only the public certificate, then destroys the CI private key. The installer
+adds that public certificate to `Root` and `TrustedPublisher`.
+
+This is intentionally a development distribution. Windows must boot with test
+signing enabled, which requires Secure Boot to be disabled. The installer can
+enable test signing, but never changes Secure Boot and never silently weakens
+code-integrity settings. Production releases need Microsoft attestation/WHQL
+signing (or another project-approved production certificate flow) in place of
+the ephemeral certificate.
+
+## Installation behavior
+
+`Install-Helios.ps1` verifies the payload manifest before making changes, then:
+
+- installs the Visual C++ x64 runtime and the prebuilt PnP driver package;
+- installs Mesa and CLVK in a versioned directory below `Program Files`;
+- installs official `vulkan-1.dll`/`OpenCL.dll` only when no system loader is
+  present;
+- registers Venus and CLVK through the Khronos machine ICD registries; and
+- registers `libgallium_wgl.dll` as the Microsoft OpenGL ICD on the Helios
+  display adapter key. It does not replace Windows' `opengl32.dll`.
+
+Original OpenGL registry values and every created path/hash are saved in
+`C:\ProgramData\Helios\install-state.json`. The package refuses to overwrite an
+installation managed by another bundle; uninstall it first so rollback state
+cannot be lost.
+
+`Verify-Helios.ps1 -RunSmokeTests` checks hashes and registrations, then creates
+a Vulkan instance, creates a D3D11 device on Helios, creates a WGL context, and
+compiles/runs an OpenCL kernel. The OpenCL probe validates every output value.
+
+## Hosted runner requirements
+
+The driver and package jobs require Visual Studio 2022 and the Windows 11 SDK
+and WDK. The setup script uses an already installed WDK when available and
+otherwise installs the official 10.0.26100 SDK/WDK packages with winget. A
+self-hosted runner should preinstall those tools if winget is unavailable.
+
+The current bundle is x64-only. A real WoW64 deliverable needs independently
+validated x86 builds of the WDDM UMD, Mesa, CLVK, and both loaders; copying x64
+DLLs into `SysWOW64` is not a valid substitute.
