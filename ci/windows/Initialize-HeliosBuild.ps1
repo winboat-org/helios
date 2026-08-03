@@ -1,6 +1,12 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
+function ConvertTo-WindowsKitVersion([Parameter(Mandatory)][string]$Value) {
+    $version = [version]"0.0"
+    if ([version]::TryParse($Value, [ref]$version)) { return $version }
+    return [version]"0.0"
+}
+
 function Import-VisualStudioEnvironment {
     $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
     if (-not (Test-Path -LiteralPath $vswhere -PathType Leaf)) {
@@ -31,8 +37,8 @@ function Find-WindowsKitTool([Parameter(Mandatory)][string]$Name) {
         throw "Windows Kits bin directory was not found at $kitsBin."
     }
     $tools = @(Get-ChildItem -LiteralPath $kitsBin -Filter $Name -File -Recurse |
-        Sort-Object { [version]($_.Directory.Parent.Name -replace "[^0-9.]", "") } -Descending |
-        Where-Object { $_.Directory.Name -in @("x64", "x86") })
+        Where-Object { $_.Directory.Name -in @("x64", "x86") } |
+        Sort-Object { ConvertTo-WindowsKitVersion $_.Directory.Parent.Name } -Descending)
     $tool = $tools | Where-Object { $_.Directory.Name -eq "x64" } | Select-Object -First 1
     if (-not $tool) { $tool = $tools | Select-Object -First 1 }
     if (-not $tool) {
@@ -45,7 +51,7 @@ function Find-WindowsKitInclude {
     $includeRoot = Join-Path ${env:ProgramFiles(x86)} "Windows Kits\10\Include"
     $candidate = Get-ChildItem -LiteralPath $includeRoot -Directory |
         Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName "km\ntddk.h") } |
-        Sort-Object { [version]($_.Name -replace "[^0-9.]", "") } -Descending |
+        Sort-Object { ConvertTo-WindowsKitVersion $_.Name } -Descending |
         Select-Object -First 1
     if (-not $candidate) {
         throw "A Windows 11 WDK include tree was not found below $includeRoot."

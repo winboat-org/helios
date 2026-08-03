@@ -5,7 +5,8 @@ param(
     [string]$BuildRoot = "C:\khronos-build",
     [string]$VulkanLoaderCommit = "06830240f7a70599053f47b5f10af543e8c3daf6",
     [string]$VulkanHeadersCommit = "11d6898377797e07dbd543aaaa367e4465074597",
-    [string]$OpenClLoaderCommit = "18fdcd58286376124f938948aa8ed156079c1c16"
+    [string]$OpenClLoaderCommit = "18fdcd58286376124f938948aa8ed156079c1c16",
+    [string]$OpenClHeadersCommit = "6fe718c31a45fe25151362a72ef041c3a1047cbd"
 )
 
 Set-StrictMode -Version Latest
@@ -32,9 +33,11 @@ New-Item -ItemType Directory -Force -Path $SourceRoot,$BuildRoot,$OutputDir | Ou
 $vkHeadersSource = Join-Path $SourceRoot "Vulkan-Headers"
 $vkLoaderSource = Join-Path $SourceRoot "Vulkan-Loader"
 $openClLoaderSource = Join-Path $SourceRoot "OpenCL-ICD-Loader"
+$openClHeadersSource = Join-Path $SourceRoot "OpenCL-Headers"
 Clone-Pinned "https://github.com/KhronosGroup/Vulkan-Headers.git" $vkHeadersSource $VulkanHeadersCommit
 Clone-Pinned "https://github.com/KhronosGroup/Vulkan-Loader.git" $vkLoaderSource $VulkanLoaderCommit
 Clone-Pinned "https://github.com/KhronosGroup/OpenCL-ICD-Loader.git" $openClLoaderSource $OpenClLoaderCommit -Recursive
+Clone-Pinned "https://github.com/KhronosGroup/OpenCL-Headers.git" $openClHeadersSource $OpenClHeadersCommit
 
 $vkHeadersBuild = Join-Path $BuildRoot "vk-headers"
 $vkHeadersInstall = Join-Path $BuildRoot "vk-headers-install"
@@ -62,6 +65,7 @@ $openClInstall = Join-Path $BuildRoot "opencl-loader-install"
 & cmake.exe -S $openClLoaderSource -B $openClBuild -A x64 `
     "-DCMAKE_INSTALL_PREFIX=$openClInstall" `
     -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded `
+    "-DOPENCL_ICD_LOADER_HEADERS_DIR=$openClHeadersSource" `
     -DOPENCL_ICD_LOADER_BUILD_SHARED_LIBS=ON `
     -DENABLE_OPENCL_LAYERS=OFF `
     -DBUILD_TESTING=OFF
@@ -86,7 +90,7 @@ if (-not $vulkanLibrary -or -not $openClLibrary) { throw "A loader import librar
     -OutputDir (Join-Path $OutputDir "smoke") `
     -VulkanInclude (Join-Path $vkHeadersInstall "include") `
     -VulkanLibrary $vulkanLibrary.FullName `
-    -OpenClInclude (Join-Path $openClLoaderSource "inc") `
+    -OpenClInclude $openClHeadersSource `
     -OpenClLibrary $openClLibrary.FullName
 if ($LASTEXITCODE -ne 0) { throw "Smoke probe build failed." }
 
@@ -94,6 +98,7 @@ $pins = [ordered]@{
     vulkanLoader = $VulkanLoaderCommit
     vulkanHeaders = $VulkanHeadersCommit
     openClLoader = $OpenClLoaderCommit
+    openClHeaders = $OpenClHeadersCommit
 }
 $pins | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $OutputDir "loader-commits.json") -Encoding ascii
 $licenseRoot = Join-Path $OutputDir "licenses"
@@ -101,4 +106,5 @@ New-Item -ItemType Directory -Force -Path $licenseRoot | Out-Null
 Copy-Item -LiteralPath (Join-Path $vkLoaderSource "LICENSE.txt") -Destination (Join-Path $licenseRoot "Vulkan-Loader-LICENSE.txt") -Force
 Copy-Item -LiteralPath (Join-Path $vkHeadersSource "LICENSE.md") -Destination (Join-Path $licenseRoot "Vulkan-Headers-LICENSE.md") -Force
 Copy-Item -LiteralPath (Join-Path $openClLoaderSource "LICENSE") -Destination (Join-Path $licenseRoot "OpenCL-ICD-Loader-LICENSE") -Force
+Copy-Item -LiteralPath (Join-Path $openClHeadersSource "LICENSE") -Destination (Join-Path $licenseRoot "OpenCL-Headers-LICENSE") -Force
 Write-Host "Khronos loader artifact staged at $OutputDir"

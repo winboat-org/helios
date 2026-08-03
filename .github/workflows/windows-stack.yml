@@ -25,6 +25,7 @@ env:
   VULKAN_LOADER_COMMIT: 06830240f7a70599053f47b5f10af543e8c3daf6
   VULKAN_HEADERS_COMMIT: 11d6898377797e07dbd543aaaa367e4465074597
   OPENCL_LOADER_COMMIT: 18fdcd58286376124f938948aa8ed156079c1c16
+  OPENCL_HEADERS_COMMIT: 6fe718c31a45fe25151362a72ef041c3a1047cbd
 
 jobs:
   driver:
@@ -93,6 +94,7 @@ jobs:
             mingw-w64-ucrt-x86_64-ninja
             mingw-w64-ucrt-x86_64-python
             mingw-w64-ucrt-x86_64-python-mako
+            mingw-w64-ucrt-x86_64-python-packaging
             mingw-w64-ucrt-x86_64-python-yaml
             mingw-w64-ucrt-x86_64-pkgconf
             mingw-w64-ucrt-x86_64-zlib
@@ -155,6 +157,7 @@ jobs:
           -VulkanLoaderCommit $env:VULKAN_LOADER_COMMIT
           -VulkanHeadersCommit $env:VULKAN_HEADERS_COMMIT
           -OpenClLoaderCommit $env:OPENCL_LOADER_COMMIT
+          -OpenClHeadersCommit $env:OPENCL_HEADERS_COMMIT
       - uses: actions/upload-artifact@v7
         with:
           name: helios-loaders
@@ -219,6 +222,7 @@ jobs:
           -VulkanLoaderCommit $env:VULKAN_LOADER_COMMIT
           -VulkanHeadersCommit $env:VULKAN_HEADERS_COMMIT
           -OpenClLoaderCommit $env:OPENCL_LOADER_COMMIT
+          -OpenClHeadersCommit $env:OPENCL_HEADERS_COMMIT
       - uses: actions/upload-artifact@v7
         with:
           name: helios-windows-x64-${{ steps.metadata.outputs.version }}

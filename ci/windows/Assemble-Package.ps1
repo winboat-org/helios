@@ -12,7 +12,8 @@ param(
     [Parameter(Mandatory)][string]$ClvkCommit,
     [Parameter(Mandatory)][string]$VulkanLoaderCommit,
     [Parameter(Mandatory)][string]$VulkanHeadersCommit,
-    [Parameter(Mandatory)][string]$OpenClLoaderCommit
+    [Parameter(Mandatory)][string]$OpenClLoaderCommit,
+    [Parameter(Mandatory)][string]$OpenClHeadersCommit
 )
 
 Set-StrictMode -Version Latest
@@ -156,6 +157,7 @@ $manifest = [ordered]@{
         vulkanLoader = $VulkanLoaderCommit
         vulkanHeaders = $VulkanHeadersCommit
         openClLoader = $OpenClLoaderCommit
+        openClHeaders = $OpenClHeadersCommit
     }
     signing = [ordered]@{
         mode = "test"
