@@ -1300,6 +1300,42 @@ registered in advance (`PREDICTIONS.md`) and scored.
   Evidence: `tmp/xid109-evidence/wedge3/WEDGE3.md`. Still open (WS1):
   QEMU treating worker death as context-loss, and the Xid trigger if it
   recurs with the bound in place.
+  **Phase D attempted (68th session, 2026-08-03): dxvk-helios sweep
+  elision measured INSUFFICIENT — knob stays OFF; the Xid-109 trigger is
+  now the gating item for any further CL-path work.** Levers 1+2 of
+  HANDOFF-PHASE-D.md landed in dxvk-helios `3daacecc` (parent `7470eda`):
+  the immediate context elides redundant `ResetCommandListState` sweeps
+  via CS-stream tail tracking (`m_heliosCsState`), and `FinishCommandList`
+  stops recording the trailing sweep into every CL (`EndsClean=false`,
+  leftover state restored by the EmitCs funnel; kill switch
+  `HELIOS_DXVK_CL_FAST=0` = stock). Producer side sped up as designed
+  (2.89M finishes in 44 s ≈ 65k/s vs stock ~8k/s) but scores barely
+  moved: ON+fast GT1 53.8 / GT2 145.1 / Comb 33.2 vs ON-stock 49/144/29–31
+  — the reset sweeps were NOT the dominant per-CL cost. Remaining CS-side
+  suspects: per-chunk dispatch/wakeup overhead (EmitToCsThread → one
+  chunk + one queue op per tiny CL) and the CL content itself. GT1-ON
+  runs at ~15 % GPU (host trace) — still guest-CPU-bound.
+  **The Xid-109 trigger characterized (WS1, still unfixed): NVRM CTX
+  SWITCH TIMEOUT on the workload's venus channel, mid-GT1 only,
+  native-CL path only — 2 of 3 fast-path runs (+24 s, +53 s), ~1 of 3 at
+  stock Phase C rates (wedge3), never on the emulated path at 184 fps.**
+  New presentation with the ring bound in place: the channel dies, the
+  next `vkQueueSubmit2` dispatch fails ("resulted in CS error"), the
+  guest sees it at `vkEndCommandBuffer` (dxvk-cs exception) — a
+  PER-CONTEXT death with clean `pnputil /restart-device` recovery, no
+  QEMU relaunch (containment proven live twice). KMD counters clean both
+  times (AsSub==AsDone, no storm); healthy-run scores are tight, which
+  argues against systematic garbage draws; the leading remaining theory
+  is a timing-sensitive lost/misordered device-side signal (the WS1
+  "never signal a wire fence before host completion" suspect —
+  rate-amplified, execute-count-correlated: GT1 has 2× GT2's executes).
+  **A persistent host-side evidence trap is ARMED** (`tmp/xid-trap/`,
+  nohup, survives sessions): on any NVRM Xid line it captures journal
+  context, nvidia-smi, QEMU stderr tail, per-thread states and gdb
+  backtraces of every virgl_render_server (ptrace_scope=0). Operating
+  rule going forward: NO knob-ON benchmark runs except with the trap
+  armed and a specific hypothesis to discriminate — the next occurrence
+  must pay for itself in stacks, not scores.
   **NEW WS1 watch item (67th): `ScStale` ≈ 4,000/run under FS (23 % of
   18k flips; ScUnav ~10/run) — PRE-EXISTING load signature, masked until
   now because every historical gate check followed a counter-zeroing
