@@ -16,7 +16,6 @@ Assert-Command "meson.exe" | Out-Null
 Assert-Command "ninja.exe" | Out-Null
 Assert-Command "cargo.exe" | Out-Null
 Assert-Command "cargo-make.exe" | Out-Null
-$rustc = Assert-Command "rustc.exe"
 
 $stampInf = Find-WindowsKitTool "stampinf.exe"
 $inf2Cat = Find-WindowsKitTool "Inf2Cat.exe"
@@ -67,21 +66,20 @@ $env:HELIOS_MSVC_LIB = $llvmLib
 $env:HELIOS_WDK_INCLUDE = Find-WindowsKitInclude
 $env:HELIOS_MSVC_INCLUDE = Join-Path $env:VCToolsInstallDir "include"
 
-# rust-script repeats the 64-character cargo-make script name in its target
-# path. That exceeds link.exe's legacy MAX_PATH limit on GitHub's Windows
-# runners. Move the installed executable aside, then compile the short-name
-# shim into its original location. cargo-make and rust-script live in the same
-# Cargo bin directory, which Windows searches before PATH, so a separate shim
-# directory cannot reliably intercept the command. The shim preserves the
-# original base path while copying the script to a compact filename.
-$installedRustScript = Assert-Command "rust-script.exe"
-$realRustScript = Join-Path (Split-Path -Parent $installedRustScript) "rust-script-real.exe"
-Move-Item -LiteralPath $installedRustScript -Destination $realRustScript -Force
-$env:HELIOS_RUST_SCRIPT_REAL = $realRustScript
-$env:HELIOS_RUST_SCRIPT_SHORT_ROOT = "C:\rs"
-New-Item -ItemType Directory -Force -Path $env:HELIOS_RUST_SCRIPT_SHORT_ROOT | Out-Null
-& $rustc (Join-Path $PSScriptRoot "rust-script-shim.rs") -O -o $installedRustScript
-if ($LASTEXITCODE -ne 0) { throw "rust-script path shim failed to compile with exit code $LASTEXITCODE." }
+# rust-script repeats cargo-make's 64-character generated script names in its
+# target paths. The normal runner profile makes those paths exceed link.exe's
+# legacy MAX_PATH limit. wdk-build also force-installs its own rust-script
+# version during the build, so an executable wrapper is not durable. Redirect
+# the per-user cache root for child processes instead, then restore the shell
+# folder immediately after cargo-make exits.
+$shellFoldersKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders"
+$localAppDataName = "Local AppData"
+$previousLocalAppData = Get-ItemPropertyValue -LiteralPath $shellFoldersKey -Name $localAppDataName
+$previousLocalAppDataEnvironment = $env:LOCALAPPDATA
+$shortLocalAppData = "C:\la"
+New-Item -ItemType Directory -Force -Path $shortLocalAppData | Out-Null
+Set-ItemProperty -LiteralPath $shellFoldersKey -Name $localAppDataName -Value $shortLocalAppData
+$env:LOCALAPPDATA = $shortLocalAppData
 
 $kmdRoot = Join-Path $RepoRoot "kmd_render"
 Push-Location $kmdRoot
@@ -90,6 +88,8 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "Helios driver build failed with exit code $LASTEXITCODE." }
 } finally {
     Pop-Location
+    Set-ItemProperty -LiteralPath $shellFoldersKey -Name $localAppDataName -Value $previousLocalAppData
+    $env:LOCALAPPDATA = $previousLocalAppDataEnvironment
 }
 
 $package = Join-Path $kmdRoot "target\release\helios_kmd_render_package"
