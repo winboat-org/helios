@@ -21,6 +21,7 @@ env:
   RUST_TOOLCHAIN: nightly-2026-07-14
   CARGO_MAKE_VERSION: '0.37.24'
   LLVM_VERSION: '17.0.6'
+  VULKAN_SDK_VERSION: '1.4.309.0'
   CLVK_COMMIT: 7c1b20b75127e0868cdf38b81663b185a87c6c0d
   VULKAN_LOADER_COMMIT: 06830240f7a70599053f47b5f10af543e8c3daf6
   VULKAN_HEADERS_COMMIT: 11d6898377797e07dbd543aaaa367e4465074597
@@ -50,6 +51,11 @@ jobs:
         uses: KyleMayes/install-llvm-action@ebc0426251bc40c7cd31162802432c68818ab8f0
         with:
           version: ${{ env.LLVM_VERSION }}
+      - name: Install Vulkan SDK tools
+        uses: humbletim/install-vulkan-sdk@30ba978f977e81b72d091fc8888feb1fb26f9aff
+        with:
+          version: ${{ env.VULKAN_SDK_VERSION }}
+          cache: true
       - name: Install Rust nightly
         uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
         with:
@@ -127,7 +133,7 @@ jobs:
       - name: Install Vulkan SDK
         uses: humbletim/install-vulkan-sdk@30ba978f977e81b72d091fc8888feb1fb26f9aff
         with:
-          version: 1.4.309.0
+          version: ${{ env.VULKAN_SDK_VERSION }}
           cache: true
       - name: Build CLVK
         shell: pwsh
