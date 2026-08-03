@@ -1,0 +1,242 @@
+name: Windows graphics and compute bundle
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [wddm]
+    tags: ['v*']
+  pull_request:
+    branches: [wddm]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-stack-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: '3.12'
+  MESON_VERSION: '1.11.2'
+  RUST_TOOLCHAIN: nightly-2026-07-14
+  CARGO_MAKE_VERSION: '0.37.24'
+  LLVM_VERSION: '17.0.6'
+  CLVK_COMMIT: 7c1b20b75127e0868cdf38b81663b185a87c6c0d
+  VULKAN_LOADER_COMMIT: 06830240f7a70599053f47b5f10af543e8c3daf6
+  VULKAN_HEADERS_COMMIT: 11d6898377797e07dbd543aaaa367e4465074597
+  OPENCL_LOADER_COMMIT: 18fdcd58286376124f938948aa8ed156079c1c16
+
+jobs:
+  driver:
+    name: WDDM driver and Direct3D 11 UMD
+    runs-on: windows-2022
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: false
+          fetch-depth: 1
+      - name: Initialize DXVK sources
+        shell: pwsh
+        run: git submodule update --init --recursive dxvk-helios
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install Meson and Ninja
+        shell: pwsh
+        run: python -m pip install "meson==${env:MESON_VERSION}" ninja
+      - name: Install LLVM
+        uses: KyleMayes/install-llvm-action@ebc0426251bc40c7cd31162802432c68818ab8f0
+        with:
+          version: ${{ env.LLVM_VERSION }}
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: rust-src
+      - name: Install cargo-make
+        shell: pwsh
+        run: cargo install cargo-make --locked --version $env:CARGO_MAKE_VERSION
+      - name: Ensure Windows Driver Kit is installed
+        shell: pwsh
+        run: ./ci/windows/Install-WindowsDriverKit.ps1
+      - name: Build driver package
+        shell: pwsh
+        run: ./ci/windows/Build-Driver.ps1 -RepoRoot $env:GITHUB_WORKSPACE -OutputDir "$env:RUNNER_TEMP/helios-driver"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: helios-driver
+          path: ${{ runner.temp }}/helios-driver
+          if-no-files-found: error
+          retention-days: 14
+
+  mesa:
+    name: Mesa Venus Vulkan and Zink OpenGL
+    runs-on: windows-2022
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: false
+          fetch-depth: 1
+      - name: Initialize Mesa fork
+        shell: pwsh
+        run: git submodule update --init icd/mesa
+      - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            git
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-meson
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-python
+            mingw-w64-ucrt-x86_64-python-mako
+            mingw-w64-ucrt-x86_64-python-yaml
+            mingw-w64-ucrt-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-zlib
+            mingw-w64-ucrt-x86_64-vulkan-headers
+            mingw-w64-ucrt-x86_64-vulkan-loader
+            bison
+            flex
+      - name: Build Mesa runtime
+        shell: msys2 {0}
+        run: bash ./ci/windows/build-mesa.sh "$GITHUB_WORKSPACE" "$RUNNER_TEMP/helios-mesa"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: helios-mesa
+          path: ${{ runner.temp }}/helios-mesa
+          if-no-files-found: error
+          retention-days: 14
+
+  opencl:
+    name: CLVK with embedded clspv
+    runs-on: windows-2022
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: false
+          fetch-depth: 1
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install Vulkan SDK
+        uses: humbletim/install-vulkan-sdk@30ba978f977e81b72d091fc8888feb1fb26f9aff
+        with:
+          version: 1.4.309.0
+          cache: true
+      - name: Build CLVK
+        shell: pwsh
+        run: ./ci/windows/Build-OpenCL.ps1 -OutputDir "$env:RUNNER_TEMP/helios-opencl" -ClvkCommit $env:CLVK_COMMIT
+      - uses: actions/upload-artifact@v7
+        with:
+          name: helios-opencl
+          path: ${{ runner.temp }}/helios-opencl
+          if-no-files-found: error
+          retention-days: 14
+
+  loaders:
+    name: Khronos loaders and smoke probes
+    runs-on: windows-2022
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: false
+          fetch-depth: 1
+      - name: Build official loaders and probes
+        shell: pwsh
+        run: >-
+          ./ci/windows/Build-KhronosLoaders.ps1
+          -RepoRoot $env:GITHUB_WORKSPACE
+          -OutputDir "$env:RUNNER_TEMP/helios-loaders"
+          -VulkanLoaderCommit $env:VULKAN_LOADER_COMMIT
+          -VulkanHeadersCommit $env:VULKAN_HEADERS_COMMIT
+          -OpenClLoaderCommit $env:OPENCL_LOADER_COMMIT
+      - uses: actions/upload-artifact@v7
+        with:
+          name: helios-loaders
+          path: ${{ runner.temp }}/helios-loaders
+          if-no-files-found: error
+          retention-days: 14
+
+  package:
+    name: Sign and assemble installable bundle
+    needs: [driver, mesa, opencl, loaders]
+    runs-on: windows-2022
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: false
+          fetch-depth: 1
+      - uses: actions/download-artifact@v8
+        with:
+          name: helios-driver
+          path: ${{ runner.temp }}/artifacts/driver
+      - uses: actions/download-artifact@v8
+        with:
+          name: helios-mesa
+          path: ${{ runner.temp }}/artifacts/mesa
+      - uses: actions/download-artifact@v8
+        with:
+          name: helios-opencl
+          path: ${{ runner.temp }}/artifacts/opencl
+      - uses: actions/download-artifact@v8
+        with:
+          name: helios-loaders
+          path: ${{ runner.temp }}/artifacts/loaders
+      - name: Ensure Windows Driver Kit is installed
+        shell: pwsh
+        run: ./ci/windows/Install-WindowsDriverKit.ps1
+      - name: Read package metadata
+        id: metadata
+        shell: pwsh
+        run: |
+          $version = (Get-Content kmd_render/driver-version.env | Where-Object { $_ -match '^HELIOS_KMD_VERSION=' }) -replace '^HELIOS_KMD_VERSION=', ''
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "mesa=$(git rev-parse HEAD:icd/mesa)" >> $env:GITHUB_OUTPUT
+          "dxvk=$(git rev-parse HEAD:dxvk-helios)" >> $env:GITHUB_OUTPUT
+      - name: Assemble and test-sign bundle
+        shell: pwsh
+        run: >-
+          ./ci/windows/Assemble-Package.ps1
+          -RepoRoot $env:GITHUB_WORKSPACE
+          -DriverArtifact "$env:RUNNER_TEMP/artifacts/driver"
+          -MesaArtifact "$env:RUNNER_TEMP/artifacts/mesa"
+          -OpenClArtifact "$env:RUNNER_TEMP/artifacts/opencl"
+          -LoadersArtifact "$env:RUNNER_TEMP/artifacts/loaders"
+          -OutputDir "$env:RUNNER_TEMP/helios-package"
+          -Version '${{ steps.metadata.outputs.version }}'
+          -RepositoryCommit $env:GITHUB_SHA
+          -MesaCommit '${{ steps.metadata.outputs.mesa }}'
+          -DxvkCommit '${{ steps.metadata.outputs.dxvk }}'
+          -ClvkCommit $env:CLVK_COMMIT
+          -VulkanLoaderCommit $env:VULKAN_LOADER_COMMIT
+          -VulkanHeadersCommit $env:VULKAN_HEADERS_COMMIT
+          -OpenClLoaderCommit $env:OPENCL_LOADER_COMMIT
+      - uses: actions/upload-artifact@v7
+        with:
+          name: helios-windows-x64-${{ steps.metadata.outputs.version }}
+          path: |
+            ${{ runner.temp }}/helios-package/*.zip
+            ${{ runner.temp }}/helios-package/*.sha256
+          if-no-files-found: error
+          retention-days: 30
+      - name: Publish tagged release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $files = Get-ChildItem "$env:RUNNER_TEMP/helios-package" -File | Where-Object { $_.Extension -in @('.zip', '.sha256') } | ForEach-Object FullName
+          gh release view $env:GITHUB_REF_NAME 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $env:GITHUB_REF_NAME @files --clobber
+          } else {
+            gh release create $env:GITHUB_REF_NAME @files --generate-notes --title $env:GITHUB_REF_NAME
+          }
