@@ -16,6 +16,7 @@ Assert-Command "meson.exe" | Out-Null
 Assert-Command "ninja.exe" | Out-Null
 Assert-Command "cargo.exe" | Out-Null
 Assert-Command "cargo-make.exe" | Out-Null
+$rustc = Assert-Command "rustc.exe"
 
 $stampInf = Find-WindowsKitTool "stampinf.exe"
 $inf2Cat = Find-WindowsKitTool "Inf2Cat.exe"
@@ -68,13 +69,19 @@ $env:HELIOS_MSVC_INCLUDE = Join-Path $env:VCToolsInstallDir "include"
 
 # rust-script repeats the 64-character cargo-make script name in its target
 # path. That exceeds link.exe's legacy MAX_PATH limit on GitHub's Windows
-# runners. Resolve the real executable before putting our short-name shim first
-# in PATH; the shim preserves the original base path while copying the script to
-# a compact filename.
+# runners. Resolve the real executable before compiling a short-name shim with
+# the already-installed Rust toolchain and putting that shim first in PATH. The
+# shim preserves the original base path while copying the script to a compact
+# filename.
 $env:HELIOS_RUST_SCRIPT_REAL = Assert-Command "rust-script.exe"
 $env:HELIOS_RUST_SCRIPT_SHORT_ROOT = "C:\rs"
 New-Item -ItemType Directory -Force -Path $env:HELIOS_RUST_SCRIPT_SHORT_ROOT | Out-Null
-$env:PATH = "$PSScriptRoot;$env:PATH"
+$shimDir = "C:\rs-bin"
+$shimExecutable = Join-Path $shimDir "rust-script.exe"
+New-Item -ItemType Directory -Force -Path $shimDir | Out-Null
+& $rustc (Join-Path $PSScriptRoot "rust-script-shim.rs") -O -o $shimExecutable
+if ($LASTEXITCODE -ne 0) { throw "rust-script path shim failed to compile with exit code $LASTEXITCODE." }
+$env:PATH = "$shimDir;$env:PATH"
 
 $kmdRoot = Join-Path $RepoRoot "kmd_render"
 Push-Location $kmdRoot
