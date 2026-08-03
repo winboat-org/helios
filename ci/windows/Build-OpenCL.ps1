@@ -25,8 +25,10 @@ try {
     Pop-Location
 }
 
-& cmake.exe -S $SourceRoot -B $BuildRoot -A x64 `
+& cmake.exe -S $SourceRoot -B $BuildRoot -G Ninja `
     -DCMAKE_BUILD_TYPE=Release `
+    -DCMAKE_C_COMPILER_LAUNCHER=sccache `
+    -DCMAKE_CXX_COMPILER_LAUNCHER=sccache `
     -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded `
     -DCLVK_CLSPV_ONLINE_COMPILER=ON `
     -DCLVK_COMPILER_AVAILABLE=ON `
@@ -36,7 +38,7 @@ try {
     -DCLVK_ENABLE_ASSERTIONS=OFF
 if ($LASTEXITCODE -ne 0) { throw "clvk CMake configure failed." }
 
-& cmake.exe --build $BuildRoot --config Release --parallel
+& cmake.exe --build $BuildRoot --parallel
 if ($LASTEXITCODE -ne 0) { throw "clvk build failed." }
 
 $vendorDll = Get-ChildItem -LiteralPath $BuildRoot -Filter "OpenCL.dll" -File -Recurse |
