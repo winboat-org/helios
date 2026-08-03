@@ -33,11 +33,21 @@ if (Test-Path -LiteralPath $dxvkBuild) {
     Remove-Item -LiteralPath $dxvkBuild -Recurse -Force
 }
 
+$dxvkCppArgs = @(
+    "/D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH"
+    "-Wno-deprecated-declarations"
+    "-Wno-delete-non-abstract-non-virtual-dtor"
+    "-Wno-unused-private-field"
+    "-Wno-unused-lambda-capture"
+    "-Wno-c++20-extensions"
+    "-Wno-unused-const-variable"
+) -join " "
+
 & meson.exe setup $dxvkBuild $dxvkSource `
     --native-file $nativeFile `
     --buildtype release `
     -Db_vscrt=md `
-    -Dcpp_args=/D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH `
+    "-Dcpp_args=$dxvkCppArgs" `
     "-Dc_args=/FI$compatHeader" `
     -Denable_d3d8=false `
     -Denable_d3d9=false `
@@ -55,8 +65,16 @@ $env:HELIOS_CLANG_CL = $clangCl
 $env:HELIOS_MSVC_LIB = $llvmLib
 $env:HELIOS_WDK_INCLUDE = Find-WindowsKitInclude
 $env:HELIOS_MSVC_INCLUDE = Join-Path $env:VCToolsInstallDir "include"
-$env:RUST_SCRIPT_CACHE_DIR = "C:\rs"
-New-Item -ItemType Directory -Force -Path $env:RUST_SCRIPT_CACHE_DIR | Out-Null
+
+# rust-script repeats the 64-character cargo-make script name in its target
+# path. That exceeds link.exe's legacy MAX_PATH limit on GitHub's Windows
+# runners. Resolve the real executable before putting our short-name shim first
+# in PATH; the shim preserves the original base path while copying the script to
+# a compact filename.
+$env:HELIOS_RUST_SCRIPT_REAL = Assert-Command "rust-script.exe"
+$env:HELIOS_RUST_SCRIPT_SHORT_ROOT = "C:\rs"
+New-Item -ItemType Directory -Force -Path $env:HELIOS_RUST_SCRIPT_SHORT_ROOT | Out-Null
+$env:PATH = "$PSScriptRoot;$env:PATH"
 
 $kmdRoot = Join-Path $RepoRoot "kmd_render"
 Push-Location $kmdRoot
