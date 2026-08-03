@@ -47,7 +47,7 @@ fn zero_linear_scanout_breadcrumbs() {
 ///
 /// ⚠ `#[inline(never)]` is a STACK BUDGET decision, not style. `VenusClient` and
 /// the blob descriptors are large locals, and StartDevice's frame is already
-/// shared with `VirtioGpu::init`'s ~9.1 KB one on a 24 KB kernel stack. Keeping
+/// shared with `VirtioGpu::init`'s 3.0 KB one on a 24 KB kernel stack. Keeping
 /// these in their own transient frame — which does not overlap
 /// `VirtioGpu::init` — is what keeps the nested peak inside the budget. See
 /// `StartedState::boxed` for the boot failure this class of growth caused.
@@ -129,7 +129,7 @@ pub unsafe extern "C" fn dxgkddi_start_device(
         .store(0, core::sync::atomic::Ordering::Release);
 
     // NOT copied here. `dxgkrnl_interface` is 576 bytes and this function's
-    // stack frame is shared with `VirtioGpu::init`'s ~9.1 KB one on a 24 KB
+    // stack frame is shared with `VirtioGpu::init`'s 3.0 KB one on a 24 KB
     // kernel stack — see `StartedState::boxed`. The pointer is carried to the
     // publication site and dereferenced straight into the heap allocation.
     crate::diag::record(0x0B00_0002);

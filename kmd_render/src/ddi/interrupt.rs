@@ -28,6 +28,23 @@ pub static INT_ROUTINE_COUNT: AtomicU32 = AtomicU32::new(0);
 pub static DPC_ROUTINE_COUNT: AtomicU32 = AtomicU32::new(0);
 pub static CONTROL_INT_COUNT: AtomicU32 = AtomicU32::new(0);
 
+/// Ask dxgkrnl to run the normal completion DPC after PASSIVE-side lifecycle
+/// code changed a WDDM wait predicate.  The caller has already preserved the
+/// producer watermark under `wddm_notify_lock`; queuing the DPC only provides
+/// the prompt that lets it observe the now-ready head without waiting for an
+/// unrelated virtio interrupt.
+pub(crate) fn request_wddm_completion_dpc(adapter: &AdapterContext) {
+    let Some(dxgkrnl) = adapter.dxgkrnl_opt() else {
+        return;
+    };
+    let Some(queue_dpc) = dxgkrnl.DxgkCbQueueDpc else {
+        return;
+    };
+    // SAFETY: the callback table belongs to this live adapter, and QueueDpc is
+    // callable at PASSIVE/DISPATCH/DIRQL. It does not take wddm_notify_lock.
+    unsafe { queue_dpc(dxgkrnl.DeviceHandle) };
+}
+
 /// Drain used control-queue entries, apply any completed DISPATCH-level scan-out
 /// bind, and retire any WDDM fences whose Venus watermark is now complete.
 /// Normally called from the device DPC; the scanout worker may also call it at
@@ -40,6 +57,50 @@ pub static CONTROL_INT_COUNT: AtomicU32 = AtomicU32::new(0);
 pub(crate) fn drain_used_and_complete(adapter: &AdapterContext) {
     let _ = adapter.with_virtio(|v| v.drain_used());
 
+    // A producer completion may have made the one deferred fast bind safe.
+    // Promotion and sequence minting share this virtio-lock hold, so the host
+    // sees `SET_SCANOUT_BLOB` only after the exact carried boundary retired and
+    // its bookkeeping sequence still equals control-FIFO order.
+    let deferred_fast_bind = adapter.with_virtio(|v| {
+        v.service_deferred_scanout_bind(|resource_id| adapter.mint_scanout_bind_seq(resource_id))
+    });
+    match deferred_fast_bind {
+        Ok(Some(crate::virtio::FastBindDispatch::Queued)) => {
+            crate::ddi::scanout_trace::note_fast_bind_enqueued()
+        }
+        Ok(Some(crate::virtio::FastBindDispatch::Busy)) => {
+            crate::ddi::scanout_trace::note_fast_bind_busy()
+        }
+        Ok(Some(crate::virtio::FastBindDispatch::Failed)) => {
+            crate::ddi::scanout_trace::note_fast_bind_error()
+        }
+        Ok(Some(crate::virtio::FastBindDispatch::Deferred))
+        | Ok(Some(crate::virtio::FastBindDispatch::Handled))
+        | Ok(None)
+        | Err(_) => {}
+    }
+
+    if let Some(request) = adapter
+        .with_virtio(|v| v.take_fast_failure_wake())
+        .ok()
+        .flatten()
+    {
+        // A worker held behind this fast request is the ordinary synchronous
+        // recovery path. Release only the exact waiter and wake it on failure.
+        let _ = adapter.with_virtio(|v| v.release_fast_owned_worker(request));
+        adapter.signal_hpd();
+    }
+
+    // The synchronous VidPN worker uses the identical producer boundary.  Its
+    // handle remains in the existing pending slot; waking it only after this
+    // exact boundary retires prevents `set_scanout_blob` from racing Venus.
+    if adapter
+        .with_virtio(|v| v.take_ready_worker_scanout_bind())
+        .unwrap_or(false)
+    {
+        adapter.signal_hpd();
+    }
+
     // ── The DISPATCH fast bind's application (ROADMAP defect 0ab-C, D1(ii)) ──
     //
     // A SECOND, short `with_virtio`, and the separation is the point: the drain
@@ -51,50 +112,56 @@ pub(crate) fn drain_used_and_complete(adapter: &AdapterContext) {
     let fast_bind = adapter
         .with_virtio(|v| v.take_completed_bind())
         .ok()
-        .flatten()
-        .filter(|bind| {
-            // The wire-order guard. A bind whose sequence no longer advances the
-            // applied watermark was overtaken on the wire by one whose
-            // bookkeeping is already live; applying it now would name a resource
-            // the host has moved off.
-            let adopted = adapter.adopt_scanout_bind_seq(bind.seq);
-            if !adopted {
-                crate::ddi::scanout_trace::note_fast_bind_late();
-            }
-            adopted
-        });
-    if let Some(bind) = fast_bind {
-        // Atomics only, so this is DISPATCH-legal as it stands: no registry
-        // write (the counters are mirrored from the PASSIVE `pacing_snapshot`),
-        // no allocation, no wait.
-        //
-        // Sampled here rather than in the drain: every application is
-        // seq-ordered by the guard above, so the value this reads is the one the
-        // preceding application left, which is what makes the supersede decision
-        // coherent. A rebind to a DIFFERENT resource ends every older epoch's
-        // lease — the control queue is FIFO, so a returned SET_SCANOUT_BLOB
-        // proves every earlier flush completed.
-        let previous = adapter.host_bound_scanout_resource.load(Ordering::Acquire);
-        let superseded = previous != 0 && previous != bind.resource_id;
-        adapter.remember_scanout_blob(bind.resource_id, (bind.wh >> 32) as u32, bind.wh as u32);
-        adapter.publish_bound_epoch(bind.present_epoch, superseded);
-        adapter.publish_bound_primary(bind.primary_address);
-        crate::ddi::scanout_trace::note_fast_bind_applied();
-    }
-
+        .flatten();
+    let fast_terminal_request = fast_bind.map(crate::virtio::gpu::completed_request);
     adapter.with_wddm_notify_lock(|guard| {
-        // The bind edge's flush arm, run with the boundary the FLIP carried
-        // (D1(i)) rather than a sample taken now — the whole point of the
-        // 22.22.217.0 ordering, preserved by carrying the mark through the
-        // in-flight entry. Same shape as the `refresh_ready` tail below: the
-        // locked body decides, and the caller requests the refresh.
+        // `drain_used` runs under only `virtio_lock`, so a rejected tagged
+        // submit can only invalidate its stream there.  Discharge the stale
+        // scheduler/scanout waits here, under the required notify→virtio order;
+        // they remain gated on their ordinary wire watermark rather than being
+        // mistaken for a successful stream retirement.
+        let _ = guard.with_virtio(|order, v| v.discharge_dead_present_stream_waits(order));
+
+        // Apply the accepted bind and arm its flush edge as ONE notify-ordered
+        // transition.  In particular, `active_scanout_resource` is not exposed
+        // to PRESENT classification until its carried boundary is in the
+        // refresh state.  Otherwise a same-resource re-present could insert W2
+        // after seeing the active identity, then this older bind insert W1;
+        // `RefreshState::note(W1, ready)` correctly treats a ready *newer*
+        // marker as a replacement and would incorrectly clear W2.  The notify
+        // lock supplies the required W1-before-W2 order.
+        //
+        // This block is atomics plus `KeSetEvent(Wait = FALSE)` only: it remains
+        // DISPATCH-safe and takes no transport lock until `arm_bind_refresh`
+        // reaches its witnessed notify -> virtio critical section below.
+        //
+        // The bind edge uses the boundary the FLIP carried (D1(i)) rather than a
+        // sample taken now — the whole point of the 22.22.217.0 ordering,
+        // preserved by carrying the mark through the in-flight entry. The
+        // notification scope performs both the decision and pending-identity
+        // publication, so a later PRESENT cannot replace this bind edge after it
+        // has selected its exact resource.
         //
         // No liveness re-check here on purpose: the flush executor re-validates
         // (`resource_is_live` + the `RfUnb` arm) before it issues any read, so a
         // resource that died between the bind and now self-heals exactly as
         // today's stale states do — and host-side FIFO means our bind always
         // precedes any unref of the same resource.
-        if let Some(bind) = fast_bind {
+        if let Some(bind) = fast_bind.filter(|bind| adapter.adopt_scanout_bind_seq(bind.seq)) {
+            // The wire-order guard belongs inside the same notify-ordered
+            // transition as every identity/epoch publication.
+            // Sampled under the same ordering scope as the active-identity
+            // publication and boundary insertion.  A rebind to a DIFFERENT
+            // resource ends every older epoch's lease — the control queue is
+            // FIFO, so a returned SET_SCANOUT_BLOB proves every earlier flush
+            // completed.
+            let previous = adapter.host_bound_scanout_resource.load(Ordering::Acquire);
+            let superseded = previous != 0 && previous != bind.resource_id;
+            adapter.remember_scanout_blob(bind.resource_id, (bind.wh >> 32) as u32, bind.wh as u32);
+            adapter.publish_bound_epoch(bind.present_epoch, superseded);
+            adapter.publish_bound_primary(bind.primary_address);
+            crate::ddi::scanout_trace::note_fast_bind_applied();
+
             let (ready, carried) =
                 adapter.arm_bind_refresh_locked(guard, bind.resource_id, bind.carried_watermark);
             if carried {
@@ -104,7 +171,7 @@ pub(crate) fn drain_used_and_complete(adapter: &AdapterContext) {
             }
             crate::ddi::scanout_trace::note_bind_refresh(ready);
             if ready {
-                adapter.request_scanout_refresh_for(bind.resource_id);
+                adapter.request_scanout_refresh_for_locked(guard, bind.resource_id);
             }
         }
 
@@ -115,7 +182,7 @@ pub(crate) fn drain_used_and_complete(adapter: &AdapterContext) {
             .ok()
             .flatten();
         if let Some(resource_id) = refresh_ready {
-            adapter.request_scanout_refresh_for(resource_id);
+            adapter.request_scanout_refresh_for_locked(guard, resource_id);
         }
 
         // One at a time, so a failed notification can put its fence back. The
@@ -174,6 +241,13 @@ pub(crate) fn drain_used_and_complete(adapter: &AdapterContext) {
             break;
         }
     });
+    if let Some(request) = fast_terminal_request {
+        // A worker deliberately held behind this accepted fast bind can now
+        // rerun/re-evaluate after either an applied or stale terminal outcome.
+        // A stale accepted bind must not leave its exact waiter pinned forever.
+        let _ = adapter.with_virtio(|v| v.release_fast_owned_worker(request));
+        adapter.signal_hpd();
+    }
 }
 
 /// `DxgkDdiInterruptRoutine` — runs at the device's DIRQL; returns TRUE if the

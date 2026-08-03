@@ -65,11 +65,58 @@ $json = [ordered]@{
     api_version = $ApiVersion
   }
 }
-$manifestTmp = "$manifest.tmp"
-$json | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $manifestTmp -Encoding ascii
-$parsed = Get-Content -LiteralPath $manifestTmp -Raw | ConvertFrom-Json
-if (-not $parsed.ICD.library_path) { throw "Generated ICD manifest is invalid: missing ICD.library_path" }
-Move-Item -LiteralPath $manifestTmp -Destination $manifest -Force
+$expectedLibraryPath = $destDll -replace "\\", "/"
+$manifestText = ($json | ConvertTo-Json -Depth 4) + [Environment]::NewLine
+$parsed = $manifestText | ConvertFrom-Json
+if ([string]$parsed.ICD.library_path -ne $expectedLibraryPath) {
+  throw "Generated ICD manifest is invalid: expected library_path '$expectedLibraryPath'"
+}
+
+# A driver deploy is commonly followed immediately by a reboot. Set-Content
+# alone may leave the manifest in the system cache; an abrupt reboot can then
+# preserve its length while losing every data page (observed as a 253-byte file
+# containing only NULs). Write the replacement through and flush it to stable
+# storage before publishing its name. The old manifest remains authoritative
+# until the final same-volume rename.
+$manifestTmp = "$manifest.tmp.$PID.$([guid]::NewGuid().ToString('N'))"
+$manifestBytes = [Text.Encoding]::ASCII.GetBytes($manifestText)
+$manifestStream = $null
+try {
+  $manifestStream = [IO.FileStream]::new(
+    $manifestTmp,
+    [IO.FileMode]::CreateNew,
+    [IO.FileAccess]::Write,
+    [IO.FileShare]::None,
+    4096,
+    [IO.FileOptions]::WriteThrough)
+  $manifestStream.Write($manifestBytes, 0, $manifestBytes.Length)
+  $manifestStream.Flush($true)
+} finally {
+  if ($manifestStream) { $manifestStream.Dispose() }
+}
+
+try {
+  $tmpText = Get-Content -LiteralPath $manifestTmp -Raw
+  if ($tmpText.IndexOf([char]0) -ge 0) {
+    throw "Generated ICD manifest contains NUL bytes: $manifestTmp"
+  }
+  $tmpParsed = $tmpText | ConvertFrom-Json
+  if ([string]$tmpParsed.ICD.library_path -ne $expectedLibraryPath) {
+    throw "Generated ICD manifest failed readback validation: $manifestTmp"
+  }
+  Move-Item -LiteralPath $manifestTmp -Destination $manifest -Force
+} finally {
+  Remove-Item -LiteralPath $manifestTmp -Force -ErrorAction SilentlyContinue
+}
+
+$installedText = Get-Content -LiteralPath $manifest -Raw
+if ($installedText.IndexOf([char]0) -ge 0) {
+  throw "Installed ICD manifest contains NUL bytes: $manifest"
+}
+$installedParsed = $installedText | ConvertFrom-Json
+if ([string]$installedParsed.ICD.library_path -ne $expectedLibraryPath) {
+  throw "Installed ICD manifest failed final validation: $manifest"
+}
 Grant-HeliosReadExecute $installDirFull
 
 if ($PruneOld) {
@@ -106,6 +153,9 @@ if (-not $NoSmoke) {
     Write-Host "Running vulkaninfo --summary with VK_DRIVER_FILES=$manifest"
     $env:VK_DRIVER_FILES = $manifest
     & $vulkaninfo.Source --summary
+    if ($LASTEXITCODE -ne 0) {
+      throw "vulkaninfo --summary failed with exit code $LASTEXITCODE"
+    }
   } else {
     Write-Host "vulkaninfo.exe not found on PATH; skipping smoke test."
   }

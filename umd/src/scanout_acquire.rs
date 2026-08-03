@@ -51,7 +51,8 @@ use helios_protocol::{
     HELIOS_SCANOUT_ACQ_OK, HELIOS_SCANOUT_ACQ_OP_MAP, HELIOS_SCANOUT_ACQ_OP_PROBE,
     HELIOS_SCANOUT_ACQ_OP_REGISTER, HELIOS_SCANOUT_ACQ_OP_UNMAP,
     HELIOS_SCANOUT_ACQ_OP_UNREGISTER, HELIOS_SCANOUT_ACQ_PROBE_ACK,
-    HELIOS_SCANOUT_ACQ_TABLE_FULL, HELIOS_SCANOUT_CAP_SNAPSHOT_BIND,
+    HELIOS_SCANOUT_ACQ_TABLE_FULL, HELIOS_SCANOUT_CAP_ASYNC_PRESENT_STREAM,
+    HELIOS_SCANOUT_CAP_SNAPSHOT_BIND,
 };
 
 use crate::ddi;
@@ -95,6 +96,15 @@ pub(crate) fn scanout_snapshot_capable() -> bool {
     // seeing PROBE_OK guarantees the caps store that preceded it is visible.
     PROBE_STATE.load(Ordering::Acquire) == PROBE_OK
         && PROBE_CAPS.load(Ordering::Relaxed) & HELIOS_SCANOUT_CAP_SNAPSHOT_BIND != 0
+}
+
+/// Whether the KMD probe explicitly advertised registered monotonic
+/// present-stream markers.  The acquire probe is the shared capability latch;
+/// an old KMD, a probe failure, or `ScanoutAcquire=0` stays false and forces
+/// the historical present gate.
+pub(crate) fn async_present_stream_capable() -> bool {
+    PROBE_STATE.load(Ordering::Acquire) == PROBE_OK
+        && PROBE_CAPS.load(Ordering::Relaxed) & HELIOS_SCANOUT_CAP_ASYNC_PRESENT_STREAM != 0
 }
 
 /// The lock-free fast-path flag the DXVK export reads once per flush:

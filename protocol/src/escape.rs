@@ -65,6 +65,10 @@ pub const HELIOS_ESCAPE_MAP_READ_LEDGER: u32 = 0x000E;
 /// level-triggered (re-reads the ledger on every wake). See
 /// [`HeliosEscapeScanoutEvent`].
 pub const HELIOS_ESCAPE_SCANOUT_EVENT: u32 = 0x000F;
+/// Register or unregister a monotonic present stream.  This is intentionally a
+/// distinct escape instead of an extension of SUBMIT_VENUS: an old KMD must
+/// reject the unknown verb, letting the UMD keep its conservative gate.
+pub const HELIOS_ESCAPE_PRESENT_STREAM: u32 = 0x0010;
 
 /// Header for all escape commands. 16 bytes.
 #[repr(C)]
@@ -119,7 +123,28 @@ pub struct HeliosEscapeSubmitVenus {
     pub ctx_id: u32,
     pub buffer_size: u32,
     pub ring_idx: u32,
-    pub _pad: u32,
+    /// Zero is the legacy submit form.  A nonzero value tags this submission as
+    /// present-stream work: `fence_id` is then the stream cookie on input and
+    /// the KMD still overwrites it with its fresh normal wire fence on output.
+    pub present_value32: u32,
+}
+
+/// `HELIOS_ESCAPE_PRESENT_STREAM` operations.
+pub const HELIOS_PRESENT_STREAM_OP_REGISTER: u32 = 1;
+pub const HELIOS_PRESENT_STREAM_OP_UNREGISTER: u32 = 2;
+
+/// Register/unregister one monotonic present stream.  32 bytes.
+///
+/// REGISTER takes `ctx_id` and returns a KMD-generated opaque `cookie`.
+/// UNREGISTER requires the exact `{ctx_id, cookie}` pair.  The stream is owned
+/// by the escaping D3DKMT device; it is reclaimed on context/device teardown.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct HeliosEscapePresentStream {
+    pub hdr: HeliosEscapeHeader,
+    pub cookie: u64,
+    pub ctx_id: u32,
+    pub op: u32,
 }
 
 /// `HELIOS_ESCAPE_CTX_CREATE`. The KMD fills `out_ctx_id` with the guest-assigned
@@ -422,6 +447,10 @@ pub const HELIOS_SCANOUT_CAP_READ_LEDGER: u32 = 1 << 0;
 /// (D4b: bind/flush the UMD's snapshot resource on the DMA-flip path). The
 /// UMD must never set that flag without seeing this bit.
 pub const HELIOS_SCANOUT_CAP_SNAPSHOT_BIND: u32 = 1 << 1;
+/// The KMD accepts registered monotonic present-stream markers.  The UMD must
+/// keep its legacy CPU gate unless this bit and PRESENT_STREAM registration
+/// both succeed.
+pub const HELIOS_SCANOUT_CAP_ASYNC_PRESENT_STREAM: u32 = 1 << 2;
 
 /// out_state values for the two D4a escapes.
 pub const HELIOS_SCANOUT_ACQ_OK: u32 = 0;
@@ -603,10 +632,27 @@ pub struct HeliosEscapeQueryStatsV3 {
     pub out_query_scanout_retries: u32,
 }
 
+/// `HELIOS_ESCAPE_QUERY_STATS` v4: v3 plus bounded registered present-stream
+/// telemetry.  APPENDED so every older query prefix remains byte-identical.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct HeliosEscapeQueryStatsV4 {
+    pub v3: HeliosEscapeQueryStatsV3,
+    pub out_present_streams_live: u32,
+    pub out_present_streams_cap: u32,
+    pub out_present_streams_high_water: u32,
+    pub out_present_stream_registers: u32,
+    pub out_present_stream_tags: u32,
+    pub out_present_stream_markers: u32,
+    pub out_present_stream_retires: u32,
+    pub out_present_stream_rejects: u32,
+}
+
 const _: () = {
     assert!(core::mem::size_of::<HeliosEscapeHeader>() == 16);
     assert!(core::mem::size_of::<HeliosEscapeQueryStats>() == 88);
     assert!(core::mem::size_of::<HeliosEscapeSubmitVenus>() == 40);
+    assert!(core::mem::size_of::<HeliosEscapePresentStream>() == 32);
     assert!(core::mem::size_of::<HeliosEscapeCtxCreate>() == 24);
     assert!(core::mem::size_of::<HeliosEscapeAllocBlob>() == 48);
     assert!(core::mem::size_of::<HeliosEscapeMapBlob>() == 32);
@@ -630,4 +676,5 @@ const _: () = {
     assert!(core::mem::size_of::<HeliosEscapeQueryStatsV2>() == 152);
     // v2 (152) + 12 u32 = 200. The v2 prefix must stay byte-identical.
     assert!(core::mem::size_of::<HeliosEscapeQueryStatsV3>() == 200);
+    assert!(core::mem::size_of::<HeliosEscapeQueryStatsV4>() == 232);
 };

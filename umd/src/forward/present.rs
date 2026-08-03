@@ -432,6 +432,7 @@ pub(crate) enum RuntimeSubmission {
     TypedPresent {
         dependencies: RuntimePresentDependencies,
         private: HeliosPresentPrivateData,
+        correlation: PresentStreamCorrelation,
     },
     /// A DXGI present with no identity to carry, written as a
     /// `HeliosPresentRefreshCmd`. It still submits the present's allocation
@@ -442,6 +443,7 @@ pub(crate) enum RuntimeSubmission {
     /// (`display.rs`), so the frozen refresh-marker ordering is unaffected.
     MarkerPresent {
         dependencies: RuntimePresentDependencies,
+        correlation: PresentStreamCorrelation,
     },
 }
 
@@ -478,12 +480,17 @@ impl RuntimeSubmission {
 /// the KMD writes its own copy with real `DXGK_PRESENT_*_INDEX` values in
 /// `display.rs`. Populating them here would be a wire-semantics change with no
 /// reader.
-pub(crate) fn present_refresh_cmd() -> HeliosPresentRefreshCmd {
+pub(crate) fn present_refresh_cmd(
+    correlation: PresentStreamCorrelation,
+) -> HeliosPresentRefreshCmd {
     HeliosPresentRefreshCmd {
         magic: HELIOS_PRESENT_REFRESH_MAGIC,
         version: HELIOS_PRESENT_REFRESH_VERSION,
         source_index: 0,
         destination_index: 0,
+        present_ctx_id: correlation.ctx_id,
+        present_value: correlation.value32,
+        present_cookie: correlation.cookie,
     }
 }
 
@@ -521,12 +528,16 @@ pub(crate) unsafe fn submit_runtime_submission(
     let allocation_count = match submission {
         RuntimeSubmission::TypedPresent {
             dependencies,
-            private,
+            mut private,
+            correlation,
         } => {
             let count = match dependencies.write_to(ctx) {
                 Ok(count) => count,
                 Err(hr) => return hr,
             };
+            private.present_ctx_id = correlation.ctx_id;
+            private.present_value = correlation.value32;
+            private.present_cookie = correlation.cookie;
             (command as *mut HeliosPresentRenderCmd).write_unaligned(HeliosPresentRenderCmd {
                 magic: HELIOS_PRESENT_RENDER_MAGIC,
                 version: HELIOS_PRESENT_RENDER_VERSION,
@@ -534,12 +545,16 @@ pub(crate) unsafe fn submit_runtime_submission(
             });
             count
         }
-        RuntimeSubmission::MarkerPresent { dependencies } => {
+        RuntimeSubmission::MarkerPresent {
+            dependencies,
+            correlation,
+        } => {
             let count = match dependencies.write_to(ctx) {
                 Ok(count) => count,
                 Err(hr) => return hr,
             };
-            (command as *mut HeliosPresentRefreshCmd).write_unaligned(present_refresh_cmd());
+            (command as *mut HeliosPresentRefreshCmd)
+                .write_unaligned(present_refresh_cmd(correlation));
             count
         }
     };
@@ -601,6 +616,7 @@ pub(crate) unsafe fn submit_runtime_present(
     dev: &crate::device_funcs::HeliosDevice,
     dependencies: RuntimePresentDependencies,
     private: Option<HeliosPresentPrivateData>,
+    correlation: PresentStreamCorrelation,
 ) -> i32 {
     submit_runtime_submission(
         dev,
@@ -608,8 +624,12 @@ pub(crate) unsafe fn submit_runtime_present(
             Some(private) => RuntimeSubmission::TypedPresent {
                 dependencies,
                 private,
+                correlation,
             },
-            None => RuntimeSubmission::MarkerPresent { dependencies },
+            None => RuntimeSubmission::MarkerPresent {
+                dependencies,
+                correlation,
+            },
         },
     )
 }
@@ -626,6 +646,7 @@ pub(crate) unsafe fn submit_runtime_present_then_call(
     dev: &crate::device_funcs::HeliosDevice,
     dependencies: RuntimePresentDependencies,
     private: Option<HeliosPresentPrivateData>,
+    correlation: PresentStreamCorrelation,
     callback_args: &mut ddi::DXGIDDICB_PRESENT,
 ) -> i32 {
     if dev.dxgi_callbacks.is_null() {
@@ -637,7 +658,7 @@ pub(crate) unsafe fn submit_runtime_present_then_call(
         return E_FAIL;
     };
 
-    let render_hr = submit_runtime_present(dev, dependencies, private);
+    let render_hr = submit_runtime_present(dev, dependencies, private, correlation);
     if render_hr < 0 {
         return render_hr;
     }
@@ -759,6 +780,7 @@ pub(crate) unsafe fn finish_present(
     dst_alloc: u32,
     req: PresentRequest,
     snapshot: Option<SnapshotPlan>,
+    correlation: PresentStreamCorrelation,
 ) -> Result<i32, i32> {
     let no_callback_hr = req.kind.initial_hr();
     let Some(dev) = helios_device(h) else {
@@ -876,6 +898,7 @@ pub(crate) unsafe fn finish_present(
         dev,
         dependencies,
         present_private,
+        correlation,
         &mut cb,
     ))
 }
@@ -917,6 +940,19 @@ pub(crate) unsafe extern "C" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT
         _ => None,
     });
     let is_vehicle_present = ext_source.is_some();
+    // This only selects the ordinary fast path. The diagnostics below change
+    // command-stream ordering themselves, and a vehicle publishes its frame
+    // from the ICD side, so all three retain the historical post-flush
+    // producer publication path exactly.
+    let batch_fold_present_order = !is_vehicle_present
+        && crate::knobs::present_batch_fold()
+        && !present_force_opaque_enabled()
+        && !present_readback_enabled();
+    let mut present_order_folded = false;
+    // Only the early, folded producer publication can name the exact queue
+    // submission that this existing Flush dispatches.  Every post-Flush,
+    // debug, vehicle and Present1 path deliberately carries this all-zero.
+    let mut present_stream_correlation = PresentStreamCorrelation::default();
 
     if let Some(context) = &context {
         if let Some(ref src_info) = ext_source {
@@ -962,6 +998,35 @@ pub(crate) unsafe extern "C" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT
             if let Some(ref private) = direct_private {
                 snapshot = snapshot_for_present(h, src_h, private);
             }
+
+            // Fold the ordinary producer signal into this present's actual
+            // frame batch. The copy and direct-primary snapshot above have
+            // both been recorded, so the signal reaches the timeline after
+            // every producer write that the consumer must observe. Recording
+            // it before this existing Flush avoids creating a separate tiny
+            // batch solely to publish the present fence.
+            if batch_fold_present_order {
+                if let Some(dev) = helios_device(h) {
+                    let consumed = if copied {
+                        resource_com_raw(dst_h)
+                    } else {
+                        resource_com_raw(src_h)
+                    };
+                    if consumed != 0 {
+                        // Only suppress the historical post-Flush path when
+                        // publication actually succeeded. A failed early
+                        // attempt must retain that path as its recovery try;
+                        // otherwise a transient slot failure would leave the
+                        // consumer unordered without even the old fallback.
+                        let (published, correlation) =
+                            dev.dxvk.publish_present_order(consumed);
+                        present_order_folded = published;
+                        if published {
+                            present_stream_correlation = correlation;
+                        }
+                    }
+                }
+            }
             context.Flush();
         }
     } else if is_vehicle_present {
@@ -996,7 +1061,7 @@ pub(crate) unsafe extern "C" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT
     // src -> dst, and `dst` is win32k's redirection surface -- the one dwm
     // composes -- so publishing `src` there would key the slot on a resource no
     // consumer ever looks up, and the wait would silently not happen.
-    if !is_vehicle_present {
+    if !is_vehicle_present && !present_order_folded {
         if let Some(dev) = helios_device(h) {
             let consumed = if copied {
                 resource_com_raw(dst_h)
@@ -1004,7 +1069,7 @@ pub(crate) unsafe extern "C" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT
                 resource_com_raw(src_h)
             };
             if consumed != 0 {
-                dev.dxvk.publish_present_order(consumed);
+                let _ = dev.dxvk.publish_present_order(consumed);
             }
         }
     }
@@ -1045,7 +1110,45 @@ pub(crate) unsafe extern "C" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT
     } else {
         0
     };
-    if !is_vehicle_present || gate_us != 0 {
+    // The registration tag makes the KMD's existing Render marker wait for the
+    // exact fold batch.  It is safe to omit the submitted gate only for that
+    // one ordinary form: early publication succeeded, its complete correlation
+    // is nonzero, the probe latched KMD support, and the explicit A/B switch is
+    // still on.  `context.Flush()` above remains the dispatch guarantee.
+    let async_stream_eligible = !is_vehicle_present
+        && present_order_folded
+        && crate::umd_async_present_stream()
+        && crate::scanout_acquire::async_present_stream_capable()
+        && present_stream_correlation.is_complete();
+    // The appended marker tail changes the KMD from its legacy current-wire
+    // watermark to the registered stream boundary. It must therefore be zero
+    // for every knob/capability/correlation fallback, even though this local
+    // correlation remains useful for trace evidence below.
+    let marker_correlation = if async_stream_eligible {
+        present_stream_correlation
+    } else {
+        PresentStreamCorrelation::default()
+    };
+    if async_stream_eligible {
+        // Timed-path evidence is trace-gated: no logging or atomic RMW when
+        // UmdTrace is off. Registration/unavailable totals are one-time C++
+        // counters beside the only REGISTER escape.
+        trace_line!(
+            "present-stream: async gate skip ctx={} value={} cookie={}",
+            present_stream_correlation.ctx_id,
+            present_stream_correlation.value32,
+            present_stream_correlation.cookie,
+        );
+    } else if !is_vehicle_present && present_order_folded {
+        trace_line!(
+            "present-stream: fallback gate folded={} corr={} cap={} knob={}",
+            present_order_folded as u32,
+            present_stream_correlation.is_complete() as u32,
+            crate::scanout_acquire::async_present_stream_capable() as u32,
+            crate::umd_async_present_stream() as u32,
+        );
+    }
+    if !async_stream_eligible && (!is_vehicle_present || gate_us != 0) {
         if let Some(dev) = helios_device(h) {
             let _outcome = run_present_frame_gate(dev, gate_us, is_vehicle_present);
         }
@@ -1063,6 +1166,7 @@ pub(crate) unsafe extern "C" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT
             flags: *(&a.Flags as *const ddi::DXGI_DDI_PRESENT_FLAGS as *const u32),
         },
         snapshot,
+        marker_correlation,
     ) {
         Ok(hr) => hr,
         // Abandons the vehicle mint, EXT_PRESENTS and the ordinal log below,
@@ -1953,6 +2057,7 @@ pub(crate) unsafe extern "C" fn dxgi_present1(arg: *mut ddi::DXGI_DDI_ARG_PRESEN
         // Present1-multi performs no scanout publish and records no blit —
         // no substitution here, ever.
         None,
+        PresentStreamCorrelation::default(),
     ) {
         Ok(hr) => hr,
         // Skips the trailing PRESENT1_LOG_COUNT line, exactly as the bare

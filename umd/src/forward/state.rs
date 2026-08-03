@@ -207,6 +207,9 @@ pub(crate) fn empty_present_private() -> HeliosPresentPrivateData {
         dxgi_format: 0,
         reserved: 0,
         venus_alloc_size: 0,
+        present_ctx_id: 0,
+        present_value: 0,
+        present_cookie: 0,
     }
 }
 
@@ -1117,6 +1120,17 @@ pub(crate) unsafe fn release_resource(h: Hdevice, h_res: ddi::D3D10DDI_HRESOURCE
 /// Borrow the COM interface stored in a DDI handle (does not take ownership).
 pub(crate) unsafe fn load_com<T: Interface>(h: impl ComHandle) -> Option<ManuallyDrop<T>> {
     load_com_at::<T>(h.drv_private())
+}
+
+/// Move the COM reference stored in a DDI handle out of its slot.
+///
+/// This is intentionally separate from [`load_com`]: the latter borrows an
+/// IC-owned reference for normal forwarding, whereas BUILD_2 command-list
+/// recycling must clear the IC slot before handing that exact owned reference
+/// to the originating deferred context. A null or already-drained slot is a
+/// normal no-candidate outcome.
+pub(crate) unsafe fn take_com<T: Interface>(h: impl ComHandle) -> Option<T> {
+    Slot::<Com<T>>::from_priv(h.drv_private())?.take()
 }
 
 /// `load_com` for the three runtime-tag dispatches (`discard_11_1`,

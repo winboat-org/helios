@@ -256,6 +256,21 @@ impl<T: Interface> Slot<Com<T>> {
         Some(ManuallyDrop::new(unsafe { T::from_raw(raw) }))
     }
 
+    /// Move the stored COM reference out and empty the slot.
+    ///
+    /// This is the ownership-preserving counterpart to [`Self::load`]. BUILD_2
+    /// command-list recycling uses it to transfer the IC-side escrow reference
+    /// into its originating deferred-context handoff; callers that decline the
+    /// object simply drop the returned interface, exactly like `release`.
+    pub(crate) unsafe fn take(self) -> Option<T> {
+        let raw = unsafe { self.cell.as_ptr().read() };
+        if raw.is_null() {
+            return None;
+        }
+        unsafe { self.clear() };
+        Some(unsafe { T::from_raw(raw) })
+    }
+
     /// Release the stored reference and empty the slot. Idempotent.
     pub(crate) unsafe fn release(self) {
         let raw = unsafe { self.cell.as_ptr().read() };

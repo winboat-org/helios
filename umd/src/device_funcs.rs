@@ -535,10 +535,9 @@ pub struct CtxBindings {
 }
 
 impl CtxBindings {
-    /// Zero every shadow slot. Used for the clear-state semantics of
-    /// `pfnCommandListExecute` (post-execute the runtime treats everything as
-    /// unbound and rebinds lazily) and for `pfnRecycleCreateDeferredContext`
-    /// (the DC is reborn for its next recording).
+    /// Zero every shadow slot for clear-state semantics: post-
+    /// `pfnCommandListExecute` the runtime treats everything as unbound and
+    /// rebinds lazily.
     pub fn reset(&self) {
         self.bound_vs_com.store(0, Ordering::Relaxed);
         self.current_vs.store(0, Ordering::Relaxed);
@@ -559,6 +558,104 @@ impl CtxBindings {
         self.current_rt0_height.store(0, Ordering::Relaxed);
         self.current_rt0_format.store(0, Ordering::Relaxed);
         self.current_layout.store(0, Ordering::Relaxed);
+    }
+
+    /// Reset the pipeline-semantic shadows required when a deferred context
+    /// is reborn. With tracing enabled, retain the full diagnostic reset.
+    pub fn reset_for_deferred_context_rebirth(&self) {
+        self.reset_for_deferred_clear_state(crate::trace_enabled());
+    }
+
+    /// Reset after ExecuteCommandList(..., FALSE).  The three semantic shadows
+    /// drive the input-layout/vertex-shader variant path after the runtime
+    /// clears state; the remaining slots exist only for trace diagnostics.
+    /// Keep their full reset whenever either diagnostic surface is enabled.
+    pub fn reset_after_command_list_execute(&self) {
+        self.reset_for_deferred_clear_state(
+            crate::trace_enabled() || crate::umd_deferred_diagnostics(),
+        );
+    }
+
+    fn reset_for_deferred_clear_state(&self, full_diagnostic_reset: bool) {
+        if full_diagnostic_reset {
+            self.reset();
+            return;
+        }
+
+        self.bound_vs_com.store(0, Ordering::Relaxed);
+        self.current_vs.store(0, Ordering::Relaxed);
+        self.current_layout.store(0, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deferred_clear_fast_path_preserves_diagnostic_shadows() {
+        let bindings = CtxBindings::default();
+        bindings.bound_vs_com.store(1, Ordering::Relaxed);
+        bindings.current_vs.store(2, Ordering::Relaxed);
+        bindings.current_layout.store(3, Ordering::Relaxed);
+        bindings.current_ps.store(4, Ordering::Relaxed);
+        bindings.current_topology.store(5, Ordering::Relaxed);
+        bindings.current_rt0_alloc.store(6, Ordering::Relaxed);
+
+        bindings.reset_for_deferred_clear_state(false);
+
+        assert_eq!(bindings.bound_vs_com.load(Ordering::Relaxed), 0);
+        assert_eq!(bindings.current_vs.load(Ordering::Relaxed), 0);
+        assert_eq!(bindings.current_layout.load(Ordering::Relaxed), 0);
+        assert_eq!(bindings.current_ps.load(Ordering::Relaxed), 4);
+        assert_eq!(bindings.current_topology.load(Ordering::Relaxed), 5);
+        assert_eq!(bindings.current_rt0_alloc.load(Ordering::Relaxed), 6);
+    }
+
+    #[test]
+    fn deferred_clear_diagnostics_reset_every_shadow() {
+        let bindings = CtxBindings::default();
+        bindings.bound_vs_com.store(1, Ordering::Relaxed);
+        bindings.current_vs.store(2, Ordering::Relaxed);
+        bindings.current_ps.store(3, Ordering::Relaxed);
+        bindings.current_gs.store(4, Ordering::Relaxed);
+        bindings.current_hs.store(5, Ordering::Relaxed);
+        bindings.current_ds.store(6, Ordering::Relaxed);
+        bindings.current_cs.store(7, Ordering::Relaxed);
+        bindings.current_topology.store(8, Ordering::Relaxed);
+        bindings.current_vb0.store(9, Ordering::Relaxed);
+        bindings.current_vb0_stride.store(10, Ordering::Relaxed);
+        bindings.current_vb0_offset.store(11, Ordering::Relaxed);
+        bindings.current_ib.store(12, Ordering::Relaxed);
+        bindings.current_ib_format.store(13, Ordering::Relaxed);
+        bindings.current_ib_offset.store(14, Ordering::Relaxed);
+        bindings.current_rt0_alloc.store(15, Ordering::Relaxed);
+        bindings.current_rt0_width.store(16, Ordering::Relaxed);
+        bindings.current_rt0_height.store(17, Ordering::Relaxed);
+        bindings.current_rt0_format.store(18, Ordering::Relaxed);
+        bindings.current_layout.store(19, Ordering::Relaxed);
+
+        bindings.reset_for_deferred_clear_state(true);
+
+        assert_eq!(bindings.bound_vs_com.load(Ordering::Relaxed), 0);
+        assert_eq!(bindings.current_vs.load(Ordering::Relaxed), 0);
+        assert_eq!(bindings.current_ps.load(Ordering::Relaxed), 0);
+        assert_eq!(bindings.current_gs.load(Ordering::Relaxed), 0);
+        assert_eq!(bindings.current_hs.load(Ordering::Relaxed), 0);
+        assert_eq!(bindings.current_ds.load(Ordering::Relaxed), 0);
+        assert_eq!(bindings.current_cs.load(Ordering::Relaxed), 0);
+        assert_eq!(bindings.current_topology.load(Ordering::Relaxed), 0);
+        assert_eq!(bindings.current_vb0.load(Ordering::Relaxed), 0);
+        assert_eq!(bindings.current_vb0_stride.load(Ordering::Relaxed), 0);
+        assert_eq!(bindings.current_vb0_offset.load(Ordering::Relaxed), 0);
+        assert_eq!(bindings.current_ib.load(Ordering::Relaxed), 0);
+        assert_eq!(bindings.current_ib_format.load(Ordering::Relaxed), 0);
+        assert_eq!(bindings.current_ib_offset.load(Ordering::Relaxed), 0);
+        assert_eq!(bindings.current_rt0_alloc.load(Ordering::Relaxed), 0);
+        assert_eq!(bindings.current_rt0_width.load(Ordering::Relaxed), 0);
+        assert_eq!(bindings.current_rt0_height.load(Ordering::Relaxed), 0);
+        assert_eq!(bindings.current_rt0_format.load(Ordering::Relaxed), 0);
+        assert_eq!(bindings.current_layout.load(Ordering::Relaxed), 0);
     }
 }
 

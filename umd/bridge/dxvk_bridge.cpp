@@ -26,6 +26,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -50,6 +51,7 @@
 // instantiate D3D11DXGIDevice from our DxvkDevice and forward the d3d10umddi DDI
 // to ID3D11Device / ID3D11DeviceContext.
 #include "d3d11_device.h"
+#include "d3d11_context_def.h"
 #include "d3d11_texture.h"
 #include "d3d11_context_imm.h"
 #include "dxvk_helios_present_sync.h"
@@ -365,10 +367,23 @@ struct HeliosDxvkDeviceImpl {
   // into a GPU-side wait instead of us CPU-blocking on our own GPU work.
   // Created lazily on the first present: an app that never presents never mints
   // a kernel object.
+  //
+  // The lock serializes lazy creation and signal recording across free-threaded
+  // DDI callers.  It is never held while creating the Vulkan fence or sending
+  // the private ICD registration escape, both of which can leave this bridge.
+  std::mutex present_order_mutex;
+  std::condition_variable present_order_ready;
+  // Remaining producer timeline state is guarded by present_order_mutex.
+  bool present_fence_initializing = false;
   dxvk::Rc<dxvk::DxvkFence> present_fence;
   std::uint32_t present_fence_id = 0;
   std::uint64_t present_value    = 0;
   bool          present_fence_failed = false;
+
+  // A missing new ICD export or old KMD is a permanent per-device fallback,
+  // never a per-present retry/escape.  The initialized fence state makes the
+  // one registration attempt explicit without a separate mutable flag.
+  std::uint64_t present_stream_cookie = 0;
 
   ~HeliosDxvkDeviceImpl() {
     if (context) context->Release();
@@ -431,6 +446,41 @@ std::size_t HeliosDxvkDevice::d3d11_context_ptr() const {
 
 std::uint32_t HeliosDxvkDevice::venus_context_id() const {
   return impl ? impl->venus_ctx_id : 0;
+}
+
+bool HeliosDxvkDevice::recycle_deferred_command_list(
+    std::size_t deferred_context_ptr,
+    std::size_t command_list_ptr) const noexcept {
+  return bridge_guard("recycle_deferred_command_list", false, [&]() -> bool {
+    if (!impl || !impl->d3d11 || !deferred_context_ptr || !command_list_ptr)
+      return false;
+
+    // The UMD passes only its owned deferred COM context (created through this
+    // bridge) and the owned command list its FinishCommandList just returned.
+    // Do not probe them with GetType/GetDevice here: those methods AddRef and
+    // Release the shared device on every handoff, defeating this hot-path
+    // optimization. D3D11CommandList::IsReusableBy is the narrow contract
+    // guard for a same-device but wrong-DC handoff.
+    auto* context = reinterpret_cast<ID3D11DeviceContext*>(deferred_context_ptr);
+    auto* commandList = reinterpret_cast<ID3D11CommandList*>(command_list_ptr);
+    return static_cast<dxvk::D3D11DeferredContext*>(context)
+      ->RecycleCommandList(static_cast<dxvk::D3D11CommandList*>(commandList));
+  });
+}
+
+bool HeliosDxvkDevice::enable_deferred_context_ddi_logical_reset(
+    std::size_t deferred_context_ptr) const noexcept {
+  return bridge_guard("enable_deferred_context_ddi_logical_reset", false, [&]() -> bool {
+    if (!impl || !impl->d3d11 || !deferred_context_ptr)
+      return false;
+
+    // This is called exactly once, immediately after this bridge created the
+    // private deferred context. Do not QI or GetDevice on the hot DDI route.
+    auto* context = reinterpret_cast<ID3D11DeviceContext*>(deferred_context_ptr);
+    static_cast<dxvk::D3D11DeferredContext*>(context)
+      ->EnableHeliosDdiLogicalReset();
+    return true;
+  });
 }
 
 bool HeliosDxvkDevice::set_resource_kmt_handles(
@@ -1113,8 +1163,16 @@ static std::atomic<std::uint32_t> s_publishNoResource{0};
 static std::atomic<std::uint32_t> s_publishFenceFailed{0};
 static std::atomic<std::uint32_t> s_publishSlotFailed{0};
 static std::atomic<std::uint64_t> s_publishOk{0};
+static std::atomic<std::uint32_t> s_presentStreamRegistered{0};
+static std::atomic<std::uint32_t> s_presentStreamUnavailable{0};
 
-bool HeliosDxvkDevice::publish_present_order(std::size_t d3d11_resource_ptr) const {
+bool HeliosDxvkDevice::publish_present_order(std::size_t d3d11_resource_ptr,
+                                             std::uint32_t* out_ctx_id,
+                                             std::uint32_t* out_value32,
+                                             std::uint64_t* out_cookie) const {
+  if (out_ctx_id) *out_ctx_id = 0;
+  if (out_value32) *out_value32 = 0;
+  if (out_cookie) *out_cookie = 0;
   if (!impl || !impl->context)
     return false;
 
@@ -1130,7 +1188,11 @@ bool HeliosDxvkDevice::publish_present_order(std::size_t d3d11_resource_ptr) con
     if (!texture || !texture->GetImage() || !texture->GetImage()->storage())
       return false;
 
-    const auto info = texture->GetImage()->storage()->getMemoryInfo();
+    // Keep the exact backing allocation alive through the slot publication and
+    // mark it on success. Its destructor is the only valid release boundary:
+    // D3D wrappers can rotate backing storages while this Venus resource lives.
+    auto storage = texture->GetImage()->storage();
+    const auto info = storage->getMemoryInfo();
     const std::uint32_t resid = venus_memory_resource_id_from_handle(info.memory);
 
     if (!resid) {
@@ -1145,10 +1207,24 @@ bool HeliosDxvkDevice::publish_present_order(std::size_t d3d11_resource_ptr) con
       return false;
     }
 
-    if (impl->present_fence == nullptr) {
+    // All potentially re-entrant work stays outside present_order_mutex.  At
+    // most one caller initializes the timeline; concurrent callers wait for
+    // that one attempt and observe either its ready state or its permanent
+    // failure latch.
+    bool initialize_present_fence = false;
+    {
+      std::unique_lock lock(impl->present_order_mutex);
+      while (impl->present_fence_initializing)
+        impl->present_order_ready.wait(lock);
       if (impl->present_fence_failed)
         return false;
+      if (impl->present_fence == nullptr) {
+        impl->present_fence_initializing = true;
+        initialize_present_fence = true;
+      }
+    }
 
+    if (initialize_present_fence) {
       // One named timeline per D3D11 device. A NULL DACL is deliberate and is
       // the reason this needs a security descriptor at all: the consumer is
       // dwm, which runs as its own principal (Window Manager\DWM-N), so the
@@ -1170,27 +1246,52 @@ bool HeliosDxvkDevice::publish_present_order(std::size_t d3d11_resource_ptr) con
 
       static std::atomic<std::uint32_t> s_nextFenceId{1};
       const std::uint32_t fenceId = s_nextFenceId.fetch_add(1, std::memory_order_relaxed);
-      const std::wstring name = L"Global\\HeliosPresentFence_"
-        + std::to_wstring(static_cast<unsigned long>(GetCurrentProcessId()))
-        + L"_" + std::to_wstring(fenceId);
+      dxvk::Rc<dxvk::DxvkFence> fence;
+      std::uint64_t cookie = 0;
 
+      // `createFence` enters Vulkan and the private registration enters the
+      // ICD/KMD, so neither runs under present_order_mutex.
       try {
+        const std::wstring name = L"Global\\HeliosPresentFence_"
+          + std::to_wstring(static_cast<unsigned long>(GetCurrentProcessId()))
+          + L"_" + std::to_wstring(fenceId);
         dxvk::DxvkFenceCreateInfo fenceInfo = { };
         fenceInfo.initialValue = 0u;
         fenceInfo.sharedType   = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT;
         fenceInfo.ntExportName = name.c_str();
         fenceInfo.ntSecurityAttributes = haveSa ? &sa : nullptr;
-        impl->present_fence = impl->device->createFence(fenceInfo);
-        impl->present_fence_id = fenceId;
+        fence = impl->device->createFence(fenceInfo);
 
-        char msg[200];
-        std::snprintf(msg, sizeof(msg),
-          "present-order: publishing as pid=%lu fence=%u",
-          static_cast<unsigned long>(GetCurrentProcessId()), fenceId);
-        umd_log(msg);
+        // The exact VkDevice + VkSemaphore pair DXVK just created is the only
+        // admissible registration identity.  An old ICD missing this private
+        // DLL export stays a zero-correlation fallback without changing
+        // ordinary present publication.
+        if (venus_register_present_stream(
+              impl->device->vkd()->device(), fence->handle(), &cookie)) {
+          const auto n = s_presentStreamRegistered.fetch_add(
+              1, std::memory_order_relaxed) + 1;
+          char stream_msg[192];
+          std::snprintf(stream_msg, sizeof(stream_msg),
+            "present-stream: registered ctx=%u cookie=%llu (x%u)",
+            impl->venus_ctx_id, static_cast<unsigned long long>(cookie), n);
+          umd_log(stream_msg);
+        } else {
+          const auto n = s_presentStreamUnavailable.fetch_add(
+              1, std::memory_order_relaxed) + 1;
+          char stream_msg[192];
+          std::snprintf(stream_msg, sizeof(stream_msg),
+            "present-stream: unavailable (old ICD/KMD or refused registration, x%u)", n);
+          umd_log(stream_msg);
+        }
       } catch (const dxvk::DxvkError& e) {
-        // Latch: retrying per present would spam and never succeed.
-        impl->present_fence_failed = true;
+        // Latch: retrying per present would spam and never succeed.  Release
+        // every concurrent waiter before returning through the old fallback.
+        {
+          std::lock_guard lock(impl->present_order_mutex);
+          impl->present_fence_failed = true;
+          impl->present_fence_initializing = false;
+        }
+        impl->present_order_ready.notify_all();
         s_publishFenceFailed.fetch_add(1, std::memory_order_relaxed);
         char msg[256];
         std::snprintf(msg, sizeof(msg),
@@ -1199,20 +1300,77 @@ bool HeliosDxvkDevice::publish_present_order(std::size_t d3d11_resource_ptr) con
           e.message().c_str());
         umd_log(msg);
         return false;
+      } catch (...) {
+        // bridge_guard owns the diagnostic, but must not leave concurrent
+        // publishers waiting forever after an unexpected initialization error.
+        {
+          std::lock_guard lock(impl->present_order_mutex);
+          impl->present_fence_failed = true;
+          impl->present_fence_initializing = false;
+        }
+        impl->present_order_ready.notify_all();
+        throw;
+      }
+
+      {
+        std::lock_guard lock(impl->present_order_mutex);
+        impl->present_fence = std::move(fence);
+        impl->present_fence_id = fenceId;
+        impl->present_stream_cookie = cookie;
+        impl->present_fence_initializing = false;
+      }
+      impl->present_order_ready.notify_all();
+
+      char msg[200];
+      std::snprintf(msg, sizeof(msg),
+        "present-order: publishing as pid=%lu fence=%u",
+        static_cast<unsigned long>(GetCurrentProcessId()), fenceId);
+      umd_log(msg);
+    }
+
+    // Preserve the signal-then-slot-publication order across free-threaded
+    // callers.  HeliosSignalPresentFence only takes DXVK's immediate-context
+    // lock and emits a CS closure; HeliosPresentSync::publish only performs
+    // shared-map/seqlock work.  Neither calls back into this UMD, so this
+    // narrow lock cannot be recursively re-entered by either operation.
+    std::uint64_t value = 0;
+    std::uint32_t fenceId = 0;
+    std::uint64_t streamCookie = 0;
+    bool slot_published = false;
+    {
+      std::lock_guard lock(impl->present_order_mutex);
+      if (impl->present_fence_failed || impl->present_fence == nullptr)
+        return false;
+
+      // Record the signal on the CS stream BEFORE publishing, so the value a
+      // consumer reads is one this device has already committed to reaching.
+      // The signal executes at GPU completion of everything recorded so far,
+      // i.e. the frame being presented.
+      value = ++impl->present_value;
+      auto* immediateContext =
+        static_cast<dxvk::D3D11ImmediateContext*>(impl->context);
+      immediateContext->HeliosSignalPresentFence(impl->present_fence, value);
+
+      fenceId = impl->present_fence_id;
+      streamCookie = impl->present_stream_cookie;
+      slot_published = dxvk::HeliosPresentSync::publish(resid,
+        static_cast<std::uint32_t>(GetCurrentProcessId()), fenceId, value);
+      if (slot_published && !storage->setHeliosPresentSlot(resid, fenceId)) {
+        // A VkDeviceMemory has one immutable (fence generation, Venus resid)
+        // publication identity. Do not leave an untracked slot behind if that
+        // invariant is violated.
+        dxvk::HeliosPresentSync::release(resid, fenceId);
+        slot_published = false;
+      }
+      if (slot_published && streamCookie && value > 0 &&
+          value <= UINT32_MAX && impl->venus_ctx_id) {
+        if (out_ctx_id) *out_ctx_id = impl->venus_ctx_id;
+        if (out_value32) *out_value32 = static_cast<std::uint32_t>(value);
+        if (out_cookie) *out_cookie = streamCookie;
       }
     }
 
-    // Record the signal on the CS stream BEFORE publishing, so the value a
-    // consumer reads is one this device has already committed to reaching. The
-    // signal executes at GPU completion of everything recorded so far, i.e. the
-    // frame being presented.
-    const std::uint64_t value = ++impl->present_value;
-    auto* immediateContext = static_cast<dxvk::D3D11ImmediateContext*>(impl->context);
-    immediateContext->HeliosSignalPresentFence(impl->present_fence, value);
-
-    if (!dxvk::HeliosPresentSync::publish(resid,
-          static_cast<std::uint32_t>(GetCurrentProcessId()),
-          impl->present_fence_id, value)) {
+    if (!slot_published) {
       const auto n = s_publishSlotFailed.fetch_add(1, std::memory_order_relaxed) + 1;
       if (n == 1 || (n % 512) == 0) {
         char msg[160];

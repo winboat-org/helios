@@ -35,7 +35,7 @@ mod transfer;
 mod vehicle;
 mod views;
 
-pub(super) use crate::bridge::{DstRes, SrcRes};
+pub(super) use crate::bridge::{DstRes, PresentStreamCorrelation, SrcRes};
 pub(super) use alloc::{ScanoutGeometry, VenusBacking};
 pub(crate) use bindings::*;
 pub(crate) use deferred::*;

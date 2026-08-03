@@ -34,7 +34,7 @@ pub(crate) use read_ledger::{
     dump_counters as read_ledger_dump_counters, reset_counters as read_ledger_reset_counters,
     ReadLedger, ScanoutEventReg, AQ_REGISTER_REFUSED, RD_MAP_REFUSED,
 };
-pub(crate) use scanout::ScanoutRefreshQueue;
+pub(crate) use scanout::{PresentStreamMarker, ScanoutRefreshQueue};
 pub(crate) use segments::{BarSegment, PagingRam};
 
 /// Everything `DxgkDdiStartDevice` establishes, as one value published once.
@@ -272,9 +272,10 @@ impl StartedState {
     /// Build the sticky half DIRECTLY ON THE HEAP.
     ///
     /// ⚠ STACK BUDGET — this is not a style preference. `DxgkDdiStartDevice`
-    /// calls `VirtioGpu::init`, whose own frame is ~9.1 KB, and the x64 kernel
-    /// stack is 24 KB total. Building this 832-byte struct (which embeds a
-    /// 576-byte `DXGKRNL_INTERFACE`) in StartDevice's frame — and passing it
+    /// calls `VirtioGpu::init`, whose frame is 3.0 KB even after the queue/error
+    /// reductions, and the x64 kernel stack is 24 KB total. Building this
+    /// 832-byte struct (which embeds a 576-byte `DXGKRNL_INTERFACE`) in
+    /// StartDevice's frame — and passing it
     /// there by value, which an unoptimised build materialises several times —
     /// took StartDevice from 8824 to 9688 bytes and the nested pair to ~18.8 KB.
     /// That overflowed the kernel stack during boot, where dxgkrnl's own frames
@@ -467,7 +468,7 @@ pub struct AdapterContext {
     virtio_lock: UnsafeCell<KSPIN_LOCK>,
     /// The virtio-gpu transport, brought up in `DxgkDdiStartDevice` (Phase 2).
     /// Guarded by `virtio_lock`; `None` until StartDevice (and after StopDevice).
-    virtio: UnsafeCell<Option<VirtioGpu>>,
+    virtio: UnsafeCell<Option<Box<VirtioGpu>>>,
     /// PASSIVE-level serialization for scanout selection versus allocation
     /// destruction. A Windows primary can be replaced while an asynchronous
     /// SET_SCANOUT_BLOB/RESOURCE_FLUSH is outstanding; destruction must first
@@ -544,8 +545,9 @@ pub struct AdapterContext {
     /// and performs the Venus import/copy plus host scanout programming.
     pub pending_vidpn_allocation: AtomicUsize,
     /// Per-buffer completion boundary, captured when the app PRESENTED that
-    /// buffer, for the bind edge to arm its refresh against. `(resource, wire
-    /// fence)`; a zero resource is a free slot.
+    /// buffer, for the bind edge to arm its refresh against. `(resource,
+    /// boundary)`; a zero resource is a free slot.  Boundary bit 63 selects a
+    /// registered present stream, otherwise it is the legacy wire namespace.
     ///
     /// Eight slots (4 -> 8 for D4b): the four D4b snapshot-ring resids and the
     /// desktop's rotation coexist across fullscreen transitions, where four
@@ -561,6 +563,11 @@ pub struct AdapterContext {
     /// these arrays adds no boot-chain frame.)
     pub frame_watermark_resource: [AtomicU32; 8],
     pub frame_watermark_fence: [AtomicU64; 8],
+    /// Independent insertion order for frame-watermark eviction.  Tagged
+    /// stream and legacy wire boundaries are deliberately incomparable, so a
+    /// numeric boundary value may never select a victim.
+    pub frame_watermark_ordinal: [AtomicU64; 8],
+    pub frame_watermark_next_ordinal: AtomicU64,
     /// ── Scan-out presentation-epoch ownership (ROADMAP defect 0ab-B) ────────
     ///
     /// The display-consumer half of "when may Windows have this allocation
@@ -1089,6 +1096,17 @@ impl AdapterContext {
                 AtomicU64::new(0),
                 AtomicU64::new(0),
             ],
+            frame_watermark_ordinal: [
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+            ],
+            frame_watermark_next_ordinal: AtomicU64::new(0),
             scanout_present_epoch: AtomicU64::new(helios_kmd_logic::scanout_lease::NO_LEASE),
             scanout_bound_epoch: AtomicU64::new(helios_kmd_logic::scanout_lease::NO_LEASE),
             scanout_read_epoch: AtomicU64::new(helios_kmd_logic::scanout_lease::NO_LEASE),
@@ -1165,6 +1183,11 @@ impl AdapterContext {
         for slot in &self.frame_watermark_resource {
             slot.store(0, Ordering::Release);
         }
+        for slot in &self.frame_watermark_ordinal {
+            slot.store(0, Ordering::Release);
+        }
+        self.frame_watermark_next_ordinal
+            .store(0, Ordering::Release);
         self.active_scanout_resource.store(0, Ordering::Release);
         self.active_scanout_wh.store(0, Ordering::Release);
         self.host_bound_scanout_resource.store(0, Ordering::Release);
@@ -1534,7 +1557,7 @@ impl AdapterContext {
     /// which are PASSIVE_LEVEL-only — they must not run at the DISPATCH_LEVEL the
     /// spinlock raises to. MUST be called at PASSIVE_LEVEL (StartDevice /
     /// StopDevice, which Dxgkrnl serializes).
-    pub fn set_virtio(&self, new: Option<VirtioGpu>) {
+    pub fn set_virtio(&self, new: Option<Box<VirtioGpu>>) {
         // SAFETY: `virtio_lock` is a valid KSPIN_LOCK; the critical section only
         // swaps the Option in/out of the cell (no allocation, no device I/O).
         let irql = unsafe { KeAcquireSpinLockRaiseToDpc(self.virtio_lock.get()) };

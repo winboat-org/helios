@@ -225,6 +225,28 @@ pub struct VirtioGpuResourceUnref {
     pub padding: u32,
 }
 
+/// `VIRTIO_GPU_CMD_GET_CAPSET_INFO`. The query is device-global and has no
+/// side effects, which also makes one completed response a useful control-FIFO
+/// ordering barrier for lifecycle code.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct VirtioGpuGetCapsetInfo {
+    pub hdr: VirtioGpuCtrlHdr,
+    pub capset_index: u32,
+    pub padding: u32,
+}
+
+/// `VIRTIO_GPU_RESP_OK_CAPSET_INFO`. 40 bytes.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct VirtioGpuRespCapsetInfo {
+    pub hdr: VirtioGpuCtrlHdr,
+    pub capset_id: u32,
+    pub capset_max_version: u32,
+    pub capset_max_size: u32,
+    pub padding: u32,
+}
+
 // ── GET_DISPLAY_INFO (Phase 2 smoke test) ───────────────────────────────────
 
 /// A rectangle in the display-info response.
@@ -295,6 +317,8 @@ const _: () = {
     assert!(core::mem::size_of::<VirtioGpuResourceCreateBlob>() == 56);
     assert!(core::mem::size_of::<VirtioGpuResourceMapBlob>() == 40);
     assert!(core::mem::size_of::<VirtioGpuRespMapInfo>() == 32);
+    assert!(core::mem::size_of::<VirtioGpuGetCapsetInfo>() == 32);
+    assert!(core::mem::size_of::<VirtioGpuRespCapsetInfo>() == 40);
     assert!(core::mem::size_of::<VirtioGpuRespDisplayInfo>() == 24 + 16 * 24);
     assert!(core::mem::size_of::<VirtioGpuSetScanoutBlob>() == 96);
     assert!(core::mem::size_of::<VirtioGpuResourceFlush>() == 48);
@@ -540,6 +564,8 @@ mod virtio_bindings_pin {
         pin_layout!(VirtioGpuCtrlHdr, vb::virtio_gpu_ctrl_hdr);
         pin_layout!(VirtioGpuRect, vb::virtio_gpu_rect);
         pin_layout!(VirtioGpuResourceUnref, vb::virtio_gpu_resource_unref);
+        pin_layout!(VirtioGpuGetCapsetInfo, vb::virtio_gpu_get_capset_info);
+        pin_layout!(VirtioGpuRespCapsetInfo, vb::virtio_gpu_resp_capset_info);
         pin_layout!(
             VirtioGpuDisplayOne,
             vb::virtio_gpu_resp_display_info_virtio_gpu_display_one

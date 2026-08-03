@@ -124,6 +124,22 @@ pub static REAP_ABANDONED: AtomicU32 = AtomicU32::new(0);
 /// High-water of `fence_events.len()` since driver start.
 pub static FENCE_EVENT_HIGH_WATER: AtomicU32 = AtomicU32::new(0);
 
+// ── Registered async present-stream telemetry ───────────────────────────────
+/// Successful one-time stream registrations.
+pub static PRESENT_STREAM_REGISTERS: AtomicU32 = AtomicU32::new(0);
+/// Tagged Venus submissions accepted onto a live stream.
+pub static PRESENT_STREAM_TAGS: AtomicU32 = AtomicU32::new(0);
+/// Complete nonzero marker tails observed by the KMD.
+pub static PRESENT_STREAM_MARKERS: AtomicU32 = AtomicU32::new(0);
+/// Terminal Venus completions that monotonically advanced a stream value.
+pub static PRESENT_STREAM_RETIRES: AtomicU32 = AtomicU32::new(0);
+/// Registration/tag/marker refusal or malformed-boundary count.
+pub static PRESENT_STREAM_REJECTS: AtomicU32 = AtomicU32::new(0);
+/// Current live stream count.  Updated only under the transport lock.
+pub static PRESENT_STREAM_LIVE: AtomicU32 = AtomicU32::new(0);
+/// High-water of the preallocated stream table occupancy.
+pub static PRESENT_STREAM_HIGH_WATER: AtomicU32 = AtomicU32::new(0);
+
 // ── DISPATCH-safe resource-table telemetry ──────────────────────────────────
 // All updated under the device spinlock (DISPATCH_LEVEL), so they must be
 // atomics, never `diag::record` (RtlWriteRegistryValue is PASSIVE-only — the

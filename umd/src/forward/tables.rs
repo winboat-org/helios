@@ -219,7 +219,7 @@ pub unsafe fn install(funcs: *mut ddi::D3D11DDI_DEVICEFUNCS) -> Filled11_0 {
     f.pfnRecycleCommandList = Some(recycle_command_list);
     f.pfnRecycleCreateCommandList = Some(recycle_create_command_list);
     f.pfnRecycleCreateDeferredContext = Some(recycle_create_deferred_context);
-    f.pfnRecycleDestroyCommandList = Some(destroy_command_list);
+    f.pfnRecycleDestroyCommandList = Some(recycle_destroy_command_list);
 
     // Input layouts (lazy), vertex/index buffers, blend state.
     f.pfnCalcPrivateElementLayoutSize = Some(calc_size_element_layout);

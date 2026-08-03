@@ -10,7 +10,9 @@
 //! tables -- verified, not assumed: none of the 32 touches `transport`,
 //! `control`, `inflight`, `parked`, `dma_pool`, `fence_waiters`,
 //! `fence_events`, `wddm_pending` or `scanout_refresh_watermark`, and there is
-//! no `self.<method>()` call across the boundary in either direction.
+//! no `self.<method>()` call across the boundary in either direction. Present
+//! stream teardown deliberately happens one layer up under `wddm_notify_lock`,
+//! because it must discharge WDDM waiters as well as remove the registry row.
 
 use super::*;
 

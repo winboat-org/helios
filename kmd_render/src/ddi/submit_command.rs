@@ -8,7 +8,7 @@ use core::mem::size_of;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::adapter::{AdapterContext, WddmNotifyGuard};
-use crate::ddi::present_packet::PresentSubmissionPrivate;
+use crate::ddi::present_packet::{PresentSubmissionBoundary, PresentSubmissionPrivate};
 use crate::dxgk::_DXGK_INTERRUPT_TYPE::DXGK_INTERRUPT_DMA_COMPLETED;
 use crate::dxgk::*;
 
@@ -380,7 +380,7 @@ fn note_and_maybe_signal(
     adapter: &AdapterContext,
     fence: u32,
     is_paging: bool,
-    gpu_completion_fence: Option<u64>,
+    present_submission: Option<PresentSubmissionBoundary>,
 ) -> SubmitAck {
     let Ok(dxgkrnl) = adapter.dxgkrnl() else {
         // Effectively unreachable: dxgkrnl is set at StartDevice and never
@@ -392,7 +392,19 @@ fn note_and_maybe_signal(
     let overflows_before = crate::virtio::VirtioGpu::wddm_pending_overflows();
     adapter.with_wddm_notify_lock(|guard| {
         let signal_now = guard
-            .with_virtio(|o, v| v.note_wddm_submission(o, fence, is_paging, gpu_completion_fence))
+            .with_virtio(|o, v| {
+                let gpu_completion_fence = present_submission
+                    .and_then(|present| (present.gpu_fence_id != 0).then_some(present.gpu_fence_id));
+                let stream_boundary = present_submission
+                    .and_then(|present| (present.stream_boundary != 0).then_some(present.stream_boundary));
+                v.note_wddm_submission(
+                    o,
+                    fence,
+                    is_paging,
+                    gpu_completion_fence,
+                    stream_boundary,
+                )
+            })
             // Transport down (bring-up / teardown): no venus work can gate it.
             .unwrap_or(true);
         if signal_now {
@@ -435,7 +447,7 @@ unsafe fn decode_present_fence(
     total: usize,
     kmd_range: core::ops::Range<usize>,
     path: SubmitPath,
-) -> Option<u64> {
+) -> Option<PresentSubmissionBoundary> {
     if !base.is_null() && kmd_range.start <= kmd_range.end && kmd_range.end <= total {
         let size = kmd_range.end - kmd_range.start;
         if let Some(fence) = unsafe {
@@ -555,7 +567,9 @@ unsafe fn arm_dma_flip(adapter: &AdapterContext, base: *mut c_void, total: u32) 
     adapter.end_scanout_leases_through(epoch, crate::ddi::scanout_trace::LeaseEnd::Cancelled);
 }
 
-unsafe fn decode_virtual_present_fence(submit: &DXGKARG_SUBMITCOMMANDVIRTUAL) -> Option<u64> {
+unsafe fn decode_virtual_present_fence(
+    submit: &DXGKARG_SUBMITCOMMANDVIRTUAL,
+) -> Option<PresentSubmissionBoundary> {
     let base = submit.pDmaBufferPrivateData as *const u8;
     let total = submit.DmaBufferPrivateDataSize as usize;
     let umd = submit.DmaBufferUmdPrivateDataSize as usize;
@@ -566,7 +580,9 @@ unsafe fn decode_virtual_present_fence(submit: &DXGKARG_SUBMITCOMMANDVIRTUAL) ->
     unsafe { decode_present_fence(base, total, umd..total, SubmitPath::Virtual) }
 }
 
-unsafe fn decode_legacy_present_fence(submit: &DXGKARG_SUBMITCOMMAND) -> Option<u64> {
+unsafe fn decode_legacy_present_fence(
+    submit: &DXGKARG_SUBMITCOMMAND,
+) -> Option<PresentSubmissionBoundary> {
     let base = submit.pDmaBufferPrivateData as *const u8;
     let total = submit.DmaBufferPrivateDataSize as usize;
     let start = submit.DmaBufferPrivateDataSubmissionStartOffset as usize;
@@ -608,7 +624,11 @@ unsafe fn diagnostic_scan_present_private(base: *const u8, total: usize) {
 /// carries no identity. It travels with the watermark so the eventual flush
 /// names the frame this marker belongs to rather than whatever happens to be
 /// bound when it fires — see [`crate::virtio::gpu::VirtioGpu::note_scanout_refresh`].
-fn arm_scanout_refresh_after_current_venus(adapter: &AdapterContext, resource_id: u32) {
+fn arm_scanout_refresh_after_current_venus(
+    adapter: &AdapterContext,
+    resource_id: u32,
+    stream_marker: Option<crate::adapter::PresentStreamMarker>,
+) {
     // Unsampled: what the app PRESENTED, against `Vs*` (what Windows asked us
     // to bind) and `Ff*` (what we told the host to re-read). Atomics only, so
     // it is legal on this DISPATCH-level path.
@@ -624,7 +644,7 @@ fn arm_scanout_refresh_after_current_venus(adapter: &AdapterContext, resource_id
     {
         crate::ddi::scanout_trace::note_marker_while_bound();
     }
-    let _ready = adapter.arm_present_marker_refresh(resource_id);
+    let _ready = adapter.arm_present_marker_refresh(resource_id, stream_marker);
 }
 
 /// `DxgkDdiSubmitCommandVirtual` — submit a DMA buffer addressed by GPU virtual
@@ -848,6 +868,9 @@ pub unsafe extern "C" fn dxgkddi_reset_from_timeout(h_adapter: *mut c_void) -> N
     // discarding that same scheduler epoch.  Dxgkrnl owns the post-reset fence
     // state; no completion from the abandoned epoch may escape concurrently.
     let _ = abandon_pending_submissions(adapter, AbandonOutcome::Silent);
+    adapter.with_wddm_notify_lock(|guard| {
+        let _ = guard.with_virtio(|order, v| v.purge_all_present_streams_ordered(order));
+    });
     // Consume transport_failed(), which had zero callers repo-wide: a TDR
     // against a latched ring is the loop this tranche exists to break, and
     // without this the only evidence was a DiagLevel-gated breadcrumb. Reported
@@ -914,12 +937,19 @@ pub unsafe extern "C" fn dxgkddi_render(
         return STATUS_BUFFER_TOO_SMALL;
     }
 
-    if cmd_len >= size_of::<helios_protocol::HeliosPresentRefreshCmd>() {
+    // The 16-byte HERF prefix is the legacy command.  Zero-fill a local full
+    // form so an old UMD's absent tail cannot be read as stale runtime bytes;
+    // only a complete 32-byte tail can select a registered stream boundary.
+    const PRESENT_REFRESH_PREFIX: usize =
+        core::mem::offset_of!(helios_protocol::HeliosPresentRefreshCmd, present_ctx_id);
+    if cmd_len >= PRESENT_REFRESH_PREFIX {
+        let take = cmd_len.min(size_of::<helios_protocol::HeliosPresentRefreshCmd>());
+        let mut raw = [0u8; size_of::<helios_protocol::HeliosPresentRefreshCmd>()];
+        unsafe {
+            core::ptr::copy_nonoverlapping(args.pCommand as *const u8, raw.as_mut_ptr(), take);
+        }
         let command = unsafe {
-            core::ptr::read_unaligned(
-                args.pCommand
-                    .cast::<helios_protocol::HeliosPresentRefreshCmd>(),
-            )
+            core::ptr::read_unaligned(raw.as_ptr().cast::<helios_protocol::HeliosPresentRefreshCmd>())
         };
         if command.is_valid() {
             // The allocation identity was fixed once by SetVidPnSourceAddress.
@@ -931,10 +961,34 @@ pub unsafe extern "C" fn dxgkddi_render(
             // traversal, checked once, in the module that owns the fields.
             let context = unsafe { crate::device::ContextHandleRef::from_raw(h_context) };
             if let Some(adapter) = context.as_ref().and_then(|c| c.adapter()) {
+                let stream_marker = if take >= size_of::<helios_protocol::HeliosPresentRefreshCmd>()
+                    && command.present_ctx_id != 0
+                    && command.present_value != 0
+                    && command.present_cookie != 0
+                {
+                    context
+                        .as_ref()
+                        .and_then(|c| c.creator_process())
+                        .map(|creator_process| crate::adapter::PresentStreamMarker {
+                            ctx_id: command.present_ctx_id,
+                            value: command.present_value,
+                            cookie: command.present_cookie,
+                            creator_process,
+                        })
+                } else {
+                    None
+                };
+                if let (Some(context), Some(marker)) = (context.as_ref(), stream_marker) {
+                    context.stash_present_stream_marker(
+                        marker.ctx_id,
+                        marker.value,
+                        marker.cookie,
+                    );
+                }
                 // HERF carries no resource identity: it is the generic
                 // "the bound target is dirty" edge, so it arms with 0 and the
                 // flush resolves the bound resource as before.
-                arm_scanout_refresh_after_current_venus(adapter, 0);
+                arm_scanout_refresh_after_current_venus(adapter, 0, stream_marker);
             }
         }
     }
@@ -988,7 +1042,14 @@ pub unsafe extern "C" fn dxgkddi_render(
                     & helios_protocol::HELIOS_PRESENT_PRIVATE_FLAG_SNAPSHOT
                     != 0
                 {
-                    if take >= size_of::<helios_protocol::HeliosPresentRenderCmd>() {
+                    // Snapshot coverage remains the old v1 RenderCmd boundary:
+                    // header + PresentPrivateData through venus_alloc_size
+                    // (56 bytes).  The separately appended stream tail needs
+                    // the new full 72-byte form below.
+                    const PRESENT_RENDER_SNAPSHOT_BYTES: usize =
+                        core::mem::offset_of!(helios_protocol::HeliosPresentRenderCmd, present)
+                            + core::mem::offset_of!(helios_protocol::HeliosPresentPrivateData, present_ctx_id);
+                    if take >= PRESENT_RENDER_SNAPSHOT_BYTES {
                         if let Some(context) = context.as_ref() {
                             context.stash_snapshot(
                                 &helios_kmd_logic::snapshot_bind::SnapshotDescriptor {
@@ -1030,7 +1091,38 @@ pub unsafe extern "C" fn dxgkddi_render(
                     // on one the flip has advanced to but the app has not yet
                     // rendered (black).
                     if let Some(adapter) = adapter {
-                        arm_scanout_refresh_after_current_venus(adapter, private.resource_id);
+                        let stream_marker = if take >= size_of::<helios_protocol::HeliosPresentRenderCmd>()
+                            && private.present_ctx_id != 0
+                            && private.present_value != 0
+                            && private.present_cookie != 0
+                        {
+                            context
+                                .as_ref()
+                                .and_then(|c| c.creator_process())
+                                .map(|creator_process| crate::adapter::PresentStreamMarker {
+                                    ctx_id: private.present_ctx_id,
+                                    value: private.present_value,
+                                    cookie: private.present_cookie,
+                                    creator_process,
+                                })
+                        } else {
+                            None
+                        };
+                        // The scanout arm is not enough: VidSch's WDDM fence
+                        // must carry this exact boundary too, or it can retire
+                        // before a tagged batch has reached the transport.
+                        if let (Some(context), Some(marker)) = (context.as_ref(), stream_marker) {
+                            context.stash_present_stream_marker(
+                                marker.ctx_id,
+                                marker.value,
+                                marker.cookie,
+                            );
+                        }
+                        arm_scanout_refresh_after_current_venus(
+                            adapter,
+                            private.resource_id,
+                            stream_marker,
+                        );
                     }
                 }
             }

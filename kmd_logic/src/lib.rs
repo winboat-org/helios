@@ -1962,6 +1962,51 @@ mod sorted_splice_tests {
 /// primary machinery below is the specification of the RETIRED withholding, kept
 /// as the record of what was measured — it is no longer a model of shipped code.
 /// Every item that models only the retired half says so on its own doc line.
+pub mod scanout_retire {
+    //! Pure decisions for scanout-resource retirement while asynchronous binds
+    //! share the virtio control FIFO.
+
+    /// Whether a pure-query FIFO barrier is required before the latest
+    /// host-selected resource is authoritative. A mismatch means at least one
+    /// SET was issued after the last successful response; it may succeed or fail,
+    /// and only a later response can distinguish those outcomes.
+    pub const fn needs_fifo_barrier(wire_seq: u64, accepted_seq: u64) -> bool {
+        wire_seq != accepted_seq
+    }
+
+    /// Disable scanout only when the retiring resource is still the final
+    /// successful host selection. A different resource is already the lifetime
+    /// barrier; queueing zero behind it would blank that newer selection.
+    pub const fn needs_disable(retiring_resource: u32, final_host_resource: u32) -> bool {
+        retiring_resource != 0 && retiring_resource == final_host_resource
+    }
+}
+
+#[cfg(test)]
+mod scanout_retire_tests {
+    use super::scanout_retire::{needs_disable, needs_fifo_barrier};
+
+    #[test]
+    fn issued_newer_bind_requires_a_terminal_fifo_response() {
+        assert!(needs_fifo_barrier(12, 11));
+        assert!(!needs_fifo_barrier(12, 12));
+    }
+
+    #[test]
+    fn successful_newer_bind_must_not_be_blankened_by_retiring_the_old_one() {
+        let retiring_a = 0x121;
+        let final_b = 0x128;
+        assert!(!needs_disable(retiring_a, final_b));
+    }
+
+    #[test]
+    fn failed_newer_bind_leaves_the_old_selection_needing_disable() {
+        let retiring_a = 0x121;
+        assert!(needs_disable(retiring_a, retiring_a));
+        assert!(!needs_disable(retiring_a, 0));
+    }
+}
+
 pub mod scanout_lease {
     /// "This submission is not gated on any host read." Used for paging
     /// buffers, render submissions, and every flip that carries no scan-out
@@ -2409,6 +2454,643 @@ pub mod scanout_lease {
         pub const fn last_completed_fence(&self) -> u32 {
             self.last_completed_fence
         }
+    }
+}
+
+/// Identity-only cadence rule for the direct scanout marker path.
+///
+/// A PRESENT marker records the completion boundary for the resource the app
+/// just rendered.  It may request a host read immediately only when that exact
+/// resource is already bound, because only then can a `RESOURCE_FLUSH` name
+/// the marked frame.  A marker for another resource is retained for that
+/// resource's bind edge; treating it as a generic dirty edge can overwrite the
+/// currently bound resource's pending refresh and strand the real bind edge.
+pub mod scanout_cadence {
+    /// What the PRESENT-marker edge may do after recording its exact frame
+    /// watermark.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum PresentMarkerAction {
+        /// The marker names the active resource, or is the intentionally
+        /// identity-free HERF edge (`resource_id == 0`).
+        QueueImmediate,
+        /// A future buffer's marker. Its own bind edge owns scheduling.
+        DeferToBind,
+    }
+
+    /// Classify one PRESENT marker from exact resource identity only.
+    ///
+    /// No handle order, frame number, timing, or buffer-count inference is
+    /// admissible here: a nonzero marker may queue only when it names the
+    /// resource the host is currently bound to.
+    pub const fn present_marker_action(
+        resource_id: u32,
+        active_resource_id: u32,
+    ) -> PresentMarkerAction {
+        if resource_id == 0 || resource_id == active_resource_id {
+            PresentMarkerAction::QueueImmediate
+        } else {
+            PresentMarkerAction::DeferToBind
+        }
+    }
+
+    /// Tiny host-test model of the identity rule. The production driver owns
+    /// the actual completion-watermark table; this model deliberately carries
+    /// only identity, pending-edge, and bind ownership so cadence regressions
+    /// can be tested without KMD atomics or transport state.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct State {
+        active_resource_id: u32,
+        pending_resource_id: u32,
+        refresh_queued: bool,
+        marked_resources: [u32; 3],
+    }
+
+    impl State {
+        pub const fn new() -> Self {
+            Self {
+                active_resource_id: 0,
+                pending_resource_id: 0,
+                refresh_queued: false,
+                marked_resources: [0; 3],
+            }
+        }
+
+        /// Record one marker, queuing only when [`present_marker_action`]
+        /// permits it. The fixed table is sufficient for the A/B/C cadence
+        /// model and deliberately has no allocation.
+        pub fn present(&mut self, resource_id: u32) -> PresentMarkerAction {
+            if resource_id != 0 {
+                self.record_marker(resource_id);
+            }
+            let action = present_marker_action(resource_id, self.active_resource_id);
+            if action == PresentMarkerAction::QueueImmediate {
+                self.queue(resource_id);
+            }
+            action
+        }
+
+        /// Publish a bind and let only that resource consume its recorded
+        /// marker. Returns whether the bind produced a refresh edge.
+        pub fn bind(&mut self, resource_id: u32) -> bool {
+            self.active_resource_id = resource_id;
+            if resource_id != 0 && self.take_marker(resource_id) {
+                self.queue(resource_id);
+                true
+            } else {
+                false
+            }
+        }
+
+        pub const fn active_resource_id(self) -> u32 {
+            self.active_resource_id
+        }
+
+        pub const fn pending_resource_id(self) -> u32 {
+            self.pending_resource_id
+        }
+
+        pub const fn refresh_queued(self) -> bool {
+            self.refresh_queued
+        }
+
+        fn queue(&mut self, resource_id: u32) {
+            self.pending_resource_id = resource_id;
+            self.refresh_queued = true;
+        }
+
+        fn record_marker(&mut self, resource_id: u32) {
+            for slot in &mut self.marked_resources {
+                if *slot == resource_id {
+                    return;
+                }
+            }
+            for slot in &mut self.marked_resources {
+                if *slot == 0 {
+                    *slot = resource_id;
+                    return;
+                }
+            }
+            // The model has exactly the three rotating scanout identities used
+            // by its tests. Replace the oldest model slot when a fourth is
+            // introduced, matching bounded production bookkeeping.
+            self.marked_resources[0] = resource_id;
+        }
+
+        fn take_marker(&mut self, resource_id: u32) -> bool {
+            for slot in &mut self.marked_resources {
+                if *slot == resource_id {
+                    *slot = 0;
+                    return true;
+                }
+            }
+            false
+        }
+    }
+
+    impl Default for State {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+}
+
+/// Fixed-storage state for a completion-ordered fast scanout bind.
+///
+/// The producer-completion predicate is supplied by the KMD because it reads
+/// transport state. This module owns the bounded coalescing and cancellation
+/// rule: an unready request occupies an oldest liveness frontier plus one
+/// coalesced latest slot, and a destroyed resource can never be promoted later.
+pub mod scanout_fast_bind {
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct Request {
+        pub resource_id: u32,
+        pub boundary: u64,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum Step {
+        /// The exact producer boundary is ready, so issue this bind now.
+        Issue(Request),
+        /// Retained in bounded fixed storage for a later completion edge.
+        Deferred,
+        /// No deferred request is present, or its resource was cancelled.
+        Empty,
+    }
+
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub struct State {
+        earliest: Option<Request>,
+        latest: Option<Request>,
+    }
+
+    impl State {
+        pub const fn new() -> Self {
+            Self {
+                earliest: None,
+                latest: None,
+            }
+        }
+
+        /// Submit a request. `ready` and `live` must describe this exact
+        /// request's producer boundary and resource identity.
+        pub fn submit(&mut self, request: Request, ready: bool, live: bool) -> Step {
+            if !live {
+                return Step::Empty;
+            }
+            if ready {
+                self.earliest = None;
+                self.latest = None;
+                Step::Issue(request)
+            } else {
+                if self.earliest.is_none() {
+                    self.earliest = Some(request);
+                } else {
+                    self.latest = Some(request);
+                }
+                Step::Deferred
+            }
+        }
+
+        /// Re-evaluate the retained request after a producer completion.
+        pub fn on_completion(
+            &mut self,
+            earliest_ready: bool,
+            earliest_live: bool,
+            latest_ready: bool,
+            latest_live: bool,
+        ) -> Step {
+            let Some(earliest) = self.earliest else {
+                return Step::Empty;
+            };
+            if !earliest_live {
+                self.earliest = self.latest.take();
+                Step::Empty
+            } else if earliest_ready {
+                let latest = self.latest.take();
+                if latest.is_some() && latest_ready && latest_live {
+                    self.earliest = None;
+                    Step::Issue(latest.unwrap())
+                } else {
+                    self.earliest = latest.filter(|_| latest_live);
+                    Step::Issue(earliest)
+                }
+            } else {
+                Step::Deferred
+            }
+        }
+
+        /// Exact DestroyAllocation cancellation. A different resource must not
+        /// erase the retained request merely because it happened to retire.
+        pub fn cancel_resource(&mut self, resource_id: u32) -> bool {
+            let mut cancelled = false;
+            if self
+                .earliest
+                .is_some_and(|request| request.resource_id == resource_id)
+            {
+                self.earliest = self.latest.take();
+                cancelled = true;
+            }
+            if self
+                .latest
+                .is_some_and(|request| request.resource_id == resource_id)
+            {
+                self.latest = None;
+                cancelled = true;
+            }
+            cancelled
+        }
+
+        pub const fn deferred(self) -> Option<Request> {
+            self.earliest
+        }
+    }
+}
+
+/// Pure, bounded state transitions for completion-ordered scanout refreshes.
+///
+/// The KMD supplies producer readiness and tagged-stream liveness because both
+/// depend on transport state. This module owns only the state machine, so its
+/// liveness and coalescing rules are executable in the host test crate.
+pub mod scanout_refresh {
+    /// One exact dirty edge. Resource identity and producer boundary are an
+    /// inseparable pair: coalescing must never attach one resource to another
+    /// frame's completion.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct Marker {
+        resource_id: u32,
+        boundary: u64,
+    }
+
+    impl Marker {
+        pub const fn new(resource_id: u32, boundary: u64) -> Self {
+            Self {
+                resource_id,
+                boundary,
+            }
+        }
+
+        pub const fn resource_id(self) -> u32 {
+            self.resource_id
+        }
+
+        pub const fn boundary(self) -> u64 {
+            self.boundary
+        }
+    }
+
+    /// Two fixed marker slots: an oldest liveness frontier and one coalesced
+    /// latest marker. This is deliberately not an unbounded queue and contains
+    /// no allocation or synchronization.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct State {
+        earliest: Option<Marker>,
+        latest: Option<Marker>,
+    }
+
+    impl State {
+        pub const fn new() -> Self {
+            Self {
+                earliest: None,
+                latest: None,
+            }
+        }
+
+        pub fn clear(&mut self) {
+            self.earliest = None;
+            self.latest = None;
+        }
+
+        /// Record one exact dirty edge. An already-ready current marker is an
+        /// immediate refresh request and supersedes outstanding deferred work;
+        /// retaining the older frontier would strand the ready edge if the
+        /// used-ring becomes idle.
+        pub fn note(&mut self, marker: Marker, ready: bool) -> bool {
+            if ready {
+                self.clear();
+                true
+            } else {
+                self.note_pending(marker);
+                false
+            }
+        }
+
+        /// Record an unready marker without testing transport readiness.
+        pub fn note_pending(&mut self, marker: Marker) {
+            if self.earliest.is_none() {
+                self.earliest = Some(marker);
+            } else {
+                self.latest = Some(marker);
+            }
+        }
+
+        pub const fn earliest(self) -> Option<Marker> {
+            self.earliest
+        }
+
+        pub const fn latest(self) -> Option<Marker> {
+            self.latest
+        }
+
+        /// Consume one read-safe marker. If the coalesced latest marker is
+        /// ready too it supersedes the frontier; otherwise the frontier is
+        /// returned and the latest becomes the next frontier.
+        pub fn take_ready(&mut self, earliest_ready: bool, latest_ready: bool) -> Option<Marker> {
+            let earliest = self.earliest?;
+            if !earliest_ready {
+                return None;
+            }
+            match self.latest {
+                Some(latest) if latest_ready => {
+                    self.clear();
+                    Some(latest)
+                }
+                Some(latest) => {
+                    self.earliest = Some(latest);
+                    self.latest = None;
+                    Some(earliest)
+                }
+                None => {
+                    self.earliest = None;
+                    Some(earliest)
+                }
+            }
+        }
+
+        /// Drop explicitly cancelled markers, then promote a live latest
+        /// marker only after both slots have been filtered. `marker_live` must
+        /// return true for ordinary wire boundaries and for live tagged streams.
+        pub fn discard_cancelled<F>(&mut self, marker_live: F)
+        where
+            F: Fn(Marker) -> bool,
+        {
+            let earliest = self.earliest.filter(|marker| marker_live(*marker));
+            let latest = self.latest.filter(|marker| marker_live(*marker));
+            if earliest.is_some() {
+                self.earliest = earliest;
+                self.latest = latest;
+            } else {
+                self.earliest = latest;
+                self.latest = None;
+            }
+        }
+    }
+
+    impl Default for State {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+}
+
+#[cfg(test)]
+mod scanout_cadence_tests {
+    use super::scanout_cadence::{PresentMarkerAction, State};
+
+    #[test]
+    fn present_before_bind_defers_exact_future_resource_to_its_bind() {
+        let mut state = State::new();
+        assert!(!state.bind(10));
+
+        assert_eq!(state.present(20), PresentMarkerAction::DeferToBind);
+        assert!(!state.refresh_queued());
+
+        assert!(state.bind(20));
+        assert_eq!(state.pending_resource_id(), 20);
+    }
+
+    #[test]
+    fn bind_before_present_queues_the_now_active_resource() {
+        let mut state = State::new();
+        assert!(!state.bind(10));
+
+        assert_eq!(state.present(10), PresentMarkerAction::QueueImmediate);
+        assert!(state.refresh_queued());
+        assert_eq!(state.pending_resource_id(), 10);
+    }
+
+    #[test]
+    fn already_bound_represent_is_an_exact_immediate_refresh() {
+        let mut state = State::new();
+        assert!(!state.bind(10));
+        assert_eq!(state.present(10), PresentMarkerAction::QueueImmediate);
+        assert_eq!(state.active_resource_id(), 10);
+        assert_eq!(state.pending_resource_id(), 10);
+    }
+
+    #[test]
+    fn identity_free_herf_queues_whatever_is_bound() {
+        let mut state = State::new();
+        assert!(!state.bind(10));
+
+        assert_eq!(state.present(0), PresentMarkerAction::QueueImmediate);
+        assert!(state.refresh_queued());
+        assert_eq!(state.pending_resource_id(), 0);
+    }
+
+    #[test]
+    fn rotating_abc_markers_cannot_starve_each_resources_bind_edge() {
+        let mut state = State::new();
+        assert!(!state.bind(1));
+
+        // B and C are future buffers. Neither may overwrite A's current
+        // refresh, and each remains available to exactly its own bind.
+        assert_eq!(state.present(2), PresentMarkerAction::DeferToBind);
+        assert_eq!(state.present(3), PresentMarkerAction::DeferToBind);
+        assert_eq!(state.present(1), PresentMarkerAction::QueueImmediate);
+        assert_eq!(state.pending_resource_id(), 1);
+
+        assert!(state.bind(2));
+        assert_eq!(state.pending_resource_id(), 2);
+        assert!(state.bind(3));
+        assert_eq!(state.pending_resource_id(), 3);
+    }
+}
+
+#[cfg(test)]
+mod scanout_fast_bind_tests {
+    use super::scanout_fast_bind::{Request, State, Step};
+
+    const A: Request = Request {
+        resource_id: 10,
+        boundary: 100,
+    };
+    const B: Request = Request {
+        resource_id: 20,
+        boundary: 200,
+    };
+
+    #[test]
+    fn unready_bind_waits_for_its_exact_producer_completion() {
+        let mut state = State::new();
+        assert_eq!(state.submit(A, false, true), Step::Deferred);
+        assert_eq!(
+            state.on_completion(false, true, false, true),
+            Step::Deferred
+        );
+        assert_eq!(state.on_completion(true, true, false, true), Step::Issue(A));
+        assert_eq!(state.deferred(), None);
+    }
+
+    #[test]
+    fn already_retired_boundary_issues_without_consuming_storage() {
+        let mut state = State::new();
+        assert_eq!(state.submit(A, true, true), Step::Issue(A));
+        assert_eq!(state.deferred(), None);
+    }
+
+    #[test]
+    fn newer_flip_preserves_the_oldest_frontier_and_coalesces_only_latest() {
+        let mut state = State::new();
+        assert_eq!(state.submit(A, false, true), Step::Deferred);
+        assert_eq!(state.submit(B, false, true), Step::Deferred);
+        assert_eq!(state.deferred(), Some(A));
+        assert_eq!(state.on_completion(true, true, true, true), Step::Issue(B));
+    }
+
+    #[test]
+    fn continuous_submits_cannot_starve_the_oldest_producer() {
+        let mut state = State::new();
+        assert_eq!(state.submit(A, false, true), Step::Deferred);
+        // Every newer frame arrives before A is ready; only the trailing slot
+        // changes, so A remains a liveness frontier.
+        for boundary in [201, 202, 203, 204] {
+            assert_eq!(
+                state.submit(
+                    Request {
+                        resource_id: 20,
+                        boundary,
+                    },
+                    false,
+                    true,
+                ),
+                Step::Deferred
+            );
+            assert_eq!(state.deferred(), Some(A));
+        }
+        // Once A retires, a ready newest frame may supersede it; either way a
+        // bind reaches the wire instead of permanent replacement starvation.
+        assert!(matches!(
+            state.on_completion(true, true, true, true),
+            Step::Issue(_)
+        ));
+    }
+
+    #[test]
+    fn ready_frontier_does_not_issue_an_unready_latest() {
+        let mut state = State::new();
+        assert_eq!(state.submit(A, false, true), Step::Deferred);
+        assert_eq!(state.submit(B, false, true), Step::Deferred);
+        assert_eq!(state.on_completion(true, true, false, true), Step::Issue(A));
+        assert_eq!(state.deferred(), Some(B));
+    }
+
+    #[test]
+    fn exact_destroy_cancels_before_a_late_completion_can_issue() {
+        let mut state = State::new();
+        assert_eq!(state.submit(A, false, true), Step::Deferred);
+        assert!(!state.cancel_resource(B.resource_id));
+        assert!(state.cancel_resource(A.resource_id));
+        assert_eq!(state.on_completion(true, true, true, true), Step::Empty);
+    }
+
+    #[test]
+    fn dead_producer_is_dropped_not_reinterpreted_as_ready() {
+        let mut state = State::new();
+        assert_eq!(state.submit(A, false, true), Step::Deferred);
+        assert_eq!(state.on_completion(false, false, false, false), Step::Empty);
+        assert_eq!(state.deferred(), None);
+    }
+}
+
+#[cfg(test)]
+mod scanout_refresh_tests {
+    use super::scanout_refresh::{Marker, State};
+
+    #[test]
+    fn frontier_is_not_overwritten_by_a_hot_present_stream() {
+        let mut state = State::new();
+        state.note_pending(Marker::new(11, 100));
+        state.note_pending(Marker::new(22, 200));
+        state.note_pending(Marker::new(33, 300));
+
+        assert_eq!(state.earliest(), Some(Marker::new(11, 100)));
+        assert_eq!(state.latest(), Some(Marker::new(33, 300)));
+        assert_eq!(state.take_ready(false, false), None);
+    }
+
+    #[test]
+    fn refused_old_frontier_cannot_strand_promoted_newer_marker() {
+        let mut state = State::new();
+        state.note_pending(Marker::new(11, 100));
+        state.note_pending(Marker::new(22, 200));
+
+        assert_eq!(state.take_ready(true, false), Some(Marker::new(11, 100)));
+        assert_eq!(state.earliest(), Some(Marker::new(22, 200)));
+        assert_eq!(state.latest(), None);
+        // The KMD executor may reject 11 after a different accepted bind. Its
+        // refusal cannot erase the promoted marker; a later DPC still returns
+        // the exact resource/boundary pair for 22.
+        assert_eq!(state.take_ready(true, false), Some(Marker::new(22, 200)));
+        assert_eq!(state.earliest(), None);
+    }
+
+    #[test]
+    fn ready_latest_supersedes_frontier_without_crossing_identity() {
+        let mut state = State::new();
+        state.note_pending(Marker::new(11, 100));
+        state.note_pending(Marker::new(22, 200));
+
+        assert_eq!(state.take_ready(true, true), Some(Marker::new(22, 200)));
+        assert_eq!(state.earliest(), None);
+        assert_eq!(state.latest(), None);
+    }
+
+    #[test]
+    fn ready_current_marker_supersedes_waiting_frontier_without_a_future_dpc() {
+        let mut state = State::new();
+        state.note_pending(Marker::new(11, 100));
+
+        assert!(state.note(Marker::new(22, 200), true));
+        assert_eq!(state.earliest(), None);
+        assert_eq!(state.latest(), None);
+    }
+
+    #[test]
+    fn bind_boundary_precedes_same_resource_represent_boundary() {
+        let mut state = State::new();
+
+        // The KMD publishes an accepted bind and inserts its carried W1 under
+        // the same notification lock that a re-present uses to classify the
+        // resource and insert W2.  W1 must therefore remain the frontier and
+        // W2 the coalesced successor, even when both name the same resource.
+        assert!(!state.note(Marker::new(11, 100), false));
+        assert!(!state.note(Marker::new(11, 200), false));
+
+        assert_eq!(state.take_ready(true, false), Some(Marker::new(11, 100)));
+        assert_eq!(state.earliest(), Some(Marker::new(11, 200)));
+        assert_eq!(state.latest(), None);
+    }
+
+    #[test]
+    fn cancelled_frontier_promotes_live_latest() {
+        let mut state = State::new();
+        state.note_pending(Marker::new(11, 100));
+        state.note_pending(Marker::new(22, 200));
+
+        state.discard_cancelled(|marker| marker.boundary() == 200);
+        assert_eq!(state.earliest(), Some(Marker::new(22, 200)));
+        assert_eq!(state.latest(), None);
+    }
+
+    #[test]
+    fn two_cancelled_markers_leave_no_frontier() {
+        let mut state = State::new();
+        state.note_pending(Marker::new(11, 100));
+        state.note_pending(Marker::new(22, 200));
+
+        state.discard_cancelled(|_| false);
+        assert_eq!(state.earliest(), None);
+        assert_eq!(state.latest(), None);
     }
 }
 
@@ -3485,7 +4167,13 @@ mod snapshot_bind_tests {
     /// is a freshly created UMD image that always carries its exact format.
     #[test]
     fn format_uses_the_strict_dxgi_set() {
-        for (fmt, ok) in [(28u32, true), (87, true), (88, true), (0, false), (24, false)] {
+        for (fmt, ok) in [
+            (28u32, true),
+            (87, true),
+            (88, true),
+            (0, false),
+            (24, false),
+        ] {
             let mut d = good();
             d.dxgi_format = fmt;
             assert_eq!(validate(&d, 1920, 1080).is_ok(), ok, "dxgi {fmt}");

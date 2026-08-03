@@ -10,7 +10,9 @@
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU32, Ordering};
 
+use helios_kmd_logic::scanout_cadence::{present_marker_action, PresentMarkerAction};
 use helios_kmd_logic::scanout_lease::{merge_read_epoch, next_epoch, surplus_republish, NO_LEASE};
+use helios_kmd_logic::scanout_retire::{needs_disable, needs_fifo_barrier};
 use wdk_sys::ntddk::KeSetEvent;
 
 use crate::ddi::scanout_trace::LeaseEnd;
@@ -32,6 +34,17 @@ pub(crate) enum ScanoutRefreshQueue {
     /// so `ScUnav` keeps meaning "a dirty frame was discarded because nothing
     /// was bound"; the `Og*` counters are this arm's census.
     Dropped,
+}
+
+/// A complete nonzero marker tail received through a UMD context.  The KMD
+/// resolves it while holding the notification/transport lock, where the stream
+/// table and the captured legacy boundary are mutually ordered.
+#[derive(Clone, Copy)]
+pub(crate) struct PresentStreamMarker {
+    pub ctx_id: u32,
+    pub value: u32,
+    pub cookie: u64,
+    pub creator_process: usize,
 }
 
 impl AdapterContext {
@@ -201,6 +214,19 @@ impl AdapterContext {
         unsafe { KeSetEvent(self.hpd_event.get(), 0, 0) };
     }
 
+    /// The marker and bind edges publish their pending identity while holding
+    /// the same notification lock that serializes their watermark state.  The
+    /// event is non-blocking and legal at DISPATCH, so keeping it in that
+    /// critical section closes the old unlock-to-store window where a later
+    /// PRESENT could overwrite a bind edge's exact pending resource.
+    pub(crate) fn request_scanout_refresh_for_locked(
+        &self,
+        _guard: &super::WddmNotifyGuard<'_>,
+        resource_id: u32,
+    ) {
+        self.request_scanout_refresh_for(resource_id);
+    }
+
     /// Arm from the UMD's PRESENT MARKER, recording this frame's completion
     /// boundary for the buffer it named so the bind edge can use it.
     ///
@@ -211,22 +237,51 @@ impl AdapterContext {
     /// submission, and the bind in the PASSIVE display worker — is at least a
     /// frame later at a fullscreen frame rate, which is what made both earlier
     /// 0ab-B attempts wait a frame too long and read a re-cleared buffer.
-    pub(crate) fn arm_present_marker_refresh(&self, resource_id: u32) -> bool {
-        let ready = self.with_wddm_notify_lock(|guard| {
-            guard
+    pub(crate) fn arm_present_marker_refresh(
+        &self,
+        resource_id: u32,
+        stream_marker: Option<PresentStreamMarker>,
+    ) -> bool {
+        self.with_wddm_notify_lock(|guard| {
+            // A marker for a future flip records its exact completion boundary
+            // below, but cannot name a host read yet. Only the current bind's
+            // identity (or the explicitly identity-free HERF edge) may create
+            // a pending refresh here. This is identity-only: no PID, timing,
+            // buffer-count, or creation-order inference participates.
+            let action = present_marker_action(
+                resource_id,
+                self.active_scanout_resource.load(Ordering::Acquire),
+            );
+            let ready = guard
                 .with_virtio(|order, v| {
-                    let watermark = v.wire_fence_watermark();
+                    let watermark = stream_marker
+                        .and_then(|marker| {
+                            v.present_stream_marker_boundary(
+                                marker.ctx_id,
+                                marker.value,
+                                marker.cookie,
+                                marker.creator_process,
+                            )
+                        })
+                        // A missing, partial, or rejected stream tail is
+                        // exact legacy behavior: capture the current normal
+                        // wire boundary instead of manufacturing a dependency.
+                        .unwrap_or_else(|| v.wire_fence_watermark());
                     if resource_id != 0 {
                         self.record_frame_watermark(resource_id, watermark);
                     }
-                    v.note_scanout_refresh_at(order, resource_id, watermark)
+                    if action == PresentMarkerAction::QueueImmediate {
+                        v.note_scanout_refresh_at(order, resource_id, watermark)
+                    } else {
+                        false
+                    }
                 })
-                .unwrap_or(false)
-        });
-        if ready {
-            self.request_scanout_refresh_for(resource_id);
-        }
-        ready
+                .unwrap_or(false);
+            if ready {
+                self.request_scanout_refresh_for_locked(guard, resource_id);
+            }
+            ready
+        })
     }
 
     /// Take this flip's recorded frame boundary at FLIP-ARM time, for the
@@ -275,13 +330,14 @@ impl AdapterContext {
         resource_id: u32,
         carried_watermark: u64,
     ) -> (bool, bool) {
-        let (ready, carried) = self.with_wddm_notify_lock(|guard| {
-            self.arm_bind_refresh_locked(guard, resource_id, carried_watermark)
-        });
-        if ready {
-            self.request_scanout_refresh_for(resource_id);
-        }
-        (ready, carried)
+        self.with_wddm_notify_lock(|guard| {
+            let (ready, carried) =
+                self.arm_bind_refresh_locked(guard, resource_id, carried_watermark);
+            if ready {
+                self.request_scanout_refresh_for_locked(guard, resource_id);
+            }
+            (ready, carried)
+        })
     }
 
     /// The body of [`Self::arm_bind_refresh`], for a caller that already holds
@@ -318,6 +374,13 @@ impl AdapterContext {
                 } else {
                     table.unwrap_or_else(|| v.wire_fence_watermark())
                 };
+                // The per-flip packet may carry a marker after its context or
+                // device was torn down.  Rebase that explicitly cancelled
+                // stream boundary onto ordinary wire order; `!live` is never
+                // treated as a successful producer retirement.
+                let watermark = v
+                    .rebase_dead_present_stream_boundary(watermark)
+                    .unwrap_or(watermark);
                 let ready = v.note_scanout_refresh_at(order, resource_id, watermark);
                 if !ready {
                     // What is this deferral actually waiting for? Recorded
@@ -335,29 +398,37 @@ impl AdapterContext {
     /// older one for the same buffer (a re-present of the same buffer is a
     /// newer frame, and it is the newer frame the display will show).
     ///
-    /// Slot reuse takes a free slot first, then the LOWEST recorded boundary —
+    /// Slot reuse takes a free slot first, then the OLDEST insertion ordinal —
     /// the buffer that has gone longest without being presented — so a buffer
-    /// that stopped rotating cannot pin a slot.
+    /// that stopped rotating cannot pin a slot.  The ordinal is separate from
+    /// the boundary because registered-stream and legacy wire values have no
+    /// shared numeric ordering.
     ///
     /// Caller must hold `wddm_notify_lock`.
     fn record_frame_watermark(&self, resource_id: u32, watermark: u64) {
+        let ordinal = self
+            .frame_watermark_next_ordinal
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
         let mut victim = 0usize;
         for i in 0..self.frame_watermark_resource.len() {
             let id = self.frame_watermark_resource[i].load(Ordering::Relaxed);
             if id == resource_id {
                 self.frame_watermark_fence[i].store(watermark, Ordering::Relaxed);
+                self.frame_watermark_ordinal[i].store(ordinal, Ordering::Relaxed);
                 return;
             }
             if id == 0 {
                 victim = i;
             } else if self.frame_watermark_resource[victim].load(Ordering::Relaxed) != 0
-                && self.frame_watermark_fence[i].load(Ordering::Relaxed)
-                    < self.frame_watermark_fence[victim].load(Ordering::Relaxed)
+                && self.frame_watermark_ordinal[i].load(Ordering::Relaxed)
+                    < self.frame_watermark_ordinal[victim].load(Ordering::Relaxed)
             {
                 victim = i;
             }
         }
         self.frame_watermark_fence[victim].store(watermark, Ordering::Relaxed);
+        self.frame_watermark_ordinal[victim].store(ordinal, Ordering::Relaxed);
         self.frame_watermark_resource[victim].store(resource_id, Ordering::Relaxed);
     }
 
@@ -375,6 +446,7 @@ impl AdapterContext {
         for i in 0..self.frame_watermark_resource.len() {
             if self.frame_watermark_resource[i].load(Ordering::Relaxed) == resource_id {
                 self.frame_watermark_resource[i].store(0, Ordering::Relaxed);
+                self.frame_watermark_ordinal[i].store(0, Ordering::Relaxed);
                 return Some(self.frame_watermark_fence[i].load(Ordering::Relaxed));
             }
         }
@@ -944,6 +1016,16 @@ impl AdapterContext {
         if resource_id == 0 {
             return true;
         }
+        // Freeze the DISPATCH bind producer before resolving the final host
+        // selection. The PASSIVE worker is already excluded by `scanout_mutex`.
+        // Any SET issued before this point is ahead of the pure-query FIFO
+        // barrier below; no SET can be inserted between that proof and a
+        // necessary scanout-disable.
+        let begin = self.with_virtio(|v| v.begin_scanout_resource_retire(resource_id));
+        let Ok((accepted_before, host_before)) = begin else {
+            return false;
+        };
+        let wire_before = self.scanout_bind_wire_seq.load(Ordering::Acquire);
         // D4a (FIX-DESIGN-d4a.md §3.1): the ledger slot dies with its backing
         // allocation — reclaimed now if no read is in flight, else pinned
         // (retire-wanted) until the in-flight token's retirement equalizes the
@@ -952,64 +1034,114 @@ impl AdapterContext {
         // never recycled, so an unreclaimed slot is a leak of one of eight.
         self.read_ledger.note_alloc_retired(resource_id);
 
-        let was_active = self
-            .active_scanout_resource
-            .compare_exchange(resource_id, 0, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok();
-        let was_host_bound =
-            self.host_bound_scanout_resource.load(Ordering::Acquire) == resource_id;
-        if !was_active && !was_host_bound {
-            return true;
-        }
-        if !was_host_bound {
-            // The retiring allocation was only a newer desired candidate;
-            // a different resource is still bound on the host. Clearing
-            // the candidate above is sufficient. Sending scanout-disable
-            // here would blank the unrelated Windows-selected primary.
+        let retired = (|| {
+            // A successful pure-query response proves every earlier async SET
+            // reached a terminal host response. Successful SETs advanced the
+            // host-accepted selection in `drain_used`; failed SETs deliberately
+            // leave that selection unchanged. This is the missing distinction
+            // between "A was once accepted" and "A is still final".
+            let final_host = if needs_fifo_barrier(wire_before, accepted_before) {
+                if crate::virtio::ctrl::ctrl_fifo_barrier(lock.passive(), self).is_err() {
+                    crate::diag::record_named_bytes(b"ScRet", 0xB);
+                    crate::diag::record_named_bytes(b"ScDead", resource_id);
+                    return false;
+                }
+                self.with_virtio(|v| v.host_accepted_scanout_bind())
+                    .map(|(_, resource)| resource)
+                    .unwrap_or(host_before)
+            } else {
+                host_before
+            };
+
+            if !needs_disable(resource_id, final_host) {
+                // A newer successful bind (or an earlier disable) is the lifetime
+                // barrier. Sending SET(0) here would instead queue it BEHIND that
+                // newer bind and permanently blank scanout. Clear only guest views
+                // that still name A; a B application wholly before this closure is
+                // preserved, and one after it republishes B.
+                self.with_wddm_notify_lock(|_| {
+                    let host_was_a = self
+                        .host_bound_scanout_resource
+                        .compare_exchange(resource_id, 0, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok();
+                    let active_was_a = self
+                        .active_scanout_resource
+                        .compare_exchange(resource_id, 0, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok();
+                    if active_was_a {
+                        self.active_scanout_wh.store(0, Ordering::Release);
+                    }
+                    if self
+                        .pending_refresh_resource
+                        .compare_exchange(resource_id, 0, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                    {
+                        self.scanout_refresh_pending.store(0, Ordering::Release);
+                    }
+                    if host_was_a || active_was_a {
+                        let reason = if final_host == 0 {
+                            LeaseEnd::Cancelled
+                        } else {
+                            LeaseEnd::Superseded
+                        };
+                        if final_host == 0 {
+                            self.scanout_epoch_tracked.store(0, Ordering::Release);
+                        }
+                        let _ = self.end_scanout_leases_through(
+                            self.scanout_bound_epoch.load(Ordering::Acquire),
+                            reason,
+                        );
+                    }
+                });
+                crate::diag::record_named_bytes(b"ScRet", resource_id);
+                return true;
+            }
+
+            // A is still the final host selection, so disable scanout while the
+            // global fast-bind gate is held. Its response is both the host-reader
+            // lifetime barrier and the newest bind sequence; no newer B can be
+            // trapped in FIFO order A -> B -> 0.
+            let unbound = crate::virtio::ctrl::set_scanout_blob(
+                lock.passive(),
+                self,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            );
+            let Ok(unbind_seq) = unbound else {
+                crate::diag::record_named_bytes(b"ScRet", 0xE);
+                crate::diag::record_named_bytes(b"ScDead", resource_id);
+                return false;
+            };
+            let _ = self.with_virtio(|v| v.note_host_accepted_scanout_bind(unbind_seq, 0));
+
+            self.with_wddm_notify_lock(|_| {
+                if self.adopt_scanout_bind_seq(unbind_seq) {
+                    self.host_bound_scanout_resource.store(0, Ordering::Release);
+                    self.active_scanout_resource.store(0, Ordering::Release);
+                    self.active_scanout_wh.store(0, Ordering::Release);
+                    self.scanout_epoch_tracked.store(0, Ordering::Release);
+                    let _ = self.end_scanout_leases_through(
+                        self.scanout_bound_epoch.load(Ordering::Acquire),
+                        LeaseEnd::Cancelled,
+                    );
+                    self.scanout_refresh_pending.store(0, Ordering::Release);
+                    self.pending_refresh_resource.store(0, Ordering::Release);
+                }
+            });
             crate::diag::record_named_bytes(b"ScRet", resource_id);
-            return true;
-        }
+            true
+        })();
 
-        // QEMU's virtio-gpu SET_SCANOUT_BLOB contract treats resource_id=0
-        // as scanout disable before any resource lookup. Because this
-        // synchronous command is queued after all earlier async scanout
-        // commands, its response is the lifetime barrier before UNREF.
-        let unbound = crate::virtio::ctrl::set_scanout_blob(lock.passive(), self, 0, 0, 0, 0, 0, 0);
-        let Ok(unbind_seq) = unbound else {
-            crate::diag::record_named_bytes(b"ScRet", 0xE);
-            crate::diag::record_named_bytes(b"ScDead", resource_id);
-            return false;
-        };
-
-        // The disable is a bind like any other, so it claims its place in wire
-        // order (ROADMAP defect 0ab-C). A DISPATCH fast bind enqueued BEFORE it
-        // can still be applying its bookkeeping when we get here; letting that
-        // stale application publish an identity the host has just dropped would
-        // leave the guest believing a resource is bound while scan-out 0 is off
-        // — after which the worker's `already_bound` arm skips the wire bind and
-        // nothing rebinds. Adopting refuses it. The converse (a NEWER bind
-        // already applied) means the host is bound to that one, so this zeroing
-        // is the stale write and is correctly skipped.
-        if self.adopt_scanout_bind_seq(unbind_seq) {
-            self.host_bound_scanout_resource.store(0, Ordering::Release);
-        }
-        // Scan-out is disabled on the host, so nothing can read this resource
-        // again. Release the leases with it, or the flip that presented it never
-        // retires and VidSch escalates to a TDR.
-        self.release_all_scanout_leases(LeaseEnd::Cancelled);
-        self.scanout_refresh_pending.store(0, Ordering::Release);
-        // The armed frame died with its allocation; leaving the id set would
-        // gate every later refresh against a resource that can never bind.
-        self.pending_refresh_resource.store(0, Ordering::Release);
-        crate::diag::record_named_bytes(b"ScRet", resource_id);
-
-        // The DISPATCH Present path can publish a newer exact Windows
-        // primary without taking this PASSIVE lock. If that happened while
-        // the old resource was retiring, make the new identity drive a
-        // fresh bind instead of treating the just-issued unbind as final.
-        if self.active_scanout_resource.load(Ordering::Acquire) != 0 {
-            self.request_scanout_refresh();
-        }
-        true
+        // Paired structurally with `begin_scanout_resource_retire`: every exit
+        // from the decision closure reaches this epilogue. Wake the retained
+        // newest WDDM handle so the normal worker can bind it after the lifecycle
+        // mutex is released.
+        let _ = self.with_virtio(|v| v.finish_scanout_resource_retire());
+        self.signal_hpd();
+        retired
     }
 }

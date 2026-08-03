@@ -265,6 +265,27 @@ unsafe fn dxgkddi_present_inner(
     let stashed_snapshot = present_context
         .as_ref()
         .and_then(ContextHandleRef::take_snapshot_stash);
+    // The stream marker has the same Render→Present pairing and orphan bound as
+    // the snapshot.  Resolve it here, while the UMD context still supplies the
+    // documented KMD-process identity, then write the opaque boundary into the
+    // DMA private record consumed by SubmitCommand.  A bad/revoked marker is
+    // deliberately `None`: the scheduler follows its exact legacy current-wire
+    // rule rather than treating an untrusted tail as a future dependency.
+    let stashed_stream_marker = present_context
+        .as_ref()
+        .and_then(ContextHandleRef::take_present_stream_marker_stash);
+    let present_stream_boundary = stashed_stream_marker.and_then(|(ctx_id, value, cookie)| {
+        let creator_process = present_context
+            .as_ref()
+            .and_then(ContextHandleRef::creator_process)?;
+        let adapter = adapter?;
+        adapter
+            .with_virtio(|v| {
+                v.present_stream_marker_boundary(ctx_id, value, cookie, creator_process)
+            })
+            .ok()
+            .flatten()
+    });
     let src_handle = present_allocations
         .source()
         .map(|allocation| allocation.handle())
@@ -774,6 +795,13 @@ unsafe fn dxgkddi_present_inner(
             version: helios_protocol::HELIOS_PRESENT_REFRESH_VERSION,
             source_index: DXGK_PRESENT_SOURCE_INDEX,
             destination_index: DXGK_PRESENT_DESTINATION_INDEX,
+            // KMD-generated desktop marker: no UMD stream association.
+            // Zero-fill the appended v1-compatible tail explicitly so an old
+            // consumer sees its exact 16-byte prefix and a new one follows the
+            // legacy current-wire path.
+            present_ctx_id: 0,
+            present_value: 0,
+            present_cookie: 0,
         };
         unsafe {
             // Keep the DMA record structurally non-empty, and give Render an
@@ -787,6 +815,19 @@ unsafe fn dxgkddi_present_inner(
             args.pDmaBuffer = (args.pDmaBuffer as *mut u8).add(bytes as usize).cast();
         }
         args.MultipassOffset = 0;
+    }
+
+    if let Some(boundary) = present_stream_boundary {
+        if let Err(status) = unsafe {
+            PresentSubmissionPrivate::merge_stream_boundary(
+                args.pDmaBufferPrivateData,
+                args.DmaBufferPrivateDataSize,
+                boundary,
+            )
+        } {
+            PRESENT_LAST_STATUS.store(status as u32, Ordering::Relaxed);
+            return status;
+        }
     }
 
     PRESENT_LAST_STATUS.store(STATUS_SUCCESS as u32, Ordering::Relaxed);
@@ -1126,7 +1167,6 @@ pub(crate) unsafe fn arm_dma_flip_programming(
     if previous != 0 && previous != h_alloc as usize {
         crate::ddi::scanout_trace::note_ddi_coalesced(previous);
     }
-    adapter.signal_hpd();
     // Everything above is UNCHANGED, and that is the design: the fast bind is a
     // pure accelerator. The slot is armed, the gate is raised and the worker
     // will run exactly as it does today — the only difference is that the host
@@ -1143,6 +1183,10 @@ pub(crate) unsafe fn arm_dma_flip_programming(
             snapshot,
         )
     };
+    // Fast staging gets the first chance to publish or retain this exact
+    // boundary. Only then wake the PASSIVE fallback, so it can observe the
+    // fast completion rather than race a duplicate synchronous SET.
+    adapter.signal_hpd();
     true
 }
 
@@ -1256,15 +1300,10 @@ unsafe fn fast_bind_from_flip(
     // rode only the worker's bind, whose lateness climbs late-scene — the
     // residual black.
     //
-    // Relaxed is sufficient and correct here: every writer publishes this word
-    // under `virtio_lock` beside the sequence it belongs to, a stale read costs
-    // at worst one redundant (host-idempotent) bind or one missed acceleration,
-    // and the enqueue below re-takes that lock and mints its own sequence, which
-    // is what actually orders the bookkeeping. See the field's own doc.
-    if adapter.scanout_bind_wire_resource.load(Ordering::Relaxed) == target.resource_id() {
-        crate::ddi::scanout_trace::note_fast_bind_skip(skip::ALREADY_BOUND);
-        return;
-    }
+    // Do not use `scanout_bind_wire_resource == resource_id` as a skip here.
+    // It says only that W1 was published, not that W1's carried producer
+    // boundary includes this W2 frame. Skipping W2 can leave the newest marker
+    // unarmed forever when W1 consumes the mark-table entry.
     let request = crate::virtio::ScanoutBindRequest {
         resource_id: target.resource_id(),
         width: target.width(),
@@ -1279,24 +1318,25 @@ unsafe fn fast_bind_from_flip(
         // against this frame, not against a later sample.
         carried_watermark: frame_watermark,
     };
-    let outcome = adapter.with_virtio(|v| match v.take_bind_cmd_buffer() {
-        None => Err(crate::virtio::FastBindRefusal::Busy),
-        Some(buf) => {
-            // Minted INSIDE this lock hold, next to the enqueue it names: that
-            // is what makes the sequence agree with the control queue's FIFO
-            // order, which is the order the host applies the binds in. The same
-            // call publishes this resource as the newest ENQUEUED bind, which is
-            // what the skip test above reads.
-            let seq = adapter.mint_scanout_bind_seq(target.resource_id());
-            v.enqueue_scanout_bind_async(buf, seq, &request)
-        }
+    let outcome = adapter.with_virtio(|v| {
+        // The producer boundary is part of the request, not a new sample. An
+        // unready request occupies the fixed fast-bind slot until the used-ring
+        // completion DPC promotes it; no buffer, wire sequence, wait, or host
+        // command is consumed before then.
+        v.stage_scanout_bind(request, |resource_id| {
+            adapter.mint_scanout_bind_seq(resource_id)
+        })
     });
     match outcome {
-        Ok(Ok(())) => crate::ddi::scanout_trace::note_fast_bind_enqueued(),
-        Ok(Err(crate::virtio::FastBindRefusal::Busy)) => {
+        Ok(crate::virtio::FastBindDispatch::Queued) => {
+            crate::ddi::scanout_trace::note_fast_bind_enqueued()
+        }
+        Ok(crate::virtio::FastBindDispatch::Deferred)
+        | Ok(crate::virtio::FastBindDispatch::Handled) => {}
+        Ok(crate::virtio::FastBindDispatch::Busy) => {
             crate::ddi::scanout_trace::note_fast_bind_busy()
         }
-        Ok(Err(crate::virtio::FastBindRefusal::Failed)) => {
+        Ok(crate::virtio::FastBindDispatch::Failed) => {
             crate::ddi::scanout_trace::note_fast_bind_error()
         }
         Err(_) => crate::ddi::scanout_trace::note_fast_bind_skip(skip::NO_TRANSPORT),
@@ -1418,12 +1458,42 @@ unsafe fn apply_deferred_vidpn_source_address_locked(
     match unsafe { program_vidpn_source(adapter, lock, h_alloc, interval.ticket(), true) } {
         Ok(ScanoutOutcome::Programmed) => {
             clear_retry_state();
+            // A newer DIRQL handoff can raise its generation and fill the slot
+            // between this worker's swap and `ProgrammingInterval::adopt`. If it
+            // is pending now, this token belongs to that newer interval and must
+            // stay raised for its worker pass.
+            if adapter.pending_vidpn_allocation.load(Ordering::Acquire) != 0 {
+                interval.retain_for_retry();
+            }
             STATUS_SUCCESS
         }
         Ok(ScanoutOutcome::CopyQueued) => {
             clear_retry_state();
             release_leases_for_copy_fallback(adapter);
-            interval.transfer_to_completion();
+            if adapter.pending_vidpn_allocation.load(Ordering::Acquire) != 0 {
+                // Do not hand a newer interval's ticket to this older copy DPC.
+                // The pending worker owns the gate; the copy completion's clear
+                // would otherwise race that primary's programming.
+                interval.retain_for_retry();
+            } else {
+                interval.transfer_to_completion();
+            }
+            STATUS_SUCCESS
+        }
+        Ok(ScanoutOutcome::Deferred) => {
+            // A newer DIRQL flip may have filled the one pending slot after this
+            // worker took `h_alloc`. Never overwrite that exact newer handle,
+            // but keep the programming gate raised for whichever handle now owns
+            // forward progress. Dropping `interval` on the CAS-failure arm can
+            // clear the generation the newer flip just raised and make VSync
+            // report a primary that has not been programmed yet.
+            let _ = adapter.pending_vidpn_allocation.compare_exchange(
+                0,
+                h_alloc as usize,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+            interval.retain_for_retry();
             STATUS_SUCCESS
         }
         Err(reject) => {
@@ -1431,24 +1501,37 @@ unsafe fn apply_deferred_vidpn_source_address_locked(
             if reject.retryable() {
                 match note_retry_attempt(h_alloc) {
                     RetryDecision::Again => {
-                        // Re-arm the EXACT handle and keep the gate raised. Note
-                        // the store is inside the scanout lock, so it cannot race
-                        // the DestroyAllocation cancel.
-                        adapter
-                            .pending_vidpn_allocation
-                            .store(h_alloc as usize, Ordering::Release);
+                        // Re-arm the exact handle only while the slot is empty.
+                        // The DIRQL producer does not take the scanout lifecycle
+                        // lock, so a plain store here could overwrite a newer
+                        // Windows allocation. Either way the nonzero slot owns
+                        // the still-raised programming gate.
+                        let _ = adapter.pending_vidpn_allocation.compare_exchange(
+                            0,
+                            h_alloc as usize,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        );
                         interval.retain_for_retry();
                     }
                     // Budget exhausted. Drop the interval: the gate clears and
                     // the heartbeat resumes with the truthful OLD address, which
                     // is a visibly stale desktop rather than a frozen one.
-                    RetryDecision::GaveUp => release_leases_for_reject(adapter),
+                    RetryDecision::GaveUp => {
+                        release_leases_for_reject(adapter);
+                        if adapter.pending_vidpn_allocation.load(Ordering::Acquire) != 0 {
+                            interval.retain_for_retry();
+                        }
+                    }
                 }
             } else {
                 // Permanent for this allocation. Retrying would hold the gate
                 // and suppress CRTC_VSYNC for nothing.
                 clear_retry_state();
                 release_leases_for_reject(adapter);
+                if adapter.pending_vidpn_allocation.load(Ordering::Acquire) != 0 {
+                    interval.retain_for_retry();
+                }
             }
             reject.status()
         }
@@ -1498,6 +1581,8 @@ pub(crate) enum ScanoutReject {
     NoTarget,
     /// The primary-to-LINEAR GPU copy could not be submitted.
     CopyFailed(NTSTATUS),
+    /// Its exact producer stream was destroyed or its resource is retiring.
+    ProducerAbandoned,
 }
 
 /// Refusal counters, one per [`ScanoutReject`] variant. All must read 0 across a
@@ -1530,6 +1615,7 @@ impl ScanoutReject {
             Self::SetFailed => crate::diag::record_named_bytes(b"ScSet", 0xE),
             Self::NoTarget => crate::diag::record_named_bytes(b"ScSet", 0xE2),
             Self::CopyFailed(_) => crate::diag::record_named_bytes(b"ScCpy", 0xE),
+            Self::ProducerAbandoned => crate::diag::record_named_bytes(b"ScSet", 0xE4),
         }
     }
 
@@ -1543,6 +1629,7 @@ impl ScanoutReject {
             Self::SetFailed => &SC_SET_ERR,
             Self::NoTarget => &SC_NO_TARGET,
             Self::CopyFailed(_) => &SC_COPY_ERR,
+            Self::ProducerAbandoned => &SC_UNAVAILABLE,
         }
     }
 
@@ -1558,6 +1645,7 @@ impl ScanoutReject {
             Self::Format(_) => STATUS_NOT_SUPPORTED,
             Self::LinearAllocFailed(status) | Self::CopyFailed(status) => status,
             Self::SetFailed | Self::NoTarget => STATUS_DEVICE_NOT_READY,
+            Self::ProducerAbandoned => STATUS_SUCCESS,
         }
     }
 
@@ -1576,6 +1664,7 @@ impl ScanoutReject {
             Self::SetFailed => 6,
             Self::NoTarget => 7,
             Self::CopyFailed(_) => 8,
+            Self::ProducerAbandoned => 9,
         }
     }
 
@@ -1598,7 +1687,11 @@ impl ScanoutReject {
             Self::LinearAllocFailed(_) | Self::SetFailed | Self::NoTarget | Self::CopyFailed(_) => {
                 true
             }
-            Self::BadAlloc | Self::Extent | Self::Layout | Self::Format(_) => false,
+            Self::BadAlloc
+            | Self::Extent
+            | Self::Layout
+            | Self::Format(_)
+            | Self::ProducerAbandoned => false,
         }
     }
 }
@@ -1666,6 +1759,9 @@ enum ScanoutOutcome {
     /// A primary-to-LINEAR copy is queued on ring 1. Its used-ring completion
     /// DPC publishes the displayed address and clears the gate.
     CopyQueued,
+    /// The direct fallback retained its exact WDDM handle until the producer
+    /// boundary retires. The completion DPC wakes the existing worker.
+    Deferred,
 }
 
 /// Mirror the refusal counters into the registry. Called from the existing
@@ -1740,7 +1836,12 @@ unsafe fn apply_vidpn_source_address_locked(
     // record-then-lower order every arm had before R504.
     let interval = crate::adapter::ProgrammingInterval::adopt(&adapter.vidpn_programming);
     match unsafe { program_vidpn_source(adapter, lock, h_alloc, interval.ticket(), false) } {
-        Ok(ScanoutOutcome::Programmed) => STATUS_SUCCESS,
+        Ok(ScanoutOutcome::Programmed) => {
+            if adapter.pending_vidpn_allocation.load(Ordering::Acquire) != 0 {
+                interval.retain_for_retry();
+            }
+            STATUS_SUCCESS
+        }
         Ok(ScanoutOutcome::CopyQueued) => {
             release_leases_for_copy_fallback(adapter);
             // THE one hand-off. The copy is queued on ring 1 and its completion
@@ -1748,7 +1849,24 @@ unsafe fn apply_vidpn_source_address_locked(
             // success and clears the gate either way. Dropping the interval
             // instead would clear the gate mid-programming and let a CRTC_VSYNC
             // report the OLD address as authoritative.
-            interval.transfer_to_completion();
+            if adapter.pending_vidpn_allocation.load(Ordering::Acquire) != 0 {
+                interval.retain_for_retry();
+            } else {
+                interval.transfer_to_completion();
+            }
+            STATUS_SUCCESS
+        }
+        Ok(ScanoutOutcome::Deferred) => {
+            // Preserve a newer exact pending allocation if DIRQL published one
+            // while this PASSIVE call was running, and in both CAS arms retain
+            // the gate for the handle that now owns forward progress.
+            let _ = adapter.pending_vidpn_allocation.compare_exchange(
+                0,
+                h_alloc as usize,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+            interval.retain_for_retry();
             STATUS_SUCCESS
         }
         Err(reject) => {
@@ -1757,6 +1875,9 @@ unsafe fn apply_vidpn_source_address_locked(
             // Nothing was deferred, so there is nothing to re-arm.
             reject.report();
             release_leases_for_reject(adapter);
+            if adapter.pending_vidpn_allocation.load(Ordering::Acquire) != 0 {
+                interval.retain_for_retry();
+            }
             reject.status()
         }
     }
@@ -1834,6 +1955,7 @@ unsafe fn program_vidpn_source(
             trace.flags |= flags::COPY_QUEUED;
             0
         }
+        Ok(ScanoutOutcome::Deferred) => 0,
         Err(reject) => reject.trace_code(),
     };
     crate::ddi::scanout_trace::note_program(
@@ -1945,18 +2067,40 @@ unsafe fn program_vidpn_source_inner(
         crate::diag::record_named_bytes(b"ScPch", target.pitch());
         crate::diag::record_named_bytes(b"ScOff", target.plane_offset());
     }
-    // Sampled BEFORE the bind, because `remember_scanout_blob` below overwrites
-    // it. Only a change of RESOURCE supersedes an older presentation's lease: a
-    // re-bind of the same resource (an extent change) leaves that buffer as the
-    // scan-out, so a later flush still reads it and releasing its lease would
-    // hand the app a buffer the host is about to read (ROADMAP defect 0ab-B).
-    let previously_bound_resource = adapter.host_bound_scanout_resource.load(Ordering::Acquire);
-    // Whether THIS call's bookkeeping is the newest bind's (ROADMAP defect
-    // 0ab-C). True for an already-bound re-present, which issues no command and
-    // therefore has no wire order to be behind — that arm keeps its pre-0ab-C
-    // behaviour exactly.
-    let mut adopted = true;
+    // Filled only by the host-accepted direct bind application. The arm itself
+    // runs inside the notify-ordered transition below; reporting stays outside
+    // the spinlock because it does not participate in the ordering proof.
+    let mut bind_refresh = None;
     if !already_bound {
+        let worker_request = source.direct_scanout.then_some(crate::virtio::ScanoutBindRequest {
+            resource_id: target.resource_id(),
+            width: target.width(),
+            height: target.height(),
+            format: target.format().virtio(),
+            stride: target.pitch(),
+            offset: target.plane_offset(),
+            present_epoch: source.present_epoch,
+            primary_address: source.primary_address,
+            carried_watermark: source.frame_watermark,
+        });
+        if let Some(request) = worker_request {
+            let worker = adapter
+                .with_virtio(|v| v.stage_worker_scanout_bind(request))
+                .unwrap_or(crate::virtio::WorkerBindDispatch::Abandoned);
+            match worker {
+                crate::virtio::WorkerBindDispatch::Ready => {}
+                crate::virtio::WorkerBindDispatch::Waiting => {
+                    // Keep the exact WDDM allocation in the existing pending
+                    // slot. The used-ring DPC wakes this worker only after the
+                    // producer boundary retires; no synchronous SET can
+                    // overtake Venus.
+                    return Ok(ScanoutOutcome::Deferred);
+                }
+                crate::virtio::WorkerBindDispatch::Abandoned => {
+                    return Err(ScanoutReject::ProducerAbandoned);
+                }
+            }
+        }
         let set = crate::virtio::ctrl::set_scanout_blob(
             lock.passive(),
             adapter,
@@ -1968,8 +2112,17 @@ unsafe fn program_vidpn_source_inner(
             target.plane_offset(),
         );
         let Ok(bind_seq) = set else {
+            if let Some(request) = worker_request {
+                let _ = adapter.with_virtio(|v| v.release_failed_sync_worker_bind(request));
+            }
             return Err(ScanoutReject::SetFailed);
         };
+        // Persist the host-visible selection before any later bookkeeping.
+        // DestroyAllocation consults this under virtio_lock so it can disable a
+        // resource even if a DPC/worker handoff has not yet published it.
+        let _ = adapter.with_virtio(|v| {
+            v.note_host_accepted_scanout_bind(bind_seq, target.resource_id())
+        });
         trace.flags |= flags::BOUND;
         // THE WIRE-ORDER GUARD. This bookkeeping runs at PASSIVE after the
         // round-trip returned, so it can chronologically FOLLOW the application
@@ -1979,32 +2132,85 @@ unsafe fn program_vidpn_source_inner(
         // this older one would leave `host_bound_scanout_resource` naming a
         // buffer the host is no longer reading, which the flush executor's
         // `RfUnb` arm then refuses for the rest of the binding's life.
-        adopted = adapter.adopt_scanout_bind_seq(bind_seq);
-        if adopted {
-            // Keep the adapter-owned fallback cache separate from a rotating DWM
-            // direct primary. The latter is tracked by active_scanout_resource and
-            // dies with its WDDM allocation; publishing it here would overwrite the
-            // durable target's cached Venus identity.
-            //
-            // Branches on the SOURCE's flag, which is equivalent: the direct arm is
-            // taken only when it is set, and the LINEAR arm only when it is clear.
-            if !source.direct_scanout {
-                adapter.remember_primary_scanout(
+        let adopted = adapter.with_wddm_notify_lock(|guard| {
+            let adopted = adapter.adopt_scanout_bind_seq(bind_seq);
+            if adopted {
+                // Sample BEFORE `remember_scanout_blob` overwrites it. Only a
+                // RESOURCE change supersedes an older presentation's lease; a
+                // same-resource rebind can still be read by a later flush.
+                let previous = adapter.host_bound_scanout_resource.load(Ordering::Acquire);
+                // Keep the adapter-owned fallback cache separate from a rotating
+                // DWM direct primary.  All identity publication is serialized
+                // with the DPC's fast-bind transition.
+                if !source.direct_scanout {
+                    adapter.remember_primary_scanout(
+                        target.resource_id(),
+                        target.width(),
+                        target.height(),
+                        target.pitch(),
+                        target.plane_offset(),
+                        target.venus_alloc_size(),
+                        target.memory_type_index(),
+                        target.dxgi_format(),
+                    );
+                }
+                adapter.remember_scanout_blob(
                     target.resource_id(),
                     target.width(),
                     target.height(),
-                    target.pitch(),
-                    target.plane_offset(),
-                    target.venus_alloc_size(),
-                    target.memory_type_index(),
-                    target.dxgi_format(),
                 );
+                if source.direct_scanout {
+                    let superseded = previous != 0 && previous != target.resource_id();
+                    adapter.publish_bound_epoch(source.present_epoch, superseded);
+                    adapter.publish_bound_primary(source.primary_address);
+
+                    let refresh = if adapter.knobs().bind_flush_immediate {
+                        adapter.request_scanout_refresh_for_locked(guard, target.resource_id());
+                        (true, false)
+                    } else {
+                        let refresh = adapter.arm_bind_refresh_locked(
+                            guard,
+                            target.resource_id(),
+                            source.frame_watermark,
+                        );
+                        if refresh.0 {
+                            adapter
+                                .request_scanout_refresh_for_locked(guard, target.resource_id());
+                        }
+                        refresh
+                    };
+                    bind_refresh = Some(refresh);
+                }
             }
-            adapter.remember_scanout_blob(target.resource_id(), target.width(), target.height());
+            adopted
+        });
+        if adopted {
+            // Registry diagnostics are PASSIVE-only. The notify closure above
+            // runs at DISPATCH_LEVEL and must remain atomics/event/transport
+            // state only.
             crate::diag::record_named_bytes(b"ScPub", target.resource_id());
         } else {
             crate::ddi::scanout_trace::note_fast_bind_late();
         }
+    }
+
+    if already_bound && source.direct_scanout {
+        // A fast bind can replace the resource after the optimistic loads that
+        // formed `already_bound`. Revalidate under the same notify lock used by
+        // every bind application before publishing this presentation's epoch and
+        // primary. If it changed, the newer bind already published the truthful
+        // address; this stale worker must publish nothing.
+        let _still_bound = adapter.with_wddm_notify_lock(|_| {
+            let still_bound = adapter.active_scanout_resource.load(Ordering::Acquire)
+                == target.resource_id()
+                && adapter.active_scanout_wh.load(Ordering::Acquire)
+                    == (((target.width() as u64) << 32) | target.height() as u64);
+            if still_bound {
+                adapter.publish_bound_epoch(source.present_epoch, false);
+                adapter.publish_bound_primary(source.primary_address);
+            }
+            still_bound
+        });
     }
     if !already_bound || trace_tick {
         crate::diag::record_named_bytes(b"ScSet", 1);
@@ -2086,45 +2292,12 @@ unsafe fn program_vidpn_source_inner(
         // own flush, naming its own resource (defect 0aa) — and costs no CPU
         // wait: the flush is issued from the completion DPC via
         // `take_ready_scanout_refresh`.
-        if !already_bound && adopted {
-            // Arm against the boundary this buffer's own PRESENT MARKER
-            // captured, not against "everything in the ring now". Sampling
-            // here is defect 0ab-B: this code runs in the PASSIVE worker a
-            // frame or more after the app presented, so a fresh sample already
-            // covers the app's NEXT frame and the flush waits for that one —
-            // long enough, at a fullscreen frame rate, for the app to get this
-            // buffer back and clear it. Measured per flush on the host: frames
-            // flushed 1-3 ms after their bind were 0.2 % black, those flushed
-            // 6-12 ms after were 63 %.
-            //
-            // Capturing at flip SUBMISSION instead (22.22.210.0) was measured
-            // NOT to be early enough — see `submit_command::arm_dma_flip`.
-            // What the flip arm DOES do (22.22.217.0) is CONSUME the marker's
-            // boundary and stamp it on the allocation, because the mark table
-            // holds one entry per buffer and this bind can run after the same
-            // buffer's next present has already replaced it.
-            //
-            // No recorded boundary means no present marker named this buffer
-            // (the MMIO/desktop path), and sampling now is then correct
-            // *because* dxgkrnl retired that flip before calling us.
-            //
-            // `BindFlushMode=1` short-circuits the ordering entirely and
-            // flushes here. That is the A/B, not a shipping mode: it answers
-            // "is the buffer's content already correct at bind time?" directly.
-            // If it is, the deferral is spurious and every boundary variant is
-            // chasing the wrong thing; if it is not, the fix belongs on the
-            // buffer's LIFETIME instead of on the flush's ordering.
-            //
-            // `adopted` gates this arm for the same reason it gates the
-            // identity stores above (ROADMAP defect 0ab-C): a stale application
-            // would arm a flush against a binding the host has already
-            // replaced, and the newer bind's own arm has already run.
-            let (ready, carried) = if adapter.knobs().bind_flush_immediate {
-                adapter.request_scanout_refresh_for(target.resource_id());
-                (true, false)
-            } else {
-                adapter.arm_bind_refresh(target.resource_id(), source.frame_watermark)
-            };
+        // The host-accepted bind was adopted, published and armed as one
+        // notify-ordered transition above. Keeping the arm there is what makes
+        // it impossible for a newer bind/unbind to land between identity
+        // publication and this exact frame boundary. Only the atomics-only
+        // census is intentionally outside that spinlock.
+        if let Some((ready, carried)) = bind_refresh {
             if carried {
                 crate::ddi::scanout_trace::note_bind_watermark_carried();
             } else {
@@ -2147,49 +2320,10 @@ unsafe fn program_vidpn_source_inner(
         // its own (measured: ~350 of 4127 bind intervals) — not a substitute for
         // the read, which is the distinction 22.22.207.0 collapsed.
         //
-        // `adopted` is the third operand for the 0ab-C reason: a stale
-        // application's `previously_bound_resource` was sampled before a bind
-        // that has since landed, so its supersede decision describes a
-        // transition that is no longer the current one. The epoch publication
-        // below is left ungated deliberately — `fetch_max` is monotone and the
-        // already-bound re-present arm MUST keep publishing, or a stale
-        // `present > bound` would hold the ownership gate closed forever and
-        // freeze the desktop (defect 0aa).
-        let superseded_previous = adopted
-            && !already_bound
-            && previously_bound_resource != 0
-            && previously_bound_resource != target.resource_id();
-        adapter.publish_bound_epoch(source.present_epoch, superseded_previous);
-        // The physical address a later CRTC_VSYNC reports. It used to be
-        // WITHHELD here until this presentation's read finished — the second
-        // half of the reuse gate — and 22.22.217.0 retired that as measured
-        // inert; see `AdapterContext::publish_bound_primary`.
-        //
-        // Gated on `adopted` too, unlike the epoch above, and the asymmetry is
-        // deliberate: `fetch_max` cannot regress, an address store can. A stale
-        // application publishing here would report an address that disagrees
-        // with what the host is actually scanning out, for up to a worker pass.
-        //
-        // FREEZE-SAFE, which is the contract that matters here (the 36th-session
-        // heartbeat rule: a primary that is never published is a flip that never
-        // retires and a desktop that never moves). Three reasons, all structural:
-        //   * `adopted == false` means a NEWER bind's application advanced
-        //     `scanout_bind_applied_seq` — and that application publishes the
-        //     address itself, adopting BEFORE it publishes
-        //     (`ddi::interrupt::drain_used_and_complete`). So the address is
-        //     already correct or becomes correct within the same DPC; in between
-        //     it holds the previously displayed address, which is exactly what
-        //     the raised programming gate exists to keep authoritative.
-        //   * The `already_bound` arm keeps `adopted = true` by construction (no
-        //     command, no sequence), so same-resource re-presents — the MMIO
-        //     desktop steady state included — publish exactly as they do today.
-        //     Nothing without a concurrent fast bind changes behaviour at all.
-        //   * No retirement depends on a stale address being reported on either
-        //     contract: DMA-buffer flips retire on their fence, and MMIO flips
-        //     were retired by dxgkrnl before it ever called this DDI.
-        if adopted {
-            adapter.publish_bound_primary(source.primary_address);
-        }
+        // Epoch and primary publication also happened inside that transition.
+        // For an already-bound re-present the separate locked revalidation above
+        // publishes them without minting a fictitious wire sequence. A stale
+        // worker publishes neither; the newer accepted bind owns the heartbeat.
         // The caller's `interval` drops AFTER this, clearing the gate once the
         // matching physical address is published — the order the next VSync DPC
         // depends on (it acquires the gate before sampling

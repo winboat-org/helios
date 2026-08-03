@@ -24,11 +24,14 @@ use helios_protocol::{
     HeliosEscapeAllocBlob, HeliosEscapeAttachResource, HeliosEscapeCtxCreate,
     HeliosEscapeCtxDestroy, HeliosEscapeFenceEvent, HeliosEscapeHeader, HeliosEscapeMapBlob,
     HeliosEscapeMapReadLedger, HeliosEscapeQueryScanout, HeliosEscapeQueryStats,
-    HeliosEscapeQueryStatsV2, HeliosEscapeQueryStatsV3, HeliosEscapeReleaseBlob,
+    HeliosEscapeQueryStatsV2, HeliosEscapeQueryStatsV3, HeliosEscapeQueryStatsV4,
+    HeliosEscapeReleaseBlob,
     HeliosEscapeScanoutEvent, HeliosEscapeSubmitVenus, HeliosEscapeWaitFence,
+    HeliosEscapePresentStream,
     HeliosEscapeWaitFenceLegacy, HELIOS_ESCAPE_ALLOC_BLOB, HELIOS_ESCAPE_ATTACH_RESOURCE,
     HELIOS_ESCAPE_CTX_CREATE, HELIOS_ESCAPE_CTX_DESTROY, HELIOS_ESCAPE_MAP_BLOB,
     HELIOS_ESCAPE_MAP_READ_LEDGER, HELIOS_ESCAPE_QUERY_SCANOUT, HELIOS_ESCAPE_QUERY_STATS,
+    HELIOS_ESCAPE_PRESENT_STREAM,
     HELIOS_ESCAPE_REGISTER_FENCE_EVENT, HELIOS_ESCAPE_RELEASE_BLOB, HELIOS_ESCAPE_SCANOUT_EVENT,
     HELIOS_ESCAPE_SUBMIT_VENUS, HELIOS_ESCAPE_UNREGISTER_FENCE_EVENT, HELIOS_ESCAPE_WAIT_FENCE,
     HELIOS_FENCE_EVENT_ALREADY_COMPLETE, HELIOS_FENCE_EVENT_CANCELLED,
@@ -37,7 +40,8 @@ use helios_protocol::{
     HELIOS_SCANOUT_ACQ_OP_PROBE, HELIOS_SCANOUT_ACQ_OP_REGISTER, HELIOS_SCANOUT_ACQ_OP_UNMAP,
     HELIOS_SCANOUT_ACQ_OP_UNREGISTER, HELIOS_SCANOUT_ACQ_PROBE_ACK,
     HELIOS_SCANOUT_ACQ_TABLE_FULL, HELIOS_SCANOUT_CAP_READ_LEDGER,
-    HELIOS_SCANOUT_CAP_SNAPSHOT_BIND,
+    HELIOS_SCANOUT_CAP_SNAPSHOT_BIND, HELIOS_SCANOUT_CAP_ASYNC_PRESENT_STREAM,
+    HELIOS_PRESENT_STREAM_OP_REGISTER, HELIOS_PRESENT_STREAM_OP_UNREGISTER,
 };
 
 use super::blob_map::{
@@ -317,6 +321,19 @@ pub unsafe extern "C" fn dxgkddi_escape(
         },
         HELIOS_ESCAPE_SUBMIT_VENUS => match owner {
             Some(owner) => escape_submit_venus(passive, adapter, buf, &hdr, owner),
+            None => refuse_no_device(),
+        },
+        HELIOS_ESCAPE_PRESENT_STREAM => match owner {
+            Some(owner) => {
+                // `hDevice` is the live DeviceContext whose documented
+                // `hKmdProcess` association supplies registration identity.
+                let creator_process = unsafe { crate::device::DeviceHandleRef::from_raw(args.hDevice) }
+                    .map(|device| device.creator_process());
+                match creator_process {
+                    Some(process) => escape_present_stream(adapter, buf, &hdr, owner, process),
+                    None => STATUS_INVALID_PARAMETER,
+                }
+            }
             None => refuse_no_device(),
         },
         HELIOS_ESCAPE_WAIT_FENCE => escape_wait_fence(passive, adapter, buf, &hdr),
@@ -697,7 +714,9 @@ fn escape_map_read_ledger(
         // bit.
         HELIOS_SCANOUT_ACQ_OP_PROBE => reply(
             0,
-            HELIOS_SCANOUT_CAP_READ_LEDGER | HELIOS_SCANOUT_CAP_SNAPSHOT_BIND,
+            HELIOS_SCANOUT_CAP_READ_LEDGER
+                | HELIOS_SCANOUT_CAP_SNAPSHOT_BIND
+                | HELIOS_SCANOUT_CAP_ASYNC_PRESENT_STREAM,
             HELIOS_SCANOUT_ACQ_PROBE_ACK,
         ),
         HELIOS_SCANOUT_ACQ_OP_MAP => {
@@ -874,13 +893,16 @@ fn escape_query_stats(
         CTRL_TIMEOUT_COUNT, FENCE_EVENT_ALREADY_COMPLETE, FENCE_EVENT_CANCELS,
         FENCE_EVENT_DUP_REJECTS, FENCE_EVENT_HIGH_WATER, FENCE_EVENT_INVALID,
         FENCE_EVENT_OVERFLOWS, FENCE_EVENT_REGISTERS, FENCE_EVENT_SIGNALS,
-        FENCE_EVENT_TEARDOWN_DROPS, RESOURCE_FULL_REJECTS, RESOURCE_HIGH_WATER, TAKE_LIVE_MISSES,
-        WINDOW_RANGE_DROPS,
+        FENCE_EVENT_TEARDOWN_DROPS, PRESENT_STREAM_HIGH_WATER, PRESENT_STREAM_LIVE,
+        PRESENT_STREAM_MARKERS, PRESENT_STREAM_REGISTERS, PRESENT_STREAM_REJECTS,
+        PRESENT_STREAM_RETIRES, PRESENT_STREAM_TAGS, RESOURCE_FULL_REJECTS,
+        RESOURCE_HIGH_WATER, TAKE_LIVE_MISSES, WINDOW_RANGE_DROPS,
     };
 
     let sz = size_of::<HeliosEscapeQueryStats>();
     let sz2 = size_of::<HeliosEscapeQueryStatsV2>();
     let sz3 = size_of::<HeliosEscapeQueryStatsV3>();
+    let sz4 = size_of::<HeliosEscapeQueryStatsV4>();
     if buf.len() < sz {
         return refuse_short_buffer();
     }
@@ -894,6 +916,7 @@ fn escape_query_stats(
     let declared = hdr.size as usize;
     let v2 = declared >= sz2 && buf.len() >= sz2;
     let v3 = declared >= sz3 && buf.len() >= sz3;
+    let v4 = declared >= sz4 && buf.len() >= sz4;
     let (stats, fence_events_live) =
         match adapter.with_virtio(|v| (v.table_stats(), v.fence_events_live())) {
             Ok(s) => s,
@@ -917,9 +940,9 @@ fn escape_query_stats(
     out.out_take_live_misses = TAKE_LIVE_MISSES.load(Ordering::Relaxed);
     out.out_adopt_dead_rejects = ADOPT_DEAD_REJECTS.load(Ordering::Relaxed);
     if !v2 {
-        // NOT an EscapeBuf arm: this verb writes one of THREE layouts over the
+    // NOT an EscapeBuf arm: this verb writes one of FOUR layouts over the
         // same buffer, so there is no single wire type to bind it to. The bounds
-        // are the explicit `sz`/`sz2`/`sz3` checks above, and the version is now
+    // are the explicit `sz`/`sz2`/`sz3`/`sz4` checks above, and the version is now
         // selected by the caller's declared `hdr.size` rather than by how big a
         // scratch buffer it happened to pass.
         buf[..sz].copy_from_slice(bytes_of(&out));
@@ -968,7 +991,21 @@ fn escape_query_stats(
     out3.out_mmio_map_fails = crate::virtio::hal::MMIO_MAP_FAILS.load(Ordering::Relaxed);
     out3.out_mmio_cache_full = crate::virtio::hal::MMIO_CACHE_FULL.load(Ordering::Relaxed);
     out3.out_query_scanout_retries = QUERY_SCANOUT_RETRY_GIVEUPS.load(Ordering::Relaxed);
-    buf[..sz3].copy_from_slice(bytes_of(&out3));
+    if !v4 {
+        buf[..sz3].copy_from_slice(bytes_of(&out3));
+        return STATUS_SUCCESS;
+    }
+    let mut out4: HeliosEscapeQueryStatsV4 = pod_read_unaligned(&buf[..sz4]);
+    out4.v3 = out3;
+    out4.out_present_streams_live = PRESENT_STREAM_LIVE.load(Ordering::Relaxed);
+    out4.out_present_streams_cap = crate::virtio::gpu::max_present_streams() as u32;
+    out4.out_present_streams_high_water = PRESENT_STREAM_HIGH_WATER.load(Ordering::Relaxed);
+    out4.out_present_stream_registers = PRESENT_STREAM_REGISTERS.load(Ordering::Relaxed);
+    out4.out_present_stream_tags = PRESENT_STREAM_TAGS.load(Ordering::Relaxed);
+    out4.out_present_stream_markers = PRESENT_STREAM_MARKERS.load(Ordering::Relaxed);
+    out4.out_present_stream_retires = PRESENT_STREAM_RETIRES.load(Ordering::Relaxed);
+    out4.out_present_stream_rejects = PRESENT_STREAM_REJECTS.load(Ordering::Relaxed);
+    buf[..sz4].copy_from_slice(bytes_of(&out4));
     STATUS_SUCCESS
 }
 
@@ -994,6 +1031,56 @@ fn escape_ctx_create(
             STATUS_SUCCESS
         }
         Err(ve) => ve.into(),
+    }
+}
+
+/// `HELIOS_ESCAPE_PRESENT_STREAM` — one-time stream lifecycle.  The register
+/// reply is an opaque KMD cookie; unknown KMDs never reach this function and
+/// reject the verb from the dispatcher, which is the UMD's capability gate.
+fn escape_present_stream(
+    adapter: &AdapterContext,
+    buf: &mut [u8],
+    hdr: &HeliosEscapeHeader,
+    owner: DeviceOwner,
+    creator_process: usize,
+) -> NTSTATUS {
+    let mut wire = match EscapeBuf::<HeliosEscapePresentStream>::new(buf, hdr) {
+        Ok(wire) => wire,
+        Err(status) => return status,
+    };
+    let req = wire.read();
+    match req.op {
+        HELIOS_PRESENT_STREAM_OP_REGISTER => match adapter.with_virtio(|v| {
+            v.register_present_stream(owner, req.ctx_id, creator_process)
+        }) {
+            Ok(Ok(cookie)) => {
+                let mut out = req;
+                out.cookie = cookie;
+                wire.write_back(&out);
+                STATUS_SUCCESS
+            }
+            Ok(Err(crate::virtio::VirtioError::NotOwned)) => refuse_foreign_context(),
+            Ok(Err(error)) => error.into(),
+            Err(error) => error.into(),
+        },
+        HELIOS_PRESENT_STREAM_OP_UNREGISTER => {
+            let status = match adapter.with_wddm_notify_lock(|guard| {
+                guard.with_virtio(|order, v| {
+                    v.unregister_present_stream(order, owner, req.ctx_id, req.cookie)
+                })
+            }) {
+                Ok(true) => STATUS_SUCCESS,
+                // The caller must prove the exact owner+ctx+cookie tuple. Do
+                // not make unregister a wildcard cleanup primitive.
+                Ok(false) => STATUS_INVALID_PARAMETER,
+                Err(error) => error.into(),
+            };
+            if status == STATUS_SUCCESS {
+                crate::ddi::interrupt::request_wddm_completion_dpc(adapter);
+            }
+            status
+        }
+        _ => STATUS_INVALID_PARAMETER,
     }
 }
 
@@ -1050,14 +1137,32 @@ fn escape_submit_venus(
         return STATUS_INVALID_PARAMETER;
     }
 
-    match ctrl::submit_venus_async(
-        passive,
-        adapter,
-        Some(owner),
-        req.ctx_id,
-        req.ring_idx,
-        &stream[..payload],
-    ) {
+    // `present_value32 == 0` is byte-for-byte legacy behavior: the incoming
+    // fence id remains ignored and the KMD assigns a normal wire fence.  A
+    // tagged submit reinterprets only the INPUT fence id as the registered
+    // stream capability; writeback below still returns that same normal fence.
+    let queued = if req.present_value32 == 0 {
+        ctrl::submit_venus_async(
+            passive,
+            adapter,
+            Some(owner),
+            req.ctx_id,
+            req.ring_idx,
+            &stream[..payload],
+        )
+    } else {
+        ctrl::submit_venus_async_present_stream(
+            passive,
+            adapter,
+            owner,
+            req.ctx_id,
+            req.ring_idx,
+            req.fence_id,
+            req.present_value32,
+            &stream[..payload],
+        )
+    };
+    match queued {
         Ok(wire_fence) => {
             // Report the assigned wire fence id back (in/out escape buffer).
             let mut out = req;

@@ -22,6 +22,8 @@
 //! | `VehicleFlipGateUs` | DWORD | `32000` |
 //! | `ScanoutAcquire` | DWORD | `true` (explicit 0 is the kill switch) |
 //! | `ScanoutSnapshot` | DWORD | `true` (explicit 0 is the kill switch) |
+//! | `UmdPresentBatchFold` | DWORD | `true` (explicit 0 is the kill switch) |
+//! | `UmdAsyncPresentStream` | DWORD | `true` (explicit 0 keeps the old gate) |
 //!
 //! ⛔ **`PresentGateUs` and `PresentOrder` were DELETED 2026-07-29 by owner
 //! directive and must not come back.** They were the producer-side CPU
@@ -197,6 +199,21 @@ pub(crate) static SCANOUT_ACQUIRE: BoolKnob = BoolKnob::new(c"ScanoutAcquire", t
 /// mechanism, behind one cheap check.
 pub(crate) static SCANOUT_SNAPSHOT: BoolKnob = BoolKnob::new(c"ScanoutSnapshot", true);
 
+/// Ordinary-present batch-fold kill switch. Absent = ON; explicit 0 keeps the
+/// historical ordering where `publish_present_order` is recorded after the
+/// Present flush. When enabled, the ordinary no-debug path records the
+/// present-fence signal after its copy/snapshot and before that existing flush,
+/// so the signal shares the frame's real submission. Vehicle, force-opaque and
+/// readback presents deliberately retain their historical sequencing.
+pub(crate) static UMD_PRESENT_BATCH_FOLD: BoolKnob = BoolKnob::new(c"UmdPresentBatchFold", true);
+
+/// Registered monotonic present-stream kill switch. Absent = ON; explicit 0
+/// preserves the old frame gate even when an early folded publication has a
+/// valid KMD correlation. This gates only the final skip decision: it never
+/// changes publication or the existing Flush that dispatches the frame batch.
+pub(crate) static UMD_ASYNC_PRESENT_STREAM: BoolKnob =
+    BoolKnob::new(c"UmdAsyncPresentStream", true);
+
 /// FREETHREADED THREADING-caps kill switch (Phase B of the command-list
 /// build, `tmp/handoff-perf-structural/PLAN-commandlists.md`). Absent = ON;
 /// explicit 0 reverts the adapter to THREADING caps = 0 without a redeploy
@@ -230,20 +247,33 @@ pub(crate) static UMD_FREE_THREADED: BoolKnob = BoolKnob::new(c"UmdFreeThreaded"
 /// runtime to use them. See `device_funcs::threading_caps`.
 pub(crate) static UMD_COMMAND_LISTS: BoolKnob = BoolKnob::new(c"UmdCommandLists", false);
 
+/// Deferred-context/command-list success-path counters and sampled logs.
+///
+/// The native command-list path finishes and executes work on many worker
+/// threads. Its evidence counters used to perform two process-global atomic
+/// RMWs per successful finish/execute (the counter and `LogThrottle`), which
+/// turns instrumentation into a contended cache line in the benchmarked path.
+/// Keep the evidence available for an explicit diagnostic run, but absent =
+/// OFF means a timed run does no diagnostic atomic RMW at all.
+pub(crate) static UMD_DEFERRED_DIAGNOSTICS: BoolKnob = BoolKnob::new(c"UmdDeferredDiagnostics", false);
+
 /// The knob inventory, so the set is enumerable instead of grep-discoverable.
 ///
 /// Each entry is `(value name, resolved value as text)`. Resolving forces every
 /// `OnceLock`, which is why this is not called on any hot path — it exists for
 /// a one-shot dump at load, and for anyone asking "what knobs are there".
-pub(crate) fn resolved_inventory() -> [(&'static str, u32); 7] {
+pub(crate) fn resolved_inventory() -> [(&'static str, u32); 10] {
     [
         ("UmdTrace", UMD_TRACE.get() as u32),
         ("FeatureLevel11", FEATURE_LEVEL_11.get()),
         ("VehicleFlipGateUs", VEHICLE_FLIP_GATE_US.get()),
         ("ScanoutAcquire", SCANOUT_ACQUIRE.get() as u32),
         ("ScanoutSnapshot", SCANOUT_SNAPSHOT.get() as u32),
+        ("UmdPresentBatchFold", UMD_PRESENT_BATCH_FOLD.get() as u32),
+        ("UmdAsyncPresentStream", UMD_ASYNC_PRESENT_STREAM.get() as u32),
         ("UmdFreeThreaded", UMD_FREE_THREADED.get() as u32),
         ("UmdCommandLists", UMD_COMMAND_LISTS.get() as u32),
+        ("UmdDeferredDiagnostics", UMD_DEFERRED_DIAGNOSTICS.get() as u32),
     ]
 }
 
@@ -325,6 +355,21 @@ pub(crate) fn scanout_snapshot_knob() -> bool {
     SCANOUT_SNAPSHOT.get()
 }
 
+/// Whether an ordinary Present records its producer timeline signal in the
+/// same batch as the frame copy/snapshot. `HKLM\\SOFTWARE\\Helios!UmdPresentBatchFold`
+/// (REG_DWORD), read once per process. Absent = ON; explicit 0 restores the
+/// post-flush publication order for same-binary A/B.
+pub(crate) fn present_batch_fold() -> bool {
+    UMD_PRESENT_BATCH_FOLD.get()
+}
+
+/// Registered monotonic present-stream kill switch:
+/// `HKLM\\SOFTWARE\\Helios!UmdAsyncPresentStream` (REG_DWORD), read once per
+/// process. Absent = ON; explicit 0 retains the historical frame gate.
+pub(crate) fn umd_async_present_stream() -> bool {
+    UMD_ASYNC_PRESENT_STREAM.get()
+}
+
 /// FREETHREADED THREADING-caps kill switch:
 /// `HKLM\SOFTWARE\Helios!UmdFreeThreaded` (REG_DWORD). Read once per process.
 /// Absent = ON; explicit 0 reverts to caps = 0. See [`UMD_FREE_THREADED`].
@@ -342,3 +387,10 @@ pub(crate) fn umd_command_lists() -> bool {
     UMD_COMMAND_LISTS.get() && UMD_FREE_THREADED.get()
 }
 
+/// Whether deferred-context/command-list success-path diagnostics are enabled:
+/// `HKLM\\SOFTWARE\\Helios!UmdDeferredDiagnostics` (REG_DWORD). Read once per
+/// process. Absent = OFF so the timed command-list path performs no diagnostic
+/// counter or log-throttle atomic RMWs.
+pub(crate) fn umd_deferred_diagnostics() -> bool {
+    UMD_DEFERRED_DIAGNOSTICS.get()
+}

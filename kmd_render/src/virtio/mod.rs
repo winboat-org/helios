@@ -25,7 +25,8 @@ pub mod venus;
 // it through inference (`take_completed_bind`), and an unused re-export is a
 // warning in a crate that keeps its build clean.
 pub use gpu::{
-    FastBindRefusal, ScanoutBindRequest, ScanoutFlushToken, ScanoutNotify, VirtioGpu, WddmTake,
+    FastBindDispatch, ScanoutBindRequest, ScanoutFlushToken, ScanoutNotify, VirtioGpu, WddmTake,
+    WorkerBindDispatch,
 };
 
 use wdk_sys::{

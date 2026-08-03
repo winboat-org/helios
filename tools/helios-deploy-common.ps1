@@ -109,6 +109,26 @@ function Remove-HeliosDisplacedCopies([string]$Destination) {
   return $removed
 }
 
+function Sync-HeliosFileToDisk([string]$Path) {
+  # FlushFileBuffers is reached by FileStream.Flush(true). Opening the already
+  # copied temporary file read/write is intentional: a read-only FileStream
+  # cannot issue the durable flush on all .NET Framework versions shipped with
+  # Windows PowerShell 5.1.
+  $stream = $null
+  try {
+    $stream = [IO.FileStream]::new(
+      $Path,
+      [IO.FileMode]::Open,
+      [IO.FileAccess]::ReadWrite,
+      [IO.FileShare]::None,
+      4096,
+      [IO.FileOptions]::WriteThrough)
+    $stream.Flush($true)
+  } finally {
+    if ($stream) { $stream.Dispose() }
+  }
+}
+
 function Copy-HeliosFileVerified([string]$Source, [string]$Destination, [int]$Retries = 3, [int]$RetryDelayMs = 500, [switch]$DisplaceInUse) {
   if (-not (Test-Path -LiteralPath $Source -PathType Leaf)) { throw "Missing source file $Source" }
   $destDir = Split-Path -Parent $Destination
@@ -120,6 +140,11 @@ function Copy-HeliosFileVerified([string]$Source, [string]$Destination, [int]$Re
   }
   $tmp = Join-Path $destDir (".{0}.{1}.tmp" -f ([IO.Path]::GetFileName($Destination)), ([guid]::NewGuid()))
   Copy-Item -LiteralPath $Source -Destination $tmp -Force
+  # DriverStore temp files inherit a protected ACL even when the directory
+  # itself has just been made writable. Grant this administrator token access
+  # to the private temp before reopening it for the durable FlushFileBuffers.
+  Grant-HeliosWritable $tmp
+  Sync-HeliosFileToDisk $tmp
   $tmpHash = Get-HeliosFileHash $tmp
   if ($tmpHash -ne $sourceHash) {
     Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
@@ -140,6 +165,13 @@ function Copy-HeliosFileVerified([string]$Source, [string]$Destination, [int]$Re
       $lastError = $_
       if (-not (Test-Path -LiteralPath $tmp)) {
         Copy-Item -LiteralPath $Source -Destination $tmp -Force
+        Grant-HeliosWritable $tmp
+        Sync-HeliosFileToDisk $tmp
+        $tmpHash = Get-HeliosFileHash $tmp
+        if ($tmpHash -ne $sourceHash) {
+          Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+          throw "Retry temporary copy hash mismatch for $Destination. source=$sourceHash tmp=$tmpHash"
+        }
       }
       if ($DisplaceInUse -and (Test-Path -LiteralPath $Destination -PathType Leaf)) {
         # A LOADED image is held by the loader with no write sharing, so this is

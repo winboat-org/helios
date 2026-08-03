@@ -42,6 +42,22 @@ mod ffi {
         fn d3d11_context_ptr(self: &HeliosDxvkDevice) -> usize;
         fn venus_context_id(self: &HeliosDxvkDevice) -> u32;
         /// # Safety
+        /// `deferred_context_ptr` is borrowed and live. `command_list_ptr`
+        /// transfers one owned COM reference on true; false leaves ownership
+        /// with the caller, which must reconstruct and release it.
+        unsafe fn recycle_deferred_command_list(
+            self: &HeliosDxvkDevice,
+            deferred_context_ptr: usize,
+            command_list_ptr: usize,
+        ) -> bool;
+        /// # Safety
+        /// `deferred_context_ptr` must be a live deferred context created by
+        /// this bridge immediately before this call.
+        unsafe fn enable_deferred_context_ddi_logical_reset(
+            self: &HeliosDxvkDevice,
+            deferred_context_ptr: usize,
+        ) -> bool;
+        /// # Safety
         /// `d3d11_resource_ptr` must be a live `ID3D11Resource*`; the bridge
         /// `reinterpret_cast`s it and calls `GetCommonTexture` on it.
         unsafe fn set_resource_kmt_handles(
@@ -159,7 +175,17 @@ mod ffi {
             order_mode: u32,
         ) -> bool;
 
-        fn publish_present_order(self: &HeliosDxvkDevice, d3d11_resource_ptr: usize) -> bool;
+        /// # Safety
+        /// The three output pointers are live writable u32/u32/u64 storage for
+        /// the duration of the call. `d3d11_resource_ptr` is a live D3D11
+        /// resource COM pointer, as documented by the C++ bridge method.
+        unsafe fn publish_present_order(
+            self: &HeliosDxvkDevice,
+            d3d11_resource_ptr: usize,
+            out_ctx_id: *mut u32,
+            out_value32: *mut u32,
+            out_cookie: *mut u64,
+        ) -> bool;
 
         /// D4a scanout acquire: hand the per-device KMD retirement event to
         /// the DXVK device's signaler thread (auto-reset HANDLE as usize,
@@ -399,6 +425,22 @@ pub(crate) struct SrcRes(pub(crate) usize);
 #[derive(Clone, Copy)]
 pub(crate) struct DstRes(pub(crate) usize);
 
+/// The optional KMD correlation for one ordinary present's exact producer
+/// submission. Zero is the only fallback representation: callers cannot carry
+/// a partial `{ctx,value,cookie}` into a KMD marker.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct PresentStreamCorrelation {
+    pub(crate) ctx_id: u32,
+    pub(crate) value32: u32,
+    pub(crate) cookie: u64,
+}
+
+impl PresentStreamCorrelation {
+    pub(crate) fn is_complete(self) -> bool {
+        self.ctx_id != 0 && self.value32 != 0 && self.cookie != 0
+    }
+}
+
 /// The DXVK bridge device, with the raw cxx surface sealed off.
 pub struct BridgeDevice {
     inner: cxx::UniquePtr<ffi::HeliosDxvkDevice>,
@@ -427,6 +469,32 @@ impl BridgeDevice {
 
     pub(crate) fn d3d11_context(&self) -> Option<ManuallyDrop<ID3D11DeviceContext>> {
         self.get()?.d3d11_context()
+    }
+
+    /// # Safety
+    /// `deferred_context_ptr` must be a live DXVK deferred interface.
+    /// `command_list_ptr` transfers one owned COM reference iff this returns
+    /// true; false leaves it owned by the caller.
+    pub(crate) unsafe fn recycle_deferred_command_list(
+        &self,
+        deferred_context_ptr: usize,
+        command_list_ptr: usize,
+    ) -> bool {
+        self.get().is_some_and(|d| unsafe {
+            d.recycle_deferred_command_list(deferred_context_ptr, command_list_ptr)
+        })
+    }
+
+    /// # Safety
+    /// `deferred_context_ptr` must be the newly-created live DXVK deferred
+    /// context owned by this UMD device.
+    pub(crate) unsafe fn enable_deferred_context_ddi_logical_reset(
+        &self,
+        deferred_context_ptr: usize,
+    ) -> bool {
+        self.get().is_some_and(|d| unsafe {
+            d.enable_deferred_context_ddi_logical_reset(deferred_context_ptr)
+        })
     }
 
     // -- owned COM ---------------------------------------------------------
@@ -493,10 +561,32 @@ impl BridgeDevice {
     /// Publish this present on the device's named timeline so a consumer can
     /// order its read GPU-side. `d3d11_resource_ptr` is the presented source
     /// resource's COM pointer; the bridge derives the venus resource id the
-    /// consumer imports by.
-    pub(crate) fn publish_present_order(&self, d3d11_resource_ptr: usize) -> bool {
-        self.get()
-            .is_some_and(|d| d.publish_present_order(d3d11_resource_ptr))
+    /// consumer imports by. Slot publication remains the boolean result; the
+    /// optional stream correlation is fully zero unless all three fields name
+    /// this exact signal.
+    pub(crate) fn publish_present_order(
+        &self,
+        d3d11_resource_ptr: usize,
+    ) -> (bool, PresentStreamCorrelation) {
+        let Some(d) = self.get() else {
+            return (false, PresentStreamCorrelation::default());
+        };
+        let mut correlation = PresentStreamCorrelation::default();
+        // SAFETY: `d` is the bridge-owned live C++ device and all three
+        // out-pointers borrow initialized local fields for this synchronous
+        // call. The C++ bridge zeroes them before reporting failure.
+        let published = unsafe {
+            d.publish_present_order(
+                d3d11_resource_ptr,
+                &mut correlation.ctx_id,
+                &mut correlation.value32,
+                &mut correlation.cookie,
+            )
+        };
+        if !published || !correlation.is_complete() {
+            correlation = PresentStreamCorrelation::default();
+        }
+        (published, correlation)
     }
 
     /// D4a scanout acquire: deliver this device's KMD retirement event handle

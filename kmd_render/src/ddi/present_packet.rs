@@ -18,21 +18,24 @@ use crate::dxgk::*;
 // cannot hold the complete operation (ntstatus.h).
 pub(crate) const STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER: NTSTATUS = 0xC01E_0001u32 as NTSTATUS;
 
+// Version 2 appended the generation-qualified stream boundary after the
+// original 16-byte GPU-fence record.  Do not decode a v1 record as v2: the
+// added bytes belong to another private record in an older driver image.
+const PRESENT_SUBMISSION_VERSION: u32 = 2;
 const PRESENT_SUBMISSION_MAGIC: u32 = 0x4850_424C; // "HPBL"
-const PRESENT_SUBMISSION_VERSION: u32 = 1;
 
 /// Byte offset of [`PresentFlipPrivate`] inside the per-context DMA
-/// private-data buffer. [`PresentSubmissionPrivate`] owns bytes 0..16, so the
-/// flip record occupies 16.. and the two never collide even when dxgkrnl
+/// private-data buffer. [`PresentSubmissionPrivate`] owns bytes 0..24, so the
+/// flip record occupies bytes 24.. and the two never collide even when dxgkrnl
 /// batches a BLT and a flip into one DMA buffer.
-pub(crate) const PRESENT_FLIP_PRIVATE_OFFSET: usize = 16;
+pub(crate) const PRESENT_FLIP_PRIVATE_OFFSET: usize = 24;
 
 /// `DmaBufferPrivateDataSize` this driver requests per context (`device.rs`'s
 /// CreateContext reads it from here). 40 bytes until D4b; the snapshot
 /// descriptor grew [`PresentFlipPrivate`] by 32 bytes, and this is the OTHER
 /// half of the "deliberate change to BOTH sites" the compile-time proof below
 /// demands.
-pub(crate) const PRESENT_DMA_PRIVATE_DATA_BYTES: u32 = 72;
+pub(crate) const PRESENT_DMA_PRIVATE_DATA_BYTES: u32 = 80;
 
 const PRESENT_FLIP_MAGIC: u32 = 0x4850_464C; // "HPFL"
 const PRESENT_FLIP_VERSION: u32 = 1;
@@ -141,7 +144,10 @@ impl PresentFlipPrivate {
         // private-data buffer beyond its size.
         unsafe {
             core::ptr::write_unaligned(
-                private_data.cast::<u8>().add(PRESENT_FLIP_PRIVATE_OFFSET).cast::<PresentFlipPrivate>(),
+                private_data
+                    .cast::<u8>()
+                    .add(PRESENT_FLIP_PRIVATE_OFFSET)
+                    .cast::<PresentFlipPrivate>(),
                 record,
             );
         }
@@ -249,15 +255,27 @@ pub(crate) struct PresentSubmissionPrivate {
     magic: u32,
     version: u32,
     gpu_fence_id: u64,
+    /// Exact opaque stream boundary captured from the UMD present marker.
+    /// Bit 63 selects the stream namespace; zero means no stream marker and
+    /// SubmitCommand keeps its legacy current-wire behavior.
+    stream_boundary: u64,
+}
+
+/// The scheduler-relevant contents of one exact KMD private-data record.
+#[derive(Clone, Copy)]
+pub(crate) struct PresentSubmissionBoundary {
+    pub gpu_fence_id: u64,
+    pub stream_boundary: u64,
 }
 
 impl PresentSubmissionPrivate {
     #[inline]
-    fn for_fence(gpu_fence_id: u64) -> Self {
+    fn for_parts(gpu_fence_id: u64, stream_boundary: u64) -> Self {
         Self {
             magic: PRESENT_SUBMISSION_MAGIC,
             version: PRESENT_SUBMISSION_VERSION,
             gpu_fence_id,
+            stream_boundary,
         }
     }
 
@@ -292,10 +310,71 @@ impl PresentSubmissionPrivate {
         unsafe {
             core::ptr::write_unaligned(
                 private_data.cast::<PresentSubmissionPrivate>(),
-                Self::for_fence(merged),
+                Self::for_parts(
+                    merged,
+                    if old.magic == PRESENT_SUBMISSION_MAGIC
+                        && old.version == PRESENT_SUBMISSION_VERSION
+                    {
+                        old.stream_boundary
+                    } else {
+                        0
+                    },
+                ),
             );
         }
         PRESENT_MARKER_LAST_FENCE.store(merged as u32, Ordering::Relaxed);
+        PRESENT_MARKER_LAST_SIZE.store(private_size, Ordering::Relaxed);
+        PRESENT_MARKER_WRITES.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Merge one same-context registered stream boundary into this submission.
+    /// A context owns at most one live stream, so repeated Present records can
+    /// only advance the same generation-qualified handle.  Different handles
+    /// are refused instead of being numerically compared across namespaces.
+    pub(crate) unsafe fn merge_stream_boundary(
+        private_data: *mut c_void,
+        private_size: u32,
+        boundary: u64,
+    ) -> Result<(), NTSTATUS> {
+        if private_data.is_null()
+            || (private_size as usize) < core::mem::size_of::<PresentSubmissionPrivate>()
+        {
+            return Err(STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER);
+        }
+        // This private record carries only the opaque tagged stream namespace;
+        // a legacy wire fence must stay in `gpu_fence_id` rather than being
+        // reinterpreted as a stream handle.
+        if boundary >> 63 != 1 || ((boundary >> 32) & 0x7fff_ffff) == 0 || boundary as u32 == 0 {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let old =
+            unsafe { core::ptr::read_unaligned(private_data.cast::<PresentSubmissionPrivate>()) };
+        let (gpu_fence_id, old_boundary) =
+            if old.magic == PRESENT_SUBMISSION_MAGIC && old.version == PRESENT_SUBMISSION_VERSION {
+                (old.gpu_fence_id, old.stream_boundary)
+            } else {
+                (0, 0)
+            };
+        let merged_boundary = if old_boundary == 0 || old_boundary == boundary {
+            boundary
+        } else if (old_boundary >> 63) == 1
+            && (boundary >> 63) == 1
+            && ((old_boundary >> 32) & 0x7fff_ffff) == ((boundary >> 32) & 0x7fff_ffff)
+        {
+            // Same stream handle: values are monotonic, so the later/larger
+            // value subsumes the earlier marker without crossing namespaces.
+            let value = (old_boundary as u32).max(boundary as u32);
+            (boundary & !0xffff_ffff) | value as u64
+        } else {
+            return Err(STATUS_INVALID_PARAMETER);
+        };
+        unsafe {
+            core::ptr::write_unaligned(
+                private_data.cast::<PresentSubmissionPrivate>(),
+                Self::for_parts(gpu_fence_id, merged_boundary),
+            );
+        }
         PRESENT_MARKER_LAST_SIZE.store(private_size, Ordering::Relaxed);
         PRESENT_MARKER_WRITES.fetch_add(1, Ordering::Relaxed);
         Ok(())
@@ -309,7 +388,10 @@ impl PresentSubmissionPrivate {
     /// # Safety
     /// `private_data` points to `private_size` readable bytes supplied by
     /// dxgkrnl for this SubmitCommand call.
-    pub(crate) unsafe fn decode(private_data: *const c_void, private_size: u32) -> Option<u64> {
+    pub(crate) unsafe fn decode(
+        private_data: *const c_void,
+        private_size: u32,
+    ) -> Option<PresentSubmissionBoundary> {
         if private_data.is_null()
             || (private_size as usize) < core::mem::size_of::<PresentSubmissionPrivate>()
         {
@@ -319,8 +401,11 @@ impl PresentSubmissionPrivate {
             unsafe { core::ptr::read_unaligned(private_data.cast::<PresentSubmissionPrivate>()) };
         (value.magic == PRESENT_SUBMISSION_MAGIC
             && value.version == PRESENT_SUBMISSION_VERSION
-            && value.gpu_fence_id != 0)
-            .then_some(value.gpu_fence_id)
+            && (value.gpu_fence_id != 0 || value.stream_boundary != 0))
+            .then_some(PresentSubmissionBoundary {
+                gpu_fence_id: value.gpu_fence_id,
+                stream_boundary: value.stream_boundary,
+            })
     }
 
     /// Locate a valid marker anywhere in a bounded private-data snapshot.

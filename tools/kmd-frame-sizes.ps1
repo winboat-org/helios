@@ -10,6 +10,12 @@
   crash dump and NO bugcheck 1001 event -- an early double fault cannot write
   one). 22.22.180.0's 17936 bytes is the known-good ceiling for that nested pair.
 
+  Constructors called by init are simultaneously live too. In particular,
+  VirtQueue::new has a large by-value return slot, so omitting it understated
+  22.22.227.0's pre-fix chain by 4168 bytes. The default chains below include
+  both that constructor and the fixed present-stream/scanout-refresh allocators
+  explicitly.
+
   A function with a frame larger than one page is compiled with a __chkstk
   probe, so its prologue reads:
 
@@ -42,6 +48,11 @@ param(
     [string[]] $Symbols = @(
         '9lifecycle20dxgkddi_start_device',
         '9VirtioGpu4init',
+        # Unique across crate-hash changes: const queue size 0x40 followed by
+        # VirtQueue::new's concrete PciTransport argument.
+        'Kj40_E3newNtNtNtB5_9transport3pci12PciTransport',
+        '24allocate_present_streams',
+        '30allocate_scanout_refresh_state',
         '14bring_up_venus',
         '26allocate_host_visible_blob',
         '9VenusRing8bring_up',
@@ -55,6 +66,9 @@ param(
     # $Symbols entries, outermost first.
     [string[]] $Chains = @(
         '9lifecycle20dxgkddi_start_device,9VirtioGpu4init',
+        '9lifecycle20dxgkddi_start_device,9VirtioGpu4init,Kj40_E3newNtNtNtB5_9transport3pci12PciTransport',
+        '9lifecycle20dxgkddi_start_device,9VirtioGpu4init,24allocate_present_streams',
+        '9lifecycle20dxgkddi_start_device,9VirtioGpu4init,30allocate_scanout_refresh_state',
         '9lifecycle20dxgkddi_start_device,14bring_up_venus,26allocate_host_visible_blob,13VenusInstance11into_device,13VenusInstance29create_device_with_ext_ladder'
     ),
     [int]      $Window  = 24

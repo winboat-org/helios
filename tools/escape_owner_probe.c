@@ -1,7 +1,7 @@
 // escape_owner_probe.c — the T1b gate instrument for the escape trust boundary.
 //
 // Exercises, in order:
-//   1. QUERY_STATS dump (v1 + v2) — the "counters byte-identical across a
+//   1. QUERY_STATS dump (v1 through v4) — the "counters byte-identical across a
 //      session" half of the gate, and the context_full_drops reading R312's
 //      untracked-context policy depends on.
 //   2. A bad-magic escape        -> must be refused (ESCAPE_BAD_HEADER).
@@ -95,6 +95,14 @@ struct helios_escape_query_stats_v3 {
     UINT out_async_ctrl_resp_errors, out_cpu_host_unmap_count;
     UINT out_dma_alloc_fails, out_mmio_map_fails, out_mmio_cache_full;
     UINT out_query_scanout_retries;
+};
+/* v4 extension: registered async-present stream evidence. */
+struct helios_escape_query_stats_v4 {
+    struct helios_escape_query_stats_v3 v3;
+    UINT out_present_streams_live, out_present_streams_cap;
+    UINT out_present_streams_high_water, out_present_stream_registers;
+    UINT out_present_stream_tags, out_present_stream_markers;
+    UINT out_present_stream_retires, out_present_stream_rejects;
 };
 
 /* HeliosEscapeQueryScanout */
@@ -192,10 +200,10 @@ static int open_helios(UINT* out_ctx_a) {
 }
 
 static int dump_stats(const char* label, struct helios_escape_query_stats* out) {
-    struct helios_escape_query_stats_v3 v3;
-    memset(&v3, 0, sizeof(v3));
-    hdr_init(&v3.v2.v1.hdr, HELIOS_ESCAPE_QUERY_STATS, sizeof(v3));
-    NTSTATUS st3 = escape_on(g_device_a, &v3, sizeof(v3));
+    struct helios_escape_query_stats_v4 v4;
+    memset(&v4, 0, sizeof(v4));
+    hdr_init(&v4.v3.v2.v1.hdr, HELIOS_ESCAPE_QUERY_STATS, sizeof(v4));
+    NTSTATUS st4 = escape_on(g_device_a, &v4, sizeof(v4));
     struct helios_escape_query_stats qs;
     memset(&qs, 0, sizeof(qs));
     hdr_init(&qs.hdr, HELIOS_ESCAPE_QUERY_STATS, sizeof(qs));
@@ -204,18 +212,29 @@ static int dump_stats(const char* label, struct helios_escape_query_stats* out) 
         printf("[%s] QUERY_STATS st=0x%08x\n", label, (unsigned)st);
         return 1;
     }
-    if (st3 == 0) {
+    if (st4 == 0 && v4.out_present_streams_cap != 0) {
         printf("[%s] V3 escape_refusals: bad_header=%u unknown_verb=%u short_buffer=%u "
                "device_gone=%u no_device=%u foreign_ctx=%u | ctrl_resp_errors=%u "
                "ddi_unmaps=%u | hal: dma_fails=%u mmio_fails=%u cache_full=%u | "
                "qs_retries=%u\n",
-               label, v3.out_escape_bad_header, v3.out_escape_unknown_verb,
-               v3.out_escape_short_buffer, v3.out_escape_device_gone, v3.out_escape_no_device,
-               v3.out_escape_foreign_ctx, v3.out_async_ctrl_resp_errors,
-               v3.out_cpu_host_unmap_count, v3.out_dma_alloc_fails, v3.out_mmio_map_fails,
-               v3.out_mmio_cache_full, v3.out_query_scanout_retries);
+               label, v4.v3.out_escape_bad_header, v4.v3.out_escape_unknown_verb,
+               v4.v3.out_escape_short_buffer, v4.v3.out_escape_device_gone,
+               v4.v3.out_escape_no_device, v4.v3.out_escape_foreign_ctx,
+               v4.v3.out_async_ctrl_resp_errors, v4.v3.out_cpu_host_unmap_count,
+               v4.v3.out_dma_alloc_fails, v4.v3.out_mmio_map_fails,
+               v4.v3.out_mmio_cache_full, v4.v3.out_query_scanout_retries);
+        printf("[%s] V4 present_streams: live=%u/%u hw=%u registers=%u tags=%u "
+               "markers=%u retires=%u rejects=%u\n",
+               label, v4.out_present_streams_live, v4.out_present_streams_cap,
+               v4.out_present_streams_high_water, v4.out_present_stream_registers,
+               v4.out_present_stream_tags, v4.out_present_stream_markers,
+               v4.out_present_stream_retires, v4.out_present_stream_rejects);
     } else {
-        printf("[%s] V3 QUERY_STATS st=0x%08x (pre-22.22.180 KMD)\n", label, (unsigned)st3);
+        /* V1-V3 KMDs accept a larger declared query and write only their known
+           prefix, so success alone does not prove V4. A nonzero fixed capacity
+           is the appended-version discriminator. */
+        printf("[%s] V4 QUERY_STATS unavailable: st=0x%08x cap=%u (older KMD)\n",
+               label, (unsigned)st4, v4.out_present_streams_cap);
     }
     printf("[%s] blobs=%u/%u hw=%u rej=%u | resources=%u/%u hw=%u rej=%u | "
            "contexts=%u drops=%u | window=%llu/%llu rangedrops=%u | ctrl_timeouts=%u "

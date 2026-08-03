@@ -73,10 +73,11 @@ use crate::irql::PassiveLevel;
 use core::sync::atomic::Ordering;
 use helios_protocol::{
     resp_is_ok, VirtioGpuCtrlHdr, VirtioGpuCtxCreate, VirtioGpuCtxDestroy, VirtioGpuCtxResource,
-    VirtioGpuRect, VirtioGpuResourceCreateBlob, VirtioGpuResourceFlush, VirtioGpuResourceMapBlob,
-    VirtioGpuResourceUnmapBlob, VirtioGpuResourceUnref, VirtioGpuRespMapInfo,
-    VirtioGpuSetScanoutBlob, VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE, VIRTIO_GPU_CMD_CTX_CREATE,
-    VIRTIO_GPU_CMD_CTX_DESTROY, VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE,
+    VirtioGpuGetCapsetInfo, VirtioGpuRect, VirtioGpuResourceCreateBlob, VirtioGpuResourceFlush,
+    VirtioGpuResourceMapBlob, VirtioGpuResourceUnmapBlob, VirtioGpuResourceUnref,
+    VirtioGpuRespCapsetInfo, VirtioGpuRespMapInfo, VirtioGpuSetScanoutBlob,
+    VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE, VIRTIO_GPU_CMD_CTX_CREATE, VIRTIO_GPU_CMD_CTX_DESTROY,
+    VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE, VIRTIO_GPU_CMD_GET_CAPSET_INFO,
     VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB, VIRTIO_GPU_CMD_RESOURCE_FLUSH,
     VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB, VIRTIO_GPU_CMD_RESOURCE_UNMAP_BLOB,
     VIRTIO_GPU_CMD_RESOURCE_UNREF, VIRTIO_GPU_CMD_SET_SCANOUT_BLOB, VIRTIO_GPU_MAP_CACHE_MASK,
@@ -334,19 +335,29 @@ fn ctrl_roundtrip(
         let token: SyncTicket = loop {
             let res = adapter.with_virtio(move |v| {
                 v.drain_used();
-                let queued = v.enqueue_sync(meta, in0_len, in1_len, resp_len, block.as_ptr());
-                // Under the SAME lock hold as the descriptor publication, and
-                // only when the device has actually taken it: a sequence minted
-                // for a command that never reached the ring would let a bind
-                // that did not happen out-rank one that did — and would publish
-                // a wire resource the host will never be told about.
-                if queued.is_ok() {
-                    if let Some(bind) = bind {
-                        bind.seq_out
-                            .set(adapter.mint_scanout_bind_seq(bind.resource_id));
+                let queued = v.enqueue_sync(
+                    meta,
+                    in0_len,
+                    in1_len,
+                    resp_len,
+                    block.as_ptr(),
+                    bind.map(|bind| bind.resource_id),
+                    |resource_id| adapter.mint_scanout_bind_seq(resource_id),
+                );
+                // The sequence is minted by `enqueue_sync` after its descriptor
+                // was accepted and before it is published to the device.  Keep
+                // the caller's value in lockstep with the in-flight lifecycle
+                // tag, so a late response after waiter abandonment can still
+                // update the host-selection ledger.
+                match queued {
+                    Ok((ticket, seq)) => {
+                        if let (Some(bind), Some(seq)) = (bind, seq) {
+                            bind.seq_out.set(seq);
+                        }
+                        Ok(ticket)
                     }
+                    Err(error) => Err(error),
                 }
-                queued
             });
             match res {
                 Err(_) => return Err(VirtioError::DeviceError), // transport gone
@@ -441,6 +452,35 @@ fn ctrl_roundtrip_ok_seq(
     }
 }
 
+/// Wait until every control descriptor published before this call has reached a
+/// terminal host response, without changing device state.
+///
+/// GET_CAPSET_INFO is a pure query. Its response type is deliberately not
+/// validated here: even an error for capset index 0 proves the command reached
+/// the head of the FIFO, which is the only property lifecycle callers need.
+/// Transport enqueue/wait failure still returns `Err`, because then no ordering
+/// proof exists. The small fixed request/response keep this barrier off the
+/// already-constrained display-init stack.
+#[inline(never)]
+pub fn ctrl_fifo_barrier(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+) -> Result<(), VirtioError> {
+    let mut cmd = VirtioGpuGetCapsetInfo::zeroed();
+    cmd.hdr.type_ = VIRTIO_GPU_CMD_GET_CAPSET_INFO;
+    cmd.capset_index = 0;
+    let mut response = [0u8; size_of::<VirtioGpuRespCapsetInfo>()];
+    ctrl_roundtrip(
+        passive,
+        adapter,
+        bytes_of(&cmd),
+        None,
+        &mut response,
+        SYNC_ROUNDTRIP_TIMEOUT_MS,
+        None,
+    )
+}
+
 // ── Context lifecycle ────────────────────────────────────────────────────────
 
 /// Create a virtio-gpu 3D context bound to `capset_id` (Venus = 4) and return
@@ -498,11 +538,23 @@ pub fn ctx_destroy(
     ctx_id: u32,
 ) -> Result<(), VirtioError> {
     let owned = adapter
-        .with_virtio(|v| v.untrack_owned_context(owner, ctx_id))
+        .with_wddm_notify_lock(|guard| {
+            guard.with_virtio(|order, v| {
+                let owned = v.untrack_owned_context(owner, ctx_id);
+                if let Some(ctx_id) = owned {
+                    let _ = v.purge_present_streams_for_context(order, owner, ctx_id);
+                }
+                owned
+            })
+        })
         .map_err(|_| VirtioError::DeviceError)?;
     let Some(ctx_id) = owned else {
         return Err(VirtioError::NotOwned);
     };
+    // The stream wait was explicitly discharged under the notify lock above.
+    // Wake the normal DPC so a now-ready WDDM head is observed even if no
+    // unrelated virtio completion arrives after CTX_DESTROY's roundtrip.
+    crate::ddi::interrupt::request_wddm_completion_dpc(adapter);
     let mut cmd = VirtioGpuCtxDestroy::zeroed();
     cmd.hdr.type_ = VIRTIO_GPU_CMD_CTX_DESTROY;
     cmd.hdr.ctx_id = ctx_id;
@@ -528,11 +580,19 @@ pub fn destroy_contexts_for_owner(
 ) -> u32 {
     let mut destroyed = 0u32;
     loop {
-        let taken = adapter
-            .with_virtio(|v| v.take_context_for_owner(owner))
-            .unwrap_or(None);
+        let taken = adapter.with_wddm_notify_lock(|guard| {
+            guard
+                .with_virtio(|order, v| {
+                    let taken = v.take_context_for_owner(owner);
+                    if let Some(ctx_id) = taken {
+                        let _ = v.purge_present_streams_for_context(order, owner, ctx_id);
+                    }
+                    taken
+                })
+                .unwrap_or(None)
+        });
         let Some(ctx_id) = taken else {
-            return destroyed;
+            break;
         };
         let mut cmd = VirtioGpuCtxDestroy::zeroed();
         cmd.hdr.type_ = VIRTIO_GPU_CMD_CTX_DESTROY;
@@ -540,6 +600,10 @@ pub fn destroy_contexts_for_owner(
         let _ = ctrl_roundtrip_ok(passive, adapter, bytes_of(&cmd), None);
         destroyed += 1;
     }
+    if destroyed != 0 {
+        crate::ddi::interrupt::request_wddm_completion_dpc(adapter);
+    }
+    destroyed
 }
 
 // ── Resource / blob lifecycle ────────────────────────────────────────────────
@@ -1156,6 +1220,71 @@ pub fn submit_venus_async(
     ring_idx: u32,
     stream: &[u8],
 ) -> Result<u64, VirtioError> {
+    submit_venus_async_inner(passive, adapter, owner, ctx_id, ring_idx, stream, None)
+}
+
+/// Tagged async submit for a registered present stream.  `cookie` and `value`
+/// are validated again in the exact transport-lock critical section that adds
+/// the normal wire-fenced command, so CTX_DESTROY cannot race a successful
+/// enqueue.
+pub fn submit_venus_async_present_stream(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    owner: DeviceOwner,
+    ctx_id: u32,
+    ring_idx: u32,
+    cookie: u64,
+    value: u32,
+    stream: &[u8],
+) -> Result<u64, VirtioError> {
+    let result = submit_venus_async_inner(
+        passive,
+        adapter,
+        Some(owner),
+        ctx_id,
+        ring_idx,
+        stream,
+        Some((owner, cookie, value)),
+    );
+
+    if result.is_err() {
+        // The UMD Present marker is deliberately allowed to reach VidSch before
+        // Mesa has queued this tagged batch.  Once this function returns an
+        // error, however, no tag can ever retire that marker.  Revoke the exact
+        // registration and explicitly discharge its scheduler condition while
+        // retaining the ordinary wire/GPU watermark; otherwise an allocation or
+        // queue failure here can leave DMA_COMPLETED waiting forever for a tag
+        // that was never placed on the transport.
+        let _ = adapter.with_wddm_notify_lock(|guard| {
+            guard.with_virtio(|order, v| {
+                // `submit_venus_async_inner` opportunistically drains used
+                // descriptors before enqueue. If that drain consumed a host
+                // rejection, the stream is already dead and unregister returns
+                // false; still run the ordered discharge here so correctness
+                // never depends on receiving the interrupt that prompted the
+                // opportunistic drain in the first place.
+                let _ = v.unregister_present_stream(order, owner, ctx_id, cookie);
+                let _ = v.discharge_dead_present_stream_waits(order);
+            })
+        });
+        // Rare terminal path: request unconditionally. The stream may have
+        // been invalidated by the drain above even when exact unregister could
+        // no longer find it, and a now-ready WDDM head needs a fresh DPC edge.
+        crate::ddi::interrupt::request_wddm_completion_dpc(adapter);
+    }
+
+    result
+}
+
+fn submit_venus_async_inner(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    owner: Option<DeviceOwner>,
+    ctx_id: u32,
+    ring_idx: u32,
+    stream: &[u8],
+    present_stream: Option<(DeviceOwner, u64, u32)>,
+) -> Result<u64, VirtioError> {
     if stream.is_empty() {
         return Err(VirtioError::DeviceError);
     }
@@ -1193,7 +1322,19 @@ pub fn submit_venus_async(
     loop {
         let res = adapter.with_virtio(move |v| {
             v.drain_used();
-            v.enqueue_async_submit(ctx_id, ring_idx, meta, venus, venus_len)
+            match present_stream {
+                Some((stream_owner, cookie, value)) => v.enqueue_async_submit_present_stream(
+                    stream_owner,
+                    ctx_id,
+                    ring_idx,
+                    cookie,
+                    value,
+                    meta,
+                    venus,
+                    venus_len,
+                ),
+                None => v.enqueue_async_submit(ctx_id, ring_idx, meta, venus, venus_len),
+            }
         });
         match res {
             Err(_) => return Err(VirtioError::DeviceError), // transport gone

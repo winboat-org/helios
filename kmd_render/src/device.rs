@@ -24,6 +24,14 @@ pub struct DeviceContext {
     /// [`DeviceHandleRef`]'s checked traversal — see its docs for the cast this
     /// prevents.
     adapter: *mut AdapterContext,
+    /// Documented WDDM KMD-process token (`DXGKARG_CREATEDEVICE.hKmdProcess`).
+    /// Present markers arrive through the UMD runtime's D3DKMT device rather
+    /// than the ICD device that registered a stream, so this exact per-process
+    /// object association — never a PID or current-thread inference — is the
+    /// authorization edge between the two devices.  Zero means that async
+    /// stream registration/marker use is refused while ordinary rendering stays
+    /// available.
+    creator_process: usize,
 }
 
 /// State for one scheduler context opened on a D3D device.
@@ -70,6 +78,15 @@ pub struct ContextContext {
     /// could alias an invalid offset onto a valid-looking one).
     snap_plane_offset: AtomicU64,
     snap_alloc_size: AtomicU64,
+    /// Registered-stream marker STASH. Exactly like the snapshot handoff, the
+    /// Render→Present pair is the only documented route from UMD command bytes
+    /// into the KMD-private DMA record consumed by SubmitCommand. The three
+    /// fields are one lock-protected value: publishing/claiming them as separate
+    /// atomics lets a later Render overwrite ctx/value after Present claims the
+    /// prior cookie, cross-pairing two frames. The fixed Option neither allocates
+    /// nor blocks below DISPATCH; `SpinLock` raises/restores IRQL around the
+    /// handful of scalar accesses.
+    present_stream_marker: crate::sync::SpinLock<Option<(u32, u32, u64)>>,
 }
 
 /// Typed borrowed view of a scheduler context handle.
@@ -93,6 +110,13 @@ impl<'a> ContextHandleRef<'a> {
     pub fn adapter(&self) -> Option<&'a AdapterContext> {
         let device = unsafe { self.context.device.as_ref() }?;
         unsafe { device.adapter.as_ref() }
+    }
+
+    /// The exact documented KMD-process object token that created this
+    /// context's device.
+    pub fn creator_process(&self) -> Option<usize> {
+        let device = unsafe { self.context.device.as_ref() }?;
+        Some(device.creator_process)
     }
 
     /// Stash a VALIDATED-shape D4b snapshot descriptor from `DxgkDdiRender`'s
@@ -135,6 +159,23 @@ impl<'a> ContextHandleRef<'a> {
             plane_offset: ctx.snap_plane_offset.load(Ordering::Relaxed),
             venus_alloc_size: ctx.snap_alloc_size.load(Ordering::Relaxed),
         })
+    }
+
+    /// Stash one complete nonzero stream marker for the immediately following
+    /// Present on this context.  The KMD validates registry/process ownership
+    /// while consuming it; this handoff only preserves the exact UMD boundary
+    /// until the WDDM private-data buffer exists.
+    pub fn stash_present_stream_marker(&self, ctx_id: u32, value: u32, cookie: u64) {
+        if ctx_id == 0 || value == 0 || cookie == 0 {
+            return;
+        }
+        *self.context.present_stream_marker.lock() = Some((ctx_id, value, cookie));
+    }
+
+    /// Take and clear the stream marker stash, bounding an orphaned Render to
+    /// one following Present just like the snapshot descriptor.
+    pub fn take_present_stream_marker_stash(&self) -> Option<(u32, u32, u64)> {
+        self.context.present_stream_marker.lock().take()
     }
 }
 
@@ -180,6 +221,11 @@ impl<'a> DeviceHandleRef<'a> {
     pub fn adapter_ptr(&self) -> *mut AdapterContext {
         self.device.adapter
     }
+
+    /// The exact documented KMD-process object token that created this device.
+    pub fn creator_process(&self) -> usize {
+        self.device.creator_process
+    }
 }
 
 /// State for one GPU process object (WDDM 2.0 GPU-VA requirement). We keep no
@@ -211,6 +257,7 @@ pub unsafe extern "C" fn dxgkddi_create_device(
     let args = unsafe { &mut *create_device };
     let ctx = Box::new(DeviceContext {
         adapter: miniport_device_context as *mut AdapterContext,
+        creator_process: args.hKmdProcess as usize,
     });
     // Hand the device handle back to Dxgkrnl; reclaimed in destroy_device.
     args.hDevice = Box::into_raw(ctx) as *mut c_void;
@@ -296,10 +343,20 @@ pub unsafe extern "C" fn dxgkddi_destroy_device(h_device: *mut c_void) -> NTSTAT
         // land nowhere). Its read-ledger page mapping needs nothing here: it
         // rides the MappingTable and was unmapped by the drain above.
         adapter.read_ledger.reclaim_events_for_owner(owner);
-        let before = adapter.with_virtio(|v| v.blob_count() as u32).unwrap_or(0);
         // Sweep exactly this device's slots. A null hDevice would sweep the
         // KMD-owned ones, so the token is minted rather than cast.
         let device_owner = crate::virtio::gpu::DeviceOwner::new(owner);
+        // Present-stream slots borrow this DeviceContext's KMD-process token,
+        // so purge them before the device handle can disappear.
+        let purged_streams = adapter.with_wddm_notify_lock(|guard| {
+            guard
+                .with_virtio(|order, v| v.purge_present_streams_for_owner(order, device_owner))
+                .unwrap_or(0)
+        });
+        if purged_streams != 0 {
+            crate::ddi::interrupt::request_wddm_completion_dpc(adapter);
+        }
+        let before = adapter.with_virtio(|v| v.blob_count() as u32).unwrap_or(0);
         let blobs = crate::virtio::ctrl::release_blobs_for_owner(passive, adapter, device_owner);
         let contexts =
             crate::virtio::ctrl::destroy_contexts_for_owner(passive, adapter, device_owner);
@@ -341,6 +398,7 @@ pub unsafe extern "C" fn dxgkddi_create_context(
         snap_dxgi_format: AtomicU32::new(0),
         snap_plane_offset: AtomicU64::new(0),
         snap_alloc_size: AtomicU64::new(0),
+        present_stream_marker: crate::sync::SpinLock::new(None),
     });
     args.hContext = Box::into_raw(ctx) as HANDLE;
 
@@ -353,8 +411,8 @@ pub unsafe extern "C" fn dxgkddi_create_context(
     args.ContextInfo.DmaBufferSegmentSet = 1; // segment id 1 (aperture)
     args.ContextInfo.DmaBufferSize = 256 * 1024;
     // ONE definition site: present_packet.rs, beside the two records that live
-    // in the buffer and the compile-time proof they fit it (40 -> 72 with the
-    // D4b snapshot descriptor in `PresentFlipPrivate`).
+    // in the buffer and the compile-time proof they fit it (40 -> 80 with the
+    // D4b snapshot descriptor plus the stream-boundary scheduler handoff).
     args.ContextInfo.DmaBufferPrivateDataSize =
         crate::ddi::present_packet::PRESENT_DMA_PRIVATE_DATA_BYTES;
     args.ContextInfo.AllocationListSize = DXGK_ALLOCATION_LIST_SIZE_GDICONTEXT;

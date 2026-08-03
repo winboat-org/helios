@@ -318,6 +318,13 @@ pub struct HeliosPresentPrivateData {
     /// pre-snapshot writers leave it absent and readers must not consult it
     /// without the flag + a 48-byte length check.
     pub venus_alloc_size: u64,
+    /// Optional registered present-stream marker.  Readers must only inspect
+    /// this appended tail when their input covers the complete 64-byte form;
+    /// the v1 prefix through `venus_alloc_size` remains the compatibility and
+    /// snapshot-coverage boundary.
+    pub present_ctx_id: u32,
+    pub present_value: u32,
+    pub present_cookie: u64,
 }
 
 impl HeliosPresentPrivateData {
@@ -368,6 +375,12 @@ pub struct HeliosPresentRefreshCmd {
     pub source_index: u32,
     /// RESERVED-ZERO on the UMD path. See [`Self::source_index`].
     pub destination_index: u32,
+    /// Optional registered present-stream marker.  A complete nonzero tail
+    /// selects a stream boundary; an absent, partial, or invalid tail follows
+    /// the legacy current-wire watermark path.
+    pub present_ctx_id: u32,
+    pub present_value: u32,
+    pub present_cookie: u64,
 }
 
 impl HeliosPresentRefreshCmd {
@@ -383,10 +396,12 @@ const _: () = {
     assert!(core::mem::size_of::<HeliosWddmAllocMeta>() == 48);
     // 40 -> 48 with the appended `venus_alloc_size` (D4b snapshot); the
     // 40-byte prefix layout is unchanged — pre-snapshot readers keep working.
-    assert!(core::mem::size_of::<HeliosPresentPrivateData>() == 48);
+    assert!(core::mem::size_of::<HeliosPresentPrivateData>() == 64);
     assert!(core::mem::offset_of!(HeliosPresentPrivateData, venus_alloc_size) == 40);
-    assert!(core::mem::size_of::<HeliosPresentRenderCmd>() == 56);
-    assert!(core::mem::size_of::<HeliosPresentRefreshCmd>() == 16);
+    assert!(core::mem::offset_of!(HeliosPresentPrivateData, present_ctx_id) == 48);
+    assert!(core::mem::size_of::<HeliosPresentRenderCmd>() == 72);
+    assert!(core::mem::size_of::<HeliosPresentRefreshCmd>() == 32);
+    assert!(core::mem::offset_of!(HeliosPresentRefreshCmd, present_ctx_id) == 16);
     // The identity record must fit exactly over the HeliosWddmAllocPrivate
     // region so the meta trailer's offset is unchanged for openers.
     assert!(

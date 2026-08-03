@@ -33,6 +33,19 @@ struct HeliosDxvkDevice {
   std::size_t d3d11_device_ptr() const;
   std::size_t d3d11_context_ptr() const;
   std::uint32_t venus_context_id() const;
+  // BUILD_2 recycle handoff. The deferred-context address is borrowed; the
+  // command-list address transfers its one owned IC hCL reference on true.
+  // The bridge gives it only to that exact deferred context's bounded cache;
+  // the list's origin check rejects a cross-DC handoff, and false means the
+  // caller still owns and releases the command-list reference.
+  bool recycle_deferred_command_list(
+      std::size_t deferred_context_ptr,
+      std::size_t command_list_ptr) const noexcept;
+  // Marks a freshly-created, UMD-private deferred context as eligible for
+  // DXVK's DDI-only logical Finish(FALSE) reset. The borrowed pointer must
+  // originate from this device's CreateDeferredContext call.
+  bool enable_deferred_context_ddi_logical_reset(
+      std::size_t deferred_context_ptr) const noexcept;
   bool set_resource_kmt_handles(
       std::size_t d3d11_resource_ptr,
       std::uint32_t local,
@@ -123,10 +136,14 @@ struct HeliosDxvkDevice {
   // surface waits on the GPU instead of us blocking the CPU here. Call once per
   // present, BEFORE the gate, with the presented source resource.
   //
-  // Returns false when the present could not be published, which means any
-  // consumer read of that surface is unordered; every such path is counted and
-  // logged rather than silently degrading.
-  bool publish_present_order(std::size_t d3d11_resource_ptr) const;
+  // Returns the existing slot-publication success.  On success it also writes
+  // the registered stream correlation when it is representable; all three
+  // outputs remain zero when the private ICD export/KMD stream is unavailable
+  // or the full timeline value exceeds u32, so the Rust side retains its gate.
+  bool publish_present_order(std::size_t d3d11_resource_ptr,
+                             std::uint32_t* out_ctx_id,
+                             std::uint32_t* out_value32,
+                             std::uint64_t* out_cookie) const;
 
   // D4a scanout acquire: hand the per-device KMD read-retirement event to the
   // DXVK device's signaler thread (DxvkHeliosScanoutAcquire). `event_handle`

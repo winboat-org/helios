@@ -33,4 +33,11 @@ bool venus_memory_alloc_info_from_handle(VkDeviceMemory memory,
                                         std::uint64_t* alloc_size,
                                         std::uint32_t* memory_type_index);
 
+/* Register the exact UMD-created OPAQUE_WIN32 timeline with this Vulkan device
+ * as a monotonic present stream.  Resolved by private ICD DLL export so an old
+ * ICD returns false without any loader/proc-table assumption. */
+bool venus_register_present_stream(VkDevice device,
+                                  VkSemaphore semaphore,
+                                  std::uint64_t* out_cookie);
+
 }  // namespace helios_bridge

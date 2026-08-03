@@ -69,14 +69,20 @@ pub(crate) unsafe fn collect_slots<H, T>(
     out
 }
 
-/// Architectural cap for the per-stage binding arrays this file forwards
-/// (SRVs: 128; samplers and constant buffers: at most 16). One size for all
-/// three keeps the collector monomorphic; 128 stack words cost nothing.
-pub(crate) const MAX_BIND_SLOTS: usize = 128;
+/// Architectural caps for the per-stage binding arrays this file forwards.
+///
+/// SRVs may address all 128 D3D11 slots. Samplers and constant buffers are
+/// limited to 16 slots in this driver's in-tree DDI contract. Keeping those
+/// latter collectors at their contract cap avoids zeroing 112 unreachable
+/// pointer words on every bind, while retaining a bounded, null-filled array
+/// if a broken runtime/DDI caller exceeds the cap.
+pub(crate) const MAX_SRV_BIND_SLOTS: usize = 128;
+pub(crate) const MAX_SAMPLER_BIND_SLOTS: usize = 16;
+pub(crate) const MAX_CONSTANT_BUFFER_BIND_SLOTS: usize = 16;
 
-/// Binding-array arms that arrived with `num` beyond [`MAX_BIND_SLOTS`] and
-/// were clamped. The runtime validates the API-level slot limits, so a
-/// nonzero value means a runtime/DDI contract bug, not app input. Expected 0.
+/// Binding-array arms that arrived with `num` beyond their collector's cap and
+/// were clamped. The runtime validates the API-level slot limits, so a nonzero
+/// value means a runtime/DDI contract bug, not app input. Expected 0.
 pub(crate) static BIND_SLOTS_CLAMPED: AtomicUsize = AtomicUsize::new(0);
 
 /// A binding array collected as raw COM words on the stack.
@@ -89,12 +95,12 @@ pub(crate) static BIND_SLOTS_CLAMPED: AtomicUsize = AtomicUsize::new(0);
 /// is taken anywhere: the runtime holds each handle's reference across the
 /// DDI call by contract, and the handle slot's stored reference lives until
 /// the matching Destroy* DDI.
-pub(crate) struct RawBinds {
-    slots: [*mut c_void; MAX_BIND_SLOTS],
+pub(crate) struct RawBinds<const N: usize> {
+    slots: [*mut c_void; N],
     len: usize,
 }
 
-impl RawBinds {
+impl<const N: usize> RawBinds<N> {
     /// View the collected words as the slice type the windows-crate context
     /// methods take, WITHOUT constructing owned wrappers.
     ///
@@ -115,21 +121,33 @@ impl RawBinds {
     pub(crate) unsafe fn as_com_ptr<T: Interface>(&self) -> *const Option<T> {
         self.slots.as_ptr().cast::<Option<T>>()
     }
+
+    /// The number of collected slots, after the collector's contract cap.
+    ///
+    /// This must accompany [`RawBinds::as_com_ptr`] callers because that API
+    /// shape receives its element count separately from the pointer.
+    pub(crate) fn len(&self) -> u32 {
+        self.len as u32
+    }
 }
 
 /// Decode `num` slots of a runtime handle array into raw COM words. A null
 /// array yields `num` null slots — the same one policy as [`collect_slots`]:
 /// "no bindings", never "read `num` uninitialised pointers". `num` beyond the
-/// architectural cap is clamped loudly ([`BIND_SLOTS_CLAMPED`] + one
+/// collector's architectural cap is clamped loudly ([`BIND_SLOTS_CLAMPED`] + one
 /// `log_error!`), never indexed out of bounds.
-unsafe fn collect_raw<H>(h: *const H, num: u32, word_of: impl Fn(&H) -> usize) -> RawBinds {
+unsafe fn collect_raw<const N: usize, H>(
+    h: *const H,
+    num: u32,
+    word_of: impl Fn(&H) -> usize,
+) -> RawBinds<N> {
     let mut out = RawBinds {
-        slots: [core::ptr::null_mut(); MAX_BIND_SLOTS],
+        slots: [core::ptr::null_mut(); N],
         len: 0,
     };
-    let len = (num as usize).min(MAX_BIND_SLOTS);
-    if num as usize > MAX_BIND_SLOTS && BIND_SLOTS_CLAMPED.fetch_add(1, Ordering::Relaxed) == 0 {
-        log_error!("DDI bind array clamped: num={num} max={MAX_BIND_SLOTS}");
+    let len = (num as usize).min(N);
+    if num as usize > N && BIND_SLOTS_CLAMPED.fetch_add(1, Ordering::Relaxed) == 0 {
+        log_error!("DDI bind array clamped: num={num} max={N}");
     }
     if let Some(slice) = DdiSlice::new(h, len as u32) {
         for index in 0..len {
@@ -146,7 +164,7 @@ pub(crate) unsafe fn collect_buffers(
     start: u32,
     num: u32,
     h: *const ddi::D3D10DDI_HRESOURCE,
-) -> RawBinds {
+) -> RawBinds<MAX_CONSTANT_BUFFER_BIND_SLOTS> {
     let _ = start;
     // `buffer_raw` is the ID3D11Buffer interface pointer pre-cast at
     // `store_resource`; 0 (= a null bind) for a non-buffer resource, which is
@@ -158,7 +176,7 @@ pub(crate) unsafe fn collect_buffers(
 pub(crate) unsafe fn collect_srvs(
     num: u32,
     h: *const ddi::D3D10DDI_HSHADERRESOURCEVIEW,
-) -> RawBinds {
+) -> RawBinds<MAX_SRV_BIND_SLOTS> {
     collect_raw(h, num, |handle| handle_com_raw_at(handle.pDrvPrivate))
 }
 
@@ -191,7 +209,10 @@ pub(crate) unsafe fn srv_bind_summary(
     }
     (nonnull, missing, first_raw, first_priv)
 }
-pub(crate) unsafe fn collect_samplers(num: u32, h: *const ddi::D3D10DDI_HSAMPLER) -> RawBinds {
+pub(crate) unsafe fn collect_samplers(
+    num: u32,
+    h: *const ddi::D3D10DDI_HSAMPLER,
+) -> RawBinds<MAX_SAMPLER_BIND_SLOTS> {
     collect_raw(h, num, |handle| handle_com_raw_at(handle.pDrvPrivate))
 }
 
@@ -270,7 +291,8 @@ pub(crate) unsafe fn set_constant_buffers1_common(
         return;
     };
     let buffers = collect_buffers(start, num, bufs);
-    let buffers_ptr = if num == 0 {
+    let buffer_count = buffers.len();
+    let buffers_ptr = if buffer_count == 0 {
         None
     } else {
         Some(buffers.as_com_ptr::<ID3D11Buffer>())
@@ -304,12 +326,24 @@ pub(crate) unsafe fn set_constant_buffers1_common(
     // Exhaustive: adding a stage to the enum is a compile error here, not a
     // silent no-op bind.
     match stage {
-        ShaderStage::Vs => c.VSSetConstantBuffers1(start, num, buffers_ptr, first_ptr, count_ptr),
-        ShaderStage::Ps => c.PSSetConstantBuffers1(start, num, buffers_ptr, first_ptr, count_ptr),
-        ShaderStage::Gs => c.GSSetConstantBuffers1(start, num, buffers_ptr, first_ptr, count_ptr),
-        ShaderStage::Hs => c.HSSetConstantBuffers1(start, num, buffers_ptr, first_ptr, count_ptr),
-        ShaderStage::Ds => c.DSSetConstantBuffers1(start, num, buffers_ptr, first_ptr, count_ptr),
-        ShaderStage::Cs => c.CSSetConstantBuffers1(start, num, buffers_ptr, first_ptr, count_ptr),
+        ShaderStage::Vs => {
+            c.VSSetConstantBuffers1(start, buffer_count, buffers_ptr, first_ptr, count_ptr)
+        }
+        ShaderStage::Ps => {
+            c.PSSetConstantBuffers1(start, buffer_count, buffers_ptr, first_ptr, count_ptr)
+        }
+        ShaderStage::Gs => {
+            c.GSSetConstantBuffers1(start, buffer_count, buffers_ptr, first_ptr, count_ptr)
+        }
+        ShaderStage::Hs => {
+            c.HSSetConstantBuffers1(start, buffer_count, buffers_ptr, first_ptr, count_ptr)
+        }
+        ShaderStage::Ds => {
+            c.DSSetConstantBuffers1(start, buffer_count, buffers_ptr, first_ptr, count_ptr)
+        }
+        ShaderStage::Cs => {
+            c.CSSetConstantBuffers1(start, buffer_count, buffers_ptr, first_ptr, count_ptr)
+        }
     }
 }
 

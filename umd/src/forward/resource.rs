@@ -582,6 +582,12 @@ pub(crate) unsafe fn finish_wddm_tex2d(
             // substitution sets on its OWNED LOCAL copy; a non-snapshot mint
             // carries 0 by the wire contract (protocol/src/wddm.rs).
             venus_alloc_size: 0,
+            // The direct-primary creation path has no relationship to the
+            // registered present signal. The per-present eligible path alone
+            // fills this appended stream-correlation tail.
+            present_ctx_id: 0,
+            present_value: 0,
+            present_cookie: 0,
         },
         _ => empty_present_private(),
     };

@@ -32,7 +32,13 @@ bytemuck = { version = "1", default-features = false, features = ["derive"] }
 # Maintained no_std virtio transport. We implement its Hal + ConfigurationAccess
 # over WDK primitives (see virtio/hal.rs, virtio/config.rs) and drive a raw
 # VirtQueue with helios_protocol commands, skipping its built-in 2D GPU driver.
-virtio-drivers = "0.13"
+# The KMD uses only direct descriptor chains (`VirtQueue::new(..., false,
+# false)`). Disabling the crate's default `alloc`/`embedded-io` features removes
+# its unused 64-entry indirect-descriptor pointer table from every control-queue
+# value and constructor return slot. Besides shrinking the hot queue object,
+# this is a kernel boot-stack requirement: StartDevice nests `VirtioGpu::init`
+# and `VirtQueue::new`, so each unused inline table is paid again on that path.
+virtio-drivers = { version = "0.13", default-features = false }
 
 [build-dependencies]
 wdk-build = "0.5"

@@ -116,6 +116,9 @@ pub unsafe extern "C" fn dxgkddi_reset_engine(
             out: &mut reset.LastAbortedFenceId,
         },
     );
+    adapter.with_wddm_notify_lock(|guard| {
+        let _ = guard.with_virtio(|order, v| v.purge_all_present_streams_ordered(order));
+    });
     STATUS_SUCCESS
 }
 
