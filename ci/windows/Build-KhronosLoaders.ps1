@@ -38,7 +38,7 @@ Clone-Pinned "https://github.com/KhronosGroup/OpenCL-ICD-Loader.git" $openClLoad
 
 $vkHeadersBuild = Join-Path $BuildRoot "vk-headers"
 $vkHeadersInstall = Join-Path $BuildRoot "vk-headers-install"
-& cmake.exe -S $vkHeadersSource -B $vkHeadersBuild -A x64 -DCMAKE_INSTALL_PREFIX=$vkHeadersInstall -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded -DVULKAN_HEADERS_ENABLE_TESTS=OFF
+& cmake.exe -S $vkHeadersSource -B $vkHeadersBuild -A x64 "-DCMAKE_INSTALL_PREFIX=$vkHeadersInstall" -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded -DVULKAN_HEADERS_ENABLE_TESTS=OFF
 if ($LASTEXITCODE -ne 0) { throw "Vulkan-Headers configure failed." }
 & cmake.exe --install $vkHeadersBuild --config Release
 if ($LASTEXITCODE -ne 0) { throw "Vulkan-Headers install failed." }
@@ -46,9 +46,9 @@ if ($LASTEXITCODE -ne 0) { throw "Vulkan-Headers install failed." }
 $vkLoaderBuild = Join-Path $BuildRoot "vk-loader"
 $vkLoaderInstall = Join-Path $BuildRoot "vk-loader-install"
 & cmake.exe -S $vkLoaderSource -B $vkLoaderBuild -A x64 `
-    -DCMAKE_INSTALL_PREFIX=$vkLoaderInstall `
+    "-DCMAKE_INSTALL_PREFIX=$vkLoaderInstall" `
     -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded `
-    -DVULKAN_HEADERS_INSTALL_DIR=$vkHeadersInstall `
+    "-DVULKAN_HEADERS_INSTALL_DIR=$vkHeadersInstall" `
     -DBUILD_TESTS=OFF `
     -DBUILD_WERROR=OFF
 if ($LASTEXITCODE -ne 0) { throw "Vulkan-Loader configure failed." }
@@ -60,7 +60,7 @@ if ($LASTEXITCODE -ne 0) { throw "Vulkan-Loader install failed." }
 $openClBuild = Join-Path $BuildRoot "opencl-loader"
 $openClInstall = Join-Path $BuildRoot "opencl-loader-install"
 & cmake.exe -S $openClLoaderSource -B $openClBuild -A x64 `
-    -DCMAKE_INSTALL_PREFIX=$openClInstall `
+    "-DCMAKE_INSTALL_PREFIX=$openClInstall" `
     -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded `
     -DOPENCL_ICD_LOADER_BUILD_SHARED_LIBS=ON `
     -DENABLE_OPENCL_LAYERS=OFF `

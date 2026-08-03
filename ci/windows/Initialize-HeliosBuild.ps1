@@ -30,10 +30,11 @@ function Find-WindowsKitTool([Parameter(Mandatory)][string]$Name) {
     if (-not (Test-Path -LiteralPath $kitsBin -PathType Container)) {
         throw "Windows Kits bin directory was not found at $kitsBin."
     }
-    $tool = Get-ChildItem -LiteralPath $kitsBin -Filter $Name -File -Recurse |
-        Where-Object { $_.FullName -match "\\x64\\" } |
+    $tools = @(Get-ChildItem -LiteralPath $kitsBin -Filter $Name -File -Recurse |
         Sort-Object { [version]($_.Directory.Parent.Name -replace "[^0-9.]", "") } -Descending |
-        Select-Object -First 1
+        Where-Object { $_.Directory.Name -in @("x64", "x86") })
+    $tool = $tools | Where-Object { $_.Directory.Name -eq "x64" } | Select-Object -First 1
+    if (-not $tool) { $tool = $tools | Select-Object -First 1 }
     if (-not $tool) {
         throw "$Name was not found below $kitsBin. Install the Windows 11 WDK."
     }

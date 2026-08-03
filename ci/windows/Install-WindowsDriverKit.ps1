@@ -2,10 +2,8 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 $kitsBin = Join-Path ${env:ProgramFiles(x86)} "Windows Kits\10\bin"
-$inf2Cat = Get-ChildItem -LiteralPath $kitsBin -Filter "Inf2Cat.exe" -File -Recurse -ErrorAction SilentlyContinue |
-    Where-Object { $_.FullName -match "\\x64\\" } | Select-Object -First 1
-$stampInf = Get-ChildItem -LiteralPath $kitsBin -Filter "stampinf.exe" -File -Recurse -ErrorAction SilentlyContinue |
-    Where-Object { $_.FullName -match "\\x64\\" } | Select-Object -First 1
+$inf2Cat = Get-ChildItem -LiteralPath $kitsBin -Filter "Inf2Cat.exe" -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+$stampInf = Get-ChildItem -LiteralPath $kitsBin -Filter "stampinf.exe" -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
 if ($inf2Cat -and $stampInf) {
     Write-Host "Windows Driver Kit already available: $($inf2Cat.Directory.Parent.Name)"
     return
@@ -22,6 +20,5 @@ foreach ($package in @("Microsoft.WindowsSDK.10.0.26100", "Microsoft.WindowsWDK.
     if ($LASTEXITCODE -ne 0) { throw "winget failed to install $package (exit $LASTEXITCODE)." }
 }
 
-$inf2Cat = Get-ChildItem -LiteralPath $kitsBin -Filter "Inf2Cat.exe" -File -Recurse -ErrorAction SilentlyContinue |
-    Where-Object { $_.FullName -match "\\x64\\" } | Select-Object -First 1
+$inf2Cat = Get-ChildItem -LiteralPath $kitsBin -Filter "Inf2Cat.exe" -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
 if (-not $inf2Cat) { throw "WDK installation completed, but Inf2Cat.exe is still missing." }

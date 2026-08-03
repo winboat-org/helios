@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Every path below is already a Windows path. Without this, MSYS2's argument
+# converter rewrites the embedded `-includeD:/...` compiler argument into the
+# invalid `-includeD:A:/...` form before Meson sees it.
+export MSYS2_ARG_CONV_EXCL='*'
+
 repo_root="$(cygpath -m "${1:?usage: build-mesa.sh REPO_ROOT OUTPUT_DIR [BUILD_DIR]}")"
 output_dir="$(cygpath -m "${2:?usage: build-mesa.sh REPO_ROOT OUTPUT_DIR [BUILD_DIR]}")"
 build_dir="$(cygpath -m "${3:-C:/helios-mesa-build}")"
