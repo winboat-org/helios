@@ -20,9 +20,10 @@ use bytemuck::{bytes_of, pod_read_unaligned, Zeroable};
 use helios_protocol::{
     HeliosWddmAllocMeta, HeliosWddmAllocPrivate, HeliosWddmOpenIdentity,
     HELIOS_WDDM_ALLOC_KIND_DEVICE_MEMORY, HELIOS_WDDM_ALLOC_KIND_STANDARD,
-    HELIOS_WDDM_ALLOC_MISC_DIRECT_SCANOUT, HELIOS_WDDM_ALLOC_MISC_GDI_TYPE_MASK,
-    HELIOS_WDDM_ALLOC_MISC_GDI_TYPE_SHIFT, HELIOS_WDDM_ALLOC_MISC_OPTIMAL_GDI_TEXTURE,
-    HELIOS_WDDM_ALLOC_MISC_PRIMARY, HELIOS_WDDM_ALLOC_MISC_RESOURCE_ASSOCIATED,
+    HELIOS_WDDM_ALLOC_KIND_TRACKING, HELIOS_WDDM_ALLOC_MISC_DIRECT_SCANOUT,
+    HELIOS_WDDM_ALLOC_MISC_GDI_TYPE_MASK, HELIOS_WDDM_ALLOC_MISC_GDI_TYPE_SHIFT,
+    HELIOS_WDDM_ALLOC_MISC_OPTIMAL_GDI_TEXTURE, HELIOS_WDDM_ALLOC_MISC_PRIMARY,
+    HELIOS_WDDM_ALLOC_MISC_RESOURCE_ASSOCIATED,
     HELIOS_WDDM_ALLOC_MISC_STANDARD_TYPE_MASK, HELIOS_WDDM_ALLOC_MISC_STANDARD_TYPE_SHIFT,
     VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE, VIRTIO_GPU_BLOB_MEM_HOST3D, VIRTIO_GPU_MAP_CACHE_CACHED,
     VIRTIO_GPU_MAP_CACHE_WC,
@@ -1972,6 +1973,35 @@ fn build_backing(
     };
 
     match backing {
+        Backing::VidMmTracking { size } => {
+            // VidMm only treats a normal resource-backed WDDM allocation as
+            // local video memory. The real bytes remain owned by Venus, so this
+            // resource is a one-page identity object; `blob_size` below remains
+            // the full Venus allocation size that VidMm must charge.
+            let tracking_resource_size = PAGE as u64;
+            let resource_id = crate::virtio::ctrl::resource_create_blob(
+                passive,
+                adapter,
+                ap.ctx_id,
+                VIRTIO_GPU_BLOB_MEM_HOST3D,
+                VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE,
+                0,
+                tracking_resource_size,
+            )
+            .map_err(|_| STATUS_NO_MEMORY)?;
+            let _ = adapter.with_virtio(|v| v.note_blob_size(resource_id, tracking_resource_size));
+            Ok(CreatedBacking {
+                resource_id,
+                venus_memory_id: 0,
+                venus_image_id: 0,
+                pitch: 0,
+                plane_offset: 0,
+                dxgi_format: 0,
+                venus_alloc_size: size,
+                memory_type_index: meta.memory_type_index,
+                blob_size: BackingSize::CreatorClaimed(size),
+            })
+        }
         Backing::AdoptedUmdResource {
             resource_id,
             take_ownership,
@@ -2212,6 +2242,19 @@ unsafe fn create_one(
     crate::diag::record(0x0C32_0000 | (ap.ctx_id & 0xFFFF));
     if !ap.is_valid() {
         crate::diag::record(0x0C01_0003);
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    if ap.kind == HELIOS_WDDM_ALLOC_KIND_TRACKING
+        && (ap.size == 0
+            || ap.size > (SIZE_T::MAX - (PAGE - 1)) as u64
+            || ap.ctx_id == 0
+            || ap.blob_id != 0
+            || ap.adopt_resource_id != 0)
+    {
+        // A tracking allocation is deliberately only a VidMm charge. Reject
+        // contradictory host-resource identity instead of silently ignoring
+        // it, and bound the page-rounding operation below.
+        crate::diag::record(0x0C01_00E3);
         return Err(STATUS_INVALID_PARAMETER);
     }
 

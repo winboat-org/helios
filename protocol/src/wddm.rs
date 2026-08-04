@@ -39,6 +39,11 @@ pub const HELIOS_WDDM_ALLOC_KIND_DEVICE_MEMORY: u32 = 1;
 /// shared OPTIMAL image. The geometry the runtime supplied
 /// (width/height/format) is appended after this struct.
 pub const HELIOS_WDDM_ALLOC_KIND_STANDARD: u32 = 2;
+/// [`HeliosWddmAllocPrivate::kind`] — a VidMm-only allocation used to mirror a
+/// guest Venus `VkDeviceMemory` allocation into Windows residency accounting.
+/// Venus remains the owner of the real bytes; the KMD creates only a one-page
+/// identity resource while VidMm charges the full requested size.
+pub const HELIOS_WDDM_ALLOC_KIND_TRACKING: u32 = 3;
 
 /// [`HeliosWddmAllocMeta::misc_flags`] — the standard allocation is the exact
 /// VidPn primary selected for direct scanout.
@@ -435,6 +440,9 @@ pub const D3DDDIFMT_X8R8G8B8: u32 = 22;
 /// emergent property of an if/else chain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AllocationBacking {
+    /// A one-page host identity object used only so VidMm can account the
+    /// matching Venus device-memory allocation in its local segment.
+    VidMmTracking { size: u64 },
     /// A live virtio resource created by the UMD/ICD, adopted by this
     /// allocation. `take_ownership` re-owns the blob slot from the ICD's escape
     /// owner; otherwise the resource is only liveness-validated.
@@ -490,6 +498,9 @@ pub fn classify(
     meta: &HeliosWddmAllocMeta,
     supplied_resource_id: u32,
 ) -> Result<AllocationBacking, ClassifyRefusal> {
+    if ap.kind == HELIOS_WDDM_ALLOC_KIND_TRACKING {
+        return Ok(AllocationBacking::VidMmTracking { size: ap.size });
+    }
     if supplied_resource_id != 0 {
         return Ok(AllocationBacking::AdoptedUmdResource {
             resource_id: supplied_resource_id,
@@ -679,6 +690,16 @@ mod classify_tests {
                 blob_id: 0xBEEF,
                 size: 4096,
             })
+        );
+    }
+
+    #[test]
+    fn tracking_allocations_ignore_supplied_resource_identity() {
+        let mut p = private(HELIOS_WDDM_ALLOC_KIND_TRACKING);
+        p.adopt_resource_id = 42;
+        assert_eq!(
+            classify(&p, &meta(HELIOS_WDDM_ALLOC_MISC_PRIMARY), 42),
+            Ok(AllocationBacking::VidMmTracking { size: 4096 })
         );
     }
 }

@@ -18,7 +18,7 @@ pub(super) const VIDMM_MEMORY_BASE: u64 = 1 << 32;
 const VIDMM_VRAM_MIN_MB: u32 = 256;
 const VIDMM_VRAM_MAX_MB: u32 = 64 * 1024;
 
-fn vidmm_vram_size(knobs: &crate::adapter::AdapterKnobs) -> Option<u64> {
+pub(super) fn vidmm_vram_size(knobs: &crate::adapter::AdapterKnobs) -> Option<u64> {
     let mb = knobs.vidmm_vram_mb;
     if !(VIDMM_VRAM_MIN_MB..=VIDMM_VRAM_MAX_MB).contains(&mb) {
         return None;

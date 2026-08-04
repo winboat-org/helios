@@ -688,6 +688,8 @@ struct SegmentDescriptorSpec {
     supports_cpu_host_aperture: bool,
     supports_cached_cpu_host_aperture: bool,
     populated_from_system_memory: bool,
+    application_target: bool,
+    local_budget_group: bool,
     cpu_access: CpuAccess,
 }
 
@@ -709,6 +711,8 @@ impl SegmentDescriptorSpec {
             supports_cpu_host_aperture: false,
             supports_cached_cpu_host_aperture: false,
             populated_from_system_memory: false,
+            application_target: false,
+            local_budget_group: false,
             cpu_access: CpuAccess::None,
         }
     }
@@ -734,6 +738,8 @@ impl SegmentDescriptorSpec {
             supports_cpu_host_aperture: true,
             supports_cached_cpu_host_aperture: true,
             populated_from_system_memory: false,
+            application_target: false,
+            local_budget_group: false,
             cpu_access: CpuAccess::HostAperture {
                 gpa: base,
                 pages: (len / 4096).min(u32::MAX as u64) as u32,
@@ -754,6 +760,7 @@ impl SegmentDescriptorSpec {
         gpa: u64,
         len: u64,
         cpu_aperture_len: u64,
+        application_target: bool,
     ) -> Self {
         Self {
             base: gpu_base as i64,
@@ -774,6 +781,11 @@ impl SegmentDescriptorSpec {
             // memory. Leaving this clear is what makes Windows count the
             // reported capacity as dedicated video memory.
             populated_from_system_memory: flags & 0x40 != 0,
+            application_target,
+            // ApplicationTarget enrolls the segment in process budgeting;
+            // LocalBudgetGroup classifies its residency as local video
+            // memory. A dedicated Helios heap needs both.
+            local_budget_group: application_target,
             // CpuVisible claims the union first; the host aperture only gets it
             // when CpuVisible did not. This is the one condition the old code
             // spelled out inline, and the reason `CpuAccess` is an enum.
@@ -821,6 +833,12 @@ impl SegmentDescriptorSpec {
                 }
                 if self.populated_from_system_memory {
                     f.set_PopulatedFromSystemMemory(1);
+                }
+                if self.application_target {
+                    f.set_ApplicationTarget(1);
+                }
+                if self.local_budget_group {
+                    f.set_LocalBudgetGroup(1);
                 }
             }
             match self.cpu_access {
@@ -957,6 +975,7 @@ unsafe fn write_bar_knob_descriptor(
         gpa,
         len,
         cpu_aperture_len,
+        super::bar_segment::vidmm_vram_size(knobs).is_some(),
     );
     unsafe { spec.write_into_v4(seg) };
 }
