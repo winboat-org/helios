@@ -48,12 +48,27 @@ param(
         'SCAN-OUT PRIMARY CREATE FAILED',
         # R801 -- an adapter handle that is not the token we handed out.
         'adapter handle not ours',
-        # R812 -- we create no deferred contexts, so this must never be called.
-        'CheckDeferredContextHandleSizes called',
+        # R812 -- the runtime polling deferred-context handle sizes.
+        # 2026-08-05: pattern corrected. The emitter is
+        # umd/src/forward/deferred.rs:193,
+        #   "DDI CheckDeferredContextHandleSizes (x{n}) count_only=<b> caps=<n>"
+        # -- it never contained the word "called", so the old pattern was a
+        # silent pass. NOTE the line is emitted only when the
+        # HKLM\SOFTWARE\Helios!UmdDeferredDiagnostics REG_DWORD is 1 (and only
+        # for the first 8 hits); with the knob absent this check reads clean
+        # whether or not the DDI fired.
+        'DDI CheckDeferredContextHandleSizes',
         # Generic UMD fault vocabulary that should not appear on a healthy
-        # session. `present_frame_gate DxvkError` is the C++ gate's own catch.
-        'present_frame_gate DxvkError',
-        'DEVICE REMOVED'
+        # session. This is the C++ bridge's own catch: bridge_guard formats
+        # "%s: DxvkError" (umd/bridge/dxvk_bridge.cpp:313) with the guard name,
+        # so the text carries a COLON. 2026-08-05: colon added; the old
+        # colon-less pattern could never match.
+        'present_frame_gate: DxvkError'
+        # 2026-08-05: the 'DEVICE REMOVED' pattern was DELETED. Nothing in
+        # umd/, umd/bridge/, kmd_render/ or dxvk-helios/src/ ever logs that
+        # text (the only "DeviceRemoved" hits are D3D11 API method names), so
+        # the check could only ever pass. If a device-loss log line is ever
+        # added, re-add the pattern with the exact emitted string.
     )
 )
 

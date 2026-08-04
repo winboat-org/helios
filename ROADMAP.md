@@ -1,8 +1,76 @@
-# ROADMAP — Stage: Performance, Stability, Conformance (PSC)
+# ROADMAP — Stage: Correctness and D3D12 (since 2026-08-05)
 
 *The desktop first rendered end-to-end on 2026-07-05. The active architecture
 changed on 2026-07-09: Helios is now a WDDM render+display adapter and owns the
 virtio-gpu scanout; IddCx/Looking Glass is no longer the active display path.*
+
+## Stage pivot, 2026-08-05
+
+The **Performance, Stability, Conformance (PSC)** stage is closed as a *stage*;
+its stability contracts remain permanently in force and its performance record
+is kept below as WS2 — read it before opening any new perf work, because it is
+mostly a list of things that have already been tried and measured.
+
+**Why now.** The present-queue stall was root-caused and fixed (WS2, `PresentWmk`,
+KMD 22.22.244.0), and the remaining limit is named rather than suspected: the WDDM
+FIFO head now blocks on `stream_ready` — the frame's own producer completion on
+the host — at `WfBStrm`/`WfBWire` ≈ 15220/161, against a render-thread producer
+floor of ~3.7 ms/frame. There is no further sweep to run; the next perf gain needs
+a new causal hypothesis, not another arm.
+
+**The new order of business:**
+
+1. **D3D11 correctness / conformance** — charter in `CONFORMANCE.md`, plan in WS3.
+2. **D3D12** — charter in `DX12.md`. Today `OpenAdapter12` refuses; the
+   native-DDI vs vkd3d-proton decision is open and the doc lists what would
+   settle it.
+3. **Stability** — WS1, unchanged and non-negotiable.
+4. **Performance** — WS2, PAUSED. Do not reopen without a new hypothesis.
+
+**Also landed with the pivot (2026-08-05), because a stage change is the right
+time to stop shipping something nobody measured:**
+
+- **Sane values are now the defaults.** Three knobs whose code default was OFF
+  had been ON in the test VM's registry since 2026-08-03, so every accepted
+  score was measured on a configuration no fresh install produced. A fresh
+  install got the runtime's *emulated* command-list path — GT1 ≈ 184,
+  Graphics ≈ 43.5k — instead of the measured GT1 221-227 / Graphics 49-52k.
+  Flipped to ON, each with the evidence in the comment at its read site:
+  `HELIOS_DXVK_CL_RETAIN_SAMPLER_REFS` (isolated same-boot A/B, GT1
+  **53.609 → 181.938**), `UmdCommandLists`, `HELIOS_DXVK_CL_INLINE_REPLAY`.
+  `VidMmVramMB` likewise went 0 → 4096, the configuration the VidMm work
+  actually validated, re-confirmed on 22.22.251.0 before the flip.
+  `HELIOS_DXVK_KMT_SHARED` was forced to "1" by the UMD in every process it
+  ever created, so it was not a tunable at all; the engine now defaults it ON
+  and the `_putenv_s` is gone. **Verified**: with `HKLM\SOFTWARE\Helios`
+  completely empty and no service-key overrides, KMD 22.22.252.0 runs GT1
+  **222.857**.
+- **Retired**: the `probe/` and `host/` crates (orphans — no workspace, no CI,
+  no build, cited only by already-archived docs); the write-only
+  `TransportGeneration::page_table_window` the tree itself scheduled for
+  deletion at R510; the duplicate unread `AdapterKnobs::dma_gpu_fence`;
+  `tools/kmd-force-reject-sweep.ps1` (its knob was retired in T6),
+  `tools/attach_idd.ps1` (IddCx-only), and the two completed one-shot DXVK
+  source patchers.
+- **Gates that could only pass are gone or fixed.** `kmd-gate-surface.ps1` and
+  `kmd-counter-snapshot.ps1` were watching four counter/knob names the driver
+  no longer writes; `umd-gate-surface.ps1` had three log patterns that could
+  never match the emitted text. A gate that cannot fail is worse than no gate.
+- **Four silent failure counters were surfaced** as `WdSigF` / `DmaNtfF` /
+  `TxGone` / `RclBadH`. Each was incremented on a real refusal path and loaded
+  by nobody, which is CLAUDE.md's "every refused path gets a named counter"
+  rule being violated invisibly. **All four must read 0 on a healthy session.**
+- **Docs archived**: `ARCH.md`, `OVERVIEW.md`, `KMD.md`, `ICD.md`,
+  `WINDOWED_BLT_DESIGN.md`, `SCANOUT_DRM_MODIFIER_DESIGN.md` → `docs/archive/`.
+  `TRANSPORT.md` deliberately stayed at root: its §1/§2 wire format is still
+  ground truth and six `protocol/` comments cite it by section; its banner now
+  says which sections are live and which are archived.
+- **One real bug fell out of the audit**: `tools/escape_owner_probe.c` defined
+  `HELIOS_ESCAPE_QUERY_SCANOUT` as `0x000B`, which is
+  `HELIOS_ESCAPE_REGISTER_FENCE_EVENT`. The probe had been aiming a
+  query-scanout buffer at the fence-event registrar. Fixed to `0x000D`;
+  every other escape constant in that file was checked against
+  `protocol/src/escape.rs` and is correct.
 
 ## Current verified correction (2026-08-04, KMD 22.22.238.0)
 
@@ -2984,9 +3052,75 @@ Open defects, roughly ordered:
     call — QEMU fence behavior identical either way).
 - **Capture path**: IddCx frame drop policy vs D3D12 copy queue saturation;
   KVMFR bandwidth; 10 bpc default.
-- Candidates list from the NVIDIA fix era lives in ICD.md.
+- Candidates list from the NVIDIA fix era lives in `docs/archive/ICD.md`.
 
-## Workstream 3 — D3D11 Conformance
+## Workstream 3 — D3D11 Conformance  ← **PRIORITY 1 since 2026-08-05**
+
+**The charter is `CONFORMANCE.md`** — what "conformant" means for this stack,
+the refusal/no-op counter surface and how to read it, the ~40 `tools/` probes
+catalogued into a suite, the open gaps, and how to add a test. Everything below
+this line in WS3 is the session-by-session record that produced it; read the
+charter first.
+
+### Open items carried into the new stage
+
+1. **The `DDI refusals:` counters must reach 0 against real workloads.** Two are
+   known to move under 3DMark and each names a real gap:
+   `gs_so_declaration_dropped` and `tess_sig_fallback`. Definition of done is a
+   3DMark standard run plus a desktop session with every counter at 0, read
+   through `tools/umd-gate-surface.ps1`.
+   ⚠ Two corrections found while writing `CONFORMANCE.md`: the line carries
+   **eleven** counters, not the nine this document used to claim (R1010 added
+   `alloc_meta_format_unknown` and `readback_stride_unsafe`) — and **the
+   noop-DDI hit counter, which CLAUDE.md names as the headline WS3 metric, is
+   currently unreadable**: `DEVICE_NOOP_LOG_COUNT` is incremented and loaded by
+   nobody, with no summary line and no gate pattern. Making it readable is
+   backlog item C1 in `CONFORMANCE.md` and is a prerequisite for the rest of
+   this item.
+2. **3DMark Fire Strike reports `103 Display Mode List not found for given
+   format` and `402`** on a failed 2026-07-24 run
+   (`3DMark-Firestrike-FAILED-20260724221433.3dmark-result`). This was sitting
+   in a scratch file at the repo root rather than in the roadmap; it is a real
+   DXGI mode-enumeration conformance datapoint and belongs to this workstream.
+   Not reproduced since — first job is to establish whether it still occurs.
+3. **DXGI format coverage audit** — the format round-trip carrier landed; the
+   coverage matrix does not exist.
+4. **Remaining 11.1 DDI plumbing.** The threading/command-list surface is now
+   real and on by default (see the 2026-08-05 stage-pivot note), which changes
+   what "remaining" means — re-survey before planning.
+5. **FL11 MSAA** — status recorded below as PARTIAL with un-deployed WIP
+   (`ff14979`). Verify whether that is still true before treating it as open.
+6. **`kmd_render` has five `#[test]` functions that can never run**
+   (`present_stream_tests` in `src/virtio/gpu/mod.rs`): the crate is a
+   `panic=abort` no_std cdylib and cannot host a libtest harness, and CI runs no
+   `cargo test` at all. They are assurance that is not real. Move them, and the
+   pure functions they cover, into `kmd_logic`, which exists for exactly this and
+   does run on Linux.
+
+## Workstream 4 — D3D12  ← **PRIORITY 2 since 2026-08-05**
+
+**The charter is `DX12.md`.** Summary of the starting position, so this file is
+not silent on it:
+
+- `umd/src/adapter.rs` exports `OpenAdapter12` and it **refuses** — the D3D12
+  DDI is not implemented.
+- The earlier D3D12 scaffolding (the hand-written `D3d12Ddi*` structs, the eight
+  `d3d12_*` handlers, `D3D12_SUPPORTED_DDI_VERSIONS`) was **deleted by T6/R908**,
+  so this starts from zero rather than from a half-built surface. That is the
+  right base — the deleted code was stub-shaped, and the project's rule is never
+  to stub silently.
+- `vkd3d-proton-helios` is a registered, pinned submodule at `ee737e32` with
+  **zero Helios divergence** — it is an unmodified upstream commit, 44 behind
+  `origin/master`, and no document has ever explained why it was vendored.
+  So there is no sunk fork cost pulling the decision either way. `DX12.md` states the two
+  candidate strategies (native D3D12 DDI vs vkd3d-proton over the existing
+  Vulkan/Venus path) and what evidence would decide between them; the decision
+  is open.
+- Whatever the strategy, D3D12 asks the KMD for things D3D11 never did —
+  multi-engine command queues, residency (`OfferAllocations`/`ReclaimAllocations`),
+  tiled/reserved resources. `DX12.md` inventories which of those
+  `kmd_render/src/ddi/` has today.
+
 
 **30th session (2026-07-07) — 3DMark bring-up: LUID gap FIXED, FL11 ceiling
 root-caused.**
@@ -3194,10 +3328,15 @@ Plan:
   console's scanout kind is DMABUF, so QMP answers `"no surface"`.
   ⚠ Use `--exclusive`; QEMU refuses a SHARED client while an exclusive viewer
   (most viewers) is connected, and drops it silently after ClientInit.
-- **Registry knobs** (service key, active KMD reads): `DiagLevel`,
-  `AllocCached`, `DisplayHalf`, `ScanoutDiag`,
-  `DirectFlipCaps`, `CrossAdaptCaps`, `BarSegMode`, `BarSegFlags`,
-  `BarSegBaseMB`, `PresentWmk`, `FlipQueueN`.
+- **Registry knobs** (service key, active KMD reads) — this list is now the
+  complete set and is checked against `kmd_render/src/diag.rs`'s `pub mod knobs`:
+  `DiagLevel`, `AllocCached`, `DmaGpuFence`, `BindFlushMode`, `DispatchBind`,
+  `PresentProbe`, `DisplayHalf`, `DirectFlipCaps`, `CrossAdaptCaps`,
+  `BarSegFlags`, `BarSegBaseMB`, `BarSegMode`, `VidMmVramMB`, `FlipCapsX`,
+  `FlipQueueN`, `PresentWmk`.
+  It used to list `ScanoutDiag`, which the very next bullet says was RETIRED in
+  T6/R901, and to omit six knobs that do exist. Do not add a knob here without
+  adding it there, or the reverse.
   **`PresentWmk` (default 1 since 22.22.244.0)** gates a WDDM submission that
   carries a live present stream boundary on that boundary alone instead of on
   the whole `next_wire_fence` backlog; `0` restores the historical superset for
@@ -3262,10 +3401,14 @@ Plan:
   AE* (8-slot allocation create/open ring: resid, dimensions, ctx/open marker)
   — all failure counters must stay 0; S-ring breadcrumbs persist across boots
   and high indices go stale after short boots.
-- **Direct-primary producer gate** (`HKLM\SOFTWARE\Helios`, not the service
-  key): `PresentGateUs` is absent by default and the UMD uses 10000 µs. `0` is
-  the ordering A/B disable. The wait is condition-variable-backed; inspect
-  `present-gate:` in the current DWM UMD log for cost and timeouts.
+- **Direct-primary producer gate — DELETED, do not reintroduce.** `PresentGateUs`
+  and `PresentOrder` were removed on 2026-07-29 by owner directive and this
+  inventory entry described them as live for a week afterwards.
+  `umd/src/knobs.rs` carries the reasoning: a producer-side CPU stall hides an
+  ordering defect instead of fixing it, it costs Fire Strike GT1 158 -> 136 fps
+  when it holds, and it publishes the present anyway when it expires. Ordering
+  belongs on the GPU timeline (`ScanoutAcquire` + a consumer-side wait), never
+  on a blocked CPU thread.
 - **UMD `DDI refusals:` counters, T6/R911** — nine names on ONE bounded log
   line, read by `tools/umd-gate-surface.ps1`: `srv_raw_hazard`,
   `resource_raw_hazard`, `text_filter_size_ignored`,

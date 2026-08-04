@@ -29,6 +29,12 @@ typedef LONG NTSTATUS, *PNTSTATUS;
 #endif
 #include <d3dkmthk.h>
 
+/* protocol/src/escape.rs is the AUTHORITY for every opcode below — these are a
+ * hand-kept C mirror of it and must be re-checked against it when it changes.
+ * 2026-08-05: QUERY_SCANOUT was 0x000Bu here, which is REGISTER_FENCE_EVENT in
+ * protocol/src/escape.rs (kmd_render/src/ddi/escape.rs:365 dispatches 0x000B to
+ * escape_register_fence_event). The probe was aiming a query-scanout-shaped
+ * buffer at the fence-event registrar and printing whatever came back. */
 #define HELIOS_ESCAPE_MAGIC 0x48454C53u /* 'HELS' */
 #define HELIOS_ESCAPE_VERSION 1u
 #define HELIOS_ESCAPE_CTX_CREATE 0x0002u
@@ -37,7 +43,7 @@ typedef LONG NTSTATUS, *PNTSTATUS;
 #define HELIOS_ESCAPE_PRESENT_BLOB 0x0007u /* defined in protocol, never dispatched */
 #define HELIOS_ESCAPE_RELEASE_BLOB 0x0008u
 #define HELIOS_ESCAPE_QUERY_STATS 0x000Au
-#define HELIOS_ESCAPE_QUERY_SCANOUT 0x000Bu
+#define HELIOS_ESCAPE_QUERY_SCANOUT 0x000Du
 #define VIRTIO_GPU_CAPSET_VENUS 4u
 
 /* winnt.h defines these as DWORD; we compare against NTSTATUS. */

@@ -110,6 +110,29 @@ pub(crate) fn record_present_handoff_telemetry() {
         PRESENT_MARKER_LAST_FENCE, PRESENT_MARKER_LAST_SIZE, PRESENT_MARKER_WRITES,
     };
 
+    // THE FOUR SILENT FAILURE COUNTERS (2026-08-05). Each of these was
+    // incremented on a real refusal/failure path and then loaded by nobody:
+    // no `.load`, no `CounterEntry`, no `HeliosEscapeQueryStats*` field. Their
+    // own doc comments claim they exist so the failure "shows up as itself",
+    // and CLAUDE.md's rule is that every skipped or refused path gets a named
+    // registry counter — so a write-only counter is the rule being violated
+    // silently. They are mirrored here rather than added to the escape stats
+    // ABI because this site already runs at PASSIVE on the same teardown edge
+    // and needs no version bump. **All four must read 0 on a healthy session.**
+    crate::diag::record_named_bytes(
+        b"WdSigF",
+        crate::virtio::gpu::WDDM_SIGNAL_AFTER_FAILURE.load(Ordering::Relaxed),
+    );
+    crate::diag::record_named_bytes(b"DmaNtfF", DMA_NOTIFY_FAILS.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(
+        b"TxGone",
+        crate::virtio::gpu::TRANSPORT_GONE_AT_WAIT.load(Ordering::Relaxed),
+    );
+    crate::diag::record_named_bytes(
+        b"RclBadH",
+        crate::ddi::create_allocation::RECLAIM_BAD_HANDLE.load(Ordering::Relaxed),
+    );
+
     crate::diag::record_named_bytes(b"PmWr", PRESENT_MARKER_WRITES.load(Ordering::Relaxed));
     crate::diag::record_named_bytes(b"PmWFn", PRESENT_MARKER_LAST_FENCE.load(Ordering::Relaxed));
     crate::diag::record_named_bytes(b"PmWSz", PRESENT_MARKER_LAST_SIZE.load(Ordering::Relaxed));

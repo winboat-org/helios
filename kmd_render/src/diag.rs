@@ -536,7 +536,9 @@ pub mod knobs {
     pub const ALLOC_CACHED: KnobName = KnobName::new(b"AllocCached");
     /// Retire ordinary (non-paging) WDDM DMA fences on host GPU COMPLETION
     /// rather than host DECODE (default 1 = GPU completion). 0 restores the
-    /// historical decode-only behaviour. See `AdapterKnobs::dma_gpu_fence`.
+    /// historical decode-only behaviour. The ONE reader (and the contract this
+    /// restores) is `crate::virtio::gpu::VirtioGpu::dma_gpu_fence`; the unread
+    /// `AdapterKnobs` copy was deleted 2026-08-05.
     pub const DMA_GPU_FENCE: KnobName = KnobName::new(b"DmaGpuFence");
     /// `BindFlushMode` (default 0). Selects when the bind edge tells the host
     /// to READ the freshly bound primary (ROADMAP defect 0ab-B):
@@ -557,8 +559,8 @@ pub mod knobs {
     pub const DISPATCH_BIND: KnobName = KnobName::new(b"DispatchBind");
     /// Per-present probe instrumentation (default 0).
     pub const PRESENT_PROBE: KnobName = KnobName::new(b"PresentProbe");
-    /// T3 gate instrument: force one deferred-programming refusal (default 0).
-    /// Render+display adapter shape (default 0 = render-only recovery).
+    /// Render+display adapter shape (default 1 = the render+display miniport,
+    /// which is the product). 0 restores the boot-era render-only surface.
     pub const DISPLAY_HALF: KnobName = KnobName::new(b"DisplayHalf");
     /// Restore the legacy `SupportDirectFlip` advertisement (default 0 = deny).
     pub const DIRECT_FLIP_CAPS: KnobName = KnobName::new(b"DirectFlipCaps");

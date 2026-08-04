@@ -1,4 +1,0 @@
-Now the firestrike benchmark is not running in 3dmark. refer to https://support.benchmarks.ul.com/support/solutions/
-  articles/44002145411-windows-run-3dmark-benchmarks-from-the-command-line , you can use it to run it yourself, more importantly,
-  you can find `C:\Users\Rupansh\Documents\3DMark\3DMark-Firestrike-FAILED-20260724221433.3dmark-result` for failed run logs. I
-  can see '103 Display Mode List not found for given format' and '402'

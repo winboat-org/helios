@@ -245,8 +245,11 @@ struct WinExecArgs {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 struct WinCargoArgs {
-    /// Crate directory relative to the project root, e.g. "kmd" or "icd".
-    /// The working directory becomes Z:\<crate_dir>.
+    /// Crate directory relative to the project root, e.g. "kmd_render" or
+    /// "umd". The working directory becomes Z:\<crate_dir>. The active Rust
+    /// crates are kmd_render, umd, protocol and kmd_logic — "kmd" is the
+    /// ARCHIVED System-class driver and "icd" is a meson/C project built by
+    /// win_meson, not by cargo.
     crate_dir: String,
     /// Arguments passed to cargo, e.g. ["make","--makefile","Cargo.make.toml"]
     /// or ["build","--release"].
@@ -555,7 +558,7 @@ impl WinHost {
     }
 
     #[tool(
-        description = "Sync the project to the local build mirror and run cargo (or cargo make) there. The Z:\\ share cannot host cargo/wdk build IO (OS error 87), so this robocopy-mirrors Z:\\ -> C:\\Users\\Rupansh\\helios-vgpu (excluding target/, all .git, and the vendored Mesa submodule at icd/mesa — Mesa is a meson/C ICD built separately via win_meson straight from the share, not through this mirror) and builds inside the mirror with LIBCLANG_PATH set for bindgen. Edit sources on the Linux/Z:\\ side — the mirror is re-synced on every call. crate_dir is relative to the project root (e.g. \"kmd\"); args is the cargo argv (e.g. [\"make\",\"--makefile\",\"Cargo.make.toml\"] or [\"build\"])."
+        description = "Sync the project to the local build mirror and run cargo (or cargo make) there. The Z:\\ share cannot host cargo/wdk build IO (OS error 87), so this robocopy-mirrors Z:\\ -> C:\\Users\\Rupansh\\helios-vgpu (excluding target/, all .git, and the vendored Mesa submodule at icd/mesa — Mesa is a meson/C ICD built separately via win_meson straight from the share, not through this mirror) and builds inside the mirror with LIBCLANG_PATH set for bindgen. Edit sources on the Linux/Z:\\ side — the mirror is re-synced on every call. crate_dir is relative to the project root (e.g. \"kmd_render\" or \"umd\"; the active Rust crates are kmd_render, umd, protocol and kmd_logic — \"kmd\" is the ARCHIVED System-class driver and \"icd\" is meson/C, built by win_meson); args is the cargo argv (e.g. [\"make\",\"--makefile\",\"Cargo.make.toml\"] or [\"build\"])."
     )]
     async fn win_cargo(&self, Parameters(a): Parameters<WinCargoArgs>) -> String {
         let mut env = HashMap::new();

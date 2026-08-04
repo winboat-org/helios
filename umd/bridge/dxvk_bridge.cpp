@@ -1681,7 +1681,10 @@ std::unique_ptr<HeliosDxvkDevice> helios_dxvk_create_device(
   std::call_once(s_envOnce, [] {
     // Force selection of the Helios venus device if other ICDs are present.
     _putenv_s("DXVK_FILTER_DEVICE_NAME", "Virtio-GPU Venus");
-    _putenv_s("HELIOS_DXVK_KMT_SHARED", "1");
+    // HELIOS_DXVK_KMT_SHARED is no longer forced here: the engine defaults it
+    // ON (2026-08-05). Forcing it made a knob that could not be off in any
+    // configuration this process ever produced, which hid the fact that the
+    // engine's own default disagreed with every measurement taken.
 
     // Debug instrument (registry-gated, off by default): route DXVK's shader
     // dumping into every UMD-hosting process — session-0 services (dwm) cannot
@@ -1699,7 +1702,7 @@ std::unique_ptr<HeliosDxvkDevice> helios_dxvk_create_device(
     char msg[MAX_PATH + 128];
     std::snprintf(msg, sizeof(msg),
       "dxvk env configured once: DXVK_FILTER_DEVICE_NAME=Virtio-GPU Venus "
-      "HELIOS_DXVK_KMT_SHARED=1 DXVK_SHADER_DUMP_PATH=%s",
+      "kmt-shared=default-on DXVK_SHADER_DUMP_PATH=%s",
       haveDump ? dumpPath : "(unset)");
     umd_log(msg);
   });

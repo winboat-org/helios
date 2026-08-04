@@ -19,30 +19,77 @@
 
 #include <dxgi1_6.h>
 #include <d3d11_4.h>
+#include <tlhelp32.h>
 #include <cstdio>
 #include <cwchar>
 
 static const char* boolstr(bool b) { return b ? "YES" : "no"; }
 
+// Both Helios modules are deployed under CONTENT-HASHED file names — the Mesa
+// Venus ICD installs as `vulkan_virtio-<sha12>.dll` (tools/install-helios-icd.ps1)
+// and the UMD as `helios_umd_<sha16>.dll` (tools/hotplug-helios-umd.ps1) — so a
+// hardcoded GetModuleHandleA name can never resolve one. Match the STABLE PREFIX
+// against the process's real module list instead.
+static HMODULE find_module_by_prefix(const wchar_t* prefix, wchar_t* found, size_t found_cap) {
+    if (found && found_cap) found[0] = L'\0';
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
+    if (snap == INVALID_HANDLE_VALUE) {
+        printf("   [module-scan] CreateToolhelp32Snapshot FAILED gle=%lu -- cannot look up \"%ls*\"\n",
+               GetLastError(), prefix);
+        return nullptr;
+    }
+    MODULEENTRY32W me{};
+    me.dwSize = sizeof(me);
+    HMODULE hit = nullptr;
+    const size_t n = wcslen(prefix);
+    if (Module32FirstW(snap, &me)) {
+        do {
+            if (_wcsnicmp(me.szModule, prefix, n) == 0) {
+                hit = me.hModule;
+                // Manual copy: wcsncpy raises MSVC C4996 under /W4, and the
+                // secure variants are not portable to the WinLibs g++ used for
+                // some of the other probes in this directory.
+                if (found && found_cap) {
+                    size_t i = 0;
+                    for (; i + 1 < found_cap && me.szModule[i] != L'\0'; ++i)
+                        found[i] = me.szModule[i];
+                    found[i] = L'\0';
+                }
+                break;
+            }
+        } while (Module32NextW(snap, &me));
+    }
+    CloseHandle(snap);
+    return hit;
+}
+
 static void print_helios_ctx_export() {
     using Fn = unsigned (__cdecl*)();
-    HMODULE mod = GetModuleHandleA("vulkan_virtio-veh.dll");
-    printf("   helios ctx export: module=%p", (void*)mod);
-    if (mod) {
-        Fn fn = reinterpret_cast<Fn>(GetProcAddress(mod, "helios_venus_current_ctx_id"));
-        printf(" fn=%p", reinterpret_cast<void*>(fn));
-        if (fn)
-            printf(" ctx=%u", fn());
-    }
-    printf("\n");
 
-    const char* umd_names[] = {
-        "helios_umd_live_codex_ctx.dll",
-        "helios_umd_live_141530.dll",
-        "helios_umd.dll",
-    };
-    for (const char* name : umd_names)
-        printf("   UMD module %-30s %p\n", name, (void*)GetModuleHandleA(name));
+    // LOUD on every miss: a NULL handle here silently disables the ctx-id
+    // readout, which is exactly how this probe spent its life printing
+    // module=0000000000000000 and nothing else.
+    wchar_t icd[MAX_MODULE_NAME32 + 1];
+    HMODULE mod = find_module_by_prefix(L"vulkan_virtio", icd, MAX_MODULE_NAME32 + 1);
+    if (!mod) {
+        printf("   helios ctx export: UNAVAILABLE -- no loaded module matches \"vulkan_virtio*\";"
+               " the Venus ICD is not loaded in this process, so the ctx id cannot be read\n");
+    } else {
+        printf("   helios ctx export: module=%ls (%p)", icd, (void*)mod);
+        Fn fn = reinterpret_cast<Fn>(GetProcAddress(mod, "helios_venus_current_ctx_id"));
+        if (!fn)
+            printf(" -- UNAVAILABLE: export \"helios_venus_current_ctx_id\" not found (gle=%lu)\n",
+                   GetLastError());
+        else
+            printf(" ctx=%u\n", fn());
+    }
+
+    wchar_t umd[MAX_MODULE_NAME32 + 1];
+    HMODULE umd_mod = find_module_by_prefix(L"helios_umd", umd, MAX_MODULE_NAME32 + 1);
+    if (umd_mod)
+        printf("   UMD module: %ls (%p)\n", umd, (void*)umd_mod);
+    else
+        printf("   UMD module: NONE LOADED -- no module matches \"helios_umd*\" in this process\n");
 }
 
 int main() {

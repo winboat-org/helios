@@ -6,35 +6,43 @@ You are the **primary author** of this project. The human overseer has OS/driver
 will review your work, but you must drive all implementation decisions, write all code, and flag
 blockers proactively.
 
-**What Helios is (2026-07):** a Windows 11 guest graphics stack for QEMU/KVM on a Linux host.
-A **WDDM 3.2 render+display miniport** (`kmd_render/`, Rust) binds the virtio-gpu PCI device
+**What Helios is (2026-08):** a Windows 11 guest graphics stack for QEMU/KVM on a Linux host.
+A **WDDM render+display miniport** (`kmd_render/`, Rust) binds the virtio-gpu PCI device
 (PCI\VEN_1AF4&DEV_1050) and speaks **Venus** (Vulkan serialization) to the host's virglrenderer
 render server; a **D3D11 UMD** (`umd/`, Rust d3d10umddi frontend bridged via cxx to a forked
 **DXVK** engine at `dxvk-helios/`) gives dwm and apps D3D11 on top of the Mesa Venus ICD
 (`icd/mesa` fork). Helios owns a real VidPn source and sends DWM's shared primary through
 `SET_SCANOUT_BLOB` to the in-tree **`qemu-helios/` fork**, normally displayed by
 `egl-headless` + VNC. IddCx/Looking Glass and the older System-class KMDF + DeviceIoControl
-driver (`kmd/`, hand-written `icd/src`) remain historical/reference paths, not the active display.
+driver (`kmd/`) remain historical/reference paths, not the active display.
 
-## Stage: Performance, Stability, Conformance (PSC) — since 2026-07-05
+⚠ The driver declares `WddmSurface::Wddm2_1GpuMmu`, not 3.2 — see
+`kmd_render/src/ddi/wddm_surface.rs`, which records that 3.2 fails DWM at `E_NOTIMPL`. Older
+docs and comments that say "WDDM 3.2" are describing the intent, not the surface.
 
-The hardware-accelerated desktop milestone is met: DWM composites the whole desktop on Helios →
-Venus → host GPU → virtio-gpu scanout. The direct primary is visible through VNC on the
-current KMD/QEMU stack. The stage's charter, in priority order:
+## Stage: Correctness and D3D12 — since 2026-08-05
 
-1. **Stability** — direct-primary buffer rotation, resize, suspend/resume, device restart,
-   cold boot, DWM recovery, and TDR contracts. No hacks; loud failure over fake success.
-2. **Performance** — measure present-to-scanout and VNC delivery separately. The current DComp
-   probe sustains about 63 fps, but that does not prove the idle-to-active dirty edge. KMD v142
-   orders the exact DWM refresh marker on a Venus completion watermark; the UMD's bounded 10 ms
-   condition-variable frame gate closes the earlier DXVK-submission-thread producer race at about
-   0.48 ms steady-state average. Measure wake latency and steady-state cadence separately before
-   assigning blame to the guest, frontend, or remote client.
-3. **D3D11 conformance** — drive the noop-DDI hit counters to zero against real workloads,
-   dxvk-tests / samples / 3DMark, DXGI format coverage, remaining 11.1 DDI plumbing.
+The hardware-accelerated desktop milestone is met and the performance push is **paused, not
+abandoned**: DWM composites the whole desktop on Helios → Venus → host GPU → virtio-gpu scanout,
+and Fire Strike runs at GT1 ≈ 221 / GT2 ≈ 208 / Graphics ≈ 49k with the present-queue stall
+root-caused and fixed (ROADMAP WS2). The remaining performance limit is **named and measured** —
+the frame's own producer completion on the host, at a producer floor of ~3.7 ms/frame — so more
+perf work needs a new lever, not another sweep. The charter is now, in priority order:
+
+1. **D3D11 correctness / conformance** — `CONFORMANCE.md` is the charter. Drive the UMD's
+   `DDI refusals:` counters and the noop-DDI hit counters to zero against real workloads, turn
+   the ~40 ad-hoc probes in `tools/` into a runnable suite with pass criteria, close DXGI format
+   coverage and the remaining 11.1 DDI plumbing.
+2. **D3D12** — `DX12.md` is the charter. Today `OpenAdapter12` is exported and refuses; the
+   strategy question (native D3D12 DDI vs vkd3d-proton over the existing Vulkan/Venus path) is
+   open and the doc lists the evidence that would settle it.
+3. **Stability** — unchanged and still non-negotiable: buffer rotation, resize, suspend/resume,
+   device restart, cold boot, DWM recovery, TDR. No hacks; loud failure over fake success.
+4. **Performance** — paused. Do not open a perf sweep without a new causal hypothesis; ROADMAP
+   WS2 lists what has already been measured and rejected, with numbers.
 
 **`ROADMAP.md` is the living stage document** — current defect list, per-workstream plans, and the
-tooling inventory (registry knobs, counters, ETW AzureTriage recipe, guest probe schtasks). Update
+tooling inventory (registry knobs, counters, ETW recipes, guest probe schtasks). Update
 it as items close or appear. Session-by-session state lives in the agent memory; do not create
 per-session HANDOFF_*.md docs — distill into memory + ROADMAP.md.
 
@@ -54,10 +62,13 @@ Set this via the environment on each cargo invocation. Do **NOT** commit `target
 `.cargo/config.toml` — that file is read on both platforms.
 
 **Driving the VM:** prefer the **`win` MCP server** — `win_exec`, `win_cargo` (mirrors `Z:\` to
-`C:\Users\Rupansh\helios-vgpu` and sets the local target dir + `LIBCLANG_PATH`), `win_install_umd`,
-`win_meson` (Mesa ICD), `win_looking_glass`/`win_looking_glass_idd`. coreutils are installed on
-win11. SSH/win_exec land in **session 0** — window/desktop probes must run via scheduled tasks
-(`schtasks /run /tn <name>`; see ROADMAP.md tooling). See TOOLCHAIN.md.
+`C:\Users\Rupansh\helios-vgpu` and sets the local target dir + `LIBCLANG_PATH`),
+`win_build_kmd` + `win_install_kmd` (the KMD build/sign/deploy path), `win_install_umd`,
+`win_dxvk` (the DXVK engine), `win_meson` (Mesa ICD), and the historical
+`win_looking_glass`/`win_looking_glass_idd`. coreutils are installed on
+win11. SSH/win_exec land in **session 0** — window/desktop probes and every benchmark must run
+via scheduled tasks (`schtasks /run /tn <name>`; a 3DMark run launched from session 0 fakes a
+driver regression). See TOOLCHAIN.md and ROADMAP.md tooling.
 
 **VM launch ownership:** if you change the standalone VM launch command,
 `tools/launch-helios-gtk.sh`, QEMU display/debug transport, or launcher environment variables,
@@ -80,46 +91,68 @@ cold boots / guest reboots; `pnputil /restart-device` re-runs AddAdapter without
    evidence (`helios_paintcap` → `Z:\tmp\screen_copy.png` is ground truth); log lines are not
    frames. Registry counter values persist across boots — verify a counter *moves* this boot
    before trusting it. Never blame the host stack (proven good) without host-side evidence.
-7. **Measure before optimizing** (this stage especially): add/read counters, ETW, or timestamps
-   first; land perf changes with before/after numbers.
+7. **Measure before optimizing:** add/read counters, ETW, or timestamps first; land perf
+   changes with before/after numbers. GT1 drifts across a session, so an all-A-then-all-B
+   comparison cannot separate a knob from the drift — interleave the arms
+   (`tmp/perf/ab-presentwmk.ps1`, `ab-env.ps1`) and report paired deltas.
+8. **A knob's default is a decision, and it must match the measured configuration.** If every
+   accepted measurement was taken with a value the code does not default to, the code is
+   shipping something nobody measured. Flipping a default requires the evidence in the comment
+   at the read site, and the opposite value must remain reachable as the A/B disable.
 
 ## Repository Structure (active paths)
 
 ```
 helios-vgpu/
 ├── CLAUDE.md               ← You are here
-├── ROADMAP.md              ← PSC stage: defects, plans, tooling (living doc)
-├── ARCH.md / OVERVIEW.md   ← Architecture (some sections describe the archived
-│                             System-class path; kmd_render/ is the active driver)
-├── KMD.md ICD.md TRANSPORT.md HOST.md TOOLCHAIN.md
+├── ROADMAP.md              ← living stage doc: defects, per-workstream plans, tooling
+├── CONFORMANCE.md          ← D3D11 correctness charter (priority 1)
+├── DX12.md                 ← D3D12 charter (priority 2)
+├── TRANSPORT.md            ← virtio-gpu + Venus wire format. §1/§2 LIVE; §3/§7 archived
+├── HOST.md TOOLCHAIN.md    ← Linux host setup / cross-platform build + deploy
 ├── NTOSEYE.md              ← Windows KD (ntoseye) quirks
 ├── BRINGUP_QUIRKS.md       ← build/deploy/VM-control gotchas (purge-fingerprint,
 │                             repackage+sign, DriverStore, QMP reset, diag ring)
 ├── HELIOS_DRIVER_DEPLOYMENT.md
-├── docs/archive/           ← Frozen design/research docs (GATE*, WDDM_*,
-│                             DISPLAY*, PHASE*, HANDOFF_*, and REFACTOR_* —
-│                             the completed T0–T8 quality refactor: the review,
-│                             its two kickoff prompts, and the
-│                             tranche-by-tranche record). Read-only history;
-│                             code comments may cite them by name.
+├── WINDOWS_CI_PACKAGE.md   ← the GH Actions bundle + Install/Verify-Helios.ps1
+├── docs/archive/           ← Frozen history. Read-only; code comments may cite by
+│                             name. ARCH/OVERVIEW/KMD/ICD (the System-class stack),
+│                             WINDOWED_BLT_DESIGN, SCANOUT_DRM_MODIFIER_DESIGN, the
+│                             GATE*/WDDM_*/DISPLAY*/PHASE*/HANDOFF_* corpus, and
+│                             REFACTOR_* (the completed T0–T8 quality refactor).
+├── docs/reference/         ← Non-narrative reference data (host vulkaninfo profile)
 │
-├── kmd_render/             ← ACTIVE: WDDM 3.2 render+display miniport (Rust, no_std)
+├── kmd_render/             ← ACTIVE: WDDM render+display miniport (Rust, no_std)
 │   └── src/ddi/            ← DDI surface (query_adapter_info = caps/segments,
-│                             create_allocation, cpu_host_aperture, gdi_blit =
-│                             RenderGdi executor, build_paging_buffer, escape,
-│                             submit_command/scheduler, interrupt)
+│                             create_allocation, cpu_host_aperture, build_paging_buffer,
+│                             escape, submit_command/scheduler, interrupt, display,
+│                             vidpn, present_packet, scanout_timeline/scanout_trace)
 │   └── src/virtio/         ← virtio-gpu transport + async ctrl (C3/M3.4) + venus client
+├── kmd_logic/              ← ACTIVE: the KMD's testable pure logic. `kmd_render` is a
+│                             no_std cdylib with panic=abort and CANNOT host a libtest
+│                             harness — new KMD unit tests belong HERE, and this is the
+│                             only KMD code with tests that actually run.
 ├── umd/                    ← ACTIVE: D3D11 UMD (d3d10umddi frontend, cxx bridge)
 ├── dxvk-helios/            ← ACTIVE: forked DXVK engine (venus import model, GDI staging)
 ├── icd/mesa                ← ACTIVE: Mesa fork — Venus Vulkan ICD (build via win_meson)
 ├── qemu-helios/            ← ACTIVE: QEMU fork — modifier metadata + native OPTIMAL readback
-├── LookingGlass/           ← HISTORICAL: former IddCx capture path
 ├── protocol/               ← shared guest/host wire structs (builds on BOTH platforms)
-├── tools/                  ← launcher, deploy scripts, guest probe .ps1 toolkit
-│
-├── kmd/ + icd/src…         ← ARCHIVED reference: System-class KMDF + IOCTL stack
-└── host/                   ← host-side daemon experiments
+├── tools/                  ← launcher, deploy scripts, ~40 D3D11/DXGI/D3DKMT probes,
+│                             gate scripts, and the `win` MCP server (tools/win-mcp)
+├── packaging/windows/      ← Install-Helios.ps1 / Verify-Helios.ps1 + the four smoke
+│                             probes — the closest thing to an automated gate today
+├── ci/ + .github/workflows ← the Windows graphics+compute bundle build
+├── vkd3d-proton-helios/    ← submodule, pinned. See DX12.md — no doc yet explains the fork
+├── LookingGlass/           ← HISTORICAL: former IddCx capture path. Retained only
+│                             because tools/win-mcp still implements win_looking_glass*
+└── kmd/                    ← ARCHIVED reference: System-class KMDF + IOCTL stack. Kept
+                              because active kmd_render code cites it for provenance
+                              ("Ported from kmd/src/…"); it is in no build.
 ```
+
+⚠ Two crates were retired on 2026-08-05 — `probe/` and `host/`. Both were orphans (no
+workspace, no CI, no build, cited only by docs that had already been archived). Do not
+re-create them; if you need a host-side or user-mode probe, add it under `tools/`.
 
 ## Key Invariants (never violate)
 
@@ -133,12 +166,17 @@ helios-vgpu/
 | A SupportsCpuHostAperture segment must be the LAST reported segment; classic CpuVisible memory segments are rejected | AddAdapter Code 43 (ETW-proven 2026-07-05) |
 | The KMD version lives at ONE site, `kmd_render/driver-version.env`; never reintroduce a literal into build.rs or Cargo.make stampinf | INF/FILEVERSION mismatch = FAILED_ADD 0xc0000182 |
 | Venus commands flush before fence signal; never signal a wire fence before host completion | suspected root of DEVICE_LOST/freeze (stability WS1) |
+| A WDDM fence may wait on the frame's OWN boundary, never on the whole `next_wire_fence` backlog | the superset delayed the fence by the pipeline depth and stalled dxgkrnl's 3-deep present queue (WS2, `PresentWmk`) |
+| New KMD unit tests go in `kmd_logic`, never in `kmd_render` | `kmd_render` is a `panic=abort` no_std cdylib: a `#[cfg(test)]` module there can never run, so it is assurance that is not real |
 
 ## When You're Stuck
 
 1. `ROADMAP.md` (stage state) → `BRINGUP_QUIRKS.md` (deploy/VM) → `NTOSEYE.md` (live KD).
 2. dxgkrnl failure reasons in plain text: ETW `Microsoft-Windows-DxgKrnl` all-keywords trace →
-   tracerpt → grep `AzureTriage` (recipe in ROADMAP.md).
+   tracerpt → grep `AzureTriage` (recipe in ROADMAP.md). The SAME provider answers
+   "what is dxgkrnl doing to my thread" — take a ~2 s circular slice mid-run and read the
+   `Present` / `Flip` / `QueuePacket` / `DmaPacket` / `BlockThread` events; that is how the
+   present-queue stall was found (ROADMAP WS2).
 3. Venus protocol ground truth: `venus-protocol/vk.xml`, `virglrenderer/src/venus/`. Host-side
    log: `/tmp/helios-qemu-stderr.log` (launcher tee); `HELIOS_VKR_DEBUG=validate` enables host
    validation layers.

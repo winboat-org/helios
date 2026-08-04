@@ -591,7 +591,7 @@ pub(crate) struct PagingAllocInfo {
 /// (`DsBad` — DescribeAllocation) and reclaim sites that refused to reconstruct
 /// a `Box` from such a handle (`FreeBad`). Both must stay 0.
 static DESCRIBE_BAD_HANDLE: AtomicU32 = AtomicU32::new(0);
-static RECLAIM_BAD_HANDLE: AtomicU32 = AtomicU32::new(0);
+pub(crate) static RECLAIM_BAD_HANDLE: AtomicU32 = AtomicU32::new(0);
 
 /// The ONE place a dxgkrnl allocation handle becomes an `&AllocationContext`.
 ///

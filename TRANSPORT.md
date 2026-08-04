@@ -1,5 +1,14 @@
 # TRANSPORT.md — VirtIO-GPU + Venus Wire Protocol
 
+> **✅ KEPT AT ROOT — this is live reference, unlike its sibling architecture
+> docs.** `ARCH.md`, `OVERVIEW.md`, `KMD.md` and `ICD.md` were archived to
+> `docs/archive/` on 2026-08-05 because they are superseded end to end. This one
+> was not, because **§1 (virtio-gpu PCI/virtqueue) and §2 (Venus ring and command
+> encoding) are still ground truth for the active driver** and six `protocol/`
+> source comments cite them by section. Read §1 and §2; treat **§3 (the
+> ICD→DeviceIoControl→KMD IOCTL spine) and §7's "chosen architecture" as
+> archived** — they describe the retired System-class carrier.
+>
 > **⚠️ PARTIALLY SUPERSEDED (2026-07-05).** The Venus wire format and virtio-gpu
 > CMD_SUBMIT_3D details below remain accurate, but the **carrier is wrong**: the
 > active driver does NOT reach the KMD via `DeviceIoControl`/`GUID_DEVINTERFACE_HELIOS`.

@@ -24,6 +24,9 @@
 //! | `ScanoutSnapshot` | DWORD | `true` (explicit 0 is the kill switch) |
 //! | `UmdPresentBatchFold` | DWORD | `true` (explicit 0 is the kill switch) |
 //! | `UmdAsyncPresentStream` | DWORD | `true` (explicit 0 keeps the old gate) |
+//! | `UmdFreeThreaded` | DWORD | `true` (explicit 0 reverts the threading surface) |
+//! | `UmdCommandLists` | DWORD | `true` (explicit 0 reverts to emulated lists) |
+//! | `UmdDeferredDiagnostics` | DWORD | `false` (diagnostic atomics, opt-in) |
 //!
 //! ⛔ **`PresentGateUs` and `PresentOrder` were DELETED 2026-07-29 by owner
 //! directive and must not come back.** They were the producer-side CPU
@@ -232,9 +235,18 @@ pub(crate) static UMD_ASYNC_PRESENT_STREAM: BoolKnob =
 pub(crate) static UMD_FREE_THREADED: BoolKnob = BoolKnob::new(c"UmdFreeThreaded", true);
 
 /// Native deferred-context/command-list DDIs (Phase C of the command-list
-/// build, `tmp/handoff-perf-structural/PLAN-commandlists.md`). Bring-up
-/// default **OFF** — explicit 1 enables; the declared default flips to ON
-/// only after the full Phase C gate set passes. Per-process read.
+/// build, `tmp/handoff-perf-structural/PLAN-commandlists.md`).
+///
+/// **Default ON since 2026-08-05**; explicit 0 reverts to the runtime's
+/// emulated path. The bring-up comment used to say the default flips "only
+/// after the full Phase C gate set passes" — it has passed: with this on, plus
+/// FREETHREADED and the DXVK CL fast/inline/recycle/sampler-retention set,
+/// `tmp/handoff-perf-structural/reports/p3-227-recovery-outcome.md` records
+/// **GT1 224.16 / GT2 229.17 / Graphics 52,126 / Combined 8,465**, against
+/// GT1 ~184 and Graphics ~43.5k on the emulated path. Every accepted score
+/// since 2026-08-03 was measured with it on, supplied by the test VM's
+/// registry, so leaving the code default OFF meant a fresh install shipped a
+/// materially slower driver than the one being measured.
 ///
 /// ON (and only with [`UMD_FREE_THREADED`] also on — COMMANDLISTS requires
 /// FREETHREADED) reports `D3D11DDICAPS_COMMANDLISTS_BUILD_2`: the runtime
@@ -245,7 +257,7 @@ pub(crate) static UMD_FREE_THREADED: BoolKnob = BoolKnob::new(c"UmdFreeThreaded"
 /// `pfnCommandListExecute`. The DDI slots themselves are real and installed
 /// unconditionally; this knob only controls whether the caps bit invites the
 /// runtime to use them. See `device_funcs::threading_caps`.
-pub(crate) static UMD_COMMAND_LISTS: BoolKnob = BoolKnob::new(c"UmdCommandLists", false);
+pub(crate) static UMD_COMMAND_LISTS: BoolKnob = BoolKnob::new(c"UmdCommandLists", true);
 
 /// Deferred-context/command-list success-path counters and sampled logs.
 ///
@@ -378,8 +390,8 @@ pub(crate) fn umd_free_threaded() -> bool {
 }
 
 /// Native command-list enable: `HKLM\SOFTWARE\Helios!UmdCommandLists`
-/// (REG_DWORD). Read once per process. Absent = OFF during bring-up
-/// (explicit 1 enables). Forced off when [`umd_free_threaded`] is off —
+/// (REG_DWORD). Read once per process. Absent = ON; explicit 0 reverts to the
+/// runtime's emulated command lists. Forced off when [`umd_free_threaded`] is off —
 /// COMMANDLISTS caps require FREETHREADED, so `UmdFreeThreaded=0` remains the
 /// one kill switch that reverts the whole threading surface at once. See
 /// [`UMD_COMMAND_LISTS`].

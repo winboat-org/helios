@@ -36,6 +36,15 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)][string] $Label,
+    # !! 2026-08-05, TASK NAMES UNVERIFIED. Scheduled tasks live on the VM, not
+    # in this repo, so this default list is only as good as the box it was
+    # written on. As of this date: `helios_triangle` is documented as created
+    # (WINDOWED_BLT_DESIGN.md), `helios_d3d11_extra_suite` and
+    # `helios_d3d11_knob_suite_default` appear only in frozen T7/T8 records
+    # (docs/archive/), and `helios_tess_probe_once` appears NOWHERE outside this
+    # file. Any of the first three may no longer exist. The runner below now
+    # checks schtasks' exit code, so a missing task is reported instead of
+    # silently costing a $WaitSeconds sleep and skewing the fingerprint.
     [string[]] $Tasks = @('helios_d3d11_extra_suite', 'helios_tess_probe_once',
                           'helios_d3d11_knob_suite_default', 'helios_triangle'),
     [int]      $WaitSeconds = 60
@@ -56,10 +65,27 @@ Set-ItemProperty -Path 'HKLM:\SOFTWARE\Helios' -Name 'ShaderBytecodeDumpPath' `
     -Value $dumpDir -Type String
 
 Write-Host "dump dir  : $dumpDir"
+# A task that does not exist makes schtasks exit non-zero and print the reason;
+# swallowing that with `| Out-Null` turned a missing workload into a silent
+# $WaitSeconds nap and a fingerprint built from fewer shaders than intended.
+$missing = @()
 foreach ($t in $Tasks) {
     Write-Host "workload  : $t"
-    schtasks /run /tn $t | Out-Null
+    $so = & schtasks /run /tn $t 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host ("  FAILED TO RUN: schtasks exit {0} -- {1}" -f $LASTEXITCODE, ($so -join ' ').Trim())
+        Write-Host "  (task absent or not runnable on this box; NOT waiting for it)"
+        $missing += $t
+        continue
+    }
     Start-Sleep -Seconds $WaitSeconds
+}
+if ($missing.Count -ne 0) {
+    Write-Host ""
+    Write-Host ("WARNING: {0} of {1} workload task(s) never ran: {2}" -f `
+        $missing.Count, $Tasks.Count, ($missing -join ', '))
+    Write-Host "The fingerprint below covers only the workloads that DID run; a diff"
+    Write-Host "against a run with a different missing set is not comparable."
 }
 
 # Turn the knob back off: it is an every-shader file write on a live desktop.

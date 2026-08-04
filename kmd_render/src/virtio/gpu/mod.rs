@@ -1898,9 +1898,32 @@ pub struct VirtioGpu {
     /// outstanding marker is retained for liveness while one later marker is
     /// coalesced with exact resource identity; boxed to keep StartDevice's
     /// by-value initialization frame below the kernel-stack headroom.
-    /// `DmaGpuFence`: retire ordinary (non-paging) WDDM DMA fences on host GPU
-    /// completion rather than host decode. See `AdapterKnobs::dma_gpu_fence`
-    /// for the contract this restores.
+    /// `DmaGpuFence` (default 1). Retire ordinary (non-paging) WDDM DMA fences
+    /// on host GPU COMPLETION instead of host DECODE.
+    ///
+    /// THE CONTRACT: dxgkrnl reads a DMA fence as "the GPU is finished with this
+    /// work", and schedules everything downstream on that — including when a
+    /// compositor may read a surface an app has just rendered. Retiring at
+    /// decode reports completion while the host GPU is still executing, so
+    /// dxgkrnl can advance a flip, or let dwm compose an app's window, over a
+    /// buffer that is still being written. That is the black/torn frame, and it
+    /// is confined to the region being drawn, which is why it presented as
+    /// "only inside the app's window" and as Explorer's late top band.
+    ///
+    /// It was invisible while the UMD's present path blocked on GPU completion
+    /// before publishing a present (`PresentOrder=0`): that made the fence's lie
+    /// harmless by ensuring the work really was done before dxgkrnl saw it, at
+    /// the cost of removing all CPU/GPU overlap (Fire Strike GT1 158 -> 136 fps,
+    /// Combined 25.9 -> 18.8).
+    ///
+    /// The cost this trades against is the one `RetireDomain::DecodeOnly`'s doc
+    /// names: ring >= 1 fences stay in flight for the whole GPU-work duration,
+    /// so DMA fences now retire later. That is what the fences are supposed to
+    /// mean. 0 restores the old behaviour as the A/B lever.
+    ///
+    /// This is the ONE reader. `AdapterKnobs` used to carry a second, unread
+    /// copy of the same registry value; it was deleted 2026-08-05 so the two
+    /// cannot disagree.
     dma_gpu_fence: bool,
     /// `PresentWmk`: gate a WDDM submission that carries a LIVE present stream
     /// boundary on that exact boundary alone, instead of additionally on the

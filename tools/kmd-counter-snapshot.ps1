@@ -34,15 +34,22 @@ param(
         'WtOut', 'CtOut', 'QfRet', 'PkHi', 'IfHi', 'AsSub', 'AsDone',
         # scanout / present surface that must not move
         'VpSA', 'ScSet', 'ScFlu', 'ScRid', 'VpDSt', 'DspMd', 'ScCpy', 'ScPch',
-        'ScanoutDiag', 'ScFrc', 'VsCnt', 'SaCnt',
+        # 2026-08-05: 'ScanoutDiag' and 'ScFrc' dropped — both were retired in T6
+        # (ScForceReject owner-approved; T6/R901 deleted the ScanoutDiag forced-
+        # rebind experiment), so kmd_render writes neither and both could only
+        # ever print '<absent>'. Do not re-add them.
+        'VsCnt', 'SaCnt',
         # T3 refusal counters (zeroed at StartDevice)
         'ScBadAlc', 'ScBadExt', 'ScBadLay', 'ScBadFmt', 'ScLinErr', 'ScSetErr',
         'ScNoTgt', 'ScCpyErr', 'ScUnav', 'ScRetry', 'ScGaveUp', 'ScStale',
         'ScGateCx', 'HpdStTo',
         # counters T4a ADDS -- must be ABSENT on a healthy boot
-        'VnEncOvf', 'VnRingFt', 'VnRingWd', 'VnRingSz', 'VnMtDown', 'VnEchoNe',
+        # 2026-08-05: 'VnEchoNe' and 'WINDOW_NOT_CONFIGURED' dropped — no counter
+        # of either name exists anywhere in kmd_render/src, so watching them was
+        # a guaranteed '<absent>'. Do not re-add them.
+        'VnEncOvf', 'VnRingFt', 'VnRingWd', 'VnRingSz', 'VnMtDown',
         'CpNoDrn', 'PBTdErr', 'CtNotOurs', 'AbnDrop', 'ABANDONED_FENCES',
-        'ChSzMm', 'MapDup', 'PciCapOob', 'WINDOW_NOT_CONFIGURED',
+        'ChSzMm', 'MapDup', 'PciCapOob',
         'FENCE_WAIT_TABLE_FULL'
     )
 )

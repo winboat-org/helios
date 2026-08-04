@@ -110,6 +110,12 @@ pub(crate) struct StartedState {
 ///
 /// Every field name here corresponds to a [`crate::diag::knobs`] entry, which is
 /// where the ≤14-byte lookup-buffer rule is enforced at compile time.
+/// Reported device-local VidMm capacity in MiB when `VidMmVramMB` is absent.
+/// Named rather than inlined because it appears in both [`AdapterKnobs::DEFAULTS`]
+/// and the registry read, and the two silently disagreeing is exactly the class
+/// of bug this module exists to prevent. See the field's doc for the evidence.
+pub(crate) const VIDMM_VRAM_MB_DEFAULT: u32 = 4096;
+
 #[derive(Clone, Copy)]
 pub(crate) struct AdapterKnobs {
     /// `AllocCached` (default 1). When set, CpuVisible allocations are
@@ -119,29 +125,6 @@ pub(crate) struct AdapterKnobs {
     /// measured ~200 MB/s in the IDD readback (36 ms per 7.8 MiB frame,
     /// 2026-07-06). 0 = kill switch.
     pub alloc_cached: bool,
-    /// `DmaGpuFence` (default 1). Retire ordinary (non-paging) WDDM DMA fences
-    /// on host GPU COMPLETION instead of host DECODE.
-    ///
-    /// THE CONTRACT: dxgkrnl reads a DMA fence as "the GPU is finished with this
-    /// work", and schedules everything downstream on that — including when a
-    /// compositor may read a surface an app has just rendered. Retiring at
-    /// decode reports completion while the host GPU is still executing, so
-    /// dxgkrnl can advance a flip, or let dwm compose an app's window, over a
-    /// buffer that is still being written. That is the black/torn frame, and it
-    /// is confined to the region being drawn, which is why it presented as
-    /// "only inside the app's window" and as Explorer's late top band.
-    ///
-    /// It was invisible while the UMD's present path blocked on GPU completion
-    /// before publishing a present (`PresentOrder=0`): that made the fence's lie
-    /// harmless by ensuring the work really was done before dxgkrnl saw it, at
-    /// the cost of removing all CPU/GPU overlap (Fire Strike GT1 158 -> 136 fps,
-    /// Combined 25.9 -> 18.8).
-    ///
-    /// The cost this trades against is the one `RetireDomain::DecodeOnly`'s doc
-    /// names: ring >= 1 fences stay in flight for the whole GPU-work duration,
-    /// so DMA fences now retire later. That is what the fences are supposed to
-    /// mean. 0 restores the old behaviour as the A/B lever.
-    pub dma_gpu_fence: bool,
     /// `BindFlushMode` (default 0 = completion-ordered). 1 flushes immediately
     /// at the bind with no ordering — the A/B that separates "the buffer is not
     /// ready when we bind it" from "it is ready and our boundary is wrong".
@@ -200,12 +183,24 @@ pub(crate) struct AdapterKnobs {
     /// `crate::ddi::bar_segment::BarSegTopology`; kept raw here so the coerced
     /// value can be reported.
     pub bar_seg_mode: u32,
-    /// `VidMmVramMB` (default 0). A valid nonzero value makes the existing
-    /// BAR-backed memory segment report this device-local capacity and opts
-    /// device-local Venus tracking allocations into that local segment.
-    /// Non-local Vulkan heaps remain in the aperture/shared budget. The
-    /// programmable CPU aperture stays capped separately; tracking allocations
-    /// never map their identity blobs through it.
+    /// `VidMmVramMB` (**default 4096 since 22.22.252.0**). A valid nonzero value
+    /// makes the existing BAR-backed memory segment report this device-local
+    /// capacity and opts device-local Venus tracking allocations into that
+    /// local segment. Non-local Vulkan heaps remain in the aperture/shared
+    /// budget. The programmable CPU aperture stays capped separately; tracking
+    /// allocations never map their identity blobs through it.
+    ///
+    /// The default was 0 (no local segment) while the heap-aware accounting was
+    /// being brought up. 4096 is the configuration that work actually validated
+    /// — Task Manager shows a 4.0 GiB dedicated capacity, and direct-KMT and
+    /// native-Vulkan four-by-64 MiB probes each measured exactly +256.00 MiB in
+    /// the selected segment with no movement in the other and a clean return to
+    /// baseline after destroy (ROADMAP, "VidMm / Task Manager validation").
+    /// Shipping 0 meant no install ever got the configuration that was proven.
+    /// Re-confirmed on 22.22.251.0 before this flip: `VidVram=4096`,
+    /// `VidVBad=0`, adapter problem code 0, GT1 221.37 fps, all scanout gates
+    /// clean. Out-of-range values are refused into `VidVBad` and fall back to
+    /// the legacy topology rather than silently collapsing.
     pub vidmm_vram_mb: u32,
 }
 
@@ -220,7 +215,6 @@ impl AdapterKnobs {
     #[allow(dead_code)]
     pub const DEFAULTS: Self = Self {
         alloc_cached: true,
-        dma_gpu_fence: true,
         bind_flush_immediate: false,
         dispatch_bind: true,
         present_probe: false,
@@ -230,7 +224,7 @@ impl AdapterKnobs {
         bar_seg_flags: 0x1C,
         bar_seg_base_mb: 0,
         bar_seg_mode: 10,
-        vidmm_vram_mb: 0,
+        vidmm_vram_mb: VIDMM_VRAM_MB_DEFAULT,
     };
 
     /// Read every knob once. PASSIVE_LEVEL.
@@ -245,7 +239,6 @@ impl AdapterKnobs {
         use crate::diag::{knobs, read_config_dword};
         Self {
             alloc_cached: read_config_dword(knobs::ALLOC_CACHED, 1) != 0,
-            dma_gpu_fence: read_config_dword(knobs::DMA_GPU_FENCE, 1) != 0,
             bind_flush_immediate: read_config_dword(knobs::BIND_FLUSH_MODE, 0) == 1,
             dispatch_bind: read_config_dword(knobs::DISPATCH_BIND, 1) != 0,
             present_probe: read_config_dword(knobs::PRESENT_PROBE, 0) != 0,
@@ -255,7 +248,7 @@ impl AdapterKnobs {
             bar_seg_flags: read_config_dword(knobs::BAR_SEG_FLAGS, 0x1C),
             bar_seg_base_mb: read_config_dword(knobs::BAR_SEG_BASE_MB, 0),
             bar_seg_mode: read_config_dword(knobs::BAR_SEG_MODE, 10),
-            vidmm_vram_mb: read_config_dword(knobs::VIDMM_VRAM_MB, 0),
+            vidmm_vram_mb: read_config_dword(knobs::VIDMM_VRAM_MB, VIDMM_VRAM_MB_DEFAULT),
         }
     }
 
@@ -397,21 +390,6 @@ const _: () = {
 /// restart at 1 and whose liveness test is bare membership — which is how a
 /// recycled id used to be accepted as the cached LINEAR scan-out target.
 pub(crate) struct TransportGeneration {
-    /// venus-backed, BAR-visible, CPU-coherent page-table region self-allocated at
-    /// StartDevice (`(gpa, size)`). `None` if the venus allocation was unavailable
-    /// or failed (StartDevice stays best-effort). When present and the aperture
-    /// shape is enabled, `query_segments` reports this as the VidMm page-table
-    /// segment (segment id 2) — real device-BAR memory backed by real host memory,
-    /// which VidMm accepts where it drops a system-RAM segment. See `venus.rs`.
-    ///
-    /// ⚠ WRITE-ONLY as of R510, which is the first time that is visible: the only
-    /// consumer would be `query_segments`, and it deliberately reports
-    /// `paging_ram` instead, because QuerySegment4 runs BEFORE StartDevice's venus
-    /// allocation. Kept and annotated rather than deleted — a deletion is a T6
-    /// dead-code commit with its own reachability evidence, not a side effect of
-    /// this refactor.
-    #[allow(dead_code)]
-    pub page_table_window: Option<(u64, u64)>,
     /// BAR memory segment — the head partition of the host-visible
     /// window, reserved as dxgkrnl's CPU-host-aperture region at StartDevice.
     /// `None` if the window is absent/too small; the BAR segment is then not
@@ -1550,15 +1528,6 @@ impl AdapterContext {
     pub(crate) fn bar_segment(&self) -> Option<&BarSegment> {
         self.transport_generation()
             .and_then(|t| t.bar_segment.as_ref())
-    }
-
-    /// The venus-backed page-table window for this transport generation.
-    ///
-    /// See the field doc: no live consumer today.
-    #[allow(dead_code)]
-    pub fn page_table_window(&self) -> Option<(u64, u64)> {
-        self.transport_generation()
-            .and_then(|t| t.page_table_window)
     }
 
     /// Lock-free observation for query/diagnostic paths. Mutation is exposed

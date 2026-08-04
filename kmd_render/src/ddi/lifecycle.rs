@@ -42,8 +42,16 @@ fn zero_linear_scanout_breadcrumbs() {
     }
 }
 
-/// Stand up the persistent venus context + page-table blob. Returns
-/// `(venus_ctx_id, page_table_window)`; `(0, None)` on any failure.
+/// Stand up the persistent venus context + page-table blob. Returns the venus
+/// context id, or 0 on any failure.
+///
+/// It used to also return the blob's `(gpa, size)` window, which was stored in
+/// the transport generation and read by nobody — `query_segments` deliberately
+/// reports `paging_ram` instead, because QuerySegment4 runs BEFORE this
+/// allocation exists. R510 annotated that field write-only and left the
+/// deletion to a dead-code commit with its own reachability evidence; this is
+/// that commit (2026-08-05). The blob itself is still allocated and still owned
+/// by the venus client — only the unread copy of its address is gone.
 ///
 /// ⚠ `#[inline(never)]` is a STACK BUDGET decision, not style. `VenusClient` and
 /// the blob descriptors are large locals, and StartDevice's frame is already
@@ -52,10 +60,7 @@ fn zero_linear_scanout_breadcrumbs() {
 /// `VirtioGpu::init` — is what keeps the nested peak inside the budget. See
 /// `StartedState::boxed` for the boot failure this class of growth caused.
 #[inline(never)]
-fn bring_up_venus(
-    passive: crate::irql::PassiveLevel,
-    adapter: &AdapterContext,
-) -> (u32, Option<(u64, u64)>) {
+fn bring_up_venus(passive: crate::irql::PassiveLevel, adapter: &AdapterContext) -> u32 {
     // Persistent venus context for the device lifetime (owner 0: KMD-internal,
     // destroyed explicitly in StopDevice).
     let venus_result = crate::virtio::ctrl::ctx_create(
@@ -65,15 +70,15 @@ fn bring_up_venus(
         None,
     )
     .and_then(|ctx_id| {
-        let (client, blob) =
+        let (client, _blob) =
             crate::virtio::venus::allocate_host_visible_blob(passive, adapter, ctx_id)?;
-        Ok((ctx_id, client, blob))
+        Ok((ctx_id, client))
     });
     match venus_result {
-        Ok((ctx_id, client, blob)) => {
+        Ok((ctx_id, client)) => {
             crate::diag::record(0x0B00_0007);
             adapter.set_venus_client(Some(client));
-            (ctx_id, Some((blob.gpa, blob.size)))
+            ctx_id
         }
         Err(e) => {
             // venus bring-up failed; transport is up but no page-table window.
@@ -82,7 +87,7 @@ fn bring_up_venus(
             crate::diag::record(status as u32);
             crate::diag::fault(crate::diag::FaultCounter::StVnu, status as u32);
             adapter.set_venus_client(None);
-            (0, None)
+            0
         }
     }
 }
@@ -183,7 +188,6 @@ pub unsafe extern "C" fn dxgkddi_start_device(
     // The transport generation, built as locals and installed after publication.
     let mut bar_segment = None;
     let mut venus_ctx_id = 0u32;
-    let mut page_table_window = None;
     // SAFETY: dxgkrnl_interface is valid per the DDI contract (also copied into
     // the `dxgkrnl` local above); init only borrows it for the call.
     // SAFETY: `DxgkDdiStartDevice` is documented "IRQL: PASSIVE_LEVEL" (WDK
@@ -216,10 +220,10 @@ pub unsafe extern "C" fn dxgkddi_start_device(
             // it accepts device-BAR memory backed by real host memory). PASSIVE
             // inside StartDevice; the flows ride `virtio::ctrl` (locked enqueues +
             // PASSIVE waits), so they coexist with the interrupt DPC, which may
-            // already be live. On any failure we record diag and leave
-            // page_table_window = None — never fail StartDevice (Gate 1 stays
+            // already be live. On any failure we record diag and leave the
+            // venus context id 0 — never fail StartDevice (Gate 1 stays
             // start-safe). See virtio::venus.
-            (venus_ctx_id, page_table_window) = bring_up_venus(passive, adapter);
+            venus_ctx_id = bring_up_venus(passive, adapter);
         }
         Err(e) => {
             crate::kmsg(c"Helios: virtio-gpu init FAILED\n");
@@ -353,7 +357,6 @@ pub unsafe extern "C" fn dxgkddi_start_device(
             segment_table,
         ));
         adapter.set_transport_generation(Some(crate::adapter::TransportGeneration {
-            page_table_window,
             bar_segment,
             venus_ctx_id,
         }));
@@ -458,9 +461,9 @@ pub unsafe extern "C" fn dxgkddi_stop_device(miniport_device_context: *mut c_voi
         // StartDevice re-initializes.
         adapter.set_virtio(None);
 
-        // Drop the whole transport generation in one store — `page_table_window`,
-        // `bar_segment` and `venus_ctx_id` together, since all three are
-        // meaningless in the next generation.
+        // Drop the whole transport generation in one store — `bar_segment` and
+        // `venus_ctx_id` together, since both are meaningless in the next
+        // generation.
         //
         // The STICKY half is deliberately left alone. StopDevice has never
         // cleared the knobs, the mode or the EDID, and about two dozen sites

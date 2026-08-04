@@ -46,7 +46,10 @@ param(
     # Values printed for eyeball comparison against the previous boot, not judged.
     [string[]] $Report = @(
         'VpSA', 'ScSet', 'ScFlu', 'ScRid', 'VpDSt', 'DspMd', 'ScCpy', 'ScPch',
-        'ScFrc', 'VsCnt', 'SaCnt', 'PkHi', 'IfHi', 'AsSub', 'AsDone', 'ChSzDl',
+        # 2026-08-05: 'ScFrc' dropped — the ScForceReject instrument it echoed
+        # was RETIRED in T6 (owner-approved), so no kmd_render code writes it and
+        # the line could only ever print '<absent>'. Do not re-add it.
+        'VsCnt', 'SaCnt', 'PkHi', 'IfHi', 'AsSub', 'AsDone', 'ChSzDl',
         # QfRet is BACKPRESSURE, not a failure: it moves under real load (63 per
         # Fire Strike run, measured on both sides of T4a). Judged by order of
         # magnitude, not by zero, so it is reported rather than gated.
@@ -95,8 +98,9 @@ foreach ($n in $Report) {
     $v = if ($p) { $p.Value } else { '<absent>' }
     Write-Host ("  {0,-12} {1}" -f $n, $v)
 }
-$sd = $props | Where-Object { $_.Name -eq 'ScanoutDiag' }
-Write-Host ("  {0,-12} {1}" -f 'ScanoutDiag', $(if ($sd) { "$($sd.Value)  <-- MUST be absent or 0 in production" } else { '<absent>  OK' }))
+# 2026-08-05: the 'ScanoutDiag' production-hygiene readout was removed. T6/R901
+# deleted the forced-rebind experiment that knob selected, so kmd_render never
+# reads it and the check could only ever print '<absent>  OK'. Do not re-add it.
 
 Write-Host ""
 if ($failed.Count -ne 0) {
