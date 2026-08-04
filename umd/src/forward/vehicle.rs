@@ -233,6 +233,10 @@ pub(crate) unsafe fn vehicle_present_prepare(
             info.resid,
             info.alloc_size,
             info.memory_type_index,
+            // In-process vehicle alias: the originating VkDeviceMemory in this
+            // process already owns the tracker, so no cross-process open is
+            // needed here.
+            0,
             // Not the DWM scan-out primary import; keep the plain OPTIMAL path.
             false,
             false,

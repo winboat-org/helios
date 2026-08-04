@@ -521,10 +521,21 @@ impl VirtioGpu {
         }
     }
 
+    /// Return the recorded size of a live blob resource.
+    pub fn live_blob_size(&self, resource_id: u32) -> Option<u64> {
+        if !self.resource_is_live(resource_id) {
+            return None;
+        }
+        self.blobs
+            .iter()
+            .find(|slot| slot.resource_id == resource_id)
+            .map(|slot| slot.size)
+    }
+
     /// Transfer a blob's lifetime ownership from its escape owner (the D3DKMT
     /// device handle the ICD allocated it under) to the WDDM allocation adopting
-    /// it in `DxgkDdiCreateAllocation`. Returns whether the resource is LIVE —
-    /// adopting a dead resid must fail the CreateAllocation loudly.
+    /// it in `DxgkDdiCreateAllocation`. Returns the live blob table's recorded
+    /// size; adopting a dead or untracked resid must fail CreateAllocation.
     ///
     /// This closes the res-45 lifetime hole (2026-07-03 boot #3): without the
     /// re-tag, `DxgkDdiDestroyDevice`'s `release_blobs_for_owner` sweep unrefs
@@ -534,17 +545,23 @@ impl VirtioGpu {
     /// reclaim path; from here the allocation destroy path
     /// (`destroy_allocation_ctx` → `forget_allocation_blob` + guarded unref)
     /// owns the lifetime, matching KMD-created standard allocations.
-    pub fn adopt_blob_for_allocation(&mut self, resource_id: u32) -> bool {
+    pub fn adopt_blob_for_allocation(&mut self, resource_id: u32) -> Option<u64> {
         if !self.resource_is_live(resource_id) {
             // Atomic, not diag::record — CreateAllocation calls this under the
             // device spinlock (DISPATCH_LEVEL); the registry tracer is PASSIVE-only.
             ADOPT_DEAD_REJECTS.fetch_add(1, Ordering::Relaxed);
-            return false;
+            return None;
         }
-        if let Some(slot) = self.blobs.iter_mut().find(|s| s.resource_id == resource_id) {
-            slot.owner = None;
-        }
-        true
+        let Some(slot) = self
+            .blobs
+            .iter_mut()
+            .find(|slot| slot.resource_id == resource_id)
+        else {
+            ADOPT_DEAD_REJECTS.fetch_add(1, Ordering::Relaxed);
+            return None;
+        };
+        slot.owner = None;
+        Some(slot.size)
     }
 
     /// Drop the KMD-internal (KMD-owned) tracking slot for an allocation's blob at

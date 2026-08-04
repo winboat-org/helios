@@ -23,6 +23,7 @@
 //!   geometry happened to be absent would be a wire-visible behaviour change.
 
 use core::num::{NonZeroU32, NonZeroU64};
+use helios_protocol::GlobalVidMmTracker;
 
 /// A venus device-memory allocation this UMD already created, which the KMD
 /// should adopt rather than allocate against.
@@ -44,10 +45,11 @@ pub(crate) struct VenusBacking {
     pub(crate) alloc_size: u64,
     /// The creating `vkAllocateMemory`'s memory type index.
     pub(crate) memory_type_index: u32,
-    /// The ICD positively confirmed that this exact `VkDeviceMemory` owns a
-    /// live full-size VidMm mirror. False is the fail-safe value for an older
-    /// ICD or any best-effort tracker failure.
-    pub(crate) vidmm_tracked: bool,
+    /// System-wide KMT share and association cookie for this memory's full-size
+    /// VidMm tracker.
+    /// `None` is the fail-safe value for an older ICD or any best-effort
+    /// tracker failure; the adopted allocation then keeps its full charge.
+    pub(crate) global_vidmm_tracker: Option<GlobalVidMmTracker>,
 }
 
 impl VenusBacking {
@@ -61,15 +63,25 @@ impl VenusBacking {
         resource_id: u32,
         alloc_size: u64,
         memory_type_index: u32,
-        vidmm_tracked: bool,
+        global_vidmm_tracker: u64,
     ) -> Option<Self> {
+        let tracker = GlobalVidMmTracker {
+            global_share: global_vidmm_tracker as u32,
+            cookie: (global_vidmm_tracker >> 32) as u32,
+        };
+        let resource_id = NonZeroU32::new(resource_id);
         Some(Self {
             blob_id: NonZeroU64::new(blob_id)?,
             blob_size,
-            resource_id: NonZeroU32::new(resource_id),
+            resource_id,
             alloc_size,
             memory_type_index,
-            vidmm_tracked,
+            global_vidmm_tracker: (resource_id.is_some()
+                && blob_size != 0
+                && alloc_size != 0
+                && tracker.global_share != 0
+                && tracker.cookie != 0)
+                .then_some(tracker),
         })
     }
 

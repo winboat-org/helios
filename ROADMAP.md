@@ -175,7 +175,7 @@ time to stop shipping something nobody measured:**
   GTK/Wayland still fails during the full run with repeated GDK
   `eglMakeCurrent` errors and remains unverified.
 
-### VidMm / Task Manager validation (2026-08-04, KMD 22.22.250.0)
+### VidMm / Task Manager validation (2026-08-04, KMD 22.22.250.0 / 22.22.254.0)
 
 - Task Manager's 4.0 GiB dedicated capacity is now backed by the configured
   `VidMmVramMB=4096` local segment while the CPU-visible aperture remains
@@ -215,13 +215,31 @@ time to stop shipping something nobody measured:**
   C++ objects. The installed signed package reports `22.22.250.0`, PnP status
   is Code 0, DWM stayed responsive, and no new display/PnP/WHEA/BugCheck
   critical or error events appeared.
-- Known boundary: a full-size tracker belongs to the creating Vulkan process,
-  while the one-page adopted WDDM allocation can be shared cross-process. If a
-  creator exits while another process alone keeps that shared allocation alive,
-  dedicated usage can temporarily under-report until tracking ownership is
-  moved onto the global WDDM allocation. The normal DWM/Task Manager and tested
-  same-process allocation paths are exact; this lifetime redesign remains
-  follow-up work rather than being hidden as a completed guarantee.
+- The `.254` follow-up closes the cross-process lifetime boundary. Each tracker
+  is now a globally shared WDDM resource, its global KMT handle travels in a
+  typed private allocation flag/open identity, and an importer opens the same
+  tracker before returning the shared D3D resource. The KMD shrinks the adopted
+  payload to one page only when the cookie names a live tracker whose size
+  matches the KMD's recorded adopted-blob size; either mixed-version direction
+  therefore keeps the conservative full payload charge. If the shared tracker
+  disappears during an import race, Mesa creates a full-size tracker in the
+  imported memory's actual heap. If that fallback also fails, the bridge
+  rejects the D3D shared-resource open.
+- The `.254` cross-process gate created and cleared a 4096x4096 shared D3D11
+  texture in a child, opened it in the parent, exited the creator, and retained
+  exactly `+64.00 MiB` in both adapter-global and importer-process dedicated
+  counters. The importer then read the expected `ffff00ff` pixel and returned
+  both counters to baseline after its device was destroyed. The both-open and
+  creator-exited checks then passed 50 consecutive cycles. Raw KMT shared and
+  two-process probes independently retained exactly `+128.00 MiB` and
+  `+64.00 MiB`, respectively, after creator handle/process teardown and
+  returned to baseline after the final close.
+- With the final ICD loaded in DWM, an automated interactive Task Manager smoke
+  left both processes responsive and produced no DWM/Task Manager error event.
+  During validation, three deliberate PnP restart cycles still reproduced
+  defect 0z in the pre-existing `vn_ring_load_head` teardown path (also present
+  in the pre-branch ICD); DWM recovered each time. This branch does not claim to
+  fix that separate adapter-removal race.
 - The Task Manager-triggered DWM abort was a mixed-source Mesa deployment: the
   installed ICD combined the old `vn_queue.c` with only four files from the
   newer VidMm work. Deploying one coherent Mesa `1a02ba9` image restored the
