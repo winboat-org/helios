@@ -46,8 +46,15 @@ pub(crate) enum SegmentSpec {
     /// The contiguous-RAM cpu-host segment, reported under
     /// `BarSegTopology::Disabled` as the recovery baseline.
     RamCpuHost { base: u64, size: u64 },
-    /// The host-visible BAR window head, knob-shaped by `BarSegFlags`.
-    Bar { gpa: u64, size: u64, cpu_host: bool },
+    /// Device memory backed by the host Venus heap, with a smaller programmable
+    /// CPU-host aperture carved from the host-visible BAR window.
+    Bar {
+        gpa: u64,
+        gpu_base: u64,
+        size: u64,
+        cpu_aperture_size: u64,
+        cpu_host: bool,
+    },
 }
 
 impl SegmentSpec {
@@ -61,10 +68,18 @@ impl SegmentSpec {
     }
 
     /// Build the BAR spec, reading its cpu-host-ness out of the knob snapshot.
-    pub(crate) const fn bar(gpa: u64, size: u64, knobs: &AdapterKnobs) -> Self {
+    pub(crate) const fn bar(
+        gpa: u64,
+        gpu_base: u64,
+        size: u64,
+        cpu_aperture_size: u64,
+        knobs: &AdapterKnobs,
+    ) -> Self {
         Self::Bar {
             gpa,
+            gpu_base,
             size,
+            cpu_aperture_size,
             cpu_host: knobs.bar_seg_flags & BAR_SEG_FLAG_SUPPORTS_CPU_HOST_APERTURE != 0,
         }
     }
@@ -91,9 +106,9 @@ impl SegmentRuleViolation {
 
 /// The validated segment table. Immutable once built.
 ///
-/// Capacity is 2 because the two surviving topologies are `[Aperture, Bar]` and
-/// `[Aperture, RamCpuHost]` — the three-segment shapes were all documented as
-/// AddAdapter-rejected and were deleted (R904).
+/// Capacity is 2 because the topology remains `[Aperture, Bar]` even when the
+/// BAR-backed device-memory segment reports a larger capacity. Its programmable
+/// CPU aperture may be smaller than its reported device memory.
 #[derive(Clone, Copy)]
 pub(crate) struct SegmentTable {
     entries: [Option<SegmentSpec>; Self::MAX],

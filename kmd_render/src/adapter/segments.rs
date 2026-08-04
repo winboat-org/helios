@@ -41,9 +41,10 @@ pub struct PagingRam {
 pub struct BarSegment {
     /// Guest-physical base = the host-visible window base (partition offset 0).
     pub gpa: u64,
-    /// Partition length in bytes (== reported segment Size/CommitLimit == the
-    /// declared `DXGK_CPUHOSTAPERTURE` span == the `reserve_window_prefix`
-    /// given to the blob-window allocator).
+    /// CPU-aperture partition length in bytes (== the declared
+    /// `DXGK_CPUHOSTAPERTURE` span == the `reserve_window_prefix` given to the
+    /// blob-window allocator). `VidMmVramMB` may make the surrounding device
+    /// memory segment larger without enlarging this mapping window.
     pub size: u64,
     /// The WDDM segment id this region is reported as. All BAR-segment consumers
     /// key off this field.

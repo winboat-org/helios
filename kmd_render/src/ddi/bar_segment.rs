@@ -5,13 +5,30 @@
 //! `adapter/segments.rs` (R1101), which owns the descriptors this builds.
 
 /// Size cap for the VidMm-owned head partition of the host-visible window (the
-/// CPU-visible BAR memory segment). The window is 8 GiB on the current
-/// QEMU config (`hostmem=8G`); 1 GiB comfortably holds the CPU-rasterized
+/// CPU-visible BAR memory segment). The launcher's current test window is
+/// 4 GiB (`hostmem=4G`); 1 GiB comfortably holds the CPU-rasterized
 /// GDI/shadow/staging/shared-primary standard allocations (a full-screen
 /// surface is ~8 MiB) while leaving the rest to the KMD/ICD blob allocator.
 const BAR_SEGMENT_MAX_BYTES: u64 = 1 << 30;
 
-/// The segment topology this adapter may report. **Two shapes, not five.**
+/// Keep the opt-in device-memory range above the proven 1-GiB aperture at GPU
+/// address `0xC0000000..0x100000000`. Venus owns the real host GPU addresses,
+/// but VidMm still validates the decorative ranges it is given.
+pub(super) const VIDMM_MEMORY_BASE: u64 = 1 << 32;
+const VIDMM_VRAM_MIN_MB: u32 = 256;
+const VIDMM_VRAM_MAX_MB: u32 = 64 * 1024;
+
+fn vidmm_vram_size(knobs: &crate::adapter::AdapterKnobs) -> Option<u64> {
+    let mb = knobs.vidmm_vram_mb;
+    if !(VIDMM_VRAM_MIN_MB..=VIDMM_VRAM_MAX_MB).contains(&mb) {
+        return None;
+    }
+    Some(u64::from(mb) << 20)
+}
+
+/// The BAR portion of the segment topology. `VidMmVramMB` changes only the
+/// reported capacity of the existing BAR-backed memory segment; it never adds,
+/// reorders, or changes the placement policy of a segment.
 ///
 /// The `BarSegMode` registry DWORD (service key; read once per StartDevice, so
 /// experiments iterate via `reg add` + `devcon restart` — AddAdapter re-runs
@@ -105,9 +122,8 @@ pub(super) fn setup_bar_segment(
     Some(crate::adapter::BarSegment {
         gpa: window.base,
         size,
-        // Positional: the aperture is always index 0 (id 1), so the BAR is index
-        // 1. This used to be computed (`if mode == 10 || mode == 11 { 2 } else
-        // { 3 }`) purely because the deleted topologies moved it to id 3.
+        // Positional: the aperture is always index 0 (id 1), so the device
+        // memory segment remains index 1 (id 2), regardless of its capacity.
         seg_id: crate::ddi::gpummu::MEMORY_SEGMENT_ID,
     })
 }
@@ -140,18 +156,36 @@ pub(super) fn build_segment_table(
     // paging-buffer-host capability, which a CPU-visible memory segment never has.
     let mut specs = [SegmentSpec::Aperture; SegmentTable::MAX];
     let mut len = 1;
+    let vidmm_vram_size = vidmm_vram_size(knobs);
+    if knobs.vidmm_vram_mb != 0 && vidmm_vram_size.is_none() {
+        // Ungated and reset for every StartDevice by `read_at_start`: an invalid
+        // requested capacity must not silently collapse to the legacy topology.
+        crate::diag::record_named_bytes(b"VidVBad", knobs.vidmm_vram_mb);
+    }
     match (bar_segment.as_ref(), paging_ram) {
         // ApertureAndBar (production). The paging-RAM segment is dropped; it was
         // vestigial (page tables live in system segment 0, paging buffers in the
         // aperture).
         (Some(bar), _) => {
-            specs[1] = SegmentSpec::bar(bar.gpa, bar.size, knobs);
-            len = 2;
+            let gpu_base = if vidmm_vram_size.is_some() {
+                VIDMM_MEMORY_BASE
+            } else {
+                u64::from(knobs.bar_seg_base_mb) << 20
+            };
+            let reported_size = vidmm_vram_size.unwrap_or(bar.size);
+            specs[len] = SegmentSpec::bar(
+                bar.gpa,
+                gpu_base,
+                reported_size,
+                bar.size,
+                knobs,
+            );
+            len += 1;
         }
         // Disabled: the recovery baseline.
         (None, Some((base, size))) => {
-            specs[1] = SegmentSpec::RamCpuHost { base, size };
-            len = 2;
+            specs[len] = SegmentSpec::RamCpuHost { base, size };
+            len += 1;
         }
         (None, None) => {}
     }
