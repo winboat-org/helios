@@ -104,7 +104,19 @@ try {
   if ([string]$tmpParsed.ICD.library_path -ne $expectedLibraryPath) {
     throw "Generated ICD manifest failed readback validation: $manifestTmp"
   }
-  Move-Item -LiteralPath $manifestTmp -Destination $manifest -Force
+  if (Test-Path -LiteralPath $manifest -PathType Leaf) {
+    # Windows PowerShell's Move-Item -Force does not reliably replace an
+    # existing file (it can fail with ERROR_FILE_EXISTS). File.Replace is the
+    # same-volume atomic replacement this publishing step requires.
+    $manifestBackup = "$manifest.bak.$PID.$([guid]::NewGuid().ToString('N'))"
+    try {
+      [IO.File]::Replace($manifestTmp, $manifest, $manifestBackup, $true)
+    } finally {
+      Remove-Item -LiteralPath $manifestBackup -Force -ErrorAction SilentlyContinue
+    }
+  } else {
+    [IO.File]::Move($manifestTmp, $manifest)
+  }
 } finally {
   Remove-Item -LiteralPath $manifestTmp -Force -ErrorAction SilentlyContinue
 }
