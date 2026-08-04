@@ -718,6 +718,8 @@ struct SegmentDescriptorSpec {
     supports_cpu_host_aperture: bool,
     supports_cached_cpu_host_aperture: bool,
     populated_from_system_memory: bool,
+    application_target: bool,
+    local_budget_group: bool,
     cpu_access: CpuAccess,
 }
 
@@ -739,6 +741,8 @@ impl SegmentDescriptorSpec {
             supports_cpu_host_aperture: false,
             supports_cached_cpu_host_aperture: false,
             populated_from_system_memory: false,
+            application_target: false,
+            local_budget_group: false,
             cpu_access: CpuAccess::None,
         }
     }
@@ -764,6 +768,8 @@ impl SegmentDescriptorSpec {
             supports_cpu_host_aperture: true,
             supports_cached_cpu_host_aperture: true,
             populated_from_system_memory: false,
+            application_target: false,
+            local_budget_group: false,
             cpu_access: CpuAccess::HostAperture {
                 gpa: base,
                 pages: (len / 4096).min(u32::MAX as u64) as u32,
@@ -771,16 +777,23 @@ impl SegmentDescriptorSpec {
         }
     }
 
-    /// The fully knob-driven segment-3 descriptor. The bit ladder and its union
+    /// The fully knob-driven BAR descriptor. The bit ladder and its union
     /// special case exist HERE and nowhere else.
     ///
     ///   bit0 Aperture   bit1 CpuVisible(CpuTranslatedAddress=gpa)
     ///   bit2 CacheCoherent    bit3 SupportsCpuHostAperture
     ///   bit4 SupportsCachedCpuHostAperture   bit5 DirectFlip
     ///   bit6 PopulatedFromSystemMemory
-    fn from_bar_flags(flags: u32, base_mb: u32, gpa: u64, len: u64) -> Self {
+    fn from_bar_flags(
+        flags: u32,
+        gpu_base: u64,
+        gpa: u64,
+        len: u64,
+        cpu_aperture_len: u64,
+        application_target: bool,
+    ) -> Self {
         Self {
-            base: (base_mb as i64) << 20,
+            base: gpu_base as i64,
             size: len as SIZE_T,
             commit_limit: len as SIZE_T,
             kind: if flags & 0x01 != 0 {
@@ -793,7 +806,16 @@ impl SegmentDescriptorSpec {
             cpu_visible: flags & 0x02 != 0,
             supports_cpu_host_aperture: flags & 0x08 != 0,
             supports_cached_cpu_host_aperture: flags & 0x10 != 0,
+            // The CPU-host aperture is only a mapping window into the Venus
+            // device-memory segment; it does not make the whole segment system
+            // memory. Leaving this clear is what makes Windows count the
+            // reported capacity as dedicated video memory.
             populated_from_system_memory: flags & 0x40 != 0,
+            application_target,
+            // ApplicationTarget enrolls the segment in process budgeting;
+            // LocalBudgetGroup classifies its residency as local video
+            // memory. A dedicated Helios heap needs both.
+            local_budget_group: application_target,
             // CpuVisible claims the union first; the host aperture only gets it
             // when CpuVisible did not. This is the one condition the old code
             // spelled out inline, and the reason `CpuAccess` is an enum.
@@ -802,7 +824,7 @@ impl SegmentDescriptorSpec {
             } else if flags & 0x08 != 0 {
                 CpuAccess::HostAperture {
                     gpa,
-                    pages: (len / 4096).min(u32::MAX as u64) as u32,
+                    pages: (cpu_aperture_len / 4096).min(u32::MAX as u64) as u32,
                 }
             } else {
                 CpuAccess::None
@@ -841,6 +863,12 @@ impl SegmentDescriptorSpec {
                 }
                 if self.populated_from_system_memory {
                     f.set_PopulatedFromSystemMemory(1);
+                }
+                if self.application_target {
+                    f.set_ApplicationTarget(1);
+                }
+                if self.local_budget_group {
+                    f.set_LocalBudgetGroup(1);
                 }
             }
             match self.cpu_access {
@@ -942,7 +970,7 @@ unsafe fn write_cpu_host_memory_descriptor(seg: *mut DXGK_SEGMENTDESCRIPTOR4, ba
     unsafe { SegmentDescriptorSpec::cpu_host_memory(base, len).write_into_v4(seg) };
 }
 
-/// Segment-3 descriptor, FULLY KNOB-DRIVEN (AddAdapter shape bisect: both the
+/// BAR descriptor, FULLY KNOB-DRIVEN (AddAdapter shape bisect: both the
 /// classic-CpuVisible and CpuHostAperture shapes were rejected identically, as
 /// were 64 MiB and RAM-backed variants -- the remaining hypotheses are flag
 /// combinations and GPU-physical BaseAddress overlap with segment 2, and each
@@ -951,9 +979,9 @@ unsafe fn write_cpu_host_memory_descriptor(seg: *mut DXGK_SEGMENTDESCRIPTOR4, ba
 ///
 ///   `BarSegFlags` (REG_DWORD, default 0x1C = CacheCoherent |
 ///                  SupportsCpuHostAperture | SupportsCachedCpuHostAperture)
-///   `BarSegBaseMB` (REG_DWORD, default 0): GPU-physical BaseAddress in MiB --
-///     segment 2 sits at 0; a nonzero value (e.g. 8192 = 0x2_0000_0000) tests
-///     the BaseAddress-overlap hypothesis.
+///   `BarSegBaseMB` (REG_DWORD, default 0): GPU-physical BaseAddress in MiB for
+///     the legacy topology. The opt-in larger-capacity shape uses a fixed
+///     non-overlap base above the paging aperture.
 ///
 /// The bit ladder itself lives on [`SegmentDescriptorSpec::from_bar_flags`].
 ///
@@ -966,11 +994,19 @@ unsafe fn write_cpu_host_memory_descriptor(seg: *mut DXGK_SEGMENTDESCRIPTOR4, ba
 unsafe fn write_bar_knob_descriptor(
     seg: *mut DXGK_SEGMENTDESCRIPTOR4,
     gpa: u64,
+    gpu_base: u64,
     len: u64,
+    cpu_aperture_len: u64,
     knobs: &AdapterKnobs,
 ) {
-    let spec =
-        SegmentDescriptorSpec::from_bar_flags(knobs.bar_seg_flags, knobs.bar_seg_base_mb, gpa, len);
+    let spec = SegmentDescriptorSpec::from_bar_flags(
+        knobs.bar_seg_flags,
+        gpu_base,
+        gpa,
+        len,
+        cpu_aperture_len,
+        super::bar_segment::vidmm_vram_size(knobs).is_some(),
+    );
     unsafe { spec.write_into_v4(seg) };
 }
 
@@ -1077,14 +1113,29 @@ unsafe fn query_segments(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTERIN
                     // SAFETY: d is a writable descriptor slot (above).
                     unsafe { write_cpu_host_memory_descriptor(d, base, size) };
                 }
-                crate::ddi::segment_table::SegmentSpec::Bar { gpa, size, .. } => {
+                crate::ddi::segment_table::SegmentSpec::Bar {
+                    gpa,
+                    gpu_base,
+                    size,
+                    cpu_aperture_size,
+                    ..
+                } => {
                     crate::diag::record(0x0906_0000 | (((size >> 20) as u32) & 0xFFFF));
                     // Knob-driven descriptor (BarSegFlags/BarSegBaseMB). The
                     // production shape is CpuHostAperture-like:
                     // DxgkDdiMapCpuHostAperture maps each allocation's venus blob
                     // at the dxgkrnl-chosen aperture offset within this window.
                     // SAFETY: d is a writable descriptor slot (above).
-                    unsafe { write_bar_knob_descriptor(d, gpa, size, &knobs) };
+                    unsafe {
+                        write_bar_knob_descriptor(
+                            d,
+                            gpa,
+                            gpu_base,
+                            size,
+                            cpu_aperture_size,
+                            &knobs,
+                        )
+                    };
                 }
             }
         }

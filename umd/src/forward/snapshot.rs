@@ -146,6 +146,7 @@ unsafe fn build_ring(
                 res.as_raw() as usize,
                 &mut alloc_size,
                 &mut memory_type_index,
+                core::ptr::null_mut(),
             )
         };
         if !alloc_identity_known || alloc_size == 0 {

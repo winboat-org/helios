@@ -44,6 +44,10 @@ pub(crate) struct VenusBacking {
     pub(crate) alloc_size: u64,
     /// The creating `vkAllocateMemory`'s memory type index.
     pub(crate) memory_type_index: u32,
+    /// The ICD positively confirmed that this exact `VkDeviceMemory` owns a
+    /// live full-size VidMm mirror. False is the fail-safe value for an older
+    /// ICD or any best-effort tracker failure.
+    pub(crate) vidmm_tracked: bool,
 }
 
 impl VenusBacking {
@@ -57,6 +61,7 @@ impl VenusBacking {
         resource_id: u32,
         alloc_size: u64,
         memory_type_index: u32,
+        vidmm_tracked: bool,
     ) -> Option<Self> {
         Some(Self {
             blob_id: NonZeroU64::new(blob_id)?,
@@ -64,6 +69,7 @@ impl VenusBacking {
             resource_id: NonZeroU32::new(resource_id),
             alloc_size,
             memory_type_index,
+            vidmm_tracked,
         })
     }
 

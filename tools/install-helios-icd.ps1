@@ -79,23 +79,26 @@ if ([string]$parsed.ICD.library_path -ne $expectedLibraryPath) {
 # storage before publishing its name. The old manifest remains authoritative
 # until the final same-volume rename.
 $manifestTmp = "$manifest.tmp.$PID.$([guid]::NewGuid().ToString('N'))"
-$manifestBytes = [Text.Encoding]::ASCII.GetBytes($manifestText)
+$manifestBytes = [Text.UTF8Encoding]::new($false).GetBytes($manifestText)
 $manifestStream = $null
+$manifestBackup = $null
+$manifestValidated = $false
+$manifestPublished = $false
 try {
-  $manifestStream = [IO.FileStream]::new(
-    $manifestTmp,
-    [IO.FileMode]::CreateNew,
-    [IO.FileAccess]::Write,
-    [IO.FileShare]::None,
-    4096,
-    [IO.FileOptions]::WriteThrough)
-  $manifestStream.Write($manifestBytes, 0, $manifestBytes.Length)
-  $manifestStream.Flush($true)
-} finally {
-  if ($manifestStream) { $manifestStream.Dispose() }
-}
+  try {
+    $manifestStream = [IO.FileStream]::new(
+      $manifestTmp,
+      [IO.FileMode]::CreateNew,
+      [IO.FileAccess]::Write,
+      [IO.FileShare]::None,
+      4096,
+      [IO.FileOptions]::WriteThrough)
+    $manifestStream.Write($manifestBytes, 0, $manifestBytes.Length)
+    $manifestStream.Flush($true)
+  } finally {
+    if ($manifestStream) { $manifestStream.Dispose() }
+  }
 
-try {
   $tmpText = Get-Content -LiteralPath $manifestTmp -Raw
   if ($tmpText.IndexOf([char]0) -ge 0) {
     throw "Generated ICD manifest contains NUL bytes: $manifestTmp"
@@ -104,20 +107,51 @@ try {
   if ([string]$tmpParsed.ICD.library_path -ne $expectedLibraryPath) {
     throw "Generated ICD manifest failed readback validation: $manifestTmp"
   }
-  Move-Item -LiteralPath $manifestTmp -Destination $manifest -Force
+  if (Test-Path -LiteralPath $manifest -PathType Leaf) {
+    # Windows PowerShell's Move-Item -Force does not reliably replace an
+    # existing file (it can fail with ERROR_FILE_EXISTS). File.Replace is the
+    # same-volume atomic replacement this publishing step requires.
+    $manifestBackup = "$manifest.bak.$PID.$([guid]::NewGuid().ToString('N'))"
+    [IO.File]::Replace($manifestTmp, $manifest, $manifestBackup, $true)
+  } else {
+    [IO.File]::Move($manifestTmp, $manifest)
+  }
+  $manifestPublished = $true
+
+  $installedText = Get-Content -LiteralPath $manifest -Raw
+  if ($installedText.IndexOf([char]0) -ge 0) {
+    throw "Installed ICD manifest contains NUL bytes: $manifest"
+  }
+  $installedParsed = $installedText | ConvertFrom-Json
+  if ([string]$installedParsed.ICD.library_path -ne $expectedLibraryPath) {
+    throw "Installed ICD manifest failed final validation: $manifest"
+  }
+  Grant-HeliosReadExecute $installDirFull
+  $manifestValidated = $true
+} catch {
+  $publishError = $_
+  if ($manifestPublished -and $manifestBackup -and
+      (Test-Path -LiteralPath $manifestBackup -PathType Leaf)) {
+    $failedManifest = "$manifest.failed.$PID.$([guid]::NewGuid().ToString('N'))"
+    try {
+      [IO.File]::Replace($manifestBackup, $manifest, $failedManifest, $true)
+      Remove-Item -LiteralPath $failedManifest -Force -ErrorAction SilentlyContinue
+      $manifestBackup = $null
+      Write-Warning "ICD manifest publish failed; restored the previous manifest"
+    } catch {
+      Write-Warning "ICD manifest rollback also failed; previous manifest retained at $manifestBackup"
+    }
+  } elseif ($manifestPublished -and -not $manifestBackup) {
+    Remove-Item -LiteralPath $manifest -Force -ErrorAction SilentlyContinue
+    Write-Warning "Initial ICD manifest publish failed; removed the unvalidated manifest"
+  }
+  throw $publishError
 } finally {
   Remove-Item -LiteralPath $manifestTmp -Force -ErrorAction SilentlyContinue
+  if ($manifestValidated -and $manifestBackup) {
+    Remove-Item -LiteralPath $manifestBackup -Force -ErrorAction SilentlyContinue
+  }
 }
-
-$installedText = Get-Content -LiteralPath $manifest -Raw
-if ($installedText.IndexOf([char]0) -ge 0) {
-  throw "Installed ICD manifest contains NUL bytes: $manifest"
-}
-$installedParsed = $installedText | ConvertFrom-Json
-if ([string]$installedParsed.ICD.library_path -ne $expectedLibraryPath) {
-  throw "Installed ICD manifest failed final validation: $manifest"
-}
-Grant-HeliosReadExecute $installDirFull
 
 if ($PruneOld) {
   foreach ($oldDll in Get-ChildItem -LiteralPath $installDirFull -Filter "vulkan_virtio-*.dll" -ErrorAction SilentlyContinue) {

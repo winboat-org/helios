@@ -33,11 +33,21 @@ if (Test-Path -LiteralPath $dxvkBuild) {
     Remove-Item -LiteralPath $dxvkBuild -Recurse -Force
 }
 
+$dxvkCppArgs = @(
+    "/D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH"
+    "-Wno-deprecated-declarations"
+    "-Wno-delete-non-abstract-non-virtual-dtor"
+    "-Wno-unused-private-field"
+    "-Wno-unused-lambda-capture"
+    "-Wno-c++20-extensions"
+    "-Wno-unused-const-variable"
+) -join " "
+
 & meson.exe setup $dxvkBuild $dxvkSource `
     --native-file $nativeFile `
     --buildtype release `
     -Db_vscrt=md `
-    -Dcpp_args=/D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH `
+    "-Dcpp_args=$dxvkCppArgs" `
     "-Dc_args=/FI$compatHeader" `
     -Denable_d3d8=false `
     -Denable_d3d9=false `
@@ -55,8 +65,21 @@ $env:HELIOS_CLANG_CL = $clangCl
 $env:HELIOS_MSVC_LIB = $llvmLib
 $env:HELIOS_WDK_INCLUDE = Find-WindowsKitInclude
 $env:HELIOS_MSVC_INCLUDE = Join-Path $env:VCToolsInstallDir "include"
-$env:RUST_SCRIPT_CACHE_DIR = "C:\rs"
-New-Item -ItemType Directory -Force -Path $env:RUST_SCRIPT_CACHE_DIR | Out-Null
+
+# rust-script repeats cargo-make's 64-character generated script names in its
+# target paths. The normal runner profile makes those paths exceed link.exe's
+# legacy MAX_PATH limit. wdk-build also force-installs its own rust-script
+# version during the build, so an executable wrapper is not durable. Redirect
+# the per-user cache root for child processes instead, then restore the shell
+# folder immediately after cargo-make exits.
+$shellFoldersKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders"
+$localAppDataName = "Local AppData"
+$previousLocalAppData = Get-ItemPropertyValue -LiteralPath $shellFoldersKey -Name $localAppDataName
+$previousLocalAppDataEnvironment = $env:LOCALAPPDATA
+$shortLocalAppData = "C:\la"
+New-Item -ItemType Directory -Force -Path $shortLocalAppData | Out-Null
+Set-ItemProperty -LiteralPath $shellFoldersKey -Name $localAppDataName -Value $shortLocalAppData
+$env:LOCALAPPDATA = $shortLocalAppData
 
 $kmdRoot = Join-Path $RepoRoot "kmd_render"
 Push-Location $kmdRoot
@@ -65,6 +88,8 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "Helios driver build failed with exit code $LASTEXITCODE." }
 } finally {
     Pop-Location
+    Set-ItemProperty -LiteralPath $shellFoldersKey -Name $localAppDataName -Value $previousLocalAppData
+    $env:LOCALAPPDATA = $previousLocalAppDataEnvironment
 }
 
 $package = Join-Path $kmdRoot "target\release\helios_kmd_render_package"

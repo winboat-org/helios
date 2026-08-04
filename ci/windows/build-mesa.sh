@@ -22,6 +22,7 @@ meson setup "${build_dir}" "${mesa_src}" \
   "-Dc_args=-include${compat_header}" \
   -Dvulkan-drivers=virtio \
   -Dgallium-drivers=zink \
+  "-Dhelios-wdk-include=${repo_root}/icd/win-build/wdk-include" \
   -Dplatforms=windows \
   -Dvideo-codecs= \
   -Dvulkan-layers= \

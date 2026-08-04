@@ -569,6 +569,9 @@ pub mod knobs {
     pub const BAR_SEG_FLAGS: KnobName = KnobName::new(b"BarSegFlags");
     /// BAR descriptor `BaseAddress` in MiB (default 0).
     pub const BAR_SEG_BASE_MB: KnobName = KnobName::new(b"BarSegBaseMB");
+    /// Reported device-memory capacity in MiB. 0 (default) preserves the proven
+    /// one-GiB capacity of the existing aperture+BAR topology.
+    pub const VIDMM_VRAM_MB: KnobName = KnobName::new(b"VidMmVramMB");
     /// `DXGK_FLIPCAPS` OVERRIDE. 0 (default) = the driver's own word
     /// (`FlipOnVSyncMmIo | FlipImmediateMmIo`); nonzero replaces it verbatim,
     /// so `FlipCapsX=2` restores the pre-2026-07-29 advertisement for an A/B.

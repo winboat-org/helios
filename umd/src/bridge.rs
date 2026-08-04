@@ -85,6 +85,7 @@ mod ffi {
             d3d11_resource_ptr: usize,
             venus_alloc_size: *mut u64,
             memory_type_index: *mut u32,
+            vidmm_tracked: *mut u32,
         ) -> bool;
         /// # Safety
         /// `d3d11_resource_ptr` must be a live `ID3D11Resource*`.
@@ -652,9 +653,15 @@ impl BridgeDevice {
         d3d11_resource_ptr: usize,
         venus_alloc_size: *mut u64,
         memory_type_index: *mut u32,
+        vidmm_tracked: *mut u32,
     ) -> bool {
         self.get().is_some_and(|d| unsafe {
-            d.get_resource_alloc_identity(d3d11_resource_ptr, venus_alloc_size, memory_type_index)
+            d.get_resource_alloc_identity(
+                d3d11_resource_ptr,
+                venus_alloc_size,
+                memory_type_index,
+                vidmm_tracked,
+            )
         })
     }
 

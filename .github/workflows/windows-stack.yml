@@ -20,6 +20,7 @@ env:
   MESON_VERSION: '1.11.2'
   RUST_TOOLCHAIN: nightly-2026-07-14
   CARGO_MAKE_VERSION: '0.37.24'
+  RUST_SCRIPT_VERSION: '0.36.0'
   LLVM_VERSION: '17.0.6'
   VULKAN_SDK_VERSION: '1.4.309.0'
   CLVK_COMMIT: 7c1b20b75127e0868cdf38b81663b185a87c6c0d
@@ -61,9 +62,11 @@ jobs:
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: rust-src
-      - name: Install cargo-make
+      - name: Install Rust build helpers
         shell: pwsh
-        run: cargo install cargo-make --locked --version $env:CARGO_MAKE_VERSION
+        run: |
+          cargo install cargo-make --locked --version $env:CARGO_MAKE_VERSION
+          cargo install rust-script --locked --version $env:RUST_SCRIPT_VERSION
       - name: Ensure Windows Driver Kit is installed
         shell: pwsh
         run: ./ci/windows/Install-WindowsDriverKit.ps1
@@ -130,6 +133,16 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install Ninja
+        uses: seanmiddleditch/gha-setup-ninja@7e868db0f3406270dd46e1dac26c65f621456723
+      - name: Set up MSVC for Ninja
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756
+      - name: Restore CLVK compiler cache
+        uses: hendrikmuhs/ccache-action@5ebbd400eff9e74630f759d94ddd7b6c26299639
+        with:
+          variant: sccache
+          max-size: 2G
+          key: windows-2022-clvk-online
       - name: Install Vulkan SDK
         uses: humbletim/install-vulkan-sdk@30ba978f977e81b72d091fc8888feb1fb26f9aff
         with:

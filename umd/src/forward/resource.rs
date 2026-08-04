@@ -277,6 +277,11 @@ pub(crate) unsafe fn allocate_wddm_resource(
                 // memory ("mem cannot support mappable blob"). They still must
                 // be shareable so the host can export/import the backing memory.
                 VIRTIO_GPU_BLOB_FLAG_USE_SHAREABLE
+                    | if backing.is_some_and(|b| b.vidmm_tracked) {
+                        HELIOS_WDDM_BLOB_FLAG_VIDMM_TRACKED
+                    } else {
+                        0
+                    }
             } else {
                 VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE
             },
@@ -502,13 +507,14 @@ pub(crate) unsafe fn finish_wddm_tex2d(
     };
     // C1: record the creating vkAllocateMemory's exact size + memory type into
     // the allocation trailer so cross-process openers import with them.
-    let (mut venus_alloc_size, mut memory_type_index) = (0u64, 0u32);
+    let (mut venus_alloc_size, mut memory_type_index, mut vidmm_tracked) = (0u64, 0u32, 0u32);
     if backing_resource_id != 0 {
         if let Some(dev) = helios_device(h) {
             if !dev.dxvk.get_resource_alloc_identity(
                 res.as_raw() as usize,
                 &mut venus_alloc_size,
                 &mut memory_type_index,
+                &mut vidmm_tracked,
             ) {
                 log_error!(
                     "DDI create_resource(tex2d): no venus alloc identity for res_id={}",
@@ -523,6 +529,7 @@ pub(crate) unsafe fn finish_wddm_tex2d(
         backing_resource_id,
         venus_alloc_size,
         memory_type_index,
+        vidmm_tracked != 0,
     );
     let (allocation, km_resource) =
         match allocate_wddm_resource(h, a, mip0, h_rt, backing, direct_scanout_primary, scanout) {
