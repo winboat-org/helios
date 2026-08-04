@@ -201,9 +201,10 @@ pub(crate) struct AdapterKnobs {
     pub bar_seg_mode: u32,
     /// `VidMmVramMB` (default 0). A valid nonzero value makes the existing
     /// BAR-backed memory segment report this device-local capacity and opts
-    /// Venus tracking allocations into that local segment. The programmable
-    /// CPU aperture remains capped separately; tracking allocations never map
-    /// their identity blobs through it.
+    /// device-local Venus tracking allocations into that local segment.
+    /// Non-local Vulkan heaps remain in the aperture/shared budget. The
+    /// programmable CPU aperture stays capped separately; tracking allocations
+    /// never map their identity blobs through it.
     pub vidmm_vram_mb: u32,
 }
 

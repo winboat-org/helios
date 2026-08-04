@@ -1,9 +1,11 @@
 // Prove Helios' VidMm-only tracking allocation contract without involving Mesa.
 //
 // The probe creates one or more HELIOS_WDDM_ALLOC_KIND_TRACKING allocations,
-// makes them resident, and prints the current-process local-memory usage before
-// and after. The KMD creates a one-page identity resource for each object; the
-// full-size bytes remain owned by Venus on the host.
+// makes them resident, and prints the current-process segment usage before and
+// after. Pass `nonlocal` as the third argument to exercise the shared/aperture
+// budget; the default exercises local/dedicated. The KMD creates a one-page
+// identity resource for each object; the full-size bytes remain owned by Venus
+// on the host.
 //
 // Build from an MSVC developer command prompt:
 //   cl /nologo /W4 /O2 tools\vidmm_tracking_probe.c \
@@ -26,6 +28,7 @@ typedef LONG NTSTATUS, *PNTSTATUS;
 #define HELIOS_WDDM_MAGIC 0x4857444Du /* 'HWDM' */
 #define HELIOS_WDDM_VERSION 1u
 #define HELIOS_WDDM_ALLOC_KIND_TRACKING 3u
+#define HELIOS_WDDM_BLOB_FLAG_NONLOCAL_TRACKING 0x40000000u
 #define HELIOS_WDDM_ALLOC_KIND_SHMEM 0u
 #define VIRTIO_GPU_BLOB_MEM_HOST3D 2u
 #define VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE 1u
@@ -75,6 +78,7 @@ static D3DKMT_HANDLE g_paging_sync;
 static LUID g_adapter_luid;
 static UINT g_venus_ctx;
 static int g_backed_control;
+static int g_nonlocal_tracking;
 
 static void close_adapter_handle(D3DKMT_HANDLE handle) {
     D3DKMT_CLOSEADAPTER close_adapter;
@@ -215,14 +219,16 @@ static int open_helios(void) {
     return 0;
 }
 
-static int query_local(const char *label, UINT64 *usage_out) {
+static int query_budget(const char *label, UINT64 *usage_out) {
     D3DKMT_QUERYVIDEOMEMORYINFO query;
     NTSTATUS status;
 
     memset(&query, 0, sizeof(query));
     query.hProcess = GetCurrentProcess();
     query.hAdapter = g_adapter;
-    query.MemorySegmentGroup = D3DKMT_MEMORY_SEGMENT_GROUP_LOCAL;
+    query.MemorySegmentGroup = g_nonlocal_tracking
+                                   ? D3DKMT_MEMORY_SEGMENT_GROUP_NON_LOCAL
+                                   : D3DKMT_MEMORY_SEGMENT_GROUP_LOCAL;
     status = D3DKMTQueryVideoMemoryInfo(&query);
     if (status != 0) {
         printf("%s: QueryVideoMemoryInfo failed: status=0x%08x\n", label,
@@ -243,7 +249,7 @@ static UINT64 query_raw_statistics(const char *label) {
     D3DKMT_QUERYSTATISTICS query;
     NTSTATUS status;
     ULONG segment_id;
-    UINT64 raw_local_usage = 0;
+    UINT64 raw_tracking_usage = 0;
 
     for (segment_id = 1; segment_id <= 2; ++segment_id) {
         int is_local_segment = 0;
@@ -283,8 +289,8 @@ static UINT64 query_raw_statistics(const char *label) {
                    label, segment_id,
                    (double)process->BytesCommitted / (1024.0 * 1024.0),
                    (unsigned long)process->VideoMemory.AllocsCommitted);
-            if (is_local_segment) {
-                raw_local_usage += process->BytesCommitted;
+            if (is_local_segment != g_nonlocal_tracking) {
+                raw_tracking_usage += process->BytesCommitted;
             }
         } else {
             printf("%-16s process seg%lu query failed: status=0x%08x\n", label,
@@ -296,13 +302,16 @@ static UINT64 query_raw_statistics(const char *label) {
     query.Type = D3DKMT_QUERYSTATISTICS_PROCESS_SEGMENT_GROUP;
     query.AdapterLuid = g_adapter_luid;
     query.hProcess = GetCurrentProcess();
-    query.QueryProcessSegmentGroup = D3DKMT_MEMORY_SEGMENT_GROUP_LOCAL;
+    query.QueryProcessSegmentGroup = g_nonlocal_tracking
+                                         ? D3DKMT_MEMORY_SEGMENT_GROUP_NON_LOCAL
+                                         : D3DKMT_MEMORY_SEGMENT_GROUP_LOCAL;
     status = D3DKMTQueryStatistics(&query);
     if (status == 0) {
         const D3DKMT_QUERYSTATISTICS_PROCESS_SEGMENT_GROUP_INFORMATION *group =
             &query.QueryResult.ProcessSegmentGroupInformation;
-        printf("%-16s process local requested=%10.2f MiB usage=%10.2f MiB\n",
-               label, (double)group->Requested / (1024.0 * 1024.0),
+        printf("%-16s process %s requested=%10.2f MiB usage=%10.2f MiB\n",
+               label, g_nonlocal_tracking ? "nonlocal" : "local",
+               (double)group->Requested / (1024.0 * 1024.0),
                (double)group->Usage / (1024.0 * 1024.0));
     } else {
         printf("%-16s process group query failed: status=0x%08x\n", label,
@@ -311,9 +320,9 @@ static UINT64 query_raw_statistics(const char *label) {
     // QueryVideoMemoryInfo and PROCESS_SEGMENT_GROUP both report zero for this
     // stand-alone KMT probe on the current Windows 11 build, even though the
     // per-segment statistics (and Task Manager) account the bytes correctly.
-    // Use the non-aperture process-segment total as the authoritative raw local
-    // counter for the probe's pass/fail decision.
-    return raw_local_usage;
+    // Use the selected process-segment total as the authoritative raw counter
+    // for the probe's pass/fail decision.
+    return raw_tracking_usage;
 }
 
 static int create_tracking(UINT64 size, D3DKMT_HANDLE *allocation_out,
@@ -329,6 +338,9 @@ static int create_tracking(UINT64 size, D3DKMT_HANDLE *allocation_out,
     private_data.version = HELIOS_WDDM_VERSION;
     private_data.kind = HELIOS_WDDM_ALLOC_KIND_TRACKING;
     private_data.ctx_id = g_venus_ctx;
+    if (g_nonlocal_tracking) {
+        private_data.blob_flags = HELIOS_WDDM_BLOB_FLAG_NONLOCAL_TRACKING;
+    }
     if (g_backed_control) {
         private_data.kind = HELIOS_WDDM_ALLOC_KIND_SHMEM;
         private_data.blob_mem = VIRTIO_GPU_BLOB_MEM_HOST3D;
@@ -497,9 +509,13 @@ int main(int argc, char **argv) {
     }
     if (argc > 3 && strcmp(argv[3], "backed") == 0) {
         g_backed_control = 1;
+    } else if (argc > 3 && strcmp(argv[3], "nonlocal") == 0) {
+        g_nonlocal_tracking = 1;
     }
     if (count == 0 || count > 1024 || mib == 0 || mib > 4096) {
-        fprintf(stderr, "usage: %s [allocation-count 1..1024] [MiB 1..4096]\n",
+        fprintf(stderr,
+                "usage: %s [allocation-count 1..1024] [MiB 1..4096] "
+                "[nonlocal|backed]\n",
                 argv[0]);
         return 2;
     }
@@ -514,7 +530,7 @@ int main(int argc, char **argv) {
         failed = 1;
         goto cleanup;
     }
-    if (query_local("baseline", &reported_before)) {
+    if (query_budget("baseline", &reported_before)) {
         failed = 1;
         goto cleanup;
     }
@@ -529,23 +545,24 @@ int main(int argc, char **argv) {
     }
     printf("created %u tracking allocations of %llu MiB\n", created,
            (unsigned long long)mib);
-    (void)query_local("created", NULL);
+    (void)query_budget("created", NULL);
     (void)query_raw_statistics("created");
     if (!failed && make_resident(allocations, created)) {
         failed = 1;
     }
-    if (!failed && query_local("resident", &reported_resident)) {
+    if (!failed && query_budget("resident", &reported_resident)) {
         failed = 1;
     }
     raw_resident = query_raw_statistics("resident");
     if (!failed) {
         UINT64 expected = (UINT64)created * mib * 1024ull * 1024ull;
         UINT64 delta = raw_resident >= raw_before ? raw_resident - raw_before : 0;
-        printf("resident delta:   %.2f MiB (expected at least %.2f MiB)\n",
+        printf("resident delta:   %.2f MiB (expected %.2f MiB)\n",
                (double)delta / (1024.0 * 1024.0),
                (double)expected / (1024.0 * 1024.0));
-        if (delta < expected) {
-            puts("FAIL: raw process-local usage did not include every tracking allocation");
+        const UINT64 tolerance = 1024ull * 1024ull;
+        if (delta < expected || delta > expected + tolerance) {
+            puts("FAIL: raw process usage did not match the tracking allocation total");
             failed = 1;
         }
     }
@@ -554,10 +571,10 @@ cleanup:
     evict_and_destroy(allocations, resources, created);
     if (g_adapter) {
         Sleep(50);
-        (void)query_local("destroyed", &reported_after);
+        (void)query_budget("destroyed", &reported_after);
         raw_after = query_raw_statistics("destroyed");
         if (raw_after > raw_before + 1024ull * 1024ull) {
-            puts("FAIL: raw process-local usage did not return to baseline");
+            puts("FAIL: raw process usage did not return to baseline");
             failed = 1;
         }
     }

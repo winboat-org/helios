@@ -45,6 +45,20 @@ pub const HELIOS_WDDM_ALLOC_KIND_STANDARD: u32 = 2;
 /// identity resource while VidMm charges the full requested size.
 pub const HELIOS_WDDM_ALLOC_KIND_TRACKING: u32 = 3;
 
+/// Guest-private bit in [`HeliosWddmAllocPrivate::blob_flags`]. On an adopted
+/// DEVICE_MEMORY allocation it attests that the creator successfully made a
+/// matching full-size VidMm tracker, so the adopted identity may be charged as
+/// one page. Missing/older ICD exports leave this clear and therefore retain
+/// the safe full-size adopted charge. Old KMDs ignore this bit after selecting
+/// the adopted-resource arm, so the version-1 wire layout remains compatible.
+pub const HELIOS_WDDM_BLOB_FLAG_VIDMM_TRACKED: u32 = 0x8000_0000;
+/// Guest-private bit in [`HeliosWddmAllocPrivate::blob_flags`] on a TRACKING
+/// allocation. The mirrored Vulkan memory belongs to a non-device-local heap
+/// and must be charged to the aperture/shared budget. Old KMDs safely ignore
+/// this hint and temporarily over-classify the tracker as local during a mixed
+/// deployment; no virtio blob command ever receives the private bit.
+pub const HELIOS_WDDM_BLOB_FLAG_NONLOCAL_TRACKING: u32 = 0x4000_0000;
+
 /// [`HeliosWddmAllocMeta::misc_flags`] — the standard allocation is the exact
 /// VidPn primary selected for direct scanout.
 ///
@@ -242,7 +256,8 @@ pub struct HeliosWddmOpenIdentity {
     /// falls back to the page-rounded blob size when the creator did not
     /// record one).
     pub venus_alloc_size: u64,
-    /// Page-rounded virtio-gpu blob size (the WDDM allocation size).
+    /// Page-rounded virtio-gpu blob size. This remains the full renderer size
+    /// even when VidMm receives only a one-page tracked-adoption identity.
     pub blob_size: u64,
     pub magic: u32,   // == HELIOS_WDDM_IDENTITY_MAGIC
     pub version: u32, // == HELIOS_WDDM_IDENTITY_VERSION
@@ -441,7 +456,7 @@ pub const D3DDDIFMT_X8R8G8B8: u32 = 22;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AllocationBacking {
     /// A one-page host identity object used only so VidMm can account the
-    /// matching Venus device-memory allocation in its local segment.
+    /// matching Venus device-memory allocation in its Vulkan heap's budget.
     VidMmTracking { size: u64 },
     /// A live virtio resource created by the UMD/ICD, adopted by this
     /// allocation. `take_ownership` re-owns the blob slot from the ICD's escape
@@ -481,14 +496,16 @@ pub enum ClassifyRefusal {
 }
 
 /// Decide one allocation's backing class. Pure: no adapter, no host round-trip,
-/// no side effect — which is what makes the five arms unit-testable.
+/// no side effect — which is what makes the six semantic arms unit-testable.
 ///
-/// `supplied_resource_id` is the id the UMD passed in `adopt_resource_id`, already filtered
-/// by kind (STANDARD and DEVICE_MEMORY carry one; SHMEM does not).
+/// `supplied_resource_id` is the id the UMD passed in `adopt_resource_id`,
+/// already filtered by kind (STANDARD and DEVICE_MEMORY carry one; SHMEM and
+/// tracking allocations do not).
 ///
-/// ORDER IS LOAD-BEARING and reproduces the old if/else chain exactly:
-/// adopt wins over everything, then primary-standard, then GDI texture, then
-/// any other standard, then the raw blob. In particular a STANDARD allocation
+/// ORDER IS LOAD-BEARING: already-validated tracking allocations are classified
+/// first, then adoption wins over the standard-allocation arms, followed by
+/// primary-standard, GDI texture, any other standard, and finally the raw
+/// blob. In particular a STANDARD allocation
 /// flagged BOTH `PRIMARY` and `OPTIMAL_GDI_TEXTURE` classifies as the primary —
 /// `GetStandardAllocationDriverData`'s own if/else makes that combination
 /// unreachable, and the test below pins it so a future writer cannot change the
@@ -694,11 +711,9 @@ mod classify_tests {
     }
 
     #[test]
-    fn tracking_allocations_ignore_supplied_resource_identity() {
-        let mut p = private(HELIOS_WDDM_ALLOC_KIND_TRACKING);
-        p.adopt_resource_id = 42;
+    fn valid_tracking_allocations_classify_without_resource_identity() {
         assert_eq!(
-            classify(&p, &meta(HELIOS_WDDM_ALLOC_MISC_PRIMARY), 42),
+            classify(&private(HELIOS_WDDM_ALLOC_KIND_TRACKING), &meta(0), 0),
             Ok(AllocationBacking::VidMmTracking { size: 4096 })
         );
     }

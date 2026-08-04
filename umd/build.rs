@@ -248,9 +248,18 @@ fn main() {
         println!("cargo:rustc-link-lib=dylib={lib}");
     }
 
-    println!("cargo:rerun-if-changed=bridge/dxvk_bridge.cpp");
-    println!("cargo:rerun-if-changed=bridge/dxvk_bridge.h");
-    println!("cargo:rerun-if-changed=src/bridge.rs");
+    for path in [
+        "bridge/bridge_common.h",
+        "bridge/bridge_dxbc.cpp",
+        "bridge/bridge_dxbc.h",
+        "bridge/bridge_icd_exports.cpp",
+        "bridge/bridge_icd_exports.h",
+        "bridge/dxvk_bridge.cpp",
+        "bridge/dxvk_bridge.h",
+        "src/bridge.rs",
+    ] {
+        println!("cargo:rerun-if-changed={path}");
+    }
     println!("cargo:rerun-if-env-changed=HELIOS_DXVK_SRC");
     println!("cargo:rerun-if-env-changed=HELIOS_DXVK_BUILD");
 }

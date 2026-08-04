@@ -23,10 +23,10 @@ use helios_protocol::{
     HELIOS_WDDM_ALLOC_KIND_TRACKING, HELIOS_WDDM_ALLOC_MISC_DIRECT_SCANOUT,
     HELIOS_WDDM_ALLOC_MISC_GDI_TYPE_MASK, HELIOS_WDDM_ALLOC_MISC_GDI_TYPE_SHIFT,
     HELIOS_WDDM_ALLOC_MISC_OPTIMAL_GDI_TEXTURE, HELIOS_WDDM_ALLOC_MISC_PRIMARY,
-    HELIOS_WDDM_ALLOC_MISC_RESOURCE_ASSOCIATED,
-    HELIOS_WDDM_ALLOC_MISC_STANDARD_TYPE_MASK, HELIOS_WDDM_ALLOC_MISC_STANDARD_TYPE_SHIFT,
-    VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE, VIRTIO_GPU_BLOB_MEM_HOST3D, VIRTIO_GPU_MAP_CACHE_CACHED,
-    VIRTIO_GPU_MAP_CACHE_WC,
+    HELIOS_WDDM_ALLOC_MISC_RESOURCE_ASSOCIATED, HELIOS_WDDM_ALLOC_MISC_STANDARD_TYPE_MASK,
+    HELIOS_WDDM_ALLOC_MISC_STANDARD_TYPE_SHIFT, HELIOS_WDDM_BLOB_FLAG_NONLOCAL_TRACKING,
+    HELIOS_WDDM_BLOB_FLAG_VIDMM_TRACKED, VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE,
+    VIRTIO_GPU_BLOB_MEM_HOST3D, VIRTIO_GPU_MAP_CACHE_CACHED, VIRTIO_GPU_MAP_CACHE_WC,
 };
 
 use crate::adapter::{AdapterContext, ScanoutGuard};
@@ -1328,7 +1328,6 @@ pub(crate) unsafe fn set_bar_placement(h: HANDLE, offset: u64) {
     }
 }
 
-
 /// Direct-scan-out allocations, keyed by venus resource id.
 ///
 /// WHY IT EXISTS. `DxgkDdiPresent` receives only `hDeviceSpecificAllocation`
@@ -1666,6 +1665,13 @@ struct VidMmPlacement {
     accessed_physically: bool,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TrackingBudget {
+    None,
+    Local,
+    NonLocal,
+}
+
 /// Allocations marked CpuVisible in the BAR segment WITHOUT an aperture segment
 /// in their supported set — the shape dxgkrnl rejects for a VidPn commit.
 ///
@@ -1679,7 +1685,7 @@ pub(crate) static APERTURE_MISSING_CPU_VISIBLE: AtomicU32 = AtomicU32::new(0);
 
 fn vidmm_placement(
     bar_eligible: bool,
-    dedicated_tracking: bool,
+    tracking_budget: TrackingBudget,
     bar_seg_id: Option<u32>,
     is_primary: bool,
     is_optimal_gdi_texture: bool,
@@ -1688,19 +1694,31 @@ fn vidmm_placement(
     let aperture_bit = 1u32 << (crate::ddi::gpummu::APERTURE_SEGMENT_ID - 1);
 
     // A tracking allocation represents bytes already owned by Venus. Its
-    // one-page KMD resource is identity only: VidMm must charge the allocation's
-    // full declared size to the opted-in local budget, but must never make it
-    // CPU-visible or route content paging through the blob engine. Keep
-    // `bar_eligible` false for this class; local placement and BAR byte access
-    // are deliberately separate decisions.
-    if let (true, Some(seg_id)) = (dedicated_tracking, bar_seg_id) {
-        return VidMmPlacement {
-            preferred_segment: seg_id,
-            supported_segments: 1u32 << (seg_id - 1),
-            cpu_visible: false,
-            cached: false,
-            accessed_physically: false,
-        };
+    // one-page KMD resource is identity only: VidMm charges the full declared
+    // size to the matching Vulkan heap's budget, but must never make it
+    // CPU-visible or route content paging through the blob engine. Local
+    // tracking requires the opted-in device segment; non-local tracking (and a
+    // local request without that segment) uses the aperture/shared budget.
+    match (tracking_budget, bar_seg_id) {
+        (TrackingBudget::Local, Some(seg_id)) => {
+            return VidMmPlacement {
+                preferred_segment: seg_id,
+                supported_segments: 1u32 << (seg_id - 1),
+                cpu_visible: false,
+                cached: false,
+                accessed_physically: false,
+            };
+        }
+        (TrackingBudget::Local | TrackingBudget::NonLocal, _) => {
+            return VidMmPlacement {
+                preferred_segment: crate::ddi::gpummu::APERTURE_SEGMENT_ID,
+                supported_segments: aperture_bit,
+                cpu_visible: false,
+                cached: false,
+                accessed_physically: false,
+            };
+        }
+        (TrackingBudget::None, _) => {}
     }
 
     let (preferred_segment, supported_segments) =
@@ -2418,16 +2436,17 @@ unsafe fn create_one(
     } else {
         ap.size as SIZE_T
     });
-    // A DEVICE_MEMORY allocation that adopts a UMD/Venus resource is only the
-    // WDDM identity for bytes already charged by that VkDeviceMemory's tracking
-    // allocation. Reporting the full resource size here charges the same
-    // physical allocation twice (once local, once aperture). Keep the exact
-    // renderer size in `AllocationContext` and the open-allocation identity,
-    // but give VidMm one page for this second, identity-only handle. This also
-    // preserves the proven aperture placement: moving adopted resources into
-    // the local segment makes their first MakeResident device-remove the UMD.
+    // A DEVICE_MEMORY allocation that adopts a UMD/Venus resource is only a
+    // one-page VidMm identity when the current ICD positively attests that its
+    // full-size tracking allocation succeeded. Missing/old exports and every
+    // tracker failure leave the bit clear and retain this allocation's full
+    // fail-safe charge. Keep the exact renderer size in `AllocationContext`
+    // and the open identity in either case. The adopted object stays in its
+    // proven aperture placement: moving it local makes the first MakeResident
+    // device-remove the UMD.
     let vidmm_size = if ap.kind == HELIOS_WDDM_ALLOC_KIND_DEVICE_MEMORY
         && supplied_resource_id != 0
+        && ap.blob_flags & HELIOS_WDDM_BLOB_FLAG_VIDMM_TRACKED != 0
     {
         PAGE
     } else {
@@ -2449,11 +2468,19 @@ unsafe fn create_one(
     let bar_eligible = created.blob_size.is_host_authoritative()
         && !is_optimal_gdi_texture
         && bar_seg_id.is_some();
-    // `VidMmVramMB` is the explicit opt-in to dedicated accounting. Without a
-    // valid configured capacity, preserve the old aperture placement so merely
-    // loading a newer ICD cannot consume the legacy one-GiB BAR budget.
-    let dedicated_tracking = ap.kind == HELIOS_WDDM_ALLOC_KIND_TRACKING
-        && crate::ddi::bar_segment::vidmm_vram_size(&adapter.knobs()).is_some();
+    // The ICD classifies the backing Vulkan heap. Non-device-local memory stays
+    // in the aperture/shared budget. Device-local tracking enters the local
+    // budget only when `VidMmVramMB` explicitly supplies its capacity;
+    // otherwise preserve the legacy aperture placement.
+    let tracking_budget = if ap.kind != HELIOS_WDDM_ALLOC_KIND_TRACKING {
+        TrackingBudget::None
+    } else if ap.blob_flags & HELIOS_WDDM_BLOB_FLAG_NONLOCAL_TRACKING != 0 {
+        TrackingBudget::NonLocal
+    } else if crate::ddi::bar_segment::vidmm_vram_size(&adapter.knobs()).is_some() {
+        TrackingBudget::Local
+    } else {
+        TrackingBudget::NonLocal
+    };
 
     let ctx = Box::new(AllocationContext {
         magic: ALLOCATION_CTX_MAGIC,
@@ -2518,7 +2545,7 @@ unsafe fn create_one(
     // fails the whole VidPn commit → 0-path VidPn → display never activates.
     let placement = vidmm_placement(
         bar_eligible,
-        dedicated_tracking,
+        tracking_budget,
         bar_seg_id,
         is_primary,
         is_optimal_gdi_texture,
