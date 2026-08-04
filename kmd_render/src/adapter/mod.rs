@@ -199,10 +199,11 @@ pub(crate) struct AdapterKnobs {
     /// `crate::ddi::bar_segment::BarSegTopology`; kept raw here so the coerced
     /// value can be reported.
     pub bar_seg_mode: u32,
-    /// `VidMmVramMB` (default 0). Nonzero makes the existing BAR-backed memory
-    /// segment report this device-local capacity while its programmable CPU
-    /// aperture remains capped separately. This changes capacity reporting,
-    /// not residency accounting; the latter needs real paging integration.
+    /// `VidMmVramMB` (default 0). A valid nonzero value makes the existing
+    /// BAR-backed memory segment report this device-local capacity and opts
+    /// Venus tracking allocations into that local segment. The programmable
+    /// CPU aperture remains capped separately; tracking allocations never map
+    /// their identity blobs through it.
     pub vidmm_vram_mb: u32,
 }
 

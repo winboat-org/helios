@@ -1679,12 +1679,30 @@ pub(crate) static APERTURE_MISSING_CPU_VISIBLE: AtomicU32 = AtomicU32::new(0);
 
 fn vidmm_placement(
     bar_eligible: bool,
+    dedicated_tracking: bool,
     bar_seg_id: Option<u32>,
     is_primary: bool,
     is_optimal_gdi_texture: bool,
     display_half: bool,
 ) -> VidMmPlacement {
     let aperture_bit = 1u32 << (crate::ddi::gpummu::APERTURE_SEGMENT_ID - 1);
+
+    // A tracking allocation represents bytes already owned by Venus. Its
+    // one-page KMD resource is identity only: VidMm must charge the allocation's
+    // full declared size to the opted-in local budget, but must never make it
+    // CPU-visible or route content paging through the blob engine. Keep
+    // `bar_eligible` false for this class; local placement and BAR byte access
+    // are deliberately separate decisions.
+    if let (true, Some(seg_id)) = (dedicated_tracking, bar_seg_id) {
+        return VidMmPlacement {
+            preferred_segment: seg_id,
+            supported_segments: 1u32 << (seg_id - 1),
+            cpu_visible: false,
+            cached: false,
+            accessed_physically: false,
+        };
+    }
+
     let (preferred_segment, supported_segments) =
         if let (true, Some(seg_id)) = (bar_eligible, bar_seg_id) {
             // Prefer the BAR (the two-memory-split fix keeps CPU raster in the venus
@@ -2416,6 +2434,11 @@ unsafe fn create_one(
     let bar_eligible = created.blob_size.is_host_authoritative()
         && !is_optimal_gdi_texture
         && bar_seg_id.is_some();
+    // `VidMmVramMB` is the explicit opt-in to dedicated accounting. Without a
+    // valid configured capacity, preserve the old aperture placement so merely
+    // loading a newer ICD cannot consume the legacy one-GiB BAR budget.
+    let dedicated_tracking = ap.kind == HELIOS_WDDM_ALLOC_KIND_TRACKING
+        && crate::ddi::bar_segment::vidmm_vram_size(&adapter.knobs()).is_some();
 
     let ctx = Box::new(AllocationContext {
         magic: ALLOCATION_CTX_MAGIC,
@@ -2480,6 +2503,7 @@ unsafe fn create_one(
     // fails the whole VidPn commit → 0-path VidPn → display never activates.
     let placement = vidmm_placement(
         bar_eligible,
+        dedicated_tracking,
         bar_seg_id,
         is_primary,
         is_optimal_gdi_texture,

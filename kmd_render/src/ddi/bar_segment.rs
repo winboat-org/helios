@@ -26,9 +26,10 @@ pub(super) fn vidmm_vram_size(knobs: &crate::adapter::AdapterKnobs) -> Option<u6
     Some(u64::from(mb) << 20)
 }
 
-/// The BAR portion of the segment topology. `VidMmVramMB` changes only the
-/// reported capacity of the existing BAR-backed memory segment; it never adds,
-/// reorders, or changes the placement policy of a segment.
+/// The BAR portion of the segment topology. `VidMmVramMB` changes the reported
+/// capacity of the existing BAR-backed memory segment and opts VidMm-only Venus
+/// tracking allocations into it. It never adds or reorders a segment, and it
+/// does not enlarge the separately capped CPU-host aperture.
 ///
 /// The `BarSegMode` registry DWORD (service key; read once per StartDevice, so
 /// experiments iterate via `reg add` + `devcon restart` — AddAdapter re-runs

@@ -243,9 +243,11 @@ static UINT64 query_raw_statistics(const char *label) {
     D3DKMT_QUERYSTATISTICS query;
     NTSTATUS status;
     ULONG segment_id;
-    UINT64 process_local_usage = 0;
+    UINT64 raw_local_usage = 0;
 
     for (segment_id = 1; segment_id <= 2; ++segment_id) {
+        int is_local_segment = 0;
+
         memset(&query, 0, sizeof(query));
         query.Type = D3DKMT_QUERYSTATISTICS_SEGMENT;
         query.AdapterLuid = g_adapter_luid;
@@ -254,13 +256,15 @@ static UINT64 query_raw_statistics(const char *label) {
         if (status == 0) {
             const D3DKMT_QUERYSTATISTICS_SEGMENT_INFORMATION *segment =
                 &query.QueryResult.SegmentInformation;
+            is_local_segment = segment->Aperture == 0;
             printf("%-16s raw seg%lu committed=%10.2f MiB resident=%10.2f MiB "
-                   "allocs=%lu/%lu\n",
+                   "allocs=%lu/%lu aperture=%lu\n",
                    label, segment_id,
                    (double)segment->BytesCommitted / (1024.0 * 1024.0),
                    (double)segment->BytesResident / (1024.0 * 1024.0),
                    (unsigned long)segment->Memory.AllocsCommitted,
-                   (unsigned long)segment->Memory.AllocsResident);
+                   (unsigned long)segment->Memory.AllocsResident,
+                   (unsigned long)segment->Aperture);
         } else {
             printf("%-16s raw seg%lu query failed: status=0x%08x\n", label,
                    segment_id, (unsigned)status);
@@ -279,6 +283,9 @@ static UINT64 query_raw_statistics(const char *label) {
                    label, segment_id,
                    (double)process->BytesCommitted / (1024.0 * 1024.0),
                    (unsigned long)process->VideoMemory.AllocsCommitted);
+            if (is_local_segment) {
+                raw_local_usage += process->BytesCommitted;
+            }
         } else {
             printf("%-16s process seg%lu query failed: status=0x%08x\n", label,
                    segment_id, (unsigned)status);
@@ -297,12 +304,16 @@ static UINT64 query_raw_statistics(const char *label) {
         printf("%-16s process local requested=%10.2f MiB usage=%10.2f MiB\n",
                label, (double)group->Requested / (1024.0 * 1024.0),
                (double)group->Usage / (1024.0 * 1024.0));
-        process_local_usage = group->Usage;
     } else {
         printf("%-16s process group query failed: status=0x%08x\n", label,
                (unsigned)status);
     }
-    return process_local_usage;
+    // QueryVideoMemoryInfo and PROCESS_SEGMENT_GROUP both report zero for this
+    // stand-alone KMT probe on the current Windows 11 build, even though the
+    // per-segment statistics (and Task Manager) account the bytes correctly.
+    // Use the non-aperture process-segment total as the authoritative raw local
+    // counter for the probe's pass/fail decision.
+    return raw_local_usage;
 }
 
 static int create_tracking(UINT64 size, D3DKMT_HANDLE *allocation_out,
