@@ -2418,6 +2418,21 @@ unsafe fn create_one(
     } else {
         ap.size as SIZE_T
     });
+    // A DEVICE_MEMORY allocation that adopts a UMD/Venus resource is only the
+    // WDDM identity for bytes already charged by that VkDeviceMemory's tracking
+    // allocation. Reporting the full resource size here charges the same
+    // physical allocation twice (once local, once aperture). Keep the exact
+    // renderer size in `AllocationContext` and the open-allocation identity,
+    // but give VidMm one page for this second, identity-only handle. This also
+    // preserves the proven aperture placement: moving adopted resources into
+    // the local segment makes their first MakeResident device-remove the UMD.
+    let vidmm_size = if ap.kind == HELIOS_WDDM_ALLOC_KIND_DEVICE_MEMORY
+        && supplied_resource_id != 0
+    {
+        PAGE
+    } else {
+        size
+    };
     // CPU-rasterized surfaces (GDI/shadow/staging/shared-primary standard
     // allocations, KMD-backed by a mappable venus blob) go to the BAR memory
     // segment: CPU raster then lands in the SAME bytes the allocation's venus
@@ -2494,8 +2509,8 @@ unsafe fn create_one(
     if is_direct_scanout {
         register_scanout_allocation(ctx_resource_id, info.hAllocation as usize);
     }
-    info.Size = size;
-    info.PitchAlignedSize = size;
+    info.Size = vidmm_size;
+    info.PitchAlignedSize = vidmm_size;
     // The scan-out display primary (CpuVisible SHAREDPRIMARYSURFACE) needs special
     // handling: dxgkrnl rejects it unless the supported segment set includes an
     // APERTURE segment ("CPUVisible allocations must include an aperture segment in

@@ -65,7 +65,7 @@ virtio-gpu scanout; IddCx/Looking Glass is no longer the active display path.*
   GTK/Wayland still fails during the full run with repeated GDK
   `eglMakeCurrent` errors and remains unverified.
 
-### VidMm / Task Manager validation (2026-08-04, KMD 22.22.247.0)
+### VidMm / Task Manager validation (2026-08-04, KMD 22.22.249.0)
 
 - Task Manager's 4.0 GiB dedicated capacity is now backed by the configured
   `VidMmVramMB=4096` local segment while the CPU-visible aperture remains
@@ -76,6 +76,20 @@ virtio-gpu scanout; IddCx/Looking Glass is no longer the active display path.*
   probe moved the local segment from 486.46 to 998.46 MiB (`+512.00 MiB`),
   left the aperture segment unchanged at 26.52 MiB, then returned both to
   baseline after evict/destroy.
+- Exportable DXVK/Venus memory initially had two full VidMm charges: its local
+  `VkDeviceMemory` tracking allocation and the WDDM allocation that adopts the
+  same renderer resource in the aperture. The adopted allocation is now an
+  identity-only one-page VidMm object while its private open identity and KMD
+  context retain the exact renderer size. Eight shared 64 MiB D3D11 render
+  targets consequently measured exactly `+512.00 MiB` local and only
+  `+0.03 MiB` aperture (eight pages), then released both. An attempted
+  local-segment placement for the adopted WDDM allocation was rejected: its
+  first `CreateTexture2D` device-removed the UMD, so that policy never shipped.
+- The `.249` hardware gate passed 12/12 direct-KMT cycles, 12/12 native-Vulkan
+  cycles and 12/12 shared-D3D11 cycles. A 40-allocation Vulkan high-water test
+  charged exactly 2560 MiB locally with no aperture movement, and four
+  concurrent eight-allocation processes charged exactly 2048 MiB locally;
+  DWM kept the same responsive process throughout.
 - The Task Manager-triggered DWM abort was a mixed-source Mesa deployment: the
   installed ICD combined the old `vn_queue.c` with only four files from the
   newer VidMm work. Deploying one coherent Mesa `1a02ba9` image restored the
