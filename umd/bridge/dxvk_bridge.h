@@ -62,7 +62,8 @@ struct HeliosDxvkDevice {
   bool get_resource_alloc_identity(
       std::size_t d3d11_resource_ptr,
       std::uint64_t* venus_alloc_size,
-      std::uint32_t* memory_type_index) const noexcept;
+      std::uint32_t* memory_type_index,
+      std::uint32_t* vidmm_tracked) const noexcept;
   bool transfer_resource_ownership(std::size_t d3d11_resource_ptr) const noexcept;
   std::size_t open_ddi_texture2d(
       std::uint32_t width,

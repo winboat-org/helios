@@ -2,10 +2,10 @@
 //
 // Moved verbatim out of `dxvk_bridge.cpp` by T8/R1105: the Win32 module walk,
 // the Vulkan ICD manifest discovery (registry + environment), the hand-rolled
-// JSON `library_path` parser, the resolve-once export table, and the six
+// JSON `library_path` parser, the coherent-module export table, and the eight
 // readers `bridge_icd_exports.h` publishes.
 //
-// Everything else here is PRIVATE to this TU -- `find_export_in_loaded_modules`,
+// Everything else here is PRIVATE to this TU -- `resolve_helios_icd_module`,
 // `discover_vulkan_icd_manifests`, `parse_icd_library_path`,
 // `helios_icd_export<Fn>`, `log_export_unavailable` -- which is the
 // reachability reduction the split buys: nothing outside this file can reach
@@ -35,18 +35,29 @@
 
 namespace helios_bridge {
 
-  template<typename Fn>
-  Fn find_export_in_loaded_modules(const char* export_name) {
+  constexpr const char* kHeliosIcdAnchorExport =
+    "helios_venus_memory_alloc_info";
+
+  HMODULE find_helios_icd_in_loaded_modules() {
     HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
     if (snapshot != INVALID_HANDLE_VALUE) {
       MODULEENTRY32 module = {};
       module.dwSize = sizeof(module);
       if (Module32First(snapshot, &module)) {
         do {
-          auto fn = reinterpret_cast<Fn>(GetProcAddress(module.hModule, export_name));
-          if (fn) {
-            CloseHandle(snapshot);
-            return fn;
+          if (GetProcAddress(module.hModule, kHeliosIcdAnchorExport)) {
+            // Hold one reference for the process-wide export table. Looking up
+            // each export independently can mix two ICD versions and call a
+            // function with a foreign VkDeviceMemory/VkInstance handle.
+            HMODULE held = nullptr;
+            if (GetModuleHandleExA(0, module.szExePath, &held)) {
+              char msg[512];
+              std::snprintf(msg, sizeof(msg),
+                "selected coherent loaded ICD module -> %s", module.szExePath);
+              umd_log(msg);
+              CloseHandle(snapshot);
+              return held;
+            }
           }
         } while (Module32Next(snapshot, &module));
       }
@@ -231,8 +242,7 @@ namespace helios_bridge {
     return manifests;
   }
 
-  template<typename Fn>
-  Fn find_export_via_vulkan_icd_manifests(const char* export_name) {
+  HMODULE load_helios_icd_from_manifests() {
     auto manifests = discover_vulkan_icd_manifests();
     for (const auto& manifest : manifests) {
       const auto dll = resolve_icd_library_path(manifest);
@@ -241,56 +251,57 @@ namespace helios_bridge {
       HMODULE mod = LoadLibraryA(dll.c_str());
       if (!mod)
         continue;
-      auto fn = reinterpret_cast<Fn>(GetProcAddress(mod, export_name));
-      if (!fn) {
-        // Release the reference this call took. Without it the refcount grows
-        // on EVERY probe of an export this module does not have — and the
-        // success cache does not bound that, because a miss is retried on
-        // every call by design (an export can legitimately appear later). The
-        // miss path is the only one where the growth was ever unbounded.
-        // LoadLibraryA on an already-loaded module only increments, so this
-        // returns the module to exactly its previous state and can never
-        // unload one another component is using.
+      if (!GetProcAddress(mod, kHeliosIcdAnchorExport)) {
         FreeLibrary(mod);
         continue;
       }
-      // Deliberately NOT freed on the hit path: `fn` points into this module,
-      // so the reference is what keeps it valid. The success cache bounds that
-      // to one extra reference per export (seven total).
 
       char msg[512];
-      std::snprintf(msg, sizeof(msg), "resolved %s via ICD manifest %s -> %s",
-        export_name, manifest.c_str(), dll.c_str());
+      std::snprintf(msg, sizeof(msg),
+        "selected coherent ICD module via manifest %s -> %s",
+        manifest.c_str(), dll.c_str());
       umd_log(msg);
-      return fn;
+      return mod;
     }
     return nullptr;
   }
 
-  // The seven Mesa-ICD exports this bridge resolves, as a process-wide table.
+  HMODULE resolve_helios_icd_module() {
+    static std::atomic<HMODULE> s_module;
+    if (HMODULE cached = s_module.load(std::memory_order_acquire))
+      return cached;
+
+    HMODULE module = find_helios_icd_in_loaded_modules();
+    if (!module)
+      module = load_helios_icd_from_manifests();
+    if (!module)
+      return nullptr;
+
+    HMODULE expected = nullptr;
+    if (!s_module.compare_exchange_strong(expected, module,
+          std::memory_order_release, std::memory_order_acquire)) {
+      FreeLibrary(module);
+      return expected;
+    }
+    return module;
+  }
+
+  // The eight Mesa-ICD exports this bridge resolves, as a process-wide table.
   //
-  // `find_helios_icd_export` used to cache NOTHING. Every call took a full
-  // TH32CS_SNAPMODULE snapshot and called GetProcAddress on every loaded module
-  // until it reached the Mesa ICD — which is late in the load order, so most of
-  // the list gets walked — and on a miss it then walked the Vulkan ICD manifest
-  // list, read and parsed JSON off disk, and LoadLibraryA'd each candidate with
-  // NO matching FreeLibrary, so a persistent miss also grew module refcounts
-  // without bound. `get_resource_memory_info` alone costs two lookups per call.
+  // The old resolver cached each export independently. Every uncached call
+  // took a full TH32CS_SNAPMODULE snapshot and called GetProcAddress on every
+  // loaded module until it reached the Mesa ICD — which is late in the load
+  // order, so most of the list gets walked — and on a miss it then walked the
+  // Vulkan ICD manifest list, read and parsed JSON off disk, and could select a
+  // different version for a newly added export. The module is now selected and
+  // held once; a missing export is a fail-safe miss within that exact module.
   //
-  // CRITICAL: cache SUCCESSES ONLY, per export. A std::call_once or a magic
-  // static over the resolution would latch an early nullptr — the Mesa ICD is
-  // not loaded until `new dxvk::DxvkInstance`, and helios_venus_query_scanout in
-  // particular can legitimately miss before the KMD has a bound primary — and
-  // that would permanently disable the venus identity plumbing for the process.
-  // Failure retries exactly as it did before; the per-slot std::atomic is what
-  // makes retry-on-failure race-free without a mutex. No code path stores
-  // nullptr into a slot.
-  //
-  // FreeLibrary: released on the MISS path (see
-  // find_export_via_vulkan_icd_manifests), deliberately held on the HIT path
-  // because the cached pointer is INTO that module. Caching bounds the hit-path
-  // references to one per export; it does NOT bound the miss path, which is
-  // retried on every call by design — that is why the miss needs the free.
+  // CRITICAL: cache the MODULE only after success. A std::call_once or a magic
+  // static over a failed resolution would latch an early nullptr — the Mesa ICD
+  // is not loaded until `new dxvk::DxvkInstance`. That would permanently
+  // disable the venus identity plumbing for the process.
+  // Failure retries exactly as before. Once selected, all object-taking
+  // exports remain pinned to the same module for process lifetime.
   enum class HeliosIcdExport : std::size_t {
     CurrentCtxId = 0,
     InstanceCtxId,
@@ -298,6 +309,7 @@ namespace helios_bridge {
     MemoryResId,
     MemoryTransferOwnership,
     MemoryAllocInfo,
+    MemoryVidMmTracked,
     RegisterPresentStream,
     Count,
   };
@@ -314,13 +326,15 @@ namespace helios_bridge {
     case HeliosIcdExport::MemoryTransferOwnership:
       return "helios_venus_memory_transfer_resource_ownership";
     case HeliosIcdExport::MemoryAllocInfo: return "helios_venus_memory_alloc_info";
+    case HeliosIcdExport::MemoryVidMmTracked:
+      return "helios_venus_memory_vidmm_tracked";
     case HeliosIcdExport::RegisterPresentStream:
       return "helios_venus_register_present_stream";
     default: return "";
     }
   }
 
-  // Discovery order is unchanged, so a resolution that works today still works.
+  // A private entry point may only come from the selected coherent ICD module.
   void* resolve_helios_icd_export(HeliosIcdExport slot) {
     static std::atomic<void*> s_cache[kHeliosIcdExportCount];
     const auto index = static_cast<std::size_t>(slot);
@@ -328,11 +342,9 @@ namespace helios_bridge {
       return nullptr;
     if (void* cached = s_cache[index].load(std::memory_order_acquire))
       return cached;
-
-    const char* export_name = helios_icd_export_name(slot);
-    void* fn = find_export_in_loaded_modules<void*>(export_name);
-    if (!fn)
-      fn = find_export_via_vulkan_icd_manifests<void*>(export_name);
+    HMODULE module = resolve_helios_icd_module();
+    void* fn = module ? reinterpret_cast<void*>(
+      GetProcAddress(module, helios_icd_export_name(slot))) : nullptr;
     if (fn)
       s_cache[index].store(fn, std::memory_order_release);
     return fn;
@@ -491,6 +503,18 @@ namespace helios_bridge {
       return fn(memory, alloc_size, memory_type_index);
 
     log_export_unavailable(HeliosIcdExport::MemoryAllocInfo);
+    return false;
+  }
+
+  bool venus_memory_vidmm_tracked_from_handle(VkDeviceMemory memory) {
+    if (memory == VK_NULL_HANDLE)
+      return false;
+
+    using Fn = bool (__cdecl*)(VkDeviceMemory);
+    if (auto fn = helios_icd_export<Fn>(HeliosIcdExport::MemoryVidMmTracked))
+      return fn(memory);
+
+    log_export_unavailable(HeliosIcdExport::MemoryVidMmTracked);
     return false;
   }
 

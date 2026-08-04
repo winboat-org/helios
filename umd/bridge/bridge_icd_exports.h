@@ -1,9 +1,9 @@
 // The Helios venus ICD export surface: the loader spelunking's public results.
 //
-// T8/R1105. Only the six readers `dxvk_bridge.cpp` actually calls are declared
-// here; the manifest discovery, the JSON parsing, the resolve-once export table
-// and the `helios_icd_export<Fn>` template stay private to
-// `bridge_icd_exports.cpp`, which is the reachability reduction the split buys.
+// T8/R1105. Only the eight readers `dxvk_bridge.cpp` actually calls are
+// declared here; manifest discovery, JSON parsing, the coherent-module export
+// table and `helios_icd_export<Fn>` stay private to `bridge_icd_exports.cpp`,
+// which is the reachability reduction the split buys.
 //
 // ⚠ INCLUDE ORDER: this header names `VkInstance` and `VkDeviceMemory` but does
 // NOT include a Vulkan header of its own. DXVK ships its own loader shim
@@ -32,6 +32,7 @@ std::uint32_t venus_memory_transfer_resource_ownership(VkDeviceMemory memory);
 bool venus_memory_alloc_info_from_handle(VkDeviceMemory memory,
                                         std::uint64_t* alloc_size,
                                         std::uint32_t* memory_type_index);
+bool venus_memory_vidmm_tracked_from_handle(VkDeviceMemory memory);
 
 /* Register the exact UMD-created OPAQUE_WIN32 timeline with this Vulkan device
  * as a monotonic present stream.  Resolved by private ICD DLL export so an old

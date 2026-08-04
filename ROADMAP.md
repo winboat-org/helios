@@ -65,6 +65,59 @@ virtio-gpu scanout; IddCx/Looking Glass is no longer the active display path.*
   GTK/Wayland still fails during the full run with repeated GDK
   `eglMakeCurrent` errors and remains unverified.
 
+### VidMm / Task Manager validation (2026-08-04, KMD 22.22.250.0)
+
+- Task Manager's 4.0 GiB dedicated capacity is now backed by the configured
+  `VidMmVramMB=4096` local segment while the CPU-visible aperture remains
+  separately capped. A live SDL-window check showed `0.5/4.0 GB` dedicated,
+  `0.0/6.0 GB` shared and `0.5/10.0 GB` total.
+- Venus `VkDeviceMemory` tracking allocations follow the Vulkan memory heap:
+  device-local allocations use the local non-aperture segment without becoming
+  BAR-mappable, while non-device-local allocations use the aperture/shared
+  segment. Direct KMT and native-Vulkan four-by-64 MiB probes each measured
+  exactly `+256.00 MiB` in the selected segment, no movement in the other
+  segment, and a return to baseline after destroy.
+- Exportable DXVK/Venus memory initially had two full VidMm charges: its local
+  `VkDeviceMemory` tracking allocation and the WDDM allocation that adopts the
+  same renderer resource in the aperture. The adopted allocation is now an
+  identity-only one-page VidMm object only when the current ICD positively
+  attests that the full-size tracker exists; missing exports and tracker
+  failures retain the safe full-size adopted charge. Its private open identity
+  and KMD context retain the exact renderer size. Eight shared 64 MiB D3D11
+  render targets consequently measured exactly `+512.00 MiB` local and only
+  `+0.03 MiB` aperture (eight pages), then released both. An attempted
+  local-segment placement for the adopted WDDM allocation was rejected: its
+  first `CreateTexture2D` device-removed the UMD, so that policy never shipped.
+- The `.249` hardware gate passed 12/12 direct-KMT cycles, 12/12 native-Vulkan
+  cycles and 12/12 shared-D3D11 cycles. A 40-allocation Vulkan high-water test
+  charged exactly 2560 MiB locally with no aperture movement, and four
+  concurrent eight-allocation processes charged exactly 2048 MiB locally;
+  DWM kept the same responsive process throughout.
+- The `.250` heap-aware gate passed exact local and non-local direct-KMT tests,
+  exact local and non-local native-Vulkan tests, and the eight-allocation D3D11
+  adoption test above. A pre-tracking ICD retained one full shared charge; an
+  older tracking ICD without the attestation export retained both its exact
+  local tracker and one conservative full shared charge, proving the mixed
+  deployment cannot under-report. Private export lookup is pinned to one ICD
+  module so a missing old export cannot fall through to a newer DLL and receive
+  a foreign Vulkan handle. The UMD build now watches every compiled bridge
+  source and header, preventing incremental builds from silently reusing stale
+  C++ objects. The installed signed package reports `22.22.250.0`, PnP status
+  is Code 0, DWM stayed responsive, and no new display/PnP/WHEA/BugCheck
+  critical or error events appeared.
+- Known boundary: a full-size tracker belongs to the creating Vulkan process,
+  while the one-page adopted WDDM allocation can be shared cross-process. If a
+  creator exits while another process alone keeps that shared allocation alive,
+  dedicated usage can temporarily under-report until tracking ownership is
+  moved onto the global WDDM allocation. The normal DWM/Task Manager and tested
+  same-process allocation paths are exact; this lifetime redesign remains
+  follow-up work rather than being hidden as a completed guarantee.
+- The Task Manager-triggered DWM abort was a mixed-source Mesa deployment: the
+  installed ICD combined the old `vn_queue.c` with only four files from the
+  newer VidMm work. Deploying one coherent Mesa `1a02ba9` image restored the
+  imported-Win32-timeline path; Task Manager then stayed open with a stable DWM
+  process. The separate, pre-existing PnP-restart DWM fault remains defect 0z.
+
 ## Current priorities
 
 1. **DONE (2026-07-28) — the Phase-1 quality refactor of `kmd_render` and

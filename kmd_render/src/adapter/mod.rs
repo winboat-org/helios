@@ -199,6 +199,13 @@ pub(crate) struct AdapterKnobs {
     /// `crate::ddi::bar_segment::BarSegTopology`; kept raw here so the coerced
     /// value can be reported.
     pub bar_seg_mode: u32,
+    /// `VidMmVramMB` (default 0). A valid nonzero value makes the existing
+    /// BAR-backed memory segment report this device-local capacity and opts
+    /// device-local Venus tracking allocations into that local segment.
+    /// Non-local Vulkan heaps remain in the aperture/shared budget. The
+    /// programmable CPU aperture stays capped separately; tracking allocations
+    /// never map their identity blobs through it.
+    pub vidmm_vram_mb: u32,
 }
 
 impl AdapterKnobs {
@@ -222,6 +229,7 @@ impl AdapterKnobs {
         bar_seg_flags: 0x1C,
         bar_seg_base_mb: 0,
         bar_seg_mode: 10,
+        vidmm_vram_mb: 0,
     };
 
     /// Read every knob once. PASSIVE_LEVEL.
@@ -246,6 +254,7 @@ impl AdapterKnobs {
             bar_seg_flags: read_config_dword(knobs::BAR_SEG_FLAGS, 0x1C),
             bar_seg_base_mb: read_config_dword(knobs::BAR_SEG_BASE_MB, 0),
             bar_seg_mode: read_config_dword(knobs::BAR_SEG_MODE, 10),
+            vidmm_vram_mb: read_config_dword(knobs::VIDMM_VRAM_MB, 0),
         }
     }
 
@@ -264,6 +273,8 @@ impl AdapterKnobs {
         crate::diag::record_named_bytes(b"BarF", knobs.bar_seg_flags);
         crate::diag::record_named_bytes(b"BarB", knobs.bar_seg_base_mb);
         crate::diag::record_named_bytes(b"BarM", knobs.bar_seg_mode);
+        crate::diag::record_named_bytes(b"VidVram", knobs.vidmm_vram_mb);
+        crate::diag::record_named_bytes(b"VidVBad", 0);
         knobs
     }
 }

@@ -134,6 +134,7 @@ unsafe fn build_ring(
                 res.as_raw() as usize,
                 &mut alloc_size,
                 &mut memory_type_index,
+                core::ptr::null_mut(),
             )
         } || alloc_size == 0
         {

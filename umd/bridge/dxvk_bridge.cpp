@@ -567,12 +567,15 @@ bool HeliosDxvkDevice::get_resource_memory_info(
 bool HeliosDxvkDevice::get_resource_alloc_identity(
     std::size_t d3d11_resource_ptr,
     std::uint64_t* venus_alloc_size,
-    std::uint32_t* memory_type_index) const noexcept {
+    std::uint32_t* memory_type_index,
+    std::uint32_t* vidmm_tracked) const noexcept {
   return bridge_guard("get_resource_alloc_identity", false, [&]() -> bool {
     if (venus_alloc_size)
       *venus_alloc_size = 0;
     if (memory_type_index)
       *memory_type_index = 0;
+    if (vidmm_tracked)
+      *vidmm_tracked = 0;
 
     if (!d3d11_resource_ptr)
       return false;
@@ -583,7 +586,13 @@ bool HeliosDxvkDevice::get_resource_alloc_identity(
       return false;
 
     auto info = texture->GetImage()->storage()->getMemoryInfo();
-    return venus_memory_alloc_info_from_handle(info.memory, venus_alloc_size, memory_type_index);
+    const bool valid = venus_memory_alloc_info_from_handle(
+      info.memory, venus_alloc_size, memory_type_index);
+    if (valid && vidmm_tracked) {
+      *vidmm_tracked =
+        venus_memory_vidmm_tracked_from_handle(info.memory) ? 1u : 0u;
+    }
+    return valid;
   });
 }
 
