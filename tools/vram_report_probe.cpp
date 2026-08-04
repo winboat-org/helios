@@ -10,6 +10,8 @@
 // allocation. Shared is intentional: private DXVK resources have no paired
 // WDDM allocation and therefore cannot exercise VidMm accounting.
 // `--hold-seconds N` keeps them alive for host-side VRAM observation.
+// `--vulkan-allocs N` performs the same boundary test with 64-MiB native
+// Vulkan device-memory allocations and prints the VkResult for each request.
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -322,12 +324,126 @@ static void report_vulkan() {
   vkDestroyInstance(instance, nullptr);
 }
 
+static void report_vulkan_allocations(unsigned allocation_count,
+                                      unsigned hold_seconds) {
+  VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
+  app.pApplicationName = "Helios Vulkan allocation probe";
+  app.apiVersion = VK_API_VERSION_1_1;
+  VkInstanceCreateInfo create{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
+  create.pApplicationInfo = &app;
+  VkInstance instance = VK_NULL_HANDLE;
+  VkResult result = vkCreateInstance(&create, nullptr, &instance);
+  if (result != VK_SUCCESS) {
+    std::printf("\nVulkan allocation test: vkCreateInstance failed: %d\n",
+                result);
+    return;
+  }
+
+  uint32_t device_count = 0;
+  result = vkEnumeratePhysicalDevices(instance, &device_count, nullptr);
+  std::vector<VkPhysicalDevice> physical_devices(device_count);
+  if (result == VK_SUCCESS && device_count) {
+    result = vkEnumeratePhysicalDevices(instance, &device_count,
+                                        physical_devices.data());
+  }
+  VkPhysicalDevice physical = VK_NULL_HANDLE;
+  for (VkPhysicalDevice candidate : physical_devices) {
+    VkPhysicalDeviceProperties properties{};
+    vkGetPhysicalDeviceProperties(candidate, &properties);
+    if (properties.deviceType != VK_PHYSICAL_DEVICE_TYPE_CPU) {
+      physical = candidate;
+      break;
+    }
+  }
+  if (result != VK_SUCCESS || physical == VK_NULL_HANDLE) {
+    std::printf("\nVulkan allocation test: accelerated device not found (%d)\n",
+                result);
+    vkDestroyInstance(instance, nullptr);
+    return;
+  }
+
+  uint32_t queue_count = 0;
+  vkGetPhysicalDeviceQueueFamilyProperties(physical, &queue_count, nullptr);
+  std::vector<VkQueueFamilyProperties> queues(queue_count);
+  vkGetPhysicalDeviceQueueFamilyProperties(physical, &queue_count,
+                                           queues.data());
+  uint32_t queue_family = UINT32_MAX;
+  for (uint32_t i = 0; i < queue_count; ++i) {
+    if (queues[i].queueCount) {
+      queue_family = i;
+      break;
+    }
+  }
+
+  VkPhysicalDeviceMemoryProperties memory{};
+  vkGetPhysicalDeviceMemoryProperties(physical, &memory);
+  uint32_t memory_type = UINT32_MAX;
+  for (uint32_t i = 0; i < memory.memoryTypeCount; ++i) {
+    if (memory.memoryTypes[i].propertyFlags &
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) {
+      memory_type = i;
+      break;
+    }
+  }
+  if (queue_family == UINT32_MAX || memory_type == UINT32_MAX) {
+    std::puts("\nVulkan allocation test: no usable queue or device memory");
+    vkDestroyInstance(instance, nullptr);
+    return;
+  }
+
+  const float priority = 1.0f;
+  VkDeviceQueueCreateInfo queue{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
+  queue.queueFamilyIndex = queue_family;
+  queue.queueCount = 1;
+  queue.pQueuePriorities = &priority;
+  VkDeviceCreateInfo device_create{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
+  device_create.queueCreateInfoCount = 1;
+  device_create.pQueueCreateInfos = &queue;
+  VkDevice device = VK_NULL_HANDLE;
+  result = vkCreateDevice(physical, &device_create, nullptr, &device);
+  std::printf("\nVulkan device-memory allocation test\n");
+  std::printf("  vkCreateDevice             %d\n", result);
+  if (result != VK_SUCCESS) {
+    vkDestroyInstance(instance, nullptr);
+    return;
+  }
+
+  std::vector<VkDeviceMemory> allocations;
+  allocations.reserve(allocation_count);
+  VkMemoryAllocateInfo allocate{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+  allocate.allocationSize = 64ull * 1024 * 1024;
+  allocate.memoryTypeIndex = memory_type;
+  for (unsigned i = 0; i < allocation_count; ++i) {
+    VkDeviceMemory allocation = VK_NULL_HANDLE;
+    result = vkAllocateMemory(device, &allocate, nullptr, &allocation);
+    std::printf("  allocation %u x 64 MiB     %d\n", i + 1, result);
+    if (result != VK_SUCCESS)
+      break;
+    allocations.push_back(allocation);
+  }
+
+  if (hold_seconds) {
+    std::printf("  Holding %zu allocations for %u second(s)\n",
+                allocations.size(), hold_seconds);
+    std::fflush(stdout);
+    Sleep(hold_seconds * 1000);
+  }
+  for (VkDeviceMemory allocation : allocations)
+    vkFreeMemory(device, allocation, nullptr);
+  vkDestroyDevice(device, nullptr);
+  vkDestroyInstance(instance, nullptr);
+}
+
 int main(int argc, char **argv) {
   unsigned d3d11_allocations = 0;
+  unsigned vulkan_allocations = 0;
   unsigned hold_seconds = 0;
   for (int i = 1; i + 1 < argc; i += 2) {
     if (std::strcmp(argv[i], "--d3d11-allocs") == 0)
       d3d11_allocations =
+          static_cast<unsigned>(std::strtoul(argv[i + 1], nullptr, 10));
+    else if (std::strcmp(argv[i], "--vulkan-allocs") == 0)
+      vulkan_allocations =
           static_cast<unsigned>(std::strtoul(argv[i + 1], nullptr, 10));
     else if (std::strcmp(argv[i], "--hold-seconds") == 0)
       hold_seconds =
@@ -345,5 +461,7 @@ int main(int argc, char **argv) {
   report_vulkan();
   if (d3d11_allocations)
     report_d3d11_allocations(d3d11_allocations, hold_seconds);
+  if (vulkan_allocations)
+    report_vulkan_allocations(vulkan_allocations, hold_seconds);
   return 0;
 }
