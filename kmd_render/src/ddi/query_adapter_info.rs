@@ -404,8 +404,38 @@ unsafe fn query_driver_caps(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTE
     // PagingNode = 0 (single engine node). MemoryManagementCaps.PagingNode is the
     // second field of DXGK_VIDMMCAPS, after the flags union; the zero-fill at the
     // top of this fn already leaves it 0, which is what we want.
-    let max_queued_flip_on_vsync: UINT = 1;
+
+    // `MaxQueuedFlipOnVSync` is "the number of flips that can be queued and
+    // pending at the graphics hardware" (WDK). The historical advertisement was
+    // the hard literal 1, which is the most restrictive contract WDDM has: it
+    // means dxgkrnl may not issue present N+1's flip until flip N has retired.
+    //
+    // For Helios that is a REAL serialisation, not a formality, because a flip's
+    // DMA fence is honest — `dxgkddi_submit_command_virtual` queues it behind the
+    // venus work outstanding at submit and completes it from the interrupt DPC —
+    // so "flip N retired" means "frame N finished on the host GPU". At depth 1
+    // the guest producer and the host GPU therefore cannot overlap at all, which
+    // is what the 2026-08-04 GT1 measurement found: 16% of presents blocked 1-19
+    // ms inside dxgkrnl while `DxgkDdiPresent` itself averaged 7.9 us, and GT1
+    // and GT2 had converged on one number.
+    //
+    // Nothing in this driver holds a per-flip resource that a deeper queue could
+    // exhaust: `arm_dma_flip_programming` publishes into ONE coalescing pending
+    // slot (`VpCoal`/`DEFERRED_REPLACED`) whose newest entry wins, and it already
+    // coalesces the large majority of flips at depth 1.
+    const FLIP_QUEUE_DEPTH_DEFAULT: u32 = 1;
+    /// Bound on the advertised depth. Not a WDK limit — a guard so a mistyped
+    /// service value cannot ask dxgkrnl to queue an absurd number of flips.
+    const FLIP_QUEUE_DEPTH_MAX: u32 = 16;
+    let max_queued_flip_on_vsync: UINT = crate::diag::read_config_dword(
+        crate::diag::knobs::FLIP_QUEUE_DEPTH,
+        FLIP_QUEUE_DEPTH_DEFAULT,
+    )
+    .clamp(1, FLIP_QUEUE_DEPTH_MAX);
     out.set(caps_offset!(MaxQueuedFlipOnVSync), max_queued_flip_on_vsync);
+    // Same reason as `FlipCapV`: what was ADVERTISED, so a knob that read as its
+    // default cannot be mistaken for a knob that had no effect.
+    crate::diag::record_named_bytes(b"FlipQueV", max_queued_flip_on_vsync);
     // DIRECT-FLIP DENIAL (27th session, 2026-07-07): SupportDirectFlip=1 was an
     // unbacked bring-up advertisement (no bisect ever showed it load-mandatory —
     // the STEP-0 bisect above proved only FlipOnVSyncMmIo). On this adapter it is

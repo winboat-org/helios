@@ -65,6 +65,13 @@ pub static PARKED_HIGH_WATER: AtomicU32 = AtomicU32::new(0);
 pub static PARKED_LEAKS: AtomicU32 = AtomicU32::new(0);
 /// WDDM submissions completed by the DPC (real venus-driven fences).
 pub static WDDM_FENCE_FROM_DPC: AtomicU32 = AtomicU32::new(0);
+/// Why the WDDM FIFO head was not ready when a DPC looked at it. Exactly one
+/// of the three moves per blocked look, so their sum is the blocked-look total
+/// and their ratio names WHICH dependency paces fence retirement. Mirrored as
+/// `WfBWire` / `WfBStrm` / `WfBBlt`.
+pub static WDDM_HEAD_BLOCKED_WIRE: AtomicU32 = AtomicU32::new(0);
+pub static WDDM_HEAD_BLOCKED_STREAM: AtomicU32 = AtomicU32::new(0);
+pub static WDDM_HEAD_BLOCKED_BLT: AtomicU32 = AtomicU32::new(0);
 /// Fenced SUBMIT_3D enqueues carrying ring_idx >= 1 (GPU-completion fences —
 /// WS1 #4 consumer-side ordering; these retire at host GPU completion, not
 /// decode, so they legally stay in flight for the full GPU-work duration).

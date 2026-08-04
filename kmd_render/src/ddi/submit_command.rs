@@ -114,6 +114,27 @@ pub(crate) fn record_present_handoff_telemetry() {
     crate::diag::record_named_bytes(b"PmWFn", PRESENT_MARKER_LAST_FENCE.load(Ordering::Relaxed));
     crate::diag::record_named_bytes(b"PmWSz", PRESENT_MARKER_LAST_SIZE.load(Ordering::Relaxed));
     crate::diag::record_named_bytes(b"PmHit", PRESENT_MARKER_HITS.load(Ordering::Relaxed));
+    // How many WDDM submissions took the exact-boundary watermark (`PresentWmk`).
+    // Zero with the knob off is the correct reading; a knob that reads as its
+    // default must be distinguishable from a knob that had no effect.
+    crate::diag::record_named_bytes(
+        b"PwExact",
+        crate::virtio::gpu::PRESENT_EXACT_WATERMARK_USED.load(Ordering::Relaxed),
+    );
+    // WHY the WDDM FIFO head was not ready. The head paces every fence behind
+    // it, so this ratio names what actually paces present retirement.
+    crate::diag::record_named_bytes(
+        b"WfBWire",
+        crate::virtio::gpu::WDDM_HEAD_BLOCKED_WIRE.load(Ordering::Relaxed),
+    );
+    crate::diag::record_named_bytes(
+        b"WfBStrm",
+        crate::virtio::gpu::WDDM_HEAD_BLOCKED_STREAM.load(Ordering::Relaxed),
+    );
+    crate::diag::record_named_bytes(
+        b"WfBBlt",
+        crate::virtio::gpu::WDDM_HEAD_BLOCKED_BLT.load(Ordering::Relaxed),
+    );
     crate::diag::record_named_bytes(b"PmScan", PRESENT_MARKER_SCAN_HITS.load(Ordering::Relaxed));
     crate::diag::record_named_bytes(b"PmOff", PRESENT_MARKER_LAST_OFFSET.load(Ordering::Relaxed));
     crate::diag::record_named_bytes(b"PmVir", SUBMIT_VIRTUAL_COUNT.load(Ordering::Relaxed));

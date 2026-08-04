@@ -1955,6 +1955,65 @@ Open defects, roughly ordered:
 
 ## Workstream 2 — Performance
 
+- **THE PRESENT BLOCK IS ATTRIBUTED AND HALVED (2026-08-04/05, KMD
+  22.22.243.0 → 22.22.244.0).** `umd_present_callback` (548–661 µs/frame, the
+  single largest ours-attributable cost on the app's render thread) is not CPU
+  and not our `DxgkDdiPresent` (7.9 µs mean): it is **one dxgkrnl wait**.
+  A `Microsoft-Windows-DxgKrnl` ETW slice names it — `BlockThread` `Reason=2`
+  on 21.1 % of presents, mean 2448 µs, **516 µs amortised = the whole callback**
+  — and pins the mechanism exactly: **89 of 91 blocks began with exactly 3
+  `PresentQueuePacket`s outstanding** (non-blocked presents saw 0/1/2) and
+  **90 of 91 unblocks landed within 200 µs of a `PresentQueuePacket Stop`**
+  (median 12.1 µs). dxgkrnl allows three outstanding present packets; the
+  fourth present blocks until one retires.
+  **Why the queue filled was OUR defect:** `note_wddm_submission` gated every
+  non-paging WDDM fence on `async_retired_up_to(next_wire_fence, IncludingGpu)`
+  — *every transport entry enqueued before the buffer* — although each
+  submission already carries its exact dependency (`stream_ready` on its live
+  present stream boundary, present on 95.8 % of them: `PmHit` 12452 /
+  `PmLeg` 13003). The DXVK CS thread runs ahead of the presenting thread, so
+  the superset routinely covered LATER frames' work. `arm_dma_flip`'s 0ab-B
+  note recorded the same over-wait from the flush side in 22.22.210.0 and fixed
+  it there; the fence path kept it.
+  **Fix: `PresentWmk` (service key, default 1 since 22.22.244.0; `0` is the
+  same-boot A/B disable).** A submission carrying a LIVE boundary is gated on
+  that boundary alone. FIFO order, monotonic fence completion, the
+  stale-generation cancellation path, paging, WindowedBlt admission and every
+  scanout bind/flush ordering rule are untouched.
+  **Measured** (same boot, `pnputil /restart-device` between cells):
+  `DxgkDdiSubmitCommand`→DMA_COMPLETED 5.825→4.854 ms mean, 6.110→3.995 ms p50;
+  flip packet lifetime 8.594→7.398 ms; `umd_present_callback` 626–661→359 µs;
+  presents/run 6793–6892→7184. **GT1 +4.30 % / +3.74 % paired**, and on the
+  canonical STANDARD preset **Graphics 45 365 / 46 500 → 47 875 (median
+  45 933 → 49 405, +7.6 %)**, GT2 carrying most of it (183.8/190.2 → 196.7–211.7).
+  Host-GPU envelope barely moves (mean 59.8→60.7 %, p50 64→68 %): the extra
+  frames come out of the guest, and the host still has headroom.
+  **The residual is now NAMED, not guessed:** `.244` adds `WfBWire` /
+  `WfBStrm` / `WfBBlt` (exactly one moves per blocked look at the WDDM FIFO
+  head). One GT1 gives `WfBStrm=15482`, `WfBWire=93`, `WfBBlt=0` — the
+  over-wait is gone (0.6 %), and what paces retirement is `stream_ready`, i.e.
+  the frame's own producer completion on the host. That is physics. Its shape
+  is bursty: flip packets retire in **106.6 bursts/s, mean size 2.20,
+  inter-burst gap p50 10.06 ms**, so the app issues three presents and waits
+  for the next burst — **that burst cadence is the next question.**
+  Frame budget under the fix: **producer 3.716 ms (p10 3.273) + kernel
+  0.571 ms = 4.288 ms**; even a perfect kernel leaves ~269 fps.
+  Artifacts: `tmp/perf/present-watermark-arm/` (prediction + outcome),
+  `tmp/perf/flip-queue-arm/` (the REJECTED `MaxQueuedFlipOnVSync` arm and the
+  ETW that replaced it), `tmp/perf/etw-slice-242/`, `tmp/perf/etw-slice-pwmk1-243/`,
+  `tmp/perf/fs-std-244/`. Reusable: `tmp/perf/run-gt1-arm.ps1` +
+  `launch-gt1-arm.ps1` (feed trace + counters + read ledger + scanout timeline
+  around one GT1, `-Extra NAME=VALUE` for env-knob arms),
+  `tmp/perf/ab-presentwmk.ps1` / `ab-env.ps1` (interleaved A/B — GT1 drifts
+  across a session, so all-A-then-all-B cannot separate knob from drift),
+  `tmp/perf/sample-host-gpu.sh` (host-side GPU envelope).
+  **REJECTED, do not retry:** `MaxQueuedFlipOnVSync` (the `FlipQueueN` knob,
+  default 1) at depth 4 with and without `FlipOnVSyncWithNoWait` — inert on
+  both fps and present-callback time; and
+  `HELIOS_DXVK_LOCAL_ALLOC_CACHE_FALLBACK=1` **re-tested under the fix**
+  (+1.41 / −0.60 / −0.07 % paired), which also kills the "the present block was
+  absorbing its CPU saving" hypothesis.
+
 - **THE FRAME IS ATTRIBUTED (2026-08-02, 65th session, measurement-only):
   GT1 is guest render-thread bound; the host GPU idles at ~35 % busy
   (~200 W of 400 W) and NOTHING else in the pipeline is saturated** —
@@ -3085,7 +3144,16 @@ Plan:
 - **Registry knobs** (service key, active KMD reads): `DiagLevel`,
   `AllocCached`, `DisplayHalf`, `ScanoutDiag`,
   `DirectFlipCaps`, `CrossAdaptCaps`, `BarSegMode`, `BarSegFlags`,
-  `BarSegBaseMB`.
+  `BarSegBaseMB`, `PresentWmk`, `FlipQueueN`.
+  **`PresentWmk` (default 1 since 22.22.244.0)** gates a WDDM submission that
+  carries a live present stream boundary on that boundary alone instead of on
+  the whole `next_wire_fence` backlog; `0` restores the historical superset for
+  a same-boot A/B. Advertised value mirrored in `PwExact`; the FIFO-head block
+  reason in `WfBWire`/`WfBStrm`/`WfBBlt`. **`FlipQueueN` (default 1)** sets
+  `DXGK_DRIVERCAPS::MaxQueuedFlipOnVSync` (mirrored in `FlipQueV`); depth 4 was
+  MEASURED INERT on 2026-08-04 with and without `FlipCapsX=3`, so it exists as a
+  bisect handle only. Both are read at AddAdapter/transport init, so
+  `pnputil /restart-device` applies them with no reboot.
   `DisplayHalf=1` enables the render+display adapter shape. `AllocCached=0`
   is the CpuVisible cached-allocation kill switch. `DirectFlipCaps` and `CrossAdaptCaps` are
   explicit cap-advertisement probes; leave off unless bisecting.

@@ -576,6 +576,28 @@ pub mod knobs {
     /// 1 `FlipOnVSyncMmIo`, 2 `FlipInterval`, 3 `FlipImmediateMmIo`. Read at
     /// AddAdapter, so `pnputil /restart-device` applies it without a rebuild.
     pub const FLIP_CAPS_EXTRA: KnobName = KnobName::new(b"FlipCapsX");
+    /// `DXGK_DRIVERCAPS.MaxQueuedFlipOnVSync` — how many flips dxgkrnl may keep
+    /// queued and pending on this adapter at once. Default 1 is the historical
+    /// advertisement; a Helios flip retires only when its DMA fence completes,
+    /// which by design waits on the venus work outstanding at submit, so a
+    /// depth of 1 makes present N+1 wait for frame N's host completion. Read at
+    /// AddAdapter, so `pnputil /restart-device` applies it without a rebuild.
+    /// 0 is coerced to 1 (a zero-depth flip queue is not representable) and the
+    /// value actually advertised is mirrored in the `FlipQueV` counter.
+    pub const FLIP_QUEUE_DEPTH: KnobName = KnobName::new(b"FlipQueueN");
+    /// `PresentWmk` (default 1 = ON since 22.22.244.0). Gate a WDDM submission
+    /// that carries a LIVE present stream boundary on that exact boundary
+    /// alone, rather than additionally on every transport entry enqueued before
+    /// it. The superset delays the DMA fence by the whole guest→host pipeline
+    /// depth, which is what makes dxgkrnl block the presenting thread at its
+    /// 3-deep present queue (ETW `BlockThread` Reason=2). Measured 2026-08-04
+    /// on GT1: `DxgkDdiSubmitCommand`→DMA_COMPLETED mean 5.825→4.854 ms
+    /// (p50 6.110→3.995), flip packet lifetime 8.594→7.398 ms,
+    /// `umd_present_callback` 625-661→359 us, GT1 +3.7…+4.3% paired.
+    /// `0` is the same-boot A/B disable and restores the historical superset
+    /// exactly. Snapshotted at transport init, so `pnputil /restart-device`
+    /// flips it without a reboot.
+    pub const PRESENT_EXACT_WATERMARK: KnobName = KnobName::new(b"PresentWmk");
 }
 
 /// Read a service-key REG_DWORD knob, or `default` if absent.

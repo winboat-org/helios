@@ -1355,6 +1355,11 @@ pub enum FenceEventReg {
 /// Driver-global and monotonic across StartDevice/StopDevice cycles. Starts at
 /// 1 because 0 is the "no fence" sentinel every predicate tests for.
 static NEXT_WIRE_FENCE_BASE: AtomicU64 = AtomicU64::new(1);
+
+/// WDDM submissions whose fence was gated on their exact live present stream
+/// boundary instead of the whole `next_wire_fence` backlog (`PresentWmk=1`).
+/// Mirrored as `PwExact`; zero while the knob is off is the correct reading.
+pub(crate) static PRESENT_EXACT_WATERMARK_USED: AtomicU32 = AtomicU32::new(0);
 /// Gap between one instance's first id and the next instance's.
 ///
 /// Far more than any instance can consume: at the ~10^5 fences a heavy session
@@ -1897,6 +1902,12 @@ pub struct VirtioGpu {
     /// completion rather than host decode. See `AdapterKnobs::dma_gpu_fence`
     /// for the contract this restores.
     dma_gpu_fence: bool,
+    /// `PresentWmk`: gate a WDDM submission that carries a LIVE present stream
+    /// boundary on that exact boundary alone, instead of additionally on the
+    /// whole `next_wire_fence` backlog. Default 1 since 22.22.244.0; `0` is the
+    /// same-boot A/B disable that restores the historical superset.
+    /// See the watermark arm in [`Self::note_wddm_submission`].
+    present_exact_watermark: bool,
     scanout_refresh: Box<ScanoutRefreshState>,
     /// Ring-corruption latch: set when the used ring returns a token we do not
     /// track or `pop_used` fails structurally. The ring state is then
@@ -2154,6 +2165,10 @@ impl VirtioGpu {
             // `reg add` + `pnputil /restart-device` flips it with no reboot.
             dma_gpu_fence: crate::diag::read_config_dword(crate::diag::knobs::DMA_GPU_FENCE, 1)
                 != 0,
+            present_exact_watermark: crate::diag::read_config_dword(
+                crate::diag::knobs::PRESENT_EXACT_WATERMARK,
+                1,
+            ) != 0,
             scanout_refresh: allocate_scanout_refresh_state(),
             failed: false,
             display_mode,
@@ -5576,6 +5591,29 @@ impl VirtioGpu {
                 // work actually enqueued before this WDDM submission.
                 self.next_wire_fence
             }
+        } else if stream_boundary.is_some() && self.present_exact_watermark {
+            // EXACT PRESENT WATERMARK (2026-08-04). `next_wire_fence` is "every
+            // transport entry enqueued before this WDDM buffer" — a superset
+            // that includes work belonging to LATER frames, because the DXVK CS
+            // thread runs ahead of the presenting thread and dxgkrnl submits a
+            // flip about a frame after the app presented (the same over-wait
+            // `arm_dma_flip`'s 0ab-B note already recorded from the flush side).
+            //
+            // A submission that carries a LIVE stream boundary already states
+            // its exact dependency: `stream_ready` below is that frame's own
+            // producer completion, in the generation-qualified stream namespace.
+            // The WDDM DMA buffers on this driver carry no GPU commands at all —
+            // a Render marker or a flip record — so the frame the marker names
+            // IS the work this fence reports. Keeping the superset on top of it
+            // only delays the fence by the pipeline depth, which is what makes
+            // dxgkrnl block the presenting thread at its 3-deep present queue
+            // (ETW `BlockThread` Reason=2; 21% of presents, 2.45 ms each).
+            //
+            // The relaxation is deliberately NOT applied when the boundary was
+            // filtered out as stale above: a dead generation is a cancellation,
+            // not a satisfied producer, and keeps the ordinary wire watermark.
+            PRESENT_EXACT_WATERMARK_USED.fetch_add(1, Ordering::Relaxed);
+            0
         } else {
             self.next_wire_fence
         };
@@ -5667,16 +5705,26 @@ impl VirtioGpu {
                 head.blt_stream_boundary,
             )
         };
-        if !self.async_retired_up_to(watermark, domain)
-            || !stream_boundary.map_or(true, |boundary| self.scanout_boundary_ready(boundary))
-            || !match (blt_token, blt_stream_boundary) {
-                (Some(token), Some(boundary)) => {
-                    self.windowed_blt_terminal_prefix_ready(token, boundary)
-                }
-                (None, _) => true,
-                _ => false,
+        // Evaluated as three named conditions rather than one `||` chain: the
+        // FIFO is strictly ordered, so whatever paces its head paces every
+        // WDDM fence behind it, and "blocked" without saying ON WHAT is not an
+        // instrument. Exactly one counter moves per blocked look.
+        if !self.async_retired_up_to(watermark, domain) {
+            WDDM_HEAD_BLOCKED_WIRE.fetch_add(1, Ordering::Relaxed);
+            return WddmTake::BlockedOnProducer;
+        }
+        if !stream_boundary.map_or(true, |boundary| self.scanout_boundary_ready(boundary)) {
+            WDDM_HEAD_BLOCKED_STREAM.fetch_add(1, Ordering::Relaxed);
+            return WddmTake::BlockedOnProducer;
+        }
+        if !match (blt_token, blt_stream_boundary) {
+            (Some(token), Some(boundary)) => {
+                self.windowed_blt_terminal_prefix_ready(token, boundary)
             }
-        {
+            (None, _) => true,
+            _ => false,
+        } {
+            WDDM_HEAD_BLOCKED_BLT.fetch_add(1, Ordering::Relaxed);
             return WddmTake::BlockedOnProducer;
         }
         let Some(pending) = self.wddm_pending.pop_front() else {
