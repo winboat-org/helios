@@ -41,6 +41,9 @@ mod ffi {
         fn d3d11_device_ptr(self: &HeliosDxvkDevice) -> usize;
         fn d3d11_context_ptr(self: &HeliosDxvkDevice) -> usize;
         fn venus_context_id(self: &HeliosDxvkDevice) -> u32;
+        fn feed_trace_timestamp_ns(self: &HeliosDxvkDevice) -> u64;
+        fn feed_trace_render_callback(self: &HeliosDxvkDevice, duration_ns: u64);
+        fn feed_trace_present_callback(self: &HeliosDxvkDevice, duration_ns: u64);
         /// # Safety
         /// `deferred_context_ptr` is borrowed and live. `command_list_ptr`
         /// transfers one owned COM reference on true; false leaves ownership
@@ -169,11 +172,7 @@ mod ffi {
         /// until the current flush's submission completes on the GPU, so the
         /// IddCx consumer never copies a buffer whose writes are in flight.
         /// Returns false on timeout (caller proceeds — bounded by design).
-        fn present_frame_gate(
-            self: &HeliosDxvkDevice,
-            timeout_us: u32,
-            order_mode: u32,
-        ) -> bool;
+        fn present_frame_gate(self: &HeliosDxvkDevice, timeout_us: u32, order_mode: u32) -> bool;
 
         /// # Safety
         /// The three output pointers are live writable u32/u32/u64 storage for
@@ -218,6 +217,7 @@ mod ffi {
             self: &HeliosDxvkDevice,
             dst_resource_ptr: usize,
             src_resource_ptr: usize,
+            windowed_blt_reservation: bool,
         ) -> i32;
         unsafe fn create_geometry_shader(
             self: &HeliosDxvkDevice,
@@ -553,6 +553,22 @@ impl BridgeDevice {
         self.get().map_or(0, |d| d.venus_context_id())
     }
 
+    pub(crate) fn feed_trace_timestamp_ns(&self) -> u64 {
+        self.get().map_or(0, |d| d.feed_trace_timestamp_ns())
+    }
+
+    pub(crate) fn feed_trace_render_callback(&self, duration_ns: u64) {
+        if let Some(d) = self.get() {
+            d.feed_trace_render_callback(duration_ns);
+        }
+    }
+
+    pub(crate) fn feed_trace_present_callback(&self, duration_ns: u64) {
+        if let Some(d) = self.get() {
+            d.feed_trace_present_callback(duration_ns);
+        }
+    }
+
     pub(crate) fn present_frame_gate(&self, timeout_us: u32, order_mode: u32) -> bool {
         self.get()
             .is_some_and(|d| d.present_frame_gate(timeout_us, order_mode))
@@ -675,11 +691,17 @@ impl BridgeDevice {
     ///
     /// # Safety
     /// Both pointers must be live `ID3D11Resource*`.
-    pub(crate) unsafe fn present_snapshot_copy(&self, dst: DstRes, src: SrcRes) -> i32 {
+    pub(crate) unsafe fn present_snapshot_copy(
+        &self,
+        dst: DstRes,
+        src: SrcRes,
+        windowed_blt_reservation: bool,
+    ) -> i32 {
         // Same (dst, src) C++ order and the same transposition hazard as
         // `present_vehicle_copy`; the newtypes are what make it a type error.
-        self.get()
-            .map_or(-1, |d| unsafe { d.present_snapshot_copy(dst.0, src.0) })
+        self.get().map_or(-1, |d| unsafe {
+            d.present_snapshot_copy(dst.0, src.0, windowed_blt_reservation)
+        })
     }
 
     // -- shader creates ----------------------------------------------------

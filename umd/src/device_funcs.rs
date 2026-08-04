@@ -70,6 +70,13 @@ pub struct SnapshotSlot {
     /// Venus blob size backing `resid`, for the KMD's bind-time undersize
     /// guard (`alloc_size >= plane_offset + pitch*height`).
     pub alloc_size: u64,
+    /// Exact allocation memory type. Direct scanout never consumes this field,
+    /// but a WindowedBlt snapshot imports the same image in the KMD Venus
+    /// context and must not guess it from a resource id.
+    pub memory_type_index: u32,
+    /// `get_resource_alloc_identity` completed successfully. Zero is a valid
+    /// memory-type index, so the value itself cannot prove this fact.
+    pub alloc_identity_known: bool,
 }
 
 impl Drop for SnapshotSlot {
@@ -335,7 +342,10 @@ pub static DEVICE_TAG_MISMATCH: AtomicUsize = AtomicUsize::new(0);
 pub(crate) fn note_device_tag_mismatch(site: &str, tag: usize) {
     let n = DEVICE_TAG_MISMATCH.fetch_add(1, Ordering::Relaxed);
     if n < 16 {
-        log_error!("{site}: HDEVICE tag mismatch tag=0x{tag:016x} (x{}) — refused", n + 1);
+        log_error!(
+            "{site}: HDEVICE tag mismatch tag=0x{tag:016x} (x{}) — refused",
+            n + 1
+        );
     }
 }
 
@@ -764,7 +774,10 @@ static RELOCATE_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 fn relocate_log(tag: &str) {
     let n = RELOCATE_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
     if n < 8 || n % 65536 == 0 {
-        log_error!("DDI RelocateDeviceFuncs({tag}) (x{}) — noted, table untouched", n + 1);
+        log_error!(
+            "DDI RelocateDeviceFuncs({tag}) (x{}) — noted, table untouched",
+            n + 1
+        );
     }
 }
 
@@ -961,6 +974,9 @@ pub(crate) unsafe extern "C" fn ddi_destroy_device(h_device: ddi::D3D10DDI_HDEVI
     log_error!("{}", crate::forward::ddi_refusal_summary());
     // The deferred-context surface, same readout discipline (Phase C).
     log_error!("{}", crate::forward::deferred_summary());
+    // Bounded, process-global Present/Present1/MPO entry and callback evidence.
+    // This is emitted before teardown while the UMD log remains available.
+    log_error!("{}", crate::forward::present_boundary_summary());
     // Drop it from the liveness registry BEFORE anything is torn down, so a
     // concurrent `wait_last_present` on an ICD worker refuses rather than
     // dereferencing a block dxgkrnl is about to free and reuse (R415).

@@ -208,6 +208,10 @@ pub(crate) mod flags {
     pub const PROGRAMMED: u32 = 0x10;
     /// Returned `ScanoutOutcome::CopyQueued` (LINEAR fallback copy on ring 1).
     pub const COPY_QUEUED: u32 = 0x20;
+    /// A direct worker epoch was older than the binding already published.
+    pub const SUPERSEDED: u32 = 0x40;
+    /// A direct worker carried the bound epoch but a conflicting identity.
+    pub const EPOCH_CONFLICT: u32 = 0x80;
 }
 
 /// `dxgkddi_set_vidpn_source_address` entries, unsampled. Includes the calls
@@ -411,15 +415,19 @@ static FAST_BIND_APPLIED: AtomicU32 = AtomicU32::new(0);
 /// bookkeeping had already been applied (`FpLate`). Counted at BOTH application
 /// sites: the drain's fast-bind arm and the PASSIVE worker's post-bind tail.
 static FAST_BIND_LATE: AtomicU32 = AtomicU32::new(0);
-/// Fast binds whose completion was dropped because a NEWER one completed in the
-/// same drain pass (`FpCoal`).
+/// Fast binds coalesced by either a third unready frontier submission or two
+/// completions in the same drain pass (`FpCoal`).
 ///
 /// Kept separate from `FpLate` deliberately: they are both "bookkeeping that did
-/// not get applied", but one is the single completion slot coalescing and the
+/// not get applied", but one is bounded frontier/completion coalescing and the
 /// other is the wire-order guard refusing a stale application, and summing them
 /// would hide whichever is happening — the same reason the `Ls*` end reasons are
 /// never summed.
 static FAST_BIND_COALESCED: AtomicU32 = AtomicU32::new(0);
+/// Fast requests discarded because a newer presentation SET descriptor had
+/// already been accepted (`FpSup`). This is intentionally distinct from
+/// `FpCoal`, which only counts replacement of the bounded trailing slot.
+static FAST_BIND_SUPERSEDED: AtomicU32 = AtomicU32::new(0);
 /// Flip arms that found EVERY preallocated command buffer still in flight
 /// (`FpBusy`).
 ///
@@ -440,6 +448,12 @@ static FAST_BIND_ERRORS: AtomicU32 = AtomicU32::new(0);
 /// Flip arms that declined to fast-bind (`FpSkip`). The reason breakdown is
 /// [`FAST_BIND_SKIP_HISTOGRAM`].
 static FAST_BIND_SKIPS: AtomicU32 = AtomicU32::new(0);
+/// Direct worker requests terminally rejected because a newer epoch already
+/// owns the active binding (`WpSup`).
+static WORKER_EPOCH_SUPERSEDED: AtomicU32 = AtomicU32::new(0);
+/// Direct worker requests terminally rejected because the same epoch named a
+/// conflicting active identity (`WpCfl`).
+static WORKER_EPOCH_CONFLICT: AtomicU32 = AtomicU32::new(0);
 /// Why each `FpSkip` happened, by [`skip`] code.
 pub(crate) static FAST_BIND_SKIP_HISTOGRAM: Histogram = Histogram::new();
 
@@ -591,10 +605,17 @@ pub(crate) fn note_fast_bind_late() {
     FAST_BIND_LATE.fetch_add(1, Ordering::Relaxed);
 }
 
-/// Note a completed bind dropped by a newer one in the same drain pass.
-/// Any IRQL — runs in the used-ring drain under `virtio_lock`.
+/// Note a fast bind coalesced by the bounded frontier or same-drain completion
+/// handoff. Any IRQL — runs under `virtio_lock`.
 pub(crate) fn note_fast_bind_coalesced() {
     FAST_BIND_COALESCED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Record an epoch-floor discard of a fast/deferred presentation request. The
+/// periodic PASSIVE trace flush exposes this as `FpSup`; incrementing itself is
+/// safe under the virtio lock at DISPATCH.
+pub(crate) fn note_fast_bind_superseded() {
+    FAST_BIND_SUPERSEDED.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Note a flip arm that found the command buffer still in flight. Any IRQL.
@@ -611,6 +632,17 @@ pub(crate) fn note_fast_bind_error() {
 pub(crate) fn note_fast_bind_skip(reason: u32) {
     FAST_BIND_SKIPS.fetch_add(1, Ordering::Relaxed);
     FAST_BIND_SKIP_HISTOGRAM.note(reason);
+}
+
+/// Record an older direct worker request that must not rebind or publish a
+/// primary. Any IRQL.
+pub(crate) fn note_worker_epoch_superseded() {
+    WORKER_EPOCH_SUPERSEDED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Record a same-epoch conflicting direct worker request. Any IRQL.
+pub(crate) fn note_worker_epoch_conflict() {
+    WORKER_EPOCH_CONFLICT.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Ticks [`dump_periodic`].
@@ -746,7 +778,9 @@ pub(crate) fn note_program(
     flags: u32,
     reject: u32,
 ) {
-    let seq = PROGRAM_CALLS.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+    let seq = PROGRAM_CALLS
+        .fetch_add(1, Ordering::Relaxed)
+        .wrapping_add(1);
     if flags & flags::BOUND != 0 {
         PROGRAM_BINDS.fetch_add(1, Ordering::Relaxed);
     }
@@ -759,8 +793,10 @@ pub(crate) fn note_program(
     // Payload first, `packed` last: `packed` is nonzero for every recorded call
     // (the sequence number starts at 1), so a reader that sees it also sees the
     // three payload words for the same call.
-    slot.source_resource.store(source_resource, Ordering::Relaxed);
-    slot.target_resource.store(target_resource, Ordering::Relaxed);
+    slot.source_resource
+        .store(source_resource, Ordering::Relaxed);
+    slot.target_resource
+        .store(target_resource, Ordering::Relaxed);
     slot.alloc.store(h_alloc as u32, Ordering::Relaxed);
     slot.packed.store(
         (seq << 16) | ((reject & 0xFF) << 8) | (flags & 0xFF),
@@ -776,12 +812,10 @@ pub(crate) fn note_program(
 /// below.
 pub(crate) fn dump(adapter: &crate::adapter::AdapterContext) {
     // The live display-engine state, sampled at the same instant as the
-    // counters. `SetVidPnSourceAddress` going silent has exactly two shapes,
-    // and these tell them apart: a RAISED gate suppresses CRTC_VSYNC, so
-    // dxgkrnl never retires the queued flip and never issues the next address
-    // (the wedge `apply_deferred_vidpn_source_address_locked` documents); a
-    // LOWERED gate with `VpVsN` advancing means the heartbeat is healthy and
-    // dxgkrnl is choosing not to name a new primary.
+    // counters. A raised gate now means a newer primary is still owned by the
+    // deferred programming path; `VpVsN` must continue advancing while VSync
+    // truthfully reports the last published address. A frozen `VpVsN` is a
+    // separate interrupt-heartbeat failure, not an intended gate effect.
     crate::diag::record_named_bytes(
         b"VpGate",
         adapter.vidpn_programming.load(Ordering::Acquire) as u32,
@@ -833,9 +867,12 @@ pub(crate) fn dump(adapter: &crate::adapter::AdapterContext) {
     crate::diag::record_named_bytes(b"FpApply", FAST_BIND_APPLIED.load(Ordering::Relaxed));
     crate::diag::record_named_bytes(b"FpLate", FAST_BIND_LATE.load(Ordering::Relaxed));
     crate::diag::record_named_bytes(b"FpCoal", FAST_BIND_COALESCED.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"FpSup", FAST_BIND_SUPERSEDED.load(Ordering::Relaxed));
     crate::diag::record_named_bytes(b"FpBusy", FAST_BIND_BUSY.load(Ordering::Relaxed));
     crate::diag::record_named_bytes(b"FpErr", FAST_BIND_ERRORS.load(Ordering::Relaxed));
     crate::diag::record_named_bytes(b"FpSkip", FAST_BIND_SKIPS.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"WpSup", WORKER_EPOCH_SUPERSEDED.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"WpCfl", WORKER_EPOCH_CONFLICT.load(Ordering::Relaxed));
     crate::diag::record_named_bytes(
         b"FpSeq",
         adapter.scanout_bind_wire_seq.load(Ordering::Acquire) as u32,
@@ -983,9 +1020,12 @@ pub(crate) fn reset(adapter: &crate::adapter::AdapterContext) {
         &FAST_BIND_APPLIED,
         &FAST_BIND_LATE,
         &FAST_BIND_COALESCED,
+        &FAST_BIND_SUPERSEDED,
         &FAST_BIND_BUSY,
         &FAST_BIND_ERRORS,
         &FAST_BIND_SKIPS,
+        &WORKER_EPOCH_SUPERSEDED,
+        &WORKER_EPOCH_CONFLICT,
         &DUMP_TICKS,
     ] {
         counter.store(0, Ordering::Relaxed);

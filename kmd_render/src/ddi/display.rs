@@ -21,15 +21,24 @@ use crate::dxgk::*;
 use crate::irql::PassiveLevel;
 use crate::virtio::venus::{OptimalPresentImageDesc, PresentBufferDesc, PresentDestinationDesc};
 use crate::virtio::VirtioError;
+use helios_kmd_logic::scanout_worker_bind::{
+    decide as decide_worker_bind, decide_epoch as decide_worker_epoch, Action as WorkerBindAction,
+    Dispatch as WorkerBindDispatch, EpochPolicy as WorkerEpochPolicy,
+};
 use helios_kmd_logic::snapshot_bind::SnapshotDescriptor;
 use helios_kmd_logic::ScanoutFormat;
-use wdk_sys::ntddk::KeGetCurrentIrql;
+use wdk_sys::ntddk::{KeGetCurrentIrql, KeQueryInterruptTimePrecise};
 
 pub static PRESENT_COUNT: AtomicU32 = AtomicU32::new(0);
 /// Drives the throttle for this DDI's IDENTITY dumps (`diag::sample_tick`).
 /// Failure values — PBRet, PBCpy, PBSyWt, PBSyCp and PBFlip's error arms — are
 /// never sampled; they stay unconditional.
 static PRESENT_TRACE_TICK: AtomicU32 = AtomicU32::new(0);
+/// Drives the independent success-result mirror. `PBRet` used to perform a
+/// synchronous registry write for every successful Present, directly on the
+/// render thread. Non-success statuses remain immediate; successful results
+/// need only the same first/every-600th live refresh as the identity block.
+static PRESENT_RESULT_TRACE_TICK: AtomicU32 = AtomicU32::new(0);
 pub static PRESENT_LAST_SRC_COUNT: AtomicU32 = AtomicU32::new(0);
 pub static PRESENT_LAST_DST_COUNT: AtomicU32 = AtomicU32::new(0);
 pub static PRESENT_LAST_DMA_SIZE: AtomicU32 = AtomicU32::new(0);
@@ -171,10 +180,37 @@ pub unsafe extern "C" fn dxgkddi_present(
     h_context: IN_CONST_HANDLE,
     present: INOUT_PDXGKARG_PRESENT,
 ) -> NTSTATUS {
+    let mut qpc_timestamp = 0u64;
+    // SAFETY: KeQueryInterruptTimePrecise is a scalar, any-IRQL time read and
+    // the output pointer names a live local. DXGKDDI_PRESENT itself is PASSIVE.
+    let start_100ns = unsafe { KeQueryInterruptTimePrecise(&mut qpc_timestamp) };
     let status = unsafe { dxgkddi_present_inner(h_context, present) };
     // Fixed-name telemetry survives the steady-state registry ring flood and
-    // proves whether a failing UMD pfnPresentCb originated in this DDI.
-    crate::diag::record_named_bytes(b"PBRet", status as u32);
+    // proves whether a failing UMD pfnPresentCb originated in this DDI. A
+    // failure is never delayed. Successful frames update the same name on the
+    // first call and every SAMPLE_EVERY calls (or every call at DiagLevel=1),
+    // avoiding one synchronous RtlWriteRegistryValue in every production
+    // Present while leaving the status ABI and debug cadence unchanged.
+    if status != STATUS_SUCCESS || crate::diag::sample_tick(&PRESENT_RESULT_TRACE_TICK) {
+        crate::diag::record_named_bytes(b"PBRet", status as u32);
+    }
+    // Include the whole exported DDI, including its sampled result mirror. The
+    // fixed timeline write is the only per-call publication: no registry I/O,
+    // allocation, lock, wait, or producer polling is introduced here.
+    let end_100ns = unsafe { KeQueryInterruptTimePrecise(&mut qpc_timestamp) };
+    crate::ddi::scanout_timeline::note(
+        crate::ddi::scanout_timeline::kind::PRESENT_RETURN,
+        if status == STATUS_SUCCESS {
+            crate::ddi::scanout_timeline::flag::SUCCESS
+        } else {
+            0
+        },
+        0,
+        0,
+        end_100ns.saturating_sub(start_100ns),
+        0,
+        PRESENT_LAST_FLAGS.load(Ordering::Relaxed),
+    );
     status
 }
 
@@ -443,30 +479,70 @@ unsafe fn dxgkddi_present_inner(
                 PRESENT_LAST_STATUS.store(STATUS_INVALID_PARAMETER as u32, Ordering::Relaxed);
                 return STATUS_INVALID_PARAMETER;
             }
-            let source_desc = match source.storage {
-                PresentAllocationStorage::OptimalCrossContextImage => {
-                    OptimalPresentImageDesc::new_cross_context_dma_buf(
-                        source.resource_id,
-                        source.venus_alloc_size,
-                        source.memory_type_index,
-                        source.width,
-                        source.height,
-                        source.bind_flags,
-                        source_dxgi_format,
-                    )
+            // A WindowedBlt snapshot is an exact, UMD-created DMA-BUF source.
+            // It is valid only when the Render→Present stash carried the full
+            // typed tail and its descriptor agrees with DXGI's allocation-list
+            // source extent. A direct-bind snapshot (`purpose == 0`) is never
+            // allowed through this arm.
+            let snapshot_source = match stashed_snapshot {
+                Some(candidate) => match helios_kmd_logic::snapshot_bind::validate_windowed_blt(
+                    &candidate,
+                    source.width,
+                    source.height,
+                    source_dxgi_format,
+                ) {
+                    Ok(()) => Some(candidate),
+                    Err(_) => {
+                        crate::ddi::scanout_trace::note_snapshot_fallback();
+                        crate::diag::record_named_bytes(b"PBCpy", 0xE7);
+                        PRESENT_LAST_STATUS
+                            .store(STATUS_INVALID_PARAMETER as u32, Ordering::Relaxed);
+                        return STATUS_INVALID_PARAMETER;
+                    }
+                },
+                None => None,
+            };
+            let source_desc = if let Some(snapshot) = snapshot_source {
+                // D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET. The
+                // image was created by the UMD snapshot ring with exactly these
+                // binds; spelling them here keeps the KMD import typed without
+                // rediscovering source identity from a handle or resource id.
+                const SNAPSHOT_BIND_FLAGS: u32 = 0x0000_0008 | 0x0000_0020;
+                OptimalPresentImageDesc::new_cross_context_dma_buf(
+                    snapshot.resource_id,
+                    snapshot.venus_alloc_size,
+                    snapshot.memory_type_index,
+                    snapshot.width,
+                    snapshot.height,
+                    SNAPSHOT_BIND_FLAGS,
+                    snapshot.dxgi_format,
+                )
+            } else {
+                match source.storage {
+                    PresentAllocationStorage::OptimalCrossContextImage => {
+                        OptimalPresentImageDesc::new_cross_context_dma_buf(
+                            source.resource_id,
+                            source.venus_alloc_size,
+                            source.memory_type_index,
+                            source.width,
+                            source.height,
+                            source.bind_flags,
+                            source_dxgi_format,
+                        )
+                    }
+                    PresentAllocationStorage::OptimalOpaqueFdImage => {
+                        OptimalPresentImageDesc::new_opaque_fd(
+                            source.resource_id,
+                            source.venus_alloc_size,
+                            source.memory_type_index,
+                            source.width,
+                            source.height,
+                            source.bind_flags,
+                            source_dxgi_format,
+                        )
+                    }
+                    PresentAllocationStorage::PitchedStandardBuffer => None,
                 }
-                PresentAllocationStorage::OptimalOpaqueFdImage => {
-                    OptimalPresentImageDesc::new_opaque_fd(
-                        source.resource_id,
-                        source.venus_alloc_size,
-                        source.memory_type_index,
-                        source.width,
-                        source.height,
-                        source.bind_flags,
-                        source_dxgi_format,
-                    )
-                }
-                PresentAllocationStorage::PitchedStandardBuffer => None,
             };
             let destination_desc = match destination.storage {
                 PresentAllocationStorage::PitchedStandardBuffer
@@ -521,101 +597,176 @@ unsafe fn dxgkddi_present_inner(
                 return STATUS_INVALID_PARAMETER;
             }
 
-            // SAFETY: `DxgkDdiPresent` is documented "IRQL: PASSIVE_LEVEL" (WDK
-            // DXGKDDI_PRESENT) — it is a pageable DDI, and the BLT arm below
-            // waits on a wire fence and maps blob bytes, neither of which is
-            // legal above PASSIVE. Note this is the BLT arm only; the MMIO-flip
-            // arm generates no DMA buffer and is completed through
-            // SetVidPnSourceAddress, whose DIRQL half holds no token at all.
-            let passive = unsafe { crate::irql::PassiveLevel::assume() };
-            let copy = adapter.with_venus_client(passive, |client| {
-                client.submit_present_blt(adapter, source_desc, destination_desc)
-            });
-            let gpu_fence = match copy {
-                Ok(Ok(fence)) => fence,
-                Ok(Err(VirtioError::OutOfMemory | VirtioError::QueueFull)) => {
-                    crate::diag::record_named_bytes(b"PBCpy", 0xE4);
-                    PRESENT_LAST_STATUS.store(STATUS_NO_MEMORY as u32, Ordering::Relaxed);
-                    return STATUS_NO_MEMORY;
-                }
-                Ok(Err(_)) | Err(_) => {
-                    crate::diag::record_named_bytes(b"PBCpy", 0xE5);
-                    PRESENT_LAST_STATUS.store(STATUS_DEVICE_NOT_READY as u32, Ordering::Relaxed);
-                    return STATUS_DEVICE_NOT_READY;
-                }
-            };
-            crate::diag::record_named_bytes(
-                b"PBConv",
-                u32::from(source_dxgi_format != destination_dxgi_format),
-            );
-            // Windows can page a lockable standard staging destination from
-            // the BAR/Venus allocation into system memory and keep DWM's CPU
-            // view there. BuildPagingBuffer records that exact MDL-page
-            // association by resource id. Once this Venus copy completes,
-            // mirror into those pages before Present retires; otherwise later
-            // frames update only the stale BAR blob.
-            let has_system_backing = adapter.system_backings.contains(destination.resource_id);
-            if has_system_backing {
-                match crate::virtio::ctrl::wait_fence(passive, adapter, gpu_fence, 5_000_000_000) {
-                    crate::virtio::ctrl::WaitFenceOutcome::Complete => {
-                        crate::diag::record_named_bytes(b"PBSyWt", 1);
+            // A typed WindowedBlt snapshot is a TWO-PHASE transaction. Prepare
+            // its reusable Venus command and reserve the exact reader lease at
+            // Present, but do not submit until SubmitCommand admits the same
+            // token/stream after destination residency is effective.
+            if snapshot_source.is_some() {
+                let Some(boundary) = present_stream_boundary else {
+                    crate::diag::record_named_bytes(b"PBCpy", 0xE8);
+                    PRESENT_LAST_STATUS.store(STATUS_INVALID_PARAMETER as u32, Ordering::Relaxed);
+                    return STATUS_INVALID_PARAMETER;
+                };
+                // SAFETY: DXGKDDI_PRESENT is PASSIVE_LEVEL. The lock order is
+                // scanout -> venus -> virtio; cache preparation may block only
+                // while the Venus mutex is held, and FIFO insertion is then a
+                // preallocated spinlock-only mutation.
+                let passive = unsafe { crate::irql::PassiveLevel::assume() };
+                let queued = adapter.with_scanout_lifecycle(passive, |lock| {
+                    let prepared = lock.with_venus_client(|client| {
+                        client.prepare_present_blt(adapter, source_desc, destination_desc)
+                    });
+                    let prepared = match prepared {
+                        Ok(Ok(prepared)) => prepared,
+                        Ok(Err(error)) => return Err(error),
+                        Err(_) => return Err(VirtioError::DeviceError),
+                    };
+                    adapter
+                        .with_virtio(|v| {
+                            v.queue_windowed_blt(
+                                adapter,
+                                source_desc,
+                                destination_desc,
+                                prepared,
+                                boundary,
+                                adapter.system_backings.contains(destination.resource_id),
+                            )
+                        })
+                        .unwrap_or(Err(VirtioError::DeviceError))
+                });
+                let token = match queued {
+                    Ok(token) => token,
+                    Err(VirtioError::OutOfMemory | VirtioError::QueueFull) => {
+                        crate::diag::record_named_bytes(b"PBCpy", 0xE4);
+                        PRESENT_LAST_STATUS.store(STATUS_NO_MEMORY as u32, Ordering::Relaxed);
+                        return STATUS_NO_MEMORY;
                     }
-                    crate::virtio::ctrl::WaitFenceOutcome::TimedOut => {
-                        crate::diag::record_named_bytes(b"PBSyWt", 0xE1);
+                    Err(_) => {
+                        crate::diag::record_named_bytes(b"PBCpy", 0xE5);
                         PRESENT_LAST_STATUS
                             .store(STATUS_DEVICE_NOT_READY as u32, Ordering::Relaxed);
                         return STATUS_DEVICE_NOT_READY;
                     }
-                    crate::virtio::ctrl::WaitFenceOutcome::Invalid => {
-                        crate::diag::record_named_bytes(b"PBSyWt", 0xE2);
-                        PRESENT_LAST_STATUS
-                            .store(STATUS_DEVICE_NOT_READY as u32, Ordering::Relaxed);
-                        return STATUS_DEVICE_NOT_READY;
-                    }
-                }
-            }
-            if has_system_backing {
-                match unsafe {
-                    crate::ddi::build_paging_buffer::mirror_present_system_backing(
-                        passive,
-                        adapter,
-                        destination.resource_id,
+                };
+                if let Err(status) = unsafe {
+                    PresentSubmissionPrivate::merge_windowed_blt_token(
+                        args.pDmaBufferPrivateData,
+                        args.DmaBufferPrivateDataSize,
+                        token,
+                        boundary,
                     )
                 } {
-                    Some(true) => crate::diag::record_named_bytes(b"PBSyCp", 1),
-                    // Windows may page the allocation back to the BAR between
-                    // the pre-check and completed fence. With no system
-                    // backing, the Venus destination is authoritative again.
-                    None => crate::diag::record_named_bytes(b"PBSyCp", 2),
-                    Some(false) => {
-                        crate::diag::record_named_bytes(b"PBSyCp", 0xE1);
+                    let _ =
+                        adapter.with_virtio(|v| v.cancel_windowed_blt(adapter, token, boundary));
+                    crate::diag::record_named_bytes(b"PBCpy", 0xE6);
+                    PRESENT_LAST_STATUS.store(status as u32, Ordering::Relaxed);
+                    return status;
+                }
+                crate::diag::record_named_bytes(b"PBCpy", 2);
+                crate::diag::record_named_bytes(b"PBFnc", token as u32);
+            } else {
+                // SAFETY: `DxgkDdiPresent` is documented "IRQL: PASSIVE_LEVEL" (WDK
+                // DXGKDDI_PRESENT) — it is a pageable DDI, and the BLT arm below
+                // waits on a wire fence and maps blob bytes, neither of which is
+                // legal above PASSIVE. Note this is the BLT arm only; the MMIO-flip
+                // arm generates no DMA buffer and is completed through
+                // SetVidPnSourceAddress, whose DIRQL half holds no token at all.
+                let passive = unsafe { crate::irql::PassiveLevel::assume() };
+                let copy = adapter.with_venus_client(passive, |client| {
+                    client.submit_present_blt(adapter, source_desc, destination_desc)
+                });
+                let gpu_fence = match copy {
+                    Ok(Ok(fence)) => fence,
+                    Ok(Err(VirtioError::OutOfMemory | VirtioError::QueueFull)) => {
+                        crate::diag::record_named_bytes(b"PBCpy", 0xE4);
+                        PRESENT_LAST_STATUS.store(STATUS_NO_MEMORY as u32, Ordering::Relaxed);
+                        return STATUS_NO_MEMORY;
+                    }
+                    Ok(Err(_)) | Err(_) => {
+                        crate::diag::record_named_bytes(b"PBCpy", 0xE5);
                         PRESENT_LAST_STATUS
                             .store(STATUS_DEVICE_NOT_READY as u32, Ordering::Relaxed);
                         return STATUS_DEVICE_NOT_READY;
                     }
+                };
+                crate::diag::record_named_bytes(
+                    b"PBConv",
+                    u32::from(source_dxgi_format != destination_dxgi_format),
+                );
+                // Windows can page a lockable standard staging destination from
+                // the BAR/Venus allocation into system memory and keep DWM's CPU
+                // view there. BuildPagingBuffer records that exact MDL-page
+                // association by resource id. Once this Venus copy completes,
+                // mirror into those pages before Present retires; otherwise later
+                // frames update only the stale BAR blob.
+                let has_system_backing = adapter.system_backings.contains(destination.resource_id);
+                if has_system_backing {
+                    match crate::virtio::ctrl::wait_fence(
+                        passive,
+                        adapter,
+                        gpu_fence,
+                        5_000_000_000,
+                    ) {
+                        crate::virtio::ctrl::WaitFenceOutcome::Complete => {
+                            crate::diag::record_named_bytes(b"PBSyWt", 1);
+                        }
+                        crate::virtio::ctrl::WaitFenceOutcome::TimedOut => {
+                            crate::diag::record_named_bytes(b"PBSyWt", 0xE1);
+                            PRESENT_LAST_STATUS
+                                .store(STATUS_DEVICE_NOT_READY as u32, Ordering::Relaxed);
+                            return STATUS_DEVICE_NOT_READY;
+                        }
+                        crate::virtio::ctrl::WaitFenceOutcome::Invalid => {
+                            crate::diag::record_named_bytes(b"PBSyWt", 0xE2);
+                            PRESENT_LAST_STATUS
+                                .store(STATUS_DEVICE_NOT_READY as u32, Ordering::Relaxed);
+                            return STATUS_DEVICE_NOT_READY;
+                        }
+                    }
                 }
-            } else {
-                crate::diag::record_named_bytes(b"PBSyCp", 0);
+                if has_system_backing {
+                    match unsafe {
+                        crate::ddi::build_paging_buffer::mirror_present_system_backing(
+                            passive,
+                            adapter,
+                            destination.resource_id,
+                        )
+                    } {
+                        Some(true) => crate::diag::record_named_bytes(b"PBSyCp", 1),
+                        // Windows may page the allocation back to the BAR between
+                        // the pre-check and completed fence. With no system
+                        // backing, the Venus destination is authoritative again.
+                        None => crate::diag::record_named_bytes(b"PBSyCp", 2),
+                        Some(false) => {
+                            crate::diag::record_named_bytes(b"PBSyCp", 0xE1);
+                            PRESENT_LAST_STATUS
+                                .store(STATUS_DEVICE_NOT_READY as u32, Ordering::Relaxed);
+                            return STATUS_DEVICE_NOT_READY;
+                        }
+                    }
+                } else {
+                    crate::diag::record_named_bytes(b"PBSyCp", 0);
+                }
+                // Capacity was checked before host work was queued, so this cannot
+                // fail. Merge preserves the newest fence if dxgkrnl batches more
+                // than one Present into the same DMA private-data buffer.
+                if let Err(status) = unsafe {
+                    PresentSubmissionPrivate::merge_fence(
+                        args.pDmaBufferPrivateData,
+                        args.DmaBufferPrivateDataSize,
+                        gpu_fence,
+                    )
+                } {
+                    crate::diag::record_named_bytes(b"PBCpy", 0xE6);
+                    PRESENT_LAST_STATUS.store(status as u32, Ordering::Relaxed);
+                    return status;
+                }
+                // NOT sampled: PBCpy is the value a failed Present is read from
+                // (its 0xE1..0xE6 arms), so its success arm has to keep the same
+                // cadence or "last PBCpy" stops meaning "what the last BLT did".
+                crate::diag::record_named_bytes(b"PBCpy", 1);
+                crate::diag::record_named_bytes(b"PBFnc", gpu_fence as u32);
             }
-            // Capacity was checked before host work was queued, so this cannot
-            // fail. Merge preserves the newest fence if dxgkrnl batches more
-            // than one Present into the same DMA private-data buffer.
-            if let Err(status) = unsafe {
-                PresentSubmissionPrivate::merge_fence(
-                    args.pDmaBufferPrivateData,
-                    args.DmaBufferPrivateDataSize,
-                    gpu_fence,
-                )
-            } {
-                crate::diag::record_named_bytes(b"PBCpy", 0xE6);
-                PRESENT_LAST_STATUS.store(status as u32, Ordering::Relaxed);
-                return status;
-            }
-            // NOT sampled: PBCpy is the value a failed Present is read from
-            // (its 0xE1..0xE6 arms), so its success arm has to keep the same
-            // cadence or "last PBCpy" stops meaning "what the last BLT did".
-            crate::diag::record_named_bytes(b"PBCpy", 1);
-            crate::diag::record_named_bytes(b"PBFnc", gpu_fence as u32);
         }
     }
 
@@ -730,11 +881,12 @@ unsafe fn dxgkddi_present_inner(
         // validated descriptor counts `SnSub` ONCE per flip, at this single
         // decision site.
         let snapshot = stashed_snapshot.and_then(|candidate| {
-            match helios_kmd_logic::snapshot_bind::validate(
-                &candidate,
-                source.width,
-                source.height,
-            ) {
+            if candidate.purpose != 0 {
+                crate::ddi::scanout_trace::note_snapshot_fallback();
+                return None;
+            }
+            match helios_kmd_logic::snapshot_bind::validate(&candidate, source.width, source.height)
+            {
                 Ok(()) => {
                     crate::ddi::scanout_trace::note_snapshot_substituted();
                     Some(candidate)
@@ -832,6 +984,84 @@ unsafe fn dxgkddi_present_inner(
 
     PRESENT_LAST_STATUS.store(STATUS_SUCCESS as u32, Ordering::Relaxed);
     STATUS_SUCCESS
+}
+
+/// PASSIVE continuation for two-phase WindowedBlt presents. Present only
+/// prepares/reserves; SubmitCommand admits exact residency; this worker submits
+/// only when both that admission and the producer stream boundary are ready.
+/// There is no timer or producer poll: every promotion/completion signals HPD.
+pub(crate) fn service_windowed_blt(passive: PassiveLevel, adapter: &AdapterContext) {
+    adapter.with_scanout_lifecycle(passive, |lock| {
+        let submit = lock.with_venus_client(|client| {
+            let request = adapter
+                .with_virtio(|v| v.take_ready_windowed_blt())
+                .ok()
+                .flatten();
+            request.map(|request| {
+                (
+                    request.token,
+                    request.stream_boundary,
+                    client.submit_prepared_present_blt(
+                        adapter,
+                        request.prepared,
+                        request.token,
+                        request.stream_boundary,
+                    ),
+                )
+            })
+        });
+        if let Ok(Some((token, boundary, result))) = submit {
+            match result {
+                Ok(fence) => crate::ddi::scanout_timeline::note(
+                    crate::ddi::scanout_timeline::kind::WINDOWED_BLT_SUBMIT,
+                    crate::ddi::scanout_timeline::flag::SUCCESS,
+                    0,
+                    boundary,
+                    token,
+                    fence as u32,
+                    0,
+                ),
+                Err(_) => {
+                    let _ = adapter.with_virtio(|v| {
+                        v.complete_windowed_blt_ring(adapter, token, boundary, false)
+                    });
+                }
+            }
+        }
+
+        let mirror = adapter
+            .with_virtio(|v| v.take_windowed_blt_mirror())
+            .ok()
+            .flatten();
+        if let Some(request) = mirror {
+            let ok = match unsafe {
+                crate::ddi::build_paging_buffer::mirror_present_system_backing(
+                    passive,
+                    adapter,
+                    request.destination_resource_id,
+                )
+            } {
+                Some(true) | None => true,
+                Some(false) => false,
+            };
+            let _ = adapter.with_virtio(|v| {
+                v.complete_windowed_blt_mirror(adapter, request.token, request.stream_boundary, ok)
+            });
+            crate::ddi::scanout_timeline::note(
+                crate::ddi::scanout_timeline::kind::WINDOWED_BLT_MIRROR,
+                if ok {
+                    crate::ddi::scanout_timeline::flag::SUCCESS
+                } else {
+                    0
+                },
+                0,
+                request.stream_boundary,
+                request.token,
+                request.source_resource_id,
+                request.destination_resource_id,
+            );
+        }
+    });
 }
 
 pub unsafe extern "C" fn dxgkddi_set_pointer_position(
@@ -1142,10 +1372,9 @@ pub(crate) unsafe fn arm_dma_flip_programming(
     // so a substituted flip takes by the descriptor's resid, and everything
     // downstream (`arm_bind_refresh`, the D2 identity arm, `RfUnb`, epochs,
     // leases, the D4a ledger) self-aligns because armed = bound = snapshot.
-    let frame_watermark = adapter.take_flip_frame_watermark(match snapshot {
-        Some(snap) => snap.resource_id,
-        None => unsafe { crate::ddi::create_allocation::allocation_resource_id(h_alloc) },
-    });
+    let source_resource = unsafe { crate::ddi::create_allocation::allocation_resource_id(h_alloc) };
+    let target_resource = snapshot.map_or(source_resource, |snap| snap.resource_id);
+    let frame_watermark = adapter.take_flip_frame_watermark(target_resource);
     if !unsafe {
         crate::ddi::create_allocation::set_vidpn_primary_address(
             h_alloc,
@@ -1166,7 +1395,33 @@ pub(crate) unsafe fn arm_dma_flip_programming(
         .swap(h_alloc as usize, Ordering::AcqRel);
     if previous != 0 && previous != h_alloc as usize {
         crate::ddi::scanout_trace::note_ddi_coalesced(previous);
+        // The old pending slot can be joined exactly to its earlier
+        // DMA_FLIP_ARM by its full allocation handle; do not let a later arm
+        // simply make that epoch disappear from the diagnostic timeline.
+        crate::ddi::scanout_timeline::note(
+            crate::ddi::scanout_timeline::kind::DEFERRED_REPLACED,
+            crate::ddi::scanout_timeline::flag::REPLACED
+                | crate::ddi::scanout_timeline::flag::PENDING_SLOT,
+            present_epoch,
+            frame_watermark,
+            previous as u64,
+            target_resource,
+            source_resource,
+        );
     }
+    crate::ddi::scanout_timeline::note(
+        crate::ddi::scanout_timeline::kind::DMA_FLIP_ARM,
+        if snapshot.is_some() {
+            crate::ddi::scanout_timeline::flag::SNAPSHOT
+        } else {
+            0
+        },
+        present_epoch,
+        frame_watermark,
+        h_alloc as usize as u64,
+        target_resource,
+        source_resource,
+    );
     // Everything above is UNCHANGED, and that is the design: the fast bind is a
     // pure accelerator. The slot is armed, the gate is raised and the worker
     // will run exactly as it does today — the only difference is that the host
@@ -1255,20 +1510,25 @@ unsafe fn fast_bind_from_flip(
     // (`from_snapshot_descriptor` re-runs the same layout validation the
     // Present arm already passed). Structurally-unreachable failure falls back
     // to the flipped allocation, counted — the §6 "descriptor fails" row.
-    let substituted = snapshot.and_then(|snap| {
-        match ScanoutTarget::from_snapshot_descriptor(&snap) {
-            Ok(target) => Some(target),
-            Err(_) => {
-                crate::ddi::scanout_trace::note_snapshot_fallback();
-                None
-            }
-        }
-    });
+    let substituted =
+        snapshot.and_then(
+            |snap| match ScanoutTarget::from_snapshot_descriptor(&snap) {
+                Ok(target) => Some(target),
+                Err(_) => {
+                    crate::ddi::scanout_trace::note_snapshot_fallback();
+                    None
+                }
+            },
+        );
     // The SAME validation the worker runs, through the SAME constructor: the
     // pitch/offset/size/format checks are the undersize guard that keeps QEMU
     // from reading past the blob (the 38th-session Xid-31 lesson), and they are
     // not restated here in any weakened form.
     let target = match substituted {
+        // A validated D4b snapshot remains subject to the same exact producer
+        // boundary as its source primary. Publishing its SET early detached
+        // selection from the producer-gated refresh: successor SETs could then
+        // change the bound resource before this epoch's exact flush was issued.
         Some(target) => target,
         None => match ScanoutTarget::from_direct_primary(&source, source.width, source.height) {
             Ok(target) => target,
@@ -1322,7 +1582,9 @@ unsafe fn fast_bind_from_flip(
         // The producer boundary is part of the request, not a new sample. An
         // unready request occupies the fixed fast-bind slot until the used-ring
         // completion DPC promotes it; no buffer, wire sequence, wait, or host
-        // command is consumed before then.
+        // command is consumed before then. This applies to snapshots as well:
+        // the exact carried boundary protects both host selection and the
+        // response-side RESOURCE_FLUSH read.
         v.stage_scanout_bind(request, |resource_id| {
             adapter.mint_scanout_bind_seq(resource_id)
         })
@@ -1332,7 +1594,8 @@ unsafe fn fast_bind_from_flip(
             crate::ddi::scanout_trace::note_fast_bind_enqueued()
         }
         Ok(crate::virtio::FastBindDispatch::Deferred)
-        | Ok(crate::virtio::FastBindDispatch::Handled) => {}
+        | Ok(crate::virtio::FastBindDispatch::Handled)
+        | Ok(crate::virtio::FastBindDispatch::Superseded) => {}
         Ok(crate::virtio::FastBindDispatch::Busy) => {
             crate::ddi::scanout_trace::note_fast_bind_busy()
         }
@@ -1394,8 +1657,9 @@ unsafe fn set_vidpn_source_address_dirql(
         return false;
     }
     // This exact Windows handoff is now pending display-engine programming.
-    // Keep the periodic VSync path from reporting the preceding physical
-    // address while the DIRQL callback is deferred to PASSIVE_LEVEL.
+    // The periodic VSync path continues reporting the preceding physical
+    // address until this primary has actually been published; that is the
+    // scanout pipeline's truthful current address.
     //
     // Raising bumps the generation and sets the active flag in ONE publication,
     // so a completion can tell which interval it belongs to.
@@ -1496,6 +1760,16 @@ unsafe fn apply_deferred_vidpn_source_address_locked(
             interval.retain_for_retry();
             STATUS_SUCCESS
         }
+        Ok(ScanoutOutcome::Superseded) => {
+            // This exact worker request is terminally stale.  Do not re-arm it
+            // or retain its own gate; only a newer DIRQL handoff already in the
+            // slot may still own forward progress.
+            clear_retry_state();
+            if adapter.pending_vidpn_allocation.load(Ordering::Acquire) != 0 {
+                interval.retain_for_retry();
+            }
+            STATUS_SUCCESS
+        }
         Err(reject) => {
             reject.report();
             if reject.retryable() {
@@ -1514,9 +1788,9 @@ unsafe fn apply_deferred_vidpn_source_address_locked(
                         );
                         interval.retain_for_retry();
                     }
-                    // Budget exhausted. Drop the interval: the gate clears and
-                    // the heartbeat resumes with the truthful OLD address, which
-                    // is a visibly stale desktop rather than a frozen one.
+                    // Budget exhausted. Drop the interval while VSync continues
+                    // reporting the truthful old address; the failed primary
+                    // must not retain programming ownership indefinitely.
                     RetryDecision::GaveUp => {
                         release_leases_for_reject(adapter);
                         if adapter.pending_vidpn_allocation.load(Ordering::Acquire) != 0 {
@@ -1525,8 +1799,8 @@ unsafe fn apply_deferred_vidpn_source_address_locked(
                     }
                 }
             } else {
-                // Permanent for this allocation. Retrying would hold the gate
-                // and suppress CRTC_VSYNC for nothing.
+                // Permanent for this allocation. Retrying would retain stale
+                // programming ownership for nothing.
                 clear_retry_state();
                 release_leases_for_reject(adapter);
                 if adapter.pending_vidpn_allocation.load(Ordering::Acquire) != 0 {
@@ -1696,12 +1970,13 @@ impl ScanoutReject {
     }
 }
 
-/// Retry attempts allowed for one primary before the gate is dropped and the
-/// heartbeat resumes with the truthful old address.
+/// Retry attempts allowed for one primary before its programming interval is
+/// dropped while VSync continues reporting the truthful old address.
 ///
-/// A few, not hundreds: the gate suppresses CRTC_VSYNC for its whole duration,
-/// and the VSync DPC re-signals the worker every ~16 ms, so this is a bounded
-/// ~64 ms stall in the worst case rather than an unbounded one.
+/// A few, not hundreds: the gate retains the exact deferred programming
+/// ownership, and the VSync DPC re-signals the worker every ~16 ms. The retry
+/// stays bounded even though VSync continues reporting the last displayed
+/// primary throughout.
 const SCANOUT_RETRY_BUDGET: u32 = 4;
 
 /// Retry bookkeeping for the deferred path. Touched only under `scanout_mutex`
@@ -1762,6 +2037,10 @@ enum ScanoutOutcome {
     /// The direct fallback retained its exact WDDM handle until the producer
     /// boundary retires. The completion DPC wakes the existing worker.
     Deferred,
+    /// A newer direct binding already owns this epoch, or this epoch names a
+    /// conflicting active identity. This worker published neither a SET nor a
+    /// primary address.
+    Superseded,
 }
 
 /// Mirror the refusal counters into the registry. Called from the existing
@@ -1869,6 +2148,15 @@ unsafe fn apply_vidpn_source_address_locked(
             interval.retain_for_retry();
             STATUS_SUCCESS
         }
+        Ok(ScanoutOutcome::Superseded) => {
+            // The stale/equal-conflicting worker must never publish another
+            // SET or primary. Preserve only a separately queued newer handle.
+            clear_retry_state();
+            if adapter.pending_vidpn_allocation.load(Ordering::Acquire) != 0 {
+                interval.retain_for_retry();
+            }
+            STATUS_SUCCESS
+        }
         Err(reject) => {
             // No retry on this path: the DDI ran at PASSIVE, so the refusal's
             // NTSTATUS reaches dxgkrnl directly and is the truthful answer.
@@ -1944,8 +2232,7 @@ unsafe fn program_vidpn_source(
         target_resource: 0,
         flags: if deferred { flags::DEFERRED } else { 0 },
     };
-    let result =
-        unsafe { program_vidpn_source_inner(adapter, lock, h_alloc, ticket, &mut trace) };
+    let result = unsafe { program_vidpn_source_inner(adapter, lock, h_alloc, ticket, &mut trace) };
     let reject = match result {
         Ok(ScanoutOutcome::Programmed) => {
             trace.flags |= flags::PROGRAMMED;
@@ -1955,7 +2242,7 @@ unsafe fn program_vidpn_source(
             trace.flags |= flags::COPY_QUEUED;
             0
         }
-        Ok(ScanoutOutcome::Deferred) => 0,
+        Ok(ScanoutOutcome::Deferred) | Ok(ScanoutOutcome::Superseded) => 0,
         Err(reject) => reject.trace_code(),
     };
     crate::ddi::scanout_trace::note_program(
@@ -2035,15 +2322,16 @@ unsafe fn program_vidpn_source_inner(
     // reachable from a torn stamp, since the descriptor validated at Present —
     // falls back to the primary itself, counted (`SnFbk`).
     let target = if source.direct_scanout {
-        let substituted = source.snapshot.and_then(|snap| {
-            match ScanoutTarget::from_snapshot_descriptor(&snap) {
-                Ok(target) => Some(target),
-                Err(_) => {
-                    crate::ddi::scanout_trace::note_snapshot_fallback();
-                    None
-                }
-            }
-        });
+        let substituted =
+            source.snapshot.and_then(
+                |snap| match ScanoutTarget::from_snapshot_descriptor(&snap) {
+                    Ok(target) => Some(target),
+                    Err(_) => {
+                        crate::ddi::scanout_trace::note_snapshot_fallback();
+                        None
+                    }
+                },
+            );
         match substituted {
             Some(target) => target,
             None => ScanoutTarget::from_direct_primary(&source, width, height)?,
@@ -2067,12 +2355,56 @@ unsafe fn program_vidpn_source_inner(
         crate::diag::record_named_bytes(b"ScPch", target.pitch());
         crate::diag::record_named_bytes(b"ScOff", target.plane_offset());
     }
+    // The worker can run after a later DPC bind has already published its
+    // epoch.  Never let this older (or equal-but-different) request issue a
+    // synchronous SET or overwrite the displayed primary afterward.
+    let same_active_identity = already_bound
+        && adapter.last_primary_address.load(Ordering::Acquire) == source.primary_address;
+    if source.direct_scanout {
+        match decide_worker_epoch(
+            source.present_epoch != helios_kmd_logic::scanout_lease::NO_LEASE,
+            source.present_epoch,
+            adapter.scanout_bound_epoch.load(Ordering::Acquire),
+            same_active_identity,
+        ) {
+            WorkerEpochPolicy::Superseded => {
+                trace.flags |= flags::SUPERSEDED;
+                crate::ddi::scanout_trace::note_worker_epoch_superseded();
+                crate::ddi::scanout_timeline::note(
+                    crate::ddi::scanout_timeline::kind::WORKER_STAGE,
+                    crate::ddi::scanout_timeline::flag::SUPERSEDED,
+                    source.present_epoch,
+                    source.frame_watermark,
+                    h_alloc as usize as u64,
+                    target.resource_id(),
+                    source.resource_id,
+                );
+                return Ok(ScanoutOutcome::Superseded);
+            }
+            WorkerEpochPolicy::EqualConflict => {
+                trace.flags |= flags::EPOCH_CONFLICT;
+                crate::ddi::scanout_trace::note_worker_epoch_conflict();
+                crate::ddi::scanout_timeline::note(
+                    crate::ddi::scanout_timeline::kind::WORKER_STAGE,
+                    crate::ddi::scanout_timeline::flag::EPOCH_CONFLICT,
+                    source.present_epoch,
+                    source.frame_watermark,
+                    h_alloc as usize as u64,
+                    target.resource_id(),
+                    source.resource_id,
+                );
+                return Ok(ScanoutOutcome::Superseded);
+            }
+            WorkerEpochPolicy::AlreadyBound | WorkerEpochPolicy::Newer => {}
+        }
+    }
     // Filled only by the host-accepted direct bind application. The arm itself
     // runs inside the notify-ordered transition below; reporting stays outside
     // the spinlock because it does not participate in the ordering proof.
     let mut bind_refresh = None;
-    if !already_bound {
-        let worker_request = source.direct_scanout.then_some(crate::virtio::ScanoutBindRequest {
+    let worker_request = source
+        .direct_scanout
+        .then_some(crate::virtio::ScanoutBindRequest {
             resource_id: target.resource_id(),
             width: target.width(),
             height: target.height(),
@@ -2083,24 +2415,98 @@ unsafe fn program_vidpn_source_inner(
             primary_address: source.primary_address,
             carried_watermark: source.frame_watermark,
         });
-        if let Some(request) = worker_request {
+    let issue_sync_set = match worker_request {
+        Some(request) => {
+            // This check is required even when a fast SET has already selected
+            // the same resource. The exact carried boundary is required before
+            // either host selection or Windows flip retirement can proceed.
             let worker = adapter
-                .with_virtio(|v| v.stage_worker_scanout_bind(request))
+                .with_virtio(|v| v.stage_worker_scanout_bind(request, !already_bound))
                 .unwrap_or(crate::virtio::WorkerBindDispatch::Abandoned);
-            match worker {
-                crate::virtio::WorkerBindDispatch::Ready => {}
+            let worker_flags = (if already_bound {
+                crate::ddi::scanout_timeline::flag::ALREADY_BOUND
+            } else {
+                0
+            }) | if source.snapshot.is_some() {
+                crate::ddi::scanout_timeline::flag::SNAPSHOT
+            } else {
+                0
+            } | match worker {
+                crate::virtio::WorkerBindDispatch::Ready => {
+                    crate::ddi::scanout_timeline::flag::READY
+                }
                 crate::virtio::WorkerBindDispatch::Waiting => {
-                    // Keep the exact WDDM allocation in the existing pending
-                    // slot. The used-ring DPC wakes this worker only after the
-                    // producer boundary retires; no synchronous SET can
-                    // overtake Venus.
-                    return Ok(ScanoutOutcome::Deferred);
+                    crate::ddi::scanout_timeline::flag::WAITING
                 }
                 crate::virtio::WorkerBindDispatch::Abandoned => {
+                    crate::ddi::scanout_timeline::flag::ABANDONED
+                }
+                crate::virtio::WorkerBindDispatch::Superseded => {
+                    crate::ddi::scanout_timeline::flag::SUPERSEDED
+                }
+            };
+            crate::ddi::scanout_timeline::note(
+                crate::ddi::scanout_timeline::kind::WORKER_STAGE,
+                worker_flags,
+                source.present_epoch,
+                source.frame_watermark,
+                h_alloc as usize as u64,
+                target.resource_id(),
+                source.resource_id,
+            );
+            let dispatch = match worker {
+                crate::virtio::WorkerBindDispatch::Ready => WorkerBindDispatch::Ready,
+                crate::virtio::WorkerBindDispatch::Waiting => WorkerBindDispatch::Waiting,
+                crate::virtio::WorkerBindDispatch::Abandoned => WorkerBindDispatch::Abandoned,
+                crate::virtio::WorkerBindDispatch::Superseded => {
+                    trace.flags |= flags::SUPERSEDED;
+                    crate::ddi::scanout_trace::note_worker_epoch_superseded();
+                    return Ok(ScanoutOutcome::Superseded);
+                }
+            };
+            match decide_worker_bind(already_bound, dispatch) {
+                WorkerBindAction::Deferred => {
+                    // Keep the exact WDDM allocation in the existing pending
+                    // slot. The used-ring DPC wakes this worker only after the
+                    // producer boundary retires; no Windows-primary publication
+                    // or synchronous SET can overtake Venus.
+                    return Ok(ScanoutOutcome::Deferred);
+                }
+                WorkerBindAction::AlreadyBound => false,
+                WorkerBindAction::IssueSyncSet => true,
+                WorkerBindAction::RejectAbandoned => {
                     return Err(ScanoutReject::ProducerAbandoned);
                 }
             }
         }
+        // The adapter-owned fallback has no direct producer-boundary request.
+        // It must still wait before entering the synchronous retry loop: that
+        // loop runs under scanout_mutex, while the active direct transaction's
+        // HPD worker needs this same mutex to enqueue its exact terminal
+        // flush.  The wire-side gate remains the backstop for a race after this
+        // preflight.
+        None => {
+            if !already_bound
+                && adapter
+                    .with_virtio(|v| v.publication_active())
+                    .unwrap_or(true)
+            {
+                return Ok(ScanoutOutcome::Deferred);
+            }
+            !already_bound
+        }
+    };
+    if issue_sync_set {
+        let sync_timeline = worker_request.map(|request| crate::virtio::ctrl::ScanoutSetTimeline {
+            request,
+            present_epoch: source.present_epoch,
+            carried_watermark: source.frame_watermark,
+            flags: if source.snapshot.is_some() {
+                crate::ddi::scanout_timeline::flag::SNAPSHOT
+            } else {
+                0
+            },
+        });
         let set = crate::virtio::ctrl::set_scanout_blob(
             lock.passive(),
             adapter,
@@ -2110,19 +2516,58 @@ unsafe fn program_vidpn_source_inner(
             target.format().virtio(),
             target.pitch(),
             target.plane_offset(),
+            sync_timeline,
         );
-        let Ok(bind_seq) = set else {
-            if let Some(request) = worker_request {
-                let _ = adapter.with_virtio(|v| v.release_failed_sync_worker_bind(request));
+        let bind_seq = match set {
+            Ok(bind_seq) => bind_seq,
+            Err(crate::virtio::VirtioError::PresentationSuperseded) => {
+                // The descriptor floor rejected this request after worker
+                // staging. It never reached the host; clear only this exact
+                // reservation and consume the WDDM handle terminally instead
+                // of retrying an epoch that can only move scanout backward.
+                if let Some(request) = worker_request {
+                    let _ = adapter.with_virtio(|v| v.release_failed_sync_worker_bind(request));
+                }
+                return Ok(ScanoutOutcome::Superseded);
             }
-            return Err(ScanoutReject::SetFailed);
+            Err(crate::virtio::VirtioError::PublicationBusy) => {
+                // The enqueue-side backstop observed a transaction claimed
+                // after worker staging (or after the fallback preflight).  No
+                // descriptor reached the wire, so drop only this worker's
+                // reservation and hand the exact hAllocation back to the
+                // Deferred wrapper.  In particular, do not let ctrl_roundtrip
+                // sleep/retry while holding scanout_mutex: the older
+                // transaction's HPD worker needs this mutex to flush.
+                if let Some(request) = worker_request {
+                    let _ = adapter.with_virtio(|v| v.release_failed_sync_worker_bind(request));
+                }
+                return Ok(ScanoutOutcome::Deferred);
+            }
+            Err(crate::virtio::VirtioError::Timeout) => {
+                // The stack waiter detached, not the host descriptor. Its full
+                // request remains in the in-flight transaction so a late OK
+                // response can be applied/flush-armed by the DPC. Retain the
+                // exact pending handle and programming gate through the normal
+                // Deferred wrapper; releasing either here would allow a newer
+                // SET to overtake an unknown host selection.
+                return Ok(ScanoutOutcome::Deferred);
+            }
+            Err(_) => {
+                // Pre-wire/enqueue refusal has no host-visible SET, while a
+                // host-error response already cleared its exact transaction in
+                // the used-ring drain. Both may release only this worker's
+                // reservation and let the normal recovery path retry.
+                if let Some(request) = worker_request {
+                    let _ = adapter.with_virtio(|v| v.release_failed_sync_worker_bind(request));
+                }
+                return Err(ScanoutReject::SetFailed);
+            }
         };
         // Persist the host-visible selection before any later bookkeeping.
         // DestroyAllocation consults this under virtio_lock so it can disable a
         // resource even if a DPC/worker handoff has not yet published it.
-        let _ = adapter.with_virtio(|v| {
-            v.note_host_accepted_scanout_bind(bind_seq, target.resource_id())
-        });
+        let _ = adapter
+            .with_virtio(|v| v.note_host_accepted_scanout_bind(bind_seq, target.resource_id()));
         trace.flags |= flags::BOUND;
         // THE WIRE-ORDER GUARD. This bookkeeping runs at PASSIVE after the
         // round-trip returned, so it can chronologically FOLLOW the application
@@ -2163,6 +2608,15 @@ unsafe fn program_vidpn_source_inner(
                     let superseded = previous != 0 && previous != target.resource_id();
                     adapter.publish_bound_epoch(source.present_epoch, superseded);
                     adapter.publish_bound_primary(source.primary_address);
+                    crate::ddi::scanout_timeline::note(
+                        crate::ddi::scanout_timeline::kind::BIND_APPLY,
+                        crate::ddi::scanout_timeline::flag::SUCCESS,
+                        source.present_epoch,
+                        source.frame_watermark,
+                        bind_seq,
+                        target.resource_id(),
+                        previous,
+                    );
 
                     let refresh = if adapter.knobs().bind_flush_immediate {
                         adapter.request_scanout_refresh_for_locked(guard, target.resource_id());
@@ -2174,8 +2628,7 @@ unsafe fn program_vidpn_source_inner(
                             source.frame_watermark,
                         );
                         if refresh.0 {
-                            adapter
-                                .request_scanout_refresh_for_locked(guard, target.resource_id());
+                            adapter.request_scanout_refresh_for_locked(guard, target.resource_id());
                         }
                         refresh
                     };
@@ -2191,6 +2644,16 @@ unsafe fn program_vidpn_source_inner(
             crate::diag::record_named_bytes(b"ScPub", target.resource_id());
         } else {
             crate::ddi::scanout_trace::note_fast_bind_late();
+            // The host accepted this direct SET, but a newer wire sequence has
+            // already won the bookkeeping race.  This worker can no longer
+            // arm a refresh for its request, so terminate only its exact
+            // publication transaction; retaining it would permanently fence
+            // every successor behind a host read that will never be queued.
+            if let Some(request) = worker_request {
+                let _ = adapter.with_virtio(|v| {
+                    v.cancel_publication_exact(request.resource_id, request.present_epoch)
+                });
+            }
         }
     }
 

@@ -42,7 +42,8 @@ pub(crate) use segments::{BarSegment, PagingRam};
 /// StartDevice used to take a unique `&mut AdapterContext` that stayed live for
 /// the whole function and mutated ~a dozen plain fields through it — while the
 /// context pointer had been public to dxgkrnl since AddDevice and THREE
-/// concurrent agents build `&AdapterContext` from it. `init_vsync` arms a 16 ms
+/// concurrent agents build `&AdapterContext` from it. `start_vsync` arms the
+/// fixed-phase one-shot
 /// timer and `init_hpd` starts a thread that both immediately take `&self` from
 /// the same address while the outer `&mut` is still in scope, and
 /// `set_virtio(Some(gpu))` enables the device so the DIRQL ISR can fire
@@ -516,16 +517,29 @@ pub struct AdapterContext {
     /// waiting for the PASSIVE display worker to drain it (R320). Only ever set
     /// when the `PresentProbe` knob is on.
     pub probe_pending: AtomicU32,
-    /// VSync heartbeat timer for the display half. A `SynchronizationTimer` fired
-    /// every ~16 ms (`vsync_dpc`) whose DPC synthesizes `DXGK_INTERRUPT_CRTC_VSYNC`
-    /// so dxgkrnl advances the flip queue and issues `SetVidPnSourceAddress` — the
-    /// heartbeat a render-only adapter structurally lacks (the viogpu3d FlipThread
-    /// analog, `viogpu_vidpn.cpp:1977`). Both are zeroed here and initialized in
-    /// place by [`Self::init_vsync`] at StartDevice (a KTIMER/KDPC is
-    /// self-referential once initialized — never move it afterwards); the timer is
-    /// cancelled at StopDevice. Only armed when `display_half`.
+    /// VSync heartbeat timer for the display half. A fixed-phase 60 Hz one-shot
+    /// prefers a system-allocated `EX_TIMER_HIGH_RESOLUTION` timer and falls
+    /// back to this embedded `SynchronizationTimer`/DPC pair only if that
+    /// allocation failed. Both sources synthesize
+    /// `DXGK_INTERRUPT_CRTC_VSYNC` so dxgkrnl advances the flip queue and issues
+    /// `SetVidPnSourceAddress` — the heartbeat a render-only adapter structurally
+    /// lacks (the viogpu3d FlipThread analog, `viogpu_vidpn.cpp:1977`). Both are
+    /// zeroed here and initialized in place by [`Self::init_kernel_events`]
+    /// before publication (a KTIMER/KDPC is self-referential once initialized —
+    /// never move it afterwards), then only armed/cancelled by display lifecycle
+    /// paths. Only armed when `display_half`.
     pub vsync_timer: UnsafeCell<KTIMER>,
     pub vsync_dpc: UnsafeCell<KDPC>,
+    /// `PEX_TIMER` returned by `ExAllocateTimer`, stored as an integer so the
+    /// stable adapter context remains `Sync`. Zero means allocation failed and
+    /// the embedded `KTIMER` fallback is active for this adapter's lifetime.
+    /// The pointer is deleted exactly once from `Drop` at final RemoveDevice,
+    /// after `stop_vsync` has cancelled it.
+    pub vsync_ex_timer: AtomicUsize,
+    /// Interrupt-time deadline (100 ns units) of the one-shot tick currently
+    /// armed. Advancing this fixed phase avoids both the old 16 ms/62.5 Hz mode
+    /// mismatch and cumulative DPC-latency drift.
+    pub vsync_deadline_100ns: AtomicU64,
     /// CRTC_VSYNC delivery gate: default 1 once the display half arms the timer,
     /// toggled by `DxgkDdiControlInterrupt(DXGK_INTERRUPT_CRTC_VSYNC, enable)`.
     /// The DPC only synthesizes an interrupt while this is nonzero.
@@ -727,7 +741,7 @@ pub struct AdapterContext {
     /// dirty bit is re-armed and the bind completion wakes the worker).
     pub scanout_refresh_unbound: AtomicU32,
     pub scanout_flush_inflight: AtomicU32,
-    /// 1 once [`Self::init_vsync`] has armed the timer (StopDevice cancels once).
+    /// 1 while the fixed-phase one-shot is armed (quiesce/StopDevice clear it).
     pub vsync_armed: AtomicU32,
     /// HPD worker event. `DxgkCbIndicateChildStatus` — which tells the OS the child
     /// video-output is *connected*, the transition that makes the target available
@@ -830,11 +844,11 @@ pub(crate) static GATE_RAISE_CAS_GIVEUPS: AtomicU32 = AtomicU32::new(0);
 /// The gate is raised at exactly one place — the DIRQL half of
 /// `SetVidPnSourceAddress` — and used to be lowered at nine hand-written
 /// `store(0)` sites inside one 196-line function, plus one asynchronous site in
-/// the used-ring DPC. Every future early return in that function was a potential
-/// permanent display stop: `vsync_dpc_routine` returns early on every 16 ms tick
-/// while the gate is set, so no CRTC_VSYNC is delivered and dxgkrnl never
-/// retires the queued flip. Two exits already got this wrong (T1a's k-display-01
-/// and k-display-03).
+/// the used-ring DPC. Every future early return in that function can leave a
+/// programming interval stranded, retaining an allocation/producer handoff that
+/// no worker will complete. The VSync DPC continues reporting the last actually
+/// displayed primary while that occurs; it must not turn a PASSIVE producer
+/// delay into missing CRTC_VSYNC notifications.
 ///
 /// The token is *adopted*, not constructed at the raise site: the raise happens
 /// in the DIRQL DDI and the lower happens in the PASSIVE worker's call stack, so
@@ -1047,10 +1061,12 @@ impl AdapterContext {
             // `init_kernel_events` once the context is at its final address.
             venus_mutex: UnsafeCell::new(unsafe { core::mem::zeroed() }),
             probe_pending: AtomicU32::new(0),
-            // Zeroed placeholders — the real KTIMER/KDPC dispatcher state is
-            // written by `init_vsync` once the context is at its final address.
+            // Zeroed placeholders — initialized by `init_kernel_events` once
+            // the context reaches its final address, before publication.
             vsync_timer: UnsafeCell::new(unsafe { core::mem::zeroed() }),
             vsync_dpc: UnsafeCell::new(unsafe { core::mem::zeroed() }),
+            vsync_ex_timer: AtomicUsize::new(0),
+            vsync_deadline_100ns: AtomicU64::new(0),
             vsync_enabled: AtomicU32::new(0),
             vsync_count: AtomicU32::new(0),
             last_primary_address: AtomicU64::new(0),
@@ -1149,9 +1165,8 @@ impl AdapterContext {
     ///
     /// 1. A gate raised at DIRQL immediately before the stop is never cleared,
     ///    because `stop_hpd` makes the worker exit before it runs its deferred
-    ///    continuation. The next StartDevice arms the timer and every
-    ///    `vsync_dpc_routine` tick early-returns on the inherited gate, so
-    ///    `VsCnt` never advances again.
+    ///    continuation. The next StartDevice must not inherit that stale
+    ///    programming ownership into a new transport generation.
     /// 2. Every surviving resource id is meaningless in the new generation,
     ///    whose ids restart at 1 and whose liveness test is bare membership. A
     ///    recycled id can then be accepted as the cached LINEAR scan-out target
@@ -1303,14 +1318,6 @@ impl AdapterContext {
             .store(gate_pack(seq, true), Ordering::Release);
         GATE_RAISE_CAS_GIVEUPS.fetch_add(1, Ordering::Relaxed);
         ProgrammingTicket(seq)
-    }
-
-    /// Whether a programming interval is currently outstanding.
-    ///
-    /// The VSync DPC's gate: while this is true it must not report
-    /// `last_primary_address`, because a newer primary is mid-programming.
-    pub(crate) fn programming_active(&self) -> bool {
-        gate_active(self.vidpn_programming.load(Ordering::Acquire))
     }
 
     /// Clear whichever interval is currently active, whoever owns it.
@@ -1594,7 +1601,8 @@ impl Drop for AdapterContext {
         // context's memory (which embeds the KTIMER/KDPC/KEVENT the worker touches)
         // is freed, in case StopDevice was skipped. No-ops if never started.
         // PASSIVE_LEVEL (RemoveDevice).
-        self.cancel_vsync();
+        self.stop_vsync();
+        self.delete_vsync_ex_timer();
         self.stop_hpd();
         // Free the contiguous paging-RAM segment. RemoveDevice (which drops the
         // boxed AdapterContext) runs at PASSIVE_LEVEL, where MmFreeContiguousMemory

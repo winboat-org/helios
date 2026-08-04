@@ -231,6 +231,12 @@ pub unsafe extern "C" fn hpd_thread_routine(context: *mut c_void) {
         // PASSIVE continuation for that exact callback.
         crate::ddi::display::process_deferred_vidpn_source_address(passive, adapter);
 
+        // WindowedBlt has an event-driven PASSIVE continuation distinct from
+        // scanout refresh: the request must first be admitted by SubmitCommand
+        // and have its exact producer stream retire. This call merely consumes
+        // those already-signalled edges; it never polls a producer.
+        crate::ddi::display::service_windowed_blt(passive, adapter);
+
         // Publish the unsampled scanout-bind trace. This is the ONE PASSIVE
         // site that mirrors it; accumulation happens at DIRQL/DISPATCH with
         // atomics only. Throttled inside `dump_periodic` — a dump is ~120
@@ -244,8 +250,8 @@ pub unsafe extern "C" fn hpd_thread_routine(context: *mut c_void) {
         // arms short-circuited the production publication path -- skipping the
         // `vidpn_programming.store(0)` every sibling exit performs -- while the
         // DDI returned STATUS_SUCCESS to dxgkrnl as if the Windows primary had
-        // been programmed. The gate stayed at 1, the VSync heartbeat stopped,
-        // and the Windows primary was never bound again for the rest of the boot.
+        // been programmed. The gate stayed at 1 and the Windows primary was
+        // never bound again for the rest of the boot.
         // Deleting the experiment removes that failure mode by construction
         // rather than by keeping it on a worker that cannot lie to the OS.
         //

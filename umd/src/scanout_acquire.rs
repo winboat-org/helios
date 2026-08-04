@@ -1,7 +1,7 @@
 //! D4a scanout-read acquire — the UMD half (FIX-DESIGN-d4a.md §4).
 //!
-//! The KMD keeps a per-resource READ LEDGER (one nonpaged page: `issued` /
-//! `retired` host-readback counters per venus resource id) and signals a
+//! The KMD keeps a generation-qualified READ LEDGER (one nonpaged page:
+//! `resid`, `generation`, `issued`, and `retired`) and signals a
 //! registered auto-reset event on every retirement. This module is the UMD's
 //! plumbing for that contract:
 //!
@@ -34,14 +34,14 @@
 //! Every ledger read — the DXVK exports below — happens UNDER that mutex and
 //! only through a currently-registered mapping, and teardown removes the entry
 //! under the same mutex before it unmaps, so a reader can never touch a VA
-//! whose device is mid-destroy. The reads are a handful of `u32` loads per
+//! whose device is mid-destroy. The reads are a handful of atomic loads per
 //! flush; the mutex is uncontended at that rate. The one lock-free fast path
 //! is [`helios_scanout_acquire_enabled`], a single Acquire load, which is what
 //! keeps the knob-off / probe-failed path bit-identical to a build without the
 //! mechanism.
 
 use core::mem::{offset_of, size_of};
-use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use helios_protocol::{
@@ -52,7 +52,8 @@ use helios_protocol::{
     HELIOS_SCANOUT_ACQ_OP_REGISTER, HELIOS_SCANOUT_ACQ_OP_UNMAP,
     HELIOS_SCANOUT_ACQ_OP_UNREGISTER, HELIOS_SCANOUT_ACQ_PROBE_ACK,
     HELIOS_SCANOUT_ACQ_TABLE_FULL, HELIOS_SCANOUT_CAP_ASYNC_PRESENT_STREAM,
-    HELIOS_SCANOUT_CAP_SNAPSHOT_BIND,
+    HELIOS_SCANOUT_CAP_READ_LEDGER, HELIOS_SCANOUT_CAP_SNAPSHOT_BIND,
+    HELIOS_SCANOUT_CAP_WINDOWED_BLT_SNAPSHOT,
 };
 
 use crate::ddi;
@@ -105,6 +106,24 @@ pub(crate) fn scanout_snapshot_capable() -> bool {
 pub(crate) fn async_present_stream_capable() -> bool {
     PROBE_STATE.load(Ordering::Acquire) == PROBE_OK
         && PROBE_CAPS.load(Ordering::Relaxed) & HELIOS_SCANOUT_CAP_ASYNC_PRESENT_STREAM != 0
+}
+
+/// Whether the KMD can consume a typed snapshot as the source of a windowed
+/// BLT. This requires the same probe/ledger transport as direct snapshots but
+/// is deliberately a separate capability: a direct-bind-only KMD must retain
+/// its existing windowed copy path.
+pub(crate) fn windowed_blt_snapshot_capable() -> bool {
+    PROBE_STATE.load(Ordering::Acquire) == PROBE_OK
+        && {
+            let caps = PROBE_CAPS.load(Ordering::Relaxed);
+            caps
+                & (HELIOS_SCANOUT_CAP_WINDOWED_BLT_SNAPSHOT
+                    | HELIOS_SCANOUT_CAP_ASYNC_PRESENT_STREAM
+                    | HELIOS_SCANOUT_CAP_READ_LEDGER)
+                == (HELIOS_SCANOUT_CAP_WINDOWED_BLT_SNAPSHOT
+                    | HELIOS_SCANOUT_CAP_ASYNC_PRESENT_STREAM
+                    | HELIOS_SCANOUT_CAP_READ_LEDGER)
+        }
 }
 
 /// The lock-free fast-path flag the DXVK export reads once per flush:
@@ -259,9 +278,7 @@ unsafe fn escape_scanout_event(
     }
 }
 
-/// Acquire-load one `u32` field of the mapped ledger page. The KMD writes the
-/// counters with Release stores; Acquire loads are the reader half of that
-/// contract (protocol doc on [`HeliosReadLedgerSlot`]).
+/// Acquire-load one `u32` field of the mapped ledger page.
 ///
 /// # Safety
 /// `va + offset` must lie inside a currently-mapped ledger page — guaranteed
@@ -274,17 +291,30 @@ unsafe fn ledger_load(va: usize, offset: usize) -> u32 {
     unsafe { (*((va + offset) as *const AtomicU32)).load(Ordering::Acquire) }
 }
 
+/// Acquire-load one naturally aligned `u64` field of the mapped ledger page.
+///
+/// # Safety
+/// Same mapping-lifetime and bounds contract as [`ledger_load`]. The v2 wire
+/// layout explicitly aligns every shared `u64`, so this atomic view is valid.
+#[inline]
+unsafe fn ledger_load_u64(va: usize, offset: usize) -> u64 {
+    // SAFETY: caller guarantees a live mapping and the protocol layout pins the
+    // 8-byte alignment of generation/issued/retired.
+    unsafe { (*((va + offset) as *const AtomicU64)).load(Ordering::Acquire) }
+}
+
 const LEDGER_MAGIC_OFF: usize = offset_of!(HeliosReadLedgerPage, magic);
 const LEDGER_VERSION_OFF: usize = offset_of!(HeliosReadLedgerPage, version);
 const LEDGER_SLOT_COUNT_OFF: usize = offset_of!(HeliosReadLedgerPage, slot_count);
 const LEDGER_SLOTS_OFF: usize = offset_of!(HeliosReadLedgerPage, slots);
 const SLOT_SIZE: usize = size_of::<HeliosReadLedgerSlot>();
 const SLOT_RESID_OFF: usize = offset_of!(HeliosReadLedgerSlot, resid);
+const SLOT_GENERATION_OFF: usize = offset_of!(HeliosReadLedgerSlot, generation);
 const SLOT_ISSUED_OFF: usize = offset_of!(HeliosReadLedgerSlot, issued);
 const SLOT_RETIRED_OFF: usize = offset_of!(HeliosReadLedgerSlot, retired);
 
-/// Validate a freshly-mapped ledger page's magic/version. A mismatch means a
-/// driver skew and the feature must treat the page as absent.
+/// Validate a freshly-mapped ledger page's complete v2 header. A mismatch
+/// means a driver skew and the feature must treat the page as absent.
 ///
 /// # Safety
 /// `va` must be a live mapping of at least `size_of::<HeliosReadLedgerPage>()`.
@@ -293,7 +323,11 @@ unsafe fn ledger_page_valid(va: usize) -> bool {
     let magic = unsafe { ledger_load(va, LEDGER_MAGIC_OFF) };
     // SAFETY: as above.
     let version = unsafe { ledger_load(va, LEDGER_VERSION_OFF) };
-    magic == HELIOS_READ_LEDGER_MAGIC && version == HELIOS_READ_LEDGER_VERSION
+    // SAFETY: as above.
+    let slot_count = unsafe { ledger_load(va, LEDGER_SLOT_COUNT_OFF) };
+    magic == HELIOS_READ_LEDGER_MAGIC
+        && version == HELIOS_READ_LEDGER_VERSION
+        && slot_count == HELIOS_READ_LEDGER_SLOTS as u32
 }
 
 /// Recompute the fast-path flag from the registry. Call under the mutex.
@@ -405,7 +439,7 @@ pub(crate) fn init_for_device(dev: &HeliosDevice) -> usize {
                 va
             } else {
                 log_error!(
-                    "scanout-acquire: mapped ledger page failed magic/version check — unmapping, feature off for this device"
+                    "scanout-acquire: mapped ledger page failed v2 header check — unmapping, feature off for this device"
                 );
                 // Best effort: return the bogus mapping rather than leak it.
                 // SAFETY: as for the map call.
@@ -578,17 +612,18 @@ pub extern "C" fn helios_scanout_acquire_enabled() -> bool {
     ENABLED.load(Ordering::Acquire) != 0
 }
 
-/// Reader protocol from the protocol doc ([`HeliosReadLedgerSlot`]): find the
-/// slot by resid; Acquire-read `issued`, `retired`; RE-READ `resid` — if it
-/// changed, a mid-read reclaim happened and every read of this resource has
-/// retired, so answer "no slot" (= no wait). `false` = no slot / feature off.
+/// Version-2 reader protocol: find a `resid`, Acquire-read its generation and
+/// counters, then revalidate both identity fields. A same-resid generation
+/// change is a re-claim, so retry a full scan rather than treating it as no
+/// current read. The explicit `_v2` name makes an old DXVK/UMD pair fail closed.
 #[no_mangle]
-pub extern "C" fn helios_scanout_ledger_lookup(
+pub extern "C" fn helios_scanout_ledger_lookup_v2(
     resid: u32,
-    out_issued: *mut u32,
-    out_retired: *mut u32,
+    out_generation: *mut u64,
+    out_issued: *mut u64,
+    out_retired: *mut u64,
 ) -> bool {
-    if resid == 0 || out_issued.is_null() || out_retired.is_null() {
+    if resid == 0 || out_generation.is_null() || out_issued.is_null() || out_retired.is_null() {
         return false;
     }
     if ENABLED.load(Ordering::Acquire) == 0 {
@@ -604,40 +639,52 @@ pub extern "C" fn helios_scanout_ledger_lookup(
     // held for the whole read, so the mapping cannot be torn down under us.
     let slot_count = unsafe { ledger_load(va, LEDGER_SLOT_COUNT_OFF) } as usize;
     let slots = slot_count.min(HELIOS_READ_LEDGER_SLOTS);
-    for i in 0..slots {
-        let slot = va + LEDGER_SLOTS_OFF + i * SLOT_SIZE;
-        // SAFETY: as above; `slot` stays inside the page for i < 8.
-        if unsafe { ledger_load(slot, SLOT_RESID_OFF) } != resid {
-            continue;
+    for _ in 0..HELIOS_READ_LEDGER_SLOTS {
+        let mut changed = false;
+        for i in 0..slots {
+            let slot = va + LEDGER_SLOTS_OFF + i * SLOT_SIZE;
+            // SAFETY: as above; `slot` stays inside the mapped v2 page.
+            if unsafe { ledger_load(slot, SLOT_RESID_OFF) } != resid {
+                continue;
+            }
+            // SAFETY: as above.
+            let generation = unsafe { ledger_load_u64(slot, SLOT_GENERATION_OFF) };
+            // SAFETY: as above.
+            let issued = unsafe { ledger_load_u64(slot, SLOT_ISSUED_OFF) };
+            // SAFETY: as above.
+            let retired = unsafe { ledger_load_u64(slot, SLOT_RETIRED_OFF) };
+            // SAFETY: both re-reads close recycle and same-resid re-claim races.
+            let final_generation = unsafe { ledger_load_u64(slot, SLOT_GENERATION_OFF) };
+            // SAFETY: as above.
+            let final_resid = unsafe { ledger_load(slot, SLOT_RESID_OFF) };
+            if generation == 0 || final_generation != generation || final_resid != resid {
+                changed = true;
+                break;
+            }
+            // SAFETY: out pointers were null-checked; the caller owns them.
+            unsafe {
+                *out_generation = generation;
+                *out_issued = issued;
+                *out_retired = retired;
+            }
+            return true;
         }
-        // SAFETY: as above.
-        let issued = unsafe { ledger_load(slot, SLOT_ISSUED_OFF) };
-        // SAFETY: as above.
-        let retired = unsafe { ledger_load(slot, SLOT_RETIRED_OFF) };
-        // SAFETY: as above — the re-read that closes the reclaim race.
-        if unsafe { ledger_load(slot, SLOT_RESID_OFF) } != resid {
+        if !changed {
             return false;
         }
-        // SAFETY: out pointers were null-checked; the caller owns them.
-        unsafe {
-            *out_issued = issued;
-            *out_retired = retired;
-        }
-        return true;
     }
     false
 }
 
-/// Snapshot up to `max_slots` ledger slots as (resid, issued, retired) `u32`
-/// triples for the DXVK signaler's level-triggered pass. A slot that fails its
-/// resid re-read is reported with resid = 0 (mid-read reclaim = fully
-/// retired). Returns the number of triples written (0 = feature off).
+/// Snapshot v2 slots for the DXVK signaler's level-triggered pass. A slot that
+/// changes resid or generation while sampled is zeroed, never attributed to an
+/// old or new claim. Returns the number of slots written (0 = feature off).
 #[no_mangle]
-pub extern "C" fn helios_scanout_ledger_snapshot(
-    out_triples: *mut u32,
+pub extern "C" fn helios_scanout_ledger_snapshot_v2(
+    out_slots: *mut HeliosReadLedgerSlot,
     max_slots: u32,
 ) -> u32 {
-    if out_triples.is_null() || max_slots == 0 {
+    if out_slots.is_null() || max_slots == 0 {
         return 0;
     }
     if ENABLED.load(Ordering::Acquire) == 0 {
@@ -649,7 +696,7 @@ pub extern "C" fn helios_scanout_ledger_snapshot(
     let Some(va) = reg.iter().find(|e| e.ledger_va != 0).map(|e| e.ledger_va) else {
         return 0;
     };
-    // SAFETY: see helios_scanout_ledger_lookup — same mutex-held contract.
+    // SAFETY: see helios_scanout_ledger_lookup_v2 — same mutex-held contract.
     let slot_count = unsafe { ledger_load(va, LEDGER_SLOT_COUNT_OFF) } as usize;
     let slots = slot_count
         .min(HELIOS_READ_LEDGER_SLOTS)
@@ -659,21 +706,38 @@ pub extern "C" fn helios_scanout_ledger_snapshot(
         // SAFETY: as above.
         let resid = unsafe { ledger_load(slot, SLOT_RESID_OFF) };
         // SAFETY: as above.
-        let issued = unsafe { ledger_load(slot, SLOT_ISSUED_OFF) };
+        let generation = unsafe { ledger_load_u64(slot, SLOT_GENERATION_OFF) };
         // SAFETY: as above.
-        let retired = unsafe { ledger_load(slot, SLOT_RETIRED_OFF) };
-        // SAFETY: as above — mid-read reclaim reports as a free slot.
-        let resid = if unsafe { ledger_load(slot, SLOT_RESID_OFF) } == resid {
-            resid
+        let issued = unsafe { ledger_load_u64(slot, SLOT_ISSUED_OFF) };
+        // SAFETY: as above.
+        let retired = unsafe { ledger_load_u64(slot, SLOT_RETIRED_OFF) };
+        // SAFETY: both fields identify this exact sampled claim.
+        let stable = resid != 0
+            && generation != 0
+            && unsafe { ledger_load_u64(slot, SLOT_GENERATION_OFF) } == generation
+            // SAFETY: as above.
+            && unsafe { ledger_load(slot, SLOT_RESID_OFF) } == resid;
+        let snapshot = if stable {
+            HeliosReadLedgerSlot {
+                resid,
+                _pad0: 0,
+                generation,
+                issued,
+                retired,
+            }
         } else {
-            0
+            HeliosReadLedgerSlot {
+                resid: 0,
+                _pad0: 0,
+                generation: 0,
+                issued: 0,
+                retired: 0,
+            }
         };
-        // SAFETY: the caller promises `max_slots` triples of capacity; `i` is
+        // SAFETY: the caller promises `max_slots` slot capacity; `i` is
         // bounded by `slots <= max_slots`.
         unsafe {
-            *out_triples.add(i * 3) = resid;
-            *out_triples.add(i * 3 + 1) = issued;
-            *out_triples.add(i * 3 + 2) = retired;
+            *out_slots.add(i) = snapshot;
         }
     }
     slots as u32

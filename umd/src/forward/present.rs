@@ -447,6 +447,281 @@ pub(crate) enum RuntimeSubmission {
     },
 }
 
+/// The DXGI entry which led to a runtime present callback.
+///
+/// This is deliberately observation-only.  In particular, `Present1Single`
+/// still takes the ordinary Present implementation after the DDI argument is
+/// translated; retaining the tag is what makes that delegation visible in the
+/// per-process probe summary.
+#[derive(Clone, Copy)]
+pub(crate) enum PresentBoundaryEntry {
+    Present,
+    Present1Single,
+    Present1Multi,
+    Mpo,
+}
+
+impl PresentBoundaryEntry {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Present => "Present",
+            Self::Present1Single => "Present1-single",
+            Self::Present1Multi => "Present1-multi",
+            Self::Mpo => "MPO",
+        }
+    }
+
+    fn entry_counter(self) -> &'static AtomicUsize {
+        match self {
+            Self::Present => &PRESENT_BOUNDARY_PRESENT,
+            Self::Present1Single => &PRESENT_BOUNDARY_PRESENT1_SINGLE,
+            Self::Present1Multi => &PRESENT_BOUNDARY_PRESENT1_MULTI,
+            Self::Mpo => &PRESENT_BOUNDARY_MPO,
+        }
+    }
+}
+
+// These are deliberately process-global: DXGI owns the DDI entry lifetime,
+// while a process may create and destroy more than one UMD device. The probe
+// uses relaxed counters only; allocation/string formatting happens in the
+// first-N diagnostic lines or the PASSIVE DestroyDevice summary, never in the
+// steady-state callback path.
+static PRESENT_BOUNDARY_PRESENT: AtomicUsize = AtomicUsize::new(0);
+static PRESENT_BOUNDARY_PRESENT1_SINGLE: AtomicUsize = AtomicUsize::new(0);
+static PRESENT_BOUNDARY_PRESENT1_MULTI: AtomicUsize = AtomicUsize::new(0);
+static PRESENT_BOUNDARY_MPO: AtomicUsize = AtomicUsize::new(0);
+static PRESENT_BOUNDARY_RENDER_ATTEMPTED: AtomicUsize = AtomicUsize::new(0);
+static PRESENT_BOUNDARY_RENDER_SUCCESS: AtomicUsize = AtomicUsize::new(0);
+static PRESENT_BOUNDARY_RENDER_FAILURE: AtomicUsize = AtomicUsize::new(0);
+static PRESENT_BOUNDARY_RENDER_MISSING: AtomicUsize = AtomicUsize::new(0);
+static PRESENT_BOUNDARY_PRESENT_ATTEMPTED: AtomicUsize = AtomicUsize::new(0);
+static PRESENT_BOUNDARY_PRESENT_SUCCESS: AtomicUsize = AtomicUsize::new(0);
+static PRESENT_BOUNDARY_PRESENT_FAILURE: AtomicUsize = AtomicUsize::new(0);
+static PRESENT_BOUNDARY_PRESENT_MISSING: AtomicUsize = AtomicUsize::new(0);
+static PRESENT_BOUNDARY_MPO_ATTEMPTED: AtomicUsize = AtomicUsize::new(0);
+static PRESENT_BOUNDARY_MPO_SUCCESS: AtomicUsize = AtomicUsize::new(0);
+static PRESENT_BOUNDARY_MPO_FAILURE: AtomicUsize = AtomicUsize::new(0);
+static PRESENT_BOUNDARY_MPO_MISSING: AtomicUsize = AtomicUsize::new(0);
+static PRESENT_BOUNDARY_EARLY_REFUSAL: AtomicUsize = AtomicUsize::new(0);
+static PRESENT_BOUNDARY_ENTRY_LOG_COUNT: LogThrottle = LogThrottle::new();
+static PRESENT_BOUNDARY_CALLBACK_LOG_COUNT: LogThrottle = LogThrottle::new();
+static PRESENT_BOUNDARY_REFUSAL_LOG_COUNT: LogThrottle = LogThrottle::new();
+
+const PRESENT_BOUNDARY_LOG_FIRST_N: usize = 16;
+
+fn probe_entry_attempt(entry: PresentBoundaryEntry) {
+    entry.entry_counter().fetch_add(1, Ordering::Relaxed);
+}
+
+unsafe fn probe_present_entry(
+    entry: PresentBoundaryEntry,
+    a: &ddi::DXGI_DDI_ARG_PRESENT,
+    src_alloc: ddi::D3DKMT_HANDLE,
+    dst_alloc: ddi::D3DKMT_HANDLE,
+) {
+    let Some(n) = PRESENT_BOUNDARY_ENTRY_LOG_COUNT.first_n(PRESENT_BOUNDARY_LOG_FIRST_N) else {
+        return;
+    };
+    let flags = *(&a.Flags as *const ddi::DXGI_DDI_PRESENT_FLAGS as *const u32);
+    log_error!(
+        "present-boundary entry #{} {}: callback_src=0 hSrc={:p}/{} srcAlloc=0x{:x} \
+         hDst={:p}/{} dstAlloc=0x{:x} flags=0x{:x} dirty=0 multiplicity=1 dxgiCtx={:p}",
+        n + 1,
+        entry.name(),
+        a.hSurfaceToPresent as *mut c_void,
+        a.SrcSubResourceIndex,
+        src_alloc,
+        a.hDstResource as *mut c_void,
+        a.DstSubResourceIndex,
+        dst_alloc,
+        flags,
+        a.pDXGIContext,
+    );
+}
+
+unsafe fn probe_present1_multi_entry(
+    a: &ddi::DXGI_DDI_ARG_PRESENT1,
+    callback_source_index: usize,
+    source_handle: usize,
+    source_subresource: u32,
+    src_alloc: ddi::D3DKMT_HANDLE,
+    dst_alloc: ddi::D3DKMT_HANDLE,
+) {
+    let Some(n) = PRESENT_BOUNDARY_ENTRY_LOG_COUNT.first_n(PRESENT_BOUNDARY_LOG_FIRST_N) else {
+        return;
+    };
+    let flags = *(&a.Flags as *const ddi::DXGI_DDI_PRESENT_FLAGS as *const u32);
+    log_error!(
+        "present-boundary entry #{} Present1-multi: surfaces={} callback_src={} hSrc={:p}/{} \
+         srcAlloc=0x{:x} hDst={:p}/{} dstAlloc=0x{:x} flags=0x{:x} dirty={} multiplicity={} dxgiCtx={:p}",
+        n + 1,
+        a.SurfacesToPresent,
+        callback_source_index,
+        source_handle as *mut c_void,
+        source_subresource,
+        src_alloc,
+        a.hDstResource as *mut c_void,
+        a.DstSubResourceIndex,
+        dst_alloc,
+        flags,
+        a.DirtyRects,
+        a.BackBufferMultiplicity,
+        a.pDXGIContext,
+    );
+}
+
+fn probe_early_refusal(entry: PresentBoundaryEntry, reason: &'static str) {
+    PRESENT_BOUNDARY_EARLY_REFUSAL.fetch_add(1, Ordering::Relaxed);
+    if let Some(n) = PRESENT_BOUNDARY_REFUSAL_LOG_COUNT.first_n(PRESENT_BOUNDARY_LOG_FIRST_N) {
+        log_error!(
+            "present-boundary refusal #{} {}: {}",
+            n + 1,
+            entry.name(),
+            reason
+        );
+    }
+}
+
+unsafe fn probe_render_result(
+    entry: PresentBoundaryEntry,
+    hr: i32,
+    allocation_count: u32,
+    h_context: *mut c_void,
+    command_length: u32,
+) {
+    PRESENT_BOUNDARY_RENDER_ATTEMPTED.fetch_add(1, Ordering::Relaxed);
+    if hr >= 0 {
+        PRESENT_BOUNDARY_RENDER_SUCCESS.fetch_add(1, Ordering::Relaxed);
+    } else {
+        PRESENT_BOUNDARY_RENDER_FAILURE.fetch_add(1, Ordering::Relaxed);
+    }
+    if let Some(n) = PRESENT_BOUNDARY_CALLBACK_LOG_COUNT.first_n(PRESENT_BOUNDARY_LOG_FIRST_N) {
+        log_error!(
+            "present-boundary callback #{} {} pfnRenderCb: hr=0x{:08x} allocations={} hContext={:p} commandLength={}",
+            n + 1,
+            entry.name(),
+            hr as u32,
+            allocation_count,
+            h_context,
+            command_length,
+        );
+    }
+}
+
+unsafe fn probe_present_result(
+    entry: PresentBoundaryEntry,
+    hr: i32,
+    callback_args: &ddi::DXGIDDICB_PRESENT,
+    flags: u32,
+) {
+    PRESENT_BOUNDARY_PRESENT_ATTEMPTED.fetch_add(1, Ordering::Relaxed);
+    if hr >= 0 {
+        PRESENT_BOUNDARY_PRESENT_SUCCESS.fetch_add(1, Ordering::Relaxed);
+    } else {
+        PRESENT_BOUNDARY_PRESENT_FAILURE.fetch_add(1, Ordering::Relaxed);
+    }
+    if let Some(n) = PRESENT_BOUNDARY_CALLBACK_LOG_COUNT.first_n(PRESENT_BOUNDARY_LOG_FIRST_N) {
+        log_error!(
+            "present-boundary callback #{} {} pfnPresentCb: hr=0x{:08x} srcAlloc=0x{:x} dstAlloc=0x{:x} \
+             hContext={:p} dxgiCtx={:p} flags=0x{:x} optimize={}",
+            n + 1,
+            entry.name(),
+            hr as u32,
+            callback_args.hSrcAllocation,
+            callback_args.hDstAllocation,
+            callback_args.hContext,
+            callback_args.pDXGIContext,
+            flags,
+            callback_args.bOptimizeForComposition,
+        );
+    }
+}
+
+unsafe fn probe_mpo_result(hr: i32, callback_args: &ddi::DXGIDDICB_PRESENT_MULTIPLANE_OVERLAY) {
+    PRESENT_BOUNDARY_MPO_ATTEMPTED.fetch_add(1, Ordering::Relaxed);
+    if hr >= 0 {
+        PRESENT_BOUNDARY_MPO_SUCCESS.fetch_add(1, Ordering::Relaxed);
+    } else {
+        PRESENT_BOUNDARY_MPO_FAILURE.fetch_add(1, Ordering::Relaxed);
+    }
+    if let Some(n) = PRESENT_BOUNDARY_CALLBACK_LOG_COUNT.first_n(PRESENT_BOUNDARY_LOG_FIRST_N) {
+        log_error!(
+            "present-boundary callback #{} MPO pfnPresentMultiplaneOverlayCb: hr=0x{:08x} allocations={} \
+             hContext={:p} dxgiCtx={:p}",
+            n + 1,
+            hr as u32,
+            callback_args.AllocationInfoCount,
+            callback_args.hContext,
+            callback_args.pDXGIContext,
+        );
+    }
+}
+
+unsafe fn probe_mpo_entry(
+    a: &ddi::DXGI_DDI_ARG_PRESENTMULTIPLANEOVERLAY,
+    callback_args: &ddi::DXGIDDICB_PRESENT_MULTIPLANE_OVERLAY,
+) {
+    let Some(n) = PRESENT_BOUNDARY_ENTRY_LOG_COUNT.first_n(PRESENT_BOUNDARY_LOG_FIRST_N) else {
+        return;
+    };
+    log_error!(
+        "present-boundary entry #{} MPO: planes={} enabled={} dxgiCtx={:p} hContext={:p}",
+        n + 1,
+        a.PresentPlaneCount,
+        callback_args.AllocationInfoCount,
+        a.pDXGIContext,
+        callback_args.hContext,
+    );
+    let mut allocation_slot = 0usize;
+    for i in 0..a.PresentPlaneCount as usize {
+        let plane = &*a.pPresentPlanes.add(i);
+        let allocation = if plane.Enabled == 0 {
+            0
+        } else {
+            let allocation = callback_args.AllocationInfo[allocation_slot].PresentAllocation;
+            allocation_slot += 1;
+            allocation
+        };
+        log_error!(
+            "present-boundary entry #{} MPO plane {}: enabled={} hSrc={:p}/{} srcAlloc=0x{:x} flags=0x{:x} dirty={}",
+            n + 1,
+            i,
+            plane.Enabled,
+            plane.hResource as *mut c_void,
+            plane.SubResourceIndex,
+            allocation,
+            plane.PlaneAttributes.Flags,
+            plane.PlaneAttributes.DirtyRectCount,
+        );
+    }
+}
+
+/// Process-global present-entry and callback totals, read at `DestroyDevice`.
+pub(crate) fn present_boundary_summary() -> String {
+    format!(
+        "DDI PresentBoundary: entry present={} present1_single={} present1_multi={} mpo={} \
+         render attempt/success/failure/missing={}/{}/{}/{} present attempt/success/failure/missing={}/{}/{}/{} \
+         mpo attempt/success/failure/missing={}/{}/{}/{} early_refusal={}",
+        PRESENT_BOUNDARY_PRESENT.load(Ordering::Relaxed),
+        PRESENT_BOUNDARY_PRESENT1_SINGLE.load(Ordering::Relaxed),
+        PRESENT_BOUNDARY_PRESENT1_MULTI.load(Ordering::Relaxed),
+        PRESENT_BOUNDARY_MPO.load(Ordering::Relaxed),
+        PRESENT_BOUNDARY_RENDER_ATTEMPTED.load(Ordering::Relaxed),
+        PRESENT_BOUNDARY_RENDER_SUCCESS.load(Ordering::Relaxed),
+        PRESENT_BOUNDARY_RENDER_FAILURE.load(Ordering::Relaxed),
+        PRESENT_BOUNDARY_RENDER_MISSING.load(Ordering::Relaxed),
+        PRESENT_BOUNDARY_PRESENT_ATTEMPTED.load(Ordering::Relaxed),
+        PRESENT_BOUNDARY_PRESENT_SUCCESS.load(Ordering::Relaxed),
+        PRESENT_BOUNDARY_PRESENT_FAILURE.load(Ordering::Relaxed),
+        PRESENT_BOUNDARY_PRESENT_MISSING.load(Ordering::Relaxed),
+        PRESENT_BOUNDARY_MPO_ATTEMPTED.load(Ordering::Relaxed),
+        PRESENT_BOUNDARY_MPO_SUCCESS.load(Ordering::Relaxed),
+        PRESENT_BOUNDARY_MPO_FAILURE.load(Ordering::Relaxed),
+        PRESENT_BOUNDARY_MPO_MISSING.load(Ordering::Relaxed),
+        PRESENT_BOUNDARY_EARLY_REFUSAL.load(Ordering::Relaxed),
+    )
+}
+
 impl RuntimeSubmission {
     /// The wire command's length and the label its log line carries.
     ///
@@ -504,13 +779,22 @@ pub(crate) fn present_refresh_cmd(
 pub(crate) unsafe fn submit_runtime_submission(
     dev: &crate::device_funcs::HeliosDevice,
     submission: RuntimeSubmission,
+    entry: PresentBoundaryEntry,
 ) -> i32 {
     static LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 
-    let (Some(ctx), false) = (dev.context.as_ref(), dev.kt_callbacks.is_null()) else {
+    let Some(ctx) = dev.context.as_ref() else {
+        probe_early_refusal(entry, "missing runtime context");
         return E_FAIL;
     };
+    if dev.kt_callbacks.is_null() {
+        PRESENT_BOUNDARY_RENDER_MISSING.fetch_add(1, Ordering::Relaxed);
+        probe_early_refusal(entry, "kernel callback table missing");
+        return E_FAIL;
+    }
     let Some(render_cb) = (*dev.kt_callbacks).pfnRenderCb else {
+        PRESENT_BOUNDARY_RENDER_MISSING.fetch_add(1, Ordering::Relaxed);
+        probe_early_refusal(entry, "pfnRenderCb missing");
         log_error!("DXGI submission: pfnRenderCb missing");
         return E_FAIL;
     };
@@ -518,6 +802,7 @@ pub(crate) unsafe fn submit_runtime_submission(
     let command = command_window.map_or(core::ptr::null_mut(), |w| w.ptr.as_ptr());
     let (command_length, label) = submission.command_length_and_label();
     if command.is_null() || command_window.map_or(0, |w| w.capacity) < command_length {
+        probe_early_refusal(entry, "runtime command buffer unavailable");
         log_error!("DXGI {label}: no runtime command buffer");
         return E_FAIL;
     }
@@ -533,7 +818,10 @@ pub(crate) unsafe fn submit_runtime_submission(
         } => {
             let count = match dependencies.write_to(ctx) {
                 Ok(count) => count,
-                Err(hr) => return hr,
+                Err(hr) => {
+                    probe_early_refusal(entry, "runtime allocation list unavailable");
+                    return hr;
+                }
             };
             private.present_ctx_id = correlation.ctx_id;
             private.present_value = correlation.value32;
@@ -551,7 +839,10 @@ pub(crate) unsafe fn submit_runtime_submission(
         } => {
             let count = match dependencies.write_to(ctx) {
                 Ok(count) => count,
-                Err(hr) => return hr,
+                Err(hr) => {
+                    probe_early_refusal(entry, "runtime allocation list unavailable");
+                    return hr;
+                }
             };
             (command as *mut HeliosPresentRefreshCmd)
                 .write_unaligned(present_refresh_cmd(correlation));
@@ -565,7 +856,14 @@ pub(crate) unsafe fn submit_runtime_submission(
     render.NumAllocations = allocation_count;
     render.NumPatchLocations = 0;
     render.hContext = ctx.handle.as_ptr();
+    let trace_start_ns = dev.dxvk.feed_trace_timestamp_ns();
     let hr = render_cb(dev.h_rt_device, &mut render);
+    if trace_start_ns != 0 {
+        let trace_end_ns = dev.dxvk.feed_trace_timestamp_ns();
+        dev.dxvk
+            .feed_trace_render_callback(trace_end_ns.saturating_sub(trace_start_ns));
+    }
+    probe_render_result(entry, hr, allocation_count, render.hContext, command_length);
 
     if hr >= 0 {
         // Each window is replaced as a unit, so a new pointer can never be
@@ -617,6 +915,7 @@ pub(crate) unsafe fn submit_runtime_present(
     dependencies: RuntimePresentDependencies,
     private: Option<HeliosPresentPrivateData>,
     correlation: PresentStreamCorrelation,
+    entry: PresentBoundaryEntry,
 ) -> i32 {
     submit_runtime_submission(
         dev,
@@ -631,6 +930,7 @@ pub(crate) unsafe fn submit_runtime_present(
                 correlation,
             },
         },
+        entry,
     )
 }
 
@@ -648,22 +948,36 @@ pub(crate) unsafe fn submit_runtime_present_then_call(
     private: Option<HeliosPresentPrivateData>,
     correlation: PresentStreamCorrelation,
     callback_args: &mut ddi::DXGIDDICB_PRESENT,
+    entry: PresentBoundaryEntry,
+    flags: u32,
 ) -> i32 {
     if dev.dxgi_callbacks.is_null() {
+        PRESENT_BOUNDARY_PRESENT_MISSING.fetch_add(1, Ordering::Relaxed);
+        probe_early_refusal(entry, "DXGI callback table missing");
         log_error!("DXGI Present: callback table missing");
         return E_FAIL;
     }
     let Some(present_cb) = (*dev.dxgi_callbacks).pfnPresentCb else {
+        PRESENT_BOUNDARY_PRESENT_MISSING.fetch_add(1, Ordering::Relaxed);
+        probe_early_refusal(entry, "pfnPresentCb missing");
         log_error!("DXGI Present: pfnPresentCb missing");
         return E_FAIL;
     };
 
-    let render_hr = submit_runtime_present(dev, dependencies, private, correlation);
+    let render_hr = submit_runtime_present(dev, dependencies, private, correlation, entry);
     if render_hr < 0 {
         return render_hr;
     }
 
-    present_cb(dev.h_rt_device, callback_args)
+    let trace_start_ns = dev.dxvk.feed_trace_timestamp_ns();
+    let hr = present_cb(dev.h_rt_device, callback_args);
+    if trace_start_ns != 0 {
+        let trace_end_ns = dev.dxvk.feed_trace_timestamp_ns();
+        dev.dxvk
+            .feed_trace_present_callback(trace_end_ns.saturating_sub(trace_start_ns));
+    }
+    probe_present_result(entry, hr, callback_args, flags);
+    hr
 }
 
 /// Which entry point a [`finish_present`] call is serving.
@@ -743,6 +1057,7 @@ impl PresentKind {
 /// DDI argument struct.
 pub(crate) struct PresentRequest {
     pub(crate) kind: PresentKind,
+    pub(crate) boundary: PresentBoundaryEntry,
     /// `DXGI_DDI_ARG_PRESENT{,1}::pDXGIContext`, passed straight through.
     pub(crate) dxgi_context: *mut c_void,
     /// The raw `Flags` word. TRACE ONLY -- nothing branches on it here.
@@ -784,12 +1099,17 @@ pub(crate) unsafe fn finish_present(
 ) -> Result<i32, i32> {
     let no_callback_hr = req.kind.initial_hr();
     let Some(dev) = helios_device(h) else {
+        probe_early_refusal(req.boundary, "device handle not live");
         return Ok(no_callback_hr);
     };
 
     let ready = match present_prerequisites(dev, src_alloc) {
         Ok(ready) => ready,
         Err(_skip) => {
+            if dev.dxgi_callbacks.is_null() {
+                PRESENT_BOUNDARY_PRESENT_MISSING.fetch_add(1, Ordering::Relaxed);
+            }
+            probe_early_refusal(req.boundary, "present prerequisites refused");
             // Which of the three preconditions failed lives in
             // PRESENT_SKIP_NO_CALLBACKS / _NO_CONTEXT / _NO_SRC_ALLOC.
             match req.kind {
@@ -861,6 +1181,7 @@ pub(crate) unsafe fn finish_present(
         0
     };
     let Some(dependencies) = RuntimePresentDependencies::new(src_alloc, dst_alloc) else {
+        probe_early_refusal(req.boundary, "source allocation identity lost");
         log_error!(
             "{}: nonzero source allocation invariant lost",
             req.kind.error_tag()
@@ -900,16 +1221,34 @@ pub(crate) unsafe fn finish_present(
         present_private,
         correlation,
         &mut cb,
+        req.boundary,
+        req.flags,
     ))
 }
 
 /// DXGI `pfnPresent`: copy the source resource to the destination resource when
 /// DXGI provides both handles, then flush submitted GPU work.
 pub(crate) unsafe extern "C" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT) -> i32 {
+    probe_entry_attempt(PresentBoundaryEntry::Present);
+    dxgi_present_impl(arg, PresentBoundaryEntry::Present)
+}
+
+/// The common implementation for an ordinary Present and a one-surface
+/// Present1 delegation. The caller chooses only the observation tag; rendering,
+/// snapshot and callback behavior remains the ordinary path.
+unsafe fn dxgi_present_impl(
+    arg: *mut ddi::DXGI_DDI_ARG_PRESENT,
+    boundary: PresentBoundaryEntry,
+) -> i32 {
     if arg.is_null() {
+        probe_early_refusal(boundary, "null Present argument");
         return 0;
     }
     let a = &*arg;
+    // `DXGI_DDI_PRESENT_FLAGS` is a bindgen bitfield wrapper. Read its
+    // documented Blt bit through the raw initialized representation rather
+    // than depending on an operator implementation for that wrapper.
+    let present_flags = *(&a.Flags as *const ddi::DXGI_DDI_PRESENT_FLAGS as *const u32);
     // DXGI_DDI_HDEVICE is a UINT_PTR carrying the driver device handle, the same
     // private pointer stored in D3D10DDI_HDEVICE.pDrvPrivate.
     let h = dxgi_device_handle(a.hDevice);
@@ -918,6 +1257,7 @@ pub(crate) unsafe extern "C" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT
     let dst_h = dxgi_resource_handle(a.hDstResource);
     let src_alloc = resource_allocation(src_h);
     let dst_alloc = resource_allocation(dst_h);
+    probe_present_entry(boundary, a, src_alloc, dst_alloc);
     let mut copied = false;
     // D4b snapshot plan: `Some` iff the direct-flip arm below RECORDED the
     // ordered blit this present. Value-threaded into `finish_present`, never
@@ -996,7 +1336,29 @@ pub(crate) unsafe extern "C" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT
             // the KMD's completion watermark valid for the substituted resid.
             // Every refusal inside returns None (present exactly as today).
             if let Some(ref private) = direct_private {
-                snapshot = snapshot_for_present(h, src_h, private);
+                snapshot = snapshot_for_present(
+                    h,
+                    src_h,
+                    private.width,
+                    private.height,
+                    private.dxgi_format,
+                    SnapshotPurpose::DirectFlip,
+                );
+            } else if present_flags & 1 != 0 {
+                if let Some(source) = resource_snapshot_source(src_h) {
+                    // Windowed BLT: DXGI's exact source is copied into a fresh
+                    // ICD-owned snapshot BEFORE Flush, then the typed Render
+                    // record makes that immutable snapshot the KMD BLT source.
+                    // No direct-primary private selector participates here.
+                    snapshot = snapshot_for_present(
+                        h,
+                        src_h,
+                        source.width,
+                        source.height,
+                        source.dxgi_format,
+                        SnapshotPurpose::WindowedBlt,
+                    );
+                }
             }
 
             // Fold the ordinary producer signal into this present's actual
@@ -1018,8 +1380,7 @@ pub(crate) unsafe extern "C" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT
                         // attempt must retain that path as its recovery try;
                         // otherwise a transient slot failure would leave the
                         // consumer unordered without even the old fallback.
-                        let (published, correlation) =
-                            dev.dxvk.publish_present_order(consumed);
+                        let (published, correlation) = dev.dxvk.publish_present_order(consumed);
                         present_order_folded = published;
                         if published {
                             present_stream_correlation = correlation;
@@ -1129,6 +1490,18 @@ pub(crate) unsafe extern "C" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT
     } else {
         PresentStreamCorrelation::default()
     };
+    // A WindowedBlt snapshot is safe only when this exact producer stream
+    // marker is carried with it. The snapshot copy may already be in the
+    // batch, but without a registered marker it is intentionally unused: the
+    // legacy KMD BLT path remains the truthful fallback rather than inventing
+    // a current-wire boundary.
+    if snapshot
+        .as_ref()
+        .is_some_and(|plan| plan.purpose == SnapshotPurpose::WindowedBlt)
+        && !async_stream_eligible
+    {
+        snapshot = None;
+    }
     if async_stream_eligible {
         // Timed-path evidence is trace-gated: no logging or atomic RMW when
         // UmdTrace is off. Registration/unavailable totals are one-time C++
@@ -1162,6 +1535,7 @@ pub(crate) unsafe extern "C" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT
         dst_alloc,
         PresentRequest {
             kind: PresentKind::Present,
+            boundary,
             dxgi_context: a.pDXGIContext,
             flags: *(&a.Flags as *const ddi::DXGI_DDI_PRESENT_FLAGS as *const u32),
         },
@@ -1417,6 +1791,7 @@ pub(crate) unsafe fn rotate_ring(
     // would change what RotateResourceIdentities moves.
     let first_ownership = (*first).ownership;
     let first_present_private = (*first).present_private;
+    let first_snapshot_source = (*first).snapshot_source;
     for pair in states.windows(2) {
         let (Some(&cur), Some(&next)) = (pair.first(), pair.get(1)) else {
             continue;
@@ -1430,11 +1805,13 @@ pub(crate) unsafe fn rotate_ring(
         // DXVK storage. Leaving this behind makes a flip scan out the previous
         // resource's memory after the first RotateResourceIdentities call.
         (*cur).present_private = (*next).present_private;
+        (*cur).snapshot_source = (*next).snapshot_source;
     }
     (*last).allocation = first_allocation;
     (*last).km_resource = first_km_resource;
     (*last).ownership = first_ownership;
     (*last).present_private = first_present_private;
+    (*last).snapshot_source = first_snapshot_source;
 
     RotationOutcome::Rotated
 }
@@ -1842,15 +2219,19 @@ pub(crate) unsafe extern "C" fn dxgi_get_mpo_group_caps(
 pub(crate) unsafe extern "C" fn dxgi_present_mpo(
     arg: *mut ddi::DXGI_DDI_ARG_PRESENTMULTIPLANEOVERLAY,
 ) -> i32 {
+    probe_entry_attempt(PresentBoundaryEntry::Mpo);
     if arg.is_null() {
+        probe_early_refusal(PresentBoundaryEntry::Mpo, "null MPO argument");
         return E_INVALIDARG;
     }
     let a = &*arg;
     if a.PresentPlaneCount == 0 || a.pPresentPlanes.is_null() {
+        probe_early_refusal(PresentBoundaryEntry::Mpo, "no MPO planes");
         log_error!("DXGI PresentMultiplaneOverlay: no present planes");
         return E_INVALIDARG;
     }
     if a.PresentPlaneCount > DXGI_MPO_MAX_PLANES {
+        probe_early_refusal(PresentBoundaryEntry::Mpo, "too many MPO planes");
         log_error!(
             "DXGI PresentMultiplaneOverlay: too many planes {}",
             a.PresentPlaneCount
@@ -1860,13 +2241,26 @@ pub(crate) unsafe extern "C" fn dxgi_present_mpo(
 
     let h = dxgi_device_handle(a.hDevice);
     let Some(dev) = helios_device(h) else {
+        probe_early_refusal(PresentBoundaryEntry::Mpo, "MPO device handle not live");
         return E_INVALIDARG;
     };
     let (false, Some(ctx)) = (dev.dxgi_callbacks.is_null(), dev.context.as_ref()) else {
+        if dev.dxgi_callbacks.is_null() {
+            PRESENT_BOUNDARY_MPO_MISSING.fetch_add(1, Ordering::Relaxed);
+        }
+        probe_early_refusal(
+            PresentBoundaryEntry::Mpo,
+            "MPO callback table or context missing",
+        );
         log_error!("DXGI PresentMultiplaneOverlay: no DXGI callbacks/context");
         return DXGI_ERROR_UNSUPPORTED;
     };
     let Some(present_cb) = (*dev.dxgi_callbacks).pfnPresentMultiplaneOverlayCb else {
+        PRESENT_BOUNDARY_MPO_MISSING.fetch_add(1, Ordering::Relaxed);
+        probe_early_refusal(
+            PresentBoundaryEntry::Mpo,
+            "pfnPresentMultiplaneOverlayCb missing",
+        );
         log_error!("DXGI PresentMultiplaneOverlay: pfnPresentMultiplaneOverlayCb missing");
         return DXGI_ERROR_UNSUPPORTED;
     };
@@ -1912,11 +2306,19 @@ pub(crate) unsafe extern "C" fn dxgi_present_mpo(
             continue;
         }
         if cb.AllocationInfoCount as usize >= cb.AllocationInfo.len() {
+            probe_early_refusal(
+                PresentBoundaryEntry::Mpo,
+                "MPO allocation list capacity exceeded",
+            );
             return E_INVALIDARG;
         }
         let resource = dxgi_resource_handle(plane.hResource);
         let alloc = resource_allocation(resource);
         if alloc == 0 {
+            probe_early_refusal(
+                PresentBoundaryEntry::Mpo,
+                "MPO plane source allocation missing",
+            );
             log_error!(
                 "DXGI PresentMultiplaneOverlay: plane {} has no allocation hResource=0x{:x}",
                 i,
@@ -1939,15 +2341,19 @@ pub(crate) unsafe extern "C" fn dxgi_present_mpo(
     }
 
     if cb.AllocationInfoCount == 0 {
+        probe_early_refusal(PresentBoundaryEntry::Mpo, "no enabled MPO planes");
         log_error!("DXGI PresentMultiplaneOverlay: no enabled planes");
         return E_INVALIDARG;
     }
+
+    probe_mpo_entry(a, &cb);
 
     if let Some(context) = d3d11_context(h) {
         context.Flush();
     }
 
     let hr = present_cb(dev.h_rt_device, &cb);
+    probe_mpo_result(hr, &cb);
     if MPO_LOG_COUNT.first_n(64).is_some() {
         trace_line!(
             "DXGI PresentMultiplaneOverlay: planes={} enabled={} presentCb=0x{:08x} ctx={:p}",
@@ -1969,15 +2375,24 @@ pub(crate) unsafe extern "C" fn dxgi_reserved_unsupported(_arg: *mut c_void) -> 
 
 pub(crate) unsafe extern "C" fn dxgi_present1(arg: *mut ddi::DXGI_DDI_ARG_PRESENT1) -> i32 {
     if arg.is_null() {
+        probe_early_refusal(
+            PresentBoundaryEntry::Present1Multi,
+            "null Present1 argument",
+        );
         return E_INVALIDARG;
     }
     let a = &*arg;
     if a.SurfacesToPresent == 0 || a.phSurfacesToPresent.is_null() {
+        probe_early_refusal(
+            PresentBoundaryEntry::Present1Multi,
+            "Present1 has no source surfaces",
+        );
         log_error!("DXGI Present1: no source surfaces");
         return E_INVALIDARG;
     }
 
     if a.SurfacesToPresent == 1 {
+        probe_entry_attempt(PresentBoundaryEntry::Present1Single);
         let source = *a.phSurfacesToPresent;
         let mut present = ddi::DXGI_DDI_ARG_PRESENT {
             hDevice: a.hDevice,
@@ -1989,7 +2404,7 @@ pub(crate) unsafe extern "C" fn dxgi_present1(arg: *mut ddi::DXGI_DDI_ARG_PRESEN
             Flags: a.Flags,
             FlipInterval: a.FlipInterval,
         };
-        return dxgi_present(&mut present);
+        return dxgi_present_impl(&mut present, PresentBoundaryEntry::Present1Single);
     }
 
     // WDDM 1.3 Present1's surface array is not an old single-source Present.
@@ -2004,6 +2419,15 @@ pub(crate) unsafe extern "C" fn dxgi_present1(arg: *mut ddi::DXGI_DDI_ARG_PRESEN
     let dst_h = dxgi_resource_handle(a.hDstResource);
     let src_alloc = resource_allocation(src_h);
     let dst_alloc = resource_allocation(dst_h);
+    probe_entry_attempt(PresentBoundaryEntry::Present1Multi);
+    probe_present1_multi_entry(
+        a,
+        source_index,
+        source.hSurface as usize,
+        source.SubResourceIndex,
+        src_alloc,
+        dst_alloc,
+    );
     if PRESENT1_LOG_COUNT.first_n(64).is_some() {
         trace_line!(
             "DXGI Present1 multi: surfaces={} callback_src={} src={:p}/{} alloc=0x{:x} \
@@ -2023,6 +2447,10 @@ pub(crate) unsafe extern "C" fn dxgi_present1(arg: *mut ddi::DXGI_DDI_ARG_PRESEN
     }
 
     if src_alloc == 0 {
+        probe_early_refusal(
+            PresentBoundaryEntry::Present1Multi,
+            "Present1 callback source allocation missing",
+        );
         log_error!(
             "DXGI Present1 multi: callback source has no allocation hResource=0x{:x}",
             source.hSurface
@@ -2051,6 +2479,7 @@ pub(crate) unsafe extern "C" fn dxgi_present1(arg: *mut ddi::DXGI_DDI_ARG_PRESEN
         dst_alloc,
         PresentRequest {
             kind: PresentKind::Present1Multi,
+            boundary: PresentBoundaryEntry::Present1Multi,
             dxgi_context: a.pDXGIContext,
             flags: *(&a.Flags as *const ddi::DXGI_DDI_PRESENT_FLAGS as *const u32),
         },

@@ -76,6 +76,7 @@ pub(crate) fn drain_used_and_complete(adapter: &AdapterContext) {
         }
         Ok(Some(crate::virtio::FastBindDispatch::Deferred))
         | Ok(Some(crate::virtio::FastBindDispatch::Handled))
+        | Ok(Some(crate::virtio::FastBindDispatch::Superseded))
         | Ok(None)
         | Err(_) => {}
     }
@@ -147,31 +148,58 @@ pub(crate) fn drain_used_and_complete(adapter: &AdapterContext) {
         // resource that died between the bind and now self-heals exactly as
         // today's stale states do — and host-side FIFO means our bind always
         // precedes any unref of the same resource.
-        if let Some(bind) = fast_bind.filter(|bind| adapter.adopt_scanout_bind_seq(bind.seq)) {
-            // The wire-order guard belongs inside the same notify-ordered
-            // transition as every identity/epoch publication.
-            // Sampled under the same ordering scope as the active-identity
-            // publication and boundary insertion.  A rebind to a DIFFERENT
-            // resource ends every older epoch's lease — the control queue is
-            // FIFO, so a returned SET_SCANOUT_BLOB proves every earlier flush
-            // completed.
-            let previous = adapter.host_bound_scanout_resource.load(Ordering::Acquire);
-            let superseded = previous != 0 && previous != bind.resource_id;
-            adapter.remember_scanout_blob(bind.resource_id, (bind.wh >> 32) as u32, bind.wh as u32);
-            adapter.publish_bound_epoch(bind.present_epoch, superseded);
-            adapter.publish_bound_primary(bind.primary_address);
-            crate::ddi::scanout_trace::note_fast_bind_applied();
+        if let Some(bind) = fast_bind {
+            if adapter.adopt_scanout_bind_seq(bind.seq) {
+                // The wire-order guard belongs inside the same notify-ordered
+                // transition as every identity/epoch publication.
+                // Sampled under the same ordering scope as the active-identity
+                // publication and boundary insertion.  A rebind to a DIFFERENT
+                // resource ends every older epoch's lease — the control queue is
+                // FIFO, so a returned SET_SCANOUT_BLOB proves every earlier flush
+                // completed.
+                let previous = adapter.host_bound_scanout_resource.load(Ordering::Acquire);
+                let superseded = previous != 0 && previous != bind.resource_id;
+                adapter.remember_scanout_blob(
+                    bind.resource_id,
+                    (bind.wh >> 32) as u32,
+                    bind.wh as u32,
+                );
+                adapter.publish_bound_epoch(bind.present_epoch, superseded);
+                adapter.publish_bound_primary(bind.primary_address);
+                crate::ddi::scanout_timeline::note(
+                    crate::ddi::scanout_timeline::kind::BIND_APPLY,
+                    crate::ddi::scanout_timeline::flag::SUCCESS,
+                    bind.present_epoch,
+                    bind.carried_watermark,
+                    bind.seq,
+                    bind.resource_id,
+                    previous,
+                );
+                crate::ddi::scanout_trace::note_fast_bind_applied();
 
-            let (ready, carried) =
-                adapter.arm_bind_refresh_locked(guard, bind.resource_id, bind.carried_watermark);
-            if carried {
-                crate::ddi::scanout_trace::note_bind_watermark_carried();
+                let (ready, carried) = adapter.arm_bind_refresh_locked(
+                    guard,
+                    bind.resource_id,
+                    bind.carried_watermark,
+                );
+                if carried {
+                    crate::ddi::scanout_trace::note_bind_watermark_carried();
+                } else {
+                    crate::ddi::scanout_trace::note_bind_watermark_sampled();
+                }
+                crate::ddi::scanout_trace::note_bind_refresh(ready);
+                if ready {
+                    adapter.request_scanout_refresh_for_locked(guard, bind.resource_id);
+                }
             } else {
-                crate::ddi::scanout_trace::note_bind_watermark_sampled();
-            }
-            crate::ddi::scanout_trace::note_bind_refresh(ready);
-            if ready {
-                adapter.request_scanout_refresh_for_locked(guard, bind.resource_id);
+                // The host accepted this SET, but a later bind's bookkeeping
+                // already owns the displayed identity. It cannot arm a flush
+                // for a resource the host has moved on from; resolve only this
+                // full request's transaction, never a resource-wide guess.
+                crate::ddi::scanout_trace::note_fast_bind_late();
+                let _ = guard.with_virtio(|_, v| {
+                    v.cancel_publication_exact(bind.resource_id, bind.present_epoch)
+                });
             }
         }
 
@@ -181,8 +209,17 @@ pub(crate) fn drain_used_and_complete(adapter: &AdapterContext) {
             .with_virtio(|o, v| v.take_ready_scanout_refresh(o))
             .ok()
             .flatten();
-        if let Some(resource_id) = refresh_ready {
-            adapter.request_scanout_refresh_for_locked(guard, resource_id);
+        if let Some(marker) = refresh_ready {
+            crate::ddi::scanout_timeline::note(
+                crate::ddi::scanout_timeline::kind::REFRESH_PROMOTE,
+                crate::ddi::scanout_timeline::flag::READY,
+                adapter.scanout_bound_epoch.load(Ordering::Acquire),
+                marker.boundary(),
+                0,
+                marker.resource_id(),
+                0,
+            );
+            adapter.request_scanout_refresh_for_locked(guard, marker.resource_id());
         }
 
         // One at a time, so a failed notification can put its fence back. The
@@ -226,7 +263,17 @@ pub(crate) fn drain_used_and_complete(adapter: &AdapterContext) {
                 super::submit_command::signal_dma_completed(guard, dxgkrnl, ready.fence())
             };
             if status == STATUS_SUCCESS {
+                let terminal_prefix = ready.terminal_prefix();
                 ready.delivered();
+                if let Some(prefix) = terminal_prefix {
+                    // Consume the complete same-stream WindowedBlt prefix
+                    // only after dxgkrnl accepted the DMA completion. A
+                    // callback failure requeues the WDDM entry without
+                    // having to reconstruct terminal membership.
+                    let _ = guard.with_virtio(|_o, v| {
+                        v.consume_windowed_blt_terminal_prefix(prefix)
+                    });
+                }
                 continue;
             }
             super::submit_command::DMA_NOTIFY_FAILS.fetch_add(1, Ordering::Relaxed);

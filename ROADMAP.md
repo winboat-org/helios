@@ -4,7 +4,49 @@
 changed on 2026-07-09: Helios is now a WDDM render+display adapter and owns the
 virtio-gpu scanout; IddCx/Looking Glass is no longer the active display path.*
 
-## Current verified baseline (2026-07-23, KMD 22.22.142.0)
+## Current verified correction (2026-08-04, KMD 22.22.238.0)
+
+- **Fullscreen presentation is not currently a broken SDL scanout path.** The
+  owner corrected the viewer identity after the `.238` visible test: the
+  hold/judder that looked like roughly 30–40 fps was observed through **VNC**,
+  not SDL. Native QEMU SDL is owner-verified rock solid and smooth, and the
+  tearing is gone. Treat the earlier claim that SDL independently reproduced
+  the hold/burst defect as retracted. A VNC cadence observation is evidence
+  about VNC update/encoding/client delivery only; it must not be used to blame
+  KMD scanout, QEMU readback, or the D3D11 render path without a correlated
+  boundary trace. Smooth SDL means smooth at the display refresh ceiling, not
+  that all 150–220 rendered frames per second can be shown on a 60 Hz output.
+- `.238` replaced the coarse fallback VSync timer with a high-resolution
+  `ExAllocateTimer(EX_TIMER_HIGH_RESOLUTION)` source. In the targeted Combined
+  trace its active VSync samples were stable at about 16.6 ms (p95 about
+  17.1 ms, no gaps over 40 ms), and the owner now sees no tearing. This closes
+  the fullscreen tearing/cadence symptom for SDL; VNC fluidity remains a
+  separate frontend/client concern and is not a blocker for D3D11 throughput
+  work.
+- **Windowed 3D11 presentation remains open and is a different defect.** In
+  the interactive standard Fire Strike flow, a blank titled `3DMark Workload`
+  window appears and then disappears while 3DMark continues the workload and
+  ultimately reports a score. The scheduled custom `FireStrikeCombinedC`
+  window trace (`tmp/cadence-238-window-blt-accept.csv`) rendered successfully,
+  but it does **not** validate this interactive path. Instrument the actual
+  runtime entry point (ordinary Present, single/multi-surface Present1, or MPO)
+  and its exact handles/allocations before changing policy. In particular,
+  current `dxgi_present1` many-surface code deliberately passes no snapshot or
+  stream correlation; that is a source-backed lead, not yet the proven cause.
+- **The remaining Fire Strike performance gap is not a scanout-cadence
+  diagnosis.** The current multithreaded command-list path recorded GT1
+  221.337, GT2 220.996, Physics 125.986, and Combined 41.952 fps in
+  `tmp/perf/fs-std.txt`; a later targeted Combined run reached 43.593 fps.
+  Nevertheless, the owner observes only roughly 50–60% host-GPU utilization
+  in Fire Strike/DX11, versus a sustained roughly 80–90% in Steel Nomad's
+  Vulkan path. Use that differential to find where the D3D11-specific
+  runtime/UMD/DXVK command-production pipeline fails to keep the GPU fed.
+  Steel Nomad exonerates generic Vulkan throughput, but not D3D11 per-draw,
+  command-list, synchronization, or submission economics. Do not spend the
+  next performance session tuning scanout unless an epoch-correlated trace
+  actually shows scanout back-pressure reaching rendering.
+
+## Earlier direct-primary baseline (2026-07-23, KMD 22.22.142.0)
 
 - `DisplayHalf=1` exposes one connected child and one VidPn source. DWM composes
   the whole desktop on Helios and `SetVidPnSourceAddress` selects the real
@@ -1811,7 +1853,8 @@ Open defects, roughly ordered:
    (`Global\HeliosPresentFence_<pid>_<fenceId>` — dwm owns SEVERAL devices, per-pid
    names collided live; Everyone-DACL), records signalFence(++counter) on the frame's
    OPEN cmdlist (no present-thread wait), publishes (resid → pid, fenceId, value) in a
-   seqlock-slotted mapped FILE `C:\ProgramData\Helios\helios_present_sync.bin` (both
+   HPS2 seqlock-slotted mapped FILE `C:\ProgramData\Helios\helios_present_sync_v2.bin`
+   (4096 fixed 32-byte slots; 131104 bytes total; both
    principals have ProgramData rights; do NOT delete the live file — mapped views
    split-brain until the mappers restart). Consumer imports by name (cached per
    pid+fenceId), `getValue` fast-path, bounded wait, timeout → copy anyway + loud
@@ -1950,17 +1993,20 @@ Open defects, roughly ordered:
   live cache would cost GT2 through venus. Run table + honest noise
   discussion: report §3c.
 
-- **OPEN (2026-07-26, found while taking the T0 baseline): DComp cadence ~50 fps, not the
-  documented ~63; present-gate avg ~2.0 ms, not the documented ~0.48 ms.** Measured on an
+- **HISTORICAL OPEN MEASUREMENT (2026-07-26, found while taking the T0 baseline):
+  DComp producer cadence ~50 fps, not the then-documented ~63; present-gate avg
+  ~2.0 ms, not the then-documented ~0.48 ms.** Measured on an
   idle box (CPU ~1 %) with `helios_dcomp_probe` (25 s runs): 1236 / 1152 / 1253 frames
   **before** the T0 deploy and 1227 / 1307 **after**, i.e. 46–52 fps throughout — so this
   is NOT a T0 effect and not a debug-vs-release-UMD effect. An earlier stored run of the
   same probe on this box recorded 1576 frames (63.0 fps), which is where the documented
   figure comes from. dwm `present-gate:` reads avg 2018 µs / max 14595 µs / 30 timeouts in
-  3072 presents on the release UMD. Not yet triaged: unknown whether the regression is in
-  the guest (present path), the QEMU frontend, or host-side scanout delivery — the PSC
-  charter says to measure present-to-scanout and VNC delivery separately before assigning
-  blame. Repeatable baseline procedure: two `helios_dcomp_probe` runs, then read the last
+  3072 presents on the release UMD. This count is a producer-side DComp observation,
+  not proof of a visible fullscreen scanout defect. The 2026-08-04 owner correction
+  verifies native SDL smooth and retracts the prior SDL hold/burst report; VNC cadence
+  must be measured separately. Revisit this probe only when targeting DWM/desktop
+  producer cadence, and correlate it through presentation before assigning blame.
+  Repeatable baseline procedure: two `helios_dcomp_probe` runs, then read the last
   `present-gate:` line from the live dwm UMD log.
 - **IDD delivered-frame cycle — MEASURED (21st session, `D3D11 path stats:` line,
   1/300 frames in the LGIdd log):** the swapchain thread is fully serialized, so
@@ -3078,8 +3124,10 @@ Plan:
   every 600th thereafter at `DiagLevel=0`, NOT per frame. **A `PB*` identity
   value can therefore be up to ~10 s stale; do not read one as live.** Set
   `DiagLevel=1` (+ `pnputil /restart-device`) to restore the per-call cadence.
-  UNTHROTTLED, always current: `PBRet`, `PBCpy` (all arms), `PBFnc`, `PBSyWt`,
-  `PBSyCp`, and `PBFlip`'s `0xE1`/`0xE2` failure arms.
+  `PBRet=STATUS_SUCCESS` follows the same first/every-600th cadence beginning
+  with 22.22.240.0; every non-success `PBRet` remains immediate. UNTHROTTLED,
+  always current: `PBCpy` (all arms), `PBFnc`, `PBSyWt`, `PBSyCp`, and
+  `PBFlip`'s `0xE1`/`0xE2` failure arms.
 - **RETIRED 22.22.180.0** (R903/x-dup-dead-20 — do not look for these; they are
   gone from the driver, and any value still in the service key is a stale
   leftover): the `GdiAccelMode` knob and the whole `Gd*` counter family —

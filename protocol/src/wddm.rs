@@ -261,7 +261,9 @@ impl HeliosWddmOpenIdentity {
 
 /// `'HPRS'` — magic of [`HeliosPresentPrivateData`].
 pub const HELIOS_PRESENT_PRIVATE_MAGIC: u32 = 0x4850_5253;
-/// Current present-private-data ABI version.
+/// Current present-private-data ABI version. Appended tails are guarded by
+/// their exact flags and command coverage, so this remains prefix-compatible
+/// with mixed UMD/KMD deployment.
 pub const HELIOS_PRESENT_PRIVATE_VERSION: u32 = 1;
 /// `HeliosPresentPrivateData::reserved` bit: the payload came from the exact
 /// exportable `pPrimaryDesc` allocation and may be scanned out directly. The
@@ -279,6 +281,10 @@ pub const HELIOS_PRESENT_PRIVATE_FLAG_DIRECT_SCANOUT: u32 = 1 << 0;
 /// predate the bit ignore it and behave exactly as before (and the UMD only
 /// sets it after the KMD advertised `HELIOS_SCANOUT_CAP_SNAPSHOT_BIND`).
 pub const HELIOS_PRESENT_PRIVATE_FLAG_SNAPSHOT: u32 = 1 << 1;
+/// The snapshot is the exact source for a windowed `DXGK_PRESENTFLAGS.Blt`.
+/// It MUST NOT be consumed by the direct-flip binding arm.  The inverse is
+/// also enforced: a direct-flip snapshot never enters the windowed BLT FIFO.
+pub const HELIOS_PRESENT_PRIVATE_FLAG_WINDOWED_BLT_SNAPSHOT: u32 = 1 << 2;
 /// `'HEPR'` — magic of [`HeliosPresentRenderCmd`].
 pub const HELIOS_PRESENT_RENDER_MAGIC: u32 = 0x5250_4548;
 /// Current inline present-render command ABI version.
@@ -325,7 +331,18 @@ pub struct HeliosPresentPrivateData {
     pub present_ctx_id: u32,
     pub present_value: u32,
     pub present_cookie: u64,
+    /// Exact `VkMemoryAllocateInfo::memoryTypeIndex` recorded for a snapshot
+    /// source. Meaningful only with `FLAG_WINDOWED_BLT_SNAPSHOT` and only when
+    /// the command covers this complete v2 tail.
+    pub snapshot_memory_type_index: u32,
+    /// Reserved-zero except for `HELIOS_PRESENT_SNAPSHOT_PURPOSE_WINDOWED_BLT`.
+    /// Keeping the purpose scalar makes a flagged malformed/private-data tail a
+    /// refusal rather than an implicit direct-vs-windowed inference.
+    pub snapshot_purpose: u32,
 }
+
+pub const HELIOS_PRESENT_SNAPSHOT_PURPOSE_NONE: u32 = 0;
+pub const HELIOS_PRESENT_SNAPSHOT_PURPOSE_WINDOWED_BLT: u32 = 1;
 
 impl HeliosPresentPrivateData {
     #[inline]
@@ -396,10 +413,11 @@ const _: () = {
     assert!(core::mem::size_of::<HeliosWddmAllocMeta>() == 48);
     // 40 -> 48 with the appended `venus_alloc_size` (D4b snapshot); the
     // 40-byte prefix layout is unchanged — pre-snapshot readers keep working.
-    assert!(core::mem::size_of::<HeliosPresentPrivateData>() == 64);
+    assert!(core::mem::size_of::<HeliosPresentPrivateData>() == 72);
     assert!(core::mem::offset_of!(HeliosPresentPrivateData, venus_alloc_size) == 40);
     assert!(core::mem::offset_of!(HeliosPresentPrivateData, present_ctx_id) == 48);
-    assert!(core::mem::size_of::<HeliosPresentRenderCmd>() == 72);
+    assert!(core::mem::offset_of!(HeliosPresentPrivateData, snapshot_memory_type_index) == 64);
+    assert!(core::mem::size_of::<HeliosPresentRenderCmd>() == 80);
     assert!(core::mem::size_of::<HeliosPresentRefreshCmd>() == 32);
     assert!(core::mem::offset_of!(HeliosPresentRefreshCmd, present_ctx_id) == 16);
     // The identity record must fit exactly over the HeliosWddmAllocPrivate

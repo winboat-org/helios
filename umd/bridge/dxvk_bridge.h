@@ -33,6 +33,11 @@ struct HeliosDxvkDevice {
   std::size_t d3d11_device_ptr() const;
   std::size_t d3d11_context_ptr() const;
   std::uint32_t venus_context_id() const;
+  // Opt-in queue-feed attribution. The timestamp is zero when tracing is off,
+  // so the ordinary callback path performs no clock read or atomic update.
+  std::uint64_t feed_trace_timestamp_ns() const noexcept;
+  void feed_trace_render_callback(std::uint64_t duration_ns) const noexcept;
+  void feed_trace_present_callback(std::uint64_t duration_ns) const noexcept;
   // BUILD_2 recycle handoff. The deferred-context address is borrowed; the
   // command-list address transfers its one owned IC hCL reference on true.
   // The bridge gives it only to that exact deferred context's bounded cache;
@@ -195,7 +200,8 @@ struct HeliosDxvkDevice {
   // negative on failure, where the caller presents exactly as today.
   std::int32_t present_snapshot_copy(
       std::size_t dst_resource_ptr,
-      std::size_t src_resource_ptr) const;
+      std::size_t src_resource_ptr,
+      bool windowed_blt_reservation) const;
 
   std::size_t create_hull_shader(const std::uint8_t* code, std::size_t len) const;
   std::size_t create_domain_shader(const std::uint8_t* code, std::size_t len) const;

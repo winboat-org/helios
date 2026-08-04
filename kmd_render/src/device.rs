@@ -78,6 +78,8 @@ pub struct ContextContext {
     /// could alias an invalid offset onto a valid-looking one).
     snap_plane_offset: AtomicU64,
     snap_alloc_size: AtomicU64,
+    snap_memory_type: AtomicU32,
+    snap_purpose: AtomicU32,
     /// Registered-stream marker STASH. Exactly like the snapshot handoff, the
     /// Render→Present pair is the only documented route from UMD command bytes
     /// into the KMD-private DMA record consumed by SubmitCommand. The three
@@ -135,6 +137,9 @@ impl<'a> ContextHandleRef<'a> {
             .store(snap.plane_offset, Ordering::Relaxed);
         ctx.snap_alloc_size
             .store(snap.venus_alloc_size, Ordering::Relaxed);
+        ctx.snap_memory_type
+            .store(snap.memory_type_index, Ordering::Relaxed);
+        ctx.snap_purpose.store(snap.purpose, Ordering::Relaxed);
         ctx.snap_resid.store(snap.resource_id, Ordering::Release);
     }
 
@@ -158,6 +163,8 @@ impl<'a> ContextHandleRef<'a> {
             dxgi_format: ctx.snap_dxgi_format.load(Ordering::Relaxed),
             plane_offset: ctx.snap_plane_offset.load(Ordering::Relaxed),
             venus_alloc_size: ctx.snap_alloc_size.load(Ordering::Relaxed),
+            memory_type_index: ctx.snap_memory_type.load(Ordering::Relaxed),
+            purpose: ctx.snap_purpose.load(Ordering::Relaxed),
         })
     }
 
@@ -398,6 +405,8 @@ pub unsafe extern "C" fn dxgkddi_create_context(
         snap_dxgi_format: AtomicU32::new(0),
         snap_plane_offset: AtomicU64::new(0),
         snap_alloc_size: AtomicU64::new(0),
+        snap_memory_type: AtomicU32::new(0),
+        snap_purpose: AtomicU32::new(0),
         present_stream_marker: crate::sync::SpinLock::new(None),
     });
     args.hContext = Box::into_raw(ctx) as HANDLE;

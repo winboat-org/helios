@@ -241,6 +241,7 @@ impl AdapterContext {
         &self,
         resource_id: u32,
         stream_marker: Option<PresentStreamMarker>,
+        snapshot_submission: bool,
     ) -> bool {
         self.with_wddm_notify_lock(|guard| {
             // A marker for a future flip records its exact completion boundary
@@ -269,6 +270,26 @@ impl AdapterContext {
                         .unwrap_or_else(|| v.wire_fence_watermark());
                     if resource_id != 0 {
                         self.record_frame_watermark(resource_id, watermark);
+                    }
+                    crate::ddi::scanout_timeline::note(
+                        crate::ddi::scanout_timeline::kind::PRODUCER_MARKER,
+                        0,
+                        0,
+                        watermark,
+                        0,
+                        resource_id,
+                        u32::from(action == PresentMarkerAction::QueueImmediate),
+                    );
+                    if snapshot_submission {
+                        crate::ddi::scanout_timeline::note(
+                            crate::ddi::scanout_timeline::kind::SNAPSHOT_SUBMIT,
+                            crate::ddi::scanout_timeline::flag::SNAPSHOT,
+                            0,
+                            watermark,
+                            0,
+                            resource_id,
+                            0,
+                        );
                     }
                     if action == PresentMarkerAction::QueueImmediate {
                         v.note_scanout_refresh_at(order, resource_id, watermark)
@@ -382,6 +403,19 @@ impl AdapterContext {
                     .rebase_dead_present_stream_boundary(watermark)
                     .unwrap_or(watermark);
                 let ready = v.note_scanout_refresh_at(order, resource_id, watermark);
+                crate::ddi::scanout_timeline::note(
+                    crate::ddi::scanout_timeline::kind::BIND_REFRESH_ARM,
+                    if ready {
+                        crate::ddi::scanout_timeline::flag::READY
+                    } else {
+                        crate::ddi::scanout_timeline::flag::WAITING
+                    },
+                    self.scanout_bound_epoch.load(Ordering::Acquire),
+                    watermark,
+                    0,
+                    resource_id,
+                    u32::from(carried_watermark != 0 || table.is_some()),
+                );
                 if !ready {
                     // What is this deferral actually waiting for? Recorded
                     // because two boundary variants have now been falsified
@@ -761,13 +795,65 @@ impl AdapterContext {
     fn queue_active_scanout_refresh_locked(&self, lock: &ScanoutGuard<'_>) -> ScanoutRefreshQueue {
         use core::sync::atomic::Ordering;
 
+        let note_pending = |resource_id, armed, reason| {
+            crate::ddi::scanout_timeline::note(
+                crate::ddi::scanout_timeline::kind::REFRESH_PENDING,
+                crate::ddi::scanout_timeline::flag::WAITING,
+                self.scanout_bound_epoch.load(Ordering::Acquire),
+                0,
+                armed as u64,
+                resource_id,
+                reason,
+            );
+        };
+        let note_dropped = |resource_id, armed, reason| {
+            crate::ddi::scanout_timeline::note(
+                crate::ddi::scanout_timeline::kind::REFRESH_DROPPED,
+                crate::ddi::scanout_timeline::flag::DROPPED,
+                self.scanout_bound_epoch.load(Ordering::Acquire),
+                0,
+                armed as u64,
+                resource_id,
+                reason,
+            );
+        };
+
         // This is the production path only. Diagnostic fills issue their own
         // explicit one-shot flushes; never query the registry on every frame.
         let resource_id = self.active_scanout_resource.load(Ordering::Acquire);
         let wh = self.active_scanout_wh.load(Ordering::Relaxed);
+        // An active publication is a strict oldest-first frontier.  Do not
+        // treat a SetInFlight/FlushInFlight transaction (or one for a different
+        // resource) as if there were no transaction: that could enqueue an old
+        // dirty read with the wrong epoch behind it.  Only its exact
+        // SetSucceeded request is eligible to issue the first host read.
+        let publication = match self.with_virtio(|v| v.publication_refresh_for(resource_id)) {
+            Ok(crate::virtio::PublicationRefresh::NoActive) => None,
+            Ok(crate::virtio::PublicationRefresh::ReadyExact(request)) => Some(request),
+            Ok(crate::virtio::PublicationRefresh::Blocked) | Err(_) => {
+                note_pending(
+                    resource_id,
+                    self.pending_refresh_resource.load(Ordering::Acquire),
+                    crate::ddi::scanout_timeline::refresh_outcome::FLUSH_INFLIGHT,
+                );
+                return ScanoutRefreshQueue::Busy;
+            }
+        };
+        let bound_epoch = publication.map_or_else(
+            || self.scanout_bound_epoch.load(Ordering::Acquire),
+            |request| request.present_epoch,
+        );
         // A newer present may publish while we sample the companion field.
         // Retry from the worker rather than combine two primary identities.
-        if self.active_scanout_resource.load(Ordering::Acquire) != resource_id {
+        if self.active_scanout_resource.load(Ordering::Acquire) != resource_id
+            || (publication.is_none()
+                && self.scanout_bound_epoch.load(Ordering::Acquire) != bound_epoch)
+        {
+            note_pending(
+                resource_id,
+                self.pending_refresh_resource.load(Ordering::Acquire),
+                crate::ddi::scanout_timeline::refresh_outcome::ACTIVE_CHANGED,
+            );
             return ScanoutRefreshQueue::Busy;
         }
 
@@ -780,7 +866,7 @@ impl AdapterContext {
         // Keep the counters: the rate is still how far the bind path lags the
         // present path, and `RfWait` minus `OgIdn` is what the gate refused.
         let armed = self.pending_refresh_resource.load(Ordering::Acquire);
-        if armed != 0 && armed != resource_id {
+        if publication.is_none() && armed != 0 && armed != resource_id {
             let n = self
                 .scanout_refresh_unbound
                 .fetch_add(1, Ordering::Relaxed)
@@ -799,6 +885,12 @@ impl AdapterContext {
             // Loud (`LsCanc`), exact, and not a timeout: at this point the host
             // holds no scan-out at all.
             self.release_all_scanout_leases(LeaseEnd::Cancelled);
+            let _ = self.with_virtio(|v| v.cancel_publication_exact(resource_id, bound_epoch));
+            note_dropped(
+                resource_id,
+                armed,
+                crate::ddi::scanout_timeline::refresh_outcome::UNAVAILABLE,
+            );
             return ScanoutRefreshQueue::Unavailable;
         }
         let live = self
@@ -807,6 +899,7 @@ impl AdapterContext {
         if !live {
             // The resource is gone, so no read of it exists or can be issued.
             self.release_all_scanout_leases(LeaseEnd::Cancelled);
+            let _ = self.with_virtio(|v| v.cancel_publication_exact(resource_id, bound_epoch));
             // Only clear the identity we sampled. A newer Windows primary may
             // have been published concurrently by the Present path.
             let _ = self.active_scanout_resource.compare_exchange(
@@ -822,9 +915,19 @@ impl AdapterContext {
             {
                 crate::diag::record_named_bytes(b"ScDead", resource_id);
             }
+            note_dropped(
+                resource_id,
+                armed,
+                crate::ddi::scanout_timeline::refresh_outcome::RESOURCE_DEAD,
+            );
             return ScanoutRefreshQueue::Unavailable;
         }
         if self.scanout_flush_inflight.load(Ordering::Acquire) != 0 {
+            note_pending(
+                resource_id,
+                armed,
+                crate::ddi::scanout_timeline::refresh_outcome::FLUSH_INFLIGHT,
+            );
             return ScanoutRefreshQueue::Busy;
         }
 
@@ -838,6 +941,12 @@ impl AdapterContext {
             // The host is bound to something else (or to nothing): this refresh
             // will never be issued, so no lease may go on waiting for it.
             self.release_all_scanout_leases(LeaseEnd::Cancelled);
+            let _ = self.with_virtio(|v| v.cancel_publication_exact(resource_id, bound_epoch));
+            note_dropped(
+                resource_id,
+                armed,
+                crate::ddi::scanout_timeline::refresh_outcome::HOST_UNBOUND,
+            );
             return ScanoutRefreshQueue::Unavailable;
         }
 
@@ -856,9 +965,15 @@ impl AdapterContext {
         // coalesced away, no publish of it is possible at all. Clearing the
         // armed id is what keeps the drop self-healing: the next identity-free
         // edge flushes whatever is bound.
-        if armed != 0 && armed != resource_id {
+        if publication.is_none() && armed != 0 && armed != resource_id {
             self.pending_refresh_resource.store(0, Ordering::Release);
+            let _ = self.with_virtio(|v| v.cancel_publication_exact(resource_id, bound_epoch));
             crate::ddi::scanout_trace::note_ownership_drop_identity();
+            note_dropped(
+                resource_id,
+                armed,
+                crate::ddi::scanout_timeline::refresh_outcome::OWNERSHIP_IDENTITY,
+            );
             return ScanoutRefreshQueue::Dropped;
         }
         // EPOCH: this binding generation was already published AND a newer
@@ -866,14 +981,22 @@ impl AdapterContext {
         // next publish and a re-read now races the app's clear. The predicate
         // (including the `tracked` operand that keeps the desktop path out of
         // it) lives in `helios_kmd_logic` with its host tests.
-        if surplus_republish(
-            self.scanout_epoch_tracked.load(Ordering::Acquire) != 0,
-            self.scanout_read_epoch.load(Ordering::Acquire),
-            self.scanout_bound_epoch.load(Ordering::Acquire),
-            self.scanout_present_epoch.load(Ordering::Acquire),
-        ) {
+        if publication.is_none()
+            && surplus_republish(
+                self.scanout_epoch_tracked.load(Ordering::Acquire) != 0,
+                self.scanout_read_epoch.load(Ordering::Acquire),
+                self.scanout_bound_epoch.load(Ordering::Acquire),
+                self.scanout_present_epoch.load(Ordering::Acquire),
+            )
+        {
             self.pending_refresh_resource.store(0, Ordering::Release);
+            let _ = self.with_virtio(|v| v.cancel_publication_exact(resource_id, bound_epoch));
             crate::ddi::scanout_trace::note_ownership_drop_epoch();
+            note_dropped(
+                resource_id,
+                armed,
+                crate::ddi::scanout_timeline::refresh_outcome::OWNERSHIP_EPOCH,
+            );
             return ScanoutRefreshQueue::Dropped;
         }
 
@@ -882,6 +1005,11 @@ impl AdapterContext {
             .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
+            note_pending(
+                resource_id,
+                armed,
+                crate::ddi::scanout_timeline::refresh_outcome::FLUSH_GATE_RACE,
+            );
             return ScanoutRefreshQueue::Busy;
         }
 
@@ -901,15 +1029,17 @@ impl AdapterContext {
         // its `Drop` on every path that never reaches completion (including
         // the enqueue-failure arm underneath, which drops the token inside
         // `resource_flush_async`).
-        let ledger_slot = self.read_ledger.issue(resource_id);
+        let ledger_ticket = self.read_ledger.issue(resource_id);
         // THE LEASE TOKEN. Snapshot the presentation the host is bound to right
         // now: when this exact command's response returns, the host has read
         // that buffer, and therefore every presentation at or below that epoch.
         // Snapshotted at ISSUE, not at completion — the read happens somewhere
         // inside the command, and only the issue point is provably after the
         // binding was published.
-        let covers_epoch = self.scanout_bound_epoch.load(Ordering::Acquire);
+        let covers_epoch = bound_epoch;
         crate::ddi::scanout_trace::note_lease_read_queued();
+        let flush =
+            crate::virtio::ScanoutFlushToken::new(self, covers_epoch, resource_id, ledger_ticket);
         let result = crate::virtio::ctrl::resource_flush_async(
             lock.passive(),
             self,
@@ -921,10 +1051,30 @@ impl AdapterContext {
             // SAFETY: hpd_event is an embedded, in-place initialized KEVENT and
             // the adapter outlives every transport entry that holds this pointer.
             unsafe { NonNull::new_unchecked(self.hpd_event.get()) },
-            crate::virtio::ScanoutFlushToken::new(self, covers_epoch, resource_id, ledger_slot),
+            flush,
         );
+        if matches!(result, Err(crate::virtio::VirtioError::QueueFull)) {
+            // The enqueue-side reclassification saw a new or non-ready
+            // publication after this worker released virtio_lock. Its token
+            // never reached the wire (Drop retires only the ledger issue), so
+            // retain the active transaction and let its completion re-arm the
+            // HPD worker. This is ordering backpressure, not a terminal flush
+            // failure and must not cancel/end the exact lease.
+            self.scanout_flush_inflight.store(0, Ordering::Release);
+            note_pending(
+                resource_id,
+                armed,
+                crate::ddi::scanout_timeline::refresh_outcome::FLUSH_GATE_RACE,
+            );
+            return ScanoutRefreshQueue::Busy;
+        }
         if result.is_err() {
             self.scanout_flush_inflight.store(0, Ordering::Release);
+            // No descriptor reached the wire, so this exact binding cannot
+            // receive a host read. Release only its publication transaction;
+            // a newer resource/epoch remains protected and cannot be guessed
+            // from this failure path.
+            let _ = self.with_virtio(|v| v.cancel_publication_exact(resource_id, covers_epoch));
             // The command never reached the ring, so the read it would have
             // performed does not exist. End exactly the epochs it named — not
             // more — so a later presentation stays gated.
@@ -937,6 +1087,11 @@ impl AdapterContext {
                 crate::diag::record_named_bytes(b"RfRid", resource_id);
                 crate::diag::record_named_bytes(b"RfFail", failed);
             }
+            note_pending(
+                resource_id,
+                armed,
+                crate::ddi::scanout_timeline::refresh_outcome::ENQUEUE_FAILED,
+            );
             return ScanoutRefreshQueue::Failed;
         }
 
@@ -992,12 +1147,9 @@ impl AdapterContext {
             // worker's swap() will now yield 0 and
             // process_deferred_vidpn_source_address will return None -
             // meaning nobody reaches any of the ten sites that clear
-            // `vidpn_programming`. A gate left at 1 makes vsync_dpc_routine
-            // early-return on every 16 ms tick before it increments
-            // vsync_count, so CRTC_VSYNC stops, dxgkrnl never retires the
-            // queued flip, and it therefore never issues the next
-            // SetVidPnSourceAddress that would re-arm the gate. The display
-            // is wedged for the rest of the boot.
+            // `vidpn_programming`. A gate left at 1 retains stale programming
+            // ownership into a destroyed allocation; it must be cancelled
+            // rather than carried into the next transport generation.
             //
             // Both conditions below are load-bearing. SetVidPnSourceAddress
             // runs at DIRQL and does NOT take the scanout lifecycle lock, so
@@ -1093,6 +1245,10 @@ impl AdapterContext {
                         );
                     }
                 });
+                // The FIFO barrier proved a later host selection (or prior
+                // disable) terminal. It is the exact no-read terminal for a
+                // still-recorded transaction on this retiring allocation.
+                let _ = self.with_virtio(|v| v.cancel_publication_for_retirement(resource_id));
                 crate::diag::record_named_bytes(b"ScRet", resource_id);
                 return true;
             }
@@ -1101,22 +1257,19 @@ impl AdapterContext {
             // global fast-bind gate is held. Its response is both the host-reader
             // lifetime barrier and the newest bind sequence; no newer B can be
             // trapped in FIFO order A -> B -> 0.
-            let unbound = crate::virtio::ctrl::set_scanout_blob(
-                lock.passive(),
-                self,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-            );
+            let unbound =
+                crate::virtio::ctrl::set_scanout_blob(lock.passive(), self, 0, 0, 0, 0, 0, 0, None);
             let Ok(unbind_seq) = unbound else {
                 crate::diag::record_named_bytes(b"ScRet", 0xE);
                 crate::diag::record_named_bytes(b"ScDead", resource_id);
                 return false;
             };
             let _ = self.with_virtio(|v| v.note_host_accepted_scanout_bind(unbind_seq, 0));
+            // SET(0) returned successfully behind the retirement barrier: no
+            // later host read of this exact allocation can exist. This is the
+            // explicit no-flush terminal path for a publication whose resource
+            // is being destroyed.
+            let _ = self.with_virtio(|v| v.cancel_publication_for_retirement(resource_id));
 
             self.with_wddm_notify_lock(|_| {
                 if self.adopt_scanout_bind_seq(unbind_seq) {

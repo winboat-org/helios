@@ -110,7 +110,7 @@ pub unsafe extern "C" fn dxgkddi_start_device(
     // AddDevice, and before this function returns the DIRQL ISR, the VSync timer
     // DPC and the HPD worker all build `&AdapterContext` from the same address —
     // `set_virtio(Some(gpu))` below enables the device mid-function, and
-    // `init_vsync`/`init_hpd` at the end start the other two. A unique `&mut`
+    // `start_vsync`/`init_hpd` at the end start the other two. A unique `&mut`
     // spanning that was an unambiguous Stacked-Borrows violation.
     //
     // Everything StartDevice establishes is therefore built as LOCALS and
@@ -371,7 +371,7 @@ pub unsafe extern "C" fn dxgkddi_start_device(
         // SAFETY: `adapter` is the final boxed context (dxgkrnl holds it as the
         // miniport device context); the started state — including the callback
         // table the DPC needs — is published above. PASSIVE_LEVEL.
-        unsafe { adapter.init_vsync() };
+        unsafe { adapter.start_vsync() };
 
         // Start the HPD worker: it indicates the child connected shortly after this
         // StartDevice returns (DxgkCbIndicateChildStatus is forbidden during it) and
@@ -422,7 +422,7 @@ pub unsafe extern "C" fn dxgkddi_stop_device(miniport_device_context: *mut c_voi
         // teardown (both idempotent; no-ops when the render-only surface never
         // started them). stop_hpd blocks until the worker exits so it can't touch
         // the (about-to-be-torn-down) context.
-        adapter.cancel_vsync();
+        adapter.stop_vsync();
         adapter.stop_hpd();
         // AFTER stop_hpd, so the worker can no longer re-publish into the state
         // we are about to clear. Every scanout identity below belongs to the
@@ -558,11 +558,10 @@ pub unsafe extern "C" fn dxgkddi_set_power_state(
     // called DxgkDdiControlInterrupt(CRTC_VSYNC, FALSE) first, which is a brake
     // entirely under its control, not ours.
     //
-    // Treat ANY non-D0 state as "cancel" and re-arm unconditionally on D0 when
-    // the display half is up. Both functions are already idempotent
-    // (`vsync_armed` swap; cancel flushes queued DPCs), so a repeated transition
-    // in either direction is a no-op. `vsync_enabled`, which ControlInterrupt
-    // writes at up to DIRQL, is untouched and keeps its meaning.
+    // Treat ANY non-D0 state as a timer quiesce and re-arm on D0 when the
+    // display half is up. These transitions preserve `vsync_enabled`, whose
+    // sole owner after StartDevice is ControlInterrupt at up to DIRQL; a power
+    // resume must not silently reverse a prior CRTC_VSYNC disable.
     //
     // Compared against the bindgen discriminant rather than a hand-written
     // integer, so a WDK header change cannot silently invert this.
@@ -571,10 +570,10 @@ pub unsafe extern "C" fn dxgkddi_set_power_state(
             // SAFETY: the context is the final boxed adapter (dxgkrnl holds it
             // as the miniport device context) and dxgkrnl was saved at
             // StartDevice. PASSIVE_LEVEL.
-            unsafe { adapter.init_vsync() };
+            unsafe { adapter.resume_vsync() };
         }
     } else {
-        adapter.cancel_vsync();
+        adapter.quiesce_vsync();
     }
     STATUS_SUCCESS
 }

@@ -69,6 +69,16 @@ pub const HELIOS_ESCAPE_SCANOUT_EVENT: u32 = 0x000F;
 /// distinct escape instead of an extension of SUBMIT_VENUS: an old KMD must
 /// reject the unknown verb, letting the UMD keep its conservative gate.
 pub const HELIOS_ESCAPE_PRESENT_STREAM: u32 = 0x0010;
+/// Read the fixed, always-on KMD scanout causal timeline. This verb is
+/// read-only: callers snapshot its cursor before/after a workload, then read
+/// the closed `[before + 1, after]` interval in fixed batches.
+pub const HELIOS_ESCAPE_QUERY_SCANOUT_TIMELINE: u32 = 0x0011;
+
+pub const HELIOS_SCANOUT_TIMELINE_OP_META: u32 = 0;
+pub const HELIOS_SCANOUT_TIMELINE_OP_READ: u32 = 1;
+/// `KeQueryInterruptTimePrecise` units: 100 ns interrupt time.
+pub const HELIOS_SCANOUT_TIMELINE_TIME_100NS: u32 = 1;
+pub const HELIOS_SCANOUT_TIMELINE_BATCH_CAP: usize = 32;
 
 /// Header for all escape commands. 16 bytes.
 #[repr(C)]
@@ -366,6 +376,45 @@ pub struct HeliosEscapeQueryScanout {
     pub reserved: [u32; 2],
 }
 
+/// One committed scanout-timeline event. The KMD's ring record is also exactly
+/// 64 bytes; this is the copy-out ABI, deliberately scalar and padding-free for
+/// the standalone C collector.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct HeliosScanoutTimelineEvent {
+    pub sequence: u64,
+    pub timestamp_100ns: u64,
+    pub present_epoch: u64,
+    pub carried_watermark: u64,
+    /// Allocation/address at flip time; SET wire sequence; or unique flush id.
+    pub identity: u64,
+    pub resource_id: u32,
+    pub aux: u32,
+    pub kind: u32,
+    pub flags: u32,
+    pub reserved: u64,
+}
+
+/// `HELIOS_ESCAPE_QUERY_SCANOUT_TIMELINE` fixed 64-byte header. `META` returns
+/// the current cursor, capacity, and time unit. `READ` appends at most 32
+/// [`HeliosScanoutTimelineEvent`] values after this header; the caller declares
+/// that complete byte count in `hdr.size`. Keeping the batch trailing prevents
+/// the KMD from ever copying a 2 KiB reply onto its kernel stack.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct HeliosEscapeQueryScanoutTimeline {
+    pub hdr: HeliosEscapeHeader,
+    pub in_op: u32,
+    pub in_count: u32,
+    pub in_start_seq: u64,
+    pub out_cursor: u64,
+    pub out_first_seq: u64,
+    pub out_returned: u32,
+    pub out_lost: u32,
+    pub out_capacity: u32,
+    pub out_time_unit: u32,
+}
+
 // ---------------------------------------------------------------------------
 // D4a scanout acquire (FIX-DESIGN-d4a.md) — the read ledger + retirement event
 // ---------------------------------------------------------------------------
@@ -373,44 +422,48 @@ pub struct HeliosEscapeQueryScanout {
 /// `"HLRL"` — first word of the mapped ledger page.
 pub const HELIOS_READ_LEDGER_MAGIC: u32 = 0x4C52_4C48;
 /// Current ledger page layout version.
-pub const HELIOS_READ_LEDGER_VERSION: u32 = 1;
-/// Slot count in [`HeliosReadLedgerPage`]. Sized like the KMD's flush
-/// histogram: DWM rotates a 3-buffer chain, an app swapchain is 2-4 deep,
-/// and a fullscreen transition can briefly hold both sets.
-pub const HELIOS_READ_LEDGER_SLOTS: usize = 8;
+///
+/// Version 2 is intentionally not prefix-compatible with v1.  The reader
+/// exports are versioned with it, so an old DXVK/UMD pair fails closed rather
+/// than interpreting a 32-bit counter triple as the generation-qualified ABI.
+pub const HELIOS_READ_LEDGER_VERSION: u32 = 2;
+/// One slot for every admissible WindowedBlt reader plus the one globally
+/// serialized direct `RESOURCE_FLUSH` reader.  The KMD asserts the 64+1
+/// relationship at the WindowedBlt capacity use site.
+pub const HELIOS_READ_LEDGER_SLOTS: usize = 65;
 
-/// One ledger slot: the per-scanout-buffer host-readback ledger, keyed by the
-/// venus resource id (monotonic, never recycled — a stale key can never alias
-/// a new buffer). `issued` counts RESOURCE_FLUSH commands enqueued for this
-/// resource; `retired` counts their terminal outcomes (host completion, host
-/// error, cancel, teardown — every issue retires exactly once, enforced
-/// KMD-side by the flush token's Drop). Invariant: `issued >= retired`;
-/// `issued - retired` is the number of host reads in flight (0 or 1 today —
-/// the KMD holds at most one flush outstanding).
+/// One generation-qualified host-read claim. `resid == 0` and
+/// `generation == 0` both mean no valid claim. `issued` counts reads enqueued
+/// for this claim; `retired` counts their terminal outcomes. The KMD recycles a
+/// slot only at quiescence (`issued == retired`), including when the backing
+/// allocation remains live, then gives the replacement claim a fresh global
+/// generation.
 ///
 /// All fields are written KMD-side with Release stores and must be read with
-/// Acquire loads. Reader protocol for "is a read of X in flight?": find the
-/// slot with `resid == X`; read `issued`, `retired`; RE-READ `resid` — if it
-/// changed, treat as no-read-in-flight (slots are reclaimed only when
-/// `issued == retired`, so a mid-read reclaim implies every read of X
-/// retired).
+/// Acquire loads. A reader first matches `resid`, then samples `generation`,
+/// `issued`, and `retired`, and finally revalidates both `generation` and
+/// `resid`. A changed generation is a same-resid re-claim, not a no-read
+/// verdict; the reader must retry the full scan.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub struct HeliosReadLedgerSlot {
     /// Venus resource id owning this slot; 0 = free.
     pub resid: u32,
-    /// Host readbacks enqueued for this resource (monotonic within a boot).
-    pub issued: u32,
-    /// Host readbacks retired (any outcome). The gate-semaphore value space.
-    pub retired: u32,
-    pub reserved: u32,
+    /// Explicit padding keeps the shared `u64` atomics naturally aligned.
+    pub _pad0: u32,
+    /// Nonzero global claim identity. Never reset at a transport reset.
+    pub generation: u64,
+    /// Host reads enqueued for this claim. The gate-semaphore value space.
+    pub issued: u64,
+    /// Host reads retired (any terminal outcome).
+    pub retired: u64,
 }
 
 /// Layout of the one nonpaged 4 KiB page `HELIOS_ESCAPE_MAP_READ_LEDGER` maps
-/// read-only into user mode. KMD-owned, adapter-lifetime, zeroed at
-/// StartDevice (values are within-boot deltas like every Helios counter).
+/// read-only into user mode. KMD-owned and adapter-lifetime. Transport reset
+/// clears claims, but never rewinds the KMD-private generation source.
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+#[derive(Debug, Clone, Copy)]
 pub struct HeliosReadLedgerPage {
     /// == [`HELIOS_READ_LEDGER_MAGIC`]. A reader finding anything else must
     /// treat the feature as off (page torn down / driver mismatch).
@@ -426,6 +479,16 @@ pub struct HeliosReadLedgerPage {
     pub slot_overflow: u32,
     pub reserved1: [u32; 3],
 }
+
+// `bytemuck` in the supported toolchain does not provide an array `Pod` impl
+// for the deliberately non-power-of-two 65-slot page. The layout assertions
+// below prove that `repr(C)` adds no tail padding; every field is itself Pod
+// and all bit patterns are valid for this read-only shared-memory ABI.
+// SAFETY: all fields are `Zeroable`, including the 65-element slot array.
+unsafe impl Zeroable for HeliosReadLedgerPage {}
+// SAFETY: all fields are `Pod` and the asserted 2112-byte layout has no
+// implicit padding.
+unsafe impl Pod for HeliosReadLedgerPage {}
 
 /// op values for [`HeliosEscapeMapReadLedger`] and
 /// [`HeliosEscapeScanoutEvent`]. PROBE follows the fence-event idiom: a
@@ -451,6 +514,11 @@ pub const HELIOS_SCANOUT_CAP_SNAPSHOT_BIND: u32 = 1 << 1;
 /// keep its legacy CPU gate unless this bit and PRESENT_STREAM registration
 /// both succeed.
 pub const HELIOS_SCANOUT_CAP_ASYNC_PRESENT_STREAM: u32 = 1 << 2;
+/// The KMD accepts a typed UMD snapshot source for a windowed
+/// `DXGK_PRESENTFLAGS.Blt`.  This is intentionally separate from
+/// `SNAPSHOT_BIND`: a windowed snapshot is imported as the *copy source*, never
+/// as a scanout bind target.
+pub const HELIOS_SCANOUT_CAP_WINDOWED_BLT_SNAPSHOT: u32 = 1 << 3;
 
 /// out_state values for the two D4a escapes.
 pub const HELIOS_SCANOUT_ACQ_OK: u32 = 0;
@@ -673,8 +741,54 @@ const _: () = {
     assert!(core::mem::size_of::<HeliosEscapePresentBlob>() == 40);
     assert!(core::mem::size_of::<HeliosEscapeFenceEvent>() == 40);
     assert!(core::mem::size_of::<HeliosEscapeQueryScanout>() == 64);
+    assert!(core::mem::size_of::<HeliosScanoutTimelineEvent>() == 64);
+    assert!(core::mem::size_of::<HeliosEscapeQueryScanoutTimeline>() == 64);
     assert!(core::mem::size_of::<HeliosEscapeQueryStatsV2>() == 152);
     // v2 (152) + 12 u32 = 200. The v2 prefix must stay byte-identical.
     assert!(core::mem::size_of::<HeliosEscapeQueryStatsV3>() == 200);
     assert!(core::mem::size_of::<HeliosEscapeQueryStatsV4>() == 232);
+    assert!(core::mem::size_of::<HeliosReadLedgerSlot>() == 32);
+    assert!(core::mem::align_of::<HeliosReadLedgerSlot>() == 8);
+    assert!(core::mem::offset_of!(HeliosReadLedgerSlot, generation) == 8);
+    assert!(core::mem::offset_of!(HeliosReadLedgerSlot, issued) == 16);
+    assert!(core::mem::offset_of!(HeliosReadLedgerSlot, retired) == 24);
+    assert!(core::mem::size_of::<HeliosReadLedgerPage>() == 2112);
+    assert!(core::mem::size_of::<HeliosReadLedgerPage>() <= 4096);
 };
+
+#[cfg(test)]
+mod scanout_timeline_tests {
+    use super::*;
+
+    #[test]
+    fn timeline_wire_batch_is_fixed_and_stack_bounded() {
+        assert_eq!(core::mem::size_of::<HeliosEscapeQueryScanoutTimeline>(), 64);
+        assert_eq!(core::mem::size_of::<HeliosScanoutTimelineEvent>(), 64);
+        assert_eq!(HELIOS_SCANOUT_TIMELINE_BATCH_CAP, 32);
+        assert_eq!(
+            core::mem::size_of::<HeliosEscapeQueryScanoutTimeline>()
+                + HELIOS_SCANOUT_TIMELINE_BATCH_CAP
+                    * core::mem::size_of::<HeliosScanoutTimelineEvent>(),
+            2112,
+        );
+    }
+
+    #[test]
+    fn read_ledger_v2_abi_layout_is_pinned() {
+        assert_eq!(HELIOS_READ_LEDGER_VERSION, 2);
+        assert_eq!(HELIOS_READ_LEDGER_SLOTS, 65);
+        assert_eq!(core::mem::size_of::<HeliosReadLedgerSlot>(), 32);
+        assert_eq!(core::mem::align_of::<HeliosReadLedgerSlot>(), 8);
+        assert_eq!(core::mem::offset_of!(HeliosReadLedgerSlot, resid), 0);
+        assert_eq!(core::mem::offset_of!(HeliosReadLedgerSlot, generation), 8);
+        assert_eq!(core::mem::offset_of!(HeliosReadLedgerSlot, issued), 16);
+        assert_eq!(core::mem::offset_of!(HeliosReadLedgerSlot, retired), 24);
+        assert_eq!(core::mem::offset_of!(HeliosReadLedgerPage, slots), 16);
+        assert_eq!(
+            core::mem::offset_of!(HeliosReadLedgerPage, slot_overflow),
+            2096
+        );
+        assert_eq!(core::mem::size_of::<HeliosReadLedgerPage>(), 2112);
+        assert!(core::mem::size_of::<HeliosReadLedgerPage>() <= 4096);
+    }
+}

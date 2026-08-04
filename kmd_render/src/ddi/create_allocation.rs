@@ -997,6 +997,8 @@ pub(crate) unsafe fn set_vidpn_primary_address(
         dxgi_format: 0,
         plane_offset: 0,
         venus_alloc_size: 0,
+        memory_type_index: 0,
+        purpose: 0,
     });
     ctx.vidpn_snap_width.store(snap.width, Ordering::Relaxed);
     ctx.vidpn_snap_height.store(snap.height, Ordering::Relaxed);
@@ -1060,6 +1062,8 @@ pub(crate) unsafe fn scanout_alloc_info(h: HANDLE) -> Option<WindowsPrimary> {
             dxgi_format: ctx.vidpn_snap_dxgi_format.load(Ordering::Relaxed),
             plane_offset: ctx.vidpn_snap_plane_offset.load(Ordering::Relaxed) as u64,
             venus_alloc_size: ctx.vidpn_snap_alloc_size.load(Ordering::Relaxed),
+            memory_type_index: 0,
+            purpose: 0,
         })
     } else {
         None
@@ -1326,7 +1330,6 @@ pub(crate) unsafe fn set_bar_placement(h: HANDLE, offset: u64) {
         ctx.bar_placed.store(offset, Ordering::Release);
     }
 }
-
 
 /// Direct-scan-out allocations, keyed by venus resource id.
 ///
@@ -1810,16 +1813,37 @@ unsafe fn destroy_allocation_ctx(
     // resources. Drain the cache before any one backing resource can be
     // detached/unref'd. The cache is intentionally one ownership unit because
     // several swapchain sources may share the same DWM destination.
-    let present_drained = adapter
-        .with_venus_client(passive, |client| {
-            client.release_present_blits_for_resource(adapter, ctx.resource_id)
-        })
-        .map(|result| result.is_ok())
-        .unwrap_or(false);
-    if !present_drained {
+    let windowed_terminal = adapter.with_scanout_lifecycle(passive, |lock| {
+        let present_drained = lock
+            .with_venus_client(|client| {
+                // Undispatched requests have no host reader and cancel now.
+                // A dispatched request stays pinned in the FIFO until its
+                // exact ring response; cache release below drains that fence
+                // before the backing can be destroyed.
+                let _ = adapter
+                    .with_virtio(|v| v.cancel_windowed_blt_for_resource(adapter, ctx.resource_id));
+                client.release_present_blits_for_resource(adapter, ctx.resource_id)
+            })
+            .map(|result| result.is_ok())
+            .unwrap_or(false);
+        if !present_drained {
+            return false;
+        }
+
+        // Keep the scanout lifecycle lock from cancellation through the
+        // exact reader terminal.  Releasing it between these phases would
+        // let the HPD worker dispatch a request for this resource after
+        // the cache drain but before the backing is retained/destroyed.
+        // `with_venus_client` has returned before this virtio step, so the
+        // established scanout -> Venus ordering is not extended.
+        adapter
+            .with_virtio(|v| v.finish_windowed_blt_teardown_for_resource(adapter, ctx.resource_id))
+            .unwrap_or(false)
+    });
+    if !windowed_terminal {
         crate::diag::record_named_bytes(b"PBDrn", 0xE);
-        // Ambiguous GPU completion: retain the allocation and all host objects
-        // until Venus-context teardown rather than risk a GPU use-after-free.
+        // A matching ring-1 command still owns the source or destination.
+        // Retain all backing state until context teardown rather than UAF it.
         drop(ctx);
         return;
     }

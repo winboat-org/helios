@@ -100,10 +100,10 @@ std::fs::copy(&source, &destination).unwrap_or_else(|e| {
 });
 '''
 
-# wdk-build 0.5.1's generated task looks for the linker map in
-# target/<profile>/deps, while current Rust places the /MAP output under the
-# crate's hashed build/.../out directory. Copy the newest map from its actual
-# location so packaging works across that layout mismatch.
+# Rust/link.exe toolchain revisions have emitted the /MAP output in both
+# target/<profile>/deps and the crate's hashed build/.../out directory. Search
+# those two compiler-owned locations explicitly (never the package directory)
+# and copy the newest map so an old packaged artifact cannot win discovery.
 [tasks.copy-map-to-package]
 private = true
 dependencies = ["build"]
@@ -134,12 +134,13 @@ let cargo_profile =
 let profile_dir = if cargo_profile == "dev" { "debug" } else { cargo_profile.as_str() };
 let target_dir = kmd_dir.join("target").join(profile_dir);
 let mut maps = Vec::new();
+collect_maps(&target_dir.join("deps"), &mut maps);
 collect_maps(&target_dir.join("build"), &mut maps);
 let source = maps
     .into_iter()
     .max_by_key(|(modified, _)| *modified)
     .map(|(_, path)| path)
-    .expect("linker map not found below target/<profile>/build after successful driver build");
+    .expect("linker map not found below target/<profile>/{deps,build} after successful driver build");
 let package = target_dir.join("helios_kmd_render_package");
 std::fs::create_dir_all(&package).unwrap();
 let destination = package.join("helios_kmd_render.map");

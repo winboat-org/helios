@@ -23,30 +23,31 @@ use bytemuck::{bytes_of, pod_read_unaligned};
 use helios_protocol::{
     HeliosEscapeAllocBlob, HeliosEscapeAttachResource, HeliosEscapeCtxCreate,
     HeliosEscapeCtxDestroy, HeliosEscapeFenceEvent, HeliosEscapeHeader, HeliosEscapeMapBlob,
-    HeliosEscapeMapReadLedger, HeliosEscapeQueryScanout, HeliosEscapeQueryStats,
-    HeliosEscapeQueryStatsV2, HeliosEscapeQueryStatsV3, HeliosEscapeQueryStatsV4,
-    HeliosEscapeReleaseBlob,
+    HeliosEscapeMapReadLedger, HeliosEscapePresentStream, HeliosEscapeQueryScanout,
+    HeliosEscapeQueryScanoutTimeline, HeliosEscapeQueryStats, HeliosEscapeQueryStatsV2,
+    HeliosEscapeQueryStatsV3, HeliosEscapeQueryStatsV4, HeliosEscapeReleaseBlob,
     HeliosEscapeScanoutEvent, HeliosEscapeSubmitVenus, HeliosEscapeWaitFence,
-    HeliosEscapePresentStream,
     HeliosEscapeWaitFenceLegacy, HELIOS_ESCAPE_ALLOC_BLOB, HELIOS_ESCAPE_ATTACH_RESOURCE,
     HELIOS_ESCAPE_CTX_CREATE, HELIOS_ESCAPE_CTX_DESTROY, HELIOS_ESCAPE_MAP_BLOB,
-    HELIOS_ESCAPE_MAP_READ_LEDGER, HELIOS_ESCAPE_QUERY_SCANOUT, HELIOS_ESCAPE_QUERY_STATS,
-    HELIOS_ESCAPE_PRESENT_STREAM,
+    HELIOS_ESCAPE_MAP_READ_LEDGER, HELIOS_ESCAPE_PRESENT_STREAM, HELIOS_ESCAPE_QUERY_SCANOUT,
+    HELIOS_ESCAPE_QUERY_SCANOUT_TIMELINE, HELIOS_ESCAPE_QUERY_STATS,
     HELIOS_ESCAPE_REGISTER_FENCE_EVENT, HELIOS_ESCAPE_RELEASE_BLOB, HELIOS_ESCAPE_SCANOUT_EVENT,
     HELIOS_ESCAPE_SUBMIT_VENUS, HELIOS_ESCAPE_UNREGISTER_FENCE_EVENT, HELIOS_ESCAPE_WAIT_FENCE,
     HELIOS_FENCE_EVENT_ALREADY_COMPLETE, HELIOS_FENCE_EVENT_CANCELLED,
     HELIOS_FENCE_EVENT_NOT_FOUND, HELIOS_FENCE_EVENT_PROBE_ACK, HELIOS_FENCE_EVENT_REGISTERED,
+    HELIOS_PRESENT_STREAM_OP_REGISTER, HELIOS_PRESENT_STREAM_OP_UNREGISTER,
     HELIOS_SCANOUT_ACQ_NOT_FOUND, HELIOS_SCANOUT_ACQ_OK, HELIOS_SCANOUT_ACQ_OP_MAP,
     HELIOS_SCANOUT_ACQ_OP_PROBE, HELIOS_SCANOUT_ACQ_OP_REGISTER, HELIOS_SCANOUT_ACQ_OP_UNMAP,
-    HELIOS_SCANOUT_ACQ_OP_UNREGISTER, HELIOS_SCANOUT_ACQ_PROBE_ACK,
-    HELIOS_SCANOUT_ACQ_TABLE_FULL, HELIOS_SCANOUT_CAP_READ_LEDGER,
-    HELIOS_SCANOUT_CAP_SNAPSHOT_BIND, HELIOS_SCANOUT_CAP_ASYNC_PRESENT_STREAM,
-    HELIOS_PRESENT_STREAM_OP_REGISTER, HELIOS_PRESENT_STREAM_OP_UNREGISTER,
+    HELIOS_SCANOUT_ACQ_OP_UNREGISTER, HELIOS_SCANOUT_ACQ_PROBE_ACK, HELIOS_SCANOUT_ACQ_TABLE_FULL,
+    HELIOS_SCANOUT_CAP_ASYNC_PRESENT_STREAM, HELIOS_SCANOUT_CAP_READ_LEDGER,
+    HELIOS_SCANOUT_CAP_SNAPSHOT_BIND, HELIOS_SCANOUT_CAP_WINDOWED_BLT_SNAPSHOT,
+    HELIOS_SCANOUT_TIMELINE_BATCH_CAP, HELIOS_SCANOUT_TIMELINE_OP_META,
+    HELIOS_SCANOUT_TIMELINE_OP_READ, HELIOS_SCANOUT_TIMELINE_TIME_100NS,
 };
 
 use super::blob_map::{
-    effective_map_cache, map_cache_to_mm, map_io_pages_to_user,
-    map_nonpaged_page_to_user_readonly, unmap_io_pages_from_user,
+    effective_map_cache, map_cache_to_mm, map_io_pages_to_user, map_nonpaged_page_to_user_readonly,
+    unmap_io_pages_from_user,
 };
 use crate::adapter::AdapterContext;
 use crate::dxgk::*;
@@ -160,6 +161,13 @@ impl<'a, T: bytemuck::Pod> EscapeBuf<'a, T> {
     /// bound is `buf.len()` and not `hdr.size`.
     fn trailing(&self) -> &[u8] {
         &self.buf[size_of::<T>()..]
+    }
+
+    /// Mutable trailing reply bytes. The timeline escape uses this for a
+    /// bounded event batch so no large protocol value is copied onto the KMD
+    /// stack; caller-declared bounds remain checked by its specific verb.
+    fn trailing_mut(&mut self) -> &mut [u8] {
+        &mut self.buf[size_of::<T>()..]
     }
 }
 
@@ -327,8 +335,9 @@ pub unsafe extern "C" fn dxgkddi_escape(
             Some(owner) => {
                 // `hDevice` is the live DeviceContext whose documented
                 // `hKmdProcess` association supplies registration identity.
-                let creator_process = unsafe { crate::device::DeviceHandleRef::from_raw(args.hDevice) }
-                    .map(|device| device.creator_process());
+                let creator_process =
+                    unsafe { crate::device::DeviceHandleRef::from_raw(args.hDevice) }
+                        .map(|device| device.creator_process());
                 match creator_process {
                     Some(process) => escape_present_stream(adapter, buf, &hdr, owner, process),
                     None => STATUS_INVALID_PARAMETER,
@@ -352,6 +361,7 @@ pub unsafe extern "C" fn dxgkddi_escape(
         HELIOS_ESCAPE_ATTACH_RESOURCE => escape_attach_resource(passive, adapter, buf, &hdr),
         HELIOS_ESCAPE_QUERY_STATS => escape_query_stats(adapter, buf, &hdr),
         HELIOS_ESCAPE_QUERY_SCANOUT => escape_query_scanout(adapter, buf, &hdr),
+        HELIOS_ESCAPE_QUERY_SCANOUT_TIMELINE => escape_query_scanout_timeline(buf, &hdr),
         HELIOS_ESCAPE_REGISTER_FENCE_EVENT => escape_register_fence_event(adapter, buf, &hdr),
         HELIOS_ESCAPE_UNREGISTER_FENCE_EVENT => escape_unregister_fence_event(adapter, buf, &hdr),
         // D4a scanout acquire (FIX-DESIGN-d4a.md §3.3). Ownership-bearing: the
@@ -474,6 +484,83 @@ fn escape_query_scanout(
     out.reserved = [0; 2];
     wire.write_back(&out);
     STATUS_SUCCESS
+}
+
+/// Read-only copy-out of the fixed scanout ordering timeline. Escape is
+/// PASSIVE_LEVEL, but the ring itself has no lock/owner dependency and writers
+/// keep running at DIRQL/DISPATCH while this batch is copied.
+fn escape_query_scanout_timeline(buf: &mut [u8], hdr: &HeliosEscapeHeader) -> NTSTATUS {
+    let mut wire = match EscapeBuf::<HeliosEscapeQueryScanoutTimeline>::new(buf, hdr) {
+        Ok(w) => w,
+        Err(st) => return st,
+    };
+    let request = wire.read();
+    let mut out = request;
+    out.out_cursor = crate::ddi::scanout_timeline::cursor();
+    out.out_first_seq = 0;
+    out.out_returned = 0;
+    out.out_lost = 0;
+    out.out_capacity = crate::ddi::scanout_timeline::capacity();
+    out.out_time_unit = HELIOS_SCANOUT_TIMELINE_TIME_100NS;
+    match request.in_op {
+        HELIOS_SCANOUT_TIMELINE_OP_META => {
+            wire.write_back(&out);
+            STATUS_SUCCESS
+        }
+        HELIOS_SCANOUT_TIMELINE_OP_READ => {
+            let count = (request.in_count as usize).clamp(1, HELIOS_SCANOUT_TIMELINE_BATCH_CAP);
+            let event_bytes =
+                count * core::mem::size_of::<helios_protocol::HeliosScanoutTimelineEvent>();
+            if wire.trailing_mut().len() < event_bytes
+                || (hdr.size as usize) < size_of::<HeliosEscapeQueryScanoutTimeline>() + event_bytes
+            {
+                return refuse_short_buffer();
+            }
+            let mut sequence = request.in_start_seq;
+            let earliest = out
+                .out_cursor
+                .saturating_sub(crate::ddi::scanout_timeline::capacity() as u64)
+                .saturating_add(1)
+                .max(1);
+            if sequence < earliest {
+                out.out_lost = earliest.saturating_sub(sequence).min(u32::MAX as u64) as u32;
+                sequence = earliest;
+            }
+            out.out_first_seq = sequence;
+            let end = sequence
+                .saturating_add(count as u64)
+                .min(out.out_cursor.saturating_add(1));
+            while sequence < end {
+                if let Some(event) = crate::ddi::scanout_timeline::read(sequence) {
+                    let wire_event = helios_protocol::HeliosScanoutTimelineEvent {
+                        sequence: event.sequence,
+                        timestamp_100ns: event.timestamp_100ns,
+                        present_epoch: event.present_epoch,
+                        carried_watermark: event.carried_watermark,
+                        identity: event.identity,
+                        resource_id: event.resource_id,
+                        aux: event.aux,
+                        kind: event.kind,
+                        flags: event.flags,
+                        reserved: 0,
+                    };
+                    let offset = out.out_returned as usize
+                        * core::mem::size_of::<helios_protocol::HeliosScanoutTimelineEvent>();
+                    wire.trailing_mut()[offset
+                        ..offset
+                            + core::mem::size_of::<helios_protocol::HeliosScanoutTimelineEvent>()]
+                        .copy_from_slice(bytes_of(&wire_event));
+                    out.out_returned += 1;
+                } else {
+                    out.out_lost = out.out_lost.saturating_add(1);
+                }
+                sequence = sequence.wrapping_add(1);
+            }
+            wire.write_back(&out);
+            STATUS_SUCCESS
+        }
+        _ => STATUS_INVALID_PARAMETER,
+    }
 }
 
 // ── Fence events (KMD 22.22.54, PSC WS2) ────────────────────────────────────
@@ -716,7 +803,8 @@ fn escape_map_read_ledger(
             0,
             HELIOS_SCANOUT_CAP_READ_LEDGER
                 | HELIOS_SCANOUT_CAP_SNAPSHOT_BIND
-                | HELIOS_SCANOUT_CAP_ASYNC_PRESENT_STREAM,
+                | HELIOS_SCANOUT_CAP_ASYNC_PRESENT_STREAM
+                | HELIOS_SCANOUT_CAP_WINDOWED_BLT_SNAPSHOT,
             HELIOS_SCANOUT_ACQ_PROBE_ACK,
         ),
         HELIOS_SCANOUT_ACQ_OP_MAP => {
@@ -895,8 +983,8 @@ fn escape_query_stats(
         FENCE_EVENT_OVERFLOWS, FENCE_EVENT_REGISTERS, FENCE_EVENT_SIGNALS,
         FENCE_EVENT_TEARDOWN_DROPS, PRESENT_STREAM_HIGH_WATER, PRESENT_STREAM_LIVE,
         PRESENT_STREAM_MARKERS, PRESENT_STREAM_REGISTERS, PRESENT_STREAM_REJECTS,
-        PRESENT_STREAM_RETIRES, PRESENT_STREAM_TAGS, RESOURCE_FULL_REJECTS,
-        RESOURCE_HIGH_WATER, TAKE_LIVE_MISSES, WINDOW_RANGE_DROPS,
+        PRESENT_STREAM_RETIRES, PRESENT_STREAM_TAGS, RESOURCE_FULL_REJECTS, RESOURCE_HIGH_WATER,
+        TAKE_LIVE_MISSES, WINDOW_RANGE_DROPS,
     };
 
     let sz = size_of::<HeliosEscapeQueryStats>();
@@ -940,9 +1028,9 @@ fn escape_query_stats(
     out.out_take_live_misses = TAKE_LIVE_MISSES.load(Ordering::Relaxed);
     out.out_adopt_dead_rejects = ADOPT_DEAD_REJECTS.load(Ordering::Relaxed);
     if !v2 {
-    // NOT an EscapeBuf arm: this verb writes one of FOUR layouts over the
+        // NOT an EscapeBuf arm: this verb writes one of FOUR layouts over the
         // same buffer, so there is no single wire type to bind it to. The bounds
-    // are the explicit `sz`/`sz2`/`sz3`/`sz4` checks above, and the version is now
+        // are the explicit `sz`/`sz2`/`sz3`/`sz4` checks above, and the version is now
         // selected by the caller's declared `hdr.size` rather than by how big a
         // scratch buffer it happened to pass.
         buf[..sz].copy_from_slice(bytes_of(&out));
@@ -1050,9 +1138,9 @@ fn escape_present_stream(
     };
     let req = wire.read();
     match req.op {
-        HELIOS_PRESENT_STREAM_OP_REGISTER => match adapter.with_virtio(|v| {
-            v.register_present_stream(owner, req.ctx_id, creator_process)
-        }) {
+        HELIOS_PRESENT_STREAM_OP_REGISTER => match adapter
+            .with_virtio(|v| v.register_present_stream(owner, req.ctx_id, creator_process))
+        {
             Ok(Ok(cookie)) => {
                 let mut out = req;
                 out.cookie = cookie;

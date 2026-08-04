@@ -280,6 +280,23 @@ struct BindMint<'a> {
     seq_out: &'a Cell<u64>,
     /// The `SET_SCANOUT_BLOB`'s own `resource_id`; 0 is the scan-out disable.
     resource_id: u32,
+    /// The full presentation identity carried by a direct synchronous SET. It
+    /// survives waiter abandonment in the in-flight tag so a late success can
+    /// be applied and arm this request's exact flush from the DPC.
+    request: Option<crate::virtio::ScanoutBindRequest>,
+    timeline: Option<ScanoutSetTimeline>,
+}
+
+/// Caller-owned context for the synchronous `SET_SCANOUT_BLOB` timeline.
+/// The wire sequence is still minted by `VirtioGpu::enqueue_sync` under
+/// `virtio_lock`; this values-only context lets that exact publish and the
+/// PASSIVE caller's eventual return retain the originating epoch/watermark.
+#[derive(Clone, Copy)]
+pub(crate) struct ScanoutSetTimeline {
+    pub request: crate::virtio::ScanoutBindRequest,
+    pub present_epoch: u64,
+    pub carried_watermark: u64,
+    pub flags: u32,
 }
 
 /// One synchronous control round-trip: `req` (+ optional second device-read
@@ -341,7 +358,7 @@ fn ctrl_roundtrip(
                     in1_len,
                     resp_len,
                     block.as_ptr(),
-                    bind.map(|bind| bind.resource_id),
+                    bind.map(|bind| (bind.resource_id, bind.request)),
                     |resource_id| adapter.mint_scanout_bind_seq(resource_id),
                 );
                 // The sequence is minted by `enqueue_sync` after its descriptor
@@ -353,6 +370,17 @@ fn ctrl_roundtrip(
                     Ok((ticket, seq)) => {
                         if let (Some(bind), Some(seq)) = (bind, seq) {
                             bind.seq_out.set(seq);
+                            if let Some(timeline) = bind.timeline {
+                                crate::ddi::scanout_timeline::note(
+                                    crate::ddi::scanout_timeline::kind::SYNC_SET_PUBLISH,
+                                    timeline.flags | crate::ddi::scanout_timeline::flag::SUCCESS,
+                                    timeline.present_epoch,
+                                    timeline.carried_watermark,
+                                    seq,
+                                    bind.resource_id,
+                                    0,
+                                );
+                            }
                         }
                         Ok(ticket)
                     }
@@ -658,6 +686,7 @@ pub fn set_scanout_blob(
     format: u32,
     stride: u32,
     offset: u32,
+    timeline: Option<ScanoutSetTimeline>,
 ) -> Result<u64, VirtioError> {
     let mut cmd = VirtioGpuSetScanoutBlob::zeroed();
     fill_set_scanout_blob(&mut cmd, resource_id, width, height, format, stride, offset);
@@ -669,8 +698,27 @@ pub fn set_scanout_blob(
     let bind = BindMint {
         seq_out: &seq,
         resource_id,
+        request: timeline.map(|timeline| timeline.request),
+        timeline,
     };
-    ctrl_roundtrip_ok_seq(passive, adapter, bytes_of(&cmd), None, Some(bind))?;
+    let result = ctrl_roundtrip_ok_seq(passive, adapter, bytes_of(&cmd), None, Some(bind));
+    if let Some(timeline) = timeline {
+        crate::ddi::scanout_timeline::note(
+            crate::ddi::scanout_timeline::kind::SYNC_SET_RETURN,
+            timeline.flags
+                | if result.is_ok() {
+                    crate::ddi::scanout_timeline::flag::SUCCESS
+                } else {
+                    0
+                },
+            timeline.present_epoch,
+            timeline.carried_watermark,
+            seq.get(),
+            resource_id,
+            0,
+        );
+    }
+    result?;
     Ok(seq.get())
 }
 
@@ -1086,6 +1134,29 @@ pub fn release_blob_for_owner(
     let Some((res, mapped, map_offset, map_len)) = taken else {
         return Ok(());
     };
+    // A snapshot/DWM resource cannot detach while a deferred WindowedBlt
+    // still owns its reader lease or reusable Venus command. Cancellation is
+    // exact by resource id; cache release runs before detach/unref.
+    let terminal = adapter.with_scanout_lifecycle(passive, |lock| -> Result<(), VirtioError> {
+        lock.with_venus_client(|client| {
+            let _ = adapter.with_virtio(|v| v.cancel_windowed_blt_for_resource(adapter, res));
+            client.release_present_blits_for_resource(adapter, res)
+        })
+        .map_err(|_| VirtioError::DeviceError)??;
+
+        // Hold the lifecycle gate until the exact reader terminal has
+        // been established.  The Venus guard is released above, before
+        // this virtio-only finalization, preserving lock order.
+        if adapter
+            .with_virtio(|v| v.finish_windowed_blt_teardown_for_resource(adapter, res))
+            .unwrap_or(false)
+        {
+            Ok(())
+        } else {
+            Err(VirtioError::DeviceError)
+        }
+    });
+    terminal?;
     if mapped {
         let _ = resource_unmap_blob(passive, adapter, res);
         let _ = adapter.with_virtio(|v| v.free_window_range_pub(map_offset, map_len));
@@ -1129,6 +1200,28 @@ pub fn release_blobs_for_owner(
         let Some((ctx_id, res, mapped, map_offset, map_len)) = taken else {
             return reclaimed;
         };
+        let terminal = adapter.with_scanout_lifecycle(passive, |lock| {
+            let cache_release = lock.with_venus_client(|client| {
+                let _ = adapter.with_virtio(|v| v.cancel_windowed_blt_for_resource(adapter, res));
+                client.release_present_blits_for_resource(adapter, res)
+            });
+            if !matches!(cache_release, Ok(Ok(()))) {
+                return false;
+            }
+
+            // As in the single-resource path, the worker cannot pass this
+            // point until cancellation, cache drain, and reader terminal are
+            // one lifecycle transaction.
+            adapter
+                .with_virtio(|v| v.finish_windowed_blt_teardown_for_resource(adapter, res))
+                .unwrap_or(false)
+        });
+        if !terminal {
+            // The blob tracking entry was intentionally taken first. Retaining
+            // the host objects on an ambiguous drain leaks safely until Venus
+            // teardown; continuing would detach a possibly in-flight resource.
+            return reclaimed;
+        }
         if mapped {
             let _ = resource_unmap_blob(passive, adapter, res);
             let _ = adapter.with_virtio(|v| v.free_window_range_pub(map_offset, map_len));
@@ -1451,6 +1544,32 @@ pub fn submit_venus_async_present(
             meta,
             venus,
             venus_len,
+        )
+    }))
+}
+
+/// Nonblocking ring-1 submission for an already admitted WindowedBlt token.
+/// The used-ring entry carries the token back to the DPC so the reader lease
+/// and WDDM completion cannot be released by a different present stream.
+pub fn submit_venus_async_windowed_blt(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    ctx_id: u32,
+    stream: &[u8],
+    token: u64,
+    stream_boundary: u64,
+) -> Result<u64, VirtioError> {
+    let (meta, venus, venus_len) = stage_display_submit(passive, adapter, stream)?;
+    display_submit_outcome(adapter.with_virtio(move |v| {
+        v.drain_used();
+        v.enqueue_async_submit_windowed_blt(
+            adapter,
+            ctx_id,
+            meta,
+            venus,
+            venus_len,
+            token,
+            stream_boundary,
         )
     }))
 }

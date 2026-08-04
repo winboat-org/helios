@@ -25,8 +25,8 @@ pub mod venus;
 // it through inference (`take_completed_bind`), and an unused re-export is a
 // warning in a crate that keeps its build clean.
 pub use gpu::{
-    FastBindDispatch, ScanoutBindRequest, ScanoutFlushToken, ScanoutNotify, VirtioGpu, WddmTake,
-    WorkerBindDispatch,
+    FastBindDispatch, PublicationRefresh, ScanoutBindRequest, ScanoutFlushToken, ScanoutNotify,
+    VirtioGpu, WddmTake, WorkerBindDispatch,
 };
 
 use wdk_sys::{
@@ -51,6 +51,15 @@ pub enum VirtioError {
     /// The control queue / in-flight tables are full — retry after a PASSIVE
     /// sleep (natural backpressure; NOT a device failure).
     QueueFull,
+    /// A live presentation SET/flush owns the scanout reader. This is distinct
+    /// from descriptor pressure: retrying it inside the synchronous control
+    /// loop would sleep while holding scanout_mutex and block the worker that
+    /// must issue the exact terminal flush.
+    PublicationBusy,
+    /// A direct presentation SET is at or below the monotonic epoch floor of
+    /// descriptors already accepted by the control queue. This is terminal for
+    /// that exact worker request, never a retryable queue-pressure condition.
+    PresentationSuperseded,
     /// A synchronous control command did not complete within its PASSIVE wait
     /// budget (the in-flight slot was abandoned; the transport keeps working).
     Timeout,
@@ -69,7 +78,9 @@ impl From<VirtioError> for NTSTATUS {
             VirtioError::CapNotFound | VirtioError::FeatureRejected | VirtioError::DeviceError => {
                 STATUS_IO_DEVICE_ERROR
             }
-            VirtioError::QueueFull => STATUS_DEVICE_BUSY,
+            VirtioError::QueueFull
+            | VirtioError::PublicationBusy
+            | VirtioError::PresentationSuperseded => STATUS_DEVICE_BUSY,
             VirtioError::Timeout => STATUS_IO_TIMEOUT,
             VirtioError::NotImplemented => STATUS_NOT_IMPLEMENTED,
             VirtioError::NotOwned => STATUS_INVALID_DEVICE_REQUEST,

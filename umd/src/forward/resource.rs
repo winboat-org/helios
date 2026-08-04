@@ -560,9 +560,21 @@ pub(crate) unsafe fn finish_wddm_tex2d(
         backing_blob_size
     );
     stamp_dxvk_resource_kmt_handles(h, &res, allocation_handle, km_resource);
+    let snapshot_source = core::num::NonZeroU32::new(backing_resource_id).and_then(|resource_id| {
+        (venus_alloc_size != 0 && mip0.TexelWidth != 0 && mip0.TexelHeight != 0).then_some(
+            SnapshotSourceDesc {
+                resource_id: resource_id.get(),
+                venus_alloc_size,
+                memory_type_index,
+                width: mip0.TexelWidth,
+                height: mip0.TexelHeight,
+                dxgi_format: a.Format as u32,
+            },
+        )
+    });
     // Only the exact runtime-designated primary may identify itself through
-    // PresentCb private data. Ordinary shared/pitched DWM sources are copied to
-    // the KMD-owned LINEAR target and must use the identity-free refresh path.
+    // Present private data. Ordinary resource identity stays in
+    // `snapshot_source` above, never in this rotation-coupled field.
     let present_private = match (
         direct_scanout_primary,
         core::num::NonZeroU32::new(backing_resource_id),
@@ -578,9 +590,6 @@ pub(crate) unsafe fn finish_wddm_tex2d(
             pitch: geometry.pitch.get(),
             dxgi_format: a.Format as u32,
             reserved: HELIOS_PRESENT_PRIVATE_FLAG_DIRECT_SCANOUT,
-            // Meaningful only under FLAG_SNAPSHOT (D4b), which the per-present
-            // substitution sets on its OWNED LOCAL copy; a non-snapshot mint
-            // carries 0 by the wire contract (protocol/src/wddm.rs).
             venus_alloc_size: 0,
             // The direct-primary creation path has no relationship to the
             // registered present signal. The per-present eligible path alone
@@ -588,6 +597,8 @@ pub(crate) unsafe fn finish_wddm_tex2d(
             present_ctx_id: 0,
             present_value: 0,
             present_cookie: 0,
+            snapshot_memory_type_index: 0,
+            snapshot_purpose: HELIOS_PRESENT_SNAPSHOT_PURPOSE_NONE,
         },
         _ => empty_present_private(),
     };
@@ -606,6 +617,7 @@ pub(crate) unsafe fn finish_wddm_tex2d(
         h_rt.handle,
         AllocationOwnership::CreatedByUmd, // via pfnAllocateCb above
         present_private,
+        snapshot_source,
     );
     if present_private.is_valid() {
         unsafe { remember_direct_scanout_allocation(h, allocation_handle, present_private) };
@@ -832,6 +844,7 @@ pub(crate) unsafe extern "C" fn create_resource(
                     h_rt.handle,
                     AllocationOwnership::CreatedByUmd, // via pfnAllocateCb above
                     empty_present_private(),
+                    None,
                 );
             });
             if !stored && allocation_handle != 0 {
@@ -1145,6 +1158,7 @@ pub(crate) unsafe extern "C" fn create_resource(
                     h_rt.handle,
                     AllocationOwnership::CreatedByUmd,
                     empty_present_private(),
+                    None,
                 );
             });
         }
@@ -1238,6 +1252,7 @@ pub(crate) unsafe extern "C" fn create_resource(
                     h_rt.handle,
                     AllocationOwnership::CreatedByUmd,
                     empty_present_private(),
+                    None,
                 );
             });
         }
@@ -1490,6 +1505,19 @@ pub(crate) unsafe extern "C" fn open_resource(
         a.hKMResource,
         raw
     );
+    let snapshot_source = (ident.resource_id != 0
+        && venus_alloc_size != 0
+        && meta.width != 0
+        && meta.height != 0
+        && open_dxgi_format != 0)
+        .then_some(SnapshotSourceDesc {
+            resource_id: ident.resource_id,
+            venus_alloc_size,
+            memory_type_index: ident.memory_type_index,
+            width: meta.width,
+            height: meta.height,
+            dxgi_format: open_dxgi_format,
+        });
     store_resource(
         h_resource,
         res,
@@ -1498,6 +1526,7 @@ pub(crate) unsafe extern "C" fn open_resource(
         h_rt.handle,
         AllocationOwnership::OpenedByRuntime,
         empty_present_private(),
+        snapshot_source,
     );
 }
 

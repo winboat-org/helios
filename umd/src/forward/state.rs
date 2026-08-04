@@ -36,6 +36,22 @@ pub(crate) struct ResourceState {
     /// side of the open.
     pub(crate) ownership: AllocationOwnership,
     pub(crate) present_private: HeliosPresentPrivateData,
+    /// Exact creation/open-time ordinary texture identity used only to create a
+    /// WindowedBlt snapshot. It is deliberately distinct from `present_private`:
+    /// the latter rotates with a direct primary and remains empty for ordinary
+    /// resources, so no validity test can turn this source into a scanout
+    /// selector.
+    pub(crate) snapshot_source: Option<SnapshotSourceDesc>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct SnapshotSourceDesc {
+    pub(crate) resource_id: u32,
+    pub(crate) venus_alloc_size: u64,
+    pub(crate) memory_type_index: u32,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) dxgi_format: u32,
 }
 
 /// Who owns the WDDM allocation behind a resource.
@@ -210,6 +226,8 @@ pub(crate) fn empty_present_private() -> HeliosPresentPrivateData {
         present_ctx_id: 0,
         present_value: 0,
         present_cookie: 0,
+        snapshot_memory_type_index: 0,
+        snapshot_purpose: HELIOS_PRESENT_SNAPSHOT_PURPOSE_NONE,
     }
 }
 
@@ -388,9 +406,7 @@ pub(crate) unsafe fn helios_device<'a>(h: Hdevice) -> Option<&'a HeliosDevice> {
 
 /// The binding shadow of the context this handle records on: the device's
 /// immediate-context copy, or the DC's own.
-pub(crate) unsafe fn ctx_bindings<'a>(
-    h: Hdevice,
-) -> Option<&'a crate::device_funcs::CtxBindings> {
+pub(crate) unsafe fn ctx_bindings<'a>(h: Hdevice) -> Option<&'a crate::device_funcs::CtxBindings> {
     match drv_handle(h)? {
         DrvHandle::Device(dev) => Some(&dev.owned.bindings),
         DrvHandle::Deferred(dc) => Some(&dc.bindings),
@@ -571,6 +587,7 @@ pub(crate) unsafe fn store_resource(
     rt_resource: ddi::HANDLE,
     ownership: AllocationOwnership,
     present_private: HeliosPresentPrivateData,
+    snapshot_source: Option<SnapshotSourceDesc>,
 ) {
     let Some(slot) = boxed_slot(h_res) else {
         drop(obj);
@@ -590,6 +607,7 @@ pub(crate) unsafe fn store_resource(
         rt_resource,
         ownership,
         present_private,
+        snapshot_source,
     });
 }
 
@@ -706,6 +724,12 @@ pub(crate) unsafe fn resource_present_private(
     p.is_valid().then_some(p)
 }
 
+pub(crate) unsafe fn resource_snapshot_source(
+    h_res: ddi::D3D10DDI_HRESOURCE,
+) -> Option<SnapshotSourceDesc> {
+    resource_state(h_res)?.snapshot_source
+}
+
 /// Resolve scanout metadata by the allocation Windows is actually presenting.
 /// DXGI may keep one stable resource object while rotating its `hAllocation`
 /// among the pPrimaryDesc ring, so resource-local metadata alone is not enough.
@@ -714,7 +738,9 @@ pub(crate) unsafe fn presented_primary_private(
     h_res: ddi::D3D10DDI_HRESOURCE,
 ) -> Option<HeliosPresentPrivateData> {
     if let Some(private) = unsafe { resource_present_private(h_res) } {
-        return Some(private);
+        if private.reserved & HELIOS_PRESENT_PRIVATE_FLAG_DIRECT_SCANOUT != 0 {
+            return Some(private);
+        }
     }
     let allocation = unsafe { resource_allocation(h_res) };
     if allocation == 0 {

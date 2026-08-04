@@ -23,6 +23,7 @@ pub(crate) mod interrupt;
 mod lifecycle;
 pub(crate) mod present_packet;
 pub(crate) mod query_adapter_info;
+pub(crate) mod scanout_timeline;
 pub(crate) mod scanout_trace;
 mod scheduler;
 pub(crate) mod segment_table;

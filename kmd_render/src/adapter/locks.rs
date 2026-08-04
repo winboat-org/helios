@@ -4,13 +4,15 @@
 //! `wddm_notify_lock` taken before the interrupt object. Moved verbatim out of
 //! `adapter.rs` by T8/R1101.
 //!
-//! One LEAF spinlock sits below all of the above: `ReadLedger`'s
-//! `scanout_event_lock` (D4a, `adapter/read_ledger.rs`). It is acquired LAST —
-//! the retirement broadcast runs at DISPATCH under `virtio_lock` — and nothing
-//! may be acquired while holding it; it guards only the 16-entry event table
-//! and the ≤16 `KeSetEvent(Wait = FALSE)` calls of a broadcast. It has no
-//! accessor here because it mints no token: `crate::sync::SpinLock`'s guard is
-//! its whole discipline.
+//! Two independent D4a LEAF spinlocks sit below all of the above:
+//! `ReadLedger`'s mutation lock and its event-table lock
+//! (`adapter/read_ledger.rs`). Each is acquired LAST; nothing may be acquired,
+//! allocated, waited on, logged to the registry, or paged while either is held.
+//! The mutation lock serializes issue, allocation retire, reset, and token
+//! retirement. It is always released before the event-table lock broadcasts
+//! `KeSetEvent(Wait = FALSE)`, so the two leaf locks never nest. They have no
+//! accessor here because `crate::sync::SpinLock`'s guard is their whole
+//! discipline.
 
 use core::marker::PhantomData;
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -121,8 +123,8 @@ impl WddmNotifyGuard<'_> {
 /// carrying a `_locked` suffix and a doc comment.
 ///
 /// The lock order this token sits at the head of is
-/// `scanout_mutex -> venus_mutex -> virtio_lock` (below which only the D4a
-/// `scanout_event_lock` LEAF may nest — see the module doc);
+/// `scanout_mutex -> venus_mutex -> virtio_lock` (below which one D4a read
+/// ledger LEAF may nest — see the module doc);
 /// [`Self::with_venus_client`] is the enforced path for the middle step.
 ///
 /// ⚠ This does NOT make recursion unrepresentable: the guard is handed to the

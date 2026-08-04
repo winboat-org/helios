@@ -18,24 +18,23 @@ use crate::dxgk::*;
 // cannot hold the complete operation (ntstatus.h).
 pub(crate) const STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER: NTSTATUS = 0xC01E_0001u32 as NTSTATUS;
 
-// Version 2 appended the generation-qualified stream boundary after the
-// original 16-byte GPU-fence record.  Do not decode a v1 record as v2: the
-// added bytes belong to another private record in an older driver image.
-const PRESENT_SUBMISSION_VERSION: u32 = 2;
+// Version 3 appends the exact WindowedBlt admission token. Do not decode an
+// older layout as v3: the tail belongs to another private record there.
+const PRESENT_SUBMISSION_VERSION: u32 = 3;
 const PRESENT_SUBMISSION_MAGIC: u32 = 0x4850_424C; // "HPBL"
 
 /// Byte offset of [`PresentFlipPrivate`] inside the per-context DMA
-/// private-data buffer. [`PresentSubmissionPrivate`] owns bytes 0..24, so the
-/// flip record occupies bytes 24.. and the two never collide even when dxgkrnl
+/// private-data buffer. [`PresentSubmissionPrivate`] owns bytes 0..32, so the
+/// flip record occupies bytes 32.. and the two never collide even when dxgkrnl
 /// batches a BLT and a flip into one DMA buffer.
-pub(crate) const PRESENT_FLIP_PRIVATE_OFFSET: usize = 24;
+pub(crate) const PRESENT_FLIP_PRIVATE_OFFSET: usize = 32;
 
 /// `DmaBufferPrivateDataSize` this driver requests per context (`device.rs`'s
 /// CreateContext reads it from here). 40 bytes until D4b; the snapshot
 /// descriptor grew [`PresentFlipPrivate`] by 32 bytes, and this is the OTHER
 /// half of the "deliberate change to BOTH sites" the compile-time proof below
 /// demands.
-pub(crate) const PRESENT_DMA_PRIVATE_DATA_BYTES: u32 = 80;
+pub(crate) const PRESENT_DMA_PRIVATE_DATA_BYTES: u32 = 88;
 
 const PRESENT_FLIP_MAGIC: u32 = 0x4850_464C; // "HPFL"
 const PRESENT_FLIP_VERSION: u32 = 1;
@@ -125,6 +124,8 @@ impl PresentFlipPrivate {
             dxgi_format: 0,
             plane_offset: 0,
             venus_alloc_size: 0,
+            memory_type_index: 0,
+            purpose: 0,
         });
         let record = PresentFlipPrivate {
             magic: PRESENT_FLIP_MAGIC,
@@ -209,6 +210,8 @@ impl PresentFlipPrivate {
                 dxgi_format: record.snap_dxgi_format,
                 plane_offset: record.snap_plane_offset as u64,
                 venus_alloc_size: record.snap_alloc_size,
+                memory_type_index: 0,
+                purpose: 0,
             })
         } else {
             None
@@ -259,6 +262,9 @@ pub(crate) struct PresentSubmissionPrivate {
     /// Bit 63 selects the stream namespace; zero means no stream marker and
     /// SubmitCommand keeps its legacy current-wire behavior.
     stream_boundary: u64,
+    /// Monotonic WindowedBlt request token. Zero means this submission has no
+    /// deferred BLT admission to promote.
+    blt_token: u64,
 }
 
 /// The scheduler-relevant contents of one exact KMD private-data record.
@@ -266,16 +272,18 @@ pub(crate) struct PresentSubmissionPrivate {
 pub(crate) struct PresentSubmissionBoundary {
     pub gpu_fence_id: u64,
     pub stream_boundary: u64,
+    pub blt_token: u64,
 }
 
 impl PresentSubmissionPrivate {
     #[inline]
-    fn for_parts(gpu_fence_id: u64, stream_boundary: u64) -> Self {
+    fn for_parts(gpu_fence_id: u64, stream_boundary: u64, blt_token: u64) -> Self {
         Self {
             magic: PRESENT_SUBMISSION_MAGIC,
             version: PRESENT_SUBMISSION_VERSION,
             gpu_fence_id,
             stream_boundary,
+            blt_token,
         }
     }
 
@@ -319,6 +327,13 @@ impl PresentSubmissionPrivate {
                     } else {
                         0
                     },
+                    if old.magic == PRESENT_SUBMISSION_MAGIC
+                        && old.version == PRESENT_SUBMISSION_VERSION
+                    {
+                        old.blt_token
+                    } else {
+                        0
+                    },
                 ),
             );
         }
@@ -350,11 +365,11 @@ impl PresentSubmissionPrivate {
         }
         let old =
             unsafe { core::ptr::read_unaligned(private_data.cast::<PresentSubmissionPrivate>()) };
-        let (gpu_fence_id, old_boundary) =
+        let (gpu_fence_id, old_boundary, blt_token) =
             if old.magic == PRESENT_SUBMISSION_MAGIC && old.version == PRESENT_SUBMISSION_VERSION {
-                (old.gpu_fence_id, old.stream_boundary)
+                (old.gpu_fence_id, old.stream_boundary, old.blt_token)
             } else {
-                (0, 0)
+                (0, 0, 0)
             };
         let merged_boundary = if old_boundary == 0 || old_boundary == boundary {
             boundary
@@ -372,7 +387,59 @@ impl PresentSubmissionPrivate {
         unsafe {
             core::ptr::write_unaligned(
                 private_data.cast::<PresentSubmissionPrivate>(),
-                Self::for_parts(gpu_fence_id, merged_boundary),
+                Self::for_parts(gpu_fence_id, merged_boundary, blt_token),
+            );
+        }
+        PRESENT_MARKER_LAST_SIZE.store(private_size, Ordering::Relaxed);
+        PRESENT_MARKER_WRITES.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Carry a bounded WindowedBlt request token into the exact DMA submission
+    /// that admits its destination residency. Tokens may merge only under one
+    /// generation-qualified stream; the largest token then represents the
+    /// same-stream prefix SubmitCommand is allowed to promote.
+    pub(crate) unsafe fn merge_windowed_blt_token(
+        private_data: *mut c_void,
+        private_size: u32,
+        token: u64,
+        boundary: u64,
+    ) -> Result<(), NTSTATUS> {
+        if token == 0
+            || boundary >> 63 != 1
+            || ((boundary >> 32) & 0x7fff_ffff) == 0
+            || boundary as u32 == 0
+        {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        if private_data.is_null()
+            || (private_size as usize) < core::mem::size_of::<PresentSubmissionPrivate>()
+        {
+            return Err(STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER);
+        }
+        let old =
+            unsafe { core::ptr::read_unaligned(private_data.cast::<PresentSubmissionPrivate>()) };
+        let (gpu_fence_id, old_boundary, old_token) =
+            if old.magic == PRESENT_SUBMISSION_MAGIC && old.version == PRESENT_SUBMISSION_VERSION {
+                (old.gpu_fence_id, old.stream_boundary, old.blt_token)
+            } else {
+                (0, 0, 0)
+            };
+        let same_stream = old_boundary == 0
+            || (old_boundary >> 63) == 1
+                && ((old_boundary >> 32) & 0x7fff_ffff) == ((boundary >> 32) & 0x7fff_ffff);
+        if !same_stream {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let merged_boundary = if old_boundary == 0 || old_boundary == boundary {
+            boundary
+        } else {
+            (boundary & !0xffff_ffff) | u64::from((old_boundary as u32).max(boundary as u32))
+        };
+        unsafe {
+            core::ptr::write_unaligned(
+                private_data.cast::<PresentSubmissionPrivate>(),
+                Self::for_parts(gpu_fence_id, merged_boundary, old_token.max(token)),
             );
         }
         PRESENT_MARKER_LAST_SIZE.store(private_size, Ordering::Relaxed);
@@ -401,10 +468,11 @@ impl PresentSubmissionPrivate {
             unsafe { core::ptr::read_unaligned(private_data.cast::<PresentSubmissionPrivate>()) };
         (value.magic == PRESENT_SUBMISSION_MAGIC
             && value.version == PRESENT_SUBMISSION_VERSION
-            && (value.gpu_fence_id != 0 || value.stream_boundary != 0))
+            && (value.gpu_fence_id != 0 || value.stream_boundary != 0 || value.blt_token != 0))
             .then_some(PresentSubmissionBoundary {
                 gpu_fence_id: value.gpu_fence_id,
                 stream_boundary: value.stream_boundary,
+                blt_token: value.blt_token,
             })
     }
 

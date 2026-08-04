@@ -3,27 +3,24 @@
 //!
 //! One 4 KiB nonpaged page, adapter-owned, mapped READ-ONLY into user mode by
 //! `HELIOS_ESCAPE_MAP_READ_LEDGER`. Its head is `helios_protocol::
-//! HeliosReadLedgerPage`: 8 slots of `{resid, issued, retired}` whose whole
-//! content is "a host readback of resid X is in flight iff issued > retired".
+//! HeliosReadLedgerPage`: 65 generation-qualified slots of
+//! `{resid, generation, issued, retired}`. A host read is in flight iff the
+//! stable claim sample has `issued > retired`.
 //! The UMD arms a GPU-side wait on X's reuse from exactly that predicate, so
-//! every write here is a wire-visible publication: Release stores only, and the
-//! reclaim discipline (counters zeroed BEFORE `resid` is released) is what
-//! makes a claimant always inherit `0/0`.
+//! every write here is a wire-visible publication: a fresh claim publishes its
+//! nonzero generation and counters before publishing its `resid`.
 //!
 //! The state machine — claim, pin-until-quiescent, wanted-token reclaim
 //! arbitration — is `helios_kmd_logic::scanout_read_ledger` (host-tested);
 //! this module is its atomic transcription. Serialization facts it relies on:
 //!
-//!   * `issue` and `note_alloc_retired` run under `scanout_mutex`
-//!     (`queue_active_scanout_refresh_locked` /
-//!     `retire_scanout_allocation_locked`), so claims never race claims.
-//!   * At most ONE flush is in flight (`scanout_flush_inflight` CAS), so
-//!     `issued - retired` is 0 or 1 and `retire` never races a same-slot mint.
+//!   * Every page mutation is serialized by `mutation`, a dedicated leaf
+//!     spinlock. It is taken after any currently-held adapter lock, and no
+//!     allocation, wait, pageable operation, registry logging, event-table
+//!     lock, or other lock is legal while it is held.
 //!   * `retire` is driven exclusively by [`crate::virtio::ScanoutFlushToken`]
 //!     — completion or `Drop` — at PASSIVE or at DISPATCH under `virtio_lock`.
-//!     Everything it touches is atomics, the leaf event lock, and
-//!     `KeSetEvent(Wait = FALSE)`: no allocation, no registry, and never
-//!     `wddm_notify_lock`.
+//!     It releases `mutation` before broadcasting the retirement event.
 //!
 //! The page is allocated ONCE (first StartDevice) and freed only in
 //! `AdapterContext::drop`: user mappings created through the escape can
@@ -31,12 +28,12 @@
 //! owner-keyed `MappingTable`) before RemoveDevice.
 
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
-use helios_kmd_logic::scanout_read_ledger::{reclaim_now, FREE_RESID, NO_SLOT, SLOT_COUNT};
+use helios_kmd_logic::scanout_read_ledger::{LedgerTicket, FREE_RESID, NO_SLOT, SLOT_COUNT};
 use helios_protocol::{
-    HeliosReadLedgerPage, HeliosReadLedgerSlot, HELIOS_READ_LEDGER_MAGIC,
-    HELIOS_READ_LEDGER_SLOTS, HELIOS_READ_LEDGER_VERSION,
+    HeliosReadLedgerPage, HeliosReadLedgerSlot, HELIOS_READ_LEDGER_MAGIC, HELIOS_READ_LEDGER_SLOTS,
+    HELIOS_READ_LEDGER_VERSION,
 };
 use wdk_sys::ntddk::{KeSetEvent, MmAllocateContiguousMemory, ObDereferenceObjectDeferDelete};
 use wdk_sys::{KEVENT, PHYSICAL_ADDRESS, PVOID};
@@ -70,6 +67,9 @@ static RD_DROP_RETIRED: AtomicU32 = AtomicU32::new(0);
 /// Reachable ONLY when Stop/StartDevice zeroed the ledger with the read in
 /// flight; movement outside a PnP stop is a bug.
 static RD_ORPHANED: AtomicU32 = AtomicU32::new(0);
+/// Global claim-generation space was exhausted. This cannot silently alias:
+/// the affected read is explicitly unledgered/refused by its caller.
+static RD_GENERATION_EXHAUSTED: AtomicU32 = AtomicU32::new(0);
 /// MAP_READ_LEDGER refusals: page missing, MDL/map failure, bad op (`RdMapF`).
 pub(crate) static RD_MAP_REFUSED: AtomicU32 = AtomicU32::new(0);
 /// Event registrations parked (`AqReg`).
@@ -87,6 +87,7 @@ pub(crate) fn dump_counters() {
     crate::diag::record_named_bytes(b"RdOvf", RD_OVERFLOW.load(Ordering::Relaxed));
     crate::diag::record_named_bytes(b"RdDrp", RD_DROP_RETIRED.load(Ordering::Relaxed));
     crate::diag::record_named_bytes(b"RdOrp", RD_ORPHANED.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"RdGEx", RD_GENERATION_EXHAUSTED.load(Ordering::Relaxed));
     crate::diag::record_named_bytes(b"RdMapF", RD_MAP_REFUSED.load(Ordering::Relaxed));
     crate::diag::record_named_bytes(b"AqReg", AQ_REGISTERED.load(Ordering::Relaxed));
     crate::diag::record_named_bytes(b"AqRgF", AQ_REGISTER_REFUSED.load(Ordering::Relaxed));
@@ -102,6 +103,7 @@ pub(crate) fn reset_counters() {
         &RD_OVERFLOW,
         &RD_DROP_RETIRED,
         &RD_ORPHANED,
+        &RD_GENERATION_EXHAUSTED,
         &RD_MAP_REFUSED,
         &AQ_REGISTERED,
         &AQ_REGISTER_REFUSED,
@@ -111,17 +113,18 @@ pub(crate) fn reset_counters() {
     }
 }
 
-/// The KMD's atomic view of one [`HeliosReadLedgerSlot`]. `AtomicU32` has the
-/// same in-memory representation as `u32`, so the layouts are identical; the
-/// const block below pins that rather than asserting it in prose.
+/// The KMD's atomic view of one [`HeliosReadLedgerSlot`]. The `u64` fields are
+/// explicitly aligned by the wire layout, and the const block below pins the
+/// complete byte identity instead of asserting it in prose.
 #[repr(C)]
 pub(crate) struct LedgerSharedSlot {
     resid: AtomicU32,
-    issued: AtomicU32,
-    retired: AtomicU32,
-    /// Layout-mirror only — never read KMD-side (`dead_code` is about reads).
+    /// Layout-mirror padding before the naturally aligned shared `u64`s.
     #[allow(dead_code)]
-    reserved: AtomicU32,
+    pad0: AtomicU32,
+    generation: AtomicU64,
+    issued: AtomicU64,
+    retired: AtomicU64,
 }
 
 /// The KMD's atomic view of the mapped [`HeliosReadLedgerPage`]. The header
@@ -195,6 +198,34 @@ pub(crate) enum ScanoutEventReg {
     TableFull,
 }
 
+/// KMD-private state behind the read-ledger mutation leaf lock. `next_generation`
+/// belongs to the adapter rather than a transport generation: reset clears the
+/// mapped claims but never rewinds it.
+struct LedgerPrivate {
+    next_generation: u64,
+    retire_wanted: [bool; SLOT_COUNT],
+}
+
+impl LedgerPrivate {
+    const fn new() -> Self {
+        Self {
+            next_generation: 1,
+            retire_wanted: [false; SLOT_COUNT],
+        }
+    }
+
+    fn mint_generation(&mut self) -> Option<u64> {
+        if self.next_generation == 0 {
+            return None;
+        }
+        let generation = self.next_generation;
+        // `0` is the exhausted sentinel. The final nonzero generation is still
+        // usable; the following mint is the checked, loud refusal.
+        self.next_generation = generation.checked_add(1).unwrap_or(0);
+        Some(generation)
+    }
+}
+
 /// The D4a read ledger + retirement-event table, owned by `AdapterContext`.
 pub(crate) struct ReadLedger {
     /// Kernel VA of the one nonpaged ledger page; 0 until the first
@@ -202,10 +233,12 @@ pub(crate) struct ReadLedger {
     /// zeroed and its header written, so an Acquire reader of a nonzero value
     /// sees an initialized page. Never cleared while the adapter lives.
     page_va: AtomicUsize,
-    /// KMD-private retire-wanted marks, parallel to the page slots — the
-    /// reclaim arbitration token (`helios_kmd_logic::scanout_read_ledger`).
-    /// NOT in the mapped page: readers must never see reclaim bookkeeping.
-    retire_wanted: [AtomicU32; SLOT_COUNT],
+    /// ⚠ LEAF LOCK (`read_ledger_mutation_lock`): acquired after any other
+    /// adapter lock and released before event broadcast. It serializes issue,
+    /// allocation-retire, reset, and retirement so a quiescent slot can never
+    /// be recycled underneath an old ticket. Nothing may be acquired while it
+    /// is held; its state is values only and never allocates.
+    mutation: crate::sync::SpinLock<LedgerPrivate>,
     /// ⚠ LEAF LOCK (`scanout_event_lock`): acquired after any other lock this
     /// driver holds — the broadcast runs at DISPATCH under `virtio_lock` from
     /// the used-ring drain — and NOTHING may be acquired while holding it.
@@ -216,10 +249,9 @@ pub(crate) struct ReadLedger {
 
 impl ReadLedger {
     pub(crate) const fn new() -> Self {
-        const WANTED_ZERO: AtomicU32 = AtomicU32::new(0);
         Self {
             page_va: AtomicUsize::new(0),
-            retire_wanted: [WANTED_ZERO; SLOT_COUNT],
+            mutation: crate::sync::SpinLock::new(LedgerPrivate::new()),
             events: crate::sync::SpinLock::new([None; EVENT_TABLE_LEN]),
         }
     }
@@ -295,123 +327,119 @@ impl ReadLedger {
         page.reserved0.store(0, Ordering::Release);
         // Magic LAST: a mapped reader treats a non-magic page as feature-off,
         // so it never consumes a half-written header.
-        page.magic.store(HELIOS_READ_LEDGER_MAGIC, Ordering::Release);
+        page.magic
+            .store(HELIOS_READ_LEDGER_MAGIC, Ordering::Release);
     }
 
-    /// One `RESOURCE_FLUSH` issue for `resid`: find-or-claim a slot, bump
-    /// `issued`, return the slot for the flush token. [`NO_SLOT`] when the
-    /// page is absent or all slots are live — the read then runs unledgered
-    /// (no UMD wait can arm on it), counted, never refused.
-    ///
-    /// Under `scanout_mutex` (the single mint site), so claims never race
-    /// claims; the CAS discipline below is against concurrent RECLAIMS, which
-    /// run from the retirement path at DISPATCH.
-    pub(crate) fn issue(&self, resid: u32) -> u8 {
+    /// Issue one host reader. Mutation is serialized at every IRQL by the
+    /// dedicated leaf lock; callers may hold higher adapter locks, but this
+    /// routine never allocates, waits, logs, or acquires another lock.
+    pub(crate) fn issue(&self, resid: u32) -> LedgerTicket {
         if resid == FREE_RESID {
-            // The flush path refuses resid 0 before reaching the mint; a 0 key
-            // would alias the free-slot sentinel.
-            return NO_SLOT;
+            return LedgerTicket::NONE;
         }
+        let mut private = self.mutation.lock();
         let Some(page) = self.page() else {
-            return NO_SLOT;
+            return LedgerTicket::NONE;
         };
         let mut i = 0;
         while i < SLOT_COUNT {
             let slot = &page.slots[i];
             if slot.resid.load(Ordering::Acquire) == resid {
-                slot.issued.fetch_add(1, Ordering::AcqRel);
+                let generation = slot.generation.load(Ordering::Acquire);
+                if generation == 0 {
+                    // A mapped claim with a zero ticket is protocol corruption.
+                    // Keep it loud and refuse rather than mint an alias.
+                    RD_GENERATION_EXHAUSTED.fetch_add(1, Ordering::Relaxed);
+                    return LedgerTicket::NONE;
+                }
+                slot.issued.fetch_add(1, Ordering::Release);
                 RD_ISSUED.fetch_add(1, Ordering::Relaxed);
-                return i as u8;
+                return LedgerTicket {
+                    slot: i as u8,
+                    resid,
+                    generation,
+                };
             }
             i += 1;
         }
+        // Required preference order: an unclaimed slot wins before a quiescent
+        // live claim is recycled.
         let mut i = 0;
         while i < SLOT_COUNT {
             let slot = &page.slots[i];
-            // A reclaim zeroes the counters BEFORE releasing `resid`, so a won
-            // CAS (Acquire pairs with that Release) always inherits 0/0.
-            if slot
-                .resid
-                .compare_exchange(FREE_RESID, resid, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                slot.issued.fetch_add(1, Ordering::AcqRel);
-                RD_ISSUED.fetch_add(1, Ordering::Relaxed);
-                return i as u8;
+            if slot.resid.load(Ordering::Acquire) == FREE_RESID {
+                return Self::claim_fresh(&mut private, slot, i, resid);
+            }
+            i += 1;
+        }
+        // Allocation lifetime is deliberately irrelevant here. A slot is
+        // recyclable when and only when no reader is active.
+        let mut i = 0;
+        while i < SLOT_COUNT {
+            let slot = &page.slots[i];
+            if slot.issued.load(Ordering::Acquire) == slot.retired.load(Ordering::Acquire) {
+                return Self::claim_fresh(&mut private, slot, i, resid);
             }
             i += 1;
         }
         page.slot_overflow.fetch_add(1, Ordering::AcqRel);
         RD_OVERFLOW.fetch_add(1, Ordering::Relaxed);
-        NO_SLOT
+        LedgerTicket::NONE
     }
 
-    /// One token retirement (`ledger_retire`, §3.2): the read terminated —
-    /// host OK, host error, or never-enqueued/teardown via the token's `Drop`.
-    /// Bumps `retired`, completes a pending reclaim if this bump equalized the
-    /// counters, and broadcasts to every registered event.
-    ///
-    /// PASSIVE or DISPATCH (used-ring drain under `virtio_lock`): atomics, the
-    /// leaf event lock, and `KeSetEvent(Wait = FALSE)` only.
-    pub(crate) fn retire(&self, slot: u8, resid: u32, via_drop: bool) {
-        if slot == NO_SLOT {
-            // Overflow token: nothing was issued, nothing retires — which is
-            // what keeps `RdIss == RdRet` an identity under overflow.
+    /// Retire one exact ticket. The mutation lock is released before event
+    /// broadcast; the two leaf locks never nest.
+    pub(crate) fn retire(&self, ticket: LedgerTicket, via_drop: bool) {
+        if !ticket.is_claimed() {
             return;
         }
-        let i = slot as usize;
-        let Some(page) = self.page() else {
-            // A token exists only after an `issue` against a live page, and the
-            // page is never freed while tokens can exist; count rather than
-            // trust that reasoning.
-            RD_ORPHANED.fetch_add(1, Ordering::Relaxed);
-            return;
+        let retired = {
+            let mut private = self.mutation.lock();
+            let Some(page) = self.page() else {
+                RD_ORPHANED.fetch_add(1, Ordering::Relaxed);
+                return;
+            };
+            let i = ticket.slot as usize;
+            if i >= SLOT_COUNT {
+                RD_ORPHANED.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            RD_RETIRED.fetch_add(1, Ordering::Relaxed);
+            if via_drop {
+                RD_DROP_RETIRED.fetch_add(1, Ordering::Relaxed);
+            }
+            let slot = &page.slots[i];
+            if slot.resid.load(Ordering::Acquire) != ticket.resid
+                || slot.generation.load(Ordering::Acquire) != ticket.generation
+            {
+                RD_ORPHANED.fetch_add(1, Ordering::Relaxed);
+                false
+            } else {
+                slot.retired.fetch_add(1, Ordering::Release);
+                let issued = slot.issued.load(Ordering::Acquire);
+                let retired = slot.retired.load(Ordering::Acquire);
+                if private.retire_wanted[i] && issued == retired {
+                    private.retire_wanted[i] = false;
+                    Self::reclaim_slot(slot);
+                }
+                true
+            }
         };
-        if i >= SLOT_COUNT {
-            RD_ORPHANED.fetch_add(1, Ordering::Relaxed);
-            return;
+        if retired {
+            // Event signaling stays outside the mutation lock. The consumer is
+            // level-triggered and will acquire-load the fully published claim.
+            self.broadcast();
         }
-        RD_RETIRED.fetch_add(1, Ordering::Relaxed);
-        if via_drop {
-            RD_DROP_RETIRED.fetch_add(1, Ordering::Relaxed);
-        }
-        let s = &page.slots[i];
-        if s.resid.load(Ordering::Acquire) != resid {
-            // Stop/StartDevice zeroed the ledger with this read in flight (the
-            // only path that clears a pinned slot). The slot — possibly
-            // re-claimed by a NEW generation's resid — must not be touched;
-            // the global totals above still balance.
-            RD_ORPHANED.fetch_add(1, Ordering::Relaxed);
-            return;
-        }
-        s.retired.fetch_add(1, Ordering::AcqRel);
-        // Complete a reclaim the allocation retire could not perform (a live
-        // read pinned the slot): whoever wins the `wanted` swap while the
-        // counters are equal does the ONE reclaim.
-        let took = self.retire_wanted[i].swap(0, Ordering::AcqRel) != 0;
-        let issued = s.issued.load(Ordering::Acquire);
-        let retired = s.retired.load(Ordering::Acquire);
-        if reclaim_now(issued, retired, took) {
-            Self::reclaim_slot(s);
-        } else if took {
-            // Unreachable while at most one read is in flight; the token must
-            // not be lost if that ever changes.
-            self.retire_wanted[i].store(1, Ordering::Release);
-        }
-        self.broadcast();
     }
 
-    /// The backing allocation for `resid` is retiring (§3.1 reclaim rule):
-    /// reclaim its slot now if quiescent, else mark retire-wanted and let the
-    /// equalizing [`Self::retire`] complete it — a live token pins its slot,
-    /// so a token can never retire into a recycled slot.
-    ///
-    /// Under `scanout_mutex` (`retire_scanout_allocation_locked`), so it never
-    /// races `issue`; the wanted-token swap arbitrates against `retire`.
+    /// Mark allocation teardown. An active reader pins the claim until its
+    /// exact ticket retires; a quiescent claim is immediately released.
     pub(crate) fn note_alloc_retired(&self, resid: u32) {
         if resid == FREE_RESID {
             return;
         }
+        let mut private = self.mutation.lock();
         let Some(page) = self.page() else {
             return;
         };
@@ -422,30 +450,51 @@ impl ReadLedger {
                 i += 1;
                 continue;
             }
-            // Mark FIRST, then decide: whichever of this marker and the
-            // equalizing retirement runs second observes both conditions and
-            // wins the token; the other loses the swap. Exactly one reclaims.
-            self.retire_wanted[i].store(1, Ordering::Release);
+            private.retire_wanted[i] = true;
             let issued = s.issued.load(Ordering::Acquire);
             let retired = s.retired.load(Ordering::Acquire);
             if issued == retired {
-                let took = self.retire_wanted[i].swap(0, Ordering::AcqRel) != 0;
-                if reclaim_now(issued, retired, took) {
-                    Self::reclaim_slot(s);
-                }
+                private.retire_wanted[i] = false;
+                Self::reclaim_slot(s);
             }
             return;
         }
     }
 
-    /// Counters zeroed BEFORE `resid` is released (§3.1): a claimant takes
-    /// only `resid == 0` slots, so it can never inherit stale counters, and a
-    /// mapped reader that still sees the old resid sees `0/0` = no-wait —
-    /// correct, because reclaim requires quiescence.
+    /// Disassociate the ticket before clearing its fields. A reader that began
+    /// on the old resid either observes the free marker or catches a changed
+    /// generation when a same-resid replacement has already published.
     fn reclaim_slot(s: &LedgerSharedSlot) {
+        s.resid.store(FREE_RESID, Ordering::Release);
         s.issued.store(0, Ordering::Release);
         s.retired.store(0, Ordering::Release);
-        s.resid.store(FREE_RESID, Ordering::Release);
+        s.generation.store(0, Ordering::Release);
+    }
+
+    /// Publish a fresh claim only after its nonzero generation and initial
+    /// counters exist. The final `resid` release is the mapped-reader commit.
+    fn claim_fresh(
+        private: &mut LedgerPrivate,
+        slot: &LedgerSharedSlot,
+        index: usize,
+        resid: u32,
+    ) -> LedgerTicket {
+        let Some(generation) = private.mint_generation() else {
+            RD_GENERATION_EXHAUSTED.fetch_add(1, Ordering::Relaxed);
+            return LedgerTicket::NONE;
+        };
+        slot.resid.store(FREE_RESID, Ordering::Release);
+        slot.generation.store(generation, Ordering::Release);
+        slot.retired.store(0, Ordering::Release);
+        slot.issued.store(1, Ordering::Release);
+        slot.resid.store(resid, Ordering::Release);
+        private.retire_wanted[index] = false;
+        RD_ISSUED.fetch_add(1, Ordering::Relaxed);
+        LedgerTicket {
+            slot: index as u8,
+            resid,
+            generation,
+        }
     }
 
     /// Drop every piece of per-transport-generation ledger state: signal +
@@ -453,11 +502,9 @@ impl ReadLedger {
     /// word, rewrite the header. PASSIVE_LEVEL
     /// (`reset_display_publication_state`, Stop/StartDevice).
     ///
-    /// A token still in flight when this runs retires as an orphan (`RdOrp`) —
-    /// benign by construction: resource ids restart in the new generation, but
-    /// the old transport's tokens all die in `set_virtio(None)` BEFORE the
-    /// next StartDevice can mint a claim, so an orphan can only ever observe a
-    /// zeroed slot, never a re-claimed one it would corrupt.
+    /// A token still in flight when this runs is generation-orphaned. Reset
+    /// never rewinds the private source, so it cannot touch a new same-resid
+    /// claim after the next StartDevice.
     pub(crate) fn reset(&self) {
         // Take the registrations out under the leaf lock, signal + deref
         // OUTSIDE it: the signal wakes level-triggered consumers into a
@@ -474,22 +521,20 @@ impl ReadLedger {
                 ObDereferenceObjectDeferDelete(entry.event as PVOID);
             }
         }
+        let mut private = self.mutation.lock();
         let Some(page) = self.page() else {
             return;
         };
         let mut i = 0;
         while i < SLOT_COUNT {
-            self.retire_wanted[i].store(0, Ordering::Release);
-            // Same discipline as reclaim: counters before resid.
-            page.slots[i].issued.store(0, Ordering::Release);
-            page.slots[i].retired.store(0, Ordering::Release);
-            page.slots[i].reserved.store(0, Ordering::Release);
-            page.slots[i].resid.store(FREE_RESID, Ordering::Release);
+            private.retire_wanted[i] = false;
+            Self::reclaim_slot(&page.slots[i]);
             i += 1;
         }
         page.slot_overflow.store(0, Ordering::Release);
         // The header survives the zeroing so mapped readers keep the feature
-        // on across a PnP stop/start.
+        // on across a PnP stop/start. `next_generation` deliberately remains
+        // preserved in `LedgerPrivate`; reset never aliases an old ticket.
         Self::write_header(page);
     }
 
@@ -497,11 +542,7 @@ impl ReadLedger {
     /// The table takes ownership of the caller's object reference on
     /// [`ScanoutEventReg::Registered`] — every other outcome leaves it with
     /// the caller. PASSIVE (escape).
-    pub(crate) fn register_event(
-        &self,
-        owner: usize,
-        event: NonNull<KEVENT>,
-    ) -> ScanoutEventReg {
+    pub(crate) fn register_event(&self, owner: usize, event: NonNull<KEVENT>) -> ScanoutEventReg {
         let raw = event.as_ptr() as usize;
         let mut table = self.events.lock();
         let mut free = None;

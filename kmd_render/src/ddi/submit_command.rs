@@ -393,16 +393,21 @@ fn note_and_maybe_signal(
     adapter.with_wddm_notify_lock(|guard| {
         let signal_now = guard
             .with_virtio(|o, v| {
-                let gpu_completion_fence = present_submission
-                    .and_then(|present| (present.gpu_fence_id != 0).then_some(present.gpu_fence_id));
-                let stream_boundary = present_submission
-                    .and_then(|present| (present.stream_boundary != 0).then_some(present.stream_boundary));
+                let gpu_completion_fence = present_submission.and_then(|present| {
+                    (present.gpu_fence_id != 0).then_some(present.gpu_fence_id)
+                });
+                let stream_boundary = present_submission.and_then(|present| {
+                    (present.stream_boundary != 0).then_some(present.stream_boundary)
+                });
+                let blt_token = present_submission
+                    .and_then(|present| (present.blt_token != 0).then_some(present.blt_token));
                 v.note_wddm_submission(
                     o,
                     fence,
                     is_paging,
                     gpu_completion_fence,
                     stream_boundary,
+                    blt_token,
                 )
             })
             // Transport down (bring-up / teardown): no venus work can gate it.
@@ -422,6 +427,13 @@ fn note_and_maybe_signal(
             }
         }
     });
+    if present_submission.is_some_and(|present| present.blt_token != 0) {
+        // SubmitCommand is the residency-admission edge. Publish the worker
+        // cause before its wake: the exact producer may have terminalized
+        // during preemption, so its original wake can already be gone.
+        adapter.scanout_retire_wanted.store(1, Ordering::Release);
+        adapter.signal_hpd();
+    }
     // The pending FIFO overflowed and degraded to the immediate model, dropping
     // every queued entry. Those entries were the only waiters on their scan-out
     // leases, so release them now — outside the notify lock, because the lease
@@ -442,6 +454,9 @@ fn note_and_maybe_signal(
 ///
 /// # Safety
 /// `base` must be readable for `total` bytes for the duration of the call.
+/// Replay is resolved by exact pending/terminal membership in `VirtioGpu`, not
+/// by mutating dxgkrnl's private buffer: preemption may resubmit that same
+/// documented record after the host copy has already terminalized.
 unsafe fn decode_present_fence(
     base: *const u8,
     total: usize,
@@ -459,7 +474,7 @@ unsafe fn decode_present_fence(
         }
     }
     if let Some(fence) = unsafe {
-        PresentSubmissionPrivate::decode(base as *const c_void, total.min(u32::MAX as usize) as u32)
+        PresentSubmissionPrivate::decode(base.cast(), total.min(u32::MAX as usize) as u32)
     } {
         PRESENT_MARKER_HITS.fetch_add(1, Ordering::Relaxed);
         PRESENT_MARKER_LAST_OFFSET.store(0, Ordering::Relaxed);
@@ -570,7 +585,7 @@ unsafe fn arm_dma_flip(adapter: &AdapterContext, base: *mut c_void, total: u32) 
 unsafe fn decode_virtual_present_fence(
     submit: &DXGKARG_SUBMITCOMMANDVIRTUAL,
 ) -> Option<PresentSubmissionBoundary> {
-    let base = submit.pDmaBufferPrivateData as *const u8;
+    let base = submit.pDmaBufferPrivateData.cast::<u8>();
     let total = submit.DmaBufferPrivateDataSize as usize;
     let umd = submit.DmaBufferUmdPrivateDataSize as usize;
     SUBMIT_VIRTUAL_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -583,7 +598,7 @@ unsafe fn decode_virtual_present_fence(
 unsafe fn decode_legacy_present_fence(
     submit: &DXGKARG_SUBMITCOMMAND,
 ) -> Option<PresentSubmissionBoundary> {
-    let base = submit.pDmaBufferPrivateData as *const u8;
+    let base = submit.pDmaBufferPrivateData.cast::<u8>();
     let total = submit.DmaBufferPrivateDataSize as usize;
     let start = submit.DmaBufferPrivateDataSubmissionStartOffset as usize;
     let end = submit.DmaBufferPrivateDataSubmissionEndOffset as usize;
@@ -628,6 +643,7 @@ fn arm_scanout_refresh_after_current_venus(
     adapter: &AdapterContext,
     resource_id: u32,
     stream_marker: Option<crate::adapter::PresentStreamMarker>,
+    snapshot_submission: bool,
 ) {
     // Unsampled: what the app PRESENTED, against `Vs*` (what Windows asked us
     // to bind) and `Ff*` (what we told the host to re-read). Atomics only, so
@@ -644,7 +660,8 @@ fn arm_scanout_refresh_after_current_venus(
     {
         crate::ddi::scanout_trace::note_marker_while_bound();
     }
-    let _ready = adapter.arm_present_marker_refresh(resource_id, stream_marker);
+    let _ready =
+        adapter.arm_present_marker_refresh(resource_id, stream_marker, snapshot_submission);
 }
 
 /// `DxgkDdiSubmitCommandVirtual` — submit a DMA buffer addressed by GPU virtual
@@ -795,8 +812,21 @@ pub(crate) fn abandon_pending_submissions(
     // primary address and signals the display worker, and neither belongs
     // inside a DISPATCH notification lock.
     adapter.release_all_scanout_leases(crate::ddi::scanout_trace::LeaseEnd::Teardown);
+    // Preemption is the sole replayable scheduler outcome: dxgkrnl resubmits
+    // the same private record after it re-establishes residency. Reset and
+    // timeout abandon the epoch, so their WindowedBlt readers must be settled
+    // or retained only through an already-dispatched host response.
+    let retain_for_resubmit = matches!(&outcome, AbandonOutcome::Preempted { .. });
     adapter.with_wddm_notify_lock(|guard| {
-        let dropped = guard.with_virtio(|o, v| v.preempt_flush(o)).unwrap_or(0);
+        let dropped = guard
+            .with_virtio(|o, v| {
+                if retain_for_resubmit {
+                    v.preempt_flush(o)
+                } else {
+                    v.terminal_abandon_wddm_epoch(o)
+                }
+            })
+            .unwrap_or(0);
         if dropped != 0 {
             ABANDONED_FENCES.fetch_add(dropped, Ordering::Relaxed);
         }
@@ -949,7 +979,10 @@ pub unsafe extern "C" fn dxgkddi_render(
             core::ptr::copy_nonoverlapping(args.pCommand as *const u8, raw.as_mut_ptr(), take);
         }
         let command = unsafe {
-            core::ptr::read_unaligned(raw.as_ptr().cast::<helios_protocol::HeliosPresentRefreshCmd>())
+            core::ptr::read_unaligned(
+                raw.as_ptr()
+                    .cast::<helios_protocol::HeliosPresentRefreshCmd>(),
+            )
         };
         if command.is_valid() {
             // The allocation identity was fixed once by SetVidPnSourceAddress.
@@ -979,16 +1012,12 @@ pub unsafe extern "C" fn dxgkddi_render(
                     None
                 };
                 if let (Some(context), Some(marker)) = (context.as_ref(), stream_marker) {
-                    context.stash_present_stream_marker(
-                        marker.ctx_id,
-                        marker.value,
-                        marker.cookie,
-                    );
+                    context.stash_present_stream_marker(marker.ctx_id, marker.value, marker.cookie);
                 }
                 // HERF carries no resource identity: it is the generic
                 // "the bound target is dirty" edge, so it arms with 0 and the
                 // flush resolves the bound resource as before.
-                arm_scanout_refresh_after_current_venus(adapter, 0, stream_marker);
+                arm_scanout_refresh_after_current_venus(adapter, 0, stream_marker, false);
             }
         }
     }
@@ -1015,11 +1044,16 @@ pub unsafe extern "C" fn dxgkddi_render(
             core::ptr::copy_nonoverlapping(args.pCommand as *const u8, raw.as_mut_ptr(), take);
         }
         let command = unsafe {
-            core::ptr::read_unaligned(raw.as_ptr().cast::<helios_protocol::HeliosPresentRenderCmd>())
+            core::ptr::read_unaligned(
+                raw.as_ptr()
+                    .cast::<helios_protocol::HeliosPresentRenderCmd>(),
+            )
         };
         if command.is_valid() {
             static PRESENT_RENDER_DIAG_COUNT: AtomicU32 = AtomicU32::new(0);
             let diag = PRESENT_RENDER_DIAG_COUNT.fetch_add(1, Ordering::Relaxed) < 4;
+            let mut snapshot_submission = false;
+            let mut windowed_blt_snapshot = false;
             if h_context.is_null() {
                 if diag {
                     crate::diag::record_named_bytes(b"PRset", 0xE1);
@@ -1038,8 +1072,7 @@ pub unsafe extern "C" fn dxgkddi_render(
                 // the full 56-byte form — the 48-byte prefix decode above can
                 // legitimately carry the flag bit while the appended
                 // `venus_alloc_size` was never written.
-                if command.present.reserved
-                    & helios_protocol::HELIOS_PRESENT_PRIVATE_FLAG_SNAPSHOT
+                if command.present.reserved & helios_protocol::HELIOS_PRESENT_PRIVATE_FLAG_SNAPSHOT
                     != 0
                 {
                     // Snapshot coverage remains the old v1 RenderCmd boundary:
@@ -1048,9 +1081,20 @@ pub unsafe extern "C" fn dxgkddi_render(
                     // the new full 72-byte form below.
                     const PRESENT_RENDER_SNAPSHOT_BYTES: usize =
                         core::mem::offset_of!(helios_protocol::HeliosPresentRenderCmd, present)
-                            + core::mem::offset_of!(helios_protocol::HeliosPresentPrivateData, present_ctx_id);
+                            + core::mem::offset_of!(
+                                helios_protocol::HeliosPresentPrivateData,
+                                present_ctx_id
+                            );
                     if take >= PRESENT_RENDER_SNAPSHOT_BYTES {
-                        if let Some(context) = context.as_ref() {
+                        let windowed = command.present.reserved
+                            & helios_protocol::HELIOS_PRESENT_PRIVATE_FLAG_WINDOWED_BLT_SNAPSHOT
+                            != 0;
+                        // The WindowedBlt import consumes the v2 tail's exact
+                        // memory type/purpose. A prefix-compatible direct D4b
+                        // command may never be reinterpreted as one.
+                        if windowed && take < size_of::<helios_protocol::HeliosPresentRenderCmd>() {
+                            crate::ddi::scanout_trace::note_snapshot_fallback();
+                        } else if let Some(context) = context.as_ref() {
                             context.stash_snapshot(
                                 &helios_kmd_logic::snapshot_bind::SnapshotDescriptor {
                                     resource_id: command.present.resource_id,
@@ -1060,8 +1104,12 @@ pub unsafe extern "C" fn dxgkddi_render(
                                     dxgi_format: command.present.dxgi_format,
                                     plane_offset: command.present.plane_offset,
                                     venus_alloc_size: command.present.venus_alloc_size,
+                                    memory_type_index: command.present.snapshot_memory_type_index,
+                                    purpose: command.present.snapshot_purpose,
                                 },
                             );
+                            snapshot_submission = true;
+                            windowed_blt_snapshot = windowed;
                         }
                     } else {
                         // Flagged without coverage of the appended field: the
@@ -1091,20 +1139,25 @@ pub unsafe extern "C" fn dxgkddi_render(
                     // on one the flip has advanced to but the app has not yet
                     // rendered (black).
                     if let Some(adapter) = adapter {
-                        let stream_marker = if take >= size_of::<helios_protocol::HeliosPresentRenderCmd>()
+                        const PRESENT_RENDER_STREAM_BYTES: usize =
+                            core::mem::offset_of!(helios_protocol::HeliosPresentRenderCmd, present)
+                                + core::mem::offset_of!(
+                                    helios_protocol::HeliosPresentPrivateData,
+                                    snapshot_memory_type_index
+                                );
+                        let stream_marker = if take >= PRESENT_RENDER_STREAM_BYTES
                             && private.present_ctx_id != 0
                             && private.present_value != 0
                             && private.present_cookie != 0
                         {
-                            context
-                                .as_ref()
-                                .and_then(|c| c.creator_process())
-                                .map(|creator_process| crate::adapter::PresentStreamMarker {
+                            context.as_ref().and_then(|c| c.creator_process()).map(
+                                |creator_process| crate::adapter::PresentStreamMarker {
                                     ctx_id: private.present_ctx_id,
                                     value: private.present_value,
                                     cookie: private.present_cookie,
                                     creator_process,
-                                })
+                                },
+                            )
                         } else {
                             None
                         };
@@ -1118,11 +1171,39 @@ pub unsafe extern "C" fn dxgkddi_render(
                                 marker.cookie,
                             );
                         }
-                        arm_scanout_refresh_after_current_venus(
-                            adapter,
-                            private.resource_id,
-                            stream_marker,
-                        );
+                        if windowed_blt_snapshot {
+                            // Keep Render's causal handoff observable without
+                            // resolving the marker here: resolution touches the
+                            // transport marker table and would mutate its
+                            // telemetry before Present owns the transaction.
+                            // The raw ctx/value plus registration cookie is the
+                            // complete producer identity; Present's ARM event
+                            // records the resolved opaque boundary.
+                            let (raw_stream, cookie) = match stream_marker {
+                                Some(marker) => (
+                                    (u64::from(marker.ctx_id) << 32) | u64::from(marker.value),
+                                    marker.cookie,
+                                ),
+                                None => (0, 0),
+                            };
+                            crate::ddi::scanout_timeline::note(
+                                crate::ddi::scanout_timeline::kind::WINDOWED_BLT_STASH,
+                                crate::ddi::scanout_timeline::flag::SNAPSHOT,
+                                0,
+                                raw_stream,
+                                cookie,
+                                private.resource_id,
+                                private.snapshot_memory_type_index,
+                            );
+                        }
+                        if !windowed_blt_snapshot {
+                            arm_scanout_refresh_after_current_venus(
+                                adapter,
+                                private.resource_id,
+                                stream_marker,
+                                snapshot_submission,
+                            );
+                        }
                     }
                 }
             }
@@ -1146,9 +1227,7 @@ pub unsafe extern "C" fn dxgkddi_render(
         output.AllocationOffset = 0;
         output.PatchOffset = 0;
         output.SplitOffset = 0;
-        unsafe {
-            output.__bindgen_anon_1.Value = i & 0x00ff_ffff;
-        }
+        output.__bindgen_anon_1.Value = i & 0x00ff_ffff;
     }
     args.PatchLocationListOutSize = args.PatchLocationListInSize;
     if !args.pPatchLocationListOut.is_null() {

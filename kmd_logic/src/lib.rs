@@ -18,6 +18,97 @@
 
 #![no_std]
 
+/// Fixed-phase scheduling for the synthetic 60 Hz CRTC heartbeat.
+///
+/// `DXGK_VIDPN_SOURCE_MODE` advertises 60/1 Hz, so a 16 ms recurring timer is
+/// not an approximation we may expose as the same mode: it runs at 62.5 Hz.
+/// The KMD uses a one-shot timer and advances this absolute interrupt-time
+/// deadline instead. Advancing from the preceding deadline (rather than from
+/// `now`) prevents ordinary DPC latency from accumulating as phase drift; a
+/// genuinely late DPC skips directly to the first future deadline instead of
+/// generating a catch-up burst.
+pub mod vsync_deadline {
+    /// 16.6667 ms in the kernel timer's 100 ns units. This is 60 Hz to within
+    /// 0.0002%, versus the old 16 ms period's 4.17% error.
+    pub const PERIOD_100NS: u64 = 166_667;
+
+    /// Return the first fixed-phase deadline strictly after `now`.
+    ///
+    /// `previous` is the deadline which just fired (or `now` when arming the
+    /// first tick). `None` is terminal: the interrupt-time representation is
+    /// exhausted, so the KMD must leave the one-shot timer unarmed rather than
+    /// turn a saturated deadline into an immediate rearm storm.
+    pub const fn next(previous: u64, now: u64) -> Option<u64> {
+        let Some(candidate) = previous.checked_add(PERIOD_100NS) else {
+            return None;
+        };
+        if candidate > now {
+            return Some(candidate);
+        }
+
+        let late = now.saturating_sub(candidate);
+        let intervals = late / PERIOD_100NS + 1;
+        let Some(advance) = intervals.checked_mul(PERIOD_100NS) else {
+            return None;
+        };
+        candidate.checked_add(advance)
+    }
+
+    /// Convert a future interrupt-time deadline to a negative relative
+    /// `LARGE_INTEGER` due time. A raced/equal deadline is rearmed one 100 ns
+    /// unit ahead, never as zero (which has absolute-time semantics).
+    pub const fn relative_due(deadline: u64, now: u64) -> i64 {
+        let delta = deadline.saturating_sub(now);
+        let nonzero = if delta == 0 { 1 } else { delta };
+        let bounded = if nonzero > i64::MAX as u64 {
+            i64::MAX as u64
+        } else {
+            nonzero
+        };
+        -(bounded as i64)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn initial_arm_is_one_sixtieth_second() {
+            assert_eq!(next(10_000_000, 10_000_000), Some(10_166_667));
+        }
+
+        #[test]
+        fn ordinary_lateness_does_not_accumulate_phase_drift() {
+            let fired = 1_166_667;
+            assert_eq!(next(fired, fired + 4_000), Some(1_333_334));
+        }
+
+        #[test]
+        fn missed_ticks_skip_to_one_future_deadline_without_burst() {
+            let fired = 1_166_667;
+            let now = fired + PERIOD_100NS * 4 + 7;
+            let Some(deadline) = next(fired, now) else {
+                panic!("a representable deadline must remain armable");
+            };
+            assert!(deadline > now);
+            assert_eq!(deadline, fired + PERIOD_100NS * 5);
+        }
+
+        #[test]
+        fn relative_due_is_always_negative_and_exact() {
+            assert_eq!(relative_due(166_667, 0), -166_667);
+            assert_eq!(relative_due(42, 42), -1);
+            assert_eq!(relative_due(41, 42), -1);
+        }
+
+        #[test]
+        fn deadline_overflow_is_terminal_not_an_immediate_rearm() {
+            assert_eq!(next(u64::MAX - PERIOD_100NS + 1, 0), None);
+            assert_eq!(next(u64::MAX - PERIOD_100NS, u64::MAX), None);
+        }
+    }
+}
+
 /// Page granularity for blob window offsets/sizes and for WDDM allocation sizes.
 ///
 /// Moved verbatim from `kmd_render/src/ddi/create_allocation.rs` (`const PAGE`)
@@ -2594,6 +2685,262 @@ pub mod scanout_cadence {
     }
 }
 
+/// Pure decision for the PASSIVE worker after `VirtioGpu` checked one exact
+/// direct presentation's producer boundary.
+///
+/// The host and Windows primary both wait for a D4b snapshot's exact producer
+/// boundary. The KMD maps its transport-facing dispatch into [`Dispatch`] and
+/// consumes this result without making the testable rule depend on a WDK type.
+pub mod scanout_worker_bind {
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum Dispatch {
+        Ready,
+        Waiting,
+        Abandoned,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum Action {
+        Deferred,
+        AlreadyBound,
+        IssueSyncSet,
+        RejectAbandoned,
+    }
+
+    /// Whether this worker's direct-primary epoch may publish a SET or a
+    /// primary address.  This is deliberately separate from [`Dispatch`]: the
+    /// producer boundary says when a request is ready; it cannot make an older
+    /// or identity-conflicting request become the host selection again.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum EpochPolicy {
+        /// A newer presentation owns the binding and heartbeat already.
+        Superseded,
+        /// The same epoch names a different active identity.  It is terminal:
+        /// guessing which identity wins would rebind behind an already-applied
+        /// host selection.
+        EqualConflict,
+        /// The exact epoch/identity is already bound; preserve the ordinary
+        /// already-bound path without another SET.
+        AlreadyBound,
+        /// This is a newer (or untracked) presentation and may stage normally.
+        Newer,
+    }
+
+    /// An already-bound target cannot bypass [`Dispatch::Waiting`]. Once it is
+    /// ready, it avoids a duplicate synchronous SET; an unbound target owns
+    /// that SET instead.
+    pub const fn decide(already_bound: bool, dispatch: Dispatch) -> Action {
+        match dispatch {
+            Dispatch::Waiting => Action::Deferred,
+            Dispatch::Abandoned => Action::RejectAbandoned,
+            Dispatch::Ready if already_bound => Action::AlreadyBound,
+            Dispatch::Ready => Action::IssueSyncSet,
+        }
+    }
+
+    /// Decide the direct-primary epoch before staging a worker SET.  `tracked`
+    /// is false for the MMIO/desktop path, whose epoch is intentionally
+    /// `NO_LEASE`; it must retain its existing identity-only behavior.
+    pub const fn decide_epoch(
+        tracked: bool,
+        present_epoch: u64,
+        bound_epoch: u64,
+        same_active_identity: bool,
+    ) -> EpochPolicy {
+        if !tracked || present_epoch == 0 || bound_epoch == 0 {
+            return EpochPolicy::Newer;
+        }
+        if present_epoch < bound_epoch {
+            EpochPolicy::Superseded
+        } else if present_epoch == bound_epoch {
+            if same_active_identity {
+                EpochPolicy::AlreadyBound
+            } else {
+                EpochPolicy::EqualConflict
+            }
+        } else {
+            EpochPolicy::Newer
+        }
+    }
+}
+
+/// Descriptor-acceptance admission for direct presentation epochs.
+///
+/// Producer readiness and host-reader retirement determine WHEN a request may
+/// bind; this smaller rule determines whether a request can ever travel
+/// backward once a newer presentation SET has been accepted by the control
+/// queue.  The floor advances at descriptor acceptance, not at host response,
+/// so host errors and explicit retire paths cannot reopen an old epoch.
+pub mod scanout_presentation_epoch {
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum Admission {
+        /// No direct presentation epoch is attached (fallback/SET(0)).
+        Untracked,
+        /// Strictly newer than the highest accepted presentation SET epoch.
+        Newer,
+        /// Equal to or older than the accepted floor; must never reach wire.
+        Superseded,
+    }
+
+    /// Decide whether a presentation epoch may be admitted. `0` is the
+    /// untracked sentinel used by adapter-owned fallback/disable SETs.
+    pub const fn decide(floor: u64, present_epoch: u64) -> Admission {
+        if present_epoch == 0 {
+            Admission::Untracked
+        } else if present_epoch > floor {
+            Admission::Newer
+        } else {
+            Admission::Superseded
+        }
+    }
+
+    /// Advance only for an already-accepted tracked presentation descriptor.
+    /// This is monotonic even when the host later rejects that descriptor.
+    pub const fn advance_after_accept(floor: u64, present_epoch: u64) -> u64 {
+        if present_epoch > floor {
+            present_epoch
+        } else {
+            floor
+        }
+    }
+}
+
+/// Fixed publication-transaction decisions for a host-visible scanout SET.
+///
+/// One SET is not terminal when it succeeds: the matching `RESOURCE_FLUSH`
+/// is the host-reader completion that makes the next presentation SET safe.
+/// The KMD stores the full `ScanoutBindRequest` beside this state; this module
+/// keeps the scalar matching and phase rules independently testable.
+pub mod scanout_publish_txn {
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct Key {
+        pub resource_id: u32,
+        pub present_epoch: u64,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum Phase {
+        /// The SET descriptor has reached the wire but has no terminal reply.
+        SetInFlight,
+        /// The SET succeeded and must be applied/armed before the flush exists.
+        SetSucceeded,
+        /// The exact resource/epoch `RESOURCE_FLUSH` is in flight.
+        FlushInFlight,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct Transaction {
+        pub key: Key,
+        pub seq: u64,
+        pub phase: Phase,
+    }
+
+    /// A fixed, value-only transaction slot.  `None` is the only state that
+    /// permits another presentation SET; a timeout deliberately leaves the
+    /// transaction intact because the host can still complete that descriptor.
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub struct State {
+        active: Option<Transaction>,
+    }
+
+    impl State {
+        pub const fn new() -> Self {
+            Self { active: None }
+        }
+
+        pub const fn active(&self) -> Option<Transaction> {
+            self.active
+        }
+
+        /// Claim exactly one accepted SET. Returns false rather than replacing
+        /// an active transaction; replacing it would permit a later wire SET
+        /// before the earlier host reader has terminated.
+        pub fn claim(&mut self, key: Key, seq: u64) -> bool {
+            if self.active.is_some() || seq == 0 {
+                return false;
+            }
+            self.active = Some(Transaction {
+                key,
+                seq,
+                phase: Phase::SetInFlight,
+            });
+            true
+        }
+
+        /// A terminal SET response. Error clears only this exact transaction;
+        /// success remains active until the matching flush terminal response.
+        pub fn complete_set(&mut self, key: Key, seq: u64, ok: bool) -> bool {
+            let Some(mut transaction) = self.active else {
+                return false;
+            };
+            if transaction.key != key || transaction.seq != seq {
+                return false;
+            }
+            if ok {
+                transaction.phase = Phase::SetSucceeded;
+                self.active = Some(transaction);
+            } else {
+                self.active = None;
+            }
+            true
+        }
+
+        /// The application path successfully placed the exact flush on wire.
+        pub fn arm_flush(&mut self, key: Key) -> bool {
+            let Some(mut transaction) = self.active else {
+                return false;
+            };
+            if transaction.key != key || transaction.phase != Phase::SetSucceeded {
+                return false;
+            }
+            transaction.phase = Phase::FlushInFlight;
+            self.active = Some(transaction);
+            true
+        }
+
+        /// Undo an arm that happened before the descriptor was accepted.  No
+        /// host read exists in this transition, so the exact SET remains ready
+        /// for a later flush attempt.
+        pub fn rollback_flush(&mut self, key: Key) -> bool {
+            let Some(mut transaction) = self.active else {
+                return false;
+            };
+            if transaction.key != key || transaction.phase != Phase::FlushInFlight {
+                return false;
+            }
+            transaction.phase = Phase::SetSucceeded;
+            self.active = Some(transaction);
+            true
+        }
+
+        /// A flush response clears only the exact resource/epoch it covered.
+        pub fn complete_flush(&mut self, key: Key) -> bool {
+            let Some(transaction) = self.active else {
+                return false;
+            };
+            if transaction.key != key || transaction.phase != Phase::FlushInFlight {
+                return false;
+            }
+            self.active = None;
+            true
+        }
+
+        /// Exact no-flush termination: stale apply, host-unbound/dead refresh,
+        /// enqueue failure, cancellation, or a completed unbind barrier.
+        pub fn cancel_exact(&mut self, key: Key) -> bool {
+            if self
+                .active
+                .is_some_and(|transaction| transaction.key == key)
+            {
+                self.active = None;
+                true
+            } else {
+                false
+            }
+        }
+    }
+}
+
 /// Fixed-storage state for a completion-ordered fast scanout bind.
 ///
 /// The producer-completion predicate is supplied by the KMD because it reads
@@ -2656,7 +3003,7 @@ pub mod scanout_fast_bind {
             &mut self,
             earliest_ready: bool,
             earliest_live: bool,
-            latest_ready: bool,
+            _latest_ready: bool,
             latest_live: bool,
         ) -> Step {
             let Some(earliest) = self.earliest else {
@@ -2667,13 +3014,12 @@ pub mod scanout_fast_bind {
                 Step::Empty
             } else if earliest_ready {
                 let latest = self.latest.take();
-                if latest.is_some() && latest_ready && latest_live {
-                    self.earliest = None;
-                    Step::Issue(latest.unwrap())
-                } else {
-                    self.earliest = latest.filter(|_| latest_live);
-                    Step::Issue(earliest)
-                }
+                // A completion first advances the oldest liveness frontier.
+                // Keep any live successor even when it is already ready: the
+                // SET issued below creates the next completion pass, which can
+                // then issue that exact successor without silently losing it.
+                self.earliest = latest.filter(|_| latest_live);
+                Step::Issue(earliest)
             } else {
                 Step::Deferred
             }
@@ -2907,6 +3253,195 @@ mod scanout_cadence_tests {
 }
 
 #[cfg(test)]
+mod scanout_worker_bind_tests {
+    use super::scanout_worker_bind::{decide, decide_epoch, Action, Dispatch, EpochPolicy};
+
+    #[test]
+    fn already_bound_target_still_defers_while_its_producer_is_unready() {
+        assert_eq!(decide(true, Dispatch::Waiting), Action::Deferred);
+    }
+
+    #[test]
+    fn ready_already_bound_target_does_not_issue_a_duplicate_sync_set() {
+        assert_eq!(decide(true, Dispatch::Ready), Action::AlreadyBound);
+    }
+
+    #[test]
+    fn ready_unbound_target_owns_the_sync_set() {
+        assert_eq!(decide(false, Dispatch::Ready), Action::IssueSyncSet);
+    }
+
+    #[test]
+    fn abandoned_producer_stays_terminal() {
+        assert_eq!(decide(true, Dispatch::Abandoned), Action::RejectAbandoned);
+    }
+
+    #[test]
+    fn older_worker_epoch_is_terminal_and_cannot_rebind() {
+        assert_eq!(decide_epoch(true, 41, 42, false), EpochPolicy::Superseded);
+    }
+
+    #[test]
+    fn equal_epoch_with_conflicting_identity_is_terminal() {
+        assert_eq!(
+            decide_epoch(true, 42, 42, false),
+            EpochPolicy::EqualConflict
+        );
+    }
+
+    #[test]
+    fn equal_epoch_with_same_identity_uses_already_bound_path() {
+        assert_eq!(decide_epoch(true, 42, 42, true), EpochPolicy::AlreadyBound);
+    }
+
+    #[test]
+    fn newer_worker_epoch_may_stage_normally() {
+        assert_eq!(decide_epoch(true, 43, 42, false), EpochPolicy::Newer);
+    }
+}
+
+#[cfg(test)]
+mod scanout_presentation_epoch_tests {
+    use super::scanout_presentation_epoch::{advance_after_accept, decide, Admission};
+
+    #[test]
+    fn newer_epoch_is_admitted_and_advances_only_after_acceptance() {
+        assert_eq!(decide(1056, 1057), Admission::Newer);
+        assert_eq!(advance_after_accept(1056, 1057), 1057);
+    }
+
+    #[test]
+    fn equal_or_older_epoch_is_terminally_superseded() {
+        assert_eq!(decide(1056, 1056), Admission::Superseded);
+        assert_eq!(decide(1056, 1055), Admission::Superseded);
+        assert_eq!(advance_after_accept(1056, 1055), 1056);
+    }
+
+    #[test]
+    fn accepted_1056_rejects_later_deferred_1055() {
+        let floor = advance_after_accept(0, 1056);
+        assert_eq!(floor, 1056);
+        assert_eq!(decide(floor, 1055), Admission::Superseded);
+    }
+
+    #[test]
+    fn untracked_fallback_does_not_participate_in_the_floor() {
+        assert_eq!(decide(1056, 0), Admission::Untracked);
+        assert_eq!(advance_after_accept(1056, 0), 1056);
+    }
+}
+
+#[cfg(test)]
+mod scanout_publish_txn_tests {
+    use super::scanout_publish_txn::{Key, Phase, State, Transaction};
+
+    const A: Key = Key {
+        resource_id: 0x121,
+        present_epoch: 41,
+    };
+    const B: Key = Key {
+        resource_id: 0x128,
+        present_epoch: 42,
+    };
+
+    #[test]
+    fn active_transaction_blocks_a_ready_second_set() {
+        let mut state = State::new();
+        assert!(state.claim(A, 7));
+        assert!(!state.claim(B, 8));
+        assert_eq!(
+            state.active(),
+            Some(Transaction {
+                key: A,
+                seq: 7,
+                phase: Phase::SetInFlight,
+            })
+        );
+    }
+
+    #[test]
+    fn exact_flush_completion_clears_the_transaction() {
+        let mut state = State::new();
+        assert!(state.claim(A, 7));
+        assert!(state.complete_set(A, 7, true));
+        assert!(state.arm_flush(A));
+        assert!(state.complete_flush(A));
+        assert_eq!(state.active(), None);
+    }
+
+    #[test]
+    fn wrong_resource_or_epoch_cannot_clear_the_transaction() {
+        let mut state = State::new();
+        assert!(state.claim(A, 7));
+        assert!(state.complete_set(A, 7, true));
+        assert!(state.arm_flush(A));
+        assert!(!state.complete_flush(Key {
+            resource_id: B.resource_id,
+            present_epoch: A.present_epoch,
+        }));
+        assert!(!state.complete_flush(Key {
+            resource_id: A.resource_id,
+            present_epoch: B.present_epoch,
+        }));
+        assert_eq!(
+            state.active(),
+            Some(Transaction {
+                key: A,
+                seq: 7,
+                phase: Phase::FlushInFlight,
+            })
+        );
+    }
+
+    #[test]
+    fn set_error_is_an_exact_terminal_path() {
+        let mut state = State::new();
+        assert!(state.claim(A, 7));
+        assert!(state.complete_set(A, 7, false));
+        assert_eq!(state.active(), None);
+    }
+
+    #[test]
+    fn timeout_keeps_late_success_transaction_until_its_flush() {
+        let mut state = State::new();
+        assert!(state.claim(A, 7));
+        // Timeout detaches only the caller. It is intentionally no transition.
+        assert_eq!(
+            state.active(),
+            Some(Transaction {
+                key: A,
+                seq: 7,
+                phase: Phase::SetInFlight,
+            })
+        );
+        assert!(state.complete_set(A, 7, true));
+        assert!(state.arm_flush(A));
+        assert!(state.complete_flush(A));
+        assert_eq!(state.active(), None);
+    }
+
+    #[test]
+    fn prepublication_flush_refusal_rolls_back_exactly() {
+        let mut state = State::new();
+        assert!(state.claim(A, 7));
+        assert!(state.complete_set(A, 7, true));
+        assert!(state.arm_flush(A));
+        assert!(state.rollback_flush(A));
+        assert_eq!(
+            state.active(),
+            Some(Transaction {
+                key: A,
+                seq: 7,
+                phase: Phase::SetSucceeded,
+            })
+        );
+        assert!(!state.rollback_flush(A));
+        assert!(state.arm_flush(A));
+        assert!(state.complete_flush(A));
+    }
+}
+
+#[cfg(test)]
 mod scanout_fast_bind_tests {
     use super::scanout_fast_bind::{Request, State, Step};
 
@@ -2939,12 +3474,17 @@ mod scanout_fast_bind_tests {
     }
 
     #[test]
-    fn newer_flip_preserves_the_oldest_frontier_and_coalesces_only_latest() {
+    fn ready_successor_waits_behind_the_oldest_frontier() {
         let mut state = State::new();
         assert_eq!(state.submit(A, false, true), Step::Deferred);
         assert_eq!(state.submit(B, false, true), Step::Deferred);
         assert_eq!(state.deferred(), Some(A));
+        assert_eq!(state.on_completion(true, true, true, true), Step::Issue(A));
+        assert_eq!(state.deferred(), Some(B));
+        // The SET for A causes the next completion pass. B was already ready,
+        // but it remains exact and is issued there rather than being discarded.
         assert_eq!(state.on_completion(true, true, true, true), Step::Issue(B));
+        assert_eq!(state.deferred(), None);
     }
 
     #[test]
@@ -2967,12 +3507,20 @@ mod scanout_fast_bind_tests {
             );
             assert_eq!(state.deferred(), Some(A));
         }
-        // Once A retires, a ready newest frame may supersede it; either way a
-        // bind reaches the wire instead of permanent replacement starvation.
-        assert!(matches!(
+        // The oldest completion always progresses first. The bounded trailing
+        // slot remains the newest coalesced request and advances on the SET's
+        // following completion pass.
+        assert_eq!(state.on_completion(true, true, true, true), Step::Issue(A));
+        let newest = Request {
+            resource_id: 20,
+            boundary: 204,
+        };
+        assert_eq!(state.deferred(), Some(newest));
+        assert_eq!(
             state.on_completion(true, true, true, true),
-            Step::Issue(_)
-        ));
+            Step::Issue(newest)
+        );
+        assert_eq!(state.deferred(), None);
     }
 
     #[test]
@@ -2982,6 +3530,28 @@ mod scanout_fast_bind_tests {
         assert_eq!(state.submit(B, false, true), Step::Deferred);
         assert_eq!(state.on_completion(true, true, false, true), Step::Issue(A));
         assert_eq!(state.deferred(), Some(B));
+    }
+
+    #[test]
+    fn ready_submit_explicitly_supersedes_retained_frontier() {
+        let mut state = State::new();
+        assert_eq!(state.submit(A, false, true), Step::Deferred);
+        // A currently-ready request is an explicit newer selection, distinct
+        // from completion service. The production path accounts for this
+        // supersession in its timeline/counter before issuing B.
+        assert_eq!(state.submit(B, true, true), Step::Issue(B));
+        assert_eq!(state.deferred(), None);
+    }
+
+    #[test]
+    fn cancelled_successor_cannot_issue_after_oldest_progresses() {
+        let mut state = State::new();
+        assert_eq!(state.submit(A, false, true), Step::Deferred);
+        assert_eq!(state.submit(B, false, true), Step::Deferred);
+        assert_eq!(state.on_completion(true, true, true, true), Step::Issue(A));
+        assert_eq!(state.deferred(), Some(B));
+        assert!(state.cancel_resource(B.resource_id));
+        assert_eq!(state.on_completion(true, true, true, true), Step::Empty);
     }
 
     #[test]
@@ -3507,81 +4077,68 @@ mod scanout_lease_tests {
 }
 
 pub mod scanout_read_ledger {
-    //! D4a scanout-read acquire: the READ LEDGER slot state machine
-    //! (FIX-DESIGN-d4a.md §3.1/§3.2).
+    //! Generation-qualified v2 READ LEDGER state machine.
     //!
-    //! One 4 KiB nonpaged page carries 8 slots of `{resid, issued, retired}`
-    //! that the KMD writes and a user-mode reader consumes: `issued > retired`
-    //! for resid X means a host readback of X is in flight, and the reader arms
-    //! a GPU-side wait on X's reuse. The driver implements every transition
-    //! below with monotone atomics; [`LedgerModel`] is the single-threaded
-    //! executable specification those atomics must agree with, and the free
-    //! functions are the shared decision predicates the driver actually calls.
-    //!
-    //! The load-bearing rules, stated once:
-    //!
-    //! * A slot is keyed by the venus resource id (monotonic within a transport
-    //!   generation, never recycled), claimed by CAS `resid` 0→X, and reclaimed
-    //!   ONLY when `issued == retired` — so a live read pins its slot and a
-    //!   token can never retire into a recycled slot.
-    //! * Reclaim zeroes the counters BEFORE releasing `resid`, so a claimant
-    //!   (which only takes `resid == 0` slots) always inherits `0/0`.
-    //! * Reclaim is arbitrated by the `wanted` token: allocation retire marks
-    //!   it, and whoever wins `take(wanted)` while `issued == retired` — the
-    //!   marker itself or the equalizing read retirement — performs the one
-    //!   reclaim. Two concurrent reclaims of one slot would let a fresh claim's
-    //!   counters be zeroed under it.
-    //! * Every issue is followed by exactly ONE retirement (any outcome —
-    //!   enforced driver-side by the flush token's `Drop`), so
-    //!   `issued == retired` at quiescence is an identity, not a hope.
+    //! A page has 65 slots: every legal WindowedBlt reader plus the one direct
+    //! flush reader. A slot may be recycled at quiescence even if its allocation
+    //! stays live. Its nonzero generation makes that safe: an old token must
+    //! never retire a replacement claim with the same slot or resource id.
 
-    /// Slots in the ledger page. Duplicated from
-    /// `helios_protocol::HELIOS_READ_LEDGER_SLOTS` because this crate
-    /// deliberately has no dependency edge; `kmd_render` pins the two together
-    /// with a `const` assertion at the use site.
-    pub const SLOT_COUNT: usize = 8;
-
-    /// "This read claimed no ledger slot" (all 8 were live — counted as
-    /// overflow). A token carrying it bumps nothing at retirement, which is
-    /// what keeps `issued == retired` an identity under overflow.
+    /// Duplicated from `helios_protocol` to keep this executable model
+    /// dependency-free. `kmd_render` pins it to the wire ABI and to the
+    /// WindowedBlt bound at the actual KMD use site.
+    pub const SLOT_COUNT: usize = 65;
     pub const NO_SLOT: u8 = 0xFF;
-
-    /// `resid` value of an unclaimed slot. A real venus resource id is never 0.
     pub const FREE_RESID: u32 = 0;
 
-    /// THE RECLAIM ARBITRATION. True exactly when the caller both holds the
-    /// `wanted` token (it won the `swap(wanted, false)`) and observes the slot
-    /// quiescent. The two callers are allocation retire (marks `wanted`, then
-    /// tries to take it back) and read retirement (takes it when its bump
-    /// equalizes the counters); at most one of them can have `took_wanted`.
-    pub const fn reclaim_now(issued: u32, retired: u32, took_wanted: bool) -> bool {
-        took_wanted && issued == retired
+    /// Exact KMD-side identity carried by every direct-flush and WindowedBlt
+    /// reader: a slot number alone is deliberately insufficient after recycle.
+    #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+    pub struct LedgerTicket {
+        pub slot: u8,
+        pub resid: u32,
+        pub generation: u64,
     }
 
-    /// The user-mode reader protocol (§3.1): is a read of X in flight?
-    ///
-    /// The reader found a slot whose `resid` was `resid_probe`, read `issued`
-    /// and `retired`, then RE-READ `resid` as `resid_reread`. A changed resid
-    /// means the slot was reclaimed mid-read — and a reclaim implies every read
-    /// of X retired, so the verdict is no-wait. Not called by the KMD; it is
-    /// the executable statement of the contract the UMD half implements.
+    impl LedgerTicket {
+        pub const NONE: Self = Self {
+            slot: NO_SLOT,
+            resid: FREE_RESID,
+            generation: 0,
+        };
+
+        pub const fn is_claimed(self) -> bool {
+            self.slot != NO_SLOT && self.resid != FREE_RESID && self.generation != 0
+        }
+    }
+
+    /// Reader verdict for a stable v2 sample. A generation change is a
+    /// same-resid re-claim, so the UMD retries its full scan rather than using
+    /// this predicate to turn it into a false no-wait.
     pub const fn reader_in_flight(
         resid_probe: u32,
-        issued: u32,
-        retired: u32,
+        generation_probe: u64,
+        issued: u64,
+        retired: u64,
+        generation_reread: u64,
         resid_reread: u32,
     ) -> bool {
-        resid_probe != FREE_RESID && resid_probe == resid_reread && issued > retired
+        resid_probe != FREE_RESID
+            && generation_probe != 0
+            && resid_probe == resid_reread
+            && generation_probe == generation_reread
+            && issued > retired
     }
 
-    /// One model slot. The driver's counterpart is four atomics: three in the
-    /// mapped page (`resid`, `issued`, `retired`) and one KMD-private
-    /// (`wanted`) — the reader must never see retire-wanted state.
+    /// One model slot. The driver's counterpart is four mapped atomics
+    /// (`resid`, `generation`, `issued`, `retired`) plus a KMD-private
+    /// retire-wanted bit, serialized by the ledger's mutation leaf lock.
     #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
     pub struct SlotModel {
         pub resid: u32,
-        pub issued: u32,
-        pub retired: u32,
+        pub generation: u64,
+        pub issued: u64,
+        pub retired: u64,
         pub wanted: bool,
     }
 
@@ -3610,10 +4167,7 @@ pub mod scanout_read_ledger {
 
     /// The executable specification of the ledger state machine.
     ///
-    /// Single-threaded by construction. The shipped driver serializes issue and
-    /// allocation-retire under `scanout_mutex`, runs retirement from the token
-    /// at any IRQL, and reproduces each transition here with monotone atomics
-    /// calling [`reclaim_now`].
+    /// Single-threaded executable form of the driver's mutation leaf lock.
     #[derive(Clone, Copy, Debug)]
     pub struct LedgerModel {
         pub slots: [SlotModel; SLOT_COUNT],
@@ -3621,6 +4175,9 @@ pub mod scanout_read_ledger {
         /// signal). Zeroed by reset with the slots, unlike the counters.
         pub page_overflow: u32,
         pub counters: LedgerCounters,
+        /// KMD-private global source. Transport reset clears the page, never
+        /// this source, so a token from before reset cannot alias a new claim.
+        pub next_generation: u64,
     }
 
     impl Default for LedgerModel {
@@ -3634,6 +4191,7 @@ pub mod scanout_read_ledger {
             Self {
                 slots: [SlotModel {
                     resid: FREE_RESID,
+                    generation: 0,
                     issued: 0,
                     retired: 0,
                     wanted: false,
@@ -3646,6 +4204,7 @@ pub mod scanout_read_ledger {
                     drop_retired: 0,
                     orphaned: 0,
                 },
+                next_generation: 1,
             }
         }
 
@@ -3657,69 +4216,50 @@ pub mod scanout_read_ledger {
             self.slots.iter().position(|s| s.resid == resid)
         }
 
-        /// One `RESOURCE_FLUSH` issue for `resid`: find-or-claim a slot and
-        /// bump `issued`. Returns the claimed slot, or [`NO_SLOT`] on overflow
-        /// (the read still happens host-side; it just runs unledgered — loud
-        /// via the overflow counters, never wedged).
-        ///
-        /// Two passes, mirroring the driver's Histogram CAS discipline: match
-        /// an existing claim first, then take a free slot.
-        pub fn issue(&mut self, resid: u32) -> u8 {
-            // `resid == FREE_RESID` cannot claim: the flush path refuses
-            // resid 0 upstream, and a 0 key would alias the free sentinel.
+        /// Find, claim, or (only when necessary) recycle one quiescent slot.
+        pub fn issue(&mut self, resid: u32) -> LedgerTicket {
             if resid == FREE_RESID {
-                return NO_SLOT;
+                return LedgerTicket::NONE;
             }
             if let Some(i) = self.slot_of(resid) {
                 self.slots[i].issued += 1;
                 self.counters.issued += 1;
-                return i as u8;
+                return Self::ticket(i, self.slots[i]);
             }
             if let Some(i) = self.slots.iter().position(|s| s.resid == FREE_RESID) {
-                // A reclaimed slot was zeroed before its resid was released, so
-                // a fresh claim always starts from 0/0 — asserted by the tests'
-                // invariant checker, not here: nothing in this crate may panic
-                // (it links into the kernel image, dev profile asserts ON).
-                self.slots[i].resid = resid;
-                self.slots[i].issued = 1;
-                self.counters.issued += 1;
-                return i as u8;
+                return self.claim_fresh(i, resid);
+            }
+            // Allocation liveness is not reader liveness. Once every free slot
+            // is occupied, reuse any claim with no active reader.
+            if let Some(i) = self.slots.iter().position(|s| s.issued == s.retired) {
+                return self.claim_fresh(i, resid);
             }
             self.page_overflow += 1;
             self.counters.overflow += 1;
-            NO_SLOT
+            LedgerTicket::NONE
         }
 
-        /// One token retirement: the read terminated (host OK, host error,
-        /// enqueue failure via `Drop`, teardown via `Drop`).
-        pub fn token_retire(&mut self, slot: u8, resid: u32, via_drop: bool) {
-            if slot == NO_SLOT {
-                // Overflow token: nothing was issued, nothing retires.
+        /// One token retirement. A stale `{slot,resid,generation}` is counted
+        /// orphaned and cannot mutate a replacement claim.
+        pub fn token_retire(&mut self, ticket: LedgerTicket, via_drop: bool) {
+            if !ticket.is_claimed() {
                 return;
             }
-            let i = slot as usize;
+            let i = ticket.slot as usize;
             self.counters.retired += 1;
             if via_drop {
                 self.counters.drop_retired += 1;
             }
-            if self.slots[i].resid != resid {
-                // The slot no longer names this read's resource: a reset zeroed
-                // the ledger with the read in flight. The global counters still
-                // balance; the slot (possibly re-claimed by a NEW resid) must
-                // not be touched.
+            if i >= SLOT_COUNT
+                || self.slots[i].resid != ticket.resid
+                || self.slots[i].generation != ticket.generation
+            {
                 self.counters.orphaned += 1;
                 return;
             }
             self.slots[i].retired += 1;
-            // The equalizing retirement completes a reclaim the allocation
-            // retire could not (a live read pinned the slot).
-            let took = core::mem::take(&mut self.slots[i].wanted);
-            if reclaim_now(self.slots[i].issued, self.slots[i].retired, took) {
+            if self.slots[i].wanted && self.slots[i].issued == self.slots[i].retired {
                 self.reclaim(i);
-            } else if took {
-                // Defensive restore: unreachable while at most one read is in
-                // flight, but the token must not be lost if that ever changes.
-                self.slots[i].wanted = true;
             }
         }
 
@@ -3730,22 +4270,14 @@ pub mod scanout_read_ledger {
             let Some(i) = self.slot_of(resid) else {
                 return;
             };
-            // Mark FIRST, then decide: whichever of this marker and the
-            // equalizing retirement runs second sees both conditions and wins
-            // the `wanted` token; the other sees a losing arbitration.
             self.slots[i].wanted = true;
             if self.slots[i].issued == self.slots[i].retired {
-                let took = core::mem::take(&mut self.slots[i].wanted);
-                if reclaim_now(self.slots[i].issued, self.slots[i].retired, took) {
-                    self.reclaim(i);
-                }
+                self.reclaim(i);
             }
         }
 
-        /// StopDevice/StartDevice: the page's contents belong to the transport
-        /// generation being torn down. Counters survive (per-boot, reset only
-        /// at StartDevice by `scanout_trace::reset`), so tokens that die during
-        /// the teardown still balance `retired` against their `issued`.
+        /// Transport reset orphans old tickets but deliberately preserves the
+        /// global generation source.
         pub fn reset(&mut self) {
             for slot in &mut self.slots {
                 *slot = SlotModel::default();
@@ -3753,21 +4285,48 @@ pub mod scanout_read_ledger {
             self.page_overflow = 0;
         }
 
-        /// Counters zeroed BEFORE the resid is released (§3.1): a claimant
-        /// takes only `resid == 0` slots, so it can never observe the stale
-        /// counters; a mapped reader that still sees the old resid sees
-        /// `0/0` = no-wait, which is correct (reclaim requires quiescence).
         fn reclaim(&mut self, i: usize) {
-            self.slots[i].issued = 0;
-            self.slots[i].retired = 0;
-            self.slots[i].resid = FREE_RESID;
+            self.slots[i] = SlotModel::default();
         }
 
         /// Reads in flight for `resid` — what the mapped reader computes.
-        pub fn in_flight(&self, resid: u32) -> u32 {
+        pub fn in_flight(&self, resid: u32) -> u64 {
             self.slot_of(resid)
                 .map(|i| self.slots[i].issued - self.slots[i].retired)
                 .unwrap_or(0)
+        }
+
+        fn claim_fresh(&mut self, i: usize, resid: u32) -> LedgerTicket {
+            let generation = match self.mint_generation() {
+                Some(generation) => generation,
+                None => return LedgerTicket::NONE,
+            };
+            self.slots[i] = SlotModel {
+                resid,
+                generation,
+                issued: 1,
+                retired: 0,
+                wanted: false,
+            };
+            self.counters.issued += 1;
+            Self::ticket(i, self.slots[i])
+        }
+
+        fn mint_generation(&mut self) -> Option<u64> {
+            if self.next_generation == 0 {
+                return None;
+            }
+            let generation = self.next_generation;
+            self.next_generation = generation.checked_add(1).unwrap_or(0);
+            Some(generation)
+        }
+
+        fn ticket(i: usize, slot: SlotModel) -> LedgerTicket {
+            LedgerTicket {
+                slot: i as u8,
+                resid: slot.resid,
+                generation: slot.generation,
+            }
         }
     }
 }
@@ -3782,10 +4341,11 @@ mod scanout_read_ledger_tests {
         for (i, s) in m.slots.iter().enumerate() {
             assert!(s.issued >= s.retired, "slot {i}: retired ran ahead");
             if s.resid == FREE_RESID {
-                // Reclaim zeroes counters before releasing the resid, so a
-                // free slot is always 0/0 and never retire-wanted.
                 assert_eq!((s.issued, s.retired), (0, 0), "slot {i}: dirty free slot");
+                assert_eq!(s.generation, 0, "slot {i}: free slot has generation");
                 assert!(!s.wanted, "slot {i}: free slot still wanted");
+            } else {
+                assert_ne!(s.generation, 0, "slot {i}: claim has zero generation");
             }
         }
     }
@@ -3795,18 +4355,18 @@ mod scanout_read_ledger_tests {
     #[test]
     fn issue_then_retire_balances_and_reuses_the_slot() {
         let mut m = LedgerModel::new();
-        let slot = m.issue(191);
-        assert_ne!(slot, NO_SLOT);
+        let ticket = m.issue(191);
+        assert!(ticket.is_claimed());
         assert_eq!(m.in_flight(191), 1);
-        m.token_retire(slot, 191, false);
+        m.token_retire(ticket, false);
         assert_eq!(m.in_flight(191), 0);
-        // The next read of the same resid reuses the same slot and accumulates.
-        assert_eq!(m.issue(191), slot);
-        m.token_retire(slot, 191, false);
+        let same_claim = m.issue(191);
+        assert_eq!(same_claim, ticket);
+        m.token_retire(same_claim, false);
         assert_eq!(m.counters.issued, 2);
         assert_eq!(m.counters.retired, 2);
-        assert_eq!(m.slots[slot as usize].issued, 2);
-        assert_eq!(m.slots[slot as usize].retired, 2);
+        assert_eq!(m.slots[ticket.slot as usize].issued, 2);
+        assert_eq!(m.slots[ticket.slot as usize].retired, 2);
         check_invariants(&m);
     }
 
@@ -3815,7 +4375,7 @@ mod scanout_read_ledger_tests {
     #[test]
     fn free_resid_cannot_claim() {
         let mut m = LedgerModel::new();
-        assert_eq!(m.issue(FREE_RESID), NO_SLOT);
+        assert_eq!(m.issue(FREE_RESID), LedgerTicket::NONE);
         assert_eq!(m.counters.issued, 0);
         check_invariants(&m);
     }
@@ -3825,28 +4385,55 @@ mod scanout_read_ledger_tests {
     #[test]
     fn drop_retirement_balances_and_is_counted() {
         let mut m = LedgerModel::new();
-        let slot = m.issue(191);
-        m.token_retire(slot, 191, true);
+        let ticket = m.issue(191);
+        m.token_retire(ticket, true);
         assert_eq!(m.counters.issued, m.counters.retired);
         assert_eq!(m.counters.drop_retired, 1);
         assert_eq!(m.in_flight(191), 0);
     }
 
-    /// §3.1 overflow: the 9th distinct live resid gets no slot, is counted on
-    /// both the page and the census, and its token retires into nothing.
+    /// The v2 capacity is exactly 64 WindowedBlt readers plus one direct
+    /// flush. All 65 active claims fit without a refusal.
     #[test]
-    fn ninth_distinct_resid_overflows_loudly() {
+    fn sixty_five_active_distinct_claims_do_not_overflow() {
         let mut m = LedgerModel::new();
-        for resid in 1..=8 {
-            assert_ne!(m.issue(resid), NO_SLOT);
+        for resid in 1..=SLOT_COUNT as u32 {
+            assert!(m.issue(resid).is_claimed());
         }
-        let slot = m.issue(9);
-        assert_eq!(slot, NO_SLOT);
+        assert_eq!(m.page_overflow, 0);
+        assert_eq!(m.counters.overflow, 0);
+        check_invariants(&m);
+    }
+
+    /// One live desktop ring and two concurrent four-slot WindowedBlt rings
+    /// are ordinary legal pressure, not an overflow condition. This is the
+    /// minimal mixed population that used to exhaust the v1 eight-slot page.
+    #[test]
+    fn desktop_ring_plus_two_windowed_blt_rings_fit_without_overflow() {
+        let mut m = LedgerModel::new();
+        for resid in [6, 821, 822, 823] {
+            assert!(m.issue(resid).is_claimed());
+        }
+        for resid in [992, 993, 994, 995, 1017, 1018, 1019, 1020] {
+            assert!(m.issue(resid).is_claimed());
+        }
+        assert_eq!(m.page_overflow, 0);
+        assert_eq!(m.counters.overflow, 0);
+        check_invariants(&m);
+    }
+
+    #[test]
+    fn sixty_sixth_active_distinct_claim_overflows_loudly() {
+        let mut m = LedgerModel::new();
+        for resid in 1..=SLOT_COUNT as u32 {
+            assert!(m.issue(resid).is_claimed());
+        }
+        let ticket = m.issue(SLOT_COUNT as u32 + 1);
+        assert_eq!(ticket, LedgerTicket::NONE);
         assert_eq!(m.page_overflow, 1);
         assert_eq!(m.counters.overflow, 1);
-        // The unledgered token bumps nothing — issued == retired stays exact.
-        m.token_retire(slot, 9, false);
-        assert_eq!(m.counters.issued, 8);
+        m.token_retire(ticket, false);
+        assert_eq!(m.counters.issued, SLOT_COUNT as u32);
         assert_eq!(m.counters.retired, 0);
     }
 
@@ -3855,14 +4442,15 @@ mod scanout_read_ledger_tests {
     #[test]
     fn alloc_retire_without_inflight_read_reclaims_immediately() {
         let mut m = LedgerModel::new();
-        let slot = m.issue(191);
-        m.token_retire(slot, 191, false);
+        let ticket = m.issue(191);
+        m.token_retire(ticket, false);
         m.alloc_retire(191);
         assert_eq!(m.slot_of(191), None);
         let reused = m.issue(400);
-        assert_eq!(reused, slot);
-        assert_eq!(m.slots[slot as usize].issued, 1);
-        assert_eq!(m.slots[slot as usize].retired, 0);
+        assert_eq!(reused.slot, ticket.slot);
+        assert_ne!(reused.generation, ticket.generation);
+        assert_eq!(m.slots[ticket.slot as usize].issued, 1);
+        assert_eq!(m.slots[ticket.slot as usize].retired, 0);
     }
 
     /// Row 6, pinned half: a live token pins its slot across the allocation
@@ -3871,83 +4459,105 @@ mod scanout_read_ledger_tests {
     #[test]
     fn live_token_pins_the_slot_until_its_retirement_reclaims() {
         let mut m = LedgerModel::new();
-        let slot = m.issue(191);
+        let ticket = m.issue(191);
         m.alloc_retire(191);
         // Pinned: still claimed, retire-wanted, and the reader still sees the
         // in-flight read (correct — the host read has not terminated).
-        assert_eq!(m.slot_of(191), Some(slot as usize));
-        assert!(m.slots[slot as usize].wanted);
+        assert_eq!(m.slot_of(191), Some(ticket.slot as usize));
+        assert!(m.slots[ticket.slot as usize].wanted);
         assert_eq!(m.in_flight(191), 1);
-        m.token_retire(slot, 191, false);
+        m.token_retire(ticket, false);
         // The retirement won the wanted token and reclaimed.
         assert_eq!(m.slot_of(191), None);
-        assert!(!m.slots[slot as usize].wanted);
+        assert!(!m.slots[ticket.slot as usize].wanted);
         assert_eq!(m.counters.issued, m.counters.retired);
         check_invariants(&m);
     }
 
-    /// The arbitration cannot double-reclaim: after the retirement's reclaim,
-    /// a second alloc-retire of the same resid finds nothing.
+    /// A quiescent claim can be recycled without allocation teardown once all
+    /// slots are occupied; allocation liveness is not reader liveness.
     #[test]
-    fn double_alloc_retire_is_inert() {
+    fn quiescent_live_claim_recycles_when_no_free_slot_exists() {
         let mut m = LedgerModel::new();
-        let slot = m.issue(191);
-        m.alloc_retire(191);
-        m.token_retire(slot, 191, false);
-        m.alloc_retire(191);
+        let old = m.issue(191);
+        m.token_retire(old, false);
+        for resid in 2..=SLOT_COUNT as u32 {
+            assert!(m.issue(resid).is_claimed());
+        }
+        let replacement = m.issue(500);
+        assert_eq!(replacement.slot, old.slot);
+        assert_ne!(replacement.generation, old.generation);
         assert_eq!(m.slot_of(191), None);
-        // And the slot is claimable by a new resid with clean state.
-        let reused = m.issue(500);
-        assert_eq!(reused, slot);
-        assert!(!m.slots[slot as usize].wanted);
+        check_invariants(&m);
     }
 
-    /// Row 7: a reset with a read in flight orphans the token. The orphaned
-    /// retirement must not touch the slot — which a NEW generation's resid may
-    /// have re-claimed — and the global counters still balance.
     #[test]
-    fn orphaned_retirement_after_reset_corrupts_nothing() {
+    fn same_resid_reclaim_gets_a_new_generation() {
         let mut m = LedgerModel::new();
-        let old_slot = m.issue(191);
+        let old = m.issue(191);
+        m.token_retire(old, false);
+        m.alloc_retire(191);
+        let replacement = m.issue(191);
+        assert_eq!(replacement.slot, old.slot);
+        assert_ne!(replacement.generation, old.generation);
+        assert_eq!(replacement.resid, old.resid);
+    }
+
+    #[test]
+    fn stale_ticket_cannot_retire_a_new_claim() {
+        let mut m = LedgerModel::new();
+        let old = m.issue(191);
+        m.token_retire(old, false);
+        m.alloc_retire(191);
+        let replacement = m.issue(400);
+        m.token_retire(old, true);
+        assert_eq!(m.counters.orphaned, 1);
+        assert_eq!(m.slots[replacement.slot as usize].retired, 0);
+        assert_eq!(m.in_flight(400), 1);
+    }
+
+    #[test]
+    fn reset_generation_never_aliases_old_ticket() {
+        let mut m = LedgerModel::new();
+        let old = m.issue(191);
         m.reset();
         assert_eq!(m.page_overflow, 0);
-        // New generation: resource ids restart; resid 3 lands in slot 0 — the
-        // same slot the orphan token still names.
-        let new_slot = m.issue(3);
-        assert_eq!(new_slot, old_slot);
-        m.token_retire(old_slot, 191, true);
+        let replacement = m.issue(191);
+        assert_eq!(replacement.slot, old.slot);
+        assert_ne!(replacement.generation, old.generation);
+        m.token_retire(old, true);
         assert_eq!(m.counters.orphaned, 1);
-        // The new claim's counters were not corrupted by the orphan.
-        assert_eq!(m.slots[new_slot as usize].issued, 1);
-        assert_eq!(m.slots[new_slot as usize].retired, 0);
-        assert_eq!(m.in_flight(3), 1);
-        m.token_retire(new_slot, 3, false);
-        // Every issue retired exactly once, across the reset.
+        assert_eq!(m.in_flight(191), 1);
+        m.token_retire(replacement, false);
         assert_eq!(m.counters.issued, m.counters.retired);
         check_invariants(&m);
     }
 
-    /// [`reclaim_now`] is the whole arbitration: quiescence alone is not
-    /// enough, the wanted token alone is not enough.
     #[test]
-    fn reclaim_requires_both_quiescence_and_the_wanted_token() {
-        assert!(reclaim_now(3, 3, true));
-        assert!(!reclaim_now(3, 2, true));
-        assert!(!reclaim_now(3, 3, false));
-        assert!(!reclaim_now(0, 0, false));
+    fn issued_equals_retired_at_quiescence() {
+        let mut m = LedgerModel::new();
+        let mut tickets = [LedgerTicket::NONE; SLOT_COUNT];
+        for (index, ticket) in tickets.iter_mut().enumerate() {
+            *ticket = m.issue(index as u32 + 1);
+        }
+        for ticket in tickets {
+            m.token_retire(ticket, false);
+        }
+        assert_eq!(m.counters.issued, m.counters.retired);
+        for slot in m.slots {
+            assert_eq!(slot.issued, slot.retired);
+        }
     }
 
     /// The reader protocol (§3.1): in-flight requires a stable resid and
     /// `issued > retired`; a mid-read reclaim (resid changed) is a no-wait.
     #[test]
     fn reader_protocol_verdicts() {
-        assert!(reader_in_flight(191, 5, 4, 191));
-        assert!(!reader_in_flight(191, 5, 5, 191));
-        // Reclaimed mid-read: every read of 191 retired, so no-wait.
-        assert!(!reader_in_flight(191, 5, 4, 0));
-        assert!(!reader_in_flight(191, 5, 4, 400));
-        // A free slot can never demand a wait.
-        assert!(!reader_in_flight(FREE_RESID, 1, 0, FREE_RESID));
+        assert!(reader_in_flight(191, 7, 5, 4, 7, 191));
+        assert!(!reader_in_flight(191, 7, 5, 5, 7, 191));
+        assert!(!reader_in_flight(191, 7, 5, 4, 8, 191));
+        assert!(!reader_in_flight(191, 7, 5, 4, 7, 0));
+        assert!(!reader_in_flight(FREE_RESID, 0, 1, 0, 0, FREE_RESID));
     }
 }
 
@@ -3993,6 +4603,12 @@ pub mod snapshot_bind {
         /// Total venus blob size backing `resource_id` — the undersize guard's
         /// right-hand side.
         pub venus_alloc_size: u64,
+        /// Exact Vulkan memory type for a typed WindowedBlt import.  Zero is a
+        /// valid type; its presence is proved by the complete v2 command tail
+        /// and the WindowedBlt purpose, not by a sentinel value.
+        pub memory_type_index: u32,
+        /// 0 = direct bind snapshot, 1 = WindowedBlt source snapshot.
+        pub purpose: u32,
     }
 
     /// Why a snapshot descriptor was refused. Every arm is one `SnFbk` and a
@@ -4009,6 +4625,12 @@ pub mod snapshot_bind {
         Layout,
         /// No virtio scan-out encoding for `dxgi_format`.
         Format,
+        /// Descriptor format differs from the DXGI allocation-list source.
+        /// Both can be individually supported but are not interchangeable.
+        SourceFormatMismatch,
+        /// A WindowedBlt path received a direct-bind descriptor (or vice
+        /// versa). These are different consumers and must never be inferred.
+        Purpose,
     }
 
     /// The full Present-time gate: identity, extent, then layout. The caller
@@ -4052,6 +4674,147 @@ pub mod snapshot_bind {
         }
         Ok(())
     }
+
+    /// Typed WindowedBlt source gate. It is deliberately distinct from
+    /// [`validate`]: this snapshot is imported into the KMD Venus context and
+    /// copied into DXGI's destination; it is never a `SET_SCANOUT_BLOB` target.
+    pub const fn validate_windowed_blt(
+        d: &SnapshotDescriptor,
+        source_width: u32,
+        source_height: u32,
+        source_dxgi_format: u32,
+    ) -> Result<(), SnapshotReject> {
+        if d.purpose != 1 {
+            return Err(SnapshotReject::Purpose);
+        }
+        if d.dxgi_format != source_dxgi_format {
+            return Err(SnapshotReject::SourceFormatMismatch);
+        }
+        validate(d, source_width, source_height)
+    }
+}
+
+/// Pure exact-membership rule for WindowedBlt WDDM retirement. Tokens are
+/// monotonically minted only as local request identities; they are not an
+/// ordering relation across generation-qualified present streams.
+pub mod windowed_blt_token {
+    /// Returns true only for the exact terminal `(token, stream_boundary)`
+    /// pair. A greater token on another stream proves nothing about this one.
+    pub fn terminal_contains(terminal: &[(u64, u64)], token: u64, stream_boundary: u64) -> bool {
+        terminal.iter().any(|&(known_token, known_stream)| {
+            known_token == token && known_stream == stream_boundary
+        })
+    }
+
+    /// Does `candidate` belong to the merged terminal prefix ending at
+    /// `(max_token, max_boundary)`? The boundary encoding reserves bit 63 and
+    /// carries a generation-qualified stream handle in bits 32..62. Token
+    /// order is meaningful only *inside* that exact stream.
+    pub const fn prefix_contains(
+        max_token: u64,
+        max_boundary: u64,
+        candidate_token: u64,
+        candidate_boundary: u64,
+    ) -> bool {
+        const TAG: u64 = 1 << 63;
+        const HANDLE_MASK: u64 = 0x7fff_ffff;
+        max_token != 0
+            && max_boundary & TAG != 0
+            && candidate_boundary & TAG != 0
+            && candidate_token <= max_token
+            && ((max_boundary >> 32) & HANDLE_MASK) == ((candidate_boundary >> 32) & HANDLE_MASK)
+    }
+
+    /// Whether an exact terminal/pending pair may attach to a newly replayed
+    /// SubmitCommand. A preempted buffer can legitimately reach a terminal
+    /// before its DMA private data is resubmitted; an already queued WDDM
+    /// prefix owns that terminal and must reject a duplicate replay.
+    pub const fn can_attach_dependency(
+        exact_pending: bool,
+        exact_terminal: bool,
+        already_owned_by_wddm: bool,
+    ) -> bool {
+        !already_owned_by_wddm && (exact_pending || exact_terminal)
+    }
+
+    /// Number of terminal identities left after successfully consuming one
+    /// same-stream WDDM prefix. This makes bounded-capacity behavior a host
+    /// testable pure rule rather than a property of the KMD container.
+    pub fn count_after_prefix_consume(
+        terminal: &[(u64, u64)],
+        max_token: u64,
+        max_boundary: u64,
+    ) -> usize {
+        terminal
+            .iter()
+            .filter(|&&(token, boundary)| {
+                !prefix_contains(max_token, max_boundary, token, boundary)
+            })
+            .count()
+    }
+
+    /// Scheduler/lifecycle cancellation may only reclaim an undispatched
+    /// request that belongs to the dead same-stream prefix.
+    pub const fn prefix_cancel_eligible(
+        dispatched: bool,
+        max_token: u64,
+        max_boundary: u64,
+        token: u64,
+        boundary: u64,
+    ) -> bool {
+        !dispatched && prefix_contains(max_token, max_boundary, token, boundary)
+    }
+}
+
+#[cfg(test)]
+mod windowed_blt_token_tests {
+    use super::windowed_blt_token::{
+        can_attach_dependency, count_after_prefix_consume, prefix_cancel_eligible, prefix_contains,
+        terminal_contains,
+    };
+
+    #[test]
+    fn interleaved_stream_terminal_tokens_do_not_cross_admit() {
+        let stream_a = 0x8000_0001_0000_0009u64;
+        let stream_b = 0x8000_0002_0000_0007u64;
+        // Stream B's numerically later token completed first. It cannot retire
+        // stream A's older token just because a global counter would be past it.
+        let terminal = [(3u64, stream_b)];
+        assert!(!terminal_contains(&terminal, 2, stream_a));
+        assert!(terminal_contains(&terminal, 3, stream_b));
+    }
+
+    #[test]
+    fn merged_prefix_consumes_only_its_own_stream_and_releases_capacity() {
+        let stream_a_7 = 0x8000_0011_0000_0007u64;
+        let stream_a_9 = 0x8000_0011_0000_0009u64;
+        let stream_b_3 = 0x8000_0022_0000_0003u64;
+        let terminal = [(7, stream_a_7), (3, stream_b_3), (9, stream_a_9)];
+        assert!(prefix_contains(9, stream_a_9, 7, stream_a_7));
+        assert!(!prefix_contains(9, stream_a_9, 3, stream_b_3));
+        assert_eq!(count_after_prefix_consume(&terminal, 9, stream_a_9), 1);
+
+        let full = [(1, stream_a_7); 64];
+        assert_eq!(count_after_prefix_consume(&full, 64, stream_a_9), 0);
+    }
+
+    #[test]
+    fn dead_prefix_cancels_only_undispatched_same_stream_requests() {
+        let stream_a_7 = 0x8000_0011_0000_0007u64;
+        let stream_a_9 = 0x8000_0011_0000_0009u64;
+        let stream_b_3 = 0x8000_0022_0000_0003u64;
+        assert!(prefix_cancel_eligible(false, 9, stream_a_9, 7, stream_a_7));
+        assert!(prefix_cancel_eligible(false, 9, stream_a_9, 9, stream_a_9));
+        assert!(!prefix_cancel_eligible(false, 9, stream_a_9, 3, stream_b_3));
+        assert!(!prefix_cancel_eligible(true, 9, stream_a_9, 7, stream_a_7));
+    }
+
+    #[test]
+    fn preempted_terminal_can_replay_once_but_stale_or_owned_private_cannot() {
+        assert!(can_attach_dependency(false, true, false));
+        assert!(!can_attach_dependency(false, false, false));
+        assert!(!can_attach_dependency(false, true, true));
+    }
 }
 
 #[cfg(test)]
@@ -4069,6 +4832,8 @@ mod snapshot_bind_tests {
             dxgi_format: 87,
             plane_offset: 0,
             venus_alloc_size: 7680 * 1080,
+            memory_type_index: 0,
+            purpose: 0,
         }
     }
 
@@ -4178,5 +4943,23 @@ mod snapshot_bind_tests {
             d.dxgi_format = fmt;
             assert_eq!(validate(&d, 1920, 1080).is_ok(), ok, "dxgi {fmt}");
         }
+    }
+
+    #[test]
+    fn windowed_blt_requires_the_exact_dxgi_source_format() {
+        let mut d = good();
+        d.purpose = 1;
+        assert_eq!(validate_windowed_blt(&d, 1920, 1080, 87), Ok(()));
+        // RGBA and BGRA are both supported scanout encodings, but importing a
+        // BGRA snapshot for a DXGI RGBA source would silently swizzle DWM.
+        assert_eq!(
+            validate_windowed_blt(&d, 1920, 1080, 28),
+            Err(SnapshotReject::SourceFormatMismatch)
+        );
+        d.purpose = 0;
+        assert_eq!(
+            validate_windowed_blt(&d, 1920, 1080, 87),
+            Err(SnapshotReject::Purpose)
+        );
     }
 }

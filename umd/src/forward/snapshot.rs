@@ -52,6 +52,18 @@ pub(crate) struct SnapshotPlan {
     pub(crate) plane_offset: u64,
     pub(crate) dxgi_format: u32,
     pub(crate) venus_alloc_size: u64,
+    pub(crate) memory_type_index: u32,
+    pub(crate) purpose: SnapshotPurpose,
+}
+
+/// The typed consumer of a snapshot.  The direct arm binds it; the windowed
+/// BLT arm imports it as an ordinary Vulkan source.  Keeping the distinction in
+/// the plan prevents a WindowedBlt descriptor from ever reaching a scanout
+/// refresh arm.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SnapshotPurpose {
+    DirectFlip,
+    WindowedBlt,
 }
 
 /// Presents whose descriptor was substituted with a snapshot (the UMD-side
@@ -129,14 +141,14 @@ unsafe fn build_ring(
         // open-path's preference order in resource.rs.
         let (mut alloc_size, mut memory_type_index) = (0u64, 0u32);
         // SAFETY: `res` is the live resource created above.
-        if !unsafe {
+        let alloc_identity_known = unsafe {
             dev.dxvk.get_resource_alloc_identity(
                 res.as_raw() as usize,
                 &mut alloc_size,
                 &mut memory_type_index,
             )
-        } || alloc_size == 0
-        {
+        };
+        if !alloc_identity_known || alloc_size == 0 {
             alloc_size = memory_size;
         }
         let pitch = row_pitch as u32;
@@ -166,6 +178,8 @@ unsafe fn build_ring(
             pitch,
             plane_offset,
             alloc_size,
+            memory_type_index,
+            alloc_identity_known,
         });
     }
     log_error!(
@@ -204,16 +218,23 @@ unsafe fn build_ring(
 pub(crate) unsafe fn snapshot_for_present(
     h: Hdevice,
     src_h: ddi::D3D10DDI_HRESOURCE,
-    private: &HeliosPresentPrivateData,
+    width: u32,
+    height: u32,
+    dxgi_format: u32,
+    purpose: SnapshotPurpose,
 ) -> Option<SnapshotPlan> {
     // The single cheap gate (§6 row 1): knob off or a KMD without
     // CAP_SNAPSHOT_BIND leaves the present path bit-identical to a build
     // without the mechanism — no ring, no blit, no logs.
-    if !crate::scanout_snapshot_knob() || !crate::scanout_acquire::scanout_snapshot_capable() {
+    if !crate::scanout_snapshot_knob()
+        || !(match purpose {
+            SnapshotPurpose::DirectFlip => crate::scanout_acquire::scanout_snapshot_capable(),
+            SnapshotPurpose::WindowedBlt => crate::scanout_acquire::windowed_blt_snapshot_capable(),
+        })
+    {
         return None;
     }
     let dev = helios_device(h)?;
-    let (width, height, dxgi_format) = (private.width, private.height, private.dxgi_format);
     if width == 0 || height == 0 {
         // A valid private with zero extent cannot exist (finish_wddm_tex2d
         // mints from a real mip0); refuse rather than build a 0x0 ring.
@@ -265,7 +286,7 @@ pub(crate) unsafe fn snapshot_for_present(
     }
     // Rotate to the next slot and copy its (all-Copy) identity out, so the
     // borrow arithmetic below stays trivial.
-    let (slot_index, dst_raw, plan) = {
+    let (slot_index, dst_raw, plan, alloc_identity_known) = {
         let ring = ring_cell.as_mut()?; // Some by construction above
         let index = ring.next % SNAPSHOT_RING_SLOTS;
         ring.next = (index + 1) % SNAPSHOT_RING_SLOTS;
@@ -281,9 +302,24 @@ pub(crate) unsafe fn snapshot_for_present(
                 plane_offset: slot.plane_offset,
                 dxgi_format: ring.dxgi_format,
                 venus_alloc_size: slot.alloc_size,
+                memory_type_index: slot.memory_type_index,
+                purpose,
             },
+            slot.alloc_identity_known,
         )
     };
+
+    if purpose == SnapshotPurpose::WindowedBlt && !alloc_identity_known {
+        let n = SNAP_COPY_FAILS.fetch_add(1, Ordering::Relaxed);
+        if n < 16 || n % 512 == 0 {
+            log_error!(
+                "scanout-snapshot: WindowedBlt refused snapshot slot {} without exact allocation identity ({})",
+                slot_index,
+                counter_summary()
+            );
+        }
+        return None;
+    }
 
     // Copy direction: S_i <- the PRESENTED source resource — the same COM
     // identity publish_present_order names on the flip path.
@@ -302,7 +338,13 @@ pub(crate) unsafe fn snapshot_for_present(
     // outlives this call — it is only torn down above, under the same
     // RefCell, or at device teardown); `src_raw` is the presented resource's
     // live COM pointer for the duration of this DDI call.
-    match unsafe { dev.dxvk.present_snapshot_copy(DstRes(dst_raw), SrcRes(src_raw)) } {
+    match unsafe {
+        dev.dxvk.present_snapshot_copy(
+            DstRes(dst_raw),
+            SrcRes(src_raw),
+            purpose == SnapshotPurpose::WindowedBlt,
+        )
+    } {
         0 => {
             let n = SNAP_SUBSTITUTED.fetch_add(1, Ordering::Relaxed);
             // Steady-state cadence: first presents prove the arm is live, then
@@ -372,6 +414,30 @@ pub(crate) fn apply_snapshot_override(
     present_private: &mut Option<HeliosPresentPrivateData>,
     plan: &SnapshotPlan,
 ) {
+    if plan.purpose == SnapshotPurpose::WindowedBlt {
+        // Windowed DXGI Present has no direct primary private record. Build a
+        // fresh typed *source* descriptor, which is deliberately not marked
+        // DIRECT_SCANOUT and can therefore never select scanout in the KMD.
+        *present_private = Some(HeliosPresentPrivateData {
+            plane_offset: plan.plane_offset,
+            magic: HELIOS_PRESENT_PRIVATE_MAGIC,
+            version: HELIOS_PRESENT_PRIVATE_VERSION,
+            resource_id: plan.resid,
+            width: plan.width,
+            height: plan.height,
+            pitch: plan.pitch,
+            dxgi_format: plan.dxgi_format,
+            reserved: HELIOS_PRESENT_PRIVATE_FLAG_SNAPSHOT
+                | HELIOS_PRESENT_PRIVATE_FLAG_WINDOWED_BLT_SNAPSHOT,
+            venus_alloc_size: plan.venus_alloc_size,
+            present_ctx_id: 0,
+            present_value: 0,
+            present_cookie: 0,
+            snapshot_memory_type_index: plan.memory_type_index,
+            snapshot_purpose: HELIOS_PRESENT_SNAPSHOT_PURPOSE_WINDOWED_BLT,
+        });
+        return;
+    }
     let Some(private) = present_private.as_mut() else {
         let n = SNAP_PRIVATE_SKIPS.fetch_add(1, Ordering::Relaxed);
         if n < 16 || n % 512 == 0 {
@@ -411,4 +477,6 @@ pub(crate) fn apply_snapshot_override(
     private.dxgi_format = plan.dxgi_format;
     private.venus_alloc_size = plan.venus_alloc_size;
     private.reserved |= HELIOS_PRESENT_PRIVATE_FLAG_SNAPSHOT;
+    private.snapshot_memory_type_index = plan.memory_type_index;
+    private.snapshot_purpose = HELIOS_PRESENT_SNAPSHOT_PURPOSE_NONE;
 }

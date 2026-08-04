@@ -60,6 +60,10 @@ impl OptimalPresentImageDesc {
         self.pixel_format
     }
 
+    pub(crate) fn resource_id(self) -> u32 {
+        self.resource_id
+    }
+
     /// Ordinary UMD-created shared images use the renderer's OPAQUE_FD
     /// transport. Keeping this constructor distinct from the DMA_BUF variant
     /// prevents Present from silently importing one allocation with the other
@@ -188,7 +192,7 @@ pub enum PresentDestinationDesc {
 }
 
 impl PresentDestinationDesc {
-    pub(super) fn resource_id(self) -> u32 {
+    pub(crate) fn resource_id(self) -> u32 {
         match self {
             Self::StandardBuffer(desc) => desc.resource_id,
             Self::OptimalImage(desc) => desc.resource_id,
@@ -269,6 +273,16 @@ pub(super) struct PreparedPresentBlt {
     pub(super) last_wire_fence_id: u64,
     pub(super) submit_count: u32,
     pub(super) probe_done: bool,
+}
+
+/// PASSIVE-time cache preparation result. It contains only stable cache
+/// identity and the exact destination contract; actual ring-1 submission is a
+/// separate later operation after SubmitCommand has admitted residency.
+#[derive(Clone, Copy)]
+pub(crate) struct PreparedPresentBltSubmission {
+    blt_index: usize,
+    command_buffer_id: VkCommandBufferId,
+    destination: PresentDestinationDesc,
 }
 
 impl PreparedPresentBlt {
@@ -1035,12 +1049,12 @@ impl VenusClient {
     /// Setup is cached by exact resource descriptors. The steady-state path
     /// only encodes one vkQueueSubmit and performs one nonblocking ring-1
     /// enqueue; no sleep or synchronous ctrl round-trip occurs per frame.
-    pub fn submit_present_blt(
+    pub fn prepare_present_blt(
         &mut self,
         adapter: &AdapterContext,
         source: OptimalPresentImageDesc,
         destination: PresentDestinationDesc,
-    ) -> Result<u64, VirtioError> {
+    ) -> Result<PreparedPresentBltSubmission, VirtioError> {
         if source.resource_id == destination.resource_id()
             || source.width != destination.width()
             || source.height != destination.height()
@@ -1201,40 +1215,102 @@ impl VenusClient {
         };
 
         let command_buffer_id = self.present_blits[blt_index].command_buffer_id;
-        let submit = self.encode_command_buffer_submit(command_buffer_id);
+        Ok(PreparedPresentBltSubmission {
+            blt_index,
+            command_buffer_id,
+            destination,
+        })
+    }
+
+    /// Preserve the legacy Present path for an untyped source. It uses the
+    /// same prepared cache record as WindowedBlt snapshots, but submits through
+    /// the ordinary ring-1 path because no deferred token/reader transaction
+    /// exists for it.
+    pub fn submit_present_blt(
+        &mut self,
+        adapter: &AdapterContext,
+        source: OptimalPresentImageDesc,
+        destination: PresentDestinationDesc,
+    ) -> Result<u64, VirtioError> {
+        let prepared = self.prepare_present_blt(adapter, source, destination)?;
+        self.validate_prepared_present_blt(prepared)?;
+        let submit = self.encode_command_buffer_submit(prepared.command_buffer_id);
         let fence_id = ctrl::submit_venus_async_present(
             self.passive(),
             adapter,
             self.ctx_id(),
             submit.as_slice()?,
         )?;
-        let run_probe = {
-            let blt = &mut self.present_blits[blt_index];
-            blt.last_wire_fence_id = fence_id;
-            blt.submit_count = blt.submit_count.saturating_add(1);
-            if adapter.present_probe()
-                && blt.submit_count >= PRESENT_PROBE_AFTER_SUBMITS
-                && !blt.probe_done
-            {
-                // Claim the one-shot before doing any fallible work. Even a
-                // failed diagnostic can therefore never turn into a recurring
-                // Present-path stall.
-                blt.probe_done = true;
-                true
-            } else {
-                false
-            }
+        self.note_prepared_present_blt_submit(adapter, prepared, fence_id);
+        Ok(fence_id)
+    }
+
+    fn validate_prepared_present_blt(
+        &self,
+        prepared: PreparedPresentBltSubmission,
+    ) -> Result<(), VirtioError> {
+        let Some(blt) = self.present_blits.get(prepared.blt_index) else {
+            return Err(VirtioError::DeviceError);
+        };
+        if blt.command_buffer_id != prepared.command_buffer_id
+            || blt.destination_resource_id != prepared.destination.resource_id()
+        {
+            return Err(VirtioError::DeviceError);
+        }
+        Ok(())
+    }
+
+    fn note_prepared_present_blt_submit(
+        &mut self,
+        adapter: &AdapterContext,
+        prepared: PreparedPresentBltSubmission,
+        fence_id: u64,
+    ) {
+        let blt = &mut self.present_blits[prepared.blt_index];
+        blt.last_wire_fence_id = fence_id;
+        blt.submit_count = blt.submit_count.saturating_add(1);
+        let run_probe = if adapter.present_probe()
+            && blt.submit_count >= PRESENT_PROBE_AFTER_SUBMITS
+            && !blt.probe_done
+        {
+            // Claim the one-shot before doing any fallible work. Even a failed
+            // diagnostic can therefore never recur on the Present path.
+            blt.probe_done = true;
+            true
+        } else {
+            false
         };
         if run_probe {
-            if let PresentDestinationDesc::StandardBuffer(destination) = destination {
-                // ARM ONLY. The probe itself runs on the PASSIVE display worker,
-                // outside this mutex and off the Present path (R320).
+            if let PresentDestinationDesc::StandardBuffer(destination) = prepared.destination {
                 self.probe_pending = Some((destination, fence_id));
                 adapter
                     .probe_pending
                     .store(1, core::sync::atomic::Ordering::Release);
             }
         }
+    }
+
+    /// Submit a cache-prepared BLT only after the exact Present token was
+    /// admitted by SubmitCommand. This must never be called from Present.
+    pub fn submit_prepared_present_blt(
+        &mut self,
+        adapter: &AdapterContext,
+        prepared: PreparedPresentBltSubmission,
+        token: u64,
+        stream_boundary: u64,
+    ) -> Result<u64, VirtioError> {
+        self.validate_prepared_present_blt(prepared)?;
+        let command_buffer_id = prepared.command_buffer_id;
+        let submit = self.encode_command_buffer_submit(command_buffer_id);
+        let fence_id = ctrl::submit_venus_async_windowed_blt(
+            self.passive(),
+            adapter,
+            self.ctx_id(),
+            submit.as_slice()?,
+            token,
+            stream_boundary,
+        )?;
+        self.note_prepared_present_blt_submit(adapter, prepared, fence_id);
         Ok(fence_id)
     }
 

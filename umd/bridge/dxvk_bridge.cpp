@@ -54,6 +54,7 @@
 #include "d3d11_context_def.h"
 #include "d3d11_texture.h"
 #include "d3d11_context_imm.h"
+#include "dxvk_helios_feed_trace.h"
 #include "dxvk_helios_present_sync.h"
 
 // After the DXVK headers: see the include-order note in this header.
@@ -446,6 +447,20 @@ std::size_t HeliosDxvkDevice::d3d11_context_ptr() const {
 
 std::uint32_t HeliosDxvkDevice::venus_context_id() const {
   return impl ? impl->venus_ctx_id : 0;
+}
+
+std::uint64_t HeliosDxvkDevice::feed_trace_timestamp_ns() const noexcept {
+  return dxvk::helios_feed::timestampNs();
+}
+
+void HeliosDxvkDevice::feed_trace_render_callback(
+    std::uint64_t duration_ns) const noexcept {
+  dxvk::helios_feed::umdRenderCallback(duration_ns);
+}
+
+void HeliosDxvkDevice::feed_trace_present_callback(
+    std::uint64_t duration_ns) const noexcept {
+  dxvk::helios_feed::umdPresentCallback(duration_ns);
 }
 
 bool HeliosDxvkDevice::recycle_deferred_command_list(
@@ -1225,7 +1240,11 @@ bool HeliosDxvkDevice::publish_present_order(std::size_t d3d11_resource_ptr,
     }
 
     if (initialize_present_fence) {
-      // One named timeline per D3D11 device. A NULL DACL is deliberate and is
+      // One generation-qualified named timeline per D3D11 device. The process
+      // creation time is the same exact generation stored in HPS2; including
+      // it in the kernel name prevents a persistent slot from resolving to a
+      // later process that reused both pid and this DLL-local fence id. A NULL
+      // DACL is deliberate and is
       // the reason this needs a security descriptor at all: the consumer is
       // dwm, which runs as its own principal (Window Manager\DWM-N), so the
       // default descriptor -- owner-only -- would make the name unopenable and
@@ -1252,8 +1271,13 @@ bool HeliosDxvkDevice::publish_present_order(std::size_t d3d11_resource_ptr,
       // `createFence` enters Vulkan and the private registration enters the
       // ICD/KMD, so neither runs under present_order_mutex.
       try {
+        const std::uint64_t producerStart =
+          dxvk::HeliosPresentSync::processStartTime();
+        if (!producerStart)
+          throw dxvk::DxvkError(std::string("Could not resolve producer process generation"));
         const std::wstring name = L"Global\\HeliosPresentFence_"
           + std::to_wstring(static_cast<unsigned long>(GetCurrentProcessId()))
+          + L"_" + std::to_wstring(producerStart)
           + L"_" + std::to_wstring(fenceId);
         dxvk::DxvkFenceCreateInfo fenceInfo = { };
         fenceInfo.initialValue = 0u;
@@ -1543,7 +1567,8 @@ std::int32_t HeliosDxvkDevice::present_vehicle_copy(
 
 std::int32_t HeliosDxvkDevice::present_snapshot_copy(
     std::size_t dst_resource_ptr,
-    std::size_t src_resource_ptr) const {
+    std::size_t src_resource_ptr,
+    bool windowed_blt_reservation) const {
   if (!impl || !impl->context || !dst_resource_ptr || !src_resource_ptr)
     return -1;
 
@@ -1573,8 +1598,15 @@ std::int32_t HeliosDxvkDevice::present_snapshot_copy(
         1u,
       };
 
-      static_cast<dxvk::D3D11ImmediateContext*>(impl->context)
-        ->HeliosCopyPresentSnapshot(dstImage, srcImage, extent);
+      if (!static_cast<dxvk::D3D11ImmediateContext*>(impl->context)
+            ->HeliosCopyPresentSnapshot(
+              dstImage, srcImage, extent, windowed_blt_reservation)) {
+        // A WindowedBlt reader lease is reserved by KMD Present. Without the
+        // pre-arm reservation the producer list could wait on that same lease,
+        // so this is a hard snapshot refusal, never a best-effort copy.
+        umd_log("present_snapshot_copy: WindowedBlt reuse reservation unavailable");
+        return -1;
+      }
 
       // A mismatch means the ring was built against stale geometry. The min
       // region has been copied, but the caller must NOT substitute this
