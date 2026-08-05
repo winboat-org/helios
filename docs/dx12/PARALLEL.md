@@ -42,7 +42,7 @@ functional groups almost never touch the same state.
 
 ⇒ **Authoring and compiling parallelise. Validating does not.**
 ⭐ And they parallelise *without touching the VM at all*: every lane's inner loop is
-edit → `cargo check --target x86_64-pc-windows-msvc` **on the Linux host** (§7). That sidesteps the
+edit → `tools/umd12-host-check.sh` **on the Linux host** (§7). That sidesteps the
 whole list above — no mirror, no adapter, no knobs, 7 seconds. Deploy, gate and benchmark go through
 a **lease** (§6), and there are far fewer of those than there are edits.
 
@@ -173,9 +173,22 @@ registry knob write, and `-Mode release`.
 
 ```bash
 rustup target add x86_64-pc-windows-msvc          # once, on the Linux host
-cd umd12 && CARGO_TARGET_DIR=target/linux \
-    cargo check --target x86_64-pc-windows-msvc   # 7.4 s, full DDI surface
+tools/umd12-host-check.sh                         # 7.4 s, full DDI surface
+tools/umd12-host-check.sh --message-format short  # args forward to cargo check
 ```
+
+⚠ **Use the script, not a bare `cargo check`** — since S4 put `cxx` in the tree, the bare command
+does not work. `cxx` pulls `link-cplusplus`, whose build script runs a `cc::Build` probe for the
+*target*; cross-compiling to `x86_64-pc-windows-msvc` from Linux there is no MSVC toolchain and it
+dies with ``failed to find tool "lib.exe"``, taking the whole check down. The script supplies
+cargo's first-class `[target.<triple>.<links>]` build-script overrides for the two `links` keys
+involved (`cplusplus` = `link-cplusplus`, `cxxbridge1` = `cxx`) so neither build script runs.
+⛔ Those overrides are passed with `--config` **on the command line and never committed to
+`.cargo/config.toml`**: that file is read on **both** platforms (`CLAUDE.md`), so an override there
+would also skip cxx's build script on the real Windows build and silently produce a
+`helios_umd12.dll` with no bridge object in it. ⛔ For the same reason the script is `check` only —
+with the build scripts elided there is no `cxxbridge1` static lib to link, so a `build` here would
+be a lie; the shipping build stays `tools\umd-check.ps1 -Mode release -Crate umd12` on the VM.
 
 The obvious objection is *"the WDK is not on Linux"*, and it is correct — but **bindgen does not
 need to run there.** It runs on the VM, where the WDK is, and the host only needs the *generated
@@ -269,7 +282,7 @@ reviewer adds nothing a `grep` does not, and an agent's attention is better spen
 | no `panic!` / `todo!` / `unimplemented!` / `.unwrap()` / `.expect()` on runtime data | a panic in any DDI is a **silent graphics deadlock**; `panic = "abort"` makes it a dead compositor |
 | no `#[allow(...)]` on a hand-written line | generated code may be allowed, hand-written code may not — R908 |
 | `grep -rnE '^[[:space:]]*static_assert\(' umd/bridge umd12/bridge umd_common/bridge` → **1** | `ead692e`. ⚠ the **anchor** is what works — both the bare word and the trailing-paren form count the comments that quote them, and reported 3. ⛔ never `git grep`: it skips untracked files, so a new `umd12/bridge/` reads 0 |
-| `cargo clippy --target x86_64-pc-windows-msvc -- -D warnings` | 214 hand-written handlers is where `missing_safety_doc` earns its keep |
+| `tools/umd12-host-check.sh --clippy -- -D warnings` | 214 hand-written handlers is where `missing_safety_doc` earns its keep. ⚠ **Through the script, not a bare `cargo clippy`** — the bare form dies in `link-cplusplus`'s build script with an error naming `lib.exe` and nothing about clippy (§7), so a lane reads it as a broken tree and drops the row. It caught a real one the moment it was wired up: `umd12`'s `OpenAdapter12` had no `# Safety` section |
 | `git diff` on the four shared files is append-only | §5 |
 
 Agents take the residue — the judgement calls a grep flags but cannot settle (*is this `.unwrap()`
