@@ -393,12 +393,11 @@ pub(crate) unsafe extern "C" fn clear_view_11_1(
         trace_line!("DDI D3D11.1 ClearView: type={view_type} rects={num_rects}");
     }
     if view_type != ddi::D3D11DDI_HANDLETYPE_D3D10DDI_HT_RENDERTARGETVIEW {
-        // Already loud -- this arm logs. Bump the field directly instead of
-        // going through `note_ddi_refusal`, which would add a SECOND line for
-        // the same event. R911 is explicit about not doing that here.
-        DDI_REFUSALS
-            .clear_view_unsupported
-            .fetch_add(1, Ordering::Relaxed);
+        // Already loud -- this arm logs. `bump()` instead of
+        // `note_ddi_refusal`, which would add a SECOND line for the same event.
+        // R911 is explicit about not doing that here, and `bump` is the named
+        // form of exactly that intent (stage S2).
+        DDI_REFUSALS.clear_view_unsupported.bump();
         log_error!("DDI D3D11.1 ClearView UNSUPPORTED view type {view_type} — clear dropped");
         return;
     }

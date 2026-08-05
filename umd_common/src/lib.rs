@@ -49,9 +49,12 @@
 //! | `refusals` / `noop` | `umd/src/forward.rs`, `umd/src/device_funcs.rs` | ⏳ S2 — the MECHANISM moves, generalised to `RefusalCounter { count, name }`; the eleven D3D11 counter fields stay in `umd` |
 //! | [`slot`] | `umd/src/forward/handles.rs` | ✅ moved (`#[cfg(windows)]`) |
 //! | C++ `bridge/` | `umd/bridge/` | ✅ moved — `bridge_common.h`, `bridge_util.h` (`PeriodicStat`, `qpc_elapsed_us`, `ComRelease<T>`), `bridge_guard.h` |
-//! | `log` | `umd/src/log.rs` | ⏳ S2 — needs `init(basename)` so D3D11 keeps `umd-<pid>.log` and D3D12 writes `umd12-<pid>.log` |
-//! | `knobs` | `umd/src/knobs.rs` | ⏳ S2 — the `reg_dword` FFI site and the inventory mechanism move; the knob VALUES stay per-crate |
-//! | `refusals` / `noop` | `umd/src/forward.rs`, `umd/src/device_funcs.rs` | ⏳ S2 — the MECHANISM moves, generalised to `RefusalCounter { count, name }`; the eleven D3D11 counter fields stay in `umd` |
+//! | [`log`] | `umd/src/log.rs` | ✅ moved — with [`log::init`] so D3D11 keeps `umd-<pid>.log` and D3D12 writes `umd12-<pid>.log` |
+//! | [`knobs`] | `umd/src/knobs.rs` | ✅ moved — the `reg_dword` FFI site and the two knob policies. ⛔ The knob VALUES stay per-crate |
+//! | [`refusals`] | `umd/src/forward.rs` | ✅ moved — the MECHANISM, generalised to `RefusalCounter { count, name }`. ⛔ The eleven D3D11 counters stay in `umd` |
+//! | [`noop`] | `umd/src/device_funcs.rs` | ✅ moved — `UniformFn`, `log_backtrace`, the table stubber. ⛔ `ddi_calc_size`'s 256-byte answer did NOT move; that is a D3D11 claim |
+//!
+//! **S1–S2 are complete. This crate is what `umd12` builds on.**
 //!
 //! ⛔ **`slot` moved the code and NOT the claim.** The
 //! `Slot<Boxed<S>>::get() -> &'static S` soundness argument rests on the D3D11
@@ -69,7 +72,20 @@
 
 pub mod format;
 pub mod hr;
-#[cfg(windows)]
-pub mod slot;
+pub mod refusals;
 pub mod throttle;
 pub mod window;
+
+// ── Windows-only ────────────────────────────────────────────────────────────
+// Everything below touches the registry, the loader, `RtlCaptureStackBackTrace`
+// or the `windows` crate, so it is gated. ⚠ Keep the gate: without it a plain
+// `cargo build` on the Linux host fails and takes `tools/format-table-check.rs`
+// — the only test of the DXGI format table that runs anywhere — with it.
+#[cfg(windows)]
+pub mod knobs;
+#[cfg(windows)]
+pub mod log;
+#[cfg(windows)]
+pub mod noop;
+#[cfg(windows)]
+pub mod slot;

@@ -122,6 +122,12 @@ pub(super) type Hdevice = ddi::D3D10DDI_HDEVICE;
 // resolve unchanged.
 pub(super) use helios_umd_common::throttle::LogThrottle;
 
+// The refusal-counter MECHANISM (`DECISIONS.md` D3b, stage S2). ⛔ Only the
+// mechanism is shared: the eleven counters below are this driver's, and
+// `umd12` declares its own set. `CONFORMANCE.md`'s charter reads
+// `DDI refusals:` per driver.
+use helios_umd_common::refusals::{self, RefusalCounter};
+
 pub(super) static RESOURCE_LOG_COUNT: LogThrottle = LogThrottle::new();
 pub(super) static CREATE_RESOURCE_IDENTITY_LOG_COUNT: LogThrottle = LogThrottle::new();
 pub(super) static VIEW_LOG_COUNT: LogThrottle = LogThrottle::new();
@@ -291,37 +297,37 @@ fn device_is_live(device: usize) -> bool {
 /// different.
 struct DdiRefusals {
     /// `pfnResourceReadAfterWriteHazard` for an SRV — empty body.
-    srv_raw_hazard: AtomicUsize,
+    srv_raw_hazard: RefusalCounter,
     /// `pfnResourceReadAfterWriteHazard` for a resource — empty body.
-    resource_raw_hazard: AtomicUsize,
+    resource_raw_hazard: RefusalCounter,
     /// `pfnSetTextFilterSize` — empty body.
-    text_filter_size_ignored: AtomicUsize,
+    text_filter_size_ignored: RefusalCounter,
     /// `pfnResourceIsStagingBusy` returning 0. NOT a no-op: that is the
     /// semantic claim "never busy", which the runtime acts on.
-    staging_busy_assumed_free: AtomicUsize,
+    staging_busy_assumed_free: RefusalCounter,
     /// `pfnDiscard` with `num_rects != 0` — the partial discard is dropped.
     /// Well reasoned (upstream DXVK does the same, and forwarding partial
     /// discards as full-view discards wiped the undamaged 99% of DWM's flip
     /// backbuffer), but it was uncounted AND unlogged once the 64-line budget
     /// was spent.
-    discard_partial: AtomicUsize,
+    discard_partial: RefusalCounter,
     /// `pfnClearView` for a non-RTV view type — the clear is dropped. This one
     /// already logs its refusal, so it was uncounted but never silent; no
     /// second log line is added.
-    clear_view_unsupported: AtomicUsize,
+    clear_view_unsupported: RefusalCounter,
     /// `pfnCreateGeometryShaderWithStreamOutput` — the SO declaration is
     /// discarded and a plain GS is created. The most consequential of the nine:
     /// `SOSetTargets` then binds buffers that are never written and `DrawAuto`
     /// reads zero vertices, so the app renders nothing with nothing recording
     /// that SO capture was dropped.
-    gs_so_declaration_dropped: AtomicUsize,
+    gs_so_declaration_dropped: RefusalCounter,
     /// Hull/domain shader creates taking the signature-less fallback.
     /// Expected to MOVE under 3DMark; the UB against SINT inputs noted at the
     /// fallback is NOT fixed here — it is made countable, which is the
     /// precondition for fixing it against a real workload.
-    tess_sig_fallback: AtomicUsize,
+    tess_sig_fallback: RefusalCounter,
     /// `create_resource` with a resource dimension outside the four we handle.
-    unhandled_resource_dimension: AtomicUsize,
+    unhandled_resource_dimension: RefusalCounter,
     /// A DXGI format with no legacy D3DDDIFORMAT spelling, stamped into the
     /// KMD allocation meta as `D3DDDIFMT_UNKNOWN` (0).
     ///
@@ -333,7 +339,7 @@ struct DdiRefusals {
     /// separately in `dxgi_format`, which is what every consumer that needs
     /// bpp/layout reads), so this counts rather than refuses -- but it was the
     /// one silent path the format table's readers still had.
-    alloc_meta_format_unknown: AtomicUsize,
+    alloc_meta_format_unknown: RefusalCounter,
     /// `maybe_log_present_readback` refusing to sample a mapped surface whose
     /// `dxgi_bytes_per_pixel` stride would leave the mapped row.
     ///
@@ -342,22 +348,43 @@ struct DdiRefusals {
     /// debugging path rather than a live one -- but it was reading out of
     /// bounds for a genuinely 16-bpp or block-compressed surface, and a
     /// refusal has to be countable like every other.
-    readback_stride_unsafe: AtomicUsize,
+    readback_stride_unsafe: RefusalCounter,
 }
 
+/// ⚠ Each counter now carries its own NAME (`RefusalCounter`, stage S2), so
+/// the summary below is built by iterating a slice instead of by a
+/// hand-written format string with one `{}` per field. That shape made adding
+/// a twelfth counter a three-place edit whose third place -- the format
+/// string -- was silently optional.
 static DDI_REFUSALS: DdiRefusals = DdiRefusals {
-    srv_raw_hazard: AtomicUsize::new(0),
-    resource_raw_hazard: AtomicUsize::new(0),
-    text_filter_size_ignored: AtomicUsize::new(0),
-    staging_busy_assumed_free: AtomicUsize::new(0),
-    discard_partial: AtomicUsize::new(0),
-    clear_view_unsupported: AtomicUsize::new(0),
-    gs_so_declaration_dropped: AtomicUsize::new(0),
-    tess_sig_fallback: AtomicUsize::new(0),
-    unhandled_resource_dimension: AtomicUsize::new(0),
-    alloc_meta_format_unknown: AtomicUsize::new(0),
-    readback_stride_unsafe: AtomicUsize::new(0),
+    srv_raw_hazard: RefusalCounter::new("srv_raw_hazard"),
+    resource_raw_hazard: RefusalCounter::new("resource_raw_hazard"),
+    text_filter_size_ignored: RefusalCounter::new("text_filter_size_ignored"),
+    staging_busy_assumed_free: RefusalCounter::new("staging_busy_assumed_free"),
+    discard_partial: RefusalCounter::new("discard_partial"),
+    clear_view_unsupported: RefusalCounter::new("clear_view_unsupported"),
+    gs_so_declaration_dropped: RefusalCounter::new("gs_so_declaration_dropped"),
+    tess_sig_fallback: RefusalCounter::new("tess_sig_fallback"),
+    unhandled_resource_dimension: RefusalCounter::new("unhandled_resource_dimension"),
+    alloc_meta_format_unknown: RefusalCounter::new("alloc_meta_format_unknown"),
+    readback_stride_unsafe: RefusalCounter::new("readback_stride_unsafe"),
 };
+
+/// The set, in the order the summary prints them. ⛔ This order is the
+/// evidence contract: `DDI refusals:` lines from different builds are diffed.
+static DDI_REFUSAL_SET: [&RefusalCounter; 11] = [
+    &DDI_REFUSALS.srv_raw_hazard,
+    &DDI_REFUSALS.resource_raw_hazard,
+    &DDI_REFUSALS.text_filter_size_ignored,
+    &DDI_REFUSALS.staging_busy_assumed_free,
+    &DDI_REFUSALS.discard_partial,
+    &DDI_REFUSALS.clear_view_unsupported,
+    &DDI_REFUSALS.gs_so_declaration_dropped,
+    &DDI_REFUSALS.tess_sig_fallback,
+    &DDI_REFUSALS.unhandled_resource_dimension,
+    &DDI_REFUSALS.alloc_meta_format_unknown,
+    &DDI_REFUSALS.readback_stride_unsafe,
+];
 
 /// One bounded log line carrying all eleven counters.
 ///
@@ -375,35 +402,18 @@ static DDI_REFUSALS: DdiRefusals = DdiRefusals {
 /// each counter (so a refusal that fires once in a session that never tears a
 /// device down is still visible).
 pub(crate) fn ddi_refusal_summary() -> String {
-    let r = &DDI_REFUSALS;
-    format!(
-        "DDI refusals: srv_raw_hazard={} resource_raw_hazard={} \
-         text_filter_size_ignored={} staging_busy_assumed_free={} \
-         discard_partial={} clear_view_unsupported={} \
-         gs_so_declaration_dropped={} tess_sig_fallback={} \
-         unhandled_resource_dimension={} alloc_meta_format_unknown={} \
-         readback_stride_unsafe={}",
-        r.srv_raw_hazard.load(Ordering::Relaxed),
-        r.resource_raw_hazard.load(Ordering::Relaxed),
-        r.text_filter_size_ignored.load(Ordering::Relaxed),
-        r.staging_busy_assumed_free.load(Ordering::Relaxed),
-        r.discard_partial.load(Ordering::Relaxed),
-        r.clear_view_unsupported.load(Ordering::Relaxed),
-        r.gs_so_declaration_dropped.load(Ordering::Relaxed),
-        r.tess_sig_fallback.load(Ordering::Relaxed),
-        r.unhandled_resource_dimension.load(Ordering::Relaxed),
-        r.alloc_meta_format_unknown.load(Ordering::Relaxed),
-        r.readback_stride_unsafe.load(Ordering::Relaxed),
-    )
+    refusals::summary("DDI refusals:", &DDI_REFUSAL_SET)
 }
 
 /// Bump one refusal counter and emit the summary on its FIRST hit.
 ///
-/// Taking `&AtomicUsize` rather than a field name keeps the call sites one line
-/// and makes "increment without a readout" — the defect this whole item exists
-/// to close — impossible to write by accident.
-fn note_ddi_refusal(counter: &AtomicUsize) {
-    if counter.fetch_add(1, Ordering::Relaxed) == 0 {
+/// Taking `&RefusalCounter` rather than a field name keeps the call sites one
+/// line and makes "increment without a readout" — the defect this whole item
+/// exists to close — impossible to write by accident. `note()` is
+/// `#[must_use]` in `umd_common`, so dropping the first-hit signal does not
+/// compile.
+fn note_ddi_refusal(counter: &RefusalCounter) {
+    if counter.note() {
         log_error!("{}", ddi_refusal_summary());
     }
 }

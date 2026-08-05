@@ -36,15 +36,15 @@ mod device_funcs;
 mod forward;
 mod knobs;
 
-mod log;
 mod scanout_acquire;
 mod vehicle_exports;
 
-// `format` and `hr` moved to the shared `umd_common` crate (`DECISIONS.md` D3b,
-// stage S1). Re-exported at the crate root under their original names so every
-// `crate::format::…` / `crate::hr::…` path in this crate resolves unchanged —
+// `format` and `hr` moved to the shared `umd_common` crate at stage S1, `log`
+// (with the rest of the mechanisms) at S2 (`DECISIONS.md` D3b). Re-exported at
+// the crate root under their original names so every `crate::format::…`,
+// `crate::hr::…` and `crate::log::…` path in this crate resolves unchanged —
 // the move is a relocation, not a rename, and no call site was touched.
-pub(crate) use helios_umd_common::{format, hr};
+pub(crate) use helios_umd_common::{format, hr, log};
 
 /// The DLL entry point, present for exactly one reason: to release this
 /// module's process-lifetime handles when it is unloaded.
@@ -80,16 +80,32 @@ pub extern "system" fn DllMain(
 }
 
 pub(crate) use knobs::{
-    feature_level_mode, scanout_acquire_knob, scanout_snapshot_knob, trace_enabled,
+    feature_level_mode, log_knob_inventory, scanout_acquire_knob, scanout_snapshot_knob,
     umd_async_present_stream, umd_command_lists, umd_deferred_diagnostics, umd_free_threaded,
     vehicle_flip_gate_us,
 };
-pub(crate) use log::{log_error, log_knob_inventory, log_self_module_path, trace_line};
+// The two writers are `#[macro_export]`ed by `umd_common`, so they live at that
+// crate's root rather than in its `log` module. Re-exported here under their
+// original names: every `crate::log_error!` / `crate::trace_line!` call site —
+// ~430 of them — is untouched by the move.
+pub(crate) use helios_umd_common::{log_error, trace_line};
+pub(crate) use log::{log_self_module_path, trace_enabled};
 // R420's `#![deny(deprecated)]` guard, preserved across the move: `log_line` is
 // `#[deprecated]` so that only `trace_line!` and `log_error!` may reach the
-// unconditional writer. The re-export has to name it once; every CALL site that
-// names `crate::log_line` still trips the deny, which is the whole guarantee.
-#[allow(deprecated)]
+// unconditional writer. Deprecation is CROSS-CRATE, so the guarantee survives
+// `log_line` living in `umd_common` — verified by fault injection at each move.
+// The re-export has to name it once; every CALL site that names
+// `crate::log_line` still trips the deny, which is the whole guarantee.
+//
+// ⚠ It is now referenced by nothing, and that is its job. The macros resolve
+// `$crate::log::log_line` inside `umd_common`, so this import exists ONLY to
+// keep the name `crate::log_line` resolvable — which is what makes the
+// documented fault injection ("add a bare `crate::log_line("x")` to a
+// `forward/*` file") fail with *use of deprecated function* rather than with an
+// unresolved-path error. A guard that fails for the wrong reason is not the
+// guard. `allow(unused_imports)` states that, rather than deleting a test
+// surface to silence a warning.
+#[allow(deprecated, unused_imports)]
 pub(crate) use log::log_line;
 
 pub(crate) use caps::get_caps;

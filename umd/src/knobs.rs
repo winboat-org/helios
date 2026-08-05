@@ -55,102 +55,14 @@
 //! `HELIOS_PRESENT_DUMP_DIR` (`forward.rs`). They are listed here so the knob
 //! inventory is readable in one place even though the reader is not shared.
 
-use core::ffi::{c_void, CStr};
-use std::sync::OnceLock;
+use helios_umd_common::knobs::{BoolKnob, DwordKnob};
 
-#[link(name = "advapi32")]
-unsafe extern "system" {
-    fn RegGetValueA(
-        hkey: usize,
-        sub_key: *const u8,
-        value: *const u8,
-        flags: u32,
-        type_out: *mut u32,
-        data: *mut c_void,
-        data_len: *mut u32,
-    ) -> i32;
-}
-
-const HKEY_LOCAL_MACHINE: usize = 0x8000_0002;
-const RRF_RT_REG_DWORD: u32 = 0x10;
-const SUBKEY: &CStr = c"SOFTWARE\\Helios";
-
-/// Read one REG_DWORD from `HKLM\SOFTWARE\Helios`, or `None` if it is absent,
-/// unreadable or not a DWORD.
-///
-/// The single audited FFI site. Every knob below funnels through it.
-fn reg_dword(name: &CStr) -> Option<u32> {
-    let mut value: u32 = 0;
-    let mut len: u32 = 4;
-    // SAFETY: both names are NUL-terminated `CStr`s that outlive the call;
-    // `value`/`len` are stack locals borrowed only for its duration, and
-    // RRF_RT_REG_DWORD makes advapi32 refuse to write more than the 4 bytes
-    // `len` advertises.
-    let rc = unsafe {
-        RegGetValueA(
-            HKEY_LOCAL_MACHINE,
-            SUBKEY.as_ptr().cast(),
-            name.as_ptr().cast(),
-            RRF_RT_REG_DWORD,
-            core::ptr::null_mut(),
-            (&mut value as *mut u32).cast(),
-            &mut len,
-        )
-    };
-    if rc == 0 {
-        Some(value)
-    } else {
-        None
-    }
-}
-
-/// A REG_DWORD knob read once per process, with its absent-value default
-/// written at the definition site.
-pub(crate) struct DwordKnob {
-    name: &'static CStr,
-    default: u32,
-    cell: OnceLock<u32>,
-}
-
-impl DwordKnob {
-    pub(crate) const fn new(name: &'static CStr, default: u32) -> Self {
-        Self {
-            name,
-            default,
-            cell: OnceLock::new(),
-        }
-    }
-
-    pub(crate) fn get(&self) -> u32 {
-        *self
-            .cell
-            .get_or_init(|| reg_dword(self.name).unwrap_or(self.default))
-    }
-}
-
-/// A REG_DWORD knob interpreted as a flag: absent means `default`, present
-/// means `value != 0`.
-pub(crate) struct BoolKnob {
-    name: &'static CStr,
-    default: bool,
-    cell: OnceLock<bool>,
-}
-
-impl BoolKnob {
-    pub(crate) const fn new(name: &'static CStr, default: bool) -> Self {
-        Self {
-            name,
-            default,
-            cell: OnceLock::new(),
-        }
-    }
-
-    pub(crate) fn get(&self) -> bool {
-        *self
-            .cell
-            .get_or_init(|| reg_dword(self.name).map_or(self.default, |v| v != 0))
-    }
-}
+// ⚠ `reg_dword` (the single audited advapi32 FFI site), `DwordKnob` and
+// `BoolKnob` moved to `helios_umd_common::knobs` (`DECISIONS.md` D3b, stage S2).
+// ⛔ THE KNOB VALUES DID NOT MOVE and must not: D3b says "the knob values stay
+// per-crate -- `umd12` declares its own set including `UmdD3D12`". Sharing the
+// table would make one driver's A/B lever silently apply to the other, and
+// `UserModeDriverName[3]` is meant to be the only coupling between them.
 
 // --- The knob set ----------------------------------------------------------
 //
@@ -274,6 +186,17 @@ pub(crate) static UMD_DEFERRED_DIAGNOSTICS: BoolKnob = BoolKnob::new(c"UmdDeferr
 /// Each entry is `(value name, resolved value as text)`. Resolving forces every
 /// `OnceLock`, which is why this is not called on any hot path — it exists for
 /// a one-shot dump at load, and for anyone asking "what knobs are there".
+/// Emit this crate's knob inventory through the shared reader, once per process.
+///
+/// The thin wrapper D3b's split implies: the READER is shared
+/// (`helios_umd_common::log::log_knob_inventory`) because the log format is the
+/// evidence contract, while the SET is per-crate. `crate::log_knob_inventory()`
+/// keeps resolving at its one call site in `open_adapter_common`, and the
+/// emitted lines are byte-identical to before the move — which is `S2-check`.
+pub(crate) fn log_knob_inventory() {
+    helios_umd_common::log::log_knob_inventory(&resolved_inventory());
+}
+
 pub(crate) fn resolved_inventory() -> [(&'static str, u32); 10] {
     [
         ("UmdTrace", UMD_TRACE.get() as u32),
@@ -296,12 +219,22 @@ pub(crate) fn resolved_inventory() -> [(&'static str, u32); 10] {
 // `crate::feature_level_mode()` and `crate::vehicle_flip_gate_us()` still
 // resolve at every call site.
 
-/// Whether per-frame/per-op DDI chatter (`trace_line!`) is enabled:
-/// `HKLM\SOFTWARE\Helios!UmdTrace` (REG_DWORD) != 0. Read once per process.
-/// Errors, one-shots and refusals keep using [`log_line`] unconditionally —
+/// Resolve `HKLM\SOFTWARE\Helios!UmdTrace` (REG_DWORD) != 0, forcing its
+/// `OnceLock`. Read once per process.
+///
+/// ⚠ This is the KNOB. The GATE that `trace_line!` consults is
+/// `helios_umd_common::log::trace_enabled()`, which caches this answer in a
+/// relaxed `AtomicBool` at `log::init` time (stage S2). Two names for what used
+/// to be one function, and the split is deliberate: `trace_line!` expands at
+/// ~430 sites, many per-op, so the gate must be one relaxed load and not a
+/// `OnceLock` walk through a knob table the shared crate cannot see.
+/// `crate::trace_enabled()` now re-exports the GATE, so every call site reads
+/// the cached answer.
+///
+/// Errors, one-shots and refusals keep using `log_error!` unconditionally —
 /// only known-hot repeat traffic (Present, OMSetRenderTargets,
-/// ResolveSharedResource, per-op stamps) sits behind this gate.
-pub(crate) fn trace_enabled() -> bool {
+/// ResolveSharedResource, per-op stamps) sits behind the gate.
+pub(crate) fn umd_trace_knob() -> bool {
     UMD_TRACE.get()
 }
 

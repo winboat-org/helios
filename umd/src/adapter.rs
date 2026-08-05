@@ -192,6 +192,24 @@ unsafe fn open_adapter_common(
     open_data: *mut ddi::D3D10DDIARG_OPENADAPTER,
     with_10_2: bool,
 ) -> Hresult {
+    // ⚠ FIRST, above the first `log_error!` below and above anything that
+    // consults the trace gate. `helios_umd_common::log` is shared with
+    // `helios_umd12.dll` (stage S2), so each module must name its own log file
+    // and resolve its own trace knob before it writes a line — two drivers
+    // appending to one file would interleave unreadably and break every piece
+    // of evidence that reads the log per module.
+    //
+    // ⛔ The basename is `"umd"`, which is also `umd_common`'s default, so this
+    // call cannot change where D3D11 logs. That is deliberate: S2 must leave the
+    // D3D11 path provably unchanged, and it makes the SECOND driver the one that
+    // has to name itself. `LOG_INIT_LATE` counts the failure.
+    //
+    // `OpenAdapter` is the first entry point dxgkrnl calls on this module, so
+    // this is the earliest reachable point. ⚠ `OpenAdapter12` above logs before
+    // it — harmless only because of the default; when `umd12` takes slot 3 at
+    // S5 that export leaves this DLL entirely.
+    crate::log::init("umd", crate::knobs::umd_trace_knob());
+
     if open_data.is_null() {
         log_error!("open_adapter_common null open_data");
         return E_NOTIMPL;

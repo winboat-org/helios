@@ -643,38 +643,20 @@ pub fn device_private_size() -> usize {
     core::mem::size_of::<HeliosDevice>()
 }
 
-/// Uniform stub signature (one machine word in, one out).
-type UniformFn = unsafe extern "C" fn(usize) -> usize;
+// `UniformFn` and `log_backtrace` moved to `helios_umd_common::noop`
+// (`DECISIONS.md` D3b, stage S2) — a WDDM UMD of either D3D version must fill
+// every slot of a table it is handed, so the stub signature, the counting
+// idiom and the one-shot backtrace are engine- and version-agnostic.
+// Re-exported at their original paths so no call site in this crate moved.
+use helios_umd_common::noop::{stub_fill_sized_table, UniformFn};
+// `pub(crate)`, matching what this module exported before the move:
+// `forward/deferred.rs` reaches for `crate::device_funcs::log_backtrace`.
+pub(crate) use helios_umd_common::noop::log_backtrace;
 
 static DEVICE_NOOP_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 static DXGI_NOOP_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 static WDDM13_TABLE_AUDIT_COUNT: AtomicUsize = AtomicUsize::new(0);
 static DXGI13_TABLE_AUDIT_COUNT: AtomicUsize = AtomicUsize::new(0);
-
-#[link(name = "kernel32")]
-extern "system" {
-    fn RtlCaptureStackBackTrace(
-        frames_to_skip: u32,
-        frames_to_capture: u32,
-        back_trace: *mut *mut c_void,
-        back_trace_hash: *mut u32,
-    ) -> u16;
-}
-
-pub(crate) unsafe fn log_backtrace(tag: &str) {
-    let mut frames = [core::ptr::null_mut::<c_void>(); 32];
-    let captured = RtlCaptureStackBackTrace(
-        0,
-        frames.len() as u32,
-        frames.as_mut_ptr(),
-        core::ptr::null_mut(),
-    );
-    let mut out = String::new();
-    for i in 0..captured as usize {
-        out.push_str(&format!(" #{i}=0x{:x}", frames[i] as usize));
-    }
-    log_error!("{tag} stack{out}");
-}
 
 /// No-op DDI stub: returns 0 (S_OK for HRESULT funcs; ignored for void funcs).
 ///
@@ -1136,11 +1118,14 @@ pub unsafe fn create_runtime_paging_queue(dev: &mut HeliosDevice) -> i32 {
 /// `Option<fn>`, and `T` must be a layout-compatible extension of
 /// `D3D11DDI_DEVICEFUNCS` (a WDK header property no Rust type can assert).
 unsafe fn stub_fill_device_table<T>(funcs: *mut T) -> *mut ddi::D3D11DDI_DEVICEFUNCS {
-    let n = core::mem::size_of::<T>() / core::mem::size_of::<usize>();
-    let slots = funcs as *mut Option<UniformFn>;
-    for i in 0..n {
-        *slots.add(i) = Some(ddi_noop_device);
-    }
+    // ⚠ Deriving the slot count from `size_of::<T>()` is correct HERE and only
+    // here: the d3d10umddi device-funcs tables carry no size argument, so the
+    // type IS the contract. `d3d12umddi`'s `pfnFillDDITable` passes a `SIZE_T`
+    // (`:2527-2528`) and the D3D12 filler must use it — `umd_common`'s
+    // `stub_fill_bytes` is that primitive, and this is the convenience on top.
+    // ARCHITECTURE §12 rule 16 / R702: 24H2 passed 576 bytes for a 592-byte
+    // DRIVERCAPS.
+    unsafe { stub_fill_sized_table(funcs, ddi_noop_device) };
     funcs as *mut ddi::D3D11DDI_DEVICEFUNCS
 }
 

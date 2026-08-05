@@ -1,14 +1,107 @@
 //! The UMD's per-process log file and the two macros that write to it.
 //!
-//! Moved verbatim out of `lib.rs` by T8/R1106. `lib.rs` re-exports `log_line`,
-//! `trace_line!` and `log_error!` so the ~2000 call sites across `forward.rs`,
-//! `device_funcs.rs` and `bridge.rs` -- and the macro bodies' own
-//! `crate::log_line` paths -- are untouched.
+//! Moved from `umd/src/log.rs` (`DECISIONS.md` D3b, stage S2). It arrived there
+//! from `lib.rs` by T8/R1106; this is the second relocation and, like the first,
+//! every call site is untouched — `umd/src/lib.rs` re-exports `log_error`,
+//! `trace_line`, `log_line`, `log_self_module_path` and `log_knob_inventory` at
+//! the crate root, so the ~430 macro uses across `forward/*`, `device_funcs.rs`
+//! and `adapter.rs` still name `crate::…`.
+//!
+//! # The one thing that is genuinely new: [`init`]
+//!
+//! D3D11 keeps `umd-<pid>.log` and D3D12 gets `umd12-<pid>.log`. ⛔ **Two
+//! drivers appending to one file would interleave unreadably** and would break
+//! the evidence discipline that reads them per module — the id-1000 check, the
+//! knob inventory, `tools/capture-knob-inventory.ps1`. The C++ bridges draw the
+//! same line: `bridge_common.h` declares `umd_log` and each bridge defines it.
+//!
+//! ⚠ The basename defaults to `"umd"`, deliberately. That makes the D3D11 path
+//! **provably unchanged** by this move — which is S2's pass criterion — and puts
+//! the burden of calling [`init`] early on the crate that wants a different
+//! name. A late or missing `init` is not silent: see [`LOG_INIT_LATE`].
+//!
+//! # R420's guarantee, preserved across two crates
+//!
+//! [`log_line`] is `#[deprecated]` purely as an internal marker, and `umd`'s
+//! `#![deny(deprecated)]` turns a direct call into a compile ERROR. Deprecation
+//! is cross-crate, so the guarantee survives the move: only [`trace_line!`] and
+//! [`log_error!`] — each wrapping the call in `#[allow(deprecated)]` at the
+//! expansion site — may reach the unconditional writer. Verified by fault
+//! injection each time this moves.
 
 use core::ffi::c_void;
 use std::io::Write;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::OnceLock;
 
-use crate::knobs;
+/// The log basename, set by [`init`]. `"umd"` when nothing set it.
+static BASENAME: OnceLock<&'static str> = OnceLock::new();
+
+/// The resolved log path. Latched by the first [`umd_log_path`] call, which is
+/// the first log line of any kind — [`init`] reads it to detect being too late.
+static LOG_PATH: OnceLock<std::path::PathBuf> = OnceLock::new();
+
+/// Whether per-op trace traffic is enabled, resolved once by [`init`].
+///
+/// ⚠ A plain relaxed `AtomicBool` load, NOT a call through a registered
+/// `fn() -> bool`. `trace_line!` expands at ~430 sites, many of them per-op, and
+/// an indirect call on every one of them is a perf change — which in stage S2 is
+/// a defect, not an improvement. The knob VALUE still lives in the calling
+/// crate (D3b: "the knob values stay per-crate"); only its resolved answer is
+/// cached here.
+static TRACE: AtomicBool = AtomicBool::new(false);
+
+/// [`init`] calls that arrived after the log path was already latched, with a
+/// DIFFERENT basename — i.e. something logged before the driver named itself
+/// and the lines went to the wrong module's file.
+///
+/// CLAUDE.md rule 2: every skipped path gets a named counter. Expected 0. A
+/// non-zero value here (and the `log_error!` on the first hit) is what stops
+/// `umd12` silently appending to `umd-<pid>.log` forever.
+pub static LOG_INIT_LATE: AtomicUsize = AtomicUsize::new(0);
+
+/// Name this module's log file and resolve its trace gate. Call it **before the
+/// first line this driver logs** — for `umd` that is the top of
+/// `open_adapter_common`, which is the first entry point the runtime calls.
+///
+/// `basename` becomes `C:\ProgramData\Helios\<basename>-<pid>.log`.
+/// `trace` is the caller's own resolved `UmdTrace`-equivalent knob.
+///
+/// Idempotent, and loud if it is too late to matter.
+pub fn init(basename: &'static str, trace: bool) {
+    TRACE.store(trace, Ordering::Relaxed);
+    let _ = BASENAME.set(basename);
+
+    // ⚠ The check is on PATH, not on BASENAME. Setting the name late is
+    // harmless if nothing has logged yet; what is NOT recoverable is the log
+    // path having already been latched by an earlier line, because `PATH` is a
+    // `OnceLock` and the file handle behind it is process-lifetime. A
+    // `BASENAME.set` failure alone would also fire on the perfectly normal
+    // second `OpenAdapter` in one process, which is not a defect.
+    if let Some(path) = LOG_PATH.get() {
+        let want = format!("{basename}-{}.log", std::process::id());
+        if path.file_name().and_then(|s| s.to_str()) != Some(want.as_str())
+            && LOG_INIT_LATE.fetch_add(1, Ordering::Relaxed) == 0
+        {
+            crate::log_error!(
+                "UMD log init LATE: wanted {want}, but {} was already latched by an earlier \
+                 log line - this module's lines are in another module's file",
+                path.display()
+            );
+        }
+    }
+}
+
+/// Whether per-op/per-frame trace traffic ([`trace_line!`]) is enabled.
+///
+/// Answers `false` until [`init`] runs. That is the intended reading — a driver
+/// that has not opened its adapter yet has no per-op traffic to trace — and it
+/// is why `init` goes at the TOP of the adapter open, above the first
+/// `log_error!`.
+#[inline]
+pub fn trace_enabled() -> bool {
+    TRACE.load(Ordering::Relaxed)
+}
 
 /// Resolve the per-process UMD log path, computed once.
 ///
@@ -18,14 +111,21 @@ use crate::knobs;
 /// to a per-pid file under `C:\ProgramData\Helios\` instead: standard users may
 /// create files there (inherited ProgramData ACL), and a per-pid name means each
 /// process owns its own file with full control regardless of who created the dir.
-pub(crate) fn umd_log_path() -> &'static std::path::Path {
-    use std::sync::OnceLock;
-    static PATH: OnceLock<std::path::PathBuf> = OnceLock::new();
-    PATH.get_or_init(|| {
+///
+/// ⚠ The file is APPEND-ONLY and PIDs are reused across boots, so one file can
+/// hold several driver generations. Anything reading it for evidence must take
+/// the block after the last `UMD module:` line — `tools/capture-knob-inventory.ps1`
+/// exists because that is not obvious.
+pub fn umd_log_path() -> &'static std::path::Path {
+    LOG_PATH.get_or_init(|| {
         let dir = std::path::Path::new(r"C:\ProgramData\Helios");
         // Best effort: ignore AlreadyExists / permission errors.
         let _ = std::fs::create_dir_all(dir);
-        dir.join(format!("umd-{}.log", std::process::id()))
+        dir.join(format!(
+            "{}-{}.log",
+            BASENAME.get().copied().unwrap_or("umd"),
+            std::process::id()
+        ))
     })
 }
 
@@ -39,10 +139,10 @@ pub(crate) fn umd_log_path() -> &'static std::path::Path {
 /// unconditional writer by accident.
 ///
 /// - [`log_error!`] — errors, one-shots, refusals. Always written.
-/// - [`trace_line!`] — per-op repeat traffic. `UmdTrace`-gated, and it does not
-///   even evaluate its arguments when the knob is off.
+/// - [`trace_line!`] — per-op repeat traffic. Trace-gated, and it does not
+///   even evaluate its arguments when the gate is off.
 #[deprecated(note = "use log_error! (errors/one-shots/refusals) or trace_line! (per-op traffic)")]
-pub(crate) fn log_line(message: &str) {
+pub fn log_line(message: &str) {
     if let Ok(mut slot) = log_file().lock() {
         if let Some(f) = slot.as_mut() {
             // tid in the prefix: once creates/destroys go free-threaded and
@@ -105,6 +205,11 @@ fn log_file() -> &'static std::sync::Mutex<Option<std::fs::File>> {
 /// `tools/helios_ownership_soak.cpp` has reported since T5; the other five
 /// belong to the venus ICD.
 ///
+/// ⚠ Whether `helios_umd12.dll` is ALSO loaded/unloaded once per device is
+/// UNVERIFIED-5 and is scheduled for S5. Every never-freed process-lifetime
+/// handle in a second UMD would double the leak, which is why this function is
+/// shared rather than reimplemented.
+///
 /// Called only from `DllMain(DLL_PROCESS_DETACH)` with `lpReserved == NULL`,
 /// i.e. the `FreeLibrary` case. On process teardown the kernel reclaims
 /// everything and touching a lock there buys nothing.
@@ -114,8 +219,7 @@ fn log_file() -> &'static std::sync::Mutex<Option<std::fs::File>> {
 /// inside `log_line` while its own module is being unloaded is already a
 /// use-after-free hazard the loader created, so the contended case is not
 /// reachable in any healthy teardown — it is counted rather than waited on.
-pub(crate) fn close_at_detach() {
-    use std::sync::atomic::Ordering;
+pub fn close_at_detach() {
     let Some(lock) = log_file_if_open() else {
         return;
     };
@@ -137,8 +241,7 @@ pub(crate) fn close_at_detach() {
 
 /// Log-handle closes refused because another thread held the writer lock at
 /// `DLL_PROCESS_DETACH`. Expected 0: see [`close_at_detach`].
-pub(crate) static LOG_CLOSE_CONTENDED: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+pub static LOG_CLOSE_CONTENDED: AtomicUsize = AtomicUsize::new(0);
 
 /// The log mutex if it has already been created, WITHOUT creating it.
 ///
@@ -150,33 +253,35 @@ fn log_file_if_open() -> Option<&'static std::sync::Mutex<Option<std::fs::File>>
     LOG_FILE.get()
 }
 
-static LOG_FILE: std::sync::OnceLock<std::sync::Mutex<Option<std::fs::File>>> =
-    std::sync::OnceLock::new();
+static LOG_FILE: OnceLock<std::sync::Mutex<Option<std::fs::File>>> = OnceLock::new();
 
 /// Per-frame/per-op trace logging, gated by [`trace_enabled`]. The format
 /// arguments are not evaluated when tracing is off.
+///
+/// ⚠ `$crate`-qualified throughout, so it resolves identically no matter which
+/// cdylib expands it and regardless of what that crate calls its own modules.
+#[macro_export]
 macro_rules! trace_line {
     ($($arg:tt)*) => {
-        if crate::trace_enabled() {
+        if $crate::log::trace_enabled() {
             #[allow(deprecated)]
-            crate::log_line(&format!($($arg)*));
+            $crate::log::log_line(&format!($($arg)*));
         }
     };
 }
-pub(crate) use trace_line;
 
 /// Unconditional log line: errors, one-shots and refusals ONLY.
 ///
 /// The counterpart to [`trace_line!`]. Per-op repeat traffic must not use this
 /// — that is what put a 21-argument `format!` plus a mutex-guarded unbuffered
 /// write on all seven draw entry points and on the caps-query path (R420).
+#[macro_export]
 macro_rules! log_error {
     ($($arg:tt)*) => {{
         #[allow(deprecated)]
-        crate::log_line(&format!($($arg)*));
+        $crate::log::log_line(&format!($($arg)*));
     }};
 }
-pub(crate) use log_error;
 
 /// Log which DLL file THIS code is running from, once per process. Multiple
 /// UMD copies exist on disk (DriverStore package, ProgramData versioned
@@ -184,8 +289,12 @@ pub(crate) use log_error;
 /// pre-typed-signature FileRepository\helios_umd.dll caused cold-boot dwm
 /// devices to run old shader handlers, 2026-07-04) — the per-pid log alone
 /// cannot distinguish which copy handled which device.
-pub(crate) fn log_self_module_path() {
-    use std::sync::atomic::{AtomicBool, Ordering};
+///
+/// ⚠ The anchor is this function's own address, so with two Helios UMDs in one
+/// process each module's call reports **its own** file. That is the property
+/// `tools/capture-knob-inventory.ps1` keys on, and it is why this is a shared
+/// function rather than a shared string.
+pub fn log_self_module_path() {
     static LOGGED: AtomicBool = AtomicBool::new(false);
     if LOGGED.swap(true, Ordering::Relaxed) {
         return;
@@ -210,35 +319,38 @@ pub(crate) fn log_self_module_path() {
             let mut buf = [0u16; 512];
             let n = GetModuleFileNameW(hmod, buf.as_mut_ptr(), buf.len() as u32) as usize;
             if n > 0 && n < buf.len() {
-                log_error!("UMD module: {}", String::from_utf16_lossy(&buf[..n]));
+                crate::log_error!("UMD module: {}", String::from_utf16_lossy(&buf[..n]));
                 return;
             }
         }
-        log_error!("UMD module: <unresolvable>");
+        crate::log_error!("UMD module: <unresolvable>");
     }
 }
 
 /// Log every registry knob and its resolved value, once per process.
 ///
-/// The reader that makes [`crate::knobs`]'s inventory more than a comment: it
-/// turns "which knobs were in force in this process" from a re-derivation into
-/// a fact in the log, next to the module path that says which DLL produced it.
-/// It is also R1008's own validation instrument — the defaults moved from four
+/// The reader that makes the knob inventory more than a comment: it turns
+/// "which knobs were in force in this process" from a re-derivation into a fact
+/// in the log, next to the module path that says which DLL produced it. It is
+/// also R1008's own validation instrument — the defaults moved from four
 /// hand-written tail expressions into constructor arguments, and this line is
-/// what proves the resolved values did not move with them.
+/// what proves the resolved values did not move with them. **It is now this
+/// stage's instrument too**: `S2-check` requires its output to be byte-identical
+/// before and after this very move.
 ///
-/// Resolving forces all four `OnceLock`s here rather than at each knob's first
-/// use. Every one is read once per process either way, and the documented A/B
-/// procedure is "write the value, then start a new process (or
-/// `pnputil /restart-device`)" — which loads the DLL after the write in both
-/// orderings, so the resolved values are the same.
-pub(crate) fn log_knob_inventory() {
-    use std::sync::atomic::{AtomicBool, Ordering};
+/// ⚠ `entries` is a parameter because the KNOB SET is per-crate (D3b) — `umd12`
+/// declares its own, including `UmdD3D12`. Resolving them forces every
+/// `OnceLock`, which is why the caller passes an already-resolved array rather
+/// than this function reaching for a knob table it cannot know about.
+///
+/// The caller is expected to be its crate's own thin wrapper, so that
+/// `crate::log_knob_inventory()` keeps resolving at every existing call site.
+pub fn log_knob_inventory(entries: &[(&'static str, u32)]) {
     static LOGGED: AtomicBool = AtomicBool::new(false);
     if LOGGED.swap(true, Ordering::Relaxed) {
         return;
     }
-    for (name, value) in knobs::resolved_inventory() {
-        log_error!("UMD knob: {name}={value}");
+    for (name, value) in entries {
+        crate::log_error!("UMD knob: {name}={value}");
     }
 }
