@@ -1,15 +1,15 @@
 //! Build script for the Helios D3D12 WDDM UMD.
 //!
-//! # Stage S3 — and only S3
+//! # Stage S4 — bindgen, the cxx bridge, and the engine link
 //!
-//! `ARCHITECTURE.md` §11 stages this crate. **This script does exactly one
-//! thing: bindgen `d3d12umddi.h`.** It does *not* compile a cxx bridge and does
-//! *not* link the vkd3d archives — that is S4, and `DECISIONS.md` §7.1's
-//! standing rule is that `OpenAdapter12` stops refusing in the same commit that
-//! makes its body reachable, or the body is not written yet.
+//! `ARCHITECTURE.md` §11 stages this crate. Through S3 this script did exactly
+//! one thing, bindgen `d3d12umddi.h`. S4 adds the other two halves: it compiles
+//! the cxx bridge (`bridge/vkd3d_bridge.cpp`) that wraps vkd3d-proton's
+//! `ID3D12*` COM objects, and it links the prebuilt vkd3d engine archive into
+//! `helios_umd12.dll`.
 //!
-//! ⛔ When S4 does land, the link set is **measured, not guessed**
-//! (`D12-G1` static arm, `tmp/dx12/gates/G1-static/RESULT.md`):
+//! ⛔ The link set is **measured, not guessed** (`D12-G1` static arm,
+//! `tmp/dx12/gates/G1-static/RESULT.md:27-42`):
 //!
 //! ```text
 //! C:\Users\Rupansh\vkd3d-build\libs\d3d12core\libhelios_d3d12_static.a
@@ -17,11 +17,26 @@
 //! ```
 //!
 //! **One archive** — it is a union carrying every vkd3d / dxil-spirv /
-//! dxbc-spirv object — plus `gdi32` for the 12 `__imp_D3DKMT*` that
-//! `libs/vkd3d/d3dkmt.c` imports. ⛔ **Never `dxgi`**: `umd/build.rs:239-243`
-//! states the rule and the static engine is the first artifact that keeps it.
+//! dxbc-spirv object — plus `gdi32` for the `__imp_D3DKMT*` that
+//! `libs/vkd3d/d3dkmt.c` imports and `vkd3d_dep` does not carry. That gate's
+//! first attempt linked the archive *alone*, as `DECISIONS.md` D4 specified, and
+//! got 19 unresolved externals; the set below is what actually resolved.
+//! ⛔ **Never `dxgi`**, and nothing else either — not `advapi32`, not `ole32`,
+//! not `user32`, not `version`. `umd/build.rs:247-250` states the DXGI rule for
+//! D3D11 and the static engine is the first artifact that keeps it with zero
+//! `dxgi` references at all.
 //!
-//! # The deliverable
+//! # Toolchain coherence (critical)
+//!
+//! vkd3d, the cxx shim, and the Rust crate must all use the MSVC C++ ABI with
+//! the **dynamic** CRT (`/MD`). vkd3d is built with clang-cl under meson
+//! (`vkd3d-proton-helios/meson.build:9` recognises `clang-cl` and pins
+//! `cpp_std=c++17`, the same standard this shim compiles with); we compile the
+//! shim with the *same* clang-cl so the objects link against one another and
+//! against the Rust msvc target. `HELIOS_CLANG_CL` / `HELIOS_MSVC_LIB` /
+//! `HELIOS_VKD3D_BUILD` override the baked-in defaults.
+//!
+//! # The bindgen deliverable
 //!
 //! The layout assertions. `layout_tests(true)` makes bindgen emit a
 //! compile-time size/alignment/offset check per type, so **if this crate
@@ -35,6 +50,27 @@ use std::path::{Path, PathBuf};
 
 fn def(var: &str, default: &str) -> String {
     env::var(var).unwrap_or_else(|_| default.to_string())
+}
+
+/// Fail the build at the point the path is chosen, naming the env var that
+/// overrides it.
+///
+/// Same shape as `umd/build.rs:63-70`, and the same reasoning: every default
+/// here is an absolute path baked into this script. Without the check a wrong
+/// path surfaces far from its cause — as a clang include error, a
+/// missing-archive link error, or a "program not found" from `cc` — and none of
+/// those name the variable that would fix it.
+///
+/// ⚠ This is the one sanctioned `panic!` in the crate (CLAUDE.md's no-panic rule
+/// is about runtime data; a build script panicking on a missing toolchain path
+/// is the `require_path` idiom and is correct).
+fn require_path(env_var: &str, value: &str, dir: bool) {
+    let path = Path::new(value);
+    let ok = if dir { path.is_dir() } else { path.is_file() };
+    if !ok {
+        let kind = if dir { "directory" } else { "file" };
+        panic!("helios_umd12: {env_var} {kind} not found: {value} (override with {env_var})");
+    }
 }
 
 /// Pick the highest-versioned MSVC include directory (for the vcruntime/STL
@@ -190,14 +226,147 @@ fn compare_or_refresh_cache(fresh: &Path) {
     );
 }
 
+/// Compile the cxx bridge with clang-cl and link the measured engine set.
+///
+/// ⛔ **Only ever called when the BUILD HOST is Windows.** Everything in here
+/// wants clang-cl, `llvm-lib` and the meson output tree; none of it exists on
+/// the Linux host, and the host cross-check must return before reaching it.
+/// See `main`.
+fn build_vkd3d_bridge() {
+    let clang_cl = def("HELIOS_CLANG_CL", r"C:\Program Files\LLVM\bin\clang-cl.exe");
+    let archiver = def("HELIOS_MSVC_LIB", r"C:\Program Files\LLVM\bin\llvm-lib.exe");
+    let vkd3d_build = def("HELIOS_VKD3D_BUILD", r"C:\Users\Rupansh\vkd3d-build");
+
+    // The module doc above calls the C++ ABI / CRT agreement critical, and a
+    // build that declares no dependency on the compiler that decides it is
+    // guarding heap corruption with prose. `cc` and `cxx-build` do not add a
+    // rerun edge for a compiler supplied via `.compiler()`, so swapping
+    // HELIOS_CLANG_CL or HELIOS_MSVC_LIB would leave the previously built
+    // `helios_vkd3d_bridge.lib` — compiled against the previous MSVC STL — to be
+    // relinked against a freshly built engine archive (which DOES have
+    // rerun-if-changed), giving mismatched `std::string` / `std::mutex` layouts
+    // across the cxx boundary inside one DLL. Declaring the identity as a build
+    // input turns a changed *selection* into a rebuild. Verbatim reasoning from
+    // `umd/build.rs:158-173`; the same hole exists in both drivers.
+    //
+    // ⚠ The remaining hole, stated honestly: this does NOT catch an in-place
+    // LLVM upgrade — same toolchain paths, different compiler. A generated
+    // toolchain fingerprint (resolved `clang-cl --version` + the MSVC include
+    // dir, with `rerun-if-changed` on it) is the stronger fix and is still a
+    // follow-up in both crates.
+    println!("cargo:rerun-if-env-changed=HELIOS_CLANG_CL");
+    println!("cargo:rerun-if-env-changed=HELIOS_MSVC_LIB");
+    println!("cargo:rerun-if-env-changed=HELIOS_VKD3D_BUILD");
+
+    require_path("HELIOS_CLANG_CL", &clang_cl, false);
+    require_path("HELIOS_MSVC_LIB", &archiver, false);
+    require_path("HELIOS_VKD3D_BUILD", &vkd3d_build, true);
+
+    // ⭐ THE MEASURED LINK SET — one archive.
+    // `tmp/dx12/gates/G1-static/RESULT.md:27-42`: `libhelios_d3d12_static.a` is
+    // a *union* archive; meson hands it every object of `libvkd3d-proton`,
+    // `libvkd3d_common`, `libvkd3d-shader`, `libdxil-spirv`,
+    // `libdxbc_spv_module` and `libdxbc_spv`, plus `debug.c`,
+    // `debug_control.c` and `helios_entry.c`. Adding the other six archives
+    // `DECISIONS.md` D4 lists is harmless but redundant, so they are not listed.
+    let archive = format!(r"{vkd3d_build}\libs\d3d12core\libhelios_d3d12_static.a");
+    // Checked separately from the directory: the directory existing only means
+    // meson was configured, not that the static target was ever built, and a
+    // missing archive would otherwise surface as a wall of unresolved externals.
+    // The env var named is the one that relocates it.
+    require_path("HELIOS_VKD3D_BUILD", &archive, false);
+
+    // --- Compile the cxx bridge shim with clang-cl (matches vkd3d's ABI) -----
+    let mut build = cxx_build::bridge("src/bridge12.rs");
+    build
+        .file("bridge/vkd3d_bridge.cpp")
+        .compiler(&clang_cl)
+        .archiver(&archiver)
+        .std("c++17")
+        // cxx-build disables C++ exceptions by default; the shared
+        // `bridge_guard` is a try/catch and will not compile without this.
+        // ⛔ Enabling EH is NOT permission to define
+        // `HELIOS_BRIDGE_ENGINE_CATCH` — vkd3d throws nothing.
+        .flag("/EHsc")
+        // ⚠ `"bridge"` comes FIRST deliberately: a same-named header in this
+        // crate must win, so a future D3D12-only override of a shared header is
+        // possible without editing `umd_common`. Same ordering rule as
+        // `umd/build.rs:196-202`.
+        .include("bridge")
+        // The shared bridge headers (`DECISIONS.md` D3b, stage S1):
+        // `bridge_common.h`, `bridge_util.h`, `bridge_guard.h`. One copy of the
+        // source, compiled by this bridge and by `umd`'s — which is the whole
+        // reason there is exactly one `bridge_guard` in the tree.
+        .include("../umd_common/bridge")
+        // ⛔ NO vkd3d include directory. `vkd3d-proton-helios/include/vkd3d.h`
+        // drags in `vulkan.h` and vkd3d's own widl `D3D12_*` types, which then
+        // collide with the SDK's. The `D12-G1` static arm proved the Windows SDK
+        // `<d3d12.h>` plus this archive link is sufficient
+        // (`tmp/dx12/gates/G1-static/RESULT.md`), so the bridge sees only SDK
+        // headers.
+        //
+        // Suppresses the MSVC STL's own #error when the clang-cl version falls
+        // outside the STL's supported-compiler window (MSVC 14.44 demands Clang
+        // 19; installed clang-cl is 17.0.6). Deliberately accepted: removing it
+        // hard-fails the only working build. ⚠ It is a runtime-risk
+        // acknowledgement, not a fix — the ABI still rests on the objects
+        // agreeing, which nothing here can prove — and it is the FIRST suspect
+        // if the engine misbehaves.
+        .define("_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH", None)
+        .define("NOMINMAX", None)
+        .define("WIN32_LEAN_AND_MEAN", None)
+        .define("_WIN32_WINNT", "0x0A00")
+        .define("_CRT_SECURE_NO_WARNINGS", None);
+    build.compile("helios_vkd3d_bridge");
+
+    // --- Link the prebuilt vkd3d engine --------------------------------------
+    // An MS-format COFF archive (meson archiver = llvm-lib) with a `.a` name, so
+    // it goes in as a full path link arg rather than through Rust's
+    // `static=NAME` -> `NAME.lib` resolution.
+    println!("cargo:rustc-link-arg-cdylib={archive}");
+    println!("cargo:rerun-if-changed={archive}");
+
+    // ⛔ `gdi32` and NOTHING else. Measured, not assumed: the gate's link
+    // attempt with the archive alone left 14 `__imp_D3DKMT*` unresolved
+    // (`libs/vkd3d/d3dkmt.c`; `vkd3d_dep` does not carry `lib_gdi32`), and after
+    // adding `gdi32` the probe linked and ran clean. Not `advapi32`, not
+    // `ole32`, not `user32`, not `version`.
+    //
+    // ⛔ **Never `dxgi`.** A WDDM UMD sits *below* DXGI and implements the DXGI
+    // DDI; taking a dependency on `dxgi.dll` from inside the driver that DXGI
+    // is layered on is a load-order inversion. `umd/build.rs:247-250` states the
+    // same rule for D3D11. The static engine keeps it with zero `dxgi`
+    // references at all, and `dumpbin /IMPORTS` showing no `dxgi.dll` is the
+    // `D12-G1` pass criterion — first on the probe `.exe`, now on this DLL.
+    println!("cargo:rustc-link-lib=dylib=gdi32");
+
+    for path in [
+        // Shared, in `umd_common/bridge/`. ⚠ Cargo does not track the
+        // `umd_common` rlib's non-Rust files, so without these three lines a
+        // `bridge_guard.h` edit leaves a stale `helios_vkd3d_bridge.lib` linked
+        // into the DLL — the edit appears to have no effect, which is worse than
+        // a build failure. `umd/build.rs:258-266` carries the identical list.
+        "../umd_common/bridge/bridge_common.h",
+        "../umd_common/bridge/bridge_guard.h",
+        "../umd_common/bridge/bridge_util.h",
+        "bridge/vkd3d_bridge.cpp",
+        "bridge/vkd3d_bridge.h",
+        // The cxx bridge module itself: `cxx_build::bridge` regenerates the glue
+        // from it, so an `extern "C++"` signature change must rebuild the shim.
+        "src/bridge12.rs",
+    ] {
+        println!("cargo:rerun-if-changed={path}");
+    }
+}
+
 fn main() {
     println!("cargo:rerun-if-changed={CACHED_BINDINGS}");
 
     // ⚠ Two different questions, and conflating them is the bug this shape
     // avoids. `TARGET` is what we are compiling FOR; `cfg!(windows)` here is
-    // what the BUILD SCRIPT is running ON. bindgen needs the WDK, which lives
-    // on the build host — so the SDK availability question is about the host,
-    // not the target.
+    // what the BUILD SCRIPT is running ON. bindgen needs the WDK and the bridge
+    // needs clang-cl + the meson tree, and all three live on the build host — so
+    // the availability question is about the host, not the target.
     let target = env::var("TARGET").unwrap_or_default();
     if !target.contains("windows") {
         // Not even targeting Windows: nothing here is meaningful.
@@ -207,30 +376,43 @@ fn main() {
         return;
     }
 
-    if cfg!(windows) {
-        // The real path: regenerate from the SDK header. Ground truth.
-        generate_d3d12umddi_bindings();
+    if !cfg!(windows) {
+        // ⛔ THE HOST CROSS-CHECK, AND IT RETURNS BEFORE ANY S4 WORK.
+        //
+        // Cross-checking from a WDK-less host (the Linux side). Serve the cached
+        // generation so `ddi12.rs`'s `include!` resolves and the whole DDI
+        // surface type-checks. ⛔ `cargo check` only — this never links a DLL,
+        // and `PARALLEL.md` §10 requires the integrator to re-check on the VM.
+        //
+        // ⭐ This branch is the inner loop for the eleven-agent, 214-slot DDI
+        // fan-out (`PARALLEL.md` §7): the difference between agents writing
+        // handlers blind and writing them against the real signatures with the
+        // compiler answering. ⛔ Nothing from the cxx or link half may run here —
+        // `build_vkd3d_bridge` is called only after this return, deliberately,
+        // and moving either call site breaks the fan-out. `tools/umd12-host-check.sh`
+        // supplies the two build-script overrides cxx needs on top of this.
+        let cached = Path::new(CACHED_BINDINGS);
+        if !cached.is_file() {
+            panic!(
+                "helios_umd12: cross-checking for {target} on a host with no WDK, and \
+                 {CACHED_BINDINGS} is missing. Generate it on the VM (umd-check.ps1 -Crate umd12) \
+                 and copy $OUT_DIR/d3d12umddi.rs there."
+            );
+        }
         let out = PathBuf::from(env::var("OUT_DIR").unwrap()).join("d3d12umddi.rs");
-        compare_or_refresh_cache(&out);
+        std::fs::copy(cached, &out).expect("failed to stage cached d3d12umddi.rs");
+        println!(
+            "cargo:warning=helios_umd12: HOST CROSS-CHECK — using {CACHED_BINDINGS}, not the SDK \
+             header. Types are checked; nothing is linked and no ABI claim is made here."
+        );
         return;
     }
 
-    // Cross-checking from a WDK-less host (the Linux side). Serve the cached
-    // generation so `ddi12.rs`'s `include!` resolves and the whole DDI surface
-    // type-checks. ⛔ `cargo check` only — this never links a DLL, and
-    // `PARALLEL.md` §10 requires the integrator to re-check on the VM.
-    let cached = Path::new(CACHED_BINDINGS);
-    if !cached.is_file() {
-        panic!(
-            "helios_umd12: cross-checking for {target} on a host with no WDK, and {CACHED_BINDINGS} \
-             is missing. Generate it on the VM (umd-check.ps1 -Crate umd12) and copy \
-             $OUT_DIR/d3d12umddi.rs there."
-        );
-    }
+    // The real path: the build host is Windows. Regenerate from the SDK header
+    // (ground truth), then build and link the engine bridge.
+    generate_d3d12umddi_bindings();
     let out = PathBuf::from(env::var("OUT_DIR").unwrap()).join("d3d12umddi.rs");
-    std::fs::copy(cached, &out).expect("failed to stage cached d3d12umddi.rs");
-    println!(
-        "cargo:warning=helios_umd12: HOST CROSS-CHECK — using {CACHED_BINDINGS}, not the SDK \
-         header. Types are checked; nothing is linked and no ABI claim is made here."
-    );
+    compare_or_refresh_cache(&out);
+
+    build_vkd3d_bridge();
 }

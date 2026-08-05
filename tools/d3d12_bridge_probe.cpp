@@ -11,20 +11,36 @@
 // whether vkd3d runs on venus, so every step logs its own line: a failure must be
 // attributable to one step, not to "the probe".
 //
-// ── TWO ARMS, ONE SOURCE ────────────────────────────────────────────────────
-// `-DHELIOS_G1_STATIC` selects **the shipping arm** (DECISIONS.md "✅ D4 IS
+// ── THREE ARMS, ONE SOURCE ──────────────────────────────────────────────────
+// `-DHELIOS_G1_STATIC` selects **the engine arm** (DECISIONS.md "✅ D4 IS
 // DECIDED — STATIC"): the two Helios entry points are ordinary `extern "C"`
 // symbols pulled out of `libhelios_d3d12_static.a` at link time, exactly as
-// `umd12/build.rs` will pull them at S4. There is no `LoadLibrary` and no engine
+// `umd12/build.rs` pulls them at S4. There is no `LoadLibrary` and no engine
 // DLL anywhere in the process.
 //
-// Without it the probe keeps the **retired** `LoadLibrary("helios_vkd3d.dll")`
-// shape. That arm is kept only because it is the configuration D12-G1 passed
-// under on 2026-08-05 (mingw cross-build), so the static arm has something
-// reproducible to be compared against; it is not a supported path.
+// `-DHELIOS_G1_UMD12` selects **the shipping arm** (S4): the same engine, but
+// reached through `helios_umd12.dll`'s three `helios_umd12_probe_*_v1` exports,
+// which sit on top of the cxx bridge (`umd12/bridge/vkd3d_bridge.cpp`) which
+// sits on top of the very same archive symbols. What this proves that the
+// static arm cannot: the engine works **inside `helios_umd12.dll`** — a Rust
+// `cdylib` built with `panic = "abort"`, `lto = "thin"`, cxx-generated glue and
+// the MSVC CRT linked into the same module. That is a materially different
+// artifact from the static arm's plain clang-cl probe `.exe`; a build that links
+// is not a device that draws, which is the whole reason the static arm existed.
+// ⛔ The probe `.exe` in this arm links **nothing but itself** — no archive, no
+// engine — so it also proves the exports are the only seam the engine needs.
+//
+// Without either define the probe keeps the **retired**
+// `LoadLibrary("helios_vkd3d.dll")` shape. That arm is kept only because it is
+// the configuration D12-G1 passed under on 2026-08-05 (mingw cross-build), so
+// the other two arms have something reproducible to be compared against; it is
+// not a supported path.
 // ⛔ Copy-pasting this file into a second probe instead of the `#ifdef` would be
 // the duplication D3b forbids: the 28 steps must be the SAME 28 steps, or the
-// comparison proves nothing.
+// comparison proves nothing. Concretely: only the prologue (steps 01–02) and
+// ONE line of teardown are allowed to differ per arm. Steps 03–27 are
+// byte-identical source across all three, and that identity is the entire
+// evidentiary value of `arm-diff.txt`.
 //
 // ── WHAT IS DELIBERATELY NOT LINKED ─────────────────────────────────────────
 //   * d3d12.lib  — the device must come from the Helios entry point, never from
@@ -42,9 +58,14 @@
 //                  D3DKMT, which is what sits below DXGI, resolved by name out
 //                  of gdi32.dll so it is not even a link-time dependency.
 //                  `dumpbin /IMPORTS` showing no dxgi.dll is the assertion.
+//                  ⭐ In the `HELIOS_G1_UMD12` arm the same assertion moves to
+//                  where it now matters: it is `helios_umd12.dll` that must
+//                  import no dxgi.dll, since that DLL — not this probe — is what
+//                  ships under `UserModeDriverName[3]`.
 //
-// Build: tmp/dx12/build-g1-static.ps1 (static arm) or tmp/dx12/build-g1-probe.ps1
-// (retired DLL arm). Both run dxc -T {vs,ps}_6_0 -Fh first.
+// Build: tmp/dx12/build-g1-static.ps1 (static engine arm),
+// tmp/dx12/build-g1-umd12.ps1 (umd12 DLL arm), or tmp/dx12/build-g1-probe.ps1
+// (retired DLL arm). All three run dxc -T {vs,ps}_6_0 -Fh first.
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <d3d12.h>
@@ -59,11 +80,71 @@
 // ---- the two Helios entry points (DECISIONS.md D4) --------------------------
 // Same functions, same signatures, in both arms — D4 changed only their
 // delivery, from a DLL export to an archive symbol.
-#ifdef HELIOS_G1_STATIC
+#if defined(HELIOS_G1_STATIC)
 extern "C" HRESULT helios_vkd3d_create_device(LUID adapter_luid, REFIID iid, void **device);
 extern "C" HRESULT helios_vkd3d_serialize_root_signature(
         const D3D12_ROOT_SIGNATURE_DESC *desc, D3D_ROOT_SIGNATURE_VERSION version,
         ID3DBlob **blob, ID3DBlob **error_blob);
+
+#elif defined(HELIOS_G1_UMD12)
+// ---- the umd12 arm: the engine reached through helios_umd12.dll -------------
+// The three exports are S4 §3.3's evidence instruments. They are deliberately
+// NOT in the `helios_umd_*` family the Mesa ICD resolves by name across all
+// loaded modules first-hit-wins (S4 guardrail 7); nothing but this probe ever
+// looks them up.
+// ⛔ The LUID crosses as two SCALARS, not as a `LUID` by value — parameters the
+// ABI cannot reorder. Step 04's `device reports AdapterLuid` line is what checks
+// it: the value read back off the created device must equal step 03's, and a
+// swapped pair would print the halves the other way round.
+// ⚠ That echo proves TRANSPORT, not SELECTION. The engine passes
+// `vk_physical_device = VK_NULL_HANDLE` and lets `vkd3d_select_physical_device`
+// choose (helios_entry.c:172-179, which says in as many words that this "is NOT
+// LUID matching"), so a *wrong* LUID would still draw a correct triangle on a
+// single-GPU guest.
+typedef HRESULT(*PFN_UMD12_CREATE)(unsigned int luid_low, int luid_high,
+                                   void **out_bridge, void **out_device);
+typedef void   (*PFN_UMD12_DESTROY)(void *bridge);
+typedef HRESULT(*PFN_UMD12_SERIALIZE)(const void *desc, unsigned int version,
+                                      void **blob_out, void **err_out);
+
+// The engine-facing serializer typedef is shared with the retired arm below so
+// that step 05's call site is byte-identical in all three arms.
+typedef HRESULT(*PFN_HELIOS_VKD3D_SERIALIZE_ROOT_SIGNATURE)(
+        const D3D12_ROOT_SIGNATURE_DESC *desc, D3D_ROOT_SIGNATURE_VERSION version,
+        ID3DBlob **blob, ID3DBlob **error_blob);
+
+// `umd-check.ps1 -Mode release -Crate umd12` builds in the local mirror with
+// CARGO_TARGET_DIR = <mirror>\umd12\target (tools/umd-check.ps1:83), so the
+// release cdylib lands here. Overridable by argv[1] exactly as the retired arm.
+static const wchar_t *DEFAULT_DLL =
+        L"C:\\Users\\Rupansh\\helios-vgpu\\umd12\\target\\release\\helios_umd12.dll";
+
+// File-static so steps 03+ can keep calling `create_device(luid, iid, &dev)`
+// unqualified and the teardown can drop the bridge without an extra local.
+static PFN_UMD12_CREATE  g_umd12_create;
+static PFN_UMD12_DESTROY g_umd12_destroy;
+static void             *g_umd12_bridge;
+
+// Adapts the umd12 export's (luid, out_bridge, out_device) shape to the engine
+// entry point's (luid, iid, out_device) shape, so the probe body below does not
+// have to know which arm it is in.
+static HRESULT umd12_create_device(LUID luid, REFIID iid, void **out)
+{
+    if (iid != __uuidof(ID3D12Device)) return E_NOINTERFACE;
+    void *dev = nullptr;
+    // The one place the LUID is split; the bridge's C++ side is the one place it
+    // is reassembled. LowPart is DWORD, HighPart is LONG (winnt.h).
+    HRESULT hr = g_umd12_create((unsigned int)luid.LowPart, (int)luid.HighPart,
+                                &g_umd12_bridge, &dev);
+    if (FAILED(hr)) return hr;
+    // The bridge hands back a BORROWED reference (S4 §3.3: `out_device` is
+    // borrowed, the bridge keeps the owning one); AddRef so the probe's
+    // symmetric Release at step 28 is correct, and so teardown is arm-identical.
+    ((IUnknown *)dev)->AddRef();
+    *out = dev;
+    return hr;
+}
+
 #else
 typedef HRESULT(*PFN_HELIOS_VKD3D_CREATE_DEVICE)(LUID adapter_luid, REFIID iid, void **device);
 typedef HRESULT(*PFN_HELIOS_VKD3D_SERIALIZE_ROOT_SIGNATURE)(
@@ -310,7 +391,7 @@ static bool find_helios_luid(LUID *out, wchar_t *name_out, size_t name_cch)
 
 int main(int argc, char **argv)
 {
-#ifdef HELIOS_G1_STATIC
+#if defined(HELIOS_G1_STATIC)
     (void)argc; (void)argv;
     printf("d3d12_bridge_probe — D12-G1 engine gate (STATIC arm, DECISIONS.md D4)\n");
     printf("       engine = statically linked (libhelios_d3d12_static.a); no engine DLL\n");
@@ -336,11 +417,57 @@ int main(int argc, char **argv)
     STEP("engine is in the probe image itself, base=%p", (void *)owner);
     printf("       image = %ls\n", owner_path);
 
-    // The names are used unqualified below in both arms.
+    // The names are used unqualified below in all three arms.
     auto create_device = &helios_vkd3d_create_device;
     auto serialize_rs  = &helios_vkd3d_serialize_root_signature;
     STEP("both Helios entry points linked (create_device=%p serialize_root_signature=%p)",
          (void *)create_device, (void *)serialize_rs);
+#elif defined(HELIOS_G1_UMD12)
+    const wchar_t *dll_path = DEFAULT_DLL;
+    wchar_t dll_buf[MAX_PATH];
+    if (argc > 1) {
+        MultiByteToWideChar(CP_ACP, 0, argv[1], -1, dll_buf, MAX_PATH);
+        dll_path = dll_buf;
+    }
+
+    printf("d3d12_bridge_probe — D12-G1 engine gate (umd12 arm, S4)\n");
+    printf("       umd12 dll = %ls\n", dll_path);
+
+    // ---- 1. load helios_umd12.dll -------------------------------------------
+    // ⛔ Nothing but the probe is on this link line: no archive, no engine, no
+    // gdi32-for-the-engine. Everything vkd3d needs is already inside this DLL,
+    // and if it is not, this LoadLibraryW is where it shows up.
+    // ⚠ The resolved path is printed because the DriverStore keeps its own copy
+    // of a deployed UMD: loading Z:\... and testing C:\Windows\System32\... is
+    // the mistake that made a stale UMD look like a fixed one (memory 7th).
+    HMODULE umd12 = LoadLibraryW(dll_path);
+    if (!umd12) { FAILSTEP("LoadLibraryW(%ls) -> GetLastError=%lu", dll_path, GetLastError()); return 1; }
+    STEP("LoadLibraryW ok, base=%p", (void *)umd12);
+
+    wchar_t resolved[MAX_PATH] = {};
+    GetModuleFileNameW(umd12, resolved, MAX_PATH);
+    printf("       loaded from = %ls\n", resolved);
+
+    // ---- 2. resolve the three probe exports ---------------------------------
+    g_umd12_create  = (PFN_UMD12_CREATE)  GetProcAddress(umd12, "helios_umd12_probe_create_device_v1");
+    g_umd12_destroy = (PFN_UMD12_DESTROY) GetProcAddress(umd12, "helios_umd12_probe_destroy_device_v1");
+    auto umd12_serialize = (PFN_UMD12_SERIALIZE)
+            GetProcAddress(umd12, "helios_umd12_probe_serialize_root_signature_v1");
+    if (!g_umd12_create)  { FAILSTEP("GetProcAddress(helios_umd12_probe_create_device_v1) -> %lu", GetLastError()); return 1; }
+    if (!g_umd12_destroy) { FAILSTEP("GetProcAddress(helios_umd12_probe_destroy_device_v1) -> %lu", GetLastError()); return 1; }
+    if (!umd12_serialize) { FAILSTEP("GetProcAddress(helios_umd12_probe_serialize_root_signature_v1) -> %lu", GetLastError()); return 1; }
+
+    // The names are used unqualified below in all three arms.
+    auto create_device = &umd12_create_device;
+    // ⚠ Deliberate ABI-identical retype, not a reinterpretation: the export is
+    // declared `(const void*, unsigned int, void**, void**)` (S4 §3.3) purely so
+    // `probe12.rs` needs no D3D12 struct definitions. The bytes are the same
+    // four pointer-width arguments in the same order under the one x64 calling
+    // convention, and casting here is what keeps step 05's call site
+    // byte-identical to the other two arms.
+    auto serialize_rs = (PFN_HELIOS_VKD3D_SERIALIZE_ROOT_SIGNATURE)umd12_serialize;
+    STEP("all three umd12 probe exports resolved (create=%p destroy=%p serialize_root_signature=%p)",
+         (void *)g_umd12_create, (void *)g_umd12_destroy, (void *)serialize_rs);
 #else
     const wchar_t *dll_path = DEFAULT_DLL;
     wchar_t dll_buf[MAX_PATH];
@@ -602,6 +729,11 @@ int main(int argc, char **argv)
     fence->Release(); rtv_heap->Release(); vb->Release(); rb->Release(); rt->Release();
     cl->Release(); pso->Release(); rs->Release(); rs_blob->Release(); if (rs_err) rs_err->Release();
     alloc->Release(); queue->Release();
+#ifdef HELIOS_G1_UMD12
+    // Drop the bridge's own engine reference FIRST so the probe's Release
+    // below is the last one and step 28's "refcount 0" is arm-identical.
+    g_umd12_destroy(g_umd12_bridge);
+#endif
     ULONG left = dev->Release();
     printf("       device final Release() -> refcount %lu (0 expected)\n", left);
     if (left != 0) g_failures++;

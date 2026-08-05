@@ -20,9 +20,32 @@ crate-type = ["cdylib"]
 # ⛔ The D3b rule: anything that would also exist in `umd/` lives here, not in a
 # second copy. Nothing in this crate may be copy-pasted from `umd/`.
 helios_umd_common = { path = "../umd_common" }
+# S4: the cxx bridge to the STATICALLY LINKED vkd3d engine. Same major version
+# as `umd`'s (`umd/Cargo.toml:11`) on purpose -- both cdylibs compile the same
+# shared `umd_common/bridge/*.h` against the cxx runtime, and two cxx majors in
+# one tree would mean two `cxxbridge1` link names and two sets of glue.
+cxx = "1"
+# ⛔ `Win32_Graphics_Direct3D_Fxc` is deliberately ABSENT, for the same reason it
+# is absent from `umd` (T6/R909): it pulls `D3DCompile`, an HLSL runtime
+# compiler, into a shipped display-driver DLL. vkd3d takes raw DXIL from the
+# runtime (`dx12-p1-contract-captured-73rd`: shaders arrive as DXIL, never
+# DXBC), so nothing here needs a compiler.
+#
+# ⚠ `ARCHITECTURE.md` §5's feature list for this crate predates S4 and does not
+# list `Win32_Graphics_Direct3D12`; S4 adds it because `bridge12.rs` types the
+# bridge's borrowed/owned device handles as `ID3D12Device` rather than a bare
+# `usize`. Deviation recorded here rather than silently taken.
+#
+# ⛔ `Win32_System_Diagnostics_Debug` is GONE, and its absence is checked by the
+# compiler rather than by this comment. It was `OutputDebugStringA`'s home, used
+# by the pre-S4 hand-rolled `OpenAdapter12` refusal path; S4 deleted that path in
+# favour of the shared `helios_umd_common` log + `RefusalCounter`, so the last
+# reference went with it. Verified by removing the feature and re-running the
+# host cross-check clean -- a feature nothing imports is a dependency surface
+# carried for no reason.
 windows = { version = "0.58", features = [
     "Win32_Foundation",
-    "Win32_System_Diagnostics_Debug",
+    "Win32_Graphics_Direct3D12",
 ] }
 
 [build-dependencies]
@@ -32,19 +55,21 @@ windows = { version = "0.58", features = [
 # drivers' generated ABI comes out of one code generator.
 bindgen = "0.70"
 
-# ⛔ STILL NO cxx / cxx-build, deliberately.
-#
-# `ARCHITECTURE.md` §11 stages this crate: S3 (this) is bindgen only; S4 adds
-# the vkd3d bridge and links the archives. ⭐ That link set is already MEASURED,
-# not a guess (`D12-G1` static arm): `libhelios_d3d12_static.a` + `gdi32.lib`,
-# one archive because it is a union of every vkd3d / dxil-spirv / dxbc-spirv
-# object. ⛔ Never `dxgi`.
-#
-# ⛔ And the standing rule that shapes all of it (`DECISIONS.md` §7.1):
+# S4: compiles `bridge/vkd3d_bridge.cpp` + the cxx glue with clang-cl and links
+# the engine. ⭐ The link set is MEASURED, not a guess (`D12-G1` static arm,
+# `tmp/dx12/gates/G1-static/RESULT.md`): `libhelios_d3d12_static.a` + `gdi32`,
+# ONE archive because meson makes it a union of every vkd3d / dxil-spirv /
+# dxbc-spirv object. ⛔ Never `dxgi` -- a WDDM UMD sits below DXGI.
+cxx-build = "1"
+
+# ⛔ The standing rule that still shapes this crate (`DECISIONS.md` §7.1):
 # `OpenAdapter12` must stop refusing IN THE SAME COMMIT that makes its body
-# reachable -- or the body must not be written yet. R908 deleted ~230 lines of
-# unreachable D3D12 scaffolding hidden behind `#[allow(unreachable_code)]`;
-# that is the standing record of what this costs.
+# reachable -- or the body must not be written yet. S4 adds the engine bridge
+# and a set of `helios_umd12_probe_*_v1` test-only exports; it does NOT make
+# `OpenAdapter12` reachable, and that entry point still returns
+# `DXGI_ERROR_UNSUPPORTED`. R908 deleted ~230 lines of unreachable D3D12
+# scaffolding hidden behind `#[allow(unreachable_code)]`; that is the standing
+# record of what ignoring this costs.
 
 [profile.dev]
 panic = "abort"

@@ -3371,18 +3371,41 @@ silent on it:
   (hand-written `D3d12Ddi*` structs, eight `d3d12_*` handlers,
   `D3D12_SUPPORTED_DDI_VERSIONS`) was deleted by T6/R908 and this starts from zero
   rather than from a half-built surface.
-- **Next: S4** — `vkd3d_bridge.{h,cpp}` + `bridge12.rs`, reached by a `tools/`
-  probe. ⭐ Its link set needs no re-deriving; it is measured above and recorded in
-  `umd12/build.rs`'s module doc. Then **S4b** (the `helios_icd_anchor_v1` export in
-  both DLLs, which must land before the first two-engine run — UNVERIFIED-4), then
-  S5, then S6.
+- ⭐ **S4 is COMPLETE (2026-08-06): the engine has drawn a pixel from inside
+  `helios_umd12.dll`.** `bridge/vkd3d_bridge.{h,cpp}` + `src/bridge12.rs` carry
+  `helios_vkd3d_create_device` and `helios_vkd3d_serialize_root_signature` — both
+  needed, because the probe's root signature is unbuildable without the second —
+  through the shared `bridge_guard`, with `build.rs` linking the measured set
+  (one archive + `gdi32`, never `dxgi`).
+  - **`D12-G1` now has a third arm**, `-DHELIOS_G1_UMD12`, in the *same* probe
+    source: 28 steps, 0 failures, pixels exact, `device final Release() -> refcount
+    0`. `tmp/dx12/gates/G1-umd12/RESULT.md`. What it proves that the static arm
+    could not: the engine works inside a Rust `cdylib` with `panic = "abort"`,
+    `lto = "thin"`, cxx glue and the MSVC CRT — a different artifact from a probe
+    `.exe`. `arm-diff.txt`: only steps 01–03 differ (prologue + the per-boot LUID);
+    **steps 04–28 are byte-identical**.
+  - ⭐ `helios_umd12.dll` (4 124 672 B) imports **no `dxgi.dll`**, and of its 154
+    exports the 149 `cxxbridge1$…` are cxx's own leaked ABI (ARCHITECTURE §6.3
+    predicts them) — the other five are exactly `DllMain`, `OpenAdapter12` and the
+    three `helios_umd12_probe_*_v1`. **Zero `helios_umd_*` names**, so the Mesa
+    ICD's first-hit-wins module walk cannot mistake this DLL for the D3D11 vehicle.
+  - ⛔ Still nothing deployed: no INF, no registry, no `UserModeDriverName[3]`, and
+    `OpenAdapter12` refuses in both DLLs.
+  - ⚠ Two things S4 changed in the surrounding tooling because it had to:
+    adding `cxx` pulls `link-cplusplus`, whose build script dies cross-compiling
+    from Linux (`failed to find tool "lib.exe"`) and would have taken the host
+    cross-check away from every S6 lane — fixed with cargo build-script overrides
+    in `tools/umd12-host-check.sh`; and the `static_assert` invariant check had
+    been counting its own documentation (reporting 3) since before P2.
+- **Next: S4b** — the `helios_icd_anchor_v1` export in both DLLs, which must land
+  before the first two-engine run (UNVERIFIED-4). Then S5, then S6.
 - ⭐ **S6 is the bulk — 214 driver-side slots — and it FANS OUT. The split is
   `docs/dx12/PARALLEL.md`:** 11 lanes with exclusive file ownership, an append-only
   protocol for the four shared files, and a lease on the VM. Two things gate the
   fan-out and are worth knowing before planning around it:
   - ⭐ **Lanes compile on the LINUX HOST, so VM contention never arises.**
-    `cargo check --target x86_64-pc-windows-msvc` type-checks the whole 214-slot
-    surface in 7.4 s with no WDK: bindgen runs on the VM and `umd12/build.rs`
+    `tools/umd12-host-check.sh` type-checks the whole 214-slot
+    surface in seconds with no WDK: bindgen runs on the VM and `umd12/build.rs`
     serves the committed `umd12/bindgen/cached/d3d12umddi.rs` into `OUT_DIR` on a
     non-Windows host. ⛔ Never used for a shipping DLL — Windows regenerates from
     the header every time and warns `… is STALE …` on drift. Proven by fault
