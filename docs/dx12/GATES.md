@@ -826,17 +826,39 @@ kmd-counters-G2-{pre,post}.txt}`; **committed:** `docs/dx12/baselines/vkd3d-know
   absent from the ICD). ⛔ **`DoublePrecisionFloatShaderOps` reads TRUE, not FALSE** — that prediction
   shared H5's root cause and died with it. Tests touching stencil-ref export are expected members of
   the known-fail list; double-precision ones are not.
-* ⚠ **The hang class, seen 2026-08-05 at `test_uav_counter_null_behavior_dxbc`.** The suite stopped
-  dead: the process sat at **0.17 s of CPU over six minutes**, 5 MiB working set, all nine threads
-  in `Wait`. `cdb -pv -p <pid> -c "~*k 24; lm; qd"` — a **noninvasive** attach, which reads stacks
-  without becoming the debuggee's controller, so `qd` leaves it running — showed the shape:
-  vkd3d's `vkd3d_fence` thread parked in `SleepEx` **inside the venus ICD**
-  (`vulkan_virtio_…!…+0x74f4f`, called from `d3d12core`), `vkd3d_queue` on a condition variable, and
-  the test's main thread in `WaitForSingleObject`. The log stops immediately after
-  `DX Ultimate supported!`, i.e. it wedges after device creation and before the test body.
-  ⚠ **It is NOT a transport wedge:** re-running the `D12-G1` bridge probe *while the wedged process
-  was still alive* passed all 28 steps. So a fresh device works and the wedge is per-device — do not
-  reach for the 66th/67th sessions' whole-transport story.
+* ⛔ **`test_uav_counter_null_behavior_{dxbc,dxil}` is a DETERMINISTIC Xid-109 REPRODUCER — the first
+  one this project has had.** Found 2026-08-05 when it stopped the suite dead. This is the headline
+  result of the first real G2 run and it matters far beyond D3D12: `ROADMAP.md`'s Xid-109
+  "CTX SWITCH TIMEOUT" defect has been intermittent under Fire Strike (2 of 3 fast-path GT1 runs)
+  since the 68th session, with an evidence trap armed and never sprung. **These two tests fire it on
+  demand, in about six seconds, from a 30-second headless run.**
+
+  The chain, end to end:
+
+  | Layer | Evidence |
+  |---|---|
+  | Guest process | 0.17 s of CPU over six minutes, 5 MiB WS, all nine threads in `Wait` |
+  | Guest stacks | vkd3d's `vkd3d_fence` thread parked in `SleepEx` **inside the venus ICD** (`vulkan_virtio_…!…+0x74f4f`, called from `d3d12core`); `vkd3d_queue` on a condition variable; the test's main thread in `WaitForSingleObject` |
+  | Guest log | stops immediately after `DX Ultimate supported!` — it wedges after device creation, inside the test body's dispatch |
+  | **Host** | `journalctl -k`: **`NVRM: Xid (PCI:0000:02:00): 109, pid=…, name=vkr-ring-346, channel 0x0000001b, errorString CTX SWITCH TIMEOUT`** |
+  | Correlation | dxbc test starts 16:02:20 → Xid at **16:02:26**; dxil test starts 16:11:23 → Xid at **16:11:31**. Two for two, ~6-8 s in, a different `vkr-ring-NNN` each time |
+
+  **What the test does:** `test_uav_counters_null_behavior` (`tests/d3d12_descriptors.c:4440`) builds
+  UAVs with a **null counter resource** and dispatches a compute shader that performs counter ops on
+  them — behaviour the test itself calls *"technically undefined, but all drivers behave robustly
+  here, we should too"*. Its neighbour in the same file records **"Observed on NV: Blue screen of
+  death (?!?!)"** for the analogous root-descriptor case, so this family genuinely hard-faults NVIDIA
+  hardware rather than returning zeroes.
+
+  ⚠ **It is NOT a transport wedge**, and that is the useful part: re-running the `D12-G1` bridge
+  probe *while the wedged process was still alive* passed all 28 steps. Xid 109 kills **one channel**
+  (`0x1b`) and the `vkr-ring-NNN` thread bound to it, so a fresh device gets a fresh context and works.
+  Do not reach for the 66th/67th sessions' whole-transport story.
+  ⚠ **Nothing host-side reports it to the guest.** `/tmp/helios-qemu-stderr.log` has **no entry at
+  all** for either Xid — the render server loses the context and the guest simply waits forever.
+  That is the actual defect to fix: a lost host context must become a guest-visible error (device
+  removal / TDR), not an unbounded wait. The 67th's `VN_HELIOS_RING_WAIT_BOUND_MS=8000` bound did
+  **not** cover this site.
   **Instrument:** `tmp/dx12/g2-hang-watchdog.ps1`, run as a second scheduled task beside the suite.
   It waits for a `d3d12.exe` older than 240 s whose CPU has not moved in 120 s, names the victim (the
   newest log with no `tests executed` line), **captures `~*k` stacks and a `/ma` dump first**, appends

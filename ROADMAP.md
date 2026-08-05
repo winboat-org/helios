@@ -1649,6 +1649,36 @@ registered in advance (`PREDICTIONS.md`) and scored.
   rule going forward: NO knob-ON benchmark runs except with the trap
   armed and a specific hypothesis to discriminate — the next occurrence
   must pay for itself in stacks, not scores.
+  ⭐ **72nd: Xid-109 NOW HAS A DETERMINISTIC REPRODUCER, and it is not a
+  benchmark.** `test_uav_counter_null_behavior_dxbc` and `…_dxil` from
+  vkd3d-proton's own suite fire it **on demand, ~6-8 s in, two for two**
+  (dxbc start 16:02:20 → `Xid 109 … name=vkr-ring-346, channel 0x1b, CTX
+  SWITCH TIMEOUT` at 16:02:26; dxil start 16:11:23 → Xid at 16:11:31, a
+  different ring). Run one test headless in ~30 s instead of waiting for
+  2-of-3 fast-path GT1 runs. `tests/d3d12_descriptors.c:4440` builds UAVs
+  with a **null counter resource** and dispatches counter ops on them —
+  the test calls it *"technically undefined, but all drivers behave
+  robustly here"*, and its neighbour records *"Observed on NV: Blue screen
+  of death (?!?!)"* for the analogous case, so the family hard-faults
+  NVIDIA hardware rather than returning zeroes.
+  ⚠ **This shifts the leading theory.** The old suspect was a
+  timing-sensitive lost/misordered device-side signal, rate-amplified.
+  A null-descriptor compute dispatch that faults the channel in six
+  seconds is not rate-sensitive — so either there are two Xid-109 causes
+  or the GT1 one is also a bad-descriptor fault that only becomes likely
+  at rate. **Discriminate with the new repro before spending more on the
+  rate theory.**
+  ⚠ **Containment reconfirmed, and the real defect named:** the Xid kills
+  ONE channel — the `D12-G1` bridge probe passed all 28 steps *while the
+  wedged process was still alive* — but **nothing propagates the loss to
+  the guest**: `/tmp/helios-qemu-stderr.log` has no entry at all for
+  either Xid, and the guest's vkd3d fence thread sleeps in the venus ICD
+  forever. The 67th's `VN_HELIOS_RING_WAIT_BOUND_MS=8000` does not cover
+  this site. **A lost host context must become a guest-visible error
+  (device removal / TDR), not an unbounded wait** — that is the WS1 fix,
+  and it is now testable in half a minute.
+  Evidence: `tmp/dx12/gates/G2/hang/` (stacks + `/ma` dumps),
+  `tmp/dx12/gates/G2/hangs.txt`, `docs/dx12/GATES.md` §4.3.
   **NEW WS1 watch item (67th): `ScStale` ≈ 4,000/run under FS (23 % of
   18k flips; ScUnav ~10/run) — PRE-EXISTING load signature, masked until
   now because every historical gate check followed a counter-zeroing
