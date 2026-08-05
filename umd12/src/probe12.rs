@@ -137,12 +137,25 @@ pub unsafe extern "C" fn helios_umd12_probe_create_device_v1(
 
 /// The venus context id this bridge's `ID3D12Device` belongs to (S4b), or 0.
 ///
-/// ⭐ **This is `S4b`'s pass criterion, exposed.** With `helios_umd.dll` and
-/// `helios_umd12.dll` both live in one process, this value and the D3D11
-/// bridge's must be **non-zero and equal** — that is what proves
-/// `helios_icd_anchor_v1` forced both drivers onto one venus ICD module. Unequal
-/// would mean each is stamping identities from a different ICD, and they would
-/// hand each other foreign `VkDeviceMemory`/`VkInstance` handles.
+/// ⛔ **NOT an equality check, and `ARCHITECTURE.md` §6.4 is wrong to ask for
+/// one.** §6.4 states S4b's criterion as *"both venus context ids non-zero and
+/// equal"*. Measured twice, in both load orders
+/// (`tmp/dx12/gates/S4b/RESULT.md`):
+///
+/// | order | this value | the ICD's process-global |
+/// |---|---:|---:|
+/// | D3D11 then D3D12 | 23, 33 | 23, 33 — equal |
+/// | D3D12 then D3D11 | 25, 35 | 27, 37 — **different** |
+///
+/// Each engine builds its **own** `VkInstance` and the ICD mints a venus context
+/// **per instance**, so two engines in one process are *expected* to hold two
+/// different ids; the process-global export is last-writer-wins, so it merely
+/// names whichever engine created its instance last. Equality is an artifact of
+/// ordering, not an invariant.
+///
+/// ⭐ The invariant the anchor actually provides — and what
+/// `tools/icd_anchor_probe.cpp` asserts — is **one venus ICD MODULE per
+/// process**. This value is *reported* beside it, never asserted equal.
 ///
 /// ⚠ 0 is a *degraded read* (no ICD loaded, or one too old to export the ctx
 /// id), NOT an anchor failure: a genuine anchor mismatch refuses device

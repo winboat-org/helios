@@ -95,12 +95,32 @@ void* find_venus_icd_module();
 
 /// `helios_venus_current_ctx_id()` read out of `module`, or 0.
 ///
-/// ⚠ This is the argument-free, **thread-local** export
-/// (`icd/mesa/.../vn_renderer_helios.c:639-644`) — `helios_venus_instance_ctx_id`
-/// ignores its `VkInstance` argument and returns the same thread-local, which is
-/// why `ARCHITECTURE.md` §6.4 requires the ctx id to be read **on the thread
-/// that created the instance, synchronously**. Both bridges therefore call this
-/// immediately after their engine's device create, on that same thread.
+/// ⛔ **This is the PROCESS-GLOBAL export, not the thread-local one**, and the
+/// difference is a live hazard rather than trivia. The ICD keeps two statics
+/// (`icd/mesa/src/virtio/vulkan/vn_renderer_helios.c`), both written from the
+/// same `helios->ctx_id` at CTX_CREATE (`:4201-4202`):
+///
+///   * `helios_current_ctx_id` (`:541`) — a plain `static`, **last-writer-wins
+///     across instances** (`:534`), returned by `helios_venus_current_ctx_id`
+///     (`:637`). This one.
+///   * `helios_calling_thread_ctx_id` (`:548`) — `static _Thread_local`,
+///     returned by `helios_venus_instance_ctx_id` (`:648`). The ICD's own
+///     comment (`:545-547`) says it exists so *"a concurrent instance create
+///     cannot replace it **as it can with `helios_current_ctx_id`**"*.
+///
+/// ⚠ So reading this is safe only because the caller reads it **synchronously,
+/// on the thread that just created the instance**, immediately after its own
+/// CTX_CREATE. A concurrent `vkd3d_create_instance`/`new DxvkInstance` on
+/// another thread can still replace it in that window. The ICD is explicit that
+/// the process-global form is *"for single-instance probes only"* (`:537-538`).
+///
+/// ⛔ **Therefore: evidence only. Never stamp an identity with this value.**
+/// `umd12` has no `VkInstance` to hand `helios_venus_instance_ctx_id` (vkd3d
+/// owns it), so this is the best answer available to it — but the moment a
+/// D3D12 path needs the ctx id for a WDDM allocation identity rather than for a
+/// log line, it must obtain a real `VkInstance` and use the instance-scoped
+/// export instead. `umd`'s `read_current_venus_context_id` carries the same
+/// warning for the same reason.
 ///
 /// Returns 0 for an implausible value rather than a wrong one: KMD-assigned
 /// context ids are small monotonically allocated integers, so anything

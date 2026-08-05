@@ -47,7 +47,9 @@
 //                  the OS D3D12 runtime.
 //   * dxguid.lib — IIDs come from __uuidof().
 //   * dxgi.lib   — ⭐ NEW, and it is a pass criterion of the static arm, not a
-//                  tidy-up. `umd/build.rs:239-243` states the rule for D3D11:
+//                  tidy-up. `umd/build.rs`'s link-lib block states the rule for
+//                  D3D11 (cited without a line number on purpose: it has
+//                  already drifted once, when S4b added a .file() above it):
 //                  "a WDDM UMD sits below DXGI and implements the DXGI DDI; it
 //                  must not depend on dxgi.dll." The retired DLL arm violated it
 //                  twice over — the probe linked dxgi.lib for the adapter LUID
