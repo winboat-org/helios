@@ -242,28 +242,70 @@ A lane is done when **all** of:
 6. It touched **no** file it does not own, and its diff against `tables12.rs`/`build.rs`/
    `device12.rs`/`knobs12.rs` is append-only.
 
-## 10. ⭐ The final pass — a dedicated agent, with a checklist, not "someone compiles it"
+## 10. ⭐ The final pass — fanned out too, on two axes
 
 Host cross-checking (§7) removes the type errors before merge. What it cannot remove is everything
-that is not a Rust type. **One agent owns the final pass**, holds the VM lease for it, and runs it
-against **merged** code — never against a lane branch.
+that is not a Rust type. That review is itself large — 214 handlers across a dozen files — so it
+**also fans out**. Only **B** and **C** need the VM and a single holder.
 
-**A. Static analysis — no VM needed, run it first because it is free**
+### ⛔ Split reviewers by LENS, not by file
 
-| check | why it is here |
+The obvious split — one reviewer per file — is the weak one. A reviewer holding the same slice the
+author held **shares the author's blind spot**, and in a flat DDI table the defects that matter are
+cross-file: a handle stored in `resource12.rs` and misread in `descriptors.rs`, two lanes' fields
+colliding in `device12.rs`, an `install_*` ordering hazard visible only in `tables12.rs`. Eleven
+file-scoped reviewers also re-derive the same context eleven times and each miss the seams.
+
+So: **mechanical checks split by file; semantic checks split by lens, each reading the whole diff.**
+
+### A1 — mechanical sweep, split by file, cheap and high-volume
+
+⭐ **Script what is scriptable before spending an agent on it.** These are near-syntactic; a
+reviewer adds nothing a `grep` does not, and an agent's attention is better spent on A2.
+
+| invariant | scar |
 |---|---|
-| `cargo check --target x86_64-pc-windows-msvc` on the **merge**, not the lanes | two lanes can each compile and still conflict — a duplicate `install_*`, two fields named the same |
-| `cargo clippy --target x86_64-pc-windows-msvc -- -D warnings` | 214 hand-written handlers is exactly where `clippy::missing_safety_doc` and friends earn their keep |
-| every `unsafe` has a `// SAFETY:` | `CLAUDE.md` rule 4. Grep the diff, not the tree |
-| no `panic!` / `todo!` / `unimplemented!` / `.unwrap()` / `.expect()` on runtime data | a panic in any DDI is a **silent graphics deadlock**, and `panic = "abort"` makes it a dead compositor |
-| every refusal has a named counter and appears in its set's summary | `CLAUDE.md` rule 2. A counter nothing reads is not an instrument (T5) |
-| `grep -rn 'static_assert(' umd/bridge umd12/bridge umd_common/bridge` → **1** | `ead692e`; ⚠ with the paren — the bare word matches this document |
-| no `#[allow(...)]` on a hand-written line | generated code may be allowed; hand-written code may not. R908 is the precedent |
-| `git diff` on the four shared files is **append-only** | §5 |
-| ⛔ every `Slot<Boxed<S>>::get()` call site carries a **re-derived** D3D12 argument | `umd_common::slot` says it is established for D3D11 and NOT for D3D12 |
-| ⛔ slot-count and table-size claims re-derived from `DECISIONS.md` §4.1 | not from a group heading, not from a `grep -c` |
+| every `unsafe` has a `// SAFETY:` | `CLAUDE.md` rule 4 |
+| no `panic!` / `todo!` / `unimplemented!` / `.unwrap()` / `.expect()` on runtime data | a panic in any DDI is a **silent graphics deadlock**; `panic = "abort"` makes it a dead compositor |
+| no `#[allow(...)]` on a hand-written line | generated code may be allowed, hand-written code may not — R908 |
+| `grep -rn 'static_assert(' umd/bridge umd12/bridge umd_common/bridge` → **1** | `ead692e`. ⚠ with the paren; the bare word matches this document |
+| `cargo clippy --target x86_64-pc-windows-msvc -- -D warnings` | 214 hand-written handlers is where `missing_safety_doc` earns its keep |
+| `git diff` on the four shared files is append-only | §5 |
 
-**B. Compile / build analysis — VM, lease held**
+Agents take the residue — the judgement calls a grep flags but cannot settle (*is this `.unwrap()`
+on runtime data or on a compile-time constant?*).
+
+### A2 — semantic review, split by lens, each agent reads the WHOLE merged diff
+
+| lens | looking for | the scar that justifies it |
+|---|---|---|
+| **ABI & tables** | slot **index** vs member index; table size from the runtime's `SIZE_T` not `size_of::<T>()`; `extern "C"` not `extern "system"`; no hand-transcribed struct | `DECISIONS.md` §4.1's "slots 38-40" was a `sed` line offset misread as a member index. R702: 24H2 passed 576 B for a 592 B struct. R908 |
+| **Handles & lifetimes** | payload type **derived** from the handle type, never chosen at the call site; every `Slot<Boxed<S>>::get()` carrying a **re-derived** D3D12 argument | §12 rule 7 — `load_com::<ID3D11RenderTargetView>(h_rtv)` compiled and produced a `ManuallyDrop` whose vtable pointer was a struct field: a wild call on first use |
+| **Loud failure** | every refusal counted **and readable** — a counter that appears in no summary is not an instrument | T5: three of four scan-out counters were atomics **nothing ever loaded**, so ROADMAP's own instruction to read them was not executable |
+| **Concurrency** | state touched from create/destroy DDIs under FREETHREADED; anything that refills a live table | §12 rule 10 — `RelocateDeviceFuncs` is a **NOTIFICATION**; the old refill made a concurrent `CalcPrivate*Size` return 0 → zero-byte private region → heap corruption |
+| **Cross-lane seams** | duplicate/renamed `install_*`, colliding `device12.rs` fields, install **order** correctness, knob-inventory order | §12 rule 9 — install order once rested on textual sequence and the wrong order gave *"wrong blending for DWM, no counter, no log, only pixels"* |
+| **Engine contract** | ownership across the cxx boundary; every bridge entry through `bridge_guard`; owned-vs-borrowed COM | R815 — cxx generates raw methods as **inherent** methods; module privacy does not seal them |
+| **Claim integrity** | every number in a comment or doc re-derived, not inherited | ⭐ this session: D4's "self-contained" survived because a symbol search was mistaken for a link, and a `git grep` check counted its own documentation |
+
+Seven lenses is a good width. With fewer agents, merge lenses rather than dropping them — **ABI &
+tables** and **Loud failure** are the two that must always run.
+
+### The finding protocol — without it, N reviewers cost more than they save
+
+1. **Dedup before routing.** Seven whole-diff reviewers *will* report the same defect. The
+   integrator merges by (file, line, claim), keeping the clearest statement.
+2. ⛔ **Adversarially verify before routing.** A plausible-but-wrong finding costs a lane owner real
+   time and teaches them to discount the next one. Each surviving finding gets a skeptic asked to
+   **refute** it; default to refuted when uncertain. `refactor-review-phase1-40th` is the precedent —
+   300 findings, and the ones that mattered were the ones that survived being argued with.
+3. **Route to the owning lane, by file ownership (§4).** The reviewer does not fix.
+4. **A finding without a failure scenario is a suggestion.** State the inputs and the wrong
+   behaviour, or file it as a nit.
+
+⚠ The owner can also run `/code-review ultra` on the branch — a multi-agent cloud review — but that
+is **user-triggered and billed**; agents cannot launch it and must not try.
+
+### B. Compile / build analysis — VM, lease held, ONE holder
 
 | check | why |
 |---|---|
@@ -274,15 +316,20 @@ against **merged** code — never against a lane branch.
 | the link set is still `libhelios_d3d12_static.a` + `gdi32` | anything else appearing means a lane pulled in an object it should not have |
 | cold `cargo check` wall time and generated-file size, tracked | UNVERIFIED-2's numbers are the baseline; a sudden jump means an allowlist widened |
 
-**C. Runtime — VM, lease held, and only after A and B are clean**
+### C. Runtime — VM, lease held, and only after A and B are clean
 
 `D12-G7` → `G8` → the id-1000 cold boot → Fire Strike 3-run median for the **D3D11** parity check.
 ⚠ Report what happened, including partial failures. A lane whose slots still hit the noop counters
 is **not done** (§9.2), and saying so is the whole value of this pass.
 
-⛔ **The final-pass agent does not fix what it finds.** It reports, and the owning lane fixes.
-An agent that both writes and audits its own 214 slots is the review-your-own-homework failure the
-adversarial-verification discipline exists to prevent.
+⛔ **No reviewer fixes what it finds, and no lane reviews its own files.** An agent that both
+writes and audits its own slots is the review-your-own-homework failure the whole pass exists to
+prevent — which is also the second reason A2 splits by lens: a lens crosses every lane, so no
+reviewer can be scoped to the code it wrote.
+
+⚠ **A and C have very different costs.** A1+A2 are free and parallel — run them on every merge. B is
+cheap but serial. **C is the expensive serial tail**: if lanes land in a batch, C runs once, not
+once per lane.
 
 ## 11. Integrator's checklist per merge
 
