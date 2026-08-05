@@ -25,12 +25,20 @@ windows = { version = "0.58", features = [
     "Win32_System_Diagnostics_Debug",
 ] }
 
-# ⛔ NO cxx / cxx-build and NO build.rs yet, deliberately.
+[build-dependencies]
+# S3: bindgen `d3d12umddi.h` with `layout_tests(true)`. The layout assertions
+# ARE the deliverable -- if this crate compiles, the D3D12 DDI ABI is
+# machine-checked against the SDK header. Same bindgen version as `umd`, so both
+# drivers' generated ABI comes out of one code generator.
+bindgen = "0.70"
+
+# ⛔ STILL NO cxx / cxx-build, deliberately.
 #
-# `ARCHITECTURE.md` §11 stages this crate: S3 adds `build.rs` + bindgen of
-# `d3d12umddi.h` + `ddi12.rs`; S4 adds the vkd3d bridge. This commit is the
-# crate skeleton only -- it exists so the two-cdylib build, mirror, and install
-# path can be proven end to end before any DDI code is written.
+# `ARCHITECTURE.md` §11 stages this crate: S3 (this) is bindgen only; S4 adds
+# the vkd3d bridge and links the archives. ⭐ That link set is already MEASURED,
+# not a guess (`D12-G1` static arm): `libhelios_d3d12_static.a` + `gdi32.lib`,
+# one archive because it is a union of every vkd3d / dxil-spirv / dxbc-spirv
+# object. ⛔ Never `dxgi`.
 #
 # ⛔ And the standing rule that shapes all of it (`DECISIONS.md` §7.1):
 # `OpenAdapter12` must stop refusing IN THE SAME COMMIT that makes its body

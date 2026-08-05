@@ -1862,11 +1862,30 @@ restored. Cheaper alternative, no write: at S5, deploy a `helios_umd12.dll` whos
 only calls `log_self_module_path()` (`umd/src/log.rs:187`) and returns `DXGI_ERROR_UNSUPPORTED`, then
 check that `umd12-<pid>.log` appears for a D3D12 client.
 
-**UNVERIFIED-2 — the size and build cost of the `d3d12umddi.h` bindgen generation.** The header is
-19 031 lines with 683 `typedef struct` and 399 distinct `PFND3D12DDI_*` typedefs, versus a d3d10umddi
-generation of 43k Rust lines / 1.1 MB from 818 types. *Settle:* run S3 and read
-`wc -l $OUT_DIR/d3d12umddi.rs` plus the cold `cargo build` wall time. If it hurts, narrow the
-allowlist to the implemented DDI versions — never drop `layout_tests(true)`.
+**UNVERIFIED-2 — ✅ CLOSED 2026-08-06 by running S3. It does not hurt.** Was: the size and build
+cost of the `d3d12umddi.h` bindgen generation, against a d3d10umddi generation of 43k Rust lines /
+1.1 MB from 818 types. **Measured:**
+
+| | d3d10umddi (`umd`) | d3d12umddi (`umd12`) |
+|---|---|---|
+| generated Rust | 43k lines / 1.1 MB | **102 874 lines / 5.41 MB** |
+| `pub struct` | 818 types | **1 683** |
+| `pub type PFND3D12DDI*` | — | **399** — every one the header declares |
+| layout-assertion blocks | 6 336 fields | **1 904** |
+| cold `cargo check` wall time | — | **15 s** |
+
+⇒ ~2.4× the lines and ~4.9× the bytes of the D3D11 generation, for 15 seconds. **Do not narrow the
+allowlist**; the mitigation this item authorised is unnecessary, and `layout_tests(true)` stays.
+
+⭐ **And the number that actually settles it: `helios_umd12.dll` is 104 960 bytes — byte-for-byte
+the same size as before S3.** 5.4 MB of generated ABI costs zero bytes in the shipped binary,
+because nothing references it yet. Exports are exactly `OpenAdapter12`; imports are `KERNEL32`,
+`ntdll`, `VCRUNTIME140` and two api-sets — **no `dxgi`, no `d3d12`**.
+
+⚠ Two things the run corrected: bindgen needs `#![allow(unused_imports)]` (28 generated `use self::_FOO
+as FOO` enum aliases, which the D3D11 header does not produce) and `#![allow(unnecessary_transmutes)]`
+(9, all in generated bitfield accessors). Both are on the `include!` module in `umd12/src/ddi12.rs`;
+neither is on a hand-written line.
 
 **UNVERIFIED-3 — whether robocopy `/XD vkd3d-proton` also excludes `vkd3d-proton-helios`.**
 `tools/win-mcp/src/main.rs:576` and `:843` name a bare `vkd3d-proton`, a directory that does not

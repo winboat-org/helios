@@ -51,6 +51,8 @@
 
 #![deny(deprecated)]
 
+mod ddi12;
+
 // Mirrors `umd/src/lib.rs`: this is a Windows display driver and nothing in it
 // is meaningful on another target. Failing at the top is clearer than failing
 // deep inside a platform intrinsic.
