@@ -234,9 +234,12 @@ plumbing in `umd-check.ps1` — that whole prerequisite dissolved.
   the KMD and the D3D11 driver. One owner, and it lands after L3a/L3b, not beside them.
 - **`DECISIONS.md`, `ARCHITECTURE.md`, `GATES.md`.** Lanes propose; the integrator edits. Eleven
   agents editing the authoritative docs is how D4's "self-contained" claim happens again.
-- **The version choice (`_0040` vs `_0110`).** One decision, made once, before fan-out —
-  `_0110` carries thirteen `VulkanOn12` obligations that carry no cap and cannot be declined
-  (`SUBSTRATE.md` §4.5).
+- ~~**The version choice (`_0040` vs `_0110`).**~~ ✅ **MADE, 2026-08-06 — `DECISIONS.md` D12:
+  `_0110`, advertised as a set of exactly ONE token, filling the `_0109`-generation tables.** The
+  thirteen `VulkanOn12` obligations (`SUBSTRATE.md` §4.5) are accepted and become **lane
+  obligations**: each one a lane cannot honour gets a named refusal counter, not silence. ⛔ No lane
+  may add a second token to `pfnGetSupportedVersions` — a second token makes a second table shape
+  reachable, which is the §12-trap-2 surface D12 closes by construction.
 
 ## 9. Per-lane definition of done
 

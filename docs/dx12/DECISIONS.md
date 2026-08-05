@@ -760,6 +760,63 @@ D3D12 path. `HKLM\SOFTWARE\Helios` is writable over SSH with the desktop down; t
 per process so a running dwm keeps its behaviour while new processes pick up the change. The flip to
 default-ON requires the evidence in the comment at the read site (CLAUDE.md rule 8).
 
+**Decision D12 — the DDI version is `D3D12DDI_SUPPORTED_0110`, advertised as a set of exactly ONE
+token, with the `_0109`-generation tables. Decided 2026-08-06, before the S6 fan-out.**
+
+`PARALLEL.md` §8 lists this as the one remaining not-parallelisable choice and requires it be made
+*before* lanes start, because the lane split, every slot count in §4.1 and `DDI_REFERENCE.md` §3.2 /
+§4.2's group boundaries are all derived from the chosen revision. It is decided here, once.
+
+| | `_0110` — **chosen** | `_0040` — rejected |
+|---|---|---|
+| baseline driver-side slots | 214 (8 + 124 + 75 + 7) | 169 (8 + 96 + 58 + 7) |
+| object model | pool + recorder | the retired command **allocator** family (`CORE_0033` and older) |
+| `pfnFillDDITable` `TableSize` this runtime passes | 992 / 600 / 56 | 768 / 464 / 56 |
+| caps gauntlet | 43 types, ~60 cross-tier rules | **identical** — an older token softens nothing |
+| `VulkanOn12` obligations | thirteen, no cap, cannot be declined (`SUBSTRATE.md` §4.5) | none |
+
+Reasons, in order:
+
+1. ✅ **Measured: `_0110` is what this runtime asks for first.** `D12-G5` logged WARP's 77-token list
+   and the runtime picking `_0110` out of it (`DDI_REFERENCE.md` §1.5). `_0040` is *accepted* and a
+   triangle presents on it (§15.4), so the trade was real — but taking it means every count in §4.1,
+   every group boundary in `DDI_REFERENCE.md` §3.2/§4.2 and the whole `PARALLEL.md` §4 lane table
+   would have to be re-derived against `CORE_0040`/`_0040`-generation command lists, for which this
+   directory holds **no** counts at all. That is a doc re-derivation with its own miscount risk
+   (§4.1's own warning: "several were miscounted independently by more than one research lane") in
+   exchange for 45 stubbed slots.
+2. **The 45 slots `_0040` saves are the cheap ones.** They are state objects, mesh shaders, work
+   graphs, enhanced barriers and VRS — `PARALLEL.md`'s L9, *"mostly refuse-and-count"*. The
+   expensive surface (caps, queue, recording, descriptors, PSO) is present in both.
+3. **`_0040`'s saving is paid back immediately in the object model.** It predates the pool + recorder
+   split and carries `pfnCalcPrivateCommandAllocatorSize` / `pfnCreateCommandAllocator` /
+   `pfnDestroyCommandAllocator` / `pfnResetCommandAllocator` (`d3d12umddi.h:1740-1743`), a shape
+   vkd3d does not model and which nothing else in this plan is written against.
+
+⚠ **What choosing `_0110` costs, stated rather than discovered later.** The thirteen `VulkanOn12`
+obligations carry no cap and cannot be declined. `SUBSTRATE.md` §4.5 names the four that bite a
+Vulkan-backed forwarder — triangle fans (0097+), mismatched RT/DS sizes (0102+), dynamic-state PSO
+flags being **hints** and not the Vulkan "baked value is ignored" semantics, and non-normalized
+sampler coordinates (0100+) — plus the `DepthBias` `INT`→`FLOAT` reinterpretation at 0099 and the
+`D3D12DDI_RASTERIZER_DESC_0102` re-rev. **Each one that Helios cannot honour gets a named refusal
+counter in its owning lane, not silence.** They are lane obligations now, not an open question.
+
+⛔ **Advertise exactly one token.** `pfnGetSupportedVersions` reports a one-element set, so the
+runtime either negotiates `_0110` or fails the handshake with its own string (*"Failed to find
+matching DDI versions"*). That is what makes `ARCHITECTURE.md` §12 trap 2's closed enum trivially
+exhaustive: there is one legal `(Interface, Version)` pair, every other pair is a counted refusal,
+and there is no revision under which a `_0109`-shaped table could be written into a buffer sized for
+something else. ⛔ Adding a second token is a behaviour change that needs its own gate — it makes a
+second table shape reachable, which is the R702/§12-trap-2 surface this decision closes by
+construction.
+
+⚠ **`_0110` adds no table struct of its own.** It reuses `D3D12DDI_ADAPTERFUNCS_0109`,
+`D3D12DDI_DEVICE_FUNCS_CORE_0109`, `D3D12DDI_COMMAND_LIST_FUNCS_3D_0108` and
+`D3D12DDI_COMMAND_QUEUE_FUNCS_CORE_0001` — so "negotiate `_0110`, fill the `_0109` generation" is one
+decision, not two. The token itself is **composed from bindgen'd constants**
+(`D3D12DDI_INTERFACE_VERSION_R8`, `D3D12DDI_BUILD_VERSION_0110`), never transcribed: bindgen does not
+emit `D3D12DDI_SUPPORTED_0110` at all, because the macro casts through `(UINT64)`.
+
 ---
 
 ## 8. Deliverable map

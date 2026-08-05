@@ -347,6 +347,13 @@ accepts `_0109`, `_0089` and `_0040` (§15.4).
 
 ### 1.6 Which version to implement
 
+✅ **DECIDED 2026-08-06 — `DECISIONS.md` D12: `_0110`, advertised as a set of exactly ONE token,
+filling the `_0109`-generation tables.** Everything below is the argument that produced it and is
+kept because the rejected arm was measured, not assumed. ⛔ D12 is authoritative; nothing here
+reopens it. The one thing D12 adds that this section did not say: **advertise a one-element set**, so
+the runtime either negotiates `_0110` or fails the handshake, which makes the closed-enum dispatch
+of §12 trap 2 exhaustive with a single legal arm.
+
 ⚠ **Two measurements from `D12-G5` change the terms of this section; read them before the argument
 below.**
 
