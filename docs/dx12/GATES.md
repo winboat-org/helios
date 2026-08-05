@@ -822,9 +822,35 @@ kmd-counters-G2-{pre,post}.txt}`; **committed:** `docs/dx12/baselines/vkd3d-know
   `32 * subgroupSize` fallback, `device.c:10226-10233`, because venus exposes neither
   `VK_AMD_shader_core_properties` nor `VK_NV_shader_sm_builtins`). Record it as a defect, do not
   "fix" it by editing the CSV.
-* ⚠ `PSSpecifiedStencilRefSupported` will read FALSE (`VK_EXT_shader_stencil_export` is absent from
-  the ICD) and `DoublePrecisionFloatShaderOps` FALSE (same denorm root cause as H5). Tests touching
-  either are expected members of the known-fail list.
+* ⚠ `PSSpecifiedStencilRefSupported` reads **FALSE** — confirmed (`VK_EXT_shader_stencil_export` is
+  absent from the ICD). ⛔ **`DoublePrecisionFloatShaderOps` reads TRUE, not FALSE** — that prediction
+  shared H5's root cause and died with it. Tests touching stencil-ref export are expected members of
+  the known-fail list; double-precision ones are not.
+* ⚠ **The hang class, seen 2026-08-05 at `test_uav_counter_null_behavior_dxbc`.** The suite stopped
+  dead: the process sat at **0.17 s of CPU over six minutes**, 5 MiB working set, all nine threads
+  in `Wait`. `cdb -pv -p <pid> -c "~*k 24; lm; qd"` — a **noninvasive** attach, which reads stacks
+  without becoming the debuggee's controller, so `qd` leaves it running — showed the shape:
+  vkd3d's `vkd3d_fence` thread parked in `SleepEx` **inside the venus ICD**
+  (`vulkan_virtio_…!…+0x74f4f`, called from `d3d12core`), `vkd3d_queue` on a condition variable, and
+  the test's main thread in `WaitForSingleObject`. The log stops immediately after
+  `DX Ultimate supported!`, i.e. it wedges after device creation and before the test body.
+  ⚠ **It is NOT a transport wedge:** re-running the `D12-G1` bridge probe *while the wedged process
+  was still alive* passed all 28 steps. So a fresh device works and the wedge is per-device — do not
+  reach for the 66th/67th sessions' whole-transport story.
+  **Instrument:** `tmp/dx12/g2-hang-watchdog.ps1`, run as a second scheduled task beside the suite.
+  It waits for a `d3d12.exe` older than 240 s whose CPU has not moved in 120 s, names the victim (the
+  newest log with no `tests executed` line), **captures `~*k` stacks and a `/ma` dump first**, appends
+  to `hangs.txt`, and only then kills it so the run continues. A killed test writes no summary line,
+  so it lands in `nosummary` — which is the honest bucket for a hang, and is why `nosummary != 0`
+  must be triaged rather than treated as flake.
+* ⚠ **`graphics_hook64.dll` (OBS Studio's game-capture hook) is injected into every D3D12 test
+  process on this VM** — two of the nine threads in the wedged process were its. It is a third-party
+  overlay hooking the same surfaces the driver owns, which is exactly the foreign-stack hazard
+  `DECISIONS.md` H2(a) describes, and it is an uncontrolled variable in every G2/G9 number. It did
+  not prevent `D12-G1` from passing, so it is not *obviously* the hang's cause — but a conformance
+  baseline should be taken with it out of the picture. **Check for it (`lm` in the dump, or
+  `Get-Process | … Modules`) before trusting a G2/G9 delta**, and settle whether OBS's hook can be
+  disabled for gate runs.
 
 ---
 
