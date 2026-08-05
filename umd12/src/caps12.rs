@@ -72,31 +72,32 @@
 //! raise belongs to the lane that earns it, in the commit that earns it, and
 //! must move the feature level and the floors it arms **together**.
 //!
-//! # ⛔ What is NOT here yet, and it is what `D12-G7` is blocked on
+//! # ⭐ The per-format half, at the bottom of this file
 //!
-//! The three device-core slots ([`install`]) — `pfnCheckFormatSupport`,
-//! `pfnCheckMultisampleQualityLevels`, `pfnGetMipPacking` — are still
-//! `forward12::noop12` stubs.
+//! The 43-enumerator gauntlet above is only part of what the runtime asks. The
+//! three device-core slots this lane also owns — `pfnCheckFormatSupport`,
+//! `pfnCheckMultisampleQualityLevels`, `pfnGetMipPacking` — are called
+//! **2 823 times inside a single `D3D12CreateDevice`** (measured:
+//! `tmp/dx12/gates/G7/RESULT.md`, 93 format queries + 2 730 MSAA queries; the
+//! mip-packing slot is never reached).
 //!
 //! ⚠ An earlier revision of this paragraph said they were *"device-scope and
-//! not on the path that gates device creation"*. **Measured, and wrong**
-//! (`tmp/dx12/gates/G7/RESULT.md`): the runtime calls them **2 824 times inside
-//! `D3D12CreateDevice`** — 93 format queries, 2 730 MSAA queries, one node map.
-//! A counting noop returns 0, so the driver answers *"no format supports
-//! anything"*, which is an inconsistent caps set and exactly the
-//! `DXGI_ERROR_DRIVER_INTERNAL_ERROR` the gate sees.
+//! not on the path that gates device creation"*. **Measured, and wrong**: with
+//! counting noops they answered 0, i.e. *"no format supports anything"*, which
+//! is an inconsistent caps set and is exactly the
+//! `DXGI_ERROR_DRIVER_INTERNAL_ERROR` `D12-G7` was failing with.
 //!
-//! ⇒ **This lane is not done, and `D12-G7` cannot be green, until those three
-//! are real** — see [`install`] for the shape and for the D3D11 precedent whose
-//! `_NOT_SUPPORTED`-sentinel trap applies verbatim. `PARALLEL.md` §9.2 wants
-//! their noop counters at zero under a real workload; device creation wants them
-//! at zero immediately.
+//! They are implemented at the bottom of this file, forwarding into the vkd3d
+//! engine's `ID3D12Device::CheckFeatureSupport` and narrowing the result to
+//! what the caps above claim. The section header there carries the shape, the
+//! `_NOT_SUPPORTED`-sentinel trap, and the one coherence check that looks right
+//! and is not.
 
 use helios_umd_common::hr::{Hresult, E_INVALIDARG, S_OK};
 
 use crate::ddi12;
 use crate::forward12::tables12::{stage, DeviceCoreTable, Filling};
-use crate::{log_error, note_refusal, UMD12_REFUSALS};
+use crate::{log_error, note_refusal, trace_line, UMD12_REFUSALS};
 
 /// Short aliases for the bindgen enumerator names.
 ///
@@ -220,8 +221,84 @@ mod v {
 ///   R908 body reported. Do not resurrect it by copy-paste.
 const DRIVER_MAX_FEATURE_LEVEL: ddi12::D3D12DDI_3DPIPELINELEVEL = v::FL_11_0;
 
+// ---------------------------------------------------------------------------
+// The three caps that a per-format answer is coupled to
+// ---------------------------------------------------------------------------
+//
+// ⭐ These exist because the format/MSAA slots at the bottom of this file must
+// give the **same** answer as the caps structs at the top, and nothing else
+// would make that checkable. `D3D12Core.dll` cross-validates the caps set as a
+// whole (`DDI_REFERENCE.md` §11.5); a per-format bit that contradicts the tier
+// two hundred lines above it is exactly the inconsistency `D12-G7` was failing
+// on. Each is read at **both** sites, so the lane that raises one finds the
+// other by following the constant rather than by remembering.
+
+/// The tiled-resources tier this driver reports, and the reason
+/// `D3D12DDI_FORMAT_SUPPORT_TILED` is withheld from every format and a
+/// `TILED_RESOURCE` multisample query is answered with zero quality levels.
+///
+/// See [`tiled_resources_tier`] for why it is `NOT_SUPPORTED` while the engine
+/// backs tier 4.
+const TILED_RESOURCES_TIER_REPORTED: ddi12::D3D12DDI_TILED_RESOURCES_TIER = v::TILED_NONE;
+
+/// `D3D12DDI_SHADER_CAPS_0084::TypedUAVLoadAdditionalFormats`, and the reason
+/// `D3D12DDI_FORMAT_SUPPORT_UAV_READS` is narrowed to the three formats FL 11_0
+/// mandates.
+///
+/// ⛔ FALSE is only legal *below* FL 12_0 — strings:169, *"FL 12+ driver
+/// incorrectly does not report support for typed UAV load additional formats."* —
+/// so this constant and [`DRIVER_MAX_FEATURE_LEVEL`] move together.
+const TYPED_UAV_LOAD_ADDITIONAL_FORMATS: ddi12::BOOL = 0;
+
+/// `D3D12DDI_D3D12_OPTIONS_DATA_0089::OutputMergerLogicOp`, and the reason
+/// `D3D12DDI_FORMAT_SUPPORT_OUTPUT_MERGER_LOGIC_OP` is withheld from every
+/// format.
+const OUTPUT_MERGER_LOGIC_OP: ddi12::BOOL = 0;
+
+/// The three `DXGI_FORMAT`s whose typed UAV load FL 11_0 mandates
+/// unconditionally: `R32_FLOAT`, `R32_UINT`, `R32_SINT`.
+///
+/// ⭐ This is what makes [`TYPED_UAV_LOAD_ADDITIONAL_FORMATS`] `= FALSE` mean
+/// what it says. The cap's name is *additional* formats: FALSE narrows typed UAV
+/// loads to these three rather than removing them, so masking `UAV_READS` off
+/// everywhere would under-report a floor FL 11_0 requires, and forwarding it
+/// everywhere would over-report the cap. Both directions are wrong; this is the
+/// only answer consistent with both.
+const FL11_TYPED_UAV_LOAD_FORMATS: [ddi12::DXGI_FORMAT; 3] = [41, 42, 43];
+
+/// `Umd12FormatCaps` = 1: hand the engine's API-level `D3D12_FORMAT_SUPPORT1`
+/// back unchanged instead of translating it into `D3D12DDI_FORMAT_SUPPORT`.
+/// See [`crate::knobs12::UMD12_FORMAT_CAPS`] and [`driver_format_support`].
+const FORMAT_CAPS_API_PASSTHROUGH: u32 = 1;
+
+/// `Umd12FormatCaps` = 2: the DDI encoding with **neither** multisample bit,
+/// on any format. A bisect arm, not a policy.
+const FORMAT_CAPS_NO_MSAA_BITS: u32 = 2;
+
+/// `Umd12FormatCaps` = 3: the DDI encoding with the multisample bits kept only
+/// on formats that are also plain render targets. A bisect arm, not a policy.
+const FORMAT_CAPS_MSAA_NEEDS_RT: u32 = 3;
+
 /// How many times a bounded evidence line may repeat, per site.
 const LOG_BUDGET: usize = 64;
+
+/// The per-call evidence budget for `pfnCheckFormatSupport`.
+///
+/// ⚠ Deliberately larger than [`LOG_BUDGET`] and sized to cover a **whole
+/// sweep**: `D12-G7` measured 93 calls inside one `D3D12CreateDevice`, and the
+/// question this budget has to answer on a failing run is *"which format got
+/// which bits"* — an answer that is useless truncated at 64 of 93. Process
+/// global, so the second device's sweep is silent.
+const FORMAT_SUPPORT_LOG_BUDGET: usize = 128;
+
+/// The per-call evidence budget for `pfnCheckMultisampleQualityLevels`.
+///
+/// ⛔ Small on purpose: the same measurement counted **2 730** calls in one
+/// device creation (91 formats x 30 sample counts). A budget that covered the
+/// sweep would be a log flood on every device, and the counters carry the
+/// aggregate. The refusal arms below have their own separate budgets, so a rare
+/// event is never crowded out by the common one.
+const MSAA_LOG_BUDGET: usize = 16;
 
 // ---------------------------------------------------------------------------
 // The pData writer
@@ -457,7 +534,11 @@ unsafe fn d3d12_options(a: &ddi12::D3D12DDIARG_GETCAPS, data_size: usize) -> Hre
         TiledResourcesTier: tiled_resources_tier(),
         CrossNodeSharingTier: v::CROSS_NODE_NONE,
         VPAndRTArrayIndexFromAnyShaderFeedingRasterizerSupportedWithoutGSEmulation: 0,
-        OutputMergerLogicOp: 0,
+        // ⚠ Read from the shared constant, not written as a literal: the
+        // per-format `OUTPUT_MERGER_LOGIC_OP` bit at the bottom of this file is
+        // gated on the same value, and a driver that reports the cap FALSE
+        // while setting the bit on a format contradicts itself.
+        OutputMergerLogicOp: OUTPUT_MERGER_LOGIC_OP,
         ResourceHeapTier: v::HEAP_TIER_1,
         DepthBoundsTestSupported: 0,
         ProgrammableSamplePositionsTier: v::SAMPLE_POSITIONS_NONE,
@@ -512,7 +593,7 @@ unsafe fn d3d12_options(a: &ddi12::D3D12DDIARG_GETCAPS, data_size: usize) -> Hre
 /// The clamp is written now, at the site, so that the lane which raises this
 /// cannot forget it.
 fn tiled_resources_tier() -> ddi12::D3D12DDI_TILED_RESOURCES_TIER {
-    let engine_reports = v::TILED_NONE;
+    let engine_reports = TILED_RESOURCES_TIER_REPORTED;
     if engine_reports > v::TILED_MAX {
         UMD12_REFUSALS.caps_tiled_tier_clamped.bump();
         return v::TILED_MAX;
@@ -571,7 +652,10 @@ unsafe fn shader_caps(a: &ddi12::D3D12DDIARG_GETCAPS, data_size: usize) -> Hresu
         MinPrecision: v::MIN_PRECISION_NONE,
         DoubleOps: 0,
         ShaderSpecifiedStencilRef: 0,
-        TypedUAVLoadAdditionalFormats: 0,
+        // ⚠ The shared constant, for the same reason as `OutputMergerLogicOp`:
+        // it is what narrows the per-format `UAV_READS` bit at the bottom of
+        // this file to the three formats FL 11_0 mandates.
+        TypedUAVLoadAdditionalFormats: TYPED_UAV_LOAD_ADDITIONAL_FORMATS,
         ROVs: 0,
         WaveOps: 0,
         WaveLaneCountMin: SUBGROUP_SIZE,
@@ -927,39 +1011,818 @@ unsafe fn options_0102(a: &ddi12::D3D12DDIARG_GETCAPS, data_size: usize) -> Hres
 }
 
 // ---------------------------------------------------------------------------
-// The device-core slots
+// The device-core slots — the per-format half of the caps contract
 // ---------------------------------------------------------------------------
+//
+// ⭐ **These three are not a footnote to the caps gauntlet, they are half of
+// it.** `tmp/dx12/gates/G7/RESULT.md` counted three noop slots hit **2 824
+// times inside `D3D12CreateDevice`**; two of them are here —
+// `pfnCheckFormatSupport` **93** (the 91-format sweep `DDI_REFERENCE.md` §11.1
+// predicted; the 91 x 30 decomposition is `DDI_REFERENCE.md` §14.0, not the
+// gate file) and `pfnCheckMultisampleQualityLevels` **2 730** — for **2 823**.
+// ⚠ The remaining 1 is `pfnQueryNodeMap`, which is L9's and lands in
+// `forward12/misc.rs`; `pfnGetMipPacking` was never called at all. With
+// counting noops these answered *"no format supports anything and no sample
+// count has any quality level"*, which is an inconsistent caps set by
+// construction and is what `DXGI_ERROR_DRIVER_INTERNAL_ERROR` was reporting.
+//
+// ⚠ An earlier revision of this file's module doc called them "device-scope and
+// not on the path that gates device creation". Measured, and wrong.
+//
+// # ⭐ Why there is no new C++ here, and why that is not a shortcut
+//
+// The handoff for this work specified a new `bridge12` cxx module forwarding
+// into `ID3D12Device::CheckFeatureSupport` — C++, compilable only on the VM.
+// It is not needed: `ID3D12Device` is a **COM interface**, `bridge12` already
+// hands Rust a borrowed one through [`crate::bridge12::BridgeDevice12`], and
+// the `windows` crate's generated vtable call is the same indirect call the
+// C++ would have made. A cxx module would have added a translation unit, a
+// `build.rs` edit and a VM-only compile step to reach the identical vtable
+// slot.
+//
+// `PARALLEL.md` §5's *"a lane that needs new engine calls gets its own cxx
+// bridge module"* still stands for the calls that genuinely need C++ — the ones
+// taking engine types the SDK headers do not describe. `CheckFeatureSupport`
+// takes `D3D12_FEATURE` plus a `void*`, so it needs none. ⭐ The consequence is
+// that this whole lane type-checks on the Linux host (`PARALLEL.md` §7), which
+// the C++ route would have taken away from it.
+//
+// # ⛔ The trap, and it is the reason this gate failed the same way twice
+//
+// `DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM` (89) must be refused with the
+// explicit `_NOT_SUPPORTED` sentinel `0x8000_0000`, **never a bare 0**. The
+// D3D11 runtime rejected a bare 0 there as a malformed caps response and failed
+// `D3D11CreateDevice` with `DXGI_ERROR_DRIVER_INTERNAL_ERROR` (`0x887A0020`) —
+// the *same* HRESULT, on the same box, from the same class of mistake
+// (`umd/src/forward/format_caps.rs:244-262`). The D3D10 DDI's format-support
+// bit values are byte-for-byte `D3D12DDI_FORMAT_SUPPORT`'s, sentinel included,
+// so the precedent transfers whole.
+
+use windows::Win32::Graphics::Direct3D12::{
+    D3D12_FEATURE_DATA_FORMAT_SUPPORT, D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS,
+    D3D12_FEATURE_FORMAT_SUPPORT, D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, D3D12_FORMAT_SUPPORT1,
+    D3D12_FORMAT_SUPPORT1_BLENDABLE, D3D12_FORMAT_SUPPORT1_BUFFER, D3D12_FORMAT_SUPPORT1_DISPLAY,
+    D3D12_FORMAT_SUPPORT1_IA_VERTEX_BUFFER, D3D12_FORMAT_SUPPORT1_MULTISAMPLE_LOAD,
+    D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RENDERTARGET, D3D12_FORMAT_SUPPORT1_RENDER_TARGET,
+    D3D12_FORMAT_SUPPORT1_SHADER_GATHER, D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE,
+    D3D12_FORMAT_SUPPORT2, D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD,
+    D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE, D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_TILED_RESOURCE,
+    D3D12_MULTISAMPLE_QUALITY_LEVEL_FLAGS,
+};
+use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+
+use crate::device12::{self, HeliosD3D12Device};
+
+/// Short aliases for the DDI's own format-support bits.
+///
+/// Same discipline as [`v`]: every line below is a compile-checked reference to
+/// the generated header constant, never a transcribed number.
+mod fs {
+    use crate::ddi12;
+
+    pub(super) const SHADER_SAMPLE: u32 = ddi12::D3D12DDI_FORMAT_SUPPORT_SHADER_SAMPLE;
+    pub(super) const RENDERTARGET: u32 = ddi12::D3D12DDI_FORMAT_SUPPORT_RENDERTARGET;
+    pub(super) const BLENDABLE: u32 = ddi12::D3D12DDI_FORMAT_SUPPORT_BLENDABLE;
+    pub(super) const MULTISAMPLE_RENDERTARGET: u32 =
+        ddi12::D3D12DDI_FORMAT_SUPPORT_MULTISAMPLE_RENDERTARGET;
+    pub(super) const MULTISAMPLE_LOAD: u32 = ddi12::D3D12DDI_FORMAT_SUPPORT_MULTISAMPLE_LOAD;
+    pub(super) const DECODER_OUTPUT: u32 = ddi12::D3D12DDI_FORMAT_SUPPORT_DECODER_OUTPUT;
+    pub(super) const VIDEO_PROCESSOR_OUTPUT: u32 =
+        ddi12::D3D12DDI_FORMAT_SUPPORT_VIDEO_PROCESSOR_OUTPUT;
+    pub(super) const VIDEO_PROCESSOR_INPUT: u32 =
+        ddi12::D3D12DDI_FORMAT_SUPPORT_VIDEO_PROCESSOR_INPUT;
+    pub(super) const VERTEX_BUFFER: u32 = ddi12::D3D12DDI_FORMAT_SUPPORT_VERTEX_BUFFER;
+    pub(super) const UAV_WRITES: u32 = ddi12::D3D12DDI_FORMAT_SUPPORT_UAV_WRITES;
+    pub(super) const BUFFER: u32 = ddi12::D3D12DDI_FORMAT_SUPPORT_BUFFER;
+    pub(super) const CAPTURE: u32 = ddi12::D3D12DDI_FORMAT_SUPPORT_CAPTURE;
+    pub(super) const VIDEO_ENCODER: u32 = ddi12::D3D12DDI_FORMAT_SUPPORT_VIDEO_ENCODER;
+    pub(super) const OUTPUT_MERGER_LOGIC_OP: u32 =
+        ddi12::D3D12DDI_FORMAT_SUPPORT_OUTPUT_MERGER_LOGIC_OP;
+    pub(super) const SHADER_GATHER: u32 = ddi12::D3D12DDI_FORMAT_SUPPORT_SHADER_GATHER;
+    pub(super) const MULTIPLANE_OVERLAY: u32 = ddi12::D3D12DDI_FORMAT_SUPPORT_MULTIPLANE_OVERLAY;
+    pub(super) const TILED: u32 = ddi12::D3D12DDI_FORMAT_SUPPORT_TILED;
+    pub(super) const UAV_READS: u32 = ddi12::D3D12DDI_FORMAT_SUPPORT_UAV_READS;
+    pub(super) const DISPLAY: u32 = ddi12::D3D12DDI_FORMAT_SUPPORT_DISPLAY;
+    /// ⛔ `0x8000_0000`, *"Set only this bit"*. See the section header.
+    pub(super) const NOT_SUPPORTED: u32 = ddi12::D3D12DDI_FORMAT_SUPPORT_NOT_SUPPORTED;
+}
+
+/// The engine's `D3D12_FORMAT_SUPPORT1` bit -> this DDI's bit, for every DDI bit
+/// derived from the engine's answer.
+///
+/// ⚠ The two enums are **not** the same numbering — the API's `SHADER_SAMPLE` is
+/// `0x200` and the DDI's is `0x1` — so this is a translation and not a
+/// pass-through. `umd/src/forward/format_caps.rs` passes its value through
+/// unchanged, and that is correct *there* for a reason that does not transfer:
+/// the D3D11 DDI harmonised with the D3D11 API enum. The D3D12 DDI did not; it
+/// defines its own 20-bit `D3D12DDI_FORMAT_SUPPORT` right beside
+/// `pfnCheckFormatSupport`, and those are the bits the runtime reads.
+///
+/// ⚠ **The API bits with NO DDI counterpart, listed so their absence is a
+/// decision rather than an omission.** The DDI enum carries only *usage*
+/// capabilities; it has no way to say "this is a 2D texture format" or "this is
+/// a depth format", so these are dropped: `TEXTURE1D/2D/3D`, `TEXTURECUBE`,
+/// `MIP`, `SHADER_LOAD`, `SHADER_SAMPLE_COMPARISON`, `SHADER_SAMPLE_MONO_TEXT`,
+/// `SHADER_GATHER_COMPARISON`, `CAST_WITHIN_BIT_LAYOUT`, `BACK_BUFFER_CAST`,
+/// `IA_INDEX_BUFFER`, `SO_BUFFER`, `MULTISAMPLE_RESOLVE`,
+/// `TYPED_UNORDERED_ACCESS_VIEW` and — the one worth naming twice —
+/// **`DEPTH_STENCIL`**. ⛔ It is deliberately NOT folded into
+/// `D3D12DDI_FORMAT_SUPPORT_RENDERTARGET`: in this DDI that bit means "usable
+/// as a render target", and a depth format is not, so folding it would be an
+/// over-claim to fix a cosmetic gap. The consequence is visible and expected —
+/// `D32_FLOAT_S8X24_UINT` answers `MULTISAMPLE_RENDERTARGET` alone — and the
+/// runtime already knows which formats are depth formats without asking.
+const SUPPORT1_TO_DDI: &[(u32, u32)] = &[
+    (D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE.0 as u32, fs::SHADER_SAMPLE),
+    (D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0 as u32, fs::RENDERTARGET),
+    (D3D12_FORMAT_SUPPORT1_BLENDABLE.0 as u32, fs::BLENDABLE),
+    (
+        D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RENDERTARGET.0 as u32,
+        fs::MULTISAMPLE_RENDERTARGET,
+    ),
+    (
+        D3D12_FORMAT_SUPPORT1_MULTISAMPLE_LOAD.0 as u32,
+        fs::MULTISAMPLE_LOAD,
+    ),
+    (
+        D3D12_FORMAT_SUPPORT1_IA_VERTEX_BUFFER.0 as u32,
+        fs::VERTEX_BUFFER,
+    ),
+    (D3D12_FORMAT_SUPPORT1_BUFFER.0 as u32, fs::BUFFER),
+    (D3D12_FORMAT_SUPPORT1_SHADER_GATHER.0 as u32, fs::SHADER_GATHER),
+    // ⚠ Scan-out capability, and the one bit here that another Helios component
+    // has to back. The KMD owns a real VidPn source and sends DWM's shared
+    // primary through `SET_SCANOUT_BLOB`, so the capability exists; the engine's
+    // list of displayable formats is the narrower of the two and is what is
+    // reported. L8 (present) is the lane that would have to widen it.
+    (D3D12_FORMAT_SUPPORT1_DISPLAY.0 as u32, fs::DISPLAY),
+];
+
+/// The engine's `D3D12_FORMAT_SUPPORT2` bit -> this DDI's bit.
+const SUPPORT2_TO_DDI: &[(u32, u32)] = &[
+    (D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE.0 as u32, fs::UAV_WRITES),
+    // ⚠ Additionally narrowed by [`FL11_TYPED_UAV_LOAD_FORMATS`]; see
+    // [`TYPED_UAV_LOAD_ADDITIONAL_FORMATS`].
+    (D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD.0 as u32, fs::UAV_READS),
+];
+
+/// Every DDI bit that is decided by the engine's answer.
+const ENGINE_DERIVED_BITS: u32 = or_ddi_bits(SUPPORT1_TO_DDI) | or_ddi_bits(SUPPORT2_TO_DDI);
+
+/// Every DDI bit this driver withholds from **every** format, with the cap or
+/// the missing subsystem each one is withheld for.
+///
+/// * the four video bits (`DECODER_OUTPUT`, `VIDEO_PROCESSOR_OUTPUT`,
+///   `VIDEO_PROCESSOR_INPUT`, `VIDEO_ENCODER`) and `CAPTURE` — Helios implements
+///   no video DDI in either driver, so a format cannot be a decoder output or a
+///   capture target however capable the underlying Vulkan format is. The D3D11
+///   driver scrubs the same family for the same reason
+///   (`umd/src/forward/format_caps.rs`'s `VIDEO_BITS`).
+/// * `OUTPUT_MERGER_LOGIC_OP` — [`OUTPUT_MERGER_LOGIC_OP`] is FALSE.
+/// * `MULTIPLANE_OVERLAY` — there is no overlay path: `pfnGetOptionalDDITables`
+///   answers zero tables and `D12-G5` measured that this runtime never requests
+///   `D3D12DDI_TABLE_TYPE_DXGI` at all.
+/// * `TILED` — [`TILED_RESOURCES_TIER_REPORTED`] is `NOT_SUPPORTED`, so no
+///   tiled resource can exist and no format can be usable in one.
+///   ⚠ **No runtime string is known to enforce this**, and an earlier revision
+///   of this comment wrongly cited strings:48 for it: that string is a *range*
+///   check on the value of `D3D12DDI_D3D12_OPTIONS_DATA::TiledResourcesTier`,
+///   which `NOT_SUPPORTED` passes, in a different DDI call. The bit is withheld
+///   because `DECISIONS.md` §7.8 says an unbacked capability is a lie the OS
+///   acts on — not because a check was found that would catch it.
+const WITHHELD_BITS: u32 = fs::DECODER_OUTPUT
+    | fs::VIDEO_PROCESSOR_OUTPUT
+    | fs::VIDEO_PROCESSOR_INPUT
+    | fs::VIDEO_ENCODER
+    | fs::CAPTURE
+    | fs::OUTPUT_MERGER_LOGIC_OP
+    | fs::MULTIPLANE_OVERLAY
+    | fs::TILED;
+
+/// Every `D3D12DDI_FORMAT_SUPPORT_*` bit this build's header defines, except the
+/// `NOT_SUPPORTED` sentinel — which is not a capability and is never combined
+/// with one.
+const ALL_CAPABILITY_BITS: u32 = fs::SHADER_SAMPLE
+    | fs::RENDERTARGET
+    | fs::BLENDABLE
+    | fs::MULTISAMPLE_RENDERTARGET
+    | fs::MULTISAMPLE_LOAD
+    | fs::DECODER_OUTPUT
+    | fs::VIDEO_PROCESSOR_OUTPUT
+    | fs::VIDEO_PROCESSOR_INPUT
+    | fs::VERTEX_BUFFER
+    | fs::UAV_WRITES
+    | fs::BUFFER
+    | fs::CAPTURE
+    | fs::VIDEO_ENCODER
+    | fs::OUTPUT_MERGER_LOGIC_OP
+    | fs::SHADER_GATHER
+    | fs::MULTIPLANE_OVERLAY
+    | fs::TILED
+    | fs::UAV_READS
+    | fs::DISPLAY;
+
+// ⭐ **THE PARTITION PROOF, and it is the deliverable of this section.** Every
+// capability bit the header defines is either derived from the engine or
+// explicitly withheld with a reason — never neither, and never both. A bit
+// nobody decided about is exactly how a driver ships a capability it cannot
+// back (`DECISIONS.md` §7.8), and a bit decided twice is how the two decisions
+// diverge. Same idea as `forward12::noop12`'s ABI-order proof: state the
+// invariant to the compiler rather than to the reader.
+//
+// ⚠ **What it does NOT catch, stated because the obvious reading is wrong.** All
+// three operands are hand-written lists in this file, so a WDK bump that adds a
+// `D3D12DDI_FORMAT_SUPPORT_*` constant is referenced by none of them and the
+// build stays green with the new bit silently reported as unsupported forever.
+// bindgen emits the constant, `ddi12`'s crate-level `#![allow(dead_code)]`
+// suppresses any lint on it, and nothing here notices. The assertions prove a
+// property of the DECISIONS this file makes, not of the header it makes them
+// about — which is still worth having, and is not the same claim.
+const _: () = assert!(
+    ENGINE_DERIVED_BITS | WITHHELD_BITS == ALL_CAPABILITY_BITS,
+    "every D3D12DDI_FORMAT_SUPPORT bit must be either engine-derived or explicitly withheld"
+);
+const _: () = assert!(
+    ENGINE_DERIVED_BITS & WITHHELD_BITS == 0,
+    "a D3D12DDI_FORMAT_SUPPORT bit cannot be both engine-derived and withheld"
+);
+const _: () = assert!(
+    ALL_CAPABILITY_BITS & fs::NOT_SUPPORTED == 0,
+    "the NOT_SUPPORTED sentinel is not a capability bit"
+);
+
+// ⛔ The DDI's multisample flag and the API's must be the same value, because
+// the flag is forwarded to the engine unchanged. They are separate enums in
+// separate headers and nothing but this line couples them.
+const _: () = assert!(
+    ddi12::D3D12DDI_MULTISAMPLE_QUALITY_LEVEL_FLAGS_D3D12DDI_MULTISAMPLE_QUALITY_LEVEL_FLAG_TILED_RESOURCE
+        == D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_TILED_RESOURCE.0,
+    "D3D12DDI_MULTISAMPLE_QUALITY_LEVEL_FLAG_TILED_RESOURCE must equal the API flag it forwards to"
+);
+
+/// OR together the DDI-side bit of every pair in a translation table.
+const fn or_ddi_bits(pairs: &[(u32, u32)]) -> u32 {
+    let mut acc = 0u32;
+    let mut i = 0;
+    while i < pairs.len() {
+        acc |= pairs[i].1;
+        i += 1;
+    }
+    acc
+}
+
+/// Map a source bitmask through a translation table.
+fn translate(pairs: &[(u32, u32)], src: u32) -> u32 {
+    let mut out = 0u32;
+    for &(from, to) in pairs {
+        if src & from != 0 {
+            out |= to;
+        }
+    }
+    out
+}
+
+/// Ask the engine what it supports for one format. `None` when there is no
+/// engine to ask or it refused; both are counted.
+fn engine_format_support(dev: &HeliosD3D12Device, format: ddi12::DXGI_FORMAT) -> Option<(u32, u32)> {
+    let Some(engine) = dev.engine.d3d12_device() else {
+        // Unreachable by construction — `helios_vkd3d_bridge_create_device`
+        // returns a null `unique_ptr` rather than an empty one on every failure
+        // path, and `BridgeDevice12::create` folds null into `None` — so a live
+        // `HeliosD3D12Device` always carries a device. Counted anyway, because
+        // "unreachable by construction" is a claim about a cross-FFI contract
+        // and this is the only place it could be observed breaking.
+        note_refusal(&UMD12_REFUSALS.caps_slot_no_device);
+        return None;
+    };
+    let mut data = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+        Format: DXGI_FORMAT(format),
+        Support1: D3D12_FORMAT_SUPPORT1(0),
+        Support2: D3D12_FORMAT_SUPPORT2(0),
+    };
+    // SAFETY: `feature` and the buffer agree by construction — `data` is a live
+    // local of exactly the struct `D3D12_FEATURE_FORMAT_SUPPORT` names, and the
+    // size passed is its own `size_of`, so the engine cannot write outside it.
+    // `engine` is the bridge's BORROWED `ID3D12Device` in a `ManuallyDrop`; the
+    // call issues no reference-count change and the wrapper is never released.
+    let asked = unsafe {
+        engine.CheckFeatureSupport(
+            D3D12_FEATURE_FORMAT_SUPPORT,
+            core::ptr::from_mut(&mut data).cast::<core::ffi::c_void>(),
+            core::mem::size_of::<D3D12_FEATURE_DATA_FORMAT_SUPPORT>() as u32,
+        )
+    };
+    if let Err(err) = asked {
+        UMD12_REFUSALS.caps_format_support_engine_failed.bump();
+        let n = UMD12_REFUSALS.caps_format_support_engine_failed.get();
+        if n <= LOG_BUDGET {
+            log_error!(
+                "CheckFormatSupport fmt={format}: engine refused hr={:#010x} -> answering \
+                 unsupported (x{n})",
+                err.code().0 as u32,
+            );
+        }
+        return None;
+    }
+    Some((data.Support1.0 as u32, data.Support2.0 as u32))
+}
+
+/// What **this driver** reports for one format: the engine's answer, translated
+/// into DDI bits, narrowed to what the caps at the top of this file claim.
+///
+/// ⚠ **Every typeless format answers 0 here**, and that is the engine's own
+/// position rather than an artefact of the masking: `d3d12_device_get_format_support`
+/// skips its whole rendering-and-shader block for non-planar typeless formats
+/// (`device.c:5300`), and the bits it does still set for them — `TEXTURE1D/2D/3D`,
+/// `TEXTURECUBE`, `MIP`, `CAST_WITHIN_BIT_LAYOUT` — have **no counterpart in
+/// `D3D12DDI_FORMAT_SUPPORT` at all**. The DDI enum carries only usage
+/// capabilities, and a typeless format is not directly usable. See
+/// `check_multisample_quality_levels` for why that must not be turned into a
+/// cross-check against the multisample answer.
+fn driver_format_support(dev: &HeliosD3D12Device, format: ddi12::DXGI_FORMAT) -> u32 {
+    let (support1, support2) = engine_format_support(dev, format).unwrap_or((0, 0));
+
+    // ⭐ **THE ENCODING, AND IT IS AN A/B BECAUSE IT IS NOT SETTLED.** See
+    // [`crate::knobs12::UMD12_FORMAT_CAPS`] for the full argument: the header
+    // defines a small `D3D12DDI_FORMAT_SUPPORT` enum beside this DDI, but the
+    // D3D11 side of this project measured that its own DDI is *harmonized with
+    // the API enum* and that translating regresses device creation
+    // (`umd/src/forward/format_caps.rs:15-19`). If D3D12 inherited that, the
+    // translation below is the same mistake one generation later.
+    //
+    // ⚠ Arm 1 passes the engine's `D3D12_FORMAT_SUPPORT1` through unchanged,
+    // which is exactly what the D3D11 driver does with DXVK's value. It applies
+    // none of the masking below, deliberately: the point of the arm is to test
+    // the *encoding*, and mixing in a policy difference would make a green run
+    // unattributable.
+    if crate::knobs12::umd12_format_caps() == FORMAT_CAPS_API_PASSTHROUGH {
+        let n = UMD12_REFUSALS.caps_format_support_calls.get();
+        if n <= FORMAT_SUPPORT_LOG_BUDGET {
+            log_error!(
+                "CheckFormatSupport fmt={format} s1={support1:#010x} s2={support2:#010x} -> \
+                 {support1:#010x} (API PASSTHROUGH, Umd12FormatCaps=1) (x{n})"
+            );
+        }
+        return support1;
+    }
+
+    let mut caps = translate(SUPPORT1_TO_DDI, support1) | translate(SUPPORT2_TO_DDI, support2);
+    caps &= !WITHHELD_BITS;
+
+    // ⚠ The two diagnostic arms. They exist because the remaining `D12-G7`
+    // blocker is *which bit* in a per-format answer the runtime rejects, and
+    // the runtime gives no ETW reason for it — so the answer space is bisected
+    // by measurement instead of guessed at a fourth time. See
+    // [`crate::knobs12::UMD12_FORMAT_CAPS`].
+    match crate::knobs12::umd12_format_caps() {
+        FORMAT_CAPS_NO_MSAA_BITS => caps &= !(fs::MULTISAMPLE_RENDERTARGET | fs::MULTISAMPLE_LOAD),
+        FORMAT_CAPS_MSAA_NEEDS_RT if caps & fs::RENDERTARGET == 0 => {
+            caps &= !(fs::MULTISAMPLE_RENDERTARGET | fs::MULTISAMPLE_LOAD)
+        }
+        _ => {}
+    }
+
+    // ── The two multisample bits, and the pair rule the runtime enforces ────
+    //
+    // ⛔ **`MULTISAMPLE_LOAD` WITHOUT `MULTISAMPLE_RENDERTARGET` IS REJECTED.**
+    // `D3D12CreateDevice` fails `0x887A0020` and the ETW
+    // `Microsoft-Windows-Direct3D12` provider gives the reason in English —
+    // *"MSAA quality reported to be 0"*, message index 62. Measured on this box
+    // 2026-08-06 (`tmp/dx12/gates/G7/RESULT.md`), and the table is unambiguous:
+    // the runtime's format sweep accepted **neither** bit (formats 1, 5, 9, 15,
+    // 19), **both** bits (2-18) and `RENDERTARGET` **alone** (20, a depth
+    // format), and aborted the whole sweep at the first format that answered
+    // `LOAD` alone — `R32_FLOAT_X8X24_TYPELESS` (21).
+    //
+    // ⚠ Note what it is NOT: the rejected call's own answer was **1**, not 0
+    // (`CheckMultisampleQualityLevels fmt=21 count=2 -> 1` is the last line of
+    // the trace). Two earlier fixes aimed at the quality-level answer and both
+    // missed, because the inconsistency is inside the *format* answer.
+    //
+    // ⭐ The implication is what the enum means. `D3D10_DDI_FORMAT_SUPPORT`, whose
+    // values these are byte-for-byte, documents `MULTISAMPLE_LOAD` as *"format
+    // can be used as source for 'ld2dms'"* and `MULTISAMPLE_RENDERTARGET` as
+    // *"format can be used as RenderTarget with some sample count > 1"* — you
+    // cannot `ld2dms` a resource that could never be created multisampled. The
+    // D3D11 driver on this same box encodes the implication by construction and
+    // has done since PATH-A: `umd/src/forward/format_caps.rs:234-241` sets
+    // `DDI_MSAA_RENDERTARGET` first and `DDI_MSAA_LOAD` only *additionally*, so
+    // it can never emit the pair this runtime rejects.
+    //
+    // Why the engine produces it: `vkd3d_get_format(21, false)` returns the
+    // DEPTH-STENCIL table entry (`utils.c:160`; `plane_count > 1` forces it at
+    // `utils.c:932-934`), whose `is_dsv_format` test fails — DEPTH aspect, no
+    // STENCIL, `plane_count == 2` (`device.c:5301-5303`) — so the
+    // `DEPTH_STENCIL | MULTISAMPLE_RENDERTARGET` arm at `device.c:5341` never
+    // runs, while the sampled-image arm still sets `MULTISAMPLE_LOAD` at
+    // `device.c:5312`. ⚠ WARP does not have this gap: its D3D11 answer for the
+    // same depth-read views carries both bits (`format_caps.rs`'s
+    // `WARP_DEPTH_READ_CAPS`, `0x04d2_17b0` — ours is `0x04d0_17b0`, and the one
+    // missing bit is exactly `MULTISAMPLE_RENDERTARGET`).
+    const MSAA_RT: u32 = fs::MULTISAMPLE_RENDERTARGET;
+    const MSAA_LOAD: u32 = fs::MULTISAMPLE_LOAD;
+
+    // ⭐ **THE MULTISAMPLE POLICY, DERIVED FROM FOUR MEASURED POINTS.** The
+    // runtime rejects an incoherent (format bits, quality levels) pair with
+    // `0x887A0020` and aborts its whole 91-format sweep at the first one, so
+    // each of these came from an arm that got further or less far than the last
+    // (`tmp/dx12/gates/G7/RESULT.md` has the table):
+    //
+    // | format | answered | quality levels | runtime |
+    // |---|---|---|---|
+    // | 1 `R32G32B32A32_TYPELESS` | `0x0` | 2/4/8 | accepted -- an all-zero answer is exempt |
+    // | 2 `R32G32B32A32_FLOAT` | `0x4707` (RT, no MSAA_RT) | 2/4/8 | **rejected** |
+    // | 6 `R32G32B32_FLOAT` | `0x4501` (no MSAA bits) | none | accepted |
+    // | 20 `D32_FLOAT_S8X24_UINT` | `0x8` (MSAA_RT alone) | 2/4/8 | accepted |
+    // | 20 | `0x0` | 2/4/8 | **rejected** |
+    // | 21 `R32_FLOAT_X8X24_TYPELESS` | `0x4011` / `0x4019` (LOAD, no RENDERTARGET) | 2/4/8 | **rejected** |
+    // | 21 | `0x4001` (no MSAA bits) | 2/4/8 | **rejected** |
+    //
+    // Three rules fit all of it, and nothing simpler does:
+    //   (A) a format that declares ANY capability and CAN be multisampled must
+    //       declare `MULTISAMPLE_RENDERTARGET`;
+    //   (B) a format that cannot be multisampled must declare neither bit;
+    //   (C) `MULTISAMPLE_LOAD` only where `RENDERTARGET` is also set.
+    //
+    // ⚠ (A) subsumes FL 11_0's *"every output-capable format supports at least
+    // 4x MSAA"* floor, which `umd/src/forward/format_caps.rs:126-134` states in
+    // those words for D3D11 — but it is **wider**: format 20 is a depth target
+    // and carries no `RENDERTARGET` at all, so a rule keyed on `RENDERTARGET`
+    // alone leaves it at `0x0` and is rejected. (C) is why 21 cannot simply keep
+    // what the engine gave it.
+
+    // (B) first, so (A) cannot resurrect a capability with no shape behind it.
+    if caps & (MSAA_RT | MSAA_LOAD) != 0 && !engine_offers_any_msaa(dev, format) {
+        UMD12_REFUSALS.caps_msaa_bits_dropped.bump();
+        let n = UMD12_REFUSALS.caps_msaa_bits_dropped.get();
+        if n <= LOG_BUDGET {
+            log_error!(
+                "CheckFormatSupport fmt={format}: engine claims multisample bits ({:#010x}) but \
+                 offers no quality level at any sample count -> dropping them (x{n})",
+                caps & (MSAA_RT | MSAA_LOAD),
+            );
+        }
+        caps &= !(MSAA_RT | MSAA_LOAD);
+    }
+
+    // (A) A format that declares anything at all and CAN be multisampled must
+    //     declare `MULTISAMPLE_RENDERTARGET`. ⛔ Keyed on `caps != 0` rather than
+    //     on `RENDERTARGET`, because format 20 is a depth target with no
+    //     `RENDERTARGET` and is rejected at `0x0` yet accepted at `0x8`. The
+    //     `caps != 0` exemption is format 1's: an all-zero answer is how the
+    //     driver says "not supported", and the runtime accepts quality levels
+    //     alongside it.
+    if caps != 0 && caps & MSAA_RT == 0 && engine_offers_any_msaa(dev, format) {
+        UMD12_REFUSALS.caps_msaa_rendertarget_implied.bump();
+        let n = UMD12_REFUSALS.caps_msaa_rendertarget_implied.get();
+        if n <= LOG_BUDGET {
+            log_error!(
+                "CheckFormatSupport fmt={format}: engine offers quality levels above 1 sample but \
+                 no MULTISAMPLE_RENDERTARGET -> implying it (x{n})"
+            );
+        }
+        caps |= MSAA_RT;
+    }
+
+    // (C) `MULTISAMPLE_LOAD` only where `RENDERTARGET` is set, and AFTER (A) so
+    //     the two cannot fight. `D3D10_DDI_FORMAT_SUPPORT` defines `LOAD` as
+    //     *"can be used as source for 'ld2dms'"*, which presupposes a colour
+    //     target to have rendered into; the depth-read views (21, 22, 46, 47)
+    //     are what vkd3d answers this way, because its sampled-image arm sets
+    //     `LOAD` while its `is_dsv_format` test refuses them the render-target
+    //     arm (`device.c:5301-5312`).
+    if caps & MSAA_LOAD != 0 && caps & fs::RENDERTARGET == 0 {
+        UMD12_REFUSALS.caps_msaa_load_without_rendertarget.bump();
+        let n = UMD12_REFUSALS.caps_msaa_load_without_rendertarget.get();
+        if n <= LOG_BUDGET {
+            log_error!(
+                "CheckFormatSupport fmt={format}: MULTISAMPLE_LOAD without RENDERTARGET -> \
+                 dropping LOAD (x{n})"
+            );
+        }
+        caps &= !MSAA_LOAD;
+    }
+
+    // ⛔ Typed UAV *loads*, narrowed rather than dropped. See
+    // [`FL11_TYPED_UAV_LOAD_FORMATS`]: the cap is named *additional* formats, so
+    // FALSE means "the three FL 11_0 mandates and no others", and both the
+    // all-off and the all-on answer contradict it.
+    if TYPED_UAV_LOAD_ADDITIONAL_FORMATS == 0 && !FL11_TYPED_UAV_LOAD_FORMATS.contains(&format) {
+        caps &= !fs::UAV_READS;
+    }
+
+    // ⭐ The evidence line, and it carries the ENGINE'S RAW ANSWER as well as
+    // this driver's. The first `D12-G7` run with these slots live could not be
+    // diagnosed from the log — it took an ETW `Microsoft-Windows-Direct3D12`
+    // capture to learn which format and which rule — because the log recorded
+    // only the final DDI value, and the whole question was how it was derived.
+    // `s1`/`s2` are the API-level `D3D12_FORMAT_SUPPORT1`/`2` the engine gave.
+    let n = UMD12_REFUSALS.caps_format_support_calls.get();
+    if n <= FORMAT_SUPPORT_LOG_BUDGET {
+        log_error!(
+            "CheckFormatSupport fmt={format} s1={support1:#010x} s2={support2:#010x} -> \
+             {caps:#010x} (x{n})"
+        );
+    }
+
+    if caps != 0 {
+        return caps;
+    }
+
+    // ⛔ THE SENTINEL. A format with no capability at all is reported with a
+    // bare 0 — except for the one the runtime validates specially, where a bare
+    // 0 is a malformed response and `0x8000_0000` set alone is the required
+    // answer. The header's own words are *"Currently only valid for
+    // DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM. (Set only this bit)"*, which is
+    // why this is not applied to every unsupported format: the sentinel is not a
+    // generic "no" and setting it where it is not valid is the same class of
+    // malformed answer in the other direction.
+    if format == DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM {
+        UMD12_REFUSALS.caps_format_not_supported_sentinel.bump();
+        let n = UMD12_REFUSALS.caps_format_not_supported_sentinel.get();
+        if n <= LOG_BUDGET {
+            log_error!(
+                "CheckFormatSupport fmt={format} (R10G10B10_XR_BIAS_A2_UNORM): unsupported -> \
+                 NOT_SUPPORTED sentinel {:#010x}, never a bare 0 (x{n})",
+                fs::NOT_SUPPORTED,
+            );
+        }
+        return fs::NOT_SUPPORTED;
+    }
+    0
+}
+
+/// Does the engine offer a quality level at ANY sample count above 1?
+///
+/// The five counts are every value `vk_samples_from_sample_count` can map
+/// (`VK_SAMPLE_COUNT_2/4/8/16/32_BIT`), so a `false` here means no
+/// `pfnCheckMultisampleQualityLevels` answer this driver can give is non-zero.
+///
+/// ⚠ Not a host round trip per call: `supported_sample_counts` is computed once
+/// per format at device init (`vkd3d_init_format_sample_counts`) and this is a
+/// mask test against it. Short-circuits on the first hit, so the common case is
+/// one call.
+fn engine_offers_any_msaa(dev: &HeliosD3D12Device, format: ddi12::DXGI_FORMAT) -> bool {
+    const PROBE_COUNTS: [ddi12::UINT; 5] = [2, 4, 8, 16, 32];
+    let none = ddi12::D3D12DDI_MULTISAMPLE_QUALITY_LEVEL_FLAGS_D3D12DDI_MULTISAMPLE_QUALITY_LEVEL_FLAG_NONE;
+    PROBE_COUNTS
+        .iter()
+        .any(|&count| engine_msaa_quality_levels(dev, format, count, none).unwrap_or(0) != 0)
+}
+
+/// The one format the WDDM runtime validates specially during device creation.
+/// ⛔ See [`driver_format_support`]; `umd/src/forward/format_caps.rs:258` is the
+/// D3D11 site that learned it the hard way.
+const DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM: ddi12::DXGI_FORMAT = 89;
+
+/// `pfnCheckFormatSupport` — 93 calls inside one `D3D12CreateDevice`.
+///
+/// Returns `VOID`. ⚠ `DECISIONS.md` §7 item 6 notes that a `VOID` D3D12 DDI
+/// reports errors through `pfnSetErrorCb`, and this slot deliberately does not
+/// use it: *"this format supports nothing"* is a legitimate answer to a
+/// capability query, not a device error, and raising one would remove the device
+/// over a format the application never asked for. The channel here is the zeroed
+/// out-parameter plus the counters.
+///
+/// # Safety
+/// `h_device` must be a live handle from `device12::create_device`, and `out`
+/// must address one writable `UINT` the runtime owns.
+unsafe extern "C" fn check_format_support(
+    h_device: ddi12::D3D12DDI_HDEVICE,
+    format: ddi12::DXGI_FORMAT,
+    out: *mut ddi12::UINT,
+) {
+    UMD12_REFUSALS.caps_format_support_calls.bump();
+    if out.is_null() {
+        note_refusal(&UMD12_REFUSALS.caps_slot_bad_arg);
+        return;
+    }
+    // ⛔ Written before anything can fail, so every path below leaves a defined
+    // answer. The runtime reads `*out` unconditionally, and leaving its own
+    // buffer untouched is how a "we could not answer" becomes whatever was on
+    // its stack.
+    // SAFETY: non-null per the check above; the DDI declares it `_Out_`.
+    unsafe { core::ptr::write_unaligned(out, 0) };
+
+    // SAFETY: this is a device-scope DDI, so the runtime passes a handle
+    // `create_device` returned `S_OK` for; the borrow lives only until the end
+    // of this call, which is `device12::device`'s stated precondition.
+    let Some(dev) = (unsafe { device12::device(h_device) }) else {
+        note_refusal(&UMD12_REFUSALS.caps_slot_no_device);
+        return;
+    };
+
+    let caps = driver_format_support(dev, format);
+    // SAFETY: as above.
+    unsafe { core::ptr::write_unaligned(out, caps) };
+}
+
+/// `pfnCheckMultisampleQualityLevels` — **2 730** calls inside one
+/// `D3D12CreateDevice`, and the single hottest DDI on the device-creation path.
+///
+/// Exactly **one** gate sits between the engine's answer and the runtime's: a
+/// `TILED_RESOURCE` query is answered with zero quality levels, because
+/// [`TILED_RESOURCES_TIER_REPORTED`] is `NOT_SUPPORTED`. The engine backs tier 4
+/// and answers from `supported_sparse_sample_counts` otherwise
+/// (`vkd3d-proton-helios/libs/vkd3d/device.c:5113-5115`), so without the gate
+/// this driver would offer multisampled tiled resources on the same device that
+/// reports no tiled tier at all.
+///
+/// # ⛔ The coherence check that looks obviously right, and is not
+///
+/// The first draft of this function also refused a `SampleCount > 1` answer
+/// whose format did not carry `MULTISAMPLE_RENDERTARGET` in
+/// [`driver_format_support`], reasoning that *"Driver claimed MSAA support when
+/// it shouldn't"* (strings:20) is a device-creation failure and that the two
+/// answers, coming from one engine, could not disagree.
+///
+/// **They can, they do, and the disagreement is deliberate.** vkd3d computes
+/// them in two unrelated functions:
+///
+/// * `d3d12_device_get_format_support` wraps its ENTIRE rendering-and-shader
+///   block — including both sites that set `MULTISAMPLE_RENDERTARGET` — in
+///   `if (format->type != VKD3D_FORMAT_TYPE_TYPELESS || (aspect & PLANE_0))`
+///   (`device.c:5300`), with the comment *"Rendering and shader usage features
+///   are not set for typeless formats"*;
+/// * `d3d12_device_check_multisample_quality_levels` never looks at
+///   `format->type` at all — it tests `format->supported_sample_counts`
+///   (`device.c:5113-5119`), which `vkd3d_init_format_sample_counts` fills for
+///   every table entry, typeless included.
+///
+/// So `R24G8_TYPELESS` and `R32_TYPELESS` — **the formats an application
+/// actually creates an MSAA depth buffer with** — report no
+/// `MULTISAMPLE_RENDERTARGET` and 1 quality level at 4x, simultaneously and
+/// correctly. vkd3d's typeless suppression exists precisely to match what
+/// native drivers report. The check would therefore have zeroed the quality
+/// levels for the whole typeless family, `CreateCommittedResource` with
+/// `SampleDesc.Count > 1` would have failed, and its counter — documented
+/// "expected 0" — would have read tens per device.
+///
+/// ⇒ The engine's answer is forwarded. The invariant the check enforced does
+/// not exist, and a gate defending an invariant that does not exist is worse
+/// than no gate: it breaks the working case and reports that as health.
+///
+/// # Safety
+/// `h_device` must be a live handle from `device12::create_device`, and
+/// `num_quality_levels` must address one writable `UINT` the runtime owns.
+unsafe extern "C" fn check_multisample_quality_levels(
+    h_device: ddi12::D3D12DDI_HDEVICE,
+    format: ddi12::DXGI_FORMAT,
+    sample_count: ddi12::UINT,
+    flags: ddi12::D3D12DDI_MULTISAMPLE_QUALITY_LEVEL_FLAGS,
+    num_quality_levels: *mut ddi12::UINT,
+) {
+    UMD12_REFUSALS.caps_msaa_calls.bump();
+    if num_quality_levels.is_null() {
+        note_refusal(&UMD12_REFUSALS.caps_slot_bad_arg);
+        return;
+    }
+    // SAFETY: non-null per the check above; the DDI declares it `_Out_`. Zero
+    // first, for the same reason as `check_format_support`.
+    unsafe { core::ptr::write_unaligned(num_quality_levels, 0) };
+
+    // SAFETY: as `check_format_support`.
+    let Some(dev) = (unsafe { device12::device(h_device) }) else {
+        note_refusal(&UMD12_REFUSALS.caps_slot_no_device);
+        return;
+    };
+
+    let tiled_flag =
+        ddi12::D3D12DDI_MULTISAMPLE_QUALITY_LEVEL_FLAGS_D3D12DDI_MULTISAMPLE_QUALITY_LEVEL_FLAG_TILED_RESOURCE;
+    if flags & tiled_flag != 0 && TILED_RESOURCES_TIER_REPORTED == v::TILED_NONE {
+        UMD12_REFUSALS.caps_msaa_tiled_refused.bump();
+        let n = UMD12_REFUSALS.caps_msaa_tiled_refused.get();
+        if n <= LOG_BUDGET {
+            log_error!(
+                "CheckMultisampleQualityLevels fmt={format} count={sample_count}: TILED_RESOURCE \
+                 query with TiledResourcesTier NOT_SUPPORTED -> 0 levels (x{n})"
+            );
+        }
+        return;
+    }
+
+    let levels = engine_msaa_quality_levels(dev, format, sample_count, flags).unwrap_or(0);
+
+    // ⭐ **EVERY call, zeros included, and that is the point.** This is the one
+    // instrument that can answer *"which (format, sample count) did the runtime
+    // reject"*, and it exists because two `D12-G7` runs tried to infer it from
+    // call COUNTS instead. `log_error!` cannot do it: a bounded budget truncates
+    // long before the interesting call and an unbounded one writes 2 730 lines
+    // per device creation, on every boot, forever. `trace_line!` is gated on
+    // `HKLM\SOFTWARE\Helios!Umd12Trace`, so the shipping cost is one relaxed
+    // `bool` load per call (R420 / `umd_common::log`).
+    //
+    // ⚠ The zero answers are the informative ones. The `log_error!` line below
+    // deliberately does NOT print them — it is the always-on summary of what the
+    // driver *offered* — so the two are not redundant.
+    trace_line!(
+        "CheckMultisampleQualityLevels fmt={format} count={sample_count} flags={flags} -> {levels}"
+    );
+
+    if levels == 0 {
+        return;
+    }
+
+    let n = UMD12_REFUSALS.caps_msaa_calls.get();
+    if n <= MSAA_LOG_BUDGET {
+        log_error!(
+            "CheckMultisampleQualityLevels fmt={format} count={sample_count} flags={flags} -> \
+             {levels} (x{n})"
+        );
+    }
+    // SAFETY: as above.
+    unsafe { core::ptr::write_unaligned(num_quality_levels, levels) };
+}
+
+/// Ask the engine how many quality levels one (format, sample count, flags)
+/// triple has. `None` when there is no engine or it refused; both are counted.
+fn engine_msaa_quality_levels(
+    dev: &HeliosD3D12Device,
+    format: ddi12::DXGI_FORMAT,
+    sample_count: ddi12::UINT,
+    flags: ddi12::D3D12DDI_MULTISAMPLE_QUALITY_LEVEL_FLAGS,
+) -> Option<ddi12::UINT> {
+    let Some(engine) = dev.engine.d3d12_device() else {
+        // As `engine_format_support`: unreachable by construction, counted so
+        // that the construction claim is observable rather than merely stated.
+        note_refusal(&UMD12_REFUSALS.caps_slot_no_device);
+        return None;
+    };
+    let mut data = D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS {
+        Format: DXGI_FORMAT(format),
+        SampleCount: sample_count,
+        // The two enums are the same value; see the `const _` assertion above.
+        Flags: D3D12_MULTISAMPLE_QUALITY_LEVEL_FLAGS(flags),
+        NumQualityLevels: 0,
+    };
+    // SAFETY: as `engine_format_support` — a live local of exactly the struct
+    // the feature names, its own `size_of`, and a borrowed `ID3D12Device` that
+    // is never released here.
+    let asked = unsafe {
+        engine.CheckFeatureSupport(
+            D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS,
+            core::ptr::from_mut(&mut data).cast::<core::ffi::c_void>(),
+            core::mem::size_of::<D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS>() as u32,
+        )
+    };
+    if let Err(err) = asked {
+        UMD12_REFUSALS.caps_msaa_engine_failed.bump();
+        let n = UMD12_REFUSALS.caps_msaa_engine_failed.get();
+        if n <= LOG_BUDGET {
+            log_error!(
+                "CheckMultisampleQualityLevels fmt={format} count={sample_count}: engine refused \
+                 hr={:#010x} -> 0 levels (x{n})",
+                err.code().0 as u32,
+            );
+        }
+        return None;
+    }
+    Some(data.NumQualityLevels)
+}
+
+/// `pfnGetMipPacking` — never called on this driver, and answered as such.
+///
+/// ⛔ It describes the packed-mip tail of a **tiled** resource, and
+/// [`TILED_RESOURCES_TIER_REPORTED`] is `NOT_SUPPORTED`, so no tiled resource
+/// can exist for it to be asked about. It answers "no packed mips, no tiles"
+/// and counts, which is the honest pair: a slot that cannot be reached legally
+/// still must not leave the runtime's two out-parameters holding stack garbage.
+///
+/// ⚠ The lane that raises the tiled tier owns this body — it is
+/// `pfnUpdateTileMappings`' partner and cannot be written before it.
+///
+/// # Safety
+/// `num_packed_mips` and `num_tiles_for_packed_mips` must each address one
+/// writable `UINT` the runtime owns.
+unsafe extern "C" fn get_mip_packing(
+    _h_device: ddi12::D3D12DDI_HDEVICE,
+    _h_tiled_resource: ddi12::D3D12DDI_HRESOURCE,
+    num_packed_mips: *mut ddi12::UINT,
+    num_tiles_for_packed_mips: *mut ddi12::UINT,
+) {
+    if num_packed_mips.is_null() || num_tiles_for_packed_mips.is_null() {
+        note_refusal(&UMD12_REFUSALS.caps_slot_bad_arg);
+        return;
+    }
+    // SAFETY: both non-null per the check above; the DDI declares both `_Out_`.
+    unsafe {
+        core::ptr::write_unaligned(num_packed_mips, 0);
+        core::ptr::write_unaligned(num_tiles_for_packed_mips, 0);
+    }
+    note_refusal(&UMD12_REFUSALS.caps_mip_packing_refused);
+}
 
 /// Install L1's 3 device-core slots: `pfnCheckFormatSupport`,
 /// `pfnCheckMultisampleQualityLevels`, `pfnGetMipPacking`.
 ///
 /// Chain position: `Stubbed` -> `CapsSlots` on the device-core table — first,
 /// because caps decide everything downstream.
-///
-/// ⛔ **Still counting noops, and that is what `D12-G7` is currently blocked
-/// on.** An earlier revision of this comment said these three were "not on the
-/// path that gates device creation" because they are device-scope rather than
-/// the adapter-scope gauntlet. **Measured, and wrong**
-/// (`tmp/dx12/gates/G7/RESULT.md`): the runtime calls them **2 824 times inside
-/// `D3D12CreateDevice`** — `pfnCheckFormatSupport` 93 times (the 91-format sweep
-/// `DDI_REFERENCE.md` §11.1 predicted), `pfnCheckMultisampleQualityLevels`
-/// **2 730** times, `pfnQueryNodeMap` once. A counting noop returns 0, so the
-/// driver is answering *"no format supports anything and no sample count has any
-/// quality level"* — an inconsistent caps set by construction, and the runtime
-/// says so with `DXGI_ERROR_DRIVER_INTERNAL_ERROR`.
-///
-/// ⇒ These need a new `bridge12` entry point forwarding into
-/// `ID3D12Device::CheckFeatureSupport` (`D3D12_FEATURE_FORMAT_SUPPORT` and
-/// `_MULTISAMPLE_QUALITY_LEVELS`). ⭐ `umd/src/forward/format_caps.rs` is the
-/// D3D11 precedent and its `D3D10_DDI_FORMAT_SUPPORT` bit values are
-/// **identical** to `D3D12DDI_FORMAT_SUPPORT`'s — including the one that bites:
-/// `DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM` (89) must be refused with the
-/// explicit `_NOT_SUPPORTED` sentinel `0x8000_0000` and **not a bare 0**, which
-/// the D3D11 runtime rejected as a malformed caps response with the same
-/// `0x887A0020` this gate is seeing.
 pub(crate) fn install(
     mut filling: Filling<'_, DeviceCoreTable, stage::Stubbed>,
 ) -> Filling<'_, DeviceCoreTable, stage::CapsSlots> {
-    let _table = filling.table();
+    let table = filling.table();
+    table.pfnCheckFormatSupport = Some(check_format_support);
+    table.pfnCheckMultisampleQualityLevels = Some(check_multisample_quality_levels);
+    table.pfnGetMipPacking = Some(get_mip_packing);
     filling.advance()
 }

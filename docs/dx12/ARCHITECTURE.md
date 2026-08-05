@@ -1987,3 +1987,22 @@ boundary of D4 keeps the LGPL obligations off `helios_umd12.dll`; the six permis
 attribution in the package's licence text and nothing more. **The completed table is what goes to the
 owner before any `helios_vkd3d.dll` is distributed** — §7.4 already escalates the licence question,
 and this is what must be escalated with it.
+
+**UNVERIFIED-11 — the D3D12 UMD assumes a SINGLE physical adapter, in three places, and nothing
+checks it.** Added 2026-08-06 because three code sites already cited this item by number and it did
+not exist; the citations came first and the entry is written to match them, not the other way round.
+
+| site | the assumption |
+|---|---|
+| `umd12/src/device12.rs` `create_device` | `BridgeDevice12::create(0, 0)` — *"do not match on LUID"*. A D3D12 UMD has no supported way to obtain its adapter's LUID (`D3D12DDIARG_OPENADAPTER` carries none, and `pfnQueryAdapterInfoCb` returns the KMD's private data, not an identity), and vkd3d does not LUID-match anyway (`helios_entry.c:172-179` passes `VK_NULL_HANDLE` and delegates to `vkd3d_select_physical_device`, whose own comment says it "is NOT LUID matching"). On a one-GPU guest there is one physical device to pick, so a *correct* LUID would change nothing today. |
+| `umd12/src/forward12/misc.rs` `HELIOS_PHYSICAL_ADAPTER_COUNT` | `pfnQueryNodeMap` writes the identity map and `pfnGetImplicitPhysicalAdapterMask` answers `1`. `DDI_REFERENCE.md` §11.5h prescribes exactly this *for one node*. |
+| `umd12/src/caps12.rs` `d3d12_options` | `CrossNodeSharingTier = NOT_SUPPORTED`, and the `1002`/`1009`/`1059` caps ignore their `NodeIndex` `pInfo` on the same grounds. |
+
+⚠ The three are **one** assumption stated three times, and they must move together: an adapter that
+reports more than one node needs the LUID, the node map and the cross-node tier changed in one
+commit, or it reports a topology no other part of the driver implements.
+
+**Settling experiment.** Attach a second GPU to the guest (or a second virtio-gpu function) and read
+`NumPhysicalAdapters` at `pfnQueryNodeMap` plus `NodeMapUnexpectedAdapterCount` — the counter exists
+for exactly this and reads 0 on every single-adapter boot. ⛔ Not reachable on this box: the guest
+has one virtio-gpu function, so this stays open rather than being closed by absence of evidence.

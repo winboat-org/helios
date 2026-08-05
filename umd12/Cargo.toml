@@ -43,9 +43,33 @@ cxx = "1"
 # reference went with it. Verified by removing the feature and re-running the
 # host cross-check clean -- a feature nothing imports is a dependency surface
 # carried for no reason.
+# ⚠ `Win32_Graphics_Dxgi_Common` is L1's addition and it is NOT a DXGI
+# dependency. The `Win32_Graphics_Dxgi_Common` module of the `windows` crate
+# contains no `#[link]` block and no `extern "system"` declaration of any kind --
+# it is `DXGI_FORMAT`, `DXGI_SAMPLE_DESC` and their siblings, pure types with no
+# entry points. It is required because `D3D12_FEATURE_DATA_FORMAT_SUPPORT` and
+# `D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS` -- the two structs
+# `ID3D12Device::CheckFeatureSupport` takes for the queries `pfnCheckFormatSupport`
+# and `pfnCheckMultisampleQualityLevels` forward -- carry a `DXGI_FORMAT` field
+# and are `#[cfg(feature = "Win32_Graphics_Dxgi_Common")]` behind it.
+#
+# ⛔ The rule it must not break: `helios_umd12.dll` imports **no `dxgi.dll`**
+# (the rule is stated at `umd/build.rs:252-256`; it is `D12-G1`'s pass
+# criterion, and `tmp/dx12/build-g1-*.ps1` check it with `dumpbin /IMPORTS`).
+# A type-only feature cannot add an import; that is why this one is acceptable
+# where a `Win32_Graphics_Dxgi` feature would not be. ⚠ Measured on the release
+# build that introduced it: the import list is unchanged from S4 --
+# api-ms-win-*, ADVAPI32, KERNEL32, oleaut32, ntdll, MSVCP140, VCRUNTIME140{,_1},
+# GDI32 -- with no dxgi.dll and no d3d12.dll.
+#
+# ⚠ The alternative was rejected on `ARCHITECTURE.md` §12 rule 1: hand-writing a
+# `#[repr(C)]` copy of the two feature-data structs would be transcribing an ABI
+# by hand, which is exactly what R908 cost. These come out of the same Win32
+# metadata generator as `ID3D12Device` itself.
 windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_Graphics_Direct3D12",
+    "Win32_Graphics_Dxgi_Common",
 ] }
 
 [build-dependencies]

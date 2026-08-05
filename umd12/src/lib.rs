@@ -108,16 +108,22 @@ use helios_umd_common::refusals::{self, RefusalCounter};
 // `crate::log::…` / `crate::log_error!` path in `forward12/*` resolves the same
 // way in both drivers and a file can be read without first working out which
 // crate it belongs to.
-pub(crate) use helios_umd_common::{log, log_error};
+pub(crate) use helios_umd_common::{log, log_error, trace_line};
 pub(crate) use log::log_self_module_path;
-// ⚠ `trace_line!` is deliberately NOT re-exported yet. S6's per-op DDI handlers
-// are its only consumers, and importing it now would need `#[allow(unused_imports)]`
-// on a hand-written line — which `PARALLEL.md` §10's merge checklist forbids
-// outright ("generated code may be allowed, hand-written code may not — R908").
-// The first per-op site adds the one-line re-export beside its own first use;
-// R420's two-name choice (`log_error!` for errors/one-shots/refusals,
-// `trace_line!` for per-op repeat traffic) is enforced by `#![deny(deprecated)]`
-// on `log_line`, not by which names happen to be in scope.
+// ⭐ **`trace_line!` arrives here with its first per-op consumer**, exactly as
+// this comment previously said it would: `caps12::check_multisample_quality_levels`
+// runs **2 730 times inside one `D3D12CreateDevice`** and is the first DDI in
+// this crate with per-op repeat traffic. R420's two-name split is what makes
+// that safe — `log_error!` for errors, one-shots and refusals; `trace_line!` for
+// traffic that is gated off unless `HKLM\SOFTWARE\Helios!Umd12Trace` is set, so
+// the shipping default pays a `bool` load per call and nothing else.
+//
+// ⚠ It earned its way in rather than being added on spec: two `D12-G7` runs were
+// spent inferring which (format, sample count) the runtime rejected from call
+// COUNTS, because the bounded `log_error!` budget could not cover a 2 730-call
+// sweep and an unbounded one would flood every device creation. A trace-gated
+// per-call line is the only shape that answers the question without paying for
+// it on every boot.
 
 /// This driver's refusal counters.
 ///
@@ -289,6 +295,131 @@ pub(crate) struct Umd12Refusals {
     /// `pfnDestroyDevice` on a device this driver never created. Expected 0 —
     /// `pfnCreateDevice` refuses unconditionally at S5.
     pub(crate) destroy_device_unexpected: RefusalCounter,
+
+    // ── L1, second half: the three device-core format/MSAA slots. Appended at
+    // the END, for the same reason as the S5 block above. ──────────────────
+    /// How many `pfnCheckFormatSupport` calls this process has served. ⚠ Not a
+    /// refusal — it is the number the noop hit counters used to carry and which
+    /// implementing the slot would otherwise delete. `D12-G7` measured **93**
+    /// inside one `D3D12CreateDevice` (`DDI_REFERENCE.md` §11.1 predicted a
+    /// 91-format sweep), so a reading near 93 per device is the expected shape.
+    pub(crate) caps_format_support_calls: RefusalCounter,
+    /// How many `pfnCheckMultisampleQualityLevels` calls this process has
+    /// served. ⚠ Not a refusal, same reason: `D12-G7` measured **2 730** inside
+    /// one `D3D12CreateDevice` — 91 formats x 30 sample counts.
+    pub(crate) caps_msaa_calls: RefusalCounter,
+    /// One of the three device-core slots was called with a null out-pointer.
+    /// Expected 0 — all three declare their outputs `_Out_`, never optional.
+    pub(crate) caps_slot_bad_arg: RefusalCounter,
+    /// One of the three device-core slots could not reach the engine: the
+    /// `hDevice` did not resolve, or the bridge carries no `ID3D12Device`. The
+    /// slot answers "nothing supported" rather than reading uninitialised
+    /// runtime memory. Expected 0 — these are device-scope DDIs and a device
+    /// exists by construction.
+    pub(crate) caps_slot_no_device: RefusalCounter,
+    /// `ID3D12Device::CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT)`
+    /// returned a failure HRESULT, so the format is answered as unsupported.
+    ///
+    /// ⚠ **Expected non-zero, and that is not a fault.** vkd3d refuses a
+    /// `DXGI_FORMAT` it has no `vkd3d_get_format` table entry for with
+    /// **`E_FAIL`** (`libs/vkd3d/device.c:5241-5245`), and reserves
+    /// `E_INVALIDARG` for a value outside the format enum ranges
+    /// (`device.c:5225-5229`). The runtime's own device-creation sweep walks
+    /// formats this engine does not implement — legacy XR, video and
+    /// planar/subsampled families among them. The count is what stops "the
+    /// engine said no" being mistaken for "the driver forgot to answer".
+    pub(crate) caps_format_support_engine_failed: RefusalCounter,
+    /// A format was answered with the explicit `D3D12DDI_FORMAT_SUPPORT_NOT_SUPPORTED`
+    /// sentinel rather than a bare 0.
+    ///
+    /// ⛔ **Expected exactly 1 per format sweep, and it is the instrument for
+    /// the one trap that has already cost this project a device.**
+    /// `DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM` (89) must be refused with
+    /// `0x80000000` set alone; the D3D11 runtime rejected a bare 0 there as a
+    /// malformed caps response and failed `D3D11CreateDevice` with
+    /// `DXGI_ERROR_DRIVER_INTERNAL_ERROR` (`0x887A0020`) — the same HRESULT
+    /// `D12-G7` was failing with. A **zero** reading on a run that answered
+    /// caps is the finding, not a non-zero one.
+    pub(crate) caps_format_not_supported_sentinel: RefusalCounter,
+    /// `ID3D12Device::CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS)`
+    /// returned a failure HRESULT, so the query is answered with zero quality
+    /// levels. ⚠ Expected non-zero for the same reason as
+    /// `CapsFormatSupportEngineFailed`.
+    pub(crate) caps_msaa_engine_failed: RefusalCounter,
+    /// A multisample query carrying `D3D12DDI_MULTISAMPLE_QUALITY_LEVEL_FLAG_TILED_RESOURCE`
+    /// was answered with zero quality levels because this driver reports
+    /// `TiledResourcesTier = NOT_SUPPORTED`.
+    ///
+    /// ⚠ Expected non-zero if the runtime sweeps the flag. It is a **coupling**,
+    /// not a fault: the lane that raises the tiled tier removes this gate in the
+    /// same commit, and until then answering the engine's tier-4 truth here
+    /// would contradict the tier this driver reports two functions above.
+    pub(crate) caps_msaa_tiled_refused: RefusalCounter,
+    /// `pfnGetMipPacking` was called and answered "no packed mips, no tiles",
+    /// because this driver reports `TiledResourcesTier = NOT_SUPPORTED` and so
+    /// no tiled resource can exist for it to describe.
+    ///
+    /// ⛔ Expected 0. A hit means the runtime reached a tiled-resource path on a
+    /// driver that reports no tier, which is a caps inconsistency somewhere
+    /// else — not something this slot can fix.
+    pub(crate) caps_mip_packing_refused: RefusalCounter,
+    /// A format whose engine answer carried `MULTISAMPLE_RENDERTARGET` or
+    /// `MULTISAMPLE_LOAD` had both bits **dropped**, because the same engine
+    /// offers no quality level at any sample count above 1.
+    ///
+    /// ⛔ **This is the counter for the rule that failed `D12-G7` on 2026-08-06**,
+    /// and it is the one number that says whether the fix is doing anything. The
+    /// runtime rejects the pair with `0x887A0020` and the ETW
+    /// `Microsoft-Windows-Direct3D12` reason *"MSAA quality reported to be 0"*.
+    ///
+    /// ⚠ **Expected non-zero**, and small. It is an incoherence inside vkd3d
+    /// rather than a driver fault: `d3d12_device_get_format_support` sets
+    /// `MULTISAMPLE_LOAD` when `supported_sample_counts != VK_SAMPLE_COUNT_1_BIT`,
+    /// which is also true when that mask is **0**, while the quality-level query
+    /// reads the same 0 and answers nothing. The depth-read views
+    /// (`R32_FLOAT_X8X24_TYPELESS`, `X32_TYPELESS_G8X24_UINT` and their
+    /// `D24_UNORM_S8_UINT` siblings) are where it shows up.
+    pub(crate) caps_msaa_bits_dropped: RefusalCounter,
+    /// A format that the engine answered `MULTISAMPLE_LOAD` **without**
+    /// `MULTISAMPLE_RENDERTARGET`, while offering a quality level above 1
+    /// sample, had `MULTISAMPLE_RENDERTARGET` added.
+    ///
+    /// ⛔ **This is the counter for the pair rule that failed `D12-G7` twice.**
+    /// The runtime rejects `LOAD` alone with `0x887A0020` and the ETW
+    /// `Microsoft-Windows-Direct3D12` reason *"MSAA quality reported to be 0"*;
+    /// the D3D11 driver on this box cannot emit that pair by construction
+    /// (`umd/src/forward/format_caps.rs:234-241`), and this is the D3D12
+    /// equivalent made explicit and countable instead of structural.
+    ///
+    /// ⚠ **Expected non-zero**, and it is the depth-read views that produce it:
+    /// `R32_FLOAT_X8X24_TYPELESS` (21), `X32_TYPELESS_G8X24_UINT` (22) and their
+    /// `D24_UNORM_S8_UINT` siblings (46, 47), where vkd3d's `is_dsv_format` test
+    /// fails on `plane_count == 2` and skips the arm that would have set the
+    /// render-target bit.
+    pub(crate) caps_msaa_rendertarget_implied: RefusalCounter,
+    /// A format carrying `MULTISAMPLE_LOAD` without `RENDERTARGET` had `LOAD`
+    /// dropped.
+    ///
+    /// ⛔ Measured 2026-08-06: the runtime aborts its format sweep at the first
+    /// format answered that way. `D3D10_DDI_FORMAT_SUPPORT` defines `LOAD` as
+    /// *"can be used as source for 'ld2dms'"*, which presupposes a colour target
+    /// to have rendered into.
+    ///
+    /// ⚠ **Expected non-zero**: the depth-read views (21, 22, 46, 47) are what
+    /// vkd3d answers this way, because its sampled-image arm sets `LOAD` while
+    /// its `is_dsv_format` test refuses them the render-target arm.
+    pub(crate) caps_msaa_load_without_rendertarget: RefusalCounter,
+    /// `pfnQueryNodeMap` with a null `pMap`. Expected 0 — the DDI declares it
+    /// `_Out_writes_(NumPhysicalAdapters)`.
+    pub(crate) node_map_bad_arg: RefusalCounter,
+    /// `pfnQueryNodeMap` was asked for a node count other than 1, and the
+    /// identity map was written for every entry the runtime asked for.
+    ///
+    /// ⛔ Expected 0 on this guest: Helios is a single-node adapter, and
+    /// `DDI_REFERENCE.md` §11.5h records four separate runtime strings that
+    /// reject a bad remapping. A hit means the multi-adapter assumption behind
+    /// `ARCHITECTURE.md` §13 UNVERIFIED-11 has been reached for real.
+    pub(crate) node_map_unexpected_adapter_count: RefusalCounter,
 }
 
 pub(crate) static UMD12_REFUSALS: Umd12Refusals = Umd12Refusals {
@@ -321,12 +452,26 @@ pub(crate) static UMD12_REFUSALS: Umd12Refusals = Umd12Refusals {
     caps_texture_layout_set_end: RefusalCounter::new("CapsTextureLayoutSetEnd"),
     ddi12_version_mismatch: RefusalCounter::new("Ddi12VersionMismatch"),
     destroy_device_unexpected: RefusalCounter::new("DestroyDeviceUnexpected"),
+    caps_format_support_calls: RefusalCounter::new("CapsFormatSupportCalls"),
+    caps_msaa_calls: RefusalCounter::new("CapsMsaaCalls"),
+    caps_slot_bad_arg: RefusalCounter::new("CapsSlotBadArg"),
+    caps_slot_no_device: RefusalCounter::new("CapsSlotNoDevice"),
+    caps_format_support_engine_failed: RefusalCounter::new("CapsFormatSupportEngineFailed"),
+    caps_format_not_supported_sentinel: RefusalCounter::new("CapsFormatNotSupportedSentinel"),
+    caps_msaa_engine_failed: RefusalCounter::new("CapsMsaaEngineFailed"),
+    caps_msaa_tiled_refused: RefusalCounter::new("CapsMsaaTiledRefused"),
+    caps_mip_packing_refused: RefusalCounter::new("CapsMipPackingRefused"),
+    caps_msaa_bits_dropped: RefusalCounter::new("CapsMsaaBitsDropped"),
+    caps_msaa_rendertarget_implied: RefusalCounter::new("CapsMsaaRenderTargetImplied"),
+    caps_msaa_load_without_rendertarget: RefusalCounter::new("CapsMsaaLoadWithoutRenderTarget"),
+    node_map_bad_arg: RefusalCounter::new("NodeMapBadArg"),
+    node_map_unexpected_adapter_count: RefusalCounter::new("NodeMapUnexpectedAdapterCount"),
 };
 
 /// The set, in the order the summary prints them. ⛔ This order is the evidence
 /// contract: `D3D12 DDI refusals:` lines from different builds get diffed, so
 /// new counters are **appended**, never inserted.
-static UMD12_REFUSAL_SET: [&RefusalCounter; 29] = [
+static UMD12_REFUSAL_SET: [&RefusalCounter; 43] = [
     &UMD12_REFUSALS.open_adapter12,
     &UMD12_REFUSALS.probe12_bad_arg,
     &UMD12_REFUSALS.probe12_create_failed,
@@ -356,6 +501,20 @@ static UMD12_REFUSAL_SET: [&RefusalCounter; 29] = [
     &UMD12_REFUSALS.caps_texture_layout_set_end,
     &UMD12_REFUSALS.ddi12_version_mismatch,
     &UMD12_REFUSALS.destroy_device_unexpected,
+    &UMD12_REFUSALS.caps_format_support_calls,
+    &UMD12_REFUSALS.caps_msaa_calls,
+    &UMD12_REFUSALS.caps_slot_bad_arg,
+    &UMD12_REFUSALS.caps_slot_no_device,
+    &UMD12_REFUSALS.caps_format_support_engine_failed,
+    &UMD12_REFUSALS.caps_format_not_supported_sentinel,
+    &UMD12_REFUSALS.caps_msaa_engine_failed,
+    &UMD12_REFUSALS.caps_msaa_tiled_refused,
+    &UMD12_REFUSALS.caps_mip_packing_refused,
+    &UMD12_REFUSALS.caps_msaa_bits_dropped,
+    &UMD12_REFUSALS.caps_msaa_rendertarget_implied,
+    &UMD12_REFUSALS.caps_msaa_load_without_rendertarget,
+    &UMD12_REFUSALS.node_map_bad_arg,
+    &UMD12_REFUSALS.node_map_unexpected_adapter_count,
 ];
 
 /// Bump one refusal counter and emit the whole set's summary on its FIRST hit.

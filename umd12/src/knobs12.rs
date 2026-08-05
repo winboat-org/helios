@@ -19,6 +19,7 @@
 //! |---|---|---|
 //! | `Umd12Trace` | DWORD | `false` (explicit non-zero enables) |
 //! | `UmdD3D12` | DWORD | `false` — **the D3D12 kill switch** (D11) |
+//! | `Umd12FormatCaps` | DWORD | `0` — `pfnCheckFormatSupport`'s encoding, as an A/B |
 //!
 //! ⭐ **`UmdD3D12` lands here at S5, and not one commit earlier.** A kill switch
 //! for a driver that cannot be reached kills nothing, so declaring it before
@@ -28,7 +29,49 @@
 //! `UserModeDriverName[3]`, deletes `umd`'s duplicate `OpenAdapter12` export and
 //! makes `adapter12::OpenAdapter12`'s body reachable.
 
-use helios_umd_common::knobs::BoolKnob;
+use helios_umd_common::knobs::{BoolKnob, DwordKnob};
+
+/// ⭐ **`pfnCheckFormatSupport`'s ENCODING, as an A/B rather than an assumption.**
+///
+/// `d3d12umddi.h` defines a 20-bit `D3D12DDI_FORMAT_SUPPORT` enum immediately
+/// beside `PFND3D12DDI_CHECKFORMATSUPPORT`, whose values are byte-for-byte the
+/// D3D10 DDI's. That is strong evidence the DDI has its own small encoding — but
+/// it is *evidence*, not a measurement, and the D3D11 side of this project holds
+/// the opposite result in as many words:
+///
+/// > "The D3D11 DDI `pfnCheckFormatSupport` returns API-style
+/// > `D3D11_FORMAT_SUPPORT` flags (D3D11 harmonized the DDI with the API enum;
+/// > the small `D3D10_DDI_FORMAT_SUPPORT` enum is only for the legacy D3D10
+/// > DDI). So pass DXVK's value through unchanged -- translating to the D3D10
+/// > DDI layout regresses even a plain `D3D11CreateDevice` to
+/// > `DXGI_ERROR_UNSUPPORTED`."  -- `umd/src/forward/format_caps.rs:15-19`
+///
+/// If D3D12 inherited that harmonization, translating is the same mistake one
+/// API generation later, and it would present exactly as `D12-G7` does: a
+/// device-creation failure whose ETW reason moves every time the answer changes.
+/// ⛔ This knob exists so that question is settled by a measurement instead of a
+/// third guess, and so the losing arm stays reachable afterwards (CLAUDE.md
+/// rule 8's other half).
+///
+/// | value | meaning |
+/// |---:|---|
+/// | 0 | **`D3D12DDI_FORMAT_SUPPORT`** -- translate the engine's API bits into the DDI enum and narrow them to this driver's caps. The default. |
+/// | 1 | **API passthrough** -- hand the engine's `D3D12_FORMAT_SUPPORT1` back unchanged, exactly as the D3D11 driver does with DXVK's. ⛔ **MEASURED AND LOSING** (2026-08-06): it truncates the runtime's format sweep at 12 formats / 271 multisample queries, against 23 / 600 for arm 0. So the D3D12 DDI is **not** harmonized with the API enum the way D3D11's is, and arm 0 is right. Kept reachable as rule 8 requires. |
+/// | 2 | DDI encoding with **neither** multisample bit on any format. A bisect arm for the remaining `D12-G7` blocker. |
+/// | 3 | DDI encoding with the multisample bits kept only where `RENDERTARGET` is also set. The other bisect arm. |
+///
+/// ⚠ Arms 2 and 3 are **diagnostics, not policies**: the runtime rejects a
+/// specific per-format answer and emits no ETW reason for it, so the answer
+/// space is bisected by measurement. They come out once the rule is named.
+///
+/// ⚠ The default is 0 and stays 0 until an arm is measured green; flipping it
+/// requires the evidence written at the read site in `caps12`.
+pub(crate) static UMD12_FORMAT_CAPS: DwordKnob = DwordKnob::new(c"Umd12FormatCaps", 0);
+
+/// The `pfnCheckFormatSupport` encoding mode. See [`UMD12_FORMAT_CAPS`].
+pub(crate) fn umd12_format_caps() -> u32 {
+    UMD12_FORMAT_CAPS.get()
+}
 
 /// Per-op/per-frame DDI chatter (`trace_line!`) for the D3D12 driver.
 /// Absent = OFF.
@@ -101,9 +144,10 @@ pub(crate) fn log_knob_inventory() {
 /// are the evidence contract `tools/capture-knob-inventory.ps1` parses and that
 /// S2 proved the crate split byte-identical against; reordering makes two
 /// captures differ for a reason that is not a behaviour change.
-pub(crate) fn resolved_inventory() -> [(&'static str, u32); 2] {
+pub(crate) fn resolved_inventory() -> [(&'static str, u32); 3] {
     [
         ("Umd12Trace", UMD12_TRACE.get() as u32),
         ("UmdD3D12", UMD_D3D12.get() as u32),
+        ("Umd12FormatCaps", UMD12_FORMAT_CAPS.get()),
     ]
 }
