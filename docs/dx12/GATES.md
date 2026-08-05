@@ -1189,8 +1189,13 @@ wsi-perf.txt,vk_recreate.log}`.
 **Entry:** G4 (or any time — this gate touches no Helios code and needs no working D3D12).
 
 **Work:** answer the undocumented-DDI questions from a log instead of from inference. **H1**: the
-D3D12 UMD DDI has ~600 auto-generated reference stubs, no Remarks, zero conceptual articles, and
-there has never been a public D3D12 UMD. The mitigation is unusually good:
+D3D12 UMD DDI has ~600 auto-generated reference stubs with no Remarks in the **driver-docs** corpus,
+and there has never been a public D3D12 UMD. ⚠ *Corrected 2026-08-05:* "zero conceptual articles" holds
+for driver-docs only — `microsoft.github.io/DirectX-Specs` carries `DDI` sections in **44 of 90**
+documents (`docs/dx12/SPECS.md`). ⭐ **That correction does not weaken this gate, it vindicates it:**
+`OpenAdapter12`, `pfnSetCommandListDDITableCb` and `pfnGetPresentPrivateDriverDataSize` appear in
+**neither** corpus, so the three things only a spy could answer are precisely the three it answered.
+The mitigation is unusually good:
 `C:\Windows\System32\d3d10warp.dll` **exports `OpenAdapter12`** (verified by `dumpbin /exports`).
 
 Build a shim DLL that exports `OpenAdapter12`, forwards to WARP's, and logs:

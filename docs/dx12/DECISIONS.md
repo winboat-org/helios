@@ -303,11 +303,29 @@ Free wins worth taking on day one: `VN_DEBUG=mem_budget` (enables `VK_EXT_memory
 
 Ranked. These are where the plan should spend its risk budget.
 
-**H1 — the D3D12 UMD DDI is undocumented.** Microsoft publishes ~600 auto-generated reference stubs
-with no Remarks and *zero* conceptual articles; `OpenAdapter12` appears nowhere in the driver-docs
-corpus; there has never been a public D3D12 UMD, open or closed (D3D9On12 and D3D11On12 were both
-open-sourced; a D3D12 one never was). Strategy D1 is original engineering, not porting.
+**H1 — the D3D12 UMD DDI is undocumented *as a contract*, but it is not undocumented everywhere.**
+There has never been a public D3D12 UMD, open or closed (D3D9On12 and D3D11On12 were both
+open-sourced; a D3D12 one never was), so strategy D1 is original engineering, not porting.
 (`research/R10.md` Q1.)
+
+⚠ **Corrected 2026-08-05.** The earlier phrasing — *"~600 auto-generated reference stubs with no
+Remarks and zero conceptual articles"* — is accurate for the **driver-docs** corpus
+(`learn.microsoft.com/windows-hardware/drivers/ddi/`) and `OpenAdapter12` does appear nowhere in it.
+It was **wrong about `microsoft.github.io/DirectX-Specs`**, which the doc set had touched for two
+pages. Measured at pin `2bd58ca5` (2026-07-28): **90 documents, 44 with an explicit `DDI` section
+heading, and 123 of the header's 399 `PFND3D12DDI_*` typedefs (31 %) named in prose** — with the three
+hardest areas of `DDI_REFERENCE.md` (resource binding, resources/heaps, barriers) among the
+best-covered. `docs/dx12/SPECS.md` is the triage and the 235-finding register.
+
+⭐ **The corroboration cuts both ways, and that is the reassuring half.** `OpenAdapter12`,
+`pfnSetCommandListDDITableCb` and `pfnGetPresentPrivateDriverDataSize` appear **nowhere in either
+corpus**. Those are exactly the three things `D12-G5` had to measure, so the spy was not redundant —
+it covered the part that genuinely has no documentation.
+
+⛔ **This does not demote the measurement.** 173 of the 296 `PFND3D12DDI_*` the specs name are absent
+from SDK 26100 entirely, and several specs publish struct shapes the shipping header contradicts. The
+arbiters remain, in order: the `D12-G5` log → the staged `d3d12umddi.h` → `D3D12Core.dll`'s strings →
+the spec.
 
 *Mitigation, and it is unusually good:* **`C:\Windows\System32\d3d10warp.dll` exports
 `OpenAdapter12`** (verified by `dumpbin /exports`). A shim DLL that forwards to WARP and logs every
@@ -602,4 +620,5 @@ default-ON requires the evidence in the comment at the read site (CLAUDE.md rule
 | `docs/dx12/PRESENT.md` | how a D3D12 frame reaches the scanout, both arms |
 | `docs/dx12/SUBSTRATE.md` | vkd3d-proton + venus: build, requirements, measured gap, knobs, licensing |
 | `docs/dx12/GATES.md` | `D12-G0 … D12-G11`, exact commands and pass criteria |
+| `docs/dx12/SPECS.md` | the DirectX-Specs corpus triaged (90 docs) + the 235-finding register, pinned at `2bd58ca5` |
 | `docs/dx12/research/R1..R12` | the raw evidence dossiers |

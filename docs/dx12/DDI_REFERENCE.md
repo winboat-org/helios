@@ -6,11 +6,29 @@ vkd3d-proton's `ID3D12*` COM objects). It is a *reconstruction*: every table, ev
 struct, every caps rule, plus the semantics that are not in any header, assembled so an
 implementation session can open this file and start writing code.
 
-**What this is not.** It is not Microsoft documentation, because none exists (`DECISIONS.md` H1).
-Microsoft ships ~600 auto-generated reference stubs with no Remarks and zero conceptual articles;
-`OpenAdapter12` appears nowhere in the driver-docs corpus. It is also not `PRESENT.md` (the frame
-path), not `ARCHITECTURE.md` (the DLL/crate split), and not `SUBSTRATE.md` (vkd3d + venus). Those
-own their material; this file points at them.
+**What this is not.** It is not Microsoft documentation, because no Microsoft document describes this
+contract as a whole (`DECISIONS.md` H1). ⚠ **Corrected 2026-08-05 — the older phrasing, "zero
+conceptual articles", was true of one corpus and false of another:**
+
+- **driver-docs** (`learn.microsoft.com/windows-hardware/drivers/ddi/`) is ~600 auto-generated
+  reference stubs with no Remarks and no conceptual articles. Unchanged, and `OpenAdapter12` appears
+  nowhere in it.
+- **`microsoft.github.io/DirectX-Specs`** is a different matter: **44 of its 90 documents carry an
+  explicit `DDI` section heading, and 123 of this header's 399 `PFND3D12DDI_*` typedefs (31 %) are
+  named in its prose** — including the three hardest areas in this file: resource binding (§9.6/§9.9),
+  resources and heaps (§9.7), and barriers (§9.10). `docs/dx12/SPECS.md` triages all 90 and registers
+  235 verified findings against them.
+- **Both corpora are silent on exactly what `D12-G5` had to measure.** `OpenAdapter12`,
+  `pfnSetCommandListDDITableCb` and `pfnGetPresentPrivateDriverDataSize` appear **nowhere in either**
+  (verified by grep at the pin). The spy covered the genuinely undocumented part.
+
+⛔ **The specs are drafting-era documents and are NOT the arbiter of what exists here.** 173 of the 296
+`PFND3D12DDI_*` they name are absent from SDK 10.0.26100.0, and several publish struct shapes that no
+longer match the header. Arbiters, in order: the `D12-G5` log → the staged `d3d12umddi.h` →
+`D3D12Core.dll`'s strings → the spec. `SPECS.md` §6 lists the six ways the corpus misleads.
+
+It is also not `PRESENT.md` (the frame path), not `ARCHITECTURE.md` (the DLL/crate split), and not
+`SUBSTRATE.md` (vkd3d + venus). Those own their material; this file points at them.
 
 **The two reconstruction sources, and how to tell them apart.**
 
