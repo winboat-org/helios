@@ -33,9 +33,12 @@ perf work needs a new lever, not another sweep. The charter is now, in priority 
    `DDI refusals:` counters and the noop-DDI hit counters to zero against real workloads, turn
    the ~40 ad-hoc probes in `tools/` into a runnable suite with pass criteria, close DXGI format
    coverage and the remaining 11.1 DDI plumbing.
-2. **D3D12** — `DX12.md` is the charter. Today `OpenAdapter12` is exported and refuses; the
-   strategy question (native D3D12 DDI vs vkd3d-proton over the existing Vulkan/Venus path) is
-   open and the doc lists the evidence that would settle it.
+2. **D3D12** — `DX12.md` is the charter, `docs/dx12/` the implementation set. **The strategy
+   question is CLOSED (2026-08-05):** Helios ships a real D3D12 UMD, `helios_umd12.dll`,
+   implementing `d3d12umddi` and forwarding into vkd3d-proton's `ID3D12*` COM objects — the D3D11
+   architecture with DXVK swapped for vkd3d and `UserModeDriverName[2]` for `[3]`. The app-local
+   vkd3d arm is Phase 0 of that plan, not an alternative. `OpenAdapter12` still refuses and must
+   keep refusing until the commit that makes its body reachable.
 3. **Stability** — unchanged and still non-negotiable: buffer rotation, resize, suspend/resume,
    device restart, cold boot, DWM recovery, TDR. No hacks; loud failure over fake success.
 4. **Performance** — paused. Do not open a perf sweep without a new causal hypothesis; ROADMAP
@@ -107,7 +110,7 @@ helios-vgpu/
 ├── CLAUDE.md               ← You are here
 ├── ROADMAP.md              ← living stage doc: defects, per-workstream plans, tooling
 ├── CONFORMANCE.md          ← D3D11 correctness charter (priority 1)
-├── DX12.md                 ← D3D12 charter (priority 2)
+├── DX12.md                 ← D3D12 charter (priority 2) — decision, phases, checkpoints
 ├── TRANSPORT.md            ← virtio-gpu + Venus wire format. §1/§2 LIVE; §3/§7 archived
 ├── HOST.md TOOLCHAIN.md    ← Linux host setup / cross-platform build + deploy
 ├── NTOSEYE.md              ← Windows KD (ntoseye) quirks
@@ -120,6 +123,12 @@ helios-vgpu/
 │                             WINDOWED_BLT_DESIGN, SCANOUT_DRM_MODIFIER_DESIGN, the
 │                             GATE*/WDDM_*/DISPLAY*/PHASE*/HANDOFF_* corpus, and
 │                             REFACTOR_* (the completed T0–T8 quality refactor).
+├── docs/dx12/              ← D3D12 implementation doc set. DECISIONS.md is authoritative
+│                             (nothing there may contradict it); ARCHITECTURE (the UMD
+│                             split: umd_common + umd12 + the vkd3d bridge), DDI_REFERENCE
+│                             (the d3d12umddi contract, reconstructed — MS does not
+│                             document it), PRESENT, SUBSTRATE, KMD_IMPACT, GATES
+│                             (D12-G0..G11), research/ (12 evidence dossiers)
 ├── docs/reference/         ← Non-narrative reference data (host vulkaninfo profile)
 │
 ├── kmd_render/             ← ACTIVE: WDDM render+display miniport (Rust, no_std)
@@ -142,7 +151,10 @@ helios-vgpu/
 ├── packaging/windows/      ← Install-Helios.ps1 / Verify-Helios.ps1 + the four smoke
 │                             probes — the closest thing to an automated gate today
 ├── ci/ + .github/workflows ← the Windows graphics+compute bundle build
-├── vkd3d-proton-helios/    ← submodule, pinned. See DX12.md — no doc yet explains the fork
+├── vkd3d-proton-helios/    ← submodule, pinned at upstream 2c7ba22c, ZERO divergence.
+│                             ⚠ its own 3 nested submodules are uninitialised — nothing
+│                             builds until `git submodule update --init --recursive` runs
+│                             inside it. The D3D12 engine; see docs/dx12/SUBSTRATE.md
 ├── LookingGlass/           ← HISTORICAL: former IddCx capture path. Retained only
 │                             because tools/win-mcp still implements win_looking_glass*
 └── kmd/                    ← ARCHIVED reference: System-class KMDF + IOCTL stack. Kept

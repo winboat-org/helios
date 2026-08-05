@@ -21,9 +21,20 @@ a new causal hypothesis, not another arm.
 **The new order of business:**
 
 1. **D3D11 correctness / conformance** — charter in `CONFORMANCE.md`, plan in WS3.
-2. **D3D12** — charter in `DX12.md`. Today `OpenAdapter12` refuses; the
-   native-DDI vs vkd3d-proton decision is open and the doc lists what would
-   settle it.
+2. **D3D12** — charter in `DX12.md`, detail in `docs/dx12/`. **The strategy question is
+   CLOSED as of 2026-08-05**: Helios ships a real D3D12 UMD, `helios_umd12.dll`,
+   implementing `d3d12umddi` and forwarding into vkd3d-proton's `ID3D12*` COM
+   objects — the D3D11 architecture with DXVK swapped for vkd3d and
+   `UserModeDriverName[2]` swapped for `[3]`. The app-local vkd3d arm is Phase 0
+   of that plan, not an alternative: it proves the whole lower half (vkd3d +
+   dxil-spirv + venus + KMD + present) with zero Helios code. Decisions and the
+   twelve-lane evidence merge: `docs/dx12/DECISIONS.md`. Checkpoints:
+   `docs/dx12/GATES.md` (`D12-G0 … D12-G11`). Today `OpenAdapter12` still
+   refuses, and must keep refusing until the commit that makes its body
+   reachable.
+   *Measured up front:* the guest satisfies vkd3d-proton's
+   `VP_D3D12_FL_12_2_baseline` in full (zero feature/extension misses), and the
+   KMD work list is empty for Phase 0 / three small items for the DDI arm.
 3. **Stability** — WS1, unchanged and non-negotiable.
 4. **Performance** — WS2, PAUSED. Do not reopen without a new hypothesis.
 

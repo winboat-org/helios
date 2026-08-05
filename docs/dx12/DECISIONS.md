@@ -1,0 +1,503 @@
+# DECISIONS.md — the settled D3D12 decisions, and the merge that produced them
+
+**Status:** these are the decisions the rest of `docs/dx12/` is written against. Nothing in this
+directory may contradict this file. If evidence later overturns a decision here, change it *here*
+first and then propagate.
+
+**Provenance:** twelve independent research lanes (`docs/dx12/research/R1..R12`), each
+adversarially fact-checked by a second reader, merged 2026-08-05. Where two lanes disagreed, §6
+records the resolution and the evidence that settled it.
+
+⚠ **Line numbers into `d3d12umddi.h` are pinned to Windows SDK 10.0.26100.0.** That header is not
+committed (it is Microsoft's). Re-stage it before reading any citation:
+
+```powershell
+# win_exec, once per machine
+New-Item -ItemType Directory -Force -Path Z:\tmp\dx12\sdk | Out-Null
+$src = "C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0"
+foreach($f in @("um\d3d12umddi.h","um\d3d12.h","um\d3dumddi.h","shared\d3dkmthk.h","shared\d3dkmdt.h","shared\d3dukmdt.h","shared\d3dkmddi.h","km\dispmprt.h")) {
+  Copy-Item "$src\$f" "Z:\tmp\dx12\sdk\$(Split-Path $f -Leaf)" -Force }
+```
+
+---
+
+## 1. The architecture
+
+**Decision D1 — Helios ships a real D3D12 user-mode display driver, `helios_umd12.dll`, that
+implements `d3d12umddi.h` and forwards into vkd3d-proton's `ID3D12*` COM objects.** This is the
+D3D11 architecture with two boxes swapped:
+
+```
+              D3D11 (shipping)                          D3D12 (target)
+  app / dwm                                   app / dwm
+    │  IDXGISwapChain, ID3D11Device             │  IDXGISwapChain, ID3D12Device
+    ▼                                           ▼
+  MS d3d11.dll + dxgi.dll                     MS d3d12.dll + D3D12Core.dll + dxgi.dll
+    │  d3d10umddi DDI                           │  d3d12umddi DDI
+    ▼  (UserModeDriverName[2])                  ▼  (UserModeDriverName[3])
+  helios_umd.dll  (Rust)                      helios_umd12.dll  (Rust)          ← NEW
+    │  cxx bridge                               │  cxx bridge
+    ▼                                           ▼
+  DXVK engine (ID3D11Device COM)              vkd3d-proton engine (ID3D12Device COM)
+    │  Vulkan                                   │  Vulkan
+    ▼                                           ▼
+            Mesa venus ICD  (icd/mesa)  —  D3DKMTEscape(HELIOS_ESCAPE_SUBMIT_VENUS)
+                                    │
+                                    ▼
+            kmd_render → virtio-gpu → virglrenderer → host GPU → SET_SCANOUT_BLOB → QEMU
+```
+
+Every layer below the bridge is **already shipping and already proven**: it is the same ICD, the
+same escape, the same KMD, the same scanout that composite the desktop today.
+
+**Why a driver and not just shipping vkd3d's DLLs next to apps:** there is no supported system-wide
+`d3d12.dll` replacement on Windows 11. `System32\d3d12.dll` is WRP/TrustedInstaller-protected; the
+Agility SDK's `D3D12SDKVersion`/`D3D12SDKPath` mechanism is keyed off the **application's own
+exports** and only swaps `D3D12Core.dll`, not the driver. App-local DLL placement reaches only apps
+whose directory you control — never dwm, never Store apps, never an unmodified installer.
+(`research/R10.md` Q6, `research/R11.md` §5.2.) A driver is the only shape that makes *the adapter*
+D3D12-capable.
+
+**Decision D2 — the app-local vkd3d arm is Phase 0 of D1, not an alternative to it.** Dropping
+`d3d12.dll` + `d3d12core.dll` + DXVK `dxgi.dll` beside an executable exercises **the entire lower
+half of the target architecture** — the same vkd3d, the same dxil-spirv, the same venus ICD, the
+same KMD, the same present path — with zero Helios code written. It is therefore the cheapest
+possible proof of everything except the DDI itself, and it stays afterwards as the permanent A/B
+control and conformance oracle (the same `tests/d3d12.exe` binary tests both arms; see D9).
+
+**Decision D3 — two DLLs, not one.** `helios_umd.dll` keeps slots 0–2 and is not touched;
+`helios_umd12.dll` takes slot 3.
+
+*Mechanism, proven live, not inferred:* `UserModeDriverName` is a `REG_MULTI_SZ` indexed by
+`KMTUMDVERSION` (`d3dkmthk.h:1830-1839`: `DX9=0, DX10, DX11, DX12, DX12_WSA32, DX12_WSA64`).
+`D3DKMTQueryAdapterInfo(KMTQAITYPE_UMDRIVERNAME, Version=3)` against the Helios adapter returns our
+DriverStore `helios_umd.dll` today, and versions 4/5 return `STATUS_INVALID_PARAMETER` — so write
+**four** entries, never six. (`research/R11.md` §1.3.)
+
+*Why two:* `helios_umd.dll` is loaded **and unloaded once per D3D11 device inside dwm** (measured —
+`umd/src/lib.rs:45-64`). Anything linked into it is mapped, relocated and unmapped on every dwm
+device create. Linking vkd3d + dxil-spirv into the compositor's driver makes DWM pay for a feature
+it never uses, and makes every D3D12 compile error a change to the binary dwm loads at boot. Two
+DLLs also give the only acceptable rollback: **`UserModeDriverName[3]` is a single registry rewrite
+away from disabling D3D12 entirely, with D3D11 provably untouched** (it resolves index 2). That is a
+stability argument, not an aesthetic one — see D11.
+
+**Decision D3b — two DLLs must not mean two copies of anything. Every line that is not
+D3D-version-specific moves to a shared `umd_common` crate, and it moves *before* `umd12` is
+written.**
+
+The two-DLL split (D3) buys blast-radius isolation. It must not buy code duplication. The rule:
+
+> ⛔ **If a D3D12 file would contain code that also exists in `umd/`, that code moves to
+> `umd_common` first and both crates depend on it. Copy-paste between `umd` and `umd12` is a
+> defect, not a shortcut.**
+
+`umd_common` is an **`rlib` path dependency** of both cdylibs (no cargo workspace — that would
+change `CARGO_TARGET_DIR` semantics for `kmd_render`, which has its own `Cargo.make.toml` and WDK
+metadata; path deps already work, exactly as `helios_protocol` is consumed today at
+`umd/Cargo.toml:12`). Each cdylib gets its own copy of the *machine code* at link time — that is
+unavoidable and correct for two independently-deployable drivers — but there is exactly **one copy
+of the source, one place to fix a bug, and one place to review**.
+
+What moves, and it is ~1 500 lines with essentially no behaviour change:
+
+| `umd_common` module | From | Why it is version-agnostic |
+|---|---|---|
+| `hr` | `umd/src/hr.rs` (93 L) | HRESULT constants + the 11 compile-time severity asserts. Its own doc already names *"the D3D10/11 UMD DDI, the D3D12 UMD DDI and the DXGI DDI"* as its audience (`:1-2`) — it was written for this. |
+| `log` | `umd/src/log.rs` (244 L) | `trace_line!`/`log_error!`, the `#[deprecated]` + `#![deny(deprecated)]` compile-error guard, `close_at_detach()` under the loader lock, `log_self_module_path()`, `log_knob_inventory()`. **One change:** the log basename becomes an `init(basename)` argument so D3D11 keeps `umd-<pid>.log` and D3D12 writes `umd12-<pid>.log`. |
+| `knobs` | `umd/src/knobs.rs:58-153` | `reg_dword` (the single audited advapi32 FFI site), `DwordKnob`, `BoolKnob`, and the inventory mechanism. The **knob values** stay per-crate — `umd12` declares its own set including `UmdD3D12` (D11). |
+| `format` | `umd/src/format.rs` (449 L) | The DXGI format table. Already deliberately free of `windows`/WDK types so `tools/format-table-check.rs` can `include!` it and run on Linux — that property must survive the move. |
+| `throttle` | `umd/src/forward.rs:119-162` | `LogThrottle`, whose budget is a call argument rather than baked into the static. |
+| `refusals` | `umd/src/forward.rs:322-448` | The refusal-counter *mechanism* — `note(&AtomicUsize)` plus first-hit-emits-summary. The eleven D3D11 counter fields stay in `umd`; `umd12` declares its own set. Generalise to `RefusalCounter { count, name }`. |
+| `noop` | `umd/src/device_funcs.rs:676-754` | The counting noop-DDI idiom, `UniformFn`, `log_backtrace` (`RtlCaptureStackBackTrace` on first hit), and the `stub_fill_device_table<T>` size-derived table stubber. `ddi_calc_size`'s 256-byte answer does **not** move — that is a D3D11 claim. |
+| `slot` | `umd/src/forward/handles.rs:177-333` | `Slot<P>`, `Com<T>`, `Boxed<S>` and the three traits — already generic and already free of `ddi::` types. The `com_handles!`/`boxed_handles!` macros become `#[macro_export]` with `$crate`-qualified paths so each cdylib invokes them over its **own** `ddi` module. ⚠ The `Slot<Boxed<S>>::get() -> &'static S` soundness argument (`:294-301`) rests on the D3D11 runtime's `CUseCountedObject` ordering; **it must be re-derived for D3D12, not assumed**. |
+| `window` | `umd/src/device_funcs.rs:127-161` | `Window<T>` — a pointer and its capacity as one value. |
+| C++ side | `umd/bridge/bridge_common.h`, plus `PeriodicStat`, `qpc_elapsed_us`, `ComRelease<T>` from `dxvk_bridge.cpp:134-202` | Engine-agnostic. Becomes a shared header both bridges include. ⚠ The `bridge_guard` template — including its `static_assert` (`ead692e`) — belongs here too; a second guard template written from scratch is how that bug comes back. |
+
+`umd_common` must build on **Linux as well as Windows** (put `windows` behind
+`[target.'cfg(windows)'.dependencies]` and `#[cfg(windows)]`-gate `slot`/`log`/`knobs`) so
+`tools/format-table-check.rs` and any future host-side test keep working. It has **no `build.rs`**
+and **no WDK dependency** — the bindgen'd DDI types stay in their own crates, because D3D11 and
+D3D12 generate different headers.
+
+**Ordering is load-bearing:** the `umd_common` extraction is stages S1–S2 and lands *before* the
+`umd12` crate exists (S3). Extracting from one caller is a mechanical, provable refactor —
+`log_knob_inventory()`'s output must come out byte-identical, which is its own validation
+instrument. Extracting after a second caller exists is a merge.
+
+**Decision D4 — the vkd3d engine is reached through a Helios-added export on vkd3d's own DLL, not
+by statically linking `libvkd3d` into the UMD.** The UMD `LoadLibrary`s a Helios-built
+`helios_vkd3d.dll` (vkd3d's `d3d12core` target, renamed, with two added exports) and calls
+
+```c
+HRESULT helios_vkd3d_create_device(LUID adapter_luid, REFIID iid, void **device);   /* NEW export */
+```
+
+which calls `vkd3d_create_instance` + `vkd3d_create_device` (`include/vkd3d.h:104,110`) **directly**,
+skipping `libs/d3d12core/main.c`'s `D3D12CreateDevice`.
+
+⚠ **Two exports, not one.** The second is a root-signature serializer. `d3d12umddi` delivers root
+signatures to the driver **already parsed** (`D3D12DDI_ROOT_SIGNATURE`), while vkd3d's
+`ID3D12Device::CreateRootSignature` wants a serialized DXBC `RTS0` blob, so the UMD must
+re-serialize (H3). `vkd3d_serialize_root_signature` (`include/vkd3d.h:129`) exists but is **not
+exported from any vkd3d DLL** — `libs/d3d12core/d3d12core.def` exports only `D3D12GetInterface` and
+the `D3D12SDKVersion` data symbol. So:
+
+```c
+HRESULT helios_vkd3d_create_device(LUID adapter_luid, REFIID iid, void **device);
+HRESULT helios_vkd3d_serialize_root_signature(const D3D12_ROOT_SIGNATURE_DESC *desc,
+                                              D3D_ROOT_SIGNATURE_VERSION version,
+                                              ID3DBlob **blob, ID3DBlob **error_blob);
+```
+
+Three reasons, in order:
+
+1. **`d3d12core`'s device path calls `CreateDXGIFactory1`.** ⚠ Precisely: the exported
+   `D3D12CreateDevice` lives in `libs/d3d12/main.c:143` (the separate thin `d3d12.dll` target, which
+   Helios does not use at all). Inside `d3d12core.dll` the DXGI-touching path is
+   `d3d12core_CreateDeviceFromFactory` (`libs/d3d12core/main.c:643`), reachable only through
+   `D3D12GetInterface`, and it calls `CreateDXGIFactory1` at `:383` and `:406` to resolve the
+   adapter. A WDDM UMD sits *below* DXGI and must not depend on `dxgi.dll` —
+   `umd/build.rs:240-243` states this rule for the D3D11 side and the D3D12 side inherits it
+   verbatim, with an added hazard: a UMD that loads dxgi during device creation risks re-entering
+   adapter enumeration that loads the UMD. The new exports exist precisely to bypass that path.
+2. ~~**Licence.**~~ ⛔ **NOT A CONSTRAINT — owner directive, 2026-08-05: "I don't care about UMD
+   License."** Recorded so it is not re-litigated. For the record, the fact is that vkd3d-proton is
+   **LGPL-2.1-or-later** (`vkd3d-proton-helios/COPYING`) while DXVK is zlib, so static-linking
+   `libvkd3d` into `helios_umd12.dll` would engage LGPL §6 relinking obligations that a DLL boundary
+   does not — but that is **not** a reason to choose between them here. **D4 stands on reasons 1 and
+   3 alone**, which are purely technical, and static linking is an equally legitimate option to be
+   decided on those grounds.
+3. **It sidesteps the two-SPIR-V-compilers question entirely.** DXVK links `libdxbc_spv.a` +
+   `libspirv.a`; vkd3d links `dxil-spirv` + `libvkd3d-shader.a`. Both are C++ SPIR-V producers over
+   SPIRV-Headers, and whether their *defined external* symbol sets intersect is unverified
+   (`research/R4.md` UNVERIFIED-2). Separate modules make the question moot.
+
+*Fallback, if the export approach fails:* static-link, as `research/R4.md` §6.4 specifies — a
+`helios_d3d12_static` meson target that excludes `libs/d3d12core/main.c` so the `CreateDXGIFactory1`
+object is never pulled out of the archive, exactly as `umd/build.rs:240-243` documents for DXVK.
+Reason 1 still has to be satisfied that way; reason 3 (two SPIR-V compilers in one DLL) becomes live
+and must be settled first — `llvm-nm --defined-only --extern-only` over both archive sets, diffing
+the symbol sets (`research/R4.md` UNVERIFIED-2).
+
+**Decision D5 — the KMD is not on the critical path.** For Phase 0 the KMD work list is **empty**;
+for the DDI arm it is three items, none required for the first triangle:
+
+| # | Item | Why | Size | Required for first frame? |
+|---|---|---|---|---|
+| K1 | Validate `NodeOrdinal`/`EngineAffinity` in `DxgkDdiCreateContext` and count refusals (`CtxNode`) | Today a context for a node that does not exist is accepted silently; `DxgkDdiCreateHwContext` already checks (`scheduler.rs:135-137`). CLAUDE.md rule 2. | S | No |
+| K2 | Set `ContextInfo.Caps.NoPatchingRequired` and shrink `AllocationListSize`/`PatchLocationListSize` for `VirtualAddressing` contexts | The documented shape for a GPU-VA context; Helios asks 256+256 on every context and no-ops `DxgkDdiPatch`. Wasteful, not wrong. | S | No — and it touches the Present allocation list, so knob + paired A/B |
+| K3 | Revisit `ApertureSegmentCommitLimit` (64 MiB) | Only if D3D12 residency budgets read too small. Needs a measurement first. | S | No |
+
+Everything else people expect to be needed is **not**: no extra engine nodes (D3D12's
+`D3D12DDIARG_CREATECOMMANDQUEUE` carries no node ordinal — the UMD picks it in
+`D3DDDICB_CREATECONTEXTVIRTUAL`); no hardware queues (HWS is WDDM 2.6+ and has never been mandatory
+for D3D12); no `DxgkDdiSignalMonitoredFence` or native fences (optional, and the software path is
+proven live on this adapter); no real page tables; no residency DDIs (none exist in this WDK).
+(`research/R5.md` §10.)
+
+**One correction to the received picture:** of the 103 unset `DxgkDdi*` slots, only **31 are
+reachable** at the declared `WDDM2_1` level — the other 72 sit in higher-version blocks of
+`DRIVER_INITIALIZATION_DATA` and cannot be called. **None of the 31 is required for a baseline
+D3D12 device.** (`research/R5.md` §0.2, §1.2.)
+
+---
+
+## 2. The substrate is proven, and that is the biggest de-risking result
+
+**Decision D6 — treat the Vulkan substrate as solved and stop re-litigating it.**
+
+Measured live on the running guest this session (`research/R12.md` §9, raw capture in
+`docs/dx12/research/guest-vulkaninfo-full.txt`), parsed against vkd3d-proton's own
+`VP_D3D12_VKD3D_PROTON_profile.json`:
+
+| Profile capability set | feature misses | extension misses |
+|---|---|---|
+| `baseline_features` | **0** | **0** |
+| `fl_11_1_features` / `fl_12_0` / `fl_12_1` / `fl_12_1_rov` / `fl_12_2` | **0** | **0** |
+| `shader_model_60`, `shader_model_66` | **0** | **0** |
+| `optimal_performance` | 7 | 7 |
+
+**The live Helios guest satisfies `VP_D3D12_FL_12_2_baseline` in full.** All nine of vkd3d's
+hard-fail device-creation gates (`libs/vkd3d/device.c:3243-3489` — vertex attribute divisor,
+transform-feedback queries, single-texel alignment, `samplerMirrorClampToEdge`, robustness2 ×2,
+`shaderDrawParameters`, push descriptors, `maintenance5`+`maintenance6`) pass. Sparse binding is
+supported end to end. Raytracing reaches **DXR tier 1.1**.
+
+Known substrate ceilings, all optional: DXR 1.2 (no `VK_KHR_opacity_micromap` — at pin `2c7ba22c`
+vkd3d gates on the KHR form, `libs/vkd3d/device.c:98`, not the older EXT one),
+`OPTIONS14.AdvancedTextureOpsSupported` (no `VK_KHR_maintenance8`), and the descriptor-model
+optimisations (`VK_EXT_descriptor_buffer` / `descriptor_heap`).
+
+**Two substrate items are real work, and both are cheap to state:**
+
+- **V1 — `VK_KHR_external_memory_win32` is absent and vkd3d does not check for it.** On `_WIN32`,
+  `libs/vkd3d/resource.c:4405-4429` unconditionally chains `VkExportMemoryAllocateInfo` for any
+  `D3D12_HEAP_FLAG_SHARED` allocation and then calls `vkGetMemoryWin32HandleKHR` — a **NULL function
+  pointer** when the extension was never enabled. So shared heaps are not degraded, they are
+  *hazardous*. The Mesa fork implements the semaphore twin natively already
+  (`vn_physical_device.c:1273-1279`, assignment at `:1277`); the memory half is the analogous work.
+- **V2 — no 32-bit (WOW64) Vulkan ICD is registered.** `HKLM\SOFTWARE\WOW6432Node\Khronos\Vulkan\Drivers`
+  does not exist on the guest. A 32-bit D3D12 client finds zero physical devices. Either ship a
+  32-bit venus ICD or declare 64-bit-only in writing. (Note `3DMarkNightRaid.exe` ships a Win32
+  build, which would otherwise be a free WOW64 arm.)
+
+Free wins worth taking on day one: `VN_DEBUG=mem_budget` (enables `VK_EXT_memory_budget`, improving
+`QueryVideoMemoryInfo`); `VKD3D_CONFIG=single_queue` and `nodxr` as the two first stability A/Bs.
+
+---
+
+## 3. What is genuinely hard
+
+Ranked. These are where the plan should spend its risk budget.
+
+**H1 — the D3D12 UMD DDI is undocumented.** Microsoft publishes ~600 auto-generated reference stubs
+with no Remarks and *zero* conceptual articles; `OpenAdapter12` appears nowhere in the driver-docs
+corpus; there has never been a public D3D12 UMD, open or closed (D3D9On12 and D3D11On12 were both
+open-sourced; a D3D12 one never was). Strategy D1 is original engineering, not porting.
+(`research/R10.md` Q1.)
+
+*Mitigation, and it is unusually good:* **`C:\Windows\System32\d3d10warp.dll` exports
+`OpenAdapter12`** (verified by `dumpbin /exports`). A shim DLL that forwards to WARP and logs every
+`pfnGetCaps(Type, DataSize)`, `pfnFillDDITable(TableType, TableSize, …)`,
+`pfnGetSupportedVersions` result and every table-slot call turns **seven** undocumented contract
+questions into one log file, for about a day's work and with no driver change. Second source: the
+D3D12 runtime's own validation strings, extracted from `D3D12Core.dll`
+(`docs/dx12/research/d3d12core-driverstrings.txt`, 270 lines) — the runtime telling you in English
+what the driver must do. Both are first-class tools, not curiosities.
+
+**H2 — presentation, but not for the reason the old charter said.**
+
+*Correction of record:* `ROADMAP.md:2385` ("only the VULKAN client class lacks a HW present") and
+the version of `DX12.md` that inherited it are **stale**. The Helios Mesa ICD implements
+`VK_KHR_win32_surface` + `VK_KHR_swapchain` and has had a hardware flip present — the **dcomp
+vehicle**, default **ON** — since the 28th session. A Vulkan client on Helios already gets a
+flip-model, DWM-composited present whose pixels move GPU-side through venus, re-entering
+`helios_umd!dxgi_present`. (`research/R7.md` §4.)
+
+The real present issues are three, all named:
+
+- **P-A (Phase 0 blocker, confirmed by code).** vkd3d-proton implements **no DXGI** and never creates
+  a `VkSurfaceKHR`; it exposes `IDXGIVkSwapChainFactory` off `ID3D12CommandQueue` and consumes an
+  `IDXGIVkSurfaceFactory` — interfaces only **DXVK's `dxgi.dll`** provides (matching UUIDs already
+  exist in `dxvk-helios`). But the ICD's vehicle does `LoadLibraryA("dxgi.dll")`, and DXVK's
+  `CreateSwapChainForComposition` returns **`E_NOTIMPL`** by default. So deploying vkd3d + DXVK-DXGI
+  app-local **silently demotes every frame to the software GDI blit** — a picture that looks correct
+  and is not the path you think you measured. Fix is ~10 lines, ICD-local: load `dxgi.dll`/`d3d11.dll`/
+  `dcomp.dll` by **explicit full System32 path** in `wsi_win32_vehicle_runtime_init_locked`, **and
+  then verify what you got**: `GetModuleFileNameW` on the returned `HMODULE` and refuse, with a
+  named counter, if it does not resolve under `%SystemRoot%\System32`. ⛔ Neither
+  `LoadLibraryExA(…, LOAD_LIBRARY_SEARCH_SYSTEM32)` nor a full path is sufficient on its own — the
+  loader's already-loaded check matches on base name, so a DXVK `dxgi.dll` the *application* loaded
+  first is returned to the vehicle regardless of how the vehicle asks. The verification step is
+  what makes the failure loud instead of silent, which is the whole point of the fix.
+  **This must land before any Phase-0 measurement.**
+- **P-B (Phase 0 cost).** `helios_umd_get_present_result` has returned `-1` unconditionally since
+  R912(a), so the ICD's acquire-side gate is never armed and every vehicle present takes the
+  worker-serial `wait_last_present` fallback — measured at **avg 5.57 ms/frame**. Plus the vehicle
+  path costs two-to-three frame copies. Phase 0 numbers must be read with this in mind.
+- **P-C (the DDI arm's present design) — narrower than it first looked.** D3D12's `pfnPresent`
+  **does** reach the driver: it is on the *command-list* table (`PFND3D12DDI_PRESENT_0051`,
+  `d3d12umddi.h:7250`), takes `D3D12DDIARG_PRESENT_0001` (essentially `DXGI_DDI_ARG_PRESENT`), and
+  **outputs** the src/dst `D3DKMT_HANDLE`s and the context. There is no `pfnPresentCb` and no
+  `pfnRenderCb` **declared in `d3d12umddi.h` itself** — but that is not the whole surface.
+  ✅ **`D3D12DDIARG_CREATEDEVICE_0109.pKTCallbacks` (`d3d12umddi.h:13623`) is a
+  `CONST D3DDDI_DEVICECALLBACKS*` — the same 65-entry kernel thunk table the D3D11 UMD already
+  drives, and it contains both `pfnRenderCb` and `pfnPresentCb`** (verified:
+  `D3DDDI_DEVICECALLBACKS` at `tmp/dx12/sdk/d3dumddi.h:4499`, 65 `pfn` members, both present).
+  **Consequence:** the existing identity channel transfers — the D3D12 UMD can write a
+  `HeliosPresentRenderCmd` and call `pfnRenderCb` exactly as `umd/src/forward/present.rs:795`
+  does, landing in the KMD's **PASSIVE** `dxgkddi_render` path and its per-context stash, with no
+  KMD change at all. ⛔ **Do not design a new `DxgkDdiSubmitCommandVirtual` decode for this** — that
+  DDI runs at DISPATCH_LEVEL (`kmd_render/src/ddi/submit_command.rs:723-724`), where the stash
+  machinery's `diag::record*` calls are illegal, and it would add a fourth KMD item that D5 does not
+  have. Everything from `dxgkrnl` down — the flip arm, `PresentFlipPrivate`, `set_scanout_blob` —
+  is reused unchanged.
+  ⚠ **UNVERIFIED:** that the D3D12 runtime tolerates the driver calling `pfnRenderCb` around
+  `pfnPresent`. Settling experiment: `pfnRenderCb` + a counting `DxgkDdiRender` on the D3D12 path
+  at G7, before G8 depends on it.
+
+**H3 — the object graph, not the command stream, is where the DDI cost lives.** The command
+recording surface forwards almost 1:1 into `ID3D12GraphicsCommandList`. What does not:
+
+- **Root signatures arrive parsed**, as `D3D12DDI_ROOT_SIGNATURE` — vkd3d's
+  `CreateRootSignature` wants a serialized `RTS0` blob, so the UMD must **re-serialize**
+  (`vkd3d_serialize_root_signature`, `include/vkd3d.h:129`, exists but is not exported today).
+- **PSOs arrive as handle bundles** — blend / rasterizer / depth-stencil / element-layout are
+  separate driver objects referenced by handle; the UMD must retain each one's desc and reassemble a
+  `D3D12_GRAPHICS_PIPELINE_STATE_DESC`.
+- **Heap and resource creation are fused** into one `pfnCreateHeapAndResource` whose two argument
+  pointers are independently nullable (committed / placed / heap-only).
+- **Descriptor heaps are entirely driver-owned** — and this is the *good* surprise: both
+  `D3D12DDI_CPU_DESCRIPTOR_HANDLE{SIZE_T ptr}` and `D3D12DDI_GPU_DESCRIPTOR_HANDLE{UINT64 ptr}` are
+  opaque driver-chosen scalars, and `pfnGetDescriptorSizeInBytes` lets the driver choose the stride.
+  A forwarder can create a matching `ID3D12DescriptorHeap` on the vkd3d device and **return vkd3d's
+  own handle values and stride verbatim**, so runtime/app descriptor arithmetic lands on vkd3d's own
+  arithmetic. No shadow table at all.
+  ⚠ One ABI hazard: the DDI returns those handle structs **by value**, while vkd3d's C
+  implementation returns via hidden pointer. That is exactly the `bridge_guard` truncation class
+  (commit `ead692e`) and must be handled explicitly in the bridge.
+
+**H4 — the caps gauntlet is a hard gate with ~60 runtime-enforced consistency rules.**
+`D3D12DDICAPS_TYPE` has **43** enumerators (§4.1); `D3D12Core.dll`'s own strings enumerate the
+failures:
+`"Driver did not respond to D3D12DDICAPS_TYPE_D3D12_OPTIONS caps query."`,
+`"Driver did not report any supported shader models…"`,
+`"Driver did not set valid WaveLaneCountMin/Max or TotalLaneCount…"`, ~12 distinct
+`"Driver filled out an invalid value in D3D12DDI_D3D12_OPTIONS_DATA::<Tier>"`, and cross-checks such
+as `"Drivers that support raytracing must expose shader model 6.3."` **Every tier is a contract the
+runtime validates, and D3D12's tiered caps are exactly the shape of the `SupportDirectFlip` /
+`FlipImmediateMmIo` landmine.**
+
+**H5 — shader model may cap at 6.0 unless one probe says otherwise.** vkd3d gates SM 6.2 (and the
+whole ladder above it) on FP32 denorm control, exempting only `VK_DRIVER_ID_NVIDIA_PROPRIETARY`. The
+guest reports `driverID = MESA_VENUS` with both denorm properties `false`. **But** vkd3d handles
+layered implementations: with `VK_KHR_maintenance7` it reads the *underlying* driver's
+`VkPhysicalDeviceDriverProperties` and **swizzles `driverID` to the real one**
+(`device.c:2657-2664`) — and that runs at `device.c:4129`, well before shader-model caps init at
+`:11599`. The guest has `maintenance7` and reports `layeredApiCount = 1` naming the host NVIDIA
+device. So the swizzle very likely fires and SM 6.6 is reachable. **Verified ordering; unverified
+outcome** — see G-probe in §5.
+
+---
+
+## 4. Scale, stated honestly
+
+### 4.1 ⚠ The canonical counts — settle every disagreement here
+
+Re-derived from `tmp/dx12/sdk/d3d12umddi.h` (SDK 10.0.26100.0, **19 031** lines) by parsing struct
+and enum bodies, 2026-08-05. **Any other number anywhere in this directory is wrong; fix it to
+match this table.** Several were miscounted independently by more than one research lane, so do not
+trust a figure that is not here.
+
+| Thing | Count | Where | Miscount to watch for |
+|---|---:|---|---|
+| `D3D12DDI_ADAPTERFUNCS_0109` | **8** | `:13640-13650` | — |
+| `D3D12DDI_DEVICE_FUNCS_CORE_0109` | **124** | `:13451-13616` | — |
+| `D3D12DDI_COMMAND_LIST_FUNCS_3D_0108` | **75** | `:13303-13388` | — |
+| `D3D12DDI_COMMAND_QUEUE_FUNCS_CORE_0001` | **7** (2 are `pfnUnused`) | `:2729-2738` | — |
+| **baseline driver-side slots** | **214** | 8+124+75+7 | — |
+| the command-queue triple in `CORE_0109` | members **27, 28, 29** | `:13488-13490` | ⛔ not "slots 38-40" — that was a `sed` line offset misread as a member index |
+| `D3D12DDICAPS_TYPE` | **43** enumerators | `:94-150` | 40 carry the `D3D12DDICAPS_TYPE_` prefix; the other 3 are `D3D12DDI_FEATURE_D3D12_PREDICATION_106`, `..._PLACED_RESOURCE_SUPPORT_INFO_106`, `..._HARDWARE_COPY_106`. There are **no** versioned additions elsewhere. Neither 40 nor 42 is right |
+| `D3D12DDI_TABLE_TYPE` | **25** enumerators | `:2488-2516` | ⛔ not 27 — 27 is the highest assigned *value*; the value space has gaps at 5, 6, 18 |
+| `D3D12DDI_CORELAYER_DEVICECALLBACKS_0062` | **18** live members | `:8606-8647` | 28 lines declare members, but ten are `#else` `void* pfnReserved…` alternates at the same offsets. Live count under WDDM2_5+ gates is 18. Earlier revisions: `_0003` 12, `_0022` 14, `_0050` 17 |
+| `D3DDDI_DEVICECALLBACKS` via `pKTCallbacks` | **65** `pfn` members | `d3dumddi.h:4499` | includes `pfnRenderCb`, `pfnPresentCb`, `pfnSubmitCommandCb`, `pfnEscapeCb`, `pfnAllocateCb` — see P-C |
+| `D3DDDI_ADAPTERCALLBACKS` | 3 | — | — |
+| distinct `PFND3D12DDI_*` typedefs | 399 | — | — |
+| `typedef struct` in the header | 683 (517 `D3D12DDI_*` + 133 `D3D12DDIARG*`) | — | — |
+
+Reproduce with the script in `DDI_REFERENCE.md`'s appendix; do not eyeball a `grep -c`, because
+`#else` arms and value gaps defeat it.
+
+### 4.2 The comparison
+
+| | D3D11 (shipping) | D3D12 (target) |
+|---|---|---|
+| Driver-side table slots that must be non-NULL | ~175 (157 device + 18 DXGI) | **214** |
+| Slots needing a real body for a triangle on screen | — | ~86–99 — `DDI_REFERENCE.md` §14 owns the authoritative list; quote it, do not re-estimate |
+| Runtime→driver callbacks in | 1 table | 3 tables: `D3DDDI_ADAPTERCALLBACKS` 3, `D3D12DDI_CORELAYER_DEVICECALLBACKS_0062` 18, `D3DDDI_DEVICECALLBACKS` 65 |
+| Caps types to answer | 8 | **43** |
+| Rust today | 5 774 lines in `umd/src/*.rs` + 13 283 in `umd/src/forward/` (19 modules) | — |
+
+**~1.2× the D3D11 UMD in slot count**, and more than that in difficulty because of H3/H4. But the
+kernel-facing half is already built, the engine already exists, and the substrate is measured green.
+
+---
+
+## 5. The one experiment that should run before anything else
+
+**Settle H5 with a ~40-line read-only Vulkan probe** (`tools/vk_layered_driverid_probe.cpp`): chain
+`VkPhysicalDeviceLayeredApiPropertiesListKHR` → `VkPhysicalDeviceLayeredApiVulkanPropertiesKHR` →
+`VkPhysicalDeviceDriverProperties` on the guest and print `driverID`. If it prints
+`VK_DRIVER_ID_NVIDIA_PROPRIETARY`, shader model reaches 6.6 and feature level 12_2 is on the table.
+If it prints 0 or `MESA_VENUS`, the ceiling is SM 6.0 / FL 12_1 and the **first real content of the
+`vkd3d-proton-helios` fork** is extending the exemption at `device.c:10699` — which must then be
+conditioned on something venus can actually observe about the host, not hardcoded.
+
+No build, no driver change, no reboot. It also answers the DX12.md-era question "what was the fork
+for" by giving the fork its first justified patch.
+
+---
+
+## 6. Cross-lane conflicts and how they were resolved
+
+| Conflict | Resolution | Evidence |
+|---|---|---|
+| **R3:** "the D3D12 UMD DDI has no queue object at all — the runtime owns submission." **R1/R2:** the DDI has a full queue object. | **R1/R2 are right; R3 is wrong.** `D3D12DDI_DEVICE_FUNCS_CORE_0109` contains `pfnCalcPrivateCommandQueueSize` / `pfnCreateCommandQueue` / `pfnDestroyCommandQueue`, and `D3D12DDI_TABLE_TYPE_COMMAND_QUEUE_3D` (=2) is filled from `D3D12DDI_COMMAND_QUEUE_FUNCS_CORE_0001` with `pfnExecuteCommandLists`. | `d3d12umddi.h:13488-13490` (members 27-29 of `CORE_0109`) and `:2729-2738`. |
+| **R2:** "does a monitored fence advance with no GPU-side write?" — marked HIGH risk, strategy-deciding. **R5:** it is documented and already proven on this adapter. | **Risk downgraded HIGH → MEDIUM.** Microsoft documents the exact fallback: *"If a GPU engine isn't capable of writing to a monitored fence using its virtual address, the UMD uses the SignalSynchronizationObjectFromGpuCb callback to queue a software signal packet"*, and *"Dxgkrnl updates the fence memory location"* on CPU signal. `tools/vehicle_flipwait_probe.c` proves the queued-wait-before-queued-signal primitive live on this software-scheduled adapter with **zero KMD changes**. Residual: confirm the CPU-visible value advances for a *D3D12-shaped* fence — one probe (G-fence). | `windows-driver-docs-pr/display/context-monitoring.md`, `native-gpu-fence-objects.md`; `ROADMAP.md:2616-2621`. |
+| **R8:** vkd3d caps Helios at SM 6.0 → FL 12_1. **R12:** the `maintenance7` layered-driverID swizzle probably lifts it to SM 6.6 → FL 12_2. | **R12's mechanism is real and correctly ordered** (`vkd3d_physical_device_info_init` at `device.c:4129` runs before `d3d12_device_caps_init` at `:11599`; the swizzle is at `:2657-2664`), and the guest has `maintenance7` with `layeredApiCount=1`. **Outcome still unobserved** — the nested `VkPhysicalDeviceDriverProperties` was never chained. Treated as H5 with a named probe; plan for SM 6.0 and expect 6.6. | Verified in `vkd3d-proton-helios/libs/vkd3d/device.c` this session. |
+| **R3:** driving vkd3d's core from a DDI frontend needs ~5 surgeries (de-`static` 200 methods, ops tables, rewrite `bundle.c`…). **R2:** forwarding is straightforward with shadow state. | **They answer different questions.** R3 costed *replacing* vkd3d's COM layer with a non-COM ops table. D1 does not do that — it **calls vkd3d's public `ID3D12*` COM interfaces**, exactly as the D3D11 UMD calls DXVK's `ID3D11Device`. Zero vkd3d surgery beyond exporting a device-creation entry point (D4). R3's five surgeries are **not on the plan**. | `research/R2.md` §6 verdict table; the D3D11 precedent at `umd/bridge/dxvk_bridge.cpp:1754-1757`. |
+| **R2/DX12.md:** the "load-bearing unknown" is presentation for Vulkan clients. **R7:** that statement is stale. | **R7 is right.** The dcomp vehicle shipped in the 28th session and is default-ON. The load-bearing present issues are P-A/P-B/P-C in §3-H2, not the hand-off. | `icd/mesa/src/vulkan/wsi/wsi_common_win32.cpp:361-376`, `:2067-2258`. |
+| **DX12.md §3.2:** `DXGK_VIDMMCAPS.DriverManagesResidency` is not set. | **Field misattributed.** `DriverManagesResidency` is a **`DXGK_CONTEXTINFO_CAPS`** bit (per-context, `d3dkmddi.h:1550-1563`), not a `DXGK_VIDMMCAPS` bit. The conclusion (residency is VidMm's job) is unchanged; Helios never writes `ContextInfo.Caps` at all. | `research/R5.md` §11. |
+| **DX12.md §2(b):** "requires from the UMD: nothing; `umd/` is not in this path." | **Wrong.** The vehicle runs `D3D11CreateDevice` on the Helios adapter inside the vkd3d process, and every vkd3d frame goes through `helios_umd!dxgi_present`; the three `helios_umd_*` exports are load-bearing. | `umd/src/vehicle_exports.rs:7-11`; `research/R7.md` §8. |
+
+---
+
+### 6.1 Resolutions issued after the first doc pass (2026-08-05, verification round)
+
+| Question | Resolution |
+|---|---|
+| **Shader-model ceiling: 6.6 or 6.7?** | `SUBSTRATE.md` §7.1 walks vkd3d's ladder (`device.c:10640-10826`) against the live guest and reaches **SM 6.7**; the `shader_model_67` profile's single miss (`VK_KHR_maintenance8`) is a *profile* entry that the code does not gate on. **Canonical: "SM 6.6 at minimum, and the ladder walks to 6.7"** — and all of it is downstream of H5, so plan for 6.0 and treat anything above as upside until the probe runs. |
+| **G0 build: Linux mingw cross, or native MSVC on the VM?** | **Linux mingw cross is the primary**, because the host already has the whole toolchain installed — `x86_64-w64-mingw32-gcc`, `widl`, `glslangValidator`, `meson`, `ninja` are all on `PATH` today (verified). Zero installation, and it matches vkd3d-proton's own shipping build (`artifacts.yml`). Native MSVC x64 on the VM (upstream's `test-build-windows.yml`: choco strawberryperl + glslangValidator + meson + VS2022, built to a **local C:** path) is the **fallback, taken when a Windows debugger is wanted**. `ARCHITECTURE.md` §8.3 and `GATES.md` G0 must both say this. |
+| **`InstalledDisplayDrivers`: 2 entries or 4?** | **2** — `helios_umd,helios_umd12`. It is a flat list of distinct package binaries, not index-parallel to `UserModeDriverName`. The live four-times value is semantically wrong today; fixing it is part of the INF change, not a separate item. |
+| **PRESENT's `HELIOS_WSI_INSURANCE_BLIT` "numbers never landed"** | **Wrong** — the A/B landed: `ROADMAP.md:2919-2926` and `:2948-2950` record an owner Doom verdict run with `insurance=0` showing no fps change. Copy #3 is **measured inert at Doom resolution**. Re-measure at D3D12 resolutions before claiming it costs anything. |
+| **PRESENT's "no post-fix fullscreen vehicle measurement exists"** | **Wrong** — `ROADMAP.md:2919-2931` is that measurement (the fullscreen 1896×1030 chain went VEHICLE, READY+LIVE on the same hwnd, after the target-registry fix). Narrow the open item to: those numbers were taken with `VehicleKernelFlipWait=1`, which R912(a) has since retired, so re-measure on the shipping gate path. |
+| **Venus-level host logging lever** | `HELIOS_VKR_DEBUG=validate` (owner-gated relaunch), **not** `VIRGL_LOG_LEVEL=debug` — `ROADMAP.md:1901-1903`. `GATES.md` §5.2 must be corrected. |
+
+## 7. Standing constraints the D3D12 work inherits
+
+These are not new; they are the ones most likely to be violated by a D3D12 implementer.
+
+1. **`OpenAdapter12` must stop refusing in the same commit that makes its body reachable — or the
+   body must not be written yet.** R908 deleted ~230 lines of unreachable D3D12 scaffolding hidden
+   behind `#[allow(unreachable_code)]`; that is the standing proof of the cost.
+2. **Every DDI ABI struct comes from the WDK header through bindgen with `layout_tests(true)`.**
+   Never hand-transcribed. `adapter.rs:36-45` records a 376..392-byte out-of-bounds write into the
+   runtime's heap from a hand-written table.
+3. **Honour `pfnFillDDITable`'s `SIZE_T` argument.** Never write `size_of::<T>()` bytes. This is the
+   R702 class (24H2 passing 576 B for a 592-byte `DRIVERCAPS`), and D3D12 parameterises it
+   explicitly.
+4. **Unknown interface/version → a closed enum with an exhaustive match**, never an `else` that
+   fills the largest table.
+5. **Declining an unimplemented interface is `DXGI_ERROR_UNSUPPORTED` (0x887A0004), never
+   `DXGI_ERROR_DRIVER_INTERNAL_ERROR` (0x887A0020)** — the latter is recorded by the runtime and ETW
+   as a driver fault.
+6. **No `panic!`/`todo!`/`unwrap` on runtime data.** A panic in any DDI is a silent graphics
+   deadlock. Many D3D12 DDIs return `VOID`; errors go out through `pfnSetErrorCb` /
+   `pfnSetCommandListErrorCb`.
+7. **Every skipped or refused path gets a named counter**, with a readout. Refuse at the *first*
+   step, never succeed-then-fail (the `CreateHwQueue`/`HwQRef` model).
+8. **Advertising a capability that is not backed is a lie the OS acts on.** D3D12's 43 caps types
+   and 16 tiered enums are the densest version of this hazard the project has faced.
+9. **Never reintroduce a producer-side CPU present gate** (owner directive, 2026-07-29).
+10. **`RelocateDeviceFuncs`-style callbacks are notifications, never a signal to refill a live
+    table.**
+11. **Only owner-visible desktop state counts as rendering evidence** (`helios_paintcap` →
+    `Z:\tmp\screen_copy.png`). Log lines are not frames. Registry counters persist across boots —
+    verify a counter *moves this boot*. Anything with a window runs in **session 1** via a cloned
+    scheduled task.
+12. **A frozen benchmark is a defect to root-cause, never a retry.**
+13. ⚠ **dwm.exe already calls our `OpenAdapter12` in production.** Enabling D3D12 is a change to the
+    compositor's behaviour on the next boot. Hence D11.
+
+**Decision D11 — D3D12 ships behind an off-by-default kill switch.**
+`HKLM\SOFTWARE\Helios!UmdD3D12` (`BoolKnob::new(c"UmdD3D12", false)`), read once per process at the
+top of `OpenAdapter12`. Absent ⇒ `DXGI_ERROR_UNSUPPORTED`, i.e. bit-identical to a build without the
+D3D12 path. `HKLM\SOFTWARE\Helios` is writable over SSH with the desktop down; the knob is read once
+per process so a running dwm keeps its behaviour while new processes pick up the change. The flip to
+default-ON requires the evidence in the comment at the read site (CLAUDE.md rule 8).
+
+---
+
+## 8. Deliverable map
+
+| Document | Answers |
+|---|---|
+| `DX12.md` (repo root) | the charter: decision, phases, checkpoints, current status |
+| `docs/dx12/DECISIONS.md` | **this file** — what was decided and why; conflict resolutions |
+| `docs/dx12/ARCHITECTURE.md` | the UMD split: crates, DLLs, bridge, INF, build, deploy, rollback |
+| `docs/dx12/DDI_REFERENCE.md` | the `d3d12umddi` contract: tables, negotiation, caps, objects, fences, minimum-viable set, undocumented questions |
+| `docs/dx12/PRESENT.md` | how a D3D12 frame reaches the scanout, both arms |
+| `docs/dx12/SUBSTRATE.md` | vkd3d-proton + venus: build, requirements, measured gap, knobs, licensing |
+| `docs/dx12/GATES.md` | `D12-G0 … D12-G11`, exact commands and pass criteria |
+| `docs/dx12/research/R1..R12` | the raw evidence dossiers |

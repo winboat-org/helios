@@ -1,0 +1,270 @@
+?&k?D3DDriverVerifier.dll
+??*Driver failed D3D12DDICAPS_TYPE_SHADERCACHE_ABI_SUPPORT Caps.
+??D?{oL????Driver set pfnCopyTiles to NULL.
+?O.s?Failure when retrieving D3D12DDICAPS_TYPE_VIDEO_0020_PROCESS_MAX_INPUT_STREAMS.
+Compiler does not support the abi range reported by driver.
+D3D12_VIDEO_DECODE_OUTPUT_STREAM_ARGUMENTS::Histograms[%d] a component enabled but that component is is not supported by driver.  See D3D12_FEATURE_VIDEO_DECODE_HISTOGRAM for capability checks.
+D3D12DDI_FEATURE_D3D12_PREDICATION_106 returned invalid support for current feature level
+D3D12DDI_FEATURE_DATA_PLACED_RESOURCE_SUPPORT_INFO_106 returned invalid support for current feature level
+D3D12DDI_FEATURE_HARDWARE_COPY_106 returned invalid support for current feature level
+D3D12DDICAPS_TYPE_VIDEO_0020_DECODE_PROFILES reported an unsupported profile GUID.
+D3D12DDICAPS_TYPE_VIDEO_0020_DECODE_SUPPORT returned invalid configuration flags
+D3D12DDICAPS_TYPE_VIDEO_0020_DECODE_SUPPORT returned invalid tier
+D3DDDICB_RENDER::BroadcastContext array may not contain contexts that belong to a scheduling group.
+D3DDDICB_RENDER::BroadcastContext array must contain contexts that are all associated with the same command queue.
+D3DDDICB_SUBMITCOMMAND::BroadcastContext array may not contain contexts that belong to a scheduling group.
+D3DDDICB_SUBMITCOMMAND::BroadcastContext array must contain contexts that are all associated with the same command queue.
+D3DDDICB_SUBMITCOMMAND::BroadcastContextCount is too large.
+D3DDDICB_SUBMITCOMMAND::NumPrimaries is too large. Only half the available array may be used by driver.
+Driver cannot have gaps in reported support for release shader models in D3d12DDICAPS_TYPE_0011_SHADER_MODELS caps query.
+Driver claimed MSAA support when it shouldn't
+Driver couldn't change frame latency
+Driver did not correctly respond to D3D12DDICAPS_TYPE_0023_UMD_BASED_COMMAND_QUEUE_PRIORITY caps query.
+Driver did not correctly respond to D3D12DDICAPS_TYPE_0050_HARDWARE_SCHEDULING_CAPS caps query.
+Driver did not report any supported shader models in D3D12DDICAPS_TYPE_0011_SHADER_MODELS caps query
+Driver did not respond to D3D12DDICAPS_TYPE_0011_SHADER_MODELS caps query with a list of supported shader models.
+Driver did not respond to D3D12DDICAPS_TYPE_ARCHITECTURE_INFO caps query
+Driver did not respond to D3D12DDICAPS_TYPE_D3D12_OPTIONS caps query
+Driver did not respond to D3D12DDICAPS_TYPE_SHADER caps query
+Driver did not set valid WaveLaneCountMin/Max or TotalLaneCount via D3D12DDICAPS_TYPE_SHADER caps query
+Driver didn't call pfnSetCommandListDDITableCb or called it with invalid D3D12DDI_HRTTABLE at command list creation, defaulting to stubbed DDIs.
+Driver didn't provide any HwQueues for a hardware scheduling command queue present.
+Driver does not have OpenAdapter entrypoint
+Driver doesn't respond to D3D12DDICAPS_MEMORY_ARCHITECTURE Caps.
+Driver failed D3D12DDICAPS_TEXTURE_LAYOUT or D3D12DDICAPS_TEXTURE_LAYOUT_SETS Caps.
+Driver failed D3D12DDICAPS_TYPE_0022_CPU_PAGE_TABLE_FALSE_POSITIVES Caps.
+Driver failed D3D12DDICAPS_TYPE_0022_TEXTURE_LAYOUT Caps with NULL pInfo.
+Driver failed D3D12DDICAPS_TYPE_TEXTURE_LAYOUT1 Caps with NULL pInfo.
+Driver filled out an invalid value in D3D12DDI_D3D12_OPTIONS_110::ExecuteIndirectTier.
+Driver filled out an invalid value in D3D12DDI_D3D12_OPTIONS_DATA::ConservativeRasterizationTier.
+Driver filled out an invalid value in D3D12DDI_D3D12_OPTIONS_DATA::CrossNodeSharingTier.
+Driver filled out an invalid value in D3D12DDI_D3D12_OPTIONS_DATA::MeshShaderTier.
+Driver filled out an invalid value in D3D12DDI_D3D12_OPTIONS_DATA::ProgrammableSamplePositionsTier.
+Driver filled out an invalid value in D3D12DDI_D3D12_OPTIONS_DATA::RaytracingTier.
+Driver filled out an invalid value in D3D12DDI_D3D12_OPTIONS_DATA::RenderPassesTier.
+Driver filled out an invalid value in D3D12DDI_D3D12_OPTIONS_DATA::ResourceBindingTier.
+Driver filled out an invalid value in D3D12DDI_D3D12_OPTIONS_DATA::ResourceHeapTier.
+Driver filled out an invalid value in D3D12DDI_D3D12_OPTIONS_DATA::SamplerFeedbackTier.
+Driver filled out an invalid value in D3D12DDI_D3D12_OPTIONS_DATA::TiledResourcesTier.
+Driver filled out an invalid value in D3D12DDI_D3D12_OPTIONS_DATA::VariableShadingRateTier.
+Driver filled out an invalid value in D3D12DDI_D3D12_OPTIONS_DATA::ViewInstancingTier.
+Driver filled out an invalid value in D3D12DDI_OPTIONS1_DATA_0103::WorkGraphsTier
+Driver filled out an invalid value in D3D12DDI_SHADER_CAPS_*::WaveMMATier
+Driver is not allowed to create a global Hw queue for a context which is owned by a command queue or scheduling group.
+Driver must set pfnMapHeap and pfnUnmapHeap to non-NULL.
+Driver provided too many contexts for present.
+Driver reported adapter family is not supported by compiler plugin.
+Driver reported an invalid D3D12_VIDEO_ENCODER_VALIDATION_FLAGS.
+Driver reported an invalid D3D12DDI_VIDEO_DECODE_TIER.
+Driver reported an invalid D3D12DDI_VIDEO_ENCODER_CODEC_CONFIGURATION_SUPPORT_0083_0.
+Driver reported an invalid D3D12DDI_VIDEO_ENCODER_CODEC_PICTURE_CONTROL_SUPPORT_0080_2.
+Driver reported an invalid D3D12DDI_VIDEO_ENCODER_LEVEL_SETTING.
+Driver reported an invalid D3D12DDI_VIDEO_ENCODER_LEVEL_SETTING_0080_2.
+Driver reported an invalid D3D12DDI_VIDEO_ENCODER_PROFILE_DESC.
+Driver reported an invalid D3D12DDI_VIDEO_ENCODER_PROFILE_DESC_0080_2.
+Driver reported an invalid D3D12DDI_VIDEO_ENCODER_SUPPORT_FLAGS.
+Driver reported an invalid D3D12DDI_VIDEO_ENCODER_SUPPORT_FLAGS_0080.
+Driver reported an invalid D3D12DDI_VIDEO_ENCODER_SUPPORT_FLAGS_0082_0.
+Driver reported D3D12DDI_VIDEO_ENCODER_SUPPORT_FLAG_0080_GENERAL_SUPPORT_OK set and D3D12DDI_VIDEO_ENCODER_VALIDATION_FLAG_0080_RATE_CONTROL_CONFIGURATION_NOT_SUPPORTED off.
+Driver reported insufficient sample counts for no-output rendering
+Driver reported invalid WriteBufferImmediate support flags.
+Driver reported Support for a DecodeTier > D3D12DDI_VIDEO_DECODE_TIER_0020_1, but that support is not enabled.
+Driver reported Support for a DecodeTier > D3D12DDI_VIDEO_DECODE_TIER_0020_2, but that support is not enabled.
+Driver reported TIER_1 or greater Render Pass support despite not implementing DDI table.
+Driver reported TIER_NOT_SUPPORTED despite implementing DDI table.
+Driver reported VRS TIER_1 or greater, but did not provide a valid tile size.
+Driver reported VRS TIER_2, but did not provide a valid nonzero tile size.
+Driver responded with invalid bits to D3D12DDICAPS_TYPE_0022_CPU_PAGE_TABLE_FALSE_POSITIVES Caps.
+Driver returned invalid pipeline caps
+Driver returned non-zero D3D12DDI_RESOURCE_ALLOCATION_INFO_0022::AdditionalDataHeaderSize for a resource with a known layout.
+Driver returned non-zero D3D12DDI_RESOURCE_ALLOCATION_INFO_0022::AdditionalDataSize for a resource with a known layout.
+Driver returned unexpected D3D12DDI_RESOURCE_ALLOCATION_INFO_0022::Layout for a resource with a known layout.
+Driver returned unexpected D3D12DDI_RESOURCE_ALLOCATION_INFO_0022::ResourceDataSize for a resource with a known layout.
+Driver set D3D12DDI_ROW_MAJOR_LAYOUT_CAPS::Flags incorrect. D3D12DDI_ROW_MAJOR_LAYOUT_FLAG_DEPTH_PITCH_4_8_16_HEIGHT_MULTIPLE must be set along with D3D12DDI_ROW_MAJOR_LAYOUT_FLAG_FLEXIBLE_DEPTH_PITCH.
+Driver set D3D12DDI_ROW_MAJOR_LAYOUT_SUB_CAPS::SubCaps::BaseOffsetAlignment either too large, 0, or to a non-pow2 value.
+Driver set D3D12DDI_ROW_MAJOR_LAYOUT_SUB_CAPS::SubCaps::DepthPitchAlignment either too large, 0, or to a non-pow2 value.
+Driver set D3D12DDI_ROW_MAJOR_LAYOUT_SUB_CAPS::SubCaps::PitchAlignment either too large, 0, or to a non-pow2 value.
+Driver set D3D12DDI_ROW_MAJOR_LAYOUT_SUB_CAPS::SubCaps[ 0 ]::MaxElementSize to 0.
+Driver set D3D12DDICAPS_MEMORY_ARCHITECTURE::CacheCoherent TRUE along with D3D12DDICAPS_MEMORY_ARCHITECTURE::UMA FALSE. CacheCoherent is only a property of UMA systems, which don'tbenefit from the usage of write-combine.
+Driver set D3D12DDICAPS_MEMORY_ARCHITECTURE::IOCoherent FALSE on an x86 or amd64 system.PCIe support IOCoherence, and the hardware must use it. UMA systems must set TRUE, to avoid the runtimeflushing the CPU cache manually.
+Driver set D3D12DDICAPS_TEXTURE_LAYOUT::DeviceDependentLayoutCount too large.
+Driver set D3D12DDICAPS_TEXTURE_LAYOUT::DeviceDependentSwizzleCount too large.
+Driver set D3D12DDICAPS_TEXTURE_LAYOUT::SupportsRowMajorTexture but not DXGK_VIDMMCAPS::CrossAdapterResourceTexture.
+Driver set invalid sync interval override.
+Driver set MaxGPUVirtualAddressBitsPerResource to 0.
+Driver set pfnCalcPrivateHeapAndResourceSizes to NULL.
+Driver set pfnCalcPrivateOpenedHeapAndResourceSizes to NULL.
+Driver set pfnCheckExistingResourceAllocationInfo to NULL.
+Driver set pfnCheckResourceAllocationInfo to NULL.
+Driver set pfnCheckSubresourceInfo to NULL.
+Driver set pfnCopyBufferRegion to NULL.
+Driver set pfnCreateHeapAndResource to NULL.
+Driver set pfnDestroyHeapAndResource to NULL.
+Driver set pfnOpenHeapAndResource to NULL.
+Driver specified a non-identity node remapping with more than 1 API-visible node
+Driver specified duplicate API index in node remapping
+Driver specified incompatible cross-node sharing tier
+Driver specified invalid API index in node remapping
+Driver specified unrecognized cross-node sharing tier
+Driver targeted HwQueue against context belonging to different queue.
+Driver targeted HwQueue against scheduling group that this command queue does not belong to.
+Driver update in progress.
+Driver uses indexable swizzle patterns, but returned an out of range ColumnOffset.
+Driver's MaxSamplerDescriptorHeapSize is too small
+Driver's MaxSamplerDescriptorHeapSizeWithStaticSamplers is too small or larger than MaxSamplerDescriptorHeapSize
+Driver's MaxViewDescriptorHeapSize is too small
+Drivers that expose AtomicInt64OnTypedResource, AtomicInt64OnGroupShared, AtomicInt64OnDescriptorHeapResource, DerivativesInMeshAndAmplificationShaders or WaveMMATier must expose shader model 6.6.
+Drivers that report BarycentricsSupported = TRUE must expose shader model 6.1.
+Drivers that support AdvancedTextureOpsSupported must expose shader model 6.7.
+Drivers that support D3D12DDI_VIEW_INSTANCING_TIER_1 or greater must expose shader model 6.1.
+Drivers that support mesh shader 1.0 must expose shader model 6.5.
+Drivers that support Native16BitOps must expose shader model 6.2.
+Drivers that support raytracing must expose shader model 6.3.
+Drivers that support raytracing tier 1.1 must expose shader model 6.5.
+Drivers that support sampler feedback tier 1.0 must expose shader model 6.5.
+Drivers that support variable shading rate tier 2+ must expose shader model 6.4.
+Drivers that support WriteableMSAATexturesSupported must expose shader model 6.7.
+Failed GetCaps for D3D12DDICAPS_TYPE_0030_PROTECTED_RESOURCE_SESSION_SUPPORT.
+Failed GetCaps for D3D12DDICAPS_TYPE_0074_PROTECTED_RESOURCE_SESSION_TYPE_COUNT reported zero types when driver previously reported D3D12_PROTECTED_RESOURCE_SESSION_SUPPORT_FLAG_SUPPORTED.
+Failed GetCaps for D3D12DDICAPS_TYPE_0074_PROTECTED_RESOURCE_SESSION_TYPE_COUNT.
+Failed GetCaps for D3D12DDICAPS_TYPE_0074_PROTECTED_RESOURCE_SESSION_TYPES.
+Failed GetCaps for D3D12DDICAPS_TYPE_VIDEO_0020_DECODE_BITSTREAM_ENCRYPTION_SCHEMES.
+Failed GetCaps for D3D12DDICAPS_TYPE_VIDEO_0020_DECODE_FORMATS.
+Failed GetCaps for D3D12DDICAPS_TYPE_VIDEO_0020_DECODE_PROFILES.
+Failed GetCaps for D3D12DDICAPS_TYPE_VIDEO_0032_DECODE_BITSTREAM_ENCRYPTION_SCHEME_COUNT.
+Failed GetCaps for D3D12DDICAPS_TYPE_VIDEO_0032_DECODE_PROFILE_COUNT.
+Failed GetCaps for D3D12DDICAPS_TYPE_VIDEO_0032_DECODE_PROFILE_FORMAT_COUNT.
+Failed GetCaps for D3D12DDICAPS_TYPE_VIDEO_0041_DECODE_HISTOGRAM.
+Failed GetCaps for D3D12DDICAPS_TYPE_VIDEO_0053_FEATURE_AREA_SUPPORT.
+Failed GetCaps for D3D12DDICAPS_TYPE_VIDEO_0063_EXTENSION_COMMAND_COUNT.
+Failed GetCaps for D3D12DDICAPS_TYPE_VIDEO_0063_EXTENSION_COMMANDS.
+Failed GetCaps for D3D12DDICAPS_TYPE_VIDEO_0072_DECODE_PROTECTED_RESOURCES.
+Failed GetCaps for D3D12DDICAPS_TYPE_VIDEO_0072_MOTION_ESTIMATOR_PROTECTED_RESOURCES.
+Failed GetCaps for D3D12DDICAPS_TYPE_VIDEO_0072_PROCESS_PROTECTED_RESOURCES.
+Failed GetCaps for D3D12DDICAPS_TYPE_VIDEO_0080_ENCODER_RESOURCE_REQUIREMENTS.
+Failed GetCaps for D3D12DDICAPS_TYPE_VIDEO_0095_ENCODER_FRAME_SUBREGION_LAYOUT_CONFIG.
+Failed GetCaps for D3D12DDICAPS_TYPE_VIDEO_0096_ENCODER_SUPPORT1.
+Failed GetCaps for D3D12DDICAPS_TYPE_VIDEO_0102_ENCODER_RESOURCE_REQUIREMENTS1.
+Failed GetCaps for D3D12DDICAPS_TYPE_VIDEO_0103_ENCODER_DIRTY_REGIONS.
+Failed GetCaps for D3D12DDICAPS_TYPE_VIDEO_0103_ENCODER_QPMAP_INPUT.
+Failed GetCaps for D3D12DDICAPS_TYPE_VIDEO_0103_ENCODER_RESOLVE_INPUT_PARAM_LAYOUT.
+Failed GetCaps for D3D12DDICAPS_TYPE_VIDEO_0107_ENCODER_SUPPORT2.
+Failed GetCaps for D3D12DDICAPS_VIDEO_ENCODER_CODEC_CONFIGURATION_SUPPORT_DATA_0083_0.
+Failed GetCaps for D3D12DDICAPS_VIDEO_ENCODER_CODEC_DATA_0080.
+Failed GetCaps for D3D12DDICAPS_VIDEO_ENCODER_CODEC_PICTURE_CONTROL_SUPPORT_DATA_0080_2.
+Failed GetCaps for D3D12DDICAPS_VIDEO_ENCODER_FRAME_SUBREGION_LAYOUT_MODE_DATA_0080_2.
+Failed GetCaps for D3D12DDICAPS_VIDEO_ENCODER_HEAP_SIZE_DATA_0080_2.
+Failed GetCaps for D3D12DDICAPS_VIDEO_ENCODER_HEAP_SIZE_DATA_0110_0.
+Failed GetCaps for D3D12DDICAPS_VIDEO_ENCODER_INPUT_FORMAT_DATA_0080_2.
+Failed GetCaps for D3D12DDICAPS_VIDEO_ENCODER_INTRA_REFRESH_MODE_DATA_0080_2.
+Failed GetCaps for D3D12DDICAPS_VIDEO_ENCODER_OUTPUT_RESOLUTION_DATA_0080_2.
+Failed GetCaps for D3D12DDICAPS_VIDEO_ENCODER_OUTPUT_RESOLUTION_RATIOS_COUNT_DATA_0080_2.
+Failed GetCaps for D3D12DDICAPS_VIDEO_ENCODER_PROFILE_LEVEL_DATA_0080_2.
+Failed GetCaps for D3D12DDICAPS_VIDEO_ENCODER_RATE_CONTROL_MODE_DATA_0080.
+Failed GetCaps for D3D12DDICAPS_VIDEO_ENCODER_SUPPORT_DATA.
+Failed GetCaps for D3D12DDICAPS_VIDEO_ENCODER_SUPPORT_DATA_0082_0.
+Failed GetCaps for D3D12DDICAPS_VIDEO_ENCODER_SUPPORT_DATA_LATEST.
+Failed to find matching DDI versions
+FL 12.1+ driver incorrectly does not report support for Raster Order Views (ROVs).
+FL 12+ driver incorrectly does not report support for typed UAV load additional formats.
+FL12.1+ driver incorrectly did not report support for conservative rast tier 1+.
+FL12.2+ driver incorrectly did not report at least 40 bits of GPU virtual address bits
+FL12.2+ driver incorrectly did not report support for 64-bit integer shader ops
+FL12.2+ driver incorrectly did not report support for conservative rasterization tier at least 3
+FL12.2+ driver incorrectly did not report support for depth bounds testing
+FL12.2+ driver incorrectly did not report support for direct, compute, and bundle WriteBufferImmediate support.
+FL12.2+ driver incorrectly did not report support for mesh shader tier at least 1
+FL12.2+ driver incorrectly did not report support for output merger logic ops
+FL12.2+ driver incorrectly did not report support for raytracing tier at least 1.1
+FL12.2+ driver incorrectly did not report support for resource binding tier at least 3
+FL12.2+ driver incorrectly did not report support for root signature version at least 1.1
+FL12.2+ driver incorrectly did not report support for sampler feedback tier at least 0.9
+FL12.2+ driver incorrectly did not report support for shader model at least 6_5
+FL12.2+ driver incorrectly did not report support for the CastingFullyTypedFormatSupported capability
+FL12.2+ driver incorrectly did not report support for the CopyQueueTimestampQueriesSupported capability
+FL12.2+ driver incorrectly did not report support for the VPAndRTArrayIndexFromAnyShaderFeedingRasterizerSupportedWithoutGSEmulation capability
+FL12.2+ driver incorrectly did not report support for tiled resource tier at least 3
+FL12.2+ driver incorrectly did not report support for variable rate shading tier at least 2
+FL12.2+ driver incorrectly did not report support for wave ops
+FL12+ driver incorrectly did not report support for resource binding tier 2+.
+FL12+ driver incorrectly did not report support for tiled resources tier 2+.
+For now, driver must include shader model 5.1 support in the list of shader models returned via D3D12DDICAPS_TYPE_0011_SHADER_MODELS caps query.
+GetCaps (D3D12DDICAPS_TYPE_GPUVA_CAPS)
+GetCaps for D3D12DDICAPS_TYPE_0074_PROTECTED_RESOURCE_SESSION_TYPES must return at least D3D12DDI_PROTECTED_RESOURCES_SESSION_HARDWARE_PROTECTED when D3D12_PROTECTED_RESOURCE_SESSION_SUPPORT_FLAG_SUPPORTED is reported.
+GetCaps for D3D12DDICAPS_TYPE_0074_PROTECTED_RESOURCE_SESSION_TYPES returned an unsupported GUID.
+GetCaps for D3D12DDICAPS_TYPE_VIDEO_0020_DECODE_FORMATS reported a format that doesn't support video.
+GetCaps for D3D12DDICAPS_TYPE_VIDEO_0041_DECODE_HISTOGRAM must report a BinCount >= 64.
+GetCaps for D3D12DDICAPS_TYPE_VIDEO_0041_DECODE_HISTOGRAM must report a CounterBitDepth of 16, 24, or 32.
+GetCaps for D3D12DDICAPS_TYPE_VIDEO_0041_DECODE_HISTOGRAM must report a Pow2 BinCount.
+GetCaps for D3D12DDICAPS_TYPE_VIDEO_0041_DECODE_HISTOGRAM returned invalid D3D12DDI_VIDEO_DECODE_HISTOGRAM_COMPONENT_FLAGS_0041.
+GetCaps for D3D12DDICAPS_TYPE_VIDEO_0053_MOTION_ESTIMATOR returned invalid D3D12DDI_VIDEO_MOTION_ESTIMATOR_SEARCH_BLOCK_SIZE_FLAGS_0053.
+GetCaps for D3D12DDICAPS_TYPE_VIDEO_0053_MOTION_ESTIMATOR returned invalid D3D12DDI_VIDEO_MOTION_ESTIMATOR_VECTOR_PRECISION_FLAGS_0053.
+GetCaps for D3D12DDICAPS_TYPE_VIDEO_0053_MOTION_ESTIMATOR returned invalid supported size range.
+GetCaps for D3D12DDICAPS_TYPE_VIDEO_0053_MOTION_ESTIMATOR returned values indicating no support, but did not set all values to indicate no support.
+GetCaps for D3D12DDICAPS_TYPE_VIDEO_0053_MOTION_ESTIMATOR_SIZE returned zero for both MotionVectorHeapMemoryPoolL0Size and MotionVectorHeapMemoryPoolL1Size.
+GetCaps for D3D12DDICAPS_TYPE_VIDEO_0063_EXTENSION_COMMAND_CAPS returned an invalid failure code.
+GetCaps for D3D12DDICAPS_TYPE_VIDEO_0063_EXTENSION_COMMAND_PARAMETER_COUNT must have ParameterPacking of 1, 2, 4, or 8. 
+GetCaps for D3D12DDICAPS_TYPE_VIDEO_0063_EXTENSION_COMMAND_PARAMETER_COUNT must not fail for a supported Command ID.
+GetCaps for D3D12DDICAPS_TYPE_VIDEO_0063_EXTENSION_COMMAND_PARAMETERS must set None Flags for parameters whose type is not D3D12DDI_VIDEO_EXTENSION_COMMAND_PARAMETER_TYPE_0063_RESOURCE.
+GetCaps for D3D12DDICAPS_TYPE_VIDEO_0063_EXTENSION_COMMAND_PARAMETERS must set Read or Write Flags for D3D12DDI_VIDEO_EXTENSION_COMMAND_PARAMETER_TYPE_0063_RESOURCE.
+GetCaps for D3D12DDICAPS_TYPE_VIDEO_0063_EXTENSION_COMMAND_PARAMETERS reported a Resource parameter type for the CAPS_INPUT, CAPS_OUTPUT, or DEVICE_EXECUTE_OUTPUT stage.
+GetCaps for D3D12DDICAPS_TYPE_VIDEO_0063_EXTENSION_COMMAND_PARAMETERS returned a failure for a parameter set it claimed to support.
+GetCaps for D3D12DDICAPS_TYPE_VIDEO_0063_EXTENSION_COMMAND_PARAMETERS returned a nullptr for a parameter name.
+GetCaps for D3D12DDICAPS_TYPE_VIDEO_0063_EXTENSION_COMMAND_PARAMETERS returned an invalid D3D12DDI_VIDEO_EXTENSION_COMMAND_PARAMETER_FLAG.
+GetCaps for D3D12DDICAPS_TYPE_VIDEO_0063_EXTENSION_COMMAND_PARAMETERS returned an invalid D3D12DDI_VIDEO_EXTENSION_COMMAND_PARAMETER_TYPE.
+GetCaps for D3D12DDICAPS_TYPE_VIDEO_0063_EXTENSION_COMMAND_SIZE returned an invalid failure code.
+GetCaps for D3D12DDICAPS_TYPE_VIDEO_0072_DECODE_PROTECTED_RESOURCES returned invalid support flags.
+GetCaps for D3D12DDICAPS_TYPE_VIDEO_0072_MOTION_ESTIMATOR_PROTECTED_RESOURCES returned invalid support flags.
+GetCaps for D3D12DDICAPS_TYPE_VIDEO_0072_PROCESS_PROTECTED_RESOURCES returned invalid support flags.
+ID3D12DeviceFactory::CreateDevice: Driver does not support independent devices, a singleton device exists, and the factory was configured to disallow returning an existing device.
+ID3D12DeviceFactory::CreateDevice: Driver does not support independent devices, a singleton device exists, but the singleton's device configuration is incompatible with the factory's requested configuration.
+ID3D12DeviceFactory::CreateDevice: Driver does not support independent devices, and the factory was configured to disallow creation of a new singleton device.
+ID3D12DeviceFactory::CreateDevice: Driver does not support independent devices, but the globally-configured D3D12Core cannot be changed, as there are outstanding references to non-device global interfaces like ID3D12DebugController.
+ID3D12VideoEncodeCommandList::EncodeFrame arguments are not supported - SubregionOutputBuffers.ppSubregionFences[%d] cannot have D3D12_FENCE_FLAG_SHARED set when driver uses monitored fences.
+ING_BUFFER_BOUNDS_CHECKS). This combination is ignored and treated as DESCRIPTORS_VOLATILE. To enable static descriptor driver optimizations or debug validation, specify a bounded descriptor table size.
+Invalid D3D12DDI_VIDEO_DECODE_CONFIGURATION_FLAG reported by driver.
+Invalid D3D12DDI_VIDEO_DECODE_SUPPORT_FLAG reported by driver.
+Invalid flags reported in D3D12DDICAPS_TYPE_0030_PROTECTED_RESOURCE_SESSION_SUPPORT::Support.
+IS. However the driver does NOT support D3D12_VIDEO_ENCODER_RATE_CONTROL_FRAME_ANALYSIS_SUPPORT_FLAG_DYNAMIC_1ST_PASS_SKIP to disable two pass dynamically in given frames. When this flag is not supported and the heap allows it, two pass must always be enabled for all frames
+Microsoft.Direct3DUndocked\src\DriverCompilerHost\CompilerDDI\compilerddi.cpp
+nd %I64u, inclusively, in order that the View fit on the Buffer. In addition, the NumElements may not be larger than %u for feature level %s.
+No supported plugin DDI version found.
+One of the COMMAND_INFO returned from D3D12DDICAPS_TYPE_VIDEO_0063_EXTENSION_COMMANDS reported a non-Video D3D12DDI_COMMAND_QUEUE_FLAG.
+One of the COMMAND_INFO returned from D3D12DDICAPS_TYPE_VIDEO_0063_EXTENSION_COMMANDS reported CommandQueueFlags that do not match the registered CommandQueueFlags.
+One of the COMMAND_INFO returned from D3D12DDICAPS_TYPE_VIDEO_0063_EXTENSION_COMMANDS reported GUID_NULL.
+One of the COMMAND_INFO returned from D3D12DDICAPS_TYPE_VIDEO_0063_EXTENSION_COMMANDS reported more than one D3D12DDI_COMMAND_QUEUE_FLAG.
+PFND3D12DDI_CREATE_PROTECTED_SESSION_CB_0030 called more than once for hRTProtectedSession.
+PFND3D12DDI_GET_SUPPORTED_EXTENDED_FEATURES_0020 returned an invalid D3D12DDI_FEATURE_0020.
+PFND3D12DDI_GETOPTIONALDDITTABLES only supports D3D12DDI_TABLE_TYPE_COMMAND_LIST_3D.  An unsupported table type was requested.
+PFND3D12DDI_VIDEO_GET_BITSTREAM_ENCRYPTION_SCHEME_COUNT_0020 must report support for at least D3D12_VIDEO_DECODE_BITSTREAM_ENCRYPTION_NONE.
+PFND3D12DDI_VIDEO_GET_BITSTREAM_ENCRYPTION_SCHEME_COUNT_0020 reported an unrecognized bitstream encryption.
+PFND3D12DDI_VIDEO_GET_BITSTREAM_ENCRYPTION_SCHEME_COUNT_0020 reported zero bitstream encryption schemes.  It must support at least D3D12_VIDEO_DECODE_BITSTREAM_ENCRYPTION_NONE.
+PFND3D12DDI_VIDEO_GET_DECODE_FORMAT_COUNT_0020 must report at least one format for supported decode profile and encryption guid pairs when using D3D12_VIDEO_FRAME_CODED_INTERLACE_FORMAT_NONE .
+PFND3D12DDI_VIDEO_GET_DECODE_PROFILE_COUNT_0020 returned no supported profiles.
+QAI (CHECKDRIVERUPDATESTATUS)
+QueryAdapterInfo (KMTQAITYPE_DRIVERVERSION)
+QueryAdapterInfoCb2 (DriverPrivate)
+Removing device due to driver error.
+Removing device due to driver-reported app error.
+Render Pass DDI table retrieval failed due to out of memory.
+Render Pass DDI table retrieval failed.
+Reserved fields in D3D12DDI_ALLOCATION_INFO_0022 were not zero.
+SetDisplayPrivateDriverFormat
+Shader Cache DDI table retrieval failed due to out of memory.
+The decode output conversion specified by D3D12_VIDEO_DECODE_OUTPUT_STREAM_ARGUMENTS::Conversion failed the support check with driver.  See ID3D12VideoDevice::CheckFeatureSupport with D3D12_FEATURE_VIDEO_DECODE_CONVERSION_SUPPORT.
+The decode output conversion specified by D3D12_VIDEO_DECODE_OUTPUT_STREAM_ARGUMENTS::Conversion is not supported by driver.  See ID3D12VideoDevice::CheckFeatureSupport with D3D12_FEATURE_VIDEO_DECODE_CONVERSION_SUPPORT.
+The decode output conversion specified by D3D12_VIDEO_DECODE_OUTPUT_STREAM_ARGUMENTS::Conversion is not supported by driver.  The D3D12_VIDEO_DECODE_OUTPUT_STREAM_ARGUMENTS::ConversionArguments.OutputWidth or the D3D12_VIDEO_DECODE_OUTPUT_STREAM_ARGUMENTS::ConversionArguments.OutputHeight is not sup
+The input stream at index %d has D3D12_RESOURCE_FLAG_VIDEO_ENCODE_REFERENCE_ONLY. but D3D12_VIDEO_SCALE_SUPPORT_FLAG_DPB_ENCODER_RESOURCES is not supported by the driver.
+The specified protection type is not supported by driver.
+Video processor creation args for input stream index %d indicate a DeinterlaceMode that is not supported by the driver. %s  See D3D12_VIDEO_PROCESS_DEINTERLACE_FLAGS.
+Video processor creation args for input stream index %d requested 1DLUT support and that is not supported by the driver. %s.
+Video processor creation args for input stream index %d requested 3DLUT dimension %d and that is not supported by the driver. %s.
+Video processor creation args for input stream index %d requested 3DLUT interpolation type %d and that is not supported by the driver. %s.
+Video processor creation args for input stream index %d requested an output size range that is not supported by the driver. %s
+Video processor creation args for input stream index %d requested luma key, but this feature is not supported by the driver. %s  See D3D12_VIDEO_PROCESS_FEATURE_FLAG_LUMA_KEY.
+Video processor creation args for input stream index %d requested orientation support and that is not supported by the driver. %s  See D3D12_VIDEO_PROCESS_FEATURE_FLAG_ROTATION and D3D12_VIDEO_PROCESS_FEATURE_FLAG_FLIP.
+Video processor creation args for input stream index %d set EnableAlphaBlending, but this feature is not supported by the driver. %s  See D3D12_VIDEO_PROCESS_FEATURE_FLAG_ALPHA_BLENDING.
+Video processor creation args for input stream index %d set EnableAutoProcessing to TRUE, but this feature is not supported by the driver. %s  See D3D12_VIDEO_PROCESS_AUTO_PROCESSING_FLAGS.
+Video processor creation args for input stream index %d SourceAspectRatio != DestinationAspectRatio, but this feature is not supported by the driver. %s  See D3D12_VIDEO_PROCESS_FEATURE_FLAG_PIXEL_ASPECT_RATIO.
+Video processor creation args requestion an AlphaFillMode that is not supported by driver.. %s  If the driver does not reportD3D12_VIDEO_PROCESS_FEATURE_FLAG_ALPHA_FILL, AlphaFillMode must be D3D12_VIDEO_PROCESS_ALPHA_FILL_MODE_OPAQUE.
+Video Processor creation args specified a number of past frames or future frames that does not match driver requirements for these features.  %s  hr = 0x%x
