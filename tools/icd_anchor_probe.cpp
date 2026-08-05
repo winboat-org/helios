@@ -521,18 +521,29 @@ static void assert_one_icd_module(void)
     void *published = nullptr;
     const char *publisher_path = "(none)";
     bool split_brain = false;
+    DWORD publisher_index = 0;
     for (DWORD i = 0; i < n_anchor; ++i) {
         auto anchor = (PFN_ICD_ANCHOR)GetProcAddress(anchors[i].module, ANCHOR_EXPORT);
         void *answer = anchor ? anchor(nullptr) : nullptr;
         printf("       anchor[%lu] query(NULL) -> %p   %s\n", (unsigned long)i, answer,
                anchors[i].path);
         if (!answer) continue;
-        if (!published) { published = answer; publisher_path = anchors[i].path; }
+        if (!published) { published = answer; publisher_path = anchors[i].path; publisher_index = i; }
         else if (answer != published) split_brain = true;
     }
     require_that(published != nullptr,
                  "the process anchor has published a venus ICD module "
-                 "(non-null from the first copy in walk order)");
+                 "(some copy answers non-null)");
+    // ⚠ Reported, not asserted. `find_process_anchor` calls the copy in the FIRST
+    // exporting module, so the publisher is predicted to be index 0. A different
+    // index is not incoherent - it means this walk's order differs from the order
+    // the resolvers saw, e.g. because a module was loaded in between - but it is
+    // the one observation that would undermine reasoning built on load order, so
+    // it must not pass silently.
+    if (published && publisher_index != 0)
+        printf("       NOTE: the publisher is anchor[%lu], not anchor[0] - this walk's "
+               "module order differs from the one the resolvers used\n",
+               (unsigned long)publisher_index);
     require_that(!split_brain,
                  "no two anchor copies published DIFFERENT modules "
                  "(a split answer is two live publishers)");
