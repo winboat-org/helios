@@ -92,6 +92,22 @@ written at `DestroyDevice` **and** on each counter's FIRST hit. Deliberately nev
 path. So absence of the line means "no counter ever fired AND no device was destroyed" — that is
 what `umd-gate-surface.ps1:160-163` prints.
 
+#### 2.1a ⭐ Three of the eleven are now classified against the spec (2026-08-05)
+
+The charter's goal is to drive these to zero. **A counter that turns out to be documented, conformant
+behaviour reaches zero by being reclassified, not by being coded** — and that is a real outcome, not a
+dodge. Read against the in-tree D3D11.3 functional spec (also at
+`tmp/dx12/specs/d3d/archive/D3D11_3_FunctionalSpec.htm`, DirectX-Specs @ pin `2bd58ca5`):
+
+| counter | verdict | evidence |
+|---|---|---|
+| `srv_raw_hazard`, `resource_raw_hazard` | ✅ **CONFORMANT — declined optimisation hint, not an unimplemented DDI.** Reword the rows; do not implement. | *"If a subresource is ever bound as an output (RTV/UAV/SO Target), subsequently unbound, and then bound as a shader input, a ReadAfterWriteHazard DDI is called. **Drivers can use this as a hint as to when a rendering flush may be required.**"* An empty body is correct for a driver whose engine does its own hazard tracking, which DXVK does. |
+| `discard_partial` | ✅ **CONFORMANT — Discard is permissive.** It lets an application declare contents *may* be discarded; it never promises the app they *were*. Dropping the rect-carrying partial discard **preserves more state than required**. Costs performance only. | §5.7. The existing note explains *why* it is dropped (a full-view discard wiped the undamaged 99 % of DWM's flip backbuffer); the spec says dropping it is legal. |
+| `clear_view_unsupported` | ⛔ **NOT conformant — this one is a BUG, and it is the opposite of the other two.** | *"[D3D11.1] Added ClearView (5.2.3.3) fo allow clearing with rects on RTVs, UAVs and Video Views on all hardware."* (typo *"fo"* is the source's). ClearView is mandatory for D3D10+ hardware and legal on **RTVs, UAVs and Video Views** — the runtime drops everything else before the driver sees it. So `transfer.rs:400` refusing "a non-RTV view type" is refusing a **UAV clear the driver is required to perform**. Direct2D is a named consumer and D2D is live on any Windows desktop. |
+
+⇒ **Net: two counters convert to documented decisions, and one converts from "a decision" to "a defect
+with a named consumer".** That third is the most valuable result in this pass and belongs in §6.
+
 **Known to move under real workloads.** `ROADMAP.md:3276-3279`:
 
 > All nine should read 0 on a healthy DWM session; **`gs_so_declaration_dropped` and
@@ -285,6 +301,32 @@ still reproduces on the current UMD is **UNVERIFIED** — settling read: run `to
 via schtask `helios_flprobe` on the current build and capture the `Microsoft-Windows-DXGI` ETW
 rejection string (recipe at `ROADMAP.md:3018-3022`).
 
+✅ **The owner directive's "exact per-format/per-sample-count FL11 MSAA requirements" — ANSWERED
+2026-08-05.** §19.2.5 *Required Multisample Support*, verbatim:
+
+> D3D11 requires support for 1x(trivial), 4x and 8x MSAA, with at minimum support for the standard patterns for these MSAA counts. At 4x MSAA, all output (RenderTarget/DepthStencil-able) formats must be supported. At 8x MSAA, only output formats with less than 128 bits per sample must be supported. Support for 128+ bits per sample formats with 8x MSAA is optional. Other MSAA counts and patterns are optional as before.
+
+**So the FL11 floor is exactly four rules**, and Helios currently satisfies the first two while
+**over-reporting the other two**:
+
+| rule | Helios today (`queries.rs:129-164`) |
+|---|---|
+| 1x, 4x, 8x required, standard patterns | ✅ answered |
+| **4x for ALL** RenderTarget/DepthStencil-able formats — no exemption for 96-bit `R32G32B32`, so ROADMAP's premise was right | ✅ answered |
+| **8x only for formats < 128 bits per sample**; 128+ at 8x is **optional** | ⛔ **over-reports** — answers 1 for 8x on 128-bit formats such as `R32G32B32A32_*` |
+| **"Other MSAA counts and patterns are optional"** — i.e. **2x and 16x are NOT required at all** | ⛔ **over-reports** — answers 1 for `sample_count ∈ {2,16}` |
+
+⇒ The code comment's own confession (*"a table assertion, not a capability probe"*) is now measurable
+against a written floor: the assertion is **too generous in two specific places**, both of which are
+"advertise only what is backed" violations of exactly the class CLAUDE.md names. ⛔ Do **not** change
+the code on the strength of this alone — the residual runtime rejection is still UNVERIFIED, and
+narrowing the answer could change which format/count first trips it. Land the probe first (§6).
+
+⚠ **One consequence nobody has exercised:** because Helios reports `NumQualityLevels = 1` at counts 2,
+4, 8 and 16, an application is spec-entitled to create a resource with `QualityLevel = 0xffffffff` or
+`0xfffffffe` — the standard and centre **fixed patterns** — and Helios forwards that value straight
+through. No probe has ever passed those sentinels.
+
 **(b) DXGI format coverage.** Three separate, verifiable narrownesses:
 
 1. `umd/src/format.rs:268-274` — `to_d3dddi` knows **two** formats. Everything else becomes
@@ -305,6 +347,51 @@ rejection string (recipe at `ROADMAP.md:3018-3022`).
 The ROADMAP's own item (`:3170-3171`): "DXGI format coverage audit (the format round-trip carrier
 landed at `bfb5121`; verify beyond BGRA8)."
 
+⭐⭐ **The format-coverage audit has an ORACLE, and it is machine-readable (found 2026-08-05).** The
+format-matrix probe has never had pass criteria beyond "emit CSV". It does now: the D3D11.3 spec ships
+its format tables as **SpreadsheetML XML**, one per feature level, in the archived corpus:
+
+```
+tmp/dx12/specs/d3d/archive/images/d3d11/D3D11_3_Formats_FL9_1.xls   FL9_2  FL9_3
+                                        D3D11_3_Formats_FL10_0.xls  FL10_1
+                                        D3D11_3_Formats_FL11_0.xls  FL11_1   ← the one that matters
+```
+
+⚠ **Despite the `.xls` extension these are plain XML**, not OLE2 — `file` reports *"XML 1.0 document,
+ASCII text … with CRLF line terminators"*, so they parse with any XML reader and need no Excel and no
+`xlrd`. `FL11_0` carries one worksheet `D3D11FormatList`, **117 `<Row>`s** (2 header + 115 formats,
+covering DXGI numbers 0..115) and a capability column per bind point — `Buffer`, `Input Assembler
+Vertex Buffer`, `Input Assembler Index Buffer`, `Stream Output Buffer`, `Texture1D`, `Texture2D`, …
+Cell legend, counted over the whole sheet: **`R`** hardware support **required** (1603 cells),
+**`o`** optional (234), **`-`** not applicable (3343).
+
+⇒ **This is the pass criterion the format-matrix probe was missing**, and it is per-format *and*
+per-bind-point rather than a single blanket rule. The probe should diff its own
+`CheckFormatSupport` answers against the `R` cells and fail on any `R` that Helios does not report.
+⛔ Read the legend from the sheet rather than assuming: `o` is *permission*, so an `o` that Helios
+answers `NOT_SUPPORTED` is **not** a failure and must not be reported as one.
+
+⚠ **And it is the settling read for the one live override, which turns out to be a real deviation.**
+The FL11_0 sheet's row 89 reads, verbatim in its cells:
+
+```
+89 | R10G10B10_XR_BIAS_A2_UNORM | 32 bpe | Format Support=R  Texture2D=R  CPU Lockable=R
+                                          Display Scan-Out=R  Cast Within Bit Layout=R
+                                          Video Processor Output=R  Shared Resource=R
+                                          Video Processor Input=o  Tiled Resource=o
+```
+
+i.e. **the spec marks format 89 Required at FL11**, while `format_caps.rs:244-262` answers the explicit
+`NOT_SUPPORTED` sentinel `0x80000000` for it. ⚠ Note precisely what the code comment says forces that:
+the failure is answering **`0`** rather than the **sentinel** — the runtime distinguishes "no answer"
+from "explicitly unsupported", and answering `0` fails `D3D11CreateDevice` with `0x887a0020` and
+crash-loops dwm. So Helios refuses a format the spec requires, in the one form the runtime tolerates.
+
+⛔ **Record that as a known deviation at the site, and do not "fix" it by reporting support** — the
+override exists because of a measured dwm crash loop. What is genuinely open is narrower and worth a
+probe: whether reporting *actual* support (rather than either refusal form) is what the runtime wants,
+and what it would cost. Until then the deviation is deliberate and documented rather than unexplained.
+
 **(c) Remaining 11.1 DDI plumbing.** `ROADMAP.md:3173-3174`:
 
 > Map remaining 11.1 features (deferred contexts? threading modes? UAVs at FL11_0) against DXVK
@@ -318,6 +405,19 @@ only in the WDDM1_3 table (§1). The FL9 pipeline bits (`9_1`/`9_2`/`9_3`, bits 
 advertised — **UNVERIFIED** whether the runtime requires them for a FL11 driver; settling read: the
 D3D11.3 functional spec's caps section, or a `D3D11CreateDevice` at `D3D_FEATURE_LEVEL_9_3`
 through `tools/d3d11_fl_probe.cpp`.
+
+⚠ **The first half of that settling read is now spent, and it did NOT close the question — record the
+reason so nobody re-reads it (2026-08-05).** The spec does state, at §7.20.4.1 *Discoverability*, that
+Feature Level 9_x on D3D10+ hardware is still serviced by the **D3D9 DDIs**, which is suggestive: if
+FL9 goes to a different DDI entirely, then not advertising the 9_1/9_2/9_3 pipeline bits from a D3D11
+driver is arguably correct rather than an unexplained gap. ⛔ **But that sentence is scoped to
+min-precision reporting, not to the caps rule**, and the document has **no caps section covering the
+pipeline-level bitmask at all** — `3DPIPELINELEVEL` does not appear in it. So the reading is an
+inference from an out-of-scope sentence, not an answer.
+
+⇒ **§4(c) stays UNVERIFIED, and the remaining settling read is the second one only:** a
+`D3D11CreateDevice` at `D3D_FEATURE_LEVEL_9_3` through `tools/d3d11_fl_probe.cpp`. Do not re-open the
+spec for it.
 
 **(d) The two counters ROADMAP says will move.** `gs_so_declaration_dropped` and
 `tess_sig_fallback` (quoted in §2.1). Each names a real gap: stream-output capture is silently
@@ -412,21 +512,45 @@ taken at four sites (`shaders.rs:739, 779, 821, 861`) and its UB against SINT in
 
 **C5 — A DXGI format round-trip matrix probe.** *Evidence:* `ROADMAP.md:3170-3171` ("verify beyond
 BGRA8"); `format.rs:268-274` covers two formats; `format_caps.rs:169-262` is a hand-maintained
-override table with no test. *Done:* `tools/d3d11_format_matrix_probe.cpp` over formats 1..115 ×
-{create, CheckFormatSupport, RTV/SRV, staging Map round-trip where legal} emitting CSV; the first
-run checked in as the baseline; `alloc_meta_format_unknown` explained per format, not in bulk.
+override table with no test. ⭐ **UPGRADED 2026-08-05 — it now has an oracle, so "emitting CSV" is no
+longer the whole pass criterion** (§4(b)): `tmp/dx12/specs/d3d/archive/images/d3d11/D3D11_3_Formats_FL11_0.xls`
+is SpreadsheetML XML, worksheet `D3D11FormatList`, 115 format rows × per-bind-point cells with an
+`R`/`o`/`-` legend. *Done:* `tools/d3d11_format_matrix_probe.cpp` over formats 1..115 ×
+{create, CheckFormatSupport, RTV/SRV, staging Map round-trip where legal} emitting CSV, **diffed against
+the `R` cells of that sheet and failing on any `R` Helios does not report** (⛔ never on an `o`, which is
+permission, not obligation); the first run checked in as the baseline; `alloc_meta_format_unknown`
+explained per format, not in bulk; and the format-89 deviation (§4(b)) recorded at the site.
 
-**C6 — Settle the FL11 MSAA question against the in-tree spec.** *Evidence:* `ROADMAP.md:3027-3034`
-(PARTIAL; owner directive to conform to the D3D11.3 functional spec) vs `queries.rs:122-128`
-(R829's decision to correct the doc instead). Both cannot be the final state. *Done:* the
-per-format/per-sample-count table read out of `D3D11_3_FunctionalSpec.htm` and either implemented,
-or recorded as intentionally-above-floor with DXGI-ETW evidence that no runtime rejection remains.
+**C6 — Settle the FL11 MSAA question against the in-tree spec.** ✅ **The READ half is DONE
+(2026-08-05, §4(a)):** §19.2.5 gives the floor as 1x/4x/8x with standard patterns, 4x for **all** output
+formats, 8x only below **128 bits per sample**, and *"Other MSAA counts and patterns are optional"*.
+⇒ Helios satisfies the first two and **over-reports two**: 8x on 128-bit formats, and 2x/16x which are
+not required at all. *What remains:* decide, with evidence, between narrowing the answer to the floor
+and recording the over-report as intentional. ⛔ Do not narrow blind — the residual runtime rejection
+(`ROADMAP.md:3027-3034`) is still UNVERIFIED and narrowing could move which format/count first trips it.
+*Done:* `tools/d3d11_fl_probe.cpp` run on the current build with the `Microsoft-Windows-DXGI` ETW
+capture, then either the floor implemented or the deviation recorded with that capture as evidence.
+**Add one case the suite has never exercised:** `QualityLevel = 0xffffffff` / `0xfffffffe` (the standard
+and centre fixed patterns), which Helios' `NumQualityLevels = 1` answer entitles an app to pass.
 
 **C7 — Decide and document the tiled-resource claim.** *Evidence:* `caps.rs:81` advertises
 `TILED_RESOURCES_TIER_2_SUPPORTED` for **every** FL11 device, but the seven tiled DDIs are installed
 only in `install_wddm1_3` (`tables.rs:290-306`) — an 11.1-negotiated device gets the claim without
 the entry points. *Done:* either gate the cap on the negotiated interface or install the DDIs in the
 11.1 table, plus a probe that creates a tile pool and calls `UpdateTileMappings` on each interface.
+
+**C11 — Fix `clear_view_unsupported`: `ClearView` on a UAV is required, not optional. ⭐ NEW
+2026-08-05, and it is the only counter this pass reclassified *upward*.** *Evidence:* the D3D11.3 spec's
+change list — *"[D3D11.1] Added ClearView (5.2.3.3) fo allow clearing with rects on RTVs, UAVs and
+Video Views on all hardware."* (typo in the source) — so the feature is mandatory for D3D10+ hardware
+and legal on three view classes, and the runtime drops everything else before the driver sees it.
+`transfer.rs:400` refuses "a non-RTV view type", which means Helios is **dropping UAV clears it is
+required to perform**. Direct2D is a named consumer in the spec and D2D is live on any Windows desktop,
+so the path is reachable in ordinary use rather than only under a synthetic test. ⚠ Unlike
+`srv_raw_hazard` / `discard_partial` (§2.1a), this one cannot be reclassified away. *Done:*
+`pfnClearView` handles RTV **and UAV** (and Video Views, or refuses them with a distinct counter);
+a `tools/d3d11_clearview_probe.cpp` clears a UAV with and without rects and reads the result back;
+the counter stays 0 across a dwm session and a 3DMark run.
 
 **C8 — Give the smoke gate teeth.** *Evidence:* `Verify-Helios.ps1:78-80` treats a missing probe as
 a warning, so a bundle assembled without smoke tests still verifies "healthy". *Done:* missing
