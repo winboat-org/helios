@@ -55,6 +55,28 @@ prerequisite, not a nicety.)
 
 ---
 
+> ## ⚠ Scope note — `DECISIONS.md` D2 changed, 2026-08-05
+>
+> **There is no app-facing vkd3d arm** (owner directive). Helios never ships or measures vkd3d's
+> `d3d12.dll`/`d3d12core.dll` as an application's D3D12; vkd3d is an **engine linked behind
+> `helios_umd12.dll`**, reached through the two Helios exports on `helios_vkd3d.dll` (D4). What that
+> changes in this document:
+>
+> - **⛔ DXVK's `dxgi.dll` is not part of any deliverable.** Anywhere this file discusses shipping it
+>   alongside vkd3d, or an "(ii) app-local" deliverable shape, that is background — the shipping
+>   answer is shape (i), the UMD.
+> - **`libs/d3d12core/main.c`'s adapter resolution, the Agility-SDK `D3D12SDKVersion` mechanism, and
+>   the app-local placement rules are all bypassed** by D4's direct `vkd3d_create_device` entry.
+>   They are retained here because they explain *why* the bypass exists.
+> - **Everything else is unaffected and is the load-bearing content:** the Vulkan version floor and
+>   the nine hard device-creation gates (§3), the three-layer coverage table and the measured
+>   `VP_D3D12_FL_12_2_baseline` result (§4, §9), the gap list (§5), sparse and raytracing tiers
+>   (§6), the `driverID`/shader-model question (§7), and the build recipe (§8).
+> - **The two substrate work items keep their ids `V1` / `V2`** (`VK_KHR_external_memory_win32`
+>   absent-and-unguarded; no 32-bit venus ICD). ⚠ `V1` gets *more* important under D2, not less:
+>   `D3D12_HEAP_FLAG_SHARED` is reached through the UMD like everything else, and vkd3d calls
+>   `vkGetMemoryWin32HandleKHR` unguarded — a NULL function pointer, not a graceful degrade.
+
 ## 1. Verdict
 
 **The live Helios guest satisfies `VP_D3D12_FL_12_2_baseline` in full — zero feature misses, zero

@@ -10,6 +10,12 @@ breaks, and the order the whole thing lands in so the working D3D11 desktop is n
 caps, objects, fences, the minimum-viable set), the KMD-side work list (`KMD_IMPACT.md`, which also
 exists), the present path (`PRESENT.md`), the vkd3d/venus substrate gap (`SUBSTRATE.md`), or the
 gate commands (`GATES.md`).
+⚠ **Scope note, 2026-08-05:** `DECISIONS.md` D2 removed the app-facing vkd3d arm — vkd3d is an
+engine behind `helios_umd12.dll`, never an application's `d3d12.dll`, and **DXVK's `dxgi.dll` is
+not part of any deliverable** (a WDDM UMD implements the DXGI DDI; MS's `dxgi.dll` is the frontend —
+`umd/build.rs:238-243`). The split plan, the crate layout, the bridge and the deploy story below are
+unaffected; only the "Phase 0" framing in stage S0b changed.
+
 It is also not a re-argument of the decisions: the D-, H-, P-, K- and V-series entries are
 settled in `DECISIONS.md` and cited here by id.
 
@@ -1056,9 +1062,11 @@ EXPORTS
     helios_vkd3d_serialize_root_signature
 ```
 
-(`D3D12GetInterface` and `D3D12SDKVersion` are kept so the same binary still works as a drop-in
-`d3d12core.dll` for the Phase-0 app-local arm when copied under that name — DECISIONS D2 keeps that
-arm permanently as the A/B control.) ⚠ `d3d12core_needs_defs` is
+(`D3D12GetInterface` and `D3D12SDKVersion` are kept because they cost nothing and keep the same
+binary usable as a drop-in `d3d12core.dll` for the **headless conformance harness** — `D12-G2`,
+where the vkd3d test binary resolves `D3D12CreateDevice` from a `d3d12.dll` beside it. ⛔ That is a
+developer harness only: `DECISIONS.md` D2 removed the app-facing vkd3d arm, so nothing is ever
+*shipped* under those names.) ⚠ `d3d12core_needs_defs` is
 `(not vkd3d_is_msvc) and (vkd3d_platform == 'windows')` (`libs/d3d12core/meson.build:14`), which is **true** for the
 primary mingw cross build (§8.3), so the `.def` is a real build input there, not decoration.
 
@@ -1674,7 +1682,7 @@ and must each be proven neutral; S0, S3 and S4 touch no shipped binary at all.**
 |---|---|---|---|
 | **S0** | `git submodule update --init --recursive` in `vkd3d-proton-helios` (§8.2); **build vkd3d with the mingw cross file on the Linux host** — `meson setup --cross-file build-win64.txt --buildtype release -Denable_tests=true -Denable_extras=true tmp/dx12/build/vkd3d-win64 && ninja -C …` (§8.3, and `GATES.md` §4.1 verbatim); fix the `/XD vkd3d-proton` entry in `tools/win-mcp/src/main.rs:576` and `:843`. ⚠ **No VM toolchain bring-up and no `win_vkd3d` at this stage** — the whole cross toolchain is already installed on the host, and the artifacts reach the VM by `robocopy` | **No Helios binary is touched.** Success = `libs/d3d12core/d3d12core.dll`, `libs/d3d12/d3d12.dll`, `tests/d3d12.exe`, `demos/{triangle,gears}.exe` exist and are non-empty, hashed into `tmp/dx12/gates/G0/sha256sums.txt` | **G0** |
 | **S0c** | **The vkd3d fork change (§7.4), which nothing else assigns.** Three parts, in this order: (1) wire the fork as a push remote — `.gitmodules` names `https://github.com/rupansh/vkd3d-proton` while the checkout's `origin` is `HansKristian-Work/vkd3d-proton` via the `github-rupansh` SSH alias, so `git -C vkd3d-proton-helios remote add helios <fork>` first and push there, never to `origin` (§8.2); (2) commit `libs/d3d12core/helios_entry.c` + `libs/d3d12core/helios_vkd3d.def` + the `helios_vkd3d_lib` target in `libs/d3d12core/meson.build`; (3) rebuild and confirm the two exports. ⚠ Also read the four licence files the S0 submodule init just made readable and produce §7.4's component table (UNVERIFIED-10) | No Helios binary is touched; the change is entirely inside the pinned submodule. Success = `x86_64-w64-mingw32-objdump -p tmp/dx12/build/vkd3d-win64/libs/d3d12core/helios_vkd3d.dll \| grep -E 'helios_vkd3d_(create_device\|serialize_root_signature)'` prints **both**, and the commit is on the fork remote | **G0** |
-| **S0b** | Phase 0 (DECISIONS D2): drop vkd3d's `d3d12.dll`+`d3d12core.dll` + DXVK `dxgi.dll` beside `tests/d3d12.exe` and run it on Helios. ⚠ **P-A must land first**, and its shape is settled (DECISIONS §3-H2): in `wsi_win32_vehicle_runtime_init_locked` the ICD must load `dxgi.dll`/`d3d11.dll`/`dcomp.dll` by **explicit full `%SystemRoot%\System32` path AND then verify the result** — `GetModuleFileNameW` on the returned `HMODULE`, refusing with a named counter if it does not resolve under System32. ⛔ Neither `LoadLibraryExA(…, LOAD_LIBRARY_SEARCH_SYSTEM32)` nor a full path is sufficient alone: the loader's already-loaded check matches on **base name**, so a DXVK `dxgi.dll` the application loaded first is handed back however the vehicle asks. The verification step is what makes the failure loud instead of demoting every frame to the software GDI blit behind a picture that looks correct | Same: no Helios binary changes. This is the whole lower half of the architecture proven with zero UMD code | **G1, G2** |
+| **S0b** | **Headless engine validation** (`DECISIONS.md` D2 — ⛔ *not* an app-local arm; that framing is retired). Write `tools/d3d12_bridge_probe.cpp`: `LoadLibrary("helios_vkd3d.dll")` → `helios_vkd3d_create_device` → clear + one triangle into an offscreen `ID3D12Resource` → copy to a `READBACK` heap → `Map` and verify the pixels. **No `d3d12.dll`, no D3D12 runtime, no DXGI, no swapchain.** Optionally also run the headless vkd3d conformance suite (zero swapchains — verified) as the `D12-G9` baseline. ⚠ P-A is **closed by construction** here, not mitigated: with no app-local DLLs the ICD vehicle cannot pick up a foreign DXGI. The vehicle's bare-name `LoadLibraryA` hardening is still worth doing, but as ordinary stability work, not as a D3D12 prerequisite | Same: no Helios binary changes. This is the engine half of the architecture proven with zero UMD code, and it is the only check standing between a wrong assumption about vkd3d-on-venus and ~200 DDI slots | **G1, G2** |
 | **S1** | Create `umd_common`; move the five **zero-behaviour-change** Rust modules (`hr`, `format`, `throttle`, `slot`, `window`) **and the shared C++ header** (§4.4: `bridge_common.h` + `PeriodicStat`/`qpc_elapsed_us`/`ComRelease<T>`/`bridge_guard`). `umd` gains one path dep, `use` statements, and one `.include("../umd_common/bridge")` in its `build.rs` | **`S1-check`** (no `D12-G*` id exists for this — see the note below): (a) the 11 `hr` asserts compile; (b) `rustc --test --edition 2021 -o /tmp/format-table-check tools/format-table-check.rs && /tmp/format-table-check` passes **on Linux**, with the `#[path]` updated in the same commit; (c) `git grep -n 'static_assert' umd/bridge umd12/bridge umd_common/bridge` returns exactly one `bridge_guard` hit; (d) deploy + one Fire Strike run at the standard preset via `helios_fs_std`, 3-run median within the known ±5–6 % spread; (e) zero `helios_umd.dll` entries in the id-1000 Application log for the boot | — (see note) |
 | **S2** | Move `log`, `knobs` (reader half), the refusal and noop mechanisms. `log::init(basename)` added, called from `open_adapter_common` (`adapter.rs:218`) | **`S2-check`**: (a) ⚠ `log_knob_inventory()`'s line in `umd-<pid>.log` must be **byte-identical** to before — capture it before the move and `fc /b` after; that line is R1008's own validation instrument (`umd/src/log.rs:226-234`); (b) the P2 fault injection re-run (§4.2): add a bare `crate::log_line("x")` to a `forward/*` file, confirm the build fails with *"use of deprecated function"*, remove it; (c) all ten knob accessors still resolve — `present_batch_fold` is the one a "move the 9" reading drops (§2.1); (d) the same Fire Strike + id-1000 evidence as S1 | — (see note) |
 | **S3** | New `umd12` crate: `build.rs` + bindgen + `ddi12.rs` only. `OpenAdapter12` in `umd12` **still refuses** with `DXGI_ERROR_UNSUPPORTED`; `umd` keeps its own refusing `OpenAdapter12`. **Nothing deployed** | Nothing shipped changes. The bindgen layout assertions ARE the deliverable: if `d3d12umddi.rs` compiles, the ABI is machine-checked | **G0** |
@@ -1709,7 +1717,7 @@ attempted:
 | Gate | Meaning | Earliest stage |
 |---|---|---|
 | G0 | build | S0 (vkd3d, Linux mingw cross) / S0c (the two Helios exports) / S3 (`umd12` bindgen) |
-| G1 | substrate device (`D3D12CreateDevice` succeeds on Helios) | S0b app-local, S4 through our bridge, S4b for the two-engine process |
+| G1 | engine gate, headless (vkd3d produces correct pixels on venus through `helios_vkd3d_create_device`) | S0b the bridge probe, S4 the same path inside `umd12`, S4b for the two-engine process |
 | G2 | substrate conformance (`tests/d3d12.exe`, WARP-baselined) | S0b |
 | G3 | first frame | S0b (app-local) / S6 (DDI) |
 | G4 | present characterisation | S0b — read with P-B in mind (`helios_umd_get_present_result` returns −1 unconditionally, so every vehicle present takes the worker-serial `wait_last_present` fallback, measured **5.57 ms/frame**) |

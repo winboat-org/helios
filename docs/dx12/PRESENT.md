@@ -16,6 +16,39 @@ against **Windows SDK 10.0.26100.0**, staged uncommitted at `tmp/dx12/sdk/`. Re-
 `win_exec` snippet in `DECISIONS.md`'s preamble before trusting a citation. Every in-tree citation is
 against commit `4739649` (branch `wddm`), submodule `vkd3d-proton-helios` at `2c7ba22c`.
 
+> ## ⚠ Read this before §3 onward — scope changed 2026-08-05
+>
+> **`DECISIONS.md` D2 (owner directive) removed the app-facing vkd3d arm.** Helios never ships or
+> measures vkd3d's `d3d12.dll`/`d3d12core.dll` as an application's D3D12. Consequences for this
+> document:
+>
+> - **The shipping D3D12 present path is: app → MS `dxgi.dll` → the D3D12 runtime →
+>   `pfnPresent` (command-list table, plus `D3D12DDI_TABLE_TYPE_DXGI`) → `DxgkDdiPresent` → the
+>   existing flip arm → `set_scanout_blob`.** It is the D3D11 chain of §2 with the DDI swapped, and
+>   `pKTCallbacks` carries `pfnRenderCb`/`pfnPresentCb` so even the identity channel transfers
+>   (P-C).
+> - ⛔ **DXVK's `dxgi.dll` is not needed anywhere and is not used anywhere.**
+>   `umd/build.rs:238-243`: a WDDM UMD sits *below* DXGI and *implements* the DXGI DDI; MS's
+>   `dxgi.dll` is the frontend. DXVK's is not built in this tree (only `dxgi.dll.p` exists), not
+>   deployed, not referenced. The same is true for D3D12: the app's `ID3D12CommandQueue` is the
+>   **runtime's**, which MS DXGI understands natively, so `IDXGIVkSwapChainFactory` is never queried
+>   and vkd3d's `swapchain.c` is never entered.
+> - **§5 (how vkd3d presents) and §6 (P-A) are therefore background, not plan.** They describe what
+>   would have been required had vkd3d been app-facing. P-A is **closed by construction**, not
+>   mitigated — see `DECISIONS.md` §3-H2.
+> - **§7 (P-B: the vehicle's ~5.57 ms serial gate and its extra frame copies) is off the D3D12
+>   path.** A D3D12 frame never enters the ICD's WSI vehicle. Those costs remain real for **native
+>   Vulkan clients** and should be fixed on their own merits; they are not D3D12 numbers.
+> - **What survives unchanged and is the load-bearing content here:** §2 (the D3D11 chain, hop by
+>   hop — the reference the D3D12 path mirrors), §3 (the `pfnPresent` DDI as declared), §8 (P-C, the
+>   identity channel), §10 (the defect classes the flip arm carries), §11 (how to prove a frame, and
+>   how to tell which path served it).
+>
+> ⚠ One thing to carry forward from P-A even though it is closed: the failure *shape* was **a
+> correct-looking picture served by a path you did not intend**. §11's requirement to confirm *which
+> path served the frame* — not merely that a frame appeared — exists because of it, and applies to
+> `D12-G8` verbatim.
+
 **Evidence key.** `[HDR]` the header says it. `[MS]` Microsoft documentation says it. `[CODE]`
 in-tree source does it. `[MEAS]` a measurement recorded in this repo. `[INFER]` inference, marked.
 **UNVERIFIED** = not established; the settling experiment is always stated inline and repeated in

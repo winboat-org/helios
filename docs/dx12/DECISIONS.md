@@ -58,12 +58,54 @@ whose directory you control — never dwm, never Store apps, never an unmodified
 (`research/R10.md` Q6, `research/R11.md` §5.2.) A driver is the only shape that makes *the adapter*
 D3D12-capable.
 
-**Decision D2 — the app-local vkd3d arm is Phase 0 of D1, not an alternative to it.** Dropping
-`d3d12.dll` + `d3d12core.dll` + DXVK `dxgi.dll` beside an executable exercises **the entire lower
-half of the target architecture** — the same vkd3d, the same dxil-spirv, the same venus ICD, the
-same KMD, the same present path — with zero Helios code written. It is therefore the cheapest
-possible proof of everything except the DDI itself, and it stays afterwards as the permanent A/B
-control and conformance oracle (the same `tests/d3d12.exe` binary tests both arms; see D9).
+**Decision D2 — go straight for the UMD. There is no app-facing vkd3d arm.**
+*(Owner directive, 2026-08-05: "I don't want to spend time on app-facing d3d12, we should aim for
+the umd directly." This supersedes the earlier plan, which made app-local vkd3d DLLs a Phase 0
+milestone with on-screen gates.)*
+
+⛔ **Helios never ships, deploys, or measures vkd3d's `d3d12.dll`/`d3d12core.dll` as an
+application's D3D12.** Everything app-facing goes through Microsoft's `d3d12.dll` +
+`D3D12Core.dll` + `dxgi.dll` and lands on `helios_umd12.dll` via `UserModeDriverName[3]`, exactly
+as D3D11 does today.
+
+**Three things fall out of this, and they are the reason it is the right call:**
+
+1. **DXVK's `dxgi.dll` is not needed anywhere, and never was for the shipping path.**
+   `umd/build.rs:238-243` states the rule: *"a WDDM UMD sits below DXGI and implements the DXGI DDI;
+   it must not depend on dxgi.dll."* The D3D11 UMD fills `DXGI_DDI_BASE_FUNCTIONS` (18 slots,
+   `umd/src/forward/tables.rs:12-40`) and **Microsoft's** `dxgi.dll` is the frontend. DXVK's own
+   `dxgi.dll` is not built in this tree (only `dxgi.dll.p` exists), not deployed by any script, and
+   referenced by nothing. D3D12 inherits that exactly: the app's `ID3D12CommandQueue` is the
+   **runtime's**, which MS DXGI understands natively, and present arrives at `pfnPresent` on the
+   command-list table plus `D3D12DDI_TABLE_TYPE_DXGI` (=3). vkd3d sits *behind* the DDI as an
+   engine, so `IDXGIVkSwapChainFactory` is never queried and `swapchain.c` is never entered — just
+   as DXVK's own swapchain factory is never used today.
+2. **P-A is deleted, not mitigated.** The whole hazard (the ICD vehicle picking up an app-local DXVK
+   DXGI and silently demoting frames to the software GDI blit) existed only because an app directory
+   would have contained a DXVK `dxgi.dll`. No app-local DLLs ⇒ no hazard. The ICD's bare-name
+   `LoadLibraryA("dxgi.dll")` is still worth hardening on its own merits, but it is no longer on any
+   critical path. See H2.
+3. **No dual-arm maintenance.** One present path, one conformance target, one deployment story.
+
+⚠ **What this costs, stated plainly:** the dropped arm was the only way to answer *"does vkd3d
+actually run on venus?"* **before** ~200 DDI slots are written on the assumption that it does. That
+question does not go away, so D2 replaces it with two **headless** substitutes that need no DXGI, no
+swapchain, no vehicle and no app-facing D3D12 at all:
+
+- **The bridge probe (mandatory, gate `D12-G1`).** A `tools/` program that `LoadLibrary`s
+  `helios_vkd3d.dll`, calls `helios_vkd3d_create_device`, renders to an offscreen `ID3D12Resource`
+  and reads it back. No `d3d12.dll`, no D3D12 runtime, no DXGI — it exercises *exactly* the engine
+  path `umd12` will use, one layer below it. This is stage S4 in `ARCHITECTURE.md` §11 and it is the
+  cheapest real answer available.
+- **The headless conformance baseline (recommended, gate `D12-G2`).** `vkd3d-proton-helios/tests/`
+  creates **zero** swapchains — verified, `grep -rl CreateSwapChain tests/` is empty — so the suite
+  is fully headless and needs no DXGI. It does resolve `D3D12CreateDevice` from whatever `d3d12.dll`
+  sits beside the test binary, so running it in vkd3d-direct mode is a **developer harness, not a
+  shipping path**, and is the one narrow exception to the ⛔ above. It costs nothing extra because
+  **the same binary is needed anyway** for `D12-G9` against the system `d3d12.dll`, and it converts
+  "does the engine work" from a 200-slot bet into a recorded pass/fail triple. If the owner would
+  rather not run it at all, `D12-G1` alone still gates the DDI work — the loss is the baseline to
+  diff `D12-G9` against.
 
 **Decision D3 — two DLLs, not one.** `helios_umd.dll` keeps slots 0–2 and is not touched;
 `helios_umd12.dll` takes slot 3.
@@ -277,25 +319,35 @@ flip-model, DWM-composited present whose pixels move GPU-side through venus, re-
 
 The real present issues are three, all named:
 
-- **P-A (Phase 0 blocker, confirmed by code).** vkd3d-proton implements **no DXGI** and never creates
-  a `VkSurfaceKHR`; it exposes `IDXGIVkSwapChainFactory` off `ID3D12CommandQueue` and consumes an
-  `IDXGIVkSurfaceFactory` — interfaces only **DXVK's `dxgi.dll`** provides (matching UUIDs already
-  exist in `dxvk-helios`). But the ICD's vehicle does `LoadLibraryA("dxgi.dll")`, and DXVK's
-  `CreateSwapChainForComposition` returns **`E_NOTIMPL`** by default. So deploying vkd3d + DXVK-DXGI
-  app-local **silently demotes every frame to the software GDI blit** — a picture that looks correct
-  and is not the path you think you measured. Fix is ~10 lines, ICD-local: load `dxgi.dll`/`d3d11.dll`/
-  `dcomp.dll` by **explicit full System32 path** in `wsi_win32_vehicle_runtime_init_locked`, **and
-  then verify what you got**: `GetModuleFileNameW` on the returned `HMODULE` and refuse, with a
-  named counter, if it does not resolve under `%SystemRoot%\System32`. ⛔ Neither
-  `LoadLibraryExA(…, LOAD_LIBRARY_SEARCH_SYSTEM32)` nor a full path is sufficient on its own — the
-  loader's already-loaded check matches on base name, so a DXVK `dxgi.dll` the *application* loaded
-  first is returned to the vehicle regardless of how the vehicle asks. The verification step is
-  what makes the failure loud instead of silent, which is the whole point of the fix.
-  **This must land before any Phase-0 measurement.**
-- **P-B (Phase 0 cost).** `helios_umd_get_present_result` has returned `-1` unconditionally since
-  R912(a), so the ICD's acquire-side gate is never armed and every vehicle present takes the
-  worker-serial `wait_last_present` fallback — measured at **avg 5.57 ms/frame**. Plus the vehicle
-  path costs two-to-three frame copies. Phase 0 numbers must be read with this in mind.
+- **P-A — ✅ CLOSED by D2, not mitigated.** The hazard was: vkd3d as an app's `d3d12.dll` needs
+  DXVK's `dxgi.dll` (MS DXGI cannot make a swapchain for a foreign `ID3D12CommandQueue` —
+  `demos/demo_win32.h:248-263` is the call that fails), and once a DXVK `dxgi.dll` sits in an app
+  directory the ICD's present vehicle picks it up through its bare-name `LoadLibraryA("dxgi.dll")`
+  (`wsi_common_win32.cpp:485-487`) and DXVK's `CreateSwapChainForComposition` returns `E_NOTIMPL`
+  by default (`dxvk-helios/src/dxgi/dxgi_factory.cpp:282-298`, `dxgi_options.cpp:178`) — silently
+  demoting every frame to the software GDI blit while the picture still looks correct.
+  **D2 removes the precondition:** no app-local DLLs, so no DXVK DXGI anywhere, so no hazard.
+  DXVK's `dxgi.dll` is not built, not deployed and not referenced in this tree, and the shipping
+  D3D12 path uses Microsoft's DXGI exactly as D3D11 does.
+
+  ⚠ **Two things to keep from it anyway.** (a) The ICD's bare-name `LoadLibraryA` of `dxgi.dll` /
+  `d3d11.dll` / `dcomp.dll` is still a latent hijack: *any* process that ships its own DXGI — a
+  game with a DXVK/ReShade drop-in, an overlay — hands the vehicle a foreign compositor stack. The
+  hardening is unchanged and cheap: load by explicit full System32 path **and verify with
+  `GetModuleFileNameW`**, refusing with a named counter (neither the path nor
+  `LOAD_LIBRARY_SEARCH_SYSTEM32` suffices alone, because the loader's already-loaded check matches
+  on base name). It is now ordinary stability work, not a D3D12 blocker. (b) The failure *shape* —
+  a correct-looking picture served by a path you did not intend — is the reason `D12-G8`'s pass
+  criterion must confirm which path served the frame, not merely that a frame appeared.
+
+- **P-B — ✅ off the critical path.** `helios_umd_get_present_result` returning `-1` unconditionally
+  since R912(a) forces every *vehicle* present through the worker-serial `wait_last_present`
+  fallback (measured avg **5.57 ms/frame**), and the vehicle path costs two-to-three frame copies.
+  ⚠ None of that is on the D3D12 present path under D2: a D3D12 frame goes MS DXGI → runtime →
+  `pfnPresent` → `DxgkDdiPresent`, the same machinery D3D11 uses, and never enters the ICD's WSI
+  vehicle. It remains a real cost for **native Vulkan clients** and should be fixed on its own
+  merits; it is not a D3D12 number.
+
 - **P-C (the DDI arm's present design) — narrower than it first looked.** D3D12's `pfnPresent`
   **does** reach the driver: it is on the *command-list* table (`PFND3D12DDI_PRESENT_0051`,
   `d3d12umddi.h:7250`), takes `D3D12DDIARG_PRESENT_0001` (essentially `DXGI_DDI_ARG_PRESENT`), and

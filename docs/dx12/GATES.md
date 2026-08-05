@@ -101,7 +101,7 @@ These are not advice. A gate result taken without them is not citable.
    (the SHA256 manifest, appended per gate). Everything else stays in `tmp/`.
 
    ```powershell
-   Get-FileHash -Algorithm SHA256 d3d12.dll,d3d12core.dll,d3d12.exe,dxgi.dll |
+   Get-FileHash -Algorithm SHA256 d3d12.dll,d3d12core.dll,d3d12.exe |
      Format-Table Hash,Path -AutoSize |
      Out-File -Encoding utf8 Z:\tmp\dx12\gates\<gate>\sha256sums.txt
    ```
@@ -517,13 +517,32 @@ list-tests.txt}`; the SHA256 block appended to `docs/dx12/baselines/gate-binarie
 
 ---
 
-### 4.2 `D12-G1` — Substrate device gate: `D3D12CreateDevice` succeeds on Helios
+### 4.2 `D12-G1` — Engine gate: vkd3d produces correct pixels on venus, headless
 
-**Entry:** G0. (Or the §2.2 prebuilt pair, with its SHA256 and version banner recorded first.)
+⚠ **Rescoped by `DECISIONS.md` D2 (owner directive: no app-facing vkd3d).** This gate no longer
+proves anything through an application's `d3d12.dll`. It proves the **engine path `umd12` will
+actually use**, one layer below the DDI: `LoadLibrary("helios_vkd3d.dll")` →
+`helios_vkd3d_create_device(luid, IID_ID3D12Device, &device)` → render to an offscreen
+`ID3D12Resource` → read it back and compare. **No `d3d12.dll`, no D3D12 runtime, no DXGI, no
+swapchain, nothing on screen.**
 
-**Work:** prove that vkd3d-proton creates an `ID3D12Device` on the Helios venus ICD at all. Nothing
-in this tree has ever tried. No window is involved, so session 0 is acceptable — this is the only
-gate for which that is true.
+**Entry:** G0.
+
+**Work:** write `tools/d3d12_bridge_probe.cpp` — the D3D12 analogue of the existing `tools/` D3D11
+probes, and the same thing `ARCHITECTURE.md` §11 stage S4 calls for. It must: resolve the two
+Helios exports by name (D4); create the device; create a command queue, allocator and list; clear a
+committed `R8G8B8A8_UNORM` render target to a known non-trivial colour; draw one triangle with the
+SM 6.0 shaders from `demos/`; copy to a `READBACK` heap; `Map` and verify the pixels. Failure at any
+step is the gate's answer, and each step gets its own log line so the failure is attributable.
+
+⚠ This is the **only** thing standing between a wrong assumption about vkd3d-on-venus and ~200 DDI
+slots written on top of it (`DX12.md` §6.1). Do not wave it through because nothing is on screen.
+
+No window is involved, so session 0 is acceptable — this and G2 are the only gates for which that
+is true.
+
+<details><summary>Superseded: the original app-local device gate (kept for the adapter-identification
+recipe, which is still needed)</summary>
 
 **Commands** (win_exec, session 0):
 
@@ -597,7 +616,17 @@ create_device_system.txt,triple.txt,vkd3d.log,kmd-counters-G1-{pre,post}.txt,not
 
 ---
 
-### 4.3 `D12-G2` — Substrate conformance baseline: the suite, the triple, the known-fail list
+</details>
+
+### 4.3 `D12-G2` — Headless conformance baseline: the suite, the triple, the known-fail list
+
+⚠ **Scope under `DECISIONS.md` D2.** The vkd3d suite creates **zero** swapchains — verified,
+`grep -rl CreateSwapChain vkd3d-proton-helios/tests/` is empty — so it is fully headless and needs
+no DXGI. Running it in vkd3d-direct mode (vkd3d's `d3d12.dll` + `d3d12core.dll` beside **the test
+binary only**) is a **developer harness, not a shipping path**, and is the one narrow exception to
+D2's ⛔. It costs nothing extra because the same binary is needed anyway for `D12-G9` against the
+system `d3d12.dll`. If the owner would rather not run it at all, G1 alone gates the DDI work; the
+loss is the baseline to diff G9 against.
 
 **Entry:** G1 green **with the G0 build** (⛔ not the §2.2 prebuilt pair).
 
@@ -709,7 +738,20 @@ kmd-counters-G2-{pre,post}.txt}`; **committed:** `docs/dx12/baselines/vkd3d-know
 
 ---
 
-### 4.4 `D12-G3` — First D3D12 frame on screen (app-local arm), owner-visible
+### 4.4 `D12-G3` — ⛔ RETIRED by `DECISIONS.md` D2
+
+This gate was "first D3D12 frame on screen via the app-local vkd3d arm". **There is no app-facing
+vkd3d arm** (owner directive, 2026-08-05), so it has no subject. The first D3D12 pixels on the
+Helios desktop are now **`D12-G8`**, drawn through `helios_umd12.dll`, and that is also the first
+exercise of the D3D12 present path.
+
+The id is retired rather than renumbered so every existing cross-reference in `docs/dx12/` still
+resolves. Its two durable pieces moved: the **screen-evidence procedure** (paintcap twice ≥2 s
+apart, crop to the window rect, RMSE compare, and the promoted/maximized paintcap blind spot) is now
+part of G8's pass criterion, and the **path-confirmation discipline** — never accept "a frame
+appeared" without confirming *which path served it* — is stated in G8 as a hard requirement.
+
+<details><summary>Superseded content, kept for the evidence recipes it contains</summary>
 
 **Entry:** G2 baseline recorded, **and the P-A fix landed** (see traps).
 
@@ -815,7 +857,21 @@ vehicle-diag.txt,umd-*.log,kmd-counters-G3-{pre,post}.txt,notes.md}`.
 
 ---
 
+</details>
+
 ### 4.5 `D12-G4` — Present-path characterisation: black-frame %, present→scanout, resize/fullscreen
+
+⚠ **Re-sequenced by `DECISIONS.md` D2: this gate now runs AFTER `D12-G8`, not before it.** Its
+subject is the **DDI** present path (MS DXGI → the D3D12 runtime → `pfnPresent` → `DxgkDdiPresent`
+→ the existing flip arm → `set_scanout_blob`), because that is the only D3D12 present path that
+exists. The measurements, oracles and pass thresholds below are unchanged and still correct — only
+the entry condition and the client under test change.
+
+**Entry:** `D12-G8` green (not G3, which is retired).
+
+⚠ The ICD's dcomp vehicle, its ~5.57 ms serial gate and its extra frame copies are **not** on this
+path (`DECISIONS.md` P-B). Do not attribute a D3D12 present number to them without evidence that
+the vehicle was involved — under D2 it should not be.
 
 **Entry:** G3.
 
@@ -1452,7 +1508,8 @@ VRAM); Speed Way needs DX12 Ultimate (DXR 1.1 + mesh shaders, 6 GB). Ordering by
 $NR = 'C:\ProgramData\UL\3DMark\chops\dlc\night-raid-test\bin\x64'
 Copy-Item Z:\tmp\dx12\build\vkd3d-win64\libs\d3d12\d3d12.dll            $NR\
 Copy-Item Z:\tmp\dx12\build\vkd3d-win64\libs\d3d12core\d3d12core.dll    $NR\
-Copy-Item C:\Users\Rupansh\dxvk-build\src\dxgi\dxgi.dll                 $NR\
+# ⛔ NO dxvk dxgi.dll and NO vkd3d d3d12*.dll — under DECISIONS D2 the workload runs on the
+# system d3d12.dll + dxgi.dll and reaches Helios through UserModeDriverName[3].
 
 # 3. run through a run-gt1-arm.ps1-shaped wrapper, in session 1
 powershell -File Z:\tmp\perf\launch-gt1-arm.ps1 -Label d12-nightraid-1 `
@@ -1845,8 +1902,8 @@ step gains `"vkd3d=$(git rev-parse HEAD:vkd3d-proton-helios)"` beside `mesa` and
 | 7.2 | **The host-side evidence tools are unusable on the current boot.** The VM runs `-display sdl,gl=on` with no `-vnc` (verified `pgrep -af qemu-system-x86_64`; `tools/launch-helios-gtk.sh:464-466`), so `vnc_shot.py` / `vnc_frame_probe.py` have nothing to connect to. | Owner-run relaunch with `HELIOS_DISPLAY=egl-vnc bash tools/launch-helios-gtk.sh`. **Ask; do not do it.** Until then G4 runs its guest-only arm. |
 | 7.3 | **Which vkd3d-proton version is the Looking Glass prebuilt pair?** No version resource. | Run any client against those DLLs with `VKD3D_DEBUG=info VKD3D_LOG_FILE=…` and read the `vkd3d-proton - build: %015llx` banner (`libs/vkd3d/device.c:1479-1481`). |
 | 7.4 | **What does `dxil-spirv` pull in transitively?** The directory is empty, so its `.gitmodules` cannot be read. ⚠ Still open only because settling it *mutates the working tree* (it clones a submodule) — it is not a hard question, and **G0's first command settles it as a side effect**. | `git -C vkd3d-proton-helios submodule update --init subprojects/dxil-spirv && cat vkd3d-proton-helios/subprojects/dxil-spirv/.gitmodules` — run it as part of G0, then paste the answer here. |
-| 7.5 | **Does MS `d3d11.dll` accept a DXVK `IDXGIAdapter`?** (present risk V1). The vehicle's first COM step is `D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, …)` inside the vkd3d process, and MS `d3d11.dll`'s NULL-adapter enumeration imports `dxgi.dll` — which app-local redirection would point at DXVK. The P-A fix covers the *vehicle's* factory, not `d3d11.dll`'s import. | Drop `dxvk-helios`'s `dxgi.dll` beside the `helios_dcomp_probe` binary and run that schtask (session 1). Failure at `CreateSwapChainForComposition` `hr=0x80004001` = V2 only; failure earlier at `D3D11CreateDevice` = V1 also bites. **G3 pre-step.** |
-| 7.6 | **Does `--adapter N` reliably reach the Helios adapter with DXVK's DXGI in the path?** DXVK's DXGI enumerates via Vulkan, not the WDDM adapter list, so indices may differ. | Run `dxgi_luid_dump.exe` twice — with and without DXVK's `dxgi.dll` beside it — and diff. |
+| 7.5 | ✅ **MOOT under `DECISIONS.md` D2** — was: does MS `d3d11.dll` accept a DXVK `IDXGIAdapter`? It only arose because an app directory would hold a DXVK `dxgi.dll`. No app-local DLLs ⇒ never asked. ⚠ Keep the underlying hardening (the ICD's bare-name `LoadLibraryA("dxgi.dll")`) as ordinary stability work — any process shipping its own DXGI hands the vehicle a foreign compositor stack. | Not a D3D12 gate any more. |
+| 7.6 | ✅ **MOOT under D2** — was: does `--adapter N` reach Helios with DXVK's DXGI in the path? DXVK's DXGI is never in the path. ⚠ The live half still applies: **two display devices exist on this VM**, so `dxgi_luid_dump.exe` must be read before every suite run and the index passed explicitly. | `tools/dxgi_luid_dump.cpp`, every run. |
 | 7.7 | **What `skipped` count does a *healthy* driver produce on this suite?** Upstream publishes none. | Establish Helios' own baseline at G2; if a second machine is ever available, take a `--warp` baseline on the same OS build as an upper bound. |
 | ~~7.8~~ | ✅ **SETTLED 2026-08-05 — the VM HAS network access.** `(Invoke-WebRequest https://api.nuget.org/v3/index.json -UseBasicParsing).StatusCode` returned **200** from a `win_exec` shell. So the MS-samples nuget restore (§2.3) and CI shape (a)'s `choco install` are downloads, not blockers. Kept as a row so §2.3's cross-reference resolves. | Closed. Re-run the one-liner if a network change is suspected. |
 | 7.9 | **Which choco/msys2 package supplies `widl` on a GitHub `windows-2022` runner, and at what version?** Upstream pins nothing. | `choco install strawberryperl -y; widl -V` in a throwaway CI run. |
