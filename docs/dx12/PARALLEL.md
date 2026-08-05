@@ -117,21 +117,29 @@ Five shared files exist. Each has an **append-only** discipline:
 |---|---|---|
 | `forward12/tables12.rs` | ⛔ **nothing** — S6-0 wrote the whole install chain, all 11 lanes | edit it at all; if a lane needs a chain change, ask the integrator |
 | `umd12/build.rs` | one `.file("bridge/vkd3d_bridge_<lane>.cpp")` and one `bridges([...])` entry | change flags, includes or the link set |
-| `umd_common/src/private12.rs` | one private-data payload struct + its `boxed_handles!`/`com_handles!` line, at the **end** | reorder, repurpose, or name a `ddi12` type (D13) |
+| `protocol/src/wddm.rs` | ⚠ **nothing, normally** — the cross-module records already exist and are reused verbatim. A genuinely new one is appended, with its own magic + version, **by the integrator** | change, re-version or re-magic an existing struct: `umd`, `kmd_render` and the Mesa ICD all read them |
 | `src/device12.rs` | one field on `HeliosD3D12Device`, at the **end** | reorder or repurpose existing fields |
 | `src/knobs12.rs` | one knob + one `resolved_inventory()` entry, at the **end** | reorder (the inventory order is the evidence contract — S2) |
 
-⛔ **`DECISIONS.md` D13 — owner requirement, and it binds nearly every lane: every DDI private-data
-payload type lives in `umd_common`, never in `umd12`.** `CORE_0109` has 26 `CalcPrivate*` slots, so
-this is not one file's problem. Two rules follow and neither is negotiable:
+⛔ **`DECISIONS.md` D13 — private data that CROSSES a module boundary is declared exactly once, in
+`helios_protocol`; private data that does not cross one stays in the crate that owns it.**
 
-1. **A payload struct may not name a `ddi12` bindgen type.** `umd_common` must keep building on
-   Linux and must not grow a `build.rs`, so it cannot see the WDK. Store the *fields* — a `usize`
-   COM pointer, a `u64` GPU VA, a `u32` flags word, a format as its numeric value — and convert at
-   the DDI boundary. The private block is the driver's own record, not a copy of the runtime's
-   argument.
-2. **`Slot<Boxed<S>>::get()`'s soundness argument is still not inherited** (§9.4). D13 shares the
-   type; it does not share D3D11's `CUseCountedObject` claim.
+* **Crossing** = the allocation private driver data (`HeliosWddmAllocPrivate`, `'HWDM'`), the
+  KMD-stamped open identity (`HeliosWddmOpenIdentity`, `'HIDN'`) and the present identity channel
+  (`HeliosPresentRenderCmd`, `HeliosPresentPrivateData`). All four already exist in
+  `protocol/src/wddm.rs` and already have three readers — `umd`, `kmd_render` and the Mesa ICD.
+  **L4 and L8 reuse them verbatim**: same crate, same struct, same magic, same version. Not "a
+  compatible layout". That is how D3c — *"D3D12-created resources must be able to be opened by DWM,
+  using D3D11 and the 11 DDI"* — gets discharged in code instead of deferred.
+* **Not crossing** = the 26 `CalcPrivate*` `pDrvPrivate` payload blocks. Runtime-allocated,
+  per-object, per-process; nothing on the other side of any boundary reads them. They stay in the
+  owning crate, typed against `ddi12`, so `umd_common::slot`'s `BoxedHandle::State` can keep naming
+  a payload from its **handle type** (§12 rule 7's scar). A single shared payload file would also be
+  the hottest merge point in an 11-lane split — the contention this whole section removes.
+* ⚠ `umd12` does not yet depend on `helios_protocol`. The first lane that needs a crossing record
+  adds it, and says so.
+* ⚠ **`Slot<Boxed<S>>::get()`'s soundness argument is still not inherited** (§9.4). D13 shares
+  declarations, not claims.
 
 **Install order is structural, not textual.** Use the `#[must_use] Filled*` token pattern from
 `umd/src/forward/tables.rs:44-70` (`ARCHITECTURE.md` §12 rule 9): correctness of every ≥11.1 device
@@ -266,9 +274,10 @@ A lane is done when **all** of:
 4. ⛔ If it calls `Slot<Boxed<S>>::get()`, it carries a **re-derived** D3D12 soundness argument at
    the call site. `umd_common::slot` states plainly that the `CUseCountedObject` ordering is
    established for D3D11 and **not** for D3D12. Do not inherit the claim.
-4b. ⛔ **Every private-data payload type it introduces is in `umd_common/src/private12.rs`, not in
-   `umd12`** (`DECISIONS.md` D13, owner requirement), and names no `ddi12` type. A `CalcPrivate*Size`
-   in `umd12` that returns `size_of::<SomethingDeclaredInUmd12>()` fails this outright.
+4b. ⛔ **Any private data it writes for another module to read is a `helios_protocol` struct**
+   (`DECISIONS.md` D13), reused verbatim — never a second declaration and never a second magic. Its
+   own `pDrvPrivate` payloads stay local and typed. Smell test for a violation: a `#[repr(C)]` struct
+   in `umd12` with a magic constant in it.
 5. It compiles clean in its own lane build, and the integrator has merged and re-run
    `-Crate both` — a lane that only ever built alone has not been integrated.
 6. It touched **no** file it does not own, and its diff against `build.rs`/`private12.rs`/

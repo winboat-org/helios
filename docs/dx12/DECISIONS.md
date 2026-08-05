@@ -817,47 +817,81 @@ decision, not two. The token itself is **composed from bindgen'd constants**
 (`D3D12DDI_INTERFACE_VERSION_R8`, `D3D12DDI_BUILD_VERSION_0110`), never transcribed: bindgen does not
 emit `D3D12DDI_SUPPORTED_0110` at all, because the macro casts through `(UINT64)`.
 
-**Decision D13 — ⛔ OWNER REQUIREMENT, 2026-08-06: every DDI *private-data* type lives in
-`umd_common`. Hard requirement, no per-crate private-block structs.**
+**Decision D13 — ⛔ OWNER REQUIREMENT, 2026-08-06, then REFINED the same day once its own source was
+read: private data that CROSSES a module boundary is declared exactly once, in `helios_protocol`.
+Private data that does not cross one stays in the crate that owns it.**
 
 > *"if we must use any private data, make sure its part of the `umd_common` crate, its a hard
-> requirement"*
+> requirement"* … *"my argument for shared private data stems from §4.3 of the `DX12.md` doc, if
+> there's an alternative, feel free to pivot"* — owner.
 
-**Scope.** "Private data" is the runtime-allocated block a WDDM UMD sizes with a `CalcPrivate*Size`
-DDI and writes through the matching `Create*`/`Open*` — the thing behind every handle's
-`pDrvPrivate`. `D3D12DDI_DEVICE_FUNCS_CORE_0109` alone has **26** `CalcPrivate*` slots (§4.1), so
-this binds nearly every lane, not one file.
+**The source, `DX12.md` §4.3 row 6, resolves to D3c above and to `ResourceHeaps.md:198`:**
 
-⇒ **The payload structs go in `umd_common`, in a module of their own, and `umd12` declares none.**
-D3b already moved the *mechanism* (`umd_common::slot`: `Slot<P>`, `Com<T>`, `Boxed<S>`,
-`ComHandle`/`BoxedHandle`) while explicitly leaving the payload structs per-crate — *"`umd` keeps …
-`boxed_slot`, whose payload structs are private to `forward`"* (`slot.rs:6-8`). D13 changes that for
-D3D12: the mechanism **and** the payload types are shared.
+> The driver must construct private data that is **consumable by their D3D11 driver** and will be
+> interpreted as a shared tile pool.
 
-**Why it is right, beyond being the owner's call.** D3c is the standing open question this repairs
-in advance: `ResourceHeaps.md:1254` makes *"DWM opens D3D12-created resources through the 11 DDI"* a
-stated requirement, and Helios' two DLLs hold two different engines. A resource created by
-`helios_umd12.dll` and opened by `helios_umd.dll` is one private block read by two modules. If its
-layout is declared twice, the two declarations agree **by copy-paste** and disagree silently the
-first time one of them changes — which is exactly the class D3b was written to kill. One declaration
-makes the agreement structural.
+⭐ **That sentence is about the private data attached to a shared *allocation*, and Helios already has
+it — in `protocol/src/wddm.rs`, not in `umd_common`.** `HeliosWddmAllocPrivate` (magic `'HWDM'`,
+version 1) is what `helios_umd.dll` writes into
+`D3DKMTCreateAllocation`'s `pAllocationInfo[i].pPrivateDriverData`
+(`umd/src/forward/resource.rs:351-369`), and `HeliosWddmOpenIdentity` (magic `'HIDN'`, version 1) is
+the record the **KMD** stamps back at `DxgkDdiOpenAllocation` after validating the venus resource is
+live, which the opening driver reads (`resource.rs:1303-1322`). It is `#[repr(C)]`, `Pod`/`Zeroable`,
+padding-free, magic- and version-tagged. **It is already the cross-driver contract the spec
+describes, and it already has three readers: `umd`, `kmd_render` and the Mesa ICD.**
 
-⛔ **The constraint this puts on how private blocks are written, and it is not optional.**
-`umd_common` **must keep building on Linux** (§4.2, and the whole of `PARALLEL.md` §7 rests on it),
-and it must not acquire a `build.rs` — D3b: *"a build script there would drag the WDK into a crate
-that must also build on Linux."* Therefore:
+⇒ **The rule.** Every byte of private data that one module writes and another reads is declared once,
+in `helios_protocol`, and `helios_umd12.dll` reuses those declarations byte for byte. It never
+re-declares them, never writes a D3D12-flavoured variant, and never invents a second magic. A D3D12
+resource opened by DWM through the D3D11 DDI is then readable **by construction** rather than by two
+declarations happening to agree.
 
-* ⛔ **A private-data struct may not name a `ddi12`/`ddi` bindgen type.** Those types exist only
-  inside the two cdylibs. Store the **fields** — a `usize` COM pointer, a `u64` GPU virtual address,
-  a `u32` flags word, a format enumerator as its numeric value — not the DDI struct.
-* Anything genuinely ABI-shaped stays in the owning cdylib and is *converted* at the DDI boundary.
-  The private block is the driver's own record, not a copy of the runtime's argument.
-* `#[cfg(windows)]` is fine (`slot` already is); the host cross-check targets
-  `x86_64-pc-windows-msvc`, so cfg-windows modules still type-check there.
+⛔ **`umd_common` is the wrong home for it, and the reason is load-bearing:** `kmd_render` is a
+`no_std` cdylib that reads these same structs and does **not** depend on `umd_common` (which is
+`std`, Windows-user-mode, and pulls `windows`). `protocol` is the crate that already builds on both
+platforms *and* in the kernel. Moving the allocation private data into `umd_common` would put it
+somewhere the KMD cannot see.
 
-⚠ **`Slot<Boxed<S>>::get()`'s soundness argument is still not inherited** (`slot.rs:304-322`,
-`PARALLEL.md` §9.4). D13 shares the *type*; it does not share the D3D11 `CUseCountedObject` claim.
-A lane that calls `get()` still owes the re-derived D3D12 argument at its own call site.
+### What is NOT covered, and why the broad reading was rejected
+
+The broad reading — *"every `CalcPrivate*Size` payload struct moves to a shared crate"* — was written
+first and then withdrawn. `CORE_0109` has 26 `CalcPrivate*` slots, and those blocks are:
+
+* **runtime-allocated, per-object, per-process, and never read by another module.** `pDrvPrivate`
+  memory belongs to one driver inside one device. Sharing its *Rust type* buys nothing for D3c,
+  because nothing on the other side of the boundary ever reads it.
+* **the one place the compiler can type a payload against the handle it belongs to.**
+  `ARCHITECTURE.md` §12 rule 7 is the scar: `load_com::<ID3D11RenderTargetView>(h_rtv)` compiled and
+  produced a `ManuallyDrop` whose vtable pointer was a struct field. `umd_common::slot`'s
+  `BoxedHandle::State` fixes that by naming the payload from the *handle type*, and `slot.rs:94-97`
+  records that the associated type *"may be a type private to the implementing crate. That is
+  deliberate."*
+* **hostile to the fan-out.** A single shared payload file would be the hottest merge point in an
+  11-lane split — the exact contention `PARALLEL.md` §5 exists to remove.
+* **forced to lose type safety.** `umd_common` must keep building on Linux and must not grow a
+  `build.rs` (D3b), so it cannot name a `ddi12` type; every payload field would degrade to a bare
+  integer at precisely the sites that most need typing.
+
+⇒ Per-object `pDrvPrivate` payloads stay in the crate that owns them, typed against `ddi12`.
+
+### What this obliges the S6 lanes to do
+
+1. **`umd12` takes the `helios_protocol` dependency** (`ARCHITECTURE.md` §5's `Cargo.toml` sketch
+   already lists it; the crate as built at S5 does not have it yet).
+2. **L4 (`forward12/resource12.rs`) writes `HeliosWddmAllocPrivate` and reads
+   `HeliosWddmOpenIdentity` exactly as `umd/src/forward/resource.rs` does** — same magic, same
+   version, same `kind`, same meta trailer. ⛔ Not "a compatible layout": the same struct from the
+   same crate. That is D3c's requirement discharged in code rather than deferred to `GATES.md` §7.23.
+3. **L8 (`forward12/present12.rs`) reuses `HeliosPresentRenderCmd` / `HeliosPresentPrivateData`**,
+   for the same reason and with an extra one: the KMD decodes them (`kmd_render/src/device.rs:46`),
+   and the 64th memory records that Present private data never reaches `DxgkDdiPresent` on DMA flips
+   — it rides the Render command. A second D3D12 spelling of that channel would be a second thing the
+   KMD has to recognise.
+4. **Any genuinely new cross-module record is a new `protocol` struct**, with its own magic and
+   version, added there and nowhere else.
+
+⚠ D13 shares declarations, not claims: `Slot<Boxed<S>>::get()`'s soundness argument is still D3D11's
+`CUseCountedObject` one and is **not** established for D3D12 (`slot.rs:304-322`, `PARALLEL.md` §9.4).
 
 ---
 
