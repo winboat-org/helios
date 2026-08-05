@@ -3322,6 +3322,39 @@ silent on it:
   exact pixels, 28 steps / 0 failures) both green on the first run.
   ⇒ **vkd3d demonstrably runs on venus**, which is what stood between a wrong
   assumption and ~200 DDI slots written on top of it.
+- ⭐ **P2 is complete (2026-08-06): the engine is proven in its SHIPPING shape,
+  and `umd_common` + `umd12` are built out to S3.** Four things landed, each with
+  its evidence under `tmp/dx12/gates/`:
+  - **`D12-G1` re-run against the STATIC clang-cl archives and PASSED**
+    (`G1-static/RESULT.md`). The earlier pass was against the *mingw* DLL; D4's
+    shipping artifacts had never drawn a pixel. Same probe source, one
+    `-DHELIOS_G1_STATIC`, so the 28 steps cannot drift apart — normalised, the
+    whole diff between the two arms is six lines of banner. ⭐ Plus the assertion
+    the DLL arm could never pass: **the probe imports no `dxgi.dll`**.
+    ⭐ **Measured minimal link set, which `umd12/build.rs` hard-codes at S4:
+    `libhelios_d3d12_static.a` + `gdi32.lib`** — one archive, because it is a
+    union of every vkd3d / dxil-spirv / dxbc-spirv object; ⛔ never `dxgi`.
+    ⚠ It cost a fork fix: the archive was **not** self-contained as D4 claimed
+    (D4 checked one symbol name, `CreateDXGIFactory`, and never asked about any
+    other). Linking it alone gave 19 unresolved externals, five of them
+    `vkd3d_debug_control_*` predicates `libvkd3d` calls unconditionally and which
+    lived in the one object the static target omits. Fork `8ee4440b` splits them
+    into `libs/d3d12core/debug_control.c`.
+  - **S1 + S2 complete ⇒ `DECISIONS.md` D3b is done.** `slot`, the three shared
+    C++ bridge headers, `log` (with `init(basename)`), `knobs`, `refusals` and
+    `noop` all live in `umd_common`. Both stages carry the full check list —
+    Fire Strike 3-run medians at parity (S1 GT1 220.10/GT2 211.85; S2 GT1
+    222.90/GT2 206.07 against a ~221/208 baseline) and a **cold boot** with
+    **zero id-1000 events of any kind**. S2's headline: `log_knob_inventory()`
+    comes out **byte-identical**, one SHA256 across the pre-move DLL, the
+    post-move DLL and the cold boot.
+  - **S3: `d3d12umddi.h` is bindgen'd with `layout_tests(true)`** — 1 904
+    assertion blocks, 102 874 lines, 399 `PFND3D12DDI*`, 15 s cold. Closes
+    `UNVERIFIED-2`: it does not hurt, do not narrow the allowlist. ⭐
+    `helios_umd12.dll` is **104 960 bytes, byte-for-byte what it was before** —
+    5.4 MB of generated ABI, zero bytes shipped, because nothing references it.
+  - ⛔ **`OpenAdapter12` still refuses**, in both DLLs, and must until S5.
+    Nothing was deployed for D3D12: no INF, no registry, no `UserModeDriverName[3]`.
 - **The substrate ceiling is measured, not predicted: FL 12_2 and SM 6.8.**
   `DECISIONS.md` H5 — whether vkd3d's `maintenance7` layered-`driverID` swizzle
   fires on venus — was the one open question that moved the ceiling, and
@@ -3330,11 +3363,19 @@ silent on it:
   live device at G1 (`ResourceBindingTier 3`, `TiledResourcesTier 4`,
   `ConservativeRasterizationTier 3`, `RaytracingTier 1_1`,
   `TypedUAVLoadAdditionalFormats 1`).
-- `umd/src/adapter.rs` exports `OpenAdapter12` and it **still refuses**, and must
-  keep refusing until the commit that makes its body reachable (R908). No D3D12
-  DDI code exists before P2. The earlier scaffolding (hand-written `D3d12Ddi*`
-  structs, eight `d3d12_*` handlers, `D3D12_SUPPORTED_DDI_VERSIONS`) was deleted
-  by T6/R908 and this starts from zero rather than from a half-built surface.
+- `umd/src/adapter.rs` and `umd12/src/lib.rs` both export `OpenAdapter12` and both
+  **still refuse**, and must keep refusing until the commit that makes the body
+  reachable (R908) — that is **S5**, where `umd` drops its export, `umd12`'s
+  becomes reachable, the INF registers slot 3 and the `UmdD3D12` kill switch lands,
+  all in one commit. No D3D12 DDI code exists yet. The earlier scaffolding
+  (hand-written `D3d12Ddi*` structs, eight `d3d12_*` handlers,
+  `D3D12_SUPPORTED_DDI_VERSIONS`) was deleted by T6/R908 and this starts from zero
+  rather than from a half-built surface.
+- **Next: S4** — `vkd3d_bridge.{h,cpp}` + `bridge12.rs`, reached by a `tools/`
+  probe. ⭐ Its link set needs no re-deriving; it is measured above and recorded in
+  `umd12/build.rs`'s module doc. Then **S4b** (the `helios_icd_anchor_v1` export in
+  both DLLs, which must land before the first two-engine run — UNVERIFIED-4), then
+  S5, then S6.
 - **The fork has content now.** `vkd3d-proton-helios` is on branch `helios` at
   `github.com/rupansh/vkd3d-proton` (remote `helios`; the checkout's `origin` is
   still upstream — ⛔ push to `helios`): D4's two DXGI-free exports, plus a
