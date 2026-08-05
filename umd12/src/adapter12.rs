@@ -27,9 +27,9 @@
 //! | `pfnCloseAdapter` | **real** — validates the handle and dumps the refusal set |
 //! | `pfnGetCaps` | refuses, counted, and **logs every caps type it was asked** |
 //! | `pfnFillDDITable` | **real** as of S6-0 — delegates to `forward12::tables12` |
-//! | `pfnCalcPrivateDeviceSize` | 0, counted — S6-0 |
-//! | `pfnCreateDevice` | refuses, counted — S6-0 |
-//! | `pfnDestroyDevice` | counted; no device can exist yet |
+//! | `pfnCalcPrivateDeviceSize` | **real** as of S6-0b — `device12` |
+//! | `pfnCreateDevice` | **real** as of S6-0b — `device12`, engine and all |
+//! | `pfnDestroyDevice` | **real** as of S6-0b — `device12` |
 //!
 //! ⛔ Those are **documented refusals with named counters, not silent stubs**
 //! (CLAUDE.md rule 2). Each is reached by the runtime on a knob-ON adapter open,
@@ -58,6 +58,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use helios_umd_common::hr::{Hresult, DXGI_ERROR_UNSUPPORTED, E_INVALIDARG, E_OUTOFMEMORY, S_OK};
 
 use crate::ddi12;
+use crate::device12;
 use crate::forward12;
 use crate::knobs12;
 use crate::{init_once, log_error, log_refusal_summary, note_refusal, UMD12_REFUSALS};
@@ -125,7 +126,7 @@ impl Ddi12Interface {
     /// being re-derived correctly a second time.
     ///
     /// Panic-free: a match over two `u32`s, no indexing.
-    fn from_pair(interface: u32, version: u32) -> Option<Self> {
+    pub(crate) fn from_pair(interface: u32, version: u32) -> Option<Self> {
         match (interface, version) {
             (Self::R8_0110_INTERFACE, Self::R8_0110_VERSION) => Some(Self::R8_0110),
             _ => None,
@@ -551,139 +552,52 @@ unsafe extern "C" fn fill_ddi_table(
 /// counters in `UMD12_REFUSALS`.
 static FILL_DDI_TABLE_CALLS: AtomicUsize = AtomicUsize::new(0);
 
-/// `pfnCalcPrivateDeviceSize` — **0 at S5**, paired with a refusing
-/// `pfnCreateDevice` in the same commit.
+/// `pfnCalcPrivateDeviceSize` — the DDI slot; [`device12`] owns the answer.
 ///
-/// ⛔ The pairing is the point, not an omission. `DDI_REFERENCE.md` §1.4 warns
-/// that the size and the construction must be *one function of `Flags`* —
-/// `D3D12DDI_CREATE_DEVICE_FLAG_DEBUGGABLE` arrives at both sites and the
-/// private size may legitimately differ between debug and retail. A non-zero
-/// size here with a refusing create would be a block nothing writes, and it
-/// would put the two sites out of step at exactly the moment S6-0 has to bring
-/// them back in step. 0 with a refusing create is coherent: the runtime
-/// allocates nothing and the create fails.
-///
-/// ⚠ In practice this is unreachable at S5 — `pfnGetCaps` refuses first and the
-/// runtime abandons device creation there — so the counter reading non-zero is
-/// itself information: it would mean the caps gauntlet was satisfied by
-/// something, which at S5 nothing should be able to do.
-///
-/// S6-0 replaces this with `device12::device_private_size(flags)` and the create
-/// body in the same commit.
+/// ⛔ **The size and the construction are one function of `Flags`.**
+/// `D3D12DDI_CREATE_DEVICE_FLAG_DEBUGGABLE` arrives on *both* this arg and
+/// `D3D12DDIARG_CREATEDEVICE_0109` (`DDI_REFERENCE.md` §1.4), so a size computed
+/// here and a `size_of::<Device>()` written there is a buffer overrun waiting
+/// for a debug-layer client. Both sites call `device12::device_private_size`.
 unsafe extern "C" fn calc_private_device_size(
     h_adapter: ddi12::D3D12DDI_HADAPTER,
     arg: *const ddi12::D3D12DDIARG_CALCPRIVATEDEVICESIZE,
 ) -> ddi12::SIZE_T {
     let _ = adapter_ok(h_adapter);
-
-    // ⚠ There is no HRESULT to refuse with — the DDI returns `SIZE_T`. The
-    // counter is the only channel this slot has, which is why it exists.
-    UMD12_REFUSALS.calc_private_device_size_unimplemented.bump();
-    let n = UMD12_REFUSALS.calc_private_device_size_unimplemented.get();
-    if n <= LOG_BUDGET {
-        if arg.is_null() {
-            log_error!("CalcPrivateDeviceSize: null arg (x{n}) -> 0");
-        } else {
-            // SAFETY: non-null per the branch; the DDI declares it `_In_ CONST`,
-            // so the runtime guarantees a live, aligned struct for the call.
-            let a = unsafe { &*arg };
-            let negotiated = Ddi12Interface::from_pair(a.Interface, a.Version);
-            if negotiated.is_none() {
-                UMD12_REFUSALS.ddi12_version_mismatch.bump();
-            }
-            log_error!(
-                "CalcPrivateDeviceSize: Interface={:#010x} Version={:#010x} ({}) Flags={:#x} \
-                 (x{n}) -> 0 (S6-0 owns device12.rs)",
-                a.Interface,
-                a.Version,
-                negotiated.map_or("UNADVERTISED", Ddi12Interface::name),
-                a.Flags,
-            );
-        }
-    }
-    0
+    // SAFETY: forwarded unchanged; the DDI declares `arg` `_In_ CONST`, and
+    // `device12` null-checks it rather than trusting that.
+    let size = unsafe { device12::calc_private_device_size(arg) };
+    // `SIZE_T` is the WDK's spelling and is a distinct type from `usize` even
+    // though both are 64-bit here, so the PFN type needs the conversion.
+    size as ddi12::SIZE_T
 }
 
-/// `pfnCreateDevice` — **refuses at S5**, with the version validated first.
+/// `pfnCreateDevice` — the DDI slot; [`device12`] owns the eight steps.
 ///
-/// S6-0 + L1 own the body: a device cannot be created until the caps gauntlet
-/// is answered (`pfnGetCaps` above) and the three DDI tables are filled
-/// (`pfnFillDDITable` above), and both of those are other stages' work.
-///
-/// The version check is not decoration and is not scaffolding: it decides
-/// **which counter** ticks, and "did the runtime hand back the exact token we
-/// advertised" is the single question D12's one-token set exists to make
-/// answerable. `D12-G5` confirmed the `Interface`/`Version` split against WARP;
-/// this is the same check against Helios.
+/// ⚠ There is no table fill in it. D3D12 fills its tables at **adapter** scope
+/// through `pfnFillDDITable`, before any device exists — measured at S5, and the
+/// opposite of the D3D11 shape where `CreateDevice` writes the device-funcs
+/// table itself.
 unsafe extern "C" fn create_device(
     h_adapter: ddi12::D3D12DDI_HADAPTER,
     arg: *const ddi12::D3D12DDIARG_CREATEDEVICE_0109,
 ) -> ddi12::HRESULT {
     let _ = adapter_ok(h_adapter);
-
-    if arg.is_null() {
-        note_refusal(&UMD12_REFUSALS.create_device_bad_arg);
-        return E_INVALIDARG;
-    }
-    // SAFETY: non-null per the check above. The DDI declares it `_In_ CONST`, so
-    // the runtime guarantees a live, aligned `D3D12DDIARG_CREATEDEVICE_0109` for
-    // the duration of the call. ⛔ It is the `_0109` shape and not `_0003` only
-    // because D12 advertises a single token — a `_0003`-generation negotiation
-    // would make the two trailing fields (`pReserveRanges`, `NumReserveRanges`)
-    // a read past the end of the runtime's struct.
-    let a = unsafe { &*arg };
-
-    match Ddi12Interface::from_pair(a.Interface, a.Version) {
-        Some(negotiated) => {
-            log_error!(
-                "CreateDevice: {} hRTDevice={:p} pKTCallbacks={:p} Flags={:#x} \
-                 NumReserveRanges={} -> DXGI_ERROR_UNSUPPORTED (S6-0 owns the device)",
-                negotiated.name(),
-                a.hRTDevice.handle,
-                a.pKTCallbacks,
-                a.Flags,
-                a.NumReserveRanges,
-            );
-            note_refusal(&UMD12_REFUSALS.create_device_unimplemented);
-        }
-        None => {
-            // ⛔ The `else`-as-default landmine, refused instead of guessed.
-            // `ARCHITECTURE.md` §12 trap 2: treating an unknown interface as the
-            // largest known one is what bulk-filled 150 slots into a 101-slot
-            // table. Here it cannot happen, because there is no arm that fills
-            // anything for an unrecognised pair.
-            log_error!(
-                "CreateDevice: UNADVERTISED Interface={:#010x} Version={:#010x} -- refusing \
-                 rather than assuming a table shape",
-                a.Interface,
-                a.Version,
-            );
-            UMD12_REFUSALS.ddi12_version_mismatch.bump();
-            note_refusal(&UMD12_REFUSALS.create_device_unimplemented);
-        }
-    }
-    DXGI_ERROR_UNSUPPORTED
+    // SAFETY: forwarded unchanged; `device12::create_device` validates every
+    // runtime-supplied pointer before constructing anything, which is the
+    // ordering `DeviceUnderConstruction`'s docstring exists to record.
+    unsafe { device12::create_device(arg) }
 }
 
-/// `pfnDestroyDevice` — **counted**; no device can exist at S5.
+/// `pfnDestroyDevice` — the DDI slot; [`device12`] owns the teardown.
 ///
 /// ⚠ It lives on the **adapter** table (`d3d12umddi.h:13649`), not the device
 /// table. That is a shape difference from D3D11 and a classic place to leave a
-/// NULL (`DDI_REFERENCE.md` §1.3), which is why it is filled and counted rather
-/// than omitted: a NULL here is a crash inside the runtime, and a silent noop
-/// would hide the fact that a device the driver never made is being destroyed.
+/// NULL (`DDI_REFERENCE.md` §1.3).
 unsafe extern "C" fn destroy_device(h_device: ddi12::D3D12DDI_HDEVICE) {
-    // `create_device` refuses unconditionally, so the runtime should never reach
-    // here. Reaching it means either a device exists that this driver did not
-    // build, or the runtime tears down after a failed create — both worth a line.
-    UMD12_REFUSALS.destroy_device_unexpected.bump();
-    let n = UMD12_REFUSALS.destroy_device_unexpected.get();
-    if n <= LOG_BUDGET {
-        log_error!(
-            "DestroyDevice: hDrvDevice={:p} (x{n}) -- no device was ever created; counted only",
-            h_device.pDrvPrivate,
-        );
-    }
+    // SAFETY: the runtime passes back a handle this driver returned `S_OK` for
+    // from `create_device`, exactly once.
+    unsafe { device12::destroy_device(h_device) }
 }
 
 /// `pfnCloseAdapter` — **real**, and the set's readout point.

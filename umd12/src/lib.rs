@@ -84,6 +84,7 @@ mod adapter12;
 mod bridge12;
 mod caps12;
 mod ddi12;
+mod device12;
 mod forward12;
 mod knobs12;
 mod probe12;
@@ -216,15 +217,28 @@ pub(crate) struct Umd12Refusals {
     /// ⚠ A hit here is not cosmetic: that handle is the only way to obtain what
     /// `pfnSetCommandListDDITableCb` later needs, and it cannot be recovered.
     pub(crate) command_list_table_index_unbounded: RefusalCounter,
-    /// `pfnCalcPrivateDeviceSize` answered 0 because S6-0 owns `device12.rs`.
-    /// Expected 0 at S5, for the same reason as the row above.
-    pub(crate) calc_private_device_size_unimplemented: RefusalCounter,
-    /// `pfnCreateDevice` with a null `D3D12DDIARG_CREATEDEVICE_0109*`.
-    /// Expected 0.
+    /// `pfnCalcPrivateDeviceSize` with a null arg. Expected 0. ⚠ There is no
+    /// HRESULT to refuse with — the DDI returns `SIZE_T` — so this counter is
+    /// the slot's only channel.
+    pub(crate) calc_private_device_size_bad_arg: RefusalCounter,
+    /// `pfnCreateDevice` with a null arg, a null `hDrvDevice`, a null
+    /// `pKTCallbacks`, or a null `p12UMCallbacks`. Expected 0 — all four are
+    /// validated **before** anything is constructed, which is the ordering
+    /// `umd/src/adapter.rs`'s `DeviceUnderConstruction` docstring exists to
+    /// record: the two checks that used to run after construction leaked a
+    /// Vulkan device, a kernel context and a paging queue *per attempt*.
     pub(crate) create_device_bad_arg: RefusalCounter,
-    /// `pfnCreateDevice` refused because S6-0 owns the device. Expected 0 at S5
-    /// (caps refuses first).
-    pub(crate) create_device_unimplemented: RefusalCounter,
+    /// The vkd3d engine refused to create a device. The C++ side has already
+    /// logged the engine's HRESULT to `umd12-<pid>.log`; this is the countable
+    /// half.
+    pub(crate) create_device_engine_failed: RefusalCounter,
+    /// `pfnCreateDevice` was handed a non-empty `pReserveRanges` and **ignored
+    /// it**. The GPU-virtual-address ranges the runtime asks to be reserved at
+    /// device creation are L4's (resources, heaps, GPU VA); counting the request
+    /// makes "we ignored it" a number rather than a silence.
+    pub(crate) reserve_ranges_ignored: RefusalCounter,
+    /// `pfnDestroyDevice` on a null `hDrvDevice`. Expected 0.
+    pub(crate) destroy_device_bad_arg: RefusalCounter,
     /// The runtime handed back an `(Interface, Version)` pair that is **not** the
     /// single token `pfnGetSupportedVersions` advertised (D12). Expected 0, and
     /// a non-zero reading is a real finding: it would mean the one-token set is
@@ -252,9 +266,11 @@ pub(crate) static UMD12_REFUSALS: Umd12Refusals = Umd12Refusals {
     fill_ddi_table_truncated: RefusalCounter::new("FillDDITableTruncated"),
     fill_ddi_table_oversized: RefusalCounter::new("FillDDITableOversized"),
     command_list_table_index_unbounded: RefusalCounter::new("CommandListTableIndexUnbounded"),
-    calc_private_device_size_unimplemented: RefusalCounter::new("CalcPrivateDeviceSizeUnimplemented"),
+    calc_private_device_size_bad_arg: RefusalCounter::new("CalcPrivateDeviceSizeBadArg"),
     create_device_bad_arg: RefusalCounter::new("CreateDeviceBadArg"),
-    create_device_unimplemented: RefusalCounter::new("CreateDeviceUnimplemented"),
+    create_device_engine_failed: RefusalCounter::new("CreateDeviceEngineFailed"),
+    reserve_ranges_ignored: RefusalCounter::new("ReserveRangesIgnored"),
+    destroy_device_bad_arg: RefusalCounter::new("DestroyDeviceBadArg"),
     ddi12_version_mismatch: RefusalCounter::new("Ddi12VersionMismatch"),
     destroy_device_unexpected: RefusalCounter::new("DestroyDeviceUnexpected"),
 };
@@ -262,7 +278,7 @@ pub(crate) static UMD12_REFUSALS: Umd12Refusals = Umd12Refusals {
 /// The set, in the order the summary prints them. ⛔ This order is the evidence
 /// contract: `D3D12 DDI refusals:` lines from different builds get diffed, so
 /// new counters are **appended**, never inserted.
-static UMD12_REFUSAL_SET: [&RefusalCounter; 20] = [
+static UMD12_REFUSAL_SET: [&RefusalCounter; 22] = [
     &UMD12_REFUSALS.open_adapter12,
     &UMD12_REFUSALS.probe12_bad_arg,
     &UMD12_REFUSALS.probe12_create_failed,
@@ -278,9 +294,11 @@ static UMD12_REFUSAL_SET: [&RefusalCounter; 20] = [
     &UMD12_REFUSALS.fill_ddi_table_truncated,
     &UMD12_REFUSALS.fill_ddi_table_oversized,
     &UMD12_REFUSALS.command_list_table_index_unbounded,
-    &UMD12_REFUSALS.calc_private_device_size_unimplemented,
+    &UMD12_REFUSALS.calc_private_device_size_bad_arg,
     &UMD12_REFUSALS.create_device_bad_arg,
-    &UMD12_REFUSALS.create_device_unimplemented,
+    &UMD12_REFUSALS.create_device_engine_failed,
+    &UMD12_REFUSALS.reserve_ranges_ignored,
+    &UMD12_REFUSALS.destroy_device_bad_arg,
     &UMD12_REFUSALS.ddi12_version_mismatch,
     &UMD12_REFUSALS.destroy_device_unexpected,
 ];
