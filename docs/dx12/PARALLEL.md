@@ -37,15 +37,17 @@ functional groups almost never touch the same state.
 - `HKLM\SOFTWARE\Helios` knobs are **process-global to the machine**. One agent's A/B arm silently
   applies to another agent's measurement.
 - `tools/umd-check.ps1` hardcodes **one** mirror (`C:\Users\Rupansh\helios-vgpu`), **one**
-  `CARGO_TARGET_DIR` and **one** log path. Concurrent runs `robocopy /MIR` over each other's
-  sources mid-build.
+  `CARGO_TARGET_DIR` and **one** log path, and `robocopy /MIR`s destructively — so **concurrent
+  VM builds are not safe either.**
 
-⇒ **Authoring and compiling parallelise. Validating does not.** Every lane's inner loop is
-edit → `cargo check`, which needs only build isolation (§7, Lane 0). Deploy, gate and benchmark go
-through a **lease** (§6).
+⇒ **Authoring and compiling parallelise. Validating does not.**
+⭐ And they parallelise *without touching the VM at all*: every lane's inner loop is
+edit → `cargo check --target x86_64-pc-windows-msvc` **on the Linux host** (§7). That sidesteps the
+whole list above — no mirror, no adapter, no knobs, 7 seconds. Deploy, gate and benchmark go through
+a **lease** (§6), and there are far fewer of those than there are edits.
 
-⚠ This is why "N agents, N× throughput" is wrong here. Expect the fan-out to help most during S6's
-long authoring middle, and to collapse back to serial at every gate.
+⚠ "N agents, N× throughput" is still wrong. Expect the fan-out to help most through S6's long
+authoring middle, and to collapse back to serial at every gate.
 
 ## 3. The serial spine — none of this parallelises, and all of it comes first
 
@@ -131,6 +133,19 @@ single file would otherwise be the contention point that serialises the whole fa
 `umd/build.rs` already compiles `bridge_dxbc.cpp` and `bridge_icd_exports.cpp` as extra TUs off one
 `cc::Build`.
 
+⭐ **The DDI typedefs are `extern "C"`, not `extern "system"`.** Measured by fault-injecting a wrong
+signature against the host cross-check:
+
+```
+expected fn pointer `unsafe extern "C" fn(D3D12DDI_HCOMMANDLIST, u32, u32, u32, u32) -> ()`
+   found fn pointer `unsafe extern "system" fn(u8) -> u8`
+```
+
+On x86_64 Windows the two are the same ABI, so this is a *type* error and not a calling-convention
+bug — which is exactly why it would have been written wrong 214 times and caught by nothing until
+the first compile. ⛔ Declare every handler `unsafe extern "C"`. ⚠ Note this differs from the
+D3D11 side's exported entry points, which are `extern "system"`.
+
 ⛔ **`bridge_guard` stays singular.** Lanes use the shared `umd_common/bridge/bridge_guard.h`; no
 lane writes a second guard template, and no lane defines `HELIOS_BRIDGE_ENGINE_CATCH` (vkd3d throws
 nothing). `grep -rn 'static_assert(' umd/bridge umd12/bridge umd_common/bridge` must stay at **1**.
@@ -152,38 +167,48 @@ registry knob write, and `-Mode release`.
 ⚠ Benchmarks run in **session 1** via a cloned scheduled task. A `win_exec` launch lands in session
 0 and fakes a driver regression.
 
-## 7. ⛔ Lane 0 — the tooling prerequisite. Fan-out is unsafe until this lands.
+## 7. ⭐ Lanes compile on the LINUX HOST — no VM, no WDK, no contention
 
-`tools/umd-check.ps1` today hardcodes:
+**This is what makes the fan-out work, and it is already landed and proven.**
 
-```powershell
-$mirror = 'C:\Users\Rupansh\helios-vgpu'                 # :28   one mirror
-$env:CARGO_TARGET_DIR = "$mirror\$CrateDir\target"       # :83   one target dir
-$log = "Z:\tmp\$CrateDir-$Mode.log"                      # :80   one log
-robocopy "Z:\$sub" "$mirror\$sub" /MIR                   # :56   destructive
+```bash
+rustup target add x86_64-pc-windows-msvc          # once, on the Linux host
+cd umd12 && CARGO_TARGET_DIR=target/linux \
+    cargo check --target x86_64-pc-windows-msvc   # 7.4 s, full DDI surface
 ```
 
-Two concurrent agents `/MIR` over each other's sources mid-build, share one target dir, and
-overwrite one another's diagnostics. **The first symptom is a lane compiling code it did not
-write.**
+The obvious objection is *"the WDK is not on Linux"*, and it is correct — but **bindgen does not
+need to run there.** It runs on the VM, where the WDK is, and the host only needs the *generated
+Rust*. `umd12/build.rs` serves `umd12/bindgen/cached/d3d12umddi.rs` (5.4 MB, committed) into
+`OUT_DIR` when the build host is not Windows, so `ddi12.rs`'s `include!` resolves and all **1 904
+layout assertions plus every one of the 214 slot signatures** type-check on the host.
 
-**Required change** — add a `-Lane <name>` parameter deriving all four:
+⛔ **The cache never builds a shipping DLL.** On Windows the bindings are regenerated from
+`d3d12umddi.h` every time and the cache is only *compared* against; a mismatch emits
+`cargo:warning=… is STALE …`, so drift is loud rather than silent. The SDK header remains the single
+source of truth, and `PARALLEL.md` §10 still requires the integrator to re-check on the VM.
 
-| | single-agent (default, unchanged) | `-Lane l5` |
-|---|---|---|
-| source root | `Z:\` | `Z:\.lanes\l5\` (a git worktree) |
-| mirror | `C:\Users\Rupansh\helios-vgpu` | `C:\Users\Rupansh\helios-lane-l5` |
-| `CARGO_TARGET_DIR` | `<mirror>\<crate>\target` | `<mirror>\<crate>\target` |
-| log | `Z:\tmp\<crate>-<mode>.log` | `Z:\tmp\lanes\l5\<crate>-<mode>.log` |
+**What this buys, concretely:** eleven agents each get a **7-second compiler answer** on their own
+machine-free loop, instead of writing 214 handlers blind and discovering the errors in one avalanche
+at the end. On a transcription job against someone else's ABI, the compiler *is* the specification.
 
-⚠ Omitting `-Lane` must behave **exactly** as today; every existing recipe in `ROADMAP.md` and the
-gate scripts passes no such flag.
+**What it does NOT cover** — these are the final pass's job (§11):
 
-⚠ Disk: each lane mirror is a full `umd` + `umd12` + `umd_common` + `protocol` tree plus its own
-target dir. Budget for it, or cap concurrency.
+| covered on the host | only on the VM |
+|---|---|
+| every Rust type and DDI signature | the cxx bridge's **C++** compilation |
+| the 1 904 layout assertions | linking, and the vkd3d archive link set |
+| trait/borrow/lifetime errors | bindgen regeneration from the real header |
+| `clippy`, `rustfmt`, dead-code | anything that runs: G7…G11, Fire Strike, the desktop |
 
-Agents should run with `isolation: "worktree"` so each has its own checkout; the worktree path is
-what `-Lane` points at.
+⚠ **Refresh discipline.** When the SDK pin moves, regenerate on the VM and copy
+`$OUT_DIR/d3d12umddi.rs` over the cache in the same commit. Until then every host check is measuring
+a different ABI than the one being shipped — which is precisely the failure the `STALE` warning
+exists to make impossible to miss.
+
+⚠ Agents should still run with `isolation: "worktree"` so their edits do not collide in the source
+tree. They do **not** need a VM mirror, a `CARGO_TARGET_DIR` of their own on Windows, or `-Lane`
+plumbing in `umd-check.ps1` — that whole prerequisite dissolved.
 
 ## 8. What must NOT be parallelised
 
@@ -217,7 +242,49 @@ A lane is done when **all** of:
 6. It touched **no** file it does not own, and its diff against `tables12.rs`/`build.rs`/
    `device12.rs`/`knobs12.rs` is append-only.
 
-## 10. Integrator's checklist per merge
+## 10. ⭐ The final pass — a dedicated agent, with a checklist, not "someone compiles it"
+
+Host cross-checking (§7) removes the type errors before merge. What it cannot remove is everything
+that is not a Rust type. **One agent owns the final pass**, holds the VM lease for it, and runs it
+against **merged** code — never against a lane branch.
+
+**A. Static analysis — no VM needed, run it first because it is free**
+
+| check | why it is here |
+|---|---|
+| `cargo check --target x86_64-pc-windows-msvc` on the **merge**, not the lanes | two lanes can each compile and still conflict — a duplicate `install_*`, two fields named the same |
+| `cargo clippy --target x86_64-pc-windows-msvc -- -D warnings` | 214 hand-written handlers is exactly where `clippy::missing_safety_doc` and friends earn their keep |
+| every `unsafe` has a `// SAFETY:` | `CLAUDE.md` rule 4. Grep the diff, not the tree |
+| no `panic!` / `todo!` / `unimplemented!` / `.unwrap()` / `.expect()` on runtime data | a panic in any DDI is a **silent graphics deadlock**, and `panic = "abort"` makes it a dead compositor |
+| every refusal has a named counter and appears in its set's summary | `CLAUDE.md` rule 2. A counter nothing reads is not an instrument (T5) |
+| `grep -rn 'static_assert(' umd/bridge umd12/bridge umd_common/bridge` → **1** | `ead692e`; ⚠ with the paren — the bare word matches this document |
+| no `#[allow(...)]` on a hand-written line | generated code may be allowed; hand-written code may not. R908 is the precedent |
+| `git diff` on the four shared files is **append-only** | §5 |
+| ⛔ every `Slot<Boxed<S>>::get()` call site carries a **re-derived** D3D12 argument | `umd_common::slot` says it is established for D3D11 and NOT for D3D12 |
+| ⛔ slot-count and table-size claims re-derived from `DECISIONS.md` §4.1 | not from a group heading, not from a `grep -c` |
+
+**B. Compile / build analysis — VM, lease held**
+
+| check | why |
+|---|---|
+| `umd-check.ps1 -Mode check -Crate both` → 0 errors | the **C++** bridge TUs compile here and nowhere else |
+| `umd` warning count **unchanged** | a D3D12 lane that perturbed the D3D11 driver has broken the split |
+| no `… is STALE …` warning from `umd12/build.rs` | the committed bindings cache still matches the SDK header ⇒ every host check the lanes ran was against the shipping ABI |
+| `-Mode release -Crate both`, then `dumpbin /IMPORTS` | ⛔ **no `dxgi.dll`**, ever. `umd/build.rs:239-243` |
+| the link set is still `libhelios_d3d12_static.a` + `gdi32` | anything else appearing means a lane pulled in an object it should not have |
+| cold `cargo check` wall time and generated-file size, tracked | UNVERIFIED-2's numbers are the baseline; a sudden jump means an allowlist widened |
+
+**C. Runtime — VM, lease held, and only after A and B are clean**
+
+`D12-G7` → `G8` → the id-1000 cold boot → Fire Strike 3-run median for the **D3D11** parity check.
+⚠ Report what happened, including partial failures. A lane whose slots still hit the noop counters
+is **not done** (§9.2), and saying so is the whole value of this pass.
+
+⛔ **The final-pass agent does not fix what it finds.** It reports, and the owning lane fixes.
+An agent that both writes and audits its own 214 slots is the review-your-own-homework failure the
+adversarial-verification discipline exists to prevent.
+
+## 11. Integrator's checklist per merge
 
 - `grep -rn 'static_assert(' umd/bridge umd12/bridge umd_common/bridge` → **1**
 - `umd-check.ps1 -Mode check -Crate both` → 0 errors, and `umd`'s warning count **unchanged**

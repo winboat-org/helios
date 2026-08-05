@@ -47,3 +47,9 @@ $RECYCLE.BIN/
 # Local clean-tree comparison mirror
 /umd_clean/
 __pycache__/
+
+# umd12's host cross-check build (cargo check --target x86_64-pc-windows-msvc on
+# the Linux host, PARALLEL.md §7). The CACHED bindings under
+# umd12/bindgen/cached/ are deliberately COMMITTED and must not be ignored.
+/umd12/target/
+/umd_common/target/

@@ -154,16 +154,83 @@ fn generate_d3d12umddi_bindings() {
     println!("cargo:rerun-if-env-changed=HELIOS_MSVC_INCLUDE");
 }
 
+/// The committed copy of the generated bindings, used to TYPE-CHECK on a host
+/// that has no WDK.
+///
+/// ⭐ This is what lets `cargo check --target x86_64-pc-windows-msvc` run on the
+/// **Linux host**, which is the difference between eleven agents writing 214 DDI
+/// handlers blind and eleven agents writing them against the real signatures
+/// with the compiler answering (`PARALLEL.md` §7).
+///
+/// ⛔ **It is never used to build a shipping DLL.** On Windows the bindings are
+/// regenerated from `d3d12umddi.h` every time and this file is only *compared*
+/// against, so a stale cache is loud rather than silent. The SDK header stays
+/// the single source of truth.
+const CACHED_BINDINGS: &str = "bindgen/cached/d3d12umddi.rs";
+
+/// Refresh the cache from a freshly generated file, and say so.
+fn compare_or_refresh_cache(fresh: &Path) {
+    let cached = Path::new(CACHED_BINDINGS);
+    let fresh_text = std::fs::read_to_string(fresh).unwrap_or_default();
+    let cached_text = std::fs::read_to_string(cached).unwrap_or_default();
+    if fresh_text == cached_text {
+        return;
+    }
+    // ⚠ Loud, not fatal: a WDK/SDK update legitimately changes the output, and
+    // failing the Windows build would block the very machine that can fix it.
+    // But it MUST be noticed, because until the cache is refreshed every
+    // host-side `cargo check` is type-checking against a different ABI than the
+    // one being shipped.
+    println!(
+        "cargo:warning=helios_umd12: {CACHED_BINDINGS} is STALE ({} bytes cached vs {} generated). \
+         Host-side cross-checks are now against a different ABI than this build. Refresh it: \
+         copy $OUT_DIR/d3d12umddi.rs over it and commit.",
+        cached_text.len(),
+        fresh_text.len()
+    );
+}
+
 fn main() {
+    println!("cargo:rerun-if-changed={CACHED_BINDINGS}");
+
+    // ⚠ Two different questions, and conflating them is the bug this shape
+    // avoids. `TARGET` is what we are compiling FOR; `cfg!(windows)` here is
+    // what the BUILD SCRIPT is running ON. bindgen needs the WDK, which lives
+    // on the build host — so the SDK availability question is about the host,
+    // not the target.
     let target = env::var("TARGET").unwrap_or_default();
     if !target.contains("windows") {
-        // Windows-only, and this guard exists so the script does not go looking
-        // for the SDK on a non-Windows host. It is NOT a path to a working host
-        // build: `src/lib.rs`'s `#[cfg(not(windows))] compile_error!` reports
-        // that, and it keys off the same target this branch tests.
+        // Not even targeting Windows: nothing here is meaningful.
+        // `src/lib.rs`'s `#[cfg(not(windows))] compile_error!` reports that, and
+        // it keys off this same target.
         println!("cargo:warning=helios_umd12: skipping d3d12umddi bindgen on non-Windows target");
         return;
     }
 
-    generate_d3d12umddi_bindings();
+    if cfg!(windows) {
+        // The real path: regenerate from the SDK header. Ground truth.
+        generate_d3d12umddi_bindings();
+        let out = PathBuf::from(env::var("OUT_DIR").unwrap()).join("d3d12umddi.rs");
+        compare_or_refresh_cache(&out);
+        return;
+    }
+
+    // Cross-checking from a WDK-less host (the Linux side). Serve the cached
+    // generation so `ddi12.rs`'s `include!` resolves and the whole DDI surface
+    // type-checks. ⛔ `cargo check` only — this never links a DLL, and
+    // `PARALLEL.md` §10 requires the integrator to re-check on the VM.
+    let cached = Path::new(CACHED_BINDINGS);
+    if !cached.is_file() {
+        panic!(
+            "helios_umd12: cross-checking for {target} on a host with no WDK, and {CACHED_BINDINGS} \
+             is missing. Generate it on the VM (umd-check.ps1 -Crate umd12) and copy \
+             $OUT_DIR/d3d12umddi.rs there."
+        );
+    }
+    let out = PathBuf::from(env::var("OUT_DIR").unwrap()).join("d3d12umddi.rs");
+    std::fs::copy(cached, &out).expect("failed to stage cached d3d12umddi.rs");
+    println!(
+        "cargo:warning=helios_umd12: HOST CROSS-CHECK — using {CACHED_BINDINGS}, not the SDK \
+         header. Types are checked; nothing is linked and no ABI claim is made here."
+    );
 }

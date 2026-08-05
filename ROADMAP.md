@@ -3380,11 +3380,15 @@ silent on it:
   `docs/dx12/PARALLEL.md`:** 11 lanes with exclusive file ownership, an append-only
   protocol for the four shared files, and a lease on the VM. Two things gate the
   fan-out and are worth knowing before planning around it:
-  - ⛔ **Lane 0 is a tooling prerequisite.** `tools/umd-check.ps1` hardcodes one
-    mirror, one `CARGO_TARGET_DIR` and one log path, and `robocopy /MIR`s
-    destructively — **two agents cannot compile concurrently today**, and the first
-    symptom is a lane compiling code it did not write. It needs a `-Lane` parameter;
-    omitting it must behave exactly as today.
+  - ⭐ **Lanes compile on the LINUX HOST, so VM contention never arises.**
+    `cargo check --target x86_64-pc-windows-msvc` type-checks the whole 214-slot
+    surface in 7.4 s with no WDK: bindgen runs on the VM and `umd12/build.rs`
+    serves the committed `umd12/bindgen/cached/d3d12umddi.rs` into `OUT_DIR` on a
+    non-Windows host. ⛔ Never used for a shipping DLL — Windows regenerates from
+    the header every time and warns `… is STALE …` on drift. Proven by fault
+    injection, which also settled that the DDI typedefs are **`extern "C"`, not
+    `extern "system"`** — the same ABI, a different Rust type, and a mistake that
+    would otherwise have been made 214 times.
   - ⛔ **Authoring parallelises; validating does not.** There is one VM and one
     adapter. `win_install_umd` disables the PCI device, benchmarks are exclusive,
     and `HKLM\SOFTWARE\Helios` knobs are machine-global — one agent's A/B arm
