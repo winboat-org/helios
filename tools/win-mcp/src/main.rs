@@ -87,6 +87,17 @@ const DEFAULT_KMD_PACKAGE_DIR: &str =
 /// measurement of the wrong binary (41st/43rd-session directive).
 const DEFAULT_UMD_DLL: &str =
     "C:\\Users\\Rupansh\\helios-vgpu\\umd\\target\\release\\helios_umd.dll";
+/// The D3D12 UMD's build path — the value to pass as `umd12_dll` when you want
+/// it deployed.
+///
+/// ⛔ This is a SUGGESTED path, not a default: `win_install_umd` deploys the
+/// D3D12 UMD only when `umd12_dll` is passed explicitly. Deploying it rewrites
+/// `UserModeDriverName[3]`, a REG_MULTI_SZ dwm resolves at device start, so a
+/// routine D3D11 deploy must not be able to acquire a D3D12 path by accident.
+/// (`DECISIONS.md` D3; the real slot-3 wiring is stage S5 in
+/// `ARCHITECTURE.md` §11, which also lands the `UmdD3D12` kill switch.)
+const SUGGESTED_UMD12_DLL: &str =
+    "C:\\Users\\Rupansh\\helios-vgpu\\umd12\\target\\release\\helios_umd12.dll";
 
 /// Render one artifact path for the tool's echo line, flagging a non-default.
 fn artifact_line(label: &str, value: &str, default: &str) -> String {
@@ -347,6 +358,22 @@ struct WinInstallUmdArgs {
     /// in the transcript rather than an inherited script default.
     #[serde(default)]
     umd_dll: Option<String>,
+    /// The D3D12 UMD binary (`helios_umd12.dll`) to deploy alongside the D3D11
+    /// one, taking `UserModeDriverName` slot 3 (`DECISIONS.md` D3).
+    ///
+    /// ⛔ OMIT IT and no D3D12 UMD is deployed — the registry writes are then
+    /// bit-identical to a pre-D3D12 deploy. There is deliberately NO default,
+    /// because deploying it changes what dwm resolves at device start. Pass
+    /// `SUGGESTED_UMD12_DLL` (umd12\target\release\helios_umd12.dll) to opt in.
+    ///
+    /// Build it first: `win_cargo crate_dir:"umd12" args:["build","--release"]`,
+    /// or both UMDs at once via `tools\umd-check.ps1 -Mode release`.
+    ///
+    /// ⚠ ProgramData mode only. The DriverStore package does not carry
+    /// helios_umd12.dll until the INF change (stage S5), so a COLD BOOT will not
+    /// see it — the script warns about exactly this.
+    #[serde(default)]
+    umd12_dll: Option<String>,
     /// The KMD package dir the DriverStore/PackageUpgrade modes read. Defaults to
     /// `DEFAULT_KMD_PACKAGE_DIR`. Irrelevant to the default ProgramData mode, but
     /// passed and echoed anyway so the two install tools report the same pair.
@@ -558,7 +585,7 @@ impl WinHost {
     }
 
     #[tool(
-        description = "Sync the project to the local build mirror and run cargo (or cargo make) there. The Z:\\ share cannot host cargo/wdk build IO (OS error 87), so this robocopy-mirrors Z:\\ -> C:\\Users\\Rupansh\\helios-vgpu (excluding target/, all .git, and the vendored Mesa submodule at icd/mesa — Mesa is a meson/C ICD built separately via win_meson straight from the share, not through this mirror) and builds inside the mirror with LIBCLANG_PATH set for bindgen. Edit sources on the Linux/Z:\\ side — the mirror is re-synced on every call. crate_dir is relative to the project root (e.g. \"kmd_render\" or \"umd\"; the active Rust crates are kmd_render, umd, protocol and kmd_logic — \"kmd\" is the ARCHIVED System-class driver and \"icd\" is meson/C, built by win_meson); args is the cargo argv (e.g. [\"make\",\"--makefile\",\"Cargo.make.toml\"] or [\"build\"])."
+        description = "Sync the project to the local build mirror and run cargo (or cargo make) there. The Z:\\ share cannot host cargo/wdk build IO (OS error 87), so this robocopy-mirrors Z:\\ -> C:\\Users\\Rupansh\\helios-vgpu (excluding target/, all .git, and the vendored Mesa submodule at icd/mesa — Mesa is a meson/C ICD built separately via win_meson straight from the share, not through this mirror) and builds inside the mirror with LIBCLANG_PATH set for bindgen. Edit sources on the Linux/Z:\\ side — the mirror is re-synced on every call. crate_dir is relative to the project root (e.g. \"kmd_render\" or \"umd\"; the active Rust crates are kmd_render, umd, umd_common, umd12, protocol and kmd_logic — \"kmd\" is the ARCHIVED System-class driver and \"icd\" is meson/C, built by win_meson); args is the cargo argv (e.g. [\"make\",\"--makefile\",\"Cargo.make.toml\"] or [\"build\"]). THE TWO UMDs: \"umd\" is helios_umd.dll (D3D11, DXVK) and \"umd12\" is helios_umd12.dll (D3D12, vkd3d — currently a skeleton whose OpenAdapter12 refuses); both take \"umd_common\" as a path rlib, so it is never built on its own. To build BOTH with the rustc-only diagnostic filter, prefer `win_exec` on tools\\umd-check.ps1 -Mode release, which also avoids the ~115 clang warnings a raw umd build emits. vkd3d-proton-helios is NOT a cargo dependency and is EXCLUDED from this mirror: the UMD LoadLibrary's a separately-built helios_vkd3d.dll (DECISIONS.md D4), built on the Linux host by mingw cross, never by cargo."
     )]
     async fn win_cargo(&self, Parameters(a): Parameters<WinCargoArgs>) -> String {
         let mut env = HashMap::new();
@@ -573,7 +600,7 @@ impl WinHost {
         // excluding it keeps every kmd/probe build fast. Mesa is built separately,
         // straight from the share, via `win_meson` (no robocopy — validated).
         let command = format!(
-            "robocopy {PROJECT_DRIVE} {MIRROR_ROOT} /MIR /XJ /XD target .git \"{MESA_SRC}\" dxvk dxvk-research-only vkd3d-proton virtio-research-only-3d windows-driver-docs-research-only /NFL /NDL /NJH /NJS /NP /R:1 /W:1\n\
+            "robocopy {PROJECT_DRIVE} {MIRROR_ROOT} /MIR /XJ /XD target .git \"{MESA_SRC}\" dxvk dxvk-research-only vkd3d-proton vkd3d-proton-helios virtio-research-only-3d windows-driver-docs-research-only /NFL /NDL /NJH /NJS /NP /R:1 /W:1\n\
              $robocopyExit = $LASTEXITCODE\n\
              if ($robocopyExit -ge 8) {{ \"win_cargo: robocopy mirror sync failed (exit $robocopyExit)\"; exit $robocopyExit }}\n\
              Set-Location -LiteralPath '{MIRROR_ROOT}\\{}'\n\
@@ -776,28 +803,45 @@ impl WinHost {
     }
 
     #[tool(
-        description = "Install/hotplug the Helios UMD (helios_umd.dll) on win11 by running tools\\hotplug-helios-umd.ps1 via `powershell -NoProfile -ExecutionPolicy Bypass -File`. The -ExecutionPolicy Bypass is REQUIRED: the VM's machine ExecutionPolicy is Restricted, so invoking the .ps1 any other way silently no-ops (no output, no deploy). ARTIFACT PATHS ARE EXPLICIT: `umd_dll` (default umd\\target\\release\\helios_umd.dll — RELEASE, because debug is opt-level 1 with no LTO and silently invalidates every timing number) and `package_dir` are always passed to the script and ECHOED as the first output lines, marked NON-DEFAULT when overridden, so which binary shipped is a fact in the transcript instead of an inherited script default. Do not pass -UmdDll/-PackageDir through `args` — that is refused, since a duplicate named argument is a PowerShell binding error. Build the UMD first: `win_cargo crate_dir:\"umd\" args:[\"build\",\"--release\"]`. The script copies the build to C:\\ProgramData\\HeliosUmd, rewrites the display software key (UserModeDriverName), syncs the active DriverStore copy, verifies the destination SHA256 against the source, and prints final state. Pass script flags via `args`: [] = default ProgramData hotplug; [\"-PlanOnly\"] = dry run; [\"-KillUmdUsers\",\"-RestartDevice\",\"-NoProbe\"] = force existing UMD users off + an adapter restart so the new DLL loads immediately. NOTE: dxgkrnl caches the UMD path at DEVICE start, so without -RestartDevice (or a reboot) already-running processes keep the old DLL. See HELIOS_DRIVER_DEPLOYMENT.md."
+        description = "Install/hotplug the Helios UMD (helios_umd.dll) on win11 by running tools\\hotplug-helios-umd.ps1 via `powershell -NoProfile -ExecutionPolicy Bypass -File`. The -ExecutionPolicy Bypass is REQUIRED: the VM's machine ExecutionPolicy is Restricted, so invoking the .ps1 any other way silently no-ops (no output, no deploy). ARTIFACT PATHS ARE EXPLICIT: `umd_dll` (default umd\\target\\release\\helios_umd.dll — RELEASE, because debug is opt-level 1 with no LTO and silently invalidates every timing number) and `package_dir` are always passed to the script and ECHOED as the first output lines, marked NON-DEFAULT when overridden, so which binary shipped is a fact in the transcript instead of an inherited script default. Do not pass -UmdDll/-Umd12Dll/-PackageDir through `args` — that is refused, since a duplicate named argument is a PowerShell binding error. Build the UMD first: `win_cargo crate_dir:\"umd\" args:[\"build\",\"--release\"]`, or both UMDs at once with `win_exec` on tools\\umd-check.ps1 -Mode release. D3D12: pass `umd12_dll` (suggested umd12\\target\\release\\helios_umd12.dll) to ALSO deploy helios_umd12.dll and register it at UserModeDriverName slot 3, with InstalledDisplayDrivers corrected to the two-entry form helios_umd,helios_umd12 (DECISIONS.md D3 / §6.1). OMIT `umd12_dll` and no D3D12 UMD is deployed and the registry writes stay bit-identical to a pre-D3D12 deploy — there is deliberately no default, because deploying it changes what dwm resolves at device start. ProgramData mode only; the DriverStore package does not carry helios_umd12.dll until the INF change (ARCHITECTURE.md S5), so a COLD BOOT will not see it and the script says so. The script copies the build to C:\\ProgramData\\HeliosUmd, rewrites the display software key (UserModeDriverName), syncs the active DriverStore copy, verifies the destination SHA256 against the source, and prints final state. Pass script flags via `args`: [] = default ProgramData hotplug; [\"-PlanOnly\"] = dry run; [\"-KillUmdUsers\",\"-RestartDevice\",\"-NoProbe\"] = force existing UMD users off + an adapter restart so the new DLL loads immediately. NOTE: dxgkrnl caches the UMD path at DEVICE start, so without -RestartDevice (or a reboot) already-running processes keep the old DLL. See HELIOS_DRIVER_DEPLOYMENT.md."
     )]
     async fn win_install_umd(&self, Parameters(a): Parameters<WinInstallUmdArgs>) -> String {
         let umd_dll = a.umd_dll.as_deref().unwrap_or(DEFAULT_UMD_DLL);
         let package_dir = a.package_dir.as_deref().unwrap_or(DEFAULT_KMD_PACKAGE_DIR);
+        // No default for the D3D12 UMD, by design — see `SUGGESTED_UMD12_DLL`.
+        let umd12_dll = a.umd12_dll.as_deref();
         // The artifacts are named in the OUTPUT, not just in the command line, so
         // "which UMD did that deploy ship?" is answerable from the transcript.
+        // The D3D12 line is emitted either way, so "was D3D12 deployed?" is a
+        // fact in the transcript rather than an absence to be inferred.
         let header = format!(
-            "{}{}",
+            "{}{}{}",
             artifact_line("UMD  ", umd_dll, DEFAULT_UMD_DLL),
+            match umd12_dll {
+                Some(p) => artifact_line("UMD12", p, SUGGESTED_UMD12_DLL),
+                None => "UMD12: (not deployed — pass `umd12_dll` to register UserModeDriverName[3])\n"
+                    .to_string(),
+            },
             artifact_line("pkg  ", package_dir, DEFAULT_KMD_PACKAGE_DIR),
         );
-        if a.args
-            .iter()
-            .any(|f| f.eq_ignore_ascii_case("-UmdDll") || f.eq_ignore_ascii_case("-PackageDir"))
-        {
+        if a.args.iter().any(|f| {
+            f.eq_ignore_ascii_case("-UmdDll")
+                || f.eq_ignore_ascii_case("-PackageDir")
+                || f.eq_ignore_ascii_case("-Umd12Dll")
+        }) {
             return format!(
-                "{header}\nwin_install_umd: REFUSED — -UmdDll / -PackageDir passed through \
-                 `args` would bind twice against the explicit ones. Use the `umd_dll` / \
-                 `package_dir` fields instead."
+                "{header}\nwin_install_umd: REFUSED — -UmdDll / -Umd12Dll / -PackageDir passed \
+                 through `args` would bind twice against the explicit ones. Use the `umd_dll` / \
+                 `umd12_dll` / `package_dir` fields instead."
             );
         }
+        // Only pass -Umd12Dll when asked: the script treats an empty string as
+        // "not deployed", but not passing it at all keeps the two paths textually
+        // distinct in the transcript.
+        let umd12_arg = match umd12_dll {
+            Some(p) => format!(" -Umd12Dll '{p}'"),
+            None => String::new(),
+        };
         let extra = a.args.join(" ");
         // Nested `powershell -ExecutionPolicy Bypass -File` — REQUIRED because the
         // machine ExecutionPolicy is Restricted, so a bare `& script.ps1` (which is
@@ -807,7 +851,7 @@ impl WinHost {
         // unlike same-process Write-Host which goes to an uncaptured host stream.
         let command = format!(
             "& powershell -NoProfile -ExecutionPolicy Bypass -File '{PROJECT_DRIVE}tools\\hotplug-helios-umd.ps1' \
-             -UmdDll '{umd_dll}' -PackageDir '{package_dir}' {extra}"
+             -UmdDll '{umd_dll}'{umd12_arg} -PackageDir '{package_dir}' {extra}"
         );
         match run_ssh(
             &command,
@@ -840,7 +884,7 @@ impl WinHost {
         // Same mirror-then-build flow as win_cargo (see its comments) with the
         // kmd_render package makefile.
         let command = format!(
-            "robocopy {PROJECT_DRIVE} {MIRROR_ROOT} /MIR /XJ /XD target .git \"{MESA_SRC}\" dxvk dxvk-research-only vkd3d-proton virtio-research-only-3d windows-driver-docs-research-only /NFL /NDL /NJH /NJS /NP /R:1 /W:1\n\
+            "robocopy {PROJECT_DRIVE} {MIRROR_ROOT} /MIR /XJ /XD target .git \"{MESA_SRC}\" dxvk dxvk-research-only vkd3d-proton vkd3d-proton-helios virtio-research-only-3d windows-driver-docs-research-only /NFL /NDL /NJH /NJS /NP /R:1 /W:1\n\
              $robocopyExit = $LASTEXITCODE\n\
              if ($robocopyExit -ge 8) {{ \"win_build_kmd: robocopy mirror sync failed (exit $robocopyExit)\"; exit $robocopyExit }}\n\
              Set-Location -LiteralPath '{MIRROR_ROOT}\\kmd_render'\n\
