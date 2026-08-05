@@ -255,6 +255,31 @@ Three reasons, in order:
    `umd/build.rs:240-243` states this rule for the D3D11 side and the D3D12 side inherits it
    verbatim, with an added hazard: a UMD that loads dxgi during device creation risks re-entering
    adapter enumeration that loads the UMD. The new exports exist precisely to bypass that path.
+
+   ⛔⛔ **MEASURED 2026-08-05: the built `helios_vkd3d.dll` DOES NOT satisfy this, and the export
+   alone cannot make it.** `objdump -p` on
+   `tmp/dx12/build/vkd3d-win64/libs/d3d12core/helios_vkd3d.dll` shows, under *The Import Tables*
+   (not the delay-import directory, which is empty):
+
+   ```
+   DLL Name: dxgi.dll
+   vma:     Ordinal  Hint  Member-Name  Bound-To
+   005e6898  <none>  0004  CreateDXGIFactory1
+   ```
+
+   **It is a normal static import.** So `LoadLibrary("helios_vkd3d.dll")` makes the loader map
+   `dxgi.dll` into the process and bind `CreateDXGIFactory1` **before a single line of Helios code
+   runs**, whether or not `helios_vkd3d_create_device` ever calls it. Bypassing the *call* was never
+   enough — the object carrying it (`libs/d3d12core/main.c`) is still linked into the target, and an
+   import is resolved at load, not at call.
+
+   ⇒ **Reason 1 is currently ASPIRATIONAL, not achieved.** Two candidate fixes, and the choice is
+   P3's: (a) build a `helios_vkd3d` target that **excludes `libs/d3d12core/main.c`** so the import is
+   never generated — the same object-exclusion the static fallback below already specifies, applied
+   to the DLL arm; or (b) accept the import and prove the hazard is not live, i.e. that dxgi being
+   loaded (as opposed to *called*) during `pfnCreateDevice` cannot re-enter adapter enumeration.
+   ⚠ (b) is a claim about the loader and the D3D12 runtime together and would need a measurement,
+   not an argument. **New question: `GATES.md` §7.28.**
 2. ~~**Licence.**~~ ⛔ **NOT A CONSTRAINT — owner directive, 2026-08-05: "I don't care about UMD
    License."** Recorded so it is not re-litigated. For the record, the fact is that vkd3d-proton is
    **LGPL-2.1-or-later** (`vkd3d-proton-helios/COPYING`) while DXVK is zlib, so static-linking
@@ -267,12 +292,42 @@ Three reasons, in order:
    SPIRV-Headers, and whether their *defined external* symbol sets intersect is unverified
    (`research/R4.md` UNVERIFIED-2). Separate modules make the question moot.
 
+4. ⭐ **THE ACTUAL BLOCKER, added 2026-08-05 — the two sides do not share a C++ ABI.** This reason
+   was missing from D4 and is stronger than either of the two above, because unlike them it is not
+   satisfiable by rearranging objects.
+
+   `helios_vkd3d.dll` and everything under it is built by **mingw-w64 gcc**, cross-compiled from the
+   Linux host (`ARCHITECTURE.md` §11 S0, and the binary itself carries
+   `/build/mingw-w64-crt/src/mingw-w64-v14.0.0/…` strings). Its C++ archives use **Itanium**
+   mangling: `libdxil-spirv.a` has **1 947** `_Z…` external defined symbols and **0** MSVC-style
+   `?…@@` ones. `helios_umd.dll` / `helios_umd12.dll` are **MSVC ABI** — Rust's
+   `x86_64-pc-windows-msvc` plus clang-cl for the DXVK shim, and `umd/build.rs` states the coherence
+   rule outright: *"DXVK, the cxx shim, and the Rust crate must all use the MSVC C++ ABI with the
+   dynamic CRT (`/MD`)."*
+
+   Itanium-mangled C++ archives cannot be statically linked into an MSVC-ABI module: different name
+   mangling, different class layout and vtable shape, different exception model, different CRT.
+   **A DLL boundary is what makes the mismatch irrelevant**, because the two Helios exports are
+   `extern "C"` and C ABI is common ground.
+
+   ⇒ **Static linking is not a smaller variant of the current design; it is a second toolchain arm.**
+   It requires rebuilding all seven repositories that link into `helios_vkd3d.dll` under
+   clang-cl/MSVC. That is *possible* — upstream ships a VS2022 CI job (§6.1) — but it is a port, and
+   it must be costed as one, not assumed.
+
+⚠ **Reason 3 does not, on its own, argue against static linking — D3 already settles it.** Two
+SPIR-V compilers in one DLL is a hazard for a *single*-DLL design. Under D3 there are two DLLs and
+DXVK is not in `umd12` at all, so statically linking vkd3d into `helios_umd12.dll` would still put
+exactly one SPIR-V compiler in each module. Keep reason 3 as the reason **D3** is right; do not cite
+it as the reason **D4** is right.
+
 *Fallback, if the export approach fails:* static-link, as `research/R4.md` §6.4 specifies — a
 `helios_d3d12_static` meson target that excludes `libs/d3d12core/main.c` so the `CreateDXGIFactory1`
 object is never pulled out of the archive, exactly as `umd/build.rs:240-243` documents for DXVK.
-Reason 1 still has to be satisfied that way; reason 3 (two SPIR-V compilers in one DLL) becomes live
-and must be settled first — `llvm-nm --defined-only --extern-only` over both archive sets, diffing
-the symbol sets (`research/R4.md` UNVERIFIED-2).
+⛔ **But price reason 4 first:** the fallback is only reachable after vkd3d and its six nested
+dependencies build under MSVC, and `research/R4.md` UNVERIFIED-2's symbol-set diff
+(`llvm-nm --defined-only --extern-only` over both archive sets) only becomes meaningful in a
+hypothetical build that puts both engines in one module — which D3 says never happens.
 
 **Decision D5 — the KMD is not on the critical path.** For Phase 0 the KMD work list is **empty**;
 for the DDI arm it is three items, none required for the first triangle:
