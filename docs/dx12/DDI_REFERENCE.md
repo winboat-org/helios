@@ -1364,15 +1364,44 @@ Corroborated by MS Learn for the callback itself:
 
 and by the runtime validating what the *driver* wrote into `D3DDDICB_SUBMITCOMMAND` (§6.4).
 
-⚠ **UNVERIFIED as a direct statement in any header or doc**: that a D3D12 UMD *must* use
-`pfnSubmitCommandCb` rather than `pfnRenderCb`. Both appear in `D3D12Core.dll`'s validation strings
-(strings:13-18 name `D3DDDICB_RENDER` *and* `D3DDDICB_SUBMITCOMMAND`), so both paths are apparently
-live — and both are reachable through `pKTCallbacks`. Helios' D3D11 present path already drives
-`pfnRenderCb` (`umd/src/forward/present.rs:795`), which is exactly why `DECISIONS.md` P-C's
-identity channel transfers with **no KMD change** (§13).
-Settling experiment: §15's spy, plus an ETW `Microsoft-Windows-DxgKrnl` all-keywords slice of a
-WARP D3D12 run — `DmaPacket` / `QueuePacket` events name the submission path (the same recipe
-ROADMAP.md uses for the present-queue stall).
+✅ **PARTLY SETTLED 2026-08-05 — there IS a direct statement in a Microsoft doc, and it names
+`SubmitCommandCB`.** `ResourceHeaps.md:1678` (DirectX-Specs @ `2bd58ca5`, § *"SubmitCommandCB cannot
+pass more than 8 handles in WrittenPrimaries"*), verbatim:
+
+> The driver must call `SubmitCommandCB` during the call to `pfnExecuteCommandLists` from the same
+> thread that entered the DDI. The driver must only pass DXGK context handles that were created during
+> the command queue creation.
+
+`CPUEfficiency.md` corroborates the timing independently — the driver must call the submission callback
+*inside* the `ExecuteCommandLists` DDI and may not defer it — though that document predates WDDM 2.0
+and never names which callback it means (it says "a command buffer submission callback", once).
+
+**Three obligations this adds, none of which were written down here before:**
+
+1. **Same thread.** `SubmitCommandCB` must be called on the thread that entered
+   `pfnExecuteCommandLists`. The D3D11.3 functional spec states the underlying reason —
+   *"only a single thread can be working against a HCONTEXT at a time"*
+   (`archive/D3D11_3_FunctionalSpec.htm:7141`) — so a forwarder must **not** hand submission to
+   vkd3d's internal submission thread and call the callback from there.
+2. **Context provenance.** Only DXGK context handles minted during **command-queue creation** may be
+   passed. This pins §9.1's per-queue `{ID3D12CommandQueue, WDDM hContext, …}` shadow record as
+   mandatory, not merely convenient.
+3. **`WrittenPrimaries` ≤ 8**, and *"The driver also cannot merge command lists, such that more than 8
+   `WrittenPrimaries` handles would be passed"* (`:1680`). The runtime normally fills this field on the
+   driver's behalf; a driver that creates its own primaries must pass them and the callback **fails**
+   above eight.
+
+⛔ **What it does NOT settle, and do not overread it:** the sentence mandates that `SubmitCommandCB` be
+called during ECL. It does **not** forbid `pfnRenderCb`, and both still appear in `D3D12Core.dll`'s
+validation strings (strings:13-18 name `D3DDDICB_RENDER` *and* `D3DDDICB_SUBMITCOMMAND`). So
+`DECISIONS.md` P-C's plan — carrying the per-present identity on a `pfnRenderCb` Render command around
+`pfnPresent`, as `umd/src/forward/present.rs:795` already does for D3D11 — **stands unchanged**, and
+its `D12-G8` settling experiment is still required.
+
+Residual settling experiment, unchanged: an ETW `Microsoft-Windows-DxgKrnl` all-keywords slice of a
+D3D12 run — `DmaPacket` / `QueuePacket` events name the submission path (the ROADMAP.md recipe).
+⚠ The WARP spy **cannot** contribute: WARP is a software rasterizer and called none of the
+`pKTCallbacks` kernel thunks in any `D12-G5` run.
 
 ### 8.3 What Helios already has that makes an empty submit honest
 
@@ -1603,6 +1632,47 @@ non-zero handle. Do not assume the C++ compiler picks the same convention on bot
 
 **Risk: LOW-MEDIUM.**
 
+#### 9.6.1 ⛔ A second ABI hazard, and this one is silent: the heap flags do not mean the same thing
+
+The DDI and API flag enums **collide on value `0x1` with different meanings**:
+
+```c
+// d3d12umddi.h:819-823                        // d3d12.h:3979-3980
+D3D12DDI_DESCRIPTOR_HEAP_FLAG_NONE           = 0x0;   D3D12_DESCRIPTOR_HEAP_FLAG_NONE           = 0;
+D3D12DDI_DESCRIPTOR_HEAP_FLAG_CPU_VISIBLE    = 0x1;   D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE = 0x1;
+D3D12DDI_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE = 0x2;   // (no third value)
+```
+
+⛔ **Forwarding `pArgs->Flags` straight into `ID3D12Device::CreateDescriptorHeap` is a bug that
+produces the wrong heap with no error**: a DDI `CPU_VISIBLE` heap (`0x1`) becomes an API
+**shader-visible** heap, and a DDI `SHADER_VISIBLE` heap (`0x2`) becomes a flag value the API does not
+define at all. The bridge must **translate**, not pass through. `D3D12DDIARG_CREATE_DESCRIPTOR_HEAP_0001`
+(umddi:826-832) types the member as `D3D12DDI_DESCRIPTOR_HEAP_FLAGS`, so the compiler will not catch it.
+
+*(`CPU_VISIBLE` is a DDI-only concept: the API deleted the flag but the DDI kept it. `ResourceBinding.md`
+still documents shader-visible as `0x1`, which is the API value — one more instance of `SPECS.md` §6
+trap 1, a spec's DDI block not matching the shipping header.)*
+
+**Three more descriptor-heap facts the corpus supplies, each checkable in one line:**
+
+- **Every descriptor heap must have a non-NULL GPU handle at the DDI, including non-shader-visible
+  ones.** The API rule that `GetGPUDescriptorHandleForHeapStart` returns NULL for a non-shader-visible
+  heap is an API-layer rule and does **not** carry down to the driver.
+- **The runtime is permitted to apply a "cheap scale/shift" to descriptor handles** crossing between
+  the application and the driver (`ResourceBinding.md:4397-4401`, restated for the copy path at
+  `:4827-4830`). So a handle observed at the DDI is in the **driver's** space, and the driver must never
+  assume the app sees the same numeric value. This does **not** disturb the forwarding plan — returning
+  vkd3d's own handles and stride verbatim stays correct, because the driver's space *is* vkd3d's space.
+- **Two hardware-invariant budgets** bind the driver: **2048** samplers in any shader-visible sampler
+  heap, and **2032** unique static samplers across all root signatures alive on the device at once.
+
+⚠ **And one floor that is uncomfortably tight on this substrate.** `VulkanOn12.md:1122` requires new
+drivers to report `MaxSamplerDescriptorHeapSize >= 4000`, mandatory at DDI 0102+ and therefore at
+Helios' negotiated 0110. The host GPU's `VkPhysicalDeviceLimits::maxSamplerAllocationCount` is
+**exactly 4000** (`docs/reference/host-vulkan-profile-rtx-pro-6000-blackwell.json:882`) — the mandated
+floor consumes the entire substrate budget with zero headroom, *if* vkd3d allocates one `VkSampler` per
+descriptor. Whether it dedupes is **UNVERIFIED**; see `GATES.md` §7.
+
 ### 9.7 Resources, heaps, placed/reserved, GPU virtual addresses
 
 Creation is the single fused DDI of §7.3(1). The resource args, verbatim (umddi:13413-13436):
@@ -1698,6 +1768,25 @@ placement: `D3D12DDIARG_CREATEDEVICE_0109.pReserveRanges / NumReserveRanges` (um
 `D3D12DDI_RECREATE_AT_TIER` + `CreateAtVirtualAddress` (umddi:13397-13435) — but
 `D3D12DDI_RECREATE_AT_TIER_NOT_SUPPORTED = 0` is a legal answer and is what Helios should report:
 
+⭐ **And on this build that hook cannot fire at all — for a stronger reason than the tier answer.**
+`RecreateAtGpuva-public.md:42` (DirectX-Specs @ `2bd58ca5`) states:
+
+> **Note: While the DDI rev is on 109, RecreateAt functionality is gated behind DDI 0111. **
+
+`D3D12DDI_BUILD_VERSION_0111` and `D3D12DDI_SUPPORTED_0111` are **absent from SDK 10.0.26100.0** (0
+hits each; the header stops at `_0110`, which is what `D12-G5` negotiated). So the runtime will not use
+`CreateAtVirtualAddress` or `pReserveRanges` on this Windows build **whatever tier the driver reports**
+— the binding reason is the DDI version, not Helios' `NOT_SUPPORTED` answer. Helios should still report
+`NOT_SUPPORTED`, and should additionally treat a non-zero `CreateAtVirtualAddress` or `NumReserveRanges`
+as a **named refusal counter** rather than silently ignoring the fields, because arrival would mean the
+build assumption is wrong (CLAUDE.md rule 2).
+
+⚠ **This does not settle §15.1 #10** — see the verdict there. `RecreateAtGpuva-public.md` is the closest
+the corpus comes and it describes **no provenance check anywhere**: the runtime *reads* VAs back out of
+already-created driver objects (`ID3D12PageableTools::GetAllocation`) and passes recorded ranges through
+*"not processed in any way … depending on driver behavior during record"* (`:185`). That is the
+direction the BDA plan bets on, but it is prose about a gated path, not a measurement.
+
 ```c
 typedef enum D3D12DDI_RECREATE_AT_TIER
 {
@@ -1790,6 +1879,33 @@ and **there is no root-signature version 1.0 at the DDI** (umddi:3743-3747):
 typedef enum D3D12DDI_ROOT_SIGNATURE_VERSION { D3D12DDI_ROOT_SIGNATURE_VERSION_1_1 = 0x2,
                                                D3D12DDI_ROOT_SIGNATURE_VERSION_1_2 = 0x3, } …;
 ```
+
+✅ **Confirmed independently, and the *reason* there is no 1.0 is now documented.** `ResourceBinding.md`
+(DirectX-Specs @ `2bd58ca5`) states that **the runtime up-converts version 1.0 root signatures to 1.1
+before the driver sees them**. So a 1.0 root signature from an application is never delivered as 1.0,
+and `helios_umd12` needs exactly **one** parse path over the `D3D12DDI_ROOT_SIGNATURE_0100` tree — never
+a serialized blob, never a 1.0 arm. ⚠ The same spec contains a sentence claiming a *"serialized
+version"* arrives and that the DDK ships deserializer source: that is **dead text**, contradicted by the
+spec's own DDI struct and by the `D12-G5` measurement. The measurement wins.
+
+**Three constraints on the H3 re-serializer that nothing here recorded before:**
+
+1. **Defaults are already applied.** For descriptor-range flags and root-descriptor flags the runtime
+   fills in the documented API defaults before the driver sees them, so the driver **cannot distinguish
+   "app asked for `DATA_VOLATILE`" from "app said nothing and got the default"**. A re-serializer must
+   therefore emit the flags it is given verbatim and must not try to reconstruct app intent.
+2. **`NumDescriptors == -1` means an unbounded range**, legal only as the **last** entry in a table. As
+   an unsigned count that is `0xFFFFFFFF`, so any range-size arithmetic overflows — treat it as a
+   sentinel *before* doing arithmetic, not after.
+3. ⚠ **A driver must accept root signatures larger than the 64-DWORD API limit — up to 128 DWORDs** —
+   because the OS injects its own root parameters for shader instrumentation (in reserved register
+   spaces `0xfffffff0`-`0xffffffff`) and deliberately does **not** tell the driver which are which. A
+   re-serializer that assumes the API limit will reject an OS-instrumented signature.
+
+⚠ **`D3D12DDI_ROOT_CONSTANTS` is not field-order-compatible with the API's `D3D12_ROOT_CONSTANTS`**:
+the DDI puts `ShaderRegister` and `RegisterSpace` **before** `Num32BitValues`; the API puts
+`Num32BitValues` first. Same three `UINT`s, different order — a `memcpy` or a struct-cast silently
+transposes them.
 
 At `_0100` the union has exactly one arm, `pRootSignature_1_2` — **the driver is handed
 1.2-shaped root signatures only**; the runtime up-converts 1.0 and 1.1. (⚠ Still switch on
@@ -1904,6 +2020,63 @@ Both map 1:1 onto `ID3D12GraphicsCommandList::ResourceBarrier` and
 ⛔ **Report `EnhancedBarriersSupported = FALSE` until the enhanced path is really implemented.**
 Silently treating enhanced barriers as legacy loses synchronisation, which on this stack is a
 venus-side write/read race with no guest-visible error. **Risk: LOW** if that rule is kept.
+
+#### 9.10.1 ⭐ The cap is a table-shape decision, not just a feature flag (2026-08-05)
+
+`D3D12EnhancedBarriers.md:539` (DirectX-Specs @ `2bd58ca5`, § *"Compatibility with legacy
+D3D12_RESOURCE_STATES"*), verbatim:
+
+> The D3D12 runtime internally translates all `ResourceBarrier` calls to equivalent Enhanced Barriers at the driver interface.  Legacy barrier DDI's are never invoked on a driver supporting enhanced barriers.
+
+⇒ **The two barrier generations are mutually exclusive at the driver, not additive.** This explains the
+`D12-G5` measurement (the runtime calls `pfnBarrier`, `cl[68]`, once the driver reports
+`EnhancedBarriersSupported = 1`) as a *rule* rather than an observation of one workload:
+
+| answer | what Helios implements | what the other slot becomes |
+|---|---|---|
+| `EnhancedBarriersSupported = 1` | `pfnBarrier` (`cl[68]`) only | `pfnResourceBarrier` is **dead code** — point it at a counting refusal, not a second lowering path |
+| `EnhancedBarriersSupported = 0` | `pfnResourceBarrier` only | `pfnBarrier` never called |
+
+**Helios implements ONE barrier path either way.** That removes the main cost objection to the enhanced
+arm, which is the better target for a vkd3d forwarder because `D3D12_BARRIER_LAYOUT` maps far closer to
+`VkImageLayout` than `D3D12_RESOURCE_STATES` does. ⛔ The rule above still stands until it is real: the
+cap must not be flipped to 1 before `pfnBarrier` is implemented, because at 1 there is no legacy
+fallback left to catch the gap.
+
+⚠ **Enhanced barriers do NOT remove promotion/decay from the driver.** The runtime re-encodes the
+legacy model's ambiguity as **DDI-only layout values** that never appear in the public API:
+
+```c
+D3D12DDI_BARRIER_LAYOUT_LEGACY_COPY_SOURCE = 0x80000000,   // umddi:10632-10635, "Special layouts start here"
+D3D12DDI_BARRIER_LAYOUT_LEGACY_COPY_DEST,
+D3D12DDI_BARRIER_LAYOUT_LEGACY_SHADER_RESOURCE,
+D3D12DDI_BARRIER_LAYOUT_LEGACY_PIXEL_SHADER_RESOURCE,
+D3D12DDI_BARRIER_LAYOUT_LEGACY_DIRECT_QUEUE_GENERIC_READ_COMPUTE_QUEUE_ACCESSIBLE,  // umddi:10630
+```
+
+The spec calls these *"internal-only and not exposed in public headers"* (`:570`) — and they are indeed
+absent from `d3d12.h` while present in `d3d12umddi.h`. **A forwarder must translate them before calling
+vkd3d**, which cannot accept a value its own API header does not define. Cross-checking the two shipped
+headers (`d3d12umddi.h:10595-10636` vs `d3d12.h:22121-22156`), DDI↔API layout translation is the
+**identity for 0..30 and for `UNDEFINED = 0xffffffff`**, with exactly these five DDI-only values needing
+a mapping.
+
+⚠ **The DDI buffer-barrier struct has no `Offset` and no `Size`** — the API's two `UINT64` members are
+stripped by the runtime before the driver sees them, so a buffer barrier is always whole-resource at
+the DDI.
+
+⛔ **The spec's published DDI structs do not match SDK 26100 and must not be transcribed.** Its
+`D3D12DDI_RANGED_BARRIER_0094` carries a 24-byte `D3D12DDI_BARRIER_SUBRESOURCE_RANGE_0088 Subresources`
+where the shipping header (umddi:11277) has a 4-byte `UINT Subresource`. Take shapes from the header.
+
+⚠ **The entire *Fence Barriers* half of that spec is preview-only** — *"The Fence Barriers preview
+requires developer mode."*, it needs `D3D12EnableExperimentalFeatures`, and every symbol it names is
+absent from `d3d12umddi.h`. Nothing shipping does it; do not plan for it (§10).
+
+⚠ **One obligation the cap carries that is easy to miss:** a texture barrier with `FLAG_DISCARD` on an
+`UNDEFINED`-to-compressible layout transition makes compression-metadata initialisation a **driver**
+obligation. `D3D12DDI_TEXTURE_BARRIER_FLAG_DISCARD` and the API flag are both `0x1`, so the bit
+forwards raw — but a forwarder must satisfy the obligation, not merely pass the flag.
 
 ### 9.11 Multi-queue COPY / COMPUTE — FORWARDABLE, degraded
 
@@ -2357,6 +2530,32 @@ pipeline-mask logic into `helios_umd12`.
 ⛔ **Also: the retired R908 body reported `D3D12DDI_3DPIPELINELEVEL_1_0_CORE`** — the *compute-only*
 level. Do not resurrect that value by copy-paste.
 
+⭐⭐ **The failure mode of not implementing cap 1074 is SILENT, and it costs FL 12_2.**
+`D3D12_FeatureLevel12_2.md:116-117` (DirectX-Specs @ `2bd58ca5`, § *"DDI"* → *"Remark"*), verbatim:
+
+> * Versions of Direct3D built into the operating system at or before Manganese (20H2) use 3DPIPELINESUPPORT.
+> * Versions of Direct3D built into Iron operating system, or organized as a re-distributable use 3DPIPELINESUPPORT1, and fall back to 3DPIPELINESUPPORT if it fails.
+
+So the modern runtime asks `D3D12DDICAPS_TYPE_0081_3DPIPELINESUPPORT1` (**1074**, umddi:134) **first**,
+and on failure falls back to `D3D12DDICAPS_TYPE_3DPIPELINESUPPORT` (**1007**, umddi:103) — which the
+header forbids from answering above `12_1`. ⇒ **A `helios_umd12` that does not handle 1074 is capped at
+FL 12_1 with no error reported anywhere**, because a failing HRESULT on a caps query is tolerated
+(§15.1 #1: WARP itself fails 1074 and 1080 and the device still creates). Both selectors are in the
+`D12-G5` asked-set. **Cap 1074 is not optional for the FL 12_2 claim; implement it in the same commit
+as the caps answer.**
+
+⚠ **The runtime never infers feature level from the caps set — the driver asserts it.** That means a
+12_2 driver must satisfy *both* the explicit assertion here *and*, independently, every cap floor in
+§11.5(b); getting the second wrong fails device creation rather than quietly demoting the level.
+
+⚠ **`WriteBufferImmediateSupportFlags`' BUNDLE bit is not the driver's to report.** Same spec, same
+section: the runtime switches `D3D12_COMMAND_LIST_SUPPORT_FLAG_BUNDLE` on at the API level for any
+driver reporting `D3D12DDI_COMMAND_QUEUE_FLAG_3D` at the DDI. Do not set it.
+
+✅ **The driver-model floor for FL 12_2 is WDDM 2.0**, which `WddmSurface::Wddm2_1GpuMmu` clears with
+room to spare — a second data point beside `D12-G5`'s finding that the WDDM level does not gate the DDI
+version.
+
 ⚠ **A driver must not return anything higher than `12_1` from cap 1007.** The header spells the
 reason out at umddi:10360-10377, verbatim:
 
@@ -2421,6 +2620,35 @@ live outside the OPTIONS family** (`WaveMMATier`, `WorkGraphsTier`) in the secon
 ⚠ **Note the non-contiguous encodings** — `MESH_SHADER_TIER_1 = 10`, `SAMPLER_FEEDBACK_TIER_0_9 =
 90`, `RAYTRACING_TIER_1_0 = 10`. A `tier as u32 >= 1` test is wrong for all three. Compare against
 the named constants.
+
+⚠ **"16" counts the values `D3D12Core.dll` range-checks, not the header's `*_TIER` enums.** The header
+declares **18** non-video `D3D12DDI_*_TIER` enums (21 including video); the three not listed above are
+`HEAP_SERIALIZATION_TIER_0041`, `RESOURCE_SERIALIZATION_TIER_0041` and `RECREATE_AT_TIER` (§9.7), none
+of which has a `Driver filled out an invalid value in …` string. Both figures are right about different
+things — do not "fix" one to the other. ⛔ `DX12.md` risk 2 previously said **14**; that was simply
+wrong and is corrected to 16.
+
+#### 11.4.1 ⛔ `TiledResourcesTier`: the engine reports 4, the DDI cannot express it, and the runtime
+will not tell you
+
+`D3D12DDI_TILED_RESOURCES_TIER` stops at `_TIER_3 = 3` in SDK 26100 (umddi:709-715). A live vkd3d
+device on this guest reports **`TiledResourcesTier 4`** at the API (`D12-G1`). Tier 4 is gated to
+**DDI 0117** — eleven revisions above the `_0110` Helios negotiates — and
+`D3D12TiledResourceTier4.md:43` says Microsoft gated it deliberately so older drivers cannot light it
+up untested.
+
+⇒ **`helios_umd12` must clamp vkd3d's answer to `_TIER_3` when filling the caps struct.** Writing `4`
+into a field whose enum stops at 3 hits the measured `D12-G5` rule that an **out-of-range tier is
+clamped silently** (tier 99 → the app sees 3, debug layer included) — so the bug would not announce
+itself; it would just be a driver shipping a number nobody chose. ⛔ This is the exact shape of
+CLAUDE.md rule 8: the clamp must be explicit, at the site, with the reason in a comment — never left to
+the runtime.
+
+⚠ **The same pattern, opposite direction, for `SamplerFeedbackTier`:** `SamplerFeedback.md:79` says
+sampler feedback *"is not required as part of a Direct3D feature level"*, but that sentence predates
+FL 12_2 and is **stale** — `D3D12_FeatureLevel12_2.md:48` lists Tier 0.9 as an FL 12_2 requirement and
+vkd3d gates FL 12_2 on it. Helios' measured 12_2 is therefore already standing on a sampler-feedback
+claim. Forward `D3D12DDI_SAMPLER_FEEDBACK_TIER_0_9 = 90` — **not** 100.
 
 **Two more tiered values live outside the OPTIONS family and are validated identically:**
 
@@ -3265,6 +3493,30 @@ NULL.
 **`COMMAND_QUEUE_3D` (2) — 5 of 7 semantically, all 7 in practice.** `pfnUnused`/`pfnUnused2` are
 named unused; fill them with counting stubs anyway (§5).
 
+#### 14.1.1 ⭐ "May a slot be NULL" is three questions, not one (2026-08-05)
+
+`D12-G5` measured that WARP leaves exactly four of 206 slots NULL and still works. The corpus shows
+those four are **not the same kind of NULL**, and §15.1 #2 previously conflated them:
+
+| kind | slot | evidence | what Helios should do |
+|---|---|---|---|
+| **RETIRED** — the function was withdrawn and the table entry kept as a placeholder | `cl[69] pfnOmSetAlphaBlendFactor` | `VulkanOn12.md:270`: *"a previous version of this spec referred to `pfnOmSetAlphaBlendFactor` to assign the alpha blend factor. This function is no longer valid, but its entry has been retained and is marked as unused in D3D."* The header agrees, but **only in the older tables** — `_0092` (umddi:11242) and `_0094` (umddi:11381) carry a literal `// unused` comment; the shipping `_0108` table (umddi:13303-13388) declares the same `PFND3D12DDI_OM_SETALPHABLENDFACTOR_0092` typedef with **no comment at all** | counting stub. Never implement it — the *replacement* is the existing `pfnOmSetBlendFactor`, whose `FLOAT[4]` component `[3]` is the constant for `D3D12DDI_BLEND_ALPHA_FACTOR` (=20) / `_INV_ALPHA_FACTOR` (=21) |
+| **OPTIONAL FEATURE** — a real function the driver may decline | `core[121] pfnImplicitShaderCacheControl` | `ShaderCache.md:219`: the runtime calls it only for the `DRIVER_MANAGED` implicit-cache kind, and *"this API will only be supported in developer mode"*. Header name is `PFND3D12DDI_IMPLICITSHADERCACHECONTROL_0080` (umddi:10356) — ⚠ the spec's `…_008n` is a placeholder, not a symbol | counting stub, and report no driver-managed cache |
+| **RESERVED** — never had a function | `queue[1] pfnUnused`, `queue[2] pfnUnused2` | named in the header | counting stub |
+
+⛔ **Do not generalise from these to "optional slots exist."** `DepthBoundsTest.md:779` states the
+opposite for the command-list table — *"The existing command list v-table design does not support
+optional DDIs."* — and proposes that the **runtime** substitutes its own stubs or removes the command
+list entirely. ⚠ That sentence sits inside a future-tense internal implementation *plan*, so treat it as
+design intent rather than shipped behaviour; but it points the same way as the header, which has no
+per-slot opt-out mechanism anywhere. **Fill every slot.**
+
+⚠ **A `NOT_SUPPORTED` tier does suppress its slots — but the mechanism differs per feature, so there is
+no general rule** (§15.1 #16). Three worked examples, three different mechanisms: at `RenderPassTier 0`
+the runtime **rewrites** `BeginRenderPass` into the equivalent `OMSetRenderTargets` and never calls a
+render-pass slot; at `ProgrammableSamplePositionsTier NOT_SUPPORTED` the runtime **removes the device**
+if an app calls in; for depth bounds the plan above is runtime-supplied **stubs**.
+
 **`DXGI` (3) — the whole struct**, shape TBD (§2.3).
 
 **Extended features — genuinely optional.** Answer `pfnGetSupportedExtendedFeatures` with zero
@@ -3428,26 +3680,32 @@ Headline results, each expanded in place below:
 ### 15.1 The numbered list — with the `D12-G5` verdicts
 
 The § reference is where it is discussed; the settler is in §15.2 unless stated.
-**8 answered outright, 6 partial, 4 still UNVERIFIED with the reason stated.**
+
+**After `D12-G5` (the spy): 8 answered outright, 6 partial, 4 still UNVERIFIED with the reason stated.**
+**After the DirectX-Specs pass (2026-08-05, `SPECS.md` @ pin `2bd58ca5`): 9 / 6 / 3.** ⭐ #16 moved
+◑→✅ *per mechanism* (and the answers diverge, which is itself the result); #7 moved ⛔→◑ on a direct
+documentary statement; #2 stayed ◑ but split into three distinct kinds of NULL; #10 stayed ⛔ **and
+gained the reason** — the corpus describes no VA provenance check anywhere, and the one mechanism that
+would dictate a VA is gated above this build.
 
 | # | Question | § | Verdict (`D12-G5`, 2026-08-05) |
 |---|---|---|---|
 | 1 | Which caps types the runtime demands, in what order, and what a refusal does | 11.2 | ✅ **23 of the 43 asked**, order in §11.2; a failing HRESULT is tolerated (WARP itself fails 1074 and 1080 and the device still creates) |
-| 2 | Whether any DDI slot may legally be NULL | 14.1 | ◑ **At least four may**: WARP leaves `core[121] pfnImplicitShaderCacheControl`, `cl[69] pfnOmSetAlphaBlendFactor`, `queue[1] pfnUnused`, `queue[2] pfnUnused2` NULL and works. The other 202 need a null-one-at-a-time arm |
+| 2 | Whether any DDI slot may legally be NULL | 14.1 | ◑ **Sharpened by the specs, 2026-08-05 — it is three questions.** The four WARP leaves NULL are a **retired** slot (`cl[69]`, `VulkanOn12.md:270`), an **optional feature** (`core[121]`, `ShaderCache.md:219`), and two **reserved** (`queue[1..2]`) — §14.1.1. ⛔ And `DepthBoundsTest.md:779` says the command-list v-table *"does not support optional DDIs"* at all. **Fill every slot.** The other 202 still need a null-one-at-a-time arm |
 | 3 | The meaning of `pfnFillDDITable`'s 5th `UINT` and of `D3D12DDI_TABLE_REQUEST::numTables` | 2.2 | ◑ **The 5th `UINT` is the command-list table INDEX** — the runtime fills type 1 twice at device creation, indices 0 and 1, with distinct `hRTTable`. `numTables` still unexercised: `pfnGetOptionalDDITables` answered 0 |
 | 4 | Which `DXGI*_DDI_BASE_FUNCTIONS` shape table type 3 wants | 2.3 | ✅ **Moot — table type 3 is never requested at all** |
 | 5 | The `Interface` / `Version` split of a `D3D12DDI_SUPPORTED_*` token | 1.5 | ✅ **high 32 / low 32**, matched bit-for-bit against the driver's own list |
 | 6 | The DDI-version → Windows-release mapping | 1.5 | ◑ **26100.8875 negotiates `_0110` and accepts down to `_0040`.** One build does not give the table |
-| 7 | Where recording memory comes from — `pfnSubmitCommandCb` vs `pfnRenderCb` | 8.2 | ⛔ **UNVERIFIED and the spy structurally cannot settle it**: WARP is a software rasterizer and called **none** of the `pKTCallbacks` kernel thunks in any run. Settler unchanged — ETW `DxgKrnl` `DmaPacket`/`QueuePacket` against a hardware driver, or G7/G8 on Helios |
+| 7 | Where recording memory comes from — `pfnSubmitCommandCb` vs `pfnRenderCb` | 8.2 | ◑ **MOVED FORWARD 2026-08-05 by a direct documentary statement.** `ResourceHeaps.md:1678`: *"The driver must call `SubmitCommandCB` during the call to `pfnExecuteCommandLists` from the same thread that entered the DDI. The driver must only pass DXGK context handles that were created during the command queue creation."* — plus a ≤8 `WrittenPrimaries` cap (§8.2). ⛔ It does **not** forbid `pfnRenderCb`, so P-C's identity channel stands. The spy still structurally cannot settle it (WARP called **no** `pKTCallbacks` thunk in any run); settler unchanged — ETW `DxgKrnl` `DmaPacket`/`QueuePacket`, or G7/G8 |
 | 8 | Whether `pfnGetSupportedVersions` is really a two-call query | 1.3 | ✅ **Yes** — count with `pVersions == NULL`, then fill |
 | 9 | How a driver obtains a second `D3D12DDI_HRTTABLE` for `pfnSetCommandListDDITableCb` | 9.3 | ✅ **The runtime hands both out at device creation** (`hRTTable` `0x3E0` and `0x638`); WARP then calls `pfnSetCommandListDDITableCb(hRTCommandList, 0x3E0)` on every command-list create — observed live through the wrapped corelayer table |
-| 10 | Whether the runtime accepts GPU VAs the driver never got from the kernel | 9.7 | ⛔ **UNVERIFIED** — needs a driver that fabricates a VA; the spy only forwards WARP's. Settler unchanged |
+| 10 | Whether the runtime accepts GPU VAs the driver never got from the kernel | 9.7 | ⛔ **STILL UNVERIFIED, and now with the reason the corpus cannot answer it.** `RecreateAtGpuva-public.md` is the closest text in the corpus and it describes **no provenance check anywhere** — the runtime only ever *reads* VAs back out of driver-created objects, and passes recorded ranges through *"not processed in any way"* (`:185`). ⭐ It is also **moot on this build**: *"RecreateAt functionality is gated behind DDI 0111."* (`:42`) and `D3D12DDI_BUILD_VERSION_0111` is absent from SDK 26100. Settler unchanged: BDAs + the debug layer at G7/G8 |
 | 11 | Whether a monitored fence advances with no GPU-side write, for a **D3D12-shaped** fence | 10.5 | ⛔ **UNVERIFIED** — out of scope for the spy; still the G-fence probe |
 | 12 | Whether the runtime, not the driver, performs the kernel signal/wait for `pfnSignalFence` | 10.5 | ◑ **Evidence for "the runtime does"**: across 20 frames of `ID3D12CommandQueue::Signal` + `SetEventOnCompletion`, `pfnSignalFence`/`pfnWaitForFence` were **never called** while `pfnCreateFence` was. WARP is software-scheduled — confirm on hardware |
 | 13 | Whether the runtime cross-validates the caps set as ONE contract | 11.5 | ✅ **Yes, at retail** — two worked failures with the runtime's own English strings, §11.5 |
 | 14 | Whether the D3D12 runtime ever passes a raw DXIL bitstream instead of a DXBC container | 12.2 | ✅ **It ALWAYS does**, and it converts DXBC to DXIL first — §12.2 |
 | 15 | The exact contract of `D3D12DDICAPS_TYPE_EXECUTECOMMANDLISTS_PARALLELISM` | 11.6 | ◑ **Arm 1 run and it came back empty: the runtime never asks for 1069** on this build, in any workload. Arm 2 (force TRUE, diff a `QueuePacket` slice) is now the only route |
-| 16 | Whether the runtime honours a `NOT_SUPPORTED` tier by never calling the corresponding slot | 14.1 | ◑ **Weak support only**: `RenderPassTier = 0` and no render-pass slot was called — but no workload asked for a render pass, so this does not separate suppression from disinterest |
+| 16 | Whether the runtime honours a `NOT_SUPPORTED` tier by never calling the corresponding slot | 14.1 | ✅/⛔ **Answered per-mechanism 2026-08-05, and the answers DIVERGE — so there is no general rule.** Render passes: **yes**, and by rewriting — at Tier 0 the runtime turns `BeginRenderPass` into the equivalent `OMSetRenderTargets`, which separates suppression from disinterest and closes the `D12-G5` ambiguity for that case. Programmable sample positions: the runtime **removes the device** if an app calls in, so `cl[53]`/`cl[54]` are provably unreachable. Depth bounds: the plan is runtime-supplied **stubs** in the driver's own table. ⛔ Do not generalise from one to another (§14.1.1) |
 | 17 | The oldest `D3D12DDI_SUPPORTED_*` this Windows build accepts | 1.6 | ✅ **`_0040`** — and a triangle presents on it. §15.4 |
 | 18 | Whether `pfnFillDDITable`'s `SIZE_T` matches `size_of` of the bindgen'd struct | 2.2 | ✅ **At `_0110`/`_0109`, exactly** (992 / 600 / 56). ⛔ And it is version-dependent — `_0089` → 976/552, `_0040` → 768/464. Honour the argument |
 
