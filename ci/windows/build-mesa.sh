@@ -34,6 +34,8 @@ meson setup "${build_dir}" "${mesa_src}" \
   -Dgles2=disabled \
   -Dllvm=disabled \
   -Dshader-cache=disabled \
+  -Dzlib=disabled \
+  -Dzstd=disabled \
   -Dbuild-tests=false \
   -Dperfetto=false \
   -Dxmlconfig=disabled \
@@ -45,20 +47,15 @@ cp "${build_dir}/src/virtio/vulkan/vulkan_virtio.dll" "${output_dir}/"
 cp "${build_dir}/src/gallium/targets/wgl/libgallium_wgl.dll" "${output_dir}/"
 cp "${build_dir}/src/gallium/targets/libgl-gdi/opengl32.dll" "${output_dir}/opengl32-app-local.dll"
 
-zlib_dll="$(find "${build_dir}" -type f -name 'libz-1.dll' -print -quit)"
-if [[ -n "${zlib_dll}" ]]; then
-  cp "${zlib_dll}" "${output_dir}/"
-fi
-
-# Static MinGW linkage normally leaves only Windows and vulkan-1 imports, but
-# copy any remaining MinGW runtime DLLs next to both Mesa ICDs. This also covers
-# zlib when Meson chooses MSYS2's system package instead of its wrap fallback.
+# WGL ICD dependencies are resolved by opengl32.dll and do not reliably search
+# the private driver directory. Keep the Mesa ICDs self-contained instead of
+# silently shipping a MinGW DLL that the Windows loader will not find.
 for dll in "${output_dir}/vulkan_virtio.dll" "${output_dir}/libgallium_wgl.dll"; do
   while read -r dependency; do
     case "${dependency,,}" in
-      lib*.dll)
-        dependency_path="$(command -v "${dependency}" || true)"
-        if [[ -n "${dependency_path}" ]]; then cp -f "${dependency_path}" "${output_dir}/${dependency}"; fi
+      lib*.dll|zlib1.dll)
+        printf 'Unexpected non-system dependency in %s: %s\n' "${dll}" "${dependency}" >&2
+        exit 1
         ;;
     esac
   done < <(objdump -p "${dll}" | sed -n 's/^[[:space:]]*DLL Name: //p')

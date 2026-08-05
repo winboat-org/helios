@@ -29,6 +29,19 @@ DLLs. Vulkan and OpenCL coexist with other vendors through their standard ICD
 registries. OpenGL is registered only on the Helios display adapter software
 key.
 
+If the virtio-gpu device is using Red Hat's `viogpudo` driver, desktop setup
+shows a Yes/No dialog (default No) before uninstalling that driver package and
+replacing it with Helios. A remote console uses the equivalent `[y/N]` prompt.
+For WinBoat or another unattended orchestrator, use automatic mode:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Install-Helios.ps1 -Automatic
+```
+
+`-Automatic` enables test-signing when needed and replaces `viogpudo` without a
+prompt. An exit code of 3010 requests a reboot; run the same command again after
+the reboot to continue installation. `-Unattended` is accepted as an alias.
+
 Run the health check later with:
 
 ```powershell

@@ -48,6 +48,19 @@ function Test-HeliosManifest([Parameter(Mandatory)][string]$BundleRoot, [Paramet
 }
 
 function Get-HeliosDeviceInstanceId {
+    # Prefer a currently present device. WinBoat can change QEMU's device set
+    # between bootstrap and accelerated boots, leaving a non-present PCI
+    # instance in CIM that must not receive the WGL registration.
+    $presentDevices = @(Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue |
+        Where-Object { $_.InstanceId -like "PCI\VEN_1AF4&DEV_1050*" })
+    $device = $presentDevices |
+        Where-Object { $_.FriendlyName -like "Helios vGPU Render Adapter*" } |
+        Select-Object -First 1
+    if (-not $device) {
+        $device = $presentDevices | Select-Object -First 1
+    }
+    if ($device) { return [string]$device.InstanceId }
+
     $device = Get-CimInstance Win32_PnPEntity |
         Where-Object { $_.PNPDeviceID -like "PCI\VEN_1AF4&DEV_1050*" -and $_.Name -like "Helios vGPU Render Adapter*" } |
         Select-Object -First 1
@@ -62,17 +75,29 @@ function Get-HeliosDeviceInstanceId {
 
 function Get-HeliosDisplayClassKey([Parameter(Mandatory)][string]$InstanceId) {
     $root = "HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}"
-    $lastSlash = $InstanceId.LastIndexOf("\")
-    $needle = if ($lastSlash -gt 0) { $InstanceId.Substring(0, $lastSlash).ToUpperInvariant() } else { $InstanceId.ToUpperInvariant() }
-    for ($index = 0; $index -lt 256; $index++) {
-        $path = Join-Path $root ("{0:d4}" -f $index)
-        if (-not (Test-Path -LiteralPath $path)) { continue }
-        $properties = Get-ItemProperty -LiteralPath $path -ErrorAction SilentlyContinue
-        if (-not $properties) { continue }
-        $matchingId = [string]$properties.MatchingDeviceId
-        if ($matchingId -and $needle.StartsWith($matchingId.ToUpperInvariant())) { return $path }
+
+    # The Enum key's Driver value identifies the exact software key for this
+    # PCI instance. MatchingDeviceId alone is ambiguous when Windows retains a
+    # stale instance of the same adapter after its PCI address changes.
+    $enumPath = "HKLM:\SYSTEM\CurrentControlSet\Enum\$InstanceId"
+    $driverKeyName = ""
+    if (Test-Path -LiteralPath $enumPath) {
+        $enumProperties = Get-ItemProperty -LiteralPath $enumPath -Name "Driver" -ErrorAction SilentlyContinue
+        if ($enumProperties -and $enumProperties.PSObject.Properties["Driver"]) {
+            $driverKeyName = [string]$enumProperties.Driver
+        }
     }
-    throw "Could not locate the Helios display adapter software key."
+    if (-not $driverKeyName) {
+        $driverProperty = Get-PnpDeviceProperty -InstanceId $InstanceId -KeyName DEVPKEY_Device_Driver -ErrorAction SilentlyContinue
+        if ($driverProperty -and $driverProperty.PSObject.Properties["Data"]) {
+            $driverKeyName = [string]$driverProperty.Data
+        }
+    }
+    if ($driverKeyName -match "^\{4d36e968-e325-11ce-bfc1-08002be10318\}\\(\d{4})$") {
+        $exactPath = Join-Path $root $Matches[1]
+        if (Test-Path -LiteralPath $exactPath) { return $exactPath }
+    }
+    throw "Could not locate the display adapter software key for the present device instance $InstanceId."
 }
 
 function Get-HeliosActiveInf([Parameter(Mandatory)][string]$InstanceId) {
@@ -81,6 +106,14 @@ function Get-HeliosActiveInf([Parameter(Mandatory)][string]$InstanceId) {
         return [string]$property.Data
     }
     return ""
+}
+
+function Test-HeliosViogpudoDriver([Parameter(Mandatory)][string]$InfName) {
+    $leafName = [IO.Path]::GetFileName($InfName)
+    if ($leafName -ne $InfName -or $leafName -notmatch "^[A-Za-z0-9._-]+\.inf$") { return $false }
+    $infPath = Join-Path $env:windir "INF\$leafName"
+    if (-not (Test-Path -LiteralPath $infPath -PathType Leaf)) { return $false }
+    return (Get-Content -LiteralPath $infPath -Raw) -match "(?i)\bviogpudo(?:\.inf|\.sys)?\b"
 }
 
 function Get-HeliosRegistrySnapshot([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Name) {
@@ -110,11 +143,20 @@ function Restore-HeliosRegistrySnapshot([Parameter(Mandatory)][string]$Path, [Pa
 function Invoke-HeliosNative(
     [Parameter(Mandatory)][string]$FilePath,
     [Parameter(Mandatory)][string[]]$Arguments,
-    [int[]]$SuccessExitCodes = @(0)
+    [int[]]$SuccessExitCodes = @(0),
+    [switch]$WaitForProcess
 ) {
-    $output = & $FilePath @Arguments 2>&1
-    $exitCode = $LASTEXITCODE
-    if ($output) { $output | ForEach-Object { Write-Host $_ } }
+    if ($WaitForProcess) {
+        # Windows PowerShell can return immediately for GUI-subsystem programs
+        # without defining $LASTEXITCODE. Start-Process supplies a reliable exit
+        # code and waits for bootstrapper child activity to complete.
+        $process = Start-Process -FilePath $FilePath -ArgumentList $Arguments -NoNewWindow -Wait -PassThru
+        $exitCode = $process.ExitCode
+    } else {
+        $output = & $FilePath @Arguments 2>&1
+        $exitCode = $LASTEXITCODE
+        if ($output) { $output | ForEach-Object { Write-Host $_ } }
+    }
     if ($SuccessExitCodes -notcontains $exitCode) {
         throw "$FilePath $($Arguments -join ' ') failed with exit code $exitCode."
     }

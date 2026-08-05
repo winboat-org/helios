@@ -58,8 +58,6 @@ $mesaOut = Join-Path $payload "mesa"
 foreach ($name in @("vulkan_virtio.dll", "libgallium_wgl.dll")) {
     Copy-Required (Join-Path $MesaArtifact $name) (Join-Path $mesaOut $name)
 }
-$zlib = Join-Path $MesaArtifact "libz-1.dll"
-if (Test-Path -LiteralPath $zlib -PathType Leaf) { Copy-Required $zlib (Join-Path $mesaOut "libz-1.dll") }
 foreach ($dependency in Get-ChildItem -LiteralPath $MesaArtifact -Filter "lib*.dll" -File) {
     if ($dependency.Name -eq "libgallium_wgl.dll") { continue }
     Copy-Required $dependency.FullName (Join-Path $mesaOut $dependency.Name)

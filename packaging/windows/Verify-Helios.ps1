@@ -13,6 +13,8 @@ if (-not (Test-Path -LiteralPath $statePath -PathType Leaf)) {
 }
 $state = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
 $failures = [Collections.Generic.List[string]]::new()
+$instanceId = ""
+$classKey = ""
 
 foreach ($entry in @($state.runtimeFiles)) {
     if (-not (Test-Path -LiteralPath ([string]$entry.path) -PathType Leaf)) {
@@ -27,6 +29,7 @@ foreach ($entry in @($state.runtimeFiles)) {
 
 try {
     $instanceId = Get-HeliosDeviceInstanceId
+    $classKey = Get-HeliosDisplayClassKey $instanceId
     $device = Get-PnpDevice -InstanceId $instanceId -ErrorAction Stop
     Write-Host "Driver: $($device.FriendlyName) [$($device.Status)]"
     if ($device.Status -ne "OK") {
@@ -53,8 +56,7 @@ if ($null -eq $vulkanValue -or [int]$vulkanValue -ne 0) {
     $failures.Add("The Vulkan ICD manifest is not enabled in the machine registry.")
 } else { Write-Host "Vulkan: registered $($state.vulkanManifest)" }
 
-$classKey = [string]$state.classKey
-$openGlDriver = if (Test-Path -LiteralPath $classKey) { (Get-Item -LiteralPath $classKey).GetValue("OpenGLDriverName", $null) } else { $null }
+$openGlDriver = if ($classKey -and (Test-Path -LiteralPath $classKey)) { (Get-Item -LiteralPath $classKey).GetValue("OpenGLDriverName", $null) } else { $null }
 if (-not $openGlDriver -or ([string]$openGlDriver -ine (Join-Path ([string]$state.installRoot) "runtime\mesa\libgallium_wgl.dll"))) {
     $failures.Add("The Helios OpenGL ICD is not registered on the display adapter.")
 } else { Write-Host "OpenGL: registered $openGlDriver" }

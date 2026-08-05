@@ -1,6 +1,8 @@
 param(
     [switch]$EnableTestSigning,
-    [switch]$RunSmokeTests
+    [switch]$RunSmokeTests,
+    [Alias("Unattended")]
+    [switch]$Automatic
 )
 
 Set-StrictMode -Version Latest
@@ -24,8 +26,8 @@ if (Test-Path -LiteralPath $statePath -PathType Leaf) {
 }
 
 if ($manifest.signing.mode -eq "test" -and -not (Test-HeliosTestSigningEnabled)) {
-    if (-not $EnableTestSigning) {
-        throw "Windows test-signing is not active. Re-run with -EnableTestSigning, reboot, then run the installer again."
+    if (-not $EnableTestSigning -and -not $Automatic) {
+        throw "Windows test-signing is not active. Re-run with -EnableTestSigning (or -Automatic), reboot, then run the installer again."
     }
     if (Test-HeliosSecureBootEnabled) {
         throw "Secure Boot is enabled. Windows will not enable test-signing until Secure Boot is disabled in UEFI."
@@ -44,12 +46,62 @@ $driverInf = Join-Path $payloadRoot "driver\helios_kmd_render.inf"
 $certificatePath = Join-Path $bundleRoot ([string]$manifest.signing.certificate)
 
 $instanceId = Get-HeliosDeviceInstanceId
-$classKey = Get-HeliosDisplayClassKey $instanceId
+$replacedViogpudo = $false
+$activeInfBeforeInstall = Get-HeliosActiveInf $instanceId
+if ($activeInfBeforeInstall -and (Test-HeliosViogpudoDriver $activeInfBeforeInstall)) {
+    if (-not $Automatic) {
+        Write-Warning "The virtio-gpu device is currently using viogpudo ($activeInfBeforeInstall)."
+        $approved = $false
+        $usedGraphicalPrompt = $false
+        if (-not $env:SSH_CONNECTION) {
+            try {
+                Add-Type -AssemblyName System.Windows.Forms
+                $choice = [Windows.Forms.MessageBox]::Show(
+                    "Uninstall viogpudo ($activeInfBeforeInstall) and replace it with the Helios display driver?",
+                    "Helios display driver setup",
+                    [Windows.Forms.MessageBoxButtons]::YesNo,
+                    [Windows.Forms.MessageBoxIcon]::Warning,
+                    [Windows.Forms.MessageBoxDefaultButton]::Button2
+                )
+                $usedGraphicalPrompt = $true
+                $approved = $choice -eq [Windows.Forms.DialogResult]::Yes
+            } catch {
+                Write-Warning "The graphical confirmation dialog was unavailable: $($_.Exception.Message)"
+            }
+        }
+        if (-not $usedGraphicalPrompt) {
+            $answer = Read-Host "Uninstall viogpudo and replace it with the Helios display driver? [y/N]"
+            $approved = $answer -match "^(?i:y|yes)$"
+        }
+        if (-not $approved) {
+            throw "Helios installation was cancelled; viogpudo was not changed."
+        }
+    } else {
+        Write-Host "Automatic mode: replacing viogpudo ($activeInfBeforeInstall) with Helios."
+    }
+
+    Invoke-HeliosNative "pnputil.exe" @("/delete-driver", $activeInfBeforeInstall, "/uninstall", "/force") -SuccessExitCodes @(0, 259, 3010)
+    Invoke-HeliosNative "pnputil.exe" @("/scan-devices") -SuccessExitCodes @(0, 259, 3010)
+    Start-Sleep -Seconds 2
+    $remainingInf = Get-HeliosActiveInf $instanceId
+    if ($remainingInf -and (Test-HeliosViogpudoDriver $remainingInf)) {
+        Write-Warning "Windows requires a reboot to finish removing viogpudo ($remainingInf). Run this installer again afterward."
+        exit 3010
+    }
+    $replacedViogpudo = $true
+}
+
+$classKey = ""
 $vulkanRegistry = "HKLM:\SOFTWARE\Khronos\Vulkan\Drivers"
 $openClRegistry = "HKLM:\SOFTWARE\Khronos\OpenCL\Vendors"
 $vulkanManifestPath = Join-Path $runtimeRoot "mesa\helios_vulkan.json"
 $clvkPath = Join-Path $runtimeRoot "opencl\clvk.dll"
 $wglPath = Join-Path $runtimeRoot "mesa\libgallium_wgl.dll"
+$previousOpenGL = [ordered]@{
+    OpenGLDriverName = [ordered]@{ exists = $false; kind = $null; value = $null }
+    OpenGLVersion = [ordered]@{ exists = $false; kind = $null; value = $null }
+    OpenGLFlags = [ordered]@{ exists = $false; kind = $null; value = $null }
+}
 
 $state = [ordered]@{
     schemaVersion = 1
@@ -67,11 +119,8 @@ $state = [ordered]@{
     installedOpenClLoader = $false
     systemVulkanLoaderHash = ""
     systemOpenClLoaderHash = ""
-    previousOpenGL = [ordered]@{
-        OpenGLDriverName = Get-HeliosRegistrySnapshot $classKey "OpenGLDriverName"
-        OpenGLVersion = Get-HeliosRegistrySnapshot $classKey "OpenGLVersion"
-        OpenGLFlags = Get-HeliosRegistrySnapshot $classKey "OpenGLFlags"
-    }
+    previousOpenGL = $previousOpenGL
+    replacedViogpudo = $replacedViogpudo
     runtimeFiles = @()
 }
 
@@ -90,12 +139,20 @@ Write-HeliosJson $state $statePath
 
 $certificate = [Security.Cryptography.X509Certificates.X509Certificate2]::new($certificatePath)
 $state.signingCertificateThumbprint = $certificate.Thumbprint
-Import-Certificate -FilePath $certificatePath -CertStoreLocation "Cert:\LocalMachine\Root" | Out-Null
-Import-Certificate -FilePath $certificatePath -CertStoreLocation "Cert:\LocalMachine\TrustedPublisher" | Out-Null
+foreach ($store in @("Root", "TrustedPublisher")) {
+    try {
+        Import-Certificate -FilePath $certificatePath -CertStoreLocation "Cert:\LocalMachine\$store" | Out-Null
+    } catch {
+        # Some Windows builds report E_ACCESSDENIED after committing the
+        # certificate. Continue only when the exact thumbprint is now present.
+        if (-not (Test-Path -LiteralPath "Cert:\LocalMachine\$store\$($certificate.Thumbprint)")) { throw }
+        Write-Warning "Import-Certificate reported an error for $store, but the expected certificate is present."
+    }
+}
 Write-HeliosJson $state $statePath
 
 Write-Host "Installing/updating the Microsoft Visual C++ x64 runtime..."
-Invoke-HeliosNative (Join-Path $payloadRoot "prerequisites\vc_redist.x64.exe") @("/install", "/quiet", "/norestart") -SuccessExitCodes @(0, 3010)
+Invoke-HeliosNative (Join-Path $payloadRoot "prerequisites\vc_redist.x64.exe") @("/install", "/quiet", "/norestart") -SuccessExitCodes @(0, 3010) -WaitForProcess
 
 $systemVulkanLoader = Join-Path $env:windir "System32\vulkan-1.dll"
 if (-not (Test-Path -LiteralPath $systemVulkanLoader -PathType Leaf)) {
@@ -112,7 +169,9 @@ if (-not (Test-Path -LiteralPath $systemOpenClLoader -PathType Leaf)) {
 Write-HeliosJson $state $statePath
 
 Write-Host "Installing the Helios WDDM driver package..."
-Invoke-HeliosNative "pnputil.exe" @("/add-driver", $driverInf, "/install")
+# pnputil returns ERROR_NO_MORE_ITEMS (259) when this exact package is already
+# staged/active. The active-INF checks below still reject an outranking driver.
+Invoke-HeliosNative "pnputil.exe" @("/add-driver", $driverInf, "/install") -SuccessExitCodes @(0, 259, 3010)
 Start-Sleep -Seconds 2
 $activeInf = Get-HeliosActiveInf $instanceId
 if ($activeInf -notmatch "^oem\d+\.inf$") {
@@ -122,6 +181,13 @@ $activeInfPath = Join-Path $env:windir "INF\$activeInf"
 $activeInfText = if (Test-Path -LiteralPath $activeInfPath) { Get-Content -LiteralPath $activeInfPath -Raw } else { "" }
 if ($activeInfText -notmatch "helios_kmd_render") {
     throw "PnP selected $activeInf, but it is not the Helios driver package."
+}
+$classKey = Get-HeliosDisplayClassKey $instanceId
+$state.classKey = $classKey
+$state.previousOpenGL = [ordered]@{
+    OpenGLDriverName = Get-HeliosRegistrySnapshot $classKey "OpenGLDriverName"
+    OpenGLVersion = Get-HeliosRegistrySnapshot $classKey "OpenGLVersion"
+    OpenGLFlags = Get-HeliosRegistrySnapshot $classKey "OpenGLFlags"
 }
 $state.activeInf = $activeInf
 Write-HeliosJson $state $statePath

@@ -1,6 +1,7 @@
 #include <windows.h>
 #include <GL/gl.h>
 #include <stdio.h>
+#include <string.h>
 
 static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
     return DefWindowProcW(window, message, wparam, lparam);
@@ -34,9 +35,11 @@ int main(void) {
     const GLubyte *version = glGetString(GL_VERSION);
     if (!vendor || !renderer || !version) return 5;
     printf("OpenGL vendor: %s\nOpenGL renderer: %s\nOpenGL version: %s\n", vendor, renderer, version);
+    int result = strcmp((const char *)renderer, "GDI Generic") == 0 ? 6 : 0;
+    if (result) fprintf(stderr, "The Microsoft software OpenGL 1.1 renderer is active; the Helios ICD did not load.\n");
     wglMakeCurrent(NULL, NULL);
     wglDeleteContext(context);
     ReleaseDC(window, dc);
     DestroyWindow(window);
-    return 0;
+    return result;
 }

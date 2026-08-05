@@ -106,7 +106,6 @@ jobs:
             mingw-w64-ucrt-x86_64-python-packaging
             mingw-w64-ucrt-x86_64-python-yaml
             mingw-w64-ucrt-x86_64-pkgconf
-            mingw-w64-ucrt-x86_64-zlib
             mingw-w64-ucrt-x86_64-vulkan-headers
             mingw-w64-ucrt-x86_64-vulkan-loader
             bison

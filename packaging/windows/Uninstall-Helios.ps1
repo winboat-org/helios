@@ -25,10 +25,29 @@ if (Test-Path -LiteralPath $openClRegistry) {
 }
 
 $classKey = [string]$state.classKey
-if (Test-Path -LiteralPath $classKey) {
+if ($classKey -and (Test-Path -LiteralPath $classKey)) {
     Restore-HeliosRegistrySnapshot $classKey "OpenGLDriverName" $state.previousOpenGL.OpenGLDriverName
     Restore-HeliosRegistrySnapshot $classKey "OpenGLVersion" $state.previousOpenGL.OpenGLVersion
     Restore-HeliosRegistrySnapshot $classKey "OpenGLFlags" $state.previousOpenGL.OpenGLFlags
+}
+
+# If a VM configuration change moved the adapter after installation, remove a
+# Helios registration from the current instance as well. Do not touch values
+# that no longer point at this package's WGL ICD.
+try {
+    $currentInstanceId = Get-HeliosDeviceInstanceId
+    $currentClassKey = Get-HeliosDisplayClassKey $currentInstanceId
+    if ($currentClassKey -and $currentClassKey -ine $classKey) {
+        $expectedWgl = Join-Path ([string]$state.installRoot) "runtime\mesa\libgallium_wgl.dll"
+        $currentWgl = (Get-Item -LiteralPath $currentClassKey).GetValue("OpenGLDriverName", $null)
+        if ($currentWgl -and ([string]$currentWgl -ieq $expectedWgl)) {
+            foreach ($name in @("OpenGLDriverName", "OpenGLVersion", "OpenGLFlags")) {
+                Remove-ItemProperty -LiteralPath $currentClassKey -Name $name -ErrorAction SilentlyContinue
+            }
+        }
+    }
+} catch {
+    Write-Warning "Could not inspect the current adapter software key during cleanup: $($_.Exception.Message)"
 }
 
 $driverRemovalFailed = $false
