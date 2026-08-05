@@ -3492,9 +3492,58 @@ silent on it:
   one function of `Flags` for the size, the corelayer union arm fixed at `_0062` by
   D12's one-token set, and a per-device teardown readout that makes the block's fields
   genuinely *read* rather than merely stored (the R908 rule forces that choice).
-- **Next: L1 (caps), alone** — `PARALLEL.md` §8 makes it one agent's, whole, and S5
-  measured that it is what gates device creation. Then **`D12-G7`**, then the remaining
-  ten lanes fan out, then the §10 review pass.
+- ⭐ **L1 (caps) is LANDED (2026-08-06), and `D3D12CreateDevice` now builds a real
+  vkd3d `ID3D12Device` through the DDI.** `pfnGetCaps` answers all 43 types: the ~13
+  with an explicit "device creation fails" runtime string individually, the rest by
+  §11.2's measured safe default. The 43-way policy was derived and then
+  **adversarially verified**, three lenses per risky answer; eight drew a refutation
+  that survived and two changed the code.
+  - ⛔ **The load-bearing decision is a COUPLING: this ships FEATURE LEVEL 11_0**, and
+    every OPTIONS tier is legal only because of that. The level is asserted by the
+    driver, never inferred, and asserting 12_0 arms cap floors that are lies on a
+    driver whose descriptor/resource/recording lanes are counting noops — `D12-G5`
+    measured that exact failure. Each raise belongs to the lane that earns it and must
+    move the level and its floors **together**.
+  - ⛔ **Four caps where the §11.2 zero-fill default is ILLEGAL**, which is the least
+    obvious thing in the lane: `1002` (`IOCoherent` must be TRUE on amd64), `1004`
+    (zeroed lane counts fail device creation), `1003` (zeroed alignments are four
+    separate errors), `1088` (`EXECUTE_INDIRECT_TIER` has no zero enumerator, so a
+    zero-fill writes an out-of-range tier the runtime clamps **silently**).
+  - ⛔ **`MaxSamplerDescriptorHeapSize` is 2048, not `SUBSTRATE.md` §4.5's ">= 4000".**
+    4000 exceeds `D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE` **and** contradicts this
+    box's own measured baseline (`baselines/d3d12-caps.csv:85`). §4.5 needs correcting;
+    the code records the disagreement at the write site.
+  - ⛔ **Refusing an unknown `pfnFillDDITable` type LOSES THE DEVICE.** The runtime asks
+    for `D3D12DDI_TABLE_TYPE_0096_EXTENDED_FEATURES` (27, 32 B) on a baseline device.
+    Unknown tables are now stub-filled at the runtime's own byte count and counted —
+    filling selects no *shape*, which is what §7.4 actually forbids, while a refused
+    table has NULL slots the runtime may still call through.
+- **`D12-G7` is NOT green, and the blocker is named rather than guessed**
+  (`tmp/dx12/gates/G7/RESULT.md`). The whole chain runs: `OpenAdapter12` → caps →
+  versions → `CalcPrivateDeviceSize` → **`CreateDevice` building a real vkd3d device on
+  venus ctx 19** → all four table fills at **992 / 600 / 56 / 32**, with the
+  command-list table filled **twice** and both `hRTTable` handles (`0x3E0`, `0x638`)
+  stashed → `DestroyDevice` → `CloseAdapter`. It fails at **`0x887A0020`**, which is the
+  runtime rejecting an inconsistent caps **set** — not our own `0x887A0004` refusal.
+  ⭐ The HRESULT moving is the result: the failure went from *"the driver said no"* to
+  *"the driver said something wrong"*.
+  - ⇒ **The blocker is three device-core slots still counting noops.** The runtime calls
+    them **2 824 times inside `D3D12CreateDevice`**: `pfnCheckFormatSupport` 93 times
+    (the 91-format sweep §11.1 predicted), `pfnCheckMultisampleQualityLevels` **2 730**,
+    `pfnQueryNodeMap` once. A noop returns 0, i.e. *"no format supports anything"*.
+    They need a `bridge12` entry point into `ID3D12Device::CheckFeatureSupport`
+    (C++, VM-only). ⭐ `umd/src/forward/format_caps.rs` is the D3D11 precedent and its
+    `D3D10_DDI_FORMAT_SUPPORT` bits are **identical** to `D3D12DDI_FORMAT_SUPPORT`'s —
+    including the trap: `DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM` (89) must be refused
+    with the explicit `_NOT_SUPPORTED` sentinel `0x8000_0000` and **not a bare 0**,
+    which the D3D11 runtime rejected with the *same* `0x887A0020` on the same box.
+- ⚠ **A UMD path change needs a device restart to take effect.** A deploy without
+  `-RestartDevice` rewrote `UserModeDriverName[3]` and the next new process still loaded
+  the previous content-addressed DLL: dxgkrnl caches the resolved UMD path. Cost one
+  confusing gate run whose log showed the old hash and the old counter names.
+- **Next: finish L1** (the three format/MSAA slots + the bridge entry point) → `D12-G7`
+  → the remaining ten lanes fan out → the §10 review pass. `L9` is mostly
+  refuse-and-count and is the natural first task for a new agent.
 - ⭐ **S6 is the bulk — 214 driver-side slots — and it FANS OUT. The split is
   `docs/dx12/PARALLEL.md`:** 11 lanes with exclusive file ownership, an append-only
   protocol for the four shared files, and a lease on the VM. Two things gate the
