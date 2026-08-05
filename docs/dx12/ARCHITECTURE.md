@@ -1119,23 +1119,27 @@ decision input. **D4 stands on its two technical reasons alone** — keeping `dx
 equally legitimate option to be argued on those grounds. Do not re-open this as a licensing
 question; if it is re-opened, it is because reason 1 or reason 3 changed.
 
-⚠ **The owner must be handed the *complete* component list, not just vkd3d's.** The analysis above
-covers `vkd3d-proton-helios/COPYING` + `LICENSE` only, and those are not the only terms that reach
-`helios_vkd3d.dll`. Everything §8.2 lists as an uninitialised submodule links into that same DLL:
+✅ **The complete component list, read from the tree 2026-08-05 (UNVERIFIED-10 / R11's U5, closed).**
+The earlier version of this table had four rows and three of them were unreadable. It is **seven**,
+because `dxil-spirv` carries four nested submodules of its own:
 
-| Component | Where | Links into | Terms |
-|---|---|---|---|
-| vkd3d-proton | `COPYING` + 502-line `LICENSE` | `helios_vkd3d.dll` | **LGPL-2.1-or-later** (verified) |
-| `dxil-spirv` | `subprojects/dxil-spirv` → `HansKristian-Work/dxil-spirv` | `helios_vkd3d.dll` (`meson.build:177`, §8.4) | ⚠ **unread — the submodule is uninitialised, so the licence file is not in the tree** |
-| `Vulkan-Headers` | `khronos/Vulkan-Headers` → `KhronosGroup/Vulkan-Headers` | headers only, but they are compiled into the DLL | ⚠ **unread — uninitialised** |
-| `SPIRV-Headers` | `khronos/SPIRV-Headers` → `KhronosGroup/SPIRV-Headers` | headers only, compiled into the DLL | ⚠ **unread — uninitialised** |
+| # | Component | Where | Links into | Terms |
+|---|---|---|---|---|
+| 1 | **vkd3d-proton** | `COPYING` + 502-line `LICENSE` | `helios_vkd3d.dll` | **LGPL-2.1-or-later** |
+| 2 | `dxil-spirv` | `subprojects/dxil-spirv` → `HansKristian-Work/dxil-spirv` | `helios_vkd3d.dll` (`meson.build:177`) | **MIT** (`LICENSE.MIT`, `SPDX-License-Identifier: MIT`, Hans-Kristian Arntzen for Valve) |
+| 3 | `dxbc-spirv` | `subprojects/dxil-spirv/subprojects/dxbc-spirv` → `doitsujin/dxbc-spirv` | `helios_vkd3d.dll` | **MIT** (Philip Rebohle, 2025) |
+| 4 | `SPIRV-Cross` | `subprojects/dxil-spirv/third_party/SPIRV-Cross` | `helios_vkd3d.dll` | **Apache-2.0** (202-line text; the repo also carries a `LICENSES/` dir) |
+| 5 | `SPIRV-Tools` | `subprojects/dxil-spirv/third_party/SPIRV-Tools` | `helios_vkd3d.dll` | **Apache-2.0** |
+| 6 | `SPIRV-Headers` | `khronos/SPIRV-Headers` **and** `dxil-spirv/third_party/spirv-headers` (two different pins) | headers, compiled in | **Khronos MIT-style** ("Materials" grant, 502-line file) |
+| 7 | `Vulkan-Headers` | `khronos/Vulkan-Headers` | headers, compiled in | **Apache-2.0 OR MIT**, per-file (`LICENSE.md` + a `LICENSES/` dir) |
 
-⛔ Do not paraphrase these from memory of what the upstream projects usually use. The terms are
-literally unreadable in this checkout today; they become readable the moment S0's
-`git submodule update --init --recursive` runs, which is the first command of the first stage. The
-mechanical follow-up is **UNVERIFIED-10** (§13): read the four licence files and hand the owner one
-table before any `helios_vkd3d.dll` is distributed. R11 raised this as U5 and it was previously
-dropped.
+⇒ **One LGPL-2.1-or-later component (vkd3d itself) and six permissive ones.** The DLL boundary of D4
+is what keeps the LGPL obligations off `helios_umd12.dll`; the six permissive components need
+attribution in whatever the package ships as its licence text, and nothing more.
+
+⚠ Rows 2–7 became readable only because `git submodule update --init --recursive` ran — a
+non-recursive init leaves rows 3–6 out of the tree entirely, which is exactly how the earlier
+four-row table came to be wrong. **Re-read, do not paraphrase, if any pin moves.**
 
 *Static-link fallback, if the export approach fails* (R4 §6.4): add
 `helios_d3d12_static = static_library('helios_d3d12_static', …, dependencies: [vkd3d_dep, …])` beside
@@ -1270,15 +1274,21 @@ git submodule update --init --recursive
 git submodule status          # expect three lines with NO leading '-'
 ```
 
+✅ **Done 2026-08-05** — `khronos/SPIRV-Headers f88a2d76`, `khronos/Vulkan-Headers 0e9de566`
+(v1.4.351), `subprojects/dxil-spirv cc75a0c9`. ⚠ **`--recursive` is not optional and it is not
+cosmetic:** `dxil-spirv` has **four** nested submodules of its own —
+`subprojects/dxbc-spirv` (`doitsujin/dxbc-spirv d5b06435`), `third_party/SPIRV-Cross 4b7bcb7e`,
+`third_party/SPIRV-Tools 199cb207`, `third_party/spirv-headers c63848ec` — so seven repositories,
+not three, end up inside `helios_vkd3d.dll`.
+
 ⚠ `.gitmodules` in the superproject names `https://github.com/rupansh/vkd3d-proton` while the
 checkout's `origin` is `HansKristian-Work/vkd3d-proton` via the `github-rupansh` SSH alias (R3 §10.2).
 Any Helios change to vkd3d (§7.4) needs the fork wired as a push remote first — that wiring, and the
 commit that adds `helios_entry.c` + `helios_vkd3d.def` + the `helios_vkd3d_lib` target, is **stage
 S0c** (§11). It was previously specified in §7.4 and scheduled nowhere.
 
-⚠ Initialising these three submodules is also what makes UNVERIFIED-10 answerable: their licence
-files are not in the tree until this command runs, and three of the four components that link into
-`helios_vkd3d.dll` are among them (§7.4).
+⚠ Initialising these submodules is also what made UNVERIFIED-10 answerable — the licence files are
+not in the tree until this command runs. ✅ Read and tabulated: §7.4's seven-row table.
 
 ### 8.3 Building vkd3d — Linux mingw cross is PRIMARY; native MSVC on the VM is the fallback
 
@@ -1897,19 +1907,13 @@ the value, run a full `tools\install-helios-kmd.ps1`, re-read. If it comes back,
 class installer synthesises it; if not, it was a one-off manual write and should be `DelReg`'d by the
 INF. ⚠ Owner consent — it changes the machine.
 
-**UNVERIFIED-10 — the licence terms of the three vendored components that link into
-`helios_vkd3d.dll` alongside vkd3d itself.** §7.4 verifies vkd3d-proton as LGPL-2.1-or-later from
-`COPYING` + the 502-line `LICENSE`, and concludes that `helios_umd12.dll` stays outside the LGPL
-boundary. That analysis is **incomplete**: `subprojects/dxil-spirv`
-(`HansKristian-Work/dxil-spirv`), `khronos/Vulkan-Headers` and `khronos/SPIRV-Headers` are all
-linked or compiled into the same DLL (§8.4, `meson.build:177`) and all three are **uninitialised
-submodules today**, so their terms are physically not in this checkout — `git submodule status`
-shows the leading `-` on all three (§8.2). R11 raised this as U5 and it was dropped; it is carried
-here so it is not dropped again. *Settle:* immediately after S0's
-`git submodule update --init --recursive`, read
-`subprojects/dxil-spirv/{COPYING,LICENSE*}`, `khronos/Vulkan-Headers/LICENSE*` and
-`khronos/SPIRV-Headers/LICENSE*`, record each verbatim identifier (not a remembered one) in §7.4's
-component table, and hand the owner the completed table **before any `helios_vkd3d.dll` is
-distributed**. ⛔ Zero cost, zero risk, and it is the difference between the owner deciding on
-vkd3d's licence and the owner deciding on the DLL's actual licence set. §7.4 already escalates the
-licence question to the owner — this is what must be escalated *with* it.
+**UNVERIFIED-10 — ✅ CLOSED 2026-08-05.** The licence terms of the components that link into
+`helios_vkd3d.dll` alongside vkd3d itself are read and tabulated in §7.4. ⚠ **It was three
+components in this item's own statement and it is actually six**, because `dxil-spirv` carries four
+nested submodules that a non-recursive init leaves out of the tree: `dxbc-spirv`, `SPIRV-Cross`,
+`SPIRV-Tools` and a second `spirv-headers` pin. Result: **one LGPL-2.1-or-later component (vkd3d)
+and six permissive ones** (MIT ×2, Apache-2.0 ×2, Khronos MIT-style, Apache-2.0-OR-MIT). The DLL
+boundary of D4 keeps the LGPL obligations off `helios_umd12.dll`; the six permissive components need
+attribution in the package's licence text and nothing more. **The completed table is what goes to the
+owner before any `helios_vkd3d.dll` is distributed** — §7.4 already escalates the licence question,
+and this is what must be escalated with it.
