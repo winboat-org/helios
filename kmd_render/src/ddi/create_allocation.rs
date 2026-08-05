@@ -25,8 +25,8 @@ use helios_protocol::{
     HELIOS_WDDM_ALLOC_MISC_OPTIMAL_GDI_TEXTURE, HELIOS_WDDM_ALLOC_MISC_PRIMARY,
     HELIOS_WDDM_ALLOC_MISC_RESOURCE_ASSOCIATED, HELIOS_WDDM_ALLOC_MISC_STANDARD_TYPE_MASK,
     HELIOS_WDDM_ALLOC_MISC_STANDARD_TYPE_SHIFT, HELIOS_WDDM_BLOB_FLAG_NONLOCAL_TRACKING,
-    HELIOS_WDDM_BLOB_FLAG_VIDMM_TRACKED, VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE,
-    VIRTIO_GPU_BLOB_MEM_HOST3D, VIRTIO_GPU_MAP_CACHE_CACHED, VIRTIO_GPU_MAP_CACHE_WC,
+    VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE, VIRTIO_GPU_BLOB_MEM_HOST3D, VIRTIO_GPU_MAP_CACHE_CACHED,
+    VIRTIO_GPU_MAP_CACHE_WC,
 };
 
 use crate::adapter::{AdapterContext, ScanoutGuard};
@@ -181,6 +181,8 @@ struct AllocationContext {
     bar_eligible: bool,
     /// Provenance of `size`. See [`BackingSize`].
     size_provenance: BackingSize,
+    /// Nonzero only for a registered VidMm tracker allocation.
+    vidmm_tracker_cookie: u32,
 }
 
 /// Per-resource KMD state. Dxgkrnl requires a non-null KMD resource handle for
@@ -1555,6 +1557,10 @@ struct ParsedAllocIdentity {
     memory_type_index: u32,
     ctx_id: u32,
     kind: u32,
+    /// System-wide KMT share and association cookie for the allocation's VidMm
+    /// tracker. Both zero mean the adopted allocation keeps its full charge.
+    global_vidmm_tracker_share: u32,
+    global_vidmm_tracker_cookie: u32,
 }
 
 unsafe fn read_alloc_identity(
@@ -1570,6 +1576,7 @@ unsafe fn read_alloc_identity(
     };
     let ident: HeliosWddmOpenIdentity = pod_read_unaligned(bytes);
     if ident.is_valid() && ident.resource_id != 0 {
+        let tracker = ident.global_vidmm_tracker();
         return Some(ParsedAllocIdentity {
             resource_id: ident.resource_id,
             blob_size: ident.blob_size,
@@ -1577,11 +1584,14 @@ unsafe fn read_alloc_identity(
             memory_type_index: ident.memory_type_index,
             ctx_id: ident.ctx_id,
             kind: ident.kind,
+            global_vidmm_tracker_share: tracker.map_or(0, |tracker| tracker.global_share),
+            global_vidmm_tracker_cookie: tracker.map_or(0, |tracker| tracker.cookie),
         });
     }
     let ap: HeliosWddmAllocPrivate = pod_read_unaligned(bytes);
     if ap.is_valid() && ap.adopt_resource_id != 0 {
         let meta = unsafe { read_standard_meta(private, private_size) };
+        let tracker = ap.global_vidmm_tracker();
         return Some(ParsedAllocIdentity {
             resource_id: ap.adopt_resource_id,
             blob_size: ap.size,
@@ -1592,6 +1602,8 @@ unsafe fn read_alloc_identity(
             memory_type_index: meta.map(|m| m.memory_type_index).unwrap_or(0),
             ctx_id: ap.ctx_id,
             kind: ap.kind,
+            global_vidmm_tracker_share: tracker.map_or(0, |tracker| tracker.global_share),
+            global_vidmm_tracker_cookie: tracker.map_or(0, |tracker| tracker.cookie),
         });
     }
     None
@@ -1619,7 +1631,15 @@ unsafe fn write_open_identity(
         memory_type_index: ident.memory_type_index,
         ctx_id: ident.ctx_id,
         kind: ident.kind,
-        reserved: [0; 2],
+        reserved: if ident.global_vidmm_tracker_share != 0 && ident.global_vidmm_tracker_cookie != 0
+        {
+            [
+                ident.global_vidmm_tracker_share,
+                ident.global_vidmm_tracker_cookie,
+            ]
+        } else {
+            [0; 2]
+        },
     };
     // SAFETY: bounds-checked; the buffer is writable for the DDI call's duration
     // (same contract create_one relies on for its create-time write-back).
@@ -1800,6 +1820,7 @@ unsafe fn destroy_allocation_ctx(
     ctx: Box<AllocationContext>,
 ) {
     let allocation_handle = (&*ctx as *const AllocationContext) as usize;
+    adapter.vidmm_trackers.remove(ctx.vidmm_tracker_cookie);
     // Withdraw the DMA-flip lookup FIRST: after this no Present can resolve
     // this resource id to a handle whose Box is about to be dropped.
     unregister_scanout_allocation(ctx.resource_id);
@@ -1960,14 +1981,14 @@ unsafe fn destroy_allocation_ctx(
 pub(crate) enum BackingSize {
     /// The host allocated it and reported the size back.
     HostAuthoritative(u64),
-    /// The creator claimed it; nothing has checked it against the host.
-    CreatorClaimed(u64),
+    /// The size is valid for accounting, but not authoritative for BAR mapping.
+    NonHostAuthoritative(u64),
 }
 
 impl BackingSize {
     pub(crate) fn bytes(self) -> u64 {
         match self {
-            Self::HostAuthoritative(n) | Self::CreatorClaimed(n) => n,
+            Self::HostAuthoritative(n) | Self::NonHostAuthoritative(n) => n,
         }
     }
 
@@ -2060,7 +2081,7 @@ fn build_backing(
                 dxgi_format: 0,
                 venus_alloc_size: size,
                 memory_type_index: meta.memory_type_index,
-                blob_size: BackingSize::CreatorClaimed(size),
+                blob_size: BackingSize::NonHostAuthoritative(size),
             })
         }
         Backing::AdoptedUmdResource {
@@ -2074,15 +2095,15 @@ fn build_backing(
             // res-45 invalid-import class). Adopting a DEAD resid is a hard
             // error: succeeding here would create a permanently-black shared
             // surface that poisons every opener's venus ring at import time.
-            match adapter.with_virtio(|v| {
+            let adopted_blob_size = match adapter.with_virtio(|v| {
                 if take_ownership {
                     v.adopt_blob_for_allocation(resource_id)
                 } else {
-                    v.resource_is_live(resource_id)
+                    v.live_blob_size(resource_id)
                 }
             }) {
-                Ok(true) => {}
-                Ok(false) => {
+                Ok(Some(size)) if size != 0 => size,
+                Ok(_) => {
                     crate::diag::record(0x0C01_00E4);
                     return Err(STATUS_INVALID_PARAMETER);
                 }
@@ -2090,7 +2111,7 @@ fn build_backing(
                     crate::diag::record(0x0C01_00E1);
                     return Err(STATUS_DEVICE_NOT_READY);
                 }
-            }
+            };
             Ok(CreatedBacking {
                 resource_id,
                 venus_memory_id: 0,
@@ -2100,7 +2121,11 @@ fn build_backing(
                 dxgi_format: meta.dxgi_format,
                 venus_alloc_size: claimed_alloc_size,
                 memory_type_index: meta.memory_type_index,
-                blob_size: BackingSize::CreatorClaimed(ap.size),
+                // The escape-time blob table records the size that actually
+                // created this resource. Keep the non-host-authoritative
+                // provenance (adopted payloads are not BAR-eligible), but do
+                // not trust a second, potentially inconsistent create claim.
+                blob_size: BackingSize::NonHostAuthoritative(adopted_blob_size),
             })
         }
         Backing::KmdLinearPrimary { width, height } => {
@@ -2242,7 +2267,7 @@ fn build_backing(
                     dxgi_format: meta.dxgi_format,
                     venus_alloc_size: claimed_alloc_size,
                     memory_type_index: meta.memory_type_index,
-                    blob_size: BackingSize::CreatorClaimed(size),
+                    blob_size: BackingSize::NonHostAuthoritative(size),
                 })
             }
             Err(_ve) => {
@@ -2310,6 +2335,7 @@ unsafe fn create_one(
             || ap.size > (SIZE_T::MAX - (PAGE - 1)) as u64
             || ap.ctx_id == 0
             || ap.blob_id != 0
+            || ap.map_cache == 0
             || ap.adopt_resource_id != 0)
     {
         // A tracking allocation is deliberately only a VidMm charge. Reject
@@ -2398,6 +2424,16 @@ unsafe fn create_one(
     meta.venus_alloc_size = created.venus_alloc_size;
     meta.memory_type_index = created.memory_type_index;
     ap.size = created.blob_size.bytes();
+    let size = round_up_page(if ap.size == 0 {
+        PAGE
+    } else {
+        ap.size as SIZE_T
+    });
+    let supplied_tracker = ap.global_vidmm_tracker();
+    let tracker_attested = ap.kind == HELIOS_WDDM_ALLOC_KIND_DEVICE_MEMORY
+        && supplied_resource_id != 0
+        && supplied_tracker
+            .is_some_and(|tracker| adapter.vidmm_trackers.matches(tracker.cookie, size));
 
     crate::diag::record(0x0C01_0020);
     crate::diag::record(resource_id);
@@ -2417,7 +2453,10 @@ unsafe fn create_one(
         // imports attach explicitly through HELIOS_ESCAPE_ATTACH_RESOURCE.
         crate::diag::record(0x0C3A_1000 | (resource_id & 0x0FFF));
     }
-    if write_target_len >= size_of::<HeliosWddmOpenIdentity>() && !write_target.is_null() {
+    if ap.kind != HELIOS_WDDM_ALLOC_KIND_TRACKING
+        && write_target_len >= size_of::<HeliosWddmOpenIdentity>()
+        && !write_target.is_null()
+    {
         // Create-time write-back into dxgkrnl's per-allocation buffer (the copy
         // OpenAllocation later reads). This must happen for BOTH KMD-created
         // standard allocations and UMD/Venus-backed adopted allocations:
@@ -2431,6 +2470,12 @@ unsafe fn create_one(
             memory_type_index: meta.memory_type_index,
             ctx_id: ap.ctx_id,
             kind: ap.kind,
+            global_vidmm_tracker_share: supplied_tracker
+                .filter(|_| tracker_attested)
+                .map_or(0, |tracker| tracker.global_share),
+            global_vidmm_tracker_cookie: supplied_tracker
+                .filter(|_| tracker_attested)
+                .map_or(0, |tracker| tracker.cookie),
         };
         unsafe {
             write_open_identity(
@@ -2456,27 +2501,20 @@ unsafe fn create_one(
     }
     record_alloc_event(resource_id, meta.width, meta.height, ap.ctx_id, false);
 
-    let size = round_up_page(if ap.size == 0 {
-        PAGE
-    } else {
-        ap.size as SIZE_T
-    });
     // A DEVICE_MEMORY allocation that adopts a UMD/Venus resource is only a
-    // one-page VidMm identity when the current ICD positively attests that its
-    // full-size tracking allocation succeeded. Missing/old exports and every
-    // tracker failure leave the bit clear and retain this allocation's full
-    // fail-safe charge. Keep the exact renderer size in `AllocationContext`
-    // and the open identity in either case. The adopted object stays in its
-    // proven aperture placement: moving it local makes the first MakeResident
-    // device-remove the UMD.
-    let vidmm_size = if ap.kind == HELIOS_WDDM_ALLOC_KIND_DEVICE_MEMORY
-        && supplied_resource_id != 0
-        && ap.blob_flags & HELIOS_WDDM_BLOB_FLAG_VIDMM_TRACKED != 0
-    {
-        PAGE
-    } else {
-        size
-    };
+    // one-page VidMm identity when its cookie names a live tracker whose size
+    // matches the KMD's recorded adopted-blob size. Every cross-process opener
+    // receives that cookie plus the system-wide share, then validates the opened
+    // tracker's private data, so the charge follows the global allocation rather
+    // than the creator.
+    //
+    // The older VIDMM_TRACKED bit is deliberately insufficient here: a new KMD
+    // paired with an old UMD must retain the full fail-safe adopted charge, not
+    // recreate the creator-exit under-report. Conversely, a new UMD leaves the
+    // old bit clear, so an old KMD also retains the conservative full charge.
+    // Keep the exact renderer size in AllocationContext/open identity in both
+    // cases. The adopted object stays in its proven aperture placement.
+    let vidmm_size = if tracker_attested { PAGE } else { size };
     // CPU-rasterized surfaces (GDI/shadow/staging/shared-primary standard
     // allocations, KMD-backed by a mappable venus blob) go to the BAR memory
     // segment: CPU raster then lands in the SAME bytes the allocation's venus
@@ -2550,7 +2588,17 @@ unsafe fn create_one(
         bar_placed: core::sync::atomic::AtomicU64::new(BAR_UNPLACED),
         bar_eligible,
         size_provenance: created.blob_size,
+        vidmm_tracker_cookie: 0,
     });
+
+    let mut ctx = ctx;
+    if ap.kind == HELIOS_WDDM_ALLOC_KIND_TRACKING {
+        if !adapter.vidmm_trackers.register(ap.map_cache, size) {
+            unsafe { destroy_allocation_ctx(passive, adapter, ctx) };
+            return Err(STATUS_NO_MEMORY);
+        }
+        ctx.vidmm_tracker_cookie = ap.map_cache;
+    }
 
     // ── VidMm metadata: segment placement + CPU visibility ──────────────────
     let is_direct_scanout = ctx.direct_scanout;

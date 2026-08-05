@@ -583,14 +583,14 @@ bool HeliosDxvkDevice::get_resource_alloc_identity(
     std::size_t d3d11_resource_ptr,
     std::uint64_t* venus_alloc_size,
     std::uint32_t* memory_type_index,
-    std::uint32_t* vidmm_tracked) const noexcept {
+    std::uint64_t* global_vidmm_tracker) const noexcept {
   return bridge_guard("get_resource_alloc_identity", false, [&]() -> bool {
     if (venus_alloc_size)
       *venus_alloc_size = 0;
     if (memory_type_index)
       *memory_type_index = 0;
-    if (vidmm_tracked)
-      *vidmm_tracked = 0;
+    if (global_vidmm_tracker)
+      *global_vidmm_tracker = 0;
 
     if (!d3d11_resource_ptr)
       return false;
@@ -603,9 +603,9 @@ bool HeliosDxvkDevice::get_resource_alloc_identity(
     auto info = texture->GetImage()->storage()->getMemoryInfo();
     const bool valid = venus_memory_alloc_info_from_handle(
       info.memory, venus_alloc_size, memory_type_index);
-    if (valid && vidmm_tracked) {
-      *vidmm_tracked =
-        venus_memory_vidmm_tracked_from_handle(info.memory) ? 1u : 0u;
+    if (valid && global_vidmm_tracker) {
+      *global_vidmm_tracker =
+        venus_memory_vidmm_global_identity_from_handle(info.memory);
     }
     return valid;
   });
@@ -649,6 +649,7 @@ std::size_t HeliosDxvkDevice::open_ddi_texture2d(
     std::uint32_t renderer_resource_id,
     std::uint64_t venus_alloc_size,
     std::uint32_t memory_type_index,
+    std::uint64_t global_vidmm_tracker,
     bool scanout_linear,
     bool linear_scanout_target,
     bool cross_context_optimal) const {
@@ -661,9 +662,10 @@ std::size_t HeliosDxvkDevice::open_ddi_texture2d(
         if (bridge_log_budget(s_openBeginLogs, 64, 512)) {
           char msg[256];
           std::snprintf(msg, sizeof(msg),
-            "OpenDdiTexture2D begin %ux%u fmt=%u bind=0x%08x misc=0x%08x global=0x%08x renderer_res=%u alloc_size=%llu mem_type=%u",
+            "OpenDdiTexture2D begin %ux%u fmt=%u bind=0x%08x misc=0x%08x global=0x%08x renderer_res=%u alloc_size=%llu mem_type=%u vidmm_identity=0x%016llx",
             width, height, format, bind_flags, misc_flags, global, renderer_resource_id,
-            static_cast<unsigned long long>(venus_alloc_size), memory_type_index);
+            static_cast<unsigned long long>(venus_alloc_size), memory_type_index,
+            static_cast<unsigned long long>(global_vidmm_tracker));
           umd_log(msg);
         }
       }
@@ -726,6 +728,29 @@ std::size_t HeliosDxvkDevice::open_ddi_texture2d(
 
       if (FAILED(hr) || !resource)
         return 0;
+
+      // The payload WDDM allocation and this imported Venus memory now share
+      // one system-wide VidMm tracker. Opening it here gives this process a
+      // reference before the creator can close its VkDeviceMemory. A shrunk
+      // payload is not safe to expose without that lifetime reference (or the
+      // ICD's full-size fallback), so retention failure rejects the open.
+      if (global_vidmm_tracker) {
+        auto* common = dxvk::GetCommonTexture(resource);
+        const bool retained = common && common->GetImage() &&
+          common->GetImage()->storage() && venus_memory_open_vidmm_tracker(
+            common->GetImage()->storage()->getMemoryInfo().memory,
+            global_vidmm_tracker);
+        if (!retained) {
+          char msg[192];
+          std::snprintf(msg, sizeof(msg),
+            "OpenDdiTexture2D VidMm tracker open failed renderer_res=%u identity=0x%016llx",
+            renderer_resource_id,
+            static_cast<unsigned long long>(global_vidmm_tracker));
+          umd_log(msg);
+          resource->Release();
+          return 0;
+        }
+      }
 
       return reinterpret_cast<std::size_t>(resource);
   });

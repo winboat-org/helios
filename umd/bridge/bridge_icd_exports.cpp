@@ -286,7 +286,7 @@ namespace helios_bridge {
     return module;
   }
 
-  // The eight Mesa-ICD exports this bridge resolves, as a process-wide table.
+  // The Mesa-ICD exports this bridge resolves, as a process-wide table.
   //
   // The old resolver cached each export independently. Every uncached call
   // took a full TH32CS_SNAPMODULE snapshot and called GetProcAddress on every
@@ -309,7 +309,8 @@ namespace helios_bridge {
     MemoryResId,
     MemoryTransferOwnership,
     MemoryAllocInfo,
-    MemoryVidMmTracked,
+    MemoryVidMmGlobalIdentity,
+    MemoryOpenVidMmTracker,
     RegisterPresentStream,
     Count,
   };
@@ -326,8 +327,10 @@ namespace helios_bridge {
     case HeliosIcdExport::MemoryTransferOwnership:
       return "helios_venus_memory_transfer_resource_ownership";
     case HeliosIcdExport::MemoryAllocInfo: return "helios_venus_memory_alloc_info";
-    case HeliosIcdExport::MemoryVidMmTracked:
-      return "helios_venus_memory_vidmm_tracked";
+    case HeliosIcdExport::MemoryVidMmGlobalIdentity:
+      return "helios_venus_memory_vidmm_global_identity";
+    case HeliosIcdExport::MemoryOpenVidMmTracker:
+      return "helios_venus_memory_open_vidmm_tracker";
     case HeliosIcdExport::RegisterPresentStream:
       return "helios_venus_register_present_stream";
     default: return "";
@@ -506,15 +509,31 @@ namespace helios_bridge {
     return false;
   }
 
-  bool venus_memory_vidmm_tracked_from_handle(VkDeviceMemory memory) {
+  std::uint64_t venus_memory_vidmm_global_identity_from_handle(
+      VkDeviceMemory memory) {
     if (memory == VK_NULL_HANDLE)
-      return false;
+      return 0;
 
-    using Fn = bool (__cdecl*)(VkDeviceMemory);
-    if (auto fn = helios_icd_export<Fn>(HeliosIcdExport::MemoryVidMmTracked))
+    using Fn = std::uint64_t (__cdecl*)(VkDeviceMemory);
+    if (auto fn = helios_icd_export<Fn>(
+          HeliosIcdExport::MemoryVidMmGlobalIdentity))
       return fn(memory);
 
-    log_export_unavailable(HeliosIcdExport::MemoryVidMmTracked);
+    log_export_unavailable(HeliosIcdExport::MemoryVidMmGlobalIdentity);
+    return 0;
+  }
+
+  bool venus_memory_open_vidmm_tracker(VkDeviceMemory memory,
+                                       std::uint64_t global_identity) {
+    if (memory == VK_NULL_HANDLE || !global_identity)
+      return false;
+
+    using Fn = bool (__cdecl*)(VkDeviceMemory, std::uint64_t);
+    if (auto fn = helios_icd_export<Fn>(
+          HeliosIcdExport::MemoryOpenVidMmTracker))
+      return fn(memory, global_identity);
+
+    log_export_unavailable(HeliosIcdExport::MemoryOpenVidMmTracker);
     return false;
   }
 

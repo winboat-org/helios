@@ -68,7 +68,7 @@ struct HeliosDxvkDevice {
       std::size_t d3d11_resource_ptr,
       std::uint64_t* venus_alloc_size,
       std::uint32_t* memory_type_index,
-      std::uint32_t* vidmm_tracked) const noexcept;
+      std::uint64_t* global_vidmm_tracker) const noexcept;
   bool transfer_resource_ownership(std::size_t d3d11_resource_ptr) const noexcept;
   std::size_t open_ddi_texture2d(
       std::uint32_t width,
@@ -80,6 +80,7 @@ struct HeliosDxvkDevice {
       std::uint32_t renderer_resource_id,
       std::uint64_t venus_alloc_size,
       std::uint32_t memory_type_index,
+      std::uint64_t global_vidmm_tracker,
       bool scanout_linear,
       bool linear_scanout_target,
       bool cross_context_optimal) const;

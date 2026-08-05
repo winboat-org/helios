@@ -27,6 +27,7 @@ mod locks;
 mod read_ledger;
 mod scanout;
 mod segments;
+mod tracking;
 
 pub(crate) use backing::{SystemBackingSnapshot, SystemBackingTable};
 pub(crate) use locks::{NotifyOrdered, ScanoutGuard, WddmNotifyGuard, WITH_VIRTIO_TORN};
@@ -36,6 +37,7 @@ pub(crate) use read_ledger::{
 };
 pub(crate) use scanout::{PresentStreamMarker, ScanoutRefreshQueue};
 pub(crate) use segments::{BarSegment, PagingRam};
+pub(crate) use tracking::VidMmTrackerTable;
 
 /// Everything `DxgkDdiStartDevice` establishes, as one value published once.
 ///
@@ -488,6 +490,9 @@ pub struct AdapterContext {
     /// Exact system-memory pages Windows associates with a BAR allocation
     /// through paging TRANSFER requests.
     pub(crate) system_backings: SystemBackingTable,
+    /// Live KMD-created VidMm mirrors keyed by the association cookie returned
+    /// to the coherent ICD/UMD stack.
+    pub(crate) vidmm_trackers: VidMmTrackerTable,
     /// The persistent venus client (ring/reply BAR mappings + Vulkan ids) kept
     /// alive for the device lifetime so the page-table blob stays mapped. `None`
     /// until/unless the StartDevice venus bring-up succeeds. Its `Drop` unmaps the
@@ -1045,6 +1050,7 @@ impl AdapterContext {
             read_ledger: ReadLedger::new(),
             paging_pte_shadow: crate::ddi::PagingPteShadow::new(),
             system_backings: SystemBackingTable::new(),
+            vidmm_trackers: VidMmTrackerTable::new(),
             venus_client: UnsafeCell::new(None),
             // Zeroed placeholder — the real dispatcher header is written by
             // `init_kernel_events` once the context is at its final address.

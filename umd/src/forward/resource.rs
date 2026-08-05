@@ -270,22 +270,29 @@ pub(crate) unsafe fn allocate_wddm_resource(
             venus_ctx_id,
             backing.map_or(0, |b| b.blob_id.get()),
             size,
-            VIRTIO_GPU_BLOB_MEM_HOST3D,
+            backing
+                .and_then(|b| b.global_vidmm_tracker)
+                .map_or(VIRTIO_GPU_BLOB_MEM_HOST3D, |tracker| tracker.cookie),
             if backing.is_some() {
                 // DXVK render targets are normally backed by device-local Venus
                 // memory. virglrenderer rejects USE_MAPPABLE for non-host-visible
                 // memory ("mem cannot support mappable blob"). They still must
                 // be shareable so the host can export/import the backing memory.
                 VIRTIO_GPU_BLOB_FLAG_USE_SHAREABLE
-                    | if backing.is_some_and(|b| b.vidmm_tracked) {
-                        HELIOS_WDDM_BLOB_FLAG_VIDMM_TRACKED
+                    | if backing.is_some_and(|b| b.global_vidmm_tracker.is_some()) {
+                        HELIOS_WDDM_BLOB_FLAG_GLOBAL_VIDMM_TRACKER
                     } else {
                         0
                     }
             } else {
                 VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE
             },
-            VIRTIO_GPU_MAP_CACHE_CACHED,
+            // On the typed GLOBAL_VIDMM_TRACKER shape this field carries the
+            // system-wide KMT share handle instead of a cache policy. The KMD
+            // and protocol helper interpret it only under that private bit.
+            backing
+                .and_then(|b| b.global_vidmm_tracker)
+                .map_or(VIRTIO_GPU_MAP_CACHE_CACHED, |tracker| tracker.global_share),
             // The venus resource id for the KMD to adopt. Was patched into the
             // struct after construction because the constructor could not
             // express the field; it is a parameter now, so the record reaches
@@ -507,14 +514,15 @@ pub(crate) unsafe fn finish_wddm_tex2d(
     };
     // C1: record the creating vkAllocateMemory's exact size + memory type into
     // the allocation trailer so cross-process openers import with them.
-    let (mut venus_alloc_size, mut memory_type_index, mut vidmm_tracked) = (0u64, 0u32, 0u32);
+    let (mut venus_alloc_size, mut memory_type_index, mut global_vidmm_tracker) =
+        (0u64, 0u32, 0u64);
     if backing_resource_id != 0 {
         if let Some(dev) = helios_device(h) {
             if !dev.dxvk.get_resource_alloc_identity(
                 res.as_raw() as usize,
                 &mut venus_alloc_size,
                 &mut memory_type_index,
-                &mut vidmm_tracked,
+                &mut global_vidmm_tracker,
             ) {
                 log_error!(
                     "DDI create_resource(tex2d): no venus alloc identity for res_id={}",
@@ -529,7 +537,7 @@ pub(crate) unsafe fn finish_wddm_tex2d(
         backing_resource_id,
         venus_alloc_size,
         memory_type_index,
-        vidmm_tracked != 0,
+        global_vidmm_tracker,
     );
     let (allocation, km_resource) =
         match allocate_wddm_resource(h, a, mip0, h_rt, backing, direct_scanout_primary, scanout) {
@@ -1471,6 +1479,9 @@ pub(crate) unsafe extern "C" fn open_resource(
         ident.resource_id,
         venus_alloc_size,
         ident.memory_type_index,
+        ident.global_vidmm_tracker().map_or(0, |tracker| {
+            (u64::from(tracker.cookie) << 32) | u64::from(tracker.global_share)
+        }),
         false,
         false,
         cross_context_optimal,

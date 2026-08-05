@@ -45,12 +45,9 @@ pub const HELIOS_WDDM_ALLOC_KIND_STANDARD: u32 = 2;
 /// identity resource while VidMm charges the full requested size.
 pub const HELIOS_WDDM_ALLOC_KIND_TRACKING: u32 = 3;
 
-/// Guest-private bit in [`HeliosWddmAllocPrivate::blob_flags`]. On an adopted
-/// DEVICE_MEMORY allocation it attests that the creator successfully made a
-/// matching full-size VidMm tracker, so the adopted identity may be charged as
-/// one page. Missing/older ICD exports leave this clear and therefore retain
-/// the safe full-size adopted charge. Old KMDs ignore this bit after selecting
-/// the adopted-resource arm, so the version-1 wire layout remains compatible.
+/// Legacy guest-private tracking-attestation bit. It remains reserved for ABI
+/// compatibility, but current KMDs require the transferable global-tracker
+/// shape below before reducing an adopted allocation's VidMm charge.
 pub const HELIOS_WDDM_BLOB_FLAG_VIDMM_TRACKED: u32 = 0x8000_0000;
 /// Guest-private bit in [`HeliosWddmAllocPrivate::blob_flags`] on a TRACKING
 /// allocation. The mirrored Vulkan memory belongs to a non-device-local heap
@@ -58,6 +55,26 @@ pub const HELIOS_WDDM_BLOB_FLAG_VIDMM_TRACKED: u32 = 0x8000_0000;
 /// this hint and temporarily over-classify the tracker as local during a mixed
 /// deployment; no virtio blob command ever receives the private bit.
 pub const HELIOS_WDDM_BLOB_FLAG_NONLOCAL_TRACKING: u32 = 0x4000_0000;
+/// Guest-private bit in [`HeliosWddmAllocPrivate::blob_flags`] on an adopted
+/// DEVICE_MEMORY allocation. [`HeliosWddmAllocPrivate::map_cache`] then carries
+/// the system-wide `D3DKMT_CREATEALLOCATION::hGlobalShare` of the matching
+/// VidMm tracker rather than a cache policy, while `blob_mem` carries its
+/// nonzero association cookie. Every process importing the Venus allocation
+/// opens and validates that same tracker, so its one memory charge survives the
+/// creator and follows the global WDDM allocation lifetime.
+///
+/// This supersedes [`HELIOS_WDDM_BLOB_FLAG_VIDMM_TRACKED`] for exact
+/// accounting. New KMDs shrink the adopted allocation to one page only for
+/// this stronger, transferable attestation. Old KMDs ignore this bit and keep
+/// the full conservative adopted charge because new UMDs leave the legacy bit
+/// clear, making either mixed deployment over-report rather than under-report.
+pub const HELIOS_WDDM_BLOB_FLAG_GLOBAL_VIDMM_TRACKER: u32 = 0x2000_0000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GlobalVidMmTracker {
+    pub global_share: u32,
+    pub cookie: u32,
+}
 
 /// [`HeliosWddmAllocMeta::misc_flags`] — the standard allocation is the exact
 /// VidPn primary selected for direct scanout.
@@ -94,9 +111,11 @@ pub const HELIOS_WDDM_ALLOC_MISC_GDI_TYPE_SHIFT: u32 = 20;
 /// Private driver data for one allocation created via `D3DKMTCreateAllocation`.
 ///
 /// `blob_id` is the venus device-memory id that backs a HOST3D mappable blob (0
-/// for a scratch shmem ring); `blob_mem`/`blob_flags` mirror the
-/// `VIRTIO_GPU_BLOB_MEM_*` / `VIRTIO_GPU_BLOB_FLAG_*` the KMD forwards to
-/// `VirtioGpu::resource_create_blob`. 48 bytes.
+/// for a scratch shmem ring). Normally `blob_mem`/`blob_flags` and `map_cache`
+/// carry the virtio blob parameters the KMD forwards to
+/// `VirtioGpu::resource_create_blob`; on the typed global-tracker adopted shape,
+/// `blob_mem` and `map_cache` instead carry the tracker cookie and global share
+/// and are never forwarded as virtio parameters. 48 bytes.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub struct HeliosWddmAllocPrivate {
@@ -104,10 +123,10 @@ pub struct HeliosWddmAllocPrivate {
     pub size: u64,    // in:  blob size in bytes
     pub magic: u32,   // == HELIOS_WDDM_MAGIC
     pub version: u32, // == HELIOS_WDDM_VERSION
-    pub blob_mem: u32, // in:  VIRTIO_GPU_BLOB_MEM_* (HOST3D)
+    pub blob_mem: u32, // in:  VIRTIO_GPU_BLOB_MEM_* or typed tracker cookie
     pub blob_flags: u32, // in:  VIRTIO_GPU_BLOB_FLAG_* (USE_MAPPABLE)
     pub ctx_id: u32,  // in:  owning venus context id
-    pub map_cache: u32, // in/out: requested/effective VIRTIO_GPU_MAP_CACHE_*
+    pub map_cache: u32, // in/out: VIRTIO_GPU_MAP_CACHE_* or typed global share
     pub kind: u32,    // in:  HELIOS_WDDM_ALLOC_KIND_*
     /// Optional existing virtio resource id for the KMD to adopt instead of
     /// creating a new one (0 = create). Named `_pad` until R805, which is why
@@ -148,6 +167,25 @@ impl HeliosWddmAllocPrivate {
     #[inline]
     pub fn is_valid(&self) -> bool {
         self.magic == HELIOS_WDDM_MAGIC && self.version == HELIOS_WDDM_VERSION
+    }
+
+    /// The transferable VidMm tracker's system-wide identity.
+    ///
+    /// `map_cache` and `blob_mem` retain their normal meanings in every other
+    /// allocation shape. Requiring the complete adopted shape keeps both field
+    /// overloads at one typed boundary.
+    #[inline]
+    pub fn global_vidmm_tracker(&self) -> Option<GlobalVidMmTracker> {
+        (self.is_valid()
+            && self.kind == HELIOS_WDDM_ALLOC_KIND_DEVICE_MEMORY
+            && self.adopt_resource_id != 0
+            && self.blob_flags & HELIOS_WDDM_BLOB_FLAG_GLOBAL_VIDMM_TRACKER != 0
+            && self.map_cache != 0
+            && self.blob_mem != 0)
+            .then_some(GlobalVidMmTracker {
+                global_share: self.map_cache,
+                cookie: self.blob_mem,
+            })
     }
 }
 
@@ -236,7 +274,6 @@ pub struct HeliosWddmAllocMeta {
 pub const HELIOS_WDDM_IDENTITY_MAGIC: u32 = 0x4849_444E;
 /// Current open-identity ABI version.
 pub const HELIOS_WDDM_IDENTITY_VERSION: u32 = 1;
-
 /// Allocation identity record the KMD writes into the OPEN-time private driver
 /// data in `DxgkDdiOpenAllocation`, overwriting the first 48 bytes (the
 /// [`HeliosWddmAllocPrivate`] region — the [`HeliosWddmAllocMeta`] trailer at
@@ -276,6 +313,22 @@ impl HeliosWddmOpenIdentity {
     #[inline]
     pub fn is_valid(&self) -> bool {
         self.magic == HELIOS_WDDM_IDENTITY_MAGIC && self.version == HELIOS_WDDM_IDENTITY_VERSION
+    }
+
+    /// Return the global VidMm tracker identity only when its complete typed
+    /// shape is present. `reserved[0]` is the share and `reserved[1]` the
+    /// association cookie; legacy identities leave both zero.
+    #[inline]
+    pub fn global_vidmm_tracker(&self) -> Option<GlobalVidMmTracker> {
+        (self.is_valid()
+            && self.kind == HELIOS_WDDM_ALLOC_KIND_DEVICE_MEMORY
+            && self.resource_id != 0
+            && self.reserved[0] != 0
+            && self.reserved[1] != 0)
+            .then_some(GlobalVidMmTracker {
+                global_share: self.reserved[0],
+                cookie: self.reserved[1],
+            })
     }
 }
 
@@ -734,5 +787,81 @@ mod classify_tests {
             classify(&private(HELIOS_WDDM_ALLOC_KIND_TRACKING), &meta(0), 0),
             Ok(AllocationBacking::VidMmTracking { size: 4096 })
         );
+    }
+
+    #[test]
+    fn global_tracker_identity_requires_the_complete_adopted_shape() {
+        let mut ap = private(HELIOS_WDDM_ALLOC_KIND_DEVICE_MEMORY);
+        ap.adopt_resource_id = 42;
+        ap.blob_flags |= HELIOS_WDDM_BLOB_FLAG_GLOBAL_VIDMM_TRACKER;
+        ap.blob_mem = 0x5678;
+        ap.map_cache = 0x1234;
+        assert_eq!(
+            ap.global_vidmm_tracker(),
+            Some(GlobalVidMmTracker {
+                global_share: 0x1234,
+                cookie: 0x5678,
+            })
+        );
+
+        let mut missing_flag = ap;
+        missing_flag.blob_flags &= !HELIOS_WDDM_BLOB_FLAG_GLOBAL_VIDMM_TRACKER;
+        assert_eq!(missing_flag.global_vidmm_tracker(), None);
+
+        let mut missing_adopt = ap;
+        missing_adopt.adopt_resource_id = 0;
+        assert_eq!(missing_adopt.global_vidmm_tracker(), None);
+
+        let mut missing_share = ap;
+        missing_share.map_cache = 0;
+        assert_eq!(missing_share.global_vidmm_tracker(), None);
+
+        let mut missing_cookie = ap;
+        missing_cookie.blob_mem = 0;
+        assert_eq!(missing_cookie.global_vidmm_tracker(), None);
+
+        let mut wrong_kind = ap;
+        wrong_kind.kind = HELIOS_WDDM_ALLOC_KIND_STANDARD;
+        assert_eq!(wrong_kind.global_vidmm_tracker(), None);
+
+        let mut invalid = ap;
+        invalid.magic = 0;
+        assert_eq!(invalid.global_vidmm_tracker(), None);
+    }
+
+    #[test]
+    fn open_identity_never_infers_a_tracker_from_reserved_data() {
+        let mut ident = HeliosWddmOpenIdentity {
+            venus_alloc_size: 4096,
+            blob_size: 4096,
+            magic: HELIOS_WDDM_IDENTITY_MAGIC,
+            version: HELIOS_WDDM_IDENTITY_VERSION,
+            resource_id: 42,
+            memory_type_index: 0,
+            ctx_id: 7,
+            kind: HELIOS_WDDM_ALLOC_KIND_DEVICE_MEMORY,
+            reserved: [0x1234, 0],
+        };
+        assert_eq!(ident.global_vidmm_tracker(), None);
+
+        ident.reserved[1] = 0x5678;
+        assert_eq!(
+            ident.global_vidmm_tracker(),
+            Some(GlobalVidMmTracker {
+                global_share: 0x1234,
+                cookie: 0x5678,
+            })
+        );
+
+        ident.reserved[0] = 0;
+        assert_eq!(ident.global_vidmm_tracker(), None);
+
+        ident.reserved[0] = 0x1234;
+        ident.resource_id = 0;
+        assert_eq!(ident.global_vidmm_tracker(), None);
+
+        ident.resource_id = 42;
+        ident.kind = HELIOS_WDDM_ALLOC_KIND_STANDARD;
+        assert_eq!(ident.global_vidmm_tracker(), None);
     }
 }
