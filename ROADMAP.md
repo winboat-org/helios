@@ -83,6 +83,111 @@ time to stop shipping something nobody measured:**
   every other escape constant in that file was checked against
   `protocol/src/escape.rs` and is correct.
 
+## RDP desktop lag — root-caused and CLOSED (2026-08-05)
+
+**Symptom (owner):** over RDP, anything that *changes* the desktop is slow —
+opening the Start menu, dragging an Explorer window, a closing window whose
+frame lingers — while a static desktop, and the dragged window itself, stay
+fluid and interactive. A second tester additionally reported frame tearing.
+
+**Helios IS in the RDP path**, which is the fact the whole diagnosis rests on:
+the RDP session's `dwm` renders the desktop on Helios, and RDP's indirect
+display driver (`RDPIDD`, `SWD\REMOTEDISPLAYENUM\...&SESSIONID_nnnn`, hosted in
+`WUDFHost`) is *also* a Helios D3D11 client. Its UMD log shows it creates one
+resource of its own — `1920x1080 fmt=87 usage=3 cpu=0x30000`
+(BGRA / `USAGE_STAGING` / `CPU_ACCESS_READ|WRITE`) — and `OpenResource`s DWM's
+swapchain buffers. So every captured frame is
+`CopyResource -> Map(READ) -> memcpy 8.3 MB -> Unmap`.
+
+**Two independent causes. The first was ours; the second was not, and was the
+dominant one.** Fixing only the first left the symptom essentially intact —
+recorded here because the first fix's numbers look conclusive in isolation and
+are not.
+
+### Cause 1 (ours, FIXED) — HOST_CACHED memory was mapped write-combined
+
+`vn_device_memory.c` set `prefer_cached_map` **only** for the WSI blit
+destination, so every other host-visible allocation was mapped WC — including
+ones DXVK makes on the `HOST_VISIBLE|HOST_COHERENT|HOST_CACHED` type precisely
+to get fast CPU reads (`d3d11_texture.cpp:1015`, every `USAGE_STAGING`
+resource). The host already reports `CACHED` for that type; `effective_map_cache()`
+honours the ICD's request over the host's, so the ICD's own override was the
+entire cause. Fixed: honour `HOST_CACHED`.
+
+Same-boot A/B, `tools/d3d11_rdp_capture_probe.cpp` (new — replicates RDPIDD's
+loop on RDPIDD's exact resource desc):
+
+| per captured frame | before | after |
+|---|---|---|
+| `memcpy` out of the mapping | 25.209 ms — **313.8 MB/s** | 0.613 ms — **12906 MB/s** |
+| `MOVNTDQA`, same pages | 0.839 ms — 9428.1 MB/s | 0.620 ms — 12756.3 MB/s |
+| total | 25.069 ms | 0.942 ms |
+
+**The discriminator is that `memcpy` and `MOVNTDQA` measure the same
+afterwards.** Streaming loads only beat `memcpy` on write-combined memory, so
+"30x faster with MOVNTDQA" *is* the WC signature, and its disappearance is the
+proof. Cache maintenance stays free: the type is COHERENT, guest WB over host WB
+is hardware-coherent under KVM, and `helios_bo_needs_cache_ops()` already
+exempts exactly this flag combination. Write-only `DYNAMIC` resources are
+unaffected — they request `HOST_VISIBLE|HOST_COHERENT`, which matches the
+lower-indexed uncached type first, and WC is correct for them.
+
+### Cause 2 (NOT ours, and the dominant one) — RDP's link estimate was fiction
+
+With capture made cheap, the guest sat at **2% total CPU across 16 vCPUs** with
+the encoder idle at 1.4%, and the desktop was still slow. During a drag:
+
+    input frames/second 70.03   output frames/second 0.94
+    frames skipped/second - insufficient network resources 69.08
+    current tcp bandwidth 1536.00 (mean == max)   current tcp rtt 100.00 (mean == max)
+    loss rate 0.00
+
+Real RTT to the client is **0 ms** and the link is a **10 Gbps local virtio
+bridge** with zero loss. RDP believed 1536 Kbps / 100 ms — its built-in default
+profile — and discarded 69 of every 70 frames DWM produced. Cause:
+
+    HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp
+        SelectNetworkDetect = 1
+
+Per this box's own `C:\Windows\PolicyDefinitions\TerminalServer.admx`, `1` =
+**connect-time detect OFF**, so RDP never measures the link. Set to `0` (both
+connect-time and steady-state detection on); takes effect on the next
+connection. `DWMFRAMEINTERVAL=15` is also set on `WinStations`, so this box has
+had an "RDP optimization" pass — that is the likely provenance.
+
+**Result after both, same repro** (`tools/rdp-measure.ps1 -Mode drag`):
+
+| drag repro | original | cause 1 fixed | **both fixed** |
+|---|---|---|---|
+| input -> output fps | 43.6 -> 3.3 | 63.1 -> 15.8 | **36.1 -> 35.1** |
+| frames skipped/s (network) | 39.6 | 45.4 | **0.05** |
+| avg encoding time | 8.05 ms | 6.20 ms | **1.25 ms** |
+| `WUDFHost` (RDPIDD) CPU | **87.0%** | 5.4% | 3.9% |
+
+Owner-confirmed by eye: "RDP is smooth, perfect."
+
+**Instruments, all reusable** — `tools/d3d11_rdp_capture_probe.cpp` +
+`tools/d3d11-rdp-capture-probe.ps1` (per-phase capture cost, with a cached
+heap->heap control and the MOVNTDQA memory-type classifier);
+`tools/rdp-measure.ps1` -> `tools/rdp-lag-repro.ps1` + `tools/rdp-sample.ps1`
+(damage workload in the interactive session + RemoteFX Graphics/Network and
+per-process CPU sampling).
+
+⚠ **Two traps this cost a cycle each, both now guarded in the scripts.**
+(1) The RDP session id is **not stable** — a reconnect (e.g. after a reboot)
+moves the same user to a new session, and a sampler hardcoding the old one
+silently reports 0% CPU for a session that no longer exists. `rdp-sample.ps1`
+resolves it at run time from `query session`. (2) The workload must be *proved*
+to have run in the RDP session, not assumed: `rdp-lag-repro.ps1` writes its own
+`SessionId` to its output file. The console/SDL session is a *different*
+session with its own `dwm`, and a repro landing there measures the SDL scanout
+path instead.
+
+**Still open:** the second tester's frame tearing is unretested since the frame
+throttle was removed — RDP dropping 98 % of frames could plausibly have produced
+partial-looking updates on its own. Re-check before opening any driver-side
+tearing investigation.
+
 ## Current verified correction (2026-08-04, KMD 22.22.238.0)
 
 - **Fullscreen presentation is not currently a broken SDL scanout path.** The
