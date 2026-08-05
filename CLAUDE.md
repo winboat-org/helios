@@ -128,7 +128,8 @@ helios-vgpu/
 │                             split: umd_common + umd12 + the vkd3d bridge), DDI_REFERENCE
 │                             (the d3d12umddi contract, reconstructed — MS does not
 │                             document it), PRESENT, SUBSTRATE, KMD_IMPACT, GATES
-│                             (D12-G0..G11), research/ (12 evidence dossiers)
+│                             (D12-G0..G11), PARALLEL (the S6 lane split across
+│                             concurrent agents), research/ (12 evidence dossiers)
 ├── docs/reference/         ← Non-narrative reference data (host vulkaninfo profile)
 │
 ├── kmd_render/             ← ACTIVE: WDDM render+display miniport (Rust, no_std)

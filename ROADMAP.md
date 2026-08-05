@@ -3376,6 +3376,24 @@ silent on it:
   `umd12/build.rs`'s module doc. Then **S4b** (the `helios_icd_anchor_v1` export in
   both DLLs, which must land before the first two-engine run — UNVERIFIED-4), then
   S5, then S6.
+- ⭐ **S6 is the bulk — 214 driver-side slots — and it FANS OUT. The split is
+  `docs/dx12/PARALLEL.md`:** 11 lanes with exclusive file ownership, an append-only
+  protocol for the four shared files, and a lease on the VM. Two things gate the
+  fan-out and are worth knowing before planning around it:
+  - ⛔ **Lane 0 is a tooling prerequisite.** `tools/umd-check.ps1` hardcodes one
+    mirror, one `CARGO_TARGET_DIR` and one log path, and `robocopy /MIR`s
+    destructively — **two agents cannot compile concurrently today**, and the first
+    symptom is a lane compiling code it did not write. It needs a `-Lane` parameter;
+    omitting it must behave exactly as today.
+  - ⛔ **Authoring parallelises; validating does not.** There is one VM and one
+    adapter. `win_install_umd` disables the PCI device, benchmarks are exclusive,
+    and `HKLM\SOFTWARE\Helios` knobs are machine-global — one agent's A/B arm
+    silently applies to another's measurement. Gates are run once, by the
+    integrator, against merged code.
+  - **S6-0 is the keystone**: stub all 214 slots with counting noops *before* any
+    lane starts, so every lane is substitutive rather than additive, `D12-G7` is
+    green before any lane lands, and the noop hit counters become each lane's
+    progress metric (which is already `CONFORMANCE.md`'s charter).
 - **The fork has content now.** `vkd3d-proton-helios` is on branch `helios` at
   `github.com/rupansh/vkd3d-proton` (remote `helios`; the checkout's `origin` is
   still upstream — ⛔ push to `helios`): D4's two DXGI-free exports, plus a
