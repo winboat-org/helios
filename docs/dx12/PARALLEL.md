@@ -148,7 +148,7 @@ D3D11 side's exported entry points, which are `extern "system"`.
 
 ⛔ **`bridge_guard` stays singular.** Lanes use the shared `umd_common/bridge/bridge_guard.h`; no
 lane writes a second guard template, and no lane defines `HELIOS_BRIDGE_ENGINE_CATCH` (vkd3d throws
-nothing). `grep -rn 'static_assert(' umd/bridge umd12/bridge umd_common/bridge` must stay at **1**.
+nothing). `grep -rnE '^[[:space:]]*static_assert\(' umd/bridge umd12/bridge umd_common/bridge` must stay at **1**.
 
 ## 6. The VM lease
 
@@ -268,7 +268,7 @@ reviewer adds nothing a `grep` does not, and an agent's attention is better spen
 | every `unsafe` has a `// SAFETY:` | `CLAUDE.md` rule 4 |
 | no `panic!` / `todo!` / `unimplemented!` / `.unwrap()` / `.expect()` on runtime data | a panic in any DDI is a **silent graphics deadlock**; `panic = "abort"` makes it a dead compositor |
 | no `#[allow(...)]` on a hand-written line | generated code may be allowed, hand-written code may not — R908 |
-| `grep -rn 'static_assert(' umd/bridge umd12/bridge umd_common/bridge` → **1** | `ead692e`. ⚠ with the paren; the bare word matches this document |
+| `grep -rnE '^[[:space:]]*static_assert\(' umd/bridge umd12/bridge umd_common/bridge` → **1** | `ead692e`. ⚠ the **anchor** is what works — both the bare word and the trailing-paren form count the comments that quote them, and reported 3. ⛔ never `git grep`: it skips untracked files, so a new `umd12/bridge/` reads 0 |
 | `cargo clippy --target x86_64-pc-windows-msvc -- -D warnings` | 214 hand-written handlers is where `missing_safety_doc` earns its keep |
 | `git diff` on the four shared files is append-only | §5 |
 
@@ -333,7 +333,7 @@ once per lane.
 
 ## 11. Integrator's checklist per merge
 
-- `grep -rn 'static_assert(' umd/bridge umd12/bridge umd_common/bridge` → **1**
+- `grep -rnE '^[[:space:]]*static_assert\(' umd/bridge umd12/bridge umd_common/bridge` → **1**
 - `umd-check.ps1 -Mode check -Crate both` → 0 errors, and `umd`'s warning count **unchanged**
 - the knob inventory still byte-identical for **`umd`** (S2's instrument,
   `tools/capture-knob-inventory.ps1`) — a lane that perturbs the D3D11 driver has broken the split

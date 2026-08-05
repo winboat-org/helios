@@ -8,13 +8,22 @@
 // LogonUI crash-looped at cold boot and nothing warned. The assert below is
 // the fix, and this is the check that it is still the only one:
 //
-//     grep -rn 'static_assert(' umd/bridge umd12/bridge umd_common/bridge
+//     grep -rnE '^[[:space:]]*static_assert\(' umd/bridge umd12/bridge umd_common/bridge
 //
-// must return exactly one hit — line 87 of this file.
-// ⚠ Note the trailing `(`. The check was originally written against the bare
-// word, which now matches this very comment and the pointer left behind in
-// `dxvk_bridge.cpp`: a check that counts its own documentation reports 3 and
-// looks like a regression.
+// must return exactly one hit — the `static_assert` further down this file.
+//
+// ⚠ TWO earlier spellings of this check were BROKEN, and both looked fine:
+//   * the bare word `static_assert` matched this very comment and the pointer
+//     left behind in `dxvk_bridge.cpp` — it reported 3 and read as a
+//     regression;
+//   * adding the trailing `(` did NOT fix that, because both of those comments
+//     quote the paren too. It still reported 3, right up until S4 measured it.
+// The anchor is what actually works: a real `static_assert` starts its line
+// (after indentation), a quoted one is preceded by `//`.
+//
+// ⛔ And do NOT reach for `git grep` here. It skips untracked files, so a
+// freshly added `umd12/bridge/` — which is exactly when a second guard is most
+// likely to appear — reads as **0** and the check passes by being blind.
 #pragma once
 
 #include <cstdio>

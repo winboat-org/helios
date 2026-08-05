@@ -65,8 +65,11 @@
 //! ⛔ **`bridge_guard` kept its `static_assert`** (commit `ead692e`). A second
 //! guard template written from scratch is exactly how that truncation bug —
 //! which crash-looped dwm and LogonUI at cold boot — comes back.
-//! `git grep -n 'static_assert' umd/bridge umd12/bridge umd_common/bridge`
-//! must return exactly one hit.
+//! `grep -rnE '^[[:space:]]*static_assert\(' umd/bridge umd12/bridge umd_common/bridge`
+//! must return exactly one hit. ⛔ Not `git grep` — it skips untracked files, so
+//! a newly added `umd12/bridge/` reads as 0 and the check passes by being blind.
+//! ⚠ Not the unanchored form either: it counts the comments that quote it, this
+//! one included. See `bridge_guard.h`'s header for both broken spellings.
 
 #![deny(deprecated)]
 

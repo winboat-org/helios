@@ -217,8 +217,10 @@ namespace helios_bridge {
   // (`DECISIONS.md` D3b), together with the ~30 lines of comment recording why
   // it exists and why its compile-time assert is not optional (commit
   // `ead692e`, the truncation that crash-looped dwm and LogonUI at cold boot).
-  // Read it there; `grep -rn 'static_assert(' umd/bridge umd12/bridge
-  // umd_common/bridge` must return exactly one hit and it is in that file.
+  // Read it there; the check that it is still the only one is
+  // `grep -rnE '^[[:space:]]*static_assert\(' umd/bridge umd12/bridge
+  // umd_common/bridge` -> exactly one hit, in that file. ⚠ The anchor is
+  // load-bearing: without it this comment counts itself.
   //
   // The DXVK-specific arm stays here, as the header's one customization point.
   // `dxvk::DxvkError` is not a `std::exception`, so without this the generic
