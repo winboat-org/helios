@@ -817,6 +817,48 @@ decision, not two. The token itself is **composed from bindgen'd constants**
 (`D3D12DDI_INTERFACE_VERSION_R8`, `D3D12DDI_BUILD_VERSION_0110`), never transcribed: bindgen does not
 emit `D3D12DDI_SUPPORTED_0110` at all, because the macro casts through `(UINT64)`.
 
+**Decision D13 — ⛔ OWNER REQUIREMENT, 2026-08-06: every DDI *private-data* type lives in
+`umd_common`. Hard requirement, no per-crate private-block structs.**
+
+> *"if we must use any private data, make sure its part of the `umd_common` crate, its a hard
+> requirement"*
+
+**Scope.** "Private data" is the runtime-allocated block a WDDM UMD sizes with a `CalcPrivate*Size`
+DDI and writes through the matching `Create*`/`Open*` — the thing behind every handle's
+`pDrvPrivate`. `D3D12DDI_DEVICE_FUNCS_CORE_0109` alone has **26** `CalcPrivate*` slots (§4.1), so
+this binds nearly every lane, not one file.
+
+⇒ **The payload structs go in `umd_common`, in a module of their own, and `umd12` declares none.**
+D3b already moved the *mechanism* (`umd_common::slot`: `Slot<P>`, `Com<T>`, `Boxed<S>`,
+`ComHandle`/`BoxedHandle`) while explicitly leaving the payload structs per-crate — *"`umd` keeps …
+`boxed_slot`, whose payload structs are private to `forward`"* (`slot.rs:6-8`). D13 changes that for
+D3D12: the mechanism **and** the payload types are shared.
+
+**Why it is right, beyond being the owner's call.** D3c is the standing open question this repairs
+in advance: `ResourceHeaps.md:1254` makes *"DWM opens D3D12-created resources through the 11 DDI"* a
+stated requirement, and Helios' two DLLs hold two different engines. A resource created by
+`helios_umd12.dll` and opened by `helios_umd.dll` is one private block read by two modules. If its
+layout is declared twice, the two declarations agree **by copy-paste** and disagree silently the
+first time one of them changes — which is exactly the class D3b was written to kill. One declaration
+makes the agreement structural.
+
+⛔ **The constraint this puts on how private blocks are written, and it is not optional.**
+`umd_common` **must keep building on Linux** (§4.2, and the whole of `PARALLEL.md` §7 rests on it),
+and it must not acquire a `build.rs` — D3b: *"a build script there would drag the WDK into a crate
+that must also build on Linux."* Therefore:
+
+* ⛔ **A private-data struct may not name a `ddi12`/`ddi` bindgen type.** Those types exist only
+  inside the two cdylibs. Store the **fields** — a `usize` COM pointer, a `u64` GPU virtual address,
+  a `u32` flags word, a format enumerator as its numeric value — not the DDI struct.
+* Anything genuinely ABI-shaped stays in the owning cdylib and is *converted* at the DDI boundary.
+  The private block is the driver's own record, not a copy of the runtime's argument.
+* `#[cfg(windows)]` is fine (`slot` already is); the host cross-check targets
+  `x86_64-pc-windows-msvc`, so cfg-windows modules still type-check there.
+
+⚠ **`Slot<Boxed<S>>::get()`'s soundness argument is still not inherited** (`slot.rs:304-322`,
+`PARALLEL.md` §9.4). D13 shares the *type*; it does not share the D3D11 `CUseCountedObject` claim.
+A lane that calls `get()` still owes the re-derived D3D12 argument at its own call site.
+
 ---
 
 ## 8. Deliverable map

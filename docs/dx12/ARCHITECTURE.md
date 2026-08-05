@@ -529,7 +529,10 @@ umd12/
 └── src/
     ├── lib.rs
     ├── ddi12.rs
-    ├── adapter12.rs
+    ├── adapter12.rs                 # ⛔ D13: no private-block struct is declared anywhere under
+    │                                #   src/ — they all live in umd_common/src/private12.rs, and
+    │                                #   may name no ddi12 type (umd_common builds on Linux)
+
     ├── caps12.rs
     ├── device12.rs
     ├── bridge12.rs
@@ -551,7 +554,7 @@ umd12/
 | `src/ddi12.rs` | `include!($OUT_DIR/d3d12umddi.rs)` + the four `#![allow(non_*)]`, plus hand-pinned `offset_of!` asserts for **only** the structs read positionally (start with `D3D12DDIARG_CREATEDEVICE_0109` and `D3D12DDIARG_OPENADAPTER`) | `umd/src/ddi.rs` (80 L), whose `abi_offsets` doc (`:18-49`) explains why bindgen's own asserts are *not* a substitute | bindgen derives struct and assertion from the same header, so they are self-consistent by construction; hand-pinned offsets catch the ABI *moving* |
 | `src/adapter12.rs` | `OpenAdapter12`, the `UmdD3D12` knob gate, `AdapterToken`, `adapter_ok`, `calc_private_device_size`, `create_device`, `close_adapter`, `get_supported_versions`, `get_optional_ddi_tables`, `fill_ddi_table`, `DeviceUnderConstruction` | `umd/src/adapter.rs` (608 L) | it is the same eight-step shape; the guard and the closed-set version enum are the two things that must not be reinvented (§12 traps 2, 3) |
 | `src/caps12.rs` | one `D3D12FeatureProfile` struct + the `pfnGetCaps` dispatch over the live `D3D12DDICAPS_TYPE` set — **43 enumerators** at `d3d12umddi.h:94-150`, all of them in that one enum (§1.2 step 8; the value-by-value list is `DDI_REFERENCE.md` §11.1, the must-answer subset §11.2, the 14 tiered enums §11.4, the runtime's cross-check rules §11.5, and the three to pin conservatively from commit 1 §11.6) — with `const _: () = assert!(…)` coherence checks between tiers | `umd/src/caps.rs` (266 L) — **discipline only** | H4: `D3D12Core.dll`'s own strings enforce ~60 cross-tier consistency rules; advertising an unbacked tier is a lie the OS acts on (DECISIONS §7.8) |
-| `src/device12.rs` | `HeliosD3D12Device` (the private block), `device_private_size()`, the `pfnFillDDITable` dispatch, per-queue `RuntimeContext` creation, `DestroyDevice` | `umd/src/device_funcs.rs` (1318 L) | same runtime-allocated-private-block model (R2 §1.1); context creation is per **queue** not per device (R2 §1.3) |
+| `src/device12.rs` | ⛔ **D13: `HeliosD3D12Device` and every other private-block type live in `umd_common/src/private12.rs`, NOT here** (owner requirement, 2026-08-06). What stays: `device_private_size()`, the `pfnFillDDITable` dispatch, per-queue `RuntimeContext` creation, `DestroyDevice` | `umd/src/device_funcs.rs` (1318 L) | same runtime-allocated-private-block model (R2 §1.1); context creation is per **queue** not per device (R2 §1.3) |
 | `src/bridge12.rs` | `#[cxx::bridge] mod ffi` for `HeliosVkd3dDevice`, the owned/borrowed COM discipline, a sealed `BridgeDevice12` newtype with no `Deref` and a private `inner` | `umd/src/bridge.rs` (791 L), especially `:251-307` and `:386-405` | cxx generates raw methods as **inherent** methods on the public opaque type; module privacy does not seal them — only a newtype without `Deref` does (R815) |
 | `src/knobs12.rs` | `UMD_D3D12` (§10) + any `umd12`-only knobs, and its own `resolved_inventory()` | `umd/src/knobs.rs:155-290` | one `OnceLock` per knob per module; the two DLLs deliberately have independent caches (R11 §6-H7) |
 | `src/forward12/tables12.rs` | the installers for `D3D12DDI_DEVICE_FUNCS_CORE_*`, `D3D12DDI_COMMAND_LIST_FUNCS_3D_*`, `D3D12DDI_COMMAND_QUEUE_FUNCS_CORE_0001` with `#[must_use]` `Filled*` tokens | `umd/src/forward/tables.rs:44-70` | install order must be structural, not textual (§12 trap 9) |

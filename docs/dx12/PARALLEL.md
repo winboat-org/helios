@@ -111,14 +111,27 @@ refuse-and-count** and is the natural first task for a new agent.
 
 ## 5. The merge protocol — how lanes stay out of each other's diffs
 
-Four shared files exist. Each has an **append-only** discipline:
+Five shared files exist. Each has an **append-only** discipline:
 
 | shared file | a lane may add | never |
 |---|---|---|
-| `forward12/tables12.rs` | one line: `let t = queue::install(t);` | edit another lane's line, or reorder |
+| `forward12/tables12.rs` | ⛔ **nothing** — S6-0 wrote the whole install chain, all 11 lanes | edit it at all; if a lane needs a chain change, ask the integrator |
 | `umd12/build.rs` | one `.file("bridge/vkd3d_bridge_<lane>.cpp")` and one `bridges([...])` entry | change flags, includes or the link set |
+| `umd_common/src/private12.rs` | one private-data payload struct + its `boxed_handles!`/`com_handles!` line, at the **end** | reorder, repurpose, or name a `ddi12` type (D13) |
 | `src/device12.rs` | one field on `HeliosD3D12Device`, at the **end** | reorder or repurpose existing fields |
 | `src/knobs12.rs` | one knob + one `resolved_inventory()` entry, at the **end** | reorder (the inventory order is the evidence contract — S2) |
+
+⛔ **`DECISIONS.md` D13 — owner requirement, and it binds nearly every lane: every DDI private-data
+payload type lives in `umd_common`, never in `umd12`.** `CORE_0109` has 26 `CalcPrivate*` slots, so
+this is not one file's problem. Two rules follow and neither is negotiable:
+
+1. **A payload struct may not name a `ddi12` bindgen type.** `umd_common` must keep building on
+   Linux and must not grow a `build.rs`, so it cannot see the WDK. Store the *fields* — a `usize`
+   COM pointer, a `u64` GPU VA, a `u32` flags word, a format as its numeric value — and convert at
+   the DDI boundary. The private block is the driver's own record, not a copy of the runtime's
+   argument.
+2. **`Slot<Boxed<S>>::get()`'s soundness argument is still not inherited** (§9.4). D13 shares the
+   type; it does not share D3D11's `CUseCountedObject` claim.
 
 **Install order is structural, not textual.** Use the `#[must_use] Filled*` token pattern from
 `umd/src/forward/tables.rs:44-70` (`ARCHITECTURE.md` §12 rule 9): correctness of every ≥11.1 device
@@ -253,10 +266,13 @@ A lane is done when **all** of:
 4. ⛔ If it calls `Slot<Boxed<S>>::get()`, it carries a **re-derived** D3D12 soundness argument at
    the call site. `umd_common::slot` states plainly that the `CUseCountedObject` ordering is
    established for D3D11 and **not** for D3D12. Do not inherit the claim.
+4b. ⛔ **Every private-data payload type it introduces is in `umd_common/src/private12.rs`, not in
+   `umd12`** (`DECISIONS.md` D13, owner requirement), and names no `ddi12` type. A `CalcPrivate*Size`
+   in `umd12` that returns `size_of::<SomethingDeclaredInUmd12>()` fails this outright.
 5. It compiles clean in its own lane build, and the integrator has merged and re-run
    `-Crate both` — a lane that only ever built alone has not been integrated.
-6. It touched **no** file it does not own, and its diff against `tables12.rs`/`build.rs`/
-   `device12.rs`/`knobs12.rs` is append-only.
+6. It touched **no** file it does not own, and its diff against `build.rs`/`private12.rs`/
+   `device12.rs`/`knobs12.rs` is append-only — and against `tables12.rs`, empty.
 
 ## 10. ⭐ The final pass — fanned out too, on two axes
 
