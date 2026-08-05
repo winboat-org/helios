@@ -875,14 +875,18 @@ kmd-counters-G2-{pre,post}.txt}`; **committed:** `docs/dx12/baselines/vkd3d-know
   to `hangs.txt`, and only then kills it so the run continues. A killed test writes no summary line,
   so it lands in `nosummary` — which is the honest bucket for a hang, and is why `nosummary != 0`
   must be triaged rather than treated as flake.
-* ⚠ **`graphics_hook64.dll` (OBS Studio's game-capture hook) is injected into every D3D12 test
-  process on this VM** — two of the nine threads in the wedged process were its. It is a third-party
-  overlay hooking the same surfaces the driver owns, which is exactly the foreign-stack hazard
-  `DECISIONS.md` H2(a) describes, and it is an uncontrolled variable in every G2/G9 number. It did
-  not prevent `D12-G1` from passing, so it is not *obviously* the hang's cause — but a conformance
-  baseline should be taken with it out of the picture. **Check for it (`lm` in the dump, or
-  `Get-Process | … Modules`) before trusting a G2/G9 delta**, and settle whether OBS's hook can be
-  disabled for gate runs.
+* ✅ **`graphics_hook64.dll` (OBS Studio's game-capture hook) — found injected, and REMOVED
+  2026-08-05 before the baseline was taken.** Two of the nine threads in the wedged process were its:
+  a third-party overlay hooking the same surfaces the driver owns, i.e. the foreign-stack hazard
+  `DECISIONS.md` H2(a) describes, live, and an uncontrolled variable in every G2/G9 number. It did
+  not prevent `D12-G1` from passing, so it was never proven to be *doing* anything — but a
+  conformance baseline is the wrong place to carry an unexplained third party.
+  ⛔ **The run in flight when it was removed was discarded and restarted**, because a baseline whose
+  first 245 tests ran with an overlay and whose remainder ran without it is worth less than either
+  half: every later diff against it would inherit an unknown split.
+  ⚠ **Re-check before trusting any G2/G9 delta** — it is one line, and an overlay can come back with
+  any app install:
+  `(Get-Process d3d12).Modules | ? ModuleName -like 'graphics_hook*'` (or `lm` in a dump).
 
 ---
 
