@@ -3518,7 +3518,8 @@ silent on it:
     Unknown tables are now stub-filled at the runtime's own byte count and counted —
     filling selects no *shape*, which is what §7.4 actually forbids, while a refused
     table has NULL slots the runtime may still call through.
-- **`D12-G7` is NOT green, and the blocker is named rather than guessed**
+- **`D12-G7`'s FIRST failure, and the blocker it named — now CLOSED by L1's second
+  half below, kept because the chain it measured is still the reference**
   (`tmp/dx12/gates/G7/RESULT.md`). The whole chain runs: `OpenAdapter12` → caps →
   versions → `CalcPrivateDeviceSize` → **`CreateDevice` building a real vkd3d device on
   venus ctx 19** → all four table fills at **992 / 600 / 56 / 32**, with the
@@ -3541,9 +3542,67 @@ silent on it:
   `-RestartDevice` rewrote `UserModeDriverName[3]` and the next new process still loaded
   the previous content-addressed DLL: dxgkrnl caches the resolved UMD path. Cost one
   confusing gate run whose log showed the old hash and the old counter names.
-- **Next: finish L1** (the three format/MSAA slots + the bridge entry point) → `D12-G7`
-  → the remaining ten lanes fan out → the §10 review pass. `L9` is mostly
-  refuse-and-count and is the natural first task for a new agent.
+- ⭐ **L1's SECOND HALF is LANDED (2026-08-06, `2c7460e`): the format/MSAA slots are
+  real and `D3D12 noop DDI hits:` reads `slots=0/206`.** Every one of the 2 824 calls
+  the runtime made into counting noops inside `D3D12CreateDevice` now reaches a body —
+  `pfnCheckFormatSupport`, `pfnCheckMultisampleQualityLevels`, `pfnGetMipPacking`, plus
+  `pfnQueryNodeMap` and `pfnGetImplicitPhysicalAdapterMask` in L9's file, landed early
+  because the same sweep needs them. Full write-up: `tmp/dx12/gates/G7/RESULT.md`.
+  - ⭐ **No cxx bridge was needed, and that widened the fan-out rather than narrowing
+    it.** The handoff specified a C++ module into `ID3D12Device::CheckFeatureSupport`;
+    `bridge12` already hands Rust a borrowed `ID3D12Device`, so the `windows` crate's
+    vtable call reaches the identical slot. ⇒ the lane type-checks on the **Linux
+    host** (`PARALLEL.md` §7), which the C++ route would have taken away. The added
+    `Win32_Graphics_Dxgi_Common` feature is types only: `dumpbin /IMPORTS` on the
+    release DLL is unchanged — **no `dxgi.dll`, no `d3d12.dll`**.
+  - ⭐ **MEASURED: `pfnCheckFormatSupport` writes the small `D3D12DDI_FORMAT_SUPPORT`
+    enum, NOT API-level `D3D12_FORMAT_SUPPORT1`.** This had to be settled by experiment
+    rather than by reading the header, because the D3D11 side of this project holds the
+    *opposite* result for its own DDI (`umd/src/forward/format_caps.rs:15-19`: "D3D11
+    harmonized the DDI with the API enum … translating regresses even a plain
+    `D3D11CreateDevice`"). `Umd12FormatCaps=1` (API passthrough) truncates the runtime's
+    format sweep at **12 formats / 271 MSAA queries** against **23 / 600** for the DDI
+    encoding. Arm 0 is the default; arm 1 stays reachable (CLAUDE.md rule 8).
+- ⛔ **`D12-G7` is STILL `0x887A0020`, and the blocker changed shape: it is now ONE
+  FORMAT AT A TIME.** The runtime walks a 91-format sweep with 30
+  `pfnCheckMultisampleQualityLevels` calls each and **aborts at the first answer it
+  rejects** — with counting noops (every answer 0) the sweep ran to completion, so the
+  truncation is caused by answer *content* and the stop point moves with it.
+  - The first run's ETW `Microsoft-Windows-Direct3D12` reason was explicit —
+    `Index=62 Code=0x887A0020 Message=MSAA quality reported to be 0` — and is now
+    **gone**; the current failure emits no ETW reason at all.
+  - Three multisample rules were derived from measured accept/reject points and are in
+    the code with named counters: **(A)** a format that declares any capability and can
+    be multisampled must declare `MULTISAMPLE_RENDERTARGET`; **(B)** one that cannot be
+    multisampled must declare neither MSAA bit; **(C)** `MULTISAMPLE_LOAD` only where
+    `RENDERTARGET` is set. (A) and (C) each advanced the sweep by **exactly one format**.
+  - ⛔ **All four multisample-bit combinations for `R32_FLOAT_X8X24_TYPELESS` (21) are
+    rejected**, so what remains there is `SHADER_SAMPLE`/`SHADER_GATHER`, not MSAA.
+- ⛔ **Next is an INSTRUMENT, not a fourth guess.** Advancing one format per
+  build+deploy+run cycle is reverse-engineering a 91-entry table by bisection. The
+  ground truth needed is *what a real driver answers at this DDI*, and the vehicle
+  exists: `tools/d3d12_spy/` is a full thunking shim in front of WARP's UMD (`D12-G5`)
+  that today records call **counts** through generic asm thunks. Special-casing
+  `core[0] pfnCheckFormatSupport` and `core[1] pfnCheckMultisampleQualityLevels` to log
+  their arguments and written values yields WARP's whole 91-format table in one run —
+  which also discharges `GATES.md` §3.2's outstanding `d3d12_format_matrix_probe`
+  baseline for `D12-G9`, and turns this failure class into a diff permanently.
+  **Then** `D12-G7` → the remaining ten lanes fan out → the §10 review pass.
+- **Three instruments landed with L1's second half**, each of which paid for itself:
+  - `tools/d3d12_format_matrix_probe.cpp` — the probe `GATES.md` §3.2 names. It
+    `LoadLibrary`s the deployed `helios_umd12.dll`, takes a borrowed `ID3D12Device` off
+    `helios_umd12_probe_create_device_v1`, and dumps the **engine's** per-format
+    `Support1`/`Support2` and quality levels at counts 1/2/4/8/16/32 as CSV. No adapter
+    restart, no `UmdD3D12` knob, no D3D12 runtime, no `d3d12.lib`/`dxgi.lib`. It is what
+    made the engine's answers checkable against the driver's at all.
+  - **`trace_line!` reaches `umd12`** with `caps12`'s multisample slot as its first
+    per-op consumer: all 2 730 calls, **zeros included**, gated on `Umd12Trace`. Two
+    runs had been spent inferring the rejected `(format, sample count)` from call
+    *counts*; the trace answered it in one.
+  - The `CheckFormatSupport` evidence line now carries the **engine's raw `s1`/`s2`**
+    beside the driver's answer. Without it the first failure could not be diagnosed from
+    the log at all — it took an ETW capture — because the log recorded only the derived
+    value and the whole question was how it was derived.
 - ⭐ **S6 is the bulk — 214 driver-side slots — and it FANS OUT. The split is
   `docs/dx12/PARALLEL.md`:** 11 lanes with exclusive file ownership, an append-only
   protocol for the four shared files, and a lease on the VM. Two things gate the
