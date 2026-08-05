@@ -1673,10 +1673,29 @@ registered in advance (`PREDICTIONS.md`) and scored.
   wedged process was still alive* — but **nothing propagates the loss to
   the guest**: `/tmp/helios-qemu-stderr.log` has no entry at all for
   either Xid, and the guest's vkd3d fence thread sleeps in the venus ICD
-  forever. The 67th's `VN_HELIOS_RING_WAIT_BOUND_MS=8000` does not cover
-  this site. **A lost host context must become a guest-visible error
+  forever (6+ min, 0.17 s CPU).
+  ⭐ **Why the 67th's fix does not cover this, and it is structural rather
+  than a missed site.** That fix bounds a *ring* wait
+  (`VN_HELIOS_RING_WAIT_BOUND_MS`, default 8000,
+  `icd/mesa/.../vn_queue.c:2824`), and venus's own escalation ladder
+  (`vn_relax`, `vn_common.c:248`) checks `VK_RING_STATUS_FATAL_BIT_MESA`
+  and the `ALIVE` bit through `vn_watchdog_timeout()`. **Every one of
+  those signals is ring liveness.** Xid 109 kills the GPU *channel* while
+  the `vkr-ring-NNN` thread stays perfectly healthy and keeps marking
+  itself alive — so the watchdog is watching the wrong thing, and the
+  guest waits on a fence whose GPU work is already dead. ⛔ Do not "fix"
+  this by shortening the ring bound; the signal needed is *host
+  submission/fence failure*, which today reaches neither QEMU's log nor
+  the guest. **A lost host context must become a guest-visible error
   (device removal / TDR), not an unbounded wait** — that is the WS1 fix,
   and it is now testable in half a minute.
+  ⚠ Note for the record: the two tests exercise behaviour vkd3d itself
+  calls undefined, so they are **excluded by name** from routine G2/G9
+  runs (`test-runner.sh -x`, fork commit `fd205b2c`, which prints
+  `EXCLUDED <name>` for every one) and kept as the dedicated repro. The
+  exclusion is a scheduling decision, not a verdict: a guest application
+  being able to fault the host GPU context is a real robustness defect and
+  stays open here.
   Evidence: `tmp/dx12/gates/G2/hang/` (stacks + `/ma` dumps),
   `tmp/dx12/gates/G2/hangs.txt`, `docs/dx12/GATES.md` §4.3.
   **NEW WS1 watch item (67th): `ScStale` ≈ 4,000/run under FS (23 % of

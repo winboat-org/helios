@@ -856,9 +856,19 @@ kmd-counters-G2-{pre,post}.txt}`; **committed:** `docs/dx12/baselines/vkd3d-know
   Do not reach for the 66th/67th sessions' whole-transport story.
   ⚠ **Nothing host-side reports it to the guest.** `/tmp/helios-qemu-stderr.log` has **no entry at
   all** for either Xid — the render server loses the context and the guest simply waits forever.
-  That is the actual defect to fix: a lost host context must become a guest-visible error (device
-  removal / TDR), not an unbounded wait. The 67th's `VN_HELIOS_RING_WAIT_BOUND_MS=8000` bound did
-  **not** cover this site.
+  ⭐ **And the 67th session's bound cannot cover it, structurally.** That fix bounds a *ring* wait
+  (`VN_HELIOS_RING_WAIT_BOUND_MS`, default 8000, `icd/mesa/…/vn_queue.c:2824`), and venus's own
+  escalation ladder `vn_relax` (`vn_common.c:248`) checks `VK_RING_STATUS_FATAL_BIT_MESA` and the
+  `ALIVE` bit via `vn_watchdog_timeout()`. **All of those are ring-liveness signals**, and Xid 109
+  kills the GPU *channel* while the `vkr-ring-NNN` thread stays healthy and keeps marking itself
+  alive. The watchdog is watching the wrong thing. ⛔ Do not shorten the ring bound in response; the
+  missing signal is *host submission/fence failure*, which today reaches neither QEMU's log nor the
+  guest. A lost host context must become a guest-visible error (device removal / TDR).
+  ⚠ **These two are excluded by name from routine G2/G9 runs** — `tests/test-runner.sh -x <name>`
+  (fork `fd205b2c`), which prints `EXCLUDED <name>` for each and `WARNING` for an `-x` that matches
+  nothing, because a silently skipped test is indistinguishable from a passing one. The exclusion is
+  a scheduling decision, not a verdict: they stay the Xid-109 repro, and "a guest app can fault the
+  host GPU context" stays an open robustness defect in `ROADMAP.md`.
   **Instrument:** `tmp/dx12/g2-hang-watchdog.ps1`, run as a second scheduled task beside the suite.
   It waits for a `d3d12.exe` older than 240 s whose CPU has not moved in 120 s, names the victim (the
   newest log with no `tests executed` line), **captures `~*k` stacks and a `/ma` dump first**, appends
