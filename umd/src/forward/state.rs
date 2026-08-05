@@ -12,7 +12,16 @@
 
 use super::*;
 
-pub(crate) struct ResourceState {
+// ⚠ `pub`, not `pub(crate)`, for ONE reason and it is a compiler rule, not a
+// design choice: this struct is named as `<H as helios_umd_common::slot::BoxedHandle>::State`
+// by the `boxed_handles!` impl in `forward/handles.rs`. `BoxedHandle` became a
+// PUBLIC trait of a foreign crate when the slot encoding moved to `umd_common`
+// at S1, and E0446 forbids a `pub(crate)` type appearing in a public trait
+// impl's associated type. It is NOT a widening in any observable sense: the
+// module holding it (`mod state;` / `mod layout;` in `forward.rs`) is private,
+// so nothing outside `forward` can name the type, and `helios_umd` is a
+// `cdylib` with no library consumers at all.
+pub struct ResourceState {
     pub(crate) com_raw: usize,
     /// The same object's `ID3D11Buffer` interface pointer, pre-cast ONCE at
     /// store time; 0 for non-buffer resources. Constant-buffer bind DDIs read
@@ -162,7 +171,16 @@ impl Drop for ResidentAllocation {
     }
 }
 
-pub(crate) struct RtvState {
+// ⚠ `pub`, not `pub(crate)`, for ONE reason and it is a compiler rule, not a
+// design choice: this struct is named as `<H as helios_umd_common::slot::BoxedHandle>::State`
+// by the `boxed_handles!` impl in `forward/handles.rs`. `BoxedHandle` became a
+// PUBLIC trait of a foreign crate when the slot encoding moved to `umd_common`
+// at S1, and E0446 forbids a `pub(crate)` type appearing in a public trait
+// impl's associated type. It is NOT a widening in any observable sense: the
+// module holding it (`mod state;` / `mod layout;` in `forward.rs`) is private,
+// so nothing outside `forward` can name the type, and `helios_umd` is a
+// `cdylib` with no library consumers at all.
+pub struct RtvState {
     pub(crate) com_raw: usize,
     /// Non-owning resource pointer; the RTV itself keeps the resource alive.
     pub(crate) resource_raw: usize,

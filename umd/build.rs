@@ -193,6 +193,13 @@ fn main() {
         // DXVK (and our shim) use C++ exceptions; cxx-build disables them by default.
         .flag("/EHsc")
         .include("bridge")
+        // The shared bridge headers (`DECISIONS.md` D3b, stage S1):
+        // `bridge_common.h`, `bridge_util.h`, `bridge_guard.h`. One copy of the
+        // source, included by this bridge and by `umd12`'s.
+        // ⚠ The `.include("bridge")` above comes FIRST deliberately: a
+        // same-named header in this crate must win, so a future D3D11-only
+        // override is possible without editing `umd_common`.
+        .include("../umd_common/bridge")
         .include(format!(r"{dxvk_src}\src"))
         .include(format!(r"{dxvk_src}\src\dxvk"))
         .include(format!(r"{dxvk_src}\src\d3d11"))
@@ -249,7 +256,14 @@ fn main() {
     }
 
     for path in [
-        "bridge/bridge_common.h",
+        // Shared, in `umd_common/bridge/` — a change to any of these must
+        // rebuild this bridge exactly as a local header change does. Cargo does
+        // not track the `umd_common` rlib's non-Rust files, so without these
+        // three lines a `bridge_guard.h` edit would leave a stale
+        // `helios_dxvk_bridge.lib` linked into the DLL.
+        "../umd_common/bridge/bridge_common.h",
+        "../umd_common/bridge/bridge_guard.h",
+        "../umd_common/bridge/bridge_util.h",
         "bridge/bridge_dxbc.cpp",
         "bridge/bridge_dxbc.h",
         "bridge/bridge_icd_exports.cpp",

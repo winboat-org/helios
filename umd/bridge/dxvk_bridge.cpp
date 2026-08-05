@@ -19,7 +19,14 @@
 
 #include "dxvk_bridge.h"
 
+// ⚠ These two resolve to `umd_common/bridge/`, not to this directory —
+// `build.rs` adds it to the include path (`DECISIONS.md` D3b: one copy of the
+// source, shared with the D3D12 bridge). `bridge_guard.h` is NOT included here:
+// it needs `dxvk::DxvkError` for its engine arm, so it comes after the DXVK
+// headers below.
 #include "bridge_common.h"
+#include "bridge_util.h"
+
 #include "bridge_dxbc.h"
 
 #include <algorithm>
@@ -59,6 +66,26 @@
 
 // After the DXVK headers: see the include-order note in this header.
 #include "bridge_icd_exports.h"
+
+// ── the shared bridge_guard, with this bridge's one engine-specific arm ──────
+//
+// `dxvk::DxvkError` is not a `std::exception`, so without this arm every DXVK
+// failure would log "unknown exception". The macro is the header's documented
+// customization point and expands to the *identical* catch clause the guard
+// carried before it moved (S1 is a move; behaviour change here is a defect).
+// It must be defined AFTER `util_error.h` above, because it is expanded when
+// `bridge_guard.h` is preprocessed.
+//
+// ⛔ Must not allocate — a `std::string` built inside a `std::bad_alloc`
+// handler can throw again. That is also why `DxvkError::message()` (which
+// returns `std::string`) is not called here.
+#define HELIOS_BRIDGE_ENGINE_CATCH(what)                          \
+  catch (const dxvk::DxvkError&) {                                \
+    char msg[160];                                                \
+    std::snprintf(msg, sizeof(msg), "%s: DxvkError", (what));     \
+    ::helios_bridge::umd_log(msg);                                \
+  }
+#include "bridge_guard.h"
 
 namespace dxbc_spv::dxbc {
   util::md5::Digest hashDxbcBinary(const void* data, size_t size);
@@ -107,99 +134,17 @@ namespace helios_bridge {
     }
   }
 
-  // First `first` occurrences, then every `every`-th — the idiom the periodic
-  // bridge telemetry already uses. The per-create lines below were
-  // unconditional, and each one is an _fsopen + fprintf + fclose.
-  bool bridge_log_budget(std::atomic<std::uint32_t>& counter,
-                         std::uint32_t first,
-                         std::uint32_t every) {
-    const std::uint32_t n = counter.fetch_add(1, std::memory_order_relaxed) + 1;
-    return n <= first || (every != 0 && (n % every) == 0);
-  }
+  // ⚠ `bridge_log_budget`, `PeriodicStat`, `qpc_elapsed_us` and `ComRelease<T>`
+  // moved to `umd_common/bridge/{bridge_common,bridge_util}.h` at stage S1
+  // (`DECISIONS.md` D3b) — same namespace, same signatures, so every use site
+  // below is unchanged. They are engine-agnostic and the D3D12 bridge gets them
+  // from the same file rather than a copy.
 
-
-  // The "atomic total + CAS max + count + log every Nth + reset max" idiom,
-  // open-coded at two telemetry sites with two different periods.
-  //
-  // `bridge_log_budget` above is deliberately a SEPARATE, smaller helper for the
-  // simpler count-and-rate-limit counters -- forcing the two shapes together
-  // would give both a worse API than either has now. (The review names three
-  // accumulators; `copy-lat:` is gone, so there are two.)
-  //
-  // Per-site extras stay at the sites: `present-gate:` also accumulates
-  // `s_gateTimeouts`, which it deliberately never resets, plus two failure
-  // counters. Each site keeps its own log key and format string, so before/after
-  // numbers stay directly comparable -- which is the whole reason those lines
-  // exist.
-  class PeriodicStat {
-  public:
-    struct Sample {
-      std::uint32_t n;
-      std::uint64_t avg_us;
-      std::uint64_t max_us;
-    };
-
-    // `period` must be a power of two: the two sites tested `(n & 31u) == 0`
-    // and `(n & 127u) == 0`, and keeping the mask form keeps that cadence exact.
-    explicit constexpr PeriodicStat(std::uint32_t period) : mask_(period - 1u) {}
-
-    // Record one measurement. Returns the sample to log when this call lands on
-    // the period boundary, resetting the running max exactly as both sites did.
-    std::optional<Sample> record(std::uint64_t us) {
-      total_us_.fetch_add(us, std::memory_order_relaxed);
-      std::uint64_t prev_max = max_us_.load(std::memory_order_relaxed);
-      while (us > prev_max &&
-             !max_us_.compare_exchange_weak(prev_max, us, std::memory_order_relaxed)) {}
-      const std::uint32_t n = count_.fetch_add(1, std::memory_order_relaxed) + 1;
-      if ((n & mask_) != 0)
-        return std::nullopt;
-      const Sample sample{
-        n,
-        total_us_.load(std::memory_order_relaxed) / n,
-        max_us_.load(std::memory_order_relaxed),
-      };
-      max_us_.store(0, std::memory_order_relaxed);
-      return sample;
-    }
-
-  private:
-    const std::uint32_t mask_;
-    std::atomic<std::uint64_t> total_us_{0};
-    std::atomic<std::uint64_t> max_us_{0};
-    std::atomic<std::uint32_t> count_{0};
-  };
-
-  // Microseconds between two QueryPerformanceCounter reads. Both telemetry
-  // sites spelled this division out.
-  std::uint64_t qpc_elapsed_us(const LARGE_INTEGER& freq,
-                               const LARGE_INTEGER& t0,
-                               const LARGE_INTEGER& t1) {
-    return std::uint64_t(t1.QuadPart - t0.QuadPart) * 1000000ull
-         / std::uint64_t(freq.QuadPart);
-  }
   /// The direct-scanout PRIMARY create's QI failure — the one whose silent zero
   /// R401 now reports to the runtime.
+  ///
+  /// Stays here: it is a DXVK-path counter, not shared machinery.
   std::atomic<std::uint32_t> g_scanoutPrimaryQiFailed{0};
-
-  // Owns one COM reference until it is deliberately released. Non-copyable, so
-  // the reference cannot be duplicated into a second owner by accident.
-  template <typename T>
-  class ComRelease {
-  public:
-    explicit ComRelease(T* ptr) : m_ptr(ptr) {}
-    ComRelease(const ComRelease&) = delete;
-    ComRelease& operator=(const ComRelease&) = delete;
-    ~ComRelease() { reset(); }
-    T* get() const { return m_ptr; }
-    void reset() {
-      if (m_ptr) {
-        m_ptr->Release();
-        m_ptr = nullptr;
-      }
-    }
-  private:
-    T* m_ptr = nullptr;
-  };
 
   // Minimal IDXGIAdapter the D3D11DXGIDevice constructor stores (it is not
   // queried during construction — the Dxvk objects are passed directly).
@@ -268,61 +213,22 @@ namespace helios_bridge {
     }
   }
 
-  // cxx emits EVERY generated C++ shim `noexcept` (verified verbatim in the
-  // checked-in generated artifact, bridge.rs.cc), so an exception escaping a
-  // bridge method is std::terminate — dwm.exe dies instead of the DDI returning
-  // a failure. Seven methods had no handler at all, and every one of them
-  // reaches code that allocates (find_helios_icd_export ->
-  // discover_vulkan_icd_manifests builds a std::vector<std::string>, runs
-  // ifstream/ostringstream over the manifest and concatenates strings; the
-  // now-retired present_flip_wait_setup additionally took a lock_guard,
-  // make_shared and constructed a std::thread). Defect class: a recoverable
-  // resource failure escalated to unconditional death of the compositor.
+  // ⚠ `bridge_guard` moved to `umd_common/bridge/bridge_guard.h` at stage S1
+  // (`DECISIONS.md` D3b), together with the ~30 lines of comment recording why
+  // it exists and why its compile-time assert is not optional (commit
+  // `ead692e`, the truncation that crash-looped dwm and LogonUI at cold boot).
+  // Read it there; `grep -rn 'static_assert(' umd/bridge umd12/bridge
+  // umd_common/bridge` must return exactly one hit and it is in that file.
   //
-  // R1014(4): this is now the ONLY catch triple in the file. The other nine
-  // were hand-written copies whose DxvkError arm built a std::string, which is
-  // the bug the paragraph below describes -- so folding them in is a
-  // robustness fix, not only a dedupe.
+  // The DXVK-specific arm stays here, as the header's one customization point.
+  // `dxvk::DxvkError` is not a `std::exception`, so without this the generic
+  // arms would not name it and every DXVK failure would log "unknown
+  // exception". It expands to the identical catch clause the guard had before
+  // the move -- S1 is a move, and a behaviour change here would be a defect.
   //
-  // Making this the only path that can return the sentinel collapses "error
-  // sentinel" and "escaped exception" into one code path. The compiler cannot
-  // prove a body is exception-free, so that is the honest limit of the
-  // guarantee.
-  //
-  // The catch arms must not allocate: a std::string built inside a
-  // std::bad_alloc handler can throw again. Fixed char[] + snprintf only —
-  // which is also why DxvkError::message() (returns std::string) is not called
-  // here.
-  //
-  // `R` is deduced from `on_error` ALONE — the body's return type is not a
-  // deduction context — so the sentinel silently decides the type every
-  // SUCCESS value is converted to on the way out. A bare `0` against a
-  // `std::size_t` body deduced `R = int` and truncated every returned pointer
-  // to 32 bits: that shipped in T7 and access-violated dwm and LogonUI at the
-  // first `VSSetShader`. The static_assert makes the mismatch a compile error
-  // instead of a pointer that looks plausible in a log line.
-  template <typename R, typename Fn>
-  R bridge_guard(const char* what, R on_error, Fn&& fn) noexcept {
-    static_assert(std::is_same_v<R, decltype(fn())>,
-                  "bridge_guard's error value must have the guarded body's exact "
-                  "return type; otherwise the success path is converted too");
-    try {
-      return fn();
-    } catch (const dxvk::DxvkError&) {
-      char msg[160];
-      std::snprintf(msg, sizeof(msg), "%s: DxvkError", what);
-      umd_log(msg);
-    } catch (const std::exception& e) {
-      char msg[256];
-      std::snprintf(msg, sizeof(msg), "%s: exception: %s", what, e.what());
-      umd_log(msg);
-    } catch (...) {
-      char msg[160];
-      std::snprintf(msg, sizeof(msg), "%s: unknown exception", what);
-      umd_log(msg);
-    }
-    return on_error;
-  }
+  // ⛔ Must not allocate: a `std::string` built inside a `std::bad_alloc`
+  // handler can throw again. That is also why `DxvkError::message()` (returns
+  // `std::string`) is not called.
 
 }
 

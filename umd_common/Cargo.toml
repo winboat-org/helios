@@ -22,11 +22,20 @@ crate-type = ["rlib"]
 # D3D12 generate different headers, and a `build.rs` here would drag the WDK
 # into a crate that must also build on Linux.
 #
-# ⛔ NO unconditional `windows` dependency either. This crate MUST build on
-# Linux as well as Windows, because `tools/format-table-check.rs` `#[path]`-
-# includes `src/format.rs` and runs on the Linux host. When `slot`/`log`/`knobs`
-# move here they bring a Windows-only dependency with them; it goes under
-# `[target.'cfg(windows)'.dependencies]` and the modules get `#[cfg(windows)]`,
-# so the Linux build keeps working. Nothing moved so far needs it.
+# ⛔ NO unconditional `windows` dependency. This crate MUST build on Linux as
+# well as Windows, because `tools/format-table-check.rs` `#[path]`-includes
+# `src/format.rs` and runs on the Linux host — the only test of the DXGI format
+# table that executes anywhere. `slot` (and later `log`/`knobs`) need `windows`,
+# so it sits under `[target.'cfg(windows)'.dependencies]` below and those
+# modules carry `#[cfg(windows)]`. Verify with a plain `cargo build` on Linux,
+# not only on the VM.
 
 [dependencies]
+
+[target.'cfg(windows)'.dependencies]
+# `slot` needs `windows::core::{IUnknown, Interface}` and nothing else — the
+# feature list is deliberately a SUBSET of `umd/Cargo.toml`'s, because a shared
+# crate must not be the thing that quietly widens what a driver DLL links.
+# ⛔ `Win32_Graphics_Direct3D_Fxc` is absent here for the same reason it is
+# absent there (T6/R909): it ships an HLSL runtime compiler in a display driver.
+windows = { version = "0.58", features = ["Win32_Foundation"] }

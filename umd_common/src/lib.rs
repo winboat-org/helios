@@ -47,23 +47,29 @@
 //! | `log` | `umd/src/log.rs` | ⏳ S2 — needs `init(basename)` so D3D11 keeps `umd-<pid>.log` and D3D12 writes `umd12-<pid>.log` |
 //! | `knobs` | `umd/src/knobs.rs` | ⏳ S2 — the `reg_dword` FFI site and the inventory mechanism move; the knob VALUES stay per-crate |
 //! | `refusals` / `noop` | `umd/src/forward.rs`, `umd/src/device_funcs.rs` | ⏳ S2 — the MECHANISM moves, generalised to `RefusalCounter { count, name }`; the eleven D3D11 counter fields stay in `umd` |
-//! | `slot` | `umd/src/forward/handles.rs` | ⏳ S1b — needs `windows` under `cfg(windows)`, and the `com_handles!`/`boxed_handles!` macros become `#[macro_export]` with `$crate`-qualified paths so each cdylib invokes them over its OWN `ddi` module |
-//! | C++ `bridge_common.h` | `umd/bridge/` | ⏳ S1b — with `PeriodicStat`, `qpc_elapsed_us`, `ComRelease<T>` and **`bridge_guard`** |
+//! | [`slot`] | `umd/src/forward/handles.rs` | ✅ moved (`#[cfg(windows)]`) |
+//! | C++ `bridge/` | `umd/bridge/` | ✅ moved — `bridge_common.h`, `bridge_util.h` (`PeriodicStat`, `qpc_elapsed_us`, `ComRelease<T>`), `bridge_guard.h` |
+//! | `log` | `umd/src/log.rs` | ⏳ S2 — needs `init(basename)` so D3D11 keeps `umd-<pid>.log` and D3D12 writes `umd12-<pid>.log` |
+//! | `knobs` | `umd/src/knobs.rs` | ⏳ S2 — the `reg_dword` FFI site and the inventory mechanism move; the knob VALUES stay per-crate |
+//! | `refusals` / `noop` | `umd/src/forward.rs`, `umd/src/device_funcs.rs` | ⏳ S2 — the MECHANISM moves, generalised to `RefusalCounter { count, name }`; the eleven D3D11 counter fields stay in `umd` |
 //!
-//! ⛔ **When `slot` moves, move the code and NOT the claim.** The
+//! ⛔ **`slot` moved the code and NOT the claim.** The
 //! `Slot<Boxed<S>>::get() -> &'static S` soundness argument rests on the D3D11
-//! runtime's `CUseCountedObject` ordering. It must be re-derived for D3D12, not
-//! assumed (D3b).
+//! runtime's `CUseCountedObject` ordering; [`slot::Slot::get`]'s doc now states
+//! that it is **established for D3D11 and NOT established for D3D12**, and
+//! names what the first `umd12` caller owes. Re-derive, do not inherit (D3b).
 //!
-//! ⛔ **When `bridge_guard` moves it keeps its `static_assert`** (commit
-//! `ead692e`). A second guard template written from scratch is exactly how that
-//! truncation bug — which crash-looped dwm and LogonUI at cold boot — comes
-//! back. `git grep -n 'static_assert' umd/bridge umd12/bridge umd_common/bridge`
+//! ⛔ **`bridge_guard` kept its `static_assert`** (commit `ead692e`). A second
+//! guard template written from scratch is exactly how that truncation bug —
+//! which crash-looped dwm and LogonUI at cold boot — comes back.
+//! `git grep -n 'static_assert' umd/bridge umd12/bridge umd_common/bridge`
 //! must return exactly one hit.
 
 #![deny(deprecated)]
 
 pub mod format;
 pub mod hr;
+#[cfg(windows)]
+pub mod slot;
 pub mod throttle;
 pub mod window;
