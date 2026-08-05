@@ -1649,8 +1649,16 @@ registered in advance (`PREDICTIONS.md`) and scored.
   rule going forward: NO knob-ON benchmark runs except with the trap
   armed and a specific hypothesis to discriminate — the next occurrence
   must pay for itself in stacks, not scores.
-  ⭐ **72nd: Xid-109 NOW HAS A DETERMINISTIC REPRODUCER, and it is not a
-  benchmark.** `test_uav_counter_null_behavior_dxbc` and `…_dxil` from
+  ⛔ **STALE as of the 72nd — the GT1 half of this entry no longer
+  reproduces.** Owner report, 2026-08-05: **GT1 never triggers Xid-109
+  any more**; it was fixed in work that landed after `18dba5f` and this
+  section was not updated. Everything above about "2 of 3 fast-path GT1
+  runs", the rate-amplification model and the trap operating rule is
+  history. ⚠ The `tmp/xid-trap/` trap is still armed and last captured on
+  2026-08-03; there is no live GT1 Xid for it to catch.
+
+  ⭐ **72nd: what IS live is a D3D12-only reproducer, and it is a
+  different animal.** `test_uav_counter_null_behavior_dxbc` and `…_dxil` from
   vkd3d-proton's own suite fire it **on demand, ~6-8 s in, two for two**
   (dxbc start 16:02:20 → `Xid 109 … name=vkr-ring-346, channel 0x1b, CTX
   SWITCH TIMEOUT` at 16:02:26; dxil start 16:11:23 → Xid at 16:11:31, a
@@ -1661,20 +1669,20 @@ registered in advance (`PREDICTIONS.md`) and scored.
   robustly here"*, and its neighbour records *"Observed on NV: Blue screen
   of death (?!?!)"* for the analogous case, so the family hard-faults
   NVIDIA hardware rather than returning zeroes.
-  ⚠ **This shifts the leading theory.** The old suspect was a
-  timing-sensitive lost/misordered device-side signal, rate-amplified.
-  A null-descriptor compute dispatch that faults the channel in six
-  seconds is not rate-sensitive — so either there are two Xid-109 causes
-  or the GT1 one is also a bad-descriptor fault that only becomes likely
-  at rate. **Discriminate with the new repro before spending more on the
-  rate theory.**
+  ⚠ **Do not read this as evidence about the old GT1 Xid** — that one is
+  fixed and gone (see above), so there is no rate-amplification theory
+  left to discriminate against. This is a **self-contained D3D12
+  robustness defect**: a guest application can fault the host GPU context
+  with a null UAV counter descriptor, and the guest then hangs instead of
+  seeing an error. It is scoped to the D3D12 workstream and it is
+  excluded from routine gate runs (below), so it does not gate anything.
   ⚠ **Containment reconfirmed, and the real defect named:** the Xid kills
   ONE channel — the `D12-G1` bridge probe passed all 28 steps *while the
   wedged process was still alive* — but **nothing propagates the loss to
   the guest**: `/tmp/helios-qemu-stderr.log` has no entry at all for
   either Xid, and the guest's vkd3d fence thread sleeps in the venus ICD
   forever (6+ min, 0.17 s CPU).
-  ⭐ **Why the 67th's fix does not cover this, and it is structural rather
+  ⭐ **Why the ring bound does not cover this, and it is structural rather
   than a missed site.** That fix bounds a *ring* wait
   (`VN_HELIOS_RING_WAIT_BOUND_MS`, default 8000,
   `icd/mesa/.../vn_queue.c:2824`), and venus's own escalation ladder
