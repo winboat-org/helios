@@ -39,8 +39,13 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Install-Helios.ps1 -Au
 ```
 
 `-Automatic` enables test-signing when needed and replaces `viogpudo` without a
-prompt. An exit code of 3010 requests a reboot; run the same command again after
-the reboot to continue installation. `-Unattended` is accepted as an alias.
+prompt. It copies the bundle to `C:\ProgramData\Helios\provisioning`, installs a
+SYSTEM startup task, and reports its durable state in
+`C:\ProgramData\Helios\provisioning-status.json`. An orchestrator should reboot
+at `test-signing-restart-required`, then reboot again at
+`driver-restart-required`. After the second reboot, automatic verification
+publishes `finished` and removes the startup task. `failed` includes an error
+message. `-Unattended` is accepted as an alias.
 
 Run the health check later with:
 

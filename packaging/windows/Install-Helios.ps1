@@ -9,6 +9,60 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 . (Join-Path $PSScriptRoot "Helios-PackageCommon.ps1")
 
+$stateRoot = Join-Path $env:ProgramData "Helios"
+$statePath = Join-Path $stateRoot "install-state.json"
+$provisioningRoot = Join-Path $stateRoot "provisioning"
+$provisioningStatusPath = Join-Path $stateRoot "provisioning-status.json"
+$provisioningTaskName = "HeliosGraphicsProvisioning"
+
+function Write-HeliosProvisioningStatus(
+    [Parameter(Mandatory)]
+    [ValidateSet("waiting", "test-signing-restart-required", "driver-restart-required", "finished", "failed")]
+    [string]$Status,
+    [string]$Message = ""
+) {
+    $value = [ordered]@{
+        status = $Status
+        updatedAtUtc = [DateTime]::UtcNow.ToString("o")
+    }
+    if ($Message) { $value["message"] = $Message }
+    Write-HeliosJson $value $provisioningStatusPath
+}
+
+function Initialize-HeliosAutomaticProvisioning([Parameter(Mandatory)][string]$BundleRoot) {
+    $sourcePath = [IO.Path]::GetFullPath($BundleRoot).TrimEnd("\")
+    $persistentPath = [IO.Path]::GetFullPath($provisioningRoot).TrimEnd("\")
+    if (-not $sourcePath.Equals($persistentPath, [StringComparison]::OrdinalIgnoreCase)) {
+        Remove-Item -LiteralPath $provisioningRoot -Recurse -Force -ErrorAction SilentlyContinue
+        New-Item -ItemType Directory -Force -Path $provisioningRoot | Out-Null
+        Get-ChildItem -LiteralPath $BundleRoot -Force |
+            Copy-Item -Destination $provisioningRoot -Recurse -Force
+    }
+
+    $scriptPath = Join-Path $provisioningRoot "Install-Helios.ps1"
+    $powerShellPath = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
+    $action = New-ScheduledTaskAction -Execute $powerShellPath -Argument (
+        "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`" -Automatic"
+    )
+    $trigger = New-ScheduledTaskTrigger -AtStartup
+    Register-ScheduledTask -TaskName $provisioningTaskName -Action $action -Trigger $trigger `
+        -User "SYSTEM" -RunLevel Highest -Force | Out-Null
+}
+
+function Complete-HeliosAutomaticProvisioning {
+    Write-HeliosProvisioningStatus "finished"
+    Unregister-ScheduledTask -TaskName $provisioningTaskName -Confirm:$false -ErrorAction SilentlyContinue
+}
+
+trap {
+    if ($Automatic) {
+        try { Write-HeliosProvisioningStatus "failed" $_.Exception.Message } catch {
+            Write-Warning "Could not publish the automatic provisioning failure: $($_.Exception.Message)"
+        }
+    }
+    throw
+}
+
 Assert-HeliosAdministrator
 if (-not [Environment]::Is64BitProcess) {
     throw "Run the installer with 64-bit Windows PowerShell. This package contains x64 drivers only."
@@ -19,9 +73,19 @@ $manifest = Read-HeliosManifest $bundleRoot
 Write-Host "Verifying $(@($manifest.files).Count) package files..."
 Test-HeliosManifest $bundleRoot $manifest
 
-$stateRoot = Join-Path $env:ProgramData "Helios"
-$statePath = Join-Path $stateRoot "install-state.json"
+if ($Automatic) {
+    Initialize-HeliosAutomaticProvisioning $bundleRoot
+    if (-not (Test-Path -LiteralPath $provisioningStatusPath -PathType Leaf)) {
+        Write-HeliosProvisioningStatus "waiting"
+    }
+}
+
 if (Test-Path -LiteralPath $statePath -PathType Leaf) {
+    if ($Automatic) {
+        & (Join-Path $stateRoot "Verify-Helios.ps1")
+        Complete-HeliosAutomaticProvisioning
+        exit 0
+    }
     throw "Helios is already managed by this package installer. Run $stateRoot\Uninstall-Helios.ps1 before installing another bundle."
 }
 
@@ -34,6 +98,7 @@ if ($manifest.signing.mode -eq "test" -and -not (Test-HeliosTestSigningEnabled))
     }
     Write-Host "Enabling Windows test-signing..."
     Invoke-HeliosNative "bcdedit.exe" @("/set", "testsigning", "on")
+    if ($Automatic) { Write-HeliosProvisioningStatus "test-signing-restart-required" }
     Write-Warning "Test-signing was enabled in the boot configuration. Reboot Windows, then run this installer again."
     exit 3010
 }
@@ -85,7 +150,9 @@ if ($activeInfBeforeInstall -and (Test-HeliosViogpudoDriver $activeInfBeforeInst
     Start-Sleep -Seconds 2
     $remainingInf = Get-HeliosActiveInf $instanceId
     if ($remainingInf -and (Test-HeliosViogpudoDriver $remainingInf)) {
-        Write-Warning "Windows requires a reboot to finish removing viogpudo ($remainingInf). Run this installer again afterward."
+        $message = "Windows requires a reboot to finish removing viogpudo ($remainingInf). Run this installer again afterward."
+        if ($Automatic) { throw $message }
+        Write-Warning $message
         exit 3010
     }
     $replacedViogpudo = $true
@@ -277,5 +344,6 @@ if ($RunSmokeTests) {
 } else {
     & (Join-Path $stateRoot "Verify-Helios.ps1") -AllowPendingReboot
 }
+if ($Automatic) { Write-HeliosProvisioningStatus "driver-restart-required" }
 Write-Warning "Reboot Windows before judging driver or desktop behavior."
 exit 3010
