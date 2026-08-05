@@ -56,7 +56,7 @@
 use core::ffi::c_void;
 use core::marker::PhantomData;
 
-use helios_umd_common::hr::{Hresult, DXGI_ERROR_UNSUPPORTED, E_INVALIDARG, S_OK};
+use helios_umd_common::hr::{Hresult, E_INVALIDARG, S_OK};
 use helios_umd_common::noop::stub_fill_bytes;
 
 use super::{cmdlist, copy, descriptors, fence, misc, present12, pso, queue, resource12, rootargs};
@@ -252,13 +252,37 @@ pub(crate) unsafe fn fill(
             // SAFETY: as above.
             unsafe { fill_command_queue(table, bytes) }
         }
+        // ⛔ **MEASURED, and it corrects the obvious design.** The first cut
+        // refused every other table type without writing a byte, reasoning that
+        // a driver must never fill a shape it does not understand. `D12-G7`
+        // failed on exactly that: the runtime asks for
+        // `D3D12DDI_TABLE_TYPE_0096_EXTENDED_FEATURES` (**27**, 32 bytes, four
+        // slots) on a baseline device — `DDI_REFERENCE.md` §2.1 already records
+        // it as *"filled with no extended-features handshake, for a baseline
+        // device"* — and a refusal there loses the device, with `S_OK`
+        // everywhere else and nothing else refused.
+        //
+        // ⭐ Filling it selects no *shape*, which is what `DECISIONS.md` §7.4
+        // actually forbids: the slot count comes from the runtime's own
+        // `SIZE_T` and every slot gets the same uniform counting stub. That is
+        // strictly safer than refusing — a refused table is a table the runtime
+        // may still call through, and those slots are NULL.
+        //
+        // ⚠ It is also honest about what it is: nothing here is implemented.
+        // `unknown_slot_noop` returns 0, which for the extended-features
+        // handshake means "zero supported features" — the answer this driver
+        // can defend. The counter is what stops that reading as support.
         other => {
-            log_error!(
-                "FillDDITable: table type {other} is not one this driver serves \
-                 (index={index} size={bytes}) -> DXGI_ERROR_UNSUPPORTED"
-            );
             note_refusal(&UMD12_REFUSALS.fill_ddi_table_unknown_type);
-            DXGI_ERROR_UNSUPPORTED
+            log_error!(
+                "FillDDITable: table type {other} has no typed handler; filling {bytes} B \
+                 ({} slots) with counting stubs (index={index})",
+                bytes / core::mem::size_of::<usize>(),
+            );
+            // SAFETY: the caller guarantees `bytes` writable, pointer-aligned
+            // bytes; the count is the runtime's own and is never `size_of::<T>()`.
+            unsafe { stub_fill_bytes(table, bytes, noop12::unknown_slot_noop) };
+            S_OK
         }
     }
 }

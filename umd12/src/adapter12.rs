@@ -25,7 +25,7 @@
 //! | `pfnGetSupportedVersions` | **real** — the one-token set, D12 |
 //! | `pfnGetOptionalDDITables` | **real** — `*puEntries = 0`, the measured-correct answer (`DDI_REFERENCE.md` §2.2) |
 //! | `pfnCloseAdapter` | **real** — validates the handle and dumps the refusal set |
-//! | `pfnGetCaps` | refuses, counted, and **logs every caps type it was asked** |
+//! | `pfnGetCaps` | **real** as of L1 — delegates to `caps12` |
 //! | `pfnFillDDITable` | **real** as of S6-0 — delegates to `forward12::tables12` |
 //! | `pfnCalcPrivateDeviceSize` | **real** as of S6-0b — `device12` |
 //! | `pfnCreateDevice` | **real** as of S6-0b — `device12`, engine and all |
@@ -58,6 +58,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use helios_umd_common::hr::{Hresult, DXGI_ERROR_UNSUPPORTED, E_INVALIDARG, E_OUTOFMEMORY, S_OK};
 
 use crate::ddi12;
+use crate::caps12;
 use crate::device12;
 use crate::forward12;
 use crate::knobs12;
@@ -422,48 +423,21 @@ unsafe extern "C" fn get_supported_versions(
     S_OK
 }
 
-/// `pfnGetCaps` — **refuses at S5**, and records which caps type it was asked.
+/// `pfnGetCaps` — the DDI slot; [`caps12`] owns the 43 answers.
 ///
-/// L1 owns `caps12.rs` and the 43-enumerator gauntlet (`PARALLEL.md` §4, §8:
-/// one agent, whole — `D3D12Core.dll` enforces ~60 cross-tier consistency rules
-/// and advertising an unbacked tier is a lie the OS acts on). Refusing every
-/// type until then is the honest answer, and it is also what stops S5's
-/// knob-ON adapter from creating a device: the runtime fails device creation
-/// here, with its own English string on ETW.
-///
-/// ⭐ The bounded line is the deliverable. `D12-G5` needed a spy proxy in front
-/// of WARP to learn this runtime's caps call order; from here it is recorded on
-/// the Helios adapter itself, which is L1's input.
+/// ⭐ **This is the call the runtime makes FIRST**, before
+/// `pfnGetSupportedVersions`, and refusing it aborts device creation two calls
+/// in — measured at S5 (`tmp/dx12/gates/G6/RESULT.md`), and the reason
+/// `ARCHITECTURE.md` §1.2's step order was corrected. Nothing `caps12` answers
+/// may depend on a negotiated version, because there is not one yet.
 unsafe extern "C" fn get_caps(
     h_adapter: ddi12::D3D12DDI_HADAPTER,
     arg: *const ddi12::D3D12DDIARG_GETCAPS,
 ) -> ddi12::HRESULT {
     let _ = adapter_ok(h_adapter);
-
-    UMD12_REFUSALS.get_caps_unimplemented.bump();
-    let n = UMD12_REFUSALS.get_caps_unimplemented.get();
-    if n <= LOG_BUDGET {
-        if arg.is_null() {
-            log_error!("GetCaps: null arg (x{n}) -> DXGI_ERROR_UNSUPPORTED");
-        } else {
-            // SAFETY: non-null per the branch. The DDI declares it `_In_ CONST`,
-            // so the runtime guarantees a live, aligned `D3D12DDIARG_GETCAPS`
-            // for the duration of the call. Read only.
-            let caps = unsafe { &*arg };
-            log_error!(
-                "GetCaps: type={} pInfo={:p} pData={:p} DataSize={} (x{n}) -> \
-                 DXGI_ERROR_UNSUPPORTED (L1 owns caps12.rs)",
-                caps.Type,
-                caps.pInfo,
-                caps.pData,
-                caps.DataSize,
-            );
-        }
-    }
-    // ⛔ Nothing is written to `pData`. A caps answer this driver has not
-    // decided is a lie the OS acts on (`DECISIONS.md` §7.8); an unwritten
-    // buffer plus a failure HRESULT is the one shape that cannot become one.
-    DXGI_ERROR_UNSUPPORTED
+    // SAFETY: forwarded unchanged; the DDI declares `arg` `_In_ CONST`, and
+    // `caps12` null-checks both it and its `pData` rather than trusting them.
+    unsafe { caps12::get_caps(arg) }
 }
 
 /// `pfnGetOptionalDDITables` — **real**: this driver wants no extra tables.

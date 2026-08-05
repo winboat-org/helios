@@ -185,19 +185,19 @@ pub(crate) struct Umd12Refusals {
     /// `pfnGetOptionalDDITables` with a null `puEntries`. Expected 0, same
     /// reason.
     pub(crate) get_optional_ddi_tables_bad_arg: RefusalCounter,
-    /// `pfnGetCaps` refused because L1 (`caps12.rs`) has not landed. **Expected
-    /// non-zero and roughly 43 per knob-ON adapter open** until then — this is
-    /// the counter `CONFORMANCE.md`'s charter reads, and it is also what stops
-    /// S5 from creating a device: the runtime abandons device creation at the
-    /// caps gauntlet.
-    pub(crate) get_caps_unimplemented: RefusalCounter,
     /// `pfnFillDDITable` with a null table pointer, or a byte count too small to
     /// hold even one slot. Expected 0.
     pub(crate) fill_ddi_table_bad_arg: RefusalCounter,
-    /// `pfnFillDDITable` for one of the 22 `D3D12DDI_TABLE_TYPE` values this
-    /// driver does not serve. Expected 0 — the runtime asks only for the three
-    /// it negotiated — and **nothing is written** on that path, which is the
-    /// property `DECISIONS.md` §7.4 actually demands.
+    /// `pfnFillDDITable` for a `D3D12DDI_TABLE_TYPE` this driver has no typed
+    /// handler for. The table is filled with counting stubs at the **runtime's**
+    /// byte count, so no slot is NULL and no shape is selected; nothing in it is
+    /// implemented.
+    ///
+    /// ⚠ **Expected non-zero, and 1 per device is the measured normal**:
+    /// `D12-G7` showed the runtime asking for
+    /// `D3D12DDI_TABLE_TYPE_0096_EXTENDED_FEATURES` (27, 32 B) on a baseline
+    /// device, and refusing it **loses the device**. A count above 1 per device
+    /// means a table nobody has looked at yet.
     pub(crate) fill_ddi_table_unknown_type: RefusalCounter,
     /// The runtime's table was **smaller** than the struct this build's
     /// `d3d12umddi.h` describes, so the fill was bounded to the runtime's count.
@@ -239,6 +239,47 @@ pub(crate) struct Umd12Refusals {
     pub(crate) reserve_ranges_ignored: RefusalCounter,
     /// `pfnDestroyDevice` on a null `hDrvDevice`. Expected 0.
     pub(crate) destroy_device_bad_arg: RefusalCounter,
+    // ── L1: the caps gauntlet (`caps12`). ──────────────────────────────────
+    /// `pfnGetCaps` with a null arg, a null `pData`, or a null `pInfo` on a cap
+    /// that requires one. Expected 0.
+    pub(crate) caps_bad_arg: RefusalCounter,
+    /// The runtime's `pData` buffer was smaller than the struct this build's
+    /// header describes for that cap, so **nothing was written**. Expected 0 —
+    /// and a hit is the R702 class arriving through `pfnGetCaps` rather than
+    /// `pfnFillDDITable`.
+    pub(crate) caps_data_size_too_small: RefusalCounter,
+    /// A caps type this driver does not individually answer, served by the
+    /// `DDI_REFERENCE.md` §11.2 safe default (zero `pData` up to `DataSize`,
+    /// return `S_OK`). ⚠ **Expected non-zero and that is fine** — it is the
+    /// documented answer for the ~30 caps outside the must-answer set. It reads
+    /// as a work list for later lanes, not as a fault.
+    pub(crate) caps_defaulted: RefusalCounter,
+    /// How many `pfnGetCaps` calls this adapter has seen. ⚠ Not a refusal — it
+    /// bounds the per-call evidence line, and "how many caps did this runtime
+    /// ask, of which types" is what `D12-G5` needed a WARP spy proxy to learn.
+    pub(crate) caps_calls: RefusalCounter,
+    /// `TiledResourcesTier` was clamped to what `D3D12DDI_TILED_RESOURCES_TIER`
+    /// can express. Expected 0 while the tier is reported `NOT_SUPPORTED`; the
+    /// clamp exists now so the lane that raises it cannot forget it (vkd3d
+    /// reports **4**, the enum stops at 3, and the runtime clamps silently).
+    pub(crate) caps_tiled_tier_clamped: RefusalCounter,
+    /// `D3D12DDICAPS_TYPE_SHADER` was answered with a `TotalLaneCount` that is
+    /// **vkd3d's fallback, not a measurement**. ⚠ Expected non-zero, and that is
+    /// the point: `DDI_REFERENCE.md` §11.7 records that `32 * subgroupSize`
+    /// under-reports this GPU by roughly 24x, and venus exposes neither
+    /// `VK_AMD_shader_core_properties` nor `VK_NV_shader_sm_builtins` to do
+    /// better. The counter is what stops the number being mistaken for a fact.
+    pub(crate) caps_total_lane_count_guess: RefusalCounter,
+    /// The runtime's shader-model array was shorter than this driver's list, so
+    /// the list was truncated. Expected 0.
+    pub(crate) caps_shader_models_truncated: RefusalCounter,
+    /// `D3D12DDICAPS_TYPE_TEXTURE_LAYOUT_SETS` was asked for a layout/functional
+    /// unit outside the one set this driver advertises. ⚠ **Expected non-zero:
+    /// that is how the enumeration ENDS** — the runtime drives it until the
+    /// driver fails, and WARP's measured contract is `S_OK` once then two
+    /// failures. It counts how many sets were advertised, not a fault.
+    pub(crate) caps_texture_layout_set_end: RefusalCounter,
+
     /// The runtime handed back an `(Interface, Version)` pair that is **not** the
     /// single token `pfnGetSupportedVersions` advertised (D12). Expected 0, and
     /// a non-zero reading is a real finding: it would mean the one-token set is
@@ -260,7 +301,6 @@ pub(crate) static UMD12_REFUSALS: Umd12Refusals = Umd12Refusals {
     adapter_unrecognised: RefusalCounter::new("AdapterUnrecognised"),
     get_supported_versions_bad_arg: RefusalCounter::new("GetSupportedVersionsBadArg"),
     get_optional_ddi_tables_bad_arg: RefusalCounter::new("GetOptionalDDITablesBadArg"),
-    get_caps_unimplemented: RefusalCounter::new("GetCapsUnimplemented"),
     fill_ddi_table_bad_arg: RefusalCounter::new("FillDDITableBadArg"),
     fill_ddi_table_unknown_type: RefusalCounter::new("FillDDITableUnknownType"),
     fill_ddi_table_truncated: RefusalCounter::new("FillDDITableTruncated"),
@@ -271,6 +311,14 @@ pub(crate) static UMD12_REFUSALS: Umd12Refusals = Umd12Refusals {
     create_device_engine_failed: RefusalCounter::new("CreateDeviceEngineFailed"),
     reserve_ranges_ignored: RefusalCounter::new("ReserveRangesIgnored"),
     destroy_device_bad_arg: RefusalCounter::new("DestroyDeviceBadArg"),
+    caps_bad_arg: RefusalCounter::new("CapsBadArg"),
+    caps_data_size_too_small: RefusalCounter::new("CapsDataSizeTooSmall"),
+    caps_defaulted: RefusalCounter::new("CapsDefaulted"),
+    caps_calls: RefusalCounter::new("CapsCalls"),
+    caps_tiled_tier_clamped: RefusalCounter::new("CapsTiledTierClamped"),
+    caps_total_lane_count_guess: RefusalCounter::new("CapsTotalLaneCountGuess"),
+    caps_shader_models_truncated: RefusalCounter::new("CapsShaderModelsTruncated"),
+    caps_texture_layout_set_end: RefusalCounter::new("CapsTextureLayoutSetEnd"),
     ddi12_version_mismatch: RefusalCounter::new("Ddi12VersionMismatch"),
     destroy_device_unexpected: RefusalCounter::new("DestroyDeviceUnexpected"),
 };
@@ -278,7 +326,7 @@ pub(crate) static UMD12_REFUSALS: Umd12Refusals = Umd12Refusals {
 /// The set, in the order the summary prints them. ⛔ This order is the evidence
 /// contract: `D3D12 DDI refusals:` lines from different builds get diffed, so
 /// new counters are **appended**, never inserted.
-static UMD12_REFUSAL_SET: [&RefusalCounter; 22] = [
+static UMD12_REFUSAL_SET: [&RefusalCounter; 29] = [
     &UMD12_REFUSALS.open_adapter12,
     &UMD12_REFUSALS.probe12_bad_arg,
     &UMD12_REFUSALS.probe12_create_failed,
@@ -288,7 +336,6 @@ static UMD12_REFUSAL_SET: [&RefusalCounter; 22] = [
     &UMD12_REFUSALS.adapter_unrecognised,
     &UMD12_REFUSALS.get_supported_versions_bad_arg,
     &UMD12_REFUSALS.get_optional_ddi_tables_bad_arg,
-    &UMD12_REFUSALS.get_caps_unimplemented,
     &UMD12_REFUSALS.fill_ddi_table_bad_arg,
     &UMD12_REFUSALS.fill_ddi_table_unknown_type,
     &UMD12_REFUSALS.fill_ddi_table_truncated,
@@ -299,6 +346,14 @@ static UMD12_REFUSAL_SET: [&RefusalCounter; 22] = [
     &UMD12_REFUSALS.create_device_engine_failed,
     &UMD12_REFUSALS.reserve_ranges_ignored,
     &UMD12_REFUSALS.destroy_device_bad_arg,
+    &UMD12_REFUSALS.caps_bad_arg,
+    &UMD12_REFUSALS.caps_data_size_too_small,
+    &UMD12_REFUSALS.caps_defaulted,
+    &UMD12_REFUSALS.caps_calls,
+    &UMD12_REFUSALS.caps_tiled_tier_clamped,
+    &UMD12_REFUSALS.caps_total_lane_count_guess,
+    &UMD12_REFUSALS.caps_shader_models_truncated,
+    &UMD12_REFUSALS.caps_texture_layout_set_end,
     &UMD12_REFUSALS.ddi12_version_mismatch,
     &UMD12_REFUSALS.destroy_device_unexpected,
 ];
@@ -321,15 +376,16 @@ pub(crate) fn note_refusal(counter: &RefusalCounter) {
 /// ⭐ [`note_refusal`] emits the summary on a counter's **first** hit, which is
 /// enough for the one-shot refusals. It is **not** enough for the arms that use
 /// `RefusalCounter::bump` because they already log their own line (R911: an
-/// already-loud arm must not also emit the summary) — at S5 that is
-/// `GetCapsUnimplemented` and `FillDDITableUnimplemented`, i.e. the two that
-/// fire on every adapter open. A run in which only those fired would leave the
-/// set unprinted, and T5's lesson is exactly that: *an instrument nothing can
-/// read is not an instrument.*
+/// already-loud arm must not also emit the summary) — `CapsCalls` and
+/// `CapsDefaulted` fire on every adapter open, and `CapsTotalLaneCountGuess` on
+/// every device. A run in which only those fired would leave the set unprinted,
+/// and T5's lesson is exactly that: *an instrument nothing can read is not an
+/// instrument.*
 ///
-/// Called from `adapter12::close_adapter`, which is this driver's only natural
-/// teardown point — D3D12 answers everything at adapter scope, so there is no
-/// per-device destroy to hang it on until S6-0.
+/// Called from `adapter12::close_adapter` and from `device12`'s teardown
+/// readout — adapter scope because D3D12 answers caps and fills tables there,
+/// device scope because that is where "what did THIS device touch" is a
+/// different question.
 pub(crate) fn log_refusal_summary() {
     log_error!("{}", refusals::summary("D3D12 DDI refusals:", &UMD12_REFUSAL_SET));
 }
