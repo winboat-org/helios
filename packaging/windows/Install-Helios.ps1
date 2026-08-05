@@ -32,12 +32,16 @@ function Write-HeliosProvisioningStatus(
 function Initialize-HeliosAutomaticProvisioning([Parameter(Mandatory)][string]$BundleRoot) {
     $sourcePath = [IO.Path]::GetFullPath($BundleRoot).TrimEnd("\")
     $persistentPath = [IO.Path]::GetFullPath($provisioningRoot).TrimEnd("\")
-    if (-not $sourcePath.Equals($persistentPath, [StringComparison]::OrdinalIgnoreCase)) {
+    $isPersistentBundle = $sourcePath.Equals($persistentPath, [StringComparison]::OrdinalIgnoreCase)
+    if (-not $isPersistentBundle) {
         Remove-Item -LiteralPath $provisioningRoot -Recurse -Force -ErrorAction SilentlyContinue
         New-Item -ItemType Directory -Force -Path $provisioningRoot | Out-Null
         Get-ChildItem -LiteralPath $BundleRoot -Force |
             Copy-Item -Destination $provisioningRoot -Recurse -Force
     }
+
+    $existingTask = Get-ScheduledTask -TaskName $provisioningTaskName -ErrorAction SilentlyContinue
+    if ($isPersistentBundle -and $existingTask) { return }
 
     $scriptPath = Join-Path $provisioningRoot "Install-Helios.ps1"
     $powerShellPath = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
