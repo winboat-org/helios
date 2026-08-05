@@ -31,40 +31,19 @@
 #include "dxvk_instance.h"
 
 #include "bridge_common.h"
+#include "bridge_icd_anchor.h"
 #include "bridge_icd_exports.h"
 
 namespace helios_bridge {
 
-  constexpr const char* kHeliosIcdAnchorExport =
-    "helios_venus_memory_alloc_info";
-
-  HMODULE find_helios_icd_in_loaded_modules() {
-    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
-    if (snapshot != INVALID_HANDLE_VALUE) {
-      MODULEENTRY32 module = {};
-      module.dwSize = sizeof(module);
-      if (Module32First(snapshot, &module)) {
-        do {
-          if (GetProcAddress(module.hModule, kHeliosIcdAnchorExport)) {
-            // Hold one reference for the process-wide export table. Looking up
-            // each export independently can mix two ICD versions and call a
-            // function with a foreign VkDeviceMemory/VkInstance handle.
-            HMODULE held = nullptr;
-            if (GetModuleHandleExA(0, module.szExePath, &held)) {
-              char msg[512];
-              std::snprintf(msg, sizeof(msg),
-                "selected coherent loaded ICD module -> %s", module.szExePath);
-              umd_log(msg);
-              CloseHandle(snapshot);
-              return held;
-            }
-          }
-        } while (Module32Next(snapshot, &module));
-      }
-      CloseHandle(snapshot);
-    }
-    return nullptr;
-  }
+  // ⚠ `find_helios_icd_in_loaded_modules` MOVED to
+  // `umd_common/bridge/bridge_icd_anchor.cpp` as `find_venus_icd_module` at
+  // stage S4b (`DECISIONS.md` D3b). `helios_umd12.dll` needs the same walk and
+  // must not carry a second copy — two independent module selections in one
+  // process is the very hazard the walk's own comment describes, one level up.
+  // ⛔ The manifest fallback below did NOT move: `umd12` has no use for it (by
+  // the time it asks, vkd3d has already loaded `vulkan-1.dll` and the ICD with
+  // it), and moving code with one caller to a shared crate is not sharing.
 
   std::string trim_ascii(std::string s) {
     while (!s.empty() && (s.front() == ' ' || s.front() == '\t' || s.front() == '\r' || s.front() == '\n'))
@@ -251,7 +230,10 @@ namespace helios_bridge {
       HMODULE mod = LoadLibraryA(dll.c_str());
       if (!mod)
         continue;
-      if (!GetProcAddress(mod, kHeliosIcdAnchorExport)) {
+      // ⚠ The SAME probe symbol the shared loaded-module walk uses
+      // (`bridge_icd_anchor.h`), so the two paths cannot disagree about what
+      // counts as the venus ICD.
+      if (!GetProcAddress(mod, kVenusIcdProbeExport)) {
         FreeLibrary(mod);
         continue;
       }
@@ -271,9 +253,21 @@ namespace helios_bridge {
     if (HMODULE cached = s_module.load(std::memory_order_acquire))
       return cached;
 
-    HMODULE module = find_helios_icd_in_loaded_modules();
+    HMODULE module = static_cast<HMODULE>(find_venus_icd_module());
     if (!module)
       module = load_helios_icd_from_manifests();
+    if (!module)
+      return nullptr;
+
+    // ⛔ S4b, `ARCHITECTURE.md` §6.4: reconcile against the PROCESS anchor
+    // before caching. Two Helios UMDs can be loaded into one process, each with
+    // its own resolver; without this step they can independently select
+    // different venus ICD modules and then pass each other's
+    // `VkDeviceMemory`/`VkInstance` handles. A mismatch returns null, which
+    // refuses rather than adopting the other module — see
+    // `bridge_icd_anchor.h` for why adopting would CAUSE the bug it looks like
+    // it fixes.
+    module = static_cast<HMODULE>(reconcile_icd_anchor(module));
     if (!module)
       return nullptr;
 

@@ -187,6 +187,12 @@ fn main() {
         // cc::Build, so there is no flag duplication to drift.
         .file("bridge/bridge_dxbc.cpp")
         .file("bridge/bridge_icd_exports.cpp")
+        // S4b: the process-global venus-ICD anchor (`ARCHITECTURE.md` §6.4).
+        // ⛔ ONE source compiled into BOTH cdylibs — that is the mechanism, not
+        // duplication: each copy exports `helios_icd_anchor_v1`, and the copy in
+        // whichever module the loader enumerated first becomes the single
+        // publisher for the process. `umd12/build.rs` lists the identical line.
+        .file("../umd_common/bridge/bridge_icd_anchor.cpp")
         .compiler(&clang_cl)
         .archiver(&archiver)
         .std("c++17")
@@ -263,6 +269,8 @@ fn main() {
         // `helios_dxvk_bridge.lib` linked into the DLL.
         "../umd_common/bridge/bridge_common.h",
         "../umd_common/bridge/bridge_guard.h",
+        "../umd_common/bridge/bridge_icd_anchor.cpp",
+        "../umd_common/bridge/bridge_icd_anchor.h",
         "../umd_common/bridge/bridge_util.h",
         "bridge/bridge_dxbc.cpp",
         "bridge/bridge_dxbc.h",

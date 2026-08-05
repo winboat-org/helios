@@ -65,6 +65,7 @@
 #include "dxvk_helios_present_sync.h"
 
 // After the DXVK headers: see the include-order note in this header.
+#include "bridge_icd_anchor.h"
 #include "bridge_icd_exports.h"
 
 // ── the shared bridge_guard, with this bridge's one engine-specific arm ──────
@@ -1672,6 +1673,25 @@ std::unique_ptr<HeliosDxvkDevice> helios_dxvk_create_device(
         return nullptr;
       }
       d.venus_ctx_id = read_instance_venus_context_id(d.instance->handle());
+      // ⛔ S4b (`ARCHITECTURE.md` §6.4). The read above is the first thing that
+      // forces `resolve_helios_icd_module`, which now reconciles against the
+      // process-global anchor. If it refused, a SECOND venus ICD module is live
+      // in this process — `helios_umd12.dll` selected a different one — and
+      // every `VkDeviceMemory`/`VkInstance` identity this device would go on to
+      // stamp is derived from the wrong one.
+      //
+      // ⚠ This is the one place S4b can change SHIPPING D3D11 behaviour, so be
+      // exact about when: `icd_anchor_poisoned()` is false unless two distinct
+      // modules both exported `helios_venus_memory_alloc_info` and the two UMDs
+      // disagreed. In every process on this box today — one UMD, one ICD — it
+      // cannot fire. Degrading instead would be fake success: the device comes
+      // up, renders, and writes cross-process allocation identities nobody can
+      // resolve.
+      if (helios_bridge::icd_anchor_poisoned()) {
+        umd_log("REFUSING DXVK device: venus ICD anchor mismatch "
+                "(two ICD modules live in this process)");
+        return nullptr;
+      }
       if (!d.venus_ctx_id)
         umd_log("DXVK device created but Venus context export returned 0");
       umd_log("DxvkDevice created on venus adapter OK");

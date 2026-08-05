@@ -280,6 +280,12 @@ fn build_vkd3d_bridge() {
     let mut build = cxx_build::bridge("src/bridge12.rs");
     build
         .file("bridge/vkd3d_bridge.cpp")
+        // S4b: the process-global venus-ICD anchor (`ARCHITECTURE.md` §6.4).
+        // ⛔ ONE source compiled into BOTH cdylibs — that is the mechanism, not
+        // duplication: each copy exports `helios_icd_anchor_v1`, and the copy in
+        // whichever module the loader enumerated first becomes the single
+        // publisher for the process. `umd/build.rs` lists the identical line.
+        .file("../umd_common/bridge/bridge_icd_anchor.cpp")
         .compiler(&clang_cl)
         .archiver(&archiver)
         .std("c++17")
@@ -348,6 +354,8 @@ fn build_vkd3d_bridge() {
         // a build failure. `umd/build.rs:258-266` carries the identical list.
         "../umd_common/bridge/bridge_common.h",
         "../umd_common/bridge/bridge_guard.h",
+        "../umd_common/bridge/bridge_icd_anchor.cpp",
+        "../umd_common/bridge/bridge_icd_anchor.h",
         "../umd_common/bridge/bridge_util.h",
         "bridge/vkd3d_bridge.cpp",
         "bridge/vkd3d_bridge.h",

@@ -135,6 +135,35 @@ pub unsafe extern "C" fn helios_umd12_probe_create_device_v1(
     S_OK
 }
 
+/// The venus context id this bridge's `ID3D12Device` belongs to (S4b), or 0.
+///
+/// ⭐ **This is `S4b`'s pass criterion, exposed.** With `helios_umd.dll` and
+/// `helios_umd12.dll` both live in one process, this value and the D3D11
+/// bridge's must be **non-zero and equal** — that is what proves
+/// `helios_icd_anchor_v1` forced both drivers onto one venus ICD module. Unequal
+/// would mean each is stamping identities from a different ICD, and they would
+/// hand each other foreign `VkDeviceMemory`/`VkInstance` handles.
+///
+/// ⚠ 0 is a *degraded read* (no ICD loaded, or one too old to export the ctx
+/// id), NOT an anchor failure: a genuine anchor mismatch refuses device
+/// creation outright, so there is no bridge left to ask.
+///
+/// # Safety
+/// `bridge` must be null, or a live handle from
+/// [`helios_umd12_probe_create_device_v1`] that has not been destroyed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn helios_umd12_probe_venus_context_id_v1(bridge: *mut c_void) -> u32 {
+    if bridge.is_null() {
+        return 0;
+    }
+    // SAFETY: the caller guarantees a live handle produced by
+    // `Box::into_raw(Box::new(BridgeDevice12))`, so the pointee type and
+    // alignment match. Borrowed for the call only — ⛔ NOT `Box::from_raw`,
+    // which would free the caller's still-owned bridge on every read.
+    let bridge = unsafe { &*bridge.cast::<BridgeDevice12>() };
+    bridge.venus_context_id()
+}
+
 /// Drop the bridge and its engine reference. Null-tolerant.
 ///
 /// ⚠ The probe's third arm calls this **before** its own `Release`, so that the

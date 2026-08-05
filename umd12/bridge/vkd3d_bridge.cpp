@@ -46,6 +46,7 @@
 // with the D3D11 bridge).
 #include "bridge_common.h"
 #include "bridge_guard.h"
+#include "bridge_icd_anchor.h"
 
 #include <atomic>
 #include <cstdio>
@@ -133,6 +134,8 @@ using helios_bridge::umd_log;
 // image, so there is no module whose lifetime could end under a live device.
 struct HeliosVkd3dDeviceImpl {
   ID3D12Device* d3d12 = nullptr;
+  // S4b. Read ON THE CREATING THREAD — see `read_venus_ctx_id_now` below.
+  std::uint32_t venus_ctx_id = 0;
 
   ~HeliosVkd3dDeviceImpl() {
     if (d3d12) {
@@ -141,6 +144,44 @@ struct HeliosVkd3dDeviceImpl {
     }
   }
 };
+
+namespace {
+
+/// Resolve the process's canonical venus ICD and read its context id, **on the
+/// calling thread**.
+///
+/// ⚠ The thread matters and is not a detail. `helios_venus_instance_ctx_id`
+/// ignores its `VkInstance` argument and returns a `_Thread_local`
+/// (`icd/mesa/src/virtio/vulkan/vn_renderer_helios.c:639-644`), so an engine
+/// that creates its instance on one thread and asks on another gets 0 or
+/// another thread's answer. vkd3d creates its `VkInstance` on the calling
+/// thread of `vkd3d_create_instance`, which is the thread inside
+/// `helios_vkd3d_create_device` — so this is called from there, synchronously,
+/// immediately after the device comes back. `ARCHITECTURE.md` §6.4; the D3D11
+/// bridge draws the same line at `dxvk_bridge.cpp`'s
+/// `read_instance_venus_context_id` right after `new DxvkInstance`.
+///
+/// Returns false only when the process ANCHOR refused — two venus ICD modules
+/// in one process. A ctx id of 0 is not a refusal (an old ICD without the
+/// export is a degraded read, not a coherence failure).
+bool read_venus_ctx_id_now(std::uint32_t* out) {
+  *out = 0;
+  void* icd = helios_bridge::find_venus_icd_module();
+  if (!icd) {
+    umd_log("venus ctx id: no loaded module exports helios_venus_memory_alloc_info");
+    return true;
+  }
+  // ⛔ THE S4b STEP. Both UMDs run this; whichever loaded first published, and
+  // a disagreement means this process has two ICD builds live.
+  void* canonical = helios_bridge::reconcile_icd_anchor(icd);
+  if (!canonical) {
+    return false;   // IcdAnchorMismatch already counted and logged
+  }
+  *out = helios_bridge::read_venus_ctx_id(canonical);
+  return true;
+}
+
+}  // namespace
 
 HeliosVkd3dDevice::HeliosVkd3dDevice() noexcept = default;
 
@@ -154,6 +195,14 @@ std::size_t HeliosVkd3dDevice::d3d12_device_ptr() const noexcept {
   // owning `ID3D12Device` is a double release at drop, and the crash lands
   // nowhere near here.
   return impl ? reinterpret_cast<std::size_t>(impl->d3d12) : 0;
+}
+
+std::uint32_t HeliosVkd3dDevice::venus_context_id() const noexcept {
+  // Already read, on the creating thread, at device-create time. ⛔ Do NOT
+  // re-read it here: this accessor can be called from any thread and the ICD's
+  // export is thread-local, so a lazy read would answer 0 or another thread's
+  // context on every caller but the first.
+  return impl ? impl->venus_ctx_id : 0;
 }
 
 std::unique_ptr<HeliosVkd3dDevice> helios_vkd3d_bridge_create_device(
@@ -259,10 +308,26 @@ std::unique_ptr<HeliosVkd3dDevice> helios_vkd3d_bridge_create_device(
         // every exit path including an exception unwinding out of the guard.
         out->impl->d3d12 = dev;
 
-        char msg[160];
+        // ⛔ S4b: on THIS thread, before returning. The ICD's ctx-id export is
+        // thread-local, and vkd3d created its `VkInstance` on this thread
+        // inside the call above.
+        std::uint32_t ctx = 0;
+        if (!read_venus_ctx_id_now(&ctx)) {
+          // The anchor refused: two venus ICD modules in one process. Refusing
+          // device creation is `ARCHITECTURE.md` §6.4's stated behaviour, and
+          // it is the right one — a device built here would hand foreign
+          // handles across the two ICDs and fail much later, somewhere else.
+          // `IcdAnchorMismatch` is already counted and logged.
+          umd_log("REFUSING ID3D12Device: venus ICD anchor mismatch");
+          return std::unique_ptr<HeliosVkd3dDevice>{};
+        }
+        out->impl->venus_ctx_id = ctx;
+
+        char msg[192];
         std::snprintf(msg, sizeof(msg),
-                      "ID3D12Device created OK on luid %08x:%08x (static vkd3d engine)",
-                      (unsigned)luid_high, (unsigned)luid_low);
+                      "ID3D12Device created OK on luid %08x:%08x venus ctx_id=%u "
+                      "(static vkd3d engine)",
+                      (unsigned)luid_high, (unsigned)luid_low, ctx);
         umd_log(msg);
         return out;
       });

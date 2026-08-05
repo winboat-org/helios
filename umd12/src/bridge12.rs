@@ -72,6 +72,11 @@ mod ffi {
         /// taking ownership.
         fn d3d12_device_ptr(self: &HeliosVkd3dDevice) -> usize;
 
+        /// The venus context id this device's `VkInstance` belongs to (S4b),
+        /// captured at create time on the creating thread. 0 if the ICD is
+        /// absent or too old to export it.
+        fn venus_context_id(self: &HeliosVkd3dDevice) -> u32;
+
         /// Create a vkd3d device on the Helios adapter identified by the split
         /// LUID. Returns a null `UniquePtr` on failure (adapter not found,
         /// engine refused, ...).
@@ -150,6 +155,18 @@ impl BridgeDevice12 {
         // whole life). `ManuallyDrop` borrows it without taking a reference,
         // so no Release is ever issued against a reference we do not own.
         (p != 0).then(|| ManuallyDrop::new(unsafe { ID3D12Device::from_raw(p as *mut c_void) }))
+    }
+
+    /// The venus context id this device's Vulkan instance belongs to (S4b).
+    ///
+    /// ⭐ This is the S4b pass criterion's instrument: with `helios_umd.dll` and
+    /// `helios_umd12.dll` both live in one process, this value and the D3D11
+    /// bridge's must be **non-zero and equal**, because
+    /// `helios_icd_anchor_v1` forced both to the same ICD module. If they were
+    /// ever unequal the two drivers would be handing each other foreign
+    /// `VkDeviceMemory`/`VkInstance` handles.
+    pub(crate) fn venus_context_id(&self) -> u32 {
+        self.get().map_or(0, |d| d.venus_context_id())
     }
 }
 

@@ -51,6 +51,13 @@ struct HeliosVkd3dDevice {
   // paired with exactly one `from_raw` on the Rust side. `bridge12.rs`'s module
   // doc carries the same note so neither half is re-derived alone.
   std::size_t d3d12_device_ptr() const noexcept;
+
+  // S4b. The venus context id this device's `VkInstance` belongs to, captured
+  // at create time ON THE CREATING THREAD (the ICD's export is thread-local).
+  // 0 when the ICD is absent or too old to export it — which is a degraded
+  // read, not a failure; an anchor MISMATCH refuses device creation outright
+  // and no `HeliosVkd3dDevice` exists to ask.
+  std::uint32_t venus_context_id() const noexcept;
 };
 
 // ⛔ NOT named `helios_vkd3d_create_device`: that C symbol is DEFINED in the
