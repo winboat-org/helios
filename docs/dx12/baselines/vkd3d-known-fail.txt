@@ -1,0 +1,80 @@
+# docs/dx12/baselines/vkd3d-known-fail.txt
+#
+# D12-G2 headless conformance baseline — the FIRST green run IS the baseline.
+# Thereafter the pass criterion is: nosummary count unchanged, no NEW failing
+# test name, and `skipped` not increased.
+#
+#   run     2026-08-05, clean (OBS graphics_hook64 removed first)
+#   arm     app-local vkd3d developer harness: vkd3d d3d12.dll + d3d12core.dll
+#           beside tests/d3d12.exe. NOT a shipping path (DECISIONS D2's one
+#           narrow exception); D12-G9 runs the SAME binary against the system
+#           d3d12.dll and diffs against this file.
+#   build   vkd3d-proton-helios branch `helios`, mingw cross — hashes in
+#           docs/dx12/baselines/gate-binaries.txt
+#   jobs    -j 1        wall 57.5 min
+#
+#   TRIPLE  logs=543 nosummary=5 executed=22968526 failures=2020 skipped=86
+#           42 tests carry a failure, 49 carry a skip, 5 produced no summary.
+#
+# ⚠ `executed` is an ASSERTION count, not a test count. The histogram is the
+#   harness health check: this run has 265 distinct values, min 3, max 2300046.
+#   A run where every test reports the SAME `executed` is a harness failure —
+#   that is how the CRLF bug faked an ALL PASSED! (GATES.md §4.3).
+
+## EXCLUDED BY NAME (2) — not run; they fault the host GPU, see GATES.md §4.3
+test_uav_counter_null_behavior_dxbc
+test_uav_counter_null_behavior_dxil
+
+## NO SUMMARY (5) — hung or died before writing a summary line. NOT "flake".
+## Two were hung and killed by tmp/dx12/g2-hang-watchdog.ps1, each with a
+## matching host GPU fault in `journalctl -k`:
+test_undefined_descriptor_heap_mismatch_types   # HUNG — Xid 109 CTX SWITCH TIMEOUT, vkr-ring-1208 ch 0x1b
+test_uav_clear_exhaustive_descriptors           # HUNG — Xid 13 Graphics Exception SKEDCHECK36_DEPENDENCE_COUNTER_UNDERFLOW, vkr-ring-1642 ch 0x52
+## Three died on their own (no watchdog entry, so they exited rather than hung):
+test_custom_border_color_limits                 # dies after "device limits are exhausted" + "no suitable memory type for type_flags #6"
+test_destruction_notifier_interfaces            # dies immediately after device init
+test_fence_wait_robustness_shared               # dies after repeated "Failed to open shared handle, hr #80004001" (E_NOTIMPL)
+
+## FAILING (42) — ran to completion, reported failures
+test_amplification_shader_execute_indirect_state
+test_buffer_feedback_instructions_dxil
+test_buffer_feedback_instructions_sm51
+test_buffers_oob_behavior_vectorized_structured_16bit
+test_check_feature_support
+test_conditional_rendering
+test_copy_texture_ds_edge_cases
+test_create_committed_resource
+test_create_root_signature
+test_derivative_hoisting_dxil
+test_device_factory
+test_dynamic_depth_bias
+test_execute_indirect_multi_dispatch_root_constants
+test_execute_indirect_multi_dispatch_root_descriptors
+test_execute_indirect_state
+test_execute_indirect_state_predication
+test_execute_indirect_state_vbo_offsets
+test_format_support
+test_map_texture_validation
+test_mesh_shader_create_pipeline
+test_mesh_shader_execute_indirect_state
+test_multisample_resolve_strongly_typed
+test_open_heap_from_address
+test_placed_msaa_alignment_workaround
+test_planar_video_formats
+test_primitive_restart
+test_raytracing_deferred_compilation
+test_raytracing_local_rs_static_sampler_collection
+test_renderpass_validation
+test_resolve_non_issued_query_data
+test_root_constant_indexing_dxil
+test_sample_shading_coverage_mask
+test_shader_instructions
+test_shader_instructions_dxil
+test_sm68_draw_parameters
+test_structured_buffer_addressing_wrap
+test_undefined_structured_raw_alias_dxbc
+test_undefined_structured_raw_alias_dxil
+test_undefined_structured_raw_read_typed_dxbc
+test_undefined_structured_raw_read_typed_dxil
+test_view_instancing
+test_view_instancing_indirect_state

@@ -752,6 +752,55 @@ cmd /c "call `"$VC`" >nul && cl /nologo /EHsc /W4 Z:\tools\d3d12_caps_dump.cpp /
 `(executed, failures, skipped)` and the failing-test-name list. Thereafter:
 `nosummary == 0` **and** no new failing test name **and** `skipped` not increased.
 
+⛔ **Amend that criterion: `nosummary == 0` is not achievable on this stack and must not be the
+gate.** The baseline run has **five**, and each is a named, understood defect rather than noise — see
+below. The usable criterion is **`nosummary` unchanged, no NEW name in any of the three lists,
+`skipped` not increased**. A gate that demands zero would be permanently red and would therefore be
+ignored, which is worse than a gate that tracks a known set.
+
+---
+
+#### ✅ BASELINE TAKEN 2026-08-05 — `docs/dx12/baselines/vkd3d-known-{fail,skip}.txt`
+
+```
+logs=543  nosummary=5  executed=22968526  failures=2020  skipped=86
+42 tests carry a failure · 49 carry a skip · 5 produced no summary · 2 excluded by name
+-j 1, wall 57.5 min, clean (OBS's hook removed first)
+```
+
+**Harness health check — the number that proves the run was real:** the per-test `executed`
+histogram has **265 distinct values, min 3, max 2 300 046**. Compare the CRLF false pass, where all
+545 read exactly `3`. ⚠ **Always print this histogram**; the triple alone cannot tell the two apart.
+
+**The five no-summary tests, classified** (this is the work `nosummary != 0` is asking for — two hung
+and were killed by the watchdog, three exited on their own):
+
+| Test | What |
+|---|---|
+| `test_undefined_descriptor_heap_mismatch_types` | HUNG — host **Xid 109** CTX SWITCH TIMEOUT, `vkr-ring-1208`, ch `0x1b` |
+| `test_uav_clear_exhaustive_descriptors` | HUNG — host **Xid 13** Graphics Exception, `SKEDCHECK36_DEPENDENCE_COUNTER_UNDERFLOW`, `vkr-ring-1642`, ch `0x52` |
+| `test_custom_border_color_limits` | died after `device limits are exhausted` + `no suitable memory type for requested type_flags #6` |
+| `test_destruction_notifier_interfaces` | died immediately after device init |
+| `test_fence_wait_robustness_shared` | died after repeated `Failed to open shared handle, hr #80004001` (`E_NOTIMPL`) |
+
+⇒ **Together with the two excluded tests, four of the seven are the same shape: undefined / null /
+mismatched / exhausted descriptor usage faults the host GPU, in two distinct ways, and the guest
+hangs instead of seeing device-removed.** That is one defect with four witnesses, not four defects.
+
+**⛔ Two documented expectations died in this run — fix them where they are written:**
+
+1. **The S1 shared-heap trap did NOT fire.** This gate's own trap note predicted
+   `test_map_texture_validation` and `test_open_heap_from_address` would **crash** (`executed =
+   null`) on `vkGetMemoryWin32HandleKHR` being a NULL function pointer, and made that a
+   before-G9 blocker. Both ran to completion: **49 executed / 2 failures** and **20 executed /
+   2 failures** respectively. S1 is real but it degrades to ordinary failures here rather than
+   crashing, so it does **not** gate G9. ⚠ Why it does not crash is unexplained — do not convert
+   "did not crash" into "is fixed".
+2. **`DECISIONS.md` risk 7 — D3D12 cross-process sharing broken on native Windows under vkd3d — is
+   CONFIRMED, not merely likely.** `test_fence_wait_robustness_shared` fails every shared-handle
+   open with `hr #80004001` (`E_NOTIMPL`) and then dies. That is the Wine-private-escape dependency,
+   observed.
+
 ⚠ **A run whose `skipped` count is ≈ 545 is a G1 regression masquerading as a pass.** Check
 `triple.txt`, never `runner.txt`'s `ALL PASSED!`.
 
