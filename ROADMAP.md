@@ -3418,10 +3418,83 @@ silent on it:
     ICD fragility at device removal, not a UMD regression — no id-1000 names
     `helios_umd`, and the desktop was verified composited afterwards. Worth a stability
     item of its own.
-- **Next: S5** — INF + slot 3 + `UmdD3D12` (default OFF) + `OpenAdapter12` reachable,
-  all in ONE commit. Then S6-0 (all 214 slots stubbed), then the 11-lane S6 fan-out,
-  then the §10 review pass. The paste-ready brief is
-  `tmp/dx12/NEXT-SESSION-PROMPT.md`.
+- ⭐ **S5 is COMPLETE (2026-08-06): `helios_umd12.dll` holds `UserModeDriverName[3]`
+  and `OpenAdapter12` no longer refuses.** ONE commit, because `DECISIONS.md` §7.1 /
+  R908 makes atomicity non-negotiable: the eight `D3D12DDI_ADAPTERFUNCS_0109` slots,
+  the `UmdD3D12` kill switch (default OFF), the deletion of `umd`'s duplicate
+  `OpenAdapter12` export, the four `.inx` edits and the `cargo make` staging of the
+  second UMD all land together.
+  - **`D12-G6` PASSES** (`tmp/dx12/gates/G6/RESULT.md`): four `UserModeDriverName`
+    entries with `[3]` on the deployed `helios_umd12`, `InstalledDisplayDrivers` the
+    two-entry form, `D3D12CreateDevice` → `0x887A0004` with the knob absent, zero
+    `helios_umd*` id-1000s, desktop composited, and `umd`'s rustc warning count
+    **15 → 15** measured by reverting `adapter.rs` alone.
+  - ⭐ **`ARCHITECTURE.md` §13 UNVERIFIED-1 is CLOSED — slot 3 IS served
+    independently.** The D3D12 client loaded the slot-3 DLL by its content-addressed
+    name and logged to its own `umd12-<pid>.log` with `OpenAdapter12=1`, so the
+    refusal the app saw is **ours**, not DXGI's generic answer.
+  - ⛔ **Two things the doc set had backwards or open, corrected by the knob-ON run.**
+    `pfnGetCaps` is called **BEFORE** `pfnGetSupportedVersions` (§1.2 had it the other
+    way): `GetCaps(1074)`, `GetCaps(1007)`, then the two version calls. ⇒ **the caps
+    answer cannot depend on a negotiated version, because there is not one yet**, and
+    refusing 1074/1007 aborts device creation two calls in — which is why `D12-G7` is
+    not reachable until L1 lands. And `pfnGetSupportedVersions` really is the two-call
+    count-then-fill pair (`DDI_REFERENCE.md` §1.3's UNVERIFIED, closed without needing
+    the §15 spy).
+  - ⚠ The DriverStore package still carries no `helios_umd12.dll`: the INF and the
+    packaging task are committed, but the `win_build_kmd` + `win_install_kmd` + reboot
+    that publishes them is deliberately deferred until after S6-0, so one boot
+    validates a device that can actually be created. A cold boot has no D3D12 UMD
+    until then — harmless while the kill switch is off.
+- ⭐ **`DECISIONS.md` D12 (2026-08-06): the DDI version is `_0110`, advertised as
+  exactly ONE token, filling the `_0109`-generation tables.** `PARALLEL.md` §8's last
+  not-parallelisable decision, made before the fan-out. One token means the runtime
+  either negotiates `_0110` or fails the handshake, which makes §12 trap 2's closed
+  enum exhaustive with a single legal arm and a wrong-sized table fill
+  *unrepresentable*. The thirteen `VulkanOn12` obligations are accepted and become
+  **lane** obligations — each one a lane cannot honour gets a named refusal counter.
+- ⭐ **`DECISIONS.md` D13 (2026-08-06, owner): private data that CROSSES a module
+  boundary is declared once, in `helios_protocol`.** The requirement traces to
+  `DX12.md` §4.3 row 6 → D3c → `ResourceHeaps.md:198` (*"private data … consumable by
+  their D3D11 driver"*), and the thing it names **already exists**:
+  `HeliosWddmAllocPrivate` (`'HWDM'`) and `HeliosWddmOpenIdentity` (`'HIDN'`) in
+  `protocol/src/wddm.rs`, already read by `umd`, `kmd_render` and the Mesa ICD. L4 and
+  L8 reuse them **verbatim** — same struct, same magic, same version — which discharges
+  D3c in code. ⛔ `umd_common` would have been the wrong home: `kmd_render` is `no_std`
+  and does not depend on it. Per-object `pDrvPrivate` blocks stay local and typed.
+- ⭐ **S6-0 is COMPLETE (2026-08-06): all 206 device / command-list / queue slots carry
+  PER-SLOT counting noops, and the eleven-lane sequencer is written.**
+  - **Per-slot, not per-table**, because `PARALLEL.md` §9.2 makes *"its noop hit
+    counters read zero for its slots"* a per-lane definition of done and
+    `CONFORMANCE.md` reads the same instrument. One const-generic
+    `slot_noop<TABLE, SLOT>` monomorphises 206 times, and **the slot ordinal is
+    `offset_of!(Table, field) / 8`** — derived from the ABI, so a mis-ordered name list
+    cannot mis-attribute a hit.
+  - ⭐ **The compile-time ABI-order proof is the real deliverable**: per table,
+    `OFFSETS.len() == size_of::<T>()/8` and `OFFSETS[i] == i*8` for every `i`, on every
+    build of either platform. That is `DECISIONS.md` §4.1's "slots 38-40" scar — a
+    `sed` line offset misread as a member index — made unrepresentable.
+  - ⭐ **Install order is structural**: `Filling<'a, T, Stage>` is `#[must_use]`, carries
+    the `&mut`, and each lane's `install` names the previous lane's marker. S6-0 wrote
+    the whole chain, so a lane's diff against `tables12.rs` is **empty** — fewer merge
+    points than §5's original one-line-per-lane protocol, not more.
+  - **Evidence: 40 steps, 0 failures** (`tmp/dx12/gates/S6-0/RESULT.md`). Driven by
+    `tools/d3d12_fill_table_probe.cpp` through two probe exports, because the runtime
+    cannot reach `pfnFillDDITable` until L1 answers caps. It poisons a buffer, asks for
+    `size − 8`, and checks the **guard band is untouched** — the R702 failure a
+    prefix-only test cannot see.
+  - ⭐ **And the sizes came back 992 / 600 / 56**, exactly what `D12-G5` measured this
+    runtime handing WARP at `_0110`: the bindgen structs are byte-identical to what the
+    runtime negotiates, confirming D12 from the driver's own side.
+- **S6-0b is COMPLETE (2026-08-06): `device12.rs`** — the private block,
+  `pfnCalcPrivateDeviceSize` / `pfnCreateDevice` / `pfnDestroyDevice`, the engine
+  device, and the `DeviceUnderConstruction` unwind guard. Validate-before-construct,
+  one function of `Flags` for the size, the corelayer union arm fixed at `_0062` by
+  D12's one-token set, and a per-device teardown readout that makes the block's fields
+  genuinely *read* rather than merely stored (the R908 rule forces that choice).
+- **Next: L1 (caps), alone** — `PARALLEL.md` §8 makes it one agent's, whole, and S5
+  measured that it is what gates device creation. Then **`D12-G7`**, then the remaining
+  ten lanes fan out, then the §10 review pass.
 - ⭐ **S6 is the bulk — 214 driver-side slots — and it FANS OUT. The split is
   `docs/dx12/PARALLEL.md`:** 11 lanes with exclusive file ownership, an append-only
   protocol for the four shared files, and a lease on the VM. Two things gate the
