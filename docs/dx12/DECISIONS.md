@@ -336,17 +336,43 @@ two engines differently.
 2. Upstream's *"we do not stress test these builds at all"* — a real risk signal for the MSVC arm,
    and an argument for keeping the mingw cross-build as the **conformance** arm even if the shipping
    UMD links statically.
-3. Blast radius in dwm. `helios_umd12.dll` is **105 KB** today and only pulls the ~20 MB engine when
-   a device is actually created; statically linked it would be ~20 MB mapped and relocated whenever
-   dwm calls `OpenAdapter12` — which `DECISIONS.md` §7.13 records that dwm *already does in
-   production*. ⚠ This is the one consideration that genuinely favours a module boundary, it is the
-   same argument D3 uses for splitting the DLLs at all, and it is measurable rather than theoretical.
+3. ~~Blast radius in dwm.~~ ⛔ **MEASURED AND DEAD, 2026-08-05.** This was stated as "105 KB versus a
+   ~20 MB engine". **The 20 MB was 10.6 MB of embedded DWARF**: mingw links debug info *into* the
+   image, MSVC emits it to a separate PDB. Compared honestly:
 
-⇒ **D4 is downgraded from a settled decision to an OPEN choice with a stated default.** The default
-stays "DLL + two exports" **only** because it is what is already built and green at `D12-G1` — not
-because the recorded reasons hold. Anyone may switch to static linking on the strength of (1)–(3);
-the switch does not need new justification, it needs a costed build. **`GATES.md` §7.29** owns the
-experiment.
+   | | DLL bytes | `.text` bytes |
+   |---|---:|---:|
+   | `helios_umd.dll` — **DXVK statically linked**, MSVC, release | **6 115 328** | 4 377 211 |
+   | `helios_vkd3d.dll` — vkd3d, mingw, **stripped** | **6 193 166** | 5 189 504 |
+
+   *(`helios_umd.pdb` is a further 46 460 928 bytes, outside the DLL. Unstripped,
+   `helios_vkd3d.dll` is 20 066 830.)*
+
+   ⇒ **The two engines are the same size — 1.3 % apart on the module, 1.19× on code.** So a
+   statically-linked `helios_umd12.dll` would be ≈ 6 MB: *exactly the module size dwm already maps,
+   relocates and unmaps once per D3D11 device create today* for `helios_umd.dll`. This is not a new
+   cost class, and the owner's prior was right — "dxvk should be as big as vkd3d if not bigger" is
+   off by 19 % in `.text` and by nothing that matters.
+
+   ⚠ **The one residual, and it is transitional only:** at 105 KB the `LoadLibrary` shape lets
+   `OpenAdapter12` *refuse* without mapping any engine at all, which matters while D3D12 is off by
+   default. Statically linked, dwm maps ≈ 6 MB to receive an immediate `DXGI_ERROR_UNSUPPORTED`.
+   That window closes the moment D3D12 is actually enabled — from then on a real device create maps
+   the engine either way — and it is already governed by the `UmdD3D12` kill switch (D11) and by not
+   registering slot 3 until S5. **It is a reason to sequence the switch, not a reason to reject it.**
+
+⇒ **D4 is downgraded from a settled decision to an OPEN choice, and the evidence now leans the other
+way.** Of the four things ever offered in its favour, three are dead and one is transitional:
+licence retracted, two-SPIR-V-compilers subsumed by D3, the dxgi objection **inverted** (static
+linking achieves it; the shipping DLL does not), and the size objection **measured away** — the two
+engines differ by 1.3 %, and dwm already maps a statically-linked engine of that size every D3D11
+device create.
+
+The default stays "DLL + two exports" for exactly one reason: **it is what is already built and green
+at `D12-G1`.** That is inertia, not justification. The switch does not need a new argument — it needs
+a costed clang-cl build, and the only open cost is (1). **`GATES.md` §7.29** owns that experiment,
+and its pass condition is the thing the current shape fails: `objdump -p` showing **no `dxgi.dll`
+import**.
 
 ⛔ **Do not re-cite reasons 1–3 as though they settle this.** They are recorded above with their
 status so the argument is not re-run from the stale version.
