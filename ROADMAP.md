@@ -3397,8 +3397,31 @@ silent on it:
     cross-check away from every S6 lane — fixed with cargo build-script overrides
     in `tools/umd12-host-check.sh`; and the `static_assert` invariant check had
     been counting its own documentation (reporting 3) since before P2.
-- **Next: S4b** — the `helios_icd_anchor_v1` export in both DLLs, which must land
-  before the first two-engine run (UNVERIFIED-4). Then S5, then S6.
+- ⭐ **S4b is COMPLETE (2026-08-06): one venus ICD module per process, whichever UMD
+  loads first.** Both cdylibs export `helios_icd_anchor_v1`; the module walk moved to
+  `umd_common/bridge/bridge_icd_anchor.{h,cpp}` (ONE source compiled into both — that
+  is the mechanism, not duplication); a mismatch **refuses** device creation rather
+  than adopting the other module, and counts `IcdAnchorMismatch`.
+  - **Gate: 18 steps, 0 failures, in BOTH load orders** (`tmp/dx12/gates/S4b/RESULT.md`).
+    Both DLLs' logs name the same ICD; ⭐ the **publisher** changes with load order and
+    the **answer** does not.
+  - ⛔ **A correction to `ARCHITECTURE.md` §6.4, settled by the run.** §6.4's criterion
+    *"both venus context ids non-zero and EQUAL"* is **wrong**: each engine builds its
+    own `VkInstance`, the ICD mints a context per instance, and
+    `helios_venus_current_ctx_id` is last-writer-wins — so `normal` order gives 23/23
+    and `reverse` gives 25/27 **on one ICD module**. Equality is an artifact of
+    ordering; the invariant is one ICD **module** per process. §6.4 not edited — owner
+    call.
+  - ⚠ The deploy this needed faulted four live Vulkan clients (Explorer, dwm,
+    SearchHost, ApplicationFrameHost, `0xc0000005`) **inside the venus ICD**
+    (`vulkan_virtio-*.dll`) when `-RestartDevice` removed the PCI device. Pre-existing
+    ICD fragility at device removal, not a UMD regression — no id-1000 names
+    `helios_umd`, and the desktop was verified composited afterwards. Worth a stability
+    item of its own.
+- **Next: S5** — INF + slot 3 + `UmdD3D12` (default OFF) + `OpenAdapter12` reachable,
+  all in ONE commit. Then S6-0 (all 214 slots stubbed), then the 11-lane S6 fan-out,
+  then the §10 review pass. The paste-ready brief is
+  `tmp/dx12/NEXT-SESSION-PROMPT.md`.
 - ⭐ **S6 is the bulk — 214 driver-side slots — and it FANS OUT. The split is
   `docs/dx12/PARALLEL.md`:** 11 lanes with exclusive file ownership, an append-only
   protocol for the four shared files, and a lease on the VM. Two things gate the
