@@ -3249,27 +3249,50 @@ charter first.
 
 ## Workstream 4 — D3D12  ← **PRIORITY 2 since 2026-08-05**
 
-**The charter is `DX12.md`.** Summary of the starting position, so this file is
-not silent on it:
+**The charter is `DX12.md`; the implementation set is `docs/dx12/`, and
+`docs/dx12/DECISIONS.md` is authoritative over both.** State, so this file is not
+silent on it:
 
-- `umd/src/adapter.rs` exports `OpenAdapter12` and it **refuses** — the D3D12
-  DDI is not implemented.
-- The earlier D3D12 scaffolding (the hand-written `D3d12Ddi*` structs, the eight
-  `d3d12_*` handlers, `D3D12_SUPPORTED_DDI_VERSIONS`) was **deleted by T6/R908**,
-  so this starts from zero rather than from a half-built surface. That is the
-  right base — the deleted code was stub-shaped, and the project's rule is never
-  to stub silently.
-- `vkd3d-proton-helios` is a registered, pinned submodule at `ee737e32` with
-  **zero Helios divergence** — it is an unmodified upstream commit, 44 behind
-  `origin/master`, and no document has ever explained why it was vendored.
-  So there is no sunk fork cost pulling the decision either way. `DX12.md` states the two
-  candidate strategies (native D3D12 DDI vs vkd3d-proton over the existing
-  Vulkan/Venus path) and what evidence would decide between them; the decision
-  is open.
-- Whatever the strategy, D3D12 asks the KMD for things D3D11 never did —
-  multi-engine command queues, residency (`OfferAllocations`/`ReclaimAllocations`),
-  tiled/reserved resources. `DX12.md` inventories which of those
-  `kmd_render/src/ddi/` has today.
+- **The strategy is CLOSED (2026-08-05):** Helios ships a real D3D12 UMD,
+  `helios_umd12.dll`, implementing `d3d12umddi` and forwarding into vkd3d-proton's
+  `ID3D12*` COM objects — the D3D11 architecture with DXVK swapped for vkd3d and
+  `UserModeDriverName[2]` for `[3]`. ⛔ There is **no app-facing vkd3d arm**
+  (owner directive, DECISIONS D2): Helios never ships or measures vkd3d's
+  `d3d12.dll` as an application's D3D12.
+- **P0 is complete (2026-08-05) and it was the load-bearing risk.** `D12-G0`
+  (mingw cross build, `--list-tests` = 557) and `D12-G1` (the headless bridge
+  probe: `helios_vkd3d_create_device` → DXIL SM 6.0 triangle → `READBACK` →
+  exact pixels, 28 steps / 0 failures) both green on the first run.
+  ⇒ **vkd3d demonstrably runs on venus**, which is what stood between a wrong
+  assumption and ~200 DDI slots written on top of it.
+- **The substrate ceiling is measured, not predicted: FL 12_2 and SM 6.8.**
+  `DECISIONS.md` H5 — whether vkd3d's `maintenance7` layered-`driverID` swizzle
+  fires on venus — was the one open question that moved the ceiling, and
+  `tools/vk_layered_driverid_probe.cpp` answered it: the nested
+  `VkPhysicalDeviceDriverProperties` carries `NVIDIA_PROPRIETARY`. Confirmed on a
+  live device at G1 (`ResourceBindingTier 3`, `TiledResourcesTier 4`,
+  `ConservativeRasterizationTier 3`, `RaytracingTier 1_1`,
+  `TypedUAVLoadAdditionalFormats 1`).
+- `umd/src/adapter.rs` exports `OpenAdapter12` and it **still refuses**, and must
+  keep refusing until the commit that makes its body reachable (R908). No D3D12
+  DDI code exists before P2. The earlier scaffolding (hand-written `D3d12Ddi*`
+  structs, eight `d3d12_*` handlers, `D3D12_SUPPORTED_DDI_VERSIONS`) was deleted
+  by T6/R908 and this starts from zero rather than from a half-built surface.
+- **The fork has content now.** `vkd3d-proton-helios` is on branch `helios` at
+  `github.com/rupansh/vkd3d-proton` (remote `helios`; the checkout's `origin` is
+  still upstream — ⛔ push to `helios`): D4's two DXGI-free exports, plus a
+  Windows-bash fix to `tests/test-runner.sh`. The "zero Helios divergence, nobody
+  knows why it was vendored" note is history.
+- **The KMD is not on the critical path** — three small items (`K1` NodeOrdinal
+  validation, `K2` `NoPatchingRequired`, `K3` `ApertureSegmentCommitLimit`), none
+  required for the first triangle, and none of the 31 reachable-but-unset
+  `DxgkDdi*` slots is required for a baseline D3D12 device. The multi-engine /
+  residency / tiled-resource expectations in the earlier version of this bullet
+  were wrong: `docs/dx12/KMD_IMPACT.md` walks each one.
+- **Next, and it writes no driver code either:** P1 / `D12-G5`, the WARP spy
+  proxy — `d3d10warp.dll` exports `OpenAdapter12`, so forwarding to it and
+  logging the real call sequence turns seven undocumented contract questions
+  into one log file.
 
 
 **30th session (2026-07-07) — 3DMark bring-up: LUID gap FIXED, FL11 ceiling
