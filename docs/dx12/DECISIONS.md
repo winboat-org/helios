@@ -219,8 +219,15 @@ D3's rollback and blast-radius arguments are unaffected.
 - It raises the priority of `pfnOpenHeapAndResource`, which `DDI_REFERENCE.md` §9.7 already records as
   one of the runtime's nine hard NULL-checks, from "must be non-NULL" to "must actually work".
 
-**Decision D4 — the vkd3d engine is reached through a Helios-added export on vkd3d's own DLL, not
-by statically linking `libvkd3d` into the UMD.** The UMD `LoadLibrary`s a Helios-built
+**Decision D4 — ⛔ SUPERSEDED 2026-08-05. `helios_umd12.dll` STATICALLY LINKS vkd3d, exactly as
+`helios_umd.dll` statically links DXVK. Read "✅ D4 IS DECIDED — STATIC" below before this
+paragraph.** What follows is the original DLL-and-two-exports decision, retained because the **two
+Helios entry points it introduced are unchanged and still the interface** — only their delivery
+changed, from an exported DLL to a static archive. Every *rationale* below is dead; see the status
+table in the decided section.
+
+*Original text:* the vkd3d engine is reached through a Helios-added export on vkd3d's own DLL, not
+by statically linking `libvkd3d` into the UMD. The UMD `LoadLibrary`s a Helios-built
 `helios_vkd3d.dll` (vkd3d's `d3d12core` target, renamed, with two added exports) and calls
 
 ```c
@@ -292,90 +299,64 @@ Three reasons, in order:
    SPIRV-Headers, and whether their *defined external* symbol sets intersect is unverified
    (`research/R4.md` UNVERIFIED-2). Separate modules make the question moot.
 
-### ⛔ D4's RATIONALE IS REOPENED — 2026-08-05, and none of the three reasons survived
+### ✅ D4 IS DECIDED — STATIC, 2026-08-05 (owner)
 
-**Owner challenge:** *"if we are fine with statically linking dxvk, why are we not fine with linking
-vkd3d-proton? … vkd3d-proton is our fork, we can make whatever changes we want in it, we have a
-heavily modified dxvk, and we will probably have a heavily modified vkd3d-proton."*
+> *"D4 is an open choice, the choice is we are going to statically link vkd3d-proton and not mess
+> with dynamic dlls."*
 
-That is correct, and every reason recorded above fails on inspection:
+**`helios_umd12.dll` statically links vkd3d-proton, exactly as `helios_umd.dll` statically links
+DXVK.** There is no `helios_vkd3d.dll` on the shipping path and no `LoadLibrary` of an engine.
+
+**Built and verified the same day**, so this is a measured decision rather than a planned one:
+
+| check | result |
+|---|---|
+| vkd3d builds under clang-cl / MSVC ABI | ✅ **143/143 targets, exit 0** — compiler id `clang-cl` 17.0.6, linker `lld-link`, `b_vscrt=md`, byte-for-byte the toolchain the DXVK build already uses |
+| the static arm has no DXGI dependency | ✅ **0** undefined `CreateDXGIFactory` refs in `libhelios_d3d12_static.a`, `libvkd3d-proton.a`, `libdxil-spirv.a` — against **1** dxgi import in the retired `helios_vkd3d.dll` |
+| the Helios entry points survive | ✅ `T helios_vkd3d_create_device`, `T helios_vkd3d_serialize_root_signature` |
+| archive set | `libhelios_d3d12_static.a` (15.3 MB, self-contained — it already defines `vkd3d_create_device`) plus `libvkd3d-proton.a`, `libvkd3d_common.a`, `libvkd3d-shader.a`, `libdxil-spirv.a`, `libdxbc_spv_module.a`, `libdxbc_spv.a`; **30.6 MB total** |
+
+**The fork change:** `libs/d3d12core/meson.build` gains `helios_d3d12_static` — the same Helios entry
+points as the DLL target, as a `static_library`, **without `main.c` and without `lib_dxgi`**. `main.c`
+is the only object in the engine that references `CreateDXGIFactory1`; a `shared_library` force-links
+every object it is handed, an archive member is pulled only when referenced, so omitting it makes the
+import unrepresentable. ⇒ **the static arm delivers what D4 reason 1 always wanted and the DLL arm
+never did.**
+
+⛔ **One required build flag, and it is a risk acknowledgement rather than a fix.**
+`-D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH` on both `c_args` and `cpp_args`: MSVC 14.44's
+`<yvals_core.h>` hard-asserts *"expected Clang 19.0.0 or newer"* and the installed clang-cl is
+**17.0.6**, so dxbc-spirv does not compile without it. This is the **same define `umd/build.rs`
+already applies to the DXVK bridge shim**, carrying the same caveat recorded there: the ABI still
+rests on the objects agreeing, which nothing here can prove. Raising clang to 19+ retires it.
+
+**Build it with `win_vkd3d`** (`tools/win-mcp`), which mirrors `Z:\vkd3d-proton-helios` to a local
+`C:` checkout and runs the canonical setup + compile — the same mirror-then-build shape as `win_dxvk`,
+including the LLVM-before-vcvars PATH ordering that cmd's parse-time `%PATH%` expansion demands.
+
+**Why the three original reasons are gone, kept so the argument is not re-run from the stale version:**
 
 | reason | status |
 |---|---|
-| **2 — licence** | **Retracted already**, by owner directive. Not a factor. |
-| **3 — two SPIR-V compilers in one DLL** | **Subsumed by D3.** Under the two-DLL split, DXVK is in `umd` and vkd3d in `umd12`, so static-linking vkd3d into `helios_umd12.dll` still leaves exactly **one** SPIR-V compiler per module. It is the reason **D3** is right; it says nothing about D4. |
-| **1 — the engine must not depend on `dxgi.dll`** | ⛔ **Backwards. Static linking ACHIEVES this; the DLL split currently does not.** Measured: `nm --undefined-only` over `libvkd3d-proton.a`, `libvkd3d-shader.a`, `libvkd3d_common.a`, `libdxil-spirv.a` and `libdxbc_spv.a` finds **zero** references to `CreateDXGIFactory1`. The *only* object referencing it is `libs/d3d12core/main.c.obj` — the DLL target's own entry point, which a DLL link force-includes and an **archive** link would never pull, because nothing references it once `helios_vkd3d_create_device` calls `vkd3d_create_device` directly. So the shipping `helios_vkd3d.dll` imports dxgi (see the measurement above) while a static `helios_d3d12_static` would not. |
+| 1 — engine must not depend on `dxgi.dll` | ✅ **Achieved by static linking, and only by it.** Measured above. |
+| 2 — licence | Retracted by owner directive; never a factor. |
+| 3 — two SPIR-V compilers in one DLL | Subsumed by **D3**. Two DLLs already means one SPIR-V compiler per module, so it says nothing about static vs dynamic. |
+| *(the C++-ABI objection briefly recorded here)* | ⛔ **Was wrong, and is retracted.** It generalised the mingw/Itanium artifacts into a property of vkd3d. `vkd3d-proton/meson.build:9` already accepts `clang-cl`; the mingw cross was a G0 convenience because the Linux host had that toolchain. Now disproven by a working clang-cl build. |
+| *(the "blast radius in dwm" objection)* | ⛔ **Measured away.** `helios_umd.dll` with DXVK statically linked is **6 115 328** bytes; `helios_vkd3d.dll` stripped is **6 193 166**. 1.3 % apart. The 20 MB figure was 10.6 MB of embedded DWARF — mingw links debug info into the image, MSVC emits a separate PDB. dwm already maps a statically-linked engine of that size every D3D11 device create. |
 
-⚠ **And the C++-ABI argument briefly recorded here was wrong; it is retracted.** It claimed the
-mingw/Itanium artifacts made static linking impossible. They do not: they are a **build-recipe
-choice**, not a property of vkd3d. `vkd3d-proton/meson.build:9` reads
+⚠ **The one real consequence, and it is a sequencing note:** at 105 KB the old `LoadLibrary` shape let
+`OpenAdapter12` refuse without mapping any engine. Statically linked, `helios_umd12.dll` becomes ≈ 6 MB
+and dwm maps all of it to receive an immediate `DXGI_ERROR_UNSUPPORTED` — until D3D12 is actually
+enabled, at which point a real device create maps the engine either way. This is already governed by
+the `UmdD3D12` kill switch (D11) and by not registering `UserModeDriverName[3]` until **S5**. Keep that
+ordering; it is the reason the switch is cheap.
 
-```meson
-vkd3d_is_msvc  = vkd3d_compiler.get_id() == 'msvc' or vkd3d_compiler.get_id() == 'clang-cl'
-```
+⚠ **The mingw cross-build stays**, as the **conformance** arm: `D12-G0`/`G2` build the vkd3d test suite
+on the Linux host, and upstream's README says outright it does *"not stress test"* MSVC builds. Two
+build recipes, one shipping arm — the MSVC/clang-cl archives ship, the mingw suite validates.
 
-— i.e. the build system already supports **`clang-cl`**, which is the exact compiler
-`dxvk-helios` is built with (`umd/build.rs`: clang-cl + `-Db_vscrt=md`, archives linked as
-`libhelios_d3d11_static.a`, `libdxvk.a`, `libdxbc_spv.a`, …). The mingw cross was chosen at G0
-because the Linux host already had that toolchain (§6.1), not because MSVC was unavailable. Upstream
-also documents an MSVC path outright (`README.md`: *"MSVC is supported as a compiler, although we do
-not stress test these builds at all"*).
-
-⭐ **The symmetry the challenge names is exact.** `dxvk-helios` is a fork that already carries a
-Helios-specific static target (`libhelios_d3d11_static.a`) that upstream does not have.
-`vkd3d-proton-helios` is *also* our fork, already carrying Helios-specific content
-(`helios_entry.c`, `helios_vkd3d.def`, a `helios_vkd3d` target). `research/R4.md` §6.4 already
-specifies the analogous `helios_d3d12_static`. There is no reason of principle left for treating the
-two engines differently.
-
-**What actually remains is cost, and it must be measured rather than argued:**
-
-1. Porting the vkd3d build to clang-cl across the **seven** repositories that link into it, including
-   `widl` (an unconditional `find_program` at `meson.build:73`, needed on any arm) and `glslang`.
-   `GATES.md` §7.9 already tracks the `widl`-on-Windows question.
-2. Upstream's *"we do not stress test these builds at all"* — a real risk signal for the MSVC arm,
-   and an argument for keeping the mingw cross-build as the **conformance** arm even if the shipping
-   UMD links statically.
-3. ~~Blast radius in dwm.~~ ⛔ **MEASURED AND DEAD, 2026-08-05.** This was stated as "105 KB versus a
-   ~20 MB engine". **The 20 MB was 10.6 MB of embedded DWARF**: mingw links debug info *into* the
-   image, MSVC emits it to a separate PDB. Compared honestly:
-
-   | | DLL bytes | `.text` bytes |
-   |---|---:|---:|
-   | `helios_umd.dll` — **DXVK statically linked**, MSVC, release | **6 115 328** | 4 377 211 |
-   | `helios_vkd3d.dll` — vkd3d, mingw, **stripped** | **6 193 166** | 5 189 504 |
-
-   *(`helios_umd.pdb` is a further 46 460 928 bytes, outside the DLL. Unstripped,
-   `helios_vkd3d.dll` is 20 066 830.)*
-
-   ⇒ **The two engines are the same size — 1.3 % apart on the module, 1.19× on code.** So a
-   statically-linked `helios_umd12.dll` would be ≈ 6 MB: *exactly the module size dwm already maps,
-   relocates and unmaps once per D3D11 device create today* for `helios_umd.dll`. This is not a new
-   cost class, and the owner's prior was right — "dxvk should be as big as vkd3d if not bigger" is
-   off by 19 % in `.text` and by nothing that matters.
-
-   ⚠ **The one residual, and it is transitional only:** at 105 KB the `LoadLibrary` shape lets
-   `OpenAdapter12` *refuse* without mapping any engine at all, which matters while D3D12 is off by
-   default. Statically linked, dwm maps ≈ 6 MB to receive an immediate `DXGI_ERROR_UNSUPPORTED`.
-   That window closes the moment D3D12 is actually enabled — from then on a real device create maps
-   the engine either way — and it is already governed by the `UmdD3D12` kill switch (D11) and by not
-   registering slot 3 until S5. **It is a reason to sequence the switch, not a reason to reject it.**
-
-⇒ **D4 is downgraded from a settled decision to an OPEN choice, and the evidence now leans the other
-way.** Of the four things ever offered in its favour, three are dead and one is transitional:
-licence retracted, two-SPIR-V-compilers subsumed by D3, the dxgi objection **inverted** (static
-linking achieves it; the shipping DLL does not), and the size objection **measured away** — the two
-engines differ by 1.3 %, and dwm already maps a statically-linked engine of that size every D3D11
-device create.
-
-The default stays "DLL + two exports" for exactly one reason: **it is what is already built and green
-at `D12-G1`.** That is inertia, not justification. The switch does not need a new argument — it needs
-a costed clang-cl build, and the only open cost is (1). **`GATES.md` §7.29** owns that experiment,
-and its pass condition is the thing the current shape fails: `objdump -p` showing **no `dxgi.dll`
-import**.
-
-⛔ **Do not re-cite reasons 1–3 as though they settle this.** They are recorded above with their
-status so the argument is not re-run from the stale version.
+⛔ The retired `helios_vkd3d` shared target is kept in the fork **only** so `D12-G1` stays reproducible.
+Delete it once G1 has been re-run against the static arm.
 
 **Decision D5 — the KMD is not on the critical path.** For Phase 0 the KMD work list is **empty**;
 for the DDI arm it is three items, none required for the first triangle:

@@ -59,7 +59,8 @@ prerequisite, not a nicety.)
 >
 > **There is no app-facing vkd3d arm** (owner directive). Helios never ships or measures vkd3d's
 > `d3d12.dll`/`d3d12core.dll` as an application's D3D12; vkd3d is an **engine linked behind
-> `helios_umd12.dll`**, reached through the two Helios exports on `helios_vkd3d.dll` (D4). What that
+> `helios_umd12.dll`**, reached through the two Helios entry points — ⛔ *since 2026-08-05 linked as
+> **static archives** (`helios_d3d12_static`), not exported from a DLL; `DECISIONS.md` D4* (D4). What that
 > changes in this document:
 >
 > - **⛔ DXVK's `dxgi.dll` is not part of any deliverable.** Anywhere this file discusses shipping it

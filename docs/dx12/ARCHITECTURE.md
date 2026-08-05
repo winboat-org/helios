@@ -1713,6 +1713,20 @@ Each stage is independently buildable, deployable and revertible. **S1 and S2 to
 and must each be proven neutral; S0, S3 and S4 touch no shipped binary at all.** Gate ids reference
 `docs/dx12/GATES.md` (`D12-G0 … D12-G11`).
 
+⛔ **AMENDMENT 2026-08-05 — the engine is STATICALLY LINKED (`DECISIONS.md` D4, owner).** The table
+below was written against the superseded "`LoadLibrary` a `helios_vkd3d.dll`" shape. Read it with
+these three substitutions:
+
+| where the table says | read |
+|---|---|
+| S0 builds `helios_vkd3d.dll` by **mingw cross on the Linux host** | that build **stays**, but as the **conformance** arm only — it is what `D12-G0`/`G2` need for the vkd3d test suite. The **shipping** artifacts are static archives built on the VM by **`win_vkd3d`** with clang-cl (`libhelios_d3d12_static.a` + six engine archives, ~30.6 MB), matching how DXVK is built and linked today. |
+| S4's probe **`LoadLibrary`s** the engine | S4's `umd12/build.rs` **links the archives**, exactly as `umd/build.rs` links DXVK's eight. There is no engine DLL on the shipping path and no `LoadLibrary` of one. |
+| `helios_vkd3d.dll` as a deliverable | `helios_d3d12_static` (the fork's new `static_library` target, which omits `libs/d3d12core/main.c` so no `CreateDXGIFactory1` import can be generated — verified 0 refs). |
+
+⚠ **What does NOT change:** the two Helios entry points (`helios_vkd3d_create_device`,
+`helios_vkd3d_serialize_root_signature`) are the same functions with the same signatures — only their
+delivery changed from an export to an archive symbol. S4's bridge design is unaffected.
+
 | Stage | Content | Proof the D3D11 path is unharmed | Gates |
 |---|---|---|---|
 | **S0** | `git submodule update --init --recursive` in `vkd3d-proton-helios` (§8.2); **build vkd3d with the mingw cross file on the Linux host** — `meson setup --cross-file build-win64.txt --buildtype release -Denable_tests=true -Denable_extras=true tmp/dx12/build/vkd3d-win64 && ninja -C …` (§8.3, and `GATES.md` §4.1 verbatim); fix the `/XD vkd3d-proton` entry in `tools/win-mcp/src/main.rs:576` and `:843`. ⚠ **No VM toolchain bring-up and no `win_vkd3d` at this stage** — the whole cross toolchain is already installed on the host, and the artifacts reach the VM by `robocopy` | **No Helios binary is touched.** Success = `libs/d3d12core/d3d12core.dll`, `libs/d3d12/d3d12.dll`, `tests/d3d12.exe`, `demos/{triangle,gears}.exe` exist and are non-empty, hashed into `tmp/dx12/gates/G0/sha256sums.txt` | **G0** |

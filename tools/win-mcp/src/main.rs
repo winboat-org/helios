@@ -64,6 +64,21 @@ const LLVM_BIN: &str = "C:\\Program Files\\LLVM\\bin";
 const DXVK_SRC: &str = "Z:\\dxvk-helios";
 const DXVK_MIRROR: &str = "C:\\Users\\Rupansh\\dxvk-helios";
 const DXVK_BUILD: &str = "C:\\Users\\Rupansh\\dxvk-build";
+
+/// vkd3d-proton, built exactly like DXVK: clang-cl + MSVC ABI + `-Db_vscrt=md`,
+/// into static archives that `helios_umd12.dll` links directly.
+///
+/// ⛔ **Static, not a DLL** — owner decision 2026-08-05 (`DECISIONS.md` D4):
+/// *"we are going to statically link vkd3d-proton and not mess with dynamic
+/// dlls."* The `helios_vkd3d.dll` shared target is retired and retained only so
+/// `D12-G1` stays reproducible.
+///
+/// Same mirror-then-build shape as DXVK and for the same reason: meson/ninja
+/// build IO must not run on the `Z:\` 9p share, and the build dir is kept out of
+/// the source tree.
+const VKD3D_SRC: &str = "Z:\\vkd3d-proton-helios";
+const VKD3D_MIRROR: &str = "C:\\Users\\Rupansh\\vkd3d-proton-helios";
+const VKD3D_BUILD: &str = "C:\\Users\\Rupansh\\vkd3d-build";
 /// mingw-w64 (WinLibs UCRT gcc 16.1) bin dir — the RECOMMENDED venus toolchain
 /// (icd/win-build/mingw-native.ini). gcc compiles venus's GNU-isms natively and
 /// builds straight from Z:\. Installed via `winget install BrechtSanders.WinLibs.POSIX.UCRT`.
@@ -350,6 +365,28 @@ struct WinDxvkArgs {
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
+struct WinVkd3dArgs {
+    /// meson argv run for the vkd3d build. **Empty is the normal case** and does
+    /// the right thing: it configures the build dir with the canonical clang-cl
+    /// setup if it is not configured yet, then compiles. Pass an explicit argv
+    /// (e.g. `["setup","--reconfigure", ...]`) only to override.
+    #[serde(default)]
+    args: Vec<String>,
+    /// Skip the Z:\vkd3d-proton-helios -> local-checkout source mirror and build
+    /// only. Default false (always mirror first, so share edits are picked up).
+    #[serde(default)]
+    no_sync: bool,
+    /// Force `meson setup --wipe` before building. Use after changing a meson
+    /// option or the compiler; a plain reconfigure does not always pick those up.
+    #[serde(default)]
+    wipe: bool,
+    /// Timeout in seconds. Defaults to 3600 — vkd3d is seven repositories and a
+    /// cold clang-cl build of dxil-spirv + SPIRV-Tools is slow.
+    #[serde(default)]
+    timeout_secs: Option<u64>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
 struct WinInstallUmdArgs {
     /// The UMD binary to deploy. Defaults to the RELEASE build
     /// (umd\target\release\helios_umd.dll) — see `DEFAULT_UMD_DLL` for why a
@@ -609,6 +646,74 @@ impl WinHost {
             a.args.join(" "),
         );
         match run_ssh(&command, None, &env, a.timeout_secs.unwrap_or(1800)).await {
+            Ok(o) => format_output(&o),
+            Err(e) => format!("error launching ssh: {e}"),
+        }
+    }
+
+    #[tool(
+        description = "Build vkd3d-proton (the D3D12 engine) on win11 with the clang-cl (MSVC ABI) toolchain, producing the STATIC archives helios_umd12.dll links. ⛔ STATIC, NOT A DLL — owner decision 2026-08-05 (DECISIONS.md D4): \"we are going to statically link vkd3d-proton and not mess with dynamic dlls\". This is the exact shape win_dxvk uses for DXVK, and for the same reasons: it mirrors Z:\\vkd3d-proton-helios -> the local checkout C:\\Users\\Rupansh\\vkd3d-proton-helios (meson build IO must not run on the Z:\\ 9p share) and builds into C:\\Users\\Rupansh\\vkd3d-build. CRITICAL and the reason this tool exists rather than a raw win_exec: it prepends LLVM (clang-cl) to PATH BEFORE calling vcvars64, because cmd expands %PATH% at PARSE time — the reverse order silently drops MSVC's lib.exe/link.exe and the archive step dies with 'CreateProcess failed'. It also pins CC/CXX=clang-cl, which is how meson picks clang-cl over cl.exe (matching the DXVK build dir, verified: compiler id clang-cl 17.0.6, linker lld-link, b_vscrt=md). Empty `args` is the normal case: it configures the build dir with the canonical setup if unconfigured, then compiles. The artifact set to link is libs/d3d12core/libhelios_d3d12_static.a plus libs/vkd3d/libvkd3d-proton.a, libs/vkd3d-common/libvkd3d_common.a, libs/vkd3d-shader/libvkd3d-shader.a, subprojects/dxil-spirv/libdxil-spirv.a, subprojects/dxil-spirv/libdxbc_spv_module.a and subprojects/dxil-spirv/subprojects/dxbc-spirv/libdxbc_spv.a. ⚠ helios_d3d12_static deliberately excludes libs/d3d12core/main.c, the only object in the engine that references CreateDXGIFactory1 — so the static arm has NO dxgi.dll import, which the retired DLL arm did have. Toolchain deps are all present on win11: widl from the WinLibs UCRT mingw64 bin, glslangValidator from the Vulkan SDK, meson/ninja from Python 3.12. Prerequisite: the nested submodules must be initialised (git submodule update --init --recursive inside the submodule) or meson will not configure."
+    )]
+    async fn win_vkd3d(&self, Parameters(a): Parameters<WinVkd3dArgs>) -> String {
+        // Same mirror-then-build flow as win_dxvk. /XD+/XF .git skip all git
+        // metadata (the submodule .git dirs AND the .git pointer files), so the
+        // local checkout's git state is never touched, and the meson BUILD dir is
+        // outside the source tree so the mirror stays clean.
+        let sync = if a.no_sync {
+            "\"win_vkd3d: no_sync — skipping source mirror\"".to_string()
+        } else {
+            format!(
+                "robocopy {VKD3D_SRC} {VKD3D_MIRROR} /MIR /XJ /XD .git /XF .git /NFL /NDL /NJH /NJS /NP /R:1 /W:1\n\
+                 $rc = $LASTEXITCODE\n\
+                 if ($rc -ge 8) {{ \"win_vkd3d: robocopy vkd3d source mirror failed (exit $rc)\"; exit $rc }}"
+            )
+        };
+        // The canonical configure. `--buildtype release` + `-Db_vscrt=md` match
+        // DXVK exactly, which is what keeps the two engines' CRT and C++ ABI
+        // compatible with the Rust msvc target that links them both.
+        // enable_tests stays OFF: the conformance suite is built by the mingw
+        // cross arm on the Linux host (D12-G0/G2), not here.
+        //
+        // ⛔ `_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH` is REQUIRED, not optional.
+        // MSVC 14.44's <yvals_core.h> hard-asserts "expected Clang 19.0.0 or
+        // newer" and the installed clang-cl is 17.0.6, so without it the
+        // dxbc-spirv objects fail to compile at all (verified: 143-target build
+        // goes from `ninja: build stopped` to clean). This is the same define
+        // `umd/build.rs` already applies to the DXVK bridge shim, with the same
+        // caveat recorded there: it is a runtime-risk acknowledgement, not a fix
+        // — the ABI still rests on the objects agreeing, which nothing here can
+        // prove. Removing it hard-fails the only working build.
+        let stl = "-D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH";
+        let setup = format!(
+            "meson setup {VKD3D_BUILD} {VKD3D_MIRROR} --buildtype release -Db_vscrt=md \
+             -Denable_tests=false \"-Dcpp_args={stl}\" \"-Dc_args={stl}\""
+        );
+        let meson_cmd = if !a.args.is_empty() {
+            format!("meson {}", a.args.join(" "))
+        } else if a.wipe {
+            format!("{setup} --wipe && meson compile -C {VKD3D_BUILD}")
+        } else {
+            // Configure only when not configured yet, so the common call is a
+            // plain incremental compile.
+            format!(
+                "(if not exist \"{VKD3D_BUILD}\\build.ninja\" ({setup}) ) && meson compile -C {VKD3D_BUILD}"
+            )
+        };
+        // ⛔ LLVM before vcvars64 — see win_dxvk. CC/CXX pin clang-cl; without
+        // them meson picks cl.exe from vcvars and the archives come out with a
+        // different C++ ABI from DXVK's.
+        let command = format!(
+            "{sync}\n\
+             cmd /c 'set \"PATH={LLVM_BIN};%PATH%\" && set \"CC=clang-cl\" && set \"CXX=clang-cl\" && call \"{VCVARS}\" && {meson_cmd}'"
+        );
+        match run_ssh(
+            &command,
+            None,
+            &HashMap::new(),
+            a.timeout_secs.unwrap_or(3600),
+        )
+        .await
+        {
             Ok(o) => format_output(&o),
             Err(e) => format!("error launching ssh: {e}"),
         }
