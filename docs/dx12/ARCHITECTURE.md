@@ -73,6 +73,29 @@ Three new artifacts, in dependency order: `umd_common/` (rlib, shared by both UM
 
 Named function by named function. Left column is the D3D11 site to model each step on.
 
+⛔ **MEASURED CORRECTION, 2026-08-06 (S5, `tmp/dx12/gates/G6/RESULT.md`): steps 7 and 8 are in the
+wrong order below. `pfnGetCaps` is called FIRST, before `pfnGetSupportedVersions`.** Observed on the
+Helios adapter with `UmdD3D12=1`, in this order:
+
+```
+OpenAdapter12  ->  GetCaps(1074)  ->  GetCaps(1007)
+               ->  GetSupportedVersions(puEntries=0, buf=NULL)
+               ->  GetSupportedVersions(puEntries=1, buf!=NULL)
+               ->  CloseAdapter
+```
+
+`1074` is `D3D12DDICAPS_TYPE_0081_3DPIPELINESUPPORT1` and `1007` is the legacy
+`D3D12DDICAPS_TYPE_3DPIPELINESUPPORT` — the 0081 form first, the older form as the fallback. Both
+arrive with `pInfo = NULL`, `DataSize` 8 and 4.
+
+⚠ **The consequence is L1's, and it is not cosmetic: the caps answer cannot depend on a negotiated
+interface version, because at `pfnGetCaps` time there is not one.** A `caps12.rs` that branches on
+the negotiated revision would be reading a value the runtime has not supplied yet. It is also why S5
+— which refuses every caps type — never reaches `pfnFillDDITable`, `pfnCalcPrivateDeviceSize` or
+`pfnCreateDevice` at all: refusing `1074` aborts device creation two steps in.
+
+The rest of the table's order is unchallenged; only the 7/8 pair moved.
+
 | # | D3D12 step | Header / signature | Model it on |
 |---|---|---|---|
 | 0 | loader resolves `OpenAdapter12` by name from the DLL in `UserModeDriverName[3]` | `PFND3D12DDI_OPENADAPTER` (`d3d12umddi.h:2694`) | `umd/src/adapter.rs:177` (already exported and refusing) |
@@ -1851,16 +1874,26 @@ One rule per trap, each with its citation. All re-verified this session.
 
 ## 13. UNVERIFIED, with the experiment that settles each
 
-**UNVERIFIED-1 — that `UserModeDriverName` index 3 is served *independently*.** The enum
-(`d3dkmthk.h:1830-1839`), Microsoft's "second entry / third entry" doc statements, and the fact that
-`OpenAdapter12` is called all point one way, but **all four entries are identical on every adapter on
-this box**, so the kernel has never been observed returning a *different* string for index 3.
-*Settle:* temporarily set `UserModeDriverName` to four distinct strings (`a.dll,b.dll,c.dll,d.dll`)
-and re-run the read-only `D3DKMTQueryAdapterInfo(Type=1)` probe from R11 §1.3; expect
-`v=0→a.dll … v=3→d.dll`. ⚠ This is a registry write, needs owner consent, and breaks D3D until
-restored. Cheaper alternative, no write: at S5, deploy a `helios_umd12.dll` whose `OpenAdapter12`
-only calls `log_self_module_path()` (`umd/src/log.rs:187`) and returns `DXGI_ERROR_UNSUPPORTED`, then
-check that `umd12-<pid>.log` appears for a D3D12 client.
+**UNVERIFIED-1 — ✅ CLOSED 2026-08-06 by S5. `UserModeDriverName` index 3 IS served
+independently.** Was: the enum (`d3dkmthk.h:1830-1839`), Microsoft's "second entry / third entry"
+doc statements and the fact that `OpenAdapter12` is called all pointed one way, but **all four
+entries were identical on every adapter on this box**, so the kernel had never been observed
+returning a *different* string for index 3.
+
+**Settled by the cheap alternative this item proposed** — no registry experiment with four dummy
+strings was needed. S5 deployed a real `helios_umd12.dll` at slot 3 and a D3D12 client produced
+(`tmp/dx12/gates/G6/RESULT.md`):
+
+```
+[pid=8536] UMD module: C:\ProgramData\HeliosUmd\helios_umd12_12fd0bbed9154609.dll
+[pid=8536] UMD knob: UmdD3D12=0
+[pid=8536] D3D12 DDI refusals: OpenAdapter12=1 …
+```
+
+The D3D12 client loaded the **slot-3** DLL by its content-addressed name while slots 0-2 still named
+`helios_umd_bd662064b3b75088.dll`, it logged to **its own** `umd12-<pid>.log`, and the refusal
+counter proves the `DXGI_ERROR_UNSUPPORTED` the app saw came from **our** `OpenAdapter12` rather
+than from DXGI's generic "this adapter has no D3D12".
 
 **UNVERIFIED-2 — ✅ CLOSED 2026-08-06 by running S3. It does not hurt.** Was: the size and build
 cost of the `d3d12umddi.h` bindgen generation, against a d3d10umddi generation of 43k Rust lines /

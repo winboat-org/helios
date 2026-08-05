@@ -195,8 +195,16 @@ Three things worth pinning:
   shape difference from D3D11 and a classic place to leave a NULL.
 - `pfnGetSupportedVersions` is a two-call query: the `_Inout_ UINT32* puEntries` +
   `_Out_writes_opt_` annotation pair is the standard count-then-fill idiom. The header states no
-  prose. **UNVERIFIED** that the runtime actually makes the first call with
-  `pSupportedDDIInterfaceVersions == NULL`; settled by the §15 spy.
+  prose. ✅ **CONFIRMED 2026-08-06 on Helios itself, not by the §15 spy** (S5,
+  `tmp/dx12/gates/G6/RESULT.md`): the runtime calls it **twice**, first with
+  `*puEntries = 0` and `pSupportedDDIInterfaceVersions == NULL`, then with `*puEntries = 1` and a
+  real buffer — i.e. it takes the count the first call writes and sizes the second to it. A driver
+  that ignores the null-buffer form and writes through it faults the runtime on the first call.
+- ⛔ **`pfnGetCaps` runs BEFORE `pfnGetSupportedVersions`**, which is the opposite of
+  `ARCHITECTURE.md` §1.2's step order and is now corrected there. Measured sequence:
+  `GetCaps(1074)`, `GetCaps(1007)`, then the two version calls. ⇒ **the caps answer cannot depend on
+  a negotiated version** (§11 is written on that assumption and is unaffected; anything that starts
+  branching on the revision would not be).
 
 ### 1.4 `D3D12DDIARG_CREATEDEVICE_0109`
 
