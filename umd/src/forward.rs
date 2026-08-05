@@ -116,50 +116,11 @@ pub(super) type Hdevice = ddi::D3D10DDI_HDEVICE;
 /// `< 2048` and a `% 1024` shape). Giving each site its own counter would change
 /// the cadence of every one of them, which is precisely what must not happen.
 /// So the counter is shared exactly as today and the budget is a call argument.
-pub(super) struct LogThrottle {
-    count: AtomicUsize,
-}
-
-impl LogThrottle {
-    pub(super) const fn new() -> Self {
-        Self {
-            count: AtomicUsize::new(0),
-        }
-    }
-
-    /// Bump and return the occurrence ordinal with no rate decision, for sites
-    /// whose gate carries an extra escape clause (`|| alloc != 0`) or a shape
-    /// of its own.
-    pub(super) fn next(&self) -> usize {
-        self.count.fetch_add(1, Ordering::Relaxed)
-    }
-
-    /// Read the ordinal WITHOUT bumping it — one site logs a "pre" line under
-    /// the same budget as the "post" line that follows it.
-    pub(super) fn peek(&self) -> usize {
-        self.count.load(Ordering::Relaxed)
-    }
-
-    /// The first `first` occurrences.
-    pub(super) fn first_n(&self, first: usize) -> Option<usize> {
-        let n = self.next();
-        (n < first).then_some(n)
-    }
-
-    /// The first `first`, then every `every`-th counting from zero.
-    pub(super) fn first_n_then_every(&self, first: usize, every: usize) -> Option<usize> {
-        let n = self.next();
-        (n < first || n % every == 0).then_some(n)
-    }
-
-    /// The first `first`, then every `every`-th counting from one. Distinct
-    /// from [`Self::first_n_then_every`]: it fires at n = every-1, 2*every-1,
-    /// not at n = 0, every, 2*every.
-    pub(super) fn first_n_then_every_from_one(&self, first: usize, every: usize) -> Option<usize> {
-        let n = self.next();
-        (n < first || (n + 1) % every == 0).then_some(n)
-    }
-}
+// `LogThrottle` moved to `helios_umd_common::throttle` (`DECISIONS.md` D3b,
+// stage S1) — the budget stays a call argument, exactly as described above.
+// Re-exported here so all 44 call sites in this module and its submodules
+// resolve unchanged.
+pub(super) use helios_umd_common::throttle::LogThrottle;
 
 pub(super) static RESOURCE_LOG_COUNT: LogThrottle = LogThrottle::new();
 pub(super) static CREATE_RESOURCE_IDENTITY_LOG_COUNT: LogThrottle = LogThrottle::new();

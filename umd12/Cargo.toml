@@ -1,0 +1,52 @@
+[package]
+name = "helios_umd12"
+version = "0.1.0"
+edition = "2021"
+description = "Helios vGPU WDDM D3D12 user-mode display driver (skeleton; OpenAdapter12 refuses)."
+
+[lib]
+# The second cdylib. `DECISIONS.md` D3: `helios_umd.dll` keeps
+# `UserModeDriverName` slots 0-2, `helios_umd12.dll` takes slot 3.
+#
+# Why two DLLs and not one: `helios_umd.dll` is loaded AND UNLOADED once per
+# D3D11 device create inside dwm (measured). Linking vkd3d + dxil-spirv into the
+# compositor's driver would make DWM pay, on every device create, for a feature
+# it never uses. Two DLLs also give the only acceptable rollback -- slot 3 is a
+# single registry rewrite away from disabling D3D12 with D3D11 provably
+# untouched.
+crate-type = ["cdylib"]
+
+[dependencies]
+# ⛔ The D3b rule: anything that would also exist in `umd/` lives here, not in a
+# second copy. Nothing in this crate may be copy-pasted from `umd/`.
+helios_umd_common = { path = "../umd_common" }
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_System_Diagnostics_Debug",
+] }
+
+# ⛔ NO cxx / cxx-build and NO build.rs yet, deliberately.
+#
+# `ARCHITECTURE.md` §11 stages this crate: S3 adds `build.rs` + bindgen of
+# `d3d12umddi.h` + `ddi12.rs`; S4 adds the vkd3d bridge. This commit is the
+# crate skeleton only -- it exists so the two-cdylib build, mirror, and install
+# path can be proven end to end before any DDI code is written.
+#
+# ⛔ And the standing rule that shapes all of it (`DECISIONS.md` §7.1):
+# `OpenAdapter12` must stop refusing IN THE SAME COMMIT that makes its body
+# reachable -- or the body must not be written yet. R908 deleted ~230 lines of
+# unreachable D3D12 scaffolding hidden behind `#[allow(unreachable_code)]`;
+# that is the standing record of what this costs.
+
+[profile.dev]
+panic = "abort"
+opt-level = 1
+
+[profile.release]
+panic = "abort"
+lto = "thin"
+opt-level = 2
+# Full debug info, matching `umd`: the minidump symbolization workflow
+# (dump_syms + minidump-stackwalk) requires a GUID-matched PDB for the deployed
+# DLL.
+debug = "full"

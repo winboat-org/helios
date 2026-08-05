@@ -17,13 +17,14 @@
 //! asserted against verbatim copies of the eight pre-change predicates over
 //! every format number 0..=200.
 
-// `format.rs` is `pub(crate)` throughout, which is `pub` to this single-file
-// crate; the readers are exercised only by its own `#[cfg(test)] mod tests`.
+// `format.rs` is `pub` throughout (it lives in `umd_common` and is consumed by
+// two cdylibs); the readers are exercised only by its own `#[cfg(test)] mod
+// tests`, so everything else is dead to this single-file crate.
 #![allow(dead_code)]
 
 // `#[path]` rather than `include!`: the file is a real module, so its own `//!`
 // documentation stays where an inner doc comment is legal.
-#[path = "../umd/src/format.rs"]
+#[path = "../umd_common/src/format.rs"]
 mod format;
 
 fn main() {

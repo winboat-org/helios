@@ -33,14 +33,18 @@ mod bridge;
 pub(crate) mod caps;
 mod ddi;
 mod device_funcs;
-mod format;
 mod forward;
-mod hr;
 mod knobs;
 
 mod log;
 mod scanout_acquire;
 mod vehicle_exports;
+
+// `format` and `hr` moved to the shared `umd_common` crate (`DECISIONS.md` D3b,
+// stage S1). Re-exported at the crate root under their original names so every
+// `crate::format::…` / `crate::hr::…` path in this crate resolves unchanged —
+// the move is a relocation, not a rename, and no call site was touched.
+pub(crate) use helios_umd_common::{format, hr};
 
 /// The DLL entry point, present for exactly one reason: to release this
 /// module's process-lifetime handles when it is unloaded.

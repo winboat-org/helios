@@ -28,7 +28,7 @@
 
 /// Every classification of one DXGI format, in one row.
 #[derive(Clone, Copy)]
-pub(crate) struct FormatInfo {
+pub struct FormatInfo {
     /// Bytes per pixel for WDDM surface-pitch arithmetic. 4 is the default for
     /// everything not explicitly sized, including the 16-bpp B5G6R5 /
     /// B5G5R5A1 / B4G4R4A4 formats and every block-compressed format:
@@ -218,35 +218,35 @@ fn info(format: u32) -> FormatInfo {
 }
 
 /// Bytes per pixel of a `DXGI_FORMAT`, for computing the WDDM surface pitch.
-pub(crate) fn bytes_per_pixel(format: u32) -> u32 {
+pub fn bytes_per_pixel(format: u32) -> u32 {
     info(format).bytes_per_pixel as u32
 }
 
 /// Bits per sample for D3D11 output/MSAA validation.
-pub(crate) fn bits_per_sample(format: u32) -> Option<u32> {
+pub fn bits_per_sample(format: u32) -> Option<u32> {
     info(format).bits_per_sample.map(u32::from)
 }
 
 /// Bits per sample of the format's output family.
-pub(crate) fn output_family_bits(format: u32) -> Option<u32> {
+pub fn output_family_bits(format: u32) -> Option<u32> {
     info(format).output_family_bits.map(u32::from)
 }
 
 /// Whether the format must be excluded from the MSAA answer regardless of its
 /// support bits.
-pub(crate) fn msaa_ineligible(format: u32) -> bool {
+pub fn msaa_ineligible(format: u32) -> bool {
     info(format).msaa_ineligible
 }
 
-pub(crate) fn resolve_required(format: u32) -> bool {
+pub fn resolve_required(format: u32) -> bool {
     info(format).resolve_required
 }
 
-pub(crate) fn color_typeless_parent(format: u32) -> bool {
+pub fn color_typeless_parent(format: u32) -> bool {
     info(format).color_typeless_parent
 }
 
-pub(crate) fn integer_typed(format: u32) -> bool {
+pub fn integer_typed(format: u32) -> bool {
     info(format).integer_typed
 }
 
@@ -257,15 +257,15 @@ pub(crate) fn integer_typed(format: u32) -> bool {
 // two-way and lossy in both directions. It is a two-entry correspondence, not
 // a per-format classification, so it stays a match rather than a table column.
 
-pub(crate) const D3DDDIFMT_UNKNOWN: u32 = 0;
-pub(crate) const D3DDDIFMT_A8R8G8B8: u32 = 21;
-pub(crate) const D3DDDIFMT_A8B8G8R8: u32 = 32;
-pub(crate) const DXGI_FORMAT_R8G8B8A8_UNORM: u32 = 28;
-pub(crate) const DXGI_FORMAT_B8G8R8A8_UNORM: u32 = 87;
+pub const D3DDDIFMT_UNKNOWN: u32 = 0;
+pub const D3DDDIFMT_A8R8G8B8: u32 = 21;
+pub const D3DDDIFMT_A8B8G8R8: u32 = 32;
+pub const DXGI_FORMAT_R8G8B8A8_UNORM: u32 = 28;
+pub const DXGI_FORMAT_B8G8R8A8_UNORM: u32 = 87;
 
 /// DXGI -> legacy D3DDDIFORMAT. `D3DDDIFMT_UNKNOWN` for anything else; the
 /// caller is expected to say so out loud rather than stamp a silent 0.
-pub(crate) fn to_d3dddi(format: u32) -> u32 {
+pub fn to_d3dddi(format: u32) -> u32 {
     match format {
         DXGI_FORMAT_R8G8B8A8_UNORM => D3DDDIFMT_A8B8G8R8,
         DXGI_FORMAT_B8G8R8A8_UNORM => D3DDDIFMT_A8R8G8B8,
@@ -276,7 +276,7 @@ pub(crate) fn to_d3dddi(format: u32) -> u32 {
 /// Legacy D3DDDIFORMAT -> DXGI, as a bare number. Unlike [`to_d3dddi`] this
 /// has a total default (BGRA), which is the pre-existing contract: the two
 /// legacy values are the only ones any Helios allocation carries.
-pub(crate) fn from_d3dddi(format: u32) -> u32 {
+pub fn from_d3dddi(format: u32) -> u32 {
     match format {
         D3DDDIFMT_A8R8G8B8 => DXGI_FORMAT_B8G8R8A8_UNORM,
         D3DDDIFMT_A8B8G8R8 => DXGI_FORMAT_R8G8B8A8_UNORM,

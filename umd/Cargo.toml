@@ -10,6 +10,11 @@ crate-type = ["cdylib"]
 [dependencies]
 cxx = "1"
 helios_protocol = { path = "../protocol" }
+# Shared with `umd12` (`DECISIONS.md` D3b). A path `rlib`, not a workspace
+# member — a workspace root would change CARGO_TARGET_DIR semantics for
+# kmd_render. ⚠ `tools/umd-check.ps1` and win_cargo must mirror `umd_common`
+# into the local build mirror or this dependency does not resolve there.
+helios_umd_common = { path = "../umd_common" }
 # `Win32_Graphics_Direct3D_Fxc` is deliberately ABSENT (T6/R909): it pulls
 # `D3DCompile` -- an HLSL runtime compiler -- into a shipped display-driver DLL.
 # Its only user was the deleted in-process selftest. Re-adding it means shipping

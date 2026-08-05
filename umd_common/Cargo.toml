@@ -1,0 +1,32 @@
+[package]
+name = "helios_umd_common"
+version = "0.1.0"
+edition = "2021"
+description = "Code shared by the Helios D3D11 and D3D12 user-mode display drivers."
+
+[lib]
+# `rlib`, consumed as a PATH dependency by both cdylibs (`umd`, `umd12`).
+#
+# Deliberately NOT a cargo workspace member: a workspace root would change
+# `CARGO_TARGET_DIR` semantics for `kmd_render`, which carries its own
+# `Cargo.make.toml` and WDK metadata. Path deps already work — `helios_protocol`
+# is consumed exactly this way at `umd/Cargo.toml`. (`DECISIONS.md` D3b.)
+#
+# Each cdylib gets its own copy of the machine code at link time. That is
+# unavoidable and correct for two independently-deployable drivers; what this
+# crate buys is one copy of the SOURCE, one place to fix a bug, one to review.
+crate-type = ["rlib"]
+
+# ⛔ NO `[build-dependencies]` and NO build script, by design (`DECISIONS.md`
+# D3b). The bindgen'd DDI types stay in their owning crates because D3D11 and
+# D3D12 generate different headers, and a `build.rs` here would drag the WDK
+# into a crate that must also build on Linux.
+#
+# ⛔ NO unconditional `windows` dependency either. This crate MUST build on
+# Linux as well as Windows, because `tools/format-table-check.rs` `#[path]`-
+# includes `src/format.rs` and runs on the Linux host. When `slot`/`log`/`knobs`
+# move here they bring a Windows-only dependency with them; it goes under
+# `[target.'cfg(windows)'.dependencies]` and the modules get `#[cfg(windows)]`,
+# so the Linux build keeps working. Nothing moved so far needs it.
+
+[dependencies]

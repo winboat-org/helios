@@ -124,40 +124,10 @@ pub struct RuntimePagingQueue {
     pub fence_value_cpu: core::ptr::NonNull<u64>,
 }
 
-/// One runtime-owned buffer window: a pointer and the capacity that describes
-/// it, which are only ever meaningful together.
-///
-/// Pre-R808 these were six independent `Cell`s (`command_buffer` +
-/// `command_buffer_size`, `allocation_list` + `allocation_list_size`,
-/// `patch_list` + `patch_list_size`), so a pointer could be updated without its
-/// size. Pairing them makes that unrepresentable.
-pub struct Window<T> {
-    pub ptr: core::ptr::NonNull<T>,
-    pub capacity: u32,
-}
-
-// Hand-written rather than derived: `derive` would add a `T: Copy` bound, and
-// the pointee types here (c_void, the DDI list structs) are not Copy. A window
-// is a pointer and an integer; copying it never copies a `T`.
-impl<T> Clone for Window<T> {
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-impl<T> Copy for Window<T> {}
-
-impl<T> Window<T> {
-    /// `None` for a null pointer, which is how the runtime spells "no window".
-    /// A zero capacity is retained rather than rejected: `pfnRenderCb` returns
-    /// pointer/size pairs and only the pointer decides presence, exactly as the
-    /// pre-R808 `is_null()` checks did.
-    pub fn new(ptr: *mut T, capacity: u32) -> Option<Self> {
-        Some(Self {
-            ptr: core::ptr::NonNull::new(ptr)?,
-            capacity,
-        })
-    }
-}
+// `Window<T>` moved to `helios_umd_common::window` (`DECISIONS.md` D3b,
+// stage S1). Re-exported so `Window<c_void>` / `Window<ddi::…>` in this
+// module resolve unchanged.
+pub use helios_umd_common::window::Window;
 
 /// The kernel context every present path submits through, plus the three
 /// runtime-owned buffer windows that arrive with it.
