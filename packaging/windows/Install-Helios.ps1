@@ -159,14 +159,47 @@ Write-HeliosJson $state $statePath
 
 $certificate = [Security.Cryptography.X509Certificates.X509Certificate2]::new($certificatePath)
 $state.signingCertificateThumbprint = $certificate.Thumbprint
+
+function Test-HeliosCertificateStoreThumbprint(
+    [Parameter(Mandatory)][string]$StoreName,
+    [Parameter(Mandatory)][string]$Thumbprint
+) {
+    # The PowerShell Cert: provider can retain a stale view after a native
+    # certificate-store update. Open a new X509Store for every check so a
+    # certutil fallback is verified against the store itself.
+    $x509Store = [Security.Cryptography.X509Certificates.X509Store]::new(
+        $StoreName,
+        [Security.Cryptography.X509Certificates.StoreLocation]::LocalMachine
+    )
+    try {
+        $x509Store.Open([Security.Cryptography.X509Certificates.OpenFlags]::ReadOnly)
+        $matches = $x509Store.Certificates.Find(
+            [Security.Cryptography.X509Certificates.X509FindType]::FindByThumbprint,
+            $Thumbprint,
+            $false
+        )
+        return $matches.Count -gt 0
+    } finally {
+        $x509Store.Close()
+    }
+}
+
 foreach ($store in @("Root", "TrustedPublisher")) {
     try {
         Import-Certificate -FilePath $certificatePath -CertStoreLocation "Cert:\LocalMachine\$store" | Out-Null
     } catch {
-        # Some Windows builds report E_ACCESSDENIED after committing the
-        # certificate. Continue only when the exact thumbprint is now present.
-        if (-not (Test-Path -LiteralPath "Cert:\LocalMachine\$store\$($certificate.Thumbprint)")) { throw }
-        Write-Warning "Import-Certificate reported an error for $store, but the expected certificate is present."
+        # Some Windows builds report E_ACCESSDENIED after committing Root, but
+        # fail before committing TrustedPublisher. Fall back to certutil only
+        # when the exact thumbprint is absent.
+        if (Test-HeliosCertificateStoreThumbprint $store $certificate.Thumbprint) {
+            Write-Warning "Import-Certificate reported an error for $store, but the expected certificate is present."
+        } else {
+            Write-Warning "Import-Certificate failed for $store; retrying with certutil."
+            Invoke-HeliosNative "certutil.exe" @("-addstore", "-f", $store, $certificatePath)
+        }
+    }
+    if (-not (Test-HeliosCertificateStoreThumbprint $store $certificate.Thumbprint)) {
+        throw "The Helios signing certificate was not installed in LocalMachine\$store."
     }
 }
 Write-HeliosJson $state $statePath

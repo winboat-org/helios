@@ -83,6 +83,25 @@ time to stop shipping something nobody measured:**
   every other escape constant in that file was checked against
   `protocol/src/escape.rs` and is correct.
 
+## Dockur/WinBoat fresh installation — automatic path verified (2026-08-05)
+
+A new Dockur Windows 11 VM was installed from an empty 90 GB qcow2 using the
+WinBoat-pinned `ghcr.io/dockur/windows:6.03` image, then booted with bootstrap
+VGA plus the 4 GiB-limited Helios/Venus adapter. The clean guest bound Dockur's
+signed `viogpudo` as `oem14.inf` on the Helios PCI function. The first
+`Install-Helios.ps1 -Automatic` pass enabled test-signing and returned 3010;
+after reboot, the second pass removed `viogpudo` without prompting and selected
+Helios on the same device instance.
+
+The fresh guest exposed one additional packaging fault: `Import-Certificate`
+committed the CI certificate to `Root` but returned E_ACCESSDENIED before
+committing `TrustedPublisher`. Native `certutil -addstore` succeeded. The
+installer now falls back to that native path when the exact thumbprint is
+absent, and verifies through a newly opened `X509Store`; the PowerShell `Cert:`
+provider was proven to retain a stale same-process view after the native add.
+The repaired automatic pass completed, rebooted, and passed Vulkan, D3D11,
+OpenGL 4.6/Zink, and OpenCL smoke tests on the RX 6600.
+
 ## RDP desktop lag — root-caused and CLOSED (2026-08-05)
 
 **Symptom (owner):** over RDP, anything that *changes* the desktop is slow —
