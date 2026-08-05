@@ -125,6 +125,26 @@ $state = [ordered]@{
 }
 
 New-Item -ItemType Directory -Force -Path $runtimeRoot,$stateRoot | Out-Null
+
+# The cross-process present-order table is opened read/write by ordinary D3D
+# producers, DWM (Window Manager\DWM-N), and RDPIDD (WUDFHost as LOCAL
+# SERVICE). A table first created by DWM inherits an ACL that gives LOCAL
+# SERVICE read-only access, so RDP silently copies unfinished frames without
+# the producer-fence wait. Pre-create/repair this one coordination file before
+# any new driver process starts; the UMD applies the same ACL when it creates
+# the file independently of this installer.
+$presentSyncPath = Join-Path $stateRoot "helios_present_sync_v2.bin"
+if (-not (Test-Path -LiteralPath $presentSyncPath -PathType Leaf)) {
+    New-Item -ItemType File -Path $presentSyncPath -Force | Out-Null
+}
+Invoke-HeliosNative "icacls.exe" @(
+    $presentSyncPath,
+    "/grant",
+    "*S-1-5-11:(M)",  # Authenticated Users
+    "*S-1-5-19:(M)",  # LOCAL SERVICE / RDPIDD
+    "*S-1-5-90-0:(M)" # Window Manager group / DWM
+)
+
 Copy-Item -Path (Join-Path $payloadRoot "mesa") -Destination $runtimeRoot -Recurse -Force
 Copy-Item -Path (Join-Path $payloadRoot "opencl") -Destination $runtimeRoot -Recurse -Force
 Copy-Item -Path (Join-Path $payloadRoot "loaders") -Destination $runtimeRoot -Recurse -Force
