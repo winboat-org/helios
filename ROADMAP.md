@@ -356,6 +356,22 @@ tearing investigation.
   defect 0z in the pre-existing `vn_ring_load_head` teardown path (also present
   in the pre-branch ICD); DWM recovered each time. This branch does not claim to
   fix that separate adapter-removal race.
+- **Re-gated after the merge, on the version that actually ships (2026-08-05).**
+  The bullets above say `.254`; `kmd_render/driver-version.env` says
+  **22.22.255.0** (the branch bumped 252 -> 255 directly), so read `.254` as the
+  development build and `.255` as the shipped one. The merge also joined this
+  branch to the ICD `HOST_CACHED` mapping fix, two changes that had never seen
+  each other — the submodule conflict resolved to `e7ad5b238ec`, which strictly
+  contains the branch's own `c3262452217`. Re-gated on the merged image:
+  `d3d11_xproc_lifetime_probe` **PASS** (both-open and creator-exited each
+  retained exactly `+64.00 MiB` adapter and process, pixel `ffff00ff` survived
+  the creator's exit, exact return to baseline); `vidmm_tracking_probe` **PASS**
+  in all four modes — local, `nonlocal`, `shared` (each exactly `+256.00 MiB`
+  for 4x64 MiB) and the new `crossproc` (`+64.00 MiB` retained past creator
+  exit). PnP `OK`/`CM_PROB_NONE`, desktop composites (screenshot), no
+  display/Dxgkrnl/WHEA/BugCheck critical or error events since boot,
+  `WdSigF`/`DmaNtfF`/`TxGone`/`RclBadH` all **0**, and `umd-gate-surface.ps1`
+  reports `UMD GATE SURFACE CLEAN` with its must-not-appear set `all clear`.
 - The Task Manager-triggered DWM abort was a mixed-source Mesa deployment: the
   installed ICD combined the old `vn_queue.c` with only four files from the
   newer VidMm work. Deploying one coherent Mesa `1a02ba9` image restored the
