@@ -311,7 +311,8 @@ reviewer adds nothing a `grep` does not, and an agent's attention is better spen
 | no `#[allow(...)]` on a hand-written line | generated code may be allowed, hand-written code may not — R908 |
 | `grep -rnE '^[[:space:]]*static_assert\(' umd/bridge umd12/bridge umd_common/bridge` → **1** | `ead692e`. ⚠ the **anchor** is what works — both the bare word and the trailing-paren form count the comments that quote them, and reported 3. ⛔ never `git grep`: it skips untracked files, so a new `umd12/bridge/` reads 0 |
 | `tools/umd12-host-check.sh --clippy -- -D warnings` | 214 hand-written handlers is where `missing_safety_doc` earns its keep. ⚠ **Through the script, not a bare `cargo clippy`** — the bare form dies in `link-cplusplus`'s build script with an error naming `lib.exe` and nothing about clippy (§7), so a lane reads it as a broken tree and drops the row. It caught a real one the moment it was wired up: `umd12`'s `OpenAdapter12` had no `# Safety` section |
-| `git diff` on the four shared files is append-only | §5 |
+| `tools/umd12-log-ascii-check.sh` | ⭐ **the reader, not the writer.** The UMD writes UTF-8 correctly, but every gate script and every triage step reads `umd12-<pid>.log` with `Get-Content`, and PowerShell 5.1 defaults to the ANSI code page — so an em dash in a format string renders as `<?"` in the one reader anyone uses. Found by the S6-0 fill-table run, with the bytes checked both ways before blaming the writer. Comments are exempt and must stay so: the ⭐/⛔/⚠ markers are load-bearing |
+| `git diff` on the shared files is append-only, and empty for `tables12.rs` | §5 |
 
 Agents take the residue — the judgement calls a grep flags but cannot settle (*is this `.unwrap()`
 on runtime data or on a compile-time constant?*).
