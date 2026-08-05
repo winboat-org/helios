@@ -33,7 +33,83 @@ use helios_umd_common::hr::{Hresult, E_FAIL, E_INVALIDARG, S_OK};
 use windows::core::Interface;
 
 use crate::bridge12::{self, BridgeDevice12};
-use crate::{init_once, note_refusal, UMD12_REFUSALS};
+use crate::{ddi12, forward12, init_once, note_refusal, UMD12_REFUSALS};
+
+// The one cast in this file, made checkable instead of trusted.
+const _: () = assert!(core::mem::size_of::<usize>() == core::mem::size_of::<ddi12::SIZE_T>());
+
+/// Drive `pfnFillDDITable` directly, without a device.
+///
+/// ⭐ **This export exists because S6-0's fill is otherwise unreachable, and
+/// landing the stage's highest-consequence line with no execution evidence is
+/// not acceptable.** `PARALLEL.md` §3 calls the `SIZE_T` handling *"the single
+/// highest-consequence line in S6-0"* (`ARCHITECTURE.md` §12 rule 16 / R702:
+/// 24H2 passed 576 bytes for a 592-byte `DRIVERCAPS`) — and the runtime cannot
+/// reach it yet, because `pfnGetCaps` refuses until L1 lands and device creation
+/// is abandoned two calls in. Measured at S5, not assumed
+/// (`tmp/dx12/gates/G6/RESULT.md`).
+///
+/// So the fill is driven by a probe instead: `tools/d3d12_fill_table_probe.cpp`
+/// poisons a buffer, calls this with a chosen byte count, and checks that every
+/// slot inside the count is non-NULL **and that not one byte past it moved.**
+/// That is a direct test of R702 in both directions, and it needs no adapter, no
+/// device and no caps answer.
+///
+/// ⚠ Same standing as the three `helios_umd12_probe_*_v1` exports above: outside
+/// the `helios_umd_*` family the venus ICD walks, resolved by nothing but the
+/// probe, and reachable — which is what `DECISIONS.md` §7.1 permits and R908
+/// forbids the opposite of. *Code nothing can run* is banned; *code only a probe
+/// runs* is evidence.
+///
+/// `table_type` is a raw `D3D12DDI_TABLE_TYPE` value (0 device-core,
+/// 1 command-list-3D, 2 command-queue-3D; anything else must be refused).
+///
+/// # Safety
+/// `table` must point at `table_size` writable, pointer-aligned bytes the caller
+/// owns. Every byte in that range may be overwritten.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn helios_umd12_probe_fill_ddi_table_v1(
+    table_type: i32,
+    table: *mut c_void,
+    table_size: usize,
+    index: u32,
+) -> Hresult {
+    init_once();
+    // SAFETY: forwarded unchanged under the caller's guarantee above.
+    // `D3D12DDI_HRTTABLE` is the runtime's opaque handle for the table instance;
+    // a null one is what a caller with no runtime has, and the fill only stashes
+    // it.
+    unsafe {
+        forward12::tables12::fill(
+            table_type,
+            table,
+            // `SIZE_T` is `ULONG_PTR` is `c_ulonglong`; `usize` is what a C++
+            // caller spells `size_t`. Identical on x86_64-msvc, which is the
+            // only target this crate builds for (`lib.rs`'s `compile_error!`),
+            // and asserted below rather than assumed.
+            table_size as ddi12::SIZE_T,
+            index,
+            crate::ddi12::D3D12DDI_HRTTABLE {
+                handle: core::ptr::null_mut(),
+            },
+        )
+    }
+}
+
+/// The three table sizes this build's `d3d12umddi.h` describes, so a probe can
+/// ask for them instead of hard-coding 992 / 600 / 56.
+///
+/// ⚠ Hard-coding them in the probe would make the probe agree with a *previous*
+/// SDK after a pin move, which is the one failure a size test must not have.
+/// Returns 0 for an unrecognised `table_type`.
+///
+/// # Safety
+/// None — it reads nothing. `unsafe` only because it is an `extern "C"` export
+/// the probe resolves by name, matching the family above.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn helios_umd12_probe_ddi_table_size_v1(table_type: i32) -> usize {
+    forward12::tables12::header_table_size(table_type)
+}
 
 /// Create a vkd3d device on the adapter with this LUID and hand back both
 /// halves of it.

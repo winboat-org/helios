@@ -26,7 +26,7 @@
 //! | `pfnGetOptionalDDITables` | **real** — `*puEntries = 0`, the measured-correct answer (`DDI_REFERENCE.md` §2.2) |
 //! | `pfnCloseAdapter` | **real** — validates the handle and dumps the refusal set |
 //! | `pfnGetCaps` | refuses, counted, and **logs every caps type it was asked** |
-//! | `pfnFillDDITable` | refuses, counted, and **logs `(type, size, index)`** — S6-0 |
+//! | `pfnFillDDITable` | **real** as of S6-0 — delegates to `forward12::tables12` |
 //! | `pfnCalcPrivateDeviceSize` | 0, counted — S6-0 |
 //! | `pfnCreateDevice` | refuses, counted — S6-0 |
 //! | `pfnDestroyDevice` | counted; no device can exist yet |
@@ -53,10 +53,12 @@
 //! respond to D3D12DDICAPS_TYPE_D3D12_OPTIONS caps query."*
 
 use core::ffi::c_void;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use helios_umd_common::hr::{Hresult, DXGI_ERROR_UNSUPPORTED, E_INVALIDARG, E_OUTOFMEMORY, S_OK};
 
 use crate::ddi12;
+use crate::forward12;
 use crate::knobs12;
 use crate::{init_once, log_error, log_refusal_summary, note_refusal, UMD12_REFUSALS};
 
@@ -212,7 +214,7 @@ fn adapter_ok(h: ddi12::D3D12DDI_HADAPTER) -> bool {
     let n = UMD12_REFUSALS.adapter_unrecognised.get();
     if n <= LOG_BUDGET {
         log_error!(
-            "adapter handle not ours: pDrvPrivate={:p} expected={:p} (x{n}) — counted only",
+            "adapter handle not ours: pDrvPrivate={:p} expected={:p} (x{n}) -- counted only",
             h.pDrvPrivate,
             expected,
         );
@@ -496,19 +498,23 @@ unsafe extern "C" fn get_optional_ddi_tables(
     S_OK
 }
 
-/// `pfnFillDDITable` — **refuses at S5**, and records the runtime's own sizes.
+/// `pfnFillDDITable` — the DDI slot; [`forward12::tables12`] owns the tables.
 ///
-/// S6-0 owns this: it is where all 214 slots get their counting noops, and it is
-/// where `hRTTable` must be stashed per index, because there is no other way to
-/// obtain the handle `pfnSetCommandListDDITableCb` later needs
-/// (`DDI_REFERENCE.md` §2.2).
+/// The split is deliberate and follows `ARCHITECTURE.md` §5: this file is the
+/// **adapter** surface, and `forward12` is the 206-slot DDI surface. Keeping the
+/// slot here and the fill there means the eleven-lane sequencer lives beside the
+/// lanes rather than inside the adapter.
 ///
-/// ⛔ **The `SIZE_T` is the contract.** `ARCHITECTURE.md` §12 rule 16 / R702:
-/// 24H2 passed 576 bytes for a 592-byte `DRIVERCAPS` and the D3D11 driver wrote
-/// past it. D3D12 parameterises the size explicitly and it *moves with the
-/// version* — 992/600/56 at `_0110`, 768/464/56 at `_0040` — so
-/// `size_of::<T>()` is never the count. The line below is what makes that
-/// checkable on this adapter instead of inherited from WARP's capture.
+/// ⛔ **The `SIZE_T` is the contract, and `tables12` is where it is honoured.**
+/// `ARCHITECTURE.md` §12 rule 16 / R702: 24H2 passed 576 bytes for a 592-byte
+/// `DRIVERCAPS` and the D3D11 driver wrote past it. D3D12 parameterises the size
+/// explicitly and it *moves with the version* — 992/600/56 at `_0110`,
+/// 768/464/56 at `_0040` — so `size_of::<T>()` is never the count. Both
+/// directions of disagreement are counted (`FillDDITableTruncated`,
+/// `FillDDITableOversized`).
+///
+/// The line below records the runtime's own numbers on *this* adapter, which is
+/// what `D12-G5` needed a WARP spy proxy to obtain.
 unsafe extern "C" fn fill_ddi_table(
     h_adapter: ddi12::D3D12DDI_HADAPTER,
     table_type: ddi12::D3D12DDI_TABLE_TYPE,
@@ -519,21 +525,31 @@ unsafe extern "C" fn fill_ddi_table(
 ) -> ddi12::HRESULT {
     let _ = adapter_ok(h_adapter);
 
-    UMD12_REFUSALS.fill_ddi_table_unimplemented.bump();
-    let n = UMD12_REFUSALS.fill_ddi_table_unimplemented.get();
+    FILL_DDI_TABLE_CALLS.fetch_add(1, Ordering::Relaxed);
+    let n = FILL_DDI_TABLE_CALLS.load(Ordering::Relaxed);
     if n <= LOG_BUDGET {
         log_error!(
             "FillDDITable: type={table_type} size={table_size} index={index} pTable={table:p} \
-             hRTTable={:p} (x{n}) -> DXGI_ERROR_UNSUPPORTED (S6-0 owns the tables)",
+             hRTTable={:p} (x{n})",
             h_rt_table.handle,
         );
     }
-    // ⛔ Not one byte is written to `table`. A partial fill would leave the rest
-    // of the runtime's table uninitialised, which is strictly worse than
-    // refusing: the runtime calls through an uninitialised slot instead of
-    // failing device creation.
-    DXGI_ERROR_UNSUPPORTED
+    // SAFETY: forwarded unchanged. `tables12::fill` re-states this function's
+    // own precondition — `table` points at `table_size` writable, pointer-aligned
+    // bytes the runtime owns — and validates the null/too-small cases itself
+    // rather than trusting them.
+    unsafe { forward12::tables12::fill(table_type, table, table_size, index, h_rt_table) }
 }
+
+/// How many times the runtime has asked this adapter to fill a table.
+///
+/// ⚠ **Not a refusal counter, and deliberately outside the refusal set**: a fill
+/// is the normal path now, not a skip. It exists to bound the evidence line
+/// above, and because "how many tables did this runtime ask for, of which types
+/// and at which sizes" is the one question `D12-G5` had to build a spy proxy to
+/// answer. The refusals that *can* happen inside a fill have their own named
+/// counters in `UMD12_REFUSALS`.
+static FILL_DDI_TABLE_CALLS: AtomicUsize = AtomicUsize::new(0);
 
 /// `pfnCalcPrivateDeviceSize` — **0 at S5**, paired with a refusing
 /// `pfnCreateDevice` in the same commit.
@@ -637,7 +653,7 @@ unsafe extern "C" fn create_device(
             // table. Here it cannot happen, because there is no arm that fills
             // anything for an unrecognised pair.
             log_error!(
-                "CreateDevice: UNADVERTISED Interface={:#010x} Version={:#010x} — refusing \
+                "CreateDevice: UNADVERTISED Interface={:#010x} Version={:#010x} -- refusing \
                  rather than assuming a table shape",
                 a.Interface,
                 a.Version,
@@ -664,7 +680,7 @@ unsafe extern "C" fn destroy_device(h_device: ddi12::D3D12DDI_HDEVICE) {
     let n = UMD12_REFUSALS.destroy_device_unexpected.get();
     if n <= LOG_BUDGET {
         log_error!(
-            "DestroyDevice: hDrvDevice={:p} (x{n}) — no device was ever created; counted only",
+            "DestroyDevice: hDrvDevice={:p} (x{n}) -- no device was ever created; counted only",
             h_device.pDrvPrivate,
         );
     }
@@ -682,5 +698,15 @@ unsafe extern "C" fn close_adapter(h_adapter: ddi12::D3D12DDI_HADAPTER) -> ddi12
     let _ = adapter_ok(h_adapter);
     log_error!("CloseAdapter");
     log_refusal_summary();
+    // ⭐ And the other instrument, for the same reason: the per-slot noop hit
+    // counts. `PARALLEL.md` §9.2 makes "its noop hit counters read zero for its
+    // slots under a real workload" a per-lane definition of done, and
+    // `CONFORMANCE.md`'s charter is to drive them to zero — neither is
+    // executable unless something prints them.
+    forward12::noop12::log_noop_hits();
+    // And the two runtime table handles the fill stashed — the one piece of the
+    // D3D12 contract that cannot be recovered after the fill returns
+    // (`DDI_REFERENCE.md` §2.2).
+    forward12::tables12::log_command_list_tables();
     S_OK
 }

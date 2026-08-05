@@ -82,7 +82,9 @@
 
 mod adapter12;
 mod bridge12;
+mod caps12;
 mod ddi12;
+mod forward12;
 mod knobs12;
 mod probe12;
 
@@ -188,10 +190,32 @@ pub(crate) struct Umd12Refusals {
     /// S5 from creating a device: the runtime abandons device creation at the
     /// caps gauntlet.
     pub(crate) get_caps_unimplemented: RefusalCounter,
-    /// `pfnFillDDITable` refused because S6-0 has not landed. Expected 0 at S5
-    /// **because the caps refusal comes first**; a non-zero reading means the
-    /// runtime pressed on past caps, which is worth knowing.
-    pub(crate) fill_ddi_table_unimplemented: RefusalCounter,
+    /// `pfnFillDDITable` with a null table pointer, or a byte count too small to
+    /// hold even one slot. Expected 0.
+    pub(crate) fill_ddi_table_bad_arg: RefusalCounter,
+    /// `pfnFillDDITable` for one of the 22 `D3D12DDI_TABLE_TYPE` values this
+    /// driver does not serve. Expected 0 — the runtime asks only for the three
+    /// it negotiated — and **nothing is written** on that path, which is the
+    /// property `DECISIONS.md` §7.4 actually demands.
+    pub(crate) fill_ddi_table_unknown_type: RefusalCounter,
+    /// The runtime's table was **smaller** than the struct this build's
+    /// `d3d12umddi.h` describes, so the fill was bounded to the runtime's count.
+    ///
+    /// ⚠ This is the R702 direction and the reason the byte count comes from the
+    /// argument: 24H2 passed 576 bytes for a 592-byte `DRIVERCAPS` and the D3D11
+    /// driver wrote past it. Expected 0 at `_0110` — 992/600/56 is what `D12-G5`
+    /// measured — so non-zero means the negotiated revision is not the one
+    /// `ddi12` was generated from.
+    pub(crate) fill_ddi_table_truncated: RefusalCounter,
+    /// The runtime's table was **larger** than this build's struct. The tail is
+    /// served by counted stubs rather than left NULL, but those slots can never
+    /// do anything: refresh the bindings.
+    pub(crate) fill_ddi_table_oversized: RefusalCounter,
+    /// `pfnFillDDITable` asked for a command-list table index beyond the two
+    /// `D12-G5` measured, so its `D3D12DDI_HRTTABLE` was not stashed. Expected 0.
+    /// ⚠ A hit here is not cosmetic: that handle is the only way to obtain what
+    /// `pfnSetCommandListDDITableCb` later needs, and it cannot be recovered.
+    pub(crate) command_list_table_index_unbounded: RefusalCounter,
     /// `pfnCalcPrivateDeviceSize` answered 0 because S6-0 owns `device12.rs`.
     /// Expected 0 at S5, for the same reason as the row above.
     pub(crate) calc_private_device_size_unimplemented: RefusalCounter,
@@ -223,7 +247,11 @@ pub(crate) static UMD12_REFUSALS: Umd12Refusals = Umd12Refusals {
     get_supported_versions_bad_arg: RefusalCounter::new("GetSupportedVersionsBadArg"),
     get_optional_ddi_tables_bad_arg: RefusalCounter::new("GetOptionalDDITablesBadArg"),
     get_caps_unimplemented: RefusalCounter::new("GetCapsUnimplemented"),
-    fill_ddi_table_unimplemented: RefusalCounter::new("FillDDITableUnimplemented"),
+    fill_ddi_table_bad_arg: RefusalCounter::new("FillDDITableBadArg"),
+    fill_ddi_table_unknown_type: RefusalCounter::new("FillDDITableUnknownType"),
+    fill_ddi_table_truncated: RefusalCounter::new("FillDDITableTruncated"),
+    fill_ddi_table_oversized: RefusalCounter::new("FillDDITableOversized"),
+    command_list_table_index_unbounded: RefusalCounter::new("CommandListTableIndexUnbounded"),
     calc_private_device_size_unimplemented: RefusalCounter::new("CalcPrivateDeviceSizeUnimplemented"),
     create_device_bad_arg: RefusalCounter::new("CreateDeviceBadArg"),
     create_device_unimplemented: RefusalCounter::new("CreateDeviceUnimplemented"),
@@ -234,7 +262,7 @@ pub(crate) static UMD12_REFUSALS: Umd12Refusals = Umd12Refusals {
 /// The set, in the order the summary prints them. ⛔ This order is the evidence
 /// contract: `D3D12 DDI refusals:` lines from different builds get diffed, so
 /// new counters are **appended**, never inserted.
-static UMD12_REFUSAL_SET: [&RefusalCounter; 16] = [
+static UMD12_REFUSAL_SET: [&RefusalCounter; 20] = [
     &UMD12_REFUSALS.open_adapter12,
     &UMD12_REFUSALS.probe12_bad_arg,
     &UMD12_REFUSALS.probe12_create_failed,
@@ -245,7 +273,11 @@ static UMD12_REFUSAL_SET: [&RefusalCounter; 16] = [
     &UMD12_REFUSALS.get_supported_versions_bad_arg,
     &UMD12_REFUSALS.get_optional_ddi_tables_bad_arg,
     &UMD12_REFUSALS.get_caps_unimplemented,
-    &UMD12_REFUSALS.fill_ddi_table_unimplemented,
+    &UMD12_REFUSALS.fill_ddi_table_bad_arg,
+    &UMD12_REFUSALS.fill_ddi_table_unknown_type,
+    &UMD12_REFUSALS.fill_ddi_table_truncated,
+    &UMD12_REFUSALS.fill_ddi_table_oversized,
+    &UMD12_REFUSALS.command_list_table_index_unbounded,
     &UMD12_REFUSALS.calc_private_device_size_unimplemented,
     &UMD12_REFUSALS.create_device_bad_arg,
     &UMD12_REFUSALS.create_device_unimplemented,
