@@ -177,6 +177,48 @@ D3D12 generate different headers.
 `log_knob_inventory()`'s output must come out byte-identical, which is its own validation
 instrument. Extracting after a second caller exists is a merge.
 
+**Decision D3c — ⚠ the two-DLL split has a cost D3 did not price: cross-DDI resource interchange is a
+*stated Microsoft requirement*, and Helios' two DLLs hold two different engines.** *(Raised
+2026-08-05 from `ResourceHeaps.md`, DirectX-Specs @ `2bd58ca5`. This is **not** a decision to reverse
+D3 — it is the constraint D3 must be implemented against.)*
+
+`ResourceHeaps.md:1254-1256`, verbatim:
+
+> Shared resources created in D3D11 must be able to be opened in D3D12. This behavior must be supported until all previous D3Ds can be hoisted on top of D3D12.
+>
+> Similar scenarios must be supported in reverse, as well. D3D12-created resources must be able to be opened by DWM, using D3D11 and the 11 DDI. Such resources will be created as both resource & heap with compatible D3D11 descriptions.
+
+and `:198`, on what that costs the driver:
+
+> The necessary requirements to support all these scenarios are also imposed on the driver. The driver must construct private data that is consumable by their D3D11 driver and will be interpreted as a shared tile pool.
+
+**Why this bites Helios specifically.** D3 puts D3D11 behind `helios_umd.dll` → **DXVK** and D3D12
+behind `helios_umd12.dll` → **vkd3d**. A resource created through one is not the same driver object as
+one created through the other, and the two engines have independent resource representations. The spec
+names **DWM opening D3D12-created resources through the 11 DDI** as the scenario — and DWM compositing
+the whole desktop on Helios is this project's stated goal, so a D3D12 application's swapchain back
+buffer walks straight into it at **P4**, the first-pixels gate.
+
+⚠ **State the limits of the evidence honestly.** These are requirements on *a* D3D12 driver. Whether
+the D3D12 runtime *enforces* them at device or resource creation, or whether they only bite when DWM
+actually opens a shared handle, is **not** established by these quotes — and this is a 2014-2015-era
+design document (`SPECS.md` §6 trap 1). ⛔ Nothing here is a reason to pre-emptively merge the two DLLs;
+D3's rollback and blast-radius arguments are unaffected.
+
+**What follows for the plan, concretely:**
+
+- `ResourceHeaps.md:187` narrows the surface usefully: *"Only committed resources and certain heaps can
+  be shared with earlier runtimes"*, and only `L1` heaps on discrete / `L0` on UMA, both with **no CPU
+  access**. So the exposure is committed resources and a narrow heap class, not everything.
+- The settling experiment is **not** an 11on12 test. `TranslationLayerResourceInterop.md` covers only
+  Microsoft's own 9on12/11on12 layers, where by construction there is exactly **one** driver-side
+  engine, and it never addresses two independently-authored UMDs on one adapter. The real test is:
+  create a shared texture through `helios_umd.dll`/DXVK (`D3D11 CreateSharedHandle`), open it through
+  `helios_umd12.dll`/vkd3d (`pfnOpenHeapAndResource`), and the reverse — recorded as a new question in
+  `GATES.md` §7.
+- It raises the priority of `pfnOpenHeapAndResource`, which `DDI_REFERENCE.md` §9.7 already records as
+  one of the runtime's nine hard NULL-checks, from "must be non-NULL" to "must actually work".
+
 **Decision D4 — the vkd3d engine is reached through a Helios-added export on vkd3d's own DLL, not
 by statically linking `libvkd3d` into the UMD.** The UMD `LoadLibrary`s a Helios-built
 `helios_vkd3d.dll` (vkd3d's `d3d12core` target, renamed, with two added exports) and calls

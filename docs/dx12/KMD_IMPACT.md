@@ -515,6 +515,24 @@ paging operations. Nothing extra reaches the miniport. `DXGK_CONTEXTINFO_CAPS.Dr
 (`d3dkmddi.h:1550-1563`) — the flag by which a driver takes residency over — is **not** set; Helios
 never writes `ContextInfo.Caps` at all (`device.rs:414-428`). That is the correct default.
 
+⚠ **And that default is now load-bearing, not merely convenient (2026-08-05).** `ResourceHeaps.md`
+(DirectX-Specs @ `2bd58ca5`) states that publishing **non-NULL** `pfnMakeResident` / `pfnEvict` takes
+on two coupled obligations: the driver must **stop creating its DXGK allocations resident at creation
+time**, and the KMD must set `DXGK_CONTEXTINFO_CAPS::DriverManagesResidency` on **every** context.
+
+⇒ **The UMD-side and KMD-side choices are one decision, not two.** A `helios_umd12` that publishes real
+residency entry points while `kmd_render` leaves `ContextInfo.Caps` zeroed would be an incoherent pair —
+and it is exactly the kind of split-brain the "advertise only what is backed" rule exists to prevent.
+⛔ So the residency plan is: keep `ContextInfo.Caps` unwritten in the KMD **and** keep the UMD's
+residency entry points as honest thin forwards that claim nothing (`S_OK` / no-op), together, in the
+same review. If residency is ever taken over, both halves move in one commit.
+
+⚠ **Evidence class:** this contradicts a repo *claim* (that residency is purely VidMm's job and the
+driver does nothing), not a measurement — `D12-G5`'s spy never exercised `MakeResident`/`Evict`, so
+there is no Helios measurement of residency at all. The conclusion "VidMm owns it" is unchanged; what
+changes is that the *reason* is now a choice Helios is making, with a stated cost if it is ever
+reversed.
+
 ⚠ The one trap is the `E_PENDING` + paging-fence protocol on `pfnMakeResident`
 (`D3D12DDIARG_MAKERESIDENT_0001.pPagingFenceValue` / `WaitMask`, `d3d12umddi.h:494-514`): it must
 not be faked. A thin honest forward, or `S_OK`, is fine; a fabricated fence value is not.

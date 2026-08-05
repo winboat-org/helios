@@ -761,6 +761,47 @@ is the cheapest way to move off this floor.
 
 ---
 
+## 4.5 ⭐ `VulkanOn12.md` — Microsoft's own D3D12↔Vulkan impedance list, read backwards
+
+*(2026-08-05. `VulkanOn12.md` is the highest-signal document in the DirectX-Specs corpus for this
+project: **11 of its 11 distinct `PFND3D12DDI_*` typedefs exist in SDK 26100** — the only spec in the
+corpus with a 100 % hit rate. It is Microsoft's account of what D3D12 had to **add** so that Vulkan
+semantics could be expressed on it. Helios runs that mapping in reverse, so every addition marks a seam
+where the two models do not line up — i.e. exactly where a forwarding UMD breaks.)*
+
+⛔ **The load-bearing consequence: thirteen of its behaviours are mandatory by DDI *version floor*
+alone.** They carry no cap, and the driver cannot decline them — negotiating `D3D12DDI_SUPPORTED_0110`
+signs Helios up for all of them. Only **five BOOL caps**, spread across four of the spec's seventeen
+features, are declinable (`RelaxedFormatCastingSupported`,
+`UnrestrictedBufferTextureCopyPitchSupported`, `UnrestrictedVertexElementAlignmentSupported`, and two
+others in `D3D12DDI_OPTIONS_DATA_0090`/`_0091`).
+
+⚠ **This sharpens the `_0040`-vs-`_0110` trade in `DDI_REFERENCE.md` §1.6, which had been framed purely
+as a slot count.** `_0110` is not just 214 slots instead of 169 — it is also a behavioural contract with
+no opt-out. The four that matter most for a vkd3d forwarder:
+
+| seam | what `_0110` obliges | why it bites a Vulkan-backed forwarder |
+|---|---|---|
+| **Triangle fans** | DDI 0097 revives `D3D12DDI_PRIMITIVE_TOPOLOGY_TRIANGLEFAN` (value 6) and makes it **mandatory** at 0097+ | Microsoft revived it *because* "software emulation for it is expensive" for a Vulkan-on-D3D12 layer. Helios is the same mapping in reverse and inherits the same expense — core Vulkan 1.3 has no triangle fan without `VK_KHR_portability_subset`/`VK_EXT_primitive_topology_list_restart` semantics |
+| **Mismatched RT/DS sizes** | at 0102+ the driver must accept render targets and depth buffers of **differing** width/height, and D3D withdraws its guarantee of an implicit scissor to `{0,0,width,height}` | Beyond the smallest output view the result is explicitly **undefined**, and the spec permits GPU hangs/faults as a legal outcome. ⛔ On this stack a "GPU fault" is not confined to the offending app — it takes the host virglrenderer context, and historically the guest desktop with it (`GATES.md` §7.26) |
+| **Dynamic-state PSO flags are HINTS** | the `D3D12DDI_PIPELINE_STATE_FLAG_DYNAMIC_*` flags do **not** relieve the driver of applying the PSO's own depth-bias and IB-strip-cut values on every `pfnSetPipelineState` | ⚠ This is a **precise inversion** of the Vulkan mental model a vkd3d-shaped forwarder brings: in Vulkan, declaring `VK_DYNAMIC_STATE_DEPTH_BIAS` means the pipeline's baked value is *ignored*. Here it is not |
+| **Non-normalized sampler coords** | mandatory at 0100+: sampling outside the valid range is undefined **in the device state left behind**, not merely in the value returned, unless AddressU/V are CLAMP or BORDER | `D3D12DDI_SAMPLER_FLAG_NON_NORMALIZED_COORDINATES = 0x02` is live in the header and can arrive on a dynamic sampler descriptor |
+
+⚠ **One ABI trap in the same family:** `DepthBias` silently changed from `INT` to `FLOAT` in the DDI
+rasterizer desc at 0099, and 0102 revs the struct again (`D3D12DDI_RASTERIZER_DESC_0102`) replacing
+`MultisampleEnable`/`AntialiasedLineEnable` with a single `LineRasterizationMode` enum. At 0110
+`pfnCreateRasterizerState` receives the 0102 shape, where a `FLOAT DepthBias` sits at the same offset an
+older `INT` did — a reinterpretation no compiler will flag.
+
+⚠ **A substrate ceiling this raises, not yet settled:** `MaxSamplerDescriptorHeapSize` must be reported
+**≥ 4000** at 0102+, and the host GPU's `maxSamplerAllocationCount` is **exactly 4000** — zero headroom
+if vkd3d allocates one `VkSampler` per descriptor. `GATES.md` §7.24 owns it.
+
+⚠ **What `VulkanOn12.md` does *not* cover, despite the title:** image layouts, barriers, resource
+state, fences, semaphores, and queue submission ordering are **entirely absent** — the word does not
+appear. Given that WS1 stability is a synchronisation question, that silence is worth knowing about
+rather than assuming coverage. Barrier/layout impedance is owned by `DDI_REFERENCE.md` §9.10.1 instead.
+
 ## 5. The gap, cheapest-first
 
 Nothing in the **required** band is missing. Every item below is optional to `D3D12CreateDevice`

@@ -470,6 +470,44 @@ synchronised against.
 > Whether the runtime ever calls `pfnFillDDITable` with type 3, and with what size, is unknown.
 > *Settling experiment:* the WARP spy proxy logs every `(TableType, TableSize)` pair.
 
+### 3.4a ⭐ What the D3D12 *primary* actually is at the DDI — and four rules that come with it
+
+*(2026-08-05, from `ResourceHeaps.md`, DirectX-Specs @ pin `2bd58ca5`. This document previously had
+nothing on how a D3D12 back buffer becomes a DXGK allocation; §3.5 picks up downstream of it.)*
+
+**1. `DXGI_DDI_PRIMARY_DESC` is gone; a heap *flag* declares the primary.** *"The existing
+`DXGI_DDI_PRIMARY_DESC` is no longer passed to the UMD during heap & resource creation. Instead, two
+primary flags are told to the user mode driver at two different points in time"* — a resource
+**optimization** flag (which influences the driver's swizzle choice) and a **heap** flag. Receiving the
+heap flag obliges the driver to create a resource **simultaneously with the heap**. ⭐ This is the
+mechanism behind the measured *"no DXGI table"* result: the same spec says outright that *"The following
+DXGI DDIs are not coming forward, and the entire table is deprecated."* — so `D12-G5` seeing
+`D3D12DDI_TABLE_TYPE_DXGI` never requested across 20 presents is the **design**, not an artefact of the
+workload.
+
+**2. A presentable resource must occupy exactly ONE DXGK allocation** — and the obligation is scoped:
+it binds only **committed** resources (heap and resource created together) that are `Texture2D`,
+single-mip, non-MSAA, in a flip-model present format, with array size ≤ 2. Other resources may span
+more. ⚠ Helios' scanout already assumes one allocation per presentable surface; this is the rule that
+makes that assumption correct rather than lucky.
+
+**3. `AllocateCB` must be called inside the create-heap-and-resource DDI, on the entering thread**, and
+the UMD must pass **`D3DDDI_ID_UNINITIALIZED`** as `VidPnSourceId` for allocations containing runtime
+primaries — the runtime overwrites that field for every `D3DDDI_ALLOCATIONINFO` with `Flags.Primary`
+set anyway. The driver is *encouraged* to keep a sentinel of its own in the private data to recognise
+D3D12 primaries later.
+
+**4. The back buffer must be in `D3D12_BARRIER_LAYOUT_COMMON` at present time.** `COMMON == _PRESENT ==
+0`, and the faster `D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_COMMON` is explicitly **not** a legal present
+layout. Under the enhanced-barrier arm (`DDI_REFERENCE.md` §9.10.1) that is a rule `helios_umd12` must
+not optimise away.
+
+⚠ **KMD-side, and advisory rather than mandatory:** the spec says the KMD *should* fill
+`DXGKARG_DESCRIBEALLOCATION::Rotation` with `D3DDDI_ROTATION_IDENTITY` for D3D12-created managed
+primaries, by analogy with the already-unused `RefreshRate`. **"Should", not "must"** — so it is a
+candidate `kmd_render` item, not a fifth entry on `DECISIONS.md` D5's list. It costs nothing to honour
+and is recorded here so it is not rediscovered at G8.
+
 ### 3.5 Swapchain-model consequences
 
 * ⛔ **D3D12 has no BLT-model swapchain.** Only `DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL` and
