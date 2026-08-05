@@ -20,6 +20,7 @@ Helios_CopyFiles = 13  ; driver store (DIRID 13) — required for a universal IN
 [SourceDisksFiles]
 helios_kmd_render.sys = 1,,
 helios_umd.dll = 1,,
+helios_umd12.dll = 1,,
 
 ; ──── Manufacturer / Models ────────────────────────────────────────────────
 
@@ -42,6 +43,7 @@ AddReg = Helios_DeviceSettings
 [Helios_CopyFiles]
 helios_kmd_render.sys
 helios_umd.dll
+helios_umd12.dll
 
 [Helios_Install.Services]
 AddService = helios_kmd_render, 0x00000002, Helios_ServiceInstall, Helios_EventLog
@@ -73,13 +75,32 @@ HKR, "Interrupt Management\MessageSignaledInterruptProperties", MSISupported, %R
 HKR, "Interrupt Management\MessageSignaledInterruptProperties", MessageNumberLimit, %REG_DWORD%, 1
 
 ; ──── Software key / UMD registration ──────────────────────────────────────
-; Gate 1 registers a real DLL name so Dxgkrnl/Direct3D see the package as a
-; normal third-party display miniport stack. The DLL entrypoints fail honestly
-; until the DXVK/VKD3D-backed UMD path is implemented.
+; TWO user-mode drivers, since stage S5 (docs/dx12/ARCHITECTURE.md 9.1
+; "Variant B", DECISIONS.md D3):
+;
+;   helios_umd.dll    - D3D9/D3D10/D3D11, the DXVK-backed driver DWM composites
+;                       on. Slots 0-2.
+;   helios_umd12.dll  - D3D12, the vkd3d-backed driver. Slot 3 only, and behind
+;                       the HKLM\SOFTWARE\Helios!UmdD3D12 kill switch, which is
+;                       absent by default so OpenAdapter12 refuses.
+;
+; UserModeDriverName is a REG_MULTI_SZ indexed by KMTUMDVERSION:
+; DX9=0, DX10=1, DX11=2, DX12=3.
+; FOUR entries, never six - D3DKMTQueryAdapterInfo(KMTQAITYPE_UMDRIVERNAME)
+; returns STATUS_INVALID_PARAMETER for versions 4/5 on this adapter, so
+; DX12_WSA32/DX12_WSA64 must not be written (DECISIONS.md D3).
+;
+; InstalledDisplayDrivers is NOT index-parallel to UserModeDriverName. It is a
+; flat list of the DISTINCT package binaries with the extension stripped - its
+; stated purpose is that WHQL test programs use it to check the driver binaries
+; are unchanged across a run - so TWO entries here is correct against FOUR
+; above (DECISIONS.md 6.1; tools/hotplug-helios-umd.ps1 writes the same shape
+; and its verifier asserts exactly it). The historical four-copies-of-one-name
+; value was harmless but semantically wrong.
 
 [Helios_DeviceSettings]
-HKR,, UserModeDriverName,       %REG_MULTI_SZ%, %13%\helios_umd.dll,%13%\helios_umd.dll,%13%\helios_umd.dll,%13%\helios_umd.dll
-HKR,, InstalledDisplayDrivers,  %REG_MULTI_SZ%, helios_umd,helios_umd,helios_umd,helios_umd
+HKR,, UserModeDriverName,       %REG_MULTI_SZ%, %13%\helios_umd.dll,%13%\helios_umd.dll,%13%\helios_umd.dll,%13%\helios_umd12.dll
+HKR,, InstalledDisplayDrivers,  %REG_MULTI_SZ%, helios_umd,helios_umd12
 
 ; ──── Vulkan ICD registration ──────────────────────────────────────────────
 ; A universal INF may only write device-relative (HKR) registry keys, not the

@@ -1,18 +1,22 @@
 //! Adapter open/close, DDI version negotiation, and device creation.
 //!
-//! The three `OpenAdapter*` exports the runtime resolves by name, the
+//! The two `OpenAdapter*` exports the runtime resolves by name, the
 //! interface-version handshake behind them, the adapter identity token, and
 //! `create_device` with the `DeviceUnderConstruction` unwind guard.
 //!
 //! Moved verbatim out of `lib.rs` by T8/R1106.
+//!
+//! ⚠ **Two, not three, since S5.** `OpenAdapter12` left this DLL entirely when
+//! `helios_umd12.dll` took `UserModeDriverName[3]` (`ARCHITECTURE.md` §6.2). It
+//! is the only export S5 removes from the D3D11 driver, and it is deliberately
+//! not replaced by a refusing stub — see the note above `AdapterToken`.
 
 use core::ffi::c_void;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::get_caps;
 use crate::hr::{
-    Hresult, DXGI_ERROR_UNSUPPORTED, DXGI_STATUS_NO_REDIRECTION, E_FAIL, E_NOTIMPL, E_OUTOFMEMORY,
-    S_OK,
+    Hresult, DXGI_STATUS_NO_REDIRECTION, E_FAIL, E_NOTIMPL, E_OUTOFMEMORY, S_OK,
 };
 use crate::{bridge, ddi, device_funcs, forward};
 use crate::{log_error, trace_line};
@@ -107,6 +111,16 @@ const _: () = {
 // unconditional early return, and `#[allow(unreachable_code)]` was silencing
 // that proof. `D3d10_2DdiArgGetCaps` is NOT among them -- the live `get_caps`
 // uses it.
+//
+// ⛔ AND THE `OpenAdapter12` EXPORT ITSELF IS GONE, at stage S5 (ARCHITECTURE.md
+// §6.2, §11). It is the ONE deleted export in that commit, and it must not come
+// back: `helios_umd12.dll` now serves `UserModeDriverName[3]` and owns the D3D12
+// DDI. Two DLLs exporting the same name is not a link conflict -- the loader
+// resolves each module's own -- but it makes "which one answered?" unanswerable
+// from a log, and both DLLs can be loaded into one process (S4b's whole subject).
+// A refusing duplicate here would also outrank nothing and explain nothing: the
+// D3D12 kill switch lives in `umd12/src/knobs12.rs` as `UmdD3D12`, so "D3D12 is
+// off" is already a countable, greppable fact in exactly one place.
 
 /// The value handed back as every adapter's `pDrvPrivate`.
 ///
@@ -163,31 +177,6 @@ pub unsafe extern "system" fn OpenAdapter10_2(
     unsafe { open_adapter_common(open_data, true) }
 }
 
-/// The D3D12 adapter entry point. Kept EXPORTED and refusing: the loader
-/// resolves it by name, and a missing export is a different (worse) failure
-/// than a clean refusal.
-///
-/// The parameter is `*mut c_void` because nothing here reads it. Before R908
-/// this took a hand-written `D3d12DdiArgOpenAdapter` and was followed by ~200
-/// lines of adapter-funcs installation and a D3D12 caps policy (UMA,
-/// 3DPIPELINESUPPORT, 3DPIPELINELEVEL_1_0_CORE) behind
-/// `#[allow(unreachable_code)]` -- a second, divergent copy of the caps-dispatch
-/// pattern that read as a live contract while the compiler had already proved
-/// it could never run.
-#[no_mangle]
-pub unsafe extern "system" fn OpenAdapter12(open_data: *mut c_void) -> Hresult {
-    log_error!("OpenAdapter12");
-    log_error!("OpenAdapter12 -> DXGI_ERROR_UNSUPPORTED (D3D12 DDI not implemented yet)");
-    let _ = open_data;
-    // Declining an unimplemented DDI is DXGI_ERROR_UNSUPPORTED (0x887A_0004),
-    // not DXGI_ERROR_DRIVER_INTERNAL_ERROR (0x887A_0020). This site returned
-    // the latter until R801 because the two shared a constant name: a D3D12
-    // client's ordinary "this driver has no D3D12 DDI" negotiation was recorded
-    // by the runtime and by ETW as a *driver fault*. Nothing distinguished the
-    // two in our log, since both printed as "DXGI_ERROR_UNSUPPORTED".
-    DXGI_ERROR_UNSUPPORTED
-}
-
 unsafe fn open_adapter_common(
     open_data: *mut ddi::D3D10DDIARG_OPENADAPTER,
     with_10_2: bool,
@@ -204,10 +193,11 @@ unsafe fn open_adapter_common(
     // D3D11 path provably unchanged, and it makes the SECOND driver the one that
     // has to name itself. `LOG_INIT_LATE` counts the failure.
     //
-    // `OpenAdapter` is the first entry point dxgkrnl calls on this module, so
-    // this is the earliest reachable point. ⚠ `OpenAdapter12` above logs before
-    // it — harmless only because of the default; when `umd12` takes slot 3 at
-    // S5 that export leaves this DLL entirely.
+    // `OpenAdapter` is the first entry point dxgkrnl calls on this module, and
+    // as of S5 it is the ONLY one: the `OpenAdapter12` export that used to log
+    // above this call is gone from this DLL, so there is no longer any path that
+    // writes a line before `log::init` runs. ⚠ Before S5 that was harmless only
+    // because the basename and the default coincided.
     crate::log::init("umd", crate::knobs::umd_trace_knob());
 
     if open_data.is_null() {
