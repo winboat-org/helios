@@ -3346,10 +3346,40 @@ silent on it:
   `DxgkDdi*` slots is required for a baseline D3D12 device. The multi-engine /
   residency / tiled-resource expectations in the earlier version of this bullet
   were wrong: `docs/dx12/KMD_IMPACT.md` walks each one.
-- **Next, and it writes no driver code either:** P1 / `D12-G5`, the WARP spy
-  proxy — `d3d10warp.dll` exports `OpenAdapter12`, so forwarding to it and
-  logging the real call sequence turns seven undocumented contract questions
-  into one log file.
+- **P1 is complete (2026-08-05) — `D12-G5`, the WARP spy proxy.**
+  `tools/d3d12_spy/` is a proxy `d3d10warp.dll` that forwards to Microsoft's own
+  D3D12 UMD with a counting thunk on **all 206 driver slots** (+32 armed DXGI
+  slots), driven by four workloads, six caps-mutation arms, four version-floor
+  arms, and one run on the real Helios adapter. Containment check passes: 23
+  caps types asked, all within the 43, none of the 7 deprecated. Artifacts
+  `tmp/dx12/gates/G5/{spy.log,answers.md}`; `DX12.md` §4.2 has the summary and
+  `DDI_REFERENCE.md` §15.0 the merged result. Six results that change P2-P4:
+  - ⭐ **`D3D12DDI_SUPPORTED_0040` is accepted by this Windows build and a
+    triangle presents on it** — 96 core + 58 CL slots instead of 124 + 75, i.e.
+    **169 baseline slots instead of 214**. The default the runtime negotiates is
+    `_0110`, not `_0109`. The choice between them belongs to P3.
+  - ⭐ **`pfnCreateShader` receives a RAW stream, never a DXBC container**
+    (`dword[0]=(type<<16)|(major<<4)|minor`, `dword[1]=length in dwords`,
+    `dword[2]='DXIL'`), and the runtime converts SM 5.1 DXBC to DXIL first.
+  - ⭐ **The caps set is validated as ONE contract at retail** —
+    `D3D12CreateDevice` fails `0x887A0020` with an English reason on ETW
+    **`Microsoft-Windows-Direct3D12`** (⛔ *not* `DxgKrnl`/`AzureTriage`, which
+    said nothing). But an **out-of-range tier is clamped silently** — the
+    advertise-what-is-backed hazard with the loud failure removed.
+  - **No DXGI table**: `D3D12DDI_TABLE_TYPE_DXGI` is never requested, across 20
+    flip-model presents. Present arrives on the command-list table only.
+  - **A WDDM 2.1 adapter is not a barrier** — forced `_0110` negotiated cleanly
+    on the real Helios adapter, so `Wddm2_1GpuMmu` does not cap the DDI version.
+  - **`pfnGetPresentPrivateDriverDataSize` is called once per present**, right
+    before `pfnPresent` — a second candidate identity channel, to test at G8
+    beside the `pfnRenderCb` plan rather than instead of it.
+  ⛔ Traps worth keeping: `C:\ProgramData\Helios` has a junction loop, so a
+  wildcard *inside* a path silently finds nothing (use `-Filter`); Route B needs
+  `pnputil /restart-device` because dxgkrnl caches the UMD path at StartDevice;
+  and the spy's own `UmdD3D12Spy` gate refuses everything when the knob is
+  absent, which faked four "the runtime rejected this DDI version" results.
+- **Next: P2 / `D12-G6`** — the `umd_common` extraction (stages S1-S2), the
+  first phase that writes driver code. `OpenAdapter12` still refuses.
 
 
 **30th session (2026-07-07) — 3DMark bring-up: LUID gap FIXED, FL11 ceiling

@@ -77,9 +77,12 @@ as D3D11 does today.
    `dxgi.dll` is not built in this tree (only `dxgi.dll.p` exists), not deployed by any script, and
    referenced by nothing. D3D12 inherits that exactly: the app's `ID3D12CommandQueue` is the
    **runtime's**, which MS DXGI understands natively, and present arrives at `pfnPresent` on the
-   command-list table plus `D3D12DDI_TABLE_TYPE_DXGI` (=3). vkd3d sits *behind* the DDI as an
-   engine, so `IDXGIVkSwapChainFactory` is never queried and `swapchain.c` is never entered — just
-   as DXVK's own swapchain factory is never used today.
+   command-list table. ⚠ **Correction from `D12-G5`: and NOT on `D3D12DDI_TABLE_TYPE_DXGI` (=3),
+   which is never requested at all** — `pfnFillDDITable` was never called with type 3, and 0 of 32
+   armed DXGI thunks fired across 20 flip-model presents. A D3D12 UMD on this build needs **no DXGI
+   table** (`DDI_REFERENCE.md` §2.3). vkd3d sits *behind* the DDI as an engine, so
+   `IDXGIVkSwapChainFactory` is never queried and `swapchain.c` is never entered — just as DXVK's own
+   swapchain factory is never used today.
 2. **P-A is deleted, not mitigated.** The whole hazard (the ICD vehicle picking up an app-local DXVK
    DXGI and silently demoting frames to the software GDI blit) existed only because an app directory
    would have contained a DXVK `dxgi.dll`. No app-local DLLs ⇒ no hazard. The ICD's bare-name
@@ -309,11 +312,25 @@ open-sourced; a D3D12 one never was). Strategy D1 is original engineering, not p
 *Mitigation, and it is unusually good:* **`C:\Windows\System32\d3d10warp.dll` exports
 `OpenAdapter12`** (verified by `dumpbin /exports`). A shim DLL that forwards to WARP and logs every
 `pfnGetCaps(Type, DataSize)`, `pfnFillDDITable(TableType, TableSize, …)`,
-`pfnGetSupportedVersions` result and every table-slot call turns **seven** undocumented contract
-questions into one log file, for about a day's work and with no driver change. Second source: the
-D3D12 runtime's own validation strings, extracted from `D3D12Core.dll`
-(`docs/dx12/research/d3d12core-driverstrings.txt`, 270 lines) — the runtime telling you in English
-what the driver must do. Both are first-class tools, not curiosities.
+`pfnGetSupportedVersions` result and every table-slot call turns undocumented contract questions into
+one log file, with no driver change. Second source: the D3D12 runtime's own validation strings,
+extracted from `D3D12Core.dll` (`docs/dx12/research/d3d12core-driverstrings.txt`, 270 lines) — the
+runtime telling you in English what the driver must do. Both are first-class tools, not curiosities.
+
+✅ **BUILT AND RUN — `D12-G5`, 2026-08-05, `tools/d3d12_spy/`, results in
+`tmp/dx12/gates/G5/answers.md`.** Of `DDI_REFERENCE.md` §15.1's eighteen questions: **8 answered
+outright, 6 moved forward, 4 re-marked UNVERIFIED with the reason stated** (three of those four are
+structurally out of the spy's reach — WARP is a software rasterizer and never enters the kernel).
+The four results that change the plan are in `DX12.md` §4.2; the two largest are that **this Windows
+build accepts `D3D12DDI_SUPPORTED_0040`** (169 baseline slots instead of 214, and a triangle presents
+on it) and that **the runtime hands `pfnCreateShader` a raw DXIL stream, never a DXBC container**,
+converting SM 5.1 DXBC on the way. H1 is no longer "original engineering with no reference": there
+is now a recorded call trace of a working D3D12 UMD on this exact Windows build.
+
+⚠ The strings file remains the second source, but with a measured caveat: `D12-G5` showed that the
+fifteen `Driver filled out an invalid value in …::<Tier>` strings are **not** retail device-creation
+gates — an out-of-range tier is clamped silently. The cross-cap consistency strings *are* enforced at
+retail. `DDI_REFERENCE.md` §11.5.0 separates the two.
 
 **H2 — presentation, but not for the reason the old charter said.**
 

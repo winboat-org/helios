@@ -306,30 +306,49 @@ exactly this reason (it assumed build = 80); the correct value is `0x000C0050_00
 
 Gaps are real: there is no `_0085` and no `_0087`.
 
-**A load-bearing inference, flagged.** `D3D12DDIARG_CREATEDEVICE::Interface` receives the **high 32
-bits** of the chosen token (`INTERFACE_VERSION_Rn`) and `::Version` the **low 32 bits**
-(`BUILD_VERSION_NNNN << 16`). That is the only split of a `UINT64` into two `UINT`s consistent with
-the constant's construction and with the D3D10/11 convention. **The header does not state it —
-UNVERIFIED.** Settling experiment: the §15 spy logs `Interface` and `Version` as WARP receives them
-and compares against `D3D12DDI_SUPPORTED_*`. Until it runs, dispatch on the *pair* as an opaque
-key, not on either half alone.
+✅ **CONFIRMED (`D12-G5`, was "a load-bearing inference"):**
+`D3D12DDIARG_CREATEDEVICE::Interface` receives the **high 32 bits** of the chosen token
+(`INTERFACE_VERSION_Rn`) and `::Version` the **low 32 bits** (`BUILD_VERSION_NNNN << 16`). The spy
+logged both the driver's returned token list and the `Interface`/`Version` pair the runtime came back
+with: `((UINT64)Interface << 32) | Version` equals the list entry **bit for bit**
+(`0x000c0050_006e0000`, WARP's `version[76]`). Dispatching on the *pair* as an opaque key is still
+the right implementation, but the split itself is no longer a guess.
+
+⚠ The first cut of the spy capped its version capture at 64 entries while WARP returns **77**, and
+therefore printed "NO MATCH in pfnGetSupportedVersions' list" — a truncated instrument reading
+exactly like a finding. Raise the cap before believing a mismatch.
 
 The runtime's failure string for a bad handshake is `Failed to find matching DDI versions`
 (strings:167).
 
-**UNVERIFIED: the DDI-version → Windows-release mapping.** The header records only a feature banner
-per version, never an OS build. Do not infer "this Windows build accepts version X" from the SDK.
-The settling experiment is §15's spy (which version WARP negotiates on *this* guest) or the
-`D3D12DDI_SUPPORTED_0040`-only floor probe in §15.4.
+✅ **The DDI-version → Windows-release mapping, for one build.** The header records only a feature
+banner per version, never an OS build, and one measurement does not give the table — but for
+**26100.8875**: WARP offers **77** tokens (13 D3D11-era `0x000b00xx` ones plus `_0003` … `_0110`) and
+the runtime picks the **newest**, `D3D12DDI_SUPPORTED_0110`. Forced single-token runs show it also
+accepts `_0109`, `_0089` and `_0040` (§15.4).
 
 ### 1.6 Which version to implement
 
-Recommendation: **negotiate `_0109`** — `D3D12DDI_DEVICE_FUNCS_CORE_0109` (124 slots) +
+⚠ **Two measurements from `D12-G5` change the terms of this section; read them before the argument
+below.**
+
+1. **This Windows negotiates `_0110`, not `_0109`.** `_0110` adds no table struct of its own — it
+   reuses `ADAPTERFUNCS_0109`, `DEVICE_FUNCS_CORE_0109` (992 B, observed), `COMMAND_LIST_FUNCS_3D_0108`
+   (600 B) and `COMMAND_QUEUE_FUNCS_CORE_0001` (56 B). So the *table choice* below is right and only
+   the **token** changes: report `_0110` and fill the `_0109`/`_0108` shapes.
+2. **`_0040` is accepted by this build**, and a triangle presents on it, at **96 core + 58 CL** slots
+   (§15.4). The old text called reporting a single old token a sizing experiment; it is now a real
+   option. What it costs is the *old object model* — `_0040` predates the pool + recorder split and
+   carries the retired command-**allocator** family, which reason 3 below is about.
+
+Recommendation, unchanged in substance: **negotiate `_0110` and fill the `_0109`-generation tables**
+— `D3D12DDI_DEVICE_FUNCS_CORE_0109` (124 slots) +
 `D3D12DDI_COMMAND_LIST_FUNCS_3D_0108` (75 slots) + `D3D12DDI_COMMAND_QUEUE_FUNCS_CORE_0001` (7) +
 `D3D12DDI_ADAPTERFUNCS_0109` (8). Reasons, in order:
 
 1. It is the newest coherent set in this header (`_0110` adds only `ExecuteIndirectTier` caps and
-   reuses `ADAPTERFUNCS_0109`), so it is the shape a 26100-era runtime will ask for first.
+   reuses `ADAPTERFUNCS_0109`), and ✅ **measured: it is the shape this 26100-era runtime asks for
+   first** — `_0110` is what it picked out of WARP's 77-entry list.
 2. Every tier that would otherwise pull in work is *declinable through caps* (§11), not through
    table shape. Choosing an older version does not remove the caps gauntlet; it removes slots you
    would have stubbed anyway.
@@ -338,11 +357,21 @@ Recommendation: **negotiate `_0109`** — `D3D12DDI_DEVICE_FUNCS_CORE_0109` (124
    `pfnDestroyCommandAllocator` / `pfnResetCommandAllocator`, umddi:1740-1743), which exists only up
    to `CORE_0033` and was replaced at `_0040` by pool + recorder (§8.1).
 
-**The counter-argument is real and should be measured, not assumed:** `research/R2` §5.4 proposes
-reporting a single old token (e.g. `D3D12DDI_SUPPORTED_0040`, a 96-slot core table with no state
-objects, no mesh shaders, no enhanced barriers, no work graphs) purely to size the project. That is
-the §15.4 experiment. If the runtime accepts `_0040`, revisit this recommendation before writing the
-first table.
+**The counter-argument was real, and it has now been measured rather than assumed:** `research/R2`
+§5.4 proposed reporting a single old token (`D3D12DDI_SUPPORTED_0040`, a 96-slot core table with no
+state objects, no mesh shaders, no enhanced barriers, no work graphs) purely to size the project.
+✅ **§15.4 ran it: `_0040` is accepted and a triangle presents on it.** So the trade is live and it
+is a real decision to make at P3, not a hypothesis:
+
+| | `_0110` (recommended) | `_0040` |
+|---|---:|---:|
+| baseline slots | 214 (8 + 124 + 75 + 7) | **169** (8 + 96 + 58 + 7) |
+| object model | pool + recorder (§8.1) | the retired command **allocator** family |
+| caps gauntlet | unchanged | unchanged — an older token does not soften §11.5 |
+
+⛔ Whichever is chosen, choose it **once and explicitly**, and derive every table struct from the
+matching header revision through bindgen. A `_0040` token with `_0109`-shaped tables is the R702
+class with the size handed to you in the argument.
 
 ---
 
@@ -401,10 +430,21 @@ through `pfnSetExtendedFeatureCallbacks` whose SAL says `_In_reads_(TableSize)` 
 | 25 `PIN_RESOURCES_CALLBACKS` | **runtime → driver** | `D3D12DDI_PIN_RESOURCES_CALLBACKS_0076` | 2 | 18380 |
 | 4,7,9,11–15,17,19–22,24,26 | driver → runtime | video / protection / experimental | — | — |
 
-**A baseline Helios device needs exactly four: 0, 1, 2 and 3.** Everything ≥4 is reached only
-through the extended-features handshake, and a driver that answers
-`pfnGetSupportedExtendedFeatures` with **zero features** never sees any of them. That is the honest
-posture and it matches the KMD's (protected-content and video DDIs unset).
+⚠ **"A baseline Helios device needs exactly four: 0, 1, 2 and 3" was wrong in both directions.**
+`D12-G5` measured what the runtime actually fills for a plain device + swapchain + present:
+
+| type | filled? | note |
+|---|---|---|
+| 0 `DEVICE_CORE` | ✅ once | 992 B |
+| 1 `COMMAND_LIST_3D` | ✅ **twice** | indices 0 and 1, distinct `hRTTable` (§2.2) |
+| 2 `COMMAND_QUEUE_3D` | ✅ once | 56 B |
+| 3 `DXGI` | ⛔ **never** | not at device creation, not by a flip-model swapchain, not across 20 presents (§2.3) |
+| 27 `0096_EXTENDED_FEATURES` | ✅ once, **32 B** | filled with **no** extended-features handshake, for a baseline device. ⚠ **Version-dependent**: at `_0089` and `_0040` the runtime fills type **8** `0020_EXTENDED_FEATURES` instead, same 32 bytes |
+
+So the real baseline is **0, 1 (×2), 2 and 27** (or 8 on an older token). Everything else ≥4 is still reached only through the
+extended-features handshake, and a driver that answers `pfnGetSupportedExtendedFeatures` with
+**zero features** never sees those. That remains the honest posture and it matches the KMD's
+(protected-content and video DDIs unset) — but type 27 arrives regardless, so it needs an answer.
 
 ```c
 typedef enum D3D12DDI_FEATURE_0020            // umddi:4062-4074
@@ -470,6 +510,24 @@ if n < core::mem::size_of::<ddi12::D3D12DDI_DEVICE_FUNCS_CORE_0109>() {
 core::ptr::copy_nonoverlapping(&filled as *const _ as *const u8, p_table as *mut u8, n);
 ```
 
+✅ **MEASURED (`D12-G5`): the 5th `UINT` is the command-list table INDEX.** The runtime fills
+`D3D12DDI_TABLE_TYPE_COMMAND_LIST_3D` **twice** during device creation, in immediate succession, with
+the 5th `UINT` = **0** then **1** and two distinct `hRTTable` handles (`0x3E0`, `0x638`). Both fills
+are the same 600-byte `_0108` shape. Those handles are exactly what the driver later passes to
+`pfnSetCommandListDDITableCb` — WARP was observed calling
+`pfnSetCommandListDDITableCb(hRTCommandList, 0x3E0)` on every command-list create (§9.3, §15.1 #9).
+⇒ **`hRTTable` must be stashed per index at fill time**; there is no other way to obtain it.
+
+⚠ `D3D12DDI_TABLE_REQUEST::numTables` is still unexercised: `pfnGetOptionalDDITables` was called
+once and WARP answered `*puEntries = 0`, and the runtime still filled two command-list tables. So the
+second table is **not** something the driver asks for — the runtime provides it unconditionally.
+
+✅ **MEASURED: `TableSize` is exactly `size_of` the negotiated revision's struct** — 992 / 600 / 56 at
+`_0110` and `_0109`, matching `DEVICE_FUNCS_CORE_0109` / `COMMAND_LIST_FUNCS_3D_0108` /
+`COMMAND_QUEUE_FUNCS_CORE_0001` byte for byte. ⛔ **And it moves with the version**: at `_0089` the
+runtime passes **976 / 552**, at `_0040` **768 / 464** (§15.4). That is the R702 class with the
+correct size handed to you in the argument — there is no excuse for `size_of::<T>()`.
+
 ⚠ **`pfnGetOptionalDDITables` may only request table type 1.** The runtime says so:
 
 > `PFND3D12DDI_GETOPTIONALDDITTABLES only supports D3D12DDI_TABLE_TYPE_COMMAND_LIST_3D.  An unsupported table type was requested.` — strings:238
@@ -508,10 +566,19 @@ The struct comes from `dxgiddi.h`, which defines seven candidates (measured on w
                                     798: DXGI1_6_1_DDI_BASE_FUNCTIONS (22 members = 176 B)
 ```
 
-**UNVERIFIED: which shape D3D12 requests, and whether it varies with the negotiated DDI version.**
-Settling experiment: the §15 spy logs `TableSize` for `TableType == 3`; 168 vs 176 identifies the
-struct, and `DXGI1_5` vs `DXGI1_6_1` is then distinguished by whether `pfnPresent1` is called with
-`DXGI1_6_1_DDI_ARG_PRESENT`. ✅ `um\dxgiddi.h` **is** in this document's staging block (§preamble;
+⭐ ✅ **ANSWERED (`D12-G5`), and the answer is that the question is moot: `D3D12DDI_TABLE_TYPE_DXGI`
+is NEVER REQUESTED.** The spy armed 32 generic DXGI thunks and logged every `pfnFillDDITable` call
+across four workloads — device-only, +queue, +swapchain with 20 flip-model presents, and +draw.
+`TableType == 3` never appeared, and **0 of 32** DXGI thunks were ever called. Present reaches the
+driver on the *command-list* table (`cl[19] pfnPresent`) and nowhere else.
+
+⇒ **A D3D12 UMD on this Windows build needs no DXGI table at all**, and `helios_umd12` should not
+plan one. (`DECISIONS.md` D2's remark that present arrives "on the command-list table plus
+`D3D12DDI_TABLE_TYPE_DXGI` (=3)" is half right: the command-list half is what happens.)
+
+⚠ Scope of the claim: four workloads on WARP, no fullscreen/exclusive transition, no stereo, no
+HDR/colour-space call. If a later gate sees type 3 requested, the 168-vs-176 discriminator below is
+still the way to identify the shape. ✅ `um\dxgiddi.h` **is** in this document's staging block (§preamble;
 it is *not* in `DECISIONS.md`'s — that is the one deliberate difference between the two lists).
 Member counts re-confirmed on win11 at `10.0.26100.0`: `dxgiddi:737` `DXGI1_4` = **21** members
 (168 B), `dxgiddi:767` `DXGI1_5` = **22** (176 B), `dxgiddi:798` `DXGI1_6_1` = **22** (176 B) — so
@@ -2141,6 +2208,63 @@ still `D3D12DDICAPS_TYPE` values passed to `pfnGetCaps`, and the runtime validat
 extended feature. A baseline device that reports zero extended features never sees it. Do not merge
 the two enums.
 
+#### 11.1a ✅ Measured — which types the runtime actually asks, and with what `DataSize`
+
+`D12-G5`, 2026-08-05, against WARP 10.0.26100.8875 on this guest's own `D3D12Core.dll`. Full table
+including the never-asked rows: `tmp/dx12/gates/G5/answers.md` §2.
+
+**23 of the 43 are asked. None of the 7 deprecated ones is. No value outside the 43 ever appeared.**
+
+⭐ **The asked set is identical across all four workloads** (device-only, +queue, +swapchain/present,
++shaders/draw). Caps are answered entirely during adapter open and device creation; nothing an
+application does adds a query. So "not asked" here is the strong form, not a workload artefact.
+
+| type | enumerator | `DataSize` | `pInfo` | calls per run |
+|---:|---|---:|---|---:|
+| 1002 | `MEMORY_ARCHITECTURE` | 20 | `NodeIndex` | 1 |
+| 1003 | `TEXTURE_LAYOUT_SETS` | 20 | non-NULL | **3** — an *enumeration*, see below |
+| 1004 | `SHADER` | 64 | NULL | 1 |
+| 1005 | `ARCHITECTURE_INFO` | 4 | NULL | 1 |
+| 1006 | `D3D12_OPTIONS` | **124** | NULL | 1 |
+| 1007 | `3DPIPELINESUPPORT` | 4 | NULL | 1 |
+| 1009 | `GPUVA_CAPS` | 4 | `NodeIndex` | 1 |
+| 1012 | `0011_SHADER_MODELS` | 16 | NULL | 2 |
+| 1013 | `OPTIONS1_0103` | 4 | NULL | 1 |
+| 1059 | `0022_CPU_PAGE_TABLE_FALSE_POSITIVES` | 4 | non-NULL | 1 |
+| 1060 | `0022_TEXTURE_LAYOUT` | 20 | **NULL** | 1 |
+| 1062 | `0023_UMD_BASED_COMMAND_QUEUE_PRIORITY` | 4 | NULL | 1 |
+| 1067 | `0050_HARDWARE_SCHEDULING_CAPS` | 4 | NULL | 1 |
+| 1071 | `0073_SUPPORT_BATCHED_MARKERS` | 4 | NULL | 1 |
+| 1074 | `0081_3DPIPELINESUPPORT1` | 8 | NULL | 1 |
+| 1077 / 1078 / 1079 | `OPTIONS_0090` / `_0091` / `_0093` | 4 / 16 / 8 | NULL | 1 each |
+| 1080 | `OPTIONS_0098` | 4 | NULL | 1 |
+| 1082 | `OPTIONS_0102` | 16 | NULL | 1 |
+| 1087 / 1088 | `OPTIONS_0109` / `_0110` | 4 / 4 | NULL | 1 each |
+| 1091 | `SHADER_MODEL_6_8_OPTIONS_0110` | 8 | NULL | 1 |
+
+**Never asked** (13 live enumerators): 1057, 1061, 1066, 1068, **1069 `EXECUTECOMMANDLISTS_PARALLELISM`**,
+1070, 1072, 1073, 1075, 1081, 1084, 1085, 1086.
+
+**Ask order** — and the first two matter structurally:
+
+```
+1074, 1007                                   <-- BEFORE pfnGetSupportedVersions, on a bare adapter
+  (version negotiation, pfnCalcPrivateDeviceSize, pfnCreateDevice)
+1006, 1077, 1078, 1079, 1080, 1013, 1087, 1088, 1004, 1012, 1012
+  (pfnGetOptionalDDITables, pfnFillDDITable x5)
+1005, 1091, 1062, 1067, 1060, 1002, 1003, 1003, 1003, 1059, 1082
+  (the 91-format pfnCheckFormatSupport sweep, pfnQueryNodeMap)
+1009, 1071
+```
+
+⭐ **`3DPIPELINESUPPORT1` (1074) and `3DPIPELINESUPPORT` (1007) are answered before any version is
+negotiated and before any device exists.** `helios_umd12`'s `pfnGetCaps` must answer both without
+knowing which DDI version it is speaking.
+
+⭐ **`TEXTURE_LAYOUT_SETS` (1003) is an enumeration, not a query.** The runtime calls it with
+`pInfo = {1,0}`, `{1,1}`, `{1,2}` and stops at the first failure. A driver that answers `S_OK`
+forever loops it.
+
 ### 11.2 The caps a device MUST answer
 
 These are the ones with an explicit "device creation fails" string. **This list is *verified*, not
@@ -2169,15 +2293,23 @@ e.g. umddi:152-155 for `MEMORY_ARCHITECTURE` (`*pInfo = NodeIndex`) and umddi:25
 `GPUVA_CAPS`. **Always check `pInfo` for NULL before dereferencing** — two of the strings above
 exist precisely because the runtime calls with `pInfo == NULL`.
 
-**UNVERIFIED: what the runtime does when the driver returns a failing HRESULT for a caps type it
-does not recognise.** The `_0090` convention ("the runtime will keep requesting from the driver all
-`D3D12DDI_OPTION` versions whose caps it cares about", umddi:11125, inside the comment block at
-umddi:11122-11125) strongly suggests "treat as
-zeroed/unsupported", but the header does not say. Settling experiment: §15's spy — return a failure
-for one benign cap (e.g. `_OPTIONS_0110`) against WARP and observe whether the device still creates.
-Until then, the safe default is: **answer every cap you understand; for the rest, zero `pData` up to
-`DataSize` and return `S_OK`.** ⛔ Do not return `S_OK` without writing `pData` — the runtime reads
-whatever was in its buffer.
+✅ **ANSWERED (`D12-G5`): a failing HRESULT on a caps type is tolerated.** The `_0090` convention
+("the runtime will keep requesting from the driver all `D3D12DDI_OPTION` versions whose caps it cares
+about", umddi:11125, in the comment block at umddi:11122-11125) suggested "treat as
+zeroed/unsupported", and that is what happens. Three independent observations:
+
+* WARP itself answers **`1074 3DPIPELINESUPPORT1`** and **`1080 OPTIONS_0098`** with `E_UNEXPECTED`
+  (0x8000ffff) on **every** run, and the device creates every time;
+* `1003 TEXTURE_LAYOUT_SETS` is *designed* to end in failure — the runtime enumerates until the
+  driver refuses;
+* the spy's `capfail` arm returned `E_INVALIDARG` for `1088 OPTIONS_0110` without calling WARP at
+  all, and `D3D12CreateDevice` still returned `S_OK`.
+
+⛔ **This does not extend to the ~13 caps with an explicit "device creation fails" string above** —
+all of those were answered `S_OK` in every run, so refusing one is untested. The safe rule is
+unchanged: **answer every cap you understand; for the rest, zero `pData` up to `DataSize` and return
+`S_OK`.** ⛔ Do not return `S_OK` without writing `pData` — the runtime reads whatever was in its
+buffer.
 
 ### 11.3 Feature level — `3DPIPELINESUPPORT` and its trap
 
@@ -2359,6 +2491,41 @@ typedef struct D3D12DDI_SHADER_CAPS_0084
 > `Driver did not set valid WaveLaneCountMin/Max or TotalLaneCount via D3D12DDICAPS_TYPE_SHADER caps query` — strings:29
 
 ### 11.5 The cross-check rules the runtime enforces
+
+#### 11.5.0 ✅ Measured (`D12-G5`): which of these are RETAIL gates, and which are not
+
+The strings below are extracted from `D3D12Core.dll`. Whether the retail runtime actually enforces
+them was inference until `D12-G5` answered caps through the spy and watched what happened. Three
+distinct behaviours, and conflating them is the easy mistake:
+
+| what the driver does | what the retail runtime does |
+|---|---|
+| **an inconsistent SET of caps** (a tier that requires a shader model the driver did not list; a feature level that requires a tier it did not claim) | ⛔ **`D3D12CreateDevice` FAILS**, `DXGI_ERROR_DRIVER_INTERNAL_ERROR` (0x887A0020), with the matching English string on ETW **`Microsoft-Windows-Direct3D12`** |
+| **an out-of-range tier value** (`ResourceBindingTier = 99`) | ⚠ **silently CLAMPED to the maximum legal value.** The device creates and `CheckFeatureSupport` reports the app tier **3**. The debug layer changed nothing. The fifteen `Driver filled out an invalid value in D3D12DDI_D3D12_OPTIONS_DATA::<Tier>` strings are **not** retail device-creation gates |
+| **a legal but lower answer** (`ResourceBindingTier = 2`) | ✅ propagates **verbatim** to `CheckFeatureSupport`. The driver's caps answer *is* what the application sees |
+
+Two worked failures, both on the retail path with no debug layer, both reproducible:
+
+> `FL12+ driver incorrectly did not report support for resource binding tier 2+.`
+> — forcing `ResourceBindingTier = 1` while `3DPIPELINESUPPORT` says FL 12_1
+
+> `Drivers that expose AtomicInt64OnTypedResource, AtomicInt64OnGroupShared, AtomicInt64OnDescriptorHeapResource, DerivativesInMeshAndAmplificationShaders or WaveMMATier must expose shader model 6.6.`
+> — clamping the `_0011_SHADER_MODELS` list to 6.5 while leaving `OPTIONS1_0103` alone
+
+⛔ **The clamp is the dangerous half, not the failure.** A wrong tier does not become a loud error;
+it becomes a *wrong advertised tier*, which is CLAUDE.md's "advertising a capability that is not
+backed" with the loud failure removed. Answer in range, and answer consistently.
+
+**ETW recipe** — ⚠ `Microsoft-Windows-DxgKrnl` / `AzureTriage` contributed **nothing** here; the
+failure is above dxgkrnl. The provider that answers for D3D12 is `Microsoft-Windows-Direct3D12`,
+exactly as `Microsoft-Windows-DXGI` was for the D3D11 feature-level work (30th session):
+
+```powershell
+logman create trace helios_d12 -p Microsoft-Windows-Direct3D12 0xFFFFFFFFFFFFFFFF 0xff -o x.etl -ets
+logman update helios_d12 -p Microsoft-Windows-DXGI 0xFFFFFFFFFFFFFFFF 0xff -ets
+# ... run the probe ...
+logman stop helios_d12 -ets ; tracerpt x.etl -o x.xml -of XML -y   # read <Data Name="Message">
+```
 
 **(a) Shader-model coupling — 11 rules, verbatim (strings:116-126).** A tier claim *requires* a
 shader model in the `_0011_SHADER_MODELS` list.
@@ -2764,14 +2931,38 @@ CLAUDE.md's "validate every runtime-supplied size & offset before reading" deman
 `umd/src/forward/shaders.rs:41-59`, `log_shader_code()`, is the matching instrument — it prints
 `len`, `dxbc=`, and the first four dwords; port that too.
 
-⚠ **UNVERIFIED: whether the D3D12 runtime ever hands the driver a *raw* DXIL bitstream rather than a
-DXBC container, and whether SM 5.1 arrives as a container or as a token stream.** Neither the header
-nor <https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/d3d12umddi/ns-d3d12umddi-d3d12ddiarg_create_shader_0026>
-(which says only "Pointer to the shader code") settles it. Settling experiment: §15's spy, or the
-narrower version — a `pfnCreateShader` that logs the first 8 dwords and returns, run against
-`D3D12HelloTriangle`; first dword `0x43425844` ⇒ container. ⚠ That narrower version requires
-`OpenAdapter12` to succeed, so it must be paired with honest caps in the *same commit* or R908
-repeats.
+⭐ ✅ **ANSWERED (`D12-G5`) — and it is neither of the two options as posed.** The runtime hands
+`pfnCreateShader` a **raw stream behind the two-token header**, never a DXBC container. Verbatim
+first eight dwords, from three different slots in one run:
+
+```
+pfnCreateVertexShader:  00010060 0000010a 4c495844 00000100 00000010 00000410 dec04342 00000c21
+pfnCreatePixelShader:   00000060 00000102 4c495844 ...
+pfnCreateComputeShader: 00050060 000000d4 4c495844 ...
+```
+
+| dword | meaning | evidence |
+|---|---|---|
+| `[0]` | `(programType << 16) \| (major << 4) \| minor` | `0x0001_0060` = vertex/SM 6.0, `0x0000_0060` = pixel, `0x0005_0060` = compute — the type field matched the slot it arrived on in every case |
+| `[1]` | **length in dwords** | `0x10a` = 266 dwords = 1 064 bytes |
+| `[2]` | **`'DXIL'` (0x4c495844)** — the DXIL part payload | — |
+
+⇒ the second row of the table above is the live one, and `_0026`'s missing SAL annotation says the
+same thing `_0003`'s `_In_reads_(pShaderCode[1])` did.
+
+⭐ **And the stronger half: the runtime converts DXBC to DXIL before the DDI.** The `D12-G5`
+`triangle` workload builds two pipelines in one process — one from `dxc -T vs_6_0` (a 3 152-byte
+container) and one from `D3DCompile(…, "vs_5_1")` (a 596-byte container). **Both** of the app's blobs
+start `'DXBC'`; **both** arrive at the DDI as `…0060` + length + `'DXIL'`, and neither length matches
+the app's blob. The `window` workload, which has no application shaders at all, produces only the two
+runtime-internal shaders, so the attribution is unambiguous.
+⇒ **A D3D12 UMD on this Windows build never sees DXBC**, and never sees a shader-model token below
+`0x0060`, even for a `vs_5_1` pipeline.
+
+**Consequence for `helios_umd12`:** port `shader_code_len()` as written, but expect only its
+**raw-stream branch** to execute; the DXBC-container branch is dead on this DDI. Keep it anyway — the
+bounds checks are the value — and give it a named counter, so that if a container ever does arrive
+the fact is recorded rather than assumed away.
 
 ### 12.3 The IO-signature structs, and the DXBC→DXIL admission
 
@@ -2861,6 +3052,34 @@ Helios D3D12 UMD gets it for free by forwarding into vkd3d — **do not bypass i
 
 **`docs/dx12/PRESENT.md` owns the design.** This section gives only the DDI shape so the reader does
 not have to re-derive it.
+
+### 13.0 ✅ Measured (`D12-G5`) — the real per-frame present sequence
+
+A flip-model `DXGI_SWAP_EFFECT_FLIP_DISCARD` swapchain, 20 presents, WARP behind the spy. Every
+frame, identically, and the first frame is the same as the steady state:
+
+```
+cl[ 0] pfnCloseCommandList
+queue[0] pfnExecuteCommandLists
+core[81] pfnGetPresentPrivateDriverDataSize      <-- ONCE PER PRESENT, immediately before
+cl[19] pfnPresent
+```
+
+* ⭐ **`pfnGetPresentPrivateDriverDataSize` is the private-data hook, and it is called per present.**
+  WARP answers 0, so all 20 presents carried `PrivateDriverDataSize = 0` and
+  `pPrivateDriverData = NULL`. A driver that returns N is handed an N-byte buffer.
+  ⚠ **Whether that buffer reaches `DxgkDdiPresent` is NOT settled here** — the D3D11 answer is *no on
+  DMA flips* (memory 64th), which is why `PRESENT.md` rides the identity on the Render command. This
+  is a **second candidate channel to test at G8**, not a replacement for the first.
+* **The argument, verbatim:** `phSurfacesToPresent` with `SurfacesToPresent = 1`,
+  `hDstResource = NULL`, `Flags = 0x21`, `FlipInterval = 0`, `VidPnSourceID = 0xffffffff`,
+  `DirtyRects = 0`, `OptimizeForComposition = 1`.
+* **`pOut` is a 536-byte `D3D12DDI_PRESENT_0051`** and its first dword is a `D3DKMT_HANDLE` —
+  `0x40000b00`, then `0x40000b80` on the next frame: the two swapchain buffers.
+  `pCtx` (`D3D12DDI_PRESENT_CONTEXTS_0051`) is non-NULL; `pHwQ` was NULL at `_0110` and non-NULL at
+  `_0040`.
+* ⛔ **`D3D12DDI_TABLE_TYPE_DXGI` is never filled and no DXGI slot is ever called** (§2.3). Present
+  reaches the driver here and only here.
 
 `pfnPresent` is a **command-list** slot (`DECISIONS.md` P-C). Signature and structs, verbatim
 (umddi:7226-7251):
@@ -2960,6 +3179,46 @@ Four facts a `PRESENT.md` reader needs from here:
 ---
 
 ## 14. The minimum viable table
+
+### 14.0 ✅ Measured (`D12-G5`) — what a triangle actually touches
+
+Per-slot call counts from a real driver (WARP) under a device + queue + swapchain + two PSOs + two
+draws + three presents, with a counting thunk on **every** slot of all four tables:
+
+| table | slots called | of |
+|---|---:|---:|
+| `DEVICE_CORE` | **47** | 124 |
+| `COMMAND_LIST_3D` | **22** | 75 |
+| `COMMAND_QUEUE_3D` | **1** | 7 |
+| `DXGI` | **0** | 32 armed |
+| **total** | **70** | 206 |
+
+Three things this changes about how §14.2's list should be read:
+
+* ⭐ **`D3D12CreateDevice` alone drives 27 of the 124 core slots** — before the application owns a
+  single object. The runtime builds *its own* internal pipelines at device creation: root signature,
+  vertex shader, blend / depth-stencil / rasterizer state, PSO, `pfnMakeResident`, then a compute
+  shader + PSO + `pfnMakeResident`, plus a command pool created and destroyed. It also runs a
+  **91-format `pfnCheckFormatSupport` sweep with 30 `pfnCheckMultisampleQualityLevels` calls each —
+  2 730 calls**. None of that is optional and none of it is app-driven.
+* ⭐ **The one queue slot called is `pfnExecuteCommandLists`.** `pfnSignalFence` and `pfnWaitForFence`
+  were **never called** across 20 frames of `ID3D12CommandQueue::Signal` + `SetEventOnCompletion`,
+  although `pfnCreateFence` was called three times ⇒ evidence that the *runtime* performs the queue
+  signal/wait (§15.1 #12). WARP is software-scheduled, so confirm on hardware before designing on it.
+* ⭐ **`pfnResetCommandList` is followed by a fixed 15-call state-reset block** on every reset,
+  whether or not the application touches that state: `pfnSetPipelineState`, `pfnIaSetTopology`,
+  `pfnSetDescriptorHeaps`, `pfnIASetVertexBuffers`, `pfnIASetIndexBuffer`, `pfnSOSetTargets`,
+  `pfnOMSetRenderTargets`, `pfnRsSetViewports`, `pfnRsSetScissorRects`, `pfnOmSetBlendFactor`,
+  `pfnOmSetFrontAndBackStencilRef`, `pfnOMSetDepthBounds`, `pfnRSSetShadingRate`,
+  `pfnSetPredication`, `pfnClearRootArguments`. They are not optional for a first frame.
+* ⚠ **Barriers arrive on `pfnBarrier` (`cl[68]`), not the legacy resource-barrier slot**, because
+  WARP reports `EnhancedBarriersSupported = 1`. The barrier cap decides which slot the runtime calls
+  — answering it wrong means implementing the slot the runtime never uses.
+
+**70 is the measured floor for a triangle on WARP; §14.2's 99 is the design target.** They are
+different questions — 99 counts slots that need a *real body* for correctness across the whole
+first-frame surface, 70 counts what one specific workload hit. Diff the two lists before P4 sizes
+itself, and treat a slot in 99-but-not-70 as "not exercised yet", never as "not needed".
 
 ### 14.1 Slots that are structurally mandatory
 
@@ -3125,272 +3384,217 @@ enumerated — see §17.1.
 
 ## 15. What the header does NOT tell you
 
-### 15.1 The numbered list
+### 15.0 ✅ The spy has RUN — `D12-G5`, 2026-08-05
 
-Every item here is **UNVERIFIED** and every one costs a day if guessed wrong. The § reference is
-where it is discussed; the settler is in §15.2 unless stated.
+**Everything in §15 below is now backed by a log rather than by inference.** The full result is
+`tmp/dx12/gates/G5/answers.md`; the raw captures are the `*.log` files beside it. Driver behind the
+proxy: `d3d10warp.dll` **10.0.26100.8875**; runtime: this guest's own `D3D12Core.dll`.
 
-| # | Question | § | Settler |
-|---|---|---|---|
-| 1 | Which caps types the runtime demands, in what order, and what a refusal does | 11.2 | spy |
-| 2 | Whether any DDI slot may legally be NULL (12 are proven non-NULL; the rest are unknown) | 14.1 | spy |
-| 3 | The meaning of `pfnFillDDITable`'s 5th `UINT` and of `D3D12DDI_TABLE_REQUEST::numTables` | 2.2 | spy |
-| 4 | Which `DXGI*_DDI_BASE_FUNCTIONS` shape table type 3 wants | 2.3 | spy (`TableSize` = 168 vs 176) |
-| 5 | The `Interface` / `Version` split of a `D3D12DDI_SUPPORTED_*` token | 1.5 | spy |
-| 6 | The DDI-version → Windows-release mapping | 1.5 | spy (which version WARP negotiates on this guest) |
-| 7 | Where recording memory comes from — `pfnSubmitCommandCb` vs `pfnRenderCb` | 8.2 | spy + ETW `DxgKrnl` `DmaPacket`/`QueuePacket` |
-| 8 | Whether `pfnGetSupportedVersions` is really a two-call query | 1.3 | spy |
-| 9 | How a driver obtains a second `D3D12DDI_HRTTABLE` for `pfnSetCommandListDDITableCb` | 9.3 | spy |
-| 10 | Whether the runtime accepts GPU VAs the driver never got from the kernel | 9.7 | debug-layer run, §9.7 |
-| 11 | Whether a monitored fence advances on this adapter with no GPU-side write, for a **D3D12-shaped** fence | 10.5 | **G-fence probe** — `tools/monitored_fence_probe.c` |
-| 12 | Whether the runtime, not the driver, performs the kernel signal/wait for `pfnSignalFence` | 10.5 | ETW slice around a WARP `ID3D12CommandQueue::Signal` |
-| 13 | Whether the runtime cross-validates the caps set as ONE contract | 11.5 | spy with deliberately inconsistent caps + ETW `AzureTriage` |
-| 14 | Whether the D3D12 runtime ever passes a raw DXIL bitstream instead of a DXBC container | 12.2 | spy, or `ShaderBytecodeDumpPath` port |
-| 15 | The exact contract of `D3D12DDICAPS_TYPE_EXECUTECOMMANDLISTS_PARALLELISM` | 11.6 | **two named arms, commands in §11.6**: arm 1 = grep the spy log for `GetCaps Type=1069` and read WARP's own answer; arm 2 = force TRUE in the spy thunk and diff a `logman`/`tracerpt` `DxgKrnl` slice for overlapping `QueuePacket` submits |
-| 16 | Whether the runtime honours a `NOT_SUPPORTED` tier by never calling the corresponding slot | 14.1 | spy (counting stubs record every call WARP receives) |
-| 17 | The oldest `D3D12DDI_SUPPORTED_*` this Windows build accepts | 1.6 | §15.4 |
-| 18 | Whether `pfnFillDDITable`'s `SIZE_T` matches `size_of` of the bindgen'd struct | 2.2 | spy — log both |
+**Route A works** — the runtime honours an app-local `d3d10warp.dll`, no registry change and no
+reboot, which §15.2 had marked UNVERIFIED. **Route B also works** and is required for anything about
+the *Helios* adapter, with one addition §15.2 did not have: after rewriting `UserModeDriverName[3]`
+you must `pnputil /restart-device`, because dxgkrnl uses the path it cached at StartDevice.
 
-⭐ **The spy settles 1–9, 13, 14, 16 and 18 — thirteen of eighteen — in one log file.**
+Headline results, each expanded in place below:
 
-### 15.2 ⚠ The WARP spy proxy
-
-**The idea.** `C:\Windows\System32\d3d10warp.dll` exports `OpenAdapter12` (§1.1) — Microsoft's own
-D3D12 UMD, on this exact Windows build. A shim DLL that forwards to it and logs every call turns
-thirteen undocumented contract questions into one text file, for about a day's work, **with no
-Helios driver change and no reboot**. `DECISIONS.md` H1 calls it "unusually good" mitigation; this
-is the build sheet.
-
-**Where it goes.** `tools/d3d12_spy/` (⛔ not `probe/`, not `host/` — both were retired 2026-08-05
-and must not be re-created). Files:
-
-```
-tools/d3d12_spy/d3d12_spy.cpp     the proxy
-tools/d3d12_spy/d3d12_spy.def     EXPORTS OpenAdapter12  (and OpenAdapter, OpenAdapter10_2 as pass-through)
-tools/d3d12_spy/build.ps1         WinLibs g++ build, matching the other tools/ probes
-```
-
-**How to build it** (WinLibs g++ is what every other `tools/` probe uses — see the build comment at
-`tools/d3d11_triangle.cpp:12-14`):
-
-```powershell
-# win_exec, from Z:\tools\d3d12_spy
-g++ -O2 -shared -static-libgcc -static-libstdc++ `
-    -o C:\Users\Rupansh\d3d12_spy\d3d10warp.dll d3d12_spy.cpp d3d12_spy.def `
-    -I"C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um" `
-    -I"C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared"
-```
-
-⛔ Build to a **local C: path**, never `Z:\` — the 9p/virtio share fails Rust/cargo file IO with
-`OS error 87`, and the same class bites linkers.
-
-**What it does.** In `OpenAdapter12`:
-
-1. **Load the real WARP by explicit full System32 path, then *verify what you got*.** A bare
-   `LoadLibrary("d3d10warp.dll")` from a DLL *named* `d3d10warp.dll` re-enters itself. This is the
-   same class as the ICD's `LoadLibraryA("dxgi.dll")` defect in `DECISIONS.md` P-A — and P-A's
-   resolution (§6.1) says plainly that **neither `LOAD_LIBRARY_SEARCH_SYSTEM32` nor a full path is
-   sufficient on its own**, because the loader's already-loaded check matches on *base name*: a
-   module with that base name already in the process is handed back regardless of how you ask.
-   The only load that is safe is full path **plus** a post-hoc identity check:
-
-   ```c
-   wchar_t sys[MAX_PATH], want[MAX_PATH], got[MAX_PATH];
-   GetSystemDirectoryW(sys, MAX_PATH);                    /* -> %SystemRoot%\System32 */
-   swprintf(want, MAX_PATH, L"%s\\d3d10warp.dll", sys);
-   HMODULE h = LoadLibraryExW(want, nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
-   if (!h) { SPY_REFUSE("warp_load_failed"); return DXGI_ERROR_UNSUPPORTED; }
-   if (!GetModuleFileNameW(h, got, MAX_PATH) || _wcsnicmp(got, sys, wcslen(sys)) != 0) {
-       SPY_REFUSE("warp_not_system32");                    /* named counter, CLAUDE.md rule 2 */
-       log("spy: refusing, d3d10warp.dll resolved to %ls", got);
-       return DXGI_ERROR_UNSUPPORTED;                      /* never 0x887A0020 — §14.3(5) */
-   }
-   ```
-
-   The `GetModuleFileNameW` step is what turns "I loaded myself and every log line is a lie" into a
-   loud refusal with a counter. Apply the identical shape to the ICD's P-A fix
-   (`dxgi.dll` / `d3d11.dll` / `dcomp.dll` in `wsi_win32_vehicle_runtime_init_locked`) — same three
-   lines, same refusal, same reason.
-2. `GetProcAddress(h, "OpenAdapter12")`, call it, let WARP fill `pAdapterFuncs`.
-3. **Copy** WARP's `D3D12DDI_ADAPTERFUNCS_0109` into a static, then overwrite all 8 slots in the
-   runtime's table with logging thunks that call through to the copy.
-4. In the `pfnFillDDITable` thunk: log the parameters, let WARP fill the runtime's buffer, then
-   **snapshot** the filled table and overwrite every slot with a counting thunk that logs
-   `"<TableType>:<slot index> <name>"` on first call and forwards.
-
-**Step 4 is the only part with real difficulty, so here is the mechanism.** 124 + 75 + 7 = 206
-slots, each a *differently typed* `extern "system"` function pointer, and each thunk must recover
-which slot index it is. §7.3(2) forbids hand-writing D3D12 slot signatures, so do not write 206
-prototypes — generate them, and make the generator carry the type from the header.
-
-*The trick: the thunk does not need the slot's real signature.* Every one of these is a `__stdcall`
-(x64: the single Microsoft calling convention) call whose arguments the spy never inspects — it
-logs the slot index and tail-jumps to the snapshot. So one X-macro over the slot list produces a
-naked forwarder per slot, all of them ABI-transparent:
-
-```cpp
-// tools/d3d12_spy/slots_core_0109.inc  -- generated, never hand-edited; see the generator below
-X(  0, pfnCheckFormatSupport)
-X(  1, pfnCheckMultisampleQualityLevels)
-/* ... 124 lines ... */
-
-// tools/d3d12_spy/thunks.h
-static D3D12DDI_DEVICE_FUNCS_CORE_0109 g_core_snapshot;   // WARP's real pointers
-static LONG g_core_hits[124];
-
-#define X(IDX, NAME)                                                              \
-  extern "C" __declspec(naked) void spy_core_##IDX() {                            \
-      __asm__ __volatile__(                                                       \
-          "subq $40, %%rsp\n\t"        /* shadow space + 16B alignment */          \
-          "movl $" #IDX ", %%ecx\n\t"                                             \
-          "call spy_note_core\n\t"     /* logs first hit, bumps g_core_hits[IDX] */\
-          "addq $40, %%rsp\n\t"                                                   \
-          "jmp *%0\n\t"                /* tail-jump: args untouched in RCX..R9,   */\
-          :: "m" (g_core_snapshot.NAME) : );  /* stack args untouched, RAX/XMM0 */ \
-  }
-#include "slots_core_0109.inc"
-#undef X
-```
-
-⛔ The `call spy_note_core` clobbers the volatile argument registers, so `spy_note_core` **must**
-save and restore `RCX/RDX/R8/R9` and `XMM0-3` itself (`push`/`pop` plus a 64-byte XMM save area) —
-or, simpler and safer, make `spy_note_core` a bare `lock incl g_core_hits(,%rcx,4)` with the
-first-hit log deferred to the counter dump at `pfnDestroyDevice`. **Prefer the deferred form**: it
-is four instructions, cannot clobber anything, and the first-call ordering question the spy is
-answering is recoverable from the counter dump plus the per-call ETW timeline anyway.
-
-*The generator* — one command, run on the Linux host against the staged header, so the slot list and
-its order can never drift from the struct being filled:
-
-```bash
-cd /home/rupansh/helios-vgpu
-python3 - <<'EOF' > tools/d3d12_spy/slots_core_0109.inc
-import re
-L=open('tmp/dx12/sdk/d3d12umddi.h',encoding='utf-8',errors='replace').read().split('\n')
-i=next(n for n,l in enumerate(L) if l.startswith('typedef struct D3D12DDI_DEVICE_FUNCS_CORE_0109'))
-n=0
-for l in L[i:]:
-    if l.startswith('}'): break
-    m=re.match(r'\s*(?:PFN\w+|void\*|VOID\*)\s+(\w+);', l)
-    if m: print(f"X({n:3d}, {m.group(1)})"); n+=1
-EOF
-# repeat with COMMAND_LIST_FUNCS_3D_0108 and COMMAND_QUEUE_FUNCS_CORE_0001 -> the other two .inc files
-```
-
-⚠ Regenerate the `.inc` files whenever the SDK pin moves; a stale slot list mislabels every line in
-the log, which is worse than no log. The `wc -l` on each generated file must equal 124 / 75 / 7 —
-assert that in `build.ps1`.
-
-**What to log, in this order of value:**
-
-| Hook | Log line |
+| | |
 |---|---|
-| `pfnGetSupportedVersions` | the `UINT32` count on the first (counting) call, and every `UINT64` returned, in hex |
-| `pfnGetCaps` | `Type` (decimal + symbolic), `DataSize`, `pInfo` (NULL or `*(UINT*)pInfo`), the returned `HRESULT`, and the first 64 bytes of `pData` **after** the call, hex |
-| `pfnGetOptionalDDITables` | count, then every `{tableType, numTables}` |
-| `pfnFillDDITable` | `TableType`, `TableSize` (decimal — **this answers #4 and #18**), the 5th `UINT`, `hRTTable`, `HRESULT` |
-| `pfnCalcPrivateDeviceSize` | `Interface`, `Version`, `Flags`, and the returned `SIZE_T` |
-| `pfnCreateDevice` | `Interface`, `Version`, `Flags`, `NumReserveRanges` and each `{StartAddress, SizeInBytes}`, plus which `p12UMCallbacks` arm is non-NULL |
-| every core / CL / queue slot | first-call marker with the slot's index and name, and a per-slot call counter dumped at `pfnDestroyDevice` |
-| `pfnSetCommandListDDITableCb` (observed via the corelayer pointer WARP is handed) | `hRTCommandList`, `hRTTable` |
+| **Negotiated version** | `D3D12DDI_SUPPORTED_0110`, the newest of the **77** WARP offers (13 of which are D3D11-era tokens). `Interface` = high 32 bits, `Version` = low 32 — **confirmed, not inferred** (§1.5) |
+| **⭐ The version floor** | **`_0040` is accepted by this Windows build and a triangle presents on it** — 96 core + 58 CL slots instead of 124 + 75 (§1.6, §15.4) |
+| **⭐ Shader bytecode** | the runtime hands `pfnCreateShader` a **raw stream**, `dword[0]=(type<<16)|(major<<4)|minor`, `dword[1]=length in dwords`, `dword[2]='DXIL'` — **never a DXBC container**, and it converts SM 5.1 DXBC to DXIL first (§12.2) |
+| **⭐ Caps are one contract** | cross-cap consistency is enforced **at retail**, at `D3D12CreateDevice`, `0x887A0020` + an English reason on ETW `Microsoft-Windows-Direct3D12`. Out-of-range tiers are **clamped silently**; legal answers propagate verbatim to the app (§11.5) |
+| **The DXGI table** | `D3D12DDI_TABLE_TYPE_DXGI` is **never requested** — not by a flip-model swapchain, not across 20 presents (§2.3) |
+| **WDDM level** | the runtime does **not** gate the DDI version on the adapter's WDDM level: forced `_0110` negotiated cleanly on the WDDM 2.1 Helios adapter (§11.7) |
+| **Coverage** | a triangle + present touches **70 of 206** driver slots (47 core, 22 CL, 1 queue, 0 DXGI) |
 
-Log destination: `C:\ProgramData\Helios\d3d12_spy-<pid>.log`, appended, flushed per line. That
-directory already exists and is writable from both sessions (the DXVK logs live there). ⚠ It
-contains a junction loop — never `-Recurse` it.
+### 15.1 The numbered list — with the `D12-G5` verdicts
 
-**How to register it — two routes, pick by risk appetite.**
+The § reference is where it is discussed; the settler is in §15.2 unless stated.
+**8 answered outright, 6 partial, 4 still UNVERIFIED with the reason stated.**
 
-*Route A — app-local, cheapest, no driver change.* Put the proxy `d3d10warp.dll` next to a test
-executable and reach WARP through `IDXGIFactory4::EnumWarpAdapter` + `D3D12CreateDevice`.
-⚠ **UNVERIFIED whether the loader honours an app-local `d3d10warp.dll`** — D3D12Core may resolve it
-with `LOAD_LIBRARY_SEARCH_SYSTEM32` exactly as this proxy is told to. **Check before trusting a null
-result**: run the test under WinDbg / Process Explorer and confirm which `d3d10warp.dll` path is
-mapped, or simply confirm the log file appears. If it does not, use Route B.
+| # | Question | § | Verdict (`D12-G5`, 2026-08-05) |
+|---|---|---|---|
+| 1 | Which caps types the runtime demands, in what order, and what a refusal does | 11.2 | ✅ **23 of the 43 asked**, order in §11.2; a failing HRESULT is tolerated (WARP itself fails 1074 and 1080 and the device still creates) |
+| 2 | Whether any DDI slot may legally be NULL | 14.1 | ◑ **At least four may**: WARP leaves `core[121] pfnImplicitShaderCacheControl`, `cl[69] pfnOmSetAlphaBlendFactor`, `queue[1] pfnUnused`, `queue[2] pfnUnused2` NULL and works. The other 202 need a null-one-at-a-time arm |
+| 3 | The meaning of `pfnFillDDITable`'s 5th `UINT` and of `D3D12DDI_TABLE_REQUEST::numTables` | 2.2 | ◑ **The 5th `UINT` is the command-list table INDEX** — the runtime fills type 1 twice at device creation, indices 0 and 1, with distinct `hRTTable`. `numTables` still unexercised: `pfnGetOptionalDDITables` answered 0 |
+| 4 | Which `DXGI*_DDI_BASE_FUNCTIONS` shape table type 3 wants | 2.3 | ✅ **Moot — table type 3 is never requested at all** |
+| 5 | The `Interface` / `Version` split of a `D3D12DDI_SUPPORTED_*` token | 1.5 | ✅ **high 32 / low 32**, matched bit-for-bit against the driver's own list |
+| 6 | The DDI-version → Windows-release mapping | 1.5 | ◑ **26100.8875 negotiates `_0110` and accepts down to `_0040`.** One build does not give the table |
+| 7 | Where recording memory comes from — `pfnSubmitCommandCb` vs `pfnRenderCb` | 8.2 | ⛔ **UNVERIFIED and the spy structurally cannot settle it**: WARP is a software rasterizer and called **none** of the `pKTCallbacks` kernel thunks in any run. Settler unchanged — ETW `DxgKrnl` `DmaPacket`/`QueuePacket` against a hardware driver, or G7/G8 on Helios |
+| 8 | Whether `pfnGetSupportedVersions` is really a two-call query | 1.3 | ✅ **Yes** — count with `pVersions == NULL`, then fill |
+| 9 | How a driver obtains a second `D3D12DDI_HRTTABLE` for `pfnSetCommandListDDITableCb` | 9.3 | ✅ **The runtime hands both out at device creation** (`hRTTable` `0x3E0` and `0x638`); WARP then calls `pfnSetCommandListDDITableCb(hRTCommandList, 0x3E0)` on every command-list create — observed live through the wrapped corelayer table |
+| 10 | Whether the runtime accepts GPU VAs the driver never got from the kernel | 9.7 | ⛔ **UNVERIFIED** — needs a driver that fabricates a VA; the spy only forwards WARP's. Settler unchanged |
+| 11 | Whether a monitored fence advances with no GPU-side write, for a **D3D12-shaped** fence | 10.5 | ⛔ **UNVERIFIED** — out of scope for the spy; still the G-fence probe |
+| 12 | Whether the runtime, not the driver, performs the kernel signal/wait for `pfnSignalFence` | 10.5 | ◑ **Evidence for "the runtime does"**: across 20 frames of `ID3D12CommandQueue::Signal` + `SetEventOnCompletion`, `pfnSignalFence`/`pfnWaitForFence` were **never called** while `pfnCreateFence` was. WARP is software-scheduled — confirm on hardware |
+| 13 | Whether the runtime cross-validates the caps set as ONE contract | 11.5 | ✅ **Yes, at retail** — two worked failures with the runtime's own English strings, §11.5 |
+| 14 | Whether the D3D12 runtime ever passes a raw DXIL bitstream instead of a DXBC container | 12.2 | ✅ **It ALWAYS does**, and it converts DXBC to DXIL first — §12.2 |
+| 15 | The exact contract of `D3D12DDICAPS_TYPE_EXECUTECOMMANDLISTS_PARALLELISM` | 11.6 | ◑ **Arm 1 run and it came back empty: the runtime never asks for 1069** on this build, in any workload. Arm 2 (force TRUE, diff a `QueuePacket` slice) is now the only route |
+| 16 | Whether the runtime honours a `NOT_SUPPORTED` tier by never calling the corresponding slot | 14.1 | ◑ **Weak support only**: `RenderPassTier = 0` and no render-pass slot was called — but no workload asked for a render pass, so this does not separate suppression from disinterest |
+| 17 | The oldest `D3D12DDI_SUPPORTED_*` this Windows build accepts | 1.6 | ✅ **`_0040`** — and a triangle presents on it. §15.4 |
+| 18 | Whether `pfnFillDDITable`'s `SIZE_T` matches `size_of` of the bindgen'd struct | 2.2 | ✅ **At `_0110`/`_0109`, exactly** (992 / 600 / 56). ⛔ And it is version-dependent — `_0089` → 976/552, `_0040` → 768/464. Honour the argument |
 
-*Route B — registry, definitive, and gated.* Point `UserModeDriverName[3]` at the proxy. The proxy
-receives the **Helios** adapter handle and callbacks and forwards them to WARP's `OpenAdapter12`;
-whether WARP can then actually render on a foreign adapter does not matter — **the log up to the
-first failure already answers negotiation, table sizes and the caps sequence.**
+### 15.2 ✅ The WARP spy proxy — BUILT AND RUN, `tools/d3d12_spy/`
 
-⚠⚠ **dwm.exe calls `OpenAdapter12` in production** (`DECISIONS.md` §7.13). Route B changes the
-compositor's behaviour on the next device create. Mitigations, all three required:
-- have the proxy read `HKLM\SOFTWARE\Helios!UmdD3D12Spy` once at load and return
-  `DXGI_ERROR_UNSUPPORTED` immediately unless it is 1 — same shape as D11;
-- set the value, run the probe, clear the value, in one scripted sequence;
-- verify the desktop is alive afterwards with `helios_paintcap` → `Z:\tmp\screen_copy.png` before
-  declaring the experiment done. Log lines are not frames.
+**The idea.** `C:\Windows\System32\d3d10warp.dll` exports `OpenAdapter12` (§1.1): Microsoft's own
+D3D12 UMD, on this exact Windows build. A shim that forwards to it and logs turns the undocumented
+contract into one text file, with no Helios driver change and no reboot. `DECISIONS.md` H1 called it
+"unusually good" mitigation; it delivered — see §15.0 and `tmp/dx12/gates/G5/answers.md`.
 
-**How to run it.** ⛔ **Session 1, via a cloned scheduled task** — a windowed D3D12 sample launched
-from `win_exec` lands in **session 0**, which has no desktop, and will fake a driver regression
-(memory `lease-gate-falsified-60th.md`). Console-only device-creation probes are fine from
-`win_exec`, but anything that presents is not.
+**Where it is.** `tools/d3d12_spy/` (⛔ not `probe/`, not `host/` — both retired 2026-08-05):
+
+```
+gen_slots.py          generator: reads tmp/dx12/sdk/d3d12umddi.h, writes everything below
+slots_{core_0109,cl_0108,queue_0001,adapter_0109,dxgi}.inc   X(index, name) slot lists
+caps_types.inc  table_types.inc                              CAP(value,name,deprecated) / TBL()
+spy_thunks.asm        206 + 32 generated ABI-transparent forwarders (ml64)
+d3d12_warp_spy.cpp    the proxy
+d3d12_spy.def         EXPORTS OpenAdapter12, OpenAdapter, OpenAdapter10_2
+spy_workload.cpp      the four workloads, one exe with a mode argument
+spy_workload.hlsl     the triangle, compilable as both vs_5_1 (DXBC) and vs_6_0 (DXIL)
+build.ps1             cl + ml64 to a LOCAL C: path, with the count assertions
+```
+
+⚠ **Two corrections to the recipe this section used to give, both of which simply do not build.**
+
+1. **The toolchain is `cl` + `ml64`, not WinLibs g++.** The old sheet specified
+   `__declspec(naked)` + GCC inline asm: `naked` is MSVC syntax, GCC has no `naked` attribute on
+   x86-64, and the WDK headers want `cl`. `GATES.md` §4.6's command block already said `cl`.
+2. **`d3d12umddi.h` does not compile out of the box in user mode.** It pulls in `d3dkmddi.h`, which
+   uses `NTSTATUS`, which the user-mode `windows.h` does not define. Use the same incantation the
+   D3D11 UMD's bindgen wrapper does (`umd/bindgen/d3d10umddi_wrapper.h:14-18`):
+   `#ifndef _NTDEF_ typedef LONG NTSTATUS, *PNTSTATUS; #endif` before the include.
+
+⛔ Build to a **local C: path**, never `Z:\` — the 9p/virtio share fails file IO with `OS error 87`.
+
+**Loading the real WARP.** ⚠ A full-path `LoadLibrary` of `d3d10warp.dll` from a DLL *named*
+`d3d10warp.dll` returns **itself**: the loader's already-loaded check matches on base name, so
+neither `LOAD_LIBRARY_SEARCH_SYSTEM32` nor a full path is sufficient (`DECISIONS.md` P-A, §6.1). The
+fix that works is a **copy under a different base name**: `build.ps1` copies System32's to
+`d3d10warp_real.dll` beside the proxy and asserts the SHA-256 matches; the proxy loads that by full
+path and then verifies with `GetModuleFileNameW` that it got the module it asked for, refusing with a
+named counter (`warp_load_failed` / `warp_wrong_path`) and `DXGI_ERROR_UNSUPPORTED` if not.
+
+**The thunk mechanism, as built.** 124 + 75 + 7 = 206 slots, each a differently typed
+`extern "system"` pointer, and §7.3(2) forbids hand-writing D3D12 slot signatures. *The thunk does
+not need the signature.* `gen_slots.py` emits one eight-instruction MASM forwarder per slot:
+
+```asm
+spy_core_5 PROC
+    lock inc dword ptr [g_spy_core_hits + 20]     ; per-slot total, never saturates
+    mov     r11d, 1
+    lock xadd dword ptr [g_spy_trace_idx], r11d   ; global event order
+    cmp     r11d, 00100000h
+    jae     spy_core_5_skip                       ; keep the FIRST 1Mi events
+    lea     r10, [g_spy_trace]
+    mov     dword ptr [r10+r11*4], 00000005h      ; (tableTag<<24)|slotIndex
+spy_core_5_skip:
+    jmp     qword ptr [g_spy_core_snapshot + 40]  ; tail-jump to WARP's real pointer
+spy_core_5 ENDP
+```
+
+It touches only **R10, R11 and the flags** — all volatile in the Microsoft x64 ABI, none of them an
+argument register — and uses **no stack at all**, so the callee sees exactly the RSP, return address
+and shadow space of a direct call. Arguments in RCX/RDX/R8/R9, XMM0-3 and on the stack pass through
+untouched, and RAX/XMM0 return untouched. A handful of slots that carry an answer this gate wanted
+(the eight `pfnCreate*Shader` + `pfnCalcPrivateShaderSize`, the two descriptor-handle getters and
+`pfnGetDescriptorSizeInBytes`, `pfnCalcPrivateHeapAndResourceSizes`, `pfnCreateHeapAndResource`,
+`pfnCreateRootSignature`, and `cl[19] pfnPresent`) additionally get a **typed** C++ hook installed
+over the generic one, calling through the real header typedef.
+
+⛔ **Preserve NULL slots.** WARP leaves four of the 206 NULL and the runtime may test a slot for NULL
+to detect an unsupported feature; replacing one with a thunk answers "supported" on the driver's
+behalf. The NULL set is also the data for §15.1 #2.
+
+⚠ **Regenerate the `.inc` files whenever the SDK pin moves** — a stale slot list mislabels every line
+in the log, which is worse than no log. `build.ps1` asserts 124 / 75 / 7 / 8 / 32 / 43 / 25 before
+compiling. And note that the names are pinned to `_0109`/`_0108`: in a **forced-old-version** run
+(§15.4) the table is a different shape and only the counts and sizes are trustworthy.
+
+**What it logs.** Adapter-table calls with full arguments; every `pfnGetCaps` `Type`/`DataSize`/
+`pInfo`/`HRESULT` plus the first 64 bytes of `pData` after the call, with `D3D12_OPTIONS` and
+`SHADER_MODELS` decoded field by field; every `pfnFillDDITable` `(TableType, TableSize, 5th UINT,
+hRTTable)`; `pfnCreateDevice`'s `Interface`/`Version` checked against the token list; all 18
+corelayer callbacks, three of them wrapped; per-slot hit counts; and a global ordered event ring in
+which the log lines themselves appear as markers, so the two orderings merge exactly.
+
+**Mutation arms** (`HELIOS_D12SPY_MUTATE`, off by default, each logged when it fires):
+`range` (an out-of-range tier), `tier` + `HELIOS_D12SPY_TIERVAL` (a legal one — the control that
+separates "clamped" from "ignored"), `cross` (raytracing tier vs a clamped shader-model list),
+`sm65`, `capfail` (fail one cap), `forcever` + `HELIOS_D12SPY_VER` (§15.4's floor probe).
+
+⛔ **Three traps in the mutation arms, each of which produced a confident wrong answer first:**
+1. Forcing `pfnGetSupportedVersions`' **COUNT** answer down makes WARP's own FILL hit an undersized
+   buffer and return `ERROR_INSUFFICIENT_BUFFER` (0x8007007A) — indistinguishable from the runtime
+   rejecting the token. Edit only the FILL answer, on the way out.
+2. **Not** calling WARP at all crashes at `0xC0000005` a moment later: `pfnGetSupportedVersions` is
+   where WARP initialises the state `pfnCalcPrivateDeviceSize` needs.
+3. The proxy's own gate (below) returns `DXGI_ERROR_UNSUPPORTED` for **everything** when the knob is
+   absent. Four "the runtime refused this token" results were the spy refusing itself. **Assert the
+   knob in the same command that runs the arm.**
+
+**How to register it — both routes work, and which you need depends on the adapter.**
+
+*Route A — app-local, no registry change, no reboot.* Put the proxy `d3d10warp.dll` beside the test
+exe and reach WARP through `IDXGIFactory4::EnumWarpAdapter`. ✅ **Verified: the runtime honours it.**
+`(Get-Process …).Modules` shows both `d3d10warp.dll` and `d3d10warp_real.dll` resolving to the app
+directory. This is the route for everything about the *runtime's* behaviour.
+⚠ **Check the module list before trusting a null result** — and check the log with
+`Get-ChildItem 'C:\ProgramData\Helios' -Filter 'd3d12_spy-*.log' -File`, **never** with a wildcard
+inside the path: that directory contains a junction loop and the wildcard form silently returns
+nothing. Two "the proxy was never loaded" observations here were that glob, not a null result.
+
+*Route B — registry, and the only way to reach the Helios adapter.* Point `UserModeDriverName[3]`
+(index 3 of the four-entry `REG_MULTI_SZ`) at the proxy under a **different base name**
+(`helios_umd12_spy.dll`, same bytes) and then **`pnputil /restart-device`** — without the restart the
+runtime keeps using the path dxgkrnl cached at StartDevice and the proxy is never loaded. The proxy
+receives the *Helios* adapter handle and callbacks and forwards them to WARP.
+
+⚠⚠ **dwm.exe calls `OpenAdapter12` in production** (`DECISIONS.md` §7.13). Route B's gate, all of it
+required and all of it default-refuse:
+- `HKLM\SOFTWARE\Helios!UmdD3D12Spy` must be 1, read once per process — the D11 shape;
+- **and** the process must be the named workload (`HELIOS_D12SPY_PROC`, default `spy_workload.exe`),
+  so that even with the knob on, dwm's `OpenAdapter12` gets `DXGI_ERROR_UNSUPPORTED` — *bit-identical
+  to what `helios_umd.dll` returns today* (`umd/src/adapter.rs:177-189`). The compositor cannot be
+  changed by the experiment;
+- set the knob, run, clear the knob, restore `UserModeDriverName`, `pnputil /restart-device` again,
+  and verify the desktop with `helios_paintcap` → `Z:\tmp\screen_copy.png` before believing anything.
+  Done, and the desktop was alive and composited afterwards.
+
+**How to run it.** ⛔ **Session 1, via a cloned scheduled task**, for anything with a window — a
+windowed D3D12 sample launched from `win_exec` lands in session 0, which has no desktop, and fakes a
+driver regression (memory `lease-gate-falsified-60th.md`). Console-only device probes are fine from
+`win_exec`.
 
 ```powershell
-# create once
-schtasks /create /tn helios_d3d12_spy /tr "C:\Users\Rupansh\d3d12_spy\d3d12_hello.exe" /sc once /st 00:00 /it /rl highest
-# run
-schtasks /run /tn helios_d3d12_spy
+schtasks /create /tn helios_d12g5_window /tr "C:\Users\Rupansh\d12g5\run-window.cmd" /sc once /st 00:00 /it /rl highest /f
+schtasks /run /tn helios_d12g5_window
 ```
 
-**Workload to drive it with, in order.** ⚠ Two of these are files you copy and two are ~60-line
-programs you write; the doc used to blur that, and (a)/(b) are the two that settle eight of the
-eighteen unknowns, so they are specified concretely here.
+(The `.cmd` wrapper exists because a scheduled task does not inherit `HELIOS_D12SPY_*` from the
+creating shell.)
 
-**(a) `tools/d3d12_spy/probe_a_device.cpp` — `D3D12CreateDevice` alone.** Settles #1, #5, #6, #8,
-#18. Console-only, so it may run straight from `win_exec`. The whole program:
+**The four workloads** are one binary, `spy_workload.cpp`, with a mode argument:
 
-```cpp
-// build: g++ -O2 -o C:\Users\Rupansh\d3d12_spy\probe_a.exe probe_a_device.cpp -ld3d12 -ldxgi
-//        (same WinLibs g++ and the same two -I paths as the spy build above)
-#include <d3d12.h>
-#include <dxgi1_4.h>
-#include <cstdio>
-int main() {
-    IDXGIFactory4 *f = nullptr; IDXGIAdapter1 *a = nullptr; ID3D12Device *d = nullptr;
-    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&f)))) { printf("factory failed\n"); return 1; }
-    // WARP arm (Route A). For the Helios arm (Route B) enumerate adapter 0 instead.
-    if (FAILED(f->EnumWarpAdapter(IID_PPV_ARGS(&a))))  { printf("warp enum failed\n"); return 2; }
-    HRESULT hr = D3D12CreateDevice(a, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&d));
-    printf("D3D12CreateDevice -> 0x%08lx\n", (unsigned long)hr);
-    if (d) d->Release(); if (a) a->Release(); if (f) f->Release();
-    return SUCCEEDED(hr) ? 0 : 3;
-}
-```
+| mode | what | settles |
+|---|---|---|
+| `device` | `D3D12CreateDevice` and nothing else | 1, 5, 6, 8, 18 |
+| `queue` | + command queue, pool/recorder/list, `Close` | 3, 9 |
+| `window` | + swapchain, clear, present — **no shaders at all** | 2, 4, 16 |
+| `triangle` | + a draw with **two** pipelines: SM 6.0 DXIL (dxc, build time) and SM 5.1 DXBC (`D3DCompile`, run time) | 14 |
 
-**(b) `tools/d3d12_spy/probe_b_queue.cpp` — (a) plus the command-object graph.** Settles #3, #9.
-Also console-only. Append to (a), before the releases:
+⚠ **Why not `dx-samples-research-only/.../D3D12HelloWorld`, which `GATES.md` §4.6 names.** That
+sample carries the Agility SDK exports — `D3D12HelloWindow.cpp:15-16`, `D3D12SDKVersion = 618` and
+`D3D12SDKPath = ".\\D3D12\\"` — so whether it runs against **this Windows build's**
+`D3D12Core.dll` or a NuGet one depends on whether a `D3D12\` directory happens to sit beside the exe.
+This gate measures the shipping runtime; a silent runtime substitution would invalidate every line.
+The samples also need `include/d3dx12/d3dx12.h` from `Microsoft.Direct3D.D3D12` 1.618.3, which is not
+vendored here. The `triangle` mode's two-pipelines-in-one-process shape is also strictly better for
+#14 than `HelloTriangle`: a single shader model cannot show a conversion.
 
-```cpp
-    D3D12_COMMAND_QUEUE_DESC qd = {};            // DIRECT, priority NORMAL, no flags, node 0
-    ID3D12CommandQueue *q = nullptr; ID3D12CommandAllocator *al = nullptr;
-    ID3D12GraphicsCommandList *cl = nullptr;
-    printf("CreateCommandQueue     -> 0x%08lx\n", (unsigned long)d->CreateCommandQueue(&qd, IID_PPV_ARGS(&q)));
-    printf("CreateCommandAllocator -> 0x%08lx\n", (unsigned long)d->CreateCommandAllocator(
-                                       D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&al)));
-    printf("CreateCommandList      -> 0x%08lx\n", (unsigned long)d->CreateCommandList(
-                                       0, D3D12_COMMAND_LIST_TYPE_DIRECT, al, nullptr, IID_PPV_ARGS(&cl)));
-    printf("Close                  -> 0x%08lx\n", (unsigned long)cl->Close());
-```
-
-That sequence is chosen precisely because it exercises `pfnCalcPrivateCommandQueueSize` /
-`pfnCreateCommandQueue` (→ `pfnCreateContextCb`, §6.4), the pool + recorder + list triple of §8.1,
-and `pfnCloseCommandList` — i.e. every DDI object whose *table identity* question (#9,
-`pfnSetCommandListDDITableCb`) the spy is there to answer — with no shader, no PSO, no swapchain and
-no window.
-
-**(c) `D3D12HelloWorld/src/HelloWindow`** (clear + present, **no shaders at all**) — settles #2, #4,
-#7, #16. **(d) `HelloTriangle`** — settles #14. (c) and (d) are existing sources under
-`dx-samples-research-only/Samples/Desktop/D3D12HelloWorld/src/` — copy them; both present, so both
-must run in **session 1** via the scheduled task above.
-
-⚠ `D3D12HelloTriangle` builds with `dxc -Tvs_6_0 / -Tps_6_0` and loads precompiled `.cso`
-(`…/D3D12HelloWorld/src/HelloTriangle/D3D12HelloTriangle.vcxproj:147-150`,
-`D3D12HelloTriangle.cpp:161-162`), so it needs SM 6.0, not 5.1. **178 of the 180 shader-compile
-steps in that sample tree use `dxc -T*_6_x`** — re-counted over
-`dx-samples-research-only/**/*.vcxproj`: 178 `dxc.exe … -T` invocations, of which **zero** target
-anything but `_6_x`; the two `fxc.exe /T*_5_0` steps are both in `D3D12On7`. **"FL 11_0 + Tier 1 +
-SM 5.1" is a valid DDI floor but not a runnable milestone** — the first meaningful bring-up target
-is **FL 11_0 + SM 6.0**.
+⚠ `D3D12HelloTriangle` and its siblings compile with `dxc -T*_6_x`: **178 of the 180** shader-compile
+steps across `dx-samples-research-only/**/*.vcxproj` target `_6_x` and **zero** target anything else;
+the two `fxc /T*_5_0` steps are both in `D3D12On7`. **"FL 11_0 + Tier 1 + SM 5.1" is a valid DDI
+floor but not a runnable milestone** — the first meaningful bring-up target is **FL 11_0 + SM 6.0**.
 
 ### 15.3 The second source: `D3D12Core.dll` strings
 
@@ -3415,23 +3619,40 @@ grep -E 'Driver|driver|DDI' tmp/dx12/research/d3d12core-strings.txt \
 ⚠ Line numbers in this document (`strings:NN`) are into the **committed 270-line file**. Regenerating
 it against a different `D3D12Core.dll` build renumbers everything.
 
-### 15.4 The floor probe — how old a DDI version will this Windows accept?
+### 15.4 ✅ The floor probe — RUN, and `_0040` is accepted
 
-`research/R2` §5.4's experiment, restated with the R908 guard. Implement **only**
-`OpenAdapter12` + `pfnGetSupportedVersions` returning a single old token
-(`D3D12DDI_SUPPORTED_0040` = `0x000C0028_00000000`) + `pfnGetCaps` refusing everything, call
-`D3D12CreateDevice`, and read the runtime's reason from ETW (`Microsoft-Windows-DxgKrnl`
-all-keywords → tracerpt → grep `AzureTriage`; recipe in `ROADMAP.md`) plus any
-`Failed to find matching DDI versions` (strings:167).
+`research/R2` §5.4's experiment. ⭐ **It needed no Helios code at all**: the spy's `forcever` arm
+replaces `pfnGetSupportedVersions`' answer with a single token, so the version floor was measured
+against WARP with `OpenAdapter12` still refusing in `helios_umd.dll`. The R908 guard never came into
+play — which is the better shape, and it should stay that way.
 
-**Value:** if `_0040` is accepted, the mandatory surface shrinks by roughly a third (96 core + 58 CL
-instead of 124 + 75) and state objects, mesh shaders, enhanced barriers, work graphs and sampler
-feedback leave the first milestone entirely. That is the cheapest way to size the whole project.
+`HELIOS_D12SPY_MUTATE=forcever HELIOS_D12SPY_VER=<token>`, `spy_workload device --warp`:
 
-⚠ **This experiment makes `OpenAdapter12`'s body reachable**, so `DECISIONS.md` §7.1 binds: it must
-land in `helios_umd12.dll` behind `UmdD3D12` (D11), never by editing
-`umd/src/adapter.rs:178`, and the honest-caps refusal must be in the same commit as the reachable
-body.
+| forced token | `pfnCalcPrivateDeviceSize` | CORE `TableSize` | CL `TableSize` | `D3D12CreateDevice` |
+|---|---:|---:|---:|---|
+| `_0110` `0x000c0050_006e0000` | 4016 | **992** (124 slots) | **600** (75) | ✅ `S_OK` |
+| `_0109` `0x000c0050_006d0000` | 4016 | **992** (124) | **600** (75) | ✅ `S_OK` |
+| `_0089` `0x000c0050_00090000` | — | **976** (122) | **552** (69) | ✅ `S_OK` |
+| `_0040` `0x000c0028_00000000` | — | **768** (96) | **464** (58) | ✅ `S_OK` |
+
+⭐ **`D3D12DDI_SUPPORTED_0040` is accepted by this Windows build (26100.8875), and `research/R2`
+§5.4's predicted "96 core + 58 CL" is exactly right.** The baseline surface at `_0040` is
+**96 + 58 + 7 + 8 = 169 slots instead of 214**, and state objects, mesh shaders, enhanced barriers,
+work graphs and sampler feedback leave the first milestone entirely.
+
+**And it is not merely a device that creates:** the `triangle` workload ran **ten frames, 0
+failures** at `_0040` — same DXIL shader encoding, same `pfnPresent` on the command-list table
+(`tmp/dx12/gates/G5/F40-triangle.log`).
+
+⚠ **This does not decide §1.6 on its own.** `_0040` is smaller but it is also the *old* object model:
+it predates the pool + recorder split and carries the retired command-**allocator** family. The
+decision at P3 is between "169 slots of an older shape" and "214 of the shape a 26100-era runtime
+asks for first"; what §15.4 removes is the *uncertainty*, not the choice. ⛔ Nor does the table above
+mean the runtime rejects nothing: the caps gauntlet (§11.5) is unchanged at every version and is
+enforced at retail.
+
+⚠ The traps that made this arm lie three times before it told the truth are in §15.2's mutation-arm
+list; two of them return HRESULTs that read exactly like the runtime rejecting the token.
 
 ---
 
