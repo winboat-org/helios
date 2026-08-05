@@ -3429,6 +3429,15 @@ root-caused.**
   `ff14979` (WIP, un-deployed source; the all-count MSAA-log build was not
   installed). Probe: `tools/d3d11_fl_probe.cpp`, schtasks `helios_flprobe`,
   session 1 (session-0 win_exec fails all levels for a context reason, not FL).
+  ✅ **The owner directive's READ half is DONE, 2026-08-05** — §19.2.5 *Required
+  Multisample Support*: 1x/4x/8x required with standard patterns, **4x for ALL**
+  output formats (so this entry's "does NOT exempt 96-bit R32G32B32" was right),
+  **8x only below 128 bits per sample**, and *"Other MSAA counts and patterns are
+  optional"*. ⇒ Helios meets the first two and **over-reports two**: 8x on
+  128-bit formats, and 2x/16x which are not required at all. ⛔ Not changed in
+  code — the residual rejection above is still UNVERIFIED and narrowing could
+  move which format/count first trips it. Full table + the decision that remains:
+  `CONFORMANCE.md` §4(a) and backlog **C6**.
 
 **31st session (2026-07-07) — Fire Strike launch blocker moved past FL11:
 legacy DXGI output mode-list fails on the IddCx logical output.**
