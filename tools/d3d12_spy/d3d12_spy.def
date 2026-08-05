@@ -1,0 +1,7 @@
+; The three D3D UMD entry points d3d10warp.dll exports (dumpbin /exports, verified on
+; win11 10.0.26100.8875). OpenAdapter12 is the one this proxy is for; the other two are
+; pass-throughs so an app-local copy does not break D3D10/11 on WARP.
+EXPORTS
+    OpenAdapter12
+    OpenAdapter
+    OpenAdapter10_2
