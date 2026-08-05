@@ -898,7 +898,32 @@ and the entry point, in `bridge_guard` and mirroring
    check into construction so a `BridgeDevice12` that exists is always usable
    (`umd/src/bridge.rs:451-458`).
 
-### 7.4 ⚠ The change required in `vkd3d-proton-helios`
+### 7.4 ✅ The change required in `vkd3d-proton-helios` — LANDED 2026-08-05 (`fc35d37d`)
+
+**Status:** on branch `helios` of `github.com/rupansh/vkd3d-proton`, exactly as specified below:
+`libs/d3d12core/helios_entry.c`, `libs/d3d12core/helios_vkd3d.def`, and the
+`shared_library('helios_vkd3d', …)` target appended to `libs/d3d12core/meson.build`. Verified:
+
+```
+$ x86_64-w64-mingw32-objdump -p tmp/dx12/build/vkd3d-win64/libs/d3d12core/helios_vkd3d.dll
+    [ 0] D3D12GetInterface   [ 1] D3D12SDKVersion
+    [ 2] helios_vkd3d_create_device   [ 3] helios_vkd3d_serialize_root_signature
+```
+
+and both are exercised end to end by `D12-G1` (`tools/d3d12_bridge_probe.cpp`, 28 steps, 0 failures).
+
+⛔ **One correction to the sketch below, and it is load-bearing:** `include/vkd3d.h:68` claims that a
+NULL `pfn_vkGetInstanceProcAddr` makes libvkd3d load libvulkan itself. **It does not** —
+`vkd3d_init_vk_global_procs` (`libs/vkd3d/device.c:461-468`) returns `E_INVALIDARG` for NULL. The
+`...` in the sketch below therefore has to include the module load: `helios_entry.c` mirrors
+`load_modules_once` (`libs/d3d12core/main.c:319-364`) — `LoadLibraryA("winevulkan.dll")` then
+`"vulkan-1.dll"`, `GetProcAddress("vkGetInstanceProcAddr")`, behind a `pthread_once` — minus the
+wineopenxr/openvr half, which only supplies VR instance extensions a display driver has no use for.
+The instance/device extension lists are otherwise copied verbatim from `d3d12core`
+(`main.c:574-593`, `:659-670`) so the device this export builds is configured identically to the one
+vkd3d's own conformance suite builds; that equivalence is what makes G1 predictive of G9.
+
+---
 
 **vkd3d exports nothing usable today.** `libs/d3d12core/d3d12core.def` is exactly:
 
@@ -1681,7 +1706,7 @@ and must each be proven neutral; S0, S3 and S4 touch no shipped binary at all.**
 | Stage | Content | Proof the D3D11 path is unharmed | Gates |
 |---|---|---|---|
 | **S0** | `git submodule update --init --recursive` in `vkd3d-proton-helios` (§8.2); **build vkd3d with the mingw cross file on the Linux host** — `meson setup --cross-file build-win64.txt --buildtype release -Denable_tests=true -Denable_extras=true tmp/dx12/build/vkd3d-win64 && ninja -C …` (§8.3, and `GATES.md` §4.1 verbatim); fix the `/XD vkd3d-proton` entry in `tools/win-mcp/src/main.rs:576` and `:843`. ⚠ **No VM toolchain bring-up and no `win_vkd3d` at this stage** — the whole cross toolchain is already installed on the host, and the artifacts reach the VM by `robocopy` | **No Helios binary is touched.** Success = `libs/d3d12core/d3d12core.dll`, `libs/d3d12/d3d12.dll`, `tests/d3d12.exe`, `demos/{triangle,gears}.exe` exist and are non-empty, hashed into `tmp/dx12/gates/G0/sha256sums.txt` | **G0** |
-| **S0c** | **The vkd3d fork change (§7.4), which nothing else assigns.** Three parts, in this order: (1) wire the fork as a push remote — `.gitmodules` names `https://github.com/rupansh/vkd3d-proton` while the checkout's `origin` is `HansKristian-Work/vkd3d-proton` via the `github-rupansh` SSH alias, so `git -C vkd3d-proton-helios remote add helios <fork>` first and push there, never to `origin` (§8.2); (2) commit `libs/d3d12core/helios_entry.c` + `libs/d3d12core/helios_vkd3d.def` + the `helios_vkd3d_lib` target in `libs/d3d12core/meson.build`; (3) rebuild and confirm the two exports. ⚠ Also read the four licence files the S0 submodule init just made readable and produce §7.4's component table (UNVERIFIED-10) | No Helios binary is touched; the change is entirely inside the pinned submodule. Success = `x86_64-w64-mingw32-objdump -p tmp/dx12/build/vkd3d-win64/libs/d3d12core/helios_vkd3d.dll \| grep -E 'helios_vkd3d_(create_device\|serialize_root_signature)'` prints **both**, and the commit is on the fork remote | **G0** |
+| **S0c** ✅ **DONE 2026-08-05** (`fc35d37d` exports, `e571d71a` the Windows-bash test-runner fix; both pushed to remote `helios`) | **The vkd3d fork change (§7.4), which nothing else assigns.** Three parts, in this order: (1) wire the fork as a push remote — `.gitmodules` names `https://github.com/rupansh/vkd3d-proton` while the checkout's `origin` is `HansKristian-Work/vkd3d-proton` via the `github-rupansh` SSH alias, so `git -C vkd3d-proton-helios remote add helios <fork>` first and push there, never to `origin` (§8.2); (2) commit `libs/d3d12core/helios_entry.c` + `libs/d3d12core/helios_vkd3d.def` + the `helios_vkd3d_lib` target in `libs/d3d12core/meson.build`; (3) rebuild and confirm the two exports. ⚠ Also read the four licence files the S0 submodule init just made readable and produce §7.4's component table (UNVERIFIED-10) | No Helios binary is touched; the change is entirely inside the pinned submodule. Success = `x86_64-w64-mingw32-objdump -p tmp/dx12/build/vkd3d-win64/libs/d3d12core/helios_vkd3d.dll \| grep -E 'helios_vkd3d_(create_device\|serialize_root_signature)'` prints **both**, and the commit is on the fork remote | **G0** |
 | **S0b** | **Headless engine validation** (`DECISIONS.md` D2 — ⛔ *not* an app-local arm; that framing is retired). Write `tools/d3d12_bridge_probe.cpp`: `LoadLibrary("helios_vkd3d.dll")` → `helios_vkd3d_create_device` → clear + one triangle into an offscreen `ID3D12Resource` → copy to a `READBACK` heap → `Map` and verify the pixels. **No `d3d12.dll`, no D3D12 runtime, no DXGI, no swapchain.** Optionally also run the headless vkd3d conformance suite (zero swapchains — verified) as the `D12-G9` baseline. ⚠ P-A is **closed by construction** here, not mitigated: with no app-local DLLs the ICD vehicle cannot pick up a foreign DXGI. The vehicle's bare-name `LoadLibraryA` hardening is still worth doing, but as ordinary stability work, not as a D3D12 prerequisite | Same: no Helios binary changes. This is the engine half of the architecture proven with zero UMD code, and it is the only check standing between a wrong assumption about vkd3d-on-venus and ~200 DDI slots | **G1, G2** |
 | **S1** | Create `umd_common`; move the five **zero-behaviour-change** Rust modules (`hr`, `format`, `throttle`, `slot`, `window`) **and the shared C++ header** (§4.4: `bridge_common.h` + `PeriodicStat`/`qpc_elapsed_us`/`ComRelease<T>`/`bridge_guard`). `umd` gains one path dep, `use` statements, and one `.include("../umd_common/bridge")` in its `build.rs` | **`S1-check`** (no `D12-G*` id exists for this — see the note below): (a) the 11 `hr` asserts compile; (b) `rustc --test --edition 2021 -o /tmp/format-table-check tools/format-table-check.rs && /tmp/format-table-check` passes **on Linux**, with the `#[path]` updated in the same commit; (c) `git grep -n 'static_assert' umd/bridge umd12/bridge umd_common/bridge` returns exactly one `bridge_guard` hit; (d) deploy + one Fire Strike run at the standard preset via `helios_fs_std`, 3-run median within the known ±5–6 % spread; (e) zero `helios_umd.dll` entries in the id-1000 Application log for the boot | — (see note) |
 | **S2** | Move `log`, `knobs` (reader half), the refusal and noop mechanisms. `log::init(basename)` added, called from `open_adapter_common` (`adapter.rs:218`) | **`S2-check`**: (a) ⚠ `log_knob_inventory()`'s line in `umd-<pid>.log` must be **byte-identical** to before — capture it before the move and `fc /b` after; that line is R1008's own validation instrument (`umd/src/log.rs:226-234`); (b) the P2 fault injection re-run (§4.2): add a bare `crate::log_line("x")` to a `forward/*` file, confirm the build fails with *"use of deprecated function"*, remove it; (c) all ten knob accessors still resolve — `present_batch_fold` is the one a "move the 9" reading drops (§2.1); (d) the same Fire Strike + id-1000 evidence as S1 | — (see note) |

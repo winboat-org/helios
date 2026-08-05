@@ -496,6 +496,23 @@ msbuild C:\Users\Rupansh\vkd3d-build-msvc\vkd3d-proton.sln
 `libs/d3d12/d3d12.dll`, `libs/d3d12core/d3d12core.dll`, `tests/d3d12.exe`, `demos/triangle.exe`,
 `demos/gears.exe` — and `wc -l < list-tests.txt` == **557**.
 
+✅ **PASSED 2026-08-05, primary (mingw cross) arm, first attempt.** `--list-tests` = **557**;
+`wine … --list-tests` works on the Linux host (two benign `libEGL warning:` lines on stderr — send
+them to a separate file, they are not part of the list). Add a sixth artifact to the hash block:
+**`libs/d3d12core/helios_vkd3d.dll`**, the D4 target added in the same session
+(`ARCHITECTURE.md` §7.4) — it is the binary `D12-G1` and every later gate actually loads, and it is
+20 MiB because it carries the whole static `libvkd3d-proton.a` + `dxil-spirv`.
+
+⚠ **Re-running `meson setup --reconfigure` after adding the target rebuilds only the new DLL** — the
+rest of the tree is cached, so this is ~30 s, not a full rebuild. But it does mean the artifact
+hashes change; re-hash rather than assuming the old block still describes the tree.
+
+⚠ **The `subprojects/dxil-spirv` nested-submodule question this gate was told to settle is settled:**
+four of them — `subprojects/dxbc-spirv` (`doitsujin/dxbc-spirv`), `third_party/SPIRV-Cross`,
+`third_party/SPIRV-Tools`, `third_party/spirv-headers`. With vkd3d's own three that is **seven**
+repositories in `helios_vkd3d.dll`; `ARCHITECTURE.md` §7.4's licence table needs seven rows, not
+three.
+
 **Counters:** none (no driver involved).
 
 **Artifact:** `tmp/dx12/gates/G0/{setup.log,build.log,sha256sums.txt,vkd3d-commit.txt,
@@ -540,6 +557,53 @@ slots written on top of it (`DX12.md` §6.1). Do not wave it through because not
 
 No window is involved, so session 0 is acceptable — this and G2 are the only gates for which that
 is true.
+
+---
+
+#### ✅ PASSED 2026-08-05 — 28 steps, 0 failures, first run
+
+**As built:** `tools/d3d12_bridge_probe.cpp` + `tools/d3d12_bridge_probe.hlsl`, driven by
+`tmp/dx12/build-g1-probe.ps1` (dxc → `-Fh` headers, then `cl`, then run). Output in
+`tmp/dx12/gates/G1/bridge_probe.txt`; engine log in `tmp/dx12/gates/G1/vkd3d.log`.
+
+What it proved, in order: both Helios exports resolve by name → `helios_vkd3d_create_device` returns
+an `ID3D12Device` **with no DXGI in the device path** → queue/allocator/list → a root signature
+serialized by `helios_vkd3d_serialize_root_signature` and accepted by `CreateRootSignature` (the H3
+path) → a DXIL SM 6.0 PSO → clear + one triangle into a committed `R8G8B8A8_UNORM` 256×256 target →
+`CopyTextureRegion` to a `READBACK` heap → fence → `Map` → **five sample points exact**: three
+outside the triangle read `32,96,192,255` and two inside read `255,128,64,255` → `Release()` to
+refcount 0.
+
+Caps read off the live device, which is the real prize (this is the G7 zero-point, and it settles
+H5 and U14 as a side effect):
+`MaxSupportedFeatureLevel = 12_2`, `HighestShaderModel = 6.8`, `ResourceBindingTier 3`,
+`TiledResourcesTier 4`, `ConservativeRasterizationTier 3`, `TypedUAVLoadAdditionalFormats 1`,
+`ROVsSupported 1`, `RaytracingTier 11 (= TIER_1_1)`, `RenderPassesTier 0`, RTV descriptor stride 32.
+`vkd3d.log`: `Enabling support for SM 6.6.` → `6.7.` → `6.8.`, `DXR 1.1 support enabled.`,
+`DX Ultimate supported!`.
+
+**Three corrections to the instructions above, all found by building it:**
+
+1. ⛔ **The demos' shaders are DXBC `vs_5_0`/`ps_5_0`, not SM 6.0** (`demos/triangle_vs.h:21`). The
+   probe compiles its own HLSL to **DXIL SM 6.0** with the Vulkan SDK's `dxc`
+   (`C:\VulkanSDK\1.4.350.0\Bin\dxc.exe`, already on `PATH`), because DXIL is the path real D3D12
+   clients take and the one H5 makes reachable. Reusing the demos' blobs would have gated on the
+   legacy path instead.
+2. ⚠ **`include/vkd3d.h:68` is wrong about `pfn_vkGetInstanceProcAddr = NULL`.** It says libvkd3d
+   loads libvulkan itself; `vkd3d_init_vk_global_procs` (`device.c:461-468`) returns `E_INVALIDARG`.
+   `helios_entry.c` therefore loads the Vulkan module itself. Anyone writing the `umd12` bridge
+   against that header comment gets `E_INVALIDARG` from device creation and no explanation.
+3. ⛔ **Do not write `& probe.exe 2>&1 | Tee-Object` in the runner script.** The Helios ICD prints a
+   `HELIOS[gate5a]:` banner on **stderr**; PowerShell turns a native process's stderr into an
+   `ErrorRecord`, and with `$ErrorActionPreference = 'Stop'` that kills the script *before the
+   probe's own stdout is ever printed* — the first run looked like a probe crash and was a
+   PowerShell artefact. Redirect inside `cmd` instead (`build-g1-probe.ps1`).
+
+⚠ **The probe links `dxgi.lib` for exactly one thing — reading the Helios adapter's LUID** (it
+matches `VendorId == 0x1af4` and never assumes index 0; on this guest Helios is index 0 and two
+Microsoft Basic Render Driver entries follow). It links **no `d3d12.lib`**, which is the property
+that makes it a test of the engine rather than of the runtime. `umd12` gets the LUID from the
+runtime and needs no DXGI at all.
 
 <details><summary>Superseded: the original app-local device gate (kept for the adapter-identification
 recipe, which is still needed)</summary>
@@ -700,6 +764,30 @@ kmd-counters-G2-{pre,post}.txt}`; **committed:** `docs/dx12/baselines/vkd3d-know
 `docs/dx12/baselines/d3d12-caps.csv`.
 
 **Known traps:**
+* ⛔ **The CRLF trap — it produced a false `ALL PASSED!` on the first attempt, 2026-08-05, and it is
+  the single most dangerous thing in this gate.** Upstream's `tests/test-runner.sh` does
+  `mapfile -t tests < <("$d3d12_bin" --list-tests)`. Run under Git-for-Windows bash the test binary
+  writes **CRLF**, `mapfile -t` strips only the LF, and every test name keeps a trailing `\r`. So
+  `VKD3D_TEST_MATCH="test_foo\r"` matches nothing, each of the 545 invocations runs only the
+  unconditional tests, and **every** log reads
+  `3 tests executed (0 failures, 0 successful todo, 0 skipped, 0 todo, 0 bugs)` — 1 635 assertions
+  for the whole suite, against 19 for `test_create_device` alone. The runner then prints
+  `Finished in 23s!` and `ALL PASSED!`. The log filenames carry the CR too, which is the cheapest
+  tell: `ls logs | cat -A` shows `test_x^M.log`.
+  **Fixed in the fork** (`e571d71a`, `tr -d '\r'`; the same commit fixes `nr_cpus`, which reads 0
+  from a missing `/proc/cpuinfo` and makes the run loop start nothing unless `-j` is passed).
+  ⚠ **The generalisation, which is the reason this is written out at length:** `triple.txt` is not
+  a sufficient pass criterion on its own, because a triple of `(1635, 0, 0)` is all-green. **Also
+  assert a per-test floor** — a suite where *every* test reports the *same* `executed` count is a
+  harness failure, not a conformance result. `executed`-per-test histogram first, `failures` second.
+  ⚠ **A 23-second wall time for 545 D3D12 tests at `-j 1` is itself the alarm.** Record wall time in
+  `runner.txt` (`run-g2.ps1` does) and disbelieve any run that is implausibly fast.
+* ⚠ **Reduce the logs on the Linux side, not in PowerShell.** The in-script PowerShell reduction
+  enumerated **zero** files through the 9p share while `ls` on the Linux side saw all 545 in the same
+  instant. Whether that is 9p directory-cache staleness or the CRs, a reduction that silently reports
+  `logs=0` and still writes a `triple.txt` is worse than no reduction. `run-g2.ps1` keeps the
+  PowerShell pass, but the number that gets recorded comes from the Python reduction over
+  `tmp/dx12/gates/G2/logs/*.log` on the host.
 * ⛔ **The S1 shared-heap trap — this is the one known *crash* hazard in the substrate, and this
   gate is where it fires.** `DECISIONS.md` S1: `VK_KHR_external_memory_win32` is absent from the
   Helios ICD, but on `_WIN32` vkd3d chains `VkExportMemoryAllocateInfo` for **any**
@@ -727,7 +815,9 @@ kmd-counters-G2-{pre,post}.txt}`; **committed:** `docs/dx12/baselines/vkd3d-know
   (`kmd_render/src/ddi/query_adapter_info.rs:1254-1278`). Step `-j 1` → `-j 2` → `-j 4`, recording
   wall time and any wedge (§7.10).
 * ⛔ No `--feature-level`, no `VKD3D_FEATURE_LEVEL` (rule 4).
-* ⚠ Expect the caps CSV to read **SM 6.0 / FL 12_1** unless the H5 probe said otherwise;
+* ⚠ Expect the caps CSV to read **SM 6.8 / FL 12_2** — H5 closed on the upside (`SUBSTRATE.md` §7),
+  and `D12-G1` already read exactly that off a live device. A CSV that says 6.0/12_1 is a
+  *regression*, not the expected baseline;
   `TotalLaneCount` will read **1024** and that number is *known wrong* (vkd3d's
   `32 * subgroupSize` fallback, `device.c:10226-10233`, because venus exposes neither
   `VK_AMD_shader_core_properties` nor `VK_NV_shader_sm_builtins`). Record it as a defect, do not

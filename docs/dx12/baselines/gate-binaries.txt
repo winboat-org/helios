@@ -1,0 +1,14 @@
+# docs/dx12/baselines/gate-binaries.txt
+# SHA256 of the binaries each gate ran against. A G2 baseline and a G9 result taken
+# against DLLs from different arms are not comparable, so every gate appends here.
+
+## D12-G0 — 2026-08-05 — mingw cross on the Linux host (PRIMARY arm)
+#   vkd3d-proton-helios e571d71a8fc9ea8f7d15e5a3e8a8bb37947bed1c (branch helios, forked at 2c7ba22c)
+#   builddir tmp/dx12/build/vkd3d-win64 ; meson release, -Denable_tests=true -Denable_extras=true
+#   tests/d3d12.exe --list-tests = 557
+c0b51dcbf19e1fd211bd87d5198d4cae1a84c23aa8cfaa44d56a27dfe736ed0e  libs/d3d12/d3d12.dll
+08487c54b6e3ff4801b16af5af6b514812b0eae68d49e0daebdc2d632391f0fd  libs/d3d12core/d3d12core.dll
+2094c5e9211572f3166d84f4dbce8010a4a5697aa8f423f2b719f377eda54253  libs/d3d12core/helios_vkd3d.dll
+5c866851409db8e5c0c0bb2976dc54e12c2b23a536b4f55242e9985a8363e443  tests/d3d12.exe
+831478c090949d1b1d31ebb4af396d04e253a64e2570f5a4db22e5abe262c6c6  demos/triangle.exe
+4b7e5a0cea1b0d2e58cb3f3e2a7d725c86cb30a60eb9431a5ca299763f49700e  demos/gears.exe

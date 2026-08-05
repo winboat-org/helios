@@ -92,11 +92,18 @@ actually run on venus?"* **before** ~200 DDI slots are written on the assumption
 question does not go away, so D2 replaces it with two **headless** substitutes that need no DXGI, no
 swapchain, no vehicle and no app-facing D3D12 at all:
 
-- **The bridge probe (mandatory, gate `D12-G1`).** A `tools/` program that `LoadLibrary`s
-  `helios_vkd3d.dll`, calls `helios_vkd3d_create_device`, renders to an offscreen `ID3D12Resource`
-  and reads it back. No `d3d12.dll`, no D3D12 runtime, no DXGI — it exercises *exactly* the engine
-  path `umd12` will use, one layer below it. This is stage S4 in `ARCHITECTURE.md` §11 and it is the
-  cheapest real answer available.
+- **The bridge probe (mandatory, gate `D12-G1`) — ✅ GREEN 2026-08-05.** A `tools/` program that
+  `LoadLibrary`s `helios_vkd3d.dll`, calls `helios_vkd3d_create_device`, renders to an offscreen
+  `ID3D12Resource` and reads it back. No `d3d12.dll`, no D3D12 runtime, no DXGI — it exercises
+  *exactly* the engine path `umd12` will use, one layer below it. This is stage S4 in
+  `ARCHITECTURE.md` §11 and it is the cheapest real answer available.
+  **Result:** `tools/d3d12_bridge_probe.cpp`, 28 steps, 0 failures, first run — both Helios exports
+  resolved, device created with no DXGI, root signature round-tripped through
+  `helios_vkd3d_serialize_root_signature`, a DXIL SM 6.0 triangle drawn into a committed
+  `R8G8B8A8_UNORM` target, copied to a `READBACK` heap and verified exact at five sample points
+  (clear `32,96,192,255`, triangle `255,128,64,255`), fence signalled, device released to refcount 0.
+  ⇒ **vkd3d runs on venus.** The ~200-slot assumption is no longer an assumption.
+  (`tmp/dx12/gates/G1/bridge_probe.txt`.)
 - **The headless conformance baseline (recommended, gate `D12-G2`).** `vkd3d-proton-helios/tests/`
   creates **zero** swapchains — verified, `grep -rl CreateSwapChain tests/` is empty — so the suite
   is fully headless and needs no DXGI. It does resolve `D3D12CreateDevice` from whatever `d3d12.dll`
@@ -401,15 +408,27 @@ as `"Drivers that support raytracing must expose shader model 6.3."` **Every tie
 runtime validates, and D3D12's tiered caps are exactly the shape of the `SupportDirectFlip` /
 `FlipImmediateMmIo` landmine.**
 
-**H5 — shader model may cap at 6.0 unless one probe says otherwise.** vkd3d gates SM 6.2 (and the
-whole ladder above it) on FP32 denorm control, exempting only `VK_DRIVER_ID_NVIDIA_PROPRIETARY`. The
-guest reports `driverID = MESA_VENUS` with both denorm properties `false`. **But** vkd3d handles
-layered implementations: with `VK_KHR_maintenance7` it reads the *underlying* driver's
+**H5 — ✅ CLOSED 2026-08-05: the swizzle fires, and the ceiling is SM 6.8 / FL 12_2.** *(Was: shader
+model may cap at 6.0 unless one probe says otherwise.)* vkd3d gates SM 6.2 (and the whole ladder
+above it) on FP32 denorm control, exempting only `VK_DRIVER_ID_NVIDIA_PROPRIETARY`. The guest reports
+`driverID = MESA_VENUS` with both denorm properties `false`. **But** vkd3d handles layered
+implementations: with `VK_KHR_maintenance7` it reads the *underlying* driver's
 `VkPhysicalDeviceDriverProperties` and **swizzles `driverID` to the real one**
 (`device.c:2657-2664`) — and that runs at `device.c:4129`, well before shader-model caps init at
-`:11599`. The guest has `maintenance7` and reports `layeredApiCount = 1` naming the host NVIDIA
-device. So the swizzle very likely fires and SM 6.6 is reachable. **Verified ordering; unverified
-outcome** — see G-probe in §5.
+`:11599`.
+
+`tools/vk_layered_driverid_probe.cpp` chained the nested struct and printed
+**`NESTED driverID = 4 (NVIDIA_PROPRIETARY) driverName=NVIDIA`** (`maintenance7` PRESENT,
+`layeredApiCount = 1`, `layerVendorID = 0x10de`) — the bit that was proven by source ordering but
+never observed. **Confirmed end to end at `D12-G1`**, which is the stronger evidence because it is a
+real vkd3d device on the live guest rather than a prediction of one: `VKD3D_DEBUG=info` printed
+`Enabling support for SM 6.6.` → `6.7.` → `6.8.` and `DX Ultimate supported!`, and
+`CheckFeatureSupport` answered `HighestShaderModel = 6.8`, `MaxSupportedFeatureLevel = 12_2`.
+
+⚠ **The canonical phrasing changes: "SM 6.8, and FL 12_2 is live", not "plan for 6.0".** §5 and
+`SUBSTRATE.md` §7 are updated to match. The one place to still be careful is that **6.8 is what the
+*engine* reports**; what the *DDI arm* advertises is a separate decision made at P3 against the caps
+gauntlet (H4), and it must not exceed what is backed.
 
 ---
 
@@ -456,18 +475,32 @@ kernel-facing half is already built, the engine already exists, and the substrat
 
 ---
 
-## 5. The one experiment that should run before anything else
+## 5. ✅ The one experiment that should run before anything else — RUN, 2026-08-05
 
-**Settle H5 with a ~40-line read-only Vulkan probe** (`tools/vk_layered_driverid_probe.cpp`): chain
-`VkPhysicalDeviceLayeredApiPropertiesListKHR` → `VkPhysicalDeviceLayeredApiVulkanPropertiesKHR` →
-`VkPhysicalDeviceDriverProperties` on the guest and print `driverID`. If it prints
-`VK_DRIVER_ID_NVIDIA_PROPRIETARY`, shader model reaches 6.6 and feature level 12_2 is on the table.
-If it prints 0 or `MESA_VENUS`, the ceiling is SM 6.0 / FL 12_1 and the **first real content of the
-`vkd3d-proton-helios` fork** is extending the exemption at `device.c:10699` — which must then be
-conditioned on something venus can actually observe about the host, not hardcoded.
+**H5 is settled with a ~40-line read-only Vulkan probe** (`tools/vk_layered_driverid_probe.cpp`):
+chain `VkPhysicalDeviceLayeredApiPropertiesListKHR` → `VkPhysicalDeviceLayeredApiVulkanPropertiesKHR`
+→ `VkPhysicalDeviceDriverProperties` on the guest and print `driverID`. Verbatim output, from
+`tmp/dx12/gates/H5/driverid-probe.txt`:
 
-No build, no driver change, no reboot. It also answers the DX12.md-era question "what was the fork
-for" by giving the fork its first justified patch.
+```
+pd[0] Virtio-GPU Venus (NVIDIA RTX PRO 6000 Blackwell Workstation Edition)
+  VK_KHR_maintenance7 = PRESENT   (vkd3d builds the layered chain only when present)
+  top    driverID = 22 (MESA_VENUS) driverName=venus
+  layeredApiCount = 1  layerVendorID=0x10de layerDeviceID=0x2bb1 layerName=NVIDIA RTX PRO 6000 …
+  NESTED driverID = 4 (NVIDIA_PROPRIETARY) driverName=NVIDIA
+  ==> vkd3d WILL swizzle driverID  ==>  SM 6.6+ (FL 12_2)
+```
+
+⇒ **The swizzle fires. SM 6.8 and FL 12_2, both confirmed on a live vkd3d device at `D12-G1`.**
+`SUBSTRATE.md` §7.4's three candidate fixes are all **moot**: the ICD's layered chain already tells
+the truth, and the vkd3d fork does **not** need the `device.c:10699` patch. The fork's first content
+turned out to be D4's two exports instead (`ARCHITECTURE.md` §7.4), which is a better answer to
+"what was the fork for" than a workaround would have been.
+
+⚠ **The probe deliberately leaves `vk_layered_props.properties.sType` zeroed**, because vkd3d does
+(`device.c:2318-2321` memsets and `:2338-2342` sets only the outer sType). Keep it that way: a probe
+that sets the field could succeed where the engine fails, which is the worst possible outcome for a
+probe whose whole job is to predict the engine.
 
 ---
 
@@ -477,7 +510,7 @@ for" by giving the fork its first justified patch.
 |---|---|---|
 | **R3:** "the D3D12 UMD DDI has no queue object at all — the runtime owns submission." **R1/R2:** the DDI has a full queue object. | **R1/R2 are right; R3 is wrong.** `D3D12DDI_DEVICE_FUNCS_CORE_0109` contains `pfnCalcPrivateCommandQueueSize` / `pfnCreateCommandQueue` / `pfnDestroyCommandQueue`, and `D3D12DDI_TABLE_TYPE_COMMAND_QUEUE_3D` (=2) is filled from `D3D12DDI_COMMAND_QUEUE_FUNCS_CORE_0001` with `pfnExecuteCommandLists`. | `d3d12umddi.h:13488-13490` (members 27-29 of `CORE_0109`) and `:2729-2738`. |
 | **R2:** "does a monitored fence advance with no GPU-side write?" — marked HIGH risk, strategy-deciding. **R5:** it is documented and already proven on this adapter. | **Risk downgraded HIGH → MEDIUM.** Microsoft documents the exact fallback: *"If a GPU engine isn't capable of writing to a monitored fence using its virtual address, the UMD uses the SignalSynchronizationObjectFromGpuCb callback to queue a software signal packet"*, and *"Dxgkrnl updates the fence memory location"* on CPU signal. `tools/vehicle_flipwait_probe.c` proves the queued-wait-before-queued-signal primitive live on this software-scheduled adapter with **zero KMD changes**. Residual: confirm the CPU-visible value advances for a *D3D12-shaped* fence — one probe (G-fence). | `windows-driver-docs-pr/display/context-monitoring.md`, `native-gpu-fence-objects.md`; `ROADMAP.md:2616-2621`. |
-| **R8:** vkd3d caps Helios at SM 6.0 → FL 12_1. **R12:** the `maintenance7` layered-driverID swizzle probably lifts it to SM 6.6 → FL 12_2. | **R12's mechanism is real and correctly ordered** (`vkd3d_physical_device_info_init` at `device.c:4129` runs before `d3d12_device_caps_init` at `:11599`; the swizzle is at `:2657-2664`), and the guest has `maintenance7` with `layeredApiCount=1`. **Outcome still unobserved** — the nested `VkPhysicalDeviceDriverProperties` was never chained. Treated as H5 with a named probe; plan for SM 6.0 and expect 6.6. | Verified in `vkd3d-proton-helios/libs/vkd3d/device.c` this session. |
+| **R8:** vkd3d caps Helios at SM 6.0 → FL 12_1. **R12:** the `maintenance7` layered-driverID swizzle probably lifts it to SM 6.6 → FL 12_2. | ✅ **R12 is right, and it is now observed, not inferred.** The probe printed nested `driverID = 4 (NVIDIA_PROPRIETARY)` and a live vkd3d device reports **SM 6.8 / FL 12_2** (`D12-G1`). R8's SM 6.0 reading is dead. | `tmp/dx12/gates/H5/driverid-probe.txt`; `tmp/dx12/gates/G1/{bridge_probe.txt,vkd3d.log}`. |
 | **R3:** driving vkd3d's core from a DDI frontend needs ~5 surgeries (de-`static` 200 methods, ops tables, rewrite `bundle.c`…). **R2:** forwarding is straightforward with shadow state. | **They answer different questions.** R3 costed *replacing* vkd3d's COM layer with a non-COM ops table. D1 does not do that — it **calls vkd3d's public `ID3D12*` COM interfaces**, exactly as the D3D11 UMD calls DXVK's `ID3D11Device`. Zero vkd3d surgery beyond exporting a device-creation entry point (D4). R3's five surgeries are **not on the plan**. | `research/R2.md` §6 verdict table; the D3D11 precedent at `umd/bridge/dxvk_bridge.cpp:1754-1757`. |
 | **R2/DX12.md:** the "load-bearing unknown" is presentation for Vulkan clients. **R7:** that statement is stale. | **R7 is right.** The dcomp vehicle shipped in the 28th session and is default-ON. The load-bearing present issues are P-A/P-B/P-C in §3-H2, not the hand-off. | `icd/mesa/src/vulkan/wsi/wsi_common_win32.cpp:361-376`, `:2067-2258`. |
 | **DX12.md §3.2:** `DXGK_VIDMMCAPS.DriverManagesResidency` is not set. | **Field misattributed.** `DriverManagesResidency` is a **`DXGK_CONTEXTINFO_CAPS`** bit (per-context, `d3dkmddi.h:1550-1563`), not a `DXGK_VIDMMCAPS` bit. The conclusion (residency is VidMm's job) is unchanged; Helios never writes `ContextInfo.Caps` at all. | `research/R5.md` §11. |
@@ -489,7 +522,7 @@ for" by giving the fork its first justified patch.
 
 | Question | Resolution |
 |---|---|
-| **Shader-model ceiling: 6.6 or 6.7?** | `SUBSTRATE.md` §7.1 walks vkd3d's ladder (`device.c:10640-10826`) against the live guest and reaches **SM 6.7**; the `shader_model_67` profile's single miss (`VK_KHR_maintenance8`) is a *profile* entry that the code does not gate on. **Canonical: "SM 6.6 at minimum, and the ladder walks to 6.7"** — and all of it is downstream of H5, so plan for 6.0 and treat anything above as upside until the probe runs. |
+| **Shader-model ceiling: 6.6 or 6.7?** | ⛔ **Both answers were low. Measured: 6.8.** The ladder does not stop at 6.7 — `device.c:10817-10820` adds an unconditional 6.7→6.8 step, which `SUBSTRATE.md` §7.2's walk did not enumerate. The live guest logs `Enabling support for SM 6.6.` → `6.7.` → `6.8.` and `CheckFeatureSupport(SHADER_MODEL)` answers **6.8** (`D12-G1`). **Canonical: SM 6.8.** The "plan for 6.0, treat above as upside" hedge is retired — H5 is closed. |
 | **G0 build: Linux mingw cross, or native MSVC on the VM?** | **Linux mingw cross is the primary**, because the host already has the whole toolchain installed — `x86_64-w64-mingw32-gcc`, `widl`, `glslangValidator`, `meson`, `ninja` are all on `PATH` today (verified). Zero installation, and it matches vkd3d-proton's own shipping build (`artifacts.yml`). Native MSVC x64 on the VM (upstream's `test-build-windows.yml`: choco strawberryperl + glslangValidator + meson + VS2022, built to a **local C:** path) is the **fallback, taken when a Windows debugger is wanted**. `ARCHITECTURE.md` §8.3 and `GATES.md` G0 must both say this. |
 | **`InstalledDisplayDrivers`: 2 entries or 4?** | **2** — `helios_umd,helios_umd12`. It is a flat list of distinct package binaries, not index-parallel to `UserModeDriverName`. The live four-times value is semantically wrong today; fixing it is part of the INF change, not a separate item. |
 | **PRESENT's `HELIOS_WSI_INSURANCE_BLIT` "numbers never landed"** | **Wrong** — the A/B landed: `ROADMAP.md:2919-2926` and `:2948-2950` record an owner Doom verdict run with `insurance=0` showing no fps change. Copy #3 is **measured inert at Doom resolution**. Re-measure at D3D12 resolutions before claiming it costs anything. |

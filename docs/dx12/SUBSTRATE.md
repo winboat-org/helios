@@ -1023,11 +1023,19 @@ This is the concrete D3D12 consequence of S9 and the reason S9 is not merely "re
 
 ---
 
-## 7. ⚠ The shader-model / `driverID` question (`DECISIONS.md` H5)
+## 7. ✅ The shader-model / `driverID` question (`DECISIONS.md` H5) — CLOSED 2026-08-05
 
-**This is the single open question that changes the substrate's advertised ceiling**, and it is
-settled by one ~40-line read-only probe with no build, no driver change and no reboot.
-`DX12.md` §5 names it as the first thing to run.
+**Answer first: the swizzle fires. The nested `VkPhysicalDeviceDriverProperties` carries
+`VK_DRIVER_ID_NVIDIA_PROPRIETARY`, and a live vkd3d device on this guest reports SM 6.8 and
+FL 12_2.** Everything below is retained because the *mechanism* still has to be understood by anyone
+touching shader caps — but §7.4's three candidate fixes are moot, and the "plan for SM 6.0" hedge is
+retired. Evidence: `tmp/dx12/gates/H5/driverid-probe.txt` (the Vulkan-level prediction) and
+`tmp/dx12/gates/G1/{bridge_probe.txt,vkd3d.log}` (the D3D12-level confirmation).
+
+⛔ **One correction the walk below got wrong: the ladder does not stop at 6.7.** `device.c:10817-10820`
+adds an unconditional 6.7 → 6.8 step, which §7.2's table omitted. The guest logs
+`Enabling support for SM 6.6.` → `6.7.` → `6.8.`, and `CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL)`
+answers 6.8. **Canonical: SM 6.8.**
 
 ### 7.1 The chain, in full
 
@@ -1122,11 +1130,12 @@ and the ICD fills that struct **before** it rewrites `driverID`: `vn_physical_de
 whereas `vn_physical_device_sanitize_properties()` — which does
 `props->driverID = VK_DRIVER_ID_MESA_VENUS;` at **`:571`** — is only called at **`:905`**.
 
-**(e) What is still unobserved.** `vulkaninfo` prints the layered list but does **not** chain the
-nested `VkPhysicalDeviceDriverProperties`. So `real_driver_props.driverID ==
-VK_DRIVER_ID_NVIDIA_PROPRIETARY` is **proven by source ordering, never observed**. ⇒ **UNVERIFIED.**
-**Plan for SM 6.0; expect SM 6.6 at minimum, with the ladder walking to 6.7** (the canonical phrasing,
-`DECISIONS.md` §6.1).
+**(e) ✅ Observed 2026-08-05.** `vulkaninfo` prints the layered list but does **not** chain the nested
+`VkPhysicalDeviceDriverProperties`, which is why this sat UNVERIFIED. `tools/vk_layered_driverid_probe.cpp`
+chains it and prints `NESTED driverID = 4 (NVIDIA_PROPRIETARY) driverName=NVIDIA`, with
+`VK_KHR_maintenance7 = PRESENT` and `layerVendorID = 0x10de`. ⇒ `real_driver_props.driverID ==
+VK_DRIVER_ID_NVIDIA_PROPRIETARY` is now **measured**, and the D3D12-level consequence is confirmed
+independently at `D12-G1`. **Canonical: SM 6.8.**
 
 ### 7.2 The full shader-model ladder, walked against the live values
 
@@ -1141,6 +1150,7 @@ gated on `max_shader_model == <previous>`, so one failure freezes everything abo
 | **6.5** | unconditional once 6.3 (`:10739-10745`) | — | follows 6.2 |
 | **6.6** | (`computeDerivativeGroupLinear` \|\| `driverID == NVIDIA`) && `shaderBufferInt64Atomics` && `shaderInt8` && required-subgroup-size for COMPUTE (`:10759-10770`) | `computeDerivativeGroupLinear=true` (`[CAPTURE]:1327`); `shaderBufferInt64Atomics=true` (`:1636`); `shaderInt8=true` (`:1639`); `subgroupSizeControl=true` (`:1688`) | ✅ *if* 6.2 passed |
 | **6.7** | `shaderMaximalReconvergence && shaderQuadControl`, **or** `VKD3D_CONFIG=enable_experimental_features` (`:10794-10797`) | both `true` (`[CAPTURE]:1571`, `:1575`) | ✅ *if* 6.6 passed |
+| **6.8** | ⛔ **unconditional once 6.7** (`:10817-10820`, `if (max_shader_model == D3D_SHADER_MODEL_6_7) … = D3D_SHADER_MODEL_6_8;`) — this row was missing from the original walk, which is why the doc set said "the ladder walks to 6.7" | — | ✅ **observed live**: `Enabling support for SM 6.8.` |
 
 ⚠ **Correction to a natural assumption: `VK_KHR_maintenance8` does NOT gate SM 6.7.** The code
 (read verbatim at `:10794-10797`) requires only maximal-reconvergence + quad-control.
@@ -1150,18 +1160,17 @@ max_shader_model >= 6_7 && (maintenance8 || experimental)` — plus
 is aspirational (§3.4). `options14->WriteableMSAATexturesSupported` also needs
 `shaderStorageImageMultisample`, which the guest reports `true` (`[CAPTURE]:1258`).
 
-⇒ **The whole shader-model story reduces to one bit.** Swizzle fires → **SM 6.6 at minimum, and the
-ladder above walks to 6.7**; swizzle does not fire → **SM 6.0**, FL caps at **12.1**.
+⇒ **The whole shader-model story reduces to one bit.** ✅ **The bit is a 1**: the swizzle fires and the
+ladder runs 6.2 → 6.3 → 6.5 → 6.6 → 6.7 → **6.8**. (Had it not fired: SM 6.0, FL capped at 12.1.)
 
-⚠ **Canonical phrasing, per `DECISIONS.md` §6.1:** *"SM 6.6 at minimum, and `SUBSTRATE.md` §7.1 walks
-vkd3d's ladder to 6.7"* — **and all of it is downstream of H5, so plan for 6.0 and treat anything
-above as upside until the `driverID` probe runs.** Do not write "the ceiling is SM 6.7" anywhere: the
-6.7 step is well-evidenced (`device.c:10794-10797` needs only `shaderMaximalReconvergence` +
-`shaderQuadControl`, both `true` at `[CAPTURE]:1571`/`:1575`, and `VK_KHR_maintenance8` genuinely
-does not gate it), but it is conditional on an *unobserved* bit, and `DECISIONS.md` H5/§5 and
-`DX12.md` §5 all state the floor as 6.6. 6.6 is the number that matters, because 6.6 is what the
-FL 12.2 gate needs (`>= D3D_SHADER_MODEL_6_5`, `device.c:10572`) — 6.7 buys nothing at feature-level
-granularity.
+⚠ **Canonical phrasing, superseding `DECISIONS.md` §6.1's original answer: SM 6.8**, observed on a
+live vkd3d device (`D12-G1`, `VKD3D_DEBUG=info` + `CheckFeatureSupport`). The old hedge ("plan for
+6.0, treat anything above as upside") is retired with H5.
+⚠ **What still matters at feature-level granularity is 6.5**, not 6.8: the FL 12.2 gate asks
+`>= D3D_SHADER_MODEL_6_5` (`device.c:10572`). Everything above 6.5 is shader-feature reach, not
+feature level — so a later regression that dropped the ceiling to 6.5 would not show up as an FL
+change. If shader-model coverage is ever a gate criterion, assert on the
+`Enabling support for SM …` lines, not on `MaxSupportedFeatureLevel`.
 
 **Other `driverID`-conditional vkd3d paths** that will behave differently depending on the answer —
 worth knowing because they are not all cosmetic: `device.c:1883`, `:1912`, `:1921`, `:1937` (memory
@@ -1183,7 +1192,7 @@ with its source in vkd3d and its live value.
 | # | Conjunct (line) | Where vkd3d sets it | Live guest | |
 |---|---|---|---|---|
 | 1 | `max_feature_level >= 12_1` (`:10572`) | the whole ladder below it in `d3d12_device_caps_init_feature_level` (`:10549`): **11.1** at `:10557-10560` (`OutputMergerLogicOp` + `vertexPipelineStoresAndAtomics` + `maxPerStageDescriptorStorage{Buffers,Images} >= D3D12_UAV_SLOT_COUNT`), **12.0** at `:10562-10566` (`TiledResourcesTier >= 2`, `ResourceBindingTier >= 2`, `TypedUAVLoadAdditionalFormats`), **12.1** at `:10568-10570` (`ROVsSupported` + `ConservativeRasterizationTier >= 1`) | `logicOp=true` (`[CAPTURE]:1236`), `vertexPipelineStoresAndAtomics=true` (`:1253`), both storage limits 1 048 576 ≫ 64 (`:299`, `:301`); TiledResourcesTier **4**, ResourceBindingTier **3**; ROVs `true` — `fragmentShaderPixelInterlock` + `fragmentShaderSampleInterlock` at `:10180-10181`, both `true` (`[CAPTURE]:1425-1426`); ConsRast **Tier 3**. ⚠ `TypedUAVLoadAdditionalFormats` is the one clause **not** decidable from the capture: `d3d12_device_determine_additional_typed_uav_support` (`:10010`, wired at `:10179`) issues live `vkGetPhysicalDeviceFormatProperties` calls, and `vulkaninfo --summary` does not carry them — booked as **U14** | ⚠ one clause open |
-| 2 | `max_shader_model >= D3D_SHADER_MODEL_6_5` (`:10572`) | §7.2 ladder | **§7.1's open question** | ⚠ **the only real unknown** |
+| 2 | `max_shader_model >= D3D_SHADER_MODEL_6_5` (`:10572`) | §7.2 ladder | ✅ **6.8** — §7.1 is closed | ✅ |
 | 3 | `VPAndRTArrayIndexFromAnyShaderFeedingRasterizerSupportedWithoutGSEmulation` (`:10573`) | `:10187-10189` = `shaderOutputViewportIndex && shaderOutputLayer` | both `true` (`[CAPTURE]:1675-1676`) | ✅ |
 | 4 | `options1.WaveOps` (`:10574`) | `:10197` = `max_shader_model >= D3D_SHADER_MODEL_6_0` | SM 6.0 passes unconditionally (§7.2 row 1) | ✅ |
 | 5 | `options1.Int64ShaderOps` (`:10574`) | `:10231` = `features2.features.shaderInt64` | `true` (`[CAPTURE]:1268`) | ✅ |
@@ -1212,13 +1221,19 @@ claim lives in the **`description` fields of the two FL-12.2 profiles inside
 (`VP_D3D12_FL_12_2_optimal`) — i.e. it describes what the *profile document* does not yet encode,
 not what the driver does not implement.
 
-⇒ **Every conjunct except #2 passes on the live guest, with #1 carrying one runtime-computed clause
-(U14) that has never been read.** On this reading the substrate reaches `D3D_FEATURE_LEVEL_12_2`
-**iff** the §7.1 swizzle fires; there is no *known* second blocker hiding in the predicate, and the
-one unread clause (`TypedUAVLoadAdditionalFormats`) gates FL **12.0**, so if it failed the guest
-would visibly cap at 11.1 — a failure loud enough that U1's own `VKD3D_DEBUG=info` run
-(`"Max feature level: %#x."`, `device.c:10585`, a `TRACE`; `"DX Ultimate supported!"`, `:10588`,
-an `INFO`) settles U14 as a side effect.
+⇒ ✅ **All twelve conjuncts pass on the live guest, and the predicate is no longer a prediction.**
+`D12-G1` read the answer straight off a real vkd3d device:
+`CheckFeatureSupport(D3D12_FEATURE_FEATURE_LEVELS)` → **`MaxSupportedFeatureLevel = 12_2`**, and
+`VKD3D_DEBUG=info` printed `DX Ultimate supported!` (`device.c:10588`), which is the `INFO` emitted
+on the FL 12.2 arm.
+
+⚠ **U14 is settled as a side effect, and it settled the way this section predicted:**
+`D3D12_FEATURE_D3D12_OPTIONS` reports **`TypedUAVLoadAdditionalFormats = 1`** — the one clause that
+needed live `vkGetPhysicalDeviceFormatProperties` calls and could not be read from the
+`vulkaninfo` capture. The rest of the same query also matches this walk exactly:
+`ResourceBindingTier = 3`, `TiledResourcesTier = 4`, `ConservativeRasterizationTier = 3`,
+`ROVsSupported = 1`, and `OPTIONS5.RaytracingTier = 11` (`D3D12_RAYTRACING_TIER_1_1`). Nothing in the
+predicate walk needs re-deriving.
 
 ### 7.3 The probe that settles it
 
@@ -1326,7 +1341,27 @@ No window, so `win_exec` (session 0) is fine.
 - prints `NESTED driverID = 0` or `MESA_VENUS` ⇒ the ceiling is SM 6.0 / FL 12_1 and one of the
   fixes below is required.
 
-### 7.4 The three candidate fixes, ranked
+✅ **It printed `NESTED driverID = 4 (NVIDIA_PROPRIETARY)` on 2026-08-05, and the end-to-end
+confirmation landed the same day at `D12-G1`:** `Enabling support for SM 6.6.` / `6.7.` / `6.8.` and
+`DX Ultimate supported!` in `tmp/dx12/gates/G1/vkd3d.log`, with `HighestShaderModel = 6.8` and
+`MaxSupportedFeatureLevel = 12_2` from `CheckFeatureSupport`. **The as-built probe** (committed at
+`tools/vk_layered_driverid_probe.cpp`) also prints whether `VK_KHR_maintenance7` is advertised,
+because a `0` answer is not attributable without it — vkd3d only builds the layered chain when the
+extension is present (`device.c:2323`).
+
+### 7.4 ⛔ The three candidate fixes — ALL MOOT (H5 closed, 2026-08-05)
+
+**Rank 1 is what turned out to be true**: the ICD's layered chain already reports the host driver
+honestly, so there was nothing to repair on either side. Ranks 2 and 3 must **not** be applied — a
+`device.c:10699` fork patch would now be dead code guarding a condition that never occurs, and
+`VKD3D_SHADER_MODEL=6_6` would be an override that lowers the real ceiling of 6.8. The table is kept
+because it is the right analysis to re-run if a host, ICD or virglrenderer change ever makes the
+nested `driverID` go to zero.
+
+⚠ **The regression test for that is one line**: rebuild and re-run
+`tools/vk_layered_driverid_probe.cpp`, or grep a `VKD3D_DEBUG=info` log for
+`Enabling support for SM 6.6.`. Do not infer it from `MaxSupportedFeatureLevel`, which only needs
+SM 6.5 (§7.2b).
 
 | Rank | Fix | Where | Why this order |
 |---|---|---|---|
@@ -1338,29 +1373,43 @@ No window, so `win_exec` (session 0) is fine.
 
 ## 8. Building vkd3d-proton for Windows
 
-### 8.1 ⚠ Step zero: the nested submodules are uninitialised
+### 8.1 ✅ Step zero: the nested submodules — DONE 2026-08-05
 
-Verified this session:
-
-```
-$ cd vkd3d-proton-helios && git submodule status
--f88a2d766840fc825af1fc065977953ba1fa4a91 khronos/SPIRV-Headers
--0e9de566b7d4051c5cc1b762e242c46565956bdf khronos/Vulkan-Headers
--cc75a0c98d34d7bcc03560527c799b52e48b4d1f subprojects/dxil-spirv
-```
-
-The leading `-` means **uninitialised**; all three directories are empty. `meson.build:177-178`
-does `subproject('dxil-spirv')` and `meson.build:62` includes
-`./khronos/Vulkan-Headers/include` + `./khronos/SPIRV-Headers/include`, so **nothing configures,
-let alone builds, until:**
+They were uninitialised (a leading `-` in `git submodule status`, all three directories empty), and
+`meson.build:177-178` does `subproject('dxil-spirv')` while `meson.build:62` includes
+`./khronos/Vulkan-Headers/include` + `./khronos/SPIRV-Headers/include`, so nothing configured until:
 
 ```bash
 cd /home/rupansh/helios-vgpu/vkd3d-proton-helios && git submodule update --init --recursive
 ```
 
-⚠ The checkout's `origin` is `HansKristian-Work/vkd3d-proton`, while `.gitmodules` in the
-superproject names `https://github.com/rupansh/vkd3d-proton`. Any Helios patch (§7.4 rank 2) needs
-the fork wired as a push remote first.
+Now populated: `khronos/SPIRV-Headers f88a2d76`, `khronos/Vulkan-Headers 0e9de566` (v1.4.351),
+`subprojects/dxil-spirv cc75a0c9`.
+
+⚠ **`--recursive` was load-bearing: `dxil-spirv` has four nested submodules of its own** — this
+settles the UNVERIFIED item `GATES.md` G0 booked. From `subprojects/dxil-spirv/.gitmodules`:
+
+| Path | Upstream | At |
+|---|---|---|
+| `subprojects/dxbc-spirv` | `github.com/doitsujin/dxbc-spirv` | `d5b06435` |
+| `third_party/SPIRV-Cross` | `KhronosGroup/SPIRV-Cross` | `4b7bcb7e` |
+| `third_party/SPIRV-Tools` | `KhronosGroup/SPIRV-Tools` | `199cb207` |
+| `third_party/spirv-headers` | `KhronosGroup/SPIRV-Headers` | `c63848ec` |
+
+⇒ **seven repositories link into `helios_vkd3d.dll`**, not three, and each carries its own licence
+(`ARCHITECTURE.md` §7.4's component table, UNVERIFIED-10, needs all seven rows).
+
+✅ **The fork is wired.** The checkout's `origin` is still `HansKristian-Work/vkd3d-proton`; the
+Helios fork named by the superproject's `.gitmodules` is now a second remote:
+
+```bash
+git -C vkd3d-proton-helios remote add helios git@github-rupansh:rupansh/vkd3d-proton
+git -C vkd3d-proton-helios push -u helios helios     # branch `helios`, forked at 2c7ba22c
+```
+
+⛔ **Push to `helios`, never to `origin`.** The Helios branch is `helios`; the submodule now points
+at `fc35d37d` (D4's two exports, `ARCHITECTURE.md` §7.4), so `DX12.md` §3.3's "zero local commits,
+clean tree" is history.
 
 ### 8.2 The **PRIMARY** arm: mingw cross on the Linux host — zero installs, today
 
