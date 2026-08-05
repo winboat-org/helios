@@ -314,7 +314,9 @@ DXVK.** There is no `helios_vkd3d.dll` on the shipping path and no `LoadLibrary`
 | vkd3d builds under clang-cl / MSVC ABI | ✅ **143/143 targets, exit 0** — compiler id `clang-cl` 17.0.6, linker `lld-link`, `b_vscrt=md`, byte-for-byte the toolchain the DXVK build already uses |
 | the static arm has no DXGI dependency | ✅ **0** undefined `CreateDXGIFactory` refs in `libhelios_d3d12_static.a`, `libvkd3d-proton.a`, `libdxil-spirv.a` — against **1** dxgi import in the retired `helios_vkd3d.dll` |
 | the Helios entry points survive | ✅ `T helios_vkd3d_create_device`, `T helios_vkd3d_serialize_root_signature` |
-| archive set | `libhelios_d3d12_static.a` (15.3 MB, self-contained — it already defines `vkd3d_create_device`) plus `libvkd3d-proton.a`, `libvkd3d_common.a`, `libvkd3d-shader.a`, `libdxil-spirv.a`, `libdxbc_spv_module.a`, `libdxbc_spv.a`; **30.6 MB total** |
+| ⭐ **the engine actually renders** | ✅ **`D12-G1` PASS against the static archive, 2026-08-05** — 28 steps, 0 failures, DXIL SM 6.0 triangle exact at five sample points, `dumpbin /IMPORTS` shows **no `dxgi.dll`**. Caps identical to the mingw arm. Until this run the clang-cl archives had produced nothing and only the mingw DLL had ever drawn. `tmp/dx12/gates/G1-static/RESULT.md` |
+| ⭐ **measured minimal link set** | **`libhelios_d3d12_static.a` + `gdi32.lib`. One archive, one system library** — this is what `umd12/build.rs` hard-codes at S4. |
+| archive set | ⚠ The six sibling archives (`libvkd3d-proton.a`, `libvkd3d_common.a`, `libvkd3d-shader.a`, `libdxil-spirv.a`, `libdxbc_spv_module.a`, `libdxbc_spv.a`; 30.6 MB with the union) are **redundant on the link line**, not required: `libhelios_d3d12_static.a` is a *union* archive that meson hands every one of their objects (`build.ninja:1146`, `STATIC_LINKER_RSP`). Passing them anyway is harmless. |
 
 **The fork change:** `libs/d3d12core/meson.build` gains `helios_d3d12_static` — the same Helios entry
 points as the DLL target, as a `static_library`, **without `main.c` and without `lib_dxgi`**. `main.c`
@@ -322,6 +324,27 @@ is the only object in the engine that references `CreateDXGIFactory1`; a `shared
 every object it is handed, an archive member is pulled only when referenced, so omitting it makes the
 import unrepresentable. ⇒ **the static arm delivers what D4 reason 1 always wanted and the DLL arm
 never did.**
+
+⛔ **AMENDED 2026-08-05 — "self-contained" was wrong, and the way it was wrong is the lesson.**
+The line above previously called `libhelios_d3d12_static.a` self-contained *because it already defines
+`vkd3d_create_device`*. Linking it alone into the `D12-G1` probe produced **19 unresolved externals**.
+D4 had verified *"0 undefined `CreateDXGIFactory` references"* and never asked about any **other**
+undefined symbol — a search for one name is not a link.
+
+- 14 were `__imp_D3DKMT*`: `libs/vkd3d/d3dkmt.c` imports 12 kernel entry points and `vkd3d_dep` does
+  not carry `lib_gdi32`. That is the **consumer's** job and is why `gdi32` is in the minimal set above.
+- 5 were `vkd3d_debug_control_*` — predicates `libvkd3d`'s `device.c`, `command.c`, `resource.c` and
+  `state.c` call **unconditionally**, and which lived in `main.c`, **the one object the static target
+  omits**. Dropping main.c for its dxgi import silently dropped these with it; the DLL arm never
+  noticed because a `shared_library` force-links everything.
+
+**Fix:** fork commit `8ee4440b` moves the facility verbatim from `main.c:840-1045` into
+`libs/d3d12core/debug_control.c` (+ `.h`), added to **both** `d3d12core_src` and the static target, so
+all three targets carry **one** implementation. Restating the five in the Helios target was rejected:
+they read state that only the COM vtbl writes, so two copies would mean the conformance arm's
+`IVKD3DDebugControlInterface` not reaching the shipping arm's statics — a behavioural difference
+between the arms, which is exactly what `D12-G1` exists to rule out. `debug_control.c` references no
+DXGI, so the zero-dxgi property is untouched.
 
 ⛔ **One required build flag, and it is a risk acknowledgement rather than a fix.**
 `-D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH` on both `c_args` and `cpp_args`: MSVC 14.44's
@@ -355,8 +378,12 @@ ordering; it is the reason the switch is cheap.
 on the Linux host, and upstream's README says outright it does *"not stress test"* MSVC builds. Two
 build recipes, one shipping arm — the MSVC/clang-cl archives ship, the mingw suite validates.
 
-⛔ The retired `helios_vkd3d` shared target is kept in the fork **only** so `D12-G1` stays reproducible.
-Delete it once G1 has been re-run against the static arm.
+⛔ The retired `helios_vkd3d` shared target is kept in the fork. It was originally kept *only* so
+`D12-G1` stayed reproducible, to be deleted once G1 had been re-run against the static arm — **that
+re-run happened on 2026-08-05 and PASSED, and the target still stays.** It is now the comparison
+control: `tmp/dx12/gates/G1-static/arm-diff.txt` is the whole difference between the two arms, and a
+future engine regression is far cheaper to localise when the pre-D4 binary can still be built and run
+from the same probe source. It costs one `shared_library` stanza and is on no shipping path.
 
 **Decision D5 — the KMD is not on the critical path.** For Phase 0 the KMD work list is **empty**;
 for the DDI arm it is three items, none required for the first triangle:

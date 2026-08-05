@@ -599,11 +599,74 @@ H5 and U14 as a side effect):
    probe's own stdout is ever printed* — the first run looked like a probe crash and was a
    PowerShell artefact. Redirect inside `cmd` instead (`build-g1-probe.ps1`).
 
-⚠ **The probe links `dxgi.lib` for exactly one thing — reading the Helios adapter's LUID** (it
-matches `VendorId == 0x1af4` and never assumes index 0; on this guest Helios is index 0 and two
-Microsoft Basic Render Driver entries follow). It links **no `d3d12.lib`**, which is the property
-that makes it a test of the engine rather than of the runtime. `umd12` gets the LUID from the
-runtime and needs no DXGI at all.
+⚠ ~~**The probe links `dxgi.lib` for exactly one thing — reading the Helios adapter's LUID**~~
+⛔ **No longer true — see the static arm below, where NOT linking it is a pass criterion.** It links
+**no `d3d12.lib`**, which is the property that makes it a test of the engine rather than of the
+runtime. `umd12` gets the LUID from the runtime and needs no DXGI at all.
+
+---
+
+#### ✅✅ RE-RUN AND PASSED 2026-08-05 against the **STATIC** engine — `D12-G1` static arm
+
+**Why a second pass was mandatory.** The run above was against the **mingw-cross
+`helios_vkd3d.dll`**. `DECISIONS.md` D4 then made the shipping engine a set of **clang-cl static
+archives**, and those had produced nothing: different compiler, different CRT, and a suppressed STL
+version assert (`-D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH`). A build succeeding is not an engine
+working, and every later stage rests on this one.
+
+**As built:** the *same* `tools/d3d12_bridge_probe.cpp`, with `-DHELIOS_G1_STATIC` selecting the
+static arm, driven by `tmp/dx12/build-g1-static.ps1` (dxc → `-Fh`, then **clang-cl** `/MD`
+`-D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH` — the archives' own ABI triple — then run). Artifacts in
+`tmp/dx12/gates/G1-static/`; `RESULT.md` there is the write-up.
+
+⛔ **One source, two arms.** A second copied probe would let the 28 steps drift apart and the
+comparison would then prove nothing. `arm-diff.txt` is the whole normalised difference between the
+two runs: **six lines, all of them the engine-resolution banner.** Steps 03–28 — caps, both Helios
+entry points, all five pixel samples, teardown — are identical.
+
+**Pass criteria, all met:** 28 steps / 0 failures; the DXIL SM 6.0 triangle exact at five sample
+points; `Release()` to refcount 0; caps identical to the mingw arm; **and one new assertion the DLL
+arm could never pass** —
+
+> ⭐ `dumpbin /IMPORTS` on the probe binary shows **no `dxgi.dll`**. Imports are exactly `GDI32`,
+> `KERNEL32`, `MSVCP140`, `VCRUNTIME140{,_1}` and nine UCRT api-sets.
+
+`umd/build.rs:239-243` states the rule — *"a WDDM UMD sits below DXGI and implements the DXGI DDI; it
+must not depend on dxgi.dll"* — and the retired arm broke it twice over: the probe linked `dxgi.lib`,
+**and** `helios_vkd3d.dll` carried a static `CreateDXGIFactory1` import from `libs/d3d12core/main.c`.
+The static arm is the first artifact that actually keeps it. Step `[01]` also asserts the engine is
+in the probe's own image (`GetModuleHandleExW(FROM_ADDRESS, &helios_vkd3d_create_device) ==
+GetModuleHandleW(NULL)`), so a link against an import library instead of the archive fails loudly.
+
+**⭐ The deliverable — the MEASURED minimal link set, which `umd12/build.rs` hard-codes at S4:**
+
+```
+libs\d3d12core\libhelios_d3d12_static.a        # ONE archive: it is a union of every
+                                               # vkd3d / dxil-spirv / dxbc-spirv object
+gdi32.lib                                      # the 12 __imp_D3DKMT* in libs/vkd3d/d3dkmt.c
+```
+
+Nothing else — not `advapi32`, not `ole32`, not `user32`, not `version`, and ⛔ never `dxgi`.
+
+**Two findings that had to be fixed before it would link at all:**
+
+1. ⛔ **`libhelios_d3d12_static.a` was NOT self-contained**, as D4's status table claimed. The
+   archive alone gave **19 unresolved externals**. D4 had verified *"0 undefined `CreateDXGIFactory`
+   references"* and never asked about any other undefined symbol — **a search for one name is not a
+   link.** Five of the 19 were `vkd3d_debug_control_*` predicates that `libvkd3d` calls
+   unconditionally and that lived in `main.c`, the one object the static target omits. Fixed by fork
+   commit `8ee4440b`, which splits the facility into `libs/d3d12core/debug_control.c` and adds it to
+   both `d3d12core_src` and the static target. `DECISIONS.md` D4 carries the full note.
+2. ⚠ **`KMTQAITYPE_ADAPTERREGISTRYINFO` fails on every adapter on this box.** The probe's
+   dxgi-free adapter walk therefore identifies Helios by
+   `KMTQAITYPE_UMDRIVERNAME(KMTUMDVERSION_DX11)` — the adapter whose D3D11 UMD is our DriverStore
+   `helios_umd.dll`. That is a *stronger* identification than the old `VendorId == 0x1af4` match: it
+   names the driver under test rather than the PCI device, and it is the same `UserModeDriverName`
+   mechanism `DECISIONS.md` D3 rests on.
+
+⛔ **The retired `helios_vkd3d` shared target stays** even though its "keep until G1 re-runs"
+condition is now discharged — it is the comparison control for `arm-diff.txt`, and G0/G2 still need
+the mingw conformance arm. Both were rebuilt green after the fork split (clang-cl 11/11, mingw 41/41).
 
 <details><summary>Superseded: the original app-local device gate (kept for the adapter-identification
 recipe, which is still needed)</summary>
@@ -2192,6 +2255,6 @@ step gains `"vkd3d=$(git rev-parse HEAD:vkd3d-proton-helios)"` beside `mesa` and
 | 7.24 | **Does vkd3d-proton allocate one `VkSampler` per D3D12 sampler descriptor, or does it dedupe?** `VulkanOn12.md:1122` requires new drivers to report `MaxSamplerDescriptorHeapSize >= 4000`, mandatory at DDI 0102+ and therefore at the `_0110` Helios negotiates. The host GPU's `maxSamplerAllocationCount` is **exactly 4000** (`docs/reference/host-vulkan-profile-rtx-pro-6000-blackwell.json:882`), so if the mapping is 1:1 a single conformant sampler heap consumes the entire substrate budget with zero headroom. `maxDescriptorSetSamplers` is 1048576, so the ceiling is allocation count, not set size. | Read `vkd3d-proton-helios/libs/vkd3d/` for the `VkSampler` cache/dedupe path; then a probe that creates a 4000-entry shader-visible sampler heap on the live guest and watches for `VK_ERROR_TOO_MANY_OBJECTS`. **Before the caps answer at P3** — this decides whether the mandated floor is reportable at all. |
 | 7.25 | **Must `helios_umd12` participate in the runtime shader cache, or explicitly refuse it?** The machinery exists on SDK 26100: the runtime pushes `D3D12DDI_SHADERCACHE_CALLBACKS_0021 { pfnShaderCacheGetValueCb, pfnShaderCacheStoreValueCb }` (`d3d12umddi.h:4266-4270`) into the driver by calling the driver's own `pfnSetExtendedFeatureCallbacks` (`:4100`) with `Table = D3D12DDI_TABLE_TYPE_0021_SHADERCACHE_CALLBACKS` (=10, `:2498`), gated by the extended-feature handshake — **not** by `pfnGetOptionalDDITables`, which goes the other direction. Whether WARP took that path is not in the `D12-G5` record. ⚠ Related but separate: the `D3DShaderCacheRegistration: Registry Error` that appeared on **every** G5 ETW capture is still unexplained. | Re-read the G5 spy log for `pfnSetExtendedFeatureCallbacks` with `Table == 10`; if absent, decline the extended feature explicitly with a named counter rather than silently. **P3, with the caps answer.** |
 | 7.26 | ⭐ **Which Helios layer must raise device-removal, and why does the live null-UAV-counter fault hang instead?** `D3D12GpuDumps.md:224` gives the chain for a kernel-detected error: dxgkrnl sets a `_VIDSCH_ERROR_CODE`, the user-mode boundary turns it into a `D3DKMT_DEVICEEXECUTION_STATE`, and the D3D12 runtime converts that to `DXGI_ERROR_DEVICE_REMOVED`/`HUNG`/`RESET`. ⚠ But `:86`'s workflow opens with *"dxgkrnl detects a timeout or other issues that result in a device error (existing functionality)"* — both specs treat **detection** as pre-existing and out of scope, and neither mentions a translation layer, so the venus→virglrenderer→host half is unaddressed anywhere in the corpus. Microsoft does separately concede a *"software device removal"* class detected by the runtime rather than the kernel, which would be the one lever a forwarding UMD has. ⛔ Also: **DRED cannot diagnose this.** Its API path requires a removal to have been *detected* first, so on a hang with no reported removal `ID3D12DeviceRemovedExtendedData` returns nothing — `GATES.md` §5.3's triage order must not send the first hour at it. | Two arms. (a) During the hang, take an ETW `Microsoft-Windows-DxgKrnl` all-keywords slice and read whether a DMA packet is outstanding: if one is, TDR is being suppressed (a `TdrDelay` or completion-reporting bug in `kmd_render`); if none is, the KMD never queued the work and dxgkrnl has nothing to time out. (b) Determine whether `pfnSetErrorCb` with a device-removed HRESULT actually marks the device removed — vkd3d already learns `VK_ERROR_DEVICE_LOST` from the ICD, so that would let `helios_umd12` convert a host context death into a reported removal. **Stability WS / G11.** |
-| ~~7.29~~ | ✅ **SETTLED 2026-08-05 — DECIDED STATIC, and built.** Owner: *"we are going to statically link vkd3d-proton and not mess with dynamic dlls."* The costed build was run the same day and cleared every unknown: vkd3d configures and compiles under **clang-cl 17.0.6 / lld-link / `b_vscrt=md`** — the exact DXVK toolchain — **143/143 targets, exit 0**. `widl` and `glslangValidator` were already present (§7.9). One flag is REQUIRED: `-D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH` on `c_args`+`cpp_args`, because MSVC 14.44's `<yvals_core.h>` demands Clang 19+ — the same define `umd/build.rs` already applies to the DXVK shim, and the same risk acknowledgement. `DECISIONS.md` D4. | Closed. Build with `win_vkd3d`. ⛔ Re-run `D12-G1` against the static arm before deleting the retired `helios_vkd3d` shared target. |
-| ~~7.28~~ | ✅ **SETTLED 2026-08-05 by the static arm — the import is gone.** Was: `helios_vkd3d.dll` statically imports `CreateDXGIFactory1`, so loading the engine loaded DXGI, which is what `DECISIONS.md` D4 reason 1 exists to prevent. The cheap arm worked exactly as predicted: `helios_d3d12_static` omits `libs/d3d12core/main.c` — the only object in the engine that references the symbol — and because an archive member is pulled only when referenced, the import cannot be generated. Measured on the clang-cl build: **0** undefined `CreateDXGIFactory` refs in `libhelios_d3d12_static.a`, `libvkd3d-proton.a` and `libdxil-spirv.a`, against **1** dxgi import still present in the retired `helios_vkd3d.dll`. Both Helios entry points survive as defined symbols. | Closed. The DLL arm keeps the import and is retired; it is retained only for `D12-G1` reproducibility. |
+| ~~7.29~~ | ✅ **SETTLED 2026-08-05 — DECIDED STATIC, and built.** Owner: *"we are going to statically link vkd3d-proton and not mess with dynamic dlls."* The costed build was run the same day and cleared every unknown: vkd3d configures and compiles under **clang-cl 17.0.6 / lld-link / `b_vscrt=md`** — the exact DXVK toolchain — **143/143 targets, exit 0**. `widl` and `glslangValidator` were already present (§7.9). One flag is REQUIRED: `-D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH` on `c_args`+`cpp_args`, because MSVC 14.44's `<yvals_core.h>` demands Clang 19+ — the same define `umd/build.rs` already applies to the DXVK shim, and the same risk acknowledgement. `DECISIONS.md` D4. | Closed. Build with `win_vkd3d`. ✅ **`D12-G1` re-run against the static arm the same day and PASSED** (§4.2, `tmp/dx12/gates/G1-static/`) — 28 steps, 0 failures, no `dxgi.dll` import, minimal link set measured at `libhelios_d3d12_static.a` + `gdi32`. It cost one fork fix: the archive was **not** self-contained (5 `vkd3d_debug_control_*` predicates lived in the omitted `main.c`), fixed by `8ee4440b`. ⛔ The retired shared target now **stays** as the comparison control. |
+| ~~7.28~~ | ✅ **SETTLED 2026-08-05 by the static arm — the import is gone.** Was: `helios_vkd3d.dll` statically imports `CreateDXGIFactory1`, so loading the engine loaded DXGI, which is what `DECISIONS.md` D4 reason 1 exists to prevent. The cheap arm worked exactly as predicted: `helios_d3d12_static` omits `libs/d3d12core/main.c` — the only object in the engine that references the symbol — and because an archive member is pulled only when referenced, the import cannot be generated. Measured on the clang-cl build: **0** undefined `CreateDXGIFactory` refs in `libhelios_d3d12_static.a`, `libvkd3d-proton.a` and `libdxil-spirv.a`, against **1** dxgi import still present in the retired `helios_vkd3d.dll`. Both Helios entry points survive as defined symbols. ⭐ **And now proven at the binary level, not just by symbol search:** the `D12-G1` static arm's probe binary imports `GDI32`, `KERNEL32`, `MSVCP140`, `VCRUNTIME140{,_1}` and nine UCRT api-sets — **no `dxgi.dll`**, from `dumpbin /IMPORTS` (§4.2). ⚠ The same run also showed the limit of the symbol-search method that closed this row: it asked about **one** name, and the archive turned out to be missing five others. | Closed. The DLL arm keeps the import and is retired; it is retained as the `D12-G1` comparison control. |
 | 7.27 | **Is the render-pass tier cross-checked against whether the driver filled the render-pass DDI table, in both directions, fatally?** `RenderPasses.md:723-727` states that a driver filling the table must report at least `TIER_1` and one that does not must report `TIER_0`. That is a **different shape** from every cross-check `DDI_REFERENCE.md` §11.5 currently catalogues (which relate one cap to another cap or to a shader model) — this one relates a cap to *table population*. ⚠ The sentence is hard-wrapped in the source and the one-line quote alone carries neither direction, so it is recorded as plausible, not established. Helios reports `NOT_SUPPORTED` and does not fill the table, which is self-consistent either way. | Confirm at **G7** by reading the full `:723-727` passage against a caps-mutation arm: report `TIER_1` without filling the table and see whether `D3D12CreateDevice` fails with the `0x887A0020` + English-reason signature §11.5.0 documents. |

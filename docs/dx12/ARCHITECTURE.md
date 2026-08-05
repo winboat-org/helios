@@ -1720,7 +1720,7 @@ these three substitutions:
 | where the table says | read |
 |---|---|
 | S0 builds `helios_vkd3d.dll` by **mingw cross on the Linux host** | that build **stays**, but as the **conformance** arm only — it is what `D12-G0`/`G2` need for the vkd3d test suite. The **shipping** artifacts are static archives built on the VM by **`win_vkd3d`** with clang-cl (`libhelios_d3d12_static.a` + six engine archives, ~30.6 MB), matching how DXVK is built and linked today. |
-| S4's probe **`LoadLibrary`s** the engine | S4's `umd12/build.rs` **links the archives**, exactly as `umd/build.rs` links DXVK's eight. There is no engine DLL on the shipping path and no `LoadLibrary` of one. |
+| S4's probe **`LoadLibrary`s** the engine | S4's `umd12/build.rs` **links the archives**, exactly as `umd/build.rs` links DXVK's eight. There is no engine DLL on the shipping path and no `LoadLibrary` of one. ⭐ **The link set is MEASURED, not guessed** (`D12-G1` static arm, 2026-08-05): `libhelios_d3d12_static.a` **alone**, plus `cargo:rustc-link-lib=dylib=gdi32`. One archive — it is a *union* archive carrying every vkd3d / dxil-spirv / dxbc-spirv object — and `gdi32` for the 12 `__imp_D3DKMT*` that `libs/vkd3d/d3dkmt.c` imports. ⛔ **Never `dxgi`.** `tmp/dx12/gates/G1-static/RESULT.md` |
 | `helios_vkd3d.dll` as a deliverable | `helios_d3d12_static` (the fork's new `static_library` target, which omits `libs/d3d12core/main.c` so no `CreateDXGIFactory1` import can be generated — verified 0 refs). |
 
 ⚠ **What does NOT change:** the two Helios entry points (`helios_vkd3d_create_device`,
