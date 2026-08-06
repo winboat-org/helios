@@ -3827,6 +3827,40 @@ silent on it:
     `IncludingGpu` only means GPU completion for `ring_idx >= 1`.) ⭐ **The first step needs ZERO
     KMD change**: `dma_gpu_fence` defaults to 1, so a bare `pfnRenderCb` already takes
     `RetireDomain::IncludingGpu` + `watermark = next_wire_fence` in shipped, exercised code.
+  - ⛔⛔ **UV3 IS ANSWERED (✗) FROM SOURCE, AND IT INVALIDATES THAT EXPERIMENT'S DECISION TABLE**
+    (2026-08-06; full account and citations in `KMD_IMPACT.md` §14a.1's correction block).
+    **For a D3D12 frame this driver usually sees no wire fence at all.** vkd3d's command stream
+    rides the shared venus ring and never touches virtio (`vn_ring.c:630-636`); the only virtio
+    submission a frame can make is the ring-0 `vkNotifyRingMESA` doorbell, and that is sent only
+    when the host ring advertises IDLE and then only past a **1 ms limiter**
+    (`vn_ring.c:673-690`) — so a ring busier than 1 ms emits nothing, `next_wire_fence` freezes,
+    and `async_retired_up_to` returns true instantly. ⇒ ***the measured 0.8–1.1 µs is an EMPTY
+    WATERMARK, not a fence bug.***
+    - ⛔ **UV3's own cited evidence was stale in both halves**: `SUBMIT_VENUS` *does* propagate
+      `ring_idx` (`vn_renderer_helios.c:1702`) and is **not** synchronous (`:1672-1678` — ASYNC,
+      *"returns at QUEUE time"*). Right conclusion, wrong mechanism — which is why the fix it
+      implied (ICD-1, "the last submitted wire fence") was also wrong and is now **replaced** by a
+      per-queue `vkWaitRingSeqnoMESA` barrier submitted on `queue->ring_idx`.
+    - ⛔ **The bare-`pfnRenderCb` reading cannot answer UV1**, so the table's *"N flat under both
+      ⇒ UV1 ✗"* row must not be used. K-F1 settles the **plumbing** (and **P7**, free);
+      **UV1's only clean test is the deliberate KMD-side hold**, which is therefore no longer
+      conditional on K-F1.
+    - ⛔ **The "one free run" UV3 pre-check is dead twice over**: `RING_SUBMIT_COUNT` /
+      `RING_COMPLETE_COUNT` appeared **only** in the `'HDBG'` `DxgkDdiCollectDbgInfo` report, i.e.
+      readable only by provoking a TDR — and `SCANOUT_RING_IDX = 1`, so they count **this driver's
+      own** scanout/BLT copies from *three* internal producers (`gpu/mod.rs:3375`, `:3442`,
+      `ctrl.rs:1541-1547`). Now mirrored as `RngSub`/`RngCmp` with a guest-originated split
+      (`EscSub`/`EscSubRing`) counted at the escape wrapper — attribution, not a subtraction.
+    - ⭐ **Why D3D11 is truthful and D3D12 is not, in one line:** the only `ring_idx >= 1` producer
+      on Windows is `vn_signal_win32_external_semaphore` (`vn_queue.c:1714-1724`, `:1986-1994`),
+      which needs an **OPAQUE_WIN32** semaphore. DXVK's present path signals one per frame; vkd3d
+      signals an internal timeline semaphore and a non-shared `ID3D12Fence` has no Vulkan
+      semaphore at all. ⇒ `EscSubRing` has a nonzero **control** reading from DWM alone, so the
+      run needs an idle-desktop vs. probe-running arm over the same window.
+    - ⛔ A ring-0 fence is not even a venus *decode* fence here: without
+      `VIRTIO_GPU_FLAG_INFO_RING_IDX` (`gpu/mod.rs:3482`) QEMU routes it to the legacy
+      `virgl_renderer_create_fence`, which ignores `ctx_id`
+      (`qemu-helios/hw/display/virtio-gpu-virgl.c:1167-1186`).
   - ⛔ **A LIVE DEFECT ON THE SHIPPING PRESENT PATH, found on the way and independent of D3D12**:
     `present_stream_marker_boundary` (`virtio/gpu/mod.rs:4721-4744`) bounds the guest-supplied
     `value` in no way, so an absurd `present_value` yields a *live* boundary
