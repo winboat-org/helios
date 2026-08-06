@@ -222,18 +222,21 @@ unsafe extern "C" fn present(
     // adapter, so nothing establishes that this driver will only ever see NULL.
     if !arg.hDstResource.pDrvPrivate.is_null() {
         note_refusal(&L8_REFUSALS.present_dst_resource_refused);
-        log_error!(
-            "L8: pfnPresent with hDstResource={:p} subresource={} -- a resource-to-resource \
-             present is not implemented; refusing rather than presenting the back buffer to the \
-             wrong destination (flags={:#x} vidpn={} surfaces={})",
-            arg.hDstResource.pDrvPrivate,
-            arg.DstSubResourceIndex,
-            // SAFETY: the union's `Value` arm is a plain `UINT` overlaying the
-            // bitfield; reading it is defined for any initialised bit pattern.
-            unsafe { arg.Flags.__bindgen_anon_1.Value },
-            arg.VidPnSourceID,
-            arg.SurfacesToPresent,
-        );
+        let n = L8_REFUSALS.present_dst_resource_refused.get();
+        if n <= LOG_BUDGET {
+            log_error!(
+                "L8: pfnPresent with hDstResource={:p} subresource={} -- a resource-to-resource \
+                 present is not implemented; refusing rather than presenting the back buffer to \
+                 the wrong destination (flags={:#x} vidpn={} surfaces={}) (x{n})",
+                arg.hDstResource.pDrvPrivate,
+                arg.DstSubResourceIndex,
+                // SAFETY: the union's `Value` arm is a plain `UINT` overlaying the
+                // bitfield; reading it is defined for any initialised bit pattern.
+                unsafe { arg.Flags.__bindgen_anon_1.Value },
+                arg.VidPnSourceID,
+                arg.SurfacesToPresent,
+            );
+        }
         return;
     }
 
@@ -243,11 +246,14 @@ unsafe extern "C" fn present(
     // truncated.
     if arg.SurfacesToPresent == 0 || arg.phSurfacesToPresent.is_null() {
         note_refusal(&L8_REFUSALS.present_bad_arg);
-        log_error!(
-            "L8: pfnPresent with SurfacesToPresent={} phSurfacesToPresent={:p}",
-            arg.SurfacesToPresent,
-            arg.phSurfacesToPresent,
-        );
+        let n = L8_REFUSALS.present_bad_arg.get();
+        if n <= LOG_BUDGET {
+            log_error!(
+                "L8: pfnPresent with SurfacesToPresent={} phSurfacesToPresent={:p} (x{n})",
+                arg.SurfacesToPresent,
+                arg.phSurfacesToPresent,
+            );
+        }
         return;
     }
     if arg.SurfacesToPresent > 1 {
@@ -269,13 +275,21 @@ unsafe extern "C" fn present(
         // it was not adopted — which means the create did not see
         // `D3D12DDI_HEAP_FLAG_PRIMARY`. Read this against `HeapPrimaryVenusExport`.
         note_refusal(&L8_REFUSALS.present_source_not_adopted);
-        log_error!(
-            "L8: pfnPresent source resource {:#x} has no kernel allocation -- it was never \
-             adopted, so the runtime has nothing to present. Check HeapPrimaryVenusExport \
-             against IdentityRecorded (subresource={})",
-            engine.as_raw() as usize,
-            surface.SubResourceIndex,
-        );
+        // ⛔ BUDGETED, and this is the site where it matters most: if the admission
+        // predicate is wrong then EVERY present takes this arm, at frame rate, on the
+        // exact run designed to answer that question -- and an unbounded logger there
+        // is the T2 measurement again (module doc's `LOG_BUDGET`). The counter is
+        // unbounded; the line is not.
+        let n = L8_REFUSALS.present_source_not_adopted.get();
+        if n <= LOG_BUDGET {
+            log_error!(
+                "L8: pfnPresent source resource {:#x} has no kernel allocation -- it was never \
+                 adopted, so the runtime has nothing to present. Check HeapPrimaryVenusExport \
+                 against IdentityRecorded (subresource={}) (x{n})",
+                engine.as_raw() as usize,
+                surface.SubResourceIndex,
+            );
+        }
         return;
     };
 
@@ -390,13 +404,17 @@ unsafe extern "C" fn present(
     // record — so this is the assertion that the table's invariant held.
     if !record.is_valid() {
         note_refusal(&L8_REFUSALS.present_identity_invalid);
-        log_error!(
-            "L8: pfnPresent identity record REJECTED BY ITS OWN VALIDATOR -- venus_res_id={} \
-             alloc={:#x}. The KMD's dxgkddi_render decode gates on the same predicate, so \
-             submitting it would drop the frame's identity silently",
-            identity.venus_res_id,
-            identity.h_allocation,
-        );
+        let n = L8_REFUSALS.present_identity_invalid.get();
+        if n <= LOG_BUDGET {
+            log_error!(
+                "L8: pfnPresent identity record REJECTED BY ITS OWN VALIDATOR -- \
+                 venus_res_id={} alloc={:#x}. The KMD's dxgkddi_render decode gates on the \
+                 same predicate, so submitting it would drop the frame's identity silently \
+                 (x{n})",
+                identity.venus_res_id,
+                identity.h_allocation,
+            );
+        }
         return;
     }
     // The allocation list, which is MANDATORY for a present — see
@@ -436,14 +454,20 @@ unsafe extern "C" fn present(
             // `queue::report_present_submit_error` carries the channel argument and
             // why no knob softens it (`METHOD.md` §2 Phase 4 consequence 1).
             note_refusal(&L8_REFUSALS.present_identity_refused);
-            log_error!(
-                "L8: pfnPresent identity submission REFUSED by dxgkrnl hr={:#010x} for alloc={:#x} \
-                 venus_res_id={} on ctx={h_context:p} -- removing the device; no present \
-                 descriptor is written",
-                hr as u32,
-                identity.h_allocation,
-                identity.venus_res_id,
-            );
+            // ⚠ Budgeted like every other line here: `pfnSetErrorCb` removes the
+            // device, but nothing guarantees the runtime stops presenting before it
+            // notices, so this arm is per-frame-reachable too.
+            let n = L8_REFUSALS.present_identity_refused.get();
+            if n <= LOG_BUDGET {
+                log_error!(
+                    "L8: pfnPresent identity submission REFUSED by dxgkrnl hr={:#010x} for \
+                     alloc={:#x} venus_res_id={} on ctx={h_context:p} -- removing the device; \
+                     no present descriptor is written (x{n})",
+                    hr as u32,
+                    identity.h_allocation,
+                    identity.venus_res_id,
+                );
+            }
             // SAFETY: as the submission above — the same live queue handle.
             unsafe { queue::report_present_submit_error(h_queue, hr) };
             // ⛔ No descriptor. The frame's identity did not reach the kernel and the
