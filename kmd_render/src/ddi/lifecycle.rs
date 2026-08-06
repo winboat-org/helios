@@ -200,12 +200,18 @@ pub unsafe extern "C" fn dxgkddi_start_device(
         Ok(gpu) => {
             crate::kmsg(c"Helios: virtio-gpu transport up\n");
             crate::diag::record(0x0B00_0003);
+            let host_visible_bytes = gpu.host_visible().map(|window| window.len);
             // Publish the ISR-status register VA for the DIRQL ISR before the
             // transport goes live (capture before `gpu` is moved into set_virtio).
             adapter
                 .isr_status
                 .store(gpu.isr_status_addr(), core::sync::atomic::Ordering::Release);
             adapter.set_virtio(Some(gpu));
+
+            // An explicit VidMmVramMB registry value remains authoritative.
+            // When it is absent, use the exact virtio shared-memory capability
+            // length rather than a compiled 4-GiB default or the padded PCI BAR.
+            super::bar_segment::resolve_vidmm_vram_mb(&mut knobs, host_visible_bytes);
 
             // ── BAR memory segment / CPU host aperture ──────────────────────
             // Reserve the window head BEFORE any blob map can allocate a
@@ -236,6 +242,7 @@ pub unsafe extern "C" fn dxgkddi_start_device(
                 .isr_status
                 .store(0, core::sync::atomic::Ordering::Release);
             adapter.set_virtio(None);
+            super::bar_segment::resolve_vidmm_vram_mb(&mut knobs, None);
         }
     }
 
