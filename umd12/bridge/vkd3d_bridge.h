@@ -79,15 +79,40 @@ std::int32_t helios_vkd3d_bridge_serialize_root_signature(
     std::size_t* blob_out, std::size_t* err_out) noexcept;
 
 // K-F1 (`docs/dx12/KMD_IMPACT.md` §14a.2). Drain one `ID3D12CommandQueue`'s vkd3d
-// submission worker: when this returns true, everything enqueued on that queue
-// before the call has reached `vkQueueSubmit`.
+// submission worker, and — while the queue is still held — sample the venus wire
+// fence that retires at host GPU completion of everything now submitted to it.
 //
-// ⭐ A CPU-side wait for SUBMISSION, NOT for GPU completion. That distinction is
-// the whole reason this call is permitted where `FENCE-BRIDGE-DESIGN.md`'s
-// design A is rejected: it costs no CPU/GPU overlap.
+// ⭐ The drain is a CPU-side wait for SUBMISSION, NOT for GPU completion. That
+// distinction is the whole reason this call is permitted where
+// `FENCE-BRIDGE-DESIGN.md`'s design A is rejected: it costs no CPU/GPU overlap.
+// The fence sample is not a wait at all — it reads a boundary and returns.
 //
 // `queue` is an `ID3D12CommandQueue*` carried as an integer, for the same
 // header-isolation reason as `d3d12_device_ptr` above. BORROWED — no reference is
 // taken and none is released. Returns false and counts if `queue` is 0 or if the
 // engine declined to hand over the Vulkan queue. Never throws: `bridge_guard`.
-bool helios_vkd3d_bridge_drain_queue(std::size_t queue) noexcept;
+//
+// `out_wire_fence` / `out_fence_status`: pass **both or neither**. Non-null asks
+// for the fence and both are always written before this returns. A **0 fence is a
+// legal outcome**, not an error — it is `HeliosD3D12SubmitCmd`'s documented "order
+// against nothing" arm — so the status is what says WHY, and the four values are
+// four different findings that must not share a counter:
+//
+//   0 `HELIOS_VKD3D_FENCE_SAMPLED`    — a non-zero fence; the boundary is real
+//   1 `HELIOS_VKD3D_FENCE_NO_ICD`     — no venus ICD module in this process, or the
+//                                       S4b anchor refused (two ICD images live)
+//   2 `HELIOS_VKD3D_FENCE_NO_EXPORT`  — the module predates
+//                                       `helios_venus_queue_gpu_fence`
+//   3 `HELIOS_VKD3D_FENCE_REFUSED`    — the export ran and declined (ring 0, a
+//                                       handle it could not decode, no ctx, ...)
+//
+// ⛔ Keep these values in sync with `bridge12.rs`'s `FenceStatus`, which maps them
+// by number and counts an unknown value rather than assuming.
+constexpr std::uint32_t HELIOS_VKD3D_FENCE_SAMPLED = 0;
+constexpr std::uint32_t HELIOS_VKD3D_FENCE_NO_ICD = 1;
+constexpr std::uint32_t HELIOS_VKD3D_FENCE_NO_EXPORT = 2;
+constexpr std::uint32_t HELIOS_VKD3D_FENCE_REFUSED = 3;
+
+bool helios_vkd3d_bridge_drain_queue(std::size_t queue,
+                                     std::uint64_t* out_wire_fence,
+                                     std::uint32_t* out_fence_status) noexcept;

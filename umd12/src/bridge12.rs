@@ -118,7 +118,16 @@ mod ffi {
         /// disguise: nothing in the signature stops a caller passing a stale or
         /// foreign value, and the C++ body dereferences it through vkd3d's
         /// `CONTAINING_RECORD`.
-        unsafe fn helios_vkd3d_bridge_drain_queue(queue: usize) -> bool;
+        ///
+        /// `out_wire_fence` / `out_fence_status` are passed **both or neither**
+        /// and both are always written when non-null (0 and a status). See
+        /// [`drain_queue`] for the status mapping and [`FenceStatus`] for why a
+        /// zero fence has four distinguishable causes.
+        unsafe fn helios_vkd3d_bridge_drain_queue(
+            queue: usize,
+            out_wire_fence: *mut u64,
+            out_fence_status: *mut u32,
+        ) -> bool;
     }
 }
 
@@ -247,5 +256,89 @@ pub(crate) unsafe fn serialize_root_signature(
 pub(crate) unsafe fn drain_queue(queue: usize) -> bool {
     // SAFETY: forwarded unchanged; the caller's guarantee above is exactly the
     // cxx declaration's precondition, and the C++ side additionally refuses a 0.
-    unsafe { ffi::helios_vkd3d_bridge_drain_queue(queue) }
+    // Null out-params ask for no fence sample and the C++ side skips resolving the
+    // export entirely — which is the `Umd12EclFence=0` arm's whole cost.
+    unsafe {
+        ffi::helios_vkd3d_bridge_drain_queue(queue, core::ptr::null_mut(), core::ptr::null_mut())
+    }
+}
+
+/// Why a GPU-completion boundary came back as it did.
+///
+/// ⛔ **A zero fence is a LEGAL outcome** — `HeliosD3D12SubmitCmd`'s documented
+/// "submit the packet, order it against nothing" arm — so the caller cannot learn
+/// anything from the value alone. These are the four *reasons*, and they are four
+/// different findings: an ICD that is not there, an ICD too old to have the export,
+/// an export that ran and declined (ring 0, an undecodable handle, no venus ctx),
+/// and a real boundary. ⛔ Sharing one counter between them would produce exactly
+/// the un-attributable number this project has now corrected four times in the
+/// KMD's own counters.
+///
+/// ⚠ **The numbers are the C++ side's** — `HELIOS_VKD3D_FENCE_*` in
+/// `umd12/bridge/vkd3d_bridge.h`, which is the single declaration. This mapping is
+/// by value across an FFI the type system cannot check, so [`Self::Unknown`] exists
+/// rather than a `_ => Refused` that would silently absorb a drift.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FenceStatus {
+    /// A non-zero wire fence retiring at host GPU completion. The real boundary.
+    Sampled,
+    /// No venus ICD module in this process, or the S4b anchor refused because two
+    /// ICD images are live. Counted and logged once, at resolution.
+    NoIcd,
+    /// The anchored ICD module predates `helios_venus_queue_gpu_fence`. ⛔ The
+    /// designed graceful path, not an error: an older ICD still gets a submission,
+    /// carrying the 0 boundary.
+    NoExport,
+    /// The export ran and declined. ⚠ Its own most important arm is `ring_idx == 0`,
+    /// which it refuses unconditionally because a ring-0 wire fence retires at
+    /// decode — a fence that would lie about GPU completion.
+    Refused,
+    /// The C++ side returned a value this enum does not know. ⛔ A drift between
+    /// `vkd3d_bridge.h`'s constants and this mapping, and it must be loud: silently
+    /// folding it into `Refused` would make the next status added invisible.
+    Unknown(u32),
+}
+
+impl FenceStatus {
+    /// Map the C++ side's `HELIOS_VKD3D_FENCE_*` value. ⛔ The authority for these
+    /// numbers is `umd12/bridge/vkd3d_bridge.h`; keep both in sync.
+    fn from_raw(raw: u32) -> Self {
+        match raw {
+            0 => Self::Sampled,
+            1 => Self::NoIcd,
+            2 => Self::NoExport,
+            3 => Self::Refused,
+            other => Self::Unknown(other),
+        }
+    }
+}
+
+/// Drain one command queue **and** sample the venus wire fence that retires at host
+/// GPU completion of everything now submitted to it.
+///
+/// Returns `(drained, wire_fence, status)`. `drained` is [`drain_queue`]'s value and
+/// is independent of the fence: a queue can drain successfully and still yield no
+/// boundary, which is what `status` explains.
+///
+/// # ⛔ The ordering obligation lives at the C++ call site, not here
+///
+/// The sample happens **after** the `VKD3D_SUBMISSION_DRAIN` and **while both of
+/// vkd3d's queue locks are still held** — see `vkd3d_bridge.cpp`, which carries the
+/// argument in full. The short form, because it is the whole correctness of the
+/// boundary: reading a *larger* ring seqno than needed is harmless (it over-orders),
+/// while reading a **stale smaller** one yields a fence covering less work than the
+/// caller believes, and nothing inside the ICD export can detect that — only the
+/// call's position can.
+///
+/// # Safety
+/// As [`drain_queue`].
+pub(crate) unsafe fn drain_queue_with_fence(queue: usize) -> (bool, u64, FenceStatus) {
+    let mut wire_fence: u64 = 0;
+    let mut raw_status: u32 = 0;
+    // SAFETY: as `drain_queue`, plus two live writable locals for the out-params.
+    // The C++ side clears both before anything that can fail, so they are defined on
+    // every path including a false return.
+    let drained =
+        unsafe { ffi::helios_vkd3d_bridge_drain_queue(queue, &mut wire_fence, &mut raw_status) };
+    (drained, wire_fence, FenceStatus::from_raw(raw_status))
 }

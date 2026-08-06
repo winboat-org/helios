@@ -290,6 +290,7 @@ use windows::Win32::Graphics::Direct3D12::{
 
 use super::fence;
 use super::tables12::{self, stage, CommandQueueTable, DeviceCoreTable, Filling};
+use crate::bridge12::FenceStatus;
 use crate::{ddi12, device12, log_error, note_refusal, trace_line};
 
 // ---------------------------------------------------------------------------
@@ -2212,30 +2213,50 @@ unsafe extern "C" fn destroy_command_signature(
 /// it is unreadable — the packet would go in and nothing in the kernel could tell
 /// it apart from an empty buffer.
 ///
-/// # ⚠ `gpu_wire_fence = 0`, which is a supported value and not a placeholder
+/// # ⚠ `gpu_wire_fence` — RE-GRADED: 0 was the steady state, and now it is a finding
 ///
-/// Zero means *"submit the packet, order it against nothing"* — the type's own doc
-/// says so, and it is why `is_valid()` deliberately does not check the fence. It is
-/// the **plumbing arm**, and it is what K-F1 is: the submission takes the KMD's
-/// existing fall-through for a packet carrying no boundary —
-/// `RetireDomain::IncludingGpu` with `watermark = next_wire_fence` (both in
+/// ⛔ **An earlier version of this doc said the field is 0 and called that "the
+/// plumbing arm, and it is what K-F1 is". That is no longer true, and the grading
+/// went stale the moment the ICD export landed** — the caller now samples
+/// `helios_venus_queue_gpu_fence` inside the drain window and passes a real venus
+/// wire fence retiring at **host GPU completion** of everything submitted to the
+/// queue. With `Umd12EclFence` at its ON default, a zero arriving here is one of
+/// three named findings (`EclFenceNoIcd` / `EclFenceNoExport` / `EclFenceRefused`),
+/// not the expected value.
+///
+/// Zero remains **legal** and unchanged in meaning — *"submit the packet, order it
+/// against nothing"*, which is why `is_valid()` deliberately does not check the
+/// fence — and it is exactly what the `Umd12EclFence=0` arm submits. What changed is
+/// which value is the default, and therefore what a reader should conclude from a
+/// zero.
+///
+/// ⚠ On the zero arm the packet takes the KMD's fall-through for a boundary-less
+/// submission — `RetireDomain::IncludingGpu` with `watermark = next_wire_fence` (in
 /// `gpu/mod.rs`'s WDDM-submission arm, `grep` `let domain = if stream_boundary`) —
-/// with **zero KMD change**. A real GPU-completion boundary needs the ICD export that produces
-/// the fence and the KMD decode that honours it; both are separate lanes, and this
-/// record is already the right shape for them. Only the field's value changes.
+/// a conservative superset needing no KMD change. ⛔ That superset is also why the
+/// zero arm cannot settle anything about ordering: the venus ring emits no virtio
+/// submission while it is busy, so `next_wire_fence` is typically frozen and an
+/// unheld packet retires instantly. A real boundary is what makes the dependency mean
+/// the frame's own work.
 ///
 /// ⛔ **The record's PRESENCE is never conditional on a knob.** `Umd12EclSubmit`
-/// gates the whole `pfnRenderCb` call — packet or no packet — and nothing else.
-/// Presence is what lets a KMD-side experiment scope a deliberate hold to the
-/// D3D12 path instead of to the adapter-global WDDM FIFO, where it would stall
-/// DWM; a second knob that removed the record while keeping the packet would take
-/// that scoping away and leave a packet the kernel cannot attribute.
-fn ecl_submit_command() -> helios_protocol::HeliosD3D12SubmitCmd {
+/// gates the whole `pfnRenderCb` call — packet or no packet — and `Umd12EclFence`
+/// gates only the *value of one field*. Presence is what lets a KMD-side experiment
+/// scope a deliberate hold to the D3D12 path instead of to the adapter-global WDDM
+/// FIFO, where it would stall DWM; a knob that removed the record while keeping the
+/// packet would take that scoping away and leave a packet the kernel cannot
+/// attribute.
+///
+/// ⚠ The fence is **not validated here**, and that is deliberate rather than lax: the
+/// consumer clamps a value at or beyond `next_wire_fence` down to it, so an impossible
+/// future dependency is unrepresentable on the wire and the worst a wrong value can do
+/// is name an earlier boundary and under-wait. The type's own "safety of a
+/// guest-supplied fence" section is the authority.
+fn ecl_submit_command(gpu_wire_fence: u64) -> helios_protocol::HeliosD3D12SubmitCmd {
     helios_protocol::HeliosD3D12SubmitCmd {
         magic: helios_protocol::HELIOS_D3D12_SUBMIT_MAGIC,
         version: helios_protocol::HELIOS_D3D12_SUBMIT_VERSION,
-        // The plumbing arm. See the doc above and the type's own.
-        gpu_wire_fence: 0,
+        gpu_wire_fence,
     }
 }
 
@@ -2711,10 +2732,60 @@ unsafe extern "C" fn execute_command_lists(
         // discipline `HeliosWaitFrameSubmitted` gives the D3D11 present path
         // (`KMD_IMPACT.md` §14a.2).
         //
+        // ⭐⭐ AND THE GPU-COMPLETION BOUNDARY IS SAMPLED IN THE SAME WINDOW, which
+        // is why the drain and the sample are one bridge call rather than two.
+        // `helios_venus_queue_gpu_fence` is read AFTER the drain marker has
+        // completed and WHILE both of vkd3d's queue locks are still held; reading a
+        // larger ring seqno than needed only over-orders, while a stale smaller one
+        // yields a fence covering less work than this packet claims, and nothing
+        // inside the ICD export can detect that — only the call's position can.
+        // `bridge12::drain_queue_with_fence` and the C++ site carry the full
+        // argument, including why the release's own empty `vkQueueSubmit2` is
+        // deliberately outside the boundary.
+        //
+        // ⛔ The boundary is a knob (`Umd12EclFence`, **default ON**) because the
+        // record's own declaration requires the zero arm to stay reachable as the
+        // A/B disable for the fence itself. OFF calls the drain with no out-params,
+        // so the export is never even resolved.
+        //
         // SAFETY: `engine_queue` is the live `ID3D12CommandQueue` this state owns,
         // created by this bridge's own vkd3d engine — `bridge12::drain_queue`'s
         // stated precondition — and it is borrowed for the call only.
-        let drained = unsafe { crate::bridge12::drain_queue(queue.engine_queue.as_raw() as usize) };
+        let (drained, gpu_wire_fence) = if crate::knobs12::umd12_ecl_fence() {
+            let (drained, fence, status) = unsafe {
+                crate::bridge12::drain_queue_with_fence(queue.engine_queue.as_raw() as usize)
+            };
+            // ⛔ One counter per cause, never one for "the fence was 0". A zero is a
+            // LEGAL record value, so the value says nothing on its own and only the
+            // reason is a finding: an absent ICD, an ICD too old for the export, or
+            // an export that ran and declined (its loudest arm being `ring_idx == 0`,
+            // which retires at decode and would lie about GPU completion).
+            note_refusal(match status {
+                FenceStatus::Sampled => &L2_REFUSALS.ecl_fence_sampled,
+                FenceStatus::NoIcd => &L2_REFUSALS.ecl_fence_no_icd,
+                FenceStatus::NoExport => &L2_REFUSALS.ecl_fence_no_export,
+                FenceStatus::Refused => &L2_REFUSALS.ecl_fence_refused,
+                // ⛔ A status this build's mapping does not know = the C++ header and
+                // `bridge12::FenceStatus` have drifted apart. Loud, not absorbed.
+                FenceStatus::Unknown(_) => &L2_REFUSALS.ecl_fence_status_bad,
+            });
+            if let FenceStatus::Unknown(raw) = status {
+                if let Some(n) = budget(&ECL_LOG) {
+                    log_error!(
+                        "ExecuteCommandLists: bridge returned fence status {raw}, which this                          build does not know -- vkd3d_bridge.h's HELIOS_VKD3D_FENCE_* and                          bridge12::FenceStatus have drifted (x{})",
+                        n + 1,
+                    );
+                }
+            }
+            (drained, fence)
+        } else {
+            // ⭐ The A/B disable, and it is the K-F1 plumbing arm exactly: same
+            // packet, same magic, `gpu_wire_fence = 0`.
+            note_refusal(&L2_REFUSALS.ecl_fence_disabled);
+            let drained =
+                unsafe { crate::bridge12::drain_queue(queue.engine_queue.as_raw() as usize) };
+            (drained, 0)
+        };
         if !drained {
             // Counted, and the submission still goes: a failed drain is an
             // ORDERING risk, not a reason to withhold the packet. Withholding it
@@ -2726,8 +2797,9 @@ unsafe extern "C" fn execute_command_lists(
         // SAFETY: this is the DDI that owns the submission and we are on the
         // thread that entered it; `dev` below is the device this queue was created
         // against, and `queue` is live for this call.
-        let outcome = unsafe { device12::device(queue.h_device) }
-            .map(|dev| unsafe { submit_wddm_render(dev, queue, &ecl_submit_command()) });
+        let outcome = unsafe { device12::device(queue.h_device) }.map(|dev| unsafe {
+            submit_wddm_render(dev, queue, &ecl_submit_command(gpu_wire_fence))
+        });
         match outcome {
             Some(WddmSubmit::Submitted) => {}
             // ⛔ `EclNoWddmSubmission` fires for every arm below, including the
@@ -3552,6 +3624,60 @@ pub(crate) struct L2Refusals {
     /// instead of it. `report_ecl_submit_error` has why the gate exists and
     /// `knobs12::UMD12_ECL_SUBMIT_STRICT` the written condition that retires it.
     ecl_submit_error_not_raised: RefusalCounter,
+    /// ⭐⭐ **A REAL GPU-completion boundary went into the submitted record**:
+    /// `helios_venus_queue_gpu_fence` returned a non-zero venus wire fence, sampled
+    /// inside the drain window.
+    ///
+    /// ⛔ **Expected non-zero on every submitting workload with `Umd12EclFence` at
+    /// its ON default, and it is the only counter that means the fence is real.**
+    /// `EclWddmSubmitted` says a packet went in; this says the packet asked for
+    /// something. A run with `EclWddmSubmitted > 0` and `EclFenceSampled == 0`
+    /// submitted only "order against nothing" packets, and its three possible causes
+    /// each have their own counter below.
+    ecl_fence_sampled: RefusalCounter,
+    /// The venus ICD module could not be resolved for the fence export — no loaded
+    /// module exports the probe symbol, or the **S4b anchor refused** because two ICD
+    /// images are live in this process.
+    ///
+    /// ⛔ **Expected 0.** Resolution happens once per process, so a non-zero count is
+    /// one finding repeated per submit, not N findings. ⚠ Read `IcdAnchorMismatch` in
+    /// the bridge log beside it: that separates "no venus ICD at all" from "two of
+    /// them, and this driver refused to pick".
+    ecl_fence_no_icd: RefusalCounter,
+    /// The anchored venus ICD does not export `helios_venus_queue_gpu_fence`.
+    ///
+    /// ⚠ **Expected 0 against a current ICD, and it is a VERSION statement rather
+    /// than a fault**: an older image predating the export is the designed graceful
+    /// path, and the submission still goes with a zero boundary. A non-zero count
+    /// means the deployed `vulkan_venus.dll` is behind the driver — which is a
+    /// deploy-order finding (`win_meson` before `umd12`), not a code defect.
+    ecl_fence_no_export: RefusalCounter,
+    /// The export ran and **declined**, leaving the fence 0.
+    ///
+    /// ⛔ **Expected 0, and its loudest cause is `ring_idx == 0`, which the export
+    /// refuses unconditionally** — a ring-0 wire fence retires at *decode*, so
+    /// honouring one would put a fence on the wire that lies about GPU completion.
+    /// Its other arms are a handle it could not decode as a `VkQueue`, a device or
+    /// renderer whose two independent instance pointers disagree, and a missing venus
+    /// ctx id. ⚠ The bridge log's `queue_gpu_fence(...) declined` line and the ICD's
+    /// own `helios_qgf_refused_*` counters say which.
+    ecl_fence_refused: RefusalCounter,
+    /// `Umd12EclFence` is off, so the record deliberately carried a zero boundary.
+    ///
+    /// ⚠ **Expected 0 on a default build and expected to equal `EclForwarded` on the
+    /// A/B arm** — it is what makes "this run had no boundary" a positive statement
+    /// rather than an absence, and it is why the three findings above cannot be
+    /// confused with the disable.
+    ecl_fence_disabled: RefusalCounter,
+    /// The bridge reported a fence status this build's mapping does not know.
+    ///
+    /// ⛔ **Expected 0, and a hit is a DRIFT between two declarations**:
+    /// `HELIOS_VKD3D_FENCE_*` in `umd12/bridge/vkd3d_bridge.h` and
+    /// `bridge12::FenceStatus`. The status crosses an FFI as a bare `u32`, so nothing
+    /// but this counter can notice a value added on one side only — which is exactly
+    /// why the mapping has an explicit unknown arm instead of folding into
+    /// `EclFenceRefused`.
+    ecl_fence_status_bad: RefusalCounter,
 }
 
 pub(crate) static L2_REFUSALS: L2Refusals = L2Refusals {
@@ -3608,6 +3734,12 @@ pub(crate) static L2_REFUSALS: L2Refusals = L2Refusals {
     ecl_submit_render_failed: RefusalCounter::new("EclSubmitRenderFailed"),
     ecl_drain_failed: RefusalCounter::new("EclDrainFailed"),
     ecl_submit_error_not_raised: RefusalCounter::new("EclSubmitErrorNotRaised"),
+    ecl_fence_sampled: RefusalCounter::new("EclFenceSampled"),
+    ecl_fence_no_icd: RefusalCounter::new("EclFenceNoIcd"),
+    ecl_fence_no_export: RefusalCounter::new("EclFenceNoExport"),
+    ecl_fence_refused: RefusalCounter::new("EclFenceRefused"),
+    ecl_fence_disabled: RefusalCounter::new("EclFenceDisabled"),
+    ecl_fence_status_bad: RefusalCounter::new("EclFenceStatusBad"),
 };
 
 /// L2's refusal counters, printed by `crate::log_refusal_summary` at this
@@ -3696,6 +3828,15 @@ pub(crate) static REFUSALS: &[&RefusalCounter] = &[
     // gate was a review outcome on the same commit, and the counters that shipped
     // in the K-F1 review draft must keep their positions.
     &L2_REFUSALS.ecl_submit_error_not_raised,
+    // ⛔ APPENDED, the GPU-completion boundary commit. Six, and none of them may be
+    // folded together: a zero fence is a LEGAL record value, so only the REASON is a
+    // finding, and one shared counter would produce a number nobody can attribute.
+    &L2_REFUSALS.ecl_fence_sampled,
+    &L2_REFUSALS.ecl_fence_no_icd,
+    &L2_REFUSALS.ecl_fence_no_export,
+    &L2_REFUSALS.ecl_fence_refused,
+    &L2_REFUSALS.ecl_fence_disabled,
+    &L2_REFUSALS.ecl_fence_status_bad,
 ];
 
 // ⚠ `Hresult` is imported for the `E_*`/`S_OK` constants this file returns; the

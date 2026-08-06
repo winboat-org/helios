@@ -107,6 +107,7 @@ std::atomic<std::uint32_t> g_vkd3dCreateDeviceNullOut{0};  // engine returned S_
 std::atomic<std::uint32_t> g_vkd3dSerializeBadArg{0};      // serialize refused: null desc/blob_out
 std::atomic<std::uint32_t> g_vkd3dDrainBadArg{0};          // drain refused: queue == 0
 std::atomic<std::uint32_t> g_vkd3dDrainNotAcquired{0};     // acquire returned no VkQueue
+std::atomic<std::uint32_t> g_vkd3dQueueFenceZero{0};       // gpu-fence sample yielded 0
 
 // ── this DLL's `umd_log` ────────────────────────────────────────────────────
 //
@@ -205,6 +206,93 @@ bool read_venus_ctx_id_now(std::uint32_t* out) {
   }
   *out = helios_bridge::read_venus_ctx_id(canonical);
   return true;
+}
+
+// ── the venus per-queue GPU-completion fence, resolved ONCE ──────────────────
+//
+// `helios_venus_queue_gpu_fence(VkQueue, uint64_t*)` — `icd/mesa`'s
+// `src/virtio/vulkan/vn_renderer_helios.c:1859`, exported by
+// `__declspec(dllexport)` alone (no `.def` entry; the eleven existing
+// `helios_venus_*` exports work the same way, proven by the live present-stream
+// path). Returns a venus wire fence that retires at HOST GPU COMPLETION of
+// everything already submitted to that `VkQueue`, or false with the fence left 0.
+//
+// ⚠ `void*` stands in for `VkQueue` here rather than including `vulkan.h`, which
+// this file has never needed. `VkQueue` is a `VK_DEFINE_HANDLE` — a plain pointer
+// — so under `__cdecl` on x64 the parameter is passed in RCX either way. Same
+// substitution and same argument as the `vkd3d_acquire_vk_queue` declarations
+// above, and it keeps this translation unit free of the Vulkan headers whose
+// `D3D12_*`/vkd3d collisions the file banner is about.
+// ⛔ The precedent this is modelled on types the handle concretely
+// (`umd/bridge/bridge_icd_exports.cpp:542`, `bool (__cdecl*)(VkDevice,
+// VkSemaphore, std::uint64_t*)`) because that TU already includes Vulkan. The
+// deviation is the include set, not the ABI.
+using QueueGpuFenceFn = bool(__cdecl*)(void* /*VkQueue*/, std::uint64_t*);
+
+struct QueueGpuFenceExport {
+  QueueGpuFenceFn fn = nullptr;
+  std::uint32_t status = HELIOS_VKD3D_FENCE_NO_ICD;
+};
+
+/// Resolve the export **once per process**, from the S4b-anchored module.
+///
+/// ⛔ **Once, and that is a correctness requirement rather than an optimisation.**
+/// `find_venus_icd_module()` takes a module reference on every successful call
+/// (`GetModuleHandleExA` without `UNCHANGED_REFCOUNT`,
+/// `umd_common/bridge/bridge_icd_anchor.cpp:143-146`) and nothing releases it. A
+/// per-submit resolution would therefore leak one ICD module reference **per
+/// `ExecuteCommandLists`** — the per-object-leak class the 54th session closed,
+/// one API generation later and several thousand times faster.
+///
+/// ⛔ And it resolves through `reconcile_icd_anchor`, never from a bare
+/// `find_venus_icd_module`: S4b's rule is one coherent ICD module per process, and
+/// a mismatch must REFUSE rather than adopt the published one, because the Vulkan
+/// objects this process holds came from whichever image the loader bound. The
+/// mismatch path already counts and logs `IcdAnchorMismatch`.
+///
+/// ⚠ A magic static: C++11 guarantees the initialiser runs exactly once even under
+/// concurrent first calls, and every DDI that reaches this is free-threaded.
+const QueueGpuFenceExport& queue_gpu_fence_export() {
+  static const QueueGpuFenceExport resolved = [] {
+    QueueGpuFenceExport out;
+    void* candidate = helios_bridge::find_venus_icd_module();
+    if (!candidate) {
+      umd_log("queue_gpu_fence: no loaded module exports the venus ICD probe "
+              "symbol -- the D3D12 submission will carry a 0 boundary");
+      out.status = HELIOS_VKD3D_FENCE_NO_ICD;
+      return out;
+    }
+    void* canonical = helios_bridge::reconcile_icd_anchor(candidate);
+    if (!canonical) {
+      // IcdAnchorMismatch is already counted and logged by the anchor.
+      umd_log("queue_gpu_fence: venus ICD anchor mismatch -- refusing to resolve "
+              "the fence export; the submission will carry a 0 boundary");
+      out.status = HELIOS_VKD3D_FENCE_NO_ICD;
+      return out;
+    }
+    // ⚠ Through `void*` and back: a function pointer is not
+    // `reinterpret_cast`-able from `FARPROC` directly without a
+    // -Wcast-function-type diagnostic on clang-cl, and the two-step is the
+    // conforming spelling.
+    out.fn = reinterpret_cast<QueueGpuFenceFn>(reinterpret_cast<void*>(
+        GetProcAddress(static_cast<HMODULE>(canonical),
+                       "helios_venus_queue_gpu_fence")));
+    if (!out.fn) {
+      // ⛔ NOT fatal, and not even a refusal: an older ICD image that predates the
+      // export is the designed graceful path. The submission still goes, carrying
+      // the 0 boundary the record explicitly allows.
+      umd_log("queue_gpu_fence: the anchored venus ICD does not export "
+              "helios_venus_queue_gpu_fence (older ICD) -- the D3D12 submission "
+              "will carry a 0 boundary");
+      out.status = HELIOS_VKD3D_FENCE_NO_EXPORT;
+      return out;
+    }
+    umd_log("queue_gpu_fence: resolved helios_venus_queue_gpu_fence from the "
+            "anchored venus ICD");
+    out.status = HELIOS_VKD3D_FENCE_SAMPLED;
+    return out;
+  }();
+  return resolved;
 }
 
 }  // namespace
@@ -410,7 +498,16 @@ std::int32_t helios_vkd3d_bridge_serialize_root_signature(
       });
 }
 
-bool helios_vkd3d_bridge_drain_queue(std::size_t queue) noexcept {
+bool helios_vkd3d_bridge_drain_queue(std::size_t queue,
+                                     std::uint64_t* out_wire_fence,
+                                     std::uint32_t* out_fence_status) noexcept {
+  // ⛔ Cleared FIRST, before anything that can fail or throw. A caller that reads
+  // an untouched pair after a false return would otherwise read stack garbage as a
+  // GPU boundary — and a garbage fence is the one input the KMD clamps but cannot
+  // reject (`HeliosD3D12SubmitCmd`'s "safety of a guest-supplied fence" note).
+  if (out_wire_fence) *out_wire_fence = 0;
+  if (out_fence_status) *out_fence_status = HELIOS_VKD3D_FENCE_NO_ICD;
+
   // ⚠ `false` as the sentinel, and its type is `bool` at a glance — the
   // `ead692e` rule from the two entry points above: `bridge_guard` deduces `R`
   // from the ERROR VALUE ALONE, and the `static_assert` in
@@ -473,7 +570,8 @@ bool helios_vkd3d_bridge_drain_queue(std::size_t queue) noexcept {
         // one extra empty `vkQueueSubmit2` per drain. ⛔ Do NOT try to avoid it
         // with `vkd3d_unlock_vk_queue`: that releases only the vkd3d_queue mutex
         // and would leave `queue_lock` held forever.
-        if (!vkd3d_acquire_vk_queue(q)) {
+        void* vk_queue = vkd3d_acquire_vk_queue(q);
+        if (!vk_queue) {
           const std::uint32_t n =
               helios_bridge::g_vkd3dDrainNotAcquired.fetch_add(
                   1, std::memory_order_relaxed) + 1;
@@ -484,6 +582,62 @@ bool helios_vkd3d_bridge_drain_queue(std::size_t queue) noexcept {
           umd_log(msg);
           return false;
         }
+
+        // ⛔⛔ THE FENCE IS SAMPLED **HERE**, AND THE POSITION IS THE WHOLE
+        // CORRECTNESS OF IT. Two properties, both of which only this line's
+        // placement can provide — nothing inside the ICD export can check either:
+        //
+        //   * **After the drain.** The `VKD3D_SUBMISSION_DRAIN` above has already
+        //     completed, so every `vkQueueSubmit` for the work this packet is meant
+        //     to cover has reached the host driver and is inside the boundary the
+        //     export reports. Reading a LARGER ring seqno than needed is harmless —
+        //     it over-orders. Reading a **stale smaller** one is the only way to get
+        //     a fence covering less work than the caller believes, and that is
+        //     exactly what sampling before the drain would produce.
+        //   * **While the queue is still held.** Both of vkd3d's locks are ours
+        //     until the release below, so no other thread can push a submission in
+        //     between and make the boundary describe a moving target.
+        //
+        // ⚠ **The release's OWN submit is deliberately not covered**, and a reader
+        // who spots that gap must not "fix" it. `vkd3d_release_vk_queue` issues an
+        // empty `vkQueueSubmit2` signalling vkd3d's internal `submission_timeline`
+        // (see the note above it): that batch carries no application work, so a
+        // boundary excluding it is correct — and moving the sample after the release
+        // would read the queue with no lock held, racing the very submissions the
+        // drain just serialised.
+        if (out_wire_fence && out_fence_status) {
+          const QueueGpuFenceExport& e = queue_gpu_fence_export();
+          if (!e.fn) {
+            // NO_ICD or NO_EXPORT, decided and logged once at resolution time.
+            *out_fence_status = e.status;
+          } else if (!e.fn(vk_queue, out_wire_fence) || *out_wire_fence == 0) {
+            // ⛔ `|| == 0` as well as the bool: the export documents that it always
+            // writes the out-param and leaves 0 on every refusal, so a `true` with a
+            // 0 fence would be a contract break — and treating it as a sample would
+            // put a "no boundary" record on the wire labelled as a real one.
+            *out_wire_fence = 0;
+            *out_fence_status = HELIOS_VKD3D_FENCE_REFUSED;
+            const std::uint32_t n =
+                helios_bridge::g_vkd3dQueueFenceZero.fetch_add(
+                    1, std::memory_order_relaxed) + 1;
+            if (n <= 8 || (n % 4096) == 0) {
+              char msg[192];
+              std::snprintf(msg, sizeof(msg),
+                            "queue_gpu_fence(%p) declined -- submitting a 0 "
+                            "boundary (Vkd3dQueueFenceZero=%u)", vk_queue, n);
+              umd_log(msg);
+            }
+          } else {
+            *out_fence_status = HELIOS_VKD3D_FENCE_SAMPLED;
+          }
+        }
+
+        // ⛔ ONE release, on every path that acquired. The sample above adds no
+        // early return by construction — it cannot `return`, only write its
+        // out-params — because skipping this call leaves BOTH of vkd3d's locks held
+        // and the next submission on this queue blocks forever. (The null-acquire arm
+        // above already leaks `queue_lock`; see its note. That is upstream's shape
+        // and this is not a second instance of it.)
         vkd3d_release_vk_queue(q);
         return true;
       });

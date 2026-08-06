@@ -24,6 +24,7 @@
 //! | `Umd12EclDelayUs` | DWORD | `0` — **diagnostic**, the F1 delay probe on `pfnExecuteCommandLists` |
 //! | `Umd12EclSubmit` | DWORD | **`1` — ON.** K-F1's `pfnRenderCb` WDDM submission during `pfnExecuteCommandLists` |
 //! | `Umd12EclSubmitStrict` | DWORD | `0` — **OFF during bring-up.** Whether a refused `pfnRenderCb` removes the `ID3D12Device` |
+//! | `Umd12EclFence` | DWORD | **`1` — ON.** Whether the ECL record carries a real venus GPU-completion boundary |
 //!
 //! ⭐ **`UmdD3D12` lands here at S5, and not one commit earlier.** A kill switch
 //! for a driver that cannot be reached kills nothing, so declaring it before
@@ -406,6 +407,62 @@ pub(crate) static UMD12_ECL_SUBMIT: BoolKnob = BoolKnob::new(c"Umd12EclSubmit", 
 /// on a rebuild.
 pub(crate) static UMD12_ECL_SUBMIT_STRICT: BoolKnob = BoolKnob::new(c"Umd12EclSubmitStrict", false);
 
+/// ⭐⭐ **Whether the ECL record carries a REAL GPU-completion boundary.
+/// DEFAULT ON.**
+///
+/// ON samples `helios_venus_queue_gpu_fence` inside the drain window and puts the
+/// result in `HeliosD3D12SubmitCmd::gpu_wire_fence`. OFF submits the same record
+/// with the fence left **0**, which is that field's documented *"submit the packet,
+/// order it against nothing"* value.
+///
+/// # Why ON, and why that is not the same argument as `UMD12_ECL_SUBMIT_STRICT`'s
+///
+/// ⛔ **This default is NOT the strictness question wearing a different name**, and
+/// the difference is worth stating because the two knobs landed one commit apart
+/// with opposite defaults. Strict severity OFF because turning it on *destroys the
+/// measurement* (a removed device produces no reading). A real fence ON because it
+/// **IS** the measurement: a zero boundary orders the packet against nothing, so a
+/// run with the fence off cannot distinguish "dxgkrnl does not order behind our
+/// packets" from "our packet asked for no ordering". Shipping the zero arm as the
+/// default would be shipping the plumbing arm as the product, which is exactly what
+/// decision **D5a** forbids — *"stop gaps are not acceptable"*.
+///
+/// ⚠ **And the wedge hazard that would otherwise argue for OFF is closed in the
+/// KMD, not hoped away.** A boundary naming work that never retires would park an
+/// **adapter-global head-of-line FIFO** and stall every context including DWM until
+/// TDR. It cannot: the consumer clamps a value at or beyond `next_wire_fence` down
+/// to `next_wire_fence` rather than trusting it — *"a malformed/stale private marker
+/// must not manufacture an impossible future dependency"* — so the worst a wrong
+/// fence can do is name an **earlier** boundary and under-wait, which is a
+/// correctness bug with a counter rather than a hang.
+/// `HeliosD3D12SubmitCmd`'s own "safety of a guest-supplied fence" section is the
+/// authority; that asymmetry is why ON is survivable.
+///
+/// # ⛔ Why the OFF arm must stay reachable
+///
+/// `HeliosD3D12SubmitCmd`'s declaration requires it in as many words: the zero-fence
+/// arm *"must stay reachable as the A/B disable for the fence itself"*, and
+/// `is_valid()` deliberately does not check the fence so that the disabled arm is
+/// still a recognisable D3D12 packet to the KMD. ⇒ `Umd12EclFence=0` is the paired
+/// comparison for any change the boundary causes, and it keeps the K-F1 plumbing arm
+/// runnable after the fence lands.
+///
+/// # ⚠ A zero fence with this knob ON is a FINDING, not a fallback
+///
+/// It has three distinguishable causes and each has its own counter, because a
+/// single number here would be unattributable: `EclFenceNoIcd` (no venus ICD module,
+/// or the S4b anchor refused), `EclFenceNoExport` (an ICD image predating
+/// `helios_venus_queue_gpu_fence`), `EclFenceRefused` (the export ran and declined —
+/// its loudest arm being `ring_idx == 0`, which it refuses unconditionally because a
+/// ring-0 wire fence retires at *decode* and would lie about GPU completion).
+/// `EclFenceDisabled` is the fourth and belongs to this knob's OFF arm.
+/// ⛔ `EclFenceSampled` is the only one that means the boundary is real.
+///
+/// ⚠ Read once per process, like every knob here, and reported in
+/// [`resolved_inventory`] — a fence reading whose arm is not recorded cannot be
+/// attributed.
+pub(crate) static UMD12_ECL_FENCE: BoolKnob = BoolKnob::new(c"Umd12EclFence", true);
+
 /// The `pfnSignalFence` diagnostic delay in microseconds, clamped. `0` = off.
 /// See [`UMD12_FENCE_SIGNAL_DELAY_US`].
 pub(crate) fn umd12_fence_signal_delay_us() -> u32 {
@@ -432,6 +489,13 @@ pub(crate) fn umd12_ecl_submit_strict() -> bool {
     UMD12_ECL_SUBMIT_STRICT.get()
 }
 
+/// Whether the ECL record carries a real venus GPU-completion boundary.
+/// **Absent = ON**; see [`UMD12_ECL_FENCE`] for why, and for the three
+/// distinguishable ways an ON run can still produce a zero fence.
+pub(crate) fn umd12_ecl_fence() -> bool {
+    UMD12_ECL_FENCE.get()
+}
+
 /// Emit this crate's knob inventory through the shared reader, once per process.
 ///
 /// The thin wrapper D3b's split implies: the READER is shared
@@ -454,7 +518,7 @@ pub(crate) fn log_knob_inventory() {
 /// are the evidence contract `tools/capture-knob-inventory.ps1` parses and that
 /// S2 proved the crate split byte-identical against; reordering makes two
 /// captures differ for a reason that is not a behaviour change.
-pub(crate) fn resolved_inventory() -> [(&'static str, u32); 7] {
+pub(crate) fn resolved_inventory() -> [(&'static str, u32); 8] {
     [
         ("Umd12Trace", UMD12_TRACE.get() as u32),
         ("UmdD3D12", UMD_D3D12.get() as u32),
@@ -478,5 +542,10 @@ pub(crate) fn resolved_inventory() -> [(&'static str, u32); 7] {
         // suppressed", which is exactly the ambiguity the OFF default introduces
         // and this line removes.
         ("Umd12EclSubmitStrict", umd12_ecl_submit_strict() as u32),
+        // ⭐ APPENDED, the fence-boundary commit. It says whether the run's
+        // submissions carried a real GPU-completion boundary or the zero "order
+        // against nothing" arm — without which a fence-wait number cannot be
+        // attributed to either, and the two are the whole A/B.
+        ("Umd12EclFence", umd12_ecl_fence() as u32),
     ]
 }
