@@ -447,23 +447,64 @@ pub(crate) unsafe fn device<'a>(
     Some(unsafe { &*device })
 }
 
-// ⚠ THE SHAPE THE FIRST LANE NEEDS, written down rather than written.
-//
-// `set_error(dev, hr)` — forwarding a device-scope failure to the runtime
-// through `um_callbacks.pfnSetErrorCb(dev.h_rt_device, hr)` — is how a
-// `VOID`-returning D3D12 DDI says it failed, and most of them are `VOID`
-// (`DECISIONS.md` §7.6). It is NOT here, and its absence is the rule rather than
-// an oversight: `PARALLEL.md` §10 forbids `#[allow(dead_code)]` on a
-// hand-written line (R908), and at S6-0b there is no handler that can fail.
-// `bridge12.rs`'s owned-COM accessor was deleted for exactly this reason and
-// documented the same way.
-//
-// Two things the first lane to add it must get right, so they are not
-// re-derived:
-//   * `PFND3D12DDI_SETERROR_CB` takes a `D3D10DDI_HRTDEVICE`, not the
-//     `D3D12DDI_HRTDEVICE` the create arg carries. They are the same
-//     one-pointer struct — `D3D12DDI_HRTDEVICE` is a bindgen *alias* — so it
-//     compiles with no cast. It looks like a mismatch and is not.
-//   * a null `pfnSetErrorCb` needs its own named counter. It is the only channel
-//     a `VOID` slot has, so losing it turns an error into corrupt output instead
-//     of a removed device.
+/// Report a device-scope failure to the runtime. Returns whether it was
+/// delivered.
+///
+/// ⭐ **This is how a `VOID`-returning D3D12 DDI says it failed**, and most of
+/// them are `VOID` (`DECISIONS.md` §7.6). It did not exist at S6-0b, and its
+/// absence was the rule rather than an oversight — `PARALLEL.md` §10 forbids
+/// `#[allow(dead_code)]` on a hand-written line (R908) and no handler could yet
+/// fail. The S6 Round-1 lanes are what made it reachable: L2's queue-table fence
+/// ops, L5's ten `VOID` view/heap slots and L6's thirteen `VOID` shader and
+/// sub-state creates all fail with no other channel.
+///
+/// ⚠ **Three of the four lanes wrote this function independently, in isolated
+/// worktrees, and converged on the same contract** — including the non-obvious
+/// half, that it returns a `bool` instead of counting. That agreement is the
+/// reason the shape below is stated as a rule rather than as one lane's taste.
+///
+/// Two things the S6-0b comment this replaced flagged as *looking* like
+/// mistakes. Both are still true, both are load-bearing, and all three lanes
+/// re-derived them:
+///
+/// * `PFND3D12DDI_SETERROR_CB` takes a `D3D10DDI_HRTDEVICE`, **not** the
+///   `D3D12DDI_HRTDEVICE` the create arg carries. They are the same one-pointer
+///   struct — `D3D12DDI_HRTDEVICE` is a bindgen *alias* — so `h_rt_device`
+///   passes with no cast;
+/// * a null `pfnSetErrorCb` must be **counted**. It is the only channel a `VOID`
+///   slot has, so losing it turns an error into corrupt output instead of a
+///   removed device.
+///
+/// ⛔ **Which is why the counter belongs to the CALLER, and why this is
+/// `#[must_use]`.** Eleven lanes reach this function and each keeps its refusal
+/// set in its own file (`PARALLEL.md` §9.1, and `lib.rs`'s `UMD12_REFUSAL_SETS`).
+/// A counter named *here* would either have to live in `lib.rs` — the merge point
+/// that whole scheme exists to remove — or bind this shared function to one
+/// lane's set. `RefusalCounter::note` is `#[must_use]` for the same reason.
+///
+/// ⚠ Safe, not `unsafe`, and that is a deliberate choice between the two shapes
+/// the lanes submitted. The only raw operation is reading `um_callbacks`, whose
+/// validity is a **type invariant of [`HeliosD3D12Device`]** rather than a caller
+/// obligation: [`create_device`] is the sole constructor, it null-checks the
+/// pointer before writing the struct, the field is never reassigned, and there is
+/// deliberately no `device_mut` through which it could be. An `unsafe fn` whose
+/// precondition no caller can violate teaches callers to stop reading
+/// `# Safety` sections.
+#[must_use = "a device-scope error that could not be reported must be counted by the caller"]
+pub(crate) fn set_error(dev: &HeliosD3D12Device, hr: Hresult) -> bool {
+    if dev.um_callbacks.is_null() {
+        return false;
+    }
+    // SAFETY: non-null per the check above, and `create_device` stored the arm
+    // the negotiated version selects — D12 advertises exactly one token, so
+    // `_0062` is the only reachable shape — for a table the runtime keeps alive
+    // at least as long as the device. The borrow does not outlive this call.
+    let Some(set_error_cb) = (unsafe { (*dev.um_callbacks).pfnSetErrorCb }) else {
+        return false;
+    };
+    // SAFETY: the runtime supplied this callback for this device, and
+    // `h_rt_device` is the handle it supplied alongside it and owns until
+    // `pfnDestroyDevice`. The call transfers no ownership.
+    unsafe { set_error_cb(dev.h_rt_device, hr) };
+    true
+}
