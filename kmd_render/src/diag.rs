@@ -619,6 +619,21 @@ pub mod knobs {
     ///   no causal dependency on this context's packets at all, and none of
     ///   K-F3..K-F9 is the answer. Say so loudly and stop.
     ///
+    /// ⛔⛔ **PRECONDITION, AND WITHOUT IT THE ✗ ROW IS A TRUSTING-A-ZERO.**
+    /// `WfBHold` must have **MOVED** on the run. Three different states produce a
+    /// flat N and only the third is UV1 ✗:
+    ///   1. **The knob never took.** `WDDM_HOLD_MS` is snapshotted at
+    ///      `VirtioGpu::init`, so setting the registry value and then doing
+    ///      `pnputil /restart-device` — the project's standard deploy — leaves the
+    ///      hold at 0. It needs a **reboot**, exactly like `DiagLevel`.
+    ///   2. **The hold never armed.** It only arms when a D3D12 packet reaches the
+    ///      FIFO head with its three real dependency arms already satisfied. If
+    ///      `Umd12EclSubmit` is off, or no D3D12 packet reached the head at all,
+    ///      nothing was ever held.
+    ///   3. Genuinely no causal dependency — the only reading that licenses ✗.
+    /// ⇒ **read `WfBHold` first. If it is 0, the experiment did not run, and the
+    /// flat N says nothing whatever about UV1.**
+    ///
     /// ⭐ THIS IS THE ONLY CLEAN UV1 TEST AVAILABLE. The bare submission's reading
     /// is confounded: the venus ring emits NO wire fence at all while it is busier
     /// than 1 ms (`icd/mesa/src/virtio/vulkan/vn_ring.c:673-690` — the doorbell is

@@ -124,8 +124,13 @@ pub static D3D12_SUBMIT_RECORDS: AtomicU32 = AtomicU32::new(0);
 /// UMD is submitting packets and naming no boundary yet, which is the intended
 /// first step, not a defect. It becomes a finding only once the UMD is supposed
 /// to be sampling a real ring-1 fence: `D12Zero` climbing then means the ICD
-/// handed it nothing (see `EscSubRing` — a guest that never submits on a
-/// GPU-completion ring has no such fence to name).
+/// handed it nothing.
+///
+/// ⚠ `EscSubRing` IS THE CROSS-CHECK BUT ONLY AS A DELTA. It is adapter-global and
+/// DWM's own present path makes it nonzero, so "`EscSubRing == 0` ⇒ no such fence
+/// exists to name" is a test that can never pass. Compare an idle-desktop delta
+/// with a probe delta over the same wall-clock window; the procedure is beside the
+/// static in `virtio/counters.rs`.
 pub static D3D12_SUBMIT_ZERO_FENCE: AtomicU32 = AtomicU32::new(0);
 /// Records whose boundary could not be written into this Render's private data
 /// (`merge_fence` refused: null pointer, or a private-data buffer shorter than
@@ -171,8 +176,11 @@ pub static D3D12_SUBMIT_MERGED: AtomicU32 = AtomicU32::new(0);
 /// `D12Clr` climbing in lockstep with present frequency is the batching, while
 /// `D12Clr` moving on a run with no D3D12 presents at all is the hazard.
 ///
-/// ⚠ It is the accounting term the `D12Exact` identity in this file's mirror
-/// comment does not yet include — see that comment.
+/// ⚠ It was one of the terms missing from the `D12Exact` "identity" this file's
+/// mirror comment used to assert. **That identity is retired** — it could not hold
+/// for four other reasons besides this one, and its failure was documented as
+/// re-opening a closed defect. `D12Exact` now carries a sound bound and a
+/// qualitative A4 signal instead; see `D3D12_EXACT_WATERMARK_USED`.
 pub static D3D12_STALE_RECORD_CLEARED: AtomicU32 = AtomicU32::new(0);
 
 /// Mirror the scheduler private-data handoff evidence at PASSIVE_LEVEL.
@@ -217,9 +225,23 @@ pub(crate) fn record_present_handoff_telemetry() {
     );
     // A4: D3D12 ECL packets gated on the EXACT wire fence their batch ends at,
     // instead of on the whole prefix below it (the invariant CLAUDE.md's table
-    // states verbatim). Expected to equal the number of D3D12 records that named a
-    // usable boundary — `D12Rec - D12Zero - D12MrgF - GpuFncClamp - GpuFncGen`. A
-    // shortfall means a D3D12 packet took a prefix arm after all.
+    // states verbatim).
+    //
+    // ⛔⛔ NO EXACT IDENTITY EXISTS FOR THIS COUNTER. This comment used to claim
+    // `D12Rec - D12Zero - D12MrgF - GpuFncClamp - GpuFncGen` and call any shortfall
+    // "a D3D12 packet took a prefix arm after all" — i.e. it graded an arithmetic
+    // failure as a CLOSED DEFECT RE-OPENING. It cannot hold: the two sides count
+    // different DDIs (Renders vs SubmitCommands), `D12Merged` and `D12Clr` are
+    // missing terms, replays are unaccounted because `decode` consumes the record
+    // by design, and `GpuFncClamp`/`GpuFncGen` are ADAPTER-GLOBAL — DWM's D3D11
+    // presents move them.
+    //
+    // What to read instead, in one line each (full argument at the static):
+    //   * SOUND BOUND: `D12Exact <= D12Rec - D12Zero`. A violation is a real
+    //     defect — a record honoured twice.
+    //   * THE A4 SIGNAL: `D12Rec > D12Zero` while `D12Exact == 0`.
+    //   * HEALTHY: `D12Exact` MOVES, well below `D12Rec`.
+    //   * A shortfall against any expression attributes NOTHING.
     crate::diag::record_named_bytes(
         b"D12Exact",
         crate::virtio::gpu::D3D12_EXACT_WATERMARK_USED.load(Ordering::Relaxed),
@@ -248,9 +270,14 @@ pub(crate) fn record_present_handoff_telemetry() {
     // The D3D12 ECL arm (KMD_IMPACT §14a.2 K-F4). `D12Rec` is the first proof
     // that `pfnRenderCb` from `pfnExecuteCommandLists` reaches this driver;
     // `D12Zero` is EXPECTED to equal it during bring-up (the documented
-    // order-against-nothing arm); `D12MrgF` and `GpuFncClamp` must both stay 0 —
-    // the first means a context this driver did not size, the second means the
-    // UMD named a fence id this KMD never issued.
+    // order-against-nothing arm); `D12MrgF` must stay 0 — a nonzero value means a
+    // context this driver did not size.
+    //
+    // ⛔ `GpuFncClamp` IS NOT PART OF THIS BLOCK'S GRADING AND USED TO BE. It was
+    // listed here as "the UMD named a fence id this KMD never issued", which
+    // attributes an ADAPTER-GLOBAL counter to `helios_umd12.dll`: the clamp is
+    // decided in `wddm_boundary::select` before the `d3d12` bit is read, so DWM's
+    // D3D11 present BLT marker reaches it too. See its own mirror below.
     crate::diag::record_named_bytes(b"D12Rec", D3D12_SUBMIT_RECORDS.load(Ordering::Relaxed));
     crate::diag::record_named_bytes(b"D12Zero", D3D12_SUBMIT_ZERO_FENCE.load(Ordering::Relaxed));
     crate::diag::record_named_bytes(b"D12MrgF", D3D12_SUBMIT_MERGE_FAILS.load(Ordering::Relaxed));
@@ -265,6 +292,11 @@ pub(crate) fn record_present_handoff_telemetry() {
         b"D12Clr",
         D3D12_STALE_RECORD_CLEARED.load(Ordering::Relaxed),
     );
+    // ⛔ ADAPTER-GLOBAL, AND DWM MOVES IT. A guest-supplied boundary replaced by
+    // the conservative prefix, from EITHER writer — `wddm_boundary::select` decides
+    // the rejection before it reads the `d3d12` bit, so the D3D11 present BLT
+    // marker lands here exactly as a `HeliosD3D12SubmitCmd` does. Attributable only
+    // as a DELTA over a window in which just the D3D12 client changed.
     crate::diag::record_named_bytes(
         b"GpuFncClamp",
         crate::virtio::gpu::GPU_FENCE_CLAMPED.load(Ordering::Relaxed),
@@ -272,17 +304,26 @@ pub(crate) fn record_present_handoff_telemetry() {
     // A6's half of the same rejection: a boundary naming a fence from a FOREIGN
     // transport generation. `GpuFncClamp` provably cannot flag it — its condition
     // is one-sided (`>= next_wire_fence`) and a pre-restart id is far BELOW the
-    // live range. Must read 0 on any session without a device restart; a small
-    // number after one is the surviving-ICD case; nonzero without a restart means a
-    // UMD is sampling fence ids that did not come from this transport.
+    // live range. Same adapter-global population as `GpuFncClamp`.
+    //
+    // ⛔⛔ ITS OLD GRADING — "must read 0 on any session without a device restart"
+    // — IS NOT EVALUABLE FROM THE COUNTER. Neither this nor `FncIdGen` is reset at
+    // StartDevice (both are plain image-lifetime statics) and the STANDARD DEPLOY
+    // IS `pnputil /restart-device`, so after the first restart in a boot the value
+    // is permanently nonzero and carries no information about the session being
+    // graded. Only a delta across a restart-FREE window can be graded, and only
+    // that delta must be 0.
     crate::diag::record_named_bytes(
         b"GpuFncGen",
         crate::virtio::gpu::GPU_FENCE_FOREIGN_GENERATION.load(Ordering::Relaxed),
     );
     // The same defect on the two usermode-facing predicates: a WAIT_FENCE or
     // REGISTER_FENCE_EVENT naming a fence from a dead transport generation used to
-    // be answered Complete. Same grading (0 without a device restart); NOT expected
-    // to track `GpuFncGen`, whose callers are different.
+    // be answered Complete. ⛔ Its population is EVERY venus client's waits — DWM's
+    // DXVK is the busiest of them, and none of it is D3D12. Same not-evaluable
+    // absolute value as `GpuFncGen`, and NOT expected to track it: different
+    // callers, and a client that survives a restart typically has many parked waits
+    // and no WDDM submissions of its own.
     crate::diag::record_named_bytes(
         b"FncIdGen",
         crate::virtio::gpu::FENCE_ID_FOREIGN_GENERATION.load(Ordering::Relaxed),
@@ -304,6 +345,14 @@ pub(crate) fn record_present_handoff_telemetry() {
     // The fourth arm is not a dependency: it is `WddmHoldMs` delaying an
     // otherwise-ready D3D12 ECL packet on purpose (UV1). Must be 0 unless
     // somebody is running that experiment.
+    //
+    // ⛔ IT IS ALSO UV1'S ARMED-CHECK, AND THE UV1 TABLE IS UNSOUND WITHOUT IT.
+    // That table grades a flat `WaitForSingleObject` reading as UV1 ✗ ("say so
+    // loudly and stop") with no precondition — but the knob is snapshotted once at
+    // `VirtioGpu::init`, so setting it WITHOUT `pnputil /restart-device` leaves the
+    // hold at 0 and produces the identical flat reading. ⇒ `WfBHold` MUST have
+    // MOVED in the measured window, or the run measured nothing and UV1 ✗ is a
+    // conclusion drawn from an absence.
     crate::diag::record_named_bytes(
         b"WfBHold",
         crate::virtio::gpu::WDDM_HEAD_BLOCKED_HOLD.load(Ordering::Relaxed),
@@ -312,11 +361,26 @@ pub(crate) fn record_present_handoff_telemetry() {
     // onto the conservative wire watermark after `WddmHeadMs`. Each one is a DMA
     // fence released while its named producer may not have completed, taken in
     // preference to the 256-entry overflow (the same lie times 256 plus a lease
-    // teardown) or an adapter-wide TDR. MUST read 0 on a healthy session; if it
-    // moves, whichever of `WfBStrm`/`WfBBlt` moved with it is the diagnosis.
+    // teardown) or an adapter-wide TDR. MUST read 0 on a healthy session.
+    //
+    // ⛔ "WHICHEVER OF `WfBStrm`/`WfBBlt` MOVED WITH IT IS THE DIAGNOSIS" WAS THE
+    // OLD RULE AND IT CANNOT DISCRIMINATE: those are session-cumulative,
+    // adapter-global blocked-look totals that climb continuously under DWM, so both
+    // have thousands of unrelated increments by the time one rebase fires. The arm
+    // is recorded AT the rebase instead — `WfBRebS` + `WfBRebB` partition `WfBReb`
+    // exactly, and they are the diagnosis. ⚠ Each names the arm still unsatisfied
+    // on the look that EXPIRED the bound, not necessarily the one that armed it.
     crate::diag::record_named_bytes(
         b"WfBReb",
         crate::virtio::gpu::WDDM_HEAD_REBASED.load(Ordering::Relaxed),
+    );
+    crate::diag::record_named_bytes(
+        b"WfBRebS",
+        crate::virtio::gpu::WDDM_HEAD_REBASED_STREAM.load(Ordering::Relaxed),
+    );
+    crate::diag::record_named_bytes(
+        b"WfBRebB",
+        crate::virtio::gpu::WDDM_HEAD_REBASED_BLT.load(Ordering::Relaxed),
     );
     // UV3's instrument (KMD_IMPACT §14a.1). Until now the ring pair was read in
     // exactly ONE place — words 33/34 of the `'HDBG'` report below, which
@@ -326,11 +390,24 @@ pub(crate) fn record_present_handoff_telemetry() {
     //
     // `RngSub`/`RngCmp` are adapter-wide and include this driver's own scanout,
     // windowed-BLT and present-BLT copies (all ring 1); `EscSub`/`EscSubRing`
-    // are the guest-attributed half, counted where the ICD's value enters. The
-    // informative reading is a zero — `EscSub > 0` with `EscSubRing == 0` means
-    // the guest never submits on a GPU-completion ring, `EscSub == 0` means this
-    // driver saw nothing from that process at all. Both are spelled out beside
-    // the statics in `virtio/counters.rs`.
+    // are the guest-attributed half, counted where the ICD's value enters.
+    //
+    // ⛔⛔ ALL FOUR ARE ADAPTER-GLOBAL ACROSS PROCESSES AND DWM MOVES ALL FOUR ON
+    // AN IDLE DESKTOP. This comment used to say "the informative reading is a
+    // zero" and offer `EscSub > 0 && EscSubRing == 0` and `EscSub == 0` as the two
+    // findings. NEITHER BRANCH IS REACHABLE: the shipping D3D11 present path adds
+    // ~1 to both per present, because `vn_signal_win32_external_semaphore` submits
+    // its signal batch on the submitting `VkQueue`'s ring and venus reserves ring 0
+    // for the CPU timeline, so every acquired ring is >= 1. A rule whose
+    // informative branch cannot be taken will always report the other one.
+    //
+    // ⇒ READ THEM ONLY AS DELTAS: an idle-desktop window and a probe window of the
+    // SAME wall-clock length, subtracted. `Δ EscSubRing` growing when the D3D12
+    // workload is added is the reading that refutes "vkd3d's work is ring-0 only";
+    // `Δ EscSubRing` flat while `Δ EscSub` grows means the client submits but never
+    // on a GPU-completion ring. Full procedure beside the statics in
+    // `virtio/counters.rs`. ⚠ None of the four is reset at StartDevice, so an
+    // absolute value spans every device generation since the image loaded.
     crate::diag::record_named_bytes(
         b"RngSub",
         crate::virtio::gpu::RING_SUBMIT_COUNT.load(Ordering::Relaxed),
@@ -363,6 +440,26 @@ pub(crate) fn record_present_handoff_telemetry() {
     crate::diag::record_named_bytes(b"ClkCal", clk_calls);
     crate::diag::record_named_bytes(b"ClkNoGpu", clk_no_gpu);
     crate::diag::record_named_bytes(b"ClkFreq", clk_freq_hz);
+    // ⛔ `DxgkDdiCalibrateGpuClock` WAS NOT THE ONLY FABRICATED SUCCESS, and its
+    // repair comment claimed it was. `DxgkDdiSetStablePowerState` returns `void`,
+    // so dxgkrnl reports success unconditionally and
+    // `ID3D12Device::SetStablePowerState(TRUE)` — the FIRST call of every D3D12
+    // timing harness — was answered by an empty body with no counter. The no-op is
+    // very likely correct (there is no guest clock to pin); being
+    // indistinguishable from a working one was not. Mirrored HERE for the same
+    // IRQL reason as `ClkCal`: that DDI may run at DISPATCH.
+    //
+    // GRADING: `StblPwr == 0` means no harness asked and nothing is fabricated.
+    // `StblPwrEn > 0` is the loud reading — that many callers believe their GPU
+    // clock is locked and it is not, so run-to-run timestamp variance is expected
+    // and any conclusion resting on clock stability is void. ⭐ DWM cannot move
+    // either; unlike most counters here these need no control arm.
+    // `HistBuf` is the same class, lower stakes: `DxgkDdiFormatHistoryBuffer`
+    // answering `NumTimestamps = 0` + SUCCESS. No expected value.
+    let (stbl_calls, stbl_enable, hist_calls) = super::scheduler::fabricated_success_counters();
+    crate::diag::record_named_bytes(b"StblPwr", stbl_calls);
+    crate::diag::record_named_bytes(b"StblPwrEn", stbl_enable);
+    crate::diag::record_named_bytes(b"HistBuf", hist_calls);
     crate::diag::record_named_bytes(b"PmScan", PRESENT_MARKER_SCAN_HITS.load(Ordering::Relaxed));
     crate::diag::record_named_bytes(b"PmOff", PRESENT_MARKER_LAST_OFFSET.load(Ordering::Relaxed));
     crate::diag::record_named_bytes(b"PmVir", SUBMIT_VIRTUAL_COUNT.load(Ordering::Relaxed));
@@ -1343,6 +1440,18 @@ pub unsafe extern "C" fn dxgkddi_render(
     // `DxgkDdiRender` the ECL arm is the ONLY writer of offset 0 (the HEPR/HERF
     // arms below merge through `display.rs`'s Present DDI, never through this
     // one), so once that arm has been decided nothing later can re-stamp it.
+    //
+    // ⚠ A HOLE WAS SUSPECTED HERE AND IS **REFUTED BY GUARD SYMMETRY** — recorded
+    // so it is not re-raised. `stamped_d3d12` is set on the `mark_d3d12` ERROR arm
+    // too, which looks like a Render that neither writes nor clears and could
+    // therefore inherit a predecessor's boundary. It cannot: `mark_d3d12`,
+    // `invalidate_d3d12` and `peek` carry the **identical** guard
+    // (`private_data.is_null() || private_size < size_of::<PresentSubmissionPrivate>()`).
+    // So `mark_d3d12` returning `Err` implies `invalidate_d3d12` would have
+    // returned `false` anyway AND `peek` returns `None`, i.e. the buffer is too
+    // small (or absent) to hold a record at all — there is nothing to inherit and
+    // no boundary is decoded. The three guards must stay identical for this
+    // argument to hold; that is the invariant to preserve, not the branch.
     //
     // SAFETY: `pDmaBufferPrivateData` / `DmaBufferPrivateDataSize` are the pair
     // dxgkrnl supplied for THIS Render; the helper re-checks null and size before

@@ -1440,10 +1440,21 @@ fn submit_venus_async_inner(
                 // ring 1 on their own, one of them (`submit_venus_async_present`
                 // below) through the same generic enqueue this path uses.
                 // Counted on the accepted arm only, so it compares directly with
-                // `ASYNC_SUBMIT_COUNT`. Grading and the two readings that matter
-                // — a zero `EscSubRing` with a nonzero `EscSub`, versus a zero
-                // `EscSub` — are documented with the statics in
-                // `virtio/counters.rs`.
+                // `ASYNC_SUBMIT_COUNT`.
+                //
+                // ⛔ The retired text here named "the two readings that matter" as
+                // *a zero `EscSubRing` with a nonzero `EscSub`, versus a zero
+                // `EscSub`*. **Both of those readings are UNREACHABLE.** This
+                // counter is guest-originated but NOT process-scoped, and DWM's own
+                // DXVK -> Mesa-venus ICD submits through this same escape: every
+                // present signals a win32 external semaphore whose batch carries a
+                // ring index that is always >= 1 (ring 0 is reserved for the CPU
+                // timeline and never handed out). So on any live desktop BOTH
+                // counters are already climbing before a D3D12 client starts, and a
+                // zero in either can only mean the driver never ran.
+                // ⇒ the grading in `virtio/counters.rs` is a **delta against a
+                // control arm** over the same wall-clock window, never an absolute
+                // value and never a zero-test. Read it there.
                 ESCAPE_SUBMIT_COUNT.fetch_add(1, Ordering::Relaxed);
                 if ring_idx != 0 {
                     ESCAPE_SUBMIT_RING_COUNT.fetch_add(1, Ordering::Relaxed);

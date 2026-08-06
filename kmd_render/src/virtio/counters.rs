@@ -78,6 +78,32 @@ pub static WDDM_HEAD_BLOCKED_BLT: AtomicU32 = AtomicU32::new(0);
 /// Must be 0 on any shipping deployment — the knob defaults to 0. Nonzero means
 /// somebody is running UV1's experiment, and its magnitude is the number of DPC
 /// looks the hold absorbed, not a duration.
+///
+/// WHOSE ACTIVITY INCREMENTS IT: only a packet carrying a `HeliosD3D12SubmitCmd`
+/// record, i.e. `helios_umd12.dll`'s. ⭐ **DWM CANNOT MOVE IT** — the hold is
+/// scoped by that record's identity precisely because this FIFO is adapter-global
+/// and head-of-line, so an unscoped hold would stall the desktop.
+///
+/// ⛔⛔ **IT IS ALSO UV1'S ARMED-CHECK, AND THE UV1 READING TABLE IS UNSOUND
+/// WITHOUT IT.** That table (`diag::knobs::WDDM_HOLD_MS`) grades a flat
+/// `WaitForSingleObject` measurement as **UV1 ✗** — *"none of K-F3..K-F9 is the
+/// answer, say so loudly and stop"* — which is a conclusion drawn from an
+/// ABSENCE. Three unrelated states produce that same flat reading:
+///   1. the hold never armed because `WddmHoldMs` was set but the transport was
+///      not re-initialised. The knob is snapshotted ONCE, at `VirtioGpu::init`
+///      from StartDevice, so **setting the registry value without
+///      `pnputil /restart-device` leaves the hold at 0** and every packet
+///      completes unheld;
+///   2. the hold armed but no D3D12 ECL packet ever reached the FIFO head with
+///      its three real dependencies already satisfied, so the fourth arm was
+///      never reached (it is deliberately last);
+///   3. the hold really did delay packets and the runtime's fence advance is
+///      genuinely independent of them — the ONLY state that supports UV1 ✗.
+///
+/// ⇒ **PRECONDITION: `WfBHold` must have MOVED during the measured window.** If
+/// it did not, the run measured nothing and the correct report is "the experiment
+/// did not run", not UV1 ✗. Registry values persist across boots (CLAUDE.md rule
+/// 6), so it is the movement that counts, never the absolute value.
 pub static WDDM_HEAD_BLOCKED_HOLD: AtomicU32 = AtomicU32::new(0);
 /// WDDM FIFO heads whose TAGGED-namespace dependency was REBASED onto the
 /// conservative wire watermark after blocking for `WddmHeadMs` (default 250 ms).
@@ -89,14 +115,50 @@ pub static WDDM_HEAD_BLOCKED_HOLD: AtomicU32 = AtomicU32::new(0);
 /// the 256-entry FIFO overflow (the same lie times 256, plus
 /// `release_all_scanout_leases(Teardown)`) and an adapter-wide TDR.
 ///
+/// WHOSE ACTIVITY INCREMENTS IT: any context whose submission named a TAGGED
+/// dependency — a present-stream boundary or a windowed-BLT terminal. Both are
+/// D3D11 present-path constructs, so **DWM CAN MOVE IT and a D3D12 client
+/// normally cannot** (an ECL packet's boundary is a wire fence, and the wire arm
+/// is not rebasable).
+///
 /// GRADING: **must read 0 on a healthy session.** A nonzero value means some
-/// context named a boundary that stayed unsatisfiable for a quarter of a second,
-/// and `WfBStrm` / `WfBBlt` say which namespace it was — the counter that MOVED
-/// before this one is the diagnosis, since a rebase is always preceded by blocked
-/// looks on exactly one arm. ⚠ It cannot be nonzero from a wire-fence block: that
-/// arm is deliberately not rebasable, so `WfBWire` climbing with `WfBReb` at 0 is
-/// the expected shape of an ordinary busy desktop.
+/// context named a boundary that stayed unsatisfiable for a quarter of a second.
+/// ⚠ It cannot be nonzero from a wire-fence block: that arm is deliberately not
+/// rebasable, so `WfBWire` climbing with `WfBReb` at 0 is the expected shape of an
+/// ordinary busy desktop.
+///
+/// ⛔⛔ **`WfBStrm` / `WfBBlt` CANNOT DIAGNOSE IT, AND AN EARLIER GRADING SAID
+/// THEY COULD** — *"the counter that MOVED before this one is the diagnosis, since
+/// a rebase is always preceded by blocked looks on exactly one arm"*. Both halves
+/// fail. The premise is true only of the SINGLE look that rebased; the counters
+/// are session-cumulative, adapter-global counts of blocked DPC looks that climb
+/// continuously under DWM, so by the time one `WfBReb` fires each sibling already
+/// carries thousands of increments from unrelated heads. "Which one moved" is not
+/// a question two monotonic totals can answer without a per-rebase snapshot, and
+/// nothing snapshots them.
+///
+/// ⇒ The arm is recorded at the rebase instead, by
+/// [`WDDM_HEAD_REBASED_STREAM`] / [`WDDM_HEAD_REBASED_BLT`]. Those two partition
+/// this counter exactly (`WfBRebS + WfBRebB == WfBReb`) and ARE the diagnosis.
 pub static WDDM_HEAD_REBASED: AtomicU32 = AtomicU32::new(0);
+/// The [`WDDM_HEAD_REBASED`] subset whose blocking arm at the rebasing look was
+/// the PRESENT-STREAM boundary. Mirrored as `WfBRebS`.
+///
+/// WHOSE ACTIVITY: any context with a registered present stream — i.e. the D3D11
+/// present path, DWM's included. It is not D3D12-specific.
+///
+/// ⚠ WHAT IT NAMES, precisely: the arm that was still unsatisfied on the look that
+/// EXPIRED the bound, not necessarily the arm that armed it. A head can carry both
+/// a stream boundary and a windowed-BLT terminal, and `take_one_ready_wddm` tests
+/// stream first; if the stream cleared while the bound was running and the BLT did
+/// not, the rebase is attributed to the BLT — which is the more useful of the two,
+/// because it is the dependency that was actually abandoned.
+pub static WDDM_HEAD_REBASED_STREAM: AtomicU32 = AtomicU32::new(0);
+/// The [`WDDM_HEAD_REBASED`] subset whose blocking arm at the rebasing look was
+/// the WINDOWED-BLT terminal prefix. Mirrored as `WfBRebB`. Same attribution
+/// caveat as [`WDDM_HEAD_REBASED_STREAM`], and the same population — the windowed
+/// present path, not D3D12.
+pub static WDDM_HEAD_REBASED_BLT: AtomicU32 = AtomicU32::new(0);
 /// Fenced SUBMIT_3D enqueues carrying ring_idx >= 1 (GPU-completion fences —
 /// WS1 #4 consumer-side ordering; these retire at host GPU completion, not
 /// decode, so they legally stay in flight for the full GPU-work duration).
@@ -133,34 +195,62 @@ pub static RING_COMPLETE_COUNT: AtomicU32 = AtomicU32::new(0);
 // (`virtio/ctrl.rs`), which is reachable from nowhere else (`ddi/escape.rs:1233`
 // and `:1242` are its only callers).
 //
-// HOW TO READ THEM, spelled out because the informative reading is a ZERO:
-//   * `EscSub > 0` and `EscSubRing == 0` — the ICD submits, and never on a
-//     GPU-completion ring. `RetireDomain::IncludingGpu` (`gpu/mod.rs:1496-1519`,
-//     implemented at `:4958-4972` as "no in-flight entry below the watermark,
-//     whatever its ring") is then gating on host DECODE, not GPU completion —
-//     which `:1506-1515`'s own comment already states for ring 0. A D3D12 fence
-//     built on it would report decode and lie.
-//   * `EscSub == 0` across a D3D12 run — this driver saw NOTHING from that
-//     process, which is a different finding and the one that fits a 0.8–1.1 µs
-//     fence wait: a plain `vkQueueSubmit`'s command stream never touches virtio
-//     (it rides the shared ring), and the only virtio submit a frame can
-//     produce is the `vkNotifyRingMESA` doorbell — hardcoded `ring_idx = 0`
-//     (`icd/mesa/src/virtio/vulkan/vn_renderer_util.h:22-35`) and emitted only
-//     when the host ring advertises IDLE and the 1 ms limiter has expired
-//     (`vn_ring.c:673-690`, `VN_RING_IDLE_TIMEOUT_NS` at `:22`). A ring busier
-//     than 1 ms emits no doorbell and therefore no wire fence at all.
-//   * `RngSub` climbing while `EscSubRing` stays put — all ring-1 work is this
-//     driver's own compositor copies. That is the state the old single counter
-//     could not distinguish from success.
+// ⛔⛔ HOW TO READ THEM: **ONLY AS DELTAS AGAINST A CONTROL ARM. THE ZERO FORMS
+// ARE UNSATISFIABLE READINGS AND ANY RULE PHRASED ON ONE IS UNFALSIFIABLE.**
 //
-// ⭐ THE READING THAT WOULD REFUTE "vkd3d's work is ring-0 only": an `EscSubRing`
-// delta that GROWS when a D3D12 workload is added to an otherwise unchanged
-// desktop. It needs a control arm, not arithmetic: the shipping D3D11 present
-// path contributes ~one `EscSubRing` per present by itself — the win32 external
-// semaphore signal batch, whose ring_idx is the submitting queue's ring
-// (`vn_queue.c:1719-1751` ← `:887` ← `vn_device.c:83-88`; ring 0 is reserved,
-// `vn_instance.c:309-310`) — so take the idle-desktop delta first and the
-// probe-running delta second, over the same wall-clock window.
+// WHOSE ACTIVITY INCREMENTS THEM. Every client of this adapter's, DWM's
+// included. "Guest-attributed" means attributed to the guest SIDE of the wire —
+// `submit_venus_async_inner` counts each `HELIOS_ESCAPE_SUBMIT_VENUS` from
+// whichever process made it — NOT attributed to a process. They are plain
+// statics in the driver image with no reset at StartDevice, so a value is
+// cumulative over every device generation since the image loaded, and
+// `pnputil /restart-device` does not zero it.
+//
+// ⛔ AN EARLIER REVISION OF THIS COMMENT SAID *"the informative reading is a
+// ZERO"* AND GAVE `EscSub > 0 && EscSubRing == 0` AND `EscSub == 0` AS DECISION
+// RULES. Neither branch can ever be taken on a live desktop, so their absence
+// would have been read as evidence for the other branch. The mechanism that
+// forecloses them is the SHIPPING D3D11 PRESENT PATH:
+// `vn_signal_win32_external_semaphore` (`icd/mesa/src/virtio/vulkan/vn_queue.c`)
+// builds a `vn_renderer_submit_batch` with `ring_idx =
+// sem->external_payload.ring_idx`, which `vn_queue_submission_prepare` sets to
+// the submitting `VkQueue`'s own `ring_idx`; every `VkQueue` acquires
+// its ring through `vn_instance_acquire_ring_idx` (`vn_device.c`), and ring 0 is
+// RESERVED for the CPU timeline (`vn_instance.c` seeds `ring_idx_used_mask` with
+// bit 0), so that value is always >= 1. When the payload carries a ring seqno
+// the batch also carries `cs_size != 0`, and `helios_submit`
+// (`vn_renderer_helios.c`) turns exactly such a batch into ONE
+// `HELIOS_ESCAPE_SUBMIT_VENUS`. ⇒ each DWM present through a shared/win32
+// semaphore adds ~1 to `EscSub` AND ~1 to `EscSubRing`, with no D3D12 client on
+// the box at all.
+//
+// ⭐ THE PROCEDURE THAT DOES WORK — an idle-desktop delta and a probe delta over
+// the SAME wall-clock window, subtracted:
+//   * `Δ EscSubRing` GROWS when a D3D12 workload is added ⇒ vkd3d's work does
+//     reach a GPU-completion ring. This is the reading that would refute
+//     "vkd3d's work is ring-0 only", and it is the whole reason these exist.
+//   * `Δ EscSubRing` UNCHANGED while `Δ EscSub` grows ⇒ the D3D12 client submits
+//     through this transport but never on a GPU-completion ring.
+//     `RetireDomain::IncludingGpu` (implemented as "no in-flight entry below the
+//     watermark, whatever its ring") is then gating on host DECODE, not GPU
+//     completion, and a D3D12 fence built on it would report decode and lie.
+//   * NEITHER delta grows ⇒ this driver saw nothing new from that process. That
+//     is the shape that fits a 0.8–1.1 µs fence wait: a plain `vkQueueSubmit`'s
+//     command stream never touches virtio (it rides the shared ring), and the
+//     only virtio submit a frame can produce by itself is the
+//     `vkNotifyRingMESA` doorbell — hardcoded `ring_idx = 0` (`/* CPU ring */`
+//     in `vn_renderer_util.h`'s `vn_renderer_submit_simple`) and emitted only when
+//     the host ring advertises IDLE and the `VN_RING_IDLE_TIMEOUT_NS` limiter has
+//     expired (`vn_ring.c`). A ring busier than 1 ms emits no doorbell and
+//     therefore no wire fence at all.
+//   * `Δ RngSub` climbing while `Δ EscSubRing` stays put ⇒ all NEW ring-1 work is
+//     this driver's own compositor copies. That is the state the old single
+//     counter could not distinguish from success.
+//
+// ⚠ The control arm is not optional and it is not arithmetic: there is no
+// constant to subtract, because DWM's per-present contribution scales with how
+// much the desktop composited during the window. Two windows of equal wall-clock
+// length with the desktop otherwise untouched is the whole method.
 //
 // ⚠ [`ASYNC_SUBMIT_COUNT`] is NOT the guest total and cannot stand in for
 // `EscSub`: it is bumped inside `enqueue_submit_inner`, so it already includes
@@ -189,10 +279,29 @@ pub static ESCAPE_SUBMIT_RING_COUNT: AtomicU32 = AtomicU32::new(0);
 /// it, `PresentSubmissionPrivate`'s BLT fence and `HeliosD3D12SubmitCmd`'s
 /// `gpu_wire_fence`, so it is not named after either.
 ///
-/// Nonzero on the D3D12 path means the UMD sampled a fence id this KMD has not
-/// issued (a stale sample, or a value from another transport generation), and the
-/// packet then waits on the whole backlog instead of its own work — slower, never
-/// wedged, and `RngSub`/`EscSubRing` say whether such a fence could exist at all.
+/// ⛔ WHOSE ACTIVITY INCREMENTS IT: **BOTH WRITERS' — SO DWM'S D3D11 PRESENTS
+/// MOVE IT WITH NO D3D12 CLIENT ON THE BOX.** The rejection is decided in
+/// `wddm_boundary::select` BEFORE the `d3d12` bit is consulted, so a
+/// `PresentSubmissionPrivate` BLT marker naming a stale id lands here exactly as a
+/// `HeliosD3D12SubmitCmd` would. An earlier grading said a nonzero value means
+/// *"the UMD named a fence id this KMD never issued"* — there is no "the UMD"
+/// here, and reading it as a D3D12 finding attributes the present path's clamps
+/// to `helios_umd12.dll`.
+///
+/// ⚠ NOT RESET AT StartDevice (a plain image-lifetime static), while the standard
+/// deploy is `pnputil /restart-device`. A value therefore spans every device
+/// generation since the image loaded, and CLAUDE.md rule 6 applies in full:
+/// verify it MOVES within the window you are attributing before reading anything
+/// into it.
+///
+/// GRADING, honestly: **a DELTA over a window in which only the D3D12 client
+/// changed** is the only attributable form. A nonzero delta then means that client
+/// sampled a fence id this KMD has not issued (a stale sample, or a value from
+/// another transport generation), and the packet fell back to waiting on the whole
+/// backlog instead of its own work — slower, never wedged. `RngSub`/`EscSubRing`
+/// (as deltas, see their block above) say whether such a fence could exist at all.
+/// ⛔ An absolute reading cannot separate the two writers and must not be quoted
+/// as a D3D12 number.
 pub static GPU_FENCE_CLAMPED: AtomicU32 = AtomicU32::new(0);
 /// Guest-supplied completion boundaries REJECTED because they name a fence from a
 /// FOREIGN transport generation — below this instance's `wire_fence_base`.
@@ -210,11 +319,30 @@ pub static GPU_FENCE_CLAMPED: AtomicU32 = AtomicU32::new(0);
 /// reading in either means the packet fell back to the conservative
 /// `next_wire_fence` prefix rather than to the boundary the writer named.
 ///
-/// GRADING: **0 on any session without a device restart**, and a small number
-/// after one — a client that survived `pnputil /restart-device` holding fences is
-/// exactly the case the striding comment at `VirtioGpu::init` describes. Nonzero
-/// *without* a restart means a UMD is sampling fence ids from somewhere other than
-/// this transport, which is a different and worse finding.
+/// ⛔ WHOSE ACTIVITY INCREMENTS IT: **BOTH WRITERS' — DWM'S D3D11 PRESENT BLT
+/// MARKER REACHES THIS ARM TOO**, for the same reason as [`GPU_FENCE_CLAMPED`]:
+/// the generation test runs inside `wddm_boundary::select` before the `d3d12` bit
+/// is looked at. A survivor of a device restart is far more likely to be DWM (it
+/// is the longest-lived D3D client on the box and it is not restarted by
+/// `pnputil /restart-device`) than a freshly launched D3D12 probe.
+///
+/// ⛔⛔ GRADING, CORRECTED — **"0 on any session without a device restart" IS NOT
+/// EVALUABLE FROM THIS COUNTER.** It is a plain image-lifetime static with NO
+/// reset at StartDevice, and the standard deploy IS `pnputil /restart-device`. So
+/// after the first restart in a boot the value is permanently nonzero and stays
+/// nonzero for every later reading, whether or not the session being graded had a
+/// restart of its own. The counter cannot tell you which generation its
+/// increments came from.
+///
+/// ⇒ The evaluable forms:
+///   * a DELTA across a window with NO device restart in it — must be 0. Nonzero
+///     there means some client is sampling fence ids that did not come from this
+///     transport, which is the different and worse finding;
+///   * a DELTA across a window that DID contain a restart — a small number is the
+///     surviving-client case the striding comment at `VirtioGpu::init` describes,
+///     and it is expected;
+///   * the absolute value — says only "at least one restart has happened since
+///     this driver image loaded", which the boot log already says better.
 pub static GPU_FENCE_FOREIGN_GENERATION: AtomicU32 = AtomicU32::new(0);
 /// `WAIT_FENCE` / `REGISTER_FENCE_EVENT` refusals of a fence id from a FOREIGN
 /// transport generation — the same one-sided-bound defect as
@@ -226,11 +354,25 @@ pub static GPU_FENCE_FOREIGN_GENERATION: AtomicU32 = AtomicU32::new(0);
 /// dressed as success. Its own counter rather than [`FENCE_EVENT_INVALID`], which
 /// already pools several unrelated rejections.
 ///
-/// GRADING: identical to [`GPU_FENCE_FOREIGN_GENERATION`] — 0 without a device
-/// restart, small after one. ⚠ It is NOT expected to track that counter's value:
-/// the two paths have different callers (the WDDM boundary vs the ICD's own waits),
-/// and a client that survives a restart typically has many parked waits and no
-/// WDDM submissions of its own.
+/// ⛔ WHOSE ACTIVITY INCREMENTS IT: **ANY PROCESS'S ICD, DWM'S ABOVE ALL.** The
+/// two increment sites are `VirtioGpu::fence_wait_prepare` and
+/// `VirtioGpu::fence_event_register` — the `HELIOS_ESCAPE_WAIT_FENCE` and
+/// `REGISTER_FENCE_EVENT` escapes — which every venus client makes constantly and
+/// which have nothing to do with the WDDM submission path or with D3D12. An
+/// earlier grading said a nonzero value means *"a UMD is sampling fence ids from
+/// somewhere other than this transport"*; the population is "every waiter on the
+/// adapter", and DWM's DXVK is the busiest member of it.
+///
+/// ⛔⛔ GRADING: **the same correction as [`GPU_FENCE_FOREIGN_GENERATION`] —
+/// "0 without a device restart" IS NOT EVALUABLE from the counter.** No reset at
+/// StartDevice + `pnputil /restart-device` as the standard deploy ⇒ permanently
+/// nonzero after the first restart in a boot. Only a delta over a restart-free
+/// window can be graded, and only that delta must be 0.
+///
+/// ⚠ It is NOT expected to track [`GPU_FENCE_FOREIGN_GENERATION`]'s value: the two
+/// paths have different callers (the WDDM boundary vs the ICD's own waits), and a
+/// client that survives a restart typically has many parked waits and no WDDM
+/// submissions of its own.
 pub static FENCE_ID_FOREIGN_GENERATION: AtomicU32 = AtomicU32::new(0);
 /// Fire-and-forget control commands queued by PASSIVE workers (currently the
 /// scanout RESOURCE_FLUSH path).  These own their DMA buffers until the normal

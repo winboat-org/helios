@@ -17,7 +17,7 @@ pass() { echo "ok   $1${2:+: $2}"; }
 
 # The changeset's Rust + C++ sources (submodules and docs excluded -- they are reviewed by lens,
 # not by grep, and a submodule path is a gitlink with no lines).
-mapfile -t SRC < <(git diff --name-only "$BASE"..HEAD -- '*.rs' '*.cpp' '*.h' | grep -v '^docs/')
+mapfile -t SRC < <(git diff --name-only "$BASE" -- '*.rs' '*.cpp' '*.h' | grep -v '^docs/')
 if [ ${#SRC[@]} -eq 0 ]; then echo "FAIL setup: no source files in $BASE..HEAD"; exit 1; fi
 echo "== A1 over ${#SRC[@]} changed source files, base $BASE =="
 
@@ -45,7 +45,7 @@ for f in "${SRC[@]}"; do
     if ! sed -n "${lo},${ln}p" "$f" | grep -qE 'SAFETY|#[[:space:]]*Safety'; then
       n_missing=$((n_missing+1)); missing_list+=$'\n'"    $f:$ln"
     fi
-  done < <(git diff -U0 "$BASE"..HEAD -- "$f" \
+  done < <(git diff -U0 "$BASE" -- "$f" \
             | awk '/^(\+\+\+|---|diff |index |new file|deleted file|similarity|rename |old mode|new mode)/ { next }
                    /^@@/{ if (match($0,/\+[0-9]+/)) { ln=substr($0,RSTART+1,RLENGTH-1)+0 } ; next }
                    /^\+/ { if ($0 ~ /unsafe[[:space:]]*[{]/ || $0 ~ /unsafe[[:space:]]+(fn|extern|impl)/) print ln; ln++ ; next }
@@ -73,7 +73,7 @@ for f in "${SRC[@]}"; do
       *"const _"*|*"static_assert"*) continue ;;
     esac
     panic_hits+=$'\n'"    $f:$ln: $(echo "$txt" | sed 's/^[[:space:]]*//' | cut -c1-100)"
-  done < <(git diff -U0 "$BASE"..HEAD -- "$f" \
+  done < <(git diff -U0 "$BASE" -- "$f" \
             | awk '/^(\+\+\+|---|diff |index |new file|deleted file|similarity|rename |old mode|new mode)/ { next }
                    /^@@/{ if (match($0,/\+[0-9]+/)) { ln=substr($0,RSTART+1,RLENGTH-1)+0 } ; next }
                    /^\+/ { s=substr($0,2);
@@ -95,7 +95,7 @@ for f in "${SRC[@]}"; do
   [ -f "$f" ] || continue
   while IFS= read -r ln; do
     allow_hits+=$'\n'"    $f:$ln: $(sed -n "${ln}p" "$f" | sed 's/^[[:space:]]*//')"
-  done < <(git diff -U0 "$BASE"..HEAD -- "$f" \
+  done < <(git diff -U0 "$BASE" -- "$f" \
             | awk '/^(\+\+\+|---|diff |index |new file|deleted file|similarity|rename |old mode|new mode)/ { next }
                    /^@@/{ if (match($0,/\+[0-9]+/)) { ln=substr($0,RSTART+1,RLENGTH-1)+0 } ; next }
                    /^\+/ { s=substr($0,2);
@@ -121,7 +121,7 @@ if [ "$sa" -ne 1 ]; then fail "static_assert-count" "expected 1, got $sa"; else 
 # ---------------------------------------------------------------------------
 # 5. Shared files: tables12.rs must have an EMPTY diff (§5).
 # ---------------------------------------------------------------------------
-t12=$(git diff --name-only "$BASE"..HEAD -- 'umd12/src/tables12.rs' | wc -l)
+t12=$(git diff --name-only "$BASE" -- 'umd12/src/tables12.rs' | wc -l)
 if [ "$t12" -ne 0 ]; then fail "tables12-untouched" "tables12.rs changed in the changeset"; else pass "tables12-untouched"; fi
 
 # ---------------------------------------------------------------------------

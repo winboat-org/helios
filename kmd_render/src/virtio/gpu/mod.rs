@@ -331,6 +331,17 @@ const WDDM_HOLD_MS_MAX: u32 = 250;
 /// two could not disagree. A static rather than a `VirtioGpu` field because the
 /// 60 Hz heartbeat in `adapter/kobj.rs` must test it WITHOUT taking `virtio_lock`
 /// — it is that heartbeat that provides the hold's release edge.
+///
+/// ⛔⛔ **SNAPSHOTTED AT `VirtioGpu::init`, SO SETTING THE REGISTRY VALUE DOES
+/// NOTHING UNTIL THE NEXT StartDevice.** `pnputil /restart-device` is enough (no
+/// reboot); without it the hold stays 0 and UV1's experiment silently does not
+/// run. This matters because the outcome of not running is INDISTINGUISHABLE from
+/// the experiment's own negative result: both produce the flat 0.8–1.1 µs
+/// `WaitForSingleObject` reading that the UV1 table at `diag::knobs::WDDM_HOLD_MS`
+/// grades as **UV1 ✗ — "say so loudly and stop"**. The discriminator is
+/// [`WDDM_HEAD_BLOCKED_HOLD`] (`WfBHold`): it must have MOVED during the measured
+/// window, or the run measured nothing. Its own doc carries the full precondition
+/// and the two other ways a flat reading arises.
 pub static WDDM_HOLD_MS: AtomicU32 = AtomicU32::new(0);
 /// `WddmHeadMs`: how long the head of the WDDM FIFO may stay blocked on a
 /// TAGGED-NAMESPACE dependency before that dependency is rebased onto the
@@ -369,6 +380,21 @@ const WDDM_HEAD_MS_MAX: u32 = 1000;
 /// which is the 0ab-B stale/black-frame class. A 1 ms bound would rebase healthy
 /// frames continuously. 100 ms is ~27 frames at the measured producer floor.
 const WDDM_HEAD_MS_MIN: u32 = 100;
+/// Which blocked arm reached [`VirtioGpu::rebase_blocked_head`].
+///
+/// An enum rather than a `bool`, because the value is only ever used to select a
+/// counter and a bare `true` at the call site would say nothing about which arm it
+/// meant. There is no `Wire` variant on purpose: the wire arm returns
+/// `BlockedOnProducer` without ever calling the rebase (it has nothing to rebase
+/// onto), and the hold arm is not a dependency.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RebaseArm {
+    /// The present-stream boundary was still unsatisfied.
+    Stream,
+    /// The windowed-BLT terminal prefix was still unsatisfied.
+    Blt,
+}
+
 /// The FIFO head's armed `WddmHeadMs` deadline, in interrupt-time 100 ns units, or
 /// 0 when nothing is armed — which is the state of every ordinary desktop.
 ///
@@ -1457,11 +1483,62 @@ pub(crate) static PRESENT_EXACT_WATERMARK_USED: AtomicU32 = AtomicU32::new(0);
 /// keep reachable. The A/B that matters is `D12Zero` — a UMD naming no boundary at
 /// all — which is already the documented order-against-nothing lever.
 ///
-/// GRADING: expected to EQUAL the number of D3D12 records that named a usable
-/// boundary, i.e. `D12Rec - D12Zero - D12MrgF - GpuFncClamp - GpuFncGen`. Any
-/// shortfall means a D3D12 packet took a prefix arm, which is the defect A4 names
-/// coming back; `D12Exact > 0` with `EscSubRing == 0` means the ICD is handing the
-/// UMD ring-0 fence ids, so the exactness is exact about the wrong domain.
+/// WHOSE ACTIVITY INCREMENTS IT: only a submission that carried a live
+/// `HeliosD3D12SubmitCmd` record, i.e. `helios_umd12.dll`'s. DWM cannot move it —
+/// the D3D11 present writer of the same field is routed to `Kind::Prefix` by
+/// `wddm_boundary::select`. It is the one counter in this cluster with a clean
+/// population.
+///
+/// ⛔⛔ **THERE IS NO EXACT IDENTITY FOR THIS COUNTER, AND AN EARLIER GRADING
+/// ASSERTED ONE**: `D12Exact == D12Rec - D12Zero - D12MrgF - GpuFncClamp -
+/// GpuFncGen`, with *"any shortfall means a D3D12 packet took a prefix arm, which
+/// is the defect A4 names coming back"*. That arithmetic cannot hold, so its
+/// failure would have been reported as a closed defect re-opening. Four
+/// independent reasons, each sufficient:
+///
+///  1. **THE UNITS DIFFER.** `D12Rec`/`D12Zero`/`D12MrgF`/`D12Merged`/`D12Clr`
+///     count `DxgkDdiRender` calls — one per ECL record decoded. THIS counts
+///     `DxgkDdiSubmitCommand{,Virtual}` packets. dxgkrnl batches Renders into one
+///     DMA buffer, so N records can produce one submission.
+///  2. **`D12Merged` IS NOT IN THE EXPRESSION** and is exactly the collapse in
+///     (1): the k-1 later records in a batch merge into the first (largest fence
+///     wins), contributing 0 further exact submissions.
+///  3. **REPLAYS ARE UNACCOUNTED.** `PresentSubmissionPrivate::decode` CONSUMES
+///     the D3D12 magic by design, so a packet resubmitted out of the same buffer
+///     falls back to the prefix on purpose — a `D12Rec` with no `D12Exact`, and
+///     the fail-safe direction the consume exists for.
+///  4. **`GpuFncClamp` / `GpuFncGen` ARE ADAPTER-GLOBAL.** Both are decided in
+///     `wddm_boundary::select` BEFORE the `d3d12` bit is read, so DWM's D3D11
+///     present BLT marker moves them. Subtracting them from a D3D12 accounting
+///     mixes populations; their own docs in `virtio/counters.rs` say so.
+///  (5. `D12Clr` post-dates the expression and is a further term.)
+///
+/// ⇒ GRADING, in the forms that ARE true:
+///
+///  * **SOUND BOUND: `D12Exact <= D12Rec - D12Zero`.** Every exact submission
+///    consumes one `'HD12'` record whose surviving `gpu_fence_id` is nonzero, and
+///    only a nonzero-fence Render can put one there (`mark_d3d12` takes the max,
+///    and a zero-fence record is overwritten rather than merged). A VIOLATION is a
+///    real defect — a record honoured twice, or a boundary from somewhere
+///    `mark_d3d12` did not write. Every term above slackens this bound in the same
+///    direction, which is why it survives all of them.
+///  * **THE A4 REGRESSION SIGNAL is qualitative: `D12Rec > D12Zero` while
+///    `D12Exact == 0`.** Records named real boundaries and NOT ONE reached
+///    SubmitCommand as an exact wait. That is A4 coming back, or the record never
+///    surviving to SubmitCommand at all — and unlike a shortfall it needs no
+///    arithmetic to state.
+///  * **HEALTHY = `D12Exact` MOVES**, at roughly the rate of `ExecuteCommandLists`
+///    batches that named a fence, and well below `D12Rec`.
+///  * ⛔ **A SHORTFALL AGAINST ANY EXPRESSION ATTRIBUTES NOTHING.** At least five
+///    independent terms sit between the two counters, four legitimately nonzero
+///    and two adapter-global. If the per-term attribution is ever needed it has to
+///    be counted at the site, not inferred here.
+///
+/// ⚠ The old rule's second half — *"`D12Exact > 0` with `EscSubRing == 0` means
+/// the ICD is handing the UMD ring-0 fence ids"* — rests on a reading that cannot
+/// occur: `EscSubRing` is adapter-global and DWM's own present path makes it
+/// nonzero. The ring question is answerable only as a delta against a control arm;
+/// see `EscSubRing`'s block in `virtio/counters.rs`.
 pub(crate) static D3D12_EXACT_WATERMARK_USED: AtomicU32 = AtomicU32::new(0);
 /// Gap between one instance's first id and the next instance's.
 ///
@@ -6307,7 +6384,7 @@ impl VirtioGpu {
             }
             if !stream_boundary.map_or(true, |boundary| self.scanout_boundary_ready(boundary)) {
                 WDDM_HEAD_BLOCKED_STREAM.fetch_add(1, Ordering::Relaxed);
-                if pass == 1 && self.rebase_blocked_head() {
+                if pass == 1 && self.rebase_blocked_head(RebaseArm::Stream) {
                     continue;
                 }
                 return WddmTake::BlockedOnProducer;
@@ -6320,7 +6397,7 @@ impl VirtioGpu {
                 _ => false,
             } {
                 WDDM_HEAD_BLOCKED_BLT.fetch_add(1, Ordering::Relaxed);
-                if pass == 1 && self.rebase_blocked_head() {
+                if pass == 1 && self.rebase_blocked_head(RebaseArm::Blt) {
                     continue;
                 }
                 return WddmTake::BlockedOnProducer;
@@ -6401,7 +6478,18 @@ impl VirtioGpu {
     /// in [`Self::take_one_ready_wddm`]), the hold arm is not a dependency, and the
     /// entry's `fence` and FIFO position are untouched — dxgkrnl requires monotonic
     /// `SubmissionFenceId` completion and this must never become a bypass.
-    fn rebase_blocked_head(&mut self) -> bool {
+    ///
+    /// # `arm` — why the caller has to say
+    ///
+    /// ⛔ THE REBASE IS THE ONLY PLACE THE ANSWER EXISTS. `WfBReb` used to be
+    /// graded *"whichever of `WfBStrm`/`WfBBlt` moved with it is the diagnosis"*,
+    /// which cannot work: those are session-cumulative, adapter-global blocked-look
+    /// totals that climb continuously under DWM, so both have thousands of
+    /// unrelated increments by the time one rebase fires. Passing the blocking arm
+    /// in costs one relaxed `fetch_add` on the path that already writes three of
+    /// them, and turns an undiagnosable price tag into an attributed one
+    /// (`WfBRebS`/`WfBRebB`, which partition `WfBReb`).
+    fn rebase_blocked_head(&mut self, arm: RebaseArm) -> bool {
         let ms = WDDM_HEAD_MS.load(Ordering::Relaxed);
         if ms == 0 {
             return false;
@@ -6467,6 +6555,14 @@ impl VirtioGpu {
             self.abandon_windowed_blt_wddm_prefix(prefix);
         }
         WDDM_HEAD_REBASED.fetch_add(1, Ordering::Relaxed);
+        // The two subsets partition `WfBReb` exactly: one increment per rebase,
+        // chosen by the caller's arm. A relaxed atomic, like every counter around
+        // it — this runs under `virtio_lock` at DISPATCH, where `diag::record` is
+        // forbidden (it writes the registry and is PASSIVE-only).
+        match arm {
+            RebaseArm::Stream => WDDM_HEAD_REBASED_STREAM.fetch_add(1, Ordering::Relaxed),
+            RebaseArm::Blt => WDDM_HEAD_REBASED_BLT.fetch_add(1, Ordering::Relaxed),
+        };
         true
     }
 

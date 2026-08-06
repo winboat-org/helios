@@ -312,6 +312,52 @@ static GPU_CLOCK_CALIBRATE_CALLS: AtomicU32 = AtomicU32::new(0);
 /// somebody landed a real GPU-clock source and did not re-grade this counter.
 static GPU_CLOCK_NO_GPU_COUNTER: AtomicU32 = AtomicU32::new(0);
 
+/// `DxgkDdiSetStablePowerState` calls, and the subset that asked to ENABLE the
+/// stable power state. Mirrored as `StblPwr` / `StblPwrEn`.
+///
+/// ⛔ THE DDI RETURNS `void`, SO dxgkrnl REPORTS SUCCESS NO MATTER WHAT THIS
+/// DRIVER DOES — and this driver does nothing. `ID3D12Device::SetStablePowerState`
+/// is the FIRST call of every D3D12 timing/profiling harness, and after it the
+/// application believes the GPU clock is pinned and that its timestamp deltas are
+/// comparable across runs. This is the same shape `DxgkDdiCalibrateGpuClock` was
+/// repaired for and it stood uncounted beside it.
+///
+/// ⚠ THE NO-OP IS PROBABLY THE CORRECT BEHAVIOUR — there are no guest clocks to
+/// lock, virtio-gpu carries no clock-control command, and the host's clock policy
+/// is not this driver's to change. The defect is that a no-op was
+/// INDISTINGUISHABLE from a working one. These two make it distinguishable
+/// without pretending to a capability, which is CLAUDE.md rule 2's "loud failure
+/// over fake success" in the only form available to a `void` DDI.
+///
+/// WHOSE ACTIVITY INCREMENTS THEM: any process calling
+/// `ID3D12Device::SetStablePowerState` (or the D3D11 equivalent) on this adapter.
+/// ⭐ DWM CANNOT — it never asks for a stable power state — so unlike most
+/// counters in this driver these ARE attributable to the profiling client without
+/// a control arm.
+///
+/// GRADING: `StblPwr == 0` across a D3D12 benchmark run means no harness asked,
+/// and nothing is being fabricated. `StblPwrEn > 0` is the loud reading: that many
+/// callers were told their GPU clock is locked and it is not, so run-to-run
+/// timestamp variance is expected and any conclusion drawn from clock stability is
+/// void. `StblPwr > StblPwrEn` is the normal paired teardown (`FALSE` after
+/// `TRUE`), not a finding.
+static STABLE_POWER_CALLS: AtomicU32 = AtomicU32::new(0);
+static STABLE_POWER_ENABLE_CALLS: AtomicU32 = AtomicU32::new(0);
+
+/// `DxgkDdiFormatHistoryBuffer` calls, every one of which reports
+/// `NumTimestamps = 0` + SUCCESS. Mirrored as `HistBuf`.
+///
+/// Same class as [`STABLE_POWER_CALLS`], lower stakes: the answer "this buffer
+/// contains no timestamps" is at least not a fabricated VALUE, and nothing divides
+/// by it. It is counted so the absence of GPU work history is a reading rather
+/// than an assumption. WHOSE ACTIVITY: dxgkrnl's, on behalf of any client that
+/// asked for GPU work history (ETW/GPUView-class consumers); DWM does not.
+///
+/// GRADING: no expected value. Nonzero means something IS asking for history and
+/// getting an empty answer, which is the point at which implementing it becomes a
+/// question worth having.
+static FORMAT_HISTORY_CALLS: AtomicU32 = AtomicU32::new(0);
+
 /// Mirror the clock-calibration counters at PASSIVE. Called from
 /// [`crate::ddi::record_present_handoff_telemetry`]; the DDI itself may run at
 /// DISPATCH, where a registry write is a never-violate rule.
@@ -325,14 +371,34 @@ pub(crate) fn gpu_clock_counters() -> (u32, u32, u32) {
     )
 }
 
+/// Mirror the two fabricated-success counters for the `void` DDI at PASSIVE, from
+/// the same site and for the same IRQL reason as [`gpu_clock_counters`].
+/// Returns `(StblPwr, StblPwrEn, HistBuf)`.
+pub(crate) fn fabricated_success_counters() -> (u32, u32, u32) {
+    (
+        STABLE_POWER_CALLS.load(Ordering::Relaxed),
+        STABLE_POWER_ENABLE_CALLS.load(Ordering::Relaxed),
+        FORMAT_HISTORY_CALLS.load(Ordering::Relaxed),
+    )
+}
+
 /// ⛔ THE ONE CHANNEL FOR THE GPU TIMESTAMP FREQUENCY. See
 /// [`GPU_TIMESTAMP_FREQUENCY_HZ`] for why, and for what would make the answer
 /// wrong.
 ///
 /// Until 2026-08-06 this zero-filled `DXGKARG_CALIBRATEGPUCLOCK` and returned
-/// `STATUS_SUCCESS` with no counter and no diag record — the one DDI in this
-/// driver that fabricated data, claimed success, and said nothing about it, on the
-/// exact path a benchmark score depends on (CLAUDE.md rule 2).
+/// `STATUS_SUCCESS` with no counter and no diag record — fabricated data, claimed
+/// success, and said nothing about it, on the exact path a benchmark score depends
+/// on (CLAUDE.md rule 2).
+///
+/// ⛔ THE ORIGINAL FORM OF THIS SENTENCE CALLED IT *"the ONE DDI in this driver
+/// that"* did so, and that was FALSE WHEN WRITTEN. Its sibling further down this
+/// same file, [`dxgkddi_set_stable_power_state`] — an empty body returning `void`,
+/// reached by `ID3D12Device::SetStablePowerState(TRUE)` at the start of every
+/// D3D12 timing harness — was the same shape and was uncounted. A
+/// superlative in a comment is a claim about the rest of the file, and this one
+/// would have retired a live defect by asserting it did not exist. Both are
+/// counted now; the claim is deliberately not restated in any form.
 ///
 /// ⚠ NO `diag::record` HERE, and its absence is a requirement rather than an
 /// omission: `d3dkmddi.h` declares this DDI `_IRQL_requires_max_(DISPATCH_LEVEL)`
@@ -427,6 +493,15 @@ pub unsafe extern "C" fn dxgkddi_calibrate_gpu_clock(
     STATUS_SUCCESS
 }
 
+/// Reports an EMPTY history buffer and SUCCESS. Counted (`HistBuf`) rather than
+/// silent — see [`FORMAT_HISTORY_CALLS`] for the grading and for why this is the
+/// lower-stakes member of the fabricated-success pair.
+///
+/// ⚠ NO `diag::record` HERE, for the same reason as its two siblings: the IRQL
+/// contract of this DDI is not readable from the Linux tree (the WDK header's SAL
+/// annotations do not survive bindgen), a registry write above PASSIVE is a
+/// never-violate rule, and an atomic costs nothing. The safe form is
+/// unconditional.
 pub unsafe extern "C" fn dxgkddi_format_history_buffer(
     _h_adapter: IN_CONST_HANDLE,
     args: *mut DXGKARG_FORMATHISTORYBUFFER,
@@ -435,18 +510,50 @@ pub unsafe extern "C" fn dxgkddi_format_history_buffer(
         return STATUS_INVALID_PARAMETER;
     }
 
+    // Counted AFTER the null check, so `HistBuf` means "answered with an empty
+    // buffer" and not "was called with something unusable".
+    FORMAT_HISTORY_CALLS.fetch_add(1, Ordering::Relaxed);
     let args = unsafe { &mut *args };
     args.NumTimestamps = 0;
     args.Offset = 0;
     STATUS_SUCCESS
 }
 
+/// ⛔ A NO-OP THAT dxgkrnl REPORTS AS SUCCESS, NOW COUNTED (`StblPwr` /
+/// `StblPwrEn`). See [`STABLE_POWER_CALLS`] for the full grading, for who can
+/// increment it (not DWM), and for the argument that the no-op is very likely the
+/// CORRECT behaviour — a guest that cannot control any GPU clock has nothing to
+/// pin — while being indistinguishable from a working implementation was not.
+///
+/// The DDI returns `void`, so there is no error channel: refusing is not
+/// expressible and `STATUS_NOT_SUPPORTED` cannot be returned. A counter is the
+/// only loudness available, which is exactly why the silent version survived a
+/// review that repaired its sibling [`dxgkddi_calibrate_gpu_clock`].
+///
+/// ⚠ NO `diag::record` HERE, and its absence is a requirement rather than an
+/// omission — identical to `dxgkddi_calibrate_gpu_clock`: this DDI is reached from
+/// a power/scheduler path that may run at DISPATCH-capable IRQL, `diag::record*`
+/// writes the registry and is PASSIVE-only, and the counters are mirrored from a
+/// PASSIVE site instead (`record_present_handoff_telemetry`).
+///
+/// ⛔ DO NOT "IMPLEMENT" THIS BY STORING THE FLAG AND REPORTING IT BACK SOMEWHERE.
+/// A remembered `Enabled` that changes no clock is a better-dressed version of the
+/// same fabrication. The honest implementation would need a host-side clock-policy
+/// channel that virtio-gpu does not have; until one exists the honest answer is a
+/// no-op plus these counters.
 pub unsafe extern "C" fn dxgkddi_set_stable_power_state(
     _h_adapter: IN_CONST_HANDLE,
     args: IN_CONST_PDXGKARG_SETSTABLEPOWERSTATE,
 ) {
     if args.is_null() {
         return;
+    }
+    STABLE_POWER_CALLS.fetch_add(1, Ordering::Relaxed);
+    // SAFETY: `args` is the dxgkrnl-supplied input struct, null-checked above;
+    // `DXGKARG_SETSTABLEPOWERSTATE` is a single `BOOL` and the read is in bounds.
+    if unsafe { (*args).Enabled } != 0 {
+        // The loud half: a caller was just told its GPU clock is pinned.
+        STABLE_POWER_ENABLE_CALLS.fetch_add(1, Ordering::Relaxed);
     }
 }
 
