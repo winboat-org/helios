@@ -188,8 +188,7 @@
 //! file that closes `EclNoWddmSubmission`.
 
 use core::ffi::c_void;
-use core::sync::atomic::{AtomicPtr, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use helios_umd_common::hr::{Hresult, E_FAIL, E_INVALIDARG, E_NOTIMPL, S_OK};
 use helios_umd_common::refusals::RefusalCounter;
@@ -224,12 +223,20 @@ use crate::{ddi12, device12, log_error, note_refusal, trace_line};
 // (`cmdlist.rs`) owns the 23 recording slots that read it, because this lane owns
 // the list's *lifetime* — `pfnCreateCommandList` is what puts a value in the slot
 // and `pfnDestroyCommandList` is what takes it out. One declaration, in the lane
-// that writes it. It is a bare COM word today because nothing this lane does
-// needs shadow state beyond the list itself; L3a promoting it to `boxed_handles!`
-// is an edit to this file, which is the correct place for it.
-helios_umd_common::com_handles!(crate::ddi12::D3D12DDI_HCOMMANDLIST,);
-
+// that writes it.
+//
+// ⭐ **It was a bare `com_handles!` word until S6 Round 2, and what promoted it
+// was not shadow state but an ERROR CHANNEL.** Every one of the 75 command-list
+// slots takes `D3D12DDI_HCOMMANDLIST` and **nothing else** — no `hDevice`
+// (`pfnDrawInstanced`, `d3d12umddi.h`), and 74 of the 75 return `VOID`. So a
+// recording DDI that fails has exactly one way to say so, `pfnSetErrorCb`, which
+// is **device**-scoped (`device12::set_error`) — and the only place a command
+// list can learn its device is here, at `pfnCreateCommandList`, which is the one
+// DDI in the list's whole life that is handed one. ⇒ [`CommandListState`], and
+// the promotion is this lane's to make (`PARALLEL.md` §4 gives it the handle) on
+// behalf of L3a/L3b/L3c/L8, which all four need it.
 helios_umd_common::boxed_handles!(
+    crate::ddi12::D3D12DDI_HCOMMANDLIST => CommandListState,
     crate::ddi12::D3D12DDI_HCOMMANDQUEUE => QueueState,
     crate::ddi12::D3D12DDI_HCOMMANDPOOL_0040 => PoolState,
     crate::ddi12::D3D12DDI_HCOMMANDRECORDER_0040 => RecorderState,
@@ -348,19 +355,128 @@ pub struct PoolState {
     allocator: OnceLock<PoolAllocator>,
 }
 
+/// Per-command-list shadow state.
+///
+/// ⛔ **Two fields, and the first one is the reason this type exists.** See the
+/// `boxed_handles!` comment above: a command-list DDI is handed the list handle
+/// and nothing else, so `h_device` is the only route from a recording slot to
+/// `device12::set_error`, and `pfnCreateCommandList` is the only DDI in the
+/// list's life that is told which device it belongs to.
+///
+/// ⚠ **Nothing else is shadowed, deliberately.** A forwarder is at its most
+/// correct when it holds no state the engine also holds: the current PSO, the
+/// bound descriptor heaps, the topology and the recording/closed flag all live
+/// inside vkd3d's own `d3d12_command_list` and a second copy here could only
+/// disagree with it. ⭐ The one obligation that *looked* like it needed shadow
+/// state — `SUBSTRATE.md` §4.5's *"the `DYNAMIC_*` PSO flags do not relieve the
+/// driver of applying the PSO's own depth-bias and IB-strip-cut on every
+/// `pfnSetPipelineState`"* — is discharged by the engine; see
+/// [`super::pso::L6Refusals::pso_dynamic_state_flag_forwarded`], which carries
+/// the source citation.
+///
+/// ⚠ `pub` for the same E0446 reason as [`QueueState`]: it is named as the
+/// associated type of the `pub` `BoxedHandle` trait. Both fields are private.
+pub struct CommandListState {
+    /// The device this list was created against — the only error channel a
+    /// `VOID`-returning recording slot has.
+    h_device: ddi12::D3D12DDI_HDEVICE,
+    /// The engine list. **Owned** — dropping this state releases it.
+    engine: ID3D12GraphicsCommandList,
+    /// The class this list was created as, from `Type` + `QueueFlags`.
+    ///
+    /// ⭐ Kept for exactly one reader, and it is the instrument for the open
+    /// question this lane's module doc names: **how a BUNDLE allocator is
+    /// expressed at this DDI.** `pfnResetCommandList` must reset against an
+    /// allocator of the *list's* class, `ID3D12CommandAllocator`'s class is fixed
+    /// at creation, and `D3D12DDIARG_CREATE_COMMAND_RECORDER_0040` carries no
+    /// bundle bit — so a bundle list and its recorder disagree here and nowhere
+    /// else. Without this field the symptom is an opaque engine `E_INVALIDARG`
+    /// from `Reset`; with it, `cmdlist.rs` names the mismatch before making the
+    /// call.
+    list_type: D3D12_COMMAND_LIST_TYPE,
+}
+
+impl CommandListState {
+    /// The engine command list, borrowed for the caller's DDI call.
+    ///
+    /// ⚠ A shared reference rather than a `ManuallyDrop<ID3D12GraphicsCommandList>`:
+    /// the box keeps the owning reference, and borrowing it as `&` makes
+    /// releasing it *unwritable* where a `ManuallyDrop` merely makes it
+    /// unlikely. Same choice, and the same reasoning, as
+    /// `resource12::engine_resource`.
+    pub(crate) fn engine(&self) -> &ID3D12GraphicsCommandList {
+        &self.engine
+    }
+
+    /// The device handle, for reaching `device12::set_error` from a `VOID` slot.
+    pub(crate) fn h_device(&self) -> ddi12::D3D12DDI_HDEVICE {
+        self.h_device
+    }
+
+    /// The class this list was created as. See the field doc — its only reader is
+    /// `pfnResetCommandList`'s allocator-class check.
+    pub(crate) fn list_type(&self) -> D3D12_COMMAND_LIST_TYPE {
+        self.list_type
+    }
+}
+
+/// What a recorder is currently pointed at: the pool's identity, and an **owned**
+/// reference to the allocator that pool is backed by.
+///
+/// ⛔ **The owned reference is the whole point, and it replaces a raw
+/// `AtomicPtr<c_void>` that could not be made safe.** Until S6 Round 2 this lane
+/// stored only the pool's `pDrvPrivate` and never dereferenced it — the one
+/// reader printed it as `{:p}`. `pfnResetCommandList` (L3a) has to go the other
+/// way, from the recorder to a live `ID3D12CommandAllocator`, and re-deriving
+/// `PoolState` from a stored `pDrvPrivate` would read memory **the runtime owns
+/// and frees at `pfnDestroyCommandPool`**. That the runtime "would not" destroy a
+/// pool a recorder still targets is a claim about someone else's object
+/// lifetimes, and CLAUDE.md rule 4 wants an invariant, not a claim. Holding a
+/// reference makes the freed-pool read *unrepresentable*: the allocator outlives
+/// the pool's private block because this box owns a reference to it.
+///
+/// ⚠ `pool` is a `usize`, not a pointer: it is **identity only**, for the trace
+/// lines and the rebind check, and is never dereferenced. Storing it as an
+/// integer says so in the type.
+struct RecorderTarget {
+    pool: usize,
+    allocator: ID3D12CommandAllocator,
+    /// The class that allocator was **created** for.
+    ///
+    /// ⛔ Carried rather than re-derived, because it cannot be re-derived:
+    /// `ID3D12CommandAllocator` exposes **no `GetType`** — the D3D12 API has no
+    /// way to ask an allocator its class, which is why [`PoolAllocator`] pairs
+    /// the two in the first place. `pfnResetCommandList`'s bundle check is the
+    /// reader (`cmdlist.rs`), and without this field it would have nothing to
+    /// compare the list's class against.
+    ///
+    /// ⚠ It is the **allocator's** class, not the binding recorder's. The two
+    /// differ exactly when `PoolTypeMismatch` fires, and it is the allocator's
+    /// that `ID3D12GraphicsCommandList::Reset` is judged against.
+    list_type: D3D12_COMMAND_LIST_TYPE,
+}
+
 /// Per-command-recorder shadow state. There is no engine object — see the module
 /// doc.
 pub struct RecorderState {
     /// The engine list class this recorder records for, derived once from
     /// `D3D12DDIARG_CREATE_COMMAND_RECORDER_0040::QueueFlags`.
     list_type: D3D12_COMMAND_LIST_TYPE,
-    /// The `pDrvPrivate` of the `D3D12DDI_HCOMMANDPOOL_0040` this recorder last
-    /// targeted, or null.
+    /// The pool this recorder last targeted, and that pool's allocator.
     ///
-    /// ⚠ Stored as the raw slot pointer rather than a `&PoolState`: it is the
-    /// handle identity the runtime will hand back, and re-deriving the state from
-    /// it keeps the pool's lifetime the pool's own business.
-    target_pool: AtomicPtr<c_void>,
+    /// ⚠ A `Mutex` rather than the `OnceLock`+atomic pair the pool uses, because
+    /// unlike a pool's allocator this is **rebindable**: the runtime may point a
+    /// recorder at a different pool at any time, so there is no
+    /// initialise-once shape to exploit. The critical section is one `Option`
+    /// swap and one `AddRef`, on a path the runtime drives once per
+    /// `ID3D12GraphicsCommandList::Reset`.
+    ///
+    /// ⛔ A poisoned lock is treated as a live one (`unwrap_or_else(|e|
+    /// e.into_inner())`): this crate is `panic = "abort"`, so no lock in it can
+    /// actually be poisoned, and `.unwrap()` on runtime data is forbidden
+    /// (`PARALLEL.md` §9.3). The recovery arm is what keeps the forbidden call
+    /// out of the file rather than a claim that it could not fire.
+    target: Mutex<Option<RecorderTarget>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -457,17 +573,32 @@ unsafe fn recorder_state<'a>(
     Some(unsafe { &*p })
 }
 
-/// The slot behind a `D3D12DDI_HCOMMANDLIST`. Named rather than generic for the
-/// same reason as the three above.
+/// The command-list state behind a DDI command-list handle. Same argument as
+/// [`queue_state`].
+///
+/// ⭐ **`pub(crate)`, and it is the seam the whole command-list table stands
+/// on.** L3a (`cmdlist.rs`), L3b (`rootargs.rs`), L3c (`copy.rs`) and L8
+/// (`present12.rs`) between them own 72 of the 75 command-list slots, every one
+/// of which starts by turning this handle into an engine list and a device to
+/// report against. R803's scar is that the payload must be derived from the
+/// handle **type** in one place rather than decoded at each call site; this lane
+/// owns the handle, so this is that one place — the same shape
+/// `resource12::engine_resource` takes for `D3D12DDI_HRESOURCE`.
 ///
 /// # Safety
-/// `h`'s slot, when non-null, must lie inside the private memory
-/// [`calc_private_command_list_size`] sized for this handle.
-unsafe fn command_list_slot(
+/// As [`queue_state`], for a handle [`create_command_list`] returned `S_OK` for.
+pub(crate) unsafe fn command_list_state<'a>(
     h: ddi12::D3D12DDI_HCOMMANDLIST,
-) -> Option<Slot<Com<ID3D12GraphicsCommandList>>> {
-    // SAFETY: forwarded unchanged; the caller's guarantee is `Slot::from_priv`'s.
-    unsafe { Slot::from_priv(h.drv_private()) }
+) -> Option<&'a CommandListState> {
+    // SAFETY: as `queue_state`.
+    let slot = unsafe { Slot::<Boxed<CommandListState>>::from_priv(h.drv_private()) }?;
+    // SAFETY: as `queue_state`.
+    let p = unsafe { slot.ptr() };
+    if p.is_null() {
+        return None;
+    }
+    // SAFETY: as `queue_state`.
+    Some(unsafe { &*p })
 }
 
 // ---------------------------------------------------------------------------
@@ -1051,7 +1182,7 @@ unsafe extern "C" fn create_command_recorder(
     unsafe {
         slot.store(RecorderState {
             list_type,
-            target_pool: AtomicPtr::new(core::ptr::null_mut()),
+            target: Mutex::new(None),
         });
     }
     S_OK
@@ -1090,22 +1221,20 @@ unsafe extern "C" fn command_recorder_set_command_pool_as_target(
         return;
     };
 
-    // ⚠ `swap`, not `store`: reading the previous binding is what makes this
-    // field an instrument rather than write-only state, and the trace line below
-    // is the readout. `AcqRel` because the value is a pointer another thread may
-    // publish and read.
-    let previous = recorder
-        .target_pool
-        .swap(h_pool.drv_private(), Ordering::AcqRel);
+    // ⚠ The previous binding is read rather than overwritten blind: reporting
+    // *what changed* is what makes this field an instrument rather than
+    // write-only state, and the trace line below is the readout.
+    let previous = target_pool_identity(recorder);
     trace_line!(
-        "CommandRecorderSetCommandPoolAsTarget: recorder={:p} pool {:p} -> {:p}",
+        "CommandRecorderSetCommandPoolAsTarget: recorder={:p} pool {:#x} -> {:p}",
         h_recorder.pDrvPrivate,
         previous,
         h_pool.pDrvPrivate,
     );
 
-    // Already backed? Then the only thing left to check is that the class the
-    // allocator was created for still matches this recorder's.
+    // Already backed? Then the only things left to do are to check that the class
+    // the allocator was created for still matches this recorder's, and to adopt
+    // it as this recorder's target.
     if let Some(backing) = pool.allocator.get() {
         if backing.list_type != recorder.list_type {
             note_refusal(&L2_REFUSALS.pool_type_mismatch);
@@ -1120,6 +1249,12 @@ unsafe extern "C" fn command_recorder_set_command_pool_as_target(
                 );
             }
         }
+        // ⚠ Bound even on the mismatch path, and deliberately: the binding this
+        // slot exists to record happened, the mismatch is counted, and
+        // `pfnResetCommandList` failing against an allocator of the wrong class
+        // is a far more legible symptom than a recorder that silently still
+        // names its previous pool.
+        bind_target(recorder, h_pool.drv_private() as usize, backing);
         return;
     }
 
@@ -1165,6 +1300,104 @@ unsafe extern "C" fn command_recorder_set_command_pool_as_target(
     {
         trace_line!("CommandRecorderSetCommandPoolAsTarget: lost the allocator init race");
     }
+    // ⛔ Read back through `pool.allocator` rather than binding the local: on the
+    // losing side of the race the local is not the pool's allocator, and binding
+    // it would give this recorder a reference to an object the pool does not own
+    // and `pfnResetCommandPool` will never reset.
+    let Some(backing) = pool.allocator.get() else {
+        // Unreachable: `set` either stored ours or found another thread's, so the
+        // `OnceLock` is initialised either way. Counted rather than asserted —
+        // this crate is `panic = "abort"`.
+        note_refusal(&L2_REFUSALS.pool_allocator_engine_failed);
+        return;
+    };
+    bind_target(recorder, h_pool.drv_private() as usize, backing);
+}
+
+/// This recorder's current pool identity, or 0.
+///
+/// ⚠ Identity only — the value is never dereferenced. See [`RecorderTarget`].
+fn target_pool_identity(recorder: &RecorderState) -> usize {
+    lock_target(recorder).as_ref().map_or(0, |t| t.pool)
+}
+
+/// Point a recorder at a pool, taking its own reference to that pool's allocator.
+///
+/// The `clone` is one `AddRef`, balanced when this recorder is rebound or
+/// destroyed. It is what makes [`recorder_allocator`] unable to touch a
+/// destroyed pool's private block — see [`RecorderTarget`].
+fn bind_target(recorder: &RecorderState, pool: usize, backing: &PoolAllocator) {
+    *lock_target(recorder) = Some(RecorderTarget {
+        pool,
+        allocator: backing.allocator.clone(),
+        list_type: backing.list_type,
+    });
+}
+
+/// Take a recorder's target lock, treating a poisoned lock as a live one.
+///
+/// ⛔ `unwrap_or_else(|e| e.into_inner())`, never `.unwrap()`. A `Mutex` is
+/// poisoned only by a panic while it is held, and this crate is `panic = "abort"`
+/// — so the poisoned arm cannot fire. `PARALLEL.md` §9.3 forbids `.unwrap()` on
+/// runtime data regardless, and writing the recovery is how that stays true
+/// without an argument at the call site.
+fn lock_target(recorder: &RecorderState) -> MutexGuard<'_, Option<RecorderTarget>> {
+    recorder
+        .target
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// What [`recorder_allocator`] found when a `pfnResetCommandList` asked a
+/// recorder for the allocator to reset against.
+///
+/// ⭐ Three distinguishable failures rather than one `Option`, because they are
+/// three different findings and L3a counts them apart: a handle the runtime
+/// invented, a recorder the runtime never bound, and a pool whose allocator
+/// creation failed at `pfnCommandRecorderSetCommandPoolAsTarget`.
+pub(crate) enum RecorderAllocator {
+    /// The recorder names a pool and that pool is backed.
+    Ready {
+        /// **Owned** — one `AddRef` the caller releases by dropping.
+        allocator: ID3D12CommandAllocator,
+        /// The class that allocator was created for. See
+        /// [`RecorderTarget::list_type`]: the API cannot be asked, so it is
+        /// carried.
+        list_type: D3D12_COMMAND_LIST_TYPE,
+    },
+    /// The recorder handle did not resolve to a live [`RecorderState`].
+    NoRecorder,
+    /// No `pfnCommandRecorderSetCommandPoolAsTarget` has ever run on it, so
+    /// there is no pool and no allocator.
+    NoPoolBound,
+}
+
+/// The allocator `pfnResetCommandList` must reset a list against.
+///
+/// ⭐ **`pub(crate)` because L3a's `pfnResetCommandList` is its only caller and
+/// the chain it walks is entirely this lane's private state** — recorder ->
+/// bound pool -> `ID3D12CommandAllocator`. `PARALLEL.md` §4 gives L3a the slot
+/// and this lane the three objects, and this function is that seam, in the file
+/// that owns the objects. ⛔ It returns an **owned** reference rather than a
+/// borrow because the target sits behind a `Mutex`; see [`RecorderState::target`].
+///
+/// # Safety
+/// As [`recorder_state`], for a handle [`create_command_recorder`] returned
+/// `S_OK` for.
+pub(crate) unsafe fn recorder_allocator(
+    h_recorder: ddi12::D3D12DDI_HCOMMANDRECORDER_0040,
+) -> RecorderAllocator {
+    // SAFETY: forwarded unchanged; the caller's guarantee is `recorder_state`'s.
+    let Some(recorder) = (unsafe { recorder_state(h_recorder) }) else {
+        return RecorderAllocator::NoRecorder;
+    };
+    match lock_target(recorder).as_ref() {
+        Some(target) => RecorderAllocator::Ready {
+            allocator: target.allocator.clone(),
+            list_type: target.list_type,
+        },
+        None => RecorderAllocator::NoPoolBound,
+    }
 }
 
 /// `pfnDestroyCommandRecorder`.
@@ -1194,11 +1427,13 @@ unsafe extern "C" fn destroy_command_recorder(
         return;
     };
     trace_line!(
-        "DestroyCommandRecorder: recorder={:p} type={} lastPool={:p}",
+        "DestroyCommandRecorder: recorder={:p} type={} lastPool={:#x}",
         h_recorder.pDrvPrivate,
         state.list_type.0,
-        state.target_pool.load(Ordering::Acquire),
+        target_pool_identity(&state),
     );
+    // Dropping the box drops the target, releasing this recorder's own reference
+    // to its pool's allocator.
     drop(state);
 }
 
@@ -1265,7 +1500,9 @@ unsafe extern "C" fn create_command_list(
     h_rt_list: ddi12::D3D12DDI_HRTCOMMANDLIST,
 ) -> ddi12::HRESULT {
     // SAFETY: the caller guarantees the slot lies in the sized private block.
-    let Some(slot) = (unsafe { command_list_slot(h_list) }) else {
+    let Some(slot) =
+        (unsafe { Slot::<Boxed<CommandListState>>::from_priv(h_list.drv_private()) })
+    else {
         note_refusal(&L2_REFUSALS.command_list_bad_arg);
         return E_INVALIDARG;
     };
@@ -1392,8 +1629,16 @@ unsafe extern "C" fn create_command_list(
     }
 
     // SAFETY: the slot lies in the sized private block and is currently null;
-    // `store` moves the single reference `CreateCommandList1` returned into it.
-    unsafe { slot.store(list) };
+    // `store` boxes the state and moves the box into it, so the slot owns both
+    // the box and, through it, the single reference `CreateCommandList1`
+    // returned.
+    unsafe {
+        slot.store(CommandListState {
+            h_device,
+            engine: list,
+            list_type,
+        });
+    }
     S_OK
 }
 
@@ -1446,13 +1691,20 @@ unsafe extern "C" fn destroy_command_list(
     h_list: ddi12::D3D12DDI_HCOMMANDLIST,
 ) {
     // SAFETY: the caller guarantees a live handle from `create_command_list`.
-    let Some(slot) = (unsafe { command_list_slot(h_list) }) else {
+    let Some(slot) =
+        (unsafe { Slot::<Boxed<CommandListState>>::from_priv(h_list.drv_private()) })
+    else {
         note_refusal(&L2_REFUSALS.command_list_bad_arg);
         return;
     };
-    // SAFETY: the slot holds either null or the one `ID3D12GraphicsCommandList`
-    // reference `create_command_list` moved in; `release` is idempotent on null.
-    unsafe { slot.release() };
+    // SAFETY: the slot holds either null or the one box `create_command_list`
+    // moved in; `take` empties it, so a second destroy is a no-op rather than a
+    // double free. Dropping the box releases the engine list's single reference.
+    let Some(state) = (unsafe { slot.take() }) else {
+        note_refusal(&L2_REFUSALS.command_list_bad_arg);
+        return;
+    };
+    drop(state);
 }
 
 // ---------------------------------------------------------------------------
@@ -1602,8 +1854,8 @@ unsafe extern "C" fn execute_command_lists(
         let h = unsafe { *lists.add(i) };
         // SAFETY: the caller guarantees each entry is a live handle from
         // `create_command_list`, so its slot lies in the sized private block.
-        let com = unsafe { command_list_slot(h).and_then(|s| s.load()) };
-        let Some(com) = com else {
+        let state = unsafe { command_list_state(h) };
+        let Some(state) = state else {
             note_refusal(&L2_REFUSALS.execute_command_lists_list_missing);
             // ⚠ `k`, not `n` — see the refusal above.
             if let Some(k) = budget(&ECL_LOG) {
@@ -1618,7 +1870,7 @@ unsafe extern "C" fn execute_command_lists(
         // `ID3D12GraphicsCommandList` derefs to its COM base `ID3D12CommandList`
         // (single inheritance, the `windows` crate's own `interface_hierarchy!`);
         // `clone` is the AddRef the vector's drop then balances.
-        engine_lists.push(Some((**com).clone()));
+        engine_lists.push(Some((**state.engine()).clone()));
     }
 
     // SAFETY: `engine_lists` is a live slice of owned interfaces for the whole

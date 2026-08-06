@@ -1586,25 +1586,29 @@ unsafe extern "C" fn create_pipeline_state(
     // IB-strip-cut on every `pfnSetPipelineState` — *"a precise inversion of the
     // Vulkan mental model"*, where declaring the state dynamic makes the baked
     // value ignored. The flags are forwarded verbatim (they are the runtime's
-    // declaration, not this driver's choice) and the value is forwarded too, so
-    // the obligation that remains is L3a's: `pfnSetPipelineState` must re-apply
-    // the PSO's baked values. Counted so that obligation is a number here rather
-    // than a sentence in a document.
+    // declaration, not this driver's choice) and the value is forwarded too.
+    //
+    // ⛔ **The obligation this used to route to L3a is discharged by the ENGINE**,
+    // in `d3d12_command_list_SetPipelineState`
+    // (`vkd3d-proton-helios/libs/vkd3d/command.c:12711-12733`), which re-applies
+    // both. Read this counter's doc before treating a hit as an exposure — the
+    // grading was corrected at S6 Round 2 and the line below no longer warns.
+    // Counted because "an application used the dynamic-state flags" is a fact
+    // worth having, and because it is half of a two-counter reading: a hit here
+    // while `pfnSetPipelineState` is still a counting noop IS the exposure.
     let dynamic_mask = ddi12::D3D12DDI_PIPELINE_STATE_FLAGS_D3D12DDI_PIPELINE_STATE_FLAG_DYNAMIC_DEPTH_BIAS
         | ddi12::D3D12DDI_PIPELINE_STATE_FLAGS_D3D12DDI_PIPELINE_STATE_FLAG_DYNAMIC_INDEX_BUFFER_STRIP_CUT;
     if a.Flags & dynamic_mask != 0 {
         L6_REFUSALS.pso_dynamic_state_flag_forwarded.bump();
-        // ⛔ Loud at the moment it moves, because the obligation it records is
-        // ANOTHER lane's (`forward12/cmdlist.rs`'s `pfnSetPipelineState` must
-        // re-apply the PSO's baked depth bias and strip-cut) and the summary
-        // only prints at `pfnDestroyDevice`. Until that lands, a line here is
-        // the only warning that these pipelines render with whatever depth bias
-        // was last set.
+        // ⚠ Bounded and non-alarming. It was a warning while the obligation was
+        // believed to be open; the engine turns out to honour it, so the line's
+        // job now is to say which PSOs are on the dynamic path at all — which is
+        // what makes `pfnSetPipelineState` still being a noop diagnosable.
         let n = L6_REFUSALS.pso_dynamic_state_flag_forwarded.get();
         if n <= LOG_BUDGET {
             log_error!(
-                "CreatePipelineState: DYNAMIC_* flags={:#x} forwarded; SetPipelineState must \
-                 re-apply the baked depth bias and strip-cut (x{n})",
+                "CreatePipelineState: DYNAMIC_* flags={:#x} forwarded; the engine re-applies the \
+                 baked depth bias and strip-cut at SetPipelineState (x{n})",
                 a.Flags & dynamic_mask,
             );
         }
@@ -2435,14 +2439,41 @@ pub(crate) struct L6Refusals {
     /// A PSO declared `DYNAMIC_DEPTH_BIAS` or `DYNAMIC_INDEX_BUFFER_STRIP_CUT`
     /// and the flag was forwarded to the engine.
     ///
-    /// ⛔ **This counter is a cross-lane obligation, not a refusal**
-    /// (`SUBSTRATE.md` §4.5): those flags are HINTS, and the DDI still requires
-    /// the PSO's own depth-bias and strip-cut to be applied on every
-    /// `pfnSetPipelineState` — the precise inverse of Vulkan's dynamic-state
-    /// rule, which vkd3d follows. ⚠ Expected non-zero as soon as an app uses
-    /// them, and while L3a's `pfnSetPipelineState` does not re-apply the baked
+    /// ⚠ **An instrument, not an exposure — REGRADED at S6 Round 2, against the
+    /// engine's source.** It first read: *"this counter is a cross-lane
+    /// obligation … while L3a's `pfnSetPipelineState` does not re-apply the baked
     /// values, a non-zero reading means those pipelines render with whatever
-    /// depth bias was last set.
+    /// depth bias was last set."* The premise — `SUBSTRATE.md` §4.5's *"the
+    /// `DYNAMIC_*` flags are HINTS and the DDI still requires the PSO's own
+    /// depth-bias and strip-cut to be applied on every `pfnSetPipelineState`, the
+    /// precise inverse of Vulkan's dynamic-state rule"* — is correct and
+    /// unchanged. ⛔ **The conclusion was wrong: vkd3d already does it**, in
+    /// `d3d12_command_list_SetPipelineState` itself
+    /// (`vkd3d-proton-helios/libs/vkd3d/command.c:12711-12733`):
+    ///
+    /// > *"For any optionally dynamic state, we need to re-apply the
+    /// > corresponding static state that the PSO was created with."*
+    ///
+    /// — re-applying `rs_desc.depthBias{ConstantFactor,Clamp,SlopeFactor}`
+    /// whenever `explicit_dynamic_states & VKD3D_DYNAMIC_STATE_DEPTH_BIAS` (which
+    /// is the bit `state.c:6064` sets from this very flag), and
+    /// `index_buffer_strip_cut_value` unconditionally for graphics pipelines
+    /// (`command.c:12728-12733`). ⇒ **forwarding `pfnSetPipelineState` discharges
+    /// the obligation**, and re-applying it in `cmdlist.rs` as well would issue
+    /// the state twice.
+    ///
+    /// ⛔ **So the reading to be alarmed by is not this one.** A non-zero count
+    /// here is just "an application used the dynamic-state flags". What would be
+    /// a finding is this counter moving while `pfnSetPipelineState` is **still a
+    /// counting noop** — because then nothing forwards and nothing re-applies.
+    /// `D3D12 noop DDI hits:`'s `pfnSetPipelineState` entry is the other half of
+    /// that reading, and the two must be read together.
+    ///
+    /// ⚠ ⭐ Regraded rather than deleted, and the reason is the S6 Round 1
+    /// lesson in its own words: *a counter's grading is a claim, and it goes
+    /// stale like any other.* Two counters were caught mis-graded in one merge
+    /// there; this is the third, caught by reading the engine instead of the
+    /// document that predicted it.
     pub(crate) pso_dynamic_state_flag_forwarded: RefusalCounter,
     /// `NumRenderTargets` exceeded the eight `D3D12_RT_FORMAT_ARRAY` holds and
     /// was clamped. ⛔ Expected 0 — `D3D12DDIARG_CREATE_PIPELINE_STATE_0099`'s
