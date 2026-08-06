@@ -1,10 +1,29 @@
-# GATES.md — the D3D12 checkpoint ladder, `D12-G0` … `D12-G11`
+# GATES.md — the D3D12 acceptance suite, `D12-G0` … `D12-G11`
 
-**What this is:** the twelve checkpoints that carry Helios from "no D3D12 at all" to "a fully
-working D3D12 implementation". Each gate states an entry condition, the exact commands (verbatim,
-copy-pasteable), a pass criterion that is a number or a screenshot, the counters to snapshot, a
-named artifact, and the traps that have already burned somebody. It is the D3D12 analogue of
-`CONFORMANCE.md` §5–6 for D3D11, and it is written to be executed cold.
+> ⛔⛔ **DEMOTED 2026-08-06 BY OWNER DIRECTIVE — this file is no longer the order of work.**
+> It was written as a *ladder*: twelve rungs climbed in sequence, each driving the implementation
+> until its probe passed. That loop is rejected — see **`docs/dx12/METHOD.md`**, which is
+> authoritative over sequencing in every file in this directory.
+>
+> **What changed:** a gate is now run **after** static analysis is saturated, to *accept* a
+> subsystem that was implemented to its contract. A gate no longer tells anyone what to build next,
+> and no gate is an entry condition for writing code.
+>
+> ⛔ **And a gate passing is not evidence that the code is right.** The proof is in this ladder's own
+> record: with `Umd12EclDelayUs=50000`, `D12-G8` rung 0 **passed** — pixels exactly correct — while
+> the application's fence wait stayed at **0.6 µs**, i.e. with the entire ordering dependency the
+> rung existed to establish still absent. A CPU sleep had shifted everything in time. Read a gate as
+> *"this configuration produced this observation"*, never as *"this subsystem is correct"*.
+>
+> **§1 below stands verbatim and is the most valuable part of this file.** It is about how to read
+> evidence from any run — session 0, counters persisting across boots, exit codes that lie — and none
+> of that is affected by the demotion.
+
+**What this is:** the twelve checkpoints that accept Helios's D3D12 implementation, subsystem by
+subsystem. Each gate states an entry condition, the exact commands (verbatim, copy-pasteable), a pass
+criterion that is a number or a screenshot, the counters to snapshot, a named artifact, and the traps
+that have already burned somebody. It is the D3D12 analogue of `CONFORMANCE.md` §5–6 for D3D11, and
+it is written to be executed cold.
 
 **What this is not:** a design document. The architecture is `docs/dx12/DECISIONS.md` (the D-, H-,
 P-, K- and V-series entries) and it is authoritative — nothing here may contradict it. The
@@ -14,7 +33,9 @@ kernel-side impact of all of it — including the K1–K3 work items §4.13 assi
 `docs/dx12/KMD_IMPACT.md`. It is also
 not a performance document: only `D12-G10` reports a score, and it reports it as a 3-run median.
 
-**Gate → phase map** (`DX12.md` §4 owns the phases; this file owns the gates):
+**Gate → phase map** — ⚠ **read as scope, not as order.** `METHOD.md` owns sequencing; the phases
+below describe *what a gate accepts*, and the P0→P7 progression no longer implies that work happens
+in that sequence or that one gate must pass before the next subsystem is implemented.
 
 | Phase | `DX12.md` | Gates |
 |---|---|---|

@@ -285,7 +285,16 @@ A lane is done when **all** of:
 6. It touched **no** file it does not own, and its diff against `build.rs`/`private12.rs`/
    `device12.rs`/`knobs12.rs` is append-only — and against `tables12.rs`, empty.
 
-## 10. ⭐ The final pass — fanned out too, on two axes
+## 10. ⭐ The adversarial review — fanned out on two axes
+
+> ⭐⭐ **PROMOTED 2026-08-06 BY OWNER DIRECTIVE.** This section was written as *"the final pass"* for
+> one phase's 214 DDI slots. It is now **the standing Phase 2 review protocol for every D3D12
+> changeset**, and it runs repeatedly — see `docs/dx12/METHOD.md`, which owns the loop, the
+> saturation criterion, and two lenses added to the seven below (**contract completeness** and
+> **instrument attribution**). §9's per-lane definition of done became METHOD's Phase 1 exit
+> criterion. Nothing in this section's content is retracted; only its scope widened, and "final" was
+> the wrong word — the loop repeats until two consecutive rounds with different lens compositions
+> produce no new real findings.
 
 Host cross-checking (§7) removes the type errors before merge. What it cannot remove is everything
 that is not a Rust type. That review is itself large — 214 handlers across a dozen files — so it

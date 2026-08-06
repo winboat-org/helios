@@ -771,6 +771,18 @@ the two are one piece of work.
 
 ### 14a.1 ⛔ Two unknowns gate everything, and they are separable in ONE experiment
 
+> ⛔⛔ **THIS SECTION'S SEQUENCING IS REJECTED, 2026-08-06 (owner directive; `docs/dx12/METHOD.md`).**
+> Its instruction *"Do not write anything below the experiment until the experiment has run"* is
+> precisely the implement-a-bit-then-run-a-probe loop that has now been retired — and this section is
+> its own best argument, because the experiment it gates everything on turned out to be **unable to
+> decide its own question** (see the correction block below: a flat reading is fully explained by the
+> venus ring emitting no fence at all).
+>
+> ⇒ **Implement the subsystem to its contract. The experiment is a diagnostic carried alongside it,
+> never a gate in front of it.** What remains true and valuable here is the *content*: UV1 is a real
+> unknown about closed-source dxgkrnl behaviour, and `METHOD.md` §3 lists it among the few questions
+> static analysis provably cannot settle. UV3 is answered.
+
 Do not write anything below the experiment until the experiment has run.
 
 | id | Question | Why it decides the design |

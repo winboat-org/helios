@@ -123,13 +123,19 @@ helios-vgpu/
 │                             WINDOWED_BLT_DESIGN, SCANOUT_DRM_MODIFIER_DESIGN, the
 │                             GATE*/WDDM_*/DISPLAY*/PHASE*/HANDOFF_* corpus, and
 │                             REFACTOR_* (the completed T0–T8 quality refactor).
-├── docs/dx12/              ← D3D12 implementation doc set. DECISIONS.md is authoritative
-│                             (nothing there may contradict it); ARCHITECTURE (the UMD
-│                             split: umd_common + umd12 + the vkd3d bridge), DDI_REFERENCE
-│                             (the d3d12umddi contract, reconstructed — MS does not
-│                             document it), PRESENT, SUBSTRATE, KMD_IMPACT, GATES
-│                             (D12-G0..G11), PARALLEL (the S6 lane split across
-│                             concurrent agents), research/ (12 evidence dossiers)
+├── docs/dx12/              ← D3D12 implementation doc set. ⭐ **METHOD.md is the working
+│                             loop and is authoritative over SEQUENCING in all of them**
+│                             (owner directive 2026-08-06: implement a subsystem to its
+│                             contract → adversarial review of the whole changeset →
+│                             repair → repeat until saturated → then deploy. The old
+│                             implement-a-bit-then-run-a-probe ladder is retired, and
+│                             GATES.md is demoted to an acceptance suite). DECISIONS.md
+│                             remains authoritative for ARCHITECTURE (nothing may
+│                             contradict it); ARCHITECTURE (the UMD split: umd_common +
+│                             umd12 + the vkd3d bridge), DDI_REFERENCE (the d3d12umddi
+│                             contract, reconstructed — MS does not document it), PRESENT,
+│                             SUBSTRATE, KMD_IMPACT, GATES (D12-G0..G11, acceptance only),
+│                             PARALLEL (§10 is the review protocol), research/ (12 dossiers)
 ├── docs/reference/         ← Non-narrative reference data (host vulkaninfo profile)
 │
 ├── kmd_render/             ← ACTIVE: WDDM render+display miniport (Rust, no_std)
