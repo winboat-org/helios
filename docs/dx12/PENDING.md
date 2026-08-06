@@ -108,7 +108,22 @@ after the desktop has composited ~600 more frames; **or** set `DiagLevel = 1` an
 hidden by the throttle; `kmd-counter-snapshot.ps1` DOES dump all 19 to file (only its printed
 `-Watch` subset omits them); a multi-minute Fire Strike/Time Spy run IS readable.
 
-### Instrument gradings still to repair (found, not yet fixed)
+### Instrument gradings — ✅ ALL REPAIRED LATER THE SAME DAY (`a1c7f38`)
+
+⛔ **The list below is the FINDING, kept as the record; it is no longer the state.** Read it
+for what was wrong and why, not for what to do. Two of its own claims expired within hours and
+are struck here rather than edited away: `RENDER_COUNT`'s two re-commitments in `KMD_IMPACT.md`
+are **removed** (replaced by `D12Rec`), and `DxgkDdiSetStablePowerState` **is** counted now
+(`StblPwr`/`StblPwrEn`, plus `HistBuf` for its sibling).
+⭐ The repair also found the decisive error in `D12Exact`'s identity that the review missed — a
+**unit mismatch**: the `D12*` family counts `DxgkDdiRender` CALLS, `D12Exact` counts
+`DxgkDdiSubmitCommand` PACKETS, and dxgkrnl batches Renders into one DMA buffer, so no
+expression over the first set can ever equal the second. The identity is retired in favour of a
+sound bound, `D12Exact <= D12Rec - D12Zero`, which every omitted term slackens in the same
+direction. And `WfBReb` is now diagnosable rather than merely re-graded: `WfBRebS`/`WfBRebB`
+partition it by the arm unsatisfied **at expiry**.
+
+### The findings, as found (historical)
 
 `EscSub == 0` and `EscSubRing == 0` are **unsatisfiable readings** — DWM's own ICD makes both
 non-zero on an idle desktop, so the branch written as "the informative one" can never be
@@ -124,7 +139,21 @@ what K-F1 settles, 30 lines from where the same changeset strikes it (and it is 
 ever moved, and the hold is snapshotted at `StartDevice` so setting the knob without a device
 restart leaves it 0.
 
-### Contract gaps found (not yet fixed)
+### Contract gaps — ✅ ALL THREE CLOSED LATER THE SAME DAY (`0e188a9`, `a1c7f38`)
+
+The three caps are **raised** — and the raise gained a safety argument the review did not have:
+`d3d12_device_validate_shader_meta` fails PSO creation against **vkd3d's own** copy of the same
+facts, so raising them cannot admit an unbacked shader, only stop the runtime refusing a backed
+one. ⛔ Re-derived: all three are FL **12_2** floors, not 12_1, so no level moved and
+`TiledResourcesTier` is still the only open 12_1 floor.
+`DxgkDdiSetStablePowerState` keeps its no-op (there are no guest clocks to lock — the defect was
+that a no-op was indistinguishable from a working one) and is now counted.
+⛔ `BackBufferMultiplicity` got **no counter, deliberately**: it is a field of the `_Out_`
+struct and the twelve-member IN struct has no multiplicity member, so the runtime cannot request
+one and the counter could never move — a permanent zero reading as "nobody asked" is the same
+trusting-a-zero pattern relocated from a comment into an instrument. Both comments corrected.
+
+### The gaps, as found (historical)
 
 Three caps are left at absent values with **no argument, no counter, and no gap-list entry**,
 in the commit whose purpose was to raise exactly this class:
@@ -355,11 +384,11 @@ reachable by `tools/d3d12_clear_probe.cpp`**, which uses one queue and never cal
 | # | Defect | Evidence | Size |
 |---|---|---|---|
 | **A1** | ⛔⛔ **HARD DEADLOCK, no TDR.** The drain (`vkd3d_acquire_vk_queue` → `d3d12_command_queue_acquire_serialized`, `command.c:25202-25217`) enqueues `VKD3D_SUBMISSION_DRAIN` and `pthread_cond_wait`s until the worker drains **everything ahead of it, FIFO**. A queued `VKD3D_SUBMISSION_WAIT` resolves through `d3d12_fence_block_until_pending_value_reaches_locked` → `pthread_cond_wait` with **no timeout** (`:1229`). ⇒ `queue->Wait(f,N); ExecuteCommandLists(...); …later… Signal(N)` — entirely legal — hangs the app's own thread inside the DDI, permanently, with no GPU packet outstanding for TDR to catch. **CONFIRMED from source.** | `command.c:25202-25217`, `:1229`, `:23725`, `:23848` | **M** fork fix / **XS** containment (default the drain OFF) |
-| **A4** | ⛔ **The boundary is a PREFIX, not the frame's own fence — a standing invariant violated on the new arm.** `watermark = gpu_fence_id + 1` and `async_retired_up_to` is satisfied only when **no** in-flight venus entry has `fence_id < watermark`, every ring, every process — including DWM's ring-1 scanout copies. This is the exact superset the present path had to relax away (`PRESENT_EXACT_WATERMARK_USED`), and CLAUDE.md's table forbids it: *"a WDDM fence may wait on the frame's OWN boundary, never on the whole `next_wire_fence` backlog"*. **CONFIRMED.** | `gpu/mod.rs:5028-5042`, `:5676-5684` | **S** (exact test + its own counter) |
-| **A5** | **`wddm_pending` overflow completes 256 packets EARLY**, while their host work is still running, and forces `release_all_scanout_leases(Teardown)`. A4 makes reaching 256 likelier than the code's "practically unreachable" note assumes. The fix is the consumer-side head deadline ROADMAP already names for K-F2 — now covering **two** writers. | `gpu/mod.rs:312`, `:5445-5459`, `submit_command.rs:586-616` | **S** |
-| **A2** | The 64-entry seqno cache **can never hit**: `vkd3d_release_vk_queue` issues a real `vkQueueSubmit2` *after* we sample, advancing the ring tail that is the cache key. ⛔ Its own doc describes behaviour it cannot deliver. | `command.c:25591-25612`, `vn_ring.c:373-383`, `vn_renderer_helios.c:2034-2043` | **XS** doc / **S** repair |
-| **A3** | `dev_mutex` — which serialises **every venus submit in the process** — is held across a kernel escape that retries up to **5 s** on `QueueFull`, and QueueFull is reachable at frame rate (64 descriptors, 3/chain ⇒ ~21 concurrent; 3 queues × 2 ECL × 200 fps is at the ceiling). | `vn_renderer_helios.c:2025-2069`, `ctrl.rs:100`, `gpu/mod.rs:83` | **S** |
-| **A6** | A fence sampled across a StopDevice/StartDevice cycle passes the clamp **uncounted** (`next_wire_fence` restarts at `BASE + instance·2^32`), names a fence the new instance never issued, and completes immediately — **the fence lies early**, and `GpuFncClamp` will not flag it. No owner check either. SUSPECTED. | `gpu/mod.rs:5680`, `:2214`, `:1377` | **S** |
+| **A4** | ⛔ **The boundary is a PREFIX, not the frame's own fence — a standing invariant violated on the new arm.** `watermark = gpu_fence_id + 1` and `async_retired_up_to` is satisfied only when **no** in-flight venus entry has `fence_id < watermark`, every ring, every process — including DWM's ring-1 scanout copies. This is the exact superset the present path had to relax away (`PRESENT_EXACT_WATERMARK_USED`), and CLAUDE.md's table forbids it: *"a WDDM fence may wait on the frame's OWN boundary, never on the whole `next_wire_fence` backlog"*. **CONFIRMED.** | `gpu/mod.rs`'s `note_wddm_submission` + `async_retired_up_to` — ⚠ **the decision itself has MOVED OUT of `kmd_render`**: it is `helios_kmd_logic::wddm_boundary::select`, with `wddm_boundary_tests` as its oracle (was `:5028-5042`, `:5676-5684`) | **S** (exact test + its own counter) |
+| **A5** | **`wddm_pending` overflow completes 256 packets EARLY**, while their host work is still running, and forces `release_all_scanout_leases(Teardown)`. A4 makes reaching 256 likelier than the code's "practically unreachable" note assumes. The fix is the consumer-side head deadline ROADMAP already names for K-F2 — now covering **two** writers. | `gpu/mod.rs`'s `MAX_WDDM_PENDING`, the `wddm_pending.len() >= MAX_WDDM_PENDING` arm of `note_wddm_submission` → `overflow_wddm_pending`, and `submit_command.rs`'s `note_and_maybe_signal` (was `:312`, `:5445-5459`, `:586-616` — all three drifted 250–600 lines) | **S** |
+| **A2** | The 64-entry seqno cache **can never hit**: `vkd3d_release_vk_queue` issues a real `vkQueueSubmit2` *after* we sample, advancing the ring tail that is the cache key. ⛔ Its own doc describes behaviour it cannot deliver. | `command.c:25591-25612` (unchanged by the bump), `vn_ring.c`'s `vn_ring_current_seqno` — ⛔ **`vn_renderer_helios.c:2034-2043` NO LONGER EXISTS AS CITED**: the ICD submodule was bumped in this changeset and that range is now brand-new unrelated code the same changeset added (`helios_venus_queue_gpu_fence`'s decode/refuse block). ✅ **The cache was DELETED** (`6993dd4a`); what survives is the *bound*, `HELIOS_QUEUE_GPU_FENCE_RING_LIMIT = 64`, whose comment records the deletion and why the key could never match | **XS** doc / **S** repair |
+| **A3** | `dev_mutex` — which serialises **every venus submit in the process** — is held across a kernel escape that retries up to **5 s** on `QueueFull`, and QueueFull is reachable at frame rate (64 descriptors, 3/chain ⇒ ~21 concurrent; 3 queues × 2 ECL × 200 fps is at the ceiling). | ⛔ **`vn_renderer_helios.c:2025-2069` is STALE IN THE MOST MISLEADING WAY**: the ICD submodule was bumped in this changeset and that range is now brand-new code *the same changeset added* — `helios_venus_queue_gpu_fence`'s decode/refuse block — so a reader re-deriving it lands on the very function written to AVOID this defect. The live evidence is `helios_ioctl_submit_cs`'s header (*"Caller MUST hold dev_mutex (ordering)"*) against `helios_submit_gpu_fence_cs`'s header, which enumerates item by item what `dev_mutex` actually protects and why the new path needs none of it. `ctrl.rs`'s `ENQUEUE_RETRY_MAX_MS = 5_000` (still `:100`) and `gpu/mod.rs`'s `CTRL_QUEUE_SIZE = 64` (still `:83`) are both current. ⛔⛔ **NOT FIXED AS A CLASS, and the wave-1 block above listing A3 as "Landed" OVERSTATES it**: `dev_mutex` is genuinely off the new gpu-fence path, but `helios_ioctl_submit_cs` still contracts *"caller holds dev_mutex"* and still issues the same 5 s-retry escape, and `umd12` now holds **vkd3d's queue mutex** across that escape on the shipping default arm. ⭐ The trigger is settleable with no new probe: `QUEUE_FULL_RETRIES` (`virtio/counters.rs`) already exists as a registry counter | **S** |
+| **A6** | A fence sampled across a StopDevice/StartDevice cycle passes the clamp **uncounted** (`next_wire_fence` restarts at `BASE + instance·2^32`), names a fence the new instance never issued, and completes immediately — **the fence lies early**, and `GpuFncClamp` will not flag it. No owner check either. SUSPECTED. | `helios_kmd_logic::wddm_boundary::select`'s `Rejection::ForeignGeneration` arm (the clamp moved OUT of `gpu/mod.rs`), `gpu/mod.rs`'s `wire_fence_base` assignment in `init` and its `NEXT_WIRE_FENCE_BASE` / `WIRE_FENCE_INSTANCE_STRIDE` statics (was `:5680`, `:2214`, `:1377`) | **S** |
 
 ⭐ **Minimum before the first VM run:** default the drain OFF (A1), land A4's exact watermark, land A5's head
 deadline. The deadlock is unreachable for the current probe and reachable for every real engine; the
@@ -502,20 +531,51 @@ outright. One `vulkaninfo` assertion, **XS**.
 
 ## 6. Doc and instrument corrections banked by these inventories
 
+⚠ **Bullets marked ✅ PAID were discharged by the changeset itself and are kept, not deleted** — a
+struck correction still tells the next reader which claim was wrong and where the wrong version may
+survive in someone's notes. Everything unmarked is still open.
+
 * `DDI_REFERENCE.md:3036-3041` still carries the tiled-resources reasoning `DX12.md` §4.4 **struck** — the
   third document to carry it after the correction reached four other sites.
 * `caps12.rs`'s ROV claim — **false**, corrected `63b8f1b`. Its citation was also wrong.
-* `caps12.rs:557-559`'s binding-tier reason — **stale** since all 15 descriptor slots landed.
+* ✅ **PAID** — `caps12.rs`'s binding-tier reason was **stale** since all 15 descriptor slots
+  landed. `ResourceBindingTier` is now `BINDING_TIER_MAX` (3), and the stale claim (*"L5 has not
+  written a descriptor handler yet"*) is quoted at the read site as the thing being retired, with
+  each of the 14 verbatim-forwarding slots enumerated and the ONE genuine refusal
+  (`pfnCreateSamplerFeedbackUnorderedAccessView`) named as gated on `SamplerFeedbackTier`, not on
+  the binding tier. ⚠ Was cited `:557-559`; symbol now — `d3d12_options`.
 * `DX12.md` §4.4's tiled lane attribution names two tile slots; the header has **four**.
-* `queue.rs:2118-2121`'s stated blocker for command signatures is **discharged**.
-* `SPECS.md:136` logged the timestamp-frequency question against `KMD_IMPACT.md`, which has **zero**
-  occurrences of "timestamp". It fell through, and it is S-1 — the top benchmark blocker.
+* ✅ **PAID** — `queue.rs`'s stated blocker for command signatures was **discharged**, and the row
+  has since gone further: `pfnCreateCommandSignature` is *implemented*
+  (`queue12`'s `create_command_signature` + the `ID3D12CommandSignature` handle slot), so the
+  `E_NOTIMPL` §2 S-4 describes is gone for the native argument classes. ⚠ Was cited `:2118-2121`,
+  which is now the `CreateCommandList` class-refusal arm — a re-deriving reader would land on an
+  unrelated refusal and read it as confirmation. Symbol now.
+* ✅ **PAID (2026-08-07)** — `SPECS.md:136` logged the timestamp-frequency question against
+  `KMD_IMPACT.md`, which had **zero** occurrences of "timestamp" *or* "CalibrateGpuClock". It fell
+  through, and it is S-1, the top benchmark blocker. ⛔⛔ **AND IT FELL THROUGH A SECOND TIME**: the
+  changeset shipped the GPU clock — the largest KMD item in it — and `KMD_IMPACT.md` still had zero
+  occurrences of either word afterwards. Two identical misses on the same item is a process finding,
+  not an oversight. Now carried as `KMD_IMPACT.md` §14a.2 **K-F6**, with the derivation
+  (`GPU_TIMESTAMP_FREQUENCY_HZ = 1e9` because vkd3d answers `1e9 / timestampPeriod` and this guest
+  reports `timestampPeriod = 1`), the three counters (`ClkCal`/`ClkNoGpu`/`ClkFreq`, boot-cumulative
+  and NOT hidden by the 600-refresh publish throttle), the deliberate `GpuClockCounter = 0`, and the
+  ⛔ *a diag record here is FORBIDDEN, not omitted* IRQL rule.
 * `PRESENT.md` §8.2's acceptance criterion `P12sub == P12take` is **unsatisfiable for windowed by
   construction** (`P12take` fires in `DxgkDdiPresent`, which a DWM-composited windowed present never reaches) —
   a *"trusting a zero"* pre-installed into the acceptance criterion of work that has not started.
 * The absent-snapshot case is **uncounted** — neither `SnSub` nor `SnFbk` moves, so "no identity ever arrived"
   reads as a healthy zero (**XS**).
 * `PBFlip`/`PBCpy`/`PBMmio` are last-value markers, not accumulators — use `VpPres`/`VpBlt`/`FlR<n>` instead.
-* `kmd_render/src/virtio/gpu/mod.rs:5950` — a `#[cfg(test)] mod present_stream_tests` with six tests that
-  **can never run** in a `panic=abort` cdylib, covering the present-stream helpers the D3D12 fence bridge now
-  depends on. A CLAUDE.md invariant violated in-tree; the helpers are pure and belong in `kmd_logic`.
+* ✅ **PAID** — `kmd_render/src/virtio/gpu/mod.rs` carried a `#[cfg(test)] mod present_stream_tests`
+  that **could never run** in a `panic=abort` cdylib, covering the present-stream helpers the D3D12
+  fence bridge now depends on. A CLAUDE.md invariant violated in-tree. Moved, with the pure helpers,
+  to `helios_kmd_logic::present_stream` + `present_stream_boundary_tests`; `grep -c 'cfg(test)'`
+  over `kmd_render/src` is now **0**, and a `grep` for the old module name finds only the note in
+  `gpu/mod.rs` recording the move (*"Do not reintroduce tests in this file"*). ⚠ Was cited `:5950`.
+  ⛔ **THE COUNT: it was FIVE, not six** — the wave-1 correction #5 above is right and this bullet
+  was wrong; `git show 3e750c0:…/gpu/mod.rs` counts 5 `#[test]`s. ⚠ But `present_stream_boundary_tests`
+  holds **six** today, because the move recovered five and **added one**
+  (`slot_63_and_new_generation_never_alias`) — which is why `kmd_logic`'s own doc comment still says
+  *"These six tests lived in `kmd_render`"*. That sentence is wrong about provenance, not arithmetic,
+  and `gpu/mod.rs`'s note (*"FIVE tests (not six …)"*) is the one to trust for the original.

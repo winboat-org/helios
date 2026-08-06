@@ -3297,12 +3297,22 @@ charter first.
    what "remaining" means — re-survey before planning.
 5. **FL11 MSAA** — status recorded below as PARTIAL with un-deployed WIP
    (`ff14979`). Verify whether that is still true before treating it as open.
-6. **`kmd_render` has five `#[test]` functions that can never run**
+6. ✅ **RESOLVED 2026-08-06 — `kmd_render` had five `#[test]` functions that could never run**
    (`present_stream_tests` in `src/virtio/gpu/mod.rs`): the crate is a
    `panic=abort` no_std cdylib and cannot host a libtest harness, and CI runs no
-   `cargo test` at all. They are assurance that is not real. Move them, and the
-   pure functions they cover, into `kmd_logic`, which exists for exactly this and
-   does run on Linux.
+   `cargo test` at all. They were assurance that is not real. They and the pure
+   helpers they cover were moved into `kmd_logic` as
+   `helios_kmd_logic::present_stream_boundary_tests`, beside the
+   `present_stream` module; `grep -c 'cfg(test)'` over `kmd_render/src` is now
+   **0**, and the only trace left in `gpu/mod.rs` is the note recording the move
+   (*"Do not reintroduce tests in this file"*). ⚠ **The count is five, and three
+   places disagree about it** — `git show 3e750c0:…/gpu/mod.rs` counts **5**
+   `#[test]`s, which is what this item and `gpu/mod.rs`'s note say and what
+   `PENDING.md`'s wave-1 correction #5 established against `PENDING.md` §6's
+   "six". But `present_stream_boundary_tests` now holds **six**: the move
+   recovered five and **added one** (`slot_63_and_new_generation_never_alias`),
+   which is why `kmd_logic`'s own doc comment says *"These six tests lived in
+   `kmd_render`"* — that sentence is wrong about provenance, not about arithmetic.
 
 ## Workstream 4 — D3D12  ← **PRIORITY 2 since 2026-08-05**
 
@@ -3920,8 +3930,13 @@ State, so this file is not silent on it:
     - ⛔ **The "one free run" UV3 pre-check is dead twice over**: `RING_SUBMIT_COUNT` /
       `RING_COMPLETE_COUNT` appeared **only** in the `'HDBG'` `DxgkDdiCollectDbgInfo` report, i.e.
       readable only by provoking a TDR — and `SCANOUT_RING_IDX = 1`, so they count **this driver's
-      own** scanout/BLT copies from *three* internal producers (`gpu/mod.rs:3375`, `:3442`,
-      `ctrl.rs:1541-1547`). Now mirrored as `RngSub`/`RngCmp` with a guest-originated split
+      own** scanout/BLT copies from *three* internal producers — `gpu/mod.rs`'s
+      `enqueue_async_submit_windowed_blt` and `enqueue_scanout_submit`, plus `ctrl.rs`'s
+      `submit_venus_async_present` through the generic `enqueue_async_submit`. ⚠ **Cited by symbol:
+      the old `gpu/mod.rs:3375`, `:3442`, `ctrl.rs:1541-1547` are all stale** — `gpu/mod.rs` grew
+      983 lines in the D3D12 changeset. (`enqueue_async_submit_present_stream` is a fourth submit
+      site but not a fourth internal producer: its ring is the guest's, forwarded.)
+      Now mirrored as `RngSub`/`RngCmp` with a guest-originated split
       (`EscSub`/`EscSubRing`) counted at the escape wrapper — attribution, not a subtraction.
     - ⭐ **Why D3D11 is truthful and D3D12 is not, in one line:** the only `ring_idx >= 1` producer
       on Windows is `vn_signal_win32_external_semaphore` (`vn_queue.c:1714-1724`, `:1986-1994`),
@@ -3930,21 +3945,30 @@ State, so this file is not silent on it:
       semaphore at all. ⇒ `EscSubRing` has a nonzero **control** reading from DWM alone, so the
       run needs an idle-desktop vs. probe-running arm over the same window.
     - ⛔ A ring-0 fence is not even a venus *decode* fence here: without
-      `VIRTIO_GPU_FLAG_INFO_RING_IDX` (`gpu/mod.rs:3482`) QEMU routes it to the legacy
+      `VIRTIO_GPU_FLAG_INFO_RING_IDX` (stamped only for `ring_idx != 0`, in `gpu/mod.rs`'s
+      `enqueue_submit_inner`; was `:3482`) QEMU routes it to the legacy
       `virgl_renderer_create_fence`, which ignores `ctx_id`
       (`qemu-helios/hw/display/virtio-gpu-virgl.c:1167-1186`).
   - ⛔ **A LIVE DEFECT ON THE SHIPPING PRESENT PATH, found on the way and independent of D3D12**:
-    `present_stream_marker_boundary` (`virtio/gpu/mod.rs:4721-4744`) bounds the guest-supplied
+    `virtio/gpu/mod.rs`'s `present_stream_marker_boundary` bounds the guest-supplied
     `value` in no way, so an absurd `present_value` yields a *live* boundary
-    `present_stream_slot_ready` (`:945-953`) can never satisfy — and `wddm_pending` is an
-    **adapter-global head-of-line FIFO** (`take_one_ready_wddm:5718-5765`), so it blocks every
-    context including DWM's, bounded only by the FIFO's own 256-entry overflow escape
-    (`:5664-5685`) or TDR. `KMD_IMPACT.md` §14a.2 **K-F2**; its own commit.
+    `present_stream_slot_ready` can never satisfy — and `wddm_pending` is an
+    **adapter-global head-of-line FIFO** (`take_one_ready_wddm`), so it blocks every
+    context including DWM's, bounded only by the FIFO's own 256-entry overflow escape (the
+    `wddm_pending.len() >= MAX_WDDM_PENDING` arm of `note_wddm_submission` → `overflow_wddm_pending`,
+    `WDDM_PENDING_OVERFLOWS`) or TDR. `KMD_IMPACT.md` §14a.2 **K-F2**; its own commit.
+    ⚠ **All five line numbers this bullet used to carry are stale and are SYMBOLS now**
+    (`:4721-4744`, `:945-953`, `take_one_ready_wddm:5718-5765`, `:5664-5685`, and `MAX_WDDM_PENDING`)
+    — `gpu/mod.rs` grew 983 lines in the D3D12 changeset, and every one of them drifted 250–600
+    lines. ✅ **And the prescribed repair has since LANDED**: `WddmHeadMs` (default 250 ms) bounds how
+    long the FIFO head may block, `rebase_blocked_head` rebases to the conservative wire watermark,
+    `WfBReb` counts it, and `present_stream_marker_boundary` gained two magnitude instruments —
+    deliberately INSTRUMENT ONLY, returning a byte-identical boundary.
   - ⛔⛔ **The obvious fix is REFUTED and would be a correctness regression, not a hardening**
     (2026-08-06, static, no VM needed). Copying the tag path's comparison —
     refuse unless `value <= slot.submitted_value` — inverts a CONSUMER predicate into the
     PRODUCER's: on the shipping default the marker is delivered **before** the frame's
-    `vkQueueSubmit` **on purpose**. `UmdAsyncPresentStream` is absent = ON (`umd/src/knobs.rs:129`)
+    `vkQueueSubmit` **on purpose**. `UmdAsyncPresentStream` is absent = ON (`umd/src/knobs.rs`'s `UMD_ASYNC_PRESENT_STREAM`)
     and `async_stream_eligible` then **skips** `HeliosWaitFrameSubmitted`
     (`umd/src/forward/present.rs:1479-1528`) *because* the marker carries the dependency instead.
     The value is minted on the app thread (`umd/bridge/dxvk_bridge.cpp:1316`) while the tag that
