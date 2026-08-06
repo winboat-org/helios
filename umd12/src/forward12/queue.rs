@@ -757,9 +757,26 @@ unsafe fn create_wddm_context(
         );
     }
 
-    if hr != S_OK {
+    // ⛔ `hr < 0`, not `hr != S_OK`, and the difference is a fake success. This arm
+    // decides the create FAILED: it counts it, and `create_command_queue` releases
+    // the engine queue and returns this value as `pfnCreateCommandQueue`'s own
+    // HRESULT. A non-negative non-`S_OK` value (`S_FALSE` and friends) is a
+    // SUCCESS code, so returning it verbatim would hand the runtime a successful
+    // queue create whose private slot is null and whose engine queue has already
+    // been dropped. So the classification and the returned value must agree:
+    // anything this arm treats as failure leaves as a failure. `resource12.rs`'s
+    // `return if hr < 0 { hr } else { E_FAIL };` is the same normalisation one
+    // file over, and the two now match.
+    if hr < 0 {
         note_refusal(&L2_REFUSALS.queue_context_failed);
         return Err(hr);
+    }
+    if hr != S_OK {
+        // A success code this driver did not expect from `pfnCreateContextCb`.
+        // Not fatal — the context may be perfectly usable — but it is counted,
+        // because "the callback answered something other than S_OK" is exactly
+        // the kind of fact that is invisible until it matters.
+        note_refusal(&L2_REFUSALS.queue_context_failed);
     }
     if arg.hContext.is_null() {
         // The whole group becomes meaningful at once or the call failed —

@@ -362,6 +362,32 @@ struct ResourceState {
     /// [`check_resource_allocation_info`] did. Two independent computations of
     /// one answer is how they come to disagree.
     alloc_info: ddi12::D3D12DDI_RESOURCE_ALLOCATION_INFO_0022,
+    /// ⛔ **Whether the `hHeap` of this object's fused create/destroy pair is a
+    /// private block THIS DRIVER OWNS**, i.e. whether the paired sizing call
+    /// asked for one. `true` for the heap-only and committed arms, `false` for
+    /// the placed arm, where `hHeap` is an **already-live** heap's handle rather
+    /// than a fresh block.
+    ///
+    /// ⭐ It exists because `pfnDestroyHeapAndResource` is handed the same
+    /// `(hHeap, hResource)` pair as the create but **not** the `pCreateHeap` /
+    /// `pCreateResource` pointers the create classified the arm from, so the
+    /// answer has to be carried on the object. Without it the destroy cannot
+    /// tell "my heap block" from "someone else's live heap", and the two halves
+    /// of one operation held contradictory beliefs about the same parameter:
+    /// `create_heap_and_resource` refuses even to *clear* that word on the
+    /// placed arm — at length, calling it *"the single most dangerous line in
+    /// the lane if it is wrong"* — while the destroy took the box and dropped
+    /// it on every arm. Under the create site's own premise, the first
+    /// `Release()` of any placed resource tore down its live parent heap:
+    /// `ID3D12Heap` released, map anchor gone, `pfnMapHeap` refusing thereafter,
+    /// and a later placed create into that heap misdiagnosed as a *reserved*
+    /// resource. Found by the `PARALLEL.md` §10 review, before any VM run.
+    ///
+    /// ⚠ Recorded on the RESOURCE and not on the heap deliberately: on the
+    /// placed arm the heap's own `HeapState` says "I am owned" — truthfully, by
+    /// its own create — so it cannot distinguish which operation is asking.
+    /// The resource is the object whose create knew the answer.
+    owns_heap_block: bool,
 }
 
 // ⚠ **`D3D12DDI_HRTRESOURCE` is deliberately NOT a field**, and the omission is
@@ -1199,6 +1225,9 @@ unsafe fn create_heap_only(
                 }),
                 desc: desc1,
                 alloc_info: whole_heap_allocation_info(a.ByteSize, a.Alignment),
+                // The heap-only arm: `pCreateHeap` was non-null, so the sizing
+                // asked for a heap block and it is this driver's to reclaim.
+                owns_heap_block: true,
             });
         }
     }
@@ -1349,6 +1378,10 @@ unsafe fn create_committed(
                 res_arg,
                 heap_arg.VisibleNodeMask,
             ),
+            // The committed arm: both arg pointers were non-null, so the sizing
+            // asked for a heap block and the implicit heap stored below is this
+            // driver's to reclaim.
+            owns_heap_block: true,
         });
     }
     // SAFETY: as above, for the implicit heap's block.
@@ -1542,6 +1575,11 @@ unsafe fn create_placed_or_reserved(
             }),
             desc,
             alloc_info: allocation_info_from_engine(device10, &desc, res_arg, 1),
+            // ⛔ The placed arm: `pCreateHeap` was NULL, the sizing answered
+            // `Heap = 0`, and the `hHeap` this create was handed is an
+            // **already-live** heap owned by its own create. Destroying this
+            // resource must not touch it.
+            owns_heap_block: false,
         });
     }
     S_OK
@@ -1787,23 +1825,51 @@ unsafe extern "C" fn destroy_heap_and_resource(
     h_resource: ddi12::D3D12DDI_HRESOURCE,
 ) {
     let mut seen = false;
+
+    // ⛔ **Whether this driver may reclaim `hHeap` is decided by the RESOURCE**,
+    // not by `hHeap`'s own contents, and the default is "no". `ResourceState`'s
+    // `owns_heap_block` doc carries the whole argument; the short version is that
+    // on the placed arm `hHeap` is an already-live heap belonging to a different
+    // create, so taking its box would tear down a live `ID3D12Heap` under its
+    // owner.
+    //
+    // ⚠ Defaulting to `false` when the resource block does not resolve is the
+    // deliberate direction: not reclaiming is a leak, which is counted below and
+    // is diagnosable; reclaiming something that is not ours is a use-after-free
+    // in the runtime's own object graph, which is not.
+    let mut owns_heap_block = false;
+
     // SAFETY: the caller guarantees a live, not-yet-destroyed handle; `take`
     // nulls the slot first, so a second call finds nothing and does nothing.
     if let Some(slot) = unsafe { Slot::<Boxed<ResourceState>>::from_priv(h_resource.pDrvPrivate) } {
         // SAFETY: as above.
         if let Some(state) = unsafe { slot.take() } {
+            owns_heap_block = state.owns_heap_block;
             drop(state);
             seen = true;
         }
     }
-    // SAFETY: as above, for the heap.
-    if let Some(slot) = unsafe { Slot::<Boxed<HeapState>>::from_priv(h_heap.pDrvPrivate) } {
-        // SAFETY: as above.
-        if let Some(state) = unsafe { slot.take() } {
-            drop(state);
-            seen = true;
+
+    if owns_heap_block {
+        // SAFETY: as above, for the heap.
+        if let Some(slot) = unsafe { Slot::<Boxed<HeapState>>::from_priv(h_heap.pDrvPrivate) } {
+            // SAFETY: as above.
+            if let Some(state) = unsafe { slot.take() } {
+                drop(state);
+                seen = true;
+            } else {
+                // The paired create asked for a heap block and the destroy found
+                // none: the `ID3D12Heap` and its map anchor are now unreachable.
+                // ⚠ A separate counter from `ResourceHandleUnresolved` because
+                // `seen` is already true here — the resource resolved — so the
+                // aggregate could never have shown this.
+                note_refusal(&L4_REFUSALS.heap_block_unreclaimed);
+            }
+        } else if !h_heap.pDrvPrivate.is_null() {
+            note_refusal(&L4_REFUSALS.heap_block_unreclaimed);
         }
     }
+
     if !seen {
         note_refusal(&L4_REFUSALS.resource_handle_unresolved);
     }
@@ -2882,6 +2948,20 @@ struct L4Refusals {
     /// it is a census, not a fault. See the handler for why honouring it would
     /// make the two derivations of one answer disagree.
     resource_alignment_restriction_ignored: RefusalCounter,
+    /// `pfnDestroyHeapAndResource` was told by the resource it just destroyed
+    /// that the paired create HAD asked for a heap block, and then found no
+    /// `Box<HeapState>` behind `hHeap` to reclaim.
+    ///
+    /// ⛔ **Expected 0.** A hit means an `ID3D12Heap` and its map anchor are now
+    /// unreachable — a leak of engine memory, not a crash, which is why the
+    /// destroy is allowed to reach it at all.
+    ///
+    /// ⚠ It is a separate counter from `ResourceHandleUnresolved` and not an
+    /// extra bump of it, because on this path `seen` is already `true`: the
+    /// resource resolved. The aggregate could never have shown a heap that went
+    /// unreclaimed, which is exactly the shape the review pass found in the arm
+    /// this counter was added with.
+    heap_block_unreclaimed: RefusalCounter,
 }
 
 static L4_REFUSALS: L4Refusals = L4Refusals {
@@ -2927,6 +3007,7 @@ static L4_REFUSALS: L4Refusals = L4Refusals {
     resource_alignment_restriction_ignored: RefusalCounter::new(
         "ResourceAlignmentRestrictionIgnored",
     ),
+    heap_block_unreclaimed: RefusalCounter::new("HeapBlockUnreclaimed"),
 };
 
 /// L4's refusal set, printed by `crate::log_refusal_summary` at this lane's
@@ -2980,4 +3061,5 @@ pub(crate) static REFUSALS: &[&RefusalCounter] = &[
     &L4_REFUSALS.residency_bad_arg,
     &L4_REFUSALS.heap_primary_flag_dropped,
     &L4_REFUSALS.resource_alignment_restriction_ignored,
+    &L4_REFUSALS.heap_block_unreclaimed,
 ];

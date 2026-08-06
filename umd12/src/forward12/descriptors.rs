@@ -76,7 +76,7 @@
 //! a `const _` below pins the collision so it is machine-visible rather than
 //! prose.
 //!
-//! # ⛔ What this lane could NOT finish, and why
+//! # ⭐ The L4 seam, and how it was closed
 //!
 //! Five slots — `pfnCreateShaderResourceView`, `pfnCreateUnorderedAccessView`,
 //! `pfnCreateRenderTargetView`, `pfnCreateDepthStencilView` and
@@ -85,9 +85,16 @@
 //! belongs to **L4** (`forward12/resource12.rs`, groups (g)+(h)); declaring it
 //! here would be R803's exact scar — choosing a slot's payload at the call site
 //! — and would collide with L4's own `com_handles!`/`boxed_handles!` invocation
-//! at merge. [`engine_resource`] is the one-function seam, it is a **loud stub**
-//! with a named counter, and the translators below it are the shipping bodies:
-//! wiring L4 in is a single function body, not new code.
+//! at merge. So this lane shipped [`engine_resource`] as a one-function seam,
+//! a loud `STUB:` with its own counter, and everything below it as the real
+//! bodies.
+//!
+//! ⭐ **L4 landed in the same batch, so the seam is CLOSED** —
+//! [`engine_resource`] forwards to `resource12::engine_resource` and carries
+//! L4's borrowed `&ID3D12Resource` through [`ViewResource`]. ⛔ The consequence
+//! that matters for reading a gate log: `ViewResourceUnavailable` is now
+//! **expected 0**, and a hit means a non-null handle this driver failed to
+//! resolve — which removes the device.
 //!
 //! ⛔ **A null `hDrvResource` is NOT that seam.** D3D12's null-descriptor form
 //! — `CreateShaderResourceView(nullptr, &desc, handle)` for an unbound table
@@ -1388,9 +1395,25 @@ unsafe extern "C" fn create_unordered_access_view(
             // spelled through `view_resource` so that classification lives in
             // exactly one place.
             ViewResource::Null => None,
+            // ⛔ **Refuse, do not drop.** The runtime NAMED a counter resource and
+            // this driver could not resolve it. Writing the descriptor anyway
+            // produces exactly the null UAV counter the 72nd memory records
+            // faulting the host GPU context and hanging the guest — and this
+            // slot's own doc twelve lines above promises it *"never drops one"*.
+            //
+            // ⚠ It was written as bump-and-continue, and the counter's own
+            // declaration recorded the vkd3d consequence — which made it worse,
+            // not better: the lane wrote down that a dropped counter hangs the
+            // guest and then chose the silent arm for it, while choosing
+            // `pfnSetErrorCb` for the strictly *less* dangerous unresolvable-view
+            // case four lines above. The two arms now agree, and they agree on
+            // the side where the failure is visible: a removed device is a
+            // diagnosable event, a hung guest is not.
             ViewResource::Unresolved => {
                 note_refusal(&DESCRIPTOR_REFUSALS.uav_counter_unavailable);
-                None
+                log_view_refusal("CreateUnorderedAccessView counter", a.Format, a.ResourceDimension);
+                report_error(dev, E_FAIL);
+                return;
             }
         }
     } else {
@@ -2446,18 +2469,36 @@ struct DescriptorRefusals {
     /// ⚠ A *null* handle is not this: that is D3D12's null-descriptor form,
     /// it is legal, and it is counted on `ViewNullResource` and forwarded.
     ///
-    /// ⛔ **Expected NON-ZERO on any workload that draws, until L4 lands.**
-    /// `engine_resource` is a loud stub: the resource handle's private payload
-    /// is `forward12/resource12.rs`'s, and declaring it here would be R803 (the
-    /// payload chosen at the call site) plus a coherence conflict at merge. Every
-    /// one of these also raises `pfnSetErrorCb`, so the device is removed rather
-    /// than rendering from a descriptor nobody wrote.
+    /// ⛔ **Expected 0.** ⚠ It was written as *"expected NON-ZERO on any workload
+    /// that draws, until L4 lands"*, which was true for exactly as long as this
+    /// lane was authored in isolation: **L4 landed in the same batch** and
+    /// [`engine_resource`] forwards to `resource12::engine_resource` now. So the
+    /// counter's meaning inverted at merge, and a grading left behind is worse
+    /// than no grading — this is the readout for the run the merge exists to
+    /// enable, and "expected non-zero" would have read a device-removal count as
+    /// normal traffic.
+    ///
+    /// What a hit means now: the runtime named a **non-null** resource handle
+    /// whose private word `resource12` did not write — a lifetime or ownership
+    /// defect, not a missing lane. Every one of these also raises
+    /// `pfnSetErrorCb`, so **the device is removed** rather than rendering from a
+    /// descriptor nobody wrote.
     view_resource_unavailable: RefusalCounter,
     /// A UAV named a counter resource whose engine `ID3D12Resource` could not be
-    /// resolved, so the view was created without one. Same cause as
-    /// `ViewResourceUnavailable`, counted apart because a dropped counter is a
-    /// different wrongness from a dropped view: `memory 72nd` records a null UAV
-    /// counter descriptor faulting the host GPU context and hanging the guest.
+    /// resolved, so **the view was refused** and `pfnSetErrorCb` raised.
+    ///
+    /// ⛔ **Expected 0**, and counted apart from `ViewResourceUnavailable`
+    /// because the two have the same cause and different consequences: an
+    /// unresolvable *view* resource produces a descriptor nobody wrote, while an
+    /// unresolvable *counter* would produce the null UAV counter descriptor the
+    /// 72nd memory records **faulting the host GPU context and hanging the
+    /// guest** — an unrecoverable, undiagnosable failure rather than a removed
+    /// device.
+    ///
+    /// ⚠ This arm used to bump-and-continue, with that consequence written down
+    /// right here. Recording a hazard is not mitigating it: the review pass
+    /// found the slot's own doc promising it *"never drops one"* while the code
+    /// dropped one. Both arms refuse now.
     uav_counter_unavailable: RefusalCounter,
     /// A view's `ResourceDimension` named no arm this translation handles.
     /// Expected 0 - the six DDI dimensions are all covered, so a hit means the

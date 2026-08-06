@@ -48,12 +48,15 @@
 //!   noop returns 0, i.e. *"this device has no physical adapters"*. Landing one
 //!   half of a two-part invariant and leaving the other answering zero is the
 //!   silent stub CLAUDE.md rule 2 exists to forbid, so both land together.
-//! * `pfnGetDebugAllocationInfo` is the same `_Out_`-left-unwritten class as
-//!   `pfnQueryNodeMap`, arriving through a second slot: it takes **two** `_Out_`
-//!   `UINT*` array counts and a `VOID`-returning counting noop writes neither,
-//!   so the runtime reads its own uninitialised stack as two array lengths.
-//!   `D12-G7` called it **four times** per `D3D12CreateDevice` and passed on the
-//!   luck of what those words held. See [`get_debug_allocation_info`].
+//! * `pfnGetDebugAllocationInfo` is the same output-the-runtime-acts-on class,
+//!   arriving through a second slot. Its two array counts are **`_Inout_`**
+//!   (`d3d12umddi.h:3541-3548`): the runtime writes each array's *capacity* in
+//!   and expects a fill count back, so a `VOID`-returning noop that writes
+//!   neither leaves the capacity standing as the count and the runtime reads
+//!   that many entries out of an array this driver never filled. `D12-G7` called
+//!   it **four times** per `D3D12CreateDevice`. See
+//!   [`get_debug_allocation_info`], whose doc records that this was first
+//!   written down as `_Out_` with the wrong mechanism.
 //!
 //! ⚠ They are still **L9's slots**, in L9's file, under L9's ownership
 //! (`PARALLEL.md` §4). The lane that takes the rest of this file inherits them
@@ -156,29 +159,38 @@ unsafe extern "C" fn query_node_map(
 /// ⭐ **The third slot to land ahead of L9, for the same reason as the other two
 /// and with a sharper edge.** `D12-G7`'s passing run called it **four times**
 /// inside `D3D12CreateDevice`, and the counting noop it reached returns `0` —
-/// which for a `VOID` slot means it returns having written **nothing**. Both
-/// `pNumVirtualAddressInfos` and `pNumKMTInfos` are `_Out_` `UINT*`, so the
-/// runtime then reads its own uninitialised stack as two array counts and, if
-/// either is non-zero, walks a buffer this driver never filled. That is
-/// precisely the class `query_node_map` above exists to close, arriving through
-/// a second slot on the same device-creation path; it survived `D12-G7` on the
-/// luck of whatever those four stack words happened to hold.
+/// which for a `VOID` slot means it returns having written **nothing**.
+///
+/// ⛔ **Both counts are `_Inout_`, and that is what makes the noop dangerous**:
+///
+/// ```text
+/// _Inout_ UINT* pNumVirtualAddressInfos,
+/// _Out_writes_to_opt_(*pNumVirtualAddressInfos, *pNumVirtualAddressInfos) ...* pVirtualAddressInfos,
+/// ```
+/// (`d3d12umddi.h:3541-3548`)
+///
+/// So the runtime writes each array's **capacity** in and expects the driver to
+/// write back how many entries it actually filled. A body that returns without
+/// touching them leaves the runtime's own capacity standing as the fill count,
+/// and the runtime then reads `capacity` entries out of an array this driver
+/// never wrote. Same family as the `query_node_map` above — an output the
+/// runtime acts on that the noop never produced — arriving through a second slot
+/// on the same device-creation path. ⚠ **Corrected after the fact:** this
+/// comment first said `_Out_` and "the runtime reads its own uninitialised
+/// stack". The shipped body was right either way, but the mechanism was not, and
+/// it is the mechanism a future real body has to honour.
 ///
 /// ⛔ **Zero is the honest answer, not a placeholder.** `DDI_REFERENCE.md` §9.12
 /// says this slot *"must map any `D3D12DDI_HANDLE_AND_TYPE` to
-/// `{ VA infos, KMT allocation infos }`"*, and §9.11 records that kernel
-/// identity is *"mandatory in at least three places, so pure passthrough with no
-/// `pfnAllocateCb` is not viable"*. Helios **is** that passthrough: the venus
-/// ICD mints every allocation through its own D3DKMT, this driver calls no
+/// `{ VA infos, KMT allocation infos }`"*, and **§9.7** (`:1735`) records that
+/// kernel identity is *"mandatory in at least three places, so pure passthrough
+/// with no `pfnAllocateCb` is not viable"*. Helios **is** that passthrough: the
+/// venus ICD mints every allocation through its own D3DKMT, this driver calls no
 /// `pfnAllocateCb`, and L4's `pfnCheckResourceAllocationHandle` answers `0` for
-/// the same reason (`resource12.rs` §5.3). So there is no `D3DKMT_HANDLE` to
-/// report and reporting a fabricated one would be worse than reporting none.
-/// The counter is what stops the zero reading as *"the debug layer looked and
-/// the resource was fine"*.
-///
-/// ⚠ The two-call shape is safe under this answer either way it is meant:
-/// whether the runtime passes array capacities in or asks for required counts
-/// first, `0` is written to both and neither array is touched.
+/// the same reason (`forward12/resource12.rs`, which cites §9.7 correctly). So
+/// there is no `D3DKMT_HANDLE` to report and reporting a fabricated one would be
+/// worse than reporting none. The counter is what stops the zero reading as
+/// *"the debug layer looked and the resource was fine"*.
 ///
 /// ⚠ **Deliberately does NOT reach `pfnSetErrorCb`.** A debug-layer query that
 /// finds nothing is not a driver error, and `DDI_REFERENCE.md` §9.12's own
@@ -189,8 +201,12 @@ unsafe extern "C" fn query_node_map(
 ///
 /// # Safety
 /// `p_num_virtual_address_infos` and `p_num_kmt_infos`, when non-null, must each
-/// address one writable `UINT` the runtime owns. The two array pointers are not
-/// dereferenced at all, because both counts are answered `0`.
+/// address one `UINT` the runtime owns that is **readable and writable**: the
+/// header declares them `_Inout_`, so each holds an array capacity on entry and
+/// takes a fill count on exit. This body reads neither — it overwrites both with
+/// `0` — but a future real body must read them before writing either array, and
+/// that obligation belongs in this contract rather than in a comment. The two
+/// array pointers are not dereferenced at all, because both counts are `0`.
 unsafe extern "C" fn get_debug_allocation_info(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     _object: ddi12::D3D12DDI_HANDLE_AND_TYPE,

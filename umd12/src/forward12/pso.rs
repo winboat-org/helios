@@ -72,7 +72,7 @@ use windows::Win32::Graphics::Direct3D12::{
     D3D12_INDEX_BUFFER_STRIP_CUT_VALUE, D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFFFFFF,
     D3D12_INPUT_CLASSIFICATION, D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA,
     D3D12_INPUT_ELEMENT_DESC, D3D12_INPUT_LAYOUT_DESC, D3D12_LINE_RASTERIZATION_MODE,
-    D3D12_LINE_RASTERIZATION_MODE_ALIASED,
+    D3D12_LINE_RASTERIZATION_MODE_ALIASED, D3D12_LINE_RASTERIZATION_MODE_QUADRILATERAL_NARROW,
     D3D12_LOGIC_OP, D3D12_LOGIC_OP_NOOP, D3D12_PIPELINE_STATE_FLAGS,
     D3D12_PIPELINE_STATE_FLAG_DYNAMIC_DEPTH_BIAS,
     D3D12_PIPELINE_STATE_FLAG_DYNAMIC_INDEX_BUFFER_STRIP_CUT, D3D12_PIPELINE_STATE_STREAM_DESC,
@@ -329,9 +329,18 @@ const _: () = assert!(
 );
 const _: () = assert!(
     ddi12::D3D12DDI_LINE_RASTERIZATION_MODE_D3D12DDI_LINE_RASTERIZATION_MODE_QUADRILATERAL_NARROW
-        == D3D12_LINE_RASTERIZATION_MODE(3).0,
+        == D3D12_LINE_RASTERIZATION_MODE_QUADRILATERAL_NARROW.0,
     "D3D12DDI_LINE_RASTERIZATION_MODE must be value-identical to D3D12_LINE_RASTERIZATION_MODE"
 );
+// ⚠ The line above was `D3D12_LINE_RASTERIZATION_MODE(3).0` — a hand-transcribed
+// literal, and the ONE assertion of the 21 below that compared this DDI enumerator
+// against a number instead of against the API's own generated constant. It asserted
+// `DDI_QUADRILATERAL_NARROW == 3` and never compared the two enumerations at all,
+// inside the block whose own preamble is *"neither side is transcribed"*.
+// `ARCHITECTURE.md` §12 rule 1 in the one place a reader would never look for it.
+// The named constant existed the whole time
+// (`windows-0.58.0/.../Direct3D12/mod.rs:4778`) and its sibling was already
+// imported two lines up.
 const _: () = assert!(
     ddi12::D3D12DDI_BLEND_D3D12DDI_BLEND_ZERO == D3D12_BLEND_ZERO.0
         && ddi12::D3D12DDI_BLEND_D3D12DDI_BLEND_ONE == D3D12_BLEND_ONE.0,
