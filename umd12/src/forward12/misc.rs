@@ -157,6 +157,7 @@ use windows::Win32::Graphics::Direct3D12::{
 
 use super::queue;
 use super::tables12::{stage, Filling};
+use super::{identity12, resource12};
 use super::tables12::{CommandListTable, DeviceCoreTable};
 use crate::{ddi12, log_error, note_refusal, UMD12_REFUSALS};
 
@@ -393,8 +394,8 @@ unsafe extern "C" fn retrieve_shader_comment(
     E_NOTIMPL
 }
 
-/// `pfnGetDebugAllocationInfo` — this driver owns no kernel allocations, and
-/// says so by **writing two zeros** rather than by returning without writing.
+/// `pfnGetDebugAllocationInfo` — the real `D3DKMT_HANDLE` for a presentable
+/// resource since UP-6, and two honest zeros for everything else.
 ///
 /// ⭐ **The third slot to land ahead of L9, for the same reason as the other two
 /// and with a sharper edge.** `D12-G7`'s passing run called it **four times**
@@ -420,17 +421,35 @@ unsafe extern "C" fn retrieve_shader_comment(
 /// stack". The shipped body was right either way, but the mechanism was not, and
 /// it is the mechanism a future real body has to honour.
 ///
-/// ⛔ **Zero is the honest answer, not a placeholder.** `DDI_REFERENCE.md` §9.12
-/// says this slot *"must map any `D3D12DDI_HANDLE_AND_TYPE` to
-/// `{ VA infos, KMT allocation infos }`"*, and **§9.7** (`:1735`) records that
-/// kernel identity is *"mandatory in at least three places, so pure passthrough
-/// with no `pfnAllocateCb` is not viable"*. Helios **is** that passthrough: the
-/// venus ICD mints every allocation through its own D3DKMT, this driver calls no
-/// `pfnAllocateCb`, and L4's `pfnCheckResourceAllocationHandle` answers `0` for
-/// the same reason (`forward12/resource12.rs`, which cites §9.7 correctly). So
-/// there is no `D3DKMT_HANDLE` to report and reporting a fabricated one would be
-/// worse than reporting none. The counter is what stops the zero reading as
-/// *"the debug layer looked and the resource was fine"*.
+/// ⛔⛔ **The whole premise of this doc's first form is now FALSE and the old text is
+/// quoted so the change is not silent.** It said: *"Zero is the honest answer, not a
+/// placeholder … Helios **is** that passthrough: the venus ICD mints every allocation
+/// through its own D3DKMT, this driver calls no `pfnAllocateCb`, and L4's
+/// `pfnCheckResourceAllocationHandle` answers `0` for the same reason … there is no
+/// `D3DKMT_HANDLE` to report"*. UP-5 landed `pfnAllocateCb` for resources the runtime
+/// declares `D3D12DDI_HEAP_FLAG_PRIMARY`, so this driver owns a handle for exactly
+/// that class — and `DDI_REFERENCE.md` §9.7's *"kernel identity is mandatory in at
+/// least three places, so pure passthrough with no `pfnAllocateCb` is not viable"*
+/// (`:1735`) is discharged for the class that needs it and left standing for the class
+/// that does not.
+///
+/// ⇒ **Two answers, and the split is the same one `pfnCheckResourceAllocationHandle`
+/// makes**: one KMT info out of the [`identity12`] table for a presentable resource,
+/// and zero infos — still the honest answer, never a fabricated handle — for every
+/// other resource, whose memory is the venus ICD's.
+///
+/// ⚠ **No VA infos in either case**, and that is a *different* argument rather than
+/// the same one twice: `D3D12DDI_DEBUG_VIRTUAL_ADDRESS_ALLOCATION_INFO_0012` describes
+/// a range in this adapter's GPU virtual address space, this driver reserves none
+/// (`pfnReserveGpuVirtualAddressCb` is called nowhere in this crate), and the address
+/// `pfnCheckResourceVirtualAddress` answers with is vkd3d's own allocator's. Reporting
+/// it here would attribute a host-side range to this adapter's segments.
+///
+/// ⚠ **Both counts are `_Inout_` and BOTH are written on every path**, which is the
+/// obligation the counting noop could not honour and the one a future edit is most
+/// likely to break. [`fill_kmt_allocation_info`] reads the KMT capacity before it
+/// touches the array and writes the fill count back first as 0, so no early return can
+/// leave the runtime's own capacity standing as a count.
 ///
 /// ⚠ **Deliberately does NOT reach `pfnSetErrorCb`.** A debug-layer query that
 /// finds nothing is not a driver error, and `DDI_REFERENCE.md` §9.12's own
@@ -449,30 +468,129 @@ unsafe extern "C" fn retrieve_shader_comment(
 /// array pointers are not dereferenced at all, because both counts are `0`.
 unsafe extern "C" fn get_debug_allocation_info(
     _h_device: ddi12::D3D12DDI_HDEVICE,
-    _object: ddi12::D3D12DDI_HANDLE_AND_TYPE,
+    object: ddi12::D3D12DDI_HANDLE_AND_TYPE,
     p_num_virtual_address_infos: *mut ddi12::UINT,
     _p_virtual_address_infos: *mut ddi12::D3D12DDI_DEBUG_VIRTUAL_ADDRESS_ALLOCATION_INFO_0012,
     p_num_kmt_infos: *mut ddi12::UINT,
-    _p_kmt_infos: *mut ddi12::D3D12DDI_DEBUG_KMT_ALLOCATION_INFO_0014,
+    p_kmt_infos: *mut ddi12::D3D12DDI_DEBUG_KMT_ALLOCATION_INFO_0014,
 ) {
-    // ⚠ `bump` and not `note_refusal`: R911 -- the arm below logs its own line.
-    DEBUG_ALLOCATION_INFO_EMPTY.bump();
-    let n = DEBUG_ALLOCATION_INFO_EMPTY.get();
-    if n <= LOG_BUDGET {
-        log_error!(
-            "GetDebugAllocationInfo: this driver owns no kernel allocations (the venus ICD mints \
-             them); answering 0 VA infos and 0 KMT infos (x{n})"
-        );
-    }
+    // ⛔ NO VIRTUAL-ADDRESS INFOS, and 0 is the answer rather than a gap. The
+    // struct is `{PhysicalAdapterIndex, StartAddress, EndAddress}` — a range in the
+    // *adapter's* GPU virtual address space — and this driver reserves none:
+    // `pfnReserveGpuVirtualAddressCb` is not called anywhere in this crate, and the
+    // address `pfnCheckResourceVirtualAddress` answers with is
+    // `ID3D12Resource::GetGPUVirtualAddress()`, i.e. **vkd3d's own** VA allocator's,
+    // which the host owns. Reporting one here would attribute a host-side range to
+    // this adapter's segments — a fabrication with an `S_OK` on it, which is the
+    // shape `query_node_map` above is also about.
     if !p_num_virtual_address_infos.is_null() {
-        // SAFETY: non-null per the check; the DDI declares it a writable `_Out_`
+        // SAFETY: non-null per the check; the DDI declares it a writable `_Inout_`
         // `UINT*` the runtime owns for the duration of the call.
         unsafe { core::ptr::write_unaligned(p_num_virtual_address_infos, 0) };
     }
-    if !p_num_kmt_infos.is_null() {
-        // SAFETY: as above.
-        unsafe { core::ptr::write_unaligned(p_num_kmt_infos, 0) };
+
+    // ── the KMT allocation info, since UP-5/UP-9 ────────────────────────────
+    let filled = unsafe { fill_kmt_allocation_info(object, p_num_kmt_infos, p_kmt_infos) };
+    if !filled {
+        DEBUG_ALLOCATION_INFO_EMPTY.bump();
+        let n = DEBUG_ALLOCATION_INFO_EMPTY.get();
+        if n <= LOG_BUDGET {
+            log_error!(
+                "GetDebugAllocationInfo: no kernel allocation for handle {:p} type {} -- \
+                 answering 0 VA infos and 0 KMT infos (x{n})",
+                object.Handle,
+                object.Type,
+            );
+        }
     }
+}
+
+/// Fill the one `D3D12DDI_DEBUG_KMT_ALLOCATION_INFO_0014` a presentable resource
+/// has, if it has one. `true` when an entry was written.
+///
+/// ⛔ **Both counts are `_Inout_`, and this is the obligation the noop could not
+/// honour**: the runtime writes each array's *capacity* in and expects the driver to
+/// write back how many entries it filled. So the capacity is **read before** the
+/// array is touched, and the write-back happens on every path — including the
+/// zero-entry one, which is what stops the runtime reading `capacity` entries out of
+/// an array this driver never wrote.
+///
+/// ⚠ **Only `HT_0012_RESOURCE` is answered**, and it is the only resource handle type
+/// the header has (`d3d12umddi.rs`'s `D3D12DDI_HANDLETYPE` block: one resource
+/// enumerator, value 34). Every other type — heaps included — takes the zero arm:
+/// `pfnCreateHeapAndResource` mints an allocation for the *resource*, and a
+/// `D3D12DDI_HHEAP` handle does not resolve through `resource12`.
+///
+/// # Safety
+/// `object.Handle`, when `object.Type` is `HT_0012_RESOURCE`, must be the
+/// `pDrvPrivate` of a resource handle `pfnCreateHeapAndResource` returned `S_OK` for.
+/// `p_num_kmt_infos`, when non-null, must address one readable-and-writable `UINT`.
+/// `p_kmt_infos` must address at least `*p_num_kmt_infos` writable entries.
+unsafe fn fill_kmt_allocation_info(
+    object: ddi12::D3D12DDI_HANDLE_AND_TYPE,
+    p_num_kmt_infos: *mut ddi12::UINT,
+    p_kmt_infos: *mut ddi12::D3D12DDI_DEBUG_KMT_ALLOCATION_INFO_0014,
+) -> bool {
+    if p_num_kmt_infos.is_null() {
+        // Nowhere to report a count, so nothing may be written to the array either:
+        // its length is only knowable through the count this driver cannot read.
+        return false;
+    }
+    // SAFETY: non-null per the check; `_Inout_`, so it is readable on entry.
+    let capacity = unsafe { core::ptr::read_unaligned(p_num_kmt_infos) };
+    // ⛔ The count is written back FIRST, as 0, so every early return below leaves the
+    // runtime's own capacity overwritten rather than standing as a fill count.
+    // SAFETY: as above, and `_Inout_` makes it writable.
+    unsafe { core::ptr::write_unaligned(p_num_kmt_infos, 0) };
+
+    if object.Type != ddi12::D3D12DDI_HANDLETYPE_D3D12DDI_HT_0012_RESOURCE
+        || object.Handle.is_null()
+        || capacity == 0
+        || p_kmt_infos.is_null()
+    {
+        return false;
+    }
+    let h_resource = ddi12::D3D12DDI_HRESOURCE {
+        pDrvPrivate: object.Handle,
+    };
+    // SAFETY: the type tag says this is a resource handle and the caller guarantees
+    // it is one this driver's create returned; the borrow ends inside this function.
+    let Some(engine) = (unsafe { resource12::engine_resource(h_resource) }) else {
+        return false;
+    };
+    let Some(identity) = identity12::lookup(engine.as_raw() as usize) else {
+        // ⚠ The ordinary case, not a fault: only a resource the runtime declared a
+        // PRIMARY has a WDDM allocation at all. `resource12`'s
+        // `pfnCheckResourceAllocationHandle` answers 0 for the same class and for the
+        // same reason.
+        return false;
+    };
+    // SAFETY: `p_kmt_infos` is non-null with a capacity of at least 1 entry per the
+    // checks above, so element 0 is inside the array the runtime supplied.
+    // `write_unaligned` because the DDI promises a count and not an alignment.
+    unsafe {
+        p_kmt_infos.write_unaligned(ddi12::D3D12DDI_DEBUG_KMT_ALLOCATION_INFO_0014 {
+            // Single-node adapter: `CreationNodeMask`/`VisibleNodeMask` are 1 across
+            // this driver and there is no second physical adapter to index.
+            PhysicalAdapterIndex: 0,
+            hAllocation: identity.h_allocation,
+            // ⚠ The resource's offset **within the allocation**, which is the venus
+            // `VkDeviceMemory` the allocation adopted whole — so it is
+            // `memory_offset`, and UP-3's dedicated export makes it 0. Carried rather
+            // than hardcoded: `adopt_presentable` refuses a non-zero one, so a
+            // non-zero value reaching here would be a finding, and writing a literal
+            // 0 would hide it.
+            Offset: identity.memory_offset,
+            // The whole `VkMemoryAllocateInfo::allocationSize`, i.e. the allocation's
+            // size — **not** the resource's. `identity12::PresentableIdentity::
+            // memory_size` has why the two are kept apart.
+            Size: identity.memory_size,
+        });
+    }
+    // SAFETY: as the count write above.
+    unsafe { core::ptr::write_unaligned(p_num_kmt_infos, 1) };
+    DEBUG_ALLOCATION_INFO_ANSWERED.bump();
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -2021,6 +2139,9 @@ pub(crate) fn install_cmdlist(
 /// `D3D12 DDI refusals:` breaks the diff that set order exists to protect.
 pub(crate) static REFUSALS: &[&RefusalCounter] = &[
     &DEBUG_ALLOCATION_INFO_EMPTY,
+    // ⛔ APPENDED, UP-6's second half. See the counter's doc for why it is a pair
+    // with the one above and unreadable alone.
+    &DEBUG_ALLOCATION_INFO_ANSWERED,
     // -- device core -------------------------------------------------------
     &L9_REFUSALS.shader_comment_refused,
     &L9_REFUSALS.shader_comment_bad_arg,
@@ -2085,10 +2206,19 @@ pub(crate) static REFUSALS: &[&RefusalCounter] = &[
 
 /// `pfnGetDebugAllocationInfo` answered "no VA infos, no KMT infos".
 ///
-/// It is an instrument, not a fault: Helios owns no kernel allocations — the
-/// venus ICD mints every one through its own D3DKMT and this driver never calls
-/// `pfnAllocateCb` — so there is no `D3DKMT_HANDLE` to report, the same reason
-/// L4's `pfnCheckResourceAllocationHandle` answers 0.
+/// It is an instrument, not a fault: the queried object had no WDDM allocation of
+/// this driver's, which is true of every resource the runtime did not declare a
+/// primary — the same class, and the same reason, as L4's
+/// `pfnCheckResourceAllocationHandle` answering 0.
+///
+/// ⚠⚠ **RE-GRADED by UP-6, and the widening is the whole change**: it used to mean
+/// *"this driver owns no kernel allocations, so there is nothing to report"* — a
+/// statement about the driver. It now means *"this particular object has no kernel
+/// allocation"*, which is the ordinary answer for every resource that is not a
+/// primary, plus the four argument-shaped refusals (no count pointer, zero capacity,
+/// a non-resource handle type, an unresolved handle). ⇒ it can no longer be read as
+/// *"the passthrough model is still in force"*; `DebugAllocationInfoAnswered` is the
+/// counter that says whether a handle was ever produced.
 ///
 /// ⚠ **Expected 0 on a retail device-creation path, and non-zero under the debug
 /// layer.** ⛔ This was first graded the other way round — *"expected non-zero;
@@ -2111,6 +2241,19 @@ pub(crate) static REFUSALS: &[&RefusalCounter] = &[
 /// there" — not a claim about which mechanism produced the 4.
 static DEBUG_ALLOCATION_INFO_EMPTY: RefusalCounter =
     RefusalCounter::new("DebugAllocationInfoEmpty");
+
+/// ⭐ `pfnGetDebugAllocationInfo` **answered a real `D3DKMT_HANDLE`** for a
+/// presentable resource (UP-6's second half).
+///
+/// ⚠ **Expected 0 in retail and non-zero only under the debug layer**, like the
+/// counter above — this slot is a debug-layer query and nothing on the shipping path
+/// calls it. ⛔ Its value is as a *pair* with `DebugAllocationInfoEmpty`: the two
+/// together partition every entry, so `Empty > 0` with `Answered == 0` on a run with
+/// `IdentityRecorded > 0` says the debug layer asked about resources that are not
+/// primaries (benign), while `Answered == 0` with `Empty == 0` says the slot was never
+/// entered at all. Neither reading is available from one counter.
+static DEBUG_ALLOCATION_INFO_ANSWERED: RefusalCounter =
+    RefusalCounter::new("DebugAllocationInfoAnswered");
 
 /// L9's Round-2 refusal counters. One instance, [`L9_REFUSALS`]; the set that
 /// prints them is [`REFUSALS`].
