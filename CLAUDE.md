@@ -152,7 +152,11 @@ helios-vgpu/
 ├── packaging/windows/      ← Install-Helios.ps1 / Verify-Helios.ps1 + the four smoke
 │                             probes — the closest thing to an automated gate today
 ├── ci/ + .github/workflows ← the Windows graphics+compute bundle build
-├── vkd3d-proton-helios/    ← submodule, pinned at upstream 2c7ba22c, ZERO divergence.
+├── vkd3d-proton-helios/    ← submodule at 8ee4440b = upstream 2c7ba22c + 5 Helios commits
+│                             (7 files, all build plumbing: libs/d3d12core/{helios_entry.c,
+│                             debug_control.c,helios_vkd3d.def,meson.build,main.c} and
+│                             tests/test-runner.sh). ⛔ NOT zero divergence — that line was
+│                             stale from 2026-08-05 and cost a session's reasoning.
 │                             ⚠ its own 3 nested submodules are uninitialised — nothing
 │                             builds until `git submodule update --init --recursive` runs
 │                             inside it. The D3D12 engine; see docs/dx12/SUBSTRATE.md
