@@ -111,6 +111,24 @@ const BYTE kExpectA = 255;
 enum class Expect { Report, Ok };
 enum class Which { Helios, Warp };
 
+// `--sentinel` fills the readback buffer with this byte from the CPU BEFORE the
+// GPU work is recorded, and reports what survived.
+//
+// ⭐ It exists to split the one failure a plain readback cannot attribute. An
+// all-zero result has two completely different causes and the same appearance:
+//
+//   * the GPU work did not land   -> the buffer still holds what the CPU last
+//                                    wrote, i.e. the SENTINEL;
+//   * the second Map handed back memory that is not the buffer (a driver
+//     `pfnMapHeap` defect) -> the sentinel is GONE and the read is zeros,
+//                             because it is fresh, zeroed memory.
+//
+// One byte pattern separates them, and it needs no debugger, no host-side
+// capture and no second machine. ⚠ Off by default: it writes to a READBACK heap,
+// which is legal (the memory is CPU-accessible) but is not what the gate is
+// measuring, so the gate's arm must stay the plain one.
+const BYTE kSentinel = 0xAB;
+
 void print_hr(const char* what, HRESULT hr) {
     printf("%-38s hr=0x%08lX\n", what, static_cast<unsigned long>(hr));
 }
@@ -136,6 +154,7 @@ void release(T*& p) {
 int main(int argc, char** argv) {
     Expect expect = Expect::Report;
     Which which = Which::Helios;
+    bool sentinel = false;
 
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--expect") == 0 && i + 1 < argc) {
@@ -156,6 +175,8 @@ int main(int argc, char** argv) {
                 printf("FAIL: --adapter takes 'helios' or 'warp', got '%s'\n", argv[i]);
                 return 2;
             }
+        } else if (std::strcmp(argv[i], "--sentinel") == 0) {
+            sentinel = true;
         } else {
             printf("FAIL: unrecognised argument '%s'\n", argv[i]);
             return 2;
@@ -337,6 +358,23 @@ int main(int argc, char** argv) {
             break;
         }
 
+        // ---- optional: stamp the readback buffer from the CPU, before any GPU
+        // work exists to overwrite it. See `kSentinel`.
+        if (sentinel) {
+            void* pre = nullptr;
+            D3D12_RANGE none = {0, 0};
+            if (!step("Map(readback, pre-fill)", readback->Map(0, &none, &pre)) || !pre) {
+                break;
+            }
+            std::memset(pre, kSentinel, static_cast<size_t>(readback_bytes));
+            D3D12_RANGE all = {0, static_cast<SIZE_T>(readback_bytes)};
+            readback->Unmap(0, &all);
+            printf("%-38s wrote 0x%02X over %llu bytes\n",
+                   "sentinel pre-fill",
+                   kSentinel,
+                   static_cast<unsigned long long>(readback_bytes));
+        }
+
         D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtv_heap->GetCPUDescriptorHandleForHeapStart();
         printf("%-38s ptr=0x%016llX increment=%u\n",
                "RTV heap start",
@@ -421,6 +459,41 @@ int main(int argc, char** argv) {
         }
 
         const BYTE* base = static_cast<const BYTE*>(mapped);
+
+        // ⭐ The attribution, when `--sentinel` is on. Counted over the whole
+        // buffer so a partial copy is visible as a mixture rather than rounded to
+        // one of the two stories.
+        if (sentinel) {
+            UINT64 still_sentinel = 0;
+            UINT64 zeroed = 0;
+            UINT64 other = 0;
+            for (UINT64 i = 0; i < readback_bytes; ++i) {
+                if (base[i] == kSentinel) {
+                    ++still_sentinel;
+                } else if (base[i] == 0) {
+                    ++zeroed;
+                } else {
+                    ++other;
+                }
+            }
+            printf("\nsentinel survey: %llu still 0x%02X, %llu zeroed, %llu other (of %llu)\n",
+                   static_cast<unsigned long long>(still_sentinel), kSentinel,
+                   static_cast<unsigned long long>(zeroed),
+                   static_cast<unsigned long long>(other),
+                   static_cast<unsigned long long>(readback_bytes));
+            if (still_sentinel == readback_bytes) {
+                printf("  => the mapping is COHERENT and the GPU work did NOT land.\n");
+                printf("     Look at recording and submission, not at pfnMapHeap.\n");
+            } else if (zeroed == readback_bytes) {
+                printf("  => the second Map returned memory that is NOT the buffer the CPU\n");
+                printf("     wrote: the sentinel is gone and the read is fresh zeros. This is\n");
+                printf("     a pfnMapHeap / heap-identity defect, not a rendering one.\n");
+            } else if (other > 0) {
+                printf("  => mixed: some bytes are neither the sentinel nor zero, so real GPU\n");
+                printf("     output reached this buffer. A partial copy, not a dead path.\n");
+            }
+        }
+
         const BYTE* pixel0 = base;
         printf("\npixel(0,0)  = (%u, %u, %u, %u)\n", pixel0[0], pixel0[1], pixel0[2], pixel0[3]);
         printf("expected    = (%u, %u, %u, %u)\n", kExpectR, kExpectG, kExpectB, kExpectA);
