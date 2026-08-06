@@ -35,15 +35,20 @@
 //! # ⚠ What this lane cannot honour, and says so
 //!
 //! * **`pfnCopyTiles`** is behind `TiledResourcesTier`, which `caps12.rs`
-//!   reports `NOT_SUPPORTED`. Refused and counted, exactly as
-//!   `queue::update_tile_mappings` refuses its two — and, like it, deliberately
-//!   **not** raised through `pfnSetErrorCb`, because a hit means a caps
-//!   inconsistency elsewhere that removing the device would not fix.
+//!   reports `NOT_SUPPORTED`. Refused, counted **and reported**.
 //! * **`pfnAtomicCopyBufferRegion`** has an engine entry point,
 //!   `ID3D12GraphicsCommandList1::AtomicCopyBufferUINT`, and that entry point is
 //!   a **`FIXME` stub with an empty body** in this pinned vkd3d
 //!   (`vkd3d-proton-helios/libs/vkd3d/command.c:18021-18032`). Forwarding into
-//!   it would be fake success; it is refused and counted instead.
+//!   it would be fake success; it is refused, counted and reported instead.
+//!
+//! ⭐ **"Reported" means one list, not the device**, and that is what makes
+//! refusing these two affordable. Both were counted-but-silent while the only
+//! channel this file knew about was `pfnSetErrorCb`, whose answer is to remove
+//! the whole `ID3D12Device`; [`report_error`] now routes through
+//! `pfnSetCommandListErrorCb`, which quarantines the one list that recorded the
+//! call and lets the application learn at `Close()`. The full argument, and the
+//! false sentence it replaces, are in that function's doc.
 //!
 //! # ⭐ Where the copy DDI's shape came from
 //!
@@ -271,36 +276,73 @@ const MAX_BARRIERS: usize = 65_536;
 // The error channel
 // ---------------------------------------------------------------------------
 
-/// Report a device-scope failure from a command-list slot, counting the case
-/// where there is no way to hear it.
+/// Report a **command-list**-scope failure from a recording slot, counting the
+/// case where there is no way to hear it.
 ///
-/// ⭐ The command-list table's only error channel: all 75 of its slots take
-/// `D3D12DDI_HCOMMANDLIST` and nothing else and 74 of the 75 return `VOID`
-/// (`DECISIONS.md` §7.6), so a recording failure can only be reported through
-/// the device-scoped `pfnSetErrorCb`, reached through the `h_device` that
-/// `queue::CommandListState` exists to carry.
+/// # ⛔ This is `pfnSetCommandListErrorCb`, and the difference from
+/// `pfnSetErrorCb` is a compositor
+///
+/// An earlier revision of this function asserted that *"all 75 of its slots take
+/// `D3D12DDI_HCOMMANDLIST` and nothing else and 74 of the 75 return `VOID`, so a
+/// recording failure can only be reported through the device-scoped
+/// `pfnSetErrorCb`"*. The premise is true; the conclusion was **false**, and the
+/// `PARALLEL.md` §10 review settled it out of the header this tree ships.
+/// `pfnSetCommandListErrorCb` sits **one field below** `pfnSetErrorCb` in
+/// `D3D12DDI_CORELAYER_DEVICECALLBACKS_0062` — the same struct
+/// `queue::set_command_list_ddi_table` already reads `pfnSetCommandListDDITableCb`
+/// out of — and it takes the **runtime's** list handle,
+/// `D3D12DDI_HRTCOMMANDLIST`, which is why `queue::CommandListState` carries one
+/// beside `h_device`. `device12::set_command_list_error` holds the full
+/// argument and the callback's three-HRESULT contract.
+///
+/// What the choice buys, and what every policy decision in this file now rests
+/// on:
+///
+/// | callback | the runtime's response |
+/// |---|---|
+/// | `pfnSetErrorCb` | *"Removing device due to bad UMD error"* — the whole `ID3D12Device`, with every list, queue, PSO, heap and resource on it, and the compositor if the device is DWM's |
+/// | `pfnSetCommandListErrorCb` | *"the runtime will drop all calls into the driver which record commands on the specified command list"* (`tmp/dx12/specs/d3d/CPUEfficiency.md:2143-2158`) — one list is quarantined and the application learns at `Close()` |
+///
+/// ⇒ the second is D3D12's **existing** recording-error contract, not a stricter
+/// reading of the first. Answering a bad copy argument by removing the device
+/// was never the conservative choice; it was a different and much worse one.
+///
+/// ⚠ `device12::command_list_error_code` narrows the HRESULT to one of the three
+/// the callback accepts, so the `E_INVALIDARG` and `E_NOTIMPL` this file passes
+/// both arrive as `D3DDDIERR_APPLICATIONERROR`. The distinguishing detail is
+/// therefore **only** in the budgeted log line at the call site, which is why
+/// every reporting arm here has one.
+///
+/// ⚠ That last clause was FALSE when first written — `pfnCopyTiles` reported
+/// with no line at all, so its `D3DDDIERR_APPLICATIONERROR` reached the runtime
+/// carrying nothing a reader could attribute to a slot. It has one now. ⛔ The
+/// rule the near-miss establishes: an invariant asserted in a doc that nothing
+/// checks is a claim with a half-life, so a reporting arm added to this file
+/// must add its line in the same edit.
 ///
 /// ⚠ Its counters are **this lane's**. `cmdlist.rs::report_error`,
 /// `pso.rs::set_error_if_possible` and `descriptors.rs::report_error` are the
 /// same function against those lanes' sets, which is the established per-lane
 /// pattern (`PARALLEL.md` §9.1) rather than duplication to be folded away.
 ///
-/// ⚠ Reserved for real correctness failures: the runtime answers it by removing
-/// the device (*"Removing device due to bad UMD error"*, `DDI_REFERENCE.md`
-/// §9.12). A capability this driver does not advertise being asked for —
-/// `pfnCopyTiles`, `pfnAtomicCopyBufferRegion` — is **counted, not reported**.
+/// ⚠ **The threshold moved with the channel.** `pfnCopyTiles` and
+/// `pfnAtomicCopyBufferRegion` were counted-but-silent on the reasoning that
+/// *"removing the device would not fix a capability gap"* — true, and no longer
+/// the alternative. Both now report: a recording call that provably did not
+/// happen is exactly what a quarantined list is for, and silence there is the
+/// fake success CLAUDE.md forbids. See each slot's doc.
 ///
 /// # Safety
-/// `h_device` must be the handle `queue::CommandListState` recorded for a live
-/// list, i.e. one `device12::create_device` returned `S_OK` for.
-unsafe fn report_error(h_device: ddi12::D3D12DDI_HDEVICE, hr: Hresult) {
-    // SAFETY: the caller guarantees a live device handle; the borrow does not
-    // outlive this call.
-    let Some(dev) = (unsafe { device12::device(h_device) }) else {
+/// `state` must be the live list state the caller resolved for this DDI call.
+unsafe fn report_error(state: &CommandListState, hr: Hresult) {
+    // SAFETY: `h_device()` is the handle `create_command_list` recorded for this
+    // list, and the runtime cannot destroy a device while one of its lists is
+    // inside a recording DDI. The borrow does not outlive this call.
+    let Some(dev) = (unsafe { device12::device(state.h_device()) }) else {
         note_refusal(&L3C_REFUSALS.set_error_no_device);
         return;
     };
-    if !device12::set_error(dev, hr) {
+    if !device12::set_command_list_error(dev, state.h_rt_list(), hr) {
         note_refusal(&L3C_REFUSALS.set_error_cb_absent);
     }
 }
@@ -338,7 +380,26 @@ fn is_block_compressed(format: ddi12::DXGI_FORMAT) -> bool {
         || (DXGI_FORMAT_BC6H_TYPELESS.0..=DXGI_FORMAT_BC7_UNORM_SRGB.0).contains(&format)
 }
 
-/// Count a pitched layout whose `SlicePitch` cannot survive the translation.
+/// The factor between a dimension stated in **blocks** and the same dimension in
+/// **texels**, for `format`.
+///
+/// ⛔ `(4, 4, 1)` for the whole BC family and `(1, 1, 1)` for everything else,
+/// and that is exact rather than a convention. vkd3d's own format table gives a
+/// `block_width` / `block_height` of 4 to exactly **21** entries — BC1..BC7, the
+/// same 21 [`is_block_compressed`] classifies — and 1 to all 75 others
+/// (`vkd3d-proton-helios/libs/vkd3d/utils.c`, the `vkd3d_formats[]` rows). No
+/// DXGI format has a block depth above 1, which is why the third element is
+/// always 1 and the `Depth` field needs no scaling at all.
+fn block_extent(format: ddi12::DXGI_FORMAT) -> (u32, u32, u32) {
+    if is_block_compressed(format) {
+        (4, 4, 1)
+    } else {
+        (1, 1, 1)
+    }
+}
+
+/// Whether a pitched layout's `SlicePitch` survives the translation to
+/// `D3D12_SUBRESOURCE_FOOTPRINT`.
 ///
 /// ⛔ **Both DDI pitched layouts carry a `SlicePitch` and the API footprint has
 /// nowhere to put it.** `D3D12DDIARG_PHYSICAL_SUBRESOURCE_PITCHED_LAYOUT` ends
@@ -346,52 +407,53 @@ fn is_block_compressed(format: ddi12::DXGI_FORMAT) -> bool {
 /// `D3D12DDIARG_VIRTUAL_SUBRESOURCE_PITCHED_LAYOUT` likewise (28 and 32), while
 /// `D3D12_SUBRESOURCE_FOOTPRINT` is `{ Format, Width, Height, Depth, RowPitch }`
 /// and nothing else. So the field is **necessarily** dropped by
-/// [`texture_copy_location`], and D3D12 instead derives the distance between
-/// depth slices as `RowPitch * rows`. This is the reading that says whether that
-/// derivation ever disagreed with what the runtime actually sent.
+/// [`texture_copy_location`], and D3D12 derives the distance between depth
+/// slices instead. This is the test that says whether that derivation can
+/// reproduce what the runtime actually sent.
 ///
 /// ⭐ The comparison is `SlicePitch == Pitch * PhysicalHeight`, and it is
 /// **format-independent by construction**: all three are memory quantities —
-/// bytes per row, rows in memory, bytes per slice — so unlike the
-/// texel-vs-block question next door
-/// ([`L3cRefusals::copy_texture_block_physical_layout`]) it needs no block-size
-/// table and cannot be wrong about BC formats. Both structs carry
-/// `PhysicalHeight` / `PhysicalDepth`, including the virtual one, which is why
-/// one helper serves both arms.
+/// bytes per block row, block rows in memory, bytes per slice. It is also
+/// exactly the engine's own derivation, which is the reason it is the right
+/// comparison rather than a plausible one: `vk_buffer_image_copy_from_d3d12`
+/// computes `row_count = Footprint.Height / block_height` and strides by
+/// `row_count * RowPitch` (`libs/vkd3d/command.c:9631-9645`), and
+/// [`texture_copy_location`] writes `Footprint.Height = PhysicalHeight *
+/// block_height`, so `row_count` is `PhysicalHeight` for **every** format, BC or
+/// not. Both structs carry `PhysicalHeight` / `PhysicalDepth`, including the
+/// virtual one, which is why one helper serves both arms.
 ///
-/// ⚠ `PhysicalDepth <= 1` returns early: with a single slice there is no second
-/// offset for a slice pitch to move, so the field is unused rather than lost.
-/// That is what keeps this from firing on the 2-D traffic that is nearly all of
-/// it.
+/// ⚠ `PhysicalDepth <= 1` is representable by definition: with a single slice
+/// there is no second offset for a slice pitch to move, so the field is unused
+/// rather than lost. That is what keeps this from firing on the 2-D traffic that
+/// is nearly all of it.
 ///
-/// ⚠ Counted and logged, **not** reported. A divergence is an expressiveness gap
-/// in the API this driver forwards to, not a malformed call, and this host
-/// cannot yet say whether the runtime ever produces one — removing the device on
-/// an unmeasured case would be the guess, not the safe default. The log line
-/// prints both numbers so a VM run can settle it; see the counter's doc for what
-/// a hit obliges.
-fn note_slice_pitch(arm: &str, pitch: u32, physical_height: u32, physical_depth: u32, slice: u32) {
+/// ⚠ **A `false` now refuses the copy**, where an earlier revision counted it
+/// and forwarded anyway. That revision's stated reason was that *"removing the
+/// device on an unmeasured case would be the guess"* — which described
+/// `pfnSetErrorCb` and is no longer the alternative ([`report_error`]). The
+/// principle that separates this from the block-dimension question next door is
+/// **expressibility**: block dimensions are wrong but *computable*, so
+/// [`texture_copy_location`] corrects them; a divergent slice pitch has no field
+/// in `D3D12_SUBRESOURCE_FOOTPRINT` to carry it at all, so the only honest
+/// answers are refuse or corrupt slices >= 1. ⚠ The condition should be
+/// unreachable — the public `D3D12_PLACED_SUBRESOURCE_FOOTPRINT` the runtime
+/// itself computes has no slice pitch, so its layouts can only ever be
+/// `RowPitch * rows` — which is what makes refusing cheap; see
+/// [`L3cRefusals::copy_slice_pitch_unrepresentable`].
+fn slice_pitch_representable(
+    pitch: u32,
+    physical_height: u32,
+    physical_depth: u32,
+    slice: u32,
+) -> bool {
     if physical_depth <= 1 {
-        return;
+        return true;
     }
     // ⚠ `u64` on both sides: `Pitch * PhysicalHeight` overflows `u32` at a 64 KB
     // row and a 64 Ki-row surface, and a wrapped product would compare equal to
     // the wrong thing. No `as`, no panic.
-    if u64::from(slice) == u64::from(pitch) * u64::from(physical_height) {
-        return;
-    }
-    L3C_REFUSALS.copy_slice_pitch_unrepresentable.bump();
-    if let Some(n) = budget(&COPY_LOG) {
-        log_error!(
-            "CopyTextureRegion: {arm} pitched layout carries SlicePitch={slice} but \
-             Pitch={pitch} * PhysicalHeight={physical_height} is {}, and \
-             D3D12_SUBRESOURCE_FOOTPRINT has no slice-pitch member to carry the difference \
-             -- every depth slice after the first ({physical_depth} total) will be read at \
-             the derived offset (x{})",
-            u64::from(pitch) * u64::from(physical_height),
-            n + 1,
-        );
-    }
+    u64::from(slice) == u64::from(pitch) * u64::from(physical_height)
 }
 
 /// Resolve a `D3D12DDI_HRESOURCE` that the DDI requires to be present.
@@ -440,28 +502,63 @@ enum LocationRefusal {
     UnknownLayout(ddi12::D3D12DDI_RESOURCE_LAYOUT),
     /// `RL_SELECT_SUBRESOURCE` carried a subresource index above `UINT_MAX`.
     SubresourceOutOfRange(u64),
+    /// A `Physical*` block dimension times its block extent does not fit in the
+    /// `UINT` texel count `D3D12_SUBRESOURCE_FOOTPRINT` wants. ⚠ Unreachable for
+    /// any real texture — D3D12's maximum dimension is 16384 texels — so this
+    /// exists to keep the conversion total without a wrapping `as`.
+    BlockDimensionsOverflow,
+    /// A pitched layout's `SlicePitch` is not the `Pitch * PhysicalHeight` the
+    /// API footprint can express. Carries every number the log line needs,
+    /// because nothing downstream can recover them.
+    SlicePitchUnrepresentable {
+        arm: &'static str,
+        pitch: u32,
+        physical_height: u32,
+        physical_depth: u32,
+        slice: u32,
+    },
 }
 
 /// Build one API `D3D12_TEXTURE_COPY_LOCATION` out of the DDI's two arguments.
 ///
 /// See the module doc for where the `RL_SELECT_SUBRESOURCE` rule comes from.
 ///
-/// ⚠ **`RL_PLACED_PHYSICAL_SUBRESOURCE_PITCHED` forwards its dimensions
-/// unchanged, and that is the minimal-assumption transform rather than a proved
-/// one.** The header labels those three fields *"Block dimensions"*
-/// (`d3d12umddi.h:1549-1551`) while `D3D12_SUBRESOURCE_FOOTPRINT::Width` is in
-/// texels — a distinction that only exists for block-compressed formats, where
-/// the two differ by four. Identity is correct for every other format and is
-/// correct for those too if the comment is describing the field's *provenance*
-/// rather than its units. It cannot be settled on the Linux host, so it is
-/// instrumented instead: [`L3cRefusals::copy_texture_block_physical_layout`]
-/// fires exactly on the case where the two readings disagree.
+/// # ⛔ `RL_PLACED_PHYSICAL_SUBRESOURCE_PITCHED` converts BLOCKS to TEXELS
+///
+/// An earlier revision forwarded `Physical{Width,Height,Depth}` into
+/// `D3D12_SUBRESOURCE_FOOTPRINT::{Width,Height,Depth}` unchanged and called the
+/// units unsettleable on the Linux host. **The SDK header in this tree settles
+/// them, against that choice.** `D3D12DDIARG_VIRTUAL_SUBRESOURCE_PITCHED_LAYOUT`
+/// carries **both** triples in one struct (`d3d12umddi.h:1556-1568`) with
+/// `// Block dimensions` on the `Physical*` one only — so `Physical*` cannot be
+/// texels without making `Virtual*` a duplicate field — while
+/// `D3D12_SUBRESOURCE_FOOTPRINT` is in texels. The VIRTUAL arm below already
+/// acted on that reading; the two arms could not both be right.
+///
+/// The engine confirms it independently: `vk_buffer_image_copy_from_d3d12`
+/// divides `Footprint.Height` by `src_format->block_height`
+/// (`libs/vkd3d/command.c:9631-9645`) and clamps `imageExtent` against
+/// `Footprint.{Width,Height,Depth}` as texel extents. A 64x64 BC7 subresource
+/// arriving as 16x16 blocks therefore became `row_count = 4` against a 16-texel
+/// extent — a quarter of the rows copied into a sixteenth of the area, success
+/// returned, frame wrong.
+///
+/// ⭐ So the three fields are multiplied by [`block_extent`] — 4x4x1 for every BC
+/// format, 1x1x1 otherwise. ⚠ For a texture whose texel size is not a multiple
+/// of the block size the product **over-states** the extent (a 65-texel-wide BC7
+/// mip is 17 blocks, i.e. 68), and that is harmless rather than tolerated: the
+/// engine takes `min(subresource extent, Footprint.Width)`, so the true 65 wins,
+/// while the row arithmetic that actually needs the number — `row_count =
+/// 68 / 4 = 17` — gets exactly the 17 block rows the memory holds. The
+/// unmultiplied value got neither right.
 ///
 /// ⚠ **`SlicePitch` is dropped by both pitched arms**, and that one is forced
 /// rather than chosen: `D3D12_SUBRESOURCE_FOOTPRINT` has no member for it, so
-/// D3D12 derives the distance between depth slices from `RowPitch`. It is only
-/// *lossy* where the runtime's value and that derivation disagree, which
-/// [`note_slice_pitch`] measures on every pitched location, on both arms.
+/// D3D12 derives the distance between depth slices from `RowPitch`. Where the
+/// runtime's value and that derivation disagree the layout is **not
+/// expressible**, and the location is refused rather than forwarded — see
+/// [`slice_pitch_representable`] for why that is the opposite answer from the
+/// block-dimension one and why both are right.
 ///
 /// # Safety
 /// `placement` must be non-null and point at a live `D3D12DDIARG_BUFFER_PLACEMENT`,
@@ -504,30 +601,38 @@ unsafe fn texture_copy_location(
                     .pLayout
                     .cast::<ddi12::D3D12DDIARG_PHYSICAL_SUBRESOURCE_PITCHED_LAYOUT>()
             };
-            if is_block_compressed(l.Format) {
+            // ⛔ Blocks -> texels; see this function's doc for the header
+            // pairing that settles the units and the engine arithmetic that
+            // confirms them. ⚠ `Pitch` is NOT scaled: it is bytes per block row
+            // on both sides, which is what `D3D12_SUBRESOURCE_FOOTPRINT::RowPitch`
+            // means for a BC format.
+            let (bw, bh, bd) = block_extent(l.Format);
+            // ⚠ Counted off the extent rather than off `is_block_compressed`, so
+            // the counter means exactly "a scaling happened here" and cannot
+            // drift from the arithmetic below it.
+            if (bw, bh, bd) != (1, 1, 1) {
                 L3C_REFUSALS.copy_texture_block_physical_layout.bump();
-                if let Some(n) = budget(&COPY_LOG) {
-                    log_error!(
-                        "CopyTextureRegion: PHYSICAL pitched layout on block-compressed DXGI \
-                         format {} -- forwarding {}x{}x{} pitch={} unchanged, but the header \
-                         calls these block dimensions and D3D12_SUBRESOURCE_FOOTPRINT wants \
-                         texels; settle this on the VM before trusting BC texture copies (x{})",
-                        l.Format,
-                        l.PhysicalWidth,
-                        l.PhysicalHeight,
-                        l.PhysicalDepth,
-                        l.Pitch,
-                        n + 1,
-                    );
-                }
             }
-            note_slice_pitch(
-                "PHYSICAL",
-                l.Pitch,
-                l.PhysicalHeight,
-                l.PhysicalDepth,
-                l.SlicePitch,
-            );
+            // ⚠ `checked_mul`, not `as` and not `saturating_mul`: a saturated
+            // extent would be a silently wrong footprint, which is the class of
+            // bug this whole arm was just repaired for.
+            let (Some(width), Some(height), Some(depth)) = (
+                l.PhysicalWidth.checked_mul(bw),
+                l.PhysicalHeight.checked_mul(bh),
+                l.PhysicalDepth.checked_mul(bd),
+            ) else {
+                return Err(LocationRefusal::BlockDimensionsOverflow);
+            };
+            if !slice_pitch_representable(l.Pitch, l.PhysicalHeight, l.PhysicalDepth, l.SlicePitch)
+            {
+                return Err(LocationRefusal::SlicePitchUnrepresentable {
+                    arm: "PHYSICAL",
+                    pitch: l.Pitch,
+                    physical_height: l.PhysicalHeight,
+                    physical_depth: l.PhysicalDepth,
+                    slice: l.SlicePitch,
+                });
+            }
             Ok(D3D12_TEXTURE_COPY_LOCATION {
                 pResource: borrowed(resource),
                 Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
@@ -536,9 +641,9 @@ unsafe fn texture_copy_location(
                         Offset: base.Offset,
                         Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
                             Format: DXGI_FORMAT(l.Format),
-                            Width: l.PhysicalWidth,
-                            Height: l.PhysicalHeight,
-                            Depth: l.PhysicalDepth,
+                            Width: width,
+                            Height: height,
+                            Depth: depth,
                             RowPitch: l.Pitch,
                         },
                     },
@@ -557,18 +662,25 @@ unsafe fn texture_copy_location(
                     .cast::<ddi12::D3D12DDIARG_VIRTUAL_SUBRESOURCE_PITCHED_LAYOUT>()
             };
             // ⭐ The virtual dimensions, not the physical ones: the API's
-            // footprint is in texels and this arm is the one that states them.
-            // ⚠ The `Physical*` triple this struct ALSO carries is therefore
-            // dropped on purpose, and the only piece of it that can move data
-            // is its interaction with `SlicePitch`, which is what the call below
-            // measures.
-            note_slice_pitch(
-                "VIRTUAL",
-                l.Pitch,
-                l.PhysicalHeight,
-                l.PhysicalDepth,
-                l.SlicePitch,
-            );
+            // footprint is in texels, and this struct carrying BOTH triples —
+            // `Virtual*` unlabelled, `Physical*` labelled "Block dimensions"
+            // (`d3d12umddi.h:1556-1568`) — is precisely what says which is
+            // which. That same pairing is what the PHYSICAL arm above now
+            // converts on; no scaling is needed here because `Virtual*` is
+            // already the texel triple.
+            // ⚠ The `Physical*` triple is therefore dropped on purpose, and the
+            // only piece of it that can move data is its interaction with
+            // `SlicePitch`, which is what the test below settles.
+            if !slice_pitch_representable(l.Pitch, l.PhysicalHeight, l.PhysicalDepth, l.SlicePitch)
+            {
+                return Err(LocationRefusal::SlicePitchUnrepresentable {
+                    arm: "VIRTUAL",
+                    pitch: l.Pitch,
+                    physical_height: l.PhysicalHeight,
+                    physical_depth: l.PhysicalDepth,
+                    slice: l.SlicePitch,
+                });
+            }
             Ok(D3D12_TEXTURE_COPY_LOCATION {
                 pResource: borrowed(resource),
                 Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
@@ -612,6 +724,28 @@ unsafe fn refuse_location(state: &CommandListState, role: &str, why: &LocationRe
             &L3C_REFUSALS.copy_bad_arg,
             format!("RL_SELECT_SUBRESOURCE carries Offset {o}, which is not a subresource index"),
         ),
+        LocationRefusal::BlockDimensionsOverflow => (
+            &L3C_REFUSALS.copy_bad_arg,
+            "a PHYSICAL pitched layout's block dimensions do not fit in a UINT texel count \
+             once multiplied by the format's block extent"
+                .to_string(),
+        ),
+        LocationRefusal::SlicePitchUnrepresentable {
+            arm,
+            pitch,
+            physical_height,
+            physical_depth,
+            slice,
+        } => (
+            &L3C_REFUSALS.copy_slice_pitch_unrepresentable,
+            format!(
+                "the {arm} pitched layout carries SlicePitch={slice} but Pitch={pitch} * \
+                 PhysicalHeight={physical_height} is {}, and D3D12_SUBRESOURCE_FOOTPRINT has no \
+                 slice-pitch member to carry the difference -- every one of the {physical_depth} \
+                 depth slices after the first would be read at the derived offset",
+                u64::from(*pitch) * u64::from(*physical_height),
+            ),
+        ),
     };
     counter.bump();
     if let Some(n) = budget(&COPY_LOG) {
@@ -620,9 +754,8 @@ unsafe fn refuse_location(state: &CommandListState, role: &str, why: &LocationRe
             n + 1
         );
     }
-    // SAFETY: `h_device()` is the handle `create_command_list` recorded for this
-    // list, so it is a live device handle.
-    unsafe { report_error(state.h_device(), E_INVALIDARG) };
+    // SAFETY: `state` is the live list state the caller resolved for this call.
+    unsafe { report_error(state, E_INVALIDARG) };
 }
 
 // ---------------------------------------------------------------------------
@@ -664,8 +797,8 @@ unsafe extern "C" fn copy_texture_region(
                 n + 1,
             );
         }
-        // SAFETY: a live device handle, per `CommandListState`'s contract.
-        unsafe { report_error(state.h_device(), E_INVALIDARG) };
+        // SAFETY: `state` is the live list state this call resolved.
+        unsafe { report_error(state, E_INVALIDARG) };
         return;
     }
 
@@ -704,8 +837,8 @@ unsafe extern "C" fn copy_texture_region(
                         n + 1,
                     );
                 }
-                // SAFETY: a live device handle, as above.
-                unsafe { report_error(state.h_device(), E_INVALIDARG) };
+                // SAFETY: `state` is the live list state resolved above.
+                unsafe { report_error(state, E_INVALIDARG) };
                 return;
             }
         }
@@ -760,8 +893,8 @@ unsafe extern "C" fn resource_copy(
                 n + 1,
             );
         }
-        // SAFETY: a live device handle, per `CommandListState`'s contract.
-        unsafe { report_error(state.h_device(), E_INVALIDARG) };
+        // SAFETY: `state` is the live list state this call resolved.
+        unsafe { report_error(state, E_INVALIDARG) };
         return;
     };
     trace_line!(
@@ -778,12 +911,20 @@ unsafe extern "C" fn resource_copy(
 ///
 /// ⛔ This driver reports `TiledResourcesTier = NOT_SUPPORTED`
 /// (`caps12.rs:278`), so no tiled resource can exist for this DDI to copy
-/// through. Refusing is the coherent answer, and it is the same shape
-/// `queue::update_tile_mappings` takes for the same reason: counted, and
-/// deliberately **not** raised through `pfnSetErrorCb`, because a hit means a
-/// caps inconsistency somewhere else and removing the device would not fix it.
-/// ⚠ No log line either: the counter is the readout, and this DDI is per-region
-/// traffic that a budgeted line would only half cover.
+/// through. Refusing is the coherent answer.
+///
+/// ⭐ **And it is now reported, which it was not.** The earlier revision counted
+/// this silently, reasoning that *"a hit means a caps inconsistency somewhere
+/// else and removing the device would not fix it"*. The first half stands; the
+/// second described `pfnSetErrorCb`, which is no longer the channel — see
+/// [`report_error`]. Whoever's fault the call is, the tile copy **did not
+/// happen**, and a `VOID` return that says nothing is the fake success CLAUDE.md
+/// forbids. Quarantining the one list that recorded it is the proportionate
+/// answer and hands the application a failing `Close()`.
+///
+/// ⚠ Still no log line: the counter plus the summary `note_refusal` emits on its
+/// first hit is the readout, and this DDI is per-region traffic that a budgeted
+/// line would only half cover.
 ///
 /// ⚠ **`DX12.md` §4.4 makes `TiledResourcesTier >= 2` a feature-level 12_1
 /// floor**, and it lands with this slot plus `pfnUpdateTileMappings`,
@@ -794,9 +935,10 @@ unsafe extern "C" fn resource_copy(
 /// the feature level as if the KMD were on its critical path.
 ///
 /// # Safety
-/// The arguments are the runtime's and this body reads none of them.
+/// `h_list` must be a live handle from `queue::create_command_list`; the
+/// remaining arguments are the runtime's and this body reads none of them.
 unsafe extern "C" fn copy_tiles(
-    _h_list: ddi12::D3D12DDI_HCOMMANDLIST,
+    h_list: ddi12::D3D12DDI_HCOMMANDLIST,
     _h_resource: ddi12::D3D12DDI_HRESOURCE,
     _region_start_coord: *const ddi12::D3D12DDI_TILED_RESOURCE_COORDINATE,
     _region_size: *const ddi12::D3D12DDI_TILE_REGION_SIZE,
@@ -804,7 +946,29 @@ unsafe extern "C" fn copy_tiles(
     _buffer_start_offset_in_bytes: ddi12::UINT64,
     _flags: ddi12::D3D12DDI_TILE_COPY_FLAGS,
 ) {
-    note_refusal(&L3C_REFUSALS.copy_tiles_refused);
+    L3C_REFUSALS.copy_tiles_refused.bump();
+    // ⛔ A budgeted line, and it is not decoration: `report_error` narrows every
+    // HRESULT this file passes to `D3DDDIERR_APPLICATIONERROR`, so the log line
+    // at the call site is the ONLY place the reason survives. This slot was the
+    // one reporting arm in the file without one, which made `report_error`'s own
+    // doc — *"every reporting arm here has one"* — false.
+    //
+    // ⚠ `bump`, not `note_refusal`, now that the line exists: R911, an
+    // already-loud arm must not also print the whole refusal set.
+    if let Some(n) = budget(&COPY_LOG) {
+        log_error!(
+            "CopyTiles: refused -- this driver reports TiledResourcesTier = NOT_SUPPORTED, so no \
+             tiled resource can exist for this DDI to copy (x{})",
+            n + 1,
+        );
+    }
+    // SAFETY: the caller guarantees a live handle from `create_command_list`.
+    let Some(state) = (unsafe { queue::command_list_state(h_list) }) else {
+        note_refusal(&L3C_REFUSALS.command_list_missing);
+        return;
+    };
+    // SAFETY: `state` is the live list state resolved above.
+    unsafe { report_error(state, E_INVALIDARG) };
 }
 
 /// The two buffer-region slots' shared body: resolve both placements, then hand
@@ -841,8 +1005,8 @@ unsafe fn buffer_region(
                 n + 1,
             );
         }
-        // SAFETY: a live device handle, per `CommandListState`'s contract.
-        unsafe { report_error(state.h_device(), E_INVALIDARG) };
+        // SAFETY: `state` is the live list state this call resolved.
+        unsafe { report_error(state, E_INVALIDARG) };
         return;
     };
     op(state, dst_res, dst_base.Offset, src_res, src_base.Offset);
@@ -907,14 +1071,20 @@ unsafe extern "C" fn copy_buffer_region(
 /// no UINT-vs-UINT64 selector (only `SrcBytes`, which would have to be *read as*
 /// one).
 ///
-/// ⚠ Counted, **not** reported through `pfnSetErrorCb`: this is a capability
-/// this stack does not have rather than a malformed call, and removing the
-/// device would not fix it.
+/// ⭐ **Counted, logged AND reported.** The earlier revision stopped at counted,
+/// on the reasoning that *"this is a capability this stack does not have rather
+/// than a malformed call, and removing the device would not fix it"* — which
+/// described `pfnSetErrorCb`, no longer the channel ([`report_error`]). This is
+/// the sharpest case in the file for reporting: the engine's body is empty, so
+/// the atomic copy provably did **not** happen, and a silent `VOID` return
+/// leaves the application reading whatever was in the destination before. One
+/// quarantined list and a failing `Close()` is the honest answer.
 ///
 /// # Safety
-/// The arguments are the runtime's and this body reads none of them.
+/// `h_list` must be a live handle from `queue::create_command_list`; the
+/// remaining arguments are the runtime's and this body reads none of them.
 unsafe extern "C" fn atomic_copy_buffer_region(
-    _h_list: ddi12::D3D12DDI_HCOMMANDLIST,
+    h_list: ddi12::D3D12DDI_HCOMMANDLIST,
     _dst: ddi12::D3D12DDIARG_BUFFER_PLACEMENT,
     _src: ddi12::D3D12DDIARG_BUFFER_PLACEMENT,
     _src_bytes: ddi12::UINT64,
@@ -932,6 +1102,13 @@ unsafe extern "C" fn atomic_copy_buffer_region(
             n + 1,
         );
     }
+    // SAFETY: the caller guarantees a live handle from `create_command_list`.
+    let Some(state) = (unsafe { queue::command_list_state(h_list) }) else {
+        note_refusal(&L3C_REFUSALS.command_list_missing);
+        return;
+    };
+    // SAFETY: `state` is the live list state resolved above.
+    unsafe { report_error(state, E_INVALIDARG) };
 }
 
 /// `pfnResourceResolveSubresource` -> `ID3D12GraphicsCommandList::ResolveSubresource`.
@@ -965,8 +1142,8 @@ unsafe extern "C" fn resource_resolve_subresource(
                 n + 1,
             );
         }
-        // SAFETY: a live device handle, per `CommandListState`'s contract.
-        unsafe { report_error(state.h_device(), E_INVALIDARG) };
+        // SAFETY: `state` is the live list state this call resolved.
+        unsafe { report_error(state, E_INVALIDARG) };
         return;
     };
     trace_line!(
@@ -1051,8 +1228,8 @@ unsafe extern "C" fn resource_resolve_subresource_region(
                 n + 1,
             );
         }
-        // SAFETY: a live device handle, per `CommandListState`'s contract.
-        unsafe { report_error(state.h_device(), E_INVALIDARG) };
+        // SAFETY: `state` is the live list state this call resolved.
+        unsafe { report_error(state, E_INVALIDARG) };
         return;
     };
     // SAFETY: the runtime handed both handles in this call, so both are live.
@@ -1068,8 +1245,8 @@ unsafe extern "C" fn resource_resolve_subresource_region(
                 n + 1,
             );
         }
-        // SAFETY: a live device handle, as above.
-        unsafe { report_error(state.h_device(), E_INVALIDARG) };
+        // SAFETY: `state` is the live list state resolved above.
+        unsafe { report_error(state, E_INVALIDARG) };
         return;
     };
 
@@ -1102,8 +1279,8 @@ unsafe extern "C" fn resource_resolve_subresource_region(
                     n + 1,
                 );
             }
-            // SAFETY: a live device handle, as above.
-            unsafe { report_error(state.h_device(), E_NOTIMPL) };
+            // SAFETY: `state` is the live list state resolved above.
+            unsafe { report_error(state, E_NOTIMPL) };
             return;
         }
     };
@@ -1165,8 +1342,8 @@ unsafe fn barrier_array_len(
                 k + 1
             );
         }
-        // SAFETY: a live device handle, per `CommandListState`'s contract.
-        unsafe { report_error(state.h_device(), E_INVALIDARG) };
+        // SAFETY: `state` is the live list state this call resolved.
+        unsafe { report_error(state, E_INVALIDARG) };
         return None;
     }
     Some(n)
@@ -1218,13 +1395,17 @@ unsafe fn barrier_array_len(
 ///
 /// An element this lane cannot lower — an unresolvable `D3D12DDI_HRESOURCE`, or
 /// a `Type` this header does not name — is skipped so the **rest of the call
-/// still reaches the engine**, and then `pfnSetErrorCb` is raised **once, after**
-/// the surviving barriers are recorded. Both halves are load-bearing:
+/// still reaches the engine**, and then a command-list error is raised **once,
+/// after** the surviving barriers are recorded. Both halves are load-bearing:
 ///
 /// * Reporting does not abort anything. `report_error` returns `()` and only
-///   calls `device12::set_error`, so "issue the survivors" and "tell the
-///   runtime" were never alternatives — an earlier revision of this file
-///   justified staying silent with that trade, and the trade does not exist.
+///   calls `device12::set_command_list_error`, so "issue the survivors" and
+///   "tell the runtime" were never alternatives — an earlier revision of this
+///   file justified staying silent with that trade, and the trade does not
+///   exist. ⚠ *After* also matters on its own terms now: the runtime drops
+///   further **recording DDIs** on a list once it has been told, so a report
+///   raised mid-loop would be a report against a list the runtime is entitled
+///   to stop feeding.
 /// * The condition is the same one every other slot in this file answers with
 ///   `E_INVALIDARG` (`resource_copy`, `buffer_region`, both resolves,
 ///   `resolve_query_data`, `set_predication`). A barrier is the **more**
@@ -1400,8 +1581,8 @@ unsafe extern "C" fn resource_barrier(
     }
     if dropped != 0 {
         // ⛔ After the survivors, once for the call. See the slot doc.
-        // SAFETY: a live device handle, per `CommandListState`'s contract.
-        unsafe { report_error(state.h_device(), E_INVALIDARG) };
+        // SAFETY: `state` is the live list state this call resolved.
+        unsafe { report_error(state, E_INVALIDARG) };
     }
 }
 
@@ -1732,11 +1913,11 @@ unsafe extern "C" fn barrier(
                     );
                 }
                 // ⚠ Returns here rather than falling through to the `dropped`
-                // report below: the device is already being removed for this
-                // call, and a second `pfnSetErrorCb` would only double-count one
-                // event.
-                // SAFETY: a live device handle, per `CommandListState`'s contract.
-                unsafe { report_error(state.h_device(), E_NOTIMPL) };
+                // report below: this list is already being quarantined for this
+                // call, and a second `pfnSetCommandListErrorCb` on the same
+                // handle would only double-count one event.
+                // SAFETY: `state` is the live list state this call resolved.
+                unsafe { report_error(state, E_NOTIMPL) };
                 return;
             }
         };
@@ -1754,8 +1935,8 @@ unsafe extern "C" fn barrier(
     }
     if dropped != 0 {
         // ⛔ After the survivors, once for the call. See [`resource_barrier`].
-        // SAFETY: a live device handle, per `CommandListState`'s contract.
-        unsafe { report_error(state.h_device(), E_INVALIDARG) };
+        // SAFETY: `state` is the live list state this call resolved.
+        unsafe { report_error(state, E_INVALIDARG) };
     }
 }
 
@@ -1848,8 +2029,8 @@ unsafe fn query_edge(
                 n + 1,
             );
         }
-        // SAFETY: a live device handle, per `CommandListState`'s contract.
-        unsafe { report_error(state.h_device(), E_INVALIDARG) };
+        // SAFETY: `state` is the live list state this call resolved.
+        unsafe { report_error(state, E_INVALIDARG) };
         return;
     };
     let Some(api_type) = api_query_type(query_type) else {
@@ -1860,8 +2041,8 @@ unsafe fn query_edge(
                 n + 1,
             );
         }
-        // SAFETY: a live device handle, as above.
-        unsafe { report_error(state.h_device(), E_INVALIDARG) };
+        // SAFETY: `state` is the live list state resolved above.
+        unsafe { report_error(state, E_INVALIDARG) };
         return;
     };
     trace_line!("{name}: type={query_type} index={index}");
@@ -1936,8 +2117,8 @@ unsafe extern "C" fn resolve_query_data(
                 n + 1,
             );
         }
-        // SAFETY: a live device handle, per `CommandListState`'s contract.
-        unsafe { report_error(state.h_device(), E_INVALIDARG) };
+        // SAFETY: `state` is the live list state this call resolved.
+        unsafe { report_error(state, E_INVALIDARG) };
         return;
     };
     let Some(api_type) = api_query_type(query_type) else {
@@ -1949,8 +2130,8 @@ unsafe extern "C" fn resolve_query_data(
                 n + 1,
             );
         }
-        // SAFETY: a live device handle, as above.
-        unsafe { report_error(state.h_device(), E_INVALIDARG) };
+        // SAFETY: `state` is the live list state resolved above.
+        unsafe { report_error(state, E_INVALIDARG) };
         return;
     };
     // SAFETY: the runtime handed this handle in this call, so it is live.
@@ -1963,8 +2144,8 @@ unsafe extern "C" fn resolve_query_data(
                 n + 1,
             );
         }
-        // SAFETY: a live device handle, as above.
-        unsafe { report_error(state.h_device(), E_INVALIDARG) };
+        // SAFETY: `state` is the live list state resolved above.
+        unsafe { report_error(state, E_INVALIDARG) };
         return;
     };
     trace_line!(
@@ -2031,8 +2212,8 @@ unsafe extern "C" fn set_predication(
                     n + 1,
                 );
             }
-            // SAFETY: a live device handle, per `CommandListState`'s contract.
-            unsafe { report_error(state.h_device(), E_INVALIDARG) };
+            // SAFETY: `state` is the live list state this call resolved.
+            unsafe { report_error(state, E_INVALIDARG) };
             return;
         }
     };
@@ -2052,8 +2233,8 @@ unsafe extern "C" fn set_predication(
                         n + 1,
                     );
                 }
-                // SAFETY: a live device handle, as above.
-                unsafe { report_error(state.h_device(), E_INVALIDARG) };
+                // SAFETY: `state` is the live list state resolved above.
+                unsafe { report_error(state, E_INVALIDARG) };
                 return;
             }
         }
@@ -2117,15 +2298,22 @@ pub(crate) struct L3cRefusals {
     /// live `queue::CommandListState`. **Expected 0** — the runtime only records
     /// into a list `pfnCreateCommandList` returned `S_OK` for.
     ///
-    /// ⚠ Deliberately **not** reported through `pfnSetErrorCb`: with no state
-    /// there is no `h_device` to report against, which is the one failure this
-    /// table cannot escalate. Tracks `cmdlist.rs`'s counter of the same name in
-    /// the other lane's set.
+    /// ⚠ Deliberately **not** reported: with no state there is neither an
+    /// `h_device` to resolve the callbacks through nor an
+    /// `D3D12DDI_HRTCOMMANDLIST` to name the list, so this is the one failure
+    /// this table cannot escalate by either channel. Tracks `cmdlist.rs`'s
+    /// counter of the same name in the other lane's set.
     command_list_missing: RefusalCounter,
-    /// A copy slot arrived with a null pointer the DDI declares `_In_ CONST`, or
-    /// with an `RL_SELECT_SUBRESOURCE` `Offset` that is not a subresource index.
-    /// **Expected 0**; reported, because a copy that cannot be expressed is a
-    /// correctness failure rather than an unsupported capability.
+    /// A copy slot arrived with a null pointer the DDI declares `_In_ CONST`,
+    /// with an `RL_SELECT_SUBRESOURCE` `Offset` that is not a subresource index,
+    /// or with a `Physical*` triple that does not fit a `UINT` texel count once
+    /// multiplied by the format's block extent. **Expected 0**; reported,
+    /// because a copy that cannot be expressed is a correctness failure rather
+    /// than an unsupported capability.
+    ///
+    /// ⚠ The third condition is defensive only — D3D12's maximum texture
+    /// dimension is 16384 texels, so no legal layout can reach it. It exists so
+    /// [`block_extent`]'s multiplication is total without a wrapping `as`.
     copy_bad_arg: RefusalCounter,
     /// A `D3D12DDI_HRESOURCE` in a copy, resolve or buffer-region slot did not
     /// resolve to an `ID3D12Resource`. **Expected 0.**
@@ -2144,39 +2332,54 @@ pub(crate) struct L3cRefusals {
     /// runtime's own box is unsigned, so a negative here means the `LONG`s were
     /// not written by a `D3D12_BOX`.
     copy_box_negative: RefusalCounter,
-    /// ⛔ **The one named UNVERIFIED in this lane.**
+    /// A **traffic** counter, not a refusal:
     /// `RL_PLACED_PHYSICAL_SUBRESOURCE_PITCHED` arrived carrying a
-    /// block-compressed `DXGI_FORMAT`, and its dimensions were forwarded into
-    /// `D3D12_SUBRESOURCE_FOOTPRINT` unchanged.
+    /// block-compressed `DXGI_FORMAT`, and its `Physical*` block dimensions were
+    /// converted to the texels `D3D12_SUBRESOURCE_FOOTPRINT` wants.
     ///
-    /// **Expected 0**, and a hit is *work*, not a failure: it is the only case
-    /// where the header's *"Block dimensions"* label
-    /// (`d3d12umddi.h:1549-1551`) and the API footprint's texel units can
-    /// disagree, and a factor-of-four difference in a BC texture copy is silent
-    /// corruption in either direction. The log line prints the exact dimensions
-    /// so a VM run can settle it by comparing them against the source texture.
-    /// ⚠ Every non-block format makes the two readings the same number, so a
-    /// zero reading here does **not** mean the arm was never taken.
+    /// ⚠ **Re-graded, and the grading is the whole point.** It read *"Expected
+    /// 0, and a hit is work"* while this arm forwarded block dimensions raw and
+    /// called the units unsettleable. The `PARALLEL.md` §10 review settled them
+    /// out of `d3d12umddi.h:1556-1568`, where
+    /// `D3D12DDIARG_VIRTUAL_SUBRESOURCE_PITCHED_LAYOUT` carries the `Virtual*`
+    /// and `Physical*` triples side by side with `// Block dimensions` on the
+    /// second only. ⇒ **Expected NON-ZERO on any workload that copies BC
+    /// textures**, which is nearly all of them, and it is now the readout that
+    /// says the conversion path ran rather than a defect waiting to be graded.
+    ///
+    /// ⛔ A **zero** on a workload known to stream BC textures is the finding
+    /// now: either those copies take the VIRTUAL arm — legitimate, that arm
+    /// needs no conversion — or they are not reaching this slot at all.
+    /// ⚠ Every non-block format leaves the two readings equal, so a zero says
+    /// nothing about whether the arm itself was taken; read it with
+    /// `L3cCopyBadArg`.
+    ///
+    /// ⚠ Its log line was deleted with the re-grade. It existed to carry the
+    /// dimensions to a VM run that would settle the units; the units are
+    /// settled, and a per-BC-copy line would be pure noise.
     copy_texture_block_physical_layout: RefusalCounter,
-    /// ⛔ **The second named UNVERIFIED in this lane, and the sibling of the one
-    /// above.** A pitched copy location arrived with `PhysicalDepth > 1` and a
-    /// `SlicePitch` that is not `Pitch * PhysicalHeight`, and the field was
-    /// dropped because `D3D12_SUBRESOURCE_FOOTPRINT` has no member for it.
+    /// A pitched copy location arrived with `PhysicalDepth > 1` and a
+    /// `SlicePitch` that is not `Pitch * PhysicalHeight`, and **the copy was
+    /// refused**: `D3D12_SUBRESOURCE_FOOTPRINT` has no member that could carry
+    /// the difference.
     ///
-    /// **Expected 0**, and a hit is *work*: every depth slice at index >= 1 is
-    /// then read at the derived offset instead of the stated one, which is a
-    /// wrong 3-D / array texture copy with no other symptom. ⚠ Unlike its
-    /// sibling this reading is exact rather than conservative — the comparison
-    /// is between three memory quantities and needs no format knowledge (see
-    /// [`note_slice_pitch`]) — so a zero really does mean the runtime never
-    /// diverged on this workload.
+    /// **Expected 0**, and unlike its neighbour above this grading survived the
+    /// review unchanged — what changed is the **answer**. It used to forward the
+    /// copy anyway, and its own doc conceded that *"silent forwarding is the one
+    /// answer that is only acceptable while this reads 0"*; the reason given for
+    /// forwarding was that reporting would remove the device, which is no longer
+    /// the channel ([`report_error`]). It now refuses and reports, quarantining
+    /// one list.
     ///
-    /// ⚠ What a hit obliges, in order: log the two numbers from the line, decide
-    /// on the VM whether the runtime's `SlicePitch` or the API's derivation is
-    /// authoritative, and then either honour it (which the API cannot express,
-    /// so the copy would have to be split per slice) or refuse the copy. Silent
-    /// forwarding, which is what happens today, is the one answer that is only
-    /// acceptable while this reads 0.
+    /// ⛔ Refusing is cheap precisely because the condition should be
+    /// unreachable: the public `D3D12_PLACED_SUBRESOURCE_FOOTPRINT` the runtime
+    /// computes for itself has no slice-pitch member, so any layout it derives
+    /// can only be `RowPitch * rows`. A hit is therefore a **finding about the
+    /// runtime**, and the log line at `refuse_location` prints all four numbers.
+    /// ⚠ The reading is exact rather than conservative — the comparison is
+    /// between three memory quantities and needs no format knowledge (see
+    /// [`slice_pitch_representable`]) — so a zero really does mean the runtime
+    /// never diverged on this workload.
     copy_slice_pitch_unrepresentable: RefusalCounter,
     /// `pfnCopyTiles` was called and refused. **Expected 0** while `caps12.rs`
     /// reports `TiledResourcesTier = NOT_SUPPORTED`: a hit means the runtime
@@ -2184,12 +2387,20 @@ pub(crate) struct L3cRefusals {
     /// caps inconsistency somewhere else. ⚠ It moves with L2's
     /// `TileMappingsRefused`, which counts the queue-side half of the same
     /// capability; a run that hits one and not the other is itself the finding.
+    ///
+    /// ⚠ **Re-graded consequence**: a hit now also quarantines the recording
+    /// list, where it used to be silent. The expected reading is unchanged; what
+    /// changed is that the application finds out, at `Close()`.
     copy_tiles_refused: RefusalCounter,
     /// `pfnAtomicCopyBufferRegion` was called and refused. **Expected 0** — the
     /// cross-adapter atomic copy needs a shared heap this stack does not
     /// advertise. ⛔ A hit is a real exposure and not merely a gap: the engine's
     /// own `AtomicCopyBufferUINT` is an empty `FIXME` stub, so *no* answer this
     /// driver can give makes the copy happen. See the slot's doc.
+    ///
+    /// ⚠ **Re-graded consequence**, as `CopyTilesRefused`: the list is now
+    /// quarantined too, so the application learns instead of reading stale
+    /// destination bytes.
     atomic_copy_refused: RefusalCounter,
     /// `pfnResourceResolveSubresourceRegion` carried a `D3D12DDI_RESOLVE_MODE`
     /// this header does not name. **Expected 0.**
@@ -2223,7 +2434,7 @@ pub(crate) struct L3cRefusals {
     /// (`DDI_REFERENCE.md` §9.10).
     ///
     /// ⚠ It is counted **and reported** — the surviving barriers in the call are
-    /// issued first, then `pfnSetErrorCb` is raised once. Those were never
+    /// issued first, then one command-list error is raised. Those were never
     /// alternatives (`report_error` returns and aborts nothing), and an earlier
     /// revision of this doc claimed they were. See [`resource_barrier`].
     ///
@@ -2252,7 +2463,7 @@ pub(crate) struct L3cRefusals {
     /// A legacy barrier carried a `D3D12DDI_RESOURCE_BARRIER_TYPE` this header
     /// does not name, and **the barrier was dropped**. **Expected 0**; same
     /// hazard as `LegacyBarrierResourceMissing`, and reported the same way — the
-    /// call's survivors first, then one `pfnSetErrorCb`.
+    /// call's survivors first, then one command-list error.
     legacy_barrier_type_unknown: RefusalCounter,
     /// `pfnBarrier` was entered at all — the second **traffic** counter, and
     /// `LegacyBarrierCalled`'s twin.
@@ -2279,13 +2490,13 @@ pub(crate) struct L3cRefusals {
     /// reads the resource (`libs/vkd3d/command.c:21569-21578`), so dropping it
     /// would lose an ordering edge for nothing.
     ///
-    /// ⛔ **Only the texture arm reports.** `pfnSetErrorCb` is raised once per
+    /// ⛔ **Only the texture arm reports.** One command-list error is raised per
     /// call, after the survivors, and exactly when something was *lost*; the
     /// buffer arm loses nothing, so a reading that moved only through buffer
-    /// barriers leaves the device alone. That asymmetry is deliberate and it is
-    /// the reason this counter alone cannot tell you whether the device was
-    /// removed -- read it with `EnhancedBarrierTypeUnknown` and the log line,
-    /// which names the arm.
+    /// barriers leaves the list usable. That asymmetry is deliberate and it is
+    /// the reason this counter alone cannot tell you whether the list was
+    /// quarantined -- read it with `EnhancedBarrierTypeUnknown` and the log
+    /// line, which names the arm.
     enhanced_barrier_resource_missing: RefusalCounter,
     /// An enhanced texture barrier carried one of the five **DDI-only** layout
     /// values and it was mapped to its API counterpart.
@@ -2332,15 +2543,33 @@ pub(crate) struct L3cRefusals {
     /// **Expected 0.** ⚠ A *null* buffer is the legal "stop predicating" form
     /// and does not reach this counter.
     predication_resource_missing: RefusalCounter,
-    /// A command-list slot needed to report a device-scope error and the device
-    /// handle did not resolve. **Expected 0.**
-    set_error_no_device: RefusalCounter,
-    /// A command-list slot needed `pfnSetErrorCb` and there was none.
+    /// A command-list slot needed to report and could not reach the device its
+    /// list was created on, so the callback table was unreachable.
+    /// **Expected 0.**
     ///
-    /// ⛔ **Expected 0.** It is the first member of
-    /// `D3D12DDI_CORELAYER_DEVICECALLBACKS_0062` and the only error channel this
-    /// whole table has, so a hit means a recording failure the runtime will never
-    /// learn about.
+    /// ⚠ The device is resolved only to reach `um_callbacks`; the error itself
+    /// is scoped to the list. Read it with `L3cCommandListMissing`, which is the
+    /// same failure one handle earlier.
+    set_error_no_device: RefusalCounter,
+    /// A command-list slot needed `pfnSetCommandListErrorCb` and the runtime's
+    /// `D3D12DDI_CORELAYER_DEVICECALLBACKS_0062` carried none.
+    ///
+    /// ⛔ **Expected 0**, and **re-graded**: it used to read *"needed
+    /// `pfnSetErrorCb` ... the only error channel this whole table has"*, which
+    /// named the wrong callback on a premise the `PARALLEL.md` §10 review
+    /// disproved. The correct callback is the **second** member of that struct,
+    /// one below `pfnSetErrorCb` and one above the
+    /// `pfnSetCommandListDDITableCb` this driver already reads out of it
+    /// (`queue::set_command_list_ddi_table`) — so a hit here means the runtime
+    /// supplied a table with a hole in the middle.
+    ///
+    /// ⚠ The **consequence** changed with the channel, and that is the part
+    /// worth re-reading. A hit no longer means "a device that never dies"; it
+    /// means a recording failure the runtime never learns about, so the list is
+    /// **not** quarantined, `Close()` returns success, and the application
+    /// executes commands this driver knows are wrong. That is strictly worse
+    /// than the old reading and is why it stays a named counter rather than a
+    /// silent `else`.
     set_error_cb_absent: RefusalCounter,
 }
 

@@ -40,7 +40,10 @@
 //! same guard for D3D12, and the ordering rule it enforces is the cheaper half:
 //! **validate every runtime-supplied pointer BEFORE constructing anything.**
 
-use helios_umd_common::hr::{Hresult, DXGI_ERROR_UNSUPPORTED, E_FAIL, E_INVALIDARG, S_OK};
+use helios_umd_common::hr::{
+    Hresult, D3DDDIERR_APPLICATIONERROR, D3DDDIERR_DEVICEREMOVED, DXGI_ERROR_DEVICE_REMOVED,
+    DXGI_ERROR_UNSUPPORTED, E_FAIL, E_INVALIDARG, E_OUTOFMEMORY, S_OK,
+};
 
 use crate::adapter12::Ddi12Interface;
 use crate::bridge12::BridgeDevice12;
@@ -506,5 +509,101 @@ pub(crate) fn set_error(dev: &HeliosD3D12Device, hr: Hresult) -> bool {
     // `h_rt_device` is the handle it supplied alongside it and owns until
     // `pfnDestroyDevice`. The call transfers no ownership.
     unsafe { set_error_cb(dev.h_rt_device, hr) };
+    true
+}
+
+/// Narrow an arbitrary HRESULT to one `pfnSetCommandListErrorCb` accepts.
+///
+/// ⛔ **The callback takes exactly three codes**, and the spec says so in a list
+/// (`tmp/dx12/specs/d3d/CPUEfficiency.md:2143-2158`):
+///
+/// > There are only 3 errors which drivers should pass to this function:
+/// > `E_OUTOFMEMORY`, `D3DDDIERR_DEVICEREMOVED`, `D3DDDIERROR_APPLICATIONERROR`.
+///
+/// So a recording slot that wants to report `E_INVALIDARG`, `E_NOTIMPL` or a raw
+/// engine HRESULT cannot pass it through: everything that is not one of the two
+/// specific conditions is *"the application recorded something this driver
+/// cannot honour"*, which is what `D3DDDIERR_APPLICATIONERROR` means.
+///
+/// ⭐ **One declaration, three callers.** `cmdlist.rs`, `rootargs.rs` and
+/// `copy.rs` all need it and the rule is subtle enough that three copies would
+/// be three chances to drop an arm. It lives here rather than in a lane because
+/// it is a property of the DDI, not of any lane — the same reason
+/// [`set_error`] does.
+pub(crate) fn command_list_error_code(hr: Hresult) -> Hresult {
+    match hr {
+        // Passed through: the runtime can act on an allocation failure, and it
+        // is one of the three.
+        E_OUTOFMEMORY => E_OUTOFMEMORY,
+        // The engine reporting a lost device is the second, and it must not be
+        // flattened into an application error: they call for different recovery.
+        DXGI_ERROR_DEVICE_REMOVED | D3DDDIERR_DEVICEREMOVED => D3DDDIERR_DEVICEREMOVED,
+        // Everything else. ⚠ Including `E_FAIL` and raw engine HRESULTs: this
+        // driver cannot tell the runtime *which* engine failure occurred through
+        // this channel, and the log line at the call site is where that detail
+        // lives.
+        _ => D3DDDIERR_APPLICATIONERROR,
+    }
+}
+
+/// Report a **command-list**-scope failure to the runtime. Returns whether it was
+/// delivered.
+///
+/// # ⭐⭐ This is the command-list table's error channel, and it is NOT
+/// [`set_error`]
+///
+/// ⛔ The S6 Round 2 spine asserted the opposite — *"All 75 of its slots take
+/// `D3D12DDI_HCOMMANDLIST` and nothing else, and 74 of the 75 return `VOID`, so
+/// a recording failure can only be reported through the device-scoped
+/// `pfnSetErrorCb`"* — and three lanes copied that sentence into 49 call sites
+/// before the `PARALLEL.md` §10 review opened the header. The first half is
+/// true; the conclusion is false.
+///
+/// `pfnSetCommandListErrorCb` sits **one field below `pfnSetErrorCb`** in
+/// `D3D12DDI_CORELAYER_DEVICECALLBACKS_0062` and one field *above*
+/// `pfnSetCommandListDDITableCb`, which this driver already reads out of that
+/// same struct (`forward12::queue::set_command_list_ddi_table`). So the callback
+/// was reachable the whole time. It takes the **runtime's** command-list handle,
+/// `D3D12DDI_HRTCOMMANDLIST` — which is why `queue::CommandListState` now carries
+/// one.
+///
+/// The difference is the whole point:
+///
+/// | callback | the runtime's response |
+/// |---|---|
+/// | `pfnSetErrorCb` | *"Removing device due to bad UMD error"* — the whole `ID3D12Device` dies, with every list, queue, PSO, heap and resource on it. If it is DWM's device, the compositor goes with it. |
+/// | `pfnSetCommandListErrorCb` | *"the runtime will drop all calls into the driver which record commands on the specified command list"* — one list is quarantined and the application learns at `Close()`. |
+///
+/// ⚠ **Which is exactly the contract D3D12 recording already has**: a recording
+/// error is not observable until `Close()`, and the runtime is what implements
+/// that. Reporting a bad viewport count by removing the device is not a stricter
+/// reading of the same rule, it is a different and much worse behaviour.
+///
+/// ⛔ The HRESULT must come from [`command_list_error_code`]; the callback takes
+/// only three values.
+///
+/// ⚠ Safe, not `unsafe`, for the identical reason [`set_error`] is: the only raw
+/// operation is reading `um_callbacks`, whose validity is a type invariant of
+/// [`HeliosD3D12Device`] rather than a caller obligation.
+#[must_use = "a command-list error that could not be reported must be counted by the caller"]
+pub(crate) fn set_command_list_error(
+    dev: &HeliosD3D12Device,
+    h_rt_list: ddi12::D3D12DDI_HRTCOMMANDLIST,
+    hr: Hresult,
+) -> bool {
+    if dev.um_callbacks.is_null() {
+        return false;
+    }
+    // SAFETY: non-null per the check above, and `create_device` stored the arm
+    // the negotiated version selects — D12 advertises exactly one token, so
+    // `_0062` is the only reachable shape — for a table the runtime keeps alive
+    // at least as long as the device. The borrow does not outlive this call.
+    let Some(cb) = (unsafe { (*dev.um_callbacks).pfnSetCommandListErrorCb }) else {
+        return false;
+    };
+    // SAFETY: the runtime supplied this callback for this device, and
+    // `h_rt_list` is the handle it supplied to `pfnCreateCommandList` for the
+    // list being reported on. The call transfers no ownership.
+    unsafe { cb(h_rt_list, command_list_error_code(hr)) };
     true
 }

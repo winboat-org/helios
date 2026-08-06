@@ -1681,8 +1681,10 @@ unsafe extern "C" fn create_pipeline_state(
     // both. Read this counter's doc before treating a hit as an exposure — the
     // grading was corrected at S6 Round 2 and the line below no longer warns.
     // Counted because "an application used the dynamic-state flags" is a fact
-    // worth having, and because it is half of a two-counter reading: a hit here
-    // while `pfnSetPipelineState` is still a counting noop IS the exposure.
+    // worth having, and because it is half of a two-counter reading — read it
+    // beside `L3aPipelineStateUnresolved` / `L3aCommandListMissing`, the two arms
+    // where a `pfnSetPipelineState` reaches this driver and still does not reach
+    // the engine.
     let dynamic_mask = ddi12::D3D12DDI_PIPELINE_STATE_FLAGS_D3D12DDI_PIPELINE_STATE_FLAG_DYNAMIC_DEPTH_BIAS
         | ddi12::D3D12DDI_PIPELINE_STATE_FLAGS_D3D12DDI_PIPELINE_STATE_FLAG_DYNAMIC_INDEX_BUFFER_STRIP_CUT;
     if a.Flags & dynamic_mask != 0 {
@@ -1690,7 +1692,7 @@ unsafe extern "C" fn create_pipeline_state(
         // ⚠ Bounded and non-alarming. It was a warning while the obligation was
         // believed to be open; the engine turns out to honour it, so the line's
         // job now is to say which PSOs are on the dynamic path at all — which is
-        // what makes `pfnSetPipelineState` still being a noop diagnosable.
+        // what makes a later `L3aPipelineStateUnresolved` attributable.
         let n = L6_REFUSALS.pso_dynamic_state_flag_forwarded.get();
         if n <= LOG_BUDGET {
             log_error!(
@@ -2550,17 +2552,30 @@ pub(crate) struct L6Refusals {
     /// the state twice.
     ///
     /// ⛔ **So the reading to be alarmed by is not this one.** A non-zero count
-    /// here is just "an application used the dynamic-state flags". What would be
-    /// a finding is this counter moving while `pfnSetPipelineState` is **still a
-    /// counting noop** — because then nothing forwards and nothing re-applies.
-    /// `D3D12 noop DDI hits:`'s `pfnSetPipelineState` entry is the other half of
-    /// that reading, and the two must be read together.
+    /// here is just *"an application used the dynamic-state flags"*, and on its
+    /// own it is informational — the same class as `CapsCalls`.
     ///
-    /// ⚠ ⭐ Regraded rather than deleted, and the reason is the S6 Round 1
-    /// lesson in its own words: *a counter's grading is a claim, and it goes
-    /// stale like any other.* Two counters were caught mis-graded in one merge
-    /// there; this is the third, caught by reading the engine instead of the
-    /// document that predicted it.
+    /// ⚠ **The pairing that makes it actionable**, and it is deliberately NOT
+    /// the one this doc first named. The first regrade said the finding condition
+    /// was *"this counter moving while `pfnSetPipelineState` is still a counting
+    /// noop"*, read off `D3D12 noop DDI hits:`. That condition became
+    /// unreachable two commits later in the same merge, when L3a installed
+    /// `pfnSetPipelineState` — and `noop12::log_noop_hits` only prints slots
+    /// whose count is non-zero, so the entry it told a reader to look for can
+    /// never appear again. Read it instead beside **`L3aPipelineStateUnresolved`
+    /// and `L3aCommandListMissing`**: those are the two arms in which a
+    /// `pfnSetPipelineState` reaches this driver and still does *not* reach
+    /// `d3d12_command_list_SetPipelineState`, which are the surviving cases where
+    /// nothing forwards and so nothing re-applies. Non-zero here **with** either
+    /// of those non-zero is the exposure.
+    ///
+    /// ⚠ ⭐ **Regraded twice now, and the second regrade is the lesson.** The
+    /// S6 Round 1 finding is *a counter's grading is a claim, and it goes stale
+    /// like any other* — and the first correction to this counter went stale
+    /// inside the very merge that wrote it, because it named a condition another
+    /// commit in the same batch removed. ⇒ when a grading is written as a
+    /// cross-reference to another slot's state, check that slot's state **at the
+    /// end of the merge**, not at the moment of writing.
     pub(crate) pso_dynamic_state_flag_forwarded: RefusalCounter,
     /// `NumRenderTargets` exceeded the eight `D3D12_RT_FORMAT_ARRAY` holds and
     /// was clamped. ⛔ Expected 0 — `D3D12DDIARG_CREATE_PIPELINE_STATE_0099`'s

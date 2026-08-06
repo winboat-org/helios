@@ -201,8 +201,8 @@ use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D12::{
     ID3D12CommandAllocator, ID3D12CommandList, ID3D12CommandQueue, ID3D12Device4,
     ID3D12GraphicsCommandList, D3D12_COMMAND_LIST_FLAG_NONE, D3D12_COMMAND_LIST_TYPE,
-    D3D12_COMMAND_LIST_TYPE_BUNDLE, D3D12_COMMAND_LIST_TYPE_COMPUTE,
-    D3D12_COMMAND_LIST_TYPE_COPY, D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_QUEUE_DESC,
+    D3D12_COMMAND_LIST_TYPE_COMPUTE, D3D12_COMMAND_LIST_TYPE_COPY,
+    D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_QUEUE_DESC,
     D3D12_COMMAND_QUEUE_FLAG_NONE,
 };
 
@@ -229,12 +229,23 @@ use crate::{ddi12, device12, log_error, note_refusal, trace_line};
 // was not shadow state but an ERROR CHANNEL.** Every one of the 75 command-list
 // slots takes `D3D12DDI_HCOMMANDLIST` and **nothing else** — no `hDevice`
 // (`pfnDrawInstanced`, `d3d12umddi.h`), and 74 of the 75 return `VOID`. So a
-// recording DDI that fails has exactly one way to say so, `pfnSetErrorCb`, which
-// is **device**-scoped (`device12::set_error`) — and the only place a command
-// list can learn its device is here, at `pfnCreateCommandList`, which is the one
-// DDI in the list's whole life that is handed one. ⇒ [`CommandListState`], and
-// the promotion is this lane's to make (`PARALLEL.md` §4 gives it the handle) on
+// recording DDI that fails cannot report through its return value and cannot
+// reach a callback from its arguments alone: it needs something the create-time
+// handles carry. `pfnCreateCommandList` is the one DDI in the list's whole life
+// that is handed both the device handle and the runtime's list handle, so it is
+// the only place either can be captured. ⇒ [`CommandListState`], and the
+// promotion is this lane's to make (`PARALLEL.md` §4 gives it the handle) on
 // behalf of L3a/L3b/L3c/L8, which all four need it.
+//
+// ⛔ **The first version of this comment said the channel was `pfnSetErrorCb`,
+// "which is device-scoped", and called it the only one. That was WRONG**, and
+// three lanes copied the sentence into 49 call sites before the `PARALLEL.md`
+// §10 review opened the header. `pfnSetCommandListErrorCb` sits one field below
+// `pfnSetErrorCb` in the same `_0062` struct this file already reads
+// `pfnSetCommandListDDITableCb` out of; it quarantines one list where the device
+// callback removes the whole device. `device12::set_command_list_error` has the
+// full account. That is why [`CommandListState`] carries `h_rt_list` as well as
+// `h_device`.
 helios_umd_common::boxed_handles!(
     crate::ddi12::D3D12DDI_HCOMMANDLIST => CommandListState,
     crate::ddi12::D3D12DDI_HCOMMANDQUEUE => QueueState,
@@ -357,11 +368,14 @@ pub struct PoolState {
 
 /// Per-command-list shadow state.
 ///
-/// ⛔ **Two fields, and the first one is the reason this type exists.** See the
+/// ⛔ **The first two fields are the reason this type exists.** See the
 /// `boxed_handles!` comment above: a command-list DDI is handed the list handle
-/// and nothing else, so `h_device` is the only route from a recording slot to
-/// `device12::set_error`, and `pfnCreateCommandList` is the only DDI in the
-/// list's life that is told which device it belongs to.
+/// and nothing else, so a recording slot can only report a failure through
+/// handles captured at create. `h_rt_list` is what
+/// `device12::set_command_list_error` takes — the correct, list-scoped channel —
+/// and `h_device` is how the device that owns the callback table is found.
+/// `pfnCreateCommandList` is the only DDI in the list's life that is told
+/// either.
 ///
 /// ⚠ **Nothing else is shadowed, deliberately.** A forwarder is at its most
 /// correct when it holds no state the engine also holds: the current PSO, the
@@ -382,6 +396,16 @@ pub struct CommandListState {
     h_device: ddi12::D3D12DDI_HDEVICE,
     /// The engine list. **Owned** — dropping this state releases it.
     engine: ID3D12GraphicsCommandList,
+    /// The **runtime's** handle for this list.
+    ///
+    /// ⭐ Stored for `pfnSetCommandListErrorCb`, which is what a recording slot
+    /// must use instead of the device-scoped `pfnSetErrorCb` — see
+    /// `device12::set_command_list_error`, whose doc records that the spine
+    /// originally claimed no such channel existed. The callback takes this
+    /// handle and nothing else identifies the list to the runtime, so like
+    /// `h_device` it can only be captured here, at `pfnCreateCommandList`.
+    h_rt_list: ddi12::D3D12DDI_HRTCOMMANDLIST,
+
     /// The class this list was created as, from `Type` + `QueueFlags`.
     ///
     /// ⭐ Kept for exactly one reader, and it is the instrument for the open
@@ -408,7 +432,10 @@ impl CommandListState {
         &self.engine
     }
 
-    /// The device handle, for reaching `device12::set_error` from a `VOID` slot.
+    /// The device handle. ⚠ Used to *find* the corelayer callback table, not to
+    /// scope the error: a command-list failure is reported through
+    /// `device12::set_command_list_error` with [`Self::h_rt_list`], never through
+    /// the device-scoped `device12::set_error`.
     pub(crate) fn h_device(&self) -> ddi12::D3D12DDI_HDEVICE {
         self.h_device
     }
@@ -417,6 +444,11 @@ impl CommandListState {
     /// `pfnResetCommandList`'s allocator-class check.
     pub(crate) fn list_type(&self) -> D3D12_COMMAND_LIST_TYPE {
         self.list_type
+    }
+
+    /// The runtime's handle for this list, for `pfnSetCommandListErrorCb`.
+    pub(crate) fn h_rt_list(&self) -> ddi12::D3D12DDI_HRTCOMMANDLIST {
+        self.h_rt_list
     }
 }
 
@@ -511,9 +543,28 @@ pub struct RecorderState {
 //     *runtime's* object under that call; no driver can defend against it and
 //     none is expected to;
 //   * ⚠ concurrent **reads** across free-threaded workers are permitted by `&`
-//     and are the expected case. The two fields that change after construction —
-//     `PoolState::allocator` and `RecorderState::target_pool` — are a `OnceLock`
-//     and an atomic for that reason. There is deliberately no `&mut` accessor.
+//     and are the expected case. The two fields that change after construction
+//     are `PoolState::allocator`, a `OnceLock` because a pool's allocator is
+//     created once and never replaced, and `RecorderState::target`, a
+//     `Mutex<Option<RecorderTarget>>` because a recorder's target is
+//     **rebindable** and so has no initialise-once shape to exploit. There is
+//     deliberately no `&mut` accessor.
+//
+//     ⛔ The `Mutex` carries one argument the atomic it replaced could not:
+//     `recorder_allocator` hands back an **owned** `ID3D12CommandAllocator`
+//     clone, taken under the lock, which is what makes a concurrent
+//     `pfnCommandRecorderSetCommandPoolAsTarget` unable to release the allocator
+//     a `pfnResetCommandList` is about to reset against. ⚠ Every holder —
+//     `bind_target`, `unbind_target`, `target_pool_identity`,
+//     `recorder_allocator` — releases the guard before returning, so no lock is
+//     ever held across a call back into the runtime or into the engine.
+//
+//     ⚠ The premise the compiler never checks, stated because it is a premise:
+//     `RecorderTarget` holds a windows-rs COM interface, which carries no
+//     `unsafe impl Send`/`Sync`. No auto-trait obligation is ever raised, because
+//     every `&RecorderState` in this file is conjured from `Slot::ptr()` inside
+//     `unsafe` rather than obtained from a `Sync` container — so the sharing
+//     rests on D3D12's free-threading contract, not on a bound Rust enforced.
 
 /// The queue state behind a DDI queue handle, borrowed for the caller's DDI call.
 ///
@@ -1217,6 +1268,9 @@ unsafe extern "C" fn command_recorder_set_command_pool_as_target(
     };
     // SAFETY: the caller guarantees a live handle from `create_command_pool`.
     let Some(pool) = (unsafe { pool_state(h_pool) }) else {
+        // ⛔ The recorder DID resolve, so it may still be pointing at a previous
+        // pool. See `unbind_target`: a bind that failed must leave no binding.
+        unbind_target(recorder);
         note_refusal(&L2_REFUSALS.pool_bad_arg);
         return;
     };
@@ -1260,10 +1314,12 @@ unsafe extern "C" fn command_recorder_set_command_pool_as_target(
 
     // SAFETY: device-scope DDI; the borrow lives only until the end of the call.
     let Some(dev) = (unsafe { device12::device(h_device) }) else {
+        unbind_target(recorder);
         note_refusal(&L2_REFUSALS.pool_no_device);
         return;
     };
     let Some(engine) = dev.engine.d3d12_device() else {
+        unbind_target(recorder);
         note_refusal(&L2_REFUSALS.pool_no_device);
         return;
     };
@@ -1274,6 +1330,7 @@ unsafe extern "C" fn command_recorder_set_command_pool_as_target(
     let allocator = match created {
         Ok(a) => a,
         Err(e) => {
+            unbind_target(recorder);
             note_refusal(&L2_REFUSALS.pool_allocator_engine_failed);
             if let Some(n) = budget(&POOL_LOG) {
                 log_error!(
@@ -1308,6 +1365,7 @@ unsafe extern "C" fn command_recorder_set_command_pool_as_target(
         // Unreachable: `set` either stored ours or found another thread's, so the
         // `OnceLock` is initialised either way. Counted rather than asserted —
         // this crate is `panic = "abort"`.
+        unbind_target(recorder);
         note_refusal(&L2_REFUSALS.pool_allocator_engine_failed);
         return;
     };
@@ -1319,6 +1377,22 @@ unsafe extern "C" fn command_recorder_set_command_pool_as_target(
 /// ⚠ Identity only — the value is never dereferenced. See [`RecorderTarget`].
 fn target_pool_identity(recorder: &RecorderState) -> usize {
     lock_target(recorder).as_ref().map_or(0, |t| t.pool)
+}
+
+/// Forget whatever this recorder was pointed at.
+///
+/// ⛔ **Called from every failure arm of
+/// `pfnCommandRecorderSetCommandPoolAsTarget`, and that is not tidiness.** The
+/// slot's contract is *"this recorder now targets this pool"*; if it cannot be
+/// honoured, leaving the PREVIOUS binding in place is worse than leaving none,
+/// because `recorder_allocator` then answers `Ready` with an allocator belonging
+/// to a pool the runtime did not name — one that may already back another
+/// recording list, and one that `pfnResetCommandPool` on the *new* pool will
+/// never reset. L3a's `L3aResetNoAllocator`, whose doc grades it *"Expected 0,
+/// and a hit is a real finding about DDI ordering"*, is the loud-failure path
+/// built for exactly this and is bypassed unless the stale target is cleared.
+fn unbind_target(recorder: &RecorderState) {
+    *lock_target(recorder) = None;
 }
 
 /// Point a recorder at a pool, taking its own reference to that pool's allocator.
@@ -1402,7 +1476,7 @@ pub(crate) unsafe fn recorder_allocator(
 
 /// `pfnDestroyCommandRecorder`.
 ///
-/// The log line is this lane's readout of `RecorderState::target_pool`: *did the
+/// The log line is this lane's readout of `RecorderState::target`: *did the
 /// runtime ever bind a pool to this recorder?* is a real triage question, and one
 /// line per recorder teardown is the cheapest place to answer it.
 ///
@@ -1516,14 +1590,50 @@ unsafe extern "C" fn create_command_list(
     // SAFETY: non-null per the check; the DDI declares it `_In_ CONST`.
     let a = unsafe { &*arg };
 
+    // ⛔⛔ **A BUNDLE is REFUSED HERE, at create, and that is the only honest
+    // place for it.** `D3D12DDIARG_CREATE_COMMAND_RECORDER_0040` is
+    // `{ QueueFlags, RecorderFlags }` and `D3D12DDI_COMMAND_QUEUE_FLAGS`
+    // enumerates NONE / 3D / COMPUTE / COPY / PAGING / VIDEO_* with **no bundle
+    // bit** — so `engine_list_type` can only ever answer DIRECT, COMPUTE or
+    // COPY, and this driver can never mint a BUNDLE `ID3D12CommandAllocator`.
+    // An `ID3D12CommandAllocator`'s class is fixed at creation and the engine
+    // enforces the pairing unconditionally (`libs/vkd3d/bundle.c:239-245`,
+    // `:411-427`), so a bundle list accepted here is a list whose
+    // `pfnResetCommandList` is **guaranteed** to fail.
+    //
+    // ⛔ Accepting it and failing later is the "succeed at create, fail at
+    // submit" shape this project forbids. Worse, concretely: the reset arm's
+    // only channel is an error callback, so every bundle a legal application
+    // records would have taken the device — the compositor's, if DWM is the
+    // application. Refusing at create instead fails
+    // `ID3D12Device::CreateCommandList` with an HRESULT the application
+    // receives and can act on, which is what a driver that lacks a capability
+    // is supposed to do.
+    //
+    // ⚠ **This is a real capability gap and the counter is not a formality.**
+    // Bundles are core D3D12 with no cap to decline them, so a workload that
+    // uses them loses work here. The fix is one `ID3D12CommandAllocator` per
+    // (pool, class) — `CreateCommandAllocator(BUNDLE)` on first use by a bundle
+    // list — and the commit that lands it deletes this arm. Until then the
+    // refusal is visible, counted, and survivable.
+    if a.Type == ddi12::D3D12DDI_COMMAND_LIST_TYPE_D3D12DDI_COMMAND_LIST_TYPE_BUNDLE {
+        note_refusal(&L2_REFUSALS.bundle_list_refused);
+        if let Some(n) = budget(&LIST_LOG) {
+            log_error!(
+                "CreateCommandList: BUNDLE refused -- D3D12DDIARG_CREATE_COMMAND_RECORDER_0040 \
+                 carries no bundle bit, so this driver can never mint a BUNDLE command \
+                 allocator and the paired ResetCommandList could not succeed (x{})",
+                n + 1,
+            );
+        }
+        return E_INVALIDARG;
+    }
+
     // ⚠ `Type` is only DIRECT or BUNDLE (`d3d12umddi.h:1425-1429`); COMPUTE and
     // COPY are expressed through `QueueFlags`, not through a list type
-    // (`DDI_REFERENCE.md` §8.1). Both fields are therefore needed to reach one
-    // `D3D12_COMMAND_LIST_TYPE`.
-    let list_type = if a.Type == ddi12::D3D12DDI_COMMAND_LIST_TYPE_D3D12DDI_COMMAND_LIST_TYPE_BUNDLE
-    {
-        D3D12_COMMAND_LIST_TYPE_BUNDLE
-    } else {
+    // (`DDI_REFERENCE.md` §8.1). BUNDLE is refused above, so the remaining
+    // answer comes from `QueueFlags` alone.
+    let list_type = {
         match engine_list_type(a.QueueFlags) {
             Some(t) => t,
             None => {
@@ -1635,6 +1745,7 @@ unsafe extern "C" fn create_command_list(
     unsafe {
         slot.store(CommandListState {
             h_device,
+            h_rt_list,
             engine: list,
             list_type,
         });
@@ -2276,8 +2387,18 @@ pub(crate) struct L2Refusals {
     /// 3D/COMPUTE/COPY class. **Expected 0**, same reasoning as
     /// `QueueClassUnsupported`.
     recorder_class_unsupported: RefusalCounter,
-    /// A command-list slot was called with a null arg or a null `pDrvPrivate`.
-    /// **Expected 0.**
+    /// A command-list slot was called with a null arg or a null `pDrvPrivate`,
+    /// **or a destroy hit an already-empty slot**. **Expected 0.**
+    ///
+    /// ⚠ The second condition was added when `pfnDestroyCommandList` started
+    /// taking a box rather than releasing a bare COM word, and it is the same
+    /// second condition `PoolBadArg` and `RecorderBadArg` already document — this
+    /// was the one of the three that was missed. It fires when a create FAILED
+    /// (leaving the slot cleared) and the runtime then destroyed the handle
+    /// anyway, which is legal. ⇒ **read `CommandListEngineFailed`,
+    /// `CommandListClassUnsupported` and `L2BundleListRefused` first**: a hit
+    /// here with one of those non-zero is the runtime cleaning up after a refused
+    /// create, not a bad pointer.
     command_list_bad_arg: RefusalCounter,
     /// A command-list slot could not reach the engine. **Expected 0.**
     command_list_no_device: RefusalCounter,
@@ -2325,6 +2446,20 @@ pub(crate) struct L2Refusals {
     /// created. ⚠ Expected to track `CommandSignatureRefused`; it is the
     /// runtime cleaning up after a refused create, not a fault.
     command_signature_destroy_unexpected: RefusalCounter,
+    /// `pfnCreateCommandList` was asked for a BUNDLE and refused.
+    ///
+    /// ⚠ **Expected 0 on a workload that records no bundles, and NON-ZERO — with
+    /// lost application work — on one that does.** This is a real capability gap,
+    /// not an instrument: `D3D12DDIARG_CREATE_COMMAND_RECORDER_0040` carries no
+    /// bundle bit, so no BUNDLE `ID3D12CommandAllocator` can be minted and the
+    /// paired `pfnResetCommandList` could never succeed. Refusing at create is
+    /// the survivable end of that: the application gets a failed
+    /// `ID3D12Device::CreateCommandList` instead of a removed device.
+    ///
+    /// ⛔ It is the counter that says whether the one-allocator-per-(pool, class)
+    /// fix is worth doing yet. A non-zero reading on a real workload is what
+    /// promotes it from a named gap to scheduled work.
+    bundle_list_refused: RefusalCounter,
     /// `pfnExecuteCommandLists` was called with an unresolvable queue, a null
     /// array, or a count above `MAX_EXECUTE_COMMAND_LISTS`. **Expected 0.**
     execute_command_lists_bad_arg: RefusalCounter,
@@ -2421,6 +2556,7 @@ pub(crate) static L2_REFUSALS: L2Refusals = L2Refusals {
     command_signature_bad_arg: RefusalCounter::new("CommandSignatureBadArg"),
     command_signature_refused: RefusalCounter::new("CommandSignatureRefused"),
     command_signature_destroy_unexpected: RefusalCounter::new("CommandSignatureDestroyUnexpected"),
+    bundle_list_refused: RefusalCounter::new("L2BundleListRefused"),
     execute_command_lists_bad_arg: RefusalCounter::new("ExecuteCommandListsBadArg"),
     execute_command_lists_list_missing: RefusalCounter::new("ExecuteCommandListsListMissing"),
     ecl_no_wddm_submission: RefusalCounter::new("EclNoWddmSubmission"),
@@ -2486,6 +2622,14 @@ pub(crate) static REFUSALS: &[&RefusalCounter] = &[
     &L2_REFUSALS.fence_op_fence_missing,
     &L2_REFUSALS.fence_op_engine_failed,
     &L2_REFUSALS.fence_wait_not_forwarded,
+    // ⛔ APPENDED, S6 Round 2. It was first written into the middle of this array,
+    // between `CommandSignatureDestroyUnexpected` and `ExecuteCommandListsBadArg`,
+    // where it read tidily beside the other create-time refusals -- and shifted
+    // the nine counters after it in every `D3D12 DDI refusals:` line this driver
+    // will ever print. That is precisely what the append-only rule above exists
+    // to stop, and the rule was violated in the same commit that quotes it.
+    // ⇒ new counters go HERE, at the end, however badly they group.
+    &L2_REFUSALS.bundle_list_refused,
 ];
 
 // ⚠ `Hresult` is imported for the `E_*`/`S_OK` constants this file returns; the

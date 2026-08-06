@@ -66,9 +66,61 @@ pub const DXGI_ERROR_UNSUPPORTED: Hresult = 0x887A_0004u32 as Hresult;
 /// `DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM` note in `forward.rs`).
 pub const DXGI_ERROR_DRIVER_INTERNAL_ERROR: Hresult = 0x887A_0020u32 as Hresult;
 
+/// The GPU device instance has been suspended. `winerror.h`:
+/// `DXGI_ERROR_DEVICE_REMOVED`.
+///
+/// ⚠ The code the **engine** returns for a lost device, as against
+/// [`D3DDDIERR_DEVICEREMOVED`], which is the code the **kernel DDI** uses for
+/// the same condition. `umd12::device12::command_list_error_code` maps the one
+/// to the other rather than folding a lost device into an application error:
+/// the two call for different recovery.
+pub const DXGI_ERROR_DEVICE_REMOVED: Hresult = 0x887A_0005u32 as Hresult;
+
 /// The presentation was not redirected; the caller should present directly.
 /// `winerror.h`: `DXGI_STATUS_NO_REDIRECTION`. A success code (severity 0).
 pub const DXGI_STATUS_NO_REDIRECTION: Hresult = 0x087A_0004u32 as Hresult;
+
+// ── The two `D3DDDIERR_*` codes a D3D12 command-list error may carry ────────
+//
+// ⛔ These are NOT `winerror.h` codes. They come from `d3dumddi.h`'s own
+// facility, and they are here because `pfnSetCommandListErrorCb` accepts
+// **exactly three** HRESULTs and two of them are these
+// (`tmp/dx12/specs/d3d/CPUEfficiency.md:2143-2158`; the third is
+// [`E_OUTOFMEMORY`], already above). Anything else sent to that callback is
+// outside the contract, and the callback is the only way a D3D12 recording DDI
+// can fail without taking the whole device down — see
+// `umd12::device12::command_list_error_code`.
+//
+// ⚠ **Derived, not transcribed.** `d3dumddi.h:4716-4717` defines
+// `_FACD3DDDI 0x876` and `MAKE_D3DDDIHRESULT(code) MAKE_HRESULT(1, _FACD3DDDI,
+// code)`, i.e. `0x8000_0000 | (0x876 << 16) | code`. Both constants below are
+// written as that expression over their decimal code, so the arithmetic is the
+// compiler's and the only hand-written number is the one the header states.
+// `ARCHITECTURE.md` §12 rule 1 forbids hand-transcribing an ABI, and a
+// pre-computed hex literal here would be exactly that.
+
+/// Build a `D3DDDIERR_*` value the way `d3dumddi.h:4717` does.
+const fn make_d3dddi_hresult(code: u32) -> Hresult {
+    (0x8000_0000u32 | (0x876u32 << 16) | code) as Hresult
+}
+
+/// The device was removed. `d3dumddi.h:4723`: `MAKE_D3DDDIHRESULT(2160)`.
+///
+/// One of the three codes `pfnSetCommandListErrorCb` accepts.
+pub const D3DDDIERR_DEVICEREMOVED: Hresult = make_d3dddi_hresult(2160);
+
+/// The application did something wrong. `d3dumddi.h:4734`:
+/// `MAKE_D3DDDIHRESULT(2181)`.
+///
+/// ⭐ The code a D3D12 recording DDI uses to say *"this command list is
+/// unusable because of what was recorded into it"*, which the runtime answers
+/// by dropping further recording calls on **that list** rather than by removing
+/// the device.
+///
+/// ⚠ The spec spells it `D3DDDIERROR_APPLICATIONERROR`; the header spells it
+/// `D3DDDIERR_APPLICATIONERROR`. Same value, and the header's spelling is the
+/// one used here because the header is what compiles.
+pub const D3DDDIERR_APPLICATIONERROR: Hresult = make_d3dddi_hresult(2181);
 
 // The numeric identity of every constant above, checked at build time against
 // the values in `winerror.h`. These exist so the R801 consolidation is
@@ -81,6 +133,14 @@ const _: () = assert!(E_OUTOFMEMORY as u32 == 0x8007_000E);
 const _: () = assert!(DXGI_ERROR_UNSUPPORTED as u32 == 0x887A_0004);
 const _: () = assert!(DXGI_ERROR_DRIVER_INTERNAL_ERROR as u32 == 0x887A_0020);
 const _: () = assert!(DXGI_STATUS_NO_REDIRECTION as u32 == 0x087A_0004);
+const _: () = assert!(DXGI_ERROR_DEVICE_REMOVED as u32 == 0x887A_0005);
+// ⚠ These two are checked the other way round from the rest: the constants
+// above are hand-written hex checked against a decimal expression, and these are
+// a decimal expression checked against the hex `MAKE_D3DDDIHRESULT` produces.
+// Both directions exist so a typo in either the code number or the facility is
+// a build failure rather than a wrong HRESULT on a rarely-taken path.
+const _: () = assert!(D3DDDIERR_DEVICEREMOVED as u32 == 0x8876_0870);
+const _: () = assert!(D3DDDIERR_APPLICATIONERROR as u32 == 0x8876_0885);
 
 // The two codes the pre-R801 tree conflated must stay distinct, and the
 // unsupported/internal-error distinction must stay the right way round.

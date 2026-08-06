@@ -21,7 +21,7 @@
 //!
 //! | slot | counter | why |
 //! |---|---|---|
-//! | `pfnOMSetDepthBounds` | `L3aDepthBoundsRefused` | `caps12.rs` reports `DepthBoundsTestSupported = 0` |
+//! | `pfnOMSetDepthBounds` | `L3aDepthBoundsDefaultDropped` / `L3aDepthBoundsRefused` | `caps12.rs` reports `DepthBoundsTestSupported = 0`. ⛔ **Two counters, because the runtime calls this slot after EVERY reset** — see [`om_set_depth_bounds`] |
 //! | `pfnSetSamplePositions` | `L3aSamplePositionsRefused` | `ProgrammableSamplePositionsTier = NONE` **and** the engine's own body is a `FIXME(...) stub!` |
 //! | `pfnOmSetAlphaBlendFactor` | `L3aAlphaBlendFactorRetired` | RETIRED by Microsoft; `pfnOmSetBlendFactor`'s component `[3]` replaced it |
 //! | `pfnExecuteIndirect` | `L3aExecuteIndirectRefused` | its command signature comes from `pfnCreateCommandSignature`, which `queue.rs` refuses |
@@ -38,27 +38,35 @@
 //!
 //! * ⛔ **Together they are what makes the spine's accessors real rather than
 //!   dead.** `PARALLEL.md` §10 forbids `#[allow(dead_code)]` on a hand-written
-//!   line (R908), so `queue::CommandListState`, its `h_device` and its
-//!   `list_type`, and `queue::recorder_allocator` could not be committed without
-//!   a caller. These two are that caller, and they are the *right* one: they are
-//!   the only command-list slots whose whole content is the objects `queue.rs`
-//!   owns.
+//!   line (R908), so `queue::CommandListState`, its `h_device`, its `h_rt_list`
+//!   and its `list_type`, and `queue::recorder_allocator` could not be committed
+//!   without a caller. These two are that caller, and they are the *right* one:
+//!   they are the only command-list slots whose whole content is the objects
+//!   `queue.rs` owns.
 //! * ⭐ `pfnCloseCommandList` is the slot that **proves the error channel is
 //!   needed**. `ID3D12GraphicsCommandList::Close` returns an `HRESULT` and the
 //!   DDI returns `VOID` — and the DDI is handed the command-list handle and
-//!   *nothing else*, no `hDevice`. Without `CommandListState::h_device` a failed
-//!   `Close` would be unreportable, which is `DECISIONS.md` §7.6's problem in
-//!   its sharpest form.
+//!   *nothing else*. Without `CommandListState::h_rt_list` a failed `Close`
+//!   would be unreportable, which is `DECISIONS.md` §7.6's problem in its
+//!   sharpest form. ⛔ It is `h_rt_list`, **not** `h_device`: see
+//!   [`report_error`] for why every failure in this file is a *list*-scoped
+//!   report and what the earlier device-scoped one cost.
 //! * ⛔ `pfnResetCommandList` is where the module doc of `queue.rs` says the
 //!   bundle question lands: *"UNVERIFIED, and it belongs to whoever writes
 //!   `pfnResetCommandList` (L3a): how a BUNDLE allocator is expressed at this
 //!   DDI."* **It is answered, and the answer is that it is not expressed at all
-//!   and bundles therefore do not work yet.** The DDI carries no bundle bit, the
-//!   engine enforces the class pairing in both halves
-//!   (`command.c:7378-7382`, `bundle.c:411-427`), so this slot refuses the
-//!   mismatch instead of forwarding a call whose failure is known in advance.
-//!   The fix is `queue.rs`'s, one allocator per (pool, class). See
-//!   [`reset_command_list`].
+//!   and bundles therefore do not work yet.** The DDI carries no bundle bit and
+//!   the engine enforces the class pairing in both halves
+//!   (`command.c:7378-7382`, `bundle.c:411-427`).
+//!   ⚠ **The refusal moved one DDI earlier than this file first placed it.**
+//!   Refusing at *reset* meant `ID3D12Device::CreateCommandList` had already
+//!   returned success, so the application held a bundle it could never record
+//!   into — the "succeed at create, fail at submit" shape. `queue.rs`'s
+//!   `create_command_list` now refuses `Type == BUNDLE` up front
+//!   (`L2BundleListRefused`), so the application gets a failed create it can act
+//!   on. This slot's mismatch arm remains as the tripwire for the narrower
+//!   DIRECT/COMPUTE/COPY disagreement. The fix that lifts both is `queue.rs`'s,
+//!   one allocator per (pool, class). See [`reset_command_list`].
 //!
 //! # ⭐ What Round 1 routed here and the engine had already done
 //!
@@ -138,32 +146,62 @@ fn record_budget() -> Option<usize> {
     RECORD_LOG.first_n_then_every(8, 4096)
 }
 
-/// Report a device-scope failure from a command-list slot, counting the case
-/// where there is no way to hear it.
+/// Report a **command-list**-scope failure from a recording slot, counting the
+/// two cases where there is no way to hear it.
 ///
-/// ⭐ **The command-list table's only error channel.** All 75 of its slots take
-/// `D3D12DDI_HCOMMANDLIST` and nothing else, and 74 of the 75 return `VOID`
-/// (`DECISIONS.md` §7.6) — so a recording failure can only be reported through
-/// the device-scoped `pfnSetErrorCb`, reached through the `h_device` that
-/// `queue::CommandListState` exists to carry.
+/// # ⛔ This reports through `pfnSetCommandListErrorCb`, NOT `pfnSetErrorCb`
+///
+/// The first half of the old claim here was true — all 75 command-list slots
+/// take `D3D12DDI_HCOMMANDLIST` and nothing else, and 74 of the 75 return `VOID`
+/// (`DECISIONS.md` §7.6). ⛔ **The conclusion drawn from it was false.** This
+/// file, and two sibling lanes, carried the sentence *"so a recording failure
+/// can only be reported through the device-scoped `pfnSetErrorCb`"* into 49 call
+/// sites before the `PARALLEL.md` §10 review opened
+/// `D3D12DDI_CORELAYER_DEVICECALLBACKS_0062` and found the list-scoped callback
+/// **one field below** the device-scoped one — in the same struct this driver
+/// already reads `pfnSetCommandListDDITableCb` out of.
+///
+/// The difference is the whole reason this function was rewritten:
+///
+/// | callback | what the runtime does |
+/// |---|---|
+/// | `pfnSetErrorCb` | removes the whole `ID3D12Device` — every list, queue, PSO, heap and resource on it, and the compositor if it is DWM's |
+/// | `pfnSetCommandListErrorCb` | *"the runtime will drop all calls into the driver which record commands on the specified command list"* (`tmp/dx12/specs/d3d/CPUEfficiency.md:2143-2158`) — **one** list is quarantined and the application learns at `Close()` |
+///
+/// ⚠ **The second is D3D12's own recording-error contract**, not a weaker
+/// version of the first: a recording error is defined to surface at `Close()`,
+/// and this callback is what implements that. Answering a malformed viewport
+/// count by removing the device was never a stricter reading of the rule.
+///
+/// ⛔ The HRESULT is narrowed by `device12::command_list_error_code`, which
+/// `device12::set_command_list_error` calls internally — the callback takes only
+/// `E_OUTOFMEMORY`, `D3DDDIERR_DEVICEREMOVED` and `D3DDDIERROR_APPLICATIONERROR`
+/// — so a call site here passes whatever HRESULT actually describes the failure
+/// and the log line at that site is where the detail lives.
 ///
 /// ⚠ Its counters are **this lane's**, not `device12`'s and not L6's, because
 /// `PARALLEL.md` §9.1 puts a lane's counters in the lane's file and every lane
-/// that reaches `device12::set_error` will write this same twelve lines.
+/// that reaches `device12::set_command_list_error` will write these same lines.
 /// `pso.rs`'s `set_error_if_possible` and `descriptors.rs`'s `report_error` are
-/// the same function against those lanes' sets.
+/// the same function against those lanes' sets. ⚠ Those two lanes own DEVICE
+/// tables, where `pfnSetErrorCb` remains the right callback — there is no list to
+/// quarantine. The choice is made by which table the slot is in, not by how bad
+/// the failure looks.
 ///
 /// # Safety
-/// `h_device` must be the handle `queue::CommandListState` recorded for a live
-/// list, i.e. one `device12::create_device` returned `S_OK` for.
-unsafe fn report_error(h_device: ddi12::D3D12DDI_HDEVICE, hr: Hresult) {
-    // SAFETY: the caller guarantees a live device handle; the borrow does not
-    // outlive this call.
-    let Some(dev) = (unsafe { device12::device(h_device) }) else {
+/// `state` must be a `CommandListState` borrowed for the duration of the current
+/// DDI call — i.e. one [`recording_list`] or `queue::command_list_state` has just
+/// returned. The borrow those hand back has an unbounded lifetime, so liveness is
+/// a caller obligation rather than something `&CommandListState` proves.
+unsafe fn report_error(state: &CommandListState, hr: Hresult) {
+    // SAFETY: the caller guarantees `state` is live, and `h_device` is the handle
+    // `create_command_list` recorded for it — a device that outlives its lists.
+    // The borrow does not outlive this call.
+    let Some(dev) = (unsafe { device12::device(state.h_device()) }) else {
         note_refusal(&L3A_REFUSALS.set_error_no_device);
         return;
     };
-    if !device12::set_error(dev, hr) {
+    if !device12::set_command_list_error(dev, state.h_rt_list(), hr) {
         note_refusal(&L3A_REFUSALS.set_error_cb_absent);
     }
 }
@@ -238,10 +276,15 @@ fn engine_list9(state: &CommandListState) -> Option<ID3D12GraphicsCommandList9> 
 /// place in this file where that distinction is not a judgement call: D3D12's
 /// contract is that every recording error a driver detected surfaces *here*, at
 /// `Close`, and an application that is told `S_OK` will go on to submit a list
-/// the engine has already rejected. `DDI_REFERENCE.md` §9.12's warning that
-/// `pfnSetErrorCb` removes the device is the reason the *other* refusals in this
-/// crate stay counted-only; a list that cannot be closed is exactly the case the
-/// callback is for.
+/// the engine has already rejected.
+///
+/// ⭐ **`pfnSetCommandListErrorCb` is the callback that contract is built on**,
+/// and this is its textbook case: the runtime drops every later recording call
+/// into *this* list and hands the application the failure at `Close`
+/// ([`report_error`]). `DDI_REFERENCE.md` §9.12's warning that `pfnSetErrorCb`
+/// removes the whole device is why the *caps* refusals in this file stay
+/// counted-only — it has never been what a recording report has to cost, and
+/// this file no longer pays it.
 ///
 /// ⚠ There is no "already closed" arm. vkd3d answers a redundant `Close` with a
 /// failure HRESULT of its own and that lands in the same counter — which is the
@@ -272,9 +315,9 @@ unsafe extern "C" fn close_command_list(h_list: ddi12::D3D12DDI_HCOMMANDLIST) {
             n + 1,
         );
     }
-    // SAFETY: `h_device()` is the handle `create_command_list` recorded for this
-    // list, so it is a live device handle.
-    unsafe { report_error(state.h_device(), hr) };
+    // SAFETY: `state` is the borrow `command_list_state` returned above and does
+    // not outlive this call.
+    unsafe { report_error(state, hr) };
 }
 
 /// `pfnResetCommandList` -> `ID3D12GraphicsCommandList::Reset(allocator, NULL)`.
@@ -328,12 +371,20 @@ unsafe extern "C" fn close_command_list(h_list: ddi12::D3D12DDI_HCOMMANDLIST) {
 /// leaves `d3d12_bundle::allocator` NULL, and every bundle recording method goes
 /// through `d3d12_bundle_add_command`, which dereferences it with no null test
 /// (`bundle.c:253-267` into `bundle.c:29-57`). That is why this arm **reports**
-/// rather than merely counting: `pfnResetCommandList` returns `VOID`, so
-/// `pfnSetErrorCb` is the only way to tell the runtime that the list it is about
+/// rather than merely counting: `pfnResetCommandList` returns `VOID`, so the
+/// error callback is the only way to tell the runtime that the list it is about
 /// to record into is not usable, and a silent count would hand the application a
 /// null dereference inside its own process instead. This is a real correctness
 /// failure of this driver, not a capability it declines to advertise, which is
 /// the distinction `DDI_REFERENCE.md` §9.12 draws for the callback.
+///
+/// ⭐ **And the callback is `pfnSetCommandListErrorCb`, which fits this failure
+/// exactly** — see [`report_error`]. The runtime's documented response is to
+/// *"drop all calls into the driver which record commands on the specified
+/// command list"*, i.e. precisely the calls that would otherwise reach
+/// `d3d12_bundle_add_command` with a NULL allocator. The device-scoped
+/// `pfnSetErrorCb` this arm used to call also prevented the dereference, by
+/// destroying the whole `ID3D12Device` the unusable list belonged to.
 ///
 /// ⛔ **The fix is one allocator per (pool, class) in `queue.rs`** — the same fix
 /// `queue.rs`'s `PoolTypeMismatch` already names, arrived at from the other
@@ -360,8 +411,8 @@ unsafe extern "C" fn reset_command_list(
     };
     if arg.is_null() {
         note_refusal(&L3A_REFUSALS.reset_bad_arg);
-        // SAFETY: a live device handle, as `close_command_list`.
-        unsafe { report_error(state.h_device(), E_INVALIDARG) };
+        // SAFETY: `state` is live for this DDI call, as `close_command_list`.
+        unsafe { report_error(state, E_INVALIDARG) };
         return;
     }
     // SAFETY: non-null per the check; the DDI declares it `_In_ CONST`.
@@ -373,7 +424,24 @@ unsafe extern "C" fn reset_command_list(
     // API's `D3D12_COMMAND_LIST_FLAGS` defines only `NONE`, so there is nothing
     // to forward them to.
     if a.CommandListFlags != ddi12::D3D12DDI_COMMAND_LIST_FLAGS_D3D12DDI_COMMAND_LIST_FLAG_NONE {
-        note_refusal(&L3A_REFUSALS.reset_flags_ignored);
+        // ⛔ `bump`, not `note_refusal`, and the reason is the counter's own
+        // grading: it is *expected non-zero under a debug layer or a PIX
+        // capture*, which is exactly the configuration triage runs in.
+        // `note_refusal` prints the whole `D3D12 DDI refusals:` set on a
+        // counter's first hit, so the old form wrote a full refusal record on
+        // the FIRST reset of every debug-layer run — for two marker bits this
+        // driver knowingly tolerates. Same hazard the depth-bounds and
+        // stream-output splits were made to remove, in the one arm that had it
+        // by construction rather than by accident.
+        L3A_REFUSALS.reset_flags_ignored.bump();
+        let n = L3A_REFUSALS.reset_flags_ignored.get();
+        if n <= 8 {
+            log_error!(
+                "ResetCommandList: CommandListFlags={:#x} carries marker hints the API enum has \
+                 no counterpart for; dropped (x{n})",
+                a.CommandListFlags,
+            );
+        }
     }
 
     // SAFETY: the caller guarantees `hDrvCommandRecorder` is a live recorder
@@ -386,8 +454,8 @@ unsafe extern "C" fn reset_command_list(
             } => (allocator, list_type),
             RecorderAllocator::NoRecorder => {
                 note_refusal(&L3A_REFUSALS.reset_recorder_missing);
-                // SAFETY: a live device handle, as above.
-                unsafe { report_error(state.h_device(), E_INVALIDARG) };
+                // SAFETY: `state` is live for this DDI call, as above.
+                unsafe { report_error(state, E_INVALIDARG) };
                 return;
             }
             RecorderAllocator::NoPoolBound => {
@@ -399,8 +467,8 @@ unsafe extern "C" fn reset_command_list(
                         n + 1,
                     );
                 }
-                // SAFETY: a live device handle, as above.
-                unsafe { report_error(state.h_device(), E_FAIL) };
+                // SAFETY: `state` is live for this DDI call, as above.
+                unsafe { report_error(state, E_FAIL) };
                 return;
             }
         };
@@ -430,11 +498,11 @@ unsafe extern "C" fn reset_command_list(
                 n + 1,
             );
         }
-        // SAFETY: a live device handle, as above. ⛔ Reported, not merely
+        // SAFETY: `state` is live for this DDI call, as above. ⛔ Reported, not merely
         // counted: the list is left unreset, and recording into an unreset
         // bundle dereferences a NULL allocator inside the engine
         // (bundle.c:253-267), so the runtime has to be told the list is unusable.
-        unsafe { report_error(state.h_device(), E_INVALIDARG) };
+        unsafe { report_error(state, E_INVALIDARG) };
         return;
     }
 
@@ -464,8 +532,8 @@ unsafe extern "C" fn reset_command_list(
             n + 1,
         );
     }
-    // SAFETY: a live device handle, as above.
-    unsafe { report_error(state.h_device(), hr) };
+    // SAFETY: `state` is live for this DDI call, as above.
+    unsafe { report_error(state, hr) };
 }
 
 // ---------------------------------------------------------------------------
@@ -805,6 +873,21 @@ const DEFAULT_BLEND_FACTOR: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
 const MAX_VIEWPORTS_AND_SCISSORS: usize =
     D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE as usize;
 
+/// The depth-bounds range D3D12 defines as the default, and therefore the exact
+/// value the runtime's per-reset state block restores.
+///
+/// ⛔ Named rather than written inline at the one comparison, because the two
+/// halves of [`om_set_depth_bounds`]'s partition are only correct *together*:
+/// this is what makes "the runtime's unconditional default write" and "an
+/// application asking for depth bounds" separable at all. `DepthBoundsTest.md`
+/// states it for the API — *"The default values are 0 and 1 for the Min and Max,
+/// respectively"* — and again, verbatim, for the DDI. ⚠ There is no generated
+/// constant for it on either side; the spec text is the whole authority, which is
+/// why it is quoted here rather than cited.
+const DEPTH_BOUNDS_DEFAULT_MIN: ddi12::FLOAT = 0.0;
+/// The upper half of [`DEPTH_BOUNDS_DEFAULT_MIN`]'s range.
+const DEPTH_BOUNDS_DEFAULT_MAX: ddi12::FLOAT = 1.0;
+
 /// `pfnIaSetTopology` -> `ID3D12GraphicsCommandList::IASetPrimitiveTopology`.
 ///
 /// See the identity proof above for why the value is range-checked and for the
@@ -844,9 +927,9 @@ unsafe extern "C" fn ia_set_topology(
                 n + 1,
             );
         }
-        // SAFETY: `h_device()` is the handle `create_command_list` recorded for
-        // this list, so it is a live device handle.
-        unsafe { report_error(state.h_device(), E_INVALIDARG) };
+        // SAFETY: `state` is the borrow `recording_list` returned above and does
+        // not outlive this call.
+        unsafe { report_error(state, E_INVALIDARG) };
         return;
     };
     if topology == ddi12::D3D12DDI_PRIMITIVE_TOPOLOGY_D3D12DDI_PRIMITIVE_TOPOLOGY_TRIANGLEFAN {
@@ -894,8 +977,8 @@ unsafe extern "C" fn rs_set_viewports(
                 k + 1,
             );
         }
-        // SAFETY: a live device handle, as `ia_set_topology`.
-        unsafe { report_error(state.h_device(), E_INVALIDARG) };
+        // SAFETY: `state` is live for this DDI call, as `ia_set_topology`.
+        unsafe { report_error(state, E_INVALIDARG) };
         return;
     }
     // ⚠ `&[]` for the empty case rather than `from_raw_parts(null, 0)`, which is
@@ -938,8 +1021,8 @@ unsafe extern "C" fn rs_set_scissor_rects(
                 k + 1,
             );
         }
-        // SAFETY: a live device handle, as `ia_set_topology`.
-        unsafe { report_error(state.h_device(), E_INVALIDARG) };
+        // SAFETY: `state` is live for this DDI call, as `ia_set_topology`.
+        unsafe { report_error(state, E_INVALIDARG) };
         return;
     }
     let api_rects: &[RECT] = if n == 0 {
@@ -970,7 +1053,14 @@ unsafe extern "C" fn om_set_blend_factor(
         return;
     };
     let value: &[f32; 4] = if factor.is_null() {
-        note_refusal(&L3A_REFUSALS.blend_factor_defaulted);
+        // ⚠ Not a refusal, and ⛔ `bump` rather than `note_refusal` for the same
+        // reason as the triangle-fan and `SoTargetsNullArray` arms: this arm
+        // FORWARDS the value D3D12 documents for a NULL, so nothing was refused
+        // and it must not print the `D3D12 DDI refusals:` set. ⚠ This slot is in
+        // the runtime's own per-reset state block too — `D-triangle.log:301`
+        // reads `cl[27] pfnOmSetBlendFactor 7` against 7 resets — so if the
+        // runtime lowers its default as NULL, the first hit is frame 1.
+        L3A_REFUSALS.blend_factor_defaulted.bump();
         &DEFAULT_BLEND_FACTOR
     } else {
         // SAFETY: non-null per the check. The length is NOT carried by the type
@@ -1068,29 +1158,88 @@ unsafe extern "C" fn set_pipeline_state(
     unsafe { state.engine().SetPipelineState(pso.as_deref()) };
 }
 
-/// `pfnOMSetDepthBounds` — **REFUSED**, `L3aDepthBoundsRefused`.
+/// `pfnOMSetDepthBounds` — **counted, in two arms.**
 ///
-/// ⛔ `caps12.rs:571` reports `DepthBoundsTestSupported = 0`, so no pipeline
-/// this driver advertises can perform a depth-bounds test and there is nothing
-/// for a bounds value to affect. Same shape and same reasoning as
-/// `queue::update_tile_mappings`: counted, and deliberately **not** raised
-/// through `pfnSetErrorCb`, because a hit means a caps inconsistency somewhere
-/// else and removing the device would not fix it.
+/// ⛔ `caps12.rs:571` reports `DepthBoundsTestSupported = 0`, so no pipeline this
+/// driver advertises can perform a depth-bounds test and there is nothing for a
+/// bounds value to affect. Neither arm forwards.
+///
+/// # ⛔ Two arms, because the runtime calls this slot after EVERY reset
+///
+/// ⚠ **A single counter here was graded backwards and could not have been read.**
+/// `DDI_REFERENCE.md:3499-3504` measured `pfnResetCommandList` as being followed
+/// by a fixed 15-call state-reset block *"whether or not the application touches
+/// that state"*, and `pfnOMSetDepthBounds` is one of the fifteen:
+/// `tmp/dx12/gates/G5/D-triangle.log:293` reads `cl[1] pfnResetCommandList 7` and
+/// `:310` reads `cl[52] pfnOMSetDepthBounds 7` — identical counts, in a triangle
+/// sample that never uses depth bounds. So one counter was guaranteed non-zero on
+/// any workload that records a command list, while its doc graded it *"Expected
+/// 0, and a hit is a finding about the caps"*. Because `note_refusal` prints the
+/// whole `D3D12 DDI refusals:` set on a counter's first hit
+/// (`umd12/src/lib.rs:556-560`), frame 1 of the first gate run wrote a refusal
+/// record and sent triage after a caps bug that cannot exist.
+///
+/// ⭐ **The partition is exact, not a heuristic.** The depth-bounds default is
+/// `[0.0, 1.0]` — `tmp/dx12/specs/d3d/DepthBoundsTest.md` states it twice, once
+/// for the API (*"The default values are 0 and 1 for the Min and Max,
+/// respectively"*) and once for the DDI — so that is the value the reset block
+/// restores and `min == 0.0 && max == 1.0` separates the runtime's unconditional
+/// default write from an application request with no tolerance and no guessing.
+///
+/// * the default: `L3aDepthBoundsDefaultDropped`, graded **expected non-zero**,
+///   ~1 per `pfnResetCommandList`. It changes nothing, so dropping it is exact.
+/// * anything else: `L3aDepthBoundsRefused`, graded **Expected 0**, and it logs.
+///
+/// ⛔ Split exactly as L9 split `pfnRSSetShadingRate` — `L9ShadingRateDefaultDropped`
+/// / `L9ShadingRateRefused` in `misc.rs`, which cites the same measured block —
+/// including `note_refusal` on both arms: the first-hit summary is what makes
+/// either counter readable at all, and once the two are separated the line it
+/// prints says which of them moved.
+///
+/// ⭐ **Reading both floats is the point of the body**, not incidental: as `_min`
+/// and `_max` they were dropped arguments with no counter, so nothing could tell
+/// the two cases apart. NaN is not a special case — the API converts NaNs to 0
+/// before the DDI sees them, and a NaN that arrived anyway compares unequal to
+/// both bounds and lands in the refused arm, which is where an unexplained value
+/// belongs.
+///
+/// ⚠ **Neither arm is reported to the runtime**, and that policy was re-checked
+/// against [`report_error`]'s repoint rather than inherited. For the default arm
+/// it is not close: it fires once per reset, so a report would quarantine every
+/// command list this driver ever hands back. For the refused arm the reason is
+/// the older one, and it survives the repoint because it was never about the
+/// cost: a declined *capability* is not a lost recording. This driver publishes
+/// `DepthBoundsTestSupported = 0` in caps, and `DepthBoundsTest.md`'s "Runtime
+/// Code" section describes the runtime deciding **from that cap** to remove the
+/// command list when the DDI is unsupported — so the fact is already published
+/// where the runtime reads it, and reporting would answer it a second time from
+/// the wrong end.
 ///
 /// ⚠ **The engine is not the limit here** — `d3d12_command_list_OMSetDepthBounds`
 /// is fully implemented (`command.c:18047-18061`). So the whole cost of turning
 /// this on is `caps12.rs` reporting the cap and this body forwarding two floats;
-/// the counter is what says whether any workload ever wanted it.
+/// `L3aDepthBoundsRefused` is what says whether any workload ever wanted it.
 ///
 /// # Safety
 /// Trivially safe: no argument is dereferenced. Declared `unsafe` because the
 /// DDI's PFN typedef is.
 unsafe extern "C" fn om_set_depth_bounds(
     _h_list: ddi12::D3D12DDI_HCOMMANDLIST,
-    _min: ddi12::FLOAT,
-    _max: ddi12::FLOAT,
+    min: ddi12::FLOAT,
+    max: ddi12::FLOAT,
 ) {
+    if min == DEPTH_BOUNDS_DEFAULT_MIN && max == DEPTH_BOUNDS_DEFAULT_MAX {
+        note_refusal(&L3A_REFUSALS.depth_bounds_default_dropped);
+        return;
+    }
     note_refusal(&L3A_REFUSALS.depth_bounds_refused);
+    if let Some(n) = record_budget() {
+        log_error!(
+            "OMSetDepthBounds: [{min}, {max}] is not the [0, 1] default the runtime's state-reset \
+             block restores, and this driver reports DepthBoundsTestSupported=0 -- dropped (x{})",
+            n + 1,
+        );
+    }
 }
 
 /// `pfnSetSamplePositions` — **REFUSED**, `L3aSamplePositionsRefused`.
@@ -1159,9 +1308,9 @@ unsafe extern "C" fn om_set_front_and_back_stencil_ref(
         return;
     };
     let Some(list9) = engine_list9(state) else {
-        // SAFETY: a live device handle, as `ia_set_topology`. The state was
+        // SAFETY: `state` is live for this DDI call, as `ia_set_topology`. The state was
         // dropped, which is a correctness failure and not a declined capability.
-        unsafe { report_error(state.h_device(), E_FAIL) };
+        unsafe { report_error(state, E_FAIL) };
         return;
     };
     // SAFETY: `list9` is an owned reference to the same engine list, live for
@@ -1196,8 +1345,8 @@ unsafe extern "C" fn rs_set_depth_bias(
         return;
     };
     let Some(list9) = engine_list9(state) else {
-        // SAFETY: a live device handle, as `om_set_front_and_back_stencil_ref`.
-        unsafe { report_error(state.h_device(), E_FAIL) };
+        // SAFETY: `state` is live for this DDI call, as `om_set_front_and_back_stencil_ref`.
+        unsafe { report_error(state, E_FAIL) };
         return;
     };
     // SAFETY: `list9` is live for this call; three by-value `FLOAT`s, forwarded
@@ -1297,8 +1446,8 @@ unsafe extern "C" fn ia_set_vertex_buffers(
                 k + 1,
             );
         }
-        // SAFETY: a live device handle, as `ia_set_topology`.
-        unsafe { report_error(state.h_device(), E_INVALIDARG) };
+        // SAFETY: `state` is live for this DDI call, as `ia_set_topology`.
+        unsafe { report_error(state, E_INVALIDARG) };
         return;
     }
     let slice: Option<&[D3D12_VERTEX_BUFFER_VIEW]> = if views.is_null() {
@@ -1318,11 +1467,33 @@ unsafe extern "C" fn ia_set_vertex_buffers(
 
 /// `pfnSOSetTargets` -> `ID3D12GraphicsCommandList::SOSetTargets`.
 ///
-/// ⛔ The bound is `D3D12_SO_BUFFER_SLOT_COUNT` (4), and the null check is not
-/// optional here the way it is for vertex buffers: vkd3d's `SOSetTargets`
-/// dereferences `views[i]` with **no** null test
-/// (`command.c:14641-14660`), so a non-zero count with a null array would fault
-/// inside the engine.
+/// ⛔ The bound is `D3D12_SO_BUFFER_SLOT_COUNT` (4), and a range outside it is
+/// refused and reported, exactly as in [`ia_set_vertex_buffers`].
+///
+/// # ⭐ A null `pViews` with a non-zero count FORWARDS, and does not remove
+/// anything
+///
+/// ⚠ It used to be folded into the range check and answered with an error
+/// report, which the `PARALLEL.md` §10 review caught as an asymmetry: the twin
+/// slot one screen up takes the **identical** `(HCOMMANDLIST, StartSlot,
+/// NumViews, pViews)` shape, sits in the **same** measured 15-call per-reset
+/// block (`DDI_REFERENCE.md:3499-3504`), and treats that shape as a legal no-op
+/// on vkd3d's own authority — *"Native drivers appear to ignore this call"*
+/// (`vkd3d-proton-helios/libs/vkd3d/command.c:14556-14558`). One slot cannot
+/// answer a shape with a driver error while its twin forwards it.
+///
+/// ⚠ **Reachability is UNPROVEN** — `tmp/dx12/gates/G5/D-triangle.log:307` shows
+/// `cl[47] pfnSOSetTargets 7` against 7 `pfnResetCommandList` calls, so this slot
+/// does fire once per reset, but the trace records slot names and not arguments.
+/// If the runtime ever lowers "no stream-output targets" as `(0, N, NULL)`, the
+/// old code answered the first reset of the first frame with an error report.
+///
+/// ⛔ **Forwarding is strictly safer in both directions**, which is why it is not
+/// a coin toss. `SOSetTargets(start, None)` reaches the engine as
+/// `view_count = 0, views = NULL` (windows-rs `map_or(0, len)`), so the loop that
+/// dereferences `views[i]` with **no** null test (`command.c:14641-14660`) runs
+/// zero times — the fault the old check existed to prevent is prevented by the
+/// count, not by the refusal — and a possibly-legal unbind stops being fatal.
 ///
 /// ⚠ Stream output needs `VK_EXT_transform_feedback`; without it vkd3d prints a
 /// `FIXME` and returns, which is the engine's answer to give and is not
@@ -1343,20 +1514,29 @@ unsafe extern "C" fn so_set_targets(
     let start = start_slot as usize;
     let n = num_views as usize;
     let limit = D3D12_SO_BUFFER_SLOT_COUNT as usize;
-    if start >= limit || n > limit - start || (n != 0 && views.is_null()) {
+    if start >= limit || n > limit - start {
         note_refusal(&L3A_REFUSALS.so_targets_bad_arg);
         if let Some(k) = record_budget() {
             log_error!(
-                "SOSetTargets: StartSlot={start_slot} NumViews={num_views} pViews={views:p} -- \
-                 refused against the {limit} stream-output slots D3D12 defines (x{})",
+                "SOSetTargets: StartSlot={start_slot} NumViews={num_views} is outside the {limit} \
+                 stream-output slots D3D12 defines -- refused (x{})",
                 k + 1,
             );
         }
-        // SAFETY: a live device handle, as `ia_set_topology`.
-        unsafe { report_error(state.h_device(), E_INVALIDARG) };
+        // SAFETY: `state` is live for this DDI call, as `ia_set_topology`.
+        unsafe { report_error(state, E_INVALIDARG) };
         return;
     }
     let slice: Option<&[D3D12_STREAM_OUTPUT_BUFFER_VIEW]> = if views.is_null() {
+        if n != 0 {
+            // ⚠ Not a refusal, and ⛔ `bump` rather than `note_refusal` for the
+            // same reason as the triangle-fan arm: this arm FORWARDS, and
+            // `note_refusal` would print the whole `D3D12 DDI refusals:` set at
+            // error level on its first hit. If the runtime does lower the null
+            // form, that first hit is the first reset of the first frame — a
+            // refusal record for a call this driver honoured.
+            L3A_REFUSALS.so_targets_null_array.bump();
+        }
         None
     } else if n == 0 {
         Some(&[])
@@ -1410,8 +1590,8 @@ unsafe extern "C" fn om_set_render_targets(
                 k + 1,
             );
         }
-        // SAFETY: a live device handle, as `ia_set_topology`.
-        unsafe { report_error(state.h_device(), E_INVALIDARG) };
+        // SAFETY: `state` is live for this DDI call, as `ia_set_topology`.
+        unsafe { report_error(state, E_INVALIDARG) };
         return;
     }
     let rtvs =
@@ -1459,13 +1639,13 @@ unsafe extern "C" fn ia_set_index_buffer_strip_cut_value(
                 n + 1,
             );
         }
-        // SAFETY: a live device handle, as `ia_set_topology`.
-        unsafe { report_error(state.h_device(), E_INVALIDARG) };
+        // SAFETY: `state` is live for this DDI call, as `ia_set_topology`.
+        unsafe { report_error(state, E_INVALIDARG) };
         return;
     };
     let Some(list9) = engine_list9(state) else {
-        // SAFETY: a live device handle, as `om_set_front_and_back_stencil_ref`.
-        unsafe { report_error(state.h_device(), E_FAIL) };
+        // SAFETY: `state` is live for this DDI call, as `om_set_front_and_back_stencil_ref`.
+        unsafe { report_error(state, E_FAIL) };
         return;
     };
     // SAFETY: `list9` is live for this call; one translated by-value enumerator.
@@ -1496,10 +1676,13 @@ unsafe extern "C" fn ia_set_index_buffer_strip_cut_value(
 /// a `WARN` and nothing else. A disagreement between the two sides about which
 /// lists are bundles is worth measuring exactly because measuring it is free.
 ///
-/// ⚠ **This slot cannot work while `pfnResetCommandList` refuses bundles.** A
-/// bundle this driver never reset has an empty command chain, so the forward is
-/// a no-op; see [`reset_command_list`] for why, and for whose file the fix is
-/// in.
+/// ⚠ **This slot cannot work while this driver refuses bundles**, and the
+/// refusal is now at `queue::create_command_list` rather than at
+/// `pfnResetCommandList` — so in practice the runtime never reaches here with a
+/// bundle handle at all, because the application's `CreateCommandList` failed.
+/// ⛔ Which makes `L3aExecuteBundleMissing` / `L3aExecuteBundleNotBundle` the
+/// instruments for *"the runtime submitted a bundle anyway"*, a question worth
+/// keeping open; `L2BundleListRefused` is where the lost work is counted.
 ///
 /// # Safety
 /// As [`draw_instanced`], for **both** handles.
@@ -1522,8 +1705,8 @@ unsafe extern "C" fn execute_bundle(
                 n + 1,
             );
         }
-        // SAFETY: a live device handle, as `ia_set_topology`.
-        unsafe { report_error(state.h_device(), E_INVALIDARG) };
+        // SAFETY: `state` is live for this DDI call, as `ia_set_topology`.
+        unsafe { report_error(state, E_INVALIDARG) };
         return;
     };
     if bundle.list_type() != D3D12_COMMAND_LIST_TYPE_BUNDLE {
@@ -1636,9 +1819,10 @@ pub(crate) struct L3aRefusals {
     /// live `queue::CommandListState`. **Expected 0** — the runtime only records
     /// into a list `pfnCreateCommandList` returned `S_OK` for.
     ///
-    /// ⚠ It is deliberately **not** reported through `pfnSetErrorCb`: with no
-    /// state there is no `h_device` to report against, which is the one failure
-    /// this table cannot escalate.
+    /// ⚠ It is the one failure in this file that **cannot** be reported at all:
+    /// with no `CommandListState` there is neither the `h_rt_list` the
+    /// list-scoped callback takes nor the `h_device` the device-scoped one does,
+    /// so both channels are out of reach. Every other refusal here has a choice.
     command_list_missing: RefusalCounter,
     /// `ID3D12GraphicsCommandList::Close` failed, and the failure **was** raised
     /// to the runtime. **Expected 0**; a hit means the engine rejected something
@@ -1661,6 +1845,16 @@ pub(crate) struct L3aRefusals {
     /// a debug layer or a PIX capture; they are tooling hints, not behaviour.
     /// Tracks `queue.rs`'s `CommandListFlagsIgnored`, which counts the same two
     /// bits arriving at *create* rather than at reset.
+    ///
+    /// ⛔ Its arm uses `bump()` and logs its own budgeted line, **because** of
+    /// the grading above: `note_refusal` prints the whole `D3D12 DDI refusals:`
+    /// set on a counter's first hit, so a counter expected to fire under the
+    /// debug layer must not be on that path — the debug layer is the
+    /// configuration triage runs in, and a refusal record on frame 1 for a
+    /// tolerated hint sends the reader somewhere there is nothing to find.
+    /// ⚠ **A counter's grading and its call site have to agree**: expected
+    /// non-zero means `bump`, expected 0 means `note_refusal`. This one was
+    /// graded one way and called the other.
     reset_flags_ignored: RefusalCounter,
     /// `D3D12DDIARG_RESETCOMMANDLIST_0040::hDrvCommandRecorder` did not resolve
     /// to a live `queue::RecorderState`. **Expected 0.**
@@ -1680,19 +1874,31 @@ pub(crate) struct L3aRefusals {
     /// The list's class and its recorder's allocator's class disagree, so the
     /// `Reset` was **refused** — not forwarded — and raised to the runtime.
     ///
-    /// ⛔ **Expected 0 — and GUARANTEED non-zero the moment a workload records a
-    /// BUNDLE, in which case it is a defect report about this driver rather than
-    /// a measurement.** ⚠ Its grading changed in the recording lane, and the reason
-    /// is the standing lesson that a counter's grading is a claim which goes
-    /// stale: it previously read *"a non-zero reading without `ResetEngineFailed`
-    /// moving is the good outcome — it would mean vkd3d does not enforce the class
-    /// pairing"*, and the engine source settles that without a run. It enforces,
-    /// in both halves — `command.c:7378-7382` for a regular list,
-    /// `bundle.c:239-245` + `bundle.c:411-427` (vtable identity) for a bundle — so
-    /// the outcome that grading hoped for cannot happen and the pair can never
-    /// move apart. See [`reset_command_list`]; the fix is one allocator per
-    /// (pool, class) in `queue.rs`, and until it lands a bundle cannot be
-    /// recorded at all.
+    /// ⛔ **Expected 0, and the one reachable case it now covers is narrow.**
+    ///
+    /// ⚠⚠ **THIS GRADING HAS BEEN WRONG TWICE, and the second time it went stale
+    /// inside the very merge that corrected the first.** Worth stating in full,
+    /// because the pattern is the point:
+    ///
+    /// 1. It first read *"a non-zero reading without `ResetEngineFailed` moving
+    ///    is the good outcome — it would mean vkd3d does not enforce the class
+    ///    pairing"*. The engine settles that without a run: it enforces in both
+    ///    halves (`command.c:7378-7382` for a regular list, `bundle.c:239-245`
+    ///    and `:411-427` by vtable identity for a bundle), so the hoped-for
+    ///    outcome cannot happen.
+    /// 2. It was then regraded to *"GUARANTEED non-zero the moment a workload
+    ///    records a BUNDLE"*. That was true when written and false by the end of
+    ///    the same merge: `queue::create_command_list` now refuses
+    ///    `Type == BUNDLE` outright (`L2BundleListRefused`), so no bundle list
+    ///    can exist to reach `pfnResetCommandList` at all.
+    ///
+    /// ⇒ **The surviving reachable case is the narrow one**: a DIRECT / COMPUTE /
+    /// COPY list whose recorder is bound to a pool already backed by an allocator
+    /// of a *different* one of those three classes. It pairs with `queue.rs`'s
+    /// `PoolTypeMismatch`, which sees the same disagreement from the binding side.
+    /// ⛔ **For bundles, read `L2BundleListRefused` instead** — that is where the
+    /// lost work now shows up, one DDI earlier. This counter stays as the
+    /// tripwire that says the refusal at create is doing its job.
     reset_list_type_mismatch: RefusalCounter,
     /// `ID3D12GraphicsCommandList::Reset` was forwarded and failed, and the
     /// failure **was** raised to the runtime.
@@ -1704,15 +1910,30 @@ pub(crate) struct L3aRefusals {
     /// allocator the GPU is not done with, which is the application's obligation
     /// rather than this driver's.
     reset_engine_failed: RefusalCounter,
-    /// A command-list slot needed to report a device-scope error and the device
-    /// handle did not resolve. **Expected 0.**
-    set_error_no_device: RefusalCounter,
-    /// A command-list slot needed `pfnSetErrorCb` and there was none.
+    /// A command-list slot needed to report a failure, and the `h_device` its
+    /// `CommandListState` recorded did not resolve to a live device.
     ///
-    /// ⛔ **Expected 0.** It is the first member of
-    /// `D3D12DDI_CORELAYER_DEVICECALLBACKS_0062` and the only error channel this
-    /// whole table has, so a hit means a recording failure the runtime will never
-    /// learn about.
+    /// ⛔ **Expected 0**, and the name is older than what it counts: the report
+    /// itself is now *list*-scoped, but it is still reached by way of the device,
+    /// because `device12::set_command_list_error` needs the device's callback
+    /// table to find the callback. ⚠ The name is kept because counter names are
+    /// the evidence contract — `D3D12 DDI refusals:` lines are diffed across
+    /// builds — and renaming it would break every comparison to buy a word.
+    set_error_no_device: RefusalCounter,
+    /// A command-list slot needed `pfnSetCommandListErrorCb` and the runtime's
+    /// `D3D12DDI_CORELAYER_DEVICECALLBACKS_0062` did not carry one.
+    ///
+    /// ⛔ **Expected 0, and its meaning changed with its call site.** It used to
+    /// count a missing `pfnSetErrorCb`; it now counts a missing
+    /// `pfnSetCommandListErrorCb`, the field immediately below it in the same
+    /// struct. The consequence is different and *smaller*, which is the point: a
+    /// hit is a recording failure the runtime never learns about — this driver
+    /// dropped or refused something and the application will be told its
+    /// `Close()` succeeded — where before a hit meant a device that never died.
+    ///
+    /// ⚠ Read it beside `SetErrorNoDevice`: that one is "no device to ask", this
+    /// one is "asked, and the runtime published no such callback". Only the
+    /// second is a statement about the runtime.
     set_error_cb_absent: RefusalCounter,
     // ── appended by the recording lane; ⛔ append only, never reorder ────────
     /// `pfnIaSetTopology` was handed a value outside the three runs
@@ -1758,6 +1979,13 @@ pub(crate) struct L3aRefusals {
     /// forwarding the NULL would fault inside the caller's process. A hit says
     /// the runtime does pass NULL through to the DDI, which is a fact about the
     /// runtime nothing in `docs/dx12/` records.
+    ///
+    /// ⛔ **Not a refusal, and bumped with `bump` rather than `note_refusal`.**
+    /// The documented value is applied and the call forwards, so nothing was
+    /// refused; and this slot is in the runtime's per-reset state block
+    /// (`D-triangle.log:301`, `cl[27] pfnOmSetBlendFactor 7` against 7 resets),
+    /// so a `note_refusal` here would print the whole `D3D12 DDI refusals:` set
+    /// on frame 1 of any run in which the runtime lowers its default as NULL.
     blend_factor_defaulted: RefusalCounter,
     /// `pfnSetPipelineState` was given a non-null `D3D12DDI_HPIPELINESTATE`
     /// whose slot is empty, i.e. L6's `pfnCreatePipelineState` refused it, and
@@ -1765,18 +1993,36 @@ pub(crate) struct L3aRefusals {
     ///
     /// ⛔ **Expected 0, and read it beside `L6PsoEngineFailed`** — this counter
     /// is the *consequence* of that one, one DDI later, and it is the point at
-    /// which a failed PSO create turns into a draw that cannot work. It is
-    /// deliberately not reported through `pfnSetErrorCb`: L6 already reported
-    /// the create, and removing the device twice for one failure would hide
-    /// which half was first.
-    pipeline_state_unresolved: RefusalCounter,
-    /// `pfnOMSetDepthBounds` — refused, coherently with
-    /// `DepthBoundsTestSupported = 0` in `caps12.rs`.
+    /// which a failed PSO create turns into a draw that cannot work.
     ///
-    /// ⚠ **Expected 0**, and a hit is a finding about the *caps*, not about this
-    /// slot: it would mean an application reached a depth-bounds path on a
-    /// driver that reports no support. ⭐ The engine implements the call fully,
-    /// so if this ever moves the fix is to flip the cap and forward two floats.
+    /// ⚠ **Still not reported after the §10 review re-checked the policy**, but
+    /// for a corrected reason. `pfnCreatePipelineState` is one of the few DDIs
+    /// that **returns an HRESULT**, and L6 returns the engine's
+    /// (`pso.rs`, `L6PsoEngineFailed`) rather than calling any error callback —
+    /// so the runtime failed the application's `CreateGraphicsPipelineState` and
+    /// the application has no `ID3D12PipelineState` to bind. Reaching this slot
+    /// with a non-null handle for a PSO that was never created is therefore a
+    /// runtime-level impossibility, which is what makes Expected 0 a real
+    /// grading; quarantining a list for it would add a second answer to a
+    /// question already answered at the API boundary.
+    pipeline_state_unresolved: RefusalCounter,
+    /// `pfnOMSetDepthBounds` with a range that is **not** the `[0, 1]` default —
+    /// refused, coherently with `DepthBoundsTestSupported = 0` in `caps12.rs`.
+    ///
+    /// ⚠ **Expected 0**, and it is only honestly Expected 0 because
+    /// `DepthBoundsDefaultDropped` now takes the default range: this slot is one
+    /// of the fifteen the runtime issues after every `pfnResetCommandList`
+    /// (`DDI_REFERENCE.md:3499-3504`), so a single counter here was guaranteed
+    /// non-zero on any workload that records a list and this grading was
+    /// unreachable. ⛔ **A counter's grading is a claim and it goes stale like any
+    /// other** — that is the standing lesson, and this is the third counter in
+    /// this crate to be caught by it.
+    ///
+    /// A hit is now what the old grading meant to say: a finding about the
+    /// *caps*, not about this slot — an application reached a depth-bounds path
+    /// on a driver that reports no support. ⭐ The engine implements the call
+    /// fully, so if this ever moves the fix is to flip the cap and forward two
+    /// floats.
     depth_bounds_refused: RefusalCounter,
     /// `pfnSetSamplePositions` — refused for two reasons:
     /// `ProgrammableSamplePositionsTier = NONE`, and the engine's own body is a
@@ -1801,9 +2047,10 @@ pub(crate) struct L3aRefusals {
     ///
     /// ⛔ **Expected 0.** vkd3d answers every `IID_ID3D12GraphicsCommandList*`
     /// from 0 to 10 with the same object, so a hit means the engine behind this
-    /// driver is not the one it links against. It **is** reported through
-    /// `pfnSetErrorCb`: unlike the caps refusals above, this is state the
-    /// application set and the driver silently lost.
+    /// driver is not the one it links against. It **is** reported, through
+    /// `pfnSetCommandListErrorCb`: unlike the caps refusals above, this is state
+    /// the application set and the driver silently lost, so the list that lost it
+    /// must not go on to be submitted as if it were correct.
     list9_unavailable: RefusalCounter,
     /// `pfnIASetIndexBufferStripCutValue` named none of the three values the
     /// enumeration defines. **Expected 0.**
@@ -1813,10 +2060,14 @@ pub(crate) struct L3aRefusals {
     /// the same check and answers with a `WARN` and a silent return, so this
     /// counter is what makes the dropped binding visible.
     vertex_buffers_bad_arg: RefusalCounter,
-    /// `pfnSOSetTargets` addressed a slot outside `D3D12_SO_BUFFER_SLOT_COUNT`,
-    /// or passed a non-zero count with a null array. **Expected 0** — and the
-    /// null case is not merely invalid, it would fault inside the engine, which
-    /// dereferences the array with no null test.
+    /// `pfnSOSetTargets` addressed a slot outside `D3D12_SO_BUFFER_SLOT_COUNT`.
+    /// **Expected 0** — the same range check, made the same non-overflowing way,
+    /// as `VertexBuffersBadArg`.
+    ///
+    /// ⚠ **It no longer counts a non-zero count with a null array**; that moved
+    /// to `SoTargetsNullArray`, which forwards. Read the two together when
+    /// comparing this line against a build from before the §10 review: a
+    /// pre-review non-zero reading here could have been either case.
     so_targets_bad_arg: RefusalCounter,
     /// `pfnOMSetRenderTargets` arrived with a count above
     /// `D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT`, or with a non-zero count and a
@@ -1851,7 +2102,48 @@ pub(crate) struct L3aRefusals {
     /// useful alone. A non-zero reading means a workload actually issues
     /// indirect draws, which is the evidence that would justify the
     /// `D3D12DDI_INDIRECT_ARGUMENT_DESC` translation `queue.rs` deferred.
+    ///
+    /// ⚠ **Counted, not reported, and the §10 review re-checked that** now that a
+    /// report costs a list rather than a device. It stays counted for a reason
+    /// that has nothing to do with the cost: `queue::create_command_signature`
+    /// returns `E_NOTIMPL`, and `pfnCreateCommandSignature` **returns an
+    /// HRESULT**, so the application's `ID3D12Device::CreateCommandSignature`
+    /// already failed and it holds no signature to pass here. A driver-side
+    /// report would be a second answer to a question the API boundary answered
+    /// first — the same shape as `PipelineStateUnresolved`. ⛔ If this ever moves,
+    /// that reasoning is what has been falsified, and reporting becomes correct.
     execute_indirect_refused: RefusalCounter,
+    // ── appended by the §10 error-channel repair; ⛔ append only ─────────────
+    /// `pfnSOSetTargets` arrived with a non-zero `NumViews` and a **null**
+    /// `pViews`, and the call was **forwarded** as `SOSetTargets(start, None)`.
+    ///
+    /// ⚠ **Not a refusal**, and nothing was dropped that the twin slot would have
+    /// kept: `pfnIASetVertexBuffers` answers the identical shape by forwarding
+    /// `None` on vkd3d's own authority (*"Native drivers appear to ignore this
+    /// call"*, `command.c:14556-14558`), and this counter exists so the two can
+    /// stop disagreeing without the disagreement becoming invisible.
+    ///
+    /// ⛔ **Expected 0, and a NON-zero reading is the valuable one** — it would be
+    /// the first evidence that the runtime lowers "no stream-output targets" as
+    /// `(0, N, NULL)`, which `tmp/dx12/gates/G5/D-triangle.log` cannot show
+    /// because it records slot names and not arguments. Until it moves, the null
+    /// form is UNPROVEN rather than absent. ⚠ Read it beside `SoTargetsBadArg`,
+    /// which used to absorb this case and answered it with an error report.
+    so_targets_null_array: RefusalCounter,
+    /// `pfnOMSetDepthBounds` with the `[0, 1]` default range — dropped.
+    ///
+    /// ⚠ **Expected NON-zero, at roughly one per `pfnResetCommandList`**, and a
+    /// **zero** reading is the finding: it would mean the runtime's fixed 15-call
+    /// state-reset block (`DDI_REFERENCE.md:3499-3504`) is not what
+    /// `tmp/dx12/gates/G5/D-triangle.log:293`/`:310` measured — 7 resets, 7
+    /// `pfnOMSetDepthBounds`, in a sample that never uses depth bounds.
+    ///
+    /// ⛔ It exists so `DepthBoundsRefused` can be graded Expected 0 and mean it.
+    /// The default range changes nothing on a driver that reports
+    /// `DepthBoundsTestSupported = 0`, so dropping it is exact rather than
+    /// approximate — the same partition, for the same measured reason, as
+    /// `L9ShadingRateDefaultDropped`.
+    depth_bounds_default_dropped: RefusalCounter,
 }
 
 pub(crate) static L3A_REFUSALS: L3aRefusals = L3aRefusals {
@@ -1882,6 +2174,8 @@ pub(crate) static L3A_REFUSALS: L3aRefusals = L3aRefusals {
     execute_bundle_missing: RefusalCounter::new("L3aExecuteBundleMissing"),
     execute_bundle_not_bundle: RefusalCounter::new("L3aExecuteBundleNotBundle"),
     execute_indirect_refused: RefusalCounter::new("L3aExecuteIndirectRefused"),
+    so_targets_null_array: RefusalCounter::new("L3aSoTargetsNullArray"),
+    depth_bounds_default_dropped: RefusalCounter::new("L3aDepthBoundsDefaultDropped"),
 };
 
 /// L3a's refusal counters, printed by `crate::log_refusal_summary` at this
@@ -1900,9 +2194,12 @@ pub(crate) static L3A_REFUSALS: L3aRefusals = L3aRefusals {
 /// lines get diffed across builds.
 ///
 /// ⚠ The first ten are the list-lifetime pair's, in the order the Round 2 spine
-/// wrote them; the recording lane **appended** its seventeen — 27 entries in all
-/// — and reordered nothing, so every pre-recording `D3D12 DDI refusals:` line is
-/// still a byte-for-byte prefix of a post-recording one.
+/// wrote them; the recording lane **appended** its seventeen, and the §10
+/// error-channel repair appended two more — 29 entries in all. Nothing was
+/// reordered at either step, so every earlier `D3D12 DDI refusals:` line is still
+/// a byte-for-byte prefix of a later one. ⛔ That is why `SoTargetsNullArray` and
+/// `DepthBoundsDefaultDropped` are at the END rather than beside the counters
+/// they split off from, which would read better and would break the diff.
 pub(crate) static REFUSALS: &[&RefusalCounter] = &[
     &L3A_REFUSALS.command_list_missing,
     &L3A_REFUSALS.close_engine_failed,
@@ -1931,4 +2228,6 @@ pub(crate) static REFUSALS: &[&RefusalCounter] = &[
     &L3A_REFUSALS.execute_bundle_missing,
     &L3A_REFUSALS.execute_bundle_not_bundle,
     &L3A_REFUSALS.execute_indirect_refused,
+    &L3A_REFUSALS.so_targets_null_array,
+    &L3A_REFUSALS.depth_bounds_default_dropped,
 ];

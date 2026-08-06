@@ -54,8 +54,22 @@
 //!
 //! ⚠ The struct does not appear in this lane at all — it is a **root-signature
 //! creation** shape and belongs to L6, which reached the same conclusion
-//! independently and recorded it at `pso.rs:1079-1090`, copying by field name so
-//! the code is correct either way.
+//! independently and recorded it in `pso.rs`'s `root_signature_to_1_0`, in the
+//! `D3D12DDI_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS` arm — the comment beginning
+//! *"`DDI_REFERENCE.md` §9.9 warns that `D3D12DDI_ROOT_CONSTANTS` is not
+//! field-order-compatible"* — copying by field name so the code is correct
+//! either way.
+//!
+//! ⛔ Cited by function and by the comment's opening words rather than by line
+//! span **on purpose**, and this citation is why the rule exists: it used to read
+//! `pso.rs:1079-1090`, and the integrator's hand-merge of two lanes' accessors
+//! into `pso.rs` pushed the block down ~84 lines, so the span came to name an
+//! unrelated bounds check. That matters more than a usual stale line — this is
+//! the independent second check the `463154f` correction rests on, so a reader
+//! who follows it and finds nothing reads the corroboration as fabricated.
+//! ⚠ The raw §10 finding proposed re-citing it against `create_root_signature`;
+//! that is the wrong function — the arm is inside `root_signature_to_1_0`, which
+//! `create_root_signature` calls.
 //!
 //! ⛔ The hazard that IS real in the same `DX12.md` row — the descriptor-heap
 //! flags colliding on `0x1` — is L5's and is pinned there
@@ -77,13 +91,28 @@
 //!
 //! Three of the five clear/discard slots carry a `D3D12DDI_HRESOURCE`, and
 //! `descriptors.rs` learned the hard way that a **null** handle and an
-//! **unresolvable** handle must not flatten into the same `None`: meeting a
-//! legal call with `pfnSetErrorCb` gets *"Removing device due to bad UMD
-//! error"*. [`ClearResource`] keeps the three apart. ⚠ Where this lane differs
-//! from L5: for a *view creation* a null resource is D3D12's legal
-//! null-descriptor form, while for these three the API declares `pResource`
-//! `_In_` and required — so a null here is counted and dropped rather than
+//! **unresolvable** handle must not flatten into the same `None`: the two mean
+//! different things and want different answers. [`ClearResource`] keeps the
+//! three apart. ⚠ Where this lane differs from L5: for a *view creation* a null
+//! resource is D3D12's legal null-descriptor form, while for these three the API
+//! declares `pResource` required and vkd3d's `DiscardResource` dereferences it
+//! without a null check — so a null here is counted and dropped rather than
 //! forwarded, and [`L3B_REFUSALS.clear_resource_null`] says so.
+//!
+//! # ⭐⭐ Every failure in this lane is reported at COMMAND-LIST scope
+//!
+//! ⛔ **Not `pfnSetErrorCb`.** This lane's 21 slots are all `VOID`-returning
+//! recording DDIs, and the S6 Round 2 spine claimed the device-scoped
+//! `pfnSetErrorCb` was therefore the only error channel they had. That was
+//! **false**: `pfnSetCommandListErrorCb` sits one field below it in
+//! `D3D12DDI_CORELAYER_DEVICECALLBACKS_0062`, the same struct this driver
+//! already reads `pfnSetCommandListDDITableCb` out of. The runtime's answer to
+//! it is *"the runtime will drop all calls into the driver which record commands
+//! on the specified command list"* — one list quarantined, the application told
+//! at `Close()`, which is D3D12's own recording-error contract — where
+//! `pfnSetErrorCb` removes the whole `ID3D12Device`, and the compositor with it
+//! when the device is DWM's. [`report_error`] is this lane's one door to it and
+//! `device12::set_command_list_error` is behind it.
 
 use helios_umd_common::hr::{Hresult, E_INVALIDARG};
 use helios_umd_common::refusals::RefusalCounter;
@@ -134,47 +163,67 @@ fn budget(throttle: &LogThrottle) -> Option<usize> {
 // Error reporting for the VOID slots
 // ---------------------------------------------------------------------------
 
-/// Report a device-scope failure from a command-list slot, counting the case
-/// where there is no way to hear it.
+/// Report a **command-list**-scope failure from a recording slot, counting the
+/// two cases where there is no way to hear it.
 ///
-/// ⭐ **The command-list table's only error channel**, reached through the
-/// `h_device` that `queue::CommandListState` exists to carry: all 75 of its
-/// slots take `D3D12DDI_HCOMMANDLIST` and nothing else, and every one of this
-/// lane's 21 returns `VOID` (`DECISIONS.md` §7.6).
+/// ⭐ **The channel is `pfnSetCommandListErrorCb`, not `pfnSetErrorCb`** — see
+/// `device12::set_command_list_error`, which carries the whole argument. The
+/// runtime quarantines the one list and the application learns at `Close()`;
+/// nothing else on the device is touched.
+///
+/// ⚠ It takes `&CommandListState` rather than a bare handle because the callback
+/// needs **two** things `queue::CommandListState` carries: `h_device()` to reach
+/// the device's callback table, and `h_rt_list()` — the *runtime's* handle for
+/// this list — to name what to quarantine. Passing them separately would let a
+/// call site pair one list's device with another list's handle.
 ///
 /// ⚠ Its counters are **this lane's**, not `device12`'s, because
 /// `PARALLEL.md` §9.1 puts a lane's counters in the lane's file.
-/// `cmdlist.rs::report_error`, `pso.rs::set_error_if_possible` and
-/// `descriptors.rs::report_error` are the same function against those lanes'
-/// sets.
+/// `cmdlist.rs::report_error` and `copy.rs`'s equivalent are the same function
+/// against those lanes' sets.
 ///
-/// ⛔ Reporting **removes the device**, so it is reserved here for the cases
-/// where continuing would render from state this driver knows is wrong: a
-/// root signature or descriptor heap the runtime named and this driver could
-/// not resolve, and a runtime-supplied array that cannot be read. A capability
-/// this driver does not advertise, or a call whose legality this driver is not
-/// certain of, is **counted and not reported**.
+/// ⛔ **The HRESULT is narrowed for you.** `set_command_list_error` runs it
+/// through `device12::command_list_error_code`, because the callback accepts
+/// exactly three values; call sites pass the code that describes the failure
+/// (`E_INVALIDARG` throughout this lane, i.e. *the application recorded
+/// something this driver cannot honour*) and do not narrow it themselves.
+///
+/// ⭐ **What is reported and what is only counted.** Reporting costs the list
+/// this call is recording into, so it is used wherever continuing would leave
+/// the application rendering from state this driver knows is wrong and could not
+/// tell it about: an unresolvable root signature, descriptor heap or resource, a
+/// runtime array this driver cannot read, and a null resource on a slot whose
+/// API counterpart requires one. What stays **counted only** is the traffic this
+/// driver *forwards* correctly — a null root signature, a zero GPU address, a
+/// null descriptor-heap entry — plus [`clear_root_arguments`], which is refused
+/// on every list create and every `pfnResetCommandList`; reporting there would
+/// quarantine every list in the process.
 ///
 /// # Safety
-/// `h_device` must be the handle `queue::CommandListState` recorded for a live
-/// list, i.e. one `device12::create_device` returned `S_OK` for.
-unsafe fn report_error(h_device: ddi12::D3D12DDI_HDEVICE, hr: Hresult) {
-    // SAFETY: the caller guarantees a live device handle; the borrow does not
-    // outlive this call.
-    let Some(dev) = (unsafe { device12::device(h_device) }) else {
+/// `state` must be borrowed from a live `queue::CommandListState`, i.e. one
+/// [`list_state`] returned for a handle `pfnDestroyCommandList` has not been
+/// called on, whose `h_device()` names a device `device12::create_device`
+/// returned `S_OK` for and `pfnDestroyDevice` has not torn down.
+unsafe fn report_error(state: &CommandListState, hr: Hresult) {
+    // SAFETY: the caller guarantees `state` is live, so `h_device()` is the
+    // handle `create_command_list` recorded for a live device; the borrow does
+    // not outlive this call.
+    let Some(dev) = (unsafe { device12::device(state.h_device()) }) else {
         note_refusal(&L3B_REFUSALS.set_error_no_device);
         return;
     };
-    if !device12::set_error(dev, hr) {
+    if !device12::set_command_list_error(dev, state.h_rt_list(), hr) {
         note_refusal(&L3B_REFUSALS.set_error_cb_absent);
     }
 }
 
 /// Resolve a command-list handle to its state, counting the one failure.
 ///
-/// ⚠ Deliberately **not** reported through `pfnSetErrorCb`: with no state there
-/// is no `h_device` to report against, which is the one failure this table
-/// cannot escalate. `cmdlist.rs` records the same.
+/// ⚠ Deliberately **not** reported: with no state there is neither an
+/// `h_device` to reach the callback table through nor an `h_rt_list` to name the
+/// list to quarantine, so this is the one failure this table cannot escalate —
+/// and the list-scope channel makes that *more* true than the device-scope one
+/// did, because it needs both. `cmdlist.rs` records the same.
 ///
 /// # Safety
 /// `h_list` must be a handle `queue::create_command_list` returned `S_OK` for
@@ -338,7 +387,20 @@ impl RootView {
 /// accepts `nullptr` and vkd3d implements it — `set_root_signature` stores
 /// `NULL` into the bindings and invalidates every root parameter
 /// (`command.c:14021-14034`) — so this is an unbind, and it is counted as an
-/// instrument rather than met with `pfnSetErrorCb`.
+/// instrument rather than reported.
+///
+/// ⛔ And counted with `bump`, **not** `note_refusal`: `note_refusal` prints the
+/// whole `D3D12 DDI refusals:` set at `log_error!` level on a counter's first
+/// hit, and the established triage step is to grep `umd12-<pid>.log` for that
+/// line — so a legal unbind would write a refusal record into a frame on which
+/// nothing was refused. Same rule, and the same words, as `cmdlist.rs`'s
+/// triangle-fan arm: *this arm FORWARDS*. ⚠ It applies here and **not** to this
+/// lane's other three forward-and-count arms
+/// ([`L3B_REFUSALS.root_table_zero_base`],
+/// [`L3B_REFUSALS.descriptor_heap_null_entry`],
+/// [`L3B_REFUSALS.root_view_null_address`]): those are graded Expected 0, so a
+/// hit *is* a finding and dumping the set is what the dump is for. This one is
+/// explicitly not graded.
 ///
 /// ⛔ The counter is **not** graded "expected 0", and the reason it must not be
 /// is worth stating here: the DDI prototype marks the parameter `_In_`
@@ -374,7 +436,10 @@ unsafe fn set_root_signature(
     // into the same `None` an unresolvable handle produces. See that accessor's
     // doc, and `descriptors.rs`'s `view_resource` for the scar.
     let bound = if h_rs.pDrvPrivate.is_null() {
-        note_refusal(&L3B_REFUSALS.root_signature_null);
+        // ⛔ `bump`, not `note_refusal`: this arm FORWARDS a legal unbind, and
+        // `note_refusal` would print the whole `D3D12 DDI refusals:` set on its
+        // first hit. See the doc above.
+        L3B_REFUSALS.root_signature_null.bump();
         None
     } else {
         // SAFETY: non-null per the check; the caller guarantees the handle came
@@ -393,9 +458,9 @@ unsafe fn set_root_signature(
                         n + 1,
                     );
                 }
-                // SAFETY: `h_device()` is the handle `create_command_list`
-                // recorded for this list, so it is a live device handle.
-                unsafe { report_error(state.h_device(), E_INVALIDARG) };
+                // SAFETY: `state` is the live state `list_state` just returned
+                // for this list, which is `report_error`'s whole precondition.
+                unsafe { report_error(state, E_INVALIDARG) };
                 return;
             }
         }
@@ -671,8 +736,8 @@ unsafe fn set_root_32bit_constants(
                 n + 1,
             );
         }
-        // SAFETY: a live device handle, as `set_root_signature`.
-        unsafe { report_error(state.h_device(), E_INVALIDARG) };
+        // SAFETY: `state` is this list's live state, as `set_root_signature`.
+        unsafe { report_error(state, E_INVALIDARG) };
         return;
     }
     if num_32bit_values_to_set == 0 {
@@ -1014,8 +1079,8 @@ unsafe extern "C" fn set_descriptor_heaps(
                 n + 1,
             );
         }
-        // SAFETY: a live device handle, as `set_root_signature`.
-        unsafe { report_error(state.h_device(), E_INVALIDARG) };
+        // SAFETY: `state` is this list's live state, as `set_root_signature`.
+        unsafe { report_error(state, E_INVALIDARG) };
         return;
     }
     if num as usize > MAX_DESCRIPTOR_HEAPS {
@@ -1028,8 +1093,8 @@ unsafe extern "C" fn set_descriptor_heaps(
                 n + 1,
             );
         }
-        // SAFETY: a live device handle, as above.
-        unsafe { report_error(state.h_device(), E_INVALIDARG) };
+        // SAFETY: this list's live state, as above.
+        unsafe { report_error(state, E_INVALIDARG) };
         return;
     }
 
@@ -1064,8 +1129,8 @@ unsafe extern "C" fn set_descriptor_heaps(
                     n + 1,
                 );
             }
-            // SAFETY: a live device handle, as above.
-            unsafe { report_error(state.h_device(), E_INVALIDARG) };
+            // SAFETY: this list's live state, as above.
+            unsafe { report_error(state, E_INVALIDARG) };
             return;
         };
         // ⚠ The clone is the `AddRef`; `bound` releases it on the way out. See
@@ -1182,29 +1247,35 @@ unsafe extern "C" fn clear_root_arguments(h_list: ddi12::D3D12DDI_HCOMMANDLIST) 
 /// ⛔ **The three answers are kept apart at the one place the distinction is
 /// still available** — before `resource12::engine_resource` flattens a null
 /// handle and an unresolvable one into the same `None`. `descriptors.rs`'s
-/// `ViewResource` is the same shape for the same reason, and the reason is that
-/// answering a legal call with `pfnSetErrorCb` gets *"Removing device due to bad
-/// UMD error"* (`DDI_REFERENCE.md` §9.12, the *"Device removal is the runtime's
-/// response to `pfnSetErrorCb`"* bullet).
+/// `ViewResource` is the same shape, and the reason is that the two carry
+/// different information: a null is the runtime declining to name a resource, an
+/// unresolvable handle is this driver losing one it was given.
 ///
 /// ⚠ **Where this lane's grading differs from L5's.** For view *creation* a null
 /// resource is D3D12's legal null-descriptor form. For these three slots it is
 /// not: `ID3D12GraphicsCommandList::ClearUnorderedAccessView{Uint,Float}` and
-/// `::DiscardResource` all declare `pResource` `_In_` and required, and vkd3d's
-/// `DiscardResource` dereferences it without a null check
-/// (`libs/vkd3d/command.c:16305-16333` reaches `d3d12_resource_is_texture` on
-/// the decoded pointer). So [`Null`](ClearResource::Null) is counted and
-/// dropped here rather than forwarded.
+/// `::DiscardResource` all declare `pResource` required, and vkd3d's
+/// `DiscardResource` dereferences it without a null check —
+/// `impl_from_ID3D12Resource(resource)` feeds `d3d12_resource_is_texture`, whose
+/// body is `resource->desc.Dimension != ...` with no guard
+/// (`libs/vkd3d/vkd3d_private.h:1217-1220`). So [`Null`](ClearResource::Null) is
+/// counted and dropped here rather than forwarded.
+///
+/// ⛔ Note the `_In_` annotation is deliberately **not** cited as the evidence:
+/// [`L3B_REFUSALS.root_signature_null`]'s re-grading established that
+/// `ResourceBinding.md` puts `_In_` on by-value scalars with no null form at
+/// all, so it says nothing about nullability. The API's own requirement and the
+/// engine's unguarded dereference are what carry this.
 enum ClearResource<'a> {
     /// The runtime named **no** resource. Counted on
-    /// [`L3B_REFUSALS.clear_resource_null`] and **not** forwarded; see the type
-    /// doc for why this is not L5's legal null-descriptor form.
+    /// [`L3B_REFUSALS.clear_resource_null`], **not** forwarded, and reported at
+    /// list scope; see the type doc for why this is not L5's legal
+    /// null-descriptor form.
     Null,
     /// The runtime named a resource and this driver resolved it to the engine's
     /// object, **borrowed** from L4's state box.
     Engine(&'a ID3D12Resource),
     /// The runtime named a resource and this driver could **not** resolve it.
-    /// The only one of the three that reaches `pfnSetErrorCb`.
     Unresolved,
 }
 
@@ -1228,9 +1299,19 @@ unsafe fn clear_resource<'a>(h_resource: ddi12::D3D12DDI_HRESOURCE) -> ClearReso
 /// Resolve a clear or discard slot's resource, counting and reporting the two
 /// failures so the call sites stay one `let else`.
 ///
+/// ⭐ **Both failures are reported now, and the null one is a policy change.**
+/// It used to be counted-only, and its reason was written down: *"the cost of
+/// being wrong in one direction is a dropped clear (wrong pixels), and in the
+/// other it is 'Removing device due to bad UMD error' on a call that turns out
+/// to be legal"*. The right-hand cost is what changed — [`report_error`] now
+/// quarantines the one list and the application learns at `Close()` — so the
+/// asymmetry that bought silence is gone, and what is left is this driver
+/// dropping a clear the application asked for without telling it. See
+/// [`L3B_REFUSALS.clear_resource_null`] for the reversal condition.
+///
 /// # Safety
-/// As [`clear_resource`]; `state` must be the list's own state, so that
-/// `h_device()` is a live device handle.
+/// As [`clear_resource`]; `state` must be the list's own live state, which is
+/// [`report_error`]'s precondition.
 unsafe fn clear_resource_or_refuse<'a>(
     slot: &str,
     state: &CommandListState,
@@ -1245,12 +1326,15 @@ unsafe fn clear_resource_or_refuse<'a>(
                 log_error!(
                     "{slot}: hDrvResource is NULL. This slot's API counterpart declares \
                      pResource as required, and the engine dereferences it, so the call is \
-                     dropped rather than forwarded. It is NOT reported to the runtime: if this \
-                     ever turns out to be a legal lowering, reporting it would remove the \
-                     device on a legal call (x{})",
+                     dropped rather than forwarded -- and reported on THIS COMMAND LIST, which \
+                     costs the list and not the device. If this ever turns out to be a legal \
+                     lowering, revert the report and leave the counter (x{})",
                     n + 1,
                 );
             }
+            // SAFETY: the caller guarantees `state` is this list's own live
+            // state, which is `report_error`'s precondition.
+            unsafe { report_error(state, E_INVALIDARG) };
             None
         }
         ClearResource::Unresolved => {
@@ -1263,9 +1347,9 @@ unsafe fn clear_resource_or_refuse<'a>(
                     n + 1,
                 );
             }
-            // SAFETY: the caller guarantees `state` is this list's, so
-            // `h_device()` is a live device handle.
-            unsafe { report_error(state.h_device(), E_INVALIDARG) };
+            // SAFETY: the caller guarantees `state` is this list's own live
+            // state, which is `report_error`'s precondition.
+            unsafe { report_error(state, E_INVALIDARG) };
             None
         }
     }
@@ -1279,8 +1363,9 @@ unsafe fn clear_resource_or_refuse<'a>(
 /// where its four clear values are.
 ///
 /// ⚠ The pointer lives in the enum rather than a borrow, because the null check
-/// belongs after the command-list lookup: without the list's state there is no
-/// `h_device` to report a null through.
+/// belongs after the command-list lookup: without the list's state there is
+/// nothing to report a null through — [`report_error`] needs both of the handles
+/// that state carries.
 #[derive(Clone, Copy)]
 enum UavClear {
     Uint(*const ddi12::UINT),
@@ -1370,8 +1455,8 @@ unsafe fn clear_unordered_access_view(
         if let Some(n) = budget(&ERROR_LOG) {
             log_error!("{}: NULL clear values (x{})", values.name(), n + 1);
         }
-        // SAFETY: a live device handle, as `set_root_signature`.
-        unsafe { report_error(state.h_device(), E_INVALIDARG) };
+        // SAFETY: `state` is this list's live state, as `set_root_signature`.
+        unsafe { report_error(state, E_INVALIDARG) };
         return;
     };
     // SAFETY: the caller guarantees `num_rects` live elements behind a non-null
@@ -1385,11 +1470,12 @@ unsafe fn clear_unordered_access_view(
                 n + 1,
             );
         }
-        // SAFETY: a live device handle, as above.
-        unsafe { report_error(state.h_device(), E_INVALIDARG) };
+        // SAFETY: this list's live state, as above.
+        unsafe { report_error(state, E_INVALIDARG) };
         return;
     };
-    // SAFETY: `state` is this list's own state, so `h_device()` is live.
+    // SAFETY: `state` is this list's own live state, which is what
+    // `clear_resource_or_refuse` -- and `report_error` behind it -- requires.
     let Some(resource) = (unsafe { clear_resource_or_refuse(values.name(), state, h_resource) })
     else {
         return;
@@ -1509,8 +1595,8 @@ unsafe extern "C" fn clear_render_target_view(
         if let Some(n) = budget(&ERROR_LOG) {
             log_error!("ClearRenderTargetView: NULL colour (x{})", n + 1);
         }
-        // SAFETY: a live device handle, as `set_root_signature`.
-        unsafe { report_error(state.h_device(), E_INVALIDARG) };
+        // SAFETY: `state` is this list's live state, as `set_root_signature`.
+        unsafe { report_error(state, E_INVALIDARG) };
         return;
     };
     // SAFETY: as `clear_unordered_access_view`.
@@ -1522,8 +1608,8 @@ unsafe extern "C" fn clear_render_target_view(
                 n + 1,
             );
         }
-        // SAFETY: a live device handle, as above.
-        unsafe { report_error(state.h_device(), E_INVALIDARG) };
+        // SAFETY: this list's live state, as above.
+        unsafe { report_error(state, E_INVALIDARG) };
         return;
     };
 
@@ -1612,8 +1698,8 @@ unsafe extern "C" fn clear_depth_stencil_view(
                 n + 1,
             );
         }
-        // SAFETY: a live device handle, as `set_root_signature`.
-        unsafe { report_error(state.h_device(), E_INVALIDARG) };
+        // SAFETY: `state` is this list's live state, as `set_root_signature`.
+        unsafe { report_error(state, E_INVALIDARG) };
         return;
     };
 
@@ -1664,7 +1750,8 @@ unsafe extern "C" fn discard_resource(
     let Some(state) = (unsafe { list_state(h_list) }) else {
         return;
     };
-    // SAFETY: `state` is this list's own state, so `h_device()` is live.
+    // SAFETY: `state` is this list's own live state, which is what
+    // `clear_resource_or_refuse` -- and `report_error` behind it -- requires.
     let Some(resource) =
         (unsafe { clear_resource_or_refuse("DiscardResource", state, h_resource) })
     else {
@@ -1691,8 +1778,8 @@ unsafe extern "C" fn discard_resource(
                     n + 1,
                 );
             }
-            // SAFETY: a live device handle, as `set_root_signature`.
-            unsafe { report_error(state.h_device(), E_INVALIDARG) };
+            // SAFETY: `state` is this list's live state, as `set_root_signature`.
+            unsafe { report_error(state, E_INVALIDARG) };
             return;
         }
         region = D3D12_DISCARD_REGION {
@@ -1768,18 +1855,32 @@ pub(crate) struct L3bRefusals {
     /// live `queue::CommandListState`. **Expected 0** — the runtime only records
     /// into a list `pfnCreateCommandList` returned `S_OK` for.
     ///
-    /// ⚠ Deliberately **not** reported through `pfnSetErrorCb`: with no state
-    /// there is no `h_device` to report against, which is the one failure this
-    /// table cannot escalate. `cmdlist.rs`'s counter of the same name is the
-    /// same case in that lane's slots.
+    /// ⚠ Deliberately **not** reported: with no state there is neither an
+    /// `h_device` to reach the callback table through nor an `h_rt_list` to name
+    /// the list to quarantine, so this is the one failure this table cannot
+    /// escalate. `cmdlist.rs`'s counter of the same name is the same case in
+    /// that lane's slots.
     command_list_missing: RefusalCounter,
-    /// A slot needed to report a device-scope error and the device handle did
-    /// not resolve. **Expected 0.**
+    /// A slot needed to report a command-list error and the `h_device` its
+    /// `CommandListState` recorded did not resolve to a live device.
+    /// **Expected 0** — the state cannot outlive the device that created it, so
+    /// a hit means a list state survived `pfnDestroyDevice`.
     set_error_no_device: RefusalCounter,
-    /// A slot needed `pfnSetErrorCb` and there was none. ⛔ **Expected 0.** It is
-    /// the first member of `D3D12DDI_CORELAYER_DEVICECALLBACKS_0062` and the
-    /// only error channel this whole table has, so a hit means a recording
-    /// failure the runtime will never learn about.
+    /// A slot needed `pfnSetCommandListErrorCb` and the runtime's callback table
+    /// did not carry one.
+    ///
+    /// ⛔ **Expected 0**, and re-graded: this used to count an absent
+    /// `pfnSetErrorCb`, whose absence would have meant *a device that never
+    /// dies*. It now counts an absent `pfnSetCommandListErrorCb`, one field
+    /// below it in `D3D12DDI_CORELAYER_DEVICECALLBACKS_0062` — the same struct
+    /// `forward12::queue::set_command_list_ddi_table` already reads
+    /// `pfnSetCommandListDDITableCb` out of — and the consequence is different:
+    /// **a recording failure the runtime never learns about.** The list is not
+    /// quarantined, the application's `Close()` succeeds, and it renders from
+    /// state this driver already knows is wrong. ⚠ Two absent callbacks in one
+    /// struct this driver otherwise reads successfully means the negotiated
+    /// table is not the `_0062` shape this driver assumes, so a hit is a
+    /// version-negotiation finding before it is anything else.
     set_error_cb_absent: RefusalCounter,
     /// `pfnSetDescriptorHeaps` was given a non-zero count with a null array.
     /// **Expected 0.** ⚠ A **zero** count with a null array is the legal unbind
@@ -1810,9 +1911,9 @@ pub(crate) struct L3bRefusals {
     /// ⛔ **Expected 0.** The refusal is whole-call rather than per-entry
     /// because this DDI replaces the entire bound set: forwarding the survivors
     /// would unbind a heap the application still expects, which is a worse
-    /// failure than the one being reported. Every hit also raises
-    /// `pfnSetErrorCb`, so the device is removed rather than drawing from a
-    /// descriptor table nobody bound.
+    /// failure than the one being reported. Every hit also reports on the list,
+    /// so the runtime quarantines it and the application fails at `Close()`
+    /// rather than drawing from a descriptor table nobody bound.
     descriptor_heap_missing: RefusalCounter,
     /// `pfnSet{Compute,Graphics}RootSignature` was given a null handle, and a
     /// null root signature was forwarded (an unbind).
@@ -1827,6 +1928,12 @@ pub(crate) struct L3bRefusals {
     /// D3D12 and which this driver forwards correctly; it is a **finding only
     /// if it correlates with wrong rendering**. Do not open an investigation on
     /// the reading alone.
+    ///
+    /// ⛔ Which is why the call site uses `bump`, not `note_refusal`: an
+    /// ungraded forward must not print the `D3D12 DDI refusals:` set into a log
+    /// whose triage step is to grep for exactly that line. It is still readable
+    /// — `crate::log_refusal_summary` dumps the whole set at adapter close and
+    /// device teardown regardless.
     ///
     /// ⛔ It was graded "expected 0" on the DDI prototype's `_In_`
     /// (`ResourceBinding.md:5100-5102`) and that grading was **wrong**: the same
@@ -1882,15 +1989,27 @@ pub(crate) struct L3bRefusals {
     /// view *creation* a null resource is required D3D12 behaviour; for
     /// `ClearUnorderedAccessView{Uint,Float}` and `DiscardResource` the API
     /// declares `pResource` required, and vkd3d's `DiscardResource` dereferences
-    /// it without a null check (`libs/vkd3d/command.c:16305-16333`).
+    /// it without a null check — `d3d12_resource_is_texture` is
+    /// `resource->desc.Dimension != ...` with no guard
+    /// (`libs/vkd3d/vkd3d_private.h:1217-1220`).
     ///
-    /// ⚠ It is deliberately **not** reported through `pfnSetErrorCb`, and that
-    /// is the one place in this lane where the choice is not obvious: the cost
-    /// of being wrong in one direction is a dropped clear (wrong pixels), and in
-    /// the other it is *"Removing device due to bad UMD error"* on a call that
-    /// turns out to be legal. Given that a legal lowering with a null resource
-    /// is exactly what `descriptors.rs` discovered for view creation, the
-    /// reversible choice is taken and the counter carries the evidence.
+    /// ⭐ **It IS reported now, and that is a change from S6 Round 2.** The old
+    /// doc justified silence with *"the cost of being wrong ... is 'Removing
+    /// device due to bad UMD error' on a call that turns out to be legal"*, and
+    /// that cost is gone: this lane reports through
+    /// `pfnSetCommandListErrorCb`, which quarantines the one list and surfaces
+    /// at `Close()`. What remains is a clear the application asked for, dropped,
+    /// with nothing told to the application — which is the failure shape this
+    /// project's rules forbid outright.
+    ///
+    /// ⚠ **The reversal condition, named.** vkd3d's ClearUAV bodies *do* guard
+    /// (`if (!resource_impl || !metadata.view) return;`,
+    /// `libs/vkd3d/command.c:16018-16022`), so if a null resource on those two
+    /// slots ever turns out to be a legal lowering, this driver's drop already
+    /// matches what the engine would have done and only the report is wrong:
+    /// take the `report_error` call out of `clear_resource_or_refuse`'s `Null`
+    /// arm, keep the counter, and attach the run. ⛔ Do not extend that to
+    /// `DiscardResource` — there the null would fault inside the engine.
     clear_resource_null: RefusalCounter,
     /// A clear or discard slot named a **non-null** resource handle this driver
     /// could not resolve. ⛔ **Expected 0**; refused and reported, because a
@@ -1906,6 +2025,12 @@ pub(crate) struct L3bRefusals {
     /// through"* plus vkd3d reading the same two bits. A hit means either the
     /// header grew a third bit or that assumption is wrong, and the two are
     /// distinguishable from the logged value.
+    ///
+    /// ⚠ **Reviewed against the list-scope error channel and deliberately still
+    /// counted only.** The known bits are forwarded, so the app gets the
+    /// depth/stencil clear it asked for and loses only an aspect D3D12 does not
+    /// define; failing the whole list over a bit a future header added would be
+    /// a worse answer than the partial clear.
     clear_depth_stencil_flags_unknown: RefusalCounter,
     /// `pfnClearRootArguments` was called and **not forwarded**.
     ///
@@ -1926,6 +2051,12 @@ pub(crate) struct L3bRefusals {
     /// distinguish; see [`clear_root_arguments`] for why forwarding
     /// `ClearState` here would be worse than refusing, and for what closing the
     /// gap would take.
+    ///
+    /// ⛔ **And it must never be reported**, cheap channel or not. It fires on
+    /// every command-list create and every `pfnResetCommandList`, so a
+    /// `pfnSetCommandListErrorCb` here would quarantine every list the process
+    /// ever records into — the device-scope outcome by a slower road. The
+    /// counter and its own log line are the whole instrument.
     clear_root_arguments_not_forwarded: RefusalCounter,
 }
 

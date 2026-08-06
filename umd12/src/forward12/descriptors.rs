@@ -773,7 +773,14 @@ unsafe fn engine_resource<'a>(
 /// `d3d12_rtv_desc_create_rtv` zeroes the RTV (`:8788-8792`), and the engine
 /// hard-requires `VK_EXT_robustness2::nullDescriptor` for exactly this
 /// (`SUBSTRATE.md:426`). Answering `pfnSetErrorCb` there would meet a legal call
-/// with *"Removing device due to bad UMD error"* (`DDI_REFERENCE.md:2126-2130`).
+/// with *"Removing device due to bad UMD error"* — `DDI_REFERENCE.md` §9.12, the
+/// *"Device removal is the runtime's response to `pfnSetErrorCb`"* bullet.
+/// ⚠ Cited by section and opening words rather than by line span, because the
+/// span this used to carry (`:2126-2130`) was invalidated inside its own merge:
+/// the docs commit that struck §9.9's false `D3D12DDI_ROOT_CONSTANTS` hazard
+/// inserted 30 lines above it, and `:2126` now lands in §9.11's multi-queue
+/// prose. A line number into a document another commit is editing is a citation
+/// with a half-life.
 ///
 /// So the three answers are kept apart at the one place the distinction is
 /// still available — before [`engine_resource`] flattens a null handle and an
