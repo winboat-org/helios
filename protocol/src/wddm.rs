@@ -244,7 +244,35 @@ pub struct HeliosWddmAllocMeta {
     pub height: u32,
     pub format: u32, // D3DDDIFORMAT
     pub pitch: u32,
+    /// ⛔⛔ **D3D11 DDI bind flags (`D3D10DDI_BIND_*`), and the vocabulary is a
+    /// WIRE CONTRACT rather than "whatever the producer had".** This was
+    /// undocumented, and a second producer (`helios_umd12.dll`) wrote a
+    /// `D3D12DDI_RESOURCE_FLAGS_0003` word into it — a different vocabulary at
+    /// overlapping bit positions, which is not a mismatch a reader can detect.
+    ///
+    /// The reader is `umd`'s `pfnOpenResource`: `api_bind_flags`
+    /// (`umd/src/forward/state.rs`) passes the low 7 bits through unchanged as
+    /// `D3D11_BIND_*` and maps `0x100` to `D3D11_BIND_UNORDERED_ACCESS`, and the
+    /// result becomes `D3D11_TEXTURE2D_DESC::BindFlags` for the imported texture —
+    /// i.e. the `VkImageUsageFlags` DXVK builds the alias with. ⇒ a wrong word here
+    /// is a wrong-usage image, which fails the import or silently forbids the SRV
+    /// the compositor needs.
+    ///
+    /// ⚠ **The D3D12 DDI's word is not a translation of this one.** Its
+    /// `RENDER_TARGET` is `1` where this field's is `0x20`, and its
+    /// `SHADER_RESOURCE` is `0x10` where this field's is `0x8` — so a D3D12 back
+    /// buffer's `RENDER_TARGET | SHADER_RESOURCE` (`0x11`) would read here as
+    /// `VERTEX_BUFFER | STREAM_OUTPUT`. The `HELIOS_WDDM_BIND_*` constants below
+    /// are what a non-D3D11 producer maps onto.
     pub bind_flags: u32,
+    /// D3D11 DDI misc flags (`D3D10DDI_RESOURCE_MISC_*`), plus the
+    /// `HELIOS_WDDM_ALLOC_MISC_*` bits this project adds above them.
+    ///
+    /// ⚠ Its reader masks it against the **API** `D3D11_RESOURCE_MISC_*` values
+    /// (`SHARED`, `RESOURCE_CLAMP`, `GDI_COMPATIBLE`), which happen to be
+    /// numerically equal to the DDI's for those three. A producer with nothing to
+    /// say writes 0: the opener's C++ side ORs `D3D11_RESOURCE_MISC_SHARED` in
+    /// unconditionally, so 0 is a complete answer for a plain shared image.
     pub misc_flags: u32,
     /// Exact `VkMemoryAllocateInfo::allocationSize` of the backing venus memory
     /// as encoded by the creator (0 = unknown; opener falls back to blob size).
@@ -269,6 +297,33 @@ pub struct HeliosWddmAllocMeta {
     /// and KMD are rebuilt together, so the on-wire layout stays in sync.
     pub plane_offset: u64,
 }
+
+// ── HeliosWddmAllocMeta::bind_flags — the wire vocabulary ───────────────────
+//
+// ⛔ These are the `D3D10DDI_BIND_*` values, declared HERE because
+// [`HeliosWddmAllocMeta::bind_flags`] is a wire field with two producers and only
+// one of them can name the D3D11 DDI header. `umd` writes `a.BindFlags` straight
+// through, which is these numbers by construction; `umd12` has no d3d10umddi
+// bindgen at all and must map onto something, and "something" has to be a
+// declaration rather than a literal at the call site (`ARCHITECTURE.md` §12 rule 1
+// in spirit: the vocabulary lives where the record does).
+//
+// ⚠ Only the values a reader acts on are declared. `api_bind_flags`
+// (`umd/src/forward/state.rs`) consumes the low-7-bit pipeline mask plus `0x100`
+// for UAV and `0x200`/`0x400` for the two video binds; the remaining DDI bits
+// (`PRESENT` 0x80, `CAPTURE` 0x800) are explicitly discarded there, so a producer
+// that set them would be asking for nothing.
+
+/// `D3D10_DDI_BIND_SHADER_RESOURCE` — sampleable. What a compositor needs.
+pub const HELIOS_WDDM_BIND_SHADER_RESOURCE: u32 = 0x0000_0008;
+/// `D3D10_DDI_BIND_RENDER_TARGET`.
+pub const HELIOS_WDDM_BIND_RENDER_TARGET: u32 = 0x0000_0020;
+/// `D3D10_DDI_BIND_DEPTH_STENCIL`.
+pub const HELIOS_WDDM_BIND_DEPTH_STENCIL: u32 = 0x0000_0040;
+/// `D3D11_DDI_BIND_UNORDERED_ACCESS`. ⚠ `0x100` at the DDI and `0x80` at the API —
+/// the one bind whose two spellings differ, and the reason `api_bind_flags` cannot
+/// simply pass the whole word through.
+pub const HELIOS_WDDM_BIND_UNORDERED_ACCESS: u32 = 0x0000_0100;
 
 /// `'HIDN'` — magic of [`HeliosWddmOpenIdentity`].
 pub const HELIOS_WDDM_IDENTITY_MAGIC: u32 = 0x4849_444E;

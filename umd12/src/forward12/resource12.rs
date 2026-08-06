@@ -322,6 +322,20 @@ mod v {
         D3D12DDI_RESOURCE_FLAGS_0003_D3D12DDI_RESOURCE_FLAG_0080_VIDEO_ENCODE_REFERENCE_ONLY;
     pub(super) const RES_RAYTRACING_ACCELERATION_STRUCTURE: D3D12DDI_RESOURCE_FLAGS_0003 =
         D3D12DDI_RESOURCE_FLAGS_0003_D3D12DDI_RESOURCE_FLAG_0088_RAYTRACING_ACCELERATION_STRUCTURE;
+    // ⚠ The five remaining enumerators, aliased for ONE purpose: `meta_bind_flags`
+    // builds its known-bit mask out of these rather than out of a literal, so a
+    // header revision that adds an enumerator makes its counter fire instead of
+    // silently widening the mask. None of them is a bind.
+    pub(super) const RES_CONTENT_PROTECTION: D3D12DDI_RESOURCE_FLAGS_0003 =
+        D3D12DDI_RESOURCE_FLAGS_0003_D3D12DDI_RESOURCE_FLAG_0020_CONTENT_PROTECTION;
+    pub(super) const RES_ONLY_NON_RT_DS_TEXTURE_PLACEMENT: D3D12DDI_RESOURCE_FLAGS_0003 =
+        D3D12DDI_RESOURCE_FLAGS_0003_D3D12DDI_RESOURCE_FLAG_0041_ONLY_NON_RT_DS_TEXTURE_PLACEMENT;
+    pub(super) const RES_ONLY_RT_DS_TEXTURE_PLACEMENT: D3D12DDI_RESOURCE_FLAGS_0003 =
+        D3D12DDI_RESOURCE_FLAGS_0003_D3D12DDI_RESOURCE_FLAG_0041_ONLY_RT_DS_TEXTURE_PLACEMENT;
+    pub(super) const RES_4MB_ALIGNED: D3D12DDI_RESOURCE_FLAGS_0003 =
+        D3D12DDI_RESOURCE_FLAGS_0003_D3D12DDI_RESOURCE_FLAG_0041_4MB_ALIGNED;
+    pub(super) const RES_SAMPLER_FEEDBACK: D3D12DDI_RESOURCE_FLAGS_0003 =
+        D3D12DDI_RESOURCE_FLAGS_0003_D3D12DDI_RESOURCE_FLAG_0073_SAMPLER_FEEDBACK;
 
     // -- D3D12DDI_BARRIER_LAYOUT (d3d12umddi.rs:78589-78657) ----------------
     pub(super) const LAYOUT_UNDEFINED: D3D12DDI_BARRIER_LAYOUT =
@@ -1465,6 +1479,94 @@ const _: () = {
     assert!(core::mem::offset_of!(AdoptedAllocPrivate, meta) == 48);
 };
 
+/// Translate a `D3D12DDI_RESOURCE_FLAGS_0003` word into the **D3D11 DDI bind
+/// word** `HeliosWddmAllocMeta::bind_flags` carries.
+///
+/// # ⛔⛔ Why this is not a cosmetic translation
+///
+/// The field's reader is the D3D11 driver's `pfnOpenResource`, i.e. **DWM opening
+/// this back buffer**: `api_bind_flags` (`umd/src/forward/state.rs`) passes the low
+/// 7 bits through as `D3D11_BIND_*`, and the result becomes
+/// `D3D11_TEXTURE2D_DESC::BindFlags` on the imported alias
+/// (`umd/bridge/dxvk_bridge.cpp`'s `desc.BindFlags = bind_flags`), which is the
+/// `VkImageUsageFlags` DXVK builds it with.
+///
+/// ⇒ passing the D3D12 word verbatim is not "an unread field": it decodes in the
+/// other vocabulary. A swapchain back buffer arrives with
+/// `RENDER_TARGET | SHADER_RESOURCE` = `0x1 | 0x10` = `0x11`, and `0x11` in the
+/// D3D11 DDI is **`VERTEX_BUFFER | STREAM_OUTPUT`** — so DWM would import a
+/// vertex-buffer-and-stream-output image with **no** render-target and **no**
+/// shader-resource usage, and could not sample the frame it is composing. The
+/// overlap is structural rather than unlucky: the two enums number the same
+/// concepts differently and `RENDER_TARGET` is `1` in one and `0x20` in the other.
+///
+/// # The mapping, and what has no counterpart
+///
+/// | D3D12 DDI | D3D11 DDI bind | note |
+/// |---|---|---|
+/// | `RENDER_TARGET` `0x1` | `RENDER_TARGET` `0x20` | |
+/// | `DEPTH_STENCIL` `0x2` | `DEPTH_STENCIL` `0x40` | |
+/// | `SHADER_RESOURCE` `0x10` | `SHADER_RESOURCE` `0x8` | ⚠ the positive form; the *API* spells it `DENY_SHADER_RESOURCE` |
+/// | `UNORDERED_ACCESS` `0x80` | `UNORDERED_ACCESS` `0x100` | ⚠ `0x100` at the DDI, `0x80` at the API — `api_bind_flags` is what re-maps it |
+///
+/// ⚠ **`CROSS_ADAPTER`, `SIMULTANEOUS_ACCESS`, the two video-reference bits,
+/// `CONTENT_PROTECTION`, the three placement/alignment bits, `SAMPLER_FEEDBACK` and
+/// `RAYTRACING_ACCELERATION_STRUCTURE` are dropped and that is correct, not lossy:**
+/// none of them is a bind. `SIMULTANEOUS_ACCESS` in particular is a *sharing*
+/// property and is common on a back buffer, so counting it as a dropped bit would
+/// make the counter fire on every healthy frame. They are named here instead.
+///
+/// ⛔ **A bit outside the known set is counted**, because the only way it can appear
+/// is a header revision adding an enumerator this table has not been told about —
+/// and the failure mode of guessing would be a bind flag nobody asked for.
+fn meta_bind_flags(flags: ddi12::D3D12DDI_RESOURCE_FLAGS_0003) -> u32 {
+    let mut out = 0u32;
+    if flags & v::RES_RENDER_TARGET != 0 {
+        out |= helios_protocol::HELIOS_WDDM_BIND_RENDER_TARGET;
+    }
+    if flags & v::RES_DEPTH_STENCIL != 0 {
+        out |= helios_protocol::HELIOS_WDDM_BIND_DEPTH_STENCIL;
+    }
+    if flags & v::RES_SHADER_RESOURCE != 0 {
+        out |= helios_protocol::HELIOS_WDDM_BIND_SHADER_RESOURCE;
+    }
+    if flags & v::RES_UNORDERED_ACCESS != 0 {
+        out |= helios_protocol::HELIOS_WDDM_BIND_UNORDERED_ACCESS;
+    }
+    // Every enumerator the header defines, mapped or deliberately not. The mask is
+    // built from the aliases rather than written as a literal so that a header
+    // revision adding a bit makes the counter fire instead of silently widening it.
+    let known = v::RES_RENDER_TARGET
+        | v::RES_DEPTH_STENCIL
+        | v::RES_CROSS_ADAPTER
+        | v::RES_SIMULTANEOUS_ACCESS
+        | v::RES_SHADER_RESOURCE
+        | v::RES_VIDEO_DECODE_REFERENCE_ONLY
+        | v::RES_UNORDERED_ACCESS
+        | v::RES_VIDEO_ENCODE_REFERENCE_ONLY
+        | v::RES_RAYTRACING_ACCELERATION_STRUCTURE
+        | v::RES_CONTENT_PROTECTION
+        | v::RES_ONLY_NON_RT_DS_TEXTURE_PLACEMENT
+        | v::RES_ONLY_RT_DS_TEXTURE_PLACEMENT
+        | v::RES_4MB_ALIGNED
+        | v::RES_SAMPLER_FEEDBACK;
+    if flags & !known != 0 {
+        L4_REFUSALS.meta_bind_flag_unknown.bump();
+        let n = L4_REFUSALS.meta_bind_flag_unknown.get();
+        if n <= LOG_BUDGET {
+            log_error!(
+                "L4: D3D12DDI_RESOURCE_FLAGS {:#x} carries bits {:#x} this build's bind-flag \
+                 translation does not know -- the primary's HeliosWddmAllocMeta::bind_flags is \
+                 {:#x} and may be missing a usage the opener needs (x{n})",
+                flags,
+                flags & !known,
+                out,
+            );
+        }
+    }
+    out
+}
+
 /// Give a `PRIMARY` committed resource a kernel allocation the KMD adopts, and
 /// record its identity.
 ///
@@ -1729,11 +1831,14 @@ unsafe fn adopt_presentable(
             // all, so it carries 0 and lets the KMD's own describe path answer.
             format: 0,
             pitch,
-            // The D3D12 resource flags, verbatim. ⚠ NOT D3D11 bind flags: nothing
-            // reads this field for an adopted allocation, and inventing a D3D11
-            // BindFlags word from a D3D12 resource-flags word would be a translation
-            // no reader asked for.
-            bind_flags: res_arg.Flags as u32,
+            // ⛔⛔ TRANSLATED, and the comment this replaces was WRONG in the one way
+            // that produces a wrong picture instead of an error. It read: *"The D3D12
+            // resource flags, verbatim. ⚠ NOT D3D11 bind flags: nothing reads this
+            // field for an adopted allocation, and inventing a D3D11 BindFlags word
+            // from a D3D12 resource-flags word would be a translation no reader asked
+            // for."* Both halves are false — see [`meta_bind_flags`] for the reader and
+            // for what the verbatim word decodes as.
+            bind_flags: meta_bind_flags(res_arg.Flags),
             // ⛔ NOT `HELIOS_WDDM_ALLOC_MISC_PRIMARY`, and NOT
             // `HELIOS_WDDM_ALLOC_MISC_DIRECT_SCANOUT` -- see this function's doc for
             // both arguments. A windowed DWM-composited back buffer is not the VidPn
@@ -4201,6 +4306,16 @@ struct L4Refusals {
     /// kernel is the authority for those three fields and a future opener should read
     /// them back rather than trust the creator's claim.
     alloc_private_written_back: RefusalCounter,
+    /// A `D3D12DDI_RESOURCE_FLAGS` word carried a bit
+    /// [`meta_bind_flags`]' translation table does not know.
+    ///
+    /// ⛔ **Expected 0, and the only way it can move is a header revision adding an
+    /// enumerator** — the mask it is checked against is built out of the `v::RES_*`
+    /// aliases, so it cannot go stale silently. A hit means the primary's
+    /// `HeliosWddmAllocMeta::bind_flags` may be missing a usage the D3D11 opener
+    /// needs, which surfaces as an import failure or a surface DWM cannot sample,
+    /// never as an error at create.
+    meta_bind_flag_unknown: RefusalCounter,
 }
 
 static L4_REFUSALS: L4Refusals = L4Refusals {
@@ -4267,6 +4382,7 @@ static L4_REFUSALS: L4Refusals = L4Refusals {
     deallocate_cb_missing: RefusalCounter::new("DeallocateCbMissing"),
     deallocate_cb_failed: RefusalCounter::new("DeallocateCbFailed"),
     alloc_private_written_back: RefusalCounter::new("AllocPrivateWrittenBack"),
+    meta_bind_flag_unknown: RefusalCounter::new("MetaBindFlagUnknown"),
 };
 
 /// L4's refusal set, printed by `crate::log_refusal_summary` at this lane's
@@ -4341,4 +4457,7 @@ pub(crate) static REFUSALS: &[&RefusalCounter] = &[
     &L4_REFUSALS.deallocate_cb_missing,
     &L4_REFUSALS.deallocate_cb_failed,
     &L4_REFUSALS.alloc_private_written_back,
+    // ⛔ APPENDED, the bind-flag translation fix. At the END for the reason the
+    // block comments above give: `D3D12 DDI refusals:` lines are diffed across builds.
+    &L4_REFUSALS.meta_bind_flag_unknown,
 ];
