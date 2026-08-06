@@ -464,6 +464,10 @@ struct ContextWindows {
     /// `NumAllocations = 0`) and **mandatory** for a DXGI present, which is where
     /// VidMm gets the residency it keeps live across the pending operation —
     /// `umd/src/forward/present.rs:772-777` has that argument.
+    ///
+    /// ⛔ **Its capacity is in ELEMENTS**, unlike [`Self::command`]'s bytes. See
+    /// [`PresentDependencies::write_to`] for the header citation; the two units on
+    /// adjacent fields of one struct are the trap.
     allocations: Option<Window<ddi12::D3DDDI_ALLOCATIONLIST>>,
     /// The patch-location list. Helios' GpuMmu is decorative — the host owns the
     /// real MMU and there are no guest GPU-VAs to patch, which is why
@@ -583,6 +587,21 @@ impl PresentDependencies {
     ///
     /// `Err(())` means the window is absent or smaller than [`Self::count`] — the
     /// caller counts and refuses; nothing is written on that path.
+    ///
+    /// ⛔⛔ **`capacity` is in ELEMENTS, and the command window's is in BYTES.** The
+    /// two windows `pfnRenderCb` hands back use different units and nothing in
+    /// `Window<T>` says so, which makes this the one place a reader can get it wrong
+    /// in the direction that writes out of bounds. Verified against the WDK header,
+    /// not inherited: `D3DDDICB_CREATECONTEXT` (`tmp/dx12/sdk/d3dumddi.h`) spells them
+    /// *"Command buffer size (bytes)"* and *"Allocation list size (**elements**)"* on
+    /// adjacent lines. ⇒ the comparison below is entry count against entry count.
+    ///
+    /// ⚠ `D3DDDICB_RENDER::NewAllocationListSize` is *"in: Size requested for the
+    /// next allocation list"* and this driver requests **0**, exactly as the shipping
+    /// D3D11 present does. dxgkrnl keeps handing back the context's original list
+    /// size regardless — which the D3D11 path demonstrates every frame with a
+    /// two-entry list — and [`ContextWindows::re_latch`]'s `!= 0` guard is what makes
+    /// a request of 0 mean *"keep what you have"* rather than *"take my list away"*.
     ///
     /// # Safety
     /// `list`/`capacity` must be the pair the runtime handed out together, from
