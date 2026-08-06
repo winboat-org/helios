@@ -3681,14 +3681,106 @@ silent on it:
   (counted its own documentation; missed raw-pointer slots; missed rustfmt-wrapped
   assignments) before the matcher was rebuilt to join continuation lines. Its two remaining
   blind spots both over-report and are recorded at the site.
-- **Round 2, for `D12-G8` (a triangle, owner-visible):** the command-list table is **0/75**.
-  It needs **L3a** (draw, fixed function, IA/SO/OM), **L3b** (root arguments, descriptor
-  binding, clears), **L3c** (copy, resolve, barriers, queries) and **L8** (present — ⛔ not
-  parallelisable, and it touches the `HeliosPresentRenderCmd` identity channel shared with
-  the KMD and the D3D11 driver). ⚠ L6 routed one obligation to L3a:
-  `pfnSetPipelineState` must re-apply the PSO's baked depth bias and strip-cut even when the
-  PSO declares them dynamic — `SUBSTRATE.md` §4.5's *"precise inversion of the Vulkan mental
-  model"* — and `L6PsoDynamicStateFlagForwarded` counts the exposure until it does.
+- ⭐⭐ **S6 ROUND 2 IS COMPLETE (2026-08-06): the command-list table went 0/75 -> 73/75 and
+  static coverage is 203/206.** Only L8's three present slots remain. Commits `3682203` ->
+  `4d263e3`. Evidence: `tmp/dx12/gates/G7-s6r2/` and `tmp/dx12/gates/G8-r0/RESULT.md`.
+  - **The spine first**: `D3D12DDI_HCOMMANDLIST` promoted to a boxed payload carrying
+    `h_device`, `h_rt_list` and the list class. Every one of the 75 command-list slots takes
+    that handle and **nothing else**, and 74 of the 75 return `VOID`, so the handles a
+    recording failure needs can only be captured at `pfnCreateCommandList`.
+  - **Four lanes, authored concurrently in worktrees and adversarially verified before the
+    VM**: **L3a** `cmdlist.rs` 23, **L3b** `rootargs.rs` 21, **L3c** `copy.rs` 13, **L9**
+    `misc.rs` 44. Then the `PARALLEL.md` §10 lens review: 7 lenses, 20 raw findings on top of
+    **135 the lenses refuted themselves**, adjudicated to **12 confirmed**.
+  - ⛔⛔ **The two blockers were both DEVICE REMOVAL ON A LEGAL CALL, and both came from the
+    spine rather than from a lane.**
+    1. **The whole recording surface was reporting on the wrong callback.** The spine wrote
+       *"a recording failure can only be reported through the device-scoped `pfnSetErrorCb`"*
+       and three lanes copied that sentence into 49 call sites. It is false:
+       **`pfnSetCommandListErrorCb` sits one field BELOW `pfnSetErrorCb`** in the same
+       `_0062` struct this driver already reads `pfnSetCommandListDDITableCb` out of, so it
+       was reachable the whole time. The spec: *"the runtime will drop all calls into the
+       driver which record commands on the specified command list"*
+       (`CPUEfficiency.md:2143-2158`) — one list quarantined and the application told at
+       `Close()`, which **is** D3D12's existing recording-error contract, against
+       `pfnSetErrorCb`'s *"Removing device due to bad UMD error"*, which takes the whole
+       device and the compositor with it if the device is DWM's. All 51 sites repointed;
+       `device12::set_error` now survives only where it is correct.
+    2. **Bundles succeeded at create and removed the device at reset.**
+       `D3D12DDIARG_CREATE_COMMAND_RECORDER_0040` carries no bundle bit, so no BUNDLE
+       `ID3D12CommandAllocator` can ever be minted and the paired reset was **structurally**
+       guaranteed to fail. `pfnCreateCommandList` refuses `Type == BUNDLE` up front now
+       (`L2BundleListRefused`), so the application gets a failed create instead of a dead
+       device. Durable fix named at both sites: one allocator per (pool, class).
+- ⛔⛔ **The obligation Round 1 routed to L3a was already discharged BY THE ENGINE, and the
+  document that predicted it was what made it look open.** `SUBSTRATE.md` §4.5 is right that
+  the `DYNAMIC_*` PSO flags are hints and the baked depth bias and strip-cut must be
+  re-applied on every `pfnSetPipelineState` — but `d3d12_command_list_SetPipelineState` does
+  exactly that (`libs/vkd3d/command.c:12711-12733`, *"For any optionally dynamic state, we
+  need to re-apply the corresponding static state that the PSO was created with"*).
+  Forwarding discharges it; re-implementing would issue the state twice.
+  ⇒ **Read the engine before spending a gate on an UNVERIFIED.** Three items this round were
+  settled that way and none needed a run.
+- ⛔ **`DX12.md` §4.3 row 4's second "silent ABI hazard" was FALSE and is struck.**
+  `D3D12DDI_ROOT_CONSTANTS` and `D3D12_ROOT_CONSTANTS` are field-order **identical** in
+  `d3d12umddi.h:1310`, `d3d12.h:4016` and the Win32 metadata. It had reached a lane's brief.
+  The other half of that row (descriptor-heap flags colliding on `0x1`) is real and stays —
+  ⚠ a half-true row is worse than a false one, because the true half lends it credibility.
+- ⛔ **The recurring shape, third merge running: a claim written when it was true, left
+  standing after the code moved under it.** This round it hit a SAFETY argument, three
+  counter gradings and two `file:line` citations — and **one grading went stale inside the
+  merge that corrected it**, because it named a condition a later commit in the same batch
+  removed. L2's own append-only refusal-array rule was violated by the commit that quotes
+  it. ⇒ when a grading is a cross-reference to another slot's state, check that state at the
+  **end** of the merge, not at the moment of writing.
+- ⛔⛔ **`D12-G8` RUNG 0 FAILED, and the failure is ATTRIBUTED — this is the open defect.**
+  `tools/d3d12_clear_probe.cpp` is new (`GATES.md` §4.9 has named it as rung 0 since it was
+  written; it did not exist). It renders offscreen, copies back through a placed footprint
+  and compares integers — no swapchain, no DWM, no shaders. Full account:
+  `tmp/dx12/gates/G8-r0/RESULT.md`.
+  - **WARP passes the identical sequence** (65536/65536 pixels exactly `(0, 51, 102, 255)`),
+    so the probe is right and the defect is ours. That control arm is the whole reason this
+    is a finding rather than an argument.
+  - **Every DDI in the chain reaches the driver and is forwarded** — traced with
+    `Umd12Trace=1`: `ResetCommandList` (`type=0 allocatorType=0`, classes matched),
+    `ClearRenderTargetView`, `ResourceBarrier lowered=1`, `CopyTextureRegion`, `Close` S_OK,
+    `ExecuteCommandLists`, `Signal` S_OK, fence `completed=1`, `Map` S_OK.
+    **And nothing executes.**
+  - ⭐ **`pfnMapHeap` is ELIMINATED, by the probe's new `--sentinel` arm.** A CPU byte
+    pattern written into the readback buffer before recording comes back **262144 of 262144
+    bytes intact** on Helios and is entirely gone on WARP. So the mapping is coherent and not
+    one byte of GPU output reaches the destination — which also eliminates every partial-copy
+    story (a wrong pitch, footprint or block-vs-texel error would leave a *mixture*).
+  - **What remains, in order**: (1) the recorded commands never reach the
+    `ID3D12GraphicsCommandList` that is submitted, or reach it in a state vkd3d discards —
+    next instrument is a `trace_line!` in `pfnExecuteCommandLists` printing each list pointer
+    against the one `pfnResetCommandList` traced, one deploy cycle; (2) the engine executes
+    but the work never reaches the host — `EclNoWddmSubmission=1` is the standing gap, and
+    the D3D11 proof that work flows out-of-band through the venus ICD is proven for **DXVK on
+    its own Vulkan device**, not for vkd3d driven through this DDI; (3) the fence signals
+    without the work completing (`FenceBottomOfPipeUnproven=1`).
+  - ⚠ **vkd3d's own `WARN`/`FIXME` are compiled out of the static build** — `VKD3D_DEBUG=warn`
+    produces nothing. Restoring them for one build is probably the cheapest instrument after (1).
+- ⭐ **Three UNVERIFIED rows from `G7-s6r1` are SETTLED by that run**, and they needed it:
+  **U-B** — `pfnCreateContextCb` succeeds for a D3D12 queue (`CreateCommandQueue:
+  CreateContext hr=0 hContext=0x… cmd=…/262144 allocList=…/256 patchList=…/256`).
+  ⛔ **That line existed in no log before now**: the handoff said to read it out of the `G7`
+  log and it was not there, because no D3D12 queue had ever been created on this adapter.
+  **U-D** — command-list table index 0 is the right `hRTTable`, proved not by a zero counter
+  but by recording DDIs demonstrably arriving at *this driver's* table. **U-F** — the bundle
+  question, settled by the headers and acted on. ⚠ **U-E** is only half settled: `Signal` ran,
+  `pfnWaitForFence` was never issued by this workload.
+- ⛔⛔ **PRESENT IS NOT THREE SLOTS AWAY, and this is the round's largest scoping finding.**
+  `PFND3D12DDI_PRESENT_0051` **outputs `D3DKMT_HANDLE`s** (`BroadcastSrc/DstAllocation`) and
+  this driver has none, by design: the venus ICD mints every allocation through its own
+  D3DKMT, `resource12.rs`'s `pfnCheckResourceAllocationHandle` answers **0** and says so, and
+  `DDI_REFERENCE.md` §9.7 already records that *"pure passthrough with no `pfnAllocateCb` is
+  not viable"*. The D3D11 driver, which presents successfully, **calls `pfnAllocateCb`
+  itself** (`umd/src/forward/resource.rs:217`, `:370`, `:459`; it feeds `hSrcAllocation` at
+  `present.rs:1164`). ⇒ the gap is a **kernel-allocation-identity bridge at the L4/L8 seam**,
+  which is also where `DECISIONS.md` D3c and `PARALLEL.md` §5's *"the first lane that needs a
+  crossing record adds it"* finally bite. `D12-G8` rungs 1 and 2 are blocked on it; rung 0 is
+  not, and rung 0 is where the current defect lives.
 - ⚠ **The deferred INF / cold-boot half of S5 is still deferred** and is now worth doing: the
   DriverStore package carries no `helios_umd12.dll`, so a cold boot has no D3D12 UMD.
   Harmless while `UmdD3D12` is off, and one reboot would validate a device that can actually
