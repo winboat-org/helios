@@ -132,7 +132,11 @@
 //!   `TiledResourcesTier = NOT_SUPPORTED` and creating one would contradict the
 //!   caps this device was accepted on.
 //! * **Kernel allocation identity** (`pfnCheckResourceAllocationHandle`) —
-//!   answered 0 with a counter; there is no `D3DKMT_HANDLE` to give.
+//!   answered 0 with a counter; there is still no `D3DKMT_HANDLE` to give.
+//!   ⚠ UP-4 adds the *bookkeeping* for one ([`identity12`], written by
+//!   [`note_presentable_identity`] and retired by [`destroy_heap_and_resource`])
+//!   but not the handle: minting it is UP-5's `pfnAllocateCb` call, and UP-6 is
+//!   what makes this slot answer with it.
 //!
 //! Each is a named counter, never a silent stub (CLAUDE.md rule 2).
 
@@ -170,6 +174,7 @@ use windows::Win32::Graphics::Direct3D12::{
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_SAMPLE_DESC};
 
+use super::identity12;
 use super::tables12::{stage, DeviceCoreTable, Filling};
 use crate::device12::{self, HeliosD3D12Device};
 use crate::{ddi12, log_error, note_refusal};
@@ -229,6 +234,16 @@ mod v {
     /// the shared unrepresentable bucket — see [`super::heap_flags`].
     pub(super) const HEAP_PRIMARY: D3D12DDI_HEAP_FLAGS =
         D3D12DDI_HEAP_FLAGS_D3D12DDI_HEAP_FLAG_PRIMARY;
+
+    // -- D3D12DDI_RESOURCE_OPTIMIZATION_FLAGS (d3d12umddi.rs:48846-48854) ----
+    /// ⚠ `KMD_IMPACT.md` §14a.3's *"second signal"* for a primary — and it
+    /// arrives on `pfnCheckResourceAllocationInfo`, NOT on the create. This
+    /// enum appears in exactly one function-pointer family
+    /// (`d3d12umddi.rs:51734`, `:59866`, `:75022`, `:76696`, `:79414`,
+    /// `:87548`), and `D3D12DDIARG_CREATERESOURCE_0109` has no field of the
+    /// type. See [`super::note_presentable_identity`].
+    pub(super) const RESOURCE_OPT_PRIMARY: D3D12DDI_RESOURCE_OPTIMIZATION_FLAGS =
+        D3D12DDI_RESOURCE_OPTIMIZATION_FLAGS_D3D12DDI_RESOURCE_OPTIMIZATION_FLAG_PRIMARY;
 
     // -- D3D12DDI_RESOURCE_FLAGS_0003 (d3d12umddi.rs:48362-48389) -----------
     pub(super) const RES_RENDER_TARGET: D3D12DDI_RESOURCE_FLAGS_0003 =
@@ -662,8 +677,9 @@ fn heap_flags(flags: ddi12::D3D12DDI_HEAP_FLAGS) -> D3D12_HEAP_FLAGS {
         if n <= LOG_BUDGET {
             log_error!(
                 "L4: D3D12DDI_HEAP_FLAG_PRIMARY arrived -- this heap declares the swapchain \
-                 primary and it is being created as an ordinary CUSTOM heap, so nothing \
-                 downstream can tell the primary apart (x{n})"
+                 primary and is being created as an ordinary CUSTOM heap, because the API has \
+                 no counterpart bit. The FACT is not lost: on the committed arm \
+                 note_presentable_identity records it in the identity table (UP-4) (x{n})"
             );
         }
     }
@@ -1171,6 +1187,25 @@ unsafe fn create_heap_only(
 ) -> Hresult {
     note_node_masks(a);
 
+    // ⛔ A `PRIMARY` heap with no resource description contradicts the DDI's own
+    // contract: `SPECS.md` §9.7 from `ResourceHeaps.md:897` says receiving the
+    // flag *"obliges the driver to create a resource simultaneously with the
+    // heap"*, i.e. a primary is always the committed arm. If it ever arrives here
+    // the UP-4 identity table cannot record it -- there is no `ID3D12Resource` to
+    // key on -- so the primary would be silently unrecorded. Counted, not
+    // assumed away, because `note_presentable_identity`'s admission predicate
+    // depends on the obligation holding.
+    if a.Flags & v::HEAP_PRIMARY != 0 {
+        note_refusal(&L4_REFUSALS.heap_primary_without_resource);
+        log_error!(
+            "L4: D3D12DDI_HEAP_FLAG_PRIMARY on the heap-ONLY arm -- ResourceHeaps.md:897 says a \
+             primary heap must come with a resource description, so this primary has no resource \
+             to record an identity against (size={} flags={:#x})",
+            a.ByteSize,
+            a.Flags,
+        );
+    }
+
     let desc = D3D12_HEAP_DESC {
         SizeInBytes: a.ByteSize,
         Properties: D3D12_HEAP_PROPERTIES {
@@ -1294,6 +1329,149 @@ fn whole_heap_allocation_info(
     }
 }
 
+/// Record a `PRIMARY` committed resource in the UP-4 identity table.
+///
+/// `KMD_IMPACT.md` §14a.3 UP-4. Called from [`create_committed`] only, because
+/// the primary declaration only reaches this driver there — see the three notes
+/// below.
+///
+/// # ⛔ The admission predicate is `D3D12DDI_HEAP_FLAG_PRIMARY`, and it is the
+/// only per-create primary signal that exists
+///
+/// `SPECS.md` §9.7 from `ResourceHeaps.md:897`: the flag *is* the D3D12
+/// replacement for `DXGI_DDI_PRIMARY_DESC`, no primary description is ever passed
+/// to the UMD, and receiving it obliges the driver to create a resource
+/// simultaneously with the heap. So a primary is a **committed** create by
+/// construction, and this is the one place the fact arrives.
+///
+/// ⚠ **§14a.3's "second signal" is NOT available here, and that is a real
+/// mismatch rather than a naming difference.**
+/// `D3D12DDI_RESOURCE_OPTIMIZATION_FLAG_PRIMARY = 4` is a
+/// `D3D12DDI_RESOURCE_OPTIMIZATION_FLAGS` value, and that type appears on exactly
+/// one DDI slot family — `pfnCheckResourceAllocationInfo`, in every generation
+/// `_0003` through `_0109` (`umd12/bindgen/cached/d3d12umddi.rs:51734`, `:59866`,
+/// `:75022`, `:76696`, `:79414`, `:87548`). It is **not** a field of
+/// `D3D12DDIARG_CREATERESOURCE_0109` (`:87456-87473`, 16 fields, checked) and not
+/// a parameter of `pfnCreateHeapAndResource` or
+/// `pfnCalcPrivateHeapAndResourceSizes`. It arrives on a *sizing query* that
+/// carries a description and no handle, for a resource that does not exist yet,
+/// so it cannot be attributed to one. It is therefore **measured** rather than
+/// used: [`check_resource_allocation_info`] splits it out of the
+/// `ResourceOptimizationFlagsIgnored` aggregate into
+/// `ResourceOptimizationPrimary`, which is the instrument that says whether the
+/// signal arrives at all.
+///
+/// ⛔ **And the first signal's arrival is UNMEASURED**, which is why the split
+/// above matters. §14a.3 states the trigger is *"already detected and counted:
+/// `D3D12DDI_HEAP_FLAG_PRIMARY = 16` arrives and is dropped"*. The detection is
+/// real; the arrival is not established. `HeapPrimaryFlagDropped` reads **0 in
+/// all 150** logged `umd12` runs in `tmp/`, and none of those was a swapchain
+/// workload, so the counter is untested rather than negative. If a real D3D12
+/// present run leaves `HeapPrimaryFlagDropped` at 0 while
+/// `ResourceOptimizationPrimary` is non-zero, then the heap flag is not this
+/// runtime's channel and UP-5's predicate has to change — most plausibly to
+/// latching the PRIMARY-flagged sizing query's description and matching it at the
+/// next create. That correlation machinery is deliberately NOT written on
+/// speculation; the two counters decide whether it is needed.
+fn note_presentable_identity(
+    resource: &ID3D12Resource,
+    heap_arg: &ddi12::D3D12DDIARG_CREATEHEAP_0001,
+    res_arg: &ddi12::D3D12DDIARG_CREATERESOURCE_0109,
+) {
+    if heap_arg.Flags & v::HEAP_PRIMARY == 0 {
+        return;
+    }
+
+    let identity = identity12::PresentableIdentity {
+        // ⚠ An identity token, never dereferenced by the table — see
+        // `identity12`'s module doc for the whole argument, including how the
+        // address-recycling hazard is closed.
+        engine_resource: resource.as_raw() as usize,
+        // ⛔ The two unresolved halves. They are zero because there is no path to
+        // them from this crate yet, and each is counted below rather than
+        // silently left at a plausible-looking 0:
+        //   * the Vulkan half needs `ID3D12DXVKInteropDevice4::
+        //     GetVulkanResourceMemoryInfo` (UP-2, which exists in the engine)
+        //     reached through a `bridge12` entry point that does not exist;
+        //   * the venus half needs the ICD's `helios_venus_memory_res_id` /
+        //     `helios_venus_memory_alloc_info`, and this crate's bridge resolves
+        //     the process ICD anchor for `venus_context_id()` alone.
+        vk_memory: 0,
+        memory_offset: 0,
+        memory_size: 0,
+        venus_res_id: 0,
+        venus_alloc_size: 0,
+        memory_type_index: 0,
+        geometry: identity12::IdentityGeometry {
+            width: res_arg.Width,
+            height: res_arg.Height,
+            depth_or_array_size: res_arg.DepthOrArraySize,
+            mip_levels: res_arg.MipLevels,
+            sample_count: res_arg.SampleDesc.Count,
+            dxgi_format: res_arg.Format as u32,
+        },
+        heap_flags: heap_arg.Flags as u32,
+    };
+
+    match identity12::record(identity) {
+        identity12::RecordOutcome::Inserted => {
+            L4_REFUSALS.identity_recorded.bump();
+        }
+        identity12::RecordOutcome::Replaced => {
+            L4_REFUSALS.identity_recorded.bump();
+            note_refusal(&L4_REFUSALS.identity_replaced);
+        }
+        identity12::RecordOutcome::TableFull => {
+            note_refusal(&L4_REFUSALS.identity_table_full);
+            log_error!(
+                "L4: identity table FULL -- the primary at {:#x} is NOT recorded and cannot be \
+                 presented; {}x{} fmt={} heapFlags={:#x}",
+                identity.engine_resource,
+                identity.geometry.width,
+                identity.geometry.height,
+                identity.geometry.dxgi_format,
+                identity.heap_flags,
+            );
+            return;
+        }
+    }
+
+    if identity.vk_memory == 0 {
+        L4_REFUSALS.identity_vk_memory_unresolved.bump();
+    }
+    if identity.venus_res_id == 0 {
+        L4_REFUSALS.identity_venus_unresolved.bump();
+    }
+
+    let n = L4_REFUSALS.identity_recorded.get();
+    if n <= LOG_BUDGET {
+        // ⚠ Every field is printed, and that is not only for the log: an entry
+        // whose fields no code reads is `dead_code`, and a table whose contents
+        // cannot be seen from a run is the T5 lesson (*an instrument nothing can
+        // read is not an instrument*) rebuilt. Until UP-5 consumes the table this
+        // line is the whole readout.
+        log_error!(
+            "L4: presentable identity recorded res={:#x} {}x{}x{} mips={} samples={} fmt={} \
+             heapFlags={:#x} vk_memory={:#x} off={} mem_size={} mti={} venus_res_id={} \
+             venus_alloc_size={} (x{n})",
+            identity.engine_resource,
+            identity.geometry.width,
+            identity.geometry.height,
+            identity.geometry.depth_or_array_size,
+            identity.geometry.mip_levels,
+            identity.geometry.sample_count,
+            identity.geometry.dxgi_format,
+            identity.heap_flags,
+            identity.vk_memory,
+            identity.memory_offset,
+            identity.memory_size,
+            identity.memory_type_index,
+            identity.venus_res_id,
+            identity.venus_alloc_size,
+        );
+    }
+}
+
 /// Arm 1 of the fused create: both argument pointers ->
 /// `ID3D12Device10::CreateCommittedResource3`.
 ///
@@ -1384,6 +1562,12 @@ unsafe fn create_committed(
         );
         return if hr < 0 { hr } else { E_FAIL };
     };
+
+    // UP-4: if this is the swapchain primary, remember how to find its memory.
+    // Before the state is stored, so a `TableFull` refusal is not attributed to
+    // the create -- it never fails the create, it only makes the resource
+    // un-presentable, and UP-5 is the commit that turns that into an error.
+    note_presentable_identity(&resource, heap_arg, res_arg);
 
     // SAFETY: `resource_slot` is this driver's private block for the resource
     // being created, cleared by the caller and written exactly once.
@@ -1874,6 +2058,30 @@ unsafe extern "C" fn destroy_heap_and_resource(
         // SAFETY: as above.
         if let Some(state) = unsafe { slot.take() } {
             owns_heap_block = state.owns_heap_block;
+            // ⛔ UP-4: the identity dies with the resource, and it dies HERE
+            // because this is the only site that ever retires an
+            // `ID3D12Resource` this driver created. The engine address is read
+            // out of the state box while the box is still alive and the COM
+            // reference it holds is still valid, so the key that is removed is
+            // provably the key `note_presentable_identity` inserted -- both are
+            // `ID3D12Resource::as_raw()` on the same object.
+            //
+            // ⚠ Ordering: before `drop(state)`. After the drop the resource may
+            // be released, its address may be recycled, and removing it then
+            // could delete an entry a *different* create had just inserted at
+            // the same address. Reading the address first makes the removal
+            // unconditionally about this object.
+            //
+            // ⚠ Unconditional: an ordinary non-presentable resource has no
+            // entry, `remove` finds nothing, returns false and nothing is
+            // counted. `IdentityRecorded - IdentityRemoved` is therefore the
+            // live-entry count and a leak shows up as a growing difference
+            // rather than needing its own instrument.
+            if let Some(engine) = state.resource.as_ref() {
+                if identity12::remove(engine.as_raw() as usize) {
+                    L4_REFUSALS.identity_removed.bump();
+                }
+            }
             drop(state);
             seen = true;
         }
@@ -2416,6 +2624,36 @@ unsafe extern "C" fn check_resource_allocation_info(
     if optimization_flags != 0 {
         L4_REFUSALS.resource_optimization_flags_ignored.bump();
     }
+    // ⭐ UP-4 splits `PRIMARY` out of that aggregate, the same move the file
+    // already makes for `HeapPrimaryFlagDropped` against
+    // `HeapFlagUnrepresentable` and for the same reason: the aggregate is graded
+    // "non-zero OK" because ignoring an optimisation *hint* is benign, and the
+    // PRIMARY bit is not a hint about layout, it is a declaration that the
+    // swapchain primary is being sized. `KMD_IMPACT.md` §14a.3 names it as the
+    // present path's second trigger, and this counter is the only instrument that
+    // can say whether it arrives -- the measured logs show the aggregate at 1..3
+    // in 101 of 150 runs, so *something* sets these bits and the aggregate cannot
+    // say which.
+    //
+    // ⛔ Counted and NOT acted on. This slot has no `D3D12DDI_HRESOURCE`: it is a
+    // sizing query about a resource that does not exist yet, so there is nothing
+    // to record an identity against. See `note_presentable_identity` for why that
+    // makes §14a.3's "use both signals" unimplementable as written.
+    if optimization_flags & v::RESOURCE_OPT_PRIMARY != 0 {
+        L4_REFUSALS.resource_optimization_primary.bump();
+        let n = L4_REFUSALS.resource_optimization_primary.get();
+        if n <= LOG_BUDGET {
+            log_error!(
+                "L4: D3D12DDI_RESOURCE_OPTIMIZATION_FLAG_PRIMARY on CheckResourceAllocationInfo -- \
+                 the swapchain primary is being SIZED here, and this slot has no resource handle to \
+                 attach an identity to; {}x{} fmt={} (x{n})",
+                // SAFETY: `p_resource` was null-checked above and is `_In_ CONST`.
+                unsafe { (*p_resource).Width },
+                unsafe { (*p_resource).Height },
+                unsafe { (*p_resource).Format },
+            );
+        }
+    }
     if alignment_restriction != 0 {
         L4_REFUSALS.resource_alignment_restriction_ignored.bump();
         let n = L4_REFUSALS.resource_alignment_restriction_ignored.get();
@@ -2919,7 +3157,16 @@ struct L4Refusals {
     /// A non-zero `D3D12DDI_RESOURCE_OPTIMIZATION_FLAGS` was ignored.
     /// `GetResourceAllocationInfo` has no counterpart parameter, and the flags
     /// are a hint: ignoring one yields a correct answer that may be larger than
-    /// an optimal one. ⚠ May legitimately be non-zero.
+    /// an optimal one. ⚠ May legitimately be non-zero — measured at 1..3 in 101
+    /// of the 150 logged runs under `tmp/`.
+    ///
+    /// ⚠ **RE-GRADED at UP-4.** "Non-zero OK" is only defensible now that
+    /// `PRIMARY` is counted separately by `ResourceOptimizationPrimary`: this
+    /// aggregate absorbs `SHADER_RESOURCE`, `UNORDERED_ACCESS` and
+    /// `DETERMINISTIC`, which are layout hints, and the PRIMARY bit is a
+    /// declaration about what the resource IS. Both counters still move for a
+    /// PRIMARY arrival — this one is deliberately the total, so its measured
+    /// history stays comparable across builds.
     resource_optimization_flags_ignored: RefusalCounter,
     /// `pfnCheckSubresourceInfo` was asked about a subresource the engine would
     /// not describe — i.e. an index outside the resource, which
@@ -2959,16 +3206,34 @@ struct L4Refusals {
     /// A residency DDI arrived with a null argument struct. Expected 0 — all
     /// four declare their argument non-optional.
     residency_bad_arg: RefusalCounter,
-    /// ⛔ **`D3D12DDI_HEAP_FLAG_PRIMARY` arrived and was dropped**, so a heap
-    /// that declares the swapchain primary was created as an ordinary CUSTOM
-    /// heap and nothing downstream can tell it apart. Split out of
-    /// `HeapFlagUnrepresentable` deliberately: that counter is graded "non-zero
-    /// OK" because the bits it absorbs (`COHERENT_SYSTEMWIDE`,
-    /// `_0041_DENY_L0_DEMOTION`) are benign, and this one is not. It is the only
-    /// channel the DDI has for declaring a primary
-    /// (`SPECS.md` §9.7, `ResourceHeaps.md:897`). Expected **0** until L8's
-    /// present path consumes it; non-zero says a primary reached this driver and
-    /// was demoted.
+    /// ⛔ **`D3D12DDI_HEAP_FLAG_PRIMARY` arrived and was dropped from the
+    /// `D3D12_HEAP_FLAGS` word this driver hands the engine**, because the API
+    /// has no counterpart bit. Split out of `HeapFlagUnrepresentable`
+    /// deliberately: that counter is graded "non-zero OK" because the bits it
+    /// absorbs (`COHERENT_SYSTEMWIDE`, `_0041_DENY_L0_DEMOTION`) are benign, and
+    /// this one is not. It is the only channel the DDI has for declaring a
+    /// primary (`SPECS.md` §9.7, `ResourceHeaps.md:897`).
+    ///
+    /// ⚠ **RE-GRADED at UP-4, because what it means changed.** It used to mean
+    /// *"a primary reached this driver and was demoted — nothing downstream can
+    /// tell it apart"*. The flag is still dropped on the way to the engine, but
+    /// the **fact** is no longer lost: `note_presentable_identity` now records the
+    /// primary in the `forward12::identity12` table, keyed on the engine resource,
+    /// with the raw heap-flags word intact. So:
+    ///
+    /// * still expected **0** until something drives a real D3D12 swapchain;
+    /// * non-zero now means a primary arrived **and an identity entry should
+    ///   exist for it** — read it against `IdentityRecorded`, which is the same
+    ///   event counted at the other site. Equal is correct. `HeapPrimaryFlagDropped`
+    ///   ahead of `IdentityRecorded` means primaries arrived on an arm that cannot
+    ///   record one (check `HeapPrimaryWithoutResource` and `IdentityTableFull`).
+    ///
+    /// ⛔ And the arrival itself is still **UNMEASURED**: this counter reads 0 in
+    /// all 150 logged `umd12` runs under `tmp/`, none of which was a swapchain
+    /// workload. `KMD_IMPACT.md` §14a.3 asserts the flag *"arrives"*; the only
+    /// instrument for that claim has never been non-zero, so it is untested rather
+    /// than confirmed. `ResourceOptimizationPrimary` is the counter that says
+    /// whether the other signal arrives instead.
     heap_primary_flag_dropped: RefusalCounter,
     /// A non-zero `AlignmentRestriction` arrived on
     /// `pfnCheckResourceAllocationInfo` and was NOT forwarded to the engine, so
@@ -2991,6 +3256,74 @@ struct L4Refusals {
     /// unreclaimed, which is exactly the shape the review pass found in the arm
     /// this counter was added with.
     heap_block_unreclaimed: RefusalCounter,
+    // -- UP-4, the resource -> kernel-allocation-identity table -------------
+    /// Entries made in the `forward12::identity12` table, i.e. `PRIMARY`
+    /// committed resources this driver saw. ⚠ **Not a refusal — the census.**
+    /// Expected **0** until something drives a real D3D12 swapchain through this
+    /// driver, and it must move in lock-step with `HeapPrimaryFlagDropped`: they
+    /// are two readings of the same event (the flag arriving) taken at different
+    /// sites, so a disagreement means the admission predicate and the flag test
+    /// have drifted apart.
+    identity_recorded: RefusalCounter,
+    /// A primary arrived and the identity table was **full**, so its identity was
+    /// dropped and the resource cannot be presented. ⛔ Expected 0. The bound is
+    /// four fully-buffered swapchains (`identity12::MAX_PRESENTABLE_IDENTITIES`),
+    /// so a hit says the admission predicate is admitting things that are not
+    /// primaries — not that the bound is too small.
+    identity_table_full: RefusalCounter,
+    /// A recorded identity **overwrote** one already held for the same engine
+    /// resource address. ⛔ Expected 0, and non-zero is a lifetime defect, not a
+    /// benign duplicate: it means a `pfnDestroyHeapAndResource` did not retire
+    /// its entry and a recycled COM address then collided. The overwrite is the
+    /// safe direction (the live resource wins); this counter is how the missed
+    /// removal stops being silent.
+    identity_replaced: RefusalCounter,
+    /// Identities retired by `pfnDestroyHeapAndResource`. ⚠ Not a refusal.
+    /// `IdentityRecorded - IdentityRemoved` is the live-entry count, so a
+    /// difference that grows across a run is a leak with no extra instrument
+    /// needed. It counts only removals that found an entry, so ordinary
+    /// non-presentable destroys do not move it.
+    identity_removed: RefusalCounter,
+    /// An identity was recorded with `vk_memory == 0`. ⛔ **Expected to equal
+    /// `IdentityRecorded` today, and that is the honest reading of UP-4**: the
+    /// engine-side accessor exists (`ID3D12DXVKInteropDevice4::
+    /// GetVulkanResourceMemoryInfo`, UP-2) but no `bridge12` entry point calls
+    /// it, so this driver has no path to a `VkDeviceMemory`. It goes to 0 in the
+    /// commit that adds that bridge accessor, and until it does UP-5 cannot run.
+    identity_vk_memory_unresolved: RefusalCounter,
+    /// An identity was recorded with `venus_res_id == 0`. ⛔ Same shape as
+    /// `IdentityVkMemoryUnresolved` and a **separate** link: the venus half needs
+    /// the ICD's `helios_venus_memory_res_id` / `helios_venus_memory_alloc_info`
+    /// (`icd/mesa/src/virtio/vulkan/vn_renderer_helios.c:619-632`), and this
+    /// crate's bridge resolves the process ICD anchor for `venus_context_id()`
+    /// alone. Two counters because the two links close in different commits, and
+    /// one counter could not say which was still missing. ⛔ A zero
+    /// `adopt_resource_id` is what makes the KMD *create* rather than *adopt*
+    /// (`protocol/src/wddm.rs:131-138`), so UP-5 must refuse on this rather than
+    /// pass the zero through.
+    identity_venus_unresolved: RefusalCounter,
+    /// `D3D12DDI_HEAP_FLAG_PRIMARY` arrived on the **heap-only** arm, with no
+    /// resource description. ⛔ Expected 0: `ResourceHeaps.md:897` says the flag
+    /// obliges the driver to create a resource simultaneously with the heap, and
+    /// `note_presentable_identity`'s admission predicate depends on that
+    /// obligation holding. A hit means a primary reached this driver with no
+    /// `ID3D12Resource` to key an identity on, so it went unrecorded.
+    heap_primary_without_resource: RefusalCounter,
+    /// `D3D12DDI_RESOURCE_OPTIMIZATION_FLAG_PRIMARY` arrived on
+    /// `pfnCheckResourceAllocationInfo`. ⚠ Not a refusal — it is
+    /// `KMD_IMPACT.md` §14a.3's *"second signal"*, measured at the only slot that
+    /// carries it, and split out of `ResourceOptimizationFlagsIgnored` for the
+    /// same reason `HeapPrimaryFlagDropped` is split out of
+    /// `HeapFlagUnrepresentable`: the aggregate is graded "non-zero OK" because
+    /// ignoring a layout hint is benign, and this bit is not a layout hint.
+    ///
+    /// ⭐ **It is the tie-breaker for UP-5's predicate.** `HeapPrimaryFlagDropped`
+    /// reads 0 in all 150 logged runs while the optimisation-flags aggregate
+    /// reads 1..3 in 101 of them, so it is entirely possible that this is the
+    /// only primary signal this runtime sends. Non-zero here with
+    /// `HeapPrimaryFlagDropped` still 0 after a real swapchain run means the
+    /// admission predicate must move to description-matching against this query.
+    resource_optimization_primary: RefusalCounter,
 }
 
 static L4_REFUSALS: L4Refusals = L4Refusals {
@@ -3037,6 +3370,14 @@ static L4_REFUSALS: L4Refusals = L4Refusals {
         "ResourceAlignmentRestrictionIgnored",
     ),
     heap_block_unreclaimed: RefusalCounter::new("HeapBlockUnreclaimed"),
+    identity_recorded: RefusalCounter::new("IdentityRecorded"),
+    identity_table_full: RefusalCounter::new("IdentityTableFull"),
+    identity_replaced: RefusalCounter::new("IdentityReplaced"),
+    identity_removed: RefusalCounter::new("IdentityRemoved"),
+    identity_vk_memory_unresolved: RefusalCounter::new("IdentityVkMemoryUnresolved"),
+    identity_venus_unresolved: RefusalCounter::new("IdentityVenusUnresolved"),
+    heap_primary_without_resource: RefusalCounter::new("HeapPrimaryWithoutResource"),
+    resource_optimization_primary: RefusalCounter::new("ResourceOptimizationPrimary"),
 };
 
 /// L4's refusal set, printed by `crate::log_refusal_summary` at this lane's
@@ -3091,4 +3432,12 @@ pub(crate) static REFUSALS: &[&RefusalCounter] = &[
     &L4_REFUSALS.heap_primary_flag_dropped,
     &L4_REFUSALS.resource_alignment_restriction_ignored,
     &L4_REFUSALS.heap_block_unreclaimed,
+    &L4_REFUSALS.identity_recorded,
+    &L4_REFUSALS.identity_table_full,
+    &L4_REFUSALS.identity_replaced,
+    &L4_REFUSALS.identity_removed,
+    &L4_REFUSALS.identity_vk_memory_unresolved,
+    &L4_REFUSALS.identity_venus_unresolved,
+    &L4_REFUSALS.heap_primary_without_resource,
+    &L4_REFUSALS.resource_optimization_primary,
 ];

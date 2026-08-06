@@ -62,3 +62,11 @@ pub(crate) mod rootargs;
 // set stay in [`pso`]; this module holds the 14 shader-create slots and the
 // DXBC container the engine needs and the DDI does not supply.
 pub(crate) mod shaders;
+// ⚠ L4's second file, on the same footing as [`shaders`]: `KMD_IMPACT.md`
+// §14a.3's UP-4 resource->identity table. It belongs to L4 because
+// `pfnCreateHeapAndResource` is its only writer and `pfnDestroyHeapAndResource`
+// its only remover, and it is a separate file because L8's present path is its
+// intended reader -- so the seam runs between the table and the DDI handlers
+// rather than between two lanes' files. It holds no DDI slot; the lane counts in
+// the table above are unchanged.
+pub(crate) mod identity12;

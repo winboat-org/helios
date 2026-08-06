@@ -370,6 +370,14 @@ pub const HELIOS_PRESENT_RENDER_VERSION: u32 = 1;
 pub const HELIOS_PRESENT_REFRESH_MAGIC: u32 = 0x4652_4548;
 /// Current stable-scanout refresh command ABI version.
 pub const HELIOS_PRESENT_REFRESH_VERSION: u32 = 1;
+/// `'HE12'` — magic of [`HeliosD3D12SubmitCmd`].  Distinct from both present
+/// magics for the reason [`HELIOS_PRESENT_REFRESH_MAGIC`] records: `DxgkDdiRender`
+/// attempts a `HeliosPresentRefreshCmd` decode on **every** command whose length
+/// reaches 16 bytes, so a D3D12 record that shared a magic would arm a scanout
+/// refresh — which a compute or graphics `ExecuteCommandLists` must never do.
+pub const HELIOS_D3D12_SUBMIT_MAGIC: u32 = 0x3231_4548;
+/// Current D3D12 submission-command ABI version.
+pub const HELIOS_D3D12_SUBMIT_VERSION: u32 = 1;
 
 /// Private payload carried through `DXGIDDICB_PRESENT::pPrivateDriverData` to
 /// `DxgkDdiPresent`.
@@ -480,6 +488,70 @@ impl HeliosPresentRefreshCmd {
     }
 }
 
+/// The command `helios_umd12.dll` submits through `pfnRenderCb` during
+/// `pfnExecuteCommandLists`, so that the D3D12 queue's WDDM context carries a DMA
+/// packet for dxgkrnl to order the runtime's monitored-fence signal behind.
+///
+/// # Why this record exists at all
+///
+/// The D3D12 runtime owns `ID3D12Fence`. There is no `pfnGetCompletedFenceValue`,
+/// no `pfnSetEventOnCompletion`, and `pfnSignalFence` is never called on this
+/// driver (measured — `FenceSignalForwarded = 0`). `D3D12DDI_FENCE` carries no
+/// `D3DKMT_HANDLE` and no `hRTFence`, while every `pfnSignal*Cb` names its target
+/// by `D3DKMT_HANDLE`, so the driver can **never** name the application's fence.
+/// The one remaining lever is what dxgkrnl orders that signal behind: the DMA
+/// packets on the queue's WDDM context. `pfnExecuteCommandLists` submitted none,
+/// which is why rung 0 of `D12-G8` saw the fence complete in 0.8–1.1 µs against
+/// WARP's 561 µs while the surface was still 0/65536 exact.
+///
+/// # The two things it carries, and the one it carries by being present
+///
+/// * [`Self::gpu_wire_fence`] is the completion boundary. It is **not** a fence
+///   this record's writer invented: it is the wire fence the KMD itself assigned
+///   to a venus submission on the queue's `ring_idx >= 1`, which is the only
+///   retirement domain on this transport that means *host GPU completion*. Ring-0
+///   fences retire at decode (`kmd_render`'s `RetireDomain::DecodeOnly`), and on
+///   this host they do not even mean that — a ring-0 wire fence has no
+///   `VIRTIO_GPU_FLAG_INFO_RING_IDX`, so QEMU routes it to the legacy
+///   `virgl_renderer_create_fence`, which never sees the venus context.
+/// * Zero is legal and means *"submit the packet, order it against nothing"*.
+///   That is the plumbing arm — it proves `pfnRenderCb` on a D3D12 queue's legacy
+///   context reaches `DxgkDdiRender` at all — and it must stay reachable as the
+///   A/B disable for the fence itself. It is why [`Self::is_valid`] does **not**
+///   check the fence: identifying the packet and trusting its boundary are two
+///   different questions, and conflating them would make the disable arm
+///   unrecognisable to the KMD.
+/// * ⭐ Its mere **presence** is what identifies a submission as a D3D12 ECL
+///   packet, which is what lets a KMD-side experiment scope itself to this path
+///   instead of to the adapter-global WDDM FIFO — where a hold would stall DWM.
+///
+/// # Safety of a guest-supplied fence id
+///
+/// The consumer clamps it: a value at or beyond `next_wire_fence` is replaced by
+/// `next_wire_fence` rather than trusted, because *"a malformed/stale private
+/// marker must not manufacture an impossible future dependency"*. So the worst a
+/// wrong value can do is name an **earlier** fence and under-wait — the fence
+/// lies, which is a correctness bug with a counter — and it can never park the
+/// head-of-line FIFO on a boundary that will not arrive. No wedge is reachable
+/// from this field, and that asymmetry is deliberate.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct HeliosD3D12SubmitCmd {
+    pub magic: u32,
+    pub version: u32,
+    /// Venus wire fence retiring at host GPU completion of everything this
+    /// queue had submitted when the UMD sampled it, or 0 for "no boundary".
+    pub gpu_wire_fence: u64,
+}
+
+impl HeliosD3D12SubmitCmd {
+    /// Magic and version only — deliberately **not** the fence. See the type doc.
+    #[inline]
+    pub fn is_valid(&self) -> bool {
+        self.magic == HELIOS_D3D12_SUBMIT_MAGIC && self.version == HELIOS_D3D12_SUBMIT_VERSION
+    }
+}
+
 const _: () = {
     assert!(core::mem::size_of::<HeliosWddmAllocPrivate>() == 48);
     assert!(core::mem::size_of::<HeliosWddmCmdBuf>() == 32);
@@ -493,6 +565,18 @@ const _: () = {
     assert!(core::mem::size_of::<HeliosPresentRenderCmd>() == 80);
     assert!(core::mem::size_of::<HeliosPresentRefreshCmd>() == 32);
     assert!(core::mem::offset_of!(HeliosPresentRefreshCmd, present_ctx_id) == 16);
+    // 16 bytes exactly, and that length is load-bearing in TWO directions.
+    // Upward: it must reach `offset_of!(HeliosPresentRefreshCmd, present_ctx_id)`
+    // = 16, or `DxgkDdiRender` skips the decode block that recognises it. Downward:
+    // it must stay BELOW `size_of::<HeliosPresentRenderCmd>()`'s 48-byte prefix
+    // gate so the typed-scanout arm is never even attempted for it. Both arms then
+    // reject on magic; this record's own arm is what accepts it.
+    assert!(core::mem::size_of::<HeliosD3D12SubmitCmd>() == 16);
+    assert!(
+        core::mem::size_of::<HeliosD3D12SubmitCmd>()
+            >= core::mem::offset_of!(HeliosPresentRefreshCmd, present_ctx_id)
+    );
+    assert!(core::mem::offset_of!(HeliosD3D12SubmitCmd, gpu_wire_fence) == 8);
     // The identity record must fit exactly over the HeliosWddmAllocPrivate
     // region so the meta trailer's offset is unchanged for openers.
     assert!(
