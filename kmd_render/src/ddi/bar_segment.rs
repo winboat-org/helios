@@ -18,6 +18,35 @@ pub(super) const VIDMM_MEMORY_BASE: u64 = 1 << 32;
 const VIDMM_VRAM_MIN_MB: u32 = 256;
 const VIDMM_VRAM_MAX_MB: u32 = 64 * 1024;
 
+/// Resolve an absent `VidMmVramMB` registry value from the exact virtio shared-
+/// memory capability length. QEMU may pad its containing PCI BAR to a power of
+/// two, but the capability retains the requested `hostmem` length, so 6 GiB is
+/// reported as 6 GiB rather than the 8-GiB BAR envelope.
+pub(super) fn resolve_vidmm_vram_mb(
+    knobs: &mut crate::adapter::AdapterKnobs,
+    host_visible_bytes: Option<u64>,
+) {
+    if knobs.vidmm_vram_mb == crate::adapter::VIDMM_VRAM_MB_AUTO {
+        knobs.vidmm_vram_mb = match host_visible_bytes {
+            None => 0,
+            Some(bytes) => {
+                const MIB: u64 = 1 << 20;
+                let mb = bytes / MIB;
+                if bytes % MIB == 0
+                    && mb <= u32::MAX as u64
+                    && (VIDMM_VRAM_MIN_MB..=VIDMM_VRAM_MAX_MB).contains(&(mb as u32))
+                {
+                    mb as u32
+                } else {
+                    crate::diag::record_named_bytes(b"VidVBad", mb.min(u32::MAX as u64) as u32);
+                    0
+                }
+            }
+        };
+    }
+    crate::diag::record_named_bytes(b"VidVram", knobs.vidmm_vram_mb);
+}
+
 pub(super) fn vidmm_vram_size(knobs: &crate::adapter::AdapterKnobs) -> Option<u64> {
     let mb = knobs.vidmm_vram_mb;
     if !(VIDMM_VRAM_MIN_MB..=VIDMM_VRAM_MAX_MB).contains(&mb) {

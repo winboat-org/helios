@@ -10,6 +10,7 @@ $ErrorActionPreference = "Stop"
 Assert-HeliosAdministrator
 $stateRoot = Join-Path $env:ProgramData "Helios"
 $statePath = Join-Path $stateRoot "install-state.json"
+Unregister-ScheduledTask -TaskName "HeliosGraphicsProvisioning" -Confirm:$false -ErrorAction SilentlyContinue
 if (-not (Test-Path -LiteralPath $statePath -PathType Leaf)) {
     throw "No package-managed Helios installation was found at $statePath."
 }
@@ -111,4 +112,6 @@ if ($driverRemovalFailed) {
     throw "Runtime registrations were removed, but driver removal is incomplete. The state and signing certificate were kept so the uninstall can be retried."
 }
 Remove-Item -LiteralPath $statePath -Force
+Remove-Item -LiteralPath (Join-Path $stateRoot "provisioning") -Recurse -Force -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath (Join-Path $stateRoot "provisioning-status.json") -Force -ErrorAction SilentlyContinue
 Write-Host "Helios runtime registrations were removed. Reboot Windows to finish unloading the driver."

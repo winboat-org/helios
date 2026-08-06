@@ -9,6 +9,64 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 . (Join-Path $PSScriptRoot "Helios-PackageCommon.ps1")
 
+$stateRoot = Join-Path $env:ProgramData "Helios"
+$statePath = Join-Path $stateRoot "install-state.json"
+$provisioningRoot = Join-Path $stateRoot "provisioning"
+$provisioningStatusPath = Join-Path $stateRoot "provisioning-status.json"
+$provisioningTaskName = "HeliosGraphicsProvisioning"
+
+function Write-HeliosProvisioningStatus(
+    [Parameter(Mandatory)]
+    [ValidateSet("waiting", "test-signing-restart-required", "driver-restart-required", "finished", "failed")]
+    [string]$Status,
+    [string]$Message = ""
+) {
+    $value = [ordered]@{
+        status = $Status
+        updatedAtUtc = [DateTime]::UtcNow.ToString("o")
+    }
+    if ($Message) { $value["message"] = $Message }
+    Write-HeliosJson $value $provisioningStatusPath
+}
+
+function Initialize-HeliosAutomaticProvisioning([Parameter(Mandatory)][string]$BundleRoot) {
+    $sourcePath = [IO.Path]::GetFullPath($BundleRoot).TrimEnd("\")
+    $persistentPath = [IO.Path]::GetFullPath($provisioningRoot).TrimEnd("\")
+    $isPersistentBundle = $sourcePath.Equals($persistentPath, [StringComparison]::OrdinalIgnoreCase)
+    if (-not $isPersistentBundle) {
+        Remove-Item -LiteralPath $provisioningRoot -Recurse -Force -ErrorAction SilentlyContinue
+        New-Item -ItemType Directory -Force -Path $provisioningRoot | Out-Null
+        Get-ChildItem -LiteralPath $BundleRoot -Force |
+            Copy-Item -Destination $provisioningRoot -Recurse -Force
+    }
+
+    $existingTask = Get-ScheduledTask -TaskName $provisioningTaskName -ErrorAction SilentlyContinue
+    if ($isPersistentBundle -and $existingTask) { return }
+
+    $scriptPath = Join-Path $provisioningRoot "Install-Helios.ps1"
+    $powerShellPath = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
+    $action = New-ScheduledTaskAction -Execute $powerShellPath -Argument (
+        "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`" -Automatic"
+    )
+    $trigger = New-ScheduledTaskTrigger -AtStartup
+    Register-ScheduledTask -TaskName $provisioningTaskName -Action $action -Trigger $trigger `
+        -User "SYSTEM" -RunLevel Highest -Force | Out-Null
+}
+
+function Complete-HeliosAutomaticProvisioning {
+    Write-HeliosProvisioningStatus "finished"
+    Unregister-ScheduledTask -TaskName $provisioningTaskName -Confirm:$false -ErrorAction SilentlyContinue
+}
+
+trap {
+    if ($Automatic) {
+        try { Write-HeliosProvisioningStatus "failed" $_.Exception.Message } catch {
+            Write-Warning "Could not publish the automatic provisioning failure: $($_.Exception.Message)"
+        }
+    }
+    throw
+}
+
 Assert-HeliosAdministrator
 if (-not [Environment]::Is64BitProcess) {
     throw "Run the installer with 64-bit Windows PowerShell. This package contains x64 drivers only."
@@ -19,9 +77,19 @@ $manifest = Read-HeliosManifest $bundleRoot
 Write-Host "Verifying $(@($manifest.files).Count) package files..."
 Test-HeliosManifest $bundleRoot $manifest
 
-$stateRoot = Join-Path $env:ProgramData "Helios"
-$statePath = Join-Path $stateRoot "install-state.json"
+if ($Automatic) {
+    Initialize-HeliosAutomaticProvisioning $bundleRoot
+    if (-not (Test-Path -LiteralPath $provisioningStatusPath -PathType Leaf)) {
+        Write-HeliosProvisioningStatus "waiting"
+    }
+}
+
 if (Test-Path -LiteralPath $statePath -PathType Leaf) {
+    if ($Automatic) {
+        & (Join-Path $stateRoot "Verify-Helios.ps1")
+        Complete-HeliosAutomaticProvisioning
+        exit 0
+    }
     throw "Helios is already managed by this package installer. Run $stateRoot\Uninstall-Helios.ps1 before installing another bundle."
 }
 
@@ -34,6 +102,7 @@ if ($manifest.signing.mode -eq "test" -and -not (Test-HeliosTestSigningEnabled))
     }
     Write-Host "Enabling Windows test-signing..."
     Invoke-HeliosNative "bcdedit.exe" @("/set", "testsigning", "on")
+    if ($Automatic) { Write-HeliosProvisioningStatus "test-signing-restart-required" }
     Write-Warning "Test-signing was enabled in the boot configuration. Reboot Windows, then run this installer again."
     exit 3010
 }
@@ -85,7 +154,9 @@ if ($activeInfBeforeInstall -and (Test-HeliosViogpudoDriver $activeInfBeforeInst
     Start-Sleep -Seconds 2
     $remainingInf = Get-HeliosActiveInf $instanceId
     if ($remainingInf -and (Test-HeliosViogpudoDriver $remainingInf)) {
-        Write-Warning "Windows requires a reboot to finish removing viogpudo ($remainingInf). Run this installer again afterward."
+        $message = "Windows requires a reboot to finish removing viogpudo ($remainingInf). Run this installer again afterward."
+        if ($Automatic) { throw $message }
+        Write-Warning $message
         exit 3010
     }
     $replacedViogpudo = $true
@@ -125,6 +196,26 @@ $state = [ordered]@{
 }
 
 New-Item -ItemType Directory -Force -Path $runtimeRoot,$stateRoot | Out-Null
+
+# The cross-process present-order table is opened read/write by ordinary D3D
+# producers, DWM (Window Manager\DWM-N), and RDPIDD (WUDFHost as LOCAL
+# SERVICE). A table first created by DWM inherits an ACL that gives LOCAL
+# SERVICE read-only access, so RDP silently copies unfinished frames without
+# the producer-fence wait. Pre-create/repair this one coordination file before
+# any new driver process starts; the UMD applies the same ACL when it creates
+# the file independently of this installer.
+$presentSyncPath = Join-Path $stateRoot "helios_present_sync_v2.bin"
+if (-not (Test-Path -LiteralPath $presentSyncPath -PathType Leaf)) {
+    New-Item -ItemType File -Path $presentSyncPath -Force | Out-Null
+}
+Invoke-HeliosNative "icacls.exe" @(
+    $presentSyncPath,
+    "/grant",
+    "*S-1-5-11:(M)",  # Authenticated Users
+    "*S-1-5-19:(M)",  # LOCAL SERVICE / RDPIDD
+    "*S-1-5-90-0:(M)" # Window Manager group / DWM
+)
+
 Copy-Item -Path (Join-Path $payloadRoot "mesa") -Destination $runtimeRoot -Recurse -Force
 Copy-Item -Path (Join-Path $payloadRoot "opencl") -Destination $runtimeRoot -Recurse -Force
 Copy-Item -Path (Join-Path $payloadRoot "loaders") -Destination $runtimeRoot -Recurse -Force
@@ -139,14 +230,47 @@ Write-HeliosJson $state $statePath
 
 $certificate = [Security.Cryptography.X509Certificates.X509Certificate2]::new($certificatePath)
 $state.signingCertificateThumbprint = $certificate.Thumbprint
+
+function Test-HeliosCertificateStoreThumbprint(
+    [Parameter(Mandatory)][string]$StoreName,
+    [Parameter(Mandatory)][string]$Thumbprint
+) {
+    # The PowerShell Cert: provider can retain a stale view after a native
+    # certificate-store update. Open a new X509Store for every check so a
+    # certutil fallback is verified against the store itself.
+    $x509Store = [Security.Cryptography.X509Certificates.X509Store]::new(
+        $StoreName,
+        [Security.Cryptography.X509Certificates.StoreLocation]::LocalMachine
+    )
+    try {
+        $x509Store.Open([Security.Cryptography.X509Certificates.OpenFlags]::ReadOnly)
+        $matches = $x509Store.Certificates.Find(
+            [Security.Cryptography.X509Certificates.X509FindType]::FindByThumbprint,
+            $Thumbprint,
+            $false
+        )
+        return $matches.Count -gt 0
+    } finally {
+        $x509Store.Close()
+    }
+}
+
 foreach ($store in @("Root", "TrustedPublisher")) {
     try {
         Import-Certificate -FilePath $certificatePath -CertStoreLocation "Cert:\LocalMachine\$store" | Out-Null
     } catch {
-        # Some Windows builds report E_ACCESSDENIED after committing the
-        # certificate. Continue only when the exact thumbprint is now present.
-        if (-not (Test-Path -LiteralPath "Cert:\LocalMachine\$store\$($certificate.Thumbprint)")) { throw }
-        Write-Warning "Import-Certificate reported an error for $store, but the expected certificate is present."
+        # Some Windows builds report E_ACCESSDENIED after committing Root, but
+        # fail before committing TrustedPublisher. Fall back to certutil only
+        # when the exact thumbprint is absent.
+        if (Test-HeliosCertificateStoreThumbprint $store $certificate.Thumbprint) {
+            Write-Warning "Import-Certificate reported an error for $store, but the expected certificate is present."
+        } else {
+            Write-Warning "Import-Certificate failed for $store; retrying with certutil."
+            Invoke-HeliosNative "certutil.exe" @("-addstore", "-f", $store, $certificatePath)
+        }
+    }
+    if (-not (Test-HeliosCertificateStoreThumbprint $store $certificate.Thumbprint)) {
+        throw "The Helios signing certificate was not installed in LocalMachine\$store."
     }
 }
 Write-HeliosJson $state $statePath
@@ -224,5 +348,6 @@ if ($RunSmokeTests) {
 } else {
     & (Join-Path $stateRoot "Verify-Helios.ps1") -AllowPendingReboot
 }
+if ($Automatic) { Write-HeliosProvisioningStatus "driver-restart-required" }
 Write-Warning "Reboot Windows before judging driver or desktop behavior."
 exit 3010

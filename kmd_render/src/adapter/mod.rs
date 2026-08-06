@@ -112,11 +112,11 @@ pub(crate) struct StartedState {
 ///
 /// Every field name here corresponds to a [`crate::diag::knobs`] entry, which is
 /// where the ≤14-byte lookup-buffer rule is enforced at compile time.
-/// Reported device-local VidMm capacity in MiB when `VidMmVramMB` is absent.
-/// Named rather than inlined because it appears in both [`AdapterKnobs::DEFAULTS`]
-/// and the registry read, and the two silently disagreeing is exactly the class
-/// of bug this module exists to prevent. See the field's doc for the evidence.
-pub(crate) const VIDMM_VRAM_MB_DEFAULT: u32 = 4096;
+/// `VidMmVramMB` value used internally when the registry value is absent. It is
+/// resolved from the virtio host-visible capability during StartDevice, after
+/// the transport has exposed the exact QEMU `hostmem` length. Keeping this
+/// distinct from zero preserves zero as the explicit legacy-topology switch.
+pub(crate) const VIDMM_VRAM_MB_AUTO: u32 = u32::MAX;
 
 #[derive(Clone, Copy)]
 pub(crate) struct AdapterKnobs {
@@ -185,16 +185,21 @@ pub(crate) struct AdapterKnobs {
     /// `crate::ddi::bar_segment::BarSegTopology`; kept raw here so the coerced
     /// value can be reported.
     pub bar_seg_mode: u32,
-    /// `VidMmVramMB` (**default 4096 since 22.22.252.0**). A valid nonzero value
-    /// makes the existing BAR-backed memory segment report this device-local
-    /// capacity and opts device-local Venus tracking allocations into that
-    /// local segment. Non-local Vulkan heaps remain in the aperture/shared
-    /// budget. The programmable CPU aperture stays capped separately; tracking
-    /// allocations never map their identity blobs through it.
+    /// `VidMmVramMB`. When absent, StartDevice derives the value from the exact
+    /// virtio host-visible capability length (QEMU `hostmem`). A valid nonzero
+    /// registry value overrides that automatic value; zero explicitly restores
+    /// the legacy topology. The selected value makes the existing BAR-backed
+    /// memory segment report this device-local capacity and opts device-local
+    /// Venus tracking allocations into that local segment. Non-local Vulkan
+    /// heaps remain in the aperture/shared budget. The programmable CPU aperture
+    /// stays capped separately; tracking allocations never map their identity
+    /// blobs through it.
     ///
     /// The default was 0 (no local segment) while the heap-aware accounting was
-    /// being brought up. 4096 is the configuration that work actually validated
-    /// — Task Manager shows a 4.0 GiB dedicated capacity, and direct-KMT and
+    /// being brought up, then 4096 since 22.22.252.0. That fixed default made
+    /// every VM report 4 GiB even when the host configured a different capacity.
+    /// 4096 is the configuration that originally validated the path — Task
+    /// Manager shows a 4.0 GiB dedicated capacity, and direct-KMT and
     /// native-Vulkan four-by-64 MiB probes each measured exactly +256.00 MiB in
     /// the selected segment with no movement in the other and a clean return to
     /// baseline after destroy (ROADMAP, "VidMm / Task Manager validation").
@@ -226,7 +231,7 @@ impl AdapterKnobs {
         bar_seg_flags: 0x1C,
         bar_seg_base_mb: 0,
         bar_seg_mode: 10,
-        vidmm_vram_mb: VIDMM_VRAM_MB_DEFAULT,
+        vidmm_vram_mb: VIDMM_VRAM_MB_AUTO,
     };
 
     /// Read every knob once. PASSIVE_LEVEL.
@@ -250,7 +255,7 @@ impl AdapterKnobs {
             bar_seg_flags: read_config_dword(knobs::BAR_SEG_FLAGS, 0x1C),
             bar_seg_base_mb: read_config_dword(knobs::BAR_SEG_BASE_MB, 0),
             bar_seg_mode: read_config_dword(knobs::BAR_SEG_MODE, 10),
-            vidmm_vram_mb: read_config_dword(knobs::VIDMM_VRAM_MB, VIDMM_VRAM_MB_DEFAULT),
+            vidmm_vram_mb: read_config_dword(knobs::VIDMM_VRAM_MB, VIDMM_VRAM_MB_AUTO),
         }
     }
 
@@ -269,7 +274,8 @@ impl AdapterKnobs {
         crate::diag::record_named_bytes(b"BarF", knobs.bar_seg_flags);
         crate::diag::record_named_bytes(b"BarB", knobs.bar_seg_base_mb);
         crate::diag::record_named_bytes(b"BarM", knobs.bar_seg_mode);
-        crate::diag::record_named_bytes(b"VidVram", knobs.vidmm_vram_mb);
+        // VidVram is recorded after StartDevice resolves the absent-value
+        // sentinel from the virtio host-visible capability.
         crate::diag::record_named_bytes(b"VidVBad", 0);
         knobs
     }

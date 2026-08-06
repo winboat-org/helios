@@ -83,6 +83,25 @@ time to stop shipping something nobody measured:**
   every other escape constant in that file was checked against
   `protocol/src/escape.rs` and is correct.
 
+## Dockur/WinBoat fresh installation — automatic path verified (2026-08-05)
+
+A new Dockur Windows 11 VM was installed from an empty 90 GB qcow2 using the
+WinBoat-pinned `ghcr.io/dockur/windows:6.03` image, then booted with bootstrap
+VGA plus the 4 GiB-limited Helios/Venus adapter. The clean guest bound Dockur's
+signed `viogpudo` as `oem14.inf` on the Helios PCI function. The first
+`Install-Helios.ps1 -Automatic` pass enabled test-signing and returned 3010;
+after reboot, the second pass removed `viogpudo` without prompting and selected
+Helios on the same device instance.
+
+The fresh guest exposed one additional packaging fault: `Import-Certificate`
+committed the CI certificate to `Root` but returned E_ACCESSDENIED before
+committing `TrustedPublisher`. Native `certutil -addstore` succeeded. The
+installer now falls back to that native path when the exact thumbprint is
+absent, and verifies through a newly opened `X509Store`; the PowerShell `Cert:`
+provider was proven to retain a stale same-process view after the native add.
+The repaired automatic pass completed, rebooted, and passed Vulkan, D3D11,
+OpenGL 4.6/Zink, and OpenCL smoke tests on the RX 6600.
+
 ## RDP desktop lag — root-caused and CLOSED (2026-08-05)
 
 **Symptom (owner):** over RDP, anything that *changes* the desktop is slow —
@@ -183,10 +202,24 @@ to have run in the RDP session, not assumed: `rdp-lag-repro.ps1` writes its own
 session with its own `dwm`, and a repro landing there measures the SDL scanout
 path instead.
 
-**Still open:** the second tester's frame tearing is unretested since the frame
-throttle was removed — RDP dropping 98 % of frames could plausibly have produced
-partial-looking updates on its own. Re-check before opening any driver-side
-tearing investigation.
+**RDP stale-tile/ghosting CLOSED (second tester, 2026-08-05).** This was not
+scanline tearing or a FreeRDP presenter defect: old Explorer tiles remained
+until mouse damage refreshed them, and an offline replay reproduced the exact
+corruption from the recorded RDP stream. A synchronized capture then showed a
+clean session-1 desktop while FreeRDP held stale/partial blocks, placing the
+defect in RDPIDD's DWM-buffer capture path. The decisive WUDFHost log line was
+`HeliosPresentSync: CreateFile(...helios_present_sync_v2.bin) failed: 5`:
+RDPIDD runs as `NT AUTHORITY\LOCAL SERVICE`, but a table first created by DWM
+inherited only read access for that principal. The consumer therefore issued
+hundreds of imported-buffer reads with no publication table and no producer
+fence wait.
+
+Granting LOCAL SERVICE modify access was the same-session discriminator:
+WUDFHost mapped HPS2, imported DWM's fence, and the owner reported **zero
+glitches**, including through Explorer as a WinBoat-style RemoteApp. Permanent
+fix: DXVK creates/repairs HPS2 with read/write access for Authenticated Users,
+LOCAL SERVICE, and the Window Manager group; the package installer pre-creates
+and repairs the same file so an upgrade cannot retain the old ACL.
 
 ## Current verified correction (2026-08-04, KMD 22.22.238.0)
 
