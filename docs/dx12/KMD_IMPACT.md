@@ -907,8 +907,19 @@ gate and `set_scanout_blob` engage — later, and deliberately not scoped here.
    presents an unfinished frame — and would be misread as a present bug. Rung 1 cannot pass while
    rung 0 fails.
 2. **FB-1 is shared by both `pfnRenderCb` users.** Land it once, in the fence work.
-3. **`P7` — does `DxgkDdiRender` fire on the D3D12 path — is settled by the fence work for free.**
-   `RENDER_COUNT` (`submit_command.rs:996`) moving is the whole test. Do not spend a gate on it.
+3. **`P7` — does `DxgkDdiRender` fire on the D3D12 path — is settled by the fence work for free**,
+   but ⛔ **NOT by the counter this row named.** ~~`RENDER_COUNT` (`submit_command.rs:996`) moving is
+   the whole test.~~ `RENDER_COUNT` is **adapter-global and incremented from three sites**
+   (`submit_command.rs:1046`, `:1377`, `:1434` — the citation had also drifted from `:996`), and
+   DWM's own D3D11 present path calls `pfnRenderCb` on every frame (`umd/src/forward/present.rs:860`).
+   So it moves continuously with no D3D12 client at all. P7 is settled by the **record-seen counter**
+   on K-F3's decode arm, which is D3D12-specific by construction.
+   ⭐ **The general trap, and this document has now walked into it three times in one family:** every
+   KMD counter here is adapter-global, and **DWM is always running**, so any counter read to
+   attribute a *client-specific* behaviour needs a client-specific arm or a client-specific counter.
+   `WfBWire` (dominated by DWM's presents), `RING_SUBMIT_COUNT` (dominated by this driver's own
+   scanout copies, §14a.1) and `RENDER_COUNT` (dominated by DWM's `pfnRenderCb`) were each proposed
+   as the test for something they cannot attribute.
 4. **The allocation-identity bridge does NOT block the fence bridge**: `D3DDDICB_RENDER` names its
    target by `hContext` and needs no driver-minted `D3DKMT_HANDLE`. ⇒ UP-1…UP-6 can be written in
    parallel with the fence measurement, and should be — the vkd3d work plus a new table is the long
