@@ -201,3 +201,47 @@ constexpr std::uint32_t HELIOS_VKD3D_IDENTITY_ICD_REFUSED = 6;
 bool helios_vkd3d_bridge_drain_queue(std::size_t queue,
                                      std::uint64_t* out_wire_fence,
                                      std::uint32_t* out_fence_status) noexcept;
+
+// Sample the same venus GPU-completion boundary **without draining**.
+//
+// ⛔⛔ **Why this exists, and it is not an optimisation.** The boundary can only be
+// read from a `VkQueue`, and until now the only way to obtain one here was
+// `vkd3d_acquire_vk_queue`, which is *inside* `helios_vkd3d_bridge_drain_queue`. With
+// the drain gated OFF (`Umd12EclDrain`, default 0, because the acquire contains an
+// untimed `pthread_cond_wait` reachable from inside a DDI) every submission would
+// carry `gpu_wire_fence = 0` — so `Umd12EclFence`'s ON default would be inert and the
+// kernel's exact-boundary arm could never fire. The fence bridge would ship doing
+// nothing, knowingly. This entry point is what makes the sample reachable with the
+// drain off, and the two must stay independently switchable for exactly that reason.
+//
+// ⭐ The primitive is upstream and already in this link: `vkd3d_lock_vk_queue` /
+// `vkd3d_unlock_vk_queue` (`vkd3d.h:122-123`, `command.c:25572`/`:25584`) take the
+// `vkd3d_queue` mutex through `vkd3d_queue_acquire` and **enqueue no
+// `VKD3D_SUBMISSION_DRAIN`**, so nothing waits on the submission worker. Two further
+// differences from the drain, both in this call's favour: the release issues **no**
+// empty `vkQueueSubmit2` (it is a bare `vkd3d_queue_release`), and a failed lock leaks
+// nothing — the drain's null-acquire arm leaves `queue_lock` held, and there is no
+// `queue_lock` here.
+//
+// ⚠⚠ **THE CORRECTNESS COST, stated precisely because it is real and it is the whole
+// reason the drain existed.** Without the DRAIN nothing guarantees that everything the
+// application enqueued has reached `vkQueueSubmit` at the moment the ring seqno is
+// sampled, so the boundary may name **less work than the frame contains** — an
+// under-wait, i.e. the application's fence can still complete before its GPU work
+// does. ⛔ This is therefore **NOT** equivalent to the drained boundary and must never
+// be described as such. It is strictly better than *no* boundary, which is where the
+// drain-off arm sits today, and strictly worse than a drained one.
+//
+// ⭐ The asymmetry that makes it acceptable rather than merely cheaper: reading a
+// *larger* seqno than needed over-orders and is harmless, only a stale *smaller* one
+// under-waits; and a refused sample is `0`, which `HeliosD3D12SubmitCmd` already
+// documents as "order against nothing" rather than as a lie.
+//
+// `queue` is an `ID3D12CommandQueue*` as an integer, BORROWED. Both out-params are
+// mandatory here (unlike the drain's both-or-neither, where a null pair means "do not
+// sample"): a call with nowhere to put the answer would be a lock/unlock around
+// nothing. Returns false with the fence 0 and a `HELIOS_VKD3D_FENCE_*` status
+// explaining why. Never throws: `bridge_guard`.
+bool helios_vkd3d_bridge_sample_queue_fence(std::size_t queue,
+                                            std::uint64_t* out_wire_fence,
+                                            std::uint32_t* out_fence_status) noexcept;

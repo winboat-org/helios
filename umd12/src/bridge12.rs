@@ -54,6 +54,50 @@
 //! with no `Deref` and a private `inner`) are live below. Layer 1 is not
 //! omitted, it is vacuous: it is "one `from_raw` per **owning entry point**",
 //! and S4 has none.
+//!
+//! # ⛔ One C++ entry point has NO Rust half yet, deliberately — and it is needed
+//!
+//! `helios_vkd3d_bridge_sample_queue_fence` exists in `umd12/bridge/vkd3d_bridge.h`
+//! and `.cpp` and is **not declared here**, because nothing in this crate calls it:
+//! its one caller is `pfnExecuteCommandLists` in `forward12::queue.rs`. A cxx
+//! declaration plus a wrapper with no caller is two hand-written lines carrying
+//! `#[allow(dead_code)]`, which `PARALLEL.md` §10 forbids outright (R908) — the same
+//! reason `adopt_d3d12_device` above was written and then removed. So the shape is
+//! recorded instead of landed, exactly as that one is.
+//!
+//! ⚠ **Why it matters, because "no Rust half" reads as optional and is not.**
+//! `Umd12EclDrain` defaults **OFF** — `vkd3d_acquire_vk_queue` reaches an untimed
+//! `pthread_cond_wait` from inside a DDI — and the drain is the only place a
+//! `VkQueue` was obtainable. So on the shipping default every submission carries
+//! `gpu_wire_fence = 0`, `Umd12EclFence`'s ON default is inert, and the kernel's
+//! exact-boundary arm can never fire. The C++ side reaches the same boundary through
+//! `vkd3d_lock_vk_queue`, which drains nothing; the header carries the full argument
+//! and the under-wait it costs.
+//!
+//! The two halves to add, in ONE commit with the call site so `-D warnings` stays
+//! clean:
+//!
+//! ```ignore
+//! // in `mod ffi`, beside `helios_vkd3d_bridge_drain_queue`:
+//! unsafe fn helios_vkd3d_bridge_sample_queue_fence(
+//!     queue: usize, out_wire_fence: *mut u64, out_fence_status: *mut u32) -> bool;
+//!
+//! // and the wrapper, mirroring `drain_queue_with_fence`'s intersection rule:
+//! pub(crate) unsafe fn sample_queue_fence(queue: usize) -> (u64, FenceStatus) {
+//!     let mut wire_fence: u64 = 0;
+//!     let mut raw_status: u32 = 0;
+//!     let sampled = unsafe {
+//!         ffi::helios_vkd3d_bridge_sample_queue_fence(queue, &mut wire_fence, &mut raw_status)
+//!     };
+//!     let status = FenceStatus::from_raw(raw_status);
+//!     if sampled && status == FenceStatus::Sampled { (wire_fence, status) }
+//!     else if status == FenceStatus::Sampled { (0, FenceStatus::Unknown(raw_status)) }
+//!     else { (0, status) }
+//! }
+//! ```
+//!
+//! ⛔ `FenceStatus::from_raw` is private to this module, so the wrapper belongs here
+//! and not at the call site.
 
 // ⚠ `too_many_arguments` is allowed for this MODULE and not for a function,
 // because the lint fires on a declaration inside a `#[cxx::bridge]` block and cxx
@@ -489,12 +533,24 @@ pub(crate) unsafe fn serialize_root_signature(
 /// * this blocks only until vkd3d's own submission worker has *handed the work to
 ///   Vulkan*. The GPU has typically not started, and nothing waits for it.
 ///
-/// It is required rather than defensive: vkd3d's `ID3D12CommandQueue::
-/// ExecuteCommandLists` is asynchronous — it pushes a submission onto a worker
-/// thread's queue (`libs/vkd3d/command.c`'s `d3d12_command_queue_add_submission`)
-/// — so without the drain the WDDM packet submitted immediately afterwards could
-/// be *ordered ahead of* the `vkQueueSubmit` it is supposed to fence, and the
-/// application's `ID3D12Fence` would be exactly as untruthful as it is today.
+/// What it buys: vkd3d's `ID3D12CommandQueue::ExecuteCommandLists` is asynchronous —
+/// it pushes a submission onto a worker thread's queue (`libs/vkd3d/command.c`'s
+/// `d3d12_command_queue_add_submission`) — so without the drain the WDDM packet
+/// submitted immediately afterwards can be *ordered ahead of* the `vkQueueSubmit` it
+/// is supposed to fence, and the boundary the packet carries then covers less work
+/// than the frame contains.
+///
+/// ⚠⚠ **This doc used to call the drain *"required rather than defensive"*. That is
+/// no longer true and the correction matters.** `Umd12EclDrain` defaults **OFF**,
+/// because `vkd3d_acquire_vk_queue` reaches an untimed, unbounded
+/// `pthread_cond_wait` from inside a DDI (`PENDING.md` §1 A1). So the drained
+/// boundary is the *best* boundary and not the only one:
+/// `helios_vkd3d_bridge_sample_queue_fence` obtains the same boundary through
+/// `vkd3d_lock_vk_queue`, which drains nothing, and accepts a possible under-wait in
+/// exchange for being reachable at all — see this module's doc for why it has no Rust
+/// half yet and what the two halves are. ⛔ The two are separately switchable on
+/// purpose: folding them back into one knob would put the fence bridge back to
+/// carrying 0 on the shipping default.
 ///
 /// ⭐ It is the same discipline `HeliosWaitFrameSubmitted` gives the D3D11 present
 /// path, and `KMD_IMPACT.md` §14a.2 says so in as many words.

@@ -93,6 +93,23 @@ extern "C" HRESULT helios_vkd3d_serialize_root_signature(
 extern "C" void* vkd3d_acquire_vk_queue(void* queue);
 extern "C" void vkd3d_release_vk_queue(void* queue);
 
+// ── the two UPSTREAM interop symbols the SAMPLE-ONLY path locks through ─────
+//
+// `vkd3d.h:122-123`, defined at `libs/vkd3d/command.c:25572` and `:25584`, same
+// `extern "C"` block and same `void*`-for-`ID3D12CommandQueue*`/`VkQueue`
+// substitution as the pair above — ABI-identical for the reasons stated there.
+//
+// ⛔ **They are a genuinely different primitive, not a cheaper spelling of the pair
+// above**, and the difference is the whole point of the sample-only path:
+// `vkd3d_lock_vk_queue` is `vkd3d_queue_acquire(d3d12_queue->vkd3d_queue)` and nothing
+// else — no `VKD3D_SUBMISSION_DRAIN` is enqueued, no `queue_lock` is taken, and
+// `vkd3d_unlock_vk_queue` is a bare `vkd3d_queue_release` with no empty
+// `vkQueueSubmit2`. ⇒ obtaining a `VkQueue` this way costs nothing and orders nothing;
+// see `helios_vkd3d_bridge_sample_queue_fence`'s header comment for the correctness
+// cost that buys.
+extern "C" void* vkd3d_lock_vk_queue(void* queue);
+extern "C" void vkd3d_unlock_vk_queue(void* queue);
+
 // ── ID3D12DXVKInteropDevice4, hand-declared ─────────────────────────────────
 //
 // ⛔ This file includes no vkd3d header (see the banner), so the interop interface
@@ -192,6 +209,8 @@ std::atomic<std::uint32_t> g_vkd3dNoInteropDevice{0};      // QI for ID3D12DXVKI
 std::atomic<std::uint32_t> g_vkd3dIdentityEngineRefused{0};// GetVulkanResourceMemoryInfo failed
 std::atomic<std::uint32_t> g_vkd3dIdentityIcdRefused{0};   // the ICD memory exports answered 0
 std::atomic<std::uint32_t> g_vkd3dOwnershipTransferFailed{0}; // transfer_resource_ownership gave 0
+std::atomic<std::uint32_t> g_vkd3dSampleBadArg{0};         // sample refused: queue/out-params
+std::atomic<std::uint32_t> g_vkd3dSampleNotLocked{0};      // vkd3d_lock_vk_queue gave no VkQueue
 
 // ── this DLL's `umd_log` ────────────────────────────────────────────────────
 //
@@ -596,6 +615,53 @@ std::uint32_t engine_resource_memory(const HeliosVkd3dDeviceImpl* impl,
     return HELIOS_VKD3D_IDENTITY_ENGINE_REFUSED;
   }
   return HELIOS_VKD3D_IDENTITY_RESOLVED;
+}
+
+/// Sample the venus GPU-completion boundary on a `VkQueue` the caller ALREADY HOLDS.
+///
+/// ⛔ **One implementation, two callers** — the drained path
+/// (`helios_vkd3d_bridge_drain_queue`) and the sample-only path
+/// (`helios_vkd3d_bridge_sample_queue_fence`). It is factored out rather than copied
+/// because the two would then be two spellings of one contract: the `|| == 0` guard,
+/// the four statuses and the rate-limited log all have to agree on what a refusal is,
+/// and a second copy is a second place for that to drift.
+///
+/// ⚠ **It does not lock, does not unlock, and cannot return early.** The caller owns
+/// the queue for the whole call; this function only writes its two out-params, which is
+/// what makes "the release always runs" a property of the callers' straight-line code
+/// rather than something to check.
+///
+/// ⚠ **It says nothing about WHEN it is called, and that is the caller's whole
+/// correctness.** After a drain the boundary covers everything the application
+/// enqueued; without one it may cover less. Neither is visible from here, which is why
+/// both call sites carry the argument and this function does not.
+void sample_queue_gpu_fence(void* vk_queue, std::uint64_t* out_wire_fence,
+                            std::uint32_t* out_fence_status) {
+  const QueueGpuFenceExport& e = queue_gpu_fence_export();
+  if (!e.fn) {
+    // NO_ICD or NO_EXPORT, decided and logged once at resolution time.
+    *out_fence_status = e.status;
+    return;
+  }
+  if (!e.fn(vk_queue, out_wire_fence) || *out_wire_fence == 0) {
+    // ⛔ `|| == 0` as well as the bool: the export documents that it always writes the
+    // out-param and leaves 0 on every refusal, so a `true` with a 0 fence would be a
+    // contract break — and treating it as a sample would put a "no boundary" record on
+    // the wire labelled as a real one.
+    *out_wire_fence = 0;
+    *out_fence_status = HELIOS_VKD3D_FENCE_REFUSED;
+    const std::uint32_t n =
+        helios_bridge::g_vkd3dQueueFenceZero.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n <= 8 || (n % 4096) == 0) {
+      char msg[192];
+      std::snprintf(msg, sizeof(msg),
+                    "queue_gpu_fence(%p) declined -- submitting a 0 boundary "
+                    "(Vkd3dQueueFenceZero=%u)", vk_queue, n);
+      umd_log(msg);
+    }
+    return;
+  }
+  *out_fence_status = HELIOS_VKD3D_FENCE_SAMPLED;
 }
 
 }  // namespace
@@ -1095,30 +1161,7 @@ bool helios_vkd3d_bridge_drain_queue(std::size_t queue,
         // would read the queue with no lock held, racing the very submissions the
         // drain just serialised.
         if (out_wire_fence && out_fence_status) {
-          const QueueGpuFenceExport& e = queue_gpu_fence_export();
-          if (!e.fn) {
-            // NO_ICD or NO_EXPORT, decided and logged once at resolution time.
-            *out_fence_status = e.status;
-          } else if (!e.fn(vk_queue, out_wire_fence) || *out_wire_fence == 0) {
-            // ⛔ `|| == 0` as well as the bool: the export documents that it always
-            // writes the out-param and leaves 0 on every refusal, so a `true` with a
-            // 0 fence would be a contract break — and treating it as a sample would
-            // put a "no boundary" record on the wire labelled as a real one.
-            *out_wire_fence = 0;
-            *out_fence_status = HELIOS_VKD3D_FENCE_REFUSED;
-            const std::uint32_t n =
-                helios_bridge::g_vkd3dQueueFenceZero.fetch_add(
-                    1, std::memory_order_relaxed) + 1;
-            if (n <= 8 || (n % 4096) == 0) {
-              char msg[192];
-              std::snprintf(msg, sizeof(msg),
-                            "queue_gpu_fence(%p) declined -- submitting a 0 "
-                            "boundary (Vkd3dQueueFenceZero=%u)", vk_queue, n);
-              umd_log(msg);
-            }
-          } else {
-            *out_fence_status = HELIOS_VKD3D_FENCE_SAMPLED;
-          }
+          sample_queue_gpu_fence(vk_queue, out_wire_fence, out_fence_status);
         }
 
         // ⛔ ONE release, on every path that acquired. The sample above adds no
@@ -1129,5 +1172,67 @@ bool helios_vkd3d_bridge_drain_queue(std::size_t queue,
         // and this is not a second instance of it.)
         vkd3d_release_vk_queue(q);
         return true;
+      });
+}
+
+bool helios_vkd3d_bridge_sample_queue_fence(std::size_t queue,
+                                            std::uint64_t* out_wire_fence,
+                                            std::uint32_t* out_fence_status) noexcept {
+  // ⛔ Cleared FIRST, before anything that can fail or throw — the same rule and the
+  // same reason as the drain: a caller reading an untouched pair after a false return
+  // would take stack garbage for a GPU boundary, and the kernel clamps a bad fence but
+  // cannot reject one.
+  if (out_wire_fence) *out_wire_fence = 0;
+  if (out_fence_status) *out_fence_status = HELIOS_VKD3D_FENCE_NO_ICD;
+
+  return helios_bridge::bridge_guard(
+      "helios_vkd3d_bridge_sample_queue_fence", false, [&]() -> bool {
+        if (!queue || !out_wire_fence || !out_fence_status) {
+          // ⚠ Both out-params are MANDATORY here, unlike the drain's both-or-neither:
+          // there the null pair means "drain but do not sample", which is a real mode.
+          // A sample with nowhere to put the answer would be a lock/unlock around
+          // nothing.
+          const std::uint32_t n =
+              helios_bridge::g_vkd3dSampleBadArg.fetch_add(1, std::memory_order_relaxed) + 1;
+          char msg[160];
+          std::snprintf(msg, sizeof(msg),
+                        "sample_queue_fence refused: queue=%p fence=%p status=%p "
+                        "(Vkd3dSampleBadArg=%u)",
+                        (void*)queue, (void*)out_wire_fence, (void*)out_fence_status, n);
+          umd_log(msg);
+          return false;
+        }
+        void* q = reinterpret_cast<void*>(queue);
+
+        // ⭐ LOCK, not acquire. `vkd3d_lock_vk_queue` enqueues no
+        // `VKD3D_SUBMISSION_DRAIN` and takes no `queue_lock` — see the extern
+        // declarations at the top of this file, and the header comment for the
+        // under-wait this buys and the asymmetry that makes it acceptable.
+        void* vk_queue = vkd3d_lock_vk_queue(q);
+        if (!vk_queue) {
+          // ⚠ `vkd3d_queue_acquire` returns `VK_NULL_HANDLE` only when
+          // `pthread_mutex_lock` on the vkd3d_queue fails (`command.c:333-347`; the
+          // `vk_queue` itself is `assert`ed non-null). ⭐ Unlike the drain's identical
+          // arm this leaks NOTHING — no `queue_lock` was taken — so skipping the
+          // unlock is correct rather than merely upstream's shape.
+          const std::uint32_t n =
+              helios_bridge::g_vkd3dSampleNotLocked.fetch_add(1, std::memory_order_relaxed) + 1;
+          char msg[176];
+          std::snprintf(msg, sizeof(msg),
+                        "sample_queue_fence: lock_vk_queue(%p) returned no VkQueue -- the "
+                        "submission carries a 0 boundary (Vkd3dSampleNotLocked=%u)", q, n);
+          umd_log(msg);
+          *out_fence_status = HELIOS_VKD3D_FENCE_REFUSED;
+          return false;
+        }
+
+        sample_queue_gpu_fence(vk_queue, out_wire_fence, out_fence_status);
+
+        // ⛔ ONE unlock, on the one path that locked. `sample_queue_gpu_fence` cannot
+        // `return` — it only writes its out-params — so there is no early exit between
+        // the lock and here by construction, and the next submission on this queue is
+        // never left blocked.
+        vkd3d_unlock_vk_queue(q);
+        return *out_fence_status == HELIOS_VKD3D_FENCE_SAMPLED;
       });
 }
