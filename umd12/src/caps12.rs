@@ -683,11 +683,30 @@ unsafe fn architecture_info(a: &ddi12::D3D12DDIARG_GETCAPS, data_size: usize) ->
 ///
 /// The five SM 6.6 fields (three `AtomicInt64*`, `DerivativesInMeshAnd...`,
 /// `WaveMMATier`) are FALSE because the shader-model list below stops at 6.0 —
-/// strings:116, which `D12-G5` proved is a live retail gate. `ROVs` is FALSE
-/// both because FL 11_0 arms no floor and because there is no real
-/// fragment-shader interlock: `DDI_REFERENCE.md` §11.6 hazard 2 calls that
-/// *"non-deterministically wrong and frame-rate dependent"*, the hardest class
-/// this project has already burned four sessions on.
+/// strings:116, which `D12-G5` proved is a live retail gate.
+///
+/// `ROVs` is FALSE because **FL 11_0 arms no floor** — and for that reason only.
+///
+/// ⛔⛔ **CORRECTED 2026-08-06. The second reason this comment used to give was
+/// FALSE, and it mattered: it read *"there is no real fragment-shader
+/// interlock"*, which documented one of FL 12_1's five floors as
+/// substrate-blocked when it is a one-line flip.** Refuted three ways: vkd3d
+/// derives the cap as `fragmentShaderPixelInterlock && fragmentShaderSampleInterlock`
+/// (`vkd3d-proton-helios/libs/vkd3d/device.c:10181-10182`); this guest reports
+/// **both true** with the extension present
+/// (`docs/dx12/research/guest-vulkaninfo-full.txt:952`, `:1425-1426`); and the
+/// measured baseline records `OPTIONS,ROVsSupported,1`
+/// (`docs/dx12/baselines/d3d12-caps.csv:16`).
+///
+/// ⚠ **How the error was made, because it is a repeatable one.**
+/// `DDI_REFERENCE.md` §11.6 hazard 2 is *conditional* — it warns against
+/// `ROVsSupported = TRUE` **without** real interlock, calling that
+/// *"non-deterministically wrong and frame-rate dependent"*. That conditional
+/// was read as an unconditional claim about this substrate. `DX12.md` §4.4 had
+/// already corrected the identical mistake once, for **tiled resources**, about
+/// a floor in the same five-item list, and closed it with *"a code comment
+/// asserting a dependency is not evidence of one"*. ⇒ When raising the feature
+/// level, `ROVs` moves with it as a const flip; there is nothing to build.
 ///
 /// # Safety
 /// As [`get_caps`].
