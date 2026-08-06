@@ -152,14 +152,23 @@ helios-vgpu/
 ├── packaging/windows/      ← Install-Helios.ps1 / Verify-Helios.ps1 + the four smoke
 │                             probes — the closest thing to an automated gate today
 ├── ci/ + .github/workflows ← the Windows graphics+compute bundle build
-├── vkd3d-proton-helios/    ← submodule at 8ee4440b = upstream 2c7ba22c + 5 Helios commits
-│                             (7 files, all build plumbing: libs/d3d12core/{helios_entry.c,
-│                             debug_control.c,helios_vkd3d.def,meson.build,main.c} and
-│                             tests/test-runner.sh). ⛔ NOT zero divergence — that line was
-│                             stale from 2026-08-05 and cost a session's reasoning.
-│                             ⚠ its own 3 nested submodules are uninitialised — nothing
-│                             builds until `git submodule update --init --recursive` runs
-│                             inside it. The D3D12 engine; see docs/dx12/SUBSTRATE.md
+├── vkd3d-proton-helios/    ← submodule at 4c26d855 = upstream 2c7ba22c + 6 Helios commits
+│                             (11 files). ⛔ NOT zero divergence — that line was stale from
+│                             2026-08-05 and cost a session's reasoning. Commits 1–5 are
+│                             build plumbing (libs/d3d12core/{helios_entry.c,debug_control.c,
+│                             debug_control.h,helios_vkd3d.def,meson.build,main.c},
+│                             tests/test-runner.sh); the 6th is the first that is NOT —
+│                             ID3D12DXVKInteropDevice4::GetVulkanResourceMemoryInfo
+│                             (include/vkd3d_device_vkd3d_ext.idl, libs/vkd3d/{device.c,
+│                             device_vkd3d_ext.c,vkd3d_private.h}), the resource-level
+│                             sibling of GetVulkanHeapInfo that the D3D12 present path
+│                             needs. ⭐ Its 3 nested submodules ARE checked out and the fork
+│                             BUILDS NATIVELY ON LINUX, tests included (widl/meson/ninja/
+│                             glslang all present) — so vkd3d changes are verifiable on the
+│                             host with no VM and no WDK. The older "nested submodules are
+│                             uninitialised, nothing builds" line was wrong and cost a round
+│                             a stated inability to verify. The D3D12 engine; see
+│                             docs/dx12/SUBSTRATE.md
 ├── LookingGlass/           ← HISTORICAL: former IddCx capture path. Retained only
 │                             because tools/win-mcp still implements win_looking_glass*
 └── kmd/                    ← ARCHIVED reference: System-class KMDF + IOCTL stack. Kept
