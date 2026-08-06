@@ -26,6 +26,12 @@ System\ Volume\ Information
 # Windows share junk
 $RECYCLE.BIN/
 
+# vkd3d-proton's pipeline cache, written into the CWD by any process that loads the
+# engine. The D3D12 gate probes run with the CWD on the Z:\ share, i.e. the repo root, so
+# a `D12-G7` run drops a `VKS`-magic blob here. It is regenerated on demand and must never
+# be committed -- a stale one would ship a shader cache built against a different driver.
+vkd3d-proton.cache*
+
 # Research-only checkouts (reference material, not part of the build)
 /dx-samples-research-only/
 /dxvk-research-only/
