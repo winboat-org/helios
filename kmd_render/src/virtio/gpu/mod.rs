@@ -369,6 +369,30 @@ const WDDM_HEAD_MS_MAX: u32 = 1000;
 /// which is the 0ab-B stale/black-frame class. A 1 ms bound would rebase healthy
 /// frames continuously. 100 ms is ~27 frames at the measured producer floor.
 const WDDM_HEAD_MS_MIN: u32 = 100;
+/// The FIFO head's armed `WddmHeadMs` deadline, in interrupt-time 100 ns units, or
+/// 0 when nothing is armed — which is the state of every ordinary desktop.
+///
+/// ⛔ IT IS STATE, NOT CONFIGURATION, AND THE DISTINCTION IS THE WHOLE POINT. The
+/// 60 Hz heartbeat in `adapter/kobj.rs` needs to know whether it should prompt a
+/// completion DPC, and the obvious-looking test — *"is `WddmHeadMs` non-zero"* —
+/// is TRUE ON EVERY SHIPPING BOOT, because [`WDDM_HEAD_MS_DEFAULT`] is 250. That
+/// would fire `request_wddm_completion_dpc` on all 60 ticks a second forever, on a
+/// desktop with no D3D12 client at all: a permanent DISPATCH tax on the exact
+/// compositor path WS2 fought over. This atomic is non-zero only while a head is
+/// genuinely waiting on a bound it may exceed.
+///
+/// ⚠ A HINT, NEVER THE AUTHORITY. The authoritative deadline lives on the FIFO
+/// entry (`WddmPending::head_deadline_100ns`); this is a lock-free shadow so a
+/// caller holding no transport lock can ask "is there any point in a DPC". It may
+/// therefore be STALE in exactly one direction: a head that retires normally before
+/// its deadline leaves a future value behind, which costs at most ONE spurious DPC
+/// (the reader claims and clears it — see [`VirtioGpu::wddm_head_bound_due`]) and
+/// never a repeating one. It is deliberately not cleared on the hot success path.
+///
+/// ⚠ Driver-global, like [`WDDM_HOLD_MS`], and for the same reason: one adapter,
+/// one FIFO, and the heartbeat cannot take `virtio_lock`. A value left behind by a
+/// dead transport generation costs the same single DPC.
+static WDDM_HEAD_DEADLINE_100NS: AtomicU64 = AtomicU64::new(0);
 /// Max response bytes a synchronous command may expect (copied into the
 /// waiter's [`SyncWaitBlock`]; the largest runtime response is
 /// `VirtioGpuRespMapInfo`. `init`'s big GET_DISPLAY_INFO reply stays on the
@@ -6134,6 +6158,76 @@ impl VirtioGpu {
         now.saturating_add(ms as u64 * 10_000)
     }
 
+    /// Whether a `WddmHeadMs` deadline is armed AND has expired, so the periodic
+    /// heartbeat should prompt a completion DPC. Claims the deadline on the way out,
+    /// so one arm yields at most one prompt.
+    ///
+    /// # Why the heartbeat needs this at all
+    ///
+    /// [`Self::rebase_blocked_head`] can only run when something looks at the FIFO,
+    /// and the release edges are all opportunistic: a used-ring completion DPC, or
+    /// `request_wddm_completion_dpc` from the ctrl/escape/device paths. On a busy
+    /// desktop those arrive constantly. The residual is the FULLY IDLE tail — a head
+    /// blocked on an unsatisfiable boundary while nothing else submits anything —
+    /// where without a periodic prompt the bound would never fire and the outcome
+    /// would be the TDR it exists to prevent.
+    ///
+    /// # ⛔ Why it is not `WDDM_HEAD_MS != 0`
+    ///
+    /// Because that is CONFIGURATION and it is true on every shipping boot
+    /// ([`WDDM_HEAD_MS_DEFAULT`] is 250), so it would prompt a DPC 60 times a second
+    /// forever on a desktop with no D3D12 client. See [`WDDM_HEAD_DEADLINE_100NS`].
+    ///
+    /// # Cost
+    ///
+    /// In the common case (nothing armed) exactly ONE relaxed 64-bit load, and
+    /// notably NO clock read: the time is sampled only after a non-zero deadline
+    /// proves there is something to compare against.
+    ///
+    /// # An associated function
+    ///
+    /// It takes no `&self` deliberately — the caller is the display heartbeat, which
+    /// holds no transport lock and must not take one. The FIFO entry remains the
+    /// authority; this only decides whether looking is worthwhile.
+    ///
+    /// # Why claiming (rather than re-arming) does not lose the prompt
+    ///
+    /// The alternative — push the shadow forward instead of clearing it, so a
+    /// dropped prompt retries — was rejected: nothing would then clear a STALE arm,
+    /// and a head that retired normally before its deadline would prompt once per
+    /// bound forever. Claiming is safe because the prompt cannot be dropped in any
+    /// state where it would have mattered: `request_wddm_completion_dpc` bails only
+    /// when the adapter has no callback table or no `DxgkCbQueueDpc`, and dxgkrnl is
+    /// set at StartDevice and never cleared — so if it is absent, no `DMA_COMPLETED`
+    /// can be delivered at all and a blocked FIFO head is not the live problem.
+    /// `DxgkCbQueueDpc` itself has no failure return.
+    ///
+    /// A later look that finds the entry's own deadline already past rebases on that
+    /// look, with no prompt needed, which is what covers the ordinary case where the
+    /// prompted DPC happens to find the head blocked on the (non-rebasable) wire arm
+    /// instead.
+    pub fn wddm_head_bound_due() -> bool {
+        let deadline = WDDM_HEAD_DEADLINE_100NS.load(Ordering::Relaxed);
+        if deadline == 0 {
+            return false;
+        }
+        let mut qpc_timestamp = 0;
+        // SAFETY: `KeQueryInterruptTimePrecise` is a scalar time read legal at any
+        // IRQL (this heartbeat runs at DISPATCH); it takes no lock and cannot
+        // re-enter the transport.
+        let now = unsafe { KeQueryInterruptTimePrecise(&mut qpc_timestamp) };
+        if !helios_kmd_logic::wddm_head_bound::heartbeat_due(deadline, now) {
+            return false;
+        }
+        // CLAIM IT. A stale arm (the head retired before its deadline) must cost one
+        // prompt, never a repeating one, and a `compare_exchange` rather than a
+        // `swap` so a concurrent re-arm with a LATER deadline is not silently
+        // discarded by this reader.
+        WDDM_HEAD_DEADLINE_100NS
+            .compare_exchange(deadline, 0, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    }
+
     /// Whether the last [`Self::note_wddm_submission`] overflowed the pending
     /// FIFO, and the caller therefore owes a lease release.
     ///
@@ -6335,10 +6429,20 @@ impl VirtioGpu {
                 bound::Action::Arm(deadline) => {
                     // FIRST blocked look at this entry as head.
                     head.head_deadline_100ns = deadline;
+                    // Publish the lock-free shadow so the 60 Hz heartbeat can tell
+                    // that a look is now worth prompting for. A store, not a
+                    // compare-exchange: the newest armed head is the one that
+                    // matters, and this runs under `virtio_lock` inside
+                    // `wddm_notify_lock` so there is no second arming writer.
+                    WDDM_HEAD_DEADLINE_100NS.store(deadline, Ordering::Relaxed);
                     return false;
                 }
                 bound::Action::Rebase => {}
             }
+            // The shadow's purpose is discharged: this head will never arm again
+            // (`rebased`), so leaving the value behind could only buy a spurious
+            // prompt. A later head arming overwrites it.
+            WDDM_HEAD_DEADLINE_100NS.store(0, Ordering::Relaxed);
             head.rebased = true;
             head.stream_boundary = None;
             head.watermark = rebase_watermark;

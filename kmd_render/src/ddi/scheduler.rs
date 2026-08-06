@@ -408,7 +408,21 @@ pub unsafe extern "C" fn dxgkddi_calibrate_gpu_clock(
     let clock_data = unsafe { &mut *clock_data };
     clock_data.GpuFrequency = GPU_TIMESTAMP_FREQUENCY_HZ;
     clock_data.CpuClockCounter = qpc_timestamp;
-    // Left at 0 by the zero-fill above. Counted, never fabricated.
+    // ⛔ `GpuClockCounter` IS LEFT AT 0 BY THE ZERO-FILL ABOVE, ON PURPOSE. DO NOT
+    // "fix" it with `qpc_timestamp * 100`, or with any other value derived from the
+    // guest clock, however tempting the fact that `GpuFrequency` is 1e9 makes it.
+    // The field must read the clock the HOST GPU stamps `vkCmdWriteTimestamp` into,
+    // and this guest cannot: virtio-gpu carries no such command, Venus exposes the
+    // host's timestamps only inside query results, and this DDI is a DISPATCH-level
+    // timer callback that may not wait on the host even if a channel existed.
+    //
+    // A guest-derived nanosecond count would have the correct RATE and a completely
+    // wrong EPOCH, so every GPU→CPU correlation built on it would be silently wrong
+    // while `ClkCal`, `ClkNoGpu` and `ClkFreq` all read healthy. That is fake
+    // success, which CLAUDE.md rule 2 forbids in favour of loud failure. The honest
+    // interim is this zero plus its counter; the honest ANSWER is
+    // `VK_KHR_calibrated_timestamps` read in the ICD and carried in by escape
+    // (`docs/dx12/PENDING.md` S-1 sizes that **M**).
     GPU_CLOCK_NO_GPU_COUNTER.fetch_add(1, Ordering::Relaxed);
     STATUS_SUCCESS
 }

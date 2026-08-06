@@ -5018,6 +5018,18 @@ pub mod wddm_head_bound {
         AlreadyRebased,
     }
 
+    /// Whether the periodic heartbeat should prompt a completion DPC.
+    ///
+    /// ⚠ THE ZERO IS THE COMMON CASE AND IT MUST STAY CHEAP. Nothing is armed on
+    /// an ordinary desktop, and the caller reads a single relaxed atomic to learn
+    /// that — it must not reach for a clock, and it must NOT test the knob instead:
+    /// `WddmHeadMs` defaults to 250, so a knob test is true on every shipping boot
+    /// and would turn this into a permanent 60 DPC/s tax on the compositor path.
+    /// Armed-ness is STATE; the bound is CONFIGURATION.
+    pub const fn heartbeat_due(deadline_100ns: u64, now_100ns: u64) -> bool {
+        deadline_100ns != 0 && now_100ns >= deadline_100ns
+    }
+
     /// Decide one blocked look. `deadline_100ns == 0` means "not armed".
     pub const fn look(bound_ms: u32, now_100ns: u64, deadline_100ns: u64, rebased: bool) -> Action {
         if bound_ms == 0 {
@@ -5041,7 +5053,7 @@ pub mod wddm_head_bound {
 
 #[cfg(test)]
 mod wddm_head_bound_tests {
-    use super::wddm_head_bound::{Action, clamp_bound_ms, look};
+    use super::wddm_head_bound::{Action, clamp_bound_ms, heartbeat_due, look};
 
     const MIN: u32 = 100;
     const MAX: u32 = 1000;
@@ -5090,6 +5102,24 @@ mod wddm_head_bound_tests {
         assert_eq!(look(0, 0, 0, false), Action::Disabled);
         assert_eq!(look(0, u64::MAX, 1, false), Action::Disabled);
         assert_eq!(look(0, u64::MAX, 1, true), Action::Disabled);
+    }
+
+    #[test]
+    fn an_unarmed_head_never_asks_the_heartbeat_for_anything() {
+        // THE COMMON CASE, and the one that must stay false: an ordinary desktop
+        // has nothing armed. A caller that tested the KNOB instead of this state
+        // would be true on every shipping boot (WddmHeadMs defaults to 250) and
+        // would prompt a DPC on all 60 ticks a second, forever.
+        assert!(!heartbeat_due(0, 0));
+        assert!(!heartbeat_due(0, u64::MAX));
+    }
+
+    #[test]
+    fn the_heartbeat_fires_only_at_or_after_an_armed_deadline() {
+        let deadline = 2_500_000;
+        assert!(!heartbeat_due(deadline, deadline - 1));
+        assert!(heartbeat_due(deadline, deadline));
+        assert!(heartbeat_due(deadline, deadline + 1));
     }
 
     #[test]
