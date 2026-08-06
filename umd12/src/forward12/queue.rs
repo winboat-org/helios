@@ -3463,6 +3463,19 @@ impl FenceOp {
 ///   being asked to wait beyond what it issued. **Loud**: there is no reading
 ///   under which dropping this is correct, so it goes to `pfnSetErrorCb`.
 ///
+/// ⛔⛔ **THE WATERMARK GATE IS ALSO WHAT KEEPS THE ECL DRAIN FROM DEADLOCKING, and
+/// that coupling is not obvious from either site.** A forwarded wait becomes a
+/// `VKD3D_SUBMISSION_WAIT` on vkd3d's worker queue, resolved by an **untimed**
+/// `pthread_cond_wait` (`command.c:1226`), and `pfnExecuteCommandLists`' drain waits
+/// FIFO behind it (`:25216-25217`). The reason that is not a permanent hang today is
+/// this gate: a forwarded wait for `V` implies some `pfnSignalFence(V' >= V)` was
+/// **issued earlier**, hence enqueued earlier on its own queue, so the dependency
+/// graph follows issue order and cannot contain a cycle. ⇒ **any change that
+/// forwards waits above the watermark — the obvious "fix" for the
+/// `FenceWaitNotForwarded` gap — must land together with a bounded or WAIT-skipping
+/// acquire in the fork.** `knobs12::UMD12_ECL_DRAIN` carries the same note from the
+/// drain's side.
+///
 /// ⛔ **`pfnSetErrorCb`, not `pfnSetCommandListErrorCb`, and that is decided by
 /// the TABLE and not by severity.** `pfnWaitForFence` is on
 /// `D3D12DDI_COMMAND_QUEUE_FUNCS_CORE_0001` — there is no command list to

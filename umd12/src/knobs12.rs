@@ -407,7 +407,37 @@ pub(crate) static UMD12_ECL_SUBMIT: BoolKnob = BoolKnob::new(c"Umd12EclSubmit", 
 /// the `pfnRenderCb` packet still goes in with `'HE12'`; only its fence field is 0.
 /// That is exactly the K-F1 plumbing arm `tmp/dx12/gates/G8-r0-settle/` measured, so
 /// this default *is* the measured configuration (CLAUDE.md rule 8) and the KMD can
-/// still recognise and scope-hold D3D12 packets.
+/// still recognise and scope-hold D3D12 packets — its decode counts the zero arm by
+/// name (`D3D12_SUBMIT_ZERO_FENCE`, `kmd_render/src/ddi/submit_command.rs`'s D3D12
+/// ECL arm), so this configuration is first-class on both sides rather than an
+/// unhandled edge.
+///
+/// # ⚠⚠ ONE NARROWING OF THE HAZARD, recorded because a hazard claim has premises too
+///
+/// `PENDING.md` A1 names the trigger as *"`queue->Wait(f,N);
+/// ExecuteCommandLists(...); …later… Signal(N)`"* and calls it a permanent hang.
+/// ⛔ **That specific pattern is REFUTED by code already in the tree.** A CPU
+/// `ID3D12Fence::Signal` never reaches this driver (`DDI_REFERENCE.md` §10.3), so at
+/// the moment `pfnWaitForFence` arrives `N` is above `FenceState`'s watermark and the
+/// wait is **not forwarded** (`FenceWaitRuntimeOwned`) — so no
+/// `VKD3D_SUBMISSION_WAIT` is ever enqueued and the drain has nothing to block
+/// behind. `d3d12_command_queue_Wait` (`command.c:23208`) is vkd3d's **only**
+/// producer of that submission type, so this is exhaustive rather than indicative.
+///
+/// ⇒ what is actually established, stated at the strength the source supports:
+///
+/// | claim | status |
+/// |---|---|
+/// | the drain is an **untimed** wait on another thread's progress, taken inside a DDI, with no counter and no GPU packet for TDR | **CONFIRMED** from source (`command.c:25216-25217`, `:1226`) |
+/// | its length is unbounded — it waits for the signalling queue's worker to reach a SIGNAL that sits behind that queue's whole pending FIFO | **CONFIRMED** |
+/// | the *permanent* hang requires a **cycle** among queue workers | and no cycle is constructible while the watermark gate stands: a forwarded wait for `V` implies some `pfnSignalFence(V' >= V)` was **issued earlier**, hence enqueued earlier on its own queue, so the dependency graph follows issue order and is acyclic |
+///
+/// ⛔⛔ **Which makes the watermark gate LOAD-BEARING FOR THIS KNOB, a coupling
+/// nobody had written down.** If a future change ever forwards waits above the
+/// watermark — the obvious "fix" for the `FenceWaitNotForwarded` ordering gap — the
+/// acyclicity argument dies and A1's permanent deadlock becomes reachable *through
+/// the ON arm*. ⇒ that change and a bounded acquire must land together, and
+/// `queue::fence_operation`'s wait arm carries the same note.
 ///
 /// # ⭐ The real fix, and it is not this knob and not in this crate
 ///
