@@ -3619,6 +3619,29 @@ silent on it:
   command pool, `pfnMakeResident`, `pfnGetDebugAllocationInfo`. Those are **L6**, **L2**
   and **L4**, and driving them to zero is those lanes' definition of done
   (`PARALLEL.md` §9.2).
+- ⭐⭐ **THE FEATURE-LEVEL TARGET IS FL 12_2 ("DirectX Ultimate") BY P4/P5** (owner,
+  2026-08-06). `DX12.md` **§4.4** is the ladder. FL 11_0 is what `caps12.rs` ships
+  today and it is a **staging value**, not the destination.
+  - ⭐ **The ceiling is not the substrate — every one of the eighteen FL 12_2 floors
+    is already backed on this guest**, tabulated in §4.4 against
+    `baselines/d3d12-caps.csv`, with vkd3d's own log saying `DX Ultimate supported!`.
+    ⇒ the feature level is a **function of lane completion**: it rises as the DDI
+    slots behind each cap become real, because `DECISIONS.md` §7.8 forbids
+    advertising what the *driver* cannot back.
+  - ⛔ **The level and its floors move in ONE commit, by the lane that earned them.**
+    12_0 arms typed-UAV-load + `ResourceBindingTier >= 2` + `TiledResourcesTier >= 2`
+    (L5, L4); 12_1 adds ROVs + conservative raster (L6); 12_2 adds eighteen more
+    across L6/L5/L4/L3a/L3c/L9.
+  - ⛔ **This is a constraint on how the lanes are BUILT, not a later milestone.** A
+    lane written against binding tier 1, or against a two-entry shader-model list, is
+    a lane that gets rewritten; where the tier-3 shape costs the same effort, build it.
+  - ⛔ **The long pole is `TiledResourcesTier >= 3` and it is NOT a UMD-only job**:
+    `kmd_render`'s guest page tables are decorative
+    (`kmd_render/src/ddi/gpummu.rs:1-14`). Schedule the KMD dependency rather than
+    discovering it at the last floor.
+  - ⚠ Three floors are met **exactly** — GPU VA 40 bits, conservative raster tier 3,
+    VRS tier 2 — so a substrate regression in any of them lowers the achievable
+    level. Worth a `D12-G9` assertion rather than an assumption.
 - **Next: `D12-G8`** — a triangle through the DDI, owner-visible. That needs the 25 slots
   above, i.e. the `PARALLEL.md` §4 fan-out: **L2** first (it mints the WDDM context),
   then **L6** → **L5** → **L4**, then L3a/L3b, then L8 — followed by the §10 review pass.

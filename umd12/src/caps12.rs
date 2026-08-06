@@ -212,6 +212,28 @@ mod v {
 /// `shader_caps`'s `ROVs` / `TypedUAVLoadAdditionalFormats` move **together or
 /// not at all**.
 ///
+/// # ⭐ 11_0 IS A STAGING VALUE. THE TARGET IS 12_2.
+///
+/// Owner directive, 2026-08-06: the goal by **P4 (first frame) / P5
+/// (conformance)** is the **highest feature level D3D12 defines — FL 12_2,
+/// "DirectX Ultimate"**. `DX12.md` §4.4 is the ladder: which floors each step
+/// arms, and which lane must land before the step can be taken.
+///
+/// ⭐ **The ceiling is not the substrate.** Every one of the eighteen FL 12_2
+/// floors is already backed on this guest — `baselines/d3d12-caps.csv` has them
+/// all, and vkd3d's own log says `DX Ultimate supported!`. What gates the level
+/// is that the DDI slots behind each cap become real, because `DECISIONS.md`
+/// §7.8 forbids advertising what the *driver* cannot back.
+///
+/// ⛔ So this constant is not "raise it when someone feels brave". It is
+/// **`min(what every lane has landed)`**, and the commit that raises it is the
+/// commit that raises its floors — never one without the other, which is the
+/// failure `D12-G5` measured verbatim.
+///
+/// ⚠ The long pole is `TiledResourcesTier >= 3`, and it is the one floor that
+/// is **not a UMD-only job**: `kmd_render`'s guest page tables are decorative
+/// (`kmd_render/src/ddi/gpummu.rs:1-14`). See §4.4.
+///
 /// ⛔ Two values this must never be, both by precedent:
 /// * a **bitmask**. `D3D12DDICAPS_TYPE_3DPIPELINESUPPORT` is a *maximum level*
 ///   for D3D12 — the exact opposite of `D3D11DDICAPS_3DPIPELINESUPPORT`, which
