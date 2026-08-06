@@ -73,22 +73,51 @@
 //! cast. That is the same finding the 80th memory records for formats: D3D11
 //! harmonised its DDI enums with the API's and D3D12 did **not**.
 //!
-//! # ⛔ `DECISIONS.md` D13 and what this lane does NOT declare
+//! # ⛔ `DECISIONS.md` D13 — and why this lane now DOES take the dependency
 //!
 //! D13 binds this lane hardest: private data that CROSSES a module boundary is
 //! declared once, in `helios_protocol`, and reused verbatim —
-//! `HeliosWddmAllocPrivate` (`'HWDM'`) and `HeliosWddmOpenIdentity` (`'HIDN'`).
-//! ⭐ **This lane declares no such record and takes no `helios_protocol`
-//! dependency**, because it writes none: it mints no WDDM allocation. vkd3d's
-//! memory is minted by the Mesa venus ICD through its own `D3DKMT` path, so this
-//! driver never calls `pfnAllocateCb` and therefore never fills
-//! `pAllocationInfo[i].pPrivateDriverData`. The record has no writer here to be
-//! wrong about. The two slots that WOULD need it — `pfnOpenHeapAndResource` and
-//! its sizing call — are refused; see [`open_heap_and_resource`] for exactly
-//! what is missing and why. ⇒ `PARALLEL.md` §5's *"`umd12` does not yet depend
-//! on `helios_protocol`; the first lane that needs a crossing record adds it"*
-//! is still true after this lane, and that is a deliberate, stated outcome
-//! rather than an oversight.
+//! `HeliosWddmAllocPrivate` (`'HWDM'`), `HeliosWddmAllocMeta`,
+//! `HeliosWddmOpenIdentity` (`'HIDN'`), `HeliosPresentPrivateData` and
+//! `HeliosPresentRenderCmd`.
+//!
+//! ⚠ **This block used to say the opposite**, and the reversal is recorded
+//! rather than quietly edited. It said this lane *"declares no such record and
+//! takes no `helios_protocol` dependency, because it writes none: it mints no
+//! WDDM allocation"* — vkd3d's memory being minted by the Mesa venus ICD
+//! through its own `D3DKMT` path, so this driver never calls `pfnAllocateCb`.
+//! Every clause of that was true of L4 as shipped, and the conclusion is now
+//! **wrong**, because `KMD_IMPACT.md` §14a.3 settled what the D3D12 present path
+//! actually needs: not the ICD handing over a `D3DKMT_HANDLE` (it has none that
+//! means anything — its only `D3DKMTCreateAllocation2` mints a
+//! `kind = TRACKING` VidMm charge the KMD forbids from carrying identity,
+//! `create_allocation.rs:2333-2344`), and not this driver allocating and the ICD
+//! importing (backwards), but the third shape, the one D3D11 ships: **the engine
+//! allocates the Vulkan memory and this driver ADOPTS it**, by calling
+//! `pfnAllocateCb` with `HeliosWddmAllocPrivate.adopt_resource_id = <venus
+//! resid>`. The KMD already accepts exactly that
+//! (`create_allocation.rs:2377-2379`: `kind == DEVICE_MEMORY &&
+//! adopt_resource_id != 0` → `AllocationBacking::AdoptedUmdResource`, with
+//! `write_open_identity` stamping `HeliosWddmOpenIdentity` back so DWM's D3D11
+//! opener works unchanged) — so there is no new allocation shape and no new KMD
+//! verb, only a writer this lane did not have. The model to mirror is
+//! `umd/src/forward/resource.rs:263-324` (build the record) and `:374` (the one
+//! `pfnAllocateCb` call site — there is exactly one, for four callers).
+//!
+//! ⇒ `PARALLEL.md` §5's *"`umd12` does not yet depend on `helios_protocol`; the
+//! first lane that needs a crossing record adds it, and says so"* is discharged
+//! **here**: `umd12/Cargo.toml` takes it, and this is the saying-so.
+//!
+//! ⚠ What is NOT yet true, stated so nothing reads more into the dependency than
+//! it carries: **nothing in this crate calls `pfnAllocateCb` yet.** That is UP-5.
+//! `pfnCheckResourceAllocationHandle` still answers 0 and still counts
+//! (`ResourceAllocationHandleUnavailable`), and `pfnOpenHeapAndResource` and its
+//! sizing call are still refused — see [`open_heap_and_resource`] for exactly
+//! what is missing and why. UP-1 takes the dependency and deletes the claim that
+//! it is not needed; it adds no writer and no reader of its own. The size and
+//! layout asserts are not restated either — `protocol/src/wddm.rs:483-501`
+//! already carries all of them, and a second copy of an assert is a second thing
+//! that can drift.
 //!
 //! The per-object `pDrvPrivate` payloads below ([`HeapState`], [`ResourceState`])
 //! are runtime-allocated, per-object, per-process and read by nothing outside

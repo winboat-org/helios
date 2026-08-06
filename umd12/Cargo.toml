@@ -17,6 +17,34 @@ description = "Helios vGPU WDDM D3D12 user-mode display driver (skeleton; OpenAd
 crate-type = ["cdylib"]
 
 [dependencies]
+# UP-1 (`KMD_IMPACT.md` §14a.3). ⛔ `DECISIONS.md` D13 is an OWNER REQUIREMENT:
+# private data that CROSSES a module boundary is declared exactly once, in
+# `helios_protocol`, and `helios_umd12.dll` reuses those declarations BYTE FOR
+# BYTE -- `HeliosWddmAllocPrivate` (`'HWDM'`), `HeliosWddmAllocMeta`,
+# `HeliosWddmOpenIdentity` (`'HIDN'`), `HeliosPresentPrivateData` and
+# `HeliosPresentRenderCmd`. It never re-declares them and never invents a second
+# magic, so a D3D12 resource opened by DWM through the D3D11 DDI is readable
+# **by construction** rather than by two declarations happening to agree.
+#
+# ⛔ Why this crate and not `umd_common`: `kmd_render` reads the same structs and
+# is a `no_std` cdylib that does not (and must not) depend on `umd_common`, which
+# is `std`, Windows-user-mode and pulls `windows`. `protocol` is the only crate
+# that already builds on both platforms *and* in the kernel. D13 states this
+# outright, and moving the records would put them somewhere the KMD cannot see.
+#
+# ⚠ What this dependency does NOT yet do: nothing here calls `pfnAllocateCb`.
+# That is UP-5, and the standing rule (`DECISIONS.md` §7.1) is that a refusal
+# stops refusing in the same commit that makes its body reachable. UP-1 exists as
+# its own commit so that the dependency and the deleted *"this lane declares no
+# such record and takes no `helios_protocol` dependency"* block in
+# `src/forward12/resource12.rs` are verifiable together and in isolation.
+#
+# ⚠ No size or layout asserts are restated here: `protocol/src/wddm.rs:483-501`
+# already asserts all of them (48 / 48 / 48 / 72 / 80 bytes, plus
+# `size_of::<HeliosWddmOpenIdentity>() == size_of::<HeliosWddmAllocPrivate>()`,
+# which is what lets the KMD overwrite the first 48 bytes in place). A second
+# copy of an assert is a second thing that can drift.
+helios_protocol = { path = "../protocol" }
 # ⛔ The D3b rule: anything that would also exist in `umd/` lives here, not in a
 # second copy. Nothing in this crate may be copy-pasted from `umd/`.
 helios_umd_common = { path = "../umd_common" }

@@ -136,8 +136,10 @@ Five shared files exist. Each has an **append-only** discipline:
   owning crate, typed against `ddi12`, so `umd_common::slot`'s `BoxedHandle::State` can keep naming
   a payload from its **handle type** (§12 rule 7's scar). A single shared payload file would also be
   the hottest merge point in an 11-lane split — the contention this whole section removes.
-* ⚠ `umd12` does not yet depend on `helios_protocol`. The first lane that needs a crossing record
-  adds it, and says so.
+* ✅ `umd12` **now depends on `helios_protocol`** — taken by `KMD_IMPACT.md` §14a.3's UP-1, whose
+  whole content is the dependency plus the deletion of L4's *"this lane declares no such record"*
+  block. The rule the bullet stated still stands for every future record: a crossing record is
+  appended to `protocol/src/wddm.rs` with its own magic and version, never re-declared here.
 * ⚠ **`Slot<Boxed<S>>::get()`'s soundness argument is still not inherited** (§9.4). D13 shares
   declarations, not claims.
 
