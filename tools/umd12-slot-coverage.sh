@@ -105,20 +105,58 @@ fi
 # finding arrives in a report nobody trusts any more.
 #
 # The filter is `//`-or-`*` at the start of the trimmed line, which covers `//`, `///`,
-# `//!` and the continuation lines of a `/* */` block. It cannot see a `.pfnX = Some(`
-# inside a string literal or a trailing comment — both would read as *installed*, i.e.
+# `//!` and the continuation lines of a `/* */` block. It cannot see an assignment inside a
+# string literal or a trailing comment — both would read as *installed*, i.e.
 # over-reporting — so if this ever disagrees with the runtime counters, suspect those two
 # shapes first.
-assignments="$(grep -rnE '\.pfn[A-Za-z0-9_]+ = Some\(' \
-    "${SRC}/forward12" "${SRC}/caps12.rs" 2>/dev/null |
-    awk -F: '{
-        text = $0
-        sub(/^[^:]*:[0-9]+:/, "", text)
-        gsub(/^[ \t]+/, "", text)
-        if (text ~ /^\/\// || text ~ /^\*/) next
-        print $0
-    }' |
-    sed -E 's|^(.*):([0-9]+):.*\.(pfn[A-Za-z0-9_]+) = Some\(.*$|\3\t\1:\2|' || true)"
+#
+# ⚠⚠ **THE MATCHER IS FORMATTING-INSENSITIVE BY CONSTRUCTION, AND IT TOOK THREE WRONG
+# ANSWERS IN ONE SITTING TO GET THERE.** A naive `\.pfnX = Some\(` grep missed two whole
+# classes on the first S6 merge, both silently and both under-reporting:
+#
+#   1. `Some(` is not the only install form. The command-queue table's `pfnUnused` /
+#      `pfnUnused2` are bindgen'd as bare `*mut ::std::os::raw::c_void` — the header
+#      declares them as untyped reserved words, not `Option<unsafe extern "C" fn(..)>` — so
+#      they install as `table.pfnUnused = queue_unused_slot as *mut c_void;`.
+#   2. **rustfmt wraps.** Three slots with long handler names install as
+#      `table.pfnCalcPrivateGeometryShaderWithStreamOutput =` followed by `Some(handler);`
+#      on the NEXT line, and a line-at-a-time grep cannot see them.
+#
+# Patching the pattern a third time is how an instrument becomes a thing nobody believes,
+# so the shape changed instead: continuation lines are **joined** before matching (any line
+# whose last non-space character is `=` absorbs the next), and the match is then any
+# `.pfnName = <rhs>` whose rhs is not `None`. It still cannot match `==` or `!=`, both of
+# which need a second `=` where this needs a space or an end of line.
+#
+# ⚠ What it still cannot see, both of which OVER-report: an assignment inside a string
+# literal, and one in a trailing comment. If this ever disagrees with the runtime counters,
+# suspect those two first.
+assignments="$(
+    while IFS= read -r -d '' f; do
+        awk -v file="${f}" '
+            {
+                line = $0
+                lineno = FNR
+                # Join rustfmt continuation lines: a statement broken after `=`.
+                while (line ~ /=[ \t]*$/ && (getline nxt) > 0) {
+                    sub(/^[ \t]+/, "", nxt)
+                    line = line " " nxt
+                }
+                trimmed = line
+                gsub(/^[ \t]+/, "", trimmed)
+                if (trimmed ~ /^\/\//) next
+                if (trimmed ~ /^\*/) next
+                if (trimmed ~ /\.pfn[A-Za-z0-9_]+ = None/) next
+                if (match(trimmed, /\.pfn[A-Za-z0-9_]+ = [^=]/)) {
+                    # The match is `.` + name + ` = ` + one non-`=`, so the name is
+                    # RLENGTH - 5 characters starting one past the dot.
+                    slot = substr(trimmed, RSTART + 1, RLENGTH - 5)
+                    print slot "\t" file ":" lineno
+                }
+            }
+        ' "${f}"
+    done < <(find "${SRC}/forward12" "${SRC}/caps12.rs" -name '*.rs' -print0) || true
+)"
 
 status=0
 total=0
