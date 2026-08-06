@@ -702,6 +702,52 @@ unsafe fn texture_copy_location(
     }
 }
 
+/// One trace field describing the **resolved** [`D3D12_TEXTURE_COPY_LOCATION`]
+/// this driver is about to hand the engine.
+///
+/// ⭐ **The existing trace printed the DDI's `Layout` discriminant, which names
+/// which arm of [`texture_copy_location`] ran and says nothing about what came
+/// out of it.** A wrong `RowPitch`, a wrong `Offset`, a block-compressed extent
+/// that was or was not scaled, and a subresource index that landed in the wrong
+/// mip all look identical at that resolution — and a missing footprint print
+/// cost the F1 fence-bridge investigation a day of reading vkd3d logs for a
+/// number this driver already had in a local. This prints the struct itself,
+/// plus the `ID3D12Resource` the engine will see, which is the only identity
+/// shared with vkd3d's own log.
+///
+/// ⚠ Allocates, so every call site must be inside a `trace_line!` argument list
+/// — the macro evaluates its arguments only when the gate is open.
+fn describe_location(l: &D3D12_TEXTURE_COPY_LOCATION) -> String {
+    let resource = l
+        .pResource
+        .as_ref()
+        .map_or(core::ptr::null_mut(), |r| r.as_raw());
+    if l.Type.0 == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT.0 {
+        // SAFETY: `Type` selects the union arm, and this driver wrote BOTH in
+        // the same struct literal in `texture_copy_location` — the footprint is
+        // never read for a location whose `Type` this function did not set.
+        let f = unsafe { &l.Anonymous.PlacedFootprint };
+        format!(
+            "res={resource:p},FOOTPRINT,off={},fmt={},{}x{}x{},rowPitch={}",
+            f.Offset,
+            f.Footprint.Format.0,
+            f.Footprint.Width,
+            f.Footprint.Height,
+            f.Footprint.Depth,
+            f.Footprint.RowPitch,
+        )
+    } else if l.Type.0 == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX.0 {
+        // SAFETY: as above.
+        let index = unsafe { l.Anonymous.SubresourceIndex };
+        format!("res={resource:p},SUBRESOURCE,index={index}")
+    } else {
+        // ⛔ Unreachable through `texture_copy_location`, which returns only the
+        // two arms above — printed rather than asserted because a trace helper
+        // that can panic is a graphics deadlock (CLAUDE.md's DDI rule).
+        format!("res={resource:p},TYPE={}", l.Type.0)
+    }
+}
+
 /// Count, log and report one [`LocationRefusal`], once per copy.
 ///
 /// # Safety
@@ -845,10 +891,13 @@ unsafe extern "C" fn copy_texture_region(
     };
 
     trace_line!(
-        "CopyTextureRegion: dstLayout={} srcLayout={} dst=({dst_x},{dst_y},{dst_z}) box={}",
+        "CopyTextureRegion: dstLayout={} srcLayout={} dst=({dst_x},{dst_y},{dst_z}) box={} \
+         DST[{}] SRC[{}]",
         dst_resource.Layout,
         src_resource.Layout,
         u8::from(api_src_box.is_some()),
+        describe_location(&dst),
+        describe_location(&src),
     );
 
     // SAFETY: `engine()` borrows the list this box owns; both locations are live

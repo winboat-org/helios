@@ -189,6 +189,7 @@
 
 use core::ffi::c_void;
 use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::time::Duration;
 
 use helios_umd_common::hr::{Hresult, E_FAIL, E_INVALIDARG, E_NOTIMPL, S_OK};
 use helios_umd_common::refusals::RefusalCounter;
@@ -1952,6 +1953,13 @@ unsafe extern "C" fn execute_command_lists(
         return;
     }
 
+    // ⚠ The per-list trace detail is formatted only when the trace gate is
+    // ALREADY open. This is per-submit traffic and the loop below is on it; a
+    // `String` built unconditionally would be R420's cost with none of its
+    // evidence.
+    let tracing = crate::log::trace_enabled();
+    let mut traced_lists = String::new();
+
     // ⚠ One `AddRef`/`Release` pair per list per submit, on purpose. The engine's
     // wrapper takes `&[Option<ID3D12CommandList>]`, i.e. owned references, while
     // each slot only *lends* one; cloning is the encoding of that difference
@@ -1982,11 +1990,44 @@ unsafe extern "C" fn execute_command_lists(
         // (single inheritance, the `windows` crate's own `interface_hierarchy!`);
         // `clone` is the AddRef the vector's drop then balances.
         engine_lists.push(Some((**state.engine()).clone()));
+        if tracing {
+            // ⭐ Both identities, because neither alone answers the question
+            // `tmp/dx12/gates/G8-r0/RESULT.md` asked and never got an instrument
+            // for: `pDrvPrivate` ties this entry back to the `CreateCommandList`
+            // / `ResetCommandList` / `CloseCommandList` lines for the SAME list,
+            // and the engine pointer is what a vkd3d log names. Without the
+            // pair, "the recorded commands reached the submitted list" is an
+            // inference across two logs that do not share a vocabulary.
+            // ⚠ The deref is to the COM base `ID3D12CommandList` — the exact
+            // interface pushed above — so the printed pointer is the one handed
+            // to the engine, not a sibling QI of it.
+            traced_lists.push_str(&format!(
+                " [{i}]priv={:p},list={:p}",
+                h.drv_private(),
+                (**state.engine()).as_raw(),
+            ));
+        }
     }
+
+    // ⚠ Emitted BEFORE the forward, deliberately: if the engine call ever wedges
+    // (it did, in teardown, in the `G8-r0-settle` round), this line is the last
+    // thing that says what was being submitted when it did.
+    trace_line!(
+        "ExecuteCommandLists: Count={count} queue={:p}{traced_lists}",
+        queue.engine_queue.as_raw(),
+    );
 
     // SAFETY: `engine_lists` is a live slice of owned interfaces for the whole
     // call, and `engine_queue` is the live queue this state owns.
     unsafe { queue.engine_queue.ExecuteCommandLists(&engine_lists) };
+
+    // ⭐ `bump`, not `note_refusal`: the `EclNoWddmSubmission` line immediately
+    // below already emits this set's summary on its first hit, and R911 is
+    // explicit that an already-loud arm must not emit it a second time for one
+    // event — here that would be the whole ~300-counter line twice per submit's
+    // first occurrence. The count is still readable, because it is inside the
+    // very summary that call prints.
+    L2_REFUSALS.ecl_forwarded.bump();
 
     // ⛔ The WDDM half is NOT here. `ResourceHeaps.md:1678` requires a kernel
     // submission during this DDI, on this thread, with a context minted at queue
@@ -1996,6 +2037,31 @@ unsafe extern "C" fn execute_command_lists(
     // `pKTCallbacks->pfnSubmitCommandCb` (`DDI_REFERENCE.md` §6.4's submission
     // row). Counted on every forward so the gap is a number.
     note_refusal(&L2_REFUSALS.ecl_no_wddm_submission);
+
+    // ⛔⛔ DIAGNOSTIC ARM — INERT BY DEFAULT (`Umd12EclDelayUs` absent = 0 = no
+    // delay, so a run with no knob set is byte-identical to the build that never
+    // heard of it). It is a producer-side CPU stall, which
+    // `umd/src/knobs.rs:31-43` forbids as a *fix*; it is legal here only as a
+    // MEASUREMENT with a question attached, and it must be DELETED by the commit
+    // that lands the `pfnRenderCb` WDDM submission this DDI is missing.
+    //
+    // The question — *where does the runtime's fence advance become downstream
+    // of this driver?* `D12-G8` rung 0's fence completes with no causal
+    // dependency on the engine's work. Delay only this DDI, and read the probe's
+    // own `WaitForSingleObject signalled in N us`:
+    //   N >= the delay ⇒ the advance is downstream of THIS DDI returning, which
+    //                    is exactly where the submission goes. The best case.
+    //   N ~ 1 µs, and the `pfnSignalFence` arm reads the same ⇒ the runtime
+    //                    advances the fence independently of both DDIs, so the
+    //                    submission's precondition is in doubt and must be
+    //                    settled directly, in the kernel, by holding a DMA
+    //                    packet and watching the app's wait.
+    // `knobs12::UMD12_ECL_DELAY_US` carries the full table and the citations.
+    let ecl_delay_us = crate::knobs12::umd12_ecl_delay_us();
+    if ecl_delay_us != 0 {
+        note_refusal(&L2_REFUSALS.ecl_delayed);
+        std::thread::sleep(Duration::from_micros(u64::from(ecl_delay_us)));
+    }
 }
 
 /// `pfnUnused` — the header's own name for queue-table slot 1.
@@ -2163,6 +2229,18 @@ unsafe fn fence_operation(
         return;
     };
 
+    // ⚠ Emitted before either arm can return, so a refused wait is as visible as
+    // a forwarded one. `pDrvPrivate` is what ties this line to L7's
+    // `CreateFence: valueVA=… monitoredVA=… flags=…` for the SAME fence — the
+    // runtime hands the driver no other name for it (`FENCE-BRIDGE-DESIGN.md`
+    // §1.3), so without it two fences in one process are indistinguishable here.
+    trace_line!(
+        "{}: value={} fence={:p}",
+        which.name(),
+        op.Value,
+        op.Fence.drv_private(),
+    );
+
     match which {
         // ⚠ The watermark is raised BEFORE the engine call — `note_signal`'s doc
         // has the ordering argument.
@@ -2193,6 +2271,18 @@ unsafe fn fence_operation(
         }
     };
     let Err(e) = result else {
+        // ⭐⭐ THE SUCCESS PATH, counted — and it was not, until the F1 round.
+        // `tmp/dx12/gates/G8-r0/RESULT.md` claimed *"the queue-table `Signal`
+        // path ran"* on the strength of `FenceOpEngineFailed = FenceOpBadArg =
+        // FenceWaitNotForwarded = 0`, i.e. three ZERO readings, while this
+        // branch incremented nothing and logged nothing. A zero reading is not
+        // evidence a path works — this file says so 40 lines above, and
+        // `fence.rs:61-64` says it again — so the claim was unsupported and the
+        // whole A-vs-C decision (`FENCE-BRIDGE-DESIGN.md` §5) rests on it.
+        note_refusal(match which {
+            FenceOp::Signal => &L2_REFUSALS.fence_signal_forwarded,
+            FenceOp::Wait => &L2_REFUSALS.fence_wait_forwarded,
+        });
         return;
     };
 
@@ -2232,6 +2322,36 @@ unsafe extern "C" fn signal_fence(
 ) {
     // SAFETY: forwarded unchanged; the caller's guarantee is `fence_operation`'s.
     unsafe { fence_operation(FenceOp::Signal, h_queue, op_arg) }
+
+    // ⛔⛔ DIAGNOSTIC ARM — INERT BY DEFAULT (`Umd12FenceSignalDelayUs` absent =
+    // 0 = no delay, so a run with no knob set is byte-identical to the build
+    // that never heard of it). It is a producer-side CPU stall, which
+    // `umd/src/knobs.rs:31-43` forbids as a *fix*; it is legal here only as a
+    // MEASUREMENT with a question attached, and it must be DELETED by the commit
+    // that lands the `pfnRenderCb` WDDM submission.
+    //
+    // The question — *where does the runtime's fence advance become downstream
+    // of this driver?* `D12-G8` rung 0's fence completes with no causal
+    // dependency on the engine's work (`tmp/dx12/gates/G8-r0-settle/`: the app's
+    // wait returns in 1.1 µs, the surface is 0/65536 exact at T+0 and
+    // 65536/65536 at +2000 ms through the same mapping). Delay only THIS DDI,
+    // and read the probe's own `WaitForSingleObject signalled in N us`:
+    //   N >= the delay ⇒ the advance is downstream of `pfnSignalFence`
+    //                    RETURNING, so the submission must be in place by then;
+    //   N ~ 1 µs       ⇒ it is not this DDI, and the `Umd12EclDelayUs` arm says
+    //                    whether it is `pfnExecuteCommandLists` or neither.
+    // ⚠ `FenceSignalForwarded = 0` makes this arm's reading UNOBSERVABLE rather
+    // than negative: a delay on a DDI the runtime never enters cannot be seen,
+    // and that absence is itself a fact the submission design must accommodate.
+    // ⛔ Placed AFTER the whole forward and OUTSIDE any early return, because the
+    // thing under test is when this DDI *returns to the runtime*, not what
+    // happened inside it. `knobs12::UMD12_FENCE_SIGNAL_DELAY_US` carries the
+    // reading table and the citations.
+    let delay_us = crate::knobs12::umd12_fence_signal_delay_us();
+    if delay_us != 0 {
+        note_refusal(&L2_REFUSALS.fence_signal_delayed);
+        std::thread::sleep(Duration::from_micros(u64::from(delay_us)));
+    }
 }
 
 /// `pfnWaitForFence`.
@@ -2525,6 +2645,60 @@ pub(crate) struct L2Refusals {
     /// next to visible cross-queue corruption is the third case and is a finding;
     /// see `fence.rs`'s module doc.
     fence_wait_not_forwarded: RefusalCounter,
+    /// `pfnSignalFence` reached its engine forward and
+    /// `ID3D12CommandQueue::Signal` returned success.
+    ///
+    /// ⚠ **Expected NON-ZERO once any D3D12 workload signals a fence. A zero
+    /// here means the runtime never enters this slot at all** — a fact the
+    /// `pfnRenderCb` WDDM submission design has to accommodate, because nothing
+    /// this driver does *inside* `pfnSignalFence` can then be part of the
+    /// ordering (`tmp/dx12/FENCE-BRIDGE-DESIGN.md` §5 step 2). It is also
+    /// `DDI_REFERENCE.md` §14.0's WARP reading, which measured WARP never
+    /// entering this slot across 20 frames of `ID3D12CommandQueue::Signal` +
+    /// `SetEventOnCompletion`.
+    ///
+    /// ⭐ **Why a success counter exists at all**, against this file's own
+    /// convention that counters name refusals: until it did, `pfnSignalFence`
+    /// succeeding was **invisible**. `fence_operation` incremented nothing and
+    /// logged nothing on its success path, so `tmp/dx12/gates/G8-r0/RESULT.md`'s
+    /// claim that *"the queue-table `Signal` path ran"* rested on three **zero**
+    /// readings — `FenceOpEngineFailed`, `FenceOpBadArg`, `FenceWaitNotForwarded`
+    /// — and this project has twice written, in this very file
+    /// (`queue.rs`'s `fence_operation` doc) and in `fence.rs:61-64`, that a zero
+    /// reading is not evidence a path works.
+    fence_signal_forwarded: RefusalCounter,
+    /// `pfnWaitForFence` reached its engine forward and
+    /// `ID3D12CommandQueue::Wait` returned success. Same grading and the same
+    /// reason for existing as [`Self::fence_signal_forwarded`].
+    ///
+    /// ⚠ Expected non-zero only on a workload that waits on a value this driver
+    /// has itself signalled: everything above that watermark is refused by
+    /// `FenceWaitNotForwarded` before it can reach the forward. ⇒ read the two
+    /// together — `FenceWaitForwarded = 0` with `FenceWaitNotForwarded > 0` is
+    /// the shadow-fence policy working, not a dead slot.
+    fence_wait_forwarded: RefusalCounter,
+    /// `pfnExecuteCommandLists` forwarded a submit to the engine's
+    /// `ID3D12CommandQueue::ExecuteCommandLists`.
+    ///
+    /// ⚠ **Expected non-zero on any workload that submits.** It is the
+    /// denominator for `EclNoWddmSubmission` — which today tracks it exactly,
+    /// one for one, because every forward is missing the WDDM half — and it is
+    /// what makes that ratio a fact rather than an assumption once the WDDM half
+    /// lands and the two counts diverge.
+    ///
+    /// ⭐ Same reason for existing as [`Self::fence_signal_forwarded`]: a submit
+    /// that reached the engine left no trace of its own, so "the engine was
+    /// given the work" was inferred from the pixels rather than counted.
+    ecl_forwarded: RefusalCounter,
+    /// `Umd12FenceSignalDelayUs` was non-zero and `pfnSignalFence` slept before
+    /// returning. **Expected 0** on any run that did not deliberately set the
+    /// knob; see `knobs12::UMD12_FENCE_SIGNAL_DELAY_US` for the question it is
+    /// attached to and the commit that must delete it.
+    fence_signal_delayed: RefusalCounter,
+    /// `Umd12EclDelayUs` was non-zero and `pfnExecuteCommandLists` slept before
+    /// returning. **Expected 0** on any run that did not deliberately set the
+    /// knob; see `knobs12::UMD12_ECL_DELAY_US`.
+    ecl_delayed: RefusalCounter,
 }
 
 pub(crate) static L2_REFUSALS: L2Refusals = L2Refusals {
@@ -2567,6 +2741,11 @@ pub(crate) static L2_REFUSALS: L2Refusals = L2Refusals {
     fence_op_fence_missing: RefusalCounter::new("FenceOpFenceMissing"),
     fence_op_engine_failed: RefusalCounter::new("FenceOpEngineFailed"),
     fence_wait_not_forwarded: RefusalCounter::new("FenceWaitNotForwarded"),
+    fence_signal_forwarded: RefusalCounter::new("FenceSignalForwarded"),
+    fence_wait_forwarded: RefusalCounter::new("FenceWaitForwarded"),
+    ecl_forwarded: RefusalCounter::new("EclForwarded"),
+    fence_signal_delayed: RefusalCounter::new("FenceSignalDelayed"),
+    ecl_delayed: RefusalCounter::new("EclDelayed"),
 };
 
 /// L2's refusal counters, printed by `crate::log_refusal_summary` at this
@@ -2630,6 +2809,15 @@ pub(crate) static REFUSALS: &[&RefusalCounter] = &[
     // to stop, and the rule was violated in the same commit that quotes it.
     // ⇒ new counters go HERE, at the end, however badly they group.
     &L2_REFUSALS.bundle_list_refused,
+    // ⛔ APPENDED, the F1 fence-bridge instrument round. Three SUCCESS counters
+    // and two knob-firing counters, at the end for the same reason
+    // `L2BundleListRefused` is: the `D3D12 DDI refusals:` line is diffed across
+    // builds and inserting shifts every counter after the insertion point.
+    &L2_REFUSALS.fence_signal_forwarded,
+    &L2_REFUSALS.fence_wait_forwarded,
+    &L2_REFUSALS.ecl_forwarded,
+    &L2_REFUSALS.fence_signal_delayed,
+    &L2_REFUSALS.ecl_delayed,
 ];
 
 // ⚠ `Hresult` is imported for the `E_*`/`S_OK` constants this file returns; the

@@ -84,6 +84,7 @@
 
 use helios_umd_common::hr::{Hresult, E_FAIL, E_INVALIDARG};
 use helios_umd_common::refusals::RefusalCounter;
+use helios_umd_common::slot::DdiHandle;
 use helios_umd_common::throttle::LogThrottle;
 // ⚠ Imported for `Interface::cast` — the `QueryInterface` that reaches
 // `ID3D12GraphicsCommandList9`. A trait method, so invisible to method
@@ -303,7 +304,19 @@ unsafe extern "C" fn close_command_list(h_list: ddi12::D3D12DDI_HCOMMANDLIST) {
     };
     // SAFETY: `engine()` borrows the list this box owns; `Close` takes no
     // arguments and returns an HRESULT.
-    let Err(err) = (unsafe { state.engine().Close() }) else {
+    let result = unsafe { state.engine().Close() };
+    // ⚠ Traced on BOTH outcomes, and it is the SUCCESS one that was missing: a
+    // closed list that never reaches `pfnExecuteCommandLists`, and one that
+    // reaches it having recorded nothing, are the two readings
+    // `tmp/dx12/gates/G8-r0/RESULT.md` could not separate. `pDrvPrivate` is the
+    // join key with the `ExecuteCommandLists` line, which prints the same word
+    // per entry.
+    trace_line!(
+        "CloseCommandList: list={:p} hr={:#010x}",
+        h_list.drv_private(),
+        result.as_ref().err().map_or(0u32, |e| e.code().0 as u32),
+    );
+    let Err(err) = result else {
         return;
     };
     let hr = err.code().0;
