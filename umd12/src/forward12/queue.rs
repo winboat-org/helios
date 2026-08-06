@@ -3986,41 +3986,67 @@ unsafe fn fence_operation(
                 // engine timeline at all, because that is the only thing the DDI
                 // makes observable.
                 if fence_state.driver_signals_issued() {
-                    // ⛔ LOUD. This driver has signalled this fence, so the value is
-                    // ordering it is being asked for and is refusing. There is no
-                    // reading under which dropping it is correct.
+                    // ⛔⛔ COUNTED AND LOGGED, **not** device-removing — and the
+                    // severity was WRONG until 2026-08-07, on the one pattern the
+                    // stated target depends on.
+                    //
+                    // The retired text here read *"There is no reading under which
+                    // dropping it is correct"*, and reported `E_FAIL` through
+                    // `pfnSetErrorCb`, which removes the whole `ID3D12Device`
+                    // (`DDI_REFERENCE.md:2157`, `D3D12Core.dll`: *"Removing device due
+                    // to bad UMD error."*). ⛔ **This module's OWN doc names the
+                    // reading it says does not exist**, ~3900 lines up: a legal
+                    // wait-before-signal — `queueB->Wait(f, N)` enqueued *before*
+                    // `queueA->Signal(f, N)`, which D3D12 permits — is above the
+                    // watermark at the instant it arrives, on a fence this driver
+                    // *has* signalled before. `signals_issued > 0 && Value >
+                    // watermark` is therefore reached **deterministically, with no
+                    // race**, by an ordinary async-compute frame. Time Spy's
+                    // async-compute subtest is exactly that shape.
+                    //
+                    // ⛔ The two cases this predicate covers are INDISTINGUISHABLE
+                    // here, and only one of them is a fault:
+                    //   (a) a wait for a value this driver will never signal — a real
+                    //       unsatisfiable ordering request;
+                    //   (b) a wait for a value this driver will signal microseconds
+                    //       later — legal, common, and NOT an error of any kind.
+                    // Removing the device answers (b) with *"bad UMD error"* and makes
+                    // every affected application fail to run at all.
+                    //
+                    // ⚠ This is NOT a knob default chosen for survivability
+                    // (`METHOD.md` §2 Phase 4 forbids that, and it is why
+                    // `report_ecl_submit_error`'s softening knob was backed out). The
+                    // distinction is that Phase 4 forbids softening a severity the
+                    // CONTRACT requires. No DDI contract requires this one: the driver
+                    // invented it, and it misclassifies a legal application call as a
+                    // driver fault. `pfnSetErrorCb`'s severity is reserved for *"this
+                    // UMD is broken"*, which is not what happened.
+                    //
+                    // ⭐ What the loud severity was actually defending against — a
+                    // SILENT drop yielding wrong pixels *with a score* — is fully
+                    // discharged by the counter plus the log line below. Device
+                    // removal adds nothing to attribution and subtracts the entire
+                    // run, including the run that would let anyone read the counter.
+                    //
+                    // ⛔ Forwarding the wait instead is the real fix and is NOT
+                    // available here: an engine wait for a value the engine timeline
+                    // cannot reach never completes, and `PENDING.md`'s wave-1
+                    // correction 1 proves forwarding above the watermark destroys the
+                    // acyclicity that keeps `vkd3d_acquire_vk_queue`'s drain from
+                    // hanging — so it must land TOGETHER with a bounded/WAIT-skipping
+                    // acquire. Until then this stays a NAMED, COUNTED ordering gap:
+                    // `PENDING.md` §S-2, whose grading carries it.
                     note_refusal(&L2_REFUSALS.fence_wait_not_forwarded);
                     if let Some(n) = budget(&FENCE_OP_LOG) {
                         log_error!(
                             "WaitForFence: value={} is above this driver's signalled watermark on a \
-                             fence it HAS signalled -- the wait is real cross-queue ordering and \
-                             cannot be forwarded (an engine wait for an unreachable value never \
-                             completes), so it is reported to the runtime (x{})",
+                             fence it HAS signalled -- real cross-queue ordering that cannot be \
+                             forwarded (an engine wait for an unreachable value never completes). \
+                             DROPPED and counted; this is S-2's ordering gap, and a legal \
+                             wait-before-signal lands here too (x{})",
                             op.Value,
                             n + 1,
                         );
-                    }
-                    // ⛔ `E_FAIL`, and the code is argued rather than picked. It is
-                    // not `E_INVALIDARG`: the wait is LEGAL D3D12 and blaming the
-                    // application would be the wrong half of §9.12's app-vs-driver
-                    // distinction. It is not the engine's HRESULT either — no engine
-                    // call was made. What happened is that this driver cannot
-                    // represent the requested ordering, which is a driver error with
-                    // no more specific code in the DDI's set.
-                    //
-                    // ⚠ It removes the `ID3D12Device`, and that severity is the point:
-                    // silently dropping the wait yields wrong pixels *with a score*,
-                    // which is the failure shape `PENDING.md` S-4 and this project's
-                    // history both name as the worst outcome. No knob softens it —
-                    // `report_ecl_submit_error` records why one was tried and backed
-                    // out (`METHOD.md` §2 Phase 4).
-                    //
-                    // SAFETY: `h_device` is the device this queue was created against;
-                    // the borrow lives only until the end of this statement.
-                    let reported = unsafe { device12::device(queue.h_device) }
-                        .is_some_and(|dev| device12::set_error(dev, E_FAIL));
-                    if !reported {
-                        note_refusal(&L2_REFUSALS.queue_set_error_unavailable);
                     }
                 } else {
                     // ⚠ QUIET, and correct for the reachable-and-legal case: this

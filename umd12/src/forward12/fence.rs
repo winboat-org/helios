@@ -107,8 +107,8 @@
 //!
 //! | condition | counter | treatment | why |
 //! |---|---|---|---|
-//! | [`FenceState::signals_issued`] is **0** | `FenceWaitRuntimeOwned` | dropped, counted, **not** reported | the value's provenance is entirely outside this DDI: a `CreateFence(InitialValue = N)` the DDI never delivers, or a CPU `ID3D12Fence::Signal` §10.3 says never reaches the driver. Both are waits the runtime **already considers satisfied**, so dropping is exactly right, and `CreateFence(1)` + `queue->Wait(f, 1)` is a common idiom. Reporting it would answer a legal call with *"Removing device due to bad UMD error"* — `descriptors.rs`'s scar |
-//! | it is **> 0** and `Value` is above the watermark | `FenceWaitNotForwarded` | dropped, counted, **reported through `pfnSetErrorCb`** | this driver *is* on that fence's timeline and is being asked for ordering beyond what it has issued. There is no reading under which dropping it is correct, and silently dropping it is the *"an empty scene with a score"* failure shape this project has burned sessions on |
+//! | [`FenceState::driver_signals_issued`] is **false** | `FenceWaitRuntimeOwned` | dropped, counted, **not** reported | the value's provenance is entirely outside this DDI: a `CreateFence(InitialValue = N)` the DDI never delivers, or a CPU `ID3D12Fence::Signal` §10.3 says never reaches the driver. Both are waits the runtime **already considers satisfied**, so dropping is exactly right, and `CreateFence(1)` + `queue->Wait(f, 1)` is a common idiom. Reporting it would answer a legal call with *"Removing device due to bad UMD error"* — `descriptors.rs`'s scar |
+//! | it is **> 0** and `Value` is above the watermark | `FenceWaitNotForwarded` | dropped, counted, logged — ⛔ **NOT** reported through `pfnSetErrorCb` | this driver *is* on that fence's timeline and is being asked for ordering beyond what it has issued, so the drop is a real gap (`PENDING.md` §S-2). ⛔ **But it is NOT a driver fault, and until 2026-08-07 this row said it was**: the legal wait-before-signal named four paragraphs above lands here **deterministically**, so removing the `ID3D12Device` would answer an ordinary async-compute frame with *"Removing device due to bad UMD error"*. The *"empty scene with a score"* shape is what the **counter and the log** exist to prevent; device removal adds no attribution and costs the whole run. Argument at the site, `queue::fence_operation` |
 //!
 //! ⛔ **And the first arm is NOT clean, which is stated here rather than hidden in a
 //! counter's grading.** A CPU `Signal` that has *not happened yet* — `queueB->Wait(f,
@@ -258,24 +258,37 @@ pub struct FenceState {
     /// The engine fence. **Owned** — dropping this state releases it.
     engine: ID3D12Fence,
     /// The highest `D3D12DDIARG_FENCE_OPERATION::Value` this driver has issued an
-    /// `ID3D12CommandQueue::Signal` for on [`Self::engine`].
+    /// `ID3D12CommandQueue::Signal` for on [`Self::engine`], **biased by one** so
+    /// that `0` means *"never signalled"*.
     ///
-    /// ⛔ This is the whole answer to the shadow-divergence problem in the module
-    /// doc: it is a lower bound on what the engine timeline will reach, and it is
+    /// ⛔ This is a lower bound on what the engine timeline will reach, and it is
     /// the *only* such bound the DDI gives this driver — the initial value and
     /// every CPU signal are invisible here.
-    signalled_watermark: AtomicU64,
-    /// How many queue-level signals this driver has **issued** on
-    /// [`Self::engine`].
     ///
-    /// ⛔ **Not derivable from [`Self::signalled_watermark`], and that is why it
-    /// exists rather than being a `> 0` test on the watermark.** A legal
-    /// `pfnSignalFence` with `Value = 0` raises no watermark, so a zero watermark
-    /// cannot distinguish *"this driver has never touched this fence's timeline"*
-    /// from *"this driver signalled 0 on it"* — and the module doc's two dropped-wait
-    /// arms turn on exactly that distinction. One `AtomicU64` removes the ambiguity
-    /// instead of arguing that `Signal(0)` never happens.
-    signals_issued: AtomicU64,
+    /// ⛔⛔ **ONE word, deliberately, and it was TWO until 2026-08-07.** The
+    /// predecessor kept `signalled_watermark` and a separate `signals_issued`
+    /// count, because a legal `pfnSignalFence` with `Value = 0` raises no
+    /// watermark and a bare `> 0` test could not tell *"never touched"* from
+    /// *"signalled 0"* — the distinction both dropped-wait arms turn on. That
+    /// reasoning is right; **two atomics were the wrong way to get it.**
+    /// `note_signal` had to publish them in some order, and whichever order it
+    /// chose left a window in which the pair is torn: a concurrent
+    /// `queue::fence_operation` wait arm reads one fact from before the signal and
+    /// the other from after, and takes an arm neither state justifies. No
+    /// reader-side fix closes a writer-side tear — reading the count first only
+    /// moves the window, since the writer can be preempted between its two stores.
+    ///
+    /// ⭐ The bias makes both predicates derive from **one load**, so they can
+    /// never disagree: `0` = never signalled; `N + 1` = watermark `N`. `Signal(0)`
+    /// stores `1`, which is distinguishable from never-signalled, so the ambiguity
+    /// the two-field design existed to remove is still removed.
+    ///
+    /// ⚠ Honest edge: `saturating_add` makes `Signal(u64::MAX - 1)` and
+    /// `Signal(u64::MAX)` both store `u64::MAX`, so a wait for exactly `u64::MAX`
+    /// reads reachable after only `MAX - 1` was signalled. A D3D12 fence timeline
+    /// would have to be advanced 2^64 times to reach it; recorded rather than
+    /// hidden.
+    signalled_biased: AtomicU64,
 }
 
 impl FenceState {
@@ -299,16 +312,12 @@ impl FenceState {
     /// `fetch_max` because D3D12 fence values are not required to arrive in
     /// order and a lower one must not lower the bound.
     ///
-    /// ⚠ **The count is bumped BEFORE the watermark**, and the order matters for
-    /// exactly one reader: `queue::fence_operation`'s wait arm reads the count to
-    /// choose between a benign drop and a device-removing report. Publishing
-    /// *"this driver is on this fence's timeline"* before publishing *how far* is
-    /// the conservative order — a concurrent wait can then see the count and a
-    /// stale watermark, which routes it to the **loud** arm; the reverse order
-    /// could route a genuine ordering gap to the silent one.
+    /// ⭐ **One store, so there is no publication order to get wrong.** Both facts
+    /// the wait arm needs live in [`Self::signalled_biased`], whose doc carries
+    /// why two atomics could not be made correct from the reader's side.
     pub(crate) fn note_signal(&self, value: u64) {
-        self.signals_issued.fetch_add(1, Ordering::AcqRel);
-        self.signalled_watermark.fetch_max(value, Ordering::AcqRel);
+        self.signalled_biased
+            .fetch_max(value.saturating_add(1), Ordering::AcqRel);
     }
 
     /// Whether this driver has issued **any** signal on this fence's engine
@@ -319,7 +328,7 @@ impl FenceState {
     /// which reaches this DDI (`DDI_REFERENCE.md` §10.3) — which is the module
     /// doc's first dropped-wait arm.
     pub(crate) fn driver_signals_issued(&self) -> bool {
-        self.signals_issued.load(Ordering::Acquire) != 0
+        self.signalled_biased.load(Ordering::Acquire) != 0
     }
 
     /// Whether this driver's own engine timeline can reach `value`.
@@ -328,8 +337,12 @@ impl FenceState {
     /// driver — a `CreateFence` initial value, a CPU `ID3D12Fence::Signal`, or a
     /// signal not yet issued — and forwarding a wait for it would be
     /// unsatisfiable. See the module doc for what the caller must do instead.
+    ///
+    /// ⚠ Compares in the **biased** domain so it never has to subtract from a
+    /// value that may be `0`: `value + 1 <= biased` is `value <= watermark` for
+    /// every signalled state, and is false for all `value` when `biased == 0`.
     pub(crate) fn signal_reachable(&self, value: u64) -> bool {
-        value <= self.signalled_watermark.load(Ordering::Acquire)
+        value.saturating_add(1) <= self.signalled_biased.load(Ordering::Acquire)
     }
 }
 
@@ -590,15 +603,16 @@ unsafe extern "C" fn create_fence(
     unsafe {
         slot.store(FenceState {
             engine: fence,
-            // ⛔ 0, matching the engine fence's own initial value above. The
-            // watermark is a claim about what THIS driver has signalled, so it
-            // must start where the engine timeline starts and not where the
-            // runtime's monitored fence does — which the DDI never says.
-            signalled_watermark: AtomicU64::new(0),
-            // 0 signals issued: nothing on this fence's engine timeline is this
-            // driver's yet, which is what routes a wait arriving now to the
-            // module doc's benign `FenceWaitRuntimeOwned` arm.
-            signals_issued: AtomicU64::new(0),
+            // ⛔ 0 is the BIASED "never signalled" value, not a watermark of 0 —
+            // the field's doc carries the bias. Nothing on this fence's engine
+            // timeline is this driver's yet, which is what routes a wait arriving
+            // now to the module doc's benign `FenceWaitRuntimeOwned` arm.
+            //
+            // ⚠ It must start where the ENGINE timeline starts and not where the
+            // runtime's monitored fence does — which the DDI never says. A
+            // `CreateFence(InitialValue = N)` is invisible here, so biased-0 is
+            // the only honest initial claim.
+            signalled_biased: AtomicU64::new(0),
         });
     }
     S_OK
