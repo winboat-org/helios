@@ -11,20 +11,27 @@
 //! vkd3d-shaped forwarder brings. Whatever this lane cannot honour gets a named
 //! refusal counter, not silence.
 //!
-//! ⚠ **S6 Round 2: all 23 slots are now filled** — 17 forward into the engine,
-//! 4 refuse with a named counter and 2 are the list-lifetime pair the spine
+//! ⚠ **All 23 slots are filled** — as of S-4, **18** forward into the engine,
+//! 3 refuse with a named counter and 2 are the list-lifetime pair the spine
 //! landed. `PARALLEL.md` §9.2 does not call this lane done until the *noop* hit
 //! counters for these slots read zero under a real workload, which only a run
 //! can show; what the source can show is that none of the 23 is a noop any more.
 //!
-//! # ⭐ The four that do NOT forward, and why each one is honest
+//! # ⭐ The three that do NOT forward, and why each one is honest
 //!
 //! | slot | counter | why |
 //! |---|---|---|
 //! | `pfnOMSetDepthBounds` | `L3aDepthBoundsDefaultDropped` / `L3aDepthBoundsRefused` | `caps12.rs` reports `DepthBoundsTestSupported = 0`. ⛔ **Two counters, because the runtime calls this slot after EVERY reset** — see [`om_set_depth_bounds`] |
 //! | `pfnSetSamplePositions` | `L3aSamplePositionsRefused` | `ProgrammableSamplePositionsTier = NONE` **and** the engine's own body is a `FIXME(...) stub!` |
 //! | `pfnOmSetAlphaBlendFactor` | `L3aAlphaBlendFactorRetired` | RETIRED by Microsoft; `pfnOmSetBlendFactor`'s component `[3]` replaced it |
-//! | `pfnExecuteIndirect` | `L3aExecuteIndirectRefused` | its command signature comes from `pfnCreateCommandSignature`, which `queue.rs` refuses |
+//!
+//! ⭐ **`pfnExecuteIndirect` LEFT that table with S-4** and now forwards; the
+//! refusal moved one DDI earlier, to `queue::create_command_signature`, which is
+//! the only place it can be honest — vkd3d accepts a state-template signature on a
+//! guest without `VK_EXT_device_generated_commands` and then **silently skips**
+//! every `ExecuteIndirect` through it (`command.c:26447-26453`, `:17811-17818`).
+//! Refusing here instead would be the "succeed at create, fail at submit" shape
+//! the bundle lesson already cost this lane once.
 //!
 //! # ⭐ The two exceptions, and why they landed with the Round 2 spine
 //!
@@ -103,7 +110,7 @@ use windows::Win32::Graphics::Direct3D::{
     D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP_ADJ, D3D_PRIMITIVE_TOPOLOGY_UNDEFINED,
 };
 use windows::Win32::Graphics::Direct3D12::{
-    ID3D12CommandAllocator, ID3D12GraphicsCommandList9, D3D12_COMMAND_LIST_TYPE,
+    ID3D12CommandAllocator, ID3D12GraphicsCommandList9, ID3D12Resource, D3D12_COMMAND_LIST_TYPE,
     D3D12_COMMAND_LIST_TYPE_BUNDLE, D3D12_CPU_DESCRIPTOR_HANDLE,
     D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT, D3D12_INDEX_BUFFER_STRIP_CUT_VALUE,
     D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFF, D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFFFFFF,
@@ -210,12 +217,12 @@ unsafe fn report_error(state: &CommandListState, hr: Hresult) {
 /// The state behind a recording slot's one and only argument, counting the
 /// handle that did not resolve.
 ///
-/// ⭐ Seventeen of this file's 21 recording slots open with exactly these four
-/// lines — the other four (`pfnOMSetDepthBounds`, `pfnSetSamplePositions`,
-/// `pfnOmSetAlphaBlendFactor`, `pfnExecuteIndirect`) refuse outright and never
-/// touch the handle. Writing them seventeen times is how the seventeenth ends up
-/// without the counter — `queue.rs`'s `lock_target` is the same move for the
-/// same reason.
+/// ⭐ Eighteen of this file's 21 recording slots open with exactly these four
+/// lines — the other three (`pfnOMSetDepthBounds`, `pfnSetSamplePositions`,
+/// `pfnOmSetAlphaBlendFactor`) refuse outright and never touch the handle.
+/// Writing them eighteen times is how the eighteenth ends up without the counter
+/// — `queue.rs`'s `lock_target` is the same move for the same reason.
+/// ⚠ `pfnExecuteIndirect` joined the eighteen with S-4.
 ///
 /// # Safety
 /// As [`queue::command_list_state`]: `h_list` must be a handle
@@ -1738,45 +1745,207 @@ unsafe extern "C" fn execute_bundle(
     unsafe { state.engine().ExecuteBundle(bundle.engine()) };
 }
 
-/// `pfnExecuteIndirect` — **REFUSED**, `L3aExecuteIndirectRefused`.
+/// The `{ID3D12Resource, offset}` pair one `D3D12DDIARG_BUFFER_PLACEMENT` names.
 ///
-/// # ⛔ It is refused because its command signature does not exist
+/// ⛔ **The union has exactly one member and it is the UMD's arm.**
+/// `D3D12DDIARG_BUFFER_PLACEMENT` is `{ BaseAddress: union { UMD:
+/// D3D12DDIARG_HRESOURCE_PLACEMENT } }` and that inner struct is
+/// `{ hResource, Offset }` (`umd12/bindgen/cached/d3d12umddi.rs:48461-48464`,
+/// `:48485-48494`) — so there is no discriminant to check and no other arm to
+/// mistake it for. The API's `ExecuteIndirect` takes exactly this pair as two
+/// separate parameters, which is why the translation is a projection and not a
+/// conversion.
 ///
-/// `ID3D12GraphicsCommandList::ExecuteIndirect` takes an
-/// `ID3D12CommandSignature`, and this driver has none:
-/// `queue::create_command_signature` returns `E_NOTIMPL` and counts
-/// `CommandSignatureRefused`, so every `D3D12DDI_HCOMMANDSIGNATURE` that reaches
-/// this slot carries a null slot word. ⛔ **The two are one capability and they
-/// land together or not at all** — a lane that implemented this half alone would
-/// have nothing to pass as the first argument.
-///
-/// ⚠ `queue.rs` routed the create's missing half here by name: the
-/// `D3D12DDI_INDIRECT_ARGUMENT_DESC` -> `D3D12_INDIRECT_ARGUMENT_DESC`
-/// translation *"deserves the lane that also implements `pfnExecuteIndirect`
-/// (L3a) and can test it"*. This lane's answer is that it cannot test it, for a
-/// structural reason rather than a scheduling one: `pfnCreateCommandSignature`
-/// lives in `queue.rs`, which `PARALLEL.md` §4 gives to L2, and the accessor
-/// budget for this round is one function in `pso.rs`. Implementing the create
-/// from here would be the second declaration of a handle's payload that
-/// `DECISIONS.md` D13 exists to prevent. **The pair is one commit, in `queue.rs`
-/// plus this file, and it is the integrator's to schedule.**
-///
-/// ⚠ Nothing on the critical path is lost: `DDI_REFERENCE.md` §14.2's 99-slot
-/// minimum-viable list contains neither this slot nor the command-signature
-/// triple.
+/// ⛔ **Three outcomes, not two, and an `Option` would have collapsed the two that
+/// matter.** *"The runtime named no buffer"* is legal for the count buffer and
+/// illegal for the argument buffer; *"the runtime named one and this driver could not
+/// resolve it"* is a lifetime bug in **both** positions. `pso::root_signature`'s doc
+/// carries the same warning for root signatures, and `descriptors.rs`'s scar is what
+/// happens when the two are conflated: a legal call answered with an error report.
+enum PlacementRef<'a> {
+    /// `hResource` was null — the runtime named no buffer.
+    Absent,
+    /// A live engine resource and the placement's byte offset into it.
+    Bound(&'a ID3D12Resource, u64),
+    /// `hResource` was non-null and carried no engine resource.
+    Unresolved,
+}
+
+/// Project one `D3D12DDIARG_BUFFER_PLACEMENT` onto the
+/// `(ID3D12Resource, UINT64 offset)` pair the API's `ExecuteIndirect` takes.
 ///
 /// # Safety
-/// Trivially safe: no argument is dereferenced. The two
-/// `D3D12DDIARG_BUFFER_PLACEMENT`s arrive **by value** and hold nothing that is
-/// freed, so ignoring them leaks nothing.
+/// `placement` must be an initialised `D3D12DDIARG_BUFFER_PLACEMENT` the runtime
+/// passed by value, and its `hResource`, when non-null, must be a live handle from
+/// `resource12`'s create. The returned reference must not outlive the DDI call.
+unsafe fn buffer_placement<'a>(
+    placement: &ddi12::D3D12DDIARG_BUFFER_PLACEMENT,
+) -> PlacementRef<'a> {
+    // SAFETY: the union has a single member, so reading `UMD` is reading the only
+    // thing the runtime can have written; the value is initialised per the caller's
+    // precondition.
+    let umd = unsafe { placement.BaseAddress.UMD };
+    if umd.hResource.pDrvPrivate.is_null() {
+        return PlacementRef::Absent;
+    }
+    // SAFETY: a non-null `pDrvPrivate` on a resource handle the runtime passed to a
+    // recording DDI is a handle `resource12`'s create sized and wrote; the borrow
+    // does not outlive this call.
+    match unsafe { super::resource12::engine_resource(umd.hResource) } {
+        Some(resource) => PlacementRef::Bound(resource, umd.Offset),
+        None => PlacementRef::Unresolved,
+    }
+}
+
+/// `pfnExecuteIndirect` — **IMPLEMENTED**, `L3aExecuteIndirectForwarded`.
+///
+/// # ⭐ It forwards, and both halves of the old blocker are discharged
+///
+/// The old body was a **silent counted noop** justified by
+/// `queue::create_command_signature` returning `E_NOTIMPL`. That create now builds a
+/// real `ID3D12CommandSignature` for the four native action classes and refuses the
+/// state-template classes **at create** (`queue.rs`'s S-4 block has why refusing at
+/// create rather than here is the only honest split — vkd3d would otherwise accept
+/// the signature and silently skip every call through it). ⇒ every signature that
+/// reaches this slot is one this driver built and can execute.
+///
+/// The two objects this needed are both reached through their owning lane's single
+/// accessor, so no handle payload is declared twice (`DECISIONS.md` D13):
+/// `queue::engine_command_signature` for `D3D12DDI_HCOMMANDSIGNATURE` and
+/// `resource12::engine_resource` for the two `D3D12DDIARG_BUFFER_PLACEMENT`s.
+///
+/// # ⛔ The §14.2 argument this slot used to make is INVALID and is not repeated
+///
+/// Its previous doc closed with *"`DDI_REFERENCE.md` §14.2's 99-slot minimum-viable
+/// list contains neither this slot nor the command-signature triple"*. §14.0 of the
+/// same document forbids that inference outright: *"treat a slot in 99-but-not-70 as
+/// 'not exercised yet', never as 'not needed'."* The list was being read as licence
+/// for the reading it rules out, in two files at once.
+///
+/// # ⚠ What is forwarded verbatim, and why nothing is validated here
+///
+/// `MaxCommandCount`, both offsets and the count buffer go through unchanged. vkd3d
+/// owns every check that matters and duplicating one would create a second authority
+/// able to drift: it early-returns on `max_command_count == 0`
+/// (`command.c:17777-17778`) and refuses a count buffer when the guest lacks
+/// `drawIndirectCount` (`:17781-17785`) — which this guest **has**, alongside
+/// `multiDrawIndirect` (`docs/dx12/research/guest-vulkaninfo-full.txt:1237`,
+/// `:1632`).
+///
+/// ⛔ A **null argument buffer** is the one thing refused here, and it is refused
+/// because the engine dereferences it unconditionally:
+/// `impl_from_ID3D12Resource(arg_buffer)` at `command.c:17763` is a
+/// `CONTAINING_RECORD`-style cast, and `arg_impl->res.cookie.index` is read before
+/// any null test. A null count buffer is fine — the engine tests it everywhere.
+///
+/// # Safety
+/// `h_list` must be a live handle from `queue::create_command_list`; `h_signature` a
+/// live handle from `queue::create_command_signature`; the two
+/// `D3D12DDIARG_BUFFER_PLACEMENT`s arrive **by value** and their `hResource`s, when
+/// non-null, must be live resource handles.
 unsafe extern "C" fn execute_indirect(
-    _h_list: ddi12::D3D12DDI_HCOMMANDLIST,
-    _h_signature: ddi12::D3D12DDI_HCOMMANDSIGNATURE,
-    _max_command_count: ddi12::UINT,
-    _argument_buffer: ddi12::D3D12DDIARG_BUFFER_PLACEMENT,
-    _count_buffer: ddi12::D3D12DDIARG_BUFFER_PLACEMENT,
+    h_list: ddi12::D3D12DDI_HCOMMANDLIST,
+    h_signature: ddi12::D3D12DDI_HCOMMANDSIGNATURE,
+    max_command_count: ddi12::UINT,
+    argument_buffer: ddi12::D3D12DDIARG_BUFFER_PLACEMENT,
+    count_buffer: ddi12::D3D12DDIARG_BUFFER_PLACEMENT,
 ) {
-    note_refusal(&L3A_REFUSALS.execute_indirect_refused);
+    // SAFETY: forwarded unchanged; the caller carries `recording_list`'s
+    // precondition.
+    let Some(state) = (unsafe { recording_list(h_list) }) else {
+        return;
+    };
+    // SAFETY: the caller guarantees a live signature handle, so its slot lies in the
+    // private block `pfnCalcPrivateCommandSignatureSize` sized.
+    let Some(signature) = (unsafe { queue::engine_command_signature(h_signature) }) else {
+        // ⛔ Reported, not merely counted, and that is a change of channel the S-4
+        // commit is entitled to make: with the create implemented, a signature that
+        // does not resolve is no longer "the application already got `E_NOTIMPL` from
+        // `CreateCommandSignature`" — the old doc's reason for staying silent — it is
+        // this driver losing an object it built. Recording something the driver then
+        // drops is exactly what `pfnSetCommandListErrorCb` quarantines.
+        note_refusal(&L3A_REFUSALS.execute_indirect_signature_missing);
+        if let Some(n) = record_budget() {
+            log_error!(
+                "ExecuteIndirect: hCommandSignature={:p} carries no engine signature -- the \
+                 indirect draw is DROPPED (x{})",
+                h_signature.drv_private(),
+                n + 1,
+            );
+        }
+        // SAFETY: `state` is live for this call — `recording_list` just returned it.
+        unsafe { report_error(state, E_FAIL) };
+        return;
+    };
+    // ⛔ The argument buffer is MANDATORY, and refusing a missing one is not
+    // defensive: `d3d12_command_list_ExecuteIndirect` casts `arg_buffer` with no null
+    // test and reads `arg_impl->res.cookie.index` before any check
+    // (`command.c:17763`, `:17797`), so forwarding a null is an access violation
+    // inside the engine rather than a dropped draw.
+    //
+    // SAFETY: the placement arrived by value from the runtime and is initialised;
+    // its `hResource`, when non-null, is a live resource handle.
+    let (arg_resource, arg_offset) = match unsafe { buffer_placement(&argument_buffer) } {
+        PlacementRef::Bound(r, o) => (r, o),
+        PlacementRef::Absent | PlacementRef::Unresolved => {
+            note_refusal(&L3A_REFUSALS.execute_indirect_arg_buffer_missing);
+            if let Some(n) = record_budget() {
+                log_error!(
+                    "ExecuteIndirect: argument buffer resolves to nothing -- refused, because the \
+                     engine dereferences it unconditionally (x{})",
+                    n + 1,
+                );
+            }
+            // SAFETY: `state` is live for this call.
+            unsafe { report_error(state, E_INVALIDARG) };
+            return;
+        }
+    };
+    // ⚠ An ABSENT count buffer is LEGAL and is the common case — it selects
+    // `vkCmdDrawIndirect` over `vkCmdDrawIndirectCount` — so it is the ordinary path
+    // and touches no counter. Only `Unresolved` is a finding.
+    //
+    // SAFETY: as above.
+    let (count_resource, count_offset) = match unsafe { buffer_placement(&count_buffer) } {
+        PlacementRef::Absent => (None, 0),
+        PlacementRef::Bound(r, o) => (Some(r), o),
+        PlacementRef::Unresolved => {
+            note_refusal(&L3A_REFUSALS.execute_indirect_count_buffer_missing);
+            if let Some(n) = record_budget() {
+                log_error!(
+                    "ExecuteIndirect: count buffer handle is non-null but carries no engine \
+                     resource -- refused rather than executed with MaxCommandCount (x{})",
+                    n + 1,
+                );
+            }
+            // ⛔ Refused, not degraded. Dropping the count buffer would run all
+            // `MaxCommandCount` commands instead of the `N <= MaxCommandCount` the
+            // application asked for — extra draws with garbage arguments, i.e. wrong
+            // pixels, which is strictly worse than a reported failure.
+            // SAFETY: as above.
+            unsafe { report_error(state, E_INVALIDARG) };
+            return;
+        }
+    };
+
+    // SAFETY: the list, the signature and both resources are live for this call and
+    // the engine takes borrowed references it does not keep; every scalar is passed
+    // by value.
+    unsafe {
+        state.engine().ExecuteIndirect(
+            &*signature,
+            max_command_count,
+            arg_resource,
+            arg_offset,
+            count_resource,
+            count_offset,
+        );
+    }
+    note_refusal(&L3A_REFUSALS.execute_indirect_forwarded);
+    trace_line!(
+        "ExecuteIndirect: max={max_command_count} arg={arg_offset} countBuf={} count={count_offset}",
+        count_resource.is_some(),
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -2106,25 +2275,22 @@ pub(crate) struct L3aRefusals {
     /// list's class, which is worth a number because the engine answers it with
     /// a `WARN` and a dropped draw batch.
     execute_bundle_not_bundle: RefusalCounter,
-    /// `pfnExecuteIndirect` — refused, because `pfnCreateCommandSignature`
-    /// refuses.
+    /// ⛔ **RETIRED BY S-4, and kept only so the `D3D12 DDI refusals:` line does
+    /// not shift.** It counted the blanket `pfnExecuteIndirect` noop, which is
+    /// gone: the slot forwards now, and its outcomes are
+    /// `L3aExecuteIndirectForwarded` plus three per-cause refusals appended at the
+    /// end of [`REFUSALS`].
     ///
-    /// ⛔ **Expected 0 while the pair is unimplemented, and it is the trigger for
-    /// implementing them.** The two are one capability: this slot's first
-    /// argument is the object that create would have built, so neither half is
-    /// useful alone. A non-zero reading means a workload actually issues
-    /// indirect draws, which is the evidence that would justify the
-    /// `D3D12DDI_INDIRECT_ARGUMENT_DESC` translation `queue.rs` deferred.
+    /// ⛔ **Expected 0 forever.** Nothing increments it. Not deleted because
+    /// removing an entry from [`REFUSALS`] shifts every counter after it, and that
+    /// array is the evidence contract diffed across builds.
     ///
-    /// ⚠ **Counted, not reported, and the §10 review re-checked that** now that a
-    /// report costs a list rather than a device. It stays counted for a reason
-    /// that has nothing to do with the cost: `queue::create_command_signature`
-    /// returns `E_NOTIMPL`, and `pfnCreateCommandSignature` **returns an
-    /// HRESULT**, so the application's `ID3D12Device::CreateCommandSignature`
-    /// already failed and it holds no signature to pass here. A driver-side
-    /// report would be a second answer to a question the API boundary answered
-    /// first — the same shape as `PipelineStateUnresolved`. ⛔ If this ever moves,
-    /// that reasoning is what has been falsified, and reporting becomes correct.
+    /// ⚠ Its old grading also carried a claim that is now false — *"the
+    /// application's `ID3D12Device::CreateCommandSignature` already failed and it
+    /// holds no signature to pass here"* — which is exactly why the new
+    /// `L3aExecuteIndirectSignatureMissing` **does** report: with the create
+    /// implemented, an unresolvable signature is this driver losing an object it
+    /// built, not the API boundary having already answered.
     execute_indirect_refused: RefusalCounter,
     // ── appended by the §10 error-channel repair; ⛔ append only ─────────────
     /// `pfnSOSetTargets` arrived with a non-zero `NumViews` and a **null**
@@ -2157,6 +2323,50 @@ pub(crate) struct L3aRefusals {
     /// approximate — the same partition, for the same measured reason, as
     /// `L9ShadingRateDefaultDropped`.
     depth_bounds_default_dropped: RefusalCounter,
+    // ── appended by S-4 (`pfnExecuteIndirect` implemented); ⛔ append only ────
+    /// ⭐ **S-4's success counter: an indirect draw/dispatch was forwarded to the
+    /// engine.**
+    ///
+    /// ⛔ **Read it beside `CommandSignatureCreated`** (L2's). A non-zero
+    /// `CommandSignatureCreated` with a **zero** here is `METHOD.md` saturation
+    /// criterion 6 exactly — *implemented but never exercised* — and it is the only
+    /// pair of numbers that can show it: the signature create happens at engine
+    /// startup, the execute happens per frame, and either can be reached without the
+    /// other.
+    ///
+    /// ⚠ Non-zero here means the native path ran. It does **not** mean the scene is
+    /// right: `CommandSignatureStateTemplateRefused` is where the root-argument
+    /// classes an engine also wanted went, and those draws are absent.
+    execute_indirect_forwarded: RefusalCounter,
+    /// `pfnExecuteIndirect`'s `D3D12DDI_HCOMMANDSIGNATURE` carried no engine
+    /// signature, so the indirect draw was dropped **and reported** through
+    /// `pfnSetCommandListErrorCb`.
+    ///
+    /// ⛔ **Expected 0** — `queue::create_command_signature` either stores an object
+    /// or fails, and the runtime only records against a signature the create
+    /// returned `S_OK` for. A hit means this driver lost an object it built, which is
+    /// a lifetime bug rather than a capability gap.
+    execute_indirect_signature_missing: RefusalCounter,
+    /// `pfnExecuteIndirect`'s **argument** buffer placement named no resource, so the
+    /// call was refused and reported.
+    ///
+    /// ⛔ **Expected 0, and refusing is not defensive.** `d3d12_command_list_
+    /// ExecuteIndirect` casts the argument buffer with no null test and reads
+    /// `arg_impl->res.cookie.index` before any check (`command.c:17763`, `:17797`),
+    /// so forwarding a null is an access violation inside the engine — a crashed
+    /// process rather than a dropped draw.
+    execute_indirect_arg_buffer_missing: RefusalCounter,
+    /// `pfnExecuteIndirect`'s **count** buffer handle was non-null and carried no
+    /// engine resource, so the call was refused and reported.
+    ///
+    /// ⛔ **Expected 0.** ⚠ A *null* count-buffer handle is legal and common — it
+    /// selects `vkCmdDrawIndirect` over `vkCmdDrawIndirectCount` — and does **not**
+    /// touch this counter. What is counted is a named buffer this driver could not
+    /// resolve, and it is refused rather than degraded: executing without the count
+    /// buffer would run all `MaxCommandCount` commands instead of the `N <=
+    /// MaxCommandCount` the application asked for, i.e. extra draws with garbage
+    /// arguments.
+    execute_indirect_count_buffer_missing: RefusalCounter,
 }
 
 pub(crate) static L3A_REFUSALS: L3aRefusals = L3aRefusals {
@@ -2189,6 +2399,12 @@ pub(crate) static L3A_REFUSALS: L3aRefusals = L3aRefusals {
     execute_indirect_refused: RefusalCounter::new("L3aExecuteIndirectRefused"),
     so_targets_null_array: RefusalCounter::new("L3aSoTargetsNullArray"),
     depth_bounds_default_dropped: RefusalCounter::new("L3aDepthBoundsDefaultDropped"),
+    execute_indirect_forwarded: RefusalCounter::new("L3aExecuteIndirectForwarded"),
+    execute_indirect_signature_missing: RefusalCounter::new("L3aExecuteIndirectSignatureMissing"),
+    execute_indirect_arg_buffer_missing: RefusalCounter::new("L3aExecuteIndirectArgBufferMissing"),
+    execute_indirect_count_buffer_missing: RefusalCounter::new(
+        "L3aExecuteIndirectCountBufferMissing",
+    ),
 };
 
 /// L3a's refusal counters, printed by `crate::log_refusal_summary` at this
@@ -2243,4 +2459,12 @@ pub(crate) static REFUSALS: &[&RefusalCounter] = &[
     &L3A_REFUSALS.execute_indirect_refused,
     &L3A_REFUSALS.so_targets_null_array,
     &L3A_REFUSALS.depth_bounds_default_dropped,
+    // ⛔ APPENDED, S-4 (`pfnExecuteIndirect` implemented). One success counter and
+    // three per-cause refusals. ⚠ `L3aExecuteIndirectRefused` keeps its position
+    // above and is now **dead** — expected 0 forever — because removing an array
+    // entry shifts every counter after it. Its doc says so.
+    &L3A_REFUSALS.execute_indirect_forwarded,
+    &L3A_REFUSALS.execute_indirect_signature_missing,
+    &L3A_REFUSALS.execute_indirect_arg_buffer_missing,
+    &L3A_REFUSALS.execute_indirect_count_buffer_missing,
 ];
