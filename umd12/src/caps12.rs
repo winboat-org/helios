@@ -271,14 +271,6 @@ const FL11_TYPED_UAV_LOAD_FORMATS: [ddi12::DXGI_FORMAT; 3] = [41, 42, 43];
 /// See [`crate::knobs12::UMD12_FORMAT_CAPS`] and [`driver_format_support`].
 const FORMAT_CAPS_API_PASSTHROUGH: u32 = 1;
 
-/// `Umd12FormatCaps` = 2: the DDI encoding with **neither** multisample bit,
-/// on any format. A bisect arm, not a policy.
-const FORMAT_CAPS_NO_MSAA_BITS: u32 = 2;
-
-/// `Umd12FormatCaps` = 3: the DDI encoding with the multisample bits kept only
-/// on formats that are also plain render targets. A bisect arm, not a policy.
-const FORMAT_CAPS_MSAA_NEEDS_RT: u32 = 3;
-
 /// How many times a bounded evidence line may repeat, per site.
 const LOG_BUDGET: usize = 64;
 
@@ -928,8 +920,33 @@ unsafe fn texture_layout_sets(a: &ddi12::D3D12DDIARG_GETCAPS, data_size: usize) 
             MaxElementSize: 16,
             BaseOffsetAlignment: 512,
             PitchAlignment: 256,
-            DepthPitchAlignment: 512,
+            // ⛔ **256, and it was 512 until the runtime said so in English.**
+            // `D12-G7`, 2026-08-06, ETW `Microsoft-Windows-Direct3D12`:
+            //
+            // > `Driver set D3D12DDI_ROW_MAJOR_LAYOUT_SUB_CAPS::SubCaps::DepthPitchAlignment
+            // > either too large, 0, or to a non-pow2 value.`  (strings:85)
+            //
+            // 512 is non-zero and a power of two, so the complaint was **too
+            // large** — and the bound is relative, not absolute: the identical
+            // 512 in `BaseOffsetAlignment` above passes (strings:84 never
+            // fired). The reason it cannot exceed `PitchAlignment`: a row-major
+            // depth pitch is `RowPitch * Height`, and `RowPitch` is only
+            // guaranteed aligned to `PitchAlignment` — so demanding 512 is
+            // unsatisfiable for any odd height, which the runtime can prove
+            // without asking.
+            DepthPitchAlignment: 256,
         };
+    // The property the string is about, stated to the compiler: neither
+    // alignment may be zero or non-power-of-two, and the depth pitch cannot be
+    // aligned more strictly than the row pitch it is a multiple of.
+    const _: () = assert!(SUB.PitchAlignment != 0 && SUB.PitchAlignment.is_power_of_two());
+    const _: () = assert!(SUB.BaseOffsetAlignment != 0 && SUB.BaseOffsetAlignment.is_power_of_two());
+    const _: () = assert!(
+        SUB.DepthPitchAlignment != 0
+            && SUB.DepthPitchAlignment.is_power_of_two()
+            && SUB.DepthPitchAlignment <= SUB.PitchAlignment
+    );
+    const _: () = assert!(SUB.MaxElementSize != 0);
     let caps = ddi12::D3D12DDI_ROW_MAJOR_LAYOUT_CAPS {
         SubCaps: [SUB, SUB],
         Flags: v::ROW_MAJOR_FLAG_NONE,
@@ -969,24 +986,37 @@ unsafe fn options_0110(a: &ddi12::D3D12DDIARG_GETCAPS, data_size: usize) -> Hres
     unsafe { write_caps("OPTIONS_0110", a.pData, data_size, options) }
 }
 
-/// `1082 OPTIONS_0102` — descriptor-heap ceilings, and ⭐ **the one answer in
-/// this file that a first draft got wrong in two directions at once.**
+/// `1082 OPTIONS_0102` — descriptor-heap ceilings, and ⭐ **the answer in this
+/// file that was argued down from the right value and then corrected by the
+/// runtime saying so out loud.**
 ///
 /// `SUBSTRATE.md` §4.5 states that `MaxSamplerDescriptorHeapSize` must be
-/// **>= 4000** at DDI 0102+, and pairs it with the guest's
-/// `maxSamplerAllocationCount` of exactly 4000 to conclude "zero headroom".
-/// Both halves are wrong for this cap:
+/// **>= 4000** at DDI 0102+. L1's first cut overrode that to 2048 on two
+/// arguments that both look strong and are both about **the wrong layer**:
 ///
-/// * the D3D12 API constant `D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE` is
-///   **2048**, so 4000 would advertise a heap larger than the API permits an
-///   application to create;
-/// * the **measured** shipping-driver baseline on this very box reports
-///   **2048 / 2048** (`docs/dx12/baselines/d3d12-caps.csv:85-86`), not 4000.
+/// * *"the D3D12 API constant `D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE` is
+///   2048, so 4000 advertises a heap larger than the API permits"* — but this
+///   is the **DDI** cap, and the runtime is what clamps it down to the API
+///   limit. The two numbers describe different layers and do not compete;
+/// * *"the measured baseline reports 2048"* (`baselines/d3d12-caps.csv:85-86`)
+///   — that CSV is `tools/d3d12_caps_dump.cpp` reading
+///   `D3D12_FEATURE_DATA_D3D12_OPTIONS19` through the **API**. It is the
+///   post-clamp value, so it could not have disagreed with 4000 whatever the
+///   driver underneath reported.
 ///
-/// ⇒ 2048, which is simultaneously the API ceiling, the measured baseline, and
-/// comfortably inside the Vulkan sampler budget. `SUBSTRATE.md` §4.5's ">= 4000"
-/// claim needs correcting there; this site records the disagreement rather than
-/// silently diverging.
+/// ⛔ **The runtime settled it.** `D12-G7`, 2026-08-06, ETW
+/// `Microsoft-Windows-Direct3D12`: `Driver's MaxSamplerDescriptorHeapSize is
+/// too small` (strings:113) with 2048. §4.5 was right; the "correction" was a
+/// layer confusion, and the lesson is that an API-level capture cannot falsify
+/// a DDI-level requirement.
+///
+/// ⚠ 4000 is **exactly** the guest's `maxSamplerAllocationCount` (§4.5), i.e.
+/// zero headroom — §4.5 flags that itself, and it is a real substrate ceiling
+/// rather than a number chosen for comfort.
+/// `MaxSamplerDescriptorHeapSizeWithStaticSamplers` is equal rather than
+/// smaller because strings:114 rejects it only for being **larger** than the
+/// heap size or too small; reserving a slice for static samplers is a
+/// refinement no measurement calls for yet.
 ///
 /// `SupportedSampleCountsWithNoOutputs = 1` (count 1 only) is likewise the
 /// measured baseline (`:80`) rather than the spec-prose `0x1D`; raising it needs
@@ -995,8 +1025,11 @@ unsafe fn options_0110(a: &ddi12::D3D12DDIARG_GETCAPS, data_size: usize) -> Hres
 /// # Safety
 /// As [`get_caps`].
 unsafe fn options_0102(a: &ddi12::D3D12DDIARG_GETCAPS, data_size: usize) -> Hresult {
-    /// `D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE`, and the measured baseline.
-    const MAX_SAMPLER_HEAP: ddi12::UINT = 2048;
+    /// `SUBSTRATE.md` §4.5's DDI floor, and the guest's exact
+    /// `maxSamplerAllocationCount`. ⛔ NOT `D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE`
+    /// (2048) — that is the API limit the runtime clamps to, one layer up, and
+    /// reporting it here is what the runtime rejected with strings:113.
+    const MAX_SAMPLER_HEAP: ddi12::UINT = 4000;
     /// The measured baseline's view-heap ceiling.
     const MAX_VIEW_HEAP: ddi12::UINT = 1_000_000;
 
@@ -1063,7 +1096,8 @@ use windows::Win32::Graphics::Direct3D12::{
     D3D12_FEATURE_FORMAT_SUPPORT, D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, D3D12_FORMAT_SUPPORT1,
     D3D12_FORMAT_SUPPORT1_BLENDABLE, D3D12_FORMAT_SUPPORT1_BUFFER, D3D12_FORMAT_SUPPORT1_DISPLAY,
     D3D12_FORMAT_SUPPORT1_IA_VERTEX_BUFFER, D3D12_FORMAT_SUPPORT1_MULTISAMPLE_LOAD,
-    D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RENDERTARGET, D3D12_FORMAT_SUPPORT1_RENDER_TARGET,
+    D3D12_FORMAT_SUPPORT1_DEPTH_STENCIL, D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RENDERTARGET,
+    D3D12_FORMAT_SUPPORT1_RENDER_TARGET,
     D3D12_FORMAT_SUPPORT1_SHADER_GATHER, D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE,
     D3D12_FORMAT_SUPPORT2, D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD,
     D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE, D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_TILED_RESOURCE,
@@ -1369,146 +1403,55 @@ fn driver_format_support(dev: &HeliosD3D12Device, format: ddi12::DXGI_FORMAT) ->
     let mut caps = translate(SUPPORT1_TO_DDI, support1) | translate(SUPPORT2_TO_DDI, support2);
     caps &= !WITHHELD_BITS;
 
-    // ⚠ The two diagnostic arms. They exist because the remaining `D12-G7`
-    // blocker is *which bit* in a per-format answer the runtime rejects, and
-    // the runtime gives no ETW reason for it — so the answer space is bisected
-    // by measurement instead of guessed at a fourth time. See
-    // [`crate::knobs12::UMD12_FORMAT_CAPS`].
-    match crate::knobs12::umd12_format_caps() {
-        FORMAT_CAPS_NO_MSAA_BITS => caps &= !(fs::MULTISAMPLE_RENDERTARGET | fs::MULTISAMPLE_LOAD),
-        FORMAT_CAPS_MSAA_NEEDS_RT if caps & fs::RENDERTARGET == 0 => {
-            caps &= !(fs::MULTISAMPLE_RENDERTARGET | fs::MULTISAMPLE_LOAD)
-        }
-        _ => {}
-    }
-
-    // ── The two multisample bits, and the pair rule the runtime enforces ────
-    //
-    // ⛔ **`MULTISAMPLE_LOAD` WITHOUT `MULTISAMPLE_RENDERTARGET` IS REJECTED.**
-    // `D3D12CreateDevice` fails `0x887A0020` and the ETW
-    // `Microsoft-Windows-Direct3D12` provider gives the reason in English —
-    // *"MSAA quality reported to be 0"*, message index 62. Measured on this box
-    // 2026-08-06 (`tmp/dx12/gates/G7/RESULT.md`), and the table is unambiguous:
-    // the runtime's format sweep accepted **neither** bit (formats 1, 5, 9, 15,
-    // 19), **both** bits (2-18) and `RENDERTARGET` **alone** (20, a depth
-    // format), and aborted the whole sweep at the first format that answered
-    // `LOAD` alone — `R32_FLOAT_X8X24_TYPELESS` (21).
-    //
-    // ⚠ Note what it is NOT: the rejected call's own answer was **1**, not 0
-    // (`CheckMultisampleQualityLevels fmt=21 count=2 -> 1` is the last line of
-    // the trace). Two earlier fixes aimed at the quality-level answer and both
-    // missed, because the inconsistency is inside the *format* answer.
-    //
-    // ⭐ The implication is what the enum means. `D3D10_DDI_FORMAT_SUPPORT`, whose
-    // values these are byte-for-byte, documents `MULTISAMPLE_LOAD` as *"format
-    // can be used as source for 'ld2dms'"* and `MULTISAMPLE_RENDERTARGET` as
-    // *"format can be used as RenderTarget with some sample count > 1"* — you
-    // cannot `ld2dms` a resource that could never be created multisampled. The
-    // D3D11 driver on this same box encodes the implication by construction and
-    // has done since PATH-A: `umd/src/forward/format_caps.rs:234-241` sets
-    // `DDI_MSAA_RENDERTARGET` first and `DDI_MSAA_LOAD` only *additionally*, so
-    // it can never emit the pair this runtime rejects.
-    //
-    // Why the engine produces it: `vkd3d_get_format(21, false)` returns the
-    // DEPTH-STENCIL table entry (`utils.c:160`; `plane_count > 1` forces it at
-    // `utils.c:932-934`), whose `is_dsv_format` test fails — DEPTH aspect, no
-    // STENCIL, `plane_count == 2` (`device.c:5301-5303`) — so the
-    // `DEPTH_STENCIL | MULTISAMPLE_RENDERTARGET` arm at `device.c:5341` never
-    // runs, while the sampled-image arm still sets `MULTISAMPLE_LOAD` at
-    // `device.c:5312`. ⚠ WARP does not have this gap: its D3D11 answer for the
-    // same depth-read views carries both bits (`format_caps.rs`'s
-    // `WARP_DEPTH_READ_CAPS`, `0x04d2_17b0` — ours is `0x04d0_17b0`, and the one
-    // missing bit is exactly `MULTISAMPLE_RENDERTARGET`).
-    const MSAA_RT: u32 = fs::MULTISAMPLE_RENDERTARGET;
-    const MSAA_LOAD: u32 = fs::MULTISAMPLE_LOAD;
-
-    // ⭐ **THE MULTISAMPLE POLICY, DERIVED FROM FOUR MEASURED POINTS.** The
-    // runtime rejects an incoherent (format bits, quality levels) pair with
-    // `0x887A0020` and aborts its whole 91-format sweep at the first one, so
-    // each of these came from an arm that got further or less far than the last
-    // (`tmp/dx12/gates/G7/RESULT.md` has the table):
-    //
-    // | format | answered | quality levels | runtime |
-    // |---|---|---|---|
-    // | 1 `R32G32B32A32_TYPELESS` | `0x0` | 2/4/8 | accepted -- an all-zero answer is exempt |
-    // | 2 `R32G32B32A32_FLOAT` | `0x4707` (RT, no MSAA_RT) | 2/4/8 | **rejected** |
-    // | 6 `R32G32B32_FLOAT` | `0x4501` (no MSAA bits) | none | accepted |
-    // | 20 `D32_FLOAT_S8X24_UINT` | `0x8` (MSAA_RT alone) | 2/4/8 | accepted |
-    // | 20 | `0x0` | 2/4/8 | **rejected** |
-    // | 21 `R32_FLOAT_X8X24_TYPELESS` | `0x4011` / `0x4019` (LOAD, no RENDERTARGET) | 2/4/8 | **rejected** |
-    // | 21 | `0x4001` (no MSAA bits) | 2/4/8 | **rejected** |
-    //
-    // Three rules fit all of it, and nothing simpler does:
-    //   (A) a format that declares ANY capability and CAN be multisampled must
-    //       declare `MULTISAMPLE_RENDERTARGET`;
-    //   (B) a format that cannot be multisampled must declare neither bit;
-    //   (C) `MULTISAMPLE_LOAD` only where `RENDERTARGET` is also set.
-    //
-    // ⚠ (A) subsumes FL 11_0's *"every output-capable format supports at least
-    // 4x MSAA"* floor, which `umd/src/forward/format_caps.rs:126-134` states in
-    // those words for D3D11 — but it is **wider**: format 20 is a depth target
-    // and carries no `RENDERTARGET` at all, so a rule keyed on `RENDERTARGET`
-    // alone leaves it at `0x0` and is rejected. (C) is why 21 cannot simply keep
-    // what the engine gave it.
-
-    // (B) first, so (A) cannot resurrect a capability with no shape behind it.
-    if caps & (MSAA_RT | MSAA_LOAD) != 0 && !engine_offers_any_msaa(dev, format) {
-        UMD12_REFUSALS.caps_msaa_bits_dropped.bump();
-        let n = UMD12_REFUSALS.caps_msaa_bits_dropped.get();
-        if n <= LOG_BUDGET {
-            log_error!(
-                "CheckFormatSupport fmt={format}: engine claims multisample bits ({:#010x}) but \
-                 offers no quality level at any sample count -> dropping them (x{n})",
-                caps & (MSAA_RT | MSAA_LOAD),
-            );
-        }
-        caps &= !(MSAA_RT | MSAA_LOAD);
-    }
-
-    // (A) A format that declares anything at all and CAN be multisampled must
-    //     declare `MULTISAMPLE_RENDERTARGET`. ⛔ Keyed on `caps != 0` rather than
-    //     on `RENDERTARGET`, because format 20 is a depth target with no
-    //     `RENDERTARGET` and is rejected at `0x0` yet accepted at `0x8`. The
-    //     `caps != 0` exemption is format 1's: an all-zero answer is how the
-    //     driver says "not supported", and the runtime accepts quality levels
-    //     alongside it.
-    if caps != 0 && caps & MSAA_RT == 0 && engine_offers_any_msaa(dev, format) {
-        UMD12_REFUSALS.caps_msaa_rendertarget_implied.bump();
-        let n = UMD12_REFUSALS.caps_msaa_rendertarget_implied.get();
-        if n <= LOG_BUDGET {
-            log_error!(
-                "CheckFormatSupport fmt={format}: engine offers quality levels above 1 sample but \
-                 no MULTISAMPLE_RENDERTARGET -> implying it (x{n})"
-            );
-        }
-        caps |= MSAA_RT;
-    }
-
-    // (C) `MULTISAMPLE_LOAD` only where `RENDERTARGET` is set, and AFTER (A) so
-    //     the two cannot fight. `D3D10_DDI_FORMAT_SUPPORT` defines `LOAD` as
-    //     *"can be used as source for 'ld2dms'"*, which presupposes a colour
-    //     target to have rendered into; the depth-read views (21, 22, 46, 47)
-    //     are what vkd3d answers this way, because its sampled-image arm sets
-    //     `LOAD` while its `is_dsv_format` test refuses them the render-target
-    //     arm (`device.c:5301-5312`).
-    if caps & MSAA_LOAD != 0 && caps & fs::RENDERTARGET == 0 {
-        UMD12_REFUSALS.caps_msaa_load_without_rendertarget.bump();
-        let n = UMD12_REFUSALS.caps_msaa_load_without_rendertarget.get();
-        if n <= LOG_BUDGET {
-            log_error!(
-                "CheckFormatSupport fmt={format}: MULTISAMPLE_LOAD without RENDERTARGET -> \
-                 dropping LOAD (x{n})"
-            );
-        }
-        caps &= !MSAA_LOAD;
-    }
-
     // ⛔ Typed UAV *loads*, narrowed rather than dropped. See
     // [`FL11_TYPED_UAV_LOAD_FORMATS`]: the cap is named *additional* formats, so
     // FALSE means "the three FL 11_0 mandates and no others", and both the
     // all-off and the all-on answer contradict it.
     if TYPED_UAV_LOAD_ADDITIONAL_FORMATS == 0 && !FL11_TYPED_UAV_LOAD_FORMATS.contains(&format) {
         caps &= !fs::UAV_READS;
+    }
+
+    // ── The multisample answer: ONE predicate, both slots ──────────────────
+    //
+    // ⭐ **This is transliterated from the D3D11 driver, and the structure is
+    // the hard-won part.** `umd/src/forward/queries.rs:104-164` does not forward
+    // the engine's quality-level answer at all -- it *derives* it from the same
+    // `dxgi_msaa_bits_per_sample(fmt, caps).is_some()` predicate that decides
+    // the format-support multisample bits, and says why in as many words:
+    //
+    // > "The Microsoft runtime validates `CheckFormatSupport` and
+    // > `CheckMultisampleQualityLevels` as a coherent feature-level contract
+    // > during `CDevice::LLOCompleteLayerConstruction`. ... the caps/quality
+    // > pair stays internally coherent either way because `check_format_support`
+    // > uses the SAME predicate."
+    //
+    // ⛔ Forwarding two independent engine queries -- which is what this file did
+    // first -- makes the pair a *coincidence*, and `D12-G7` measured the runtime
+    // rejecting it four different ways on one format. Deriving both from
+    // [`msaa_capable`] makes disagreement unrepresentable, which is the same
+    // move `forward12::noop12` makes for slot ordinals.
+    let msaa = msaa_capable(dev, format, support1);
+    if msaa {
+        caps |= fs::MULTISAMPLE_RENDERTARGET;
+        // ⚠ `LOAD` only for non-depth formats, exactly as
+        // `format_caps.rs:135-138` gates it (`if caps & DEPTH_STENCIL == 0`).
+        // It is *"can be used as source for 'ld2dms'"*, and it is also the bit
+        // whose absence is why `D32_FLOAT_S8X24_UINT` (20) is accepted carrying
+        // `MULTISAMPLE_RENDERTARGET` **alone** -- measured.
+        if support1 & API_DEPTH_STENCIL == 0 {
+            caps |= fs::MULTISAMPLE_LOAD;
+        }
+    } else if caps & (fs::MULTISAMPLE_RENDERTARGET | fs::MULTISAMPLE_LOAD) != 0 {
+        UMD12_REFUSALS.caps_msaa_bits_dropped.bump();
+        let n = UMD12_REFUSALS.caps_msaa_bits_dropped.get();
+        if n <= LOG_BUDGET {
+            log_error!(
+                "CheckFormatSupport fmt={format}: engine claims multisample bits ({:#010x}) but \
+                 this format is not MSAA-capable -> dropping them (x{n})",
+                caps & (fs::MULTISAMPLE_RENDERTARGET | fs::MULTISAMPLE_LOAD),
+            );
+        }
+        caps &= !(fs::MULTISAMPLE_RENDERTARGET | fs::MULTISAMPLE_LOAD);
     }
 
     // ⭐ The evidence line, and it carries the ENGINE'S RAW ANSWER as well as
@@ -1550,6 +1493,67 @@ fn driver_format_support(dev: &HeliosD3D12Device, format: ddi12::DXGI_FORMAT) ->
         return fs::NOT_SUPPORTED;
     }
     0
+}
+
+/// `D3D12_FORMAT_SUPPORT1_RENDER_TARGET`, needed as a raw value because the
+/// output test below is asked of the **engine's API bits**, not of the DDI
+/// answer. The DDI enum has no depth bit at all, so the DDI value cannot
+/// distinguish "render target" from "depth target" — and that distinction is
+/// exactly what decides `MULTISAMPLE_LOAD`.
+const API_RENDER_TARGET: u32 = 0x0000_4000;
+/// `D3D12_FORMAT_SUPPORT1_DEPTH_STENCIL`. See [`API_RENDER_TARGET`].
+const API_DEPTH_STENCIL: u32 = 0x0001_0000;
+
+const _: () = assert!(API_RENDER_TARGET == D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0 as u32);
+const _: () = assert!(API_DEPTH_STENCIL == D3D12_FORMAT_SUPPORT1_DEPTH_STENCIL.0 as u32);
+
+/// ⭐ **THE multisample predicate — one function, both slots.**
+///
+/// A transliteration of the D3D11 driver's
+/// `dxgi_msaa_bits_per_sample(fmt, caps).is_some()`
+/// (`umd/src/forward.rs:197-214`), which is what
+/// `umd/src/forward/format_caps.rs` and
+/// `umd/src/forward/queries.rs::helios_multisample_quality_levels` **both**
+/// consult so their answers cannot drift apart. `D12-G7` measured what happens
+/// when they can.
+///
+/// Three terms, and each one is load-bearing:
+///
+/// 1. ⛔ **`format::msaa_ineligible`** — true for exactly `R32_FLOAT_X8X24_TYPELESS`
+///    (21), `X32_TYPELESS_G8X24_UINT` (22), `R24_UNORM_X8_TYPELESS` (46) and
+///    `X24_TYPELESS_G8_UINT` (47). Its own field doc in
+///    `umd_common/src/format.rs` is the whole answer to this gate's blocker:
+///    *"Depth-resource read/view formats are format-support siblings of the
+///    MSAA-capable typeless/depth formats, but WARP reports zero quality levels
+///    above 1x and the runtime rejects advertising them as MSAA render
+///    targets."* Format **21 is where `D12-G7`'s sweep stops**, and every arm
+///    tried before this one changed the format bits while still forwarding the
+///    engine's non-zero quality levels — so the one answer that works, *neither
+///    MSAA bits nor levels*, was never on the table.
+/// 2. **the output test**, asked of the engine's API bits: a format carrying
+///    `RENDER_TARGET` or `DEPTH_STENCIL` is sized by `bits_per_sample`, and one
+///    carrying neither by its `output_family_bits`. Absent ⇒ not MSAA-capable,
+///    which is how compressed and video-only formats stay out (`format.rs:38-41`:
+///    *"deliberately absent so the runtime does not require MSAA for them"*).
+/// 3. ⚠ **the engine term, which D3D11 does NOT have.** R829 records that the
+///    D3D11 predicate *"never asks whether that SAMPLE COUNT is supported, so
+///    today's '8x on a 128-bit format' is a table assertion, not a capability
+///    probe"*. Here the probe is free — `supported_sample_counts` is computed
+///    once per format at device init and this is a mask test — so the claim is
+///    narrowed to what vkd3d can actually back. It is what keeps
+///    `R32G32B32_FLOAT` (6) answering no MSAA bits, which is the value the
+///    runtime was measured accepting.
+fn msaa_capable(dev: &HeliosD3D12Device, format: ddi12::DXGI_FORMAT, support1: u32) -> bool {
+    if helios_umd_common::format::msaa_ineligible(format as u32) {
+        UMD12_REFUSALS.caps_msaa_ineligible_format.bump();
+        return false;
+    }
+    let output_bits = if support1 & (API_RENDER_TARGET | API_DEPTH_STENCIL) != 0 {
+        helios_umd_common::format::bits_per_sample(format as u32)
+    } else {
+        helios_umd_common::format::output_family_bits(format as u32)
+    };
+    output_bits.is_some() && engine_offers_any_msaa(dev, format)
 }
 
 /// Does the engine offer a quality level at ANY sample count above 1?
@@ -1701,7 +1705,24 @@ unsafe extern "C" fn check_multisample_quality_levels(
         return;
     }
 
-    let levels = engine_msaa_quality_levels(dev, format, sample_count, flags).unwrap_or(0);
+    // ⭐ **DERIVED, NOT FORWARDED.** The engine's own quality-level answer is
+    // deliberately not used here: it comes from a different vkd3d function than
+    // its format-support answer (`device.c:5104-5121` vs `:5290-5345`) and the
+    // two disagree, which the runtime rejects as one contract. Both slots now
+    // read [`msaa_capable`], so the pair is coherent by construction — the
+    // structure `umd/src/forward/queries.rs:129-164` arrived at for D3D11.
+    let (support1, _support2) = engine_format_support(dev, format).unwrap_or((0, 0));
+    let capable = msaa_capable(dev, format, support1);
+
+    // ⛔ Only the power-of-two counts D3D11's predicate admits: *"The runtime
+    // rejects arbitrary non-power-of-two sample counts"*
+    // (`queries.rs:110-112`). The runtime sweeps 2..31 per format, so this is
+    // what makes 27 of every 30 answers zero.
+    let levels = if capable && matches!(sample_count, 1 | 2 | 4 | 8 | 16) {
+        1
+    } else {
+        0
+    };
 
     // ⭐ **EVERY call, zeros included, and that is the point.** This is the one
     // instrument that can answer *"which (format, sample count) did the runtime
@@ -1711,12 +1732,9 @@ unsafe extern "C" fn check_multisample_quality_levels(
     // per device creation, on every boot, forever. `trace_line!` is gated on
     // `HKLM\SOFTWARE\Helios!Umd12Trace`, so the shipping cost is one relaxed
     // `bool` load per call (R420 / `umd_common::log`).
-    //
-    // ⚠ The zero answers are the informative ones. The `log_error!` line below
-    // deliberately does NOT print them — it is the always-on summary of what the
-    // driver *offered* — so the two are not redundant.
     trace_line!(
-        "CheckMultisampleQualityLevels fmt={format} count={sample_count} flags={flags} -> {levels}"
+        "CheckMultisampleQualityLevels fmt={format} count={sample_count} flags={flags} \
+         capable={capable} -> {levels}"
     );
 
     if levels == 0 {
@@ -1731,8 +1749,7 @@ unsafe extern "C" fn check_multisample_quality_levels(
         );
     }
     // SAFETY: as above.
-    unsafe { core::ptr::write_unaligned(num_quality_levels, levels) };
-}
+    unsafe { core::ptr::write_unaligned(num_quality_levels, levels) };}
 
 /// Ask the engine how many quality levels one (format, sample count, flags)
 /// triple has. `None` when there is no engine or it refused; both are counted.

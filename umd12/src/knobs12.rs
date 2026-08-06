@@ -57,12 +57,13 @@ use helios_umd_common::knobs::{BoolKnob, DwordKnob};
 /// |---:|---|
 /// | 0 | **`D3D12DDI_FORMAT_SUPPORT`** -- translate the engine's API bits into the DDI enum and narrow them to this driver's caps. The default. |
 /// | 1 | **API passthrough** -- hand the engine's `D3D12_FORMAT_SUPPORT1` back unchanged, exactly as the D3D11 driver does with DXVK's. ⛔ **MEASURED AND LOSING** (2026-08-06): it truncates the runtime's format sweep at 12 formats / 271 multisample queries, against 23 / 600 for arm 0. So the D3D12 DDI is **not** harmonized with the API enum the way D3D11's is, and arm 0 is right. Kept reachable as rule 8 requires. |
-/// | 2 | DDI encoding with **neither** multisample bit on any format. A bisect arm for the remaining `D12-G7` blocker. |
-/// | 3 | DDI encoding with the multisample bits kept only where `RENDERTARGET` is also set. The other bisect arm. |
 ///
-/// ⚠ Arms 2 and 3 are **diagnostics, not policies**: the runtime rejects a
-/// specific per-format answer and emits no ETW reason for it, so the answer
-/// space is bisected by measurement. They come out once the rule is named.
+/// ⚠ Two further arms existed briefly (2: no multisample bits anywhere; 3:
+/// multisample bits only alongside `RENDERTARGET`) purely to bisect which bit
+/// the runtime was rejecting. **They are gone**, because the rule they were
+/// hunting turned out to be written down already — `msaa_ineligible` in
+/// `umd_common/src/format.rs`, which the D3D11 driver paid for. A diagnostic
+/// arm that outlives its question is scaffolding.
 ///
 /// ⚠ The default is 0 and stays 0 until an arm is measured green; flipping it
 /// requires the evidence written at the read site in `caps12`.

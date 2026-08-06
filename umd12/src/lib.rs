@@ -379,36 +379,25 @@ pub(crate) struct Umd12Refusals {
     /// reads the same 0 and answers nothing. The depth-read views
     /// (`R32_FLOAT_X8X24_TYPELESS`, `X32_TYPELESS_G8X24_UINT` and their
     /// `D24_UNORM_S8_UINT` siblings) are where it shows up.
+    pub(crate) caps_msaa_ineligible_format: RefusalCounter,
+    /// A format refused any multisample capability because
+    /// `helios_umd_common::format::msaa_ineligible` says so.
+    ///
+    /// ⛔ **This is the counter for `D12-G7`'s longest-running blocker.** True for
+    /// exactly the four depth/stencil READ views — `R32_FLOAT_X8X24_TYPELESS`
+    /// (21), `X32_TYPELESS_G8X24_UINT` (22), `R24_UNORM_X8_TYPELESS` (46) and
+    /// `X24_TYPELESS_G8_UINT` (47). The table's own field doc records what the
+    /// D3D11 driver paid to learn: *"WARP reports zero quality levels above 1x
+    /// and the runtime rejects advertising them as MSAA render targets."*
+    /// Format 21 is where the runtime aborted its 91-format sweep, through four
+    /// separate arms that each changed the format bits and none of which
+    /// changed the quality levels.
+    ///
+    /// ⚠ **Expected non-zero** — it fires once per `pfnCheckFormatSupport` and
+    /// once per `pfnCheckMultisampleQualityLevels` for each of the four, so a
+    /// full sweep reads in the dozens. Zero would mean the shared format table
+    /// is not being consulted.
     pub(crate) caps_msaa_bits_dropped: RefusalCounter,
-    /// A format that the engine answered `MULTISAMPLE_LOAD` **without**
-    /// `MULTISAMPLE_RENDERTARGET`, while offering a quality level above 1
-    /// sample, had `MULTISAMPLE_RENDERTARGET` added.
-    ///
-    /// ⛔ **This is the counter for the pair rule that failed `D12-G7` twice.**
-    /// The runtime rejects `LOAD` alone with `0x887A0020` and the ETW
-    /// `Microsoft-Windows-Direct3D12` reason *"MSAA quality reported to be 0"*;
-    /// the D3D11 driver on this box cannot emit that pair by construction
-    /// (`umd/src/forward/format_caps.rs:234-241`), and this is the D3D12
-    /// equivalent made explicit and countable instead of structural.
-    ///
-    /// ⚠ **Expected non-zero**, and it is the depth-read views that produce it:
-    /// `R32_FLOAT_X8X24_TYPELESS` (21), `X32_TYPELESS_G8X24_UINT` (22) and their
-    /// `D24_UNORM_S8_UINT` siblings (46, 47), where vkd3d's `is_dsv_format` test
-    /// fails on `plane_count == 2` and skips the arm that would have set the
-    /// render-target bit.
-    pub(crate) caps_msaa_rendertarget_implied: RefusalCounter,
-    /// A format carrying `MULTISAMPLE_LOAD` without `RENDERTARGET` had `LOAD`
-    /// dropped.
-    ///
-    /// ⛔ Measured 2026-08-06: the runtime aborts its format sweep at the first
-    /// format answered that way. `D3D10_DDI_FORMAT_SUPPORT` defines `LOAD` as
-    /// *"can be used as source for 'ld2dms'"*, which presupposes a colour target
-    /// to have rendered into.
-    ///
-    /// ⚠ **Expected non-zero**: the depth-read views (21, 22, 46, 47) are what
-    /// vkd3d answers this way, because its sampled-image arm sets `LOAD` while
-    /// its `is_dsv_format` test refuses them the render-target arm.
-    pub(crate) caps_msaa_load_without_rendertarget: RefusalCounter,
     /// `pfnQueryNodeMap` with a null `pMap`. Expected 0 — the DDI declares it
     /// `_Out_writes_(NumPhysicalAdapters)`.
     pub(crate) node_map_bad_arg: RefusalCounter,
@@ -461,9 +450,8 @@ pub(crate) static UMD12_REFUSALS: Umd12Refusals = Umd12Refusals {
     caps_msaa_engine_failed: RefusalCounter::new("CapsMsaaEngineFailed"),
     caps_msaa_tiled_refused: RefusalCounter::new("CapsMsaaTiledRefused"),
     caps_mip_packing_refused: RefusalCounter::new("CapsMipPackingRefused"),
+    caps_msaa_ineligible_format: RefusalCounter::new("CapsMsaaIneligibleFormat"),
     caps_msaa_bits_dropped: RefusalCounter::new("CapsMsaaBitsDropped"),
-    caps_msaa_rendertarget_implied: RefusalCounter::new("CapsMsaaRenderTargetImplied"),
-    caps_msaa_load_without_rendertarget: RefusalCounter::new("CapsMsaaLoadWithoutRenderTarget"),
     node_map_bad_arg: RefusalCounter::new("NodeMapBadArg"),
     node_map_unexpected_adapter_count: RefusalCounter::new("NodeMapUnexpectedAdapterCount"),
 };
@@ -471,7 +459,7 @@ pub(crate) static UMD12_REFUSALS: Umd12Refusals = Umd12Refusals {
 /// The set, in the order the summary prints them. ⛔ This order is the evidence
 /// contract: `D3D12 DDI refusals:` lines from different builds get diffed, so
 /// new counters are **appended**, never inserted.
-static UMD12_REFUSAL_SET: [&RefusalCounter; 43] = [
+static UMD12_REFUSAL_SET: [&RefusalCounter; 42] = [
     &UMD12_REFUSALS.open_adapter12,
     &UMD12_REFUSALS.probe12_bad_arg,
     &UMD12_REFUSALS.probe12_create_failed,
@@ -510,9 +498,8 @@ static UMD12_REFUSAL_SET: [&RefusalCounter; 43] = [
     &UMD12_REFUSALS.caps_msaa_engine_failed,
     &UMD12_REFUSALS.caps_msaa_tiled_refused,
     &UMD12_REFUSALS.caps_mip_packing_refused,
+    &UMD12_REFUSALS.caps_msaa_ineligible_format,
     &UMD12_REFUSALS.caps_msaa_bits_dropped,
-    &UMD12_REFUSALS.caps_msaa_rendertarget_implied,
-    &UMD12_REFUSALS.caps_msaa_load_without_rendertarget,
     &UMD12_REFUSALS.node_map_bad_arg,
     &UMD12_REFUSALS.node_map_unexpected_adapter_count,
 ];
