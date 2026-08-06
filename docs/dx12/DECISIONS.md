@@ -385,8 +385,45 @@ control: `tmp/dx12/gates/G1-static/arm-diff.txt` is the whole difference between
 future engine regression is far cheaper to localise when the pre-D4 binary can still be built and run
 from the same probe source. It costs one `shared_library` stanza and is on no shipping path.
 
-**Decision D5 — the KMD is not on the critical path.** For Phase 0 the KMD work list is **empty**;
-for the DDI arm it is three items, none required for the first triangle:
+**Decision D5a — ⛔⛔ SUPERSEDES D5's premise (owner, 2026-08-06). THE KMD IS ON THE CRITICAL
+PATH, and the next session is a KMD session.** Owner, verbatim: *"stop gaps are not acceptable, we
+must do the correct, expected and performant implementation, do it right the first time. doesn't
+matter if its complex or if changes are needed to be done in KMD. … Fence completion is also going
+to need some KMD level changes and we anyways need changes in KMD for present, so the next session
+is going to focus on kmd changes to unblock the UMD."*
+
+**What forced it.** `D12-G8` rung 0 failed and the cause is measured, not argued
+(`tmp/dx12/gates/G8-r0-settle/`): the application's `ID3D12Fence` completes in **0.8–1.1 µs**
+against WARP's **561 µs**, the surface is **0/65536 exact at T+0 and 65536/65536 at +2000 ms**
+through the same live mapping, and vkd3d logs **zero errors** on the whole path. The GPU work
+lands; nothing orders the fence behind it. `EclNoWddmSubmission=1` — the missing kernel submission
+during `pfnExecuteCommandLists` — is therefore **the defect, not a deferred nicety**, and it is a
+KMD-adjacent one: dxgkrnl releases a queued monitored-fence signal when the DMA packets already on
+that context retire, and this driver submits none.
+
+⛔ **A user-mode-only fix was designed, costed and REJECTED** (`tmp/dx12/FENCE-BRIDGE-DESIGN.md`
+design A, a bounded drain inside a DDI). It is a producer-side CPU stall, i.e. the shape
+`umd/src/knobs.rs:31-43`'s standing directive exists to forbid — *"a producer-side stall hides an
+ordering defect instead of fixing it; the ordering belongs on the GPU timeline, not on a blocked
+CPU thread"*. ⛔ Do not re-propose it. The two *unbuildable* routes are recorded there too:
+`D3D12DDI_FENCE` carries no `D3DKMT_HANDLE` and no `hRTFence`, and every `pfnSignal*Cb` names its
+target by `D3DKMT_HANDLE`, so the driver can **never** name the application's fence to signal it.
+
+**What D5a does NOT change.** D5's *census* stands: no extra engine nodes, no hardware queues, no
+native fences, no real page tables, no residency DDIs, and 72 of the 103 unset `DxgkDdi*` slots are
+unreachable at `WDDM2_1`. What changes is the conclusion drawn from it — "therefore the KMD needs
+nothing" was true only while nothing needed a *truthful completion boundary*. The fence path and the
+present path both do, and they share one WDDM context and one submission route, which is why they
+are one session's work and not two.
+
+⇒ The live KMD work list is **`docs/dx12/KMD_IMPACT.md` §14**, not the K1/K2/K3 table below. K1–K3
+remain valid as hygiene and are unaffected.
+
+---
+
+**Decision D5 — ~~the KMD is not on the critical path~~ ⚠ PREMISE SUPERSEDED BY D5a ABOVE; the
+table below is still correct as a list of *hygiene* items.** For Phase 0 the KMD work list is
+**empty**; for the DDI arm it is three items, none required for the first triangle:
 
 | # | Item | Why | Size | Required for first frame? |
 |---|---|---|---|---|

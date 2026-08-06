@@ -2298,10 +2298,50 @@ So the D3D12 fence model on Helios is:
 | D3D12 concept | Helios mechanism |
 |---|---|
 | `ID3D12Fence` object | runtime-created monitored fence; driver sees only `D3D12DDI_FENCE`'s VAs |
-| `ID3D12CommandQueue::Signal` | `pfnSignalFence` → `pKTCallbacks->pfnSignalSynchronizationObjectFromGpuCb` queued software signal packet on the queue's WDDM context |
-| `ID3D12CommandQueue::Wait` | `pfnWaitForFence` → `pfnWaitForSynchronizationObjectFromGpuCb` queued wait on the same context |
+| `ID3D12CommandQueue::Signal` | ⛔ **THIS ROW WAS WRONG AND IS STRUCK — see the correction below.** ~~`pfnSignalFence` → `pKTCallbacks->pfnSignalSynchronizationObjectFromGpuCb` queued software signal packet on the queue's WDDM context~~ |
+| `ID3D12CommandQueue::Wait` | ⛔ **Struck for the same reason.** ~~`pfnWaitForFence` → `pfnWaitForSynchronizationObjectFromGpuCb` queued wait on the same context~~ |
 | `ID3D12Fence::Signal` / `SetEventOnCompletion` / `GetCompletedValue` | entirely runtime + dxgkrnl; the driver is not involved |
 | "signalled after the GPU work in preceding `ExecuteCommandLists`" | reduces to Helios' existing wire-fence contract — `DxgkDdiSubmitCommandVirtual` completes a fence only after the venus work outstanding at submit time (`kmd_render/src/ddi/submit_command.rs:720-724`) |
+
+### ⛔⛔ CORRECTION 2026-08-06 — the two struck rows are NOT IMPLEMENTABLE, and it cost a session
+
+**The driver can never name a D3D12 fence to the kernel.** From the bindings, not from inference:
+
+* `D3D12DDIARG_CREATE_FENCE` is `{ FenceCount, Fences: *mut D3D12DDI_FENCE }`
+  (`umd12/bindgen/cached/d3d12umddi.rs:51121-51124`) and `D3D12DDI_FENCE` is
+  `{ FenceValue: PLACEMENT, FenceMonitoredValue: PLACEMENT, Flags }` (`:51094-51098`). **There is
+  no `D3DKMT_HANDLE`, no `hRTFence`, and no CPU pointer** — and unlike `pfnCreateCommandQueue`,
+  which receives `D3D12DDI_HRTCOMMANDQUEUE`, `pfnCreateFence` is handed **no runtime handle of any
+  kind**. `D3D12DDI_HFENCE` is the driver's own private block.
+* Every signal/wait callback names its target by `D3DKMT_HANDLE`:
+  `D3DDDICB_SIGNALSYNCHRONIZATIONOBJECTFROMCPU { ObjectCount, ObjectHandleArray: *const
+  D3DKMT_HANDLE, FenceValueArray }` (`:20949-20953`),
+  `D3DDDICB_SIGNALSYNCHRONIZATIONOBJECTFROMGPU { hContext, ObjectCount, ObjectHandleArray: *const
+  D3DKMT_HANDLE, … }` (`:21053-21064`), and the `2Cb` / `FromGpu2Cb` variants likewise.
+* Measured on Helios: both `BaseAddress`es arrive **0**
+  (`CreateFence: valueVA=0x0 monitoredVA=0x0 flags=0x1`,
+  `tmp/dx12/gates/G8-r0/umd12-trace-pid10836.log`), so there is not even fence memory to write.
+  `D3D12Core.dll`'s own strings model this state — *"must be either monitored fences **with GPU
+  access** or native fences"*.
+
+⚠ **The Microsoft sentence these rows were built on is real but was mis-applied.**
+`context-monitoring.md`'s *"If a GPU engine isn't capable of writing to a monitored fence using its
+virtual address, the UMD uses the `SignalSynchronizationObjectFromGpuCb` callback to queue a
+software signal packet"* is about a UMD signalling a fence **it created and holds the handle for**
+— which D3D11 does. Applying it to `D3D12DDI_HFENCE` was the reconstruction, and it is wrong.
+Four comment sites inherit it and are re-graded when the fix lands: `umd12/src/forward12/fence.rs`
+(3) and `queue.rs` (1).
+
+⭐ **What is true instead, and it is the whole D3D12 fence design on Helios:** the runtime owns the
+fence and its signal, and the *only* lever this driver has is **what dxgkrnl orders that signal
+behind** — i.e. the DMA packets already submitted on the queue's WDDM context. That is why
+`EclNoWddmSubmission` stopped being a gap and became the defect (`DECISIONS.md` **D5a**), and why
+the fix is a real `pfnRenderCb` submission carrying the frame's own completion boundary
+(`KMD_IMPACT.md` §14). ⚠ It also carries one **UNVERIFIED** the design rests on: *that the runtime
+queues its fence signal on our context at all, rather than CPU-signalling it independently.*
+Settling experiment: submit a DMA packet the KMD deliberately holds for N ms and read whether the
+application's fence wait grows by N (`tmp/dx12/gates/G8-r0-settle/` established the baseline —
+0.8–1.1 µs today, against WARP's 561 µs).
 
 ⛔ **Do not claim `D3D12DDI_FENCE_FLAG_BOTTOM_OF_PIPE` semantics the stack cannot deliver.** The
 flag is an input the driver *receives*, so the obligation runs the other way: if a fence carries it,

@@ -120,7 +120,8 @@ null-pointer bugcheck), so unregistering is a separate behaviour change with its
 
 ### 2c. ⚠ `DxgkDdiCreateAllocation` refuses any allocation without a Helios private-data blob
 
-`kmd_render/src/ddi/create_allocation.rs:2291-2307`, verbatim:
+`kmd_render/src/ddi/create_allocation.rs:2316-2318` and `:2329-2330` (⚠ the citation drifted from
+`:2291-2307`; re-pinned 2026-08-06), verbatim:
 
 ```rust
     if priv_ptr.is_null() || priv_len < size_of::<HeliosWddmAllocPrivate>() {
@@ -134,7 +135,8 @@ null-pointer bugcheck), so unregistering is a separate behaviour change with its
     }
 ```
 
-`HeliosWddmAllocPrivate` is 48 bytes (`protocol/src/wddm.rs:102-120`) and `is_valid()` is
+`HeliosWddmAllocPrivate` is 48 bytes (`protocol/src/wddm.rs:121-139`; `is_valid()` at `:167-170`
+— ⚠ both re-pinned 2026-08-06 from `:102-120` / `:149-151`) and `is_valid()` is
 `magic == HELIOS_WDDM_MAGIC && version == HELIOS_WDDM_VERSION` (`:149-151`).
 
 **This is a UMD obligation, not a KMD defect.** The KMD is correctly refusing an allocation it
@@ -417,7 +419,38 @@ handles must go through `D3DKMTShareObjects` + `OpenSyncObjectFromNtHandle2`**, 
 `DXGK_VIDSCHCAPS.No64BitAtomics` = 0 — i.e. Helios claims 64-bit atomic fence updates. Correct: the
 writes are dxgkrnl's CPU writes, which are atomic.
 
-**KMD work for D3D12 fences: none.**
+~~**KMD work for D3D12 fences: none.**~~
+
+### ⛔⛔ CORRECTION 2026-08-06 — this section's CONCLUSION is refuted; its FACTS still stand
+
+`D12-G8` rung 0 failed and was measured (`tmp/dx12/gates/G8-r0-settle/`): the application's
+`ID3D12Fence` completes in **0.8–1.1 µs** against WARP's **561 µs**, while the surface goes from
+**0/65536 exact at T+0** to **65536/65536 at +2000 ms** through the same live mapping. The GPU work
+lands; nothing orders the fence behind it. See `DECISIONS.md` **D5a** and §14a.
+
+**What was wrong, and why it survived review:**
+
+1. ⛔ ***"Local proof it already works"* overstates its own evidence.** `tools/vehicle_flipwait_probe.c`
+   issues `CreateSynchronizationObject2`, `WaitForSynchronizationObjectFromGpu`,
+   `SignalSynchronizationObjectFromGpu/Cpu` — and **no `D3DKMTRender`, no `D3DKMTSubmitCommand`,
+   no present**; its own header says *"with no rendering"*. It proves VidSch orders **software sync
+   packets** FIFO on a Helios context. **The DMA-packet dependency — which is the entire question —
+   it never exercises.** ⇒ the residual it left open (§7's `D12-G-fence`, whose step (3) is
+   *"`D3DKMTSubmitCommand` an empty DMA buffer"*) was the load-bearing half, and it was never run.
+2. ⛔ **The sentence this section is built on was mis-applied.** `context-monitoring.md`'s *"the UMD
+   uses the `SignalSynchronizationObjectFromGpuCb` callback to queue a software signal packet"* is
+   about a UMD signalling a fence **it created and holds the handle for** — which D3D11 does. A
+   D3D12 `ID3D12Fence` is the *runtime's*, and the driver is handed no handle for it at all. See
+   `DDI_REFERENCE.md` §10.4's correction block.
+3. ⚠ Citation drift: §7 cites `ROADMAP.md:2616-2621` for the probe result; that passage is now at
+   **`ROADMAP.md:2812-2818`**.
+
+**What still stands, unchanged and load-bearing:** dxgkrnl owns the monitored-fence mechanism; the
+miniport implements none of the fence DDIs; `MONITORED_FENCE_SIGNALED` is never raised (the only
+three interrupt types are `DMA_COMPLETED`, `CRTC_VSYNC`, `DMA_PREEMPTED`); and **the miniport's only
+involvement is retiring DMA packets.** That last clause is exactly why the conclusion inverted: the
+mechanism is sound and this driver puts **nothing on the context for it to order behind**. The fix
+is a real submission, not a new fence DDI — §14a.
 
 **Residual unknown, and its probe.** What is proven is the *primitive*. What has not been observed
 is a **D3D12-shaped** fence: the runtime creating a monitored fence, handing the driver its two GPU
@@ -691,7 +724,15 @@ Three *conditional* items, none required for a first frame:
 | C2 | Raise `SegmentTable::MAX` and add a segment | only if D3D12 needs a distinct heap segment | M | **High** — the cpu-host-must-be-LAST rule is Code-43 territory |
 | C3 | Revisit `ApertureSegmentCommitLimit` (64 MiB) | only if D3D12 residency budgets read too small | S (one const) | Medium — it is an advertised capability; needs a measurement first |
 
-### DDI arm — three items
+### ⛔⛔ DDI arm — REWRITTEN 2026-08-06. The three items below are HYGIENE; the real list is §14a
+
+The "three items, none required for the first triangle" framing was **wrong**, and it was wrong for
+a reason worth stating: it was derived from §7, whose conclusion (*"KMD work for D3D12 fences:
+none"*) rested on a probe that never issued a DMA packet. `D12-G8` rung 0 then failed, was measured,
+and the cause is a **missing kernel submission** — see §7's correction block and `DECISIONS.md`
+**D5a**. K1/K2/K3 remain valid and remain optional; they are simply not the D3D12 work.
+
+⇒ **The live work list is §14a.** K1/K2/K3 are retained below unchanged.
 
 | # | Item | Why | Evidence | Size | First triangle? | Risk to the working D3D11 desktop |
 |---|---|---|---|---|:--:|---|
@@ -709,6 +750,136 @@ Three *conditional* items, none required for a first frame:
   the app-visible VA is a Vulkan device address the host resolves (§8).
 - **Residency DDIs** — there are none to implement in this WDK (§9).
 - **Any of the 31 reachable-unset slots** — none is class (c) (§3.2).
+
+---
+
+## 14a. ⭐ THE LIVE WORK LIST — the D3D12 kernel submission, fences and present
+
+**Written 2026-08-06, after `D12-G8` rung 0 was measured and re-attributed.** Owner decision
+(`DECISIONS.md` **D5a**): *"stop gaps are not acceptable … doesn't matter if its complex or if
+changes are needed to be done in KMD."* There is no stopgap arm on this list, by instruction.
+
+### 14a.0 The one sentence
+
+The GPU work lands; nothing orders the application's `ID3D12Fence` behind it, because
+`pfnExecuteCommandLists` makes **no kernel submission** and the D3D12 runtime's only lever on a
+driver is *what dxgkrnl orders its monitored-fence signal behind* — the DMA packets on the queue's
+WDDM context. Measured: Helios `WaitForSingleObject` returns in **0.8–1.1 µs** against WARP's
+**561 µs**; the surface is **0/65536 exact at T+0 and 65536/65536 at +2000 ms**
+(`tmp/dx12/gates/G8-r0-settle/`). Present sits on top of the same context and the same callback, so
+the two are one piece of work.
+
+### 14a.1 ⛔ Two unknowns gate everything, and they are separable in ONE experiment
+
+Do not write anything below the experiment until the experiment has run.
+
+| id | Question | Why it decides the design |
+|---|---|---|
+| **UV1** | Does dxgkrnl release the runtime's queued monitored-fence signal behind **our** DMA packets? | If no, no amount of submission helps and the design needs a different lever entirely. Doc support is good (`context-monitoring.md:35,47`); **local proof is absent** — §7's cited `tools/vehicle_flipwait_probe.c` issues no `D3DKMTRender` and no `D3DKMTSubmitCommand`, so it proves sync-packet-vs-sync-packet ordering only. |
+| **UV3** | Does vkd3d's venus work retire at **host GPU completion** or at **decode**? | `RetireDomain::IncludingGpu` only means GPU completion for work on `ring_idx >= 1`. The ICD says outright: *"the synchronous SUBMIT_VENUS path does not yet propagate `batch->ring_idx` … per-ring async fencing is a later refinement"* (`icd/mesa/src/virtio/vulkan/vn_renderer_helios.c:3969-3973`). If D3D12 submits land on ring 0, a D3D12 fence gated `IncludingGpu` still reports **decode**, and it lies even with a perfect packet. |
+
+**The experiment, in three readings.** Land the UMD's bare `pfnRenderCb` (K-F1, below — zero KMD
+change), then read the probe's own `WaitForSingleObject signalled in N us` against the measured
+0.8–1.1 µs baseline:
+
+| reading | conclusion |
+|---|---|
+| N → real GPU time, no hold | **UV1 ✓ and UV3 ✓.** The design stands; everything after K-F5 is performance. |
+| N flat; with `WddmHoldMs=100` **scoped to that context**, N → ~100 ms | **UV1 ✓, UV3 ✗.** The packet works, the venus retirement domain is the bug. Fix the ring, not the submission. |
+| N flat under both | **UV1 ✗.** Say so loudly and stop — none of K-F3..K-F9 is the answer. |
+
+⭐ **UV3 is separately pre-checkable with ZERO code**: read `RING_SUBMIT_COUNT` /
+`RING_COMPLETE_COUNT` (`kmd_render/src/virtio/gpu/mod.rs:3502-3504`, `:4027-4029`) before and after
+a D3D12 run. Do this first; it costs one run.
+
+### 14a.2 The fence/completion bridge
+
+⭐ **The producer half needs no vkd3d fork patch.** `vkd3d_acquire_vk_queue` /
+`vkd3d_release_vk_queue` are upstream public interop API (`include/vkd3d.h:120-121`), and
+`d3d12_command_queue_acquire_serialized` (`libs/vkd3d/command.c:25202-25218`) pushes a
+`VKD3D_SUBMISSION_DRAIN` marker and waits until the worker has **submitted** everything enqueued —
+a CPU-side wait for `vkQueueSubmit`, **not** for GPU completion, so it costs no CPU/GPU overlap.
+This is the same discipline `HeliosWaitFrameSubmitted` gives the D3D11 present path.
+
+| # | Item | Where | Size | Class |
+|---|---|---|---|---|
+| **FB-1** | Latch the three context windows in `QueueState` and re-latch them after every `pfnRenderCb`. Today they are logged and **dropped on purpose** (`umd12/src/forward12/queue.rs:920-940`). ⚠ **Shared by both `pfnRenderCb` users** — the fence carrier and the present identity. Do it once. Copy `umd/src/forward/present.rs:868-897` and `umd_common/src/window.rs`, which already documents the D3D12 case. | `umd12` | S | **[C]** |
+| **K-F1** | The bare submission: drain → `pfnRenderCb` on `QueueState::h_context` → re-latch. **No boundary record.** It takes the existing fall-through at `gpu/mod.rs:5641` → `RetireDomain::IncludingGpu` + `watermark = next_wire_fence`. ⭐ **Zero KMD change**, and if UV1 holds this alone makes `ID3D12Fence` truthful. | `umd12` | S | **[C]** |
+| **K-F0** | The scoped hold knob, only if K-F1's reading is flat: `WddmHoldMs` + a fourth block arm in `take_one_ready_wddm` (`gpu/mod.rs:5735-5752`, three already) + `WfBHold`, released by the existing 60 Hz DISPATCH heartbeat (`adapter/kobj.rs:461-540`) with one added `request_wddm_completion_dpc`. ⛔ **Must be scoped to the D3D12 context** or the adapter-global FIFO stalls the whole desktop; N ≪ TdrDelay. | `kmd_render` | S | **[E]** |
+| **K-F2** | ⛔ **A LIVE DEFECT ON THE SHIPPING PRESENT PATH, independent of D3D12.** `present_stream_marker_boundary` (`gpu/mod.rs:4721-4744`) validates `ctx_id`/`value != 0`/`cookie`/`creator_process` and slot liveness but **never compares `value` against `slot.submitted_value`** — although both siblings on the tag path do (`prepare_present_stream_tag:4770`, `commit_present_stream_tag:4790`). A guest writing an absurd `present_value` gets a *live* boundary `present_stream_slot_ready` can never satisfy, and `wddm_pending` is an **adapter-global head-of-line FIFO**, so it stalls every context including DWM's until TDR. Its own commit. | `kmd_render` | S | **[C]** |
+| **K-F5** | Counters for the new arm, atomics only (DISPATCH), mirrored from the PASSIVE site `record_present_handoff_telemetry` (`submit_command.rs:108-181`). The `PmHit`/`PwExact`/`WfB*` family is the template. | `kmd_render` | XS | **[C]** |
+| **ICD-1** | `helios_venus_last_submitted_wire_fence(VkDevice, uint32_t *ctx_id, uint64_t *wire_fence)` — one new `uint64_t last_wire_fence_id` on `struct helios` (`vn_renderer_helios.c:472`), stored at `:1739` inside code that already holds `dev_mutex`, read under the same mutex. No thread affinity (unlike `helios_venus_instance_ctx_id`, which returns a `_Thread_local`). Export beside the existing block at `:619-632`. | `icd/mesa` | XS | **[P]** |
+| **K-F3** | The boundary record, declared **once** in `protocol/` per D13, with its **own magic**. ⛔ Not `HeliosPresentRenderCmd` — `HeliosPresentPrivateData::is_valid()` requires `resource_id != 0` and an ECL has no primary. ⛔ Not `HeliosPresentRefreshCmd` — its `dxgkddi_render` arm unconditionally arms a scanout refresh (`submit_command.rs:1064`), which a compute or graphics ECL must not do. | `protocol` | S | **[P]** |
+| **K-F4** | Decode K-F3 in `dxgkddi_render` and write the wire fence into `PresentSubmissionPrivate.gpu_fence_id` via `merge_fence` (`present_packet.rs:299-344`). ⚠ **`dxgkddi_render` never touches `pDmaBufferPrivateData` today** — every hit in `submit_command.rs` is on the `submit` arg. `DXGKARG_RENDER` has both fields. Write at offset 0, do not advance the pointer, which is the shape Present already proves. ⭐ Everything downstream is already correct **and already guarded**: `gpu/mod.rs:5609-5616` rejects a guest value `>= next_wire_fence` — *"must not manufacture an impossible future dependency"*. | `kmd_render` | S | **[P]** |
+
+⚠ **Do not add a new private-data record.** `PRESENT_DMA_PRIVATE_DATA_BYTES = 88` with
+`PresentSubmissionPrivate` 32 at offset 0 and `PresentFlipPrivate` 56 at offset 32 — **exactly
+full**, with compile-time asserts (`present_packet.rs:231-241`) written to force the issue. Reusing
+`gpu_fence_id` costs zero bytes.
+
+⚠ **One silent-lie hazard to guard**: `DmaGpuFence=0` routes a D3D12 packet to
+`RetireDomain::DecodeOnly` (`gpu/mod.rs:5599`) and makes the fence lie quietly. Default is 1.
+
+### 14a.3 Present — the kernel-allocation-identity bridge
+
+⭐ **The shape is not "the ICD hands over its `D3DKMT_HANDLE`" (it has none that means anything —
+its only `D3DKMTCreateAllocation2` mints a `kind = TRACKING` VidMm charge the KMD forbids from
+carrying identity, `create_allocation.rs:2333-2344`) and not "`umd12` allocates and the ICD
+imports" (backwards). It is the third shape, the one D3D11 ships: the engine allocates the Vulkan
+memory, and the UMD ADOPTS it** by calling `pfnAllocateCb` with
+`HeliosWddmAllocPrivate.adopt_resource_id = <venus resid>`.
+
+**The KMD already accepts exactly that** — `create_allocation.rs:2377-2379`,
+`kind == DEVICE_MEMORY && adopt_resource_id != 0` → `AllocationBacking::AdoptedUmdResource`, with
+`write_open_identity` stamping `HeliosWddmOpenIdentity` back so DWM's D3D11 opener works unchanged.
+⇒ **no new allocation shape, no new KMD verb.**
+
+| # | Item | Where | Size | Rung |
+|---|---|---|---|---|
+| **UP-1** | Take the `helios_protocol` dependency and reuse `HeliosWddmAllocPrivate` / `Meta` / `OpenIdentity` / `PresentPrivateData` / `PresentRenderCmd` **byte for byte** (D13). `resource12.rs:76-96` states their absence as a deliberate outcome — this is the commit that ends it. | `umd12` | XS | 1 |
+| **UP-2** | ⭐ **A ~20-line vkd3d method, not an M-sized patch.** `ID3D12DXVKInteropDevice3::GetVulkanHeapInfo` (`libs/vkd3d/device_vkd3d_ext.c:1123-1146`) already returns `{VkDeviceMemory, offset, vk_memory_type}` for an `ID3D12Heap`; a **committed** resource has no `ID3D12Heap`, and `GetVulkanResourceInfo1` returns the `VkImage`/`VkBuffer`, not the memory. Add the sibling — an `ID3D12DXVKInteropDevice4::GetVulkanResourceMemoryInfo(ID3D12Resource*, …)` reading `resource->mem.device_allocation.{vk_memory, vk_memory_type}` and `.offset` — same file, same shape, same guards. | vkd3d fork | S | 1 |
+| **UP-3** | Force **dedicated + venus-exportable** memory for resources created under `D3D12DDI_HEAP_FLAG_PRIMARY`. Two hazards, both real: vkd3d suballocates committed textures unless `prefersDedicatedAllocation` (`libs/vkd3d/resource.c:4434-4461`) — one venus resid covering several D3D12 resources breaks both the one-resource-one-allocation rule and D3D11's `memory_offset == 0` precondition (`umd/src/forward/resource.rs:488-490`); and vkd3d chains `VkExportMemoryAllocateInfo` only for `D3D12_HEAP_FLAG_SHARED`, which a back buffer does not set. ⛔ Do **not** reach it by passing `SHARED` through — `VK_KHR_external_memory_win32` is absent on this device and vkd3d chains the export info unguarded. | vkd3d fork | M | 1 |
+| **UP-4** | The resource→identity table: every `pfnCreateHeapAndResource` records `{engine res*, vk_memory, offset, size, venus res_id, venus_alloc_size, memory_type_index, geometry, is_primary}`. Stays local to `umd12` per D13's refinement. ⭐ The trigger is **already detected and counted**: `D3D12DDI_HEAP_FLAG_PRIMARY = 16` arrives and is dropped at `resource12.rs:630-645` (`HeapPrimaryFlagDropped`); `D3D12DDI_RESOURCE_OPTIMIZATION_FLAG_PRIMARY = 4` is the second signal. | `umd12` | M | 1 |
+| **UP-5** | Call the corelayer `pfnAllocateCb` (`D3D12DDICB_ALLOCATE_0022`) for presentable resources with `kind = DEVICE_MEMORY`, `adopt_resource_id`, `Flags = PRIMARY`, `Reserved[5]` **zeroed** (`Reserved fields in D3D12DDI_ALLOCATION_INFO_0022 were not zero.` is a runtime string), then `helios_venus_memory_transfer_resource_ownership` (`vn_renderer_helios.c:806`). Unwind on failure. | `umd12` | M | 1 |
+| **UP-6** | `pfnCheckResourceAllocationHandle` returns the real handle; `pfnGetDebugAllocationInfo` fills its four fields. ⚠ **Re-grade both counters** — today they are graded for a driver that has no handles. | `umd12` | XS | 1 |
+| **UP-7/8/9** | The three L8 slots: `pfnGetPresentPrivateDriverDataSize` (0, with a 72-byte arm behind a knob for U6's arrival half), `pfnPresent` (fill `BroadcastSrc/DstAllocation[0]`, `AddedGpuWork=FALSE`, `SyncIntervalOverrideValid=FALSE`, `_CONTEXTS.hContext = QueueState::h_context`, `_HWQUEUES.BroadcastQueueCount = 0`; **null-check both `_Out_opt_`s** — `D12-G5` saw `pHwQ` non-NULL at `_0040` and NULL at `_0110`), and the identity `pfnRenderCb` carrying `HeliosPresentRenderCmd`. | `umd12` | M | 1 |
+| **KP-1..5** | KMD present items: **counters and one measurement, no structural work.** `P12sub`/`P12take`/`P12ref` (≤14 chars, `diag.rs:471`); the `PBIdOk` decode behind `DiagLevel >= 1`; and ⚠ **attribute which `DxgkDdiPresent` arm a D3D12 windowed present takes** — the measured `pfnPresent` carries `DXGI_DDI_PRESENT_FLAG_Blt` (`Flags = 0x21`), and `DXGI_DDI_PRESENT_FLAGS` ≠ `DXGK_PRESENTFLAGS`; the mapping is established nowhere. | `kmd_render` | XS | 1 |
+
+⭐ **Rung 1 needs no new KMD scanout work.** DWM composites, so the app's back buffer is opened by
+**DWM's D3D11 device** through `helios_umd.dll`'s existing `pfnOpenResource` reading
+`HeliosWddmOpenIdentity`. `umd12`'s `pfnOpenHeapAndResource` serves the *other* direction of D3c and
+is **not** on rung 1's path. Fullscreen flip is where `PresentFlipPrivate`, the D2 identity/epoch
+gate and `set_scanout_blob` engage — later, and deliberately not scoped here.
+
+### 14a.4 Ordering, and why
+
+1. ⛔ **The fence bridge first, and it is not negotiable.** A present built on an untruthful fence
+   presents an unfinished frame — and would be misread as a present bug. Rung 1 cannot pass while
+   rung 0 fails.
+2. **FB-1 is shared by both `pfnRenderCb` users.** Land it once, in the fence work.
+3. **`P7` — does `DxgkDdiRender` fire on the D3D12 path — is settled by the fence work for free.**
+   `RENDER_COUNT` (`submit_command.rs:996`) moving is the whole test. Do not spend a gate on it.
+4. **The allocation-identity bridge does NOT block the fence bridge**: `D3DDDICB_RENDER` names its
+   target by `hContext` and needs no driver-minted `D3DKMT_HANDLE`. ⇒ UP-1…UP-6 can be written in
+   parallel with the fence measurement, and should be — the vkd3d work plus a new table is the long
+   pole.
+5. **K-F4 and UP-9 touch the same `dxgkddi_render` region.** Land the KMD side once, with both
+   callers in view.
+6. **K-F2 is independent of all of it** and is a live defect today. It can land first, alone.
+
+### 14a.5 ⛔ What must NOT be done
+
+* **No producer-side CPU stall to "fix" the ordering** — rejected by the owner and by
+  `umd/src/knobs.rs:31-43`'s standing directive. `tmp/dx12/FENCE-BRIDGE-DESIGN.md` design A is
+  recorded there as rejected; do not re-propose it.
+* **No design routed through `pfnSignalFence`.** Measured: it is **never called** on this driver
+  (`FenceSignalForwarded=0`, and no trace line ever emitted), matching the WARP observation in
+  `DDI_REFERENCE.md` §14.0.
+* **No `pfnSignal*Cb` for the application's fence.** `D3D12DDI_FENCE` carries no `D3DKMT_HANDLE` and
+  no `hRTFence`, and every such callback names its target by `D3DKMT_HANDLE` — see
+  `DDI_REFERENCE.md` §10.4's correction block.
+* **No `pfnSubmitCommandCb`.** This queue's context is legacy by a decision taken inside
+  `pfnCreateCommandQueue`; the pair is `pfnCreateContextCb` → `pfnRenderCb`.
 
 ---
 
@@ -786,7 +957,12 @@ DDI."*
    WDDM 2.0 is the D3D12 floor, so 2.1 clears it.
 4. **One** engine node, `DXGK_ENGINE_TYPE_3D`, ordinal 0 only.
 5. D3D12 queue class → WDDM node is a **UMD** decision.
-6. Monitored fences work today with **zero** KMD support beyond DMA-packet retirement.
+6. Monitored fences work today with **zero** KMD support beyond DMA-packet retirement. ⚠ **And the
+   rider is the whole D3D12 fence defect (§7's correction, §14a):** "beyond DMA-packet retirement"
+   is not a small print — retirement of packets *on the waiting context* is the entire lever, and a
+   client that submits no packets gets a fence that signals immediately. What was proven is the
+   primitive between two **software sync packets**; the DMA-packet dependency is **UV1** and is
+   unmeasured.
 7. Guest GPU page tables are **decorative**; the host GPU owns the real MMU.
 8. Segment topology is `[Aperture id 1, Bar id 2]`, `SegmentTable::MAX = 2`, and a
    `SupportsCpuHostAperture` segment must be **LAST**.

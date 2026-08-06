@@ -3733,7 +3733,8 @@ silent on it:
   removed. L2's own append-only refusal-array rule was violated by the commit that quotes
   it. ⇒ when a grading is a cross-reference to another slot's state, check that state at the
   **end** of the merge, not at the moment of writing.
-- ⛔⛔ **`D12-G8` RUNG 0 FAILED, and the failure is ATTRIBUTED — this is the open defect.**
+- ⛔⛔ **`D12-G8` RUNG 0 FAILED. ⚠ ITS FIRST ATTRIBUTION WAS WRONG; the corrected one is
+  "the fence does not wait for the work", four bullets down.**
   `tools/d3d12_clear_probe.cpp` is new (`GATES.md` §4.9 has named it as rung 0 since it was
   written; it did not exist). It renders offscreen, copies back through a placed footprint
   and compares integers — no swapchain, no DWM, no shaders. Full account:
@@ -3745,22 +3746,94 @@ silent on it:
     `Umd12Trace=1`: `ResetCommandList` (`type=0 allocatorType=0`, classes matched),
     `ClearRenderTargetView`, `ResourceBarrier lowered=1`, `CopyTextureRegion`, `Close` S_OK,
     `ExecuteCommandLists`, `Signal` S_OK, fence `completed=1`, `Map` S_OK.
-    **And nothing executes.**
-  - ⭐ **`pfnMapHeap` is ELIMINATED, by the probe's new `--sentinel` arm.** A CPU byte
-    pattern written into the readback buffer before recording comes back **262144 of 262144
-    bytes intact** on Helios and is entirely gone on WARP. So the mapping is coherent and not
-    one byte of GPU output reaches the destination — which also eliminates every partial-copy
-    story (a wrong pitch, footprint or block-vs-texel error would leave a *mixture*).
-  - **What remains, in order**: (1) the recorded commands never reach the
-    `ID3D12GraphicsCommandList` that is submitted, or reach it in a state vkd3d discards —
-    next instrument is a `trace_line!` in `pfnExecuteCommandLists` printing each list pointer
-    against the one `pfnResetCommandList` traced, one deploy cycle; (2) the engine executes
-    but the work never reaches the host — `EclNoWddmSubmission=1` is the standing gap, and
-    the D3D11 proof that work flows out-of-band through the venus ICD is proven for **DXVK on
-    its own Vulkan device**, not for vkd3d driven through this DDI; (3) the fence signals
-    without the work completing (`FenceBottomOfPipeUnproven=1`).
-  - ⚠ **vkd3d's own `WARN`/`FIXME` are compiled out of the static build** — `VKD3D_DEBUG=warn`
-    produces nothing. Restoring them for one build is probably the cheapest instrument after (1).
+  - ⛔⛔ **THE 2026-08-06 ATTRIBUTION ABOVE WAS WRONG AND IS SUPERSEDED. THE GPU WORK LANDS;
+    THE FENCE DOES NOT WAIT FOR IT.** Measured by the `--settle` arm,
+    `tmp/dx12/gates/G8-r0-settle/`: on Helios `WaitForSingleObject` returns in **0.8–1.1 µs**
+    against WARP's **561 µs**, the surface is **0/65536 exact at T+0** and **65536/65536
+    exact at +2000 ms** (and again after an `Unmap`+`Map`), every mapped pointer is the same
+    address throughout, and `GetDeviceRemovedReason` is `0` at every point. Three arms,
+    identical result. ⇒ ***`EclNoWddmSubmission=1` is not a standing gap, it is the
+    defect.*** The application's `ID3D12Fence` completes with **no causal dependency on the
+    engine's Vulkan work**, so the probe maps and reads before the guest → venus → host copy
+    has landed. Suspect (3) — ranked last — was the answer.
+  - ⛔ **The `--sentinel` elimination of `pfnMapHeap` was an INVALID INFERENCE**, even though
+    heap identity does happen to be sound. A CPU write/read round-trip proves the mapping is
+    *self-consistent*; it says nothing about whether the GPU wrote those bytes. The same
+    reading is produced by "the work has not landed **yet**", which is what was happening.
+    (Identity is separately fine: both resources take the committed arm, so
+    `HeapState::map_anchor` **is** the copy destination, and `pfnCheckSubresourceInfo`
+    reports offset 0 for subresource 0.)
+  - ⛔ **"vkd3d's own `WARN`/`FIXME` are compiled out of the static build" was FALSE, and the
+    evidence was already on the VM.** `vkd3d-proton-helios/meson.build:53-55` defines only
+    `-DVKD3D_NO_TRACE_MESSAGES`; `VKD3D_NO_DEBUG_MESSAGES` is defined nowhere in the fork, so
+    only `TRACE` is out. Nothing appeared on stderr because
+    **`umd12/bridge/vkd3d_bridge.cpp:216-244` redirects the engine's log to
+    `C:\ProgramData\Helios\umd12-<pid>-vkd3d.log`**, and `tmp/dx12/run-g8r0.ps1:99` collected
+    only `umd12-<pid>.log`. The failing run's own `VKD3D_DEBUG=warn` log is now at
+    `tmp/dx12/gates/G8-r0/umd12-3040-vkd3d.log`: **zero `err:` and zero `warn:` from
+    `ClearRenderTargetView`, `CopyTextureRegion`, `Close`, `ExecuteCommandLists` or
+    `Signal`** — which is what refutes every silent-drop path in the engine, since each of
+    them logs at WARN or ERR (`libs/vkd3d/command.c:22827`, `:10360`, `:10367`, `:24402`,
+    `:24631`, `device.c:12047`) and `b_ndebug` defaults false so vkd3d's asserts are live.
+    ⇒ *the log sink is part of the instrument; an absent output is not an absent finding.*
+  - ⭐ **Settled for free by the same run: vkd3d's GPU work DOES flow out-of-band through the
+    venus ICD with no WDDM submission.** That was recorded as proven for *DXVK on its own
+    Vulkan device* only; a second `VkDevice` in the process now demonstrably renders and
+    copies. `DDI_REFERENCE.md` §8.3's doubt on this point can be closed.
+  - **The fix is a fence/completion bridge**, designed and costed in
+    `tmp/dx12/FENCE-BRIDGE-DESIGN.md`. ⛔ The obvious route is **not buildable**:
+    `D3D12DDI_FENCE` is `{FenceValue.BaseAddress, FenceMonitoredValue.BaseAddress, Flags}`
+    (`d3d12umddi.rs:51094-51098`) with **no `D3DKMT_HANDLE` and no `hRTFence`**, both
+    `BaseAddress`es arrive **0**, and every `pfnSignal*Cb` names its target by
+    `D3DKMT_HANDLE` (`:20949-20953`, `:21053-21064`) — so the driver can never name the
+    application's fence. ⚠ `DDI_REFERENCE.md` §10.4's row *"`pfnSignalFence` →
+    `pfnSignalSynchronizationObjectFromGpuCb`"* is a reconstruction that cannot be
+    implemented; four comment sites in `fence.rs`/`queue.rs` inherit it.
+  - ⛔ **A SECOND DEFECT, downstream of the same root cause: prompt teardown WEDGES and loses
+    the Vulkan device.** The one arm that tore down immediately after the fence wait (no
+    `--settle`) never exited — 4 threads in Wait, and the only two `err:` lines of the whole
+    round: `d3d12_command_allocator_Release: … still 1 pending command lists awaiting
+    execution …! Deferring release`, `d3d12_command_queue_wait_idle: Failed to wait for
+    virtual queue idle, vr -4`, then `d3d12_device_mark_as_removed: … VK_ERROR_DEVICE_LOST`.
+    Nothing ties object lifetime to engine completion either, so an application that believes
+    its own fence destroys objects with work in flight. ⚠ **Not deterministic** — the
+    identical arm completed in the previous round — and **no host-side evidence**:
+    `/tmp/helios-qemu-stderr.log` has no entry for the window. Blast radius was nil (dwm
+    survived, desktop composited), but a lost `VkDevice` inside the process-shared venus ICD
+    module is a stability risk the fence bridge has to close too, not just a correctness one.
+  - ⛔⛔ **OWNER DECISION 2026-08-06: no stopgap. Design C — the real `pfnRenderCb` submission,
+    with the KMD changes it needs.** *"stop gaps are not acceptable, we must do the correct,
+    expected and performant implementation, do it right the first time. doesn't matter if its
+    complex or if changes are needed to be done in KMD. … the next session is going to focus on
+    kmd changes to unblock the UMD."* ⇒ `DECISIONS.md` **D5a**; the full, ordered work list is
+    **`docs/dx12/KMD_IMPACT.md` §14a**, which replaces that document's "three items, none
+    required for the first triangle".
+  - ⭐ **The instrument round landed and settled three things** (`tmp/dx12/gates/G8-r0-F1-*`):
+    **`pfnSignalFence` is NEVER CALLED** — `FenceSignalForwarded=0` and no trace line ever
+    emitted, matching `DDI_REFERENCE.md` §14.0's WARP reading, so any design routed through
+    that slot is dead; the resolved copy footprint is **exact** (`fmt=28, 256x256x1,
+    rowPitch=1024, off=0`, matching the probe's own `GetCopyableFootprints`); and record →
+    `Close` → ECL is provably **one list** (the closed list's `pDrvPrivate` is byte-identical to
+    the submitted entry). ⚠ The two knob-gated delays could **not** answer whether the runtime's
+    fence advance rides our context: delaying a slot that is never entered measures nothing, and
+    delaying the end of ECL only shifts everything in time when the context carries no packets.
+    ⛔ With `Umd12EclDelayUs=50000` rung 0 **passed** while the fence wait stayed **0.6 µs** —
+    pixels correct, dependency absent. *A gate that reads only the exit code would have called
+    that a fix.*
+  - **The two unknowns that gate C, and the one experiment that separates them** — `KMD_IMPACT.md`
+    §14a.1. **UV1**: does dxgkrnl release the runtime's queued monitored-fence signal behind *our*
+    DMA packets? **UV3**: does vkd3d's venus work retire at host GPU completion or at **decode**?
+    (The ICD says the synchronous `SUBMIT_VENUS` path does not propagate `ring_idx`, and
+    `IncludingGpu` only means GPU completion for `ring_idx >= 1`.) ⭐ **The first step needs ZERO
+    KMD change**: `dma_gpu_fence` defaults to 1, so a bare `pfnRenderCb` already takes
+    `RetireDomain::IncludingGpu` + `watermark = next_wire_fence` in shipped, exercised code.
+  - ⛔ **A LIVE DEFECT ON THE SHIPPING PRESENT PATH, found on the way and independent of D3D12**:
+    `present_stream_marker_boundary` (`virtio/gpu/mod.rs:4721-4744`) never compares `value`
+    against `slot.submitted_value`, although both siblings on the tag path do
+    (`prepare_present_stream_tag:4770`, `commit_present_stream_tag:4790`). A guest-supplied
+    `present_value` ahead of anything submitted yields a *live* boundary that can never be
+    satisfied — and `wddm_pending` is an **adapter-global head-of-line FIFO**, so it stalls every
+    context including DWM's until TDR. `KMD_IMPACT.md` §14a.2 **K-F2**; its own commit.
 - ⭐ **Three UNVERIFIED rows from `G7-s6r1` are SETTLED by that run**, and they needed it:
   **U-B** — `pfnCreateContextCb` succeeds for a D3D12 queue (`CreateCommandQueue:
   CreateContext hr=0 hContext=0x… cmd=…/262144 allocList=…/256 patchList=…/256`).
@@ -3776,8 +3849,16 @@ silent on it:
   D3DKMT, `resource12.rs`'s `pfnCheckResourceAllocationHandle` answers **0** and says so, and
   `DDI_REFERENCE.md` §9.7 already records that *"pure passthrough with no `pfnAllocateCb` is
   not viable"*. The D3D11 driver, which presents successfully, **calls `pfnAllocateCb`
-  itself** (`umd/src/forward/resource.rs:217`, `:370`, `:459`; it feeds `hSrcAllocation` at
-  `present.rs:1164`). ⇒ the gap is a **kernel-allocation-identity bridge at the L4/L8 seam**,
+  itself** — ⚠ **one** call site, not three: the fn-ptr fetch is `umd/src/forward/resource.rs:217`,
+  the call is **`:374`**, the success return is `:459`, and it has four callers (tex2D/primary
+  `:543`, buffer `:804`, tex1D `:1143`, tex3D `:1235`); it feeds `hSrcAllocation` at
+  `present.rs:1164`. ⭐ **And the shape is ADOPT, not import**: the engine allocates the Vulkan
+  memory first (`resource.rs:1045`), the UMD reads it back (`:487`) and wraps it with
+  `HeliosWddmAllocPrivate.adopt_resource_id` (`:300`), then transfers ownership (`:561`). **The KMD
+  already accepts exactly that arm** (`create_allocation.rs:2377-2379` →
+  `AllocationBacking::AdoptedUmdResource`), so present needs **no new KMD allocation shape**. The
+  full field-by-field scope is `docs/dx12/KMD_IMPACT.md` **§14a.3**. ⇒ the gap is a
+  **kernel-allocation-identity bridge at the L4/L8 seam**,
   which is also where `DECISIONS.md` D3c and `PARALLEL.md` §5's *"the first lane that needs a
   crossing record adds it"* finally bite. `D12-G8` rungs 1 and 2 are blocked on it; rung 0 is
   not, and rung 0 is where the current defect lives.
