@@ -55,6 +55,21 @@
 //! omitted, it is vacuous: it is "one `from_raw` per **owning entry point**",
 //! and S4 has none.
 
+// ⚠ `too_many_arguments` is allowed for this MODULE and not for a function,
+// because the lint fires on a declaration inside a `#[cxx::bridge]` block and cxx
+// passes through only a fixed set of attributes — an `#[allow]` on the extern `fn`
+// itself is not one of them.
+//
+// The declaration it fires on is `resource_venus_identity`, and its width is the
+// FFI's shape rather than a design choice: the alternative is a shared `#[repr(C)]`
+// struct, which cxx emits into its own generated header — a header
+// `vkd3d_bridge.cpp` deliberately does not include (it hand-declares every
+// signature instead, see `vkd3d_bridge.h`'s banner), and which itself includes
+// `vkd3d_bridge.h`. So a struct out-param would mean either a duplicated POD
+// declaration or an include cycle. Seven out-params it is, cleared by the C++ side
+// before anything that can fail. The precedent is `umd/src/bridge.rs:315`, the same
+// lint on the same kind of accessor in the D3D11 bridge.
+#[allow(clippy::too_many_arguments)]
 #[cxx::bridge]
 mod ffi {
     unsafe extern "C++" {
@@ -76,6 +91,47 @@ mod ffi {
         /// captured at create time on the creating thread. 0 if the ICD is
         /// absent or too old to export it.
         fn venus_context_id(self: &HeliosVkd3dDevice) -> u32;
+
+        /// The **instance-scoped** venus context id (UP-5), captured at create
+        /// time on the creating thread. 0 if the ICD is absent or predates
+        /// `helios_venus_instance_ctx_id`.
+        ///
+        /// ⛔ This is the one an allocation identity may be stamped with;
+        /// [`venus_context_id`](Self::venus_context_id) is process-global and
+        /// `umd_common/bridge/bridge_icd_anchor.h` forbids stamping it.
+        fn venus_instance_context_id(self: &HeliosVkd3dDevice) -> u32;
+
+        /// The venus identity of the memory an `ID3D12Resource` is bound to
+        /// (UP-2c). See the Rust wrapper
+        /// [`BridgeDevice12::resource_venus_identity`].
+        ///
+        /// # Safety
+        /// `resource` is an `ID3D12Resource*` as a `usize`, **BORROWED** and
+        /// created by this bridge's engine; all seven out-pointers must address
+        /// writable storage and are written on every path.
+        unsafe fn resource_venus_identity(
+            self: &HeliosVkd3dDevice,
+            resource: usize,
+            out_vk_memory: *mut u64,
+            out_memory_offset: *mut u64,
+            out_memory_size: *mut u64,
+            out_memory_type_index: *mut u32,
+            out_venus_res_id: *mut u32,
+            out_venus_alloc_size: *mut u64,
+            out_status: *mut u32,
+        ) -> bool;
+
+        /// Hand the venus resource behind `resource`'s memory to the WDDM
+        /// allocation that has just adopted it (UP-5). Returns the res_id it
+        /// transferred, or 0 — which is a defect, see the wrapper.
+        ///
+        /// # Safety
+        /// As [`resource_venus_identity`](Self::resource_venus_identity)'s
+        /// `resource`.
+        unsafe fn transfer_resource_ownership(
+            self: &HeliosVkd3dDevice,
+            resource: usize,
+        ) -> u32;
 
         /// Create a vkd3d device on the Helios adapter identified by the split
         /// LUID. Returns a null `UniquePtr` on failure (adapter not found,
@@ -193,6 +249,206 @@ impl BridgeDevice12 {
     /// `VkDeviceMemory`/`VkInstance` handles.
     pub(crate) fn venus_context_id(&self) -> u32 {
         self.get().map_or(0, |d| d.venus_context_id())
+    }
+
+    /// The **instance-scoped** venus context id — the one an allocation identity
+    /// may carry (UP-5).
+    ///
+    /// ⛔ Not interchangeable with [`Self::venus_context_id`], and the difference
+    /// is a live hazard rather than a preference. That one reads the ICD's
+    /// process-global `helios_current_ctx_id`, which is last-writer-wins across
+    /// `VkInstance` creations; `umd_common/bridge/bridge_icd_anchor.h` states the
+    /// rule outright — *"evidence only. Never stamp an identity with this
+    /// value"*. This one reads `helios_venus_instance_ctx_id`, a `_Thread_local`
+    /// written by the CTX_CREATE of the thread that created **this** device's
+    /// instance, which no concurrent create can replace.
+    ///
+    /// 0 means the ICD is absent or predates the export. ⚠ A 0 is not fatal: the
+    /// KMD's adopt path never reads `ctx_id` (`helios_protocol::classify` returns
+    /// `AdoptedUmdResource` from `adopt_resource_id` alone, and the adopt arm of
+    /// `build_backing` does not consult it), so the field is a diagnostic that
+    /// reaches `HeliosWddmOpenIdentity::ctx_id` — which that record's own doc
+    /// calls *"diagnostic only"*. It is counted rather than refused for exactly
+    /// that reason.
+    pub(crate) fn venus_instance_context_id(&self) -> u32 {
+        self.get().map_or(0, |d| d.venus_instance_context_id())
+    }
+
+    /// The venus identity of the memory an `ID3D12Resource` is bound to.
+    ///
+    /// Returns the fields **and** the status, always. ⭐ The fields are readable
+    /// even when the status is not [`IdentityStatus::Resolved`], deliberately: on
+    /// [`IdentityStatus::IcdRefused`] the engine half (`vk_memory`, `offset`,
+    /// `size`, `memory_type_index`) is real and the venus half is 0, and that
+    /// combination is the single most informative log line on this path — it says
+    /// *"vkd3d bound this memory and the ICD has no venus resource for it"*, i.e.
+    /// the export chain did not engage. Collapsing it to `None` would throw away
+    /// the evidence that distinguishes it from *"this resource has no memory"*.
+    ///
+    /// ⛔ **Only `Resolved` may be used to build an allocation.** Every other
+    /// status leaves `venus_res_id == 0`, and 0 is precisely the value that makes
+    /// the KMD *create* a resource instead of adopting ours
+    /// (`create_allocation.rs:2377`), so passing one through would silently
+    /// produce an allocation backed by memory nothing renders into.
+    ///
+    /// # Safety
+    /// `resource` must be a live `ID3D12Resource*` **created by this bridge's
+    /// vkd3d engine**, valid for the duration of the call. It is borrowed: no
+    /// reference is taken and none is released. ⛔ A resource from any other D3D12
+    /// implementation would be `CONTAINING_RECORD`-cast to a
+    /// `struct d3d12_resource` it is not.
+    pub(crate) unsafe fn resource_venus_identity(
+        &self,
+        resource: usize,
+    ) -> (ResourceVenusIdentity, IdentityStatus) {
+        let mut id = ResourceVenusIdentity::default();
+        let mut raw_status: u32 = 0;
+        let Some(device) = self.get() else {
+            return (id, IdentityStatus::BadArg);
+        };
+        // SAFETY: the caller's guarantee above is exactly the cxx declaration's
+        // precondition, and every out-pointer addresses a live local for the whole
+        // call. The C++ side clears all seven before anything that can fail, so
+        // they are defined on every path including a `false` return.
+        let resolved = unsafe {
+            device.resource_venus_identity(
+                resource,
+                &mut id.vk_memory,
+                &mut id.memory_offset,
+                &mut id.memory_size,
+                &mut id.memory_type_index,
+                &mut id.venus_res_id,
+                &mut id.venus_alloc_size,
+                &mut raw_status,
+            )
+        };
+        let status = IdentityStatus::from_raw(raw_status);
+        // ⛔ The intersection, not either alone. The C++ side returns `true` on
+        // exactly the path that sets `RESOLVED`, so the two agree by construction
+        // today — and this is an FFI the type system cannot check, so a future
+        // divergence must fall to the SAFE side rather than to whichever field the
+        // caller happened to read.
+        if resolved && matches!(status, IdentityStatus::Resolved) {
+            (id, IdentityStatus::Resolved)
+        } else if matches!(status, IdentityStatus::Resolved) {
+            (id, IdentityStatus::Unknown(raw_status))
+        } else {
+            (id, status)
+        }
+    }
+
+    /// Hand the venus resource behind `resource`'s memory over to the WDDM
+    /// allocation that has just adopted it. Returns the transferred res_id, or 0.
+    ///
+    /// ⛔ **Call only AFTER `pfnAllocateCb` has succeeded**, and treat a 0 as a
+    /// defect rather than a degraded read: the ICD stops unref'ing the host
+    /// resource only once this has run, so a 0 leaves the resource owned by both
+    /// the ICD and the kernel allocation and it is unref'd twice — the res-45
+    /// invalid-import class `create_allocation.rs`'s adopt arm exists to prevent.
+    /// Transferring *before* the allocation would be the mirror-image bug: an
+    /// allocation failure would then leave the resource owned by nobody.
+    ///
+    /// # Safety
+    /// As [`Self::resource_venus_identity`].
+    pub(crate) unsafe fn transfer_resource_ownership(&self, resource: usize) -> u32 {
+        let Some(device) = self.get() else {
+            return 0;
+        };
+        // SAFETY: as `resource_venus_identity`; no out-params.
+        unsafe { device.transfer_resource_ownership(resource) }
+    }
+}
+
+/// The venus identity of one `ID3D12Resource`'s bound memory.
+///
+/// ⚠ Plain integers, `Default`-constructible, and **not** a validity claim: a
+/// value of this type says nothing about whether the identity resolved. The
+/// paired [`IdentityStatus`] is the only thing that does, which is why
+/// [`BridgeDevice12::resource_venus_identity`] returns them together and never
+/// one without the other.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct ResourceVenusIdentity {
+    /// The `VkDeviceMemory` the resource's image or buffer is BOUND to, as a
+    /// 64-bit handle. ⚠ For a CPU-accessible texture this is `private_mem`, not
+    /// the host-visible staging buffer — the engine method branches with the bind
+    /// site, which is what makes it *the memory the image is bound to* rather than
+    /// *the resource's first allocation*.
+    pub(crate) vk_memory: u64,
+    /// The resource's byte offset within `vk_memory`. ⚠ **Must be 0 for anything
+    /// that gets a WDDM allocation.** One venus resource id covering several D3D12
+    /// resources breaks the one-resource-one-allocation rule, and the D3D11 adopt
+    /// path requires `memory_offset == 0` outright
+    /// (`umd/src/forward/resource.rs:488-490`).
+    pub(crate) memory_offset: u64,
+    /// The whole `VkDeviceMemory`'s `VkMemoryAllocateInfo::allocationSize`, as
+    /// vkd3d recorded it — **not** the resource's size.
+    pub(crate) memory_size: u64,
+    /// vkd3d's `memoryTypeIndex` for `vk_memory`.
+    pub(crate) memory_type_index: u32,
+    /// The venus resource id backing `vk_memory`, i.e. the value that becomes
+    /// `HeliosWddmAllocPrivate::adopt_resource_id`. Non-zero only on
+    /// [`IdentityStatus::Resolved`].
+    pub(crate) venus_res_id: u32,
+    /// The ICD's own record of the creating `vkAllocateMemory`'s `allocationSize`.
+    /// Expected to equal [`Self::memory_size`] — two independent sources for one
+    /// number, kept apart so a disagreement is visible.
+    pub(crate) venus_alloc_size: u64,
+}
+
+/// Why a resource's venus identity came back as it did.
+///
+/// ⛔ Seven outcomes and not a `bool`, for the reason [`FenceStatus`] gives: they
+/// are different findings and sharing one counter produces exactly the
+/// un-attributable number this project has corrected four times in the KMD's own
+/// counters. In particular [`Self::IcdRefused`] — *"vkd3d bound memory the ICD has
+/// no venus resource for"* — is the one that says the export chain
+/// (`VKD3D_HEAP_FLAG_HELIOS_VENUS_EXPORT`) did not engage, and it must never be
+/// confused with [`Self::EngineRefused`], which says the resource has no memory at
+/// all.
+///
+/// ⚠ **The numbers are the C++ side's** — `HELIOS_VKD3D_IDENTITY_*` in
+/// `umd12/bridge/vkd3d_bridge.h`, the single declaration. [`Self::Unknown`] exists
+/// rather than a catch-all arm so a drift is loud instead of absorbed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IdentityStatus {
+    /// Everything answered; `venus_res_id` and `venus_alloc_size` are real.
+    Resolved,
+    /// A null resource, or no device behind the bridge.
+    BadArg,
+    /// This engine build has no `ID3D12DXVKInteropDevice4`.
+    NoInterop,
+    /// `GetVulkanResourceMemoryInfo` failed — the resource has no bound device
+    /// memory (a reserved/sparse resource, for example).
+    EngineRefused,
+    /// No venus ICD module in this process, or the S4b anchor refused because two
+    /// ICD images are live.
+    NoIcd,
+    /// The anchored ICD predates the memory identity exports.
+    NoExport,
+    /// ⛔ The exports ran and answered 0: this `VkDeviceMemory` has **no venus
+    /// resource**, i.e. it was not allocated on the ICD's export arm. The engine
+    /// half of the record is still valid and worth logging.
+    IcdRefused,
+    /// The C++ side returned a value this enum does not know, or returned
+    /// `RESOLVED` with a `false`. ⛔ A drift between `vkd3d_bridge.h`'s constants
+    /// and this mapping.
+    Unknown(u32),
+}
+
+impl IdentityStatus {
+    /// Map the C++ side's `HELIOS_VKD3D_IDENTITY_*` value. ⛔ The authority for
+    /// these numbers is `umd12/bridge/vkd3d_bridge.h`; keep both in sync.
+    fn from_raw(raw: u32) -> Self {
+        match raw {
+            0 => Self::Resolved,
+            1 => Self::BadArg,
+            2 => Self::NoInterop,
+            3 => Self::EngineRefused,
+            4 => Self::NoIcd,
+            5 => Self::NoExport,
+            6 => Self::IcdRefused,
+            other => Self::Unknown(other),
+        }
     }
 }
 

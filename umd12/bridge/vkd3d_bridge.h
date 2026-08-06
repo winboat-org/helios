@@ -58,6 +58,81 @@ struct HeliosVkd3dDevice {
   // read, not a failure; an anchor MISMATCH refuses device creation outright
   // and no `HeliosVkd3dDevice` exists to ask.
   std::uint32_t venus_context_id() const noexcept;
+
+  // UP-5. The **instance-scoped** venus context id, `helios_venus_instance_ctx_id`,
+  // also captured at create time on the creating thread.
+  //
+  // ⛔ This is the one that may be STAMPED into an allocation identity, and
+  // `venus_context_id()` above is not — `bridge_icd_anchor.h` says so outright
+  // (*"evidence only. Never stamp an identity with this value"*): the
+  // process-global static it reads is last-writer-wins across `VkInstance`
+  // creations, so a concurrent instance create can replace it in exactly the
+  // window between vkd3d's own create and this read. The instance-scoped export
+  // returns a `_Thread_local` written by THIS thread's own CTX_CREATE
+  // (`vn_renderer_helios.c:648`), which no other thread can touch.
+  //
+  // ⚠ Both are captured because a DISAGREEMENT is a finding — it means another
+  // instance was created concurrently — and one field could not show one. 0 when
+  // the ICD is absent or predates the export.
+  std::uint32_t venus_instance_context_id() const noexcept;
+
+  // UP-2c/UP-5. The venus identity of the memory an `ID3D12Resource` is bound to.
+  //
+  // `resource` is an `ID3D12Resource*` carried as an integer for the header
+  // isolation reason at the top of this file. BORROWED: no reference is taken and
+  // none is released.
+  //
+  // Two engines answer in sequence and both must, which is why there is one call
+  // and not two: `ID3D12DXVKInteropDevice4::GetVulkanResourceMemoryInfo` gives the
+  // `{VkDeviceMemory, offset, size, memory type}` the resource's image or buffer is
+  // BOUND to, and the anchored venus ICD then turns that `VkDeviceMemory` into the
+  // `{res_id, allocationSize, memoryTypeIndex}` a WDDM allocation adopts. A caller
+  // that made those two calls itself would have to carry the `VkDeviceMemory`
+  // across the cxx seam as an integer for no reason — nothing on the Rust side may
+  // do anything with it except hand it back.
+  //
+  // Every out-param is written on every path, including a `false` return, so a
+  // caller reading them after a failure reads zeroes and not stack garbage.
+  // `out_status` says WHY a zero identity came back, and the values are seven
+  // different findings that must not share a counter — the same discipline as
+  // `HELIOS_VKD3D_FENCE_*` above, and for the same reason.
+  //
+  // ⛔ Keep these values in sync with `bridge12.rs`'s `IdentityStatus`, which maps
+  // them by number and counts an unknown value rather than assuming.
+  //
+  //   0 `HELIOS_VKD3D_IDENTITY_RESOLVED`      — everything answered; the identity is real
+  //   1 `HELIOS_VKD3D_IDENTITY_BAD_ARG`       — `resource` was 0, or no device
+  //   2 `HELIOS_VKD3D_IDENTITY_NO_INTEROP`    — the engine has no `ID3D12DXVKInteropDevice4`
+  //   3 `HELIOS_VKD3D_IDENTITY_ENGINE_REFUSED`— `GetVulkanResourceMemoryInfo` failed (a
+  //                                             reserved resource has no bound memory)
+  //   4 `HELIOS_VKD3D_IDENTITY_NO_ICD`        — no venus ICD module, or the S4b anchor refused
+  //   5 `HELIOS_VKD3D_IDENTITY_NO_EXPORT`     — the anchored ICD predates the memory exports
+  //   6 `HELIOS_VKD3D_IDENTITY_ICD_REFUSED`   — the exports ran and answered 0, i.e. the
+  //                                             memory has no venus resource (not exported)
+  bool resource_venus_identity(std::size_t resource,
+                               std::uint64_t* out_vk_memory,
+                               std::uint64_t* out_memory_offset,
+                               std::uint64_t* out_memory_size,
+                               std::uint32_t* out_memory_type_index,
+                               std::uint32_t* out_venus_res_id,
+                               std::uint64_t* out_venus_alloc_size,
+                               std::uint32_t* out_status) const noexcept;
+
+  // UP-5. Hand the venus resource behind `resource`'s memory over to the WDDM
+  // allocation that has just adopted it.
+  //
+  // `helios_venus_memory_transfer_resource_ownership` (`vn_renderer_helios.c:843`)
+  // sets `bo->resource_released` so the ICD stops unref'ing the host resource when
+  // the `VkDeviceMemory` is freed — the guest KMD's allocation owns it from then on
+  // (`create_allocation.rs`'s `adopt_blob_for_allocation`). ⛔ Called only AFTER
+  // `pfnAllocateCb` has succeeded: transferring first and then failing the
+  // allocation would leave the resource owned by nobody.
+  //
+  // Returns the res_id it handed over, or 0 (counted and logged) if the interop
+  // device, the ICD or the export is unavailable or declined. ⚠ A 0 here after a
+  // successful identity read is a REAL defect — the resource would be double-freed
+  // at process exit — so the caller must treat it as one.
+  std::uint32_t transfer_resource_ownership(std::size_t resource) const noexcept;
 };
 
 // ⛔ NOT named `helios_vkd3d_create_device`: that C symbol is DEFINED in the
@@ -112,6 +187,16 @@ constexpr std::uint32_t HELIOS_VKD3D_FENCE_SAMPLED = 0;
 constexpr std::uint32_t HELIOS_VKD3D_FENCE_NO_ICD = 1;
 constexpr std::uint32_t HELIOS_VKD3D_FENCE_NO_EXPORT = 2;
 constexpr std::uint32_t HELIOS_VKD3D_FENCE_REFUSED = 3;
+
+// The `out_status` values of `resource_venus_identity` above. Declared here, at the
+// seam, for the same reason as the fence family: `bridge12.rs` maps them by number.
+constexpr std::uint32_t HELIOS_VKD3D_IDENTITY_RESOLVED = 0;
+constexpr std::uint32_t HELIOS_VKD3D_IDENTITY_BAD_ARG = 1;
+constexpr std::uint32_t HELIOS_VKD3D_IDENTITY_NO_INTEROP = 2;
+constexpr std::uint32_t HELIOS_VKD3D_IDENTITY_ENGINE_REFUSED = 3;
+constexpr std::uint32_t HELIOS_VKD3D_IDENTITY_NO_ICD = 4;
+constexpr std::uint32_t HELIOS_VKD3D_IDENTITY_NO_EXPORT = 5;
+constexpr std::uint32_t HELIOS_VKD3D_IDENTITY_ICD_REFUSED = 6;
 
 bool helios_vkd3d_bridge_drain_queue(std::size_t queue,
                                      std::uint64_t* out_wire_fence,

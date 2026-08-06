@@ -93,6 +93,86 @@ extern "C" HRESULT helios_vkd3d_serialize_root_signature(
 extern "C" void* vkd3d_acquire_vk_queue(void* queue);
 extern "C" void vkd3d_release_vk_queue(void* queue);
 
+// ── ID3D12DXVKInteropDevice4, hand-declared ─────────────────────────────────
+//
+// ⛔ This file includes no vkd3d header (see the banner), so the interop interface
+// vkd3d publishes in `include/vkd3d_device_vkd3d_ext.idl` is redeclared here rather
+// than imported. Transcribed from that IDL, in vtable order, against the shipped
+// `d3d12_dxvk_interop_device_vtbl` (`libs/vkd3d/device_vkd3d_ext.c`) — **22 slots**,
+// three IUnknown plus nineteen, and the one this bridge calls is the LAST.
+//
+// ⚠ **An abstract class and not a hand-built vtable struct**, deliberately: a
+// single-inheritance class with only pure virtuals has exactly the COM vtable
+// layout under MSVC/clang-cl, and it makes a mis-ordered slot a compile-visible
+// list rather than an index arithmetic error. ⛔ But the ORDER is still the whole
+// correctness of it: a method inserted anywhere above the last one silently calls
+// the wrong function. The IDL's interface chain is the authority
+// (v -> v1 -> v2 -> v3 -> v4), and every method of every revision must appear
+// here even though this bridge calls two.
+//
+// ⚠ Vulkan and vkd3d types are substituted, and each substitution is
+// ABI-identical on x64: every `Vk*` handle is a pointer (dispatchable handles are
+// `struct T*`; non-dispatchable handles are `struct T*` too under
+// `VK_DEFINE_NON_DISPATCHABLE_HANDLE` on a 64-bit build), and `VkImageLayout` /
+// `VkFormat` are `int`-sized enums. The `D3D12_*` types are the SDK's own, which
+// this file already includes. Same substitution and same argument as the
+// `vkd3d_acquire_vk_queue` declarations below.
+struct ID3D12DXVKInteropDevice4 : public IUnknown {
+  // ID3D12DXVKInteropDevice
+  virtual HRESULT STDMETHODCALLTYPE GetDXGIAdapter(REFIID iid, void** object) = 0;
+  virtual HRESULT STDMETHODCALLTYPE GetInstanceExtensions(UINT* count, const char** ext) = 0;
+  virtual HRESULT STDMETHODCALLTYPE GetDeviceExtensions(UINT* count, const char** ext) = 0;
+  virtual HRESULT STDMETHODCALLTYPE GetDeviceFeatures(const void** features) = 0;
+  virtual HRESULT STDMETHODCALLTYPE GetVulkanHandles(void** vk_instance,
+                                                    void** vk_physical_device,
+                                                    void** vk_device) = 0;
+  virtual HRESULT STDMETHODCALLTYPE GetVulkanQueueInfo(ID3D12CommandQueue* queue,
+                                                      void** vk_queue,
+                                                      std::uint32_t* vk_queue_family) = 0;
+  virtual void STDMETHODCALLTYPE GetVulkanImageLayout(ID3D12Resource* resource,
+                                                      D3D12_RESOURCE_STATES state,
+                                                      int* vk_layout) = 0;
+  virtual HRESULT STDMETHODCALLTYPE GetVulkanResourceInfo(ID3D12Resource* resource,
+                                                          std::uint64_t* vk_handle,
+                                                          std::uint64_t* buffer_offset) = 0;
+  virtual HRESULT STDMETHODCALLTYPE LockCommandQueue(ID3D12CommandQueue* queue) = 0;
+  virtual HRESULT STDMETHODCALLTYPE UnlockCommandQueue(ID3D12CommandQueue* queue) = 0;
+  // ID3D12DXVKInteropDevice1
+  virtual HRESULT STDMETHODCALLTYPE GetVulkanResourceInfo1(ID3D12Resource* resource,
+                                                           std::uint64_t* vk_handle,
+                                                           std::uint64_t* buffer_offset,
+                                                           int* format) = 0;
+  virtual HRESULT STDMETHODCALLTYPE CreateInteropCommandQueue(
+      const D3D12_COMMAND_QUEUE_DESC* desc, std::uint32_t vk_queue_family_index,
+      ID3D12CommandQueue** queue) = 0;
+  virtual HRESULT STDMETHODCALLTYPE CreateInteropCommandAllocator(
+      D3D12_COMMAND_LIST_TYPE type, std::uint32_t vk_queue_family_index,
+      ID3D12CommandAllocator** allocator) = 0;
+  virtual HRESULT STDMETHODCALLTYPE BeginVkCommandBufferInterop(ID3D12CommandList* list,
+                                                                 void** command_buffer) = 0;
+  virtual HRESULT STDMETHODCALLTYPE EndVkCommandBufferInterop(ID3D12CommandList* list) = 0;
+  // ID3D12DXVKInteropDevice2
+  virtual HRESULT STDMETHODCALLTYPE LockVulkanQueue(ID3D12CommandQueue* queue) = 0;
+  virtual HRESULT STDMETHODCALLTYPE UnlockVulkanQueue(ID3D12CommandQueue* queue) = 0;
+  // ID3D12DXVKInteropDevice3
+  virtual HRESULT STDMETHODCALLTYPE GetVulkanHeapInfo(ID3D12Heap* heap,
+                                                      std::uint64_t* vk_memory,
+                                                      std::uint64_t* heap_offset,
+                                                      std::uint32_t* vk_memory_type) = 0;
+  // ID3D12DXVKInteropDevice4 — the one this bridge exists to call.
+  virtual HRESULT STDMETHODCALLTYPE GetVulkanResourceMemoryInfo(
+      ID3D12Resource* resource, std::uint64_t* vk_memory, std::uint64_t* memory_offset,
+      std::uint64_t* memory_size, std::uint32_t* vk_memory_type) = 0;
+};
+
+// `uuid(9c0850e7-70f1-4229-ae05-440b387ec517)` from the IDL block above.
+// ⛔ Spelled out rather than `__uuidof`: `__uuidof` needs a `DECLSPEC_UUID` on the
+// declaration, and a wrong literal here would be a QueryInterface miss (loud,
+// counted) rather than a wrong call — which is why the miss path is a named status
+// and not an assumption.
+static const GUID IID_HeliosID3D12DXVKInteropDevice4 = {
+    0x9c0850e7, 0x70f1, 0x4229, {0xae, 0x05, 0x44, 0x0b, 0x38, 0x7e, 0xc5, 0x17}};
+
 namespace helios_bridge {
 
 // ── named counters ──────────────────────────────────────────────────────────
@@ -108,6 +188,10 @@ std::atomic<std::uint32_t> g_vkd3dSerializeBadArg{0};      // serialize refused:
 std::atomic<std::uint32_t> g_vkd3dDrainBadArg{0};          // drain refused: queue == 0
 std::atomic<std::uint32_t> g_vkd3dDrainNotAcquired{0};     // acquire returned no VkQueue
 std::atomic<std::uint32_t> g_vkd3dQueueFenceZero{0};       // gpu-fence sample yielded 0
+std::atomic<std::uint32_t> g_vkd3dNoInteropDevice{0};      // QI for ID3D12DXVKInteropDevice4 failed
+std::atomic<std::uint32_t> g_vkd3dIdentityEngineRefused{0};// GetVulkanResourceMemoryInfo failed
+std::atomic<std::uint32_t> g_vkd3dIdentityIcdRefused{0};   // the ICD memory exports answered 0
+std::atomic<std::uint32_t> g_vkd3dOwnershipTransferFailed{0}; // transfer_resource_ownership gave 0
 
 // ── this DLL's `umd_log` ────────────────────────────────────────────────────
 //
@@ -161,10 +245,36 @@ using helios_bridge::umd_log;
 // image, so there is no module whose lifetime could end under a live device.
 struct HeliosVkd3dDeviceImpl {
   ID3D12Device* d3d12 = nullptr;
+  // UP-2c. The engine's interop interface, queried ONCE at device create.
+  //
+  // ⛔ Once, and for the same class of reason the ICD export is resolved once: a
+  // per-resource `QueryInterface` is an `AddRef`/`Release` pair per create on the
+  // device that owns the whole Vulkan device, and a missed `Release` on that path
+  // is the 54th session's per-object leak with the largest possible object. Held
+  // as an OWNING reference, released below.
+  //
+  // ⚠ `nullptr` is a legal state, not a failure of device creation: an engine
+  // build without `ID3D12DXVKInteropDevice4` still renders, it just cannot hand
+  // out a present identity. Counted (`Vkd3dNoInteropDevice`) and reported as
+  // `HELIOS_VKD3D_IDENTITY_NO_INTEROP`.
+  ID3D12DXVKInteropDevice4* interop = nullptr;
   // S4b. Read ON THE CREATING THREAD — see `read_venus_ctx_id_now` below.
   std::uint32_t venus_ctx_id = 0;
+  // UP-5. The instance-scoped ctx id, also read on the creating thread. This is
+  // the one that may be stamped into an identity; see the header.
+  std::uint32_t venus_instance_ctx_id = 0;
 
   ~HeliosVkd3dDeviceImpl() {
+    // ⛔ The interop interface FIRST: it is a reference on the same object as
+    // `d3d12` (vkd3d's `QueryInterface` hands back the containing
+    // `d3d12_device`), so releasing `d3d12` first would leave this one pointing
+    // at an object whose last reference we are about to drop through a different
+    // pointer. Order is free insurance here and would be a use-after-free if the
+    // two were ever separate objects.
+    if (interop) {
+      interop->Release();
+      interop = nullptr;
+    }
     if (d3d12) {
       d3d12->Release();
       d3d12 = nullptr;
@@ -295,6 +405,109 @@ const QueueGpuFenceExport& queue_gpu_fence_export() {
   return resolved;
 }
 
+// ── the venus MEMORY identity exports, resolved ONCE ────────────────────────
+//
+// UP-2c. Four exports out of the same anchored module, all from
+// `icd/mesa/src/virtio/vulkan/vn_renderer_helios.c`:
+//
+//   `helios_venus_memory_res_id` (:698)                       -> the virtio resource id
+//   `helios_venus_memory_alloc_info` (:714)                   -> {allocationSize, memoryTypeIndex}
+//   `helios_venus_memory_transfer_resource_ownership` (:843)  -> hand the resource over
+//   `helios_venus_instance_ctx_id` (:681)                     -> the thread-local ctx id
+//
+// ⛔ **One table, one resolution, and the module reference argument from
+// `queue_gpu_fence_export` applies verbatim**: `find_venus_icd_module()` takes a
+// module reference on every successful call and nothing releases it, so resolving
+// per resource would leak one ICD module reference per `pfnCreateHeapAndResource`.
+// ⛔ And it goes through `reconcile_icd_anchor`, never a bare
+// `find_venus_icd_module`, because a mismatch must REFUSE: these functions decode a
+// `VkDeviceMemory` that came from whichever image the Vulkan loader bound, and
+// handing it to a different ICD build is precisely the foreign-handle bug S4b
+// exists to prevent.
+//
+// ⚠ `void*` stands in for `VkDeviceMemory` and `VkInstance`. `VkInstance` is a
+// dispatchable handle (a pointer); `VkDeviceMemory` is non-dispatchable, which is
+// also a pointer on a 64-bit build (`VK_DEFINE_NON_DISPATCHABLE_HANDLE` is
+// `struct T*` when `VK_USE_64_BIT_PTR_DEFINES == 1`, and this DLL is x64 only). ⛔
+// On a 32-bit build it would be `uint64_t` and this substitution would be wrong —
+// which is stated rather than guarded because `helios_umd12.dll` has no 32-bit
+// target and the `.def`/INF surface has none either.
+//
+// ⚠ **All four are resolved or none is.** The ICD exports them from the same
+// image, so a module with `helios_venus_memory_res_id` but not
+// `helios_venus_memory_alloc_info` is not an old ICD, it is a broken one — and
+// filling half an identity is worse than filling none, because the halves are what
+// a later reader compares to detect drift. `NO_EXPORT` therefore covers the whole
+// group.
+using MemoryResIdFn = std::uint32_t(__cdecl*)(void* /*VkDeviceMemory*/);
+using MemoryAllocInfoFn = bool(__cdecl*)(void* /*VkDeviceMemory*/, std::uint64_t*,
+                                         std::uint32_t*);
+using MemoryTransferOwnershipFn = std::uint32_t(__cdecl*)(void* /*VkDeviceMemory*/);
+using InstanceCtxIdFn = std::uint32_t(__cdecl*)(void* /*VkInstance*/);
+
+struct MemoryIdentityExports {
+  MemoryResIdFn res_id = nullptr;
+  MemoryAllocInfoFn alloc_info = nullptr;
+  MemoryTransferOwnershipFn transfer_ownership = nullptr;
+  InstanceCtxIdFn instance_ctx_id = nullptr;
+  // `HELIOS_VKD3D_IDENTITY_NO_ICD` / `_NO_EXPORT` / `_RESOLVED`, decided once.
+  std::uint32_t status = HELIOS_VKD3D_IDENTITY_NO_ICD;
+};
+
+const MemoryIdentityExports& memory_identity_exports() {
+  static const MemoryIdentityExports resolved = [] {
+    MemoryIdentityExports out;
+    void* candidate = helios_bridge::find_venus_icd_module();
+    if (!candidate) {
+      umd_log("memory_identity: no loaded module exports the venus ICD probe symbol "
+              "-- no D3D12 resource can carry a present identity");
+      return out;
+    }
+    void* canonical = helios_bridge::reconcile_icd_anchor(candidate);
+    if (!canonical) {
+      // IcdAnchorMismatch is already counted and logged by the anchor.
+      umd_log("memory_identity: venus ICD anchor mismatch -- refusing to resolve the "
+              "memory identity exports");
+      return out;
+    }
+    HMODULE m = static_cast<HMODULE>(canonical);
+    // ⚠ Through `void*` and back, as `queue_gpu_fence_export` above: a function
+    // pointer is not `reinterpret_cast`-able from `FARPROC` without a
+    // -Wcast-function-type diagnostic on clang-cl.
+    out.res_id = reinterpret_cast<MemoryResIdFn>(
+        reinterpret_cast<void*>(GetProcAddress(m, "helios_venus_memory_res_id")));
+    out.alloc_info = reinterpret_cast<MemoryAllocInfoFn>(
+        reinterpret_cast<void*>(GetProcAddress(m, "helios_venus_memory_alloc_info")));
+    out.transfer_ownership = reinterpret_cast<MemoryTransferOwnershipFn>(
+        reinterpret_cast<void*>(
+            GetProcAddress(m, "helios_venus_memory_transfer_resource_ownership")));
+    out.instance_ctx_id = reinterpret_cast<InstanceCtxIdFn>(
+        reinterpret_cast<void*>(GetProcAddress(m, "helios_venus_instance_ctx_id")));
+    if (!out.res_id || !out.alloc_info || !out.transfer_ownership ||
+        !out.instance_ctx_id) {
+      char msg[224];
+      std::snprintf(msg, sizeof(msg),
+                    "memory_identity: the anchored venus ICD is missing an export "
+                    "(res_id=%d alloc_info=%d transfer=%d instance_ctx=%d) -- no D3D12 "
+                    "resource can carry a present identity",
+                    out.res_id != nullptr, out.alloc_info != nullptr,
+                    out.transfer_ownership != nullptr, out.instance_ctx_id != nullptr);
+      umd_log(msg);
+      out.res_id = nullptr;
+      out.alloc_info = nullptr;
+      out.transfer_ownership = nullptr;
+      out.instance_ctx_id = nullptr;
+      out.status = HELIOS_VKD3D_IDENTITY_NO_EXPORT;
+      return out;
+    }
+    umd_log("memory_identity: resolved the four venus memory identity exports from "
+            "the anchored venus ICD");
+    out.status = HELIOS_VKD3D_IDENTITY_RESOLVED;
+    return out;
+  }();
+  return resolved;
+}
+
 }  // namespace
 
 HeliosVkd3dDevice::HeliosVkd3dDevice() noexcept = default;
@@ -317,6 +530,208 @@ std::uint32_t HeliosVkd3dDevice::venus_context_id() const noexcept {
   // export is thread-local, so a lazy read would answer 0 or another thread's
   // context on every caller but the first.
   return impl ? impl->venus_ctx_id : 0;
+}
+
+std::uint32_t HeliosVkd3dDevice::venus_instance_context_id() const noexcept {
+  // Same rule, and it binds harder here: `helios_venus_instance_ctx_id` returns a
+  // `_Thread_local`, so on any thread but the creating one it answers 0.
+  return impl ? impl->venus_instance_ctx_id : 0;
+}
+
+namespace {
+
+/// The `VkDeviceMemory` an `ID3D12Resource` is bound to, plus its geometry, out of
+/// the engine's interop interface.
+///
+/// Shared by `resource_venus_identity` and `transfer_resource_ownership` because
+/// both need exactly this and getting it twice by two spellings is how they come to
+/// disagree about which memory a resource is bound to.
+///
+/// Returns one of the `HELIOS_VKD3D_IDENTITY_*` statuses; `*out_vk_memory` is
+/// non-zero only on `_RESOLVED`.
+std::uint32_t engine_resource_memory(const HeliosVkd3dDeviceImpl* impl,
+                                    std::size_t resource,
+                                    std::uint64_t* out_vk_memory,
+                                    std::uint64_t* out_memory_offset,
+                                    std::uint64_t* out_memory_size,
+                                    std::uint32_t* out_memory_type_index) {
+  *out_vk_memory = 0;
+  *out_memory_offset = 0;
+  *out_memory_size = 0;
+  *out_memory_type_index = 0;
+
+  if (!impl || !resource) {
+    return HELIOS_VKD3D_IDENTITY_BAD_ARG;
+  }
+  if (!impl->interop) {
+    // Counted at device create, where the QI actually failed; counted again here
+    // because "the engine has no interop interface" and "N resources could not get
+    // an identity because of it" are different numbers.
+    helios_bridge::g_vkd3dNoInteropDevice.fetch_add(1, std::memory_order_relaxed);
+    return HELIOS_VKD3D_IDENTITY_NO_INTEROP;
+  }
+
+  auto* res = reinterpret_cast<ID3D12Resource*>(resource);
+  const HRESULT hr = impl->interop->GetVulkanResourceMemoryInfo(
+      res, out_vk_memory, out_memory_offset, out_memory_size, out_memory_type_index);
+  if (FAILED(hr) || *out_vk_memory == 0) {
+    // ⛔ `|| == 0` as well as the HRESULT: the method returns E_FAIL for a resource
+    // with no bound device memory, and a hypothetical S_OK with a null handle would
+    // otherwise become a zero identity labelled as a real one.
+    *out_vk_memory = 0;
+    const std::uint32_t n =
+        helios_bridge::g_vkd3dIdentityEngineRefused.fetch_add(1, std::memory_order_relaxed) + 1;
+    // ⛔ The budget is computed from `n`, NOT from a second
+    // `bridge_log_budget(g_vkd3dIdentityEngineRefused, ...)` call: that helper does
+    // its own `fetch_add`, so it would count every refusal twice and the counter
+    // this file publishes would be exactly double the truth.
+    if (n <= 8 || (n % 4096) == 0) {
+      char msg[192];
+      std::snprintf(msg, sizeof(msg),
+                    "resource_venus_identity: GetVulkanResourceMemoryInfo(%p) hr=0x%08lx "
+                    "(Vkd3dIdentityEngineRefused=%u)",
+                    (void*)res, (unsigned long)hr, n);
+      umd_log(msg);
+    }
+    return HELIOS_VKD3D_IDENTITY_ENGINE_REFUSED;
+  }
+  return HELIOS_VKD3D_IDENTITY_RESOLVED;
+}
+
+}  // namespace
+
+bool HeliosVkd3dDevice::resource_venus_identity(
+    std::size_t resource, std::uint64_t* out_vk_memory, std::uint64_t* out_memory_offset,
+    std::uint64_t* out_memory_size, std::uint32_t* out_memory_type_index,
+    std::uint32_t* out_venus_res_id, std::uint64_t* out_venus_alloc_size,
+    std::uint32_t* out_status) const noexcept {
+  // ⛔ Every out-param cleared FIRST, before anything that can fail or throw. A
+  // caller that read an untouched pair after a `false` return would take stack
+  // garbage for a venus resource id — and a wrong resource id is an allocation
+  // adopting somebody else's memory, which the KMD accepts as readily as the right
+  // one (it validates liveness, not provenance).
+  if (out_vk_memory) *out_vk_memory = 0;
+  if (out_memory_offset) *out_memory_offset = 0;
+  if (out_memory_size) *out_memory_size = 0;
+  if (out_memory_type_index) *out_memory_type_index = 0;
+  if (out_venus_res_id) *out_venus_res_id = 0;
+  if (out_venus_alloc_size) *out_venus_alloc_size = 0;
+  if (out_status) *out_status = HELIOS_VKD3D_IDENTITY_BAD_ARG;
+
+  return helios_bridge::bridge_guard(
+      "helios_vkd3d_bridge_resource_venus_identity", false, [&]() -> bool {
+        if (!out_vk_memory || !out_memory_offset || !out_memory_size ||
+            !out_memory_type_index || !out_venus_res_id || !out_venus_alloc_size ||
+            !out_status) {
+          // ⛔ All-or-nothing, unlike the fence pair's both-or-neither: a partial
+          // identity has no legal meaning. The caller is `bridge12.rs`, which passes
+          // seven live locals, so this is a contract check and not a supported mode.
+          return false;
+        }
+
+        std::uint32_t status = engine_resource_memory(
+            impl.get(), resource, out_vk_memory, out_memory_offset, out_memory_size,
+            out_memory_type_index);
+        *out_status = status;
+        if (status != HELIOS_VKD3D_IDENTITY_RESOLVED) {
+          return false;
+        }
+
+        const MemoryIdentityExports& e = memory_identity_exports();
+        if (!e.res_id) {
+          // NO_ICD or NO_EXPORT, decided and logged once at resolution time. The
+          // engine half of the answer is left in place on purpose: it is true, and a
+          // caller logging it can tell "vkd3d answered, the ICD did not" from "the
+          // resource has no memory at all".
+          *out_status = e.status;
+          return false;
+        }
+
+        void* memory = reinterpret_cast<void*>(*out_vk_memory);
+        const std::uint32_t res_id = e.res_id(memory);
+        std::uint64_t alloc_size = 0;
+        std::uint32_t alloc_mti = 0;
+        const bool alloc_ok = e.alloc_info(memory, &alloc_size, &alloc_mti);
+        if (res_id == 0 || !alloc_ok || alloc_size == 0) {
+          // ⛔ **This is the expected failure while the export chain is not in
+          // place, and it must stay loud.** A venus memory object only has a
+          // resource id if it was allocated on the ICD's export arm, which is what
+          // `VKD3D_HEAP_FLAG_HELIOS_VENUS_EXPORT` exists to force. A 0 here means
+          // either that flag did not reach vkd3d or vkd3d suballocated anyway — both
+          // of which make the resource unpresentable, and neither of which may be
+          // rounded to "no identity today".
+          *out_status = HELIOS_VKD3D_IDENTITY_ICD_REFUSED;
+          const std::uint32_t n =
+              helios_bridge::g_vkd3dIdentityIcdRefused.fetch_add(1, std::memory_order_relaxed) + 1;
+          if (n <= 8 || (n % 4096) == 0) {
+            char msg[256];
+            std::snprintf(msg, sizeof(msg),
+                          "resource_venus_identity: vk_memory=0x%llx off=%llu size=%llu "
+                          "mti=%u has NO venus resource (res_id=%u alloc_ok=%d "
+                          "alloc_size=%llu) -- not exportable "
+                          "(Vkd3dIdentityIcdRefused=%u)",
+                          (unsigned long long)*out_vk_memory,
+                          (unsigned long long)*out_memory_offset,
+                          (unsigned long long)*out_memory_size, *out_memory_type_index,
+                          res_id, (int)alloc_ok, (unsigned long long)alloc_size, n);
+            umd_log(msg);
+          }
+          return false;
+        }
+
+        *out_venus_res_id = res_id;
+        *out_venus_alloc_size = alloc_size;
+        // ⚠ The ICD's `memoryTypeIndex` is deliberately NOT written over the
+        // engine's. They are two reads of one number and the caller keeps both so a
+        // disagreement is visible; overwriting here would make the check
+        // unwritable. `alloc_mti` is compared, not stored.
+        if (alloc_mti != *out_memory_type_index) {
+          char msg[192];
+          std::snprintf(msg, sizeof(msg),
+                        "resource_venus_identity: MEMORY TYPE DISAGREEMENT vk_memory=0x%llx "
+                        "engine=%u icd=%u -- an importer will use the engine's",
+                        (unsigned long long)*out_vk_memory, *out_memory_type_index,
+                        alloc_mti);
+          umd_log(msg);
+        }
+        *out_status = HELIOS_VKD3D_IDENTITY_RESOLVED;
+        return true;
+      });
+}
+
+std::uint32_t HeliosVkd3dDevice::transfer_resource_ownership(
+    std::size_t resource) const noexcept {
+  return helios_bridge::bridge_guard(
+      "helios_vkd3d_bridge_transfer_resource_ownership", std::uint32_t(0),
+      [&]() -> std::uint32_t {
+        std::uint64_t vk_memory = 0;
+        std::uint64_t offset = 0;
+        std::uint64_t size = 0;
+        std::uint32_t mti = 0;
+        const std::uint32_t status = engine_resource_memory(
+            impl.get(), resource, &vk_memory, &offset, &size, &mti);
+        const MemoryIdentityExports& e = memory_identity_exports();
+        std::uint32_t handed = 0;
+        if (status == HELIOS_VKD3D_IDENTITY_RESOLVED && e.transfer_ownership) {
+          handed = e.transfer_ownership(reinterpret_cast<void*>(vk_memory));
+        }
+        if (handed == 0) {
+          // ⛔ Loud, and the caller treats it as a defect: `pfnAllocateCb` has
+          // already succeeded by the time this runs, so the KMD's allocation now
+          // owns a resource the ICD still believes it owns, and both will unref it.
+          const std::uint32_t n =
+              helios_bridge::g_vkd3dOwnershipTransferFailed.fetch_add(
+                  1, std::memory_order_relaxed) + 1;
+          char msg[224];
+          std::snprintf(msg, sizeof(msg),
+                        "transfer_resource_ownership(%p) FAILED: status=%u vk_memory=0x%llx "
+                        "export=%d (Vkd3dOwnershipTransferFailed=%u)",
+                        (void*)resource, status, (unsigned long long)vk_memory,
+                        e.transfer_ownership != nullptr, n);
+          umd_log(msg);
+        }
+        return handed;
+      });
 }
 
 std::unique_ptr<HeliosVkd3dDevice> helios_vkd3d_bridge_create_device(
@@ -437,12 +852,86 @@ std::unique_ptr<HeliosVkd3dDevice> helios_vkd3d_bridge_create_device(
         }
         out->impl->venus_ctx_id = ctx;
 
-        char msg[192];
+        // ── UP-2c: the engine's interop interface, ONCE ────────────────────
+        //
+        // ⚠ A failure here does NOT fail device creation, and that asymmetry with
+        // the anchor mismatch above is deliberate: a mismatch means this process
+        // holds Vulkan objects from two ICDs and nothing it does is trustworthy,
+        // while a missing interop interface means this engine build cannot hand out
+        // a present identity — every other D3D12 obligation still works. Counted,
+        // logged, and reported per-resource as `NO_INTEROP`.
+        {
+          ID3D12DXVKInteropDevice4* interop = nullptr;
+          const HRESULT qi = dev->QueryInterface(
+              IID_HeliosID3D12DXVKInteropDevice4, reinterpret_cast<void**>(&interop));
+          if (SUCCEEDED(qi) && interop) {
+            out->impl->interop = interop;
+          } else {
+            const std::uint32_t n =
+                helios_bridge::g_vkd3dNoInteropDevice.fetch_add(
+                    1, std::memory_order_relaxed) + 1;
+            char qmsg[224];
+            std::snprintf(qmsg, sizeof(qmsg),
+                          "ID3D12DXVKInteropDevice4 unavailable hr=0x%08lx -- no D3D12 "
+                          "resource can carry a present identity "
+                          "(Vkd3dNoInteropDevice=%u)",
+                          (unsigned long)qi, n);
+            umd_log(qmsg);
+          }
+        }
+
+        // ── UP-5: the INSTANCE-SCOPED ctx id, on this thread ──────────────
+        //
+        // ⛔ Here and nowhere else. `helios_venus_instance_ctx_id` returns a
+        // `_Thread_local` written by this thread's own CTX_CREATE inside
+        // `helios_vkd3d_create_device` above, so any later thread reads 0. This is
+        // the value UP-5 stamps into an allocation identity; `venus_ctx_id` above is
+        // the process-global one the anchor header forbids stamping.
+        //
+        // ⚠ The `VkInstance` is obtained honestly from the engine rather than passed
+        // as null, even though the ICD's export ignores its argument
+        // (`vn_renderer_helios.c:683`, `(void)instance;`) — a driver that relies on
+        // an implementation detail of a function it does not own is one ICD change
+        // away from a wrong ctx id, and a wrong ctx id is a diagnostic that lies.
+        {
+          const MemoryIdentityExports& e = memory_identity_exports();
+          if (e.instance_ctx_id) {
+            void* vk_instance = nullptr;
+            void* vk_physical_device = nullptr;
+            void* vk_device = nullptr;
+            if (out->impl->interop &&
+                SUCCEEDED(out->impl->interop->GetVulkanHandles(
+                    &vk_instance, &vk_physical_device, &vk_device))) {
+              out->impl->venus_instance_ctx_id = e.instance_ctx_id(vk_instance);
+            } else {
+              out->impl->venus_instance_ctx_id = e.instance_ctx_id(nullptr);
+            }
+          }
+        }
+
+        char msg[256];
         std::snprintf(msg, sizeof(msg),
                       "ID3D12Device created OK on luid %08x:%08x venus ctx_id=%u "
-                      "(static vkd3d engine)",
-                      (unsigned)luid_high, (unsigned)luid_low, ctx);
+                      "instance_ctx_id=%u interop=%d (static vkd3d engine)",
+                      (unsigned)luid_high, (unsigned)luid_low, ctx,
+                      out->impl->venus_instance_ctx_id,
+                      out->impl->interop != nullptr);
         umd_log(msg);
+        // ⚠ A DISAGREEMENT between the two ctx ids is a finding, not noise: it means
+        // another `VkInstance` was created between vkd3d's CTX_CREATE and the
+        // process-global read, i.e. the value the anchor header forbids stamping was
+        // about to be stamped. Logged rather than refused because the
+        // instance-scoped read is the one that is used and it is unaffected.
+        if (out->impl->venus_instance_ctx_id != 0 && ctx != 0 &&
+            out->impl->venus_instance_ctx_id != ctx) {
+          char wmsg[192];
+          std::snprintf(wmsg, sizeof(wmsg),
+                        "venus ctx id DISAGREEMENT: process-global=%u instance-scoped=%u "
+                        "-- a concurrent instance create replaced the global one; "
+                        "stamping the instance-scoped value",
+                        ctx, out->impl->venus_instance_ctx_id);
+          umd_log(wmsg);
+        }
         return out;
       });
 }
