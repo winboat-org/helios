@@ -456,9 +456,16 @@ pub(crate) static UMD12_REFUSALS: Umd12Refusals = Umd12Refusals {
     node_map_unexpected_adapter_count: RefusalCounter::new("NodeMapUnexpectedAdapterCount"),
 };
 
-/// The set, in the order the summary prints them. ⛔ This order is the evidence
-/// contract: `D3D12 DDI refusals:` lines from different builds get diffed, so
-/// new counters are **appended**, never inserted.
+/// The **spine's** set, in the order the summary prints them. ⛔ This order is
+/// the evidence contract: `D3D12 DDI refusals:` lines from different builds get
+/// diffed, so new counters are **appended**, never inserted.
+///
+/// ⚠ This set is closed to the S6 lanes. It holds what existed when the eleven
+/// lanes were about to start — the adapter/table/device spine, L1's caps
+/// gauntlet, and the two `misc.rs` slots that had to land with L1 — and it stays
+/// FIRST in [`UMD12_REFUSAL_SETS`] precisely so every pre-fan-out
+/// `D3D12 DDI refusals:` line is still a byte-for-byte prefix of a post-fan-out
+/// one. A lane appends to **its own** set, in its own file.
 static UMD12_REFUSAL_SET: [&RefusalCounter; 42] = [
     &UMD12_REFUSALS.open_adapter12,
     &UMD12_REFUSALS.probe12_bad_arg,
@@ -504,6 +511,41 @@ static UMD12_REFUSAL_SET: [&RefusalCounter; 42] = [
     &UMD12_REFUSALS.node_map_unexpected_adapter_count,
 ];
 
+/// Every refusal set this DLL prints, in print order: the spine's, then one per
+/// S6 lane.
+///
+/// ⭐ **This is the S6-0 trick applied to the counters**, and it is the reason a
+/// lane's diff against this file is a single pre-existing line rather than an
+/// edit. `PARALLEL.md` §5 lists five shared files and `lib.rs` is not among
+/// them — yet every one of the eleven lanes needs somewhere to declare the
+/// refusals `PARALLEL.md` §9.1 requires of it, which made this the hottest
+/// unlisted merge point in the split. Naming all eleven sets up front converts
+/// that from **additive** (eleven agents inserting into one array) to
+/// **substitutive** (each agent filling in its own file's array), exactly as
+/// `forward12::tables12` did for the 206 slots.
+///
+/// ⛔ **Order is the evidence contract.** The spine's set stays first, so a
+/// `D3D12 DDI refusals:` line from before the fan-out is still a byte-for-byte
+/// prefix of one from after it. Lane sets are appended in lane order and never
+/// reordered; a counter never moves between sets.
+///
+/// ⚠ A lane whose set is still `&[]` has not landed. That is a readable state,
+/// not a dead one: the array is iterated on every summary, and the day the lane
+/// lands its counters appear at exactly this position.
+static UMD12_REFUSAL_SETS: &[&[&RefusalCounter]] = &[
+    &UMD12_REFUSAL_SET,
+    forward12::queue::REFUSALS,       // L2: queue, pool, recorder, list lifetime
+    forward12::cmdlist::REFUSALS,     // L3a: draw, fixed function, IA/SO/OM
+    forward12::rootargs::REFUSALS,    // L3b: root arguments, binding, clears
+    forward12::copy::REFUSALS,        // L3c: copy, resolve, barriers, queries
+    forward12::resource12::REFUSALS,  // L4: resources, heaps, residency
+    forward12::descriptors::REFUSALS, // L5: descriptor heaps and views
+    forward12::pso::REFUSALS,         // L6: PSO, root signatures, shaders
+    forward12::fence::REFUSALS,       // L7: fences and query heaps
+    forward12::present12::REFUSALS,   // L8: present
+    forward12::misc::REFUSALS,        // L9: the tail
+];
+
 /// Bump one refusal counter and emit the whole set's summary on its FIRST hit.
 ///
 /// Taking `&RefusalCounter` rather than a field name keeps the call sites one
@@ -513,7 +555,7 @@ static UMD12_REFUSAL_SET: [&RefusalCounter; 42] = [
 /// first-hit signal does not compile.
 pub(crate) fn note_refusal(counter: &RefusalCounter) {
     if counter.note() {
-        log_error!("{}", refusals::summary("D3D12 DDI refusals:", &UMD12_REFUSAL_SET));
+        log_refusal_summary();
     }
 }
 
@@ -533,7 +575,10 @@ pub(crate) fn note_refusal(counter: &RefusalCounter) {
 /// device scope because that is where "what did THIS device touch" is a
 /// different question.
 pub(crate) fn log_refusal_summary() {
-    log_error!("{}", refusals::summary("D3D12 DDI refusals:", &UMD12_REFUSAL_SET));
+    log_error!(
+        "{}",
+        refusals::summary_sets("D3D12 DDI refusals:", UMD12_REFUSAL_SETS)
+    );
 }
 
 /// Name this DLL's log file, resolve its trace gate, and dump the module path

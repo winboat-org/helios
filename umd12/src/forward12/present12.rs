@@ -33,6 +33,7 @@
 
 use super::tables12::{stage, Filling};
 use super::tables12::{CommandListTable, DeviceCoreTable};
+use helios_umd_common::refusals::RefusalCounter;
 
 /// Install L8's one device-core slot, `pfnGetPresentPrivateDriverDataSize`.
 ///
@@ -62,3 +63,23 @@ pub(crate) fn install_cmdlist(
     filling.advance()
 }
 
+/// L8's refusal counters, printed by `crate::log_refusal_summary` at this
+/// lane's position in `lib.rs`'s `UMD12_REFUSAL_SETS`.
+///
+/// ⭐ **Declared here rather than in `lib.rs` so this lane's diff against the
+/// crate root is empty.** Every one of the eleven S6 lanes needs counters
+/// (`PARALLEL.md` §9.1: *every skipped or refused path gets a named counter*),
+/// and one flat array in `lib.rs` would have been the split's hottest merge
+/// point — §5's shared-file table does not even list `lib.rs`. Same move
+/// `forward12::tables12` makes for the 206 slots: name all eleven up front and
+/// the lanes become substitutive instead of additive.
+///
+/// ⛔ **Append only.** Counter order inside a set, and set order in
+/// `UMD12_REFUSAL_SETS`, are both the evidence contract: `D3D12 DDI refusals:`
+/// lines get diffed across builds.
+///
+/// ⚠ Empty until this lane lands. That is a readable state and not a dead
+/// one — the array is iterated on every summary, so the day L8
+/// (present) lands, its counters appear at
+/// exactly this position.
+pub(crate) static REFUSALS: &[&RefusalCounter] = &[];

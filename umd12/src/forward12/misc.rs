@@ -56,6 +56,7 @@
 use super::tables12::{stage, Filling};
 use super::tables12::{CommandListTable, DeviceCoreTable};
 use crate::{ddi12, log_error, note_refusal, UMD12_REFUSALS};
+use helios_umd_common::refusals::RefusalCounter;
 
 /// How many physical adapters this driver's node map describes.
 ///
@@ -168,3 +169,32 @@ pub(crate) fn install_cmdlist(
     filling.advance()
 }
 
+/// L9's refusal counters, printed by `crate::log_refusal_summary` at this
+/// lane's position in `lib.rs`'s `UMD12_REFUSAL_SETS`.
+///
+/// ⭐ **Declared here rather than in `lib.rs` so this lane's diff against the
+/// crate root is empty.** Every one of the eleven S6 lanes needs counters
+/// (`PARALLEL.md` §9.1: *every skipped or refused path gets a named counter*),
+/// and one flat array in `lib.rs` would have been the split's hottest merge
+/// point — §5's shared-file table does not even list `lib.rs`. Same move
+/// `forward12::tables12` makes for the 206 slots: name all eleven up front and
+/// the lanes become substitutive instead of additive.
+///
+/// ⛔ **Append only.** Counter order inside a set, and set order in
+/// `UMD12_REFUSAL_SETS`, are both the evidence contract: `D3D12 DDI refusals:`
+/// lines get diffed across builds.
+///
+/// ⚠ Empty until this lane lands. That is a readable state and not a dead
+/// one — the array is iterated on every summary, so the day L9
+/// (the tail: meta-commands, state objects, VRS, mesh, work graphs) lands, its counters appear at
+/// exactly this position.
+///
+/// ⚠ **Empty even though this file already has two live slots.**
+/// `pfnQueryNodeMap` and `pfnGetImplicitPhysicalAdapterMask` landed with L1
+/// because the caps sweep needs them, so their two counters
+/// (`NodeMapBadArg`, `NodeMapUnexpectedAdapterCount`) are in the spine's set,
+/// where they were declared and where the evidence contract has already
+/// printed them. ⛔ They are not moved here: a counter that changes position
+/// in `D3D12 DDI refusals:` breaks the diff that set order exists to protect.
+/// The rest of L9's counters go here.
+pub(crate) static REFUSALS: &[&RefusalCounter] = &[];

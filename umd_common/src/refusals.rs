@@ -89,13 +89,37 @@ impl RefusalCounter {
 /// replaced, given the same prefix and the same counter order — which is what
 /// makes the move checkable rather than merely plausible.
 pub fn summary(prefix: &str, counters: &[&RefusalCounter]) -> String {
-    let mut out = String::with_capacity(prefix.len() + counters.len() * 32);
+    summary_sets(prefix, &[counters])
+}
+
+/// Render SEVERAL sets as one line, concatenated in the order given.
+///
+/// ⭐ **This exists so a driver's counters can live beside the code that
+/// increments them without the summary becoming eleven separate log lines.**
+/// `umd12` is written by eleven concurrent lanes (`PARALLEL.md` §4) and a single
+/// flat counter list in `lib.rs` is the hottest merge point in that split — §5's
+/// shared-file table does not even list `lib.rs`, which is how the hazard stayed
+/// invisible. Each lane declares its own set in its own file; the crate root
+/// holds one line per lane and calls this.
+///
+/// ⛔ **Concatenation order is the evidence contract**, exactly as counter order
+/// within a set is: `D3D12 DDI refusals:` lines get diffed across builds. A set
+/// is appended, never inserted, and a lane's counters never move between sets.
+///
+/// ⚠ Byte-identical to [`summary`] for a single set — which is what keeps every
+/// pre-split `DDI refusals:` line comparable with a post-split one, since the
+/// spine's own set stays first and unchanged.
+pub fn summary_sets(prefix: &str, sets: &[&[&RefusalCounter]]) -> String {
+    let total: usize = sets.iter().map(|s| s.len()).sum();
+    let mut out = String::with_capacity(prefix.len() + total * 32);
     out.push_str(prefix);
-    for c in counters {
-        out.push(' ');
-        out.push_str(c.name());
-        out.push('=');
-        out.push_str(&c.get().to_string());
+    for set in sets {
+        for c in *set {
+            out.push(' ');
+            out.push_str(c.name());
+            out.push('=');
+            out.push_str(&c.get().to_string());
+        }
     }
     out
 }
