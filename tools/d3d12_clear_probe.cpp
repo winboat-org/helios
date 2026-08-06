@@ -21,6 +21,38 @@
 //   clear.exe                        Helios, report only, exit 0
 //   clear.exe --expect ok            exit 0 iff the readback pixel is exact
 //   clear.exe --adapter warp         the CONTROL arm -- see below
+//   clear.exe --sentinel             stamp the readback buffer first -- see kSentinel
+//   clear.exe --settle 2000          re-survey after N ms, and again after a remap
+//   clear.exe --debug-layer          EnableDebugLayer + drain ID3D12InfoQueue
+//
+// == WHY --settle EXISTS ==
+//
+// The D3D12 DDI has no `pfnGetCompletedFenceValue` and no
+// `pfnSetEventOnCompletion`: the runtime services the application's
+// `ID3D12Fence` itself, and `umd12` makes no kernel submission at all
+// (`EclNoWddmSubmission=1`). vkd3d's `ExecuteCommandLists` only ENQUEUES; the
+// real `vkQueueSubmit2` happens later, on a worker thread. So the application's
+// fence can complete with NO causal dependency on the engine's Vulkan work, and
+// an all-sentinel readback then has a second reading the first round did not
+// separate:
+//
+//   * the work never lands            -> the buffer is still the sentinel, for
+//                                        ever, however long you wait;
+//   * the work lands LATE             -> the buffer is the sentinel at T+0 and
+//                                        the correct pixels a moment later.
+//
+// `--settle <ms>` sleeps and re-surveys, twice: once through the SAME still-live
+// mapping (which answers "did the bytes appear in memory the CPU already sees?")
+// and once after an Unmap/Map pair. The remap is not ceremony: vkd3d issues
+// `vkInvalidateMappedMemoryRanges` inside `ID3D12Resource::Map`, and the
+// heap-scoped D3D12 DDI only reaches that on a fresh `pfnMapHeap`. A buffer that
+// is correct only after the remap is a COHERENCY finding; correct after the
+// sleep alone is a pure ORDERING finding; still sentinel after both is a dead
+// path.
+//
+// ! The settle surveys are DIAGNOSTIC ONLY. `--expect ok` still grades the T+0
+//   survey and nothing else -- a late arrival is a failure with a mechanism, not
+//   a pass.
 //
 // == WHY THERE ARE NO SHADERS IN HERE ==
 //
@@ -83,9 +115,16 @@
 #include <windows.h>
 
 #include <d3d12.h>
+// ! ID3D12Debug and ID3D12InfoQueue live HERE, not in d3d12.h -- only the
+//   D3D12GetDebugInterface entry point is declared there. Including it after
+//   windows.h is deliberate: winuser.h's `#define GetMessage GetMessageW` is
+//   then in force for the interface DECLARATION as well as for our call site,
+//   so both rename together and the call resolves.
+#include <d3d12sdklayers.h>
 #include <dxgi1_6.h>
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <cwchar>
 
@@ -149,12 +188,128 @@ void release(T*& p) {
     }
 }
 
+// The result of one pass over the readback buffer. Returned rather than printed
+// only, because `--settle` compares passes against each other: a T+0 that is
+// wrong and a +2000 ms that is exact is the LATE ARRIVAL finding, and that
+// comparison needs numbers, not stdout.
+struct SurveyResult {
+    UINT64 exact;
+    UINT64 near_miss;
+    UINT64 wrong;
+    UINT64 still_sentinel;
+    bool have_first_wrong;
+    UINT first_wrong_x;
+    UINT first_wrong_y;
+    BYTE first_wrong[4];
+};
+
+// ! ONE implementation, called up to three times. A second, hand-copied
+//   comparison for the settle passes would be a way for the three answers to
+//   disagree for a reason that is not the driver.
+SurveyResult survey(const BYTE* base, UINT row_pitch, UINT64 readback_bytes, bool sentinel,
+                    const char* label) {
+    SurveyResult r = {};
+
+    printf("\n---- %s ----\n", label);
+
+    // The attribution, when `--sentinel` is on. Counted over the whole buffer so
+    // a partial copy is visible as a mixture rather than rounded to one of the
+    // two stories.
+    if (sentinel) {
+        UINT64 zeroed = 0;
+        UINT64 other = 0;
+        for (UINT64 i = 0; i < readback_bytes; ++i) {
+            if (base[i] == kSentinel) {
+                ++r.still_sentinel;
+            } else if (base[i] == 0) {
+                ++zeroed;
+            } else {
+                ++other;
+            }
+        }
+        printf("sentinel survey: %llu still 0x%02X, %llu zeroed, %llu other (of %llu)\n",
+               static_cast<unsigned long long>(r.still_sentinel), kSentinel,
+               static_cast<unsigned long long>(zeroed),
+               static_cast<unsigned long long>(other),
+               static_cast<unsigned long long>(readback_bytes));
+        if (r.still_sentinel == readback_bytes) {
+            printf("  => the mapping is COHERENT and the GPU work has NOT landed (yet).\n");
+            printf("     Look at recording and submission, not at pfnMapHeap.\n");
+        } else if (zeroed == readback_bytes) {
+            printf("  => this Map returned memory that is NOT the buffer the CPU wrote: the\n");
+            printf("     sentinel is gone and the read is fresh zeros. This is a pfnMapHeap /\n");
+            printf("     heap-identity defect, not a rendering one.\n");
+        } else if (other > 0) {
+            printf("  => mixed: some bytes are neither the sentinel nor zero, so real GPU\n");
+            printf("     output reached this buffer.\n");
+        }
+    }
+
+    const BYTE* pixel0 = base;
+    printf("pixel(0,0)  = (%u, %u, %u, %u)\n", pixel0[0], pixel0[1], pixel0[2], pixel0[3]);
+    printf("expected    = (%u, %u, %u, %u)\n", kExpectR, kExpectG, kExpectB, kExpectA);
+
+    // Not only pixel 0. A clear that wrote one pixel, or wrote the first row and
+    // stopped, or ignored the row pitch, all pass a single-pixel check. Sweeping
+    // the whole surface costs nothing here and turns three different
+    // partial-write bugs into a count.
+    for (UINT y = 0; y < kHeight; ++y) {
+        const BYTE* row = base + static_cast<UINT64>(y) * row_pitch;
+        for (UINT x = 0; x < kWidth; ++x) {
+            const BYTE* p = row + static_cast<UINT64>(x) * 4;
+            const int dr = static_cast<int>(p[0]) - static_cast<int>(kExpectR);
+            const int dg = static_cast<int>(p[1]) - static_cast<int>(kExpectG);
+            const int db = static_cast<int>(p[2]) - static_cast<int>(kExpectB);
+            const int da = static_cast<int>(p[3]) - static_cast<int>(kExpectA);
+            if (dr == 0 && dg == 0 && db == 0 && da == 0) {
+                ++r.exact;
+            } else if (dr >= -1 && dr <= 1 && dg >= -1 && dg <= 1 && db >= -1 && db <= 1 &&
+                       da >= -1 && da <= 1) {
+                ++r.near_miss;
+            } else {
+                ++r.wrong;
+                if (!r.have_first_wrong) {
+                    r.first_wrong[0] = p[0];
+                    r.first_wrong[1] = p[1];
+                    r.first_wrong[2] = p[2];
+                    r.first_wrong[3] = p[3];
+                    r.first_wrong_x = x;
+                    r.first_wrong_y = y;
+                    r.have_first_wrong = true;
+                }
+            }
+        }
+    }
+    const UINT64 total = static_cast<UINT64>(kWidth) * kHeight;
+    printf("surface     = %llu exact, %llu within +/-1, %llu wrong (of %llu)\n",
+           static_cast<unsigned long long>(r.exact),
+           static_cast<unsigned long long>(r.near_miss),
+           static_cast<unsigned long long>(r.wrong),
+           static_cast<unsigned long long>(total));
+    if (r.have_first_wrong) {
+        printf("first wrong at (%u, %u) = (%u, %u, %u, %u)\n",
+               r.first_wrong_x, r.first_wrong_y,
+               r.first_wrong[0], r.first_wrong[1], r.first_wrong[2], r.first_wrong[3]);
+    }
+    return r;
+}
+
+// Both call sites print it the same way, and both matter: a device that is
+// already removed explains a fence that returns instantly, and one that is NOT
+// removed forbids that explanation.
+void print_removed_reason(ID3D12Device* device, const char* when) {
+    printf("%-38s 0x%08lX  (%s)\n", "GetDeviceRemovedReason",
+           static_cast<unsigned long>(device->GetDeviceRemovedReason()), when);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     Expect expect = Expect::Report;
     Which which = Which::Helios;
     bool sentinel = false;
+    unsigned settle_ms = 0;
+    bool debug_layer = false;
 
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--expect") == 0 && i + 1 < argc) {
@@ -177,19 +332,52 @@ int main(int argc, char** argv) {
             }
         } else if (std::strcmp(argv[i], "--sentinel") == 0) {
             sentinel = true;
+        } else if (std::strcmp(argv[i], "--settle") == 0 && i + 1 < argc) {
+            ++i;
+            const long ms = std::atol(argv[i]);
+            if (ms < 0 || ms > 600000) {
+                printf("FAIL: --settle takes 0..600000 ms, got '%s'\n", argv[i]);
+                return 2;
+            }
+            settle_ms = static_cast<unsigned>(ms);
+        } else if (std::strcmp(argv[i], "--debug-layer") == 0) {
+            debug_layer = true;
         } else {
             printf("FAIL: unrecognised argument '%s'\n", argv[i]);
             return 2;
         }
     }
 
-    printf("d3d12_clear_probe: adapter=%s expect=%s\n",
+    printf("d3d12_clear_probe: adapter=%s expect=%s sentinel=%s settle=%ums debugLayer=%s\n",
            which == Which::Warp ? "WARP (control)" : "Helios",
-           expect == Expect::Ok ? "ok" : "report");
+           expect == Expect::Ok ? "ok" : "report",
+           sentinel ? "on" : "off",
+           settle_ms,
+           debug_layer ? "on" : "off");
     printf("target %ux%u R8G8B8A8_UNORM, clear {%.1f, %.1f, %.1f, %.1f} -> (%u, %u, %u, %u)\n\n",
            kWidth, kHeight,
            kClearColour[0], kClearColour[1], kClearColour[2], kClearColour[3],
            kExpectR, kExpectG, kExpectB, kExpectA);
+
+    // ---- optional: the debug layer, which must be enabled BEFORE any device
+    // exists or it does not apply to it.
+    //
+    // ! Fails soft on purpose. The layer ships in the "Graphics Tools" optional
+    //   feature, so its absence is a configuration fact about this VM and not a
+    //   result about the driver; a probe that aborted here would lose the run it
+    //   was asked to make.
+    ID3D12Debug* debug = nullptr;
+    if (debug_layer) {
+        HRESULT dbg = D3D12GetDebugInterface(IID_PPV_ARGS(&debug));
+        if (SUCCEEDED(dbg) && debug) {
+            debug->EnableDebugLayer();
+            printf("%-38s enabled\n", "D3D12 debug layer");
+        } else {
+            printf("debug layer unavailable hr=0x%08lX -- continuing without it\n",
+                   static_cast<unsigned long>(dbg));
+            release(debug);
+        }
+    }
 
     IDXGIFactory4* factory = nullptr;
     if (!step("CreateDXGIFactory2", CreateDXGIFactory2(0, IID_PPV_ARGS(&factory)))) {
@@ -249,13 +437,34 @@ int main(int argc, char** argv) {
     ID3D12Resource* target = nullptr;
     ID3D12Resource* readback = nullptr;
     ID3D12Fence* fence = nullptr;
+    ID3D12InfoQueue* info_queue = nullptr;
     HANDLE fence_event = nullptr;
     int rc = 2;
+    // Kept outside the loop so the epilogue can grade them after every `break`.
+    SurveyResult t0_survey = {};
+    SurveyResult settled_survey = {};
+    SurveyResult remap_survey = {};
+    bool have_t0 = false;
+    bool have_settled = false;
+    bool have_remap = false;
 
     do {
         if (!step("D3D12CreateDevice(FL 11_0)",
                   D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)))) {
             break;
+        }
+
+        // The info queue is a QI on the device and only exists when the debug
+        // layer is live. It is drained at the very end, not here, so that the
+        // messages a failing run produces are all in one block.
+        if (debug_layer) {
+            HRESULT iq = device->QueryInterface(IID_PPV_ARGS(&info_queue));
+            printf("%-38s hr=0x%08lX %s\n", "QueryInterface(ID3D12InfoQueue)",
+                   static_cast<unsigned long>(iq),
+                   SUCCEEDED(iq) ? "" : "-- no per-message detail this run");
+            if (FAILED(iq)) {
+                info_queue = nullptr;
+            }
         }
 
         // The queue, and with it the WDDM context. This is the first D3D12 queue
@@ -360,12 +569,20 @@ int main(int argc, char** argv) {
 
         // ---- optional: stamp the readback buffer from the CPU, before any GPU
         // work exists to overwrite it. See `kSentinel`.
+        //
+        // ! Its POINTER is kept. The probe used to map twice and never compare
+        //   the two addresses, which left "the read map is a different buffer"
+        //   as an unfalsifiable story told from the byte values alone.
+        void* pre_ptr = nullptr;
         if (sentinel) {
             void* pre = nullptr;
             D3D12_RANGE none = {0, 0};
             if (!step("Map(readback, pre-fill)", readback->Map(0, &none, &pre)) || !pre) {
                 break;
             }
+            pre_ptr = pre;
+            printf("%-38s ptr=0x%016llX\n", "Map(readback, pre-fill)",
+                   reinterpret_cast<unsigned long long>(pre));
             std::memset(pre, kSentinel, static_cast<size_t>(readback_bytes));
             D3D12_RANGE all = {0, static_cast<SIZE_T>(readback_bytes)};
             readback->Unmap(0, &all);
@@ -438,12 +655,31 @@ int main(int argc, char** argv) {
         // ⚠ Bounded. An unbounded wait on a driver under bring-up is a hung gate
         // with no output, which is strictly worse than a reported timeout -- and a
         // frozen run is a defect to root-cause, never a retry.
+        //
+        // ! TIMED. The DDI has no `pfnGetCompletedFenceValue` and no
+        //   `pfnSetEventOnCompletion` -- the runtime services this fence itself
+        //   -- so the duration is evidence in its own right. A wait that returns
+        //   in a few microseconds did not wait for a GPU; it observed a value
+        //   that was already there.
         const DWORD kTimeoutMs = 20000;
+        LARGE_INTEGER qpf = {};
+        LARGE_INTEGER wait_begin = {};
+        LARGE_INTEGER wait_end = {};
+        QueryPerformanceFrequency(&qpf);
+        QueryPerformanceCounter(&wait_begin);
         DWORD waited = WaitForSingleObject(fence_event, kTimeoutMs);
-        printf("%-38s %s (completed=%llu)\n",
+        QueryPerformanceCounter(&wait_end);
+        const double wait_us =
+            qpf.QuadPart
+                ? static_cast<double>(wait_end.QuadPart - wait_begin.QuadPart) * 1000000.0 /
+                      static_cast<double>(qpf.QuadPart)
+                : -1.0;
+        printf("%-38s %s in %.1f us (completed=%llu)\n",
                "WaitForSingleObject",
                waited == WAIT_OBJECT_0 ? "signalled" : (waited == WAIT_TIMEOUT ? "TIMEOUT" : "?"),
+               wait_us,
                static_cast<unsigned long long>(fence->GetCompletedValue()));
+        print_removed_reason(device, "after the fence wait");
         if (waited != WAIT_OBJECT_0) {
             printf("FAIL: the GPU did not complete within %lu ms. This is a defect to\n",
                    static_cast<unsigned long>(kTimeoutMs));
@@ -457,99 +693,66 @@ int main(int argc, char** argv) {
         if (!step("Map(readback)", readback->Map(0, &read_range, &mapped)) || !mapped) {
             break;
         }
+        printf("%-38s ptr=0x%016llX\n", "Map(readback)",
+               reinterpret_cast<unsigned long long>(mapped));
+        if (sentinel) {
+            printf("%-38s %s\n", "  pre-fill ptr vs read ptr",
+                   pre_ptr == mapped ? "EQUAL -- the same mapping came back"
+                                     : "DIFFERENT -- the two Maps are different addresses");
+        }
 
         const BYTE* base = static_cast<const BYTE*>(mapped);
-
-        // ⭐ The attribution, when `--sentinel` is on. Counted over the whole
-        // buffer so a partial copy is visible as a mixture rather than rounded to
-        // one of the two stories.
-        if (sentinel) {
-            UINT64 still_sentinel = 0;
-            UINT64 zeroed = 0;
-            UINT64 other = 0;
-            for (UINT64 i = 0; i < readback_bytes; ++i) {
-                if (base[i] == kSentinel) {
-                    ++still_sentinel;
-                } else if (base[i] == 0) {
-                    ++zeroed;
-                } else {
-                    ++other;
-                }
-            }
-            printf("\nsentinel survey: %llu still 0x%02X, %llu zeroed, %llu other (of %llu)\n",
-                   static_cast<unsigned long long>(still_sentinel), kSentinel,
-                   static_cast<unsigned long long>(zeroed),
-                   static_cast<unsigned long long>(other),
-                   static_cast<unsigned long long>(readback_bytes));
-            if (still_sentinel == readback_bytes) {
-                printf("  => the mapping is COHERENT and the GPU work did NOT land.\n");
-                printf("     Look at recording and submission, not at pfnMapHeap.\n");
-            } else if (zeroed == readback_bytes) {
-                printf("  => the second Map returned memory that is NOT the buffer the CPU\n");
-                printf("     wrote: the sentinel is gone and the read is fresh zeros. This is\n");
-                printf("     a pfnMapHeap / heap-identity defect, not a rendering one.\n");
-            } else if (other > 0) {
-                printf("  => mixed: some bytes are neither the sentinel nor zero, so real GPU\n");
-                printf("     output reached this buffer. A partial copy, not a dead path.\n");
-            }
-        }
-
-        const BYTE* pixel0 = base;
-        printf("\npixel(0,0)  = (%u, %u, %u, %u)\n", pixel0[0], pixel0[1], pixel0[2], pixel0[3]);
-        printf("expected    = (%u, %u, %u, %u)\n", kExpectR, kExpectG, kExpectB, kExpectA);
-
-        // ⭐ Not only pixel 0. A clear that wrote one pixel, or wrote the first row
-        // and stopped, or ignored the row pitch, all pass a single-pixel check.
-        // Sweeping the whole surface costs nothing here and turns three different
-        // partial-write bugs into a count.
-        UINT64 exact = 0;
-        UINT64 near_miss = 0;
-        UINT64 wrong = 0;
-        BYTE first_wrong[4] = {0, 0, 0, 0};
-        UINT first_wrong_x = 0;
-        UINT first_wrong_y = 0;
-        bool have_first_wrong = false;
-        for (UINT y = 0; y < kHeight; ++y) {
-            const BYTE* row = base + static_cast<UINT64>(y) * footprint.Footprint.RowPitch;
-            for (UINT x = 0; x < kWidth; ++x) {
-                const BYTE* p = row + static_cast<UINT64>(x) * 4;
-                const int dr = static_cast<int>(p[0]) - static_cast<int>(kExpectR);
-                const int dg = static_cast<int>(p[1]) - static_cast<int>(kExpectG);
-                const int db = static_cast<int>(p[2]) - static_cast<int>(kExpectB);
-                const int da = static_cast<int>(p[3]) - static_cast<int>(kExpectA);
-                if (dr == 0 && dg == 0 && db == 0 && da == 0) {
-                    ++exact;
-                } else if (dr >= -1 && dr <= 1 && dg >= -1 && dg <= 1 && db >= -1 && db <= 1 &&
-                           da >= -1 && da <= 1) {
-                    ++near_miss;
-                } else {
-                    ++wrong;
-                    if (!have_first_wrong) {
-                        first_wrong[0] = p[0];
-                        first_wrong[1] = p[1];
-                        first_wrong[2] = p[2];
-                        first_wrong[3] = p[3];
-                        first_wrong_x = x;
-                        first_wrong_y = y;
-                        have_first_wrong = true;
-                    }
-                }
-            }
-        }
         const UINT64 total = static_cast<UINT64>(kWidth) * kHeight;
-        printf("surface     = %llu exact, %llu within +/-1, %llu wrong (of %llu)\n",
-               static_cast<unsigned long long>(exact),
-               static_cast<unsigned long long>(near_miss),
-               static_cast<unsigned long long>(wrong),
-               static_cast<unsigned long long>(total));
-        if (have_first_wrong) {
-            printf("first wrong at (%u, %u) = (%u, %u, %u, %u)\n",
-                   first_wrong_x, first_wrong_y,
-                   first_wrong[0], first_wrong[1], first_wrong[2], first_wrong[3]);
+
+        t0_survey = survey(base, footprint.Footprint.RowPitch, readback_bytes, sentinel,
+                           "survey @ T+0 (immediately after the fence wait)");
+        have_t0 = true;
+
+        // ---- optional: does it arrive LATE? ----
+        //
+        // ! Diagnostic only. `rc` below is decided by `t0_survey` and by nothing
+        //   here; a late arrival is a failure WITH A MECHANISM, not a pass.
+        if (settle_ms != 0) {
+            printf("\n--settle %u: sleeping, then re-reading the SAME mapping...\n", settle_ms);
+            Sleep(settle_ms);
+            char label[96];
+            _snprintf_s(label, sizeof(label), _TRUNCATE, "survey @ +%ums (same mapping)",
+                        settle_ms);
+            settled_survey =
+                survey(base, footprint.Footprint.RowPitch, readback_bytes, sentinel, label);
+            have_settled = true;
+
+            // The remap is not ceremony. vkd3d calls
+            // `vkInvalidateMappedMemoryRanges` inside `ID3D12Resource::Map`, and
+            // on a heap-scoped D3D12 DDI that invalidate is only reached through
+            // a fresh `pfnMapHeap`. If the bytes are in host memory but this
+            // process's view of them is stale, THIS is the pass that shows it.
+            D3D12_RANGE nothing_written = {0, 0};
+            readback->Unmap(0, &nothing_written);
+            void* remapped = nullptr;
+            if (!step("Map(readback, remap)", readback->Map(0, &read_range, &remapped)) ||
+                !remapped) {
+                printf("FAIL: the remap did not return a pointer; no post-remap survey.\n");
+                break;
+            }
+            printf("%-38s ptr=0x%016llX\n", "remap", reinterpret_cast<unsigned long long>(remapped));
+            printf("%-38s %s\n", "  read ptr vs remap ptr",
+                   remapped == mapped ? "EQUAL -- the same address was handed back"
+                                      : "DIFFERENT -- the remap moved the mapping");
+            mapped = remapped;
+            base = static_cast<const BYTE*>(remapped);
+            remap_survey =
+                survey(base, footprint.Footprint.RowPitch, readback_bytes, sentinel,
+                       "survey after remap (Unmap + Map, i.e. a fresh pfnMapHeap)");
+            have_remap = true;
         }
 
         D3D12_RANGE written = {0, 0};
         readback->Unmap(0, &written);
+
+        const UINT64 exact = t0_survey.exact;
+        const UINT64 near_miss = t0_survey.near_miss;
+        const UINT64 wrong = t0_survey.wrong;
 
         if (exact == total) {
             printf("\nPASS: every one of %llu pixels is exactly (%u, %u, %u, %u).\n",
@@ -569,9 +772,90 @@ int main(int argc, char** argv) {
         }
     } while (false);
 
+    // ---- the settle verdict -------------------------------------------------
+    //
+    // ! Printed AFTER the pass/fail line and it does not touch `rc`. This block
+    //   exists to split "the work lands late" from "the work never lands", which
+    //   are the same picture at T+0 and completely different defects.
+    if (have_t0 && (have_settled || have_remap)) {
+        const UINT64 total_px = static_cast<UINT64>(kWidth) * kHeight;
+        const bool t0_ok = (t0_survey.exact == total_px);
+        const bool settled_ok = have_settled && (settled_survey.exact == total_px);
+        const bool remap_ok = have_remap && (remap_survey.exact == total_px);
+
+        printf("\n---- settle verdict ----\n");
+        printf("exact pixels: T+0=%llu", static_cast<unsigned long long>(t0_survey.exact));
+        if (have_settled) {
+            printf("  +%ums=%llu", settle_ms,
+                   static_cast<unsigned long long>(settled_survey.exact));
+        }
+        if (have_remap) {
+            printf("  after-remap=%llu", static_cast<unsigned long long>(remap_survey.exact));
+        }
+        printf("  (of %llu)\n", static_cast<unsigned long long>(total_px));
+
+        if (!t0_ok && (settled_ok || remap_ok)) {
+            printf("*** LATE ARRIVAL: the pixels are correct at +%ums but were not at +0. ***\n",
+                   settle_ms);
+            printf("    The GPU work DOES land. The application's fence completed without a\n");
+            printf("    causal dependency on it -- an ORDERING defect, not a dead path.\n");
+            if (!settled_ok && remap_ok) {
+                printf("    ...and only AFTER the remap, so it is specifically the invalidate:\n");
+                printf("    the bytes were in host memory while this mapping's view was stale.\n");
+            }
+        } else if (!t0_ok) {
+            printf("NO LATE ARRIVAL: still wrong at +%ums and still wrong after a fresh\n",
+                   settle_ms);
+            printf("    pfnMapHeap. Waiting is not the missing ingredient; the work is not\n");
+            printf("    reaching this buffer at all.\n");
+        } else {
+            printf("T+0 was already exact; the settle passes are corroboration only.\n");
+        }
+    }
+
+    if (device) {
+        print_removed_reason(device, "at exit");
+    }
+
+    // ---- the debug layer's own account, if there is one ---------------------
+    if (info_queue) {
+        const UINT64 stored = info_queue->GetNumStoredMessages();
+        printf("\n---- ID3D12InfoQueue: %llu stored message(s) ----\n",
+               static_cast<unsigned long long>(stored));
+        for (UINT64 i = 0; i < stored; ++i) {
+            SIZE_T len = 0;
+            // Two-call idiom: the first asks the size, the second fills it. A
+            // fixed buffer would truncate exactly the long messages that carry
+            // the detail.
+            if (FAILED(info_queue->GetMessage(i, nullptr, &len)) || len == 0) {
+                continue;
+            }
+            D3D12_MESSAGE* msg = static_cast<D3D12_MESSAGE*>(std::malloc(len));
+            if (!msg) {
+                printf("  [%llu] out of memory reading the message\n",
+                       static_cast<unsigned long long>(i));
+                break;
+            }
+            if (SUCCEEDED(info_queue->GetMessage(i, msg, &len))) {
+                printf("  [%llu] cat=%d sev=%d id=%d: %s\n",
+                       static_cast<unsigned long long>(i),
+                       static_cast<int>(msg->Category), static_cast<int>(msg->Severity),
+                       static_cast<int>(msg->ID),
+                       msg->pDescription ? msg->pDescription : "(no description)");
+            }
+            std::free(msg);
+        }
+        if (stored == 0) {
+            printf("  (the debug layer had nothing to say -- an absence, and it is a finding:\n");
+            printf("   no invalid call, no leaked object, no state error was detected.)\n");
+        }
+    }
+
     if (fence_event) {
         CloseHandle(fence_event);
     }
+    release(info_queue);
+    release(debug);
     release(fence);
     release(readback);
     release(target);
