@@ -3509,10 +3509,17 @@ silent on it:
     (zeroed lane counts fail device creation), `1003` (zeroed alignments are four
     separate errors), `1088` (`EXECUTE_INDIRECT_TIER` has no zero enumerator, so a
     zero-fill writes an out-of-range tier the runtime clamps **silently**).
-  - ⛔ **`MaxSamplerDescriptorHeapSize` is 2048, not `SUBSTRATE.md` §4.5's ">= 4000".**
-    4000 exceeds `D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE` **and** contradicts this
-    box's own measured baseline (`baselines/d3d12-caps.csv:85`). §4.5 needs correcting;
-    the code records the disagreement at the write site.
+  - ⛔ ~~**`MaxSamplerDescriptorHeapSize` is 2048, not `SUBSTRATE.md` §4.5's ">= 4000".**~~
+    **FALSIFIED 2026-08-06 by the runtime itself, at `D12-G7`.** ETW
+    `Microsoft-Windows-Direct3D12`: `Driver's MaxSamplerDescriptorHeapSize is too small`
+    (strings:113) with 2048. **§4.5 was right and this "correction" was a LAYER
+    CONFUSION**, which is the part worth keeping: both arguments for 2048 —
+    `D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE` and
+    `baselines/d3d12-caps.csv:85` — are **API-level**, and the runtime is what clamps
+    the DDI value down to them. `d3d12_caps_dump.cpp` reads the *post-clamp* number
+    through the API, so it could not have disagreed with 4000 whatever the driver
+    reported. ⇒ **an API-level capture cannot falsify a DDI-level requirement.** The
+    value is now 4000, which is also exactly the guest's `maxSamplerAllocationCount`.
   - ⛔ **Refusing an unknown `pfnFillDDITable` type LOSES THE DEVICE.** The runtime asks
     for `D3D12DDI_TABLE_TYPE_0096_EXTENDED_FEATURES` (27, 32 B) on a baseline device.
     Unknown tables are now stub-filled at the runtime's own byte count and counted —
@@ -3563,31 +3570,58 @@ silent on it:
     `D3D11CreateDevice`"). `Umd12FormatCaps=1` (API passthrough) truncates the runtime's
     format sweep at **12 formats / 271 MSAA queries** against **23 / 600** for the DDI
     encoding. Arm 0 is the default; arm 1 stays reachable (CLAUDE.md rule 8).
-- ⛔ **`D12-G7` is STILL `0x887A0020`, and the blocker changed shape: it is now ONE
-  FORMAT AT A TIME.** The runtime walks a 91-format sweep with 30
-  `pfnCheckMultisampleQualityLevels` calls each and **aborts at the first answer it
-  rejects** — with counting noops (every answer 0) the sweep ran to completion, so the
-  truncation is caused by answer *content* and the stop point moves with it.
-  - The first run's ETW `Microsoft-Windows-Direct3D12` reason was explicit —
-    `Index=62 Code=0x887A0020 Message=MSAA quality reported to be 0` — and is now
-    **gone**; the current failure emits no ETW reason at all.
-  - Three multisample rules were derived from measured accept/reject points and are in
-    the code with named counters: **(A)** a format that declares any capability and can
-    be multisampled must declare `MULTISAMPLE_RENDERTARGET`; **(B)** one that cannot be
-    multisampled must declare neither MSAA bit; **(C)** `MULTISAMPLE_LOAD` only where
-    `RENDERTARGET` is set. (A) and (C) each advanced the sweep by **exactly one format**.
-  - ⛔ **All four multisample-bit combinations for `R32_FLOAT_X8X24_TYPELESS` (21) are
-    rejected**, so what remains there is `SHADER_SAMPLE`/`SHADER_GATHER`, not MSAA.
-- ⛔ **Next is an INSTRUMENT, not a fourth guess.** Advancing one format per
-  build+deploy+run cycle is reverse-engineering a 91-entry table by bisection. The
-  ground truth needed is *what a real driver answers at this DDI*, and the vehicle
-  exists: `tools/d3d12_spy/` is a full thunking shim in front of WARP's UMD (`D12-G5`)
-  that today records call **counts** through generic asm thunks. Special-casing
-  `core[0] pfnCheckFormatSupport` and `core[1] pfnCheckMultisampleQualityLevels` to log
-  their arguments and written values yields WARP's whole 91-format table in one run —
-  which also discharges `GATES.md` §3.2's outstanding `d3d12_format_matrix_probe`
-  baseline for `D12-G9`, and turns this failure class into a diff permanently.
-  **Then** `D12-G7` → the remaining ten lanes fan out → the §10 review pass.
+- ⭐⭐ **`D12-G7` PASSES (2026-08-06, `23fbf44`): a real `ID3D12Device` exists on the
+  Helios adapter, built by the D3D12 runtime through Helios' own `d3d12umddi`
+  implementation on top of vkd3d on venus.** `D3D12CreateDevice` → `S_OK` at FL 11_0,
+  `nodes=1`, `final Release()` → refcount 0. The runtime then builds its **own** objects
+  through the DDI — a root signature, two graphics PSOs, a command pool, the
+  extended-features handshake — and reports
+  `UMAdapterVersion = UMDeviceVersion = 0xC0050006E0000`, D12's single `_0110` token
+  negotiated end to end. Full write-up: `tmp/dx12/gates/G7/RESULT.md`.
+  - ⭐ **The fix was already in this repository, in the D3D11 driver.** Six
+    build/deploy/run cycles were spent bisecting the runtime's per-format contract
+    before the answer turned out to be written down:
+    `umd/src/forward/queries.rs:104-164` does **not** forward the engine's
+    quality-level answer, it *derives* it from the same predicate that decides the
+    format-support multisample bits, *"because the Microsoft runtime validates
+    `CheckFormatSupport` and `CheckMultisampleQualityLevels` as a coherent
+    feature-level contract"*. ⛔ **Two independent engine queries make a coherent pair
+    a coincidence; one shared predicate makes disagreement unrepresentable.**
+  - ⛔ And the predicate rests on `umd_common/src/format.rs`, whose `msaa_ineligible`
+    field doc is the entire answer to where the sweep was stopping — the depth/stencil
+    **read** views `R32_FLOAT_X8X24_TYPELESS` (21), `X32_TYPELESS_G8X24_UINT` (22),
+    `R24_UNORM_X8_TYPELESS` (46), `X24_TYPELESS_G8_UINT` (47): *"WARP reports zero
+    quality levels above 1x and the runtime rejects advertising them as MSAA render
+    targets."* The sweep stopped at **21**, and four earlier arms each changed the
+    format bits while still forwarding non-zero levels — so the one answer that works,
+    *neither bits nor levels*, was never tried.
+  - Two further answers the runtime named in English over ETW, one cycle each:
+    `ROW_MAJOR_LAYOUT_SUB_CAPS::DepthPitchAlignment` **512 → 256** (strings:85 — the
+    bound is *relative*: the identical 512 in `BaseOffsetAlignment` passes, because a
+    depth pitch is `RowPitch * Height` and `RowPitch` is only `PitchAlignment`-aligned);
+    and `OPTIONS_0102::MaxSamplerDescriptorHeapSize` **2048 → 4000** (strings:113).
+  - **Counters, all expected-non-zero and documented as such:**
+    `CapsFormatSupportCalls=93` and `CapsMsaaCalls=2730` — byte-for-byte what `D12-G5`
+    measured the runtime handing WARP; `CapsTextureLayoutSetEnd=2` (the enumeration
+    terminating as WARP's contract does); ⭐ `CapsFormatNotSupportedSentinel=1` — format
+    89's `_NOT_SUPPORTED` trap discharged and **observed**; `CapsMsaaIneligibleFormat=124`;
+    `CapsMsaaBitsDropped=4`.
+  - **Gate criteria:** `HwQRef` never moved; the knob off restores `0x887A0004` exactly
+    (`D12-G6` still passes); knobs deleted; zero id-1000 events naming `helios_umd`
+    across ten device restarts (all 60 name the venus ICD — pre-existing); desktop
+    composited afterwards with `dwm` started after the last restart; the D3D11 UMD hash
+    byte-identical throughout.
+- ⚠ **25 noop slots were hit on the passing run, and they ARE the fan-out's work list** —
+  `DDI_REFERENCE.md` §14.0's prediction landing exactly: *"`D3D12CreateDevice` alone
+  drives 27 of the 124 core slots"*, the runtime building its own internal pipelines.
+  Blend / depth-stencil / rasterizer state, `pfnCalcPrivateShaderSize`,
+  `pfnCreateVertexShader`, `pfnCreateComputeShader`, PSO create/destroy, root signature,
+  command pool, `pfnMakeResident`, `pfnGetDebugAllocationInfo`. Those are **L6**, **L2**
+  and **L4**, and driving them to zero is those lanes' definition of done
+  (`PARALLEL.md` §9.2).
+- **Next: `D12-G8`** — a triangle through the DDI, owner-visible. That needs the 25 slots
+  above, i.e. the `PARALLEL.md` §4 fan-out: **L2** first (it mints the WDDM context),
+  then **L6** → **L5** → **L4**, then L3a/L3b, then L8 — followed by the §10 review pass.
 - **Three instruments landed with L1's second half**, each of which paid for itself:
   - `tools/d3d12_format_matrix_probe.cpp` — the probe `GATES.md` §3.2 names. It
     `LoadLibrary`s the deployed `helios_umd12.dll`, takes a borrowed `ID3D12Device` off

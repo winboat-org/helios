@@ -794,9 +794,20 @@ rasterizer desc at 0099, and 0102 revs the struct again (`D3D12DDI_RASTERIZER_DE
 `pfnCreateRasterizerState` receives the 0102 shape, where a `FLOAT DepthBias` sits at the same offset an
 older `INT` did — a reinterpretation no compiler will flag.
 
-⚠ **A substrate ceiling this raises, not yet settled:** `MaxSamplerDescriptorHeapSize` must be reported
-**≥ 4000** at 0102+, and the host GPU's `maxSamplerAllocationCount` is **exactly 4000** — zero headroom
-if vkd3d allocates one `VkSampler` per descriptor. `GATES.md` §7.24 owns it.
+⭐ **A substrate ceiling this raises — and the ≥ 4000 half is now CONFIRMED BY THE RUNTIME.**
+`MaxSamplerDescriptorHeapSize` must be reported **≥ 4000** at 0102+, and the host GPU's
+`maxSamplerAllocationCount` is **exactly 4000** — zero headroom if vkd3d allocates one `VkSampler`
+per descriptor. `GATES.md` §7.24 owns the headroom question.
+
+⛔ **Do not "correct" the 4000 to 2048.** L1 did, on the reasoning that
+`D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE` is 2048 and that
+`baselines/d3d12-caps.csv:85` measures 2048 — and `D12-G7` then failed with
+`DXGI_ERROR_DRIVER_INTERNAL_ERROR` and the ETW `Microsoft-Windows-Direct3D12` reason
+`Driver's MaxSamplerDescriptorHeapSize is too small` (strings:113). Both of those facts are
+**API-level**: this is the **DDI** cap, and the runtime is what clamps it down to the API limit.
+`tools/d3d12_caps_dump.cpp` reads the post-clamp value through the API, so that baseline could not
+have disagreed with 4000 whatever the driver underneath reported. The general lesson, which cost a
+gate cycle: **an API-level capture cannot falsify a DDI-level requirement.**
 
 ⚠ **What `VulkanOn12.md` does *not* cover, despite the title:** image layouts, barriers, resource
 state, fences, semaphores, and queue submission ordering are **entirely absent** — the word does not
