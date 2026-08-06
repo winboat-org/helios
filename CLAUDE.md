@@ -158,9 +158,14 @@ helios-vgpu/
 ├── packaging/windows/      ← Install-Helios.ps1 / Verify-Helios.ps1 + the four smoke
 │                             probes — the closest thing to an automated gate today
 ├── ci/ + .github/workflows ← the Windows graphics+compute bundle build
-├── vkd3d-proton-helios/    ← submodule at 4c26d855 = upstream 2c7ba22c + 6 Helios commits
-│                             (11 files). ⛔ NOT zero divergence — that line was stale from
-│                             2026-08-05 and cost a session's reasoning. Commits 1–5 are
+├── vkd3d-proton-helios/    ← submodule, forked off upstream 2c7ba22c. ⛔⛔ **DO NOT WRITE THE
+│                             CURRENT SHA HERE.** This line has named a stale SHA three times,
+│                             twice in one session (2c7ba22c "zero divergence" → 8ee4440b →
+│                             4c26d855 → …), and each time a lane reasoned from it. A doc line
+│                             naming a moving pointer is stale by construction; read it with
+│                             `git ls-files -s vkd3d-proton-helios` and `git -C
+│                             vkd3d-proton-helios log --oneline 2c7ba22c..HEAD`, which cannot
+│                             go stale. ⛔ NOT zero divergence. The early Helios commits are
 │                             build plumbing (libs/d3d12core/{helios_entry.c,debug_control.c,
 │                             debug_control.h,helios_vkd3d.def,meson.build,main.c},
 │                             tests/test-runner.sh); the 6th is the first that is NOT —
