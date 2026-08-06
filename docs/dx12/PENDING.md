@@ -9,6 +9,160 @@ that is now the unit of work.
 
 ---
 
+## ⛔⛔ STATUS 2026-08-07 — THE CHANGESET COMPILES, AND ROUND 1 OF PHASE 2 IS DONE (10 lenses, 7 skeptics)
+
+**Read this block before every block below it.** It supersedes them where they disagree.
+
+### ⭐ All five components COMPILE and LINK — the first compiler ever to see ~55 commits
+
+`umd-check.ps1 -Mode check/-Mode release -Crate both` → **0 errors**; `umd`'s warning count
+**15**, exactly baseline (the crate split held); **no `… is STALE …`** from `umd12/build.rs`;
+`dumpbin /IMPORTS` → **no `dxgi.dll`**, link set still `libhelios_d3d12_static.a` + `gdi32`;
+`kmd-check.ps1 -Mode build` → 0 errors, 11 pre-existing dead-code warnings; `win_build_kmd`
+packaged + signed with `inf2cat`/`infverif` clean; `win_vkd3d` and `win_meson` clean; slot
+coverage **205/206**. ⇒ **no compile error revealed a wrong assumption**, so nothing was fed
+back as a new lens under `METHOD.md` §2 Phase 4.
+
+⛔ **The KMD was deliberately NOT installed.** `METHOD.md` §2 puts deploy in Phase 4, after
+saturation; installing at Phase 1 is the rejected loop with a bigger blast radius.
+
+### The round-1 result: ~41 raw findings → **3 refuted, 5 survived (all narrowed)**
+
+⛔⛔ **THE METHODOLOGICAL FINDING, and it is the most important line in this block: FOUR
+LENSES CONVERGED ON A DEFECT THAT DOES NOT EXIST.** ABI-tables, wire-vocabulary, cross-lane
+and handles all reported that `umd12`'s `pfnPresent` sends the wrong record type (`'HEPR'`,
+"declared for the VidPn primary only") and poisons the KMD's 8-slot frame-watermark LRU.
+Both halves are **REFUTED**:
+* the "primary only" domain is **stale prose** that calls the alternative record a *"legacy
+  four-byte marker"* when it is 16/32 bytes, and the **D3D11 writer has emitted `'HEPR'` with
+  a real non-zero `resource_id` for ordinary windowed presents since 2026-08-04**
+  (`apply_snapshot_override` overwrites the private record unconditionally, by design);
+* the proposed repair (`'HERF'`) is **actively harmful** — it has no `resource_id` field, and
+  `resource_id == 0` *escalates* to `QueueImmediate`, firing a generic dirty edge at DWM's
+  bound primary at app frame rate;
+* the LRU half fails on occupancy (**5 live ids against 8 slots**, and eviction picks
+  least-recently-*presented*, so a stopped buffer cannot pin a slot) and on instrumentation
+  (`BIND_REFRESH_SAMPLED`/`BeSmp` names the symptom already).
+
+⇒ **three of those four lenses read the same stale comment and inherited its claim.** Their
+independence was illusory. **Convergence measures salience, not correctness** — it is not
+evidence, and this doc set's own anti-pattern *"believing a doc claim because it is written
+down"* is what it actually demonstrated, at scale.
+
+### Refuted outright — do not re-open without new evidence
+
+| claim | why it died |
+|---|---|
+| `pfnPresent` sends the wrong record / poisons the watermark LRU | above |
+| `WddmHeadMs` is inert on the wire arm ⇒ head-of-line stall + 256-entry early completion | **backwards**: with `Umd12EclFence=0` the same packet falls to `Prefix`+`IncludingGpu`, which waits on *every* in-flight fence on *every* ring from *every* process — a strict **superset**. `Exact` REDUCES head-of-line blocking; it is the A4 repair, misread as the injury. The overflow half misquoted the comment's scope (*"a boundary that **may be unsatisfiable**"* = the tagged stream namespace, not a range-checked KMD-issued wire fence), and `WfBWire` already owns that residual |
+| the `kobj.rs` vsync heartbeat wedge | two further lenses independently rejected it: `DisplayHalf` defaults to 1 and `vsync_armed` is 1 while started, so the shipping configuration is covered |
+
+### Survived, narrowed — and two skeptics produced better findings than the claims they killed
+
+1. ⛔⛔ **FIXED (`9d511b8`) — a legal wait-before-signal was REMOVING THE `ID3D12Device`.** The
+   race the finding reported is real but LOW (it only decides anything on a fence's *first*
+   signal). Refuting it exposed the blocker underneath, which needs **no race at all**:
+   `queueB->Wait(f,N)` before `queueA->Signal(f,N)` — legal D3D12, named verbatim in
+   `fence.rs`'s own module doc — reads `watermark < N && count > 0` **deterministically**, and
+   that was the arm that reported `E_FAIL` through `pfnSetErrorCb`. **Time Spy's async-compute
+   subtest is exactly that shape.** Now a counted, logged drop; the gap stays §S-2.
+   ⚠ Both proposed fixes for the race were also refuted — no reader-side change closes a
+   writer-side tear. Fixed by publishing watermark+count as **one** biased `AtomicU64`.
+2. **A3 is NOT fixed as a class, and this document said "Landed".** `dev_mutex` is genuinely
+   off the new path — but `umd12` now holds **vkd3d's queue mutex** across the same escape, on
+   the shipping default arm, and `helios_ioctl_submit_cs` still contracts *"caller holds
+   dev_mutex"* and issues that escape. ⚠ The "5 s past TdrDelay" framing is wrong in **both**
+   directions: the bound is really ~80 s (`KeDelayExecutionThread` rounds to ~15.6 ms
+   granularity), and the realistic cost is **one timer tick, ~15.6 ms**, self-draining, on ONE
+   queue — **not** a TDR (the escape is `HardwareAccess=0` and no DMA packet is outstanding
+   yet). ⇒ **latency/jitter, size S.** ⭐ The trigger is settleable with no new probe:
+   `QUEUE_FULL_RETRIES` already exists as a registry counter.
+3. ⛔ **FIXED (`91e6906`) — a Render that does not WRITE an `'HD12'` record must CLEAR one.**
+   The unconditional write and the consuming `decode` both exist for the recycled-buffer
+   hazard; **UP-9 added a second `pfnRenderCb` on the same context that writes nothing at
+   offset 0**, so a stale record could only be cleared by a submitter that no longer always
+   runs. Skeptic's argument for not refuting: *you cannot hold that hazard load-bearing and
+   simultaneously call this unreachable.* Reachability is confined to in-place TDR/abandonment
+   (preemption cannot — `decode` already zeroed the magic; a device restart cannot —
+   `ForeignGeneration` rejects it). New counter **`D12Clr`**.
+4. **The `d3d12` bit's "identity, never a boundary" is false** — it selects `Kind::Exact` over
+   `Kind::Prefix`. Code is RIGHT, comments were wrong; fixed `81a06c4`.
+
+### ⛔⛔ THE 19 NEW KMD COUNTERS ARE NOT READABLE AT PROBE TIMESCALES — and this changes the next run
+
+`record_present_handoff_telemetry` is their **sole** writer; it publishes only from the
+scanout pacing tick, at `DiagLevel = 0`, once per **600 queued refreshes** — **≥10 s per
+mirror write**, and unbounded while DWM is idle. No new counter is a `CounterEntry
+{ failure: true }`, so nothing flushes on change. Only `RngSub`/`RngCmp` have a second reader
+(words 33/34 of the `'HDBG'` TDR report — i.e. provoke a TDR and decode a minidump).
+
+⛔ **This document's own "shortest path to a pixel" is therefore wrong as written.** It names
+`tools/d3d12_spy/spy_workload.cpp` and claims *"every counter this lane added becomes readable
+at once"*. Its defaults are **`mode = "device"` — no window at all — and `frames = 5`,
+`hold = 0`**: a sub-second, windowless run that would produce neither a pixel nor a moved
+counter, and the zero would read as *"the D3D12 path never reached the KMD"*.
+⇒ **run `spy_workload window --frames 3600`** (~60 s vsync-locked) and take the post-snapshot
+after the desktop has composited ~600 more frames; **or** set `DiagLevel = 1` and **reboot**
+(`restart-device` cannot enable it — `DIAG_LEVEL` is cached once per image load).
+⚠ Corrections to that finding: `ClkCal`/`ClkNoGpu`/`ClkFreq` are boot-cumulative and are NOT
+hidden by the throttle; `kmd-counter-snapshot.ps1` DOES dump all 19 to file (only its printed
+`-Watch` subset omits them); a multi-minute Fire Strike/Time Spy run IS readable.
+
+### Instrument gradings still to repair (found, not yet fixed)
+
+`EscSub == 0` and `EscSubRing == 0` are **unsatisfiable readings** — DWM's own ICD makes both
+non-zero on an idle desktop, so the branch written as "the informative one" can never be
+taken · `D12Exact`'s identity subtracts two **adapter-global** counters (`GpuFncClamp`,
+`GpuFncGen`) from a D3D12-scoped one, omits `D12Merged`, and ignores replay fallbacks — and
+now also `D12Clr` · `GpuFncClamp`/`GpuFncGen`/`FncIdGen` are attributed to "the UMD" but share
+a rejection site with the D3D11 present BLT marker, and none is reset at `StartDevice` ·
+`WfBReb`'s "whichever of `WfBStrm`/`WfBBlt` moved with it" cannot discriminate, since both
+climb continuously under DWM · `RENDER_COUNT` is re-committed **twice** in `KMD_IMPACT.md` as
+what K-F1 settles, 30 lines from where the same changeset strikes it (and it is adapter-global,
+16-bit-truncated in its only ring reader, and has no reader on a default deployment) ·
+`WddmHoldMs`'s UV1 table grades a flat reading **UV1 ✗** with no precondition that `WfBHold`
+ever moved, and the hold is snapshotted at `StartDevice` so setting the knob without a device
+restart leaves it 0.
+
+### Contract gaps found (not yet fixed)
+
+Three caps are left at absent values with **no argument, no counter, and no gap-list entry**,
+in the commit whose purpose was to raise exactly this class:
+`VPAndRTArrayIndexFromAnyShaderFeedingRasterizerSupportedWithoutGSEmulation`, `WaveOps`,
+`Int64Ops` — all three measured **1** on this guest (`baselines/d3d12-caps.csv`), all three
+slot-free (vkd3d derives them from Vulkan features / DXIL lowering), and the FALSE answer
+costs a **geometry-shader emulation pass per cubemap face and shadow cascade**.
+⚠ `caps12.rs` already fills `WaveLaneCountMin/Max/TotalLaneCount` with substrate values while
+reporting `WaveOps = FALSE`.
+Also: `DxgkDdiSetStablePowerState` is an **empty body** returning void — it fabricates success
+with no counter, the same shape `DxgkDdiCalibrateGpuClock` was just fixed for, and it is
+reachable today (`SetStablePowerState(TRUE)` is the first call of every timing harness) ·
+`pfnPresent` writes `BackBufferMultiplicity` and **twice** cites an instrument for it that
+does not exist anywhere in `umd12`.
+
+### Citation drift is systemic, not incidental
+
+Every `gpu/mod.rs` citation in `KMD_IMPACT.md` §14a has drifted **250–600 lines** (the file
+grew 983 lines) · `ROADMAP.md` WS4's five `gpu/mod.rs` pointers are all stale · this
+document's own §1 A2/A3 evidence columns now point at **code the same changeset added** (the
+submodules were bumped and the citations into them were not re-derived) · §6 has three bullets
+the changeset itself paid · `KMD_IMPACT.md` UP-4 contains a **citation-drift correction that
+has itself drifted** · `CLAUDE.md`'s vkd3d entry went stale **a fourth time**, inside this
+changeset (fixed: it no longer names a count, and it now names the hand-mirrored
+`VKD3D_HEAP_FLAG_HELIOS_VENUS_EXPORT` bit as the highest-risk divergence).
+⭐ `caps12.rs`'s "symbols, not lines" rule works — the six citations that drifted (+118, two of
+them the sole evidence for a cap decision) were into `misc.rs`, the one file not on its list.
+
+### ⚠ Round 1 is NOT saturation
+
+`METHOD.md` §3 needs **two consecutive dry rounds with different lens compositions**, a
+completeness critic returning nothing, and every grading re-checked at the END of the merge.
+Round 1 was not dry. Round 2 must rotate at least two lenses — and the four-lens false
+convergence above says one of the new ones should be **"which of these findings share a
+source?"**
+
+---
+
 ## ⛔⛔ STATUS 2026-08-06 (later) — THE INTEGRATION LANE: §S-3 IS COMPLETE IN CODE, AND THE THING IN THE WAY IS A PROBE
 
 Read this block before the wave-1 block below it. It closes `§S-3`'s items 2–6 and the fence

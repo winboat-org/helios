@@ -165,15 +165,27 @@ helios-vgpu/
 │                             naming a moving pointer is stale by construction; read it with
 │                             `git ls-files -s vkd3d-proton-helios` and `git -C
 │                             vkd3d-proton-helios log --oneline 2c7ba22c..HEAD`, which cannot
-│                             go stale. ⛔ NOT zero divergence. The early Helios commits are
-│                             build plumbing (libs/d3d12core/{helios_entry.c,debug_control.c,
+│                             go stale. ⛔ NOT zero divergence. ⛔⛔ AND NEITHER IS A COUNT:
+│                             this entry said "the 6th is the first that is NOT plumbing" and
+│                             went stale INSIDE the changeset that wrote it — there are 7, and
+│                             the 7th is not plumbing either. That is the FOURTH time this
+│                             line has been stale. ⇒ do not write a count here either; run
+│                             `git -C vkd3d-proton-helios log --oneline 2c7ba22c..HEAD`.
+│                             The SHAPE, which does not go stale: the early commits are build
+│                             plumbing (libs/d3d12core/{helios_entry.c,debug_control.c,
 │                             debug_control.h,helios_vkd3d.def,meson.build,main.c},
-│                             tests/test-runner.sh); the 6th is the first that is NOT —
+│                             tests/test-runner.sh); after them come the real divergences —
 │                             ID3D12DXVKInteropDevice4::GetVulkanResourceMemoryInfo
 │                             (include/vkd3d_device_vkd3d_ext.idl, libs/vkd3d/{device.c,
 │                             device_vkd3d_ext.c,vkd3d_private.h}), the resource-level
 │                             sibling of GetVulkanHeapInfo that the D3D12 present path
-│                             needs. ⭐ Its 3 nested submodules ARE checked out and the fork
+│                             needs; and VKD3D_HEAP_FLAG_HELIOS_VENUS_EXPORT, a PRIVATE
+│                             D3D12_HEAP_FLAGS bit (vkd3d_private.h) with an export-memory
+│                             chain in resource.c. ⛔ That bit's value is HAND-MIRRORED in
+│                             umd12/src/forward12/resource12.rs across two repositories with
+│                             NO compile-time check — the highest-risk divergence in the fork
+│                             and the one a lane reading only the old entry would miss.
+│                             ⭐ Its 3 nested submodules ARE checked out and the fork
 │                             BUILDS NATIVELY ON LINUX, tests included (widl/meson/ninja/
 │                             glslang all present) — so vkd3d changes are verifiable on the
 │                             host with no VM and no WDK. The older "nested submodules are
