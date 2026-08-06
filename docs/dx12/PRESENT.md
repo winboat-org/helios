@@ -100,7 +100,7 @@ IDXGISwapChain::Present
       ├─ vehicle arm      : alias-import ICD frame by resid, GPU copy into the DXGI backbuffer
       │                     present.rs:1272-1308 → vehicle.rs:187-297
       ├─ direct-flip arm  : NO COPY (this source IS the scanout backing)
-      │                     present.rs:1317-1346, presented_primary_private() state.rs:736
+      │                     present.rs:1317-1346, presented_primary_private() state.rs:754
       └─ windowed/BLT arm : CopySubresourceRegion(dst ← src) into win32k's redirection surface
                             present.rs:1328-1330
       → context.Flush()          (present.rs:1391 on the direct-flip/BLT arms; :1308 on the vehicle arm)
@@ -156,7 +156,7 @@ Exactly one is taken, selected at `present.rs:1297-1398`:
   `vehicle.rs:206-270`) and GPU-copies it into the DXGI backbuffer (`vehicle.rs:273-292`). A failure
   **fails the present** (`present.rs:1303-1306`) so the ICD latches its sw fallback rather than
   flipping a stale backbuffer.
-* **Direct-flip arm** — `presented_primary_private(h, src_h)` (`umd/src/forward/state.rs:736`)
+* **Direct-flip arm** — `presented_primary_private(h, src_h)` (`umd/src/forward/state.rs:754`)
   returns `Some`, i.e. this source *is* the scan-out backing. **No copy** (`present.rs:1320-1321`).
   Optionally records the D4b snapshot blit *before* the Flush (`snapshot_for_present`,
   `umd/src/forward/snapshot.rs:219`, called at `present.rs:1339-1346`).
@@ -199,8 +199,12 @@ The channel that *does* work: `submit_runtime_present_then_call` (`present.rs:94
             });
 ```
 
-`HeliosPresentRenderCmd` is 80 bytes (`protocol/src/wddm.rs:382-440`, static-asserted at `:440`),
-magic `'HEPR'` = `0x5250_4548` (`wddm.rs:309`). The allocation list is written by
+`HeliosPresentRenderCmd` is 80 bytes (`protocol/src/wddm.rs:433-439`, static-asserted at `:493`) —
+a 4-byte magic + 4-byte version prefix over a 72-byte `HeliosPresentPrivateData` (`wddm.rs:380-415`,
+asserted 72 at `:489` with the three tail offsets pinned at `:490-492`). Magic `'HEPR'` =
+`0x5250_4548` (`wddm.rs:362`); the inner payload's own magic is `'HPRS'` = `0x4850_5253`
+(`wddm.rs:336`) and both are checked by `HeliosPresentRenderCmd::is_valid` (`:441-448`).
+The allocation list is written by
 `RuntimePresentDependencies::write_to` (`present.rs:388-424`): source read-only (`Value = 0`),
 destination written (`Value = 1`).
 
@@ -264,6 +268,15 @@ arm** (`display.rs:296-313`) — the clear is the orphan bound.
 ⚠ **Everything from `dxgkrnl` down is arm-agnostic.** A D3D12 flip present lands on exactly this
 `DxgkDdiPresent` flip arm, this `PresentFlipPrivate`, this `set_scanout_blob`. `DECISIONS.md` §3-H2
 P-C says so and it is correct: the reuse boundary is the DDI, not the kernel.
+
+⚠ **But "a D3D12 flip present" is an assumption about *which arm*, and it is not measured.** The
+reuse claim — the kernel does not care who produced the present — stands. **Which of these two arms
+a D3D12 present selects does not**: the only `pfnPresent` ever observed carried
+`DXGI_DDI_PRESENT_FLAGS Flags = 0x21`, which sets **`Blt` (0x1)** and leaves `Flip` (0x2) clear
+(`DDI_REFERENCE.md` §13.0, `:3406`). That is a *different enum* from the `DXGK_PRESENTFLAGS` this
+section decodes (bit 0 `Blt`, bit 2 `Flip`), with no established mapping, so it neither confirms nor
+refutes the flip arm — it removes the right to assume. **UNVERIFIED — U13** (§12); if the BLT arm is
+what fires, `display.rs:431-770` is on the D3D12 path and §3.5 currently scopes it out.
 
 ---
 
@@ -465,10 +478,13 @@ synchronised against.
 > all-keywords trace around a D3D12 sample on a real driver. **Does not block anything** — under
 > every variant the KMD still sees `DxgkDdiPresent`.
 
-> **UNVERIFIED — U2:** `D3D12DDI_TABLE_TYPE_DXGI = 3` is declared (`d3d12umddi.h:2493`) but **no
-> function-table struct for it exists anywhere in the header** (`grep -n 'D3D12DDI_DXGI'` → 0 hits).
-> Whether the runtime ever calls `pfnFillDDITable` with type 3, and with what size, is unknown.
-> *Settling experiment:* the WARP spy proxy logs every `(TableType, TableSize)` pair.
+> ✅ ~~**UNVERIFIED — U2**~~ **SETTLED by `D12-G5`:** `D3D12DDI_TABLE_TYPE_DXGI = 3` is declared
+> (`d3d12umddi.h:2493`) but **no function-table struct for it exists anywhere in the header**
+> (`grep -n 'D3D12DDI_DXGI'` → 0 hits) — ~~and whether the runtime ever calls `pfnFillDDITable` with
+> type 3, and with what size, is unknown~~. **It never does.** The spy logged every
+> `(TableType, TableSize)` pair across four workloads: `TableType == 3` never appeared and **0 of 32**
+> armed DXGI thunks were called (`DDI_REFERENCE.md` §2.3, `:602-610`). ⇒ `helios_umd12` needs no DXGI
+> table at all. ⚠ Scope: WARP, windowed only, no colour-space or stereo call.
 
 ### 3.4a ⭐ What the D3D12 *primary* actually is at the DDI — and four rules that come with it
 
@@ -515,13 +531,28 @@ and is recorded here so it is not rediscovered at G8.
   **The entire windowed/BLT arm of §2.3 — `CopySubresourceRegion` into win32k's redirection
   surface — has no D3D12 analogue.** That also removes the `SnapshotPurpose::WindowedBlt` path
   (`present.rs:1347-1360`) from the D3D12 picture.
+
+  ⚠ **Read that as a statement about the UMD-side copy arm only, because that is all it establishes.**
+  D3D12 is never asked to `CopySubresourceRegion` into a redirection surface — true, and the source
+  is DXGI's swap-effect enum. It is **not** established that the *KMD's* BLT arm
+  (`display.rs:431-770`) is out of the picture, and the one measurement that exists points the other
+  way: the `D12-G5` `pfnPresent` arrived with `Flags = 0x21` = `Blt (0x1)` + `AllowFlexibleRefresh
+  (0x20)`, i.e. **`Blt` set and `Flip` (0x2) clear** (`DDI_REFERENCE.md` §13.0, `:3406`;
+  bit meanings `dxgiddi.h:64-81`). ⛔ Do **not** carry that bit across as if it were the kernel's:
+  `DXGI_DDI_PRESENT_FLAGS` at `pfnPresent` and `DXGK_PRESENTFLAGS` at `DxgkDdiPresent`
+  (`d3dkmddi.h:167-199`) are **two different enums** that agree only on bit 0 — kernel-side `Flip` is
+  `0x4`, and `0x20` is `DstColorKey` — and **nothing in the corpus establishes the mapping between
+  them**. The runtime, not the driver, chooses the kernel flags. **UNVERIFIED — U13.**
 * **`CreateSwapChainForHwnd` takes a *command queue*, not a device.** [MS] same sources. This is why
   vkd3d-proton hangs `IDXGIVkSwapChainFactory` off `d3d12_command_queue`
   (`vkd3d-proton-helios/libs/vkd3d/command.c:22282-22287`).
 * **FLIP_DISCARD / FLIP_SEQUENTIAL windowed:** the backbuffer goes to DWM; there is no driver-side
-  src→dst copy, so `hDstResource` will normally be null. **[INFER]** — the header permits a
-  destination and nothing states DXGI will not use one. **UNVERIFIED — U3**; *settling experiment:*
-  the WARP spy proxy, or instrument `pfnPresent` once a Helios D3D12 UMD exists.
+  src→dst copy, so `hDstResource` will normally be null. ~~**[INFER]** — the header permits a
+  destination and nothing states DXGI will not use one.~~ ✅ **[MEAS] `D12-G5`** — 20 presents on a
+  `FLIP_DISCARD` swapchain, every frame identical: `SurfacesToPresent = 1`, **`hDstResource = NULL`**,
+  `Flags = 0x21`, `FlipInterval = 0`, `VidPnSourceID = 0xffffffff`, `DirtyRects = 0`,
+  `OptimizeForComposition = 1` (`DDI_REFERENCE.md` §13.0, `:3405-3407`). ⚠ **Measured on WARP, which
+  has no display adapter** — settled for that configuration, re-opens for a real one. **U3, narrowed.**
 * **Fullscreen exclusive:** `D3D12DDIARG_PRESENT_0001` carries `VidPnSourceID` and `FlipInterval` —
   the same information a D3D11 flip present carries. **No D3D12-specific miniport DDI exists**; the
   scan-out contract below dxgkrnl is unchanged.
@@ -1273,11 +1304,16 @@ and hope dxgkrnl forwards it to `DXGKARG_PRESENT.pPrivateDriverData`.
 the header to think the D3D12 plumbing differs, and one reason to think it is the *same* plumbing:
 the field ends up in the same `_D3DKMT_PRESENT`/`DXGKARG_PRESENT` structures.
 
-**UNVERIFIED — U6**, but cheaply settleable and worth settling because it would be the smallest
-possible implementation. *Settling experiment:* the WARP spy proxy (`DX12.md` P1) answers whether
-`pfnGetPresentPrivateDriverDataSize` is even called and with what; the *arrival* half needs a Helios
-KMD counter (`PBIdOk` is still in the KMD's vocabulary — re-add the decode behind
-`DiagLevel >= 1` and read it once a D3D12 present exists).
+**UNVERIFIED — U6, now HALF settled.** ✅ ~~*Settling experiment:* the WARP spy proxy (`DX12.md` P1)
+answers whether `pfnGetPresentPrivateDriverDataSize` is even called and with what~~ — **it ran, as
+`D12-G5`, and the answer is yes**: `core[81] pfnGetPresentPrivateDriverDataSize` fires **once per
+present, immediately before `cl[19] pfnPresent`**, on every one of 20 frames (`DDI_REFERENCE.md`
+§13.0, `:3393-3401`). WARP returns 0, so every observed present carried `PrivateDriverDataSize = 0`
+and `pPrivateDriverData = NULL`; a driver that returns N is handed an N-byte buffer. ⛔ **The
+*arrival* half is still open and is the half that decides this option** — it needs a Helios KMD
+counter (`PBIdOk` is still in the KMD's vocabulary — re-add the decode behind `DiagLevel >= 1`,
+return a non-zero size, write a watermark, and read it once a D3D12 present exists). The call
+existing is not the data arriving.
 
 **Verdict: try it, do not depend on it.**
 
@@ -1331,16 +1367,25 @@ is not re-proposed as if it were untried.
    comes first**.
 
    ⚠ **The genuinely new work is the resource→identity lookup, and it is not specified anywhere
-   yet.** On the D3D11 side `presented_primary_private` (`umd/src/forward/state.rs:736`) resolves
+   yet.** On the D3D11 side `presented_primary_private` (`umd/src/forward/state.rs:754`) resolves
    the venus resid / `venus_alloc_size` / `memory_type_index` / pitch / plane offset out of the
    UMD's own resource table, keyed by the allocation dxgkrnl is presenting. D3D12 hands
    `pfnPresent` a `D3D12DDI_HRESOURCE`, and the D3D12 UMD's equivalent table does not exist yet —
    it has to be built as part of `pfnCreateHeapAndResource` (`DECISIONS.md` §3-H3), because the
    same lookup is what `pfnAllocateCb` needs to author `HeliosWddmAllocPrivate` (§9 option i). Do
-   not plan this step as "copy `state.rs:736`"; plan it as "build the D3D12 resource table, then
-   copy `state.rs:736`". **UNVERIFIED — U11.**
+   not plan this step as "copy `state.rs:754`"; plan it as "build the D3D12 resource table, then
+   copy `state.rs:754`". **UNVERIFIED — U11.**
 
-2. **KMD — nothing.** `dxgkddi_render` already decodes the command (`submit_command.rs:1080-1096`,
+2. **KMD — nothing *for the identity channel*.** ⛔ ~~KMD — nothing~~, read as a statement about the
+   D3D12 present **path**, is **superseded by `DECISIONS.md` Decision D5a** (owner, 2026-08-06):
+   *"THE KMD IS ON THE CRITICAL PATH."* The narrow claim below survives intact and is why this step
+   is kept rather than deleted — the *identity channel taken alone* costs zero KMD lines. The path it
+   rides on does not: `D12-G8` rung 0 failed with `EclNoWddmSubmission=1`, the missing kernel
+   submission during `pfnExecuteCommandLists`, and dxgkrnl only releases a queued monitored-fence
+   signal when DMA packets already on that context retire. Nothing presents until that
+   fence/completion bridge lands, and the bridge **is** a KMD change (live list:
+   `docs/dx12/KMD_IMPACT.md` §14, not D5's K1/K2/K3). With that said, for this channel:
+   `dxgkddi_render` already decodes the command (`submit_command.rs:1080-1096`,
    prefix-compatible at 48 / 56 / 72 bytes) and stashes on the context (`:1099-1160`) through
    `ContextHandleRef::stash_snapshot` (`kmd_render/src/device.rs:129`) and
    `stash_present_stream_marker` (`:175`). The magic + version + per-arm length validation the
@@ -1373,8 +1418,10 @@ is not re-proposed as if it were untried.
 
 **Why this is the recommendation:** it is the only option that reuses the *entire* validated
 pipeline (`snapshot_bind::validate`, the epoch/lease bookkeeping, `PresentFlipPrivate`,
-`set_scanout_blob`) with **zero KMD change and zero new trust boundaries**, and its failure mode is
-the one the KMD already handles.
+`set_scanout_blob`) with **zero KMD change and zero new trust boundaries** *for the identity
+channel*, and its failure mode is the one the KMD already handles. ⛔ Not *"and therefore D3D12
+present needs no KMD change"* — `DECISIONS.md` **D5a** (owner, 2026-08-06) supersedes that reading;
+see step 2 above.
 
 **Two orderings to settle, both cheap:**
 
@@ -1406,7 +1453,7 @@ optimisation once (ii) is proven and the extra submission is *measured* to cost 
 | Option | Reuses KMD unchanged? | New trust boundary | Verdict |
 |---|---|---|---|
 | (i) `pPrivateDriverData` | yes | none | try, do not depend (U6) |
-| **(ii) own `HeliosPresentRenderCmd` via `pfnRenderCb`** | **yes — literally zero KMD lines** | none | ✅ **recommended** (`DECISIONS.md` §3-H2 P-C; D5's list stays at three) |
+| **(ii) own `HeliosPresentRenderCmd` via `pfnRenderCb`** | **yes — literally zero KMD lines *for the identity channel*.** ⛔ ~~and therefore zero KMD lines for D3D12 present~~ — superseded by `DECISIONS.md` **D5a** (owner, 2026-08-06): *"THE KMD IS ON THE CRITICAL PATH."* The channel is free; the **path** is not, because nothing presents until the fence/completion bridge lands and that bridge is a KMD change (`KMD_IMPACT.md` §14) | none | ✅ **recommended** (`DECISIONS.md` §3-H2 P-C; ~~D5's list stays at three~~ — D5's *hygiene* list still does, but it is no longer the whole KMD list) |
 | (ii′) the same identity via `pfnSubmitCommandCb` → `DxgkDdiSubmitCommandVirtual` | no — a new decode site | **IRQL**: that DDI is DISPATCH_LEVEL | ⛔ **rejected**, see §8.2(ii) |
 | (iii) piggyback on the last command buffer | yes | frame/identity pairing | later, if (ii) is measurably expensive |
 
@@ -1440,9 +1487,17 @@ spot.
 **Frame copies.** 0 (direct flip) to 1.
 
 **Blocking unknowns.** §8 (U6/U7/U11/U12); the engine story is D1's answer (vkd3d behind the DDI).
-⚠ Note what is **not** here: a KMD change. Per §8.2(ii) the identity channel is `pfnRenderCb` into
+⛔ ~~Note what is **not** here: a KMD change. Per §8.2(ii) the identity channel is `pfnRenderCb` into
 the existing PASSIVE `dxgkddi_render`, so `DECISIONS.md` D5's KMD list stays at K1/K2/K3, none of
-them required for the first triangle.
+them required for the first triangle.~~ **Superseded by `DECISIONS.md` Decision D5a** (owner,
+2026-08-06): *"THE KMD IS ON THE CRITICAL PATH."* ⚠ The struck sentence is still true **of the
+identity channel taken alone** — `pfnRenderCb` into the existing PASSIVE `dxgkddi_render` really does
+cost zero KMD lines, and that is why it is kept here rather than deleted. It is **false as a
+statement about this option's present path**: `D12-G8` rung 0 failed with `EclNoWddmSubmission=1`
+(no kernel submission during `pfnExecuteCommandLists`, so dxgkrnl has no retiring DMA packet to
+release the monitored-fence signal behind), and until the fence/completion bridge lands there is no
+first triangle to present. That bridge is a KMD change; the live KMD work list is
+`docs/dx12/KMD_IMPACT.md` §14, not D5's K1/K2/K3.
 
 **Proof.** A D3D12 sample composing on the desktop, `helios_paintcap` diff advancing, KMD
 `PBcall`/`PBFlip`/`PBsrc` counters moving **this boot**.
@@ -1532,7 +1587,7 @@ native-Vulkan clients a zero-copy present.
 
 | | Code to write | Frame copies | Inherits 0ab machinery | Inherits vehicle defects | Blocking unknown |
 |---|---|---|---|---|---|
-| (i) native D3D12 UMD | very high (2nd DDI + engine) | 0-1 | **yes (good)** | no | §8 identity channel (U6/U7/U11/U12) — but **no KMD change**, §8.2(ii) |
+| (i) native D3D12 UMD | very high (2nd DDI + engine) | 0-1 | **yes (good)** | no | §8 identity channel (U6/U7/U11/U12) — ~~but **no KMD change**, §8.2(ii)~~ ⛔ **the identity *channel* needs none; the present *path* does** (`DECISIONS.md` **D5a**, the fence/completion bridge — `KMD_IMPACT.md` §14) |
 | (ii)+(iii) vkd3d + DXVK dxgi | one ~10-line ICD fix (§6.4) + deploy | **2-3** | no | **yes** (~5 ms gate) | **P-A CONFIRMED** (fixable); **V1** open (U5) |
 | (iv) vkd3d-specific vehicle | medium | 2-3 | no | yes, re-implemented | none, but no benefit ⛔ |
 | (v) interop presenter | high | 2+ | partial | partial | shared handles over venus (S1) ⛔ |
@@ -1819,19 +1874,27 @@ Additional cross-checks:
 | id | Claim not established | Settling experiment | Blocks |
 |---|---|---|---|
 | **U1** | The D3D12 runtime issues `D3DKMTPresent` (`d3dkmthk.h:5929`) rather than `D3DKMTPresentRedirected` (`:6078`) or another internal variant | WARP spy proxy (`DX12.md` P1); or ETW `Microsoft-Windows-DxgKrnl` all-keywords around a D3D12 sample on a real driver, read the `Present`/`QueuePacket` events | nothing — the KMD sees `DxgkDdiPresent` either way |
-| **U2** | `D3D12DDI_TABLE_TYPE_DXGI = 3` (`d3d12umddi.h:2493`) is declared with **no** function-table struct in the header. Whether the runtime ever fills it, and with what size | WARP spy proxy logs every `pfnFillDDITable(TableType, TableSize)` pair | option (i), table negotiation |
-| **U3** | Whether DXGI ever passes a non-null `hDstResource` in `D3D12DDIARG_PRESENT_0001` for a flip-model windowed swapchain | WARP spy proxy; or instrument `pfnPresent` once a Helios D3D12 UMD exists | option (i) `pfnPresent` body |
+| ~~**U2**~~ | ✅ **SETTLED by `D12-G5` — the runtime NEVER fills it.** ~~`D3D12DDI_TABLE_TYPE_DXGI = 3` (`d3d12umddi.h:2493`) is declared with **no** function-table struct in the header. Whether the runtime ever fills it, and with what size~~ (the header half stands; the *whether* is answered) | ✅ **The experiment RAN.** The spy logged every `pfnFillDDITable(TableType, TableSize)` pair across four workloads — device-only, +queue, +swapchain with 20 flip-model presents, +draw. `TableType == 3` **never appeared** and **0 of 32** armed DXGI thunks were ever called: `DDI_REFERENCE.md` §2.3 (`:602-610`), restated at §13.0 (`:3412-3413`). ⇒ `helios_umd12` plans no DXGI table. ⚠ Scope: WARP, no fullscreen-exclusive transition, no stereo, no colour-space call | ~~option (i), table negotiation~~ — nothing. §3.1's "D3D12 has no DXGI DDI table" is now **measured**, not inferred from the header |
+| ◑ **U3** | ✅ **SETTLED FOR THE MEASURED CONFIGURATION by `D12-G5` — `hDstResource = NULL`, on all 20 presents.** ~~Whether DXGI ever passes a non-null `hDstResource` in `D3D12DDIARG_PRESENT_0001` for a flip-model windowed swapchain~~ | ✅ **The experiment RAN.** `DXGI_SWAP_EFFECT_FLIP_DISCARD`, 20 presents, every frame identical and the first the same as the steady state: `SurfacesToPresent = 1`, `hDstResource = NULL`, `Flags = 0x21`, `FlipInterval = 0`, `VidPnSourceID = 0xffffffff`, `DirtyRects = 0`, `OptimizeForComposition = 1` — `DDI_REFERENCE.md` §13.0 (`:3405-3407`). ⚠ **The honest limit: measured on WARP, which has no display adapter.** Settled *for that configuration*; it **re-opens for a real adapter**, and fullscreen-exclusive was never exercised at all. Re-read the argument on `helios_umd12` at `GATES.md` G8 | option (i)'s `pfnPresent` body may take the NULL case as the normal path **today**, but must still **refuse a non-NULL `hDstResource` loudly with a named counter**, not ignore it |
 | **U4** | Whether DXVK's `DxgiSwapChain` recreates the `VkSurfaceKHR` on a fullscreen transition | read `dxvk-helios/src/dxgi/dxgi_swapchain.cpp` fullscreen/resize paths | low stakes — the hwnd→target registry is refcounted by HWND (§10a) |
 | **U5** | **Risk V1:** does MS `d3d11.dll` accept a DXVK `IDXGIAdapter` when app-local redirection binds its `dxgi.dll` import to DXVK's? | **§6.6, no build** — DXVK `dxgi.dll` beside `helios_dcomp_probe`, session-1 schtask, read the staged HRESULTs | Phase 0 (options ii/iii) |
-| **U6** | Whether `D3D12DDIARG_PRESENT_0001.pPrivateDriverData` reaches `DXGKARG_PRESENT.pPrivateDriverData` (the D3D11 equivalent measurably did **not** — `PBIdOk` = "no payload" ×3 generations) | WARP spy proxy for the *call* half; re-add the KMD `PBIdOk` decode behind `DiagLevel >= 1` for the *arrival* half, once a D3D12 present exists | §8 option (i) only; (ii) does not need it |
+| ◑ **U6** | **Call half ✅ SETTLED by `D12-G5`; arrival half STILL OPEN.** ✅ *Call:* the private-data hook is real and per-present — `core[81] pfnGetPresentPrivateDriverDataSize` fires **once per present, immediately before `cl[19] pfnPresent`**, on all 20 frames, first frame identical to steady state (`DDI_REFERENCE.md` §13.0, `:3393-3401`). WARP answers 0, so every observed present carried `PrivateDriverDataSize = 0` and `pPrivateDriverData = NULL`; **a driver that returns N is handed an N-byte buffer.** ⛔ *Arrival:* whether that buffer reaches `DXGKARG_PRESENT.pPrivateDriverData` is **not** settled by G5 and `DDI_REFERENCE.md:3402-3404` says so in as many words — the D3D11 equivalent measurably did **not** (`PBIdOk` = "no payload" ×3 generations) | ~~WARP spy proxy for the *call* half~~ — **run**. **Arrival half only:** return a non-zero size from `pfnGetPresentPrivateDriverDataSize`, write a watermark into the buffer it hands back, and re-add the KMD `PBIdOk` decode behind `DiagLevel >= 1` to read whether the watermark arrives — at `GATES.md` G8, once a D3D12 present exists | §8 option (i) only; (ii) does not need it. ⛔ **The call existing is not the data arriving** — do not drop the Render-command channel on the strength of the hook |
 | **U7** | That the D3D12 runtime tolerates the driver calling `pfnRenderCb` around `pfnPresent` at all, and that `pfnPresent` runs before the runtime's own submission on that queue with nothing of the runtime's own in between | `DECISIONS.md` §3-H2 P-C's experiment: `pfnRenderCb` + a counting `DxgkDdiRender` on the D3D12 path at `GATES.md` **G7**, before G8 depends on it. WARP spy proxy gives the call order for free; live fallback = KMD counter pair `P12sub`/`P12take`, so a pairing failure is loud | §8 option (ii) |
 | **U8** | Post-fix **fullscreen** vehicle behaviour **on the shipping gate path**. ⚠ Not "no measurement exists" — `ROADMAP.md:2919-2931` measured it (fullscreen 1896×1030 chain VEHICLE/READY+LIVE, `queue_present_avg` 5.96→2.81 ms, acquire gate 4.06→7.69 ms). It was taken with `VehicleKernelFlipWait=1`, which R912(a) has since retired | Re-run §11.1 with a fullscreen client on shipping defaults, session-1 schtask, `HELIOS_WSI_PERF=1` via the `.cmd` wrapper; read `creates=/fails=/ready=/gate_arms=/gate_fb=` and take the picture through Looking Glass or the VNC samplers (§10f). Compare against 2.81 ms / 7.69 ms | Phase-0 fullscreen numbers **quoted as current** (the historical pair stands as-is) |
 | **U9** | Whether `VK_KHR_swapchain` can silently disappear — it is conditional on `renderer_sync_fd.semaphore_importable` (`vn_physical_device.c:1334`), and its absence kills D3D12 device creation outright, not just presentation (§5.2) | add a gate assertion: `vulkaninfo` on the guest must list `VK_KHR_swapchain` before any D3D12 gate runs (`GATES.md`) | every D3D12 arm |
 | **U10** | The *loader* half of P-A: that `LoadLibraryExA("dxgi.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32)` returns an already-loaded app-local DXVK `dxgi.dll` rather than System32's. §6.6's probe **cannot** show this — it links `-ldxgi` and never calls `LoadLibraryEx` | Add an arm to `tools/dcomp_present_probe.cpp`: call `LoadLibraryExA("dxgi.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32)` **and** `LoadLibraryW(L"C:\\Windows\\System32\\dxgi.dll")`, print `GetModuleFileNameW` on both handles, run it with a DXVK `dxgi.dll` app-local. ~15 lines, one rebuild of the probe | Nothing — §6.4 ships the `GetModuleFileNameW` verification either way, which is correct under both outcomes. It only decides whether the ⛔ is a proven rule or a documented-behaviour inference |
-| **U11** | How the D3D12 UMD gets from a `D3D12DDI_HRESOURCE` to a venus resid / `venus_alloc_size` / `memory_type_index` / pitch / plane offset. The D3D11 side reads its own resource table (`presented_primary_private`, `umd/src/forward/state.rs:736`); the D3D12 equivalent does not exist yet | Design it with `pfnCreateHeapAndResource` (`DECISIONS.md` §3-H3), not with `pfnPresent` — the same table is what `pfnAllocateCb` needs to author `HeliosWddmAllocPrivate` (§9 option i, `create_allocation.rs:2291-2307`). Settled by writing it, at `GATES.md` G7/G8 | §8 option (ii) step 1; §9 option (i) |
+| **U11** ⭐ **RE-STATED 2026-08-06 — the blocker is NAMED now, and it is one link, not the table** | How the D3D12 UMD gets from a `D3D12DDI_HRESOURCE` to a venus resid / `venus_alloc_size` / `memory_type_index` / pitch / plane offset. The D3D11 side reads its own resource table (`presented_primary_private`, `umd/src/forward/state.rs:754`). ⛔ The chain is `HRESOURCE → ResourceState` (exists) `→ ID3D12Resource*` (exists) `→ VkDeviceMemory + offset` **(MISSING)** `→ helios_venus_memory_res_id(mem)` (ICD export, `vn_renderer_helios.c:622`) `→ pfnAllocateCb{adopt_resource_id}` `→ D3DKMT_HANDLE`. Everything but the third arrow already exists on all three sides | ⭐ **A ~20-line vkd3d method, not a redesign.** `ID3D12DXVKInteropDevice3::GetVulkanHeapInfo` (`libs/vkd3d/device_vkd3d_ext.c:1123-1146`) already returns `{VkDeviceMemory, offset, vk_memory_type}` for an `ID3D12Heap` — but a **committed** resource has no `ID3D12Heap`, and `GetVulkanResourceInfo1` returns the `VkImage`/`VkBuffer`, not the memory. Add the sibling reading `resource->mem.device_allocation`. ⚠ Two hazards ride with it: vkd3d **suballocates** committed textures unless dedicated is forced (`resource.c:4434-4461`), and its memory is not venus-**exportable** unless asked. Full scope: `KMD_IMPACT.md` §14a.3 (UP-2/UP-3/UP-4) | §8 option (ii) step 1; §9 option (i) |
 | **U12** | Which context-creation callback the D3D12 UMD ends up on, and whether `DxgkDdiRender` fires for `pfnRenderCb` on a `VirtualAddressing` context. The D3D11 UMD uses legacy `pfnCreateContextCb` (`umd/src/device_funcs.rs:1053-1061`), which is why `DxgkDdiRender` fires today; `DECISIONS.md` D5 has the D3D12 UMD picking its node in `D3DDDICB_CREATECONTEXTVIRTUAL` | Same G7 experiment as U7: `RENDER_COUNT` (`kmd_render/src/ddi/submit_command.rs:996`) moving on the D3D12 path is the whole test | §8 option (ii) step 2 being empty |
+| **U13** | **Which KMD present arm a D3D12 present actually lands on.** §2.5 (`⚠` after the arm list) and §3.5 both proceed as though it is the **flip** arm (`DXGK_PRESENTFLAGS.Flip`, bit 2, `display.rs:773`). The one measurement says the UMD-side call carried `DXGI_DDI_PRESENT_FLAGS Flags = 0x21` = `Blt (0x1)` + `AllowFlexibleRefresh (0x20)` — **`Blt` set, `Flip` (0x2) clear** (`DDI_REFERENCE.md` §13.0, `:3406`). ⛔ These are **two different enums**: `DXGI_DDI_PRESENT_FLAGS` (`dxgiddi.h:64-81`) at `pfnPresent` versus `DXGK_PRESENTFLAGS` (`d3dkmddi.h:167-199`) at `DxgkDdiPresent`, where `Flip = 0x4` and `0x20` is `DstColorKey`. They agree on bit 0 and nowhere else, **nothing in the corpus establishes the mapping**, and the runtime — not the driver — picks the kernel flags | **Diff the KMD's existing present-arm counters across one `D12-G8` rung-1 run**, this boot (registry values persist across boots — confirm they *move*). ⭐ Use the **unsampled, accumulating** census first: `note_present` (`display.rs:240-246` → `scanout_trace.rs:662-672`) publishes `VpPres` / `VpBlt` / `VpFlip` and `VpMmio` (`scanout_trace.rs:833-836`), and `PRESENT_FLAGS_HISTOGRAM` dumps the **raw `DXGK_PRESENTFLAGS` word** as `FlR<n>` with counts `FlC<n>` (`scanout_trace.rs:664`, `:956`) — that histogram alone answers the question. ⚠ The `PB*` family is weaker than it looks: only `PBcall` is a count (`PRESENT_COUNT`, `display.rs:32`, incremented `:221`, published **sampled** at `:279`); `PBFlip` (`:822`, sampled), `PBMmio` (`:833`) and the BLT-arm `PBCpy` (`:767` = 1 direct copy, `:665` = 2 two-phase WindowedBlt, `0xE*` = failure arms, unsampled) are **last-value markers, not accumulators** — read them as "which arm ran last" | §2.5's *"a D3D12 flip present lands on exactly this flip arm"* and §3.5's BLT bullet. If the **BLT** arm is what fires, `display.rs:431-770` is on the D3D12 path, which §3.5 currently scopes out, and §8/§9's `PresentFlipPrivate` reuse argument needs re-reading |
 
-⚠ Note that **U1, U2, U3, U6 and U7 are all answered by the same artefact** — the WARP spy proxy of
+⛔ ~~Note that **U1, U2, U3, U6 and U7 are all answered by the same artefact** — the WARP spy proxy of
 `DECISIONS.md` §3-H1 (`C:\Windows\System32\d3d10warp.dll` exports `OpenAdapter12`). That is five of
 this document's twelve open questions for roughly one day's work and no driver change, which is the
-strongest argument in this file for building it early.
+strongest argument in this file for building it early.~~
+✅ **The artefact was built and run, as `D12-G5`** (`GATES.md` §4.6), and the argument for building it
+early was correct. What it actually settled, of the five: **U2** (the DXGI table is never filled),
+**U3** (`hDstResource = NULL` — on WARP), and **U6's call half** (`pfnGetPresentPrivateDriverDataSize`
+fires once per present). ⚠ **Still open after it: U1 and U7**, and neither is a spy question — U1 is
+about which `D3DKMT*` entry point the runtime calls *below* the DDI, and U7 needs a real
+`pfnRenderCb` on a live path (`GATES.md` 7.19 moves it to G8). It also *created* **U13**, by
+measuring a `Flags` word nobody had a mapping for.
