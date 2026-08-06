@@ -460,6 +460,64 @@ impl PresentSubmissionPrivate {
         })
     }
 
+    /// Clear a `'HD12'` record this Render did **not** write, so it cannot be
+    /// inherited by a submission that carries no boundary of its own.
+    ///
+    /// ⛔⛔ **The invariant this restores: a `'HD12'` record is honoured only by
+    /// the SubmitCommand for the Render(s) that wrote it.** [`Self::mark_d3d12`]'s
+    /// unconditional write establishes that for the ECL arm, and [`Self::decode`]
+    /// consumes the magic so a *replayed* packet fails safe to the conservative
+    /// prefix. Both were sound while the ECL arm was the only `pfnRenderCb` on a
+    /// D3D12 WDDM context. **UP-9 added a second one** — the present-identity
+    /// Render — which writes nothing at offset 0, so from that commit a stale
+    /// record could only be cleared by a submitter that no longer always runs.
+    ///
+    /// ⚠ The window is narrow and neither of its obvious entrances is open:
+    /// preemption cannot reach it (a preempted packet already reached
+    /// SubmitCommand, so `decode` already zeroed the magic), and a device restart
+    /// cannot (`wddm_boundary::select`'s `ForeignGeneration` arm rejects the id).
+    /// What is left is in-place TDR/epoch abandonment. ⭐ It is cleared here
+    /// rather than argued about, because the recycled-buffer hazard is *already
+    /// load-bearing* in this file — the unconditional write and the consuming
+    /// decode both exist for it — and it cannot be simultaneously relied on and
+    /// dismissed.
+    ///
+    /// ⚠ **The cost, stated:** an ECL and a present identity batched by dxgkrnl
+    /// into ONE DMA buffer, with the present's Render second, lose an `Exact`
+    /// boundary that would have been correct for that packet and fall back to the
+    /// `next_wire_fence` prefix. That direction is **conservative — a longer wait,
+    /// never a shorter one** — which is the same asymmetry `decode`'s own doc
+    /// rests on. `D12Clr` counts it, so the trade is measurable rather than
+    /// assumed.
+    ///
+    /// Returns `true` if a record was cleared.
+    ///
+    /// # Safety
+    /// `private_data` points to `private_size` writable bytes supplied by dxgkrnl
+    /// for this Render call.
+    pub(crate) unsafe fn invalidate_d3d12(private_data: *mut c_void, private_size: u32) -> bool {
+        if private_data.is_null()
+            || (private_size as usize) < core::mem::size_of::<PresentSubmissionPrivate>()
+        {
+            return false;
+        }
+        let old =
+            unsafe { core::ptr::read_unaligned(private_data.cast::<PresentSubmissionPrivate>()) };
+        if old.magic != D3D12_SUBMISSION_MAGIC || old.version != PRESENT_SUBMISSION_VERSION {
+            return false;
+        }
+        // Only the magic word, exactly as `decode` consumes it — a Present record
+        // written into the same buffer later must still be recognisable, and
+        // zeroing the whole struct would also discard a `stream_boundary` or
+        // `blt_token` that a Present arm may legitimately have merged.
+        //
+        // SAFETY: the size check above proved `private_data` non-null with at
+        // least `size_of::<PresentSubmissionPrivate>()` writable bytes; `magic` is
+        // the first field of that record, at offset 0.
+        unsafe { core::ptr::write_unaligned(private_data.cast::<u32>(), 0) };
+        true
+    }
+
     /// Merge one same-context registered stream boundary into this submission.
     /// A context owns at most one live stream, so repeated Present records can
     /// only advance the same generation-qualified handle.  Different handles

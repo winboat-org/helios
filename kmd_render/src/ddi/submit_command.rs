@@ -151,6 +151,29 @@ pub static D3D12_SUBMIT_MERGE_FAILS: AtomicU32 = AtomicU32::new(0);
 /// into a later submission — which is now unrepresentable, and this counter is
 /// how you would see the batching that used to make it look benign.
 pub static D3D12_SUBMIT_MERGED: AtomicU32 = AtomicU32::new(0);
+/// `'HD12'` records cleared by a `DxgkDdiRender` that did **not** write one —
+/// the present-identity Render, or any other Render on a D3D12 WDDM context.
+///
+/// ⛔ **This closes the half of the recycled-buffer hazard that `D12Merged`'s doc
+/// above assumed away.** That doc argues a predecessor "can now only be an ECL
+/// batched into the SAME DMA buffer, or a buffer whose earlier submission never
+/// reached SubmitCommand" — true, and both merge conservatively *for another ECL*.
+/// It does not cover a **non-ECL** Render inheriting the record, which UP-9 made
+/// possible by adding a second `pfnRenderCb` on the same context that writes
+/// nothing at offset 0. `invalidate_d3d12` removes that inheritance.
+///
+/// ⚠ **NOT a failure counter, and not expected to be 0.** Nonzero means either
+/// the hazard was live (a stale record really was inherited before this landed),
+/// or — the benign and probably dominant cause — dxgkrnl batched an ECL and a
+/// present identity into one DMA buffer, in which case the cleared boundary was
+/// correct for that packet and the packet falls back to the conservative
+/// `next_wire_fence` prefix. ⛔ The two are not separable by this counter alone;
+/// `D12Clr` climbing in lockstep with present frequency is the batching, while
+/// `D12Clr` moving on a run with no D3D12 presents at all is the hazard.
+///
+/// ⚠ It is the accounting term the `D12Exact` identity in this file's mirror
+/// comment does not yet include — see that comment.
+pub static D3D12_STALE_RECORD_CLEARED: AtomicU32 = AtomicU32::new(0);
 
 /// Mirror the scheduler private-data handoff evidence at PASSIVE_LEVEL.
 pub(crate) fn record_present_handoff_telemetry() {
@@ -235,6 +258,13 @@ pub(crate) fn record_present_handoff_telemetry() {
     // private-data buffer. Nonzero = several ECLs batched into one DMA buffer, or
     // a buffer whose earlier submission never reached SubmitCommand.
     crate::diag::record_named_bytes(b"D12Merged", D3D12_SUBMIT_MERGED.load(Ordering::Relaxed));
+    // Also NOT a failure counter: a stale `'HD12'` record cleared by a Render that
+    // did not write one. Its doc carries how to tell the benign cause (dxgkrnl
+    // batched an ECL and a present identity together) from the hazard.
+    crate::diag::record_named_bytes(
+        b"D12Clr",
+        D3D12_STALE_RECORD_CLEARED.load(Ordering::Relaxed),
+    );
     crate::diag::record_named_bytes(
         b"GpuFncClamp",
         crate::virtio::gpu::GPU_FENCE_CLAMPED.load(Ordering::Relaxed),
@@ -1241,6 +1271,7 @@ pub unsafe extern "C" fn dxgkddi_render(
     // The three arms in this function are magic-disjoint by construction, and
     // `protocol/src/wddm.rs`'s const asserts pin the two size relationships that
     // make this one reachable without shadowing the others.
+    let mut stamped_d3d12 = false;
     if cmd_len >= size_of::<helios_protocol::HeliosD3D12SubmitCmd>() {
         let mut raw = [0u8; size_of::<helios_protocol::HeliosD3D12SubmitCmd>()];
         // SAFETY: the runtime guarantees `CommandLength` readable bytes at
@@ -1284,7 +1315,33 @@ pub unsafe extern "C" fn dxgkddi_render(
                     D3D12_SUBMIT_MERGE_FAILS.fetch_add(1, Ordering::Relaxed);
                 }
             }
+            stamped_d3d12 = true;
         }
+    }
+
+    // ⛔ THE OTHER HALF OF THE UNCONDITIONAL WRITE ABOVE. A Render that did not
+    // stamp a `'HD12'` record must not leave one it found, or it inherits another
+    // submission's boundary. `mark_d3d12`'s write covers the ECL arm; this covers
+    // every other `pfnRenderCb` on a D3D12 WDDM context — above all UP-9's
+    // present-identity Render, which writes nothing at offset 0.
+    //
+    // Placed here rather than at the end of the function on purpose: in
+    // `DxgkDdiRender` the ECL arm is the ONLY writer of offset 0 (the HEPR/HERF
+    // arms below merge through `display.rs`'s Present DDI, never through this
+    // one), so once that arm has been decided nothing later can re-stamp it.
+    //
+    // SAFETY: `pDmaBufferPrivateData` / `DmaBufferPrivateDataSize` are the pair
+    // dxgkrnl supplied for THIS Render; the helper re-checks null and size before
+    // touching a byte, and writes only the 4-byte magic at offset 0.
+    if !stamped_d3d12
+        && unsafe {
+            PresentSubmissionPrivate::invalidate_d3d12(
+                args.pDmaBufferPrivateData,
+                args.DmaBufferPrivateDataSize,
+            )
+        }
+    {
+        D3D12_STALE_RECORD_CLEARED.fetch_add(1, Ordering::Relaxed);
     }
 
     // The 16-byte HERF prefix is the legacy command.  Zero-fill a local full
