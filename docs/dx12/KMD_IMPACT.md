@@ -788,9 +788,59 @@ change), then read the probe's own `WaitForSingleObject signalled in N us` again
 | N flat; with `WddmHoldMs=100` **scoped to that context**, N → ~100 ms | **UV1 ✓, UV3 ✗.** The packet works, the venus retirement domain is the bug. Fix the ring, not the submission. |
 | N flat under both | **UV1 ✗.** Say so loudly and stop — none of K-F3..K-F9 is the answer. |
 
-⭐ **UV3 is separately pre-checkable with ZERO code**: read `RING_SUBMIT_COUNT` /
+~~⭐ **UV3 is separately pre-checkable with ZERO code**: read `RING_SUBMIT_COUNT` /
 `RING_COMPLETE_COUNT` (`kmd_render/src/virtio/gpu/mod.rs:3502-3504`, `:4027-4029`) before and after
-a D3D12 run. Do this first; it costs one run.
+a D3D12 run. Do this first; it costs one run.~~
+
+#### ⛔⛔ CORRECTION 2026-08-06 — UV3 IS ANSWERED (✗) FROM SOURCE, AND THE TABLE ABOVE IS UNSOUND
+
+**UV3: ✗, and worse than "decode" — for a D3D12 frame this driver usually sees no wire fence at
+all.** Answered without a run, and the two things that made it look unanswerable were both wrong.
+
+1. ⛔ **UV3's own cited evidence is STALE IN BOTH HALVES.** `vn_renderer_helios.c:3969-3973` says
+   `SUBMIT_VENUS` *"does not yet propagate `batch->ring_idx`"* and is *"synchronous"*. It propagates
+   it at **`:1702`** (`hdr.ring_idx = ring_idx`), and the function's own header at **`:1672-1678`**
+   says it is **ASYNC** and *"returns at QUEUE time"*. UV3's conclusion happens to be right, for a
+   reason its premise never mentions.
+2. ⭐ **The command stream never touches virtio.** `vn_QueueSubmit2` writes the cs into the shared
+   venus ring (`vn_ring.c:630-636`) and stores the tail; there is no `SUBMIT_3D`. The only virtio
+   submission a frame can produce is the `vkNotifyRingMESA` doorbell, hardcoded `.ring_idx = 0`
+   (`vn_renderer_util.h:26-35`).
+3. ⛔⛔ **And that doorbell is usually not sent.** It goes only when the host ring advertises IDLE,
+   and then only past a 1 ms limiter (`vn_ring.c:673-690`, `VN_RING_IDLE_TIMEOUT_NS` at `:22`). A
+   ring busier than 1 ms — every D3D12 frame — emits nothing. So `next_wire_fence` is **frozen**,
+   every entry below it has already retired, and `async_retired_up_to` returns true instantly.
+   ⇒ **That is the measured 0.8–1.1 µs.** It is an empty watermark, not a fence bug.
+4. ⛔ **A ring-0 wire fence is not even a venus decode fence on this host.** The KMD sets
+   `VIRTIO_GPU_FLAG_INFO_RING_IDX` only for `ring_idx != 0` (`gpu/mod.rs:3482`), and QEMU routes a
+   fence without that flag to the legacy `virgl_renderer_create_fence`, which ignores `ctx_id`
+   entirely (`qemu-helios/hw/display/virtio-gpu-virgl.c:1167-1186`). SUSPECTED beyond that boundary
+   (virglrenderer is not checked out): it becomes an empty `glFenceSync` in vrend's GL context 0.
+5. ⛔ **The only `ring_idx >= 1` producer on Windows is `vn_signal_win32_external_semaphore`**
+   (`vn_queue.c:1714-1724`, called at `:1986-1994`), gated on `payload->win32_sync` — non-NULL only
+   for an exported/imported OPAQUE_WIN32 semaphore. vkd3d signals one *internal* timeline semaphore
+   per submit (`command.c:24482-24485`) and a non-shared `ID3D12Fence` has no Vulkan semaphore at
+   all (`command.c:1728-1786`, `:23785-23818`). It never asks. ⇒ **DXVK's present path does produce
+   this traffic (~one per present, which is how D3D11 gets a truthful boundary); vkd3d produces
+   none.**
+
+**⛔ THEREFORE THE THREE-READING TABLE ABOVE MUST NOT BE USED.** Its bottom row — *"N flat under
+both ⇒ UV1 ✗"* — is unsound: a flat reading on the **unheld** arm is fully explained by (3), with no
+bearing on whether dxgkrnl would have ordered anything. The bare `pfnRenderCb` (K-F1) therefore
+settles **the plumbing only** — that dxgkrnl accepts the callback on a D3D12 queue's *legacy*
+context, that `RENDER_COUNT` moves (§14a.4 item 3's free settlement of **P7**), that the three
+windows come back, and that nothing bugchecks. **UV1's only clean test is a deliberate KMD-side
+hold** (`WddmHoldMs`, K-F0), scoped by the presence of `HeliosD3D12SubmitCmd`, which is why K-F0 is
+no longer conditional on K-F1's reading.
+
+⛔ **And the "ZERO code" pre-check above cannot answer UV3 either**: `SCANOUT_RING_IDX = 1`
+(`gpu/mod.rs:386`), so `RING_SUBMIT_COUNT` is dominated by **this driver's own** scanout and BLT
+copies — three internal producers (`gpu/mod.rs:3375`, `:3442`, and `ctrl.rs:1541-1547` through the
+generic enqueue), not two. Nor were those counters readable at all: they appeared only in the
+`'HDBG'` `DxgkDdiCollectDbgInfo` report, i.e. only after provoking a TDR. Both are now mirrored
+(`RngSub`/`RngCmp`) alongside a guest-originated split (`EscSub`/`EscSubRing`) counted at the escape
+wrapper — attribution, not a subtraction, because a subtraction goes stale the next time a fourth
+internal producer appears.
 
 ### 14a.2 The fence/completion bridge
 
@@ -804,12 +854,12 @@ This is the same discipline `HeliosWaitFrameSubmitted` gives the D3D11 present p
 | # | Item | Where | Size | Class |
 |---|---|---|---|---|
 | **FB-1** | Latch the three context windows in `QueueState` and re-latch them after every `pfnRenderCb`. Today they are logged and **dropped on purpose** (`umd12/src/forward12/queue.rs:920-940`). ⚠ **Shared by both `pfnRenderCb` users** — the fence carrier and the present identity. Do it once. Copy `umd/src/forward/present.rs:868-897` and `umd_common/src/window.rs`, which already documents the D3D12 case. | `umd12` | S | **[C]** |
-| **K-F1** | The bare submission: drain → `pfnRenderCb` on `QueueState::h_context` → re-latch. **No boundary record.** It takes the existing fall-through at `gpu/mod.rs:5641` → `RetireDomain::IncludingGpu` + `watermark = next_wire_fence`. ⭐ **Zero KMD change**, and if UV1 holds this alone makes `ID3D12Fence` truthful. | `umd12` | S | **[C]** |
-| **K-F0** | The scoped hold knob, only if K-F1's reading is flat: `WddmHoldMs` + a fourth block arm in `take_one_ready_wddm` (`gpu/mod.rs:5735-5752`, three already) + `WfBHold`, released by the existing 60 Hz DISPATCH heartbeat (`adapter/kobj.rs:461-540`) with one added `request_wddm_completion_dpc`. ⛔ **Must be scoped to the D3D12 context** or the adapter-global FIFO stalls the whole desktop; N ≪ TdrDelay. | `kmd_render` | S | **[E]** |
+| **K-F1** | The submission: drain (`vkd3d_acquire_vk_queue`) → `pfnRenderCb` on `QueueState::h_context` → re-latch. ⛔ **"No boundary record" is SUPERSEDED** — it carries `HeliosD3D12SubmitCmd` from the start, with `gpu_wire_fence = 0` until ICD-1 lands, because the record's presence is what scopes K-F0 and a second payload shape would be one more thing to keep in sync. ⭐ **Zero KMD change.** ⛔ **But it does NOT make `ID3D12Fence` truthful on its own, and it is not the UV1 test** — with a zero fence it takes the fall-through at `gpu/mod.rs:5641` (`watermark = next_wire_fence`), which §14a.1's correction shows is **already satisfied** during a D3D12 frame. What it settles is the **plumbing**: dxgkrnl accepts `pfnRenderCb` on a legacy D3D12 context, `RENDER_COUNT` moves (**P7**, free), the windows come back, nothing bugchecks. | `umd12` | S | **[C]** |
+| **K-F0** | ⛔ **NO LONGER CONDITIONAL** (was *"only if K-F1's reading is flat"*): per §14a.1's correction, K-F1's unheld reading cannot answer **UV1** at all, so the hold is the *only* clean test and lands in the same KMD deploy. `WddmHoldMs` + a fourth block arm in `take_one_ready_wddm` (`gpu/mod.rs:5735-5752`, three already, exactly one counter per blocked look) + `WfBHold`, released by the existing 60 Hz DISPATCH heartbeat (`adapter/kobj.rs:461-540`) with one added `request_wddm_completion_dpc`. ⛔ **Scoped by the presence of `HeliosD3D12SubmitCmd`** — carried as a flag on `WddmPending` — or the adapter-global head-of-line FIFO stalls the whole desktop, DWM included. N ≪ TdrDelay, **clamped in code**: an operator typo must not be a TDR. **Reading:** N grows by ~the hold ⇒ **UV1 ✓**; N stays at the 0.8–1.1 µs baseline ⇒ **UV1 ✗**, and none of this design is the answer. | `kmd_render` | S | **[E]** |
 | **K-F2** | ⛔ **A LIVE DEFECT ON THE SHIPPING PRESENT PATH, independent of D3D12 — but ⛔⛔ NOT the fix this row prescribed until 2026-08-06.** `present_stream_marker_boundary` (`gpu/mod.rs:4721-4744`) validates `ctx_id`/`value != 0`/`cookie`/`creator_process` and slot liveness, and bounds `value` in **no** way, so a guest writing an absurd `present_value` gets a *live* boundary `present_stream_slot_ready` (`:945-953`) can never satisfy; `wddm_pending` is an **adapter-global head-of-line FIFO** (`take_one_ready_wddm:5718-5765`, never bypassed), so it blocks every context including DWM's — bounded only by the FIFO's own 256-entry overflow escape (`:5664-5685`, `WDDM_PENDING_OVERFLOWS`, which then *drops* fences) or TDR, whichever lands first. ⛔⛔ **Copying the tag-path comparison (`value <= slot.submitted_value`) is REFUTED**: the tag path (`prepare:4770`, `commit:4790`) is the PRODUCER advancing the stream and requires the new value to be strictly AHEAD; the marker is a CONSUMER predicate, and on the shipping default the marker is delivered **before** the frame's `vkQueueSubmit` **by design**. `UmdAsyncPresentStream` is absent = ON (`umd/src/knobs.rs:129`), and `async_stream_eligible` **skips** `HeliosWaitFrameSubmitted` (`umd/src/forward/present.rs:1479-1528`) *because* the marker is what carries the dependency; the value is minted on the app thread (`umd/bridge/dxvk_bridge.cpp:1316`) while the tag that sets `submitted_value` rides DXVK's submission thread (`HeliosSignalPresentFence` is `EmitCs` only — `d3d11_context_imm.cpp:1150-1162` → `vn_queue.c:1994` → `:1736-1744`). So `value == submitted_value + 1` is the steady state, the check would refuse ~every legitimate frame, and each refusal falls back to `wire_fence_watermark()` (`adapter/scanout.rs:256-270`) — which does **not** cover the unsubmitted frame. With the UMD's gate skipped too, that is the **0ab-B stale/black-frame class returning**, plus `PresentWmk` silently demoted: a correctness regression, not a hardening. ⇒ **the guard is consumer-side liveness** — bound how long the FIFO head may block on a stream boundary, then rebase to the legacy watermark, loudly counted (K-F0's fourth-arm plumbing in `take_one_ready_wddm`), which also covers "submitted but never retired". An acceptance-side lookahead bound cannot stand alone: legitimate lookahead reaches DXVK's `MaxNumQueuedCommandBuffers = 32` (`dxvk-helios/src/dxvk/dxvk_limits.h:17`), and a forged value whose process then stops presenting is unsatisfiable at any bound. Its own commit; its own counter (**not** `PRESENT_STREAM_REJECTS`, which every other refusal already shares). | `kmd_render` | S | **[C]** |
 | **K-F5** | Counters for the new arm, atomics only (DISPATCH), mirrored from the PASSIVE site `record_present_handoff_telemetry` (`submit_command.rs:108-181`). The `PmHit`/`PwExact`/`WfB*` family is the template. | `kmd_render` | XS | **[C]** |
-| **ICD-1** | `helios_venus_last_submitted_wire_fence(VkDevice, uint32_t *ctx_id, uint64_t *wire_fence)` — one new `uint64_t last_wire_fence_id` on `struct helios` (`vn_renderer_helios.c:472`), stored at `:1739` inside code that already holds `dev_mutex`, read under the same mutex. No thread affinity (unlike `helios_venus_instance_ctx_id`, which returns a `_Thread_local`). Export beside the existing block at `:619-632`. | `icd/mesa` | XS | **[P]** |
-| **K-F3** | The boundary record, declared **once** in `protocol/` per D13, with its **own magic**. ⛔ Not `HeliosPresentRenderCmd` — `HeliosPresentPrivateData::is_valid()` requires `resource_id != 0` and an ECL has no primary. ⛔ Not `HeliosPresentRefreshCmd` — its `dxgkddi_render` arm unconditionally arms a scanout refresh (`submit_command.rs:1064`), which a compute or graphics ECL must not do. | `protocol` | S | **[P]** |
+| **ICD-1** | ⛔⛔ **REPLACED 2026-08-06, not relocated.** ~~`helios_venus_last_submitted_wire_fence(VkDevice, …)` reading a new `last_wire_fence_id` stored at `vn_renderer_helios.c:1739`~~ would return **whatever `SUBMIT_VENUS` happened last, process-wide, on any thread** — and for a vkd3d workload every submission that reaches that line is `ring_idx == 0` (§14a.1's correction): the ring doorbell, `vn_ring_submit_roundtrip`, ring create/destroy, the wait-alloc ordering batch. The KMD would then take it as a `gpu_completion_fence` and gate on `watermark = id + 1` (`gpu/mod.rs:5606-5610`) — **a fence that resolves at decode at best, and on this host at an empty `glFenceSync` in QEMU's GL context 0.** It would make the D3D12 fence *look* ordered while ordering nothing, and nondeterministically, since it names another thread's submit. ⇒ The shape is **per-queue**: `helios_venus_queue_gpu_fence(VkQueue, uint64_t *out_wire_fence)`, which encodes `vkWaitRingSeqnoMESA(vn_ring_get_id(dev->primary_ring), vn_ring_current_seqno(...))` — the barrier proving the host issued our `vkQueueSubmit` — and submits it with `.ring_idx = queue->ring_idx` (`vn_queue.h:26`, assigned `vn_device.c:83-88`, **never 0**), returning the KMD-assigned wire fence. Template: `vn_signal_win32_external_semaphore` (`vn_queue.c:1710-1755`). ⚠ A non-empty cs is **mandatory** — `helios_submit` skips the escape entirely when `cs_size == 0` (`vn_renderer_helios.c:3038-3044`) and no fence id comes back; and it discards the id unless a sync is attached (`:3037-3060`), so this calls `helios_ioctl_submit_cs` directly under one explicit `dev_mutex` acquisition (`mtx_plain`, **non-recursive**, `:454`). ⛔ Must refuse `ring_idx == 0` loudly: the host fails a fence on an unbound/out-of-range ring (`vkr_context.c:151-155`), the virtio response never comes, and the KMD's in-flight entry is **immortal** — the wedge at `gpu/mod.rs:3522-3537`. | `icd/mesa` | S | **[P]** |
+| **K-F3** | ✅ **LANDED 2026-08-06** (`629d1da`) as `HeliosD3D12SubmitCmd` — `{magic `'HE12'`, version, gpu_wire_fence: u64}`, **16 bytes**, declared once in `protocol/src/wddm.rs` per D13. ⭐ The length is load-bearing in **both** directions and the `const _` block asserts both: it must reach 16 to be recognisable at all (`DxgkDdiRender` gates its refresh decode on `cmd_len >= 16`) and stay under the 48-byte typed-scanout prefix so that arm is never attempted. Both existing arms then reject on magic — which, not length, is the real guard. ⛔ Not `HeliosPresentRenderCmd` — `HeliosPresentPrivateData::is_valid()` requires `resource_id != 0` and an ECL has no primary. ⛔ Not `HeliosPresentRefreshCmd` — its arm unconditionally arms a scanout refresh (`submit_command.rs:1064`), which a compute or graphics ECL must not do. ⭐ `is_valid()` deliberately does **not** check the fence: `0` is legal and means *"submit the packet, order it against nothing"* — the plumbing arm and the A/B disable — and the record's **presence**, not its content, is what scopes K-F0's hold to this path instead of the adapter-global FIFO. ⭐ A guest-supplied fence is safe by asymmetry: `gpu/mod.rs:5609-5616` clamps a value at or beyond `next_wire_fence`, so the worst case is naming an *earlier* fence and under-waiting (a lie, with a counter) — no unsatisfiable boundary, and therefore no wedge, is reachable from this field. | `protocol` | S | ✅ |
 | **K-F4** | Decode K-F3 in `dxgkddi_render` and write the wire fence into `PresentSubmissionPrivate.gpu_fence_id` via `merge_fence` (`present_packet.rs:299-344`). ⚠ **`dxgkddi_render` never touches `pDmaBufferPrivateData` today** — every hit in `submit_command.rs` is on the `submit` arg. `DXGKARG_RENDER` has both fields. Write at offset 0, do not advance the pointer, which is the shape Present already proves. ⭐ Everything downstream is already correct **and already guarded**: `gpu/mod.rs:5609-5616` rejects a guest value `>= next_wire_fence` — *"must not manufacture an impossible future dependency"*. | `kmd_render` | S | **[P]** |
 
 ⚠ **Do not add a new private-data record.** `PRESENT_DMA_PRIVATE_DATA_BYTES = 88` with
@@ -964,6 +1014,18 @@ DDI."*
    primitive between two **software sync packets**; the DMA-packet dependency is **UV1** and is
    unmeasured.
 7. Guest GPU page tables are **decorative**; the host GPU owns the real MMU.
+6a. ⭐ **A venus wire fence means host GPU completion only on `ring_idx >= 1`, and vkd3d produces
+   none.** The command stream rides the shared venus ring and never touches virtio
+   (`vn_ring.c:630-636`); the only virtio submission a frame can make is the ring-0
+   `vkNotifyRingMESA` doorbell, which is itself sent only when the host ring advertises IDLE and
+   then only past a 1 ms limiter (`vn_ring.c:673-690`) — so a busy ring emits **nothing** and
+   `next_wire_fence` freezes. The sole `ring_idx >= 1` producer on Windows is
+   `vn_signal_win32_external_semaphore`, which needs an OPAQUE_WIN32 semaphore: DXVK's present path
+   has one, vkd3d never asks for one. And a ring-0 fence carries no
+   `VIRTIO_GPU_FLAG_INFO_RING_IDX` (`gpu/mod.rs:3482`), so QEMU routes it to the legacy
+   `virgl_renderer_create_fence`, which never sees the venus context
+   (`qemu-helios/hw/display/virtio-gpu-virgl.c:1167-1186`). ⇒ **Any design that gates a D3D12
+   completion on "the last wire fence" is gating on nothing.**
 8. Segment topology is `[Aperture id 1, Bar id 2]`, `SegmentTable::MAX = 2`, and a
    `SupportsCpuHostAperture` segment must be **LAST**.
 9. `ApplicationTarget` + `LocalBudgetGroup` are ON for the BAR segment by default
