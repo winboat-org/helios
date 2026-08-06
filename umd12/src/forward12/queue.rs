@@ -460,14 +460,11 @@ const MAX_EXECUTE_COMMAND_LISTS: usize = 65_536;
 struct ContextWindows {
     /// The legacy command buffer `pfnRenderCb` records from and recycles.
     command: Option<Window<c_void>>,
-    /// The allocation list. ⚠ Empty for the fence carrier (K-F1 submits
-    /// `NumAllocations = 0`) and **mandatory** for a DXGI present, which is where
-    /// VidMm gets the residency it keeps live across the pending operation —
-    /// `umd/src/forward/present.rs:772-777` has that argument.
-    ///
-    /// ⛔ **Its capacity is in ELEMENTS**, unlike [`Self::command`]'s bytes. See
-    /// [`PresentDependencies::write_to`] for the header citation; the two units on
-    /// adjacent fields of one struct are the trap.
+    /// The allocation-list window dxgkrnl supplied with the legacy context.
+    /// D3D12 submissions in this driver deliberately use `NumAllocations = 0`:
+    /// residency is owned by the D3D12 runtime and the actual present source is
+    /// returned through `D3D12DDI_PRESENT_0051`. The window is still latched and
+    /// re-latched as part of the indivisible runtime window set.
     allocations: Option<Window<ddi12::D3DDDI_ALLOCATIONLIST>>,
     /// The patch-location list. Helios' GpuMmu is decorative — the host owns the
     /// real MMU and there are no guest GPU-VAs to patch, which is why
@@ -535,134 +532,6 @@ impl ContextWindows {
         }
     }
 }
-
-/// The allocations one WDDM present submission makes VidMm keep resident.
-///
-/// ⭐⭐ **This is the one place the present submission differs from K-F1's fence
-/// carrier, and the difference is mandatory rather than stylistic.** K-F1 submits
-/// `NumAllocations = 0` because its record names no allocation. A DXGI present's
-/// allocation list is *required*: it is where VidMm takes the residency it holds
-/// across the pending operation, which
-/// `umd/src/forward/present.rs:772-777` states outright for the shipping D3D11
-/// path. ⇒ [`submit_wddm_render`] grows a parameter rather than the present reusing
-/// it with an empty list.
-///
-/// ⛔ **A source-allocation-free present is unrepresentable**, which is the whole
-/// reason this is a type and not two `u32`s: [`Self::new`] returns `None` for a zero
-/// source. Same encoding and same argument as D3D11's `RuntimePresentDependencies`
-/// (`umd/src/forward/present.rs:370-376`).
-#[derive(Clone, Copy)]
-pub(crate) struct PresentDependencies {
-    /// The present **source** — the back buffer being presented. Read-only, so its
-    /// list entry carries `Value = 0`.
-    source: core::num::NonZeroU32,
-    /// The present **destination**, when there is one. Written by the copy, so its
-    /// entry carries `Value = 1` (bit 0 is `WriteOperation`).
-    ///
-    /// ⚠ `None` for every windowed D3D12 present this driver serves: the
-    /// destination is DWM's surface, named by the runtime and not by this driver.
-    /// The arm exists because the D3D11 template has it and because a fullscreen
-    /// flip is the case that will need it — not because anything reaches it today.
-    destination: Option<core::num::NonZeroU32>,
-}
-
-impl PresentDependencies {
-    /// `None` when `source` is 0 — see the type doc.
-    pub(crate) fn new(
-        source: ddi12::D3DKMT_HANDLE,
-        destination: ddi12::D3DKMT_HANDLE,
-    ) -> Option<Self> {
-        Some(Self {
-            source: core::num::NonZeroU32::new(source)?,
-            destination: core::num::NonZeroU32::new(destination),
-        })
-    }
-
-    /// How many entries [`Self::write_to`] will write.
-    fn count(self) -> u32 {
-        1 + u32::from(self.destination.is_some())
-    }
-
-    /// Write the entries into the runtime's allocation-list window.
-    ///
-    /// `Err(())` means the window is absent or smaller than [`Self::count`] — the
-    /// caller counts and refuses; nothing is written on that path.
-    ///
-    /// ⛔⛔ **`capacity` is in ELEMENTS, and the command window's is in BYTES.** The
-    /// two windows `pfnRenderCb` hands back use different units and nothing in
-    /// `Window<T>` says so, which makes this the one place a reader can get it wrong
-    /// in the direction that writes out of bounds. Verified against the WDK header,
-    /// not inherited: `D3DDDICB_CREATECONTEXT` (`tmp/dx12/sdk/d3dumddi.h`) spells them
-    /// *"Command buffer size (bytes)"* and *"Allocation list size (**elements**)"* on
-    /// adjacent lines. ⇒ the comparison below is entry count against entry count.
-    ///
-    /// ⚠ `D3DDDICB_RENDER::NewAllocationListSize` is *"in: Size requested for the
-    /// next allocation list"* and this driver requests **0**, exactly as the shipping
-    /// D3D11 present does. dxgkrnl keeps handing back the context's original list
-    /// size regardless — which the D3D11 path demonstrates every frame with a
-    /// two-entry list — and [`ContextWindows::re_latch`]'s `!= 0` guard is what makes
-    /// a request of 0 mean *"keep what you have"* rather than *"take my list away"*.
-    ///
-    /// # Safety
-    /// `list`/`capacity` must be the pair the runtime handed out together, from
-    /// `pfnCreateContextCb` or the preceding successful `pfnRenderCb`. They are
-    /// taken as one argument pair for the reason `Window` exists: a pointer checked
-    /// against a capacity that describes a different pointer is the corruption
-    /// `umd_common/src/window.rs:11-21` records.
-    unsafe fn write_to(
-        self,
-        list: *mut ddi12::D3DDDI_ALLOCATIONLIST,
-        capacity: u32,
-    ) -> Result<u32, ()> {
-        let required = self.count();
-        if list.is_null() || capacity < required {
-            return Err(());
-        }
-        // SAFETY: non-null with a capacity of at least `required` entries per the
-        // check above, so element 0 and — when a destination exists, making
-        // `required` 2 — element 1 are both inside the runtime's array.
-        // ⛔ `write_unaligned`: the window is dxgkrnl's and this driver has no way to
-        // check its alignment. It costs nothing on x64 and removes an assumption the
-        // D3D11 site makes implicitly by using a plain typed store.
-        unsafe {
-            list.write_unaligned(allocation_list_entry(self.source.get(), false));
-            if let Some(destination) = self.destination {
-                list.add(1)
-                    .write_unaligned(allocation_list_entry(destination.get(), true));
-            }
-        }
-        Ok(required)
-    }
-}
-
-/// One `D3DDDI_ALLOCATIONLIST` entry.
-///
-/// ⚠ Built through the union's `Value` arm rather than the bitfield accessors, and
-/// that is what the D3D11 site does too (`umd/src/forward/present.rs:412`): bit 0 is
-/// `WriteOperation` and every other bit is 0. The union is exactly 4 bytes with no
-/// padding, so writing `Value` initialises all of it — which a `set_WriteOperation`
-/// call on a `MaybeUninit` bitfield would not.
-fn allocation_list_entry(
-    h_allocation: ddi12::D3DKMT_HANDLE,
-    write_operation: bool,
-) -> ddi12::D3DDDI_ALLOCATIONLIST {
-    ddi12::D3DDDI_ALLOCATIONLIST {
-        hAllocation: h_allocation,
-        __bindgen_anon_1: ddi12::_D3DDDI_ALLOCATIONLIST__bindgen_ty_1 {
-            Value: u32::from(write_operation),
-        },
-    }
-}
-
-// ⛔ The one thing this file depends on POSITIONALLY in `D3DDDI_ALLOCATIONLIST`, and
-// `ddi12`'s module doc requires it to be pinned here rather than trusted to bindgen's
-// self-consistent assertions: the flags union must be exactly the 4 bytes `Value`
-// covers, or `allocation_list_entry` leaves part of an entry uninitialised.
-const _: () = {
-    assert!(core::mem::size_of::<ddi12::_D3DDDI_ALLOCATIONLIST__bindgen_ty_1>() == 4);
-    assert!(core::mem::offset_of!(ddi12::D3DDDI_ALLOCATIONLIST, __bindgen_anon_1) == 4);
-    assert!(core::mem::size_of::<ddi12::D3DDDI_ALLOCATIONLIST>() == 8);
-};
 
 /// `(pointer, capacity)` for a window that may be absent.
 ///
@@ -2882,13 +2751,18 @@ pub(crate) enum WddmSubmit {
 /// size_of::<T>()`. `NumPatchLocations` is always **0**: Helios' GpuMmu is
 /// decorative, so there is nothing to patch.
 ///
-/// `dependencies` is the allocation list, and it is the one thing the two callers
-/// disagree about. `None` — K-F1's fence carrier — submits `NumAllocations = 0`,
-/// because the ECL record names no allocation. `Some(..)` — UP-9's present
-/// identity — is **mandatory** for a DXGI present: that list is where VidMm takes
-/// the residency it holds across the pending operation
-/// (`umd/src/forward/present.rs:772-777`). ⇒ the parameter, rather than the
-/// present reusing this call with an empty list.
+/// `NumAllocations` is always **0**. Both records are metadata: the ECL packet names
+/// a completion boundary and the present packet names a venus resource. The D3D12
+/// runtime owns residency through `pfnMakeResidentCb` and carries the actual source
+/// allocation in `D3D12DDI_PRESENT_0051::BroadcastSrcAllocation`; unlike D3D11's
+/// copy submission, neither Render packet reads or writes an allocation.
+///
+/// ⛔ This was settled live rather than inferred from the D3D11 template. On the
+/// same D3D12 context, 900 zero-allocation ECL Render callbacks succeeded while the
+/// first otherwise-identical 80-byte HEPR callback with one allocation-list entry
+/// was refused by dxgkrnl with `E_FAIL` before `DxgkDdiRender`. An empty list makes
+/// the metadata submission match what it actually does and leaves residency on the
+/// two D3D12 channels that own it.
 ///
 /// ⛔ **The list is written inside this function and under the same guard as the
 /// command**, which is why it cannot be a caller's job: [`QueueState::windows`]
@@ -2942,7 +2816,6 @@ unsafe fn submit_wddm_render<T: Copy>(
     dev: &device12::HeliosD3D12Device,
     queue: &QueueState,
     command_record: &T,
-    dependencies: Option<PresentDependencies>,
     label: &'static str,
 ) -> WddmSubmit {
     if dev.kt_callbacks.is_null() {
@@ -3018,37 +2891,6 @@ unsafe fn submit_wddm_render<T: Copy>(
         return WddmSubmit::Unavailable;
     }
 
-    // ⛔ THE ALLOCATION LIST IS VALIDATED AND WRITTEN BEFORE THE COMMAND, so a
-    // present whose list window is unusable leaves the command window untouched
-    // rather than half-prepared. Both windows are dxgkrnl's; both are checked
-    // per-arm against this submission's own requirement (CLAUDE.md: validate every
-    // runtime-supplied size before writing), never against a max union.
-    let num_allocations = match dependencies {
-        None => 0,
-        Some(deps) => {
-            let (list, list_capacity) = window_parts(&windows.allocations);
-            // SAFETY: `window_parts` returns the pointer and the capacity as one
-            // pair out of one `Window`, which is exactly `write_to`'s stated
-            // precondition — the pair can never describe two different buffers.
-            match unsafe { deps.write_to(list, list_capacity) } {
-                Ok(count) => count,
-                Err(()) => {
-                    note_refusal(&L2_REFUSALS.wddm_alloc_list_unavailable);
-                    if let Some(n) = budget(&ECL_LOG) {
-                        log_error!(
-                            "{label}: context {:p} allocation list is {list:p}/{list_capacity}, \
-                             need {} entries -- not submitting (x{})",
-                            queue.h_context,
-                            deps.count(),
-                            n + 1,
-                        );
-                    }
-                    return WddmSubmit::Unavailable;
-                }
-            }
-        }
-    };
-
     // SAFETY: `command` is the runtime's command-buffer window, non-null and proven
     // to hold at least `size_of::<T>()` bytes by the two checks above, and it can
     // never overlap `command_record` — one is dxgkrnl's buffer and the other the
@@ -3061,7 +2903,7 @@ unsafe fn submit_wddm_render<T: Copy>(
     let mut render = ddi12::D3DDDICB_RENDER {
         CommandLength: command_length,
         CommandOffset: 0,
-        NumAllocations: num_allocations,
+        NumAllocations: 0,
         NumPatchLocations: 0,
         hContext: queue.h_context,
         ..Default::default()
@@ -3094,7 +2936,7 @@ unsafe fn submit_wddm_render<T: Copy>(
     windows.re_latch(&render);
     // ⛔ No success counter here — see this function's doc. The caller owns it.
     trace_line!(
-        "{label}: pfnRenderCb ok ctx={:p} len={command_length} allocations={num_allocations} \
+        "{label}: pfnRenderCb ok ctx={:p} len={command_length} allocations=0 \
          queued={} next_cmd={:p}/{}",
         queue.h_context,
         render.QueuedBufferCount,
@@ -3111,9 +2953,7 @@ unsafe fn submit_wddm_render<T: Copy>(
 /// reason [`present_context`] returns a handle: `submit_wddm_render` needs a
 /// `&QueueState`, and handing one across the module boundary would export
 /// [`QueueState::windows`]' guard discipline — the guard that must span write →
-/// `pfnRenderCb` → re-latch — to a file that does not own it. The allocation list
-/// has to be written inside that guard too, which is why L8 passes
-/// [`PresentDependencies`] and never touches the window.
+/// `pfnRenderCb` → re-latch — to a file that does not own it.
 ///
 /// ⛔ **The caller decides what a failure means, and this function decides
 /// nothing.** It reports the [`WddmSubmit`] verbatim; `report_present_submit_error`
@@ -3131,7 +2971,6 @@ unsafe fn submit_wddm_render<T: Copy>(
 pub(crate) unsafe fn submit_present_identity(
     h_queue: ddi12::D3D12DDI_HCOMMANDQUEUE,
     record: &helios_protocol::HeliosPresentRenderCmd,
-    dependencies: PresentDependencies,
 ) -> WddmSubmit {
     // SAFETY: forwarded to `queue_state`'s identical precondition; the borrow ends
     // inside this function.
@@ -3151,8 +2990,7 @@ pub(crate) unsafe fn submit_present_identity(
     // SAFETY: `dev` is the live device `queue` was created against, `queue` is live
     // for this call, and the caller guarantees we are inside `pfnPresent` on the
     // entering thread — `submit_wddm_render`'s three obligations.
-    let outcome =
-        unsafe { submit_wddm_render(dev, queue, record, Some(dependencies), "Present identity") };
+    let outcome = unsafe { submit_wddm_render(dev, queue, record, "Present identity") };
     if matches!(outcome, WddmSubmit::Submitted) {
         // ⭐ Counted HERE and not in L8, because this function is present-scoped by
         // construction — nothing else calls it — so the counter cannot be confounded
@@ -3658,12 +3496,6 @@ unsafe extern "C" fn execute_command_lists(
                 dev,
                 queue,
                 &ecl_submit_command(gpu_wire_fence),
-                // ⛔ K-F1's record names no allocation, so the list is empty and the
-                // reason is not thrift: `NumAllocations = 0` on a legacy context is
-                // what a submission with nothing to keep resident looks like. UP-9's
-                // present is the opposite case; `PresentDependencies` has the
-                // argument.
-                None,
                 "ExecuteCommandLists",
             )
         });
@@ -4905,16 +4737,10 @@ pub(crate) struct L2Refusals {
     /// root signature"* as *"the application passed none"*, which is the exact
     /// conflation `pso::root_signature`'s own doc warns callers to separate.
     command_signature_root_sig_unresolved: RefusalCounter,
-    /// A WDDM submission needed an **allocation list** and dxgkrnl's window was
-    /// absent or smaller than the entry count.
-    ///
-    /// ⛔ **Expected 0, and it can only ever be reached by the present arm**: K-F1's
-    /// fence carrier passes no [`PresentDependencies`] at all, so a hit means
-    /// `pfnPresent` had an identity and a context and still could not name the back
-    /// buffer's residency. ⚠ Read it beside `EclSubmitNoCmdWindow`: both non-zero
-    /// says the whole legacy context arrived without windows, which is a fact about
-    /// the adapter; this one alone says the *allocation* window specifically is
-    /// under-sized, which is a fact about how many entries dxgkrnl lent.
+    /// ⛔ Retired append-only telemetry slot. D3D12 Render callbacks in this driver
+    /// carry metadata only and submit `NumAllocations = 0`; the D3D12 runtime owns
+    /// residency and `pfnPresent` returns the source allocation separately. Kept in
+    /// its historical position so refusal-summary ordering does not change.
     wddm_alloc_list_unavailable: RefusalCounter,
     /// ⭐ **UP-9's success counter: a present identity record went in.**
     ///

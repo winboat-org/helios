@@ -67,7 +67,7 @@
 //!
 //! # ⛔ The key is an ADDRESS, and it is never dereferenced
 //!
-//! [`PresentableIdentity::engine_resource`] is `ID3D12Resource::as_raw() as
+//! [`AllocationIdentity::engine_resource`] is `ID3D12Resource::as_raw() as
 //! usize`. This module holds **no** COM reference and performs **no** load
 //! through that value: it is an identity token compared with `==`, nothing more.
 //! The owning reference lives in `ResourceState`, whose box outlives every entry
@@ -122,7 +122,8 @@
 //! `HeliosWddmOpenIdentity::ctx_id`, which that record's own doc calls *"diagnostic
 //! only"*. Refusing a create over a diagnostic would be the wrong severity.
 
-use std::sync::{Mutex, MutexGuard};
+use std::collections::HashMap;
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 /// The resource geometry the create DDI supplies, verbatim.
 ///
@@ -139,7 +140,7 @@ use std::sync::{Mutex, MutexGuard};
 /// here would be a second, unchecked derivation of a number the engine already
 /// owns. UP-5 asks the engine instead, and UP-9 needs the answer for
 /// `HeliosPresentPrivateData::pitch`, so it is kept as
-/// [`PresentableIdentity::pitch`]: outside this struct precisely because it is
+/// [`AllocationIdentity::pitch`]: outside this struct precisely because it is
 /// not one of the DDI's own fields.
 #[derive(Clone, Copy)]
 pub(crate) struct IdentityGeometry {
@@ -158,15 +159,14 @@ pub(crate) struct IdentityGeometry {
     pub(crate) dxgi_format: u32,
 }
 
-/// One presentable resource's identity, as far as it is known.
+/// One committed resource's WDDM allocation identity.
 ///
 /// `Copy`, and every field is a plain integer: this record holds no COM
-/// reference, no pointer it may dereference and nothing with a destructor, which
-/// is what makes a fixed array of `Option<Self>` a `const`-initialisable
-/// `static` and what makes reading an entry out under the lock free of any
-/// ownership question.
+/// reference, no pointer it may dereference and nothing with a destructor. That
+/// makes copying a record out under the registry lock free of any ownership
+/// question.
 #[derive(Clone, Copy)]
-pub(crate) struct PresentableIdentity {
+pub(crate) struct AllocationIdentity {
     /// `ID3D12Resource::as_raw() as usize` — the table key. **Never
     /// dereferenced**; see the module doc.
     pub(crate) engine_resource: usize,
@@ -174,7 +174,7 @@ pub(crate) struct PresentableIdentity {
     /// as a 64-bit handle. **0 = unresolved** (see the module doc's table).
     pub(crate) vk_memory: u64,
     /// The resource's byte offset within `vk_memory`. ⚠ Non-zero means vkd3d
-    /// suballocated, which UP-3 exists to prevent for a primary: D3D11's adopt
+    /// suballocated, which UP-3 exists to prevent for an adopted allocation: D3D11's adopt
     /// path requires `memory_offset == 0`
     /// (`umd/src/forward/resource.rs:488-490`), because one venus resid covering
     /// several D3D12 resources breaks the one-resource-one-allocation rule.
@@ -254,11 +254,10 @@ pub(crate) struct PresentableIdentity {
     pub(crate) pitch: u32,
     /// The raw `D3D12DDI_HEAP_FLAGS` word the create arrived with.
     ///
-    /// ⭐ This is §14a.3's `is_primary` field, kept in its unreduced form. The
-    /// table's admission predicate *is* `HEAP_FLAG_PRIMARY`, so a `bool` here
-    /// would be a field that is always `true`; the raw word instead says which
-    /// other bits the primary carried, which is what UP-5 needs to map onto
-    /// `HeliosWddmAllocMeta::bind_flags` / `misc_flags`.
+    /// ⭐ This keeps the runtime's declaration unreduced. The allocation registry
+    /// admits every committed resource because no later shared-resource signal
+    /// exists; the raw word still records whether the runtime also declared the
+    /// resource a `HEAP_FLAG_PRIMARY` and which other bits it carried.
     pub(crate) heap_flags: u32,
 }
 
@@ -266,15 +265,15 @@ pub(crate) struct PresentableIdentity {
 ///
 /// `#[must_use]`: an ignored outcome is a dropped identity nobody counted, which
 /// is the silent-failure shape CLAUDE.md rule 2 forbids.
-#[must_use = "every outcome has a named counter; dropping it makes a full table silent"]
+#[must_use = "every outcome has a named counter; dropping it makes an identity failure silent"]
 pub(crate) enum RecordOutcome {
-    /// A free slot took the entry.
+    /// The registry took a new entry.
     Inserted,
     /// An entry for the same `engine_resource` already existed and was
     /// overwritten. ⛔ Means a destroy did not remove one.
     Replaced,
-    /// The table is full and the identity was **dropped**.
-    TableFull,
+    /// The registry could not reserve storage and the identity was **dropped**.
+    RegistryAllocationFailed,
     /// ⛔⛔ **A DIFFERENT live resource already claims this `venus_res_id`**, so the
     /// engine suballocated two D3D12 resources out of one `VkDeviceMemory` and the
     /// identity was **refused**.
@@ -295,32 +294,28 @@ pub(crate) enum RecordOutcome {
     },
 }
 
-/// How many presentable identities the table holds.
+/// Process-local allocation identities, indexed both ways required by the
+/// contract: resource identity for DDI lookups and venus resource id for the
+/// one-resource/one-allocation collision check.
 ///
-/// ⛔ Bounded on purpose (CLAUDE.md rule 2: loud failure over silent
-/// truncation). The number is derived, not picked: `DXGI_MAX_SWAP_CHAIN_BUFFERS`
-/// is 16, so 64 is four fully-buffered swapchains live in one process at once.
-/// At `size_of::<PresentableIdentity>()` ≈ 96 bytes that is ~6 KiB of process
-/// lifetime data, which is not worth a heap allocation or a `HashMap` — and a
-/// fixed array is what lets the table be a plain `static` with no lazy
-/// initialisation on a free-threaded DDI path.
-///
-/// ⚠ It bounds **presentable** resources, not resources. The admission
-/// predicate is the `PRIMARY` heap flag, so an application creating 50 000
-/// textures records none of them; that is why 64 is a plausible bound at all,
-/// and it is why `IdentityTableFull` reading non-zero would say the predicate is
-/// wrong rather than that the bound is small.
-const MAX_PRESENTABLE_IDENTITIES: usize = 64;
+/// ⛔ This used to be a 64-entry fixed array because only runtime-declared
+/// `PRIMARY` resources were admitted. The deployed runtime sends no such flag:
+/// every committed resource must receive its WDDM identity at create time,
+/// because the DDI exposes no later shared-resource declaration. Keeping the
+/// old bound would make an ordinary application fail on its 65th committed
+/// resource. Two hash maps preserve O(1) lookup without an arbitrary resource
+/// ceiling; [`record`] uses `try_reserve` so allocation failure is a loud,
+/// unwindable result rather than a panic in a DDI.
+#[derive(Default)]
+struct IdentityRegistry {
+    by_resource: HashMap<usize, AllocationIdentity>,
+    by_venus_res_id: HashMap<u32, usize>,
+}
 
-/// The table. One lock, held for the length of one array scan and nothing else.
-///
-/// ⚠ A `Mutex` and not a lock-free scheme: D3D12 DDIs are FREETHREADED
-/// (`DDI_REFERENCE.md` §7.1), so a create on one thread and a destroy on another
-/// are the expected case, and the critical section here is tens of integer
-/// comparisons. `Mutex::new` is `const`, so this needs no `OnceLock` and no
-/// initialisation ordering.
-static IDENTITIES: Mutex<[Option<PresentableIdentity>; MAX_PRESENTABLE_IDENTITIES]> =
-    Mutex::new([None; MAX_PRESENTABLE_IDENTITIES]);
+/// D3D12 DDIs are FREETHREADED (`DDI_REFERENCE.md` §7.1), so create, lookup and
+/// destroy share one short critical section. Empty `HashMap`s allocate no
+/// storage when `OnceLock` initialises the registry.
+static IDENTITIES: OnceLock<Mutex<IdentityRegistry>> = OnceLock::new();
 
 /// Lock the table, ignoring poisoning.
 ///
@@ -330,19 +325,20 @@ static IDENTITIES: Mutex<[Option<PresentableIdentity>; MAX_PRESENTABLE_IDENTITIE
 /// because a `panic!` in a DDI is a silent graphics deadlock (CLAUDE.md's
 /// invariant table) and this crate must not contain a reachable one, even a
 /// theoretically unreachable one.
-fn identities() -> MutexGuard<'static, [Option<PresentableIdentity>; MAX_PRESENTABLE_IDENTITIES]> {
+fn identities() -> MutexGuard<'static, IdentityRegistry> {
     IDENTITIES
+        .get_or_init(|| Mutex::new(IdentityRegistry::default()))
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Record one presentable resource's identity.
+/// Record one committed resource's allocation identity.
 ///
 /// Overwrites any entry with the same `engine_resource` — see the module doc's
 /// address-recycling argument for why that is the correct direction and not a
 /// convenience.
-pub(crate) fn record(identity: PresentableIdentity) -> RecordOutcome {
-    let mut table = identities();
+pub(crate) fn record(identity: AllocationIdentity) -> RecordOutcome {
+    let mut registry = identities();
 
     // ⛔ THE RES-ID SCAN COMES BEFORE ANY WRITE, and it is a refusal rather than a
     // replacement. A shared `venus_res_id` is not a stale entry to overwrite -- both
@@ -353,36 +349,37 @@ pub(crate) fn record(identity: PresentableIdentity) -> RecordOutcome {
     // one value that would otherwise match every unresolved entry a future caller
     // might add.
     if identity.venus_res_id != 0 {
-        for existing in table.iter().flatten() {
-            if existing.venus_res_id == identity.venus_res_id
-                && existing.engine_resource != identity.engine_resource
-            {
-                return RecordOutcome::ResIdShared {
-                    holder: existing.engine_resource,
-                };
+        if let Some(&holder) = registry.by_venus_res_id.get(&identity.venus_res_id) {
+            if holder != identity.engine_resource {
+                return RecordOutcome::ResIdShared { holder };
             }
         }
     }
 
-    // ⛔ The address-collision scan comes next and completes before any insertion. A
-    // single pass that inserted into the first free slot it met would, on a
-    // colliding key held in a *later* slot, leave two entries for one address --
-    // and then `remove` would clear one and `IdentityRemoved` would under-count
-    // by exactly the number of collisions, i.e. the leak detector would be
-    // broken by the very case it exists to catch.
-    for slot in table.iter_mut() {
-        if slot.is_some_and(|existing| existing.engine_resource == identity.engine_resource) {
-            *slot = Some(identity);
-            return RecordOutcome::Replaced;
-        }
+    // Reserve both maps before mutating either. Once both succeed, neither
+    // insertion below can allocate, so the two indexes cannot diverge on OOM.
+    if registry.by_resource.try_reserve(1).is_err()
+        || registry.by_venus_res_id.try_reserve(1).is_err()
+    {
+        return RecordOutcome::RegistryAllocationFailed;
     }
-    for slot in table.iter_mut() {
-        if slot.is_none() {
-            *slot = Some(identity);
-            return RecordOutcome::Inserted;
-        }
+
+    let replaced = registry.by_resource.remove(&identity.engine_resource);
+    if let Some(previous) = replaced {
+        registry.by_venus_res_id.remove(&previous.venus_res_id);
     }
-    RecordOutcome::TableFull
+    registry
+        .by_venus_res_id
+        .insert(identity.venus_res_id, identity.engine_resource);
+    registry
+        .by_resource
+        .insert(identity.engine_resource, identity);
+
+    if replaced.is_some() {
+        RecordOutcome::Replaced
+    } else {
+        RecordOutcome::Inserted
+    }
 }
 
 /// The recorded identity for `engine_resource`, if there is one.
@@ -398,33 +395,25 @@ pub(crate) fn record(identity: PresentableIdentity) -> RecordOutcome {
 /// the runtime for a resource it is holding, so the resource cannot be destroyed
 /// under them — that is the runtime's own object-lifetime guarantee, not something
 /// this table provides.
-pub(crate) fn lookup(engine_resource: usize) -> Option<PresentableIdentity> {
-    let table = identities();
-    table
-        .iter()
-        .flatten()
-        .find(|existing| existing.engine_resource == engine_resource)
-        .copied()
+pub(crate) fn lookup(engine_resource: usize) -> Option<AllocationIdentity> {
+    identities().by_resource.get(&engine_resource).copied()
 }
 
 /// Take the entry for `engine_resource`, if there is one.
 ///
 /// Returns the removed record, which is how the caller distinguishes "this destroy
 /// retired an identity" from the ordinary case of destroying a resource that was
-/// never presentable — **and** how it learns which `D3DKMT_HANDLE` to hand
-/// `pfnDeallocateCb`.
+/// not created on the committed arm — **and** how it learns which
+/// `D3DKMT_HANDLE` to hand `pfnDeallocateCb`.
 ///
 /// ⭐ **Take, not read-then-remove**, and the atomicity is the point: the slot is
 /// cleared under the same lock acquisition that reads it, so two concurrent
 /// destroys of one resource cannot both come away with the handle and deallocate it
 /// twice. A `lookup` + `remove` pair would have that race, and a double
 /// `pfnDeallocateCb` is a kernel-handle double free.
-pub(crate) fn take(engine_resource: usize) -> Option<PresentableIdentity> {
-    let mut table = identities();
-    for slot in table.iter_mut() {
-        if slot.is_some_and(|existing| existing.engine_resource == engine_resource) {
-            return slot.take();
-        }
-    }
-    None
+pub(crate) fn take(engine_resource: usize) -> Option<AllocationIdentity> {
+    let mut registry = identities();
+    let identity = registry.by_resource.remove(&engine_resource)?;
+    registry.by_venus_res_id.remove(&identity.venus_res_id);
+    Some(identity)
 }

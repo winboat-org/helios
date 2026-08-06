@@ -9,6 +9,40 @@ that is now the unit of work.
 
 ---
 
+## ⭐ STATUS 2026-08-07 02:12 (DEPLOYED) — THE D3D12 SWAPCHAIN WORKS
+
+**This block supersedes the earlier 2026-08-07 swapchain-blocker status below.**
+
+The deployed D3D12 UMD (`SHA256 3DF16C82CD924679F1E4CE1D29C15DA1BEA278DC7B161320A0BE8F893808B64E`)
+passes both acceptance rungs on the Helios adapter:
+
+* `spy_workload share --adapter 0`: committed shared render target creation and
+  `CreateSharedHandle(resource)` both return `S_OK`; the shared-fence and non-shared-resource
+  controls also return `S_OK`.
+* `spy_workload window --adapter 0 --frames 900`: swapchain creation, both `GetBuffer` calls and
+  all **900/900** Presents succeed; the task exits 0. The per-process log records
+  `PresentEntered=900`, `PresentIdentitySubmitted=900`, `EclWddmSubmitted=900`,
+  `EclSubmitRenderFailed=0`, and every `PresentIdentity*` refusal counter is 0.
+* `helios_paintcap_hidden` captured the unobscured probe window filled with the expected
+  `(0.125, 0.375, 0.75)` medium-blue clear colour. The Looking Glass IDD was disabled and was
+  not used for this acceptance; the native Helios desktop path produced the frame.
+
+The repair is contract-defined rather than description-matched: every committed resource gets
+its WDDM allocation identity at create time, because this DDI exposes no later shared-resource
+declaration and the measured runtime does not query an allocation handle before sharing. The
+identity table is now a fallible dynamic two-index registry, so ordinary applications do not
+fail on a fixed 65th resource. The vkd3d fork gives committed buffers the same dedicated Venus
+OPAQUE_FD export chain images already had. Finally, the HEPR `pfnRenderCb` is metadata-only and
+submits `NumAllocations=0`; the actual present source remains in
+`D3D12DDI_PRESENT_0051::BroadcastSrcAllocation`, while the D3D12 runtime owns residency. This
+last distinction was measured directly: the first HEPR call with a redundant legacy allocation
+list was rejected by dxgkrnl with `E_FAIL`, while the zero-list form completed all 900 frames.
+
+Time Spy and Port Royal remain subsequent capability/compatibility goals; they are no longer
+blocked on basic HWND swapchain creation or presentation.
+
+---
+
 ## ⛔⛔ STATUS 2026-08-07 (DEPLOYED) — IT RUNS, AND THE SWAPCHAIN BLOCKER IS ROOT-CAUSED
 
 **Read this block first. It supersedes every block below it, including the compile block.**

@@ -353,7 +353,8 @@ unsafe extern "C" fn present(
     // packet.
     let private = helios_protocol::HeliosPresentPrivateData {
         // The resource's byte offset inside the venus resource. UP-3's dedicated
-        // export makes this 0 for a primary and `adopt_presentable` refuses anything
+        // export makes this 0 for a committed resource and
+        // `adopt_committed_allocation` refuses anything
         // else, so it is carried rather than recomputed.
         plane_offset: identity.memory_offset,
         magic: helios_protocol::HELIOS_PRESENT_PRIVATE_MAGIC,
@@ -362,18 +363,18 @@ unsafe extern "C" fn present(
         resource_id: identity.venus_res_id,
         // ⚠ Saturating rather than `as`: the DDI's `Width` is a `UINT64` even for a
         // texture and this field is 32-bit. Same clamp as `HeliosWddmAllocMeta`'s in
-        // `adopt_presentable`, so the two records cannot disagree.
+        // `adopt_committed_allocation`, so the two records cannot disagree.
         width: identity.geometry.width.min(u64::from(u32::MAX)) as u32,
         height: identity.geometry.height,
         // The ENGINE's row pitch, recorded at create. ⚠ 0 means the engine declined;
-        // see `identity12::PresentableIdentity::pitch` for why that is carried and
+        // see `identity12::AllocationIdentity::pitch` for why that is carried and
         // not refused on the windowed path.
         pitch: identity.pitch,
         dxgi_format: identity.geometry.dxgi_format,
         // ⛔ `reserved` is the FLAGS word, and every bit stays 0 deliberately.
         // `FLAG_DIRECT_SCANOUT` would claim this allocation came from the exact
         // exportable `pPrimaryDesc` and may be scanned out directly — it did not, and
-        // `adopt_presentable` refuses to set the matching
+        // `adopt_committed_allocation` refuses to set the matching
         // `HELIOS_WDDM_ALLOC_MISC_DIRECT_SCANOUT` for the same reason. The two
         // SNAPSHOT bits belong to the D3D11 windowed-BLT machinery, which this path
         // does not use.
@@ -400,7 +401,7 @@ unsafe extern "C" fn present(
     // ⛔ Asked of the record itself rather than re-checked field by field: the KMD
     // gates its decode on exactly this predicate, so anything it would reject must be
     // refused here instead of submitted and silently dropped. Its one runtime-valued
-    // term is `resource_id != 0`, which `adopt_presentable` already refuses to
+    // term is `resource_id != 0`, which `adopt_committed_allocation` already refuses to
     // record — so this is the assertion that the table's invariant held.
     if !record.is_valid() {
         note_refusal(&L8_REFUSALS.present_identity_invalid);
@@ -417,10 +418,10 @@ unsafe extern "C" fn present(
         }
         return;
     }
-    // The allocation list, which is MANDATORY for a present — see
-    // `queue::PresentDependencies`. ⚠ Destination 0: a windowed present's destination
-    // is DWM's surface, named by the runtime and not by this driver.
-    let Some(dependencies) = queue::PresentDependencies::new(identity.h_allocation, 0) else {
+    // The source allocation travels in the D3D12 present descriptor below, not in
+    // this metadata-only Render callback's legacy allocation list. Keep the table's
+    // non-zero invariant explicit before either channel is used.
+    if identity.h_allocation == 0 {
         // ⛔ Unreachable by the table's invariant — `identity12`'s module doc: an
         // entry exists **iff** this driver owns a WDDM allocation, so
         // `h_allocation != 0` on every recorded entry. Counted because "unreachable
@@ -432,7 +433,7 @@ unsafe extern "C" fn present(
     // SAFETY: `h_queue` is a handle `create_command_queue` returned `S_OK` for — the
     // same handle `present_context` just resolved — and this is `pfnPresent` on the
     // thread the runtime entered it on, which is the accessor's other obligation.
-    match unsafe { queue::submit_present_identity(h_queue, &record, dependencies) } {
+    match unsafe { queue::submit_present_identity(h_queue, &record) } {
         queue::WddmSubmit::Submitted => {}
         queue::WddmSubmit::Unavailable => {
             // ⛔ Counted, NOT raised, and the present PROCEEDS. This arm means this
@@ -667,7 +668,7 @@ struct L8Refusals {
     /// `is_valid()`, so it was refused rather than submitted.
     ///
     /// ⛔ **Expected 0**, and its only runtime-valued term is `resource_id != 0` —
-    /// which `adopt_presentable` already refuses to record, so a hit means the
+    /// which `adopt_committed_allocation` already refuses to record, so a hit means the
     /// `identity12` table holds an entry with a zero venus resource id. ⚠ It is
     /// checked here rather than left to the kernel because the KMD's `dxgkddi_render`
     /// gates its decode on the identical predicate: submitting an invalid record
@@ -683,7 +684,7 @@ struct L8Refusals {
     /// invariant, and this is the site that would observe it breaking.
     present_source_allocation_zero: RefusalCounter,
     /// The identity submission could not be built — no `pfnRenderCb`, no context, no
-    /// command window, or no allocation-list window. **The present PROCEEDS.**
+    /// command window. **The present PROCEEDS.**
     ///
     /// ⚠ **Expected 0, and it is deliberately NOT a device-removing error.** It is
     /// the same state `Umd12EclSubmit=0` produces on purpose on the ECL path, so it
