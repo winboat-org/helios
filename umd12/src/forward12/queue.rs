@@ -3211,6 +3211,12 @@ unsafe extern "C" fn execute_command_lists(
                 // ⭐ The fence A/B disable, and it is the K-F1 plumbing arm exactly:
                 // same packet, same magic, `gpu_wire_fence = 0`, drain still taken.
                 note_refusal(&L2_REFUSALS.ecl_fence_disabled);
+                // SAFETY: as the sibling arm above — `engine_queue` is the live
+                // `ID3D12CommandQueue` this state owns, created by this bridge's own
+                // vkd3d engine, and it is borrowed for the call only. ⚠ Restated
+                // rather than left to the shared comment 30 lines up: the rule is
+                // that every `unsafe` block carries its own `// SAFETY:`, and a
+                // grep-able check is what enforces it.
                 unsafe { crate::bridge12::drain_queue(queue.engine_queue.as_raw() as usize) }
             };
             if !drained {
