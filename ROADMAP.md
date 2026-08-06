@@ -3306,9 +3306,28 @@ charter first.
 
 ## Workstream 4 — D3D12  ← **PRIORITY 2 since 2026-08-05**
 
-**The charter is `DX12.md`; the implementation set is `docs/dx12/`, and
-`docs/dx12/DECISIONS.md` is authoritative over both.** State, so this file is not
-silent on it:
+**The charter is `DX12.md`; the implementation set is `docs/dx12/`.
+`docs/dx12/DECISIONS.md` is authoritative over both for ARCHITECTURE, and
+⭐ `docs/dx12/METHOD.md` is authoritative over both for SEQUENCING.**
+
+⛔⛔ **HOW THIS WORKSTREAM IS WORKED CHANGED ON 2026-08-06 (owner directive).** The
+probe-driven loop — implement a bit, run a probe, repeat until it passes, discover the
+contract violations only when a later probe trips over them — is **retired**. The loop
+is now: implement a whole subsystem to its contract (UMD + KMD + ICD + engine
+together) → adversarial review of the entire changeset, fanned out by lens with every
+finding refuted before it is routed → repair → **repeat until saturated** → then
+deploy. `METHOD.md` §3 states the saturation test; §2 Phase 4 records that a BSOD or a
+dead DWM is a diagnosis on a dev box and therefore that **fear of a crash may not shape
+the implementation**.
+⇒ Every `D12-G*` gate named below is now an **acceptance** step, not a driver of work,
+and `GATES.md` is demoted accordingly. ⛔ A gate passing is not evidence the code is
+right: with `Umd12EclDelayUs=50000`, `D12-G8` rung 0 **passed** with correct pixels
+while the fence wait stayed 0.6 µs and the dependency it existed to prove was absent.
+⇒ **The target is real D3D12 applications and benchmarks** (owner: *"Rendering triangle
+is useless … unless we can render REAL DX12 apps and benchmarks"*), so a rung that
+renders something is not a milestone unless a real workload follows it.
+
+State, so this file is not silent on it:
 
 - **The strategy is CLOSED (2026-08-05):** Helios ships a real D3D12 UMD,
   `helios_umd12.dll`, implementing `d3d12umddi` and forwarding into vkd3d-proton's
