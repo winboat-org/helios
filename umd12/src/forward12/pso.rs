@@ -339,6 +339,52 @@ pub(crate) unsafe fn set_error_if_possible(h_device: ddi12::D3D12DDI_HDEVICE, hr
 }
 
 // ---------------------------------------------------------------------------
+// ⬇ L3b's accessor into this file — ONE function (`PARALLEL.md` §4)
+// ---------------------------------------------------------------------------
+
+/// The engine `ID3D12RootSignature` behind a DDI root-signature handle,
+/// **borrowed**.
+///
+/// ⭐ `pub(crate)` because it is the seam L3b needs and the only legal route to
+/// it: `pfnSetComputeRootSignature` and `pfnSetGraphicsRootSignature` are handed
+/// a `D3D12DDI_HROOTSIGNATURE` and must give the engine the
+/// `ID3D12RootSignature` behind it. R803 / `ARCHITECTURE.md` §12 rule 7 is that
+/// a slot's payload is a property of the handle **type** and is decided once, in
+/// the file that owns the handle — this file's `com_handles!` invocation is that
+/// decision, so this is where the decode belongs. Same shape and same reason as
+/// `resource12::engine_resource` and `descriptors::engine_heap`.
+///
+/// ⚠ A `ManuallyDrop`, i.e. **borrowed**: [`create_root_signature`] moved the
+/// one owning reference into the slot and [`destroy_root_signature`] is what
+/// releases it. Dropping the returned value would release the slot's reference;
+/// `ManuallyDrop` makes that drop a no-op.
+///
+/// ⛔ A null `h_rs.pDrvPrivate` and an empty slot both fold to `None`. A caller
+/// that needs to tell "the runtime named no root signature" (a legal unbind at
+/// the API, `ID3D12GraphicsCommandList::SetGraphicsRootSignature(nullptr)`) from
+/// "this driver failed to resolve one the runtime named" must check
+/// `pDrvPrivate` itself **before** calling. `descriptors.rs`'s `view_resource`
+/// carries the scar that says why: meeting a legal call with `pfnSetErrorCb`
+/// answers it with *"Removing device due to bad UMD error"*.
+///
+/// # Safety
+/// Same precondition as `Slot::from_priv`: `h_rs.pDrvPrivate`, when non-null,
+/// must address the private block
+/// `pfnCalcPrivateRootSignatureSize` sized for this handle. The returned value
+/// must not outlive the DDI call that obtained it.
+pub(crate) unsafe fn root_signature(
+    h_rs: ddi12::D3D12DDI_HROOTSIGNATURE,
+) -> Option<core::mem::ManuallyDrop<ID3D12RootSignature>> {
+    // SAFETY: forwarded; the caller carries `com_slot`'s precondition, and
+    // `load` borrows the slot's reference without taking it.
+    unsafe { com_slot::<_, ID3D12RootSignature>(h_rs)?.load() }
+}
+
+// ---------------------------------------------------------------------------
+// ⬆ end of L3b's accessor
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
 // ⭐ The enum identity proofs
 // ---------------------------------------------------------------------------
 //

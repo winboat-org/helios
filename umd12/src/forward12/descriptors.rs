@@ -145,6 +145,9 @@ use windows::Win32::Graphics::Direct3D12::{
     D3D12_DSV_DIMENSION_TEXTURE2DARRAY, D3D12_DSV_DIMENSION_TEXTURE2DMS,
     D3D12_DSV_DIMENSION_TEXTURE2DMSARRAY, D3D12_DSV_FLAGS, D3D12_DSV_FLAG_NONE,
     D3D12_DSV_FLAG_READ_ONLY_DEPTH, D3D12_DSV_FLAG_READ_ONLY_STENCIL, D3D12_FILTER,
+    // ⬇ L3b: the GPU sibling of `D3D12_CPU_DESCRIPTOR_HANDLE`, for
+    // [`api_gpu_handle`]. Type-only, like every other name in this list.
+    D3D12_GPU_DESCRIPTOR_HANDLE,
     D3D12_RAYTRACING_ACCELERATION_STRUCTURE_SRV, D3D12_RENDER_TARGET_VIEW_DESC,
     D3D12_RENDER_TARGET_VIEW_DESC_0, D3D12_RESOURCE_DESC, D3D12_RTV_DIMENSION,
     D3D12_RTV_DIMENSION_BUFFER,
@@ -226,6 +229,55 @@ unsafe fn heap_slot(
     // verbatim; the null case is folded into `None` by `from_priv` itself.
     unsafe { Slot::from_priv(h_heap.drv_private()) }
 }
+
+// ---------------------------------------------------------------------------
+// ⬇ L3b's accessor into this file — ONE function (`PARALLEL.md` §4)
+// ---------------------------------------------------------------------------
+
+/// The engine `ID3D12DescriptorHeap` behind a DDI descriptor-heap handle,
+/// **borrowed**.
+///
+/// ⭐ `pub(crate)` because it is the seam L3b needs and the only legal route to
+/// it: `pfnSetDescriptorHeaps` is handed an array of `D3D12DDI_HDESCRIPTORHEAP`
+/// and must give the engine the `ID3D12DescriptorHeap`s behind them. R803's scar
+/// is that a slot's payload must be derived from the handle **type**, in one
+/// place, never chosen at the call site — this file owns descriptor-heap
+/// handles, so this is that one place. Same shape and same reason as
+/// `resource12::engine_resource`.
+///
+/// ⚠ A `ManuallyDrop`, i.e. **borrowed**: [`create_descriptor_heap`] moved the
+/// one owning reference into the slot and [`destroy_descriptor_heap`] is what
+/// releases it. Dropping the returned value would release the slot's reference;
+/// `ManuallyDrop` makes that drop a no-op.
+///
+/// ⚠ It is not a `&ID3D12DescriptorHeap` the way `resource12::engine_resource`
+/// is, and that is a property of the payload rather than a weaker choice: L4's
+/// slot holds a `Box<ResourceState>` that *contains* an `ID3D12Resource` value
+/// to borrow from, while this slot holds the bare COM pointer itself (see the
+/// `com_handles!` comment above) — there is no owned interface value in this
+/// driver's memory here.
+///
+/// ⛔ A null `h_heap.pDrvPrivate` and an empty slot both fold to `None`, so a
+/// caller that needs to tell "the runtime named no heap" from "this driver
+/// failed to resolve a heap the runtime named" must check `pDrvPrivate` itself
+/// **before** calling — exactly as [`view_resource`] does for resources, and for
+/// the same reason.
+///
+/// # Safety
+/// As [`heap_slot`]: `h_heap.pDrvPrivate`, when non-null, must address the
+/// private block the runtime allocated for a heap of this kind. The returned
+/// value must not outlive the DDI call that obtained it.
+pub(crate) unsafe fn engine_heap(
+    h_heap: ddi12::D3D12DDI_HDESCRIPTORHEAP,
+) -> Option<core::mem::ManuallyDrop<ID3D12DescriptorHeap>> {
+    // SAFETY: forwarded; the caller carries `heap_slot`'s precondition, and
+    // `load` borrows the slot's reference without taking it.
+    unsafe { heap_slot(h_heap)?.load() }
+}
+
+// ---------------------------------------------------------------------------
+// ⬆ end of L3b's accessor
+// ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 // Log budgets
@@ -2207,10 +2259,56 @@ const _: () = assert!(core::mem::size_of::<usize>() == core::mem::size_of::<ddi1
 ///
 /// Used wherever a handle crosses **by value**; the array form is the pointer
 /// cast above, guarded by the same assertions.
-fn api_cpu_handle(h: ddi12::D3D12DDI_CPU_DESCRIPTOR_HANDLE) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+///
+/// ⚠ `pub(crate)` for L3b: the five clear/discard slots and
+/// `pfnClearRenderTargetView`/`pfnClearDepthStencilView` all take a
+/// `D3D12DDI_CPU_DESCRIPTOR_HANDLE` by value and must hand the engine the API
+/// form. Re-deriving the conversion there would put a second copy of the
+/// assertions above in a second file, which is exactly how two claims about one
+/// ABI drift apart.
+pub(crate) fn api_cpu_handle(
+    h: ddi12::D3D12DDI_CPU_DESCRIPTOR_HANDLE,
+) -> D3D12_CPU_DESCRIPTOR_HANDLE {
     D3D12_CPU_DESCRIPTOR_HANDLE {
         ptr: h.ptr as usize,
     }
+}
+
+// ⭐ AND THE GPU SIBLING, PINNED THE SAME WAY. `D3D12DDI_GPU_DESCRIPTOR_HANDLE`
+// (bindgen, `d3d12umddi.rs:50628`) and `D3D12_GPU_DESCRIPTOR_HANDLE`
+// (windows-rs, from the Win32 metadata) are both `#[repr(C)]` one-field structs
+// over a 64-bit scalar. `pfnSet{Compute,Graphics}RootDescriptorTable` and the
+// two `pfnClearUnorderedAccessView*` slots hand one across by value.
+//
+// ⚠ Unlike the CPU pair, the two generators DO agree on the Rust integer type
+// here (`UINT64` -> `u64` on one side, `u64` on the other), so no `as`
+// conversion is involved and the assertions are the whole proof. They are kept
+// anyway, and separate from the CPU pair's: the CPU pair's `usize`-vs-`u64`
+// assertion says nothing about this struct, and a header revision that widened
+// or padded one side would otherwise be caught by nothing.
+const _: () = assert!(
+    core::mem::size_of::<ddi12::D3D12DDI_GPU_DESCRIPTOR_HANDLE>()
+        == core::mem::size_of::<D3D12_GPU_DESCRIPTOR_HANDLE>()
+);
+const _: () = assert!(
+    core::mem::align_of::<ddi12::D3D12DDI_GPU_DESCRIPTOR_HANDLE>()
+        == core::mem::align_of::<D3D12_GPU_DESCRIPTOR_HANDLE>()
+);
+const _: () = assert!(core::mem::offset_of!(ddi12::D3D12DDI_GPU_DESCRIPTOR_HANDLE, ptr) == 0);
+const _: () = assert!(core::mem::offset_of!(D3D12_GPU_DESCRIPTOR_HANDLE, ptr) == 0);
+
+/// One DDI GPU descriptor handle as the API's, by field.
+///
+/// ⭐ The value crossing here is **vkd3d's own `gpu_va`**, handed back
+/// unchanged by [`get_gpu_descriptor_handle_for_heap_start`] and then advanced
+/// by the runtime with this driver's own increment — see this module's doc. So
+/// this conversion is a type change and nothing else, and it must stay one:
+/// arithmetic on a GPU handle anywhere in this driver would be a second
+/// descriptor model beside the engine's.
+pub(crate) fn api_gpu_handle(
+    h: ddi12::D3D12DDI_GPU_DESCRIPTOR_HANDLE,
+) -> D3D12_GPU_DESCRIPTOR_HANDLE {
+    D3D12_GPU_DESCRIPTOR_HANDLE { ptr: h.ptr }
 }
 
 /// `pfnCopyDescriptors`.
