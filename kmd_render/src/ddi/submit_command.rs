@@ -192,6 +192,15 @@ pub(crate) fn record_present_handoff_telemetry() {
         b"PwExact",
         crate::virtio::gpu::PRESENT_EXACT_WATERMARK_USED.load(Ordering::Relaxed),
     );
+    // A4: D3D12 ECL packets gated on the EXACT wire fence their batch ends at,
+    // instead of on the whole prefix below it (the invariant CLAUDE.md's table
+    // states verbatim). Expected to equal the number of D3D12 records that named a
+    // usable boundary — `D12Rec - D12Zero - D12MrgF - GpuFncClamp - GpuFncGen`. A
+    // shortfall means a D3D12 packet took a prefix arm after all.
+    crate::diag::record_named_bytes(
+        b"D12Exact",
+        crate::virtio::gpu::D3D12_EXACT_WATERMARK_USED.load(Ordering::Relaxed),
+    );
     // K-F2 (2026-08-06): how far ahead of its own producer a present marker
     // names. Mirrored HERE, beside the lever it protects, because the counting
     // site runs at DISPATCH under `virtio_lock` and a registry write above

@@ -1386,6 +1386,21 @@ static NEXT_WIRE_FENCE_BASE: AtomicU64 = AtomicU64::new(1);
 /// boundary instead of the whole `next_wire_fence` backlog (`PresentWmk=1`).
 /// Mirrored as `PwExact`; zero while the knob is off is the correct reading.
 pub(crate) static PRESENT_EXACT_WATERMARK_USED: AtomicU32 = AtomicU32::new(0);
+/// D3D12 ECL submissions gated on the EXACT wire fence their batch ends at rather
+/// than on the prefix below it (A4, `docs/dx12/PENDING.md` §1). Mirrored as
+/// `D12Exact`.
+///
+/// ⚠ NOT KNOB-GATED, and that is deliberate: the prefix was an invariant
+/// violation, not a tuning choice, so there is no "restore the superset" arm to
+/// keep reachable. The A/B that matters is `D12Zero` — a UMD naming no boundary at
+/// all — which is already the documented order-against-nothing lever.
+///
+/// GRADING: expected to EQUAL the number of D3D12 records that named a usable
+/// boundary, i.e. `D12Rec - D12Zero - D12MrgF - GpuFncClamp - GpuFncGen`. Any
+/// shortfall means a D3D12 packet took a prefix arm, which is the defect A4 names
+/// coming back; `D12Exact > 0` with `EscSubRing == 0` means the ICD is handing the
+/// UMD ring-0 fence ids, so the exactness is exact about the wrong domain.
+pub(crate) static D3D12_EXACT_WATERMARK_USED: AtomicU32 = AtomicU32::new(0);
 /// Gap between one instance's first id and the next instance's.
 ///
 /// Far more than any instance can consume: at the ~10^5 fences a heavy session
@@ -1544,6 +1559,30 @@ enum RetireDomain {
     IncludingGpu,
 }
 
+/// How a [`WddmPending::watermark`] is compared against the in-flight wire fences.
+///
+/// ⛔ THE DISTINCTION IS A CLAUDE.md INVARIANT, not a tuning choice: *"a WDDM fence
+/// may wait on the frame's OWN boundary, never on the whole `next_wire_fence`
+/// backlog."* A prefix wait is satisfied only when EVERY async fence below the
+/// watermark has retired — every ring, every process, DWM's ring-1 scanout copies
+/// included — so it delays the fence by the whole pipeline depth and is the
+/// over-wait `PRESENT_EXACT_WATERMARK_USED` had to relax away on the present path
+/// (measured: dxgkrnl blocks the presenting thread at its 3-deep present queue,
+/// 21 % of presents, 2.45 ms each).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WireBoundary {
+    /// `watermark` is EXCLUSIVE and a PREFIX: every async fence strictly below it
+    /// must have retired. Conservative, always eventually satisfied, never a lie,
+    /// and the fallback whenever a boundary cannot be trusted.
+    Prefix,
+    /// `watermark` names ONE wire fence and ONLY that fence must have retired.
+    ///
+    /// The frame's own boundary. See the D3D12 arm in
+    /// [`VirtioGpu::note_wddm_submission`] for why exactness is sound there and
+    /// why it is not applied to the legacy Present arm.
+    Exact,
+}
+
 /// A WDDM submission whose `DXGK_INTERRUPT_DMA_COMPLETED` is gated on venus
 /// completion: it may signal once every async wire fence `< watermark` has
 /// retired (and strictly in FIFO order — SubmissionFenceIds are watermarks to
@@ -1565,6 +1604,9 @@ struct WddmPending {
     /// ring-1 fence).  This namespace is intentionally separate from
     /// `stream_boundary` below.
     watermark: u64,
+    /// Whether `watermark` is a prefix bound or the one fence this packet's own
+    /// work ends at. See [`WireBoundary`].
+    wire_boundary: WireBoundary,
     domain: RetireDomain,
     /// Optional generation-qualified registered-stream marker carried by the
     /// KMD private DMA record.  A WDDM completion requires BOTH boundaries.
@@ -5101,6 +5143,49 @@ impl VirtioGpu {
             })
     }
 
+    /// Whether the ONE async wire fence `fence_id` has retired.
+    ///
+    /// ⛔ THE FRAME'S OWN BOUNDARY, and the point of A4. Where
+    /// [`Self::async_retired_up_to`] asks *"has everything below this retired"* —
+    /// a prefix over every ring and every process — this asks only about the fence
+    /// the submitting UMD actually named. Every id below `next_wire_fence` was
+    /// genuinely assigned AND enqueued (the counter is bumped only after
+    /// `control.add` succeeds, in the same spinlock section as the `inflight`
+    /// push), so an id that is not in flight has necessarily retired: absence is a
+    /// completion proof here, not an unknown.
+    ///
+    /// ⚠ NO `RetireDomain` FILTER, deliberately. A domain filter over a SINGLE
+    /// named fence could only ever fake readiness — "ring 1, so ignore it" — never
+    /// add safety, and the exact arm is constructed exclusively with
+    /// `IncludingGpu` anyway (`gpu_completion_fence.is_some()` forces that domain
+    /// one screen above the watermark selection). Taking the domain as a parameter
+    /// and ignoring it would have been the trap.
+    fn async_exact_retired(&self, fence_id: u64) -> bool {
+        fence_id == 0
+            || !self.inflight.iter().any(|e| match e.kind {
+                InFlightKind::AsyncVenus {
+                    fence_id: in_flight,
+                    ..
+                } => in_flight == fence_id,
+                _ => false,
+            })
+    }
+
+    /// Evaluate one WDDM entry's wire-fence dependency under its own
+    /// interpretation. The ONLY caller shape for a `WddmPending`; the bare
+    /// [`Self::async_retired_up_to`] keeps its three existing non-WDDM callers.
+    fn wire_boundary_ready(
+        &self,
+        watermark: u64,
+        domain: RetireDomain,
+        boundary: WireBoundary,
+    ) -> bool {
+        match boundary {
+            WireBoundary::Prefix => self.async_retired_up_to(watermark, domain),
+            WireBoundary::Exact => self.async_exact_retired(watermark),
+        }
+    }
+
     /// Readiness for the two intentionally incomparable boundary namespaces.
     /// A tagged stream boundary is never fed to the wire-fence `< watermark`
     /// scan: it is ready only when the same generation-qualified stream has
@@ -5732,72 +5817,113 @@ impl VirtioGpu {
         } else {
             RetireDomain::IncludingGpu
         };
-        let watermark = if paging {
-            0
+        let (watermark, wire_boundary) = if paging {
+            (0, WireBoundary::Prefix)
         } else if let Some(gpu_fence_id) = gpu_completion_fence {
-            // async_retired_up_to uses an exclusive watermark. A marker written
-            // by Present names the exact ring-1 fence that owns its copy.
+            // THE DECISION TABLE IS `helios_kmd_logic::wddm_boundary::select`, and
+            // it is there rather than here because A4 and A6 are both defects OF
+            // THIS TABLE and this crate cannot host a test (`panic = "abort"`
+            // cdylib). `wddm_boundary_tests` is the oracle; this frame only maps
+            // its verdict onto counters and onto the transport's own enum.
             //
-            // ⛔ THE BOUND IS TWO-SIDED SINCE 2026-08-06 (A6). `wire_fence_base`
-            // is this transport generation's FIRST id; ids stride up by 2^32 at
-            // every StartDevice, so an id sampled before a StopDevice/StartDevice
-            // cycle is billions BELOW the live range and passed the old one-sided
-            // `< next_wire_fence` test trivially — then matched nothing in flight
-            // and satisfied the dependency instantly. That is a DMA fence
-            // completing before its work exists, and `GpuFncClamp` never saw it.
-            if gpu_fence_id == 0 || gpu_fence_id >= self.next_wire_fence {
+            // `[wire_fence_base, next_wire_fence)` is exactly "issued by this
+            // transport generation": ids stride up by 2^32 at every StartDevice,
+            // and `next_wire_fence` is bumped only after `control.add` succeeds,
+            // in the same spinlock section as the `inflight` push.
+            use helios_kmd_logic::wddm_boundary as boundary;
+            let selection = boundary::select(
+                gpu_fence_id,
+                self.wire_fence_base,
+                self.next_wire_fence,
+                d3d12,
+            );
+            match selection.rejection {
                 // A malformed/stale private marker must not manufacture an
-                // impossible future dependency. Conservatively gate on all
-                // work actually enqueued before this WDDM submission.
+                // impossible future dependency. Conservatively gate on all work
+                // actually enqueued before this WDDM submission.
                 //
                 // COUNTED since the D3D12 arm exists (2026-08-06). This clamp was
                 // silent, and it is the one place a guest-supplied boundary is
                 // quietly replaced by a different one: the fence then reports a
-                // watermark nobody asked for. Both writers reach it — Present's
-                // BLT marker and `HeliosD3D12SubmitCmd` — so it is deliberately
-                // NOT named after either.
-                GPU_FENCE_CLAMPED.fetch_add(1, Ordering::Relaxed);
-                self.next_wire_fence
-            } else if gpu_fence_id < self.wire_fence_base {
-                // FOREIGN GENERATION. Same conservative fallback, its own counter:
-                // the two conditions are diagnosed differently (an id ahead of the
-                // range is a stale/forged sample within this generation; an id
-                // below it is a survivor of a device restart), and one counter for
-                // both would have hidden the whole A6 class inside a number that
-                // reads as the known-benign clamp.
-                GPU_FENCE_FOREIGN_GENERATION.fetch_add(1, Ordering::Relaxed);
-                self.next_wire_fence
-            } else {
-                // ⛔ NO OWNER CHECK, AND THAT IS A DECISION (A6's second half).
+                // watermark nobody asked for. Both writers reach it — Present's BLT
+                // marker and `HeliosD3D12SubmitCmd` — so it is deliberately NOT
+                // named after either.
+                boundary::Rejection::OutOfRange => {
+                    GPU_FENCE_CLAMPED.fetch_add(1, Ordering::Relaxed);
+                }
+                // FOREIGN GENERATION (A6). Same conservative fallback, its own
+                // counter: the two conditions are diagnosed differently — an id
+                // ahead of the range is a stale or forged sample inside this
+                // generation, an id below it is a survivor of a device restart —
+                // and one counter for both would have hidden the whole A6 class
+                // inside a number that reads as the known-benign clamp.
                 //
-                // The check would be "was this fence id issued to the process /
-                // context that submitted this DMA buffer", and it is NOT worth its
-                // cost here:
-                //
-                //  * It cannot be answered from existing state. `InFlightKind::
-                //    AsyncVenus` records `fence_id`/`ring_idx` and no owner, so an
-                //    owner check means a new field in the transport's hottest
-                //    DISPATCH-time table (or a side table indexed by fence id) that
-                //    every enqueue, drain and reap would have to maintain.
-                //  * The attack it would prevent is strictly weaker than one the
-                //    contract already grants. A fence id is only ever a WAIT
-                //    TARGET here — never something this arm signals — so naming
-                //    another process's id can make THIS packet wait longer (a
-                //    self-inflicted stall on the naming context) or, if that id has
-                //    already retired, complete without waiting for the namer's own
-                //    work. The second is a real harm and it lands entirely on the
-                //    naming process's own pixels. And a hostile guest already has a
-                //    cheaper way to get it: `gpu_wire_fence = 0` is the DOCUMENTED
-                //    "order it against nothing" arm (`D12Zero`).
-                //  * Nothing another process owns becomes reachable: the boundary
+                // ⛔ NO OWNER CHECK BESIDE IT, AND THAT IS A DECISION. The check
+                // would be "was this id issued to the process/context that
+                // submitted this DMA buffer", and it is not worth its cost:
+                //  * it cannot be answered from existing state —
+                //    `InFlightKind::AsyncVenus` records `fence_id`/`ring_idx` and
+                //    no owner, so it means a new field in the transport's hottest
+                //    DISPATCH-time table that every enqueue, drain and reap must
+                //    maintain;
+                //  * the harm it would prevent is strictly weaker than one the
+                //    contract already grants. A fence id here is only ever a WAIT
+                //    TARGET, never something this arm signals, so naming another
+                //    process's id can only stall the naming context or — if that id
+                //    already retired — complete without waiting for the namer's own
+                //    work, which lands on the namer's own pixels. A hostile guest
+                //    already has the cheaper form: `gpu_wire_fence = 0` is the
+                //    DOCUMENTED order-against-nothing arm (`D12Zero`);
+                //  * nothing another process owns becomes reachable — the boundary
                 //    selects a wait, and every other client's WDDM fence keeps its
                 //    own entry with its own watermark.
-                //
                 // ⇒ generation is checked because a cross-generation id breaks the
                 // predicate's soundness for the OS scheduler; ownership is not,
                 // because it only re-describes a self-harm the DDI already permits.
-                gpu_fence_id.saturating_add(1)
+                boundary::Rejection::ForeignGeneration => {
+                    GPU_FENCE_FOREIGN_GENERATION.fetch_add(1, Ordering::Relaxed);
+                }
+                boundary::Rejection::Accepted => {}
             }
+            let wire_boundary = match selection.kind {
+                boundary::Kind::Prefix => WireBoundary::Prefix,
+                // ⛔⛔ THE EXACT D3D12 BOUNDARY (A4). CLAUDE.md's invariant table:
+                // *"A WDDM fence may wait on the frame's OWN boundary, never on the
+                // whole `next_wire_fence` backlog."* Until 2026-08-06 this arm
+                // produced `gpu_fence_id + 1` as a PREFIX, so a D3D12 packet waited
+                // for every async wire fence below the named one to retire — every
+                // ring, every process, DWM's ring-1 scanout copies included. That is
+                // the exact superset the present path had to relax away
+                // (`PRESENT_EXACT_WATERMARK_USED`), reintroduced on the new arm.
+                //
+                // WHY EXACTNESS IS SOUND HERE. The WDDM DMA buffers on this driver
+                // carry no GPU commands at all — this one carries a
+                // `HeliosD3D12SubmitCmd` record and nothing else — so the only thing
+                // DMA_COMPLETED can truthfully report is that the work this
+                // submission named has finished. `pfnExecuteCommandLists` submits
+                // the batch's Vulkan work through the ICD and hands us the ring-1
+                // wire fence it ends at, and `mark_d3d12` takes the MAX over records
+                // batched into the same private-data buffer, so the named id
+                // subsumes every earlier submission of this packet. Waiting on
+                // anything else is waiting on another process's frames.
+                //
+                // ⚠ WHY THE LEGACY PRESENT ARM KEEPS THE PREFIX (the same
+                // `gpu_completion_fence` field, written by Present's BLT marker).
+                // Two reasons, and neither is "exactness would not work there":
+                // (1) that arm IS the shipping, measured desktop configuration —
+                // every accepted present-path measurement, `PresentWmk`'s
+                // +3.7…+4.3 % paired GT1 delta included, was taken with the prefix
+                // on the wire-fence boundary, and CLAUDE.md rule 8 forbids shipping
+                // a default nobody measured; (2) A4 is a defect report about THIS
+                // arm, and widening the repair to the desktop path would mean the
+                // first D3D12 deploy could not attribute a present regression.
+                // `D12Exact` against `PwExact` keeps the two answerable separately.
+                boundary::Kind::Exact => {
+                    D3D12_EXACT_WATERMARK_USED.fetch_add(1, Ordering::Relaxed);
+                    WireBoundary::Exact
+                }
+            };
+            (selection.watermark, wire_boundary)
         } else if stream_boundary.is_some() && self.present_exact_watermark {
             // EXACT PRESENT WATERMARK (2026-08-04). `next_wire_fence` is "every
             // transport entry enqueued before this WDDM buffer" — a superset
@@ -5820,9 +5946,9 @@ impl VirtioGpu {
             // filtered out as stale above: a dead generation is a cancellation,
             // not a satisfied producer, and keeps the ordinary wire watermark.
             PRESENT_EXACT_WATERMARK_USED.fetch_add(1, Ordering::Relaxed);
-            0
+            (0, WireBoundary::Prefix)
         } else {
-            self.next_wire_fence
+            (self.next_wire_fence, WireBoundary::Prefix)
         };
         // UV1's instrument (`WddmHoldMs`, KMD_IMPACT §14a.1). Scoped to D3D12 ECL
         // packets by the record's identity, never by timing or by which context
@@ -5840,7 +5966,7 @@ impl VirtioGpu {
             _ => false,
         };
         if self.wddm_pending.is_empty()
-            && self.async_retired_up_to(watermark, domain)
+            && self.wire_boundary_ready(watermark, domain, wire_boundary)
             && stream_ready
             && blt_ready
             // A held packet must not take the immediate-signal path: that is the
@@ -5880,6 +6006,7 @@ impl VirtioGpu {
         self.wddm_pending.push_back(WddmPending {
             fence,
             watermark,
+            wire_boundary,
             domain,
             stream_boundary,
             blt_token,
@@ -5936,12 +6063,21 @@ impl VirtioGpu {
     /// `SubmissionFenceId` as a watermark and requires monotonic completion, so
     /// skipping ahead is bugcheck 0x119/1.
     pub fn take_one_ready_wddm(&mut self, _order: &crate::adapter::NotifyOrdered<'_>) -> WddmTake {
-        let (watermark, domain, stream_boundary, blt_token, blt_stream_boundary, hold_until) = {
+        let (
+            watermark,
+            wire_boundary,
+            domain,
+            stream_boundary,
+            blt_token,
+            blt_stream_boundary,
+            hold_until,
+        ) = {
             let Some(head) = self.wddm_pending.front() else {
                 return WddmTake::Empty;
             };
             (
                 head.watermark,
+                head.wire_boundary,
                 head.domain,
                 head.stream_boundary,
                 head.blt_token,
@@ -5953,7 +6089,7 @@ impl VirtioGpu {
         // FIFO is strictly ordered, so whatever paces its head paces every
         // WDDM fence behind it, and "blocked" without saying ON WHAT is not an
         // instrument. Exactly one counter moves per blocked look.
-        if !self.async_retired_up_to(watermark, domain) {
+        if !self.wire_boundary_ready(watermark, domain, wire_boundary) {
             WDDM_HEAD_BLOCKED_WIRE.fetch_add(1, Ordering::Relaxed);
             return WddmTake::BlockedOnProducer;
         }

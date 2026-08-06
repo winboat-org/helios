@@ -4972,6 +4972,210 @@ mod snapshot_bind_tests {
 /// is a PANIC — a silent graphics deadlock — for exactly the input the
 /// instrument above it exists to observe. Saturating it makes that input
 /// unrepresentable, and puts a host-run test under the claim.
+/// How a WDDM DMA fence's wire-fence dependency is chosen from the boundary a
+/// guest submission named. Defects A4 and A6 of `docs/dx12/PENDING.md` §1 are both
+/// decisions in this one table, which is why the table is here and testable rather
+/// than an `if` chain inside the transport.
+pub mod wddm_boundary {
+    /// How the resulting watermark is compared against the in-flight wire fences.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub enum Kind {
+        /// EXCLUSIVE PREFIX: every async fence strictly below the watermark must
+        /// have retired — every ring, every process. Conservative, always
+        /// eventually satisfied, never a lie, and the fallback for any boundary
+        /// that cannot be trusted.
+        Prefix,
+        /// The watermark IS one wire fence, and only that fence must have retired.
+        /// The frame's own boundary.
+        Exact,
+    }
+
+    /// Why a named boundary was replaced, if it was.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub enum Rejection {
+        /// The named boundary was used.
+        Accepted,
+        /// Zero, or at/beyond the ids this transport generation has assigned — a
+        /// malformed or stale marker inside the live generation.
+        OutOfRange,
+        /// Below this transport generation's first id: a fence from a PREVIOUS
+        /// StartDevice, surviving in a client that outlived a device restart.
+        ///
+        /// ⛔ It is a separate variant because an upper bound cannot see it. Wire
+        /// fence ranges STRIDE UP at every StartDevice, so such an id is billions
+        /// below the live range, satisfies `< next_wire_fence` trivially, matches
+        /// nothing in flight, and would make the dependency complete instantly —
+        /// a DMA fence reporting completion before its work exists.
+        ForeignGeneration,
+    }
+
+    /// The chosen dependency.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub struct Selection {
+        pub watermark: u64,
+        pub kind: Kind,
+        pub rejection: Rejection,
+    }
+
+    /// Choose the wire-fence dependency for a submission that named
+    /// `gpu_fence_id`.
+    ///
+    /// `wire_fence_base` is the FIRST id this transport generation may hand out and
+    /// `next_wire_fence` the next it will; every id in `base..next` was genuinely
+    /// assigned and enqueued, so `[base, next)` is exactly "issued by this
+    /// generation".
+    ///
+    /// `d3d12` says the submission carried a `HeliosD3D12SubmitCmd` record — an
+    /// IDENTITY, never a boundary. It selects [`Kind::Exact`] because a D3D12 ECL
+    /// packet carries no GPU commands of its own: the only thing its DMA completion
+    /// can truthfully report is that the batch the UMD named has finished, so
+    /// waiting on the prefix below that fence is waiting on other processes'
+    /// frames. The legacy Present writer of the same field keeps [`Kind::Prefix`]
+    /// because that is the shipping, measured desktop configuration.
+    pub const fn select(
+        gpu_fence_id: u64,
+        wire_fence_base: u64,
+        next_wire_fence: u64,
+        d3d12: bool,
+    ) -> Selection {
+        if gpu_fence_id == 0 || gpu_fence_id >= next_wire_fence {
+            return Selection {
+                watermark: next_wire_fence,
+                kind: Kind::Prefix,
+                rejection: Rejection::OutOfRange,
+            };
+        }
+        if gpu_fence_id < wire_fence_base {
+            return Selection {
+                watermark: next_wire_fence,
+                kind: Kind::Prefix,
+                rejection: Rejection::ForeignGeneration,
+            };
+        }
+        if d3d12 {
+            return Selection {
+                watermark: gpu_fence_id,
+                kind: Kind::Exact,
+                rejection: Rejection::Accepted,
+            };
+        }
+        Selection {
+            // The prefix bound is EXCLUSIVE, so naming fence N means waiting for
+            // everything below N + 1. `saturating_add` because a u64 fence id at
+            // the representation's ceiling must not wrap to 0, which is the "no
+            // dependency" watermark.
+            watermark: gpu_fence_id.saturating_add(1),
+            kind: Kind::Prefix,
+            rejection: Rejection::Accepted,
+        }
+    }
+}
+
+#[cfg(test)]
+mod wddm_boundary_tests {
+    use super::wddm_boundary::{Kind, Rejection, select};
+
+    /// A representative live generation: base 1 + 3·2^32, 40 ids issued.
+    const BASE: u64 = 1 + (3u64 << 32);
+    const NEXT: u64 = BASE + 40;
+
+    #[test]
+    fn a_d3d12_boundary_is_exact_and_names_the_fence_itself() {
+        let s = select(BASE + 12, BASE, NEXT, true);
+        assert_eq!(s.kind, Kind::Exact);
+        assert_eq!(s.rejection, Rejection::Accepted);
+        // NOT `+ 1`: an exact test names the fence, and adding one would silently
+        // turn it back into the prefix that A4 is about.
+        assert_eq!(s.watermark, BASE + 12);
+    }
+
+    #[test]
+    fn the_legacy_present_writer_keeps_the_exclusive_prefix() {
+        let s = select(BASE + 12, BASE, NEXT, false);
+        assert_eq!(s.kind, Kind::Prefix);
+        assert_eq!(s.rejection, Rejection::Accepted);
+        assert_eq!(s.watermark, BASE + 13);
+    }
+
+    #[test]
+    fn a_foreign_generation_fence_is_rejected_however_plausible_it_looks() {
+        // A6. The previous generation's ids are a whole stride below, and every
+        // one of them satisfies `< next_wire_fence`.
+        for id in [1u64, 42, BASE - 1, 1 + (2u64 << 32) + 7] {
+            let s = select(id, BASE, NEXT, true);
+            assert_eq!(s.rejection, Rejection::ForeignGeneration, "id {id}");
+            // The fallback must be the conservative prefix, never the named id:
+            // an exact wait on a fence this generation never issued is satisfied
+            // immediately, which is the lie.
+            assert_eq!(s.kind, Kind::Prefix, "id {id}");
+            assert_eq!(s.watermark, NEXT, "id {id}");
+        }
+    }
+
+    #[test]
+    fn zero_and_beyond_the_range_stay_on_the_old_clamp_and_its_own_counter() {
+        for id in [0u64, NEXT, NEXT + 1, u64::MAX] {
+            let s = select(id, BASE, NEXT, true);
+            assert_eq!(s.rejection, Rejection::OutOfRange, "id {id}");
+            assert_eq!(s.kind, Kind::Prefix, "id {id}");
+            assert_eq!(s.watermark, NEXT, "id {id}");
+        }
+    }
+
+    #[test]
+    fn exactly_one_rejection_can_apply_to_any_input() {
+        // The two rejections must partition, or a counter pair reads as double
+        // the truth. Sweep the boundaries of both conditions.
+        for id in [0, 1, BASE - 1, BASE, BASE + 1, NEXT - 1, NEXT, NEXT + 1] {
+            let s = select(id, BASE, NEXT, true);
+            let out_of_range = id == 0 || id >= NEXT;
+            let foreign = !out_of_range && id < BASE;
+            assert_eq!(s.rejection == Rejection::OutOfRange, out_of_range, "id {id}");
+            assert_eq!(
+                s.rejection == Rejection::ForeignGeneration,
+                foreign,
+                "id {id}"
+            );
+            assert_eq!(
+                s.rejection == Rejection::Accepted,
+                !out_of_range && !foreign,
+                "id {id}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_first_generation_starts_at_one_and_accepts_its_own_low_ids() {
+        // `NEXT_WIRE_FENCE_BASE` starts at 1, so instance 0's ids ARE small. The
+        // foreign-generation test must not reject them.
+        let s = select(1, 1, 5, true);
+        assert_eq!(s.rejection, Rejection::Accepted);
+        assert_eq!(s.watermark, 1);
+        assert_eq!(select(0, 1, 5, true).rejection, Rejection::OutOfRange);
+    }
+
+    #[test]
+    fn an_empty_generation_accepts_nothing() {
+        // Nothing assigned yet: base == next, so every id is out of range and no
+        // boundary can be honoured. Notably NOT reported as foreign — the
+        // out-of-range test runs first, and it is the honest description.
+        let s = select(BASE, BASE, BASE, true);
+        assert_eq!(s.rejection, Rejection::OutOfRange);
+        assert_eq!(s.watermark, BASE);
+        assert_eq!(s.kind, Kind::Prefix);
+    }
+
+    #[test]
+    fn a_prefix_watermark_never_wraps_to_the_no_dependency_sentinel() {
+        // 0 is "no dependency". A `+ 1` that wrapped would turn the strongest
+        // possible wait into none at all.
+        let s = select(u64::MAX - 1, 0, u64::MAX, false);
+        assert_eq!(s.rejection, Rejection::Accepted);
+        assert_eq!(s.watermark, u64::MAX);
+        assert_ne!(s.watermark, 0);
+    }
+}
+
 pub mod present_stream {
     /// Capacity of the KMD's fixed, allocation-free registered-stream table.
     ///
