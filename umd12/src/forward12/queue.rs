@@ -159,14 +159,35 @@
 //! `QueueContextFailed` risk at the very gate this lane is written for. The
 //! evidence that would flip it is U12's, not an argument.
 //!
-//! ⛔ **What is NOT stored, deliberately.** `D3DDDICB_CREATECONTEXT` returns the
-//! command-buffer / allocation-list / patch-location windows alongside
-//! `hContext`, and the D3D11 driver keeps all three because its present writes
-//! into them. Nothing in *this* round reads them — L8 is not in it — so they are
-//! **logged and dropped**. `PARALLEL.md` §10 forbids `#[allow(dead_code)]` on a
-//! hand-written line, and a stored window nothing loads is the T5 anti-pattern
-//! (*an instrument nothing can read is not an instrument*). L8 adds them, with
-//! its reader, in the same commit.
+//! ⛔ **The three context windows ARE stored — this reverses the earlier round's
+//! decision, and the reversal is FB-1** (`KMD_IMPACT.md` §14a.2).
+//! `D3DDDICB_CREATECONTEXT` returns the command-buffer / allocation-list /
+//! patch-location windows alongside `hContext`, and the D3D11 driver keeps all
+//! three because its present writes into them (`umd/src/device_funcs.rs:144-151`,
+//! `:1036-1046`). This file used to log and drop them, correctly, on the argument
+//! that a stored window nothing loads is the T5 anti-pattern (*an instrument
+//! nothing can read is not an instrument*) and that `PARALLEL.md` §10 forbids
+//! `#[allow(dead_code)]` on a hand-written line. What changed is not the argument
+//! but the premise: there are now **two** readers, and the first of them is on
+//! this file's critical path rather than L8's.
+//!
+//! [`ContextWindows`] holds them, behind a `Mutex`. Every `pfnRenderCb` on this
+//! context must then re-latch them from that callback's own out-fields, through
+//! **one** shared method — which lands with its first caller rather than ahead of
+//! it, because §10 forbids the `#[allow(dead_code)]` the alternative needs and
+//! the compiler settled it in one line (`method re_latch is never used`). The two
+//! readers, in landing order:
+//!
+//! 1. the **fence carrier** — `pfnExecuteCommandLists`' WDDM submission
+//!    (`KMD_IMPACT.md` §14a.2 K-F1), which is what makes the application's
+//!    `ID3D12Fence` order behind the frame's own work at all;
+//! 2. the **present identity** — `DECISIONS.md` P-C's `HeliosPresentRenderCmd`
+//!    around `pfnPresent` (§14a.3 UP-9), which writes a 72-byte record into the
+//!    same command window through the same helper.
+//!
+//! ⚠ Which is why the latch is general rather than shaped to the first caller:
+//! §14a.4 point 2 says in as many words that FB-1 is *"shared by both
+//! `pfnRenderCb` users. Land it once, in the fence work."*
 //!
 //! # ⚠ What `pfnExecuteCommandLists` does NOT do yet
 //!
@@ -195,6 +216,11 @@ use helios_umd_common::hr::{Hresult, E_FAIL, E_INVALIDARG, E_NOTIMPL, S_OK};
 use helios_umd_common::refusals::RefusalCounter;
 use helios_umd_common::slot::{Boxed, Com, DdiHandle, Slot};
 use helios_umd_common::throttle::LogThrottle;
+// FB-1. ⚠ The shared type, not a second copy: `umd_common/src/window.rs:6-9`
+// records the D3D12 case as the reason it is in the shared crate at all — *"a
+// D3D12 forwarder that calls `pfnRenderCb` handles the same pointer/size
+// pairs"*. D3b forbids copying from `umd/`, and this is what that leaves.
+use helios_umd_common::window::Window;
 // ⚠ Imported for `Interface::cast` (the `QueryInterface` that reaches
 // `ID3D12Device4`), which is a trait method and therefore invisible to method
 // resolution unless the trait is in scope.
@@ -312,6 +338,65 @@ fn budget(t: &LogThrottle) -> Option<usize> {
 /// would demand, and its counter says if a real workload ever approached it.
 const MAX_EXECUTE_COMMAND_LISTS: usize = 65_536;
 
+/// The three runtime-owned buffer windows a **legacy** WDDM context carries.
+///
+/// ⭐ **FB-1** (`KMD_IMPACT.md` §14a.2). `D3DDDICB_CREATECONTEXT` hands them out
+/// with `hContext`, and every `pfnRenderCb` on that context hands back
+/// replacements in its own out-fields — so they are not constants, they are a
+/// rotating resource dxgkrnl owns and lends. `D3DDDICB_CREATECONTEXTVIRTUAL` has
+/// none of them (`KMD_IMPACT.md:314-322`), which is the mechanical reason this
+/// lane mints a legacy context; see the module doc.
+///
+/// ⛔ **Each window is one value, never a pointer beside a size.**
+/// `helios_umd_common::window::Window` exists for exactly this and its own doc
+/// says so: pre-R808 the D3D11 driver held six independent `Cell`s and *"a
+/// pointer could be updated without its size"*
+/// (`umd_common/src/window.rs:11-21`). `Option<Window<T>>` makes both halves of
+/// that unrepresentable — absent, or a non-null pointer with the capacity that
+/// describes it.
+struct ContextWindows {
+    /// The legacy command buffer `pfnRenderCb` records from and recycles.
+    command: Option<Window<c_void>>,
+    /// The allocation list. ⚠ Empty for the fence carrier (K-F1 submits
+    /// `NumAllocations = 0`) and **mandatory** for a DXGI present, which is where
+    /// VidMm gets the residency it keeps live across the pending operation —
+    /// `umd/src/forward/present.rs:772-777` has that argument.
+    allocations: Option<Window<ddi12::D3DDDI_ALLOCATIONLIST>>,
+    /// The patch-location list. Helios' GpuMmu is decorative — the host owns the
+    /// real MMU and there are no guest GPU-VAs to patch, which is why
+    /// `dxgkddi_render` passes the list straight through and `DxgkDdiPatch` is a
+    /// no-op (`kmd_render/src/ddi/submit_command.rs:981-987`).
+    patches: Option<Window<ddi12::D3DDDI_PATCHLOCATIONLIST>>,
+}
+
+impl ContextWindows {
+    /// Latch the windows `pfnCreateContextCb` just returned.
+    ///
+    /// ⚠ Unconditional, unlike the re-latch that follows a `pfnRenderCb`: at
+    /// create there is nothing to keep, so a null pointer here means "this context
+    /// has no such window" rather than "keep what you have".
+    fn from_create_context(arg: &ddi12::D3DDDICB_CREATECONTEXT) -> Self {
+        Self {
+            command: Window::new(arg.pCommandBuffer, arg.CommandBufferSize),
+            allocations: Window::new(arg.pAllocationList, arg.AllocationListSize),
+            patches: Window::new(arg.pPatchLocationList, arg.PatchLocationListSize),
+        }
+    }
+}
+
+/// `(pointer, capacity)` for a window that may be absent.
+///
+/// A null pointer with a zero capacity is how the runtime itself spells "no
+/// window" (`umd_common/src/window.rs:34-37`), so flattening `None` to that pair
+/// loses nothing and keeps every caller — the bounds check and the trace line —
+/// off `Option` gymnastics.
+fn window_parts<T>(w: &Option<Window<T>>) -> (*mut T, u32) {
+    match w {
+        Some(w) => (w.ptr.as_ptr(), w.capacity),
+        None => (core::ptr::null_mut(), 0),
+    }
+}
+
 /// Per-`ID3D12CommandQueue` shadow state (`DDI_REFERENCE.md` §9.1 row 1).
 ///
 /// ⚠ **`pub`, not `pub(crate)`, and that is forced rather than chosen.**
@@ -345,6 +430,45 @@ pub struct QueueState {
     /// module doc has the doc-set contradiction this resolves and the U12
     /// evidence that would flip it.
     h_context: *mut c_void,
+    /// The three runtime-owned buffer windows [`h_context`](Self::h_context)
+    /// arrived with, re-latched after every `pfnRenderCb` on it (**FB-1**).
+    ///
+    /// # ⛔ What serializes this, and why a `Mutex` is the DDI's requirement
+    /// rather than this driver's taste
+    ///
+    /// A D3D12 DDI is free-threaded and `pfnExecuteCommandLists` may be entered
+    /// from any thread the application likes. The window behind it is **not**
+    /// free-threaded: it is one runtime-owned region that a submission writes
+    /// into and that `pfnRenderCb` then *replaces*, so two concurrent submissions
+    /// on one queue would write the same bytes and race to install two different
+    /// successors. The D3D11.3 functional spec states the underlying rule —
+    /// *"only a single thread can be working against a HCONTEXT at a time"* —
+    /// quoted at `DDI_REFERENCE.md` §8.2 as the first of the three obligations
+    /// `ResourceHeaps.md:1678` adds. ⇒ the lock is how this driver honours a
+    /// contract, not how it tidies a field.
+    ///
+    /// ⛔ **The guard therefore spans write → `pfnRenderCb` → re-latch**, and
+    /// that is the one place in this file where a lock is deliberately held
+    /// across a call back into the runtime. The accessor block below states the
+    /// opposite rule for [`RecorderState::target`] — *"no lock is ever held
+    /// across a call back into the runtime or into the engine"* — and that rule
+    /// is right for that lock and wrong for this one: releasing between the write
+    /// and the re-latch is exactly the window in which a second thread writes a
+    /// buffer dxgkrnl has already rotated away, which is the corruption the
+    /// "replace as a unit" rule exists to make unrepresentable.
+    ///
+    /// ⚠ **Deadlock argument, stated because holding a lock across a callback
+    /// demands one.** `pfnRenderCb` is a dxgkrnl thunk; it does not call back
+    /// into this driver's DDI table, so it cannot re-enter
+    /// `pfnExecuteCommandLists` or any other holder of this lock, and no holder
+    /// of this lock takes a second lock. The lock order is therefore a single
+    /// element and no cycle is expressible.
+    ///
+    /// ⚠ Poisoning is treated as liveness ([`lock_windows`]), for the reason
+    /// [`RecorderState::target`] gives: this crate is `panic = "abort"`
+    /// (`umd12/Cargo.toml:146`, `:150`), so no lock in it can be poisoned, and
+    /// `PARALLEL.md` §9.3 forbids `.unwrap()` on runtime data regardless.
+    windows: Mutex<ContextWindows>,
 }
 
 /// The allocator a pool ends up backed by, and the class it was created for.
@@ -587,6 +711,23 @@ unsafe fn queue_state<'a>(h: ddi12::D3D12DDI_HCOMMANDQUEUE) -> Option<&'a QueueS
     // `create_command_queue` and is dropped only by `destroy_command_queue`. See
     // the re-derived argument above for why no borrow can overlap that drop.
     Some(unsafe { &*p })
+}
+
+/// Take a queue's context-window lock, treating a poisoned lock as a live one.
+///
+/// ⛔ `unwrap_or_else(|e| e.into_inner())`, never `.unwrap()` — the same shape and
+/// the same argument as [`lock_target`]: this crate is `panic = "abort"`, so the
+/// poisoned arm cannot fire, and `PARALLEL.md` §9.3 forbids `.unwrap()` on runtime
+/// data regardless.
+///
+/// ⚠ **The caller holds this guard across the whole submission**, not just across
+/// the field write. [`QueueState::windows`] carries the contract argument and the
+/// deadlock argument for that; read it before shortening the critical section.
+fn lock_windows(queue: &QueueState) -> MutexGuard<'_, ContextWindows> {
+    queue
+        .windows
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// The pool state behind a DDI pool handle. Same argument as [`queue_state`].
@@ -833,8 +974,8 @@ unsafe extern "C" fn create_command_queue(
     // literally inside `pfnCreateCommandQueue` — which is
     // `create_wddm_context`'s whole precondition, and the one the runtime
     // enforces from its side.
-    let h_context = match unsafe { create_wddm_context(dev, h_rt_queue) } {
-        Ok(h) => h,
+    let (h_context, windows) = match unsafe { create_wddm_context(dev, h_rt_queue) } {
+        Ok(pair) => pair,
         Err(hr) => {
             // ⚠ The engine queue is dropped here, releasing it: a queue that can
             // never present or submit is not a queue, and CLAUDE.md rule 2 is
@@ -854,6 +995,11 @@ unsafe extern "C" fn create_command_queue(
             h_rt_queue,
             engine_queue,
             h_context,
+            // FB-1. ⚠ The handle and its windows are latched from the SAME
+            // `D3DDDICB_CREATECONTEXT` and travel together from here on: a
+            // window paired with another context's handle would have
+            // `pfnRenderCb` record into memory dxgkrnl never lent this context.
+            windows: Mutex::new(windows),
         });
     }
     S_OK
@@ -877,6 +1023,12 @@ unsafe extern "C" fn create_command_queue(
 /// open), and it carries a consequence for every later lane: a legacy context
 /// submits with `pfnRenderCb`, **never** with `pfnSubmitCommandCb`.
 ///
+/// ⭐ **Returns the handle AND its three windows** (FB-1). They are one value
+/// because they are meaningful only together — `umd/src/device_funcs.rs:132-151`
+/// (R808) made the same group one value for the same reason, after seven fields
+/// *"used to become meaningful together or not at all, depending on one `hr` the
+/// caller never saw"*.
+///
 /// # Safety
 /// `dev` must be a live device and `h_rt_queue` the runtime's handle for the
 /// queue currently being created — the callback is only legal inside
@@ -884,7 +1036,7 @@ unsafe extern "C" fn create_command_queue(
 unsafe fn create_wddm_context(
     dev: &device12::HeliosD3D12Device,
     h_rt_queue: ddi12::D3D12DDI_HRTCOMMANDQUEUE,
-) -> Result<*mut c_void, ddi12::HRESULT> {
+) -> Result<(*mut c_void, ContextWindows), ddi12::HRESULT> {
     if dev.um_callbacks.is_null() {
         note_refusal(&L2_REFUSALS.queue_context_failed);
         if budget(&QUEUE_LOG).is_some() {
@@ -918,12 +1070,15 @@ unsafe fn create_wddm_context(
     // runtime writes `hContext` and the three windows into it.
     let hr = unsafe { create_context_cb(h_rt_queue, &mut arg) };
 
-    // ⚠ The windows are LOGGED, not stored — see the module doc. This line is
-    // also the only capture of what dxgkrnl hands a D3D12 queue on this adapter,
-    // which is contract data no document in `docs/dx12/` holds. ⚠ It is on the
-    // SUCCESS path too, so it carries the budget even though queue creates are
-    // rare: "rare" is a property of the applications measured so far, not of the
-    // DDI.
+    // ⚠ KEPT VERBATIM, and it still reads `arg` rather than the latched
+    // [`ContextWindows`] even though FB-1 now stores them. Two reasons, both
+    // load-bearing: this is *the only capture of what dxgkrnl hands a D3D12 queue
+    // on this adapter*, which is contract data no document in `docs/dx12/` holds;
+    // and it fires on the FAILURE path too, where there is nothing to latch. A
+    // version that read the stored windows could only run after the refusals
+    // below and would lose exactly the case worth having. ⚠ It carries the budget
+    // even though queue creates are rare: "rare" is a property of the
+    // applications measured so far, not of the DDI.
     if let Some(n) = budget(&QUEUE_LOG) {
         log_error!(
             "CreateCommandQueue: CreateContext hr={:#010x} hContext={:p} cmd={:p}/{} \
@@ -972,7 +1127,10 @@ unsafe fn create_wddm_context(
         }
         return Err(E_FAIL);
     }
-    Ok(arg.hContext)
+    // FB-1. ⚠ Latched here and not at the call site: `arg` is this function's
+    // local and dies with it, so the only place the group can be captured is the
+    // one place that owns the out-struct.
+    Ok((arg.hContext, ContextWindows::from_create_context(&arg)))
 }
 
 /// `pfnDestroyCommandQueue`.
@@ -2012,10 +2170,29 @@ unsafe extern "C" fn execute_command_lists(
     // ⚠ Emitted BEFORE the forward, deliberately: if the engine call ever wedges
     // (it did, in teardown, in the `G8-r0-settle` round), this line is the last
     // thing that says what was being submitted when it did.
-    trace_line!(
-        "ExecuteCommandLists: Count={count} queue={:p}{traced_lists}",
-        queue.engine_queue.as_raw(),
-    );
+    //
+    // ⭐ FB-1's reading, on the same line rather than a second one: the three
+    // latched context windows AS THEY STAND ON ENTRY to this submit. That is the
+    // WDDM submission's whole precondition — a command window and its capacity —
+    // and printing it here makes "the window rotated" visible as a changing
+    // pointer across submits, which is the only direct evidence that
+    // `pfnRenderCb`'s re-latch is doing anything. ⚠ Formatted only when the trace
+    // gate is already open, like `traced_lists` above; the lock is taken and
+    // released inside the guard scope, so the tracing arm cannot hold it into the
+    // engine forward.
+    if tracing {
+        let windows = lock_windows(queue);
+        let (cmd, cmd_cap) = window_parts(&windows.command);
+        let (alloc, alloc_cap) = window_parts(&windows.allocations);
+        let (patch, patch_cap) = window_parts(&windows.patches);
+        drop(windows);
+        trace_line!(
+            "ExecuteCommandLists: Count={count} queue={:p} ctx={:p} cmd={cmd:p}/{cmd_cap} \
+             allocList={alloc:p}/{alloc_cap} patchList={patch:p}/{patch_cap}{traced_lists}",
+            queue.engine_queue.as_raw(),
+            queue.h_context,
+        );
+    }
 
     // SAFETY: `engine_lists` is a live slice of owned interfaces for the whole
     // call, and `engine_queue` is the live queue this state owns.
