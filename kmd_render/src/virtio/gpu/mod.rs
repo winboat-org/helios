@@ -56,7 +56,9 @@ use virtio_drivers::queue::VirtQueue;
 use virtio_drivers::transport::pci::PciTransport;
 use virtio_drivers::transport::pci::bus::{DeviceFunction, PciRoot};
 use virtio_drivers::transport::{DeviceStatus, Transport};
-use wdk_sys::ntddk::{KeInitializeEvent, KeSetEvent, ObDereferenceObjectDeferDelete};
+use wdk_sys::ntddk::{
+    KeInitializeEvent, KeQueryInterruptTimePrecise, KeSetEvent, ObDereferenceObjectDeferDelete,
+};
 use wdk_sys::{KEVENT, PVOID};
 
 mod resource_tables;
@@ -308,6 +310,24 @@ const PRESENT_STREAM_GENERATION_MAX: u32 = (1 << PRESENT_STREAM_GENERATION_BITS)
 pub const PRESENT_STREAM_BOUNDARY_TAG: u64 = 1 << 63;
 /// Max WDDM submissions pending on venus completion.
 const MAX_WDDM_PENDING: usize = 256;
+/// Ceiling the `WddmHoldMs` knob is clamped to, IN CODE.
+///
+/// The hold delays the head of an adapter-global, strictly head-of-line FIFO, so
+/// an operator typo (`WddmHoldMs=100000`) must not be able to produce a TDR. 250
+/// ms is an eighth of the default `TdrDelay` (2 s) and still five orders of
+/// magnitude above the 0.8–1.1 µs `WaitForSingleObject` baseline the experiment
+/// reads against — the reading needs no more range than that, and the
+/// `MAX_WDDM_PENDING` overflow escape remains the second line of defence.
+const WDDM_HOLD_MS_MAX: u32 = 250;
+/// `WddmHoldMs`, snapshotted once at transport init. 0 = off (the default), which
+/// is the only value the shipping driver runs with.
+///
+/// ONE read site for this knob, deliberately: `dma_gpu_fence`'s doc records that
+/// a second, unread copy of a registry value existed here and was deleted so the
+/// two could not disagree. A static rather than a `VirtioGpu` field because the
+/// 60 Hz heartbeat in `adapter/kobj.rs` must test it WITHOUT taking `virtio_lock`
+/// — it is that heartbeat that provides the hold's release edge.
+pub static WDDM_HOLD_MS: AtomicU32 = AtomicU32::new(0);
 /// Max response bytes a synchronous command may expect (copied into the
 /// waiter's [`SyncWaitBlock`]; the largest runtime response is
 /// `VirtioGpuRespMapInfo`. `init`'s big GET_DISPLAY_INFO reply stays on the
@@ -1551,6 +1571,17 @@ struct WddmPending {
     /// be discharged after generation death, but a dispatched copy still has
     /// to wait for the terminal pair rather than `(token, None)`.
     blt_stream_boundary: Option<u64>,
+    /// `WddmHoldMs`: interrupt-time deadline (100 ns units) before which this
+    /// entry may not complete, or 0 for every ordinary submission.
+    ///
+    /// ⚠ THE ONLY ARTIFICIAL DELAY IN THIS STRUCT, and the only field here that
+    /// does not describe real work. It is set exclusively for a packet that
+    /// carried a `HeliosD3D12SubmitCmd`, because this FIFO is adapter-global and
+    /// head-of-line: attaching a hold to anything else stalls DWM. It exists to
+    /// answer UV1 — whether dxgkrnl orders the D3D12 runtime's monitored-fence
+    /// signal behind our DMA packets — and nothing in the shipping path reads it,
+    /// since the knob defaults to 0.
+    hold_until_100ns: u64,
 }
 
 /// One WDDM submission represents every WindowedBlt terminal for the same
@@ -2196,6 +2227,14 @@ impl VirtioGpu {
             failed: false,
             display_mode,
         });
+        // `WddmHoldMs` (UV1's instrument). Snapshotted here with every other knob
+        // so `reg add` + `pnputil /restart-device` applies it with no reboot, and
+        // CLAMPED here rather than trusted: see `WDDM_HOLD_MS_MAX`.
+        WDDM_HOLD_MS.store(
+            crate::diag::read_config_dword(crate::diag::knobs::WDDM_HOLD_MS, 0)
+                .min(WDDM_HOLD_MS_MAX),
+            Ordering::Relaxed,
+        );
         // (The old Gate-2 venus ctx self-test is gone: the StartDevice venus
         // client bring-up right after transport init exercises the full context
         // + blob lifecycle for real.)
@@ -5517,6 +5556,7 @@ impl VirtioGpu {
         gpu_completion_fence: Option<u64>,
         stream_boundary: Option<u64>,
         blt_token: Option<u64>,
+        d3d12: bool,
     ) -> bool {
         if self.failed {
             // Nothing will ever retire, so queueing this fence guarantees a TDR.
@@ -5679,6 +5719,12 @@ impl VirtioGpu {
         } else {
             self.next_wire_fence
         };
+        // UV1's instrument (`WddmHoldMs`, KMD_IMPACT §14a.1). Scoped to D3D12 ECL
+        // packets by the record's identity, never by timing or by which context
+        // happened to submit: this FIFO is adapter-global and strictly
+        // head-of-line, so a hold that could attach to a DWM present would stall
+        // the whole desktop. Default 0 makes every line below inert.
+        let hold_until_100ns = if d3d12 { self.wddm_hold_deadline() } else { 0 };
         let stream_ready =
             stream_boundary.map_or(true, |boundary| self.scanout_boundary_ready(boundary));
         let blt_ready = match (blt_token, blt_stream_boundary) {
@@ -5692,6 +5738,10 @@ impl VirtioGpu {
             && self.async_retired_up_to(watermark, domain)
             && stream_ready
             && blt_ready
+            // A held packet must not take the immediate-signal path: that is the
+            // exact case the experiment measures (a packet with nothing real to
+            // wait for), so the hold has to be able to reach it.
+            && hold_until_100ns == 0
             // A WindowedBlt terminal can predate a preempted DMA replay. It
             // still must enter the FIFO so a failed NotifyInterrupt leaves a
             // retryable owner; only the DPC's successful callback consumes
@@ -5729,8 +5779,34 @@ impl VirtioGpu {
             stream_boundary,
             blt_token,
             blt_stream_boundary,
+            hold_until_100ns,
         });
         false
+    }
+
+    /// The interrupt-time deadline a held D3D12 packet may not complete before,
+    /// or 0 when `WddmHoldMs` is off (the default) or the clock is unusable.
+    ///
+    /// The clamp is in CODE, not in the operator's registry value: an unbounded
+    /// hold on a head-of-line FIFO is a TDR, and a typo must not be able to cause
+    /// one. `WDDM_HOLD_MS_MAX` is far below the default `TdrDelay` of 2 s while
+    /// still five orders of magnitude above the 0.8–1.1 µs fence-wait baseline the
+    /// experiment reads against, so nothing about the reading needs the extra
+    /// range.
+    fn wddm_hold_deadline(&self) -> u64 {
+        let ms = WDDM_HOLD_MS.load(Ordering::Relaxed);
+        if ms == 0 {
+            return 0;
+        }
+        let mut qpc_timestamp = 0;
+        // SAFETY: `KeQueryInterruptTimePrecise` is a scalar time read legal at any
+        // IRQL (the same call this driver already makes at DIRQL in
+        // `ddi/display.rs` and from the vsync DPC); it takes no lock and cannot
+        // re-enter this transport.
+        let now = unsafe { KeQueryInterruptTimePrecise(&mut qpc_timestamp) };
+        // 100 ns units. A saturating add keeps an exhausted interrupt-time
+        // representation from wrapping into a deadline already in the past.
+        now.saturating_add(ms as u64 * 10_000)
     }
 
     /// Whether the last [`Self::note_wddm_submission`] overflowed the pending
@@ -5755,7 +5831,7 @@ impl VirtioGpu {
     /// `SubmissionFenceId` as a watermark and requires monotonic completion, so
     /// skipping ahead is bugcheck 0x119/1.
     pub fn take_one_ready_wddm(&mut self, _order: &crate::adapter::NotifyOrdered<'_>) -> WddmTake {
-        let (watermark, domain, stream_boundary, blt_token, blt_stream_boundary) = {
+        let (watermark, domain, stream_boundary, blt_token, blt_stream_boundary, hold_until) = {
             let Some(head) = self.wddm_pending.front() else {
                 return WddmTake::Empty;
             };
@@ -5765,6 +5841,7 @@ impl VirtioGpu {
                 head.stream_boundary,
                 head.blt_token,
                 head.blt_stream_boundary,
+                head.hold_until_100ns,
             )
         };
         // Evaluated as three named conditions rather than one `||` chain: the
@@ -5788,6 +5865,20 @@ impl VirtioGpu {
         } {
             WDDM_HEAD_BLOCKED_BLT.fetch_add(1, Ordering::Relaxed);
             return WddmTake::BlockedOnProducer;
+        }
+        // FOURTH ARM, AND DELIBERATELY LAST (`WddmHoldMs`, UV1). Placed after the
+        // three real dependencies so `WfBHold` can only mean "an otherwise READY
+        // packet was artificially delayed" — which is the experiment's signal —
+        // and so the meaning of the other three counters is unchanged. Inert
+        // unless the knob is on AND the head is a D3D12 ECL packet.
+        if hold_until != 0 {
+            let mut qpc_timestamp = 0;
+            // SAFETY: scalar any-IRQL time read, as in `wddm_hold_deadline`.
+            let now = unsafe { KeQueryInterruptTimePrecise(&mut qpc_timestamp) };
+            if now < hold_until {
+                WDDM_HEAD_BLOCKED_HOLD.fetch_add(1, Ordering::Relaxed);
+                return WddmTake::BlockedOnProducer;
+            }
         }
         let Some(pending) = self.wddm_pending.pop_front() else {
             return WddmTake::Empty;

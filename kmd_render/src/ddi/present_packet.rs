@@ -22,6 +22,16 @@ pub(crate) const STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER: NTSTATUS = 0xC01E_0001
 // older layout as v3: the tail belongs to another private record there.
 const PRESENT_SUBMISSION_VERSION: u32 = 3;
 const PRESENT_SUBMISSION_MAGIC: u32 = 0x4850_424C; // "HPBL"
+/// The same 32-byte record, written by `dxgkddi_render`'s D3D12 ECL arm instead
+/// of by Present. "HD12" — distinct from `helios_protocol`'s wire-side
+/// `HELIOS_D3D12_SUBMIT_MAGIC` ("HE12") because they identify different things:
+/// that one is the UMD's command record, this one is the KMD's private handoff.
+///
+/// It exists so `decode` can tell the scheduler that a submission belongs to a
+/// D3D12 command queue. The FIFO it feeds is adapter-global and strictly
+/// head-of-line, so any experiment that delays a packet MUST be able to name the
+/// packets it may delay; see `PresentSubmissionPrivate::mark_d3d12`.
+const D3D12_SUBMISSION_MAGIC: u32 = 0x4844_3132; // "HD12"
 
 /// Byte offset of [`PresentFlipPrivate`] inside the per-context DMA
 /// private-data buffer. [`PresentSubmissionPrivate`] owns bytes 0..32, so the
@@ -267,24 +277,61 @@ pub(crate) struct PresentSubmissionPrivate {
     blt_token: u64,
 }
 
+/// Whether a D3D12 ECL record found one of its own already in this DMA buffer.
+///
+/// Named rather than a bare `bool` because the two cases mean different things
+/// and only one of them is expected: several ECLs batched into one DMA buffer
+/// (`MergedWithPredecessor`, benign — the largest wire fence subsumes the rest),
+/// versus the first record in a fresh or consumed buffer (`First`, the norm).
+/// After [`PresentSubmissionPrivate::decode`] began consuming the D3D12 record,
+/// a predecessor can ALSO mean a buffer whose earlier submission never reached
+/// SubmitCommand (preempted, or abandoned by a TDR epoch); merging is
+/// conservative there too — it waits for work that really was enqueued.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum D3d12Mark {
+    First,
+    MergedWithPredecessor,
+}
+
 /// The scheduler-relevant contents of one exact KMD private-data record.
 #[derive(Clone, Copy)]
 pub(crate) struct PresentSubmissionBoundary {
     pub gpu_fence_id: u64,
     pub stream_boundary: u64,
     pub blt_token: u64,
+    /// This submission carried a `HeliosD3D12SubmitCmd` — the scoping signal for
+    /// anything that must apply to D3D12 ECL packets and to nothing else. Never
+    /// a boundary: a `true` here says WHO submitted, not WHAT to wait for.
+    pub d3d12: bool,
 }
 
 impl PresentSubmissionPrivate {
+    /// `magic` says WHICH DDI arm wrote this record. The two are the same 32-byte
+    /// shape with the same field meanings; the distinction exists only so
+    /// [`Self::decode`] can report a D3D12 ECL submission as itself — see
+    /// [`D3D12_SUBMISSION_MAGIC`].
     #[inline]
-    fn for_parts(gpu_fence_id: u64, stream_boundary: u64, blt_token: u64) -> Self {
+    fn for_parts(magic: u32, gpu_fence_id: u64, stream_boundary: u64, blt_token: u64) -> Self {
         Self {
-            magic: PRESENT_SUBMISSION_MAGIC,
+            magic,
             version: PRESENT_SUBMISSION_VERSION,
             gpu_fence_id,
             stream_boundary,
             blt_token,
         }
+    }
+
+    /// Whether a record already in the buffer is one PRESENT wrote.
+    ///
+    /// ⚠ Deliberately NOT "either magic". The three Present writers must keep
+    /// their exact prior behaviour, and accepting the D3D12 magic here would not
+    /// be neutral: a D3D12 record's `stream_boundary`/`blt_token` are always 0, so
+    /// preserving those would write the same zeros, but its `gpu_fence_id` would
+    /// start being inherited into a Present record where before it was discarded.
+    /// `mark_d3d12` runs the mirror-image check on its own magic instead.
+    #[inline]
+    fn is_present_record(&self) -> bool {
+        self.magic == PRESENT_SUBMISSION_MAGIC && self.version == PRESENT_SUBMISSION_VERSION
     }
 
     /// Merge a newly queued BLT fence into the current DMA buffer's marker.
@@ -309,31 +356,20 @@ impl PresentSubmissionPrivate {
 
         let old =
             unsafe { core::ptr::read_unaligned(private_data.cast::<PresentSubmissionPrivate>()) };
-        let merged =
-            if old.magic == PRESENT_SUBMISSION_MAGIC && old.version == PRESENT_SUBMISSION_VERSION {
-                old.gpu_fence_id.max(gpu_fence_id)
-            } else {
-                gpu_fence_id
-            };
+        let recognised = old.is_present_record();
+        let merged = if recognised {
+            old.gpu_fence_id.max(gpu_fence_id)
+        } else {
+            gpu_fence_id
+        };
         unsafe {
             core::ptr::write_unaligned(
                 private_data.cast::<PresentSubmissionPrivate>(),
                 Self::for_parts(
+                    PRESENT_SUBMISSION_MAGIC,
                     merged,
-                    if old.magic == PRESENT_SUBMISSION_MAGIC
-                        && old.version == PRESENT_SUBMISSION_VERSION
-                    {
-                        old.stream_boundary
-                    } else {
-                        0
-                    },
-                    if old.magic == PRESENT_SUBMISSION_MAGIC
-                        && old.version == PRESENT_SUBMISSION_VERSION
-                    {
-                        old.blt_token
-                    } else {
-                        0
-                    },
+                    if recognised { old.stream_boundary } else { 0 },
+                    if recognised { old.blt_token } else { 0 },
                 ),
             );
         }
@@ -341,6 +377,87 @@ impl PresentSubmissionPrivate {
         PRESENT_MARKER_LAST_SIZE.store(private_size, Ordering::Relaxed);
         PRESENT_MARKER_WRITES.fetch_add(1, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// Stamp the D3D12 ECL identity, and its boundary, onto the private data of
+    /// the `DxgkDdiRender` call that carried `HeliosD3D12SubmitCmd`.
+    ///
+    /// # Why a second magic instead of a flag
+    ///
+    /// The record is exactly full — 32 bytes at offset 0, with `PresentFlipPrivate`
+    /// immediately after it and a compile-time assert forbidding overlap — so
+    /// there is no spare field, and `PRESENT_DMA_PRIVATE_DATA_BYTES` is exactly
+    /// consumed. Identity also cannot ride the fence: `gpu_wire_fence` is legally
+    /// 0 (the documented *order it against nothing* arm), and [`Self::decode`]
+    /// rejects an all-zero payload under Present's magic — as it must, so a zeroed
+    /// buffer is never read as a boundary. A distinct magic is positively
+    /// identifying with every payload field still 0, which is precisely what
+    /// `HELIOS_D3D12_SUBMIT_MAGIC`'s own doc means by *"its mere presence is what
+    /// identifies a submission as a D3D12 ECL packet"*.
+    ///
+    /// Deliberately does NOT touch the `PRESENT_MARKER_*` trio: `PmWr`/`PmWFn`/
+    /// `PmWSz` name the Present handoff, and `D12Rec` already counts this arm.
+    ///
+    /// # It is called for EVERY D3D12 record, including `gpu_fence_id == 0`
+    ///
+    /// ⛔ THIS IS WHAT MAKES A RECYCLED BUFFER SAFE, and it is not optional.
+    /// dxgkrnl reuses DMA private-data buffers between submissions — the reason
+    /// [`PresentFlipPrivate::take`] consumes its record, stated at that call site.
+    /// If a zero-fence ECL declined to write, a previous ECL's `F1` would still be
+    /// sitting at offset 0, SubmitCommand would gate the new packet on a fence
+    /// that has already retired, the application's `ID3D12Fence` would signal
+    /// early, and every counter would read healthy: the original defect wearing
+    /// the instrumentation of the fix. Writing unconditionally makes "no boundary"
+    /// EXPLICIT for this submission instead of inherited from another one.
+    ///
+    /// # What it preserves, and what it clears
+    ///
+    /// It always writes a full record, never a partial one. The fence takes the
+    /// max only over a predecessor under THIS magic — several ECL records can be
+    /// batched into one DMA buffer, exactly as several Presents can, and wire
+    /// fence ids are monotonic so the largest subsumes the earlier ones.
+    /// `stream_boundary` and `blt_token` are always ZEROED: a D3D12 ECL has no
+    /// present stream and no windowed BLT, so inheriting either from whatever
+    /// last used this buffer would attach a foreign dependency to this packet.
+    ///
+    /// # Safety
+    /// `private_data` points to `private_size` writable bytes supplied by dxgkrnl
+    /// for this Render call.
+    pub(crate) unsafe fn mark_d3d12(
+        private_data: *mut c_void,
+        private_size: u32,
+        gpu_fence_id: u64,
+    ) -> Result<D3d12Mark, NTSTATUS> {
+        if private_data.is_null()
+            || (private_size as usize) < core::mem::size_of::<PresentSubmissionPrivate>()
+        {
+            return Err(STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER);
+        }
+        let old =
+            unsafe { core::ptr::read_unaligned(private_data.cast::<PresentSubmissionPrivate>()) };
+        let predecessor = old.magic == D3D12_SUBMISSION_MAGIC
+            && old.version == PRESENT_SUBMISSION_VERSION
+            && old.gpu_fence_id != 0;
+        unsafe {
+            core::ptr::write_unaligned(
+                private_data.cast::<PresentSubmissionPrivate>(),
+                Self::for_parts(
+                    D3D12_SUBMISSION_MAGIC,
+                    if predecessor {
+                        old.gpu_fence_id.max(gpu_fence_id)
+                    } else {
+                        gpu_fence_id
+                    },
+                    0,
+                    0,
+                ),
+            );
+        }
+        Ok(if predecessor {
+            D3d12Mark::MergedWithPredecessor
+        } else {
+            D3d12Mark::First
+        })
     }
 
     /// Merge one same-context registered stream boundary into this submission.
@@ -365,12 +482,11 @@ impl PresentSubmissionPrivate {
         }
         let old =
             unsafe { core::ptr::read_unaligned(private_data.cast::<PresentSubmissionPrivate>()) };
-        let (gpu_fence_id, old_boundary, blt_token) =
-            if old.magic == PRESENT_SUBMISSION_MAGIC && old.version == PRESENT_SUBMISSION_VERSION {
-                (old.gpu_fence_id, old.stream_boundary, old.blt_token)
-            } else {
-                (0, 0, 0)
-            };
+        let (gpu_fence_id, old_boundary, blt_token) = if old.is_present_record() {
+            (old.gpu_fence_id, old.stream_boundary, old.blt_token)
+        } else {
+            (0, 0, 0)
+        };
         let merged_boundary = if old_boundary == 0 || old_boundary == boundary {
             boundary
         } else if (old_boundary >> 63) == 1
@@ -387,7 +503,12 @@ impl PresentSubmissionPrivate {
         unsafe {
             core::ptr::write_unaligned(
                 private_data.cast::<PresentSubmissionPrivate>(),
-                Self::for_parts(gpu_fence_id, merged_boundary, blt_token),
+                Self::for_parts(
+                    PRESENT_SUBMISSION_MAGIC,
+                    gpu_fence_id,
+                    merged_boundary,
+                    blt_token,
+                ),
             );
         }
         PRESENT_MARKER_LAST_SIZE.store(private_size, Ordering::Relaxed);
@@ -419,12 +540,11 @@ impl PresentSubmissionPrivate {
         }
         let old =
             unsafe { core::ptr::read_unaligned(private_data.cast::<PresentSubmissionPrivate>()) };
-        let (gpu_fence_id, old_boundary, old_token) =
-            if old.magic == PRESENT_SUBMISSION_MAGIC && old.version == PRESENT_SUBMISSION_VERSION {
-                (old.gpu_fence_id, old.stream_boundary, old.blt_token)
-            } else {
-                (0, 0, 0)
-            };
+        let (gpu_fence_id, old_boundary, old_token) = if old.is_present_record() {
+            (old.gpu_fence_id, old.stream_boundary, old.blt_token)
+        } else {
+            (0, 0, 0)
+        };
         let same_stream = old_boundary == 0
             || (old_boundary >> 63) == 1
                 && ((old_boundary >> 32) & 0x7fff_ffff) == ((boundary >> 32) & 0x7fff_ffff);
@@ -439,7 +559,12 @@ impl PresentSubmissionPrivate {
         unsafe {
             core::ptr::write_unaligned(
                 private_data.cast::<PresentSubmissionPrivate>(),
-                Self::for_parts(gpu_fence_id, merged_boundary, old_token.max(token)),
+                Self::for_parts(
+                    PRESENT_SUBMISSION_MAGIC,
+                    gpu_fence_id,
+                    merged_boundary,
+                    old_token.max(token),
+                ),
             );
         }
         PRESENT_MARKER_LAST_SIZE.store(private_size, Ordering::Relaxed);
@@ -452,10 +577,61 @@ impl PresentSubmissionPrivate {
     /// Unknown data is deliberately treated as an ordinary submission rather
     /// than reinterpreted as a fence id.
     ///
+    /// ⚠ THE TWO ARMS HAVE DIFFERENT ACCEPTANCE RULES, on purpose. Under
+    /// Present's magic an all-zero payload is REJECTED: that magic can also be
+    /// what a recycled buffer happens to hold, and a boundary of nothing is not
+    /// worth trusting. Under [`D3D12_SUBMISSION_MAGIC`] an all-zero payload is
+    /// ACCEPTED, because there the record's job is identity — `gpu_wire_fence`
+    /// is legally 0 — and only `mark_d3d12` ever writes that magic.
+    ///
+    /// ⛔ AND THE D3D12 ARM IS CONSUMED, exactly as [`PresentFlipPrivate::take`]
+    /// consumes its own record and for the same stated reason: dxgkrnl recycles
+    /// these buffers between submissions, and a boundary left behind would be
+    /// read a second time by whatever submission next reuses the buffer — gating
+    /// that packet on a fence that has already retired, which signals an
+    /// application's `ID3D12Fence` early while every counter reads healthy.
+    ///
+    /// The asymmetry is deliberate: Present's record is NOT consumed, because the
+    /// Present path read-modify-writes it across several `merge_*` calls that
+    /// legitimately accumulate into one DMA buffer, and consuming it here would
+    /// change those semantics. That is why the D3D12 arm's protection is
+    /// "`mark_d3d12` writes unconditionally" FIRST and this consume second: the
+    /// write is what makes each submission's boundary its own, and the consume is
+    /// what makes a missing write fail safe (no boundary) instead of silently
+    /// inheriting the last one.
+    ///
+    /// Consuming can only ever make a packet wait LONGER — a second submission
+    /// out of the same buffer falls back to the ordinary wire watermark — while
+    /// not consuming makes it wait less than it should. That direction is the
+    /// whole argument.
+    ///
     /// # Safety
-    /// `private_data` points to `private_size` readable bytes supplied by
-    /// dxgkrnl for this SubmitCommand call.
+    /// `private_data` points to `private_size` readable-and-writable bytes
+    /// supplied by dxgkrnl for this SubmitCommand call.
     pub(crate) unsafe fn decode(
+        private_data: *mut c_void,
+        private_size: u32,
+    ) -> Option<PresentSubmissionBoundary> {
+        let boundary = unsafe { Self::peek(private_data, private_size) }?;
+        if boundary.d3d12 {
+            // CONSUME IT — only the magic word, so a re-read finds an
+            // unrecognised record rather than this boundary.
+            //
+            // SAFETY: `peek` proved `private_data` non-null and at least
+            // `size_of::<PresentSubmissionPrivate>()` bytes; `magic` is the first
+            // field of that record at offset 0.
+            unsafe { core::ptr::write_unaligned(private_data.cast::<u32>(), 0) };
+        }
+        Some(boundary)
+    }
+
+    /// Read the record WITHOUT consuming it — the shared body of [`Self::decode`]
+    /// and of the diagnostic scan, which must never mutate dxgkrnl's buffer while
+    /// merely looking for an offset.
+    ///
+    /// # Safety
+    /// `private_data` points to `private_size` readable bytes supplied by dxgkrnl.
+    unsafe fn peek(
         private_data: *const c_void,
         private_size: u32,
     ) -> Option<PresentSubmissionBoundary> {
@@ -466,14 +642,20 @@ impl PresentSubmissionPrivate {
         }
         let value =
             unsafe { core::ptr::read_unaligned(private_data.cast::<PresentSubmissionPrivate>()) };
-        (value.magic == PRESENT_SUBMISSION_MAGIC
-            && value.version == PRESENT_SUBMISSION_VERSION
-            && (value.gpu_fence_id != 0 || value.stream_boundary != 0 || value.blt_token != 0))
-            .then_some(PresentSubmissionBoundary {
+        if value.version != PRESENT_SUBMISSION_VERSION {
+            return None;
+        }
+        let d3d12 = value.magic == D3D12_SUBMISSION_MAGIC;
+        let carries_boundary =
+            value.gpu_fence_id != 0 || value.stream_boundary != 0 || value.blt_token != 0;
+        (d3d12 || (value.magic == PRESENT_SUBMISSION_MAGIC && carries_boundary)).then_some(
+            PresentSubmissionBoundary {
                 gpu_fence_id: value.gpu_fence_id,
                 stream_boundary: value.stream_boundary,
                 blt_token: value.blt_token,
-            })
+                d3d12,
+            },
+        )
     }
 
     /// Locate a valid marker anywhere in a bounded private-data snapshot.
@@ -498,7 +680,7 @@ impl PresentSubmissionPrivate {
         let base = private_data.cast::<u8>();
         for offset in 0..=size - record_size {
             if unsafe {
-                Self::decode(
+                Self::peek(
                     base.add(offset).cast(),
                     (size - offset).min(u32::MAX as usize) as u32,
                 )

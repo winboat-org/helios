@@ -72,6 +72,13 @@ pub static WDDM_FENCE_FROM_DPC: AtomicU32 = AtomicU32::new(0);
 pub static WDDM_HEAD_BLOCKED_WIRE: AtomicU32 = AtomicU32::new(0);
 pub static WDDM_HEAD_BLOCKED_STREAM: AtomicU32 = AtomicU32::new(0);
 pub static WDDM_HEAD_BLOCKED_BLT: AtomicU32 = AtomicU32::new(0);
+/// The fourth arm, and the only one that is not a real dependency: an otherwise
+/// READY D3D12 ECL packet held back by `WddmHoldMs`. Mirrored as `WfBHold`.
+///
+/// Must be 0 on any shipping deployment — the knob defaults to 0. Nonzero means
+/// somebody is running UV1's experiment, and its magnitude is the number of DPC
+/// looks the hold absorbed, not a duration.
+pub static WDDM_HEAD_BLOCKED_HOLD: AtomicU32 = AtomicU32::new(0);
 /// Fenced SUBMIT_3D enqueues carrying ring_idx >= 1 (GPU-completion fences —
 /// WS1 #4 consumer-side ordering; these retire at host GPU completion, not
 /// decode, so they legally stay in flight for the full GPU-work duration).

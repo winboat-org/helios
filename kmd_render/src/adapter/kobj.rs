@@ -460,6 +460,19 @@ impl AdapterContext {
 /// and arm just one future expiration. No timer source performs a catch-up burst.
 unsafe fn service_vsync_tick(adapter: &AdapterContext) {
     use core::sync::atomic::Ordering;
+    // THE RELEASE EDGE FOR `WddmHoldMs` (UV1's instrument), and the reason it is
+    // here: a held WDDM head is not waiting on any completion, so no used-ring DPC
+    // is guaranteed to arrive and look at it again. This 60 Hz tick is the one
+    // periodic DISPATCH edge this driver already owns; at 16.7 ms granularity it
+    // releases a 100 ms hold with ~17 ms of slop, which the experiment's own
+    // three-orders-of-magnitude signal does not care about.
+    //
+    // ONE relaxed load per tick when the knob is off, which is the shipping
+    // default — deliberately BEFORE the display gates below so the release does
+    // not also depend on `vsync_enabled`.
+    if crate::virtio::gpu::WDDM_HOLD_MS.load(Ordering::Relaxed) != 0 {
+        crate::ddi::interrupt::request_wddm_completion_dpc(adapter);
+    }
     if !adapter.display_half() || adapter.vsync_armed.load(Ordering::Acquire) == 0 {
         return;
     }

@@ -603,6 +603,40 @@ pub mod knobs {
     /// exactly. Snapshotted at transport init, so `pnputil /restart-device`
     /// flips it without a reboot.
     pub const PRESENT_EXACT_WATERMARK: KnobName = KnobName::new(b"PresentWmk");
+    /// `WddmHoldMs` (default 0 = OFF, and OFF is the only shipping value).
+    ///
+    /// # THE KNOB IS THE EXPERIMENT (UV1, `docs/dx12/KMD_IMPACT.md` §14a.1)
+    ///
+    /// Hold a D3D12 ECL packet's `DMA_COMPLETED` back by N ms after everything it
+    /// really depends on is satisfied, then read the D3D12 probe's own
+    /// `WaitForSingleObject signalled in N us` against the measured 0.8–1.1 µs
+    /// baseline:
+    ///
+    /// * **N grows by ~the hold** ⇒ **UV1 ✓**. dxgkrnl DOES release the runtime's
+    ///   queued monitored-fence signal behind our DMA packets, so the fence bridge
+    ///   is the right lever and everything after it is plumbing.
+    /// * **N stays at the baseline** ⇒ **UV1 ✗**. The runtime's fence advance has
+    ///   no causal dependency on this context's packets at all, and none of
+    ///   K-F3..K-F9 is the answer. Say so loudly and stop.
+    ///
+    /// ⭐ THIS IS THE ONLY CLEAN UV1 TEST AVAILABLE. The bare submission's reading
+    /// is confounded: the venus ring emits NO wire fence at all while it is busier
+    /// than 1 ms (`icd/mesa/src/virtio/vulkan/vn_ring.c:673-690` — the doorbell is
+    /// rate-limited and only sent when the host ring advertises IDLE), so an
+    /// unheld packet can retire immediately for a reason that has nothing to do
+    /// with whether dxgkrnl would have ordered anything. A hold is the one
+    /// dependency this driver can create unilaterally and time exactly.
+    ///
+    /// ⛔ SCOPED, and it must stay scoped: only a submission whose private data
+    /// carries the D3D12 ECL record is eligible (`present_packet.rs`'s
+    /// `mark_d3d12`). `wddm_pending` is adapter-global and strictly head-of-line,
+    /// so an unscoped hold stalls DWM.
+    /// ⛔ Clamped in code to `WDDM_HOLD_MS_MAX`, because an unbounded hold on that
+    /// FIFO is a TDR and an operator typo must not be able to cause one.
+    /// ⚠ The release edge is the 60 Hz display heartbeat (`adapter/kobj.rs`), so
+    /// the experiment requires the display half armed — which is the configuration
+    /// it runs in anyway. `WfBHold` counts the blocked looks.
+    pub const WDDM_HOLD_MS: KnobName = KnobName::new(b"WddmHoldMs");
 }
 
 /// Read a service-key REG_DWORD knob, or `default` if absent.
