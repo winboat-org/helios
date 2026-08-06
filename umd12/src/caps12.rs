@@ -664,14 +664,22 @@ unsafe fn pipeline_support(a: &ddi12::D3D12DDIARG_GETCAPS, data_size: usize) -> 
 /// * `ViewInstancingTier` — the PSO carries the whole
 ///   `D3D12DDI_VIEW_INSTANCING_DESC` through (`forward12/pso.rs:1869-1876`, all
 ///   three fields, locations copied element-wise at `:2186-2187`) but
-///   `pfnSetViewInstanceMask` is a counted noop (`forward12/misc.rs:1967`
+///   `pfnSetViewInstanceMask` is a counted noop (`forward12/misc.rs`, `set_view_instance_mask`
 ///   installed), so a non-identity mask is silently dropped.
 ///
-/// ⚠ **Citations into `forward12/{queue,cmdlist,fence,copy,resource12}.rs` below
-/// name SYMBOLS, not lines, deliberately.** Those five files were being edited
+/// ⚠ **Citations into `forward12/{queue,cmdlist,fence,copy,resource12,misc}.rs`
+/// below name SYMBOLS, not lines, deliberately.** Those five files were being edited
 /// concurrently with this commit and three of them had already moved every line
 /// number a read-only sweep had collected — `resource12.rs`'s `heap_flags` by 64
 /// lines. A citation that drifts is worse than none (`METHOD.md` §3 criterion 5).
+///
+/// ⛔ **`misc.rs` was NOT on that list and drifted anyway — every citation into it
+/// was off by exactly +118**, because `026e4a1` landed after this commit's `3c29677`
+/// and inserted 118 lines above them. Two of the six were the SOLE slot evidence for
+/// a cap decision: the `WriteBufferImmediateQueueFlags` raise and the `ViewInstancing`
+/// decline. A reviewer re-deriving either landed on `set_protected_resource_session`
+/// and a log budget, and would have concluded the caps answer was unbacked. All six
+/// are symbols now, and `misc.rs` has been added to the list above.
 ///
 /// ⚠ **NO VALUE HERE CAN BE FORWARDED FROM THE ENGINE, and that is structural.**
 /// `pfnGetCaps` is an **adapter** slot — `get_caps(h_adapter, arg)`,
@@ -829,12 +837,13 @@ unsafe fn d3d12_options(a: &ddi12::D3D12DDIARG_GETCAPS, data_size: usize) -> Hre
         //
         // ⛔ The reason this used to be NONE was STALE: it read "the honest answer
         // while `pfnWriteBufferImmediate` is a noop", and the slot is a real
-        // forward — `pfnWriteBufferImmediate` (installed `forward12/misc.rs:1966`)
-        // copies each parameter (`misc.rs:1422-1423`), translates the modes, and
+        // forward — `pfnWriteBufferImmediate` (installed in `forward12/misc.rs`'s
+        // `install_misc`) copies each parameter (`misc.rs`,
+        // `write_buffer_immediate`), translates the modes, and
         // calls `ID3D12GraphicsCommandList2::WriteBufferImmediate`
-        // (`misc.rs:1471`).
+        // (`misc.rs`, `write_buffer_immediate` -> `list2.WriteBufferImmediate`).
         //
-        // ⚠ CROSS-LANE COUNTER RE-GRADE: `misc.rs:1371` bumps
+        // ⚠ CROSS-LANE COUNTER RE-GRADE: `misc.rs`'s `write_buffer_immediate` bumps
         // `write_buffer_immediate_under_none_cap` on EVERY call, whose whole
         // meaning is "the cap says NONE". With this raise that counter can only
         // ever read "all of them", which grades as noise rather than as a defect —
@@ -847,7 +856,7 @@ unsafe fn d3d12_options(a: &ddi12::D3D12DDIARG_GETCAPS, data_size: usize) -> Hre
         // `D3D12DDI_VIEW_INSTANCING_DESC` (`forward12/pso.rs:1869-1876`) with the
         // locations copied member-wise (`:2186-2187`) and only vkd3d's own two
         // validation refusals in front of it — but `pfnSetViewInstanceMask` is
-        // installed (`forward12/misc.rs:1967`) as a counted noop. A dropped mask
+        // installed (`forward12/misc.rs`, `set_view_instance_mask`) as a counted noop. A dropped mask
         // renders every declared view instance instead of the selected subset:
         // wrong pixels, silently. The PSO half is therefore **implemented but
         // unreachable**, not done.

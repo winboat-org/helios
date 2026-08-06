@@ -24,7 +24,7 @@
 //! | `Umd12EclDelayUs` | DWORD | `0` — **diagnostic**, the F1 delay probe on `pfnExecuteCommandLists` |
 //! | `Umd12EclSubmit` | DWORD | **`1` — ON.** K-F1's `pfnRenderCb` WDDM submission during `pfnExecuteCommandLists` |
 //! | `Umd12EclDrain` | DWORD | **`0` — OFF.** Whether `pfnExecuteCommandLists` drains vkd3d's submission worker (A1) |
-//! | `Umd12EclFence` | DWORD | **`1` — ON.** Whether the ECL record carries a real venus GPU-completion boundary — ⛔ **has no effect unless `Umd12EclDrain` is also on** |
+//! | `Umd12EclFence` | DWORD | **`1` — ON.** Whether the ECL record carries a real venus GPU-completion boundary. ⛔ Its old entry here said *"has no effect unless `Umd12EclDrain` is also on"* — **FALSE since `f71fef4`**, and that sentence is why the fence bridge once shipped inert. ON samples on **both** drain arms; `Umd12EclDrain` decides only whether the boundary is EXACT or a **prefix** that may under-wait (`EclFenceNoDrain` is the census of the prefix arm). See the knob's own declaration below |
 //!
 //! ⭐ **`UmdD3D12` lands here at S5, and not one commit earlier.** A kill switch
 //! for a driver that cannot be reached kills nothing, so declaring it before

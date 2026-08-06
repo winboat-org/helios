@@ -650,10 +650,24 @@ fn note_and_maybe_signal(
                 });
                 let blt_token = present_submission
                     .and_then(|present| (present.blt_token != 0).then_some(present.blt_token));
-                // Identity, not a boundary: the ONLY thing it may decide is
-                // whether the `WddmHoldMs` experiment is allowed to delay this
-                // packet. The FIFO is adapter-global and head-of-line, so an
-                // unscoped hold would stall DWM.
+                // ⛔ CORRECTED 2026-08-07. This said "the ONLY thing it may decide
+                // is whether the `WddmHoldMs` experiment is allowed to delay this
+                // packet". That was true when written (`56483b2`, where the hold
+                // was the bit's only consumer) and FALSE four commits later:
+                // `1e6b34a` added a second consumer, and it is the load-bearing
+                // one. The bit now has exactly two:
+                //
+                //   1. `wddm_boundary::select` reads it to choose `Kind::Exact`
+                //      over `Kind::Prefix` — i.e. it DOES decide what to wait for.
+                //      That is the A4 repair and it is deliberate: `Exact` names
+                //      the frame's OWN fence, which is what CLAUDE.md's invariant
+                //      requires, instead of the whole `next_wire_fence` prefix.
+                //      ⚠ "Identity, not a boundary" survives only in the narrow
+                //      sense that the bit is not itself a fence VALUE.
+                //   2. `wddm_hold_deadline`, the `WddmHoldMs` experiment.
+                //
+                // The FIFO is adapter-global and head-of-line, so an unscoped hold
+                // would stall DWM — which is why (2) is scoped by this bit.
                 let d3d12 = present_submission.is_some_and(|present| present.d3d12);
                 v.note_wddm_submission(
                     o,

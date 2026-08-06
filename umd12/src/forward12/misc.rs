@@ -47,7 +47,7 @@
 //! * `pfnWriteBufferImmediate` — **forwarded**. It has no companion DDI slot, no
 //!   PSO subobject and no tier that gates a *feature*; the only thing gating it
 //!   is `WriteBufferImmediateQueueFlags`, whose own comment
-//!   (`caps12.rs:574-576`) says it reads `NONE` *"which is the honest answer
+//!   (`caps12.rs`, `d3d12_options`) USED to read `NONE` *"which is the honest answer
 //!   while `pfnWriteBufferImmediate` is a noop"*. The cap follows the slot here,
 //!   not the other way round — see [`write_buffer_immediate`] and the coherence
 //!   note in this lane's REPORT.
@@ -1432,13 +1432,18 @@ unsafe extern "C" fn set_protected_resource_session(
 ///
 /// # ⭐ The one slot in this lane that forwards, and why it is not the cap's twin
 ///
-/// `caps12.rs:574-576` reports `WriteBufferImmediateQueueFlags = NONE` with the
-/// comment *"NONE = 'no queue supports WriteBufferImmediate', which is the honest
-/// answer while `pfnWriteBufferImmediate` is a noop."* ⇒ **the cap follows this
-/// slot, not the other way round.** It is not a feature tier gating a family of
-/// DDIs; it is a statement about this one body, written when this body was a
-/// counting noop. Implementing it makes that statement stale, and this lane's
-/// REPORT routes that to L1 rather than editing `caps12.rs` (`PARALLEL.md` §4).
+/// `caps12.rs` (`d3d12_options`) USED to report
+/// `WriteBufferImmediateQueueFlags = NONE` with the comment *"NONE = 'no queue
+/// supports WriteBufferImmediate', which is the honest answer while
+/// `pfnWriteBufferImmediate` is a noop."* ⇒ **the cap follows this slot, not the
+/// other way round.** It is not a feature tier gating a family of DDIs; it is a
+/// statement about this one body, written when this body was a counting noop.
+///
+/// ⭐ **RESOLVED: implementing the body made that statement stale, and the cap was
+/// raised to `3D|COMPUTE|COPY` in the same changeset (`3c29677`).** This lane's
+/// REPORT routed it to L1 (`PARALLEL.md` §4) and L1 acted. ⛔ The line citation
+/// that stood here was `caps12.rs:574-576` and had drifted +118 by the time
+/// anyone read it — symbols, not lines, into a file being edited concurrently.
 ///
 /// The forward is honest on the substrate side: vkd3d implements it fully —
 /// `d3d12_command_list_WriteBufferImmediate`,
@@ -1486,7 +1491,7 @@ unsafe extern "C" fn write_buffer_immediate(
     // ⚠ The instrument the caps coherence needs: this slot should be unreachable
     // while `WriteBufferImmediateQueueFlags` reads NONE. Counted first, so that
     // it counts even the degenerate and refused arms below.
-    L9_REFUSALS.write_buffer_immediate_under_none_cap.bump();
+    L9_REFUSALS.write_buffer_immediate_calls.bump();
 
     let n = count as usize;
     if n == 0 {
@@ -2182,7 +2187,7 @@ pub(crate) static REFUSALS: &[&RefusalCounter] = &[
     &L9_REFUSALS.marker_dropped,
     &L9_REFUSALS.protected_resource_session_none,
     &L9_REFUSALS.protected_resource_session_refused,
-    &L9_REFUSALS.write_buffer_immediate_under_none_cap,
+    &L9_REFUSALS.write_buffer_immediate_calls,
     &L9_REFUSALS.write_buffer_immediate_bad_arg,
     &L9_REFUSALS.write_buffer_immediate_mode_unknown,
     &L9_REFUSALS.write_buffer_immediate_engine_missing,
@@ -2436,14 +2441,26 @@ pub(crate) struct L9Refusals {
     protected_resource_session_refused: RefusalCounter,
     /// `pfnWriteBufferImmediate` was called at all.
     ///
-    /// ⛔ **Expected 0 while `caps12.rs:576` reports
-    /// `WriteBufferImmediateQueueFlags = NONE`, and a non-zero reading is the
-    /// evidence L1 needs to raise that cap** — not a fault. This slot forwards
+    /// ⛔⛔ **RE-GRADED AND RENAMED 2026-08-07. It used to read: "Expected 0 while
+    /// `caps12.rs:576` reports `WriteBufferImmediateQueueFlags = NONE`, and a
+    /// non-zero reading is the evidence L1 needs to raise that cap." Every clause
+    /// of that is now false**, and it was false the moment it shipped: `3c29677`
+    /// raised the cap to `3D|COMPUTE|COPY` **in the same changeset**, its cited
+    /// line no longer holds the cap, and the old name asserted a condition
+    /// (`UnderNoneCap`) that is untrue of every call it counts. Left as-is it
+    /// could only rise, so it could never again distinguish anything, while still
+    /// printing in the `D3D12 DDI refusals:` line that `CONFORMANCE.md`'s charter
+    /// says to drive to zero — inviting either a chase after a non-defect or a
+    /// second "raise" of an already-raised cap.
+    ///
+    /// ⭐ What it is now: **a plain census of `pfnWriteBufferImmediate` entries**,
+    /// which is the instrument `METHOD.md` saturation criterion 6 requires to tell
+    /// *implemented* from *implemented-but-never-exercised*. Expected **non-zero**
+    /// on any DRED or breadcrumb-using title, and 0 elsewhere. The slot forwards
     /// into vkd3d (see [`write_buffer_immediate`]), so a hit means the write
-    /// *worked*; what it contradicts is the caps line, whose own comment says it
-    /// reads NONE only because this slot used to be a noop. ⚠ Bumped on **every**
-    /// call including the degenerate `Count == 0` one, so it counts calls rather
-    /// than writes.
+    /// worked. ⚠ Bumped on **every** call including the degenerate `Count == 0`
+    /// one, so it counts calls rather than writes; `L9WriteBufferImmediateBadArg`
+    /// beside it is the one that must stay 0.
     ///
     /// ⚠ **An instrument in a set named `DDI refusals:`, and there is precedent
     /// for that** — `CapsCalls`/`CapsMsaaCalls` in the spine's set and
@@ -2452,7 +2469,7 @@ pub(crate) struct L9Refusals {
     /// not print the whole refusal summary; the summary is emitted
     /// unconditionally at adapter close and device teardown
     /// (`crate::log_refusal_summary`), so the counter is still readable.
-    write_buffer_immediate_under_none_cap: RefusalCounter,
+    write_buffer_immediate_calls: RefusalCounter,
     /// `pfnWriteBufferImmediate` with a null parameter array or a count above
     /// [`MAX_WRITE_BUFFER_IMMEDIATE_PARAMS`]. **Expected 0.**
     ///
@@ -2595,8 +2612,8 @@ pub(crate) static L9_REFUSALS: L9Refusals = L9Refusals {
     marker_dropped: RefusalCounter::new("L9MarkerDropped"),
     protected_resource_session_none: RefusalCounter::new("L9ProtectedResourceSessionNone"),
     protected_resource_session_refused: RefusalCounter::new("L9ProtectedResourceSessionRefused"),
-    write_buffer_immediate_under_none_cap: RefusalCounter::new(
-        "L9WriteBufferImmediateUnderNoneCap",
+    write_buffer_immediate_calls: RefusalCounter::new(
+        "L9WriteBufferImmediateCalls",
     ),
     write_buffer_immediate_bad_arg: RefusalCounter::new("L9WriteBufferImmediateBadArg"),
     write_buffer_immediate_mode_unknown: RefusalCounter::new("L9WriteBufferImmediateModeUnknown"),

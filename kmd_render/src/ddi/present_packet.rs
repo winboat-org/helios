@@ -300,8 +300,14 @@ pub(crate) struct PresentSubmissionBoundary {
     pub stream_boundary: u64,
     pub blt_token: u64,
     /// This submission carried a `HeliosD3D12SubmitCmd` — the scoping signal for
-    /// anything that must apply to D3D12 ECL packets and to nothing else. Never
-    /// a boundary: a `true` here says WHO submitted, not WHAT to wait for.
+    /// anything that must apply to D3D12 ECL packets and to nothing else.
+    ///
+    /// ⚠ "Never a boundary" is true only in the narrow sense that this is not a
+    /// fence VALUE. It **does** decide what to wait for: `wddm_boundary::select`
+    /// reads it to choose `Kind::Exact` (the frame's own fence) over
+    /// `Kind::Prefix` (the whole `next_wire_fence` backlog). That is the A4
+    /// repair, it is deliberate, and `kmd_logic` pins it with five tests. Its
+    /// second consumer is the `WddmHoldMs` experiment's scoping.
     pub d3d12: bool,
 }
 
