@@ -1927,6 +1927,13 @@ unsafe fn adopt_presentable(
             sample_count: res_arg.SampleDesc.Count,
             dxgi_format: res_arg.Format as u32,
         },
+        // ⭐ The SAME number that went into `meta.pitch` above, not a second
+        // derivation of it: UP-9's `HeliosPresentPrivateData::pitch` has to agree with
+        // the allocation's, and the only way to guarantee that is one source. ⚠ Read
+        // out of the local rather than `private.meta.pitch`, because the kernel may
+        // have written that field back and the write-back is deliberately kept as an
+        // observation (see the comparison above) instead of becoming an input.
+        pitch,
         heap_flags: heap_arg.Flags as u32,
     };
 

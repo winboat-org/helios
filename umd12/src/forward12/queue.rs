@@ -532,6 +532,119 @@ impl ContextWindows {
     }
 }
 
+/// The allocations one WDDM present submission makes VidMm keep resident.
+///
+/// ⭐⭐ **This is the one place the present submission differs from K-F1's fence
+/// carrier, and the difference is mandatory rather than stylistic.** K-F1 submits
+/// `NumAllocations = 0` because its record names no allocation. A DXGI present's
+/// allocation list is *required*: it is where VidMm takes the residency it holds
+/// across the pending operation, which
+/// `umd/src/forward/present.rs:772-777` states outright for the shipping D3D11
+/// path. ⇒ [`submit_wddm_render`] grows a parameter rather than the present reusing
+/// it with an empty list.
+///
+/// ⛔ **A source-allocation-free present is unrepresentable**, which is the whole
+/// reason this is a type and not two `u32`s: [`Self::new`] returns `None` for a zero
+/// source. Same encoding and same argument as D3D11's `RuntimePresentDependencies`
+/// (`umd/src/forward/present.rs:370-376`).
+#[derive(Clone, Copy)]
+pub(crate) struct PresentDependencies {
+    /// The present **source** — the back buffer being presented. Read-only, so its
+    /// list entry carries `Value = 0`.
+    source: core::num::NonZeroU32,
+    /// The present **destination**, when there is one. Written by the copy, so its
+    /// entry carries `Value = 1` (bit 0 is `WriteOperation`).
+    ///
+    /// ⚠ `None` for every windowed D3D12 present this driver serves: the
+    /// destination is DWM's surface, named by the runtime and not by this driver.
+    /// The arm exists because the D3D11 template has it and because a fullscreen
+    /// flip is the case that will need it — not because anything reaches it today.
+    destination: Option<core::num::NonZeroU32>,
+}
+
+impl PresentDependencies {
+    /// `None` when `source` is 0 — see the type doc.
+    pub(crate) fn new(
+        source: ddi12::D3DKMT_HANDLE,
+        destination: ddi12::D3DKMT_HANDLE,
+    ) -> Option<Self> {
+        Some(Self {
+            source: core::num::NonZeroU32::new(source)?,
+            destination: core::num::NonZeroU32::new(destination),
+        })
+    }
+
+    /// How many entries [`Self::write_to`] will write.
+    fn count(self) -> u32 {
+        1 + u32::from(self.destination.is_some())
+    }
+
+    /// Write the entries into the runtime's allocation-list window.
+    ///
+    /// `Err(())` means the window is absent or smaller than [`Self::count`] — the
+    /// caller counts and refuses; nothing is written on that path.
+    ///
+    /// # Safety
+    /// `list`/`capacity` must be the pair the runtime handed out together, from
+    /// `pfnCreateContextCb` or the preceding successful `pfnRenderCb`. They are
+    /// taken as one argument pair for the reason `Window` exists: a pointer checked
+    /// against a capacity that describes a different pointer is the corruption
+    /// `umd_common/src/window.rs:11-21` records.
+    unsafe fn write_to(
+        self,
+        list: *mut ddi12::D3DDDI_ALLOCATIONLIST,
+        capacity: u32,
+    ) -> Result<u32, ()> {
+        let required = self.count();
+        if list.is_null() || capacity < required {
+            return Err(());
+        }
+        // SAFETY: non-null with a capacity of at least `required` entries per the
+        // check above, so element 0 and — when a destination exists, making
+        // `required` 2 — element 1 are both inside the runtime's array.
+        // ⛔ `write_unaligned`: the window is dxgkrnl's and this driver has no way to
+        // check its alignment. It costs nothing on x64 and removes an assumption the
+        // D3D11 site makes implicitly by using a plain typed store.
+        unsafe {
+            list.write_unaligned(allocation_list_entry(self.source.get(), false));
+            if let Some(destination) = self.destination {
+                list.add(1)
+                    .write_unaligned(allocation_list_entry(destination.get(), true));
+            }
+        }
+        Ok(required)
+    }
+}
+
+/// One `D3DDDI_ALLOCATIONLIST` entry.
+///
+/// ⚠ Built through the union's `Value` arm rather than the bitfield accessors, and
+/// that is what the D3D11 site does too (`umd/src/forward/present.rs:412`): bit 0 is
+/// `WriteOperation` and every other bit is 0. The union is exactly 4 bytes with no
+/// padding, so writing `Value` initialises all of it — which a `set_WriteOperation`
+/// call on a `MaybeUninit` bitfield would not.
+fn allocation_list_entry(
+    h_allocation: ddi12::D3DKMT_HANDLE,
+    write_operation: bool,
+) -> ddi12::D3DDDI_ALLOCATIONLIST {
+    ddi12::D3DDDI_ALLOCATIONLIST {
+        hAllocation: h_allocation,
+        __bindgen_anon_1: ddi12::_D3DDDI_ALLOCATIONLIST__bindgen_ty_1 {
+            Value: u32::from(write_operation),
+        },
+    }
+}
+
+// ⛔ The one thing this file depends on POSITIONALLY in `D3DDDI_ALLOCATIONLIST`, and
+// `ddi12`'s module doc requires it to be pinned here rather than trusted to bindgen's
+// self-consistent assertions: the flags union must be exactly the 4 bytes `Value`
+// covers, or `allocation_list_entry` leaves part of an entry uninitialised.
+const _: () = {
+    assert!(core::mem::size_of::<ddi12::_D3DDDI_ALLOCATIONLIST__bindgen_ty_1>() == 4);
+    assert!(core::mem::offset_of!(ddi12::D3DDDI_ALLOCATIONLIST, __bindgen_anon_1) == 4);
+    assert!(core::mem::size_of::<ddi12::D3DDDI_ALLOCATIONLIST>() == 8);
+};
+
 /// `(pointer, capacity)` for a window that may be absent.
 ///
 /// A null pointer with a zero capacity is how the runtime itself spells "no
@@ -2712,11 +2825,16 @@ fn ecl_submit_command(gpu_wire_fence: u64) -> helios_protocol::HeliosD3D12Submit
 
 /// The three distinguishable outcomes of one [`submit_wddm_render`] attempt.
 ///
+/// ⚠ `pub(crate)` since UP-9, because [`submit_present_identity`] hands it to L8 —
+/// which needs all three arms apart for exactly the reason below: they choose
+/// different error channels, and collapsing any two would decide the severity of a
+/// refused present by accident.
+///
 /// ⭐ Three and not two, because the middle one decides whether the runtime is told
 /// at all — see [`report_ecl_submit_error`] for that line and the argument behind
 /// it. An `Option`/`Result` here would have collapsed exactly the distinction that
 /// matters.
-enum WddmSubmit {
+pub(crate) enum WddmSubmit {
     /// The packet went in and the windows were re-latched from its out-fields.
     Submitted,
     /// **This driver could not make a packet** — no `pfnRenderCb`, no context, no
@@ -2742,12 +2860,22 @@ enum WddmSubmit {
 /// to diverge.
 ///
 /// `command` is written at `CommandOffset = 0` with `CommandLength =
-/// size_of::<T>()`. `NumAllocations` and `NumPatchLocations` are **0**: the ECL
-/// record names no allocation, and Helios' GpuMmu is decorative so there is
-/// nothing to patch. ⚠ A DXGI *present* is the opposite case — its allocation
-/// list is mandatory, because that list is where VidMm takes the residency it
-/// holds across the pending operation (`umd/src/forward/present.rs:772-777`) — so
-/// UP-9 grows a parameter here rather than reusing this call with an empty list.
+/// size_of::<T>()`. `NumPatchLocations` is always **0**: Helios' GpuMmu is
+/// decorative, so there is nothing to patch.
+///
+/// `dependencies` is the allocation list, and it is the one thing the two callers
+/// disagree about. `None` — K-F1's fence carrier — submits `NumAllocations = 0`,
+/// because the ECL record names no allocation. `Some(..)` — UP-9's present
+/// identity — is **mandatory** for a DXGI present: that list is where VidMm takes
+/// the residency it holds across the pending operation
+/// (`umd/src/forward/present.rs:772-777`). ⇒ the parameter, rather than the
+/// present reusing this call with an empty list.
+///
+/// ⛔ **The list is written inside this function and under the same guard as the
+/// command**, which is why it cannot be a caller's job: [`QueueState::windows`]
+/// requires one thread per `HCONTEXT` across write → `pfnRenderCb` → re-latch, and
+/// a caller that wrote the list before taking the guard would be writing a buffer
+/// dxgkrnl may already have rotated away.
 ///
 /// ⚠ **Generic over the record, deliberately, and this is what makes it shareable.**
 /// One typed `write_unaligned` per command type is exactly the D3D11 shape
@@ -2756,9 +2884,27 @@ enum WddmSubmit {
 /// where it is declared instead of hand-assembling bytes here —
 /// `ARCHITECTURE.md` §12 rule 1: never hand-transcribe an ABI struct.
 ///
-/// Every arm counts itself before returning; the [`WddmSubmit`] it hands back is
-/// what decides the caller's *error channel*, and the two are not the same
+/// Every FAILURE arm counts itself before returning; the [`WddmSubmit`] it hands
+/// back is what decides the caller's *error channel*, and the two are not the same
 /// question.
+///
+/// ⛔ **The SUCCESS counter is the caller's, and that is an attribution decision.**
+/// This function used to bump `EclWddmSubmitted` itself, which was exact while
+/// `pfnExecuteCommandLists` was the only caller and becomes a confounded number the
+/// moment a present shares it — the `METHOD.md` instrument-attribution lens, three
+/// instances of which this project has already paid for in the KMD's counters. The
+/// ECL arm's documented arithmetic (`EclForwarded == EclWddmSubmitted +
+/// EclNoWddmSubmission`) only stays checkable if presents are not in the sum. ⇒ each
+/// caller counts its own `Submitted`.
+///
+/// ⚠ The six *cause* counters (`EclSubmitNoKtCb`, `EclSubmitNoRenderCb`,
+/// `EclSubmitNoContext`, `EclSubmitNoCmdWindow`, `EclSubmitWindowSmall`,
+/// `EclSubmitRenderFailed`) stay **shared**, and their `Ecl` names are now legacy:
+/// every one of them is a fact about dxgkrnl's callback table or about the windows on
+/// *this queue's context*, which is the same context both callers submit on, so a hit
+/// means the same thing whichever DDI produced it. `label` is what says which. Their
+/// docs carry the widening; the names were kept because renaming a counter changes
+/// every `D3D12 DDI refusals:` line it appears in.
 ///
 /// # Safety
 /// `dev` must be the live device `queue` was created against, and `queue` a live
@@ -2777,6 +2923,8 @@ unsafe fn submit_wddm_render<T: Copy>(
     dev: &device12::HeliosD3D12Device,
     queue: &QueueState,
     command_record: &T,
+    dependencies: Option<PresentDependencies>,
+    label: &'static str,
 ) -> WddmSubmit {
     if dev.kt_callbacks.is_null() {
         // ⚠ Expected unreachable: `create_device` refuses a null `pKTCallbacks`
@@ -2798,7 +2946,7 @@ unsafe fn submit_wddm_render<T: Copy>(
         note_refusal(&L2_REFUSALS.ecl_submit_render_cb_missing);
         if let Some(n) = budget(&ECL_LOG) {
             log_error!(
-                "ExecuteCommandLists: pKTCallbacks->pfnRenderCb is absent (x{})",
+                "{label}: pKTCallbacks->pfnRenderCb is absent (x{})",
                 n + 1,
             );
         }
@@ -2822,7 +2970,7 @@ unsafe fn submit_wddm_render<T: Copy>(
         note_refusal(&L2_REFUSALS.ecl_submit_no_command_window);
         if let Some(n) = budget(&ECL_LOG) {
             log_error!(
-                "ExecuteCommandLists: context {:p} has no command window -- cannot submit (x{})",
+                "{label}: context {:p} has no command window -- cannot submit (x{})",
                 queue.h_context,
                 n + 1,
             );
@@ -2843,13 +2991,44 @@ unsafe fn submit_wddm_render<T: Copy>(
         note_refusal(&L2_REFUSALS.ecl_submit_window_too_small);
         if let Some(n) = budget(&ECL_LOG) {
             log_error!(
-                "ExecuteCommandLists: command window {command:p} holds {capacity} bytes, need \
+                "{label}: command window {command:p} holds {capacity} bytes, need \
                  {command_length} -- not submitting (x{})",
                 n + 1,
             );
         }
         return WddmSubmit::Unavailable;
     }
+
+    // ⛔ THE ALLOCATION LIST IS VALIDATED AND WRITTEN BEFORE THE COMMAND, so a
+    // present whose list window is unusable leaves the command window untouched
+    // rather than half-prepared. Both windows are dxgkrnl's; both are checked
+    // per-arm against this submission's own requirement (CLAUDE.md: validate every
+    // runtime-supplied size before writing), never against a max union.
+    let num_allocations = match dependencies {
+        None => 0,
+        Some(deps) => {
+            let (list, list_capacity) = window_parts(&windows.allocations);
+            // SAFETY: `window_parts` returns the pointer and the capacity as one
+            // pair out of one `Window`, which is exactly `write_to`'s stated
+            // precondition — the pair can never describe two different buffers.
+            match unsafe { deps.write_to(list, list_capacity) } {
+                Ok(count) => count,
+                Err(()) => {
+                    note_refusal(&L2_REFUSALS.wddm_alloc_list_unavailable);
+                    if let Some(n) = budget(&ECL_LOG) {
+                        log_error!(
+                            "{label}: context {:p} allocation list is {list:p}/{list_capacity}, \
+                             need {} entries -- not submitting (x{})",
+                            queue.h_context,
+                            deps.count(),
+                            n + 1,
+                        );
+                    }
+                    return WddmSubmit::Unavailable;
+                }
+            }
+        }
+    };
 
     // SAFETY: `command` is the runtime's command-buffer window, non-null and proven
     // to hold at least `size_of::<T>()` bytes by the two checks above, and it can
@@ -2863,7 +3042,7 @@ unsafe fn submit_wddm_render<T: Copy>(
     let mut render = ddi12::D3DDDICB_RENDER {
         CommandLength: command_length,
         CommandOffset: 0,
-        NumAllocations: 0,
+        NumAllocations: num_allocations,
         NumPatchLocations: 0,
         hContext: queue.h_context,
         ..Default::default()
@@ -2883,7 +3062,7 @@ unsafe fn submit_wddm_render<T: Copy>(
         note_refusal(&L2_REFUSALS.ecl_submit_render_failed);
         if let Some(n) = budget(&ECL_LOG) {
             log_error!(
-                "ExecuteCommandLists: pfnRenderCb(ctx={:p}, len={command_length}) failed \
+                "{label}: pfnRenderCb(ctx={:p}, len={command_length}) failed \
                  hr={:#010x} (x{})",
                 queue.h_context,
                 hr as u32,
@@ -2894,16 +3073,124 @@ unsafe fn submit_wddm_render<T: Copy>(
     }
 
     windows.re_latch(&render);
-    note_refusal(&L2_REFUSALS.ecl_wddm_submitted);
+    // ⛔ No success counter here — see this function's doc. The caller owns it.
     trace_line!(
-        "ExecuteCommandLists: pfnRenderCb ok ctx={:p} len={command_length} queued={} \
-         next_cmd={:p}/{}",
+        "{label}: pfnRenderCb ok ctx={:p} len={command_length} allocations={num_allocations} \
+         queued={} next_cmd={:p}/{}",
         queue.h_context,
         render.QueuedBufferCount,
         render.pNewCommandBuffer,
         render.NewCommandBufferSize,
     );
     WddmSubmit::Submitted
+}
+
+/// Submit one present's identity record on the queue's WDDM context — **UP-9, and
+/// L8's second seam into this file** ([`present_context`] is the first).
+///
+/// ⭐ It exists rather than L8 calling [`submit_wddm_render`] directly for the same
+/// reason [`present_context`] returns a handle: `submit_wddm_render` needs a
+/// `&QueueState`, and handing one across the module boundary would export
+/// [`QueueState::windows`]' guard discipline — the guard that must span write →
+/// `pfnRenderCb` → re-latch — to a file that does not own it. The allocation list
+/// has to be written inside that guard too, which is why L8 passes
+/// [`PresentDependencies`] and never touches the window.
+///
+/// ⛔ **The caller decides what a failure means, and this function decides
+/// nothing.** It reports the [`WddmSubmit`] verbatim; `report_present_submit_error`
+/// is the channel for the one arm that must reach the runtime.
+///
+/// ⚠ `WddmSubmit::Unavailable` is returned for a queue handle that did not resolve,
+/// which is *not* the same shape as [`submit_wddm_render`]'s other unavailable arms —
+/// but it is the same fact for the caller (no packet went in, nothing to report to the
+/// runtime), so it takes the same variant with its own counter.
+///
+/// # Safety
+/// `h_queue` must be a handle [`create_command_queue`] returned `S_OK` for.
+/// ⛔ The caller must be inside `pfnPresent` on the thread that entered it —
+/// [`submit_wddm_render`]'s obligations 1 and 2, forwarded unchanged.
+pub(crate) unsafe fn submit_present_identity(
+    h_queue: ddi12::D3D12DDI_HCOMMANDQUEUE,
+    record: &helios_protocol::HeliosPresentRenderCmd,
+    dependencies: PresentDependencies,
+) -> WddmSubmit {
+    // SAFETY: forwarded to `queue_state`'s identical precondition; the borrow ends
+    // inside this function.
+    let Some(queue) = (unsafe { queue_state(h_queue) }) else {
+        note_refusal(&L2_REFUSALS.present_submit_no_queue);
+        return WddmSubmit::Unavailable;
+    };
+    // SAFETY: `queue.h_device` is the device handle this queue was created against
+    // and the queue is live, so the device is.
+    let Some(dev) = (unsafe { device12::device(queue.h_device) }) else {
+        // Expected unreachable — a live queue implies a live device — and its own
+        // counter rather than the queue one, because the two would need different
+        // fixes.
+        note_refusal(&L2_REFUSALS.present_submit_no_device);
+        return WddmSubmit::Unavailable;
+    };
+    // SAFETY: `dev` is the live device `queue` was created against, `queue` is live
+    // for this call, and the caller guarantees we are inside `pfnPresent` on the
+    // entering thread — `submit_wddm_render`'s three obligations.
+    let outcome =
+        unsafe { submit_wddm_render(dev, queue, record, Some(dependencies), "Present identity") };
+    if matches!(outcome, WddmSubmit::Submitted) {
+        // ⭐ Counted HERE and not in L8, because this function is present-scoped by
+        // construction — nothing else calls it — so the counter cannot be confounded
+        // the way `EclWddmSubmitted` would have been. L8 keeps its own refusals.
+        note_refusal(&L2_REFUSALS.present_identity_submitted);
+    }
+    outcome
+}
+
+/// Report a **refused** present-identity submission to the runtime.
+///
+/// ⛔ **`pfnSetErrorCb`, and the argument is [`report_ecl_submit_error`]'s three
+/// reasons re-derived for a slot that has a command-list handle in scope** — which is
+/// exactly the situation in which this project got the channel wrong 49 times, so it
+/// is argued rather than copied:
+///
+/// 1. ⛔ **`pfnSetCommandListErrorCb` quarantines RECORDING, and a present records
+///    nothing.** Its documented effect is *"the runtime will drop all calls into the
+///    driver which record commands on the specified command list"*. `pfnPresent` is
+///    handed an `hCommandList`, but this driver writes nothing into it —
+///    `AddedGpuWork` is FALSE precisely because nothing is recorded — so dropping
+///    future recording calls on it reports the failure to nobody.
+/// 2. **What failed is not one list's recording.** It is the queue's kernel
+///    submission of this frame's identity, on the queue's own WDDM context.
+/// 3. **There is no per-queue error callback in `_0062`**, so the device callback is
+///    the only channel left. Same conclusion as `fence_operation` and
+///    [`report_ecl_submit_error`], down to reusing `QueueSetErrorUnavailable` when
+///    the channel itself is absent.
+///
+/// # ⛔ Why the severity is device removal and no knob softens it
+///
+/// `pfnRenderCb` refused a packet this driver built, on the context every later
+/// present on this queue will use. That does not get better next frame, and
+/// `METHOD.md` §2 Phase 4 consequence 1 forbids a knob whose default exists to keep a
+/// run alive. ⚠ It is deliberately **not** the severity of `Unavailable`: that arm is
+/// *this driver* failing to make a packet, which is the same state the ECL path
+/// declines to raise, and it leaves the frame without an identity rather than without
+/// a device.
+///
+/// # Safety
+/// `h_queue` must be a handle [`create_command_queue`] returned `S_OK` for.
+pub(crate) unsafe fn report_present_submit_error(
+    h_queue: ddi12::D3D12DDI_HCOMMANDQUEUE,
+    hr: ddi12::HRESULT,
+) {
+    // SAFETY: forwarded to `queue_state`'s identical precondition.
+    let Some(queue) = (unsafe { queue_state(h_queue) }) else {
+        note_refusal(&L2_REFUSALS.queue_set_error_unavailable);
+        return;
+    };
+    // SAFETY: as `submit_present_identity` — the device behind a live queue; the
+    // borrow lives only until the end of this statement.
+    let reported =
+        unsafe { device12::device(queue.h_device) }.is_some_and(|dev| device12::set_error(dev, hr));
+    if !reported {
+        note_refusal(&L2_REFUSALS.queue_set_error_unavailable);
+    }
 }
 
 /// Report a **refused** WDDM submission to the runtime.
@@ -3348,10 +3635,27 @@ unsafe extern "C" fn execute_command_lists(
         // thread that entered it; `dev` below is the device this queue was created
         // against, and `queue` is live for this call.
         let outcome = unsafe { device12::device(queue.h_device) }.map(|dev| unsafe {
-            submit_wddm_render(dev, queue, &ecl_submit_command(gpu_wire_fence))
+            submit_wddm_render(
+                dev,
+                queue,
+                &ecl_submit_command(gpu_wire_fence),
+                // ⛔ K-F1's record names no allocation, so the list is empty and the
+                // reason is not thrift: `NumAllocations = 0` on a legacy context is
+                // what a submission with nothing to keep resident looks like. UP-9's
+                // present is the opposite case; `PresentDependencies` has the
+                // argument.
+                None,
+                "ExecuteCommandLists",
+            )
         });
         match outcome {
-            Some(WddmSubmit::Submitted) => {}
+            Some(WddmSubmit::Submitted) => {
+                // ⭐ The success counter moved OUT of `submit_wddm_render` when UP-9
+                // became its second caller: `EclForwarded == EclWddmSubmitted +
+                // EclNoWddmSubmission` is documented as checkable arithmetic, and a
+                // present bumping the same counter would break it silently.
+                note_refusal(&L2_REFUSALS.ecl_wddm_submitted);
+            }
             // ⛔ `EclNoWddmSubmission` fires for every arm below, including the
             // refused one: each of them is "a submission was forwarded to the
             // engine with no WDDM submission behind it", which is exactly what
@@ -4231,6 +4535,16 @@ pub(crate) struct L2Refusals {
     /// the two arms. A `D3D12 DDI refusals:` line where that does not hold is
     /// reporting something other than what this code does.
     ///
+    /// ⚠⚠ **RE-GRADED BY UP-9, and the re-grading is what KEEPS the arithmetic
+    /// above true.** `submit_wddm_render` used to bump this counter itself, which
+    /// was exact while `pfnExecuteCommandLists` was its only caller. UP-9 made the
+    /// present a second caller, so the bump moved out to the ECL call site and this
+    /// counter's scope **narrowed to ECL submissions alone**. Had it stayed inside,
+    /// every present would have added to it and the invariant would have broken
+    /// silently — the `METHOD.md` instrument-attribution failure, in the one counter
+    /// whose whole value is that it is client-specific. The present arm's
+    /// counterpart is `PresentIdentitySubmitted`.
+    ///
     /// ⚠ **It says the PACKET was accepted; it does not say the fence became
     /// truthful.** What it settles is the plumbing — that dxgkrnl takes
     /// `pfnRenderCb` on a *legacy* D3D12 context and returns success — and, unlike
@@ -4244,6 +4558,16 @@ pub(crate) struct L2Refusals {
     /// unheld packet retires instantly. `knobs12::UMD12_ECL_SUBMIT` has that
     /// correction with its ICD citations, and the module doc repeats it.
     ecl_wddm_submitted: RefusalCounter,
+    // ⚠⚠ THE SIX COUNTERS BELOW ARE SHARED BY BOTH `pfnRenderCb` USERS SINCE UP-9,
+    // and their `Ecl` names are LEGACY. Every one of them is a fact about dxgkrnl's
+    // callback table or about the windows on *this queue's context* — the same
+    // context `pfnExecuteCommandLists` and `pfnPresent` both submit on — so a hit
+    // means the same thing whichever DDI produced it, and the fix is the same. The
+    // `submit_wddm_render` log line's `label` is what says which caller saw it. The
+    // names were kept rather than corrected because renaming a counter changes every
+    // `D3D12 DDI refusals:` line it appears in, and the widening is recorded here
+    // instead. ⛔ Do NOT read any of them as ECL-specific.
+    //
     /// `pKTCallbacks` was null when the WDDM submission needed it. **Expected 0** —
     /// `create_device` refuses a null `pKTCallbacks` before the device exists, so a
     /// hit means the table went away under a live device.
@@ -4536,6 +4860,40 @@ pub(crate) struct L2Refusals {
     /// root signature"* as *"the application passed none"*, which is the exact
     /// conflation `pso::root_signature`'s own doc warns callers to separate.
     command_signature_root_sig_unresolved: RefusalCounter,
+    /// A WDDM submission needed an **allocation list** and dxgkrnl's window was
+    /// absent or smaller than the entry count.
+    ///
+    /// ⛔ **Expected 0, and it can only ever be reached by the present arm**: K-F1's
+    /// fence carrier passes no [`PresentDependencies`] at all, so a hit means
+    /// `pfnPresent` had an identity and a context and still could not name the back
+    /// buffer's residency. ⚠ Read it beside `EclSubmitNoCmdWindow`: both non-zero
+    /// says the whole legacy context arrived without windows, which is a fact about
+    /// the adapter; this one alone says the *allocation* window specifically is
+    /// under-sized, which is a fact about how many entries dxgkrnl lent.
+    wddm_alloc_list_unavailable: RefusalCounter,
+    /// ⭐ **UP-9's success counter: a present identity record went in.**
+    ///
+    /// ⛔ Its own counter rather than `EclWddmSubmitted`, deliberately — see
+    /// [`submit_wddm_render`]'s doc.
+    ///
+    /// ⭐ **The arithmetic is the check, and `PresentEntered` (L8's set) is what makes
+    /// it one**: `PresentEntered` must equal `PresentIdentitySubmitted` plus
+    /// `PresentIdentityRefused` plus `PresentIdentityUnavailable` plus every L8
+    /// refusal that returns before the submission. A `D3D12 DDI refusals:` line where
+    /// that does not hold is reporting something other than what this code does. ⚠ It
+    /// had no left-hand side until `PresentEntered` was added, which is exactly the
+    /// state `EclForwarded` exists to prevent on the ECL path.
+    present_identity_submitted: RefusalCounter,
+    /// A present identity submission was attempted on a queue handle that did not
+    /// resolve to a live `QueueState`. **Expected 0**: L8 resolves the same handle
+    /// through [`present_context`] two statements earlier, so a hit means the queue
+    /// was destroyed between them — a lifetime finding, not a missing feature.
+    present_submit_no_queue: RefusalCounter,
+    /// A present identity submission found no live device behind its queue.
+    /// **Expected 0** — a live queue implies a live device — and its own counter
+    /// rather than [`Self::present_submit_no_queue`]'s because the two would need
+    /// different fixes.
+    present_submit_no_device: RefusalCounter,
 }
 
 pub(crate) static L2_REFUSALS: L2Refusals = L2Refusals {
@@ -4612,6 +4970,10 @@ pub(crate) static L2_REFUSALS: L2Refusals = L2Refusals {
     command_signature_engine_failed: RefusalCounter::new("CommandSignatureEngineFailed"),
     command_signature_root_sig_unexpected: RefusalCounter::new("CommandSignatureRootSigUnexpected"),
     command_signature_root_sig_unresolved: RefusalCounter::new("CommandSignatureRootSigUnresolved"),
+    wddm_alloc_list_unavailable: RefusalCounter::new("WddmAllocListUnavailable"),
+    present_identity_submitted: RefusalCounter::new("PresentIdentitySubmitted"),
+    present_submit_no_queue: RefusalCounter::new("PresentSubmitNoQueue"),
+    present_submit_no_device: RefusalCounter::new("PresentSubmitNoDevice"),
 };
 
 /// L2's refusal counters, printed by `crate::log_refusal_summary` at this
@@ -4730,6 +5092,16 @@ pub(crate) static REFUSALS: &[&RefusalCounter] = &[
     &L2_REFUSALS.command_signature_engine_failed,
     &L2_REFUSALS.command_signature_root_sig_unexpected,
     &L2_REFUSALS.command_signature_root_sig_unresolved,
+    // ⛔ APPENDED, UP-9 (the present identity `pfnRenderCb`). One shared-window
+    // refusal and three present-scoped outcomes, at the end for the same reason as
+    // every block above. ⚠ `EclWddmSubmitted` keeps its position and its name, and
+    // only its SCOPE narrowed -- it now counts `pfnExecuteCommandLists` submissions
+    // alone, because `submit_wddm_render` stopped bumping it when UP-9 became its
+    // second caller. Its doc carries the re-grading.
+    &L2_REFUSALS.wddm_alloc_list_unavailable,
+    &L2_REFUSALS.present_identity_submitted,
+    &L2_REFUSALS.present_submit_no_queue,
+    &L2_REFUSALS.present_submit_no_device,
 ];
 
 // ⚠ `Hresult` is imported for the `E_*`/`S_OK` constants this file returns; the

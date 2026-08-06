@@ -133,12 +133,14 @@ use std::sync::{Mutex, MutexGuard};
 /// translation means a future translation bug shows up as a disagreement instead
 /// of being reproduced identically on both sides.
 ///
-/// ⛔ **No row pitch.** `HeliosWddmAllocMeta::pitch` needs one and the create
-/// DDI carries none: a D3D12 resource's layout is the engine's, obtainable only
-/// through `GetCopyableFootprints` (which this lane already calls, from
-/// `check_subresource_info`). UP-5 is where that is resolved; recording a
-/// computed guess here would be a second, unchecked derivation of a number the
-/// engine already owns.
+/// ⛔ **No row pitch, and that is a statement about THIS struct rather than
+/// about the table.** The create DDI carries none — a D3D12 resource's layout is
+/// the engine's, obtainable only through `GetCopyableFootprints` — so a pitch
+/// here would be a second, unchecked derivation of a number the engine already
+/// owns. UP-5 asks the engine instead, and UP-9 needs the answer for
+/// `HeliosPresentPrivateData::pitch`, so it is kept as
+/// [`PresentableIdentity::pitch`]: outside this struct precisely because it is
+/// not one of the DDI's own fields.
 #[derive(Clone, Copy)]
 pub(crate) struct IdentityGeometry {
     /// `Width` — `UINT64` at the DDI, even for a texture.
@@ -235,6 +237,21 @@ pub(crate) struct PresentableIdentity {
     /// counted: the KMD's adopt path never reads it.
     pub(crate) ctx_id: u32,
     pub(crate) geometry: IdentityGeometry,
+    /// The engine's row pitch for subresource 0, as `GetCopyableFootprints`
+    /// answered it at create time — the value UP-5 put in
+    /// `HeliosWddmAllocMeta::pitch`, kept so UP-9's
+    /// `HeliosPresentPrivateData::pitch` is the **same** number rather than a
+    /// second derivation.
+    ///
+    /// ⚠ **0 is legal and means the engine declined**, not "one byte per row":
+    /// `check_subresource_info`'s `FOOTPRINT_UNANSWERED_U32` sentinel collapses to
+    /// 0 here. Nothing on the windowed path reads it — DWM imports an OPTIMAL
+    /// device-local image by venus resource id, not by stride — so it is carried
+    /// rather than validated. ⛔ Whoever makes a *fullscreen* flip read it must
+    /// treat a 0 as a refusal: the primary's stride is a frozen agreement with the
+    /// host (`align(width*bpp, 256)`), and presenting with a disagreeing stride
+    /// turns a hard failure into a sheared picture (`PENDING.md` §S-3 item 7).
+    pub(crate) pitch: u32,
     /// The raw `D3D12DDI_HEAP_FLAGS` word the create arrived with.
     ///
     /// ⭐ This is §14a.3's `is_primary` field, kept in its unreduced form. The
