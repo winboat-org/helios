@@ -852,6 +852,38 @@ unsafe fn queue_state<'a>(h: ddi12::D3D12DDI_HCOMMANDQUEUE) -> Option<&'a QueueS
     Some(unsafe { &*p })
 }
 
+/// The WDDM context one queue submits on — **L8's one seam into this file.**
+///
+/// ⭐ It returns the handle and not the [`QueueState`], and that is the whole
+/// point of it. `pfnPresent` needs exactly one field of this file's state —
+/// `D3D12DDI_PRESENT_CONTEXTS_0051::hContext` must be the context
+/// `pfnCreateCommandQueue` minted (`KMD_IMPACT.md` §14a.3 UP-7) — and handing
+/// out a `&QueueState` instead would export three invariants that belong here:
+/// that [`QueueState::windows`]' guard spans write → `pfnRenderCb` → re-latch,
+/// that the windows rotate under that guard, and that a submission must be made
+/// on the thread inside the owning DDI. [`submit_present_identity`] is the other
+/// seam, for the same reason.
+///
+/// ⚠ **Two handle resolutions per present, deliberately.** L8 calls this and then
+/// [`submit_present_identity`], each of which resolves the handle again — two
+/// pointer loads. The alternative is one call returning a borrow of the state,
+/// which is the thing the paragraph above rules out. And the order matters more
+/// than the loads do: L8 must know the context exists *before* it decides to
+/// submit, because a refused present has to write nothing at all.
+///
+/// `None` means the handle did not resolve to a live queue, or its context is
+/// null — which `create_wddm_context` makes unreachable by failing the queue
+/// create, so a `None` is a finding rather than a state to work around.
+///
+/// # Safety
+/// As [`queue_state`]. The returned handle is dxgkrnl's and is only valid while
+/// the queue lives, i.e. for the DDI call that obtained it.
+pub(crate) unsafe fn present_context(h: ddi12::D3D12DDI_HCOMMANDQUEUE) -> Option<*mut c_void> {
+    // SAFETY: forwarded unchanged to `queue_state`'s identical precondition.
+    let queue = unsafe { queue_state(h) }?;
+    (!queue.h_context.is_null()).then_some(queue.h_context)
+}
+
 /// Take a queue's context-window lock, treating a poisoned lock as a live one.
 ///
 /// ⛔ `unwrap_or_else(|e| e.into_inner())`, never `.unwrap()` — the same shape and

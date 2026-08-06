@@ -37,22 +37,30 @@
 //! `DIRECT_SCANOUT` bit, no host stride agreement and none of the 0ab machinery.
 //! Fullscreen flip is a later, separate piece of work.
 //!
-//! # ⛔ What is still missing, and it is one accessor in another lane's file
+//! # ⭐ The two seams into `forward12::queue.rs`, and why they are two
 //!
-//! `D3D12DDI_PRESENT_CONTEXTS_0051::hContext` must be the WDDM context the queue
-//! created in `pfnCreateCommandQueue` — `QueueState::h_context`, a **private field
-//! of a struct in `forward12::queue.rs`**, which this lane does not own and must
-//! not edit. There is no `pub(crate)` accessor for it and no `pub(crate)`
-//! `queue_state`, so [`present`] below fills every field it can, refuses with
-//! `PresentQueueContextUnavailable`, and writes no handles — because a present
-//! descriptor naming a back buffer with no context to submit it on is a request
-//! dxgkrnl cannot serve, and filling it halfway would be a silent wrong answer
-//! rather than a loud missing one.
+//! This lane needs two things from the queue and neither of them is a
+//! `&QueueState`:
 //!
-//! ⇒ The one-line change that completes it, for the lane that owns `queue.rs`:
-//! a `pub(crate) fn present_context(&self) -> *mut c_void` on `QueueState` plus
-//! `pub(crate)` on `queue_state`, or a single
-//! `pub(crate) unsafe fn present_context(h: D3D12DDI_HCOMMANDQUEUE) -> Option<*mut c_void>`.
+//! 1. [`queue::present_context`] — the WDDM context
+//!    `D3D12DDI_PRESENT_CONTEXTS_0051::hContext` must name, i.e. the one
+//!    `pfnCreateCommandQueue` minted (UP-7).
+//! 2. [`queue::submit_present_identity`] — the `pfnRenderCb` submission carrying
+//!    this frame's `HeliosPresentRenderCmd` (UP-9).
+//!
+//! ⛔ **Both are handle-taking free functions rather than accessors on the
+//! state**, because `QueueState` carries invariants that are `queue.rs`'s to
+//! keep: the window guard spans write → `pfnRenderCb` → re-latch, the three
+//! runtime windows rotate under it, and the submission must happen on the thread
+//! inside the owning DDI. A borrow handed across the module boundary would export
+//! all three. Each accessor's own doc has the argument.
+//!
+//! ⚠ **The order below is load-bearing and it is not the order the fields are
+//! declared in.** The context is resolved first, then the identity is submitted,
+//! and only then are the out-structs filled — so a refusal at either step leaves
+//! the all-zero descriptor written at the top of [`present`] standing. Filling
+//! the handles and *then* failing to submit would hand the runtime a descriptor
+//! that looks complete for a frame the kernel never learned the identity of.
 
 use helios_umd_common::refusals::RefusalCounter;
 
@@ -60,7 +68,7 @@ use windows::core::Interface;
 
 use super::tables12::{stage, Filling};
 use super::tables12::{CommandListTable, DeviceCoreTable};
-use super::{identity12, resource12};
+use super::{identity12, queue, resource12};
 use crate::{ddi12, log_error, note_refusal};
 
 /// How many times any one bounded evidence line may repeat, per site.
@@ -118,10 +126,10 @@ unsafe extern "C" fn get_present_private_driver_data_size(
 /// |---|---|---|
 /// | `BroadcastSrcAllocation[0]` | the back buffer's `D3DKMT_HANDLE` | the UP-5 allocation, out of the `identity12` table |
 /// | `BroadcastDstAllocation[0]` | 0 | there is no destination allocation: a windowed present's destination is DWM's, named by the runtime and not by this driver |
-/// | `AddedGpuWork` | `FALSE` | ⛔ this DDI records no GPU work. `TRUE` would tell the runtime to expect a submission that never happens |
+/// | `AddedGpuWork` | `FALSE` | ⛔ nothing is recorded into `hCommandList`. The UP-9 `pfnRenderCb` below is a **kernel** submission already in dxgkrnl's FIFO for the same context, not pending command-list work |
 /// | `BackBufferMultiplicity` | 1 | see the counter's note — **unpriced**, and instrumented for exactly that reason |
 /// | `SyncIntervalOverrideValid` | `FALSE` | the driver does not override the application's sync interval; `SyncIntervalOverride` is therefore left alone |
-/// | `_CONTEXTS.hContext` | the queue's WDDM context | ⛔ **unavailable — see the module doc** |
+/// | `_CONTEXTS.hContext` | the queue's WDDM context | [`queue::present_context`], the first of the module doc's two seams |
 /// | `_CONTEXTS.BroadcastContextCount` | 0 | one adapter, one context; broadcast is a multi-GPU shape |
 /// | `_HWQUEUES.BroadcastQueueCount` | 0 | this driver refuses hardware queues |
 ///
@@ -181,9 +189,11 @@ unsafe extern "C" fn present(
     if p_out.is_null() {
         // The allocations out-struct is the one output the runtime cannot proceed
         // without, so its absence is a distinct fault from a null argument struct.
-        // ⚠ Tested for nullness rather than bound: nothing below this point writes
-        // through it — see the tail — so a binding would be an unused `&mut` and the
-        // only thing that matters here is that the refusal is attributed.
+        // ⚠ Tested for nullness here and bound again at the tail rather than held
+        // as a `&mut` across the whole body: everything between the two is a
+        // refusal path or a call into another module, and a live `&mut` into the
+        // runtime's out-struct held across those would be an aliasing claim this
+        // function cannot make.
         note_refusal(&L8_REFUSALS.present_no_out_struct);
         return;
     }
@@ -250,42 +260,94 @@ unsafe extern "C" fn present(
         return;
     };
 
-    // ⛔⛔ THE ONE MISSING FIELD. `QueueState::h_context` is private to
-    // `forward12::queue.rs`, which this lane does not own — see the module doc for
-    // the exact accessor that completes this. Refused here, before any handle is
-    // written, because a present descriptor naming a back buffer with no context to
-    // submit it on is a request dxgkrnl cannot serve.
-    //
-    // ⚠ The queue handle is validated for non-nullness so that when the accessor
-    // lands the check is already the right one, and so that "the runtime passed no
-    // queue" and "this driver cannot read the queue's context" are different
-    // counters.
+    // ⚠ The queue handle is validated for non-nullness on its own so that "the
+    // runtime passed no queue" and "this driver cannot read the queue's context" stay
+    // different counters.
     if h_queue.pDrvPrivate.is_null() {
         note_refusal(&L8_REFUSALS.present_bad_arg);
         return;
     }
-    note_refusal(&L8_REFUSALS.present_queue_context_unavailable);
-    let n = L8_REFUSALS.present_queue_context_unavailable.get();
-    if n <= LOG_BUDGET {
-        log_error!(
-            "L8: pfnPresent REFUSED -- the queue's WDDM context is unreachable from this lane \
-             (QueueState::h_context is private to forward12::queue.rs and has no accessor), so \
-             no present descriptor can be completed. Everything else was ready: alloc={:#x} \
-             venus_res_id={} {}x{} fmt={} queue={:p} (x{n})",
-            identity.h_allocation,
-            identity.venus_res_id,
-            identity.geometry.width,
-            identity.geometry.height,
-            identity.geometry.dxgi_format,
-            h_queue.pDrvPrivate,
-        );
+    // The WDDM context this present must be submitted on — the first of the two
+    // seams into `queue.rs` (module doc). Resolved BEFORE anything is written,
+    // because a present descriptor naming a back buffer with no context to submit it
+    // on is a request dxgkrnl cannot serve, and filling it halfway would be a silent
+    // wrong answer rather than a loud missing one.
+    //
+    // SAFETY: the runtime names a queue handle `create_command_queue` returned
+    // `S_OK` for and has not destroyed — the accessor's stated precondition. The
+    // returned handle is dxgkrnl's, read for this call and never stored.
+    let Some(h_context) = (unsafe { queue::present_context(h_queue) }) else {
+        note_refusal(&L8_REFUSALS.present_queue_context_unavailable);
+        let n = L8_REFUSALS.present_queue_context_unavailable.get();
+        if n <= LOG_BUDGET {
+            log_error!(
+                "L8: pfnPresent REFUSED -- queue {:p} resolved to no live WDDM context, so no \
+                 present descriptor can be completed. Everything else was ready: alloc={:#x} \
+                 venus_res_id={} {}x{} fmt={} (x{n})",
+                h_queue.pDrvPrivate,
+                identity.h_allocation,
+                identity.venus_res_id,
+                identity.geometry.width,
+                identity.geometry.height,
+                identity.geometry.dxgi_format,
+            );
+        }
+        return;
+    };
+
+    // ── the descriptor ──────────────────────────────────────────────────────
+    //
+    // ⛔ Written LAST and only once nothing above refused, so that every refusal
+    // path leaves the all-zero descriptor from the top of this function standing.
+    // An all-zero descriptor is unmistakably "the driver answered nothing", which is
+    // what `METHOD.md` §5's *"trusting a zero"* asks a reader to be able to tell
+    // apart from a half-filled one.
+    //
+    // SAFETY: `p_out` is non-null per the check above and `p_contexts`/`p_hw_queues`
+    // are each either null — `as_mut` then yields `None` — or the live out-struct the
+    // runtime allocated for this call. Every one of them was fully initialised by the
+    // zero-fill at the top of this function, so each field assignment below writes
+    // over a defined value.
+    unsafe {
+        if let Some(out) = p_out.as_mut() {
+            // Entry 0 only: `BroadcastSrcAllocation` is a 65-entry multi-GPU
+            // broadcast array and this adapter is single-node.
+            out.BroadcastSrcAllocation[0] = identity.h_allocation;
+            // ⛔ `BroadcastDstAllocation[0]` stays 0. A windowed present's
+            // destination is DWM's surface, named by the runtime and not by this
+            // driver; naming one here would be a claim about a resource this driver
+            // does not own.
+            //
+            // ⛔ `AddedGpuWork = FALSE`, and the reason is narrower than it looks.
+            // The flag is about GPU work **recorded into `hCommandList`**
+            // (`PRESENT.md` §3.4's *"optionally record GPU work into the given
+            // command list and set `AddedGpuWork`"*), and this body records nothing
+            // into it. ⚠ It does make a kernel submission — the UP-9 `pfnRenderCb`
+            // below — but that packet is already in dxgkrnl's FIFO for this very
+            // context by the time the runtime's own present is issued on it, so
+            // there is nothing left for the runtime to flush. TRUE would ask it to.
+            out.AddedGpuWork = 0;
+            // One back buffer per present. ⚠ **Unpriced** — see the counter's note:
+            // nothing in this driver has measured a runtime that wants anything
+            // else, and 1 is the value that means "no multiplicity", not a guess at
+            // one.
+            out.BackBufferMultiplicity = 1;
+            // The driver does not override the application's sync interval, so
+            // `SyncIntervalOverride` is left at the zero-fill's value.
+            out.SyncIntervalOverrideValid = 0;
+        }
+        if let Some(contexts) = p_contexts.as_mut() {
+            contexts.hContext = h_context;
+            // One adapter, one context. Broadcast is a multi-GPU shape and
+            // `BroadcastContext` stays zeroed with the count.
+            contexts.BroadcastContextCount = 0;
+        }
+        // ⛔ `p_hw_queues` is deliberately left exactly as the zero-fill wrote it:
+        // `BroadcastQueueCount = 0`, no handles. This driver refuses hardware queues
+        // at creation (`HwQRef`), so there is no handle it could legally name — and
+        // `D12-G5` measured this pointer non-NULL at `_0040` and NULL at `_0110`,
+        // which is why nothing here dereferences it.
     }
-    // ⛔ Every out-struct is left as the zeroed one written at the top: no allocation
-    // handle, and `BackBufferMultiplicity` deliberately NOT set to 1 either. Writing
-    // the scalars while withholding the handles would produce a descriptor that looks
-    // half-valid; an all-zero descriptor is unmistakably "the driver answered
-    // nothing", which is what `METHOD.md` §5's *"trusting a zero"* asks a reader to be
-    // able to tell apart.
 }
 
 /// Install L8's one device-core slot, `pfnGetPresentPrivateDriverDataSize`.
@@ -351,11 +413,21 @@ struct L8Refusals {
     /// `HeapPrimaryVenusExport` and `IdentityRecorded`, not against this counter
     /// alone.
     present_source_not_adopted: RefusalCounter,
-    /// ⛔⛔ **The blocker.** Every `pfnPresent` that got as far as needing the queue's
-    /// WDDM context and could not read it, because `QueueState::h_context` is private
-    /// to another lane's file. Expected non-zero on every present until that accessor
-    /// exists, and expected **0** afterwards; it is the counter that says whether the
-    /// one-line change landed.
+    /// The queue handle did not resolve to a live WDDM context.
+    ///
+    /// ⚠⚠ **RE-GRADED, and the old grading is written out so the change is not
+    /// silent.** It used to mean *"`QueueState::h_context` is private to another
+    /// lane's file and there is no accessor"* — a structural blocker, expected
+    /// non-zero on **every** present until [`queue::present_context`] landed. That
+    /// accessor exists now, so the counter no longer says anything about this
+    /// driver's own structure and instead means one of two runtime-facing things:
+    /// the handle did not resolve to a live `QueueState`, or its `h_context` was
+    /// null.
+    ///
+    /// ⛔ **Expected 0**, and both causes are unreachable by construction —
+    /// `create_wddm_context` fails the queue create on a null context, so a live
+    /// queue always has one. ⇒ a hit is a lifetime finding (a present on a
+    /// destroyed queue), not a missing feature.
     present_queue_context_unavailable: RefusalCounter,
 }
 
