@@ -3618,6 +3618,81 @@ silent on it:
   `pfnCreateVertexShader`, `pfnCreateComputeShader`, PSO create/destroy, root signature,
   command pool, `pfnMakeResident`, `pfnGetDebugAllocationInfo`. Those are **L6**, **L2**
   and **L4**, and driving them to zero is those lanes' definition of done
+- ⭐⭐ **S6 ROUND 1 IS COMPLETE (2026-08-06): four DDI lanes landed and
+  `D3D12 noop DDI hits:` reads `slots=0/206`.** Every one of the 25 slots the passing
+  `D12-G7` run hit now reaches a real body. Static coverage went **5/206 -> 105/206**
+  (device-core 98/124, command-queue **7/7**, command-list 0/75). Evidence:
+  `tmp/dx12/gates/G7-s6r1/RESULT.md`; commits `81cf82d` -> `1ce9939`.
+  - **L2+L7** (30 slots, `forward12/queue.rs` + `fence.rs`) — queues, command pools,
+    recorders, command lists, command signatures, fences, query heaps. ⭐ The WDDM-context
+    question is settled **decisively and not by the doc**: the runtime enforces the scoping
+    itself (*"CreateContextCb or CreateContextVirtualCb called outside of queue creation"*,
+    fullstrings:10597), so a lane that skips it makes the object **unobtainable for every
+    later lane**, L8's `pfnPresent` included. ⭐ And grepping the D3D11 driver confirmed
+    what its own context is FOR — every use of `HeliosDevice::context` is present-path
+    (`umd/src/forward/present.rs:786`), never submission — so §6.4's *"cardinality, not
+    kind"* is confirmed from source. ⚠ The context class is **legacy**, which forecloses
+    `pfnSubmitCommandCb`; the doc-set contradiction (D5/§9.2 say VIRTUAL) is recorded at the
+    site with its cost rather than left for L8.
+  - **L4** (16 slots, `forward12/resource12.rs`) — committed / heap / placed creates,
+    map/unmap, residency, the four introspection slots. Cross-process sharing
+    (`pfnOpenHeapAndResource`) refused with named counters: it is what discharges D3c and it
+    needs `helios_protocol` verbatim, which an in-process triangle does not.
+  - **L5** (15 slots, `forward12/descriptors.rs`) — heaps and all six view creates. ⭐ Found
+    the fifteenth slot (`pfnCreateSamplerFeedbackUnorderedAccessView`, appended late to the
+    `_0109` struct far from its siblings, which is why a reader counts 14). ⭐⭐ The
+    `ead692e` struct-return hazard is **CLEARED with both halves quoted**: vkd3d's
+    `resource.c:9146` takes a hidden out-pointer and windows-rs 0.58's vtable
+    (`Direct3D12/mod.rs:652`) declares exactly that — they agree, no shim.
+  - **L6** (38 slots, `forward12/pso.rs` + `shaders.rs`) — ⭐⭐ **the DDI's shader bytecode is
+    unusable by vkd3d as delivered.** It arrives as a bare `DxilProgramHeader` and three
+    engine readers reject a non-`'DXBC'` tag, so the lane **synthesises a DXBC container**.
+    `DDI_REFERENCE.md` §12.3 had left this open; the gate closed it — `L6ShaderDxbcContainerSeen=0`
+    on both shaders the runtime built. ⭐ And the `DepthBias` `INT`/`FLOAT` trap is resolved
+    **by never converting it**: the pipeline-state STREAM's `RASTERIZER2` keeps it a
+    `FLOAT`, which also carries mesh/amplification shaders the legacy struct cannot express.
+  - ⭐ **The fan-out shape worked, and the pre-VM adversarial pass paid for itself twice.**
+    Four lanes authored concurrently in isolated worktrees, each verified by an adversarial
+    refuter and repaired before merge: that caught two **blockers** (`Slot::clear()` on a
+    live heap; array-ness decided from `ArraySize` alone) and a missing null-descriptor arm
+    that would have met a **legal** D3D12 call with `pfnSetErrorCb`, i.e. device removal.
+    None of it cost a VM lease.
+  - ⭐ **The `PARALLEL.md` §10 lens review then found six more**: 7 reviewers, 27 raw
+    findings, **21 rejected** by an adjudicator that re-verified each against source. The
+    survivors included a **blocker** — `pfnDestroyHeapAndResource` freed a heap it did not
+    own, contradicting the create site's own guard, so the first `Release()` of any placed
+    resource tore down its live parent heap — and the one enum proof of 21 that compared
+    against a transcribed literal inside the block whose preamble says none are.
+- ⛔ **TWO counters were graded for a world that had ended, in one merge, and that is now a
+  thing to check rather than a coincidence.** L5's `ViewResourceUnavailable` still said
+  *"expected non-zero until L4 lands"* after L4 landed in the same batch — where every hit
+  now removes the device; and `DebugAllocationInfoEmpty` said *"a zero reading is the
+  finding"* and then read zero on a healthy run. **A counter's grading is a claim and it
+  goes stale like any other.** The first was caught by a reviewer, the second by the gate.
+- ⚠ **`pfnGetDebugAllocationInfo` went from 4 calls to 0** between the two `D12-G7` runs, on
+  otherwise byte-identical device creates (`Flags=0x0` both times). Why is **not
+  established** and is recorded as unknown: either the four calls were the runtime reacting
+  to the noop'd path (a zero-byte PSO private block), or the slot is debug-layer traffic
+  enabled some other way. A run with the debug layer deliberately on settles it.
+- ⭐ **`tools/umd12-slot-coverage.sh` is new**, and it exists because a slot with **two
+  owners is silent**: the install chain runs lanes in order over one table, so the later
+  wins and the earlier handler is unreachable — it compiles, both files look complete, both
+  lanes report the slot done. Now an exit code. ⚠ It was wrong three times in one sitting
+  (counted its own documentation; missed raw-pointer slots; missed rustfmt-wrapped
+  assignments) before the matcher was rebuilt to join continuation lines. Its two remaining
+  blind spots both over-report and are recorded at the site.
+- **Round 2, for `D12-G8` (a triangle, owner-visible):** the command-list table is **0/75**.
+  It needs **L3a** (draw, fixed function, IA/SO/OM), **L3b** (root arguments, descriptor
+  binding, clears), **L3c** (copy, resolve, barriers, queries) and **L8** (present — ⛔ not
+  parallelisable, and it touches the `HeliosPresentRenderCmd` identity channel shared with
+  the KMD and the D3D11 driver). ⚠ L6 routed one obligation to L3a:
+  `pfnSetPipelineState` must re-apply the PSO's baked depth bias and strip-cut even when the
+  PSO declares them dynamic — `SUBSTRATE.md` §4.5's *"precise inversion of the Vulkan mental
+  model"* — and `L6PsoDynamicStateFlagForwarded` counts the exposure until it does.
+- ⚠ **The deferred INF / cold-boot half of S5 is still deferred** and is now worth doing: the
+  DriverStore package carries no `helios_umd12.dll`, so a cold boot has no D3D12 UMD.
+  Harmless while `UmdD3D12` is off, and one reboot would validate a device that can actually
+  be created.
   (`PARALLEL.md` §9.2).
 - ⭐⭐ **THE FEATURE-LEVEL TARGET IS FL 12_1. FL 12_2 IS OUT OF SCOPE, AND THE BLOCKER
   IS WDDM, NOT CAPS** (owner, 2026-08-06). `DX12.md` **§4.4** is the ladder. FL 11_0 is
