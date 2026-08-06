@@ -75,6 +75,19 @@
 //! SLOTS, not with the feature level.** The level is raised when its floors
 //! happen to be met, which is a consequence, not a precondition.
 //!
+//! ⭐ **And read the converse, because it is where this file kept under-reporting:
+//! a substrate-backed cap with NO SLOT AT ALL needs no implementation work, so
+//! there is nothing to withhold it for.** Three were sitting at their absent
+//! values with no argument, no counter and no gap-list entry until 2026-08-07 —
+//! `VPAndRTArrayIndexFromAnyShaderFeedingRasterizerSupportedWithoutGSEmulation`,
+//! `WaveOps` and `Int64Ops`. All three are shader-side: vkd3d derives them from
+//! Vulkan features and dxil-spirv lowers the intrinsics, and a
+//! `pfn.*(Wave|Int64|ViewportArray|RenderTargetArray|ArrayIndex)` grep over
+//! `bindgen/cached/d3d12umddi.rs` returns nothing to implement. ⛔ A FALSE there is
+//! not the conservative answer, it is the **silent** one: `CheckFeatureSupport`
+//! returns a false negative, the application picks its own fallback, and no
+//! counter in this driver moves. Each field carries what its FALSE cost.
+//!
 //! ⚠ **The substrate is more capable than this file reports, and the remaining
 //! gaps are now specific rather than wholesale.** Measured on a live vkd3d device
 //! on this guest (`docs/dx12/baselines/d3d12-caps.csv`): SM **6.8**, RT tier 1_1,
@@ -82,7 +95,10 @@
 //! their slots are still noops, so this file still reports what the *driver* can
 //! do. As of 2026-08-06 that includes binding tier 3, heap tier 2, conservative
 //! raster 3, typed UAV load, ROVs, logic ops, `WriteBufferImmediate` and
-//! copy-queue timestamps — each with its slot evidence at the field.
+//! copy-queue timestamps — each with its slot evidence at the field — and as of
+//! 2026-08-07 the three slot-free shader caps below
+//! (`VPAndRTArrayIndexFromAnyShaderFeedingRasterizerSupportedWithoutGSEmulation`,
+//! `WaveOps`, `Int64Ops`), each with the argument that no slot exists at all.
 //!
 //! ⭐ **Consequence for FL 12_1, stated so the next lane does not re-derive it:**
 //! four of its five floors are now met — typed-UAV-load, binding tier >= 2, ROVs,
@@ -746,7 +762,48 @@ unsafe fn d3d12_options(a: &ddi12::D3D12DDIARG_GETCAPS, data_size: usize) -> Hre
         ConservativeRasterizationTier: v::CONSERVATIVE_RASTER_MAX,
         TiledResourcesTier: tiled_resources_tier(),
         CrossNodeSharingTier: v::CROSS_NODE_NONE,
-        VPAndRTArrayIndexFromAnyShaderFeedingRasterizerSupportedWithoutGSEmulation: 0,
+        // ⭐ RAISED 0 -> 1, 2026-08-07. Engine: 1 —
+        // `OPTIONS,VPAndRTArrayIndexFromAnyShaderFeedingRasterizerSupportedWithoutGSEmulation,1`
+        // (`baselines/d3d12-caps.csv:22`), measured on a live vkd3d device on this
+        // guest. `SUBSTRATE.md` §7.2b clause 3 and `research/R8-shaders-caps.md`'s
+        // options table reach the same verdict from the Vulkan capture.
+        //
+        // ⭐ **THERE IS NO SLOT TO IMPLEMENT, and that is checkable rather than
+        // asserted**: a `pfn.*(ViewportArray|RenderTargetArray|ArrayIndex)` grep over
+        // `bindgen/cached/d3d12umddi.rs` returns nothing. The cap is a *shader-side*
+        // statement — may a stage other than the GS write `SV_RenderTargetArrayIndex`
+        // / `SV_ViewportArrayIndex` — and vkd3d derives it from Vulkan alone:
+        // `d3d12_device_caps_init_feature_options` assigns it
+        // `vulkan_1_2_features.shaderOutputViewportIndex && ...shaderOutputLayer`,
+        // both `true` on this guest. Bytecode reaches vkd3d whole
+        // (`forward12/pso.rs`'s shader lane) and dxil-spirv lowers it, so the
+        // engine's own answer already encodes the whole question. Same shape as
+        // `ROVs` in [`shader_caps`].
+        //
+        // ⭐ **And the engine keeps enforcing it whatever this file reports.**
+        // `d3d12_device_validate_shader_meta` fails PSO creation for a shader
+        // carrying `VKD3D_SHADER_META_FLAG_USES_SHADER_VIEWPORT_INDEX_LAYER` when
+        // those two Vulkan features are absent — tested against vkd3d's *own* copy
+        // of the fact, not against this constant. ⇒ Raising the cap cannot admit an
+        // unbacked shader; it can only stop the runtime telling an application "no"
+        // about a backed one.
+        //
+        // ⛔ **WHAT FALSE COSTS, and why nothing here would show it.** With this
+        // FALSE the two system values may only be written from a **geometry
+        // shader**, so an engine routes every cubemap face and every shadow cascade
+        // through a GS emulation pass — one extra GS per layer, and the most
+        // expensive stage in this stack. The application takes that path on its own,
+        // out of a `CheckFeatureSupport` false negative: nothing is refused here, so
+        // **no counter in this driver moves**. That is the failure mode this cap
+        // family is silent in, in the opposite direction from `DECISIONS.md` §7.8's
+        // over-report.
+        //
+        // ⚠ It is an FL **12_2** floor (`DDI_REFERENCE.md` §11.5's eighteen), never
+        // a 12_1 one, so this raise moves no feature level and
+        // [`DRIVER_MAX_FEATURE_LEVEL`] is untouched — and the floor implication is
+        // one-directional (module doc): every string in the family rejects a cap for
+        // being too LOW at a declared level, never for exceeding it.
+        VPAndRTArrayIndexFromAnyShaderFeedingRasterizerSupportedWithoutGSEmulation: 1,
         // ⚠ Read from the shared constant, not written as a literal: the
         // per-format `OUTPUT_MERGER_LOGIC_OP` bit at the bottom of this file is
         // gated on the same value, and a driver that reports the cap FALSE
@@ -957,8 +1014,15 @@ unsafe fn architecture_info(a: &ddi12::D3D12DDIARG_GETCAPS, data_size: usize) ->
 /// > D3D12DDICAPS_TYPE_SHADER caps query` — strings:29
 ///
 /// so an all-zero answer fails device creation. The lane counts are filled
-/// even though `WaveOps` is FALSE, because it is **not established** that the
-/// check is gated on `WaveOps`.
+/// unconditionally, because it is **not established** that the check is gated on
+/// `WaveOps` — and as of 2026-08-07 `WaveOps` is TRUE, so the two now agree.
+///
+/// ⛔ **They did not agree before, and the disagreement is what raised it.** This
+/// function filled `WaveLaneCountMin` / `WaveLaneCountMax` / `TotalLaneCount` from
+/// the substrate and bumped `CapsTotalLaneCountGuess` for the third of them — the
+/// entire instrumentation cost of answering TRUE — while answering
+/// `WaveOps = FALSE`. A driver that pays for an answer and then reports its
+/// negation is describing two devices; the argument is at the field.
 ///
 /// ⚠ **`TotalLaneCount` is a known-wrong placeholder and is counted as one.**
 /// 32 x 32 is vkd3d's fallback; `DDI_REFERENCE.md` §11.7 records that it
@@ -1032,11 +1096,67 @@ unsafe fn shader_caps(a: &ddi12::D3D12DDIARG_GETCAPS, data_size: usize) -> Hresu
         // ⭐ See the doc above: no slot, engine reports 1, and the FL floor is
         // one-directional.
         ROVs: 1,
-        WaveOps: 0,
+        // ⭐ RAISED 0 -> 1, 2026-08-07. Engine: 1 — `OPTIONS1,WaveOps,1`
+        // (`baselines/d3d12-caps.csv:24`), sitting in the baseline directly above
+        // the three lane counts this function ALREADY reports:
+        // `OPTIONS1,WaveLaneCountMin,32` (`:25`), `OPTIONS1,WaveLaneCountMax,32`
+        // (`:26`), `OPTIONS1,TotalLaneCount,1024` (`:27`) — the same 32/32/1024
+        // written on the next three lines. The cap and its own operands came out of
+        // one measurement, and only the cap was being withheld.
+        //
+        // ⭐ **No slot, and none could exist.** Wave ops are SM 6.0 *DXIL
+        // intrinsics* — `WaveGetLaneIndex`, `WaveActiveSum`, the ballot family —
+        // lowered to SPIR-V `GroupNonUniform*` by dxil-spirv
+        // (`vkd3d-proton-helios/subprojects/dxil-spirv/opcodes/dxil/dxil_waveops.cpp`);
+        // the same grep as `d3d12_options`' `VPAndRTArrayIndex…` finds no `pfn*` in
+        // this DDI for any of them. vkd3d derives the cap in
+        // `d3d12_device_caps_init_feature_options1` as
+        // `max_shader_model >= D3D_SHADER_MODEL_6_0`, and [`shader_models`] below
+        // reports 6.0 — so this driver's own shader-model answer already asserts the
+        // thing this field was denying.
+        //
+        // ⛔ **WHAT FALSE COSTS.** GPU-driven culling, wave-level prefix sums and
+        // visibility-buffer resolves all probe this cap and fall back to
+        // groupshared-memory scans when it reads FALSE. Silent, and in the direction
+        // no counter here can see: `CheckFeatureSupport` returns a false negative,
+        // the application takes its own slow path, nothing is refused.
+        //
+        // ⚠ An FL **12_2** floor (`DDI_REFERENCE.md` §11.5), not a 12_1 one, so this
+        // raise moves no feature level. The floor implication is one-directional —
+        // module doc.
+        WaveOps: 1,
         WaveLaneCountMin: SUBGROUP_SIZE,
         WaveLaneCountMax: SUBGROUP_SIZE,
         TotalLaneCount: TOTAL_LANE_COUNT_GUESS,
-        Int64Ops: 0,
+        // ⭐ RAISED 0 -> 1, 2026-08-07. Engine: 1 — `OPTIONS1,Int64ShaderOps,1`
+        // (`baselines/d3d12-caps.csv:29`). ⚠ The API spells the field
+        // `Int64ShaderOps` and the DDI spells it `Int64Ops`: one cap, two names, so
+        // that row is read by name and never by position.
+        //
+        // ⭐ **No slot**, the same argument as `WaveOps` above: 64-bit integer ops
+        // are DXIL, lowered by dxil-spirv, and vkd3d derives the cap in
+        // `d3d12_device_caps_init_feature_options1` straight from
+        // `features2.features.shaderInt64` — `true` on this guest
+        // (`SUBSTRATE.md` §7.2b clause 5, `research/R8-shaders-caps.md`).
+        //
+        // ⭐ And vkd3d keeps enforcing it against its own copy:
+        // `d3d12_device_validate_shader_meta` fails PSO creation for a shader
+        // flagged `VKD3D_SHADER_META_FLAG_USES_INT64` when *its* `Int64ShaderOps` is
+        // FALSE. ⇒ This constant cannot admit an unbacked shader — only refuse a
+        // backed one.
+        //
+        // ⛔ **WHAT FALSE COSTS**: an application told 64-bit integer ops are absent
+        // emulates them with 32-bit pairs — the packed instance keys and wide
+        // bitmasks of the GPU-culling / visibility-buffer family — or declines the
+        // path outright. Silent, for the same reason as `WaveOps`.
+        //
+        // ⚠ **NOT one of the five SM 6.6 fields below.** `AtomicInt64OnTypedResource`,
+        // `AtomicInt64OnGroupShared`, `AtomicInt64OnDescriptorHeapResource`,
+        // `DerivativesInMeshAndAmplificationShaders` and `WaveMMATier` stay FALSE
+        // because the shader-model list stops at 6.0 (strings:116). `Int64Ops` is an
+        // SM 6.0 cap, which that same list reports — so raising it contradicts none
+        // of them.
+        Int64Ops: 1,
         Native16BitOps: 0,
         AtomicInt64OnTypedResource: 0,
         AtomicInt64OnGroupShared: 0,

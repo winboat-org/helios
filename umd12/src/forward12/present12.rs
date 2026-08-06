@@ -136,7 +136,7 @@ unsafe extern "C" fn get_present_private_driver_data_size(
 /// | `BroadcastSrcAllocation[0]` | the back buffer's `D3DKMT_HANDLE` | the UP-5 allocation, out of the `identity12` table |
 /// | `BroadcastDstAllocation[0]` | 0 | there is no destination allocation: a windowed present's destination is DWM's, named by the runtime and not by this driver |
 /// | `AddedGpuWork` | `FALSE` | ⛔ nothing is recorded into `hCommandList`. The UP-9 `pfnRenderCb` below is a **kernel** submission already in dxgkrnl's FIFO for the same context, not pending command-list work |
-/// | `BackBufferMultiplicity` | 1 | see the counter's note — **unpriced**, and instrumented for exactly that reason |
+/// | `BackBufferMultiplicity` | 1 | ⛔ an **output**, not a request: the D3D12 in-struct has no such field, so there is nothing to honour, refuse or count. See the field |
 /// | `SyncIntervalOverrideValid` | `FALSE` | the driver does not override the application's sync interval; `SyncIntervalOverride` is therefore left alone |
 /// | `_CONTEXTS.hContext` | the queue's WDDM context | [`queue::present_context`], the first of the module doc's two seams |
 /// | `_CONTEXTS.BroadcastContextCount` | 0 | one adapter, one context; broadcast is a multi-GPU shape |
@@ -509,10 +509,47 @@ unsafe extern "C" fn present(
             // context by the time the runtime's own present is issued on it, so
             // there is nothing left for the runtime to flush. TRUE would ask it to.
             out.AddedGpuWork = 0;
-            // One back buffer per present. ⚠ **Unpriced** — see the counter's note:
-            // nothing in this driver has measured a runtime that wants anything
-            // else, and 1 is the value that means "no multiplicity", not a guess at
-            // one.
+            // One back buffer per present. 1 is the value that *means* "no
+            // multiplicity" rather than a guess at one.
+            //
+            // ⛔ **It is an OUT field on an OUT-only struct, so there is no request
+            // here to honour or refuse.** `D3D12DDI_PRESENT_0051` is `_Out_` — the
+            // `PFND3D12DDI_PRESENT_0051` typedef, `PRESENT.md` §3.2 — and the entire
+            // IN struct `D3D12DDIARG_PRESENT_0001` has no multiplicity field: its
+            // twelve members are `phSurfacesToPresent` / `SurfacesToPresent`,
+            // `hDstResource` / `DstSubResourceIndex`, `Flags`, `FlipInterval`,
+            // `VidPnSourceID`, `pDirtyRects` / `DirtyRects`, the private-data pair
+            // and `OptimizeForComposition` (`bindgen/cached/d3d12umddi.rs`,
+            // `D3D12DDIARG_PRESENT_0001`). The runtime states no multiplicity to
+            // this DDI; the driver answers one.
+            //
+            // ⚠ **It is the D3D11 shape that misleads, and it is one struct away.**
+            // On the DXGI DDI the field is an *input*:
+            // `DXGI_DDI_ARG_PRESENT1::BackBufferMultiplicity` is a member of the arg
+            // struct and the shipping D3D11 driver reads it — `umd/src/forward/
+            // present.rs`'s `dxgi_present1`, forwarded into
+            // `probe_present1_multi_entry`. D3D12 moved the field to the out side,
+            // so the D3D11 intuition *"the runtime asks, we honour it or count the
+            // refusal"* does not transfer.
+            //
+            // ⛔⛔ **CORRECTED 2026-08-07: this comment and the table in the doc
+            // above both said the value was "unpriced, and instrumented for exactly
+            // that reason", and cited a counter that has never existed.**
+            // `L8Refusals` has no multiplicity field and `REFUSALS` no such entry.
+            // Nor could one be added honestly: a counter for *"the runtime asked for
+            // a multiplicity this driver does not honour"* can never move, because
+            // the DDI gives the runtime no way to ask. Its permanent zero would then
+            // be read as *"nobody ever wanted anything else"* — `METHOD.md` §5's
+            // *"trusting a zero"*, pre-installed into a comment instead of arrived
+            // at by accident. ⇒ The instrument claim is deleted rather than
+            // implemented, and this paragraph is what stands in its place.
+            //
+            // ⚠ So what WOULD price it is not a counter: a swapchain whose presents
+            // each look correct while its buffer rotation does not, on a runtime
+            // that expected the driver to claim more than one physical buffer per
+            // logical back buffer. That is a measurement against the screen
+            // (CLAUDE.md rule 6), and no instrument at this slot can stand in for
+            // it.
             out.BackBufferMultiplicity = 1;
             // The driver does not override the application's sync interval, so
             // `SyncIntervalOverride` is left at the zero-fill's value.
