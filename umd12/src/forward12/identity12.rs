@@ -17,12 +17,21 @@
 //! `pfnPresent`, `pfnCheckResourceAllocationHandle` and the unwind path all need
 //! the same record.
 //!
-//! ⛔ **Inert at UP-4, deliberately.** Nothing consumes this table. UP-5 is the
-//! commit that calls `pfnAllocateCb`, and `DECISIONS.md` §7.1's standing rule is
-//! that a refusal stops refusing in the same commit that makes its body
-//! reachable — so the allocation path is not written here, and the two integer
-//! halves this table has no way to fill yet are filled with zero **and counted**
-//! rather than guessed (see *What is unresolved*, below).
+//! ⚠ **No longer inert, and the entry condition changed with it.** At UP-4 nothing
+//! consumed this table and every entry's `vk_memory`/`venus_res_id` halves were 0
+//! and counted. UP-5 landed the `pfnAllocateCb` call, and the rule is now stronger
+//! than "filled in": **an entry exists if and only if this driver owns a WDDM
+//! allocation for that resource**. [`record`] is called only after the callback
+//! returned a handle, so
+//!
+//! * `h_allocation != 0` on every recorded entry — a partially-resolved identity is
+//!   no longer representable in the table, it is a refusal at the create;
+//! * `pfnDestroyHeapAndResource` must `pfnDeallocateCb` exactly the entries
+//!   [`take`] hands back, which makes the deallocate unconditional rather than
+//!   gated on a second flag that could disagree with the table;
+//! * `IdentityRecorded − IdentityRemoved` is therefore both the live-entry count
+//!   **and** the live WDDM-allocation count, so the 54th session's leak class is
+//!   one subtraction away rather than needing its own instrument.
 //!
 //! # ⛔ D13: this table is NOT shared private data
 //!
@@ -62,7 +71,7 @@
 //! usize`. This module holds **no** COM reference and performs **no** load
 //! through that value: it is an identity token compared with `==`, nothing more.
 //! The owning reference lives in `ResourceState`, whose box outlives every entry
-//! by construction — [`remove`] is called from `pfnDestroyHeapAndResource` while
+//! by construction — [`take`] is called from `pfnDestroyHeapAndResource` while
 //! that box is still alive, before it is dropped.
 //!
 //! ⚠ **The hazard an address key has, and how it is closed.** COM object
@@ -72,7 +81,7 @@
 //! the wrong memory — a silent wrong answer, the class this project treats as
 //! worse than a failure. Two things close it, and both are counted:
 //!
-//! * [`remove`] on every `pfnDestroyHeapAndResource` whose resource block
+//! * [`take`] on every `pfnDestroyHeapAndResource` whose resource block
 //!   resolved, so the normal path leaves nothing behind. `IdentityRecorded`
 //!   minus `IdentityRemoved` is the live-entry count and therefore a leak
 //!   detector that needs no extra instrument.
@@ -82,31 +91,36 @@
 //!   stale entry is replaced by the live one (correct) *and* the failure is
 //!   visible (loud), instead of the new resource inheriting the old memory.
 //!
-//! # What is unresolved at UP-4, and why it is zero rather than wrong
+//! # ⛔ The second collision, and it is not the same one
 //!
-//! | field group | needs | status |
-//! |---|---|---|
-//! | `vk_memory` / `memory_offset` / `memory_size` / `memory_type_index` | `ID3D12DXVKInteropDevice4::GetVulkanResourceMemoryInfo`, reached through a new `bridge12` entry point | **0** — the vkd3d method exists (UP-2) but no C++ bridge accessor calls it yet |
-//! | `venus_res_id` / `venus_alloc_size` | the venus ICD's `helios_venus_memory_res_id` / `helios_venus_memory_alloc_info` exports, reached through the process ICD anchor | **0** — `umd12`'s bridge resolves the anchor for `venus_context_id()` alone (`umd_common/bridge/bridge_icd_anchor.h`); it exposes no memory-identity accessor |
+//! [`RecordOutcome::ResIdShared`] is a *refusal*, not a replacement, and it is what
+//! keeps buffer rotation honest. Two live D3D12 resources sharing one
+//! `venus_res_id` means the engine suballocated them out of one `VkDeviceMemory`;
+//! every WDDM allocation would then name the same host resource and an N-buffered
+//! swapchain would present one surface. That is the 56th session's *"scanout pinned
+//! to ONE resource"* class by a new route, and the table is the only place in the
+//! driver that can see all the live ids at once — so the check lives here and the
+//! caller unwinds. `VKD3D_HEAP_FLAG_HELIOS_VENUS_EXPORT`'s dedicated allocation is
+//! what makes the refusal unreachable; this is the assertion that it worked.
 //!
-//! ⛔ Neither is stubbed silently: `record`'s caller bumps
-//! `IdentityVkMemoryUnresolved` and `IdentityVenusUnresolved` for every entry
-//! whose respective half is zero, so "the table is populated" and "the table is
-//! *usefully* populated" are different, readable numbers. While either counter
-//! equals `IdentityRecorded`, UP-5 cannot be reached at all — an
-//! `adopt_resource_id` of 0 is precisely what makes the KMD treat an allocation
-//! as *create*, not *adopt* (`protocol/src/wddm.rs:131-138`).
+//! # `ctx_id`, and why the field that *was* absent is now present
 //!
-//! ⚠ **`ctx_id` is deliberately absent**, and it is not an oversight to fix by
-//! adding a field. `HeliosWddmAllocPrivate` needs one, and the only value
-//! `umd12` can currently obtain is `HeliosVkd3dDevice::venus_context_id()`,
-//! which reads the ICD's **process-global** `helios_current_ctx_id`.
-//! `bridge_icd_anchor.h` states the rule outright: *"evidence only. Never stamp
-//! an identity with this value"* — it is last-writer-wins across instances, so a
-//! concurrent instance create can replace it. UP-5 has to obtain a real
-//! `VkInstance`-scoped id (`helios_venus_instance_ctx_id`) before it may stamp
-//! one, and putting the wrong one in this table now is how it would end up
-//! stamped by accident.
+//! ⚠ This block used to say `ctx_id` was *"deliberately absent"* because the only
+//! value `umd12` could obtain was `HeliosVkd3dDevice::venus_context_id()`, which
+//! reads the ICD's **process-global** `helios_current_ctx_id` — and
+//! `bridge_icd_anchor.h` says of it: *"evidence only. Never stamp an identity with
+//! this value"*, because it is last-writer-wins across instances. That reasoning
+//! was right and its conclusion has been discharged rather than overturned: the
+//! bridge now also captures `helios_venus_instance_ctx_id` at device create, on the
+//! creating thread, and **that** is the value stored here. The forbidden one is
+//! still not stamped; both are read so that a disagreement between them is a log
+//! line rather than a silent wrong id.
+//!
+//! ⚠ A `ctx_id` of 0 is legal and counted. The KMD's adopt path never reads it —
+//! `helios_protocol::classify` reaches `AdoptedUmdResource` from
+//! `adopt_resource_id` alone — so it travels only into
+//! `HeliosWddmOpenIdentity::ctx_id`, which that record's own doc calls *"diagnostic
+//! only"*. Refusing a create over a diagnostic would be the wrong severity.
 
 use std::sync::{Mutex, MutexGuard};
 
@@ -182,6 +196,44 @@ pub(crate) struct PresentableIdentity {
     /// The `memoryTypeIndex` of `vk_memory`, which a cross-process opener must
     /// import with (`protocol/src/wddm.rs:233-236`).
     pub(crate) memory_type_index: u32,
+    /// The `D3DKMT_HANDLE` `pfnAllocateCb` minted for this resource (UP-5).
+    ///
+    /// ⭐ **This is the field the whole table exists to hold**, and it is what
+    /// `pfnCheckResourceAllocationHandle` (UP-6) and `pfnPresent`'s
+    /// `BroadcastSrcAllocation[0]` (UP-7) answer with. Never 0 on a recorded
+    /// entry: [`record`] is called only after the callback succeeded, so an entry
+    /// exists **iff** this driver owns a WDDM allocation for the resource — which
+    /// is also what makes `pfnDeallocateCb` on the destroy path unconditional
+    /// rather than conditional on a second flag.
+    pub(crate) h_allocation: u32,
+    /// The `hKMResource` the same callback returned, or 0.
+    ///
+    /// ⚠ Recorded but **not** used to deallocate. The wire contract is *either*
+    /// `hResource` *or* `NumAllocations`+`HandleList`, never both
+    /// (`umd/src/forward/state.rs:90-105`: both together is `E_INVALIDARG`, and
+    /// that is a measured 0x80070057 rather than a reading of the header), and
+    /// this driver deallocates by handle list. It is kept because it is the only
+    /// evidence that dxgkrnl created a kernel *resource* object for the
+    /// allocation, which a cross-process opener needs and a shared surface's
+    /// absence of would explain.
+    pub(crate) h_km_resource: u32,
+    /// The runtime's `D3D12DDI_HRTRESOURCE::handle` for this resource, as an
+    /// integer.
+    ///
+    /// ⛔ **An identity token, never dereferenced**, exactly like
+    /// [`Self::engine_resource`]. It is kept for one reason: `pfnDeallocateCb`'s
+    /// legal `hResource` form needs it at destroy time, and
+    /// `pfnDestroyHeapAndResource` is handed only the *driver* handles. Storing it
+    /// here rather than in `ResourceState` keeps that block write-once, and it lives
+    /// exactly as long as the allocation it releases.
+    pub(crate) h_rt_resource: usize,
+    /// The venus context id stamped into `HeliosWddmAllocPrivate::ctx_id`.
+    ///
+    /// ⛔ The **instance-scoped** one (`helios_venus_instance_ctx_id`), never the
+    /// process-global `helios_venus_current_ctx_id` — see
+    /// `bridge12::BridgeDevice12::venus_instance_context_id`. 0 is legal and
+    /// counted: the KMD's adopt path never reads it.
+    pub(crate) ctx_id: u32,
     pub(crate) geometry: IdentityGeometry,
     /// The raw `D3D12DDI_HEAP_FLAGS` word the create arrived with.
     ///
@@ -206,6 +258,24 @@ pub(crate) enum RecordOutcome {
     Replaced,
     /// The table is full and the identity was **dropped**.
     TableFull,
+    /// ⛔⛔ **A DIFFERENT live resource already claims this `venus_res_id`**, so the
+    /// engine suballocated two D3D12 resources out of one `VkDeviceMemory` and the
+    /// identity was **refused**.
+    ///
+    /// ⭐ This is the rotation-collapse detector, and it is the reason the check
+    /// lives in the table rather than at the call site: buffer rotation is *free*
+    /// on this design — each `GetBuffer(i)` is a distinct `ID3D12Resource`, so N
+    /// back buffers are N allocations — but only while N venus resource ids are N
+    /// different numbers. If they shared one, every WDDM allocation would name the
+    /// same host resource and the whole swapchain would present one surface: the
+    /// 56th session's *"scanout pinned to ONE resource"* class, reached by a new
+    /// route. `VKD3D_HEAP_FLAG_HELIOS_VENUS_EXPORT`'s dedicated allocation is what
+    /// prevents it; this is the assertion that it worked, in the one place that can
+    /// see all the live ids at once.
+    ResIdShared {
+        /// The engine resource that already holds the id.
+        holder: usize,
+    },
 }
 
 /// How many presentable identities the table holds.
@@ -213,7 +283,7 @@ pub(crate) enum RecordOutcome {
 /// ⛔ Bounded on purpose (CLAUDE.md rule 2: loud failure over silent
 /// truncation). The number is derived, not picked: `DXGI_MAX_SWAP_CHAIN_BUFFERS`
 /// is 16, so 64 is four fully-buffered swapchains live in one process at once.
-/// At `size_of::<PresentableIdentity>()` ≈ 80 bytes that is ~5 KiB of process
+/// At `size_of::<PresentableIdentity>()` ≈ 96 bytes that is ~6 KiB of process
 /// lifetime data, which is not worth a heap allocation or a `HashMap` — and a
 /// fixed array is what lets the table be a plain `static` with no lazy
 /// initialisation on a free-threaded DDI path.
@@ -257,7 +327,27 @@ fn identities() -> MutexGuard<'static, [Option<PresentableIdentity>; MAX_PRESENT
 pub(crate) fn record(identity: PresentableIdentity) -> RecordOutcome {
     let mut table = identities();
 
-    // ⛔ The collision scan comes FIRST and completes before any insertion. A
+    // ⛔ THE RES-ID SCAN COMES BEFORE ANY WRITE, and it is a refusal rather than a
+    // replacement. A shared `venus_res_id` is not a stale entry to overwrite -- both
+    // resources are live and both would name one host resource -- so the correct
+    // action is to refuse the second identity and let the caller unwind its
+    // allocation. ⚠ Only a non-zero id can collide: `record` is only reached with a
+    // resolved identity, but the guard is written anyway because a zero id is the
+    // one value that would otherwise match every unresolved entry a future caller
+    // might add.
+    if identity.venus_res_id != 0 {
+        for existing in table.iter().flatten() {
+            if existing.venus_res_id == identity.venus_res_id
+                && existing.engine_resource != identity.engine_resource
+            {
+                return RecordOutcome::ResIdShared {
+                    holder: existing.engine_resource,
+                };
+            }
+        }
+    }
+
+    // ⛔ The address-collision scan comes next and completes before any insertion. A
     // single pass that inserted into the first free slot it met would, on a
     // colliding key held in a *later* slot, leave two entries for one address --
     // and then `remove` would clear one and `IdentityRemoved` would under-count
@@ -278,18 +368,46 @@ pub(crate) fn record(identity: PresentableIdentity) -> RecordOutcome {
     RecordOutcome::TableFull
 }
 
-/// Drop the entry for `engine_resource`, if there is one.
+/// The recorded identity for `engine_resource`, if there is one.
 ///
-/// Returns whether an entry was removed, which is how the caller distinguishes
-/// "this destroy retired an identity" from the ordinary case of destroying a
-/// resource that was never presentable.
-pub(crate) fn remove(engine_resource: usize) -> bool {
+/// ⚠ Returns a **copy**, taken under the lock and never a reference into the
+/// table: the entry may be removed by a concurrent `pfnDestroyHeapAndResource` on
+/// another thread the instant the lock is dropped (D3D12 DDIs are FREETHREADED),
+/// so a borrow would be a use-after-free waiting for a scheduler. Every consumer
+/// wants two integers anyway.
+///
+/// ⛔ **The copy is a snapshot, and callers must not treat it as a liveness
+/// claim.** `pfnCheckResourceAllocationHandle` and `pfnPresent` are both called by
+/// the runtime for a resource it is holding, so the resource cannot be destroyed
+/// under them — that is the runtime's own object-lifetime guarantee, not something
+/// this table provides.
+pub(crate) fn lookup(engine_resource: usize) -> Option<PresentableIdentity> {
+    let table = identities();
+    table
+        .iter()
+        .flatten()
+        .find(|existing| existing.engine_resource == engine_resource)
+        .copied()
+}
+
+/// Take the entry for `engine_resource`, if there is one.
+///
+/// Returns the removed record, which is how the caller distinguishes "this destroy
+/// retired an identity" from the ordinary case of destroying a resource that was
+/// never presentable — **and** how it learns which `D3DKMT_HANDLE` to hand
+/// `pfnDeallocateCb`.
+///
+/// ⭐ **Take, not read-then-remove**, and the atomicity is the point: the slot is
+/// cleared under the same lock acquisition that reads it, so two concurrent
+/// destroys of one resource cannot both come away with the handle and deallocate it
+/// twice. A `lookup` + `remove` pair would have that race, and a double
+/// `pfnDeallocateCb` is a kernel-handle double free.
+pub(crate) fn take(engine_resource: usize) -> Option<PresentableIdentity> {
     let mut table = identities();
     for slot in table.iter_mut() {
         if slot.is_some_and(|existing| existing.engine_resource == engine_resource) {
-            *slot = None;
-            return true;
+            return slot.take();
         }
     }
-    false
+    None
 }

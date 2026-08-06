@@ -108,16 +108,26 @@
 //! first lane that needs a crossing record adds it, and says so"* is discharged
 //! **here**: `umd12/Cargo.toml` takes it, and this is the saying-so.
 //!
-//! ⚠ What is NOT yet true, stated so nothing reads more into the dependency than
-//! it carries: **nothing in this crate calls `pfnAllocateCb` yet.** That is UP-5.
-//! `pfnCheckResourceAllocationHandle` still answers 0 and still counts
-//! (`ResourceAllocationHandleUnavailable`), and `pfnOpenHeapAndResource` and its
-//! sizing call are still refused — see [`open_heap_and_resource`] for exactly
-//! what is missing and why. UP-1 takes the dependency and deletes the claim that
-//! it is not needed; it adds no writer and no reader of its own. The size and
-//! layout asserts are not restated either — `protocol/src/wddm.rs:483-501`
-//! already carries all of them, and a second copy of an assert is a second thing
-//! that can drift.
+//! ⚠ **This block's own "what is NOT yet true" note is now discharged**, and the
+//! reversal is recorded rather than quietly edited. It said *"nothing in this crate
+//! calls `pfnAllocateCb` yet. That is UP-5."* UP-5 has landed:
+//! [`adopt_presentable`] calls it for every resource the runtime declares a
+//! `PRIMARY`, [`deallocate_adopted`] releases the handle in
+//! [`destroy_heap_and_resource`], and [`check_resource_allocation_handle`] answers
+//! with the real `D3DKMT_HANDLE` instead of 0.
+//!
+//! ⚠ Still not true, and stated so nothing reads more into the above than it
+//! carries: `pfnOpenHeapAndResource` and its sizing call are **still refused** — see
+//! [`open_heap_and_resource`] for exactly what is missing and why — and that is the
+//! *other* direction of D3c, not this one. Rung 1 does not need it: DWM opens the
+//! app's back buffer through `helios_umd.dll`'s existing D3D11 `pfnOpenResource`
+//! reading `HeliosWddmOpenIdentity`, which the KMD stamps for an adopted allocation
+//! with no change on either side. The size and layout asserts for the shared records
+//! are not restated either — `protocol/src/wddm.rs:483-501` already carries all of
+//! them, and a second copy of an assert is a second thing that can drift.
+//! [`AdoptedAllocPrivate`]'s own asserts are a *different* claim: not the records'
+//! sizes but their **adjacency**, which is what the KMD's trailer reader depends on
+//! positionally and which nothing else pins.
 //!
 //! The per-object `pDrvPrivate` payloads below ([`HeapState`], [`ResourceState`])
 //! are runtime-allocated, per-object, per-process and read by nothing outside
@@ -131,12 +141,14 @@
 //! * **Reserved (tiled) resources** — refused, because `caps12.rs:278` reports
 //!   `TiledResourcesTier = NOT_SUPPORTED` and creating one would contradict the
 //!   caps this device was accepted on.
-//! * **Kernel allocation identity** (`pfnCheckResourceAllocationHandle`) —
-//!   answered 0 with a counter; there is still no `D3DKMT_HANDLE` to give.
-//!   ⚠ UP-4 adds the *bookkeeping* for one ([`identity12`], written by
-//!   [`note_presentable_identity`] and retired by [`destroy_heap_and_resource`])
-//!   but not the handle: minting it is UP-5's `pfnAllocateCb` call, and UP-6 is
-//!   what makes this slot answer with it.
+//! * **Kernel allocation identity for anything that is NOT a primary**
+//!   (`pfnCheckResourceAllocationHandle` answers 0 with a counter). ⚠ Since UP-5 a
+//!   `PRIMARY` resource *does* have a handle — [`adopt_presentable`] mints it, the
+//!   [`identity12`] table keeps it, and [`destroy_heap_and_resource`] releases it —
+//!   so the 0 is now the honest answer for the class that has no kernel allocation
+//!   rather than for every resource. `DDI_REFERENCE.md` §9.7's *"pure passthrough
+//!   with no `pfnAllocateCb` is not viable"* is discharged for the class that needed
+//!   it.
 //!
 //! Each is a named counter, never a silent stub (CLAUDE.md rule 2).
 
@@ -178,6 +190,51 @@ use super::identity12;
 use super::tables12::{stage, DeviceCoreTable, Filling};
 use crate::device12::{self, HeliosD3D12Device};
 use crate::{ddi12, log_error, note_refusal};
+
+/// ⛔ **The one `D3D12_HEAP_FLAGS` bit in this file that the D3D12 API does not
+/// define**, and the channel that makes a committed texture adoptable at all.
+///
+/// It asks the vkd3d fork for two properties on the resource's `VkDeviceMemory`:
+/// **exportable**, which is what makes the Mesa venus ICD assign it a virtio
+/// resource id (`vn_device_memory_alloc` takes its export arm only when
+/// `export_handle_types` is non-zero, and only that arm sets `base_bo`, so
+/// `helios_venus_memory_res_id` answers 0 for anything else), and **dedicated at
+/// offset 0**, without which N swapchain buffers could share one venus resource id
+/// and buffer rotation would collapse onto a single surface.
+///
+/// ⛔ **The authority for this value is the fork**, `vkd3d-proton-helios/libs/vkd3d/
+/// vkd3d_private.h`'s `VKD3D_HEAP_FLAG_HELIOS_VENUS_EXPORT`, where the whole
+/// argument lives. This is a mirror, kept in sync by hand, because the
+/// `D3D12_HEAP_FLAGS` word is the only channel between the two and neither side can
+/// include the other's header — the same arrangement as `HELIOS_VKD3D_FENCE_*` in
+/// `umd12/bridge/vkd3d_bridge.h`. ⚠ A drift is not silent: the fork would take no
+/// export arm, the memory would have no venus resource, and
+/// `IdentityVenusUnresolved` would count every primary create while
+/// `HeapPrimaryVenusExport` counted the same number of translations.
+///
+/// `1 << 30` is above every value `D3D12_HEAP_FLAGS` defines (the highest is
+/// `TOOLS_USE_MANUAL_WRITE_TRACKING`, `0x2000`), and vkd3d's `validate_heap_desc`
+/// rejects no unknown bits.
+const HELIOS_HEAP_FLAG_VENUS_EXPORT: D3D12_HEAP_FLAGS = D3D12_HEAP_FLAGS(1 << 30);
+
+/// What [`heap_flags`] should do with `D3D12DDI_HEAP_FLAG_PRIMARY`.
+///
+/// ⭐ A parameter and not a constant, because the answer is genuinely per-arm and
+/// the two arms are in different files' worth of contract. On the **committed** arm
+/// the primary declaration can be honoured — there is an `ID3D12Resource` to give a
+/// kernel allocation to — so the flag is translated into
+/// [`HELIOS_HEAP_FLAG_VENUS_EXPORT`]. On the **heap-only** arm there is no resource,
+/// `ResourceHeaps.md:897` says that combination should not exist, and the fork would
+/// silently ignore the export bit on a bare `CreateHeap` (nothing in
+/// `vkd3d_allocate_heap_memory` reads it) — so passing it there would be a request
+/// this driver knows is dropped, which is the shape CLAUDE.md rule 2 forbids.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PrimaryTranslation {
+    /// Translate `PRIMARY` into the fork's private venus-export bit.
+    VenusExport,
+    /// Drop it and count `HeapPrimaryFlagDropped`.
+    Dropped,
+}
 
 /// Short aliases for the bindgen enumerator names, which arrive doubled because
 /// bindgen prefixes each constant with its enum's name and the SDK header
@@ -241,7 +298,7 @@ mod v {
     /// enum appears in exactly one function-pointer family
     /// (`d3d12umddi.rs:51734`, `:59866`, `:75022`, `:76696`, `:79414`,
     /// `:87548`), and `D3D12DDIARG_CREATERESOURCE_0109` has no field of the
-    /// type. See [`super::note_presentable_identity`].
+    /// type. See [`super::adopt_presentable`].
     pub(super) const RESOURCE_OPT_PRIMARY: D3D12DDI_RESOURCE_OPTIMIZATION_FLAGS =
         D3D12DDI_RESOURCE_OPTIMIZATION_FLAGS_D3D12DDI_RESOURCE_OPTIMIZATION_FLAG_PRIMARY;
 
@@ -434,17 +491,34 @@ struct ResourceState {
     owns_heap_block: bool,
 }
 
-// ⚠ **`D3D12DDI_HRTRESOURCE` is deliberately NOT a field**, and the omission is
-// a rule rather than an oversight. `DDI_REFERENCE.md` §7.3(3) says *"the `hRT`
-// must be stored -- it is the token every callback about that object takes"*,
-// and it names the callbacks that make that true: `pfnCreateContextCb` takes an
-// `HRTCOMMANDQUEUE`, `pfnSetCommandListErrorCb` takes an `HRTCOMMANDLIST`.
-// **Nothing in the corelayer or kernel callback tables takes an
-// `HRTRESOURCE`**, so a field holding it would be written once and read never --
-// which is R908's shape exactly, and `PARALLEL.md` §10 forbids the
-// `#[allow(dead_code)]` that would otherwise silence it. The lane that finds a
-// resource callback needing the runtime handle adds the field then, with a
-// reader.
+// ⚠⚠ **`D3D12DDI_HRTRESOURCE` is still not a field of `ResourceState`, but the RULE
+// that said it never could be is FALSE and is corrected here.**
+//
+// This block used to read: *"`DDI_REFERENCE.md` §7.3(3) says the `hRT` must be
+// stored -- it is the token every callback about that object takes -- and it names
+// the callbacks that make that true: `pfnCreateContextCb` takes an
+// `HRTCOMMANDQUEUE`, `pfnSetCommandListErrorCb` takes an `HRTCOMMANDLIST`. **Nothing
+// in the corelayer or kernel callback tables takes an `HRTRESOURCE`**, so a field
+// holding it would be written once and read never."*
+//
+// The premise's last clause is wrong. `D3D12DDICB_ALLOCATE_0022::hResource` is a
+// `HANDLE` at offset 16 (`d3d12umddi.rs:60044-60051`) and it takes exactly that
+// token, and D3D11's own path states that the association is *"not optional for
+// present-only allocations"* (`umd/src/forward/resource.rs:364-370`) -- which is what
+// a presentable back buffer is. `D3D12DDICB_DEALLOCATE_0022::hResource` takes it
+// again on the way out.
+//
+// ⇒ UP-5 threads the handle from `pfnCreateHeapAndResource` into
+// [`adopt_presentable`], which runs *inside* that DDI while the parameter is live, so
+// it never needs to be stored on the resource at all. What does need it later is the
+// paired `pfnDeallocateCb`, and that is kept in the [`identity12`] table beside the
+// allocation handle it releases -- for the two reasons that table exists rather than
+// a field: `ResourceState` is written once and never mutated, and the entry's
+// lifetime is the allocation's rather than the resource's.
+//
+// ⛔ So the conclusion survives for `ResourceState` and the reasoning does not. A
+// lane that needs the runtime handle for a *third* purpose must re-derive from the
+// callback that takes it, not from this block's old claim that none does.
 
 // ---------------------------------------------------------------------------
 // Slot access — the D3D12 soundness argument, RE-DERIVED
@@ -657,10 +731,20 @@ fn cpu_page_property(prop: ddi12::D3D12DDI_CPU_PAGE_PROPERTY) -> D3D12_CPU_PAGE_
 /// therefore the only channel by which this driver can learn it is building the
 /// thing that reaches the scanout, and dropping it into an aggregate this lane's
 /// own evidence contract grades *"non-zero OK"* would hide a demoted primary
-/// behind two genuinely benign bits. It gets its own counter, expected 0 until
-/// L8's present path consumes it, so the aggregate can honestly stay "non-zero
-/// OK" and the one bit that changes the present path is visible on its own.
-fn heap_flags(flags: ddi12::D3D12DDI_HEAP_FLAGS) -> D3D12_HEAP_FLAGS {
+/// behind two genuinely benign bits.
+///
+/// ⭐ **At UP-5 it stopped being dropped on the committed arm.** `primary` selects
+/// the arm's behaviour: [`PrimaryTranslation::VenusExport`] turns the declaration
+/// into [`HELIOS_HEAP_FLAG_VENUS_EXPORT`], the fork's private request for
+/// exportable dedicated memory, which is the only way the resource can end up with
+/// a venus resource id for [`adopt_presentable`] to hand the kernel.
+/// [`PrimaryTranslation::Dropped`] keeps the old behaviour and the old counter, and
+/// is reachable only from the heap-only arm — where the declaration cannot be
+/// honoured at all.
+fn heap_flags(
+    flags: ddi12::D3D12DDI_HEAP_FLAGS,
+    primary: PrimaryTranslation,
+) -> D3D12_HEAP_FLAGS {
     let mut out = D3D12_HEAP_FLAG_NONE;
     if flags & v::HEAP_ALLOW_BUFFERS == 0 {
         out |= D3D12_HEAP_FLAG_DENY_BUFFERS;
@@ -672,15 +756,32 @@ fn heap_flags(flags: ddi12::D3D12DDI_HEAP_FLAGS) -> D3D12_HEAP_FLAGS {
         out |= D3D12_HEAP_FLAG_DENY_RT_DS_TEXTURES;
     }
     if flags & v::HEAP_PRIMARY != 0 {
-        L4_REFUSALS.heap_primary_flag_dropped.bump();
-        let n = L4_REFUSALS.heap_primary_flag_dropped.get();
-        if n <= LOG_BUDGET {
-            log_error!(
-                "L4: D3D12DDI_HEAP_FLAG_PRIMARY arrived -- this heap declares the swapchain \
-                 primary and is being created as an ordinary CUSTOM heap, because the API has \
-                 no counterpart bit. The FACT is not lost: on the committed arm \
-                 note_presentable_identity records it in the identity table (UP-4) (x{n})"
-            );
+        match primary {
+            PrimaryTranslation::VenusExport => {
+                out |= HELIOS_HEAP_FLAG_VENUS_EXPORT;
+                L4_REFUSALS.heap_primary_venus_export.bump();
+                let n = L4_REFUSALS.heap_primary_venus_export.get();
+                if n <= LOG_BUDGET {
+                    log_error!(
+                        "L4: D3D12DDI_HEAP_FLAG_PRIMARY arrived on the committed arm -- \
+                         requesting exportable dedicated memory from the engine via the \
+                         private heap flag {:#x} so the resource gets a venus resource id \
+                         the kernel can adopt (x{n})",
+                        HELIOS_HEAP_FLAG_VENUS_EXPORT.0,
+                    );
+                }
+            }
+            PrimaryTranslation::Dropped => {
+                L4_REFUSALS.heap_primary_flag_dropped.bump();
+                let n = L4_REFUSALS.heap_primary_flag_dropped.get();
+                if n <= LOG_BUDGET {
+                    log_error!(
+                        "L4: D3D12DDI_HEAP_FLAG_PRIMARY arrived on an arm that cannot honour \
+                         it -- dropped, because there is no resource to give a kernel \
+                         allocation to (x{n})"
+                    );
+                }
+            }
         }
     }
     let unmapped = flags
@@ -1193,7 +1294,7 @@ unsafe fn create_heap_only(
     // heap"*, i.e. a primary is always the committed arm. If it ever arrives here
     // the UP-4 identity table cannot record it -- there is no `ID3D12Resource` to
     // key on -- so the primary would be silently unrecorded. Counted, not
-    // assumed away, because `note_presentable_identity`'s admission predicate
+    // assumed away, because `adopt_presentable`'s admission predicate
     // depends on the obligation holding.
     if a.Flags & v::HEAP_PRIMARY != 0 {
         note_refusal(&L4_REFUSALS.heap_primary_without_resource);
@@ -1222,7 +1323,7 @@ unsafe fn create_heap_only(
             VisibleNodeMask: a.VisibleNodeMask,
         },
         Alignment: a.Alignment,
-        Flags: heap_flags(a.Flags),
+        Flags: heap_flags(a.Flags, PrimaryTranslation::Dropped),
     };
 
     let mut heap: Option<ID3D12Heap> = None;
@@ -1329,79 +1430,495 @@ fn whole_heap_allocation_info(
     }
 }
 
-/// Record a `PRIMARY` committed resource in the UP-4 identity table.
+/// The private driver data one adopted D3D12 allocation carries into
+/// `pfnAllocateCb`.
 ///
-/// `KMD_IMPACT.md` §14a.3 UP-4. Called from [`create_committed`] only, because
-/// the primary declaration only reaches this driver there — see the three notes
-/// below.
+/// ⛔ **Both members are `helios_protocol`'s, byte for byte** (D13). What is
+/// declared here is only their **adjacency**, and that adjacency is itself the wire
+/// contract: the KMD reads `HeliosWddmAllocPrivate` at offset 0
+/// (`create_allocation.rs:2316-2324`) and then `read_standard_meta` looks for the
+/// trailer at offset 48, so the pair must be exactly 48 + 48 with no padding
+/// between. The `const _` block below asserts both, which is what makes this a
+/// checked layout rather than a hope.
 ///
-/// # ⛔ The admission predicate is `D3D12DDI_HEAP_FLAG_PRIMARY`, and it is the
-/// only per-create primary signal that exists
+/// ⚠ **A DUPLICATE, and it is named as one.** `umd/src/forward/state.rs:193-198`
+/// declares the identical pair as `RuntimeAllocPrivate`, crate-private to `umd`.
+/// Under D13 the *pair* belongs in `helios_protocol` alongside its two members, and
+/// the correct end state is one declaration there with both UMDs using it. That
+/// move is not made here because `protocol/` is outside this lane's ownership; it is
+/// reported as a debt instead of made silently, and the asserts below mean the
+/// duplicate cannot drift from the KMD's expectation without failing to compile.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct AdoptedAllocPrivate {
+    alloc: helios_protocol::HeliosWddmAllocPrivate,
+    meta: helios_protocol::HeliosWddmAllocMeta,
+}
+
+// ⛔ The two numbers the KMD's reader depends on positionally. `ddi12`'s module doc
+// states the rule these satisfy: bindgen's own assertions are self-consistent, so
+// "anything this crate depends on POSITIONALLY needs its own `const _` beside the
+// code that depends on it".
+const _: () = {
+    assert!(core::mem::size_of::<AdoptedAllocPrivate>() == 96);
+    assert!(core::mem::offset_of!(AdoptedAllocPrivate, alloc) == 0);
+    assert!(core::mem::offset_of!(AdoptedAllocPrivate, meta) == 48);
+};
+
+/// Give a `PRIMARY` committed resource a kernel allocation the KMD adopts, and
+/// record its identity.
 ///
-/// `SPECS.md` §9.7 from `ResourceHeaps.md:897`: the flag *is* the D3D12
-/// replacement for `DXGI_DDI_PRIMARY_DESC`, no primary description is ever passed
-/// to the UMD, and receiving it obliges the driver to create a resource
-/// simultaneously with the heap. So a primary is a **committed** create by
-/// construction, and this is the one place the fact arrives.
+/// `KMD_IMPACT.md` §14a.3 UP-5, on top of UP-2c's bridge accessors. This is the
+/// commit that makes the identity table mean something: the engine allocated the
+/// Vulkan memory, and this driver **adopts** it by calling `pfnAllocateCb` with
+/// `HeliosWddmAllocPrivate.adopt_resource_id = <venus resid>`. The KMD already
+/// accepts exactly that (`create_allocation.rs:2377-2379`: `kind == DEVICE_MEMORY &&
+/// adopt_resource_id != 0` → `AllocationBacking::AdoptedUmdResource`, with
+/// `write_open_identity` stamping `HeliosWddmOpenIdentity` back so DWM's D3D11
+/// opener works unchanged), so there is no new allocation shape and no new KMD verb.
 ///
-/// ⚠ **§14a.3's "second signal" is NOT available here, and that is a real
-/// mismatch rather than a naming difference.**
-/// `D3D12DDI_RESOURCE_OPTIMIZATION_FLAG_PRIMARY = 4` is a
-/// `D3D12DDI_RESOURCE_OPTIMIZATION_FLAGS` value, and that type appears on exactly
-/// one DDI slot family — `pfnCheckResourceAllocationInfo`, in every generation
-/// `_0003` through `_0109` (`umd12/bindgen/cached/d3d12umddi.rs:51734`, `:59866`,
-/// `:75022`, `:76696`, `:79414`, `:87548`). It is **not** a field of
-/// `D3D12DDIARG_CREATERESOURCE_0109` (`:87456-87473`, 16 fields, checked) and not
-/// a parameter of `pfnCreateHeapAndResource` or
-/// `pfnCalcPrivateHeapAndResourceSizes`. It arrives on a *sizing query* that
-/// carries a description and no handle, for a resource that does not exist yet,
-/// so it cannot be attributed to one. It is therefore **measured** rather than
-/// used: [`check_resource_allocation_info`] splits it out of the
-/// `ResourceOptimizationFlagsIgnored` aggregate into
-/// `ResourceOptimizationPrimary`, which is the instrument that says whether the
-/// signal arrives at all.
+/// # ⛔ Every failure fails the CREATE, and that is the contract rather than a
+/// severity choice
 ///
-/// ⛔ **And the first signal's arrival is UNMEASURED**, which is why the split
-/// above matters. §14a.3 states the trigger is *"already detected and counted:
-/// `D3D12DDI_HEAP_FLAG_PRIMARY = 16` arrives and is dropped"*. The detection is
-/// real; the arrival is not established. `HeapPrimaryFlagDropped` reads **0 in
-/// all 150** logged `umd12` runs in `tmp/`, and none of those was a swapchain
-/// workload, so the counter is untested rather than negative. If a real D3D12
-/// present run leaves `HeapPrimaryFlagDropped` at 0 while
-/// `ResourceOptimizationPrimary` is non-zero, then the heap flag is not this
-/// runtime's channel and UP-5's predicate has to change — most plausibly to
-/// latching the PRIMARY-flagged sizing query's description and matching it at the
-/// next create. That correlation machinery is deliberately NOT written on
-/// speculation; the two counters decide whether it is needed.
-fn note_presentable_identity(
+/// The runtime declared this resource a primary
+/// (`D3D12DDI_HEAP_FLAG_PRIMARY`; `SPECS.md` §9.7 from `ResourceHeaps.md:897` — the
+/// flag alone is the declaration). A primary with no kernel allocation is not a
+/// primary: nothing can open it cross-process, `pfnCheckResourceAllocationHandle`
+/// has nothing to answer, and `pfnPresent` has no `D3DKMT_HANDLE` to broadcast. So
+/// returning `S_OK` with the allocation missing would hand the runtime an object
+/// that satisfies its type and not its purpose — the survivable lie CLAUDE.md rule 2
+/// and `METHOD.md` §2 Phase 4 both forbid — and the failure would surface much later
+/// as a black window with no counter naming its cause. ⛔ It is deliberately **not**
+/// knob-gated: `METHOD.md` §2 Phase 4 consequence 1 records that a default chosen to
+/// keep a run alive rather than to be correct is *"a hack wearing a knob's
+/// clothes"*, with this driver's own `Umd12EclSubmitStrict` as the example.
+///
+/// Every distinguishable cause has its own counter, because they are different
+/// findings with different fixes:
+///
+/// | counter | what it means | where the fix is |
+/// |---|---|---|
+/// | `IdentityVkMemoryUnresolved` | the engine could not name the memory a resource is bound to | the vkd3d fork / the interop interface |
+/// | `IdentityVenusUnresolved` | the memory has no venus resource id | the export chain: `HELIOS_HEAP_FLAG_VENUS_EXPORT` did not reach the fork, or the ICD is absent |
+/// | `IdentityOffsetNonZero` | the engine suballocated the resource | the fork's dedicated-allocation arm |
+/// | `IdentityResIdShared` | two live resources share one venus resource id | as above — and buffer rotation is already broken |
+/// | `AllocateCbMissing` / `AllocateCbFailed` / `AllocateCbNoHandle` | dxgkrnl refused | the record, the flags, or the kernel |
+/// | `OwnershipTransferFailed` | the ICD would not hand the resource over | the ICD |
+/// | `IdentityTableFull` | more than 64 live primaries | the admission predicate |
+///
+/// # ⚠ What this does NOT set, and why each omission is a decision
+///
+/// * **`D3D12DDI_ALLOCATION_INFO_FLAGS_0022_PRIMARY` is NOT set**, though
+///   `KMD_IMPACT.md` §14a.3 UP-5 prescribes `Flags = PRIMARY`. That flag reaches
+///   dxgkrnl as a VidPn-primary claim and is paired with `VidPnSourceId`, which this
+///   driver has no per-swapchain value for — the only source id it owns is **0**,
+///   the live desktop's. The target here is the **windowed** DWM-composited present,
+///   which never reaches `DxgkDdiPresent` at all (measured: `PRESENT_FLAGS_HISTOGRAM`
+///   has only ever seen `0x1` and `0xC`, unsampled and non-overflowing), so nothing
+///   on this path needs the allocation to be a primary — while asserting it would
+///   aim dxgkrnl's primary bookkeeping at source 0. It is the first field a
+///   fullscreen-flip lane must revisit, together with
+///   `HELIOS_WDDM_ALLOC_MISC_DIRECT_SCANOUT`.
+/// * **`HELIOS_WDDM_ALLOC_MISC_PRIMARY` is NOT set** in the meta, for the same
+///   reason and a sharper one: that bit's documented meaning is *"the standard
+///   allocation is the exact VidPn primary selected for direct scanout"*
+///   (`protocol/src/wddm.rs`), and in the KMD it selects `accessed_physically`,
+///   drops `Cached`, and forces the aperture segment
+///   (`create_allocation.rs:1770-1809`). A windowed back buffer is none of those
+///   things.
+/// * **`HELIOS_WDDM_ALLOC_MISC_DIRECT_SCANOUT` is NOT set.** Fullscreen only, and
+///   `PENDING.md` §S-3 item 7 is explicit that setting it before the host stride
+///   agreement is settled turns a hard failure into a *sheared picture*.
+///
+/// # Safety
+/// `dev` must be the live device this create is running on, `resource` the engine
+/// resource it just created, and `h_rt_resource` the runtime handle
+/// `pfnCreateHeapAndResource` was called with — which is live for the duration of
+/// the call, because this runs **inside** that DDI.
+unsafe fn adopt_presentable(
+    dev: &HeliosD3D12Device,
+    device10: &ID3D12Device10,
     resource: &ID3D12Resource,
     heap_arg: &ddi12::D3D12DDIARG_CREATEHEAP_0001,
     res_arg: &ddi12::D3D12DDIARG_CREATERESOURCE_0109,
-) {
-    if heap_arg.Flags & v::HEAP_PRIMARY == 0 {
-        return;
+    desc: &D3D12_RESOURCE_DESC1,
+    h_rt_resource: ddi12::D3D12DDI_HRTRESOURCE,
+) -> Result<(), Hresult> {
+    let engine_resource = resource.as_raw() as usize;
+
+    // ── 1. the identity, from the engine and then from the ICD ─────────────
+    //
+    // SAFETY: `resource` is the `ID3D12Resource` this driver's own engine just
+    // created and holds a reference to for the whole call; the bridge borrows it
+    // and takes no reference.
+    let (id, status) = unsafe { dev.engine.resource_venus_identity(engine_resource) };
+    if status != crate::bridge12::IdentityStatus::Resolved {
+        // ⛔ Two counters, split by WHICH half failed, because the two have
+        // different fixes in different repositories — see the table above. The
+        // engine half failing means vkd3d could not name the memory at all; the
+        // venus half failing means the memory exists and is not exportable, which
+        // is the export chain not engaging.
+        let venus_half = matches!(
+            status,
+            crate::bridge12::IdentityStatus::NoIcd
+                | crate::bridge12::IdentityStatus::NoExport
+                | crate::bridge12::IdentityStatus::IcdRefused
+        );
+        if venus_half {
+            note_refusal(&L4_REFUSALS.identity_venus_unresolved);
+        } else {
+            note_refusal(&L4_REFUSALS.identity_vk_memory_unresolved);
+        }
+        log_error!(
+            "L4: PRIMARY create REFUSED -- no venus identity for the engine resource {:#x} \
+             (status={:?} vk_memory={:#x} off={} size={} mti={}); a primary with no kernel \
+             allocation cannot be opened, presented or handed to \
+             pfnCheckResourceAllocationHandle. {}x{} fmt={} heapFlags={:#x}",
+            engine_resource,
+            status,
+            id.vk_memory,
+            id.memory_offset,
+            id.memory_size,
+            id.memory_type_index,
+            res_arg.Width,
+            res_arg.Height,
+            res_arg.Format,
+            heap_arg.Flags,
+        );
+        return Err(E_FAIL);
+    }
+
+    // ⛔ `memory_offset == 0` is a PRECONDITION of the adopt model, not a
+    // preference: one venus resource id covering several D3D12 resources breaks the
+    // one-resource-one-allocation rule the KMD's adopt arm rests on, and D3D11's
+    // path states the same requirement outright
+    // (`umd/src/forward/resource.rs:488-490`). `HELIOS_HEAP_FLAG_VENUS_EXPORT`'s
+    // dedicated allocation is what guarantees it; this is the assertion that the
+    // guarantee held.
+    if id.memory_offset != 0 {
+        note_refusal(&L4_REFUSALS.identity_offset_nonzero);
+        log_error!(
+            "L4: PRIMARY create REFUSED -- the engine SUBALLOCATED the resource {:#x} at \
+             offset {} of vk_memory {:#x} (venus res_id {}). The private heap flag {:#x} asks \
+             for a dedicated allocation; a shared VkDeviceMemory would give every swapchain \
+             buffer the same venus resource id and collapse buffer rotation onto one surface",
+            engine_resource,
+            id.memory_offset,
+            id.vk_memory,
+            id.venus_res_id,
+            HELIOS_HEAP_FLAG_VENUS_EXPORT.0,
+        );
+        return Err(E_FAIL);
+    }
+
+    // ⚠ Two independent readings of one number. vkd3d reports the whole
+    // `VkDeviceMemory`'s `VkMemoryAllocateInfo::allocationSize` from its own
+    // allocator record; the ICD reports what it passed to `vkAllocateMemory`. A
+    // disagreement means one of them is describing a different object, and the
+    // import that a cross-process opener performs is exact-size — so it is counted
+    // rather than reconciled here.
+    if id.memory_size != id.venus_alloc_size {
+        note_refusal(&L4_REFUSALS.identity_alloc_size_disagreement);
+        log_error!(
+            "L4: allocation size DISAGREEMENT for vk_memory {:#x}: engine says {}, the venus \
+             ICD says {}. A cross-process import is exact-size, so one of the two will reject \
+             it; the record carries the ICD's value in venus_alloc_size and the engine's in \
+             size",
+            id.vk_memory,
+            id.memory_size,
+            id.venus_alloc_size,
+        );
+    }
+
+    // ── 2. the row pitch, from the ENGINE ──────────────────────────────────
+    //
+    // ⛔ Asked, never computed. `HeliosWddmAllocMeta::pitch` is what a linear
+    // cross-process opener lays rows out with, and this driver has two ways to
+    // produce a number: ask the engine that owns the layout, or re-derive
+    // `align(width * bpp, 256)` here. The second is a *second* derivation of a
+    // number the engine already owns, and the 15th/39th sessions are what a
+    // disagreeing stride costs (a sheared or black surface). `GetCopyableFootprints`
+    // is the engine's own answer and this lane already calls it from
+    // `check_subresource_info`, with `FOOTPRINT_UNANSWERED_U32` as vkd3d's own
+    // "declined" sentinel.
+    //
+    // ⚠ A pitch of 0 is not fatal and is not a refusal: nothing on the windowed
+    // path reads it (DWM imports an OPTIMAL device-local image by venus resource id,
+    // not by stride). It is carried because the record has the field and an opener
+    // that ever needs it must see the engine's number or none.
+    let api_desc = resource_desc(desc);
+    let mut layout = D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+        Offset: 0,
+        Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+            Format: DXGI_FORMAT(0),
+            Width: 0,
+            Height: 0,
+            Depth: 0,
+            RowPitch: FOOTPRINT_UNANSWERED_U32,
+        },
+    };
+    // SAFETY: `api_desc` and `layout` are live locals; `NumSubresources` is 1, so
+    // the one array this call writes has exactly one element, and the three outputs
+    // this call does not want are declined with `None`.
+    unsafe {
+        device10.GetCopyableFootprints(
+            &api_desc,
+            0,
+            1,
+            0,
+            Some(core::ptr::from_mut(&mut layout)),
+            None,
+            None,
+            None,
+        );
+    }
+    let pitch = if layout.Footprint.RowPitch == FOOTPRINT_UNANSWERED_U32 {
+        0
+    } else {
+        layout.Footprint.RowPitch
+    };
+
+    // ── 3. the record ──────────────────────────────────────────────────────
+    let ctx_id = dev.engine.venus_instance_context_id();
+    if ctx_id == 0 {
+        // ⚠ Counted, NOT refused. The KMD's adopt path never reads `ctx_id`:
+        // `helios_protocol::classify` reaches `AdoptedUmdResource` from
+        // `adopt_resource_id` alone, and `build_backing`'s adopt arm does not consult
+        // it either. The field travels into `HeliosWddmOpenIdentity::ctx_id`, which
+        // that record's own doc calls "diagnostic only". Failing a create over a
+        // diagnostic would be the wrong severity.
+        note_refusal(&L4_REFUSALS.identity_ctx_id_unavailable);
+    }
+    let mut private = AdoptedAllocPrivate {
+        alloc: helios_protocol::HeliosWddmAllocPrivate::new(
+            // ⛔ DEVICE_MEMORY, which with a non-zero `adopt_resource_id` is the one
+            // combination that makes the KMD take the blob's OWNERSHIP rather than
+            // only validating its liveness (`protocol/src/wddm.rs`'s `classify`:
+            // `take_ownership = kind == DEVICE_MEMORY`). That is what step 5's
+            // ownership transfer pairs with.
+            helios_protocol::HELIOS_WDDM_ALLOC_KIND_DEVICE_MEMORY,
+            ctx_id,
+            // The venus device-memory id. ⚠ Deliberately 0: this driver has no
+            // `helios_venus_memory_id` accessor and does not need one — the KMD's
+            // adopt arm names the resource by `adopt_resource_id` and never creates a
+            // blob, so `blob_id` is unread on this path. D3D11 passes it because its
+            // non-adopt arms create the blob from it.
+            0,
+            // The engine's allocation size. The KMD overwrites `ap.size` with the
+            // adopted blob's real size from its own table (`create_allocation.rs`'s
+            // `ap.size = created.blob_size.bytes()`), so this is the claim, not the
+            // answer.
+            id.memory_size,
+            // ⚠ `blob_mem` / `blob_flags` / `map_cache` are the virtio blob-create
+            // parameters, and the adopt arm forwards NONE of them: `classify` returns
+            // `AdoptedUmdResource` before it ever reads them. Zero rather than a
+            // plausible-looking `VIRTIO_GPU_BLOB_MEM_HOST3D`, so a future reader
+            // cannot mistake them for a request that was honoured.
+            0,
+            0,
+            0,
+            // ⭐ THE FIELD THIS WHOLE PATH EXISTS FOR.
+            id.venus_res_id,
+        ),
+        meta: helios_protocol::HeliosWddmAllocMeta {
+            width: res_arg.Width.min(u64::from(u32::MAX)) as u32,
+            height: res_arg.Height,
+            // ⚠ The lossy `D3DDDIFORMAT` the KMD reports from
+            // `DxgkDdiDescribeAllocation`. `dxgi_format` below is the one an opener
+            // rebuilds with; this driver does not translate DXGI -> D3DDDIFORMAT at
+            // all, so it carries 0 and lets the KMD's own describe path answer.
+            format: 0,
+            pitch,
+            // The D3D12 resource flags, verbatim. ⚠ NOT D3D11 bind flags: nothing
+            // reads this field for an adopted allocation, and inventing a D3D11
+            // BindFlags word from a D3D12 resource-flags word would be a translation
+            // no reader asked for.
+            bind_flags: res_arg.Flags as u32,
+            // ⛔ NOT `HELIOS_WDDM_ALLOC_MISC_PRIMARY`, and NOT
+            // `HELIOS_WDDM_ALLOC_MISC_DIRECT_SCANOUT` -- see this function's doc for
+            // both arguments. A windowed DWM-composited back buffer is not the VidPn
+            // primary selected for direct scanout.
+            misc_flags: 0,
+            venus_alloc_size: id.venus_alloc_size,
+            memory_type_index: id.memory_type_index,
+            dxgi_format: res_arg.Format as u32,
+            // Scanout only; 0 for everything a DWM-composited window presents.
+            plane_offset: 0,
+        },
+    };
+
+    // ── 4. pfnAllocateCb ───────────────────────────────────────────────────
+    if dev.um_callbacks.is_null() {
+        // Expected unreachable: `create_device` refuses a null `p12UMCallbacks`
+        // before the device exists.
+        note_refusal(&L4_REFUSALS.allocate_cb_missing);
+        return Err(E_FAIL);
+    }
+    // SAFETY: non-null per the check. `um_callbacks` is the runtime's
+    // `D3D12DDI_CORELAYER_DEVICECALLBACKS_0062`, stored by `create_device` and never
+    // reassigned, for a table the runtime keeps alive at least as long as the device.
+    let Some(allocate_cb) = (unsafe { (*dev.um_callbacks).pfnAllocateCb }) else {
+        note_refusal(&L4_REFUSALS.allocate_cb_missing);
+        log_error!(
+            "L4: PRIMARY create REFUSED -- p12UMCallbacks->pfnAllocateCb is absent, so this \
+             driver cannot mint a kernel allocation for a primary"
+        );
+        return Err(E_FAIL);
+    };
+
+    let private_ptr = core::ptr::from_mut(&mut private).cast::<c_void>();
+    let private_size = u32::try_from(core::mem::size_of::<AdoptedAllocPrivate>()).unwrap_or(0);
+    let mut allocation_info = ddi12::D3D12DDI_ALLOCATION_INFO_0022 {
+        hAllocation: 0,
+        // Not a system-memory allocation: the bytes are the host's, behind a venus
+        // resource. D3D11's adopt path leaves the same field null.
+        pSystemMem: core::ptr::null(),
+        pPrivateDriverData: private_ptr,
+        PrivateDriverDataSize: private_size,
+        // ⚠ 0, and it is only meaningful with the PRIMARY flag this driver does not
+        // set -- see the doc. The one source id this adapter owns is 0, the live
+        // desktop's.
+        VidPnSourceId: 0,
+        Flags: ddi12::D3D12DDI_ALLOCATION_INFO_FLAGS_0022_D3D12DDI_ALLOCATION_INFO_FLAGS_0022_NONE,
+        // The KMD assigns the GPU VA; this driver never reserves one
+        // (`pfnReserveGpuVirtualAddressCb` is not called anywhere in this crate).
+        GpuVirtualAddress: 0,
+        Priority: 0,
+        // ⛔ ZEROED, and the runtime checks it: `Reserved fields in
+        // D3D12DDI_ALLOCATION_INFO_0022 were not zero.` is a literal string in the
+        // D3D12 runtime. `[0; 5]` rather than a `..Default::default()` tail so the
+        // zeroing is visible at the write site and cannot be lost to a struct-update
+        // that a later field addition silently reorders.
+        Reserved: [0; 5],
+    };
+    let mut alloc = ddi12::D3D12DDICB_ALLOCATE_0022 {
+        pPrivateDriverData: private_ptr,
+        PrivateDriverDataSize: private_size,
+        // ⛔⛔ THE ASSOCIATION, and it is NOT optional. D3D11 states it outright for
+        // exactly this class of allocation: *"the association itself is not optional
+        // for present-only allocations"* (`umd/src/forward/resource.rs:364-370`).
+        // Without it dxgkrnl gets an allocation tied to no resource, and the KMD's
+        // open path finds nothing to stamp `HeliosWddmOpenIdentity` onto -- so DWM
+        // could never open the back buffer.
+        //
+        // ⚠ This is the parameter `pfnCreateHeapAndResource` used to discard as
+        // `_h_rt_resource`, under a rule in `ResourceState`'s doc that said no
+        // callback takes an `HRTRESOURCE`. That rule was FALSE for this one callback,
+        // and it is corrected there in this commit.
+        hResource: h_rt_resource.handle,
+        hKMResource: 0,
+        NumAllocations: 1,
+        pAllocationInfo: core::ptr::from_mut(&mut allocation_info),
+    };
+
+    // SAFETY: a non-null callback out of the runtime's own corelayer table, given
+    // the device handle it supplied and two fully initialised out-structs that are
+    // live locals. `pAllocationInfo` addresses exactly `NumAllocations` = 1 element.
+    let hr = unsafe { allocate_cb(dev.h_rt_device, core::ptr::from_mut(&mut alloc)) };
+    if hr < 0 {
+        // ⛔ `hr < 0`, not `hr != S_OK`: a non-negative non-`S_OK` value is a success
+        // code, and treating `S_FALSE` as a failure would fail a create that worked.
+        note_refusal(&L4_REFUSALS.allocate_cb_failed);
+        log_error!(
+            "L4: pfnAllocateCb FAILED hr={:#010x} for the primary {:#x} (venus res_id {} \
+             size {} rt_resource {:p} priv {} bytes)",
+            hr as u32,
+            engine_resource,
+            id.venus_res_id,
+            id.memory_size,
+            h_rt_resource.handle,
+            private_size,
+        );
+        return Err(hr);
+    }
+    let h_allocation = allocation_info.hAllocation;
+    if h_allocation == 0 {
+        // Success with no handle is a runtime contract violation this driver cannot
+        // act on, and it is exactly the shape that would otherwise become a 0 in
+        // `pfnPresent`'s `BroadcastSrcAllocation[0]`.
+        note_refusal(&L4_REFUSALS.allocate_cb_no_handle);
+        log_error!(
+            "L4: pfnAllocateCb returned hr={:#010x} with hAllocation=0 for the primary {:#x}",
+            hr as u32,
+            engine_resource,
+        );
+        return Err(E_FAIL);
+    }
+
+    // ⚠ **Did anything write the private data back?** The buffer is the runtime's to
+    // pass down and the kernel's to fill: `DxgkDdiCreateAllocation` recomputes
+    // `meta.pitch`, `meta.venus_alloc_size`, `meta.memory_type_index` and
+    // `meta.dxgi_format` from what the host actually did
+    // (`create_allocation.rs`'s "THE one update site"), and whether that reaches this
+    // buffer at CREATE time — rather than only at OPEN, where `write_open_identity`
+    // definitely writes — is **not established anywhere in the doc set**. So it is
+    // measured instead of assumed, at the one moment the answer is visible.
+    //
+    // ⛔ The record already stored the values this driver sent; a write-back is
+    // therefore an observation and not an input, and it must not be folded into the
+    // identity — the whole point of two sources is that they can be compared.
+    if private.meta.pitch != pitch
+        || private.meta.venus_alloc_size != id.venus_alloc_size
+        || private.meta.memory_type_index != id.memory_type_index
+    {
+        L4_REFUSALS.alloc_private_written_back.bump();
+        let n = L4_REFUSALS.alloc_private_written_back.get();
+        if n <= LOG_BUDGET {
+            log_error!(
+                "L4: the kernel WROTE BACK the allocation private data for {:#x}: pitch {} -> \
+                 {}, venus_alloc_size {} -> {}, mti {} -> {} (x{n})",
+                engine_resource,
+                pitch,
+                private.meta.pitch,
+                id.venus_alloc_size,
+                private.meta.venus_alloc_size,
+                id.memory_type_index,
+                private.meta.memory_type_index,
+            );
+        }
+    }
+
+    // ── 5. hand the venus resource over, then record ───────────────────────
+    //
+    // ⛔ In THIS order. The ICD stops unref'ing the host resource only once the
+    // transfer has run, and the KMD's allocation took ownership inside the callback
+    // above (`adopt_blob_for_allocation`), so the window between them is the one
+    // where both believe they own it. Transferring first would be worse: an
+    // allocation failure would then leave the resource owned by nobody.
+    //
+    // SAFETY: as the identity read above -- the same live engine resource, borrowed.
+    let transferred = unsafe { dev.engine.transfer_resource_ownership(engine_resource) };
+    if transferred != id.venus_res_id {
+        note_refusal(&L4_REFUSALS.ownership_transfer_failed);
+        log_error!(
+            "L4: venus ownership transfer FAILED for the primary {:#x}: asked for res_id {}, \
+             the ICD handed back {}. The kernel allocation and the ICD would both unref the \
+             host resource, so the allocation is rolled back and the create fails",
+            engine_resource,
+            id.venus_res_id,
+            transferred,
+        );
+        // SAFETY: `h_allocation` is the handle `pfnAllocateCb` just minted for this
+        // driver, not yet recorded anywhere, so this is its only reference.
+        unsafe { deallocate_adopted(dev, h_allocation, DeallocateForm::ByHandleList) };
+        return Err(E_FAIL);
     }
 
     let identity = identity12::PresentableIdentity {
-        // ⚠ An identity token, never dereferenced by the table — see
+        // ⚠ An identity token, never dereferenced by the table -- see
         // `identity12`'s module doc for the whole argument, including how the
         // address-recycling hazard is closed.
-        engine_resource: resource.as_raw() as usize,
-        // ⛔ The two unresolved halves. They are zero because there is no path to
-        // them from this crate yet, and each is counted below rather than
-        // silently left at a plausible-looking 0:
-        //   * the Vulkan half needs `ID3D12DXVKInteropDevice4::
-        //     GetVulkanResourceMemoryInfo` (UP-2, which exists in the engine)
-        //     reached through a `bridge12` entry point that does not exist;
-        //   * the venus half needs the ICD's `helios_venus_memory_res_id` /
-        //     `helios_venus_memory_alloc_info`, and this crate's bridge resolves
-        //     the process ICD anchor for `venus_context_id()` alone.
-        vk_memory: 0,
-        memory_offset: 0,
-        memory_size: 0,
-        venus_res_id: 0,
-        venus_alloc_size: 0,
-        memory_type_index: 0,
+        engine_resource,
+        vk_memory: id.vk_memory,
+        memory_offset: id.memory_offset,
+        memory_size: id.memory_size,
+        venus_res_id: id.venus_res_id,
+        venus_alloc_size: id.venus_alloc_size,
+        memory_type_index: id.memory_type_index,
+        h_allocation,
+        h_km_resource: alloc.hKMResource,
+        h_rt_resource: h_rt_resource.handle as usize,
+        ctx_id,
         geometry: identity12::IdentityGeometry {
             width: res_arg.Width,
             height: res_arg.Height,
@@ -1424,37 +1941,63 @@ fn note_presentable_identity(
         identity12::RecordOutcome::TableFull => {
             note_refusal(&L4_REFUSALS.identity_table_full);
             log_error!(
-                "L4: identity table FULL -- the primary at {:#x} is NOT recorded and cannot be \
-                 presented; {}x{} fmt={} heapFlags={:#x}",
-                identity.engine_resource,
-                identity.geometry.width,
-                identity.geometry.height,
-                identity.geometry.dxgi_format,
-                identity.heap_flags,
+                "L4: identity table FULL -- the primary at {:#x} cannot be recorded, so its \
+                 allocation would be unreachable and unfreeable; rolling it back. {}x{} fmt={} \
+                 heapFlags={:#x}",
+                engine_resource,
+                res_arg.Width,
+                res_arg.Height,
+                res_arg.Format,
+                heap_arg.Flags,
             );
-            return;
+            // SAFETY: as above -- the only reference to a handle nothing recorded.
+            unsafe { deallocate_adopted(dev, h_allocation, DeallocateForm::ByHandleList) };
+            return Err(E_FAIL);
         }
-    }
-
-    if identity.vk_memory == 0 {
-        L4_REFUSALS.identity_vk_memory_unresolved.bump();
-    }
-    if identity.venus_res_id == 0 {
-        L4_REFUSALS.identity_venus_unresolved.bump();
+        identity12::RecordOutcome::ResIdShared { holder } => {
+            // ⛔⛔ ROTATION COLLAPSE. See `identity12::RecordOutcome::ResIdShared`.
+            note_refusal(&L4_REFUSALS.identity_res_id_shared);
+            log_error!(
+                "L4: venus res_id {} is ALREADY held by the live resource {:#x} -- the engine \
+                 suballocated two D3D12 resources out of one VkDeviceMemory ({:#x}), so every \
+                 swapchain buffer would name one host surface and rotation would collapse. \
+                 Refusing the primary {:#x} and rolling its allocation back",
+                id.venus_res_id,
+                holder,
+                id.vk_memory,
+                engine_resource,
+            );
+            // SAFETY: as above.
+            unsafe { deallocate_adopted(dev, h_allocation, DeallocateForm::ByHandleList) };
+            return Err(E_FAIL);
+        }
     }
 
     let n = L4_REFUSALS.identity_recorded.get();
     if n <= LOG_BUDGET {
-        // ⚠ Every field is printed, and that is not only for the log: an entry
-        // whose fields no code reads is `dead_code`, and a table whose contents
-        // cannot be seen from a run is the T5 lesson (*an instrument nothing can
-        // read is not an instrument*) rebuilt. Until UP-5 consumes the table this
-        // line is the whole readout.
+        // ⚠ **Read out of the RECORD, field by field, not out of the locals it was
+        // built from**, and that is not stylistic. It prints what was stored rather
+        // than what was intended, so a field the construction above got wrong is
+        // visible here; and an entry whose fields no code reads is `dead_code`, which
+        // `PARALLEL.md` §10 forbids silencing on hand-written lines (R908). `pitch`
+        // is the one value not in the record — it lives in the wire meta — so it is
+        // printed from its local.
         log_error!(
-            "L4: presentable identity recorded res={:#x} {}x{}x{} mips={} samples={} fmt={} \
-             heapFlags={:#x} vk_memory={:#x} off={} mem_size={} mti={} venus_res_id={} \
-             venus_alloc_size={} (x{n})",
+            "L4: PRIMARY adopted res={:#x} alloc={:#x} km={:#x} rt={:#x} ctx={} \
+             venus_res_id={} vk_memory={:#x} off={} size={} venus_alloc_size={} mti={} \
+             pitch={} {}x{}x{} mips={} samples={} fmt={} heapFlags={:#x} (x{n})",
             identity.engine_resource,
+            identity.h_allocation,
+            identity.h_km_resource,
+            identity.h_rt_resource,
+            identity.ctx_id,
+            identity.venus_res_id,
+            identity.vk_memory,
+            identity.memory_offset,
+            identity.memory_size,
+            identity.venus_alloc_size,
+            identity.memory_type_index,
+            pitch,
             identity.geometry.width,
             identity.geometry.height,
             identity.geometry.depth_or_array_size,
@@ -1462,14 +2005,117 @@ fn note_presentable_identity(
             identity.geometry.sample_count,
             identity.geometry.dxgi_format,
             identity.heap_flags,
-            identity.vk_memory,
-            identity.memory_offset,
-            identity.memory_size,
-            identity.memory_type_index,
-            identity.venus_res_id,
-            identity.venus_alloc_size,
         );
     }
+    Ok(())
+}
+
+/// Release one WDDM allocation this driver minted with `pfnAllocateCb`.
+///
+/// `KMD_IMPACT.md` §14a.3 UP-5's second half, and the one whose absence
+/// `PENDING.md` §S-3 item 4 prices: without it every back buffer leaks one WDDM
+/// allocation per `ResizeBuffers`, and `ResizeBuffers` fires on every window drag.
+/// That is the 54th session's leak class, one API generation later.
+///
+/// # ⛔ The wire shape is EITHER/OR, and both together is `E_INVALIDARG`
+///
+/// `umd/src/forward/state.rs:90-105` states the contract and what breaking it cost:
+/// *"EITHER `hResource` alone, OR `NumAllocations`+`HandleList` with `hResource`
+/// NULL. Both together is E_INVALIDARG -- the old 0x80070057, which also leaked
+/// opened resources."* [`DeallocateForm`] is what makes the illegal combination
+/// unrepresentable here, exactly as D3D11's enum of the same name does: the caller
+/// picks a form and this function writes the other half as the contract's zero.
+///
+/// # Safety
+/// `h_allocation` must be a handle `pfnAllocateCb` returned to this driver and which
+/// has not already been deallocated; passing one twice is a kernel-handle double
+/// free. On [`DeallocateForm::ByResource`] the handle must be the runtime resource
+/// the allocation was associated with at the create.
+unsafe fn deallocate_adopted(
+    dev: &HeliosD3D12Device,
+    h_allocation: ddi12::D3DKMT_HANDLE,
+    form: DeallocateForm,
+) {
+    if dev.um_callbacks.is_null() {
+        note_refusal(&L4_REFUSALS.deallocate_cb_missing);
+        return;
+    }
+    // SAFETY: non-null per the check; the same table `adopt_presentable` read.
+    let Some(deallocate_cb) = (unsafe { (*dev.um_callbacks).pfnDeallocateCb }) else {
+        // ⛔ A leaked WDDM allocation, and it is counted rather than ignored: the
+        // handle is now unreachable and only process exit frees it.
+        note_refusal(&L4_REFUSALS.deallocate_cb_missing);
+        log_error!(
+            "L4: p12UMCallbacks->pfnDeallocateCb is absent -- the WDDM allocation {:#x} is \
+             LEAKED for the lifetime of this process",
+            h_allocation,
+        );
+        return;
+    };
+    // ⚠ `handle` must outlive the call: `HandleList` points into it on the
+    // handle-list arm. Declared before `arg` so that is a lifetime the compiler
+    // enforces rather than a comment.
+    let handle = h_allocation;
+    let arg = match form {
+        DeallocateForm::ByResource(h_rt_resource) => ddi12::D3D12DDICB_DEALLOCATE_0022 {
+            hResource: h_rt_resource.handle,
+            // ⛔ 0 and null, because `hResource` is set. Both forms at once is
+            // `E_INVALIDARG`.
+            NumAllocations: 0,
+            HandleList: core::ptr::null(),
+            Flags: ddi12::D3D12DDI_DEALLOCATE_FLAGS_0022_D3D12DDI_DEALLOCATE_FLAGS_0022_NONE,
+        },
+        DeallocateForm::ByHandleList => ddi12::D3D12DDICB_DEALLOCATE_0022 {
+            // ⛔ NULL, because the handle list is set.
+            hResource: core::ptr::null_mut(),
+            NumAllocations: 1,
+            HandleList: core::ptr::from_ref(&handle),
+            Flags: ddi12::D3D12DDI_DEALLOCATE_FLAGS_0022_D3D12DDI_DEALLOCATE_FLAGS_0022_NONE,
+        },
+    };
+    // SAFETY: a non-null callback out of the runtime's own corelayer table, given
+    // the device handle it supplied and a fully initialised live local.
+    let hr = unsafe { deallocate_cb(dev.h_rt_device, core::ptr::from_ref(&arg)) };
+    if hr < 0 {
+        note_refusal(&L4_REFUSALS.deallocate_cb_failed);
+        log_error!(
+            "L4: pfnDeallocateCb FAILED hr={:#010x} for allocation {:#x} rtResource={:p} \
+             handleList={} -- the allocation is leaked",
+            hr as u32,
+            h_allocation,
+            arg.hResource,
+            arg.NumAllocations,
+        );
+    }
+}
+
+/// The one legal shape of a `D3D12DDICB_DEALLOCATE_0022` call.
+///
+/// ⭐ **A mirror of `umd/src/forward/state.rs`'s `DeallocateForm`, and it exists for
+/// the same measured reason**: the wire contract is *either* `hResource` *or*
+/// `NumAllocations`+`HandleList`, and both together returned `0x80070057` and leaked.
+/// Constructing this enum is the only way [`deallocate_adopted`] builds the struct,
+/// so the illegal combination is unrepresentable rather than merely avoided.
+///
+/// ⚠ **Which arm goes where is the D3D11 pairing, not a preference**, and the two
+/// arms are used from two different places for reasons that do not generalise to each
+/// other:
+///
+/// * [`Self::ByHandleList`] on the **rollback inside the create**. This is what
+///   `umd/src/forward/resource.rs`'s `deallocate_standalone` does, and the reason is
+///   that the create is about to fail: the runtime resource is being abandoned, and
+///   naming it would ask the runtime to release every allocation it tracks for a
+///   resource whose creation never completed. Naming the one handle this driver made
+///   is exactly what needs undoing.
+/// * [`Self::ByResource`] on the **destroy**. `DeallocateForm::select` prefers it
+///   there for a stated reason — *"the runtime then releases every allocation it
+///   tracks for the resource — created AND opened instances"* — which is the correct
+///   behaviour when the resource itself is going away.
+enum DeallocateForm {
+    /// Name the runtime resource; the runtime releases what it tracks for it.
+    ByResource(ddi12::D3D12DDI_HRTRESOURCE),
+    /// Name this driver's one allocation handle, with `hResource` NULL.
+    ByHandleList,
 }
 
 /// Arm 1 of the fused create: both argument pointers ->
@@ -1485,14 +2131,30 @@ fn note_presentable_identity(
 /// anchor: a committed resource starts at offset 0 of its own implicit heap, so
 /// its mapped base **is** the heap's base.
 ///
+/// ⭐ **It is also the only arm that can receive a primary declaration**, so it is
+/// where [`adopt_presentable`] runs — see that function for the whole UP-5 path and
+/// for why a primary that cannot obtain a kernel allocation fails the create.
+///
 /// # Safety
 /// `heap_arg` and `res_arg` must be live for the call; both slots must be this
-/// driver's own private blocks, already cleared by the caller.
+/// driver's own private blocks, already cleared by the caller. `h_rt_resource` must
+/// be the runtime handle `pfnCreateHeapAndResource` was invoked with — it is live
+/// for the duration of that DDI, which is the duration of this call.
+///
+// ⚠ Eight arguments, and each one is a distinct piece of the DDI call this arm is
+// forwarding: the device, the engine, the two argument structs, the optional clear
+// value, the runtime handle and the two private blocks. Bundling them into a struct
+// would be a second shape of `pfnCreateHeapAndResource`'s parameter list that has to
+// be kept in step with the real one. Same lint and same judgement as
+// `umd/src/forward/pipeline.rs:8`.
+#[allow(clippy::too_many_arguments)]
 unsafe fn create_committed(
+    dev: &HeliosD3D12Device,
     device10: &ID3D12Device10,
     heap_arg: &ddi12::D3D12DDIARG_CREATEHEAP_0001,
     res_arg: &ddi12::D3D12DDIARG_CREATERESOURCE_0109,
     p_clear: *const ddi12::D3D12DDI_CLEAR_VALUES,
+    h_rt_resource: ddi12::D3D12DDI_HRTRESOURCE,
     heap_slot: Slot<Boxed<HeapState>>,
     resource_slot: Slot<Boxed<ResourceState>>,
 ) -> Hresult {
@@ -1529,7 +2191,7 @@ unsafe fn create_committed(
     let created = unsafe {
         device10.CreateCommittedResource3(
             &properties,
-            heap_flags(heap_arg.Flags),
+            heap_flags(heap_arg.Flags, PrimaryTranslation::VenusExport),
             &desc,
             barrier_layout(res_arg.InitialBarrierLayout, is_buffer),
             clear.as_ref().map(core::ptr::from_ref),
@@ -1563,11 +2225,40 @@ unsafe fn create_committed(
         return if hr < 0 { hr } else { E_FAIL };
     };
 
-    // UP-4: if this is the swapchain primary, remember how to find its memory.
-    // Before the state is stored, so a `TableFull` refusal is not attributed to
-    // the create -- it never fails the create, it only makes the resource
-    // un-presentable, and UP-5 is the commit that turns that into an error.
-    note_presentable_identity(&resource, heap_arg, res_arg);
+    // ── UP-5: a primary gets a kernel allocation here, or the create fails ──
+    //
+    // ⛔ **Before the state is stored, and the ordering is what makes the failure
+    // clean.** On this path `resource` is still an owned local: returning drops it
+    // and the engine releases the resource, so a refused primary leaves nothing
+    // behind — no half-built `ResourceState`, no heap block, and the two slots the
+    // caller cleared stay null, which is exactly what a failed create is required to
+    // leave (`umd_common::slot`'s `DdiHandle` doc). Storing first and then failing
+    // would leak an `ID3D12Resource` and an `ID3D12Heap` per refused swapchain
+    // buffer.
+    //
+    // ⚠ **This IS a change of severity from UP-4**, where the identity was recorded
+    // and *"never fails the create"*. UP-4 recorded bookkeeping; this mints a kernel
+    // object the runtime and DWM both depend on, and a primary without one is an
+    // object that satisfies its type and not its purpose. `adopt_presentable`'s doc
+    // carries the argument.
+    if heap_arg.Flags & v::HEAP_PRIMARY != 0 {
+        // SAFETY: `dev` is the live device this create is running on, `resource` the
+        // engine resource just created (owned here, so alive for the call), and
+        // `h_rt_resource` the runtime handle this DDI was invoked with.
+        if let Err(hr) = unsafe {
+            adopt_presentable(
+                dev,
+                device10,
+                &resource,
+                heap_arg,
+                res_arg,
+                &desc,
+                h_rt_resource,
+            )
+        } {
+            return hr;
+        }
+    }
 
     // SAFETY: `resource_slot` is this driver's private block for the resource
     // being created, cleared by the caller and written exactly once.
@@ -1840,13 +2531,18 @@ unsafe fn castable_formats(
 /// call. `h_heap.pDrvPrivate` and `h_resource.pDrvPrivate` must address the
 /// blocks the paired [`calc_private_heap_and_resource_sizes`] sized.
 ///
-/// ⚠ `_h_rt_resource` is unused on purpose; see the note under [`ResourceState`]
-/// for why the runtime resource handle is not stored.
+/// ⚠ **`h_rt_resource` used to be `_h_rt_resource` and discarded**, under a rule in
+/// [`ResourceState`]'s doc that no callback takes an `HRTRESOURCE`. UP-5 falsified
+/// that rule for exactly one callback — `D3D12DDICB_ALLOCATE_0022::hResource` — so
+/// the handle is now threaded to the committed arm. ⛔ It is still not *stored*: it
+/// is a live parameter of this DDI and [`adopt_presentable`] runs inside it, so the
+/// only place it needs to survive to is the identity table, which keeps it as an
+/// integer for the paired `pfnDeallocateCb`.
 unsafe extern "C" fn create_heap_and_resource(
     h_device: ddi12::D3D12DDI_HDEVICE,
     p_heap: *const ddi12::D3D12DDIARG_CREATEHEAP_0001,
     h_heap: ddi12::D3D12DDI_HHEAP,
-    _h_rt_resource: ddi12::D3D12DDI_HRTRESOURCE,
+    h_rt_resource: ddi12::D3D12DDI_HRTRESOURCE,
     p_resource: *const ddi12::D3D12DDIARG_CREATERESOURCE_0109,
     p_clear: *const ddi12::D3D12DDI_CLEAR_VALUES,
     h_protected_session: ddi12::D3D12DDI_HPROTECTEDRESOURCESESSION_0030,
@@ -1974,13 +2670,16 @@ unsafe extern "C" fn create_heap_and_resource(
                 return E_INVALIDARG;
             };
             // SAFETY: both args are live references; both slots are this
-            // driver's own blocks, cleared above.
+            // driver's own blocks, cleared above; `dev` is the device this DDI was
+            // dispatched on and `h_rt_resource` the runtime handle it carried.
             unsafe {
                 create_committed(
+                    dev,
                     &device10,
                     heap_arg,
                     res_arg,
                     p_clear,
+                    h_rt_resource,
                     heap_slot,
                     resource_slot,
                 )
@@ -2028,12 +2727,17 @@ unsafe extern "C" fn create_heap_and_resource(
 /// to its heap, so releasing in that order keeps the engine's own teardown in
 /// the order it would see from an application.
 ///
+/// ⭐ **It is also where the UP-5 WDDM allocation is released**, and that is not
+/// optional: `PENDING.md` §S-3 item 4 prices its absence at *"one leaked WDDM
+/// allocation per back buffer per `ResizeBuffers`"*, and `ResizeBuffers` fires on
+/// every window drag.
+///
 /// # Safety
 /// `h_heap` and `h_resource`, when their `pDrvPrivate` is non-null, must be
 /// handles [`create_heap_and_resource`] returned `S_OK` for and which have not
 /// already been destroyed. Passing one twice is a double free.
 unsafe extern "C" fn destroy_heap_and_resource(
-    _h_device: ddi12::D3D12DDI_HDEVICE,
+    h_device: ddi12::D3D12DDI_HDEVICE,
     h_heap: ddi12::D3D12DDI_HHEAP,
     h_resource: ddi12::D3D12DDI_HRESOURCE,
 ) {
@@ -2063,7 +2767,7 @@ unsafe extern "C" fn destroy_heap_and_resource(
             // `ID3D12Resource` this driver created. The engine address is read
             // out of the state box while the box is still alive and the COM
             // reference it holds is still valid, so the key that is removed is
-            // provably the key `note_presentable_identity` inserted -- both are
+            // provably the key `adopt_presentable` inserted -- both are
             // `ID3D12Resource::as_raw()` on the same object.
             //
             // ⚠ Ordering: before `drop(state)`. After the drop the resource may
@@ -2078,8 +2782,53 @@ unsafe extern "C" fn destroy_heap_and_resource(
             // live-entry count and a leak shows up as a growing difference
             // rather than needing its own instrument.
             if let Some(engine) = state.resource.as_ref() {
-                if identity12::remove(engine.as_raw() as usize) {
+                if let Some(identity) = identity12::take(engine.as_raw() as usize) {
                     L4_REFUSALS.identity_removed.bump();
+                    // ⛔ UP-5's other half. An entry EXISTS iff this driver owns a
+                    // WDDM allocation for the resource (`identity12`'s module doc
+                    // states that invariant), so the deallocate is unconditional
+                    // here rather than gated on a second flag that could disagree
+                    // with the table. `take` cleared the slot under the same lock
+                    // acquisition that read it, so two concurrent destroys of one
+                    // resource cannot both reach this line with the same handle.
+                    //
+                    // ⚠ The `hResource` form needs a device, which this DDI supplies
+                    // and did not used to resolve. A device that does not resolve is
+                    // a leaked allocation, counted -- it cannot be a silent skip,
+                    // because the handle is unreachable from that moment on.
+                    // SAFETY: `h_device` is the device this destroy was dispatched
+                    // on; the borrow ends inside this block.
+                    match unsafe { device12::device(h_device) } {
+                        Some(dev) => {
+                            // SAFETY: `h_allocation` is the handle `pfnAllocateCb`
+                            // minted for this resource, taken out of the table so no
+                            // other path can reach it, and `h_rt_resource` is the
+                            // runtime handle it was associated with at the create.
+                            unsafe {
+                                deallocate_adopted(
+                                    dev,
+                                    identity.h_allocation,
+                                    // ⛔ The `hResource` form on the destroy, and the
+                                    // handle-list form on the create's rollback --
+                                    // see `DeallocateForm` for why the two arms are
+                                    // used from two places.
+                                    DeallocateForm::ByResource(ddi12::D3D12DDI_HRTRESOURCE {
+                                        handle: identity.h_rt_resource as *mut c_void,
+                                    }),
+                                )
+                            };
+                        }
+                        None => {
+                            note_refusal(&L4_REFUSALS.resource_no_device);
+                            note_refusal(&L4_REFUSALS.deallocate_cb_missing);
+                            log_error!(
+                                "L4: destroy could not resolve the device -- the WDDM \
+                                 allocation {:#x} for the primary {:#x} is LEAKED",
+                                identity.h_allocation,
+                                identity.engine_resource,
+                            );
+                        }
+                    }
                 }
             }
             drop(state);
@@ -2637,7 +3386,7 @@ unsafe extern "C" fn check_resource_allocation_info(
     //
     // ⛔ Counted and NOT acted on. This slot has no `D3D12DDI_HRESOURCE`: it is a
     // sizing query about a resource that does not exist yet, so there is nothing
-    // to record an identity against. See `note_presentable_identity` for why that
+    // to record an identity against. See `adopt_presentable` for why that
     // makes §14a.3's "use both signals" unimplementable as written.
     if optimization_flags & v::RESOURCE_OPT_PRIMARY != 0 {
         L4_REFUSALS.resource_optimization_primary.bump();
@@ -2955,30 +3704,60 @@ unsafe extern "C" fn check_resource_virtual_address(
     unsafe { resource.GetGPUVirtualAddress() }
 }
 
-/// `pfnCheckResourceAllocationHandle` — answers 0, and the counter is the point.
+/// `pfnCheckResourceAllocationHandle` — the real `D3DKMT_HANDLE`, since UP-5.
 ///
-/// ⛔ **This is the one place this lane cannot be honest and complete at the same
-/// time, so it is honest.** The DDI asks for the `D3DKMT_HANDLE` of the kernel
-/// allocation behind a resource. This driver has none: vkd3d's memory is minted
-/// by the Mesa venus ICD through its own `D3DKMT` path, so `helios_umd12.dll`
-/// never calls `pfnAllocateCb` and no object reachable from this DDI carries a
-/// kernel allocation it owns. `DDI_REFERENCE.md` §9.7 names this exactly —
-/// *"kernel identity is mandatory in at least three places, so 'pure passthrough
-/// with no `pfnAllocateCb`' is not viable"* — and the honest answer while that
-/// remains true is 0 with a counter, never a fabricated handle.
+/// The DDI asks for the kernel allocation behind a resource. ⭐ Since UP-5 this
+/// driver has one for every resource the runtime declared a **primary**: the
+/// `pfnAllocateCb` handle [`adopt_presentable`] minted, kept in the
+/// [`identity12`] table and looked up here by the engine resource behind the
+/// handle.
 ///
-/// ⚠ Expected **non-zero if this slot is ever called**, and a reading above zero
-/// is the measurement that says the passthrough model has been reached for real.
+/// ⚠ **0 remains the correct answer for every other resource**, and it is not a
+/// refusal: an ordinary D3D12 texture's memory is the venus ICD's and this driver
+/// owns no kernel allocation for it. `DDI_REFERENCE.md` §9.7's *"kernel identity is
+/// mandatory in at least three places, so 'pure passthrough with no
+/// `pfnAllocateCb`' is not viable"* is discharged for the class that needs it —
+/// presentable resources — and left standing for the class that does not.
+///
+/// ⚠⚠ **`ResourceAllocationHandleUnavailable` is RE-GRADED by this commit**, and
+/// the old grading is written out so the change is not silent. It used to mean
+/// *"this driver has no handles at all; expected non-zero if this slot is ever
+/// called, and a reading above zero says the passthrough model has been reached"*.
+/// It now means *"this slot was asked about a resource with no kernel allocation"*,
+/// which is:
+///
+/// * **expected non-zero and benign** if the runtime asks about ordinary resources;
+/// * **a real finding** only when read against `IdentityRecorded` — the interesting
+///   quantity is now the *answered* case, and there is no counter for it because
+///   `IdentityRecorded` already bounds it. ⛔ So this counter can no longer be read
+///   as *"the model has been reached"*; that reading belonged to a driver with no
+///   handles and it is now false.
+///
+/// ⚠ The parameter is spelled `D3D10DDI_HRESOURCE` — this is the one slot in the
+/// header that uses the D3D10 name — and no conversion is needed or written:
+/// `d3d12umddi.rs:47367` makes `D3D12DDI_HRESOURCE` a bindgen **alias** of it, so
+/// they are the same type and `engine_resource` takes it directly.
 ///
 /// # Safety
-/// `_h_resource` is not dereferenced. Declared `unsafe` because the DDI's PFN
-/// typedef is.
+/// `h_resource`, when its `pDrvPrivate` is non-null, must be a resource handle
+/// [`create_heap_and_resource`] returned `S_OK` for.
 unsafe extern "C" fn check_resource_allocation_handle(
     _h_device: ddi12::D3D12DDI_HDEVICE,
-    _h_resource: ddi12::D3D10DDI_HRESOURCE,
+    h_resource: ddi12::D3D10DDI_HRESOURCE,
 ) -> ddi12::D3DKMT_HANDLE {
-    note_refusal(&L4_REFUSALS.resource_allocation_handle_unavailable);
-    0
+    // SAFETY: the runtime passes a resource handle this driver wrote; the borrow
+    // ends with this call.
+    let Some(engine) = (unsafe { engine_resource(h_resource) }) else {
+        note_refusal(&L4_REFUSALS.resource_handle_unresolved);
+        return 0;
+    };
+    match identity12::lookup(engine.as_raw() as usize) {
+        Some(identity) => identity.h_allocation,
+        None => {
+            note_refusal(&L4_REFUSALS.resource_allocation_handle_unavailable);
+            0
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3176,10 +3955,22 @@ struct L4Refusals {
     /// 2 048-slice 15-mip Texture2DArray. A hit is a question with no right
     /// answer, and the zeroed out-struct stands because there is none.
     subresource_info_out_of_range: RefusalCounter,
-    /// `pfnCheckResourceAllocationHandle` answered 0 because this driver mints
-    /// no kernel allocations. ⚠ **Expected non-zero if the slot is called at
-    /// all**, and driving it to zero is what closing `DDI_REFERENCE.md` §9.7's
-    /// kernel-identity gap would mean.
+    /// `pfnCheckResourceAllocationHandle` answered 0 for a resource with **no kernel
+    /// allocation**.
+    ///
+    /// ⚠⚠ **RE-GRADED at UP-5, and the old grading is now FALSE.** It read: *"answered
+    /// 0 because this driver mints no kernel allocations. Expected non-zero if the
+    /// slot is called at all, and driving it to zero is what closing
+    /// `DDI_REFERENCE.md` §9.7's kernel-identity gap would mean."* This driver does
+    /// mint kernel allocations now, for every adopted primary, and the slot answers
+    /// with the real handle for those.
+    ///
+    /// ⇒ It is **expected non-zero and benign**: the runtime is free to ask about any
+    /// resource, and an ordinary D3D12 texture has no kernel allocation because its
+    /// memory is the venus ICD's. ⛔ Driving it to zero is no longer a goal and would
+    /// mean the runtime stopped asking. The quantity that matters is the *answered*
+    /// case, which `IdentityRecorded` already bounds — there is deliberately no second
+    /// counter for it.
     resource_allocation_handle_unavailable: RefusalCounter,
     /// `pfnCalcPrivateOpenedHeapAndResourceSizes` answered {0, 0} because the
     /// paired open refuses. Expected 0 until something opens a shared resource.
@@ -3214,26 +4005,18 @@ struct L4Refusals {
     /// this one is not. It is the only channel the DDI has for declaring a
     /// primary (`SPECS.md` §9.7, `ResourceHeaps.md:897`).
     ///
-    /// ⚠ **RE-GRADED at UP-4, because what it means changed.** It used to mean
-    /// *"a primary reached this driver and was demoted — nothing downstream can
-    /// tell it apart"*. The flag is still dropped on the way to the engine, but
-    /// the **fact** is no longer lost: `note_presentable_identity` now records the
-    /// primary in the `forward12::identity12` table, keyed on the engine resource,
-    /// with the raw heap-flags word intact. So:
+    /// ⚠⚠ **RE-GRADED TWICE, and this is the second time.** At UP-4 it meant *"a
+    /// primary reached this driver and was demoted"* on every arm. At UP-5 the
+    /// committed arm stopped dropping the flag — it translates it into
+    /// `HELIOS_HEAP_FLAG_VENUS_EXPORT` and counts `HeapPrimaryVenusExport` — so this
+    /// counter is now reachable **only from the heap-only arm**, where the
+    /// declaration cannot be honoured because there is no resource to give an
+    /// allocation to.
     ///
-    /// * still expected **0** until something drives a real D3D12 swapchain;
-    /// * non-zero now means a primary arrived **and an identity entry should
-    ///   exist for it** — read it against `IdentityRecorded`, which is the same
-    ///   event counted at the other site. Equal is correct. `HeapPrimaryFlagDropped`
-    ///   ahead of `IdentityRecorded` means primaries arrived on an arm that cannot
-    ///   record one (check `HeapPrimaryWithoutResource` and `IdentityTableFull`).
-    ///
-    /// ⛔ And the arrival itself is still **UNMEASURED**: this counter reads 0 in
-    /// all 150 logged `umd12` runs under `tmp/`, none of which was a swapchain
-    /// workload. `KMD_IMPACT.md` §14a.3 asserts the flag *"arrives"*; the only
-    /// instrument for that claim has never been non-zero, so it is untested rather
-    /// than confirmed. `ResourceOptimizationPrimary` is the counter that says
-    /// whether the other signal arrives instead.
+    /// ⇒ It is therefore no longer the census of primaries; `HeapPrimaryVenusExport`
+    /// is. It is expected **0**, and non-zero means the same thing
+    /// `HeapPrimaryWithoutResource` means — the two now fire together and either one
+    /// alone would be a finding about this file rather than about the runtime.
     heap_primary_flag_dropped: RefusalCounter,
     /// A non-zero `AlignmentRestriction` arrived on
     /// `pfnCheckResourceAllocationInfo` and was NOT forwarded to the engine, so
@@ -3257,13 +4040,20 @@ struct L4Refusals {
     /// this counter was added with.
     heap_block_unreclaimed: RefusalCounter,
     // -- UP-4, the resource -> kernel-allocation-identity table -------------
-    /// Entries made in the `forward12::identity12` table, i.e. `PRIMARY`
-    /// committed resources this driver saw. ⚠ **Not a refusal — the census.**
-    /// Expected **0** until something drives a real D3D12 swapchain through this
-    /// driver, and it must move in lock-step with `HeapPrimaryFlagDropped`: they
-    /// are two readings of the same event (the flag arriving) taken at different
-    /// sites, so a disagreement means the admission predicate and the flag test
-    /// have drifted apart.
+    /// Entries made in the `forward12::identity12` table, i.e. `PRIMARY` committed
+    /// resources this driver **successfully adopted**. ⚠ **Not a refusal — the
+    /// census**, and since UP-5 it is also the count of live-or-once-live WDDM
+    /// allocations this driver owns.
+    ///
+    /// ⚠ **Re-graded at UP-5**: it used to be expected to move in lock-step with
+    /// `HeapPrimaryFlagDropped`. Its partner is now `HeapPrimaryVenusExport` (the
+    /// primaries this driver *tried* to adopt), and the two are deliberately **not**
+    /// equal-by-construction any more: every refusal in `adopt_presentable` widens
+    /// the gap, and the gap is the interesting quantity. `HeapPrimaryVenusExport −
+    /// IdentityRecorded` is the number of primaries that could not be adopted, and
+    /// the counter that says why is one of `IdentityVenusUnresolved`,
+    /// `IdentityVkMemoryUnresolved`, `IdentityOffsetNonZero`, `IdentityResIdShared`,
+    /// `AllocateCb*`, `OwnershipTransferFailed` or `IdentityTableFull`.
     identity_recorded: RefusalCounter,
     /// A primary arrived and the identity table was **full**, so its identity was
     /// dropped and the resource cannot be presented. ⛔ Expected 0. The bound is
@@ -3284,28 +4074,35 @@ struct L4Refusals {
     /// needed. It counts only removals that found an entry, so ordinary
     /// non-presentable destroys do not move it.
     identity_removed: RefusalCounter,
-    /// An identity was recorded with `vk_memory == 0`. ⛔ **Expected to equal
-    /// `IdentityRecorded` today, and that is the honest reading of UP-4**: the
-    /// engine-side accessor exists (`ID3D12DXVKInteropDevice4::
-    /// GetVulkanResourceMemoryInfo`, UP-2) but no `bridge12` entry point calls
-    /// it, so this driver has no path to a `VkDeviceMemory`. It goes to 0 in the
-    /// commit that adds that bridge accessor, and until it does UP-5 cannot run.
+    /// ⚠⚠ **RE-GRADED at UP-5, and its bump site moved.** It used to count *entries
+    /// recorded with `vk_memory == 0`*, and was expected to equal `IdentityRecorded`
+    /// because no bridge accessor existed. Both halves are now false: the accessor
+    /// exists, and an entry with a zero half is no longer representable — the table's
+    /// invariant is that an entry exists **iff** a WDDM allocation exists.
+    ///
+    /// It now counts **a primary create refused because the ENGINE could not name the
+    /// memory the resource is bound to** — `IdentityStatus::BadArg`, `NoInterop` or
+    /// `EngineRefused`. ⛔ Expected 0, and non-zero points at the vkd3d fork or the
+    /// interop interface, not at the ICD. Its sibling below is the other half.
     identity_vk_memory_unresolved: RefusalCounter,
-    /// An identity was recorded with `venus_res_id == 0`. ⛔ Same shape as
-    /// `IdentityVkMemoryUnresolved` and a **separate** link: the venus half needs
-    /// the ICD's `helios_venus_memory_res_id` / `helios_venus_memory_alloc_info`
-    /// (`icd/mesa/src/virtio/vulkan/vn_renderer_helios.c:619-632`), and this
-    /// crate's bridge resolves the process ICD anchor for `venus_context_id()`
-    /// alone. Two counters because the two links close in different commits, and
-    /// one counter could not say which was still missing. ⛔ A zero
-    /// `adopt_resource_id` is what makes the KMD *create* rather than *adopt*
-    /// (`protocol/src/wddm.rs:131-138`), so UP-5 must refuse on this rather than
-    /// pass the zero through.
+    /// ⚠⚠ **RE-GRADED at UP-5 with its sibling above.** It now counts **a primary
+    /// create refused because the memory has no VENUS RESOURCE** —
+    /// `IdentityStatus::NoIcd`, `NoExport` or `IcdRefused`. The engine named the
+    /// memory; the ICD had no resource id for it.
+    ///
+    /// ⛔ **This is the counter that says the export chain did not engage**, and it is
+    /// the most likely non-zero on a first run: `VKD3D_HEAP_FLAG_HELIOS_VENUS_EXPORT`
+    /// must reach the fork (check it against `HeapPrimaryVenusExport`), the fork must
+    /// take its export arm, and the anchored ICD must export
+    /// `helios_venus_memory_res_id`. A zero `adopt_resource_id` is what makes the KMD
+    /// *create* rather than *adopt* (`protocol/src/wddm.rs:131-138`), so it is refused
+    /// here rather than passed through — which is what the old grading already
+    /// demanded of UP-5.
     identity_venus_unresolved: RefusalCounter,
     /// `D3D12DDI_HEAP_FLAG_PRIMARY` arrived on the **heap-only** arm, with no
     /// resource description. ⛔ Expected 0: `ResourceHeaps.md:897` says the flag
     /// obliges the driver to create a resource simultaneously with the heap, and
-    /// `note_presentable_identity`'s admission predicate depends on that
+    /// `adopt_presentable`'s admission predicate depends on that
     /// obligation holding. A hit means a primary reached this driver with no
     /// `ID3D12Resource` to key an identity on, so it went unrecorded.
     heap_primary_without_resource: RefusalCounter,
@@ -3324,6 +4121,79 @@ struct L4Refusals {
     /// `HeapPrimaryFlagDropped` still 0 after a real swapchain run means the
     /// admission predicate must move to description-matching against this query.
     resource_optimization_primary: RefusalCounter,
+    // -- UP-5, the kernel allocation -----------------------------------------
+    /// `D3D12DDI_HEAP_FLAG_PRIMARY` arrived on the **committed** arm and was
+    /// translated into [`HELIOS_HEAP_FLAG_VENUS_EXPORT`]. ⚠ Not a refusal — the
+    /// census of primaries this driver tried to adopt, and the numerator every
+    /// counter below is read against.
+    ///
+    /// ⛔ **It is also the instrument for the one claim this whole path rests on
+    /// and nothing has ever measured**: `KMD_IMPACT.md` §14a.3 asserts the heap flag
+    /// *"arrives"*, and `HeapPrimaryFlagDropped` — its only previous instrument —
+    /// read 0 in all 150 logged `umd12` runs, none of them a swapchain workload. If
+    /// this reads 0 after a real D3D12 swapchain run then the admission predicate is
+    /// wrong, not the adoption: check `ResourceOptimizationPrimary`, which is the
+    /// competing signal.
+    heap_primary_venus_export: RefusalCounter,
+    /// A primary's memory came back with a non-zero **offset**, i.e. the engine
+    /// suballocated it. ⛔ Expected 0, and non-zero means the fork's dedicated
+    /// arm did not engage — the create is refused, because one venus resource id
+    /// shared between D3D12 resources breaks the adopt model and D3D11's own path
+    /// requires `memory_offset == 0`.
+    identity_offset_nonzero: RefusalCounter,
+    /// ⛔⛔ **Two live resources claimed one `venus_res_id`** — the rotation-collapse
+    /// detector (`identity12::RecordOutcome::ResIdShared`). Expected 0. Non-zero
+    /// means every swapchain buffer would name one host surface, which is the 56th
+    /// session's *"scanout pinned to ONE resource"* class reached through
+    /// suballocation instead of through the scanout selector.
+    identity_res_id_shared: RefusalCounter,
+    /// A primary was adopted with `ctx_id == 0`, because the instance-scoped venus
+    /// context id was unavailable. ⚠ **Not a refusal and not a defect**: the KMD's
+    /// adopt path never reads `ctx_id`, so the field is a diagnostic that reaches
+    /// `HeliosWddmOpenIdentity::ctx_id` — *"diagnostic only"* by that record's own
+    /// doc. Non-zero means the ICD is absent or predates
+    /// `helios_venus_instance_ctx_id`.
+    identity_ctx_id_unavailable: RefusalCounter,
+    /// vkd3d's `memory_size` and the ICD's `venus_alloc_size` **disagreed** for one
+    /// `VkDeviceMemory`. ⛔ Expected 0: they are two readings of one
+    /// `VkMemoryAllocateInfo::allocationSize`. Non-zero means one of them describes a
+    /// different object, and a cross-process import is exact-size — so an opener will
+    /// reject the surface.
+    identity_alloc_size_disagreement: RefusalCounter,
+    /// `pfnAllocateCb` was absent from the corelayer table, or the table itself was
+    /// null. ⛔ Expected 0 — `create_device` refuses a null `p12UMCallbacks` — and a
+    /// hit means no primary can be adopted at all.
+    allocate_cb_missing: RefusalCounter,
+    /// `pfnAllocateCb` returned a failure HRESULT. ⛔ Expected 0. The HRESULT is
+    /// dxgkrnl's own and is logged; it is the channel that would report a rejected
+    /// private-data record, a rejected flag combination, or a kernel that refused
+    /// the adopt.
+    allocate_cb_failed: RefusalCounter,
+    /// `pfnAllocateCb` succeeded and left `hAllocation == 0`. ⛔ Expected 0: a
+    /// runtime contract violation, refused here rather than allowed to become a 0
+    /// in `pfnPresent`'s `BroadcastSrcAllocation[0]`.
+    allocate_cb_no_handle: RefusalCounter,
+    /// The venus ICD would not hand the host resource's ownership over after the
+    /// allocation was minted. ⛔ Expected 0, and it is a **defect** rather than a
+    /// degraded read: the KMD's allocation and the ICD would both unref the host
+    /// resource. The allocation is rolled back and the create fails.
+    ownership_transfer_failed: RefusalCounter,
+    /// `pfnDeallocateCb` was unreachable at destroy — absent from the table, or the
+    /// device did not resolve. ⛔ Expected 0, and every hit is **one leaked WDDM
+    /// allocation**, unreachable until process exit.
+    deallocate_cb_missing: RefusalCounter,
+    /// `pfnDeallocateCb` returned a failure HRESULT. ⛔ Expected 0; same leak.
+    deallocate_cb_failed: RefusalCounter,
+    /// The kernel **wrote back** into an allocation's private driver data at create
+    /// time — its `meta.pitch`, `venus_alloc_size` or `memory_type_index` differed
+    /// from what this driver sent. ⚠ **Not a refusal, and its expected value is
+    /// UNKNOWN**, which is why it exists: `DxgkDdiCreateAllocation` recomputes all
+    /// three from what the host actually did, and whether that reaches the UMD's
+    /// buffer at CREATE (rather than only at OPEN, where `write_open_identity`
+    /// certainly writes) is established nowhere in the doc set. Non-zero says the
+    /// kernel is the authority for those three fields and a future opener should read
+    /// them back rather than trust the creator's claim.
+    alloc_private_written_back: RefusalCounter,
 }
 
 static L4_REFUSALS: L4Refusals = L4Refusals {
@@ -3378,6 +4248,18 @@ static L4_REFUSALS: L4Refusals = L4Refusals {
     identity_venus_unresolved: RefusalCounter::new("IdentityVenusUnresolved"),
     heap_primary_without_resource: RefusalCounter::new("HeapPrimaryWithoutResource"),
     resource_optimization_primary: RefusalCounter::new("ResourceOptimizationPrimary"),
+    heap_primary_venus_export: RefusalCounter::new("HeapPrimaryVenusExport"),
+    identity_offset_nonzero: RefusalCounter::new("IdentityOffsetNonZero"),
+    identity_res_id_shared: RefusalCounter::new("IdentityResIdShared"),
+    identity_ctx_id_unavailable: RefusalCounter::new("IdentityCtxIdUnavailable"),
+    identity_alloc_size_disagreement: RefusalCounter::new("IdentityAllocSizeDisagreement"),
+    allocate_cb_missing: RefusalCounter::new("AllocateCbMissing"),
+    allocate_cb_failed: RefusalCounter::new("AllocateCbFailed"),
+    allocate_cb_no_handle: RefusalCounter::new("AllocateCbNoHandle"),
+    ownership_transfer_failed: RefusalCounter::new("OwnershipTransferFailed"),
+    deallocate_cb_missing: RefusalCounter::new("DeallocateCbMissing"),
+    deallocate_cb_failed: RefusalCounter::new("DeallocateCbFailed"),
+    alloc_private_written_back: RefusalCounter::new("AllocPrivateWrittenBack"),
 };
 
 /// L4's refusal set, printed by `crate::log_refusal_summary` at this lane's
@@ -3440,4 +4322,16 @@ pub(crate) static REFUSALS: &[&RefusalCounter] = &[
     &L4_REFUSALS.identity_venus_unresolved,
     &L4_REFUSALS.heap_primary_without_resource,
     &L4_REFUSALS.resource_optimization_primary,
+    &L4_REFUSALS.heap_primary_venus_export,
+    &L4_REFUSALS.identity_offset_nonzero,
+    &L4_REFUSALS.identity_res_id_shared,
+    &L4_REFUSALS.identity_ctx_id_unavailable,
+    &L4_REFUSALS.identity_alloc_size_disagreement,
+    &L4_REFUSALS.allocate_cb_missing,
+    &L4_REFUSALS.allocate_cb_failed,
+    &L4_REFUSALS.allocate_cb_no_handle,
+    &L4_REFUSALS.ownership_transfer_failed,
+    &L4_REFUSALS.deallocate_cb_missing,
+    &L4_REFUSALS.deallocate_cb_failed,
+    &L4_REFUSALS.alloc_private_written_back,
 ];
