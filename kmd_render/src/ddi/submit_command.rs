@@ -278,6 +278,16 @@ pub(crate) fn record_present_handoff_telemetry() {
         b"WfBHold",
         crate::virtio::gpu::WDDM_HEAD_BLOCKED_HOLD.load(Ordering::Relaxed),
     );
+    // A5 / K-F2's price tag: heads whose tagged-namespace dependency was rebased
+    // onto the conservative wire watermark after `WddmHeadMs`. Each one is a DMA
+    // fence released while its named producer may not have completed, taken in
+    // preference to the 256-entry overflow (the same lie times 256 plus a lease
+    // teardown) or an adapter-wide TDR. MUST read 0 on a healthy session; if it
+    // moves, whichever of `WfBStrm`/`WfBBlt` moved with it is the diagnosis.
+    crate::diag::record_named_bytes(
+        b"WfBReb",
+        crate::virtio::gpu::WDDM_HEAD_REBASED.load(Ordering::Relaxed),
+    );
     // UV3's instrument (KMD_IMPACT §14a.1). Until now the ring pair was read in
     // exactly ONE place — words 33/34 of the `'HDBG'` report below, which
     // dxgkrnl collects only on a TDR — so "read the ring counters before and

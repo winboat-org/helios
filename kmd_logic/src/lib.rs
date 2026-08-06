@@ -4972,6 +4972,139 @@ mod snapshot_bind_tests {
 /// is a PANIC — a silent graphics deadlock — for exactly the input the
 /// instrument above it exists to observe. Saturating it makes that input
 /// unrepresentable, and puts a host-run test under the claim.
+/// The consumer-side liveness bound on the WDDM FIFO head (`WddmHeadMs`;
+/// `KMD_IMPACT.md` §14a.2 K-F2 and `docs/dx12/PENDING.md` §1 A5).
+///
+/// Two rules live here because both are places an operator value or a clock edge
+/// could silently break correctness, and neither is testable inside `kmd_render`.
+pub mod wddm_head_bound {
+    /// Clamp an operator-supplied bound, in ms.
+    ///
+    /// ⛔ CLAMPED IN BOTH DIRECTIONS, and the two directions protect different
+    /// things: too LARGE reinstates the unbounded head and therefore the
+    /// adapter-wide TDR the bound exists to prevent, too SMALL turns a last-resort
+    /// release into a continuous early-fence generator (the 0ab-B stale-frame
+    /// class). 0 is preserved exactly — it is the A/B disable and must stay
+    /// reachable (CLAUDE.md rule 8).
+    pub const fn clamp_bound_ms(raw: u32, min: u32, max: u32) -> u32 {
+        if raw == 0 {
+            return 0;
+        }
+        if raw < min {
+            return min;
+        }
+        if raw > max {
+            return max;
+        }
+        raw
+    }
+
+    /// What a blocked look at the FIFO head should do about the bound.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub enum Action {
+        /// The bound is disabled (`WddmHeadMs = 0`): historical unbounded head.
+        Disabled,
+        /// Nothing was armed yet; arm the deadline at this absolute time and keep
+        /// waiting. The FIRST blocked look at this entry as head does this.
+        Arm(u64),
+        /// Armed and not yet expired: keep waiting.
+        Wait,
+        /// Expired: rebase this head's tagged dependencies onto the conservative
+        /// wire watermark.
+        Rebase,
+        /// Already rebased once. A second rebase could only install a NEWER
+        /// `next_wire_fence`, i.e. a STRICTER dependency, so it is forbidden rather
+        /// than merely pointless.
+        AlreadyRebased,
+    }
+
+    /// Decide one blocked look. `deadline_100ns == 0` means "not armed".
+    pub const fn look(bound_ms: u32, now_100ns: u64, deadline_100ns: u64, rebased: bool) -> Action {
+        if bound_ms == 0 {
+            return Action::Disabled;
+        }
+        if rebased {
+            return Action::AlreadyRebased;
+        }
+        if deadline_100ns == 0 {
+            // 100 ns units. A saturating add keeps an exhausted interrupt-time
+            // representation from wrapping into a deadline already in the past —
+            // which would rebase the very next look.
+            return Action::Arm(now_100ns.saturating_add(bound_ms as u64 * 10_000));
+        }
+        if now_100ns < deadline_100ns {
+            return Action::Wait;
+        }
+        Action::Rebase
+    }
+}
+
+#[cfg(test)]
+mod wddm_head_bound_tests {
+    use super::wddm_head_bound::{Action, clamp_bound_ms, look};
+
+    const MIN: u32 = 100;
+    const MAX: u32 = 1000;
+
+    #[test]
+    fn zero_survives_the_clamp_because_it_is_the_ab_disable() {
+        assert_eq!(clamp_bound_ms(0, MIN, MAX), 0);
+    }
+
+    #[test]
+    fn an_operator_typo_cannot_reinstate_the_tdr() {
+        // The failure this guards: WddmHeadMs=100000 would be 100 s, far past the
+        // 2 s default TdrDelay, i.e. the bound never acts.
+        assert_eq!(clamp_bound_ms(100_000, MIN, MAX), MAX);
+        assert_eq!(clamp_bound_ms(u32::MAX, MIN, MAX), MAX);
+    }
+
+    #[test]
+    fn an_operator_typo_cannot_turn_the_last_resort_into_a_policy() {
+        // 1 ms would rebase healthy frames continuously, which is 0ab-B on purpose.
+        assert_eq!(clamp_bound_ms(1, MIN, MAX), MIN);
+        assert_eq!(clamp_bound_ms(MIN - 1, MIN, MAX), MIN);
+        assert_eq!(clamp_bound_ms(MIN, MIN, MAX), MIN);
+        assert_eq!(clamp_bound_ms(250, MIN, MAX), 250);
+    }
+
+    #[test]
+    fn the_first_blocked_look_arms_and_does_not_release() {
+        assert_eq!(look(250, 1_000, 0, false), Action::Arm(1_000 + 2_500_000));
+    }
+
+    #[test]
+    fn an_armed_head_waits_until_the_deadline_and_then_rebases_once() {
+        let deadline = 1_000 + 2_500_000;
+        assert_eq!(look(250, deadline - 1, deadline, false), Action::Wait);
+        assert_eq!(look(250, deadline, deadline, false), Action::Rebase);
+        // ...and never again, however long it stays blocked afterwards.
+        assert_eq!(
+            look(250, deadline + 10_000_000, deadline, true),
+            Action::AlreadyRebased
+        );
+    }
+
+    #[test]
+    fn the_disabled_bound_short_circuits_every_other_state() {
+        assert_eq!(look(0, 0, 0, false), Action::Disabled);
+        assert_eq!(look(0, u64::MAX, 1, false), Action::Disabled);
+        assert_eq!(look(0, u64::MAX, 1, true), Action::Disabled);
+    }
+
+    #[test]
+    fn an_exhausted_interrupt_clock_does_not_arm_a_deadline_in_the_past() {
+        // Without the saturating add the arm would wrap to a small number and the
+        // NEXT look would rebase immediately — a released fence caused by a clock,
+        // not by a stuck producer.
+        let Action::Arm(deadline) = look(250, u64::MAX, 0, false) else {
+            panic!("expected Arm");
+        };
+        assert_eq!(deadline, u64::MAX);
+        assert_eq!(look(250, u64::MAX - 1, deadline, false), Action::Wait);
+    }
+}
+
 /// How a WDDM DMA fence's wire-fence dependency is chosen from the boundary a
 /// guest submission named. Defects A4 and A6 of `docs/dx12/PENDING.md` §1 are both
 /// decisions in this one table, which is why the table is here and testable rather
@@ -5130,7 +5263,11 @@ mod wddm_boundary_tests {
             let s = select(id, BASE, NEXT, true);
             let out_of_range = id == 0 || id >= NEXT;
             let foreign = !out_of_range && id < BASE;
-            assert_eq!(s.rejection == Rejection::OutOfRange, out_of_range, "id {id}");
+            assert_eq!(
+                s.rejection == Rejection::OutOfRange,
+                out_of_range,
+                "id {id}"
+            );
             assert_eq!(
                 s.rejection == Rejection::ForeignGeneration,
                 foreign,
@@ -5272,10 +5409,7 @@ pub mod present_stream {
     /// `SyncScanoutBind`: abandoning a stack waiter detaches only the waiter,
     /// and a late `RESP_OK` must still advance lifecycle selection, while any
     /// non-OK response must not.
-    pub const fn terminal_on_response_ok<T: Copy>(
-        response_ok: bool,
-        tag: Option<T>,
-    ) -> Option<T> {
+    pub const fn terminal_on_response_ok<T: Copy>(response_ok: bool, tag: Option<T>) -> Option<T> {
         if response_ok {
             tag
         } else {

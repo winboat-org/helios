@@ -306,8 +306,9 @@ const MAX_FENCE_EVENTS: usize = 256;
 /// handle ABI now lives in `helios_kmd_logic::present_stream`, because the six
 /// tests that cover it could never run inside this `panic = "abort"` cdylib. Two
 /// copies of these numbers would let the tested rules and the shipped ones drift.
+/// (`INDEX_BITS` has no alias here on purpose: after the delegation nothing in
+/// this crate packs or unpacks a handle by hand, and an unused alias is a warning.)
 const MAX_PRESENT_STREAMS: usize = helios_kmd_logic::present_stream::MAX_STREAMS;
-const PRESENT_STREAM_INDEX_BITS: u32 = helios_kmd_logic::present_stream::INDEX_BITS;
 const PRESENT_STREAM_GENERATION_MAX: u32 = helios_kmd_logic::present_stream::GENERATION_MAX;
 /// Bit 63 distinguishes this from the legacy exclusive wire-fence namespace.
 pub const PRESENT_STREAM_BOUNDARY_TAG: u64 = helios_kmd_logic::present_stream::BOUNDARY_TAG;
@@ -331,6 +332,43 @@ const WDDM_HOLD_MS_MAX: u32 = 250;
 /// 60 Hz heartbeat in `adapter/kobj.rs` must test it WITHOUT taking `virtio_lock`
 /// — it is that heartbeat that provides the hold's release edge.
 pub static WDDM_HOLD_MS: AtomicU32 = AtomicU32::new(0);
+/// `WddmHeadMs`: how long the head of the WDDM FIFO may stay blocked on a
+/// TAGGED-NAMESPACE dependency before that dependency is rebased onto the
+/// conservative wire watermark. Snapshotted once at transport init and CLAMPED —
+/// see [`WDDM_HEAD_MS_MIN`] / [`WDDM_HEAD_MS_MAX`].
+///
+/// A static, not a `VirtioGpu` field, for the same reason as [`WDDM_HOLD_MS`]: one
+/// read site, and readable without `virtio_lock`.
+pub static WDDM_HEAD_MS: AtomicU32 = AtomicU32::new(WDDM_HEAD_MS_DEFAULT);
+/// `WddmHeadMs`'s shipping default, in ms, and it is a DECISION (CLAUDE.md rule 8).
+///
+/// The bound exists because `present_stream_marker_boundary` accepts any nonzero
+/// marker value and bounds it in no way, so a guest can name a boundary
+/// `present_stream_slot_ready` will never satisfy — and `wddm_pending` is
+/// adapter-global and strictly head-of-line, so that blocks EVERY context, DWM's
+/// presents included, until either the 256-entry overflow drops 256 fences on the
+/// floor or dxgkrnl TDRs the adapter. `KMD_IMPACT.md` §14a.2 K-F2, which also
+/// records why the acceptance-side guard (`value <= submitted_value`) is refuted:
+/// on the shipping default the marker is delivered BEFORE the frame's
+/// `vkQueueSubmit` deliberately, so that test would refuse every legitimate frame.
+///
+/// 250 ms is picked, not tuned: an eighth of the default `TdrDelay` (2 s), so
+/// several rebases fit inside one TDR window, and ~68x the measured 3.7 ms/frame
+/// producer floor, so no legitimate frame's producer can reach it without the
+/// desktop having visibly frozen already.
+///
+/// 0 is the same-boot A/B disable and restores the historical unbounded head
+/// exactly — which is what makes the rebase's cost measurable rather than argued.
+const WDDM_HEAD_MS_DEFAULT: u32 = 250;
+/// Ceiling for `WddmHeadMs`, IN CODE. An operator typo (`WddmHeadMs=100000`) must
+/// not be able to reinstate the unbounded head and hence the TDR; 1 s is half the
+/// default `TdrDelay`, which is the largest bound that can still act before one.
+const WDDM_HEAD_MS_MAX: u32 = 1000;
+/// FLOOR for a nonzero `WddmHeadMs`, IN CODE, and it protects correctness rather
+/// than liveness: a rebase RELEASES a fence whose named producer has not completed,
+/// which is the 0ab-B stale/black-frame class. A 1 ms bound would rebase healthy
+/// frames continuously. 100 ms is ~27 frames at the measured producer floor.
+const WDDM_HEAD_MS_MIN: u32 = 100;
 /// Max response bytes a synchronous command may expect (copied into the
 /// waiter's [`SyncWaitBlock`]; the largest runtime response is
 /// `VirtioGpuRespMapInfo`. `init`'s big GET_DISPLAY_INFO reply stays on the
@@ -1630,6 +1668,18 @@ struct WddmPending {
     /// signal behind our DMA packets — and nothing in the shipping path reads it,
     /// since the knob defaults to 0.
     hold_until_100ns: u64,
+    /// `WddmHeadMs`: absolute interrupt-time deadline (100 ns units) after which
+    /// this entry's TAGGED-namespace dependencies are rebased onto the conservative
+    /// wire watermark. 0 until the first blocked look at this entry AS HEAD arms it.
+    ///
+    /// ⚠ Armed lazily, and from the HEAD position only, because the bound is on how
+    /// long the head may block. An entry that sits in the FIFO behind legitimately
+    /// slow predecessors has not blocked on anything of its own.
+    head_deadline_100ns: u64,
+    /// Set once this entry has been rebased. A second rebase could only make the
+    /// dependency STRICTER — it would install a NEWER `next_wire_fence` — so it is
+    /// forbidden rather than merely pointless.
+    rebased: bool,
 }
 
 /// One WDDM submission represents every WindowedBlt terminal for the same
@@ -2319,6 +2369,21 @@ impl VirtioGpu {
         WDDM_HOLD_MS.store(
             crate::diag::read_config_dword(crate::diag::knobs::WDDM_HOLD_MS, 0)
                 .min(WDDM_HOLD_MS_MAX),
+            Ordering::Relaxed,
+        );
+        // `WddmHeadMs` (K-F2 / A5's consumer-side head bound). Snapshotted with
+        // every other knob, and CLAMPED IN BOTH DIRECTIONS rather than trusted: too
+        // large reinstates the unbounded head and hence the TDR, too small turns a
+        // last-resort rebase into a continuous early-fence generator (0ab-B). 0
+        // stays 0 — it is the A/B disable and must remain reachable.
+        let head_ms =
+            crate::diag::read_config_dword(crate::diag::knobs::WDDM_HEAD_MS, WDDM_HEAD_MS_DEFAULT);
+        WDDM_HEAD_MS.store(
+            helios_kmd_logic::wddm_head_bound::clamp_bound_ms(
+                head_ms,
+                WDDM_HEAD_MS_MIN,
+                WDDM_HEAD_MS_MAX,
+            ),
             Ordering::Relaxed,
         );
         // (The old Gate-2 venus ctx self-test is gone: the StartDevice venus
@@ -5984,8 +6049,19 @@ impl VirtioGpu {
         if self.wddm_pending.len() >= MAX_WDDM_PENDING {
             // Degrade to the old immediate model for this fence — signaling the
             // newest (monotonically largest) fence implicitly completes the
-            // queued older ones, so drop them too. Loud, counted, and
-            // practically unreachable (VidSch queues far fewer than 256).
+            // queued older ones, so drop them too. Loud and counted.
+            //
+            // ⚠ THE "PRACTICALLY UNREACHABLE (VidSch queues far fewer than 256)"
+            // LINE THAT USED TO BE HERE IS RETIRED (A5, 2026-08-06). It was an
+            // assumption about dxgkrnl's queue depths — closed source, and this
+            // FIFO is adapter-global across every context, so no single queue depth
+            // bounds it — and the D3D12 arm adds a writer at
+            // `pfnExecuteCommandLists` frequency rather than at present frequency.
+            // What actually keeps this path away is now stated and measured:
+            // `WddmHeadMs` bounds how long a head may block on a boundary that may
+            // be unsatisfiable, so 256 outstanding entries requires 256 genuinely
+            // in-flight producers. If this counter ever moves, `WfBWire`/`WfBReb`
+            // say whether the host stopped retiring or the bound was disabled.
             //
             // ⚠ The caller still releases every outstanding scan-out lease when
             // this returns true after an overflow. The leases no longer gate a
@@ -6012,6 +6088,8 @@ impl VirtioGpu {
             blt_token,
             blt_stream_boundary,
             hold_until_100ns,
+            head_deadline_100ns: 0,
+            rebased: false,
         });
         false
     }
@@ -6044,10 +6122,15 @@ impl VirtioGpu {
     /// Whether the last [`Self::note_wddm_submission`] overflowed the pending
     /// FIFO, and the caller therefore owes a lease release.
     ///
-    /// A counter read rather than a second return value, because the overflow is
-    /// practically unreachable and threading a tuple through the one call site
-    /// would put the rare path in everyone's way. The caller compares before and
-    /// after; `WDDM_PENDING_OVERFLOWS` is cumulative and monotonic.
+    /// A counter read rather than a second return value, because the overflow is a
+    /// rare last resort and threading a tuple through the one call site would put
+    /// it in everyone's way. The caller compares before and after;
+    /// `WDDM_PENDING_OVERFLOWS` is cumulative and monotonic.
+    ///
+    /// ⚠ "PRACTICALLY UNREACHABLE" WAS THE OLD WORDING AND IT IS RETIRED (A5): it
+    /// rested on an assumption about dxgkrnl's queue depths, and this FIFO is
+    /// adapter-global across every context. What keeps it away is now
+    /// `WddmHeadMs` — see the overflow arm in [`Self::note_wddm_submission`].
     pub fn wddm_pending_overflows() -> u32 {
         WDDM_PENDING_OVERFLOWS.load(Ordering::Relaxed)
     }
@@ -6063,76 +6146,209 @@ impl VirtioGpu {
     /// `SubmissionFenceId` as a watermark and requires monotonic completion, so
     /// skipping ahead is bugcheck 0x119/1.
     pub fn take_one_ready_wddm(&mut self, _order: &crate::adapter::NotifyOrdered<'_>) -> WddmTake {
-        let (
-            watermark,
-            wire_boundary,
-            domain,
-            stream_boundary,
-            blt_token,
-            blt_stream_boundary,
-            hold_until,
-        ) = {
-            let Some(head) = self.wddm_pending.front() else {
-                return WddmTake::Empty;
+        // TWO PASSES AT MOST, and the loop exists for LIVENESS, not for retrying:
+        // `rebase_blocked_head` can succeed at most once per entry
+        // (`WddmPending::rebased`), and the `pass` guard bounds it again in case
+        // that ever breaks. Without the second pass a rebase would return
+        // `BlockedOnProducer`, which ENDS the DPC's drain loop
+        // (`ddi/interrupt.rs`), so a head this driver just released would then sit
+        // there waiting for an unrelated wake edge — and the whole point of the
+        // bound is that no such edge is guaranteed.
+        let mut pass = 0u8;
+        loop {
+            pass += 1;
+            let (
+                watermark,
+                wire_boundary,
+                domain,
+                stream_boundary,
+                blt_token,
+                blt_stream_boundary,
+                hold_until,
+            ) = {
+                let Some(head) = self.wddm_pending.front() else {
+                    return WddmTake::Empty;
+                };
+                (
+                    head.watermark,
+                    head.wire_boundary,
+                    head.domain,
+                    head.stream_boundary,
+                    head.blt_token,
+                    head.blt_stream_boundary,
+                    head.hold_until_100ns,
+                )
             };
-            (
-                head.watermark,
-                head.wire_boundary,
-                head.domain,
-                head.stream_boundary,
-                head.blt_token,
-                head.blt_stream_boundary,
-                head.hold_until_100ns,
-            )
-        };
-        // Evaluated as three named conditions rather than one `||` chain: the
-        // FIFO is strictly ordered, so whatever paces its head paces every
-        // WDDM fence behind it, and "blocked" without saying ON WHAT is not an
-        // instrument. Exactly one counter moves per blocked look.
-        if !self.wire_boundary_ready(watermark, domain, wire_boundary) {
-            WDDM_HEAD_BLOCKED_WIRE.fetch_add(1, Ordering::Relaxed);
-            return WddmTake::BlockedOnProducer;
-        }
-        if !stream_boundary.map_or(true, |boundary| self.scanout_boundary_ready(boundary)) {
-            WDDM_HEAD_BLOCKED_STREAM.fetch_add(1, Ordering::Relaxed);
-            return WddmTake::BlockedOnProducer;
-        }
-        if !match (blt_token, blt_stream_boundary) {
-            (Some(token), Some(boundary)) => {
-                self.windowed_blt_terminal_prefix_ready(token, boundary)
-            }
-            (None, _) => true,
-            _ => false,
-        } {
-            WDDM_HEAD_BLOCKED_BLT.fetch_add(1, Ordering::Relaxed);
-            return WddmTake::BlockedOnProducer;
-        }
-        // FOURTH ARM, AND DELIBERATELY LAST (`WddmHoldMs`, UV1). Placed after the
-        // three real dependencies so `WfBHold` can only mean "an otherwise READY
-        // packet was artificially delayed" — which is the experiment's signal —
-        // and so the meaning of the other three counters is unchanged. Inert
-        // unless the knob is on AND the head is a D3D12 ECL packet.
-        if hold_until != 0 {
-            let mut qpc_timestamp = 0;
-            // SAFETY: scalar any-IRQL time read, as in `wddm_hold_deadline`.
-            let now = unsafe { KeQueryInterruptTimePrecise(&mut qpc_timestamp) };
-            if now < hold_until {
-                WDDM_HEAD_BLOCKED_HOLD.fetch_add(1, Ordering::Relaxed);
+            // Evaluated as three named conditions rather than one `||` chain: the
+            // FIFO is strictly ordered, so whatever paces its head paces every
+            // WDDM fence behind it, and "blocked" without saying ON WHAT is not an
+            // instrument. Exactly one counter moves per blocked look.
+            if !self.wire_boundary_ready(watermark, domain, wire_boundary) {
+                WDDM_HEAD_BLOCKED_WIRE.fetch_add(1, Ordering::Relaxed);
+                // ⛔ DELIBERATELY NOT REBASABLE, and this is the load-bearing half
+                // of `WddmHeadMs`'s scope. There is nothing to rebase a wire
+                // dependency ONTO: the rebase target IS the conservative wire
+                // prefix at the current `next_wire_fence`, which for a Prefix head
+                // is the same class of wait and for an Exact head is STRICTER (it
+                // still includes the named fence, plus everything below it). A wire
+                // arm that never clears means the host has stopped retiring work
+                // altogether, and the honest outcome of a wedged host is a TDR, not
+                // a fence this driver signals on its behalf.
                 return WddmTake::BlockedOnProducer;
             }
+            if !stream_boundary.map_or(true, |boundary| self.scanout_boundary_ready(boundary)) {
+                WDDM_HEAD_BLOCKED_STREAM.fetch_add(1, Ordering::Relaxed);
+                if pass == 1 && self.rebase_blocked_head() {
+                    continue;
+                }
+                return WddmTake::BlockedOnProducer;
+            }
+            if !match (blt_token, blt_stream_boundary) {
+                (Some(token), Some(boundary)) => {
+                    self.windowed_blt_terminal_prefix_ready(token, boundary)
+                }
+                (None, _) => true,
+                _ => false,
+            } {
+                WDDM_HEAD_BLOCKED_BLT.fetch_add(1, Ordering::Relaxed);
+                if pass == 1 && self.rebase_blocked_head() {
+                    continue;
+                }
+                return WddmTake::BlockedOnProducer;
+            }
+            // FOURTH ARM, AND DELIBERATELY LAST (`WddmHoldMs`, UV1). Placed after
+            // the three real dependencies so `WfBHold` can only mean "an otherwise
+            // READY packet was artificially delayed" — which is the experiment's
+            // signal — and so the meaning of the other three counters is unchanged.
+            // Inert unless the knob is on AND the head is a D3D12 ECL packet.
+            //
+            // ⚠ NOT REBASABLE EITHER, and the two knobs therefore do not interact:
+            // a hold is not a dependency, so `WddmHeadMs` has nothing to rebase it
+            // onto, and letting the head bound cut a hold short would make UV1's
+            // experiment measure `WddmHeadMs` instead of dxgkrnl. The hold is also
+            // reached only when the three real arms are already satisfied, so it can
+            // never be the reason a deadline was armed.
+            if hold_until != 0 {
+                let mut qpc_timestamp = 0;
+                // SAFETY: scalar any-IRQL time read, as in `wddm_hold_deadline`.
+                let now = unsafe { KeQueryInterruptTimePrecise(&mut qpc_timestamp) };
+                if now < hold_until {
+                    WDDM_HEAD_BLOCKED_HOLD.fetch_add(1, Ordering::Relaxed);
+                    return WddmTake::BlockedOnProducer;
+                }
+            }
+            let Some(pending) = self.wddm_pending.pop_front() else {
+                return WddmTake::Empty;
+            };
+            let terminal_prefix = match (blt_token, blt_stream_boundary) {
+                (Some(token), Some(boundary)) => WindowedBltTerminalPrefix::new(token, boundary),
+                _ => None,
+            };
+            WDDM_FENCE_FROM_DPC.fetch_add(1, Ordering::Relaxed);
+            return WddmTake::Ready(WddmReady {
+                pending,
+                terminal_prefix,
+            });
         }
-        let Some(pending) = self.wddm_pending.pop_front() else {
-            return WddmTake::Empty;
+    }
+
+    /// CONSUMER-SIDE LIVENESS FOR THE FIFO HEAD (`WddmHeadMs`; `KMD_IMPACT.md`
+    /// §14a.2 K-F2 and `docs/dx12/PENDING.md` §1 A5). Arms a deadline on the first
+    /// blocked look at this head, and once it expires REBASES the head's
+    /// tagged-namespace dependencies onto the conservative wire watermark. Returns
+    /// `true` only on the call that actually rebases.
+    ///
+    /// # ⚠ THE REBASE RELEASES A FENCE WHOSE NAMED PRODUCER MAY NOT HAVE COMPLETED
+    ///
+    /// That is a LIE, stated plainly because it is one. A present-stream boundary
+    /// names a specific producer completion, and on the shipping default the marker
+    /// is delivered BEFORE the frame's `vkQueueSubmit` on purpose
+    /// (`PsMkAhd`/`PsMkAhdHi` measure exactly that), so the wire prefix this rebases
+    /// onto need not cover it. The frame dxgkrnl then hands onward can be one the
+    /// app has not finished writing — the 0ab-B stale/black-frame class.
+    ///
+    /// # Why that trade was made anyway
+    ///
+    /// `present_stream_marker_boundary` bounds a marker's value in NO way, so a
+    /// guest can name a boundary `present_stream_slot_ready` will never satisfy —
+    /// and an acceptance-side bound cannot fix it (K-F2 records why: legitimate
+    /// lookahead reaches DXVK's `MaxNumQueuedCommandBuffers = 32`, and a forged
+    /// value whose process then stops presenting is unsatisfiable at any bound). The
+    /// FIFO is ADAPTER-GLOBAL and strictly head-of-line, so such a head blocks every
+    /// context including DWM's. The two alternatives are both worse:
+    ///
+    ///  * the 256-entry overflow escape, which completes 256 queued fences at once
+    ///    while their host work is still running AND forces
+    ///    `release_all_scanout_leases(Teardown)` — the same lie times 256, plus the
+    ///    whole adapter's presentation state;
+    ///  * an adapter-wide TDR, i.e. every D3D device in the system lost.
+    ///
+    /// ⇒ one bounded, counted, per-entry release beats both. `WfBReb` is the price
+    /// tag: it must read 0 on a healthy session.
+    ///
+    /// # What it does NOT touch
+    ///
+    /// Only the tagged namespaces. The wire arm is not rebasable (see the WIRE arm
+    /// in [`Self::take_one_ready_wddm`]), the hold arm is not a dependency, and the
+    /// entry's `fence` and FIFO position are untouched — dxgkrnl requires monotonic
+    /// `SubmissionFenceId` completion and this must never become a bypass.
+    fn rebase_blocked_head(&mut self) -> bool {
+        let ms = WDDM_HEAD_MS.load(Ordering::Relaxed);
+        if ms == 0 {
+            return false;
+        }
+        let mut qpc_timestamp = 0;
+        // SAFETY: `KeQueryInterruptTimePrecise` is a scalar time read legal at any
+        // IRQL, as in `wddm_hold_deadline`; it takes no lock and cannot re-enter
+        // this transport.
+        let now = unsafe { KeQueryInterruptTimePrecise(&mut qpc_timestamp) };
+        // Read before the mutable borrow of the FIFO below.
+        let rebase_watermark = self.next_wire_fence;
+        let abandoned_prefix = {
+            let Some(head) = self.wddm_pending.front_mut() else {
+                return false;
+            };
+            // The arm/wait/expire state machine is
+            // `helios_kmd_logic::wddm_head_bound::look`, tested there: this crate
+            // cannot host a test, and an off-by-one or an unsaturated add here would
+            // release fences for a reason that has nothing to do with a producer.
+            use helios_kmd_logic::wddm_head_bound as bound;
+            match bound::look(ms, now, head.head_deadline_100ns, head.rebased) {
+                bound::Action::Disabled | bound::Action::Wait | bound::Action::AlreadyRebased => {
+                    return false;
+                }
+                bound::Action::Arm(deadline) => {
+                    // FIRST blocked look at this entry as head.
+                    head.head_deadline_100ns = deadline;
+                    return false;
+                }
+                bound::Action::Rebase => {}
+            }
+            head.rebased = true;
+            head.stream_boundary = None;
+            head.watermark = rebase_watermark;
+            // The rebase target is the LEGACY watermark in every sense: an
+            // exclusive prefix over every ring, which is "everything this transport
+            // had enqueued at the moment of the rebase". Conservative, and always
+            // eventually satisfied unless the host itself has stopped.
+            head.wire_boundary = WireBoundary::Prefix;
+            head.domain = RetireDomain::IncludingGpu;
+            let prefix = head
+                .blt_token
+                .zip(head.blt_stream_boundary)
+                .and_then(|(token, boundary)| WindowedBltTerminalPrefix::new(token, boundary));
+            head.blt_token = None;
+            head.blt_stream_boundary = None;
+            prefix
         };
-        let terminal_prefix = match (blt_token, blt_stream_boundary) {
-            (Some(token), Some(boundary)) => WindowedBltTerminalPrefix::new(token, boundary),
-            _ => None,
-        };
-        WDDM_FENCE_FROM_DPC.fetch_add(1, Ordering::Relaxed);
-        WddmTake::Ready(WddmReady {
-            pending,
-            terminal_prefix,
-        })
+        if let Some(prefix) = abandoned_prefix {
+            // The FIFO entry OWNED this terminal prefix; dropping the dependency
+            // without detaching the ownership would strand the reader leases the
+            // exact same way the overflow path documents. Same helper, same reason.
+            self.abandon_windowed_blt_wddm_prefix(prefix);
+        }
+        WDDM_HEAD_REBASED.fetch_add(1, Ordering::Relaxed);
+        true
     }
 
     /// Put a popped-but-undelivered submission back at the head of the FIFO.

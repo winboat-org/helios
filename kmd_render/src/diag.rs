@@ -637,6 +637,22 @@ pub mod knobs {
     /// the experiment requires the display half armed — which is the configuration
     /// it runs in anyway. `WfBHold` counts the blocked looks.
     pub const WDDM_HOLD_MS: KnobName = KnobName::new(b"WddmHoldMs");
+    /// `WddmHeadMs` (default 250 = ON; `0` is the A/B disable).
+    ///
+    /// CONSUMER-SIDE LIVENESS FOR THE WDDM FIFO HEAD (`KMD_IMPACT.md` §14a.2
+    /// K-F2, and `docs/dx12/PENDING.md` §1 A5). How long the head may stay blocked
+    /// on a TAGGED-namespace dependency — a present-stream boundary or a
+    /// WindowedBlt terminal, both of which can be unsatisfiable by construction —
+    /// before that dependency is rebased onto the conservative wire watermark and
+    /// counted (`WfBReb`).
+    ///
+    /// ⚠ A rebase RELEASES a fence whose named producer has not completed, so this
+    /// is a bounded last resort, not a policy. The alternative it is traded against
+    /// is an adapter-wide TDR (or the 256-entry FIFO overflow, which drops 256
+    /// fences at once) — see the read site and `WDDM_HEAD_MS_DEFAULT`.
+    /// ⛔ Clamped in code to `[WDDM_HEAD_MS_MIN, WDDM_HEAD_MS_MAX]` when nonzero:
+    /// too large reinstates the TDR, too small re-opens the 0ab-B stale-frame class.
+    pub const WDDM_HEAD_MS: KnobName = KnobName::new(b"WddmHeadMs");
 }
 
 /// Read a service-key REG_DWORD knob, or `default` if absent.

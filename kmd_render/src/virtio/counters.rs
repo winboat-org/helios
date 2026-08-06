@@ -79,6 +79,24 @@ pub static WDDM_HEAD_BLOCKED_BLT: AtomicU32 = AtomicU32::new(0);
 /// somebody is running UV1's experiment, and its magnitude is the number of DPC
 /// looks the hold absorbed, not a duration.
 pub static WDDM_HEAD_BLOCKED_HOLD: AtomicU32 = AtomicU32::new(0);
+/// WDDM FIFO heads whose TAGGED-namespace dependency was REBASED onto the
+/// conservative wire watermark after blocking for `WddmHeadMs` (default 250 ms).
+/// Mirrored as `WfBReb`.
+///
+/// ⛔ THIS IS A PRICE TAG, NOT A HEALTH METRIC. Each increment is one WDDM DMA
+/// fence released while the producer it named had not necessarily completed — the
+/// 0ab-B stale/black-frame class, deliberately, because the two alternatives are
+/// the 256-entry FIFO overflow (the same lie times 256, plus
+/// `release_all_scanout_leases(Teardown)`) and an adapter-wide TDR.
+///
+/// GRADING: **must read 0 on a healthy session.** A nonzero value means some
+/// context named a boundary that stayed unsatisfiable for a quarter of a second,
+/// and `WfBStrm` / `WfBBlt` say which namespace it was — the counter that MOVED
+/// before this one is the diagnosis, since a rebase is always preceded by blocked
+/// looks on exactly one arm. ⚠ It cannot be nonzero from a wire-fence block: that
+/// arm is deliberately not rebasable, so `WfBWire` climbing with `WfBReb` at 0 is
+/// the expected shape of an ordinary busy desktop.
+pub static WDDM_HEAD_REBASED: AtomicU32 = AtomicU32::new(0);
 /// Fenced SUBMIT_3D enqueues carrying ring_idx >= 1 (GPU-completion fences —
 /// WS1 #4 consumer-side ordering; these retire at host GPU completion, not
 /// decode, so they legally stay in flight for the full GPU-work duration).
