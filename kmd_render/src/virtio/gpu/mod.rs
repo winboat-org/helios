@@ -302,12 +302,15 @@ const MAX_FENCE_EVENTS: usize = 256;
 /// Registered UMD present streams. The table is allocated once at transport
 /// initialization; every register/tag/retire lookup thereafter runs under the
 /// transport spinlock without allocating at DISPATCH.
-const MAX_PRESENT_STREAMS: usize = 64;
-const PRESENT_STREAM_INDEX_BITS: u32 = 6;
-const PRESENT_STREAM_GENERATION_BITS: u32 = 31 - PRESENT_STREAM_INDEX_BITS;
-const PRESENT_STREAM_GENERATION_MAX: u32 = (1 << PRESENT_STREAM_GENERATION_BITS) - 1;
+/// ⚠ ALIASES, NOT DEFINITIONS since 2026-08-06. The tagged-boundary and packed-
+/// handle ABI now lives in `helios_kmd_logic::present_stream`, because the six
+/// tests that cover it could never run inside this `panic = "abort"` cdylib. Two
+/// copies of these numbers would let the tested rules and the shipped ones drift.
+const MAX_PRESENT_STREAMS: usize = helios_kmd_logic::present_stream::MAX_STREAMS;
+const PRESENT_STREAM_INDEX_BITS: u32 = helios_kmd_logic::present_stream::INDEX_BITS;
+const PRESENT_STREAM_GENERATION_MAX: u32 = helios_kmd_logic::present_stream::GENERATION_MAX;
 /// Bit 63 distinguishes this from the legacy exclusive wire-fence namespace.
-pub const PRESENT_STREAM_BOUNDARY_TAG: u64 = 1 << 63;
+pub const PRESENT_STREAM_BOUNDARY_TAG: u64 = helios_kmd_logic::present_stream::BOUNDARY_TAG;
 /// Max WDDM submissions pending on venus completion.
 const MAX_WDDM_PENDING: usize = 256;
 /// Ceiling the `WddmHoldMs` knob is clamped to, IN CODE.
@@ -819,7 +822,7 @@ fn terminal_sync_scanout_bind(
     response_ok: bool,
     scanout_bind: Option<SyncScanoutBind>,
 ) -> Option<SyncScanoutBind> {
-    response_ok.then_some(scanout_bind).flatten()
+    helios_kmd_logic::present_stream::terminal_on_response_ok(response_ok, scanout_bind)
 }
 
 /// The stream-side payload attached to one ordinary async Venus submission.
@@ -865,7 +868,7 @@ impl PresentStreamSlot {
         // whole handle is nonzero without making slot 63 carry into bit 6.
         // This keeps the packed handle within the 31 bits reserved by the
         // tagged-boundary ABI.
-        (self.generation << PRESENT_STREAM_INDEX_BITS) | index as u32
+        helios_kmd_logic::present_stream::slot_handle(self.generation, index)
     }
 }
 
@@ -968,29 +971,32 @@ fn present_stream_slot_ready(
     handle: u32,
     value: u32,
 ) -> bool {
-    slot.live && slot.handle(index) == handle && slot.retired_value >= value
+    helios_kmd_logic::present_stream::slot_ready(
+        slot.live,
+        slot.generation,
+        index,
+        handle,
+        value,
+        slot.retired_value,
+    )
 }
 
 #[inline]
 fn advance_present_stream_retired(retired_value: u32, completed_value: u32) -> u32 {
-    retired_value.max(completed_value)
+    helios_kmd_logic::present_stream::advance_retired(retired_value, completed_value)
 }
 
 /// Encode a generation-qualified opaque present-stream boundary.
 #[inline]
 pub fn encode_present_stream_boundary(handle: u32, value: u32) -> u64 {
-    PRESENT_STREAM_BOUNDARY_TAG | ((handle as u64) << 32) | value as u64
+    helios_kmd_logic::present_stream::encode_boundary(handle, value)
 }
 
 /// Decode a tagged boundary.  Legacy wire-fence boundaries are intentionally
 /// not accepted here: their ordering relation is unrelated to stream values.
 #[inline]
 pub fn decode_present_stream_boundary(boundary: u64) -> Option<(u32, u32)> {
-    if boundary & PRESENT_STREAM_BOUNDARY_TAG == 0 {
-        return None;
-    }
-    let handle = ((boundary >> 32) & 0x7fff_ffff) as u32;
-    (handle != 0).then_some((handle, boundary as u32))
+    helios_kmd_logic::present_stream::decode_boundary(boundary)
 }
 
 /// Capacity of the fixed, allocation-free registered present-stream table.
@@ -4750,8 +4756,7 @@ impl VirtioGpu {
     }
 
     fn present_stream_index(handle: u32) -> Option<usize> {
-        let index = (handle & ((1 << PRESENT_STREAM_INDEX_BITS) - 1)) as usize;
-        (index < MAX_PRESENT_STREAMS).then_some(index)
+        helios_kmd_logic::present_stream::handle_index(handle)
     }
 
     /// Turn one complete marker tail into an opaque, generation-qualified
@@ -5947,82 +5952,13 @@ impl VirtioGpu {
     }
 }
 
-#[cfg(test)]
-mod present_stream_tests {
-    use super::{
-        MAX_PRESENT_STREAMS, PresentStreamSlot, SyncScanoutBind, advance_present_stream_retired,
-        decode_present_stream_boundary, encode_present_stream_boundary, present_stream_slot_ready,
-        terminal_sync_scanout_bind,
-    };
-
-    #[test]
-    fn tagged_boundary_round_trips_without_entering_legacy_namespace() {
-        let boundary = encode_present_stream_boundary(0x1234_5678, 77);
-        assert_eq!(
-            decode_present_stream_boundary(boundary),
-            Some((0x1234_5678, 77))
-        );
-        assert_eq!(decode_present_stream_boundary(77), None);
-    }
-
-    #[test]
-    fn slot_63_and_new_generation_never_alias() {
-        let first = PresentStreamSlot {
-            live: true,
-            generation: 1,
-            ..PresentStreamSlot::EMPTY
-        };
-        let next = PresentStreamSlot {
-            live: true,
-            generation: 2,
-            ..PresentStreamSlot::EMPTY
-        };
-        let last_index = MAX_PRESENT_STREAMS - 1;
-        let first_handle = first.handle(last_index);
-        assert!(first_handle < (1 << 31));
-        assert_ne!(first_handle, next.handle(last_index));
-        assert_ne!(first.handle(0), next.handle(0));
-    }
-
-    #[test]
-    fn retirement_is_monotonic_even_when_completions_reorder() {
-        let retired = advance_present_stream_retired(9, 4);
-        assert_eq!(retired, 9);
-        assert_eq!(advance_present_stream_retired(retired, 12), 12);
-    }
-
-    #[test]
-    fn dead_or_generation_mismatched_stream_boundary_never_reads_as_retired() {
-        let live = PresentStreamSlot {
-            live: true,
-            generation: 3,
-            retired_value: 6,
-            ..PresentStreamSlot::EMPTY
-        };
-        let handle = live.handle(0);
-        assert!(!present_stream_slot_ready(live, 0, handle, 7));
-        assert!(present_stream_slot_ready(live, 0, handle, 6));
-        let dead = PresentStreamSlot {
-            live: false,
-            ..live
-        };
-        assert!(!present_stream_slot_ready(dead, 0, handle, 1));
-        assert!(!present_stream_slot_ready(live, 0, handle ^ (1 << 6), 1));
-    }
-
-    #[test]
-    fn late_successful_sync_set_retains_its_lifecycle_tag() {
-        let bind = SyncScanoutBind {
-            seq: 41,
-            resource_id: 77,
-        };
-        // `abandon_sync` detaches only the stack waiter; the tag remains on the
-        // entry and a later RESP_OK must still advance lifecycle selection.
-        assert_eq!(terminal_sync_scanout_bind(true, Some(bind)), Some(bind));
-        assert_eq!(terminal_sync_scanout_bind(false, Some(bind)), None);
-        assert_eq!(terminal_sync_scanout_bind(true, None), None);
-    }
-}
+// The `#[cfg(test)] mod present_stream_tests` that used to sit HERE was moved to
+// `helios_kmd_logic::present_stream_boundary_tests` on 2026-08-06, together with
+// the pure helpers it covered. FIVE tests (not six, as `docs/dx12/PENDING.md` §6
+// said), none of which had ever executed: this crate is a `panic = "abort"`
+// cdylib whose `build.rs` runs bindgen and shells to `rc.exe`, so a libtest
+// harness cannot exist here at all — CLAUDE.md's invariant table says exactly
+// that. Do not reintroduce tests in this file; add them to `kmd_logic`.
 
 impl Drop for VirtioGpu {
     fn drop(&mut self) {

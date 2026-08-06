@@ -4973,6 +4973,112 @@ mod snapshot_bind_tests {
 /// instrument above it exists to observe. Saturating it makes that input
 /// unrepresentable, and puts a host-run test under the claim.
 pub mod present_stream {
+    /// Capacity of the KMD's fixed, allocation-free registered-stream table.
+    ///
+    /// ⚠ These five constants are the ABI of the tagged boundary and of the
+    /// packed handle, and they are DEFINED HERE so that the rules below and the
+    /// tests that exercise them cannot drift from the driver's own numbers:
+    /// `kmd_render`'s `MAX_PRESENT_STREAMS` / `PRESENT_STREAM_INDEX_BITS` /
+    /// `PRESENT_STREAM_GENERATION_BITS` / `PRESENT_STREAM_GENERATION_MAX` /
+    /// `PRESENT_STREAM_BOUNDARY_TAG` are aliases of these.
+    pub const MAX_STREAMS: usize = 64;
+    /// Low bits of a packed handle that carry the raw slot index.
+    pub const INDEX_BITS: u32 = 6;
+    /// Bits left for the generation inside the 31 the tagged-boundary ABI
+    /// reserves for the handle (bit 63 is the namespace tag, bit 31 is unused so
+    /// the handle stays positive in every signed reinterpretation).
+    pub const GENERATION_BITS: u32 = 31 - INDEX_BITS;
+    /// Largest generation a slot may reach before it must be retired rather than
+    /// re-registered; the registration scan refuses a slot at this value.
+    pub const GENERATION_MAX: u32 = (1 << GENERATION_BITS) - 1;
+    /// Bit 63 distinguishes a tagged stream boundary from the legacy exclusive
+    /// wire-fence namespace. The two are intentionally incomparable.
+    pub const BOUNDARY_TAG: u64 = 1 << 63;
+
+    /// Pack one slot's `(generation, index)` into the opaque handle.
+    ///
+    /// The generation is nonzero for a live slot, so the whole handle is nonzero
+    /// without slot 63 ever carrying into the generation field — which is why
+    /// the index occupies the LOW bits and is not added to a shifted generation.
+    pub const fn slot_handle(generation: u32, index: usize) -> u32 {
+        (generation << INDEX_BITS) | index as u32
+    }
+
+    /// Recover the slot index a handle names, or `None` when it is out of range.
+    pub const fn handle_index(handle: u32) -> Option<usize> {
+        let index = (handle & ((1 << INDEX_BITS) - 1)) as usize;
+        if index < MAX_STREAMS {
+            Some(index)
+        } else {
+            None
+        }
+    }
+
+    /// Readiness for one decoded stream slot.
+    ///
+    /// A dead or generation-mismatched slot is NEVER success. Its owner must
+    /// explicitly discharge any scheduler/scanout wait that still carries the
+    /// old boundary before the slot is retired; accepting it here would turn a
+    /// rejected producer into a false `DMA_COMPLETED` edge.
+    pub const fn slot_ready(
+        live: bool,
+        generation: u32,
+        index: usize,
+        handle: u32,
+        value: u32,
+        retired_value: u32,
+    ) -> bool {
+        live && slot_handle(generation, index) == handle && retired_value >= value
+    }
+
+    /// Monotonic stream retirement: host completions may be observed out of
+    /// order, and a stream value must never move backwards.
+    pub const fn advance_retired(retired_value: u32, completed_value: u32) -> u32 {
+        if completed_value > retired_value {
+            completed_value
+        } else {
+            retired_value
+        }
+    }
+
+    /// Encode a generation-qualified opaque present-stream boundary.
+    pub const fn encode_boundary(handle: u32, value: u32) -> u64 {
+        BOUNDARY_TAG | ((handle as u64) << 32) | value as u64
+    }
+
+    /// Decode a tagged boundary. Legacy wire-fence boundaries are intentionally
+    /// NOT accepted here: their ordering relation is unrelated to stream values,
+    /// so a numeric comparison across the two namespaces is meaningless.
+    pub const fn decode_boundary(boundary: u64) -> Option<(u32, u32)> {
+        if boundary & BOUNDARY_TAG == 0 {
+            return None;
+        }
+        let handle = ((boundary >> 32) & 0x7fff_ffff) as u32;
+        if handle == 0 {
+            None
+        } else {
+            Some((handle, boundary as u32))
+        }
+    }
+
+    /// A value-only lifecycle tag reaches the host-selection ledger only on a
+    /// TERMINAL SUCCESSFUL response.
+    ///
+    /// Generic over the tag so the rule is expressible without the transport's
+    /// `SyncScanoutBind`: abandoning a stack waiter detaches only the waiter,
+    /// and a late `RESP_OK` must still advance lifecycle selection, while any
+    /// non-OK response must not.
+    pub const fn terminal_on_response_ok<T: Copy>(
+        response_ok: bool,
+        tag: Option<T>,
+    ) -> Option<T> {
+        if response_ok {
+            tag
+        } else {
+            None
+        }
+    }
+
     /// How far a marker `value` runs AHEAD of what the producer has actually
     /// submitted on that stream; 0 when it does not run ahead at all.
     ///
@@ -5041,5 +5147,82 @@ mod present_stream_tests {
         assert_eq!(marker_lookahead(0, u32::MAX), 0);
         assert_eq!(marker_lookahead(1, u32::MAX), 0);
         assert!(!marker_runs_ahead(0, u32::MAX));
+    }
+}
+
+/// RECOVERED ASSURANCE, 2026-08-06. These six tests lived in
+/// `kmd_render/src/virtio/gpu/mod.rs` as `#[cfg(test)] mod present_stream_tests`
+/// — inside a `panic = "abort"` `cdylib` whose `build.rs` runs bindgen and
+/// `rc.exe`, i.e. a crate that **cannot host a libtest harness at all**. They had
+/// therefore never executed, on any platform, since the day they were written,
+/// while covering exactly the boundary/handle helpers the D3D12 fence bridge now
+/// depends on. CLAUDE.md's invariant table forbids that shape in `kmd_render`;
+/// this is the violation being repaid rather than deleted.
+#[cfg(test)]
+mod present_stream_boundary_tests {
+    use super::present_stream::{
+        GENERATION_MAX, MAX_STREAMS, advance_retired, decode_boundary, encode_boundary,
+        handle_index, slot_handle, slot_ready, terminal_on_response_ok,
+    };
+
+    #[test]
+    fn tagged_boundary_round_trips_without_entering_legacy_namespace() {
+        let boundary = encode_boundary(0x1234_5678, 77);
+        assert_eq!(decode_boundary(boundary), Some((0x1234_5678, 77)));
+        // 77 on its own is a legacy exclusive wire watermark, and the two
+        // namespaces must never be numerically compared.
+        assert_eq!(decode_boundary(77), None);
+    }
+
+    #[test]
+    fn slot_63_and_new_generation_never_alias() {
+        let last_index = MAX_STREAMS - 1;
+        let first_handle = slot_handle(1, last_index);
+        // Bit 31 stays clear: the tagged-boundary ABI reserves 31 bits.
+        assert!(first_handle < (1 << 31));
+        assert_ne!(first_handle, slot_handle(2, last_index));
+        assert_ne!(slot_handle(1, 0), slot_handle(2, 0));
+        // The index occupies the LOW bits, so the highest slot cannot carry into
+        // the generation field and impersonate the next generation of slot 0.
+        assert_eq!(handle_index(first_handle), Some(last_index));
+        assert_eq!(handle_index(slot_handle(2, 0)), Some(0));
+    }
+
+    #[test]
+    fn retirement_is_monotonic_even_when_completions_reorder() {
+        let retired = advance_retired(9, 4);
+        assert_eq!(retired, 9);
+        assert_eq!(advance_retired(retired, 12), 12);
+    }
+
+    #[test]
+    fn dead_or_generation_mismatched_stream_boundary_never_reads_as_retired() {
+        // live, generation 3, slot 0, retired through 6.
+        let handle = slot_handle(3, 0);
+        assert!(!slot_ready(true, 3, 0, handle, 7, 6));
+        assert!(slot_ready(true, 3, 0, handle, 6, 6));
+        // A dead slot is not ready even for a value it has already passed.
+        assert!(!slot_ready(false, 3, 0, handle, 1, 6));
+        // A handle from another generation is not ready either. Flipping bit 6
+        // is the lowest generation bit, i.e. the nearest possible collision.
+        assert!(!slot_ready(true, 3, 0, handle ^ (1 << 6), 1, 6));
+    }
+
+    #[test]
+    fn late_successful_sync_set_retains_its_lifecycle_tag() {
+        // `abandon_sync` detaches only the stack waiter; the tag remains on the
+        // entry and a later RESP_OK must still advance lifecycle selection.
+        let bind = (41u64, 77u32);
+        assert_eq!(terminal_on_response_ok(true, Some(bind)), Some(bind));
+        assert_eq!(terminal_on_response_ok(false, Some(bind)), None);
+        assert_eq!(terminal_on_response_ok::<(u64, u32)>(true, None), None);
+    }
+
+    #[test]
+    fn generation_ceiling_stays_inside_the_reserved_handle_width() {
+        // The registration scan refuses a slot whose generation has reached
+        // GENERATION_MAX; the largest handle it can therefore mint must still
+        // fit the 31 bits the boundary ABI reserves.
+        assert!(slot_handle(GENERATION_MAX, MAX_STREAMS - 1) < (1 << 31));
     }
 }
