@@ -75,7 +75,7 @@ if ($LASTEXITCODE -ne 0) { throw "dxc ps_6_0 failed, exit $LASTEXITCODE" }
 $cmds = @(
   "ml64 /nologo /c /Fo spy_thunks.obj spy_thunks.asm",
   "cl /nologo /LD /EHsc /W4 /O2 /I. d3d12_warp_spy.cpp spy_thunks.obj /Fe:d3d10warp.dll /link /DEF:d3d12_spy.def advapi32.lib",
-  "cl /nologo /EHsc /W4 /O2 /I. spy_workload.cpp /Fe:spy_workload.exe /link d3d12.lib dxgi.lib d3dcompiler.lib user32.lib"
+  "cl /nologo /EHsc /W4 /O2 /I. spy_workload.cpp /Fe:spy_workload.exe /link d3d12.lib dxgi.lib dxguid.lib d3dcompiler.lib user32.lib"
 )
 # [STOP] `cd /d "$dir"` INSIDE the already-quoted cmd string loses its quoting and cmd
 #    answers "The filename, directory name, or volume label syntax is incorrect." -- with a

@@ -33,6 +33,7 @@
 #include <windows.h>
 #include <d3d12.h>
 #include <dxgi1_6.h>
+#include <dxgidebug.h>
 #include <d3dcompiler.h>
 #include <stdio.h>
 #include <string.h>
@@ -91,8 +92,58 @@ static D3D12_VERTEX_BUFFER_VIEW g_vbv;
 
 static const UINT kWidth = 640, kHeight = 480;
 
+// ⭐ Why this exists: a bare HRESULT from CreateSwapChainForHwnd is not a diagnosis.
+// 2026-08-07's first Helios D3D12 run returned E_INVALIDARG from a descriptor that the
+// SAME binary presents 20 frames from on WARP (run-C.txt), so the parameters are legal
+// and the rejection is adapter-specific -- but the driver's own refusal counters all read
+// zero, i.e. DXGI refused BEFORE reaching pfnPresent and nothing in this driver saw the
+// reason. The DXGI info queue is the only place that reason is written down.
+//
+// ⚠ DXGIGetDebugInterface1 is resolved by name rather than linked: it lives in dxgi.dll
+// but only answers when the Graphics Tools optional feature is present, and a probe that
+// fails to START because a diagnostic export is missing has destroyed the measurement it
+// was added to take.
+static void dump_dxgi_messages(const char* when) {
+    HMODULE dxgi = GetModuleHandleW(L"dxgi.dll");
+    if (!dxgi) return;
+    typedef HRESULT(WINAPI * PFN_GET)(UINT, REFIID, void**);
+    PFN_GET get = (PFN_GET)GetProcAddress(dxgi, "DXGIGetDebugInterface1");
+    if (!get) {
+        printf("[dxgi-info] DXGIGetDebugInterface1 absent -- no Graphics Tools?\n");
+        return;
+    }
+    IDXGIInfoQueue* q = nullptr;
+    if (FAILED(get(0, IID_PPV_ARGS(&q))) || !q) {
+        printf("[dxgi-info] no IDXGIInfoQueue (factory not created with "
+               "DXGI_CREATE_FACTORY_DEBUG?)\n");
+        return;
+    }
+    const UINT64 n = q->GetNumStoredMessages(DXGI_DEBUG_ALL);
+    printf("[dxgi-info] %s: %llu stored message(s)\n", when, (unsigned long long)n);
+    for (UINT64 i = 0; i < n; ++i) {
+        SIZE_T len = 0;
+        if (FAILED(q->GetMessage(DXGI_DEBUG_ALL, i, nullptr, &len)) || len == 0) continue;
+        DXGI_INFO_QUEUE_MESSAGE* m = (DXGI_INFO_QUEUE_MESSAGE*)malloc(len);
+        if (!m) continue;
+        if (SUCCEEDED(q->GetMessage(DXGI_DEBUG_ALL, i, m, &len))) {
+            printf("[dxgi-info] sev=%d cat=%d id=%d: %.*s\n", (int)m->Severity,
+                   (int)m->Category, (int)m->ID, (int)m->DescriptionByteLength,
+                   m->pDescription);
+        }
+        free(m);
+    }
+    fflush(stdout);
+    q->Release();
+}
+
 static HRESULT pick_adapter(const Args& a) {
-    MUST(CreateDXGIFactory1(IID_PPV_ARGS(&g_factory)));
+    // The info queue only records anything when the FACTORY carries the debug flag, so
+    // --debug has to change how the factory is made, not just call EnableDebugLayer.
+    if (a.debug) {
+        MUST(CreateDXGIFactory2(DXGI_CREATE_FACTORY_DEBUG, IID_PPV_ARGS(&g_factory)));
+    } else {
+        MUST(CreateDXGIFactory1(IID_PPV_ARGS(&g_factory)));
+    }
     if (a.warp) {
         IDXGIAdapter* warp = nullptr;
         MUST(g_factory->EnumWarpAdapter(IID_PPV_ARGS(&warp)));
@@ -339,6 +390,72 @@ static HRESULT make_pipelines() {
     return S_OK;
 }
 
+// ⭐ `share` — which kernel object does the flip-model swapchain have no handle for?
+//
+// 2026-08-07: CreateSwapChainForHwnd on Helios failed E_INVALIDARG, and the ONLY reason
+// written down anywhere was in ETW, not in any HRESULT: dxgkrnl AzureTriage
+// "Input object handle is NULL. Returning 0xC000000D" immediately followed by the
+// Microsoft-Windows-Direct3D12 journal entry Message="ShareObjects" Code=0xC000000D.
+// So the runtime called D3DKMTShareObjects on a swapchain object that has NO kernel
+// handle. A flip-model swapchain shares TWO kinds of object — the back buffers and the
+// present fence — and the aggregate failure cannot say which.
+//
+// ⛔ This arm exists because attributing it by reading the driver is exactly the
+// premise-sharing trap the 85th session recorded: `fence.rs`'s module doc already
+// ASSERTS that "sharing a fence is D3DKMTShareObjects on the runtime's own kernel
+// handle — the one the driver never sees", which if believed would attribute this to
+// the resource without measuring. Each object is shared here on its own, so the two
+// HRESULTs are independent readings.
+static void probe_sharing() {
+    D3D12_HEAP_PROPERTIES hp = {};
+    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC rd = {};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    rd.Width = kWidth;
+    rd.Height = kHeight;
+    rd.DepthOrArraySize = 1;
+    rd.MipLevels = 1;
+    rd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    rd.SampleDesc.Count = 1;
+    rd.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+
+    // (a) the back-buffer shape: a SHARED committed render target, then its NT handle.
+    ID3D12Resource* res = nullptr;
+    HRESULT hr = g_device->CreateCommittedResource(
+        &hp, D3D12_HEAP_FLAG_SHARED, &rd, D3D12_RESOURCE_STATE_COMMON, nullptr,
+        IID_PPV_ARGS(&res));
+    check(hr, "share: CreateCommittedResource(HEAP_FLAG_SHARED, RT 640x480 RGBA8)");
+    if (SUCCEEDED(hr)) {
+        HANDLE h = nullptr;
+        check(g_device->CreateSharedHandle(res, nullptr, GENERIC_ALL, nullptr, &h),
+              "share: CreateSharedHandle(resource)");
+        if (h) CloseHandle(h);
+        res->Release();
+    }
+
+    // (b) the present-fence shape.
+    ID3D12Fence* f = nullptr;
+    hr = g_device->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&f));
+    check(hr, "share: CreateFence(FENCE_FLAG_SHARED)");
+    if (SUCCEEDED(hr)) {
+        HANDLE h = nullptr;
+        check(g_device->CreateSharedHandle(f, nullptr, GENERIC_ALL, nullptr, &h),
+              "share: CreateSharedHandle(fence)");
+        if (h) CloseHandle(h);
+        f->Release();
+    }
+
+    // (c) the control: a NON-shared committed resource of the same shape, so a failure
+    //     in (a) can be attributed to the SHARED flag rather than to the descriptor.
+    ID3D12Resource* plain = nullptr;
+    check(g_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+                                            D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                            IID_PPV_ARGS(&plain)),
+          "share: CreateCommittedResource(HEAP_FLAG_NONE, same desc) [control]");
+    if (plain) plain->Release();
+}
+
 static void render_frame(int frame, bool draw) {
     UINT idx = g_swap->GetCurrentBackBufferIndex();
     g_alloc->Reset();
@@ -434,8 +551,14 @@ int main(int argc, char** argv) {
     if (FAILED(pick_adapter(a))) { release_all(); return 2; }
     if (FAILED(make_device())) { release_all(); return 3; }
     if (wantQueue && FAILED(make_queue())) { release_all(); return 4; }
-    if (wantWindow && FAILED(make_window_and_swapchain())) { release_all(); return 5; }
+    if (wantWindow && FAILED(make_window_and_swapchain())) {
+        dump_dxgi_messages("after make_window_and_swapchain failed");
+        release_all();
+        return 5;
+    }
     if (wantDraw && FAILED(make_pipelines())) { release_all(); return 6; }
+    if (!_stricmp(a.mode, "share")) probe_sharing();
+    if (a.debug) dump_dxgi_messages("after setup");
 
     if (wantWindow) {
         for (int f = 0; f < a.frames; ++f) {

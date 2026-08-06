@@ -9,9 +9,81 @@ that is now the unit of work.
 
 ---
 
-## ⛔⛔ STATUS 2026-08-07 — THE CHANGESET COMPILES, AND ROUND 1 OF PHASE 2 IS DONE (10 lenses, 7 skeptics)
+## ⛔⛔ STATUS 2026-08-07 (DEPLOYED) — IT RUNS, AND THE SWAPCHAIN BLOCKER IS ROOT-CAUSED
 
-**Read this block before every block below it.** It supersedes them where they disagree.
+**Read this block first. It supersedes every block below it, including the compile block.**
+
+`22.22.256.0` is installed (`CM_PROB_NONE`), both UMDs are registered
+(`UserModeDriverName[3]` → `helios_umd12`), `DiagLevel = 1` and `UmdD3D12 = 1` are set, and the
+desktop still composites on Helios after all of it (paintcap 01:24). **Nothing crashed** — no
+BSOD, no dead DWM, across ~6 D3D12 process lifetimes.
+
+### ⭐ How far a real D3D12 app gets, measured
+
+`spy_workload window --adapter 0`: `D3D12CreateDevice` **OK** → command queue **OK** →
+allocator + command list **OK** → graphics **and** compute PSOs from DXIL SM 6.0 **OK** → root
+signature **OK** → fences **OK** → `CheckFormatSupport` × 97 / `CheckMultisampleQualityLevels` ×
+2730 answered → back buffers created and made resident. `slots = 0/206` noop hits.
+⇒ **`CreateSwapChainForHwnd` → `E_INVALIDARG` is the single thing between this driver and a
+D3D12 pixel.** Everything upstream of it works.
+
+### ⛔⛔ THE BLOCKER, ROOT-CAUSED AT THREE INDEPENDENT LEVELS
+
+**`helios_umd12.dll` mints no WDDM allocation for any resource, so the runtime has no kernel
+object to share, so a flip-model swapchain cannot be created.**
+
+| level | evidence |
+|---|---|
+| app | `CreateSharedHandle(resource)` → `E_INVALIDARG` on Helios, **`S_OK` on WARP**. On the same device `CreateSharedHandle(fence)` → **`S_OK`** and the same descriptor without `HEAP_FLAG_SHARED` creates fine ⇒ the failing object is the **resource**, not the fence and not the descriptor |
+| runtime | `Microsoft-Windows-Direct3D12` journal entry `Message="ShareObjects" Code=0xC000000D` |
+| kernel | dxgkrnl AzureTriage `"Input object handle is NULL. Returning 0xC000000D"` (`STATUS_INVALID_PARAMETER`), 44 µs earlier on the same thread |
+| driver | `AllocateCbMissing/Failed/NoHandle` **all 0** and `IdentityRecorded = 0` — `pfnAllocateCb` was never *called*, not refused |
+
+⛔ **The DXGI InfoQueue is EMPTY for this failure** (0 stored messages with
+`DXGI_CREATE_FACTORY_DEBUG`). That is the same signature ROADMAP's FL11 entry records — the
+reason exists only in ETW. Do not conclude "no debug message ⇒ no reason".
+
+### ⛔⛔ THE ADMISSION PREDICATE IS AIMED AT THE WRONG CHANNEL — this doc's open question, answered
+
+This file asked which channel `HEAP_FLAG_PRIMARY` arrives through, `HeapPrimaryVenusExport` or
+`ResourceOptimizationPrimary`, and said *"both readings are one run away and neither exists"*.
+**Both readings now exist and both are 0** — as are `HeapPrimaryFlagDropped` and
+`HeapPrimaryWithoutResource`. ⇒ **NEITHER. `PRIMARY` never arrives at all**, so `adopt_presentable`
+— the driver's only `pfnAllocateCb` call site — is unreachable on the swapchain path.
+
+⛔ And the obvious repair, "admit on the SHARED heap flag instead", is **already refuted**:
+`HeapFlagUnrepresentable = 0` on a run whose app passed `D3D12_HEAP_FLAG_SHARED` explicitly, and
+`heap_flags` maps exactly four DDI bits. **There is no SHARED bit at this DDI** — the runtime
+never tells the driver a resource will be shared. ⇒ the allocation cannot be minted from a flag;
+the driver must give *shareable* resources a kernel allocation on some other basis. That is a
+design question, not a patch, and it is the next real piece of work.
+
+### ⚠ Also seen, not the blocker
+
+* dxgkrnl logged **`"Driver returned an invalid NTSTATUS code: 0xC00000BB"` (`STATUS_NOT_SUPPORTED`)
+  ten times in 3 ms** during D3D12 device bring-up. This is ROADMAP open defect #5, previously
+  unattributed; it now has a **reproducer on the D3D12 path**.
+* `D12Rec = D12Exact = D12Clr = 0` and did not move. **With `DiagLevel = 1` that zero is now
+  trustworthy** — the app never reached `pfnExecuteCommandLists`, so no `pfnRenderCb` was due.
+  It is not evidence about the KMD bridge, which remains untested end to end.
+* `Umd12Trace = 1` is **left ON** on the VM. It is per-op chatter; a perf reading taken without
+  clearing it is invalid.
+
+### ⚠ Traps banked this session
+
+* **`DiagLevel` is a SERVICE-key knob** — `HKLM\SYSTEM\CurrentControlSet\Services\helios_kmd_render`
+  (`diag::read_config_dword` uses `RTL_REGISTRY_SERVICES`). The handoff said
+  `Control\Video\{adapter}\0000`; writing it there does nothing.
+* ⛔ **`C:\Users\Rupansh\d12g5` contains a `d3d10warp.dll` SPY PROXY.** Any `--warp` arm run with
+  that as the working directory loads the proxy, not WARP, and fails `D3D12CreateDevice` with
+  `DXGI_ERROR_UNSUPPORTED`. It cost one wrong control-arm reading. Run WARP controls from
+  `C:\Users\Rupansh\d12share`.
+
+---
+
+## STATUS 2026-08-07 — THE CHANGESET COMPILES, AND ROUND 1 OF PHASE 2 IS DONE (10 lenses, 7 skeptics)
+
+**Superseded in part by the block above.** It supersedes everything below it where they disagree.
 
 ### ⭐ All five components COMPILE and LINK — the first compiler ever to see ~55 commits
 
