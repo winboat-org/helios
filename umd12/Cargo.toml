@@ -66,8 +66,27 @@ cxx = "1"
 # `#[repr(C)]` copy of the two feature-data structs would be transcribing an ABI
 # by hand, which is exactly what R908 cost. These come out of the same Win32
 # metadata generator as `ID3D12Device` itself.
+#
+# ⚠ `Win32_Graphics_Direct3D` is L6's addition and it is NOT a compiler
+# dependency. It is required for **`ID3DBlob`** alone: the DDI delivers root
+# signatures already parsed while vkd3d's `CreateRootSignature` wants a
+# serialized DXBC `RTS0` blob, so `forward12/pso.rs` re-serializes through
+# `bridge12::serialize_root_signature` and must then read the resulting blob's
+# bytes with `GetBufferPointer`/`GetBufferSize`.
+#
+# ⛔ Verified link-free before adding, not assumed: the whole module,
+# `windows-0.58.0/src/Windows/Win32/Graphics/Direct3D/mod.rs`, contains **zero**
+# `windows_targets::link!` entries -- it is `ID3DBlob`, `ID3DInclude`,
+# `ID3DDestructionNotifier` and the `D3D_*` enums, pure types with no entry
+# points. The two submodules that DO carry link entries, `Fxc` and `Dxc`, sit
+# behind their own features (`Win32_Graphics_Direct3D_Fxc` /
+# `_Dxc`), and neither is enabled. So this cannot add an import, which is what
+# `D12-G1`'s `dumpbin /IMPORTS` criterion requires -- no `dxgi.dll`, no
+# `d3d12.dll`.
+# ⛔ `Win32_Graphics_Direct3D_Fxc` stays forbidden for the reason above it.
 windows = { version = "0.58", features = [
     "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
     "Win32_Graphics_Direct3D12",
     "Win32_Graphics_Dxgi_Common",
 ] }

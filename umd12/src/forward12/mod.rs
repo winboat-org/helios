@@ -56,3 +56,9 @@ pub(crate) mod pso;
 pub(crate) mod queue;
 pub(crate) mod resource12;
 pub(crate) mod rootargs;
+// ⚠ L6's second file. `PARALLEL.md` §4 gives L6 `pso.rs` **and** `shaders.rs`,
+// and `ARCHITECTURE.md` §12 rule 8 is why it is two files on day one rather
+// than one that gets split later. The lane's chain links and its whole refusal
+// set stay in [`pso`]; this module holds the 14 shader-create slots and the
+// DXBC container the engine needs and the DDI does not supply.
+pub(crate) mod shaders;
