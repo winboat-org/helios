@@ -393,15 +393,22 @@ pub(crate) static UMD12_ECL_SUBMIT: BoolKnob = BoolKnob::new(c"Umd12EclSubmit", 
 ///    `vkQueueSubmit` may not have happened when the WDDM packet is submitted.** The
 ///    packet can therefore be ordered *ahead of* work it is supposed to fence, and the
 ///    boundary it carries names less work than the frame contains.
-/// 2. ⛔ **There is no boundary at all on this arm, not merely a smaller one.** The
-///    venus wire fence is sampled from the `VkQueue` that only
-///    `vkd3d_acquire_vk_queue` can hand back, and the sample is *inside* the same
-///    bridge call (`umd12/bridge/vkd3d_bridge.cpp`'s
-///    `helios_vkd3d_bridge_drain_queue`). Skipping the drain therefore skips the
-///    sample: `HeliosD3D12SubmitCmd::gpu_wire_fence` is **0**, which is that field's
-///    documented *"submit the packet, order it against nothing"* value. It is counted
-///    as `EclFenceNoDrain`, which is the fifth distinguishable cause of a zero
-///    boundary and exists so this arm cannot be mistaken for any of the other four.
+/// 2. ⚠ **The boundary this arm carries names a PREFIX of the frame, so it can
+///    under-wait.** `bridge12::sample_queue_fence` reads the same venus wire fence
+///    through upstream's `vkd3d_lock_vk_queue`, which enqueues no
+///    `VKD3D_SUBMISSION_DRAIN` — so the sample happens without waiting for the
+///    worker, and consequence 1 above is exactly what makes it a prefix. Counted as
+///    `EclFenceNoDrain`, which now fires **beside** one of the five cause counters
+///    rather than instead of one.
+///
+///    ⛔ **This bullet used to say something much worse and it was true:** *"there is
+///    no boundary at all on this arm, not merely a smaller one"*, because the sample
+///    lived inside `helios_vkd3d_bridge_drain_queue` and skipping the drain skipped
+///    the sample. That made the whole fence bridge inert on every default build —
+///    `Umd12EclFence`'s ON default resolving to a 0 — which is a deletion wearing a
+///    containment's clothes. The sample-only entry point is what closed it, and the
+///    correction is kept here because *"no boundary"* and *"a prefix boundary"* are
+///    different enough to change what a run means.
 ///
 /// ⛔ **The record's PRESENCE is unaffected.** `Umd12EclSubmit` still defaults ON, so
 /// the `pfnRenderCb` packet still goes in with `'HE12'`; only its fence field is 0.
@@ -443,9 +450,11 @@ pub(crate) static UMD12_ECL_SUBMIT: BoolKnob = BoolKnob::new(c"Umd12EclSubmit", 
 ///
 /// A **WAIT-skipping or bounded acquire in the fork** — an `vkd3d_try_acquire_vk_queue`
 /// that either refuses rather than blocking behind a `VKD3D_SUBMISSION_WAIT`, or takes
-/// a deadline — plus a bridge entry point that samples the boundary through it. Sized
-/// **M**, and it belongs to whoever owns `vkd3d-proton-helios/` and
-/// `umd12/bridge/**`; this lane may not touch either. Until it lands, the ON arm stays
+/// a deadline. Sized **M**, in `vkd3d-proton-helios/`. ⚠ The *"plus a bridge entry
+/// point that samples the boundary through it"* half of this row is **done** —
+/// `helios_vkd3d_bridge_sample_queue_fence` / `bridge12::sample_queue_fence` — which
+/// is what turned the OFF arm from *no* boundary into a *prefix* boundary. What
+/// remains is the exactness, not the existence. Until it lands, the ON arm stays
 /// reachable so the drain's effect on ordering can still be measured deliberately, one
 /// run at a time, on a box where a wedged app thread is a diagnosis.
 ///
@@ -456,19 +465,25 @@ pub(crate) static UMD12_ECL_DRAIN: BoolKnob = BoolKnob::new(c"Umd12EclDrain", fa
 /// ⭐⭐ **Whether the ECL record carries a REAL GPU-completion boundary.
 /// DEFAULT ON.**
 ///
-/// ⛔⛔ **It has NO EFFECT unless [`UMD12_ECL_DRAIN`] is also on**, and that
-/// coupling is mechanical rather than a policy: the boundary is sampled from the
-/// `VkQueue` that only `vkd3d_acquire_vk_queue` hands back, inside the same bridge
-/// call that performs the drain. With the drain at its OFF default this knob's ON
-/// default therefore resolves to a **0** boundary counted as `EclFenceNoDrain`. The
-/// default is left ON so that `Umd12EclDrain=1` alone restores the full
-/// submission-plus-boundary configuration in one registry write, and so that the
-/// composite state is named by a counter instead of being an absence.
+/// ⛔⛔ **Its old first line — *"it has NO EFFECT unless [`UMD12_ECL_DRAIN`] is also
+/// on"* — is FALSE now, and it was the reason the fence bridge shipped inert.** The
+/// coupling was mechanical: the boundary was sampled from the `VkQueue` that only
+/// `vkd3d_acquire_vk_queue` hands back, inside the same bridge call that drains, so
+/// with the drain at its OFF default this knob's ON default resolved to a **0**
+/// counted as `EclFenceNoDrain`. `bridge12::sample_queue_fence` broke the coupling by
+/// taking upstream's `vkd3d_lock_vk_queue` instead, which drains nothing.
 ///
-/// ON samples `helios_venus_queue_gpu_fence` inside the drain window and puts the
-/// result in `HeliosD3D12SubmitCmd::gpu_wire_fence`. OFF submits the same record
-/// with the fence left **0**, which is that field's documented *"submit the packet,
-/// order it against nothing"* value.
+/// ⇒ **ON now samples on BOTH drain arms**, and the drain decides only how much work
+/// the boundary covers:
+///
+/// | `Umd12EclDrain` | boundary | counters |
+/// |---|---|---|
+/// | 1 | **exact** — everything the application enqueued has reached `vkQueueSubmit` | `EclFenceSampled` |
+/// | 0 (default) | a **prefix** of the frame; may under-wait | `EclFenceSampled` **and** `EclFenceNoDrain` |
+///
+/// OFF submits the same record with the fence left **0**, which is that field's
+/// documented *"submit the packet, order it against nothing"* value, counted as
+/// `EclFenceDisabled` — and it is the only arm on which no sample is attempted.
 ///
 /// # Why ON
 ///
@@ -513,8 +528,10 @@ pub(crate) static UMD12_ECL_DRAIN: BoolKnob = BoolKnob::new(c"Umd12EclDrain", fa
 /// `helios_venus_queue_gpu_fence`), `EclFenceRefused` (the export ran and declined —
 /// its loudest arm being `ring_idx == 0`, which it refuses unconditionally because a
 /// ring-0 wire fence retires at *decode* and would lie about GPU completion).
-/// `EclFenceDisabled` is the fourth and belongs to this knob's OFF arm.
-/// ⛔ `EclFenceSampled` is the only one that means the boundary is real.
+/// `EclFenceDisabled` is the fourth and belongs to this knob's OFF arm; a fifth,
+/// `EclFenceStatusBad`, means the C++ header and `bridge12::FenceStatus` have drifted.
+/// ⛔ `EclFenceSampled` is the only one that means the boundary is real, and
+/// `EclFenceNoDrain` beside it is the only thing that says whether it is exact.
 ///
 /// ⚠ Read once per process, like every knob here, and reported in
 /// [`resolved_inventory`] — a fence reading whose arm is not recorded cannot be
@@ -541,17 +558,17 @@ pub(crate) fn umd12_ecl_submit() -> bool {
 }
 
 /// Whether the ECL record carries a real venus GPU-completion boundary.
-/// **Absent = ON**; see [`UMD12_ECL_FENCE`] for why, for the three
-/// distinguishable ways an ON run can still produce a zero fence, and for why it
-/// is inert while [`umd12_ecl_drain`] is off.
+/// **Absent = ON**; see [`UMD12_ECL_FENCE`] for why, for the ways an ON run can still
+/// produce a zero fence, and for the exact-vs-prefix table that replaced this
+/// sentence's old *"why it is inert while [`umd12_ecl_drain`] is off"*.
 pub(crate) fn umd12_ecl_fence() -> bool {
     UMD12_ECL_FENCE.get()
 }
 
 /// Whether `pfnExecuteCommandLists` drains vkd3d's submission worker.
 /// **Absent = OFF** (A1 containment); see [`UMD12_ECL_DRAIN`] for the contract
-/// argument behind that default, the two things the OFF arm costs, and what the
-/// real fix is.
+/// argument behind that default, what the OFF arm costs — a boundary that names a
+/// prefix of the frame, not the absence of one — and what the real fix is.
 pub(crate) fn umd12_ecl_drain() -> bool {
     UMD12_ECL_DRAIN.get()
 }

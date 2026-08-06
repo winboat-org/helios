@@ -207,21 +207,30 @@
 //! a second untimed `pthread_cond_wait` (`command.c:1226`). So the drain can park
 //! the application's own thread inside this DDI with no timeout, no counter and no
 //! GPU packet outstanding for TDR. `knobs12::UMD12_ECL_DRAIN` (**default OFF**)
-//! carries the contract argument, the two things the OFF arm costs — the packet may
-//! precede the frame's `vkQueueSubmit`, and there is **no** GPU-completion boundary
-//! at all because the sample lives inside the acquire — and where the real fix
-//! belongs (a WAIT-skipping or bounded acquire in the fork, plus a sample-only
-//! bridge entry point; neither is this file's).
+//! carries the contract argument, what the OFF arm costs — the packet may precede the
+//! frame's `vkQueueSubmit`, so its boundary may name a **prefix** of the frame — and
+//! where the real fix belongs (a WAIT-skipping or bounded acquire in the fork, which
+//! is not this file's).
+//!
+//! ⚠ The OFF arm's **second** cost is gone, and the correction is recorded because it
+//! was the larger of the two. This block used to say there was *"no GPU-completion
+//! boundary at all, because the sample lives inside the acquire"* — which meant the
+//! fence bridge shipped inert on every default build.
+//! `bridge12::sample_queue_fence` samples the same venus boundary through upstream's
+//! `vkd3d_lock_vk_queue`, which enqueues no `VKD3D_SUBMISSION_DRAIN`, so the default
+//! arm now carries a real fence: possibly a prefix, never absent.
 //!
 //! ⚠ **The order of the forward and the acquire is load-bearing.** The engine
 //! `ExecuteCommandLists` comes FIRST and the acquire second; inverting them would
 //! hold vkd3d's `queue_lock` across a call into the same queue.
 //!
 //! The packet carries `HeliosD3D12SubmitCmd` — 16 bytes, magic `'HE12'`, declared
-//! once in `protocol/` per D13. Its `gpu_wire_fence` is a real venus
-//! GPU-completion boundary **only** on the drain arm; on the default arm it is `0`,
-//! which the record's own doc defines as *"submit the packet, order it against
-//! nothing"* and which `EclFenceNoDrain` states positively.
+//! once in `protocol/` per D13. Its `gpu_wire_fence` is a real venus GPU-completion
+//! boundary on **both** knob arms now — exact behind the drain, a possible prefix
+//! without it (`EclFenceNoDrain` is the census of the second case). `0` remains legal
+//! and means what the record's own doc says, *"submit the packet, order it against
+//! nothing"*; with the fence knob ON it is now a **finding** with one counter per
+//! cause rather than the default outcome.
 //! [`ecl_submit_command`] has why 16 is the **minimum** recognisable length and why
 //! the earlier "keep it under 16" reasoning was the wrong lever (the KMD's decode
 //! arms reject on **magic**, not on length).
@@ -2645,25 +2654,30 @@ unsafe extern "C" fn destroy_command_signature(
 ///
 /// # ⚠ `gpu_wire_fence` — RE-GRADED: 0 was the steady state, and now it is a finding
 ///
-/// ⛔ **This field's grading has now gone stale TWICE, so both moves are recorded.**
-/// It began as *"0 — the plumbing arm, and it is what K-F1 is"*; the ICD export
-/// landed and made it a real venus wire fence retiring at **host GPU completion**,
-/// sampled inside the drain window, so a zero became one of three named findings
-/// (`EclFenceNoIcd` / `EclFenceNoExport` / `EclFenceRefused`). **A1 then gated the
-/// drain OFF by default**, and because the sample can only happen inside the acquire
-/// the default value is **0 again** — but for a fifth, differently-named reason
-/// (`EclFenceNoDrain`), not for the original one.
+/// ⛔ **This field's grading has gone stale THREE times, so all four states are
+/// recorded.** (1) It began as *"0 — the plumbing arm, and it is what K-F1 is"*. (2)
+/// The ICD export landed and made it a real venus wire fence retiring at **host GPU
+/// completion**, sampled inside the drain window, so a zero became one of three named
+/// findings (`EclFenceNoIcd` / `EclFenceNoExport` / `EclFenceRefused`). (3) **A1 gated
+/// the drain OFF by default** and the sample lived inside the acquire, so the default
+/// value went back to **0** for a fifth, differently-named reason
+/// (`EclFenceNoDrain`). (4) `bridge12::sample_queue_fence` reaches the same boundary
+/// through upstream's `vkd3d_lock_vk_queue`, so the default value is a **real fence
+/// again** — one that may name a *prefix* of the frame, with `EclFenceNoDrain`
+/// re-graded to say exactly that.
 ///
 /// ⇒ **A zero here means nothing on its own; only the counter beside it does.** Read
 /// the run's `Umd12EclDrain` inventory value first: with it 0, expect
-/// `EclFenceNoDrain == EclForwarded`; with it 1, expect `EclFenceSampled` to carry
-/// every submit and the other four to be 0.
+/// `EclFenceSampled` to carry every submit **and** `EclFenceNoDrain` to equal it —
+/// every boundary is a prefix. With it 1, expect `EclFenceSampled` to carry every
+/// submit, `EclFenceNoDrain` to be 0, and the boundaries to be exact.
 ///
 /// Zero remains **legal** and unchanged in meaning — *"submit the packet, order it
 /// against nothing"*, which is why `is_valid()` deliberately does not check the
-/// fence — and it is exactly what the `Umd12EclFence=0` and `Umd12EclDrain=0` arms
-/// submit. What changed each time is which value is the default, and therefore what a
-/// reader should conclude from a zero.
+/// fence — and it is exactly what the `Umd12EclFence=0` arm submits. ⛔ It is **no
+/// longer** what `Umd12EclDrain=0` submits; that clause was true for one commit and is
+/// corrected here. What changed each time is which value is the default, and therefore
+/// what a reader should conclude from a zero.
 ///
 /// ⚠ On the zero arm the packet takes the KMD's fall-through for a boundary-less
 /// submission — `RetireDomain::IncludingGpu` with `watermark = next_wire_fence` (in
@@ -3189,18 +3203,24 @@ unsafe extern "C" fn execute_command_lists(
         // A/B disable for the fence itself. OFF calls the drain with no out-params,
         // so the export is never even resolved.
         //
-        // ⛔⛔ **AND THE BOUNDARY IS UNREACHABLE WITHOUT THE DRAIN, mechanically.**
-        // The sample needs the `VkQueue` that only `vkd3d_acquire_vk_queue` hands
-        // back, and it happens *inside* the one bridge call
-        // (`helios_vkd3d_bridge_drain_queue`) that performs the acquire. So the
-        // `Umd12EclDrain=0` default arm carries `gpu_wire_fence = 0` — not a smaller
-        // boundary, **no** boundary — and `EclFenceNoDrain` is the fifth
-        // distinguishable cause of a zero so that arm can never be confused with
-        // the other four. ⚠ Separating them needs a sample-only or bounded-acquire
-        // entry point in `umd12/bridge/**`, which is another lane's file.
+        // ⛔⛔ **AND THE BOUNDARY IS NOW REACHABLE WITHOUT THE DRAIN — that claim
+        // moved and the old form is quoted because it was load-bearing.** It read:
+        // *"the sample needs the `VkQueue` that only `vkd3d_acquire_vk_queue` hands
+        // back, and it happens inside the one bridge call that performs the acquire,
+        // so the `Umd12EclDrain=0` default arm carries no boundary at all"*. True of
+        // `helios_vkd3d_bridge_drain_queue`, and it meant the fence bridge shipped
+        // inert on every default build. `bridge12::sample_queue_fence` takes the
+        // `vkd3d_queue` mutex through upstream's `vkd3d_lock_vk_queue` instead —
+        // enqueueing no `VKD3D_SUBMISSION_DRAIN` — so the default arm now carries a
+        // real venus boundary that may name a **prefix** of the frame. Three states,
+        // ordered: drained (exact) > undrained (may under-wait) > absent (under-waits
+        // the whole frame).
         //
-        // ⚠ Exactly ONE fence-cause counter fires per submit on every arm below,
-        // which is what keeps the five readable as a partition of `EclForwarded`.
+        // ⚠ Exactly ONE fence-CAUSE counter fires per submit on every arm below,
+        // which is what keeps them readable as a partition of `EclForwarded`.
+        // `EclFenceNoDrain` is not one of the causes any more: it is the census of
+        // the undrained arm and fires *beside* a cause. Its doc carries the
+        // re-grading.
         let mut gpu_wire_fence: u64 = 0;
         if crate::knobs12::umd12_ecl_drain() {
             // SAFETY (both arms): `engine_queue` is the live `ID3D12CommandQueue`
@@ -3259,17 +3279,69 @@ unsafe extern "C" fn execute_command_lists(
                 note_refusal(&L2_REFUSALS.ecl_drain_failed);
             }
         } else {
-            // ⛔⛔ A1's containment arm, and it is the DEFAULT. No bridge call at all,
-            // so no acquire, no untimed `pthread_cond_wait`, and no fence sample.
+            // ⛔⛔ A1's containment arm, and it is the DEFAULT. No acquire, so no
+            // untimed `pthread_cond_wait` inside this DDI.
             note_refusal(&L2_REFUSALS.ecl_drain_disabled);
-            note_refusal(if crate::knobs12::umd12_ecl_fence() {
-                // The fence knob asked for a boundary the drain's absence makes
-                // unobtainable. ⛔ Its own counter, because "we could not sample"
-                // and "we were told not to" are different findings.
-                &L2_REFUSALS.ecl_fence_no_drain
+            if crate::knobs12::umd12_ecl_fence() {
+                // ⭐⭐ **AND THE BOUNDARY IS STILL SAMPLED, WITHOUT THE DRAIN.** This
+                // arm used to carry no boundary at all and count
+                // `EclFenceNoDrain` — which meant the fence bridge shipped INERT on
+                // every default build, `Umd12EclFence`'s ON default resolving to a 0
+                // and the kernel's exact-boundary arm unable to fire. That is not a
+                // containment, it is a deletion.
+                //
+                // `bridge12::sample_queue_fence` takes only the `vkd3d_queue` mutex
+                // (`vkd3d_lock_vk_queue`, upstream, already in this link): no
+                // `VKD3D_SUBMISSION_DRAIN`, no `queue_lock`, no empty
+                // `vkQueueSubmit2`, and a failed lock leaks nothing.
+                //
+                // ⛔ **The cost, stated here and not only in the wrapper: this is an
+                // UNDER-WAIT, not the drained boundary.** Nothing guarantees the
+                // frame's `vkQueueSubmit` has happened when the ring seqno is read,
+                // so the fence may name a PREFIX of the frame. It is strictly better
+                // than no boundary — which under-waits the whole frame — and strictly
+                // worse than a drained one. `EclFenceNoDrain` is what says a run took
+                // it; its doc carries the re-grading.
+                //
+                // ⚠ No lock of this file's is held here: `lock_windows` is taken
+                // inside `submit_wddm_render`, below and after.
+                //
+                // SAFETY: `engine_queue` is the live `ID3D12CommandQueue` this state
+                // owns, created by this bridge's own vkd3d engine —
+                // `bridge12::sample_queue_fence`'s stated precondition — and it is
+                // borrowed for the call only.
+                let (fence, status) = unsafe {
+                    crate::bridge12::sample_queue_fence(queue.engine_queue.as_raw() as usize)
+                };
+                // The same five-way partition as the drained arm, by the same rule:
+                // one counter per CAUSE, never one for "the fence was 0".
+                note_refusal(match status {
+                    FenceStatus::Sampled => &L2_REFUSALS.ecl_fence_sampled,
+                    FenceStatus::NoIcd => &L2_REFUSALS.ecl_fence_no_icd,
+                    FenceStatus::NoExport => &L2_REFUSALS.ecl_fence_no_export,
+                    FenceStatus::Refused => &L2_REFUSALS.ecl_fence_refused,
+                    FenceStatus::Unknown(_) => &L2_REFUSALS.ecl_fence_status_bad,
+                });
+                if let FenceStatus::Unknown(raw) = status {
+                    if let Some(n) = budget(&ECL_LOG) {
+                        log_error!(
+                            "ExecuteCommandLists: bridge returned fence status {raw} from the \
+                             undrained sample, which this build does not know -- \
+                             vkd3d_bridge.h's HELIOS_VKD3D_FENCE_* and bridge12::FenceStatus \
+                             have drifted (x{})",
+                            n + 1,
+                        );
+                    }
+                }
+                // ⭐ The census of the reduced path, fired BESIDE the cause counter
+                // rather than instead of it: the causes still partition
+                // `EclForwarded`, and this says how many of them were sampled with no
+                // drain behind them, i.e. how many boundaries may be prefixes.
+                note_refusal(&L2_REFUSALS.ecl_fence_no_drain);
+                gpu_wire_fence = fence;
             } else {
-                &L2_REFUSALS.ecl_fence_disabled
-            });
+                note_refusal(&L2_REFUSALS.ecl_fence_disabled);
+            }
         }
 
         // SAFETY: this is the DDI that owns the submission and we are on the
@@ -4242,19 +4314,23 @@ pub(crate) struct L2Refusals {
     /// `helios_venus_queue_gpu_fence` returned a non-zero venus wire fence, sampled
     /// inside the drain window.
     ///
-    /// ⛔ **RE-GRADED BY A1: expected 0 on a DEFAULT build**, because the sample
-    /// lives inside the drain and `Umd12EclDrain` defaults OFF. Its old grading —
-    /// *"expected non-zero on every submitting workload with `Umd12EclFence` at its
-    /// ON default"* — is quoted because it went stale the moment the drain was
-    /// gated, and because the fence knob alone no longer implies a boundary.
+    /// ⚠⚠ **RE-GRADED TWICE, and both moves are kept because the second undoes the
+    /// first.** (1) Originally *"expected non-zero on every submitting workload with
+    /// `Umd12EclFence` at its ON default"*. (2) A1 gated the drain OFF and the sample
+    /// lived inside it, so it became *"expected 0 on a DEFAULT build"*. (3)
+    /// `bridge12::sample_queue_fence` made the boundary reachable without the drain,
+    /// so grading (1) applies again — **expected non-zero on every submitting
+    /// workload** — with one difference: on a default build the fence it counts is a
+    /// possible **prefix** of the frame, and `EclFenceNoDrain` fires beside it to say
+    /// so.
     ///
-    /// ⛔ It remains **the only counter that means the fence is real**, and on a run
-    /// with `Umd12EclDrain=1` its old grading applies verbatim. `EclWddmSubmitted`
-    /// says a packet went in; this says the packet asked for something. A run with
-    /// `EclWddmSubmitted > 0` and `EclFenceSampled == 0` submitted only "order
-    /// against nothing" packets, and its **five** possible causes each have their own
-    /// counter below — four sampling failures plus `EclFenceNoDrain`, the arm the
-    /// default takes.
+    /// ⛔ It remains **the only counter that means the fence is real**.
+    /// `EclWddmSubmitted` says a packet went in; this says the packet asked for
+    /// something. A run with `EclWddmSubmitted > 0` and `EclFenceSampled == 0`
+    /// submitted only "order against nothing" packets, and its **four** possible
+    /// causes each have their own counter below — `EclFenceNoIcd`,
+    /// `EclFenceNoExport`, `EclFenceRefused`, `EclFenceStatusBad` — plus
+    /// `EclFenceDisabled` for the knob.
     ecl_fence_sampled: RefusalCounter,
     /// The venus ICD module could not be resolved for the fence export — no loaded
     /// module exports the probe symbol, or the **S4b anchor refused** because two ICD
@@ -4290,10 +4366,11 @@ pub(crate) struct L2Refusals {
     /// rather than an absence, and it is why the three findings above cannot be
     /// confused with the disable.
     ///
-    /// ⚠ It fires on **both** `Umd12EclFence=0` arms, with the drain on or off; the
-    /// arm where the fence knob is *on* and the drain is off is
-    /// `EclFenceNoDrain` instead, because "we were told not to sample" and "we could
-    /// not sample" are different findings.
+    /// ⚠ It fires on **both** `Umd12EclFence=0` arms, with the drain on or off, and it
+    /// is the only arm on which no sample is attempted at all. ⛔ Its old sentence
+    /// *"the arm where the fence knob is on and the drain is off is `EclFenceNoDrain`
+    /// instead"* is stale: that arm now samples, so it reaches one of the five cause
+    /// counters **and** `EclFenceNoDrain` as the undrained census.
     ecl_fence_disabled: RefusalCounter,
     /// The bridge reported a fence status this build's mapping does not know.
     ///
@@ -4317,22 +4394,28 @@ pub(crate) struct L2Refusals {
     /// zero there says either "the drain succeeded every time" or "the drain never
     /// ran", and those are opposite facts.
     ecl_drain_disabled: RefusalCounter,
-    /// ⛔ **A1: `Umd12EclFence` asked for a boundary and the drain's absence made it
-    /// unobtainable**, so the record carried 0.
+    /// ⭐ **The boundary in the submitted record was sampled WITHOUT a drain**, so it
+    /// may name a **prefix** of the frame rather than all of it.
     ///
-    /// ⛔ **Expected to equal `EclForwarded` on a default build.** The venus wire
-    /// fence is sampled from the `VkQueue` only `vkd3d_acquire_vk_queue` hands back,
-    /// *inside* the same bridge call that drains — so with `Umd12EclDrain=0` there is
-    /// no boundary to be had, and this is the fifth distinguishable cause of a zero
-    /// beside `EclFenceNoIcd` / `EclFenceNoExport` / `EclFenceRefused` /
-    /// `EclFenceDisabled`. ⚠ It is a **capability statement about this build's
-    /// configuration**, not a fault: the four above are all "the sample was attempted
-    /// and did not produce a boundary", and folding this into any of them would
-    /// misattribute a knob to the ICD.
+    /// ⚠⚠ **RE-GRADED, and the old grading is quoted because it was a cause and this
+    /// is not.** It used to mean *"`Umd12EclFence` asked for a boundary and the
+    /// drain's absence made it unobtainable, so the record carried 0"* — the fifth
+    /// distinguishable cause of a zero fence, expected to equal `EclForwarded` on a
+    /// default build. `bridge12::sample_queue_fence` removed that state: the default
+    /// arm samples through upstream's `vkd3d_lock_vk_queue` and gets a real fence.
     ///
-    /// ⭐ It is also the counter that says the ordering gap A1's containment accepts
-    /// was actually taken on this run, which is what CLAUDE.md rule 2 asks of a
-    /// deliberately reduced path.
+    /// ⛔ **It is no longer part of the cause partition.** It fires *beside* exactly
+    /// one of `EclFenceSampled` / `EclFenceNoIcd` / `EclFenceNoExport` /
+    /// `EclFenceRefused` / `EclFenceStatusBad`, never instead of one, so those five
+    /// plus `EclFenceDisabled` still sum to `EclForwarded` while this one counts the
+    /// arm they were reached on.
+    ///
+    /// ⛔ **Expected to equal `EclForwarded` on a default build** — same number as
+    /// before, opposite meaning — and expected **0** on a run with
+    /// `Umd12EclDrain=1`. ⚠ Read it as the *under-wait census*: on a run where it
+    /// equals `EclFenceSampled`, every boundary this driver put on the wire is a
+    /// prefix, and an application fence completing early is explained by this counter
+    /// and not by the KMD.
     ecl_fence_no_drain: RefusalCounter,
     /// ⭐ **S-2's entry instrument: the runtime entered `pfnSignalFence`.** Counted as
     /// the function's first statement, above the null-argument check, so it counts

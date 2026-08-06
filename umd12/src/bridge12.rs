@@ -55,49 +55,27 @@
 //! omitted, it is vacuous: it is "one `from_raw` per **owning entry point**",
 //! and S4 has none.
 //!
-//! # ⛔ One C++ entry point has NO Rust half yet, deliberately — and it is needed
+//! # ⭐ The sample-only boundary, and why it landed WITH its call site
 //!
-//! `helios_vkd3d_bridge_sample_queue_fence` exists in `umd12/bridge/vkd3d_bridge.h`
-//! and `.cpp` and is **not declared here**, because nothing in this crate calls it:
-//! its one caller is `pfnExecuteCommandLists` in `forward12::queue.rs`. A cxx
+//! `helios_vkd3d_bridge_sample_queue_fence` was in `umd12/bridge/vkd3d_bridge.h` and
+//! `.cpp` for one commit with **no Rust half**, because nothing in this crate called
+//! it: its one caller is `pfnExecuteCommandLists` in `forward12::queue.rs`. A cxx
 //! declaration plus a wrapper with no caller is two hand-written lines carrying
 //! `#[allow(dead_code)]`, which `PARALLEL.md` §10 forbids outright (R908) — the same
-//! reason `adopt_d3d12_device` above was written and then removed. So the shape is
-//! recorded instead of landed, exactly as that one is.
+//! reason `adopt_d3d12_device` above was written and then removed. ⇒ the declaration,
+//! [`sample_queue_fence`] and the call site are one commit, and the shape recorded in
+//! this block's earlier form is what landed.
 //!
-//! ⚠ **Why it matters, because "no Rust half" reads as optional and is not.**
+//! ⚠ **Why it mattered, because "no Rust half" reads as optional and was not.**
 //! `Umd12EclDrain` defaults **OFF** — `vkd3d_acquire_vk_queue` reaches an untimed
-//! `pthread_cond_wait` from inside a DDI — and the drain is the only place a
-//! `VkQueue` was obtainable. So on the shipping default every submission carries
-//! `gpu_wire_fence = 0`, `Umd12EclFence`'s ON default is inert, and the kernel's
-//! exact-boundary arm can never fire. The C++ side reaches the same boundary through
-//! `vkd3d_lock_vk_queue`, which drains nothing; the header carries the full argument
-//! and the under-wait it costs.
-//!
-//! The two halves to add, in ONE commit with the call site so `-D warnings` stays
-//! clean:
-//!
-//! ```ignore
-//! // in `mod ffi`, beside `helios_vkd3d_bridge_drain_queue`:
-//! unsafe fn helios_vkd3d_bridge_sample_queue_fence(
-//!     queue: usize, out_wire_fence: *mut u64, out_fence_status: *mut u32) -> bool;
-//!
-//! // and the wrapper, mirroring `drain_queue_with_fence`'s intersection rule:
-//! pub(crate) unsafe fn sample_queue_fence(queue: usize) -> (u64, FenceStatus) {
-//!     let mut wire_fence: u64 = 0;
-//!     let mut raw_status: u32 = 0;
-//!     let sampled = unsafe {
-//!         ffi::helios_vkd3d_bridge_sample_queue_fence(queue, &mut wire_fence, &mut raw_status)
-//!     };
-//!     let status = FenceStatus::from_raw(raw_status);
-//!     if sampled && status == FenceStatus::Sampled { (wire_fence, status) }
-//!     else if status == FenceStatus::Sampled { (0, FenceStatus::Unknown(raw_status)) }
-//!     else { (0, status) }
-//! }
-//! ```
-//!
-//! ⛔ `FenceStatus::from_raw` is private to this module, so the wrapper belongs here
-//! and not at the call site.
+//! `pthread_cond_wait` from inside a DDI — and the drain was the only place a
+//! `VkQueue` was obtainable. So on the shipping default every submission carried
+//! `gpu_wire_fence = 0`, `Umd12EclFence`'s ON default was inert, and the kernel's
+//! exact-boundary arm could never fire: the whole fence bridge shipped doing nothing,
+//! knowingly. The C++ side reaches the same boundary through `vkd3d_lock_vk_queue`,
+//! which drains nothing; that header carries the full argument and the under-wait it
+//! costs, and [`sample_queue_fence`] repeats the cost rather than relying on the
+//! reader following the link.
 
 // ⚠ `too_many_arguments` is allowed for this MODULE and not for a function,
 // because the lint fires on a declaration inside a `#[cxx::bridge]` block and cxx
@@ -224,6 +202,31 @@ mod ffi {
         /// [`drain_queue`] for the status mapping and [`FenceStatus`] for why a
         /// zero fence has four distinguishable causes.
         unsafe fn helios_vkd3d_bridge_drain_queue(
+            queue: usize,
+            out_wire_fence: *mut u64,
+            out_fence_status: *mut u32,
+        ) -> bool;
+
+        /// Sample the venus GPU-completion boundary **without draining**.
+        ///
+        /// ⭐ Same `queue`/borrowing contract and the same `HELIOS_VKD3D_FENCE_*`
+        /// status set as [`helios_vkd3d_bridge_drain_queue`]; the difference is
+        /// `vkd3d_lock_vk_queue` in place of `vkd3d_acquire_vk_queue`, so no
+        /// `VKD3D_SUBMISSION_DRAIN` is enqueued and nothing waits on vkd3d's
+        /// submission worker. See the Rust wrapper [`sample_queue_fence`] for the
+        /// under-wait that buys.
+        ///
+        /// ⚠ Both out-params are **mandatory** here, unlike the drain's
+        /// both-or-neither: a null pair there means *"drain but do not sample"*,
+        /// which is a real mode, while a sample with nowhere to put the answer
+        /// would be a lock/unlock around nothing.
+        ///
+        /// # Safety
+        /// As [`helios_vkd3d_bridge_drain_queue`], plus: both out-pointers must be
+        /// non-null and address writable storage. Both are cleared before anything
+        /// that can fail, so both are defined on every path including a `false`
+        /// return.
+        unsafe fn helios_vkd3d_bridge_sample_queue_fence(
             queue: usize,
             out_wire_fence: *mut u64,
             out_fence_status: *mut u32,
@@ -545,12 +548,11 @@ pub(crate) unsafe fn serialize_root_signature(
 /// because `vkd3d_acquire_vk_queue` reaches an untimed, unbounded
 /// `pthread_cond_wait` from inside a DDI (`PENDING.md` §1 A1). So the drained
 /// boundary is the *best* boundary and not the only one:
-/// `helios_vkd3d_bridge_sample_queue_fence` obtains the same boundary through
-/// `vkd3d_lock_vk_queue`, which drains nothing, and accepts a possible under-wait in
-/// exchange for being reachable at all — see this module's doc for why it has no Rust
-/// half yet and what the two halves are. ⛔ The two are separately switchable on
-/// purpose: folding them back into one knob would put the fence bridge back to
-/// carrying 0 on the shipping default.
+/// [`sample_queue_fence`] obtains the same boundary through `vkd3d_lock_vk_queue`,
+/// which drains nothing, and accepts a possible under-wait in exchange for being
+/// reachable at all. ⛔ The two are separately switchable on purpose: folding them
+/// back into one knob would put the fence bridge back to carrying 0 on the shipping
+/// default.
 ///
 /// ⭐ It is the same discipline `HeliosWaitFrameSubmitted` gives the D3D11 present
 /// path, and `KMD_IMPACT.md` §14a.2 says so in as many words.
@@ -653,4 +655,66 @@ pub(crate) unsafe fn drain_queue_with_fence(queue: usize) -> (bool, u64, FenceSt
     let drained =
         unsafe { ffi::helios_vkd3d_bridge_drain_queue(queue, &mut wire_fence, &mut raw_status) };
     (drained, wire_fence, FenceStatus::from_raw(raw_status))
+}
+
+/// Sample the venus wire fence that retires at host GPU completion of everything
+/// **already submitted** to this queue, without draining vkd3d's submission worker.
+///
+/// Returns `(wire_fence, status)`. A `0` fence is legal and only `status` says why.
+///
+/// # ⛔⛔ This is NOT the drained boundary, and it must never be described as one
+///
+/// [`drain_queue_with_fence`] waits for vkd3d's worker to hand *everything the
+/// application enqueued* to Vulkan and then samples. This takes only the
+/// `vkd3d_queue` mutex (`vkd3d_lock_vk_queue`, upstream, already in this link) and
+/// samples immediately — so **the boundary may name less work than the frame
+/// contains**, an under-wait, i.e. the application's fence can still complete before
+/// its GPU work does. The C++ header carries the same statement at the same strength.
+///
+/// ⭐ **Why that is acceptable rather than merely cheaper**, and it is an ordering of
+/// three states and not a preference:
+///
+/// * a **drained** boundary is exact;
+/// * an **undrained** boundary names a prefix of the frame — it can under-wait, and
+///   the asymmetry is that a *larger* seqno only over-orders while only a stale
+///   *smaller* one under-waits;
+/// * **no** boundary orders the packet against nothing at all, which is where the
+///   `Umd12EclDrain=0` default sat before this existed — and that is strictly worse
+///   than an under-wait, because it is an under-wait of the entire frame.
+///
+/// ⛔ And the reason the middle state has to exist: the drain reaches an **untimed,
+/// unbounded** `pthread_cond_wait` from inside a DDI (`PENDING.md` §1 A1), so it
+/// cannot be the default. Without a sample-only path the fence bridge ships inert on
+/// every default build — `Umd12EclFence`'s ON default resolving to a 0 boundary — and
+/// the kernel's exact-boundary arm can never fire.
+///
+/// ⚠ It also carries **no** cost the drain does: no `VKD3D_SUBMISSION_DRAIN`, no
+/// `queue_lock` (so a failed lock leaks nothing, unlike the drain's identical arm),
+/// and no empty `vkQueueSubmit2` on release.
+///
+/// # Safety
+/// As [`drain_queue`].
+pub(crate) unsafe fn sample_queue_fence(queue: usize) -> (u64, FenceStatus) {
+    let mut wire_fence: u64 = 0;
+    let mut raw_status: u32 = 0;
+    // SAFETY: as `drain_queue`, plus two live writable locals for the two out-params
+    // this entry point requires. The C++ side clears both before anything that can
+    // fail, so they are defined on every path including a `false` return.
+    let sampled = unsafe {
+        ffi::helios_vkd3d_bridge_sample_queue_fence(queue, &mut wire_fence, &mut raw_status)
+    };
+    let status = FenceStatus::from_raw(raw_status);
+    // ⛔ The intersection, not either alone — the identical rule and the identical
+    // reason as `resource_venus_identity`: the C++ side returns `true` on exactly the
+    // path that sets `SAMPLED`, so the two agree by construction today, and this is an
+    // FFI the type system cannot check. A future divergence must fall to the SAFE side
+    // (a 0 boundary, loudly attributed) rather than to whichever of the two the caller
+    // happened to read.
+    if sampled && status == FenceStatus::Sampled {
+        (wire_fence, status)
+    } else if status == FenceStatus::Sampled {
+        (0, FenceStatus::Unknown(raw_status))
+    } else {
+        (0, status)
+    }
 }
