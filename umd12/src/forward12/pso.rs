@@ -241,6 +241,47 @@ unsafe fn boxed_state<'a, H: BoxedHandle>(h: H) -> Option<&'a H::State> {
     Some(unsafe { &*p })
 }
 
+// ── ⚠ L3a's accessor (S6 Round 2, `PARALLEL.md` §4's accessor budget) ───────
+//
+// ⛔ **Named and monomorphic, and that is the point of it.** `com_slot` above is
+// generic over the interface, which is fine *inside* this file where both call
+// sites name the only interface their slot ever holds — but exporting a generic
+// form would put the payload choice back at a call site in another file, which
+// is R803's shape exactly (`ARCHITECTURE.md` §12 rule 7). The payload of
+// `D3D12DDI_HPIPELINESTATE` is decided once, here, in the file that owns the
+// handle and writes the slot.
+
+/// The engine `ID3D12PipelineState` behind a DDI pipeline-state handle.
+///
+/// ⭐ `pub(crate)` for exactly one caller: `cmdlist.rs`'s `pfnSetPipelineState`,
+/// which is the only DDI outside this file that turns a
+/// `D3D12DDI_HPIPELINESTATE` back into an engine object. Same seam, and the same
+/// reasoning, as `queue::command_list_state` and `resource12::engine_resource`.
+///
+/// ⚠ **`ManuallyDrop`, because the slot keeps the reference.** This borrows what
+/// [`create_pipeline_state`] stored; dropping the returned value would release
+/// the slot's own reference and leave a live handle pointing at a freed object.
+/// The wrapper makes that unwritable rather than merely unlikely, and it costs
+/// no `AddRef`/`Release` pair on a path an application drives per draw batch.
+/// `None` means the slot is empty — i.e. the create refused — which is a case
+/// `cmdlist.rs` counts rather than one this function decides.
+///
+/// # Safety
+/// `h_pso`'s `pDrvPrivate` must address the private block
+/// `pfnCalcPrivatePipelineStateSize` sized, and the returned value must not
+/// outlive the DDI call that obtained it.
+pub(crate) unsafe fn engine_pipeline_state(
+    h_pso: ddi12::D3D12DDI_HPIPELINESTATE,
+) -> Option<ManuallyDrop<ID3D12PipelineState>> {
+    // SAFETY: forwarded; the caller carries `Slot::from_priv`'s precondition.
+    let slot = unsafe { com_slot::<_, ID3D12PipelineState>(h_pso) }?;
+    // SAFETY: as above. `load` reads the word and reports an empty slot as
+    // `None` rather than fabricating a reference.
+    unsafe { slot.load() }
+}
+
+// ── end of L3a's accessor ──────────────────────────────────────────────────
+
 /// Null a boxed handle's slot word without touching what it pointed at.
 ///
 /// ⛔ Every create runs this first, before anything can fail: a failed create
