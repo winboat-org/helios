@@ -230,6 +230,16 @@ pub(crate) fn record_present_handoff_telemetry() {
         b"GpuFncClamp",
         crate::virtio::gpu::GPU_FENCE_CLAMPED.load(Ordering::Relaxed),
     );
+    // A6's half of the same rejection: a boundary naming a fence from a FOREIGN
+    // transport generation. `GpuFncClamp` provably cannot flag it — its condition
+    // is one-sided (`>= next_wire_fence`) and a pre-restart id is far BELOW the
+    // live range. Must read 0 on any session without a device restart; a small
+    // number after one is the surviving-ICD case; nonzero without a restart means a
+    // UMD is sampling fence ids that did not come from this transport.
+    crate::diag::record_named_bytes(
+        b"GpuFncGen",
+        crate::virtio::gpu::GPU_FENCE_FOREIGN_GENERATION.load(Ordering::Relaxed),
+    );
     // WHY the WDDM FIFO head was not ready. The head paces every fence behind
     // it, so this ratio names what actually paces present retirement.
     crate::diag::record_named_bytes(

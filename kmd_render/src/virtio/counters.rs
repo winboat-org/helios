@@ -176,6 +176,28 @@ pub static ESCAPE_SUBMIT_RING_COUNT: AtomicU32 = AtomicU32::new(0);
 /// packet then waits on the whole backlog instead of its own work — slower, never
 /// wedged, and `RngSub`/`EscSubRing` say whether such a fence could exist at all.
 pub static GPU_FENCE_CLAMPED: AtomicU32 = AtomicU32::new(0);
+/// Guest-supplied completion boundaries REJECTED because they name a fence from a
+/// FOREIGN transport generation — below this instance's `wire_fence_base`.
+///
+/// A6 (`docs/dx12/PENDING.md` §1). [`GPU_FENCE_CLAMPED`]'s condition is
+/// `id == 0 || id >= next_wire_fence`, a one-sided bound, and every StartDevice
+/// strides the id range up by 2^32 — so a fence sampled before a
+/// StopDevice/StartDevice cycle sits BILLIONS below the new range, passes that
+/// bound, matches no in-flight entry, and satisfies the dependency instantly. The
+/// old code could not tell that apart from a boundary that had genuinely retired:
+/// the WDDM fence completed early and `GpuFncClamp` stayed at 0.
+///
+/// ⚠ Exactly one of the two counters moves per rejected boundary; they are not
+/// summable into "bad boundaries" without double-counting neither, but a nonzero
+/// reading in either means the packet fell back to the conservative
+/// `next_wire_fence` prefix rather than to the boundary the writer named.
+///
+/// GRADING: **0 on any session without a device restart**, and a small number
+/// after one — a client that survived `pnputil /restart-device` holding fences is
+/// exactly the case the striding comment at `VirtioGpu::init` describes. Nonzero
+/// *without* a restart means a UMD is sampling fence ids from somewhere other than
+/// this transport, which is a different and worse finding.
+pub static GPU_FENCE_FOREIGN_GENERATION: AtomicU32 = AtomicU32::new(0);
 /// Fire-and-forget control commands queued by PASSIVE workers (currently the
 /// scanout RESOURCE_FLUSH path).  These own their DMA buffers until the normal
 /// used-ring drain retires them, but never park a stack waiter.

@@ -1924,6 +1924,27 @@ pub struct VirtioGpu {
     /// Next wire fence id to assign (globally monotonic, starts at 1; 0 is
     /// never a valid wire fence).
     next_wire_fence: u64,
+    /// FIRST wire fence id THIS transport generation may hand out — i.e.
+    /// `next_wire_fence` as of `init`, before anything was assigned.
+    ///
+    /// ⛔ IT EXISTS BECAUSE AN UPPER BOUND IS NOT A GENERATION CHECK (A6,
+    /// `docs/dx12/PENDING.md` §1). Every id space check in this transport was
+    /// `id != 0 && id < next_wire_fence`, and [`NEXT_WIRE_FENCE_BASE`] strides the
+    /// range by `WIRE_FENCE_INSTANCE_STRIDE` at every StartDevice — so an id
+    /// sampled by a usermode client BEFORE a StopDevice/StartDevice cycle is
+    /// billions below the new instance's range and satisfies that test trivially,
+    /// while naming a fence this instance never issued. The in-flight scan then
+    /// finds nothing at or below it and the dependency is satisfied INSTANTLY.
+    /// For a wait that is merely a hint that is harmless; for a WDDM DMA fence it
+    /// is a completion reported before the work exists.
+    ///
+    /// ⚠ `fence_wait_prepare` / `fence_event_register` (`:4390`, `:4433`) share the
+    /// same one-sided predicate and are deliberately NOT changed here: their
+    /// failure mode is a usermode wait that returns early to the process that
+    /// forged the id, and the striding comment above records that arm as the
+    /// intended behaviour for a client which survived a device restart. The WDDM
+    /// arm is different in kind because dxgkrnl schedules the whole desktop on it.
+    wire_fence_base: u64,
     /// WDDM submissions pending on venus completion, FIFO (capacity
     /// MAX_WDDM_PENDING, reserved at init).
     wddm_pending: VecDeque<WddmPending>,
@@ -2175,6 +2196,13 @@ impl VirtioGpu {
             crate::diag::fault(crate::diag::FaultCounter::StIsr, mmio_fails);
         }
 
+        // This transport generation's wire-fence range, claimed ONCE and stored in
+        // two fields: `next_wire_fence` moves, `wire_fence_base` does not. Both
+        // must come from the same `fetch_add`, so it happens here rather than
+        // inside the struct literal below.
+        let wire_fence_base =
+            NEXT_WIRE_FENCE_BASE.fetch_add(WIRE_FENCE_INSTANCE_STRIDE, Ordering::Relaxed);
+
         // `VirtioGpu` contains the control virtqueue and many ownership tables.
         // Return it heap-owned so StartDevice never reserves a second by-value
         // copy of this large state while `init`'s own frame is live.
@@ -2205,20 +2233,30 @@ impl VirtioGpu {
             fence_events: Vec::with_capacity(MAX_FENCE_EVENTS),
             present_streams: allocate_present_streams(),
             next_present_stream_cookie: 1,
-            // NOT 1. Wire fence ids arrive from an untrusted usermode buffer
-            // at the WAIT_FENCE escape, and both `fence_wait_prepare` and
-            // `fence_event_register` decide "already complete" with the ordinal
-            // predicate `id < next_wire_fence && not in-flight`. Restarting the
-            // id space at 1 on every transport init makes a stale id from a
-            // PREVIOUS instance — an ICD that survived a `pnputil
-            // /restart-device` still holding fences — look Complete instead of
-            // Invalid. Striding the base at each init moves those ids into the
-            // `>= next_wire_fence` Invalid arm. Behaviour within one instance is
-            // unchanged; the predicate itself is sound there, because
-            // next_wire_fence is bumped only after `control.add` succeeds, in
-            // the same spinlock section as the `inflight` push.
-            next_wire_fence: NEXT_WIRE_FENCE_BASE
-                .fetch_add(WIRE_FENCE_INSTANCE_STRIDE, Ordering::Relaxed),
+            // NOT 1. Wire fence ids arrive from an untrusted usermode buffer at
+            // the WAIT_FENCE escape, and `fence_wait_prepare` /
+            // `fence_event_register` / the WDDM boundary arm all decide against
+            // the ordinal predicate `id < next_wire_fence && not in-flight`.
+            // Restarting the id space at 1 on every transport init lets a stale id
+            // from a PREVIOUS instance — an ICD that survived a `pnputil
+            // /restart-device` still holding fences — ALIAS a live id of the new
+            // instance, so a waiter could park against completely unrelated work
+            // that happens to occupy the same number. Striding the base by
+            // `WIRE_FENCE_INSTANCE_STRIDE` at each init makes the id ranges
+            // disjoint, which removes the aliasing. Behaviour within one instance
+            // is unchanged; the predicate is sound there, because next_wire_fence
+            // is bumped only after `control.add` succeeds, in the same spinlock
+            // section as the `inflight` push.
+            //
+            // ⛔ THIS COMMENT USED TO CLAIM the stride *"moves those ids into the
+            // `>= next_wire_fence` Invalid arm"*. THAT IS BACKWARDS and it was
+            // load-bearing: the stride moves the base UP, so a pre-restart id is
+            // billions BELOW the live range and lands in the `< next_wire_fence`
+            // arm — the one that reads "already complete". The stride buys
+            // disjointness, never rejection. Rejection needs the two-sided bound
+            // against `wire_fence_base`, which is why that field exists (A6).
+            next_wire_fence: wire_fence_base,
+            wire_fence_base,
             wddm_pending: VecDeque::with_capacity(MAX_WDDM_PENDING),
             windowed_blt: WindowedBltState::new(),
             // Snapshotted at transport init like every other knob, so
@@ -5682,9 +5720,15 @@ impl VirtioGpu {
         } else if let Some(gpu_fence_id) = gpu_completion_fence {
             // async_retired_up_to uses an exclusive watermark. A marker written
             // by Present names the exact ring-1 fence that owns its copy.
-            if gpu_fence_id != 0 && gpu_fence_id < self.next_wire_fence {
-                gpu_fence_id.saturating_add(1)
-            } else {
+            //
+            // ⛔ THE BOUND IS TWO-SIDED SINCE 2026-08-06 (A6). `wire_fence_base`
+            // is this transport generation's FIRST id; ids stride up by 2^32 at
+            // every StartDevice, so an id sampled before a StopDevice/StartDevice
+            // cycle is billions BELOW the live range and passed the old one-sided
+            // `< next_wire_fence` test trivially — then matched nothing in flight
+            // and satisfied the dependency instantly. That is a DMA fence
+            // completing before its work exists, and `GpuFncClamp` never saw it.
+            if gpu_fence_id == 0 || gpu_fence_id >= self.next_wire_fence {
                 // A malformed/stale private marker must not manufacture an
                 // impossible future dependency. Conservatively gate on all
                 // work actually enqueued before this WDDM submission.
@@ -5697,6 +5741,45 @@ impl VirtioGpu {
                 // NOT named after either.
                 GPU_FENCE_CLAMPED.fetch_add(1, Ordering::Relaxed);
                 self.next_wire_fence
+            } else if gpu_fence_id < self.wire_fence_base {
+                // FOREIGN GENERATION. Same conservative fallback, its own counter:
+                // the two conditions are diagnosed differently (an id ahead of the
+                // range is a stale/forged sample within this generation; an id
+                // below it is a survivor of a device restart), and one counter for
+                // both would have hidden the whole A6 class inside a number that
+                // reads as the known-benign clamp.
+                GPU_FENCE_FOREIGN_GENERATION.fetch_add(1, Ordering::Relaxed);
+                self.next_wire_fence
+            } else {
+                // ⛔ NO OWNER CHECK, AND THAT IS A DECISION (A6's second half).
+                //
+                // The check would be "was this fence id issued to the process /
+                // context that submitted this DMA buffer", and it is NOT worth its
+                // cost here:
+                //
+                //  * It cannot be answered from existing state. `InFlightKind::
+                //    AsyncVenus` records `fence_id`/`ring_idx` and no owner, so an
+                //    owner check means a new field in the transport's hottest
+                //    DISPATCH-time table (or a side table indexed by fence id) that
+                //    every enqueue, drain and reap would have to maintain.
+                //  * The attack it would prevent is strictly weaker than one the
+                //    contract already grants. A fence id is only ever a WAIT
+                //    TARGET here — never something this arm signals — so naming
+                //    another process's id can make THIS packet wait longer (a
+                //    self-inflicted stall on the naming context) or, if that id has
+                //    already retired, complete without waiting for the namer's own
+                //    work. The second is a real harm and it lands entirely on the
+                //    naming process's own pixels. And a hostile guest already has a
+                //    cheaper way to get it: `gpu_wire_fence = 0` is the DOCUMENTED
+                //    "order it against nothing" arm (`D12Zero`).
+                //  * Nothing another process owns becomes reachable: the boundary
+                //    selects a wait, and every other client's WDDM fence keeps its
+                //    own entry with its own watermark.
+                //
+                // ⇒ generation is checked because a cross-generation id breaks the
+                // predicate's soundness for the OS scheduler; ownership is not,
+                // because it only re-describes a self-harm the DDI already permits.
+                gpu_fence_id.saturating_add(1)
             }
         } else if stream_boundary.is_some() && self.present_exact_watermark {
             // EXACT PRESENT WATERMARK (2026-08-04). `next_wire_fence` is "every
