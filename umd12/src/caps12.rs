@@ -212,27 +212,41 @@ mod v {
 /// `shader_caps`'s `ROVs` / `TypedUAVLoadAdditionalFormats` move **together or
 /// not at all**.
 ///
-/// # ⭐ 11_0 IS A STAGING VALUE. THE TARGET IS 12_2.
+/// # ⭐ 11_0 IS A STAGING VALUE. THE TARGET IS **FL 12_1**.
 ///
-/// Owner directive, 2026-08-06: the goal by **P4 (first frame) / P5
-/// (conformance)** is the **highest feature level D3D12 defines — FL 12_2,
-/// "DirectX Ultimate"**. `DX12.md` §4.4 is the ladder: which floors each step
-/// arms, and which lane must land before the step can be taken.
+/// Owner directive, 2026-08-06: aim for **FL 12_1** through the D3D12
+/// implementation. **FL 12_2 ("DirectX Ultimate") is OUT OF SCOPE**, and the
+/// blocker is not caps — it is **WDDM**. `DX12.md` §4.4 is the ladder.
 ///
-/// ⭐ **The ceiling is not the substrate.** Every one of the eighteen FL 12_2
-/// floors is already backed on this guest — `baselines/d3d12-caps.csv` has them
-/// all, and vkd3d's own log says `DX Ultimate supported!`. What gates the level
-/// is that the DDI slots behind each cap become real, because `DECISIONS.md`
-/// §7.8 forbids advertising what the *driver* cannot back.
+/// ⛔ **FL 12_2 requires a WDDM 2.9 adapter, and Helios declares 2.1 on
+/// purpose.** `kmd_render/src/ddi/wddm_surface.rs`'s module doc records why:
+/// 2.1 is *"below the MPO3 requirement boundary"*, while at **2.2+** DWM treats
+/// the adapter as a Display-Core/MPO3 presentation device and — since Helios
+/// registers no MPO3 KMD interface — *"fails fast with `E_NOTIMPL`"*. So 12_2
+/// costs a new `WddmSurface` level across five coupled sites, **plus** the MPO3
+/// interface, **plus** re-validating the display path that currently composites
+/// the whole desktop. That is a display-stack workstream wagered against a
+/// milestone already met, not a caps change.
+///
+/// ⭐ **FL 12_1 needs no KMD change at all.** Its five floors — typed-UAV-load,
+/// `ResourceBindingTier >= 2`, `TiledResourcesTier >= 2` (12_0), plus ROVs and
+/// `ConservativeRasterizationTier >= 1` (12_1) — are **L5, L4, L2 and L6**,
+/// which is the triangle's own lane order, so it adds no lane `D12-G8` did not
+/// already need and leaves L9/L3c free to trail. None of the five is marginal:
+/// the substrate reports binding tier 3, tiled tier 4, conservative raster 3.
+///
+/// ⚠ FL 12_1 is *expected* to be reachable at the current WDDM 2.1 surface —
+/// D3D12 requires only WDDM 2.0 and none of the five floors is a display-path
+/// feature. The commit that raises the level must **confirm** that, not assume
+/// it: a WDDM-shaped ETW refusal at 12_0/12_1 is what would falsify it.
+///
+/// ⚠ SM `>= 6_5` is a **12_2** floor, so `shader_models`' short `{5.1, 6.0}`
+/// list stays legal all the way to 12_1.
 ///
 /// ⛔ So this constant is not "raise it when someone feels brave". It is
 /// **`min(what every lane has landed)`**, and the commit that raises it is the
 /// commit that raises its floors — never one without the other, which is the
 /// failure `D12-G5` measured verbatim.
-///
-/// ⚠ The long pole is `TiledResourcesTier >= 3`, and it is the one floor that
-/// is **not a UMD-only job**: `kmd_render`'s guest page tables are decorative
-/// (`kmd_render/src/ddi/gpummu.rs:1-14`). See §4.4.
 ///
 /// ⛔ Two values this must never be, both by precedent:
 /// * a **bitmask**. `D3D12DDICAPS_TYPE_3DPIPELINESUPPORT` is a *maximum level*
@@ -600,12 +614,35 @@ unsafe fn d3d12_options(a: &ddi12::D3D12DDIARG_GETCAPS, data_size: usize) -> Hre
 /// explicit clamp Helios ships a number nobody chose, which is CLAUDE.md rule 8
 /// in its purest form.
 ///
-/// This driver reports `NOT_SUPPORTED` today because `pfnUpdateTileMappings` is
-/// a counting noop and the KMD's guest page tables are decorative
+/// This driver reports `NOT_SUPPORTED` today for one reason only:
+/// `pfnUpdateTileMappings` and `pfnCopyTileMappings` are counting noops. The
+/// clamp is written now, at the site, so the lane which raises this cannot
+/// forget it.
+///
+/// ⛔ **CORRECTION — this comment used to blame the KMD, and that was wrong.**
+/// It read: *"the KMD's guest page tables are decorative
 /// (`kmd_render/src/ddi/gpummu.rs:1-14`), so reads from unmapped tiles would
-/// return whatever was there instead of zero — with no failure the app can see.
-/// The clamp is written now, at the site, so that the lane which raises this
-/// cannot forget it.
+/// return whatever was there instead of zero"*. D3D12 tiled resources are
+/// implemented on Vulkan **sparse binding** — vkd3d maps tiles with
+/// `vkQueueBindSparse` — so no guest page table is in that path, which is also
+/// what `gpummu.rs` itself says is decorative *about*: venus addresses host
+/// resources by opaque id and the host GPU owns the real MMU. And the
+/// zero-read guarantee tier 2 requires is exposed by the guest already:
+/// `residencyNonResidentStrict = true`, beside `sparseResidencyImage2D/3D`,
+/// `sparseResidencyAliased` and the standard block shapes
+/// (`docs/dx12/research/guest-vulkaninfo-full.txt`).
+///
+/// ⇒ `TiledResourcesTier >= 2` — which **FL 12_0 requires**, so the FL 12_1
+/// target needs it — is a **UMD-only job**: this lane plus L2's two tile-mapping
+/// slots on the command-queue table. ⚠ Backed on paper, **unexercised**: no gate
+/// has run a tiled resource through venus, so it is a `D12-G9` item to verify.
+///
+/// ⭐ The lesson is general: *a code comment asserting a dependency is not
+/// evidence of one* — one grep of `guest-vulkaninfo-full.txt` settled it, after
+/// the wrong claim had propagated into three documents. ⚠ And note the
+/// symmetry: the KMD dependency that IS real (WDDM 2.9 / MPO3, which puts FL
+/// 12_2 out of scope) was also sitting in a module doc. Read the KMD's own docs
+/// before costing a feature level, in both directions.
 fn tiled_resources_tier() -> ddi12::D3D12DDI_TILED_RESOURCES_TIER {
     let engine_reports = TILED_RESOURCES_TIER_REPORTED;
     if engine_reports > v::TILED_MAX {

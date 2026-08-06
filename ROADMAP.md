@@ -3619,29 +3619,50 @@ silent on it:
   command pool, `pfnMakeResident`, `pfnGetDebugAllocationInfo`. Those are **L6**, **L2**
   and **L4**, and driving them to zero is those lanes' definition of done
   (`PARALLEL.md` §9.2).
-- ⭐⭐ **THE FEATURE-LEVEL TARGET IS FL 12_2 ("DirectX Ultimate") BY P4/P5** (owner,
-  2026-08-06). `DX12.md` **§4.4** is the ladder. FL 11_0 is what `caps12.rs` ships
-  today and it is a **staging value**, not the destination.
-  - ⭐ **The ceiling is not the substrate — every one of the eighteen FL 12_2 floors
-    is already backed on this guest**, tabulated in §4.4 against
-    `baselines/d3d12-caps.csv`, with vkd3d's own log saying `DX Ultimate supported!`.
-    ⇒ the feature level is a **function of lane completion**: it rises as the DDI
-    slots behind each cap become real, because `DECISIONS.md` §7.8 forbids
-    advertising what the *driver* cannot back.
+- ⭐⭐ **THE FEATURE-LEVEL TARGET IS FL 12_1. FL 12_2 IS OUT OF SCOPE, AND THE BLOCKER
+  IS WDDM, NOT CAPS** (owner, 2026-08-06). `DX12.md` **§4.4** is the ladder. FL 11_0 is
+  what `caps12.rs` ships today and is a **staging value**.
+  - ⛔ **FL 12_2 requires a WDDM 2.9 adapter; Helios declares 2.1 deliberately.**
+    `kmd_render/src/ddi/wddm_surface.rs`'s module doc has the mechanism: 2.1 is *"below
+    the MPO3 requirement boundary"*, and at **2.2+** DWM treats the adapter as a
+    Display-Core/MPO3 presentation device — Helios registers no MPO3 KMD interface, so
+    it *"fails fast with `E_NOTIMPL`"*, which is exactly why the 3.2 level is not
+    deployable. ⇒ 12_2 costs a new `WddmSurface` level across **five coupled sites**,
+    **plus** the MPO3 interface, **plus** re-validating the display path that currently
+    composites the whole desktop. A display-stack workstream wagered against a milestone
+    already met — **revisit it as its own effort**, with `WddmSurface` + MPO3 as the
+    deliverables and the feature level as a consequence.
+  - ⭐ **FL 12_1 needs no KMD change at all, and no lane `D12-G8` did not already need.**
+    Its five floors are typed-UAV-load + `ResourceBindingTier >= 2` +
+    `TiledResourcesTier >= 2` (12_0 → **L5**, **L4**, **L2**) and ROVs + conservative
+    raster ≥ 1 (12_1 → **L6**) — the triangle's own L2 → L6 → L5 → L4 order. **L9 and
+    L3c stay able to trail**, as `PARALLEL.md` §4 says.
+  - ⭐ **The substrate is not the constraint at any level** — vkd3d logs `DX Ultimate
+    supported!` and §4.4 tabulates all 23 floors against `baselines/d3d12-caps.csv`.
+    None of the five 12_1 floors is marginal (binding tier 3, tiled tier 4, conservative
+    raster 3 all exceed requirement).
   - ⛔ **The level and its floors move in ONE commit, by the lane that earned them.**
-    12_0 arms typed-UAV-load + `ResourceBindingTier >= 2` + `TiledResourcesTier >= 2`
-    (L5, L4); 12_1 adds ROVs + conservative raster (L6); 12_2 adds eighteen more
-    across L6/L5/L4/L3a/L3c/L9.
-  - ⛔ **This is a constraint on how the lanes are BUILT, not a later milestone.** A
-    lane written against binding tier 1, or against a two-entry shader-model list, is
-    a lane that gets rewritten; where the tier-3 shape costs the same effort, build it.
-  - ⛔ **The long pole is `TiledResourcesTier >= 3` and it is NOT a UMD-only job**:
-    `kmd_render`'s guest page tables are decorative
-    (`kmd_render/src/ddi/gpummu.rs:1-14`). Schedule the KMD dependency rather than
-    discovering it at the last floor.
-  - ⚠ Three floors are met **exactly** — GPU VA 40 bits, conservative raster tier 3,
-    VRS tier 2 — so a substrate regression in any of them lowers the achievable
-    level. Worth a `D12-G9` assertion rather than an assumption.
+    `D12-G5` measured the retail failure verbatim.
+  - ⚠ FL 12_1 is *expected* to be reachable at the current WDDM 2.1 surface (D3D12 needs
+    only WDDM 2.0, and no 12_1 floor is a display-path feature). The commit that raises
+    the level must **confirm** that — a WDDM-shaped ETW refusal at 12_0/12_1 falsifies it.
+  - ⛔ **CORRECTION, kept because it cuts the other way: tiled resources are NOT a
+    `kmd_render` dependency.** An earlier note called `TiledResourcesTier >= 3` "the long
+    pole" and "not a UMD-only job", on `caps12.rs`'s claim that the decorative page
+    tables cannot give the zero-read guarantee. Wrong twice: the hard guarantee is at
+    **tier 2** (required at FL 12_0, so the 12_1 target needs it), and it is **host-side
+    and already true** — tiled resources ride Vulkan **sparse binding**
+    (`vkQueueBindSparse`), no guest page table is in the path, and the guest exposes
+    `residencyNonResidentStrict = true` beside `sparseResidencyImage2D/3D`,
+    `sparseResidencyAliased` and the standard block shapes
+    (`research/guest-vulkaninfo-full.txt`). ⇒ **UMD-only**: L4 plus L2's two tile-mapping
+    slots. ⚠ Backed on paper, **unexercised** — a `D12-G9` verify item.
+  - ⭐ **The lesson, and it runs both ways:** *a code comment asserting a dependency is
+    not evidence of one* (one grep killed the tiled-resources claim after it had spread
+    to three documents) — and the dependency that IS real was also sitting in a module
+    doc. **Read the KMD's own docs before costing a feature level.**
+  - ⚠ SM `>= 6_5` is a **12_2** floor, so `shader_models`' short `{5.1, 6.0}` list stays
+    legal all the way to 12_1; L6 raises it when the shader creates become real.
 - **Next: `D12-G8`** — a triangle through the DDI, owner-visible. That needs the 25 slots
   above, i.e. the `PARALLEL.md` §4 fan-out: **L2** first (it mints the WDDM context),
   then **L6** → **L5** → **L4**, then L3a/L3b, then L8 — followed by the §10 review pass.
