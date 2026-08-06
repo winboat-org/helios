@@ -3828,12 +3828,32 @@ silent on it:
     KMD change**: `dma_gpu_fence` defaults to 1, so a bare `pfnRenderCb` already takes
     `RetireDomain::IncludingGpu` + `watermark = next_wire_fence` in shipped, exercised code.
   - ⛔ **A LIVE DEFECT ON THE SHIPPING PRESENT PATH, found on the way and independent of D3D12**:
-    `present_stream_marker_boundary` (`virtio/gpu/mod.rs:4721-4744`) never compares `value`
-    against `slot.submitted_value`, although both siblings on the tag path do
-    (`prepare_present_stream_tag:4770`, `commit_present_stream_tag:4790`). A guest-supplied
-    `present_value` ahead of anything submitted yields a *live* boundary that can never be
-    satisfied — and `wddm_pending` is an **adapter-global head-of-line FIFO**, so it stalls every
-    context including DWM's until TDR. `KMD_IMPACT.md` §14a.2 **K-F2**; its own commit.
+    `present_stream_marker_boundary` (`virtio/gpu/mod.rs:4721-4744`) bounds the guest-supplied
+    `value` in no way, so an absurd `present_value` yields a *live* boundary
+    `present_stream_slot_ready` (`:945-953`) can never satisfy — and `wddm_pending` is an
+    **adapter-global head-of-line FIFO** (`take_one_ready_wddm:5718-5765`), so it blocks every
+    context including DWM's, bounded only by the FIFO's own 256-entry overflow escape
+    (`:5664-5685`) or TDR. `KMD_IMPACT.md` §14a.2 **K-F2**; its own commit.
+  - ⛔⛔ **The obvious fix is REFUTED and would be a correctness regression, not a hardening**
+    (2026-08-06, static, no VM needed). Copying the tag path's comparison —
+    refuse unless `value <= slot.submitted_value` — inverts a CONSUMER predicate into the
+    PRODUCER's: on the shipping default the marker is delivered **before** the frame's
+    `vkQueueSubmit` **on purpose**. `UmdAsyncPresentStream` is absent = ON (`umd/src/knobs.rs:129`)
+    and `async_stream_eligible` then **skips** `HeliosWaitFrameSubmitted`
+    (`umd/src/forward/present.rs:1479-1528`) *because* the marker carries the dependency instead.
+    The value is minted on the app thread (`umd/bridge/dxvk_bridge.cpp:1316`) while the tag that
+    advances `submitted_value` rides DXVK's submission thread (`HeliosSignalPresentFence` is
+    `EmitCs` only, `d3d11_context_imm.cpp:1150-1162` → `vn_queue.c:1994` → `:1736-1744`), so
+    `value == submitted_value + 1` is the steady state and the check would refuse ~every
+    legitimate frame. Each refusal falls back to `wire_fence_watermark()`
+    (`adapter/scanout.rs:256-270`), which does **not** cover the unsubmitted frame — with the UMD's
+    gate also skipped that is the 0ab-B stale/black-frame class returning, plus `PresentWmk`
+    silently demoted. ⇒ the guard has to be **consumer-side liveness** (bound how long the FIFO
+    head may block on a stream boundary, then rebase to the legacy watermark, counted — K-F0's
+    fourth-arm plumbing), which also covers "submitted but never retired". An acceptance-side
+    lookahead bound cannot stand alone: legitimate lookahead reaches DXVK's
+    `MaxNumQueuedCommandBuffers = 32` (`dxvk-helios/src/dxvk/dxvk_limits.h:17`), and a forged value
+    whose process simply stops presenting is unsatisfiable at any bound.
 - ⭐ **Three UNVERIFIED rows from `G7-s6r1` are SETTLED by that run**, and they needed it:
   **U-B** — `pfnCreateContextCb` succeeds for a D3D12 queue (`CreateCommandQueue:
   CreateContext hr=0 hContext=0x… cmd=…/262144 allocList=…/256 patchList=…/256`).
