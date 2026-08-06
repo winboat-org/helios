@@ -302,13 +302,29 @@ pub(crate) static REFUSALS: &[&RefusalCounter] = &[&DEBUG_ALLOCATION_INFO_EMPTY]
 
 /// `pfnGetDebugAllocationInfo` answered "no VA infos, no KMT infos".
 ///
-/// ⚠ **Expected non-zero — `D12-G7` measured four calls inside one
-/// `D3D12CreateDevice`** — and it is an instrument, not a fault. Helios owns no
-/// kernel allocations: the venus ICD mints every one through its own D3DKMT and
-/// this driver never calls `pfnAllocateCb`, so there is no `D3DKMT_HANDLE` to
-/// report (the same reason L4's `pfnCheckResourceAllocationHandle` answers 0).
-/// ⛔ A **zero** reading on a run that created a device is the finding: it would
-/// mean the slot stopped being reached, i.e. that the readout below is measuring
-/// a different build than the one deployed.
+/// It is an instrument, not a fault: Helios owns no kernel allocations — the
+/// venus ICD mints every one through its own D3DKMT and this driver never calls
+/// `pfnAllocateCb` — so there is no `D3DKMT_HANDLE` to report, the same reason
+/// L4's `pfnCheckResourceAllocationHandle` answers 0.
+///
+/// ⚠ **Expected 0 on a retail device-creation path, and non-zero under the debug
+/// layer.** ⛔ This was first graded the other way round — *"expected non-zero;
+/// a zero reading is the finding"* — on the strength of `D12-G7`'s pre-fan-out
+/// ledger, which counted **four** noop hits on this slot inside one
+/// `D3D12CreateDevice`. The re-run with all 25 of those slots implemented
+/// (`tmp/dx12/gates/G7-s6r1/`) reads **0**, on an otherwise byte-identical
+/// device create: same `Flags=0x0`, same `CapsCalls=24`, same
+/// `CapsMsaaCalls=2730`, same `venusCtx=19`.
+///
+/// ⚠ **Why it went from 4 to 0 is NOT established**, and it is written down as
+/// unknown rather than guessed. Two candidates, neither confirmed:
+/// the four calls were the runtime reacting to something the noop'd
+/// device-creation path produced (`pfnCalcPrivatePipelineStateSize` answering 0
+/// gave each PSO a **zero-byte** driver block, which is abnormal); or this slot
+/// is debug-layer traffic that happened to be enabled on that run by something
+/// other than `D3D12DDI_CREATE_DEVICE_FLAG_DEBUGGABLE`, which was clear in both.
+/// ⛔ The one thing that would settle it is a run with the debug layer
+/// deliberately on, and until then the honest grading is "0 here, non-zero
+/// there" — not a claim about which mechanism produced the 4.
 static DEBUG_ALLOCATION_INFO_EMPTY: RefusalCounter =
     RefusalCounter::new("DebugAllocationInfoEmpty");
