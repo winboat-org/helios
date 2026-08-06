@@ -9,6 +9,8 @@ use alloc::boxed::Box;
 use core::mem::size_of;
 use core::sync::atomic::{AtomicU32, Ordering};
 
+use wdk_sys::ntddk::KeQueryInterruptTimePrecise;
+
 use crate::adapter::AdapterContext;
 use crate::device::DeviceHandleRef;
 use crate::dxgk::*;
@@ -263,6 +265,112 @@ pub unsafe extern "C" fn dxgkddi_cancel_command(
     STATUS_SUCCESS
 }
 
+/// GPU timestamp frequency this driver reports, in Hz.
+///
+/// ⛔ A SUBSTRATE CONSTANT THIS DRIVER CANNOT YET QUERY, and that is why it is a
+/// literal with a derivation rather than a measurement.
+///
+/// The number the D3D12 runtime hands an application from
+/// `ID3D12CommandQueue::GetTimestampFrequency` arrives through THIS DDI and no
+/// other: `d3d12umddi.h` has no `pfnGetTimestampFrequency` (grep: zero hits for
+/// any timestamp-frequency slot), there is no `KMTQAITYPE_*` for it, and
+/// `D3DKMTQueryClockCalibration`'s `D3DKMT_QUERYCLOCKCALIBRATION.ClockData` is
+/// literally a `DXGK_GPUCLOCKDATA` (`d3dkmdt.h:2289-2296`), i.e. the struct
+/// filled below. Zero-filling it therefore made every timestamp delta divide by
+/// zero, which is a zero benchmark score independent of how correct the rest of
+/// the driver is (`docs/dx12/PENDING.md` S-1).
+///
+/// THE DERIVATION. vkd3d answers its own `GetTimestampFrequency` as
+/// `1000000000 / timestampPeriod` (`vkd3d-proton-helios/libs/vkd3d/command.c`,
+/// `d3d12_command_queue_GetTimestampFrequency`), and this guest's Vulkan
+/// implementation reports `timestampPeriod = 1`
+/// (`docs/dx12/research/guest-vulkaninfo-full.txt:424`). 1e9 / 1 = 1e9. So this
+/// constant is the value the engine underneath us would have reported for the
+/// same queue, which makes the two self-consistent rather than merely plausible.
+///
+/// ⛔ WHAT WOULD MAKE IT WRONG: a host GPU whose `timestampPeriod != 1`. The
+/// value is a property of the physical device, not of Venus — AMD reports 40 ns
+/// and Intel 83.333 ns on real hardware — and on such a host every timestamp
+/// delta an application computes is off by exactly that factor, silently. The
+/// honest fix is the escape that carries the ICD's own `timestampPeriod` into the
+/// KMD (`PENDING.md` S-1 sizes it **M**); until it exists, `ClkFreq` mirrors what
+/// was actually reported so the assumption is at least readable.
+const GPU_TIMESTAMP_FREQUENCY_HZ: u64 = 1_000_000_000;
+
+/// `DxgkDdiCalibrateGpuClock` calls. Graded EXPECTED-NONZERO: the WDK header
+/// comments this DDI *"Called on timer"*, so dxgkrnl polls it once the adapter is
+/// live. `ClkCal == 0` across a D3D12 run is a finding — it would mean the
+/// frequency below never reaches anybody and S-1 is still open somewhere else.
+static GPU_CLOCK_CALIBRATE_CALLS: AtomicU32 = AtomicU32::new(0);
+/// Calls that had to report `GpuClockCounter = 0` because this driver cannot read
+/// the host GPU's timestamp counter.
+///
+/// Graded EXPECTED-EQUAL-TO-`ClkCal` today: there is no virtio-gpu or Venus
+/// command that reads the host GPU clock, and this DDI is
+/// `_IRQL_requires_max_(DISPATCH_LEVEL)` and *called on timer*, so a round trip
+/// to the host is not merely absent but illegal here. `ClkNoGpu < ClkCal` means
+/// somebody landed a real GPU-clock source and did not re-grade this counter.
+static GPU_CLOCK_NO_GPU_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+/// Mirror the clock-calibration counters at PASSIVE. Called from
+/// [`crate::ddi::record_present_handoff_telemetry`]; the DDI itself may run at
+/// DISPATCH, where a registry write is a never-violate rule.
+pub(crate) fn gpu_clock_counters() -> (u32, u32, u32) {
+    (
+        GPU_CLOCK_CALIBRATE_CALLS.load(Ordering::Relaxed),
+        GPU_CLOCK_NO_GPU_COUNTER.load(Ordering::Relaxed),
+        // Reported in Hz. 1e9 fits a u32 registry DWORD with room to spare, so
+        // the answer itself is readable rather than inferred from this file.
+        GPU_TIMESTAMP_FREQUENCY_HZ as u32,
+    )
+}
+
+/// ⛔ THE ONE CHANNEL FOR THE GPU TIMESTAMP FREQUENCY. See
+/// [`GPU_TIMESTAMP_FREQUENCY_HZ`] for why, and for what would make the answer
+/// wrong.
+///
+/// Until 2026-08-06 this zero-filled `DXGKARG_CALIBRATEGPUCLOCK` and returned
+/// `STATUS_SUCCESS` with no counter and no diag record — the one DDI in this
+/// driver that fabricated data, claimed success, and said nothing about it, on the
+/// exact path a benchmark score depends on (CLAUDE.md rule 2).
+///
+/// ⚠ NO `diag::record` HERE, and its absence is a requirement rather than an
+/// omission: `d3dkmddi.h` declares this DDI `_IRQL_requires_max_(DISPATCH_LEVEL)`
+/// and comments it *"Called on timer"*, while `diag::record*` writes the registry
+/// and is PASSIVE-only. The two atomics are mirrored from a PASSIVE site instead.
+///
+/// # The three fields, and which of them this driver can honestly fill
+///
+/// `DXGK_GPUCLOCKDATA` (`d3dkmdt.h:2082-2093`) is `GpuFrequency`,
+/// `GpuClockCounter`, `CpuClockCounter`, plus a WDDM 2.4 `Flags` word whose only
+/// bit is `ContextManagementProcessor` (`:2025-2036`).
+///
+/// * `GpuFrequency` — ANSWERED, see the constant. This is the field a timestamp
+///   delta is divided by, so it is the whole of S-1's benchmark impact.
+/// * `CpuClockCounter` — ANSWERED HONESTLY. The contract is the
+///   `QueryPerformanceCounter` domain, and `KeQueryInterruptTimePrecise` hands
+///   back exactly that value through its out-parameter, sampled at the same
+///   instant as its return value, at any IRQL.
+/// * `GpuClockCounter` — ⛔ **NOT AVAILABLE, reported 0 and counted.** It must be
+///   a reading of the clock the host GPU stamps `vkCmdWriteTimestamp` into. This
+///   guest has no way to read it: virtio-gpu carries no such command, Venus
+///   exposes the host's timestamps only inside query results, and even if a
+///   channel existed this DDI is a DISPATCH-level timer callback that may not wait
+///   on the host. Synthesising a plausible-looking value from the CPU clock was
+///   considered and REFUSED: at `GpuFrequency = 1e9` a nanosecond count derived
+///   from `KeQueryInterruptTimePrecise` would have the right *rate* and a
+///   completely wrong *epoch*, so every GPU→CPU correlation would be silently
+///   wrong while looking healthy — a survivable lie, which CLAUDE.md rule 2
+///   forbids in favour of loud failure. The honest interim is a zero plus
+///   `ClkNoGpu`; the honest answer is `VK_KHR_calibrated_timestamps` read in the
+///   ICD and carried in by escape (`PENDING.md` S-1 sizes that **M**).
+///
+/// ⚠ A ZERO `GpuClockCounter` BESIDE A LIVE `CpuClockCounter` IS DELIBERATE. The
+/// alternative — leaving both zero, as the zero-fill did — hands dxgkrnl a CPU
+/// timestamp that is not a representable `QueryPerformanceCounter` reading, and if
+/// anything in dxgkrnl differences two samples the pair becomes a zero
+/// denominator inside closed source. A truthful CPU side cannot be worse than a
+/// fabricated one, and it is the half we can actually answer.
 pub unsafe extern "C" fn dxgkddi_calibrate_gpu_clock(
     _h_adapter: IN_CONST_HANDLE,
     _node_ordinal: UINT32,
@@ -272,7 +380,11 @@ pub unsafe extern "C" fn dxgkddi_calibrate_gpu_clock(
     if clock_data.is_null() {
         return STATUS_INVALID_PARAMETER;
     }
+    GPU_CLOCK_CALIBRATE_CALLS.fetch_add(1, Ordering::Relaxed);
 
+    // Zero the whole struct first so the WDDM 2.4 `Flags` word (whose only bit,
+    // `ContextManagementProcessor`, this driver does not have) is cleared without
+    // this file naming a conditionally-compiled field.
     unsafe {
         core::ptr::write_bytes(
             clock_data as *mut u8,
@@ -280,6 +392,24 @@ pub unsafe extern "C" fn dxgkddi_calibrate_gpu_clock(
             size_of::<DXGKARG_CALIBRATEGPUCLOCK>(),
         );
     }
+
+    let mut qpc_timestamp = 0u64;
+    // SAFETY: `KeQueryInterruptTimePrecise` is a scalar time read documented as
+    // callable at ANY IRQL (this driver already makes it at DIRQL in
+    // `ddi/display.rs` and from the vsync DPC). It takes no lock, waits on
+    // nothing, and fills the valid out-pointer with the QueryPerformanceCounter
+    // value sampled at the same instant. The interrupt-time return value is
+    // discarded: the field's contract is the QPC domain, not 100 ns units.
+    let _ = unsafe { KeQueryInterruptTimePrecise(&mut qpc_timestamp) };
+
+    // SAFETY: `clock_data` is the dxgkrnl-supplied output struct, null-checked
+    // above and just fully written by `write_bytes`, so every field is
+    // initialized and writable for `size_of::<DXGKARG_CALIBRATEGPUCLOCK>()`.
+    let clock_data = unsafe { &mut *clock_data };
+    clock_data.GpuFrequency = GPU_TIMESTAMP_FREQUENCY_HZ;
+    clock_data.CpuClockCounter = qpc_timestamp;
+    // Left at 0 by the zero-fill above. Counted, never fabricated.
+    GPU_CLOCK_NO_GPU_COUNTER.fetch_add(1, Ordering::Relaxed);
     STATUS_SUCCESS
 }
 

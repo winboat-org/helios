@@ -280,6 +280,22 @@ pub(crate) fn record_present_handoff_telemetry() {
         b"EscSubRing",
         crate::virtio::gpu::ESCAPE_SUBMIT_RING_COUNT.load(Ordering::Relaxed),
     );
+    // S-1's instrument (`docs/dx12/PENDING.md` §2). `DxgkDdiCalibrateGpuClock` is
+    // the ONLY channel for the GPU timestamp frequency an application divides its
+    // timestamp deltas by, and it used to zero-fill and return SUCCESS silently.
+    // Mirrored HERE because the DDI is `_IRQL_requires_max_(DISPATCH_LEVEL)` and
+    // *"called on timer"* per the WDK header, so it may not write the registry.
+    //
+    // GRADING: `ClkCal` must MOVE this boot — a zero means the DDI is never
+    // entered and the frequency below reaches nobody. `ClkNoGpu` is expected to
+    // EQUAL `ClkCal` while no host GPU-clock source exists; a gap means somebody
+    // landed one and did not re-grade. `ClkFreq` is the answer itself, in Hz, and
+    // is expected to read exactly 1000000000 — a different value means the
+    // substrate constant was changed without changing its derivation.
+    let (clk_calls, clk_no_gpu, clk_freq_hz) = super::scheduler::gpu_clock_counters();
+    crate::diag::record_named_bytes(b"ClkCal", clk_calls);
+    crate::diag::record_named_bytes(b"ClkNoGpu", clk_no_gpu);
+    crate::diag::record_named_bytes(b"ClkFreq", clk_freq_hz);
     crate::diag::record_named_bytes(b"PmScan", PRESENT_MARKER_SCAN_HITS.load(Ordering::Relaxed));
     crate::diag::record_named_bytes(b"PmOff", PRESENT_MARKER_LAST_OFFSET.load(Ordering::Relaxed));
     crate::diag::record_named_bytes(b"PmVir", SUBMIT_VIRTUAL_COUNT.load(Ordering::Relaxed));
