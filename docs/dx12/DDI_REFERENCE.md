@@ -1917,10 +1917,40 @@ spec's own DDI struct and by the `D12-G5` measurement. The measurement wins.
    spaces `0xfffffff0`-`0xffffffff`) and deliberately does **not** tell the driver which are which. A
    re-serializer that assumes the API limit will reject an OS-instrumented signature.
 
-⚠ **`D3D12DDI_ROOT_CONSTANTS` is not field-order-compatible with the API's `D3D12_ROOT_CONSTANTS`**:
-the DDI puts `ShaderRegister` and `RegisterSpace` **before** `Num32BitValues`; the API puts
-`Num32BitValues` first. Same three `UINT`s, different order — a `memcpy` or a struct-cast silently
-transposes them.
+~~⚠ **`D3D12DDI_ROOT_CONSTANTS` is not field-order-compatible with the API's
+`D3D12_ROOT_CONSTANTS`**: the DDI puts `ShaderRegister` and `RegisterSpace` **before**
+`Num32BitValues`; the API puts `Num32BitValues` first. Same three `UINT`s, different order — a
+`memcpy` or a struct-cast silently transposes them.~~
+
+⛔ **FALSE, and struck 2026-08-06 (S6 Round 2). The two structs are field-order IDENTICAL**, in
+both SDK headers in this repository:
+
+```c
+/* tmp/dx12/sdk/d3d12umddi.h:1310-1315 */    /* tmp/dx12/sdk/d3d12.h:4016-4021 */
+typedef struct D3D12DDI_ROOT_CONSTANTS       typedef struct D3D12_ROOT_CONSTANTS
+{                                                {
+    UINT ShaderRegister;                         UINT ShaderRegister;
+    UINT RegisterSpace;                          UINT RegisterSpace;
+    UINT Num32BitValues;                         UINT Num32BitValues;
+} D3D12DDI_ROOT_CONSTANTS;                       }   D3D12_ROOT_CONSTANTS;
+```
+
+The Win32 metadata agrees independently — windows-rs 0.58's `D3D12_ROOT_CONSTANTS`
+(`Direct3D12/mod.rs:13817-13821`) is `ShaderRegister, RegisterSpace, Num32BitValues`. Three
+generators, one order.
+
+⚠ **The correction matters because the claim had propagated and was being acted on**: it reached
+`DX12.md` §4.3 row 4 as one of *"two silent ABI hazards in the bridge, neither catchable by the
+compiler"*, and from there into `umd12/src/forward12/rootargs.rs`'s module doc, i.e. into the brief
+of the lane that would have written a hand-field-by-field copy to defend against a transposition
+that does not exist. ⭐ The **other** hazard in that row is real and was verified independently:
+the descriptor-heap flags genuinely do collide on `0x1` with different meanings (§9.6.1), and
+`descriptors.rs::api_heap_flags` translates them with a `const _` pinning the collision. A half-true
+row is worse than a false one, because the true half lends it credibility.
+
+⇒ The generalisable form, which is `PARALLEL.md` §10's **claim-integrity** lens: *an ABI claim in a
+document is a claim, and both sides of it are machine-generated — so it can always be checked, and
+it must be, before a lane writes code against it.*
 
 At `_0100` the union has exactly one arm, `pRootSignature_1_2` — **the driver is handed
 1.2-shaped root signatures only**; the runtime up-converts 1.0 and 1.1. (⚠ Still switch on
