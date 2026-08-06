@@ -144,6 +144,27 @@ pub(crate) fn record_present_handoff_telemetry() {
         b"PwExact",
         crate::virtio::gpu::PRESENT_EXACT_WATERMARK_USED.load(Ordering::Relaxed),
     );
+    // K-F2 (2026-08-06): how far ahead of its own producer a present marker
+    // names. Mirrored HERE, beside the lever it protects, because the counting
+    // site runs at DISPATCH under `virtio_lock` and a registry write above
+    // PASSIVE is a never-violate rule — and here rather than in the escape
+    // stats ABI for the reason stated at the top of this function.
+    //
+    // ⚠ GRADED THE OTHER WAY ROUND from everything above: a nonzero `PsMkAhd`
+    // is the EXPECTED steady state and `PsMkAhdHi` should sit near 1, because
+    // the UMD hands the marker over before the frame's `vkQueueSubmit` on
+    // purpose. `PsMkAhdHi == 0` across a desktop + Fire Strike run is the
+    // reading that would refute that and revive the refused K-F2 guard;
+    // `PsMkAhdHi` far above DXVK's `MaxNumQueuedCommandBuffers = 32` is a
+    // forged marker rather than a frame. Full grading: `virtio/counters.rs`.
+    crate::diag::record_named_bytes(
+        b"PsMkAhd",
+        crate::virtio::gpu::PRESENT_STREAM_MARKER_AHEAD.load(Ordering::Relaxed),
+    );
+    crate::diag::record_named_bytes(
+        b"PsMkAhdHi",
+        crate::virtio::gpu::PRESENT_STREAM_MARKER_AHEAD_HIGH_WATER.load(Ordering::Relaxed),
+    );
     // WHY the WDDM FIFO head was not ready. The head paces every fence behind
     // it, so this ratio names what actually paces present retirement.
     crate::diag::record_named_bytes(

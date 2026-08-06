@@ -4739,6 +4739,37 @@ impl VirtioGpu {
             PRESENT_STREAM_REJECTS.fetch_add(1, Ordering::Relaxed);
             return None;
         };
+        // INSTRUMENT ONLY — nothing below refuses, and the boundary returned is
+        // byte-identical to the one this function returned before these two
+        // counters existed (K-F2, 2026-08-06).
+        //
+        // WHY THE DIRECTION HERE IS INVERTED FROM THE TAG PATH'S. Both siblings
+        // bound their value against the same field — `prepare_present_stream_tag`
+        // (`:4770`) and `commit_present_stream_tag` (`:4790`) reject
+        // `value <= slot.submitted_value` — because they are the PRODUCER
+        // advancing the stream, and an advance that is not strictly ahead is
+        // either a replay or a forgery. This is the CONSUMER side, and copying
+        // that comparison inverted would refuse every legitimate frame: the UMD
+        // hands the marker over BEFORE the frame's `vkQueueSubmit` on purpose
+        // (`umd/src/forward/present.rs:1479-1528` skips its own submitted-gate
+        // exactly because this marker carries the dependency instead), while the
+        // tag that moves `submitted_value` rides DXVK's submission thread. So
+        // "ahead" is the normal state, not a defect, and a refusal here would
+        // fall back to `wire_fence_watermark()` — which does not cover an
+        // unsubmitted frame at all (ROADMAP defect 0ab-B).
+        //
+        // What IS still unguarded is MAGNITUDE: a guest naming a value tens of
+        // thousands of frames out gets a live boundary `present_stream_slot_ready`
+        // can never satisfy. These two counters measure the legitimate
+        // magnitude so a bound can be chosen from data rather than assumption;
+        // grading and the reading that would refute all of this are in
+        // `virtio/counters.rs` beside the statics.
+        let lookahead =
+            helios_kmd_logic::present_stream::marker_lookahead(value, slot.submitted_value);
+        if lookahead != 0 {
+            PRESENT_STREAM_MARKER_AHEAD.fetch_add(1, Ordering::Relaxed);
+            bump_high_water(&PRESENT_STREAM_MARKER_AHEAD_HIGH_WATER, lookahead as usize);
+        }
         PRESENT_STREAM_MARKERS.fetch_add(1, Ordering::Relaxed);
         Some(encode_present_stream_boundary(slot.handle(index), value))
     }

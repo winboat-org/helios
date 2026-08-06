@@ -147,6 +147,55 @@ pub static PRESENT_STREAM_LIVE: AtomicU32 = AtomicU32::new(0);
 /// High-water of the preallocated stream table occupancy.
 pub static PRESENT_STREAM_HIGH_WATER: AtomicU32 = AtomicU32::new(0);
 
+// ── K-F2: how far ahead of the producer a marker names (2026-08-06) ──────────
+//
+// ⚠ NOT A REFUSAL COUNTER. `present_stream_marker_boundary` accepts every
+// marker it accepted before these existed; both are pure observation, mirrored
+// as `PsMkAhd` / `PsMkAhdHi`.
+//
+// WHY THEY EXIST. `KMD_IMPACT.md` §14a.2 K-F2 asked for the tag path's own
+// comparison — refuse unless `value <= slot.submitted_value` — as a guard
+// against a guest naming a boundary that can never be satisfied. That guard is
+// REFUTED, and these two counters are what makes the refutation measurable
+// instead of argued: on the shipping default the marker is delivered BEFORE the
+// frame's `vkQueueSubmit`, deliberately. `UmdAsyncPresentStream` is absent = ON
+// (`umd/src/knobs.rs:129`), and the eligible arm then SKIPS
+// `HeliosWaitFrameSubmitted` (`umd/src/forward/present.rs:1479-1528`) precisely
+// because the marker is what carries the dependency; the value is minted on the
+// app thread (`umd/bridge/dxvk_bridge.cpp:1316`) while the tag that advances
+// `submitted_value` rides DXVK's submission thread
+// (`d3d11_context_imm.cpp:1150-1162` is `EmitCs` only → `vn_queue.c:1994` →
+// `:1736-1744`).
+//
+// ⇒ a NONZERO count is the EXPECTED steady state, and `PsMkAhdHi` should sit at
+// or near 1. That is the opposite grading from every other counter in this
+// block.
+//
+// ⭐ THE READING THAT WOULD REFUTE THE REFUTATION: `PsMkAhdHi == 0` across a
+// desktop + Fire Strike run means no marker ever ran ahead — the tag reliably
+// beats the marker — and the acceptance-side guard K-F2 asked for was viable
+// after all. That inversion is the entire reason these are worth a deploy.
+//
+// ⚠ Registry values persist across boots (CLAUDE.md rule 6): verify both MOVE
+// this boot before reading anything into them, and read them AFTER a desktop +
+// Fire Strike run, not after a bare boot — an idle desktop presents little and
+// a zero then means "nothing measured", not "nothing ahead".
+
+/// Present markers whose `value` named producer work the stream had not yet
+/// submitted (`value > slot.submitted_value`), counted at
+/// `present_stream_marker_boundary` with no change to what it returns.
+pub static PRESENT_STREAM_MARKER_AHEAD: AtomicU32 = AtomicU32::new(0);
+/// High-water of `value - submitted_value` (saturating —
+/// `helios_kmd_logic::present_stream::marker_lookahead`).
+///
+/// This is the number that SIZES any future bound, and the reason a bound
+/// cannot be picked from an armchair: the legitimate ceiling is set by how many
+/// presents DXVK can leave published-but-unsubmitted, which its own
+/// `MaxNumQueuedCommandBuffers = 32` (`dxvk-helios/src/dxvk/dxvk_limits.h:17`)
+/// caps — so ~32 is the predicted high-water for the D3D11 path and anything
+/// far above it is a forgery rather than a frame.
+pub static PRESENT_STREAM_MARKER_AHEAD_HIGH_WATER: AtomicU32 = AtomicU32::new(0);
+
 // ── DISPATCH-safe resource-table telemetry ──────────────────────────────────
 // All updated under the device spinlock (DISPATCH_LEVEL), so they must be
 // atomics, never `diag::record` (RtlWriteRegistryValue is PASSIVE-only — the

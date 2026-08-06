@@ -4963,3 +4963,83 @@ mod snapshot_bind_tests {
         );
     }
 }
+
+/// The registered present-stream value relation, as pure arithmetic.
+///
+/// One rule lives here rather than inline in the KMD for a specific reason:
+/// `kmd_render` is built with `debug-assertions = on` in the profile that
+/// actually ships (46th session), so a plain `value - submitted_value` on `u32`
+/// is a PANIC — a silent graphics deadlock — for exactly the input the
+/// instrument above it exists to observe. Saturating it makes that input
+/// unrepresentable, and puts a host-run test under the claim.
+pub mod present_stream {
+    /// How far a marker `value` runs AHEAD of what the producer has actually
+    /// submitted on that stream; 0 when it does not run ahead at all.
+    ///
+    /// 0 deliberately covers both "already submitted" and "already retired":
+    /// neither is a future dependency, so neither is what the instrument
+    /// counts.
+    pub const fn marker_lookahead(value: u32, submitted_value: u32) -> u32 {
+        value.saturating_sub(submitted_value)
+    }
+
+    /// Whether the marker names producer work that has not been submitted yet.
+    ///
+    /// ⚠ This is an OBSERVATION, never a refusal predicate, and the difference
+    /// is the whole K-F2 finding: on the shipping D3D11 present path the UMD
+    /// delivers the marker BEFORE the frame's `vkQueueSubmit` on purpose (it
+    /// skips its own submitted-gate precisely because the marker carries the
+    /// dependency), so `true` here is the normal steady state. The tag path's
+    /// direction is the opposite one — a PRODUCER advancing the stream must be
+    /// strictly ahead of `submitted_value` — and conflating the two would
+    /// refuse every legitimate frame.
+    pub const fn marker_runs_ahead(value: u32, submitted_value: u32) -> bool {
+        marker_lookahead(value, submitted_value) != 0
+    }
+}
+
+#[cfg(test)]
+mod present_stream_tests {
+    use super::present_stream::{marker_lookahead, marker_runs_ahead};
+
+    #[test]
+    fn steady_state_marker_is_exactly_one_frame_ahead() {
+        // The value is minted per Present and the tag lands on the submission
+        // thread one frame behind, so this is the expected shipping reading.
+        assert_eq!(marker_lookahead(41, 40), 1);
+        assert!(marker_runs_ahead(41, 40));
+    }
+
+    #[test]
+    fn a_fresh_stream_makes_every_marker_run_ahead() {
+        // Registered, nothing tagged yet: the first frame's marker cannot be
+        // behind anything, which is why "ahead" is not evidence of forgery.
+        assert_eq!(marker_lookahead(1, 0), 1);
+        assert!(marker_runs_ahead(1, 0));
+    }
+
+    #[test]
+    fn already_submitted_or_retired_markers_do_not_run_ahead() {
+        assert_eq!(marker_lookahead(40, 40), 0);
+        assert!(!marker_runs_ahead(40, 40));
+        assert_eq!(marker_lookahead(39, 40), 0);
+        assert!(!marker_runs_ahead(39, 40));
+    }
+
+    #[test]
+    fn a_forged_far_future_value_reads_as_its_own_magnitude() {
+        // The whole point of the high-water: a forgery is not distinguishable
+        // from a legitimate marker by direction, only by MAGNITUDE.
+        assert_eq!(marker_lookahead(u32::MAX, 40), u32::MAX - 40);
+        assert_eq!(marker_lookahead(1_000_000, 0), 1_000_000);
+    }
+
+    #[test]
+    fn behind_by_the_full_range_saturates_instead_of_wrapping() {
+        // In the shipped profile the unsaturated form would panic here, and a
+        // panic in a DDI is a silent graphics deadlock.
+        assert_eq!(marker_lookahead(0, u32::MAX), 0);
+        assert_eq!(marker_lookahead(1, u32::MAX), 0);
+        assert!(!marker_runs_ahead(0, u32::MAX));
+    }
+}
