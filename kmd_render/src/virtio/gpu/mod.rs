@@ -5643,6 +5643,14 @@ impl VirtioGpu {
                 // A malformed/stale private marker must not manufacture an
                 // impossible future dependency. Conservatively gate on all
                 // work actually enqueued before this WDDM submission.
+                //
+                // COUNTED since the D3D12 arm exists (2026-08-06). This clamp was
+                // silent, and it is the one place a guest-supplied boundary is
+                // quietly replaced by a different one: the fence then reports a
+                // watermark nobody asked for. Both writers reach it — Present's
+                // BLT marker and `HeliosD3D12SubmitCmd` — so it is deliberately
+                // NOT named after either.
+                GPU_FENCE_CLAMPED.fetch_add(1, Ordering::Relaxed);
                 self.next_wire_fence
             }
         } else if stream_boundary.is_some() && self.present_exact_watermark {

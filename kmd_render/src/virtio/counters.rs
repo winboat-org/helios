@@ -154,6 +154,21 @@ pub static ESCAPE_SUBMIT_COUNT: AtomicU32 = AtomicU32::new(0);
 /// this subset is exactly the set of submits that carried
 /// `VIRTIO_GPU_FLAG_INFO_RING_IDX` onto the wire.
 pub static ESCAPE_SUBMIT_RING_COUNT: AtomicU32 = AtomicU32::new(0);
+/// Guest-supplied completion boundaries REPLACED by `next_wire_fence` because
+/// they were zero-or-beyond the fences this driver has actually assigned.
+///
+/// The clamp itself is old and correct — *"a malformed/stale private marker must
+/// not manufacture an impossible future dependency"* — and until 2026-08-06 it
+/// was silent, which made the one lossy step on the boundary path invisible: the
+/// WDDM fence then reports a watermark the writer never named. Both writers reach
+/// it, `PresentSubmissionPrivate`'s BLT fence and `HeliosD3D12SubmitCmd`'s
+/// `gpu_wire_fence`, so it is not named after either.
+///
+/// Nonzero on the D3D12 path means the UMD sampled a fence id this KMD has not
+/// issued (a stale sample, or a value from another transport generation), and the
+/// packet then waits on the whole backlog instead of its own work — slower, never
+/// wedged, and `RngSub`/`EscSubRing` say whether such a fence could exist at all.
+pub static GPU_FENCE_CLAMPED: AtomicU32 = AtomicU32::new(0);
 /// Fire-and-forget control commands queued by PASSIVE workers (currently the
 /// scanout RESOURCE_FLUSH path).  These own their DMA buffers until the normal
 /// used-ring drain retires them, but never park a stack waiter.

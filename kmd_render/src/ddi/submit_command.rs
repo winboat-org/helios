@@ -104,6 +104,39 @@ impl SubmitPath {
 }
 static PRESENT_MARKER_SCAN_ATTEMPTS: AtomicU32 = AtomicU32::new(0);
 
+// ── D3D12 ECL submission record (`HeliosD3D12SubmitCmd`) ─────────────────────
+// All three are bumped inside `dxgkddi_render`, which the WDK header declares
+// `_IRQL_requires_(PASSIVE_LEVEL)`; they are atomics anyway because the registry
+// mirror and any future DISPATCH reader must see them without a lock.
+
+/// Valid D3D12 ECL records seen by `dxgkddi_render`.
+///
+/// The first nonzero value is the proof that `pfnRenderCb` from
+/// `pfnExecuteCommandLists` reaches this driver at all — the thing rung 0 of
+/// `D12-G8` could not establish, because `EclNoWddmSubmission = 1` meant no
+/// packet was ever built.
+pub static D3D12_SUBMIT_RECORDS: AtomicU32 = AtomicU32::new(0);
+/// Records carrying `gpu_wire_fence == 0` — the documented plumbing arm
+/// ("submit the packet, order it against nothing") and the A/B disable for the
+/// boundary itself.
+///
+/// ⚠ GRADED AS EXPECTED-NONZERO DURING BRING-UP. `D12Zero == D12Rec` means the
+/// UMD is submitting packets and naming no boundary yet, which is the intended
+/// first step, not a defect. It becomes a finding only once the UMD is supposed
+/// to be sampling a real ring-1 fence: `D12Zero` climbing then means the ICD
+/// handed it nothing (see `EscSubRing` — a guest that never submits on a
+/// GPU-completion ring has no such fence to name).
+pub static D3D12_SUBMIT_ZERO_FENCE: AtomicU32 = AtomicU32::new(0);
+/// Records whose boundary could not be written into this Render's private data
+/// (`merge_fence` refused: null pointer, or a private-data buffer shorter than
+/// the 32-byte record).
+///
+/// Must stay 0: `DxgkDdiCreateContext` reports
+/// `PRESENT_DMA_PRIVATE_DATA_BYTES = 88` for EVERY context (`device.rs:425`), so
+/// a nonzero value means a context this driver did not size, i.e. the packet was
+/// submitted with no boundary and the D3D12 fence is reporting decode.
+pub static D3D12_SUBMIT_MERGE_FAILS: AtomicU32 = AtomicU32::new(0);
+
 /// Mirror the scheduler private-data handoff evidence at PASSIVE_LEVEL.
 pub(crate) fn record_present_handoff_telemetry() {
     use crate::ddi::present_packet::{
@@ -164,6 +197,19 @@ pub(crate) fn record_present_handoff_telemetry() {
     crate::diag::record_named_bytes(
         b"PsMkAhdHi",
         crate::virtio::gpu::PRESENT_STREAM_MARKER_AHEAD_HIGH_WATER.load(Ordering::Relaxed),
+    );
+    // The D3D12 ECL arm (KMD_IMPACT §14a.2 K-F4). `D12Rec` is the first proof
+    // that `pfnRenderCb` from `pfnExecuteCommandLists` reaches this driver;
+    // `D12Zero` is EXPECTED to equal it during bring-up (the documented
+    // order-against-nothing arm); `D12MrgF` and `GpuFncClamp` must both stay 0 —
+    // the first means a context this driver did not size, the second means the
+    // UMD named a fence id this KMD never issued.
+    crate::diag::record_named_bytes(b"D12Rec", D3D12_SUBMIT_RECORDS.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"D12Zero", D3D12_SUBMIT_ZERO_FENCE.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"D12MrgF", D3D12_SUBMIT_MERGE_FAILS.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(
+        b"GpuFncClamp",
+        crate::virtio::gpu::GPU_FENCE_CLAMPED.load(Ordering::Relaxed),
     );
     // WHY the WDDM FIFO head was not ready. The head paces every fence behind
     // it, so this ratio names what actually paces present retirement.
@@ -1059,6 +1105,72 @@ pub unsafe extern "C" fn dxgkddi_render(
     if cmd_len > dma_cap {
         // Buffer too small for the recorded command: ask the runtime to grow it.
         return STATUS_BUFFER_TOO_SMALL;
+    }
+
+    // ── The D3D12 ECL arm (`HeliosD3D12SubmitCmd`, 16 B) ────────────────────
+    //
+    // `helios_umd12.dll` submits this through `pfnRenderCb` during
+    // `pfnExecuteCommandLists` so the D3D12 queue's WDDM context carries a DMA
+    // packet at all. The record's `gpu_wire_fence` is the completion boundary,
+    // and writing it into THIS Render's `pDmaBufferPrivateData` is the whole
+    // commit: `dxgkddi_submit_command{,_virtual}` already decode a
+    // `PresentSubmissionPrivate` from that same buffer unconditionally
+    // (`:871` / `:827`, keyed only on the record's magic — nothing there is
+    // Present-specific), and `note_wddm_submission` already turns a nonzero
+    // `gpu_fence_id` into `RetireDomain::IncludingGpu` with the exact watermark.
+    //
+    // ⚠ FIRST WRITE TO `pDmaBufferPrivateData` ON THIS DDI. Verified against the
+    // WDK header rather than a doc: `_DXGKARG_RENDER` carries
+    // `pDmaBufferPrivateData` + `DmaBufferPrivateDataSize`
+    // (`tmp/dx12/sdk/d3dkmddi.h:130-147`). Offset 0, and the pointer is NOT
+    // advanced — the shape the Present path already proves, and the shape
+    // SubmitCommand's offset-0 fallback (`decode_present_fence`) reads.
+    //
+    // WHY THE ZERO-FENCE ARM WRITES NOTHING: `merge_fence` would store a record
+    // whose three payload fields are all zero, which `PresentSubmissionPrivate::
+    // decode` deliberately rejects — so the write would buy nothing while
+    // bumping `PmWr`, a Present-named counter. "Order it against nothing" is
+    // expressed by the absence of a record, and `D12Zero` counts the arm.
+    //
+    // The three arms in this function are magic-disjoint by construction, and
+    // `protocol/src/wddm.rs`'s const asserts pin the two size relationships that
+    // make this one reachable without shadowing the others.
+    if cmd_len >= size_of::<helios_protocol::HeliosD3D12SubmitCmd>() {
+        let mut raw = [0u8; size_of::<helios_protocol::HeliosD3D12SubmitCmd>()];
+        // SAFETY: the runtime guarantees `CommandLength` readable bytes at
+        // `pCommand` (non-null, checked above) and `cmd_len` covers the record.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                args.pCommand as *const u8,
+                raw.as_mut_ptr(),
+                size_of::<helios_protocol::HeliosD3D12SubmitCmd>(),
+            );
+        }
+        // SAFETY: `raw` is a fully initialized local of exactly the record size;
+        // the read is unaligned-safe and cannot leave the local.
+        let command = unsafe {
+            core::ptr::read_unaligned(raw.as_ptr().cast::<helios_protocol::HeliosD3D12SubmitCmd>())
+        };
+        if command.is_valid() {
+            D3D12_SUBMIT_RECORDS.fetch_add(1, Ordering::Relaxed);
+            if command.gpu_wire_fence == 0 {
+                D3D12_SUBMIT_ZERO_FENCE.fetch_add(1, Ordering::Relaxed);
+            } else if let Err(_status) = unsafe {
+                PresentSubmissionPrivate::merge_fence(
+                    args.pDmaBufferPrivateData,
+                    args.DmaBufferPrivateDataSize,
+                    command.gpu_wire_fence,
+                )
+            } {
+                // COUNT AND IGNORE, never a failing return: a non-SUCCESS status
+                // out of a submit DDI bugchecks `dxgmms2!VidSchiSendToExecutionQueue`
+                // with 0x119/1, which this file's own `SubmitAck` doc records.
+                // `STATUS_BUFFER_TOO_SMALL` is legal here for the DMA buffer, but
+                // it asks the runtime to GROW and retry — which is not an answer
+                // to a private-data buffer the driver itself sized.
+                D3D12_SUBMIT_MERGE_FAILS.fetch_add(1, Ordering::Relaxed);
+            }
+        }
     }
 
     // The 16-byte HERF prefix is the legacy command.  Zero-fill a local full
