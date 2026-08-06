@@ -4851,9 +4851,24 @@ impl VirtioGpu {
     /// Explicitly remove scheduler/scanout waits whose registration was
     /// retired.  This requires the WDDM notification ordering proof because it
     /// mutates the pending `DMA_COMPLETED` FIFO; it never treats a dead stream
-    /// as retired.  A discharged WDDM entry still waits for its ordinary wire
-    /// watermark, which covers the transport work submitted before that WDDM
-    /// buffer.
+    /// as retired.
+    ///
+    /// ⚠ CORRECTED 2026-08-06. This used to claim *"a discharged WDDM entry still
+    /// waits for its ordinary wire watermark, which covers the transport work
+    /// submitted before that WDDM buffer"*. That is FALSE whenever `PresentWmk` is
+    /// on — which is the shipping default — because the exact-present-watermark arm
+    /// in [`Self::note_wddm_submission`] sets `watermark = 0` for precisely the
+    /// entries that carry a live stream boundary. Discharging the stream on such an
+    /// entry therefore leaves it with NO dependency at all, and it completes on the
+    /// next look.
+    ///
+    /// That is defensible on this path — a dead stream is a context/device teardown,
+    /// i.e. an explicit cancellation rather than a producer that will complete — but
+    /// it is not what the comment said, and it is not what
+    /// [`Self::rebase_blocked_head`] does for a LIVE-but-unsatisfiable boundary
+    /// (that one installs the conservative wire prefix, because there the producer
+    /// may genuinely still be running). Left as-is deliberately: tightening a
+    /// teardown-path fence is an unmeasured behaviour change on the desktop path.
     pub fn discharge_dead_present_stream_waits(
         &mut self,
         _order: &crate::adapter::NotifyOrdered<'_>,
