@@ -9,6 +9,82 @@ that is now the unit of work.
 
 ---
 
+## ⛔⛔ STATUS 2026-08-06 (later) — THE INTEGRATION LANE: §S-3 IS COMPLETE IN CODE, AND THE THING IN THE WAY IS A PROBE
+
+Read this block before the wave-1 block below it. It closes `§S-3`'s items 2–6 and the fence
+bridge's unlanded half, and it replaces three of the wave's *"what stands in the way"* items with
+verified answers.
+
+**Landed.** `pfnPresent`'s missing `hContext` (`queue::present_context`) · **UP-9**, the identity
+`pfnRenderCb` carrying `HeliosPresentRenderCmd`, with the mandatory allocation list
+(`PresentDependencies`, source `Value = 0`) · `pfnGetDebugAllocationInfo`'s four fields ·
+`bridge12::sample_queue_fence` **plus its call site**, so the fence bridge stops shipping inert ·
+`identity12::pitch` · the `bind_flags` wire-vocabulary fix below.
+
+### ⭐ Three of the four items believed to be in the way, RE-DERIVED
+
+1. ✅ **The hand-declared 22-slot interop vtbl is VERIFIED, not unverified.** Its order was compared
+   slot-for-slot against the fork's *shipped* `d3d12_dxvk_interop_device_vtbl`
+   (`libs/vkd3d/device_vkd3d_ext.c`) — **22/22 identical**, three IUnknown plus nineteen. The IID
+   matches the IDL exactly (`9c0850e7-70f1-4229-ae05-440b387ec517`), `device.c:4677` has the
+   QueryInterface arm, and `GetVulkanResourceMemoryInfo`'s five-parameter signature matches the IDL
+   term for term. ⇒ *"a wrong slot is a wild call"* is retired as a risk; it is a checked property.
+2. ⛔⛔ **DWM's `pfnOpenResource` was NOT free — `HeliosWddmAllocMeta::bind_flags` had no declared
+   vocabulary and `umd12` wrote the other enum into it.** `adopt_presentable` wrote a
+   `D3D12DDI_RESOURCE_FLAGS_0003` word; the reader is `api_bind_flags`
+   (`umd/src/forward/state.rs:1211`) → `desc.BindFlags` in `umd/bridge/dxvk_bridge.cpp`'s open path →
+   the `VkImageUsageFlags` DXVK aliases with. A back buffer's `RENDER_TARGET | SHADER_RESOURCE`
+   (`0x11` in the D3D12 DDI) reads as **`VERTEX_BUFFER | STREAM_OUTPUT`** in the D3D11 DDI, so DWM
+   would import an image with no render-target and no shader-resource usage and could not sample the
+   frame. Fixed: `protocol/` now declares the vocabulary (`HELIOS_WDDM_BIND_*`) and `umd12`
+   translates. ⇒ **this was a silent wrong-picture defect on the critical path, and it was found by
+   reading the reader.**
+3. ⛔⛔ **The admission-predicate prior is UNINFORMATIVE, and the framing that it favours
+   `ResourceOptimizationPrimary` does not survive.** The quoted evidence —
+   `HeapPrimaryFlagDropped` 0 in all 150 runs vs `ResourceOptimizationFlagsIgnored` 1..3 in 101 of
+   150 — cannot discriminate, for two independent reasons: **(a) not one logged run created a
+   swapchain** (`grep -c SwapChain` over all five `tools/d3d12_*probe*.cpp` is **0**), so
+   `D3D12DDI_HEAP_FLAG_PRIMARY` could not have arrived through *either* channel; and **(b)** the
+   optimisation aggregate absorbs `SHADER_RESOURCE`/`UNORDERED_ACCESS`/`DETERMINISTIC`, which any
+   ordinary texture create sets, so 1..3 is not a PRIMARY signal at all. The counter that *can*
+   discriminate, `ResourceOptimizationPrimary`, was added in the wave and has never been read.
+   ⇒ **do not move the predicate; run a swapchain and read `HeapPrimaryVenusExport` against
+   `ResourceOptimizationPrimary`.** Both readings are one run away and neither exists.
+4. **The fork's venus-export arm still has never executed.** Read and coherent — `resource.c:4444`
+   chains `VkExportMemoryAllocateInfo` with `OPAQUE_FD` and forces
+   `prefersDedicatedAllocation`, and `:752` declares the matching
+   `VkExternalMemoryImageCreateInfo` on the image (VUID-VkMemoryAllocateInfo-pNext-00639) — but
+   nothing has run it. Unchanged.
+
+### ⭐ The shortest path to a pixel: an artefact that already exists
+
+⛔ **No D3D12 tool in this tree has ever called `pfnPresent`.** `tools/d3d12_clear_probe.cpp` and the
+other four `d3d12_*` probes contain **zero** occurrences of `SwapChain`. That, not the driver, is
+what has kept every present-path counter at 0.
+
+⭐ **`tools/d3d12_spy/spy_workload.cpp` is already the vehicle and needs no new code**: it creates a
+real window, a flip-model `CreateSwapChainForHwnd` on an `ID3D12CommandQueue`, and calls
+`Present(1, 0)` per frame — that is what produced `D12-G5`'s 20 measured presents against WARP. It
+takes **`--adapter <n>`** as well as `--warp`, and it creates its device at `D3D_FEATURE_LEVEL_11_0`,
+which Helios reports. ⇒ point it at the Helios adapter, from a **scheduled task** (session 0 fakes a
+regression, `GATES.md` §1), and every counter this lane added becomes readable at once.
+
+### ⚠ Debt recorded and deliberately NOT paid: D13's `RuntimeAllocPrivate` / `AdoptedAllocPrivate`
+
+The `{HeliosWddmAllocPrivate, HeliosWddmAllocMeta}` pair is declared twice —
+`umd/src/forward/state.rs`'s `RuntimeAllocPrivate` and `umd12/src/forward12/resource12.rs`'s
+`AdoptedAllocPrivate` — and D13 says the pair belongs in `protocol/`. **Not moved, and the reason is
+verifiability rather than ownership:** `umd/build.rs` hard-codes Windows MSVC/WDK paths
+(`C:\Program Files\...`), so `umd` **cannot be type-checked on this host at all**, and one
+declaration requires editing it. Moving the declaration to `protocol/` while leaving `umd`'s copy
+would give the tree *two* authoritative names instead of one, i.e. it would not discharge the
+directive. ⇒ the remaining move is exactly two lines in `umd/src/forward/state.rs` (delete the
+struct, `pub(crate) use helios_protocol::… as RuntimeAllocPrivate;`) and belongs in a session that
+can build `umd`. The `const _` asserts in both crates pin the 48 + 48 layout meanwhile, so the
+duplicate cannot drift without failing to compile.
+
+---
+
 ## ⭐ STATUS 2026-08-06 — WAVE 1 LANDED, and five of this document's own claims were wrong
 
 A four-lane `METHOD.md` Phase 1 wave landed after this document was written. **Read this block before
@@ -159,7 +235,15 @@ channel is the engine forward `fence_operation` already implements. **XS to sett
 Related: dropped GPU waits must become **loud** (`pfnSetErrorCb`), and `fence.rs:81-84`'s claim that the gap
 *"closes when §10.4's `pfnWaitForSynchronizationObjectFromGpuCb` half lands"* is **refuted and forbidden**.
 
-### S-3 · Present identity bridge — ⛔ nothing displays
+### S-3 · Present identity bridge — ✅ **items 1–6 LANDED; item 7 is fullscreen-only and still open**
+⛔ **Read the integration-lane status block at the top first.** Items 1–6 are code as of
+2026-08-06 and every one of them is `implemented-but-never-exercised`, because **no tool in this tree
+has ever called `pfnPresent`** — that block names the artefact that would. ⚠ Two prescriptions below
+were wrong and are corrected there: UP-9's *"one added parameter"* also required splitting
+`EclWddmSubmitted` out of `submit_wddm_render` (a present sharing it breaks the documented
+`EclForwarded == EclWddmSubmitted + EclNoWddmSubmission` invariant), and the *"believed free"*
+`pfnOpenResource` half was a live wrong-picture defect in `HeliosWddmAllocMeta::bind_flags`.
+
 Dependency-ordered; the first item is a **hard prerequisite**, not a parallel hazard:
 1. **UP-3′ — venus-exportable memory. S (~15 lines C + ~10 Rust).** ⛔ Nothing in this driver can obtain a
    non-zero venus resid today: `helios_venus_memory_res_id` returns `mem->base_bo ? … : 0`, and only the
