@@ -3327,6 +3327,59 @@ while the fence wait stayed 0.6 µs and the dependency it existed to prove was a
 is useless … unless we can render REAL DX12 apps and benchmarks"*), so a rung that
 renders something is not a milestone unless a real workload follows it.
 
+### ⭐⭐ THE GOAL, set by the owner 2026-08-06 — three deliverables, in this order
+
+> **1. Visible D3D12 pixels the owner can see. 2. Time Spy success. 3. Port Royal success.**
+
+Not a triangle, not a rung, not a green suite. `docs/dx12/PENDING.md` is the full gap inventory;
+this is the **critical path through it**, and the ordering is forced by dependencies rather than
+chosen. `docs/dx12/METHOD.md` governs *how* each stage is worked (implement the whole subsystem to
+its contract → adversarial review → repair → saturate → deploy).
+
+**Stage 0 — repair the fence bridge. Nothing runs until this is done.** It landed 2026-08-06,
+has **never executed**, and has six known defects (`PENDING.md` §1). Two are blocking by
+themselves: **A1**, a `pthread_cond_wait` with no timeout that hangs the app's own thread inside
+`pfnExecuteCommandLists` whenever a queued `Wait` precedes the drain — every real engine does this,
+and no probe can reach it; and **A5**, the adapter-global head-of-line FIFO, which decides whether
+**the desktop survives the first D3D12 frame**. Plus **A4**, the prefix watermark, which violates
+the *"frame's OWN boundary"* invariant.
+
+**Stage 1 — visible pixels, WINDOWED.** ⭐ **Windowed D3D12 needs no KMD present work at all** —
+the `PRESENT_FLAGS_HISTOGRAM` census (`FlOvf = 0`, only `0x1` and `0xC` ever seen; `RedirectedFlip`
+zero occurrences in `kmd_render`) shows a DWM-composited flip-model present never reaches
+`DxgkDdiPresent`. So Stage 1 is entirely UMD-side identity: `PENDING.md` §S-3 items 1→6, in that
+order, because item 1 (venus-exportable memory) is a **hard prerequisite** — nothing in this driver
+can obtain a non-zero venus resid today. **No `DIRECT_SCANOUT` bit, no stride question, no 0ab
+machinery.** ⚠ Evidence trap: a maximized or promoted window is **absent** from `helios_paintcap`,
+so keep the window windowed and partially overlapped, or use the VNC samplers.
+
+**Stage 2 — Time Spy.** Everything in Stage 1, plus, and any one of these makes it fail:
+`S-1` the **KMD's GPU clock** (zero-filled today ⇒ the score is zero regardless of correctness);
+`S-2` **cross-queue sync**, which does not reach the engine at all — Time Spy has an async-compute
+subtest, and a kernel-only `Wait` orders **nothing** here, so this is wrong pixels not slow ones;
+`S-4` **`ExecuteIndirect`**; `S-5` **binding tier 3 + heap tier 2**. ⚠ And the two largest
+*unquantified* risks land here, because Time Spy is the first workload to touch them: the
+**map/upload path** (`MapHeapCalls = 0` — never run, and it rests on a whole-heap span buffer its
+own code flags as the riskiest construct in the lane) and **8 of 15 descriptor slots** (~95 % of
+view translation, every cube/array/3D/MSAA/mip-subrange arm — never executed once).
+⚠ **Decide windowed-vs-fullscreen early.** Fullscreen re-introduces the `DIRECT_SCANOUT` bit, the
+frozen host **stride agreement** (`align(width*bpp,256)`, unestablished for an ordinary OPTIMAL
+vkd3d back buffer — getting it wrong is a *sheared* picture, not a failure), and the whole 0ab
+family. Prove windowed first. ⚠ The runner cannot extract a non-Fire-Strike score
+(`tmp/perf/run-fs.ps1:149` greps Fire-Strike-only label keys) — a Time Spy run through it is
+indistinguishable from the "score = 0 with a result file" failure.
+
+**Stage 3 — Port Royal. A new subsystem: DXR.** ⭐ **The substrate is CONFIRMED capable** — the
+guest exposes `VK_KHR_acceleration_structure`, `ray_tracing_pipeline`, `ray_query`,
+`deferred_host_operations` and `pipeline_library` (`research/guest-vulkaninfo-full.txt:1010-1057`),
+and the engine measures **`RaytracingTier = 11`, i.e. DXR 1.1** (`baselines/d3d12-caps.csv:42`).
+⛔ The driver reports NOT_SUPPORTED, and **not by choice**: the shader-model list stops at 6.0, and
+that one short list forces raytracing, mesh shaders, VRS and sampler feedback off as a family
+(`PENDING.md` §5). So Stage 3 is: raise the SM list to ≥ 6.3, report the measured tier, then
+implement the ten raytracing slots — state objects, acceleration-structure build/copy/prebuild-info,
+`DispatchRays`, shader identifiers and local root signatures — plus acceleration-structure resource
+state and shader tables. **L**, and it depends on every stage above it.
+
 State, so this file is not silent on it:
 
 - **The strategy is CLOSED (2026-08-05):** Helios ships a real D3D12 UMD,
