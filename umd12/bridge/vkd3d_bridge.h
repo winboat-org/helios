@@ -77,3 +77,17 @@ std::unique_ptr<HeliosVkd3dDevice> helios_vkd3d_bridge_create_device(
 std::int32_t helios_vkd3d_bridge_serialize_root_signature(
     std::size_t desc, std::uint32_t version,
     std::size_t* blob_out, std::size_t* err_out) noexcept;
+
+// K-F1 (`docs/dx12/KMD_IMPACT.md` §14a.2). Drain one `ID3D12CommandQueue`'s vkd3d
+// submission worker: when this returns true, everything enqueued on that queue
+// before the call has reached `vkQueueSubmit`.
+//
+// ⭐ A CPU-side wait for SUBMISSION, NOT for GPU completion. That distinction is
+// the whole reason this call is permitted where `FENCE-BRIDGE-DESIGN.md`'s
+// design A is rejected: it costs no CPU/GPU overlap.
+//
+// `queue` is an `ID3D12CommandQueue*` carried as an integer, for the same
+// header-isolation reason as `d3d12_device_ptr` above. BORROWED — no reference is
+// taken and none is released. Returns false and counts if `queue` is 0 or if the
+// engine declined to hand over the Vulkan queue. Never throws: `bridge_guard`.
+bool helios_vkd3d_bridge_drain_queue(std::size_t queue) noexcept;

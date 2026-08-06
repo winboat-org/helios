@@ -22,6 +22,7 @@
 //! | `Umd12FormatCaps` | DWORD | `0` — `pfnCheckFormatSupport`'s encoding, as an A/B |
 //! | `Umd12FenceSignalDelayUs` | DWORD | `0` — **diagnostic**, the F1 delay probe on `pfnSignalFence` |
 //! | `Umd12EclDelayUs` | DWORD | `0` — **diagnostic**, the F1 delay probe on `pfnExecuteCommandLists` |
+//! | `Umd12EclSubmit` | DWORD | **`1` — ON.** K-F1's `pfnRenderCb` WDDM submission during `pfnExecuteCommandLists` |
 //!
 //! ⭐ **`UmdD3D12` lands here at S5, and not one commit earlier.** A kill switch
 //! for a driver that cannot be reached kills nothing, so declaring it before
@@ -134,8 +135,24 @@ pub(crate) fn umd_d3d12() -> bool {
 /// measurement, and a measurement that wedges the machine produces nothing.
 const MAX_DIAGNOSTIC_DELAY_US: u32 = 2_000_000;
 
-/// ⛔⛔ **A DIAGNOSTIC ARM WITH A QUESTION ATTACHED. Delete it with the commit
-/// that lands the WDDM submission** (`FENCE-BRIDGE-DESIGN.md`'s design **C**).
+/// ⛔⛔ **A DIAGNOSTIC ARM WITH A QUESTION ATTACHED. It is INERT BY DEFAULT and
+/// it is NOT a fix.**
+///
+/// ⛔ **SUPERSEDED INSTRUCTION, recorded so nobody re-derives the old one.** This
+/// doc used to end its first line with *"Delete it with the commit that lands the
+/// WDDM submission"*, and [`UMD12_ECL_DELAY_US`] inherited that obligation by
+/// reference. **The commit that landed the WDDM submission (K-F1) deliberately
+/// kept both arms**, because deleting them would have removed the only lever that
+/// separates the two readings the submission still has to be attributed against:
+///
+/// | reading | what it means once K-F1 is in |
+/// |---|---|
+/// | the app's fence wait grows with **this** delay | the runtime's fence advance is downstream of a DDI *returning* |
+/// | it grows only with a delay the **KMD** imposes on the DMA packet | the advance is downstream of our packet *retiring* — which is what K-F1 is for |
+///
+/// Nothing in K-F1 answers that; it is `KMD_IMPACT.md` §14a.1's UV1, whose
+/// settling experiment is the K-F0 scoped hold. ⇒ these arms outlive the
+/// submission and retire with UV1, not with the callback.
 ///
 /// # The question: where does the runtime's fence advance become downstream of this driver?
 ///
@@ -146,11 +163,12 @@ const MAX_DIAGNOSTIC_DELAY_US: u32 = 2_000_000;
 /// through the *same still-live mapping* (`tmp/dx12/gates/G8-r0-settle/`). The
 /// work lands; only the ordering is wrong.
 ///
-/// ⭐ **The architecture is decided: a real `pfnRenderCb` WDDM submission on the
-/// queue's context during `pfnExecuteCommandLists`, with the KMD work it needs**
-/// — so that the runtime's own kernel fence signal queues *behind* work the KMD
-/// already withholds `DXGK_INTERRUPT_DMA_COMPLETED` for. No stopgap, no
-/// producer-side stall in the shipping driver.
+/// ⭐ **The architecture is decided, and as of K-F1 the UMD half is LANDED**
+/// ([`UMD12_ECL_SUBMIT`]): a real `pfnRenderCb` WDDM submission on the queue's
+/// context during `pfnExecuteCommandLists`, so that the runtime's own kernel fence
+/// signal queues *behind* work the KMD already withholds
+/// `DXGK_INTERRUPT_DMA_COMPLETED` for. No stopgap, no producer-side stall in the
+/// shipping driver.
 ///
 /// ⛔ **But that design has a precondition nobody has measured: that the runtime
 /// queues its fence signal on OUR context at all, rather than CPU-signalling it
@@ -158,6 +176,8 @@ const MAX_DIAGNOSTIC_DELAY_US: u32 = 2_000_000;
 /// before the DDI the runtime gates on returns — and *which* DDI that is decides
 /// where the submission goes and what it must already cover. This knob and
 /// [`UMD12_ECL_DELAY_US`] are the experiment that reads it, one DDI at a time.
+/// ⚠ K-F1 landing does not settle it: a submission that exists is not evidence
+/// that dxgkrnl orders anything behind it. That is UV1.
 ///
 /// ⚠ **A fixed delay, never a drain** (`FENCE-BRIDGE-DESIGN.md` §5 step 2): a
 /// drain that fixes the pixels is consistent with every mechanism and settles
@@ -188,7 +208,10 @@ const MAX_DIAGNOSTIC_DELAY_US: u32 = 2_000_000;
 /// because every accepted measurement was taken with the value absent). The
 /// non-zero arm is a producer-side CPU stall of exactly the kind
 /// `umd/src/knobs.rs:31-43` forbids as a *fix*; it is legal here only because it
-/// is a measurement that runs for one probe and is then deleted.
+/// is a **measurement**, run deliberately for one probe at a time and never
+/// shipped on. ⛔ It is not, and never becomes, the answer to the ordering defect
+/// — that is [`UMD12_ECL_SUBMIT`]'s job, and a delay that "fixes" the pixels is
+/// consistent with every mechanism and therefore evidence for none.
 ///
 /// Clamped to [`MAX_DIAGNOSTIC_DELAY_US`]; each firing bumps
 /// `FenceSignalDelayed`, so an arm that was set and never reached is
@@ -196,23 +219,135 @@ const MAX_DIAGNOSTIC_DELAY_US: u32 = 2_000_000;
 pub(crate) static UMD12_FENCE_SIGNAL_DELAY_US: DwordKnob =
     DwordKnob::new(c"Umd12FenceSignalDelayUs", 0);
 
-/// ⛔⛔ **A DIAGNOSTIC ARM WITH A QUESTION ATTACHED. Delete it with the commit
-/// that lands the WDDM submission.** The `pfnExecuteCommandLists` half of the
-/// experiment [`UMD12_FENCE_SIGNAL_DELAY_US`] documents — read that doc for the
-/// question, the reading table and the deletion obligation; everything there
-/// applies here with `pfnExecuteCommandLists` substituted for `pfnSignalFence`.
+/// ⛔⛔ **A DIAGNOSTIC ARM WITH A QUESTION ATTACHED. Inert by default, and NOT a
+/// fix.** The `pfnExecuteCommandLists` half of the experiment
+/// [`UMD12_FENCE_SIGNAL_DELAY_US`] documents — read that doc for the question and
+/// the reading table; everything there applies here with `pfnExecuteCommandLists`
+/// substituted for `pfnSignalFence`.
 ///
-/// ⭐ This is the arm that matters most to the chosen design: the `pfnRenderCb`
-/// submission goes at the end of this DDI, so a delay here is the closest
-/// available stand-in for "the submission is in place before ECL returns".
+/// ⛔ **KEPT BY K-F1, and its earlier "delete me" instruction is SUPERSEDED.**
+/// This doc used to say *"Delete it with the commit that lands the WDDM
+/// submission"*, and the same sentence sat at the read site in
+/// `forward12::queue::execute_command_lists`. Both are wrong now, for a reason
+/// that only became visible when the submission was written:
 ///
-/// ⚠ The two arms are run **separately**, never together: their whole purpose is
-/// to attribute the runtime's fence advance to one DDI or the other, and a run
-/// with both set cannot tell which delay the number came from.
+/// **what this arm measures now** — it delays the DDI's *return*, and the
+/// `pfnRenderCb` submission happens *before* that return. So with
+/// [`UMD12_ECL_SUBMIT`] ON, a fence wait that grows with this delay says the
+/// runtime's advance is downstream of **the DDI returning**; a fence wait that
+/// does *not* grow, while a KMD-imposed hold on the DMA packet *does* move it,
+/// says the advance is downstream of **our packet retiring**. Only the second is
+/// the ordering K-F1 is built on, and no other instrument in the driver can tell
+/// the two apart. Deleting this arm in the same commit would have shipped the
+/// submission with no way to attribute its effect — `KMD_IMPACT.md` §14a.1's
+/// UV1, unsettled.
+///
+/// ⇒ it retires with **UV1**, not with the callback. ⚠ And it must never be read
+/// as the fix for the ordering: it is a CPU stall, `umd/src/knobs.rs:31-43`
+/// forbids that as a fix, and [`UMD12_ECL_SUBMIT`] is what actually closes the
+/// defect.
+///
+/// ⚠ The two delay arms are run **separately**, never together: their whole
+/// purpose is to attribute the runtime's fence advance to one DDI or the other,
+/// and a run with both set cannot tell which delay the number came from.
 ///
 /// Absent = `0` = no delay. Clamped to [`MAX_DIAGNOSTIC_DELAY_US`]; each firing
 /// bumps `EclDelayed`.
 pub(crate) static UMD12_ECL_DELAY_US: DwordKnob = DwordKnob::new(c"Umd12EclDelayUs", 0);
+
+/// ⭐⭐ **K-F1: the `pfnRenderCb` WDDM submission during `pfnExecuteCommandLists`.
+/// DEFAULT ON.**
+///
+/// # Why the default is ON, and what evidence that rests on (CLAUDE.md rule 8)
+///
+/// The default is a decision, and this one is **decision D5a**
+/// (`docs/dx12/DECISIONS.md`), the owner's: *"stop gaps are not acceptable, we
+/// must do the correct, expected and performant implementation … doesn't matter
+/// if its complex or if changes are needed to be done in KMD."* An OFF default
+/// would ship the measured-broken configuration as the driver's behaviour, which
+/// is the exact inversion rule 8 exists to stop.
+///
+/// What "measured-broken" means, precisely (`tmp/dx12/gates/G8-r0-settle/`):
+/// with **no** kernel submission, `D12-G8` rung 0's `WaitForSingleObject` returns
+/// in **0.8–1.1 µs** against WARP's **561 µs**, `GetDeviceRemovedReason` is 0
+/// throughout, vkd3d logs no errors — and the readback surface is **0/65536 exact
+/// at T+0 and 65536/65536 exact at +2000 ms** through the same still-live
+/// mapping. The GPU work lands; the application's fence completes with no causal
+/// dependency on it. `EclNoWddmSubmission = 1` was the defect, not a standing gap
+/// (`KMD_IMPACT.md` §14a.0).
+///
+/// # ⭐ What the ON arm SETTLES: the plumbing, and nothing grander
+///
+/// ⛔ Read this before quoting a number from a run with this knob on. What the arm
+/// establishes is that the **submission path exists and is accepted**, which
+/// nothing before it had shown:
+///
+/// * dxgkrnl accepts `pfnRenderCb` on a D3D12 queue's **legacy** context at all —
+///   the class was chosen inside `pfnCreateCommandQueue` against a doc set that
+///   contradicted itself, and this is the first evidence either way;
+/// * the callback returns success and hands back the three context windows, which
+///   `EclWddmSubmitted` and the re-latched `next_cmd=` trace line report together;
+/// * nothing bugchecks, and `pfnRenderCb`'s HRESULT is a real reading rather than
+///   an assumption (`EclSubmitRenderFailed`).
+///
+/// ⭐ All three instruments are **this driver's own** — per-process, D3D12-only, in
+/// `umd12-<pid>.log` — and that is load-bearing rather than convenient.
+///
+/// ⛔ **It does NOT settle `PRESENT.md` §12's P7 — whether `DxgkDdiRender` fires on
+/// the D3D12 path.** `KMD_IMPACT.md` §14a.4 item 3 named `RENDER_COUNT` moving as
+/// "the whole test" and that instrument is **confounded**: it is adapter-global,
+/// incremented from three sites, and DWM's own D3D11 present path calls
+/// `pfnRenderCb` every frame (`umd/src/forward/present.rs:860`), so it moves with
+/// no D3D12 client in existence. §14a.4 now records it as the third member of a
+/// family (`WfBWire`, `RING_SUBMIT_COUNT`, `RENDER_COUNT`) with one cause: every
+/// KMD counter there is adapter-global and DWM is always running. P7 needs the
+/// D3D12-specific record-seen counter on the KMD's decode of
+/// `HeliosD3D12SubmitCmd` — a separate lane, reached by the packet this arm sends.
+///
+/// # ⛔⛔ What it does NOT settle — and why a FLAT reading is not evidence against it
+///
+/// It does **not** make the application's `ID3D12Fence` truthful on its own, and a
+/// fence wait that stays at ~1 µs with the knob ON does **not** mean dxgkrnl
+/// refused to order behind our packets.
+///
+/// ⛔ `KMD_IMPACT.md` §14a.1's table says a flat reading implies **UV1 ✗**. That
+/// inference is **known false**, and the reason is in the ICD: the venus shared
+/// ring emits *no virtio submission at all* while it is busier than 1 ms. The
+/// command stream is written straight into the shared ring with no virtio traffic
+/// (`icd/mesa/src/virtio/vulkan/vn_ring.c:630-636`), and the doorbell escape is
+/// sent only when the host ring advertises IDLE — and then only past a 1 ms rate
+/// limiter (`vn_ring.c:672-690`, `VN_RING_IDLE_TIMEOUT_NS` at `:22`). So through a
+/// D3D12 frame `next_wire_fence` is typically **frozen**, and the KMD's
+/// `async_retired_up_to(watermark, IncludingGpu)` for an unheld packet is satisfied
+/// instantly — for a reason that has nothing to do with what dxgkrnl would have
+/// done with a packet that was actually outstanding.
+///
+/// ⇒ **UV1 needs a deliberate KMD-side hold scoped to the D3D12 path**, which is a
+/// separate lane. What this arm contributes to that is the packet the hold attaches
+/// to: `HeliosD3D12SubmitCmd`'s *presence* is how the KMD recognises a D3D12 ECL
+/// submission, so the hold can find those packets instead of stalling DWM through
+/// the adapter-global WDDM FIFO.
+///
+/// # ⛔ Why the OFF arm must stay reachable
+///
+/// It is the control arm of that plumbing comparison: `Umd12EclSubmit=0` is
+/// byte-for-byte the pre-K-F1 driver, and it is what a run is compared *against*
+/// when `RENDER_COUNT`, `EclWddmSubmitted` or a fence wait is read. Rule 8's other
+/// half, and the only honest way to attribute a change to this commit.
+///
+/// ⛔ A run whose arm is not recorded is not a measurement. The knob is in
+/// [`resolved_inventory`], so every `UMD knob:` capture states which arm produced
+/// the numbers next to it.
+///
+/// ⚠ Read once per process, like every other knob here. A running `dwm` keeps the
+/// arm it started with; `HKLM\SOFTWARE\Helios` is writable over SSH with the
+/// desktop down, and `pnputil /restart-device` re-runs the load without a reboot.
+///
+/// ⚠ Absent = ON. So a machine that has never heard of this value gets the
+/// submission — which is the point: the *shipping* configuration must be the one
+/// under test, and the disable is what an operator adds to reproduce the old
+/// behaviour, never what the code assumes.
+pub(crate) static UMD12_ECL_SUBMIT: BoolKnob = BoolKnob::new(c"Umd12EclSubmit", true);
 
 /// The `pfnSignalFence` diagnostic delay in microseconds, clamped. `0` = off.
 /// See [`UMD12_FENCE_SIGNAL_DELAY_US`].
@@ -224,6 +359,13 @@ pub(crate) fn umd12_fence_signal_delay_us() -> u32 {
 /// `0` = off. See [`UMD12_ECL_DELAY_US`].
 pub(crate) fn umd12_ecl_delay_us() -> u32 {
     UMD12_ECL_DELAY_US.get().min(MAX_DIAGNOSTIC_DELAY_US)
+}
+
+/// Whether `pfnExecuteCommandLists` makes K-F1's `pfnRenderCb` WDDM submission.
+/// **Absent = ON**; see [`UMD12_ECL_SUBMIT`] for the evidence behind that default
+/// and for what the OFF arm is used to measure.
+pub(crate) fn umd12_ecl_submit() -> bool {
+    UMD12_ECL_SUBMIT.get()
 }
 
 /// Emit this crate's knob inventory through the shared reader, once per process.
@@ -248,7 +390,7 @@ pub(crate) fn log_knob_inventory() {
 /// are the evidence contract `tools/capture-knob-inventory.ps1` parses and that
 /// S2 proved the crate split byte-identical against; reordering makes two
 /// captures differ for a reason that is not a behaviour change.
-pub(crate) fn resolved_inventory() -> [(&'static str, u32); 5] {
+pub(crate) fn resolved_inventory() -> [(&'static str, u32); 6] {
     [
         ("Umd12Trace", UMD12_TRACE.get() as u32),
         ("UmdD3D12", UMD_D3D12.get() as u32),
@@ -260,5 +402,10 @@ pub(crate) fn resolved_inventory() -> [(&'static str, u32); 5] {
         // configuration the run never had.
         ("Umd12FenceSignalDelayUs", umd12_fence_signal_delay_us()),
         ("Umd12EclDelayUs", umd12_ecl_delay_us()),
+        // ⭐ APPENDED (K-F1), never inserted — see the rule above. ⛔ This one is
+        // load-bearing rather than informational: it is the only record of WHICH
+        // ARM produced a run's numbers, and its default is ON, so a capture that
+        // does not name it cannot be attributed at all.
+        ("Umd12EclSubmit", umd12_ecl_submit() as u32),
     ]
 }

@@ -102,6 +102,23 @@ mod ffi {
             blob_out: *mut usize,
             err_out: *mut usize,
         ) -> i32;
+
+        /// Drain one `ID3D12CommandQueue`'s vkd3d submission worker (K-F1).
+        ///
+        /// ⭐ A CPU-side wait for `vkQueueSubmit`, **not** for GPU completion —
+        /// see the Rust wrapper [`drain_queue`], which carries the whole
+        /// argument for why that distinction makes this legal.
+        ///
+        /// `queue` is an `ID3D12CommandQueue*` as a `usize`, **BORROWED**: the
+        /// C++ side takes no reference and releases none, so the caller's
+        /// interface must outlive the call. Returns `false` (counted and logged
+        /// on the C++ side) for a 0 queue or an engine that declined.
+        ///
+        /// ⚠ Declared `unsafe` because the integer is a raw pointer in
+        /// disguise: nothing in the signature stops a caller passing a stale or
+        /// foreign value, and the C++ body dereferences it through vkd3d's
+        /// `CONTAINING_RECORD`.
+        unsafe fn helios_vkd3d_bridge_drain_queue(queue: usize) -> bool;
     }
 }
 
@@ -191,4 +208,44 @@ pub(crate) unsafe fn serialize_root_signature(
     // the cxx declaration's own preconditions, and the C++ side additionally
     // null-checks `blob_out` before writing it.
     unsafe { ffi::helios_vkd3d_bridge_serialize_root_signature(desc, version, blob_out, err_out) }
+}
+
+/// Drain one command queue's vkd3d submission worker. `true` when the drain ran.
+///
+/// # ⭐⭐ This is a wait for `vkQueueSubmit`, NOT for GPU completion
+///
+/// State that plainly, because a later reader will otherwise mistake it for
+/// `tmp/dx12/FENCE-BRIDGE-DESIGN.md`'s **design A — which is REJECTED** and must
+/// not be reintroduced under any name. The difference is the whole permission:
+///
+/// * design A blocks the producer thread until the GPU has *finished*, which
+///   destroys CPU/GPU overlap and is the producer-side CPU present stall the owner
+///   forbade outright (`umd/src/knobs.rs:31-43`, `KMD_IMPACT.md` §14a.5);
+/// * this blocks only until vkd3d's own submission worker has *handed the work to
+///   Vulkan*. The GPU has typically not started, and nothing waits for it.
+///
+/// It is required rather than defensive: vkd3d's `ID3D12CommandQueue::
+/// ExecuteCommandLists` is asynchronous — it pushes a submission onto a worker
+/// thread's queue (`libs/vkd3d/command.c`'s `d3d12_command_queue_add_submission`)
+/// — so without the drain the WDDM packet submitted immediately afterwards could
+/// be *ordered ahead of* the `vkQueueSubmit` it is supposed to fence, and the
+/// application's `ID3D12Fence` would be exactly as untruthful as it is today.
+///
+/// ⭐ It is the same discipline `HeliosWaitFrameSubmitted` gives the D3D11 present
+/// path, and `KMD_IMPACT.md` §14a.2 says so in as many words.
+///
+/// ⚠ One cost, stated because it is not visible from here: the paired
+/// `vkd3d_release_vk_queue` submits an empty `vkQueueSubmit2` that signals the
+/// queue's submission timeline. `vkd3d_bridge.cpp`'s comment at the call has the
+/// citation and the reason it must not be avoided.
+///
+/// # Safety
+/// `queue` must be a live `ID3D12CommandQueue*` **created by this bridge's vkd3d
+/// engine**, valid for the duration of the call. It is borrowed: no reference is
+/// taken and none is released. ⛔ A queue from any other D3D12 implementation
+/// would be `CONTAINING_RECORD`-cast to a `struct d3d12_command_queue` it is not.
+pub(crate) unsafe fn drain_queue(queue: usize) -> bool {
+    // SAFETY: forwarded unchanged; the caller's guarantee above is exactly the
+    // cxx declaration's precondition, and the C++ side additionally refuses a 0.
+    unsafe { ffi::helios_vkd3d_bridge_drain_queue(queue) }
 }

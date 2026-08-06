@@ -69,6 +69,30 @@ extern "C" HRESULT helios_vkd3d_serialize_root_signature(
     const D3D12_ROOT_SIGNATURE_DESC* desc, D3D_ROOT_SIGNATURE_VERSION version,
     ID3DBlob** blob, ID3DBlob** error_blob);
 
+// ── the two UPSTREAM interop symbols K-F1 drains through ────────────────────
+//
+// `vkd3d.h:120-121` declares these as
+//     VkQueue vkd3d_acquire_vk_queue(ID3D12CommandQueue *queue);
+//     void    vkd3d_release_vk_queue(ID3D12CommandQueue *queue);
+// inside its `extern "C" {` block (`vkd3d.h:57`, closed at the file's tail),
+// with no calling-convention decoration. ⛔ That header cannot be included here
+// (see the file banner: it drags in `vulkan.h` plus vkd3d's widl `D3D12_*` types,
+// which collide with the SDK's), so the two are redeclared with `void*` standing
+// in for `ID3D12CommandQueue*` and for `VkQueue`.
+//
+// ⚠ That substitution is ABI-identical, not a hope: both are dispatchable
+// pointers, `extern "C"` means the symbol name carries no parameter types, and
+// the Microsoft x64 convention passes either in RCX and returns either in RAX. ⛔
+// It is also why no translation unit may ever include `vkd3d.h` *and* this file's
+// declarations — two `extern "C"` declarations of one symbol with different
+// parameter types is ill-formed, and the header rule above already forbids it.
+//
+// ⭐ These are UPSTREAM public interop API, so K-F1 needs no fork patch
+// (`KMD_IMPACT.md` §14a.2). They are ordinary archive symbols out of
+// `libs/vkd3d/command.c` (`:25555` and `:25591`), which is in this link already.
+extern "C" void* vkd3d_acquire_vk_queue(void* queue);
+extern "C" void vkd3d_release_vk_queue(void* queue);
+
 namespace helios_bridge {
 
 // ── named counters ──────────────────────────────────────────────────────────
@@ -81,6 +105,8 @@ namespace helios_bridge {
 std::atomic<std::uint32_t> g_vkd3dCreateDeviceFailed{0};   // engine returned a failure HRESULT
 std::atomic<std::uint32_t> g_vkd3dCreateDeviceNullOut{0};  // engine returned S_OK with a null device
 std::atomic<std::uint32_t> g_vkd3dSerializeBadArg{0};      // serialize refused: null desc/blob_out
+std::atomic<std::uint32_t> g_vkd3dDrainBadArg{0};          // drain refused: queue == 0
+std::atomic<std::uint32_t> g_vkd3dDrainNotAcquired{0};     // acquire returned no VkQueue
 
 // ── this DLL's `umd_log` ────────────────────────────────────────────────────
 //
@@ -381,5 +407,84 @@ std::int32_t helios_vkd3d_bridge_serialize_root_signature(
           err->Release();
         }
         return static_cast<std::int32_t>(hr);
+      });
+}
+
+bool helios_vkd3d_bridge_drain_queue(std::size_t queue) noexcept {
+  // ⚠ `false` as the sentinel, and its type is `bool` at a glance — the
+  // `ead692e` rule from the two entry points above: `bridge_guard` deduces `R`
+  // from the ERROR VALUE ALONE, and the `static_assert` in
+  // `umd_common/bridge/bridge_guard.h` is what makes a mismatch a compile error.
+  return helios_bridge::bridge_guard(
+      "helios_vkd3d_bridge_drain_queue", false, [&]() -> bool {
+        if (!queue) {
+          const std::uint32_t n =
+              helios_bridge::g_vkd3dDrainBadArg.fetch_add(
+                  1, std::memory_order_relaxed) + 1;
+          char msg[128];
+          std::snprintf(msg, sizeof(msg),
+                        "drain_queue refused: queue=0 (Vkd3dDrainBadArg=%u)", n);
+          umd_log(msg);
+          return false;
+        }
+        void* q = reinterpret_cast<void*>(queue);
+
+        // ⭐⭐ ACQUIRE + RELEASE AROUND NOTHING **IS** THE DRAIN, and this is not
+        // a trick: it is verbatim what upstream vkd3d does for the same purpose.
+        // `libs/vkd3d/swapchain.c:490-498`,
+        // `dxgi_vk_swap_chain_drain_queue`, with its own comment —
+        //
+        //     /* This functions as a DRAIN of the D3D12 queue.
+        //      * All CPU operations that were queued must have been submitted to
+        //      * Vulkan now. */
+        //     if (vkd3d_acquire_vk_queue(&chain->queue->ID3D12CommandQueue_iface))
+        //         vkd3d_release_vk_queue(&chain->queue->ID3D12CommandQueue_iface);
+        //
+        // — including the `if`, which is why the null test below exists rather
+        // than an unconditional pair.
+        //
+        // ⚠ **What the null arm actually means, since it is not obvious and it is
+        // not harmless.** `vkd3d_queue_acquire` returns `VK_NULL_HANDLE` only when
+        // `pthread_mutex_lock` on the vkd3d_queue itself FAILS
+        // (`command.c:333-347`; the `vk_queue` is `assert`ed non-null). By then
+        // `d3d12_command_queue_acquire_serialized` has already taken `queue_lock`
+        // and the skipped `release` never drops it — so that arm leaks a lock and
+        // the next submission on this queue would block forever. ⛔ It is
+        // nevertheless what upstream does, verbatim, and this bridge deliberately
+        // does not "improve" on it: releasing after a failed acquire would unlock a
+        // mutex this thread does not hold, which is worse. A pthread mutex lock
+        // failing here is a corrupted-mutex / EDEADLK class of event; the counter
+        // and the log line are what make it visible instead of a mystery hang.
+        //
+        // What acquire does: `d3d12_command_queue_acquire_serialized`
+        // (`libs/vkd3d/command.c:25202-25218`) pushes a `VKD3D_SUBMISSION_DRAIN`
+        // marker and `pthread_cond_wait`s until the worker thread's
+        // `queue_drain_count` catches up — i.e. until the worker has SUBMITTED
+        // everything enqueued before this call. It then takes the vkd3d_queue
+        // mutex and returns the `VkQueue`, leaving BOTH locks held.
+        //
+        // ⚠ RELEASE IS NOT FREE, and callers must know it: `vkd3d_release_vk_queue`
+        // (`command.c:25591-25620`) issues a real `vkQueueSubmit2` of an empty
+        // batch that signals the queue's `submission_timeline` and bumps
+        // `last_submission_timeline_value`, before dropping both locks. That is
+        // the documented interop contract — *"Need to increment the submission
+        // counter here so that fence signals and waits behave as expected in an
+        // interop scenario"* — so it is correct, not incidental, but it does mean
+        // one extra empty `vkQueueSubmit2` per drain. ⛔ Do NOT try to avoid it
+        // with `vkd3d_unlock_vk_queue`: that releases only the vkd3d_queue mutex
+        // and would leave `queue_lock` held forever.
+        if (!vkd3d_acquire_vk_queue(q)) {
+          const std::uint32_t n =
+              helios_bridge::g_vkd3dDrainNotAcquired.fetch_add(
+                  1, std::memory_order_relaxed) + 1;
+          char msg[160];
+          std::snprintf(msg, sizeof(msg),
+                        "drain_queue: acquire_vk_queue(%p) returned no VkQueue "
+                        "(Vkd3dDrainNotAcquired=%u)", q, n);
+          umd_log(msg);
+          return false;
+        }
+        vkd3d_release_vk_queue(q);
+        return true;
       });
 }
