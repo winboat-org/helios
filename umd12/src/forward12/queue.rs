@@ -194,14 +194,34 @@
 //! `DDI_REFERENCE.md` §8.2/§8.3: the driver must submit to the kernel **during**
 //! `pfnExecuteCommandLists`, from the thread that entered the DDI, with a DXGK
 //! context minted at queue creation. All three hold as of K-F1: the DDI forwards
-//! to the engine, **drains** the engine's submission worker, and then calls
-//! `pfnRenderCb` on [`QueueState::h_context`] — synchronously, on the entering
-//! thread. [`submit_wddm_render`] is the one call site;
+//! to the engine, optionally **drains** the engine's submission worker, and then
+//! calls `pfnRenderCb` on [`QueueState::h_context`] — synchronously, on the
+//! entering thread. [`submit_wddm_render`] is the one call site;
 //! `knobs12::UMD12_ECL_SUBMIT` (**default ON**, decision D5a) is the arm.
 //!
+//! ⛔⛔ **"optionally" is A1, and it is the DEFAULT.** The drain is
+//! `d3d12_command_queue_acquire_serialized`
+//! (`vkd3d-proton-helios/libs/vkd3d/command.c:25202-25217`): an **untimed**
+//! `pthread_cond_wait` until vkd3d's worker has drained everything queued ahead of
+//! its marker, FIFO — and a `VKD3D_SUBMISSION_WAIT` in that queue resolves through
+//! a second untimed `pthread_cond_wait` (`command.c:1226`). So the drain can park
+//! the application's own thread inside this DDI with no timeout, no counter and no
+//! GPU packet outstanding for TDR. `knobs12::UMD12_ECL_DRAIN` (**default OFF**)
+//! carries the contract argument, the two things the OFF arm costs — the packet may
+//! precede the frame's `vkQueueSubmit`, and there is **no** GPU-completion boundary
+//! at all because the sample lives inside the acquire — and where the real fix
+//! belongs (a WAIT-skipping or bounded acquire in the fork, plus a sample-only
+//! bridge entry point; neither is this file's).
+//!
+//! ⚠ **The order of the forward and the acquire is load-bearing.** The engine
+//! `ExecuteCommandLists` comes FIRST and the acquire second; inverting them would
+//! hold vkd3d's `queue_lock` across a call into the same queue.
+//!
 //! The packet carries `HeliosD3D12SubmitCmd` — 16 bytes, magic `'HE12'`, declared
-//! once in `protocol/` per D13 — with `gpu_wire_fence = 0`, which the record's own
-//! doc defines as *"submit the packet, order it against nothing"*.
+//! once in `protocol/` per D13. Its `gpu_wire_fence` is a real venus
+//! GPU-completion boundary **only** on the drain arm; on the default arm it is `0`,
+//! which the record's own doc defines as *"submit the packet, order it against
+//! nothing"* and which `EclFenceNoDrain` states positively.
 //! [`ecl_submit_command`] has why 16 is the **minimum** recognisable length and why
 //! the earlier "keep it under 16" reasoning was the wrong lever (the KMD's decode
 //! arms reject on **magic**, not on length).
@@ -2215,20 +2235,25 @@ unsafe extern "C" fn destroy_command_signature(
 ///
 /// # ⚠ `gpu_wire_fence` — RE-GRADED: 0 was the steady state, and now it is a finding
 ///
-/// ⛔ **An earlier version of this doc said the field is 0 and called that "the
-/// plumbing arm, and it is what K-F1 is". That is no longer true, and the grading
-/// went stale the moment the ICD export landed** — the caller now samples
-/// `helios_venus_queue_gpu_fence` inside the drain window and passes a real venus
-/// wire fence retiring at **host GPU completion** of everything submitted to the
-/// queue. With `Umd12EclFence` at its ON default, a zero arriving here is one of
-/// three named findings (`EclFenceNoIcd` / `EclFenceNoExport` / `EclFenceRefused`),
-/// not the expected value.
+/// ⛔ **This field's grading has now gone stale TWICE, so both moves are recorded.**
+/// It began as *"0 — the plumbing arm, and it is what K-F1 is"*; the ICD export
+/// landed and made it a real venus wire fence retiring at **host GPU completion**,
+/// sampled inside the drain window, so a zero became one of three named findings
+/// (`EclFenceNoIcd` / `EclFenceNoExport` / `EclFenceRefused`). **A1 then gated the
+/// drain OFF by default**, and because the sample can only happen inside the acquire
+/// the default value is **0 again** — but for a fifth, differently-named reason
+/// (`EclFenceNoDrain`), not for the original one.
+///
+/// ⇒ **A zero here means nothing on its own; only the counter beside it does.** Read
+/// the run's `Umd12EclDrain` inventory value first: with it 0, expect
+/// `EclFenceNoDrain == EclForwarded`; with it 1, expect `EclFenceSampled` to carry
+/// every submit and the other four to be 0.
 ///
 /// Zero remains **legal** and unchanged in meaning — *"submit the packet, order it
 /// against nothing"*, which is why `is_valid()` deliberately does not check the
-/// fence — and it is exactly what the `Umd12EclFence=0` arm submits. What changed is
-/// which value is the default, and therefore what a reader should conclude from a
-/// zero.
+/// fence — and it is exactly what the `Umd12EclFence=0` and `Umd12EclDrain=0` arms
+/// submit. What changed each time is which value is the default, and therefore what a
+/// reader should conclude from a zero.
 ///
 /// ⚠ On the zero arm the packet takes the KMD's fall-through for a boundary-less
 /// submission — `RetireDomain::IncludingGpu` with `watermark = next_wire_fence` (in
@@ -2240,8 +2265,9 @@ unsafe extern "C" fn destroy_command_signature(
 /// the frame's own work.
 ///
 /// ⛔ **The record's PRESENCE is never conditional on a knob.** `Umd12EclSubmit`
-/// gates the whole `pfnRenderCb` call — packet or no packet — and `Umd12EclFence`
-/// gates only the *value of one field*. Presence is what lets a KMD-side experiment
+/// gates the whole `pfnRenderCb` call — packet or no packet — while `Umd12EclFence`
+/// and `Umd12EclDrain` between them gate only the *value of one field*. Presence is
+/// what lets a KMD-side experiment
 /// scope a deliberate hold to the D3D12 path instead of to the adapter-global WDDM
 /// FIFO, where it would stall DWM; a knob that removed the record while keeping the
 /// packet would take that scoping away and leave a packet the kernel cannot
@@ -2710,13 +2736,32 @@ unsafe extern "C" fn execute_command_lists(
         // rejected outright; this blocks only until vkd3d's submission worker has
         // handed the batch to Vulkan, so no CPU/GPU overlap is lost.
         //
-        // It is required rather than cautious: `ID3D12CommandQueue::
-        // ExecuteCommandLists` above is ASYNCHRONOUS — it pushes onto a worker
-        // thread — so without the drain the WDDM packet could be ordered *ahead
-        // of* the `vkQueueSubmit` it exists to fence, and the application's fence
-        // would be exactly as untruthful as it is with no packet at all. Same
-        // discipline `HeliosWaitFrameSubmitted` gives the D3D11 present path
-        // (`KMD_IMPACT.md` §14a.2).
+        // It is what makes the ORDERING real rather than cautious:
+        // `ID3D12CommandQueue::ExecuteCommandLists` above is ASYNCHRONOUS — it
+        // pushes onto a worker thread — so without the drain the WDDM packet could
+        // be ordered *ahead of* the `vkQueueSubmit` it exists to fence, and the
+        // application's fence would be exactly as untruthful as it is with no
+        // packet at all. Same discipline `HeliosWaitFrameSubmitted` gives the
+        // D3D11 present path (`KMD_IMPACT.md` §14a.2).
+        //
+        // ⛔⛔ **AND IT IS KNOB-GATED, DEFAULT OFF — A1.** The drain is
+        // `d3d12_command_queue_acquire_serialized`
+        // (`vkd3d-proton-helios/libs/vkd3d/command.c:25202-25217`), which
+        // `pthread_cond_wait`s **untimed** until vkd3d's worker has processed
+        // everything already queued ahead of its marker, FIFO — and one of the
+        // things that can be ahead of it is a `VKD3D_SUBMISSION_WAIT`, resolved
+        // through a second untimed `pthread_cond_wait` (`command.c:1226`, reached
+        // from `:23745`). So the ON arm can park the application's own thread
+        // inside this DDI with no timeout, no counter, and no outstanding GPU
+        // packet for TDR to catch. `knobs12::UMD12_ECL_DRAIN` carries the full
+        // argument for why a *counted* ordering gap beats an *uninstrumented*
+        // hang, exactly what the OFF arm costs, and what the real fix is (a
+        // WAIT-skipping or bounded acquire in the fork — not this crate's).
+        //
+        // ⚠ **Do NOT move the drain above `engine_queue.ExecuteCommandLists`.**
+        // The forward deliberately precedes the acquire: taking vkd3d's
+        // `queue_lock` first and then calling into the same queue's
+        // `ExecuteCommandLists` would be a self-deadlock on a non-recursive lock.
         //
         // ⭐⭐ AND THE GPU-COMPLETION BOUNDARY IS SAMPLED IN THE SAME WINDOW, which
         // is why the drain and the sample are one bridge call rather than two.
@@ -2734,50 +2779,81 @@ unsafe extern "C" fn execute_command_lists(
         // A/B disable for the fence itself. OFF calls the drain with no out-params,
         // so the export is never even resolved.
         //
-        // SAFETY: `engine_queue` is the live `ID3D12CommandQueue` this state owns,
-        // created by this bridge's own vkd3d engine — `bridge12::drain_queue`'s
-        // stated precondition — and it is borrowed for the call only.
-        let (drained, gpu_wire_fence) = if crate::knobs12::umd12_ecl_fence() {
-            let (drained, fence, status) = unsafe {
-                crate::bridge12::drain_queue_with_fence(queue.engine_queue.as_raw() as usize)
-            };
-            // ⛔ One counter per cause, never one for "the fence was 0". A zero is a
-            // LEGAL record value, so the value says nothing on its own and only the
-            // reason is a finding: an absent ICD, an ICD too old for the export, or
-            // an export that ran and declined (its loudest arm being `ring_idx == 0`,
-            // which retires at decode and would lie about GPU completion).
-            note_refusal(match status {
-                FenceStatus::Sampled => &L2_REFUSALS.ecl_fence_sampled,
-                FenceStatus::NoIcd => &L2_REFUSALS.ecl_fence_no_icd,
-                FenceStatus::NoExport => &L2_REFUSALS.ecl_fence_no_export,
-                FenceStatus::Refused => &L2_REFUSALS.ecl_fence_refused,
-                // ⛔ A status this build's mapping does not know = the C++ header and
-                // `bridge12::FenceStatus` have drifted apart. Loud, not absorbed.
-                FenceStatus::Unknown(_) => &L2_REFUSALS.ecl_fence_status_bad,
-            });
-            if let FenceStatus::Unknown(raw) = status {
-                if let Some(n) = budget(&ECL_LOG) {
-                    log_error!(
-                        "ExecuteCommandLists: bridge returned fence status {raw}, which this                          build does not know -- vkd3d_bridge.h's HELIOS_VKD3D_FENCE_* and                          bridge12::FenceStatus have drifted (x{})",
-                        n + 1,
-                    );
+        // ⛔⛔ **AND THE BOUNDARY IS UNREACHABLE WITHOUT THE DRAIN, mechanically.**
+        // The sample needs the `VkQueue` that only `vkd3d_acquire_vk_queue` hands
+        // back, and it happens *inside* the one bridge call
+        // (`helios_vkd3d_bridge_drain_queue`) that performs the acquire. So the
+        // `Umd12EclDrain=0` default arm carries `gpu_wire_fence = 0` — not a smaller
+        // boundary, **no** boundary — and `EclFenceNoDrain` is the fifth
+        // distinguishable cause of a zero so that arm can never be confused with
+        // the other four. ⚠ Separating them needs a sample-only or bounded-acquire
+        // entry point in `umd12/bridge/**`, which is another lane's file.
+        //
+        // ⚠ Exactly ONE fence-cause counter fires per submit on every arm below,
+        // which is what keeps the five readable as a partition of `EclForwarded`.
+        let mut gpu_wire_fence: u64 = 0;
+        if crate::knobs12::umd12_ecl_drain() {
+            // SAFETY (both arms): `engine_queue` is the live `ID3D12CommandQueue`
+            // this state owns, created by this bridge's own vkd3d engine —
+            // `bridge12::drain_queue`'s stated precondition — and it is borrowed
+            // for the call only.
+            let drained = if crate::knobs12::umd12_ecl_fence() {
+                let (drained, fence, status) = unsafe {
+                    crate::bridge12::drain_queue_with_fence(queue.engine_queue.as_raw() as usize)
+                };
+                // ⛔ One counter per cause, never one for "the fence was 0". A zero is
+                // a LEGAL record value, so the value says nothing on its own and only
+                // the reason is a finding: an absent ICD, an ICD too old for the
+                // export, or an export that ran and declined (its loudest arm being
+                // `ring_idx == 0`, which retires at decode and would lie about GPU
+                // completion).
+                note_refusal(match status {
+                    FenceStatus::Sampled => &L2_REFUSALS.ecl_fence_sampled,
+                    FenceStatus::NoIcd => &L2_REFUSALS.ecl_fence_no_icd,
+                    FenceStatus::NoExport => &L2_REFUSALS.ecl_fence_no_export,
+                    FenceStatus::Refused => &L2_REFUSALS.ecl_fence_refused,
+                    // ⛔ A status this build's mapping does not know = the C++ header
+                    // and `bridge12::FenceStatus` have drifted apart. Loud, not
+                    // absorbed.
+                    FenceStatus::Unknown(_) => &L2_REFUSALS.ecl_fence_status_bad,
+                });
+                if let FenceStatus::Unknown(raw) = status {
+                    if let Some(n) = budget(&ECL_LOG) {
+                        log_error!(
+                            "ExecuteCommandLists: bridge returned fence status {raw}, which this \
+                             build does not know -- vkd3d_bridge.h's HELIOS_VKD3D_FENCE_* and \
+                             bridge12::FenceStatus have drifted (x{})",
+                            n + 1,
+                        );
+                    }
                 }
+                gpu_wire_fence = fence;
+                drained
+            } else {
+                // ⭐ The fence A/B disable, and it is the K-F1 plumbing arm exactly:
+                // same packet, same magic, `gpu_wire_fence = 0`, drain still taken.
+                note_refusal(&L2_REFUSALS.ecl_fence_disabled);
+                unsafe { crate::bridge12::drain_queue(queue.engine_queue.as_raw() as usize) }
+            };
+            if !drained {
+                // Counted, and the submission still goes: a failed drain is an
+                // ORDERING risk, not a reason to withhold the packet. Withholding it
+                // would leave the fence untruthful for certain instead of possibly
+                // early, and the counter is what says which run was which.
+                note_refusal(&L2_REFUSALS.ecl_drain_failed);
             }
-            (drained, fence)
         } else {
-            // ⭐ The A/B disable, and it is the K-F1 plumbing arm exactly: same
-            // packet, same magic, `gpu_wire_fence = 0`.
-            note_refusal(&L2_REFUSALS.ecl_fence_disabled);
-            let drained =
-                unsafe { crate::bridge12::drain_queue(queue.engine_queue.as_raw() as usize) };
-            (drained, 0)
-        };
-        if !drained {
-            // Counted, and the submission still goes: a failed drain is an
-            // ORDERING risk, not a reason to withhold the packet. Withholding it
-            // would leave the fence untruthful for certain instead of possibly
-            // early, and the counter is what says which run was which.
-            note_refusal(&L2_REFUSALS.ecl_drain_failed);
+            // ⛔⛔ A1's containment arm, and it is the DEFAULT. No bridge call at all,
+            // so no acquire, no untimed `pthread_cond_wait`, and no fence sample.
+            note_refusal(&L2_REFUSALS.ecl_drain_disabled);
+            note_refusal(if crate::knobs12::umd12_ecl_fence() {
+                // The fence knob asked for a boundary the drain's absence makes
+                // unobtainable. ⛔ Its own counter, because "we could not sample"
+                // and "we were told not to" are different findings.
+                &L2_REFUSALS.ecl_fence_no_drain
+            } else {
+                &L2_REFUSALS.ecl_fence_disabled
+            });
         }
 
         // SAFETY: this is the DDI that owns the submission and we are on the
@@ -3564,9 +3640,15 @@ pub(crate) struct L2Refusals {
     /// not that a frame was dropped.
     ecl_submit_no_command_window: RefusalCounter,
     /// The command window was **smaller than the payload**, so nothing was
-    /// written. **Expected 0** — K-F1's payload is 4 bytes — and a hit means
-    /// dxgkrnl's window is smaller than that, which is a fact about the adapter
-    /// worth having on its own line rather than folded into "no window".
+    /// written. **Expected 0** — K-F1's payload is `HeliosD3D12SubmitCmd`, **16
+    /// bytes** (`protocol/src/wddm.rs`, and `ecl_submit_command`'s doc has why 16
+    /// is the *minimum* the KMD can recognise) — and a hit means dxgkrnl's window
+    /// is smaller than that, which is a fact about the adapter worth having on its
+    /// own line rather than folded into "no window".
+    ///
+    /// ⛔ **The "4 bytes" this doc used to claim was stale** and dated from the
+    /// draft in which the record was a bare magic word; it survived the commit
+    /// that made the payload 16.
     ecl_submit_window_too_small: RefusalCounter,
     /// `pfnRenderCb` returned a failure HRESULT for a packet this driver built.
     ///
@@ -3591,17 +3673,31 @@ pub(crate) struct L2Refusals {
     /// deliberately — withholding it would make the fence untruthful for certain
     /// instead of possibly early — so this counter is the only thing that says a
     /// run's numbers came from an unordered submission.
+    ///
+    /// ⛔ **RE-GRADED by A1: on a default build this counter CANNOT move**, because
+    /// `Umd12EclDrain` defaults OFF and no acquire is attempted. A 0 here is
+    /// therefore not evidence the drain succeeded — read `EclDrainDisabled` first,
+    /// and only interpret this counter on a run whose inventory line records
+    /// `Umd12EclDrain=1`. This is the same *"trusting a zero"* trap
+    /// (`METHOD.md` §5) the fence-success counters were added to close.
     ecl_drain_failed: RefusalCounter,
     /// ⭐⭐ **A REAL GPU-completion boundary went into the submitted record**:
     /// `helios_venus_queue_gpu_fence` returned a non-zero venus wire fence, sampled
     /// inside the drain window.
     ///
-    /// ⛔ **Expected non-zero on every submitting workload with `Umd12EclFence` at
-    /// its ON default, and it is the only counter that means the fence is real.**
-    /// `EclWddmSubmitted` says a packet went in; this says the packet asked for
-    /// something. A run with `EclWddmSubmitted > 0` and `EclFenceSampled == 0`
-    /// submitted only "order against nothing" packets, and its three possible causes
-    /// each have their own counter below.
+    /// ⛔ **RE-GRADED BY A1: expected 0 on a DEFAULT build**, because the sample
+    /// lives inside the drain and `Umd12EclDrain` defaults OFF. Its old grading —
+    /// *"expected non-zero on every submitting workload with `Umd12EclFence` at its
+    /// ON default"* — is quoted because it went stale the moment the drain was
+    /// gated, and because the fence knob alone no longer implies a boundary.
+    ///
+    /// ⛔ It remains **the only counter that means the fence is real**, and on a run
+    /// with `Umd12EclDrain=1` its old grading applies verbatim. `EclWddmSubmitted`
+    /// says a packet went in; this says the packet asked for something. A run with
+    /// `EclWddmSubmitted > 0` and `EclFenceSampled == 0` submitted only "order
+    /// against nothing" packets, and its **five** possible causes each have their own
+    /// counter below — four sampling failures plus `EclFenceNoDrain`, the arm the
+    /// default takes.
     ecl_fence_sampled: RefusalCounter,
     /// The venus ICD module could not be resolved for the fence export — no loaded
     /// module exports the probe symbol, or the **S4b anchor refused** because two ICD
@@ -3636,6 +3732,11 @@ pub(crate) struct L2Refusals {
     /// A/B arm** — it is what makes "this run had no boundary" a positive statement
     /// rather than an absence, and it is why the three findings above cannot be
     /// confused with the disable.
+    ///
+    /// ⚠ It fires on **both** `Umd12EclFence=0` arms, with the drain on or off; the
+    /// arm where the fence knob is *on* and the drain is off is
+    /// `EclFenceNoDrain` instead, because "we were told not to sample" and "we could
+    /// not sample" are different findings.
     ecl_fence_disabled: RefusalCounter,
     /// The bridge reported a fence status this build's mapping does not know.
     ///
@@ -3646,6 +3747,36 @@ pub(crate) struct L2Refusals {
     /// why the mapping has an explicit unknown arm instead of folding into
     /// `EclFenceRefused`.
     ecl_fence_status_bad: RefusalCounter,
+    /// ⛔⛔ **A1: `Umd12EclDrain` is off, so `pfnExecuteCommandLists` made no
+    /// `vkd3d_acquire_vk_queue` call at all.**
+    ///
+    /// ⛔ **Expected to EQUAL `EclForwarded` on a default build**, because the knob
+    /// defaults OFF — `knobs12::UMD12_ECL_DRAIN` carries why, and the short form is
+    /// that the ON arm's failure mode is an untimed `pthread_cond_wait` inside a DDI
+    /// with no counter and no TDR, while this arm's failure mode is the counted
+    /// ordering gap named here and in `EclFenceNoDrain`.
+    ///
+    /// ⚠ **This counter is what makes `EclDrainFailed = 0` readable.** Without it a
+    /// zero there says either "the drain succeeded every time" or "the drain never
+    /// ran", and those are opposite facts.
+    ecl_drain_disabled: RefusalCounter,
+    /// ⛔ **A1: `Umd12EclFence` asked for a boundary and the drain's absence made it
+    /// unobtainable**, so the record carried 0.
+    ///
+    /// ⛔ **Expected to equal `EclForwarded` on a default build.** The venus wire
+    /// fence is sampled from the `VkQueue` only `vkd3d_acquire_vk_queue` hands back,
+    /// *inside* the same bridge call that drains — so with `Umd12EclDrain=0` there is
+    /// no boundary to be had, and this is the fifth distinguishable cause of a zero
+    /// beside `EclFenceNoIcd` / `EclFenceNoExport` / `EclFenceRefused` /
+    /// `EclFenceDisabled`. ⚠ It is a **capability statement about this build's
+    /// configuration**, not a fault: the four above are all "the sample was attempted
+    /// and did not produce a boundary", and folding this into any of them would
+    /// misattribute a knob to the ICD.
+    ///
+    /// ⭐ It is also the counter that says the ordering gap A1's containment accepts
+    /// was actually taken on this run, which is what CLAUDE.md rule 2 asks of a
+    /// deliberately reduced path.
+    ecl_fence_no_drain: RefusalCounter,
 }
 
 pub(crate) static L2_REFUSALS: L2Refusals = L2Refusals {
@@ -3707,6 +3838,8 @@ pub(crate) static L2_REFUSALS: L2Refusals = L2Refusals {
     ecl_fence_refused: RefusalCounter::new("EclFenceRefused"),
     ecl_fence_disabled: RefusalCounter::new("EclFenceDisabled"),
     ecl_fence_status_bad: RefusalCounter::new("EclFenceStatusBad"),
+    ecl_drain_disabled: RefusalCounter::new("EclDrainDisabled"),
+    ecl_fence_no_drain: RefusalCounter::new("EclFenceNoDrain"),
 };
 
 /// L2's refusal counters, printed by `crate::log_refusal_summary` at this
@@ -3800,6 +3933,10 @@ pub(crate) static REFUSALS: &[&RefusalCounter] = &[
     &L2_REFUSALS.ecl_fence_refused,
     &L2_REFUSALS.ecl_fence_disabled,
     &L2_REFUSALS.ecl_fence_status_bad,
+    // ⛔ APPENDED, A1's containment. Two: the arm that was taken, and the boundary
+    // that arm cannot produce. Same append-only rule as every block above.
+    &L2_REFUSALS.ecl_drain_disabled,
+    &L2_REFUSALS.ecl_fence_no_drain,
 ];
 
 // ⚠ `Hresult` is imported for the `E_*`/`S_OK` constants this file returns; the
