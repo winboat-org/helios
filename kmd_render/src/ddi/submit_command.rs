@@ -179,6 +179,35 @@ pub(crate) fn record_present_handoff_telemetry() {
         b"WfBBlt",
         crate::virtio::gpu::WDDM_HEAD_BLOCKED_BLT.load(Ordering::Relaxed),
     );
+    // UV3's instrument (KMD_IMPACT §14a.1). Until now the ring pair was read in
+    // exactly ONE place — words 33/34 of the `'HDBG'` report below, which
+    // dxgkrnl collects only on a TDR — so "read the ring counters before and
+    // after a run" was not executable, and the question they answer is whether
+    // anything on this driver retires at host GPU completion rather than decode.
+    //
+    // `RngSub`/`RngCmp` are adapter-wide and include this driver's own scanout,
+    // windowed-BLT and present-BLT copies (all ring 1); `EscSub`/`EscSubRing`
+    // are the guest-attributed half, counted where the ICD's value enters. The
+    // informative reading is a zero — `EscSub > 0` with `EscSubRing == 0` means
+    // the guest never submits on a GPU-completion ring, `EscSub == 0` means this
+    // driver saw nothing from that process at all. Both are spelled out beside
+    // the statics in `virtio/counters.rs`.
+    crate::diag::record_named_bytes(
+        b"RngSub",
+        crate::virtio::gpu::RING_SUBMIT_COUNT.load(Ordering::Relaxed),
+    );
+    crate::diag::record_named_bytes(
+        b"RngCmp",
+        crate::virtio::gpu::RING_COMPLETE_COUNT.load(Ordering::Relaxed),
+    );
+    crate::diag::record_named_bytes(
+        b"EscSub",
+        crate::virtio::gpu::ESCAPE_SUBMIT_COUNT.load(Ordering::Relaxed),
+    );
+    crate::diag::record_named_bytes(
+        b"EscSubRing",
+        crate::virtio::gpu::ESCAPE_SUBMIT_RING_COUNT.load(Ordering::Relaxed),
+    );
     crate::diag::record_named_bytes(b"PmScan", PRESENT_MARKER_SCAN_HITS.load(Ordering::Relaxed));
     crate::diag::record_named_bytes(b"PmOff", PRESENT_MARKER_LAST_OFFSET.load(Ordering::Relaxed));
     crate::diag::record_named_bytes(b"PmVir", SUBMIT_VIRTUAL_COUNT.load(Ordering::Relaxed));

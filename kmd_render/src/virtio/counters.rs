@@ -75,9 +75,85 @@ pub static WDDM_HEAD_BLOCKED_BLT: AtomicU32 = AtomicU32::new(0);
 /// Fenced SUBMIT_3D enqueues carrying ring_idx >= 1 (GPU-completion fences —
 /// WS1 #4 consumer-side ordering; these retire at host GPU completion, not
 /// decode, so they legally stay in flight for the full GPU-work duration).
+///
+/// ⚠ **ADAPTER-WIDE, AND DOMINATED BY THIS DRIVER'S OWN COPIES.** Three
+/// producers reach ring 1 without any guest involvement, all via
+/// [`SCANOUT_RING_IDX`](super::gpu::SCANOUT_RING_IDX): the scanout copy
+/// (`gpu/mod.rs:3442`), the windowed-BLT submit (`:3375`), and — through the
+/// GENERIC entry point, which is why an entry-point-name audit misses it —
+/// `submit_venus_async_present` (`virtio/ctrl.rs:1541-1547`). So this counter
+/// alone can never answer "did the GUEST submit anything that retires at host
+/// GPU completion"; DWM compositing produces ring-1 traffic here by itself.
+/// [`ESCAPE_SUBMIT_RING_COUNT`] is the attributed half, counted where the guest
+/// value enters, and the pair is deliberately not a subtraction: a fourth
+/// internal producer would silently corrupt an inferred difference.
 pub static RING_SUBMIT_COUNT: AtomicU32 = AtomicU32::new(0);
-/// ring_idx >= 1 completions drained from the used ring.
+/// ring_idx >= 1 completions drained from the used ring. Same three internal
+/// producers as [`RING_SUBMIT_COUNT`]; `RngSub - RngCmp` is the in-flight
+/// ring-1 depth, and a permanent gap means ring-1 work that never retired.
 pub static RING_COMPLETE_COUNT: AtomicU32 = AtomicU32::new(0);
+
+// ── Guest-attributed SUBMIT_VENUS traffic (2026-08-06, KMD_IMPACT §14a.1 UV3) ─
+//
+// WHY THESE EXIST. UV3 — "does vkd3d's venus work retire at host GPU completion
+// or at decode?" — was documented as pre-checkable with zero code by reading
+// [`RING_SUBMIT_COUNT`] before and after a run. It is not: that counter is
+// adapter-wide and dominated by this driver's own scanout/BLT copies (above),
+// and until this commit it was READ in exactly one place — words 33/34 of the
+// `'HDBG'` report `DxgkDdiCollectDbgInfo` emits, which dxgkrnl calls only on a
+// TDR. Reading it required provoking the failure it was supposed to predict.
+//
+// These two count only submissions that arrived through the guest's
+// `HELIOS_ESCAPE_SUBMIT_VENUS`, attributed at `submit_venus_async_inner`
+// (`virtio/ctrl.rs`), which is reachable from nowhere else (`ddi/escape.rs:1233`
+// and `:1242` are its only callers).
+//
+// HOW TO READ THEM, spelled out because the informative reading is a ZERO:
+//   * `EscSub > 0` and `EscSubRing == 0` — the ICD submits, and never on a
+//     GPU-completion ring. `RetireDomain::IncludingGpu` (`gpu/mod.rs:1496-1519`,
+//     implemented at `:4958-4972` as "no in-flight entry below the watermark,
+//     whatever its ring") is then gating on host DECODE, not GPU completion —
+//     which `:1506-1515`'s own comment already states for ring 0. A D3D12 fence
+//     built on it would report decode and lie.
+//   * `EscSub == 0` across a D3D12 run — this driver saw NOTHING from that
+//     process, which is a different finding and the one that fits a 0.8–1.1 µs
+//     fence wait: a plain `vkQueueSubmit`'s command stream never touches virtio
+//     (it rides the shared ring), and the only virtio submit a frame can
+//     produce is the `vkNotifyRingMESA` doorbell — hardcoded `ring_idx = 0`
+//     (`icd/mesa/src/virtio/vulkan/vn_renderer_util.h:22-35`) and emitted only
+//     when the host ring advertises IDLE and the 1 ms limiter has expired
+//     (`vn_ring.c:673-690`, `VN_RING_IDLE_TIMEOUT_NS` at `:22`). A ring busier
+//     than 1 ms emits no doorbell and therefore no wire fence at all.
+//   * `RngSub` climbing while `EscSubRing` stays put — all ring-1 work is this
+//     driver's own compositor copies. That is the state the old single counter
+//     could not distinguish from success.
+//
+// ⭐ THE READING THAT WOULD REFUTE "vkd3d's work is ring-0 only": an `EscSubRing`
+// delta that GROWS when a D3D12 workload is added to an otherwise unchanged
+// desktop. It needs a control arm, not arithmetic: the shipping D3D11 present
+// path contributes ~one `EscSubRing` per present by itself — the win32 external
+// semaphore signal batch, whose ring_idx is the submitting queue's ring
+// (`vn_queue.c:1719-1751` ← `:887` ← `vn_device.c:83-88`; ring 0 is reserved,
+// `vn_instance.c:309-310`) — so take the idle-desktop delta first and the
+// probe-running delta second, over the same wall-clock window.
+//
+// ⚠ [`ASYNC_SUBMIT_COUNT`] is NOT the guest total and cannot stand in for
+// `EscSub`: it is bumped inside `enqueue_submit_inner`, so it already includes
+// all four entry points, scanout and BLT copies among them. It is mirrored
+// separately as `AsSub`.
+
+/// Fenced SUBMIT_3D enqueues accepted from a guest `HELIOS_ESCAPE_SUBMIT_VENUS`,
+/// any ring. Counted only on the arm the transport accepted, so it is directly
+/// comparable with [`ASYNC_SUBMIT_COUNT`] rather than counting refusals.
+pub static ESCAPE_SUBMIT_COUNT: AtomicU32 = AtomicU32::new(0);
+/// The `ring_idx >= 1` subset of [`ESCAPE_SUBMIT_COUNT`] — guest-originated work
+/// that retires at host GPU completion rather than at decode.
+///
+/// The guest value is counted before `enqueue_submit_inner`'s
+/// `ring_idx.min(u8::MAX)` clamp, which cannot turn a nonzero ring into zero, so
+/// this subset is exactly the set of submits that carried
+/// `VIRTIO_GPU_FLAG_INFO_RING_IDX` onto the wire.
+pub static ESCAPE_SUBMIT_RING_COUNT: AtomicU32 = AtomicU32::new(0);
 /// Fire-and-forget control commands queued by PASSIVE workers (currently the
 /// scanout RESOURCE_FLUSH path).  These own their DMA buffers until the normal
 /// used-ring drain retires them, but never park a stack waiter.

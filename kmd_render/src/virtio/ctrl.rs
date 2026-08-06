@@ -63,8 +63,8 @@ use wdk_sys::{KEVENT, LARGE_INTEGER, PVOID, STATUS_SUCCESS};
 use super::gpu::{
     BlobMapBegin, BlobMapFinish, BlobMapPrep, BlobRemapBegin, DeviceOwner, FenceWaitPrep,
     OwnerFilter, SyncOutcome, SyncTicket, SyncWaitBlock, WaitBlockRef, CTRL_TEARDOWN_ABANDONS,
-    CTRL_TIMEOUT_COUNT, FENCE_WAIT_TABLE_FULL, FENCE_WAIT_TIMEOUTS, SUBMIT_META_BYTES,
-    TRANSPORT_GONE_AT_WAIT,
+    CTRL_TIMEOUT_COUNT, ESCAPE_SUBMIT_COUNT, ESCAPE_SUBMIT_RING_COUNT, FENCE_WAIT_TABLE_FULL,
+    FENCE_WAIT_TIMEOUTS, SUBMIT_META_BYTES, TRANSPORT_GONE_AT_WAIT,
 };
 use super::hal::DmaBuffer;
 use super::VirtioError;
@@ -1431,7 +1431,25 @@ fn submit_venus_async_inner(
         });
         match res {
             Err(_) => return Err(VirtioError::DeviceError), // transport gone
-            Ok(Ok(fence_id)) => return Ok(fence_id),
+            Ok(Ok(fence_id)) => {
+                // ATTRIBUTION POINT for guest venus traffic (KMD_IMPACT §14a.1
+                // UV3). This function is reachable only from the escape
+                // (`ddi/escape.rs:1233`, `:1242`), so a count here is
+                // GUEST-originated by construction — which the adapter-wide
+                // `RING_SUBMIT_COUNT` is not: three internal producers reach
+                // ring 1 on their own, one of them (`submit_venus_async_present`
+                // below) through the same generic enqueue this path uses.
+                // Counted on the accepted arm only, so it compares directly with
+                // `ASYNC_SUBMIT_COUNT`. Grading and the two readings that matter
+                // — a zero `EscSubRing` with a nonzero `EscSub`, versus a zero
+                // `EscSub` — are documented with the statics in
+                // `virtio/counters.rs`.
+                ESCAPE_SUBMIT_COUNT.fetch_add(1, Ordering::Relaxed);
+                if ring_idx != 0 {
+                    ESCAPE_SUBMIT_RING_COUNT.fetch_add(1, Ordering::Relaxed);
+                }
+                return Ok(fence_id);
+            }
             Ok(Err((m_back, v_back, VirtioError::QueueFull))) => {
                 meta = m_back;
                 venus = v_back;
