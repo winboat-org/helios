@@ -2241,19 +2241,22 @@ fn ecl_submit_command() -> helios_protocol::HeliosD3D12SubmitCmd {
 
 /// The three distinguishable outcomes of one [`submit_wddm_render`] attempt.
 ///
-/// ⭐ Three and not two, because the middle one decides an error channel and
-/// therefore whether an `ID3D12Device` survives — see [`report_ecl_submit_error`]
-/// for the line and the argument behind it. An `Option`/`Result` here would have
-/// collapsed exactly the distinction that matters.
+/// ⭐ Three and not two, because the middle one decides whether the runtime is told
+/// at all — see [`report_ecl_submit_error`] for that line and the argument behind
+/// it. An `Option`/`Result` here would have collapsed exactly the distinction that
+/// matters.
 enum WddmSubmit {
     /// The packet went in and the windows were re-latched from its out-fields.
     Submitted,
     /// **This driver could not make a packet** — no `pfnRenderCb`, no context, no
     /// command window, or a window smaller than the payload. Counted, logged, and
-    /// deliberately **not** raised to the runtime.
+    /// deliberately **never** raised to the runtime, on either arm of
+    /// `Umd12EclSubmitStrict`.
     Unavailable,
     /// **`pfnRenderCb` refused a packet this driver did make**, carrying dxgkrnl's
-    /// own HRESULT. This is the arm the runtime is told about.
+    /// own HRESULT. The only arm that may reach `pfnSetErrorCb` — and whether it
+    /// does is gated on `Umd12EclSubmitStrict`, which is **off by default during
+    /// bring-up**. Counted and logged either way.
     Refused(ddi12::HRESULT),
 }
 
@@ -2465,7 +2468,7 @@ unsafe fn submit_wddm_render<T: Copy>(
 ///    reaches for the sibling queue-table failure, down to reusing
 ///    `QueueSetErrorUnavailable` when the channel itself is absent.
 ///
-/// # ⚠ The HRESULT is passed through unnarrowed, and the severity is deliberate
+/// # ⚠ The HRESULT is passed through unnarrowed
 ///
 /// `device12::command_list_error_code`'s three-value narrowing is
 /// `pfnSetCommandListErrorCb`'s contract (`CPUEfficiency.md:2143-2158`), not
@@ -2474,22 +2477,51 @@ unsafe fn submit_wddm_render<T: Copy>(
 /// dxgkrnl refusing a packet this driver built is unambiguously the latter — so
 /// dxgkrnl's own code is both legal and the most informative thing available.
 ///
-/// ⚠ **This removes the `ID3D12Device`**: the runtime's response to
-/// `pfnSetErrorCb` is *"Removing device due to bad UMD error"* (`DDI_REFERENCE.md`
-/// §9.12 — it is not a log function). That is the right severity here, because a
-/// refused submission means the frame's fence ordering did not happen and every
-/// later frame's would not either, and a silently untruthful fence is the exact
-/// defect K-F1 exists to end. ⛔ The disable, if the severity ever proves wrong on
-/// a real workload, is `Umd12EclSubmit=0` — never a swallowed HRESULT.
+/// # ⛔⛔ The call is GATED, and the gate is a bring-up decision, not a doubt
 ///
-/// ⛔ **And [`WddmSubmit::Unavailable`] deliberately does NOT come here.** That arm
-/// means this driver could not build a packet at all, which is *the same state the
-/// OFF arm of `Umd12EclSubmit` produces on purpose* — so it cannot coherently be a
-/// device-removing error. Those arms are counted and logged, which is CLAUDE.md
-/// rule 2's requirement (a named counter per refusal), and they leave a queue that
-/// behaves exactly as it did before K-F1 instead of taking DWM's D3D12 device down
-/// with it.
+/// Raising it **removes the `ID3D12Device`**: the runtime's response to
+/// `pfnSetErrorCb` is *"Removing device due to bad UMD error"* (`DDI_REFERENCE.md`
+/// §9.12 — it is not a log function). That is the right **eventual** severity, for
+/// the reason above: a refused packet means the frame's fence ordering did not
+/// happen and every later frame's will not either, and a silently untruthful fence
+/// is the exact defect K-F1 exists to end. Nothing below weakens that.
+///
+/// ⛔ **But it is the wrong severity for the FIRST deployment of this path**, so the
+/// `pfnSetErrorCb` call — and only that call — sits behind
+/// `knobs12::UMD12_ECL_SUBMIT_STRICT`, **default OFF**. Two of K-F1's preconditions
+/// are unverified from the Linux host (that the cxx bridge's C++ half links, and
+/// that dxgkrnl accepts `NumAllocations = 0` with a 16-byte command on a legacy
+/// D3D12 context), and both would arrive here. With strictness ON the first run
+/// therefore yields a **removed device instead of a measurement** — no surface
+/// survey, no fence-wait number, no trace tail, and no way to tell a bridge
+/// signature error from a semantic refusal, because both look identical from
+/// outside. CLAUDE.md rule 8 decides the default and it decides it against
+/// strictness: nothing has been measured on this path, so the shipped value must be
+/// the one under which a measurement is possible. `UMD12_ECL_SUBMIT_STRICT` carries
+/// the written flip condition — **`EclWddmSubmitted > 0` with
+/// `EclSubmitRenderFailed == 0` on a real run** — and the evidence goes there.
+///
+/// ⚠ **The suppression is one call, not a quiet failure.** `EclSubmitRenderFailed`
+/// is bumped in [`submit_wddm_render`] before this function is even reached and the
+/// budgeted `hr=` line is already written; the suppression additionally bumps
+/// `EclSubmitErrorNotRaised`. With strictness off those counters are the *only*
+/// signal, which is exactly why they are undiminished.
+///
+/// ⛔ **And [`WddmSubmit::Unavailable`] deliberately does NOT come here at all**, on
+/// either arm of the knob. That arm means this driver could not build a packet,
+/// which is *the same state the OFF arm of `Umd12EclSubmit` produces on purpose* —
+/// so it cannot coherently be a device-removing error under any setting. Those arms
+/// are counted and logged, which is CLAUDE.md rule 2's requirement, and they leave a
+/// queue that behaves exactly as it did before K-F1 instead of taking DWM's D3D12
+/// device down with it.
 fn report_ecl_submit_error(queue: &QueueState, hr: ddi12::HRESULT) {
+    // ⚠ Read AFTER the refusal has already been counted and logged by the caller, so
+    // this branch decides only whether the runtime is told — never whether the
+    // failure is recorded.
+    if !crate::knobs12::umd12_ecl_submit_strict() {
+        note_refusal(&L2_REFUSALS.ecl_submit_error_not_raised);
+        return;
+    }
     // SAFETY: `h_device` is the device this queue was created against; the borrow
     // lives only until the end of this statement.
     let reported = unsafe { device12::device(queue.h_device) }
@@ -3480,11 +3512,18 @@ pub(crate) struct L2Refusals {
     ecl_submit_window_too_small: RefusalCounter,
     /// `pfnRenderCb` returned a failure HRESULT for a packet this driver built.
     ///
-    /// ⛔ **Expected 0.** A hit is raised to the runtime through `pfnSetErrorCb`
-    /// and **removes the `ID3D12Device`** — `report_ecl_submit_error` carries the
-    /// argument for that channel and that severity. ⚠ Read it together with
-    /// `QueueSetErrorUnavailable`: a non-zero count there means the failure could
-    /// not even be reported.
+    /// ⛔ **Expected 0, and it is half of `Umd12EclSubmitStrict`'s written flip
+    /// condition.** A hit *may* be raised to the runtime through `pfnSetErrorCb`,
+    /// which would remove the `ID3D12Device` — but that call is gated and the gate is
+    /// **off by default during bring-up**, so on a default build a hit is counted and
+    /// logged and nothing else happens. `report_ecl_submit_error` carries the
+    /// argument for the channel, for the severity, and for the gate.
+    ///
+    /// ⚠ Read it with two neighbours: `EclSubmitErrorNotRaised` (was the runtime told,
+    /// or only the log?) and `QueueSetErrorUnavailable` (a strict run in which the
+    /// report could not even be delivered). ⭐ **`EclSubmitRenderFailed == 0` beside
+    /// `EclWddmSubmitted > 0` on a real run is what flips that default to ON**, with
+    /// the evidence going into `knobs12::UMD12_ECL_SUBMIT_STRICT`'s comment.
     ecl_submit_render_failed: RefusalCounter,
     /// `vkd3d_acquire_vk_queue` declined to drain the engine's submission worker
     /// before the WDDM packet went in.
@@ -3498,6 +3537,21 @@ pub(crate) struct L2Refusals {
     /// instead of possibly early — so this counter is the only thing that says a
     /// run's numbers came from an unordered submission.
     ecl_drain_failed: RefusalCounter,
+    /// A refused `pfnRenderCb` was counted and logged but **not** raised through
+    /// `pfnSetErrorCb`, because `Umd12EclSubmitStrict` is off (its default during
+    /// bring-up).
+    ///
+    /// ⚠ **Expected to track `EclSubmitRenderFailed` exactly while that default
+    /// stands**, and that is the point: it makes the suppression a number instead of
+    /// an absence. `EclSubmitRenderFailed > 0` alone cannot say whether the runtime
+    /// was told; this counter says it, and the `Umd12EclSubmitStrict` line in the
+    /// knob inventory says which arm the run used.
+    ///
+    /// ⛔ It is a refusal to **report**, not a refusal to submit — the packet was
+    /// built and dxgkrnl rejected it. Read it beside `EclSubmitRenderFailed`, never
+    /// instead of it. `report_ecl_submit_error` has why the gate exists and
+    /// `knobs12::UMD12_ECL_SUBMIT_STRICT` the written condition that retires it.
+    ecl_submit_error_not_raised: RefusalCounter,
 }
 
 pub(crate) static L2_REFUSALS: L2Refusals = L2Refusals {
@@ -3553,6 +3607,7 @@ pub(crate) static L2_REFUSALS: L2Refusals = L2Refusals {
     ecl_submit_window_too_small: RefusalCounter::new("EclSubmitWindowSmall"),
     ecl_submit_render_failed: RefusalCounter::new("EclSubmitRenderFailed"),
     ecl_drain_failed: RefusalCounter::new("EclDrainFailed"),
+    ecl_submit_error_not_raised: RefusalCounter::new("EclSubmitErrorNotRaised"),
 };
 
 /// L2's refusal counters, printed by `crate::log_refusal_summary` at this
@@ -3637,6 +3692,10 @@ pub(crate) static REFUSALS: &[&RefusalCounter] = &[
     &L2_REFUSALS.ecl_submit_window_too_small,
     &L2_REFUSALS.ecl_submit_render_failed,
     &L2_REFUSALS.ecl_drain_failed,
+    // ⛔ APPENDED after the K-F1 block, not inserted into it: the strict-severity
+    // gate was a review outcome on the same commit, and the counters that shipped
+    // in the K-F1 review draft must keep their positions.
+    &L2_REFUSALS.ecl_submit_error_not_raised,
 ];
 
 // ⚠ `Hresult` is imported for the `E_*`/`S_OK` constants this file returns; the

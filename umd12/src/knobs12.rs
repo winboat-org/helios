@@ -23,6 +23,7 @@
 //! | `Umd12FenceSignalDelayUs` | DWORD | `0` — **diagnostic**, the F1 delay probe on `pfnSignalFence` |
 //! | `Umd12EclDelayUs` | DWORD | `0` — **diagnostic**, the F1 delay probe on `pfnExecuteCommandLists` |
 //! | `Umd12EclSubmit` | DWORD | **`1` — ON.** K-F1's `pfnRenderCb` WDDM submission during `pfnExecuteCommandLists` |
+//! | `Umd12EclSubmitStrict` | DWORD | `0` — **OFF during bring-up.** Whether a refused `pfnRenderCb` removes the `ID3D12Device` |
 //!
 //! ⭐ **`UmdD3D12` lands here at S5, and not one commit earlier.** A kill switch
 //! for a driver that cannot be reached kills nothing, so declaring it before
@@ -349,6 +350,62 @@ pub(crate) static UMD12_ECL_DELAY_US: DwordKnob = DwordKnob::new(c"Umd12EclDelay
 /// behaviour, never what the code assumes.
 pub(crate) static UMD12_ECL_SUBMIT: BoolKnob = BoolKnob::new(c"Umd12EclSubmit", true);
 
+/// ⛔⛔ **Whether a refused `pfnRenderCb` removes the `ID3D12Device`. DEFAULT OFF —
+/// and that default is a BRING-UP decision with a written flip condition, not an
+/// opinion about severity.**
+///
+/// # The severity question, and why the answer is "not yet"
+///
+/// `forward12::queue::report_ecl_submit_error` has the full argument for *which*
+/// channel a refused submission belongs on (`pfnSetErrorCb`, whose runtime response
+/// is *"Removing device due to bad UMD error"*) and for why that is the right
+/// **eventual** behaviour: a refused packet means the frame's fence ordering did not
+/// happen and every later frame's will not either, and a silently untruthful fence
+/// is the exact defect K-F1 exists to end. None of that is in doubt.
+///
+/// ⛔ **What is in doubt is whether the path works at all yet**, and that decides
+/// this default. Two things about K-F1's very first deployment are unverified from
+/// the Linux host: that the cxx bridge's C++ half links (nothing here compiles C++),
+/// and that dxgkrnl's own `D3DDDICB_RENDER` validation accepts `NumAllocations = 0`
+/// with a 16-byte command on a legacy D3D12 context. Either would arrive as
+/// `EclSubmitRenderFailed` plus an `hr=` line.
+///
+/// With strictness ON, that first run produces a **removed device instead of a
+/// measurement**: no surface survey, no fence-wait number, no trace tail — and no
+/// way to tell a bridge signature error from a semantic refusal by dxgkrnl, because
+/// both look like device-removed. That is self-inflicted blindness on precisely the
+/// run that exists to settle the question, and it is the shape of failure this
+/// project already has a rule against: a gate that reads only the exit code settles
+/// nothing.
+///
+/// ⇒ **CLAUDE.md rule 8 is what picks OFF**, not caution. *"A knob's default is a
+/// decision, and it must match the measured configuration"* — **nothing has been
+/// measured on this path**, so the default must be the value under which a
+/// measurement can happen. The strict arm's own doc is the record of why it is
+/// right; this knob is the record of why it is not yet the default.
+///
+/// ⚠ **OFF does not mean quiet.** A refusal still bumps `EclSubmitRenderFailed` and
+/// still writes its budgeted `pfnRenderCb(...) failed hr=...` line, and the
+/// suppression itself bumps `EclSubmitErrorNotRaised` — so with strictness off the
+/// counters are the *only* signal and they are deliberately undiminished. What is
+/// suppressed is exactly one thing: the `pfnSetErrorCb` call.
+///
+/// # ⭐ THE FLIP CONDITION, stated so this is a decision and not a fork nobody
+/// revisits
+///
+/// **Once a real guest run shows `EclWddmSubmitted > 0` with
+/// `EclSubmitRenderFailed == 0`, this default becomes `true` and the evidence goes
+/// in this comment** — the run, the counter values, and the build. That single
+/// reading retires both unknowns above at once: a submission that succeeded proves
+/// the bridge linked and that dxgkrnl accepted the packet shape, which is the whole
+/// content of "the path is proven".
+///
+/// ⛔ Until then the opposite arm stays reachable both ways, which is rule 8's other
+/// half: `Umd12EclSubmitStrict=1` is available *now*, on purpose, so that the strict
+/// behaviour can be exercised deliberately once the path is up rather than waiting
+/// on a rebuild.
+pub(crate) static UMD12_ECL_SUBMIT_STRICT: BoolKnob = BoolKnob::new(c"Umd12EclSubmitStrict", false);
+
 /// The `pfnSignalFence` diagnostic delay in microseconds, clamped. `0` = off.
 /// See [`UMD12_FENCE_SIGNAL_DELAY_US`].
 pub(crate) fn umd12_fence_signal_delay_us() -> u32 {
@@ -366,6 +423,13 @@ pub(crate) fn umd12_ecl_delay_us() -> u32 {
 /// and for what the OFF arm is used to measure.
 pub(crate) fn umd12_ecl_submit() -> bool {
     UMD12_ECL_SUBMIT.get()
+}
+
+/// Whether a refused `pfnRenderCb` is raised through `pfnSetErrorCb`, which removes
+/// the `ID3D12Device`. **Absent = OFF**; see [`UMD12_ECL_SUBMIT_STRICT`] for why the
+/// default is OFF during bring-up and for the written condition that flips it.
+pub(crate) fn umd12_ecl_submit_strict() -> bool {
+    UMD12_ECL_SUBMIT_STRICT.get()
 }
 
 /// Emit this crate's knob inventory through the shared reader, once per process.
@@ -390,7 +454,7 @@ pub(crate) fn log_knob_inventory() {
 /// are the evidence contract `tools/capture-knob-inventory.ps1` parses and that
 /// S2 proved the crate split byte-identical against; reordering makes two
 /// captures differ for a reason that is not a behaviour change.
-pub(crate) fn resolved_inventory() -> [(&'static str, u32); 6] {
+pub(crate) fn resolved_inventory() -> [(&'static str, u32); 7] {
     [
         ("Umd12Trace", UMD12_TRACE.get() as u32),
         ("UmdD3D12", UMD_D3D12.get() as u32),
@@ -407,5 +471,12 @@ pub(crate) fn resolved_inventory() -> [(&'static str, u32); 6] {
         // ARM produced a run's numbers, and its default is ON, so a capture that
         // does not name it cannot be attributed at all.
         ("Umd12EclSubmit", umd12_ecl_submit() as u32),
+        // ⭐ And this one is what says whether a `pfnRenderCb` refusal on that run
+        // would have removed the device or only been counted — i.e. whether a run
+        // that ended early ended for THIS reason. A capture without it cannot
+        // distinguish "no refusal happened" from "a refusal happened and was
+        // suppressed", which is exactly the ambiguity the OFF default introduces
+        // and this line removes.
+        ("Umd12EclSubmitStrict", umd12_ecl_submit_strict() as u32),
     ]
 }
