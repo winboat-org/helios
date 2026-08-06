@@ -15,17 +15,20 @@
 //! and finds the **command-list table has no opt-out mechanism at all**. So the
 //! command-list half of this lane is non-NULL-or-nothing regardless of caps.
 //!
-//! ⚠ **S6-0: this lane has not landed, with TWO exceptions.** Everything else
+//! ⚠ **S6-0: this lane has not landed, with THREE exceptions.** Everything else
 //! carries the per-slot counting noops `forward12::noop12` installed, so it is
 //! non-NULL and every hit is named, counted and printed by
 //! `D3D12 noop DDI hits:`. `PARALLEL.md` §9.2 does not call this lane done until
 //! those counters read **zero** under a real workload.
 //!
-//! # ⭐ The two exceptions, and why they landed before the rest of the lane
+//! # ⭐ The three exceptions, and why they landed before the rest of the lane
 //!
-//! `pfnQueryNodeMap` and `pfnGetImplicitPhysicalAdapterMask` are **on the
-//! device-creation path**, and a counting noop answers both of them wrong in a
-//! way the runtime acts on:
+//! `pfnQueryNodeMap`, `pfnGetImplicitPhysicalAdapterMask` and
+//! `pfnGetDebugAllocationInfo` are all **on the device-creation path**, and a
+//! counting noop answers each of them wrong in a way the runtime acts on. The
+//! first two landed with L1; the third with the S6 Round-1 merge, when
+//! `D12-G7`'s slot ledger showed it had been called four times per device all
+//! along:
 //!
 //! * `pfnQueryNodeMap` is called once inside `D3D12CreateDevice`
 //!   (`tmp/dx12/gates/G7/RESULT.md` counted it). Its `pMap` is `_Out_writes_`,
@@ -45,6 +48,12 @@
 //!   noop returns 0, i.e. *"this device has no physical adapters"*. Landing one
 //!   half of a two-part invariant and leaving the other answering zero is the
 //!   silent stub CLAUDE.md rule 2 exists to forbid, so both land together.
+//! * `pfnGetDebugAllocationInfo` is the same `_Out_`-left-unwritten class as
+//!   `pfnQueryNodeMap`, arriving through a second slot: it takes **two** `_Out_`
+//!   `UINT*` array counts and a `VOID`-returning counting noop writes neither,
+//!   so the runtime reads its own uninitialised stack as two array lengths.
+//!   `D12-G7` called it **four times** per `D3D12CreateDevice` and passed on the
+//!   luck of what those words held. See [`get_debug_allocation_info`].
 //!
 //! ⚠ They are still **L9's slots**, in L9's file, under L9's ownership
 //! (`PARALLEL.md` §4). The lane that takes the rest of this file inherits them
@@ -141,6 +150,75 @@ unsafe extern "C" fn query_node_map(
     }
 }
 
+/// `pfnGetDebugAllocationInfo` — this driver owns no kernel allocations, and
+/// says so by **writing two zeros** rather than by returning without writing.
+///
+/// ⭐ **The third slot to land ahead of L9, for the same reason as the other two
+/// and with a sharper edge.** `D12-G7`'s passing run called it **four times**
+/// inside `D3D12CreateDevice`, and the counting noop it reached returns `0` —
+/// which for a `VOID` slot means it returns having written **nothing**. Both
+/// `pNumVirtualAddressInfos` and `pNumKMTInfos` are `_Out_` `UINT*`, so the
+/// runtime then reads its own uninitialised stack as two array counts and, if
+/// either is non-zero, walks a buffer this driver never filled. That is
+/// precisely the class `query_node_map` above exists to close, arriving through
+/// a second slot on the same device-creation path; it survived `D12-G7` on the
+/// luck of whatever those four stack words happened to hold.
+///
+/// ⛔ **Zero is the honest answer, not a placeholder.** `DDI_REFERENCE.md` §9.12
+/// says this slot *"must map any `D3D12DDI_HANDLE_AND_TYPE` to
+/// `{ VA infos, KMT allocation infos }`"*, and §9.11 records that kernel
+/// identity is *"mandatory in at least three places, so pure passthrough with no
+/// `pfnAllocateCb` is not viable"*. Helios **is** that passthrough: the venus
+/// ICD mints every allocation through its own D3DKMT, this driver calls no
+/// `pfnAllocateCb`, and L4's `pfnCheckResourceAllocationHandle` answers `0` for
+/// the same reason (`resource12.rs` §5.3). So there is no `D3DKMT_HANDLE` to
+/// report and reporting a fabricated one would be worse than reporting none.
+/// The counter is what stops the zero reading as *"the debug layer looked and
+/// the resource was fine"*.
+///
+/// ⚠ The two-call shape is safe under this answer either way it is meant:
+/// whether the runtime passes array capacities in or asks for required counts
+/// first, `0` is written to both and neither array is touched.
+///
+/// ⚠ **Deliberately does NOT reach `pfnSetErrorCb`.** A debug-layer query that
+/// finds nothing is not a driver error, and `DDI_REFERENCE.md` §9.12's own
+/// warning is that `pfnSetErrorCb` removes the device — *"Removing device due to
+/// bad UMD error"*. This is the one Round-1 slot where the difference between
+/// "counted" and "reported" is the difference between a diagnostic and a dead
+/// compositor.
+///
+/// # Safety
+/// `p_num_virtual_address_infos` and `p_num_kmt_infos`, when non-null, must each
+/// address one writable `UINT` the runtime owns. The two array pointers are not
+/// dereferenced at all, because both counts are answered `0`.
+unsafe extern "C" fn get_debug_allocation_info(
+    _h_device: ddi12::D3D12DDI_HDEVICE,
+    _object: ddi12::D3D12DDI_HANDLE_AND_TYPE,
+    p_num_virtual_address_infos: *mut ddi12::UINT,
+    _p_virtual_address_infos: *mut ddi12::D3D12DDI_DEBUG_VIRTUAL_ADDRESS_ALLOCATION_INFO_0012,
+    p_num_kmt_infos: *mut ddi12::UINT,
+    _p_kmt_infos: *mut ddi12::D3D12DDI_DEBUG_KMT_ALLOCATION_INFO_0014,
+) {
+    // ⚠ `bump` and not `note_refusal`: R911 -- the arm below logs its own line.
+    DEBUG_ALLOCATION_INFO_EMPTY.bump();
+    let n = DEBUG_ALLOCATION_INFO_EMPTY.get();
+    if n <= LOG_BUDGET {
+        log_error!(
+            "GetDebugAllocationInfo: this driver owns no kernel allocations (the venus ICD mints \
+             them); answering 0 VA infos and 0 KMT infos (x{n})"
+        );
+    }
+    if !p_num_virtual_address_infos.is_null() {
+        // SAFETY: non-null per the check; the DDI declares it a writable `_Out_`
+        // `UINT*` the runtime owns for the duration of the call.
+        unsafe { core::ptr::write_unaligned(p_num_virtual_address_infos, 0) };
+    }
+    if !p_num_kmt_infos.is_null() {
+        // SAFETY: as above.
+        unsafe { core::ptr::write_unaligned(p_num_kmt_infos, 0) };
+    }
+}
+
 /// Install L9's 28 device-core slots.
 ///
 /// Chain position: `PresentSlots` -> `MiscSlots` on the device-core table.
@@ -148,10 +226,11 @@ pub(crate) fn install_core(
     mut filling: Filling<'_, DeviceCoreTable, stage::PresentSlots>,
 ) -> Filling<'_, DeviceCoreTable, stage::MiscSlots> {
     let table = filling.table();
-    // ⚠ 2 of this lane's 28. The other 26 keep their counting noops; see the
-    // module doc for why these two could not wait for the rest of the lane.
+    // ⚠ 3 of this lane's 28. The other 25 keep their counting noops; see the
+    // module doc for why these could not wait for the rest of the lane.
     table.pfnGetImplicitPhysicalAdapterMask = Some(get_implicit_physical_adapter_mask);
     table.pfnQueryNodeMap = Some(query_node_map);
+    table.pfnGetDebugAllocationInfo = Some(get_debug_allocation_info);
     filling.advance()
 }
 
@@ -197,4 +276,23 @@ pub(crate) fn install_cmdlist(
 /// printed them. ⛔ They are not moved here: a counter that changes position
 /// in `D3D12 DDI refusals:` breaks the diff that set order exists to protect.
 /// The rest of L9's counters go here.
-pub(crate) static REFUSALS: &[&RefusalCounter] = &[];
+///
+/// ⚠ So L9's counters are **split across two sets**, and that is the intended
+/// behaviour of the scheme rather than a wart: position stability inside
+/// `D3D12 DDI refusals:` outranks tidiness, because those lines get diffed across
+/// builds and a counter that moves breaks the diff. The two node-map counters
+/// stay where they were first printed; everything from here on is L9's own.
+pub(crate) static REFUSALS: &[&RefusalCounter] = &[&DEBUG_ALLOCATION_INFO_EMPTY];
+
+/// `pfnGetDebugAllocationInfo` answered "no VA infos, no KMT infos".
+///
+/// ⚠ **Expected non-zero — `D12-G7` measured four calls inside one
+/// `D3D12CreateDevice`** — and it is an instrument, not a fault. Helios owns no
+/// kernel allocations: the venus ICD mints every one through its own D3DKMT and
+/// this driver never calls `pfnAllocateCb`, so there is no `D3DKMT_HANDLE` to
+/// report (the same reason L4's `pfnCheckResourceAllocationHandle` answers 0).
+/// ⛔ A **zero** reading on a run that created a device is the finding: it would
+/// mean the slot stopped being reached, i.e. that the readout below is measuring
+/// a different build than the one deployed.
+static DEBUG_ALLOCATION_INFO_EMPTY: RefusalCounter =
+    RefusalCounter::new("DebugAllocationInfoEmpty");
