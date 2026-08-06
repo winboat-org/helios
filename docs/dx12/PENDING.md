@@ -9,6 +9,83 @@ that is now the unit of work.
 
 ---
 
+## ⭐ STATUS 2026-08-06 — WAVE 1 LANDED, and five of this document's own claims were wrong
+
+A four-lane `METHOD.md` Phase 1 wave landed after this document was written. **Read this block before
+any row below it.** Everything landed is still **`implemented-but-never-exercised`** — `kmd_render`
+does not typecheck on Linux at all (`bytemuck_derive` proc-macro for the linux target, *not* only
+bindgen), so no compiler has seen the KMD half; the mitigation was to extract every decision table
+into `kmd_logic`, which went **149 → 172 tests**.
+
+**Landed:** §1 **A2** (deleted, see below) · **A3** · **A4** exact D3D12 boundary + `D12Exact` ·
+**A5** `WddmHeadMs` head bound + `WfBReb` + a lock-free armed-deadline shadow · **A6** two-sided
+generation bound + `GpuFncGen` · §2 **S-1** the GPU clock now answers `GpuFrequency = 1e9` and a real
+`CpuClockCounter` · **S-2** dropped waits split by provenance · **S-4** `ExecuteIndirect` for the
+four native classes, state-templates refused **at create** · §3 **four of the five FL 12_1 floors**.
+Also: the five unrunnable `kmd_render` tests recovered into `kmd_logic`.
+
+### ⛔ Five corrections to this document
+
+1. ⛔⛔ **§1 A1's stated trigger is REFUTED.** `queue->Wait(f,N); ECL(); …Signal(N)` **cannot** hang:
+   `FenceState::signal_reachable` is `value <= signalled_watermark` (`fence.rs:331-333`), so a wait
+   for a value this driver never signalled is **dropped, not forwarded** — no
+   `VKD3D_SUBMISSION_WAIT` is ever enqueued, and the drain cannot sit behind one.
+   `d3d12_command_queue_Wait` is vkd3d's only producer of that type, so this is exhaustive.
+   **What survives:** the drain *is* an untimed, unbounded `pthread_cond_wait` inside a DDI; a
+   *permanent* hang additionally needs a cycle among queue workers, unconstructible while the
+   watermark gate stands.
+   ⭐ **And the refutation produced a better finding than the claim: the watermark gate is
+   LOAD-BEARING for the drain.** Forwarding waits above the watermark — the obvious fix for
+   `FenceWaitNotForwarded` — destroys that acyclicity and makes the hang genuinely reachable. ⇒ that
+   change and a bounded/WAIT-skipping acquire **must land together**.
+2. ⛔ **A1's containment costs more than this document said.** *"Default the drain OFF"* does not
+   shrink the boundary — it **removes** it. The wire fence is sampled from the `VkQueue` that only
+   `vkd3d_acquire_vk_queue` returns, *inside* the drain function, so with the drain off
+   `gpu_wire_fence = 0` always and the whole fence bridge is inert. ⇒ a **sample-only** bridge path
+   (vkd3d's existing `vkd3d_lock_vk_queue`, queue mutex, no DRAIN) is required for the containment to
+   mean anything. Its honest cost: the boundary may name **less** work than the frame contains.
+3. ⛔ **A2 is not repairable and was deleted.** The ring tail is **ring-global**, so *"advanced only
+   by the release's empty batch"* cannot be distinguished from *"advanced by another `VkQueue`'s real
+   work on the same primary ring"* — a tolerant key would return an **under-ordering** fence, the one
+   hazard the export exists to prevent. A sound key is a per-`VkQueue` submission count, which
+   `struct vn_queue` does not have. ⭐ Deleting also removed a latent bug: `ring_idx` **is** recycled
+   and nothing invalidated the cache slot, so a hit that ever started working would have handed back
+   a fence minted on a destroyed queue's timeline.
+4. ⛔ **S-1's *"no counter and no diag record"* is misleading: the diag record is FORBIDDEN, not
+   omitted.** `DXGKDDI_CALIBRATEGPUCLOCK` is `_IRQL_requires_max_(DISPATCH_LEVEL)` and *"called on
+   timer"*, so a registry write there is illegal. **Do not let anyone "fix" it by adding one.**
+   Relatedly, `GpuClockCounter` stays **0 with a counter** by deliberate refusal: synthesising it
+   from an interrupt-time source is the right *rate* with the wrong *epoch*, which makes every
+   GPU↔CPU correlation silently wrong while every counter reads healthy.
+5. ⛔ **§6's "six" unrunnable tests was FIVE.** A `grep -c` over-counted and this document inherited
+   the number.
+
+### ⛔ Three errors in the wave's own briefs, worth recording because two were nearly shipped
+
+* **`WriteBufferImmediateQueueFlags = 15` is the wrong enum.** 15 is
+  `D3D12_COMMAND_LIST_SUPPORT_FLAGS`; the DDI field is `D3D12DDI_COMMAND_QUEUE_FLAGS`
+  (3D=1, COMPUTE=2, COPY=4, **PAGING=8**), so 15 would have **advertised a paging queue**. Correct
+  value **7**. Same class as the `3DPIPELINESUPPORT` bitmask-vs-level trap `caps12.rs` already warns
+  about. And BUNDLE has no DDI queue flag at all, which is why the BUNDLE refusal has nothing to
+  withhold.
+* **"Forward the engine's answer, do not pin" is not available at `pfnGetCaps`** — it is
+  *adapter*-scoped with no `ID3D12Device` in scope, so every number in `d3d12_options` is necessarily
+  pinned. ⭐ But `SUBSTRATE.md` §6.3's heap-tier UNVERIFIED is **discharged**: the probe it asks for
+  is the committed CSV, which reads 2, and a clamp can only lower.
+* **`MaxSamplerDescriptorHeapSize` must stay 4000.** The substrate's real ceiling is 2048 and
+  2049..=4000 samplers will fail `E_INVALIDARG` — but 2048 is what the runtime rejects as *too
+  small*, which fails **device creation**. The repair is a named counter, not a lower cap.
+
+### ⭐ Why four FL 12_1 floors moved with no implementation work
+
+The doc and the code both said the level and its floors *"move together or not at all"*. **That
+implication is one-way**: you must not raise the level without the floors, but you *may* report a
+backed floor without raising the level. That misreading held three fully-backed caps at their absent
+values with their slots already forwarding verbatim. **Only `TiledResourcesTier` (§3 S-6) now
+remains, and the level is still not raised.**
+
+---
+
 ## 0. The two things to understand before reading the list
 
 ### 0a. ⛔ "FL 12_1" and "real apps and benchmarks" are DIFFERENT targets, and the second is harder
