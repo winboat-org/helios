@@ -29,13 +29,29 @@
 //! engine device per DDI fence, and L2's two queue slots forward
 //! `ID3D12CommandQueue::Signal` / `::Wait` onto it. That is the whole object.
 //!
-//! ⛔ **The runtime's GPU VAs are therefore deliberately NOT stored.** They are
-//! logged at create — which is the only thing this driver can honestly do with
-//! them today — and a field nothing reads would be exactly the dead state
-//! `PARALLEL.md` §10 forbids. The lane that gains a real consumer (a
+//! ⛔ **The runtime's GPU VAs are therefore deliberately NOT stored, and there is
+//! no future lane that will want them.** They are logged at create — which is the
+//! only thing this driver can honestly do with them — and a field nothing reads
+//! would be exactly the dead state `PARALLEL.md` §10 forbids.
+//!
+//! ⛔⛔ **The old text here named a consumer that CANNOT EXIST, and it is quoted so
+//! nobody re-derives it:** *"The lane that gains a real consumer (a
 //! `pfnSignalSynchronizationObjectFromGpuCb` queued software signal packet on the
-//! queue's WDDM context, §10.4's table) adds them then, with its reader in the
-//! same commit.
+//! queue's WDDM context, §10.4's table) adds them then."* `DDI_REFERENCE.md`
+//! §10.4's correction block (`:2306-2331`) **struck those rows** and states why
+//! from the bindings: every `pfnSignal*Cb` / `pfnWait*Cb` names its target by
+//! `D3DKMT_HANDLE`, and `D3D12DDIARG_CREATE_FENCE` carries no `D3DKMT_HANDLE`, no
+//! `hRTFence` and no CPU pointer — so **the driver can never name a D3D12 fence to
+//! the kernel.** Measured on Helios, both `BaseAddress`es arrive **0**
+//! (`CreateFence: valueVA=0x0 monitoredVA=0x0`,
+//! `tmp/dx12/gates/G8-r0/umd12-trace-pid10836.log`), so there is not even fence
+//! memory to write. `KMD_IMPACT.md` §14a.5 then **forbids** the design outright:
+//! *"No `pfnSignal*Cb` for the application's fence."*
+//!
+//! ⭐ What is true instead: the runtime owns the fence and its signal, and this
+//! driver's only lever is **what dxgkrnl orders that signal behind** — the DMA
+//! packets already submitted on the queue's WDDM context. That is `EclWddmSubmitted`
+//! and nothing in this file.
 //!
 //! # ⛔⛔ The engine fence is a SHADOW, and it CAN diverge from the runtime's
 //!
@@ -64,20 +80,51 @@
 //! implementation rather than the contract.
 //!
 //! ⇒ [`FenceState`] therefore carries a **watermark of every `Value` this driver
-//! has itself issued a signal for**, and L2's `pfnWaitForFence` forwards only the
-//! waits that watermark can satisfy. Everything else is counted
-//! (`FenceWaitNotForwarded`) and left to the kernel-side ordering §10.3 says the
-//! runtime performs itself.
+//! has itself issued a signal for**, plus a **count of the signals it has issued at
+//! all**, and L2's `pfnWaitForFence` forwards only the waits that watermark can
+//! satisfy. Everything else is counted and left to the kernel-side ordering §10.3
+//! says the runtime performs itself.
 //!
-//! ⚠ **The cost of that choice, named rather than hidden:** a legal
+//! # ⛔⛔ Two arms, because a dropped wait has two very different meanings
+//!
+//! ⚠ **The cost of the watermark choice, named rather than hidden:** a legal
 //! wait-before-signal — an application enqueuing `queueB->Wait(f, N)` *before*
 //! `queueA->Signal(f, N)`, which D3D12 permits — is above the watermark at the
-//! moment it arrives and is dropped rather than carried. That is an ordering gap
-//! with a number on it, against a hang with none. It closes when §10.4's
-//! `pfnWaitForSynchronizationObjectFromGpuCb` half lands, which is the same
-//! missing WDDM submission `EclNoWddmSubmission` already counts — at which point
-//! the wait rides the runtime's monitored fence, the one object that *does* see
-//! the initial value and the CPU signals.
+//! moment it arrives and is dropped rather than carried. **Dropping it produces
+//! wrong pixels**, silently, and the async-compute subtest of a real benchmark is
+//! exactly the shape that issues it.
+//!
+//! ⛔ **The old text said this "closes when §10.4's
+//! `pfnWaitForSynchronizationObjectFromGpuCb` half lands". That is REFUTED and
+//! FORBIDDEN** — see the correction quoted above: no such callback can ever name a
+//! `D3D12DDI_HFENCE`, and `KMD_IMPACT.md` §14a.5 rules the design out. There is no
+//! pending work that closes this gap; the **only** channel that orders anything is
+//! the engine forward `queue::fence_operation` already makes, which vkd3d resolves
+//! into the signalling queue's `submission_timeline`.
+//!
+//! ⇒ so the dropped waits are **split by whether this driver participates in the
+//! fence's timeline at all**, and only one of the two arms can be honest about it:
+//!
+//! | condition | counter | treatment | why |
+//! |---|---|---|---|
+//! | [`FenceState::signals_issued`] is **0** | `FenceWaitRuntimeOwned` | dropped, counted, **not** reported | the value's provenance is entirely outside this DDI: a `CreateFence(InitialValue = N)` the DDI never delivers, or a CPU `ID3D12Fence::Signal` §10.3 says never reaches the driver. Both are waits the runtime **already considers satisfied**, so dropping is exactly right, and `CreateFence(1)` + `queue->Wait(f, 1)` is a common idiom. Reporting it would answer a legal call with *"Removing device due to bad UMD error"* — `descriptors.rs`'s scar |
+//! | it is **> 0** and `Value` is above the watermark | `FenceWaitNotForwarded` | dropped, counted, **reported through `pfnSetErrorCb`** | this driver *is* on that fence's timeline and is being asked for ordering beyond what it has issued. There is no reading under which dropping it is correct, and silently dropping it is the *"an empty scene with a score"* failure shape this project has burned sessions on |
+//!
+//! ⛔ **And the first arm is NOT clean, which is stated here rather than hidden in a
+//! counter's grading.** A CPU `Signal` that has *not happened yet* — `queueB->Wait(f,
+//! N)` followed later by `fence->Signal(N)` from the CPU — is **indistinguishable at
+//! this DDI** from the already-satisfied case, because the driver is never told the
+//! initial value and never sees a CPU signal. It lands in `FenceWaitRuntimeOwned`
+//! and it is a real ordering gap. Forwarding it instead is not an option: the engine
+//! fence can never reach `N`, so an engine wait for it blocks that vkd3d queue
+//! **forever**. ⇒ the counter's grading says exactly this, and the only real fix is
+//! the runtime's monitored fence, which §10.4 proves this driver cannot reach.
+//!
+//! ⚠ **Shared fences are the third source and they are not separable either.**
+//! `D3D12DDI_FENCE_FLAGS` has no shared bit at all (see below), so a fence shared
+//! through `D3DKMTShareObjects` on the runtime's own kernel handle arrives here
+//! looking exactly like any other. It belongs with the shared-handle work, not with
+//! a counter here.
 //!
 //! # ⚠ The two fence shapes this driver cannot honour, and what it does instead
 //!
@@ -90,11 +137,14 @@
 //!   command-processor front-end time. ⛔ §10.4: *"Do not claim
 //!   `BOTTOM_OF_PIPE` semantics the stack cannot deliver."* Forwarding to
 //!   `ID3D12CommandQueue::Signal` does give bottom-of-pipe ordering **within the
-//!   engine** — vkd3d signals the timeline semaphore after the submission — but
-//!   the WDDM half, where the frame's own producer completion lives
-//!   (`PresentWmk`, CLAUDE.md's fence invariant), is not written yet. The flag is
-//!   accepted and **counted**, so the day that half lands the counter says how
-//!   often it mattered.
+//!   engine** — vkd3d signals the timeline semaphore after the submission — and
+//!   the WDDM half is `pfnExecuteCommandLists`' `pfnRenderCb` packet carrying the
+//!   frame's own completion boundary (`EclFenceSampled`, `PresentWmk`,
+//!   CLAUDE.md's fence invariant), which is knob-gated and **off by default**
+//!   (A1, `knobs12::UMD12_ECL_DRAIN`). ⛔ It is **not** a queued software signal
+//!   packet on this fence — that design is struck and forbidden, see above. The
+//!   flag is accepted and **counted**, so the counter says how often it mattered
+//!   on a run whose boundary was real.
 //!
 //! ⚠ **There is no shared / cross-adapter fence flag at this DDI.**
 //! `D3D12DDI_FENCE_FLAGS` has exactly two enumerators, `NONE = 0x0` and
@@ -215,6 +265,17 @@ pub struct FenceState {
     /// the *only* such bound the DDI gives this driver — the initial value and
     /// every CPU signal are invisible here.
     signalled_watermark: AtomicU64,
+    /// How many queue-level signals this driver has **issued** on
+    /// [`Self::engine`].
+    ///
+    /// ⛔ **Not derivable from [`Self::signalled_watermark`], and that is why it
+    /// exists rather than being a `> 0` test on the watermark.** A legal
+    /// `pfnSignalFence` with `Value = 0` raises no watermark, so a zero watermark
+    /// cannot distinguish *"this driver has never touched this fence's timeline"*
+    /// from *"this driver signalled 0 on it"* — and the module doc's two dropped-wait
+    /// arms turn on exactly that distinction. One `AtomicU64` removes the ambiguity
+    /// instead of arguing that `Signal(0)` never happens.
+    signals_issued: AtomicU64,
 }
 
 impl FenceState {
@@ -237,8 +298,28 @@ impl FenceState {
     ///
     /// `fetch_max` because D3D12 fence values are not required to arrive in
     /// order and a lower one must not lower the bound.
+    ///
+    /// ⚠ **The count is bumped BEFORE the watermark**, and the order matters for
+    /// exactly one reader: `queue::fence_operation`'s wait arm reads the count to
+    /// choose between a benign drop and a device-removing report. Publishing
+    /// *"this driver is on this fence's timeline"* before publishing *how far* is
+    /// the conservative order — a concurrent wait can then see the count and a
+    /// stale watermark, which routes it to the **loud** arm; the reverse order
+    /// could route a genuine ordering gap to the silent one.
     pub(crate) fn note_signal(&self, value: u64) {
+        self.signals_issued.fetch_add(1, Ordering::AcqRel);
         self.signalled_watermark.fetch_max(value, Ordering::AcqRel);
+    }
+
+    /// Whether this driver has issued **any** signal on this fence's engine
+    /// timeline.
+    ///
+    /// `false` means the fence's whole timeline is the runtime's — a
+    /// `CreateFence` initial value and/or CPU `ID3D12Fence::Signal`s, neither of
+    /// which reaches this DDI (`DDI_REFERENCE.md` §10.3) — which is the module
+    /// doc's first dropped-wait arm.
+    pub(crate) fn driver_signals_issued(&self) -> bool {
+        self.signals_issued.load(Ordering::Acquire) != 0
     }
 
     /// Whether this driver's own engine timeline can reach `value`.
@@ -514,6 +595,10 @@ unsafe extern "C" fn create_fence(
             // must start where the engine timeline starts and not where the
             // runtime's monitored fence does — which the DDI never says.
             signalled_watermark: AtomicU64::new(0),
+            // 0 signals issued: nothing on this fence's engine timeline is this
+            // driver's yet, which is what routes a wait arriving now to the
+            // module doc's benign `FenceWaitRuntimeOwned` arm.
+            signals_issued: AtomicU64::new(0),
         });
     }
     S_OK
@@ -753,11 +838,17 @@ pub(crate) struct L7Refusals {
     ///
     /// ⚠ **Expected non-zero, and it is a coupling rather than a fault.**
     /// `ID3D12CommandQueue::Signal` on the vkd3d queue does retire behind that
-    /// queue's submitted work, so the engine half is honoured. The WDDM half —
-    /// the queued software signal packet ordered behind the frame's own producer
-    /// completion (`DDI_REFERENCE.md` §10.4, CLAUDE.md's `PresentWmk` fence
-    /// invariant) — is not written yet. This counter is how the lane that writes
-    /// it learns how often the flag actually arrives.
+    /// queue's submitted work, so the engine half is honoured.
+    ///
+    /// ⛔ **The WDDM half this doc used to name — *"the queued software signal
+    /// packet"* on this fence — CANNOT EXIST.** `DDI_REFERENCE.md` §10.4's
+    /// correction block (`:2306-2331`) struck it, because every `pfnSignal*Cb`
+    /// names its target by `D3DKMT_HANDLE` and `D3D12DDIARG_CREATE_FENCE` carries
+    /// none; `KMD_IMPACT.md` §14a.5 forbids the design by name. The real WDDM half
+    /// is the `pfnRenderCb` packet `pfnExecuteCommandLists` submits with the
+    /// frame's own GPU-completion boundary (`EclFenceSampled`) — which is off by
+    /// default under A1 (`knobs12::UMD12_ECL_DRAIN`). ⇒ read this counter beside
+    /// `EclFenceSampled`, not beside a lane that will never be written.
     fence_bottom_of_pipe_unproven: RefusalCounter,
     /// A `D3D12DDI_FENCE::Flags` carried a bit outside the two enumerators
     /// `d3d12umddi.h` defines. **Expected 0**; a hit means the header this build

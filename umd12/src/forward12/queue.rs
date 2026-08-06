@@ -3054,10 +3054,40 @@ impl FenceOp {
 /// `fence::FenceState`'s module doc has the two reachable ways the shadow gets
 /// behind the runtime's fence (a `CreateFence` initial value and a CPU
 /// `ID3D12Fence::Signal`, neither of which reaches this DDI). ⇒ a wait above the
-/// watermark this driver has itself signalled is **not forwarded**: it is counted
-/// as `FenceWaitNotForwarded` and left to the ordering §10.3 says the runtime
-/// performs itself. Read `fence.rs`'s module doc before changing either arm — the
-/// cost of that choice is named there too.
+/// watermark this driver has itself signalled is **not forwarded**. Read
+/// `fence.rs`'s module doc before changing either arm — the cost of that choice is
+/// named there too.
+///
+/// # ⛔⛔ S-2: a dropped wait has TWO arms, and only one of them may be quiet
+///
+/// A dropped GPU wait is *wrong pixels, silently* whenever the app really needed
+/// the ordering, and this driver's DMA packets carry no GPU commands, so a `Wait`
+/// enforced only in the kernel orders nothing at all. The single
+/// `FenceWaitNotForwarded` counter that used to absorb every drop therefore could
+/// not distinguish a correct no-op from a correctness failure. It is split:
+///
+/// * **`FenceWaitRuntimeOwned`** — this driver has issued *no* signal on that
+///   fence ([`fence::FenceState::driver_signals_issued`] is false). The value's
+///   whole provenance is the runtime's: a `CreateFence(InitialValue = N)` the DDI
+///   never delivers, or a CPU `ID3D12Fence::Signal` §10.3 says never reaches the
+///   driver — both **already satisfied**, so dropping is exactly right, and
+///   `CreateFence(1)` + `queue->Wait(f, 1)` is a common idiom. ⛔ Quiet, because
+///   answering a legal call with `pfnSetErrorCb` means *"Removing device due to
+///   bad UMD error"* (`descriptors.rs`'s scar). ⚠ Its grading records the
+///   indistinguishable bad case.
+/// * **`FenceWaitNotForwarded`** — this driver *has* signalled that fence and is
+///   being asked to wait beyond what it issued. **Loud**: there is no reading
+///   under which dropping this is correct, so it goes to `pfnSetErrorCb`.
+///
+/// ⛔ **`pfnSetErrorCb`, not `pfnSetCommandListErrorCb`, and that is decided by
+/// the TABLE and not by severity.** `pfnWaitForFence` is on
+/// `D3D12DDI_COMMAND_QUEUE_FUNCS_CORE_0001` — there is no command list to
+/// quarantine and no per-queue error callback in
+/// `D3D12DDI_CORELAYER_DEVICECALLBACKS_0062` — which is the identical conclusion
+/// [`report_ecl_submit_error`] reaches for the sibling queue-table failure and the
+/// same one the engine-failure path below already takes. The list-scoped callback
+/// sits one field below the device one and using it here would report a queue's
+/// failure against an arbitrary list, or against no list at all.
 ///
 /// # Safety
 /// `h_queue` must be a live queue handle and `op_arg` must address one writable
@@ -3067,6 +3097,25 @@ unsafe fn fence_operation(
     h_queue: ddi12::D3D12DDI_HCOMMANDQUEUE,
     op_arg: *mut ddi12::D3D12DDIARG_FENCE_OPERATION,
 ) {
+    // ⭐⭐ THE ENTRY IS COUNTED, per direction, as the FIRST statement — above even
+    // the null check, because the question it answers is *"did the runtime enter this
+    // slot"* and a refused argument is still an entry.
+    //
+    // ⛔ This is S-2's instrument and it is not a duplicate of the six counters
+    // below. `KMD_IMPACT.md` §14a.5 and the 83rd session both state *"`pfnSignalFence`
+    // is never called"*, resting on `FenceSignalForwarded = 0` plus *"no trace line
+    // ever emitted"* — and the trace line is gated on `Umd12Trace`, which is OFF by
+    // default, so the second half of that evidence was unavailable on every default
+    // run. The remaining counters cannot substitute: `FenceOpBadArg`,
+    // `FenceOpFenceMissing` and `FenceOpEngineFailed` are SHARED between the two
+    // directions, so no arithmetic over them recovers "how many times did the runtime
+    // enter `pfnSignalFence`". These two do, in one number each, with no knob in the
+    // path. `METHOD.md` §5's *"trusting a zero"* is the anti-pattern they close.
+    note_refusal(match which {
+        FenceOp::Signal => &L2_REFUSALS.fence_signal_entered,
+        FenceOp::Wait => &L2_REFUSALS.fence_wait_entered,
+    });
+
     if op_arg.is_null() {
         note_refusal(&L2_REFUSALS.fence_op_bad_arg);
         return;
@@ -3108,15 +3157,69 @@ unsafe fn fence_operation(
         FenceOp::Signal => fence_state.note_signal(op.Value),
         FenceOp::Wait => {
             if !fence_state.signal_reachable(op.Value) {
-                note_refusal(&L2_REFUSALS.fence_wait_not_forwarded);
-                if let Some(n) = budget(&FENCE_OP_LOG) {
-                    log_error!(
-                        "WaitForFence: value={} is above this driver's signalled watermark -- not \
-                         forwarded, because an engine wait for a value the engine timeline cannot \
-                         reach never completes (x{})",
-                        op.Value,
-                        n + 1,
-                    );
+                // ⛔ THE SPLIT — see this function's S-2 section. Which arm a dropped
+                // wait takes is decided by whether this driver is on that fence's
+                // engine timeline at all, because that is the only thing the DDI
+                // makes observable.
+                if fence_state.driver_signals_issued() {
+                    // ⛔ LOUD. This driver has signalled this fence, so the value is
+                    // ordering it is being asked for and is refusing. There is no
+                    // reading under which dropping it is correct.
+                    note_refusal(&L2_REFUSALS.fence_wait_not_forwarded);
+                    if let Some(n) = budget(&FENCE_OP_LOG) {
+                        log_error!(
+                            "WaitForFence: value={} is above this driver's signalled watermark on a \
+                             fence it HAS signalled -- the wait is real cross-queue ordering and \
+                             cannot be forwarded (an engine wait for an unreachable value never \
+                             completes), so it is reported to the runtime (x{})",
+                            op.Value,
+                            n + 1,
+                        );
+                    }
+                    // ⛔ `E_FAIL`, and the code is argued rather than picked. It is
+                    // not `E_INVALIDARG`: the wait is LEGAL D3D12 and blaming the
+                    // application would be the wrong half of §9.12's app-vs-driver
+                    // distinction. It is not the engine's HRESULT either — no engine
+                    // call was made. What happened is that this driver cannot
+                    // represent the requested ordering, which is a driver error with
+                    // no more specific code in the DDI's set.
+                    //
+                    // ⚠ It removes the `ID3D12Device`, and that severity is the point:
+                    // silently dropping the wait yields wrong pixels *with a score*,
+                    // which is the failure shape `PENDING.md` S-4 and this project's
+                    // history both name as the worst outcome. No knob softens it —
+                    // `report_ecl_submit_error` records why one was tried and backed
+                    // out (`METHOD.md` §2 Phase 4).
+                    //
+                    // SAFETY: `h_device` is the device this queue was created against;
+                    // the borrow lives only until the end of this statement.
+                    let reported = unsafe { device12::device(queue.h_device) }
+                        .is_some_and(|dev| device12::set_error(dev, E_FAIL));
+                    if !reported {
+                        note_refusal(&L2_REFUSALS.queue_set_error_unavailable);
+                    }
+                } else {
+                    // ⚠ QUIET, and correct for the reachable-and-legal case: this
+                    // driver has never signalled this fence, so the value can only
+                    // have come from a `CreateFence(InitialValue)` or a CPU
+                    // `ID3D12Fence::Signal` — both of which the runtime already
+                    // considers satisfied. `CreateFence(1)` + `queue->Wait(f, 1)` is a
+                    // common idiom and must not remove the device.
+                    //
+                    // ⛔ The counter's grading carries the case this cannot tell apart
+                    // (a CPU signal that has not happened YET), because that one is a
+                    // genuine gap with no channel to report it through and no way to
+                    // forward it without hanging the engine queue forever.
+                    note_refusal(&L2_REFUSALS.fence_wait_runtime_owned);
+                    if let Some(n) = budget(&FENCE_OP_LOG) {
+                        log_error!(
+                            "WaitForFence: value={} on a fence this driver has never signalled -- \
+                             its whole timeline is the runtime's (initial value or CPU Signal), so \
+                             the wait is dropped as already-satisfied (x{})",
+                            op.Value,
+                            n + 1,
+                        );
+                    }
                 }
                 return;
             }
@@ -3513,32 +3616,42 @@ pub(crate) struct L2Refusals {
     /// `ID3D12CommandQueue::Signal` or `::Wait` on the engine failed, and the
     /// failure was raised to the runtime through `pfnSetErrorCb`. **Expected 0.**
     fence_op_engine_failed: RefusalCounter,
-    /// `pfnWaitForFence` asked for a `Value` above the watermark this driver has
-    /// itself signalled on that fence, so the wait was **not forwarded** to the
-    /// engine.
+    /// `pfnWaitForFence` asked for a `Value` above the watermark **on a fence this
+    /// driver HAS signalled**, so real cross-queue ordering was dropped — and the
+    /// drop was raised to the runtime through `pfnSetErrorCb`, which removes the
+    /// `ID3D12Device`.
     ///
-    /// ⚠ **May legitimately be non-zero, and it is the instrument that tells the
-    /// two cases apart.** Three things land here: a `CreateFence(InitialValue)`
-    /// the DDI never delivers, a CPU `ID3D12Fence::Signal` that
-    /// `DDI_REFERENCE.md` §10.3 says never reaches the driver, and a legal
-    /// wait-before-signal. The first two are waits the runtime already considers
-    /// satisfied and forwarding them would hang the engine queue forever; the
-    /// third is real ordering this driver is dropping until §10.4's
-    /// `pfnWaitForSynchronizationObjectFromGpuCb` half exists. ⛔ A large count
-    /// next to visible cross-queue corruption is the third case and is a finding;
-    /// see `fence.rs`'s module doc.
+    /// ⛔⛔ **Expected 0, and RE-GRADED: this counter used to absorb three cases and
+    /// was graded *"may legitimately be non-zero"*.** It no longer does. The benign
+    /// two moved to `FenceWaitRuntimeOwned`, and what is left is the one case with no
+    /// honest reading: this driver is on that fence's engine timeline and is being
+    /// asked for a value it has not issued. Forwarding would block the vkd3d queue
+    /// forever; dropping silently produces wrong pixels. ⇒ it is loud.
+    ///
+    /// ⛔ The old grading also named a fix that **cannot exist** — *"until §10.4's
+    /// `pfnWaitForSynchronizationObjectFromGpuCb` half exists"*. §10.4's own
+    /// correction block (`DDI_REFERENCE.md:2306-2331`) struck that design because no
+    /// such callback can name a `D3D12DDI_HFENCE`, and `KMD_IMPACT.md` §14a.5
+    /// forbids it. Nothing pending closes this gap; `fence.rs`'s module doc has what
+    /// would.
     fence_wait_not_forwarded: RefusalCounter,
     /// `pfnSignalFence` reached its engine forward and
     /// `ID3D12CommandQueue::Signal` returned success.
     ///
-    /// ⚠ **Expected NON-ZERO once any D3D12 workload signals a fence. A zero
-    /// here means the runtime never enters this slot at all** — a fact the
-    /// `pfnRenderCb` WDDM submission design has to accommodate, because nothing
-    /// this driver does *inside* `pfnSignalFence` can then be part of the
-    /// ordering (`tmp/dx12/FENCE-BRIDGE-DESIGN.md` §5 step 2). It is also
-    /// `DDI_REFERENCE.md` §14.0's WARP reading, which measured WARP never
-    /// entering this slot across 20 frames of `ID3D12CommandQueue::Signal` +
-    /// `SetEventOnCompletion`.
+    /// ⚠ **Expected NON-ZERO once any D3D12 workload signals a fence.**
+    ///
+    /// ⛔ **RE-GRADED: a zero here does NOT mean "the runtime never enters this
+    /// slot".** That inference was in this doc and it was unsound — a zero is equally
+    /// consistent with entering and being diverted by `FenceOpBadArg`,
+    /// `FenceOpFenceMissing` or `FenceOpEngineFailed`, all three of which are shared
+    /// with `pfnWaitForFence` and so cannot be attributed to a direction.
+    /// **`FenceSignalEntered` is the counter that answers it**, and it was added
+    /// (S-2) precisely because this one was being read as if it did. `METHOD.md` §5,
+    /// *"trusting a zero"*.
+    ///
+    /// ⚠ `DDI_REFERENCE.md` §14.0's WARP reading — WARP never entering this slot
+    /// across 20 frames of `ID3D12CommandQueue::Signal` + `SetEventOnCompletion` — is
+    /// still the expected shape, and still not evidence either way about this driver.
     ///
     /// ⭐ **Why a success counter exists at all**, against this file's own
     /// convention that counters name refusals: until it did, `pfnSignalFence`
@@ -3555,10 +3668,14 @@ pub(crate) struct L2Refusals {
     /// reason for existing as [`Self::fence_signal_forwarded`].
     ///
     /// ⚠ Expected non-zero only on a workload that waits on a value this driver
-    /// has itself signalled: everything above that watermark is refused by
-    /// `FenceWaitNotForwarded` before it can reach the forward. ⇒ read the two
-    /// together — `FenceWaitForwarded = 0` with `FenceWaitNotForwarded > 0` is
-    /// the shadow-fence policy working, not a dead slot.
+    /// has itself signalled: everything above that watermark is diverted by
+    /// `FenceWaitRuntimeOwned` (benign) or `FenceWaitNotForwarded` (loud) before it
+    /// can reach the forward. ⇒ read all three together —
+    /// `FenceWaitForwarded = 0` with `FenceWaitRuntimeOwned > 0` is the shadow-fence
+    /// policy working on runtime-owned timelines, whereas
+    /// `FenceWaitNotForwarded > 0` is dropped ordering and removes the device.
+    /// ⛔ And read `FenceWaitEntered` first: only that one distinguishes any of this
+    /// from a slot the runtime never enters.
     fence_wait_forwarded: RefusalCounter,
     /// `pfnExecuteCommandLists` forwarded a submit to the engine's
     /// `ID3D12CommandQueue::ExecuteCommandLists`.
@@ -3777,6 +3894,55 @@ pub(crate) struct L2Refusals {
     /// was actually taken on this run, which is what CLAUDE.md rule 2 asks of a
     /// deliberately reduced path.
     ecl_fence_no_drain: RefusalCounter,
+    /// ⭐ **S-2's entry instrument: the runtime entered `pfnSignalFence`.** Counted as
+    /// the function's first statement, above the null-argument check, so it counts
+    /// *entries* and not successes.
+    ///
+    /// ⛔ **This is the number that settles *"`pfnSignalFence` is never called"***
+    /// (`KMD_IMPACT.md` §14a.5, the 83rd session). That claim rested on
+    /// `FenceSignalForwarded = 0` plus *"no trace line ever emitted"* — and the trace
+    /// line is gated on `Umd12Trace`, **off by default**, so half the evidence did not
+    /// exist on a default run. The other counters cannot substitute: `FenceOpBadArg`,
+    /// `FenceOpFenceMissing` and `FenceOpEngineFailed` are shared between the two
+    /// directions, so no arithmetic over them recovers a per-direction entry count.
+    ///
+    /// ⚠ `FenceSignalEntered > 0` with `FenceSignalForwarded == 0` is a completely
+    /// different finding from both being 0, and before this counter the two were
+    /// indistinguishable.
+    fence_signal_entered: RefusalCounter,
+    /// ⭐ **S-2's entry instrument for `pfnWaitForFence`.** Same construction and the
+    /// same reason as [`Self::fence_signal_entered`].
+    ///
+    /// ⚠ Its partition is exact and worth checking as arithmetic:
+    /// `FenceWaitEntered == FenceWaitForwarded + FenceWaitRuntimeOwned +
+    /// FenceWaitNotForwarded +` (that direction's share of `FenceOpBadArg` /
+    /// `FenceOpFenceMissing` / `FenceOpEngineFailed`). A run where
+    /// `FenceWaitEntered` exceeds everything accountable is a path this file does not
+    /// know it has.
+    fence_wait_entered: RefusalCounter,
+    /// `pfnWaitForFence` asked for a value on a fence **this driver has never
+    /// signalled**, so the wait was dropped as already-satisfied.
+    ///
+    /// ⚠ **Expected NON-ZERO and correct in the reachable-and-legal case**: a
+    /// `CreateFence(InitialValue = N)` — the DDI carries no initial value
+    /// (`D3D12DDIARG_CREATE_FENCE` is `{FenceCount, Fences}`) — or a CPU
+    /// `ID3D12Fence::Signal` that `DDI_REFERENCE.md` §10.3 says never reaches the
+    /// driver. Both are waits the runtime **already considers satisfied**, so
+    /// dropping them is exact rather than approximate, and `CreateFence(1)` +
+    /// `queue->Wait(f, 1)` is a common idiom this driver must not answer by removing
+    /// the device.
+    ///
+    /// ⛔⛔ **AND IT IS NOT CLEAN, which is the whole reason it is graded here rather
+    /// than called benign.** A CPU `Signal` that has **not happened yet** —
+    /// `queueB->Wait(f, N)` and only later `fence->Signal(N)` from the CPU — is
+    /// **indistinguishable** from the satisfied case at this DDI, and it is a real
+    /// ordering gap that yields wrong pixels. It cannot be routed elsewhere (nothing
+    /// observable separates it) and it cannot be forwarded (the engine fence can
+    /// never reach `N`, so the engine wait would block that vkd3d queue forever).
+    /// ⇒ **a large count next to visible cross-queue corruption is this case**, and
+    /// the only real fix is the runtime's monitored fence — which §10.4's correction
+    /// proves this driver can never name.
+    fence_wait_runtime_owned: RefusalCounter,
 }
 
 pub(crate) static L2_REFUSALS: L2Refusals = L2Refusals {
@@ -3840,6 +4006,9 @@ pub(crate) static L2_REFUSALS: L2Refusals = L2Refusals {
     ecl_fence_status_bad: RefusalCounter::new("EclFenceStatusBad"),
     ecl_drain_disabled: RefusalCounter::new("EclDrainDisabled"),
     ecl_fence_no_drain: RefusalCounter::new("EclFenceNoDrain"),
+    fence_signal_entered: RefusalCounter::new("FenceSignalEntered"),
+    fence_wait_entered: RefusalCounter::new("FenceWaitEntered"),
+    fence_wait_runtime_owned: RefusalCounter::new("FenceWaitRuntimeOwned"),
 };
 
 /// L2's refusal counters, printed by `crate::log_refusal_summary` at this
@@ -3937,6 +4106,14 @@ pub(crate) static REFUSALS: &[&RefusalCounter] = &[
     // that arm cannot produce. Same append-only rule as every block above.
     &L2_REFUSALS.ecl_drain_disabled,
     &L2_REFUSALS.ecl_fence_no_drain,
+    // ⛔ APPENDED, S-2. Two ENTRY counters (the only per-direction instrument for
+    // "did the runtime enter this slot", which no arithmetic over the shared
+    // `FenceOp*` counters can recover) and the benign half of the dropped-wait
+    // split. `FenceWaitNotForwarded` keeps its position above and its NAME, and
+    // only its meaning narrowed — moving it would shift eleven counters.
+    &L2_REFUSALS.fence_signal_entered,
+    &L2_REFUSALS.fence_wait_entered,
+    &L2_REFUSALS.fence_wait_runtime_owned,
 ];
 
 // ⚠ `Hresult` is imported for the `E_*`/`S_OK` constants this file returns; the
