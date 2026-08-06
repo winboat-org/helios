@@ -2293,7 +2293,7 @@ pub(crate) unsafe fn engine_command_signature(
 /// ⚠ **And the offset check is not conditional on DGC**, which is why the refusal is
 /// keyed on the argument TYPES and not on "does the engine have DGC". Any signature
 /// with a non-action argument before its action has a non-zero
-/// `argument_buffer_offset_for_command` (`command.c:26305-26385` sets it to the byte
+/// `argument_buffer_offset_for_command` (`command.c:26306-26383` sets it to the byte
 /// offset of the action) and takes the skip above regardless. There is even a
 /// pathological middle case — `[CONSTANT{Num32BitValuesToSet: 0}, DRAW]`, whose
 /// offset stays 0 — where the draw *would* execute with the root constants silently
@@ -2323,7 +2323,7 @@ pub(crate) unsafe fn engine_command_signature(
 ///
 /// ⚠ The root signature is **forwarded as given**, including when it is non-null on
 /// an action-only signature — a case vkd3d answers `E_INVALIDARG`
-/// (`command.c:26417-26424`: *"Command signature does not require root signature"*).
+/// (`command.c:26421-26425`: *"Command signature does not require root signature"*).
 /// Passing `None` instead would make such a call succeed, and nothing semantic would
 /// be lost, but it would be this driver silently discarding something the
 /// application passed. `CommandSignatureRootSigUnexpected` counts it so the decision
@@ -2423,7 +2423,7 @@ unsafe extern "C" fn create_command_signature(
     }
     // ⛔⛔ THE LOUD REFUSAL S-4 EXISTS FOR. `count != 1` and `state_template` are one
     // condition in practice — vkd3d requires exactly one action and requires it LAST
-    // (`command.c:26385-26402`), and every non-action class sets
+    // (`command.c:26385-26401`), and every non-action class sets
     // `requires_state_template` — but they are tested together rather than assumed
     // equivalent, because the equivalence is a property of the engine's validator
     // and not of the DDI.
@@ -2497,7 +2497,7 @@ unsafe extern "C" fn create_command_signature(
         ..Default::default()
     };
     // ⚠ `ByteStride` and `NodeMask` are forwarded verbatim. The stride's minimum is
-    // the engine's own validation (`command.c:26404-26410` refuses a stride below
+    // the engine's own validation (`command.c:26409-26414` refuses a stride below
     // the computed signature size) and duplicating it here would be a second
     // authority that can drift; `NodeMask`'s only legal values on a one-node adapter
     // are 0 and 1 and both mean "the single node" to vkd3d, so narrowing it would
@@ -4377,7 +4377,7 @@ pub(crate) struct L2Refusals {
     /// `S_OK` with no object.
     ///
     /// ⚠ **May legitimately be non-zero**: vkd3d validates the stride against the
-    /// computed signature size (`command.c:26404-26410`) and the root-signature
+    /// computed signature size (`command.c:26409-26414`) and the root-signature
     /// pairing (`:26412-26424`), and this driver forwards both verbatim rather than
     /// duplicating checks that would then be a second authority able to drift.
     /// ⇒ read it beside `CommandSignatureRootSigUnexpected`.
@@ -4386,7 +4386,7 @@ pub(crate) struct L2Refusals {
     /// `hRootSignature`, which this driver forwarded as given.
     ///
     /// ⚠ **Expected 0, and a hit is a decision to revisit rather than a fault.**
-    /// vkd3d refuses that pairing (`command.c:26417-26424`: *"Command signature does
+    /// vkd3d refuses that pairing (`command.c:26421-26425`: *"Command signature does
     /// not require root signature, root signature must be NULL"*), so a hit here
     /// arrives with `CommandSignatureEngineFailed` and the application's create
     /// fails. Passing `None` instead would make it succeed and lose nothing semantic

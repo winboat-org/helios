@@ -1832,11 +1832,15 @@ unsafe fn buffer_placement<'a>(
 /// `multiDrawIndirect` (`docs/dx12/research/guest-vulkaninfo-full.txt:1237`,
 /// `:1632`).
 ///
-/// ⛔ A **null argument buffer** is the one thing refused here, and it is refused
-/// because the engine dereferences it unconditionally:
-/// `impl_from_ID3D12Resource(arg_buffer)` at `command.c:17763` is a
-/// `CONTAINING_RECORD`-style cast, and `arg_impl->res.cookie.index` is read before
-/// any null test. A null count buffer is fine — the engine tests it everywhere.
+/// ⛔ A **null argument buffer** is the one thing refused here, and the reason is
+/// re-derived rather than assumed: `impl_from_ID3D12Resource` *does* fold a null
+/// interface to a null `struct d3d12_resource *` (`vkd3d_private.h:1317-1318`), so
+/// the cast itself is safe — but `arg_impl` is then **dereferenced with no null
+/// test** on the ordinary path, at `scratch.buffer = arg_impl->res.vk_buffer`
+/// (`command.c:17880-17882`) and inside every `vkCmdDraw*Indirect*` call
+/// (`:17897-17905`). ⇒ forwarding a null is an access violation inside the engine,
+/// not a dropped draw. A null **count** buffer is fine — the engine tests
+/// `count_impl` everywhere it uses it.
 ///
 /// # Safety
 /// `h_list` must be a live handle from `queue::create_command_list`; `h_signature` a
@@ -1878,10 +1882,10 @@ unsafe extern "C" fn execute_indirect(
         return;
     };
     // ⛔ The argument buffer is MANDATORY, and refusing a missing one is not
-    // defensive: `d3d12_command_list_ExecuteIndirect` casts `arg_buffer` with no null
-    // test and reads `arg_impl->res.cookie.index` before any check
-    // (`command.c:17763`, `:17797`), so forwarding a null is an access violation
-    // inside the engine rather than a dropped draw.
+    // defensive: the engine's cast folds null to null, but it then dereferences
+    // `arg_impl` with no null test at `command.c:17880-17882` and in every
+    // `vkCmdDraw*Indirect*` call (`:17897-17905`), so forwarding a null is an access
+    // violation inside the engine rather than a dropped draw. See this slot's doc.
     //
     // SAFETY: the placement arrived by value from the runtime and is initialised;
     // its `hResource`, when non-null, is a live resource handle.
@@ -2350,11 +2354,12 @@ pub(crate) struct L3aRefusals {
     /// `pfnExecuteIndirect`'s **argument** buffer placement named no resource, so the
     /// call was refused and reported.
     ///
-    /// ⛔ **Expected 0, and refusing is not defensive.** `d3d12_command_list_
-    /// ExecuteIndirect` casts the argument buffer with no null test and reads
-    /// `arg_impl->res.cookie.index` before any check (`command.c:17763`, `:17797`),
-    /// so forwarding a null is an access violation inside the engine — a crashed
-    /// process rather than a dropped draw.
+    /// ⛔ **Expected 0, and refusing is not defensive.**
+    /// `d3d12_command_list_ExecuteIndirect`'s cast folds a null interface to a null
+    /// `struct d3d12_resource *` (`vkd3d_private.h:1317-1318`) and then dereferences
+    /// it with no test at `command.c:17880-17882` and in every `vkCmdDraw*Indirect*`
+    /// call (`:17897-17905`), so forwarding a null is an access violation inside the
+    /// engine — a crashed process rather than a dropped draw.
     execute_indirect_arg_buffer_missing: RefusalCounter,
     /// `pfnExecuteIndirect`'s **count** buffer handle was non-null and carried no
     /// engine resource, so the call was refused and reported.
