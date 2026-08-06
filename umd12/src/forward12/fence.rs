@@ -320,6 +320,48 @@ pub(crate) unsafe fn fence_state<'a>(h: ddi12::D3D12DDI_HFENCE) -> Option<&'a Fe
 }
 
 // ---------------------------------------------------------------------------
+// ⭐ The query-heap seam — L3c's door into L7 (the ONE accessor L3c may add)
+// ---------------------------------------------------------------------------
+
+/// The engine `ID3D12QueryHeap` behind a DDI query-heap handle, borrowed for
+/// the caller's DDI call.
+///
+/// ⭐ **`pub(crate)` and named, because the payload of `D3D12DDI_HQUERYHEAP` is
+/// declared exactly once — by the `com_handles!` invocation at the top of this
+/// file.** L3c (`copy.rs`) owns `pfnBeginQuery`, `pfnEndQuery` and
+/// `pfnResolveQueryData`, all three of which need the engine heap behind this
+/// handle, and `ARCHITECTURE.md` §12 rule 7 / R803 is the scar that says the
+/// payload must be derived from the handle **type** in one place rather than
+/// decoded at each call site. L7 owns the handle, so this is that one place —
+/// the same shape [`fence_state`] takes for `D3D12DDI_HFENCE` and
+/// `resource12::engine_resource` takes for `D3D12DDI_HRESOURCE`.
+///
+/// ⚠ **A `ManuallyDrop`, not a shared reference, and that is the slot's shape
+/// rather than a weaker choice.** `resource12`'s accessor can hand back `&T`
+/// because a resource's owning reference lives in a `Box<ResourceState>` field
+/// there is something to borrow *from*; a query heap is a bare `Slot<Com<_>>`
+/// whose whole content is one raw COM word, so the only way to name it as an
+/// interface is to rebuild the wrapper. `ManuallyDrop` is what stops that
+/// rebuilt wrapper from issuing a `Release` for the reference the slot still
+/// owns — `Slot::<Com<_>>::load`'s own documented contract, and the same
+/// pairing `pso.rs` uses for a borrowed root signature.
+///
+/// # Safety
+/// `h` must be a handle [`create_query_heap`] returned `S_OK` for and
+/// [`destroy_query_heap`] has not been called on, and the returned value must
+/// not outlive the DDI call that obtained it.
+pub(crate) unsafe fn engine_query_heap(
+    h: ddi12::D3D12DDI_HQUERYHEAP,
+) -> Option<core::mem::ManuallyDrop<ID3D12QueryHeap>> {
+    // SAFETY: the caller guarantees a live query-heap handle, so its slot lies
+    // inside the private block `calc_private_query_heap_size` sized.
+    let slot = unsafe { query_heap_slot(h) }?;
+    // SAFETY: same precondition; `load` reads the slot word and reports an empty
+    // slot as `None` rather than fabricating an interface.
+    unsafe { slot.load() }
+}
+
+// ---------------------------------------------------------------------------
 // (i) Fences — 3 slots
 // ---------------------------------------------------------------------------
 
