@@ -198,6 +198,22 @@ pub static GPU_FENCE_CLAMPED: AtomicU32 = AtomicU32::new(0);
 /// *without* a restart means a UMD is sampling fence ids from somewhere other than
 /// this transport, which is a different and worse finding.
 pub static GPU_FENCE_FOREIGN_GENERATION: AtomicU32 = AtomicU32::new(0);
+/// `WAIT_FENCE` / `REGISTER_FENCE_EVENT` refusals of a fence id from a FOREIGN
+/// transport generation — the same one-sided-bound defect as
+/// [`GPU_FENCE_FOREIGN_GENERATION`], on the two usermode-facing predicates.
+///
+/// Before this counter existed those calls returned `Complete` / `AlreadyComplete`
+/// for such an id: the ICD was told a wire fence had retired when its whole
+/// transport generation was gone, which is [`TRANSPORT_GONE_AT_WAIT`]'s failure
+/// dressed as success. Its own counter rather than [`FENCE_EVENT_INVALID`], which
+/// already pools several unrelated rejections.
+///
+/// GRADING: identical to [`GPU_FENCE_FOREIGN_GENERATION`] — 0 without a device
+/// restart, small after one. ⚠ It is NOT expected to track that counter's value:
+/// the two paths have different callers (the WDDM boundary vs the ICD's own waits),
+/// and a client that survives a restart typically has many parked waits and no
+/// WDDM submissions of its own.
+pub static FENCE_ID_FOREIGN_GENERATION: AtomicU32 = AtomicU32::new(0);
 /// Fire-and-forget control commands queued by PASSIVE workers (currently the
 /// scanout RESOURCE_FLUSH path).  These own their DMA buffers until the normal
 /// used-ring drain retires them, but never park a stack waiter.

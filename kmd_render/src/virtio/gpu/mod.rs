@@ -4424,6 +4424,13 @@ impl VirtioGpu {
     /// assigned by this transport, monotonic and never reused, and every
     /// assigned id lives in `inflight` until its used-ring completion — so
     /// `id < next_wire_fence && not in-flight` ⇒ complete.
+    ///
+    /// ⚠ "ASSIGNED BY THIS TRANSPORT" IS THE LOAD-BEARING WORD, and until
+    /// 2026-08-06 nothing tested it: the range check was one-sided, and StartDevice
+    /// strides the id space up by 2^32, so an id from a PREVIOUS generation is
+    /// below the range and reached the `Complete` arm. The ICD was then told a wire
+    /// fence had retired when its whole transport generation was gone — exactly
+    /// [`TRANSPORT_GONE_AT_WAIT`]'s failure, reported as success.
     pub fn fence_wait_prepare(
         &mut self,
         fence_id: u64,
@@ -4432,6 +4439,10 @@ impl VirtioGpu {
         // A failed transport can never retire a fence, so parking a PASSIVE
         // waiter against one is a guaranteed timeout at best.
         if self.failed || fence_id == 0 || fence_id >= self.next_wire_fence {
+            return FenceWaitPrep::Invalid;
+        }
+        if fence_id < self.wire_fence_base {
+            FENCE_ID_FOREIGN_GENERATION.fetch_add(1, Ordering::Relaxed);
             return FenceWaitPrep::Invalid;
         }
         let in_flight = self.inflight.iter().any(|e| match e.kind {
@@ -4473,8 +4484,14 @@ impl VirtioGpu {
     /// other outcome the caller still owns it and must deref.
     pub fn fence_event_register(&mut self, fence_id: u64, event: NonNull<KEVENT>) -> FenceEventReg {
         // As in fence_wait_prepare. `Invalid` leaves the object reference with
-        // the caller, per the ownership contract documented on this function.
+        // the caller, per the ownership contract documented on this function —
+        // including the foreign-generation arm below, which is why it returns
+        // `Invalid` rather than `AlreadyComplete`: the caller must still deref.
         if self.failed || fence_id == 0 || fence_id >= self.next_wire_fence {
+            return FenceEventReg::Invalid;
+        }
+        if fence_id < self.wire_fence_base {
+            FENCE_ID_FOREIGN_GENERATION.fetch_add(1, Ordering::Relaxed);
             return FenceEventReg::Invalid;
         }
         let in_flight = self.inflight.iter().any(|e| match e.kind {

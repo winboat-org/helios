@@ -240,6 +240,14 @@ pub(crate) fn record_present_handoff_telemetry() {
         b"GpuFncGen",
         crate::virtio::gpu::GPU_FENCE_FOREIGN_GENERATION.load(Ordering::Relaxed),
     );
+    // The same defect on the two usermode-facing predicates: a WAIT_FENCE or
+    // REGISTER_FENCE_EVENT naming a fence from a dead transport generation used to
+    // be answered Complete. Same grading (0 without a device restart); NOT expected
+    // to track `GpuFncGen`, whose callers are different.
+    crate::diag::record_named_bytes(
+        b"FncIdGen",
+        crate::virtio::gpu::FENCE_ID_FOREIGN_GENERATION.load(Ordering::Relaxed),
+    );
     // WHY the WDDM FIFO head was not ready. The head paces every fence behind
     // it, so this ratio names what actually paces present retirement.
     crate::diag::record_named_bytes(
