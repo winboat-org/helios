@@ -2215,7 +2215,7 @@ impl VirtioGpu {
         // chain it backed was popped above, so the device no longer references
         // it.
         drop(scratch);
-        Ok(gpu)
+        Ok(Box::new(gpu))
     }
 
     // ── C3/M3.4 queue machinery ──────────────────────────────────────────────

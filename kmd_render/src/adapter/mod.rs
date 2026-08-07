@@ -464,7 +464,9 @@ pub struct AdapterContext {
     /// unlocked state of a `KSPIN_LOCK`, so no explicit `KeInitializeSpinLock` is
     /// required (same rationale as the BAR-mapping cache in `virtio::hal`).
     virtio_lock: UnsafeCell<KSPIN_LOCK>,
-    /// The virtio-gpu transport, brought up in `DxgkDdiStartDevice` (Phase 2).
+    /// The heap-backed virtio-gpu transport, brought up in
+    /// `DxgkDdiStartDevice` (Phase 2). The `Box` is load-bearing for the kernel
+    /// boot-stack budget; see `VirtioGpu::init`.
     /// Guarded by `virtio_lock`; `None` until StartDevice (and after StopDevice).
     virtio: UnsafeCell<Option<Box<VirtioGpu>>>,
     /// PASSIVE-level serialization for scanout selection versus allocation
