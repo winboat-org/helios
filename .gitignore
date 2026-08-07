@@ -22,6 +22,8 @@ System\ Volume\ Information
 # Local environment overrides
 .env
 *.local.toml
+/.vm/
+/tibix/
 
 # Windows share junk
 $RECYCLE.BIN/

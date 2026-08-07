@@ -60,16 +60,44 @@
 # This exposes COM1 at /tmp/ntoseye-kd.sock. Configure the guest with:
 #   bcdedit /debug on
 #   bcdedit /dbgsettings serial debugport:1 baudrate:115200
+#
+# Fresh install from an ISO, using rootless user networking and a temporary
+# standard VGA adapter until the Helios driver is installed:
+#   HELIOS_NET_MODE=user HELIOS_INSTALL_ISO=/path/to/windows.iso \
+#     HELIOS_BOOTSTRAP_DISPLAY=yes bash tools/launch-helios-gtk.sh
 set -uo pipefail
 
 if [ "${HELIOS_PHASE:-}" != "user" ] && [ "$(id -u)" -ne 0 ]; then
-  exec sudo --preserve-env=HELIOS_DISPLAY,HELIOS_QEMU_BIN,HELIOS_QEMU_DATADIR,HELIOS_QEMU_MODULE_DIR,HELIOS_QEMU_RENDER_GPU,HELIOS_DISABLE_VIRTIO_GPU,HELIOS_INTEL_RENDER_NODE,HELIOS_NVIDIA_RENDER_NODE,HELIOS_LG_TRANSPORT,HELIOS_SPICE_PORT,HELIOS_VNC_ADDR,HELIOS_KVMFR_DEV,HELIOS_KVMFR_SIZE,HELIOS_LG_CLIENT,HELIOS_LG_RENDER_GPU,HELIOS_LG_DISPLAY_SERVER,HELIOS_LG_RENDERER,HELIOS_LG_ALLOW_DMA,HELIOS_LG_START_CLIENT,HELIOS_LG_RESTART_CLIENT,HELIOS_LG_CLIENT_DELAY,HELIOS_LG_CLIENT_LOG,HELIOS_INT_ACTION,HELIOS_SMP,HELIOS_SOCKETS,HELIOS_CORES,HELIOS_THREADS,HELIOS_VKR_DEBUG,HELIOS_QEMU_LOG,HELIOS_QEMU_TRACE,HELIOS_KD_SERIAL,HELIOS_KD_SOCKET,DISPLAY,WAYLAND_DISPLAY,GDK_BACKEND,SDL_VIDEODRIVER \
-    bash "$0" "$@"
+  if [ "${HELIOS_NET_MODE:-bridge}" = "user" ]; then
+    export HELIOS_PHASE=user
+  else
+    exec sudo --preserve-env=HELIOS_DISPLAY,HELIOS_QEMU_BIN,HELIOS_QEMU_DATADIR,HELIOS_QEMU_MODULE_DIR,HELIOS_QEMU_RENDER_GPU,HELIOS_DISABLE_VIRTIO_GPU,HELIOS_INTEL_RENDER_NODE,HELIOS_NVIDIA_RENDER_NODE,HELIOS_LG_TRANSPORT,HELIOS_SPICE_PORT,HELIOS_VNC_ADDR,HELIOS_KVMFR_DEV,HELIOS_KVMFR_SIZE,HELIOS_LG_CLIENT,HELIOS_LG_RENDER_GPU,HELIOS_LG_DISPLAY_SERVER,HELIOS_LG_RENDERER,HELIOS_LG_ALLOW_DMA,HELIOS_LG_START_CLIENT,HELIOS_LG_RESTART_CLIENT,HELIOS_LG_CLIENT_DELAY,HELIOS_LG_CLIENT_LOG,HELIOS_INT_ACTION,HELIOS_SMP,HELIOS_SOCKETS,HELIOS_CORES,HELIOS_THREADS,HELIOS_CPU,HELIOS_RAM_MB,HELIOS_GPU_HOSTMEM_BYTES,HELIOS_GPU_BLOB_LIMIT_BYTES,HELIOS_VKR_DEBUG,HELIOS_QEMU_LOG,HELIOS_QEMU_TRACE,HELIOS_KD_SERIAL,HELIOS_KD_SOCKET,HELIOS_SHARE,HELIOS_VM_DIR,HELIOS_DISK,HELIOS_NVRAM,HELIOS_OVMF_CODE,HELIOS_TPM_STATE_DIR,HELIOS_RUNTIME_DIR,HELIOS_VIRTIOFSD_BIN,HELIOS_SWTPM_BIN,HELIOS_NET_MODE,HELIOS_NET_DEVICE,HELIOS_SSH_PORT,HELIOS_RDP_PORT,HELIOS_INSTALL_ISO,HELIOS_BOOTSTRAP_DISPLAY,DISPLAY,WAYLAND_DISPLAY,GDK_BACKEND,SDL_VIDEODRIVER \
+      bash "$0" "$@"
+  fi
 fi
 
-USER_NAME=${SUDO_USER:-rupansh}; USER_UID=$(id -u "$USER_NAME")
-DISK=/var/lib/libvirt/images/win11.qcow2; NVRAM=/var/lib/libvirt/qemu/nvram/win11_VARS.fd
-SWSRC=/var/lib/libvirt/swtpm/bfe8dc1f-8c5b-435c-8045-1ef3a5c19053/tpm2; TPMDIR=/tmp/helios-tpm; SHARE=/home/rupansh/helios-vgpu
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+DEFAULT_SHARE=$(cd -- "$SCRIPT_DIR/.." && pwd)
+USER_NAME=${SUDO_USER:-$(id -un)}; USER_UID=$(id -u "$USER_NAME")
+SHARE=${HELIOS_SHARE:-$DEFAULT_SHARE}
+VM_DIR=${HELIOS_VM_DIR:-$SHARE/.vm}
+DISK=${HELIOS_DISK:-$VM_DIR/win11.qcow2}
+NVRAM=${HELIOS_NVRAM:-$VM_DIR/OVMF_VARS.fd}
+TPM_STATE_DIR=${HELIOS_TPM_STATE_DIR:-$VM_DIR/tpm2}
+TPMDIR=${HELIOS_RUNTIME_DIR:-${XDG_RUNTIME_DIR:-/tmp}/helios-vm}
+OVMF_CODE=${HELIOS_OVMF_CODE:-}
+if [ -z "$OVMF_CODE" ]; then
+  for ovmf_candidate in \
+    /usr/share/edk2/x64/OVMF_CODE.4m.fd \
+    /usr/share/edk2/ovmf/OVMF_CODE.fd \
+    /usr/share/OVMF/OVMF_CODE.fd; do
+    if [ -f "$ovmf_candidate" ]; then
+      OVMF_CODE=$ovmf_candidate
+      break
+    fi
+  done
+fi
+INSTALL_ISO=${HELIOS_INSTALL_ISO:-}
 DISPLAY_MODE=${HELIOS_DISPLAY:-sdl}
 QEMU_BIN=${HELIOS_QEMU_BIN:-$SHARE/qemu-helios/build-helios/qemu-system-x86_64}
 QEMU_DATADIR=${HELIOS_QEMU_DATADIR:-$SHARE/qemu-helios/pc-bios}
@@ -82,7 +110,14 @@ if [ ! -x "$QEMU_BIN" ]; then
   echo "build qemu-helios/build-helios or set HELIOS_QEMU_BIN explicitly" >&2
   exit 1
 fi
-QEMU_RENDER_GPU=${HELIOS_QEMU_RENDER_GPU:-intel}
+[ -f "$DISK" ] || { echo "missing VM disk: $DISK" >&2; exit 1; }
+[ -f "$NVRAM" ] || { echo "missing writable OVMF vars: $NVRAM" >&2; exit 1; }
+[ -n "$OVMF_CODE" ] && [ -f "$OVMF_CODE" ] || { echo "missing OVMF code; set HELIOS_OVMF_CODE" >&2; exit 1; }
+if [ -n "$INSTALL_ISO" ] && [ ! -f "$INSTALL_ISO" ]; then
+  echo "missing install ISO: $INSTALL_ISO" >&2
+  exit 1
+fi
+QEMU_RENDER_GPU=${HELIOS_QEMU_RENDER_GPU:-default}
 DISABLE_VIRTIO_GPU=${HELIOS_DISABLE_VIRTIO_GPU:-0}
 INTEL_RENDER_NODE=${HELIOS_INTEL_RENDER_NODE:-/dev/dri/renderD129}
 NVIDIA_RENDER_NODE=${HELIOS_NVIDIA_RENDER_NODE:-/dev/dri/renderD128}
@@ -105,6 +140,35 @@ SMP=${HELIOS_SMP:-16}
 SOCKETS=${HELIOS_SOCKETS:-1}
 CORES=${HELIOS_CORES:-16}
 THREADS=${HELIOS_THREADS:-1}
+CPU_MODEL=${HELIOS_CPU:-host,migratable=on,hv-time=on,hv-relaxed=on,hv-vapic=on,hv-spinlocks=0x1fff,hv-vpindex=on,hv-runtime=on,hv-synic=on,hv-stimer=on,hv-frequencies=on,hv-tlbflush=on,hv-ipi=on}
+if [ -z "${HELIOS_CPU:-}" ]; then
+  if grep -q AuthenticAMD /proc/cpuinfo 2>/dev/null; then
+    CPU_MODEL+=,hv-avic=on
+  elif grep -q GenuineIntel /proc/cpuinfo 2>/dev/null; then
+    CPU_MODEL+=,hv-evmcs=on
+  fi
+fi
+RAM_MB=${HELIOS_RAM_MB:-32768}
+GPU_HOSTMEM_BYTES=${HELIOS_GPU_HOSTMEM_BYTES:-8589934592}
+GPU_BLOB_LIMIT_BYTES=${HELIOS_GPU_BLOB_LIMIT_BYTES:-}
+RAM_BYTES=$((RAM_MB * 1024 * 1024))
+NET_MODE=${HELIOS_NET_MODE:-bridge}
+NET_DEVICE=${HELIOS_NET_DEVICE:-virtio-net-pci}
+SSH_PORT=${HELIOS_SSH_PORT:-2222}
+RDP_PORT=${HELIOS_RDP_PORT:-33890}
+BOOTSTRAP_DISPLAY=${HELIOS_BOOTSTRAP_DISPLAY:-}
+if [ -z "$BOOTSTRAP_DISPLAY" ]; then
+  [ -n "$INSTALL_ISO" ] && BOOTSTRAP_DISPLAY=yes || BOOTSTRAP_DISPLAY=no
+fi
+VIRTIOFSD_BIN=${HELIOS_VIRTIOFSD_BIN:-}
+if [ -z "$VIRTIOFSD_BIN" ]; then
+  VIRTIOFSD_BIN=$(command -v virtiofsd 2>/dev/null || true)
+  [ -n "$VIRTIOFSD_BIN" ] || [ ! -x /usr/libexec/virtiofsd ] || VIRTIOFSD_BIN=/usr/libexec/virtiofsd
+  [ -n "$VIRTIOFSD_BIN" ] || [ ! -x /usr/lib/virtiofsd ] || VIRTIOFSD_BIN=/usr/lib/virtiofsd
+fi
+SWTPM_BIN=${HELIOS_SWTPM_BIN:-$(command -v swtpm 2>/dev/null || true)}
+[ -x "$VIRTIOFSD_BIN" ] || { echo "missing virtiofsd; set HELIOS_VIRTIOFSD_BIN" >&2; exit 1; }
+[ -x "$SWTPM_BIN" ] || { echo "missing swtpm; set HELIOS_SWTPM_BIN" >&2; exit 1; }
 KD_SERIAL=${HELIOS_KD_SERIAL:-pty}
 KD_SOCKET=${HELIOS_KD_SOCKET:-/tmp/ntoseye-kd.sock}
 if [ "${HELIOS_PHASE:-}" != "user" ]; then
@@ -117,7 +181,7 @@ if [ "${HELIOS_PHASE:-}" != "user" ]; then
       wait "$USER_PHASE_PID" 2>/dev/null || true
     fi
     ip link del heltap0 2>/dev/null||true
-    chown libvirt-qemu:libvirt-qemu "$DISK" "$NVRAM" 2>/dev/null||true
+    chown "$USER_NAME" "$DISK" "$NVRAM" 2>/dev/null||true
   }
   handle_root_int() {
     if [ "$INT_ACTION" = "shutdown" ]; then
@@ -139,8 +203,8 @@ if [ "${HELIOS_PHASE:-}" != "user" ]; then
     [ -e "$KVMFR_DEV" ] || { echo "missing $KVMFR_DEV (load kvmfr first)"; exit 1; }
     chown "$USER_NAME" "$KVMFR_DEV" 2>/dev/null || true
   fi
-  mkdir -p "$TPMDIR/state"; cp -a "$SWSRC"/. "$TPMDIR/state/" 2>/dev/null || echo "WARN fresh TPM"
-  chown -R "$USER_NAME" "$TPMDIR"
+  mkdir -p "$TPMDIR" "$TPM_STATE_DIR"
+  chown -R "$USER_NAME" "$TPMDIR" "$TPM_STATE_DIR"
   ip link del heltap0 2>/dev/null||true; ip tuntap add dev heltap0 mode tap user "$USER_NAME"
   if ! ip link show virbr0 >/dev/null 2>&1; then
     virsh -c qemu:///system net-start default >/dev/null 2>&1 || true
@@ -155,9 +219,14 @@ if [ "${HELIOS_PHASE:-}" != "user" ]; then
     HELIOS_LG_RENDER_GPU="$LG_RENDER_GPU" HELIOS_LG_DISPLAY_SERVER="$LG_DISPLAY_SERVER" HELIOS_LG_RENDERER="$LG_RENDERER" HELIOS_LG_ALLOW_DMA="$LG_ALLOW_DMA" \
     HELIOS_LG_START_CLIENT="$LG_START_CLIENT" HELIOS_LG_RESTART_CLIENT="$LG_RESTART_CLIENT" \
     HELIOS_LG_CLIENT_DELAY="$LG_CLIENT_DELAY" HELIOS_LG_CLIENT_LOG="$LG_CLIENT_LOG" \
-    HELIOS_INT_ACTION="$INT_ACTION" HELIOS_SMP="$SMP" HELIOS_SOCKETS="$SOCKETS" HELIOS_CORES="$CORES" HELIOS_THREADS="$THREADS" \
+    HELIOS_INT_ACTION="$INT_ACTION" HELIOS_SMP="$SMP" HELIOS_SOCKETS="$SOCKETS" HELIOS_CORES="$CORES" HELIOS_THREADS="$THREADS" HELIOS_CPU="$CPU_MODEL" \
+    HELIOS_RAM_MB="$RAM_MB" HELIOS_GPU_HOSTMEM_BYTES="$GPU_HOSTMEM_BYTES" HELIOS_GPU_BLOB_LIMIT_BYTES="$GPU_BLOB_LIMIT_BYTES" \
     HELIOS_VKR_DEBUG="${HELIOS_VKR_DEBUG:-}" HELIOS_QEMU_LOG="${HELIOS_QEMU_LOG:-}" HELIOS_QEMU_TRACE="${HELIOS_QEMU_TRACE:-}" \
     HELIOS_KD_SERIAL="$KD_SERIAL" HELIOS_KD_SOCKET="$KD_SOCKET" \
+    HELIOS_SHARE="$SHARE" HELIOS_VM_DIR="$VM_DIR" HELIOS_DISK="$DISK" HELIOS_NVRAM="$NVRAM" HELIOS_OVMF_CODE="$OVMF_CODE" \
+    HELIOS_TPM_STATE_DIR="$TPM_STATE_DIR" HELIOS_RUNTIME_DIR="$TPMDIR" HELIOS_VIRTIOFSD_BIN="$VIRTIOFSD_BIN" HELIOS_SWTPM_BIN="$SWTPM_BIN" \
+    HELIOS_NET_MODE="$NET_MODE" HELIOS_NET_DEVICE="$NET_DEVICE" HELIOS_SSH_PORT="$SSH_PORT" HELIOS_RDP_PORT="$RDP_PORT" \
+    HELIOS_INSTALL_ISO="$INSTALL_ISO" HELIOS_BOOTSTRAP_DISPLAY="$BOOTSTRAP_DISPLAY" \
     bash "$0" &
   USER_PHASE_PID=$!
   while kill -0 "$USER_PHASE_PID" 2>/dev/null; do
@@ -172,7 +241,10 @@ if [ "${HELIOS_PHASE:-}" != "user" ]; then
   exit "$USER_PHASE_STATUS"
 fi
 # ---- user phase (desktop user, native Wayland) ----
-pkill -f 'virtiofsd.*helios-tpm' 2>/dev/null||true; pkill -f 'swtpm.*helios-tpm' 2>/dev/null||true
+mkdir -p "$TPMDIR" "$TPM_STATE_DIR"
+pkill -f "virtiofsd.*$TPMDIR/fs.sock" 2>/dev/null||true
+pkill -f "swtpm.*$TPMDIR/swtpm-sock" 2>/dev/null||true
+rm -f "$TPMDIR/fs.sock" "$TPMDIR/swtpm-sock" "$TPMDIR/mon.sock" "$TPMDIR/swtpm.pid"
 VIRTIOFSD_PID=
 LG_CLIENT_PID=
 QEMU_PID=
@@ -226,7 +298,7 @@ cleanup_user() {
     kill "$VIRTIOFSD_PID" 2>/dev/null || true
     wait "$VIRTIOFSD_PID" 2>/dev/null || true
   fi
-  pkill -f 'swtpm.*helios-tpm' 2>/dev/null || true
+  pkill -f "swtpm.*$TPMDIR/swtpm-sock" 2>/dev/null || true
 }
 handle_user_int() {
   if [ "$INT_ACTION" = "shutdown" ]; then
@@ -245,14 +317,17 @@ handle_user_int() {
 trap cleanup_user EXIT TERM
 trap handle_user_int INT
 
-/usr/lib/virtiofsd --shared-dir "$SHARE" --socket-path "$TPMDIR/fs.sock" --tag helios-vgpu --sandbox none &
+"$VIRTIOFSD_BIN" --shared-dir "$SHARE" --socket-path "$TPMDIR/fs.sock" --tag helios-vgpu --sandbox none &
 VIRTIOFSD_PID=$!
-/usr/bin/swtpm socket --tpmstate dir="$TPMDIR/state" --ctrl type=unixio,path="$TPMDIR/swtpm-sock" --tpm2 --daemon --pid file="$TPMDIR/swtpm.pid"
+"$SWTPM_BIN" socket --tpmstate dir="$TPM_STATE_DIR" --ctrl type=unixio,path="$TPMDIR/swtpm-sock" --tpm2 --daemon --pid file="$TPMDIR/swtpm.pid"
 sleep 1
 
 qemu_display_args=()
 qemu_lg_args=()
 qemu_gpu_args=()
+qemu_bootstrap_gpu_args=()
+qemu_media_args=()
+qemu_net_args=()
 qemu_vnc_args=()
 qemu_trace_args=()
 qemu_env_prefix=(env)
@@ -261,6 +336,42 @@ lg_client_args=()
 lg_client_env_prefix=(env)
 qemu_egl_headless=egl-headless
 qemu_uses_compositor_gl=0
+DISK_BOOTINDEX=1
+
+if [ -n "$INSTALL_ISO" ]; then
+  DISK_BOOTINDEX=2
+  qemu_media_args=(
+    -drive "if=none,id=install-media,format=raw,media=cdrom,readonly=on,file=$INSTALL_ISO"
+    -device '{"driver":"ide-cd","bus":"ide.1","drive":"install-media","id":"install-cd","bootindex":1}'
+  )
+  echo ">>> Windows install media attached: $INSTALL_ISO <<<"
+fi
+
+if [ "$BOOTSTRAP_DISPLAY" = "1" ] || [ "$BOOTSTRAP_DISPLAY" = "yes" ]; then
+  qemu_bootstrap_gpu_args=(
+    -device '{"driver":"VGA","id":"bootstrap-gpu","bus":"pcie.0","addr":"0x1"}'
+  )
+  echo ">>> Standard VGA bootstrap display enabled <<<"
+fi
+
+case "$NET_MODE" in
+  bridge)
+    qemu_net_args=(
+      -netdev tap,id=hostnet0,ifname=heltap0,script=no,downscript=no
+      -device "{\"driver\":\"$NET_DEVICE\",\"netdev\":\"hostnet0\",\"id\":\"net0\",\"mac\":\"52:54:00:2e:4b:35\",\"bus\":\"pci.1\",\"addr\":\"0x0\"}"
+    )
+    ;;
+  user)
+    qemu_net_args=(
+      -netdev "user,id=hostnet0,hostfwd=tcp:127.0.0.1:$SSH_PORT-:22,hostfwd=tcp:127.0.0.1:$RDP_PORT-:3389"
+      -device "{\"driver\":\"$NET_DEVICE\",\"netdev\":\"hostnet0\",\"id\":\"net0\",\"mac\":\"52:54:00:2e:4b:35\",\"bus\":\"pci.1\",\"addr\":\"0x0\"}"
+    )
+    ;;
+  *)
+    echo "unknown HELIOS_NET_MODE=$NET_MODE (expected bridge or user)"
+    exit 1
+    ;;
+esac
 
 case "$DISPLAY_MODE" in
   sdl|gtk|spice-app)
@@ -471,14 +582,23 @@ if [ "$DISABLE_VIRTIO_GPU" = "1" ] || [ "$DISABLE_VIRTIO_GPU" = "yes" ]; then
   echo ">>> HELIOS_DISABLE_VIRTIO_GPU=$DISABLE_VIRTIO_GPU: omitting virtio-gpu-gl-pci device <<<"
   QEMU_GPU_LABEL="virtio-gpu disabled"
 else
+  GPU_BLOB_LIMIT_JSON=
+  if [ -n "$GPU_BLOB_LIMIT_BYTES" ]; then
+    GPU_BLOB_LIMIT_JSON=",\"host3d_blob_limit\":$GPU_BLOB_LIMIT_BYTES"
+  fi
   qemu_gpu_args=(
     -device
-    '{"driver":"virtio-gpu-gl-pci","id":"ua-heliosgpu","max_outputs":1,"bus":"pci.8","addr":"0x0","venus":true,"blob":true,"hostmem":8589934592,"max_hostmem":8589934592}'
+    "{\"driver\":\"virtio-gpu-gl-pci\",\"id\":\"ua-heliosgpu\",\"max_outputs\":1,\"bus\":\"pci.8\",\"addr\":\"0x0\",\"venus\":true,\"blob\":true,\"hostmem\":$GPU_HOSTMEM_BYTES,\"max_hostmem\":$GPU_HOSTMEM_BYTES$GPU_BLOB_LIMIT_JSON}"
   )
   QEMU_GPU_LABEL="virtio-gpu-gl-pci"
 fi
 
-echo ">>> QEMU ($DISPLAY_MODE, $QEMU_GPU_LABEL, host GPU: $QEMU_RENDER_GPU, bin: $QEMU_BIN, datadir: $QEMU_DATADIR). Z:\\ = repo. SSH 192.168.122.120 <<<"
+if [ "$NET_MODE" = "user" ]; then
+  NET_LABEL="SSH 127.0.0.1:$SSH_PORT; RDP 127.0.0.1:$RDP_PORT"
+else
+  NET_LABEL="SSH 192.168.122.120"
+fi
+echo ">>> QEMU ($DISPLAY_MODE, $QEMU_GPU_LABEL, host GPU: $QEMU_RENDER_GPU, bin: $QEMU_BIN, datadir: $QEMU_DATADIR). Z:\\ = repo. $NET_LABEL <<<"
 # Capture QEMU + virgl_render_server (vkr_log) stderr; render-server diagnostics
 # like "failed to look up object" / "mem fd export failed" land here. Optional
 # HELIOS_VKR_DEBUG (e.g. "validate" / "all") enables vkr debugging incl. host-side
@@ -497,27 +617,30 @@ if [ -n "${HELIOS_QEMU_TRACE:-}" ]; then
     qemu_trace_args+=(-trace "$trace_event")
   done
 fi
+# Keep the GL-backed virtio GPU at QEMU console index 0. SDL tears down a
+# secondary console while it still has a placeholder surface, leaving virgl
+# without a window from which to create its renderer context.
 setsid "${qemu_env_prefix[@]}" "$QEMU_BIN" \
   -L \
   "$QEMU_DATADIR" \
   -name \
   guest=win11,debug-threads=on \
   -blockdev \
-  '{"driver":"file","filename":"/usr/share/edk2/x64/OVMF_CODE.4m.fd","node-name":"libvirt-pflash0-storage","auto-read-only":true,"discard":"unmap"}' \
+  "{\"driver\":\"file\",\"filename\":\"$OVMF_CODE\",\"node-name\":\"libvirt-pflash0-storage\",\"auto-read-only\":true,\"discard\":\"unmap\"}" \
   -blockdev \
   '{"node-name":"libvirt-pflash0-format","read-only":true,"driver":"raw","file":"libvirt-pflash0-storage"}' \
   -blockdev \
-  '{"driver":"file","filename":"/var/lib/libvirt/qemu/nvram/win11_VARS.fd","node-name":"libvirt-pflash1-storage","read-only":false}' \
+  "{\"driver\":\"file\",\"filename\":\"$NVRAM\",\"node-name\":\"libvirt-pflash1-storage\",\"read-only\":false}" \
   -machine \
   pc-q35-11.0,usb=off,vmport=off,smm=on,dump-guest-core=off,memory-backend=pc.ram,pflash0=libvirt-pflash0-format,pflash1=libvirt-pflash1-storage,hpet=off,acpi=on \
   -accel \
   kvm,honor-guest-pat=on \
   -cpu \
-  host,migratable=on,hv-time=on,hv-relaxed=on,hv-vapic=on,hv-spinlocks=0x1fff,hv-vpindex=on,hv-runtime=on,hv-synic=on,hv-stimer=on,hv-frequencies=on,hv-tlbflush=on,hv-ipi=on,hv-evmcs=on,hv-avic=on \
+  "$CPU_MODEL" \
   -m \
-  size=33554432k \
+  "size=${RAM_MB}M" \
   -object \
-  '{"qom-type":"memory-backend-memfd","id":"pc.ram","share":true,"x-use-canonical-path-for-ramblock-id":false,"size":34359738368}' \
+  "{\"qom-type\":\"memory-backend-memfd\",\"id\":\"pc.ram\",\"share\":true,\"x-use-canonical-path-for-ramblock-id\":false,\"size\":$RAM_BYTES}" \
   -overcommit \
   mem-lock=off \
   -smp \
@@ -527,7 +650,7 @@ setsid "${qemu_env_prefix[@]}" "$QEMU_BIN" \
   -no-user-config \
   -nodefaults \
   -chardev \
-  socket,id=charmonitor,path=/tmp/helios-tpm/mon.sock,server=on,wait=off \
+  "socket,id=charmonitor,path=$TPMDIR/mon.sock,server=on,wait=off" \
   -mon \
   chardev=charmonitor,id=monitor,mode=control \
   -rtc \
@@ -579,30 +702,31 @@ setsid "${qemu_env_prefix[@]}" "$QEMU_BIN" \
   -device \
   '{"driver":"virtio-serial-pci","id":"virtio-serial0","bus":"pci.3","addr":"0x0"}' \
   "${qemu_lg_args[@]}" \
+  "${qemu_gpu_args[@]}" \
+  "${qemu_bootstrap_gpu_args[@]}" \
   -blockdev \
-  '{"driver":"file","filename":"/var/lib/libvirt/images/win11.qcow2","node-name":"libvirt-1-storage","auto-read-only":true,"discard":"unmap"}' \
+  "{\"driver\":\"file\",\"filename\":\"$DISK\",\"node-name\":\"libvirt-1-storage\",\"auto-read-only\":true,\"discard\":\"unmap\"}" \
   -blockdev \
   '{"node-name":"libvirt-1-format","read-only":false,"driver":"qcow2","file":"libvirt-1-storage"}' \
   -device \
-  '{"driver":"ide-hd","bus":"ide.0","drive":"libvirt-1-format","id":"sata0-0-0","bootindex":1}' \
+  "{\"driver\":\"ide-hd\",\"bus\":\"ide.0\",\"drive\":\"libvirt-1-format\",\"id\":\"sata0-0-0\",\"bootindex\":$DISK_BOOTINDEX}" \
+  "${qemu_media_args[@]}" \
   -chardev \
-  socket,id=chr-vu-fs0,path=/tmp/helios-tpm/fs.sock \
+  "socket,id=chr-vu-fs0,path=$TPMDIR/fs.sock" \
   -device \
   '{"driver":"vhost-user-fs-pci","id":"fs0","chardev":"chr-vu-fs0","tag":"helios-vgpu","bus":"pci.7","addr":"0x0"}' \
-  -netdev \
-  tap,id=hostnet0,ifname=heltap0,script=no,downscript=no \
-  -device \
-  '{"driver":"virtio-net-pci","netdev":"hostnet0","id":"net0","mac":"52:54:00:2e:4b:35","bus":"pci.1","addr":"0x0"}' \
+  "${qemu_net_args[@]}" \
   "${qemu_serial_args[@]}" \
   -chardev \
-  socket,id=chrtpm,path=/tmp/helios-tpm/swtpm-sock \
+  "socket,id=chrtpm,path=$TPMDIR/swtpm-sock" \
   -tpmdev \
   emulator,id=tpm-tpm0,chardev=chrtpm \
   -device \
   '{"driver":"tpm-crb","tpmdev":"tpm-tpm0","id":"tpm0"}' \
   -device \
   '{"driver":"usb-tablet","id":"input2","bus":"usb.0","port":"1"}' \
-  "${qemu_gpu_args[@]}" \
+  -device \
+  '{"driver":"usb-kbd","id":"input3","bus":"usb.0","port":"2"}' \
   -global \
   ICH9-LPC.noreboot=off \
   -watchdog-action \
