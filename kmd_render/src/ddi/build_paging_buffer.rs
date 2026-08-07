@@ -154,6 +154,13 @@ static BAR_FILLS: AtomicU32 = AtomicU32::new(0);
 static BAR_DISCARDS: AtomicU32 = AtomicU32::new(0);
 static BAR_PT_HARVESTS: AtomicU32 = AtomicU32::new(0); // placements seen in leaf PTEs
 static BAR_LAST_RESID: AtomicU32 = AtomicU32::new(0);
+/// Host cache mode used for the most recent transient blob mapping.
+///
+/// This is the `VIRTIO_GPU_MAP_CACHE_*` nibble returned by
+/// `RESOURCE_MAP_BLOB`; keeping it visible is important because mapping the
+/// same host-visible pages with a different Windows cache type creates an
+/// invalid cache-attribute alias.
+static BAR_LAST_MAP_CACHE: AtomicU32 = AtomicU32::new(0);
 static BAR_LAST_XFER_FLAGS: AtomicU32 = AtomicU32::new(0);
 static BAR_LAST_XFER_OFF: AtomicU32 = AtomicU32::new(0);
 static BAR_LAST_MDL_OFF: AtomicU32 = AtomicU32::new(0);
@@ -210,6 +217,7 @@ static PAGING_COUNTERS: crate::diag::CounterBlock = crate::diag::CounterBlock {
         e(b"PgDn", &BAR_DISCARDS),
         e(b"PgUn", &BAR_PT_HARVESTS),
         e(b"PgMr", &BAR_LAST_RESID),
+        e(b"PgMc", &BAR_LAST_MAP_CACHE),
         e(b"PgSf", &BAR_LAST_XFER_FLAGS),
         e(b"PgTs", &BAR_LAST_XFER_OFF),
         e(b"PgTd", &BAR_LAST_MDL_OFF),
@@ -556,11 +564,17 @@ unsafe fn with_blob_bytes(
             return false;
         }
     };
+    BAR_LAST_MAP_CACHE.store(prep.map_cache, Ordering::Relaxed);
     let mut pa: PHYSICAL_ADDRESS = unsafe { core::mem::zeroed() };
     pa.QuadPart = prep.gpa as i64;
     // SAFETY: PASSIVE_LEVEL; the range was RESOURCE_MAP_BLOB'd into the
-    // host-visible window, so the pages are backed. Unmapped below.
-    let va = unsafe { MmMapIoSpace(pa, prep.size, _MEMORY_CACHING_TYPE::MmCached) } as *mut u8;
+    // host-visible window, so the pages are backed. The cache attribute MUST
+    // match the host's MAP_INFO response: choosing MmCached unconditionally
+    // creates a conflicting WB alias when virglrenderer reports WC/UC. Such an
+    // alias is architecturally invalid and can expose stale cache lines after
+    // the host GPU writes the blob. Unmapped below.
+    let cache = super::blob_map::map_cache_to_mm(prep.map_cache);
+    let va = unsafe { MmMapIoSpace(pa, prep.size, cache) } as *mut u8;
     if va.is_null() {
         BAR_ERR_MAP.fetch_add(1, Ordering::Relaxed);
         return false;
