@@ -127,8 +127,18 @@ function Ensure-MachineCodeSigningCert {
 
   $tmp = Join-Path $env:TEMP "WDRLocalTestCert.cer"
   Export-Certificate -Cert $cert -FilePath $tmp | Out-Null
-  Import-Certificate -FilePath $tmp -CertStoreLocation Cert:\LocalMachine\Root | Out-Null
-  Import-Certificate -FilePath $tmp -CertStoreLocation Cert:\LocalMachine\TrustedPublisher | Out-Null
+  foreach ($store in @("Root", "TrustedPublisher")) {
+    try {
+      Import-Certificate -FilePath $tmp -CertStoreLocation "Cert:\LocalMachine\$store" -ErrorAction Stop | Out-Null
+    } catch {
+      # Some elevated OpenSSH sessions can create LocalMachine\My keys but the
+      # PKI cmdlet still returns E_ACCESSDENIED for trust-store publication.
+      # certutil uses the same machine stores and succeeds in that token.
+      Write-Warning "Import-Certificate failed for LocalMachine\$store; retrying with certutil. $($_.Exception.Message)"
+      & certutil.exe -f -addstore $store $tmp | Out-Host
+      if ($LASTEXITCODE -ne 0) { throw "certutil failed to import $tmp into LocalMachine\$store" }
+    }
+  }
   Remove-Item $tmp -Force -ErrorAction SilentlyContinue
   return $cert
 }
