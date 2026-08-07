@@ -969,6 +969,7 @@ pub(crate) unsafe extern "C" fn create_resource(
                         a.Format as u32,
                         bind,
                         misc,
+                        false,
                     )
                 });
                 let (rp, off) = created.as_ref().map_or((0, 0), |(_, p, o)| (*p, *o));

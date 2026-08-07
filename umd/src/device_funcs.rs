@@ -103,6 +103,10 @@ pub struct SnapshotRing {
     pub width: u32,
     pub height: u32,
     pub dxgi_format: u32,
+    /// Direct scan-out snapshots retain SHADER_READ_ONLY_OPTIMAL for QEMU;
+    /// WindowedBlt snapshots are born GENERAL for the KMD transfer importer.
+    /// The two contracts must never share slots even at identical geometry.
+    pub purpose: crate::forward::SnapshotPurpose,
     /// Exactly [`crate::forward::SNAPSHOT_RING_SLOTS`] entries once built.
     pub slots: Vec<SnapshotSlot>,
     /// Next slot index to rotate into.

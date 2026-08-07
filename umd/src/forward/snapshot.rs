@@ -14,8 +14,10 @@
 //! gate — covers it), and ordering against frame N+1 is queue order.
 //!
 //! A device may present multiple swapchains/child surfaces with different
-//! geometries. Rings are therefore cached per exact `(width, height, format)`
-//! instead of replacing one device-global ring. Once a ring identity has
+//! geometries and may route the same geometry either to direct scan-out or the
+//! KMD transfer importer. Rings are therefore cached per exact
+//! `(width, height, format, purpose)` instead of replacing one device-global
+//! ring or mixing incompatible canonical layouts. Once a ring identity has
 //! crossed into the KMD it is not safe to evict: the descriptor contains a raw
 //! Venus resource ID, not a WDDM allocation reference, and its deferred host
 //! read can begin after Present returns. The cache is consequently bounded and
@@ -79,7 +81,7 @@ pub(crate) struct SnapshotPlan {
 /// BLT arm imports it as an ordinary Vulkan source.  Keeping the distinction in
 /// the plan prevents a WindowedBlt descriptor from ever reaching a scanout
 /// refresh arm.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SnapshotPurpose {
     DirectFlip,
     WindowedBlt,
@@ -126,6 +128,7 @@ unsafe fn build_ring(
     width: u32,
     height: u32,
     dxgi_format: u32,
+    purpose: SnapshotPurpose,
 ) -> Option<SnapshotRing> {
     // The composition-surface baseline. Sharing/export is driven by the
     // DirectOptimalScanout marker inside create_ddi_scanout_texture2d, not by
@@ -133,10 +136,14 @@ unsafe fn build_ring(
     let bind = (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32;
     let mut slots: Vec<SnapshotSlot> = Vec::with_capacity(SNAPSHOT_RING_SLOTS);
     for i in 0..SNAPSHOT_RING_SLOTS {
-        let Some((res, row_pitch, plane_offset)) =
-            dev.dxvk
-                .create_scanout_texture2d(width, height, dxgi_format, bind, 0)
-        else {
+        let Some((res, row_pitch, plane_offset)) = dev.dxvk.create_scanout_texture2d(
+            width,
+            height,
+            dxgi_format,
+            bind,
+            0,
+            purpose == SnapshotPurpose::WindowedBlt,
+        ) else {
             let n = SNAP_RING_CREATE_FAILS.fetch_add(1, Ordering::Relaxed);
             if n < 16 || n % 512 == 0 {
                 log_error!(
@@ -202,7 +209,8 @@ unsafe fn build_ring(
         });
     }
     log_error!(
-        "scanout-snapshot: ring built {}x{} fmt={} resids=[{}, {}, {}, {}] pitch={}",
+        "scanout-snapshot: ring built purpose={:?} {}x{} fmt={} resids=[{}, {}, {}, {}] pitch={}",
+        purpose,
         width,
         height,
         dxgi_format,
@@ -216,6 +224,7 @@ unsafe fn build_ring(
         width,
         height,
         dxgi_format,
+        purpose,
         slots,
         next: 0,
     })
@@ -271,7 +280,10 @@ pub(crate) unsafe fn snapshot_for_present(
 
     let mut cache = dev.owned.snapshot_rings.borrow_mut();
     let mut ring_index = cache.rings.iter().position(|ring| {
-        ring.width == width && ring.height == height && ring.dxgi_format == dxgi_format
+        ring.width == width
+            && ring.height == height
+            && ring.dxgi_format == dxgi_format
+            && ring.purpose == purpose
     });
     if ring_index.is_none() {
         // Never evict a published ring here. The KMD can defer consuming its
@@ -282,8 +294,9 @@ pub(crate) unsafe fn snapshot_for_present(
             let n = SNAP_CACHE_REFUSALS.fetch_add(1, Ordering::Relaxed);
             if n < 16 || n % 512 == 0 {
                 log_error!(
-                    "scanout-snapshot: cache sealed, refusing new geometry {}x{} fmt={} \
+                    "scanout-snapshot: cache sealed, refusing purpose={:?} geometry {}x{} fmt={} \
                      rings={} bytes={} limits={}/{} ({})",
+                    purpose,
                     width,
                     height,
                     dxgi_format,
@@ -296,7 +309,7 @@ pub(crate) unsafe fn snapshot_for_present(
             }
             return None;
         }
-        let Some(ring) = build_ring(dev, h, width, height, dxgi_format) else {
+        let Some(ring) = build_ring(dev, h, width, height, dxgi_format, purpose) else {
             return None; // counted + logged in build_ring
         };
         let ring_bytes = ring
@@ -312,8 +325,9 @@ pub(crate) unsafe fn snapshot_for_present(
             let n = SNAP_CACHE_REFUSALS.fetch_add(1, Ordering::Relaxed);
             if n < 16 || n % 512 == 0 {
                 log_error!(
-                    "scanout-snapshot: cache byte limit refuses {}x{} fmt={} \
+                    "scanout-snapshot: cache byte limit refuses purpose={:?} {}x{} fmt={} \
                      ring_bytes={} retained={} limit={} ({})",
+                    purpose,
                     width,
                     height,
                     dxgi_format,

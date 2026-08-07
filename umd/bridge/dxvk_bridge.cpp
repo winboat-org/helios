@@ -762,6 +762,7 @@ std::size_t HeliosDxvkDevice::create_ddi_scanout_texture2d(
     std::uint32_t format,
     std::uint32_t bind_flags,
     std::uint32_t misc_flags,
+    bool kmd_transfer_source,
     std::uint64_t* out_row_pitch,
     std::uint64_t* out_offset) const {
   if (out_row_pitch) *out_row_pitch = 0;
@@ -793,10 +794,11 @@ std::size_t HeliosDxvkDevice::create_ddi_scanout_texture2d(
       {
         static std::atomic<std::uint32_t> s_scanBeginLogs{0};
         if (bridge_log_budget(s_scanBeginLogs, 64, 512)) {
-          char msg[192];
+          char msg[224];
           std::snprintf(msg, sizeof(msg),
-            "CreateDdiScanoutTexture2D begin %ux%u fmt=%u bind=0x%08x misc=0x%08x",
-            width, height, format, bind_flags, misc_flags);
+            "CreateDdiScanoutTexture2D begin %ux%u fmt=%u bind=0x%08x misc=0x%08x kmdTransfer=%u",
+            width, height, format, bind_flags, misc_flags,
+            kmd_transfer_source ? 1u : 0u);
           umd_log(msg);
         }
       }
@@ -822,6 +824,7 @@ std::size_t HeliosDxvkDevice::create_ddi_scanout_texture2d(
 
       dxvk::D3D11_HELIOS_CREATE_INFO createInfo = { };
       createInfo.DirectOptimalScanout = true;
+      createInfo.KmdTransferSource = kmd_transfer_source;
 
       // static_cast, matching the sibling context downcast in this file. Zero
       // runtime change today (the base sits at offset 0), but if an upstream DXVK

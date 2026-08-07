@@ -85,16 +85,19 @@ struct HeliosDxvkDevice {
       bool linear_scanout_target,
       bool cross_context_optimal) const;
 
-  // Create the DWM scan-out primary as a dedicated OPTIMAL,
-  // DMA_BUF-exportable image (via the D3D11_HELIOS_CREATE_INFO marker) and
-  // report logical scanout metadata for exact host reconstruction. Returns an
-  // owned ID3D11Resource* (as usize), or 0.
+  // Create a dedicated OPTIMAL, DMA_BUF-exportable image (via the
+  // D3D11_HELIOS_CREATE_INFO marker) and report logical scanout metadata for
+  // exact reconstruction. kmd_transfer_source selects GENERAL as the image's
+  // canonical layout for a KMD transfer consumer; false retains the direct
+  // scan-out SHADER_READ_ONLY_OPTIMAL contract. Returns an owned
+  // ID3D11Resource* (as usize), or 0.
   std::size_t create_ddi_scanout_texture2d(
       std::uint32_t width,
       std::uint32_t height,
       std::uint32_t format,
       std::uint32_t bind_flags,
       std::uint32_t misc_flags,
+      bool kmd_transfer_source,
       std::uint64_t* out_row_pitch,
       std::uint64_t* out_offset) const;
 

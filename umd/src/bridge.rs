@@ -113,9 +113,9 @@ mod ffi {
             cross_context_optimal: bool,
         ) -> usize;
 
-        /// Create the DWM scan-out primary as a dedicated OPTIMAL,
-        /// DMA_BUF-exportable image and report logical scanout metadata for
-        /// exact host reconstruction.
+        /// Create a dedicated OPTIMAL, DMA_BUF-exportable image and report
+        /// logical scanout metadata. `kmd_transfer_source` selects the
+        /// canonical GENERAL layout required by the KMD transfer importer.
         /// Returns an owned `ID3D11Resource*` (as usize), or 0 on failure.
         unsafe fn create_ddi_scanout_texture2d(
             self: &HeliosDxvkDevice,
@@ -124,6 +124,7 @@ mod ffi {
             format: u32,
             bind_flags: u32,
             misc_flags: u32,
+            kmd_transfer_source: bool,
             out_row_pitch: *mut u64,
             out_offset: *mut u64,
         ) -> usize;
@@ -350,8 +351,9 @@ impl ffi::HeliosDxvkDevice {
         }
     }
 
-    /// The DWM scan-out primary as a dedicated OPTIMAL, DMA_BUF-exportable
-    /// image, plus the logical scan-out metadata the host reconstructs from.
+    /// A dedicated OPTIMAL, DMA_BUF-exportable image, plus its logical
+    /// scan-out metadata. `kmd_transfer_source` selects the canonical GENERAL
+    /// layout required by the KMD transfer importer.
     pub(crate) fn create_scanout_texture2d(
         &self,
         width: u32,
@@ -359,6 +361,7 @@ impl ffi::HeliosDxvkDevice {
         format: u32,
         bind_flags: u32,
         misc_flags: u32,
+        kmd_transfer_source: bool,
     ) -> Option<(ID3D11Resource, u64, u64)> {
         let mut row_pitch: u64 = 0;
         let mut offset: u64 = 0;
@@ -371,6 +374,7 @@ impl ffi::HeliosDxvkDevice {
                 format,
                 bind_flags,
                 misc_flags,
+                kmd_transfer_source,
                 &mut row_pitch,
                 &mut offset,
             )
@@ -548,9 +552,16 @@ impl BridgeDevice {
         format: u32,
         bind_flags: u32,
         misc_flags: u32,
+        kmd_transfer_source: bool,
     ) -> Option<(ID3D11Resource, u64, u64)> {
-        self.get()?
-            .create_scanout_texture2d(width, height, format, bind_flags, misc_flags)
+        self.get()?.create_scanout_texture2d(
+            width,
+            height,
+            format,
+            bind_flags,
+            misc_flags,
+            kmd_transfer_source,
+        )
     }
 
     // -- scalar passthroughs ----------------------------------------------
