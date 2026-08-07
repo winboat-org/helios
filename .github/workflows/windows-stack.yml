@@ -23,7 +23,8 @@ env:
   RUST_SCRIPT_VERSION: '0.36.0'
   LLVM_VERSION: '17.0.6'
   VULKAN_SDK_VERSION: '1.4.309.0'
-  CLVK_COMMIT: 7c1b20b75127e0868cdf38b81663b185a87c6c0d
+  CLVK_REPOSITORY: https://github.com/winboat-org/clvk-helios.git
+  CLVK_COMMIT: 5b16bbba42835d99816d5d1014d08f7a4ea4e1ef
   VULKAN_LOADER_COMMIT: 06830240f7a70599053f47b5f10af543e8c3daf6
   VULKAN_HEADERS_COMMIT: 11d6898377797e07dbd543aaaa367e4465074597
   OPENCL_LOADER_COMMIT: 18fdcd58286376124f938948aa8ed156079c1c16
@@ -149,7 +150,7 @@ jobs:
           cache: true
       - name: Build CLVK
         shell: pwsh
-        run: ./ci/windows/Build-OpenCL.ps1 -OutputDir "$env:RUNNER_TEMP/helios-opencl" -ClvkCommit $env:CLVK_COMMIT
+        run: ./ci/windows/Build-OpenCL.ps1 -OutputDir "$env:RUNNER_TEMP/helios-opencl" -ClvkRepository $env:CLVK_REPOSITORY -ClvkCommit $env:CLVK_COMMIT
       - uses: actions/upload-artifact@v7
         with:
           name: helios-opencl
@@ -183,9 +184,31 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  compatibility:
+    name: Application compatibility shims
+    runs-on: windows-2022
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: false
+          fetch-depth: 1
+      - name: Build and validate compatibility shims
+        shell: pwsh
+        run: >-
+          ./ci/windows/Build-CompatibilityShims.ps1
+          -RepoRoot $env:GITHUB_WORKSPACE
+          -OutputDir "$env:RUNNER_TEMP/helios-compatibility"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: helios-compatibility
+          path: ${{ runner.temp }}/helios-compatibility
+          if-no-files-found: error
+          retention-days: 14
+
   package:
     name: Sign and assemble installable bundle
-    needs: [driver, mesa, opencl, loaders]
+    needs: [driver, mesa, opencl, loaders, compatibility]
     runs-on: windows-2022
     timeout-minutes: 30
     permissions:
@@ -211,6 +234,10 @@ jobs:
         with:
           name: helios-loaders
           path: ${{ runner.temp }}/artifacts/loaders
+      - uses: actions/download-artifact@v8
+        with:
+          name: helios-compatibility
+          path: ${{ runner.temp }}/artifacts/compatibility
       - name: Ensure Windows Driver Kit is installed
         shell: pwsh
         run: ./ci/windows/Install-WindowsDriverKit.ps1
@@ -231,6 +258,7 @@ jobs:
           -MesaArtifact "$env:RUNNER_TEMP/artifacts/mesa"
           -OpenClArtifact "$env:RUNNER_TEMP/artifacts/opencl"
           -LoadersArtifact "$env:RUNNER_TEMP/artifacts/loaders"
+          -CompatibilityArtifact "$env:RUNNER_TEMP/artifacts/compatibility"
           -OutputDir "$env:RUNNER_TEMP/helios-package"
           -Version '${{ steps.metadata.outputs.version }}'
           -RepositoryCommit $env:GITHUB_SHA

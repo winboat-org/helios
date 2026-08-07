@@ -1,16 +1,54 @@
 #define CL_TARGET_OPENCL_VERSION 120
 #include <CL/cl.h>
+#include <CL/cl_ext.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+static void print_hex(const unsigned char *bytes, size_t size) {
+    for (size_t index = 0; index < size; ++index) printf("%02x", bytes[index]);
+}
+
 static void print_info(cl_platform_id platform, cl_device_id device) {
-    char text[512] = {0};
+    char text[8192] = {0};
+    cl_uint vendor_id = 0;
+    cl_bool luid_valid = CL_FALSE;
+    cl_uint node_mask = 0;
+    unsigned char uuid[CL_UUID_SIZE_KHR] = {0};
+    unsigned char luid[CL_LUID_SIZE_KHR] = {0};
+    cl_device_pci_bus_info_khr pci = {0};
     clGetPlatformInfo(platform, CL_PLATFORM_NAME, sizeof(text), text, NULL);
     printf("OpenCL platform: %s\n", text);
     memset(text, 0, sizeof(text));
     clGetDeviceInfo(device, CL_DEVICE_NAME, sizeof(text), text, NULL);
     printf("OpenCL device: %s\n", text);
+    memset(text, 0, sizeof(text));
+    clGetDeviceInfo(device, CL_DEVICE_VENDOR, sizeof(text), text, NULL);
+    clGetDeviceInfo(device, CL_DEVICE_VENDOR_ID, sizeof(vendor_id), &vendor_id, NULL);
+    printf("OpenCL vendor: %s (0x%04x)\n", text, vendor_id);
+    memset(text, 0, sizeof(text));
+    clGetDeviceInfo(device, CL_DEVICE_EXTENSIONS, sizeof(text), text, NULL);
+    printf("OpenCL extensions: %s\n", text);
+
+    if (strstr(text, "cl_khr_device_uuid")) {
+        clGetDeviceInfo(device, CL_DEVICE_UUID_KHR, sizeof(uuid), uuid, NULL);
+        clGetDeviceInfo(device, CL_DEVICE_LUID_VALID_KHR,
+                        sizeof(luid_valid), &luid_valid, NULL);
+        clGetDeviceInfo(device, CL_DEVICE_LUID_KHR, sizeof(luid), luid, NULL);
+        clGetDeviceInfo(device, CL_DEVICE_NODE_MASK_KHR,
+                        sizeof(node_mask), &node_mask, NULL);
+        printf("OpenCL UUID: ");
+        print_hex(uuid, sizeof(uuid));
+        printf("\nOpenCL LUID: valid=%u value=", luid_valid);
+        print_hex(luid, sizeof(luid));
+        printf(" node-mask=0x%x\n", node_mask);
+    }
+    if (strstr(text, "cl_khr_pci_bus_info") &&
+        clGetDeviceInfo(device, CL_DEVICE_PCI_BUS_INFO_KHR,
+                        sizeof(pci), &pci, NULL) == CL_SUCCESS) {
+        printf("OpenCL PCI: %04x:%02x:%02x.%u\n",
+               pci.pci_domain, pci.pci_bus, pci.pci_device, pci.pci_function);
+    }
 }
 
 int main(void) {

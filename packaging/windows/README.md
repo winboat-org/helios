@@ -9,6 +9,7 @@ compute stack:
 - OpenCL through CLVK with its clspv compiler embedded
 - official Khronos Vulkan and OpenCL loaders when Windows has no loader yet
 - the Microsoft Visual C++ x64 runtime required by the WDDM/DXVK UMD
+- an optional, app-local DaVinci Resolve GPU-detection shim
 
 ## Install
 
@@ -55,6 +56,18 @@ C:\ProgramData\Helios\Verify-Helios.ps1 -RunSmokeTests
 
 Run that command after the final reboot; the installer performs only the
 non-rendering registration/hash checks before rebooting.
+
+## DaVinci Resolve compatibility
+
+Resolve's Windows GPU detector requires a vendor-specific enumeration path and
+does not admit a generic DXGI/OpenCL adapter by itself. If Resolve reports
+`Unsupported GPU Processing Mode`, copy
+`compatibility\DaVinci Resolve\atiadlxx.dll` beside `Resolve.exe` (normally in
+`C:\Program Files\Blackmagic Design\DaVinci Resolve`), then relaunch Resolve.
+
+The DLL is an app-local detection shim and is never installed automatically.
+Do not place it in a Windows system directory. Remove the copied DLL to undo
+the workaround. See its adjacent README for implementation details and scope.
 
 Uninstall with:
 

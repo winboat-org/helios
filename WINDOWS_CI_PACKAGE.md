@@ -16,7 +16,9 @@ The jobs are independent so an error points at the actual component:
    machines therefore do not need `clspv.exe` or `CLVK_CLSPV_PATH`.
 4. `loaders` builds the official Khronos Vulkan and OpenCL loaders plus four
    native smoke probes.
-5. `package` test-signs the final driver package, hashes every payload file,
+5. `compatibility` builds and validates the app-local DaVinci Resolve ADL shim.
+6. `package` test-signs the final driver package and compatibility shim, hashes
+   every distributed binary,
    and creates `helios-windows-x64-<version>-<commit>.zip`.
 
 The workflow runs for pull requests and pushes to `wddm`, and can be started
@@ -26,9 +28,11 @@ as a GitHub Release.
 ## Reproducibility and source pins
 
 The Helios, Mesa, and DXVK revisions come from the checked-out commit and its
-gitlinks. CLVK, Vulkan-Loader, Vulkan-Headers, and OpenCL-ICD-Loader commits are
-pinned in `.github/workflows/windows-stack.yml`. Toolchain versions are pinned
-there as well. Every resulting source revision is written to `manifest.json`.
+gitlinks. The Windows OpenCL build uses the `winboat-org/clvk-helios` fork for
+guest DXGI/OpenCL device association. Its repository and commit, along with the
+Vulkan-Loader, Vulkan-Headers, and OpenCL-ICD-Loader commits, are pinned in
+`.github/workflows/windows-stack.yml`. Toolchain versions are pinned there as
+well. Every resulting source revision is written to `manifest.json`.
 
 When updating an external pin, first build and run all four packaged probes in
 the VM. In particular, CLVK and Zink are consumers of the Venus ICD and can
@@ -68,6 +72,13 @@ cannot be lost.
 `Verify-Helios.ps1 -RunSmokeTests` checks hashes and registrations, then creates
 a Vulkan instance, creates a D3D11 device on Helios, creates a WGL context, and
 compiles/runs an OpenCL kernel. The OpenCL probe validates every output value.
+
+## Application compatibility files
+
+The archive includes the separately deployed DaVinci Resolve shim at
+`compatibility\DaVinci Resolve\atiadlxx.dll`. It is not installed system-wide or
+copied by `Install-Helios.ps1`. Users who need it copy the DLL beside
+`Resolve.exe`; the adjacent README documents its scope and removal.
 
 ## Hosted runner requirements
 

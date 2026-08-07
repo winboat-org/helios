@@ -49,3 +49,6 @@ $RECYCLE.BIN/
 # Local clean-tree comparison mirror
 /umd_clean/
 __pycache__/
+
+# Local reverse-engineering and compatibility investigation notes
+/INVESTIGATIONS/

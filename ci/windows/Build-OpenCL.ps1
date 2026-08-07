@@ -2,7 +2,8 @@ param(
     [Parameter(Mandatory)][string]$OutputDir,
     [string]$SourceRoot = "C:\clvk-src",
     [string]$BuildRoot = "C:\clvk-build",
-    [string]$ClvkCommit = "7c1b20b75127e0868cdf38b81663b185a87c6c0d"
+    [string]$ClvkRepository = "https://github.com/winboat-org/clvk-helios.git",
+    [string]$ClvkCommit = "5b16bbba42835d99816d5d1014d08f7a4ea4e1ef"
 )
 
 Set-StrictMode -Version Latest
@@ -11,7 +12,7 @@ $ErrorActionPreference = "Stop"
 if (Test-Path -LiteralPath $SourceRoot) { Remove-Item -LiteralPath $SourceRoot -Recurse -Force }
 if (Test-Path -LiteralPath $BuildRoot) { Remove-Item -LiteralPath $BuildRoot -Recurse -Force }
 
-& git clone --filter=blob:none --recursive https://github.com/kpet/clvk.git $SourceRoot
+& git clone --filter=blob:none --recursive $ClvkRepository $SourceRoot
 if ($LASTEXITCODE -ne 0) { throw "Failed to clone clvk." }
 Push-Location $SourceRoot
 try {
@@ -56,6 +57,7 @@ if (Test-Path -LiteralPath $vendorPdb -PathType Leaf) {
     Copy-Item -LiteralPath $vendorPdb -Destination (Join-Path $OutputDir "clvk.pdb") -Force
 }
 Set-Content -LiteralPath (Join-Path $OutputDir "clvk-commit.txt") -Value $ClvkCommit -Encoding ascii
+Set-Content -LiteralPath (Join-Path $OutputDir "clvk-repository.txt") -Value $ClvkRepository -Encoding ascii
 $licenseRoot = Join-Path $OutputDir "licenses"
 $licenses = [ordered]@{
     "clvk-LICENSE" = Join-Path $SourceRoot "LICENSE"

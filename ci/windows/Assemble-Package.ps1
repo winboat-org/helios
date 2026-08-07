@@ -4,6 +4,7 @@ param(
     [Parameter(Mandatory)][string]$MesaArtifact,
     [Parameter(Mandatory)][string]$OpenClArtifact,
     [Parameter(Mandatory)][string]$LoadersArtifact,
+    [Parameter(Mandatory)][string]$CompatibilityArtifact,
     [Parameter(Mandatory)][string]$OutputDir,
     [Parameter(Mandatory)][string]$Version,
     [Parameter(Mandatory)][string]$RepositoryCommit,
@@ -75,12 +76,16 @@ foreach ($probe in @("vulkan-smoke.exe", "d3d11-smoke.exe", "opengl-smoke.exe", 
     Copy-Required (Join-Path $LoadersArtifact "smoke\$probe") (Join-Path $payload "smoke\$probe")
 }
 
+$resolveCompatibilityOut = Join-Path $stagingRoot "compatibility\DaVinci Resolve"
+Copy-Required (Join-Path $CompatibilityArtifact "atiadlxx.dll") (Join-Path $resolveCompatibilityOut "atiadlxx.dll")
+Copy-Required (Join-Path $CompatibilityArtifact "README.md") (Join-Path $resolveCompatibilityOut "README.md")
+
 $redist = Get-ChildItem -LiteralPath $env:VCToolsRedistDir -Filter "vc_redist.x64.exe" -File -Recurse | Select-Object -First 1
 if (-not $redist) { throw "The Visual C++ x64 redistributable was not found below $env:VCToolsRedistDir." }
 Copy-Required $redist.FullName (Join-Path $payload "prerequisites\vc_redist.x64.exe")
 
 $licenseOut = Join-Path $stagingRoot "licenses"
-foreach ($artifact in @($DriverArtifact, $MesaArtifact, $OpenClArtifact, $LoadersArtifact)) {
+foreach ($artifact in @($DriverArtifact, $MesaArtifact, $OpenClArtifact, $LoadersArtifact, $CompatibilityArtifact)) {
     $artifactLicenses = Join-Path $artifact "licenses"
     if (Test-Path -LiteralPath $artifactLicenses -PathType Container) {
         New-Item -ItemType Directory -Force -Path $licenseOut | Out-Null
@@ -121,7 +126,8 @@ try {
     $signable = @(
         (Join-Path $openClOut "clvk.dll"),
         (Join-Path $loadersOut "vulkan-1.dll"),
-        (Join-Path $loadersOut "OpenCL.dll")
+        (Join-Path $loadersOut "OpenCL.dll"),
+        (Join-Path $resolveCompatibilityOut "atiadlxx.dll")
     )
     $signable += @(Get-ChildItem -LiteralPath $mesaOut -Filter "*.dll" -File | ForEach-Object FullName)
     $signable += @(Get-ChildItem -LiteralPath (Join-Path $payload "smoke") -Filter "*.exe" -File | ForEach-Object FullName)
@@ -133,7 +139,7 @@ try {
 $files = @()
 foreach ($file in Get-ChildItem -LiteralPath $stagingRoot -File -Recurse | Where-Object { $_.Name -ne "manifest.json" } | Sort-Object FullName) {
     $relative = $file.FullName.Substring($stagingRoot.Length + 1).Replace("\", "/")
-    if ($relative -notlike "payload/*" -and $relative -notlike "certificate/*") { continue }
+    if ($relative -notlike "payload/*" -and $relative -notlike "certificate/*" -and $relative -notlike "compatibility/*") { continue }
     $files += [ordered]@{
         path = $relative
         size = $file.Length
@@ -167,6 +173,7 @@ $manifest = [ordered]@{
         driver = [ordered]@{ version = $Version; direct3D = "DXVK embedded WDDM UMD" }
         mesa = [ordered]@{ vulkan = "Venus"; openGL = "Zink WGL ICD"; vulkanApiVersion = "1.4.352" }
         openCl = [ordered]@{ implementation = "CLVK"; onlineCompiler = $true }
+        compatibility = [ordered]@{ davinciResolve = "App-local ADL GPU-detection shim" }
     }
     files = $files
 }

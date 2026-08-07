@@ -1,0 +1,13 @@
+LIBRARY "atiadlxx"
+EXPORTS
+    ADL_Main_Control_Create
+    ADL_Main_Control_Destroy
+    ADL_Adapter_NumberOfAdapters_Get
+    ADL_Adapter_AdapterInfo_Get
+    ADL_Adapter_ASICFamilyType_Get
+    ADL_Graphics_Versions_Get
+    ADL_Adapter_Primary_Get
+    ADL2_Main_Control_Create
+    ADL2_Main_Control_Destroy
+    ADL2_Main_Control_GetProcAddress
+    ADL2_Graphics_VersionsX2_Get
