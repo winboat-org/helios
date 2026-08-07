@@ -83,6 +83,33 @@ time to stop shipping something nobody measured:**
   every other escape constant in that file was checked against
   `protocol/src/escape.rs` and is correct.
 
+## Blender / native Win32 external memory — fixed (2026-08-07)
+
+The Windows Venus ICD now implements `VK_KHR_external_memory_win32` for
+`OPAQUE_WIN32`: buffer and optimal-image capability queries, export/import and
+re-export by NT handle, and import by Win32 object name. The guest handle owns
+or retains the exact WDDM allocation that adopted the renderer's exportable
+Venus resource; no Win32 handle is sent over the Venus wire.
+
+Advertising the extension exposed an independent DXVK-Helios bridge bug. DWM
+uses the internal KMT shared-resource path, but `canShareImage()` applied that
+bypass only while the native Win32 extension was absent. Once present, DXVK
+queried Vulkan `OPAQUE_WIN32_KMT` support, correctly got none, and allocated
+non-exportable primary memory. The UMD then passed a zero resource id to the
+KMD, producing virglrenderer `mem is not exportable` / command `0x1200` errors
+and a DWM crash loop. The KMT bridge is now selected independently of native
+Win32 extension advertisement, and the UMD refuses every shared/present/primary
+allocation that lacks a nonzero adoptable Venus resource id instead of
+submitting a poisonous blob request.
+
+Verified on the fresh WinBoat VM with Helios active: clean boot, normal Windows
+restart, Helios PnP code 0, DWM primaries and snapshot-ring allocations carrying
+nonzero resource ids, no export/`0x1200` host errors, Blender 5.2 surviving GPU
+initialization, and the focused native probe passing buffer handle/name plus
+optimal-image export/import/bind. The session-0 Blender run cannot prove visible
+interactive presentation; that final observation belongs in the desktop/VNC
+session.
+
 ## Dockur/WinBoat fresh installation — automatic path verified (2026-08-05)
 
 A new Dockur Windows 11 VM was installed from an empty 90 GB qcow2 using the

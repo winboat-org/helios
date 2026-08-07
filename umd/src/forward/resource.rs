@@ -485,6 +485,7 @@ pub(crate) unsafe fn finish_wddm_tex2d(
     scanout: Option<ScanoutGeometry>,
 ) {
     let (memory, memory_size, memory_offset, resource_id) = dxvk_resource_memory_info(h, &res);
+    let needs_importable = needs_wddm_texture_allocation(a);
     let (backing_blob_id, backing_blob_size, backing_resource_id) = if memory != 0
         && memory_offset == 0
         && memory <= u32::MAX as u64
@@ -496,7 +497,6 @@ pub(crate) unsafe fn finish_wddm_tex2d(
         // suballocated DXVK memory means a cross-process opener sees a
         // disconnected KMD blob (two-memory split), so shout. Private
         // textures are suballocated by design (18th session).
-        let needs_importable = needs_wddm_texture_allocation(a);
         if memory != 0 && needs_importable {
             log_error!(
                     "DDI create_resource(tex2d): SHARED RESOURCE WITHOUT IMPORTABLE BACKING memory=0x{:x} res_id={} size={} offset={} bind=0x{:x} misc=0x{:x}",
@@ -539,6 +539,24 @@ pub(crate) unsafe fn finish_wddm_tex2d(
         memory_type_index,
         global_vidmm_tracker,
     );
+    // A shared/present/primary texture must bind its WDDM allocation to the
+    // exact exportable Venus resource that backs the DXVK image. Falling back
+    // to a fresh KMD blob would create two disconnected allocations; treating
+    // a bare VkDeviceMemory id as a blob id is worse, because virglrenderer
+    // rejects the non-exportable memory and destroys the Venus context.
+    if needs_importable && backing.is_none() {
+        log_error!(
+            "DDI create_resource(tex2d): SHARED RESOURCE WITHOUT IMPORTABLE BACKING memory=0x{:x} res_id={} size={} offset={} bind=0x{:x} misc=0x{:x} -> refused",
+            memory,
+            resource_id,
+            memory_size,
+            memory_offset,
+            a.BindFlags,
+            a.MiscFlags
+        );
+        set_runtime_error(h, E_OUTOFMEMORY);
+        return;
+    }
     let (allocation, km_resource) =
         match allocate_wddm_resource(h, a, mip0, h_rt, backing, direct_scanout_primary, scanout) {
             Ok(allocation) => allocation,
