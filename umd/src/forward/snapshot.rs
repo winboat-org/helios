@@ -13,6 +13,15 @@
 //! `context.Flush()`, so `HeliosWaitFrameSubmitted` — the existing SUBMITTED
 //! gate — covers it), and ordering against frame N+1 is queue order.
 //!
+//! A device may present multiple swapchains/child surfaces with different
+//! geometries. Rings are therefore cached per exact `(width, height, format)`
+//! instead of replacing one device-global ring. Once a ring identity has
+//! crossed into the KMD it is not safe to evict: the descriptor contains a raw
+//! Venus resource ID, not a WDDM allocation reference, and its deferred host
+//! read can begin after Present returns. The cache is consequently bounded and
+//! non-evicting for the device lifetime; when full, an unknown geometry falls
+//! back to the ordinary present path.
+//!
 //! The control flow is deliberately value-threaded, never device-latched:
 //! `snapshot_for_present` returns a [`SnapshotPlan`] ONLY when the blit was
 //! recorded this present, `dxgi_present` moves that plan into
@@ -39,6 +48,16 @@ use crate::device_funcs::{SnapshotRing, SnapshotSlot};
 /// slot is re-written — and the D4a acquire additionally gates the blit on
 /// any still-in-flight host read of the slot (the designed backstop).
 pub(crate) const SNAPSHOT_RING_SLOTS: usize = 4;
+
+/// A browser can own several independently presented child surfaces. Eight
+/// geometry keys covers that shape while keeping the cache's object count
+/// strictly bounded. Reaching either limit seals new-key insertion; existing
+/// rings continue to operate.
+const SNAPSHOT_CACHE_MAX_RINGS: usize = 8;
+/// Retained dedicated backing across all rings. At 32bpp this admits one 4K
+/// ring with ample tiling/alignment headroom, or many normal window surfaces,
+/// without allowing resize churn to consume the device's full VRAM budget.
+const SNAPSHOT_CACHE_MAX_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Everything `finish_present` needs to substitute the descriptor: S_i's
 /// identity and layout, captured from the ring slot the blit just targeted.
@@ -74,10 +93,9 @@ pub(crate) static SNAP_RING_CREATE_FAILS: AtomicUsize = AtomicUsize::new(0);
 /// Blit bridge calls that failed or reported an extent mismatch. Present ran
 /// as today.
 pub(crate) static SNAP_COPY_FAILS: AtomicUsize = AtomicUsize::new(0);
-/// Presents skipped because the presented geometry moved off the ring's
-/// (resize / fullscreen transition); the ring was torn down for a lazy
-/// rebuild on the next present.
-pub(crate) static SNAP_GEOM_SKIPS: AtomicUsize = AtomicUsize::new(0);
+/// New geometry keys refused because the non-evicting cache is sealed at its
+/// hard count/byte budget. The present follows the ordinary fallback path.
+pub(crate) static SNAP_CACHE_REFUSALS: AtomicUsize = AtomicUsize::new(0);
 /// `apply_snapshot_override` refusals: the private data re-read in
 /// `finish_present` was absent or no longer matched the geometry the blit
 /// was recorded against. The stale-descriptor guard's loud half.
@@ -85,11 +103,11 @@ pub(crate) static SNAP_PRIVATE_SKIPS: AtomicUsize = AtomicUsize::new(0);
 
 fn counter_summary() -> String {
     format!(
-        "sub={} ring_fails={} copy_fails={} geom_skips={} private_skips={}",
+        "sub={} ring_fails={} copy_fails={} cache_refusals={} private_skips={}",
         SNAP_SUBSTITUTED.load(Ordering::Relaxed),
         SNAP_RING_CREATE_FAILS.load(Ordering::Relaxed),
         SNAP_COPY_FAILS.load(Ordering::Relaxed),
-        SNAP_GEOM_SKIPS.load(Ordering::Relaxed),
+        SNAP_CACHE_REFUSALS.load(Ordering::Relaxed),
         SNAP_PRIVATE_SKIPS.load(Ordering::Relaxed),
     )
 }
@@ -251,44 +269,70 @@ pub(crate) unsafe fn snapshot_for_present(
         return None;
     }
 
-    let mut ring_cell = dev.owned.snapshot_ring.borrow_mut();
-    // Geometry key check as a value, so no reference into the cell is live
-    // when the cell is reassigned below.
-    let stale_geometry: Option<(u32, u32, u32)> = ring_cell.as_ref().and_then(|ring| {
-        (ring.width != width || ring.height != height || ring.dxgi_format != dxgi_format)
-            .then_some((ring.width, ring.height, ring.dxgi_format))
+    let mut cache = dev.owned.snapshot_rings.borrow_mut();
+    let mut ring_index = cache.rings.iter().position(|ring| {
+        ring.width == width && ring.height == height && ring.dxgi_format == dxgi_format
     });
-    if let Some((old_w, old_h, old_fmt)) = stale_geometry {
-        // Geometry moved (resize / fullscreen transition): skip THIS present
-        // — a min-extent blit into a wrong-shaped slot must never be bound —
-        // tear the ring down and lazily rebuild next present.
-        let n = SNAP_GEOM_SKIPS.fetch_add(1, Ordering::Relaxed);
-        if n < 16 || n % 512 == 0 {
-            log_error!(
-                "scanout-snapshot: geometry change {}x{} fmt={} -> {}x{} fmt={}, \
-                 ring torn down for lazy rebuild ({})",
-                old_w,
-                old_h,
-                old_fmt,
-                width,
-                height,
-                dxgi_format,
-                counter_summary()
-            );
+    if ring_index.is_none() {
+        // Never evict a published ring here. The KMD can defer consuming its
+        // raw resid until after this Present returns; releasing the last COM
+        // reference would make that delayed import fatal to the Venus decoder.
+        if cache.sealed || cache.rings.len() >= SNAPSHOT_CACHE_MAX_RINGS {
+            cache.sealed = true;
+            let n = SNAP_CACHE_REFUSALS.fetch_add(1, Ordering::Relaxed);
+            if n < 16 || n % 512 == 0 {
+                log_error!(
+                    "scanout-snapshot: cache sealed, refusing new geometry {}x{} fmt={} \
+                     rings={} bytes={} limits={}/{} ({})",
+                    width,
+                    height,
+                    dxgi_format,
+                    cache.rings.len(),
+                    cache.bytes,
+                    SNAPSHOT_CACHE_MAX_RINGS,
+                    SNAPSHOT_CACHE_MAX_BYTES,
+                    counter_summary()
+                );
+            }
+            return None;
         }
-        *ring_cell = None;
-        return None;
-    }
-    if ring_cell.is_none() {
-        match build_ring(dev, h, width, height, dxgi_format) {
-            Some(ring) => *ring_cell = Some(ring),
-            None => return None, // counted + logged in build_ring
+        let Some(ring) = build_ring(dev, h, width, height, dxgi_format) else {
+            return None; // counted + logged in build_ring
+        };
+        let ring_bytes = ring
+            .slots
+            .iter()
+            .fold(0u64, |sum, slot| sum.saturating_add(slot.alloc_size));
+        let new_bytes = cache.bytes.saturating_add(ring_bytes);
+        if new_bytes > SNAPSHOT_CACHE_MAX_BYTES {
+            // This ring has never been submitted or published, so dropping it
+            // is safe. Seal before return so an over-budget geometry cannot
+            // create/drop four dedicated images every present.
+            cache.sealed = true;
+            let n = SNAP_CACHE_REFUSALS.fetch_add(1, Ordering::Relaxed);
+            if n < 16 || n % 512 == 0 {
+                log_error!(
+                    "scanout-snapshot: cache byte limit refuses {}x{} fmt={} \
+                     ring_bytes={} retained={} limit={} ({})",
+                    width,
+                    height,
+                    dxgi_format,
+                    ring_bytes,
+                    cache.bytes,
+                    SNAPSHOT_CACHE_MAX_BYTES,
+                    counter_summary()
+                );
+            }
+            return None;
         }
+        cache.bytes = new_bytes;
+        cache.rings.push(ring);
+        ring_index = Some(cache.rings.len() - 1);
     }
     // Rotate to the next slot and copy its (all-Copy) identity out, so the
     // borrow arithmetic below stays trivial.
     let (slot_index, dst_raw, plan, alloc_identity_known) = {
-        let ring = ring_cell.as_mut()?; // Some by construction above
+        let ring = cache.rings.get_mut(ring_index?)?;
         let index = ring.next % SNAPSHOT_RING_SLOTS;
         ring.next = (index + 1) % SNAPSHOT_RING_SLOTS;
         let slot = &ring.slots[index];

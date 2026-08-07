@@ -96,12 +96,9 @@ impl Drop for SnapshotSlot {
     }
 }
 
-/// The D4b snapshot ring: 4 slots rotated per direct-flip present, keyed by
-/// the presented primary's geometry. Created lazily on the first substitutable
-/// present, torn down and lazily recreated when the presented geometry moves
-/// (resize / fullscreen transition). Never handed to
-/// `dxgi_rotate_resource_identities` — its list is `a.pResources` only, so the
-/// ring is naturally excluded.
+/// One D4b snapshot ring: 4 slots rotated per present for one exact geometry.
+/// Never handed to `dxgi_rotate_resource_identities` — its list is
+/// `a.pResources` only, so the ring is naturally excluded.
 pub struct SnapshotRing {
     pub width: u32,
     pub height: u32,
@@ -110,6 +107,21 @@ pub struct SnapshotRing {
     pub slots: Vec<SnapshotSlot>,
     /// Next slot index to rotate into.
     pub next: usize,
+}
+
+/// Device-local D4b rings, one per concurrently presented geometry.
+///
+/// Snapshot descriptors cross into the KMD as raw Venus resource IDs. There
+/// is no WDDM allocation reference in that descriptor which could make a
+/// geometry-change eviction scheduler-safe, so a ring that has ever been
+/// published stays alive until device teardown. The forward path enforces a
+/// hard count/byte budget and seals the cache when a new ring would exceed it;
+/// later unknown geometries fail closed to the ordinary present path.
+#[derive(Default)]
+pub struct SnapshotRingCache {
+    pub rings: Vec<SnapshotRing>,
+    pub bytes: u64,
+    pub sealed: bool,
 }
 
 /// WDDM 2.x paging queue used to order explicit residency operations.
@@ -206,10 +218,9 @@ pub struct BridgeOwned {
     /// present-path DDIs touch it, and those stay runtime-serialized with the
     /// rest of the immediate context even under FREETHREADED caps.
     pub present_src_cache: core::cell::RefCell<Vec<PresentSrcEntry>>,
-    /// D4b snapshot ring (`None` until the first substitutable direct-flip
-    /// present builds it). Same immediate-path-only RefCell contract as
-    /// `present_src_cache`.
-    pub snapshot_ring: core::cell::RefCell<Option<SnapshotRing>>,
+    /// D4b rings, keyed by geometry and retained until device teardown. Same
+    /// immediate-path-only RefCell contract as `present_src_cache`.
+    pub snapshot_rings: core::cell::RefCell<SnapshotRingCache>,
     /// Device-global shader/layout caches for lazy `ID3D11InputLayout`
     /// creation. The d3d10umddi `CreateElementLayout` DDI does NOT pass the
     /// vertex-shader input-signature bytecode that
@@ -231,7 +242,7 @@ impl BridgeOwned {
     pub fn new() -> Self {
         Self {
             present_src_cache: core::cell::RefCell::new(Vec::new()),
-            snapshot_ring: core::cell::RefCell::new(None),
+            snapshot_rings: core::cell::RefCell::new(SnapshotRingCache::default()),
             caches: std::sync::Mutex::new(ShaderCaches::default()),
             bindings: CtxBindings::default(),
         }
@@ -260,12 +271,13 @@ impl BridgeOwned {
     pub fn release(&mut self) -> (usize, usize) {
         // Order: present caches first, shader caches last, matching the
         // pre-R807 sequence where `ia` was the field released explicitly. The
-        // snapshot ring is a cache too: dropping the slots releases their COM
-        // refs, and that is ALL its teardown — no WDDM handles, no KMD
-        // registrations to unwind (the KMD carries the descriptor by value and
-        // its executor's `resource_is_live` arm refuses a dead resid loudly).
+        // Snapshot rings are a cache too: dropping the slots releases their
+        // COM refs, and that is ALL their teardown — no WDDM handles or KMD
+        // registrations to unwind. This happens only at device teardown;
+        // mid-device eviction is forbidden because the KMD carries snapshot
+        // identities by value and may consume them after Present returns.
         self.present_src_cache.get_mut().clear();
-        self.snapshot_ring.get_mut().take();
+        *self.snapshot_rings.get_mut() = SnapshotRingCache::default();
         self.bindings.bound_vs_com.store(0, Ordering::Relaxed);
         match self.caches.get_mut() {
             Ok(caches) => caches.release_owned_com(),
@@ -299,7 +311,7 @@ pub const THREADING_CAPS_POSSIBLE: u32 =
 /// thread, concurrent with the immediate context — the state that exposes
 /// went thread-safe in Phase A ([`ShaderCaches`] mutex, [`CtxBindings`]
 /// atomics, `direct_scanout_allocations` mutex). The present-path `RefCell`s
-/// ([`BridgeOwned::present_src_cache`], [`BridgeOwned::snapshot_ring`]) and
+/// ([`BridgeOwned::present_src_cache`], [`BridgeOwned::snapshot_rings`]) and
 /// the [`RuntimeContext`] window `Cell`s remain sound: present and the other
 /// immediate-context DDIs stay runtime-serialized under FREETHREADED.
 ///
