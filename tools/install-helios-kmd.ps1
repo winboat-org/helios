@@ -93,13 +93,25 @@ function New-HeliosCatalog([string]$PackageDir, [string]$CatPath) {
   & icacls.exe $PackageDir /grant "*S-1-5-32-544:F" | Out-Null
   Remove-Item -LiteralPath $CatPath -Force -ErrorAction SilentlyContinue
   $osTargets = @("10_GE_X64", "10_NI_X64", "10_X64")
-  foreach ($os in $osTargets) {
-    Write-Host "Regenerating catalog with Inf2Cat /os:$os"
-    & $inf2cat /driver:$PackageDir /os:$os /uselocaltime
-    if ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $CatPath -PathType Leaf)) {
-      return
+  # Local builds are stamped from the developer machine's date, so keep the
+  # historical /uselocaltime attempt first. CI artifacts are stamped on UTC
+  # runners, however, and can be one calendar day ahead of a guest west of UTC.
+  # Inf2Cat's default UTC comparison is the correct fallback for those packages.
+  $timeModes = @(
+    @{ Label = "local time"; UseLocalTime = $true },
+    @{ Label = "UTC"; UseLocalTime = $false }
+  )
+  foreach ($timeMode in $timeModes) {
+    foreach ($os in $osTargets) {
+      Write-Host "Regenerating catalog with Inf2Cat /os:$os using $($timeMode.Label)"
+      $arguments = @("/driver:$PackageDir", "/os:$os")
+      if ($timeMode.UseLocalTime) { $arguments += "/uselocaltime" }
+      & $inf2cat @arguments
+      if ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $CatPath -PathType Leaf)) {
+        return
+      }
+      Write-Warning "Inf2Cat failed for /os:$os using $($timeMode.Label) (exit $LASTEXITCODE)."
     }
-    Write-Warning "Inf2Cat failed for /os:$os (exit $LASTEXITCODE)."
   }
 
   throw "Inf2Cat failed to regenerate $CatPath"
