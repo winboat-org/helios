@@ -8,9 +8,11 @@
 //! with `HELIOS_DXVK_SRC` / `HELIOS_DXVK_BUILD` / `HELIOS_CLANG_CL` if needed.
 //!
 //! Toolchain coherence (critical): DXVK, the cxx shim, and the Rust crate must
-//! all use the MSVC C++ ABI with the **dynamic** CRT (`/MD`). DXVK is compiled
-//! with clang-cl + `-Db_vscrt=md`; we compile the shim with the same clang-cl so
-//! the objects link against one another and against the Rust msvc target.
+//! all use the MSVC C++ ABI with the **static** CRT (`/MT`). A display UMD is
+//! loaded into arbitrary application directories, so `/MD` lets an app's local
+//! MSVCP/VCRUNTIME DLL override the toolset the driver was compiled against.
+//! DXVK is compiled with clang-cl + `-Db_vscrt=mt`; the shim explicitly uses
+//! `/MT`, and the Rust msvc target enables `crt-static` in `.cargo/config.toml`.
 
 use std::env;
 use std::path::{Path, PathBuf};
@@ -189,6 +191,7 @@ fn main() {
         .file("bridge/bridge_icd_exports.cpp")
         .compiler(&clang_cl)
         .archiver(&archiver)
+        .static_crt(true)
         .std("c++17")
         // DXVK (and our shim) use C++ exceptions; cxx-build disables them by default.
         .flag("/EHsc")

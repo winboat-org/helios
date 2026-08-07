@@ -12,6 +12,7 @@ $RepoRoot = (Resolve-Path -LiteralPath $RepoRoot).Path
 Import-VisualStudioEnvironment
 $clangCl = Assert-Command "clang-cl.exe"
 $llvmLib = Assert-Command "llvm-lib.exe"
+$llvmReadObj = Assert-Command "llvm-readobj.exe"
 Assert-Command "meson.exe" | Out-Null
 Assert-Command "ninja.exe" | Out-Null
 Assert-Command "cargo.exe" | Out-Null
@@ -46,7 +47,7 @@ $dxvkCppArgs = @(
 & meson.exe setup $dxvkBuild $dxvkSource `
     --native-file $nativeFile `
     --buildtype release `
-    -Db_vscrt=md `
+    -Db_vscrt=mt `
     "-Dcpp_args=$dxvkCppArgs" `
     "-Dc_args=/FI$compatHeader" `
     -Denable_d3d8=false `
@@ -98,6 +99,27 @@ foreach ($name in $required) {
     if (-not (Test-Path -LiteralPath (Join-Path $package $name) -PathType Leaf)) {
         throw "Driver package output is missing $name in $package."
     }
+}
+
+# A display UMD is loaded into arbitrary application processes. A dynamic MSVC
+# or UCRT dependency binds through that application's DLL search order; CapCut,
+# for example, supplies MSVCP140 14.28 to a UMD compiled against the 14.44 STL,
+# which leaves driver-internal std::mutex objects ABI-incompatible and crashes
+# its GPU process. Keep the shipped UMD self-contained and make CRT regressions
+# a packaging failure rather than an application-specific runtime failure.
+$umdDll = Join-Path $package "helios_umd.dll"
+$umdImports = @(& $llvmReadObj --coff-imports $umdDll 2>&1)
+if ($LASTEXITCODE -ne 0) {
+    throw "Failed to inspect helios_umd.dll imports with llvm-readobj (exit $LASTEXITCODE)."
+}
+$dynamicCrtImports = @(
+    $umdImports |
+        Where-Object { $_ -match '(?i)(MSVCP\d+|VCRUNTIME\d+(?:_\d+)?|UCRTBASE|api-ms-win-crt-[^\s]+)\.dll' } |
+        ForEach-Object { $_.Trim() } |
+        Sort-Object -Unique
+)
+if ($dynamicCrtImports.Count -ne 0) {
+    throw "helios_umd.dll imports an application-resolvable dynamic CRT: $($dynamicCrtImports -join '; ')"
 }
 
 New-Item -ItemType Directory -Force -Path $OutputDir | Out-Null
