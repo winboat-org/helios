@@ -17,7 +17,7 @@
 //!
 //! | DDI object | its create args carry | so it maps to |
 //! |---|---|---|
-//! | pool (`D3D12DDIARG_CREATE_COMMAND_POOL_0040`) | `PoolFlags` — **one enum with one value, `NONE`** | an `ID3D12CommandAllocator`, but its **type is not knowable here** |
+//! | pool (`D3D12DDIARG_CREATE_COMMAND_POOL_0040`) | `PoolFlags` — **one enum with one value, `NONE`** | one lazily-created `ID3D12CommandAllocator` per list class |
 //! | recorder (`D3D12DDIARG_CREATE_COMMAND_RECORDER_0040`) | `QueueFlags`, `RecorderFlags` | **no engine object at all** |
 //! | list (`D3D12DDIARG_CREATE_COMMAND_LIST_0040`) | `Type` (DIRECT/BUNDLE), `QueueFlags`, `ID`, `CommandListFlags`, `NodeMask` | an `ID3D12GraphicsCommandList` |
 //!
@@ -26,17 +26,17 @@
 //! `ID3D12Device::CreateCommandAllocator` takes a `D3D12_COMMAND_LIST_TYPE`; the
 //! pool's create args are a single flags word that carries no type, no size and
 //! no pointer. The only DDI that ever brings a queue class into contact with a
-//! pool is `pfnCommandRecorderSetCommandPoolAsTarget(hDevice, hRecorder,
-//! hPool)`, whose recorder *does* carry `QueueFlags`. ⇒ **this lane creates the
-//! allocator lazily, at the first bind, from the binding recorder's class**, and
-//! counts a later bind by a recorder of a *different* class (`PoolTypeMismatch`)
-//! rather than silently reusing an allocator that cannot back the new class —
-//! an `ID3D12CommandAllocator`'s type is fixed at creation.
+//! pool with the authoritative list class is `pfnResetCommandList`: the recorder
+//! names its current pool and the list being reset names DIRECT, BUNDLE, COMPUTE
+//! or COPY. ⇒ **this lane creates that pool's allocator for the exact list class
+//! lazily at first reset.** A pool can consequently serve different classes
+//! without ever passing a mismatched allocator to the engine.
 //!
 //! ⚠ `DDI_REFERENCE.md` §9.3's mapping table writes this row as
 //! *"`pfnCreateCommandPool` → `ID3D12Device::CreateCommandAllocator(type)`"* and
-//! does not say where `type` comes from. It comes from the recorder, one DDI
-//! later; the lazy creation is that gap closed, not a deviation from the table.
+//! does not say where `type` comes from. It comes from the list being reset,
+//! after its recorder names the pool; the per-class lazy creation is that gap
+//! closed, not a deviation from the table.
 //!
 //! ⭐ **The recorder has no engine object behind it, and that is a legitimate
 //! answer rather than a stub.** vkd3d fuses "the recording engine" into
@@ -56,20 +56,11 @@
 //! `Close()`"* describes the same end state reached the long way round, and the
 //! long way round is not available here.
 //!
-//! ⛔ **UNVERIFIED, and it belongs to whoever writes `pfnResetCommandList`
-//! (L3a): how a BUNDLE allocator is expressed at this DDI.** A D3D12 bundle
-//! list can only be `Reset` against a `D3D12_COMMAND_LIST_TYPE_BUNDLE`
-//! allocator, but `D3D12DDIARG_CREATE_COMMAND_RECORDER_0040` carries only
-//! `QueueFlags` (3D / COMPUTE / COPY / PAGING / video) and a `RecorderFlags`
-//! enum whose single value is `NONE` — **there is no bundle bit anywhere in the
-//! recorder's create args**, and the pool's are one flags word. So a recorder
-//! that will back a bundle is indistinguishable here from one that will back a
-//! DIRECT list, and this lane materialises a DIRECT allocator for it. ⚠ Note the
-//! `PoolTypeMismatch` counter cannot catch this: both recorders map to DIRECT,
-//! so the classes agree and nothing fires. The symptom would be
-//! `ID3D12GraphicsCommandList::Reset` failing for bundles only. Settling it
-//! needs a workload that records a bundle, which is `D12-G8`'s territory, not a
-//! header question.
+//! ⭐ **Bundles use the same rule.** The recorder carries no bundle bit, but the
+//! command list's `Type` does. At reset, that authoritative type selects the
+//! pool's BUNDLE allocator slot. Time Spy also proved why the recorder cannot be
+//! the class source: it binds a DIRECT-compatible recorder and later resets a
+//! COMPUTE list through it.
 //!
 //! # ⚠ Where the WDDM context is minted, and why the answer is "here"
 //!
@@ -293,7 +284,7 @@
 //! superseded.
 
 use core::ffi::c_void;
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
 use helios_umd_common::hr::{Hresult, E_FAIL, E_INVALIDARG, E_NOTIMPL, S_OK};
@@ -312,11 +303,12 @@ use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D12::{
     ID3D12CommandAllocator, ID3D12CommandList, ID3D12CommandQueue, ID3D12CommandSignature,
     ID3D12Device4, ID3D12GraphicsCommandList, D3D12_COMMAND_LIST_FLAG_NONE,
-    D3D12_COMMAND_LIST_TYPE, D3D12_COMMAND_LIST_TYPE_COMPUTE, D3D12_COMMAND_LIST_TYPE_COPY,
-    D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_QUEUE_DESC, D3D12_COMMAND_QUEUE_FLAG_NONE,
-    D3D12_COMMAND_SIGNATURE_DESC, D3D12_INDIRECT_ARGUMENT_DESC, D3D12_INDIRECT_ARGUMENT_TYPE,
-    D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH, D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH,
-    D3D12_INDIRECT_ARGUMENT_TYPE_DRAW, D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED,
+    D3D12_COMMAND_LIST_TYPE, D3D12_COMMAND_LIST_TYPE_BUNDLE, D3D12_COMMAND_LIST_TYPE_COMPUTE,
+    D3D12_COMMAND_LIST_TYPE_COPY, D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_QUEUE_DESC,
+    D3D12_COMMAND_QUEUE_FLAG_NONE, D3D12_COMMAND_SIGNATURE_DESC, D3D12_INDIRECT_ARGUMENT_DESC,
+    D3D12_INDIRECT_ARGUMENT_TYPE, D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH,
+    D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH, D3D12_INDIRECT_ARGUMENT_TYPE_DRAW,
+    D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED,
 };
 
 use super::fence;
@@ -620,24 +612,67 @@ pub struct QueueState {
     windows: Mutex<ContextWindows>,
 }
 
-/// The allocator a pool ends up backed by, and the class it was created for.
+/// Engine allocators materialised for one DDI command pool, indexed by command
+/// list class.
 ///
-/// One `OnceLock` payload rather than two fields, so the class can never
-/// disagree with the allocator it describes: a race between two binding threads
-/// resolves to one winner and the loser's allocator is dropped whole.
-struct PoolAllocator {
-    allocator: ID3D12CommandAllocator,
-    list_type: D3D12_COMMAND_LIST_TYPE,
+/// `D3D12DDIARG_CREATE_COMMAND_POOL_0040` carries no class, and the recorder's
+/// `QueueFlags` describes queue compatibility rather than the class of the list
+/// that will later name that recorder at `pfnResetCommandList`. Time Spy proves
+/// those can differ: a COMPUTE list arrived through a recorder whose queue class
+/// was DIRECT. The list itself is therefore the first authoritative class, so
+/// each class is initialised independently on first reset.
+struct PoolAllocators {
+    direct: OnceLock<ID3D12CommandAllocator>,
+    bundle: OnceLock<ID3D12CommandAllocator>,
+    compute: OnceLock<ID3D12CommandAllocator>,
+    copy: OnceLock<ID3D12CommandAllocator>,
+}
+
+impl PoolAllocators {
+    fn new() -> Self {
+        Self {
+            direct: OnceLock::new(),
+            bundle: OnceLock::new(),
+            compute: OnceLock::new(),
+            copy: OnceLock::new(),
+        }
+    }
+
+    fn slot(
+        &self,
+        list_type: D3D12_COMMAND_LIST_TYPE,
+    ) -> Option<&OnceLock<ID3D12CommandAllocator>> {
+        match list_type {
+            D3D12_COMMAND_LIST_TYPE_DIRECT => Some(&self.direct),
+            D3D12_COMMAND_LIST_TYPE_BUNDLE => Some(&self.bundle),
+            D3D12_COMMAND_LIST_TYPE_COMPUTE => Some(&self.compute),
+            D3D12_COMMAND_LIST_TYPE_COPY => Some(&self.copy),
+            _ => None,
+        }
+    }
+
+    fn initialized(
+        &self,
+    ) -> impl Iterator<Item = (D3D12_COMMAND_LIST_TYPE, &ID3D12CommandAllocator)> {
+        [
+            (D3D12_COMMAND_LIST_TYPE_DIRECT, self.direct.get()),
+            (D3D12_COMMAND_LIST_TYPE_BUNDLE, self.bundle.get()),
+            (D3D12_COMMAND_LIST_TYPE_COMPUTE, self.compute.get()),
+            (D3D12_COMMAND_LIST_TYPE_COPY, self.copy.get()),
+        ]
+        .into_iter()
+        .filter_map(|(list_type, allocator)| allocator.map(|allocator| (list_type, allocator)))
+    }
 }
 
 /// Per-command-pool shadow state.
 ///
-/// ⚠ Interior mutability with no lock: D3D12 DDIs are free-threaded and
-/// `OnceLock` gives a lock-free read path plus a fallible single initialisation,
-/// which is exactly the shape lazy allocator creation needs. `.set()` failing
-/// means another thread won; the loser's allocator is released by dropping it.
+/// The `Arc` lets a recorder retain the pool's allocator set without ever
+/// dereferencing runtime-owned pool private memory after `pfnDestroyCommandPool`.
+/// Each allocator slot is a `OnceLock`, so free-threaded first use has one winner
+/// and releases the losing engine object.
 pub struct PoolState {
-    allocator: OnceLock<PoolAllocator>,
+    allocators: Arc<PoolAllocators>,
 }
 
 /// Per-command-list shadow state.
@@ -682,15 +717,10 @@ pub struct CommandListState {
 
     /// The class this list was created as, from `Type` + `QueueFlags`.
     ///
-    /// ⭐ Kept for exactly one reader, and it is the instrument for the open
-    /// question this lane's module doc names: **how a BUNDLE allocator is
-    /// expressed at this DDI.** `pfnResetCommandList` must reset against an
-    /// allocator of the *list's* class, `ID3D12CommandAllocator`'s class is fixed
-    /// at creation, and `D3D12DDIARG_CREATE_COMMAND_RECORDER_0040` carries no
-    /// bundle bit — so a bundle list and its recorder disagree here and nowhere
-    /// else. Without this field the symptom is an opaque engine `E_INVALIDARG`
-    /// from `Reset`; with it, `cmdlist.rs` names the mismatch before making the
-    /// call.
+    /// ⭐ Kept so `pfnResetCommandList` can select the bound pool's allocator for
+    /// the exact list class. The recorder's queue compatibility flags are not
+    /// authoritative: Time Spy sends a COMPUTE list through a DIRECT-compatible
+    /// recorder, and only this field preserves the class the engine requires.
     list_type: D3D12_COMMAND_LIST_TYPE,
 }
 
@@ -727,47 +757,35 @@ impl CommandListState {
 }
 
 /// What a recorder is currently pointed at: the pool's identity, and an **owned**
-/// reference to the allocator that pool is backed by.
+/// reference to that pool's per-class allocator set.
 ///
 /// ⛔ **The owned reference is the whole point, and it replaces a raw
 /// `AtomicPtr<c_void>` that could not be made safe.** Until S6 Round 2 this lane
-/// stored only the pool's `pDrvPrivate` and never dereferenced it — the one
-/// reader printed it as `{:p}`. `pfnResetCommandList` (L3a) has to go the other
-/// way, from the recorder to a live `ID3D12CommandAllocator`, and re-deriving
-/// `PoolState` from a stored `pDrvPrivate` would read memory **the runtime owns
-/// and frees at `pfnDestroyCommandPool`**. That the runtime "would not" destroy a
-/// pool a recorder still targets is a claim about someone else's object
-/// lifetimes, and CLAUDE.md rule 4 wants an invariant, not a claim. Holding a
-/// reference makes the freed-pool read *unrepresentable*: the allocator outlives
-/// the pool's private block because this box owns a reference to it.
+/// stored only the pool's `pDrvPrivate` and never dereferenced it. Re-deriving
+/// `PoolState` from that identity at reset would read memory **the runtime owns
+/// and frees at `pfnDestroyCommandPool`**. The `Arc` makes that freed-pool read
+/// unrepresentable while still deferring allocator-class selection until the
+/// command list supplies the authoritative class.
 ///
 /// ⚠ `pool` is a `usize`, not a pointer: it is **identity only**, for the trace
 /// lines and the rebind check, and is never dereferenced. Storing it as an
 /// integer says so in the type.
 struct RecorderTarget {
     pool: usize,
-    allocator: ID3D12CommandAllocator,
-    /// The class that allocator was **created** for.
-    ///
-    /// ⛔ Carried rather than re-derived, because it cannot be re-derived:
-    /// `ID3D12CommandAllocator` exposes **no `GetType`** — the D3D12 API has no
-    /// way to ask an allocator its class, which is why [`PoolAllocator`] pairs
-    /// the two in the first place. `pfnResetCommandList`'s bundle check is the
-    /// reader (`cmdlist.rs`), and without this field it would have nothing to
-    /// compare the list's class against.
-    ///
-    /// ⚠ It is the **allocator's** class, not the binding recorder's. The two
-    /// differ exactly when `PoolTypeMismatch` fires, and it is the allocator's
-    /// that `ID3D12GraphicsCommandList::Reset` is judged against.
-    list_type: D3D12_COMMAND_LIST_TYPE,
+    allocators: Arc<PoolAllocators>,
 }
 
 /// Per-command-recorder shadow state. There is no engine object — see the module
 /// doc.
 pub struct RecorderState {
-    /// The engine list class this recorder records for, derived once from
+    /// The queue compatibility class from
     /// `D3D12DDIARG_CREATE_COMMAND_RECORDER_0040::QueueFlags`.
-    list_type: D3D12_COMMAND_LIST_TYPE,
+    ///
+    /// ⛔ This is diagnostic state, not an allocator class. Time Spy supplies a
+    /// DIRECT-compatible recorder for a COMPUTE list, proving that choosing an
+    /// allocator from this value is wrong. `pfnResetCommandList` supplies the
+    /// list class that selects the allocator.
+    queue_type: D3D12_COMMAND_LIST_TYPE,
     /// The pool this recorder last targeted, and that pool's allocator.
     ///
     /// ⚠ A `Mutex` rather than the `OnceLock`+atomic pair the pool uses, because
@@ -818,8 +836,8 @@ pub struct RecorderState {
 //     none is expected to;
 //   * ⚠ concurrent **reads** across free-threaded workers are permitted by `&`
 //     and are the expected case. The two fields that change after construction
-//     are `PoolState::allocator`, a `OnceLock` because a pool's allocator is
-//     created once and never replaced, and `RecorderState::target`, a
+//     are the `OnceLock` slots inside `PoolState::allocators`, each initialised
+//     once for one list class, and `RecorderState::target`, a
 //     `Mutex<Option<RecorderTarget>>` because a recorder's target is
 //     **rebindable** and so has no initialise-once shape to exploit. There is
 //     deliberately no `&mut` accessor.
@@ -834,7 +852,8 @@ pub struct RecorderState {
 //     ever held across a call back into the runtime or into the engine.
 //
 //     ⚠ The premise the compiler never checks, stated because it is a premise:
-//     `RecorderTarget` holds a windows-rs COM interface, which carries no
+//     `RecorderTarget` holds an `Arc` whose allocator slots contain windows-rs
+//     COM interfaces, which carry no
 //     `unsafe impl Send`/`Sync`. No auto-trait obligation is ever raised, because
 //     every `&RecorderState` in this file is conjured from `Slot::ptr()` inside
 //     `unsafe` rather than obtained from a `Sync` container — so the sharing
@@ -1409,9 +1428,9 @@ unsafe extern "C" fn calc_private_command_pool_size(
 /// `pfnCreateCommandPool`.
 ///
 /// ⚠ **Creates no engine object.** `D3D12DDIARG_CREATE_COMMAND_POOL_0040` is one
-/// flags word with a single legal value; the allocator this pool becomes is
-/// created at the first `pfnCommandRecorderSetCommandPoolAsTarget`, because that
-/// is the first DDI that names a queue class for it. Module doc, first section.
+/// flags word with a single legal value and carries no allocator class. The
+/// allocator for each class is created on first `pfnResetCommandList`, where the
+/// list finally supplies that authoritative class.
 ///
 /// # Safety
 /// `h_pool`'s `pDrvPrivate` must address the private block
@@ -1441,7 +1460,7 @@ unsafe extern "C" fn create_command_pool(
     // SAFETY: the slot lies in the sized private block and is currently null.
     unsafe {
         slot.store(PoolState {
-            allocator: OnceLock::new(),
+            allocators: Arc::new(PoolAllocators::new()),
         });
     }
     S_OK
@@ -1449,11 +1468,9 @@ unsafe extern "C" fn create_command_pool(
 
 /// `pfnResetCommandPool` -> `ID3D12CommandAllocator::Reset()`.
 ///
-/// Returns `VOID`. ⚠ A reset before any recorder ever targeted this pool has no
-/// allocator to reset and is counted rather than reported: there is no allocator
-/// because there was no work, so nothing is wrong yet — the failure, if any,
-/// arrives at `pfnResetCommandList`, which is L3a's slot and where a missing
-/// allocator is actually fatal.
+/// Returns `VOID`. Every class materialised for this DDI pool is reset. A reset
+/// before any list first used the pool has no engine allocator and is counted as
+/// the benign no-op it is.
 ///
 /// # Safety
 /// `h_pool` must be a handle [`create_command_pool`] returned `S_OK` for.
@@ -1466,21 +1483,25 @@ unsafe extern "C" fn reset_command_pool(
         note_refusal(&L2_REFUSALS.pool_bad_arg);
         return;
     };
-    let Some(backing) = pool.allocator.get() else {
-        note_refusal(&L2_REFUSALS.pool_reset_no_allocator);
-        return;
-    };
-    // SAFETY: `backing.allocator` is the live allocator this pool owns; `Reset`
-    // takes no arguments and returns an HRESULT.
-    if let Err(e) = unsafe { backing.allocator.Reset() } {
-        note_refusal(&L2_REFUSALS.pool_reset_engine_failed);
-        if let Some(n) = budget(&POOL_LOG) {
-            log_error!(
-                "ResetCommandPool: engine Reset failed hr={:#010x} (x{})",
-                e.code().0 as u32,
-                n + 1,
-            );
+    let mut any = false;
+    for (list_type, allocator) in pool.allocators.initialized() {
+        any = true;
+        // SAFETY: the allocator is an owned member of the pool's `Arc`; `Reset`
+        // takes no arguments and returns an HRESULT.
+        if let Err(e) = unsafe { allocator.Reset() } {
+            note_refusal(&L2_REFUSALS.pool_reset_engine_failed);
+            if let Some(n) = budget(&POOL_LOG) {
+                log_error!(
+                    "ResetCommandPool: engine Reset(type={}) failed hr={:#010x} (x{})",
+                    list_type.0,
+                    e.code().0 as u32,
+                    n + 1,
+                );
+            }
         }
+    }
+    if !any {
+        note_refusal(&L2_REFUSALS.pool_reset_no_allocator);
     }
 }
 
@@ -1499,7 +1520,8 @@ unsafe extern "C" fn destroy_command_pool(
         return;
     };
     // SAFETY: the slot holds either null or the one box `create_command_pool`
-    // moved in. Dropping the box drops the `OnceLock`, releasing the allocator.
+    // moved in. Dropping the box releases its `Arc`; recorder targets may keep
+    // the allocator set alive without touching this runtime-owned private block.
     let Some(state) = (unsafe { slot.take() }) else {
         note_refusal(&L2_REFUSALS.pool_bad_arg);
         return;
@@ -1554,7 +1576,7 @@ unsafe extern "C" fn create_command_recorder(
     // SAFETY: non-null per the check; the DDI declares it `_In_ CONST`.
     let a = unsafe { &*arg };
 
-    let Some(list_type) = engine_list_type(a.QueueFlags) else {
+    let Some(queue_type) = engine_list_type(a.QueueFlags) else {
         note_refusal(&L2_REFUSALS.recorder_class_unsupported);
         if let Some(n) = budget(&RECORDER_LOG) {
             log_error!(
@@ -1572,32 +1594,28 @@ unsafe extern "C" fn create_command_recorder(
     // SAFETY: the slot lies in the sized private block and is currently null.
     unsafe {
         slot.store(RecorderState {
-            list_type,
+            queue_type,
             target: Mutex::new(None),
         });
     }
     S_OK
 }
 
-/// `pfnCommandRecorderSetCommandPoolAsTarget` — bind a pool to a recorder, and
-/// materialise the pool's `ID3D12CommandAllocator` on first use.
+/// `pfnCommandRecorderSetCommandPoolAsTarget` — bind a pool to a recorder.
 ///
-/// ⭐ **This is the only DDI where a queue class meets a pool**, which is why the
-/// allocator is created here rather than at `pfnCreateCommandPool`. Module doc,
-/// first section.
+/// The recorder's `QueueFlags` is not the allocator class. Time Spy's exact DDI
+/// stream binds a DIRECT-compatible recorder and later resets a COMPUTE list
+/// through it. This call therefore captures the pool's owned allocator set; the
+/// list class selects and lazily creates the member at `pfnResetCommandList`.
 ///
-/// Returns `VOID`. A failed allocator creation is counted and logged but **not**
-/// raised through `pfnSetErrorCb`: the binding this slot exists to record *is*
-/// recorded either way, and removing the device over a deferred allocation
-/// failure would report a transient as fatal. Its consumer, L3a's
-/// `pfnResetCommandList`, is where a missing allocator is actually fatal and is
-/// where it must be reported.
+/// Returns `VOID`; there is no engine call and therefore no deferred failure at
+/// this point.
 ///
 /// # Safety
 /// `h_device` must be a live device handle, `h_recorder` a live recorder handle
 /// and `h_pool` a live pool handle.
 unsafe extern "C" fn command_recorder_set_command_pool_as_target(
-    h_device: ddi12::D3D12DDI_HDEVICE,
+    _h_device: ddi12::D3D12DDI_HDEVICE,
     h_recorder: ddi12::D3D12DDI_HCOMMANDRECORDER_0040,
     h_pool: ddi12::D3D12DDI_HCOMMANDPOOL_0040,
 ) {
@@ -1626,90 +1644,11 @@ unsafe extern "C" fn command_recorder_set_command_pool_as_target(
         h_pool.pDrvPrivate,
     );
 
-    // Already backed? Then the only things left to do are to check that the class
-    // the allocator was created for still matches this recorder's, and to adopt
-    // it as this recorder's target.
-    if let Some(backing) = pool.allocator.get() {
-        if backing.list_type != recorder.list_type {
-            note_refusal(&L2_REFUSALS.pool_type_mismatch);
-            if let Some(n) = budget(&POOL_LOG) {
-                log_error!(
-                    "CommandRecorderSetCommandPoolAsTarget: pool is backed by a type-{} allocator \
-                     and this recorder records type {} -- an ID3D12CommandAllocator's type is \
-                     fixed at creation, so the existing allocator is kept (x{})",
-                    backing.list_type.0,
-                    recorder.list_type.0,
-                    n + 1,
-                );
-            }
-        }
-        // ⚠ Bound even on the mismatch path, and deliberately: the binding this
-        // slot exists to record happened, the mismatch is counted, and
-        // `pfnResetCommandList` failing against an allocator of the wrong class
-        // is a far more legible symptom than a recorder that silently still
-        // names its previous pool.
-        bind_target(recorder, h_pool.drv_private() as usize, backing);
-        return;
-    }
-
-    // SAFETY: device-scope DDI; the borrow lives only until the end of the call.
-    let Some(dev) = (unsafe { device12::device(h_device) }) else {
-        unbind_target(recorder);
-        note_refusal(&L2_REFUSALS.pool_no_device);
-        return;
-    };
-    let Some(engine) = dev.engine.d3d12_device() else {
-        unbind_target(recorder);
-        note_refusal(&L2_REFUSALS.pool_no_device);
-        return;
-    };
-    // SAFETY: `engine` is the bridge's live borrowed `ID3D12Device`; the call
-    // takes one by-value enum and returns an owned interface.
-    let created =
-        unsafe { engine.CreateCommandAllocator::<ID3D12CommandAllocator>(recorder.list_type) };
-    let allocator = match created {
-        Ok(a) => a,
-        Err(e) => {
-            unbind_target(recorder);
-            note_refusal(&L2_REFUSALS.pool_allocator_engine_failed);
-            if let Some(n) = budget(&POOL_LOG) {
-                log_error!(
-                    "CommandRecorderSetCommandPoolAsTarget: engine \
-                     CreateCommandAllocator(type={}) failed hr={:#010x} (x{})",
-                    recorder.list_type.0,
-                    e.code().0 as u32,
-                    n + 1,
-                );
-            }
-            return;
-        }
-    };
-    // ⚠ A losing `set` means another thread bound this pool first; its allocator
-    // is the pool's and ours is dropped (released) here. That is the whole
-    // free-threaded story for this field — no lock, no retry, no leak.
-    if pool
-        .allocator
-        .set(PoolAllocator {
-            allocator,
-            list_type: recorder.list_type,
-        })
-        .is_err()
-    {
-        trace_line!("CommandRecorderSetCommandPoolAsTarget: lost the allocator init race");
-    }
-    // ⛔ Read back through `pool.allocator` rather than binding the local: on the
-    // losing side of the race the local is not the pool's allocator, and binding
-    // it would give this recorder a reference to an object the pool does not own
-    // and `pfnResetCommandPool` will never reset.
-    let Some(backing) = pool.allocator.get() else {
-        // Unreachable: `set` either stored ours or found another thread's, so the
-        // `OnceLock` is initialised either way. Counted rather than asserted —
-        // this crate is `panic = "abort"`.
-        unbind_target(recorder);
-        note_refusal(&L2_REFUSALS.pool_allocator_engine_failed);
-        return;
-    };
-    bind_target(recorder, h_pool.drv_private() as usize, backing);
+    bind_target(
+        recorder,
+        h_pool.drv_private() as usize,
+        &pool.allocators,
+    );
 }
 
 /// This recorder's current pool identity, or 0.
@@ -1735,16 +1674,12 @@ fn unbind_target(recorder: &RecorderState) {
     *lock_target(recorder) = None;
 }
 
-/// Point a recorder at a pool, taking its own reference to that pool's allocator.
-///
-/// The `clone` is one `AddRef`, balanced when this recorder is rebound or
-/// destroyed. It is what makes [`recorder_allocator`] unable to touch a
-/// destroyed pool's private block — see [`RecorderTarget`].
-fn bind_target(recorder: &RecorderState, pool: usize, backing: &PoolAllocator) {
+/// Point a recorder at a pool, retaining the allocator set independently of the
+/// runtime-owned pool private block.
+fn bind_target(recorder: &RecorderState, pool: usize, allocators: &Arc<PoolAllocators>) {
     *lock_target(recorder) = Some(RecorderTarget {
         pool,
-        allocator: backing.allocator.clone(),
-        list_type: backing.list_type,
+        allocators: Arc::clone(allocators),
     });
 }
 
@@ -1765,18 +1700,16 @@ fn lock_target(recorder: &RecorderState) -> MutexGuard<'_, Option<RecorderTarget
 /// What [`recorder_allocator`] found when a `pfnResetCommandList` asked a
 /// recorder for the allocator to reset against.
 ///
-/// ⭐ Three distinguishable failures rather than one `Option`, because they are
-/// three different findings and L3a counts them apart: a handle the runtime
-/// invented, a recorder the runtime never bound, and a pool whose allocator
-/// creation failed at `pfnCommandRecorderSetCommandPoolAsTarget`.
+/// Distinguishable failures rather than one `Option`, so L3a can report the
+/// reset failure through the command-list error callback without guessing why
+/// no allocator exists.
 pub(crate) enum RecorderAllocator {
     /// The recorder names a pool and that pool is backed.
     Ready {
         /// **Owned** — one `AddRef` the caller releases by dropping.
         allocator: ID3D12CommandAllocator,
-        /// The class that allocator was created for. See
-        /// [`RecorderTarget::list_type`]: the API cannot be asked, so it is
-        /// carried.
+        /// The class requested by the command list and used at creation. The API
+        /// cannot be asked for an allocator's class, so it is carried.
         list_type: D3D12_COMMAND_LIST_TYPE,
     },
     /// The recorder handle did not resolve to a live [`RecorderState`].
@@ -1784,33 +1717,91 @@ pub(crate) enum RecorderAllocator {
     /// No `pfnCommandRecorderSetCommandPoolAsTarget` has ever run on it, so
     /// there is no pool and no allocator.
     NoPoolBound,
+    /// The device or engine device needed for lazy creation was unavailable.
+    NoDevice,
+    /// The command list named a class this allocator set does not support.
+    UnsupportedClass,
+    /// `ID3D12Device::CreateCommandAllocator` failed.
+    EngineFailed,
 }
 
 /// The allocator `pfnResetCommandList` must reset a list against.
 ///
 /// ⭐ **`pub(crate)` because L3a's `pfnResetCommandList` is its only caller and
 /// the chain it walks is entirely this lane's private state** — recorder ->
-/// bound pool -> `ID3D12CommandAllocator`. `PARALLEL.md` §4 gives L3a the slot
-/// and this lane the three objects, and this function is that seam, in the file
-/// that owns the objects. ⛔ It returns an **owned** reference rather than a
-/// borrow because the target sits behind a `Mutex`; see [`RecorderState::target`].
+/// bound pool -> per-class `ID3D12CommandAllocator`. `PARALLEL.md` §4 gives L3a
+/// the slot and this lane the three objects, and this function is that seam, in
+/// the file that owns the objects. ⛔ It clones the target's `Arc` while holding
+/// the recorder mutex, then releases that mutex before entering the engine.
 ///
 /// # Safety
 /// As [`recorder_state`], for a handle [`create_command_recorder`] returned
 /// `S_OK` for.
 pub(crate) unsafe fn recorder_allocator(
+    h_device: ddi12::D3D12DDI_HDEVICE,
     h_recorder: ddi12::D3D12DDI_HCOMMANDRECORDER_0040,
+    list_type: D3D12_COMMAND_LIST_TYPE,
 ) -> RecorderAllocator {
     // SAFETY: forwarded unchanged; the caller's guarantee is `recorder_state`'s.
     let Some(recorder) = (unsafe { recorder_state(h_recorder) }) else {
         return RecorderAllocator::NoRecorder;
     };
-    match lock_target(recorder).as_ref() {
-        Some(target) => RecorderAllocator::Ready {
-            allocator: target.allocator.clone(),
-            list_type: target.list_type,
-        },
-        None => RecorderAllocator::NoPoolBound,
+    let allocators = match lock_target(recorder).as_ref() {
+        Some(target) => Arc::clone(&target.allocators),
+        None => return RecorderAllocator::NoPoolBound,
+    };
+    let Some(slot) = allocators.slot(list_type) else {
+        return RecorderAllocator::UnsupportedClass;
+    };
+    if let Some(allocator) = slot.get() {
+        return RecorderAllocator::Ready {
+            allocator: allocator.clone(),
+            list_type,
+        };
+    }
+
+    // SAFETY: device-scope lookup; the borrow lives only for this call.
+    let Some(dev) = (unsafe { device12::device(h_device) }) else {
+        note_refusal(&L2_REFUSALS.pool_no_device);
+        return RecorderAllocator::NoDevice;
+    };
+    let Some(engine) = dev.engine.d3d12_device() else {
+        note_refusal(&L2_REFUSALS.pool_no_device);
+        return RecorderAllocator::NoDevice;
+    };
+    // SAFETY: `engine` is the live bridge device and `list_type` is the exact
+    // class carried by the DDI command list being reset.
+    let allocator = match unsafe {
+        engine.CreateCommandAllocator::<ID3D12CommandAllocator>(list_type)
+    } {
+        Ok(allocator) => allocator,
+        Err(e) => {
+            note_refusal(&L2_REFUSALS.pool_allocator_engine_failed);
+            if let Some(n) = budget(&POOL_LOG) {
+                log_error!(
+                    "ResetCommandList: engine CreateCommandAllocator(type={}) failed \
+                     hr={:#010x} (x{})",
+                    list_type.0,
+                    e.code().0 as u32,
+                    n + 1,
+                );
+            }
+            return RecorderAllocator::EngineFailed;
+        }
+    };
+    if slot.set(allocator).is_err() {
+        trace_line!(
+            "ResetCommandList: lost type-{} allocator init race",
+            list_type.0
+        );
+    }
+    let Some(allocator) = slot.get() else {
+        note_refusal(&L2_REFUSALS.pool_allocator_engine_failed);
+        return RecorderAllocator::EngineFailed;
+    };
+    RecorderAllocator::Ready {
+        allocator: allocator.clone(),
+        list_type,
     }
 }
 
@@ -1841,13 +1832,12 @@ unsafe extern "C" fn destroy_command_recorder(
         return;
     };
     trace_line!(
-        "DestroyCommandRecorder: recorder={:p} type={} lastPool={:#x}",
+        "DestroyCommandRecorder: recorder={:p} queueType={} lastPool={:#x}",
         h_recorder.pDrvPrivate,
-        state.list_type.0,
+        state.queue_type.0,
         target_pool_identity(&state),
     );
-    // Dropping the box drops the target, releasing this recorder's own reference
-    // to its pool's allocator.
+    // Dropping the box drops the target's `Arc` reference to the pool allocators.
     drop(state);
 }
 
@@ -1930,66 +1920,34 @@ unsafe extern "C" fn create_command_list(
     // SAFETY: non-null per the check; the DDI declares it `_In_ CONST`.
     let a = unsafe { &*arg };
 
-    // ⛔⛔ **A BUNDLE is REFUSED HERE, at create, and that is the only honest
-    // place for it.** `D3D12DDIARG_CREATE_COMMAND_RECORDER_0040` is
-    // `{ QueueFlags, RecorderFlags }` and `D3D12DDI_COMMAND_QUEUE_FLAGS`
-    // enumerates NONE / 3D / COMPUTE / COPY / PAGING / VIDEO_* with **no bundle
-    // bit** — so `engine_list_type` can only ever answer DIRECT, COMPUTE or
-    // COPY, and this driver can never mint a BUNDLE `ID3D12CommandAllocator`.
-    // An `ID3D12CommandAllocator`'s class is fixed at creation and the engine
-    // enforces the pairing unconditionally (`libs/vkd3d/bundle.c:239-245`,
-    // `:411-427`), so a bundle list accepted here is a list whose
-    // `pfnResetCommandList` is **guaranteed** to fail.
-    //
-    // ⛔ Accepting it and failing later is the "succeed at create, fail at
-    // submit" shape this project forbids. Worse, concretely: the reset arm's
-    // only channel is an error callback, so every bundle a legal application
-    // records would have taken the device — the compositor's, if DWM is the
-    // application. Refusing at create instead fails
-    // `ID3D12Device::CreateCommandList` with an HRESULT the application
-    // receives and can act on, which is what a driver that lacks a capability
-    // is supposed to do.
-    //
-    // ⚠ **This is a real capability gap and the counter is not a formality.**
-    // Bundles are core D3D12 with no cap to decline them, so a workload that
-    // uses them loses work here. The fix is one `ID3D12CommandAllocator` per
-    // (pool, class) — `CreateCommandAllocator(BUNDLE)` on first use by a bundle
-    // list — and the commit that lands it deletes this arm. Until then the
-    // refusal is visible, counted, and survivable.
-    if a.Type == ddi12::D3D12DDI_COMMAND_LIST_TYPE_D3D12DDI_COMMAND_LIST_TYPE_BUNDLE {
-        note_refusal(&L2_REFUSALS.bundle_list_refused);
+    // `Type` distinguishes DIRECT-style lists from BUNDLE; COMPUTE and COPY are
+    // expressed by `QueueFlags`. Bundle is authoritative by itself, while the
+    // other DDI type must be translated through the queue flags. The resulting
+    // API class is also the class that lazily selects this pool's allocator at
+    // reset, so the two engine objects cannot disagree.
+    let list_type = if a.Type
+        == ddi12::D3D12DDI_COMMAND_LIST_TYPE_D3D12DDI_COMMAND_LIST_TYPE_BUNDLE
+    {
+        Some(D3D12_COMMAND_LIST_TYPE_BUNDLE)
+    } else if a.Type
+        == ddi12::D3D12DDI_COMMAND_LIST_TYPE_D3D12DDI_COMMAND_LIST_TYPE_DIRECT
+    {
+        engine_list_type(a.QueueFlags)
+    } else {
+        None
+    };
+    let Some(list_type) = list_type else {
+        note_refusal(&L2_REFUSALS.command_list_class_unsupported);
         if let Some(n) = budget(&LIST_LOG) {
             log_error!(
-                "CreateCommandList: BUNDLE refused -- D3D12DDIARG_CREATE_COMMAND_RECORDER_0040 \
-                 carries no bundle bit, so this driver can never mint a BUNDLE command \
-                 allocator and the paired ResetCommandList could not succeed (x{})",
+                "CreateCommandList: Type={} QueueFlags={:#x} names no class this driver \
+                 backs -> E_INVALIDARG (x{})",
+                a.Type,
+                a.QueueFlags,
                 n + 1,
             );
         }
         return E_INVALIDARG;
-    }
-
-    // ⚠ `Type` is only DIRECT or BUNDLE (`d3d12umddi.h:1425-1429`); COMPUTE and
-    // COPY are expressed through `QueueFlags`, not through a list type
-    // (`DDI_REFERENCE.md` §8.1). BUNDLE is refused above, so the remaining
-    // answer comes from `QueueFlags` alone.
-    let list_type = {
-        match engine_list_type(a.QueueFlags) {
-            Some(t) => t,
-            None => {
-                note_refusal(&L2_REFUSALS.command_list_class_unsupported);
-                if let Some(n) = budget(&LIST_LOG) {
-                    log_error!(
-                        "CreateCommandList: Type={} QueueFlags={:#x} names no class this driver \
-                         backs -> E_INVALIDARG (x{})",
-                        a.Type,
-                        a.QueueFlags,
-                        n + 1,
-                    );
-                }
-                return E_INVALIDARG;
-            }
-        }
     };
 
     // ⚠ `D3D12DDI_COMMAND_LIST_FLAGS` carries two marker hints
@@ -4135,21 +4093,17 @@ pub(crate) struct L2Refusals {
     pool_bad_arg: RefusalCounter,
     /// A pool slot could not reach the engine. **Expected 0.**
     pool_no_device: RefusalCounter,
-    /// `ID3D12Device::CreateCommandAllocator` failed at the first bind, so this
-    /// pool has no backing store. **Expected 0.**
+    /// `ID3D12Device::CreateCommandAllocator` failed at a class's first reset,
+    /// so that pool has no backing allocator for the class. **Expected 0.**
     pool_allocator_engine_failed: RefusalCounter,
-    /// A recorder of one class targeted a pool already backed by an allocator of
-    /// another, and the existing allocator was kept.
-    ///
-    /// ⛔ **Expected 0, and a hit is a real finding** — it would mean the
-    /// runtime reuses one command pool across queue classes, which this lane's
-    /// lazy-allocator mapping (module doc) cannot honour because an
-    /// `ID3D12CommandAllocator`'s type is fixed at creation. The fix, if it
-    /// fires, is one allocator per (pool, class) rather than one per pool.
+    /// ⛔ **RETIRED.** This counted a recorder class disagreeing with the single
+    /// allocator formerly attached to a pool. Pools now own one allocator slot
+    /// per list class and the list selects it at reset, so nothing increments
+    /// this counter. It remains only to preserve the append-only evidence line.
     pool_type_mismatch: RefusalCounter,
-    /// `pfnResetCommandPool` ran on a pool no recorder had ever targeted, so
-    /// there was no allocator to reset. ⚠ May legitimately be non-zero: a pool
-    /// created and reset before any recording is a no-op, not a fault.
+    /// `pfnResetCommandPool` ran before any class allocator had been created.
+    /// ⚠ May legitimately be non-zero: a pool created and reset before any
+    /// recording is a no-op, not a fault.
     pool_reset_no_allocator: RefusalCounter,
     /// `ID3D12CommandAllocator::Reset` failed. ⚠ May legitimately be non-zero:
     /// D3D12 requires the GPU to be done with the allocator's lists first, and
@@ -4232,19 +4186,9 @@ pub(crate) struct L2Refusals {
     /// after a refused create is still legal and still silent — the slot was cleared
     /// by the create, so `release` finds null and does nothing.
     command_signature_destroy_unexpected: RefusalCounter,
-    /// `pfnCreateCommandList` was asked for a BUNDLE and refused.
-    ///
-    /// ⚠ **Expected 0 on a workload that records no bundles, and NON-ZERO — with
-    /// lost application work — on one that does.** This is a real capability gap,
-    /// not an instrument: `D3D12DDIARG_CREATE_COMMAND_RECORDER_0040` carries no
-    /// bundle bit, so no BUNDLE `ID3D12CommandAllocator` can be minted and the
-    /// paired `pfnResetCommandList` could never succeed. Refusing at create is
-    /// the survivable end of that: the application gets a failed
-    /// `ID3D12Device::CreateCommandList` instead of a removed device.
-    ///
-    /// ⛔ It is the counter that says whether the one-allocator-per-(pool, class)
-    /// fix is worth doing yet. A non-zero reading on a real workload is what
-    /// promotes it from a named gap to scheduled work.
+    /// ⛔ **RETIRED.** Bundle lists now create normally and select a BUNDLE
+    /// allocator from the bound pool at reset. Nothing increments this counter;
+    /// it remains only to preserve the append-only evidence line.
     bundle_list_refused: RefusalCounter,
     /// `pfnExecuteCommandLists` was called with an unresolvable queue, a null
     /// array, or a count above `MAX_EXECUTE_COMMAND_LISTS`. **Expected 0.**

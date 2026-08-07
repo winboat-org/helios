@@ -10,12 +10,19 @@
 //! selected by which of its two `_In_opt_` argument pointers are non-NULL
 //! (`DDI_REFERENCE.md` §7.3(1), from `ResourceHeaps.md:1180`):
 //!
-//! | `pCreateHeap` | `pCreateResource` | public API | this file |
+//! | `pCreateHeap` | `pCreateResource` | DDI meaning | this file |
 //! |---|---|---|---|
-//! | non-NULL | non-NULL | `CreateCommittedResource` | [`create_committed`] |
+//! | non-NULL | non-NULL | fused heap + base resource | [`create_fused_heap_and_resource`] |
 //! | non-NULL | NULL | `CreateHeap` | [`create_heap_only`] |
-//! | NULL | non-NULL | `CreatePlacedResource` / `CreateReservedResource` | [`create_placed_or_reserved`] |
+//! | NULL | non-NULL | child resource / reserved resource | [`create_placed_or_reserved`] |
 //! | NULL | NULL | illegal | refused, `HeapResourceCreateBadArg` |
+//!
+//! DDI 0110 does not say whether the fused row came from an API committed
+//! resource or an explicit heap with a base resource. The forwarding
+//! representation is deliberately identical for both: an engine heap plus an
+//! offset-zero engine resource. DDI 0115 added an `IMPLICIT` bit specifically
+//! because distinguishing those API origins before then required heuristics;
+//! this driver does not use one.
 //!
 //! ⛔ CLAUDE.md's *"validate every runtime-supplied size & offset per-arm, not
 //! max-union"* applies literally here: the RenderGdi ~48 % drop bug was exactly
@@ -157,7 +164,7 @@ use helios_umd_common::slot::{Boxed, Slot};
 
 use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D12::{
-    ID3D12Device10, ID3D12Heap, ID3D12ProtectedResourceSession, ID3D12Resource,
+    ID3D12Device10, ID3D12Heap, ID3D12Resource,
     D3D12_BARRIER_LAYOUT, D3D12_BARRIER_LAYOUT_COMMON, D3D12_BARRIER_LAYOUT_COPY_DEST,
     D3D12_BARRIER_LAYOUT_COPY_SOURCE, D3D12_BARRIER_LAYOUT_GENERIC_READ,
     D3D12_BARRIER_LAYOUT_SHADER_RESOURCE, D3D12_BARRIER_LAYOUT_UNDEFINED,
@@ -403,6 +410,15 @@ const MAX_NON_MSAA_ALIGNMENT: u64 = 64 * 1024;
 /// (`libs/vkd3d/device.c`, `d3d12_device_GetResourceAllocationInfo`).
 const ALLOCATION_INFO_FAILURE: u64 = u64::MAX;
 
+/// Alignment for an absent driver-private metadata block.
+///
+/// The size is zero, but the alignment must still be a valid power of two.
+/// D3D12Core runs both additional-data fields through its align-up arithmetic
+/// unconditionally; zero makes `size + alignment - 1` underflow and turns an
+/// otherwise valid allocation answer into the API failure sentinel.  One is
+/// the identity alignment and adds no padding.
+const EMPTY_ADDITIONAL_DATA_ALIGNMENT: u32 = 1;
+
 // ---------------------------------------------------------------------------
 // Per-object payloads — LOCAL and typed, per `DECISIONS.md` D13
 // ---------------------------------------------------------------------------
@@ -430,8 +446,8 @@ struct HeapSpan {
 /// expected case and `&` permits them by construction. Nothing here needs
 /// interior mutation, so nothing here has a lock.
 struct HeapState {
-    /// The engine heap, for the `CreateHeap` arm. `None` for the implicit heap
-    /// of a committed resource, which has no `ID3D12Heap` at the API level.
+    /// The engine heap. Current create paths always store `Some`; the option is
+    /// retained for the opened-resource lane, which is still a named refusal.
     heap: Option<ID3D12Heap>,
     /// The resource [`map_heap`] maps to obtain the heap's CPU base address.
     ///
@@ -442,8 +458,8 @@ struct HeapState {
     /// has no heap map at all, so the only Rust-reachable way to obtain a heap's
     /// CPU address is to map a resource that covers it at offset 0:
     ///
-    /// * committed arm -- the resource itself, which by definition starts at
-    ///   offset 0 of its implicit heap;
+    /// * fused arm -- the base resource, placed at offset 0 of the explicit
+    ///   engine heap used for both pre-0115 DDI meanings;
     /// * heap-only arm -- a whole-heap buffer created alongside the heap, see
     ///   [`create_heap_span_buffer`].
     ///
@@ -460,9 +476,9 @@ struct ResourceState {
     /// The engine resource. `None` only for the whole-heap object of a heap
     /// whose flags deny buffers, where no covering resource can exist.
     resource: Option<ID3D12Resource>,
-    /// Where this object sits inside an engine heap, when it does. `None` for a
-    /// committed resource: its heap is implicit and has no `ID3D12Heap`, so it
-    /// can never be a placement parent.
+    /// Where this object sits inside an engine heap. Current create paths always
+    /// store `Some`; the option keeps an unresolved opened-resource path loud
+    /// rather than inventing a heap association.
     span: Option<HeapSpan>,
     /// The API description this driver built for the resource, cached so
     /// [`check_subresource_info`] is deterministic for a given resource and
@@ -1268,8 +1284,7 @@ fn create_heap_span_buffer(
 /// honour the requested memory pool and CPU page property exactly"* -- the same
 /// posture applies to the node masks, and normalising one to 1 would be this
 /// driver deciding which adapter the runtime meant. Both heap-creating arms call
-/// it, because a committed resource creates an implicit heap from exactly the
-/// same `D3D12DDIARG_CREATEHEAP_0001`.
+/// it from the same `D3D12DDIARG_CREATEHEAP_0001` contract.
 fn note_node_masks(a: &ddi12::D3D12DDIARG_CREATEHEAP_0001) {
     if a.CreationNodeMask == 1 && a.VisibleNodeMask == 1 {
         return;
@@ -1421,9 +1436,10 @@ unsafe fn create_heap_only(
 
 /// The allocation info this driver reports for a heap's own whole-heap object.
 ///
-/// It is the heap as the runtime described it, with no additional driver data —
-/// which is the honest answer, and the one the runtime's four
-/// `AdditionalData*` checks (`DDI_REFERENCE.md` §9.7, strings:79-82) require.
+/// It is the heap as the runtime described it, with no additional driver data.
+/// The two additional-data sizes are therefore zero, while their alignments
+/// are the identity alignment rather than zero; see
+/// [`EMPTY_ADDITIONAL_DATA_ALIGNMENT`].
 fn whole_heap_allocation_info(
     byte_size: u64,
     alignment: u64,
@@ -1433,8 +1449,8 @@ fn whole_heap_allocation_info(
         AdditionalDataHeaderSize: 0,
         AdditionalDataSize: 0,
         ResourceDataAlignment: u32::try_from(alignment).unwrap_or(0),
-        AdditionalDataHeaderAlignment: 0,
-        AdditionalDataAlignment: 0,
+        AdditionalDataHeaderAlignment: EMPTY_ADDITIONAL_DATA_ALIGNMENT,
+        AdditionalDataAlignment: EMPTY_ADDITIONAL_DATA_ALIGNMENT,
         Layout: v::TL_ROW_MAJOR,
         MipLevelSwizzleTransition: [0; 5],
         PlaneSliceSwizzleTransition: [0; 2],
@@ -2228,23 +2244,27 @@ enum DeallocateForm {
     ByHandleList,
 }
 
-/// Arm 1 of the fused create: both argument pointers ->
-/// `ID3D12Device10::CreateCommittedResource3`.
+/// Arm 1 of the fused create: both argument pointers -> an explicit engine heap
+/// plus an engine resource placed at offset zero.
 ///
-/// ⭐ `ResourceHeaps.md:1186` records why the call is fused at all: *"the spec's
-/// stated reason for fusing the call is to let the driver perform a single VA
-/// commit instead of a reserve-then-commit pair"* — which is exactly what
-/// `CreateCommittedResource3` does, so the fusion survives the forward.
+/// ⭐ The DDI deliberately does not distinguish an API committed resource from
+/// an explicit heap created with a base resource. `ResourceHeaps.md:1186` gives
+/// both the same fused `(heap, resource)` shape, and DDI 0115 eventually added
+/// `D3D12DDI_HEAP_FLAG_0115_IMPLICIT` because pre-0115 drivers otherwise needed
+/// fragile heuristics to tell them apart. Helios negotiates 0110, so it must not
+/// guess. The one representation valid for both cases is an explicit engine
+/// heap with the resource at offset zero: it preserves the fused allocation for
+/// committed resources and also leaves a real heap behind when later child
+/// resources name the base resource through `ReuseBufferGPUVA`.
 ///
-/// The heap block is written too, with no `ID3D12Heap` (a committed resource's
-/// heap is implicit and has no API object) and with the resource as its map
-/// anchor: a committed resource starts at offset 0 of its own implicit heap, so
-/// its mapped base **is** the heap's base.
+/// The resource is the heap's map anchor. Its [`HeapSpan`] also makes the DDI's
+/// resource-only child arm resolve to this same heap without an `hHeap`, which
+/// is the measured Windows 11 call shape.
 ///
-/// ⭐ **It is also the only arm whose implicit heap can later be shared without a
-/// second DDI declaration**, so it is where [`adopt_committed_allocation`] runs —
+/// ⭐ **It is also the only arm that creates physical backing and a resource in
+/// one DDI declaration**, so it is where [`adopt_committed_allocation`] runs —
 /// see that function for the whole create-time identity path and for why an
-/// unadoptable committed resource fails the create.
+/// unadoptable fused resource fails the create.
 ///
 /// # Safety
 /// `heap_arg` and `res_arg` must be live for the call; both slots must be this
@@ -2259,7 +2279,7 @@ enum DeallocateForm {
 // be kept in step with the real one. Same lint and same judgement as
 // `umd/src/forward/pipeline.rs:8`.
 #[allow(clippy::too_many_arguments)]
-unsafe fn create_committed(
+unsafe fn create_fused_heap_and_resource(
     dev: &HeliosD3D12Device,
     device10: &ID3D12Device10,
     heap_arg: &ddi12::D3D12DDIARG_CREATEHEAP_0001,
@@ -2274,17 +2294,10 @@ unsafe fn create_committed(
     let Some(desc) = (unsafe { resource_desc1(res_arg) }) else {
         note_refusal(&L4_REFUSALS.heap_resource_create_bad_arg);
         log_error!(
-            "L4: CreateCommittedResource with unknown D3D12DDI_RESOURCE_TYPE {}",
+            "L4: fused heap+resource create with unknown D3D12DDI_RESOURCE_TYPE {}",
             res_arg.ResourceType,
         );
         return E_INVALIDARG;
-    };
-    let properties = D3D12_HEAP_PROPERTIES {
-        Type: D3D12_HEAP_TYPE_CUSTOM,
-        CPUPageProperty: cpu_page_property(heap_arg.CPUPageProperty),
-        MemoryPoolPreference: memory_pool(heap_arg.MemoryPool),
-        CreationNodeMask: heap_arg.CreationNodeMask,
-        VisibleNodeMask: heap_arg.VisibleNodeMask,
     };
     // SAFETY: `p_clear` is `_In_opt_` and live for the call per the caller.
     let clear = unsafe { clear_value(p_clear, res_arg.Flags) };
@@ -2296,13 +2309,49 @@ unsafe fn create_committed(
     let mut engine_heap_flags = heap_flags(heap_arg.Flags, PrimaryTranslation::VenusExport);
     // ⛔ The negotiated D3D12 DDI has no SHARED heap bit. The deployed runtime
     // sends neither HEAP_FLAG_PRIMARY nor RESOURCE_OPTIMIZATION_FLAG_PRIMARY for
-    // flip-model back buffers, then later asks dxgkrnl to share the committed
-    // resource's allocation. Therefore every committed resource must be born
-    // adoptable: this is the exact DDI arm whose implicit heap can later be
-    // shared, not a format/bind/geometry guess. The fork's private flag makes the
-    // memory dedicated and venus-exportable so pfnAllocateCb can adopt it below.
+    // flip-model back buffers, then later asks dxgkrnl to share the fused
+    // resource's allocation. Therefore every fused resource must be born
+    // adoptable: this is the exact DDI arm that creates the backing heap, not a
+    // format/bind/geometry guess. The fork's private flag makes the memory
+    // allocator-dedicated and venus-exportable so pfnAllocateCb can adopt it below.
     engine_heap_flags |= HELIOS_HEAP_FLAG_VENUS_EXPORT;
     L4_REFUSALS.committed_venus_export.bump();
+
+    let engine_heap_desc = D3D12_HEAP_DESC {
+        SizeInBytes: heap_arg.ByteSize,
+        Properties: D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_CUSTOM,
+            CPUPageProperty: cpu_page_property(heap_arg.CPUPageProperty),
+            MemoryPoolPreference: memory_pool(heap_arg.MemoryPool),
+            CreationNodeMask: heap_arg.CreationNodeMask,
+            VisibleNodeMask: heap_arg.VisibleNodeMask,
+        },
+        Alignment: heap_arg.Alignment,
+        Flags: engine_heap_flags,
+    };
+
+    let mut engine_heap: Option<ID3D12Heap> = None;
+    // SAFETY: the description and output slot are live locals. Keeping the heap
+    // explicit is the contract-preserving representation shared by both fused
+    // DDI meanings; see the function doc.
+    let heap_created = unsafe { device10.CreateHeap(&engine_heap_desc, &mut engine_heap) };
+    let heap_hr = match heap_created {
+        Ok(()) => S_OK,
+        Err(err) => err.code().0,
+    };
+    let Some(engine_heap) = engine_heap.filter(|_| heap_hr >= 0) else {
+        note_refusal(&L4_REFUSALS.heap_create_engine_failed);
+        log_error!(
+            "L4: fused CreateHeap FAILED hr={:#010x} size={} align={} pool={} cpu={} flags={:#x}",
+            heap_hr as u32,
+            heap_arg.ByteSize,
+            heap_arg.Alignment,
+            heap_arg.MemoryPool,
+            heap_arg.CPUPageProperty,
+            heap_arg.Flags,
+        );
+        return if heap_hr < 0 { heap_hr } else { E_FAIL };
+    };
 
     let mut out: Option<ID3D12Resource> = None;
     // SAFETY: every pointer argument is a live local or a bounded slice built
@@ -2311,13 +2360,12 @@ unsafe fn create_committed(
     // no protected-resource support, and an arriving session is counted in
     // `create_heap_and_resource` rather than forwarded.
     let created = unsafe {
-        device10.CreateCommittedResource3(
-            &properties,
-            engine_heap_flags,
+        device10.CreatePlacedResource2(
+            &engine_heap,
+            0,
             &desc,
             barrier_layout(res_arg.InitialBarrierLayout, is_buffer),
             clear.as_ref().map(core::ptr::from_ref),
-            None::<&ID3D12ProtectedResourceSession>,
             castable,
             &mut out,
         )
@@ -2330,7 +2378,7 @@ unsafe fn create_committed(
     let Some(resource) = out.filter(|_| hr >= 0) else {
         note_refusal(&L4_REFUSALS.resource_create_engine_failed);
         log_error!(
-            "L4: CreateCommittedResource3 FAILED hr={:#010x} type={} fmt={} {}x{}x{} mips={} \
+            "L4: fused CreatePlacedResource2(offset=0) FAILED hr={:#010x} type={} fmt={} {}x{}x{} mips={} \
              samples={} flags={:#x} layout={} heapFlags={:#x}",
             hr as u32,
             res_arg.ResourceType,
@@ -2385,11 +2433,13 @@ unsafe fn create_committed(
     unsafe {
         resource_slot.store(ResourceState {
             resource: Some(resource.clone()),
-            // ⚠ No span: a committed resource's heap has no `ID3D12Heap`, so it
-            // can never be a placement parent. A later placed create naming it
-            // is counted by `ResourcePlacementUnresolved` rather than silently
-            // mis-placed.
-            span: None,
+            // The fused DDI resource starts at zero in the explicit engine
+            // heap. A later resource-only child names this resource and adds
+            // its `ReuseBufferGPUVA.Offset` to this base.
+            span: Some(HeapSpan {
+                heap: engine_heap.clone(),
+                base_offset: 0,
+            }),
             desc,
             // ⚠ The visible-node mask comes from the heap the runtime asked
             // for, not from a constant: it is the one arm where the DDI states
@@ -2402,16 +2452,16 @@ unsafe fn create_committed(
                 res_arg,
                 heap_arg.VisibleNodeMask,
             ),
-            // The committed arm: both arg pointers were non-null, so the sizing
-            // asked for a heap block and the implicit heap stored below is this
+            // The fused arm: both arg pointers were non-null, so the sizing
+            // asked for a heap block and the explicit heap stored below is this
             // driver's to reclaim.
             owns_heap_block: true,
         });
     }
-    // SAFETY: as above, for the implicit heap's block.
+    // SAFETY: as above, for the fused heap's block.
     unsafe {
         heap_slot.store(HeapState {
-            heap: None,
+            heap: Some(engine_heap),
             map_anchor: Some(resource),
             byte_size: heap_arg.ByteSize,
         });
@@ -2532,7 +2582,8 @@ unsafe fn create_placed_or_reserved(
         }
         log_error!(
             "L4: placed resource refused -- neither ReuseBufferGPUVA nor hHeap names an engine \
-             heap this driver owns"
+             heap this driver owns (hHeap.pDrvPrivate={:p})",
+            h_heap.pDrvPrivate,
         );
         return E_INVALIDARG;
     };
@@ -2554,7 +2605,7 @@ unsafe fn create_placed_or_reserved(
     let castable = unsafe { castable_formats(res_arg) };
 
     let mut out: Option<ID3D12Resource> = None;
-    // SAFETY: as `create_committed`.
+    // SAFETY: the target heap and all description pointers are live for the call.
     let created = unsafe {
         device10.CreatePlacedResource2(
             heap,
@@ -2793,7 +2844,7 @@ unsafe extern "C" fn create_heap_and_resource(
             // driver's own blocks, cleared above; `dev` is the device this DDI was
             // dispatched on and `h_rt_resource` the runtime handle it carried.
             unsafe {
-                create_committed(
+                create_fused_heap_and_resource(
                     dev,
                     &device10,
                     heap_arg,
@@ -3359,8 +3410,10 @@ unsafe extern "C" fn open_heap_and_resource(
 ///   verbatim when either was requested"*. Echoing satisfies the second half
 ///   trivially and answers the first half honestly: a Vulkan optimal-tiled image
 ///   *is* a driver-chosen unspecified layout, which is what `_UNDEFINED` names.
-/// * **The additional-data fields are zero** because there is none: this driver
-///   attaches no metadata of its own to a resource's memory.
+/// * **The additional-data sizes are zero** because there is none. Their
+///   alignments are one, not zero: alignment remains an unconditional input to
+///   D3D12Core's packing arithmetic even for an empty block, and one is the
+///   identity alignment that adds no padding.
 /// * **The alignment is clamped.** `ResourceHeaps.md:1350`: it must be a power of
 ///   two and must never exceed 64 KiB unless `SampleDesc.Count > 1`. vkd3d
 ///   answers from Vulkan memory requirements and is under no such obligation.
@@ -3423,8 +3476,8 @@ fn allocation_info_from_engine(
         // at the 4 MB MSAA tier otherwise, so the narrowing cannot lose bits;
         // `unwrap_or(0)` is the compile-time-total form of that, not a guess.
         ResourceDataAlignment: u32::try_from(clamped).unwrap_or(0),
-        AdditionalDataHeaderAlignment: 0,
-        AdditionalDataAlignment: 0,
+        AdditionalDataHeaderAlignment: EMPTY_ADDITIONAL_DATA_ALIGNMENT,
+        AdditionalDataAlignment: EMPTY_ADDITIONAL_DATA_ALIGNMENT,
         Layout: a.Layout,
         MipLevelSwizzleTransition: [0; 5],
         PlaneSliceSwizzleTransition: [0; 2],
@@ -3445,7 +3498,7 @@ fn allocation_info_from_engine(
 /// `d3d12_device_GetResourceAllocationInfo3` does
 /// `requested = desc->Alignment; if (!desc->Alignment) requested =
 /// d3d12_resource_desc_default_alignment(desc); Alignment = max(vk, requested)`
-/// (`libs/vkd3d/device.c:9036-9041`) — while [`create_committed`] and
+/// (`libs/vkd3d/device.c:9036-9041`) — while [`create_fused_heap_and_resource`] and
 /// [`create_placed_or_reserved`] must pass 0, because the create DDI carries no
 /// alignment for them to pass. Honouring it here therefore produces the exact
 /// failure `check_existing_resource_allocation_info`'s doc says caching prevents:

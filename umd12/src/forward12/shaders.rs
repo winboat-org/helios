@@ -54,7 +54,15 @@
 //! names an `InputRegister` instead. `umd/src/forward/layout.rs:100-166`
 //! solved exactly this for D3D11 by fabricating `TEXCOORD` with the register as
 //! the semantic index on **both** sides. `pso.rs`'s element-layout translation
-//! uses the same convention, so the two agree by construction.
+//! uses the same convention for the first component. Inter-stage signatures
+//! need two extra distinctions. Multiple logical user semantics may be packed
+//! into disjoint components of one register, so the writer gives y/z/w-
+//! starting entries distinct fabricated names; otherwise `TEXCOORD1.xy` and
+//! `TEXCOORD1.zw` collapse to one key. System-value entries use their canonical
+//! `SV_*` names instead of the fabricated user-semantic key. Without that
+//! rewrite a generated pixel input such as `SV_IsFrontFace` can collide with an
+//! unrelated `TEXCOORD` output in the same register and vkd3d rejects a valid
+//! pipeline before its generated-system-value arm runs.
 //!
 //! ⛔ The one place a fabricated name is NOT enough is the tessellation patch
 //! signature: the DDI carries `D3D10_SB_NAME` token values (11..22, one per
@@ -344,6 +352,34 @@ struct SignaturePart<'a> {
     entries: &'a [ddi12::D3D12DDIARG_SIGNATURE_ENTRY_0012],
 }
 
+/// Emit the runtime's flattened signature entries while UMD12 tracing is on.
+///
+/// This is deliberately a trace rather than a refusal log: packed signatures
+/// may contain several logical semantics in different components of one
+/// register, which is legal and routine.  The fields are the exact DDI
+/// contract values used by [`build_signature_body`], so a PSO-link failure can
+/// be matched back to the two shader-create calls without guessing from the
+/// synthesised DXBC container.
+fn trace_signature_parts(stage: ShaderStage, parts: &[SignaturePart<'_>]) {
+    for part in parts {
+        let tag = core::str::from_utf8(part.tag).unwrap_or("????");
+        for (index, entry) in part.entries.iter().enumerate() {
+            trace_line!(
+                "Create{}Shader: {}[{}] sv={} reg={} mask={:#x} stream={} type={} min={}",
+                stage.name(),
+                tag,
+                index,
+                entry.SystemValue,
+                entry.Register,
+                entry.Mask,
+                entry.Stream,
+                entry.RegisterComponentType,
+                entry.MinPrecision,
+            );
+        }
+    }
+}
+
 /// Bytes per `ISG1`/`OSG1`/`PSG1` element: stream, name offset, semantic index,
 /// system value, component type, register, mask, min precision.
 ///
@@ -362,8 +398,61 @@ struct EncodedEntry {
 }
 
 const NAME_TEXCOORD: &[u8] = b"TEXCOORD\0";
+const NAME_TEXCOORD_Y: &[u8] = b"TEXCOORD_Y\0";
+const NAME_TEXCOORD_Z: &[u8] = b"TEXCOORD_Z\0";
+const NAME_TEXCOORD_W: &[u8] = b"TEXCOORD_W\0";
+const NAME_POSITION: &[u8] = b"SV_Position\0";
+const NAME_CLIP_DISTANCE: &[u8] = b"SV_ClipDistance\0";
+const NAME_CULL_DISTANCE: &[u8] = b"SV_CullDistance\0";
+const NAME_RENDER_TARGET_ARRAY_INDEX: &[u8] = b"SV_RenderTargetArrayIndex\0";
+const NAME_VIEWPORT_ARRAY_INDEX: &[u8] = b"SV_ViewportArrayIndex\0";
+const NAME_VERTEX_ID: &[u8] = b"SV_VertexID\0";
+const NAME_PRIMITIVE_ID: &[u8] = b"SV_PrimitiveID\0";
+const NAME_INSTANCE_ID: &[u8] = b"SV_InstanceID\0";
+const NAME_IS_FRONT_FACE: &[u8] = b"SV_IsFrontFace\0";
+const NAME_SAMPLE_INDEX: &[u8] = b"SV_SampleIndex\0";
 const NAME_TESS_FACTOR: &[u8] = b"SV_TessFactor\0";
 const NAME_INSIDE_TESS_FACTOR: &[u8] = b"SV_InsideTessFactor\0";
+
+/// A stable fabricated name for one packed register component range.
+///
+/// The flattened DDI signature preserves register and component mask but not
+/// the source semantic name. Several entries can legally share a register, so
+/// register alone is not a unique matching key. The first written component
+/// distinguishes those disjoint ranges while preserving plain `TEXCOORD` for
+/// x-starting vertex inputs, which is the element-layout bridge's key.
+fn packed_semantic_name(mask: u8) -> &'static [u8] {
+    match (u32::from(mask) & 0xf).trailing_zeros() {
+        1 => NAME_TEXCOORD_Y,
+        2 => NAME_TEXCOORD_Z,
+        3 => NAME_TEXCOORD_W,
+        _ => NAME_TEXCOORD,
+    }
+}
+
+/// The canonical semantic name for a non-patch D3D system value.
+///
+/// vkd3d first looks up an output by `(name, semantic index, stream)` and only
+/// treats a pixel-stage system value as generated when that lookup misses. A
+/// fabricated `TEXCOORD` name can therefore turn an unrelated user varying in
+/// the same register into a false match. The DDI preserves the `D3D10_SB_NAME`
+/// value even though it drops the source spelling, so the standard name is
+/// recoverable without inspecting or rewriting the DXIL program.
+fn system_semantic_name(system_value: u32) -> Option<&'static [u8]> {
+    match system_value {
+        1 => Some(NAME_POSITION),
+        2 => Some(NAME_CLIP_DISTANCE),
+        3 => Some(NAME_CULL_DISTANCE),
+        4 => Some(NAME_RENDER_TARGET_ARRAY_INDEX),
+        5 => Some(NAME_VIEWPORT_ARRAY_INDEX),
+        6 => Some(NAME_VERTEX_ID),
+        7 => Some(NAME_PRIMITIVE_ID),
+        8 => Some(NAME_INSTANCE_ID),
+        9 => Some(NAME_IS_FRONT_FACE),
+        10 => Some(NAME_SAMPLE_INDEX),
+        _ => None,
+    }
+}
 
 /// Translate one DDI signature entry's system value into the pair a DXBC
 /// signature carries.
@@ -375,9 +464,9 @@ const NAME_INSIDE_TESS_FACTOR: &[u8] = b"SV_InsideTessFactor\0";
 /// patch part the DDI's per-factor `D3D10_SB_NAME` values 11..22 must collapse
 /// onto the `D3D_NAME` values 11..16 plus a semantic index, or hull-shader tess
 /// factors never become `TessLevelOuter`/`TessLevelInner` built-ins.
-fn encode_entry(is_patch_part: bool, system_value: u32, register: u32) -> EncodedEntry {
+fn encode_entry(is_patch_part: bool, system_value: u32, register: u32, mask: u8) -> EncodedEntry {
     let passthrough = EncodedEntry {
-        name: NAME_TEXCOORD,
+        name: system_semantic_name(system_value).unwrap_or_else(|| packed_semantic_name(mask)),
         semantic_index: register,
         system_value,
     };
@@ -459,7 +548,7 @@ fn build_signature_body(part: &SignaturePart<'_>) -> Vec<u8> {
     let mut name_offsets = Vec::with_capacity(count);
     let mut names_size = 0usize;
     for e in part.entries {
-        let enc = encode_entry(is_patch_part, e.SystemValue as u32, e.Register);
+        let enc = encode_entry(is_patch_part, e.SystemValue as u32, e.Register, e.Mask);
         name_offsets.push(name_base + names_size);
         names_size += enc.name.len();
         encoded.push(enc);
@@ -823,6 +912,7 @@ unsafe fn create_shader_common(
     // SAFETY: the caller guarantees the IO signature block is live, and the arm
     // is selected by `stage` rather than by any runtime-supplied tag.
     let parts = unsafe { signature_parts(stage, &a.IOSignatures) };
+    trace_signature_parts(stage, &parts);
     let container = build_dxbc_container(&parts, code);
     trace_line!(
         "Create{}Shader: container={} bytes, {} signature part(s), code={len}",

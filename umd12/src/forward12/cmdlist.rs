@@ -58,22 +58,11 @@
 //!   sharpest form. ⛔ It is `h_rt_list`, **not** `h_device`: see
 //!   [`report_error`] for why every failure in this file is a *list*-scoped
 //!   report and what the earlier device-scoped one cost.
-//! * ⛔ `pfnResetCommandList` is where the module doc of `queue.rs` says the
-//!   bundle question lands: *"UNVERIFIED, and it belongs to whoever writes
-//!   `pfnResetCommandList` (L3a): how a BUNDLE allocator is expressed at this
-//!   DDI."* **It is answered, and the answer is that it is not expressed at all
-//!   and bundles therefore do not work yet.** The DDI carries no bundle bit and
-//!   the engine enforces the class pairing in both halves
-//!   (`command.c:7378-7382`, `bundle.c:411-427`).
-//!   ⚠ **The refusal moved one DDI earlier than this file first placed it.**
-//!   Refusing at *reset* meant `ID3D12Device::CreateCommandList` had already
-//!   returned success, so the application held a bundle it could never record
-//!   into — the "succeed at create, fail at submit" shape. `queue.rs`'s
-//!   `create_command_list` now refuses `Type == BUNDLE` up front
-//!   (`L2BundleListRefused`), so the application gets a failed create it can act
-//!   on. This slot's mismatch arm remains as the tripwire for the narrower
-//!   DIRECT/COMPUTE/COPY disagreement. The fix that lifts both is `queue.rs`'s,
-//!   one allocator per (pool, class). See [`reset_command_list`].
+//! * ⭐ `pfnResetCommandList` supplies the authoritative list class to
+//!   `queue::recorder_allocator`. The recorder identifies the pool but its queue
+//!   flags do not identify the list class—Time Spy binds a DIRECT-compatible
+//!   recorder and resets a COMPUTE list through it. The pool therefore owns one
+//!   lazy allocator slot per DIRECT/BUNDLE/COMPUTE/COPY class, selected here.
 //!
 //! # ⭐ What Round 1 routed here and the engine had already done
 //!
@@ -358,63 +347,14 @@ unsafe extern "C" fn close_command_list(h_list: ddi12::D3D12DDI_HCOMMANDLIST) {
 /// application's initial state as a separate `pfnSetPipelineState` immediately
 /// after. Passing `None` is what a driver with no PSO in its arguments can say.
 ///
-/// # ⛔ The bundle question, ANSWERED — and the answer is that bundles do not
-/// work on this driver yet
+/// # ⭐ Exact-class allocator selection
 ///
-/// `queue.rs`'s module doc records it as UNVERIFIED and routes it here: a
-/// `D3D12_COMMAND_LIST_TYPE_BUNDLE` list can only be `Reset` against a **BUNDLE**
-/// allocator, `ID3D12CommandAllocator`'s class is fixed at creation, and
-/// `D3D12DDIARG_CREATE_COMMAND_RECORDER_0040` is `{ QueueFlags, RecorderFlags }`
-/// (`d3d12umddi.rs:66130-66133`) — 3D / COMPUTE / COPY / PAGING / video and a
-/// flags word whose only enumerator is `NONE`, so **no bundle bit anywhere**.
-/// The recorder behind a bundle is indistinguishable from one behind a DIRECT
-/// list, and `queue.rs` materialises a DIRECT allocator for it.
-///
-/// ⛔ **The engine settles the rest without a run, and the mismatch is therefore
-/// refused here rather than forwarded.** Both halves of vkd3d enforce the class
-/// pairing unconditionally:
-///
-/// * a regular list — `d3d12_command_list_Reset` opens with
-///   `if (!allocator_impl || allocator_impl->type != list->type) return
-///   E_INVALIDARG;` (`vkd3d-proton-helios/libs/vkd3d/command.c:7378-7382`);
-/// * a bundle — `d3d12_bundle_Reset` resolves the allocator through
-///   `d3d12_bundle_allocator_from_iface`, which returns NULL for any allocator
-///   whose `lpVtbl` is not `d3d12_bundle_allocator_vtbl`, and answers
-///   `E_INVALIDARG` (`bundle.c:239-245`, `bundle.c:411-427`).
-///
-/// So forwarding a mismatch is a call whose failure is known in advance: it
-/// buys no measurement, and it charges the failure to `ResetEngineFailed`, which
-/// is graded **Expected 0** and exists to catch the *unforeseen* failure. The
-/// arm now counts, logs, reports and returns.
-///
-/// ⚠ **What this does NOT fix: bundles still cannot record.** A refused `Reset`
-/// leaves `d3d12_bundle::allocator` NULL, and every bundle recording method goes
-/// through `d3d12_bundle_add_command`, which dereferences it with no null test
-/// (`bundle.c:253-267` into `bundle.c:29-57`). That is why this arm **reports**
-/// rather than merely counting: `pfnResetCommandList` returns `VOID`, so the
-/// error callback is the only way to tell the runtime that the list it is about
-/// to record into is not usable, and a silent count would hand the application a
-/// null dereference inside its own process instead. This is a real correctness
-/// failure of this driver, not a capability it declines to advertise, which is
-/// the distinction `DDI_REFERENCE.md` §9.12 draws for the callback.
-///
-/// ⭐ **And the callback is `pfnSetCommandListErrorCb`, which fits this failure
-/// exactly** — see [`report_error`]. The runtime's documented response is to
-/// *"drop all calls into the driver which record commands on the specified
-/// command list"*, i.e. precisely the calls that would otherwise reach
-/// `d3d12_bundle_add_command` with a NULL allocator. The device-scoped
-/// `pfnSetErrorCb` this arm used to call also prevented the dereference, by
-/// destroying the whole `ID3D12Device` the unusable list belonged to.
-///
-/// ⛔ **The fix is one allocator per (pool, class) in `queue.rs`** — the same fix
-/// `queue.rs`'s `PoolTypeMismatch` already names, arrived at from the other
-/// direction — i.e. `CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_BUNDLE)` on
-/// first use by a bundle list. It cannot be done from this file: the bundle
-/// holds its allocator as a **raw, un-`AddRef`ed** pointer (`bundle.c:436`), so
-/// the allocator must outlive the bundle, and the only object with that lifetime
-/// is the pool — which lives in `queue.rs`, another lane's file
-/// (`PARALLEL.md` §4). A side table keyed by list handle here would have no
-/// destroy hook, because `pfnDestroyCommandList` is `queue.rs`'s too.
+/// The engine requires allocator and list classes to match for every regular
+/// list and bundle. The DDI recorder does not carry enough information to choose
+/// that class, so this call passes the command list's stored class into the
+/// queue lane. That lane selects or lazily creates the matching allocator in the
+/// bound pool. The explicit equality check below is therefore an invariant
+/// tripwire, not a normal capability refusal.
 ///
 /// # Safety
 /// `h_list` must be a live handle from `queue::create_command_list`; `arg`, when
@@ -467,7 +407,9 @@ unsafe extern "C" fn reset_command_list(
     // SAFETY: the caller guarantees `hDrvCommandRecorder` is a live recorder
     // handle; the returned allocator is owned by this call.
     let (allocator, allocator_type): (ID3D12CommandAllocator, D3D12_COMMAND_LIST_TYPE) =
-        match unsafe { queue::recorder_allocator(a.hDrvCommandRecorder) } {
+        match unsafe {
+            queue::recorder_allocator(state.h_device(), a.hDrvCommandRecorder, state.list_type())
+        } {
             RecorderAllocator::Ready {
                 allocator,
                 list_type,
@@ -491,6 +433,18 @@ unsafe extern "C" fn reset_command_list(
                 unsafe { report_error(state, E_FAIL) };
                 return;
             }
+            RecorderAllocator::NoDevice | RecorderAllocator::EngineFailed => {
+                // The queue lane already counted and logged the exact engine-side
+                // reason. This VOID DDI still owes the runtime a list-scoped
+                // failure so it will not record into an unreset engine list.
+                unsafe { report_error(state, E_FAIL) };
+                return;
+            }
+            RecorderAllocator::UnsupportedClass => {
+                note_refusal(&L3A_REFUSALS.reset_list_type_mismatch);
+                unsafe { report_error(state, E_INVALIDARG) };
+                return;
+            }
         };
 
     // ⛔ The class check, and it REFUSES rather than falling through. See the doc
@@ -501,18 +455,15 @@ unsafe extern "C" fn reset_command_list(
     // graded Expected 0 for the failures nobody predicted.
     //
     // ⚠ The allocator's class is **carried** rather than asked for:
-    // `ID3D12CommandAllocator` exposes no `GetType`, which is why
-    // `queue::PoolAllocator` pairs the two.
+    // `ID3D12CommandAllocator` exposes no `GetType`. The queue lane returns the
+    // same class that selected the per-pool allocator slot.
     if allocator_type != state.list_type() {
         note_refusal(&L3A_REFUSALS.reset_list_type_mismatch);
         if let Some(n) = budget() {
             log_error!(
-                "ResetCommandList: this list is class {} and its recorder's allocator is class \
-                 {} -- the engine rejects a mismatched allocator unconditionally, so the Reset \
-                 is refused here rather than forwarded. For a BUNDLE list this is structural: \
-                 D3D12DDIARG_CREATE_COMMAND_RECORDER_0040 carries no bundle bit, so this driver \
-                 never mints a BUNDLE allocator, and the fix is one allocator per (pool, class) \
-                 in the queue lane (x{})",
+                "ResetCommandList: this list is class {} and the selected allocator is class \
+                 {} -- per-class pool selection must make these identical, so the Reset is \
+                 refused rather than forwarding an internal invariant violation (x{})",
                 state.list_type().0,
                 allocator_type.0,
                 n + 1,
@@ -1696,13 +1647,10 @@ unsafe extern "C" fn ia_set_index_buffer_strip_cut_value(
 /// a `WARN` and nothing else. A disagreement between the two sides about which
 /// lists are bundles is worth measuring exactly because measuring it is free.
 ///
-/// ⚠ **This slot cannot work while this driver refuses bundles**, and the
-/// refusal is now at `queue::create_command_list` rather than at
-/// `pfnResetCommandList` — so in practice the runtime never reaches here with a
-/// bundle handle at all, because the application's `CreateCommandList` failed.
-/// ⛔ Which makes `L3aExecuteBundleMissing` / `L3aExecuteBundleNotBundle` the
-/// instruments for *"the runtime submitted a bundle anyway"*, a question worth
-/// keeping open; `L2BundleListRefused` is where the lost work is counted.
+/// Bundle creation and reset are supported: reset selects a BUNDLE allocator
+/// from the bound pool using the command list's stored class. The two counters
+/// here therefore retain their direct meanings—an unresolvable second handle or
+/// a runtime/driver disagreement about that handle's class.
 ///
 /// # Safety
 /// As [`draw_instanced`], for **both** handles.
@@ -2049,10 +1997,8 @@ pub(crate) struct L3aRefusals {
     /// there is no `ID3D12CommandAllocator` to reset against.
     ///
     /// ⛔ **Expected 0, and a hit is a real finding about DDI ordering**, not a
-    /// transient: `queue.rs` creates a pool's allocator lazily at the first
-    /// `pfnCommandRecorderSetCommandPoolAsTarget` precisely because that is the
-    /// only DDI where a queue class meets a pool, and this counter is what says
-    /// the runtime issued a reset before ever making that binding. It pairs with
+    /// transient: this counter says the runtime issued a list reset before ever
+    /// binding the recorder to a pool. It pairs with
     /// `PoolResetNoAllocator`, which is the *benign* half of the same shape — a
     /// pool reset before any recording is a no-op, a **list** reset before any
     /// binding is not.
@@ -2060,31 +2006,9 @@ pub(crate) struct L3aRefusals {
     /// The list's class and its recorder's allocator's class disagree, so the
     /// `Reset` was **refused** — not forwarded — and raised to the runtime.
     ///
-    /// ⛔ **Expected 0, and the one reachable case it now covers is narrow.**
-    ///
-    /// ⚠⚠ **THIS GRADING HAS BEEN WRONG TWICE, and the second time it went stale
-    /// inside the very merge that corrected the first.** Worth stating in full,
-    /// because the pattern is the point:
-    ///
-    /// 1. It first read *"a non-zero reading without `ResetEngineFailed` moving
-    ///    is the good outcome — it would mean vkd3d does not enforce the class
-    ///    pairing"*. The engine settles that without a run: it enforces in both
-    ///    halves (`command.c:7378-7382` for a regular list, `bundle.c:239-245`
-    ///    and `:411-427` by vtable identity for a bundle), so the hoped-for
-    ///    outcome cannot happen.
-    /// 2. It was then regraded to *"GUARANTEED non-zero the moment a workload
-    ///    records a BUNDLE"*. That was true when written and false by the end of
-    ///    the same merge: `queue::create_command_list` now refuses
-    ///    `Type == BUNDLE` outright (`L2BundleListRefused`), so no bundle list
-    ///    can exist to reach `pfnResetCommandList` at all.
-    ///
-    /// ⇒ **The surviving reachable case is the narrow one**: a DIRECT / COMPUTE /
-    /// COPY list whose recorder is bound to a pool already backed by an allocator
-    /// of a *different* one of those three classes. It pairs with `queue.rs`'s
-    /// `PoolTypeMismatch`, which sees the same disagreement from the binding side.
-    /// ⛔ **For bundles, read `L2BundleListRefused` instead** — that is where the
-    /// lost work now shows up, one DDI earlier. This counter stays as the
-    /// tripwire that says the refusal at create is doing its job.
+    /// ⛔ **Expected 0.** Per-class pool selection constructs the allocator from
+    /// the list's own class, so a hit now means an internal invariant violation,
+    /// not a supported runtime call shape.
     reset_list_type_mismatch: RefusalCounter,
     /// `ID3D12GraphicsCommandList::Reset` was forwarded and failed, and the
     /// failure **was** raised to the runtime.
