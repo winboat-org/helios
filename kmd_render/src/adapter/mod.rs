@@ -29,7 +29,7 @@ mod scanout;
 mod segments;
 mod tracking;
 
-pub(crate) use backing::{SystemBackingSnapshot, SystemBackingTable};
+pub(crate) use backing::{SystemBackingGuard, SystemBackingTable, MAX_SYSTEM_BACKING_RANGES};
 pub(crate) use locks::{NotifyOrdered, ScanoutGuard, WddmNotifyGuard, WITH_VIRTIO_TORN};
 pub(crate) use read_ledger::{
     dump_counters as read_ledger_dump_counters, reset_counters as read_ledger_reset_counters,
@@ -1022,7 +1022,10 @@ impl AdapterContext {
     /// goes through the `DXGKRNL_INTERFACE` callback table saved at
     /// StartDevice, not through the device object. T6/R917.
     pub(crate) fn create() -> NonNull<AdapterContext> {
-        let raw = Box::into_raw(Box::new(Self::new()));
+        // SAFETY: DxgkDdiAddDevice is documented at PASSIVE_LEVEL. The token
+        // covers the fixed-table and passive-mutex heap allocations below.
+        let passive = unsafe { crate::irql::PassiveLevel::assume() };
+        let raw = Box::into_raw(Box::new(Self::new(passive)));
         // Kernel dispatcher objects must be initialized at the context's FINAL
         // address — a KEVENT's header is self-referential.
         // SAFETY: `raw` is the final heap address, freshly allocated, and no
@@ -1034,7 +1037,7 @@ impl AdapterContext {
 
     /// Private: an `AdapterContext` by value is only ever a transient inside
     /// [`Self::create`], before the in-place dispatcher init runs.
-    fn new() -> Self {
+    fn new(passive: crate::irql::PassiveLevel) -> Self {
         Self {
             // PASSIVE_LEVEL: `create` is called from AddAdapter. Read here so the
             // AddAdapter-time caps/segment queries — which run BEFORE
@@ -1057,7 +1060,7 @@ impl AdapterContext {
             mappings: crate::mapping::MappingTable::new(),
             read_ledger: ReadLedger::new(),
             paging_pte_shadow: crate::ddi::PagingPteShadow::new(),
-            system_backings: SystemBackingTable::new(),
+            system_backings: SystemBackingTable::new(passive),
             vidmm_trackers: VidMmTrackerTable::new(),
             venus_client: UnsafeCell::new(None),
             // Zeroed placeholder — the real dispatcher header is written by

@@ -241,6 +241,7 @@ pub(crate) unsafe fn vehicle_present_prepare(
             false,
             false,
             false,
+            false,
         );
         let Some(imported) = opened else {
             let n = EXT_IMPORT_FAILS.fetch_add(1, Ordering::Relaxed);

@@ -181,6 +181,14 @@ struct AllocationContext {
     bar_eligible: bool,
     /// Provenance of `size`. See [`BackingSize`].
     size_provenance: BackingSize,
+    /// Exact create-time semantic gate for persistent system backing.
+    system_backing_policy: SystemBackingPolicy,
+    /// The backing memory is dedicated to the exact KMD-created external
+    /// Present buffer and must never be reconstructed as an image by an opener.
+    /// Kept separate from `system_backing_policy`: Vulkan object identity and
+    /// VidMm paging policy are independent contracts even though the current
+    /// standard-buffer class opts into both.
+    dedicated_present_buffer: bool,
     /// Nonzero only for a registered VidMm tracker allocation.
     vidmm_tracker_cookie: u32,
 }
@@ -225,6 +233,16 @@ struct OpenAllocationContext {
     present: Option<PresentAllocInfo>,
     /// Trace-only companion; never read by a decision path.
     present_diag: Option<PresentAllocDiag>,
+    /// Exact process/resource authorization installed in the dedicated
+    /// Present-buffer registry for this open. Kept in the open handle so every
+    /// failure unwind and CloseAllocation releases precisely what it acquired.
+    present_buffer_capability: Option<PresentBufferOpenCapability>,
+}
+
+#[derive(Clone, Copy)]
+struct PresentBufferOpenCapability {
+    resource_id: u32,
+    creator_process: usize,
 }
 
 /// Surface identity + geometry for a Present allocation-list entry, resolved from
@@ -585,6 +603,7 @@ pub(crate) struct PagingAllocInfo {
     /// inferring it; today it only feeds the `ChSzMm` cross-check.
     pub size_provenance: BackingSize,
     pub bar_eligible: bool,
+    pub system_backing_policy: SystemBackingPolicy,
     /// Current placement ([`BAR_UNPLACED`] if none).
     pub bar_placed: u64,
 }
@@ -689,6 +708,7 @@ pub(crate) unsafe fn paging_alloc_info(h: HANDLE) -> Option<PagingAllocInfo> {
         size: ctx.size as u64,
         size_provenance: ctx.size_provenance,
         bar_eligible: ctx.bar_eligible,
+        system_backing_policy: ctx.system_backing_policy,
         bar_placed: ctx.bar_placed.load(Ordering::Acquire),
     })
 }
@@ -1561,6 +1581,18 @@ struct ParsedAllocIdentity {
     /// tracker. Both zero mean the adopted allocation keeps its full charge.
     global_vidmm_tracker_share: u32,
     global_vidmm_tracker_cookie: u32,
+    /// Kind-discriminated STANDARD allocation contract flags. DEVICE_MEMORY
+    /// uses the same wire words exclusively for the VidMm tracker above.
+    standard_contract_flags: u32,
+}
+
+impl ParsedAllocIdentity {
+    fn dedicated_present_buffer(self) -> bool {
+        self.kind == HELIOS_WDDM_ALLOC_KIND_STANDARD
+            && self.standard_contract_flags
+                & helios_protocol::HELIOS_WDDM_STANDARD_CONTRACT_DEDICATED_PRESENT_BUFFER
+                != 0
+    }
 }
 
 unsafe fn read_alloc_identity(
@@ -1586,6 +1618,11 @@ unsafe fn read_alloc_identity(
             kind: ident.kind,
             global_vidmm_tracker_share: tracker.map_or(0, |tracker| tracker.global_share),
             global_vidmm_tracker_cookie: tracker.map_or(0, |tracker| tracker.cookie),
+            standard_contract_flags: if ident.dedicated_present_buffer() {
+                helios_protocol::HELIOS_WDDM_STANDARD_CONTRACT_DEDICATED_PRESENT_BUFFER
+            } else {
+                0
+            },
         });
     }
     let ap: HeliosWddmAllocPrivate = pod_read_unaligned(bytes);
@@ -1604,6 +1641,9 @@ unsafe fn read_alloc_identity(
             kind: ap.kind,
             global_vidmm_tracker_share: tracker.map_or(0, |tracker| tracker.global_share),
             global_vidmm_tracker_cookie: tracker.map_or(0, |tracker| tracker.cookie),
+            // A create-time allocation-private record predates KMD backing
+            // selection, so it cannot assert the dedicated buffer contract.
+            standard_contract_flags: 0,
         });
     }
     None
@@ -1631,12 +1671,16 @@ unsafe fn write_open_identity(
         memory_type_index: ident.memory_type_index,
         ctx_id: ident.ctx_id,
         kind: ident.kind,
-        reserved: if ident.global_vidmm_tracker_share != 0 && ident.global_vidmm_tracker_cookie != 0
+        reserved: if ident.kind == HELIOS_WDDM_ALLOC_KIND_DEVICE_MEMORY
+            && ident.global_vidmm_tracker_share != 0
+            && ident.global_vidmm_tracker_cookie != 0
         {
             [
                 ident.global_vidmm_tracker_share,
                 ident.global_vidmm_tracker_cookie,
             ]
+        } else if ident.kind == HELIOS_WDDM_ALLOC_KIND_STANDARD {
+            [ident.standard_contract_flags, 0]
         } else {
             [0; 2]
         },
@@ -1833,7 +1877,20 @@ unsafe fn destroy_allocation_ctx(
     // never recycled (`virtio/gpu.rs`), so the entry consumes a slot rather than
     // aliasing a new allocation — but the slot is never reclaimed, and the
     // Present-time mirror keys off `contains(resource_id)`.
-    adapter.system_backings.remove(ctx.resource_id);
+    // Serialize removal against any Present-time copy that already resolved
+    // this resource. After the guard is acquired, no stale backing snapshot can
+    // write after teardown withdraws the entry.
+    if let Some(content_guard) = adapter.system_backings.serialize(passive) {
+        content_guard.remove(ctx.resource_id);
+    } else {
+        // An infinite, non-alertable kernel-mutex wait has no normal failure
+        // status. If the kernel nevertheless reports one, there is no safe way
+        // to prove that an already-started mirror has finished.
+        crate::diag::record_named_bytes(b"PgLsRm", ctx.resource_id);
+        // This branch cannot obtain the proof token required by `remove`, so
+        // deliberately leak the entry (and its page lease) until adapter
+        // teardown instead of permitting a use-after-free race.
+    }
     // Retire the exact Windows/KMD allocation identity before any backing
     // resource, Venus image, or cached copy can be torn down. If QEMU cannot
     // confirm resource_id=0 scanout disable, retain every host object until
@@ -1903,6 +1960,20 @@ unsafe fn destroy_allocation_ctx(
         crate::diag::record_named_bytes(b"PBDrn", 0xE);
         // A matching ring-1 command still owns the source or destination.
         // Retain all backing state until context teardown rather than UAF it.
+        drop(ctx);
+        return;
+    }
+
+    // The external Present-buffer ABI has a real bidirectional ownership
+    // protocol. Atomically revoke new claims and wait for the exact tagged
+    // consumer/KMD submission to retire before freeing any object imported by
+    // another Vulkan device. On timeout, retain the allocation until adapter
+    // teardown; freeing it would be a cross-process GPU use-after-free.
+    if ctx.dedicated_present_buffer
+        && crate::virtio::ctrl::begin_present_buffer_teardown(passive, adapter, ctx.resource_id)
+            .is_err()
+    {
+        crate::diag::record_named_bytes(b"PBOwn", 0xEE);
         drop(ctx);
         return;
     }
@@ -2023,6 +2094,19 @@ struct CreatedBacking {
     /// created blob's size: the KMD standard-buffer arm keeps the requested
     /// size, as it always has.
     blob_size: BackingSize,
+    /// Whether an eviction's system-memory copy must remain writable by later
+    /// windowed Presents. This is decided from the allocation's semantic
+    /// backing class here, never inferred later from handles or geometry.
+    system_backing_policy: SystemBackingPolicy,
+    /// Cross-process Vulkan object identity for the exported allocation. This
+    /// is deliberately not derived later from the paging policy.
+    dedicated_present_buffer: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SystemBackingPolicy {
+    None,
+    PresentLinearBuffer,
 }
 
 /// Produce the backing for one classified allocation.
@@ -2082,6 +2166,8 @@ fn build_backing(
                 venus_alloc_size: size,
                 memory_type_index: meta.memory_type_index,
                 blob_size: BackingSize::NonHostAuthoritative(size),
+                system_backing_policy: SystemBackingPolicy::None,
+                dedicated_present_buffer: false,
             })
         }
         Backing::AdoptedUmdResource {
@@ -2126,6 +2212,8 @@ fn build_backing(
                 // provenance (adopted payloads are not BAR-eligible), but do
                 // not trust a second, potentially inconsistent create claim.
                 blob_size: BackingSize::NonHostAuthoritative(adopted_blob_size),
+                system_backing_policy: SystemBackingPolicy::None,
+                dedicated_present_buffer: false,
             })
         }
         Backing::KmdLinearPrimary { width, height } => {
@@ -2144,6 +2232,8 @@ fn build_backing(
                     venus_alloc_size: scanout.blob.size,
                     memory_type_index: scanout.memory_type_index,
                     blob_size: BackingSize::HostAuthoritative(scanout.blob.size),
+                    system_backing_policy: SystemBackingPolicy::None,
+                    dedicated_present_buffer: false,
                 }),
                 Ok(Err(_ve)) => {
                     crate::diag::record(0x0C01_00E5);
@@ -2187,6 +2277,8 @@ fn build_backing(
                     venus_alloc_size: image.blob.size,
                     memory_type_index: image.memory_type_index,
                     blob_size: BackingSize::HostAuthoritative(image.blob.size),
+                    system_backing_policy: SystemBackingPolicy::None,
+                    dedicated_present_buffer: false,
                 }),
                 Ok(Err(_ve)) => {
                     crate::diag::record_named_bytes(b"GdiOImg", 0xE1);
@@ -2211,8 +2303,14 @@ fn build_backing(
             // GDI executor's `blob_kernel_range` resolves. PASSIVE flow under the
             // venus mutex (never the DISPATCH spinlock).
             match adapter.with_venus_client(passive, |c| {
-                c.allocate_memory_blob(adapter, size, true, primary)
-                    .map(|b| (b, c.memory_type_index()))
+                if primary {
+                    // Kept for ABI-defensive completeness; classification sends
+                    // real primaries to KmdLinearPrimary before this arm.
+                    c.allocate_memory_blob(adapter, size, true, true)
+                        .map(|b| (b, c.memory_type_index()))
+                } else {
+                    c.allocate_present_buffer_blob(adapter, size)
+                }
             }) {
                 Ok(Ok((blob, kernel_mti))) => Ok(CreatedBacking {
                     resource_id: blob.res_id,
@@ -2232,6 +2330,12 @@ fn build_backing(
                     // the `venus_memory_id != 0` set `bar_eligible` used to
                     // test, so the eligible population is unchanged.
                     blob_size: BackingSize::HostAuthoritative(ap.size),
+                    system_backing_policy: if primary {
+                        SystemBackingPolicy::None
+                    } else {
+                        SystemBackingPolicy::PresentLinearBuffer
+                    },
+                    dedicated_present_buffer: !primary,
                 }),
                 Ok(Err(_ve)) => {
                     crate::diag::record(0x0C01_00E3);
@@ -2268,6 +2372,8 @@ fn build_backing(
                     venus_alloc_size: claimed_alloc_size,
                     memory_type_index: meta.memory_type_index,
                     blob_size: BackingSize::NonHostAuthoritative(size),
+                    system_backing_policy: SystemBackingPolicy::None,
+                    dedicated_present_buffer: false,
                 })
             }
             Err(_ve) => {
@@ -2408,6 +2514,8 @@ unsafe fn create_one(
     let resource_id = created.resource_id;
     let venus_memory_id = created.venus_memory_id;
     let venus_image_id = created.venus_image_id;
+    let system_backing_policy = created.system_backing_policy;
+    let dedicated_present_buffer = created.dedicated_present_buffer;
     meta.pitch = created.pitch;
     meta.plane_offset = created.plane_offset;
     meta.dxgi_format = created.dxgi_format;
@@ -2476,6 +2584,11 @@ unsafe fn create_one(
             global_vidmm_tracker_cookie: supplied_tracker
                 .filter(|_| tracker_attested)
                 .map_or(0, |tracker| tracker.cookie),
+            standard_contract_flags: if dedicated_present_buffer {
+                helios_protocol::HELIOS_WDDM_STANDARD_CONTRACT_DEDICATED_PRESENT_BUFFER
+            } else {
+                0
+            },
         };
         unsafe {
             write_open_identity(
@@ -2588,6 +2701,8 @@ unsafe fn create_one(
         bar_placed: core::sync::atomic::AtomicU64::new(BAR_UNPLACED),
         bar_eligible,
         size_provenance: created.blob_size,
+        system_backing_policy,
+        dedicated_present_buffer,
         vidmm_tracker_cookie: 0,
     });
 
@@ -2879,13 +2994,28 @@ pub unsafe extern "C" fn dxgkddi_destroy_allocation(
 ///
 /// # Safety
 /// `args.pOpenAllocation` must hold at least `upto` entries this call published.
-unsafe fn unwind_opens(args: &mut DXGKARG_OPENALLOCATION, upto: usize) {
+unsafe fn unwind_opens(adapter: &AdapterContext, args: &mut DXGKARG_OPENALLOCATION, upto: usize) {
     for j in 0..upto {
         // SAFETY: j < upto <= NumAllocations, checked by the caller.
         let prev = unsafe { &mut *args.pOpenAllocation.add(j) };
-        drop(unsafe { take_open_ctx(prev.hDeviceSpecificAllocation) });
+        if let Some(open) = unsafe { take_open_ctx(prev.hDeviceSpecificAllocation) } {
+            release_present_buffer_capability(adapter, open.present_buffer_capability);
+            drop(open);
+        }
         prev.hDeviceSpecificAllocation = core::ptr::null_mut();
     }
+}
+
+fn release_present_buffer_capability(
+    adapter: &AdapterContext,
+    capability: Option<PresentBufferOpenCapability>,
+) {
+    let Some(capability) = capability else {
+        return;
+    };
+    let _ = adapter.with_virtio(|v| {
+        v.release_present_buffer_open(capability.resource_id, capability.creator_process)
+    });
 }
 
 /// `DxgkDdiOpenAllocation` — bind a device to allocations. dxgkrnl calls this for
@@ -2908,11 +3038,13 @@ pub unsafe extern "C" fn dxgkddi_open_allocation(
     // This site used to dereference the back-pointer in ONE expression with no
     // null check at all, unlike its two siblings in scheduler.rs and
     // submit_command.rs. The checked traversal is now the only route.
-    let Some(adapter) =
-        (unsafe { crate::device::DeviceHandleRef::from_raw(h_device) }).and_then(|d| d.adapter())
-    else {
+    let Some(device) = (unsafe { crate::device::DeviceHandleRef::from_raw(h_device) }) else {
         return STATUS_INVALID_PARAMETER;
     };
+    let Some(adapter) = device.adapter() else {
+        return STATUS_INVALID_PARAMETER;
+    };
+    let creator_process = device.creator_process();
     // SAFETY: valid per the DDI contract; `pOpenAllocation` is a `*mut` array of
     // `NumAllocations` entries whose `hDeviceSpecificAllocation` we fill.
     // The struct has output fields (`Pitch`, `SubresourceOffset`) despite the WDK
@@ -2969,7 +3101,7 @@ pub unsafe extern "C" fn dxgkddi_open_allocation(
                     crate::diag::record(0x0C02_00E4);
                     crate::diag::record(0x0C3E_0000 | (resource_id & 0xFFFF));
                     record_alloc_event(resource_id, 0xDEAD, 0xDEAD, 0, true);
-                    unsafe { unwind_opens(args, i) };
+                    unsafe { unwind_opens(adapter, args, i) };
                     return STATUS_INVALID_PARAMETER;
                 }
                 Err(_de) => {
@@ -2977,7 +3109,7 @@ pub unsafe extern "C" fn dxgkddi_open_allocation(
                     // Was a bare return: a transport error mid-OpenAllocation
                     // leaked every OpenAllocationContext already published in
                     // this call. Both failure arms unwind identically now.
-                    unsafe { unwind_opens(args, i) };
+                    unsafe { unwind_opens(adapter, args, i) };
                     return STATUS_DEVICE_NOT_READY;
                 }
             }
@@ -3029,10 +3161,36 @@ pub unsafe extern "C" fn dxgkddi_open_allocation(
                 resource_private_size: args.PrivateDriverSize,
             }
         });
+        let present_buffer_capability =
+            if ident.is_some_and(|identity| identity.dedicated_present_buffer()) {
+                if creator_process == 0 {
+                    unsafe { unwind_opens(adapter, args, i) };
+                    return STATUS_INVALID_PARAMETER;
+                }
+                match adapter
+                    .with_virtio(|v| v.authorize_present_buffer_open(resource_id, creator_process))
+                {
+                    Ok(true) => Some(PresentBufferOpenCapability {
+                        resource_id,
+                        creator_process,
+                    }),
+                    Ok(false) => {
+                        unsafe { unwind_opens(adapter, args, i) };
+                        return STATUS_INSUFFICIENT_RESOURCES;
+                    }
+                    Err(_) => {
+                        unsafe { unwind_opens(adapter, args, i) };
+                        return STATUS_DEVICE_NOT_READY;
+                    }
+                }
+            } else {
+                None
+            };
         let open = Box::new(OpenAllocationContext {
             magic: OPEN_ALLOCATION_CTX_MAGIC,
             present,
             present_diag,
+            present_buffer_capability,
         });
         record_alloc_event(
             resource_id,
@@ -3109,12 +3267,17 @@ pub unsafe extern "C" fn dxgkddi_open_allocation(
 
 /// `DxgkDdiCloseAllocation` — release device-local allocation references.
 pub unsafe extern "C" fn dxgkddi_close_allocation(
-    _h_device: IN_CONST_HANDLE,
+    h_device: IN_CONST_HANDLE,
     close_allocation: IN_CONST_PDXGKARG_CLOSEALLOCATION,
 ) -> NTSTATUS {
-    if close_allocation.is_null() {
+    if h_device.is_null() || close_allocation.is_null() {
         return STATUS_INVALID_PARAMETER;
     }
+    let Some(adapter) = (unsafe { crate::device::DeviceHandleRef::from_raw(h_device) })
+        .and_then(|device| device.adapter())
+    else {
+        return STATUS_INVALID_PARAMETER;
+    };
     let args = unsafe { &*close_allocation };
     if args.NumAllocations != 0 && args.pOpenHandleList.is_null() {
         return STATUS_INVALID_PARAMETER;
@@ -3123,8 +3286,10 @@ pub unsafe extern "C" fn dxgkddi_close_allocation(
         let handle = unsafe { *args.pOpenHandleList.add(i) };
         if !handle.is_null() {
             crate::diag::record(0x0C37_0000 | ((handle as usize as u32) & 0xFFFF));
-            // Taking the context frees it; nothing in it was ever read.
-            let _ = unsafe { take_open_ctx(handle) };
+            if let Some(open) = unsafe { take_open_ctx(handle) } {
+                release_present_buffer_capability(adapter, open.present_buffer_capability);
+                drop(open);
+            }
         }
     }
     STATUS_SUCCESS

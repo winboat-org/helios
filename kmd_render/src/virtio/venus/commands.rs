@@ -112,8 +112,9 @@ impl ImageBarrier {
 
 /// One `VkBufferMemoryBarrier`, by field name.
 ///
-/// Only the WRITE direction exists: the present destination buffer is always
-/// written by the transfer and read by the host.
+/// The steady-state direction is a transfer write followed by an external
+/// reader; the initial-release constructor establishes ownership before that
+/// cycle begins.
 pub(super) struct BufferBarrier {
     buffer: VkBufferId,
     size: u64,
@@ -126,6 +127,22 @@ pub(super) struct BufferBarrier {
 }
 
 impl BufferBarrier {
+    /// First use of a newly-created exclusive buffer implicitly acquires it for
+    /// family 0. Release that initial ownership before any reusable Present
+    /// command attempts the matching EXTERNAL -> family-0 acquire.
+    pub(super) const fn initial_release_to_external(buffer: VkBufferId, size: u64) -> Self {
+        Self {
+            buffer,
+            size,
+            src_stage: PIPELINE_STAGE_TOP_OF_PIPE,
+            dst_stage: PIPELINE_STAGE_BOTTOM_OF_PIPE,
+            src_access: 0,
+            dst_access: 0,
+            src_queue_family: 0,
+            dst_queue_family: QUEUE_FAMILY_EXTERNAL,
+        }
+    }
+
     pub(super) const fn acquire_from_external(buffer: VkBufferId, size: u64) -> Self {
         Self {
             buffer,
@@ -151,9 +168,58 @@ impl BufferBarrier {
             dst_queue_family: QUEUE_FAMILY_EXTERNAL,
         }
     }
+
+    /// Make transfer writes available to CPU reads after the submission fence
+    /// is waited. Queue-family release barriers ignore their destination
+    /// synchronization scope, so this must be a separate ordinary barrier.
+    pub(super) const fn transfer_write_to_host_read(buffer: VkBufferId, size: u64) -> Self {
+        Self {
+            buffer,
+            size,
+            src_stage: PIPELINE_STAGE_TRANSFER,
+            dst_stage: PIPELINE_STAGE_HOST,
+            src_access: ACCESS_TRANSFER_WRITE,
+            dst_access: ACCESS_HOST_READ,
+            src_queue_family: QUEUE_FAMILY_IGNORED,
+            dst_queue_family: QUEUE_FAMILY_IGNORED,
+        }
+    }
 }
 
 impl VenusClient {
+    fn allocate_memory_object_with_type(
+        &mut self,
+        adapter: &AdapterContext,
+        size: u64,
+        shareable: bool,
+        memory_type_index: u32,
+    ) -> Result<VkDeviceMemoryId, VirtioError> {
+        let memory_id = self.new_memory_id();
+        let w = encode_memory_allocate(
+            self.device_id.into(),
+            memory_id.into(),
+            &MemoryAllocateSpec {
+                pnext: if shareable {
+                    MemoryPNext::Export {
+                        handle_type: EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF,
+                    }
+                } else {
+                    MemoryPNext::None
+                },
+                size,
+                memory_type_index,
+            },
+        );
+        self.ring_command_expect(
+            adapter,
+            w.as_slice()?,
+            ReplyCheck::new(CMD_ALLOCATE_MEMORY)
+                .mismatch(0x00F6)
+                .refuse_result(0x00F7),
+        )?;
+        Ok(memory_id)
+    }
+
     /// Allocate HOST_VISIBLE|HOST_COHERENT Venus device memory and bind it to a
     /// HOST3D blob. Returns the memory id (`blob_id`) and virtio resource id.
     /// The ring reply wait guarantees `vkAllocateMemory` has EXECUTED before the
@@ -170,31 +236,12 @@ impl VenusClient {
             return Err(VirtioError::OutOfMemory);
         }
         let size = round_up_page(size.max(4096));
-        let memory_id = self.new_memory_id();
-        {
-            let w = encode_memory_allocate(
-                self.device_id.into(),
-                memory_id.into(),
-                &MemoryAllocateSpec {
-                    pnext: if shareable {
-                        MemoryPNext::Export {
-                            handle_type: EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF,
-                        }
-                    } else {
-                        MemoryPNext::None
-                    },
-                    size,
-                    memory_type_index: self.memory_type_index.0,
-                },
-            );
-            self.ring_command_expect(
-                adapter,
-                w.as_slice()?,
-                ReplyCheck::new(CMD_ALLOCATE_MEMORY)
-                    .mismatch(0x00F6)
-                    .refuse_result(0x00F7),
-            )?;
-        }
+        let memory_id = self.allocate_memory_object_with_type(
+            adapter,
+            size,
+            shareable,
+            self.memory_type_index.0,
+        )?;
 
         let mut flags = 0;
         if mappable {
@@ -234,6 +281,9 @@ impl VenusClient {
             memory_id,
             allocation_size: size,
             memory_type_index: self.memory_type_index.0,
+            prepared_present_buffer: None,
+            initial_release_pool_id: None,
+            initial_release_fence_id: None,
         });
         Ok(HostVisibleBlob {
             blob_id: memory_id.get(),
@@ -241,6 +291,211 @@ impl VenusClient {
             gpa: 0,
             size,
         })
+    }
+
+    /// Select memory for a KMD standard destination from the requirements of
+    /// the exact Vulkan buffer that will consume it, then retain that buffer for
+    /// Present.  This avoids both the old device-global heap guess and a second
+    /// create/query cycle on the first frame.
+    pub fn allocate_present_buffer_blob(
+        &mut self,
+        adapter: &AdapterContext,
+        requested_size: u64,
+    ) -> Result<(HostVisibleBlob, u32), VirtioError> {
+        if self.owned_memory_blobs.len() >= MAX_OWNED_MEMORY_BLOBS {
+            return Err(VirtioError::OutOfMemory);
+        }
+        let requested_size = round_up_page(requested_size.max(4096));
+        if requested_size == 0 {
+            return Err(VirtioError::OutOfMemory);
+        }
+
+        let mut buffer_id = self.create_present_destination_buffer(adapter, requested_size)?;
+        let (mut required_size, mut alignment, mut memory_type_bits, mut dedicated_hint) =
+            match self.buffer_memory_requirements(adapter, buffer_id) {
+                Ok(requirements) => requirements,
+                Err(e) => {
+                    let _ = self.destroy_buffer_on_ring(adapter, buffer_id);
+                    return Err(e);
+                }
+            };
+        let align = alignment.max(4096);
+        let base = requested_size.max(required_size);
+        let remainder = base % align;
+        let allocation_size = match if remainder == 0 {
+            Some(base)
+        } else {
+            base.checked_add(align - remainder)
+        } {
+            Some(size) => size,
+            None => {
+                let _ = self.destroy_buffer_on_ring(adapter, buffer_id);
+                return Err(VirtioError::OutOfMemory);
+            }
+        };
+
+        // VkMemoryRequirements::size may round a buffer up beyond its logical
+        // size.  Recreate once at that aligned size so the buffer range, the
+        // VkDeviceMemory allocation, the HOST3D blob and the identity exported
+        // to the UMD all describe one exact byte extent.
+        if allocation_size != requested_size {
+            if let Err(e) = self.destroy_buffer_on_ring(adapter, buffer_id) {
+                return Err(e);
+            }
+            buffer_id = self.create_present_destination_buffer(adapter, allocation_size)?;
+            (required_size, alignment, memory_type_bits, dedicated_hint) =
+                match self.buffer_memory_requirements(adapter, buffer_id) {
+                    Ok(requirements) => requirements,
+                    Err(e) => {
+                        let _ = self.destroy_buffer_on_ring(adapter, buffer_id);
+                        return Err(e);
+                    }
+                };
+            if required_size > allocation_size || alignment == 0 || allocation_size % alignment != 0
+            {
+                let _ = self.destroy_buffer_on_ring(adapter, buffer_id);
+                return Err(VirtioError::DeviceError);
+            }
+        }
+
+        let choice = self
+            .choose_cached_host_visible_memory_type(memory_type_bits)
+            .ok_or(VirtioError::DeviceError);
+        let memory_type_index = match choice {
+            Ok(choice) => Self::accept_memory_type(choice),
+            Err(e) => {
+                let _ = self.destroy_buffer_on_ring(adapter, buffer_id);
+                return Err(e);
+            }
+        };
+        crate::diag::record_named_bytes(b"PBCBt", memory_type_bits);
+        crate::diag::record_named_bytes(b"PBCMt", memory_type_index);
+        crate::diag::record_named_bytes(
+            b"PBCMf",
+            self.memory_type_flags[memory_type_index as usize],
+        );
+        crate::diag::record_named_bytes(b"PBCDh", u32::from(dedicated_hint));
+        crate::diag::record_named_bytes(b"PBCMd", 1);
+
+        let memory_id = match self.allocate_present_buffer_memory(
+            adapter,
+            buffer_id,
+            allocation_size,
+            memory_type_index,
+        ) {
+            Ok(memory_id) => memory_id,
+            Err(e) => {
+                let _ = self.destroy_buffer_on_ring(adapter, buffer_id);
+                return Err(e);
+            }
+        };
+        if let Err(e) = self.bind_buffer_memory(adapter, buffer_id, memory_id) {
+            let _ = self.destroy_buffer_on_ring(adapter, buffer_id);
+            let _ = self.free_memory_object(adapter, memory_id);
+            return Err(e);
+        }
+
+        // A reusable Present starts with EXTERNAL -> family-0 acquire. Give the
+        // newly-created exclusive buffer a real initial family-0 -> EXTERNAL
+        // release first; otherwise the first acquire has no matching release.
+        let (initial_pool_id, initial_command_buffer_id) =
+            match self.record_initial_present_buffer_release(adapter, buffer_id, allocation_size) {
+                Ok(setup) => setup,
+                Err(e) => {
+                    let _ = self.destroy_buffer_on_ring(adapter, buffer_id);
+                    let _ = self.free_memory_object(adapter, memory_id);
+                    return Err(e);
+                }
+            };
+        let initial_fence_id = match self.create_fence(adapter) {
+            Ok(fence) => fence,
+            Err(e) => {
+                let _ = self.destroy_command_pool(adapter, initial_pool_id);
+                let _ = self.destroy_buffer_on_ring(adapter, buffer_id);
+                let _ = self.free_memory_object(adapter, memory_id);
+                return Err(e);
+            }
+        };
+
+        let res_id = match ctrl::resource_create_blob(
+            self.passive(),
+            adapter,
+            self.ctx_id(),
+            VIRTIO_GPU_BLOB_MEM_HOST3D,
+            VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE | VIRTIO_GPU_BLOB_FLAG_USE_SHAREABLE,
+            memory_id.get(),
+            allocation_size,
+        ) {
+            Ok(resource_id) => resource_id,
+            Err(e) => {
+                let _ = self.destroy_fence(adapter, initial_fence_id);
+                let _ = self.destroy_command_pool(adapter, initial_pool_id);
+                let _ = self.destroy_buffer_on_ring(adapter, buffer_id);
+                let _ = self.free_memory_object(adapter, memory_id);
+                return Err(e);
+            }
+        };
+        let _ = adapter.with_virtio(|v| v.note_blob_size(res_id, allocation_size));
+        self.owned_memory_blobs.push(OwnedMemoryBlob {
+            resource_id: res_id,
+            memory_id,
+            allocation_size,
+            memory_type_index,
+            prepared_present_buffer: Some(buffer_id),
+            // Publish every possibly-live setup object before queue submission.
+            // A transport failure can make submission ambiguous, so destroying
+            // an untracked pool/buffer in that arm would race host execution.
+            initial_release_pool_id: Some(initial_pool_id),
+            initial_release_fence_id: Some(initial_fence_id),
+        });
+        let owned_index = self.owned_memory_blobs.len() - 1;
+
+        self.queue_submit_command_buffer(
+            adapter,
+            initial_command_buffer_id,
+            Some(initial_fence_id),
+        )?;
+        self.wait_for_fence(adapter, initial_fence_id)?;
+        self.destroy_fence(adapter, initial_fence_id)?;
+        self.owned_memory_blobs[owned_index].initial_release_fence_id = None;
+        self.destroy_command_pool(adapter, initial_pool_id)?;
+        self.owned_memory_blobs[owned_index].initial_release_pool_id = None;
+
+        // Publish the cross-device ownership state only after the one-time
+        // family-0 -> EXTERNAL release has reached its fence. From this point a
+        // DWM consumer claim and every KMD writer start serialize under the
+        // adapter's virtio lock.
+        let registration = adapter
+            .with_virtio(|v| v.register_present_buffer(res_id))
+            .map_err(|_| VirtioError::DeviceError)
+            .and_then(|result| result);
+        if let Err(error) = registration {
+            // The initial release fence completed, so no Vulkan work can still
+            // reference this unpublished object. Reclaim the blob/resource and
+            // then the dedicated buffer+memory in normal teardown order. If a
+            // transport operation is ambiguous, retain the owned record for
+            // Venus-context teardown rather than manufacture a UAF.
+            let first_teardown = adapter
+                .with_virtio(|v| v.take_live_resource(res_id))
+                .unwrap_or(false);
+            if first_teardown
+                && ctrl::ctx_detach_resource(self.passive(), adapter, self.ctx_id(), res_id).is_ok()
+                && ctrl::resource_unref(self.passive(), adapter, res_id).is_ok()
+            {
+                let _ = self.free_memory_blob(adapter, memory_id.get());
+            }
+            return Err(error);
+        }
+
+        Ok((
+            HostVisibleBlob {
+                blob_id: memory_id.get(),
+                res_id,
+                gpa: 0,
+                size: allocation_size,
+            },
+            memory_type_index,
+        ))
     }
 
     /// See [`helios_kmd_logic::choose_host_visible_memory_type`] — the rule is a
@@ -251,6 +506,18 @@ impl VenusClient {
         memory_type_bits: u32,
     ) -> Option<MemoryTypeChoice> {
         helios_kmd_logic::choose_host_visible_memory_type(
+            &self.memory_type_flags,
+            self.memory_type_count,
+            memory_type_bits,
+        )
+    }
+
+    /// See [`helios_kmd_logic::choose_cached_host_visible_memory_type`].
+    pub(super) fn choose_cached_host_visible_memory_type(
+        &self,
+        memory_type_bits: u32,
+    ) -> Option<MemoryTypeChoice> {
+        helios_kmd_logic::choose_cached_host_visible_memory_type(
             &self.memory_type_flags,
             self.memory_type_count,
             memory_type_bits,
@@ -508,6 +775,39 @@ impl VenusClient {
         Ok(pool_id)
     }
 
+    /// Record, but do not submit, the initial ownership release for a freshly
+    /// bound KMD Present buffer. The caller publishes the setup lifetime before
+    /// submission and waits its fence before exposing the blob to Windows.
+    pub(super) fn record_initial_present_buffer_release(
+        &mut self,
+        adapter: &AdapterContext,
+        buffer_id: VkBufferId,
+        size: u64,
+    ) -> Result<(VkCommandPoolId, VkCommandBufferId), VirtioError> {
+        let pool_id = self.create_command_pool(adapter)?;
+        let command_buffer_id = match self.allocate_command_buffer(adapter, pool_id) {
+            Ok(id) => id,
+            Err(e) => {
+                let _ = self.destroy_command_pool(adapter, pool_id);
+                return Err(e);
+            }
+        };
+        let record_result = (|| {
+            self.begin_command_buffer(adapter, command_buffer_id)?;
+            self.cmd_buffer_barrier(
+                adapter,
+                command_buffer_id,
+                BufferBarrier::initial_release_to_external(buffer_id, size),
+            )?;
+            self.end_command_buffer(adapter, command_buffer_id)
+        })();
+        if let Err(e) = record_result {
+            let _ = self.destroy_command_pool(adapter, pool_id);
+            return Err(e);
+        }
+        Ok((pool_id, command_buffer_id))
+    }
+
     pub(super) fn create_bound_present_conversion_image(
         &mut self,
         adapter: &AdapterContext,
@@ -578,12 +878,14 @@ impl VenusClient {
         Ok((size, memory_type_bits))
     }
 
-    /// Create a plain local buffer for a same-device memory borrow.
+    /// Create the KMD side of a present-staging buffer.
     ///
-    /// The allocation was created by this Venus device and is not being
-    /// imported here. Giving this buffer an external-memory create chain would
-    /// assert a second, false ownership/transport contract.
-    pub(super) fn create_local_present_destination_buffer(
+    /// DXVK imports the same HOST3D payload into an exactly matching OPAQUE_FD,
+    /// SRC|DST, exclusive buffer. Querying this buffer therefore gives the
+    /// memory mask for the precise dedicated export/import contract on both
+    /// sides, rather than assuming independently shaped buffers accept the same
+    /// heap.
+    pub(super) fn create_present_destination_buffer(
         &mut self,
         adapter: &AdapterContext,
         size: u64,
@@ -594,10 +896,16 @@ impl VenusClient {
         w.handle(self.device_id);
         w.count(true);
         w.i32(ST_BUFFER_CREATE_INFO);
-        w.count(false); // pNext: local buffer, no external-memory contract
+        w.count(true); // pNext: VkExternalMemoryBufferCreateInfo
+        w.i32(ST_EXTERNAL_MEMORY_BUFFER_CREATE_INFO);
+        w.count(false);
+        w.u32(EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD);
         w.u32(0); // VkBufferCreateFlags
         w.u64(size);
-        w.u32(BUFFER_USAGE_TRANSFER_DST);
+        // KMD writes this buffer and the UMD imports the same memory as its
+        // transfer source.  Asking for both usages makes the compatibility mask
+        // valid for both consumers, not only for the first one created.
+        w.u32(BUFFER_USAGE_TRANSFER_SRC | BUFFER_USAGE_TRANSFER_DST);
         w.u32(SHARING_MODE_EXCLUSIVE);
         w.u32(0); // queueFamilyIndexCount
         w.count(false);
@@ -621,27 +929,90 @@ impl VenusClient {
         &mut self,
         adapter: &AdapterContext,
         buffer_id: VkBufferId,
-    ) -> Result<(u64, u32), VirtioError> {
+    ) -> Result<(u64, u64, u32, bool), VirtioError> {
         let mut w = Writer::new();
-        w.header(CMD_GET_BUFFER_MEMORY_REQUIREMENTS, CMD_FLAG_GENERATE_REPLY);
+        w.header(
+            CMD_GET_BUFFER_MEMORY_REQUIREMENTS_2,
+            CMD_FLAG_GENERATE_REPLY,
+        );
         w.handle(self.device_id);
-        w.handle(buffer_id);
+        // pInfo: VkBufferMemoryRequirementsInfo2.
         w.count(true);
-        // No VkResult: word 1 is the simple-pointer, checked below. The
-        // pre-R1001 form short-circuited on a command mismatch and so never
-        // read it either.
+        w.i32(ST_BUFFER_MEMORY_REQUIREMENTS_INFO_2);
+        w.count(false);
+        w.handle(buffer_id);
+        // pMemoryRequirements: VkMemoryRequirements2 with an output
+        // VkMemoryDedicatedRequirements chained to it. Partial request
+        // encoding carries the structure identities but no output fields.
+        w.count(true);
+        w.i32(ST_MEMORY_REQUIREMENTS_2);
+        w.count(true);
+        w.i32(ST_MEMORY_DEDICATED_REQUIREMENTS);
+        w.count(false);
         let mut r = self.ring_command_expect(
             adapter,
             w.as_slice()?,
-            ReplyCheck::new(CMD_GET_BUFFER_MEMORY_REQUIREMENTS),
+            ReplyCheck::new(CMD_GET_BUFFER_MEMORY_REQUIREMENTS_2),
         )?;
+        // No VkResult: the reply starts with the output simple-pointer and the
+        // complete structure chain requested above.
         if r.read_u64()? == 0 {
             return Err(VirtioError::DeviceError);
         }
+        if r.read_u32()? != ST_MEMORY_REQUIREMENTS_2 as u32 || r.read_u64()? == 0 {
+            return Err(VirtioError::DeviceError);
+        }
+        if r.read_u32()? != ST_MEMORY_DEDICATED_REQUIREMENTS as u32 || r.read_u64()? != 0 {
+            return Err(VirtioError::DeviceError);
+        }
+        let prefers_dedicated = r.read_u32()? != 0;
+        let requires_dedicated = r.read_u32()? != 0;
         let size = r.read_u64()?;
-        let _alignment = r.read_u64()?;
+        let alignment = r.read_u64()?;
         let memory_type_bits = r.read_u32()?;
-        Ok((size, memory_type_bits))
+        if alignment == 0 {
+            return Err(VirtioError::DeviceError);
+        }
+        Ok((
+            size,
+            alignment,
+            memory_type_bits,
+            prefers_dedicated || requires_dedicated,
+        ))
+    }
+
+    fn allocate_present_buffer_memory(
+        &mut self,
+        adapter: &AdapterContext,
+        buffer_id: VkBufferId,
+        size: u64,
+        memory_type_index: u32,
+    ) -> Result<VkDeviceMemoryId, VirtioError> {
+        let memory_id = self.new_memory_id();
+        let w = encode_memory_allocate(
+            self.device_id.into(),
+            memory_id.into(),
+            &MemoryAllocateSpec {
+                // The memory immediately becomes an exported HOST3D blob and
+                // DXVK imports that payload with a dedicated-buffer chain.
+                // Make both sides explicit and identical regardless of whether
+                // the host merely prefers or strictly requires dedication.
+                pnext: MemoryPNext::ExportDedicatedBuffer {
+                    handle_type: EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD,
+                    buffer: buffer_id.into(),
+                },
+                size,
+                memory_type_index,
+            },
+        );
+        self.ring_command_expect(
+            adapter,
+            w.as_slice()?,
+            ReplyCheck::new(CMD_ALLOCATE_MEMORY)
+                .mismatch(0x00F6)
+                .refuse_result(0x00F7),
+        )?;
+        Ok(memory_id)
     }
 
     pub(super) fn allocate_dedicated_image_memory(
@@ -1014,6 +1385,11 @@ impl VenusClient {
         buffer: VkBufferId,
         size: u64,
     ) -> Result<(), VirtioError> {
+        self.cmd_buffer_barrier(
+            adapter,
+            command_buffer_id,
+            BufferBarrier::transfer_write_to_host_read(buffer, size),
+        )?;
         self.cmd_buffer_barrier(
             adapter,
             command_buffer_id,
@@ -1441,14 +1817,6 @@ impl VenusClient {
             self.free_memory_blob(adapter, memory_id.get())?;
         }
         ctrl::ctx_detach_resource(self.passive(), adapter, self.ctx_id(), resource_id)
-    }
-
-    pub(super) fn cleanup_borrowed_present_buffer(
-        &mut self,
-        adapter: &AdapterContext,
-        buffer_id: VkBufferId,
-    ) -> Result<(), VirtioError> {
-        self.destroy_buffer_on_ring(adapter, buffer_id)
     }
 
     pub(super) fn encode_command_buffer_submit(

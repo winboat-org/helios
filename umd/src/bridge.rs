@@ -111,6 +111,7 @@ mod ffi {
             scanout_linear: bool,
             linear_scanout_target: bool,
             cross_context_optimal: bool,
+            dedicated_present_buffer: bool,
         ) -> usize;
 
         /// Create a dedicated OPTIMAL, DMA_BUF-exportable image and report
@@ -329,6 +330,7 @@ impl ffi::HeliosDxvkDevice {
         scanout_linear: bool,
         linear_scanout_target: bool,
         cross_context_optimal: bool,
+        dedicated_present_buffer: bool,
     ) -> Option<ID3D11Resource> {
         // SAFETY: the caller upholds the resource-id/handle preconditions
         // above, and the bridge transfers one reference on success.
@@ -347,6 +349,7 @@ impl ffi::HeliosDxvkDevice {
                 scanout_linear,
                 linear_scanout_target,
                 cross_context_optimal,
+                dedicated_present_buffer,
             ))
         }
     }
@@ -525,6 +528,7 @@ impl BridgeDevice {
         scanout_linear: bool,
         linear_scanout_target: bool,
         cross_context_optimal: bool,
+        dedicated_present_buffer: bool,
     ) -> Option<ID3D11Resource> {
         unsafe {
             self.get()?.open_texture2d(
@@ -541,6 +545,7 @@ impl BridgeDevice {
                 scanout_linear,
                 linear_scanout_target,
                 cross_context_optimal,
+                dedicated_present_buffer,
             )
         }
     }

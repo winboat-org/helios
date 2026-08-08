@@ -1480,6 +1480,7 @@ pub(crate) unsafe extern "C" fn open_resource(
     };
     let cross_context_optimal = ident.kind == HELIOS_WDDM_ALLOC_KIND_STANDARD
         && meta.misc_flags & HELIOS_WDDM_ALLOC_MISC_OPTIMAL_GDI_TEXTURE != 0;
+    let dedicated_present_buffer = ident.dedicated_present_buffer();
     log_error!(
         "DDI open_resource identity: res_id={} alloc_size={} mem_type={} kind={} ctx={} meta_bind=0x{:x} meta_misc=0x{:x} open_bind=0x{:x} open_misc=0x{:x} dxgi_fmt={} d3dddi_fmt={}",
         ident.resource_id, venus_alloc_size, ident.memory_type_index, ident.kind, ident.ctx_id,
@@ -1504,6 +1505,7 @@ pub(crate) unsafe extern "C" fn open_resource(
         false,
         false,
         cross_context_optimal,
+        dedicated_present_buffer,
     );
     if opened.is_none() {
         // Import of a KMD-validated-live resource failed: a real bug, not a

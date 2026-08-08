@@ -596,7 +596,6 @@ unsafe fn dxgkddi_present_inner(
                 PRESENT_LAST_STATUS.store(STATUS_INVALID_PARAMETER as u32, Ordering::Relaxed);
                 return STATUS_INVALID_PARAMETER;
             }
-
             // A typed WindowedBlt snapshot is a TWO-PHASE transaction. Prepare
             // its reusable Venus command and reserve the exact reader lease at
             // Present, but do not submit until SubmitCommand admits the same
@@ -629,7 +628,6 @@ unsafe fn dxgkddi_present_inner(
                                 destination_desc,
                                 prepared,
                                 boundary,
-                                adapter.system_backings.contains(destination.resource_id),
                             )
                         })
                         .unwrap_or(Err(VirtioError::DeviceError))
@@ -672,17 +670,45 @@ unsafe fn dxgkddi_present_inner(
                 // arm generates no DMA buffer and is completed through
                 // SetVidPnSourceAddress, whose DIRQL half holds no token at all.
                 let passive = unsafe { crate::irql::PassiveLevel::assume() };
+                let destination_buffer = match destination_desc {
+                    PresentDestinationDesc::StandardBuffer(desc) => Some(desc.resource_id()),
+                    PresentDestinationDesc::OptimalImage(_) => None,
+                };
+                if let Some(resource_id) = destination_buffer {
+                    if crate::virtio::ctrl::begin_present_buffer_write_legacy(
+                        passive,
+                        adapter,
+                        resource_id,
+                    )
+                    .is_err()
+                    {
+                        crate::diag::record_named_bytes(b"PBOwn", 0xE1);
+                        PRESENT_LAST_STATUS
+                            .store(STATUS_DEVICE_NOT_READY as u32, Ordering::Relaxed);
+                        return STATUS_DEVICE_NOT_READY;
+                    }
+                }
                 let copy = adapter.with_venus_client(passive, |client| {
                     client.submit_present_blt(adapter, source_desc, destination_desc)
                 });
                 let gpu_fence = match copy {
                     Ok(Ok(fence)) => fence,
                     Ok(Err(VirtioError::OutOfMemory | VirtioError::QueueFull)) => {
+                        if let Some(resource_id) = destination_buffer {
+                            let _ = adapter.with_virtio(|v| {
+                                v.abort_present_buffer_write_before_submit(resource_id)
+                            });
+                        }
                         crate::diag::record_named_bytes(b"PBCpy", 0xE4);
                         PRESENT_LAST_STATUS.store(STATUS_NO_MEMORY as u32, Ordering::Relaxed);
                         return STATUS_NO_MEMORY;
                     }
                     Ok(Err(_)) | Err(_) => {
+                        if let Some(resource_id) = destination_buffer {
+                            let _ = adapter.with_virtio(|v| {
+                                v.abort_present_buffer_write_before_submit(resource_id)
+                            });
+                        }
                         crate::diag::record_named_bytes(b"PBCpy", 0xE5);
                         PRESENT_LAST_STATUS
                             .store(STATUS_DEVICE_NOT_READY as u32, Ordering::Relaxed);
@@ -699,8 +725,7 @@ unsafe fn dxgkddi_present_inner(
                 // association by resource id. Once this Venus copy completes,
                 // mirror into those pages before Present retires; otherwise later
                 // frames update only the stale BAR blob.
-                let has_system_backing = adapter.system_backings.contains(destination.resource_id);
-                if has_system_backing {
+                if destination_buffer.is_some() {
                     match crate::virtio::ctrl::wait_fence(
                         passive,
                         adapter,
@@ -723,8 +748,22 @@ unsafe fn dxgkddi_present_inner(
                             return STATUS_DEVICE_NOT_READY;
                         }
                     }
+                    let mirror_ready = destination_buffer.is_some_and(|resource_id| {
+                        adapter
+                            .with_virtio(|v| v.present_buffer_cpu_mirror_ready(resource_id))
+                            .unwrap_or(false)
+                    });
+                    if !mirror_ready {
+                        // A retired wire id is not enough: a rejected host
+                        // response leaves KmdWriter poisoned and must never
+                        // authorize a CPU read or external reacquire.
+                        crate::diag::record_named_bytes(b"PBSyWt", 0xE3);
+                        PRESENT_LAST_STATUS
+                            .store(STATUS_DEVICE_NOT_READY as u32, Ordering::Relaxed);
+                        return STATUS_DEVICE_NOT_READY;
+                    }
                 }
-                if has_system_backing {
+                let mirror_ok = if destination_buffer.is_some() {
                     match unsafe {
                         crate::ddi::build_paging_buffer::mirror_present_system_backing(
                             passive,
@@ -732,20 +771,40 @@ unsafe fn dxgkddi_present_inner(
                             destination.resource_id,
                         )
                     } {
-                        Some(true) => crate::diag::record_named_bytes(b"PBSyCp", 1),
-                        // Windows may page the allocation back to the BAR between
-                        // the pre-check and completed fence. With no system
-                        // backing, the Venus destination is authoritative again.
-                        None => crate::diag::record_named_bytes(b"PBSyCp", 2),
+                        Some(true) => {
+                            crate::diag::record_named_bytes(b"PBSyCp", 1);
+                            true
+                        }
+                        // No backing existed under the serialized post-retire
+                        // check, so the Venus blob remains authoritative. A
+                        // later eviction copies those current bytes itself.
+                        None => {
+                            crate::diag::record_named_bytes(b"PBSyCp", 2);
+                            true
+                        }
                         Some(false) => {
                             crate::diag::record_named_bytes(b"PBSyCp", 0xE1);
-                            PRESENT_LAST_STATUS
-                                .store(STATUS_DEVICE_NOT_READY as u32, Ordering::Relaxed);
-                            return STATUS_DEVICE_NOT_READY;
+                            false
                         }
                     }
                 } else {
                     crate::diag::record_named_bytes(b"PBSyCp", 0);
+                    true
+                };
+                if destination_buffer.is_some() {
+                    // The CPU has stopped reading even when the content copy
+                    // failed, so settle ownership first and report content
+                    // success separately. A state mismatch remains fail-closed.
+                    let ownership_released = destination_buffer.is_some_and(|resource_id| {
+                        adapter
+                            .with_virtio(|v| v.complete_present_buffer_cpu_mirror(resource_id))
+                            .unwrap_or(false)
+                    });
+                    if !ownership_released || !mirror_ok {
+                        PRESENT_LAST_STATUS
+                            .store(STATUS_DEVICE_NOT_READY as u32, Ordering::Relaxed);
+                        return STATUS_DEVICE_NOT_READY;
+                    }
                 }
                 // Capacity was checked before host work was queued, so this cannot
                 // fail. Merge preserves the newest fence if dxgkrnl batches more
@@ -786,7 +845,7 @@ unsafe fn dxgkddi_present_inner(
             PRESENT_LAST_STATUS.store(STATUS_INVALID_PARAMETER as u32, Ordering::Relaxed);
             return STATUS_INVALID_PARAMETER;
         };
-        let Some(dxgi_format) = source.resolved_dxgi_format() else {
+        let Some(_dxgi_format) = source.resolved_dxgi_format() else {
             crate::diag::record_named_bytes(b"PBFlip", 0xE2);
             PRESENT_LAST_STATUS.store(STATUS_INVALID_PARAMETER as u32, Ordering::Relaxed);
             return STATUS_INVALID_PARAMETER;
@@ -1001,6 +1060,12 @@ pub(crate) fn service_windowed_blt(passive: PassiveLevel, adapter: &AdapterConte
                 (
                     request.token,
                     request.stream_boundary,
+                    match request.destination {
+                        PresentDestinationDesc::StandardBuffer(destination) => {
+                            Some(destination.resource_id())
+                        }
+                        PresentDestinationDesc::OptimalImage(_) => None,
+                    },
                     client.submit_prepared_present_blt(
                         adapter,
                         request.prepared,
@@ -1010,7 +1075,7 @@ pub(crate) fn service_windowed_blt(passive: PassiveLevel, adapter: &AdapterConte
                 )
             })
         });
-        if let Ok(Some((token, boundary, result))) = submit {
+        if let Ok(Some((token, boundary, destination_buffer, result))) = submit {
             match result {
                 Ok(fence) => crate::ddi::scanout_timeline::note(
                     crate::ddi::scanout_timeline::kind::WINDOWED_BLT_SUBMIT,
@@ -1023,6 +1088,9 @@ pub(crate) fn service_windowed_blt(passive: PassiveLevel, adapter: &AdapterConte
                 ),
                 Err(_) => {
                     let _ = adapter.with_virtio(|v| {
+                        if let Some(resource_id) = destination_buffer {
+                            v.abort_present_buffer_write_before_submit(resource_id);
+                        }
                         v.complete_windowed_blt_ring(adapter, token, boundary, false)
                     });
                 }

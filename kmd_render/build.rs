@@ -76,8 +76,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Compile the SEH shim for `MmMapLockedPagesSpecifyCache(UserMode)` (which
-/// raises on failure — un-catchable from no_std Rust). Kernel-appropriate
+/// Compile the SEH shims for raising memory-manager calls (which are
+/// un-catchable from no_std Rust). Kernel-appropriate
 /// flags: `/Zl` omits default-CRT lib records from the object (rustc drives
 /// the kernel link; msvcrt must not be pulled in) and `/GS-` avoids
 /// `__security_cookie` references. The `__C_specific_handler` reference the

@@ -586,7 +586,19 @@ pub fn ctx_destroy(
     let mut cmd = VirtioGpuCtxDestroy::zeroed();
     cmd.hdr.type_ = VIRTIO_GPU_CMD_CTX_DESTROY;
     cmd.hdr.ctx_id = ctx_id;
-    ctrl_roundtrip_ok(passive, adapter, bytes_of(&cmd), None)
+    let result = ctrl_roundtrip_ok(passive, adapter, bytes_of(&cmd), None);
+    if result.is_ok() {
+        let finalized = adapter.with_wddm_notify_lock(|guard| {
+            guard
+                .with_virtio(|_order, v| v.finalize_closed_present_streams_for_context(ctx_id))
+                .unwrap_or(0)
+        });
+        if finalized != 0 {
+            crate::ddi::interrupt::request_wddm_completion_dpc(adapter);
+            adapter.signal_hpd();
+        }
+    }
+    result
 }
 
 /// Untracked teardown of a context this driver created for itself (the
@@ -625,7 +637,17 @@ pub fn destroy_contexts_for_owner(
         let mut cmd = VirtioGpuCtxDestroy::zeroed();
         cmd.hdr.type_ = VIRTIO_GPU_CMD_CTX_DESTROY;
         cmd.hdr.ctx_id = ctx_id;
-        let _ = ctrl_roundtrip_ok(passive, adapter, bytes_of(&cmd), None);
+        if ctrl_roundtrip_ok(passive, adapter, bytes_of(&cmd), None).is_ok() {
+            let finalized = adapter.with_wddm_notify_lock(|guard| {
+                guard
+                    .with_virtio(|_order, v| v.finalize_closed_present_streams_for_context(ctx_id))
+                    .unwrap_or(0)
+            });
+            if finalized != 0 {
+                crate::ddi::interrupt::request_wddm_completion_dpc(adapter);
+                adapter.signal_hpd();
+            }
+        }
         destroyed += 1;
     }
     if destroyed != 0 {
@@ -1254,7 +1276,13 @@ pub fn forget_allocation_blob(
     resource_id: u32,
 ) -> bool {
     let taken = adapter
-        .with_virtio(|v| v.forget_allocation_blob(resource_id))
+        .with_virtio(|v| {
+            if v.unregister_present_buffer(resource_id) {
+                v.forget_allocation_blob(resource_id)
+            } else {
+                None
+            }
+        })
         .unwrap_or(None);
     let Some((mapped, map_offset, map_len)) = taken else {
         return false;
@@ -1356,6 +1384,8 @@ pub fn submit_venus_async_present_stream(
                 // false; still run the ordered discharge here so correctness
                 // never depends on receiving the interrupt that prompted the
                 // opportunistic drain in the first place.
+                let _ =
+                    v.cancel_present_buffer_read_claims_before_submit(owner, ctx_id, cookie, value);
                 let _ = v.unregister_present_stream(order, owner, ctx_id, cookie);
                 let _ = v.discharge_dead_present_stream_waits(order);
             })
@@ -1523,12 +1553,16 @@ pub fn submit_venus_async_scanout(
 ///
 /// Like the scanout copy path, ring_idx=1 makes used-ring retirement represent
 /// GPU completion. Unlike scanout, an ordinary app/DWM BLT must not mark the
-/// physical scanout dirty or wake the display refresh worker.
+/// physical scanout dirty or wake the display refresh worker. Every tagged
+/// standard destination advances only to CPU-mirror ownership at retirement;
+/// its caller explicitly releases the buffer after the serialized backing
+/// check/mirror returns.
 pub fn submit_venus_async_present(
     passive: PassiveLevel,
     adapter: &AdapterContext,
     ctx_id: u32,
     stream: &[u8],
+    present_buffer_write: Option<u32>,
 ) -> Result<u64, VirtioError> {
     let (meta, venus, venus_len) = stage_display_submit(passive, adapter, stream)?;
 
@@ -1538,14 +1572,83 @@ pub fn submit_venus_async_present(
     // display refresh worker.
     display_submit_outcome(adapter.with_virtio(move |v| {
         v.drain_used();
-        v.enqueue_async_submit(
-            ctx_id,
-            crate::virtio::gpu::SCANOUT_RING_IDX,
-            meta,
-            venus,
-            venus_len,
-        )
+        match present_buffer_write {
+            Some(resource_id) => v.enqueue_async_submit_present_buffer(
+                ctx_id,
+                crate::virtio::gpu::SCANOUT_RING_IDX,
+                meta,
+                venus,
+                venus_len,
+                resource_id,
+            ),
+            None => v.enqueue_async_submit(
+                ctx_id,
+                crate::virtio::gpu::SCANOUT_RING_IDX,
+                meta,
+                venus,
+                venus_len,
+            ),
+        }
     }))
+}
+
+/// Legacy inline Present cannot leave the callback and retry asynchronously.
+/// Wait outside both the Venus mutex and virtio_lock until the external reader
+/// retires, then atomically transition the buffer to KmdWriter. The modern
+/// two-phase path never uses this wait; it remains queued and event-driven.
+pub fn begin_present_buffer_write_legacy(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    resource_id: u32,
+) -> Result<(), VirtioError> {
+    // Nominal 320 ms = roughly 5 s at Windows' common 15.6 ms timer quantum.
+    let mut budget = Budget::new(320);
+    loop {
+        let state = adapter
+            .with_virtio(|v| {
+                v.drain_used();
+                v.try_begin_present_buffer_write(resource_id)
+            })
+            .map_err(|_| VirtioError::DeviceError)?;
+        match state {
+            crate::virtio::gpu::PresentBufferWriteBegin::Acquired => return Ok(()),
+            crate::virtio::gpu::PresentBufferWriteBegin::NotFound => {
+                return Err(VirtioError::DeviceError);
+            }
+            crate::virtio::gpu::PresentBufferWriteBegin::Busy => {
+                if budget.charge_slice() {
+                    return Err(VirtioError::QueueFull);
+                }
+                sleep_ms(passive, RETRY_SLICE_MS);
+            }
+        }
+    }
+}
+
+/// Revoke new Present-buffer users and wait for every already-admitted KMD or
+/// consumer GPU submission to retire. The wait is PASSIVE and never holds the
+/// Venus mutex, virtio_lock, or the scanout lifecycle lock across a sleep.
+pub fn begin_present_buffer_teardown(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    resource_id: u32,
+) -> Result<(), VirtioError> {
+    let mut budget = Budget::new(320);
+    loop {
+        let ready = adapter
+            .with_virtio(|v| {
+                v.drain_used();
+                v.begin_present_buffer_teardown(resource_id)
+            })
+            .map_err(|_| VirtioError::DeviceError)?;
+        if ready {
+            return Ok(());
+        }
+        if budget.charge_slice() {
+            return Err(VirtioError::QueueFull);
+        }
+        sleep_ms(passive, RETRY_SLICE_MS);
+    }
 }
 
 /// Nonblocking ring-1 submission for an already admitted WindowedBlt token.

@@ -232,18 +232,28 @@ pub(super) struct ImportedOptimalImage {
     pub(super) memory_id: VkDeviceMemoryId,
 }
 
-/// One `VkDeviceMemory` allocation created by [`VenusClient::allocate_memory_blob`]
-/// and exposed as exactly one HOST3D resource.
+/// One `VkDeviceMemory` allocation created by a Venus blob allocator and
+/// exposed as exactly one HOST3D resource.
 ///
 /// This is the authoritative same-device identity for a KMD standard allocation.
 /// Present may borrow this memory for a buffer binding; it must never manufacture
 /// a second imported `VkDeviceMemory` for the same resource.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 pub(super) struct OwnedMemoryBlob {
     pub(super) resource_id: u32,
     pub(super) memory_id: VkDeviceMemoryId,
     pub(super) allocation_size: u64,
     pub(super) memory_type_index: u32,
+    /// A buffer created before memory selection so its actual compatibility
+    /// mask can choose the heap.  Ownership moves to `present_buffers` on the
+    /// first Present; if that never happens, `free_memory_blob` destroys it.
+    pub(super) prepared_present_buffer: Option<VkBufferId>,
+    /// One-shot initial family-0 -> EXTERNAL release objects. These are normally
+    /// destroyed before allocation publication. They remain recorded only when
+    /// submission/wait/cleanup failed ambiguously, in which case context
+    /// teardown—not local rollback—must reclaim them safely.
+    pub(super) initial_release_pool_id: Option<VkCommandPoolId>,
+    pub(super) initial_release_fence_id: Option<VkFenceId>,
 }
 
 /// A Present destination buffer bound to KMD-owned memory.
@@ -255,7 +265,7 @@ pub(super) struct OwnedMemoryBlob {
 pub(super) struct BorrowedPresentBuffer {
     pub(super) desc: PresentBufferDesc,
     pub(super) buffer_id: VkBufferId,
-    pub(super) memory: OwnedMemoryBlob,
+    pub(super) memory_id: VkDeviceMemoryId,
 }
 
 pub(super) struct PreparedPresentBlt {
@@ -563,7 +573,6 @@ impl VenusClient {
 
     pub(super) fn borrow_present_buffer(
         &mut self,
-        adapter: &AdapterContext,
         desc: PresentBufferDesc,
     ) -> Result<BorrowedPresentBuffer, VirtioError> {
         if desc.memory_type_index >= self.memory_type_count {
@@ -572,11 +581,10 @@ impl VenusClient {
 
         crate::diag::record_named_bytes(b"PBImRs", desc.resource_id);
         crate::diag::record_named_bytes(b"PBImSt", 1);
-        let Some(memory) = self
+        let Some(memory_index) = self
             .owned_memory_blobs
             .iter()
-            .find(|blob| blob.resource_id == desc.resource_id)
-            .copied()
+            .position(|blob| blob.resource_id == desc.resource_id)
         else {
             // PitchedStandardBuffer is a strict local-memory contract. A
             // resource not created by allocate_memory_blob must be represented
@@ -585,53 +593,41 @@ impl VenusClient {
             crate::diag::record_named_bytes(b"PBImSt", 0xE1);
             return Err(VirtioError::DeviceError);
         };
-        if memory.allocation_size != desc.allocation_size
-            || memory.memory_type_index != desc.memory_type_index
+        if self.owned_memory_blobs[memory_index].allocation_size != desc.allocation_size
+            || self.owned_memory_blobs[memory_index].memory_type_index != desc.memory_type_index
         {
             crate::diag::record_named_bytes(b"PBImSt", 0xE2);
             return Err(VirtioError::DeviceError);
         }
 
-        crate::diag::record_named_bytes(b"PBImSt", 2);
-        let buffer_id =
-            self.create_local_present_destination_buffer(adapter, desc.allocation_size)?;
-
-        crate::diag::record_named_bytes(b"PBImSt", 3);
-        let (required_size, memory_type_bits) =
-            match self.buffer_memory_requirements(adapter, buffer_id) {
-                Ok(requirements) => requirements,
-                Err(e) => {
-                    let _ = self.cleanup_borrowed_present_buffer(adapter, buffer_id);
-                    return Err(e);
-                }
-            };
-        crate::diag::record_named_bytes(b"PBImRq", required_size as u32);
-        crate::diag::record_named_bytes(b"PBImBt", memory_type_bits);
-        if required_size > desc.allocation_size
-            || (memory_type_bits & (1u32 << desc.memory_type_index)) == 0
+        let memory_id = self.owned_memory_blobs[memory_index].memory_id;
+        if let Some(buffer_id) = self.owned_memory_blobs[memory_index]
+            .prepared_present_buffer
+            .take()
         {
-            crate::diag::record_named_bytes(b"PBImSt", 0xE3);
-            let _ = self.cleanup_borrowed_present_buffer(adapter, buffer_id);
-            return Err(VirtioError::DeviceError);
+            // Transfer the sole buffer-ownership capability from the memory
+            // registry to the Present cache.  It was created, requirement-
+            // checked and bound before the blob was published.
+            crate::diag::record_named_bytes(b"PBImSt", 0x10);
+            return Ok(BorrowedPresentBuffer {
+                desc,
+                buffer_id,
+                memory_id,
+            });
         }
 
-        crate::diag::record_named_bytes(b"PBImSt", 4);
-        if let Err(e) = self.bind_buffer_memory(adapter, buffer_id, memory.memory_id) {
-            let _ = self.cleanup_borrowed_present_buffer(adapter, buffer_id);
-            return Err(e);
-        }
-        crate::diag::record_named_bytes(b"PBImSt", 0x10);
-
-        Ok(BorrowedPresentBuffer {
-            desc,
-            buffer_id,
-            memory,
-        })
+        // Present-buffer memory is always exported as a dedicated allocation
+        // for the exact prepared VkBuffer. Binding it to a newly-created buffer
+        // is forbidden even when every VkBufferCreateInfo field matches. If the
+        // prepared capability is absent and the cache did not find it above,
+        // the ownership state is inconsistent; refuse instead of violating the
+        // dedicated-allocation contract.
+        crate::diag::record_named_bytes(b"PBImSt", 0xE3);
+        Err(VirtioError::DeviceError)
     }
 
     pub(super) fn ensure_present_buffer(
         &mut self,
-        adapter: &AdapterContext,
         desc: PresentBufferDesc,
     ) -> Result<BorrowedPresentBuffer, VirtioError> {
         if let Some(buffer) = self
@@ -649,7 +645,7 @@ impl VenusClient {
         if self.present_buffers.len() >= MAX_PRESENT_BUFFERS {
             return Err(VirtioError::OutOfMemory);
         }
-        let buffer = self.borrow_present_buffer(adapter, desc)?;
+        let buffer = self.borrow_present_buffer(desc)?;
         self.present_buffers.push(buffer);
         Ok(buffer)
     }
@@ -1103,7 +1099,7 @@ impl VenusClient {
         let source_image = self.ensure_present_image(adapter, source)?;
         let (destination_buffer, destination_image) = match destination {
             PresentDestinationDesc::StandardBuffer(desc) => {
-                (Some(self.ensure_present_buffer(adapter, desc)?), None)
+                (Some(self.ensure_present_buffer(desc)?), None)
             }
             PresentDestinationDesc::OptimalImage(desc) => {
                 (None, Some(self.ensure_present_image(adapter, desc)?))
@@ -1235,11 +1231,16 @@ impl VenusClient {
         let prepared = self.prepare_present_blt(adapter, source, destination)?;
         self.validate_prepared_present_blt(prepared)?;
         let submit = self.encode_command_buffer_submit(prepared.command_buffer_id);
+        let present_buffer_write = match prepared.destination {
+            PresentDestinationDesc::StandardBuffer(destination) => Some(destination.resource_id),
+            PresentDestinationDesc::OptimalImage(_) => None,
+        };
         let fence_id = ctrl::submit_venus_async_present(
             self.passive(),
             adapter,
             self.ctx_id(),
             submit.as_slice()?,
+            present_buffer_write,
         )?;
         self.note_prepared_present_blt_submit(adapter, prepared, fence_id);
         Ok(fence_id)

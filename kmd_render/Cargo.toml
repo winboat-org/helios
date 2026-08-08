@@ -42,9 +42,8 @@ virtio-drivers = { version = "0.13", default-features = false }
 
 [build-dependencies]
 wdk-build = "0.5"
-# Compiles src/seh_shim.c — a C __try/__except wrapper for
-# MmMapLockedPagesSpecifyCache(UserMode), which RAISES on failure (no SEH in
-# no_std Rust → bugcheck, reachable from any process via Escape MAP_BLOB).
+# Compiles src/seh_shim.c — C __try/__except wrappers for memory-manager calls
+# that RAISE on failure (no SEH in no_std Rust).
 cc = "1"
 # We generate the WDDM display-miniport DDIs ourselves: wdk-sys has no display
 # ApiSubset, so build.rs runs bindgen over dispmprt.h + d3dkmddi.h. See build.rs.

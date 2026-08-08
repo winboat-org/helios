@@ -1,5 +1,5 @@
-//! A spinlock whose release is a `Drop` obligation, and a vector that cannot
-//! allocate.
+//! Kernel synchronization primitives with RAII release obligations, plus a
+//! vector that cannot allocate while protected by a spinlock.
 //!
 //! Three tables in this driver were the same hand-written construct: a raw
 //! `KSPIN_LOCK` in an `UnsafeCell`, a `Vec` pre-reserved at construction, an
@@ -32,12 +32,168 @@
 //!
 //! `panic = abort` means there is no unwind path to worry about in `Drop`.
 
+use alloc::alloc::{alloc, dealloc};
+use core::alloc::Layout;
 use core::cell::UnsafeCell;
 use core::marker::PhantomData;
 use core::ops::{Deref, DerefMut};
+use core::ptr::NonNull;
+use core::sync::atomic::{fence, AtomicUsize, Ordering};
 
-use wdk_sys::ntddk::{KeAcquireSpinLockRaiseToDpc, KeReleaseSpinLock};
-use wdk_sys::{KIRQL, KSPIN_LOCK};
+use wdk_sys::ntddk::{
+    KeAcquireSpinLockRaiseToDpc, KeInitializeMutex, KeReleaseMutex, KeReleaseSpinLock,
+    KeWaitForSingleObject,
+};
+use wdk_sys::{KIRQL, KMUTANT, KSPIN_LOCK, PVOID};
+
+use crate::irql::PassiveLevel;
+
+/// A stable, fallibly-created atomic shared owner.
+///
+/// Stable `Arc::new` routes allocation failure through the kernel panic handler,
+/// while `Arc::try_new` still requires Rust's unstable allocator API. Paging
+/// callbacks must return `STATUS_NO_MEMORY`, not bugcheck, so this small owner
+/// exposes a fallible constructor and a non-allocating, overflow-checked clone.
+pub(crate) struct FallibleArc<T> {
+    inner: NonNull<FallibleArcInner<T>>,
+}
+
+struct FallibleArcInner<T> {
+    refs: AtomicUsize,
+    value: T,
+}
+
+unsafe impl<T: Send + Sync> Send for FallibleArc<T> {}
+unsafe impl<T: Send + Sync> Sync for FallibleArc<T> {}
+
+impl<T> FallibleArc<T> {
+    pub(crate) fn try_new(value: T) -> Result<Self, T> {
+        let layout = Layout::new::<FallibleArcInner<T>>();
+        // SAFETY: `layout` is nonzero because the header contains AtomicUsize.
+        let raw = unsafe { alloc(layout) }.cast::<FallibleArcInner<T>>();
+        let Some(inner) = NonNull::new(raw) else {
+            return Err(value);
+        };
+        // SAFETY: `inner` points to a suitably aligned allocation of exactly
+        // this layout and has not been initialized yet.
+        unsafe {
+            inner.as_ptr().write(FallibleArcInner {
+                refs: AtomicUsize::new(1),
+                value,
+            });
+        }
+        Ok(Self { inner })
+    }
+
+    /// Clone without allocating; refuse the theoretical refcount-overflow
+    /// case rather than making `Clone` hide a panic path.
+    pub(crate) fn try_clone(&self) -> Option<Self> {
+        let refs = unsafe { &self.inner.as_ref().refs };
+        let mut current = refs.load(Ordering::Relaxed);
+        loop {
+            if current >= isize::MAX as usize {
+                return None;
+            }
+            match refs.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some(Self { inner: self.inner }),
+                Err(observed) => current = observed,
+            }
+        }
+    }
+}
+
+impl<T> Deref for FallibleArc<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        // SAFETY: every owner contributes one positive ref and final release
+        // destroys the allocation only after that count reaches zero.
+        unsafe { &self.inner.as_ref().value }
+    }
+}
+
+impl<T> Drop for FallibleArc<T> {
+    fn drop(&mut self) {
+        let refs = unsafe { &self.inner.as_ref().refs };
+        if refs.fetch_sub(1, Ordering::Release) != 1 {
+            return;
+        }
+        fence(Ordering::Acquire);
+        // SAFETY: this was the final owner. Drop the initialized header/value,
+        // then release the allocation with the identical layout.
+        unsafe {
+            core::ptr::drop_in_place(self.inner.as_ptr());
+            dealloc(
+                self.inner.as_ptr().cast::<u8>(),
+                Layout::new::<FallibleArcInner<T>>(),
+            );
+        }
+    }
+}
+
+/// A kernel mutex for operations which may block and therefore must remain at
+/// PASSIVE_LEVEL.
+///
+/// `KMUTANT` contains an intrusive dispatcher wait list, so it must not move
+/// after `KeInitializeMutex`. Keeping it behind a fallibly allocated shared
+/// owner makes that address stable even when the Rust owner moves, without an
+/// infallible kernel allocation on the adapter-creation path.
+pub(crate) struct PassiveMutex {
+    raw: FallibleArc<UnsafeCell<KMUTANT>>,
+}
+
+unsafe impl Send for PassiveMutex {}
+unsafe impl Sync for PassiveMutex {}
+
+impl PassiveMutex {
+    pub(crate) fn try_new(_passive: PassiveLevel) -> Option<Self> {
+        // SAFETY: KMUTANT is an opaque kernel dispatcher object.  It is placed
+        // at its final heap address before the kernel initializes every field.
+        let raw = FallibleArc::try_new(UnsafeCell::new(unsafe { core::mem::zeroed() })).ok()?;
+        unsafe { KeInitializeMutex(raw.get(), 0) };
+        Some(Self { raw })
+    }
+
+    /// Wait indefinitely and non-alertably for exclusive ownership.
+    pub(crate) fn lock(&self, _passive: PassiveLevel) -> Option<PassiveMutexGuard<'_>> {
+        // SAFETY: `raw` remains at the address initialized by KeInitializeMutex;
+        // Executive=0, KernelMode=0, Alertable=FALSE and NULL timeout form a
+        // legal indefinite PASSIVE_LEVEL wait.
+        let status = unsafe {
+            KeWaitForSingleObject(
+                self.raw.get().cast::<core::ffi::c_void>() as PVOID,
+                0,
+                0,
+                0,
+                core::ptr::null_mut(),
+            )
+        };
+        (status >= 0).then_some(PassiveMutexGuard {
+            owner: self,
+            _not_send: PhantomData,
+        })
+    }
+}
+
+/// Releases a [`PassiveMutex`] on every return path.
+pub(crate) struct PassiveMutexGuard<'a> {
+    owner: &'a PassiveMutex,
+    /// KMUTEX ownership belongs to the acquiring thread.
+    _not_send: PhantomData<*const ()>,
+}
+
+impl Drop for PassiveMutexGuard<'_> {
+    fn drop(&mut self) {
+        // SAFETY: this guard exists only after a successful wait by this
+        // thread, and it cannot outlive its mutex.
+        unsafe { KeReleaseMutex(self.owner.raw.get(), 0) };
+    }
+}
 
 /// A value protected by a `KSPIN_LOCK`.
 pub(crate) struct SpinLock<T> {
@@ -150,6 +306,17 @@ impl<T> FixedVec<T> {
         }
         self.entries.push(value);
         true
+    }
+
+    /// Append without dropping `value` on failure. This matters when `T::drop`
+    /// may call PASSIVE-only kernel APIs and the caller currently holds a
+    /// spinlock: the rejected value can then be released after the guard.
+    pub(crate) fn try_push(&mut self, value: T) -> Result<(), T> {
+        if self.entries.len() >= self.max || self.entries.len() >= self.entries.capacity() {
+            return Err(value);
+        }
+        self.entries.push(value);
+        Ok(())
     }
 
     pub(crate) fn len(&self) -> usize {

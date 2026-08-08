@@ -629,7 +629,7 @@ impl Writer {
 
 // ── Venus VkImageCreateInfo / VkMemoryAllocateInfo encoding ───────────────────
 //
-// R1002. Three image encoders and five memory encoders each re-emitted the whole
+// R1002. Several image and memory encoders each re-emitted the whole
 // struct body inline — about 25 `Writer` calls for an image — differing only in
 // the pNext chain and a handful of scalars. Two of the three image bodies wrote
 // `w.u32(0); // VK_IMAGE_TILING_OPTIMAL` as a BARE LITERAL while the third used
@@ -766,13 +766,17 @@ pub enum MemoryPNext {
     Export { handle_type: u32 },
     /// `VkMemoryDedicatedAllocateInfo` for an image.
     Dedicated { image: u64 },
+    /// `VkMemoryDedicatedAllocateInfo` for a buffer.
+    DedicatedBuffer { buffer: u64 },
     /// `VkExportMemoryAllocateInfo` -> `VkMemoryDedicatedAllocateInfo`.
     ExportDedicated { handle_type: u32, image: u64 },
+    /// `VkExportMemoryAllocateInfo` -> buffer-dedicated allocation.
+    ExportDedicatedBuffer { handle_type: u32, buffer: u64 },
     /// `VkImportMemoryResourceInfoMESA` — adopt an existing virtio resource.
     ImportResource { resource_id: u32 },
 }
 
-/// Everything the five memory allocations differ by.
+/// Everything the memory-allocation command variants differ by.
 #[derive(Clone, Copy)]
 pub struct MemoryAllocateSpec {
     pub pnext: MemoryPNext,
@@ -802,6 +806,13 @@ pub fn encode_memory_allocate(device_id: u64, memory_id: u64, spec: &MemoryAlloc
             w.u64(image);
             w.u64(0); // buffer
         }
+        MemoryPNext::DedicatedBuffer { buffer } => {
+            w.count(true);
+            w.i32(ST_MEMORY_DEDICATED_ALLOCATE_INFO);
+            w.count(false);
+            w.u64(0); // image
+            w.u64(buffer);
+        }
         MemoryPNext::ExportDedicated { handle_type, image } => {
             w.count(true);
             w.i32(ST_EXPORT_MEMORY_ALLOCATE_INFO);
@@ -811,6 +822,19 @@ pub fn encode_memory_allocate(device_id: u64, memory_id: u64, spec: &MemoryAlloc
             w.u64(image);
             w.u64(0); // buffer
                       // The EXPORT struct's own field, after the nested dedicated one.
+            w.u32(handle_type);
+        }
+        MemoryPNext::ExportDedicatedBuffer {
+            handle_type,
+            buffer,
+        } => {
+            w.count(true);
+            w.i32(ST_EXPORT_MEMORY_ALLOCATE_INFO);
+            w.count(true);
+            w.i32(ST_MEMORY_DEDICATED_ALLOCATE_INFO);
+            w.count(false);
+            w.u64(0); // image
+            w.u64(buffer);
             w.u32(handle_type);
         }
         MemoryPNext::ImportResource { resource_id } => {
@@ -836,6 +860,8 @@ pub const MEMORY_PROPERTY_DEVICE_LOCAL: u32 = 0x1;
 pub const MEMORY_PROPERTY_HOST_VISIBLE: u32 = 0x2;
 /// `VK_MEMORY_PROPERTY_HOST_COHERENT_BIT`.
 pub const MEMORY_PROPERTY_HOST_COHERENT: u32 = 0x4;
+/// `VK_MEMORY_PROPERTY_HOST_CACHED_BIT`.
+pub const MEMORY_PROPERTY_HOST_CACHED: u32 = 0x8;
 /// `VK_MAX_MEMORY_TYPES` — the fixed array length the host encodes in
 /// `vkGetPhysicalDeviceMemoryProperties`.
 pub const VK_MAX_MEMORY_TYPES: u32 = 32;
@@ -900,6 +926,47 @@ pub fn choose_host_visible_memory_type(
         i += 1;
     }
     fallback.map(MemoryTypeChoice::Downgraded)
+}
+
+/// Pick a CPU-read-efficient host-visible memory type for a GPU-written buffer.
+///
+/// The Present mirror reads the destination after the Vulkan fence retires.
+/// HOST_VISIBLE|HOST_COHERENT alone is often write-combined on discrete GPUs;
+/// sequential CPU reads from that heap measured hundreds of MB/s rather than
+/// normal RAM bandwidth. Prefer HOST_CACHED as well, while retaining a coherent
+/// fallback so hardware without a cached host heap still functions correctly.
+/// A visible-but-noncoherent type is not usable here: this path has no Vulkan
+/// mapping on which it could issue `vkInvalidateMappedMemoryRanges` after the
+/// GPU write, so accepting one would trade an allocation failure for stale
+/// frames.
+///
+/// `Exact` means all three requested properties are present. The coherent-only
+/// fallback is `Downgraded`, making the performance compromise observable.
+pub fn choose_cached_host_visible_memory_type(
+    memory_type_flags: &[u32],
+    memory_type_count: u32,
+    memory_type_bits: u32,
+) -> Option<MemoryTypeChoice> {
+    let mut coherent_fallback = None;
+    let mut i = 0;
+    while i < memory_type_count && i < VK_MAX_MEMORY_TYPES && (i as usize) < memory_type_flags.len()
+    {
+        if (memory_type_bits & (1u32 << i)) != 0 {
+            let flags = memory_type_flags[i as usize];
+            if (flags & MEMORY_PROPERTY_HOST_VISIBLE) != 0 {
+                if (flags & MEMORY_PROPERTY_HOST_COHERENT) != 0 {
+                    if coherent_fallback.is_none() {
+                        coherent_fallback = Some(i);
+                    }
+                    if (flags & MEMORY_PROPERTY_HOST_CACHED) != 0 {
+                        return Some(MemoryTypeChoice::Exact(i));
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    coherent_fallback.map(MemoryTypeChoice::Downgraded)
 }
 
 /// Pick a DEVICE_LOCAL memory type, in three tiers.
@@ -1167,6 +1234,25 @@ mod tests {
         assert_eq!(w.finished(), Some(GOLDEN_MEMORY_DEDICATED));
     }
 
+    #[test]
+    fn dedicated_buffer_memory_allocate_uses_the_buffer_union_arm() {
+        let w = encode_memory_allocate(
+            GOLD_DEVICE,
+            GOLD_MEMORY,
+            &MemoryAllocateSpec {
+                pnext: MemoryPNext::DedicatedBuffer { buffer: GOLD_IMAGE },
+                size: GOLD_SIZE,
+                memory_type_index: GOLD_MTI,
+            },
+        );
+        let mut expected = GOLDEN_MEMORY_DEDICATED.to_vec();
+        // VkMemoryDedicatedAllocateInfo: image then buffer. The image golden
+        // places GOLD_IMAGE in the first handle; this variant must invert them.
+        expected[48..56].copy_from_slice(&0u64.to_le_bytes());
+        expected[56..64].copy_from_slice(&GOLD_IMAGE.to_le_bytes());
+        assert_eq!(w.finished(), Some(expected.as_slice()));
+    }
+
     /// The order-sensitive one: the dedicated struct's image/buffer fields come
     /// BEFORE the export struct's own handleTypes, because export's pNext points
     /// at dedicated. Swapping them still compiles and still type-checks.
@@ -1185,6 +1271,26 @@ mod tests {
             },
         );
         assert_eq!(w.finished(), Some(GOLDEN_MEMORY_EXPORT_DEDICATED));
+    }
+
+    #[test]
+    fn export_dedicated_buffer_keeps_nesting_and_union_arm() {
+        let w = encode_memory_allocate(
+            GOLD_DEVICE,
+            GOLD_MEMORY,
+            &MemoryAllocateSpec {
+                pnext: MemoryPNext::ExportDedicatedBuffer {
+                    handle_type: 0x0000_0200,
+                    buffer: GOLD_IMAGE,
+                },
+                size: GOLD_SIZE,
+                memory_type_index: GOLD_MTI,
+            },
+        );
+        let mut expected = GOLDEN_MEMORY_EXPORT_DEDICATED.to_vec();
+        expected[60..68].copy_from_slice(&0u64.to_le_bytes());
+        expected[68..76].copy_from_slice(&GOLD_IMAGE.to_le_bytes());
+        assert_eq!(w.finished(), Some(expected.as_slice()));
     }
 
     #[test]
@@ -1781,6 +1887,48 @@ mod tests {
         assert_eq!(
             choose_host_visible_memory_type(&flags, 2, 0b11),
             Some(MemoryTypeChoice::Downgraded(0))
+        );
+    }
+
+    #[test]
+    fn memory_type_cached_host_visible_wins_for_cpu_readback() {
+        let flags = [
+            MEMORY_PROPERTY_HOST_VISIBLE | MEMORY_PROPERTY_HOST_COHERENT,
+            MEMORY_PROPERTY_DEVICE_LOCAL,
+            MEMORY_PROPERTY_HOST_VISIBLE
+                | MEMORY_PROPERTY_HOST_COHERENT
+                | MEMORY_PROPERTY_HOST_CACHED,
+        ];
+        assert_eq!(
+            choose_cached_host_visible_memory_type(&flags, 3, 0b111),
+            Some(MemoryTypeChoice::Exact(2))
+        );
+        // Compatibility is authoritative: a perfect but disallowed type must
+        // not override the coherent allowed fallback.
+        assert_eq!(
+            choose_cached_host_visible_memory_type(&flags, 3, 0b001),
+            Some(MemoryTypeChoice::Downgraded(0))
+        );
+    }
+
+    #[test]
+    fn memory_type_cached_selector_rejects_noncoherent_memory() {
+        let flags = [
+            MEMORY_PROPERTY_HOST_VISIBLE | MEMORY_PROPERTY_HOST_CACHED,
+            MEMORY_PROPERTY_DEVICE_LOCAL,
+            MEMORY_PROPERTY_HOST_VISIBLE | MEMORY_PROPERTY_HOST_COHERENT,
+        ];
+        assert_eq!(
+            choose_cached_host_visible_memory_type(&flags, 3, 0b011),
+            None
+        );
+        assert_eq!(
+            choose_cached_host_visible_memory_type(&flags, 3, 0b111),
+            Some(MemoryTypeChoice::Downgraded(2))
+        );
+        assert_eq!(
+            choose_cached_host_visible_memory_type(&flags, 0, u32::MAX),
+            None
         );
     }
 
