@@ -340,7 +340,12 @@ pub(crate) unsafe fn bind_input_layout(h: Hdevice) {
                 });
             }
             if descs.is_empty() {
-                log_error!(
+                // An empty layout is a normal draw state (for example shaders
+                // using only system-generated vertex IDs), and this bind path
+                // can run hundreds of thousands of times per session.  Keep it
+                // available under UmdTrace without turning tracing-off builds
+                // into a synchronous multi-megabyte log writer.
+                trace_line!(
                     "DDI bind_input_layout skipped: empty descs elements={} vs_len={}",
                     layout.elements.len(),
                     bytecode.len()
