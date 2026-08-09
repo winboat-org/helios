@@ -50,7 +50,9 @@ param(
         'VnEncOvf', 'VnRingFt', 'VnRingWd', 'VnRingSz', 'VnMtDown',
         'CpNoDrn', 'PBTdErr', 'CtNotOurs', 'AbnDrop', 'ABANDONED_FENCES',
         'ChSzMm', 'MapDup', 'PciCapOob',
-        'FENCE_WAIT_TABLE_FULL'
+        'FENCE_WAIT_TABLE_FULL',
+        # fallibly grown Present cache peaks/refusals
+        'PBIHi', 'PBBHi', 'PBLHi', 'PBIRef', 'PBBRef', 'PBLRef'
     )
 )
 

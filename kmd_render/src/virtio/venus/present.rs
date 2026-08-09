@@ -390,9 +390,54 @@ impl BorrowedPresentBuffer {
     }
 }
 
-pub(super) const MAX_PRESENT_IMAGES: usize = 32;
-pub(super) const MAX_PRESENT_BUFFERS: usize = 16;
-pub(super) const MAX_PRESENT_BLITS: usize = 32;
+/// Imported Present images cannot outnumber the transport's live resource
+/// table.  This is a safety ceiling, not an up-front allocation: the cache
+/// grows fallibly in small chunks as real DWM surfaces appear.
+pub(super) const MAX_PRESENT_IMAGES: usize = crate::virtio::gpu::MAX_RESOURCES;
+/// Every borrowed Present buffer is backed by one KMD-owned blob, so the blob
+/// registry is the exact system-wide upper bound for this cache population.
+pub(super) const MAX_PRESENT_BUFFERS: usize = crate::virtio::gpu::MAX_BLOBS;
+/// Reusable BLTs are keyed by a live source/destination pair.  Keep their host
+/// object population independently bounded by the transport resource ceiling;
+/// allocation teardown removes every pair touching the retired resource.
+pub(super) const MAX_PRESENT_BLITS: usize = crate::virtio::gpu::MAX_RESOURCES;
+/// Amortize kernel-pool growth without returning to a large infallible
+/// StartDevice allocation. Present preparation runs at PASSIVE_LEVEL under the
+/// Venus mutex, where fallible pool allocation is legal.
+const PRESENT_CACHE_GROWTH: usize = 64;
+
+/// Reserve one insertion without invoking Rust's infallible OOM path.
+///
+/// The high bits of `failure_diag` distinguish an intentional hard-cap refusal
+/// (`0x80000000`) from a kernel allocator failure (`0x40000000`); the low bits
+/// retain the population at failure. The caller records its successful high
+/// water separately after `push`.
+fn reserve_present_cache_slot<T>(
+    entries: &mut Vec<T>,
+    max: usize,
+    failure_diag: &[u8],
+) -> Result<(), VirtioError> {
+    let population = entries.len().min(0x3fff_ffff) as u32;
+    if entries.len() >= max {
+        crate::diag::record_named_bytes(failure_diag, 0x8000_0000 | population);
+        return Err(VirtioError::OutOfMemory);
+    }
+    if entries.len() == entries.capacity() {
+        let growth = PRESENT_CACHE_GROWTH.min(max - entries.capacity());
+        if entries.try_reserve_exact(growth).is_err() {
+            crate::diag::record_named_bytes(failure_diag, 0x4000_0000 | population);
+            return Err(VirtioError::OutOfMemory);
+        }
+    }
+    Ok(())
+}
+
+fn record_present_cache_high_water(current: usize, high_water: &mut usize, diag: &[u8]) {
+    if current > *high_water {
+        *high_water = current;
+        crate::diag::record_named_bytes(diag, current as u32);
+    }
+}
 /// Submissions a source/destination pair must complete before the one-shot
 /// destination probe is armed for it (`PresentProbe` knob only).
 ///
@@ -563,11 +608,14 @@ impl VenusClient {
                 Err(VirtioError::DeviceError)
             };
         }
-        if self.present_images.len() >= MAX_PRESENT_IMAGES {
-            return Err(VirtioError::OutOfMemory);
-        }
+        reserve_present_cache_slot(&mut self.present_images, MAX_PRESENT_IMAGES, b"PBIRef")?;
         let image = self.import_optimal_present_image(adapter, desc)?;
         self.present_images.push(image);
+        record_present_cache_high_water(
+            self.present_images.len(),
+            &mut self.present_images_high_water,
+            b"PBIHi",
+        );
         Ok(image)
     }
 
@@ -642,11 +690,14 @@ impl VenusClient {
                 Err(VirtioError::DeviceError)
             };
         }
-        if self.present_buffers.len() >= MAX_PRESENT_BUFFERS {
-            return Err(VirtioError::OutOfMemory);
-        }
+        reserve_present_cache_slot(&mut self.present_buffers, MAX_PRESENT_BUFFERS, b"PBBRef")?;
         let buffer = self.borrow_present_buffer(desc)?;
         self.present_buffers.push(buffer);
+        record_present_cache_high_water(
+            self.present_buffers.len(),
+            &mut self.present_buffers_high_water,
+            b"PBBHi",
+        );
         Ok(buffer)
     }
 
@@ -1090,8 +1141,8 @@ impl VenusClient {
             blt.source_resource_id == source.resource_id
                 && blt.destination_resource_id == destination.resource_id()
         });
-        if existing.is_none() && self.present_blits.len() >= MAX_PRESENT_BLITS {
-            return Err(VirtioError::OutOfMemory);
+        if existing.is_none() {
+            reserve_present_cache_slot(&mut self.present_blits, MAX_PRESENT_BLITS, b"PBLRef")?;
         }
         // Validate the complete descriptors on every call, including cache
         // hits. A recycled/mutated resource id can therefore never select a
@@ -1206,6 +1257,11 @@ impl VenusClient {
                     // Only a standard buffer is CPU-mappable for the diagnostic.
                     probe_done: matches!(destination, PresentDestinationDesc::OptimalImage(_)),
                 });
+                record_present_cache_high_water(
+                    self.present_blits.len(),
+                    &mut self.present_blits_high_water,
+                    b"PBLHi",
+                );
                 self.present_blits.len() - 1
             }
         };

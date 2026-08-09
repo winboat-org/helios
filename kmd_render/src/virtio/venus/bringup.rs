@@ -423,9 +423,15 @@ impl VenusInstance {
             memory_type_count,
             copy_target_image_id: None,
             copy_target_init_pool_id: None,
-            present_images: Vec::with_capacity(MAX_PRESENT_IMAGES),
-            present_buffers: Vec::with_capacity(MAX_PRESENT_BUFFERS),
-            present_blits: Vec::with_capacity(MAX_PRESENT_BLITS),
+            // Present caches grow fallibly at PASSIVE_LEVEL. Their semantic
+            // ceilings are tied to transport resources, but an idle adapter
+            // pays no large up-front nonpaged-pool allocation here.
+            present_images: Vec::new(),
+            present_buffers: Vec::new(),
+            present_blits: Vec::new(),
+            present_images_high_water: 0,
+            present_buffers_high_water: 0,
+            present_blits_high_water: 0,
             owned_memory_blobs: Vec::with_capacity(MAX_OWNED_MEMORY_BLOBS),
         })
     }

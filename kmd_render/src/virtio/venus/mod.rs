@@ -308,13 +308,16 @@ pub struct VenusClient {
     /// later copy execute after it.
     copy_target_image_id: Option<VkImageId>,
     copy_target_init_pool_id: Option<VkCommandPoolId>,
-    /// App/DWM BLT imports and recorded copies. Both vectors are preallocated
-    /// and capacity-bounded. Every access is serialized by
-    /// AdapterContext::with_venus_client, so setup/submission/teardown cannot
-    /// race through incidental call ordering.
+    /// App/DWM BLT imports and recorded copies. These caches grow fallibly at
+    /// PASSIVE_LEVEL and retain explicit transport-derived ceilings. Every
+    /// access is serialized by AdapterContext::with_venus_client, so
+    /// setup/submission/teardown cannot race through incidental call ordering.
     present_images: Vec<ImportedOptimalImage>,
     present_buffers: Vec<BorrowedPresentBuffer>,
     present_blits: Vec<PreparedPresentBlt>,
+    present_images_high_water: usize,
+    present_buffers_high_water: usize,
+    present_blits_high_water: usize,
     /// Exact identities of `allocate_memory_blob` allocations. This registry
     /// turns a standard Present destination into a checked borrow of the
     /// already-live local `VkDeviceMemory`; no resource-id heuristic or
