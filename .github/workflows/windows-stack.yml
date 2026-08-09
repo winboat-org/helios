@@ -3,10 +3,10 @@ name: Windows graphics and compute bundle
 on:
   workflow_dispatch:
   push:
-    branches: [wddm]
+    branches: [master]
     tags: ['v*']
   pull_request:
-    branches: [wddm]
+    branches: [master]
 
 permissions:
   contents: read
