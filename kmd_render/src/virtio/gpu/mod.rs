@@ -47,14 +47,14 @@ use bytemuck::Zeroable;
 use helios_kmd_logic::scanout_read_ledger::LedgerTicket;
 use helios_kmd_logic::scanout_refresh::{Marker as ScanoutRefreshMarker, State as RefreshState};
 use helios_protocol::{
-    HELIOS_OPTIONAL_FEATURES, HELIOS_REQUIRED_FEATURES, VIRTIO_GPU_CMD_GET_DISPLAY_INFO,
-    VIRTIO_GPU_CMD_SUBMIT_3D, VIRTIO_GPU_FLAG_FENCE, VIRTIO_GPU_FLAG_INFO_RING_IDX,
-    VirtioGpuCmdSubmit, VirtioGpuCtrlHdr, VirtioGpuRespDisplayInfo, VirtioGpuSetScanoutBlob,
-    resp_is_ok,
+    resp_is_ok, VirtioGpuCmdSubmit, VirtioGpuCtrlHdr, VirtioGpuRespDisplayInfo,
+    VirtioGpuSetScanoutBlob, HELIOS_OPTIONAL_FEATURES, HELIOS_REQUIRED_FEATURES,
+    VIRTIO_GPU_CMD_GET_DISPLAY_INFO, VIRTIO_GPU_CMD_SUBMIT_3D, VIRTIO_GPU_FLAG_FENCE,
+    VIRTIO_GPU_FLAG_INFO_RING_IDX,
 };
 use virtio_drivers::queue::VirtQueue;
-use virtio_drivers::transport::pci::PciTransport;
 use virtio_drivers::transport::pci::bus::{DeviceFunction, PciRoot};
+use virtio_drivers::transport::pci::PciTransport;
 use virtio_drivers::transport::{DeviceStatus, Transport};
 use wdk_sys::ntddk::{KeInitializeEvent, KeSetEvent, ObDereferenceObjectDeferDelete};
 use wdk_sys::{KEVENT, PVOID};
@@ -63,13 +63,13 @@ mod resource_tables;
 
 use super::config::DxgkConfigAccess;
 use super::hal::{DmaBuffer, DmaSpan, WdkHal};
-use super::pci_caps::{HostVisibleWindow, map_isr_status_register, scan_host_visible_window};
+use super::pci_caps::{map_isr_status_register, scan_host_visible_window, HostVisibleWindow};
 
 // R1103: the telemetry atomics moved to `super::counters`. Re-exported here so
 // all 53+ external `gpu::<COUNTER>` paths keep compiling unchanged; narrowing
 // the re-export is a follow-up, not part of the move.
-use super::VirtioError;
 pub use super::counters::*;
+use super::VirtioError;
 use crate::dxgk::DXGKRNL_INTERFACE;
 use crate::virtio::venus::{
     OptimalPresentImageDesc, PreparedPresentBltSubmission, PresentDestinationDesc,
@@ -488,10 +488,9 @@ impl ScanoutFlushToken {
         self.done = true;
         // SAFETY: per the type's doc — the adapter outlives every in-flight
         // transport entry, and the call touches only atomics + the leaf lock.
-        unsafe { self.adapter.as_ref() }.read_ledger.retire(
-            self.ledger_ticket,
-            via_drop,
-        );
+        unsafe { self.adapter.as_ref() }
+            .read_ledger
+            .retire(self.ledger_ticket, via_drop);
     }
 
     /// Consume the token when the control response has been drained.
@@ -718,6 +717,11 @@ enum InFlightKind {
         /// retires.  The stream handle carries its generation, so a stale
         /// completion can never advance a re-registered stream slot.
         present_stream: Option<PresentStreamRetire>,
+        /// Legacy inline standard buffer whose KMD writer ownership began
+        /// before enqueue. Successful GPU retirement always holds it for the
+        /// subsequent serialized VidMm backing check/mirror. WindowedBlt
+        /// carries the same transition in its typed FIFO.
+        present_buffer_write: Option<u32>,
         /// Exact deferred WindowedBlt transaction whose ring-1 response this
         /// entry represents. It owns no allocation pointers; lookup remains in
         /// the bounded FIFO by token/stream.
@@ -817,12 +821,19 @@ struct PresentStreamRetire {
 #[derive(Clone, Copy)]
 struct PresentStreamSlot {
     live: bool,
+    /// Unregister/owner teardown has revoked new claims, but an already-tagged
+    /// Venus submission still owns the retirement proof carried by this slot.
+    closing: bool,
     owner: Option<DeviceOwner>,
     ctx_id: u32,
     ring_idx: u8,
     generation: u32,
     cookie: u64,
     creator_process: usize,
+    /// Value reserved by one or more buffer claims but not yet attached to a
+    /// successfully enqueued Venus submission. Multiple buffers in one batch
+    /// deliberately share it.
+    claimed_value: u32,
     submitted_value: u32,
     retired_value: u32,
 }
@@ -830,12 +841,14 @@ struct PresentStreamSlot {
 impl PresentStreamSlot {
     const EMPTY: Self = Self {
         live: false,
+        closing: false,
         owner: None,
         ctx_id: 0,
         ring_idx: 0,
         generation: 0,
         cookie: 0,
         creator_process: 0,
+        claimed_value: 0,
         submitted_value: 0,
         retired_value: 0,
     };
@@ -860,20 +873,117 @@ impl PresentStreamSlot {
 /// surfacing only as `0xc0000001`/Startup Repair.
 ///
 /// `#[inline(never)]` keeps the small allocation loop transient. The returned
-/// boxed slice is fixed-length for the entire transport generation, so no
-/// registration, submission, completion, DPC, or teardown path can reallocate.
+/// vector is resized once and remains fixed-length for the entire transport
+/// generation, so no registration, submission, completion, DPC, or teardown
+/// path can reallocate. Reservation is fallible so low nonpaged-pool conditions
+/// cleanly fail StartDevice rather than reaching the allocator's OOM path.
 #[inline(never)]
-fn allocate_present_streams() -> Box<[PresentStreamSlot; MAX_PRESENT_STREAMS]> {
-    let mut slots = Box::<[PresentStreamSlot; MAX_PRESENT_STREAMS]>::new_uninit();
-    let first = slots.as_mut_ptr().cast::<PresentStreamSlot>();
-    for index in 0..MAX_PRESENT_STREAMS {
-        // SAFETY: `first` addresses the boxed array allocation and every index
-        // is in bounds. Each element is written exactly once before
-        // `assume_init` below; no reference to an uninitialized slot is made.
-        unsafe { first.add(index).write(PresentStreamSlot::EMPTY) };
-    }
-    // SAFETY: the loop initialized all MAX_PRESENT_STREAMS elements.
-    unsafe { slots.assume_init() }
+fn allocate_present_streams() -> Result<Vec<PresentStreamSlot>, VirtioError> {
+    let mut slots = Vec::new();
+    slots
+        .try_reserve_exact(MAX_PRESENT_STREAMS)
+        .map_err(|_| VirtioError::OutOfMemory)?;
+    slots.resize(MAX_PRESENT_STREAMS, PresentStreamSlot::EMPTY);
+    Ok(slots)
+}
+
+// Every owned blob can, in the worst case, be a KMD-created Present buffer.
+// Keep the ownership registry at the same explicit bound so this protocol
+// never introduces a lower cross-application allocation ceiling.
+const MAX_PRESENT_BUFFER_SYNCS: usize = MAX_BLOBS;
+
+/// Maximum number of distinct (KMD process, dedicated Present buffer) open
+/// capabilities. Duplicate opens by one process share a reference-counted row,
+/// so this is a bound on cross-process sharing fan-out rather than on
+/// `DxgkDdiOpenAllocation` calls. Eight rows per possible blob leaves ample
+/// room for ordinary app + DWM sharing without allowing an unbounded table to
+/// grow beneath `virtio_lock`.
+const MAX_PRESENT_BUFFER_OPENS: usize = MAX_PRESENT_BUFFER_SYNCS * 8;
+
+/// Queue-family ownership of one KMD-created, externally shared Present
+/// buffer. Every transition happens under `virtio_lock`, alongside stream
+/// retirement and WindowedBlt dispatch, so a reader claim and a writer start
+/// cannot pass each other.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PresentBufferAccess {
+    Empty,
+    /// Initial/previous KMD release has retired; EXTERNAL owns the buffer.
+    ExternalReady,
+    /// A consumer owns it until this registered stream boundary retires.
+    Consumer(u64),
+    /// A KMD BLT has acquired it and is in flight.
+    KmdWriter,
+    /// The KMD BLT and its release barrier retired successfully, but VidMm's
+    /// system-backing copy still has CPU read access to the shared buffer.
+    KmdCpuMirror,
+    /// Allocation teardown atomically revoked both future readers and writers.
+    Teardown,
+}
+
+#[derive(Clone, Copy)]
+struct PresentBufferSync {
+    resource_id: u32,
+    access: PresentBufferAccess,
+}
+
+impl PresentBufferSync {
+    const EMPTY: Self = Self {
+        resource_id: 0,
+        access: PresentBufferAccess::Empty,
+    };
+}
+
+#[inline(never)]
+fn allocate_present_buffer_syncs() -> Result<Vec<PresentBufferSync>, VirtioError> {
+    let mut slots = Vec::new();
+    slots
+        .try_reserve_exact(MAX_PRESENT_BUFFER_SYNCS)
+        .map_err(|_| VirtioError::OutOfMemory)?;
+    slots.resize(MAX_PRESENT_BUFFER_SYNCS, PresentBufferSync::EMPTY);
+    Ok(slots)
+}
+
+/// One exact process-scoped open capability for a dedicated Present buffer.
+/// `creator_process` is dxgkrnl's opaque `hKmdProcess`, compared only for exact
+/// equality; it is never interpreted as a PID or pointer.
+#[derive(Clone, Copy)]
+struct PresentBufferOpen {
+    resource_id: u32,
+    refs: u32,
+    creator_process: usize,
+}
+
+impl PresentBufferOpen {
+    const EMPTY: Self = Self {
+        resource_id: 0,
+        refs: 0,
+        creator_process: 0,
+    };
+}
+
+#[inline(never)]
+fn allocate_present_buffer_opens() -> Result<Vec<PresentBufferOpen>, VirtioError> {
+    let mut slots = Vec::new();
+    slots
+        .try_reserve_exact(MAX_PRESENT_BUFFER_OPENS)
+        .map_err(|_| VirtioError::OutOfMemory)?;
+    slots.resize(MAX_PRESENT_BUFFER_OPENS, PresentBufferOpen::EMPTY);
+    Ok(slots)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PresentBufferReadClaim {
+    Accepted,
+    Busy,
+    NotFound,
+    Invalid,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PresentBufferWriteBegin {
+    Acquired,
+    Busy,
+    NotFound,
 }
 
 /// Bounded completion-ordered scanout work.
@@ -1599,13 +1709,15 @@ pub(crate) struct WindowedBltPending {
     pub(crate) admitted: bool,
     pub(crate) dispatched: bool,
     pub(crate) ring_complete: bool,
+    /// Successful KMD writer -> CPU mirror ownership transition. A ring
+    /// response alone never authorizes the PASSIVE reader.
+    pub(crate) mirror_ready: bool,
     pub(crate) ledger_retired: bool,
     /// `false` after the WDDM overflow path has discarded the DMA completion
     /// that formerly owned this token. The host copy may still need to reach
     /// ring completion, but it must not retain a terminal membership no WDDM
     /// submission can ever consume.
     pub(crate) wddm_completion_required: bool,
-    pub(crate) system_backing: bool,
     pub(crate) mirror_claimed: bool,
 }
 
@@ -1877,11 +1989,19 @@ pub struct VirtioGpu {
     /// MAX_FENCE_EVENTS, reserved at init — pushes never reallocate under the
     /// spinlock). Entries hold an object reference each.
     fence_events: Vec<FenceEventEntry>,
-    /// Registered present streams. Fixed-size heap storage keeps the large
+    /// Registered present streams. Fixed-length heap storage keeps the large
     /// table out of the StartDevice/VirtioGpu::init stack chain while remaining
     /// allocation-free on registration, tagging, completion, and DISPATCH
     /// marker-readiness paths.
-    present_streams: Box<[PresentStreamSlot; MAX_PRESENT_STREAMS]>,
+    present_streams: Vec<PresentStreamSlot>,
+    /// Dedicated standard-buffer ownership table. Fixed-length heap storage keeps all
+    /// claim/retire/dispatch paths allocation-free under `virtio_lock`.
+    present_buffer_syncs: Vec<PresentBufferSync>,
+    /// Process-scoped OpenAllocation capabilities for those buffers. This is
+    /// separate from stream ownership: a stream proves which Venus context may
+    /// submit, while this table proves that its Windows process actually opened
+    /// the exact WDDM allocation named by a read claim.
+    present_buffer_opens: Vec<PresentBufferOpen>,
     /// Fresh opaque registration capability.  Zero is never issued.
     next_present_stream_cookie: u64,
     /// Next wire fence id to assign (globally monotonic, starts at 1; 0 is
@@ -2138,6 +2258,14 @@ impl VirtioGpu {
             crate::diag::fault(crate::diag::FaultCounter::StIsr, mmio_fails);
         }
 
+        // Reserve the three fixed-length ownership registries before building
+        // the device object. In particular, the process capability table is
+        // roughly 1 MiB; allocation failure must propagate through StartDevice
+        // instead of entering the kernel allocator's infallible OOM path.
+        let present_streams = allocate_present_streams()?;
+        let present_buffer_syncs = allocate_present_buffer_syncs()?;
+        let present_buffer_opens = allocate_present_buffer_opens()?;
+
         // `VirtioGpu` contains the control virtqueue and many ownership tables.
         // Return it heap-owned so StartDevice never reserves a second by-value
         // copy of this large state while `init`'s own frame is live.
@@ -2166,7 +2294,9 @@ impl VirtioGpu {
             fast_bind: allocate_fast_bind_state(),
             fence_waiters: Vec::with_capacity(MAX_FENCE_WAITERS),
             fence_events: Vec::with_capacity(MAX_FENCE_EVENTS),
-            present_streams: allocate_present_streams(),
+            present_streams,
+            present_buffer_syncs,
+            present_buffer_opens,
             next_present_stream_cookie: 1,
             // NOT 1. Wire fence ids arrive from an untrusted usermode buffer
             // at the WAIT_FENCE escape, and both `fence_wait_prepare` and
@@ -3345,7 +3475,31 @@ impl VirtioGpu {
         venus: DmaBuffer,
         venus_len: usize,
     ) -> Result<u64, (DmaBuffer, DmaBuffer, VirtioError)> {
-        self.enqueue_submit_inner(ctx_id, ring_idx, meta, venus, venus_len, None, None, None)
+        self.enqueue_submit_inner(
+            ctx_id, ring_idx, meta, venus, venus_len, None, None, None, None,
+        )
+    }
+
+    pub fn enqueue_async_submit_present_buffer(
+        &mut self,
+        ctx_id: u32,
+        ring_idx: u32,
+        meta: DmaBuffer,
+        venus: DmaBuffer,
+        venus_len: usize,
+        resource_id: u32,
+    ) -> Result<u64, (DmaBuffer, DmaBuffer, VirtioError)> {
+        self.enqueue_submit_inner(
+            ctx_id,
+            ring_idx,
+            meta,
+            venus,
+            venus_len,
+            None,
+            None,
+            None,
+            Some(resource_id),
+        )
     }
 
     /// Ring-1 submission belonging to an already admitted WindowedBlt FIFO
@@ -3383,6 +3537,7 @@ impl VirtioGpu {
                 token,
                 stream_boundary,
             }),
+            None,
         )
     }
 
@@ -3412,6 +3567,7 @@ impl VirtioGpu {
             venus_len,
             None,
             Some(retire),
+            None,
             None,
         )
     }
@@ -3446,6 +3602,7 @@ impl VirtioGpu {
             Some(notify),
             None,
             None,
+            None,
         )
     }
 
@@ -3461,6 +3618,7 @@ impl VirtioGpu {
         scanout_notify: Option<ScanoutNotify>,
         present_stream: Option<PresentStreamRetire>,
         windowed_blt: Option<WindowedBltRetire>,
+        present_buffer_write: Option<u32>,
     ) -> Result<u64, (DmaBuffer, DmaBuffer, VirtioError)> {
         let hdr_len = core::mem::size_of::<VirtioGpuCmdSubmit>();
         let resp_len = core::mem::size_of::<VirtioGpuCtrlHdr>();
@@ -3510,6 +3668,7 @@ impl VirtioGpu {
                 scanout_notify,
                 present_stream,
                 windowed_blt,
+                present_buffer_write,
             },
             meta,
             chain,
@@ -4022,6 +4181,7 @@ impl VirtioGpu {
                     scanout_notify,
                     present_stream,
                     windowed_blt,
+                    present_buffer_write,
                 } => {
                     ASYNC_COMPLETE_COUNT.fetch_add(1, Ordering::Relaxed);
                     if ring_idx != 0 {
@@ -4047,6 +4207,12 @@ impl VirtioGpu {
                         // for this exact producer edge. Signal its PASSIVE
                         // worker; readiness remains checked again under lock.
                         self.wake_ready_windowed_blt();
+                    }
+                    if response_ok {
+                        if let Some(resource_id) = present_buffer_write {
+                            let _ = self.complete_present_buffer_gpu_write(resource_id);
+                            self.wake_ready_windowed_blt();
+                        }
                     }
                     if let Some(retire) = windowed_blt {
                         // SAFETY: every token stores the stable adapter that
@@ -4464,17 +4630,9 @@ impl VirtioGpu {
             PRESENT_STREAM_REJECTS.fetch_add(1, Ordering::Relaxed);
             return Err(VirtioError::NotOwned);
         }
-        // One stream per owned Venus context.  That is what makes a batched
-        // PresentSubmissionPrivate record compactly merge same-context marker
-        // values without inventing an ordering between two stream namespaces.
-        if self
-            .present_streams
-            .iter()
-            .any(|slot| slot.live && slot.owner == Some(owner) && slot.ctx_id == ctx_id)
-        {
-            PRESENT_STREAM_REJECTS.fetch_add(1, Ordering::Relaxed);
-            return Err(VirtioError::DeviceError);
-        }
+        // Multiple timelines may belong to one Venus context. Every marker and
+        // tagged submit carries the exact opaque cookie, so they never share a
+        // value namespace; the fixed adapter table remains the hard bound.
         let Some((index, _)) = self
             .present_streams
             .iter()
@@ -4495,12 +4653,14 @@ impl VirtioGpu {
         self.next_present_stream_cookie = next_cookie;
         self.present_streams[index] = PresentStreamSlot {
             live: true,
+            closing: false,
             owner: Some(owner),
             ctx_id,
             ring_idx: 0,
             generation,
             cookie,
             creator_process,
+            claimed_value: 0,
             submitted_value: 0,
             retired_value: 0,
         };
@@ -4526,7 +4686,7 @@ impl VirtioGpu {
             PRESENT_STREAM_REJECTS.fetch_add(1, Ordering::Relaxed);
             return false;
         };
-        self.retire_present_stream_slot(index);
+        self.close_present_stream_slot(index);
         let _ = self.discharge_dead_present_stream_waits(order);
         self.cancel_dead_undispatched_windowed_blt();
         true
@@ -4541,8 +4701,11 @@ impl VirtioGpu {
     ) -> u32 {
         let mut count = 0;
         for index in 0..self.present_streams.len() {
-            if self.present_streams[index].live && self.present_streams[index].owner == owner {
-                self.retire_present_stream_slot(index);
+            if self.present_streams[index].live
+                && !self.present_streams[index].closing
+                && self.present_streams[index].owner == owner
+            {
+                self.close_present_stream_slot(index);
                 count += 1;
             }
         }
@@ -4562,8 +4725,8 @@ impl VirtioGpu {
         let mut count = 0;
         for index in 0..self.present_streams.len() {
             let slot = self.present_streams[index];
-            if slot.live && slot.owner == owner && slot.ctx_id == ctx_id {
-                self.retire_present_stream_slot(index);
+            if slot.live && !slot.closing && slot.owner == owner && slot.ctx_id == ctx_id {
+                self.close_present_stream_slot(index);
                 count += 1;
             }
         }
@@ -4576,6 +4739,7 @@ impl VirtioGpu {
     pub fn purge_all_present_streams(&mut self) {
         for index in 0..self.present_streams.len() {
             if self.present_streams[index].live {
+                self.release_retired_present_buffer_consumers_for_stream(index);
                 self.retire_present_stream_slot(index);
             }
         }
@@ -4610,9 +4774,78 @@ impl VirtioGpu {
             generation,
             ..PresentStreamSlot::EMPTY
         };
-        let _ = PRESENT_STREAM_LIVE.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |live| {
-            live.checked_sub(1)
-        });
+        if PRESENT_STREAM_LIVE.load(Ordering::Relaxed) != 0 {
+            PRESENT_STREAM_LIVE.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Before a stream capability disappears, preserve every consumer
+    /// ownership result that its already-retired timeline values proved.
+    /// Boundaries newer than `retired_value` stay Consumer and therefore fail
+    /// closed if the stream or transport dies.
+    fn release_retired_present_buffer_consumers_for_stream(&mut self, index: usize) {
+        let slot = self.present_streams[index];
+        if !slot.live {
+            return;
+        }
+        let handle = slot.handle(index);
+        for buffer in self.present_buffer_syncs.iter_mut() {
+            let PresentBufferAccess::Consumer(boundary) = buffer.access else {
+                continue;
+            };
+            if decode_present_stream_boundary(boundary).is_some_and(|(candidate, value)| {
+                candidate == handle && value <= slot.retired_value
+            }) {
+                buffer.access = PresentBufferAccess::ExternalReady;
+            }
+        }
+    }
+
+    /// Revoke new work immediately, but retain the generation-qualified slot
+    /// while an already-enqueued (or claimed-not-yet-enqueued) value still owns
+    /// the only proof that externally imported buffers are no longer in use.
+    fn close_present_stream_slot(&mut self, index: usize) {
+        self.release_retired_present_buffer_consumers_for_stream(index);
+        let slot = self.present_streams[index];
+        if slot.claimed_value == 0 && slot.retired_value >= slot.submitted_value {
+            self.retire_present_stream_slot(index);
+        } else {
+            self.present_streams[index].closing = true;
+            // DeviceOwner is a borrowed allocation capability. Once teardown
+            // begins, no completion path needs it; clear it before its owner
+            // object can disappear while keeping the opaque handle/value proof.
+            self.present_streams[index].owner = None;
+            self.present_streams[index].creator_process = 0;
+        }
+    }
+
+    /// A successful host CTX_DESTROY is stronger than a missing ring response:
+    /// no submission in that exact Venus context can still execute. Resolve
+    /// claimed-but-never-submitted and in-flight consumer ownership before
+    /// releasing the closing stream slots. This is never called on an
+    /// ambiguous or rejected destroy.
+    pub fn finalize_closed_present_streams_for_context(&mut self, ctx_id: u32) -> u32 {
+        let mut finalized = 0u32;
+        for index in 0..self.present_streams.len() {
+            let slot = self.present_streams[index];
+            if !slot.live || !slot.closing || slot.ctx_id != ctx_id {
+                continue;
+            }
+            let handle = slot.handle(index);
+            for buffer in self.present_buffer_syncs.iter_mut() {
+                if matches!(
+                    buffer.access,
+                    PresentBufferAccess::Consumer(boundary)
+                        if decode_present_stream_boundary(boundary)
+                            .is_some_and(|(candidate, _)| candidate == handle)
+                ) {
+                    buffer.access = PresentBufferAccess::ExternalReady;
+                }
+            }
+            self.retire_present_stream_slot(index);
+            finalized += 1;
+        }
+        finalized
     }
 
     fn present_stream_handle_live(&self, handle: u32) -> bool {
@@ -4731,6 +4964,7 @@ impl VirtioGpu {
         }
         let found = self.present_streams.iter().enumerate().find(|(_, slot)| {
             slot.live
+                && !slot.closing
                 && slot.ctx_id == ctx_id
                 && slot.cookie == cookie
                 && slot.creator_process == creator_process
@@ -4741,6 +4975,368 @@ impl VirtioGpu {
         };
         PRESENT_STREAM_MARKERS.fetch_add(1, Ordering::Relaxed);
         Some(encode_present_stream_boundary(slot.handle(index), value))
+    }
+
+    fn present_stream_boundary_for_owner(
+        &mut self,
+        owner: DeviceOwner,
+        ctx_id: u32,
+        cookie: u64,
+        resource_id: u32,
+        value: u32,
+    ) -> Option<u64> {
+        if ctx_id == 0 || cookie == 0 || value == 0 {
+            return None;
+        }
+        let (index, slot) = self.present_streams.iter().enumerate().find(|(_, slot)| {
+            slot.live
+                && !slot.closing
+                && slot.owner == Some(owner)
+                && slot.ctx_id == ctx_id
+                && slot.cookie == cookie
+        })?;
+        let creator_process = slot.creator_process;
+        if !self.present_buffer_is_open_for_process(resource_id, creator_process) {
+            return None;
+        }
+        // Consumer batches reserve exactly the next tag. Multiple resources in
+        // one command list may share it, but a later list cannot skip ahead of
+        // an unsubmitted batch and let max-retirement cover work that never ran.
+        if slot.submitted_value.checked_add(1) != Some(value)
+            || (slot.claimed_value != 0 && slot.claimed_value != value)
+        {
+            return None;
+        }
+        let boundary = encode_present_stream_boundary(slot.handle(index), value);
+        self.present_streams[index].claimed_value = value;
+        Some(boundary)
+    }
+
+    /// Publish a buffer only after its one-time family-0 -> EXTERNAL release
+    /// completed. Registration and every later transition share virtio_lock.
+    pub fn register_present_buffer(&mut self, resource_id: u32) -> Result<(), VirtioError> {
+        if self.failed || resource_id == 0 {
+            PRESENT_BUFFER_SYNC_REJECTS.fetch_add(1, Ordering::Relaxed);
+            return Err(VirtioError::DeviceError);
+        }
+        if self
+            .present_buffer_syncs
+            .iter()
+            .any(|slot| slot.resource_id == resource_id)
+        {
+            PRESENT_BUFFER_SYNC_REJECTS.fetch_add(1, Ordering::Relaxed);
+            return Err(VirtioError::DeviceError);
+        }
+        let Some(slot) = self
+            .present_buffer_syncs
+            .iter_mut()
+            .find(|slot| slot.access == PresentBufferAccess::Empty)
+        else {
+            PRESENT_BUFFER_SYNC_REJECTS.fetch_add(1, Ordering::Relaxed);
+            return Err(VirtioError::OutOfMemory);
+        };
+        *slot = PresentBufferSync {
+            resource_id,
+            access: PresentBufferAccess::ExternalReady,
+        };
+        Ok(())
+    }
+
+    /// Grant one exact KMD process an OpenAllocation-derived capability for a
+    /// dedicated Present buffer. The caller publishes an
+    /// `OpenAllocationContext` only after this succeeds and releases the same
+    /// row during CloseAllocation or open unwind.
+    pub fn authorize_present_buffer_open(
+        &mut self,
+        resource_id: u32,
+        creator_process: usize,
+    ) -> bool {
+        if resource_id == 0
+            || creator_process == 0
+            || !self.present_buffer_syncs.iter().any(|slot| {
+                slot.resource_id == resource_id
+                    && !matches!(
+                        slot.access,
+                        PresentBufferAccess::Empty | PresentBufferAccess::Teardown
+                    )
+            })
+        {
+            PRESENT_BUFFER_SYNC_REJECTS.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        if let Some(slot) = self
+            .present_buffer_opens
+            .iter_mut()
+            .find(|slot| slot.resource_id == resource_id && slot.creator_process == creator_process)
+        {
+            let Some(refs) = slot.refs.checked_add(1) else {
+                PRESENT_BUFFER_SYNC_REJECTS.fetch_add(1, Ordering::Relaxed);
+                return false;
+            };
+            slot.refs = refs;
+            return true;
+        }
+        let Some(slot) = self
+            .present_buffer_opens
+            .iter_mut()
+            .find(|slot| slot.resource_id == 0)
+        else {
+            PRESENT_BUFFER_SYNC_REJECTS.fetch_add(1, Ordering::Relaxed);
+            return false;
+        };
+        *slot = PresentBufferOpen {
+            resource_id,
+            refs: 1,
+            creator_process,
+        };
+        true
+    }
+
+    /// Release the exact capability acquired by OpenAllocation. Missing rows
+    /// indicate a lifecycle bug and are refused rather than decrementing an
+    /// unrelated process/resource pair.
+    pub fn release_present_buffer_open(
+        &mut self,
+        resource_id: u32,
+        creator_process: usize,
+    ) -> bool {
+        let Some(slot) = self.present_buffer_opens.iter_mut().find(|slot| {
+            slot.resource_id == resource_id && slot.creator_process == creator_process
+        }) else {
+            PRESENT_BUFFER_SYNC_REJECTS.fetch_add(1, Ordering::Relaxed);
+            return false;
+        };
+        if slot.refs > 1 {
+            slot.refs -= 1;
+        } else {
+            *slot = PresentBufferOpen::EMPTY;
+        }
+        true
+    }
+
+    fn present_buffer_is_open_for_process(&self, resource_id: u32, creator_process: usize) -> bool {
+        self.present_buffer_opens.iter().any(|slot| {
+            slot.resource_id == resource_id
+                && slot.creator_process == creator_process
+                && slot.refs != 0
+        })
+    }
+
+    pub fn unregister_present_buffer(&mut self, resource_id: u32) -> bool {
+        let Some(slot) = self
+            .present_buffer_syncs
+            .iter_mut()
+            .find(|slot| slot.resource_id == resource_id)
+        else {
+            return true;
+        };
+        if slot.access == PresentBufferAccess::Teardown {
+            *slot = PresentBufferSync::EMPTY;
+            // CloseAllocation should already have released every capability.
+            // Clear defensively at the resource lifetime boundary so a broken
+            // close sequence cannot authorize a later resource-id generation.
+            for open in self.present_buffer_opens.iter_mut() {
+                if open.resource_id == resource_id {
+                    *open = PresentBufferOpen::EMPTY;
+                }
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Atomically revoke new access once all previously admitted GPU work has
+    /// retired. A successful result is the lifetime proof required before the
+    /// backing blob, dedicated VkBuffer, or VkDeviceMemory may be destroyed.
+    pub fn begin_present_buffer_teardown(&mut self, resource_id: u32) -> bool {
+        let Some(index) = self
+            .present_buffer_syncs
+            .iter()
+            .position(|slot| slot.resource_id == resource_id)
+        else {
+            return true;
+        };
+        let access = self.present_buffer_syncs[index].access;
+        let ready = match access {
+            PresentBufferAccess::ExternalReady | PresentBufferAccess::Teardown => true,
+            PresentBufferAccess::Consumer(boundary) => self.scanout_boundary_ready(boundary),
+            PresentBufferAccess::Empty
+            | PresentBufferAccess::KmdWriter
+            | PresentBufferAccess::KmdCpuMirror => false,
+        };
+        if ready {
+            self.present_buffer_syncs[index].access = PresentBufferAccess::Teardown;
+        }
+        ready
+    }
+
+    pub fn claim_present_buffer_read(
+        &mut self,
+        owner: DeviceOwner,
+        ctx_id: u32,
+        cookie: u64,
+        resource_id: u32,
+        value: u32,
+    ) -> PresentBufferReadClaim {
+        let Some(index) = self
+            .present_buffer_syncs
+            .iter()
+            .position(|slot| slot.resource_id == resource_id)
+        else {
+            PRESENT_BUFFER_SYNC_REJECTS.fetch_add(1, Ordering::Relaxed);
+            return PresentBufferReadClaim::NotFound;
+        };
+        let old_access = self.present_buffer_syncs[index].access;
+        let available = match old_access {
+            PresentBufferAccess::ExternalReady => true,
+            PresentBufferAccess::Consumer(old) => self.scanout_boundary_ready(old),
+            PresentBufferAccess::Empty
+            | PresentBufferAccess::KmdWriter
+            | PresentBufferAccess::KmdCpuMirror
+            | PresentBufferAccess::Teardown => false,
+        };
+        if !available {
+            PRESENT_BUFFER_READ_BUSY.fetch_add(1, Ordering::Relaxed);
+            return PresentBufferReadClaim::Busy;
+        }
+        let Some(boundary) =
+            self.present_stream_boundary_for_owner(owner, ctx_id, cookie, resource_id, value)
+        else {
+            PRESENT_BUFFER_SYNC_REJECTS.fetch_add(1, Ordering::Relaxed);
+            return PresentBufferReadClaim::Invalid;
+        };
+        self.present_buffer_syncs[index].access = PresentBufferAccess::Consumer(boundary);
+        PRESENT_BUFFER_READ_CLAIMS.fetch_add(1, Ordering::Relaxed);
+        PresentBufferReadClaim::Accepted
+    }
+
+    /// Descriptor enqueue failed before the tagged Venus submit existed.
+    /// Return every buffer claimed by that exact not-submitted batch to
+    /// EXTERNAL and clear the stream reservation. This must never be called for
+    /// a host rejection or ambiguous transport failure after enqueue.
+    pub fn cancel_present_buffer_read_claims_before_submit(
+        &mut self,
+        owner: DeviceOwner,
+        ctx_id: u32,
+        cookie: u64,
+        value: u32,
+    ) -> bool {
+        let Some((index, slot)) = self.present_streams.iter().enumerate().find(|(_, slot)| {
+            slot.live
+                && !slot.closing
+                && slot.owner == Some(owner)
+                && slot.ctx_id == ctx_id
+                && slot.cookie == cookie
+                && slot.claimed_value == value
+                && slot.submitted_value < value
+        }) else {
+            return false;
+        };
+        let boundary = encode_present_stream_boundary(slot.handle(index), value);
+        for buffer in self.present_buffer_syncs.iter_mut() {
+            if buffer.access == PresentBufferAccess::Consumer(boundary) {
+                buffer.access = PresentBufferAccess::ExternalReady;
+            }
+        }
+        self.present_streams[index].claimed_value = 0;
+        true
+    }
+
+    pub fn try_begin_present_buffer_write(&mut self, resource_id: u32) -> PresentBufferWriteBegin {
+        let Some(index) = self
+            .present_buffer_syncs
+            .iter()
+            .position(|slot| slot.resource_id == resource_id)
+        else {
+            PRESENT_BUFFER_SYNC_REJECTS.fetch_add(1, Ordering::Relaxed);
+            return PresentBufferWriteBegin::NotFound;
+        };
+        let old_access = self.present_buffer_syncs[index].access;
+        let available = match old_access {
+            PresentBufferAccess::ExternalReady => true,
+            PresentBufferAccess::Consumer(boundary) => self.scanout_boundary_ready(boundary),
+            PresentBufferAccess::Empty
+            | PresentBufferAccess::KmdWriter
+            | PresentBufferAccess::KmdCpuMirror
+            | PresentBufferAccess::Teardown => false,
+        };
+        if !available {
+            PRESENT_BUFFER_WRITE_BUSY.fetch_add(1, Ordering::Relaxed);
+            return PresentBufferWriteBegin::Busy;
+        }
+        self.present_buffer_syncs[index].access = PresentBufferAccess::KmdWriter;
+        PresentBufferWriteBegin::Acquired
+    }
+
+    pub fn complete_present_buffer_write(&mut self, resource_id: u32) {
+        let Some(slot) = self
+            .present_buffer_syncs
+            .iter_mut()
+            .find(|slot| slot.resource_id == resource_id)
+        else {
+            PRESENT_BUFFER_SYNC_REJECTS.fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        if slot.access != PresentBufferAccess::KmdWriter {
+            PRESENT_BUFFER_SYNC_REJECTS.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        slot.access = PresentBufferAccess::ExternalReady;
+        self.wake_ready_windowed_blt();
+    }
+
+    fn complete_present_buffer_gpu_write(&mut self, resource_id: u32) -> bool {
+        let Some(slot) = self
+            .present_buffer_syncs
+            .iter_mut()
+            .find(|slot| slot.resource_id == resource_id)
+        else {
+            PRESENT_BUFFER_SYNC_REJECTS.fetch_add(1, Ordering::Relaxed);
+            return false;
+        };
+        if slot.access != PresentBufferAccess::KmdWriter {
+            PRESENT_BUFFER_SYNC_REJECTS.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        slot.access = PresentBufferAccess::KmdCpuMirror;
+        true
+    }
+
+    /// The ring response proved the Vulkan copy and external release ran, and
+    /// the caller may now read the buffer into VidMm system backing.
+    pub fn present_buffer_cpu_mirror_ready(&self, resource_id: u32) -> bool {
+        self.present_buffer_syncs.iter().any(|slot| {
+            slot.resource_id == resource_id && slot.access == PresentBufferAccess::KmdCpuMirror
+        })
+    }
+
+    /// End the CPU reader lifetime after the mirror routine has returned. A
+    /// content-copy failure still releases ownership: the CPU no longer reads
+    /// the buffer, while the WDDM transaction separately reports the failure.
+    pub fn complete_present_buffer_cpu_mirror(&mut self, resource_id: u32) -> bool {
+        let Some(slot) = self
+            .present_buffer_syncs
+            .iter_mut()
+            .find(|slot| slot.resource_id == resource_id)
+        else {
+            PRESENT_BUFFER_SYNC_REJECTS.fetch_add(1, Ordering::Relaxed);
+            return false;
+        };
+        if slot.access != PresentBufferAccess::KmdCpuMirror {
+            PRESENT_BUFFER_SYNC_REJECTS.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        slot.access = PresentBufferAccess::ExternalReady;
+        self.wake_ready_windowed_blt();
+        true
+    }
+
+    /// Roll back a writer transition only when descriptor enqueue itself
+    /// failed and therefore no host command can exist. Host rejection or a
+    /// transport failure is deliberately not routed here: those stay pinned.
+    pub fn abort_present_buffer_write_before_submit(&mut self, resource_id: u32) {
+        self.complete_present_buffer_write(resource_id);
     }
 
     fn prepare_present_stream_tag(
@@ -4762,12 +5358,18 @@ impl VirtioGpu {
             return Err(VirtioError::DeviceError);
         }
         let Some((index, slot)) = self.present_streams.iter().enumerate().find(|(_, slot)| {
-            slot.live && slot.owner == Some(owner) && slot.ctx_id == ctx_id && slot.cookie == cookie
+            slot.live
+                && !slot.closing
+                && slot.owner == Some(owner)
+                && slot.ctx_id == ctx_id
+                && slot.cookie == cookie
         }) else {
             PRESENT_STREAM_REJECTS.fetch_add(1, Ordering::Relaxed);
             return Err(VirtioError::NotOwned);
         };
-        if (slot.ring_idx != 0 && slot.ring_idx != ring_idx as u8) || value <= slot.submitted_value
+        if (slot.ring_idx != 0 && slot.ring_idx != ring_idx as u8)
+            || value <= slot.submitted_value
+            || (slot.claimed_value != 0 && slot.claimed_value != value)
         {
             PRESENT_STREAM_REJECTS.fetch_add(1, Ordering::Relaxed);
             return Err(VirtioError::DeviceError);
@@ -4794,6 +5396,9 @@ impl VirtioGpu {
         }
         slot.ring_idx = ring_idx as u8;
         slot.submitted_value = retire.value;
+        if slot.claimed_value == retire.value {
+            slot.claimed_value = 0;
+        }
         PRESENT_STREAM_TAGS.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -4801,18 +5406,25 @@ impl VirtioGpu {
         let Some(index) = Self::present_stream_index(retire.handle) else {
             return;
         };
-        let slot = &mut self.present_streams[index];
+        let slot = self.present_streams[index];
         let advanced = advance_present_stream_retired(slot.retired_value, retire.value);
         if slot.live && slot.handle(index) == retire.handle && advanced != slot.retired_value {
-            slot.retired_value = advanced;
+            self.present_streams[index].retired_value = advanced;
             PRESENT_STREAM_RETIRES.fetch_add(1, Ordering::Relaxed);
+            self.release_retired_present_buffer_consumers_for_stream(index);
+            let slot = self.present_streams[index];
+            if slot.closing && slot.claimed_value == 0 && slot.retired_value >= slot.submitted_value
+            {
+                self.retire_present_stream_slot(index);
+            }
         }
     }
 
-    /// A host-rejected tagged submit poisons this exact generation.  The
-    /// scheduler/scanout waits are discharged separately under
-    /// `wddm_notify_lock`; this helper only removes the capability while the
-    /// used-ring drain holds `virtio_lock`.
+    /// A host-rejected tagged submit poisons this exact generation. The stream
+    /// stays live-but-closing because its context id/generation are the only
+    /// capability that can later turn a successful host CTX_DESTROY into proof
+    /// that the rejected consumer no longer touches its buffers. Scheduler and
+    /// scanout waits are discharged separately under `wddm_notify_lock`.
     fn fail_present_stream_value(&mut self, retire: PresentStreamRetire) {
         let Some(index) = Self::present_stream_index(retire.handle) else {
             return;
@@ -4820,7 +5432,7 @@ impl VirtioGpu {
         if self.present_streams[index].live
             && self.present_streams[index].handle(index) == retire.handle
         {
-            self.retire_present_stream_slot(index);
+            self.close_present_stream_slot(index);
             PRESENT_STREAM_REJECTS.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -5008,7 +5620,6 @@ impl VirtioGpu {
         destination: PresentDestinationDesc,
         prepared: PreparedPresentBltSubmission,
         stream_boundary: u64,
-        system_backing: bool,
     ) -> Result<u64, VirtioError> {
         if self.failed
             || !self.present_stream_boundary_live(stream_boundary)
@@ -5039,9 +5650,9 @@ impl VirtioGpu {
             admitted: false,
             dispatched: false,
             ring_complete: false,
+            mirror_ready: false,
             ledger_retired: false,
             wddm_completion_required: true,
-            system_backing,
             mirror_claimed: false,
         });
         crate::ddi::scanout_timeline::note(
@@ -5104,6 +5715,17 @@ impl VirtioGpu {
         {
             return None;
         }
+        if let PresentDestinationDesc::StandardBuffer(destination) =
+            self.windowed_blt.pending[index].destination
+        {
+            if self.try_begin_present_buffer_write(destination.resource_id())
+                != PresentBufferWriteBegin::Acquired
+            {
+                // Consumer completion (or the prior writer's ring retirement)
+                // wakes this worker; retain FIFO ownership and retry then.
+                return None;
+            }
+        }
         self.windowed_blt.pending[index].dispatched = true;
         self.windowed_blt.ready.pop_front();
         Some(self.windowed_blt.pending[index])
@@ -5138,9 +5760,7 @@ impl VirtioGpu {
             return;
         };
         if !request.ledger_retired {
-            adapter
-                .read_ledger
-                .retire(request.ledger_ticket, !ok);
+            adapter.read_ledger.retire(request.ledger_ticket, !ok);
         }
         crate::ddi::scanout_timeline::note(
             crate::ddi::scanout_timeline::kind::WINDOWED_BLT_TERMINAL,
@@ -5165,9 +5785,10 @@ impl VirtioGpu {
         adapter.signal_hpd();
     }
 
-    /// Completion of the ring-1 copy. The reader lease ends exactly here. A
-    /// system-backed destination remains non-terminal until the PASSIVE mirror
-    /// finishes, while an ordinary destination terminalizes immediately.
+    /// Completion of the ring-1 copy. The source reader lease ends exactly
+    /// here. Every dedicated standard destination keeps KMD ownership until a
+    /// PASSIVE, serialized backing-table check/mirror returns; an image
+    /// destination terminalizes immediately.
     pub fn complete_windowed_blt_ring(
         &mut self,
         adapter: &crate::adapter::AdapterContext,
@@ -5182,11 +5803,13 @@ impl VirtioGpu {
         else {
             return;
         };
+        let destination_buffer = match request.destination {
+            PresentDestinationDesc::StandardBuffer(destination) => Some(destination.resource_id()),
+            PresentDestinationDesc::OptimalImage(_) => None,
+        };
         request.ring_complete = true;
         if !request.ledger_retired {
-            adapter
-                .read_ledger
-                .retire(request.ledger_ticket, !ok);
+            adapter.read_ledger.retire(request.ledger_ticket, !ok);
             request.ledger_retired = true;
         }
         crate::ddi::scanout_timeline::note(
@@ -5202,9 +5825,19 @@ impl VirtioGpu {
             request.source_resource_id,
             request.destination_resource_id,
         );
-        if !ok || !request.system_backing {
+        let mirror_ready = ok
+            && destination_buffer
+                .is_some_and(|resource_id| self.complete_present_buffer_gpu_write(resource_id));
+        if mirror_ready {
+            if let Some(request) = self.windowed_blt.pending.iter_mut().find(|request| {
+                request.token == token && request.stream_boundary == stream_boundary
+            }) {
+                request.mirror_ready = true;
+            }
+        }
+        if !ok || destination_buffer.is_none() {
             self.terminal_windowed_blt(adapter, token, stream_boundary, ok);
-        } else {
+        } else if mirror_ready {
             // The worker owns the preallocated mirror continuation.
             adapter.signal_hpd();
         }
@@ -5219,6 +5852,27 @@ impl VirtioGpu {
         stream_boundary: u64,
         ok: bool,
     ) {
+        let Some(resource_id) = self.windowed_blt.pending.iter().find_map(|request| {
+            (request.token == token
+                && request.stream_boundary == stream_boundary
+                && request.ring_complete
+                && request.mirror_ready
+                && request.mirror_claimed)
+                .then(|| match request.destination {
+                    PresentDestinationDesc::StandardBuffer(destination) => {
+                        Some(destination.resource_id())
+                    }
+                    PresentDestinationDesc::OptimalImage(_) => None,
+                })
+                .flatten()
+        }) else {
+            return;
+        };
+        if !self.complete_present_buffer_cpu_mirror(resource_id) {
+            // A mismatched ownership state is not a retirement proof. Keep the
+            // transaction pinned rather than freeing/reusing the buffer.
+            return;
+        }
         self.terminal_windowed_blt(adapter, token, stream_boundary, ok);
     }
 
@@ -5240,9 +5894,7 @@ impl VirtioGpu {
             return;
         };
         if !request.ledger_retired {
-            adapter
-                .read_ledger
-                .retire(request.ledger_ticket, true);
+            adapter.read_ledger.retire(request.ledger_ticket, true);
         }
         self.windowed_blt.ready.retain(|known| *known != token);
         adapter.signal_hpd();
@@ -5351,10 +6003,9 @@ impl VirtioGpu {
             if !request.ledger_retired {
                 // SAFETY: every queued request was created with this live
                 // adapter; transport destruction is below its lifecycle.
-                unsafe { request.adapter.as_ref() }.read_ledger.retire(
-                    request.ledger_ticket,
-                    true,
-                );
+                unsafe { request.adapter.as_ref() }
+                    .read_ledger
+                    .retire(request.ledger_ticket, true);
             }
             crate::ddi::scanout_timeline::note(
                 crate::ddi::scanout_timeline::kind::WINDOWED_BLT_TERMINAL,
@@ -5412,11 +6063,12 @@ impl VirtioGpu {
     }
 
     /// Called only after Venus cache drain proved every matching submitted
-    /// command has reached a terminal ring response. System-backed requests
-    /// may still be awaiting their PASSIVE mirror; teardown cancels those now
-    /// (their reader was already retired at ring completion). A still-dispatched
-    /// request is a hard refusal so callers retain the backing rather than
-    /// destroying memory an in-flight host GPU command can read.
+    /// command has reached a terminal ring response. A standard-buffer request
+    /// may still be awaiting its PASSIVE backing-table check/mirror; that is a
+    /// hard refusal because destination ownership is held until the possible
+    /// CPU read returns. A still-dispatched request is likewise refused so
+    /// callers retain backing rather than destroying memory an in-flight
+    /// host/CPU command can access.
     pub fn finish_windowed_blt_teardown_for_resource(
         &mut self,
         adapter: &crate::adapter::AdapterContext,
@@ -5425,6 +6077,17 @@ impl VirtioGpu {
         if self.windowed_blt.pending.iter().any(|request| {
             request.dispatched
                 && !request.ring_complete
+                && (request.source_resource_id == resource_id
+                    || request.destination_resource_id == resource_id)
+        }) {
+            return false;
+        }
+        if self.windowed_blt.pending.iter().any(|request| {
+            request.ring_complete
+                && matches!(
+                    request.destination,
+                    PresentDestinationDesc::StandardBuffer(_)
+                )
                 && (request.source_resource_id == resource_id
                     || request.destination_resource_id == resource_id)
         }) {
@@ -5441,11 +6104,18 @@ impl VirtioGpu {
         true
     }
 
-    /// Claim exactly one ring-complete system backing for PASSIVE mirroring.
-    /// The claim bit makes a lost HPD wake harmless without a polling loop.
+    /// Claim exactly one ownership-proven, ring-complete standard destination
+    /// for a PASSIVE serialized backing-table check/mirror. The claim bit makes
+    /// a lost HPD wake harmless without a polling loop.
     pub fn take_windowed_blt_mirror(&mut self) -> Option<WindowedBltPending> {
         let request = self.windowed_blt.pending.iter_mut().find(|request| {
-            request.ring_complete && request.system_backing && !request.mirror_claimed
+            request.ring_complete
+                && request.mirror_ready
+                && matches!(
+                    request.destination,
+                    PresentDestinationDesc::StandardBuffer(_)
+                )
+                && !request.mirror_claimed
         })?;
         request.mirror_claimed = true;
         Some(*request)
@@ -5820,9 +6490,9 @@ impl VirtioGpu {
 #[cfg(test)]
 mod present_stream_tests {
     use super::{
-        MAX_PRESENT_STREAMS, PresentStreamSlot, SyncScanoutBind, advance_present_stream_retired,
-        decode_present_stream_boundary, encode_present_stream_boundary, present_stream_slot_ready,
-        terminal_sync_scanout_bind,
+        advance_present_stream_retired, decode_present_stream_boundary,
+        encode_present_stream_boundary, present_stream_slot_ready, terminal_sync_scanout_bind,
+        PresentStreamSlot, SyncScanoutBind, MAX_PRESENT_STREAMS,
     };
 
     #[test]

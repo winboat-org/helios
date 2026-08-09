@@ -23,18 +23,21 @@ use bytemuck::{bytes_of, pod_read_unaligned};
 use helios_protocol::{
     HeliosEscapeAllocBlob, HeliosEscapeAttachResource, HeliosEscapeCtxCreate,
     HeliosEscapeCtxDestroy, HeliosEscapeFenceEvent, HeliosEscapeHeader, HeliosEscapeMapBlob,
-    HeliosEscapeMapReadLedger, HeliosEscapePresentStream, HeliosEscapeQueryScanout,
-    HeliosEscapeQueryScanoutTimeline, HeliosEscapeQueryStats, HeliosEscapeQueryStatsV2,
-    HeliosEscapeQueryStatsV3, HeliosEscapeQueryStatsV4, HeliosEscapeReleaseBlob,
-    HeliosEscapeScanoutEvent, HeliosEscapeSubmitVenus, HeliosEscapeWaitFence,
-    HeliosEscapeWaitFenceLegacy, HELIOS_ESCAPE_ALLOC_BLOB, HELIOS_ESCAPE_ATTACH_RESOURCE,
-    HELIOS_ESCAPE_CTX_CREATE, HELIOS_ESCAPE_CTX_DESTROY, HELIOS_ESCAPE_MAP_BLOB,
-    HELIOS_ESCAPE_MAP_READ_LEDGER, HELIOS_ESCAPE_PRESENT_STREAM, HELIOS_ESCAPE_QUERY_SCANOUT,
+    HeliosEscapeMapReadLedger, HeliosEscapePresentBufferRead, HeliosEscapePresentStream,
+    HeliosEscapeQueryScanout, HeliosEscapeQueryScanoutTimeline, HeliosEscapeQueryStats,
+    HeliosEscapeQueryStatsV2, HeliosEscapeQueryStatsV3, HeliosEscapeQueryStatsV4,
+    HeliosEscapeReleaseBlob, HeliosEscapeScanoutEvent, HeliosEscapeSubmitVenus,
+    HeliosEscapeWaitFence, HeliosEscapeWaitFenceLegacy, HELIOS_ESCAPE_ALLOC_BLOB,
+    HELIOS_ESCAPE_ATTACH_RESOURCE, HELIOS_ESCAPE_CTX_CREATE, HELIOS_ESCAPE_CTX_DESTROY,
+    HELIOS_ESCAPE_MAP_BLOB, HELIOS_ESCAPE_MAP_READ_LEDGER, HELIOS_ESCAPE_PRESENT_BUFFER_READ,
+    HELIOS_ESCAPE_PRESENT_STREAM, HELIOS_ESCAPE_QUERY_SCANOUT,
     HELIOS_ESCAPE_QUERY_SCANOUT_TIMELINE, HELIOS_ESCAPE_QUERY_STATS,
     HELIOS_ESCAPE_REGISTER_FENCE_EVENT, HELIOS_ESCAPE_RELEASE_BLOB, HELIOS_ESCAPE_SCANOUT_EVENT,
     HELIOS_ESCAPE_SUBMIT_VENUS, HELIOS_ESCAPE_UNREGISTER_FENCE_EVENT, HELIOS_ESCAPE_WAIT_FENCE,
     HELIOS_FENCE_EVENT_ALREADY_COMPLETE, HELIOS_FENCE_EVENT_CANCELLED,
     HELIOS_FENCE_EVENT_NOT_FOUND, HELIOS_FENCE_EVENT_PROBE_ACK, HELIOS_FENCE_EVENT_REGISTERED,
+    HELIOS_PRESENT_BUFFER_READ_ACCEPTED, HELIOS_PRESENT_BUFFER_READ_BUSY,
+    HELIOS_PRESENT_BUFFER_READ_INVALID, HELIOS_PRESENT_BUFFER_READ_NOT_FOUND,
     HELIOS_PRESENT_STREAM_OP_REGISTER, HELIOS_PRESENT_STREAM_OP_UNREGISTER,
     HELIOS_SCANOUT_ACQ_NOT_FOUND, HELIOS_SCANOUT_ACQ_OK, HELIOS_SCANOUT_ACQ_OP_MAP,
     HELIOS_SCANOUT_ACQ_OP_PROBE, HELIOS_SCANOUT_ACQ_OP_REGISTER, HELIOS_SCANOUT_ACQ_OP_UNMAP,
@@ -343,6 +346,10 @@ pub unsafe extern "C" fn dxgkddi_escape(
                     None => STATUS_INVALID_PARAMETER,
                 }
             }
+            None => refuse_no_device(),
+        },
+        HELIOS_ESCAPE_PRESENT_BUFFER_READ => match owner {
+            Some(owner) => escape_present_buffer_read(adapter, buf, &hdr, owner),
             None => refuse_no_device(),
         },
         HELIOS_ESCAPE_WAIT_FENCE => escape_wait_fence(passive, adapter, buf, &hdr),
@@ -1154,6 +1161,7 @@ fn escape_present_stream(
         HELIOS_PRESENT_STREAM_OP_UNREGISTER => {
             let status = match adapter.with_wddm_notify_lock(|guard| {
                 guard.with_virtio(|order, v| {
+                    v.drain_used();
                     v.unregister_present_stream(order, owner, req.ctx_id, req.cookie)
                 })
             }) {
@@ -1170,6 +1178,41 @@ fn escape_present_stream(
         }
         _ => STATUS_INVALID_PARAMETER,
     }
+}
+
+/// Claim a KMD Present buffer for one exact consumer-timeline value. The
+/// decision and stream state are serialized under virtio_lock; refusals are
+/// normal backpressure and therefore return STATUS_SUCCESS with `out_state`.
+fn escape_present_buffer_read(
+    adapter: &AdapterContext,
+    buf: &mut [u8],
+    hdr: &HeliosEscapeHeader,
+    owner: DeviceOwner,
+) -> NTSTATUS {
+    let mut wire = match EscapeBuf::<HeliosEscapePresentBufferRead>::new(buf, hdr) {
+        Ok(wire) => wire,
+        Err(status) => return status,
+    };
+    let req = wire.read();
+    let claim = adapter.with_virtio(|v| {
+        v.drain_used();
+        v.claim_present_buffer_read(owner, req.ctx_id, req.cookie, req.resource_id, req.value)
+    });
+    let mut out = req;
+    out.out_state = match claim {
+        Ok(crate::virtio::gpu::PresentBufferReadClaim::Accepted) => {
+            HELIOS_PRESENT_BUFFER_READ_ACCEPTED
+        }
+        Ok(crate::virtio::gpu::PresentBufferReadClaim::Busy) => HELIOS_PRESENT_BUFFER_READ_BUSY,
+        Ok(crate::virtio::gpu::PresentBufferReadClaim::NotFound) => {
+            HELIOS_PRESENT_BUFFER_READ_NOT_FOUND
+        }
+        Ok(crate::virtio::gpu::PresentBufferReadClaim::Invalid) | Err(_) => {
+            HELIOS_PRESENT_BUFFER_READ_INVALID
+        }
+    };
+    wire.write_back(&out);
+    STATUS_SUCCESS
 }
 
 /// `HELIOS_ESCAPE_CTX_DESTROY` → tear down a context this device owns.

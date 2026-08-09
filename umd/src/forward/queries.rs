@@ -81,7 +81,27 @@ pub(crate) unsafe extern "C" fn query_get_data(
         return;
     };
     if let Ok(async_) = (*q).cast::<ID3D11Asynchronous>() {
-        let _ = context.GetData(&async_, Some(data), data_size, flags);
+        // `windows` exposes ID3D11DeviceContext::GetData as `Result<()>`.
+        // That is unsuitable here: HRESULT::ok() maps both S_OK and S_FALSE
+        // to Ok and therefore discards the query's pending state. The DDI
+        // callback returns void, so silently dropping S_FALSE makes the D3D
+        // runtime report S_OK with an unchanged output buffer (zero Frequency
+        // for a timestamp-disjoint query, for example). Preserve the raw
+        // HRESULT and translate it through the core-layer callback exactly as
+        // PFND3D10DDI_QUERYGETDATA requires.
+        let hr = (Interface::vtable(&*context).GetData)(
+            Interface::as_raw(&*context),
+            Interface::as_raw(&async_),
+            data,
+            data_size,
+            flags,
+        )
+        .0;
+        if hr == crate::hr::S_FALSE {
+            set_runtime_error(h, crate::hr::DXGI_DDI_ERR_WASSTILLDRAWING);
+        } else if hr < 0 {
+            set_runtime_error(h, hr);
+        }
     }
 }
 

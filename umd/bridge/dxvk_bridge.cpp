@@ -652,7 +652,8 @@ std::size_t HeliosDxvkDevice::open_ddi_texture2d(
     std::uint64_t global_vidmm_tracker,
     bool scanout_linear,
     bool linear_scanout_target,
-    bool cross_context_optimal) const {
+    bool cross_context_optimal,
+    bool dedicated_present_buffer) const {
   if (!impl || !impl->d3d11 || !global || !renderer_resource_id || !width || !height)
     return 0;
 
@@ -700,6 +701,7 @@ std::size_t HeliosDxvkDevice::open_ddi_texture2d(
       importInfo.ScanoutLinear   = scanout_linear;
       importInfo.LinearScanoutTarget = linear_scanout_target;
       importInfo.CrossContextOptimal = cross_context_optimal;
+      importInfo.DedicatedPresentBuffer = dedicated_present_buffer;
 
       // static_cast, matching the sibling context downcast in this file. Zero
       // runtime change today (the base sits at offset 0), but if an upstream DXVK

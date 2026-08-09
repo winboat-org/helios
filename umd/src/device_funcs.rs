@@ -67,8 +67,11 @@ pub struct SnapshotSlot {
     pub pitch: u32,
     /// Memory-plane-0 offset, same source as `pitch`.
     pub plane_offset: u64,
-    /// Venus blob size backing `resid`, for the KMD's bind-time undersize
-    /// guard (`alloc_size >= plane_offset + pitch*height`).
+    /// Venus blob size backing `resid`. Direct LINEAR scanout applies the
+    /// bind-time `plane_offset + pitch*height` guard. WindowedBlt recreates an
+    /// OPTIMAL VkImage instead, so its importer compares this exact allocation
+    /// size with `vkGetImageMemoryRequirements`; logical pitch is not a byte
+    /// layout for optimal tiling.
     pub alloc_size: u64,
     /// Exact allocation memory type. Direct scanout never consumes this field,
     /// but a WindowedBlt snapshot imports the same image in the KMD Venus

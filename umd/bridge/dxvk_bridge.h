@@ -83,7 +83,8 @@ struct HeliosDxvkDevice {
       std::uint64_t global_vidmm_tracker,
       bool scanout_linear,
       bool linear_scanout_target,
-      bool cross_context_optimal) const;
+      bool cross_context_optimal,
+      bool dedicated_present_buffer) const;
 
   // Create a dedicated OPTIMAL, DMA_BUF-exportable image (via the
   // D3D11_HELIOS_CREATE_INFO marker) and report logical scanout metadata for

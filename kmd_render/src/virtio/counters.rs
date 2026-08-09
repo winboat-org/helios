@@ -146,6 +146,11 @@ pub static PRESENT_STREAM_REJECTS: AtomicU32 = AtomicU32::new(0);
 pub static PRESENT_STREAM_LIVE: AtomicU32 = AtomicU32::new(0);
 /// High-water of the preallocated stream table occupancy.
 pub static PRESENT_STREAM_HIGH_WATER: AtomicU32 = AtomicU32::new(0);
+/// External Present-buffer read claims accepted/refused and KMD writer stalls.
+pub static PRESENT_BUFFER_READ_CLAIMS: AtomicU32 = AtomicU32::new(0);
+pub static PRESENT_BUFFER_READ_BUSY: AtomicU32 = AtomicU32::new(0);
+pub static PRESENT_BUFFER_WRITE_BUSY: AtomicU32 = AtomicU32::new(0);
+pub static PRESENT_BUFFER_SYNC_REJECTS: AtomicU32 = AtomicU32::new(0);
 
 // ── DISPATCH-safe resource-table telemetry ──────────────────────────────────
 // All updated under the device spinlock (DISPATCH_LEVEL), so they must be

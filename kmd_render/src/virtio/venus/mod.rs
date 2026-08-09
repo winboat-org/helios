@@ -308,13 +308,16 @@ pub struct VenusClient {
     /// later copy execute after it.
     copy_target_image_id: Option<VkImageId>,
     copy_target_init_pool_id: Option<VkCommandPoolId>,
-    /// App/DWM BLT imports and recorded copies. Both vectors are preallocated
-    /// and capacity-bounded. Every access is serialized by
-    /// AdapterContext::with_venus_client, so setup/submission/teardown cannot
-    /// race through incidental call ordering.
+    /// App/DWM BLT imports and recorded copies. These caches grow fallibly at
+    /// PASSIVE_LEVEL and retain explicit transport-derived ceilings. Every
+    /// access is serialized by AdapterContext::with_venus_client, so
+    /// setup/submission/teardown cannot race through incidental call ordering.
     present_images: Vec<ImportedOptimalImage>,
     present_buffers: Vec<BorrowedPresentBuffer>,
     present_blits: Vec<PreparedPresentBlt>,
+    present_images_high_water: usize,
+    present_buffers_high_water: usize,
+    present_blits_high_water: usize,
     /// Exact identities of `allocate_memory_blob` allocations. This registry
     /// turns a standard Present destination into a checked borrow of the
     /// already-live local `VkDeviceMemory`; no resource-id heuristic or
@@ -451,7 +454,7 @@ impl VenusClient {
         if self
             .present_buffers
             .iter()
-            .any(|buffer| buffer.memory.memory_id == memory_id)
+            .any(|buffer| buffer.memory_id == memory_id)
         {
             crate::diag::record_named_bytes(b"PBFree", 0xE1);
             return Err(VirtioError::DeviceError);
@@ -460,6 +463,16 @@ impl VenusClient {
             .owned_memory_blobs
             .iter()
             .position(|blob| blob.memory_id == memory_id);
+        if let Some(index) = owned_index {
+            if let Some(buffer_id) = self.owned_memory_blobs[index].prepared_present_buffer {
+                // This allocation was never presented, so ownership never
+                // moved into `present_buffers`. Destroy the buffer before the
+                // memory it is bound to, and record the transition immediately
+                // so a retried teardown cannot destroy it twice.
+                self.destroy_buffer_on_ring(adapter, buffer_id)?;
+                self.owned_memory_blobs[index].prepared_present_buffer = None;
+            }
+        }
         self.free_memory_object(adapter, memory_id)?;
         if let Some(index) = owned_index {
             self.owned_memory_blobs.swap_remove(index);

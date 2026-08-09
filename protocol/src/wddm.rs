@@ -272,8 +272,18 @@ pub struct HeliosWddmAllocMeta {
 
 /// `'HIDN'` — magic of [`HeliosWddmOpenIdentity`].
 pub const HELIOS_WDDM_IDENTITY_MAGIC: u32 = 0x4849_444E;
-/// Current open-identity ABI version.
-pub const HELIOS_WDDM_IDENTITY_VERSION: u32 = 1;
+/// First open-identity ABI version, retained for opening allocations written by
+/// an older KMD. Version 1 has no standard-buffer object contract.
+pub const HELIOS_WDDM_IDENTITY_VERSION_LEGACY: u32 = 1;
+/// Current open-identity ABI version. Version 2 makes STANDARD `reserved[0]`
+/// semantic: old UMDs reject it instead of binding buffer-dedicated memory to
+/// an image, while a new UMD can still consume a legacy v1 identity.
+pub const HELIOS_WDDM_IDENTITY_VERSION: u32 = 2;
+/// [`HeliosWddmOpenIdentity::reserved`] bit for STANDARD allocations whose
+/// external memory is dedicated to the KMD-created Present buffer.  The field
+/// is kind-discriminated: DEVICE_MEMORY identities use the same words for the
+/// global VidMm tracker, while STANDARD identities never carry that tracker.
+pub const HELIOS_WDDM_STANDARD_CONTRACT_DEDICATED_PRESENT_BUFFER: u32 = 0x0000_0001;
 /// Allocation identity record the KMD writes into the OPEN-time private driver
 /// data in `DxgkDdiOpenAllocation`, overwriting the first 48 bytes (the
 /// [`HeliosWddmAllocPrivate`] region — the [`HeliosWddmAllocMeta`] trailer at
@@ -312,7 +322,19 @@ pub struct HeliosWddmOpenIdentity {
 impl HeliosWddmOpenIdentity {
     #[inline]
     pub fn is_valid(&self) -> bool {
-        self.magic == HELIOS_WDDM_IDENTITY_MAGIC && self.version == HELIOS_WDDM_IDENTITY_VERSION
+        self.magic == HELIOS_WDDM_IDENTITY_MAGIC
+            && (self.version == HELIOS_WDDM_IDENTITY_VERSION_LEGACY
+                || self.version == HELIOS_WDDM_IDENTITY_VERSION)
+    }
+
+    /// Whether this STANDARD allocation's exported memory may only be imported
+    /// through the exact matching Present-buffer contract.
+    #[inline]
+    pub fn dedicated_present_buffer(&self) -> bool {
+        self.is_valid()
+            && self.version >= HELIOS_WDDM_IDENTITY_VERSION
+            && self.kind == HELIOS_WDDM_ALLOC_KIND_STANDARD
+            && self.reserved[0] & HELIOS_WDDM_STANDARD_CONTRACT_DEDICATED_PRESENT_BUFFER != 0
     }
 
     /// Return the global VidMm tracker identity only when its complete typed
@@ -389,8 +411,12 @@ pub struct HeliosPresentPrivateData {
     pub pitch: u32,
     pub dxgi_format: u32,
     pub reserved: u32,
-    /// Total venus blob size backing `resource_id`, for the bind-time
-    /// undersize guard (`venus_alloc_size >= plane_offset + pitch*height`).
+    /// Total venus blob size backing `resource_id`. Direct LINEAR snapshot
+    /// binding applies the bind-time undersize guard
+    /// (`venus_alloc_size >= plane_offset + pitch*height`). A
+    /// [`HELIOS_PRESENT_PRIVATE_FLAG_WINDOWED_BLT_SNAPSHOT`] resource is an
+    /// OPTIMAL VkImage instead; its importer compares this value with the
+    /// image's Vulkan memory requirements rather than logical row-pitch math.
     /// APPENDED for [`HELIOS_PRESENT_PRIVATE_FLAG_SNAPSHOT`] (40 -> 48 bytes,
     /// offset 40 is 8-aligned, nothing before it moves — prefix-compatible
     /// with pre-snapshot readers). Meaningful ONLY when that flag is set;
@@ -862,6 +888,49 @@ mod classify_tests {
 
         ident.resource_id = 42;
         ident.kind = HELIOS_WDDM_ALLOC_KIND_STANDARD;
+        assert_eq!(ident.global_vidmm_tracker(), None);
+    }
+
+    #[test]
+    fn open_identity_reserved_words_are_discriminated_by_kind() {
+        let mut ident = HeliosWddmOpenIdentity {
+            venus_alloc_size: 4096,
+            blob_size: 4096,
+            magic: HELIOS_WDDM_IDENTITY_MAGIC,
+            version: HELIOS_WDDM_IDENTITY_VERSION,
+            resource_id: 42,
+            memory_type_index: 5,
+            ctx_id: 7,
+            kind: HELIOS_WDDM_ALLOC_KIND_STANDARD,
+            reserved: [
+                HELIOS_WDDM_STANDARD_CONTRACT_DEDICATED_PRESENT_BUFFER,
+                0x5678,
+            ],
+        };
+
+        assert!(ident.dedicated_present_buffer());
+        assert_eq!(ident.global_vidmm_tracker(), None);
+
+        // Version 1 treated both words as reserved. A new UMD must never
+        // reinterpret a legacy STANDARD allocation as buffer-dedicated merely
+        // because an old producer happened to leave nonzero padding there.
+        ident.version = HELIOS_WDDM_IDENTITY_VERSION_LEGACY;
+        assert!(!ident.dedicated_present_buffer());
+        assert_eq!(ident.global_vidmm_tracker(), None);
+        ident.version = HELIOS_WDDM_IDENTITY_VERSION;
+
+        ident.kind = HELIOS_WDDM_ALLOC_KIND_DEVICE_MEMORY;
+        assert!(!ident.dedicated_present_buffer());
+        assert_eq!(
+            ident.global_vidmm_tracker(),
+            Some(GlobalVidMmTracker {
+                global_share: HELIOS_WDDM_STANDARD_CONTRACT_DEDICATED_PRESENT_BUFFER,
+                cookie: 0x5678,
+            })
+        );
+
+        ident.magic = 0;
+        assert!(!ident.dedicated_present_buffer());
         assert_eq!(ident.global_vidmm_tracker(), None);
     }
 }

@@ -73,6 +73,10 @@ pub const HELIOS_ESCAPE_PRESENT_STREAM: u32 = 0x0010;
 /// read-only: callers snapshot its cursor before/after a workload, then read
 /// the closed `[before + 1, after]` interval in fixed batches.
 pub const HELIOS_ESCAPE_QUERY_SCANOUT_TIMELINE: u32 = 0x0011;
+/// Claim one KMD-owned Present buffer for an external Vulkan reader until the
+/// registered timeline reaches `value`. This is the consumer half of the
+/// bidirectional queue-family ownership protocol.
+pub const HELIOS_ESCAPE_PRESENT_BUFFER_READ: u32 = 0x0012;
 
 pub const HELIOS_SCANOUT_TIMELINE_OP_META: u32 = 0;
 pub const HELIOS_SCANOUT_TIMELINE_OP_READ: u32 = 1;
@@ -155,6 +159,26 @@ pub struct HeliosEscapePresentStream {
     pub cookie: u64,
     pub ctx_id: u32,
     pub op: u32,
+}
+
+pub const HELIOS_PRESENT_BUFFER_READ_ACCEPTED: u32 = 0;
+pub const HELIOS_PRESENT_BUFFER_READ_BUSY: u32 = 1;
+pub const HELIOS_PRESENT_BUFFER_READ_NOT_FOUND: u32 = 2;
+pub const HELIOS_PRESENT_BUFFER_READ_INVALID: u32 = 3;
+
+/// Associate one exact standard-buffer resource with a future value of a
+/// registered consumer timeline. The KMD accepts only while its previous write
+/// has retired; a successful claim prevents the next KMD write until the
+/// tagged Venus submission carrying `value` retires. 40 bytes.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct HeliosEscapePresentBufferRead {
+    pub hdr: HeliosEscapeHeader,
+    pub cookie: u64,
+    pub resource_id: u32,
+    pub ctx_id: u32,
+    pub value: u32,
+    pub out_state: u32,
 }
 
 /// `HELIOS_ESCAPE_CTX_CREATE`. The KMD fills `out_ctx_id` with the guest-assigned
@@ -721,6 +745,7 @@ const _: () = {
     assert!(core::mem::size_of::<HeliosEscapeQueryStats>() == 88);
     assert!(core::mem::size_of::<HeliosEscapeSubmitVenus>() == 40);
     assert!(core::mem::size_of::<HeliosEscapePresentStream>() == 32);
+    assert!(core::mem::size_of::<HeliosEscapePresentBufferRead>() == 40);
     assert!(core::mem::size_of::<HeliosEscapeCtxCreate>() == 24);
     assert!(core::mem::size_of::<HeliosEscapeAllocBlob>() == 48);
     assert!(core::mem::size_of::<HeliosEscapeMapBlob>() == 32);

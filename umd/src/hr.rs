@@ -36,6 +36,11 @@ pub type Hresult = i32;
 /// Success.
 pub const S_OK: Hresult = 0;
 
+/// The operation has not completed yet. Unlike an error HRESULT this still
+/// has success severity, so wrappers that reduce HRESULT to `Result<()>` lose
+/// the distinction from [`S_OK`]. `QueryGetData` must preserve it.
+pub const S_FALSE: Hresult = 1;
+
 /// Unspecified failure. `winerror.h`: `E_FAIL`.
 pub const E_FAIL: Hresult = 0x8000_4005u32 as Hresult;
 
@@ -66,6 +71,13 @@ pub const DXGI_ERROR_UNSUPPORTED: Hresult = 0x887A_0004u32 as Hresult;
 /// `DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM` note in `forward.rs`).
 pub const DXGI_ERROR_DRIVER_INTERNAL_ERROR: Hresult = 0x887A_0020u32 as Hresult;
 
+/// A D3D10/11 DDI query has not reached the signaled state yet.
+/// `winerror.h`: `DXGI_DDI_ERR_WASSTILLDRAWING`.
+///
+/// This is reported through `pfnSetErrorCb` because the driver's
+/// `QueryGetData` callback itself returns `void`.
+pub const DXGI_DDI_ERR_WASSTILLDRAWING: Hresult = 0x887B_0001u32 as Hresult;
+
 /// The presentation was not redirected; the caller should present directly.
 /// `winerror.h`: `DXGI_STATUS_NO_REDIRECTION`. A success code (severity 0).
 pub const DXGI_STATUS_NO_REDIRECTION: Hresult = 0x087A_0004u32 as Hresult;
@@ -74,12 +86,14 @@ pub const DXGI_STATUS_NO_REDIRECTION: Hresult = 0x087A_0004u32 as Hresult;
 // the values in `winerror.h`. These exist so the R801 consolidation is
 // provably value-preserving and so a future edit cannot quietly retype one.
 const _: () = assert!(S_OK == 0);
+const _: () = assert!(S_FALSE == 1);
 const _: () = assert!(E_FAIL as u32 == 0x8000_4005);
 const _: () = assert!(E_NOTIMPL as u32 == 0x8000_4001);
 const _: () = assert!(E_INVALIDARG as u32 == 0x8007_0057);
 const _: () = assert!(E_OUTOFMEMORY as u32 == 0x8007_000E);
 const _: () = assert!(DXGI_ERROR_UNSUPPORTED as u32 == 0x887A_0004);
 const _: () = assert!(DXGI_ERROR_DRIVER_INTERNAL_ERROR as u32 == 0x887A_0020);
+const _: () = assert!(DXGI_DDI_ERR_WASSTILLDRAWING as u32 == 0x887B_0001);
 const _: () = assert!(DXGI_STATUS_NO_REDIRECTION as u32 == 0x087A_0004);
 
 // The two codes the pre-R801 tree conflated must stay distinct, and the
