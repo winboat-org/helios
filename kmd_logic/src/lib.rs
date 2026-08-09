@@ -4721,12 +4721,14 @@ pub mod snapshot_bind {
     //! bind target; a descriptor that fails ANY check falls back to the flipped
     //! allocation (today's behaviour), counted as `SnFbk`.
     //!
-    //! [`validate_layout`] is the undersize guard — the Xid-31 protection —
-    //! reproduced byte-for-byte (saturating arithmetic included) from
-    //! `ScanoutTarget::from_direct_primary` in
+    //! For direct LINEAR scanout, [`validate_layout`] is the undersize guard —
+    //! the Xid-31 protection — reproduced byte-for-byte (saturating arithmetic
+    //! included) from `ScanoutTarget::from_direct_primary` in
     //! `kmd_render/src/ddi/create_allocation.rs`. It must NEVER be relaxed: an
     //! `alloc_size` smaller than `plane_offset + pitch*height` lets QEMU read
-    //! past the blob.
+    //! past the blob. WindowedBlt snapshots are OPTIMAL VkImages instead; their
+    //! purpose-specific validator preserves whole-allocation invariants and
+    //! leaves the physical-size/type check to the Vulkan importer.
 
     use crate::ScanoutFormat;
 
@@ -4742,14 +4744,17 @@ pub mod snapshot_bind {
         pub resource_id: u32,
         pub width: u32,
         pub height: u32,
-        /// Row pitch in bytes (the stride `SET_SCANOUT_BLOB` uses).
+        /// Logical row pitch in bytes. Direct LINEAR scanout uses this as the
+        /// `SET_SCANOUT_BLOB` stride; it is not the physical footprint of a
+        /// WindowedBlt OPTIMAL image.
         pub pitch: u32,
         /// Exact DXGI format; must resolve via [`ScanoutFormat::from_dxgi`].
         pub dxgi_format: u32,
         /// Memory-plane-0 byte offset within the backing allocation.
         pub plane_offset: u64,
-        /// Total venus blob size backing `resource_id` — the undersize guard's
-        /// right-hand side.
+        /// Total venus blob size backing `resource_id`. For LINEAR scanout it
+        /// is the undersize guard's right-hand side; for a WindowedBlt OPTIMAL
+        /// image the importer compares it with Vulkan memory requirements.
         pub venus_alloc_size: u64,
         /// Exact Vulkan memory type for a typed WindowedBlt import.  Zero is a
         /// valid type; its presence is proved by the complete v2 command tail
@@ -4779,6 +4784,11 @@ pub mod snapshot_bind {
         /// A WindowedBlt path received a direct-bind descriptor (or vice
         /// versa). These are different consumers and must never be inferred.
         Purpose,
+        /// A WindowedBlt OPTIMAL image did not describe a whole dedicated
+        /// allocation bound at offset zero. Its allocation size is opaque and
+        /// is checked against Vulkan image requirements by the importer; it is
+        /// not a linear `pitch * height` footprint.
+        OptimalAllocation,
     }
 
     /// The full Present-time gate: identity, extent, then layout. The caller
@@ -4838,7 +4848,31 @@ pub mod snapshot_bind {
         if d.dxgi_format != source_dxgi_format {
             return Err(SnapshotReject::SourceFormatMismatch);
         }
-        validate(d, source_width, source_height)
+        if d.resource_id == 0 {
+            return Err(SnapshotReject::ZeroResource);
+        }
+        if d.width != source_width || d.height != source_height {
+            return Err(SnapshotReject::ExtentMismatch);
+        }
+        // WindowedBlt snapshots are dedicated OPTIMAL images. `pitch` is only
+        // logical metadata retained by the common snapshot wire structure;
+        // applying it as a linear byte footprint is invalid because optimal
+        // tiling is implementation-defined. The Venus importer recreates the
+        // exact VkImage, asks Vulkan for its memory requirements, and rejects
+        // `required_size > venus_alloc_size` before binding. Here, retain the
+        // independent creator guarantees needed by that import: a whole,
+        // non-empty allocation at offset zero and a well-formed logical row.
+        if d.venus_alloc_size == 0
+            || d.plane_offset != 0
+            || d.pitch < d.width.saturating_mul(4)
+            || d.pitch & 3 != 0
+        {
+            return Err(SnapshotReject::OptimalAllocation);
+        }
+        if ScanoutFormat::from_dxgi(d.dxgi_format).is_none() {
+            return Err(SnapshotReject::Format);
+        }
+        Ok(())
     }
 }
 
@@ -5108,6 +5142,48 @@ mod snapshot_bind_tests {
         assert_eq!(
             validate_windowed_blt(&d, 1920, 1080, 87),
             Err(SnapshotReject::Purpose)
+        );
+    }
+
+    /// OPTIMAL image allocation size is a Vulkan memory requirement, not a
+    /// row-major footprint. CapCut's 280x215 modal is the regression vector:
+    /// its real 258048-byte dedicated allocation is smaller than the synthetic
+    /// 1280*215 logical scanout footprint and must still import successfully.
+    #[test]
+    fn windowed_blt_does_not_apply_linear_size_math_to_optimal_images() {
+        let d = SnapshotDescriptor {
+            resource_id: 3464,
+            width: 280,
+            height: 215,
+            pitch: 1280,
+            dxgi_format: 28,
+            plane_offset: 0,
+            venus_alloc_size: 258048,
+            memory_type_index: 0,
+            purpose: 1,
+        };
+        assert_eq!(
+            validate_layout(&d),
+            Err(SnapshotReject::Layout),
+            "the same numbers are deliberately invalid as a linear image"
+        );
+        assert_eq!(validate_windowed_blt(&d, 280, 215, 28), Ok(()));
+    }
+
+    #[test]
+    fn windowed_blt_still_requires_a_whole_dedicated_allocation() {
+        let mut d = good();
+        d.purpose = 1;
+        d.venus_alloc_size = 0;
+        assert_eq!(
+            validate_windowed_blt(&d, 1920, 1080, 87),
+            Err(SnapshotReject::OptimalAllocation)
+        );
+        d.venus_alloc_size = 7680 * 1080;
+        d.plane_offset = 4096;
+        assert_eq!(
+            validate_windowed_blt(&d, 1920, 1080, 87),
+            Err(SnapshotReject::OptimalAllocation)
         );
     }
 }

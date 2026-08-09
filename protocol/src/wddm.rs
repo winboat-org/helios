@@ -411,8 +411,12 @@ pub struct HeliosPresentPrivateData {
     pub pitch: u32,
     pub dxgi_format: u32,
     pub reserved: u32,
-    /// Total venus blob size backing `resource_id`, for the bind-time
-    /// undersize guard (`venus_alloc_size >= plane_offset + pitch*height`).
+    /// Total venus blob size backing `resource_id`. Direct LINEAR snapshot
+    /// binding applies the bind-time undersize guard
+    /// (`venus_alloc_size >= plane_offset + pitch*height`). A
+    /// [`HELIOS_PRESENT_PRIVATE_FLAG_WINDOWED_BLT_SNAPSHOT`] resource is an
+    /// OPTIMAL VkImage instead; its importer compares this value with the
+    /// image's Vulkan memory requirements rather than logical row-pitch math.
     /// APPENDED for [`HELIOS_PRESENT_PRIVATE_FLAG_SNAPSHOT`] (40 -> 48 bytes,
     /// offset 40 is 8-aligned, nothing before it moves — prefix-compatible
     /// with pre-snapshot readers). Meaningful ONLY when that flag is set;
