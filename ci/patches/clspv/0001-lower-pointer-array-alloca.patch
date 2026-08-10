@@ -1,0 +1,458 @@
+diff --git a/lib/CMakeLists.txt b/lib/CMakeLists.txt
+index c458729..93a9ad9 100644
+--- a/lib/CMakeLists.txt
++++ b/lib/CMakeLists.txt
+@@ -67,6 +67,7 @@ add_library(clspv_passes OBJECT
+   ${CMAKE_CURRENT_SOURCE_DIR}/SetImageMetadataPass.cpp
+   ${CMAKE_CURRENT_SOURCE_DIR}/ThreeElementVectorLoweringPass.cpp
+   ${CMAKE_CURRENT_SOURCE_DIR}/LowerAddrSpaceCastPass.cpp
++  ${CMAKE_CURRENT_SOURCE_DIR}/LowerPointerArrayAllocaPass.cpp
+   ${CMAKE_CURRENT_SOURCE_DIR}/LowerPrivatePointerPHIPass.cpp
+   ${CMAKE_CURRENT_SOURCE_DIR}/MultiVersionUBOFunctionsPass.cpp
+   ${CMAKE_CURRENT_SOURCE_DIR}/NativeMathPass.cpp
+diff --git a/lib/Compiler.cpp b/lib/Compiler.cpp
+index e059dfd..38061f3 100644
+--- a/lib/Compiler.cpp
++++ b/lib/Compiler.cpp
+@@ -840,6 +840,11 @@ int RunPassPipeline(llvm::Module &M, llvm::raw_svector_ostream *binaryStream) {
+       pm.addPass(llvm::createModuleToFunctionPassAdaptor(llvm::DCEPass()));
+     }
+ 
++    // Arrays of pointers have no representation in the logical addressing
++    // model. SROA has already removed the ones it could; this removes the rest
++    // so that the producer never has to type a pointer held in memory.
++    pm.addPass(clspv::LowerPointerArrayAllocaPass());
++
+     // This pass needs to run before an interation of
+     // SimplifyPointerBitcastPass/ReplacePointerBitcastPass.
+     pm.addPass(clspv::LowerPrivatePointerPHIPass());
+diff --git a/lib/LowerPointerArrayAllocaPass.cpp b/lib/LowerPointerArrayAllocaPass.cpp
+new file mode 100644
+index 0000000..9ecf425
+--- /dev/null
++++ b/lib/LowerPointerArrayAllocaPass.cpp
+@@ -0,0 +1,262 @@
++// Copyright 2026 The Clspv Authors. All rights reserved.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++#include "llvm/ADT/SmallVector.h"
++#include "llvm/IR/Dominators.h"
++#include "llvm/IR/IRBuilder.h"
++#include "llvm/IR/Instructions.h"
++#include "llvm/IR/Module.h"
++#include "llvm/Transforms/Utils/PromoteMemToReg.h"
++
++#include "LowerPointerArrayAllocaPass.h"
++
++using namespace llvm;
++
++namespace {
++
++// A select chain is linear in the number of elements, so a very large pointer
++// table would trade one unrepresentable construct for a great deal of code. In
++// practice these tables are small (one entry per image plane); refuse to
++// rewrite anything unreasonable and leave it to the producer to report.
++constexpr uint64_t kMaxElements = 64;
++
++// Returns the element index of |gep| if it is a well formed access to the
++// pointer array, i.e. `getelementptr [N x ptr], ptr %alloca, i32 0, idx`.
++// |index_out| is set to the second operand, which may or may not be constant.
++bool isElementGEP(GetElementPtrInst *gep, AllocaInst *alloca,
++                  ArrayType *array_ty, Value **index_out) {
++  if (gep->getPointerOperand() != alloca) {
++    return false;
++  }
++  if (gep->getSourceElementType() != array_ty) {
++    return false;
++  }
++  if (gep->getNumIndices() != 2) {
++    return false;
++  }
++  auto *first = dyn_cast<ConstantInt>(gep->getOperand(1));
++  if (first == nullptr || !first->isZero()) {
++    return false;
++  }
++  *index_out = gep->getOperand(2);
++  return true;
++}
++
++} // namespace
++
++bool clspv::LowerPointerArrayAllocaPass::isSupportedAccessPattern(
++    AllocaInst *alloca, ArrayType *array_ty) const {
++  for (auto *user : alloca->users()) {
++    auto *gep = dyn_cast<GetElementPtrInst>(user);
++    if (gep == nullptr) {
++      // The array itself is loaded, stored, passed to a call or otherwise
++      // escapes; scalarizing would not be sound.
++      return false;
++    }
++    Value *index = nullptr;
++    if (!isElementGEP(gep, alloca, array_ty, &index)) {
++      return false;
++    }
++    if (auto *constant = dyn_cast<ConstantInt>(index)) {
++      if (constant->getValue().uge(array_ty->getNumElements())) {
++        return false;
++      }
++    }
++    // Only whole-element accesses can be redirected to a scalar alloca.
++    for (auto *gep_user : gep->users()) {
++      if (auto *load = dyn_cast<LoadInst>(gep_user)) {
++        if (load->getType() != array_ty->getElementType()) {
++          return false;
++        }
++        if (!load->isSimple()) {
++          return false;
++        }
++      } else if (auto *store = dyn_cast<StoreInst>(gep_user)) {
++        // Storing the element is fine; storing the *address* of the element
++        // elsewhere is not.
++        if (store->getPointerOperand() != gep) {
++          return false;
++        }
++        if (store->getValueOperand()->getType() !=
++            array_ty->getElementType()) {
++          return false;
++        }
++        if (!store->isSimple()) {
++          return false;
++        }
++      } else {
++        return false;
++      }
++    }
++  }
++  return true;
++}
++
++void clspv::LowerPointerArrayAllocaPass::scalarize(
++    AllocaInst *alloca, ArrayType *array_ty,
++    SmallVectorImpl<AllocaInst *> &scalars) {
++  auto *element_ty = array_ty->getElementType();
++  const uint64_t num_elements = array_ty->getNumElements();
++
++  IRBuilder<> entry_builder(alloca);
++  for (uint64_t i = 0; i < num_elements; i++) {
++    auto *scalar = entry_builder.CreateAlloca(
++        element_ty, alloca->getAddressSpace(),
++        /* ArraySize */ nullptr,
++        alloca->getName() + ".elem" + Twine(i));
++    scalar->setAlignment(alloca->getAlign());
++    scalars.push_back(scalar);
++  }
++
++  SmallVector<Instruction *, 16> dead;
++
++  for (auto *user : llvm::make_early_inc_range(alloca->users())) {
++    auto *gep = cast<GetElementPtrInst>(user);
++    Value *index = nullptr;
++    bool ok = isElementGEP(gep, alloca, array_ty, &index);
++    (void)ok;
++    assert(ok && "access pattern changed since it was validated");
++
++    if (auto *constant = dyn_cast<ConstantInt>(index)) {
++      // Constant index: the access simply becomes an access to that scalar.
++      gep->replaceAllUsesWith(scalars[constant->getZExtValue()]);
++      dead.push_back(gep);
++      continue;
++    }
++
++    // Dynamic index: materialise the value with a select chain instead of an
++    // address computation.
++    for (auto *gep_user : llvm::make_early_inc_range(gep->users())) {
++      if (auto *load = dyn_cast<LoadInst>(gep_user)) {
++        IRBuilder<> builder(load);
++        // Start from the last element and fold backwards, so element 0 ends up
++        // as the outermost condition. An out-of-range index is undefined
++        // behaviour in OpenCL C, so using the last element as the fallback is
++        // as good as any other choice.
++        Value *result = builder.CreateLoad(
++            element_ty, scalars[num_elements - 1],
++            load->getName() + ".elem" + Twine(num_elements - 1));
++        for (int64_t i = static_cast<int64_t>(num_elements) - 2; i >= 0; i--) {
++          Value *candidate =
++              builder.CreateLoad(element_ty, scalars[i],
++                                 load->getName() + ".elem" + Twine(i));
++          Value *is_this = builder.CreateICmpEQ(
++              index, ConstantInt::get(index->getType(), i));
++          result = builder.CreateSelect(is_this, candidate, result);
++        }
++        load->replaceAllUsesWith(result);
++        dead.push_back(load);
++      } else {
++        // Validated above: the only other possibility is a store of the
++        // element through this address. Update every slot, keeping the old
++        // value where the index does not match.
++        auto *store = cast<StoreInst>(gep_user);
++        IRBuilder<> builder(store);
++        Value *stored = store->getValueOperand();
++        for (uint64_t i = 0; i < num_elements; i++) {
++          Value *current = builder.CreateLoad(element_ty, scalars[i]);
++          Value *is_this = builder.CreateICmpEQ(
++              index, ConstantInt::get(index->getType(), i));
++          builder.CreateStore(builder.CreateSelect(is_this, stored, current),
++                              scalars[i]);
++        }
++        dead.push_back(store);
++      }
++    }
++    dead.push_back(gep);
++  }
++
++  for (auto *instruction : dead) {
++    instruction->eraseFromParent();
++  }
++  alloca->eraseFromParent();
++}
++
++bool clspv::LowerPointerArrayAllocaPass::runOnFunction(Function &F) {
++  SmallVector<AllocaInst *, 4> candidates;
++  for (auto &BB : F) {
++    for (auto &I : BB) {
++      auto *alloca = dyn_cast<AllocaInst>(&I);
++      if (alloca == nullptr || alloca->isArrayAllocation()) {
++        continue;
++      }
++      auto *array_ty = dyn_cast<ArrayType>(alloca->getAllocatedType());
++      if (array_ty == nullptr || !array_ty->getElementType()->isPointerTy()) {
++        continue;
++      }
++      if (array_ty->getNumElements() == 0 ||
++          array_ty->getNumElements() > kMaxElements) {
++        continue;
++      }
++      candidates.push_back(alloca);
++    }
++  }
++
++  SmallVector<AllocaInst *, 16> to_promote;
++  for (auto *alloca : candidates) {
++    auto *array_ty = cast<ArrayType>(alloca->getAllocatedType());
++    if (!isSupportedAccessPattern(alloca, array_ty)) {
++      continue;
++    }
++    scalarize(alloca, array_ty, to_promote);
++  }
++
++  // Scalar allocas of pointers are just as unrepresentable as arrays of them,
++  // so promote any that are eligible, including ones this pass did not create.
++  for (auto &BB : F) {
++    for (auto &I : BB) {
++      auto *alloca = dyn_cast<AllocaInst>(&I);
++      if (alloca == nullptr || alloca->isArrayAllocation()) {
++        continue;
++      }
++      if (!alloca->getAllocatedType()->isPointerTy()) {
++        continue;
++      }
++      if (llvm::is_contained(to_promote, alloca)) {
++        continue;
++      }
++      to_promote.push_back(alloca);
++    }
++  }
++
++  SmallVector<AllocaInst *, 16> promotable;
++  for (auto *alloca : to_promote) {
++    if (isAllocaPromotable(alloca)) {
++      promotable.push_back(alloca);
++    }
++  }
++  if (promotable.empty()) {
++    return !to_promote.empty();
++  }
++
++  DominatorTree DT(F);
++  PromoteMemToReg(promotable, DT);
++  return true;
++}
++
++PreservedAnalyses
++clspv::LowerPointerArrayAllocaPass::run(Module &M, ModuleAnalysisManager &) {
++  PreservedAnalyses PA;
++  bool changed = false;
++  for (auto &F : M) {
++    if (F.isDeclaration()) {
++      continue;
++    }
++    changed |= runOnFunction(F);
++  }
++  if (!changed) {
++    return PreservedAnalyses::all();
++  }
++  return PA;
++}
+diff --git a/lib/LowerPointerArrayAllocaPass.h b/lib/LowerPointerArrayAllocaPass.h
+new file mode 100644
+index 0000000..9a16863
+--- /dev/null
++++ b/lib/LowerPointerArrayAllocaPass.h
+@@ -0,0 +1,69 @@
++// Copyright 2026 The Clspv Authors. All rights reserved.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++#ifndef _CLSPV_LIB_LOWER_POINTER_ARRAY_ALLOCA_PASS_H
++#define _CLSPV_LIB_LOWER_POINTER_ARRAY_ALLOCA_PASS_H
++
++#include "llvm/IR/Instructions.h"
++#include "llvm/IR/Module.h"
++#include "llvm/IR/PassManager.h"
++
++namespace clspv {
++
++// Lowers allocas of arrays of pointers into individual scalar allocas which
++// are then promoted to SSA values.
++//
++// SPIR-V's logical addressing model has no representation for a pointer stored
++// in memory, so `alloca [N x ptr addrspace(A)]` cannot be given a SPIR-V type
++// at all -- SPIRVProducerPass' getSPIRVType() rejects every pointer type it is
++// handed. LLVM's SROA promotes such an alloca away whenever every index is
++// constant, but it gives up as soon as one access uses a dynamic index, which
++// is exactly what an OpenCL C kernel holding a table of `__global` pointers
++// (an image plane table, say) produces:
++//
++//   __global ushort *planes[6];
++//   ...
++//   value = planes[which][offset];
++//
++// This pass finishes what SROA started. Each array element becomes its own
++// scalar alloca, constant-index accesses are redirected to the matching scalar,
++// and a dynamic-index access becomes a select chain over all the elements.
++// Once no access needs an address computation the scalars are promoted with
++// mem2reg, leaving the pointers as SSA values, selects and phis -- all of which
++// the producer can emit under the VariablePointers capability.
++//
++// Allocas whose access pattern is not understood are left untouched rather than
++// transformed incorrectly.
++struct LowerPointerArrayAllocaPass
++    : llvm::PassInfoMixin<LowerPointerArrayAllocaPass> {
++  llvm::PreservedAnalyses run(llvm::Module &M, llvm::ModuleAnalysisManager &);
++
++private:
++  bool runOnFunction(llvm::Function &F);
++
++  // Returns true when every use of |alloca| is an access this pass knows how to
++  // rewrite: a `getelementptr [N x ptr], ptr %alloca, 0, idx` whose only users
++  // are loads and stores of the element itself.
++  bool isSupportedAccessPattern(llvm::AllocaInst *alloca,
++                                llvm::ArrayType *array_ty) const;
++
++  // Replaces |alloca| with one scalar alloca per element, rewriting all
++  // accesses. Returns the newly created allocas.
++  void scalarize(llvm::AllocaInst *alloca, llvm::ArrayType *array_ty,
++                 llvm::SmallVectorImpl<llvm::AllocaInst *> &scalars);
++};
++
++} // namespace clspv
++
++#endif // _CLSPV_LIB_LOWER_POINTER_ARRAY_ALLOCA_PASS_H
+diff --git a/lib/PassRegistry.def b/lib/PassRegistry.def
+index 59669aa..0c0437d 100644
+--- a/lib/PassRegistry.def
++++ b/lib/PassRegistry.def
+@@ -41,6 +41,7 @@ MODULE_PASS("logical-pointer-to-int", clspv::LogicalPointerToIntPass)
+ MODULE_PASS("long-vector-lowering", clspv::LongVectorLoweringPass)
+ MODULE_PASS("set-image-metadata", clspv::SetImageMetadataPass)
+ MODULE_PASS("lower-addrspacecast", clspv::LowerAddrSpaceCastPass)
++MODULE_PASS("lower-pointer-array-alloca", clspv::LowerPointerArrayAllocaPass)
+ MODULE_PASS("lower-private-pointer-phi", clspv::LowerPrivatePointerPHIPass)
+ MODULE_PASS("multi-version-ubo-functions", clspv::MultiVersionUBOFunctionsPass)
+ MODULE_PASS("native-math", clspv::NativeMathPass)
+diff --git a/lib/Passes.h b/lib/Passes.h
+index 210b874..1226aa8 100644
+--- a/lib/Passes.h
++++ b/lib/Passes.h
+@@ -39,6 +39,7 @@
+ #include "LogicalPointerToIntPass.h"
+ #include "LongVectorLoweringPass.h"
+ #include "LowerAddrSpaceCastPass.h"
++#include "LowerPointerArrayAllocaPass.h"
+ #include "LowerPrivatePointerPHIPass.h"
+ #include "MultiVersionUBOFunctionsPass.h"
+ #include "NativeMathPass.h"
+diff --git a/test/PointerArrayAlloca/dynamic_index_load.ll b/test/PointerArrayAlloca/dynamic_index_load.ll
+new file mode 100644
+index 0000000..aa67027
+--- /dev/null
++++ b/test/PointerArrayAlloca/dynamic_index_load.ll
+@@ -0,0 +1,28 @@
++; RUN: clspv-opt %s -o %t.ll --passes=lower-pointer-array-alloca
++; RUN: FileCheck %s < %t.ll
++
++; CHECK-NOT: alloca
++; CHECK: [[cmp:%[^ ]+]] = icmp eq i32 %which, 0
++; CHECK: [[sel:%[^ ]+]] = select i1 [[cmp]], ptr addrspace(1) %a, ptr addrspace(1) %b
++; CHECK: load i16, ptr addrspace(1) [[sel]], align 2
++
++; An array of global pointers indexed dynamically has no representation in the
++; logical addressing model. SROA leaves it alone because of the dynamic index,
++; so this pass has to scalarize it and select between the elements instead.
++
++target datalayout = "e-p:32:32-i64:64-v16:16-v24:32-v32:32-v48:64-v96:128-v192:256-v256:256-v512:512-v1024:1024-G1"
++target triple = "spirv32-unknown-vulkan"
++
++define void @test(ptr addrspace(1) %a, ptr addrspace(1) %b, i32 %which, ptr addrspace(1) %out) {
++entry:
++  %planes = alloca [2 x ptr addrspace(1)], align 4
++  %g0 = getelementptr [2 x ptr addrspace(1)], ptr %planes, i32 0, i32 0
++  store ptr addrspace(1) %a, ptr %g0, align 4
++  %g1 = getelementptr [2 x ptr addrspace(1)], ptr %planes, i32 0, i32 1
++  store ptr addrspace(1) %b, ptr %g1, align 4
++  %gd = getelementptr [2 x ptr addrspace(1)], ptr %planes, i32 0, i32 %which
++  %p = load ptr addrspace(1), ptr %gd, align 4
++  %v = load i16, ptr addrspace(1) %p, align 2
++  store i16 %v, ptr addrspace(1) %out, align 2
++  ret void
++}
+diff --git a/test/PointerArrayAlloca/escaping_array_untouched.ll b/test/PointerArrayAlloca/escaping_array_untouched.ll
+new file mode 100644
+index 0000000..61f6382
+--- /dev/null
++++ b/test/PointerArrayAlloca/escaping_array_untouched.ll
+@@ -0,0 +1,23 @@
++; RUN: clspv-opt %s -o %t.ll --passes=lower-pointer-array-alloca
++; RUN: FileCheck %s < %t.ll
++
++; When the pointer array escapes -- here its address is handed to a call -- the
++; access pattern is not one this pass can rewrite soundly, so it must leave the
++; alloca alone rather than transform it incorrectly.
++
++; CHECK: alloca [2 x ptr addrspace(1)]
++; CHECK: call void @use(ptr %planes)
++
++target datalayout = "e-p:32:32-i64:64-v16:16-v24:32-v32:32-v48:64-v96:128-v192:256-v256:256-v512:512-v1024:1024-G1"
++target triple = "spirv32-unknown-vulkan"
++
++declare void @use(ptr)
++
++define void @test(ptr addrspace(1) %a) {
++entry:
++  %planes = alloca [2 x ptr addrspace(1)], align 4
++  %g0 = getelementptr [2 x ptr addrspace(1)], ptr %planes, i32 0, i32 0
++  store ptr addrspace(1) %a, ptr %g0, align 4
++  call void @use(ptr %planes)
++  ret void
++}
