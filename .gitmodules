@@ -1,6 +1,6 @@
 [submodule "icd/mesa"]
 	path = icd/mesa
-	url = https://github.com/rupansh/mesa-helios.git
+	url = https://github.com/winboat-org/mesa-helios.git
 [submodule "LookingGlass"]
 	path = LookingGlass
 	url = https://github.com/gnif/LookingGlass
