@@ -1,11 +1,12 @@
-// Regression probe for zero-area Win32 Vulkan surfaces.
+// Regression probe for Win32 Vulkan surface extent changes.
 //
 // A transient 120x0 client area previously reached the software WSI image
 // allocator and produced a zero-sized Venus buffer/memory bind.  The probe
 // verifies that capabilities normalize a partial-zero client area to 0x0,
-// swapchain creation fails before allocation, and creation recovers after
-// resize.  The deliberately stale create requests exercise driver hardening;
-// they are not valid application usage.
+// swapchain creation fails before allocation, live swapchains become
+// OUT_OF_DATE after resize or a zero-area transition, and creation recovers
+// after restore.  The deliberately stale create requests exercise driver
+// hardening; they are not valid application usage.
 
 #define VK_USE_PLATFORM_WIN32_KHR
 #define VK_NO_PROTOTYPES
@@ -61,6 +62,23 @@ static void expect_result(const char *name, VkResult actual,
             (int)expected);
     exit(1);
   }
+}
+
+static void resize_client(HWND hwnd, uint32_t width, uint32_t height) {
+  if (!SetWindowPos(hwnd, NULL, 0, 0, width, height,
+                    SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE)) {
+    fprintf(stderr, "FAIL SetWindowPos -> %lu\n", GetLastError());
+    exit(1);
+  }
+
+  RECT rect;
+  if (!GetClientRect(hwnd, &rect)) {
+    fprintf(stderr, "FAIL GetClientRect -> %lu\n", GetLastError());
+    exit(1);
+  }
+  expect_extent("resized client", {(uint32_t)(rect.right - rect.left),
+                                    (uint32_t)(rect.bottom - rect.top)},
+                width, height);
 }
 
 int main(int argc, char **argv) {
@@ -242,7 +260,24 @@ int main(int argc, char **argv) {
   PFN_vkGetDeviceProcAddr get_device_proc = vkGetDeviceProcAddr;
   LOAD_DEVICE_PROC(vkCreateSwapchainKHR);
   LOAD_DEVICE_PROC(vkDestroySwapchainKHR);
+  LOAD_DEVICE_PROC(vkGetSwapchainImagesKHR);
+  LOAD_DEVICE_PROC(vkAcquireNextImageKHR);
+  LOAD_DEVICE_PROC(vkCreateSemaphore);
+  LOAD_DEVICE_PROC(vkDestroySemaphore);
+  LOAD_DEVICE_PROC(vkCreateCommandPool);
+  LOAD_DEVICE_PROC(vkDestroyCommandPool);
+  LOAD_DEVICE_PROC(vkAllocateCommandBuffers);
+  LOAD_DEVICE_PROC(vkBeginCommandBuffer);
+  LOAD_DEVICE_PROC(vkEndCommandBuffer);
+  LOAD_DEVICE_PROC(vkCmdPipelineBarrier);
+  LOAD_DEVICE_PROC(vkGetDeviceQueue);
+  LOAD_DEVICE_PROC(vkQueueSubmit);
+  LOAD_DEVICE_PROC(vkQueuePresentKHR);
+  LOAD_DEVICE_PROC(vkQueueWaitIdle);
   LOAD_DEVICE_PROC(vkDestroyDevice);
+
+  VkQueue queue = VK_NULL_HANDLE;
+  vkGetDeviceQueue(device, queue_family, 0, &queue);
 
   VkSwapchainCreateInfoKHR swapchain_info = {};
   swapchain_info.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
@@ -266,11 +301,7 @@ int main(int argc, char **argv) {
                 VK_ERROR_INITIALIZATION_FAILED);
   printf("zero-area swapchain rejected with VK_ERROR_INITIALIZATION_FAILED\n");
 
-  if (!SetWindowPos(hwnd, NULL, 0, 0, 320, 240,
-                    SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE)) {
-    fprintf(stderr, "FAIL SetWindowPos -> %lu\n", GetLastError());
-    return 1;
-  }
+  resize_client(hwnd, 320, 240);
   CHECK_VK(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physical_device, surface,
                                                      &capabilities));
   expect_extent("restored currentExtent", capabilities.currentExtent, 320, 240);
@@ -288,6 +319,170 @@ int main(int argc, char **argv) {
   swapchain_info.minImageCount = capabilities.minImageCount;
   CHECK_VK(vkCreateSwapchainKHR(device, &swapchain_info, NULL, &swapchain));
   printf("restored swapchain created at %ux%u\n",
+         capabilities.currentExtent.width, capabilities.currentExtent.height);
+
+  VkSemaphoreCreateInfo semaphore_info = {};
+  semaphore_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+  VkSemaphore semaphore = VK_NULL_HANDLE;
+  CHECK_VK(vkCreateSemaphore(device, &semaphore_info, NULL, &semaphore));
+
+  resize_client(hwnd, 400, 300);
+
+  uint32_t image_index = UINT32_MAX;
+  result = vkAcquireNextImageKHR(device, swapchain, 0, semaphore,
+                                 VK_NULL_HANDLE, &image_index);
+  expect_result("resized vkAcquireNextImageKHR", result,
+                VK_ERROR_OUT_OF_DATE_KHR);
+  printf("live resize invalidated the old swapchain\n");
+  vkDestroySemaphore(device, semaphore, NULL);
+
+  resize_client(hwnd, 320, 240);
+  CHECK_VK(vkCreateSemaphore(device, &semaphore_info, NULL, &semaphore));
+  image_index = UINT32_MAX;
+  result = vkAcquireNextImageKHR(device, swapchain, 0, semaphore,
+                                 VK_NULL_HANDLE, &image_index);
+  expect_result("restored-size old vkAcquireNextImageKHR", result,
+                VK_ERROR_OUT_OF_DATE_KHR);
+  printf("old swapchain remained invalid after restoring its original size\n");
+  vkDestroySemaphore(device, semaphore, NULL);
+  vkDestroySwapchainKHR(device, swapchain, NULL);
+
+  resize_client(hwnd, 400, 300);
+  CHECK_VK(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physical_device, surface,
+                                                     &capabilities));
+  expect_extent("resized currentExtent", capabilities.currentExtent, 400, 300);
+  swapchain_info.imageExtent = capabilities.currentExtent;
+  swapchain_info.minImageCount = capabilities.minImageCount;
+  CHECK_VK(vkCreateSwapchainKHR(device, &swapchain_info, NULL, &swapchain));
+  CHECK_VK(vkCreateSemaphore(device, &semaphore_info, NULL, &semaphore));
+  VkSemaphore present_ready = VK_NULL_HANDLE;
+  CHECK_VK(
+      vkCreateSemaphore(device, &semaphore_info, NULL, &present_ready));
+
+  image_index = UINT32_MAX;
+  CHECK_VK(vkAcquireNextImageKHR(device, swapchain, 0, semaphore,
+                                 VK_NULL_HANDLE, &image_index));
+
+  uint32_t swapchain_image_count = 0;
+  CHECK_VK(vkGetSwapchainImagesKHR(device, swapchain, &swapchain_image_count,
+                                   NULL));
+  VkImage *swapchain_images =
+      (VkImage *)calloc(swapchain_image_count, sizeof(*swapchain_images));
+  if (!swapchain_images) {
+    fprintf(stderr, "FAIL allocating swapchain image list\n");
+    return 1;
+  }
+  CHECK_VK(vkGetSwapchainImagesKHR(device, swapchain, &swapchain_image_count,
+                                   swapchain_images));
+
+  VkCommandPoolCreateInfo command_pool_info = {};
+  command_pool_info.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+  command_pool_info.queueFamilyIndex = queue_family;
+  VkCommandPool command_pool = VK_NULL_HANDLE;
+  CHECK_VK(vkCreateCommandPool(device, &command_pool_info, NULL,
+                               &command_pool));
+
+  VkCommandBufferAllocateInfo command_buffer_info = {};
+  command_buffer_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+  command_buffer_info.commandPool = command_pool;
+  command_buffer_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+  command_buffer_info.commandBufferCount = 1;
+  VkCommandBuffer command_buffer = VK_NULL_HANDLE;
+  CHECK_VK(vkAllocateCommandBuffers(device, &command_buffer_info,
+                                     &command_buffer));
+
+  VkCommandBufferBeginInfo begin_info = {};
+  begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+  begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+  CHECK_VK(vkBeginCommandBuffer(command_buffer, &begin_info));
+
+  VkImageMemoryBarrier present_barrier = {};
+  present_barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+  present_barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  present_barrier.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+  present_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  present_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  present_barrier.image = swapchain_images[image_index];
+  present_barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+  present_barrier.subresourceRange.baseMipLevel = 0;
+  present_barrier.subresourceRange.levelCount = 1;
+  present_barrier.subresourceRange.baseArrayLayer = 0;
+  present_barrier.subresourceRange.layerCount = 1;
+  vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                       VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, NULL, 0,
+                       NULL, 1, &present_barrier);
+  CHECK_VK(vkEndCommandBuffer(command_buffer));
+
+  VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+  VkSubmitInfo submit_info = {};
+  submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+  submit_info.waitSemaphoreCount = 1;
+  submit_info.pWaitSemaphores = &semaphore;
+  submit_info.pWaitDstStageMask = &wait_stage;
+  submit_info.commandBufferCount = 1;
+  submit_info.pCommandBuffers = &command_buffer;
+  submit_info.signalSemaphoreCount = 1;
+  submit_info.pSignalSemaphores = &present_ready;
+  CHECK_VK(vkQueueSubmit(queue, 1, &submit_info, VK_NULL_HANDLE));
+  CHECK_VK(vkQueueWaitIdle(queue));
+
+  resize_client(hwnd, 420, 310);
+
+  VkResult per_swapchain_result = VK_SUCCESS;
+  VkPresentInfoKHR present_info = {};
+  present_info.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+  present_info.waitSemaphoreCount = 1;
+  present_info.pWaitSemaphores = &present_ready;
+  present_info.swapchainCount = 1;
+  present_info.pSwapchains = &swapchain;
+  present_info.pImageIndices = &image_index;
+  present_info.pResults = &per_swapchain_result;
+  result = vkQueuePresentKHR(queue, &present_info);
+  expect_result("resized vkQueuePresentKHR", result,
+                VK_ERROR_OUT_OF_DATE_KHR);
+  expect_result("resized vkQueuePresentKHR pResults", per_swapchain_result,
+                VK_ERROR_OUT_OF_DATE_KHR);
+  CHECK_VK(vkQueueWaitIdle(queue));
+  printf("live resize invalidated an acquired image at present\n");
+  vkDestroyCommandPool(device, command_pool, NULL);
+  free(swapchain_images);
+  vkDestroySemaphore(device, present_ready, NULL);
+  vkDestroySemaphore(device, semaphore, NULL);
+  vkDestroySwapchainKHR(device, swapchain, NULL);
+
+  CHECK_VK(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physical_device, surface,
+                                                     &capabilities));
+  expect_extent("present-resized currentExtent", capabilities.currentExtent,
+                420, 310);
+  swapchain_info.imageExtent = capabilities.currentExtent;
+  swapchain_info.minImageCount = capabilities.minImageCount;
+  CHECK_VK(vkCreateSwapchainKHR(device, &swapchain_info, NULL, &swapchain));
+  CHECK_VK(vkCreateSemaphore(device, &semaphore_info, NULL, &semaphore));
+
+  resize_client(hwnd, 120, 0);
+
+  image_index = UINT32_MAX;
+  result = vkAcquireNextImageKHR(device, swapchain, 0, semaphore,
+                                 VK_NULL_HANDLE, &image_index);
+  expect_result("zero-area vkAcquireNextImageKHR", result,
+                VK_ERROR_OUT_OF_DATE_KHR);
+  printf("zero-area resize invalidated the old swapchain\n");
+  vkDestroySemaphore(device, semaphore, NULL);
+  vkDestroySwapchainKHR(device, swapchain, NULL);
+
+  CHECK_VK(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physical_device, surface,
+                                                     &capabilities));
+  expect_extent("zero-area currentExtent", capabilities.currentExtent, 0, 0);
+
+  resize_client(hwnd, 360, 260);
+
+  CHECK_VK(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physical_device, surface,
+                                                     &capabilities));
+  expect_extent("final currentExtent", capabilities.currentExtent, 360, 260);
+  swapchain_info.imageExtent = capabilities.currentExtent;
+  swapchain_info.minImageCount = capabilities.minImageCount;
+  CHECK_VK(vkCreateSwapchainKHR(device, &swapchain_info, NULL, &swapchain));
+  printf("swapchain creation recovered after restore at %ux%u\n",
          capabilities.currentExtent.width, capabilities.currentExtent.height);
 
   vkDestroySwapchainKHR(device, swapchain, NULL);
