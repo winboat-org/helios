@@ -29,6 +29,8 @@
 // Env: HELIOS_WSI_DCOMP_PRESENT=1 HELIOS_WSI_PERF=1 HELIOS_WSI_PERF_INTERVAL=100
 //      HELIOS_WSI_PERF_FILE=C:\ProgramData\Helios\vk_surface_recreate_perf.txt
 // Run from SESSION 1 (schtasks) — session 0 windows never reach dwm.
+// Optional argv[2] = "10bit" selects VK_FORMAT_A2B10G10R10_UNORM_PACK32,
+// exercising the Premiere/WGL presentation format rather than BGRA8.
 
 #define VK_USE_PLATFORM_WIN32_KHR
 #include <vulkan/vulkan.h>
@@ -79,6 +81,15 @@ static uint32_t g_qfam;
 static VkCommandPool g_pool;
 static VkCommandBuffer g_cmd;
 static VkSemaphore g_sem_acquire, g_sem_render;
+static VkFormat g_format = VK_FORMAT_B8G8R8A8_UNORM;
+
+static const char *
+format_name(VkFormat format)
+{
+   return format == VK_FORMAT_A2B10G10R10_UNORM_PACK32
+             ? "A2B10G10R10_UNORM_PACK32"
+             : "B8G8R8A8_UNORM";
+}
 
 static void
 chain_create(struct chain *c, HWND hwnd)
@@ -100,11 +111,32 @@ chain_create(struct chain *c, HWND hwnd)
    VkSurfaceCapabilitiesKHR caps;
    CHECK(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(g_phys, c->surface, &caps));
 
+   uint32_t format_count = 0;
+   CHECK(vkGetPhysicalDeviceSurfaceFormatsKHR(g_phys, c->surface,
+                                              &format_count, NULL));
+   VkSurfaceFormatKHR *formats = (VkSurfaceFormatKHR *)calloc(
+      format_count, sizeof(*formats));
+   if (!formats) {
+      fprintf(stderr, "FAIL allocating %u surface formats\n", format_count);
+      exit(1);
+   }
+   CHECK(vkGetPhysicalDeviceSurfaceFormatsKHR(g_phys, c->surface,
+                                              &format_count, formats));
+   bool format_supported = false;
+   for (uint32_t i = 0; i < format_count; i++)
+      format_supported |= formats[i].format == g_format;
+   free(formats);
+   if (!format_supported) {
+      fprintf(stderr, "FAIL surface does not advertise %s (%u)\n",
+              format_name(g_format), (unsigned)g_format);
+      exit(1);
+   }
+
    VkSwapchainCreateInfoKHR ci = {
       VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
    ci.surface = c->surface;
    ci.minImageCount = caps.minImageCount > 3 ? caps.minImageCount : 3;
-   ci.imageFormat = VK_FORMAT_B8G8R8A8_UNORM;
+   ci.imageFormat = g_format;
    ci.imageColorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
    ci.imageExtent = caps.currentExtent;
    ci.imageArrayLayers = 1;
@@ -124,9 +156,9 @@ chain_create(struct chain *c, HWND hwnd)
       c->image_count = 16;
    CHECK(vkGetSwapchainImagesKHR(g_device, c->swapchain, &c->image_count,
                                  c->images));
-   printf("chain %p: swapchain %ux%u images=%u\n", (void *)c,
+   printf("chain %p: swapchain %ux%u images=%u format=%s (%u)\n", (void *)c,
           caps.currentExtent.width, caps.currentExtent.height,
-          c->image_count);
+          c->image_count, format_name(g_format), (unsigned)g_format);
    fflush(stdout);
 }
 
@@ -232,9 +264,12 @@ int
 main(int argc, char **argv)
 {
    const uint32_t phase_secs = argc > 1 ? (uint32_t)atoi(argv[1]) : 12;
+   if (argc > 2 && strcmp(argv[2], "10bit") == 0)
+      g_format = VK_FORMAT_A2B10G10R10_UNORM_PACK32;
 
-   printf("vk_surface_recreate_probe pid=%lu phase_secs=%u\n",
-          (unsigned long)GetCurrentProcessId(), phase_secs);
+   printf("vk_surface_recreate_probe pid=%lu phase_secs=%u format=%s (%u)\n",
+          (unsigned long)GetCurrentProcessId(), phase_secs,
+          format_name(g_format), (unsigned)g_format);
    fflush(stdout);
 
    WNDCLASSA wc = {};

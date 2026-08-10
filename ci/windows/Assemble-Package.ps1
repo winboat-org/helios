@@ -72,7 +72,13 @@ if (Test-Path -LiteralPath $clvkPdb -PathType Leaf) { Copy-Required $clvkPdb (Jo
 $loadersOut = Join-Path $payload "loaders"
 Copy-Required (Join-Path $LoadersArtifact "vulkan-1.dll") (Join-Path $loadersOut "vulkan-1.dll")
 Copy-Required (Join-Path $LoadersArtifact "OpenCL.dll") (Join-Path $loadersOut "OpenCL.dll")
-foreach ($probe in @("vulkan-smoke.exe", "d3d11-smoke.exe", "opengl-smoke.exe", "opencl-smoke.exe")) {
+foreach ($probe in @(
+    "vulkan-smoke.exe",
+    "vulkan-wsi-probe.exe",
+    "d3d11-smoke.exe",
+    "opengl-smoke.exe",
+    "opencl-smoke.exe"
+)) {
     Copy-Required (Join-Path $LoadersArtifact "smoke\$probe") (Join-Path $payload "smoke\$probe")
 }
 
