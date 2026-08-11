@@ -3,7 +3,13 @@ param(
     [string]$SourceRoot = "C:\clvk-src",
     [string]$BuildRoot = "C:\clvk-build",
     [string]$ClvkRepository = "https://github.com/winboat-org/clvk-helios.git",
-    [string]$ClvkCommit = "5b16bbba42835d99816d5d1014d08f7a4ea4e1ef"
+    [string]$ClvkCommit = "5b16bbba42835d99816d5d1014d08f7a4ea4e1ef",
+    # Patches applied to the clspv submodule after checkout. clvk-helios carries
+    # clspv as a submodule of upstream google/clspv, so Helios-local compiler
+    # fixes live here as patches until there is enough divergence to justify a
+    # clspv fork. Applied in file-name order; any failure fails the build rather
+    # than silently shipping an unpatched compiler.
+    [string]$ClspvPatchDir = (Join-Path $PSScriptRoot "..\patches\clspv")
 )
 
 Set-StrictMode -Version Latest
@@ -20,6 +26,22 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "Failed to check out clvk $ClvkCommit." }
     & git submodule update --init --recursive
     if ($LASTEXITCODE -ne 0) { throw "Failed to initialize clvk submodules." }
+
+    if (Test-Path -LiteralPath $ClspvPatchDir -PathType Container) {
+        $patches = @(Get-ChildItem -LiteralPath $ClspvPatchDir -Filter "*.patch" -File | Sort-Object Name)
+        foreach ($patch in $patches) {
+            Write-Host "Applying clspv patch $($patch.Name)"
+            Push-Location (Join-Path $SourceRoot "external\clspv")
+            try {
+                & git apply --verbose $patch.FullName
+                if ($LASTEXITCODE -ne 0) { throw "Failed to apply clspv patch $($patch.Name)." }
+            } finally {
+                Pop-Location
+            }
+        }
+        Write-Host "Applied $($patches.Count) clspv patch(es)."
+    }
+
     & python.exe external/clspv/utils/fetch_sources.py --shallow --deps llvm
     if ($LASTEXITCODE -ne 0) { throw "Failed to fetch clvk LLVM sources." }
 } finally {
@@ -58,6 +80,13 @@ if (Test-Path -LiteralPath $vendorPdb -PathType Leaf) {
 }
 Set-Content -LiteralPath (Join-Path $OutputDir "clvk-commit.txt") -Value $ClvkCommit -Encoding ascii
 Set-Content -LiteralPath (Join-Path $OutputDir "clvk-repository.txt") -Value $ClvkRepository -Encoding ascii
+# Record which compiler patches this artifact was built with, so a deployed
+# clvk.dll can be told apart from a stock one without disassembling it.
+$appliedPatches = if (Test-Path -LiteralPath $ClspvPatchDir -PathType Container) {
+    @(Get-ChildItem -LiteralPath $ClspvPatchDir -Filter "*.patch" -File | Sort-Object Name | ForEach-Object { $_.Name })
+} else { @() }
+Set-Content -LiteralPath (Join-Path $OutputDir "clspv-patches.txt") `
+    -Value ($appliedPatches -join "`n") -Encoding ascii
 $licenseRoot = Join-Path $OutputDir "licenses"
 $licenses = [ordered]@{
     "clvk-LICENSE" = Join-Path $SourceRoot "LICENSE"
