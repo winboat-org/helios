@@ -77,7 +77,8 @@ foreach ($probe in @(
     "vulkan-wsi-probe.exe",
     "d3d11-smoke.exe",
     "opengl-smoke.exe",
-    "opencl-smoke.exe"
+    "opencl-smoke.exe",
+    "opencl-gl-sharing-smoke.exe"
 )) {
     Copy-Required (Join-Path $LoadersArtifact "smoke\$probe") (Join-Path $payload "smoke\$probe")
 }

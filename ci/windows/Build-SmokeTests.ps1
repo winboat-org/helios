@@ -29,3 +29,9 @@ if ($LASTEXITCODE -ne 0) { throw "D3D11 smoke probe compilation failed." }
 if ($LASTEXITCODE -ne 0) { throw "OpenGL smoke probe compilation failed." }
 & cl.exe /nologo /O2 /W4 /MT (Join-Path $source "opencl-smoke.c") "/I$OpenClInclude" "/Fe:$(Join-Path $OutputDir 'opencl-smoke.exe')" /link $OpenClLibrary
 if ($LASTEXITCODE -ne 0) { throw "OpenCL smoke probe compilation failed." }
+& cl.exe /nologo /O2 /W4 /MT /EHsc `
+    (Join-Path $source "opencl-gl-sharing-smoke.cpp") `
+    "/I$OpenClInclude" `
+    "/Fe:$(Join-Path $OutputDir 'opencl-gl-sharing-smoke.exe')" `
+    /link opengl32.lib gdi32.lib user32.lib
+if ($LASTEXITCODE -ne 0) { throw "OpenCL/OpenGL sharing smoke probe compilation failed." }

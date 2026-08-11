@@ -57,6 +57,10 @@ C:\ProgramData\Helios\Verify-Helios.ps1 -RunSmokeTests
 Run that command after the final reboot; the installer performs only the
 non-rendering registration/hash checks before rebooting.
 
+The smoke-test pass includes a 1920x1080 RGBA16F WGL/OpenCL sharing case. It
+requires the matching Helios host image as well as the Windows bundle and
+verifies texture import, acquire, pixel readback, release, and queue finish.
+
 ## DaVinci Resolve compatibility
 
 Resolve's Windows GPU detector requires a vendor-specific enumeration path and

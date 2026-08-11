@@ -70,10 +70,15 @@ if ($null -eq $openClValue -or [int]$openClValue -ne 0) {
 if ($RunSmokeTests) {
     $smokeRoot = Join-Path ([string]$state.installRoot) "runtime\smoke"
     $tests = @(
-        [ordered]@{ name = "Vulkan"; exe = "vulkan-smoke.exe" },
-        [ordered]@{ name = "Direct3D 11"; exe = "d3d11-smoke.exe" },
-        [ordered]@{ name = "OpenGL"; exe = "opengl-smoke.exe" },
-        [ordered]@{ name = "OpenCL"; exe = "opencl-smoke.exe" }
+        [ordered]@{ name = "Vulkan"; exe = "vulkan-smoke.exe"; arguments = @() },
+        [ordered]@{ name = "Direct3D 11"; exe = "d3d11-smoke.exe"; arguments = @() },
+        [ordered]@{ name = "OpenGL"; exe = "opengl-smoke.exe"; arguments = @() },
+        [ordered]@{ name = "OpenCL"; exe = "opencl-smoke.exe"; arguments = @() },
+        [ordered]@{
+            name = "OpenGL/OpenCL sharing"
+            exe = "opencl-gl-sharing-smoke.exe"
+            arguments = @("rgba16f")
+        }
     )
     foreach ($test in $tests) {
         $executable = Join-Path $smokeRoot $test.exe
@@ -82,7 +87,8 @@ if ($RunSmokeTests) {
             continue
         }
         Write-Host "Running $($test.name) smoke probe..."
-        & $executable
+        $probeArguments = @($test.arguments)
+        & $executable @probeArguments
         if ($LASTEXITCODE -ne 0) { $failures.Add("$($test.name) smoke probe failed with exit code $LASTEXITCODE.") }
     }
 }
