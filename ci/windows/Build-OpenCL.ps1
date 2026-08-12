@@ -3,7 +3,7 @@ param(
     [string]$SourceRoot = "C:\clvk-src",
     [string]$BuildRoot = "C:\clvk-build",
     [string]$ClvkRepository = "https://github.com/winboat-org/clvk-helios.git",
-    [string]$ClvkCommit = "5b16bbba42835d99816d5d1014d08f7a4ea4e1ef",
+    [string]$ClvkCommit = "617b6e87b1e228dff04a04e9411c390ea1928a4c",
     # Patches applied to the clspv submodule after checkout. clvk-helios carries
     # clspv as a submodule of upstream google/clspv, so Helios-local compiler
     # fixes live here as patches until there is enough divergence to justify a
