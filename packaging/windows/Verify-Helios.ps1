@@ -75,9 +75,9 @@ if ($RunSmokeTests) {
         [ordered]@{ name = "OpenGL"; exe = "opengl-smoke.exe"; arguments = @() },
         [ordered]@{ name = "OpenCL"; exe = "opencl-smoke.exe"; arguments = @() },
         [ordered]@{
-            name = "OpenGL/OpenCL sharing"
+            name = "OpenGL/OpenCL sharing with a D3D11 context"
             exe = "opencl-gl-sharing-smoke.exe"
-            arguments = @("rgba16f")
+            arguments = @("rgba16f", "d3d11-context")
         }
     )
     foreach ($test in $tests) {

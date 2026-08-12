@@ -6,7 +6,9 @@
 #include <windows.h>
 
 #include <CL/cl.h>
+#include <CL/cl_d3d11.h>
 #include <CL/cl_gl.h>
+#include <d3d11.h>
 #include <GL/gl.h>
 
 #include <array>
@@ -69,8 +71,13 @@ int main(int argc, char** argv) {
     }
 
     std::printf("GL_RENDERER=%s\n", glGetString(GL_RENDERER));
-    const bool resolve_case =
-        argc > 1 && std::strcmp(argv[1], "rgba16f") == 0;
+    bool resolve_case = false;
+    bool d3d11_context_case = false;
+    for (int argument = 1; argument < argc; ++argument) {
+        resolve_case |= std::strcmp(argv[argument], "rgba16f") == 0;
+        d3d11_context_case |=
+            std::strcmp(argv[argument], "d3d11-context") == 0;
+    }
     const size_t width = resolve_case ? 1920 : 4;
     const size_t height = resolve_case ? 1080 : 4;
     const size_t channel_size = resolve_case ? 2 : 1;
@@ -169,38 +176,66 @@ int main(int argc, char** argv) {
                     device_name.data(), nullptr);
     std::printf("CL_DEVICE=%s\n", device_name.data());
 
-    const cl_context_properties properties[] = {
+    ID3D11Device* d3d11_device = nullptr;
+    ID3D11DeviceContext* d3d11_device_context = nullptr;
+    if (d3d11_context_case) {
+        D3D_FEATURE_LEVEL feature_level{};
+        const HRESULT result = D3D11CreateDevice(
+            nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0,
+            D3D11_SDK_VERSION, &d3d11_device, &feature_level,
+            &d3d11_device_context);
+        if (FAILED(result)) {
+            std::fprintf(stderr, "D3D11CreateDevice failed: 0x%08lx\n",
+                         static_cast<unsigned long>(result));
+            return 9;
+        }
+        std::printf("D3D11_CONTEXT feature_level=0x%x\n",
+                    static_cast<unsigned int>(feature_level));
+    }
+
+    std::vector<cl_context_properties> properties = {
+        CL_CONTEXT_PLATFORM,
+        reinterpret_cast<cl_context_properties>(platform),
         CL_GL_CONTEXT_KHR,
         reinterpret_cast<cl_context_properties>(gl),
         CL_WGL_HDC_KHR,
         reinterpret_cast<cl_context_properties>(dc),
-        CL_CONTEXT_PLATFORM,
-        reinterpret_cast<cl_context_properties>(platform),
-        0,
     };
-    cl_context context =
-        create_context(properties, 1, &device, nullptr, nullptr, &error);
+    if (d3d11_context_case) {
+        properties.push_back(CL_CONTEXT_D3D11_DEVICE_KHR);
+        properties.push_back(
+            reinterpret_cast<cl_context_properties>(d3d11_device));
+    }
+    properties.push_back(0);
+    cl_context context = create_context(properties.data(), 1, &device, nullptr,
+                                        nullptr, &error);
     std::printf("clCreateContext result=%p error=%d\n", context, error);
     if (!context || error != CL_SUCCESS) {
-        return 9;
+        if (d3d11_device_context != nullptr) {
+            d3d11_device_context->Release();
+        }
+        if (d3d11_device != nullptr) {
+            d3d11_device->Release();
+        }
+        return 10;
     }
     cl_command_queue queue = create_queue(context, device, 0, &error);
     if (!queue || error != CL_SUCCESS) {
         std::fprintf(stderr, "clCreateCommandQueue failed: %d\n", error);
-        return 10;
+        return 11;
     }
 
     cl_mem image = create_from_gl_texture(context, CL_MEM_READ_WRITE,
                                           GL_TEXTURE_2D, 0, texture, &error);
     std::printf("clCreateFromGLTexture result=%p error=%d\n", image, error);
     if (!image || error != CL_SUCCESS) {
-        return 11;
+        return 12;
     }
 
     error = acquire_gl(queue, 1, &image, 0, nullptr, nullptr);
     std::printf("clEnqueueAcquireGLObjects error=%d\n", error);
     if (error != CL_SUCCESS) {
-        return 12;
+        return 13;
     }
     const size_t origin[3] = {0, 0, 0};
     const size_t region[3] = {width, height, 1};
@@ -210,7 +245,7 @@ int main(int argc, char** argv) {
     std::printf("clEnqueueReadImage error=%d match=%d\n", error,
                 readback == pixels);
     if (error != CL_SUCCESS || readback != pixels) {
-        return 13;
+        return 14;
     }
     error = release_gl(queue, 1, &image, 0, nullptr, nullptr);
     if (error == CL_SUCCESS) {
@@ -221,6 +256,12 @@ int main(int argc, char** argv) {
     release_mem(image);
     release_queue(queue);
     release_context(context);
+    if (d3d11_device_context != nullptr) {
+        d3d11_device_context->Release();
+    }
+    if (d3d11_device != nullptr) {
+        d3d11_device->Release();
+    }
     glDeleteTextures(1, &texture);
     wglMakeCurrent(nullptr, nullptr);
     wglDeleteContext(gl);
@@ -228,5 +269,5 @@ int main(int argc, char** argv) {
     DestroyWindow(window);
     UnregisterClassW(window_class.lpszClassName, instance);
     FreeLibrary(opencl);
-    return error == CL_SUCCESS ? 0 : 14;
+    return error == CL_SUCCESS ? 0 : 15;
 }
