@@ -1,0 +1,146 @@
+diff --git a/lib/SPIRVProducerPass.cpp b/lib/SPIRVProducerPass.cpp
+index b0bc34b..d28b99c 100644
+--- a/lib/SPIRVProducerPass.cpp
++++ b/lib/SPIRVProducerPass.cpp
+@@ -2409,10 +2409,21 @@ SPIRVID SPIRVProducerPassImpl::getSPIRVConstant(Constant *C, Type *TyHint) {
+     Cst = UndefValue::get(Cst->getType());
+   }
+ 
+-  auto VI = VMap.find(Cst);
+-  if (VI != VMap.end()) {
+-    assert(VI->second.isValid());
+-    return VI->second;
++  // An opaque pointer undef carries no pointee type, and UndefValue::get()
++  // returns one value shared by the whole module, so unrelated uses needing
++  // different pointee types all name it. Caching its id by LLVM Value alone
++  // therefore leaks the first use's SPIR-V pointer type into every later use,
++  // producing an OpPhi whose incoming value disagrees with its result type.
++  // Emit pointer undefs per use instead. PoisonValue is a subclass of
++  // UndefValue, and poison was already folded to undef above.
++  const bool pointer_undef =
++      Cst->getType()->isPointerTy() && isa<UndefValue>(Cst);
++  if (!pointer_undef) {
++    auto VI = VMap.find(Cst);
++    if (VI != VMap.end()) {
++      assert(VI->second.isValid());
++      return VI->second;
++    }
+   }
+ 
+   SPIRVID RID;
+@@ -2425,8 +2436,15 @@ SPIRVID SPIRVProducerPassImpl::getSPIRVConstant(Constant *C, Type *TyHint) {
+   SPIRVOperandVec Ops;
+ 
+   if (Cst->getType()->isPointerTy()) {
+-    auto *inferred_ty =
+-        clspv::InferType(Cst, Cst->getContext(), &InferredTypeCache, TyHint);
++    // For a pointer undef the use site is the only sound evidence: InferType
++    // would walk the shared value's users, mixing in unrelated uses, and would
++    // then cache that answer against the shared value for every later query.
++    // Other pointer constants keep the existing inference, which already falls
++    // back to the hint.
++    auto *inferred_ty = (pointer_undef && TyHint)
++                            ? TyHint
++                            : clspv::InferType(Cst, Cst->getContext(),
++                                               &InferredTypeCache, TyHint);
+     Ops << getSPIRVPointerType(Cst->getType(), inferred_ty);
+   } else {
+     Ops << Cst->getType();
+@@ -2601,16 +2619,23 @@ SPIRVID SPIRVProducerPassImpl::getSPIRVConstant(Constant *C, Type *TyHint) {
+     RID = addSPIRVInst<kConstants>(Opcode, Ops);
+   }
+ 
+-  VMap[Cst] = RID;
++  if (!pointer_undef) {
++    VMap[Cst] = RID;
++  }
+ 
+   return RID;
+ }
+ 
+ SPIRVID SPIRVProducerPassImpl::getSPIRVValue(Value *V, Type *TyHint) {
+-  auto II = ValueMap.find(V);
+-  if (II != ValueMap.end()) {
+-    assert(II->second.isValid());
+-    return II->second;
++  // Pointer undefs are emitted per use rather than cached by Value identity;
++  // see getSPIRVConstant. PoisonValue is a subclass of UndefValue.
++  const bool pointer_undef = V->getType()->isPointerTy() && isa<UndefValue>(V);
++  if (!pointer_undef) {
++    auto II = ValueMap.find(V);
++    if (II != ValueMap.end()) {
++      assert(II->second.isValid());
++      return II->second;
++    }
+   }
+   if (Constant *Cst = dyn_cast<Constant>(V)) {
+     return getSPIRVConstant(Cst, TyHint);
+diff --git a/test/SPIRVProducer/opaque_pointer_undef_types.ll b/test/SPIRVProducer/opaque_pointer_undef_types.ll
+new file mode 100644
+index 0000000..df836eb
+--- /dev/null
++++ b/test/SPIRVProducer/opaque_pointer_undef_types.ll
+@@ -0,0 +1,63 @@
++; RUN: clspv-opt %s -o %t.ll --passes=spirv-producer -producer-out-file %t.spv
++; RUN: spirv-dis %t.spv -o %t.spvasm
++; RUN: FileCheck %s < %t.spvasm
++; RUN: spirv-val %t.spv
++
++; One LLVM opaque-pointer UndefValue is shared by both kernels. The producer
++; must nevertheless emit it once with an i16 pointer type and once with an i32
++; pointer type, as inferred from each phi's non-undef incoming value.
++;
++; CHECK-DAG: [[short:%[a-zA-Z0-9_]+]] = OpTypeInt 16 0
++; CHECK-DAG: [[uint:%[a-zA-Z0-9_]+]] = OpTypeInt 32 0
++; CHECK-DAG: [[short_ptr:%[a-zA-Z0-9_]+]] = OpTypePointer StorageBuffer [[short]]
++; CHECK-DAG: [[uint_ptr:%[a-zA-Z0-9_]+]] = OpTypePointer StorageBuffer [[uint]]
++; CHECK-DAG: [[short_undef:%[a-zA-Z0-9_]+]] = OpUndef [[short_ptr]]
++; CHECK-DAG: [[uint_undef:%[a-zA-Z0-9_]+]] = OpUndef [[uint_ptr]]
++; CHECK: OpPhi [[short_ptr]] {{.*}} [[short_undef]]
++; CHECK: OpPhi [[uint_ptr]] {{.*}} [[uint_undef]]
++
++target datalayout = "e-p:32:32-i64:64-v16:16-v24:32-v32:32-v48:64-v96:128-v192:256-v256:256-v512:512-v1024:1024"
++target triple = "spirv32-unknown-vulkan"
++
++define spir_kernel void @short_kernel(ptr addrspace(1) %unused) {
++entry:
++  %res = call ptr addrspace(1) @_Z14clspv.resource.0(i32 0, i32 0, i32 0, i32 0, i32 0, i32 0, { [0 x i16] } zeroinitializer)
++  %gep = getelementptr { [0 x i16] }, ptr addrspace(1) %res, i32 0, i32 0, i32 0
++  br label %merge
++
++merge:
++  %phi = phi ptr addrspace(1) [ %gep, %entry ], [ undef, %next ]
++  %n = phi i32 [ 0, %entry ], [ 1, %next ]
++  %value = load i16, ptr addrspace(1) %phi, align 2
++  %cmp = icmp eq i32 %n, 0
++  br i1 %cmp, label %next, label %exit
++
++next:
++  br label %merge
++
++exit:
++  ret void
++}
++
++define spir_kernel void @uint_kernel(ptr addrspace(1) %unused) {
++entry:
++  %res = call ptr addrspace(1) @_Z14clspv.resource.1(i32 0, i32 1, i32 0, i32 0, i32 1, i32 0, { [0 x i32] } zeroinitializer)
++  %gep = getelementptr { [0 x i32] }, ptr addrspace(1) %res, i32 0, i32 0, i32 0
++  br label %merge
++
++merge:
++  %phi = phi ptr addrspace(1) [ %gep, %entry ], [ undef, %next ]
++  %n = phi i32 [ 0, %entry ], [ 1, %next ]
++  %value = load i32, ptr addrspace(1) %phi, align 4
++  %cmp = icmp eq i32 %n, 0
++  br i1 %cmp, label %next, label %exit
++
++next:
++  br label %merge
++
++exit:
++  ret void
++}
++
++declare ptr addrspace(1) @_Z14clspv.resource.0(i32, i32, i32, i32, i32, i32, { [0 x i16] })
++declare ptr addrspace(1) @_Z14clspv.resource.1(i32, i32, i32, i32, i32, i32, { [0 x i32] })
