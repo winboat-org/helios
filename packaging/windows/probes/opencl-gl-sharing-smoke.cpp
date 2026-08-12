@@ -193,6 +193,22 @@ int main(int argc, char** argv) {
                     static_cast<unsigned int>(feature_level));
     }
 
+    auto cleanup_graphics = [&] {
+        if (d3d11_device_context != nullptr) {
+            d3d11_device_context->Release();
+        }
+        if (d3d11_device != nullptr) {
+            d3d11_device->Release();
+        }
+        glDeleteTextures(1, &texture);
+        wglMakeCurrent(nullptr, nullptr);
+        wglDeleteContext(gl);
+        ReleaseDC(window, dc);
+        DestroyWindow(window);
+        UnregisterClassW(window_class.lpszClassName, instance);
+        FreeLibrary(opencl);
+    };
+
     std::vector<cl_context_properties> properties = {
         CL_CONTEXT_PLATFORM,
         reinterpret_cast<cl_context_properties>(platform),
@@ -210,13 +226,19 @@ int main(int argc, char** argv) {
     cl_context context = create_context(properties.data(), 1, &device, nullptr,
                                         nullptr, &error);
     std::printf("clCreateContext result=%p error=%d\n", context, error);
+    if (d3d11_context_case) {
+        const bool correctly_rejected =
+            context == nullptr && error == CL_INVALID_OPERATION;
+        std::printf("mixed D3D11/OpenGL context rejected=%d\n",
+                    correctly_rejected);
+        if (context != nullptr) {
+            release_context(context);
+        }
+        cleanup_graphics();
+        return correctly_rejected ? 0 : 10;
+    }
     if (!context || error != CL_SUCCESS) {
-        if (d3d11_device_context != nullptr) {
-            d3d11_device_context->Release();
-        }
-        if (d3d11_device != nullptr) {
-            d3d11_device->Release();
-        }
+        cleanup_graphics();
         return 10;
     }
     cl_command_queue queue = create_queue(context, device, 0, &error);
@@ -256,18 +278,6 @@ int main(int argc, char** argv) {
     release_mem(image);
     release_queue(queue);
     release_context(context);
-    if (d3d11_device_context != nullptr) {
-        d3d11_device_context->Release();
-    }
-    if (d3d11_device != nullptr) {
-        d3d11_device->Release();
-    }
-    glDeleteTextures(1, &texture);
-    wglMakeCurrent(nullptr, nullptr);
-    wglDeleteContext(gl);
-    ReleaseDC(window, dc);
-    DestroyWindow(window);
-    UnregisterClassW(window_class.lpszClassName, instance);
-    FreeLibrary(opencl);
+    cleanup_graphics();
     return error == CL_SUCCESS ? 0 : 15;
 }

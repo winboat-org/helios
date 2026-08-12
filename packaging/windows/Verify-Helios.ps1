@@ -75,7 +75,12 @@ if ($RunSmokeTests) {
         [ordered]@{ name = "OpenGL"; exe = "opengl-smoke.exe"; arguments = @() },
         [ordered]@{ name = "OpenCL"; exe = "opencl-smoke.exe"; arguments = @() },
         [ordered]@{
-            name = "OpenGL/OpenCL sharing with a D3D11 context"
+            name = "OpenGL/OpenCL sharing"
+            exe = "opencl-gl-sharing-smoke.exe"
+            arguments = @("rgba16f")
+        },
+        [ordered]@{
+            name = "Mixed OpenGL/D3D11 context rejection"
             exe = "opencl-gl-sharing-smoke.exe"
             arguments = @("rgba16f", "d3d11-context")
         }
