@@ -10,6 +10,11 @@ $ErrorActionPreference = "Stop"
 Assert-HeliosAdministrator
 $stateRoot = Join-Path $env:ProgramData "Helios"
 $statePath = Join-Path $stateRoot "install-state.json"
+$resolveCompatibilityState = Join-Path $stateRoot "compatibility\DaVinci Resolve\install-state.json"
+if (Test-Path -LiteralPath $resolveCompatibilityState -PathType Leaf) {
+    Write-Warning "DaVinci Resolve compatibility remains installed and has an independent rollback state."
+    Write-Warning "Close Resolve and run 'C:\ProgramData\Helios\compatibility\DaVinci Resolve\Uninstall-Resolve-Compatibility.ps1' to remove it."
+}
 Unregister-ScheduledTask -TaskName "HeliosGraphicsProvisioning" -Confirm:$false -ErrorAction SilentlyContinue
 if (-not (Test-Path -LiteralPath $statePath -PathType Leaf)) {
     throw "No package-managed Helios installation was found at $statePath."

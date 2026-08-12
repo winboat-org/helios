@@ -9,7 +9,7 @@ compute stack:
 - OpenCL through CLVK with its clspv compiler embedded
 - official Khronos Vulkan and OpenCL loaders when Windows has no loader yet
 - the Microsoft Visual C++ x64 runtime required by the WDDM/DXVK UMD
-- an optional, app-local DaVinci Resolve GPU-detection shim
+- optional, app-local DaVinci Resolve GPU-detection and OpenCL compatibility shims
 
 ## Install
 
@@ -64,14 +64,18 @@ verifies texture import, acquire, pixel readback, release, and queue finish.
 ## DaVinci Resolve compatibility
 
 Resolve's Windows GPU detector requires a vendor-specific enumeration path and
-does not admit a generic DXGI/OpenCL adapter by itself. If Resolve reports
-`Unsupported GPU Processing Mode`, copy
-`compatibility\DaVinci Resolve\atiadlxx.dll` beside `Resolve.exe` (normally in
-`C:\Program Files\Blackmagic Design\DaVinci Resolve`), then relaunch Resolve.
+does not admit a generic DXGI/OpenCL adapter by itself. Resolve 21.0.4 also asks
+OpenCL for a nonstandard context combining WGL and D3D11 sharing. CLVK correctly
+rejects that request; the app-local proxy narrows only that observed request to
+the working WGL-sharing path.
 
-The DLL is an app-local detection shim and is never installed automatically.
-Do not place it in a Windows system directory. Remove the copied DLL to undo
-the workaround. See its adjacent README for implementation details and scope.
+Close Resolve and run the compatibility directory's
+`Install-Resolve-Compatibility.ps1` from an elevated PowerShell. Then launch
+with the installed `Launch Resolve (Helios).cmd`. The compatibility installer
+is explicit and separate from the system-stack installer. It backs up and
+hash-tracks every target, supports verified upgrades, and includes a saved
+uninstaller that restores the pre-Helios files. See the adjacent README for
+the exact command, implementation scope, and rollback behavior.
 
 Uninstall with:
 
