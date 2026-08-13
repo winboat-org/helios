@@ -1,11 +1,13 @@
-# Helios Windows x64 bundle
+# Helios Windows x64 bundle with WoW64 OpenGL/Vulkan
 
-This archive installs the Helios WDDM driver and its x64 user-mode graphics and
-compute stack:
+This archive installs the Helios WDDM driver, its x64 user-mode graphics and
+compute stack, and the 32-bit Vulkan/OpenGL components needed by WoW64 games:
 
 - Direct3D 11 through the DXVK core embedded in `helios_umd.dll`
 - Vulkan through Mesa Venus (`vulkan_virtio.dll`)
 - desktop OpenGL through Mesa Zink's Microsoft WGL ICD
+- 32-bit Vulkan through a separately built x86 Mesa Venus ICD
+- 32-bit desktop OpenGL through a separately built x86 Zink WGL ICD
 - OpenCL through CLVK with its clspv compiler embedded
 - official Khronos Vulkan and OpenCL loaders when Windows has no loader yet
 - the Microsoft Visual C++ x64 runtime required by the WDDM/DXVK UMD
@@ -90,8 +92,10 @@ The shared Microsoft Visual C++ runtime is also left installed.
 
 ## Current limits
 
-- This package is x64-only. Native 32-bit applications need separately built
-  x86 UMD, Mesa, CLVK, and loader binaries.
+- Native 32-bit Vulkan and OpenGL applications are supported through the x86
+  Vulkan loader, Mesa Venus ICD, and Zink WGL ICD included in the bundle.
+  Native 32-bit Direct3D and OpenCL applications remain unsupported; the DXVK
+  WDDM UMD and CLVK runtime are still x64-only.
 - The QEMU Helios/Venus protocol changes quickly. Build the host QEMU/render
   side from a compatible source revision recorded in `manifest.json`.
 - CI uses an ephemeral public test certificate whose private key is destroyed

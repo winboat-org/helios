@@ -3,14 +3,16 @@ param(
     [Parameter(Mandatory)][string]$OutputDir,
     [Parameter(Mandatory)][string]$VulkanInclude,
     [Parameter(Mandatory)][string]$VulkanLibrary,
-    [Parameter(Mandatory)][string]$OpenClInclude,
-    [Parameter(Mandatory)][string]$OpenClLibrary
+    [string]$OpenClInclude,
+    [string]$OpenClLibrary,
+    [ValidateSet("x64", "x86")][string]$Architecture = "x64",
+    [switch]$GraphicsOnly
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 . (Join-Path $PSScriptRoot "Initialize-HeliosBuild.ps1")
-Import-VisualStudioEnvironment
+Import-VisualStudioEnvironment -Architecture $Architecture
 Assert-Command "cl.exe" | Out-Null
 New-Item -ItemType Directory -Force -Path $OutputDir | Out-Null
 $source = Join-Path $RepoRoot "packaging\windows\probes"
@@ -23,10 +25,14 @@ if ($LASTEXITCODE -ne 0) { throw "Vulkan smoke probe compilation failed." }
     "/Fe:$(Join-Path $OutputDir 'vulkan-wsi-probe.exe')" `
     /link $VulkanLibrary user32.lib gdi32.lib
 if ($LASTEXITCODE -ne 0) { throw "Vulkan WSI probe compilation failed." }
-& cl.exe /nologo /O2 /W4 /MT /EHsc (Join-Path $source "d3d11-smoke.cpp") "/Fe:$(Join-Path $OutputDir 'd3d11-smoke.exe')" /link d3d11.lib dxgi.lib
-if ($LASTEXITCODE -ne 0) { throw "D3D11 smoke probe compilation failed." }
 & cl.exe /nologo /O2 /W4 /MT (Join-Path $source "opengl-smoke.c") "/Fe:$(Join-Path $OutputDir 'opengl-smoke.exe')" /link opengl32.lib gdi32.lib user32.lib
 if ($LASTEXITCODE -ne 0) { throw "OpenGL smoke probe compilation failed." }
+if ($GraphicsOnly) { return }
+if (-not $OpenClInclude -or -not $OpenClLibrary) {
+    throw "OpenCL include and library paths are required for the full smoke-probe set."
+}
+& cl.exe /nologo /O2 /W4 /MT /EHsc (Join-Path $source "d3d11-smoke.cpp") "/Fe:$(Join-Path $OutputDir 'd3d11-smoke.exe')" /link d3d11.lib dxgi.lib
+if ($LASTEXITCODE -ne 0) { throw "D3D11 smoke probe compilation failed." }
 & cl.exe /nologo /O2 /W4 /MT (Join-Path $source "opencl-smoke.c") "/I$OpenClInclude" "/Fe:$(Join-Path $OutputDir 'opencl-smoke.exe')" /link $OpenClLibrary
 if ($LASTEXITCODE -ne 0) { throw "OpenCL smoke probe compilation failed." }
 & cl.exe /nologo /O2 /W4 /MT /EHsc `

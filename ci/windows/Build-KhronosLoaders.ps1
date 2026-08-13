@@ -60,6 +60,20 @@ if ($LASTEXITCODE -ne 0) { throw "Vulkan-Loader build failed." }
 & cmake.exe --install $vkLoaderBuild --config Release
 if ($LASTEXITCODE -ne 0) { throw "Vulkan-Loader install failed." }
 
+$vkLoaderX86Build = Join-Path $BuildRoot "vk-loader-x86"
+$vkLoaderX86Install = Join-Path $BuildRoot "vk-loader-x86-install"
+& cmake.exe -S $vkLoaderSource -B $vkLoaderX86Build -A Win32 `
+    "-DCMAKE_INSTALL_PREFIX=$vkLoaderX86Install" `
+    -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded `
+    "-DVULKAN_HEADERS_INSTALL_DIR=$vkHeadersInstall" `
+    -DBUILD_TESTS=OFF `
+    -DBUILD_WERROR=OFF
+if ($LASTEXITCODE -ne 0) { throw "x86 Vulkan-Loader configure failed." }
+& cmake.exe --build $vkLoaderX86Build --config Release --parallel
+if ($LASTEXITCODE -ne 0) { throw "x86 Vulkan-Loader build failed." }
+& cmake.exe --install $vkLoaderX86Build --config Release
+if ($LASTEXITCODE -ne 0) { throw "x86 Vulkan-Loader install failed." }
+
 $openClBuild = Join-Path $BuildRoot "opencl-loader"
 $openClInstall = Join-Path $BuildRoot "opencl-loader-install"
 & cmake.exe -S $openClLoaderSource -B $openClBuild -A x64 `
@@ -76,15 +90,20 @@ if ($LASTEXITCODE -ne 0) { throw "OpenCL ICD Loader build failed." }
 if ($LASTEXITCODE -ne 0) { throw "OpenCL ICD Loader install failed." }
 
 $vulkanDll = Get-ChildItem -LiteralPath @($vkLoaderInstall, $vkLoaderBuild) -Filter "vulkan-1.dll" -File -Recurse | Select-Object -First 1
+$vulkanX86Dll = Get-ChildItem -LiteralPath @($vkLoaderX86Install, $vkLoaderX86Build) -Filter "vulkan-1.dll" -File -Recurse | Select-Object -First 1
 $openClDll = Get-ChildItem -LiteralPath @($openClInstall, $openClBuild) -Filter "OpenCL.dll" -File -Recurse | Select-Object -First 1
 if (-not $vulkanDll) { throw "Installed Vulkan loader DLL was not found." }
+if (-not $vulkanX86Dll) { throw "Installed x86 Vulkan loader DLL was not found." }
 if (-not $openClDll) { throw "Installed OpenCL loader DLL was not found." }
 Copy-Item -LiteralPath $vulkanDll.FullName -Destination (Join-Path $OutputDir "vulkan-1.dll") -Force
+New-Item -ItemType Directory -Force -Path (Join-Path $OutputDir "x86") | Out-Null
+Copy-Item -LiteralPath $vulkanX86Dll.FullName -Destination (Join-Path $OutputDir "x86\vulkan-1.dll") -Force
 Copy-Item -LiteralPath $openClDll.FullName -Destination (Join-Path $OutputDir "OpenCL.dll") -Force
 
 $vulkanLibrary = Get-ChildItem -LiteralPath @($vkLoaderInstall, $vkLoaderBuild) -Filter "vulkan-1.lib" -File -Recurse | Select-Object -First 1
+$vulkanX86Library = Get-ChildItem -LiteralPath @($vkLoaderX86Install, $vkLoaderX86Build) -Filter "vulkan-1.lib" -File -Recurse | Select-Object -First 1
 $openClLibrary = Get-ChildItem -LiteralPath @($openClInstall, $openClBuild) -Filter "OpenCL.lib" -File -Recurse | Select-Object -First 1
-if (-not $vulkanLibrary -or -not $openClLibrary) { throw "A loader import library required by the smoke probes was not found." }
+if (-not $vulkanLibrary -or -not $vulkanX86Library -or -not $openClLibrary) { throw "A loader import library required by the smoke probes was not found." }
 & (Join-Path $RepoRoot "ci\windows\Build-SmokeTests.ps1") `
     -RepoRoot $RepoRoot `
     -OutputDir (Join-Path $OutputDir "smoke") `
@@ -93,6 +112,14 @@ if (-not $vulkanLibrary -or -not $openClLibrary) { throw "A loader import librar
     -OpenClInclude $openClHeadersSource `
     -OpenClLibrary $openClLibrary.FullName
 if ($LASTEXITCODE -ne 0) { throw "Smoke probe build failed." }
+& (Join-Path $RepoRoot "ci\windows\Build-SmokeTests.ps1") `
+    -RepoRoot $RepoRoot `
+    -OutputDir (Join-Path $OutputDir "smoke\x86") `
+    -VulkanInclude (Join-Path $vkHeadersInstall "include") `
+    -VulkanLibrary $vulkanX86Library.FullName `
+    -Architecture x86 `
+    -GraphicsOnly
+if ($LASTEXITCODE -ne 0) { throw "x86 graphics smoke-probe build failed." }
 
 $pins = [ordered]@{
     vulkanLoader = $VulkanLoaderCommit

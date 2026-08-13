@@ -164,14 +164,20 @@ if ($activeInfBeforeInstall -and (Test-HeliosViogpudoDriver $activeInfBeforeInst
 
 $classKey = ""
 $vulkanRegistry = "HKLM:\SOFTWARE\Khronos\Vulkan\Drivers"
+$vulkanRegistryX86 = "HKLM:\SOFTWARE\WOW6432Node\Khronos\Vulkan\Drivers"
 $openClRegistry = "HKLM:\SOFTWARE\Khronos\OpenCL\Vendors"
 $vulkanManifestPath = Join-Path $runtimeRoot "mesa\helios_vulkan.json"
+$vulkanManifestX86Path = Join-Path $runtimeRoot "mesa\x86\helios_vulkan.json"
 $clvkPath = Join-Path $runtimeRoot "opencl\clvk.dll"
 $wglPath = Join-Path $runtimeRoot "mesa\libgallium_wgl.dll"
+$wglX86Path = Join-Path $runtimeRoot "mesa\x86\libgallium_wgl.dll"
 $previousOpenGL = [ordered]@{
     OpenGLDriverName = [ordered]@{ exists = $false; kind = $null; value = $null }
     OpenGLVersion = [ordered]@{ exists = $false; kind = $null; value = $null }
     OpenGLFlags = [ordered]@{ exists = $false; kind = $null; value = $null }
+    OpenGLDriverNameWow = [ordered]@{ exists = $false; kind = $null; value = $null }
+    OpenGLVersionWow = [ordered]@{ exists = $false; kind = $null; value = $null }
+    OpenGLFlagsWow = [ordered]@{ exists = $false; kind = $null; value = $null }
 }
 
 $state = [ordered]@{
@@ -185,10 +191,13 @@ $state = [ordered]@{
     activeInf = ""
     signingCertificateThumbprint = ""
     vulkanManifest = $vulkanManifestPath
+    vulkanManifestX86 = $vulkanManifestX86Path
     openClVendor = $clvkPath
     installedVulkanLoader = $false
+    installedVulkanLoaderX86 = $false
     installedOpenClLoader = $false
     systemVulkanLoaderHash = ""
+    systemVulkanLoaderX86Hash = ""
     systemOpenClLoaderHash = ""
     previousOpenGL = $previousOpenGL
     replacedViogpudo = $replacedViogpudo
@@ -284,6 +293,12 @@ if (-not (Test-Path -LiteralPath $systemVulkanLoader -PathType Leaf)) {
     $state.installedVulkanLoader = $true
     $state.systemVulkanLoaderHash = Get-HeliosSha256 $systemVulkanLoader
 }
+$systemVulkanLoaderX86 = Join-Path $env:windir "SysWOW64\vulkan-1.dll"
+if (-not (Test-Path -LiteralPath $systemVulkanLoaderX86 -PathType Leaf)) {
+    Copy-Item -LiteralPath (Join-Path $runtimeRoot "loaders\x86\vulkan-1.dll") -Destination $systemVulkanLoaderX86 -Force
+    $state.installedVulkanLoaderX86 = $true
+    $state.systemVulkanLoaderX86Hash = Get-HeliosSha256 $systemVulkanLoaderX86
+}
 $systemOpenClLoader = Join-Path $env:windir "System32\OpenCL.dll"
 if (-not (Test-Path -LiteralPath $systemOpenClLoader -PathType Leaf)) {
     Copy-Item -LiteralPath (Join-Path $runtimeRoot "loaders\OpenCL.dll") -Destination $systemOpenClLoader -Force
@@ -312,6 +327,9 @@ $state.previousOpenGL = [ordered]@{
     OpenGLDriverName = Get-HeliosRegistrySnapshot $classKey "OpenGLDriverName"
     OpenGLVersion = Get-HeliosRegistrySnapshot $classKey "OpenGLVersion"
     OpenGLFlags = Get-HeliosRegistrySnapshot $classKey "OpenGLFlags"
+    OpenGLDriverNameWow = Get-HeliosRegistrySnapshot $classKey "OpenGLDriverNameWow"
+    OpenGLVersionWow = Get-HeliosRegistrySnapshot $classKey "OpenGLVersionWow"
+    OpenGLFlagsWow = Get-HeliosRegistrySnapshot $classKey "OpenGLFlagsWow"
 }
 $state.activeInf = $activeInf
 Write-HeliosJson $state $statePath
@@ -329,9 +347,25 @@ Write-HeliosJson $vulkanJson $vulkanManifestPath -Encoding ASCII
 New-Item -Path $vulkanRegistry -Force | Out-Null
 New-ItemProperty -LiteralPath $vulkanRegistry -Name $vulkanManifestPath -Value 0 -PropertyType DWord -Force | Out-Null
 
+$vulkanX86Dll = Join-Path $runtimeRoot "mesa\x86\vulkan_virtio.dll"
+$vulkanX86Json = [ordered]@{
+    file_format_version = "1.0.1"
+    ICD = [ordered]@{
+        library_path = ($vulkanX86Dll -replace "\\", "/")
+        library_arch = "32"
+        api_version = [string]$manifest.components.mesa.vulkanApiVersion
+    }
+}
+Write-HeliosJson $vulkanX86Json $vulkanManifestX86Path -Encoding ASCII
+New-Item -Path $vulkanRegistryX86 -Force | Out-Null
+New-ItemProperty -LiteralPath $vulkanRegistryX86 -Name $vulkanManifestX86Path -Value 0 -PropertyType DWord -Force | Out-Null
+
 New-ItemProperty -LiteralPath $classKey -Name "OpenGLDriverName" -Value $wglPath -PropertyType String -Force | Out-Null
 New-ItemProperty -LiteralPath $classKey -Name "OpenGLVersion" -Value 2 -PropertyType DWord -Force | Out-Null
 New-ItemProperty -LiteralPath $classKey -Name "OpenGLFlags" -Value 1 -PropertyType DWord -Force | Out-Null
+New-ItemProperty -LiteralPath $classKey -Name "OpenGLDriverNameWow" -Value $wglX86Path -PropertyType String -Force | Out-Null
+New-ItemProperty -LiteralPath $classKey -Name "OpenGLVersionWow" -Value 2 -PropertyType DWord -Force | Out-Null
+New-ItemProperty -LiteralPath $classKey -Name "OpenGLFlagsWow" -Value 1 -PropertyType DWord -Force | Out-Null
 
 New-Item -Path $openClRegistry -Force | Out-Null
 New-ItemProperty -LiteralPath $openClRegistry -Name $clvkPath -Value 0 -PropertyType DWord -Force | Out-Null
@@ -342,7 +376,7 @@ Copy-Item -LiteralPath (Join-Path $bundleRoot "Verify-Helios.ps1") -Destination 
 Write-HeliosJson $state $statePath
 
 Write-Host ""
-Write-Host "Helios $($manifest.version) is installed system-wide for x64 applications."
+Write-Host "Helios $($manifest.version) is installed system-wide with x64 and WoW64 OpenGL/Vulkan support."
 if ($RunSmokeTests) {
     & (Join-Path $stateRoot "Verify-Helios.ps1") -RunSmokeTests
 } else {

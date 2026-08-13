@@ -2,6 +2,7 @@ param(
     [Parameter(Mandatory)][string]$RepoRoot,
     [Parameter(Mandatory)][string]$DriverArtifact,
     [Parameter(Mandatory)][string]$MesaArtifact,
+    [Parameter(Mandatory)][string]$MesaX86Artifact,
     [Parameter(Mandatory)][string]$OpenClArtifact,
     [Parameter(Mandatory)][string]$LoadersArtifact,
     [Parameter(Mandatory)][string]$CompatibilityArtifact,
@@ -63,6 +64,14 @@ foreach ($dependency in Get-ChildItem -LiteralPath $MesaArtifact -Filter "lib*.d
     if ($dependency.Name -eq "libgallium_wgl.dll") { continue }
     Copy-Required $dependency.FullName (Join-Path $mesaOut $dependency.Name)
 }
+$mesaX86Out = Join-Path $mesaOut "x86"
+foreach ($name in @("vulkan_virtio.dll", "libgallium_wgl.dll")) {
+    Copy-Required (Join-Path $MesaX86Artifact $name) (Join-Path $mesaX86Out $name)
+}
+foreach ($dependency in Get-ChildItem -LiteralPath $MesaX86Artifact -Filter "lib*.dll" -File) {
+    if ($dependency.Name -eq "libgallium_wgl.dll") { continue }
+    Copy-Required $dependency.FullName (Join-Path $mesaX86Out $dependency.Name)
+}
 
 $openClOut = Join-Path $payload "opencl"
 Copy-Required (Join-Path $OpenClArtifact "clvk.dll") (Join-Path $openClOut "clvk.dll")
@@ -72,6 +81,7 @@ if (Test-Path -LiteralPath $clvkPdb -PathType Leaf) { Copy-Required $clvkPdb (Jo
 $loadersOut = Join-Path $payload "loaders"
 Copy-Required (Join-Path $LoadersArtifact "vulkan-1.dll") (Join-Path $loadersOut "vulkan-1.dll")
 Copy-Required (Join-Path $LoadersArtifact "OpenCL.dll") (Join-Path $loadersOut "OpenCL.dll")
+Copy-Required (Join-Path $LoadersArtifact "x86\vulkan-1.dll") (Join-Path $loadersOut "x86\vulkan-1.dll")
 foreach ($probe in @(
     "vulkan-smoke.exe",
     "vulkan-wsi-probe.exe",
@@ -81,6 +91,9 @@ foreach ($probe in @(
     "opencl-gl-sharing-smoke.exe"
 )) {
     Copy-Required (Join-Path $LoadersArtifact "smoke\$probe") (Join-Path $payload "smoke\$probe")
+}
+foreach ($probe in @("vulkan-smoke.exe", "vulkan-wsi-probe.exe", "opengl-smoke.exe")) {
+    Copy-Required (Join-Path $LoadersArtifact "smoke\x86\$probe") (Join-Path $payload "smoke\x86\$probe")
 }
 
 $resolveCompatibilityOut = Join-Path $stagingRoot "compatibility\DaVinci Resolve"
@@ -99,7 +112,7 @@ if (-not $redist) { throw "The Visual C++ x64 redistributable was not found belo
 Copy-Required $redist.FullName (Join-Path $payload "prerequisites\vc_redist.x64.exe")
 
 $licenseOut = Join-Path $stagingRoot "licenses"
-foreach ($artifact in @($DriverArtifact, $MesaArtifact, $OpenClArtifact, $LoadersArtifact, $CompatibilityArtifact)) {
+foreach ($artifact in @($DriverArtifact, $MesaArtifact, $MesaX86Artifact, $OpenClArtifact, $LoadersArtifact, $CompatibilityArtifact)) {
     $artifactLicenses = Join-Path $artifact "licenses"
     if (Test-Path -LiteralPath $artifactLicenses -PathType Container) {
         New-Item -ItemType Directory -Force -Path $licenseOut | Out-Null
@@ -140,11 +153,12 @@ try {
     $signable = @(
         (Join-Path $openClOut "clvk.dll"),
         (Join-Path $loadersOut "vulkan-1.dll"),
+        (Join-Path $loadersOut "x86\vulkan-1.dll"),
         (Join-Path $loadersOut "OpenCL.dll"),
         (Join-Path $resolveCompatibilityOut "atiadlxx.dll")
     )
-    $signable += @(Get-ChildItem -LiteralPath $mesaOut -Filter "*.dll" -File | ForEach-Object FullName)
-    $signable += @(Get-ChildItem -LiteralPath (Join-Path $payload "smoke") -Filter "*.exe" -File | ForEach-Object FullName)
+    $signable += @(Get-ChildItem -LiteralPath $mesaOut -Filter "*.dll" -File -Recurse | ForEach-Object FullName)
+    $signable += @(Get-ChildItem -LiteralPath (Join-Path $payload "smoke") -Filter "*.exe" -File -Recurse | ForEach-Object FullName)
     foreach ($file in $signable) { Invoke-SignTool $signTool $certificate.Thumbprint $file }
 } finally {
     Remove-Item -LiteralPath "Cert:\CurrentUser\My\$($certificate.Thumbprint)" -Force -ErrorAction SilentlyContinue
@@ -166,6 +180,7 @@ $manifest = [ordered]@{
     packageId = $packageId
     version = $Version
     architecture = "x64"
+    applicationArchitectures = @("x64", "x86")
     createdAtUtc = [DateTime]::UtcNow.ToString("o")
     source = [ordered]@{
         helios = $RepositoryCommit
@@ -185,7 +200,7 @@ $manifest = [ordered]@{
     }
     components = [ordered]@{
         driver = [ordered]@{ version = $Version; direct3D = "DXVK embedded WDDM UMD" }
-        mesa = [ordered]@{ vulkan = "Venus"; openGL = "Zink WGL ICD"; vulkanApiVersion = "1.4.352" }
+        mesa = [ordered]@{ vulkan = "Venus"; openGL = "Zink WGL ICD"; architectures = @("x64", "x86"); vulkanApiVersion = "1.4.352" }
         openCl = [ordered]@{ implementation = "CLVK"; onlineCompiler = $true }
         compatibility = [ordered]@{ davinciResolve = "App-local AMD ADL detection shim" }
     }
