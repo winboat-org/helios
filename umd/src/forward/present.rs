@@ -1916,14 +1916,24 @@ pub(crate) static PRESENT1_LOG_COUNT: LogThrottle = LogThrottle::new();
 pub(crate) static DXGI13_RESERVED_LOG_COUNT: LogThrottle = LogThrottle::new();
 pub(crate) const DXGI_MPO_MAX_PLANES: u32 = 16;
 
+/// Classify the value semantics DXGI Blt needs from the two resource formats.
+/// `None` keeps unknown/non-texture formats out of the custom image path;
+/// unequal known formats must be numerically converted, never copied as four
+/// opaque bytes merely because their Vulkan texel blocks have equal size.
+fn dxgi_blt_needs_conversion(src_format: u32, dst_format: u32) -> Option<bool> {
+    (src_format != 0 && dst_format != 0).then_some(src_format != dst_format)
+}
+
 pub(crate) unsafe extern "C" fn dxgi_blt(arg: *mut ddi::DXGI_DDI_ARG_BLT) -> i32 {
     if arg.is_null() {
         return 0;
     }
     let a = &*arg;
-    let Some(context) = d3d11_context(dxgi_device_handle(a.hDevice)) else {
+    let h = dxgi_device_handle(a.hDevice);
+    let Some(context) = d3d11_context(h) else {
         return 0;
     };
+
     let dst_h = dxgi_resource_handle(a.hDstResource);
     let src_h = dxgi_resource_handle(a.hSrcResource);
     let (Some(dst), Some(src)) = (load_resource(dst_h), load_resource(src_h)) else {
@@ -1934,6 +1944,8 @@ pub(crate) unsafe extern "C" fn dxgi_blt(arg: *mut ddi::DXGI_DDI_ARG_BLT) -> i32
         );
         return 0;
     };
+    let src_format = resource_dxgi_format(src_h).0 as u32;
+    let dst_format = resource_dxgi_format(dst_h).0 as u32;
 
     if let Some(n) = BLT_LOG_COUNT.first_n_then_every_from_one(128, 512) {
         let mut src_desc = D3D11_TEXTURE2D_DESC::default();
@@ -1967,9 +1979,49 @@ pub(crate) unsafe extern "C" fn dxgi_blt(arg: *mut ddi::DXGI_DDI_ARG_BLT) -> i32
         );
     }
 
-    // The DXGI 1.0 blit DDI has no source rectangle. For DWM/windowed present
-    // setup the runtime uses it to move between compatible proxy/front-buffer
-    // surfaces, so a full subresource copy is the safest baseline.
+    // DXGI Blt, unlike D3D11 CopySubresourceRegion, carries conversion
+    // semantics. The old unconditional copy was a raw bit transfer for
+    // equal-sized color formats: an R10G10B10A2 fullscreen backbuffer copied
+    // into an RGBA8 proxy retained its packed words and was later scanned out
+    // as ordinary bytes. Route every known cross-format pair through DXVK's
+    // explicit framebuffer conversion and fail closed if it cannot be queued.
+    if dxgi_blt_needs_conversion(src_format, dst_format) == Some(true) {
+        let Some(dev) = helios_device(h) else {
+            log_error!(
+                "DXGI Blt: cross-format conversion has no device src_fmt={} dst_fmt={}",
+                src_format,
+                dst_format
+            );
+            return E_FAIL;
+        };
+        let rc = dev.dxvk.dxgi_blt_convert(
+            DstRes(resource_com_raw(dst_h)),
+            a.DstSubresource,
+            a.DstLeft,
+            a.DstTop,
+            SrcRes(resource_com_raw(src_h)),
+            a.SrcSubresource,
+            false,
+            0,
+            0,
+            0,
+            0,
+        );
+        if rc != 0 {
+            log_error!(
+                "DXGI Blt: cross-format conversion refused rc={} src_fmt={} dst_fmt={}",
+                rc,
+                src_format,
+                dst_format
+            );
+            return DXGI_ERROR_UNSUPPORTED;
+        }
+        context.Flush();
+        return 0;
+    }
+
+    // The DXGI 1.0 blit DDI has no source rectangle. Same-format proxy/front
+    // buffers retain the regular full-subresource copy path.
     context.CopySubresourceRegion(
         &*dst,
         a.DstSubresource,
@@ -1989,7 +2041,8 @@ pub(crate) unsafe extern "C" fn dxgi_blt1(arg: *mut ddi::DXGI_DDI_ARG_BLT1) -> i
         return 0;
     }
     let a = &*arg;
-    let Some(context) = d3d11_context(dxgi_device_handle(a.hDevice)) else {
+    let h = dxgi_device_handle(a.hDevice);
+    let Some(context) = d3d11_context(h) else {
         return 0;
     };
     let dst_h = dxgi_resource_handle(a.hDstResource);
@@ -2004,14 +2057,8 @@ pub(crate) unsafe extern "C" fn dxgi_blt1(arg: *mut ddi::DXGI_DDI_ARG_BLT1) -> i
     };
 
     const BLT_RESOLVE: u32 = 0x1;
-    const BLT_CONVERT: u32 = 0x2;
     const BLT_STRETCH: u32 = 0x4;
     let flags = a.Flags.__bindgen_anon_1.Value;
-    if flags & BLT_CONVERT != 0 {
-        log_error!("DXGI Blt1: convert unsupported flags=0x{flags:x}");
-        return DXGI_ERROR_UNSUPPORTED;
-    }
-
     let src_w = a.SrcRight.saturating_sub(a.SrcLeft);
     let src_h_px = a.SrcBottom.saturating_sub(a.SrcTop);
     let dst_w = a.DstRight.saturating_sub(a.DstLeft);
@@ -2040,6 +2087,48 @@ pub(crate) unsafe extern "C" fn dxgi_blt1(arg: *mut ddi::DXGI_DDI_ARG_BLT1) -> i
         );
         return DXGI_ERROR_UNSUPPORTED;
     }
+
+    let src_format = resource_dxgi_format(src_h).0 as u32;
+    let dst_format = resource_dxgi_format(dst_h).0 as u32;
+    if dxgi_blt_needs_conversion(src_format, dst_format) == Some(true) {
+        let Some(dev) = helios_device(h) else {
+            log_error!(
+                "DXGI Blt1: cross-format conversion has no device src_fmt={} dst_fmt={}",
+                src_format,
+                dst_format
+            );
+            return E_FAIL;
+        };
+        let use_src_box = a.SrcRight > a.SrcLeft && a.SrcBottom > a.SrcTop;
+        let rc = dev.dxvk.dxgi_blt_convert(
+            DstRes(resource_com_raw(dst_h)),
+            a.DstSubresource,
+            a.DstLeft,
+            a.DstTop,
+            SrcRes(resource_com_raw(src_h)),
+            a.SrcSubresource,
+            use_src_box,
+            a.SrcLeft,
+            a.SrcTop,
+            a.SrcRight,
+            a.SrcBottom,
+        );
+        if rc != 0 {
+            log_error!(
+                "DXGI Blt1: cross-format conversion refused rc={} src_fmt={} dst_fmt={} flags=0x{:x}",
+                rc,
+                src_format,
+                dst_format,
+                flags
+            );
+            return DXGI_ERROR_UNSUPPORTED;
+        }
+        context.Flush();
+        return 0;
+    }
+
+    // BLT_CONVERT with identical formats is a semantic no-op; keeping it on
+    // the ordinary copy path avoids a render pass without changing values.
 
     let bx;
     let bx_ptr = if a.SrcRight > a.SrcLeft && a.SrcBottom > a.SrcTop {
@@ -2525,4 +2614,30 @@ pub(crate) unsafe extern "C" fn dxgi_check_present_duration_support(
         );
     }
     0
+}
+
+#[cfg(test)]
+mod dxgi_blt_format_tests {
+    use super::dxgi_blt_needs_conversion;
+
+    #[test]
+    fn rgb10_to_rgba8_is_a_numeric_conversion() {
+        assert_eq!(dxgi_blt_needs_conversion(24, 28), Some(true));
+    }
+
+    #[test]
+    fn rgba_and_bgra_are_not_bitwise_interchangeable() {
+        assert_eq!(dxgi_blt_needs_conversion(28, 87), Some(true));
+    }
+
+    #[test]
+    fn identical_formats_keep_the_copy_path() {
+        assert_eq!(dxgi_blt_needs_conversion(87, 87), Some(false));
+    }
+
+    #[test]
+    fn unknown_format_does_not_enter_the_image_converter() {
+        assert_eq!(dxgi_blt_needs_conversion(0, 87), None);
+        assert_eq!(dxgi_blt_needs_conversion(24, 0), None);
+    }
 }
