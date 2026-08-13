@@ -75,10 +75,10 @@ compiles/runs an OpenCL kernel. The OpenCL probe validates every output value.
 
 ## Application compatibility files
 
-The archive includes the separately deployed DaVinci Resolve shim at
+The archive includes the separately deployed DaVinci Resolve ADL shim at
 `compatibility\DaVinci Resolve\atiadlxx.dll`. It is not installed system-wide or
-copied by `Install-Helios.ps1`. Users who need it copy the DLL beside
-`Resolve.exe`; the adjacent README documents its scope and removal.
+copied by `Install-Helios.ps1`. The adjacent installer safely backs up and
+places the DLL beside `Resolve.exe`; no special launcher is required.
 
 ## Hosted runner requirements
 

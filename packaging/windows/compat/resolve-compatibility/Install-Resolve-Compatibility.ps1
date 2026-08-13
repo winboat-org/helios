@@ -48,10 +48,7 @@ if (-not (Test-Path -LiteralPath (Join-Path $ResolveDirectory "Resolve.exe") -Pa
 }
 
 $sources = [ordered]@{
-    "OpenCL_real.dll" = Join-Path $PSScriptRoot "OpenCL_real.dll"
-    "OpenCL.dll" = Join-Path $PSScriptRoot "OpenCL.dll"
     "atiadlxx.dll" = Join-Path $PSScriptRoot "atiadlxx.dll"
-    "Launch Resolve (Helios).cmd" = Join-Path $PSScriptRoot "Launch Resolve (Helios).cmd"
 }
 foreach ($source in $sources.Values) {
     if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
@@ -68,6 +65,11 @@ if (Test-Path -LiteralPath $statePath -PathType Leaf) {
     }
     if ($state.status -notin @("installed", "upgrading")) {
         throw "Compatibility state is '$($state.status)'. Run the saved uninstaller before retrying."
+    }
+    $obsoleteEntries = @(@($state.files) |
+        Where-Object { $_.name -notin $sources.Keys })
+    if ($obsoleteEntries.Count -ne 0) {
+        throw "An older Resolve compatibility package is installed. Run the saved uninstaller, then install this ADL-only package."
     }
     foreach ($name in $sources.Keys) {
         $entry = Find-StateEntry $state $name
@@ -116,8 +118,6 @@ if ((Test-Path -LiteralPath $StateDirectory -PathType Container) -and
 
 New-Item -ItemType Directory -Force -Path $StateDirectory | Out-Null
 $backupDirectory = Join-Path $StateDirectory ("backup-" + [Guid]::NewGuid().ToString("N"))
-$proxyTarget = Join-Path $ResolveDirectory "OpenCL.dll"
-$realTarget = Join-Path $ResolveDirectory "OpenCL_real.dll"
 try {
     New-Item -ItemType Directory -Path $backupDirectory | Out-Null
     foreach ($script in @("Resolve-CompatibilityCommon.ps1", "Uninstall-Resolve-Compatibility.ps1")) {
@@ -132,10 +132,7 @@ try {
         resolveDirectory = $ResolveDirectory
         backupDirectory = $backupDirectory
         files = @(
-            (New-StateEntry "OpenCL_real.dll" $realTarget $backupDirectory),
-            (New-StateEntry "OpenCL.dll" $proxyTarget $backupDirectory),
-            (New-StateEntry "atiadlxx.dll" (Join-Path $ResolveDirectory "atiadlxx.dll") $backupDirectory),
-            (New-StateEntry "Launch Resolve (Helios).cmd" (Join-Path $ResolveDirectory "Launch Resolve (Helios).cmd") $backupDirectory)
+            (New-StateEntry "atiadlxx.dll" (Join-Path $ResolveDirectory "atiadlxx.dll") $backupDirectory)
         )
     }
     Write-HeliosCompatibilityState $state $statePath
@@ -150,8 +147,8 @@ try {
     }
     $state.status = "installed"
     Write-HeliosCompatibilityState $state $statePath
-    Write-Host "DaVinci Resolve compatibility files installed in $ResolveDirectory"
-    Write-Host "Launch Resolve with 'Launch Resolve (Helios).cmd' in that directory."
+    Write-Host "DaVinci Resolve ADL compatibility installed in $ResolveDirectory"
+    Write-Host "Resolve can now be started normally."
 } catch {
     $installError = $_
     $state.status = "install-failed"

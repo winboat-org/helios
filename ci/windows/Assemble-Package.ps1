@@ -34,13 +34,6 @@ function Invoke-SignTool([string]$SignTool, [string]$Thumbprint, [string]$Path) 
     if ($LASTEXITCODE -ne 0) { throw "signtool failed to sign $Path." }
 }
 
-function Get-OpenClExports([string]$Path) {
-    $table = (& dumpbin.exe /nologo /exports $Path 2>&1 | Out-String)
-    if ($LASTEXITCODE -ne 0) { throw "dumpbin.exe failed to inspect $Path." }
-    return @([Regex]::Matches($table, '(?m)^\s+\d+\s+[0-9A-F]+\s+(?:[0-9A-F]+\s+)?(cl[A-Za-z0-9_]+)(?:\s|$)') |
-        ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique)
-}
-
 $shortCommit = $RepositoryCommit.Substring(0, 8)
 $packageId = "helios-windows-x64-$Version-$shortCommit"
 $stagingRoot = Join-Path $OutputDir $packageId
@@ -93,21 +86,12 @@ foreach ($probe in @(
 $resolveCompatibilityOut = Join-Path $stagingRoot "compatibility\DaVinci Resolve"
 foreach ($name in @(
     "atiadlxx.dll",
-    "OpenCL.dll",
     "Resolve-CompatibilityCommon.ps1",
     "Install-Resolve-Compatibility.ps1",
     "Uninstall-Resolve-Compatibility.ps1",
-    "Launch Resolve (Helios).cmd",
     "README.md"
 )) {
     Copy-Required (Join-Path $CompatibilityArtifact $name) (Join-Path $resolveCompatibilityOut $name)
-}
-Copy-Required (Join-Path $LoadersArtifact "OpenCL.dll") (Join-Path $resolveCompatibilityOut "OpenCL_real.dll")
-$proxyExports = @(Get-OpenClExports (Join-Path $resolveCompatibilityOut "OpenCL.dll"))
-$loaderExports = @(Get-OpenClExports (Join-Path $resolveCompatibilityOut "OpenCL_real.dll"))
-if ($proxyExports.Count -ne $loaderExports.Count -or
-    @(Compare-Object -ReferenceObject $loaderExports -DifferenceObject $proxyExports).Count -ne 0) {
-    throw "The Resolve OpenCL proxy export set does not match the packaged Khronos loader."
 }
 
 $redist = Get-ChildItem -LiteralPath $env:VCToolsRedistDir -Filter "vc_redist.x64.exe" -File -Recurse | Select-Object -First 1
@@ -157,9 +141,7 @@ try {
         (Join-Path $openClOut "clvk.dll"),
         (Join-Path $loadersOut "vulkan-1.dll"),
         (Join-Path $loadersOut "OpenCL.dll"),
-        (Join-Path $resolveCompatibilityOut "atiadlxx.dll"),
-        (Join-Path $resolveCompatibilityOut "OpenCL.dll"),
-        (Join-Path $resolveCompatibilityOut "OpenCL_real.dll")
+        (Join-Path $resolveCompatibilityOut "atiadlxx.dll")
     )
     $signable += @(Get-ChildItem -LiteralPath $mesaOut -Filter "*.dll" -File | ForEach-Object FullName)
     $signable += @(Get-ChildItem -LiteralPath (Join-Path $payload "smoke") -Filter "*.exe" -File | ForEach-Object FullName)
@@ -205,7 +187,7 @@ $manifest = [ordered]@{
         driver = [ordered]@{ version = $Version; direct3D = "DXVK embedded WDDM UMD" }
         mesa = [ordered]@{ vulkan = "Venus"; openGL = "Zink WGL ICD"; vulkanApiVersion = "1.4.352" }
         openCl = [ordered]@{ implementation = "CLVK"; onlineCompiler = $true }
-        compatibility = [ordered]@{ davinciResolve = "App-local ADL detection and mixed-context OpenCL shims" }
+        compatibility = [ordered]@{ davinciResolve = "App-local AMD ADL detection shim" }
     }
     files = $files
 }

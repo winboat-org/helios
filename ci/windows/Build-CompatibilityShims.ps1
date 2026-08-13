@@ -12,20 +12,16 @@ $compatibilityRoot = Join-Path $RepoRoot "packaging\windows\compat"
 $adlRoot = Join-Path $compatibilityRoot "adl-shim"
 $adlSource = Join-Path $adlRoot "helios-adl-shim.cpp"
 $adlDefinition = Join-Path $adlRoot "helios-adl-shim.def"
-$proxyRoot = Join-Path $compatibilityRoot "resolve-opencl-proxy"
-$proxySource = Join-Path $proxyRoot "helios-resolve-opencl-proxy.c"
-$proxyTestSource = Join-Path $proxyRoot "resolve-opencl-properties-test.c"
-$lifecycleTest = Join-Path $proxyRoot "Test-Resolve-CompatibilityLifecycle.ps1"
-$proxyForwarders = Join-Path $proxyRoot "opencl-forwarders.inc"
+$resolveRoot = Join-Path $compatibilityRoot "resolve-compatibility"
+$lifecycleTest = Join-Path $resolveRoot "Test-Resolve-CompatibilityLifecycle.ps1"
 $readme = Join-Path $compatibilityRoot "README.md"
 $lifecycleFiles = @(
     "Resolve-CompatibilityCommon.ps1",
     "Install-Resolve-Compatibility.ps1",
-    "Uninstall-Resolve-Compatibility.ps1",
-    "Launch Resolve (Helios).cmd"
+    "Uninstall-Resolve-Compatibility.ps1"
 )
-$required = @($adlSource, $adlDefinition, $proxySource, $proxyTestSource, $proxyForwarders, $lifecycleTest, $readme)
-$required += @($lifecycleFiles | ForEach-Object { Join-Path $proxyRoot $_ })
+$required = @($adlSource, $adlDefinition, $lifecycleTest, $readme)
+$required += @($lifecycleFiles | ForEach-Object { Join-Path $resolveRoot $_ })
 foreach ($path in $required) {
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
         throw "Required compatibility-shim source is missing: $path"
@@ -33,6 +29,9 @@ foreach ($path in $required) {
 }
 
 New-Item -ItemType Directory -Force -Path $OutputDir | Out-Null
+foreach ($obsolete in @("OpenCL.dll", "OpenCL_real.dll", "Launch Resolve (Helios).cmd")) {
+    Remove-Item -LiteralPath (Join-Path $OutputDir $obsolete) -Force -ErrorAction SilentlyContinue
+}
 $buildDir = Join-Path ([IO.Path]::GetTempPath()) ("helios-compatibility-" + [Guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Path $buildDir | Out-Null
 
@@ -104,54 +103,9 @@ try {
         }
     }
 
-    $proxyObject = Join-Path $buildDir "helios-resolve-opencl-proxy.obj"
-    $proxyDll = Join-Path $OutputDir "OpenCL.dll"
-    $proxyImportLibrary = Join-Path $buildDir "OpenCL.lib"
-    $proxyCompileArguments = @(
-        "/nologo", "/c", "/TC", "/std:c11", "/O2", "/W4", "/WX",
-        "/MT", "/GS", "/guard:cf", "/Brepro", "/Fo$proxyObject", $proxySource
-    )
-    & cl.exe @proxyCompileArguments
-    if ($LASTEXITCODE -ne 0) { throw "cl.exe failed to compile the Resolve OpenCL proxy." }
-
-    $proxyLinkArguments = @(
-        "/nologo", "/DLL", "/MACHINE:X64", "/OPT:REF", "/OPT:ICF",
-        "/DYNAMICBASE", "/NXCOMPAT", "/HIGHENTROPYVA", "/GUARD:CF", "/Brepro",
-        "/OUT:$proxyDll", "/IMPLIB:$proxyImportLibrary", $proxyObject
-    )
-    & link.exe @proxyLinkArguments
-    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $proxyDll -PathType Leaf)) {
-        throw "link.exe failed to produce the Resolve OpenCL proxy."
-    }
-
-    $declaredExports = @(
-        Select-String -LiteralPath $proxyForwarders -Pattern '/export:(cl[A-Za-z0-9_]+)=' -AllMatches |
-            ForEach-Object { $_.Matches } | ForEach-Object { $_.Groups[1].Value }
-    ) + @("clCreateContext")
-    $declaredExports = @($declaredExports | Sort-Object -Unique)
-    if ($declaredExports.Count -ne 124) {
-        throw "The Resolve OpenCL proxy declares $($declaredExports.Count) exports; expected 124 for the pinned loader."
-    }
-    $proxyExportTable = (& dumpbin.exe /nologo /exports $proxyDll 2>&1 | Out-String)
-    if ($LASTEXITCODE -ne 0) { throw "dumpbin.exe failed to inspect the Resolve OpenCL proxy." }
-    foreach ($export in $declaredExports) {
-        if ($proxyExportTable -notmatch "(?m)\b$([Regex]::Escape($export))\b") {
-            throw "Resolve OpenCL proxy is missing declared export $export."
-        }
-    }
-
-    $testObject = Join-Path $buildDir "resolve-opencl-properties-test.obj"
-    $testExe = Join-Path $buildDir "resolve-opencl-properties-test.exe"
-    & cl.exe /nologo /c /TC /std:c11 /Od /W4 /WX /MT /GS "/Fo$testObject" $proxyTestSource
-    if ($LASTEXITCODE -ne 0) { throw "cl.exe failed to compile the Resolve OpenCL property tests." }
-    & link.exe /nologo /MACHINE:X64 /DYNAMICBASE /NXCOMPAT /OUT:$testExe $testObject
-    if ($LASTEXITCODE -ne 0) { throw "link.exe failed to produce the Resolve OpenCL property tests." }
-    & $testExe
-    if ($LASTEXITCODE -ne 0) { throw "Resolve OpenCL property tests failed." }
-
     foreach ($scriptPath in @(
         @($lifecycleFiles | Where-Object { $_ -like "*.ps1" } |
-            ForEach-Object { Join-Path $proxyRoot $_ }) + $lifecycleTest
+            ForEach-Object { Join-Path $resolveRoot $_ }) + $lifecycleTest
     )) {
         $tokens = $null
         $parseErrors = $null
@@ -164,7 +118,7 @@ try {
 
     Copy-Item -LiteralPath $readme -Destination (Join-Path $OutputDir "README.md") -Force
     foreach ($file in $lifecycleFiles) {
-        Copy-Item -LiteralPath (Join-Path $proxyRoot $file) -Destination (Join-Path $OutputDir $file) -Force
+        Copy-Item -LiteralPath (Join-Path $resolveRoot $file) -Destination (Join-Path $OutputDir $file) -Force
     }
     & $lifecycleTest -ArtifactDirectory $OutputDir
     Write-Host "Compatibility-shim artifact staged at $OutputDir"

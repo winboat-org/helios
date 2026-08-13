@@ -227,15 +227,8 @@ int main(int argc, char** argv) {
                                         nullptr, &error);
     std::printf("clCreateContext result=%p error=%d\n", context, error);
     if (d3d11_context_case) {
-        const bool correctly_rejected =
-            context == nullptr && error == CL_INVALID_OPERATION;
-        std::printf("mixed D3D11/OpenGL context rejected=%d\n",
-                    correctly_rejected);
-        if (context != nullptr) {
-            release_context(context);
-        }
-        cleanup_graphics();
-        return correctly_rejected ? 0 : 10;
+        std::printf("mixed D3D11/OpenGL context accepted=%d\n",
+                    context != nullptr && error == CL_SUCCESS);
     }
     if (!context || error != CL_SUCCESS) {
         cleanup_graphics();
