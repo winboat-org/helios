@@ -7,7 +7,9 @@ function ConvertTo-WindowsKitVersion([Parameter(Mandatory)][string]$Value) {
     return [version]"0.0"
 }
 
-function Import-VisualStudioEnvironment {
+function Import-VisualStudioEnvironment(
+    [ValidateSet("x64", "x86")][string]$Architecture = "x64"
+) {
     $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
     if (-not (Test-Path -LiteralPath $vswhere -PathType Leaf)) {
         throw "vswhere.exe was not found; Visual Studio 2022 with C++ tools is required."
@@ -15,11 +17,11 @@ function Import-VisualStudioEnvironment {
 
     $installation = (& $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath).Trim()
     if (-not $installation) {
-        throw "Visual Studio 2022 with the x64 C++ toolchain was not found."
+        throw "Visual Studio 2022 with the x86/x64 C++ toolchain was not found."
     }
 
     $devCmd = Join-Path $installation "Common7\Tools\VsDevCmd.bat"
-    $environment = & cmd.exe /s /c "`"$devCmd`" -no_logo -arch=x64 -host_arch=x64 && set"
+    $environment = & cmd.exe /s /c "`"$devCmd`" -no_logo -arch=$Architecture -host_arch=x64 && set"
     if ($LASTEXITCODE -ne 0) {
         throw "VsDevCmd.bat failed with exit code $LASTEXITCODE."
     }

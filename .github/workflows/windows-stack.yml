@@ -82,7 +82,7 @@ jobs:
           retention-days: 14
 
   mesa:
-    name: Mesa Venus Vulkan and Zink OpenGL
+    name: Mesa Venus Vulkan and Zink OpenGL (x64)
     runs-on: windows-2022
     timeout-minutes: 120
     steps:
@@ -118,6 +118,46 @@ jobs:
         with:
           name: helios-mesa
           path: ${{ runner.temp }}/helios-mesa
+          if-no-files-found: error
+          retention-days: 14
+
+  mesa_x86:
+    name: Mesa Venus Vulkan and Zink OpenGL (WoW64 x86)
+    runs-on: windows-2022
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: false
+          fetch-depth: 1
+      - name: Initialize Mesa fork
+        shell: pwsh
+        run: git submodule update --init icd/mesa
+      - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884
+        with:
+          msystem: MINGW32
+          update: true
+          install: >-
+            git
+            mingw-w64-i686-gcc
+            mingw-w64-i686-meson
+            mingw-w64-i686-ninja
+            mingw-w64-i686-python
+            mingw-w64-i686-python-mako
+            mingw-w64-i686-python-packaging
+            mingw-w64-i686-python-yaml
+            mingw-w64-i686-pkgconf
+            mingw-w64-i686-vulkan-headers
+            mingw-w64-i686-vulkan-loader
+            bison
+            flex
+      - name: Build WoW64 Mesa runtime
+        shell: msys2 {0}
+        run: bash ./ci/windows/build-mesa.sh "$GITHUB_WORKSPACE" "$RUNNER_TEMP/helios-mesa-x86"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: helios-mesa-x86
+          path: ${{ runner.temp }}/helios-mesa-x86
           if-no-files-found: error
           retention-days: 14
 
@@ -208,7 +248,7 @@ jobs:
 
   package:
     name: Sign and assemble installable bundle
-    needs: [driver, mesa, opencl, loaders, compatibility]
+    needs: [driver, mesa, mesa_x86, opencl, loaders, compatibility]
     runs-on: windows-2022
     timeout-minutes: 30
     permissions:
@@ -226,6 +266,10 @@ jobs:
         with:
           name: helios-mesa
           path: ${{ runner.temp }}/artifacts/mesa
+      - uses: actions/download-artifact@v8
+        with:
+          name: helios-mesa-x86
+          path: ${{ runner.temp }}/artifacts/mesa-x86
       - uses: actions/download-artifact@v8
         with:
           name: helios-opencl
@@ -256,6 +300,7 @@ jobs:
           -RepoRoot $env:GITHUB_WORKSPACE
           -DriverArtifact "$env:RUNNER_TEMP/artifacts/driver"
           -MesaArtifact "$env:RUNNER_TEMP/artifacts/mesa"
+          -MesaX86Artifact "$env:RUNNER_TEMP/artifacts/mesa-x86"
           -OpenClArtifact "$env:RUNNER_TEMP/artifacts/opencl"
           -LoadersArtifact "$env:RUNNER_TEMP/artifacts/loaders"
           -CompatibilityArtifact "$env:RUNNER_TEMP/artifacts/compatibility"

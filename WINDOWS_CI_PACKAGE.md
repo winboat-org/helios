@@ -1,8 +1,9 @@
 # Windows CI package
 
 The `Windows graphics and compute bundle` GitHub Actions workflow builds one
-x64 archive that turns a clean Helios Windows 11 guest into a system-wide
-graphics/compute installation.
+x64 Windows archive that turns a clean Helios Windows 11 guest into a
+system-wide graphics/compute installation. It includes x86 Vulkan/OpenGL
+components for WoW64 applications alongside the native x64 stack.
 
 ## What the workflow builds
 
@@ -10,12 +11,12 @@ The jobs are independent so an error points at the actual component:
 
 1. `driver` builds the DXVK static D3D11 core, embeds it in `helios_umd.dll`,
    and builds/packages the Rust WDDM kernel driver.
-2. `mesa` builds the pinned Mesa submodule once with both the Venus Vulkan ICD
-   and the Zink WGL OpenGL ICD enabled.
+2. `mesa` and `mesa_x86` build the pinned Mesa submodule for x64 and x86 with
+   both the Venus Vulkan ICD and the Zink WGL OpenGL ICD enabled.
 3. `opencl` builds pinned CLVK with the clspv online compiler embedded. End-user
    machines therefore do not need `clspv.exe` or `CLVK_CLSPV_PATH`.
-4. `loaders` builds the official Khronos Vulkan and OpenCL loaders plus four
-   native smoke probes.
+4. `loaders` builds the official x64 Vulkan/OpenCL loaders, the x86 Vulkan
+   loader, and architecture-matched smoke probes.
 5. `compatibility` builds and validates the app-local DaVinci Resolve ADL shim.
 6. `package` test-signs the final driver package and compatibility shim, hashes
    every distributed binary,
@@ -58,11 +59,12 @@ the ephemeral certificate.
 
 - installs the Visual C++ x64 runtime and the prebuilt PnP driver package;
 - installs Mesa and CLVK in a versioned directory below `Program Files`;
-- installs official `vulkan-1.dll`/`OpenCL.dll` only when no system loader is
-  present;
+- installs official x64 and x86 `vulkan-1.dll` loaders and the x64 `OpenCL.dll`
+  only when the matching system loader is absent;
 - registers Venus and CLVK through the Khronos machine ICD registries; and
-- registers `libgallium_wgl.dll` as the Microsoft OpenGL ICD on the Helios
-  display adapter key. It does not replace Windows' `opengl32.dll`.
+- registers the x64 and x86 `libgallium_wgl.dll` files as the Microsoft OpenGL
+  ICDs on the Helios display adapter key. It does not replace Windows'
+  `opengl32.dll`.
 
 Original OpenGL registry values and every created path/hash are saved in
 `C:\ProgramData\Helios\install-state.json`. The package refuses to overwrite an
@@ -87,6 +89,7 @@ and WDK. The setup script uses an already installed WDK when available and
 otherwise installs the official 10.0.26100 SDK/WDK packages with winget. A
 self-hosted runner should preinstall those tools if winget is unavailable.
 
-The current bundle is x64-only. A real WoW64 deliverable needs independently
-validated x86 builds of the WDDM UMD, Mesa, CLVK, and both loaders; copying x64
-DLLs into `SysWOW64` is not a valid substitute.
+The bundle supports WoW64 Vulkan and OpenGL using independently built x86 Mesa
+and Vulkan-loader binaries. WoW64 Direct3D and OpenCL still require separately
+built x86 WDDM UMD/DXVK and CLVK/OpenCL-loader components; copying x64 DLLs into
+`SysWOW64` is not a valid substitute.

@@ -56,10 +56,21 @@ if ($null -eq $vulkanValue -or [int]$vulkanValue -ne 0) {
     $failures.Add("The Vulkan ICD manifest is not enabled in the machine registry.")
 } else { Write-Host "Vulkan: registered $($state.vulkanManifest)" }
 
+$vulkanRegistryX86 = "HKLM:\SOFTWARE\WOW6432Node\Khronos\Vulkan\Drivers"
+$vulkanX86Value = if (Test-Path -LiteralPath $vulkanRegistryX86) { (Get-Item -LiteralPath $vulkanRegistryX86).GetValue([string]$state.vulkanManifestX86, $null) } else { $null }
+if ($null -eq $vulkanX86Value -or [int]$vulkanX86Value -ne 0) {
+    $failures.Add("The x86 Vulkan ICD manifest is not enabled in the WoW64 registry.")
+} else { Write-Host "Vulkan x86: registered $($state.vulkanManifestX86)" }
+
 $openGlDriver = if ($classKey -and (Test-Path -LiteralPath $classKey)) { (Get-Item -LiteralPath $classKey).GetValue("OpenGLDriverName", $null) } else { $null }
 if (-not $openGlDriver -or ([string]$openGlDriver -ine (Join-Path ([string]$state.installRoot) "runtime\mesa\libgallium_wgl.dll"))) {
     $failures.Add("The Helios OpenGL ICD is not registered on the display adapter.")
 } else { Write-Host "OpenGL: registered $openGlDriver" }
+
+$openGlDriverX86 = if ($classKey -and (Test-Path -LiteralPath $classKey)) { (Get-Item -LiteralPath $classKey).GetValue("OpenGLDriverNameWow", $null) } else { $null }
+if (-not $openGlDriverX86 -or ([string]$openGlDriverX86 -ine (Join-Path ([string]$state.installRoot) "runtime\mesa\x86\libgallium_wgl.dll"))) {
+    $failures.Add("The Helios x86 OpenGL ICD is not registered on the display adapter.")
+} else { Write-Host "OpenGL x86: registered $openGlDriverX86" }
 
 $openClRegistry = "HKLM:\SOFTWARE\Khronos\OpenCL\Vendors"
 $openClValue = if (Test-Path -LiteralPath $openClRegistry) { (Get-Item -LiteralPath $openClRegistry).GetValue([string]$state.openClVendor, $null) } else { $null }
@@ -83,7 +94,10 @@ if ($RunSmokeTests) {
             name = "Mixed OpenGL/D3D11 context compatibility"
             exe = "opencl-gl-sharing-smoke.exe"
             arguments = @("rgba16f", "d3d11-context")
-        }
+        },
+        [ordered]@{ name = "Vulkan x86"; exe = "x86\vulkan-smoke.exe"; arguments = @() },
+        [ordered]@{ name = "Vulkan WSI x86"; exe = "x86\vulkan-wsi-probe.exe"; arguments = @() },
+        [ordered]@{ name = "OpenGL x86"; exe = "x86\opengl-smoke.exe"; arguments = @() }
     )
     foreach ($test in $tests) {
         $executable = Join-Path $smokeRoot $test.exe
@@ -102,4 +116,4 @@ if ($failures.Count -gt 0) {
     foreach ($failure in $failures) { Write-Error $failure -ErrorAction Continue }
     throw "Helios verification failed with $($failures.Count) problem(s)."
 }
-Write-Host "Helios Vulkan, Direct3D 11, OpenGL, and OpenCL registrations are healthy."
+Write-Host "Helios x64/WoW64 Vulkan and OpenGL, Direct3D 11, and OpenCL registrations are healthy."

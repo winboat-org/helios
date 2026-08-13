@@ -6,18 +6,33 @@ set -euo pipefail
 # invalid `-includeD:A:/...` form before Meson sees it.
 export MSYS2_ARG_CONV_EXCL='*'
 
-repo_root="$(cygpath -m "${1:?usage: build-mesa.sh REPO_ROOT OUTPUT_DIR [BUILD_DIR]}")"
-output_dir="$(cygpath -m "${2:?usage: build-mesa.sh REPO_ROOT OUTPUT_DIR [BUILD_DIR]}")"
+repo_root="$(cygpath -m "${1:?usage: build-mesa.sh REPO_ROOT OUTPUT_DIR [BUILD_DIR] [--clean|--reuse]}")"
+output_dir="$(cygpath -m "${2:?usage: build-mesa.sh REPO_ROOT OUTPUT_DIR [BUILD_DIR] [--clean|--reuse]}")"
 build_dir="$(cygpath -m "${3:-C:/helios-mesa-build}")"
+build_mode="${4:---clean}"
 
 mesa_src="${repo_root}/icd/mesa"
 native_file="${repo_root}/ci/windows/mingw-native.ini"
 compat_header="${repo_root}/icd/win-build/helios_win_compat.h"
 
-rm -rf "${build_dir}"
+setup_mode=()
+case "${build_mode}" in
+  --clean)
+    rm -rf "${build_dir}"
+    ;;
+  --reuse)
+    if [[ -f "${build_dir}/build.ninja" ]]; then
+      setup_mode+=(--reconfigure)
+    fi
+    ;;
+  *)
+    printf 'Unknown build mode: %s (expected --clean or --reuse)\n' "${build_mode}" >&2
+    exit 2
+    ;;
+esac
 mkdir -p "${output_dir}"
 
-meson setup "${build_dir}" "${mesa_src}" \
+meson setup "${setup_mode[@]}" "${build_dir}" "${mesa_src}" \
   --native-file "${native_file}" \
   "-Dc_args=-include${compat_header}" \
   -Dvulkan-drivers=virtio \

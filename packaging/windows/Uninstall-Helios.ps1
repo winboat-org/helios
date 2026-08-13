@@ -25,6 +25,10 @@ $vulkanRegistry = "HKLM:\SOFTWARE\Khronos\Vulkan\Drivers"
 if (Test-Path -LiteralPath $vulkanRegistry) {
     Remove-ItemProperty -LiteralPath $vulkanRegistry -Name ([string]$state.vulkanManifest) -ErrorAction SilentlyContinue
 }
+$vulkanRegistryX86 = "HKLM:\SOFTWARE\WOW6432Node\Khronos\Vulkan\Drivers"
+if (Test-Path -LiteralPath $vulkanRegistryX86) {
+    Remove-ItemProperty -LiteralPath $vulkanRegistryX86 -Name ([string]$state.vulkanManifestX86) -ErrorAction SilentlyContinue
+}
 $openClRegistry = "HKLM:\SOFTWARE\Khronos\OpenCL\Vendors"
 if (Test-Path -LiteralPath $openClRegistry) {
     Remove-ItemProperty -LiteralPath $openClRegistry -Name ([string]$state.openClVendor) -ErrorAction SilentlyContinue
@@ -35,6 +39,9 @@ if ($classKey -and (Test-Path -LiteralPath $classKey)) {
     Restore-HeliosRegistrySnapshot $classKey "OpenGLDriverName" $state.previousOpenGL.OpenGLDriverName
     Restore-HeliosRegistrySnapshot $classKey "OpenGLVersion" $state.previousOpenGL.OpenGLVersion
     Restore-HeliosRegistrySnapshot $classKey "OpenGLFlags" $state.previousOpenGL.OpenGLFlags
+    Restore-HeliosRegistrySnapshot $classKey "OpenGLDriverNameWow" $state.previousOpenGL.OpenGLDriverNameWow
+    Restore-HeliosRegistrySnapshot $classKey "OpenGLVersionWow" $state.previousOpenGL.OpenGLVersionWow
+    Restore-HeliosRegistrySnapshot $classKey "OpenGLFlagsWow" $state.previousOpenGL.OpenGLFlagsWow
 }
 
 # If a VM configuration change moved the adapter after installation, remove a
@@ -48,6 +55,13 @@ try {
         $currentWgl = (Get-Item -LiteralPath $currentClassKey).GetValue("OpenGLDriverName", $null)
         if ($currentWgl -and ([string]$currentWgl -ieq $expectedWgl)) {
             foreach ($name in @("OpenGLDriverName", "OpenGLVersion", "OpenGLFlags")) {
+                Remove-ItemProperty -LiteralPath $currentClassKey -Name $name -ErrorAction SilentlyContinue
+            }
+        }
+        $expectedWglX86 = Join-Path ([string]$state.installRoot) "runtime\mesa\x86\libgallium_wgl.dll"
+        $currentWglX86 = (Get-Item -LiteralPath $currentClassKey).GetValue("OpenGLDriverNameWow", $null)
+        if ($currentWglX86 -and ([string]$currentWglX86 -ieq $expectedWglX86)) {
+            foreach ($name in @("OpenGLDriverNameWow", "OpenGLVersionWow", "OpenGLFlagsWow")) {
                 Remove-ItemProperty -LiteralPath $currentClassKey -Name $name -ErrorAction SilentlyContinue
             }
         }
@@ -77,6 +91,11 @@ if ($RemoveKhronosLoaders) {
             installed = [bool]$state.installedVulkanLoader
             path = Join-Path $env:windir "System32\vulkan-1.dll"
             hash = [string]$state.systemVulkanLoaderHash
+        },
+        [ordered]@{
+            installed = [bool]$state.installedVulkanLoaderX86
+            path = Join-Path $env:windir "SysWOW64\vulkan-1.dll"
+            hash = [string]$state.systemVulkanLoaderX86Hash
         },
         [ordered]@{
             installed = [bool]$state.installedOpenClLoader
