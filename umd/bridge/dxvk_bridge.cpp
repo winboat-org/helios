@@ -1036,6 +1036,41 @@ bool HeliosDxvkDevice::rotate_resource_backings(
         images.push_back(texture->GetImage());
       }
 
+      // DXGI may only rotate identities within one compatible swapchain ring.
+      // invalidateImage replaces the storage but intentionally leaves the
+      // stable DxvkImage's format/shape metadata in place, so accepting a
+      // mixed ring would attach (for example) packed RGB10A2 storage to a
+      // BGRA8 image and make every downstream user reinterpret its bytes.
+      const auto& expected = images[0]->info();
+      for (std::size_t i = 1; i < images.size(); ++i) {
+        const auto& actual = images[i]->info();
+        if (actual.type        != expected.type
+         || actual.format      != expected.format
+         || actual.sampleCount != expected.sampleCount
+         || actual.extent.width  != expected.extent.width
+         || actual.extent.height != expected.extent.height
+         || actual.extent.depth  != expected.extent.depth
+         || actual.numLayers   != expected.numLayers
+         || actual.mipLevels   != expected.mipLevels) {
+          char msg[320];
+          std::snprintf(msg, sizeof(msg),
+            "rotate_resource_backings: incompatible slot %zu/%zu "
+            "expected fmt=%u extent=%ux%ux%u samples=%u layers=%u mips=%u; "
+            "got fmt=%u extent=%ux%ux%u samples=%u layers=%u mips=%u",
+            i, images.size(),
+            static_cast<unsigned>(expected.format),
+            expected.extent.width, expected.extent.height, expected.extent.depth,
+            static_cast<unsigned>(expected.sampleCount),
+            expected.numLayers, expected.mipLevels,
+            static_cast<unsigned>(actual.format),
+            actual.extent.width, actual.extent.height, actual.extent.depth,
+            static_cast<unsigned>(actual.sampleCount),
+            actual.numLayers, actual.mipLevels);
+          umd_log(msg);
+          return false;
+        }
+      }
+
       // CS-side identity rotation (18th session), mirroring upstream
       // D3D11SwapChain::RotateBackBuffers: swap the storages ON the CS thread
       // via DxvkContext::invalidateImage. No GPU drain is needed — every
@@ -1195,6 +1230,99 @@ bool HeliosDxvkDevice::rotate_resource_backings(
       // The storage swap itself (resource[i] takes resource[i+1]'s, the last
       // takes the first's) executes in the injected CS command above.
       return true;
+  });
+}
+
+std::int32_t HeliosDxvkDevice::dxgi_blt_convert(
+    std::size_t dst_resource_ptr,
+    std::uint32_t dst_subresource,
+    std::uint32_t dst_x,
+    std::uint32_t dst_y,
+    std::size_t src_resource_ptr,
+    std::uint32_t src_subresource,
+    bool use_src_box,
+    std::uint32_t src_left,
+    std::uint32_t src_top,
+    std::uint32_t src_right,
+    std::uint32_t src_bottom) const {
+  if (!impl || !impl->context || !dst_resource_ptr || !src_resource_ptr)
+    return -1;
+
+  return bridge_guard("dxgi_blt_convert", -1, [&]() -> std::int32_t {
+      auto* dstTex = dxvk::GetCommonTexture(
+        reinterpret_cast<ID3D11Resource*>(dst_resource_ptr));
+      auto* srcTex = dxvk::GetCommonTexture(
+        reinterpret_cast<ID3D11Resource*>(src_resource_ptr));
+      if (!dstTex || !dstTex->GetImage() || !srcTex || !srcTex->GetImage()) {
+        umd_log("dxgi_blt_convert: non-texture resource");
+        return -1;
+      }
+      if (dst_subresource >= dstTex->CountSubresources()
+       || src_subresource >= srcTex->CountSubresources()) {
+        umd_log("dxgi_blt_convert: subresource out of range");
+        return -1;
+      }
+
+      dxvk::Rc<dxvk::DxvkImage> dstImage = dstTex->GetImage();
+      dxvk::Rc<dxvk::DxvkImage> srcImage = srcTex->GetImage();
+      const auto* dstFormat = dstImage->formatInfo();
+      const auto* srcFormat = srcImage->formatInfo();
+      if (!dstFormat || !srcFormat
+       || dstFormat->aspectMask != VK_IMAGE_ASPECT_COLOR_BIT
+       || srcFormat->aspectMask != VK_IMAGE_ASPECT_COLOR_BIT
+       || dstImage->info().sampleCount != VK_SAMPLE_COUNT_1_BIT
+       || srcImage->info().sampleCount != VK_SAMPLE_COUNT_1_BIT) {
+        umd_log("dxgi_blt_convert: needs single-sampled color images");
+        return -1;
+      }
+
+      const VkImageSubresourceLayers dstLayers = dxvk::vk::makeSubresourceLayers(
+        dstTex->GetSubresourceFromIndex(dstFormat->aspectMask, dst_subresource));
+      const VkImageSubresourceLayers srcLayers = dxvk::vk::makeSubresourceLayers(
+        srcTex->GetSubresourceFromIndex(srcFormat->aspectMask, src_subresource));
+      const VkExtent3D srcMip = srcTex->MipLevelExtent(srcLayers.mipLevel);
+      const VkExtent3D dstMip = dstTex->MipLevelExtent(dstLayers.mipLevel);
+
+      VkOffset3D srcOffset = { 0, 0, 0 };
+      VkExtent3D extent = srcMip;
+      if (use_src_box) {
+        if (src_right <= src_left || src_bottom <= src_top
+         || src_right > srcMip.width || src_bottom > srcMip.height) {
+          umd_log("dxgi_blt_convert: invalid source rectangle");
+          return -1;
+        }
+        srcOffset = {
+          static_cast<std::int32_t>(src_left),
+          static_cast<std::int32_t>(src_top),
+          0,
+        };
+        extent = { src_right - src_left, src_bottom - src_top, 1u };
+      }
+      if (dst_x > dstMip.width || dst_y > dstMip.height
+       || extent.width > dstMip.width - dst_x
+       || extent.height > dstMip.height - dst_y
+       || extent.depth != 1u) {
+        umd_log("dxgi_blt_convert: destination region out of bounds");
+        return -1;
+      }
+
+      static_cast<dxvk::D3D11ImmediateContext*>(impl->context)->HeliosConvertImage(
+        dstImage, dstLayers,
+        VkOffset3D { static_cast<std::int32_t>(dst_x), static_cast<std::int32_t>(dst_y), 0 },
+        srcImage, srcLayers, srcOffset, extent);
+      static std::atomic<std::uint32_t> s_converted{0};
+      const std::uint32_t n = s_converted.fetch_add(1, std::memory_order_relaxed) + 1;
+      if (n <= 4 || (n % 16384u) == 0) {
+        char msg[192];
+        std::snprintf(msg, sizeof(msg),
+          "dxgi_blt_convert: queued #%u src_vk=%u dst_vk=%u extent=%ux%u",
+          n,
+          static_cast<unsigned>(srcImage->info().format),
+          static_cast<unsigned>(dstImage->info().format),
+          extent.width, extent.height);
+        umd_log(msg);
+      }
+      return 0;
   });
 }
 

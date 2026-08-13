@@ -71,6 +71,10 @@ pub(crate) struct SnapshotPlan {
     pub(crate) height: u32,
     pub(crate) pitch: u32,
     pub(crate) plane_offset: u64,
+    /// Format the presented application resource had when the copy was
+    /// recorded. Used only by the stale-private guard.
+    pub(crate) source_dxgi_format: u32,
+    /// Format of the converted snapshot resource published to the KMD.
     pub(crate) dxgi_format: u32,
     pub(crate) venus_alloc_size: u64,
     pub(crate) memory_type_index: u32,
@@ -103,6 +107,20 @@ pub(crate) static SNAP_CACHE_REFUSALS: AtomicUsize = AtomicUsize::new(0);
 /// was recorded against. The stale-descriptor guard's loud half.
 pub(crate) static SNAP_PRIVATE_SKIPS: AtomicUsize = AtomicUsize::new(0);
 
+/// Select the format carried by a scan-out snapshot.
+///
+/// The KMD/QEMU direct-primary contract consumes ordinary 32-bit AR24/XR24
+/// pixels. Packed R10G10B10A2 is also four bytes per texel, but publishing its
+/// words as AR24 reinterprets bit fields as byte channels. Keep format 24 out
+/// of the scan-out allocator and convert it numerically into RGBA8 instead.
+fn snapshot_scanout_format(source_dxgi_format: u32) -> Option<u32> {
+    match source_dxgi_format {
+        24 => Some(28),
+        28 | 87 | 88 => Some(source_dxgi_format),
+        _ => None,
+    }
+}
+
 fn counter_summary() -> String {
     format!(
         "sub={} ring_fails={} copy_fails={} cache_refusals={} private_skips={}",
@@ -127,7 +145,8 @@ unsafe fn build_ring(
     h: Hdevice,
     width: u32,
     height: u32,
-    dxgi_format: u32,
+    source_dxgi_format: u32,
+    scanout_dxgi_format: u32,
     purpose: SnapshotPurpose,
 ) -> Option<SnapshotRing> {
     // The composition-surface baseline. Sharing/export is driven by the
@@ -139,7 +158,7 @@ unsafe fn build_ring(
         let Some((res, row_pitch, plane_offset)) = dev.dxvk.create_scanout_texture2d(
             width,
             height,
-            dxgi_format,
+            scanout_dxgi_format,
             bind,
             0,
             purpose == SnapshotPurpose::WindowedBlt,
@@ -147,10 +166,11 @@ unsafe fn build_ring(
             let n = SNAP_RING_CREATE_FAILS.fetch_add(1, Ordering::Relaxed);
             if n < 16 || n % 512 == 0 {
                 log_error!(
-                    "scanout-snapshot: ring slot {i} create FAILED {}x{} fmt={} ({})",
+                    "scanout-snapshot: ring slot {i} create FAILED {}x{} src_fmt={} scanout_fmt={} ({})",
                     width,
                     height,
-                    dxgi_format,
+                    source_dxgi_format,
+                    scanout_dxgi_format,
                     counter_summary()
                 );
             }
@@ -209,11 +229,12 @@ unsafe fn build_ring(
         });
     }
     log_error!(
-        "scanout-snapshot: ring built purpose={:?} {}x{} fmt={} resids=[{}, {}, {}, {}] pitch={}",
+        "scanout-snapshot: ring built purpose={:?} {}x{} src_fmt={} scanout_fmt={} resids=[{}, {}, {}, {}] pitch={}",
         purpose,
         width,
         height,
-        dxgi_format,
+        source_dxgi_format,
+        scanout_dxgi_format,
         slots[0].resid,
         slots[1].resid,
         slots[2].resid,
@@ -223,7 +244,8 @@ unsafe fn build_ring(
     Some(SnapshotRing {
         width,
         height,
-        dxgi_format,
+        source_dxgi_format,
+        scanout_dxgi_format,
         purpose,
         slots,
         next: 0,
@@ -277,12 +299,23 @@ pub(crate) unsafe fn snapshot_for_present(
         }
         return None;
     }
+    let Some(scanout_dxgi_format) = snapshot_scanout_format(dxgi_format) else {
+        let n = SNAP_RING_CREATE_FAILS.fetch_add(1, Ordering::Relaxed);
+        if n < 16 || n % 512 == 0 {
+            log_error!(
+                "scanout-snapshot: unsupported source format {} ({})",
+                dxgi_format,
+                counter_summary()
+            );
+        }
+        return None;
+    };
 
     let mut cache = dev.owned.snapshot_rings.borrow_mut();
     let mut ring_index = cache.rings.iter().position(|ring| {
         ring.width == width
             && ring.height == height
-            && ring.dxgi_format == dxgi_format
+            && ring.source_dxgi_format == dxgi_format
             && ring.purpose == purpose
     });
     if ring_index.is_none() {
@@ -309,7 +342,15 @@ pub(crate) unsafe fn snapshot_for_present(
             }
             return None;
         }
-        let Some(ring) = build_ring(dev, h, width, height, dxgi_format, purpose) else {
+        let Some(ring) = build_ring(
+            dev,
+            h,
+            width,
+            height,
+            dxgi_format,
+            scanout_dxgi_format,
+            purpose,
+        ) else {
             return None; // counted + logged in build_ring
         };
         let ring_bytes = ring
@@ -359,7 +400,8 @@ pub(crate) unsafe fn snapshot_for_present(
                 height: ring.height,
                 pitch: slot.pitch,
                 plane_offset: slot.plane_offset,
-                dxgi_format: ring.dxgi_format,
+                source_dxgi_format: ring.source_dxgi_format,
+                dxgi_format: ring.scanout_dxgi_format,
                 venus_alloc_size: slot.alloc_size,
                 memory_type_index: slot.memory_type_index,
                 purpose,
@@ -510,7 +552,7 @@ pub(crate) fn apply_snapshot_override(
     };
     if private.width != plan.width
         || private.height != plan.height
-        || private.dxgi_format != plan.dxgi_format
+        || private.dxgi_format != plan.source_dxgi_format
     {
         let n = SNAP_PRIVATE_SKIPS.fetch_add(1, Ordering::Relaxed);
         if n < 16 || n % 512 == 0 {
@@ -522,7 +564,7 @@ pub(crate) fn apply_snapshot_override(
                 private.dxgi_format,
                 plan.width,
                 plan.height,
-                plan.dxgi_format,
+                plan.source_dxgi_format,
                 counter_summary()
             );
         }
@@ -538,4 +580,26 @@ pub(crate) fn apply_snapshot_override(
     private.reserved |= HELIOS_PRESENT_PRIVATE_FLAG_SNAPSHOT;
     private.snapshot_memory_type_index = plan.memory_type_index;
     private.snapshot_purpose = HELIOS_PRESENT_SNAPSHOT_PURPOSE_NONE;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::snapshot_scanout_format;
+
+    #[test]
+    fn packed_ten_bit_snapshot_converts_to_rgba8() {
+        assert_eq!(snapshot_scanout_format(24), Some(28));
+    }
+
+    #[test]
+    fn native_scanout_formats_are_preserved() {
+        assert_eq!(snapshot_scanout_format(28), Some(28));
+        assert_eq!(snapshot_scanout_format(87), Some(87));
+        assert_eq!(snapshot_scanout_format(88), Some(88));
+    }
+
+    #[test]
+    fn unsupported_snapshot_formats_fail_closed() {
+        assert_eq!(snapshot_scanout_format(10), None);
+    }
 }
