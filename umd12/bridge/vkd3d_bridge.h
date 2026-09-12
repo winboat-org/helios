@@ -40,7 +40,8 @@ struct HeliosVkd3dDevice {
   std::unique_ptr<HeliosVkd3dDeviceImpl> impl;
 
   // Engine-derived values, rechecking native admission including override refusal.
-  bool native_optional_caps(std::uint32_t& shader_model, std::uint32_t& raytracing_tier,
+  bool native_optional_caps(std::uint32_t& maximum_feature_level,
+                            std::uint32_t& shader_model, std::uint32_t& raytracing_tier,
                             rust::Slice<std::uint8_t> device_uuid) const noexcept;
 
   // BORROWED — the bridge keeps the owning reference. 0 if not created.

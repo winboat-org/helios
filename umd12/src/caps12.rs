@@ -196,7 +196,7 @@ mod v {
     /// is `DIRECT|BUNDLE|COMPUTE|COPY` in *API* bits, and writing 15 into the DDI
     /// field would say `3D|COMPUTE|COPY|PAGING` — a paging queue, which no
     /// application can even hold. This is the `3DPIPELINESUPPORT` bitmask-vs-level
-    /// mistake (see [`DRIVER_MAX_FEATURE_LEVEL`]) one enum over: translate, never
+    /// mistake (see [`driver_max_feature_level`]) one enum over: translate, never
     /// transcribe.
     ///
     /// ⭐ BUNDLE has no DDI queue flag at all — bundles are command *lists*, not
@@ -287,22 +287,25 @@ mod v {
         D3D12DDICAPS_TYPE_D3D12DDICAPS_TYPE_0023_UMD_BASED_COMMAND_QUEUE_PRIORITY;
 }
 
-/// Native FL12_1 validation candidate. SO, root signatures, indirect state and
-/// tile copies now have implementations; native admission/behavior is recorded
-/// in FEATURE_LEVELS.md. The owner-authorized sparse compatibility exception
-/// still prevents claiming complete conformance. Both runtime query forms and
-/// the engine creation check derive from this one maximum enumerator.
-const DRIVER_MAX_FEATURE_LEVEL: ddi12::D3D12DDI_3DPIPELINELEVEL = v::FL_12_1;
+// Discovery requires the baseline, then checks the higher native contract on
+// that same device. In particular, missing FL12_1 sampling support must not
+// prevent FL11_0 device creation. Both runtime query forms use the cached result.
+pub(crate) const REQUIRED_ENGINE_FEATURE_LEVEL: u32 =
+    windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0.0 as u32;
 
-pub(crate) const REQUIRED_ENGINE_FEATURE_LEVEL: u32 = match DRIVER_MAX_FEATURE_LEVEL {
-    v::FL_11_0 => windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0.0 as u32,
-    v::FL_12_1 => windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_1.0 as u32,
-    _ => 0,
-};
-const _: () = assert!(
-    REQUIRED_ENGINE_FEATURE_LEVEL != 0,
-    "add the API/DDI feature-level translation"
-);
+fn driver_max_feature_level() -> Option<ddi12::D3D12DDI_3DPIPELINELEVEL> {
+    use windows::Win32::Graphics::Direct3D::{D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_12_1};
+    let level = native_optional_caps()?.maximum_feature_level;
+    if level == D3D_FEATURE_LEVEL_12_1.0 as u32 {
+        Some(v::FL_12_1)
+    } else if level == D3D_FEATURE_LEVEL_11_0.0 as u32 {
+        Some(v::FL_11_0)
+    } else {
+        note_refusal(&UMD12_REFUSALS.caps_engine_mismatch);
+        log_error!("Unrecognized native feature-level contract: {level:#x}");
+        None
+    }
+}
 
 // ---------------------------------------------------------------------------
 // The three caps that a per-format answer is coupled to
@@ -591,6 +594,9 @@ unsafe fn pipeline_support1(a: &ddi12::D3D12DDIARG_GETCAPS) -> Hresult {
             (*slot).HighestRuntimeSupportedFeatureLevel
         ))
     };
+    let Some(driver_max) = driver_max_feature_level() else {
+        return E_FAIL;
+    };
     let levels = [
         ddi12::D3D12DDI_3DPIPELINELEVEL_D3D12DDI_3DPIPELINELEVEL_12_2,
         v::FL_12_1,
@@ -602,14 +608,14 @@ unsafe fn pipeline_support1(a: &ddi12::D3D12DDIARG_GETCAPS) -> Hresult {
     ];
     let Some(answer) = levels
         .into_iter()
-        .find(|level| *level <= DRIVER_MAX_FEATURE_LEVEL && *level <= runtime_max)
+        .find(|level| *level <= driver_max && *level <= runtime_max)
     else {
         note_refusal(&UMD12_REFUSALS.caps_bad_arg);
         return E_INVALIDARG;
     };
     log_error!(
         "GetCaps 3DPIPELINESUPPORT1: runtime understands {runtime_max}, driver max \
-         {DRIVER_MAX_FEATURE_LEVEL} -> {answer}"
+         {driver_max} -> {answer}"
     );
     // SAFETY: the checked buffer contains this output member. Preserve the input
     // and any unknown tail without reading or writing either of them.
@@ -628,16 +634,15 @@ unsafe fn pipeline_support1(a: &ddi12::D3D12DDIARG_GETCAPS) -> Hresult {
 /// 12_1"*, because a pre-Vibranium runtime sanitises anything it does not
 /// understand down to `1_0 core`. The clamp is explicit here even though this
 /// driver's maximum is currently 12_1, so a later increase to
-/// [`DRIVER_MAX_FEATURE_LEVEL`] cannot silently break it.
+/// [`driver_max_feature_level`] cannot silently break it.
 ///
 /// # Safety
 /// As [`get_caps`].
 unsafe fn pipeline_support(a: &ddi12::D3D12DDIARG_GETCAPS, data_size: usize) -> Hresult {
-    let level = if DRIVER_MAX_FEATURE_LEVEL <= v::FL_12_1 {
-        DRIVER_MAX_FEATURE_LEVEL
-    } else {
-        v::FL_12_1
+    let Some(driver_max) = driver_max_feature_level() else {
+        return E_FAIL;
     };
+    let level = driver_max.min(v::FL_12_1);
     log_error!("GetCaps 3DPIPELINESUPPORT -> {level}");
     // SAFETY: as [`get_caps`].
     unsafe { write_caps("3DPIPELINESUPPORT", a.pData, data_size, level) }
@@ -773,7 +778,7 @@ unsafe fn d3d12_options(a: &ddi12::D3D12DDIARG_GETCAPS, data_size: usize) -> Hre
         //
         // ⚠ It is an FL **12_2** floor (`DDI_REFERENCE.md` §11.5's eighteen), never
         // a 12_1 one, so this raise moves no feature level and
-        // [`DRIVER_MAX_FEATURE_LEVEL`] is untouched — and the floor implication is
+        // The native maximum is discovered separately, and the floor implication is
         // one-directional (module doc): every string in the family rejects a cap for
         // being too LOW at a declared level, never for exceeding it.
         VPAndRTArrayIndexFromAnyShaderFeedingRasterizerSupportedWithoutGSEmulation: 1,

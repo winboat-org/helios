@@ -133,6 +133,7 @@ mod ffi {
 
         fn native_optional_caps(
             self: &HeliosVkd3dDevice,
+            maximum_feature_level: &mut u32,
             shader_model: &mut u32,
             raytracing_tier: &mut u32,
             device_uuid: &mut [u8],
@@ -331,6 +332,7 @@ pub(crate) fn discard_capability_engine() {
 /// Actual selected-engine capabilities, before the native UMD's tier ceilings.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub(crate) struct NativeOptionalCaps {
+    pub maximum_feature_level: u32,
     pub shader_model: u32,
     pub raytracing_tier: u32,
     pub device_uuid: [u8; 16],
@@ -378,6 +380,7 @@ impl BridgeDevice12 {
         let mut caps = NativeOptionalCaps::default();
         self.get()?
             .native_optional_caps(
+                &mut caps.maximum_feature_level,
                 &mut caps.shader_model,
                 &mut caps.raytracing_tier,
                 &mut caps.device_uuid,

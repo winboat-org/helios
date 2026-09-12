@@ -460,14 +460,24 @@ std::size_t HeliosVkd3dDevice::d3d12_device_ptr() const noexcept {
   return impl ? reinterpret_cast<std::size_t>(impl->d3d12) : 0;
 }
 
-bool HeliosVkd3dDevice::native_optional_caps(std::uint32_t& shader_model,
+bool HeliosVkd3dDevice::native_optional_caps(std::uint32_t& maximum_feature_level,
+    std::uint32_t& shader_model,
     std::uint32_t& raytracing_tier, rust::Slice<std::uint8_t> device_uuid) const noexcept {
   if (!impl || !impl->d3d12 || device_uuid.size() != 16)
     return false;
   // Revalidate even when adopting the discovery engine: an environment override
   // installed after adapter discovery must not bypass native admission.
-  return SUCCEEDED(helios_vkd3d_validate_native_feature_level(impl->d3d12,
-      impl->minimum_feature_level, &shader_model, &raytracing_tier, device_uuid.data()));
+  if (FAILED(helios_vkd3d_validate_native_feature_level(impl->d3d12,
+      impl->minimum_feature_level, &shader_model, &raytracing_tier, device_uuid.data())))
+    return false;
+  // Higher native levels have additional backing requirements. Their absence
+  // must not discard a device that satisfies the baseline contract.
+  const HRESULT extended = helios_vkd3d_validate_native_feature_level(impl->d3d12,
+      D3D_FEATURE_LEVEL_12_1, &shader_model, &raytracing_tier, device_uuid.data());
+  if (FAILED(extended) && extended != DXGI_ERROR_UNSUPPORTED)
+    return false;
+  maximum_feature_level = SUCCEEDED(extended) ? D3D_FEATURE_LEVEL_12_1 : impl->minimum_feature_level;
+  return true;
 }
 
 std::uint32_t HeliosVkd3dDevice::venus_context_id() const noexcept {
@@ -779,7 +789,7 @@ std::unique_ptr<HeliosVkd3dDevice> helios_vkd3d_bridge_create_device(
         // every exit path including an exception unwinding out of the guard.
         out->impl->d3d12 = dev;
 
-        // The native maximum is supplied by caps12, not an environment override.
+        // The native baseline is supplied by caps12, not an environment override.
         // Keep ownership in Impl so refusal or an exception releases the engine.
         out->impl->minimum_feature_level = minimum_feature_level;
         std::uint32_t shader_model = 0, raytracing_tier = 0;
