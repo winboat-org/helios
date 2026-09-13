@@ -113,9 +113,16 @@ case exactly.
     present (`pattern(e,0) = 0x9e3779b9*(e+1)` names the observed epoch).
   * The probe wrappers refuse a changed source against a captured receipt; rebuild with
     `-Mode Build` before `-Mode Run`.
-  * Evidence: `tmp/uv1-20260913/{fix288,fix288b,suite288,pris1}` and the instrumented
-    scripts (`run-cases.ps1`, `register-cases.ps1`, `watch-arm.ps1`, `probe-progress.ps1`,
-    `analyze-trace.ps1`).
+  * Evidence: the run JSONs are pulled into `tmp/uv1-20260913/evidence3/`
+    (`fix288-run.json` 30/30, `fix288b-run.json` 25+25, `suite288-run.json`, the residual
+    `stream-output` failure's stderr, and the `.283` deadlock stall log
+    `umd12-10620-stall.log`); the guest copies live in
+    `C:\ProgramData\Helios\uv1-evidence\<tag>`. Instruments:
+    `tmp/uv1-20260913/{run-cases,register-cases,watch-arm,probe-progress,analyze-trace}.ps1`,
+    builder `slave-build.ps1`. ⚠ **The `.287` baseline arm's raw JSON was removed during
+    the 2026-09-13 guest tidy-up** — the "2/20 FAIL" figure stands as a reading taken in
+    this session, and reproducing it means installing the `.287` package and running the
+    untouched probe again.
 
 The `.280` install is the same package flow as `.279`, with one wrinkle worth
 recording: the ring-3 upgrade driven from a scheduled task was killed by
